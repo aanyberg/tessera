@@ -50,6 +50,11 @@ Rust targets for the universal build:
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 ```
 
+## Development with agents
+
+Milestone work runs through a fixed roster of project agents in `.claude/agents/` and the
+`milestone-wave` workflow; see [`docs/software-factory.md`](docs/software-factory.md).
+
 ## Roadmap
 
 Work is tracked in [GitHub milestones](https://github.com/aanyberg/tessera/milestones).
