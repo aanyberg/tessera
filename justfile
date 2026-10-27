@@ -59,6 +59,20 @@ app: xcframework xcodeproj
 run: app
     open {{app_dir}}/DerivedData/Build/Products/Debug/Tessera.app
 
+terminfo := "shell-integration/terminfo/install.sh"
+
+# Compile the tessera terminfo entry into a temp dir and list its extended caps
+terminfo-check:
+    {{terminfo}} --check
+
+# Install the tessera terminfo entry into ~/.terminfo
+terminfo-install:
+    {{terminfo}}
+
+# Install the tessera terminfo entry on a remote host over ssh
+terminfo-ssh host:
+    {{terminfo}} --ssh {{host}}
+
 # Emit JSON Schema for the control protocol into docs/protocol (v1.x)
 schema:
     @echo "schema generation lands with tessera-protocol schemars support"
