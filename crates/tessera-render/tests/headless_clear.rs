@@ -105,7 +105,8 @@ fn readback_strips_row_padding_for_unaligned_widths() {
         .clear(&gpu, Rgba::new(1.0, 0.0, 0.0, 0.5))
         .expect("clear");
     let px = target.read_back(&gpu).expect("readback");
-    assert_solid(&px, size, [255, 0, 0, 128], 1);
+    // Clears are premultiplied: red at half opacity stores (0.5, 0, 0, 0.5).
+    assert_solid(&px, size, [128, 0, 0, 128], 1);
 }
 
 #[test]

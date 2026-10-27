@@ -11,6 +11,8 @@ publish.workspace = true
 
 [dependencies]
 tessera-grid.workspace = true
+# `Pod` instance and uniform structs for the render passes (ADR 0010).
+bytemuck.workspace = true
 # Shaping (harfrust), fallback, fontdb system font loading and swash
 # rasterisation. `fontconfig` is off: macOS loads fonts from the system
 # font directories through fontdb directly (ADR 0007).
@@ -28,6 +30,10 @@ swash = "0.2.10"
 thiserror.workspace = true
 tracing.workspace = true
 wgpu = { version = "30", default-features = false, features = ["metal", "wgsl", "std"] }
+
+[dev-dependencies]
+# Golden images in tests/golden (ADR 0010).
+png.workspace = true
 
 [lints]
 workspace = true

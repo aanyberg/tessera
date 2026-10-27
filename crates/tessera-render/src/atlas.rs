@@ -7,6 +7,12 @@
 //! layer is full, the glyphs that were used longest ago (by frame
 //! generation, see [`GlyphAtlas::begin_frame`]) are evicted until the new
 //! glyph fits; glyphs used in the current frame are never evicted.
+//!
+//! Eviction frees space but shelves can stay fragmented: glyphs of the
+//! current frame scattered over many short shelves leave no room for a
+//! taller one even at low use. [`GlyphAtlas::recover_from_full`] is the
+//! policy for that case (ADR 0010): empty the atlas once per frame and
+//! re-insert only the current frame's glyphs, tallest first.
 
 use std::collections::HashMap;
 
@@ -157,9 +163,12 @@ pub struct AtlasStats {
     pub rasterized: u64,
     /// Glyphs evicted to make room.
     pub evicted: u64,
-    /// Times the atlas was emptied by [`GlyphAtlas::clear`] or a font
-    /// change.
+    /// Times the atlas was emptied by [`GlyphAtlas::clear`], a font
+    /// change or [`GlyphAtlas::recover_from_full`].
     pub cleared: u64,
+    /// Times [`GlyphAtlas::recover_from_full`] emptied the atlas because a
+    /// frame's glyphs did not fit. At most one per frame.
+    pub full_resets: u64,
 }
 
 /// A texel rectangle.
@@ -243,20 +252,22 @@ impl ShelfPacker {
             return None;
         }
         // Best fit among shelves tall enough and not wastefully tall:
-        // occupied shelves accept glyphs down to 2/3 of their height, empty
-        // shelves any glyph that fits (and are then split down to it).
+        // occupied shelves accept glyphs whose quantised height is at
+        // least 2/3 of theirs (so a shelf opened for a glyph always takes
+        // more glyphs of the same height), empty shelves any glyph that
+        // fits (and are then split down to it).
+        let quantised = h.next_multiple_of(SHELF_QUANTUM);
         let best = self
             .shelves
             .iter()
             .enumerate()
             .filter(|(_, s)| {
                 s.height >= h
-                    && (s.used == 0 || s.height * 2 <= h * 3)
+                    && (s.used == 0 || s.height * 2 <= quantised * 3)
                     && s.free.iter().any(|&(_, fw)| fw >= w)
             })
             .min_by_key(|(_, s)| s.height)
             .map(|(i, _)| i);
-        let quantised = h.next_multiple_of(SHELF_QUANTUM);
         if let Some(i) = best {
             // An empty shelf (often several merged ones) keeps only the
             // height this glyph needs; the rest becomes a new empty shelf
@@ -361,6 +372,9 @@ pub struct GlyphAtlas {
     /// [`Self::clear`].
     rejected: HashMap<GlyphKey, [u32; 2]>,
     generation: u64,
+    /// Set by [`Self::recover_from_full`], cleared by
+    /// [`Self::begin_frame`]: one reset per frame.
+    reset_this_frame: bool,
     stats: AtlasStats,
 }
 
@@ -431,6 +445,7 @@ impl GlyphAtlas {
             entries: HashMap::new(),
             rejected: HashMap::new(),
             generation: 0,
+            reset_this_frame: false,
             stats: AtlasStats::default(),
         }
     }
@@ -489,6 +504,50 @@ impl GlyphAtlas {
     pub fn begin_frame(&mut self) {
         self.sync_fonts();
         self.generation += 1;
+        self.reset_this_frame = false;
+    }
+
+    /// Recovers from [`RenderError::AtlasFull`] on `layer` in the current
+    /// frame: empties the atlas, starts a new generation and re-inserts
+    /// the glyphs used so far this frame (in both layers), tallest first,
+    /// so they pack densely and the rest of the frame has room.
+    ///
+    /// Every [`AtlasSlot`] handed out before the call is invalid after it:
+    /// the caller must look its glyphs up again (they are hits). Counted
+    /// in [`AtlasStats::full_resets`] and [`AtlasStats::cleared`].
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::AtlasFull`] for `layer`, without touching the atlas,
+    /// when this frame was already reset: the frame needs more than one
+    /// layer holds and retrying cannot help. The same error when the
+    /// re-inserted glyphs alone do not fit, and [`RenderError::Gpu`] when
+    /// an upload fails.
+    pub fn recover_from_full(&mut self, gpu: &Gpu, layer: AtlasLayer) -> Result<(), RenderError> {
+        if self.reset_this_frame {
+            return Err(RenderError::AtlasFull(layer));
+        }
+        let current = self.generation;
+        let mut keep: Vec<(GlyphKey, [u32; 2], usize, Rect)> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.last_used == current)
+            .filter_map(|(k, e)| Some((*k, e.slot.size, e.slot.layer.index(), e.rect?)))
+            .collect();
+        // Tallest first, then widest: shelf packing wastes least that way.
+        // Ties break on the old position (unique per layer), so the order
+        // never depends on the map's iteration order.
+        keep.sort_unstable_by_key(|&(_, [w, h], layer, rect)| {
+            (std::cmp::Reverse((h, w)), layer, rect.y, rect.x)
+        });
+        self.clear();
+        self.generation += 1;
+        self.reset_this_frame = true;
+        self.stats.full_resets += 1;
+        for (key, ..) in keep {
+            self.get_or_insert(gpu, key)?;
+        }
+        Ok(())
     }
 
     /// Drops every cached glyph. Texture contents are left in place and
@@ -776,6 +835,17 @@ mod tests {
         packer.release(d);
         assert!(packer.shelves.is_empty());
         assert_eq!(packer.top, 0);
+    }
+
+    #[test]
+    fn glyphs_of_one_height_share_a_shelf() {
+        // A 5-high glyph opens an 8-high (quantised) shelf; the next
+        // 5-high glyphs must join it rather than each open their own.
+        let mut p = ShelfPacker::new(64);
+        let rects: Vec<_> = (0..6).map(|_| p.alloc(10, 5).expect("fits")).collect();
+        assert!(rects.iter().all(|r| r.y == 0), "{rects:?}");
+        assert_eq!(p.shelves.len(), 1);
+        assert_eq!(p.top, 8);
     }
 
     #[test]

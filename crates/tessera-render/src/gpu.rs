@@ -153,8 +153,10 @@ impl Gpu {
 
     /// Records and submits a render pass that clears `view` to `color`.
     ///
-    /// `color` is linear; the GPU encodes it if the view's format is sRGB.
-    /// A validation error (for example a view that is not renderable) is
+    /// `color` is linear and straight; it is written premultiplied
+    /// ([`crate::Rgba::to_clear_color`]), like everything the renderer
+    /// draws, and the GPU encodes it if the view's format is sRGB. A
+    /// validation error (for example a view that is not renderable) is
     /// returned instead of panicking.
     pub fn clear_view(
         &self,
@@ -175,7 +177,7 @@ impl Gpu {
                         depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(color.into()),
+                            load: wgpu::LoadOp::Clear(color.to_clear_color()),
                             store: wgpu::StoreOp::Store,
                         },
                     })],

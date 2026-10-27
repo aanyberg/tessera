@@ -1,10 +1,13 @@
 //! Render into a texture with no window, and read the pixels back.
 //!
-//! This is how CI exercises the clear pass: no display, no surface, just a
-//! `Gpu::headless()` device, a texture, and a mapped staging buffer.
+//! This is how CI exercises the clear pass and the grid passes (the golden
+//! tests): no display, no surface, just a `Gpu::headless()` device, a
+//! texture, and a mapped staging buffer.
 
 use crate::error::RenderError;
+use crate::frame::FrameInput;
 use crate::gpu::Gpu;
+use crate::renderer::Renderer;
 use crate::size::PhysicalSize;
 use crate::theme::Rgba;
 
@@ -113,10 +116,21 @@ impl OffscreenTarget {
         &self.view
     }
 
-    /// Clears the whole target to `color` (linear; encoded if the format is
-    /// sRGB).
+    /// Clears the whole target to `color` (linear, written premultiplied;
+    /// encoded if the format is sRGB).
     pub fn clear(&self, gpu: &Gpu, color: Rgba) -> Result<(), RenderError> {
         gpu.clear_view(&self.view, color)
+    }
+
+    /// Draws `frame` with `renderer` into the whole target; see
+    /// [`Renderer::render`].
+    pub fn render(
+        &self,
+        gpu: &Gpu,
+        renderer: &mut Renderer,
+        frame: &FrameInput<'_>,
+    ) -> Result<(), RenderError> {
+        renderer.render(gpu, &self.view, self.format, self.size, frame)
     }
 
     /// Copies the texture to the CPU and returns tightly packed rows of

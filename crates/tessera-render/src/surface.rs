@@ -3,7 +3,9 @@
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use crate::error::RenderError;
+use crate::frame::FrameInput;
 use crate::gpu::Gpu;
+use crate::renderer::Renderer;
 use crate::size::{LogicalSize, PhysicalSize, sanitize_scale};
 use crate::theme::Rgba;
 
@@ -238,39 +240,86 @@ impl RenderSurface {
         &self.config
     }
 
-    /// Clears the next swapchain image to `color` and presents it.
+    /// Clears the next swapchain image to `color` (written premultiplied,
+    /// see [`Gpu::clear_view`]) and presents it.
     ///
-    /// This is the frontend-facing clear pass: the macOS shell and the dev
-    /// window call it from their display-link callback until the real grid
-    /// passes exist. An outdated or lost swapchain is reconfigured and
-    /// retried once; a suboptimal one is still presented and reported as
-    /// [`FrameStatus::Suboptimal`] so the caller can resize.
+    /// This is the frontend-facing clear pass, for frames with nothing to
+    /// draw yet; [`Self::render`] draws the grid. An outdated or lost
+    /// swapchain is reconfigured and retried once; a suboptimal one is
+    /// still presented and reported as [`FrameStatus::Suboptimal`] so the
+    /// caller can resize.
     pub fn clear(&mut self, gpu: &Gpu, color: Rgba) -> Result<FrameStatus, RenderError> {
-        if !self.configured {
+        self.present_with(gpu, |gpu, view| gpu.clear_view(view, color))
+    }
+
+    /// Draws `frame` with `renderer` into the next swapchain image and
+    /// presents it.
+    ///
+    /// The frontend calls this from its display-link callback. Swapchain
+    /// handling is the same as for [`Self::clear`]. The renderer's backing
+    /// scale should match [`Self::scale`] (see
+    /// [`Renderer::set_font_size`]).
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::SurfaceLost`] when the swapchain cannot be
+    /// recovered, and whatever [`Renderer::render`] returns; the acquired
+    /// image is then dropped without being presented.
+    pub fn render(
+        &mut self,
+        gpu: &Gpu,
+        renderer: &mut Renderer,
+        frame: &FrameInput<'_>,
+    ) -> Result<FrameStatus, RenderError> {
+        let (format, size) = (self.format(), self.size());
+        self.present_with(gpu, |gpu, view| {
+            renderer.render(gpu, view, format, size, frame)
+        })
+    }
+
+    /// Acquires the next swapchain image, runs `draw` on it and presents
+    /// it.
+    fn present_with(
+        &mut self,
+        gpu: &Gpu,
+        draw: impl FnOnce(&Gpu, &wgpu::TextureView) -> Result<(), RenderError>,
+    ) -> Result<FrameStatus, RenderError> {
+        let Some((frame, suboptimal)) = self.acquire(gpu)? else {
             return Ok(FrameStatus::Skipped);
+        };
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        draw(gpu, &view)?;
+        gpu.queue().present(frame);
+        Ok(if suboptimal {
+            FrameStatus::Suboptimal
+        } else {
+            FrameStatus::Presented
+        })
+    }
+
+    /// The next swapchain image and whether it is suboptimal, or `None`
+    /// when the frame should be skipped.
+    fn acquire(&mut self, gpu: &Gpu) -> Result<Option<(wgpu::SurfaceTexture, bool)>, RenderError> {
+        if !self.configured {
+            return Ok(None);
         }
-        let mut suboptimal = false;
         let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) => t,
-            wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
-                suboptimal = true;
-                t
-            }
+            wgpu::CurrentSurfaceTexture::Success(t) => (t, false),
+            wgpu::CurrentSurfaceTexture::Suboptimal(t) => (t, true),
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return Ok(FrameStatus::Skipped);
+                return Ok(None);
             }
             wgpu::CurrentSurfaceTexture::Outdated
             | wgpu::CurrentSurfaceTexture::Lost
             | wgpu::CurrentSurfaceTexture::Validation => {
                 self.apply(gpu);
                 match self.surface.get_current_texture() {
-                    wgpu::CurrentSurfaceTexture::Success(t) => t,
-                    wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
-                        suboptimal = true;
-                        t
-                    }
+                    wgpu::CurrentSurfaceTexture::Success(t) => (t, false),
+                    wgpu::CurrentSurfaceTexture::Suboptimal(t) => (t, true),
                     wgpu::CurrentSurfaceTexture::Timeout
-                    | wgpu::CurrentSurfaceTexture::Occluded => return Ok(FrameStatus::Skipped),
+                    | wgpu::CurrentSurfaceTexture::Occluded => return Ok(None),
                     wgpu::CurrentSurfaceTexture::Outdated
                     | wgpu::CurrentSurfaceTexture::Lost
                     | wgpu::CurrentSurfaceTexture::Validation => {
@@ -279,16 +328,7 @@ impl RenderSurface {
                 }
             }
         };
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        gpu.clear_view(&view, color)?;
-        gpu.queue().present(frame);
-        Ok(if suboptimal {
-            FrameStatus::Suboptimal
-        } else {
-            FrameStatus::Presented
-        })
+        Ok(Some(frame))
     }
 }
 
