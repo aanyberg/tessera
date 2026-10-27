@@ -6,9 +6,11 @@
 - Commits follow [Conventional Commits](https://www.conventionalcommits.org):
   `feat(grid): reflow on resize`, `fix(vt): handle empty OSC`, `docs: …`.
   Scopes are crate names without the `tessera-` prefix, or `app` for Swift.
-- PRs are squash-merged; the PR title becomes the commit message and must be a Conventional Commit. Wave PRs
-  from the agent team (`wave/<milestone>-<n>`) are rebase-merged instead so each task's commit reaches the
-  release notes; see `docs/software-factory.md`.
+- PRs are squash-merged with an explicit Conventional Commit subject
+  (`gh pr merge <pr> --squash --subject "<type>(<scope>): <title> (#<pr>)"`).
+  Wave PRs from the agent team (`wave/<milestone>-<n>`) are rebase-merged
+  instead so each task's commit reaches the release notes; see
+  `docs/software-factory.md`.
 - Architecture changes get an ADR in `docs/adr/` in the same PR.
 
 ## Code

@@ -22,6 +22,7 @@ The full runbook is `docs/software-factory.md`. Read it before you delegate work
    through a pipe.
 7. **Integration and merging.** `integrator` merges one branch at a time into local main. Wave PRs are
    rebase-merged, all other PRs squash-merged with a conventional title. Resync local main with `origin/main`
-   after every merge, using the runbook's rule for that PR kind. Changes outside a wave follow "Changes outside a
+   after every merge, using the runbook's rule for that PR kind; if `origin/main` moves under an open PR, follow
+   "Base moved" (never GitHub's Update branch for a wave PR). Changes outside a wave follow "Changes outside a
    wave" in the runbook.
 8. **Labels.** Wave numbers are global and never reset across milestones.

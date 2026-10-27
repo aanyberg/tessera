@@ -52,8 +52,9 @@ filter_unconventional = true
 require_conventional = false
 split_commits = false
 commit_preprocessors = [
-    # 0.1.0 wave PRs #67 and #70 were squash-merged with "<version> wave <n>: ..." titles before wave PRs
-    # were rebase-merged; count them as features so they appear in the notes.
+    # Wave PRs squash-merged with a "<version> wave <n>: ..." title (0.1.0's #67 and #70, before wave PRs
+    # were rebase-merged) count as features. Deliberately general: it is also a safety net if a future wave
+    # PR is squash-merged by mistake.
     { pattern = '^(\d+\.\d+\.\d+ wave \d+): ', replace = "feat: ${1}: " },
     # Link "(#123)" PR/issue references.
     { pattern = '\((\w+\s)?#([0-9]+)\)', replace = "([#${2}](<REPO>/issues/${2}))" },
