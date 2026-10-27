@@ -55,16 +55,22 @@ on the dead inode and nothing can wake the thread when the directory comes
 back, so the native backend polls at `WatchOptions::poll_interval` until
 the directory exists again, re-registers it, and returns to sleeping on
 kernel events. Registrations are made from handles the backend owns, and a
-handle whose link count is zero right after arming (unlinked between the
-open and the `kevent` call, which can never fire `NOTE_DELETE`) is treated
-as missing.
+handle whose path no longer names its inode right after arming (removed or
+replaced between the open and the `kevent` call, which can never fire
+`NOTE_DELETE`) is treated as missing. The check compares device and inode
+numbers rather than the link count, since APFS still reports two links for
+an open directory after `rmdir`.
 
 A `config.toml` that is a symlink (into a dotfiles checkout, say) is
 followed to its target: the directory holding the final target is
 registered as well, so a target deleted and recreated by `git checkout` or
 `rm` plus rewrite is seen even though nothing in the configuration
 directory changes. While that directory is missing the backend polls, as
-for a missing root. The file's type is checked with `stat` before it is
+for a missing root. The file is registered last, after the root and the
+target's directory: re-registering a directory drops its pending events,
+so a rename-save of the target landing between opening the file and
+re-arming that directory would otherwise leave the file watch on the old
+inode and miss the next in-place write. The file's type is checked with `stat` before it is
 opened, so a FIFO in place of `config.toml` cannot block the watcher.
 
 A path that exists but cannot be registered (`config.toml` with mode 000,
