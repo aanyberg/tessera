@@ -87,18 +87,20 @@ appear in the notes.
   git cherry origin/main main`. Every line must start with `-` (each local commit has an equivalent patch
   upstream); only then run `git reset --hard origin/main`. Any `+` line means a local commit is not upstream: stop
   and investigate instead of resetting.
-  A `+` line can be a false alarm when another PR touched the same lines; confirm with `git diff origin/main main`
-  (must be empty) and `gh pr view <pr> --json state` (must be `MERGED`) before resetting.
+  A `+` line together with an empty `git diff origin/main main` and `gh pr view <pr> --json state` showing
+  `MERGED` (for example a wave PR squash-merged by mistake) is safe to reset; anything else is not.
 
 **Base moved.** `main` is protected with strict up-to-date checks, so an open PR cannot merge after `origin/main`
 moves.
 
 - Wave PR: never use GitHub's "Update branch" (it moves the wave branch away from local main). Instead run
   `git fetch origin && git switch main && git rebase origin/main`, re-run `scripts/quality-gate.sh` on main, then
-  `git push --force-with-lease origin main:refs/heads/wave/<milestone>-<n>`, wait for CI, and rebase-merge.
+  `git push --force-with-lease origin main:refs/heads/wave/<milestone>-<n>`, wait for CI, and rebase-merge. If
+  the rebase stops on a conflict, resolve it or run `git rebase --abort` and escalate; never push a partially
+  rebased main.
 - Squash PR: `gh pr update-branch <pr>`, wait for CI, and merge.
 - If a squash PR lands while local main carries integrated wave commits, do not run the `--ff-only` resync (it
-  fails); the wave rule above takes local main onto `origin/main`.
+  fails); rebase local main onto `origin/main` as in the wave PR bullet above, before pushing the wave.
 
 ## Running a wave
 
@@ -108,9 +110,10 @@ implementer disagree, and they hide progress from the user.
 
 1. **Plan.** `milestone-lead` turns open issues into waves of five parallel-safe issues and labels each issue
    `wave:<n>`. Wave numbers are global and never reset across milestones: the next wave is the highest existing
-   `wave:<n>` plus one, or 3 when no `wave:<n>` label exists (0.1.0 used waves 1 and 2 before labels existed). It returns one brief per issue (files,
-   API names, ADR numbers, deps and do-not-touch lists pre-assigned). Decisions that constrain a later issue,
-   and findings deferred to it, go in a comment on that issue. There is no task-board file in the repo.
+   `wave:<n>` plus one, or 3 when no `wave:<n>` label exists (0.1.0 used waves 1 and 2 before labels existed). It
+   returns one brief per issue (files, API names, ADR numbers, deps and do-not-touch lists pre-assigned). Decisions
+   that constrain a later issue, and findings deferred to it, go in a comment on that issue. There is no task-board
+   file in the repo.
 2. **Task list.** The lead session creates one shared task per issue in the wave, carrying the brief.
 3. **Implement.** One teammate per issue claims its task and implements it in its own worktree
    (`../tessera-worktrees/wave-<n>/task-<issue>`, branch `task/<issue>-<slug>`) as `rust-implementer`,
@@ -143,16 +146,17 @@ clean context.
 
 Hotfixes, CI fixes and factory changes take the same loop at a smaller size, still before any push:
 
-1. Precondition: `git fetch origin && git rev-list --count origin/main..main` prints `0`, meaning no wave is
-   integrated or open but unmerged. If it does not, land the open wave PR first; do not cut a hotfix from a main
-   that carries unmerged or unresynced wave commits. Then resync with the rule for the PR that last merged, and branch from local main in its own
-   worktree, so every verifier's `main...HEAD` is exactly the change.
+1. Precondition: `git fetch origin && git rev-list --count origin/main..main` prints `0`. If it does not, either
+   land the open wave PR first or, if it already merged, run the wave resync rule. Never cut a hotfix from a main
+   that carries unmerged or unresynced wave commits. Then resync with the rule for the PR that last merged, and
+   branch from local main in its own worktree, so every verifier's `main...HEAD` is exactly the change.
 2. Implement with the agent for the area (`rust-implementer`, `swift-implementer`, `release-engineer`,
    `docs-writer`), or directly by the lead for agent definitions and docs.
 3. A fresh critic for the area; revise until `ship`.
 4. `quality-gate`. Add `adversarial-tester` when the change touches product code (`crates/`, `apps/macos/`)
    other than tests; skip it for docs, agent definitions and test-only changes.
-5. `git push -u origin <branch>`, then `gh pr create --title "<conventional title>" --body-file <file>` (with
+5. `git push -u origin <branch>`, then
+   `gh pr create --base main --head <branch> --title "<conventional title>" --body-file <file>` (with
    `Closes #<issue>` where one exists). When CI is green, the lead merges it with
    `gh pr merge <pr> --squash --subject "<conventional title> (#<pr>)"`, then resyncs.
 
