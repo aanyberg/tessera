@@ -187,7 +187,19 @@ impl Performer<'_> {
 
 impl vte::Perform for Performer<'_> {
     fn print(&mut self, c: char) {
-        (self.sink)(Action::Print(c));
+        // `vte` dispatches a UTF-8 encoded C1 control (U+0080..=U+009F) as
+        // `execute` when both bytes arrive in one `advance` call but as
+        // `print` when the sequence straddles two calls. Normalise to
+        // `Execute` so the action stream never depends on chunk boundaries;
+        // this also matches xterm, which honours 8-bit C1 controls in UTF-8
+        // mode.
+        if ('\u{80}'..='\u{9f}').contains(&c) {
+            // Range check above guarantees the value fits in a byte.
+            #[allow(clippy::cast_possible_truncation)]
+            (self.sink)(Action::Execute(c as u8));
+        } else {
+            (self.sink)(Action::Print(c));
+        }
     }
 
     fn execute(&mut self, byte: u8) {
@@ -534,6 +546,24 @@ mod tests {
     fn dcs_payload_drops_high_bytes() {
         let out = parse(b"\x1bPq\xc3\xa9ab\x1b\\");
         assert_eq!(out[1], Action::DcsData(b"ab".to_vec()));
+    }
+
+    /// A UTF-8 encoded C1 control decodes to `Execute` whether or not the
+    /// two bytes arrive in the same `advance` call.
+    #[test]
+    fn utf8_c1_control_is_execute_regardless_of_split() {
+        let whole = parse(b"a\xc2\x86b");
+        let mut parser = Parser::new();
+        let mut split = Vec::new();
+        parser.advance(b"a\xc2", |a| split.push(a));
+        parser.advance(b"\x86b", |a| split.push(a));
+        let expected = vec![
+            Action::Print('a'),
+            Action::Execute(0x86),
+            Action::Print('b'),
+        ];
+        assert_eq!(whole, expected);
+        assert_eq!(split, expected);
     }
 
     #[test]
