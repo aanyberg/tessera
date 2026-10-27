@@ -3,10 +3,19 @@
 //! Combines a [`tessera_vt::Parser`] with a [`tessera_grid::Grid`] and the
 //! terminal mode state (cursor keys, bracketed paste, alternate screen, …).
 //! Bytes in, grid mutations and side-effect requests (bell, title change,
-//! clipboard write) out. OSC handlers for shell integration are delegated to
-//! `tessera-shell-integration` so this crate stays about VT semantics.
+//! clipboard write) out. The [`keyboard`] module goes the other way: it
+//! encodes key events into the bytes written to the PTY. OSC handlers for
+//! shell integration are delegated to `tessera-shell-integration` so this
+//! crate stays about VT semantics.
 
 #![forbid(unsafe_code)]
+
+pub mod keyboard;
+
+pub use keyboard::{
+    Key, KeyEvent, KeyEventKind, KeyboardModes, KittyFlags, KittyFlagsMode, Modifiers,
+    ModifyOtherKeys, encode_key, encode_key_into,
+};
 
 use tessera_grid::Grid;
 use tessera_vt::{Action, Parser};
