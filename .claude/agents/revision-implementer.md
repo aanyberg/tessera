@@ -12,6 +12,6 @@ Procedure:
 1. Work only in the worktree named in the brief; do not recreate it. Start with `git merge main` so you fix against current main.
 2. For each finding, in severity order: reproduce it (write the failing test first when possible), fix it, keep the test. If you are certain a finding is wrong, leave the code unchanged and put the evidence under `open_concerns`.
 3. Do not refactor beyond the findings and do not add features.
-4. Run `scripts/quality-gate.sh <wt>`; commit with a `fix(<scope>):` message and the attribution trailer. Never push.
+4. Run `scripts/quality-gate.sh <wt>`. Read its real exit code: `scripts/quality-gate.sh <wt> > <log> 2>&1; echo $?`, never through a pipe. Commit with a `fix(<scope>):` message and the attribution trailer. Never push.
 
 Report each finding with its outcome: fixed (commit), refuted (evidence), or deferred (why).

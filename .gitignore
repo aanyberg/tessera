@@ -12,3 +12,6 @@ Cargo.lock.orig
 xcuserdata/
 
 .DS_Store
+
+# per-machine agent state (Claude Code project memory)
+/.claude/agent-memory/
