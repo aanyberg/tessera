@@ -624,12 +624,12 @@ mod native {
                 *slot = Some(handle);
                 Ok(())
             }
-            armed => {
+            named => {
                 // Not armed after all: drop the queue's entry before the
                 // handle closes, so no later `watch()` re-submits a closed
                 // (or reused) descriptor.
                 let _ = queue.remove_file(&handle, EventFilter::EVFILT_VNODE);
-                armed.map(|_| ())
+                named.map(|_| ())
             }
         }
     }
@@ -641,12 +641,12 @@ mod native {
     /// directory removed between the open and the registration would
     /// otherwise look armed while nothing watches the path.
     fn still_names(path: &Path, handle: &File) -> std::io::Result<bool> {
-        let armed = handle.metadata()?;
-        if armed.nlink() == 0 {
+        let opened = handle.metadata()?;
+        if opened.nlink() == 0 {
             return Ok(false);
         }
         match std::fs::metadata(path) {
-            Ok(current) => Ok(current.dev() == armed.dev() && current.ino() == armed.ino()),
+            Ok(current) => Ok(current.dev() == opened.dev() && current.ino() == opened.ino()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e),
         }
@@ -694,8 +694,8 @@ mod native {
             Ok((native, stop))
         }
 
-        /// Re-registers the directory, the file and (for a symlinked file)
-        /// the target's directory, so all follow their current inodes.
+        /// Re-registers the directory, (for a symlinked file) the target's
+        /// directory and then the file, so all follow their current inodes.
         /// Every slot is attempted even when an earlier one fails, so the
         /// directory watch stays armed while the file is unreadable; the
         /// first failure is returned.
@@ -711,12 +711,6 @@ mod native {
                 &mut self.root_handle,
                 &self.root,
                 Kind::Dir,
-            ));
-            note(register(
-                &mut self.queue,
-                &mut self.file_handle,
-                &self.file,
-                Kind::File,
             ));
             self.link_dir = link_dir_of(&self.file);
             match &self.link_dir {
@@ -738,6 +732,19 @@ mod native {
                     }
                 }
             }
+            // The file goes last: re-registering a directory drops its
+            // pending events, so a rename-save landing between opening the
+            // file and re-arming the directory it was replaced in would go
+            // unseen, and the file handle would miss the new inode's writes.
+            // With every directory armed first, such a rename either
+            // precedes the open (which then sees the new inode) or raises an
+            // event on an armed directory.
+            note(register(
+                &mut self.queue,
+                &mut self.file_handle,
+                &self.file,
+                Kind::File,
+            ));
             failed.map_or(Ok(()), Err)
         }
 
@@ -883,6 +890,27 @@ mod native {
             let handle = File::open(&path).unwrap();
             std::fs::remove_file(&path).unwrap();
             assert!(!still_names(&path, &handle).unwrap(), "unlinked");
+        }
+
+        #[test]
+        fn a_symlink_target_replaced_after_opening_is_no_longer_named() {
+            let base = tempfile::tempdir().unwrap();
+            let target_dir = base.path().join("dotfiles");
+            std::fs::create_dir(&target_dir).unwrap();
+            let target = target_dir.join("config.toml");
+            std::fs::write(&target, "").unwrap();
+            let link = base.path().join("config.toml");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let handle = File::open(&link).unwrap();
+            assert!(
+                still_names(&link, &handle).unwrap(),
+                "opened through the link"
+            );
+
+            let tmp = target_dir.join("config.toml.new");
+            std::fs::write(&tmp, "").unwrap();
+            std::fs::rename(&tmp, &target).unwrap();
+            assert!(!still_names(&link, &handle).unwrap(), "target replaced");
         }
     }
 }

@@ -66,7 +66,11 @@ followed to its target: the directory holding the final target is
 registered as well, so a target deleted and recreated by `git checkout` or
 `rm` plus rewrite is seen even though nothing in the configuration
 directory changes. While that directory is missing the backend polls, as
-for a missing root. The file's type is checked with `stat` before it is
+for a missing root. The file is registered last, after the root and the
+target's directory: re-registering a directory drops its pending events,
+so a rename-save of the target landing between opening the file and
+re-arming that directory would otherwise leave the file watch on the old
+inode and miss the next in-place write. The file's type is checked with `stat` before it is
 opened, so a FIFO in place of `config.toml` cannot block the watcher.
 
 A path that exists but cannot be registered (`config.toml` with mode 000,
