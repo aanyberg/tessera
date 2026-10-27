@@ -1,9 +1,9 @@
 # Software factory
 
-Tessera milestones are delivered by a fixed roster of project agents in `.claude/agents/`, orchestrated by the
-`milestone-wave` workflow in `.claude/workflows/`. Each agent has one responsibility, a pinned model and effort,
-and a tool allowlist that matches that responsibility. Change the roster by editing the agent file; the workflow
-refers to agents by name only.
+Tessera milestones are delivered by a fixed roster of project agents in `.claude/agents/`, run as a Claude Code
+agent team: the lead session owns the shared task list and delegates each issue to a teammate. Each agent has one
+responsibility, a pinned model and effort, and a tool allowlist that matches that responsibility. Change the roster
+by editing the agent file; the lead refers to agents by name only.
 
 ## Roster
 
@@ -52,10 +52,28 @@ milestone-lead ─ brief ─► [spec-researcher] ─► rust-|swift-|release-im
 
 ## Running a wave
 
-```
-Workflow name: milestone-wave
-args: { repo, wtRoot, attribution, tasks: [brief, ...] }   # briefs come from milestone-lead; attribution = the session's commit trailer lines
-```
+Waves run as an agent team (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, set in `.claude/settings.local.json`).
+Scripted workflows are not used for waves: they cannot apply judgement when a step fails or a critic and an
+implementer disagree, and they hide progress from the user.
 
-The wave result is the input for `flow-analyst`, whose retro lands in `docs/retros/`. Agent definitions change
-only through a retro proposal or an explicit decision; record the reason in the commit message.
+1. **Plan.** `milestone-lead` turns open issues into waves of five parallel-safe issues and writes the task board
+   `TASKS.md` with one brief per issue (files, API names, ADR numbers, deps and do-not-touch lists pre-assigned).
+2. **Task list.** The lead session creates one shared task per issue in the wave, carrying the brief.
+3. **Implement.** One teammate per issue claims its task and implements it in its own worktree
+   (`../tessera-worktrees/wave-<n>/task-<issue>`, branch `task/<issue>-<slug>`) as `rust-implementer`,
+   `swift-implementer` or `release-engineer` by area. Spec-heavy issues get a `spec-researcher` pass first; if the
+   researcher fails, the lead decides whether to retry or proceed from the issue text.
+4. **Critique.** For every round the lead spawns a fresh one-shot critic subagent (`rust-critic`, `swift-critic`
+   or `code-critic` by area) with no memory of earlier rounds. On `revise` the owning teammate, or a
+   `revision-implementer`, fixes or refutes each finding. The loop is capped at 5 rounds; disputes go to
+   `milestone-lead`, whose decision is added to the brief.
+5. **Verify.** After `ship`, the lead runs `quality-gate` and `adversarial-tester` in parallel as one-shot
+   subagents. Any major finding fails the gate; at most 2 fix cycles.
+6. **Merge.** Verified branches go to `integrator` one at a time; it squash-merges into local main with the
+   session's attribution trailer, re-runs the gate and removes the worktree. Nothing is pushed without the user.
+7. **Close out.** The lead updates `TASKS.md`, starts the next wave, and hands the wave's transcripts to
+   `flow-analyst`, whose retro lands in `docs/retros/`.
+
+Critics and verifiers are always one-shot subagents, never long-lived teammates, so every review starts from a
+clean context. Agent definitions change only through a retro proposal or an explicit decision; record the reason
+in the commit message.

@@ -52,8 +52,7 @@ rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
 ## Development with agents
 
-Milestone work runs through a fixed roster of project agents in `.claude/agents/` and the
-`milestone-wave` workflow; see [`docs/software-factory.md`](docs/software-factory.md).
+Milestone work runs as an agent team over a fixed roster of project agents in `.claude/agents/`; see [`docs/software-factory.md`](docs/software-factory.md).
 
 ## Roadmap
 
