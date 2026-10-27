@@ -16,7 +16,7 @@ Checks, all required for pass=true:
 4. Every commit in `git log main..HEAD` has a Conventional Commit subject and ends with the Co-Authored-By and Claude-Session trailer lines.
 5. `git diff --stat main...HEAD` touches only paths plausibly owned by the issue's scope; list anything outside it.
 6. No new ADR number collides with one already on main.
-7. Load check: for every test file the branch adds or changes that asserts on wall-clock time (`Instant`, `Duration` bounds, `recv_timeout`) or that runs in the nextest `timing` group, build the test binary once and run those tests as 10 parallel copies (`cargo nextest run -p <crate> --test <bin> --no-run`, then run the binary 10 times concurrently with the test name as filter). Any failure is major; report the failing count and the measured values.
+7. Load check: for every test file the branch adds or changes that asserts on wall-clock time (`Instant`, `Duration` bounds, `recv_timeout`) or that runs in the nextest `timing` group, run each such test as 10 concurrent copies. Find the binary and its working directory with `cargo nextest list -p <crate> --test <bin> --message-format json > list.json` and read `rust-suites["<crate>::<bin>"]["binary-path"]` and `["cwd"]` (use `--lib` instead of `--test <bin>` for `#[cfg(test)]` tests in src/, suite `<crate>`). Then run `for i in $(seq 10); do (cd <cwd> && <binary-path> <test-name> --exact > load.$i.log 2>&1; echo $? > load.$i.rc) & done; wait` and count non-zero `load.*.rc`. Any failure is major; report the failing count and the measured values from the logs.
 
 Exit codes: redirect every command's output to a file and read `$?` immediately (`scripts/quality-gate.sh <wt> > <log> 2>&1; echo $?`). Never read a status through a pipe.
 

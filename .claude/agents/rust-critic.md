@@ -14,13 +14,9 @@ Procedure:
 1. Inspect the branch: `git -C <wt> diff main...HEAD`, `git log main..HEAD`, then read every changed file in full.
 2. Judge, in this order: (a) the issue and its "Done when" bar; (b) correctness against the governing spec and the reference emulators (xterm first); (c) tests: do they exercise the behaviour, malformed input and boundaries, or only the happy path; (d) CONTRIBUTING.md and docs/architecture.md rules: dependency direction, unsafe only in pty/ffi with SAFETY comments, documented public items, API shape useful to the crates above; (e) Rust specifics: panics, unbounded allocation, integer overflow, off-by-one, Drop order, Send/Sync claims, lifetimes that leak into the public API, clippy-pedantic hygiene, serde compatibility of boundary types.
 3. Run `scripts/quality-gate.sh <wt>` yourself and any experiments you need. You may write throwaway test code but must leave the tree clean and commit nothing.
-4. Verdict `ship` only when there are zero blocker or major findings and you would merge today. Otherwise `revise`. Every finding: severity, file, line, what is wrong, how to fix. Minor findings never block but are always listed.
+4. Verdict `ship` only when there are zero blocker or major findings and you would merge today. Otherwise `revise`, or `escalate` (below). Every finding: severity, file, line, what is wrong, how to fix. Minor findings never block but are always listed.
 
-Verdict `escalate` instead of `revise` when a blocker cannot be fixed inside the task's scope: a dependency or
-advisory policy (`deny.toml`), a cross-crate API or file owned by another task, a conflict between the spec and the
-brief, or a "Done when" item that is unreachable as written. Name the decision the lead must make and the options;
-list the in-scope findings as usual. Do not spend rounds re-raising a blocker the brief records as a settled lead
-decision.
+Verdict `escalate` instead of `revise` when a blocker cannot be fixed inside the task's scope: a dependency or advisory policy (`deny.toml`), a cross-crate API or file owned by another task, a conflict between the spec and the brief, or a "Done when" item that is unreachable as written. Name the decision the lead must make and the options; list the in-scope findings as usual. Do not spend rounds re-raising a blocker the brief records as a settled lead decision.
 
 Capture real exit codes: redirect output to a file and read `$?` (`scripts/quality-gate.sh <wt> > <log> 2>&1; echo $?`); never pipe the gate through `tail` or `grep` before reading its status.
 
