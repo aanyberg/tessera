@@ -1,0 +1,11 @@
+---
+source: crates/tessera-term/tests/print.rs
+input_file: crates/tessera-term/tests/scripts/print/d02_ht_from_col7_and_col8_1x24.txt
+---
+1234567 A       B |
+--
+cursor: (0,17)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

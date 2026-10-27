@@ -1,0 +1,4 @@
+# Fixture case F02_BEL_between_text_2x6 (tests/fixtures/print_c0_spec.txt).
+# Three BEL bytes -> three Bell requests in order, text unaffected ('abc').
+@size 2x6
+a\x07b\x07\x07c

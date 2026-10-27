@@ -1,0 +1,1097 @@
+# =============================================================================
+# tessera-term: Print + C0 control fixture  (issue #5, milestone 0.1.0)
+# crates/tessera-term/tests/fixtures/print_c0_spec.txt
+#
+# Evidence file for the implementer and the critic. Every case cites its source.
+# It is test DATA, not a test: tests/print.rs + tests/common/mod.rs are written
+# from it. Expected screens were produced by an independent Python model of xterm
+# semantics and then cross-checked (64/64 cases) against a throw-away Rust probe
+# that drives the real tessera-vt Parser and tessera-grid Grid using the
+# "FIXED" design in DECISIONS below. The same probe run with the brief taken
+# literally fails 4 cases (A06, G05, H05, H10): see "ISSUE TEXT CORRECTIONS".
+#
+# PRIMARY SOURCES
+#   xterm ctlseqs   https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+#                   (VT100 Mode > Single-character functions; SM/DECSET lists)
+#   xterm source    https://github.com/ThomasDickey/xterm-snapshots (master)
+#                   charproc.c  dotext() WrapLine() CASE_BS CASE_TAB CASE_VMOT
+#                               CASE_BELL CASE_SUB CASE_ENQ resetCharsets()
+#                   cursor.c    CursorBack() CarriageReturn() xtermIndex()
+#                   tabs.c      TabToNextStop()
+#                   util.c      WriteText()  (INSERT -> InsertChar)
+#                   VTPrsTbl.c  ansi_table[]  (ground-state action per byte)
+#   DEC VT100 UG    https://vt100.net/docs/vt100-ug/chapter3.html  (3.3.1, Table 3-10)
+#   DEC VT510 RM    https://vt100.net/docs/vt510-rm/DECAWM.html
+#                   https://vt100.net/docs/vt510-rm/IRM.html
+#   Alacritty       https://github.com/alacritty/alacritty/blob/master/alacritty_terminal/src/term/mod.rs
+#                   (input, put_tab, backspace)
+#   WezTerm         https://github.com/wezterm/wezterm/blob/main/term/src/terminalstate/
+#                   performer.rs (Backspace, Linefeed, CarriageReturn), mod.rs (c0_horizontal_tab)
+#   kitty           https://github.com/kovidgoyal/kitty/blob/master/kitty/screen.c
+#                   (screen_tab writes tab markers into blank cells; kitty's pending-wrap model
+#                   differs from the grid's, so it is not used as an oracle for pending-wrap rows)
+#
+# ----------------------------------------------------------------------------
+# SCRIPT / STEP SYNTAX (what run_script must decode)
+#   Escapes in `step:` payloads:  \xNN raw byte   \r \n \t   \\ backslash
+#                                 \u{H..} one Unicode scalar, UTF-8 encoded
+#                                 (needed for C1 controls: tessera-vt only sees U+0080..U+009F
+#                                  as Execute when they arrive UTF-8 encoded)
+#                                 everything else is literal. Payloads never contain '|' or a
+#                                 trailing '\' as text.
+#   step kinds:
+#     feed <payload>             one Terminal::advance call with the decoded bytes
+#     feed_bytewise <payload>    one advance call PER BYTE (chunk-boundary independence)
+#     set auto_wrap true|false   Terminal::set_auto_wrap  (CSI ? 7 h/l arrives with #8)
+#     set insert_mode true|false Terminal::set_insert_mode (CSI 4 h/l arrives with #8)
+#   Steps run in order on one Terminal::new(rows, cols). Mode toggles cannot be written as
+#   escape sequences in #5, so the script files need a harness-level directive, recommended:
+#   a line `@set auto_wrap off` / `@set insert_mode on` between payload lines (see D6).
+#
+# SCREEN RENDERING (the string run_script returns / insta snapshots)
+#   one line per grid row, top to bottom, each terminated by '\n':
+#     1. cell chars, one per column (a blank cell is ' ')
+#     2. if the cursor is on this row, insert '|' IMMEDIATELY AFTER the cursor's cell, i.e. at
+#        string index cursor.col + 1.  (Cursor on blank col 0 of an empty row renders " |".)
+#     3. strip trailing ' ' characters (after step 2, so '|' anchors the line)
+#     4. if Line::wrapped, append '\'
+#   Rows below are written with a leading '>' that is NOT part of the line (so empty rows and
+#   leading blanks are unambiguous).  `cursor` is 0-based (row,col) = grid.cursor(); the issue
+#   text quotes 1-based ("row 2 col 2" == (1,1)).  `pending_wrap` is grid.pending_wrap() and is
+#   NOT visible in the render, so each case lists it explicitly (D6 recommends a footer line in
+#   the snapshot so it is pinned too).  `scrollback` is what Grid::scrollback_len() /
+#   scrollback_line(0) must report (text trimmed of trailing blanks, wrapped flag).
+#
+# TERMINAL DEFAULTS asserted by H08: auto_wrap() == true, insert_mode() == false.
+# ----------------------------------------------------------------------------
+# DECISIONS FOR THE MILESTONE LEAD (recommended option first)
+#   D1  HT while pending wrap is armed (A06).
+#       xterm tabs.c TabToNextStop() and WezTerm c0_horizontal_tab() leave the pending flag
+#       alone; Alacritty put_tab() wraps immediately; the brief's `grid.tab_forward(1)` CLEARS
+#       it. Recommend xterm/WezTerm: in control::execute, `if grid.pending_wrap() { /* no-op:
+#       pending implies cursor is on the last column, nothing to tab to */ } else {
+#       grid.tab_forward(1) }`. Needs no grid change.
+#   D2  IRM + pending wrap (H05, H10).  grid.insert_chars() clears pending_wrap, so the brief's
+#       "Print first calls insert_chars(1)" inserts at the LAST column of the OLD row instead of
+#       wrapping. xterm wraps first (dotext -> WrapLine, then WriteText -> InsertChar).
+#       Recommend, using only the public grid API, when insert_mode && pending_wrap &&
+#       auto_wrap: `let row = grid.cursor().row; grid.line_mut(row).unwrap().wrapped = true;
+#       grid.carriage_return(); grid.line_feed();` and only then insert_chars(1) + put_char.
+#       (Duplicates Grid::put_cell's wrap step; suggest a follow-up grid method
+#       `resolve_pending_wrap()` owned by whoever next touches grid.rs.)  With auto_wrap off the
+#       existing goto(row, cols-1) path is used and insert_chars(1) there just replaces the cell.
+#   D3  SUB (0x1A) / CAN (0x18) in ground state (G04).  xterm (decTerminalID >= 100, the
+#       default) PRINTS U+2592 (U+2426 for id > 200) for SUB; Alacritty, kitty, WezTerm ignore.
+#       Recommend ignore (matches the brief). Only intentional xterm divergence here.
+#   D4  C1 controls arrive as Action::Execute(0x80..=0x9F) (G06).  #5 ignores them as briefed;
+#       whoever wires ESC D/E/H/M (IND/NEL/HTS/RI) should make Execute(0x84/0x85/0x88/0x8D) call
+#       the same handlers so the two paths cannot drift. Not blocking #5.
+#   D5  LNM (CSI 20 h) is not in the brief's API: LF/VT/FF never CR in #5 (E01 pins the default
+#       'off' behaviour). #8 needs a `newline_mode` flag consumed by control::execute.
+#   D6  Harness shape (the brief fixes only `run_script(bytes, rows, cols) -> String`).
+#       Recommend: (a) append a footer `cursor=(r,c) pending_wrap=bool` to the snapshot text
+#       because pending wrap is the point of this issue and the '|' cannot show it;
+#       (b) script files hold `@set ...` directive lines for mode toggles plus a `@size RxC`
+#       line, with a second helper `run_script_file(path) -> String` that parses them and calls
+#       run_script's internals; (c) every script is executed twice, whole and byte-by-byte, and
+#       both renders must be identical (case I01, any proptest); (d) the script-text decoder
+#       must reject unknown escapes (panic) so typos do not silently print backslashes.
+#   D7  Pending wrap across a DECAWM toggle (not a row; behaviour is not chunk-stable in xterm).
+#       The grid always arms pending wrap, set_auto_wrap never touches it, and the NEXT print
+#       applies the CURRENT mode (B03 pins on->off). off->on after an armed cell is left
+#       unspecified/untested: xterm's own result depends on how the bytes were batched.
+#   D8  Tab cells: xterm writes nothing for HT (D04); Alacritty/kitty record a tab marker in
+#       blank cells for copy/paste. Recommend xterm. HTS/TBC are not wired in #5, so only the
+#       default every-8 stops exist; reverse-wrap (DECSET 45/1045) is absent, matching xterm's
+#       default (C01).
+#
+# ISSUE TEXT CORRECTIONS (verified)
+#   1. "NUL/DEL ignored" under Action::Execute: DEL never arrives as Execute. tessera-vt emits
+#      Action::Print('\u{7f}') (vte ground state; probed). Terminal's Print path must drop U+007F
+#      (and defensively any char < 0x20) or DEL takes a cell and moves the cursor (G05). NUL does
+#      arrive as Execute(0).
+#   2. "HT -> tab_forward(1)" is not xterm-correct in the pending-wrap state (A06, D1).
+#   3. "when set, a Print first calls grid.insert_chars(1)" is wrong in the pending-wrap state
+#      (H05, H10, D2).
+#   4. BEL "exactly once": the existing inline `Execute(0x07)` check in Terminal::advance must
+#      move into control::execute, not be duplicated (F03). A BEL that terminates an OSC is
+#      swallowed by the parser and must not ring (F04).
+#   5. Done-when "cursor at row 2 col 2" is 1-based; Grid::cursor() is 0-based (1,1).
+#   6. Existing snapshot dir already has keyboard__legacy_xterm_matrix.snap; insta will name the
+#      new ones print__<name>.snap (tests/print.rs). G07/G08 rows (CSI/ESC/OSC/DCS ignored) are
+#      correct for #5 only and must be deleted/rewritten by #6/#9.
+# =============================================================================
+
+
+# ---------------------------------------------------------------- A. DECAWM on (default): pending wrap
+
+### A01_wrap_81_chars_80x3
+size: 3x80
+step: feed 01234567890123456789012345678901234567890123456789012345678901234567890123456789X
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c dotext()/WrapLine(): do_wrap armed after col 80, next print sets LINEWRAPPED, CR+IND, then writes; https://vt100.net/docs/vt510-rm/DECAWM.html
+note: Headline case from the issue. 81st char lands at row 2 col 1 (1-based); row 1 wrapped; cursor row 2 col 2 (1-based) = (1,1) 0-based.
+screen:
+>01234567890123456789012345678901234567890123456789012345678901234567890123456789\
+>X |
+>
+cursor: (1,1)   # 1-based row 2 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): [1]
+
+### A02_exactly_80_chars_pending_80x3
+size: 3x80
+step: feed 01234567890123456789012345678901234567890123456789012345678901234567890123456789
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c dotext(): do_wrap = (cur_col < next_col) after the last column; cursor stays in col 80
+note: No wrap yet: cursor still on the last cell, pending_wrap armed, row 1 NOT wrapped, row 2 untouched.
+screen:
+>01234567890123456789012345678901234567890123456789012345678901234567890123456789|
+>
+>
+cursor: (0,79)   # 1-based row 1 col 80
+pending_wrap: true
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### A03_80_chars_then_CR_80x3
+size: 3x80
+step: feed 01234567890123456789012345678901234567890123456789012345678901234567890123456789\rX
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/cursor.c CarriageReturn(): ResetWrap; https://vt100.net/docs/vt100-ug/chapter3.html (3.3.1 Control Characters, Table 3-10) CR
+note: CR cancels pending wrap; X overwrites col 1; row 1 never marked wrapped.
+screen:
+>X1|234567890123456789012345678901234567890123456789012345678901234567890123456789
+>
+>
+cursor: (0,1)   # 1-based row 1 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### A04_80_chars_then_LF_then_X_80x3
+size: 3x80
+step: feed 01234567890123456789012345678901234567890123456789012345678901234567890123456789\nX
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/cursor.c xtermIndex() -> CursorDown() -> ResetWrap(); LF does not touch the column
+note: LF clears pending wrap and keeps col 80: X lands at row 2 col 80, row 1 not wrapped.
+screen:
+>01234567890123456789012345678901234567890123456789012345678901234567890123456789
+>                                                                               X|
+>
+cursor: (1,79)   # 1-based row 2 col 80
+pending_wrap: true
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### A05_80_chars_then_BS_then_X_80x3
+size: 3x80
+step: feed 01234567890123456789012345678901234567890123456789012345678901234567890123456789\x08X
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/cursor.c CursorBack(): without reverse-wrap (DECSET 45) a pending wrap does NOT consume a step, col = cur_col-1 = 79 (1-based), then ResetWrap; https://github.com/alacritty/alacritty/blob/master/alacritty_terminal/src/term/mod.rs backspace() agrees; https://github.com/wezterm/wezterm/blob/main/term/src/terminalstate/performer.rs Backspace agrees
+note: BS from the pending-wrap state moves to col 79 (1-based), not 80. grid.cursor_left(1) already does exactly this. X overwrites the 79th char; last '9' survives. No wrap.
+screen:
+>012345678901234567890123456789012345678901234567890123456789012345678901234567X9|
+>
+>
+cursor: (0,79)   # 1-based row 1 col 80
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### A06_80_chars_then_HT_then_X_80x3
+size: 3x80
+step: feed 01234567890123456789012345678901234567890123456789012345678901234567890123456789\tX
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/tabs.c TabToNextStop(): only set_cur_col(), no ResetWrap, so do_wrap survives; https://github.com/wezterm/wezterm/blob/main/term/src/terminalstate/mod.rs c0_horizontal_tab() agrees (wrap_next untouched). Alacritty put_tab() instead wraps immediately (https://github.com/alacritty/alacritty/blob/master/alacritty_terminal/src/term/mod.rs) - same final screen, different intermediate cursor
+note: DIVERGES from a naive `grid.tab_forward(1)`: that call clears pending_wrap, so X would overwrite col 80 and nothing would wrap. Expected (xterm/WezTerm): X wraps to row 2, row 1 wrapped. See decision D1.
+flags: diverges-from-lead-plan
+screen:
+>01234567890123456789012345678901234567890123456789012345678901234567890123456789\
+>X |
+>
+cursor: (1,1)   # 1-based row 2 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): [1]
+
+### A07_wrap_scrolls_at_bottom_3x5
+size: 3x5
+step: feed abcdefghijklmnop
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c WrapLine(): LINEWRAPPED set before xtermIndex(); scrolling moves the flag with the line
+note: 16 chars into 3x5: the 16th wraps at the bottom row and scrolls. 'abcde' leaves the screen into scrollback (wrapped==true). Visible: fghij\ / klmno\ / p.
+screen:
+>fghij\
+>klmno\
+>p |
+cursor: (2,1)   # 1-based row 3 col 2
+pending_wrap: false
+requests: []
+scrollback: len=1 first=("abcde", wrapped=true)
+assert: scrollback_len == 1; scrollback[0] == ("abcde", wrapped=true)
+wrapped_rows(1-based): [1, 2]
+
+### A08_fill_screen_exactly_no_scroll_2x5
+size: 2x5
+step: feed abcdefghij
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c dotext(): wrap is deferred until the NEXT printable, so filling the last cell must not scroll
+note: 10 chars into 2x5: no scroll, scrollback empty, pending_wrap armed on the bottom-right cell.
+screen:
+>abcde\
+>fghij|
+cursor: (1,4)   # 1-based row 2 col 5
+pending_wrap: true
+requests: []
+scrollback: len=0
+assert: scrollback_len == 0
+wrapped_rows(1-based): [1]
+
+### A09_one_more_after_fill_scrolls_2x5
+size: 2x5
+step: feed abcdefghijk
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c WrapLine()->xtermIndex(); https://vt100.net/docs/vt510-rm/DECAWM.html
+note: 11th char: row 1 'abcde' (wrapped) scrolls off, 'fghij' keeps its wrapped flag, 'k' on the new bottom row.
+screen:
+>fghij\
+>k |
+cursor: (1,1)   # 1-based row 2 col 2
+pending_wrap: false
+requests: []
+scrollback: len=1 first=("abcde", wrapped=true)
+assert: scrollback_len == 1; scrollback[0] == ("abcde", wrapped=true)
+wrapped_rows(1-based): [1]
+
+### A10_wrap_flag_only_on_the_wrapped_row_3x5
+size: 3x5
+step: feed abcdefg\r\nhi
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c WrapLine(): LINEWRAPPED set on the row being left only
+note: A hard CR LF after a soft wrap must not set/clear flags on other rows: row1 wrapped, row2 not.
+screen:
+>abcde\
+>fg
+>hi |
+cursor: (2,2)   # 1-based row 3 col 3
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): [1]
+
+### A11_one_column_grid_3x1
+size: 3x1
+step: feed ab
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c dotext(): width_available==1 so every print arms do_wrap
+note: Degenerate width: 'a' arms pending at once; 'b' wraps. Grid::new raises zero dims to 1 so cols==1 is reachable.
+screen:
+>a\
+>b|
+>
+cursor: (1,0)   # 1-based row 2 col 1
+pending_wrap: true
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): [1]
+
+
+# ---------------------------------------------------------------- B. DECAWM off (set_auto_wrap(false))
+
+### B01_overwrite_last_col_80x3
+size: 3x80
+step: set auto_wrap false
+step: feed 01234567890123456789012345678901234567890123456789012345678901234567890123456789XYZ
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c dotext(): `if (screen->do_wrap) { do_wrap=False; if (flags & WRAPAROUND) WrapLine(); }` - with WRAPAROUND clear the char is written at cur_col; https://vt100.net/docs/vt510-rm/DECAWM.html 'replace characters already on the page'
+note: Row 1 = first 79 chars then Z (X, Y overwritten in turn). Row 2 empty, no wrapped flag anywhere. Cursor stays on col 80 with pending armed.
+screen:
+>0123456789012345678901234567890123456789012345678901234567890123456789012345678Z|
+>
+>
+cursor: (0,79)   # 1-based row 1 col 80
+pending_wrap: true
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### B02_overwrite_small_1x5
+size: 1x5
+step: set auto_wrap false
+step: feed abcdefgh
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c dotext() (see B01)
+note: Same as B01 on a 1-row grid: no scroll possible either.
+screen:
+>abcdh|
+cursor: (0,4)   # 1-based row 1 col 5
+pending_wrap: true
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### B03_toggle_off_while_pending_3x5
+size: 3x5
+step: feed abcde
+step: set auto_wrap false
+step: feed X
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c dotext(): do_wrap is checked against the CURRENT WRAPAROUND flag at the time of the next print
+note: Pending wrap armed under DECAWM on, then DECAWM turned off: X overwrites col 5, row 1 not wrapped. This is the grid.goto(row, cols-1) path from the lead brief.
+screen:
+>abcdX|
+>
+>
+cursor: (0,4)   # 1-based row 1 col 5
+pending_wrap: true
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### B04_off_then_HT_to_last_col_then_print_3x20
+size: 3x20
+step: set auto_wrap false
+step: feed \t\t\tXY
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/tabs.c TabToNextStop(): clamps to last column; https://vt100.net/docs/vt100-ug/chapter3.html (3.3.1 Control Characters, Table 3-10) HT 'or to the right margin'
+note: Stops at 8, 16, then 19 (last col, no pending). X at col 20 arms pending, Y overwrites it. Never wrapped.
+screen:
+>                   Y|
+>
+>
+cursor: (0,19)   # 1-based row 1 col 20
+pending_wrap: true
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### B05_off_does_not_wrap_on_LF_or_CR_3x5
+size: 3x5
+step: set auto_wrap false
+step: feed abcdefg\r\nx
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html (VT100 Mode > Single-character functions) (CR, LF); DECAWM only affects graphics characters
+note: C0 controls behave identically with DECAWM off.
+screen:
+>abcdg
+>x |
+>
+cursor: (1,1)   # 1-based row 2 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+
+# ---------------------------------------------------------------- C. BS (0x08)
+
+### C01_BS_at_col0_does_not_wrap_back_2x5
+size: 2x5
+step: feed abcdef\x08\x08\x08
+cite: https://vt100.net/docs/vt100-ug/chapter3.html (3.3.1 Control Characters, Table 3-10) BS 'unless it is at the left margin, in which case no action occurs'; https://github.com/ThomasDickey/xterm-snapshots/blob/master/cursor.c CursorBack(): reverse wrap only with DECSET 45/1045 (default off); https://github.com/alacritty/alacritty/blob/master/alacritty_terminal/src/term/mod.rs backspace()
+note: Row 1 is soft-wrapped into row 2, yet BS at col 1 of row 2 stays put. First BS: col 2->1, second: col 1 (stay), third: still col 1.
+screen:
+>abcde\
+>f|
+cursor: (1,0)   # 1-based row 2 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): [1]
+
+### C02_BS_moves_left_without_erasing_1x8
+size: 1x8
+step: feed abc\x08\x08X
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html (VT100 Mode > Single-character functions) BS; https://vt100.net/docs/vt100-ug/chapter3.html (3.3.1 Control Characters, Table 3-10) BS
+note: BS only moves the cursor. 'abc' BS BS 'X' -> 'aXc', cursor on col 3 (after X).
+screen:
+>aXc|
+cursor: (0,2)   # 1-based row 1 col 3
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### C03_BS_on_empty_screen_1x8
+size: 1x8
+step: feed \x08\x08
+cite: https://vt100.net/docs/vt100-ug/chapter3.html (3.3.1 Control Characters, Table 3-10) BS
+note: No movement, no panic, no underflow.
+screen:
+> |
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### C04_BS_with_one_column_clears_pending_3x1
+size: 3x1
+step: feed a\x08b
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/cursor.c CursorBack(): ResetWrap() is called even when the column does not change. (Alacritty backspace() only resets when column>0 - a divergence only reachable with cols==1.)
+note: cols==1: BS at col 1 with pending armed. xterm clears pending, so 'b' overwrites 'a' on row 1 (no wrap). grid.cursor_left(1) clears pending even at col 0, so calling it unconditionally gives this.
+flags: edge
+screen:
+>b|
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: true
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+
+# ---------------------------------------------------------------- D. HT (0x09)
+
+### D01_default_stops_every_8_1x20
+size: 1x20
+step: feed a\tb\tc
+cite: https://vt100.net/docs/vt100-ug/chapter3.html (3.3.1 Control Characters, Table 3-10) HT; https://github.com/ThomasDickey/xterm-snapshots/blob/master/tabs.c TabToNextStop(); default stops at 0,8,16,... (tabs.c TabReset)
+note: a at col 1; HT -> col 9 (1-based, i.e. index 8); b; HT -> index 16; c.
+screen:
+>a       b       c |
+cursor: (0,17)   # 1-based row 1 col 18
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### D02_HT_from_col7_and_col8_1x24
+size: 1x24
+step: feed 1234567\tA\tB
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/tabs.c TabNext(): next stop STRICTLY greater than the cursor column
+note: From index 7 -> 8; from index 8 (after A is written the cursor is at 9) -> 16. Cursor sitting exactly on a stop moves to the next one: covered by D03.
+screen:
+>1234567 A       B |
+cursor: (0,17)   # 1-based row 1 col 18
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### D03_HT_on_a_stop_goes_to_next_1x24
+size: 1x24
+step: feed \t\tX
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/tabs.c TabNext()
+note: Two HT from col 0: index 8 then 16 (never stays on a stop).
+screen:
+>                X |
+cursor: (0,17)   # 1-based row 1 col 18
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### D04_HT_does_not_erase_or_write_1x20
+size: 1x20
+step: feed abcdefghijkl\r\tX
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/tabs.c TabToNextStop(): moves only; xterm leaves cells blank/untouched (Alacritty put_tab() and kitty screen_tab() write a tab marker into blank cells for copy/paste - NOT adopted)
+note: Existing text survives under the tab; X overwrites index 8 ('i').
+screen:
+>abcdefghXj|kl
+cursor: (0,9)   # 1-based row 1 col 10
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### D05_HT_clamps_to_last_column_80x1
+size: 1x80
+step: feed \t\t\t\t\t\t\t\t\t\tZ
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/tabs.c TabToNextStop(): `if (next > max) next = max`; https://vt100.net/docs/vt100-ug/chapter3.html (3.3.1 Control Characters, Table 3-10) HT 'or to the right margin'
+note: 9th HT lands on index 72, 10th on 79 (last col), further HT are no-ops. Then Z at col 80 arms pending. No wrap, no scroll.
+screen:
+>                                                                               Z|
+cursor: (0,79)   # 1-based row 1 col 80
+pending_wrap: true
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### D06_extra_HT_at_last_col_are_noops_80x1
+size: 1x80
+step: feed \t\t\t\t\t\t\t\t\t\t\t\t
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/tabs.c TabToNextStop()
+note: Idempotent at the last column; pending stays false (never printed anything).
+screen:
+>                                                                                |
+cursor: (0,79)   # 1-based row 1 col 80
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### D07_HT_narrower_than_a_stop_1x5
+size: 1x5
+step: feed \tX
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/tabs.c TabToNextStop(): max = last column
+note: cols<8: HT goes straight to the last column (index 4).
+screen:
+>    X|
+cursor: (0,4)   # 1-based row 1 col 5
+pending_wrap: true
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### D08_HT_then_BS_1x20
+size: 1x20
+step: feed \t\x08X
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html (VT100 Mode > Single-character functions)
+note: Sanity: HT to index 8, BS to index 7, X at index 7.
+screen:
+>       X |
+cursor: (0,8)   # 1-based row 1 col 9
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+
+# ---------------------------------------------------------------- E. LF / VT / FF / CR
+
+### E01_LF_keeps_column_3x6
+size: 3x6
+step: feed ab\ncd
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html (VT100 Mode > Single-character functions) LF; https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_VMOT: xtermIndex(1) then CarriageReturn only if the LINEFEED (LNM) flag is set (default reset)
+note: Staircase: LNM is off by default, LF does NOT return the carriage. 'cd' starts at index 2 of row 2.
+screen:
+>ab
+>  cd |
+>
+cursor: (1,4)   # 1-based row 2 col 5
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### E02_CRLF_pairs_3x6
+size: 3x6
+step: feed ab\r\ncd\r\nef
+cite: https://vt100.net/docs/vt100-ug/chapter3.html (3.3.1 Control Characters, Table 3-10) CR, LF
+note: Normal line breaks.
+screen:
+>ab
+>cd
+>ef |
+cursor: (2,2)   # 1-based row 3 col 3
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### E03_VT_behaves_as_LF_3x6
+size: 3x6
+step: feed ab\x0bcd
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html (VT100 Mode > Single-character functions): 'VT ... treated the same as LF'; https://vt100.net/docs/vt100-ug/chapter3.html (3.3.1 Control Characters, Table 3-10): VT 'Interpreted as LF'
+note: Identical screen to E01.
+screen:
+>ab
+>  cd |
+>
+cursor: (1,4)   # 1-based row 2 col 5
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### E04_FF_behaves_as_LF_3x6
+size: 3x6
+step: feed ab\x0ccd
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html (VT100 Mode > Single-character functions): 'FF is treated the same as LF'; https://vt100.net/docs/vt100-ug/chapter3.html (3.3.1 Control Characters, Table 3-10): FF 'Interpreted as LF'
+note: Identical screen to E01. xterm does NOT clear the screen on FF.
+screen:
+>ab
+>  cd |
+>
+cursor: (1,4)   # 1-based row 2 col 5
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### E05_LF_at_bottom_scrolls_3x6
+size: 3x6
+step: feed 1\r\n2\r\n3\r\n4
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/cursor.c xtermIndex(): at the bottom margin the region scrolls instead of moving the cursor
+note: Line '1' scrolls into scrollback; visible 2,3,4. Scrolled-in line is not wrapped.
+screen:
+>2
+>3
+>4 |
+cursor: (2,1)   # 1-based row 3 col 2
+pending_wrap: false
+requests: []
+scrollback: len=1 first=("1", wrapped=false)
+assert: scrollback_len == 1; scrollback[0] == ("1", wrapped=false)
+wrapped_rows(1-based): none
+
+### E06_trailing_CRLF_at_bottom_3x6
+size: 3x6
+step: feed a\r\nb\r\nc\r\n
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/cursor.c xtermIndex()
+note: Cursor ends at col 1 of a fresh blank bottom row; 'a' scrolled off.
+screen:
+>b
+>c
+> |
+cursor: (2,0)   # 1-based row 3 col 1
+pending_wrap: false
+requests: []
+scrollback: len=1 first=("a", wrapped=false)
+assert: scrollback_len == 1
+wrapped_rows(1-based): none
+
+### E07_bare_LF_at_bottom_row_keeps_column_3x6
+size: 3x6
+step: feed \n\nab\ncd
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/cursor.c xtermIndex()
+note: Two LF move to the bottom row, 'ab', then LF scrolls but column stays at 3 (1-based): 'cd' continues the staircase.
+screen:
+>
+>ab
+>  cd |
+cursor: (2,4)   # 1-based row 3 col 5
+pending_wrap: false
+requests: []
+scrollback: len=1 first=("", wrapped=false)
+wrapped_rows(1-based): none
+
+### E08_CR_overwrites_from_col1_1x6
+size: 1x6
+step: feed abc\rX
+cite: https://vt100.net/docs/vt100-ug/chapter3.html (3.3.1 Control Characters, Table 3-10) CR 'Move cursor to the left margin'
+note: 'Xbc', cursor on index 1.
+screen:
+>Xb|c
+cursor: (0,1)   # 1-based row 1 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### E09_CR_at_col0_is_noop_1x6
+size: 1x6
+step: feed \r\r\r
+cite: https://vt100.net/docs/vt100-ug/chapter3.html (3.3.1 Control Characters, Table 3-10) CR
+note: No movement.
+screen:
+> |
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### E10_LF_does_not_set_wrapped_2x6
+size: 2x6
+step: feed abc\ndef
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c: LINEWRAPPED is only set by WrapLine()
+note: Hard line breaks never mark `wrapped`.
+screen:
+>abc
+>   def|
+cursor: (1,5)   # 1-based row 2 col 6
+pending_wrap: true
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### E11_many_LF_pin_to_bottom_3x4
+size: 3x4
+step: feed a\n\n\n\n\nb
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/cursor.c xtermIndex()
+note: Cursor pinned at the bottom row after repeated LF; no panic. Scrollback length is grid-defined (blank lines may or may not be retained) so it is not asserted.
+screen:
+>
+>
+> b |
+cursor: (2,2)   # 1-based row 3 col 3
+pending_wrap: false
+requests: []
+scrollback: not asserted (grid-defined whether blank scrolled lines are retained)
+wrapped_rows(1-based): none
+
+
+# ---------------------------------------------------------------- F. BEL (0x07)
+
+### F01_single_BEL_one_request_2x6
+size: 2x6
+step: feed \x07
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html (VT100 Mode > Single-character functions) BEL; https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_BELL
+note: Exactly one Request::Bell; grid and cursor untouched.
+screen:
+> |
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: [Bell]
+scrollback: len=0
+assert: requests == [Bell]
+wrapped_rows(1-based): none
+
+### F02_BEL_between_text_2x6
+size: 2x6
+step: feed a\x07b\x07\x07c
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html (VT100 Mode > Single-character functions) BEL
+note: Three BEL bytes -> three Bell requests in order, text unaffected ('abc').
+screen:
+>abc |
+>
+cursor: (0,3)   # 1-based row 1 col 4
+pending_wrap: false
+requests: [Bell, Bell, Bell]
+scrollback: len=0
+assert: requests == [Bell, Bell, Bell]
+wrapped_rows(1-based): none
+
+### F03_take_requests_drains_2x6
+size: 2x6
+step: feed \x07
+cite: crates/tessera-term/src/lib.rs Terminal::take_requests (existing API)
+note: After one take_requests() a second call returns []; BEL must not be pushed by both the old inline check and control::execute (double Bell).
+screen:
+> |
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: [Bell]
+scrollback: len=0
+assert: requests == [Bell]; second take_requests() == []
+wrapped_rows(1-based): none
+
+### F04_BEL_as_OSC_terminator_is_not_a_bell_2x6
+size: 2x6
+step: feed \x1b]2;title\x07x
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_BELL: `if (sp->string_mode == ANSI_OSC) { do_osc(...); ResetState }` else Bell(); tessera-vt/vte never yields Execute(0x07) inside OSC
+note: The BEL that ends an OSC string must NOT ring the bell. Until #9 lands OSC is ignored (no requests at all); after #9 a SetTitle may appear but never Bell. Only x is printed.
+screen:
+>x |
+>
+cursor: (0,1)   # 1-based row 1 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+assert: requests contains no Bell
+wrapped_rows(1-based): none
+
+### F05_BEL_does_not_move_cursor_or_clear_pending_2x5
+size: 2x5
+step: feed abcde\x07f
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html (VT100 Mode > Single-character functions) BEL (no cursor effect)
+note: BEL in the pending-wrap state keeps it: f still wraps.
+screen:
+>abcde\
+>f |
+cursor: (1,1)   # 1-based row 2 col 2
+pending_wrap: false
+requests: [Bell]
+scrollback: len=0
+assert: requests == [Bell]
+wrapped_rows(1-based): [1]
+
+
+# ---------------------------------------------------------------- G. Ignored controls and non-printables
+
+### G01_NUL_SOH_ENQ_ACK_ignored_1x8
+size: 1x8
+step: feed a\x00\x01\x05\x06b
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/VTPrsTbl.c ansi_table: NUL SOH ... CASE_IGNORE; ENQ -> answerback (default empty string, so nothing is sent); https://invisible-island.net/xterm/ctlseqs/ctlseqs.html (VT100 Mode > Single-character functions) ENQ
+note: No grid effect, no requests. tessera-term has no PTY write path in #5, so ENQ must be a no-op (answerback is empty by default).
+screen:
+>ab |
+cursor: (0,2)   # 1-based row 1 col 3
+pending_wrap: false
+requests: []
+scrollback: len=0
+assert: requests == []
+wrapped_rows(1-based): none
+
+### G02_SO_SI_are_visible_noops_1x8
+size: 1x8
+step: feed a\x0eb\x0fc
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c resetCharsets(): G0 and G1 both start as ASCII, so SO/SI change nothing visible; https://vt100.net/docs/vt100-ug/chapter3.html (3.3.1 Control Characters, Table 3-10) SO/SI invoke G1/G0
+note: Charsets are out of scope; later work (SCS/ESC ( 0) will give SO/SI meaning. 'abc' unchanged.
+screen:
+>abc |
+cursor: (0,3)   # 1-based row 1 col 4
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### G03_remaining_C0_ignored_1x8
+size: 1x8
+step: feed a\x02\x03\x04\x10\x11\x12\x13\x14\x15\x16\x17\x19\x1c\x1d\x1e\x1fb
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/VTPrsTbl.c ansi_table: DLE DC1..DC4 NAK SYN ETB EM FS GS RS US all CASE_IGNORE
+note: Every remaining C0 byte except ESC/CAN/SUB is ignored: grid unchanged, cursor does not move, no requests. DC1/DC3 (XON/XOFF) are consumed by the pty line discipline, not the emulator.
+screen:
+>ab |
+cursor: (0,2)   # 1-based row 1 col 3
+pending_wrap: false
+requests: []
+scrollback: len=0
+assert: requests == []
+wrapped_rows(1-based): none
+
+### G04_CAN_SUB_decision_1x8
+size: 1x8
+step: feed a\x18b\x1ac
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_SUB: xterm with decTerminalID>=100 (default) prints U+2592 (>200: U+2426) for SUB in ground state; CAN is CASE_CAN. Alacritty/kitty/WezTerm: ignore
+note: Recommended: ignore both (matches the lead brief 'everything else ignored'). xterm's visible error glyph for SUB is the only xterm divergence in this fixture on purpose; see decision D3. Expected here: 'abc'.
+flags: decision-D3
+screen:
+>abc |
+cursor: (0,3)   # 1-based row 1 col 4
+pending_wrap: false
+requests: []
+scrollback: len=0
+assert: requests == []
+wrapped_rows(1-based): none
+
+### G05_DEL_print_is_dropped_1x8
+size: 1x8
+step: feed a\x7fb
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/VTPrsTbl.c ansi_table: DEL (0x7F) is CASE_IGNORE in the ground state; observed: tessera-vt 0.1 emits Action::Print('\u{7f}') for 0x7F (vte ground state), NOT Action::Execute(0x7f)
+note: IMPORTANT: the brief says DEL is handled in control::execute, but the parser delivers it as Print. Action::Print must drop U+007F (and any char < 0x20) or it will occupy a cell. Expected: 'ab', cursor index 2.
+flags: issue-text-wrong
+screen:
+>ab |
+cursor: (0,2)   # 1-based row 1 col 3
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### G06_C1_controls_ignored_in_5_1x8
+size: 1x8
+step: feed a\u{84}\u{85}\u{88}\u{8d}b
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html (VT100 Mode > Single-character functions) C1 (8-Bit) Control Characters; tessera-vt maps U+0080..U+009F to Action::Execute(0x80..0x9F)
+note: IND/NEL/HTS/RI arrive as Execute(0x84/0x85/0x88/0x8D). #5 ignores them (brief: everything else ignored + trace log). They get real behaviour when ESC D/E/H/M are wired; flagged as decision D4 so that whoever wires ESC reuses the same handlers. Expected: 'ab'.
+flags: decision-D4
+screen:
+>ab |
+cursor: (0,2)   # 1-based row 1 col 3
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### G07_Csi_is_ignored_and_consumed_2x8
+size: 2x8
+step: feed ab\x1b[2J\x1b[5;5H\x1b[31mcd
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html (VT100 Mode > Single-character functions) CSI; brief 'Action::Csi leaves the grid unchanged'
+note: CSI is parsed by tessera-vt (params never leak as text) but not applied in #5: no erase, no cursor move, no colour. Text 'abcd'. NOTE: this row is SUPERSEDED by #6 (wave 3) - delete or rewrite it there.
+flags: superseded-by-6
+screen:
+>abcd |
+>
+cursor: (0,4)   # 1-based row 1 col 5
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### G08_Esc_Osc_Dcs_ignored_2x8
+size: 2x8
+step: feed a\x1bMb\x1b]0;hi\x1b\\c\x1bPqxyz\x1b\\d
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html (VT100 Mode > Single-character functions); brief 'Esc/Osc/Dcs stay ignored for now'
+note: ESC M (RI), OSC 0 with ST, DCS with ST all vanish. Text 'abcd', no requests. NOTE: superseded piecemeal by #6/#9 (RI, title).
+flags: superseded-by-6, superseded-by-9
+screen:
+>abcd |
+>
+cursor: (0,4)   # 1-based row 1 col 5
+pending_wrap: false
+requests: []
+scrollback: len=0
+assert: requests == []
+wrapped_rows(1-based): none
+
+
+# ---------------------------------------------------------------- H. IRM insert mode (set_insert_mode(true))
+
+### H01_shift_right_and_drop_last_1x5
+size: 1x5
+step: feed abcde\r
+step: set insert_mode true
+step: feed X
+cite: https://vt100.net/docs/vt510-rm/IRM.html 'Characters moved past the page's right border are lost'; https://github.com/ThomasDickey/xterm-snapshots/blob/master/util.c WriteText(): `if (attr_flags & INSERT) InsertChar(xw, cells)`
+note: 'abcde' CR insert X -> 'Xabcd' ('e' lost). Row not wrapped.
+screen:
+>Xa|bcd
+cursor: (0,1)   # 1-based row 1 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### H02_two_inserts_1x5
+size: 1x5
+step: feed abcde\r
+step: set insert_mode true
+step: feed XY
+cite: https://vt100.net/docs/vt510-rm/IRM.html
+note: 'XYabc'.
+screen:
+>XYa|bc
+cursor: (0,2)   # 1-based row 1 col 3
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### H03_insert_mid_line_1x10
+size: 1x10
+step: feed abcdef\x08\x08\x08
+step: set insert_mode true
+step: feed XY
+cite: https://vt100.net/docs/vt510-rm/IRM.html; BS from https://vt100.net/docs/vt100-ug/chapter3.html (3.3.1 Control Characters, Table 3-10)
+note: 'abcdef' BS x3 (cursor at index 3) insert 'XY' -> 'abcXYdef', cursor index 5.
+screen:
+>abcXYd|ef
+cursor: (0,5)   # 1-based row 1 col 6
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### H04_insert_off_again_overwrites_1x6
+size: 1x6
+step: feed abcdef\r
+step: set insert_mode true
+step: feed X
+step: set insert_mode false
+step: feed Y
+cite: https://vt100.net/docs/vt510-rm/IRM.html (CSI 4 l = replace)
+note: Insert X -> 'Xabcde'; then replace mode: Y overwrites index 1 -> 'XYbcde'.
+screen:
+>XYb|cde
+cursor: (0,2)   # 1-based row 1 col 3
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### H05_insert_in_pending_state_wraps_FIRST_3x5
+size: 3x5
+step: feed abcde
+step: set insert_mode true
+step: feed X
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c dotext() does WrapLine() BEFORE util.c WriteText() calls InsertChar(); https://github.com/alacritty/alacritty/blob/master/alacritty_terminal/src/term/mod.rs input(): wrapline() then the INSERT shift
+note: TRAP: grid.insert_chars() clears pending_wrap, so calling it first and then put_char leaves the cursor on col 5 of row 1 and writes X there ('abcdX', no wrap). Correct: resolve the pending wrap (mark row wrapped, CR, line_feed) first, then insert on the new row. Expected row1 'abcde\', row2 'X'.
+flags: trap
+screen:
+>abcde\
+>X |
+>
+cursor: (1,1)   # 1-based row 2 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): [1]
+
+### H06_insert_at_last_column_just_replaces_3x5
+size: 3x5
+step: feed abcd\r\t\t
+step: set insert_mode true
+step: feed X
+cite: https://vt100.net/docs/vt510-rm/IRM.html; https://github.com/alacritty/alacritty/blob/master/alacritty_terminal/src/term/mod.rs input(): shift guarded by `column + width < columns`
+note: Cursor on the last column (not pending): insert shifts nothing off, the cell is replaced. 'abcd' CR, HT x2 clamps to index 4 (last col, blank). X replaces that cell -> 'abcdX'. Never wraps.
+screen:
+>abcdX|
+>
+>
+cursor: (0,4)   # 1-based row 1 col 5
+pending_wrap: true
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### H07_insert_with_decawm_off_at_last_col_3x5
+size: 3x5
+step: feed abcde
+step: set auto_wrap false
+step: set insert_mode true
+step: feed X
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c dotext(): do_wrap cleared without WrapLine when WRAPAROUND is off, then WriteText InsertChar at the last col; https://vt100.net/docs/vt510-rm/DECAWM.html
+note: DECAWM off + IRM + pending: reposition to the last col, insert (blanks the last cell, nothing to shift), write X -> 'abcdX', not wrapped.
+screen:
+>abcdX|
+>
+>
+cursor: (0,4)   # 1-based row 1 col 5
+pending_wrap: true
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### H08_insert_default_off_1x5
+size: 1x5
+step: feed abcde\rX
+cite: https://vt100.net/docs/vt510-rm/IRM.html default is replace
+note: Default Terminal::new: insert_mode()==false, auto_wrap()==true. 'Xbcde'.
+screen:
+>Xb|cde
+cursor: (0,1)   # 1-based row 1 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+assert: default insert_mode() == false; default auto_wrap() == true
+wrapped_rows(1-based): none
+
+### H09_insert_does_not_affect_controls_1x6
+size: 1x6
+step: set insert_mode true
+step: feed ab\rX\x08Y\t
+cite: https://vt100.net/docs/vt510-rm/IRM.html applies to graphic characters only
+note: CR, BS and HT neither insert nor blank. 'ab' CR X -> 'Xab', BS (index 0), Y -> 'YXab' (insert), HT -> index 5 (last).
+screen:
+>YXab  |
+cursor: (0,5)   # 1-based row 1 col 6
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none
+
+### H10_insert_scrolling_wrap_2x4
+size: 2x4
+step: feed abcdefgh
+step: set insert_mode true
+step: feed X
+cite: https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c dotext(): WrapLine() (scroll) then InsertChar
+note: Pending at the bottom-right: wrap scrolls first, X lands at the start of the fresh bottom row. Visible: 'efgh\' / 'X'.
+screen:
+>efgh\
+>X |
+cursor: (1,1)   # 1-based row 2 col 2
+pending_wrap: false
+requests: []
+scrollback: len=1 first=("abcd", wrapped=true)
+assert: scrollback_len == 1
+wrapped_rows(1-based): [1]
+
+
+# ---------------------------------------------------------------- I. Chunking and non-ASCII
+
+### I01_byte_by_byte_equals_one_shot_3x5
+size: 3x5
+step: feed_bytewise abcdefg\r\n\thi\x07
+cite: tessera-vt Parser is incremental; Terminal::advance must be chunk-agnostic
+note: Feeding one byte per advance() call must produce the same screen as a single call. The test should run EVERY case in this file both ways.
+screen:
+>fg
+>    h\
+>i |
+cursor: (2,1)   # 1-based row 3 col 2
+pending_wrap: false
+requests: [Bell]
+scrollback: len=1 first=("abcde", wrapped=true)
+assert: requests == [Bell]
+wrapped_rows(1-based): [2]
+
+### I02_non_ascii_single_width_1x6
+size: 1x6
+step: feed aéb
+cite: tessera-vt Action::Print(char); wide/combining characters belong to #4 (grid unicode-width), out of scope
+note: U+00E9 is one column wide: 'aéb' occupies three cells.
+screen:
+>aéb |
+cursor: (0,3)   # 1-based row 1 col 4
+pending_wrap: false
+requests: []
+scrollback: len=0
+wrapped_rows(1-based): none

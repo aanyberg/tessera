@@ -1,0 +1,6 @@
+# Fixture case H10_insert_scrolling_wrap_2x4 (tests/fixtures/print_c0_spec.txt).
+# Pending at the bottom-right: wrap scrolls first, X lands at the start of the fresh bottom row. Visible: 'efgh\' / 'X'.
+@size 2x4
+abcdefgh
+@set insert_mode true
+X

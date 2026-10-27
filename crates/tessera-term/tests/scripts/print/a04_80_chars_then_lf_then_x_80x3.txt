@@ -1,0 +1,4 @@
+# Fixture case A04_80_chars_then_LF_then_X_80x3 (tests/fixtures/print_c0_spec.txt).
+# LF clears pending wrap and keeps col 80: X lands at row 2 col 80, row 1 not wrapped.
+@size 3x80
+01234567890123456789012345678901234567890123456789012345678901234567890123456789\nX

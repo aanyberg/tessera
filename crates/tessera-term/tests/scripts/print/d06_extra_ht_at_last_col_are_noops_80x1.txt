@@ -1,0 +1,4 @@
+# Fixture case D06_extra_HT_at_last_col_are_noops_80x1 (tests/fixtures/print_c0_spec.txt).
+# Idempotent at the last column; pending stays false (never printed anything).
+@size 1x80
+\t\t\t\t\t\t\t\t\t\t\t\t

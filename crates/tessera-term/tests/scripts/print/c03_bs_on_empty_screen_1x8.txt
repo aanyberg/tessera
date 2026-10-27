@@ -1,0 +1,4 @@
+# Fixture case C03_BS_on_empty_screen_1x8 (tests/fixtures/print_c0_spec.txt).
+# No movement, no panic, no underflow.
+@size 1x8
+\x08\x08

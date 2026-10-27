@@ -1,0 +1,16 @@
+---
+source: crates/tessera-term/tests/print.rs
+input_file: crates/tessera-term/tests/scripts/print/e11_many_lf_pin_to_bottom_3x4.txt
+---
+
+
+ b |
+--
+cursor: (2,2)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 3
+  "a"
+  ""
+  ""

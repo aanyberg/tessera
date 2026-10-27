@@ -1,0 +1,4 @@
+# Fixture case E05_LF_at_bottom_scrolls_3x6 (tests/fixtures/print_c0_spec.txt).
+# Line '1' scrolls into scrollback; visible 2,3,4. Scrolled-in line is not wrapped.
+@size 3x6
+1\r\n2\r\n3\r\n4

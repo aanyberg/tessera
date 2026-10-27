@@ -1,0 +1,4 @@
+# Fixture case C01_BS_at_col0_does_not_wrap_back_2x5 (tests/fixtures/print_c0_spec.txt).
+# Row 1 is soft-wrapped into row 2, yet BS at col 1 of row 2 stays put. First BS: col 2->1, second: col 1 (stay), third: still col 1.
+@size 2x5
+abcdef\x08\x08\x08

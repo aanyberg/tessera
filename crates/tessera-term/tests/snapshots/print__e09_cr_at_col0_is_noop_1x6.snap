@@ -1,0 +1,11 @@
+---
+source: crates/tessera-term/tests/print.rs
+input_file: crates/tessera-term/tests/scripts/print/e09_cr_at_col0_is_noop_1x6.txt
+---
+ |
+--
+cursor: (0,0)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

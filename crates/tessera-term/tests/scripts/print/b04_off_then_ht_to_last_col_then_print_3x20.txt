@@ -1,0 +1,5 @@
+# Fixture case B04_off_then_HT_to_last_col_then_print_3x20 (tests/fixtures/print_c0_spec.txt).
+# Stops at 8, 16, then 19 (last col, no pending). X at col 20 arms pending, Y overwrites it. Never wrapped.
+@size 3x20
+@set auto_wrap false
+\t\t\tXY

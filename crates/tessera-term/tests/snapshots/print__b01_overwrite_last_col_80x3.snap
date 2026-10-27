@@ -1,0 +1,13 @@
+---
+source: crates/tessera-term/tests/print.rs
+input_file: crates/tessera-term/tests/scripts/print/b01_overwrite_last_col_80x3.txt
+---
+0123456789012345678901234567890123456789012345678901234567890123456789012345678Z|
+
+
+--
+cursor: (0,79)
+pending_wrap: true
+auto_wrap: false insert_mode: false
+requests: []
+scrollback: 0

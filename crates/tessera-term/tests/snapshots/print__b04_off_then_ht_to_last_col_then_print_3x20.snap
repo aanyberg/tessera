@@ -1,0 +1,13 @@
+---
+source: crates/tessera-term/tests/print.rs
+input_file: crates/tessera-term/tests/scripts/print/b04_off_then_ht_to_last_col_then_print_3x20.txt
+---
+                   Y|
+
+
+--
+cursor: (0,19)
+pending_wrap: true
+auto_wrap: false insert_mode: false
+requests: []
+scrollback: 0

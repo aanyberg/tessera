@@ -1,0 +1,6 @@
+# Fixture case H05_insert_in_pending_state_wraps_FIRST_3x5 (tests/fixtures/print_c0_spec.txt).
+# TRAP: grid.insert_chars() clears pending_wrap, so calling it first and then put_char leaves the cursor on col 5 of row 1 and writes X there ('abcdX', no wrap). Correct: resolve the pending wrap (mark row wrapped, CR, line_feed) first, then insert on the new row. Expected row1 'abcde\', row2 'X'.
+@size 3x5
+abcde
+@set insert_mode true
+X

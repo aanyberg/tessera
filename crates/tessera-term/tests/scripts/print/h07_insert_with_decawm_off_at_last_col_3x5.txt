@@ -1,0 +1,7 @@
+# Fixture case H07_insert_with_decawm_off_at_last_col_3x5 (tests/fixtures/print_c0_spec.txt).
+# DECAWM off + IRM + pending: reposition to the last col, insert (blanks the last cell, nothing to shift), write X -> 'abcdX', not wrapped.
+@size 3x5
+abcde
+@set auto_wrap false
+@set insert_mode true
+X

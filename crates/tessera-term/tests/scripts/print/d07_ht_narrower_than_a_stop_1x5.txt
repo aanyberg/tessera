@@ -1,0 +1,4 @@
+# Fixture case D07_HT_narrower_than_a_stop_1x5 (tests/fixtures/print_c0_spec.txt).
+# cols<8: HT goes straight to the last column (index 4).
+@size 1x5
+\tX

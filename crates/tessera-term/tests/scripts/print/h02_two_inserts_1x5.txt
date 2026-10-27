@@ -1,0 +1,6 @@
+# Fixture case H02_two_inserts_1x5 (tests/fixtures/print_c0_spec.txt).
+# 'XYabc'.
+@size 1x5
+abcde\r
+@set insert_mode true
+XY

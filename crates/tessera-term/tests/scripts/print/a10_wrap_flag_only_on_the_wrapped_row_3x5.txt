@@ -1,0 +1,4 @@
+# Fixture case A10_wrap_flag_only_on_the_wrapped_row_3x5 (tests/fixtures/print_c0_spec.txt).
+# A hard CR LF after a soft wrap must not set/clear flags on other rows: row1 wrapped, row2 not.
+@size 3x5
+abcdefg\r\nhi

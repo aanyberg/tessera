@@ -1,0 +1,13 @@
+---
+source: crates/tessera-term/tests/print.rs
+input_file: crates/tessera-term/tests/scripts/print/b03_toggle_off_while_pending_3x5.txt
+---
+abcdX|
+
+
+--
+cursor: (0,4)
+pending_wrap: true
+auto_wrap: false insert_mode: false
+requests: []
+scrollback: 0

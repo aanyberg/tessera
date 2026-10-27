@@ -1,0 +1,4 @@
+# Fixture case A05_80_chars_then_BS_then_X_80x3 (tests/fixtures/print_c0_spec.txt).
+# BS from the pending-wrap state moves to col 79 (1-based), not 80. grid.cursor_left(1) already does exactly this. X overwrites the 79th char; last '9' survives. No wrap.
+@size 3x80
+01234567890123456789012345678901234567890123456789012345678901234567890123456789\x08X

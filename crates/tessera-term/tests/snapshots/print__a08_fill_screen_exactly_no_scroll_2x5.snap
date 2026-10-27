@@ -1,0 +1,12 @@
+---
+source: crates/tessera-term/tests/print.rs
+input_file: crates/tessera-term/tests/scripts/print/a08_fill_screen_exactly_no_scroll_2x5.txt
+---
+abcde\
+fghij|
+--
+cursor: (1,4)
+pending_wrap: true
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

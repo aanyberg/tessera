@@ -1,0 +1,4 @@
+# Fixture case E03_VT_behaves_as_LF_3x6 (tests/fixtures/print_c0_spec.txt).
+# Identical screen to E01.
+@size 3x6
+ab\x0bcd

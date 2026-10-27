@@ -1,0 +1,5 @@
+# Fixture case H09_insert_does_not_affect_controls_1x6 (tests/fixtures/print_c0_spec.txt).
+# CR, BS and HT neither insert nor blank. 'ab' CR X -> 'Xab', BS (index 0), Y -> 'YXab' (insert), HT -> index 5 (last).
+@size 1x6
+@set insert_mode true
+ab\rX\x08Y\t

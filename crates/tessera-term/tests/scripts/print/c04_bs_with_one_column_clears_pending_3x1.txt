@@ -1,0 +1,4 @@
+# Fixture case C04_BS_with_one_column_clears_pending_3x1 (tests/fixtures/print_c0_spec.txt).
+# cols==1: BS at col 1 with pending armed. xterm clears pending, so 'b' overwrites 'a' on row 1 (no wrap). grid.cursor_left(1) clears pending even at col 0, so calling it unconditionally gives this.
+@size 3x1
+a\x08b

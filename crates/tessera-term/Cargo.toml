@@ -12,6 +12,7 @@ publish.workspace = true
 [dependencies]
 tessera-vt.workspace = true
 tessera-grid.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

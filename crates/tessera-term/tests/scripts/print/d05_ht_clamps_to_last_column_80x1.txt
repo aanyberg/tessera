@@ -1,0 +1,4 @@
+# Fixture case D05_HT_clamps_to_last_column_80x1 (tests/fixtures/print_c0_spec.txt).
+# 9th HT lands on index 72, 10th on 79 (last col), further HT are no-ops. Then Z at col 80 arms pending. No wrap, no scroll.
+@size 1x80
+\t\t\t\t\t\t\t\t\t\tZ

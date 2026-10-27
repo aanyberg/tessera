@@ -1,0 +1,4 @@
+# Fixture case C02_BS_moves_left_without_erasing_1x8 (tests/fixtures/print_c0_spec.txt).
+# BS only moves the cursor. 'abc' BS BS 'X' -> 'aXc', cursor on col 3 (after X).
+@size 1x8
+abc\x08\x08X

@@ -1,0 +1,4 @@
+# Fixture case E01_LF_keeps_column_3x6 (tests/fixtures/print_c0_spec.txt).
+# Staircase: LNM is off by default, LF does NOT return the carriage. 'cd' starts at index 2 of row 2.
+@size 3x6
+ab\ncd

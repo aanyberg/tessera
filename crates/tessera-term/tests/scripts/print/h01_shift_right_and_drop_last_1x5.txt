@@ -1,0 +1,6 @@
+# Fixture case H01_shift_right_and_drop_last_1x5 (tests/fixtures/print_c0_spec.txt).
+# 'abcde' CR insert X -> 'Xabcd' ('e' lost). Row not wrapped.
+@size 1x5
+abcde\r
+@set insert_mode true
+X

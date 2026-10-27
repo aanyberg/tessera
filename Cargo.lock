@@ -1354,6 +1354,7 @@ dependencies = [
  "proptest",
  "tessera-grid",
  "tessera-vt",
+ "tracing",
 ]
 
 [[package]]

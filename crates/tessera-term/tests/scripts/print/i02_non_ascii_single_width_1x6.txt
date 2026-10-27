@@ -1,0 +1,4 @@
+# Fixture case I02_non_ascii_single_width_1x6 (tests/fixtures/print_c0_spec.txt).
+# U+00E9 is one column wide: 'aéb' occupies three cells.
+@size 1x6
+aéb

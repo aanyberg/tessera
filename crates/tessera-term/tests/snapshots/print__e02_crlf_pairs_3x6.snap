@@ -1,0 +1,13 @@
+---
+source: crates/tessera-term/tests/print.rs
+input_file: crates/tessera-term/tests/scripts/print/e02_crlf_pairs_3x6.txt
+---
+ab
+cd
+ef |
+--
+cursor: (2,2)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

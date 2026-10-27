@@ -1,0 +1,13 @@
+---
+source: crates/tessera-term/tests/print.rs
+input_file: crates/tessera-term/tests/scripts/print/a10_wrap_flag_only_on_the_wrapped_row_3x5.txt
+---
+abcde\
+fg
+hi |
+--
+cursor: (2,2)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

@@ -1,0 +1,4 @@
+# Fixture case D01_default_stops_every_8_1x20 (tests/fixtures/print_c0_spec.txt).
+# a at col 1; HT -> col 9 (1-based, i.e. index 8); b; HT -> index 16; c.
+@size 1x20
+a\tb\tc

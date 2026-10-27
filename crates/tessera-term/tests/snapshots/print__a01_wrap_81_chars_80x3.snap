@@ -1,0 +1,13 @@
+---
+source: crates/tessera-term/tests/print.rs
+input_file: crates/tessera-term/tests/scripts/print/a01_wrap_81_chars_80x3.txt
+---
+01234567890123456789012345678901234567890123456789012345678901234567890123456789\
+X |
+
+--
+cursor: (1,1)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

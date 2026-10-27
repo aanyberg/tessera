@@ -1,0 +1,4 @@
+# Fixture case D04_HT_does_not_erase_or_write_1x20 (tests/fixtures/print_c0_spec.txt).
+# Existing text survives under the tab; X overwrites index 8 ('i').
+@size 1x20
+abcdefghijkl\r\tX

@@ -1,0 +1,4 @@
+# Fixture case E08_CR_overwrites_from_col1_1x6 (tests/fixtures/print_c0_spec.txt).
+# 'Xbc', cursor on index 1.
+@size 1x6
+abc\rX

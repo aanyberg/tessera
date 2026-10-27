@@ -1,0 +1,11 @@
+---
+source: crates/tessera-term/tests/print.rs
+input_file: crates/tessera-term/tests/scripts/print/d04_ht_does_not_erase_or_write_1x20.txt
+---
+abcdefghXj|kl
+--
+cursor: (0,9)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

@@ -1,0 +1,4 @@
+# Fixture case A11_one_column_grid_3x1 (tests/fixtures/print_c0_spec.txt).
+# Degenerate width: 'a' arms pending at once; 'b' wraps. Grid::new raises zero dims to 1 so cols==1 is reachable.
+@size 3x1
+ab

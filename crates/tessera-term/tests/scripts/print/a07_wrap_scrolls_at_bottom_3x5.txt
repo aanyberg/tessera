@@ -1,0 +1,4 @@
+# Fixture case A07_wrap_scrolls_at_bottom_3x5 (tests/fixtures/print_c0_spec.txt).
+# 16 chars into 3x5: the 16th wraps at the bottom row and scrolls. 'abcde' leaves the screen into scrollback (wrapped==true). Visible: fghij\ / klmno\ / p.
+@size 3x5
+abcdefghijklmnop

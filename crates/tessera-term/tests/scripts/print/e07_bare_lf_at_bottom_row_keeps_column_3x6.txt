@@ -1,0 +1,4 @@
+# Fixture case E07_bare_LF_at_bottom_row_keeps_column_3x6 (tests/fixtures/print_c0_spec.txt).
+# Two LF move to the bottom row, 'ab', then LF scrolls but column stays at 3 (1-based): 'cd' continues the staircase.
+@size 3x6
+\n\nab\ncd

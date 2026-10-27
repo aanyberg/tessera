@@ -1,0 +1,4 @@
+# Fixture case D08_HT_then_BS_1x20 (tests/fixtures/print_c0_spec.txt).
+# Sanity: HT to index 8, BS to index 7, X at index 7.
+@size 1x20
+\t\x08X

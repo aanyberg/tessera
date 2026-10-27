@@ -1,0 +1,13 @@
+---
+source: crates/tessera-term/tests/print.rs
+input_file: crates/tessera-term/tests/scripts/print/c04_bs_with_one_column_clears_pending_3x1.txt
+---
+b|
+
+
+--
+cursor: (0,0)
+pending_wrap: true
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

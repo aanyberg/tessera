@@ -1,0 +1,4 @@
+# Fixture case E10_LF_does_not_set_wrapped_2x6 (tests/fixtures/print_c0_spec.txt).
+# Hard line breaks never mark `wrapped`.
+@size 2x6
+abc\ndef

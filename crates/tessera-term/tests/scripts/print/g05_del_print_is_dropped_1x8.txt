@@ -1,0 +1,4 @@
+# Fixture case G05_DEL_print_is_dropped_1x8 (tests/fixtures/print_c0_spec.txt).
+# IMPORTANT: the brief says DEL is handled in control::execute, but the parser delivers it as Print. Action::Print must drop U+007F (and any char < 0x20) or it will occupy a cell. Expected: 'ab', cursor index 2.
+@size 1x8
+a\x7fb

@@ -1,0 +1,4 @@
+# Fixture case E02_CRLF_pairs_3x6 (tests/fixtures/print_c0_spec.txt).
+# Normal line breaks.
+@size 3x6
+ab\r\ncd\r\nef

@@ -1,0 +1,4 @@
+# Fixture case E11_many_LF_pin_to_bottom_3x4 (tests/fixtures/print_c0_spec.txt).
+# Cursor pinned at the bottom row after repeated LF; no panic. Scrollback length is grid-defined (blank lines may or may not be retained) so it is not asserted.
+@size 3x4
+a\n\n\n\n\nb
