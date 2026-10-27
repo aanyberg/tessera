@@ -1,0 +1,23 @@
+[package]
+name = "tessera-ffi"
+description = "C ABI exposed to native frontends"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+tessera-app-core.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "tessera_ffi"
+crate-type = ["staticlib", "rlib"]
+
+[build-dependencies]
+cbindgen = "0.29"

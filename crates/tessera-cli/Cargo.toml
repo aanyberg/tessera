@@ -1,0 +1,20 @@
+[package]
+name = "tessera-cli"
+description = "Command-line client for the control socket"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+tessera-protocol.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "tessera"
+path = "src/main.rs"

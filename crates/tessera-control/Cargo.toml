@@ -1,0 +1,17 @@
+[package]
+name = "tessera-control"
+description = "Control socket server: auth, consent and dispatch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+tessera-protocol.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "tessera-term"
+description = "Terminal emulator: applies VT actions to a grid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+tessera-vt.workspace = true
+tessera-grid.workspace = true
+
+[lints]
+workspace = true

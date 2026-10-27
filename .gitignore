@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# macOS app build products
+/apps/macos/build
+/apps/macos/DerivedData
+/apps/macos/*.xcodeproj
+/apps/macos/TesseraCore.xcframework
+/apps/macos/Sources/TesseraCore/include/TesseraCore.h
+*.xcuserstate
+xcuserdata/
+
+.DS_Store

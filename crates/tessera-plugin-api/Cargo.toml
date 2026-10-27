@@ -1,0 +1,17 @@
+[package]
+name = "tessera-plugin-api"
+description = "Plugin trait, capabilities and event types shared by all plugin loaders"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,68 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/tessera-pty",
+    "crates/tessera-vt",
+    "crates/tessera-grid",
+    "crates/tessera-term",
+    "crates/tessera-shell-integration",
+    "crates/tessera-search",
+    "crates/tessera-render",
+    "crates/tessera-config",
+    "crates/tessera-plugin-api",
+    "crates/tessera-plugins/tessera-plugin-hello",
+    "crates/tessera-protocol",
+    "crates/tessera-control",
+    "crates/tessera-app-core",
+    "crates/tessera-ffi",
+    "crates/tessera-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/aanyberg/tessera"
+homepage = "https://github.com/aanyberg/tessera"
+authors = ["Alexander Nyberg <alexandernyberg@me.com>"]
+publish = false
+
+[workspace.dependencies]
+# internal
+tessera-pty = { path = "crates/tessera-pty" }
+tessera-vt = { path = "crates/tessera-vt" }
+tessera-grid = { path = "crates/tessera-grid" }
+tessera-term = { path = "crates/tessera-term" }
+tessera-shell-integration = { path = "crates/tessera-shell-integration" }
+tessera-search = { path = "crates/tessera-search" }
+tessera-render = { path = "crates/tessera-render" }
+tessera-config = { path = "crates/tessera-config" }
+tessera-plugin-api = { path = "crates/tessera-plugin-api" }
+tessera-plugin-hello = { path = "crates/tessera-plugins/tessera-plugin-hello" }
+tessera-protocol = { path = "crates/tessera-protocol" }
+tessera-control = { path = "crates/tessera-control" }
+tessera-app-core = { path = "crates/tessera-app-core" }
+
+# external
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

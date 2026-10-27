@@ -1,0 +1,16 @@
+[package]
+name = "tessera-render"
+description = "GPU renderer for the terminal surface (wgpu)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+tessera-grid.workspace = true
+
+[lints]
+workspace = true
