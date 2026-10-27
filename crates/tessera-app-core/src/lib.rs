@@ -9,16 +9,21 @@
 //! Today the core manages a flat set of sessions ([`App::spawn_session`],
 //! [`App::close_session`], …) and reports what happens in them through one
 //! [`SessionObserver`]; the window, tab and pane model builds on top.
+//! Frontend input reaches a session through [`App::send_input`] (see the
+//! [`input`] module).
 //!
 //! # Threads
 //!
 //! [`App`] is `Send + Sync` and every method takes `&self`, so a frontend may
 //! call it from any thread. Each session runs one reader thread, on which
-//! the observer is called. Dropping the `App` closes every session and joins
-//! its reader thread (see the [`session`] module for the close sequence).
+//! the observer is called, and one writer thread that feeds queued
+//! frontend input to the child. Dropping the `App` closes every session
+//! and joins both threads (see the [`session`] module for the close
+//! sequence).
 
 #![forbid(unsafe_code)]
 
+pub mod input;
 pub mod session;
 
 use std::collections::HashMap;
@@ -30,14 +35,16 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Instant;
 
 use tessera_pty::{NativePty, Pty, PtyEvents};
-use tessera_term::Terminal;
+use tessera_term::{KeyboardModes, Terminal, encode_key};
 
+pub use input::{InputEvent, InputOutcome};
 pub use session::{SessionEvent, SessionId, SessionObserver};
 // Re-exported so frontends (through `tessera-ffi`) depend on this crate
 // alone, as the layering in `docs/architecture.md` requires.
 pub use tessera_config::{Config, ConfigPaths};
 pub use tessera_pty::{ExitStatus, Program, PtyError, PtySize, SpawnOptions};
 
+use input::{Bindings, FocusEvent, MouseEvent};
 use session::{ObserverSlot, Session, lock};
 
 /// Application version reported to frontends and the control API.
@@ -53,8 +60,8 @@ pub enum Error {
     /// resize was rejected.
     #[error(transparent)]
     Pty(#[from] PtyError),
-    /// The session's reader thread could not be started.
-    #[error("failed to start the reader thread for session {id}: {source}")]
+    /// A session thread (reader or input writer) could not be started.
+    #[error("failed to start a session thread (reader or input writer) for session {id}: {source}")]
     ReaderThread {
         /// Session whose spawn failed.
         id: SessionId,
@@ -83,6 +90,7 @@ pub struct App {
     sessions: Mutex<HashMap<SessionId, Arc<Session>>>,
     next_id: AtomicU64,
     observers: ObserverSlot,
+    bindings: Bindings,
 }
 
 impl App {
@@ -96,6 +104,7 @@ impl App {
             sessions: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             observers: Arc::new(RwLock::new(None)),
+            bindings: Bindings::default(),
         }
     }
 
@@ -138,8 +147,9 @@ impl App {
     /// # Errors
     ///
     /// [`Error::Pty`] when the size is invalid, no PTY is available or the
-    /// program cannot be started; [`Error::ReaderThread`] when the reader
-    /// thread cannot be created (the child is then hung up).
+    /// program cannot be started; [`Error::ReaderThread`] when a session
+    /// thread (reader or input writer) cannot be created (the child is
+    /// then hung up).
     pub fn spawn_session(&self, options: SpawnOptions) -> Result<SessionId> {
         let id = self.allocate_id();
         let options = SpawnOptions {
@@ -238,6 +248,11 @@ impl App {
     /// Waits while the session's write queue is full (the child is not
     /// reading); gives up if the session is closed meanwhile.
     ///
+    /// Bypasses the queue that [`App::send_input`] feeds, so these bytes
+    /// may overtake or interleave with pending keys and pastes (both are
+    /// written in 64 KiB pieces, so a pending paste can be split around
+    /// them).
+    ///
     /// # Errors
     ///
     /// [`Error::SessionNotFound`] if `id` is not a live session,
@@ -259,17 +274,135 @@ impl App {
         Ok(self.session(id)?.resize(size)?)
     }
 
-    /// Discards session `id`'s scrollback.
+    /// Discards session `id`'s scrollback and returns its view to the live
+    /// screen.
     ///
     /// # Errors
     ///
     /// [`Error::SessionNotFound`] if `id` is not a live session.
     pub fn clear_scrollback(&self, id: SessionId) -> Result<()> {
-        let _session = self.session(id)?;
+        let session = self.session(id)?;
         // TODO(#2): call `Grid::clear_scrollback` through the terminal once
-        // the grid exposes it; until then there is nothing to discard
-        // because the terminal does not yet write into its grid.
+        // `Terminal` gives mutable access to its grid.
+        // TODO(#2, #8): every path that shrinks the scrollback (this one,
+        // ED 3, a smaller `max_scrollback`, leaving the alternate screen)
+        // must reset or clamp the session's stored scroll offset, as here.
+        session.scroll_to_bottom();
         Ok(())
+    }
+
+    /// Routes one frontend event to session `id` and reports whether the
+    /// core used it.
+    ///
+    /// * [`InputEvent::Key`]: a key bound to an application command runs it
+    ///   (no key is bound yet, #43); any other key is encoded for the child
+    ///   and queued for the session's writer thread **without blocking**
+    ///   (see the [`session`] module), and the view returns to the live
+    ///   screen. A key that encodes to nothing (a bare modifier,
+    ///   a release in legacy mode) is [`InputOutcome::Ignored`].
+    /// * [`InputEvent::Mouse`]: recorded as the last mouse event (cell
+    ///   clamped to the grid; see [`App::last_mouse`]); always
+    ///   [`InputOutcome::Ignored`] until mouse reporting and selection
+    ///   exist.
+    /// * [`InputEvent::Scroll`]: moves the scrollback view (see
+    ///   [`App::scroll_offset`]); [`InputOutcome::Consumed`] only when the
+    ///   offset changed.
+    /// * [`InputEvent::Paste`]: sanitised with [`input::sanitize_paste`]
+    ///   and queued like a key, **without blocking**, behind any input
+    ///   still pending, and the view returns to the live screen; text that
+    ///   sanitises to nothing is [`InputOutcome::Ignored`].
+    /// * [`InputEvent::Focus`]: recorded (see [`App::is_focused`]);
+    ///   [`InputOutcome::Consumed`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session;
+    /// [`Error::Write`] if the child has exited, the session is being
+    /// closed, or the key or paste does not fit in what is left of
+    /// [`session::PENDING_INPUT_BYTES`] (kind
+    /// [`io::ErrorKind::WouldBlock`]); nothing of it is queued then.
+    pub fn send_input(&self, id: SessionId, event: InputEvent) -> Result<InputOutcome> {
+        let session = self.session(id)?;
+        let write_error = |source| Error::Write { id, source };
+        match event {
+            InputEvent::Key(key) => {
+                if let Some(binding) = self.bindings.resolve(&key) {
+                    match binding {}
+                }
+                // TODO(#8): encode with the terminal's own keyboard modes
+                // (DECCKM, DECKPAM, modifyOtherKeys, kitty flags) once
+                // `Terminal` tracks them.
+                let bytes = encode_key(&key, &KeyboardModes::default());
+                if bytes.is_empty() {
+                    return Ok(InputOutcome::Ignored);
+                }
+                session.queue_input(bytes).map_err(write_error)?;
+                session.scroll_to_bottom();
+                Ok(InputOutcome::Consumed)
+            }
+            InputEvent::Mouse(mouse) => {
+                session.record_mouse(mouse);
+                Ok(InputOutcome::Ignored)
+            }
+            InputEvent::Scroll(scroll) => Ok(if session.scroll(scroll.delta_lines) {
+                InputOutcome::Consumed
+            } else {
+                InputOutcome::Ignored
+            }),
+            InputEvent::Paste(text) => {
+                let text = input::sanitize_paste(&text);
+                if text.is_empty() {
+                    return Ok(InputOutcome::Ignored);
+                }
+                // TODO(#8): wrap in `CSI 200 ~` ... `CSI 201 ~` when the
+                // terminal is in bracketed-paste mode (DECSET 2004).
+                let bracketed_paste = false;
+                let bytes = if bracketed_paste {
+                    [b"\x1b[200~", text.as_bytes(), b"\x1b[201~"].concat()
+                } else {
+                    text.into_bytes()
+                };
+                session.queue_input(bytes).map_err(write_error)?;
+                session.scroll_to_bottom();
+                Ok(InputOutcome::Consumed)
+            }
+            InputEvent::Focus(focus) => {
+                // TODO(#8): report `CSI I` / `CSI O` in focus-event mode
+                // (DECSET 1004).
+                session.set_focused(focus == FocusEvent::Gained);
+                Ok(InputOutcome::Consumed)
+            }
+        }
+    }
+
+    /// How many lines session `id`'s view is scrolled back from the live
+    /// screen: 0 at the bottom, at most the scrollback length.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn scroll_offset(&self, id: SessionId) -> Result<usize> {
+        Ok(self.session(id)?.scroll_offset())
+    }
+
+    /// Whether session `id`'s view has keyboard focus, as last reported
+    /// with [`InputEvent::Focus`]. A new session is not focused.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn is_focused(&self, id: SessionId) -> Result<bool> {
+        Ok(self.session(id)?.is_focused())
+    }
+
+    /// The last [`InputEvent::Mouse`] sent to session `id`, its cell
+    /// clamped to the grid, or `None` if there was none.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn last_mouse(&self, id: SessionId) -> Result<Option<MouseEvent>> {
+        Ok(self.session(id)?.last_mouse())
     }
 
     /// Runs `f` with session `id`'s terminal locked.
@@ -297,7 +430,7 @@ impl App {
 }
 
 impl Drop for App {
-    /// Closes every session and joins its reader thread.
+    /// Closes every session and joins its threads.
     fn drop(&mut self) {
         let sessions: Vec<_> = lock(&self.sessions)
             .drain()
@@ -346,6 +479,11 @@ mod tests {
         ignore_hangup: bool,
         /// Models a terminal held open by a grandchild after `SIGKILL`.
         ignore_kill: bool,
+        /// While set, `try_write` fails with `BrokenPipe` (the child exited
+        /// under a pending write).
+        broken: Arc<AtomicBool>,
+        /// While set, `try_write` panics.
+        panics: Arc<AtomicBool>,
     }
 
     impl FakePty {
@@ -363,6 +501,10 @@ mod tests {
         }
 
         fn try_write(&mut self, bytes: &[u8]) -> io::Result<()> {
+            assert!(!self.panics.load(Ordering::SeqCst), "fake PTY write panics");
+            if self.broken.load(Ordering::SeqCst) {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
             if self.would_block.load(Ordering::SeqCst) {
                 return Err(io::ErrorKind::WouldBlock.into());
             }
@@ -406,6 +548,8 @@ mod tests {
         written: Arc<Mutex<Vec<u8>>>,
         hangups: Arc<AtomicUsize>,
         would_block: Arc<AtomicBool>,
+        broken: Arc<AtomicBool>,
+        panics: Arc<AtomicBool>,
     }
 
     impl Fake {
@@ -434,6 +578,8 @@ mod tests {
         let written = Arc::new(Mutex::new(Vec::new()));
         let hangups = Arc::new(AtomicUsize::new(0));
         let would_block = Arc::new(AtomicBool::new(false));
+        let broken = Arc::new(AtomicBool::new(false));
+        let panics = Arc::new(AtomicBool::new(false));
         let pty = FakePty {
             events: Arc::clone(&events),
             written: Arc::clone(&written),
@@ -441,6 +587,8 @@ mod tests {
             would_block: Arc::clone(&would_block),
             ignore_hangup,
             ignore_kill,
+            broken: Arc::clone(&broken),
+            panics: Arc::clone(&panics),
         };
         let id = app.allocate_id();
         app.attach(id, Box::new(pty), rx, PtySize::default())
@@ -452,6 +600,8 @@ mod tests {
                 written,
                 hangups,
                 would_block,
+                broken,
+                panics,
             },
         )
     }
@@ -800,6 +950,441 @@ mod tests {
         }
         drop(app);
         assert!(started.elapsed() < TIMEOUT, "took {:?}", started.elapsed());
+    }
+
+    /// Waits until exactly `expected` has reached the fake PTY.
+    fn written_eventually(fake: &Fake, expected: &[u8]) {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let written = lock(&fake.written).clone();
+            if written == expected {
+                return;
+            }
+            assert!(
+                written.len() < expected.len() && Instant::now() < deadline,
+                "wrote {} bytes ending {:?}, expected {} bytes ending {:?}",
+                written.len(),
+                &written[written.len().saturating_sub(16)..],
+                expected.len(),
+                &expected[expected.len().saturating_sub(16)..],
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Proves nothing was queued for the child so far: input is written in
+    /// order, so a marker key sent now must be the first byte to arrive.
+    fn assert_nothing_written(app: &App, id: SessionId, fake: &Fake) {
+        let marker = KeyEvent::new(Key::Char('#'), Modifiers::NONE);
+        assert_eq!(key(app, id, marker), InputOutcome::Consumed);
+        written_eventually(fake, b"#");
+    }
+
+    fn key(app: &App, id: SessionId, event: KeyEvent) -> InputOutcome {
+        app.send_input(id, InputEvent::Key(event)).unwrap()
+    }
+
+    fn scroll(app: &App, id: SessionId, delta_lines: f32) -> InputOutcome {
+        let event = input::ScrollEvent {
+            delta_lines,
+            ..input::ScrollEvent::default()
+        };
+        app.send_input(id, InputEvent::Scroll(event)).unwrap()
+    }
+
+    /// Feeds `lines` newline-terminated lines and waits until the terminal
+    /// has applied them.
+    fn fill_scrollback(fake: &Fake, events: &Receiver<(SessionId, SessionEvent)>, lines: usize) {
+        let text = "x\r\n".repeat(lines);
+        fake.send(PtyEvent::Output(text.into_bytes()));
+        assert!(matches!(next(events), (_, SessionEvent::Output)));
+    }
+
+    use input::{FocusEvent, Key, KeyEvent, KeyEventKind, Modifiers, MouseButton, MouseEventKind};
+
+    #[test]
+    fn keys_are_encoded_and_written() {
+        let app = app();
+        let (id, fake) = attach_fake(&app, false);
+        let a = KeyEvent::new(Key::Char('a'), Modifiers::NONE);
+        assert_eq!(key(&app, id, a.clone()), InputOutcome::Consumed);
+        let enter = KeyEvent::new(Key::Enter, Modifiers::NONE);
+        assert_eq!(key(&app, id, enter), InputOutcome::Consumed);
+        let ctrl_c = KeyEvent::new(Key::Char('c'), Modifiers::CTRL);
+        assert_eq!(key(&app, id, ctrl_c), InputOutcome::Consumed);
+        let up = KeyEvent::new(Key::Up, Modifiers::NONE);
+        assert_eq!(key(&app, id, up), InputOutcome::Consumed);
+        written_eventually(&fake, b"a\r\x03\x1b[A");
+    }
+
+    #[test]
+    fn keys_that_encode_to_nothing_are_ignored() {
+        let app = app();
+        let (id, fake) = attach_fake(&app, false);
+        let release =
+            KeyEvent::new(Key::Char('a'), Modifiers::NONE).with_kind(KeyEventKind::Release);
+        let shift = KeyEvent::new(Key::LeftShift, Modifiers::SHIFT);
+        let control_char = KeyEvent::new(Key::Char('\u{1b}'), Modifiers::NONE);
+        for event in [release, shift, control_char] {
+            assert_eq!(key(&app, id, event), InputOutcome::Ignored);
+        }
+        assert_nothing_written(&app, id, &fake);
+    }
+
+    #[test]
+    fn control_text_falls_back_to_the_key() {
+        let app = app();
+        let (id, fake) = attach_fake(&app, false);
+        let event = KeyEvent::new(Key::Char('a'), Modifiers::NONE).with_text("\x1b[31m");
+        assert_eq!(key(&app, id, event), InputOutcome::Consumed);
+        let commit = KeyEvent::new(Key::Unidentified, Modifiers::NONE).with_text("\x1b[31m");
+        assert_eq!(key(&app, id, commit), InputOutcome::Ignored);
+        written_eventually(&fake, b"a");
+    }
+
+    #[test]
+    fn composed_text_is_sent_verbatim() {
+        let app = app();
+        let (id, fake) = attach_fake(&app, false);
+        // Option+E then E on a US layout: the frontend passes the composed
+        // text without ALT.
+        let event = KeyEvent::new(Key::Char('e'), Modifiers::NONE).with_text("é");
+        assert_eq!(key(&app, id, event), InputOutcome::Consumed);
+        written_eventually(&fake, "é".as_bytes());
+    }
+
+    #[test]
+    fn a_key_is_queued_while_the_child_is_not_reading() {
+        let app = app();
+        let (id, fake) = attach_fake(&app, false);
+        fake.would_block.store(true, Ordering::SeqCst);
+        // The PTY refuses every write, so returning at all proves the call
+        // did not wait for it.
+        assert_eq!(
+            key(&app, id, KeyEvent::new(Key::Char('x'), Modifiers::NONE)),
+            InputOutcome::Consumed
+        );
+        thread::sleep(Duration::from_millis(30));
+        assert!(lock(&fake.written).is_empty());
+        fake.would_block.store(false, Ordering::SeqCst);
+        written_eventually(&fake, b"x");
+    }
+
+    #[test]
+    fn a_paste_larger_than_the_pty_queue_never_blocks_and_keeps_order() {
+        let app = app();
+        let (id, fake) = attach_fake(&app, false);
+        fake.would_block.store(true, Ordering::SeqCst);
+        let big = "p".repeat(3 * tessera_pty::WRITE_QUEUE_BYTES);
+        let paste = app.send_input(id, InputEvent::Paste(big.clone())).unwrap();
+        assert_eq!(paste, InputOutcome::Consumed);
+        let after = KeyEvent::new(Key::Char('k'), Modifiers::NONE);
+        assert_eq!(key(&app, id, after), InputOutcome::Consumed);
+        assert!(lock(&fake.written).is_empty());
+        fake.would_block.store(false, Ordering::SeqCst);
+        let mut expected = big.into_bytes();
+        expected.push(b'k');
+        written_eventually(&fake, &expected);
+    }
+
+    #[test]
+    fn pending_input_is_bounded_and_refused_whole() {
+        let app = app();
+        let (id, fake) = attach_fake(&app, false);
+        fake.would_block.store(true, Ordering::SeqCst);
+        let would_block = |result: Result<InputOutcome>| {
+            write_error_kind(&result) == Some(io::ErrorKind::WouldBlock)
+        };
+        let too_big = "x".repeat(session::PENDING_INPUT_BYTES + 1);
+        assert!(would_block(app.send_input(id, InputEvent::Paste(too_big))));
+        let exactly = "y".repeat(session::PENDING_INPUT_BYTES);
+        let paste = app.send_input(id, InputEvent::Paste(exactly)).unwrap();
+        assert_eq!(paste, InputOutcome::Consumed);
+        let key_event = InputEvent::Key(KeyEvent::new(Key::Char('z'), Modifiers::NONE));
+        assert!(would_block(app.send_input(id, key_event.clone())));
+        fake.would_block.store(false, Ordering::SeqCst);
+        // Once the child reads, there is room again.
+        let deadline = Instant::now() + TIMEOUT;
+        while lock(&fake.written).len() < session::PENDING_INPUT_BYTES {
+            assert!(Instant::now() < deadline, "pending input never drained");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            match app.send_input(id, key_event.clone()) {
+                Ok(outcome) => break assert_eq!(outcome, InputOutcome::Consumed),
+                Err(err) => {
+                    assert!(Instant::now() < deadline, "still refused: {err}");
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        let deadline = Instant::now() + TIMEOUT;
+        while lock(&fake.written).last() != Some(&b'z') {
+            assert!(Instant::now() < deadline, "the key never arrived");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            lock(&fake.written)[..session::PENDING_INPUT_BYTES]
+                .iter()
+                .all(|&b| b == b'y')
+        );
+    }
+
+    /// The kind of the `Error::Write` in `result`, if it is one.
+    fn write_error_kind(result: &Result<InputOutcome>) -> Option<io::ErrorKind> {
+        match result {
+            Err(Error::Write { source, .. }) => Some(source.kind()),
+            _ => None,
+        }
+    }
+
+    /// Queues a paste the fake refuses, breaks the fake with `break_it`,
+    /// then waits until input to the session fails with `kind`, and checks
+    /// that closing it is still prompt.
+    fn writer_failure_is_reported(break_it: impl FnOnce(&Fake), kind: io::ErrorKind) {
+        let app = app();
+        let (id, fake) = attach_fake(&app, false);
+        fake.would_block.store(true, Ordering::SeqCst);
+        let paste = app.send_input(id, InputEvent::Paste("pending".into()));
+        assert_eq!(paste.unwrap(), InputOutcome::Consumed);
+        break_it(&fake);
+        fake.would_block.store(false, Ordering::SeqCst);
+        let key_event = InputEvent::Key(KeyEvent::new(Key::Char('k'), Modifiers::NONE));
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let result = app.send_input(id, key_event.clone());
+            if write_error_kind(&result) == Some(kind) {
+                break;
+            }
+            assert!(
+                result.is_ok() && Instant::now() < deadline,
+                "unexpected {result:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let started = Instant::now();
+        app.close_session(id).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "close took {:?}",
+            started.elapsed()
+        );
+        assert!(lock(&fake.written).is_empty());
+    }
+
+    #[test]
+    fn a_failed_writer_refuses_later_input() {
+        writer_failure_is_reported(
+            |fake| fake.broken.store(true, Ordering::SeqCst),
+            io::ErrorKind::BrokenPipe,
+        );
+    }
+
+    #[test]
+    fn a_panicking_writer_refuses_later_input() {
+        writer_failure_is_reported(
+            |fake| fake.panics.store(true, Ordering::SeqCst),
+            io::ErrorKind::Other,
+        );
+    }
+
+    #[test]
+    fn close_drops_pending_input_promptly() {
+        let app = app();
+        let (id, fake) = attach_fake(&app, false);
+        fake.would_block.store(true, Ordering::SeqCst);
+        let big = "p".repeat(2 * tessera_pty::WRITE_QUEUE_BYTES);
+        let paste = app.send_input(id, InputEvent::Paste(big)).unwrap();
+        assert_eq!(paste, InputOutcome::Consumed);
+        let started = Instant::now();
+        app.close_session(id).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "close took {:?}",
+            started.elapsed()
+        );
+        fake.would_block.store(false, Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(30));
+        assert!(lock(&fake.written).is_empty(), "pending input was written");
+    }
+
+    #[test]
+    fn paste_is_sanitised_before_it_is_written() {
+        let app = app();
+        let (id, fake) = attach_fake(&app, false);
+        let outcome = app
+            .send_input(id, InputEvent::Paste("a\nb\x1b[31mc\r\nd\u{9b}".into()))
+            .unwrap();
+        assert_eq!(outcome, InputOutcome::Consumed);
+        let empty = app
+            .send_input(id, InputEvent::Paste("\x1b\x07".into()))
+            .unwrap();
+        assert_eq!(empty, InputOutcome::Ignored);
+        let marker = KeyEvent::new(Key::Char('m'), Modifiers::NONE);
+        assert_eq!(key(&app, id, marker), InputOutcome::Consumed);
+        written_eventually(&fake, b"a\rb[31mc\rdm");
+    }
+
+    #[test]
+    fn focus_round_trips_and_writes_nothing() {
+        let app = app();
+        let (id, fake) = attach_fake(&app, false);
+        assert!(!app.is_focused(id).unwrap(), "new sessions are not focused");
+        let gained = app.send_input(id, InputEvent::Focus(FocusEvent::Gained));
+        assert_eq!(gained.unwrap(), InputOutcome::Consumed);
+        assert!(app.is_focused(id).unwrap());
+        let lost = app.send_input(id, InputEvent::Focus(FocusEvent::Lost));
+        assert_eq!(lost.unwrap(), InputOutcome::Consumed);
+        assert!(!app.is_focused(id).unwrap());
+        assert_nothing_written(&app, id, &fake);
+    }
+
+    #[test]
+    fn mouse_is_clamped_to_the_grid_recorded_and_ignored() {
+        let app = app();
+        let (id, fake) = attach_fake(&app, false);
+        assert_eq!(app.last_mouse(id).unwrap(), None);
+        let event = input::MouseEvent {
+            kind: MouseEventKind::Press,
+            button: MouseButton::Left,
+            col: u16::MAX,
+            row: 3,
+            x_px: -12.5,
+            y_px: 1e9,
+            modifiers: Modifiers::SHIFT,
+        };
+        let outcome = app.send_input(id, InputEvent::Mouse(event)).unwrap();
+        assert_eq!(outcome, InputOutcome::Ignored);
+        let recorded = app.last_mouse(id).unwrap().unwrap();
+        assert_eq!(recorded, input::MouseEvent { col: 79, ..event });
+        assert_nothing_written(&app, id, &fake);
+    }
+
+    #[test]
+    fn scroll_clamps_to_the_scrollback() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        // Nothing to scroll into yet.
+        assert_eq!(scroll(&app, id, 3.0), InputOutcome::Ignored);
+        assert_eq!(app.scroll_offset(id).unwrap(), 0);
+        // 24 rows; 30 lines plus the cursor's empty row push 7 into the
+        // scrollback.
+        fill_scrollback(&fake, &events, 30);
+        let max = app
+            .with_terminal(id, |term| term.grid().scrollback_len())
+            .unwrap();
+        assert_eq!(max, 7);
+        assert_eq!(scroll(&app, id, 3.0), InputOutcome::Consumed);
+        assert_eq!(app.scroll_offset(id).unwrap(), 3);
+        assert_eq!(scroll(&app, id, 100.0), InputOutcome::Consumed);
+        assert_eq!(app.scroll_offset(id).unwrap(), max);
+        assert_eq!(scroll(&app, id, f32::MAX), InputOutcome::Ignored);
+        assert_eq!(app.scroll_offset(id).unwrap(), max);
+        // The overshoot was not banked: one line back moves at once.
+        assert_eq!(scroll(&app, id, -1.0), InputOutcome::Consumed);
+        assert_eq!(app.scroll_offset(id).unwrap(), max - 1);
+        assert_eq!(scroll(&app, id, -1e30), InputOutcome::Consumed);
+        assert_eq!(app.scroll_offset(id).unwrap(), 0);
+        assert_eq!(scroll(&app, id, f32::MIN), InputOutcome::Ignored);
+        assert_eq!(scroll(&app, id, -0.5), InputOutcome::Ignored);
+        assert_eq!(app.scroll_offset(id).unwrap(), 0);
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(scroll(&app, id, bad), InputOutcome::Ignored);
+        }
+        assert_eq!(app.scroll_offset(id).unwrap(), 0);
+        assert_nothing_written(&app, id, &fake);
+    }
+
+    #[test]
+    fn scroll_fractions_accumulate() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        fill_scrollback(&fake, &events, 40);
+        // Quarters are exact in binary, so the arithmetic below is too.
+        for _ in 0..3 {
+            for _ in 0..3 {
+                assert_eq!(scroll(&app, id, 0.25), InputOutcome::Ignored);
+            }
+            assert_eq!(scroll(&app, id, 0.25), InputOutcome::Consumed);
+        }
+        assert_eq!(app.scroll_offset(id).unwrap(), 3);
+        assert_eq!(scroll(&app, id, 0.75), InputOutcome::Ignored);
+        // 1.25 lines: one applied, a quarter banked.
+        assert_eq!(scroll(&app, id, 0.5), InputOutcome::Consumed);
+        assert_eq!(app.scroll_offset(id).unwrap(), 4);
+        // The banked quarter counts against a change of direction.
+        assert_eq!(scroll(&app, id, -0.5), InputOutcome::Ignored);
+        assert_eq!(scroll(&app, id, -0.5), InputOutcome::Ignored);
+        assert_eq!(scroll(&app, id, -0.5), InputOutcome::Consumed);
+        assert_eq!(app.scroll_offset(id).unwrap(), 3);
+    }
+
+    #[test]
+    fn typing_and_pasting_return_the_view_to_the_bottom() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        fill_scrollback(&fake, &events, 40);
+        assert_eq!(scroll(&app, id, 5.0), InputOutcome::Consumed);
+        let shift = KeyEvent::new(Key::LeftShift, Modifiers::SHIFT);
+        assert_eq!(key(&app, id, shift), InputOutcome::Ignored);
+        assert_eq!(
+            app.scroll_offset(id).unwrap(),
+            5,
+            "ignored keys keep the view"
+        );
+        let a = KeyEvent::new(Key::Char('a'), Modifiers::NONE);
+        assert_eq!(key(&app, id, a), InputOutcome::Consumed);
+        assert_eq!(app.scroll_offset(id).unwrap(), 0);
+        assert_eq!(scroll(&app, id, 5.0), InputOutcome::Consumed);
+        let paste = app.send_input(id, InputEvent::Paste("x".into())).unwrap();
+        assert_eq!(paste, InputOutcome::Consumed);
+        assert_eq!(app.scroll_offset(id).unwrap(), 0);
+    }
+
+    #[test]
+    fn input_to_unknown_sessions_is_rejected() {
+        let app = app();
+        let id = SessionId::from_raw(9);
+        let events = [
+            InputEvent::Key(KeyEvent::new(Key::Enter, Modifiers::NONE)),
+            InputEvent::Mouse(input::MouseEvent::default()),
+            InputEvent::Scroll(input::ScrollEvent::default()),
+            InputEvent::Paste("x".into()),
+            InputEvent::Focus(FocusEvent::Gained),
+        ];
+        for event in events {
+            assert!(matches!(
+                app.send_input(id, event),
+                Err(Error::SessionNotFound(_))
+            ));
+        }
+        assert!(matches!(
+            app.scroll_offset(id),
+            Err(Error::SessionNotFound(_))
+        ));
+        assert!(matches!(app.is_focused(id), Err(Error::SessionNotFound(_))));
+        assert!(matches!(app.last_mouse(id), Err(Error::SessionNotFound(_))));
+    }
+
+    #[test]
+    fn input_to_a_closing_session_fails_without_writing() {
+        let app = app();
+        let (id, fake) = attach_fake(&app, true);
+        let session = app.session(id).unwrap();
+        session.begin_close();
+        let result = app.send_input(
+            id,
+            InputEvent::Key(KeyEvent::new(Key::Enter, Modifiers::NONE)),
+        );
+        assert!(matches!(result, Err(Error::Write { .. })), "{result:?}");
+        let result = app.send_input(id, InputEvent::Paste("x".into()));
+        assert!(matches!(result, Err(Error::Write { .. })), "{result:?}");
+        assert!(lock(&fake.written).is_empty());
+        fake.exit(ExitStatus::Signaled(1));
     }
 
     #[test]

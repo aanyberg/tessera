@@ -1,6 +1,7 @@
 #!/usr/bin/env zsh
-# Builds tessera-ffi, compiles crates/tessera-ffi/tests/c/lifecycle.c against
-# the generated TesseraCore.h and the static library, and runs it.
+# Builds tessera-ffi, compiles each C test in crates/tessera-ffi/tests/c
+# (lifecycle.c, then input.c) against the generated TesseraCore.h and the
+# static library, and runs it.
 # Usage: scripts/ffi-c-test.sh [worktree-dir]   (defaults to the repo root)
 set -euo pipefail
 dir="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
@@ -22,10 +23,12 @@ case "$(uname -s)" in
     *) native_libs=(-lutil -ldl -lm) ;;
 esac
 
-"${CC:-cc}" -std=c11 -Wall -Wextra -Werror -pedantic \
-    -I "$include_dir" \
-    crates/tessera-ffi/tests/c/lifecycle.c \
-    "$target_dir/debug/libtessera_ffi.a" \
-    $native_libs -lpthread \
-    -o "$out_dir/lifecycle"
-"$out_dir/lifecycle"
+for test in lifecycle input; do
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -pedantic \
+        -I "$include_dir" \
+        "crates/tessera-ffi/tests/c/$test.c" \
+        "$target_dir/debug/libtessera_ffi.a" \
+        $native_libs -lpthread \
+        -o "$out_dir/$test"
+    "$out_dir/$test"
+done

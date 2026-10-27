@@ -193,10 +193,12 @@ pub unsafe extern "C" fn tessera_session_close(app: *mut App, session_id: u64) -
 /// except `tessera_app_free`. Blocks while the session's input queue
 /// (1 MiB) is full because the child is not reading, with no time limit,
 /// until the child reads or the session is closed (from another thread);
-/// a large paste is best written from a background thread. Until the
-/// non-blocking input API lands (#26), a host that writes keystrokes on its
-/// UI thread can stall there behind a child that stopped reading. The bytes
-/// are copied before this returns.
+/// a large paste is best written from a background thread. For keystrokes
+/// and pastes use `tessera_session_send_key` and `tessera_session_paste`,
+/// which never block; bytes written here bypass their pending input and may
+/// overtake or interleave with it (at 64 KiB chunk boundaries, so a pending
+/// paste can be split around them). The bytes are copied before this
+/// returns.
 ///
 /// Input is queued in chunks of up to 64 KiB. Bytes from one call stay in
 /// order, but calls made concurrently from several threads for the same
