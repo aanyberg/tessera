@@ -580,9 +580,10 @@ mod native {
     ///
     /// `kqueue` watches an inode, not a name, so after a rename-save, a
     /// delete and recreate, or a removed directory this must run again to
-    /// follow the current inode. A path unlinked between the open and the
-    /// registration never produces `NOTE_DELETE`, so the handle's link
-    /// count is checked after arming and such a path counts as missing.
+    /// follow the current inode. A path removed or replaced between the
+    /// open and the registration never produces `NOTE_DELETE` for the armed
+    /// handle, so after arming the path must still name the handle's inode
+    /// (see [`still_names`]); otherwise it counts as missing.
     ///
     /// The type is checked with `stat` before opening: a FIFO where
     /// `config.toml` should be would otherwise block the open until a
@@ -618,13 +619,37 @@ mod native {
             Err(e) => return Err(e),
         };
         queue.add_file(&handle, EventFilter::EVFILT_VNODE, kind.flags())?;
-        queue.watch()?;
-        if handle.metadata()?.nlink() == 0 {
-            let _ = queue.remove_file(&handle, EventFilter::EVFILT_VNODE);
-            return Ok(());
+        match queue.watch().and_then(|()| still_names(path, &handle)) {
+            Ok(true) => {
+                *slot = Some(handle);
+                Ok(())
+            }
+            armed => {
+                // Not armed after all: drop the queue's entry before the
+                // handle closes, so no later `watch()` re-submits a closed
+                // (or reused) descriptor.
+                let _ = queue.remove_file(&handle, EventFilter::EVFILT_VNODE);
+                armed.map(|_| ())
+            }
         }
-        *slot = Some(handle);
-        Ok(())
+    }
+
+    /// Whether `path` still names the inode `handle` has open. `false` when
+    /// the handle's inode has been unlinked, or the path is missing or now
+    /// names another inode. The link count alone is not enough: APFS
+    /// reports two links for an open directory after `rmdir`, so a
+    /// directory removed between the open and the registration would
+    /// otherwise look armed while nothing watches the path.
+    fn still_names(path: &Path, handle: &File) -> std::io::Result<bool> {
+        let armed = handle.metadata()?;
+        if armed.nlink() == 0 {
+            return Ok(false);
+        }
+        match std::fs::metadata(path) {
+            Ok(current) => Ok(current.dev() == armed.dev() && current.ino() == armed.ino()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// The directory holding the final target of `file` when `file` is a
@@ -820,6 +845,44 @@ mod native {
 
                 reload_and_report(store);
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_directory_removed_after_opening_is_no_longer_named() {
+            let base = tempfile::tempdir().unwrap();
+            let dir = base.path().join("Tessera");
+            std::fs::create_dir(&dir).unwrap();
+            let handle = File::open(&dir).unwrap();
+            assert!(still_names(&dir, &handle).unwrap());
+
+            std::fs::remove_dir(&dir).unwrap();
+            assert!(!still_names(&dir, &handle).unwrap(), "removed");
+
+            std::fs::create_dir(&dir).unwrap();
+            assert!(!still_names(&dir, &handle).unwrap(), "recreated");
+        }
+
+        #[test]
+        fn a_file_unlinked_or_replaced_after_opening_is_no_longer_named() {
+            let base = tempfile::tempdir().unwrap();
+            let path = base.path().join("config.toml");
+            std::fs::write(&path, "").unwrap();
+            let handle = File::open(&path).unwrap();
+            assert!(still_names(&path, &handle).unwrap());
+
+            let tmp = base.path().join("config.toml.new");
+            std::fs::write(&tmp, "").unwrap();
+            std::fs::rename(&tmp, &path).unwrap();
+            assert!(!still_names(&path, &handle).unwrap(), "replaced");
+
+            let handle = File::open(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            assert!(!still_names(&path, &handle).unwrap(), "unlinked");
         }
     }
 }

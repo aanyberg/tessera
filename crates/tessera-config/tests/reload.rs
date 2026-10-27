@@ -8,11 +8,25 @@ use tessera_config::{
     write_atomic,
 };
 
+/// Bound for an event that follows straight from a kernel event or a poll
+/// sample: at most a poll interval plus the debounce (150 ms by default),
+/// well inside the 500 ms the issue requires.
 const LIMIT: Duration = Duration::from_millis(500);
 const BACKENDS: [WatchBackend; 2] = [WatchBackend::Native, WatchBackend::Poll];
 
 fn font_size_doc(size: u32) -> String {
     format!("[appearance]\nfont_size = {size}\n")
+}
+
+/// Bound for a step the native backend recovers through its poll fallback
+/// (a removed directory coming back, a file becoming readable again): one
+/// `poll_interval` to notice, then at worst a debounce capped by
+/// `max_wait`, times four for scheduling stalls on loaded CI runners.
+/// `recv_timeout` returns as soon as the event arrives, so the headroom
+/// costs nothing when the backend is on time.
+fn recovery_limit() -> Duration {
+    let defaults = WatchOptions::default();
+    (defaults.poll_interval + defaults.max_wait) * 4
 }
 
 fn options(backend: WatchBackend) -> WatchOptions {
@@ -508,7 +522,7 @@ fn symlink_target_directory_removed_and_recreated_is_followed() {
         std::fs::write(&target, font_size_doc(16)).unwrap();
         let changed = expect_changed(
             watcher
-                .recv_timeout(LIMIT)
+                .recv_timeout(recovery_limit())
                 .unwrap_or_else(|e| panic!("{backend:?}: restored checkout not seen: {e}")),
             backend,
         );
@@ -539,7 +553,7 @@ fn removing_and_recreating_the_root_directory_is_followed() {
         std::fs::write(paths.config_file(), font_size_doc(30)).unwrap();
         let changed = expect_changed(
             watcher
-                .recv_timeout(LIMIT)
+                .recv_timeout(recovery_limit())
                 .unwrap_or_else(|e| panic!("{backend:?}: recreated: {e}")),
             backend,
         );
@@ -579,7 +593,7 @@ fn unreadable_then_restored_file_is_followed() {
         // though the content is the same.
         let changed = expect_changed(
             watcher
-                .recv_timeout(LIMIT)
+                .recv_timeout(recovery_limit())
                 .unwrap_or_else(|e| panic!("{backend:?}: recovery not seen: {e}")),
             backend,
         );
@@ -624,7 +638,7 @@ fn watch_starts_over_an_unopenable_file_and_recovers() {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let changed = expect_changed(
             watcher
-                .recv_timeout(LIMIT)
+                .recv_timeout(recovery_limit())
                 .unwrap_or_else(|e| panic!("{backend:?}: recovery not seen: {e}")),
             backend,
         );
@@ -646,7 +660,7 @@ fn watch_starts_over_an_unopenable_file_and_recovers() {
         std::fs::write(&other, font_size_doc(22)).unwrap();
         let changed = expect_changed(
             watcher
-                .recv_timeout(LIMIT)
+                .recv_timeout(recovery_limit())
                 .unwrap_or_else(|e| panic!("{backend:?}: resolved cycle not seen: {e}")),
             backend,
         );

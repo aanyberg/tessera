@@ -55,9 +55,11 @@ on the dead inode and nothing can wake the thread when the directory comes
 back, so the native backend polls at `WatchOptions::poll_interval` until
 the directory exists again, re-registers it, and returns to sleeping on
 kernel events. Registrations are made from handles the backend owns, and a
-handle whose link count is zero right after arming (unlinked between the
-open and the `kevent` call, which can never fire `NOTE_DELETE`) is treated
-as missing.
+handle whose path no longer names its inode right after arming (removed or
+replaced between the open and the `kevent` call, which can never fire
+`NOTE_DELETE`) is treated as missing. The check compares device and inode
+numbers rather than the link count, since APFS still reports two links for
+an open directory after `rmdir`.
 
 A `config.toml` that is a symlink (into a dotfiles checkout, say) is
 followed to its target: the directory holding the final target is
