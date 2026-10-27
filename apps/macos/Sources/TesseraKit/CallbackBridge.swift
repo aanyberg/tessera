@@ -1,0 +1,136 @@
+import Synchronization
+internal import TesseraCore
+
+/// Receives the core's callbacks on its reader threads and delivers them to the
+/// ``TesseraAppDelegate`` on the main actor.
+///
+/// The bridge is the `user_data` of the installed `TesseraCallbacks`, passed
+/// unretained: ``TesseraApp`` keeps it alive until `tessera_app_free` has
+/// returned, after which the core never uses `user_data` again.
+///
+/// Each C callback copies its arguments (the title string before it returns),
+/// then hops to the main actor with an unstructured `Task`. It never waits for
+/// the main thread: closing a session and freeing the application wait for a
+/// running callback, so a synchronous hop would deadlock.
+///
+/// Events are coalesced per session, because the core calls back once per PTY
+/// read and once per BEL byte, which a program can emit far faster than any
+/// delegate runs (`yes $'\a'`): one `Task` per event would grow the main
+/// queue without bound. Each callback records its event in the session's
+/// pending set (output: a flag; title: the latest value; bell: a flag; exit:
+/// the code and signal) and schedules a delivery only if none is queued for
+/// that session. The delivery takes the whole set and reports it in a fixed
+/// order: output, title, bell, exit. So at most one delivery per session is
+/// queued at any time; a delivery reports what happened since the previous
+/// one; and the exit, the core's last callback for a session, is always
+/// delivered last.
+@MainActor
+final class CallbackBridge {
+    weak var delegate: (any TesseraAppDelegate)?
+
+    /// Sessions this application owns, by id: open sessions and exited ones
+    /// not yet closed.
+    private(set) var sessions: [UInt64: TesseraSession] = [:]
+    private var isShutDown = false
+
+    /// Events received and not yet delivered, by session. A session has an
+    /// entry exactly while a delivery for it is queued on the main actor.
+    private nonisolated let pending = Mutex<[UInt64: Pending]>([:])
+
+    func register(_ session: TesseraSession) {
+        guard !isShutDown else { return }
+        sessions[session.id] = session
+    }
+
+    func unregister(_ id: UInt64) {
+        sessions[id] = nil
+    }
+
+    /// Called after `tessera_app_free` returned: drops the sessions (breaking
+    /// their reference back to the bridge). Deliveries already queued still
+    /// run; each takes its pending record and drops it because `isShutDown` is
+    /// set.
+    func shutDown() {
+        isShutDown = true
+        sessions.removeAll()
+    }
+
+    /// The C callback table for this bridge. The function pointers capture
+    /// nothing; they find the bridge through `user_data`.
+    nonisolated func callbacks() -> TesseraCallbacks {
+        TesseraCallbacks(
+            user_data: Unmanaged.passUnretained(self).toOpaque(),
+            on_session_output: { userData, id in
+                CallbackBridge.from(userData)?.receive(for: id) { $0.output = true }
+            },
+            on_session_title: { userData, id, title in
+                // `title` is valid only during this call: copy it now.
+                let copy = title.map { String(cString: $0) } ?? ""
+                CallbackBridge.from(userData)?.receive(for: id) { $0.title = copy }
+            },
+            on_session_bell: { userData, id in
+                CallbackBridge.from(userData)?.receive(for: id) { $0.bell = true }
+            },
+            on_session_exit: { userData, id, code, signal in
+                CallbackBridge.from(userData)?.receive(for: id) { $0.exit = (code, signal) }
+            }
+        )
+    }
+
+    private nonisolated static func from(_ userData: UnsafeMutableRawPointer?) -> CallbackBridge? {
+        guard let userData else { return nil }
+        return Unmanaged<CallbackBridge>.fromOpaque(userData).takeUnretainedValue()
+    }
+
+    // MARK: Reader threads
+
+    /// What one session did since its last delivery.
+    private struct Pending: Sendable {
+        var output = false
+        var title: String?
+        var bell = false
+        var exit: (code: Int32, signal: Int32)?
+    }
+
+    private nonisolated func receive(for id: UInt64, _ record: (inout Pending) -> Void) {
+        let schedule = pending.withLock { pending in
+            var isNew = false
+            if pending[id] == nil {
+                pending[id] = Pending()
+                isNew = true
+            }
+            record(&pending[id]!)
+            return isNew
+        }
+        guard schedule else { return }
+        Task { @MainActor in
+            self.deliver(id)
+        }
+    }
+
+    // MARK: Main actor
+
+    private func deliver(_ id: UInt64) {
+        // Taken before the delegate runs, so events arriving meanwhile
+        // schedule the next delivery.
+        guard let events = pending.withLock({ $0.removeValue(forKey: id) }) else { return }
+        // The delegate may close the session, shut the app down or replace
+        // itself in any call, so look both up again before each one.
+        func target() -> (any TesseraAppDelegate, TesseraSession)? {
+            guard !isShutDown, let session = sessions[id], let delegate else { return nil }
+            return (delegate, session)
+        }
+        if events.output, let (delegate, session) = target() {
+            delegate.sessionDidOutput(session)
+        }
+        if let title = events.title, let (delegate, session) = target() {
+            delegate.session(session, didSetTitle: title)
+        }
+        if events.bell, let (delegate, session) = target() {
+            delegate.sessionDidRingBell(session)
+        }
+        if let exit = events.exit, let (delegate, session) = target() {
+            delegate.session(session, didExitWithCode: exit.code, signal: exit.signal)
+        }
+    }
+}

@@ -29,8 +29,9 @@
 ## Swift
 
 - Swift 6 language mode, strict concurrency.
-- The app talks to Rust only through `TesseraCore` (the generated header).
-  No business logic in Swift that could live in Rust.
+- The app talks to Rust only through `TesseraKit`, the Swift wrapper over
+  the generated header (ADR 0012); only `apps/macos/Sources/TesseraKit`
+  imports `TesseraCore`. No business logic in Swift that could live in Rust.
 
 ## Releases
 

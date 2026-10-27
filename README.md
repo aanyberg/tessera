@@ -41,6 +41,7 @@ Requirements: macOS 15+, Xcode 16+, Rust stable (via `rustup`), and
 ```sh
 just check   # fmt, clippy -D warnings, tests, cargo-deny
 just app     # universal xcframework + Xcode build
+just app-test  # TesseraKit XCTest suite (headless, Thread Sanitizer)
 just run     # launch Tessera.app
 ```
 

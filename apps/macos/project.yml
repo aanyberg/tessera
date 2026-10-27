@@ -43,9 +43,47 @@ targets:
       properties:
         com.apple.security.app-sandbox: false
     dependencies:
-      - framework: TesseraCore.xcframework
+      # The app reaches the Rust core only through the Swift wrapper (ADR 0012).
+      # Static, so nothing is embedded: with the hardened runtime, dyld's library
+      # validation rejects an ad-hoc signed framework (no Team ID) at launch.
+      - target: TesseraKit
         embed: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.aanyberg.tessera
         SWIFT_OBJC_INTEROP_MODE: objc
+    scheme: {}
+  # Swift wrapper over the C module `TesseraCore` (the generated TesseraCore.h in
+  # TesseraCore.xcframework). The static Rust library is linked into this framework.
+  TesseraKit:
+    type: framework.static
+    platform: macOS
+    sources:
+      - path: Sources/TesseraKit
+    dependencies:
+      - framework: TesseraCore.xcframework
+        embed: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aanyberg.TesseraKit
+        GENERATE_INFOPLIST_FILE: YES
+        # Linked into Tessera.app; keeps `xcodebuild archive` an application archive.
+        SKIP_INSTALL: YES
+        # libtool merges libtessera_ffi.a into TesseraKit.a; Rust's empty object
+        # files (cfg_if, compiler_builtins) would each print a warning.
+        OTHER_LIBTOOLFLAGS: -no_warning_for_no_symbols
+    scheme:
+      testTargets:
+        - TesseraKitTests
+  TesseraKitTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests/TesseraKitTests
+    dependencies:
+      - target: TesseraKit
+        embed: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aanyberg.TesseraKitTests
+        GENERATE_INFOPLIST_FILE: YES
