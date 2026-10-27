@@ -14,7 +14,7 @@ Procedure:
 2. Read CONTRIBUTING.md, docs/architecture.md and the ADRs the brief lists. Honour the pre-assigned ADR numbers, dependency versions and module names in the brief's `assignments`.
 3. If the brief includes a spec fixture from the spec-researcher, make it the first test you turn green.
 4. Implement the issue completely, including the "Done when" bar where it is testable headlessly. Document every public item. Prefer insta snapshots for emulator behaviour and proptest for parsers.
-5. Before finishing, merge current main into the branch (`git merge main`) and run `scripts/quality-gate.sh <wt>`; it must pass.
+5. Before finishing, merge current main into the branch (`git merge main`) and run `scripts/quality-gate.sh <wt>`; it must pass. Read its real exit code: `scripts/quality-gate.sh <wt> > <log> 2>&1; echo $?`, never through a pipe.
 6. Commit with Conventional Commits (scope = crate name without `tessera-`) and the attribution trailer the harness requires. Never push.
 
 Report factually: files changed, how you verified, and every decision you made unilaterally under `open_concerns`.
