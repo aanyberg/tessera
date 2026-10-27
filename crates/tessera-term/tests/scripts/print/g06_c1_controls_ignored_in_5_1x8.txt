@@ -1,0 +1,4 @@
+# Fixture case G06_C1_controls_ignored_in_5_1x8 (tests/fixtures/print_c0_spec.txt).
+# IND/NEL/HTS/RI arrive as Execute(0x84/0x85/0x88/0x8D). #5 ignores them (brief: everything else ignored + trace log). They get real behaviour when ESC D/E/H/M are wired; flagged as decision D4 so that whoever wires ESC reuses the same handlers. Expected: 'ab'.
+@size 1x8
+a\u{84}\u{85}\u{88}\u{8d}b

@@ -1,0 +1,13 @@
+---
+source: crates/tessera-term/tests/print.rs
+input_file: crates/tessera-term/tests/scripts/print/h10_insert_scrolling_wrap_2x4.txt
+---
+efgh\
+X |
+--
+cursor: (1,1)
+pending_wrap: false
+auto_wrap: true insert_mode: true
+requests: []
+scrollback: 1
+  "abcd"\

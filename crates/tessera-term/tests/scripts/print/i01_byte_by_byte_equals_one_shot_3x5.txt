@@ -1,0 +1,4 @@
+# Fixture case I01_byte_by_byte_equals_one_shot_3x5 (tests/fixtures/print_c0_spec.txt).
+# Feeding one byte per advance() call must produce the same screen as a single call. The test should run EVERY case in this file both ways.
+@size 3x5
+abcdefg\r\n\thi\x07

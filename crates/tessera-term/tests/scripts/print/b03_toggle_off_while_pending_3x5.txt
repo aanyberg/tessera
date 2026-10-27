@@ -1,0 +1,6 @@
+# Fixture case B03_toggle_off_while_pending_3x5 (tests/fixtures/print_c0_spec.txt).
+# Pending wrap armed under DECAWM on, then DECAWM turned off: X overwrites col 5, row 1 not wrapped. This is the grid.goto(row, cols-1) path from the lead brief.
+@size 3x5
+abcde
+@set auto_wrap false
+X

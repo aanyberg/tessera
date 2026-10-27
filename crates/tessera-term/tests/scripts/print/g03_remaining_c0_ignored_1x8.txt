@@ -1,0 +1,4 @@
+# Fixture case G03_remaining_C0_ignored_1x8 (tests/fixtures/print_c0_spec.txt).
+# Every remaining C0 byte except ESC/CAN/SUB is ignored: grid unchanged, cursor does not move, no requests. DC1/DC3 (XON/XOFF) are consumed by the pty line discipline, not the emulator.
+@size 1x8
+a\x02\x03\x04\x10\x11\x12\x13\x14\x15\x16\x17\x19\x1c\x1d\x1e\x1fb

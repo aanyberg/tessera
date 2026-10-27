@@ -1,0 +1,4 @@
+# Fixture case F04_BEL_as_OSC_terminator_is_not_a_bell_2x6 (tests/fixtures/print_c0_spec.txt).
+# The BEL that ends an OSC string must NOT ring the bell. Until #9 lands OSC is ignored (no requests at all); after #9 a SetTitle may appear but never Bell. Only x is printed.
+@size 2x6
+\x1b]2;title\x07x

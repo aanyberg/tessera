@@ -1,0 +1,4 @@
+# Fixture case A06_80_chars_then_HT_then_X_80x3 (tests/fixtures/print_c0_spec.txt).
+# DIVERGES from a naive `grid.tab_forward(1)`: that call clears pending_wrap, so X would overwrite col 80 and nothing would wrap. Expected (xterm/WezTerm): X wraps to row 2, row 1 wrapped. See decision D1.
+@size 3x80
+01234567890123456789012345678901234567890123456789012345678901234567890123456789\tX

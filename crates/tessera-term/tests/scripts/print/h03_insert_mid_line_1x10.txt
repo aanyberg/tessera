@@ -1,0 +1,6 @@
+# Fixture case H03_insert_mid_line_1x10 (tests/fixtures/print_c0_spec.txt).
+# 'abcdef' BS x3 (cursor at index 3) insert 'XY' -> 'abcXYdef', cursor index 5.
+@size 1x10
+abcdef\x08\x08\x08
+@set insert_mode true
+XY

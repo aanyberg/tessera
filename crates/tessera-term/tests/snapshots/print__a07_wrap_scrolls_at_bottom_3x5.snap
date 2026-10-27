@@ -1,0 +1,14 @@
+---
+source: crates/tessera-term/tests/print.rs
+input_file: crates/tessera-term/tests/scripts/print/a07_wrap_scrolls_at_bottom_3x5.txt
+---
+fghij\
+klmno\
+p |
+--
+cursor: (2,1)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 1
+  "abcde"\

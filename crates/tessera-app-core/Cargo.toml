@@ -10,11 +10,17 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+tessera-pty.workspace = true
 tessera-term.workspace = true
 tessera-config.workspace = true
 tessera-plugin-api.workspace = true
 tessera-plugin-hello.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+
+[features]
+# Exposes `App::panic_holding_session_lock` for tests of the FFI layer.
+test-hooks = []
 
 [lints]
 workspace = true

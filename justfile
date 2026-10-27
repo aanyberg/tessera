@@ -28,6 +28,14 @@ test:
 deny:
     cargo deny check
 
+# Regenerate docs/config.md from the tessera-config types (doc comments and defaults)
+config-docs:
+    cargo xtask config-docs
+
+# Fail with a unified diff if docs/config.md is out of date
+config-docs-check:
+    cargo xtask config-docs --check
+
 # Build the Rust static library for both macOS architectures (release)
 core-release:
     cargo build --release -p tessera-ffi --target aarch64-apple-darwin

@@ -1,0 +1,4 @@
+# Fixture case A08_fill_screen_exactly_no_scroll_2x5 (tests/fixtures/print_c0_spec.txt).
+# 10 chars into 2x5: no scroll, scrollback empty, pending_wrap armed on the bottom-right cell.
+@size 2x5
+abcdefghij

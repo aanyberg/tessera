@@ -1,0 +1,4 @@
+# Fixture case D02_HT_from_col7_and_col8_1x24 (tests/fixtures/print_c0_spec.txt).
+# From index 7 -> 8; from index 8 (after A is written the cursor is at 9) -> 16. Cursor sitting exactly on a stop moves to the next one: covered by D03.
+@size 1x24
+1234567\tA\tB

@@ -1,0 +1,4 @@
+# Fixture case G02_SO_SI_are_visible_noops_1x8 (tests/fixtures/print_c0_spec.txt).
+# Charsets are out of scope; later work (SCS/ESC ( 0) will give SO/SI meaning. 'abc' unchanged.
+@size 1x8
+a\x0eb\x0fc

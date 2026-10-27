@@ -1,0 +1,4 @@
+# Fixture case A01_wrap_81_chars_80x3 (tests/fixtures/print_c0_spec.txt).
+# Headline case from the issue. 81st char lands at row 2 col 1 (1-based); row 1 wrapped; cursor row 2 col 2 (1-based) = (1,1) 0-based.
+@size 3x80
+01234567890123456789012345678901234567890123456789012345678901234567890123456789X

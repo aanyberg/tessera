@@ -11,8 +11,20 @@ publish.workspace = true
 
 [dependencies]
 tessera-grid.workspace = true
+# Shaping (harfrust), fallback, fontdb system font loading and swash
+# rasterisation. `fontconfig` is off: macOS loads fonts from the system
+# font directories through fontdb directly (ADR 0007).
+cosmic-text = { version = "0.19", default-features = false, features = ["std", "swash"] }
 pollster = "1"
 raw-window-handle = "0.6"
+# The rasteriser cosmic-text already builds on (same version, same
+# features); used directly for 1/3 px subpixel offsets and synthetic bold,
+# which cosmic-text's own `SwashCache` does not expose (ADR 0007).
+# Must resolve to the same swash as cosmic-text: `Font::as_swash()` hands
+# out its types. A split fails to compile (`font::build_scaler` passes that
+# `FontRef` to this crate's `ScaleContext::builder`), so it cannot happen
+# silently. Bump together with cosmic-text.
+swash = "0.2.10"
 thiserror.workspace = true
 tracing.workspace = true
 wgpu = { version = "30", default-features = false, features = ["metal", "wgsl", "std"] }

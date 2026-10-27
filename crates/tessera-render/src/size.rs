@@ -90,11 +90,20 @@ impl PhysicalSize {
     }
 }
 
-/// Returns `scale` if it is finite and positive, else `1.0`.
+/// Smallest backing scale factor accepted; smaller positive ones are
+/// raised to it.
+///
+/// At [`crate::MIN_FONT_SIZE_PT`] it still gives a 1 px em: a glyph size
+/// that rounds to zero would make swash return unscaled (font-unit)
+/// outlines, hundreds of pixels across.
+pub const MIN_SCALE: f32 = 0.25;
+
+/// Returns `scale` raised to at least [`MIN_SCALE`] if it is finite and
+/// positive, else `1.0`.
 #[must_use]
 pub fn sanitize_scale(scale: f32) -> f32 {
     if scale.is_finite() && scale > 0.0 {
-        scale
+        scale.max(MIN_SCALE)
     } else {
         1.0
     }
@@ -143,6 +152,18 @@ mod tests {
         for s in [0.0, -2.0, f32::NAN, f32::INFINITY] {
             assert_eq!(l.to_physical(s), PhysicalSize::new(640, 480), "scale {s}");
         }
+    }
+
+    #[test]
+    fn tiny_positive_scales_are_floored() {
+        for s in [f32::MIN_POSITIVE, 1e-6, 0.1] {
+            assert!(
+                (sanitize_scale(s) - MIN_SCALE).abs() < f32::EPSILON,
+                "scale {s}"
+            );
+        }
+        assert!((sanitize_scale(MIN_SCALE) - MIN_SCALE).abs() < f32::EPSILON);
+        assert!((sanitize_scale(1.5) - 1.5).abs() < f32::EPSILON);
     }
 
     #[test]

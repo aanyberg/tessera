@@ -104,6 +104,7 @@ impl From<toml::de::Error> for Error {
 
 /// Top-level configuration.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct Config {
     /// Application-wide settings.
@@ -120,6 +121,7 @@ pub struct Config {
 
 /// Application-wide settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct General {
     /// Profile used for new sessions when none is specified.
@@ -139,6 +141,7 @@ impl Default for General {
 
 /// Visual settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct Appearance {
     /// Theme name resolved against `themes/`.
@@ -175,6 +178,7 @@ impl Default for Appearance {
 
 /// Terminal emulation limits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct Terminal {
     /// Maximum number of scrollback lines kept per pane.
@@ -196,6 +200,7 @@ impl Default for Terminal {
 
 /// A named session profile.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct Profile {
     /// Display name, unique.
@@ -221,6 +226,7 @@ impl Default for Profile {
 
 /// Plugin enablement.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct Plugins {
     /// Plugin ids that are enabled.

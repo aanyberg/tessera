@@ -1,0 +1,22 @@
+[package]
+name = "xtask"
+description = "Repository developer tasks (`cargo xtask <task>`)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+schemars.workspace = true
+serde_json.workspace = true
+similar = "2"
+tessera-config = { workspace = true, features = ["schema"] }
+thiserror.workspace = true
+toml = "0.9"
+
+[lints]
+workspace = true

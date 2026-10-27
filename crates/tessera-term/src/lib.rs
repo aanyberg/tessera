@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+mod control;
 pub mod keyboard;
 
 pub use keyboard::{
@@ -19,6 +20,7 @@ pub use keyboard::{
 
 use tessera_grid::Grid;
 use tessera_vt::{Action, Parser};
+use tracing::trace;
 
 /// Side effects the host must perform on behalf of the terminal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,38 +35,186 @@ pub enum Request {
 /// A terminal: parser + grid + modes.
 pub struct Terminal {
     parser: Parser,
-    grid: Grid,
-    pending: Vec<Request>,
+    state: State,
+    /// An incomplete UTF-8 sequence (1 to 3 bytes) held back from the end of
+    /// the last [`Terminal::advance`] call. See [`incomplete_utf8_suffix`].
+    carry: Vec<u8>,
 }
 
 impl Terminal {
-    /// Creates a terminal with an empty grid.
+    /// Creates a terminal with an empty grid, auto-wrap (DECAWM) on and
+    /// insert mode (IRM) off.
     pub fn new(rows: u16, cols: u16) -> Self {
         Self {
             parser: Parser::new(),
-            grid: Grid::new(rows, cols),
-            pending: Vec::new(),
+            state: State {
+                grid: Grid::new(rows, cols),
+                pending: Vec::new(),
+                auto_wrap: true,
+                insert_mode: false,
+            },
+            carry: Vec::new(),
         }
     }
 
     /// Feeds raw PTY output into the terminal.
+    ///
+    /// Splitting the output across calls at any byte boundary gives the same
+    /// result as one call. An incomplete UTF-8 sequence at the end of `bytes`
+    /// is held back and fed together with the next call, because `vte` 0.15
+    /// drops the byte after a character it completes across two calls
+    /// (`Parser::advance_partial_utf8` returns `valid_up_to - old_bytes`
+    /// rather than the completed character's length). Holding bytes back is
+    /// the same as concatenating the input, so it is safe in every parser
+    /// state; a partial character is never visible before it completes.
     pub fn advance(&mut self, bytes: &[u8]) {
-        let pending = &mut self.pending;
-        self.parser.advance(bytes, |action| {
-            if let Action::Execute(0x07) = action {
-                pending.push(Request::Bell);
-            }
-            // Grid mutation lands in M1.
-        });
+        if self.carry.is_empty() {
+            let (now, later) = bytes.split_at(bytes.len() - incomplete_utf8_suffix(bytes));
+            self.feed(now);
+            self.carry.extend_from_slice(later);
+        } else {
+            // Rare: only when the previous read ended inside a character.
+            let mut joined = std::mem::take(&mut self.carry);
+            joined.extend_from_slice(bytes);
+            let split = joined.len() - incomplete_utf8_suffix(&joined);
+            self.feed(&joined[..split]);
+            joined.drain(..split);
+            self.carry = joined;
+        }
+    }
+
+    /// Hands `bytes` to the parser and applies every action it produces.
+    fn feed(&mut self, bytes: &[u8]) {
+        let state = &mut self.state;
+        self.parser.advance(bytes, |action| state.apply(action));
     }
 
     /// Drains side-effect requests accumulated since the last call.
     pub fn take_requests(&mut self) -> Vec<Request> {
-        std::mem::take(&mut self.pending)
+        std::mem::take(&mut self.state.pending)
     }
 
     /// Read access to the grid.
     pub fn grid(&self) -> &Grid {
-        &self.grid
+        &self.state.grid
+    }
+
+    /// Whether auto-wrap mode (DECAWM) is on. Defaults to `true`.
+    pub fn auto_wrap(&self) -> bool {
+        self.state.auto_wrap
+    }
+
+    /// Turns auto-wrap mode (DECAWM) on or off.
+    ///
+    /// With auto-wrap on, a character printed while the cursor sits on the
+    /// last column with a wrap pending starts the next line and marks the
+    /// finished one as soft-wrapped. With it off, that character overwrites
+    /// the last column instead and no line is ever marked wrapped. Toggling
+    /// the mode leaves an already pending wrap armed; the next printed
+    /// character applies whichever mode is current.
+    pub fn set_auto_wrap(&mut self, on: bool) {
+        self.state.auto_wrap = on;
+    }
+
+    /// Whether insert mode (IRM) is on. Defaults to `false`.
+    pub fn insert_mode(&self) -> bool {
+        self.state.insert_mode
+    }
+
+    /// Turns insert mode (IRM) on or off.
+    ///
+    /// In insert mode a printed character shifts the cells from the cursor
+    /// to the end of the line one column right before it is written; the
+    /// cell pushed past the last column is lost. Control characters are not
+    /// affected.
+    pub fn set_insert_mode(&mut self, on: bool) {
+        self.state.insert_mode = on;
+    }
+}
+
+/// Length of the incomplete UTF-8 sequence that ends `bytes`: a lead byte
+/// followed by fewer continuation bytes than it announces, so at most 3.
+/// Zero when `bytes` ends on a complete character, an ASCII byte or bytes
+/// that can never start a valid sequence.
+fn incomplete_utf8_suffix(bytes: &[u8]) -> usize {
+    for back in 1..=bytes.len().min(3) {
+        let byte = bytes[bytes.len() - back];
+        if byte & 0xC0 == 0x80 {
+            continue; // continuation byte: keep looking for the lead
+        }
+        let len = match byte {
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            _ => return 0,
+        };
+        return if back < len { back } else { 0 };
+    }
+    0
+}
+
+/// Everything an [`Action`] can change.
+///
+/// Kept apart from the [`Parser`] so the parser's sink can borrow it
+/// mutably while the parser itself is borrowed.
+struct State {
+    grid: Grid,
+    pending: Vec<Request>,
+    auto_wrap: bool,
+    insert_mode: bool,
+}
+
+impl State {
+    /// Applies one parsed action.
+    fn apply(&mut self, action: Action) {
+        match action {
+            Action::Print(ch) => self.print(ch),
+            Action::Execute(byte) => self.execute(byte),
+            ignored @ (Action::Csi { .. }
+            | Action::Esc { .. }
+            | Action::Osc(_)
+            | Action::DcsStart { .. }
+            | Action::DcsData(_)
+            | Action::DcsEnd) => trace!(action = ?ignored, "sequence not applied yet"),
+            unknown => trace!(action = ?unknown, "unknown action ignored"),
+        }
+    }
+
+    /// Writes `ch` at the cursor, honouring auto-wrap and insert mode.
+    fn print(&mut self, ch: char) {
+        // The parser hands DEL (0x7F) over as a printable; like any other
+        // control character it must never occupy a cell.
+        if ch.is_control() {
+            trace!(ch = ?ch, "control character dropped from print");
+            return;
+        }
+        if self.grid.pending_wrap() {
+            if !self.auto_wrap {
+                // The grid always arms a pending wrap on the last column.
+                // Without DECAWM the character overwrites that column.
+                let row = self.grid.cursor().row;
+                self.grid.goto(row, self.grid.cols() - 1);
+            } else if self.insert_mode {
+                // `insert_chars` disarms the pending wrap, so wrap first and
+                // insert on the new line, as xterm does.
+                self.wrap_line();
+            }
+        }
+        if self.insert_mode {
+            self.grid.insert_chars(1);
+        }
+        self.grid.put_char(ch);
+    }
+
+    /// Resolves a pending wrap: marks the cursor's line soft-wrapped and
+    /// moves to the start of the next line, scrolling at the bottom of the
+    /// scroll region. Mirrors what [`Grid::put_cell`] does before a write.
+    fn wrap_line(&mut self) {
+        let row = self.grid.cursor().row;
+        if let Some(line) = self.grid.line_mut(row) {
+            line.wrapped = true;
+        }
+        self.grid.carriage_return();
+        self.grid.line_feed();
     }
 }

@@ -1,0 +1,14 @@
+---
+source: crates/tessera-term/tests/print.rs
+input_file: crates/tessera-term/tests/scripts/print/e05_lf_at_bottom_scrolls_3x6.txt
+---
+2
+3
+4 |
+--
+cursor: (2,1)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 1
+  "1"

@@ -1,0 +1,5 @@
+# Fixture case B05_off_does_not_wrap_on_LF_or_CR_3x5 (tests/fixtures/print_c0_spec.txt).
+# C0 controls behave identically with DECAWM off.
+@size 3x5
+@set auto_wrap false
+abcdefg\r\nx

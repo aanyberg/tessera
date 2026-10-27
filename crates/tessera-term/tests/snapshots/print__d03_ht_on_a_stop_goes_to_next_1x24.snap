@@ -1,0 +1,11 @@
+---
+source: crates/tessera-term/tests/print.rs
+input_file: crates/tessera-term/tests/scripts/print/d03_ht_on_a_stop_goes_to_next_1x24.txt
+---
+                X |
+--
+cursor: (0,17)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

@@ -1,0 +1,4 @@
+# Fixture case F05_BEL_does_not_move_cursor_or_clear_pending_2x5 (tests/fixtures/print_c0_spec.txt).
+# BEL in the pending-wrap state keeps it: f still wraps.
+@size 2x5
+abcde\x07f

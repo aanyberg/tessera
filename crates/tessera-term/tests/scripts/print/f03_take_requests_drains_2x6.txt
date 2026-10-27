@@ -1,0 +1,4 @@
+# Fixture case F03_take_requests_drains_2x6 (tests/fixtures/print_c0_spec.txt).
+# After one take_requests() a second call returns []; BEL must not be pushed by both the old inline check and control::execute (double Bell).
+@size 2x6
+\x07

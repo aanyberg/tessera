@@ -1,0 +1,13 @@
+---
+source: crates/tessera-term/tests/print.rs
+input_file: crates/tessera-term/tests/scripts/print/h06_insert_at_last_column_just_replaces_3x5.txt
+---
+abcdX|
+
+
+--
+cursor: (0,4)
+pending_wrap: true
+auto_wrap: true insert_mode: true
+requests: []
+scrollback: 0

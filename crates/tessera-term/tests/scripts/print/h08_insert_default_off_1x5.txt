@@ -1,0 +1,4 @@
+# Fixture case H08_insert_default_off_1x5 (tests/fixtures/print_c0_spec.txt).
+# Default Terminal::new: insert_mode()==false, auto_wrap()==true. 'Xbcde'.
+@size 1x5
+abcde\rX

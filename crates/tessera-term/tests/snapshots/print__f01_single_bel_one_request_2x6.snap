@@ -1,0 +1,12 @@
+---
+source: crates/tessera-term/tests/print.rs
+input_file: crates/tessera-term/tests/scripts/print/f01_single_bel_one_request_2x6.txt
+---
+ |
+
+--
+cursor: (0,0)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: [Bell]
+scrollback: 0

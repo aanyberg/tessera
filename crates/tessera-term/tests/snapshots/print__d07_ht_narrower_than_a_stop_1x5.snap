@@ -1,0 +1,11 @@
+---
+source: crates/tessera-term/tests/print.rs
+input_file: crates/tessera-term/tests/scripts/print/d07_ht_narrower_than_a_stop_1x5.txt
+---
+    X|
+--
+cursor: (0,4)
+pending_wrap: true
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

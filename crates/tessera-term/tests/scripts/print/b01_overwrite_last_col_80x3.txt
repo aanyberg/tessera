@@ -1,0 +1,5 @@
+# Fixture case B01_overwrite_last_col_80x3 (tests/fixtures/print_c0_spec.txt).
+# Row 1 = first 79 chars then Z (X, Y overwritten in turn). Row 2 empty, no wrapped flag anywhere. Cursor stays on col 80 with pending armed.
+@size 3x80
+@set auto_wrap false
+01234567890123456789012345678901234567890123456789012345678901234567890123456789XYZ

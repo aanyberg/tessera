@@ -9,11 +9,15 @@
 //! # Model
 //!
 //! A [`Grid`] is `rows × cols` [`Cell`]s organised as [`Line`]s, plus a
-//! bounded scrollback of lines that scrolled off the top. Every mutation
-//! goes through a cursor-relative primitive (`put_char`, `insert_lines`,
-//! `erase_in_display`, …) that mirrors one VT operation. The primitives are
-//! total: any argument is clamped so the grid never leaves its bounds and
-//! never panics.
+//! [`Scrollback`] ring of lines that scrolled off the top, capped at a
+//! configurable number of lines. History and the visible rows can be read as
+//! one logical buffer ([`Grid::logical_line`], [`Grid::logical_lines`]) for
+//! search and rendering. An alternate screen without scrollback
+//! ([`Grid::enter_alt_screen`]) keeps the primary screen intact while
+//! full-screen programs run. Every mutation goes through a cursor-relative
+//! primitive (`put_char`, `insert_lines`, `erase_in_display`, …) that
+//! mirrors one VT operation. The primitives are total: any argument is
+//! clamped so the grid never leaves its bounds and never panics.
 //!
 //! The grid carries a *pen* ([`Grid::pen`]): the [`Style`] applied to cells
 //! written at the cursor and whose background fills cells that are erased or
@@ -35,9 +39,11 @@
 mod cell;
 mod grid;
 mod line;
+mod scrollback;
 mod tabs;
 
 pub use cell::{Cell, Color, Point, Style};
 pub use grid::{DEFAULT_MAX_SCROLLBACK, EraseDisplay, EraseLine, Grid, ScrollRegion};
 pub use line::{Line, Mark};
+pub use scrollback::Scrollback;
 pub use tabs::TabStops;

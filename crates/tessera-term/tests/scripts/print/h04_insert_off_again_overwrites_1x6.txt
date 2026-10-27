@@ -1,0 +1,8 @@
+# Fixture case H04_insert_off_again_overwrites_1x6 (tests/fixtures/print_c0_spec.txt).
+# Insert X -> 'Xabcde'; then replace mode: Y overwrites index 1 -> 'XYbcde'.
+@size 1x6
+abcdef\r
+@set insert_mode true
+X
+@set insert_mode false
+Y

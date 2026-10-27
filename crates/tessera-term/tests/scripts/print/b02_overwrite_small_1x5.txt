@@ -1,0 +1,5 @@
+# Fixture case B02_overwrite_small_1x5 (tests/fixtures/print_c0_spec.txt).
+# Same as B01 on a 1-row grid: no scroll possible either.
+@size 1x5
+@set auto_wrap false
+abcdefgh

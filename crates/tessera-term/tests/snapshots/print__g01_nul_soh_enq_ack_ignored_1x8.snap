@@ -1,0 +1,11 @@
+---
+source: crates/tessera-term/tests/print.rs
+input_file: crates/tessera-term/tests/scripts/print/g01_nul_soh_enq_ack_ignored_1x8.txt
+---
+ab |
+--
+cursor: (0,2)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

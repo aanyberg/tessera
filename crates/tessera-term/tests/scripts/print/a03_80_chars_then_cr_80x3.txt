@@ -1,0 +1,4 @@
+# Fixture case A03_80_chars_then_CR_80x3 (tests/fixtures/print_c0_spec.txt).
+# CR cancels pending wrap; X overwrites col 1; row 1 never marked wrapped.
+@size 3x80
+01234567890123456789012345678901234567890123456789012345678901234567890123456789\rX

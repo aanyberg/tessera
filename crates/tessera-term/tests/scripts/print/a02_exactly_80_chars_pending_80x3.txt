@@ -1,0 +1,4 @@
+# Fixture case A02_exactly_80_chars_pending_80x3 (tests/fixtures/print_c0_spec.txt).
+# No wrap yet: cursor still on the last cell, pending_wrap armed, row 1 NOT wrapped, row 2 untouched.
+@size 3x80
+01234567890123456789012345678901234567890123456789012345678901234567890123456789

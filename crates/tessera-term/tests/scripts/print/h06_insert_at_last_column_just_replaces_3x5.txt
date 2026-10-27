@@ -1,0 +1,6 @@
+# Fixture case H06_insert_at_last_column_just_replaces_3x5 (tests/fixtures/print_c0_spec.txt).
+# Cursor on the last column (not pending): insert shifts nothing off, the cell is replaced. 'abcd' CR, HT x2 clamps to index 4 (last col, blank). X replaces that cell -> 'abcdX'. Never wraps.
+@size 3x5
+abcd\r\t\t
+@set insert_mode true
+X

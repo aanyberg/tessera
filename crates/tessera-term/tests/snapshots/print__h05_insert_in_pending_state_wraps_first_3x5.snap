@@ -1,0 +1,13 @@
+---
+source: crates/tessera-term/tests/print.rs
+input_file: crates/tessera-term/tests/scripts/print/h05_insert_in_pending_state_wraps_first_3x5.txt
+---
+abcde\
+X |
+
+--
+cursor: (1,1)
+pending_wrap: false
+auto_wrap: true insert_mode: true
+requests: []
+scrollback: 0

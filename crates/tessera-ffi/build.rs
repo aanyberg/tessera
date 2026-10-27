@@ -15,6 +15,6 @@ fn main() {
         }
         Err(e) => panic!("cbindgen failed: {e}"),
     }
-    println!("cargo:rerun-if-changed=src/lib.rs");
+    println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=cbindgen.toml");
 }

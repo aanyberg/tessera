@@ -1,0 +1,13 @@
+---
+source: crates/tessera-term/tests/print.rs
+input_file: crates/tessera-term/tests/scripts/print/b05_off_does_not_wrap_on_lf_or_cr_3x5.txt
+---
+abcdg
+x |
+
+--
+cursor: (1,1)
+pending_wrap: false
+auto_wrap: false insert_mode: false
+requests: []
+scrollback: 0

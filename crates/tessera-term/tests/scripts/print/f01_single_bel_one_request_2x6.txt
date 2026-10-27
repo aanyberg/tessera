@@ -1,0 +1,4 @@
+# Fixture case F01_single_BEL_one_request_2x6 (tests/fixtures/print_c0_spec.txt).
+# Exactly one Request::Bell; grid and cursor untouched.
+@size 2x6
+\x07

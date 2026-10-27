@@ -1,0 +1,4 @@
+# Fixture case G07_Csi_is_ignored_and_consumed_2x8 (tests/fixtures/print_c0_spec.txt).
+# CSI is parsed by tessera-vt (params never leak as text) but not applied in #5: no erase, no cursor move, no colour. Text 'abcd'. NOTE: this row is SUPERSEDED by #6 (wave 3) - delete or rewrite it there.
+@size 2x8
+ab\x1b[2J\x1b[5;5H\x1b[31mcd

@@ -1,0 +1,4 @@
+# Fixture case G01_NUL_SOH_ENQ_ACK_ignored_1x8 (tests/fixtures/print_c0_spec.txt).
+# No grid effect, no requests. tessera-term has no PTY write path in #5, so ENQ must be a no-op (answerback is empty by default).
+@size 1x8
+a\x00\x01\x05\x06b

@@ -1,0 +1,13 @@
+---
+source: crates/tessera-term/tests/print.rs
+input_file: crates/tessera-term/tests/scripts/print/a09_one_more_after_fill_scrolls_2x5.txt
+---
+fghij\
+k |
+--
+cursor: (1,1)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 1
+  "abcde"\

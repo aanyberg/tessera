@@ -9,7 +9,13 @@ repository.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+[features]
+# Derives `schemars::JsonSchema` on the config types, so tooling (the
+# `cargo xtask config-docs` reference generator) can read their doc comments.
+schema = ["dep:schemars"]
+
 [dependencies]
+schemars = { workspace = true, optional = true }
 serde.workspace = true
 serde_ignored = "0.1"
 thiserror.workspace = true

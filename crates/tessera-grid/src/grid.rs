@@ -1,9 +1,9 @@
-//! The visible screen, its scrollback and the cursor-relative primitives
-//! `tessera-term` drives it with.
+//! The visible screen, its scrollback, the alternate screen and the
+//! cursor-relative primitives `tessera-term` drives it with.
 
-use std::collections::VecDeque;
+use std::mem;
 
-use crate::{Cell, Line, Point, Style, TabStops};
+use crate::{Cell, Line, Point, Scrollback, Style, TabStops};
 
 /// Default number of scrolled-off lines a grid retains.
 pub const DEFAULT_MAX_SCROLLBACK: usize = 10_000;
@@ -62,24 +62,70 @@ struct SavedCursor {
     pending_wrap: bool,
 }
 
+impl SavedCursor {
+    /// The slot before any save: home position, default pen.
+    const INITIAL: Self = Self {
+        cursor: Point { row: 0, col: 0 },
+        pen: Style::DEFAULT,
+        pending_wrap: false,
+    };
+}
+
+/// The per-screen state the primary screen keeps while the alternate screen
+/// is active.
+#[derive(Debug, Clone)]
+struct Screen {
+    lines: Vec<Line>,
+    cursor: Point,
+    pending_wrap: bool,
+    pen: Style,
+    saved: SavedCursor,
+    tabs: TabStops,
+}
+
 /// The visible screen plus scrollback.
 ///
 /// Every operation is total: arguments are clamped so the grid never leaves
 /// its bounds. Coordinates are absolute screen coordinates; origin mode is
 /// resolved by the caller using [`Grid::scroll_region`].
+///
+/// # Logical buffer
+///
+/// History and the visible screen form one logical buffer of
+/// [`Grid::total_lines`] lines, addressed by [`Grid::logical_line`]: indices
+/// `0..scrollback_len()` are scrollback (oldest first) and
+/// `scrollback_len()..total_lines()` are the visible rows, top to bottom.
+///
+/// # Alternate screen
+///
+/// [`Grid::enter_alt_screen`] switches to a separate blank screen of the
+/// same size. While it is active every primitive operates on it, lines
+/// scrolled off its top are discarded, and the primary screen's lines,
+/// cursor, pending-wrap state, pen and tab stops are kept untouched until
+/// [`Grid::leave_alt_screen`] restores them. Scrollback always belongs to
+/// the primary screen: the scrollback accessors and the logical buffer keep
+/// reporting the primary history (followed by whichever screen is active).
+/// Each screen has its own [`Grid::save_cursor`] slot, as in xterm, so a
+/// DECSC issued on the alternate screen leaves the primary screen's saved
+/// cursor intact; the alternate slot starts at its initial state (home,
+/// default pen) on every entry. The scroll region is shared by both
+/// screens. Saving the cursor around DECSET 1049 is the emulator's job.
 #[derive(Debug, Clone)]
 pub struct Grid {
     rows: u16,
     cols: u16,
+    /// Lines of the active screen.
     lines: Vec<Line>,
-    scrollback: VecDeque<Line>,
-    max_scrollback: usize,
+    scrollback: Scrollback,
     cursor: Point,
     pending_wrap: bool,
     pen: Style,
     region: ScrollRegion,
     saved: SavedCursor,
     tabs: TabStops,
+    /// The stashed primary screen; `Some` exactly while the alternate screen
+    /// is active. A resize must resize this screen as well as `lines`.
+    primary: Option<Box<Screen>>,
 }
 
 impl Grid {
@@ -101,8 +147,7 @@ impl Grid {
             rows,
             cols,
             lines: vec![Line::blank(cols, Style::DEFAULT); usize::from(rows)],
-            scrollback: VecDeque::new(),
-            max_scrollback,
+            scrollback: Scrollback::new(max_scrollback),
             cursor: Point::default(),
             pending_wrap: false,
             pen: Style::DEFAULT,
@@ -110,12 +155,9 @@ impl Grid {
                 top: 0,
                 bottom: rows - 1,
             },
-            saved: SavedCursor {
-                cursor: Point::default(),
-                pen: Style::DEFAULT,
-                pending_wrap: false,
-            },
+            saved: SavedCursor::INITIAL,
             tabs: TabStops::new(cols),
+            primary: None,
         }
     }
 
@@ -188,13 +230,39 @@ impl Grid {
 
     /// Maximum number of scrollback lines retained.
     pub fn max_scrollback(&self) -> usize {
-        self.max_scrollback
+        self.scrollback.cap()
     }
 
     /// A scrollback line; index `0` is the oldest, `scrollback_len() - 1`
     /// the one most recently scrolled off the screen.
     pub fn scrollback_line(&self, index: usize) -> Option<&Line> {
         self.scrollback.get(index)
+    }
+
+    /// Number of lines in the logical buffer: scrollback plus visible rows.
+    pub fn total_lines(&self) -> usize {
+        self.scrollback.len() + self.lines.len()
+    }
+
+    /// A line of the logical buffer. Index `0` is the oldest scrollback
+    /// line; `scrollback_len()..total_lines()` are the visible rows of the
+    /// active screen, top to bottom.
+    pub fn logical_line(&self, index: usize) -> Option<&Line> {
+        match index.checked_sub(self.scrollback.len()) {
+            None => self.scrollback.get(index),
+            Some(row) => self.lines.get(row),
+        }
+    }
+
+    /// Every line of the logical buffer, oldest scrollback line first and
+    /// the bottom visible row last, without allocating.
+    pub fn logical_lines(&self) -> impl DoubleEndedIterator<Item = &Line> + Clone + '_ {
+        self.scrollback.iter().chain(&self.lines)
+    }
+
+    /// True while the alternate screen is active.
+    pub fn is_alt_screen(&self) -> bool {
+        self.primary.is_some()
     }
 
     /// The active scroll region.
@@ -357,6 +425,83 @@ impl Grid {
         self.pending_wrap = saved.pending_wrap;
     }
 
+    // ------------------------------------------------------- scrollback cap
+
+    /// Changes how many scrollback lines are retained. Lowering the cap
+    /// drops the oldest lines first; zero disables scrollback and discards
+    /// what was kept.
+    pub fn set_max_scrollback(&mut self, max_scrollback: usize) {
+        self.scrollback.set_cap(max_scrollback);
+    }
+
+    /// Discards all scrollback, keeping the cap and the visible screen.
+    pub fn clear_scrollback(&mut self) {
+        self.scrollback.clear();
+    }
+
+    // ------------------------------------------------------ alternate screen
+
+    /// Switches to the alternate screen: a separate blank screen of the same
+    /// size, without scrollback. A no-op when already active.
+    ///
+    /// The primary screen's lines, cursor, pending-wrap state, pen, saved
+    /// cursor and tab stops are stashed. The alternate screen starts with
+    /// the cursor in the same position, the same pen and a copy of the tab
+    /// stops; its lines are blank with the pen's background, like an erase.
+    /// Pending wrap is cleared and its saved-cursor slot starts at the
+    /// initial state (home, default pen). Unlike xterm, which keeps the
+    /// alternate slot across switches, each entry starts fresh, matching
+    /// the fresh alternate screen contents.
+    pub fn enter_alt_screen(&mut self) {
+        if self.primary.is_some() {
+            return;
+        }
+        let blank = vec![Line::blank(self.cols, self.pen); usize::from(self.rows)];
+        let primary = Screen {
+            lines: mem::replace(&mut self.lines, blank),
+            cursor: self.cursor,
+            pending_wrap: self.pending_wrap,
+            pen: self.pen,
+            saved: mem::replace(&mut self.saved, SavedCursor::INITIAL),
+            tabs: self.tabs.clone(),
+        };
+        self.primary = Some(Box::new(primary));
+        self.pending_wrap = false;
+    }
+
+    /// Returns to the primary screen, discarding the alternate screen's
+    /// contents and restoring the primary lines, cursor, pending-wrap state,
+    /// pen, saved cursor and tab stops exactly as they were on entry. A
+    /// no-op when the primary screen is already active.
+    pub fn leave_alt_screen(&mut self) {
+        let Some(primary) = self.primary.take() else {
+            return;
+        };
+        let Screen {
+            lines,
+            cursor,
+            pending_wrap,
+            pen,
+            saved,
+            tabs,
+        } = *primary;
+        // A resize while on the alternate screen must resize the stashed
+        // primary screen too; catch one that forgot.
+        debug_assert_eq!(lines.len(), usize::from(self.rows), "stale primary rows");
+        debug_assert!(
+            lines
+                .iter()
+                .all(|l| l.cells.len() == usize::from(self.cols)),
+            "stale primary cols"
+        );
+        self.lines = lines;
+        self.cursor = cursor;
+        self.pending_wrap = pending_wrap;
+        self.pen = pen;
+        self.saved = saved;
+        self.tabs = tabs;
+    }
+
     // ------------------------------------------------------------ tab stops
 
     /// Sets a tab stop at the cursor column (HTS).
@@ -427,8 +572,9 @@ impl Grid {
     }
 
     /// Scrolls the region up `n` lines (SU): lines leave through the top and
-    /// blank lines enter at the bottom. When the region is the whole screen
-    /// the departing lines go to scrollback.
+    /// blank lines enter at the bottom. When the region is the whole primary
+    /// screen the departing lines go to scrollback; on the alternate screen
+    /// they are discarded.
     pub fn scroll_up(&mut self, n: u16) {
         let ScrollRegion { top, bottom } = self.region;
         let n = usize::from(n.min(self.region.height()));
@@ -436,15 +582,20 @@ impl Grid {
             return;
         }
         let top = usize::from(top);
-        let keep_history = self.region_is_full_screen() && self.max_scrollback > 0;
+        let keep_history = self.region_is_full_screen() && !self.is_alt_screen();
         for i in top..top + n {
-            let line = std::mem::replace(&mut self.lines[i], Line::blank(self.cols, self.pen));
-            if keep_history {
-                self.scrollback.push_back(line);
-            }
-        }
-        while self.scrollback.len() > self.max_scrollback {
-            self.scrollback.pop_front();
+            let departed = mem::take(&mut self.lines[i]);
+            let spare = if keep_history {
+                self.scrollback.push(departed)
+            } else {
+                Some(departed)
+            };
+            // Reuse the evicted (or discarded) line's allocation so a full
+            // history scrolls without allocating.
+            self.lines[i] = match spare {
+                Some(line) => recycle(line, self.cols, self.pen),
+                None => Line::blank(self.cols, self.pen),
+            };
         }
         self.lines[top..=usize::from(bottom)].rotate_left(n);
     }
@@ -599,18 +750,29 @@ impl Grid {
                     line.clear(self.pen);
                 }
             }
-            EraseDisplay::Scrollback => self.scrollback.clear(),
+            EraseDisplay::Scrollback => self.clear_scrollback(),
         }
     }
 
-    /// Returns the grid to its initial state (RIS): blank screen, home
-    /// cursor, default pen, full scroll region, default tab stops. Scrollback
-    /// is kept.
+    /// Returns the grid to its initial state (RIS): primary screen, blank,
+    /// home cursor, default pen, full scroll region, default tab stops. The
+    /// alternate screen is left and the stashed primary contents are
+    /// discarded. Scrollback and its cap are kept.
     pub fn reset(&mut self) {
-        let scrollback = std::mem::take(&mut self.scrollback);
-        *self = Self::with_scrollback(self.rows, self.cols, self.max_scrollback);
+        let scrollback = mem::replace(&mut self.scrollback, Scrollback::new(0));
+        *self = Self::with_scrollback(self.rows, self.cols, scrollback.cap());
         self.scrollback = scrollback;
     }
+}
+
+/// Turns a line that left the screen into a blank line of `cols` cells
+/// carrying the background of `pen`, keeping its allocations.
+fn recycle(mut line: Line, cols: u16, pen: Style) -> Line {
+    line.cells.clear();
+    line.cells.resize(usize::from(cols), Cell::blank_with(pen));
+    line.marks.clear();
+    line.wrapped = false;
+    line
 }
 
 #[cfg(test)]

@@ -1,0 +1,4 @@
+# Fixture case E09_CR_at_col0_is_noop_1x6 (tests/fixtures/print_c0_spec.txt).
+# No movement.
+@size 1x6
+\r\r\r

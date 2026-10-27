@@ -1,4 +1,4 @@
-//! Error type for GPU bootstrap and presentation.
+//! Error type for GPU bootstrap, presentation, fonts and the glyph atlas.
 
 /// Everything that can go wrong while bringing up or driving the GPU.
 #[derive(Debug, thiserror::Error)]
@@ -27,4 +27,20 @@ pub enum RenderError {
     /// work. The message is `wgpu`'s own description.
     #[error("GPU error: {0}")]
     Gpu(String),
+    /// No usable font: neither the configured family, nor the default, nor
+    /// any monospaced face could be loaded.
+    #[error("no usable font: {0}")]
+    NoFont(String),
+    /// A glyph bitmap is larger than an atlas layer.
+    #[error("glyph of {width}x{height} pixels does not fit in the atlas")]
+    GlyphTooLarge {
+        /// Bitmap width in pixels.
+        width: u32,
+        /// Bitmap height in pixels.
+        height: u32,
+    },
+    /// An atlas layer has no room left, even after evicting every glyph not
+    /// used in the current frame.
+    #[error("glyph atlas {0:?} layer is full")]
+    AtlasFull(crate::AtlasLayer),
 }

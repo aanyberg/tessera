@@ -1,0 +1,4 @@
+# Fixture case E06_trailing_CRLF_at_bottom_3x6 (tests/fixtures/print_c0_spec.txt).
+# Cursor ends at col 1 of a fresh blank bottom row; 'a' scrolled off.
+@size 3x6
+a\r\nb\r\nc\r\n

@@ -1,0 +1,14 @@
+---
+source: crates/tessera-term/tests/print.rs
+input_file: crates/tessera-term/tests/scripts/print/i01_byte_by_byte_equals_one_shot_3x5.txt
+---
+fg
+    h\
+i |
+--
+cursor: (2,1)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: [Bell]
+scrollback: 1
+  "abcde"\

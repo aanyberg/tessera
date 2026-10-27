@@ -1,0 +1,4 @@
+# Fixture case D03_HT_on_a_stop_goes_to_next_1x24 (tests/fixtures/print_c0_spec.txt).
+# Two HT from col 0: index 8 then 16 (never stays on a stop).
+@size 1x24
+\t\tX

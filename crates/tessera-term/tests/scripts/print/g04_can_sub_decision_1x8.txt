@@ -1,0 +1,4 @@
+# Fixture case G04_CAN_SUB_decision_1x8 (tests/fixtures/print_c0_spec.txt).
+# Recommended: ignore both (matches the lead brief 'everything else ignored'). xterm's visible error glyph for SUB is the only xterm divergence in this fixture on purpose; see decision D3. Expected here: 'abc'.
+@size 1x8
+a\x18b\x1ac
