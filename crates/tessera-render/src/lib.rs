@@ -6,43 +6,42 @@
 //! into is handed over by the frontend as a raw window handle, so this crate
 //! has no `AppKit` dependency and can serve a future Linux frontend unchanged.
 //!
-//! The `wgpu` dependency lands in M2; this crate currently defines the theme
-//! and surface contracts the frontend compiles against.
+//! What exists today is the bootstrap: [`Gpu`] (instance, adapter, device,
+//! queue), [`RenderSurface`] (swapchain configuration, resize, `HiDPI` scale,
+//! vsync, sRGB) with a frontend-callable [`RenderSurface::clear`] pass, and
+//! [`OffscreenTarget`] so the same clear pass runs headless in CI. The grid
+//! passes land on top of these.
+//!
+//! # Threading
+//!
+//! `wgpu`'s Metal backend requires surface creation on the main thread;
+//! everything else may run from any thread. `Gpu` is `Clone + Send + Sync`.
+//!
+//! # Backends
+//!
+//! Only the Metal backend is compiled in. A Linux frontend enables `vulkan`
+//! on `wgpu` here and changes nothing else.
 
 #![forbid(unsafe_code)]
 
-/// Linear-space RGBA color.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Rgba {
-    /// Red, 0.0..=1.0.
-    pub r: f32,
-    /// Green, 0.0..=1.0.
-    pub g: f32,
-    /// Blue, 0.0..=1.0.
-    pub b: f32,
-    /// Alpha, 0.0..=1.0.
-    pub a: f32,
-}
+pub use raw_window_handle;
+pub use wgpu;
 
-/// Everything about appearance that the renderer needs and the user may change.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Theme {
-    /// Primary font family.
-    pub font_family: String,
-    /// Font size in points.
-    pub font_size: f32,
-    /// Line height multiplier.
-    pub line_height: f32,
-    /// Default foreground.
-    pub foreground: Rgba,
-    /// Default background. Alpha below 1.0 enables transparency.
-    pub background: Rgba,
-    /// Cursor color.
-    pub cursor: Rgba,
-    /// Selection highlight.
-    pub selection: Rgba,
-    /// The 16 ANSI colors.
-    pub ansi: [Rgba; 16],
-    /// Padding around the grid in logical pixels.
-    pub padding: f32,
-}
+mod error;
+mod gpu;
+mod offscreen;
+mod size;
+mod surface;
+mod theme;
+
+pub use error::RenderError;
+pub use gpu::Gpu;
+pub use offscreen::{
+    OffscreenTarget, SUPPORTED_FORMATS, is_supported_format, padded_bytes_per_row,
+};
+pub use size::{LogicalSize, PhysicalSize, sanitize_scale};
+pub use surface::{
+    FrameStatus, RenderSurface, SurfaceOptions, build_config, choose_alpha_mode, choose_format,
+    choose_present_mode,
+};
+pub use theme::{Rgba, Theme};

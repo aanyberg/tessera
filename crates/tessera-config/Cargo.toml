@@ -11,8 +11,21 @@ publish.workspace = true
 
 [dependencies]
 serde.workspace = true
+serde_ignored = "0.1"
 thiserror.workspace = true
 toml = "0.9"
+tracing.workspace = true
+
+# Non-blocking opens, so a FIFO in place of config.toml cannot block a load.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Native file watching via kqueue(2); other platforms fall back to polling.
+[target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "dragonfly"))'.dependencies]
+kqueue = "1.2"
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true
