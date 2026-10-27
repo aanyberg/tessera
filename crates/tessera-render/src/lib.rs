@@ -9,8 +9,14 @@
 //! What exists today is the bootstrap: [`Gpu`] (instance, adapter, device,
 //! queue), [`RenderSurface`] (swapchain configuration, resize, `HiDPI` scale,
 //! vsync, sRGB) with a frontend-callable [`RenderSurface::clear`] pass, and
-//! [`OffscreenTarget`] so the same clear pass runs headless in CI. The grid
-//! passes land on top of these.
+//! [`OffscreenTarget`] so the same clear pass runs headless in CI.
+//!
+//! Text goes through three pieces (ADR 0007): [`Fonts`] resolves the
+//! configured family and its fallback chain from the system fonts and
+//! rasterises glyphs; [`Shaper`] computes [`CellMetrics`] and shapes a row of
+//! cells into [`ShapedGlyph`]s (ligatures included); [`GlyphAtlas`] caches the
+//! rasterised glyphs in an alpha and a colour texture with LRU eviction. The
+//! grid passes land on top of these.
 //!
 //! # Threading
 //!
@@ -27,19 +33,30 @@
 pub use raw_window_handle;
 pub use wgpu;
 
+mod atlas;
+mod boxdraw;
 mod error;
+mod font;
 mod gpu;
 mod offscreen;
+mod shaping;
 mod size;
 mod surface;
 mod theme;
 
+pub use atlas::{AtlasLayer, AtlasSlot, AtlasStats, DEFAULT_ATLAS_SIZE, GlyphAtlas, GlyphKey};
 pub use error::RenderError;
+pub use font::{
+    DEFAULT_FAMILY, DEFAULT_FONT_SIZE_PT, EMOJI_FAMILY, FaceId, FontConfig, Fonts,
+    MAX_FONT_SIZE_PT, MAX_SCALE, MIN_FONT_SIZE_PT, SYSTEM_FALLBACK, StyleSupport,
+    sanitize_font_size,
+};
 pub use gpu::Gpu;
 pub use offscreen::{
     OffscreenTarget, SUPPORTED_FORMATS, is_supported_format, padded_bytes_per_row,
 };
-pub use size::{LogicalSize, PhysicalSize, sanitize_scale};
+pub use shaping::{CellMetrics, ShapedGlyph, Shaper};
+pub use size::{LogicalSize, MIN_SCALE, PhysicalSize, sanitize_scale};
 pub use surface::{
     FrameStatus, RenderSurface, SurfaceOptions, build_config, choose_alpha_mode, choose_format,
     choose_present_mode,

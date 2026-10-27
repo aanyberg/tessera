@@ -4,6 +4,7 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [{ id = "RUSTSEC-2026-0192", reason = "ttf-parser is unmaintained (not a vulnerability); pulled in by cosmic-text 0.19 via fontdb and only parses installed system fonts. Revisit when cosmic-text moves to skrifa/read-fonts. See ADR 0007." }]
 
 [licenses]
 version = 2

@@ -6,3 +6,11 @@ timing = { max-threads = 1 }
 [[profile.default.overrides]]
 filter = 'package(tessera-config) & binary(reload)'
 test-group = 'timing'
+
+[[profile.default.overrides]]
+filter = 'package(tessera-render) & binary(shaping) & test(uncovered_characters_are_cheap_after_warm_up)'
+test-group = 'timing'
+
+[[profile.default.overrides]]
+filter = 'package(tessera-render) & binary(shaping) & test(shaping_one_long_line_costs_the_same_as_many_short_ones)'
+test-group = 'timing'
