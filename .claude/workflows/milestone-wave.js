@@ -1,11 +1,11 @@
 export const meta = {
   name: 'milestone-wave',
-  description: 'Run one wave of milestone issues through the Tessera software factory: implement → code-critic loop (≤5) → quality-gate ∥ adversarial-tester → serialized integrator merge',
+  description: 'Run one wave of milestone issues through the Tessera software factory: implement → critic loop (rust/swift/code critic by area, ≤5) → quality-gate ∥ adversarial-tester → serialized integrator merge',
   whenToUse: 'When the milestone-lead has produced task briefs for a wave and the repo is clean on main.',
   phases: [
     { title: 'Research', detail: 'spec-researcher for briefs flagged spec:true' },
     { title: 'Implement', detail: 'one implementer per brief in its own worktree' },
-    { title: 'Critique', detail: 'code-critic verdicts; revision-implementer between rounds' },
+    { title: 'Critique', detail: 'rust-/swift-/code-critic verdicts by area; revision-implementer between rounds' },
     { title: 'Verify', detail: 'quality-gate and adversarial-tester in parallel' },
     { title: 'Merge', detail: 'integrator, one branch at a time' },
   ],
@@ -47,6 +47,7 @@ const RESEARCH_SCHEMA = { type: 'object', properties: {
 const wtOf = t => `${wtRoot}/task-${t.n}`
 const branchOf = t => `task/${t.n}-${t.slug}`
 const implementerFor = t => t.area === 'app' ? 'swift-implementer' : t.area === 'infra' ? 'release-engineer' : t.area === 'docs' ? 'docs-writer' : 'rust-implementer'
+const criticFor = t => t.area === 'app' ? 'swift-critic' : (t.area === 'infra' || t.area === 'docs') ? 'code-critic' : 'rust-critic'
 
 const brief = t => `Issue #${t.n} (milestone ${t.milestone || '0.1.0'}) — ${t.title}
 Area: ${t.area}. Scope: ${t.scope}.
@@ -85,7 +86,7 @@ const results = await pipeline(tasks,
     const { t } = s
     for (let round = 1; round <= MAX_CRITIQUE_ROUNDS; round++) {
       const c = await agent(`Critique round ${round} of ${MAX_CRITIQUE_ROUNDS}.\n\n${brief(t)}`,
-        { agentType: 'code-critic', label: `critique:#${t.n}:r${round}`, phase: 'Critique', schema: CRITIQUE_SCHEMA })
+        { agentType: criticFor(t), label: `critique:#${t.n}:r${round}`, phase: 'Critique', schema: CRITIQUE_SCHEMA })
       if (!c) { s.rounds.push({ round, verdict: 'error' }); continue }
       s.rounds.push({ round, verdict: c.verdict, findings: c.findings })
       log(`#${t.n} critique r${round}: ${c.verdict} (${c.findings.length} findings)`)

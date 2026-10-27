@@ -14,7 +14,9 @@ refers to agents by name only.
 | `rust-implementer` | One Rust issue in its own worktree, gate green | opus | high | yes | branch |
 | `swift-implementer` | One macOS app issue in its own worktree | opus | high | yes | branch |
 | `revision-implementer` | Applies findings from critic/verifiers; fixes or refutes with evidence | opus | medium | yes | branch |
-| `code-critic` | Independent ship/revise verdict; owns the "Done when" judgement | opus | high | no | no |
+| `rust-critic` | Independent ship/revise verdict for crates/ branches; owns the "Done when" judgement | opus | high | no | no |
+| `swift-critic` | Independent ship/revise verdict for apps/macos branches; Swift 6 concurrency, AppKit, FFI ownership | opus | high | no | no |
+| `code-critic` | Independent ship/revise verdict for infra and docs branches (workflows, justfile, scripts, ADRs) | opus | high | no | no |
 | `quality-gate` | Mechanical: `scripts/quality-gate.sh`, clean tree, contains main, trailers, scope, ADR collisions | haiku | low | no | no |
 | `adversarial-tester` | Breaks ship-ready branches with hostile input and real flows; reproduced bugs only | opus | xhigh | scratch only | no |
 | `integrator` | Serialized squash-merge into local main, lockfile conflicts, worktree cleanup | sonnet | medium | conflicts only | main |
@@ -29,7 +31,7 @@ critique, adversarial testing and release engineering run on Opus. Pin a full id
 ## Pipeline per issue
 
 ```
-milestone-lead ─ brief ─► [spec-researcher] ─► rust-|swift-|release-implementer ─► code-critic ─┐
+milestone-lead ─ brief ─► [spec-researcher] ─► rust-|swift-|release-implementer ─► {rust|swift|code}-critic ─┐
         ▲                                                                   revise ◄──┘ ship
         │ findings/disputes                           revision-implementer ◄───────────┘   │
         │                                                                                  ▼
@@ -39,6 +41,7 @@ milestone-lead ─ brief ─► [spec-researcher] ─► rust-|swift-|release-im
 ```
 
 - Critique loop is capped at 5 rounds; wave 1 converged in ≤3.
+- The critic is chosen by area: `rust-critic` for crates/, `swift-critic` for apps/macos, `code-critic` for infra and docs.
 - Verification runs two lenses, not three: the acceptance lens from wave 1 never failed a task while passing
   branches with major findings, and overlapped the critic. The critic now owns "Done when"; the mechanical gate is
   a haiku agent around a script; the adversarial tester stays at the highest effort because it found 7 of the 9
