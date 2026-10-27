@@ -4,6 +4,8 @@ set shell := ["zsh", "-cu"]
 
 app_dir := "apps/macos"
 xcframework := app_dir + "/TesseraCore.xcframework"
+build_dir := app_dir + "/build"
+archive_path := build_dir + "/Tessera.xcarchive"
 
 default:
     @just --list
@@ -73,10 +75,39 @@ terminfo-install:
 terminfo-ssh host:
     {{terminfo}} --ssh {{host}}
 
+# Release: archive the app (Release, universal, ad-hoc signed); version = CFBundleShortVersionString (numeric), build = CFBundleVersion
+archive version="0.1.0" build="1": xcodeproj
+    test -d {{quote(xcframework)}} || { echo "missing {{xcframework}}: run 'just xcframework' first" >&2; exit 1 }
+    rm -rf {{quote(archive_path)}}
+    mkdir -p {{quote(build_dir)}}
+    set -o pipefail; xcodebuild archive -project {{quote(app_dir + "/Tessera.xcodeproj")}} -scheme Tessera -configuration Release \
+        -destination "generic/platform=macOS" \
+        -archivePath {{quote(archive_path)}} -derivedDataPath {{quote(app_dir + "/DerivedData")}} \
+        MARKETING_VERSION={{quote(version)}} CURRENT_PROJECT_VERSION={{quote(build)}} \
+        CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM="" 2>&1 | tee {{quote(build_dir + "/archive.log")}} | tail -5 \
+        || { echo "xcodebuild archive failed; errors from {{build_dir}}/archive.log:" >&2; grep -E 'error:|\*\* ARCHIVE FAILED' {{quote(build_dir + "/archive.log")}} >&2; exit 1 }
+    lipo -archs {{quote(archive_path + "/Products/Applications/Tessera.app/Contents/MacOS/Tessera")}}
+
+# Release: zip the archived app as Tessera-<tag>-macos-universal.zip (ditto keeps bundle metadata; no __MACOSX AppleDouble tree)
+package tag="v0.0.0":
+    rm -f {{quote(build_dir + "/Tessera-" + tag + "-macos-universal.zip")}}
+    ditto -c -k --keepParent --norsrc \
+        {{quote(archive_path + "/Products/Applications/Tessera.app")}} \
+        {{quote(build_dir + "/Tessera-" + tag + "-macos-universal.zip")}}
+    ls -l {{quote(build_dir + "/Tessera-" + tag + "-macos-universal.zip")}}
+
+# Release: preview the git-cliff notes for the unreleased commits *before* tagging (e.g. `just changelog v0.1.0-rc.1`); once HEAD is tagged use `just release-notes <tag>`
+changelog tag="":
+    git-cliff --unreleased {{ if tag != "" { "--tag " + quote(tag) } else { "" } }} --strip all
+
+# Release: render the notes the workflow attaches for a tag that points at HEAD
+release-notes tag:
+    scripts/release-notes.sh {{quote(tag)}}
+
 # Emit JSON Schema for the control protocol into docs/protocol (v1.x)
 schema:
     @echo "schema generation lands with tessera-protocol schemars support"
 
 clean:
     cargo clean
-    rm -rf {{app_dir}}/DerivedData {{app_dir}}/Tessera.xcodeproj {{xcframework}}
+    rm -rf {{app_dir}}/DerivedData {{app_dir}}/Tessera.xcodeproj {{xcframework}} {{build_dir}}
