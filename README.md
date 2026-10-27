@@ -50,19 +50,17 @@ Rust targets for the universal build:
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 ```
 
-## Milestones
+## Roadmap
 
-| | Milestone | Status |
-|---|---|---|
-| M0 | Workspace, architecture, CI, skeleton app | done |
-| M1 | Headless emulator passing vttest basics + snapshot suite | next |
-| M2 | GPU renderer in a dev window | |
-| M3 | Native shell hosting one session | |
-| M4 | Tabs, splits, profiles, Preferences, themes | |
-| M5 | Shell integration marks, search, selection, reflow | |
-| M6 | v1.0: signed DMG, Homebrew cask | |
-| v1.x | Control socket + `tessera` CLI, iTerm2 theme import, agent-usage plugin | |
-| v2 | WASM plugins, MCP adapter, images, Linux frontend | |
+Work is tracked in [GitHub milestones](https://github.com/aanyberg/tessera/milestones).
+
+| Milestone | Scope |
+|---|---|
+| [0.1.0](https://github.com/aanyberg/tessera/milestone/1) | Daily-drivable basics: headless emulator passing vttest basics, wgpu renderer, native window with tabs, one profile, `config.toml` from disk |
+| [0.2.0](https://github.com/aanyberg/tessera/milestone/2) | Product surface: splits, profiles, Preferences window, themes, transparency/blur, shell integration marks, search, built-in plugin host, signed builds |
+| [Backlog](https://github.com/aanyberg/tessera/milestone/3) | Control socket and CLI, MCP adapter, agent-usage plugin, WASM plugins, images, tmux, Linux frontend |
+
+A 1.0.0 milestone will be defined once the 0.x releases are stable.
 
 ## Plugins
 
