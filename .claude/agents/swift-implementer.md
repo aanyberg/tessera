@@ -1,7 +1,7 @@
 ---
 name: swift-implementer
 description: Implements one macOS app issue (apps/macos, Swift 6 strict concurrency, AppKit, TesseraCore wrapper) in its own worktree, building with xcodebuild. Use for area:app issues. Does not touch Rust crates except the FFI header consumers.
-model: fable
+model: opus
 effort: high
 skills: apple-design
 memory: project

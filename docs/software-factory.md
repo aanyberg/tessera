@@ -9,21 +9,22 @@ refers to agents by name only.
 
 | Agent | Responsibility | Model | Effort | Writes code | Commits |
 |---|---|---|---|---|---|
-| `milestone-lead` | Waves, task briefs, pre-assigned ADR numbers/deps/modules, task board, dispute arbitration | fable | high | no | no |
+| `milestone-lead` | Waves, task briefs, pre-assigned ADR numbers/deps/modules, task board, dispute arbitration | fable | medium | no | no |
 | `spec-researcher` | Spec → test table/fixture before spec-heavy implementation | sonnet | high | fixtures only | no |
-| `rust-implementer` | One Rust issue in its own worktree, gate green | fable | high | yes | branch |
-| `swift-implementer` | One macOS app issue in its own worktree | fable | high | yes | branch |
-| `revision-implementer` | Applies findings from critic/verifiers; fixes or refutes with evidence | fable | medium | yes | branch |
-| `code-critic` | Independent ship/revise verdict; owns the "Done when" judgement | fable | high | no | no |
+| `rust-implementer` | One Rust issue in its own worktree, gate green | opus | high | yes | branch |
+| `swift-implementer` | One macOS app issue in its own worktree | opus | high | yes | branch |
+| `revision-implementer` | Applies findings from critic/verifiers; fixes or refutes with evidence | opus | medium | yes | branch |
+| `code-critic` | Independent ship/revise verdict; owns the "Done when" judgement | opus | high | no | no |
 | `quality-gate` | Mechanical: `scripts/quality-gate.sh`, clean tree, contains main, trailers, scope, ADR collisions | haiku | low | no | no |
-| `adversarial-tester` | Breaks ship-ready branches with hostile input and real flows; reproduced bugs only | fable | xhigh | scratch only | no |
+| `adversarial-tester` | Breaks ship-ready branches with hostile input and real flows; reproduced bugs only | opus | xhigh | scratch only | no |
 | `integrator` | Serialized squash-merge into local main, lockfile conflicts, worktree cleanup | sonnet | medium | conflicts only | main |
 | `docs-writer` | ADRs, CONTRIBUTING, README, generated references after merges | sonnet | medium | docs | branch |
-| `release-engineer` | CI/release workflows, justfile, packaging, tag/version guards | fable | high | infra | branch |
+| `release-engineer` | CI/release workflows, justfile, packaging, tag/version guards | opus | high | infra | branch |
 | `flow-analyst` | Post-wave retro from journals: cost/value per role, proposed changes | sonnet | high | retro only | no |
 
-Model aliases map to the current Claude 5 family (`fable` = claude-fable-5-1, `sonnet` = claude-sonnet-5-5,
-`haiku` = claude-haiku-5-5). Pin a full id in the frontmatter if a role must not follow alias updates.
+Model aliases map to the current Claude 5 family (`fable` = claude-fable-5-1, `opus` = claude-opus-5-5,
+`sonnet` = claude-sonnet-5-5, `haiku` = claude-haiku-5-5). Fable is reserved for the lead; implementation,
+critique, adversarial testing and release engineering run on Opus. Pin a full id in the frontmatter if a role must not follow alias updates.
 
 ## Pipeline per issue
 

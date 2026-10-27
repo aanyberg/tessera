@@ -1,7 +1,7 @@
 ---
 name: code-critic
 description: Independent, skeptical reviewer of a task branch. Returns verdict ship or revise with precise findings; owns the "Done when" judgement. Runs the checks itself, never edits or commits. Use after every implementation and revision round.
-model: fable
+model: opus
 effort: high
 skills: code-review, rust-coding-guidelines
 disallowedTools: Edit, Write, NotebookEdit

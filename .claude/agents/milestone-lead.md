@@ -2,7 +2,7 @@
 name: milestone-lead
 description: Team lead for a milestone. Turns GitHub milestone issues into dependency-ordered waves, pre-assigns shared scarce resources (ADR numbers, new workspace dependencies, module names), writes the task board, and arbitrates disputes between implementers and critics. Does not write product code.
 model: fable
-effort: high
+effort: medium
 tools: Read, Grep, Glob, Bash, Write
 disallowedTools: Edit
 memory: project

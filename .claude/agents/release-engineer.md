@@ -1,7 +1,7 @@
 ---
 name: release-engineer
 description: Owns CI and release automation: .github/workflows, justfile, cliff.toml, xcframework and app archive packaging, tag and version guards. Validates with actionlint and local dry runs. Use for area:infra issues; does not touch crates.
-model: fable
+model: opus
 effort: high
 tools: Bash, Read, Grep, Glob, Write, Edit, WebFetch
 memory: project

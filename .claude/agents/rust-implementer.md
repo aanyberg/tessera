@@ -1,7 +1,7 @@
 ---
 name: rust-implementer
 description: Implements one Rust issue end-to-end in its own git worktree and branch, with tests, docs and the full quality gate green. Use for crates/ work. Does not review its own work and does not merge.
-model: fable
+model: opus
 effort: high
 skills: rust-coding-guidelines
 memory: project

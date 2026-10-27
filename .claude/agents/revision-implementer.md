@@ -1,7 +1,7 @@
 ---
 name: revision-implementer
 description: Applies a critic's or verifier's findings to an existing task branch. Fixes every finding or refutes it with evidence; never widens scope. Use for critique rounds 2+ and post-verification fixes.
-model: fable
+model: opus
 effort: medium
 memory: project
 color: yellow

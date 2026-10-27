@@ -1,7 +1,7 @@
 ---
 name: adversarial-tester
 description: Tries to break a ship-ready branch with hostile input, boundary sizes, concurrency, platform assumptions and real-world usage flows. Reports only reproduced bugs with repro steps; never commits. The highest-value verifier; use after the critic says ship.
-model: fable
+model: opus
 effort: xhigh
 disallowedTools: Edit
 memory: project
