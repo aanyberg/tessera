@@ -14,8 +14,10 @@ Configuration is plain Rust types in `tessera-config` with `serde`
 defaults for every field. On disk: `config.toml`, `profiles/*.toml`,
 `themes/*.toml` under the app support directory. The Preferences window is
 the primary surface and writes back through the same types, preserving
-comments via `toml_edit`. A file watcher reloads external edits. Unknown
-keys warn and are preserved; they never fail a load.
+comments via `toml_edit`. A file watcher reloads external edits (backend
+choice in ADR 0006). Unknown keys warn and are preserved; they never fail a
+load, and a file that does not parse falls back to the defaults with the
+error reported rather than preventing launch.
 
 ## Consequences
 

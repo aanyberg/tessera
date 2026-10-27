@@ -13,5 +13,9 @@ publish.workspace = true
 tessera-vt.workspace = true
 tessera-grid.workspace = true
 
+[dev-dependencies]
+insta.workspace = true
+proptest.workspace = true
+
 [lints]
 workspace = true

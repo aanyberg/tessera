@@ -1,0 +1,8 @@
+# Timing-sensitive tests run one at a time so a loaded machine cannot make
+# their wall-clock bounds flake; everything else runs in parallel.
+[test-groups]
+timing = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(tessera-config) & binary(reload)'
+test-group = 'timing'

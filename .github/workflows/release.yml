@@ -1,0 +1,170 @@
+# Release: on a `v*` tag, build the universal TesseraCore.xcframework, archive
+# Tessera.app with xcodebuild (ad-hoc signed, not notarized), zip it and attach
+# it to a GitHub Release whose notes come from git-cliff (cliff.toml).
+#
+# Developer ID signing and notarization are tracked for 0.2.0; until then users
+# must strip the quarantine attribute before launching (see CONTRIBUTING.md).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    name: Unsigned universal Tessera.app
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # git-cliff needs the full history and all tags to find the previous release.
+          fetch-depth: 0
+
+      - name: Derive versions from the tag
+        id: version
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          # SemVer 2.0 core + pre-release (no leading zeros, no empty/dotted-empty
+          # identifiers); keep in sync with tag_pattern in cliff.toml.
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$'
+          if [[ ! "$tag" =~ $semver ]]; then
+            echo "::error::tag '$tag' is not SemVer vMAJOR.MINOR.PATCH[-prerelease]"
+            exit 1
+          fi
+          short="${tag#v}"
+          short="${short%%-*}"
+          prerelease=false
+          [[ "$tag" == *-* ]] && prerelease=true
+          {
+            echo "tag=$tag"
+            echo "short=$short"
+            echo "build=${GITHUB_RUN_NUMBER}"
+            echo "prerelease=$prerelease"
+            echo "zip=apps/macos/build/Tessera-${tag}-macos-universal.zip"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Guard that the tag is on the default branch and matches Cargo.toml
+        env:
+          SHORT: ${{ steps.version.outputs.short }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git fetch --no-tags origin "$DEFAULT_BRANCH"
+          if ! git merge-base --is-ancestor HEAD "origin/$DEFAULT_BRANCH"; then
+            echo "::error::tag commit $(git rev-parse --short HEAD) is not on $DEFAULT_BRANCH"
+            exit 1
+          fi
+          cargo_version="$(awk '/^\[workspace\.package\]/{s=1;next} /^\[/{s=0} s && /^version *=/{gsub(/[" ]/,"",$3); print $3; exit}' Cargo.toml)"
+          if [[ "$cargo_version" != "$SHORT" ]]; then
+            echo "::error::Cargo.toml workspace version '$cargo_version' does not match tag version '$SHORT'"
+            exit 1
+          fi
+          echo "HEAD is on $DEFAULT_BRANCH; Cargo.toml version $cargo_version matches the tag"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: brew install just xcodegen git-cliff
+      - name: Select Xcode
+        run: |
+          # Pin the Xcode the app is known to build with; fail loudly if the
+          # runner image no longer ships it instead of silently using another.
+          sudo xcode-select -s /Applications/Xcode_16.4.app
+          xcodebuild -version
+
+      - name: Build universal TesseraCore.xcframework
+        run: just xcframework
+
+      - name: Archive Tessera.app (Release, ad-hoc signed)
+        run: just archive "${{ steps.version.outputs.short }}" "${{ steps.version.outputs.build }}"
+
+      - name: Zip the app
+        run: just package "${{ steps.version.outputs.tag }}"
+
+      - name: Smoke-test the zip
+        env:
+          ZIP: ${{ steps.version.outputs.zip }}
+          SHORT: ${{ steps.version.outputs.short }}
+          BUILD: ${{ steps.version.outputs.build }}
+        run: |
+          dir="$RUNNER_TEMP/smoke"
+          rm -rf "$dir" && mkdir -p "$dir"
+          ditto -x -k "$ZIP" "$dir"
+          app="$dir/Tessera.app"
+          test -d "$app"
+          # Simulate a browser download, then the documented workaround.
+          xattr -w com.apple.quarantine "0083;00000000;Safari;" "$app"
+          xattr -dr com.apple.quarantine "$app"
+          codesign --verify --deep --strict "$app"
+          archs="$(lipo -archs "$app/Contents/MacOS/Tessera")"
+          echo "archs: $archs"
+          [[ "$archs" == *arm64* && "$archs" == *x86_64* ]]
+          [[ "$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")" == "$SHORT" ]]
+          [[ "$(plutil -extract CFBundleVersion raw "$app/Contents/Info.plist")" == "$BUILD" ]]
+          # Launch through LaunchServices and make sure the process stays up.
+          open "$app"
+          sleep 5
+          pid="$(pgrep -n -f "$app/Contents/MacOS/Tessera")"
+          test -n "$pid"
+          echo "Tessera.app launched (pid $pid)"
+          pkill -f "$app/Contents/MacOS/Tessera"
+
+      - name: Checksum
+        env:
+          ZIP: ${{ steps.version.outputs.zip }}
+        run: (cd "$(dirname "$ZIP")" && shasum -a 256 "$(basename "$ZIP")" > "$(basename "$ZIP").sha256" && cat "$(basename "$ZIP").sha256")
+
+      - name: Release notes (git-cliff)
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          ZIP: ${{ steps.version.outputs.zip }}
+        run: |
+          notes="$RUNNER_TEMP/notes.md"
+          {
+            echo "## Install"
+            echo
+            echo "This build is ad-hoc signed and not notarized (signing and notarization land in 0.2.0)."
+            echo "Download \`$(basename "$ZIP")\`, unzip it, then remove the quarantine attribute before launching:"
+            echo
+            echo '```sh'
+            echo 'xattr -dr com.apple.quarantine Tessera.app'
+            echo '```'
+            echo
+            # Explicit tag + range (not `git-cliff --current`, which fails when
+            # HEAD carries a second tag, e.g. an rc promoted to the final
+            # version); see scripts/release-notes.sh.
+            scripts/release-notes.sh "$TAG"
+          } > "$notes"
+          cat "$notes"
+
+      - name: Create or update the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+          ZIP: ${{ steps.version.outputs.zip }}
+        run: |
+          notes="$RUNNER_TEMP/notes.md"
+          assets=("$ZIP" "$ZIP.sha256")
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "Tessera $TAG" --notes-file "$notes" --prerelease="$PRERELEASE"
+            gh release upload "$TAG" --clobber "${assets[@]}"
+          else
+            flags=(--verify-tag --title "Tessera $TAG" --notes-file "$notes")
+            [[ "$PRERELEASE" == true ]] && flags+=(--prerelease)
+            gh release create "$TAG" "${flags[@]}" "${assets[@]}"
+          fi

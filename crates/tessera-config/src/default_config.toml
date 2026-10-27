@@ -1,0 +1,43 @@
+# Tessera configuration.
+#
+# This file was written by Tessera on first launch. Every key is optional and
+# shown here with its default value; delete a key to return to the default.
+# Edits are picked up while Tessera is running. Unknown keys are reported in
+# the log and otherwise ignored, so a typo never prevents Tessera from
+# starting.
+
+[general]
+# Profile used for new sessions when none is specified.
+default_profile = "Default"
+# Confirm before closing a window that still has running jobs.
+confirm_close = true
+
+[appearance]
+# Theme name, resolved against themes/*.toml next to this file.
+theme = "Tessera Dark"
+# Font family and size in points (4 to 512).
+font_family = "Menlo"
+font_size = 13.0
+# Window opacity from 0.0 (invisible) to 1.0 (opaque), and whether to blur
+# what is behind the window when it is translucent.
+opacity = 1.0
+blur = false
+
+[terminal]
+# Maximum number of lines kept in scrollback per pane.
+scrollback_lines = 10000
+
+# Named profiles. Each profile may override `command`, `working_directory`
+# and `appearance`. The first profile is used when `general.default_profile`
+# does not match any name.
+#
+# [[profiles]]
+# name = "Default"
+# command = "/bin/zsh -l"
+# working_directory = "~"
+# [profiles.appearance]
+# font_size = 14.0
+
+[plugins]
+# Plugin ids to enable.
+enabled = []
