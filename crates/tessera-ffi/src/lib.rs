@@ -16,6 +16,10 @@
 //!   results through out-parameters.
 //! * The core reports events through a [`TesseraCallbacks`](Callbacks)
 //!   table; the frontend never polls.
+//! * Keyboard, mouse, scroll, paste and focus events go in through the
+//!   `tessera_session_send_*`, `tessera_session_paste` and
+//!   `tessera_session_set_focus` functions as plain structs (see the
+//!   `input` module); the core decides between key bindings and PTY input.
 //! * Every export runs inside `catch_unwind` (see the `panic` module): a
 //!   panic becomes `TESSERA_ERROR_PANIC`, or is logged and swallowed by
 //!   functions that return nothing.
@@ -26,6 +30,7 @@
 mod app;
 mod callbacks;
 mod error;
+mod input;
 mod panic;
 mod session;
 
@@ -36,6 +41,14 @@ pub use app::{
 };
 pub use callbacks::Callbacks;
 pub use error::Error;
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use input::tessera_test_with_core;
+pub use input::{
+    InputOutcome, Key, KeyEvent, KeyEventKind, Modifiers, MouseButton, MouseEvent, MouseEventKind,
+    ScrollEvent, tessera_session_paste, tessera_session_send_key, tessera_session_send_mouse,
+    tessera_session_send_scroll, tessera_session_set_focus,
+};
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use panic::tessera_test_panic;

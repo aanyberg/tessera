@@ -60,10 +60,12 @@ map; the ADRs record why.
 
 ## Data flow for one keystroke
 
-1. `TerminalSurfaceView` receives `keyDown`, resolves IME, calls
-   `tessera_input_key`.
-2. `tessera-app-core` resolves keybindings; unbound keys are encoded and
-   written to the session's PTY.
+1. `TerminalSurfaceView` receives `keyDown`, resolves IME, fills a
+   `TesseraKeyEvent` and calls `tessera_session_send_key` (ADR 0011).
+2. `tessera-app-core` (`App::send_input`) resolves keybindings; unbound
+   keys are encoded by `tessera-term` and queued for the session's PTY
+   without blocking. The returned `TesseraInputOutcome` tells the view
+   whether to pass the event on to AppKit (menu key equivalents).
 3. The PTY reader thread receives child output, `tessera-term` parses and
    applies it, emits `Request`s (bell, title) and marks dirty rows.
 4. The core notifies the frontend via the `on_needs_redraw` callback.
