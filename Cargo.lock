@@ -683,6 +683,7 @@ dependencies = [
 name = "tessera-vt"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "vte",
 ]
 
