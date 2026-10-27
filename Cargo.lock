@@ -1236,8 +1236,10 @@ dependencies = [
  "tessera-config",
  "tessera-plugin-api",
  "tessera-plugin-hello",
+ "tessera-pty",
  "tessera-term",
  "thiserror 2.0.21",
+ "tracing",
 ]
 
 [[package]]
@@ -1276,6 +1278,8 @@ version = "0.1.0"
 dependencies = [
  "cbindgen",
  "tessera-app-core",
+ "tessera-ffi",
+ "tracing",
 ]
 
 [[package]]

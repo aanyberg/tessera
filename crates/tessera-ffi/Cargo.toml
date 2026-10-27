@@ -11,6 +11,15 @@ publish.workspace = true
 
 [dependencies]
 tessera-app-core.workspace = true
+tracing.workspace = true
+
+[features]
+# Rust-only hooks for this crate's own tests (never exported to C).
+test-hooks = ["tessera-app-core/test-hooks"]
+
+[dev-dependencies]
+# Enables `test-hooks` for this crate's integration tests.
+tessera-ffi = { path = ".", features = ["test-hooks"] }
 
 [lints]
 workspace = true

@@ -6,9 +6,16 @@ include_version = true
 documentation = true
 documentation_style = "doxy"
 cpp_compat = true
+usize_is_size_t = true
 
 [export]
 prefix = "Tessera"
+
+[enum]
+# `TESSERA_ERROR_OK`, `TESSERA_ERROR_NULL_POINTER`, …: C enumerators share
+# one namespace, so each carries its type's name.
+rename_variants = "ScreamingSnakeCase"
+prefix_with_name = true
 
 [fn]
 rename_args = "snake_case"
