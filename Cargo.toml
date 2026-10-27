@@ -53,10 +53,12 @@ thiserror = "2"
 portable-pty = "0.9"
 nix = { version = "0.28", default-features = false }
 tracing = "0.1"
+bytemuck = { version = "1", features = ["derive"] }
 
 # external, dev
 insta = "1.43"
 proptest = { version = "1.6", default-features = false, features = ["std"] }
+png = "0.18"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

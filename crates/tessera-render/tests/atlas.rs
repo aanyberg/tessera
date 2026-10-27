@@ -1,6 +1,8 @@
 //! The glyph atlas on a headless GPU: layer selection, exact cell-sized
 //! box drawing, LRU eviction (alpha and colour layers), fragmentation
-//! under churn, size limits and invalidation on a font size change.
+//! under churn, size limits, invalidation on a font size change, and the
+//! atlas-full policy (reset once per frame, ADR 0010), directly and through
+//! the renderer.
 //!
 //! Tests skip (with a logged reason) when the machine has no Metal adapter
 //! or `TESSERA_SKIP_GPU_TESTS` is set; `tests/headless_clear.rs` is the suite
@@ -15,7 +17,8 @@
 
 use tessera_grid::{Cell, Style};
 use tessera_render::{
-    AtlasLayer, AtlasSlot, FontConfig, GlyphAtlas, GlyphKey, Gpu, RenderError, ShapedGlyph, Shaper,
+    AtlasLayer, AtlasSlot, FontConfig, FrameInput, GlyphAtlas, GlyphKey, Gpu, OffscreenTarget,
+    PhysicalSize, RenderError, Renderer, ShapedGlyph, Shaper, Theme,
 };
 
 const SKIP_VAR: &str = "TESSERA_SKIP_GPU_TESTS";
@@ -583,4 +586,217 @@ fn an_atlas_built_for_a_shaper_on_shared_fonts_clears_on_its_resize() {
     atlas.begin_frame();
     assert!(atlas.is_empty(), "the shaper's resize must clear its atlas");
     assert_eq!(atlas.stats().cleared, 1);
+}
+
+/// Short glyphs in every style and subpixel phase: many distinct keys
+/// that each need only a short shelf.
+fn short_keys(shaper: &mut Shaper) -> Vec<GlyphKey> {
+    let styles = [
+        Style::DEFAULT,
+        Style::DEFAULT.with(Style::BOLD),
+        Style::DEFAULT.with(Style::ITALIC),
+        Style::DEFAULT.with(Style::BOLD | Style::ITALIC),
+    ];
+    let mut keys = Vec::new();
+    for style in styles {
+        let row: Vec<Cell> = ".,-_'`~:;^="
+            .chars()
+            .map(|ch| Cell::new(ch, style))
+            .collect();
+        for glyph in shaper.shape_line(&row) {
+            for third in 0..3u8 {
+                let shifted = ShapedGlyph {
+                    x_offset: glyph.x_offset.floor() + f32::from(third) / 3.0,
+                    ..glyph
+                };
+                let key = shaper.glyph_key(&shifted);
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+        }
+    }
+    keys
+}
+
+#[test]
+fn a_fragmented_atlas_resets_once_per_frame() {
+    const SIZE: u32 = 64;
+    let Some(gpu) = gpu() else { return };
+    let mut shaper = menlo(13.0, 1.0);
+    let mut atlas = GlyphAtlas::with_size(&gpu, shaper.fonts(), SIZE);
+    let keys = short_keys(&mut shaper);
+
+    // Frame 1 fills the layer with short shelves.
+    atlas.begin_frame();
+    let mut placed: Vec<(GlyphKey, AtlasSlot)> = Vec::new();
+    for key in &keys {
+        match atlas.get_or_insert(&gpu, *key) {
+            Ok(slot) if !slot.is_empty() => placed.push((*key, slot)),
+            Ok(_) => {}
+            Err(RenderError::AtlasFull(AtlasLayer::Alpha)) => break,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert!(placed.len() > 8, "{} short glyphs placed", placed.len());
+    assert!(
+        placed.len() < keys.len(),
+        "the short glyphs must fill the layer ({} keys)",
+        keys.len()
+    );
+
+    // Frame 2 keeps one glyph on every shelf, so eviction cannot merge
+    // the shelves, and then needs a full-cell glyph.
+    atlas.begin_frame();
+    let mut kept: Vec<GlyphKey> = Vec::new();
+    let mut shelves: Vec<u32> = Vec::new();
+    for (key, slot) in &placed {
+        let shelf = (slot.uv[1] * SIZE as f32).round() as u32;
+        if !shelves.contains(&shelf) {
+            shelves.push(shelf);
+            atlas.get_or_insert(&gpu, *key).expect("hit");
+            kept.push(*key);
+        }
+    }
+    let tall = key_of(&mut shaper, '█');
+    let err = atlas
+        .get_or_insert(&gpu, tall)
+        .expect_err("the kept glyphs pin every shelf");
+    assert!(
+        matches!(err, RenderError::AtlasFull(AtlasLayer::Alpha)),
+        "{err:?}"
+    );
+    let before = atlas.stats();
+
+    atlas
+        .recover_from_full(&gpu, AtlasLayer::Alpha)
+        .expect("the kept glyphs alone fit");
+    let after = atlas.stats();
+    assert_eq!(after.full_resets, before.full_resets + 1);
+    assert_eq!(after.cleared, before.cleared + 1);
+    assert_eq!(atlas.len(), kept.len(), "only this frame's glyphs are kept");
+    assert!(kept.iter().all(|k| atlas.contains(k)));
+    let slot = atlas
+        .get_or_insert(&gpu, tall)
+        .expect("fits after the reset");
+    assert!(
+        read_slot(&gpu, &atlas, &slot).iter().all(|&a| a == 255),
+        "full block"
+    );
+    for key in &kept {
+        let slot = atlas.get_or_insert(&gpu, *key).expect("kept glyph");
+        assert!(
+            read_slot(&gpu, &atlas, &slot).iter().any(|&a| a > 0),
+            "re-inserted bitmap has ink"
+        );
+    }
+
+    // A second reset in the same frame is refused and changes nothing.
+    let len = atlas.len();
+    let err = atlas
+        .recover_from_full(&gpu, AtlasLayer::Color)
+        .expect_err("one reset per frame");
+    assert!(
+        matches!(err, RenderError::AtlasFull(AtlasLayer::Color)),
+        "{err:?}"
+    );
+    assert_eq!(atlas.stats().full_resets, after.full_resets);
+    assert_eq!(atlas.len(), len);
+    assert!(atlas.contains(&tall));
+
+    // The next frame may reset again.
+    atlas.begin_frame();
+    atlas
+        .recover_from_full(&gpu, AtlasLayer::Alpha)
+        .expect("a new frame may reset");
+    assert_eq!(atlas.stats().full_resets, after.full_resets + 1);
+}
+
+/// A renderer with a tiny atlas, and one with the default size, at 1x.
+fn renderers(gpu: &Gpu, atlas_size: u32) -> (Renderer, Renderer) {
+    let theme = Theme {
+        padding: 0.0,
+        ..Theme::default()
+    };
+    let small = Renderer::with_atlas_size(gpu, theme.clone(), menlo(13.0, 1.0), atlas_size)
+        .expect("renderer");
+    let reference = Renderer::new(gpu, theme, menlo(13.0, 1.0)).expect("renderer");
+    (small, reference)
+}
+
+fn render_row(gpu: &Gpu, renderer: &mut Renderer, row: &[Cell]) -> Result<Vec<u8>, RenderError> {
+    let m = renderer.cell_metrics();
+    let size = PhysicalSize::new(m.width_px * row.len() as u32, m.height_px);
+    let target = OffscreenTarget::new(gpu, size, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let rows: [&[Cell]; 1] = [row];
+    target.render(gpu, renderer, &FrameInput::new(&rows))?;
+    Ok(target.read_back(gpu).expect("readback"))
+}
+
+#[test]
+fn renderer_resets_a_full_atlas_at_most_once_per_frame() {
+    let Some(gpu) = gpu() else { return };
+    let (mut small, mut reference) = renderers(&gpu, 64);
+    let styles = [
+        Style::DEFAULT,
+        Style::DEFAULT.with(Style::BOLD),
+        Style::DEFAULT.with(Style::ITALIC),
+    ];
+    let printable: Vec<char> = ('!'..='~').collect();
+    // A deterministic walk over characters and styles: every frame draws
+    // eighteen glyphs, most of them new, in mixed heights. A 64x64 layer
+    // holds about 28 at this size, so eviction alone leaves it fragmented
+    // now and then.
+    let mut seed = 0x2545_f491_u32;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed as usize
+    };
+    let mut resets_seen = 0;
+    for frame in 0..120 {
+        let row: Vec<Cell> = (0..18)
+            .map(|_| {
+                let ch = printable[next() % printable.len()];
+                Cell::new(ch, styles[next() % styles.len()])
+            })
+            .collect();
+        let before = small.atlas_stats().full_resets;
+        let pixels =
+            render_row(&gpu, &mut small, &row).unwrap_or_else(|e| panic!("frame {frame}: {e}"));
+        let resets = small.atlas_stats().full_resets - before;
+        assert!(resets <= 1, "frame {frame} reset the atlas {resets} times");
+        resets_seen += resets;
+        let expected = render_row(&gpu, &mut reference, &row).expect("reference");
+        assert!(
+            pixels == expected,
+            "frame {frame} differs from a renderer whose atlas never fills"
+        );
+    }
+    eprintln!("{resets_seen} resets in 120 frames");
+    assert!(resets_seen > 0, "the walk must exercise the reset");
+    assert_eq!(reference.atlas_stats().full_resets, 0);
+}
+
+#[test]
+fn renderer_reports_a_frame_that_cannot_fit() {
+    let Some(gpu) = gpu() else { return };
+    let (mut small, _) = renderers(&gpu, 64);
+    let row: Vec<Cell> = ('!'..='~')
+        .map(|ch| Cell::new(ch, Style::DEFAULT))
+        .collect();
+    let err = render_row(&gpu, &mut small, &row).expect_err("94 glyphs exceed a 64x64 layer");
+    assert!(
+        matches!(err, RenderError::AtlasFull(AtlasLayer::Alpha)),
+        "{err:?}"
+    );
+    assert_eq!(
+        small.atlas_stats().full_resets,
+        1,
+        "one reset, then give up"
+    );
+    // The renderer recovers on the next frame that fits.
+    render_row(&gpu, &mut small, &cells("hello")).expect("a small frame renders");
+    assert!(small.atlas_stats().full_resets <= 2);
 }

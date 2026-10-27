@@ -43,4 +43,13 @@ pub enum RenderError {
     /// used in the current frame.
     #[error("glyph atlas {0:?} layer is full")]
     AtlasFull(crate::AtlasLayer),
+    /// A frame needs more quads than the largest instance buffer the
+    /// device allows. Nothing was drawn; smaller frames still render.
+    #[error("frame needs {needed} instances, the device allows {max}")]
+    FrameTooLarge {
+        /// Instances the frame needs.
+        needed: u64,
+        /// Instances the largest buffer holds.
+        max: u64,
+    },
 }
