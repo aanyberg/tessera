@@ -176,6 +176,7 @@ No palette lives in `tessera-grid` or `tessera-term`; colours stay
 - The renderer has what #22 needs to draw curly, dotted and dashed
   underlines in their own colour without another layout change.
 - Further SGR attributes (53 overline, 73-75 super/subscript) have no flag
-  yet; there are four free bits (12-15). Advertising `Su`, `Smulx` and
-  `Setulc` in the terminfo entry (ADR 0005) and resetting SGR on DECSTR are
-  follow-ups.
+  yet; there are four free bits (12-15); #81 adds them. Advertising `Su`,
+  `Smulx` and `Setulc` in the terminfo entry (ADR 0005) is a follow-up.
+  DECSTR resets the whole pen, underline colour and shape included, since
+  #80.

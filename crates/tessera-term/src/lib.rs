@@ -7,6 +7,40 @@
 //! encodes key events into the bytes written to the PTY. OSC handlers for
 //! shell integration are delegated to `tessera-shell-integration` so this
 //! crate stays about VT semantics.
+//!
+//! ## DECSTR
+//!
+//! `CSI ! p` (soft terminal reset, sent by the terminfo `rs2` and `is2`
+//! strings, so by every `reset` and `tput init`) follows xterm's
+//! `ReallyReset` soft path. It resets:
+//!
+//! - the pen to [`Style::DEFAULT`](tessera_grid::Style::DEFAULT): colours,
+//!   underline colour and shape and every attribute flag. This follows
+//!   DEC, kitty and `WezTerm`; xterm keeps faint, strikeout and double
+//!   underline;
+//! - insert mode (IRM) off;
+//! - auto-wrap (DECAWM) on, xterm's default; DEC's table 5-9 says off;
+//! - the scroll region (DECSTBM) to the full screen;
+//! - the saved cursor (DECSC) to the home position with the default pen and
+//!   no pending wrap (xterm would keep the live pending wrap in the copy).
+//!   Only the active screen's saved cursor is reset, as xterm resets only
+//!   `sc[whichBuf]`.
+//!
+//! It keeps the screen contents, the scrollback, the cursor position, a
+//! pending wrap and the tab stops; RIS (`ESC c`) is the reset that clears
+//! them. Its parameters are ignored, as in xterm (`CSI 5 ! p` resets too).
+//! REP has nothing to repeat afterwards, as after any sequence.
+//!
+//! Waiting on #8, which adds the state (`// #8: reset here` in
+//! `soft_reset`): origin mode (DECOM) off, cursor visible (DECTCEM),
+//! character sets G0-G3/GL/GR to their defaults (SCS), cursor keys
+//! (DECCKM) and keypad (DECKPAM) to normal; with them the smaller items
+//! xterm also resets (KAM, DECSCA, DECLRMM, reverse wrap, the keyboard
+//! protocol flags). Two more resets wait on state that does not exist yet:
+//! the cursor shape and blink (DECSCUSR, `CSI Ps SP q`) back to the
+//! default, and the ANSI palette (colours set with OSC 4) back to the
+//! theme, which belongs to #9. DECSCL (`CSI 6x ; Pc " p`), a soft reset
+//! plus a level change in xterm, is #92.
 
 #![forbid(unsafe_code)]
 

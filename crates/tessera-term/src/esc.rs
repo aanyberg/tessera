@@ -45,7 +45,8 @@ impl State {
     }
 
     /// RIS: the grid's reset plus what xterm also resets: the scrollback,
-    /// auto-wrap (on) and insert mode (off).
+    /// auto-wrap (on) and insert mode (off). DECSTR (`CSI ! p`) is the soft
+    /// variant that keeps the screen, see the crate documentation.
     fn reset(&mut self) {
         self.grid.reset();
         self.grid.clear_scrollback();
