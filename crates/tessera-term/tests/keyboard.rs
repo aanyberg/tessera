@@ -1464,6 +1464,176 @@ fn kitty_flags_apply_modes() {
 }
 
 // ---------------------------------------------------------------------------
+// Titlecase letters (issue #73)
+// ---------------------------------------------------------------------------
+
+/// The spec-researcher fixture for titlecase (Lt) letters: its Table A lists
+/// every character the encoder used to rewrite, its Table B the expected
+/// encodings and its Table C the regression guards.
+const TITLECASE_FIXTURE: &str = include_str!("fixtures/keyboard_titlecase.txt");
+
+/// The characters of Table A in [`TITLECASE_FIXTURE`]: the `#   ` lines
+/// between `# TABLE A` and `# Columns:`, each a list of hex scalars or
+/// `FIRST..LAST` ranges, with an optional trailing `#` comment.
+fn titlecase_fixture_chars() -> Vec<char> {
+    let hex = |s: &str| {
+        u32::from_str_radix(s, 16)
+            .ok()
+            .and_then(char::from_u32)
+            .unwrap_or_else(|| panic!("bad scalar {s:?} in Table A"))
+    };
+    let table = TITLECASE_FIXTURE
+        .split_once("# TABLE A")
+        .and_then(|(_, rest)| rest.split_once("# Columns:"))
+        .expect("Table A in the fixture")
+        .0;
+    let mut chars = Vec::new();
+    for line in table.lines().filter_map(|l| l.strip_prefix("#   ")) {
+        let scalars = line.split('#').next().unwrap_or_default();
+        for token in scalars.split_whitespace() {
+            match token.split_once("..") {
+                Some((first, last)) => chars.extend(hex(first)..=hex(last)),
+                None => chars.push(hex(token)),
+            }
+        }
+    }
+    chars
+}
+
+/// The single-scalar mapping of an iterator of case-mapped characters.
+fn single(mut mapped: impl Iterator<Item = char>) -> Option<char> {
+    match (mapped.next(), mapped.next()) {
+        (Some(m), None) => Some(m),
+        _ => None,
+    }
+}
+
+/// Encodes a press of `c` with `mods` under every kitty enhancement and
+/// parses the CSI u result.
+fn kitty_all(c: char, mods: Modifiers) -> CsiU {
+    let bytes = enc(Key::Char(c), mods, kitty(KittyFlags::ALL));
+    parse_csi_u(&bytes).unwrap_or_else(|| panic!("{c:?} {mods:?}: not CSI u: {}", show(&bytes)))
+}
+
+#[test]
+fn titlecase_fixture_lists_every_titlecase_letter_with_a_simple_lowercase() {
+    let listed = titlecase_fixture_chars();
+    assert_eq!(listed.len(), 31, "Table A count");
+    // Table A is the set of characters `arb_char` admits whose lowercase is
+    // another single scalar: exactly the characters the old encoder
+    // lowercased although they are not upper case.
+    let scanned: Vec<char> = (char::MIN..=char::MAX)
+        .filter(|&c| {
+            !c.is_control() && !c.is_uppercase() && single(c.to_lowercase()).is_some_and(|l| l != c)
+        })
+        .collect();
+    assert_eq!(listed, scanned);
+}
+
+/// Table B: a titlecase letter is its own unshifted key. Kitty reports the
+/// scalar as given in the key code and the text; legacy mode sends its UTF-8.
+/// Caps Lock leaves the kitty key code alone and, as for any letter that is
+/// not lower case, lowercases the legacy text (U+1F88 -> U+1F80).
+#[test]
+fn titlecase_letters_are_their_own_unshifted_key() {
+    let caps = Modifiers::CAPS_LOCK;
+    for c in titlecase_fixture_chars() {
+        let code = u32::from(c);
+        let lower = single(c.to_lowercase()).expect("simple lowercase");
+        // Shift: the single-scalar uppercase (Dž -> Ǆ), else the letter itself
+        // (ᾈ's uppercase expands to two scalars).
+        let shifted = single(c.to_uppercase()).unwrap_or(c);
+
+        let plain = kitty_all(c, NONE);
+        assert_eq!(plain.key, code, "{c:?} key");
+        assert_eq!(plain.shifted, None, "{c:?} shifted");
+        assert_eq!(plain.mods, 0, "{c:?} mods");
+        assert_eq!(plain.text, [code], "{c:?} text");
+
+        let shift = kitty_all(c, SHIFT);
+        assert_eq!(shift.key, code, "{c:?}+Shift key");
+        assert_eq!(
+            shift.shifted,
+            (shifted != c).then_some(u32::from(shifted)),
+            "{c:?}+Shift shifted"
+        );
+        assert_eq!(shift.text, [u32::from(shifted)], "{c:?}+Shift text");
+
+        let locked = kitty_all(c, caps);
+        assert_eq!(locked.key, code, "{c:?}+Caps key");
+        assert_eq!(locked.mods, caps.bits(), "{c:?}+Caps mods");
+        assert_eq!(locked.text.len(), 1, "{c:?}+Caps text");
+
+        let utf8 = |c: char| c.to_string().into_bytes();
+        assert_eq!(enc(Key::Char(c), NONE, legacy()), utf8(c), "{c:?} legacy");
+        assert_eq!(
+            enc(Key::Char(c), Modifiers::NUM_LOCK, legacy()),
+            utf8(c),
+            "{c:?}+NumLock legacy"
+        );
+        assert_eq!(
+            enc(Key::Char(c), SHIFT, legacy()),
+            utf8(shifted),
+            "{c:?}+Shift legacy"
+        );
+        assert_eq!(
+            enc(Key::Char(c), caps, legacy()),
+            utf8(lower),
+            "{c:?}+Caps legacy"
+        );
+    }
+}
+
+/// Table B's pinned rows for one Latin digraph and two Greek letters.
+#[test]
+fn titlecase_fixture_table_b_samples() {
+    let caps = Modifiers::CAPS_LOCK;
+    for (c, shift_text, caps_legacy) in [
+        ('\u{1F88}', '\u{1F88}', "\u{1F80}"),
+        ('\u{01C5}', '\u{01C4}', "\u{01C6}"),
+        ('\u{1FBC}', '\u{1FBC}', "\u{1FB3}"),
+    ] {
+        let code = u32::from(c);
+        let plain = kitty_all(c, NONE);
+        assert_eq!((plain.key, plain.text), (code, vec![code]), "{c:?}");
+        let shift = kitty_all(c, SHIFT);
+        assert_eq!(shift.key, code, "{c:?}+Shift");
+        assert_eq!(shift.text, [u32::from(shift_text)], "{c:?}+Shift");
+        let expected_shifted = (c == '\u{01C5}').then_some(0x01C4);
+        assert_eq!(shift.shifted, expected_shifted, "{c:?}+Shift");
+        let locked = kitty_all(c, caps);
+        assert_eq!((locked.key, locked.mods), (code, 64), "{c:?}+Caps");
+        assert_eq!(enc(Key::Char(c), NONE, legacy()), c.to_string().as_bytes());
+        assert_eq!(
+            enc(Key::Char(c), SHIFT, legacy()),
+            shift_text.to_string().as_bytes()
+        );
+        assert_eq!(enc(Key::Char(c), caps, legacy()), caps_legacy.as_bytes());
+    }
+}
+
+/// Table C: upper-case letters still report their lowercase as the key, and
+/// lowercase or uncased letters are reported as given.
+#[test]
+fn titlecase_fix_keeps_cased_letters_unchanged() {
+    for (c, key) in [
+        ('A', 'a'),
+        ('ß', 'ß'),
+        ('\u{0130}', '\u{0130}'),
+        ('\u{01C4}', '\u{01C6}'),
+        ('\u{01C6}', '\u{01C6}'),
+        ('\u{1F80}', '\u{1F80}'),
+    ] {
+        assert_eq!(kitty_all(c, NONE).key, u32::from(key), "{c:?}");
+    }
+    let shift_a = kitty_all('a', SHIFT);
+    assert_eq!(
+        (shift_a.key, shift_a.shifted, shift_a.text),
+        (0x61, Some(0x41), vec![0x41])
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Property tests
 // ---------------------------------------------------------------------------
 
@@ -1530,7 +1700,14 @@ fn arb_kind() -> impl Strategy<Value = KeyEventKind> {
 }
 
 fn arb_char() -> impl Strategy<Value = char> {
-    // Lower-case so the key is already unshifted; no controls.
+    // Already unshifted, so the key code is the character itself: no
+    // upper-case letters (the encoder lowercases those), nothing whose
+    // lowercase is several scalars, and no controls. Titlecase (Lt) letters
+    // such as `ǅ` and `ᾈ` are kept on purpose: no keyboard layout produces
+    // one, but they can arrive in a `Key::Char` from composed or synthetic
+    // events, and they exercise the encoder's rule that only `is_uppercase`
+    // letters are lowercased, so a titlecase letter is its own unshifted
+    // key (#73).
     any::<char>().prop_filter("unshifted, printable", |c| {
         !c.is_control() && !c.is_uppercase() && c.to_lowercase().count() == 1
     })

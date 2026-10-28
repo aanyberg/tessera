@@ -1,0 +1,114 @@
+# Fixture for Tessera #73: keyboard encoding of titlecase (Lt) letters
+# crates/tessera-term/tests/fixtures/keyboard_titlecase.txt (spec-researcher output; read by tests/keyboard.rs)
+# Status: COMPLETE. Values marked [derived] come from reading keyboard.rs + a rustc probe of std case mappings; the rest are spec-quoted.
+#
+# SOURCES
+#  [K1] kitty keyboard protocol, "Key codes": "the codepoint used is always the lower-case (or more technically, un-shifted) version of the key"
+#       https://sw.kovidgoyal.net/kitty/keyboard-protocol/#key-codes
+#  [K2] same page, "Alternate key reporting": shifted key = "the upper-case version of unicode-codepoint" in the active layout, sent only when Shift is in the modifiers; base layout key = PC-101 key.
+#  [K3] same page, "Text as code points": text is reported as the produced code point(s) (shift+a -> 65).
+#  [K4] same page, "Modifiers": lock bits are set on the event when the lock is on (caps_lock = 64, num_lock = 128; field = 1 + bits).
+#  [K5] kitty glfw/xkb_glfw.c (master): unshifted key = xkb_state_key_get_syms(clean_state) -> xkb_keysym_to_utf32(); shifted key = live-state keysym. No lowercasing call, no titlecase handling.
+#       https://raw.githubusercontent.com/kovidgoyal/kitty/master/glfw/xkb_glfw.c
+#  [K6] kitty kitty/key_encoding.c (master): emits ev->key as given; no case conversion; shifted_key only populated when Shift held; caps lock only sets the CAPS_LOCK modifier bit.
+#       https://raw.githubusercontent.com/kovidgoyal/kitty/master/kitty/key_encoding.c
+#  [U1] Unicode 16 SpecialCasing.txt, unconditional mappings (lower; title; upper):
+#       https://www.unicode.org/Public/16.0.0/ucd/SpecialCasing.txt
+#  [U2] Unicode UnicodeData.txt: U+01C5 Lt, simple lower U+01C6, simple upper U+01C4 (one scalar each; it has NO SpecialCasing entry).
+#  [R1] Rust std probe (rustc, this machine; scratchpad probe.rs): is_uppercase() is false for every Lt char; to_lowercase() is one scalar for every Lt char.
+#  [T1] crates/tessera-term/src/keyboard.rs @ e2fc473: unshifted_char (l.685), shifted_char (l.702), apply_caps_lock (l.753), us_shifted (l.770).
+#
+# WHY IT FAILS TODAY [T1][R1]
+#  unshifted_char lowercases when to_lowercase() is a single scalar. Lt chars are not is_uppercase() but have a single-scalar lowercase,
+#  so arb_char() admits them and unshifted_char then rewrites them: U+1F88 -> U+1F80.
+#
+# RULE (recommended; matches [K1][K5][K6] and the lead's design decision)
+#  unshifted_char lowercases only when c.is_uppercase(); Lt and uncased chars are reported as given.
+#
+# ---------------------------------------------------------------------------------------------
+# TABLE A: the affected set. Every char admitted by arb_char() for which current unshifted_char changes the char [R1].
+# Count = 31 (probe over all of char::MAX). The brief's three (1F88, 01C5, 1FBC) are samples, not the whole set.
+#   01C5 01C8 01CB 01F2                         # Latin digraphs Dž Lj Nj Dz   [U2]
+#   1F88..1F8F 1F98..1F9F 1FA8..1FAF            # Greek, 24 chars, uppercase expands to 2 scalars  [U1]
+#   1FBC 1FCC 1FFC                              # Greek, uppercase expands to 2 scalars            [U1]
+# Columns: char | lower (simple, = what current code wrongly reports) | upper | source
+# 01C5 | 01C6      | 01C4      | [U2] single-scalar upper!
+# 01C8 | 01C9      | 01C7      | [U2]
+# 01CB | 01CC      | 01CA      | [U2]
+# 01F2 | 01F3      | 01F1      | [U2]
+# 1F88 | 1F80      | 1F08 0399 | [U1]
+# 1F89 | 1F81      | 1F09 0399 | [U1]
+# 1F8A..1F8F | 1F82..1F87 | 1F0A..1F0F + 0399 | [U1]
+# 1F98 | 1F90      | 1F28 0399 | [U1]   (1F99..1F9F likewise -> 1F91..1F97 / 1F29..1F2F + 0399)
+# 1FA8 | 1FA0      | 1F68 0399 | [U1]   (1FA9..1FAF likewise -> 1FA1..1FA7 / 1F69..1F6F + 0399)
+# 1FBC | 1FB3      | 0391 0399 | [U1]
+# 1FCC | 1FC3      | 0397 0399 | [U1]
+# 1FFC | 1FF3      | 03A9 0399 | [U1]
+#
+# ---------------------------------------------------------------------------------------------
+# TABLE B: expected behaviour after the fix. Chars: c in {U+1F88, U+01C5, U+1FBC} (Table A for the rest).
+# Kitty mode = KittyFlags::ALL, Press, parsed with parse_csi_u. Legacy = no kitty flags.
+# mode | modifiers | field | expected | source
+kitty  | none        | parsed.key     | u32::from(c)                         | [K1][K5][K6] key is the layout's char as given; no lowercasing of Lt
+kitty  | none        | parsed.text    | [c]  (one scalar, = c)               | [K3]; produces_text is true for no mods
+kitty  | none        | parsed.shifted | None                                 | [K2] no Shift -> no shifted key
+kitty  | none        | parsed.mods    | 0 (field absent or 1)                | [K4]
+kitty  | Shift       | parsed.key     | u32::from(c)                         | [K1][K6]
+kitty  | Shift       | parsed.shifted | 1F88: None. 1FBC: None. 01C5: Some(0x01C4) | [T1 us_shifted] [derived]. 1F88/1FBC: simple upper expands to 2 scalars so us_shifted returns c, and shifted == key is suppressed (the shifted check in full_kitty_mode_round_trips accepts). 01C5: single-scalar upper U+01C4 differs from c -> reported. See DECISION 2.
+kitty  | Shift       | parsed.text    | 1F88: [1F88]. 1FBC: [1FBC]. 01C5: [01C4] | [derived] shifted_char; text is one non-control scalar (satisfies the text check in full_kitty_mode_round_trips)
+kitty  | CapsLock    | parsed.key     | u32::from(c)                         | [K1][K4][K6] Caps never changes the key code
+kitty  | CapsLock    | parsed.mods    | 64 (field value 65)                  | [K4]
+kitty  | CapsLock    | parsed.text    | exactly one non-control scalar; do not pin value in the new test | proptest only requires this; see DECISION 1
+legacy | none        | bytes          | c.to_string().into_bytes()           | UTF-8 of the scalar; xterm sends the character the key produces
+legacy | NumLock     | bytes          | same as none                         | existing property legacy_plain_char_is_utf8 (Num Lock ignored)
+legacy | Shift       | bytes          | 1F88: UTF-8(1F88). 1FBC: UTF-8(1FBC). 01C5: UTF-8(01C4) | [derived] today (pre-fix) 1F88+Shift emits U+1F80, the bug; 01C5+Shift would emit Ǆ by us_shifted
+legacy | CapsLock    | bytes          | UTF-8 of LOWERCASE scalar: 1F88->1F80, 01C5->01C6, 1FBC->1FB3 | [T1 apply_caps_lock l.757-761 @ e2fc473] [derived]; matches the existing proptest oracle (legacy_plain_char_is_utf8 in tests/keyboard.rs). THIS CONTRADICTS the brief ("Caps Lock leaves it unchanged"). See DECISION 1.
+legacy | Caps+Shift  | bytes          | shifted_char first, then caps inversion; do not pin (see DECISION 2) |
+#
+# TABLE C: unchanged behaviour, regression guards (must stay green)
+# input | expected | source
+# 'A' (Lu) kitty, no mods | key = 0x61 | [K1] is_uppercase -> lowercased; unchanged by the fix
+# 'a' kitty Shift         | key = 0x61, shifted = Some(0x41), text [0x41] | [K1][K2]
+# 'ß' (Ll) kitty          | key = 0xDF | uncased-upper-expansion, already as given
+# 'İ' U+0130 (Lu, lower = 0069 0307) kitty | key = U+0130 | to_lowercase is 2 scalars -> unshifted_char keeps c; unaffected
+# 'Ǆ' U+01C4 (Lu) kitty   | key = U+01C6 | is_uppercase true, single-scalar lower -> lowercased as before [U2][K1]
+# 'ǆ' U+01C6 (Ll) kitty   | key = U+01C6 | lowercase already
+# 'ᾀ' U+1F80 (Ll) kitty   | key = U+1F80 | lowercase already; upper expands to 2 scalars [U1]
+#
+# ---------------------------------------------------------------------------------------------
+# AMBIGUITIES AND DECISIONS
+# DECISION 1 (milestone lead; brief is wrong): Caps Lock + Lt in legacy mode.
+#   apply_caps_lock treats any non-is_lowercase alphabetic char as "upper" and lowercases it. All 31 Lt chars have a single-scalar lowercase,
+#   so legacy Caps+ᾈ = ᾀ (U+1F80), NOT unchanged. The brief's reason ("its uppercase expands to two scalars") applies only to is_lowercase chars
+#   such as ᾀ: Caps+ᾀ -> uppercase is 2 scalars -> unchanged. It is not the path an Lt char takes. Also 01C5's uppercase is ONE scalar (U+01C4), so the
+#   brief's parenthetical is wrong for Dž in any case.
+#   Recommend: keep apply_caps_lock as is (brief says it stays) and rewrite the Done bullet to "Caps Lock lowercases it to U+1F80 / U+01C6 / U+1FB3,
+#   the same as the existing oracle". Alternative (change apply_caps_lock to skip Lt): not recommended, it would also require changing the proptest oracle.
+#   Behaviour change (implementer, #73): before the fix unshifted_char lowercased the four Latin digraphs (01C5 01C8 01CB 01F2)
+#   first, so Caps inverted e.g. 01C6 to 01C4 (Ǆ); now Caps+01C5 = 01C6 (and likewise 01C9, 01CC, 01F3), matching the proptest oracle.
+#   The 27 Greek Lt chars are unchanged (1F80 before and after: its uppercase is two scalars, so Caps kept the pre-fix lowercase).
+#   Real keyboards: xkb/OS layouts deliver composed text, which takes precedence (composed_text path), so this only affects frontends that send no text.
+# DECISION 2 (milestone lead, low stakes): Shift+Dž (01C5) reports shifted key U+01C4 in kitty mode and emits Ǆ in legacy mode because us_shifted uses
+#   the single-scalar uppercase. Per [K2] "upper-case version of unicode-codepoint" that is right. Recommend leaving it and pinning only key/text, not
+#   shifted, for 1F88/1FBC (both None) and 01C5 (Some(0x01C4)) as in Table B. Do not extend the fix to us_shifted.
+# DECISION 3: the strategy. The brief keeps Lt in arb_char (agree with [K1]: kitty has no Lt special case; it reports whatever the layout gives).
+#   The comment in arb_char should say that Lt chars exercise "unshifted key = given char". Note the arb_char filter already reads
+#   `!is_uppercase && lowercase.count()==1`; once unshifted_char matches (is_uppercase only) the two rules agree for uppercase chars.
+# DECISION 4 (blocker risk): original seed unrecoverable? The issue says it was in an uncommitted keyboard.proptest-regressions from wave 3. Not in repo
+#   (tests/ has only print.proptest-regressions). Recommended: generate one with `cc <hash> # shrinks to c = '\u{1f88}', ...` via PROPTEST_CASES=4096
+#   on a pre-fix checkout, or hand-write the file header + a seed that shrinks to 1F88. The explicit #[test] is the real regression guard.
+#   NOTE (arithmetic, not measured): 31 affected of ~1.11M scalars is ~2.8e-5 per case; 512 cases x 2 tests is ~3% per gate run if char generation
+#   were uniform, so PROPTEST_CASES=4096 may need several runs to hit one. proptest's char strategy may also bias toward some ranges (unchecked).
+#   Whoever pins the seed should confirm it fails before the fix; if no hit, a hand-written seed that does not fail is useless: say so in the file comment.
+# DECISION 5: the second Done bullet's "(parsed.key == u32::from(c))" is right under [K1] for Lt chars ONLY; keep it from claiming kitty's key is "lowercase"
+#   for Lt: kitty's text is "lower-case (un-shifted)" but a Lt char has no unshifted form distinct from itself in the layout.
+#
+# ---------------------------------------------------------------------------------------------
+# WHAT THE ISSUE TEXT GETS WRONG
+#  1. Issue: "case mapping expands to more than one scalar". False for the filter: arb_char requires a SINGLE-scalar lowercase. The cause is
+#     the single-scalar lowercase being applied to a non-uppercase (Lt) char. The upper-case expansion is irrelevant to the failure.
+#  2. Brief: Caps Lock leaves Lt unchanged in legacy mode. False under current apply_caps_lock (see DECISION 1).
+#  3. Brief: "its uppercase expands to two scalars" for the set {1F88, 01C5, 1FBC}. 01C5's uppercase is a single scalar U+01C4 [U2].
+#  4. Brief's set is a sample: 31 chars are affected (Table A); the explicit test should loop over all 31 (derive with a char::MAX scan, or list them) or at least include one of each class: Latin (01C5), Greek-psili (1F88), Greek-ypogegrammeni (1FBC).
+#  5. Brief names "kitty/key_encoding.py": the encoder is kitty/key_encoding.c (and glfw/xkb_glfw.c); spec 'Key codes' says lower-case for letters but neither source lowercases.
+#     WezTerm was NOT checked (no network source fetched); not needed for the decision.

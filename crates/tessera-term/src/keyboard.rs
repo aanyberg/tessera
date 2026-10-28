@@ -230,6 +230,9 @@ pub enum KeyEventKind {
 pub enum Key {
     /// A key that produces a character. This is the *unshifted* character of
     /// the key in the active layout (`'a'`, not `'A'`; `'4'`, not `'$'`).
+    /// An upper-case letter passed here is lowercased by the encoder when its
+    /// lowercase is one scalar (`'İ'` stays `'İ'`); a titlecase letter such
+    /// as `'ǅ'` is taken as the unshifted key itself.
     Char(char),
     /// A text-only event with no identifiable key (for instance IME commit).
     /// Encoded with key number 0 when it must be an escape code.
@@ -682,12 +685,22 @@ impl KeyEvent {
     /// The character of a `Char` key, normalised to its unshifted form.
     /// `None` for other keys and for control code points, which are not
     /// characters a key can legitimately produce.
+    ///
+    /// Only an upper-case letter ([`char::is_uppercase`]) is lowercased to
+    /// find its unshifted key, and only when its lowercase is one scalar
+    /// (`İ` stays `İ`). Titlecase letters (general category Lt, such as `ǅ`
+    /// U+01C5 or `ᾈ` U+1F88) and uncased characters are reported as given:
+    /// kitty sends the code point the layout produces and never lowercases a
+    /// titlecase letter, which has no unshifted form distinct from itself.
     fn unshifted_char(&self) -> Option<char> {
         let Key::Char(c) = self.key else {
             return None;
         };
         if c.is_control() {
             return None;
+        }
+        if !c.is_uppercase() {
+            return Some(c);
         }
         let mut lower = c.to_lowercase();
         match (lower.next(), lower.next()) {
@@ -750,6 +763,12 @@ impl KeyEvent {
 /// Applies Caps Lock to a derived character: the case of a letter is
 /// inverted while the lock is engaged, so Caps+a is `A` and Shift+Caps+a
 /// is `a`. Other characters are unchanged.
+///
+/// A titlecase letter is not lower case, so Caps Lock lowercases it:
+/// Caps+`ǅ` (U+01C5) is `ǆ` and Caps+`ᾈ` (U+1F88) is `ᾀ`. Before #73 the
+/// four Latin digraphs (U+01C5, U+01C8, U+01CB, U+01F2) reached this
+/// function already lowercased and came out upper case (`Ǆ`); the Greek
+/// titlecase letters are unaffected, as their uppercase is two scalars.
 fn apply_caps_lock(c: char, mods: Modifiers) -> char {
     if !mods.contains(Modifiers::CAPS_LOCK) || !c.is_alphabetic() {
         return c;
