@@ -17,6 +17,7 @@
 //! | `S` `T` `^` | SU SD | scroll the region up / down (`T` with more than one parameter is mouse tracking, ignored) |
 //! | `b` | REP | repeat the last printed character |
 //! | `g` | TBC | clear tab stops |
+//! | `m` | SGR | set the pen's colours and attributes (see the `sgr` module) |
 //! | `r` | DECSTBM | set the scroll region |
 //!
 //! Parameters follow xterm: an absent parameter and an explicit `0` both
@@ -66,8 +67,16 @@ fn selector(params: &[u16], index: usize) -> u16 {
 
 impl State {
     /// Applies one control sequence. See the module documentation for the
-    /// sequences handled; anything else is logged and ignored.
-    pub(crate) fn csi(&mut self, params: &[u16], intermediates: &[u8], action: char) {
+    /// sequences handled; anything else is logged and ignored. `subparams`
+    /// marks the `:`-introduced entries of `params`
+    /// ([`tessera_vt::Action::Csi`]); only SGR reads it.
+    pub(crate) fn csi(
+        &mut self,
+        params: &[u16],
+        subparams: u32,
+        intermediates: &[u8],
+        action: char,
+    ) {
         if !intermediates.is_empty() {
             trace!(
                 ?action,
@@ -119,6 +128,7 @@ impl State {
                 mode => trace!(mode, "TBC mode ignored"),
             },
             'r' => self.set_scroll_region(params),
+            'm' => self.sgr(params, subparams),
             _ => trace!(?action, ?params, "CSI ignored"),
         }
     }

@@ -1,0 +1,1278 @@
+# =============================================================================
+# tessera-term: SGR attributes incl. 256-colour, truecolour, underline styles and underline colour (issue #7, wave 4)
+# crates/tessera-term/tests/fixtures/sgr_spec.txt   (spec-researcher output)
+#
+# Evidence file for the implementer and the critic.  Companions (same directory layout, copied next to it):
+#   tests/fixtures/sgr_color_table_cells.txt   expected per-cell styles of the colour table (433 groups)
+#   tests/scripts/sgr/color_table.txt          the colour-table script (27x80), fed like the other scripts
+#   tools/ (NOT copied)                         model.py = an independent Python model of the semantics below that
+#                                               every Part A row was cross-checked against; gen_color_table.py
+#
+# FORMAT
+#   Part A (pen rows): one row per line, `ID | feed | pen [| free]`, preceded by `# cite:` / `# note:` lines.
+#     feed   `tests/common` `decode` syntax (\x1b \r \n \\ \u{..}), fed to a fresh 24x80 Terminal.  `++` separates
+#            separate Terminal::advance calls; the pen (Grid::pen()) is read after the last one.
+#            EVERY row must give the same result when the feed is sent one byte per advance() call.
+#     pen    canonical pen text (below).
+#     free   the row documents a divergence or an undefined case: parse it, do NOT assert it.
+#   Part C (cell rows): `### ID` blocks: size / feed (one per step) / cell: (row,col) 'char' pen / cursor /
+#     pending_wrap / extra keys.  Unlisted cells are NOT asserted unless the block says `others: blank`.
+#     Special chars: '<spacer>' = the right half of a wide char, `wide` / `cluster` after a char = CellFlags.
+#   Canonical pen text (a renderer local to tests/sgr.rs prints exactly this; independent of Style's bit layout):
+#     fg=<c> bg=<c> ul=<c> us=<style> flags=<list>
+#     <c>      `-` Color::Default | `iN` Color::Indexed(N) | `#rrggbb` Color::Rgb (lower case)
+#     <style>  none | single | double | curly | dotted | dashed       (Style::underline_style())
+#     <list>   `-` or comma list in this order: bold,dim,italic,blink,inverse,hidden,strike
+#              (the UNDERLINE and four *_UNDERLINE bits are shown only as us=, never in flags=)
+#     default pen: fg=- bg=- ul=- us=none flags=-
+#
+# PRIMARY SOURCES (read in full for this fixture)
+#   xterm ctlseqs   https://invisible-island.net/xterm/ctlseqs/ctlseqs.html  "CSI Pm m"
+#   xterm source    https://github.com/ThomasDickey/xterm-snapshots  (master, charproc.c $XTermId 1.2134)
+#                   charproc.c CASE_SGR (l.4322-4590), parse_extended_colors (l.2122) with its long design comment,
+#                   param_has_subparams (l.2020), CASE_REP (l.6157), `sp->lastchar = thischar` (l.6485),
+#                   CASE_DECALN (l.4837), resetRendition (l.1388); cursor.c CursorSave2 / CursorRestoreFlags;
+#                   screen.c ClearCells (erase keeps the colour pair, not the rendition flags)
+#   ECMA-48 5th     https://ecma-international.org/publications-and-standards/standards/ecma-48/
+#                   8.3.117 SGR; 5.4.2 parameter string format (":" inside a parameter sub-string)
+#   ITU-T T.416 / ISO 8613-6   SGR 38/48 with 5 = indexed, 2 = direct colour, colour-space id after the 2 (section
+#                   number 13.1.8 is from memory; the standard is paywalled and was read only through xterm's
+#                   design comment above parse_extended_colors, l.2035-2120)
+#   kitty           https://sw.kovidgoyal.net/kitty/underlines/  (4:0..4:5, 58 "works exactly like 38, 48", 59;
+#                   terminfo `Su`) and source kitty/vt-parser.c _parse_sgr, kitty/cursor.c parse_color +
+#                   cursor_from_sgr
+#   WezTerm         wezterm-escape-parser/src/csi.rs  CSIParser::sgr, parse_sgr_color, underline
+#   Alacritty/vte   https://github.com/alacritty/vte  src/ansi.rs  attrs_from_sgr_parameters, handle_colon_rgb,
+#                   parse_sgr_color
+#   (iTerm2 was not read; its documented behaviour for 4:x and 58/59 is kitty's.  Not relied on for any row.)
+#
+# EMULATOR MATRIX  (tess = recommended Tessera behaviour; D-* are the decisions below)
+#   topic                          xterm                kitty               WezTerm              Alacritty          tess
+#   4:x sub-parameter              IGNORED (group       4:0..4:5, clamp     0..5, else single    0,2,3,4,5; any     kitty/Alacritty
+#                                  skipped, even 4:3)   >5 to dashed                             other 4:n single   (D-US-UNK)
+#   21                             double underline     double              double               CANCEL BOLD        double
+#   22                             clears bold+faint    both                both                 both               both
+#   24                             clears 4 and 21      clears decoration   clears all           clears all         every style
+#   5 / 6                          both blink           5 only (6 ignored)  slow / rapid         slow / fast        both = BLINK (D-BLINK6)
+#   8 / 28                         yes                  not handled         yes                  yes                yes
+#   58 / 59                        NOT SUPPORTED        yes                 yes                  yes                yes (lead decision 1)
+#   38;5;n, n > 255                whole colour no-op   n & 0xFF (wraps)    Err (to_u8)          no-op              no-op (lead decision 4)
+#   38;2;r;g;b, any > 255          no-op                each & 0xFF         Err                  no-op              no-op
+#   38;7;.. unknown kind           eats `38;7`, goes on drops WHOLE SGR     Err                  eats `38;7`, goes  eats kind (D-38-UNK)
+#                                                                                                on
+#   1:2 colon group, other head    group ignored        applies head (bold) not traced           group ignored      ignore (D-SUB-OTHER)
+#   too few values for 38/48       consumes to the end  group dropped       Err                  consumes to end    consumes to end
+#   `38;5;` empty index            DEFAULT => no-op     index 0             -                    index 0 (vte)      index 0 (F-EMPTY-IDX)
+#   38;5:1 mixed separators        accepted             accepted            -                    not accepted       whatever falls out
+#   SGR between print and REP      cancels REP          -                   -                    keeps last char    cancels REP (D-REP)
+#   BCE (erase colour)             colour pair, no      bg only             bg only              bg only            bg only
+#                                  rendition flags
+#   DECRC without DECSC            default rendition    -                   -                    -                  default pen
+#
+# DECISIONS FOR THE MILESTONE LEAD  (recommended option first; rows that depend on them are named)
+#   D-US-UNK    `4:n` with n > 5.  Recommend: plain single underline (Alacritty, WezTerm).  kitty clamps to dashed,
+#               xterm ignores the group.  Rows US4c6/US4c9/US4c65535.
+#   D-SUB-OTHER A colon group headed by anything but 4, 38, 48, 58 (`1:2`, `3:1`, `0:1`, `:1`, `31:1`).
+#               Recommend: ignore the whole group (xterm: `item += skip`; Alacritty: `_ => None`); kitty applies the
+#               head.  Matters because `params` is flattened: a naive loop would see `1`,`2` = bold + faint and
+#               `0:1` = reset + bold.  Needs the `subparams` bitmask in sgr(): after a head, skip every following
+#               param whose bit is set.  Rows SUB_*.
+#   D-38-UNK    `38;<kind>` with kind not 2 or 5.  Recommend: eat `38;kind` and continue with the next param
+#               (xterm, Alacritty).  kitty ignores the whole SGR.  Rows 38_unknown_kind, 38_kind_zero,
+#               38_kind_1_eats_kind_only, 48_unknown_kind, UL58_unknown_kind.  Lead decision 4 does not say.
+#   D-BLINK6    SGR 6 (rapid blink).  Recommend: same BLINK flag as 5 (xterm); 25 clears it.  Row ATT06.
+#   D-REP       Any SGR clears State::last_printed, so `A ESC[31m ESC[3b` prints one A (xterm l.6485; already how
+#               main behaves, csi_spec.txt D-REP).  The brief's "SGR under REP" therefore cannot show REP picking up
+#               a new pen.  Rows REP01..03.  No change needed; keep the rule when adding sgr.rs (do not make
+#               State::apply special-case 'm').
+#   D-EMPTY     Empty parameter slots arrive from vte as 0, so `38;5;` is Indexed(0) and `38:2:1::3` is rgb(1,0,3),
+#               where xterm treats the slot as DEFAULT and drops the colour.  Recommend: accept (parser limit),
+#               rows are `free`.
+#   D-MIXED     `38;5:196` / `38;2:1:2:3` (colon inside a semicolon list).  xterm and kitty accept, Alacritty does
+#               not.  Recommend: do not special-case; a ';'-form reader that consumes flattened params regardless
+#               of the tail's bits accepts them for free.  Rows are `free`.
+#   D-LEN       More than 32 parameters: tessera-vt already sets ignore:true and Terminal drops the whole action
+#               (xterm keeps 30, kitty 100).  Recommend: keep.  Rows LEN_*.
+#   D-SAVED     DECSC/DECRC save and restore the whole Style, underline colour included, and DECRC without a prior
+#               DECSC gives the default pen (xterm zeroed slot).  No code change (Grid::save_cursor copies `pen`).
+#
+# ISSUE / BRIEF CORRECTIONS (verified against sources)
+#   1. "xterm as the reference" covers only the 0..9, 21..29, 30..49, 90..107 and 38/48 rows.  xterm has NO 58/59 at
+#      all (it would read `58;5;1` as blink + bold) and IGNORES every colon group except 38/48, so `4:0`..`4:5`
+#      are not an xterm behaviour: the reference for 4:x, 58, 59 is kitty (docs + source), cross-checked with
+#      WezTerm and Alacritty.  Expected values for those rows are kitty's.
+#   2. "SGR under REP" (see D-REP): REP is a no-op after SGR in xterm and on main; the REP rows document that.
+#   3. Brief decision 4, "too few parameters for 38/48/58 (xterm consumes what exists and stops)": true for 38/48;
+#      for 58 xterm has no code, so the rule is borrowed from 38/48 (kitty drops the group; same visible result).
+#      Values > 255: xterm, Alacritty and WezTerm make the colour a no-op, kitty wraps (`& 0xFF`).  The brief's
+#      choice (no-op) is the majority, so the kitty-derived rows for 58 deliberately differ from kitty.
+#   4. Colour-space disambiguation is by sub-parameter COUNT, not by emptiness: after the head, 4 sub-parameters
+#      (`2:r:g:b`) = no id, >= 5 = id in the slot after the 2 (empty or not, value ignored), anything beyond the
+#      third colour value is dropped.  `38:2:1:2:3:4` is rgb(2,3,4), not rgb(1,2,3).  The ';' form has NO id:
+#      `38;2;0;1;2;3` is rgb(0,1,2) then italic (SGR 3).  (xterm l.2035-2120, kitty parse_color, Alacritty
+#      handle_colon_rgb all agree.)
+#   5. vte (tessera-vt) turns empty slots into 0 and a trailing `;` into an extra 0 parameter: `ESC[1;m` is bold
+#      then RESET (xterm identical: DEFAULT == 0), `ESC[1;;3m` is italic only, `ESC[;1m` is bold.  A trailing
+#      empty slot resetting the pen surprises people; the rows RST06..RST08 pin it.
+#   6. SGR 21: Alacritty implements it as "cancel bold" (the pre-1990 reading).  Brief and xterm say double
+#      underline; so do kitty and WezTerm.  Alacritty is the odd one out.
+#   7. `CSI > 4 ; 2 m` (XTMODKEYS), `CSI ? 4 m`, `CSI 1 SP m` are not SGR.  State::csi already returns early when
+#      `intermediates` is non-empty (csi.rs l.70-79), which covers them; keep that check ahead of the new 'm' arm.
+#      Rows NOT_SGR_* pass for free as long as that order is kept.
+#   8. Follow-ups outside #7: advertise `Su`/`Smulx`/`Setulc` in the terminfo entry (ADR 0005, kitty docs name `Su`);
+#      DECSTR (`CSI ! p`) should reset SGR in xterm but is not implemented in tessera-term; SGR 53 (overline) and
+#      73-75 are ignored because Style has no flag for them.
+#
+# PARSER FACTS (probed against vte 0.15, the version tessera-vt wraps)
+#   `ESC[m` -> groups [[0]]            `ESC[1;m` -> [[1],[0]]         `ESC[;1m` -> [[0],[1]]    `ESC[1;;3m` -> [[1],[0],[3]]
+#   `ESC[4:3m` -> [[4,3]]              `ESC[4:m` -> [[4,0]]           `ESC[4::3m` -> [[4,0,3]]  `ESC[:1m` -> [[0,1]]
+#   `ESC[38:2::1:2:3m` -> [[38,2,0,1,2,3]]   `ESC[38:2:1:2:3m` -> [[38,2,1,2,3]]   `ESC[38:2:::1:2:3m` -> [[38,2,0,0,1,2,3]]
+#   `ESC[38;5:1m` -> [[38],[5,1]]      `ESC[1;4:3;5m` -> [[1],[4,3],[5]]
+#   `subparams` bitmask (bit i <=> params[i] came after ':'):  `4:3` -> params [4,3] bits 0b10;
+#   `38:2::1:2:3` -> [38,2,0,1,2,3] bits 0b111110; `1;4:3;5` -> [1,4,3,5] bits 0b100; `ESC[m` -> [0] bits 0.
+#   `ESC[>4;2m` -> intermediates [62]; `ESC[?4m` -> [63]; `ESC[1 m` -> [32].
+#   65536 and 99999999999 saturate to 65535.  33 parameters (colon-separated entries count too) set ignore:true.
+#
+# =============================================================================
+
+# #############################################################################
+# PART A / B : PEN ROWS
+# #############################################################################
+
+# ---- A1. Reset (SGR 0, empty list, empty slots) ----------------------------------------------------------
+# cite: ECMA-48 8.3.117 (default 0); xterm ctlseqs; xterm CASE_SGR `case DEFAULT: case 0`
+# note: bare CSI m; vte gives params [0]
+RST01_empty_csi_m | \x1b[m | fg=- bg=- ul=- us=none flags=-
+# cite: xterm CASE_SGR resetRendition + reset_SGR_Colors; kitty cursor_reset_display_attrs
+# note: after bold dim italic underline blink inverse hidden strike fg bg and underline colour
+RST02_empty_resets_everything | \x1b[1;2;3;4;5;7;8;9;31;42;58;5;9m++\x1b[m | fg=- bg=- ul=- us=none flags=-
+# cite: ECMA-48 8.3.117; xterm CASE_SGR
+# note: lead decision 5: 0 also resets the underline colour and every underline style
+RST03_zero | \x1b[1;2;3;4;5;7;8;9;31;42;58;5;9m++\x1b[0m | fg=- bg=- ul=- us=none flags=-
+# cite: xterm CASE_SGR DEFAULT==0 for each empty slot
+# note: [0],[0]
+RST04_semicolon_only | \x1b[1;2;3;4;5;7;8;9;31;42;58;5;9m++\x1b[;m | fg=- bg=- ul=- us=none flags=-
+# cite: xterm CASE_SGR params are applied left to right
+# note: bold and red are wiped by the 0, italic survives
+RST05_reset_in_the_middle | \x1b[1;31;0;3m | fg=- bg=- ul=- us=none flags=italic
+# cite: xterm CASE_SGR trailing empty parameter is DEFAULT => reset
+# note: vte yields [3],[0]; `ESC[3;m` is italic THEN reset
+RST06_trailing_semicolon_resets | \x1b[1m++\x1b[3;m | fg=- bg=- ul=- us=none flags=-
+# cite: xterm CASE_SGR empty middle parameter is DEFAULT => reset; vte (and so Alacritty) turns an empty slot into 0
+# note: bold, reset, italic.
+RST07_empty_in_the_middle_resets | \x1b[1;;3m | fg=- bg=- ul=- us=none flags=italic
+# cite: xterm CASE_SGR
+# note: [0],[3]
+RST08_leading_empty_resets | \x1b[1m++\x1b[;3m | fg=- bg=- ul=- us=none flags=italic
+# cite: lead decision 5
+# note: curly underline and RGB underline colour both cleared
+RST09_reset_keeps_nothing_underline_style | \x1b[4:3;58:2::1:2:3m++\x1b[0m | fg=- bg=- ul=- us=none flags=-
+
+# ---- A2. Attributes on (1..9, 21) ------------------------------------------------------------------------
+# cite: ctlseqs `Ps = 1`; xterm CASE_SGR case 1
+ATT01_bold_on | \x1b[1m | fg=- bg=- ul=- us=none flags=bold
+# cite: ctlseqs `Ps = 2`; xterm CASE_SGR case 2
+ATT02_dim_on | \x1b[2m | fg=- bg=- ul=- us=none flags=dim
+# cite: ctlseqs `Ps = 3`; xterm CASE_SGR case 3
+ATT03_italic_on | \x1b[3m | fg=- bg=- ul=- us=none flags=italic
+# cite: ctlseqs `Ps = 5`; xterm CASE_SGR case 5
+ATT05_blink_on | \x1b[5m | fg=- bg=- ul=- us=none flags=blink
+# cite: ctlseqs `Ps = 7`; xterm CASE_SGR case 7
+ATT07_inverse_on | \x1b[7m | fg=- bg=- ul=- us=none flags=inverse
+# cite: ctlseqs `Ps = 8`; xterm CASE_SGR case 8
+ATT08_hidden_on | \x1b[8m | fg=- bg=- ul=- us=none flags=hidden
+# cite: ctlseqs `Ps = 9`; xterm CASE_SGR case 9
+ATT09_strike_on | \x1b[9m | fg=- bg=- ul=- us=none flags=strike
+# cite: ctlseqs `Ps = 4`; xterm CASE_SGR case 4
+# note: UNDERLINE set, no style bit
+ATT04_underline_on | \x1b[4m | fg=- bg=- ul=- us=single flags=-
+# cite: xterm CASE_SGR case 6 falls through to BLINK; Alacritty BlinkFast, WezTerm Rapid, kitty ignores 6
+# note: decision D-BLINK6: one BLINK flag, 5 and 6 are the same
+ATT06_rapid_blink_is_blink | \x1b[6m | fg=- bg=- ul=- us=none flags=blink
+# cite: ctlseqs `Ps = 21` doubly-underlined; xterm CASE_SGR ATR_DBL_UNDER; kitty decoration=2
+# note: Alacritty maps 21 to CANCEL BOLD (old ECMA-48 reading); xterm/kitty/WezTerm/iTerm2 reading wins (lead decision 2)
+ATT21_double_underline | \x1b[21m | fg=- bg=- ul=- us=double flags=-
+# cite: lead decision 4; xterm sets BOLD and ATR_FAINT independently
+# note: no mutual exclusion
+ATT01_02_bold_and_dim_coexist | \x1b[1;2m | fg=- bg=- ul=- us=none flags=bold,dim
+# cite: xterm CASE_SGR
+ATT_all_simple_on | \x1b[1;2;3;4;5;7;8;9m | fg=- bg=- ul=- us=single flags=bold,dim,italic,blink,inverse,hidden,strike
+# cite: ECMA-48: parameters are applied in order, attributes are independent
+ATT_order_does_not_matter | \x1b[9;8;7;5;4;3;2;1m | fg=- bg=- ul=- us=single flags=bold,dim,italic,blink,inverse,hidden,strike
+
+# ---- A3. Attributes off (22..29) and underline-style interplay -------------------------------------------
+# cite: ctlseqs `Ps = 22` Normal (neither bold nor faint); xterm CASE_SGR UIntClr BOLD + ATR_FAINT
+OFF22_clears_bold | \x1b[1m++\x1b[22m | fg=- bg=- ul=- us=none flags=-
+# cite: same
+OFF22_clears_dim | \x1b[2m++\x1b[22m | fg=- bg=- ul=- us=none flags=-
+# cite: same; lead decision 4
+# note: 22 is the only code that clears either
+OFF22_clears_both | \x1b[1;2m++\x1b[22m | fg=- bg=- ul=- us=none flags=-
+# cite: same
+OFF22_keeps_the_rest | \x1b[1;2;3;4;31m++\x1b[22m | fg=i1 bg=- ul=- us=single flags=italic
+# cite: xterm: bold never changes the colour index (setExtendedFG only recomputes); no bold-as-bright in the term crate
+OFF22_keeps_colours | \x1b[1;31;44m++\x1b[22m | fg=i1 bg=i4 ul=- us=none flags=-
+# cite: ctlseqs `Ps = 23`; xterm CASE_SGR
+OFF23_clears_italic | \x1b[3m++\x1b[23m | fg=- bg=- ul=- us=none flags=-
+# cite: ctlseqs `Ps = 24`; xterm CASE_SGR
+OFF24_clears_single | \x1b[4m++\x1b[24m | fg=- bg=- ul=- us=none flags=-
+# cite: xterm CASE_SGR clears UNDERLINE and ATR_DBL_UNDER
+# note: brief: 24 clears every underline style
+OFF24_clears_double | \x1b[21m++\x1b[24m | fg=- bg=- ul=- us=none flags=-
+# cite: kitty docs (underlines): 24 and 4:0 both turn underlines off; kitty cursor_from_sgr case 24 decoration=0
+OFF24_clears_curly | \x1b[4:3m++\x1b[24m | fg=- bg=- ul=- us=none flags=-
+# cite: same
+OFF24_clears_dotted | \x1b[4:4m++\x1b[24m | fg=- bg=- ul=- us=none flags=-
+# cite: same
+OFF24_clears_dashed | \x1b[4:5m++\x1b[24m | fg=- bg=- ul=- us=none flags=-
+# cite: kitty docs: colour is independent of the style; kitty cursor_from_sgr decoration_fg untouched by 24
+# note: the colour stays in the pen and applies to the next underline
+OFF24_keeps_underline_colour | \x1b[4:3;58;5;9m++\x1b[24m | fg=- bg=- ul=i9 us=none flags=-
+# cite: ctlseqs `Ps = 25`; xterm CASE_SGR
+OFF25_clears_blink | \x1b[5m++\x1b[25m | fg=- bg=- ul=- us=none flags=-
+# cite: xterm CASE_SGR one BLINK flag
+OFF25_clears_rapid_blink | \x1b[6m++\x1b[25m | fg=- bg=- ul=- us=none flags=-
+# cite: ctlseqs `Ps = 27`; xterm CASE_SGR
+OFF27_clears_inverse | \x1b[7m++\x1b[27m | fg=- bg=- ul=- us=none flags=-
+# cite: ctlseqs `Ps = 28`; xterm CASE_SGR
+OFF28_clears_hidden | \x1b[8m++\x1b[28m | fg=- bg=- ul=- us=none flags=-
+# cite: ctlseqs `Ps = 29`; xterm CASE_SGR
+OFF29_clears_strike | \x1b[9m++\x1b[29m | fg=- bg=- ul=- us=none flags=-
+# cite: turning off what is not on changes nothing
+OFF_noop_on_default_pen | \x1b[22;23;24;25;27;28;29m | fg=- bg=- ul=- us=none flags=-
+# cite: xterm CASE_SGR
+OFF_one_leaves_the_others | \x1b[1;3;4;5;7;8;9m++\x1b[23;27m | fg=- bg=- ul=- us=single flags=bold,blink,hidden,strike
+# cite: lead decision 2: one underline style at a time, the last wins
+# note: xterm keeps UNDERLINE and ATR_DBL_UNDER as independent bits (double wins when drawing); kitty has one field. Accepted divergence, visible only as double vs single
+OFF_21_then_4_is_single | \x1b[21;4m | fg=- bg=- ul=- us=single flags=-
+# cite: same; kitty: decoration=2 replaces 1
+OFF_4_then_21_is_double | \x1b[4;21m | fg=- bg=- ul=- us=double flags=-
+# cite: kitty docs; last wins
+OFF_4_then_4_3_is_curly | \x1b[4;4:3m | fg=- bg=- ul=- us=curly flags=-
+# cite: kitty kitty cursor_from_sgr case 4 without sub-parameter sets decoration=1
+# note: plain 4 after a styled underline replaces the style (does not keep curly)
+OFF_4_3_then_4_is_single | \x1b[4:3;4m | fg=- bg=- ul=- us=single flags=-
+
+# ---- A4. ANSI colours 30-37 / 40-47 / 90-97 / 100-107, 39 / 49 -------------------------------------------
+# cite: ctlseqs `Ps = 30`; xterm CASE_SGR case 30
+# note: Color::Indexed(n); the renderer resolves it through the theme (ADR 0010)
+FG30_ansi | \x1b[30m | fg=i0 bg=- ul=- us=none flags=-
+# cite: ctlseqs `Ps = 31`; xterm CASE_SGR case 31
+FG31_ansi | \x1b[31m | fg=i1 bg=- ul=- us=none flags=-
+# cite: ctlseqs `Ps = 32`; xterm CASE_SGR case 32
+FG32_ansi | \x1b[32m | fg=i2 bg=- ul=- us=none flags=-
+# cite: ctlseqs `Ps = 33`; xterm CASE_SGR case 33
+FG33_ansi | \x1b[33m | fg=i3 bg=- ul=- us=none flags=-
+# cite: ctlseqs `Ps = 34`; xterm CASE_SGR case 34
+FG34_ansi | \x1b[34m | fg=i4 bg=- ul=- us=none flags=-
+# cite: ctlseqs `Ps = 35`; xterm CASE_SGR case 35
+FG35_ansi | \x1b[35m | fg=i5 bg=- ul=- us=none flags=-
+# cite: ctlseqs `Ps = 36`; xterm CASE_SGR case 36
+FG36_ansi | \x1b[36m | fg=i6 bg=- ul=- us=none flags=-
+# cite: ctlseqs `Ps = 37`; xterm CASE_SGR case 37
+FG37_ansi | \x1b[37m | fg=i7 bg=- ul=- us=none flags=-
+# cite: ctlseqs `Ps = 40`; xterm CASE_SGR case 40
+BG40_ansi | \x1b[40m | fg=- bg=i0 ul=- us=none flags=-
+# cite: ctlseqs `Ps = 41`; xterm CASE_SGR case 41
+BG41_ansi | \x1b[41m | fg=- bg=i1 ul=- us=none flags=-
+# cite: ctlseqs `Ps = 42`; xterm CASE_SGR case 42
+BG42_ansi | \x1b[42m | fg=- bg=i2 ul=- us=none flags=-
+# cite: ctlseqs `Ps = 43`; xterm CASE_SGR case 43
+BG43_ansi | \x1b[43m | fg=- bg=i3 ul=- us=none flags=-
+# cite: ctlseqs `Ps = 44`; xterm CASE_SGR case 44
+BG44_ansi | \x1b[44m | fg=- bg=i4 ul=- us=none flags=-
+# cite: ctlseqs `Ps = 45`; xterm CASE_SGR case 45
+BG45_ansi | \x1b[45m | fg=- bg=i5 ul=- us=none flags=-
+# cite: ctlseqs `Ps = 46`; xterm CASE_SGR case 46
+BG46_ansi | \x1b[46m | fg=- bg=i6 ul=- us=none flags=-
+# cite: ctlseqs `Ps = 47`; xterm CASE_SGR case 47
+BG47_ansi | \x1b[47m | fg=- bg=i7 ul=- us=none flags=-
+# cite: ctlseqs aixterm `Ps = 90`; xterm CASE_SGR AIX colours: sgr_foreground = op - 90 + 8
+# note: bright colours are Indexed(8..15), not bold
+FG90_bright | \x1b[90m | fg=i8 bg=- ul=- us=none flags=-
+# cite: ctlseqs aixterm `Ps = 91`; xterm CASE_SGR AIX colours: sgr_foreground = op - 90 + 8
+FG91_bright | \x1b[91m | fg=i9 bg=- ul=- us=none flags=-
+# cite: ctlseqs aixterm `Ps = 92`; xterm CASE_SGR AIX colours: sgr_foreground = op - 90 + 8
+FG92_bright | \x1b[92m | fg=i10 bg=- ul=- us=none flags=-
+# cite: ctlseqs aixterm `Ps = 93`; xterm CASE_SGR AIX colours: sgr_foreground = op - 90 + 8
+FG93_bright | \x1b[93m | fg=i11 bg=- ul=- us=none flags=-
+# cite: ctlseqs aixterm `Ps = 94`; xterm CASE_SGR AIX colours: sgr_foreground = op - 90 + 8
+FG94_bright | \x1b[94m | fg=i12 bg=- ul=- us=none flags=-
+# cite: ctlseqs aixterm `Ps = 95`; xterm CASE_SGR AIX colours: sgr_foreground = op - 90 + 8
+FG95_bright | \x1b[95m | fg=i13 bg=- ul=- us=none flags=-
+# cite: ctlseqs aixterm `Ps = 96`; xterm CASE_SGR AIX colours: sgr_foreground = op - 90 + 8
+FG96_bright | \x1b[96m | fg=i14 bg=- ul=- us=none flags=-
+# cite: ctlseqs aixterm `Ps = 97`; xterm CASE_SGR AIX colours: sgr_foreground = op - 90 + 8
+FG97_bright | \x1b[97m | fg=i15 bg=- ul=- us=none flags=-
+# cite: ctlseqs aixterm `Ps = 100`; xterm CASE_SGR AIX colours: sgr_background = op - 100 + 8
+# note: xterm without AIX colours treats 100 as 'reset fg and bg'; with them (the default build) it is bright black
+BG100_bright | \x1b[100m | fg=- bg=i8 ul=- us=none flags=-
+# cite: ctlseqs aixterm `Ps = 101`; xterm CASE_SGR AIX colours: sgr_background = op - 100 + 8
+BG101_bright | \x1b[101m | fg=- bg=i9 ul=- us=none flags=-
+# cite: ctlseqs aixterm `Ps = 102`; xterm CASE_SGR AIX colours: sgr_background = op - 100 + 8
+BG102_bright | \x1b[102m | fg=- bg=i10 ul=- us=none flags=-
+# cite: ctlseqs aixterm `Ps = 103`; xterm CASE_SGR AIX colours: sgr_background = op - 100 + 8
+BG103_bright | \x1b[103m | fg=- bg=i11 ul=- us=none flags=-
+# cite: ctlseqs aixterm `Ps = 104`; xterm CASE_SGR AIX colours: sgr_background = op - 100 + 8
+BG104_bright | \x1b[104m | fg=- bg=i12 ul=- us=none flags=-
+# cite: ctlseqs aixterm `Ps = 105`; xterm CASE_SGR AIX colours: sgr_background = op - 100 + 8
+BG105_bright | \x1b[105m | fg=- bg=i13 ul=- us=none flags=-
+# cite: ctlseqs aixterm `Ps = 106`; xterm CASE_SGR AIX colours: sgr_background = op - 100 + 8
+BG106_bright | \x1b[106m | fg=- bg=i14 ul=- us=none flags=-
+# cite: ctlseqs aixterm `Ps = 107`; xterm CASE_SGR AIX colours: sgr_background = op - 100 + 8
+BG107_bright | \x1b[107m | fg=- bg=i15 ul=- us=none flags=-
+# cite: ctlseqs `Ps = 39`; xterm CASE_SGR reset_SGR_Foreground
+FG39_default | \x1b[31;44m++\x1b[39m | fg=- bg=i4 ul=- us=none flags=-
+# cite: ctlseqs `Ps = 49`; xterm CASE_SGR reset_SGR_Background
+BG49_default | \x1b[31;44m++\x1b[49m | fg=i1 bg=- ul=- us=none flags=-
+# cite: xterm CASE_SGR
+FG39_clears_extended | \x1b[38;2;1;2;3m++\x1b[39m | fg=- bg=- ul=- us=none flags=-
+# cite: xterm CASE_SGR
+BG49_clears_extended | \x1b[48;5;200m++\x1b[49m | fg=- bg=- ul=- us=none flags=-
+# cite: kitty: 59 is the only code (besides 0) that clears the underline colour
+FG39_49_leave_underline_colour | \x1b[58;5;9;31;44m++\x1b[39;49m | fg=- bg=- ul=i9 us=none flags=-
+# cite: xterm CASE_SGR clrDirectFG
+FG_ansi_replaces_extended | \x1b[38;5;200m++\x1b[31m | fg=i1 bg=- ul=- us=none flags=-
+# cite: xterm CASE_SGR
+FG_extended_replaces_ansi | \x1b[31m++\x1b[38;5;200m | fg=i200 bg=- ul=- us=none flags=-
+# cite: xterm boldColors resource is a renderer concern; Color stays Indexed(1)
+# note: tessera-term must not map bold+30..37 to 8..15
+FG_bold_does_not_brighten | \x1b[1;31m | fg=i1 bg=- ul=- us=none flags=bold
+# cite: xterm CASE_SGR
+FG_and_BG_together | \x1b[31;44m | fg=i1 bg=i4 ul=- us=none flags=-
+# cite: xterm CASE_SGR
+BG_last_wins | \x1b[41;42;43m | fg=- bg=i3 ul=- us=none flags=-
+# cite: xterm/kitty swap at draw time, not in the stored cell
+# note: the term crate stores INVERSE; the renderer swaps
+INVERSE_does_not_swap_colours | \x1b[31;44;7m | fg=i1 bg=i4 ul=- us=none flags=inverse
+# cite: xterm CASE_SGR default arm
+# note: 98 and 99 are not colours
+FG98_99_ignored | \x1b[98;99m | fg=- bg=- ul=- us=none flags=-
+# cite: xterm CASE_SGR default arm
+BG108_109_ignored | \x1b[108;109m | fg=- bg=- ul=- us=none flags=-
+
+# ---- A5. 256 colours, semicolon form ---------------------------------------------------------------------
+# cite: ctlseqs `Ps = 38 ; 5 ; Ps`; ITU T.416 13.1.8; xterm CASE_SGR parse_extended_colors case 5
+FG38_5_0 | \x1b[38;5;0m | fg=i0 bg=- ul=- us=none flags=-
+# cite: ctlseqs `Ps = 38 ; 5 ; Ps`; ITU T.416 13.1.8; xterm CASE_SGR parse_extended_colors case 5
+FG38_5_7 | \x1b[38;5;7m | fg=i7 bg=- ul=- us=none flags=-
+# cite: ctlseqs `Ps = 38 ; 5 ; Ps`; ITU T.416 13.1.8; xterm CASE_SGR parse_extended_colors case 5
+FG38_5_8 | \x1b[38;5;8m | fg=i8 bg=- ul=- us=none flags=-
+# cite: ctlseqs `Ps = 38 ; 5 ; Ps`; ITU T.416 13.1.8; xterm CASE_SGR parse_extended_colors case 5
+FG38_5_15 | \x1b[38;5;15m | fg=i15 bg=- ul=- us=none flags=-
+# cite: ctlseqs `Ps = 38 ; 5 ; Ps`; ITU T.416 13.1.8; xterm CASE_SGR parse_extended_colors case 5
+FG38_5_16 | \x1b[38;5;16m | fg=i16 bg=- ul=- us=none flags=-
+# cite: ctlseqs `Ps = 38 ; 5 ; Ps`; ITU T.416 13.1.8; xterm CASE_SGR parse_extended_colors case 5
+FG38_5_21 | \x1b[38;5;21m | fg=i21 bg=- ul=- us=none flags=-
+# cite: ctlseqs `Ps = 38 ; 5 ; Ps`; ITU T.416 13.1.8; xterm CASE_SGR parse_extended_colors case 5
+FG38_5_196 | \x1b[38;5;196m | fg=i196 bg=- ul=- us=none flags=-
+# cite: ctlseqs `Ps = 38 ; 5 ; Ps`; ITU T.416 13.1.8; xterm CASE_SGR parse_extended_colors case 5
+FG38_5_231 | \x1b[38;5;231m | fg=i231 bg=- ul=- us=none flags=-
+# cite: ctlseqs `Ps = 38 ; 5 ; Ps`; ITU T.416 13.1.8; xterm CASE_SGR parse_extended_colors case 5
+FG38_5_232 | \x1b[38;5;232m | fg=i232 bg=- ul=- us=none flags=-
+# cite: ctlseqs `Ps = 38 ; 5 ; Ps`; ITU T.416 13.1.8; xterm CASE_SGR parse_extended_colors case 5
+FG38_5_244 | \x1b[38;5;244m | fg=i244 bg=- ul=- us=none flags=-
+# cite: ctlseqs `Ps = 38 ; 5 ; Ps`; ITU T.416 13.1.8; xterm CASE_SGR parse_extended_colors case 5
+FG38_5_255 | \x1b[38;5;255m | fg=i255 bg=- ul=- us=none flags=-
+# cite: ctlseqs `Ps = 48 ; 5 ; Ps`; xterm CASE_SGR case 48
+BG48_5_0 | \x1b[48;5;0m | fg=- bg=i0 ul=- us=none flags=-
+# cite: ctlseqs `Ps = 48 ; 5 ; Ps`; xterm CASE_SGR case 48
+BG48_5_8 | \x1b[48;5;8m | fg=- bg=i8 ul=- us=none flags=-
+# cite: ctlseqs `Ps = 48 ; 5 ; Ps`; xterm CASE_SGR case 48
+BG48_5_16 | \x1b[48;5;16m | fg=- bg=i16 ul=- us=none flags=-
+# cite: ctlseqs `Ps = 48 ; 5 ; Ps`; xterm CASE_SGR case 48
+BG48_5_196 | \x1b[48;5;196m | fg=- bg=i196 ul=- us=none flags=-
+# cite: ctlseqs `Ps = 48 ; 5 ; Ps`; xterm CASE_SGR case 48
+BG48_5_255 | \x1b[48;5;255m | fg=- bg=i255 ul=- us=none flags=-
+# cite: xterm and kitty store 38;5;1 and 31 identically
+# note: one representation for index 0..15: Indexed(n)
+FG38_5_same_as_30 | \x1b[38;5;1m | fg=i1 bg=- ul=- us=none flags=-
+# cite: xterm CASE_SGR next = item + need, loop continues after the colour
+FG38_5_then_attr | \x1b[38;5;196;1m | fg=i196 bg=- ul=- us=none flags=bold
+# cite: xterm CASE_SGR
+FG38_5_between_attrs | \x1b[1;38;5;196;3m | fg=i196 bg=- ul=- us=none flags=bold,italic
+# cite: xterm CASE_SGR
+FG_BG_256_together | \x1b[38;5;196;48;5;21m | fg=i196 bg=i21 ul=- us=none flags=-
+# cite: xterm CASE_SGR
+FG_BG_256_reversed_order | \x1b[48;5;21;38;5;196m | fg=i196 bg=i21 ul=- us=none flags=-
+# cite: decimal parameter with leading zeros (ECMA-48 5.4.2)
+FG38_5_zero_padded | \x1b[38;5;007m | fg=i7 bg=- ul=- us=none flags=-
+
+# ---- B1. Truecolour, semicolon form ----------------------------------------------------------------------
+# cite: ctlseqs `Ps = 38 ; 2 ; Pr ; Pg ; Pb` (konsole variant); xterm CASE_SGR parse_extended_colors case 2
+FG38_2_semicolon | \x1b[38;2;255;128;0m | fg=#ff8000 bg=- ul=- us=none flags=-
+# cite: ctlseqs `Ps = 48 ; 2 ; Pr ; Pg ; Pb`; xterm CASE_SGR
+BG48_2_semicolon | \x1b[48;2;0;128;255m | fg=- bg=#0080ff ul=- us=none flags=-
+# cite: xterm CASE_SGR
+# note: boundary values 0 and 255; Rgb(0,0,0) is NOT Default
+FG38_2_black_and_white | \x1b[38;2;0;0;0m++\x1b[48;2;255;255;255m | fg=#000000 bg=#ffffff ul=- us=none flags=-
+# cite: xterm without directColor maps to the nearest palette entry; kitty, WezTerm, Alacritty keep RGB
+# note: never quantise in the term crate
+FG38_2_stays_rgb_not_indexed | \x1b[38;2;0;0;1m | fg=#000001 bg=- ul=- us=none flags=-
+# cite: xterm CASE_SGR need=3 then the loop continues
+FG38_2_then_attr | \x1b[38;2;1;2;3;1m | fg=#010203 bg=- ul=- us=none flags=bold
+# cite: xterm CASE_SGR: the ';' form takes exactly three values, the fourth is the next attribute (4 = underline)
+# note: no colour-space id in the ';' form (xterm comment: 'CSI 38 ; 2 ; Pr ; Pg ; Pb')
+FG38_2_four_values_semicolon | \x1b[38;2;1;2;3;4m | fg=#010203 bg=- ul=- us=single flags=-
+# cite: xterm CASE_SGR (kitty: COLOR3 state ends after 5 parameters)
+# note: a ';'-separated colour-space id is NOT recognised: 38;2;0;1;2 is the colour, 3 is italic
+FG38_2_cs_in_semicolon_form_is_not_cs | \x1b[38;2;0;1;2;3m | fg=#000102 bg=- ul=- us=none flags=italic
+# cite: xterm CASE_SGR
+FG_BG_truecolour_together | \x1b[38;2;1;2;3;48;2;4;5;6m | fg=#010203 bg=#040506 ul=- us=none flags=-
+# cite: xterm CASE_SGR
+FG_rgb_then_256_replaces | \x1b[38;2;1;2;3;38;5;9m | fg=i9 bg=- ul=- us=none flags=-
+
+# ---- B2. Colon forms (38/48) -----------------------------------------------------------------------------
+# cite: ctlseqs `Ps = 38 : 5 : Ps` (ISO-8613-6); ECMA-48 5.4.2; xterm CASE_SGR param_has_subparams branch 1
+FG38c_5_n | \x1b[38:5:196m | fg=i196 bg=- ul=- us=none flags=-
+# cite: ctlseqs `Ps = 48 : 5 : Ps`
+BG48c_5_n | \x1b[48:5:21m | fg=- bg=i21 ul=- us=none flags=-
+# cite: ISO-8613-6 indexed colour, 0 and 255
+FG38c_5_boundaries | \x1b[38:5:0m++\x1b[48:5:255m | fg=i0 bg=i255 ul=- us=none flags=-
+# cite: ctlseqs `Ps = 38 : 2 : Pi : Pr : Pg : Pb` with an empty Pi; xterm CASE_SGR ('4 or more after 2' => id present, id ignored); kitty cursor_from_sgr parse_color skips a 4th value
+# note: vte flattens it to [38,2,0,1,2,3]: six entries, bits set on indexes 1..5
+FG38c_2_cs_empty | \x1b[38:2::1:2:3m | fg=#010203 bg=- ul=- us=none flags=-
+# cite: ctlseqs `Ps = 48 : 2 : Pi : Pr : Pg : Pb`
+BG48c_2_cs_empty | \x1b[48:2::4:5:6m | fg=- bg=#040506 ul=- us=none flags=-
+# cite: same, id 0
+FG38c_2_cs_zero | \x1b[38:2:0:1:2:3m | fg=#010203 bg=- ul=- us=none flags=-
+# cite: ctlseqs: 'The color space identifier Pi is ignored'; xterm CASE_SGR
+# note: any id value (WezTerm special-cases id 6 as RGBA with a fourth value; do not copy)
+FG38c_2_cs_nonzero_ignored | \x1b[38:2:7:1:2:3m | fg=#010203 bg=- ul=- us=none flags=-
+# cite: xterm CASE_SGR ('3 after 2 => no colour space id'); kitty cursor_from_sgr; Alacritty handle_colon_rgb (len<=4); WezTerm
+# note: disambiguation is by the NUMBER OF SUB-PARAMETERS after the head: 4 (2,r,g,b) => rgb, >=5 => id then rgb
+FG38c_2_no_cs | \x1b[38:2:1:2:3m | fg=#010203 bg=- ul=- us=none flags=-
+# cite: same
+BG48c_2_no_cs | \x1b[48:2:4:5:6m | fg=- bg=#040506 ul=- us=none flags=-
+# cite: xterm CASE_SGR (value index = 2+n+(have>4); anything beyond the third value is dropped); kitty and Alacritty agree
+# note: xterm's comment: 'ignores parameters 6 (and above)'
+FG38c_2_extra_ignored | \x1b[38:2::1:2:3:4m | fg=#010203 bg=- ul=- us=none flags=-
+# cite: xterm CASE_SGR have=5 => Pi=1, rgb=2,3,4; kitty, Alacritty, WezTerm agree
+# note: five sub-parameters after the head: the one after the 2 is the colour-space id even though it is not empty
+FG38c_2_five_after_head_is_cs_then_rgb | \x1b[38:2:1:2:3:4m | fg=#020304 bg=- ul=- us=none flags=-
+# cite: xterm CASE_SGR: the colon group ends at the next ';'
+FG38c_then_semicolon_attr | \x1b[38:5:196;1m | fg=i196 bg=- ul=- us=none flags=bold
+# cite: xterm CASE_SGR
+FG38c_after_attr | \x1b[1;38:5:196m | fg=i196 bg=- ul=- us=none flags=bold
+# cite: xterm CASE_SGR
+FG38c_2_then_attr | \x1b[38:2::1:2:3;4m | fg=#010203 bg=- ul=- us=single flags=-
+# cite: xterm CASE_SGR
+FG_BG_colon_together | \x1b[38:2::1:2:3;48:5:9m | fg=#010203 bg=i9 ul=- us=none flags=-
+# cite: xterm CASE_SGR (next = item+have swallows every sub-parameter of the group); kitty cursor_from_sgr ignores the tail of the group
+# note: extra sub-parameters after the index are dropped, the following ';' parameter still applies
+FG38c_trailing_extra_on_indexed | \x1b[38:5:1:2;3m | fg=i1 bg=- ul=- us=none flags=italic
+# cite: xterm CASE_SGR values[0]=DEFAULT => okIndexedColor fails => no-op; kitty cursor_from_sgr parse_color needs i<count
+# note: group too short: no colour
+FG38c_5_missing_index | \x1b[38:5m | fg=- bg=- ul=- us=none flags=-
+# cite: xterm CASE_SGR
+# note: the group is [38,5]; the ';1' is bold
+FG38c_5_missing_index_then_attr | \x1b[38:5;1m | fg=- bg=- ul=- us=none flags=bold
+# cite: xterm CASE_SGR (3 sub-parameters after the head: value 3 is DEFAULT => no-op); Alacritty handle_colon_rgb => None
+FG38c_2_too_short | \x1b[38:2:1:2m | fg=- bg=- ul=- us=none flags=-
+# cite: same; the ';3' applies
+FG38c_2_too_short_then_attr | \x1b[38:2:1:2;3m | fg=- bg=- ul=- us=none flags=italic
+# cite: xterm: empty component is DEFAULT => whole colour no-op. vte turns the empty slot into 0, so Tessera cannot tell; reading it as 0 is the natural outcome
+# note: parser fact F-EMPTY-COMP; accepted divergence, do not assert
+FG38c_2_empty_component | \x1b[38:2:1::3m | fg=#010003 bg=- ul=- us=none flags=- | free
+# cite: xterm: empty index is DEFAULT(-1) => no-op. vte gives [38],[5],[0] so the empty slot is Indexed(0), as in kitty
+# note: parser fact F-EMPTY-IDX; accepted divergence, do not assert
+FG38_5_empty_index | \x1b[38;5;m | fg=i0 bg=- ul=- us=none flags=- | free
+# cite: same
+# note: F-EMPTY-IDX
+FG38c_5_empty_index | \x1b[38:5:m | fg=i0 bg=- ul=- us=none flags=- | free
+# cite: xterm parse_extended_colors branch 2 ('CSI 38 ; 5 : 1 m'); kitty accepts; Alacritty does NOT
+# note: mixed form from the 2006 KDE discussion. A flattened ';' reader that consumes the next flattened parameters (ignoring bits on the tail) yields this answer for free; do not add code to reject it, do not assert it
+FG38_5_colon_index | \x1b[38;5:196m | fg=i196 bg=- ul=- us=none flags=- | free
+# cite: xterm branch 2 ('CSI 38 ; 2 : 1 : 2 : 3 m')
+# note: same
+FG38_2_colon_rgb | \x1b[38;2:1:2:3m | fg=#010203 bg=- ul=- us=none flags=- | free
+
+# ---- B3. Underline styles 4:0..4:5 and colon groups on other heads ---------------------------------------
+# cite: kitty docs: 4:0 no underline; kitty cursor_from_sgr; Alacritty [4,0]; WezTerm Underline::None
+US4c0_none | \x1b[4m++\x1b[4:0m | fg=- bg=- ul=- us=none flags=-
+# cite: kitty docs 4:1 straight underline; WezTerm; Alacritty
+US4c1_single | \x1b[4:1m | fg=- bg=- ul=- us=single flags=-
+# cite: kitty docs 4:2 double; same as SGR 21 (lead decision 2)
+US4c2_double | \x1b[4:2m | fg=- bg=- ul=- us=double flags=-
+# cite: kitty docs 4:3 curly (undercurl)
+US4c3_curly | \x1b[4:3m | fg=- bg=- ul=- us=curly flags=-
+# cite: kitty docs 4:4 dotted
+US4c4_dotted | \x1b[4:4m | fg=- bg=- ul=- us=dotted flags=-
+# cite: kitty docs 4:5 dashed
+US4c5_dashed | \x1b[4:5m | fg=- bg=- ul=- us=dashed flags=-
+# cite: last wins; 4:0 clears every style
+US4c3_then_4c0 | \x1b[4:3m++\x1b[4:0m | fg=- bg=- ul=- us=none flags=-
+# cite: exactly one style at a time (lead decision 2)
+US4c3_then_4c2 | \x1b[4:3m++\x1b[4:2m | fg=- bg=- ul=- us=double flags=-
+# cite: 4:2 == 21
+US4c2_then_21_same | \x1b[4:2;21m | fg=- bg=- ul=- us=double flags=-
+# cite: brief example for tessera-vt subparams; kitty cursor_from_sgr
+# note: the ';5' after the group is a separate parameter (blink)
+US4c3_with_others | \x1b[1;4:3;5m | fg=- bg=- ul=- us=curly flags=bold,blink
+# cite: kitty cursor_from_sgr
+US4c3_then_colour | \x1b[4:3;31m | fg=i1 bg=- ul=- us=curly flags=-
+# cite: kitty cursor_from_sgr
+US4c3_colour_first | \x1b[31;4:3m | fg=i1 bg=- ul=- us=curly flags=-
+# cite: ECMA-48: ';' separates independent parameters
+# note: NOT curly: only ':' makes a sub-parameter. Guards against flattening bugs
+US4_3_semicolon_is_two_attrs | \x1b[4;3m | fg=- bg=- ul=- us=single flags=italic
+# cite: vte yields [4,0]; kitty/Alacritty read 4:0 as none. xterm ignores the whole group
+# note: parser fact: `4:` is indistinguishable from `4:0`
+US4c_empty_sub_is_none | \x1b[4m++\x1b[4:m | fg=- bg=- ul=- us=none flags=-
+# cite: vte yields [4,0,3]; kitty cursor_from_sgr: params[i] = 0 => decoration 0; Alacritty [4,0,..] => CancelUnderline
+# note: only the first sub-parameter decides; extras ignored
+US4cc3_double_colon_is_none | \x1b[4m++\x1b[4::3m | fg=- bg=- ul=- us=none flags=-
+# cite: kitty/Alacritty read only the first sub-parameter
+US4c_extra_subparams_ignored | \x1b[4:3:1m | fg=- bg=- ul=- us=curly flags=-
+# cite: Alacritty `[4, ..] => Underline`; WezTerm falls through to Single; kitty clamps to 5 (dashed); xterm ignores
+# note: decision D-US-UNK (recommend single)
+US4c6_unknown_style_is_single | \x1b[4:6m | fg=- bg=- ul=- us=single flags=-
+# cite: same
+# note: decision D-US-UNK
+US4c9_unknown_style_is_single | \x1b[4:9m | fg=- bg=- ul=- us=single flags=-
+# cite: same
+US4c65535_unknown_style_is_single | \x1b[4:65535m | fg=- bg=- ul=- us=single flags=-
+# cite: kitty: decoration is one field
+US21_then_4c4_replaces | \x1b[21m++\x1b[4:4m | fg=- bg=- ul=- us=dotted flags=-
+# cite: attributes are independent
+US4c3_survives_other_sgr | \x1b[4:3m++\x1b[1;31m | fg=i1 bg=- ul=- us=curly flags=bold
+# cite: SGR 0
+US4c3_reset_by_0 | \x1b[4:3m++\x1b[0m | fg=- bg=- ul=- us=none flags=-
+# cite: SGR 24
+US4c3_reset_by_24 | \x1b[4:3m++\x1b[24m | fg=- bg=- ul=- us=none flags=-
+# cite: xterm CASE_SGR: 'Only SGR 38/48 accept subparameters' => group skipped (item += skip); Alacritty `_ => None`; kitty applies the head => bold
+# note: decision D-SUB-OTHER (recommend: ignore the whole group, so 1:2 is NOT bold, 3:1 is NOT italic)
+SUB_other_head_1c2_ignored | \x1b[1:2m | fg=- bg=- ul=- us=none flags=-
+# cite: same
+# note: the ';4' is a separate parameter and still applies
+SUB_other_head_then_attr | \x1b[3:1;4m | fg=- bg=- ul=- us=single flags=-
+# cite: same
+# note: a colon group headed by 0 is not a reset
+SUB_reset_head_ignored | \x1b[1m++\x1b[0:1m | fg=- bg=- ul=- us=none flags=bold
+# cite: vte yields [0,1] with the bit on index 1: a group headed by 0 => ignored, not a reset
+SUB_empty_head_ignored | \x1b[1m++\x1b[:1m | fg=- bg=- ul=- us=none flags=bold
+# cite: same: only 4, 38, 48, 58 take a colon group
+SUB_colour_head_ignored | \x1b[31:1m | fg=- bg=- ul=- us=none flags=-
+# cite: same
+SUB_39_head_ignored | \x1b[31m++\x1b[39:1m | fg=i1 bg=- ul=- us=none flags=-
+
+# ---- B4. Underline colour 58 / 59 ------------------------------------------------------------------------
+# cite: kitty docs (underlines): 58 'works exactly like 38, 48'; kitty cursor_from_sgr DECORATION_FG_CODE; WezTerm; Alacritty. xterm: not supported (58 falls to the default arm)
+# note: lead decision 1: Style.underline: Color
+UL58_5_n | \x1b[58;5;196m | fg=- bg=- ul=i196 us=none flags=-
+# cite: kitty docs (58 works exactly like 38, 48)
+UL58_2_rgb | \x1b[58;2;1;2;3m | fg=- bg=- ul=#010203 us=none flags=-
+# cite: kitty docs; ISO-8613-6 form
+UL58c_5_n | \x1b[58:5:196m | fg=- bg=- ul=i196 us=none flags=-
+# cite: kitty docs (58 works exactly like 38, 48)
+UL58c_2_cs_empty | \x1b[58:2::1:2:3m | fg=- bg=- ul=#010203 us=none flags=-
+# cite: same, disambiguated by sub-parameter count as for 38/48
+UL58c_2_no_cs | \x1b[58:2:1:2:3m | fg=- bg=- ul=#010203 us=none flags=-
+# cite: same; id ignored
+UL58c_2_cs_nonzero | \x1b[58:2:9:1:2:3m | fg=- bg=- ul=#010203 us=none flags=-
+# cite: kitty docs '59'; kitty cursor_from_sgr DECORATION_FG_CODE+1; WezTerm ResetUnderlineColor; Alacritty UnderlineColor(None)
+UL59_resets_colour | \x1b[58;5;196m++\x1b[59m | fg=- bg=- ul=- us=none flags=-
+# cite: kitty: 59 only clears decoration_fg
+UL59_does_not_touch_style | \x1b[4:3;58;5;196m++\x1b[59m | fg=- bg=- ul=- us=curly flags=-
+# cite: kitty cursor_from_sgr keeps decoration_fg in a field separate from decoration
+# note: us=none: no underline, colour remembered
+UL58_independent_of_4 | \x1b[58;5;196m | fg=- bg=- ul=i196 us=none flags=-
+# cite: kitty cursor_from_sgr
+UL58_then_4 | \x1b[58;5;196;4m | fg=- bg=- ul=i196 us=single flags=-
+# cite: kitty cursor_from_sgr
+# note: fg and underline colour are independent
+UL58_with_fg | \x1b[31;58;5;9m | fg=i1 bg=- ul=i9 us=none flags=-
+# cite: kitty cursor_from_sgr: only 59 and 0 clear it
+UL58_survives_39_49 | \x1b[58;5;196;31;41m++\x1b[39;49m | fg=- bg=- ul=i196 us=none flags=-
+# cite: kitty cursor_from_sgr
+UL58_replaces_colour | \x1b[58;5;1m++\x1b[58;2;1;2;3m | fg=- bg=- ul=#010203 us=none flags=-
+# cite: lead decision 5; kitty cursor_from_sgr cursor_reset_display_attrs
+UL58_cleared_by_0 | \x1b[58;5;196m++\x1b[0m | fg=- bg=- ul=- us=none flags=-
+# cite: same walk as 38
+UL58_then_attr | \x1b[58;5;196;1m | fg=- bg=- ul=i196 us=none flags=bold
+# cite: same walk as 38
+UL58_attr_58_attr | \x1b[3;58;2;1;2;3;1m | fg=- bg=- ul=#010203 us=none flags=bold,italic
+# cite: same as 38: consumes what exists and stops
+UL58_too_few_5 | \x1b[1;58;5m | fg=- bg=- ul=- us=none flags=bold
+# cite: same
+UL58_too_few_2 | \x1b[1;58;2;1;2m | fg=- bg=- ul=- us=none flags=bold
+# cite: same
+UL58_alone | \x1b[1;58m | fg=- bg=- ul=- us=none flags=bold
+# cite: lead decision 4; kitty would mask to 0 (parse_color & 0xFF): divergence by decision
+UL58_over_255 | \x1b[58;5;256;1m | fg=- bg=- ul=- us=none flags=bold
+# cite: lead decision 4
+UL58_rgb_over_255 | \x1b[58;2;0;256;0;1m | fg=- bg=- ul=- us=none flags=bold
+# cite: lead decision 4
+UL58c_over_255 | \x1b[58:5:256;1m | fg=- bg=- ul=- us=none flags=bold
+# cite: lead decision 4
+UL58c_rgb_over_255 | \x1b[58:2::1:2:300;1m | fg=- bg=- ul=- us=none flags=bold
+# cite: see D-38-UNK: eat `58;7`, continue
+UL58_unknown_kind | \x1b[58;7;1m | fg=- bg=- ul=- us=none flags=bold
+# cite: xterm ignores 58 and would read `5;1` as blink+bold; Tessera must not (lead decision 1)
+# note: documented divergence from xterm
+UL58_xterm_would_misparse | \x1b[58;5;1m | fg=- bg=- ul=i1 us=none flags=-
+
+# ---- B5. Unknown values, failure modes, repeats, limits, non-SGR, interruptions, DECSC/RIS ---------------
+# cite: xterm CASE_SGR default arm: unknown codes are ignored and parsing continues (lead decision 4)
+UNK_in_the_middle | \x1b[1;99;3m | fg=- bg=- ul=- us=none flags=bold,italic
+# cite: xterm CASE_SGR
+UNK_200_in_the_middle | \x1b[1;200;3m | fg=- bg=- ul=- us=none flags=bold,italic
+# cite: xterm CASE_SGR
+UNK_65535_in_the_middle | \x1b[1;65535;3m | fg=- bg=- ul=- us=none flags=bold,italic
+# cite: vte saturates at 65535 (xterm MAX_I_PARAM likewise); never overflows u16
+UNK_saturated_in_the_middle | \x1b[1;99999999999;3m | fg=- bg=- ul=- us=none flags=bold,italic
+# cite: xterm CASE_SGR ignores the alternative-font codes
+# note: ECMA-48 10-20 select fonts; kitty, Alacritty ignore; WezTerm has Font(..) (not stored in Style)
+UNK_fonts_10_to_20 | \x1b[10;11;12;13;14;15;16;17;18;19;20m | fg=- bg=- ul=- us=none flags=-
+# cite: xterm CASE_SGR default arm. 53 overline (kitty, WezTerm support it), 51/52 framed/encircled, 73-75 super/subscript: no Style flag exists, ignore
+# note: an overline flag is out of scope for #7
+UNK_misc_not_stored | \x1b[26;50;51;52;53;54;55;56;57;60;61;62;63;64;65;73;74;75m | fg=- bg=- ul=- us=none flags=-
+# cite: xterm CASE_SGR
+UNK_above_107 | \x1b[76;77;88;89;98;99;108;109;110;255;1000;65535m | fg=- bg=- ul=- us=none flags=-
+# cite: xterm CASE_SGR
+UNK_then_attr_after | \x1b[99;1m | fg=- bg=- ul=- us=none flags=bold
+# cite: xterm CASE_SGR
+UNK_zero_is_reset_not_unknown | \x1b[1;0;99;3m | fg=- bg=- ul=- us=none flags=italic
+# cite: xterm CASE_SGR (code=7, need=0, next=item: consumes `38;7` only); Alacritty parse_sgr_color consumes 7 then None; kitty drops the whole SGR
+# note: decision D-38-UNK (recommend xterm/Alacritty: eat the kind, continue)
+38_unknown_kind_eats_kind | \x1b[38;7;1m | fg=- bg=- ul=- us=none flags=bold
+# cite: same
+38_kind_zero_eats_kind | \x1b[38;0;1m | fg=- bg=- ul=- us=none flags=bold
+# cite: same: the `2` after kind 1 is SGR 2 (faint), not an rgb marker
+38_kind_1_eats_kind_only | \x1b[38;1;2m | fg=- bg=- ul=- us=none flags=dim
+# cite: same
+48_unknown_kind | \x1b[48;7;1m | fg=- bg=- ul=- us=none flags=bold
+# cite: xterm CASE_SGR: ++item < nparam fails => no colour, nothing more to consume
+38_alone | \x1b[1;38m | fg=- bg=- ul=- us=none flags=bold
+# cite: xterm CASE_SGR
+38_alone_first | \x1b[38m | fg=- bg=- ul=- us=none flags=-
+# cite: xterm CASE_SGR
+48_alone | \x1b[1;48m | fg=- bg=- ul=- us=none flags=bold
+# cite: xterm CASE_SGR: values[0]=DEFAULT => no-op; item advanced past the end
+38_5_no_index | \x1b[1;38;5m | fg=- bg=- ul=- us=none flags=bold
+# cite: xterm CASE_SGR
+48_5_no_index | \x1b[1;48;5m | fg=- bg=- ul=- us=none flags=bold
+# cite: xterm CASE_SGR
+38_2_no_values | \x1b[1;38;2m | fg=- bg=- ul=- us=none flags=bold
+# cite: xterm CASE_SGR: next = item+3 is past the end; values[1],[2] = DEFAULT
+38_2_one_value | \x1b[1;38;2;1m | fg=- bg=- ul=- us=none flags=bold
+# cite: xterm CASE_SGR
+38_2_two_values | \x1b[1;38;2;1;2m | fg=- bg=- ul=- us=none flags=bold
+# cite: xterm CASE_SGR
+48_2_two_values | \x1b[1;48;2;1;2m | fg=- bg=- ul=- us=none flags=bold
+# cite: xterm CASE_SGR: a failed colour leaves the previous colour alone
+38_too_few_keeps_old_colour | \x1b[31;38;5m | fg=i1 bg=- ul=- us=none flags=-
+# cite: xterm CASE_SGR
+48_too_few_keeps_old_colour | \x1b[44;48;2;1m | fg=- bg=i4 ul=- us=none flags=-
+# cite: xterm CASE_SGR: after `38;5;1` the next parameter `2` is faint
+38_5_consumes_index_exactly | \x1b[38;5;1;2m | fg=i1 bg=- ul=- us=none flags=dim
+# cite: xterm CASE_SGR
+38_2_consumes_three_exactly | \x1b[38;2;1;2;3;2m | fg=#010203 bg=- ul=- us=none flags=dim
+# cite: lead decision 4; xterm okIndexedColor(256) fails; Alacritty u8::try_from fails; kitty would wrap (& 0xFF)
+38_5_gt255_noop | \x1b[31;38;5;256m | fg=i1 bg=- ul=- us=none flags=-
+# cite: lead decision 4: the three parameters are consumed, parsing continues at `1`; xterm item=next
+38_5_gt255_then_attr | \x1b[38;5;256;1m | fg=- bg=- ul=- us=none flags=bold
+# cite: lead decision 4
+38_5_65535_then_attr | \x1b[38;5;65535;1m | fg=- bg=- ul=- us=none flags=bold
+# cite: saturates to 65535, still > 255
+38_5_saturated_then_attr | \x1b[38;5;99999999999;1m | fg=- bg=- ul=- us=none flags=bold
+# cite: lead decision 4
+48_5_gt255_noop | \x1b[44;48;5;256m | fg=- bg=i4 ul=- us=none flags=-
+# cite: largest valid index
+38_5_255_boundary | \x1b[38;5;255m | fg=i255 bg=- ul=- us=none flags=-
+# cite: lead decision 4; xterm range check on each value
+38_2_r_gt255 | \x1b[31;38;2;256;0;0m | fg=i1 bg=- ul=- us=none flags=-
+# cite: lead decision 4: all five parameters consumed
+38_2_g_gt255_then_attr | \x1b[38;2;0;256;0;1m | fg=- bg=- ul=- us=none flags=bold
+# cite: lead decision 4
+38_2_b_gt255_then_attr | \x1b[38;2;0;0;256;1m | fg=- bg=- ul=- us=none flags=bold
+# cite: lead decision 4
+48_2_gt255_noop | \x1b[44;48;2;300;300;300;3m | fg=- bg=i4 ul=- us=none flags=italic
+# cite: largest valid component
+38_2_255_boundary | \x1b[38;2;255;255;255m | fg=#ffffff bg=- ul=- us=none flags=-
+# cite: lead decision 4, colon form
+38c_5_gt255_noop | \x1b[31;38:5:256m | fg=i1 bg=- ul=- us=none flags=-
+# cite: lead decision 4, colon form
+38c_2_gt255_noop | \x1b[31;38:2::0:0:256m | fg=i1 bg=- ul=- us=none flags=-
+# cite: lead decision 4: the group is consumed, ';1' applies
+38c_2_gt255_then_attr | \x1b[38:2::0:256:0;1m | fg=- bg=- ul=- us=none flags=bold
+# cite: ECMA-48: idempotent
+REPEAT_bold | \x1b[1;1;1m | fg=- bg=- ul=- us=none flags=bold
+# cite: idempotent
+REPEAT_underline | \x1b[4;4m | fg=- bg=- ul=- us=single flags=-
+# cite: last wins
+REPEAT_colour_last_wins | \x1b[31;32m | fg=i2 bg=- ul=- us=none flags=-
+# cite: last wins
+REPEAT_256_last_wins | \x1b[38;5;1;38;5;2m | fg=i2 bg=- ul=- us=none flags=-
+# cite: left to right
+REPEAT_toggle | \x1b[3;23;3m | fg=- bg=- ul=- us=none flags=italic
+# cite: left to right
+REPEAT_toggle_off | \x1b[3;23m | fg=- bg=- ul=- us=none flags=-
+# cite: left to right
+REPEAT_bold_22_bold | \x1b[1;22;1m | fg=- bg=- ul=- us=none flags=bold
+# cite: state persists across sequences; 22 clears once
+REPEAT_across_sequences | \x1b[1m++\x1b[1m++\x1b[22m | fg=- bg=- ul=- us=none flags=-
+# cite: idempotent
+REPEAT_0_0 | \x1b[1m++\x1b[0;0m | fg=- bg=- ul=- us=none flags=-
+# cite: tessera-vt parser fact: 32 parameters are kept (ignore:false)
+# note: xterm's own limit is NPARAM=30; kitty 100. Either way a list this long is unusual
+LEN_32_params_applied | \x1b[1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;3m | fg=- bg=- ul=- us=none flags=bold,italic
+# cite: tessera-vt parser fact: the 33rd parameter sets ignore:true; Terminal drops the whole action (csi_spec.txt PARSER FACTS)
+# note: pen unchanged (not even the first 32 are applied)
+LEN_33_params_dropped | \x1b[1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;3m | fg=- bg=- ul=- us=none flags=-
+# cite: same, 32 parameters ending in a truecolour
+LEN_32_params_with_colour_at_end | \x1b[1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;38;2;1;2;3m | fg=#010203 bg=- ul=- us=none flags=bold
+# cite: a colon group counts toward the same 32-parameter limit (vte)
+LEN_33_colon_group_dropped | \x1b[38:2::1:2:3:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0:0m | fg=- bg=- ul=- us=none flags=-
+# cite: ctlseqs `CSI > Pp ; Pv m` is XTMODKEYS, not SGR; tessera-vt reports intermediates [62]
+# note: csi.rs must check intermediates before routing `m`
+NOT_SGR_gt_4_2 | \x1b[>4;2m | fg=- bg=- ul=- us=none flags=-
+# cite: ctlseqs `CSI > Pp m`
+NOT_SGR_gt_m | \x1b[>m | fg=- bg=- ul=- us=none flags=-
+# cite: ctlseqs `CSI ? Pp m` (DEC private, XTQMODKEYS family); intermediates [63]
+NOT_SGR_q_4 | \x1b[?4m | fg=- bg=- ul=- us=none flags=-
+# cite: private marker `<`
+NOT_SGR_lt_1 | \x1b[<1m | fg=- bg=- ul=- us=none flags=-
+# cite: private marker `=`
+NOT_SGR_eq_1 | \x1b[=1m | fg=- bg=- ul=- us=none flags=-
+# cite: intermediate SP: a different function (xterm: none; `CSI Ps SP m`)
+NOT_SGR_space_m | \x1b[1 m | fg=- bg=- ul=- us=none flags=-
+# cite: intermediate `!`
+NOT_SGR_bang_m | \x1b[1!m | fg=- bg=- ul=- us=none flags=-
+# cite: intermediate `$`
+NOT_SGR_dollar_m | \x1b[1$m | fg=- bg=- ul=- us=none flags=-
+# cite: intermediate `"`
+NOT_SGR_quote_m | \x1b[1"m | fg=- bg=- ul=- us=none flags=-
+# cite: a rejected sequence does not poison the next one
+NOT_SGR_sgr_after_private_still_works | \x1b[>4;2m\x1b[1m | fg=- bg=- ul=- us=none flags=bold
+# cite: xterm: ESC inside a CSI starts a new sequence; the first is dropped; tessera-vt (vte) agrees (csi_spec.txt PARSER FACTS)
+INT_esc_restarts | \x1b[1\x1b[3m | fg=- bg=- ul=- us=none flags=italic
+# cite: CAN aborts the CSI and the final byte prints as text (csi_spec.txt PARSER FACTS)
+INT_can_aborts | \x1b[1\x18m | fg=- bg=- ul=- us=none flags=-
+# cite: SUB aborts likewise; `3m` prints
+INT_sub_aborts | \x1b[1\x1a3m | fg=- bg=- ul=- us=none flags=-
+# cite: C0 inside a CSI executes immediately and the sequence continues (csi_spec.txt PARSER FACTS): CR executes, SGR 1;3 applies
+INT_c0_inside_continues | \x1b[1\r;3m | fg=- bg=- ul=- us=none flags=bold,italic
+# cite: xterm CursorSave2/CursorRestoreFlags (flags + sgr colours); DEC STD 070 5-186..5-191 (via xterm comment); lead decision 5
+# note: the underline colour and style are part of the pen and travel with it (no xterm reference: it has none; kitty saves the whole cursor sgr incl. decoration_fg)
+DEC01_save_restore_full_pen | \x1b[1;3;4:3;31;44;58;5;9m\x1b7\x1b[0m\x1b8 | fg=i1 bg=i4 ul=i9 us=curly flags=bold,italic
+# cite: xterm CursorRestoreFlags with sc->saved false: flags and colours come from the zeroed slot => default rendition
+# note: Grid::SavedCursor::INITIAL has a default pen
+DEC02_restore_without_save_is_default | \x1b[1;31m\x1b8 | fg=- bg=- ul=- us=none flags=-
+# cite: the saved copy is a snapshot
+DEC03_sgr_after_save_not_saved | \x1b7\x1b[1;31m\x1b8 | fg=- bg=- ul=- us=none flags=-
+# cite: single save slot (xterm sc[whichBuf])
+DEC04_second_save_wins | \x1b[1m\x1b7\x1b[3m\x1b7\x1b[0m\x1b8 | fg=- bg=- ul=- us=none flags=bold,italic
+# cite: restore does not consume the slot
+DEC05_restore_twice | \x1b[31m\x1b7\x1b[0m\x1b8\x1b[0m\x1b8 | fg=i1 bg=- ul=- us=none flags=-
+# cite: restoring a default pen clears an active one, underline colour included
+DEC06_save_default_restore_resets | \x1b7\x1b[1;4:3;58;5;9;31m\x1b8 | fg=- bg=- ul=- us=none flags=-
+# cite: csi_spec.txt D-HPR: CSI s / CSI u are ignored in #6; the pen is NOT restored by them
+DEC07_scosc_is_not_decsc | \x1b[31m\x1b[s\x1b[0m\x1b[u | fg=- bg=- ul=- us=none flags=-
+# cite: xterm ReallyReset; csi_spec.txt D-RIS (Grid::reset resets the pen)
+RIS01_resets_pen | \x1b[1;3;4:3;31;44;58;5;9m\x1bc | fg=- bg=- ul=- us=none flags=-
+# cite: csi_spec.txt D-RIS: RIS also clears the saved cursor
+RIS02_resets_saved_pen | \x1b[1;31m\x1b7\x1bc\x1b8 | fg=- bg=- ul=- us=none flags=-
+
+# #############################################################################
+# PART C : CELL ROWS (SGR, erase colour, REP, DECSC/DECRC, scrollback)
+# #############################################################################
+# Each block: `### ID`, size (rows x cols), one `feed:` per Terminal::advance call, `cell: (r,c) 'ch' <pen>`,
+# `cursor: (r,c)`, optional `pending_wrap:`, `wrapped:`, `scrollback:`, `sb_cell:`.  `others: blank` means every
+# unlisted cell must equal Cell::BLANK; the blocks below list every cell, so it holds for all of them.
+# Blocks were checked against the current main (SGR stripped) for characters, cursor, pending wrap and scrollback:
+# only the stylings are new evidence.  Part C cites sit in `cite:` lines.
+
+### CEL01_print_uses_pen_at_print_time
+size: 1x4
+feed: \x1b[31mA\x1b[0mB
+cell: (0,0) 'A' fg=i1 bg=- ul=- us=none flags=-
+cell: (0,1) 'B' fg=- bg=- ul=- us=none flags=-
+cell: (0,2) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (0,3) ' ' fg=- bg=- ul=- us=none flags=-
+cursor: (0,2)
+others: blank
+cite: ECMA-48 8.3.117 (SGR affects subsequent graphic characters); xterm CASE_SGR + dotext
+note: others: Cell::BLANK
+
+### CEL02_full_pen_copied_to_cell
+size: 1x3
+feed: \x1b[1;3;4:3;38;2;1;2;3;48;5;9;58;5;200mX
+cell: (0,0) 'X' fg=#010203 bg=i9 ul=i200 us=curly flags=bold,italic
+cell: (0,1) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (0,2) ' ' fg=- bg=- ul=- us=none flags=-
+cursor: (0,1)
+others: blank
+cite: lead decision 5 (Style carries fg, bg, underline colour, flags)
+
+### CEL03_pen_persists_across_lines_and_moves
+size: 2x3
+feed: \x1b[31mA\r\nB\x1b[1;1HC
+cell: (0,0) 'C' fg=i1 bg=- ul=- us=none flags=-
+cell: (1,0) 'B' fg=i1 bg=- ul=- us=none flags=-
+cell: (0,1) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (0,2) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (1,1) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (1,2) ' ' fg=- bg=- ul=- us=none flags=-
+cursor: (0,1)
+others: blank
+cite: the pen is cursor state, not line state
+
+### CEL04_sgr_does_not_move_cursor_or_print
+size: 1x4
+feed: ab\x1b[1;31mc
+cell: (0,0) 'a' fg=- bg=- ul=- us=none flags=-
+cell: (0,1) 'b' fg=- bg=- ul=- us=none flags=-
+cell: (0,2) 'c' fg=i1 bg=- ul=- us=none flags=bold
+cell: (0,3) ' ' fg=- bg=- ul=- us=none flags=-
+cursor: (0,3)
+others: blank
+cite: SGR has no cursor effect (xterm CASE_SGR only touches flags/colours)
+
+### CEL05_sgr_keeps_pending_wrap_then_x_wraps_with_new_pen
+size: 2x4
+feed: abcd\x1b[31mX
+cell: (0,0) 'a' fg=- bg=- ul=- us=none flags=-
+cell: (0,1) 'b' fg=- bg=- ul=- us=none flags=-
+cell: (0,2) 'c' fg=- bg=- ul=- us=none flags=-
+cell: (0,3) 'd' fg=- bg=- ul=- us=none flags=-
+cell: (1,0) 'X' fg=i1 bg=- ul=- us=none flags=-
+cell: (1,1) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (1,2) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (1,3) ' ' fg=- bg=- ul=- us=none flags=-
+cursor: (1,1)
+pending_wrap: false
+wrapped: 0 = true
+others: blank
+cite: SGR leaves the wrap flag alone (xterm: only DECSC/RC, cursor moves, erase reset do_wrap)
+
+### CEL06_lone_sgr_does_not_disarm_pending_wrap
+size: 2x4
+feed: abcd\x1b[31m
+cell: (0,0) 'a' fg=- bg=- ul=- us=none flags=-
+cell: (0,1) 'b' fg=- bg=- ul=- us=none flags=-
+cell: (0,2) 'c' fg=- bg=- ul=- us=none flags=-
+cell: (0,3) 'd' fg=- bg=- ul=- us=none flags=-
+cell: (1,0) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (1,1) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (1,2) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (1,3) ' ' fg=- bg=- ul=- us=none flags=-
+cursor: (0,3)
+pending_wrap: true
+others: blank
+cite: same
+
+### CEL07_wide_char_and_spacer_both_carry_pen
+size: 1x4
+feed: \x1b[31;44m\u{4e2d}
+cell: (0,0) '中 wide' fg=i1 bg=i4 ul=- us=none flags=-
+cell: (0,1) '<spacer>' fg=i1 bg=i4 ul=- us=none flags=-
+cell: (0,2) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (0,3) ' ' fg=- bg=- ul=- us=none flags=-
+cursor: (0,2)
+others: blank
+cite: tessera-grid Cell::spacer(style) (ADR 0008): the spacer copies the base cell's whole Style
+
+### CEL08_combining_mark_keeps_base_style
+size: 1x4
+feed: \x1b[31me\x1b[32m\u{301}
+cell: (0,0) 'é cluster' fg=i1 bg=- ul=- us=none flags=-
+cell: (0,1) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (0,2) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (0,3) ' ' fg=- bg=- ul=- us=none flags=-
+cursor: (0,1)
+others: blank
+cite: Grid::attach appends to the base cell and never restyles it (grid.rs attach; ADR 0008)
+
+### CEL09_printed_space_keeps_whole_pen
+size: 1x3
+feed: \x1b[1;31;44m 
+cell: (0,0) ' ' fg=i1 bg=i4 ul=- us=none flags=bold
+cell: (0,1) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (0,2) ' ' fg=- bg=- ul=- us=none flags=-
+cursor: (0,1)
+others: blank
+cite: a printed space is Cell::new(' ', pen), unlike an erased blank which is Cell::blank_with(pen) (bg only)
+
+### BCE01_el2_keeps_bg_only
+size: 2x6
+feed: abcdef\r\nghijkl\x1b[1;1H\x1b[1;3;4:3;31;44;58;5;9m\x1b[2K
+cell: (0,0) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,1) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,2) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,3) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,4) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,5) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,0) 'g' fg=- bg=- ul=- us=none flags=-
+cell: (1,1) 'h' fg=- bg=- ul=- us=none flags=-
+cell: (1,2) 'i' fg=- bg=- ul=- us=none flags=-
+cell: (1,3) 'j' fg=- bg=- ul=- us=none flags=-
+cell: (1,4) 'k' fg=- bg=- ul=- us=none flags=-
+cell: (1,5) 'l' fg=- bg=- ul=- us=none flags=-
+cursor: (0,0)
+others: blank
+cite: xterm ClearCells (colour pair, no rendition flags); kitty/Alacritty: erased cell = bg of the pen only; lead decision 5
+note: fg, bold, italic, curly and the underline colour are dropped; only bg=i4 stays
+
+### BCE02_el0
+size: 2x6
+feed: abcdef\x1b[1;4H\x1b[1;3;4:3;31;44;58;5;9m\x1b[K
+cell: (0,0) 'a' fg=- bg=- ul=- us=none flags=-
+cell: (0,1) 'b' fg=- bg=- ul=- us=none flags=-
+cell: (0,2) 'c' fg=- bg=- ul=- us=none flags=-
+cell: (0,3) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,4) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,5) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,0) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (1,1) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (1,2) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (1,3) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (1,4) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (1,5) ' ' fg=- bg=- ul=- us=none flags=-
+cursor: (0,3)
+others: blank
+cite: xterm ClearRight
+
+### BCE03_el1
+size: 2x6
+feed: abcdef\x1b[1;3H\x1b[1;3;4:3;31;44;58;5;9m\x1b[1K
+cell: (0,0) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,1) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,2) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,3) 'd' fg=- bg=- ul=- us=none flags=-
+cell: (0,4) 'e' fg=- bg=- ul=- us=none flags=-
+cell: (0,5) 'f' fg=- bg=- ul=- us=none flags=-
+cell: (1,0) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (1,1) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (1,2) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (1,3) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (1,4) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (1,5) ' ' fg=- bg=- ul=- us=none flags=-
+cursor: (0,2)
+others: blank
+cite: xterm ClearLeft
+
+### BCE04_ed2
+size: 2x6
+feed: abcdef\r\nghijk\x1b[1;3;4:3;31;44;58;5;9m\x1b[2J
+cell: (0,0) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,1) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,2) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,3) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,4) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,5) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,0) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,1) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,2) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,3) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,4) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,5) ' ' fg=- bg=i4 ul=- us=none flags=-
+cursor: (1,5)
+others: blank
+cite: xterm ClearScreen
+note: cursor does not move on ED
+
+### BCE05_ed0
+size: 2x6
+feed: abcdef\r\nghijkl\x1b[1;4H\x1b[1;3;4:3;31;44;58;5;9m\x1b[J
+cell: (0,0) 'a' fg=- bg=- ul=- us=none flags=-
+cell: (0,1) 'b' fg=- bg=- ul=- us=none flags=-
+cell: (0,2) 'c' fg=- bg=- ul=- us=none flags=-
+cell: (0,3) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,4) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,5) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,0) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,1) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,2) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,3) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,4) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,5) ' ' fg=- bg=i4 ul=- us=none flags=-
+cursor: (0,3)
+others: blank
+cite: xterm do_erase_display 0
+
+### BCE06_ed1
+size: 2x6
+feed: abcdef\r\nghijkl\x1b[2;3H\x1b[1;3;4:3;31;44;58;5;9m\x1b[1J
+cell: (0,0) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,1) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,2) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,3) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,4) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,5) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,0) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,1) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,2) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,3) 'j' fg=- bg=- ul=- us=none flags=-
+cell: (1,4) 'k' fg=- bg=- ul=- us=none flags=-
+cell: (1,5) 'l' fg=- bg=- ul=- us=none flags=-
+cursor: (1,2)
+others: blank
+cite: xterm do_erase_display 1
+
+### BCE07_ech
+size: 1x6
+feed: abcdef\x1b[1;2H\x1b[1;3;4:3;31;44;58;5;9m\x1b[3X
+cell: (0,0) 'a' fg=- bg=- ul=- us=none flags=-
+cell: (0,1) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,2) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,3) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,4) 'e' fg=- bg=- ul=- us=none flags=-
+cell: (0,5) 'f' fg=- bg=- ul=- us=none flags=-
+cursor: (0,1)
+others: blank
+cite: xterm ECH uses the erase colour
+
+### BCE08_ich_inserted_blanks
+size: 1x6
+feed: abcdef\x1b[1;2H\x1b[1;3;4:3;31;44;58;5;9m\x1b[2@
+cell: (0,0) 'a' fg=- bg=- ul=- us=none flags=-
+cell: (0,1) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,2) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,3) 'b' fg=- bg=- ul=- us=none flags=-
+cell: (0,4) 'c' fg=- bg=- ul=- us=none flags=-
+cell: (0,5) 'd' fg=- bg=- ul=- us=none flags=-
+cursor: (0,1)
+others: blank
+cite: xterm InsertChar fills with the erase colour
+
+### BCE09_dch_vacated_cells
+size: 1x6
+feed: abcdef\x1b[1;2H\x1b[1;3;4:3;31;44;58;5;9m\x1b[2P
+cell: (0,0) 'a' fg=- bg=- ul=- us=none flags=-
+cell: (0,1) 'd' fg=- bg=- ul=- us=none flags=-
+cell: (0,2) 'e' fg=- bg=- ul=- us=none flags=-
+cell: (0,3) 'f' fg=- bg=- ul=- us=none flags=-
+cell: (0,4) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,5) ' ' fg=- bg=i4 ul=- us=none flags=-
+cursor: (0,1)
+others: blank
+cite: xterm DeleteChar fills the vacated cells with the erase colour
+
+### BCE10_il
+size: 3x4
+feed: aaaa\r\nbbbb\r\ncccc\x1b[2;1H\x1b[1;3;4:3;31;44;58;5;9m\x1b[L
+cell: (0,0) 'a' fg=- bg=- ul=- us=none flags=-
+cell: (0,1) 'a' fg=- bg=- ul=- us=none flags=-
+cell: (0,2) 'a' fg=- bg=- ul=- us=none flags=-
+cell: (0,3) 'a' fg=- bg=- ul=- us=none flags=-
+cell: (1,0) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,1) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,2) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,3) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (2,0) 'b' fg=- bg=- ul=- us=none flags=-
+cell: (2,1) 'b' fg=- bg=- ul=- us=none flags=-
+cell: (2,2) 'b' fg=- bg=- ul=- us=none flags=-
+cell: (2,3) 'b' fg=- bg=- ul=- us=none flags=-
+cursor: (1,0)
+others: blank
+cite: xterm InsertLine
+
+### BCE11_dl
+size: 3x4
+feed: aaaa\r\nbbbb\r\ncccc\x1b[1;1H\x1b[1;3;4:3;31;44;58;5;9m\x1b[M
+cell: (0,0) 'b' fg=- bg=- ul=- us=none flags=-
+cell: (0,1) 'b' fg=- bg=- ul=- us=none flags=-
+cell: (0,2) 'b' fg=- bg=- ul=- us=none flags=-
+cell: (0,3) 'b' fg=- bg=- ul=- us=none flags=-
+cell: (1,0) 'c' fg=- bg=- ul=- us=none flags=-
+cell: (1,1) 'c' fg=- bg=- ul=- us=none flags=-
+cell: (1,2) 'c' fg=- bg=- ul=- us=none flags=-
+cell: (1,3) 'c' fg=- bg=- ul=- us=none flags=-
+cell: (2,0) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (2,1) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (2,2) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (2,3) ' ' fg=- bg=i4 ul=- us=none flags=-
+cursor: (0,0)
+others: blank
+cite: xterm DeleteLine
+
+### BCE12_linefeed_scroll
+size: 2x4
+feed: aaaa\r\nbbbb\x1b[1;3;4:3;31;44;58;5;9m\n
+cell: (0,0) 'b' fg=- bg=- ul=- us=none flags=-
+cell: (0,1) 'b' fg=- bg=- ul=- us=none flags=-
+cell: (0,2) 'b' fg=- bg=- ul=- us=none flags=-
+cell: (0,3) 'b' fg=- bg=- ul=- us=none flags=-
+cell: (1,0) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,1) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,2) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,3) ' ' fg=- bg=i4 ul=- us=none flags=-
+cursor: (1,3)
+scrollback: len=1 first=("aaaa")
+others: blank
+cite: xterm xtermScroll/ScrollSelect fill the new line with the erase colour
+
+### BCE13_su
+size: 2x4
+feed: aaaa\r\nbbbb\x1b[1;3;4:3;31;44;58;5;9m\x1b[S
+cell: (0,0) 'b' fg=- bg=- ul=- us=none flags=-
+cell: (0,1) 'b' fg=- bg=- ul=- us=none flags=-
+cell: (0,2) 'b' fg=- bg=- ul=- us=none flags=-
+cell: (0,3) 'b' fg=- bg=- ul=- us=none flags=-
+cell: (1,0) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,1) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,2) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,3) ' ' fg=- bg=i4 ul=- us=none flags=-
+cursor: (1,3)
+others: blank
+cite: xterm SU
+
+### BCE14_sd
+size: 2x4
+feed: aaaa\r\nbbbb\x1b[1;3;4:3;31;44;58;5;9m\x1b[T
+cell: (0,0) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,1) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,2) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,3) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,0) 'a' fg=- bg=- ul=- us=none flags=-
+cell: (1,1) 'a' fg=- bg=- ul=- us=none flags=-
+cell: (1,2) 'a' fg=- bg=- ul=- us=none flags=-
+cell: (1,3) 'a' fg=- bg=- ul=- us=none flags=-
+cursor: (1,3)
+others: blank
+cite: xterm SD
+
+### BCE15_ri_at_top
+size: 2x4
+feed: aaaa\x1b[1;1H\x1b[1;3;4:3;31;44;58;5;9m\x1bM
+cell: (0,0) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,1) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,2) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,3) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (1,0) 'a' fg=- bg=- ul=- us=none flags=-
+cell: (1,1) 'a' fg=- bg=- ul=- us=none flags=-
+cell: (1,2) 'a' fg=- bg=- ul=- us=none flags=-
+cell: (1,3) 'a' fg=- bg=- ul=- us=none flags=-
+cursor: (0,0)
+others: blank
+cite: xterm RevIndex scrolls down with the erase colour
+
+### BCE16_truecolour_bg
+size: 1x4
+feed: abcd\x1b[1;1H\x1b[48;2;1;2;3;31;4;58;5;9m\x1b[2K
+cell: (0,0) ' ' fg=- bg=#010203 ul=- us=none flags=-
+cell: (0,1) ' ' fg=- bg=#010203 ul=- us=none flags=-
+cell: (0,2) ' ' fg=- bg=#010203 ul=- us=none flags=-
+cell: (0,3) ' ' fg=- bg=#010203 ul=- us=none flags=-
+cursor: (0,0)
+others: blank
+cite: bg survives as Rgb
+
+### BCE17_inverse_is_not_applied_to_erase
+size: 1x4
+feed: abcd\x1b[1;1H\x1b[7;44m\x1b[2K
+cell: (0,0) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,1) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,2) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,3) ' ' fg=- bg=i4 ul=- us=none flags=-
+cursor: (0,0)
+others: blank
+cite: erase cells carry bg=i4 and no INVERSE flag (xterm ClearCells flags = colour flags only; kitty/Alacritty likewise)
+note: the renderer never swaps an erased cell; a blank with INVERSE would show the fg colour as background
+
+### BCE18_no_bg_gives_plain_blank
+size: 1x4
+feed: abcd\x1b[1;1H\x1b[1;3;4:3;31;58;5;9m\x1b[2K
+cell: (0,0) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (0,1) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (0,2) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (0,3) ' ' fg=- bg=- ul=- us=none flags=-
+cursor: (0,0)
+others: blank
+cite: pen without bg => the erased cell equals Cell::BLANK, underline colour dropped (lead decision 5)
+
+### BCE19_erase_does_not_change_pen
+size: 1x4
+feed: abcd\x1b[1;1H\x1b[1;44m\x1b[2KX
+cell: (0,0) 'X' fg=- bg=i4 ul=- us=none flags=bold
+cell: (0,1) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,2) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,3) ' ' fg=- bg=i4 ul=- us=none flags=-
+cursor: (0,1)
+others: blank
+cite: the pen survives an erase
+
+### REP01_repeats_with_print_time_pen
+size: 1x6
+feed: \x1b[31mA\x1b[3b
+cell: (0,0) 'A' fg=i1 bg=- ul=- us=none flags=-
+cell: (0,1) 'A' fg=i1 bg=- ul=- us=none flags=-
+cell: (0,2) 'A' fg=i1 bg=- ul=- us=none flags=-
+cell: (0,3) 'A' fg=i1 bg=- ul=- us=none flags=-
+cell: (0,4) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (0,5) ' ' fg=- bg=- ul=- us=none flags=-
+cursor: (0,4)
+others: blank
+cite: xterm CASE_REP repeats through dotext with the current rendition; no SGR in between here
+
+### REP02_sgr_between_print_and_rep_cancels_rep
+size: 1x6
+feed: A\x1b[31m\x1b[3b
+cell: (0,0) 'A' fg=- bg=- ul=- us=none flags=-
+cell: (0,1) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (0,2) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (0,3) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (0,4) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (0,5) ' ' fg=- bg=- ul=- us=none flags=-
+cursor: (0,1)
+others: blank
+cite: xterm charproc.c l.6485 `sp->lastchar = thischar` runs after EVERY completed action, thischar = -1 for CSI m, so REP has nothing to repeat; csi_spec.txt D-REP; already how tessera-term behaves on main (State::apply clears last_printed after every non-print action)
+note: NOTE for the brief: 'SGR under REP' cannot show REP using a NEW pen, because any SGR cancels the REP
+
+### REP03_rep_after_two_prints_uses_last_char_and_its_pen
+size: 1x6
+feed: \x1b[31mA\x1b[32mB\x1b[2b
+cell: (0,0) 'A' fg=i1 bg=- ul=- us=none flags=-
+cell: (0,1) 'B' fg=i2 bg=- ul=- us=none flags=-
+cell: (0,2) 'B' fg=i2 bg=- ul=- us=none flags=-
+cell: (0,3) 'B' fg=i2 bg=- ul=- us=none flags=-
+cell: (0,4) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (0,5) ' ' fg=- bg=- ul=- us=none flags=-
+cursor: (0,4)
+others: blank
+cite: REP repeats only the last graphic character, with the pen current at the time (green, set before B)
+
+### DEC10_decrc_restores_pen_for_next_print
+size: 1x4
+feed: \x1b[1;31;58;5;9;4:3m\x1b7\x1b[0mab\x1b8X
+cell: (0,0) 'X' fg=i1 bg=- ul=i9 us=curly flags=bold
+cell: (0,1) 'b' fg=- bg=- ul=- us=none flags=-
+cell: (0,2) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (0,3) ' ' fg=- bg=- ul=- us=none flags=-
+cursor: (0,1)
+others: blank
+cite: xterm CursorSave2/CursorRestoreFlags; lead decision 5 (test to add)
+note: 'a' was overwritten by X; 'b' keeps the plain pen
+
+### SB01_scrolled_line_keeps_style_new_line_does_not
+size: 2x4
+feed: \x1b[31;4:3mA\r\n\n
+cell: (0,0) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (0,1) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (0,2) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (0,3) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (1,0) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (1,1) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (1,2) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (1,3) ' ' fg=- bg=- ul=- us=none flags=-
+cursor: (1,0)
+scrollback: len=1 first=("A")
+sb_cell: 0 (0,0) 'A' fg=i1 bg=- ul=- us=curly flags=-
+others: blank
+cite: scrollback stores the Line unchanged; the new bottom line is Cell::blank_with(pen) = bg only
+
+# -- end of part C
+
+# #############################################################################
+# PART D : COLOUR TABLE
+# #############################################################################
+# tests/scripts/sgr/color_table.txt (27x80) + tests/fixtures/sgr_color_table_cells.txt give the 16 ANSI colours as
+# fg (30-37, 90-97) and bg (40-47, 100-107), the 6x6x6 cube (48;5;16..231, bg), the 24 greys (48:5 bg, 38;5 fg),
+# truecolour ramps in all four spellings (`;`, `:` with empty id, `:` without id, `:` with id 7), truecolour fg,
+# underline colours (58;5;n and 58:2::r:g:b with 4:1..4:5), and an attribute sampler.  Every group is 3 columns of
+# label + SGR 0 + one default space.  Cite: xterm ctlseqs (256-colour layout: 0-15 ANSI, 16-231 cube
+# 16+36r+6g+b, 232-255 greys); the expected styles are generated from the colour numbers, not from the script text.
+# The snapshot the implementer takes of this table is a regression pin; the cells file is the independent oracle.
+
+# END OF FIXTURE (nothing unfinished)

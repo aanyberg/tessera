@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tessera_devtool::dump;
 use tessera_devtool::run::{self, Completion, RunOptions};
-use tessera_grid::{Color, Grid, Style};
+use tessera_grid::{Color, Grid, Style, UnderlineStyle};
 use tessera_pty::PtyError;
 
 /// Runs `tessera-devtool run <command> <args…>` with a 10 s timeout unless
@@ -78,9 +78,9 @@ fn combining_mark_joins_its_base() {
     ));
     assert_eq!(
         cells,
-        "0:0 \"e\\u{301}\" cluster fg=default bg=default attrs=-\n\
-         0:1 \"!\" - fg=default bg=default attrs=-\n\
-         0:2 \" \" - fg=default bg=default attrs=-\n"
+        "0:0 \"e\\u{301}\" cluster fg=default bg=default ul=default attrs=-\n\
+         0:1 \"!\" - fg=default bg=default ul=default attrs=-\n\
+         0:2 \" \" - fg=default bg=default ul=default attrs=-\n"
     );
 }
 
@@ -275,7 +275,7 @@ fn cells_label_history_rows_negative_and_mark_wrapped_rows() {
         ],
     );
     assert_eq!(output.status.code(), Some(0));
-    let blank = "fg=default bg=default attrs=-";
+    let blank = "fg=default bg=default ul=default attrs=-";
     let expected = [
         format!("-3:0 \"a\" - {blank}"),
         format!("-3:1 \"b\" - {blank}"),
@@ -304,9 +304,9 @@ fn cells_format_lists_every_cell_with_markers() {
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(
         stdout(&output),
-        "0:0 \"中\" wide fg=default bg=default attrs=-\n\
-         0:1 \" \" spacer fg=default bg=default attrs=-\n\
-         0:2 \" \" - fg=default bg=default attrs=- <cursor\n"
+        "0:0 \"中\" wide fg=default bg=default ul=default attrs=-\n\
+         0:1 \" \" spacer fg=default bg=default ul=default attrs=-\n\
+         0:2 \" \" - fg=default bg=default ul=default attrs=- <cursor\n"
     );
 }
 
@@ -413,7 +413,7 @@ fn hand_styled_grid_dumps_exact_sgr() {
     grid.set_pen(Style {
         fg: Color::Rgb(1, 2, 3),
         bg: Color::Indexed(232),
-        ..Style::DEFAULT.with(Style::DOUBLE_UNDERLINE)
+        ..Style::DEFAULT.with_underline_style(UnderlineStyle::Double)
     });
     grid.put_str("中");
     grid.set_pen(Style::DEFAULT);

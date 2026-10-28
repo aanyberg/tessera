@@ -1,0 +1,438 @@
+# Expected cell styles for tests/scripts/sgr/color_table.txt (generated independently from colour numbers).
+# Line format: row col label | pen   (row/col 0-based; every character of the 3-column label carries the pen;
+# the 4th column of each group, and everything right of the last group, is Cell::BLANK).
+# Pen text format: see sgr_spec.txt header.
+# 433 groups
+0 0 "000" | fg=i0 bg=- ul=- us=none flags=-
+0 4 "001" | fg=i1 bg=- ul=- us=none flags=-
+0 8 "002" | fg=i2 bg=- ul=- us=none flags=-
+0 12 "003" | fg=i3 bg=- ul=- us=none flags=-
+0 16 "004" | fg=i4 bg=- ul=- us=none flags=-
+0 20 "005" | fg=i5 bg=- ul=- us=none flags=-
+0 24 "006" | fg=i6 bg=- ul=- us=none flags=-
+0 28 "007" | fg=i7 bg=- ul=- us=none flags=-
+0 32 "008" | fg=i8 bg=- ul=- us=none flags=-
+0 36 "009" | fg=i9 bg=- ul=- us=none flags=-
+0 40 "010" | fg=i10 bg=- ul=- us=none flags=-
+0 44 "011" | fg=i11 bg=- ul=- us=none flags=-
+0 48 "012" | fg=i12 bg=- ul=- us=none flags=-
+0 52 "013" | fg=i13 bg=- ul=- us=none flags=-
+0 56 "014" | fg=i14 bg=- ul=- us=none flags=-
+0 60 "015" | fg=i15 bg=- ul=- us=none flags=-
+1 0 "000" | fg=- bg=i0 ul=- us=none flags=-
+1 4 "001" | fg=- bg=i1 ul=- us=none flags=-
+1 8 "002" | fg=- bg=i2 ul=- us=none flags=-
+1 12 "003" | fg=- bg=i3 ul=- us=none flags=-
+1 16 "004" | fg=- bg=i4 ul=- us=none flags=-
+1 20 "005" | fg=- bg=i5 ul=- us=none flags=-
+1 24 "006" | fg=- bg=i6 ul=- us=none flags=-
+1 28 "007" | fg=- bg=i7 ul=- us=none flags=-
+1 32 "008" | fg=- bg=i8 ul=- us=none flags=-
+1 36 "009" | fg=- bg=i9 ul=- us=none flags=-
+1 40 "010" | fg=- bg=i10 ul=- us=none flags=-
+1 44 "011" | fg=- bg=i11 ul=- us=none flags=-
+1 48 "012" | fg=- bg=i12 ul=- us=none flags=-
+1 52 "013" | fg=- bg=i13 ul=- us=none flags=-
+1 56 "014" | fg=- bg=i14 ul=- us=none flags=-
+1 60 "015" | fg=- bg=i15 ul=- us=none flags=-
+2 0 "016" | fg=- bg=i16 ul=- us=none flags=-
+2 4 "017" | fg=- bg=i17 ul=- us=none flags=-
+2 8 "018" | fg=- bg=i18 ul=- us=none flags=-
+2 12 "019" | fg=- bg=i19 ul=- us=none flags=-
+2 16 "020" | fg=- bg=i20 ul=- us=none flags=-
+2 20 "021" | fg=- bg=i21 ul=- us=none flags=-
+2 24 "052" | fg=- bg=i52 ul=- us=none flags=-
+2 28 "053" | fg=- bg=i53 ul=- us=none flags=-
+2 32 "054" | fg=- bg=i54 ul=- us=none flags=-
+2 36 "055" | fg=- bg=i55 ul=- us=none flags=-
+2 40 "056" | fg=- bg=i56 ul=- us=none flags=-
+2 44 "057" | fg=- bg=i57 ul=- us=none flags=-
+2 48 "088" | fg=- bg=i88 ul=- us=none flags=-
+2 52 "089" | fg=- bg=i89 ul=- us=none flags=-
+2 56 "090" | fg=- bg=i90 ul=- us=none flags=-
+2 60 "091" | fg=- bg=i91 ul=- us=none flags=-
+2 64 "092" | fg=- bg=i92 ul=- us=none flags=-
+2 68 "093" | fg=- bg=i93 ul=- us=none flags=-
+3 0 "022" | fg=- bg=i22 ul=- us=none flags=-
+3 4 "023" | fg=- bg=i23 ul=- us=none flags=-
+3 8 "024" | fg=- bg=i24 ul=- us=none flags=-
+3 12 "025" | fg=- bg=i25 ul=- us=none flags=-
+3 16 "026" | fg=- bg=i26 ul=- us=none flags=-
+3 20 "027" | fg=- bg=i27 ul=- us=none flags=-
+3 24 "058" | fg=- bg=i58 ul=- us=none flags=-
+3 28 "059" | fg=- bg=i59 ul=- us=none flags=-
+3 32 "060" | fg=- bg=i60 ul=- us=none flags=-
+3 36 "061" | fg=- bg=i61 ul=- us=none flags=-
+3 40 "062" | fg=- bg=i62 ul=- us=none flags=-
+3 44 "063" | fg=- bg=i63 ul=- us=none flags=-
+3 48 "094" | fg=- bg=i94 ul=- us=none flags=-
+3 52 "095" | fg=- bg=i95 ul=- us=none flags=-
+3 56 "096" | fg=- bg=i96 ul=- us=none flags=-
+3 60 "097" | fg=- bg=i97 ul=- us=none flags=-
+3 64 "098" | fg=- bg=i98 ul=- us=none flags=-
+3 68 "099" | fg=- bg=i99 ul=- us=none flags=-
+4 0 "028" | fg=- bg=i28 ul=- us=none flags=-
+4 4 "029" | fg=- bg=i29 ul=- us=none flags=-
+4 8 "030" | fg=- bg=i30 ul=- us=none flags=-
+4 12 "031" | fg=- bg=i31 ul=- us=none flags=-
+4 16 "032" | fg=- bg=i32 ul=- us=none flags=-
+4 20 "033" | fg=- bg=i33 ul=- us=none flags=-
+4 24 "064" | fg=- bg=i64 ul=- us=none flags=-
+4 28 "065" | fg=- bg=i65 ul=- us=none flags=-
+4 32 "066" | fg=- bg=i66 ul=- us=none flags=-
+4 36 "067" | fg=- bg=i67 ul=- us=none flags=-
+4 40 "068" | fg=- bg=i68 ul=- us=none flags=-
+4 44 "069" | fg=- bg=i69 ul=- us=none flags=-
+4 48 "100" | fg=- bg=i100 ul=- us=none flags=-
+4 52 "101" | fg=- bg=i101 ul=- us=none flags=-
+4 56 "102" | fg=- bg=i102 ul=- us=none flags=-
+4 60 "103" | fg=- bg=i103 ul=- us=none flags=-
+4 64 "104" | fg=- bg=i104 ul=- us=none flags=-
+4 68 "105" | fg=- bg=i105 ul=- us=none flags=-
+5 0 "034" | fg=- bg=i34 ul=- us=none flags=-
+5 4 "035" | fg=- bg=i35 ul=- us=none flags=-
+5 8 "036" | fg=- bg=i36 ul=- us=none flags=-
+5 12 "037" | fg=- bg=i37 ul=- us=none flags=-
+5 16 "038" | fg=- bg=i38 ul=- us=none flags=-
+5 20 "039" | fg=- bg=i39 ul=- us=none flags=-
+5 24 "070" | fg=- bg=i70 ul=- us=none flags=-
+5 28 "071" | fg=- bg=i71 ul=- us=none flags=-
+5 32 "072" | fg=- bg=i72 ul=- us=none flags=-
+5 36 "073" | fg=- bg=i73 ul=- us=none flags=-
+5 40 "074" | fg=- bg=i74 ul=- us=none flags=-
+5 44 "075" | fg=- bg=i75 ul=- us=none flags=-
+5 48 "106" | fg=- bg=i106 ul=- us=none flags=-
+5 52 "107" | fg=- bg=i107 ul=- us=none flags=-
+5 56 "108" | fg=- bg=i108 ul=- us=none flags=-
+5 60 "109" | fg=- bg=i109 ul=- us=none flags=-
+5 64 "110" | fg=- bg=i110 ul=- us=none flags=-
+5 68 "111" | fg=- bg=i111 ul=- us=none flags=-
+6 0 "040" | fg=- bg=i40 ul=- us=none flags=-
+6 4 "041" | fg=- bg=i41 ul=- us=none flags=-
+6 8 "042" | fg=- bg=i42 ul=- us=none flags=-
+6 12 "043" | fg=- bg=i43 ul=- us=none flags=-
+6 16 "044" | fg=- bg=i44 ul=- us=none flags=-
+6 20 "045" | fg=- bg=i45 ul=- us=none flags=-
+6 24 "076" | fg=- bg=i76 ul=- us=none flags=-
+6 28 "077" | fg=- bg=i77 ul=- us=none flags=-
+6 32 "078" | fg=- bg=i78 ul=- us=none flags=-
+6 36 "079" | fg=- bg=i79 ul=- us=none flags=-
+6 40 "080" | fg=- bg=i80 ul=- us=none flags=-
+6 44 "081" | fg=- bg=i81 ul=- us=none flags=-
+6 48 "112" | fg=- bg=i112 ul=- us=none flags=-
+6 52 "113" | fg=- bg=i113 ul=- us=none flags=-
+6 56 "114" | fg=- bg=i114 ul=- us=none flags=-
+6 60 "115" | fg=- bg=i115 ul=- us=none flags=-
+6 64 "116" | fg=- bg=i116 ul=- us=none flags=-
+6 68 "117" | fg=- bg=i117 ul=- us=none flags=-
+7 0 "046" | fg=- bg=i46 ul=- us=none flags=-
+7 4 "047" | fg=- bg=i47 ul=- us=none flags=-
+7 8 "048" | fg=- bg=i48 ul=- us=none flags=-
+7 12 "049" | fg=- bg=i49 ul=- us=none flags=-
+7 16 "050" | fg=- bg=i50 ul=- us=none flags=-
+7 20 "051" | fg=- bg=i51 ul=- us=none flags=-
+7 24 "082" | fg=- bg=i82 ul=- us=none flags=-
+7 28 "083" | fg=- bg=i83 ul=- us=none flags=-
+7 32 "084" | fg=- bg=i84 ul=- us=none flags=-
+7 36 "085" | fg=- bg=i85 ul=- us=none flags=-
+7 40 "086" | fg=- bg=i86 ul=- us=none flags=-
+7 44 "087" | fg=- bg=i87 ul=- us=none flags=-
+7 48 "118" | fg=- bg=i118 ul=- us=none flags=-
+7 52 "119" | fg=- bg=i119 ul=- us=none flags=-
+7 56 "120" | fg=- bg=i120 ul=- us=none flags=-
+7 60 "121" | fg=- bg=i121 ul=- us=none flags=-
+7 64 "122" | fg=- bg=i122 ul=- us=none flags=-
+7 68 "123" | fg=- bg=i123 ul=- us=none flags=-
+8 0 "124" | fg=- bg=i124 ul=- us=none flags=-
+8 4 "125" | fg=- bg=i125 ul=- us=none flags=-
+8 8 "126" | fg=- bg=i126 ul=- us=none flags=-
+8 12 "127" | fg=- bg=i127 ul=- us=none flags=-
+8 16 "128" | fg=- bg=i128 ul=- us=none flags=-
+8 20 "129" | fg=- bg=i129 ul=- us=none flags=-
+8 24 "160" | fg=- bg=i160 ul=- us=none flags=-
+8 28 "161" | fg=- bg=i161 ul=- us=none flags=-
+8 32 "162" | fg=- bg=i162 ul=- us=none flags=-
+8 36 "163" | fg=- bg=i163 ul=- us=none flags=-
+8 40 "164" | fg=- bg=i164 ul=- us=none flags=-
+8 44 "165" | fg=- bg=i165 ul=- us=none flags=-
+8 48 "196" | fg=- bg=i196 ul=- us=none flags=-
+8 52 "197" | fg=- bg=i197 ul=- us=none flags=-
+8 56 "198" | fg=- bg=i198 ul=- us=none flags=-
+8 60 "199" | fg=- bg=i199 ul=- us=none flags=-
+8 64 "200" | fg=- bg=i200 ul=- us=none flags=-
+8 68 "201" | fg=- bg=i201 ul=- us=none flags=-
+9 0 "130" | fg=- bg=i130 ul=- us=none flags=-
+9 4 "131" | fg=- bg=i131 ul=- us=none flags=-
+9 8 "132" | fg=- bg=i132 ul=- us=none flags=-
+9 12 "133" | fg=- bg=i133 ul=- us=none flags=-
+9 16 "134" | fg=- bg=i134 ul=- us=none flags=-
+9 20 "135" | fg=- bg=i135 ul=- us=none flags=-
+9 24 "166" | fg=- bg=i166 ul=- us=none flags=-
+9 28 "167" | fg=- bg=i167 ul=- us=none flags=-
+9 32 "168" | fg=- bg=i168 ul=- us=none flags=-
+9 36 "169" | fg=- bg=i169 ul=- us=none flags=-
+9 40 "170" | fg=- bg=i170 ul=- us=none flags=-
+9 44 "171" | fg=- bg=i171 ul=- us=none flags=-
+9 48 "202" | fg=- bg=i202 ul=- us=none flags=-
+9 52 "203" | fg=- bg=i203 ul=- us=none flags=-
+9 56 "204" | fg=- bg=i204 ul=- us=none flags=-
+9 60 "205" | fg=- bg=i205 ul=- us=none flags=-
+9 64 "206" | fg=- bg=i206 ul=- us=none flags=-
+9 68 "207" | fg=- bg=i207 ul=- us=none flags=-
+10 0 "136" | fg=- bg=i136 ul=- us=none flags=-
+10 4 "137" | fg=- bg=i137 ul=- us=none flags=-
+10 8 "138" | fg=- bg=i138 ul=- us=none flags=-
+10 12 "139" | fg=- bg=i139 ul=- us=none flags=-
+10 16 "140" | fg=- bg=i140 ul=- us=none flags=-
+10 20 "141" | fg=- bg=i141 ul=- us=none flags=-
+10 24 "172" | fg=- bg=i172 ul=- us=none flags=-
+10 28 "173" | fg=- bg=i173 ul=- us=none flags=-
+10 32 "174" | fg=- bg=i174 ul=- us=none flags=-
+10 36 "175" | fg=- bg=i175 ul=- us=none flags=-
+10 40 "176" | fg=- bg=i176 ul=- us=none flags=-
+10 44 "177" | fg=- bg=i177 ul=- us=none flags=-
+10 48 "208" | fg=- bg=i208 ul=- us=none flags=-
+10 52 "209" | fg=- bg=i209 ul=- us=none flags=-
+10 56 "210" | fg=- bg=i210 ul=- us=none flags=-
+10 60 "211" | fg=- bg=i211 ul=- us=none flags=-
+10 64 "212" | fg=- bg=i212 ul=- us=none flags=-
+10 68 "213" | fg=- bg=i213 ul=- us=none flags=-
+11 0 "142" | fg=- bg=i142 ul=- us=none flags=-
+11 4 "143" | fg=- bg=i143 ul=- us=none flags=-
+11 8 "144" | fg=- bg=i144 ul=- us=none flags=-
+11 12 "145" | fg=- bg=i145 ul=- us=none flags=-
+11 16 "146" | fg=- bg=i146 ul=- us=none flags=-
+11 20 "147" | fg=- bg=i147 ul=- us=none flags=-
+11 24 "178" | fg=- bg=i178 ul=- us=none flags=-
+11 28 "179" | fg=- bg=i179 ul=- us=none flags=-
+11 32 "180" | fg=- bg=i180 ul=- us=none flags=-
+11 36 "181" | fg=- bg=i181 ul=- us=none flags=-
+11 40 "182" | fg=- bg=i182 ul=- us=none flags=-
+11 44 "183" | fg=- bg=i183 ul=- us=none flags=-
+11 48 "214" | fg=- bg=i214 ul=- us=none flags=-
+11 52 "215" | fg=- bg=i215 ul=- us=none flags=-
+11 56 "216" | fg=- bg=i216 ul=- us=none flags=-
+11 60 "217" | fg=- bg=i217 ul=- us=none flags=-
+11 64 "218" | fg=- bg=i218 ul=- us=none flags=-
+11 68 "219" | fg=- bg=i219 ul=- us=none flags=-
+12 0 "148" | fg=- bg=i148 ul=- us=none flags=-
+12 4 "149" | fg=- bg=i149 ul=- us=none flags=-
+12 8 "150" | fg=- bg=i150 ul=- us=none flags=-
+12 12 "151" | fg=- bg=i151 ul=- us=none flags=-
+12 16 "152" | fg=- bg=i152 ul=- us=none flags=-
+12 20 "153" | fg=- bg=i153 ul=- us=none flags=-
+12 24 "184" | fg=- bg=i184 ul=- us=none flags=-
+12 28 "185" | fg=- bg=i185 ul=- us=none flags=-
+12 32 "186" | fg=- bg=i186 ul=- us=none flags=-
+12 36 "187" | fg=- bg=i187 ul=- us=none flags=-
+12 40 "188" | fg=- bg=i188 ul=- us=none flags=-
+12 44 "189" | fg=- bg=i189 ul=- us=none flags=-
+12 48 "220" | fg=- bg=i220 ul=- us=none flags=-
+12 52 "221" | fg=- bg=i221 ul=- us=none flags=-
+12 56 "222" | fg=- bg=i222 ul=- us=none flags=-
+12 60 "223" | fg=- bg=i223 ul=- us=none flags=-
+12 64 "224" | fg=- bg=i224 ul=- us=none flags=-
+12 68 "225" | fg=- bg=i225 ul=- us=none flags=-
+13 0 "154" | fg=- bg=i154 ul=- us=none flags=-
+13 4 "155" | fg=- bg=i155 ul=- us=none flags=-
+13 8 "156" | fg=- bg=i156 ul=- us=none flags=-
+13 12 "157" | fg=- bg=i157 ul=- us=none flags=-
+13 16 "158" | fg=- bg=i158 ul=- us=none flags=-
+13 20 "159" | fg=- bg=i159 ul=- us=none flags=-
+13 24 "190" | fg=- bg=i190 ul=- us=none flags=-
+13 28 "191" | fg=- bg=i191 ul=- us=none flags=-
+13 32 "192" | fg=- bg=i192 ul=- us=none flags=-
+13 36 "193" | fg=- bg=i193 ul=- us=none flags=-
+13 40 "194" | fg=- bg=i194 ul=- us=none flags=-
+13 44 "195" | fg=- bg=i195 ul=- us=none flags=-
+13 48 "226" | fg=- bg=i226 ul=- us=none flags=-
+13 52 "227" | fg=- bg=i227 ul=- us=none flags=-
+13 56 "228" | fg=- bg=i228 ul=- us=none flags=-
+13 60 "229" | fg=- bg=i229 ul=- us=none flags=-
+13 64 "230" | fg=- bg=i230 ul=- us=none flags=-
+13 68 "231" | fg=- bg=i231 ul=- us=none flags=-
+14 0 "232" | fg=- bg=i232 ul=- us=none flags=-
+14 4 "233" | fg=- bg=i233 ul=- us=none flags=-
+14 8 "234" | fg=- bg=i234 ul=- us=none flags=-
+14 12 "235" | fg=- bg=i235 ul=- us=none flags=-
+14 16 "236" | fg=- bg=i236 ul=- us=none flags=-
+14 20 "237" | fg=- bg=i237 ul=- us=none flags=-
+14 24 "238" | fg=- bg=i238 ul=- us=none flags=-
+14 28 "239" | fg=- bg=i239 ul=- us=none flags=-
+14 32 "240" | fg=- bg=i240 ul=- us=none flags=-
+14 36 "241" | fg=- bg=i241 ul=- us=none flags=-
+14 40 "242" | fg=- bg=i242 ul=- us=none flags=-
+14 44 "243" | fg=- bg=i243 ul=- us=none flags=-
+15 0 "244" | fg=- bg=i244 ul=- us=none flags=-
+15 4 "245" | fg=- bg=i245 ul=- us=none flags=-
+15 8 "246" | fg=- bg=i246 ul=- us=none flags=-
+15 12 "247" | fg=- bg=i247 ul=- us=none flags=-
+15 16 "248" | fg=- bg=i248 ul=- us=none flags=-
+15 20 "249" | fg=- bg=i249 ul=- us=none flags=-
+15 24 "250" | fg=- bg=i250 ul=- us=none flags=-
+15 28 "251" | fg=- bg=i251 ul=- us=none flags=-
+15 32 "252" | fg=- bg=i252 ul=- us=none flags=-
+15 36 "253" | fg=- bg=i253 ul=- us=none flags=-
+15 40 "254" | fg=- bg=i254 ul=- us=none flags=-
+15 44 "255" | fg=- bg=i255 ul=- us=none flags=-
+16 0 "232" | fg=i232 bg=- ul=- us=none flags=-
+16 4 "233" | fg=i233 bg=- ul=- us=none flags=-
+16 8 "234" | fg=i234 bg=- ul=- us=none flags=-
+16 12 "235" | fg=i235 bg=- ul=- us=none flags=-
+16 16 "236" | fg=i236 bg=- ul=- us=none flags=-
+16 20 "237" | fg=i237 bg=- ul=- us=none flags=-
+16 24 "238" | fg=i238 bg=- ul=- us=none flags=-
+16 28 "239" | fg=i239 bg=- ul=- us=none flags=-
+16 32 "240" | fg=i240 bg=- ul=- us=none flags=-
+16 36 "241" | fg=i241 bg=- ul=- us=none flags=-
+16 40 "242" | fg=i242 bg=- ul=- us=none flags=-
+16 44 "243" | fg=i243 bg=- ul=- us=none flags=-
+17 0 "244" | fg=i244 bg=- ul=- us=none flags=-
+17 4 "245" | fg=i245 bg=- ul=- us=none flags=-
+17 8 "246" | fg=i246 bg=- ul=- us=none flags=-
+17 12 "247" | fg=i247 bg=- ul=- us=none flags=-
+17 16 "248" | fg=i248 bg=- ul=- us=none flags=-
+17 20 "249" | fg=i249 bg=- ul=- us=none flags=-
+17 24 "250" | fg=i250 bg=- ul=- us=none flags=-
+17 28 "251" | fg=i251 bg=- ul=- us=none flags=-
+17 32 "252" | fg=i252 bg=- ul=- us=none flags=-
+17 36 "253" | fg=i253 bg=- ul=- us=none flags=-
+17 40 "254" | fg=i254 bg=- ul=- us=none flags=-
+17 44 "255" | fg=i255 bg=- ul=- us=none flags=-
+18 0 " 00" | fg=- bg=#000000 ul=- us=none flags=-
+18 4 " 11" | fg=- bg=#110000 ul=- us=none flags=-
+18 8 " 22" | fg=- bg=#220000 ul=- us=none flags=-
+18 12 " 33" | fg=- bg=#330000 ul=- us=none flags=-
+18 16 " 44" | fg=- bg=#440000 ul=- us=none flags=-
+18 20 " 55" | fg=- bg=#550000 ul=- us=none flags=-
+18 24 " 66" | fg=- bg=#660000 ul=- us=none flags=-
+18 28 " 77" | fg=- bg=#770000 ul=- us=none flags=-
+18 32 " 88" | fg=- bg=#880000 ul=- us=none flags=-
+18 36 " 99" | fg=- bg=#990000 ul=- us=none flags=-
+18 40 " aa" | fg=- bg=#aa0000 ul=- us=none flags=-
+18 44 " bb" | fg=- bg=#bb0000 ul=- us=none flags=-
+18 48 " cc" | fg=- bg=#cc0000 ul=- us=none flags=-
+18 52 " dd" | fg=- bg=#dd0000 ul=- us=none flags=-
+18 56 " ee" | fg=- bg=#ee0000 ul=- us=none flags=-
+18 60 " ff" | fg=- bg=#ff0000 ul=- us=none flags=-
+19 0 " 00" | fg=- bg=#000000 ul=- us=none flags=-
+19 4 " 11" | fg=- bg=#001100 ul=- us=none flags=-
+19 8 " 22" | fg=- bg=#002200 ul=- us=none flags=-
+19 12 " 33" | fg=- bg=#003300 ul=- us=none flags=-
+19 16 " 44" | fg=- bg=#004400 ul=- us=none flags=-
+19 20 " 55" | fg=- bg=#005500 ul=- us=none flags=-
+19 24 " 66" | fg=- bg=#006600 ul=- us=none flags=-
+19 28 " 77" | fg=- bg=#007700 ul=- us=none flags=-
+19 32 " 88" | fg=- bg=#008800 ul=- us=none flags=-
+19 36 " 99" | fg=- bg=#009900 ul=- us=none flags=-
+19 40 " aa" | fg=- bg=#00aa00 ul=- us=none flags=-
+19 44 " bb" | fg=- bg=#00bb00 ul=- us=none flags=-
+19 48 " cc" | fg=- bg=#00cc00 ul=- us=none flags=-
+19 52 " dd" | fg=- bg=#00dd00 ul=- us=none flags=-
+19 56 " ee" | fg=- bg=#00ee00 ul=- us=none flags=-
+19 60 " ff" | fg=- bg=#00ff00 ul=- us=none flags=-
+20 0 " 00" | fg=- bg=#000000 ul=- us=none flags=-
+20 4 " 11" | fg=- bg=#000011 ul=- us=none flags=-
+20 8 " 22" | fg=- bg=#000022 ul=- us=none flags=-
+20 12 " 33" | fg=- bg=#000033 ul=- us=none flags=-
+20 16 " 44" | fg=- bg=#000044 ul=- us=none flags=-
+20 20 " 55" | fg=- bg=#000055 ul=- us=none flags=-
+20 24 " 66" | fg=- bg=#000066 ul=- us=none flags=-
+20 28 " 77" | fg=- bg=#000077 ul=- us=none flags=-
+20 32 " 88" | fg=- bg=#000088 ul=- us=none flags=-
+20 36 " 99" | fg=- bg=#000099 ul=- us=none flags=-
+20 40 " aa" | fg=- bg=#0000aa ul=- us=none flags=-
+20 44 " bb" | fg=- bg=#0000bb ul=- us=none flags=-
+20 48 " cc" | fg=- bg=#0000cc ul=- us=none flags=-
+20 52 " dd" | fg=- bg=#0000dd ul=- us=none flags=-
+20 56 " ee" | fg=- bg=#0000ee ul=- us=none flags=-
+20 60 " ff" | fg=- bg=#0000ff ul=- us=none flags=-
+21 0 " 00" | fg=- bg=#000000 ul=- us=none flags=-
+21 4 " 11" | fg=- bg=#111111 ul=- us=none flags=-
+21 8 " 22" | fg=- bg=#222222 ul=- us=none flags=-
+21 12 " 33" | fg=- bg=#333333 ul=- us=none flags=-
+21 16 " 44" | fg=- bg=#444444 ul=- us=none flags=-
+21 20 " 55" | fg=- bg=#555555 ul=- us=none flags=-
+21 24 " 66" | fg=- bg=#666666 ul=- us=none flags=-
+21 28 " 77" | fg=- bg=#777777 ul=- us=none flags=-
+21 32 " 88" | fg=- bg=#888888 ul=- us=none flags=-
+21 36 " 99" | fg=- bg=#999999 ul=- us=none flags=-
+21 40 " aa" | fg=- bg=#aaaaaa ul=- us=none flags=-
+21 44 " bb" | fg=- bg=#bbbbbb ul=- us=none flags=-
+21 48 " cc" | fg=- bg=#cccccc ul=- us=none flags=-
+21 52 " dd" | fg=- bg=#dddddd ul=- us=none flags=-
+21 56 " ee" | fg=- bg=#eeeeee ul=- us=none flags=-
+21 60 " ff" | fg=- bg=#ffffff ul=- us=none flags=-
+22 0 " 00" | fg=#000000 bg=- ul=- us=none flags=-
+22 4 " 11" | fg=#111100 bg=- ul=- us=none flags=-
+22 8 " 22" | fg=#222200 bg=- ul=- us=none flags=-
+22 12 " 33" | fg=#333300 bg=- ul=- us=none flags=-
+22 16 " 44" | fg=#444400 bg=- ul=- us=none flags=-
+22 20 " 55" | fg=#555500 bg=- ul=- us=none flags=-
+22 24 " 66" | fg=#666600 bg=- ul=- us=none flags=-
+22 28 " 77" | fg=#777700 bg=- ul=- us=none flags=-
+22 32 " 88" | fg=#888800 bg=- ul=- us=none flags=-
+22 36 " 99" | fg=#999900 bg=- ul=- us=none flags=-
+22 40 " aa" | fg=#aaaa00 bg=- ul=- us=none flags=-
+22 44 " bb" | fg=#bbbb00 bg=- ul=- us=none flags=-
+22 48 " cc" | fg=#cccc00 bg=- ul=- us=none flags=-
+22 52 " dd" | fg=#dddd00 bg=- ul=- us=none flags=-
+22 56 " ee" | fg=#eeee00 bg=- ul=- us=none flags=-
+22 60 " ff" | fg=#ffff00 bg=- ul=- us=none flags=-
+23 0 " 00" | fg=#000000 bg=- ul=- us=none flags=-
+23 4 " 11" | fg=#001111 bg=- ul=- us=none flags=-
+23 8 " 22" | fg=#002222 bg=- ul=- us=none flags=-
+23 12 " 33" | fg=#003333 bg=- ul=- us=none flags=-
+23 16 " 44" | fg=#004444 bg=- ul=- us=none flags=-
+23 20 " 55" | fg=#005555 bg=- ul=- us=none flags=-
+23 24 " 66" | fg=#006666 bg=- ul=- us=none flags=-
+23 28 " 77" | fg=#007777 bg=- ul=- us=none flags=-
+23 32 " 88" | fg=#008888 bg=- ul=- us=none flags=-
+23 36 " 99" | fg=#009999 bg=- ul=- us=none flags=-
+23 40 " aa" | fg=#00aaaa bg=- ul=- us=none flags=-
+23 44 " bb" | fg=#00bbbb bg=- ul=- us=none flags=-
+23 48 " cc" | fg=#00cccc bg=- ul=- us=none flags=-
+23 52 " dd" | fg=#00dddd bg=- ul=- us=none flags=-
+23 56 " ee" | fg=#00eeee bg=- ul=- us=none flags=-
+23 60 " ff" | fg=#00ffff bg=- ul=- us=none flags=-
+24 0 "000" | fg=- bg=- ul=i0 us=curly flags=-
+24 4 "001" | fg=- bg=- ul=i1 us=curly flags=-
+24 8 "002" | fg=- bg=- ul=i2 us=curly flags=-
+24 12 "003" | fg=- bg=- ul=i3 us=curly flags=-
+24 16 "004" | fg=- bg=- ul=i4 us=curly flags=-
+24 20 "005" | fg=- bg=- ul=i5 us=curly flags=-
+24 24 "006" | fg=- bg=- ul=i6 us=curly flags=-
+24 28 "007" | fg=- bg=- ul=i7 us=curly flags=-
+24 32 "008" | fg=- bg=- ul=i8 us=curly flags=-
+24 36 "009" | fg=- bg=- ul=i9 us=curly flags=-
+24 40 "010" | fg=- bg=- ul=i10 us=curly flags=-
+24 44 "011" | fg=- bg=- ul=i11 us=curly flags=-
+24 48 "012" | fg=- bg=- ul=i12 us=curly flags=-
+24 52 "013" | fg=- bg=- ul=i13 us=curly flags=-
+24 56 "014" | fg=- bg=- ul=i14 us=curly flags=-
+24 60 "015" | fg=- bg=- ul=i15 us=curly flags=-
+25 0 " 00" | fg=- bg=- ul=#0000ff us=single flags=-
+25 4 " 11" | fg=- bg=- ul=#1100ee us=double flags=-
+25 8 " 22" | fg=- bg=- ul=#2200dd us=curly flags=-
+25 12 " 33" | fg=- bg=- ul=#3300cc us=dotted flags=-
+25 16 " 44" | fg=- bg=- ul=#4400bb us=dashed flags=-
+25 20 " 55" | fg=- bg=- ul=#5500aa us=single flags=-
+25 24 " 66" | fg=- bg=- ul=#660099 us=double flags=-
+25 28 " 77" | fg=- bg=- ul=#770088 us=curly flags=-
+25 32 " 88" | fg=- bg=- ul=#880077 us=dotted flags=-
+25 36 " 99" | fg=- bg=- ul=#990066 us=dashed flags=-
+25 40 " aa" | fg=- bg=- ul=#aa0055 us=single flags=-
+25 44 " bb" | fg=- bg=- ul=#bb0044 us=double flags=-
+25 48 " cc" | fg=- bg=- ul=#cc0033 us=curly flags=-
+25 52 " dd" | fg=- bg=- ul=#dd0022 us=dotted flags=-
+25 56 " ee" | fg=- bg=- ul=#ee0011 us=dashed flags=-
+25 60 " ff" | fg=- bg=- ul=#ff0000 us=single flags=-
+26 0 "a01" | fg=- bg=- ul=- us=none flags=bold
+26 4 "a02" | fg=- bg=- ul=- us=none flags=dim
+26 8 "a03" | fg=- bg=- ul=- us=none flags=italic
+26 12 "a05" | fg=- bg=- ul=- us=none flags=blink
+26 16 "a07" | fg=- bg=- ul=- us=none flags=inverse
+26 20 "a08" | fg=- bg=- ul=- us=none flags=hidden
+26 24 "a09" | fg=- bg=- ul=- us=none flags=strike
+26 28 "a04" | fg=- bg=- ul=- us=single flags=-
+26 32 "a21" | fg=- bg=- ul=- us=double flags=-

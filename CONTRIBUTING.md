@@ -72,7 +72,7 @@ command's status (`128 + signal` if a signal ended it); a closed stdout
 (`| head`) does not change that. `125` means the tool itself failed.
 
 Memory grows with `--cols`: the default 10 000 lines of scrollback are kept
-at full width even without `--scrollback` (about 1 MiB per line at 65535
+at full width even without `--scrollback` (about 1.25 MiB per line at 65535
 columns), and `--format cells` builds its whole output in memory. Inherited
 `COLUMNS` and `LINES` are passed to the command unchanged, and programs that
 read them believe them over `--cols`/`--rows`; unset them for such programs.

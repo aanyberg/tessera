@@ -2,6 +2,8 @@
 
 **Status:** accepted · 2026-10-27
 
+Amended by ADR 0013: `Cell` is 20 bytes since `Style` carries an underline colour.
+
 ## Context
 
 Until issue #4 every `tessera_grid::Cell` was one column and held one

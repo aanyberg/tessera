@@ -118,7 +118,7 @@ side, divided into whole cells, at least 1×1 and at most
 keeps a pathological surface from allocating a huge grid: the largest
 Metal surface, 16384² pixels, at backing scale 0.25 with a 4 pt font has
 1×1-pixel cells and would otherwise ask for 16382×16382 cells, about
-4.3 GB once #3 makes `App::resize` reflow the grid. 2048 columns of the
+5.4 GB (20-byte cells, ADR 0013) once #3 makes `App::resize` reflow the grid. 2048 columns of the
 smallest readable font still span several 8K displays. The session is
 then resized with the existing
 `App::resize(id, PtySize::new(rows, cols).with_pixels(w, h))`

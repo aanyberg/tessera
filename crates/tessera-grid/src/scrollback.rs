@@ -10,29 +10,36 @@
 //!
 //! # Memory budget
 //!
-//! Measured on `aarch64-apple-darwin` with rustc 1.99 when this module was
-//! written (the `footprint` unit test prints the current values with
-//! `--nocapture`):
+//! Measured on `aarch64-apple-darwin` with rustc 1.99 when [`Cell`] grew to
+//! 20 bytes for the underline colour (ADR 0013). The `footprint` unit test
+//! prints the requested sizes with `--nocapture`; the `malloc_size` row and
+//! the allocated total were measured outside it, with a C program calling
+//! `malloc_size` on a block of each size:
 //!
 //! | item | bytes |
 //! |---|---|
-//! | `size_of::<Cell>()` | 16 |
+//! | `size_of::<Cell>()` | 20 |
 //! | `size_of::<Line>()` (the ring slot: two `Vec` headers, the grapheme table pointer and a flag) | 64 |
-//! | heap for `cells` of an 80-column line (`80 × 16`, allocated exactly) | 1 280 |
-//! | **one 80-column line, total** | **1 344** |
+//! | heap for `cells` of an 80-column line (`80 × 20`, requested exactly) | 1 600 |
+//! | **one 80-column line, requested** | **1 664** |
+//! | the same heap block as the allocator sizes it (`malloc_size`, macOS 26.6) | 1 792 |
+//! | **one 80-column line, allocated (`malloc_size`)** | **1 856** |
 //!
-//! That is 13 440 000 bytes (≈ 12.8 MiB) for the default 10 000 lines and
-//! 1 344 000 000 bytes (≈ 1 282 MiB) for 1 000 000 lines. Lines without
-//! marks carry no `marks` heap allocation, and lines without grapheme
-//! clusters (combining marks, emoji sequences) no table allocation. A line
-//! with clusters adds, per cluster, its text (at most 32 scalars, so at
-//! most 128 bytes) and a 24-byte table entry; the table is shrunk to fit
-//! when the line scrolls off. The worst case, an 80-column line of nothing
-//! but full clusters, is about 13.5 KB, ten times a plain line.
-//! Allocator rounding adds nothing here: on macOS 26.6 `malloc_size`
-//! reports exactly 1 280 bytes for a 1 280-byte request (and for an
-//! 80-cell `Vec<Cell>`). Wider lines scale linearly with the column count;
-//! a larger [`Cell`] scales the heap part.
+//! That is 16 640 000 bytes (≈ 15.9 MiB) requested and 18 560 000 bytes
+//! (≈ 17.7 MiB) allocated (`malloc_size`) for the default 10 000 lines, and
+//! 1 664 000 000 bytes (≈ 1 587 MiB) requested, 1 856 000 000 bytes
+//! (≈ 1 770 MiB) allocated for 1 000 000 lines. With 16-byte cells the heap block was
+//! 1 280 bytes, which macOS's allocator hands out exactly, so the line cost
+//! 1 344 bytes; the larger cell costs 38 % more per 80-column line. Lines
+//! without marks carry no `marks` heap allocation, and lines without
+//! grapheme clusters (combining marks, emoji sequences) no table
+//! allocation. A line with clusters adds, per cluster, its text (at most
+//! 32 scalars, so at most 128 bytes) and a 24-byte table entry; the table
+//! is shrunk to fit when the line scrolls off. The worst case, an
+//! 80-column line of nothing but full clusters, is about 14 KB, eight
+//! times a plain line. Wider lines scale linearly with the column count
+//! (up to the allocator's size classes); a larger [`Cell`] scales the heap
+//! part.
 //!
 //! `terminal.scrollback_lines` in `tessera-config` defaults to 10 000 and is
 //! capped at 10 000 000 on load.

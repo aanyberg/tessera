@@ -28,13 +28,9 @@
 //! assert_eq!(tessera_devtool::dump::ansi(&grid), "\x1b[0;31mhi\x1b[0m\n\x1b[0m\n");
 //! ```
 
-// TODO(#7): when `Style` gains `underline: Color` and the curly, dotted and
-// dashed underline bits, emit them as `4:3`/`4:4`/`4:5` and `58;5;n` /
-// `58;2;r;g;b` in `sgr_params`, and name them in `attribute_names`.
-
 use std::fmt::Write as _;
 
-use tessera_grid::{Cell, Color, Grid, Line, Style};
+use tessera_grid::{Cell, Color, Grid, Line, Style, UnderlineStyle};
 
 /// How a dump is rendered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -79,11 +75,13 @@ pub fn ansi(grid: &Grid) -> String {
 /// Each row starts in the default style. Before a cell whose style differs
 /// from the previous cell's, the dump writes `ESC[0;<params>m` (or `ESC[0m`
 /// for the default style), where the parameters are, in this order: `1`
-/// bold, `2` dim, `3` italic, `4` underline or `21` double underline, `5`
-/// blink, `7` inverse, `8` hidden, `9` strikethrough, then the foreground
-/// (`30`–`37`, `90`–`97`, `38;5;n` or `38;2;r;g;b`) and the background
-/// (`40`–`47`, `100`–`107`, `48;5;n` or `48;2;r;g;b`). A default colour adds
-/// nothing. Every row ends with `ESC[0m` and a newline. Trailing cells equal
+/// bold, `2` dim, `3` italic, the underline (`4` single, `21` double, `4:3`
+/// curly, `4:4` dotted, `4:5` dashed), `5` blink, `7` inverse, `8` hidden,
+/// `9` strikethrough, then the foreground (`30`–`37`, `90`–`97`, `38;5;n` or
+/// `38;2;r;g;b`), the background (`40`–`47`, `100`–`107`, `48;5;n` or
+/// `48;2;r;g;b`) and the underline colour (`58;5;n` or `58;2;r;g;b`). A
+/// default colour adds nothing. Fed back into `tessera_term::Terminal`, the
+/// dump reproduces every cell's style. Every row ends with `ESC[0m` and a newline. Trailing cells equal
 /// to [`Cell::BLANK`] (a space in the default style) are trimmed; any other
 /// cell is kept, including a space with a background colour, a foreground
 /// colour or attributes, so coloured areas survive. Spacers print nothing
@@ -164,10 +162,12 @@ pub fn cells(grid: &Grid) -> String {
 ///   for a cluster, `" "` for a spacer or blank).
 /// - `flags` lists the width markers `wide`, `spacer`, `cluster` joined by
 ///   `|`, or `-`.
-/// - `style` is `fg=… bg=… attrs=…` with colours as `default`, `idx(n)` or
-///   `rgb(r,g,b)` and attributes as names joined by `|` (`bold`, `dim`,
-///   `italic`, `underline`, `blink`, `inverse`, `hidden`, `strikethrough`,
-///   `double-underline`), or `-`.
+/// - `style` is `fg=… bg=… ul=… attrs=…` with colours (`ul` is the
+///   underline colour) as `default`, `idx(n)` or `rgb(r,g,b)` and attributes
+///   as names joined by `|` (`bold`, `dim`, `italic`, the underline shape as
+///   one of `underline`, `double-underline`, `curly-underline`,
+///   `dotted-underline`, `dashed-underline`, then `blink`, `inverse`,
+///   `hidden`, `strikethrough`), or `-`.
 ///
 /// A line for a row that soft-wraps is followed by `row:wrapped`. With
 /// [`DumpOptions::cursor`] the cursor's cell line ends with ` <cursor`.
@@ -268,14 +268,13 @@ fn sgr_params(style: Style) -> Vec<String> {
             .filter_map(|&(flag, param)| style.has(flag).then_some(param))
             .collect()
     };
-    // Double is checked first: once #7 lands a double underline also
-    // carries `UNDERLINE`, and `21` on its own already means "double".
-    let underline = if style.has(Style::DOUBLE_UNDERLINE) {
-        Some("21")
-    } else if style.has(Style::UNDERLINE) {
-        Some("4")
-    } else {
-        None
+    let underline = match style.underline_style() {
+        UnderlineStyle::None => None,
+        UnderlineStyle::Single => Some("4"),
+        UnderlineStyle::Double => Some("21"),
+        UnderlineStyle::Curly => Some("4:3"),
+        UnderlineStyle::Dotted => Some("4:4"),
+        UnderlineStyle::Dashed => Some("4:5"),
     };
     set(&[(Style::BOLD, "1"), (Style::DIM, "2"), (Style::ITALIC, "3")])
         .into_iter()
@@ -289,7 +288,18 @@ fn sgr_params(style: Style) -> Vec<String> {
         .map(str::to_owned)
         .chain(color_param(style.fg, 30, 90, 38))
         .chain(color_param(style.bg, 40, 100, 48))
+        .chain(underline_color_param(style.underline))
         .collect()
+}
+
+/// The SGR parameter for the underline colour: `58;5;n` or `58;2;r;g;b`
+/// (there is no short form for the first sixteen colours).
+fn underline_color_param(color: Color) -> Option<String> {
+    match color {
+        Color::Default => None,
+        Color::Indexed(n) => Some(format!("58;5;{n}")),
+        Color::Rgb(r, g, b) => Some(format!("58;2;{r};{g};{b}")),
+    }
 }
 
 /// The SGR parameter for a colour slot: `base + n` for the eight standard
@@ -318,31 +328,47 @@ fn flag_names(cell: &Cell) -> String {
     join_or_dash(&names)
 }
 
-/// `fg=… bg=… attrs=…` for [`cells_with`].
+/// `fg=… bg=… ul=… attrs=…` for [`cells_with`].
 fn style_description(style: Style) -> String {
     format!(
-        "fg={} bg={} attrs={}",
+        "fg={} bg={} ul={} attrs={}",
         color_name(style.fg),
         color_name(style.bg),
+        color_name(style.underline),
         join_or_dash(&attribute_names(style))
     )
 }
 
-/// Names of the attributes set in `style`, in SGR order.
+/// Names of the attributes set in `style`, in SGR order; the underline is
+/// named by its shape.
 fn attribute_names(style: Style) -> Vec<&'static str> {
-    [
+    let set = |flags: &[(u16, &'static str)]| -> Vec<&'static str> {
+        flags
+            .iter()
+            .filter_map(|&(flag, name)| style.has(flag).then_some(name))
+            .collect()
+    };
+    let underline = match style.underline_style() {
+        UnderlineStyle::None => None,
+        UnderlineStyle::Single => Some("underline"),
+        UnderlineStyle::Double => Some("double-underline"),
+        UnderlineStyle::Curly => Some("curly-underline"),
+        UnderlineStyle::Dotted => Some("dotted-underline"),
+        UnderlineStyle::Dashed => Some("dashed-underline"),
+    };
+    set(&[
         (Style::BOLD, "bold"),
         (Style::DIM, "dim"),
         (Style::ITALIC, "italic"),
-        (Style::UNDERLINE, "underline"),
+    ])
+    .into_iter()
+    .chain(underline)
+    .chain(set(&[
         (Style::BLINK, "blink"),
         (Style::INVERSE, "inverse"),
         (Style::HIDDEN, "hidden"),
         (Style::STRIKETHROUGH, "strikethrough"),
-        (Style::DOUBLE_UNDERLINE, "double-underline"),
-    ]
-    .into_iter()
-    .filter_map(|(flag, name)| style.has(flag).then_some(name))
+    ]))
     .collect()
 }
 
@@ -422,7 +448,7 @@ mod tests {
             (Style::INVERSE, "7"),
             (Style::HIDDEN, "8"),
             (Style::STRIKETHROUGH, "9"),
-            (Style::DOUBLE_UNDERLINE, "21"),
+            (Style::UNDERLINE | Style::DOUBLE_UNDERLINE, "21"),
         ];
         for (flag, param) in cases {
             assert_eq!(
@@ -434,13 +460,58 @@ mod tests {
     }
 
     #[test]
-    fn double_underline_wins_over_single() {
-        let style = styled(
-            Color::Default,
-            Color::Default,
-            Style::UNDERLINE | Style::DOUBLE_UNDERLINE,
+    fn underline_shapes_and_colour() {
+        let cases = [
+            (UnderlineStyle::Single, "4", "underline"),
+            (UnderlineStyle::Double, "21", "double-underline"),
+            (UnderlineStyle::Curly, "4:3", "curly-underline"),
+            (UnderlineStyle::Dotted, "4:4", "dotted-underline"),
+            (UnderlineStyle::Dashed, "4:5", "dashed-underline"),
+        ];
+        for (shape, param, name) in cases {
+            let style = Style::DEFAULT.with_underline_style(shape);
+            assert_eq!(sgr_params(style), [param], "{shape:?}");
+            assert_eq!(attribute_names(style), [name], "{shape:?}");
+        }
+        let mut style = Style::DEFAULT.with_underline_style(UnderlineStyle::Curly);
+        style.underline = Color::Indexed(1);
+        assert_eq!(sgr_params(style), ["4:3", "58;5;1"]);
+        style.underline = Color::Rgb(1, 2, 3);
+        style.fg = Color::Indexed(9);
+        assert_eq!(sgr_params(style), ["4:3", "91", "58;2;1;2;3"]);
+        assert_eq!(
+            style_description(style),
+            "fg=idx(9) bg=default ul=rgb(1,2,3) attrs=curly-underline"
         );
-        assert_eq!(sgr_params(style), ["21"]);
+    }
+
+    /// An ANSI dump fed into a fresh terminal reproduces every cell,
+    /// underline shape and colour included.
+    #[test]
+    fn ansi_dump_round_trips_through_the_terminal() {
+        let input = "\x1b[4:3;58;5;1mcurly\x1b[0m \x1b[4:4;58:2::1:2:3mdot\x1b[0m \
+                     \x1b[1;2;3;21;5;7;8;9;38;5;200;48;2;9;8;7;58;5;12mall\x1b[0m \
+                     \x1b[4:5;31;104mdash\x1b[0m \x1b[4;58;2;0;0;0mx";
+        let mut original = tessera_term::Terminal::new(2, 40);
+        original.advance(input.as_bytes());
+        let dump = ansi(original.grid());
+        assert!(dump.contains("\x1b[0;4:3;58;5;1mcurly"), "{dump:?}");
+        assert!(dump.contains("\x1b[0;4:4;58;2;1;2;3mdot"), "{dump:?}");
+        let mut copy = tessera_term::Terminal::new(2, 40);
+        // Rows end in a newline; the copy needs a carriage return too, and
+        // the last row's newline would scroll the screen.
+        let replay = dump
+            .strip_suffix('\n')
+            .unwrap_or(&dump)
+            .replace('\n', "\r\n");
+        copy.advance(replay.as_bytes());
+        for row in 0..2 {
+            let want = &original.grid().line(row).expect("row").cells;
+            let got = &copy.grid().line(row).expect("row").cells;
+            assert_eq!(got, want, "row {row}\n{dump:?}");
+        }
+        let first = original.grid().line(0).expect("row 0").cells[0];
+        assert_eq!(first.style.underline_style(), UnderlineStyle::Curly);
     }
 
     #[test]
@@ -458,11 +529,11 @@ mod tests {
         let style = styled(Color::Indexed(200), Color::Rgb(9, 8, 7), Style::ITALIC);
         assert_eq!(
             style_description(style),
-            "fg=idx(200) bg=rgb(9,8,7) attrs=italic"
+            "fg=idx(200) bg=rgb(9,8,7) ul=default attrs=italic"
         );
         assert_eq!(
             style_description(Style::DEFAULT),
-            "fg=default bg=default attrs=-"
+            "fg=default bg=default ul=default attrs=-"
         );
         assert_eq!(flag_names(&Cell::BLANK), "-");
     }

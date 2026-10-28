@@ -45,7 +45,7 @@ struct RunArgs {
     /// Terminal width in columns.
     ///
     /// Memory grows with it: the default 10 000 lines of scrollback are kept
-    /// at full width (about 1 MiB per line at 65535 columns) even without
+    /// at full width (about 1.25 MiB per line at 65535 columns) even without
     /// `--scrollback`, and `--format cells` builds its whole output in
     /// memory. An inherited `COLUMNS` overrides this for programs that read
     /// it.
