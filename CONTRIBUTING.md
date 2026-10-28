@@ -26,6 +26,61 @@
 - Prefer snapshot tests (`insta`) for emulator behaviour and property tests
   for parsers.
 
+## Debugging: screen dumps
+
+`tessera-devtool` runs a command in a headless terminal and prints what the
+emulator drew, without the app:
+
+```sh
+cargo run -p tessera-devtool -- run 'ls --color' --cols 80 --rows 24
+cargo run -p tessera-devtool -- run 'printf "a\tb\n"' --cols 20 --rows 3 --format text
+```
+
+The command string runs as `/bin/sh -c -- <command>` in a real PTY (so quote
+it as one argument; a leading `-` is part of the command), with the environment every Tessera session gets
+(`TERM=xterm-256color`, `COLORTERM=truecolor`, …) and the current directory.
+Nothing is written to its input. Output feeds `tessera_term::Terminal`; when
+the command exits, the final grid is printed in one of three formats:
+
+- `--format ansi` (default): the screen re-encoded as SGR colours and
+  attributes, for viewing in a real terminal. Each row ends with a reset.
+- `--format text`: plain text, one line per row, trailing blanks trimmed, a
+  `\` after a row that soft-wraps. These are the rules of the emulator's
+  snapshot helper (`render_screen`, which always marks the cursor; add
+  `--cursor` to match it), so a dump can be pasted into a test.
+- `--format cells`: one line per cell, `row:col "text" markers style`, to see
+  wide-character spacers, grapheme clusters and exact colours.
+
+`--scrollback` prints the history above the screen (as negative rows in
+`cells`); `--cursor` marks the cursor (a `|` after its cell in `text`,
+`<cursor` in `cells`).
+
+The tool waits about `--timeout` seconds (default 10, fractions allowed),
+even while the command floods the terminal; the timeout also covers the
+emulator processing the output, so a command that exits while the tool is
+still behind on its output counts as timed out. When the timeout expires the
+tool sends `SIGHUP` to the command's shell, gives it 200 ms to exit, then
+sends `SIGKILL`, keeps reading for up to one more second, prints the grid and
+exits with `124`. Deadlines are checked between slices of about 512 bytes of
+output, so at extreme sizes (a 2000-column `a ESC[65535b`, DECALN on a
+2000x2000 screen) a single slice can take seconds and stretch the bound. Only
+the shell is signalled: `tessera-pty` has no process-group signal, so
+processes the command started are left to the hangup the kernel sends when
+the shell (the session leader) dies. Otherwise the tool exits with the
+command's status (`128 + signal` if a signal ended it); a closed stdout
+(`| head`) does not change that. `125` means the tool itself failed.
+
+Memory grows with `--cols`: the default 10 000 lines of scrollback are kept
+at full width even without `--scrollback` (about 1 MiB per line at 65535
+columns), and `--format cells` builds its whole output in memory. Inherited
+`COLUMNS` and `LINES` are passed to the command unchanged, and programs that
+read them believe them over `--cols`/`--rows`; unset them for such programs.
+
+The formatters are a library too (`tessera_devtool::dump::{ansi, text,
+cells}`), so tests can dump a `Grid` they built by hand. The crate is
+dev-only: `publish = false`, and a test checks that `tessera-ffi` and
+`tessera-app-core` never link it.
+
 ## Swift
 
 - Swift 6 language mode, strict concurrency.
