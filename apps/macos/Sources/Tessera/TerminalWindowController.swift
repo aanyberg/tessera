@@ -3,9 +3,8 @@ import TesseraKit
 import os
 
 /// A tab's content view: the window controller installs it as the window's
-/// content view and reports its session's events to it. Today
-/// ``TerminalPlaceholderView``; #27 adds the terminal surface as another
-/// conforming view.
+/// content view and reports its session's events to it
+/// (``TerminalSurfaceView``).
 @MainActor
 protocol TerminalContentView: NSView {
     /// The session wrote output and the terminal has applied it.
@@ -46,14 +45,15 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
 
     /// - Parameters:
     ///   - title: The initial window title, until the session sets one.
-    ///   - contentView: The tab's content; a placeholder by default.
+    ///   - contentView: The tab's content; the session's terminal surface by
+    ///     default.
     init(
         session: TesseraSession,
         title: String,
-        contentView: any TerminalContentView = TerminalPlaceholderView(
-            frame: NSRect(x: 0, y: 0, width: 480, height: 200))
+        contentView: (any TerminalContentView)? = nil
     ) {
         self.session = session
+        let contentView = contentView ?? TerminalSurfaceView(session: session)
         self.contentView = contentView
         let window = TerminalWindow(
             contentRect: NSRect(x: 0, y: 0, width: 480, height: 200),

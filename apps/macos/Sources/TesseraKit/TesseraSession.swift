@@ -15,7 +15,7 @@ public final class TesseraSession: Sendable, Identifiable {
     /// The core's id for this session: unique within its application, never 0.
     public let id: UInt64
 
-    private let core: CoreHandle
+    let core: CoreHandle
     // Strong while the session is registered; the bridge drops its sessions
     // on close and shutdown, which breaks the cycle.
     private let bridge: CallbackBridge
