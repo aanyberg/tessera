@@ -1,0 +1,16 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: Cursor line is cut through the wide char (base blanked); the full line below is cleared including its wide pair.
+---
+cells:
+>a . . . . .
+>. . . . . .
+>. . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a
+>
+>

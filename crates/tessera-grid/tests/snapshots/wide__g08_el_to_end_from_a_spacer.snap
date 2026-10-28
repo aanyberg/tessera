@@ -1,0 +1,14 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: "Left boundary lands between the halves: the base at column 1 is blanked; the line from column 1 on is blank."
+---
+cells:
+>a . . . . .
+>. . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a
+>

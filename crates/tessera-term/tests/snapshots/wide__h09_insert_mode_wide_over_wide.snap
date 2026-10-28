@@ -1,0 +1,23 @@
+---
+source: crates/tessera-term/tests/wide.rs
+input_file: crates/tessera-term/tests/scripts/wide/h09_insert_mode_wide_over_wide.txt
+---
+国中|文
+
+--
+cursor: (0,2)
+pending_wrap: false
+auto_wrap: true insert_mode: true
+requests: []
+scrollback: 0
+--
+cells:
+>国/W ~ 中/W ~ 文/W ~ . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>国中文
+>

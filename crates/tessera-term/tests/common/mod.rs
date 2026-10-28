@@ -5,7 +5,12 @@
 //! ([`render_screen`]) has one line per grid row, top to bottom, each ending
 //! in `\n`:
 //!
-//! 1. the cell characters, one per column (a blank cell is a space);
+//! 1. the cell characters, one per column (a blank cell is a space). The
+//!    right half of a wide character (a [`CellFlags::SPACER`]) renders as
+//!    nothing, so `中文` shows as two glyphs covering four columns in a
+//!    monospace viewer, and a [`CellFlags::CLUSTER`] cell renders its whole
+//!    cluster text ([`Line::cluster`]). Cell counts are therefore not
+//!    visible here; `tessera-grid`'s cell-level render shows them;
 //! 2. on the cursor's row, `|` immediately after the cursor's cell;
 //! 3. trailing spaces stripped (after step 2, so `|` anchors the line);
 //! 4. `\` appended when the line is soft-wrapped ([`Line::wrapped`]).
@@ -33,6 +38,9 @@
 //! [`render_state`] reports, or assert on the grid directly.
 //!
 //! [`Line::wrapped`]: tessera_grid::Line::wrapped
+//! [`Line::cluster`]: tessera_grid::Line::cluster
+//! [`CellFlags::SPACER`]: tessera_grid::CellFlags::SPACER
+//! [`CellFlags::CLUSTER`]: tessera_grid::CellFlags::CLUSTER
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -244,12 +252,23 @@ pub fn render_screen(term: &Terminal) -> String {
     let cursor = grid.cursor();
     let mut out = String::new();
     for (row, line) in (0..grid.rows()).zip(grid.visible_lines()) {
-        let mut text: Vec<char> = line.cells.iter().map(|cell| cell.ch).collect();
+        // One piece of text per cell, so the cursor marker lands after the
+        // cursor's cell even when cells render as zero or several chars.
+        let mut text: Vec<String> = line
+            .cells
+            .iter()
+            .enumerate()
+            .map(|(col, cell)| match line.cluster(col) {
+                _ if cell.is_spacer() => String::new(),
+                Some(cluster) if cell.is_cluster() => cluster.to_owned(),
+                _ => String::from(cell.ch),
+            })
+            .collect();
         if row == cursor.row {
-            text.insert(usize::from(cursor.col) + 1, '|');
+            text.insert(usize::from(cursor.col) + 1, String::from('|'));
         }
-        let end = text.iter().rposition(|&ch| ch != ' ').map_or(0, |i| i + 1);
-        out.extend(&text[..end]);
+        let end = text.iter().rposition(|t| t != " ").map_or(0, |i| i + 1);
+        out.extend(text.drain(..end));
         if line.wrapped {
             out.push('\\');
         }

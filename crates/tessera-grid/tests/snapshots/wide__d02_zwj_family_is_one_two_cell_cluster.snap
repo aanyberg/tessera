@@ -1,0 +1,14 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: "Five scalars in one cell pair; x lands in column 2. The intermediate '👨 ZWJ 👩' prefix is also width 2 for this sequence (A20) but not for all (A21, D21)."
+---
+cells:
+>👨+200D+1F469+200D+1F467/WC ~ x . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>👨\u{200D}👩\u{200D}👧x
+>

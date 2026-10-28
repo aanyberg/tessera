@@ -1,0 +1,14 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: "The prefix '👩 ZWJ ❤' is 3 wide per the library (A21) even though the finished sequence is 2. The grid must not refuse the attach because of that: after a ZWJ the next joined scalar attaches regardless of the transient width, and the cell width is clamped to 2. D4."
+---
+cells:
+>👩+200D+2764+FE0F+200D+1F48B+200D+1F468/WC ~ x . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>👩\u{200D}❤\u{FE0F}\u{200D}💋\u{200D}👨x
+>

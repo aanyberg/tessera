@@ -1,0 +1,5 @@
+# Fixture case C11_decawm_off_wide_filling_the_line_then_narrow_splits_it (crates/tessera-grid/tests/fixtures/wide_grapheme_spec.txt).
+# Wide pair in columns 3..4 arms pending. DECAWM off moves back to the last column (the spacer) and X overwrites it: the base in column 3 becomes a blank (pen background).
+@size 3x5
+@set auto_wrap false
+abc中X

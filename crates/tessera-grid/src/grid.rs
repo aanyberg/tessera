@@ -1,9 +1,14 @@
 //! The visible screen, its scrollback, the alternate screen and the
 //! cursor-relative primitives `tessera-term` drives it with.
 
+use std::cmp::Ordering;
 use std::mem;
 
-use crate::{Cell, Line, Point, Scrollback, Style, TabStops};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
+use crate::grapheme::MAX_CLUSTER_SCALARS;
+use crate::{Cell, CellFlags, Line, Point, Scrollback, Style, TabStops, char_width};
 
 /// Default number of scrolled-off lines a grid retains.
 pub const DEFAULT_MAX_SCROLLBACK: usize = 10_000;
@@ -52,6 +57,14 @@ pub enum EraseDisplay {
     All,
     /// Scrollback only; the visible screen is untouched.
     Scrollback,
+}
+
+/// How a scalar joins an existing cluster: the column of the cluster's
+/// base cell and the cluster's width once the scalar is added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Attach {
+    col: usize,
+    width: u16,
 }
 
 /// Cursor state captured by `save_cursor` (DECSC).
@@ -212,8 +225,9 @@ impl Grid {
 
     /// Mutable access to the visible line at `row`, if in range.
     ///
-    /// Callers must keep `cells.len() == cols()`; this is how shell
-    /// integration attaches marks.
+    /// Callers must keep `cells.len() == cols()`, and the wide-character
+    /// pairing and grapheme table consistent (see [`Line`]); this is how
+    /// shell integration attaches marks.
     pub fn line_mut(&mut self, row: u16) -> Option<&mut Line> {
         self.lines.get_mut(usize::from(row))
     }
@@ -288,22 +302,74 @@ impl Grid {
     /// wrap: the next write first moves to the start of the next line,
     /// scrolling if at the bottom of the region, and marks the finished
     /// line as soft-wrapped.
+    ///
+    /// The write is width-aware ([`char_width`]):
+    ///
+    /// - A scalar that joins the cluster of the character before the
+    ///   cursor (see [`Grid::would_attach`]) is added to that cell's
+    ///   cluster instead of taking a cell; the cell may grow from one
+    ///   column to two (a flag's second regional indicator, VS16) or
+    ///   shrink from two to one (VS15), moving the cursor with it.
+    /// - Any other zero-width scalar, and any control character, is
+    ///   dropped.
+    /// - A two-column character writes a [`CellFlags::WIDE`] cell and a
+    ///   [`CellFlags::SPACER`] and advances two columns. With one column
+    ///   left it blanks that column with the pen background and wraps
+    ///   first; on a one-column grid it is dropped.
+    ///
+    /// Overwriting either half of a wide character blanks the other half.
+    ///
+    /// [`CellFlags::WIDE`]: crate::CellFlags::WIDE
+    /// [`CellFlags::SPACER`]: crate::CellFlags::SPACER
+    #[inline]
     pub fn put_char(&mut self, ch: char) {
-        let cell = Cell::new(ch, self.pen);
-        self.put_cell(cell);
+        if is_simple(ch) && self.target_is_simple() {
+            // Plain text: neither side can join a cluster.
+            self.put_cell(Cell::new(ch, self.pen));
+            return;
+        }
+        self.put_char_slow(ch);
     }
 
-    /// Writes an arbitrary cell at the cursor and advances it like
-    /// [`Grid::put_char`].
+    /// [`Grid::put_char`] for everything but plain text.
+    fn put_char_slow(&mut self, ch: char) {
+        let Some(width) = char_width(ch) else {
+            return;
+        };
+        if let Some(plan) = self.plan_attach(ch) {
+            self.attach(ch, plan);
+            return;
+        }
+        match width {
+            0 => {}
+            1 => self.put_cell(Cell::new(ch, self.pen)),
+            _ => self.put_wide(Cell::new(ch, self.pen)),
+        }
+    }
+
+    /// Writes an arbitrary cell at the cursor as a one-column character
+    /// and advances it like [`Grid::put_char`]. Width and cluster markers
+    /// on `cell` are ignored: it never attaches to its neighbour and never
+    /// takes two columns.
     pub fn put_cell(&mut self, cell: Cell) {
         if self.pending_wrap {
-            self.pending_wrap = false;
-            self.lines[usize::from(self.cursor.row)].wrapped = true;
-            self.cursor.col = 0;
-            self.line_feed();
+            self.wrap();
         }
         let Point { row, col } = self.cursor;
-        self.lines[usize::from(row)].cells[usize::from(col)] = cell;
+        let pen = self.pen;
+        let line = &mut self.lines[usize::from(row)];
+        let cell = Cell {
+            flags: CellFlags::EMPTY,
+            ..cell
+        };
+        let slot = &mut line.cells[usize::from(col)];
+        // A flagless cell has no cluster entry to drop and no other half.
+        if slot.flags.is_empty() {
+            *slot = cell;
+        } else {
+            line.unpair(usize::from(col), pen);
+            line.set(usize::from(col), cell);
+        }
         if col + 1 < self.cols {
             self.cursor.col = col + 1;
         } else {
@@ -316,6 +382,215 @@ impl Grid {
         for ch in text.chars() {
             self.put_char(ch);
         }
+    }
+
+    /// True when [`Grid::put_char`] would add `ch` to an existing cell's
+    /// grapheme cluster rather than write a new cell. Pure; the emulator
+    /// asks before it applies insert mode, wrapping or DECAWM, none of
+    /// which apply to a scalar that joins the previous character.
+    ///
+    /// The cell `ch` would join is the one left of the cursor, or the one
+    /// under it while a wrap is pending, resolved through a spacer to the
+    /// wide character's left half; never a cell on another row. `ch`
+    /// attaches when all of these hold:
+    ///
+    /// - that cell shows something (its character is not `' '`);
+    /// - its cluster has fewer than [`MAX_CLUSTER_SCALARS`] scalars;
+    /// - the cluster plus `ch` is a single extended grapheme cluster
+    ///   (UAX #29);
+    /// - the joined cluster is at most two columns wide
+    ///   (`UnicodeWidthStr::width`), unless the cluster already contains a
+    ///   ZWJ (an emoji ZWJ sequence can be wider while it is incomplete);
+    /// - when the cluster would grow from one column to two, a column is
+    ///   free to its right on the same line.
+    #[inline]
+    pub fn would_attach(&self, ch: char) -> bool {
+        char_width(ch).is_some() && self.plan_attach(ch).is_some()
+    }
+
+    /// Where and how `ch` would join an existing cluster, if it does (see
+    /// [`Grid::would_attach`]).
+    fn plan_attach(&self, ch: char) -> Option<Attach> {
+        let Point { row, col } = self.cursor;
+        let line = &self.lines[usize::from(row)];
+        let col = usize::from(col);
+        let mut base = if self.pending_wrap {
+            col
+        } else {
+            col.checked_sub(1)?
+        };
+        if line.cells[base].is_spacer() {
+            base = base.checked_sub(1)?;
+        }
+        let cell = line.cells[base];
+        if cell.ch == ' ' || cannot_join(&cell, ch) {
+            return None;
+        }
+        if cell.is_cluster() {
+            if line
+                .cluster(base)
+                .is_some_and(|text| cluster_cannot_take(text, ch))
+            {
+                return None;
+            }
+        } else if is_simple(cell.ch) && is_combining_diacritic(ch) {
+            // `e` + U+0301: one grapheme (GB9) as wide as its base.
+            return Some(Attach {
+                col: base,
+                width: 1,
+            });
+        }
+        self.plan_attach_slow(line, base, cell, ch)
+    }
+
+    /// The part of [`Grid::plan_attach`] that segments the joined text.
+    fn plan_attach_slow(&self, line: &Line, base: usize, cell: Cell, ch: char) -> Option<Attach> {
+        let mut one = [0; 4];
+        let old = match line.cluster(base) {
+            Some(text) if cell.is_cluster() => text,
+            _ => cell.ch.encode_utf8(&mut one),
+        };
+        if old.chars().count() >= MAX_CLUSTER_SCALARS {
+            return None;
+        }
+        // At most `MAX_CLUSTER_SCALARS - 1` scalars of 4 bytes plus `ch`.
+        let mut buf = [0; 4 * MAX_CLUSTER_SCALARS];
+        let joined = {
+            let len = old.len();
+            buf[..len].copy_from_slice(old.as_bytes());
+            let tail = ch.encode_utf8(&mut buf[len..]).len();
+            std::str::from_utf8(&buf[..len + tail]).ok()?
+        };
+        if joined.graphemes(true).nth(1).is_some() {
+            return None;
+        }
+        let raw = joined.width();
+        if raw > 2 && !old.contains('\u{200D}') {
+            return None;
+        }
+        let width = if raw >= 2 { 2 } else { 1 };
+        if width > cell.width() && base + 1 >= usize::from(self.cols) {
+            return None;
+        }
+        Some(Attach { col: base, width })
+    }
+
+    /// True when the cell `ch` would join (see [`Grid::would_attach`]) is
+    /// missing, a flagless cell showing an [`is_simple`] character, or the
+    /// spacer of a wide character that is not a cluster: then a simple
+    /// character cannot attach (see [`cannot_join`]) and is written as a
+    /// plain cell.
+    #[inline]
+    fn target_is_simple(&self) -> bool {
+        let Point { row, col } = self.cursor;
+        let col = if self.pending_wrap {
+            usize::from(col)
+        } else if let Some(left) = usize::from(col).checked_sub(1) {
+            left
+        } else {
+            return true;
+        };
+        let cells = &self.lines[usize::from(row)].cells;
+        let cell = &cells[col];
+        if cell.flags.is_empty() {
+            return is_simple(cell.ch);
+        }
+        cell.is_spacer()
+            && col
+                .checked_sub(1)
+                .is_some_and(|base| cells[base].flags == CellFlags::WIDE)
+    }
+
+    /// Adds `ch` to the cluster `plan` names and resizes the cell.
+    fn attach(&mut self, ch: char, plan: Attach) {
+        let Attach { col: base, width } = plan;
+        let pen = self.pen;
+        let line = &mut self.lines[usize::from(self.cursor.row)];
+        let cell = line.cells[base];
+        let mut one = [0; 4];
+        let old = match line.cluster(base) {
+            Some(text) if cell.is_cluster() => text,
+            _ => cell.ch.encode_utf8(&mut one),
+        };
+        // Exact capacity, so turning it into a `Box<str>` does not
+        // reallocate.
+        let mut text = String::with_capacity(old.len() + ch.len_utf8());
+        text.push_str(old);
+        text.push(ch);
+        line.graphemes.set(base, text.into_boxed_str());
+        line.cells[base].flags |= CellFlags::CLUSTER;
+        match width.cmp(&cell.width()) {
+            Ordering::Greater => {
+                line.unpair(base + 1, pen);
+                line.set(base + 1, Cell::spacer(cell.style));
+                line.cells[base].flags |= CellFlags::WIDE;
+                self.advance_to(base + 2);
+            }
+            Ordering::Less => {
+                line.cells[base].flags = line.cells[base].flags.difference(CellFlags::WIDE);
+                line.blank_at(base + 1, pen);
+                self.pending_wrap = false;
+                self.cursor.col = u16::try_from(base + 1).unwrap_or(self.cols - 1);
+            }
+            Ordering::Equal => {}
+        }
+    }
+
+    /// Writes a two-column character: `cell` and a spacer after it.
+    fn put_wide(&mut self, cell: Cell) {
+        if self.cols < 2 {
+            return;
+        }
+        if self.pending_wrap {
+            self.wrap();
+        } else if self.cursor.col == self.cols - 1 {
+            // One column left: blank it so the wrapped line does not end
+            // in stale content, then continue on the next line.
+            let last = usize::from(self.cols - 1);
+            let pen = self.pen;
+            self.lines[usize::from(self.cursor.row)].fill(last..last + 1, pen);
+            self.wrap();
+        }
+        let Point { row, col } = self.cursor;
+        let col = usize::from(col);
+        let pen = self.pen;
+        let line = &mut self.lines[usize::from(row)];
+        line.unpair(col, pen);
+        line.unpair(col + 1, pen);
+        line.set(
+            col,
+            Cell {
+                flags: CellFlags::WIDE,
+                ..cell
+            },
+        );
+        line.set(col + 1, Cell::spacer(cell.style));
+        self.advance_to(col + 2);
+    }
+
+    /// Moves the cursor to column `col` after a write, or arms pending
+    /// wrap on the last column when the write reached the end of the line.
+    fn advance_to(&mut self, col: usize) {
+        match u16::try_from(col) {
+            Ok(col) if col < self.cols => {
+                self.cursor.col = col;
+                self.pending_wrap = false;
+            }
+            _ => {
+                self.cursor.col = self.cols - 1;
+                self.pending_wrap = true;
+            }
+        }
+    }
+
+    /// Resolves a pending wrap: marks the cursor's line soft-wrapped and
+    /// moves to the start of the next line, scrolling at the bottom of the
+    /// scroll region.
+    fn wrap(&mut self) {
+        self.pending_wrap = false;
+        self.lines[usize::from(self.cursor.row)].wrapped = true;
+        self.cursor.col = 0;
+        self.line_feed();
     }
 
     // -------------------------------------------------------- cursor motion
@@ -584,7 +859,8 @@ impl Grid {
         let top = usize::from(top);
         let keep_history = self.region_is_full_screen() && !self.is_alt_screen();
         for i in top..top + n {
-            let departed = mem::take(&mut self.lines[i]);
+            let mut departed = mem::take(&mut self.lines[i]);
+            departed.graphemes.compact();
             let spare = if keep_history {
                 self.scrollback.push(departed)
             } else {
@@ -666,7 +942,9 @@ impl Grid {
     // ------------------------------------------------------ char editing
 
     /// Inserts `n` blank cells at the cursor, shifting the rest of the line
-    /// right; cells pushed past the last column are lost (ICH).
+    /// right; cells pushed past the last column are lost (ICH). A wide
+    /// character split by the cursor, or whose right half is pushed off the
+    /// line, is blanked whole.
     pub fn insert_chars(&mut self, n: u16) {
         self.pending_wrap = false;
         let Point { row, col } = self.cursor;
@@ -675,13 +953,12 @@ impl Grid {
         if n == 0 {
             return;
         }
-        let line = &mut self.lines[usize::from(row)];
-        line.cells[col..].rotate_right(n);
-        line.fill(col..col + n, self.pen);
+        self.lines[usize::from(row)].insert_blanks(col, n, self.pen);
     }
 
     /// Deletes `n` cells at the cursor, shifting the rest of the line left
-    /// and filling with blanks at the end (DCH).
+    /// and filling with blanks at the end (DCH). A wide character split by
+    /// either end of the deleted range is blanked whole.
     pub fn delete_chars(&mut self, n: u16) {
         self.pending_wrap = false;
         let Point { row, col } = self.cursor;
@@ -690,12 +967,11 @@ impl Grid {
         if n == 0 {
             return;
         }
-        let line = &mut self.lines[usize::from(row)];
-        line.cells[col..].rotate_left(n);
-        line.fill(cols - n..cols, self.pen);
+        self.lines[usize::from(row)].delete_cells(col, n, self.pen);
     }
 
-    /// Blanks `n` cells starting at the cursor without shifting (ECH).
+    /// Blanks `n` cells starting at the cursor without shifting (ECH). A
+    /// wide character cut by either end of the range is blanked whole.
     pub fn erase_chars(&mut self, n: u16) {
         self.pending_wrap = false;
         let Point { row, col } = self.cursor;
@@ -707,7 +983,8 @@ impl Grid {
     // --------------------------------------------------------------- erase
 
     /// Blanks part of the cursor's line (EL). Marks are kept; the wrap flag
-    /// is cleared when the end of the line is erased.
+    /// is cleared when the end of the line is erased. A wide character cut
+    /// by the cursor column is blanked whole.
     pub fn erase_in_line(&mut self, mode: EraseLine) {
         self.pending_wrap = false;
         let Point { row, col } = self.cursor;
@@ -765,12 +1042,102 @@ impl Grid {
     }
 }
 
+/// Printable characters one column wide whose grapheme cluster break
+/// property is `Other` (UAX #29) and that are not `Extended_Pictographic`
+/// apart from U+00A9 and U+00AE: ASCII, Latin-1 and Latin Extended-A/B,
+/// IPA and spacing modifiers, Greek and Cyrillic letters (not U+00AD,
+/// which is zero-width, nor the Cyrillic combining marks U+0483..U+0489),
+/// Armenian letters U+0531..U+0556 and U+0561..U+0587, Hebrew letters
+/// U+05D0..U+05EA, Arabic letters U+0621..U+064A, Georgian letters
+/// U+10A0..U+10C5, U+10D0..U+10FA and U+10FC..U+10FF, Latin Extended
+/// Additional U+1E00..U+1EFF (Vietnamese), dashes and quotes
+/// U+2010..U+2027, box drawing and block elements U+2500..U+259F, and
+/// braille U+2800..U+28FF. Two of them never form one grapheme (GB999), so
+/// writing one after another needs no segmentation; a unit test checks
+/// every pair.
+#[inline]
+fn is_simple(ch: char) -> bool {
+    matches!(
+        ch,
+        ' '..='~'
+            | '\u{A0}'..='\u{2FF}'
+            | '\u{370}'..='\u{482}'
+            | '\u{48A}'..='\u{52F}'
+            | '\u{531}'..='\u{556}'
+            | '\u{561}'..='\u{587}'
+            | '\u{5D0}'..='\u{5EA}'
+            | '\u{621}'..='\u{64A}'
+            | '\u{10A0}'..='\u{10C5}'
+            | '\u{10D0}'..='\u{10FA}'
+            | '\u{10FC}'..='\u{10FF}'
+            | '\u{1E00}'..='\u{1EFF}'
+            | '\u{2010}'..='\u{2027}'
+            | '\u{2500}'..='\u{259F}'
+            | '\u{2800}'..='\u{28FF}'
+    ) && ch != '\u{AD}'
+}
+
+/// Cheap proofs that `ch` cannot join the cluster of `base` (a cell that is
+/// not a blank or a spacer), so [`Grid::plan_attach`] can skip
+/// segmentation.
+///
+/// - Two [`is_simple`] characters never form one grapheme (a unit test
+///   checks every pair).
+/// - A simple character after a lone wide character never forms one
+///   grapheme: no two-column scalar is `Prepend`, a UAX #29 conjunct
+///   linker or a Hangul or regional-indicator base a simple character
+///   could extend, and no simple character is `Extend`, `SpacingMark` or
+///   an `InCB=Consonant` (GB999). A unit test checks every two-column
+///   scalar of planes 0 and 1 against a sample of simple characters and
+///   every simple character against a sample of two-column bases.
+/// - A two-column scalar after a lone scalar of nonzero width makes a
+///   cluster at least three columns wide (the gate refuses it), unless it
+///   is an emoji modifier (U+1F3FB..U+1F3FF), whose modifier sequence is
+///   two columns. A zero-width base, which only [`Grid::put_cell`] can
+///   write, is excluded. A unit test checks this against the full rule for
+///   every two-column scalar of planes 0 and 1 (and a sample of planes 2
+///   and 3) after a sample of 16 bases, and a property test after any
+///   base.
+#[inline]
+fn cannot_join(base: &Cell, ch: char) -> bool {
+    if base.is_cluster() {
+        return false;
+    }
+    (is_simple(ch) && (is_simple(base.ch) || base.is_wide()))
+        || (char_width(ch) == Some(2)
+            && !('\u{1F3FB}'..='\u{1F3FF}').contains(&ch)
+            && char_width(base.ch) != Some(0))
+}
+
+/// Combining Diacritical Marks (U+0300..U+036F): zero-width, grapheme
+/// cluster break `Extend`.
+#[inline]
+fn is_combining_diacritic(ch: char) -> bool {
+    ('\u{300}'..='\u{36F}').contains(&ch)
+}
+
+/// A cheap proof that `ch` cannot extend the cluster `text`: `ch` is
+/// [`is_simple`] but not `Extended_Pictographic` (U+00A9, U+00AE, which may
+/// follow a ZWJ), and the cluster ends in an [`is_simple`] character or a
+/// combining diacritic, neither of which is `Prepend`, so UAX #29 breaks
+/// before `ch` (GB999). A unit test checks it against the full rule.
+#[inline]
+fn cluster_cannot_take(text: &str, ch: char) -> bool {
+    is_simple(ch)
+        && !matches!(ch, '\u{A9}' | '\u{AE}')
+        && text
+            .chars()
+            .next_back()
+            .is_some_and(|last| is_simple(last) || is_combining_diacritic(last))
+}
+
 /// Turns a line that left the screen into a blank line of `cols` cells
 /// carrying the background of `pen`, keeping its allocations.
 fn recycle(mut line: Line, cols: u16, pen: Style) -> Line {
     line.cells.clear();
     line.cells.resize(usize::from(cols), Cell::blank_with(pen));
     line.marks.clear();
+    line.graphemes.clear();
     line.wrapped = false;
     line
 }
@@ -1239,6 +1606,206 @@ mod tests {
         assert_eq!(grid.tabs(), &TabStops::new(2));
         grid.restore_cursor();
         assert_eq!(grid.cursor(), Point::new(0, 0));
+    }
+
+    /// Every [`is_simple`] character lies below this code point; the pair
+    /// tests below enumerate it all.
+    const SIMPLE_DOMAIN: u32 = 0x3000;
+
+    /// Every [`is_simple`] character is one column wide and no two of them
+    /// form one grapheme, so the plain-text fast path of `put_char` and the
+    /// first rule of [`cannot_join`] never skip an attach.
+    #[test]
+    fn simple_characters_are_narrow_and_never_join() {
+        use unicode_segmentation::UnicodeSegmentation;
+        assert!(
+            (SIMPLE_DOMAIN..=0x10_FFFF)
+                .filter_map(char::from_u32)
+                .all(|c| !is_simple(c)),
+            "widen SIMPLE_DOMAIN to keep the pair checks exhaustive"
+        );
+        let simple: Vec<char> = (0..SIMPLE_DOMAIN)
+            .filter_map(char::from_u32)
+            .filter(|&c| is_simple(c))
+            .collect();
+        assert!(simple.len() > 1300, "{} simple characters", simple.len());
+        let mut pair = String::new();
+        for &a in &simple {
+            assert_eq!(char_width(a), Some(1), "{a:?}");
+            for &b in &simple {
+                pair.clear();
+                pair.push(a);
+                pair.push(b);
+                assert_eq!(
+                    pair.graphemes(true).nth(1),
+                    Some(&*b.to_string()),
+                    "{a:?} {b:?}"
+                );
+            }
+        }
+    }
+
+    /// Bases for the [`cannot_join`] checks: narrow and wide, emoji and
+    /// not, modifier bases, Hangul jamo, Prepend (one wide and one zero
+    /// width), a regional indicator.
+    const BASES: &[char] = &[
+        'a', 'é', '中', '👍', '👨', '☺', '⌚', '🇸', 'ᄀ', '가', 'क', '\u{600}', '\u{70F}',
+        '\u{A0}', '🏳', '1',
+    ];
+
+    /// The plan the full rule makes for `ch` after a lone `base`. A base
+    /// that is not two columns wide is written with `put_cell`, which is
+    /// how a zero-width scalar can end up in a cell.
+    fn slow_plan(base: char, ch: char) -> Option<Attach> {
+        let mut grid = Grid::new(1, 6);
+        if char_width(base) == Some(2) {
+            grid.put_char(base);
+        } else {
+            grid.put_cell(Cell::new(base, Style::DEFAULT));
+        }
+        let line = &grid.lines[0];
+        grid.plan_attach_slow(line, 0, line.cells[0], ch)
+    }
+
+    #[test]
+    fn cannot_join_never_contradicts_the_full_rule() {
+        // Every two-column scalar outside the ideograph planes, plus a
+        // sample of those.
+        let wide = (0..0x2_0000)
+            .chain((0x2_0000..0x4_0000).step_by(97))
+            .filter_map(char::from_u32)
+            .filter(|&c| char_width(c) == Some(2));
+        let mut checked = 0;
+        for ch in wide {
+            for &base in BASES {
+                let cell = Cell::new(base, Style::DEFAULT);
+                if cannot_join(&cell, ch) {
+                    checked += 1;
+                    assert_eq!(slow_plan(base, ch), None, "{base:?} + {ch:?}");
+                }
+            }
+        }
+        assert!(checked > 100_000, "{checked} rejections checked");
+        assert!(!cannot_join(&Cell::new('👍', Style::DEFAULT), '🏽'));
+    }
+
+    #[test]
+    fn diacritic_fast_accept_matches_the_full_rule() {
+        let simple = (0..SIMPLE_DOMAIN)
+            .filter_map(char::from_u32)
+            .filter(|&c| is_simple(c) && c != ' ');
+        for base in simple {
+            for mark in ('\u{300}'..='\u{36F}').filter(|&c| is_combining_diacritic(c)) {
+                assert_eq!(
+                    slow_plan(base, mark),
+                    Some(Attach { col: 0, width: 1 }),
+                    "{base:?} + {mark:?}"
+                );
+            }
+        }
+    }
+
+    /// The plan the full rule makes for `ch` after a lone wide `base`,
+    /// with the base cell as the grid wrote it (`WIDE`).
+    fn wide_plan(base: char, ch: char) -> (Cell, Option<Attach>) {
+        let mut grid = Grid::new(1, 6);
+        grid.put_char(base);
+        let line = &grid.lines[0];
+        let cell = line.cells[0];
+        (cell, grid.plan_attach_slow(line, 0, cell, ch))
+    }
+
+    #[test]
+    fn simple_after_a_wide_base_matches_the_full_rule() {
+        let simple: Vec<char> = (0..SIMPLE_DOMAIN)
+            .filter_map(char::from_u32)
+            .filter(|&c| is_simple(c))
+            .collect();
+        let wide: Vec<char> = (0..0x2_0000)
+            .chain((0x2_0000..0x4_0000).step_by(97))
+            .filter_map(char::from_u32)
+            .filter(|&c| char_width(c) == Some(2))
+            .collect();
+        let few_simple = [
+            'a', ' ', '\u{A9}', '\u{AE}', '\u{E9}', '\u{5D0}', '\u{627}', '\u{1EA1}', '\u{201C}',
+            '\u{2500}',
+        ];
+        let few_wide = [
+            '\u{4E2D}',
+            '\u{1F600}',
+            '\u{1F44D}',
+            '\u{1100}',
+            '\u{AC00}',
+            '\u{231A}',
+            '\u{1F201}',
+            '\u{FF21}',
+            '\u{1F3FD}',
+            '\u{3000}',
+            '\u{115F}',
+        ];
+        let pairs = wide
+            .iter()
+            .flat_map(|&b| few_simple.map(|c| (b, c)))
+            .chain(simple.iter().flat_map(|&c| few_wide.map(|b| (b, c))));
+        let mut checked = 0;
+        for (base, ch) in pairs {
+            let (cell, plan) = wide_plan(base, ch);
+            assert!(cell.is_wide(), "{base:?} is written wide");
+            assert!(cannot_join(&cell, ch), "{base:?} + {ch:?} takes the rule");
+            assert_eq!(plan, None, "{base:?} + {ch:?}");
+            checked += 1;
+        }
+        assert!(checked > 500_000, "{checked} pairs checked");
+    }
+
+    #[test]
+    fn cluster_cannot_take_matches_the_full_rule() {
+        use unicode_segmentation::UnicodeSegmentation;
+        let candidates = || {
+            (0..SIMPLE_DOMAIN)
+                .filter_map(char::from_u32)
+                .filter(|&c| is_simple(c) || is_combining_diacritic(c))
+        };
+        // The rule only looks at the classes of the cluster's last scalar
+        // and of `ch`: try every tail against a few followers and every
+        // follower against a few tails, after clusters of several shapes.
+        let few = [
+            'a', ' ', '\u{E9}', '\u{A9}', '\u{301}', '\u{36F}', '\u{3B1}', '\u{44F}',
+        ];
+        let pairs = candidates()
+            .flat_map(|tail| few.map(|ch| (tail, ch)))
+            .chain(candidates().flat_map(|ch| few.map(|tail| (tail, ch))));
+        let mut text = String::new();
+        let mut checked = 0;
+        for (tail, ch) in pairs {
+            for head in ["a\u{301}", "\u{1F468}\u{200D}", "\u{1F1F8}", "\u{600}"] {
+                text.clear();
+                text.push_str(head);
+                text.push(tail);
+                if cluster_cannot_take(&text, ch) {
+                    checked += 1;
+                    let joined = format!("{text}{ch}");
+                    let last = joined.graphemes(true).next_back();
+                    assert_eq!(last, Some(&*ch.to_string()), "{text:?} + {ch:?}");
+                }
+            }
+        }
+        assert!(checked > 10_000, "{checked} rejections checked");
+        assert!(!cluster_cannot_take("\u{1F468}\u{200D}", '\u{A9}'));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn cannot_join_implies_the_full_rule_refuses(
+            base in proptest::prelude::any::<char>(),
+            ch in proptest::prelude::any::<char>(),
+        ) {
+            let cell = Cell::new(base, Style::DEFAULT);
+            let placeable = char_width(base).is_some() && base != ' ';
+            if placeable && cannot_join(&cell, ch) {
+                proptest::prop_assert_eq!(slow_plan(base, ch), None);
+            }
+        }
     }
 
     #[test]

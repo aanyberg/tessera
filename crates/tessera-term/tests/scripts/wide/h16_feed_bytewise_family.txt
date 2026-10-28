@@ -1,0 +1,4 @@
+# Fixture case H16_feed_bytewise_family (crates/tessera-grid/tests/fixtures/wide_grapheme_spec.txt).
+# One advance() call per byte must give the same state as D02: attachment is decided scalar by scalar on grid state, never on buffered input.
+@size 2x8
+👨\u{200D}👩\u{200D}👧x

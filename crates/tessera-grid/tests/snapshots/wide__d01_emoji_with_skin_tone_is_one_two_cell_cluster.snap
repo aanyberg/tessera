@@ -1,0 +1,14 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: "Base 👍 is WIDE|CLUSTER with text '👍🏽'; spacer in column 1; cursor 2. The modifier (width 2 on its own) must not get a cell: the plain wide path would otherwise write a second wide char."
+---
+cells:
+>👍+1F3FD/WC ~ . . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>👍🏽
+>

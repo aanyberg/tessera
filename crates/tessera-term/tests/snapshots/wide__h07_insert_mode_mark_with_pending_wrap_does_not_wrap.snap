@@ -1,0 +1,26 @@
+---
+source: crates/tessera-term/tests/wide.rs
+input_file: crates/tessera-term/tests/scripts/wide/h07_insert_mode_mark_with_pending_wrap_does_not_wrap.txt
+---
+abcdé|
+
+
+--
+cursor: (0,4)
+pending_wrap: true
+auto_wrap: true insert_mode: true
+requests: []
+scrollback: 0
+--
+cells:
+>a b c d e+0301/C
+>. . . . .
+>. . . . .
+cursor: (0,4)
+pending_wrap: true
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>abcde\u{301}
+>
+>

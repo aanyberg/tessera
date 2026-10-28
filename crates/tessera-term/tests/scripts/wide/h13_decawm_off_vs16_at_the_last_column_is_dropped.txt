@@ -1,0 +1,5 @@
+# Fixture case H13_decawm_off_vs16_at_the_last_column_is_dropped (crates/tessera-grid/tests/fixtures/wide_grapheme_spec.txt).
+# Same as D13 with DECAWM off: ☺ in the last column cannot widen; the selector is dropped; pending armed.
+@size 3x5
+@set auto_wrap false
+abcd☺\u{FE0F}

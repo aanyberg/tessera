@@ -1,0 +1,12 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: "The base in column 1 is left without its right half: blank. Everything after the deleted cell shifts left."
+---
+cells:
+>a . b 中/W ~ c . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a b中c

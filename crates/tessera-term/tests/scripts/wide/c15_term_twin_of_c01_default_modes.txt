@@ -1,0 +1,4 @@
+# Fixture case C15_term_twin_of_c01_default_modes (crates/tessera-grid/tests/fixtures/wide_grapheme_spec.txt).
+# Must equal C01 cell for cell: print() adds nothing for a wide char in default modes.
+@size 3x5
+abcd中

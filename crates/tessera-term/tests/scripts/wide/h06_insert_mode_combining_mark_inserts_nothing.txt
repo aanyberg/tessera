@@ -1,0 +1,6 @@
+# Fixture case H06_insert_mode_combining_mark_inserts_nothing (crates/tessera-grid/tests/fixtures/wide_grapheme_spec.txt).
+# e inserts one cell; the mark (width 0) must insert nothing: e+0301 x y z.
+@size 2x8
+xyz\r
+@set insert_mode true
+e\u{301}

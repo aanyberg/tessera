@@ -1,0 +1,14 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: "⌚ (wide) + VS15 => the cluster shrinks to 1 cell: base keeps CLUSTER but loses WIDE, the old spacer becomes a plain blank (pen bg), cursor moves back to column 1, x overwrites column 1."
+---
+cells:
+>⌚+FE0E/C x . . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>⌚\u{FE0E}x
+>

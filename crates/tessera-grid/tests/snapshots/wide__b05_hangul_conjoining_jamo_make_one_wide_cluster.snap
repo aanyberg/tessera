@@ -1,0 +1,14 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: "The leading jamo is the wide base; the vowel and trailing jamo attach as zero-width scalars: CLUSTER text is three scalars, the cluster stays 2 cells, x follows in column 2."
+---
+cells:
+>ᄒ+1161+11AB/WC ~ x . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>ᄒ\u{1161}\u{11AB}x
+>

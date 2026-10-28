@@ -1,0 +1,23 @@
+---
+source: crates/tessera-term/tests/wide.rs
+input_file: crates/tessera-term/tests/scripts/wide/h05_insert_mode_modifier_does_not_open_a_gap.txt
+---
+👍🏽x|yz
+
+--
+cursor: (0,2)
+pending_wrap: false
+auto_wrap: true insert_mode: true
+requests: []
+scrollback: 0
+--
+cells:
+>👍+1F3FD/WC ~ x y z . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>👍🏽xyz
+>

@@ -1,0 +1,5 @@
+# Fixture case C13_one_column_grid_drops_wide_chars_term_with_insert_mode (crates/tessera-grid/tests/fixtures/wide_grapheme_spec.txt).
+# Trap for the term pre-wrap logic: in insert mode with DECAWM on the term must NOT wrap_line() or insert_chars(2) for a character the grid will drop. Same final state as C12.
+@size 2x1
+@set insert_mode true
+中a

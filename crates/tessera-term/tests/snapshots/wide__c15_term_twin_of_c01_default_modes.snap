@@ -1,0 +1,26 @@
+---
+source: crates/tessera-term/tests/wide.rs
+input_file: crates/tessera-term/tests/scripts/wide/c15_term_twin_of_c01_default_modes.txt
+---
+abcd\
+中 |
+
+--
+cursor: (1,2)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0
+--
+cells:
+>a b c d .
+>中/W ~ . . .
+>. . . . .
+cursor: (1,2)
+pending_wrap: false
+wrapped_rows(0-based): [0]
+scrollback: len=0
+text:
+>abcd
+>中
+>

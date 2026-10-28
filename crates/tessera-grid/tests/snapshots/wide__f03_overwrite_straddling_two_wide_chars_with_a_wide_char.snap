@@ -1,0 +1,14 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: New wide pair in columns 1..2. Column 0 (base whose spacer was overwritten) and column 3 (spacer whose base was overwritten) both become blanks.
+---
+cells:
+>. 国/W ~ . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+> 国
+>

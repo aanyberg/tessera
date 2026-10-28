@@ -1,0 +1,20 @@
+---
+source: crates/tessera-term/tests/wide.rs
+input_file: crates/tessera-term/tests/scripts/wide/h18_decawm_off_three_column_scalar_at_the_last_column_is_dropped.txt
+---
+abc |
+--
+cursor: (0,3)
+pending_wrap: false
+auto_wrap: false insert_mode: false
+requests: []
+scrollback: 0
+--
+cells:
+>a b c .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>abc

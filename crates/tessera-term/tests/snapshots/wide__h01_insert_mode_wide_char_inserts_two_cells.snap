@@ -1,0 +1,23 @@
+---
+source: crates/tessera-term/tests/wide.rs
+input_file: crates/tessera-term/tests/scripts/wide/h01_insert_mode_wide_char_inserts_two_cells.txt
+---
+中a|bc
+
+--
+cursor: (0,2)
+pending_wrap: false
+auto_wrap: true insert_mode: true
+requests: []
+scrollback: 0
+--
+cells:
+>中/W ~ a b c . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>中abc
+>

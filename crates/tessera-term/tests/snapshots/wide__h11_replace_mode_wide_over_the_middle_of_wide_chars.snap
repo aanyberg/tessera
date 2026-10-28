@@ -1,0 +1,23 @@
+---
+source: crates/tessera-term/tests/wide.rs
+input_file: crates/tessera-term/tests/scripts/wide/h11_replace_mode_wide_over_the_middle_of_wide_chars.txt
+---
+x |文
+
+--
+cursor: (0,1)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0
+--
+cells:
+>x . 文/W ~ . . . .
+>. . . . . . . .
+cursor: (0,1)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>x 文
+>

@@ -1,0 +1,6 @@
+# Fixture case H03_insert_mode_pending_wrap_wraps_first (crates/tessera-grid/tests/fixtures/wide_grapheme_spec.txt).
+# Pending + IRM + wide: wrap first (row 0 wrapped), insert 2 on the new line, write: row 1 = 中 ~.
+@size 3x5
+abcde
+@set insert_mode true
+中

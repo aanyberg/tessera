@@ -1,0 +1,14 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: "Cell 0 = e with CLUSTER; text 'e'+0301; column 1 untouched; cursor 1 after the mark, x in column 1."
+---
+cells:
+>e+0301/C x . . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>e\u{301}x
+>

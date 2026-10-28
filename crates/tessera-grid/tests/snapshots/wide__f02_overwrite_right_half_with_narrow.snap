@@ -1,0 +1,14 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: Cursor parked on the SPACER (goto is allowed to land there). Its base (column 0) becomes a blank; x in column 1.
+---
+cells:
+>. x 文/W ~ . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+> x文
+>

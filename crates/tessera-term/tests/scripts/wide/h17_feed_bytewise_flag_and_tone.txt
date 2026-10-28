@@ -1,0 +1,4 @@
+# Fixture case H17_feed_bytewise_flag_and_tone (crates/tessera-grid/tests/fixtures/wide_grapheme_spec.txt).
+# Same state as D03 + D01 combined.
+@size 2x8
+🇸🇪👍🏽a

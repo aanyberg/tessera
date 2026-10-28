@@ -1,0 +1,6 @@
+# Fixture case H19_insert_mode_three_column_scalar_inserts_two_cells (crates/tessera-grid/tests/fixtures/wide_grapheme_spec.txt).
+# Added in verification of #4. Two cells are inserted and the pair is written: no third, stray cell.
+@size 1x8
+abcdef\r
+@set insert_mode true
+៘

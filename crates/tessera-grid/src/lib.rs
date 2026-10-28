@@ -23,11 +23,25 @@
 //! written at the cursor and whose background fills cells that are erased or
 //! scrolled into view. `tessera-term` updates it from SGR sequences.
 //!
+//! # Wide characters and grapheme clusters
+//!
+//! [`Grid::put_char`] places characters by their `unicode-width` 0.2 width
+//! ([`char_width`]). A two-column character (CJK, most emoji) occupies a
+//! [`CellFlags::WIDE`] cell plus the [`CellFlags::SPACER`] after it. A
+//! scalar that extends the grapheme cluster (UAX #29, via
+//! `unicode-segmentation`) of the character before the cursor (a
+//! combining mark, ZWJ, variation selector, skin-tone modifier, a flag's
+//! second regional indicator) joins that cell instead of taking one: the
+//! cell gets [`CellFlags::CLUSTER`] and the line's [`GraphemeTable`]
+//! holds the whole cluster text, so [`Cell`] stays 16 bytes. The width of
+//! a cluster is the width of its whole text, so a cluster can grow from
+//! one column to two or shrink back. Every primitive keeps wide pairs and
+//! the table consistent: overwriting, erasing, inserting or deleting
+//! through half of a wide character blanks the other half. ADR 0008
+//! records the rules and why.
+//!
 //! Assumptions this crate documents rather than enforces:
 //!
-//! - Every [`Cell`] is one column wide. Wide-character spacers, combining
-//!   marks and grapheme clusters are the emulator's concern and will extend
-//!   [`Cell`] in a later milestone.
 //! - Origin mode (DECOM) is a terminal mode. The grid exposes
 //!   [`Grid::scroll_region`] so the emulator can translate coordinates before
 //!   calling [`Grid::goto`].
@@ -37,12 +51,14 @@
 #![forbid(unsafe_code)]
 
 mod cell;
+mod grapheme;
 mod grid;
 mod line;
 mod scrollback;
 mod tabs;
 
-pub use cell::{Cell, Color, Point, Style};
+pub use cell::{Cell, CellFlags, Color, Point, Style};
+pub use grapheme::{GraphemeTable, MAX_CLUSTER_SCALARS, char_width};
 pub use grid::{DEFAULT_MAX_SCROLLBACK, EraseDisplay, EraseLine, Grid, ScrollRegion};
 pub use line::{Line, Mark};
 pub use scrollback::Scrollback;

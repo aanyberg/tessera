@@ -1,0 +1,6 @@
+# Fixture case H01_insert_mode_wide_char_inserts_two_cells (crates/tessera-grid/tests/fixtures/wide_grapheme_spec.txt).
+# Two cells inserted, then the pair written: 中 ~ a b c.
+@size 2x8
+abc\r
+@set insert_mode true
+中

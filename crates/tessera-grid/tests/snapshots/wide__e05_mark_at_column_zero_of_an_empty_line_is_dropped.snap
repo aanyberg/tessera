@@ -1,0 +1,14 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: "Nothing at all happens: no cell written, cursor (0,0)."
+---
+cells:
+>. . . . . . . .
+>. . . . . . . .
+cursor: (0,0)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>
+>

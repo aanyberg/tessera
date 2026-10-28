@@ -10,6 +10,7 @@
 //! grid.
 
 use tessera_grid::{Cell, Style};
+use unicode_width::UnicodeWidthChar;
 
 use crate::atlas::GlyphKey;
 use crate::boxdraw;
@@ -247,9 +248,13 @@ impl Shaper {
     /// drawing neighbour (see [`ShapedGlyph::cell_span`]).
     ///
     /// A wide character (CJK, emoji) is centred across its own cell and
-    /// the next one, which is assumed to be an empty spacer. The grid does
-    /// not insert spacer cells yet, so two adjacent wide characters
-    /// currently overlap (see ADR 0007).
+    /// the spacer cell after it; the spacer itself is skipped and owned by
+    /// no glyph, so the wide glyph's `cell_span` stays 1. A cell is wide
+    /// when the grid marks it [`Cell::is_wide`], or when it is not a
+    /// cluster and its character is two columns wide on its own (cells
+    /// built without the grid's markers). Only a cell's base character is shaped: the
+    /// rest of a grapheme cluster ([`tessera_grid::Line::cluster`]) is not
+    /// drawn yet (ADR 0008).
     pub fn shape_line(&mut self, cells: &[Cell]) -> Vec<ShapedGlyph> {
         let mut inner = self.fonts.lock();
         let ctx = RunContext {
@@ -267,7 +272,7 @@ impl Shaper {
         let mut i = 0;
         while i < cells.len() {
             let cell = &cells[i];
-            if is_blank(cell.ch) {
+            if cell.is_spacer() || is_blank(cell.ch) {
                 i += 1;
                 continue;
             }
@@ -290,16 +295,20 @@ impl Shaper {
                 continue;
             }
             let style = cell_style(cell);
+            // Only the base scalar of a grapheme cluster is shaped; shaping
+            // `Line::cluster` text is deferred to the render work in #21
+            // (ADR 0008).
             let resolved = inner.resolve(cell.ch, style);
-            let wide = is_wide(cell.ch);
+            let wide = cell_is_wide(cell);
             let isolated = wide || inner.is_color(resolved.face);
             let start = i;
             i += 1;
             while !isolated && i < cells.len() {
                 let next = &cells[i];
-                if is_blank(next.ch)
+                if next.is_spacer()
+                    || is_blank(next.ch)
                     || boxdraw::is_builtin(next.ch)
-                    || is_wide(next.ch)
+                    || cell_is_wide(next)
                     || cell_style(next) != style
                     || inner.resolve(next.ch, style) != resolved
                 {
@@ -739,76 +748,6 @@ fn quantize_third(x: f32) -> f32 {
     (x * 3.0).round() / 3.0
 }
 
-/// East Asian Wide and Fullwidth ranges, plus emoji with default emoji
-/// presentation: characters drawn two columns wide.
-///
-/// Condensed from Unicode 15 `EastAsianWidth.txt`; good enough to keep
-/// such characters out of narrow runs until the grid models wide cells.
-const WIDE: &[(u32, u32)] = &[
-    (0x1100, 0x115F),
-    (0x231A, 0x231B),
-    (0x2329, 0x232A),
-    (0x23E9, 0x23EC),
-    (0x23F0, 0x23F0),
-    (0x23F3, 0x23F3),
-    (0x25FD, 0x25FE),
-    (0x2614, 0x2615),
-    (0x2648, 0x2653),
-    (0x267F, 0x267F),
-    (0x2693, 0x2693),
-    (0x26A1, 0x26A1),
-    (0x26AA, 0x26AB),
-    (0x26BD, 0x26BE),
-    (0x26C4, 0x26C5),
-    (0x26CE, 0x26CE),
-    (0x26D4, 0x26D4),
-    (0x26EA, 0x26EA),
-    (0x26F2, 0x26F3),
-    (0x26F5, 0x26F5),
-    (0x26FA, 0x26FA),
-    (0x26FD, 0x26FD),
-    (0x2705, 0x2705),
-    (0x270A, 0x270B),
-    (0x2728, 0x2728),
-    (0x274C, 0x274C),
-    (0x274E, 0x274E),
-    (0x2753, 0x2755),
-    (0x2757, 0x2757),
-    (0x2795, 0x2797),
-    (0x27B0, 0x27B0),
-    (0x27BF, 0x27BF),
-    (0x2B1B, 0x2B1C),
-    (0x2B50, 0x2B50),
-    (0x2B55, 0x2B55),
-    (0x2E80, 0x303E),
-    (0x3041, 0x33FF),
-    (0x3400, 0x4DBF),
-    (0x4E00, 0x9FFF),
-    (0xA000, 0xA4CF),
-    (0xA960, 0xA97F),
-    (0xAC00, 0xD7A3),
-    (0xF900, 0xFAFF),
-    (0xFE10, 0xFE19),
-    (0xFE30, 0xFE6F),
-    (0xFF00, 0xFF60),
-    (0xFFE0, 0xFFE6),
-    (0x1_6FE0, 0x1_6FE4),
-    (0x1_7000, 0x1_8AFF),
-    (0x1_B000, 0x1_B2FF),
-    (0x1_F004, 0x1_F004),
-    (0x1_F0CF, 0x1_F0CF),
-    (0x1_F18E, 0x1_F18E),
-    (0x1_F191, 0x1_F19A),
-    (0x1_F200, 0x1_F251),
-    (0x1_F300, 0x1_F64F),
-    (0x1_F680, 0x1_F6FF),
-    (0x1_F7E0, 0x1_F7EB),
-    (0x1_F90C, 0x1_F9FF),
-    (0x1_FA70, 0x1_FAFF),
-    (0x2_0000, 0x2_FFFD),
-    (0x3_0000, 0x3_FFFD),
-];
-
 /// Characters the shaper hides (harfrust's default-ignorable set): the
 /// Unicode `Default_Ignorable_Code_Point` ranges except U+115F, U+1160,
 /// U+180F, U+3164, U+FFA0 and U+1BCA0..1BCA3, which harfrust 0.5 shapes
@@ -841,9 +780,16 @@ fn in_table(table: &[(u32, u32)], ch: char) -> bool {
     table.get(i).is_some_and(|&(lo, _)| lo <= c)
 }
 
-/// `true` for characters that occupy two terminal columns.
+/// Whether `cell` is drawn across two columns. The grid's marker decides
+/// for a cluster: `⌚` + VS15 is one column although `⌚` alone is two.
+fn cell_is_wide(cell: &Cell) -> bool {
+    cell.is_wide() || (!cell.is_cluster() && is_wide(cell.ch))
+}
+
+/// `true` for characters that occupy two terminal columns on their own,
+/// per `unicode-width` (the same answer `tessera-grid` places them by).
 pub(crate) fn is_wide(ch: char) -> bool {
-    in_table(WIDE, ch)
+    ch.width() == Some(2)
 }
 
 #[expect(
@@ -925,28 +871,78 @@ mod tests {
     }
 
     #[test]
-    fn wide_table_is_sorted_and_disjoint() {
-        for &(lo, hi) in WIDE {
-            assert!(lo <= hi, "{lo:X}..{hi:X}");
+    fn wide_lookup_follows_unicode_width() {
+        for ch in "中\u{1F600}あ한\u{FF21}\u{2B50}\u{1F3FD}".chars() {
+            assert!(is_wide(ch), "{ch:?}");
         }
-        for pair in WIDE.windows(2) {
-            assert!(
-                pair[0].1 < pair[1].0,
-                "{:X?} overlaps {:X?}",
-                pair[0],
-                pair[1]
-            );
+        // East Asian Width N or A: one column, although the old condensed
+        // table called some of them wide (#19).
+        for ch in "a─é\u{1F0CE}\u{FFFF}\u{1F321}\u{3248}\u{263A}\u{1F1F8}".chars() {
+            assert!(!is_wide(ch), "{ch:?}");
         }
     }
 
     #[test]
-    fn wide_lookup_matches_known_characters() {
-        for ch in ['中', '\u{1F600}', 'あ', '한', '\u{FF21}', '\u{2B50}'] {
-            assert!(is_wide(ch), "{ch:?}");
-        }
-        for ch in ['a', '─', 'é', '\u{2500}', '\u{1F0CE}', '\u{FFFF}'] {
-            assert!(!is_wide(ch), "{ch:?}");
-        }
+    fn a_narrowed_cluster_is_not_drawn_wide() {
+        let mut grid = tessera_grid::Grid::new(1, 8);
+        // Fixture rows D16 (VS15 narrows a wide emoji) and D11 (VS16
+        // widens a narrow one), then a lone CJK cell without markers.
+        grid.put_str("\u{231A}\u{FE0E}\u{263A}\u{FE0F}");
+        let cells = &grid.line(0).expect("row 0").cells;
+        assert!(cells[0].is_cluster() && !cells[0].is_wide(), "D16 cell");
+        assert!(!cell_is_wide(&cells[0]), "VS15 cluster is one column");
+        assert!(cells[1].is_cluster() && cells[1].is_wide(), "D11 cell");
+        assert!(cell_is_wide(&cells[1]), "VS16 cluster is two columns");
+        assert!(cell_is_wide(&Cell::new('\u{4E2D}', Style::DEFAULT)));
+        assert!(!cell_is_wide(&Cell::new('a', Style::DEFAULT)));
+    }
+
+    #[test]
+    fn emoji_preference_follows_the_width() {
+        use crate::font::prefers_emoji;
+        assert!(prefers_emoji('\u{1F600}'));
+        assert!(prefers_emoji('\u{231A}'));
+        assert!(prefers_emoji('\u{1F3FD}'));
+        // Text presentation by default: one column, text fonts first.
+        assert!(!prefers_emoji('\u{263A}'));
+        assert!(!prefers_emoji('\u{1F321}'));
+        assert!(!prefers_emoji('\u{2764}'));
+    }
+
+    /// A row as the grid lays it out: wide characters followed by their
+    /// spacer cells, and a cluster cell whose base is all that is shaped.
+    #[test]
+    fn spacer_cells_are_skipped_and_the_partition_holds() {
+        let mut grid = tessera_grid::Grid::new(1, 10);
+        grid.put_str("a\u{4E2D}\u{6587}e\u{301}\u{1F600}b");
+        let cells = &grid.line(0).expect("row 0").cells;
+        assert!(cells[2].is_spacer() && cells[4].is_spacer() && cells[7].is_spacer());
+        let config = crate::FontConfig {
+            family: "Menlo".into(),
+            size_pt: 13.0,
+            scale: 2.0,
+            fallback: Vec::new(),
+        };
+        let mut shaper = Shaper::new(&config).expect("Menlo ships with macOS");
+        let glyphs = shaper.shape_line(cells);
+        let mut spans: Vec<(usize, usize)> =
+            glyphs.iter().map(|g| (g.cell_index, g.cell_span)).collect();
+        spans.dedup();
+        assert_eq!(
+            spans,
+            [(0, 1), (1, 1), (3, 1), (5, 1), (6, 1), (8, 1)],
+            "one glyph range per drawn cell, none on a spacer: {glyphs:?}"
+        );
+        let required: Vec<bool> = cells
+            .iter()
+            .map(|c| !c.is_spacer() && !is_blank(c.ch))
+            .collect();
+        assert_eq!(check_partition(&glyphs, &required), Ok(()));
+        // Wide glyphs are centred over both columns, so they start right
+        // of their cell's left edge, unlike the narrow `a`.
+        let w = f32_from(shaper.cell_metrics().width_px);
+        let han = glyphs.iter().find(|g| g.cell_index == 1).expect("中");
+        assert!(han.x_offset > -w / 2.0 && han.x_offset < w, "{han:?}");
     }
 
     #[test]

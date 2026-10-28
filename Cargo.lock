@@ -1547,7 +1547,10 @@ dependencies = [
 name = "tessera-grid"
 version = "0.1.0"
 dependencies = [
+ "insta",
  "proptest",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]
@@ -1597,6 +1600,7 @@ dependencies = [
  "tessera-grid",
  "thiserror 2.0.21",
  "tracing",
+ "unicode-width",
  "wgpu",
 ]
 

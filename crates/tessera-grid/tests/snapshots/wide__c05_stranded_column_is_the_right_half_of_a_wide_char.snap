@@ -1,0 +1,16 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: "Last column holds the SPACER of a wide char at columns 3..4. Blanking the stranded last column must also blank its base (3), or the grid is left with an unpaired WIDE."
+---
+cells:
+>a b c . .
+>中/W ~ . . .
+>. . . . .
+cursor: (1,2)
+pending_wrap: false
+wrapped_rows(0-based): [0]
+scrollback: len=0
+text:
+>abc
+>中
+>

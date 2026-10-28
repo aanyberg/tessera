@@ -1,0 +1,14 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: "🇸 sits in the last column (pending). A cluster cannot grow past the right edge, so 🇪 does NOT attach: it is an ordinary narrow char and wraps to (1,0). Row 0 is wrapped. Result: two lone RIs instead of a flag, no relocation logic, no DECAWM knowledge in the grid."
+---
+cells:
+>a b c d 🇸
+>🇪 . . . .
+cursor: (1,1)
+pending_wrap: false
+wrapped_rows(0-based): [0]
+scrollback: len=0
+text:
+>abcd🇸
+>🇪

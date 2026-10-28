@@ -1,0 +1,5 @@
+# Fixture case C10_decawm_off_wide_that_fits_is_written (crates/tessera-grid/tests/fixtures/wide_grapheme_spec.txt).
+# Wide char in columns 2..3, cursor 4, not pending.
+@size 3x5
+@set auto_wrap false
+ab中

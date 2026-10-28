@@ -1,0 +1,26 @@
+---
+source: crates/tessera-term/tests/wide.rs
+input_file: crates/tessera-term/tests/scripts/wide/c16_decawm_off_insert_mode_wide_with_one_column_left_changes_nothing.txt
+---
+abcd |
+
+
+--
+cursor: (0,4)
+pending_wrap: false
+auto_wrap: false insert_mode: true
+requests: []
+scrollback: 0
+--
+cells:
+>a b c d .
+>. . . . .
+>. . . . .
+cursor: (0,4)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>abcd
+>
+>

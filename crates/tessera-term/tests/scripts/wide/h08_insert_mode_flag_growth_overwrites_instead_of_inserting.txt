@@ -1,0 +1,6 @@
+# Fixture case H08_insert_mode_flag_growth_overwrites_instead_of_inserting (crates/tessera-grid/tests/fixtures/wide_grapheme_spec.txt).
+# First RI inserts one cell (🇸 x y z); the second attaches and grows into the cell that held 'x', which is overwritten, not shifted: 🇸🇪 ~ y z. 'x' is lost. Accepted limitation (insert on growth would need IRM knowledge inside Grid::put_char).
+@size 2x8
+xyz\r
+@set insert_mode true
+🇸🇪

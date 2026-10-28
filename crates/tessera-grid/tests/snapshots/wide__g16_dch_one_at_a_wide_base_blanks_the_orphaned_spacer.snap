@@ -1,0 +1,12 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: "Deleting only the base shifts the spacer into column 1 where it has no base: blank."
+---
+cells:
+>a . b 中/W ~ c . .
+cursor: (0,1)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a b中c

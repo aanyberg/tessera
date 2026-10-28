@@ -1,0 +1,5 @@
+# Fixture case C07_decawm_off_wide_with_one_column_left_is_dropped (crates/tessera-grid/tests/fixtures/wide_grapheme_spec.txt).
+# Recommended (xterm + Alacritty majority): the character is dropped; nothing in the row changes (the last column is NOT blanked here, there is no wrap to protect), cursor stays (0,4), pending_wrap false. D2.
+@size 3x5
+@set auto_wrap false
+abcd中

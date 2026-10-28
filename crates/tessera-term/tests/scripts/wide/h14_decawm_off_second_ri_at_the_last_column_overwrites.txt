@@ -1,0 +1,5 @@
+# Fixture case H14_decawm_off_second_ri_at_the_last_column_overwrites (crates/tessera-grid/tests/fixtures/wide_grapheme_spec.txt).
+# 🇸 in the last column; growth refused; 🇪 is an ordinary narrow char: pending cleared by the goto, written over the same column. Result abcd🇪, no cluster.
+@size 3x5
+@set auto_wrap false
+abcd🇸🇪

@@ -1,0 +1,23 @@
+---
+source: crates/tessera-term/tests/wide.rs
+input_file: crates/tessera-term/tests/scripts/wide/c13_one_column_grid_drops_wide_chars_term_with_insert_mode.txt
+---
+a|
+
+--
+cursor: (0,0)
+pending_wrap: true
+auto_wrap: true insert_mode: true
+requests: []
+scrollback: 0
+--
+cells:
+>a
+>.
+cursor: (0,0)
+pending_wrap: true
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a
+>

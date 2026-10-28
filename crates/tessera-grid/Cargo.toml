@@ -10,8 +10,11 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
 
 [dev-dependencies]
+insta.workspace = true
 proptest = "1.12"
 
 [lints]
