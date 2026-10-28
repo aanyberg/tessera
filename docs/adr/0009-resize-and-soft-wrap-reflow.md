@@ -62,15 +62,15 @@ Rows change first, at the old width, then columns (Alacritty's order).
   blank rows by default). The cursor moves down with its text. Rows that
   history cannot fill are blank default rows at the bottom.
 - Shrinking first drops blank rows below the cursor (every cell
-  `Cell::BLANK`, no marks, not wrapped), then pushes rows from the top
-  into scrollback, evicting the oldest lines past the cap. A dropped row
-  may be the empty continuation of a wrapped row, as readline leaves one
-  after erasing the end of a long command line; the row above then loses
-  its wrap flag, so the prompt the cursor is on stays visible (script
-  `x01`). A row filled with a background colour is not blank. A cursor
-  whose own row leaves the screen stays on row zero: content wins over
-  the cursor row (WezTerm, iTerm2; xterm and Alacritty keep the cursor
-  row and drop the rows below it instead, fixture D06).
+  `Cell::BLANK` or a `PAD` cell of any style, no marks, not wrapped), then
+  pushes rows from the top into scrollback, evicting the oldest lines past
+  the cap. A dropped row may be the empty continuation of a wrapped row,
+  as readline leaves one after erasing the end of a long command line; the
+  row above then loses its wrap flag, so the prompt the cursor is on stays
+  visible (script `x01`). A row filled with a background colour is not
+  blank. A cursor whose own row leaves the screen stays on row zero:
+  content wins over the cursor row (WezTerm, iTerm2; xterm and Alacritty
+  keep the cursor row and drop the rows below it instead, fixture D06).
 - The cursor column, pending wrap and every row's cells are untouched,
   and so is every wrap flag but that one.
 
@@ -92,25 +92,42 @@ joined.
   version guessed instead (drop a blank before a wide character, as
   iTerm2 does without its marker); every width then exposed different
   genuine spaces, and a window drag erased most spaces of Korean text.
-- *Trim.* Trailing default blanks (exactly `Cell::BLANK`, or padding) of
-  the whole logical line are dropped and rows are re-padded with default
-  blanks; blanks inside it, including at the end of a non-final row, are
-  text and move with it (WezTerm, R6). A space with any colour or
-  attribute (an inverse status bar, an underlined input field, a
+- *Trim.* Trailing default blanks (exactly `Cell::BLANK`, or padding of
+  any style) of the whole logical line are dropped and rows are re-padded
+  with default blanks; blanks inside it, including at the end of a
+  non-final row, are text and move with it (WezTerm, R6). A space with any
+  colour or attribute (an inverse status bar, an underlined input field, a
   background fill) is text too, as in Alacritty, which keeps coloured
   blanks (C4); kitty and WezTerm would trim them. This deviates from the
   spec file's recommendation, which trimmed every space; fixture row C01
   now expects the background-coloured spaces to move with the text. A
   resize is not an erase: every added row and cell uses the default style,
-  not the pen (fixture L01).
+  not the pen (fixture L01), except the padding a split leaves (below).
 - *Split.* The cells are cut greedily at the new width. A wide character
   and its spacer are never separated: one that does not fit starts the
-  next row and leaves a padding cell with the default style behind (C5),
-  which the next join drops again. On a one-column grid a wide character
-  is dropped, as `put_wide` drops it and kitty skips it (R8). A cluster is
-  one cell, so its `GraphemeTable` entry moves with it and is re-keyed to
-  its new column. Every row but the last of a logical line is marked
-  wrapped.
+  next row and leaves a padding cell with the wide character's background
+  behind (C5, amended below), which the next join drops again. On a
+  one-column grid a wide character is dropped, as `put_wide` drops it and
+  kitty skips it (R8). A cluster is one cell, so its `GraphemeTable` entry
+  moves with it and is re-keyed to its new column. Every row but the last
+  of a logical line is marked wrapped.
+
+  *Amended 2026-10-28 (#88):* C5 gave that padding cell the default
+  style, so a coloured band (`ESC[44m…ESC[K`) that a wide character
+  wrapped through showed a one-cell gap after a widen and a narrow back.
+  The padding now takes the background of the wide character it
+  precedes and nothing else of its style (`Cell::pad_with`), the cell a
+  live write leaves: the padding `put_wide` writes takes the pen's
+  background, like an erase. Issue #88 proposed the whole `Style`; only
+  the background is taken, so a re-wrap never draws an underline or
+  inverse video where a live write leaves the column plain. Padding of any
+  colour is still not text: the join drops it, the trim drops it and a
+  row made of it is blank for the rows a height shrink may drop. A DCH
+  that moves re-wrapped padding off the last column leaves a coloured
+  blank without the marker, exactly as it does for the padding of a live
+  write, so a later reflow or height shrink keeps that cell as text where
+  the default-style padding before #88 became a default blank and was
+  dropped; this is the live-write behaviour, not a regression of #88.
 - *Marks* of all rows of a logical line collect on its first row, in row
   order (kitty keeps line attributes on the first row, R10).
 - *Window.* The screen is the last `rows` rows of the re-wrapped buffer,

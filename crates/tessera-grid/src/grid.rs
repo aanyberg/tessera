@@ -847,21 +847,23 @@ impl Grid {
     ///   Growing pulls the newest scrollback lines back onto the top of
     ///   the screen (blank rows at the bottom once history runs out);
     ///   shrinking first drops blank rows below the cursor (default blanks
-    ///   only, even the empty continuation of a wrapped row, whose wrap
-    ///   flag is then cleared), then pushes rows from the top into
-    ///   scrollback (oldest lines are evicted past the cap). The cursor
-    ///   moves with the text and stops at row zero.
+    ///   and [`CellFlags::PAD`] cells of any style only, even the empty
+    ///   continuation of a wrapped row, whose wrap flag is then cleared),
+    ///   then pushes rows from the top into scrollback (oldest lines are
+    ///   evicted past the cap). The cursor moves with the text and stops
+    ///   at row zero.
     /// - **Columns:** every logical line (rows joined by
     ///   [`Line::wrapped`]) is joined and split again at the new width.
-    ///   Trailing default blanks ([`Cell::BLANK`]) of a logical line are
-    ///   dropped and rows are padded with default blanks; every other
-    ///   cell, including a space with a colour or attribute and blanks
-    ///   inside a line, is text and moves with it. A wide character never
-    ///   straddles the edge: it starts the next row and leaves a
-    ///   [`CellFlags::PAD`] cell behind, which a later join drops again
-    ///   (only padding is ever dropped); on a one-column grid it is
-    ///   dropped. Cluster text and marks move with their cells and lines
-    ///   (marks of a joined line collect on its first row). The screen is
+    ///   Trailing default blanks ([`Cell::BLANK`], or padding of any
+    ///   style) of a logical line are dropped and rows are padded with
+    ///   default blanks; every other cell, including a space with a
+    ///   colour or attribute and blanks inside a line, is text and moves
+    ///   with it. A wide character never straddles the edge: it starts
+    ///   the next row and leaves a [`CellFlags::PAD`] cell with its
+    ///   background behind, which a later join drops again (only padding
+    ///   is ever dropped); on a one-column grid it is dropped. Cluster
+    ///   text and marks move with their cells and lines (marks of a
+    ///   joined line collect on its first row). The screen is
     ///   the last `rows` rows of the result, so a narrower grid pushes
     ///   lines into scrollback and a wider one pulls them back.
     /// - **Cursor:** it stays on the character it was on. On a blank after
