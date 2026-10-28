@@ -15,3 +15,5 @@ Procedure:
 3. Build with `just app` (or `xcodebuild -project apps/macos/Tessera.xcodeproj -scheme Tessera`) with Swift 6 language mode and strict concurrency; zero warnings.
 4. Where the issue's "Done when" needs a human at the keyboard (IME, gestures), add an XCTest or a scripted check for the parts that can be automated and list the manual steps precisely in your report.
 5. Merge current main into the branch, make sure `scripts/quality-gate.sh` still passes for the Rust side, commit with Conventional Commits (scope `app`) and the attribution trailer. Never push. Read the gate's real exit code: `scripts/quality-gate.sh <wt> > <log> 2>&1; echo $?`, never through a pipe.
+
+Before reporting, re-read the brief's "Lead decisions" section, apply every item and list each one in your report as done or, with the reason, not done.

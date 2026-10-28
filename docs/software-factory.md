@@ -108,12 +108,20 @@ Waves run as an agent team (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, set in `.c
 Scripted workflows are not used for waves: they cannot apply judgement when a step fails or a critic and an
 implementer disagree, and they hide progress from the user.
 
+0. **Pre-flight.** Before planning, the lead checks that
+   `gh api repos/<owner>/<repo> --jq .allow_rebase_merge` prints `true`. If it does not, stop and ask the user to
+   enable rebase merging before the wave starts, not at merge time. Commands the user types with `!` may not run
+   in the session; when a step needs the user, give them the exact command to run in a separate terminal, or run
+   the `gh api` call from the lead with their go-ahead.
 1. **Plan.** `milestone-lead` turns open issues into waves of five parallel-safe issues and labels each issue
    `wave:<n>`. Wave numbers are global and never reset across milestones: the next wave is the highest existing
    `wave:<n>` plus one, or 3 when no `wave:<n>` label exists (0.1.0 used waves 1 and 2 before labels existed). It
    returns one brief per issue (files, API names, ADR numbers, deps and do-not-touch lists pre-assigned). Decisions
    that constrain a later issue, and findings deferred to it, go in a comment on that issue. There is no task-board
-   file in the repo.
+   file in the repo. Where two issues change the same function, the planner marks one upstream and one
+   downstream (or splits them across waves); the downstream task's critique waits for the upstream merge, or is
+   limited to a `git merge-tree` check against the upstream branch until then. Hot-path issues carry a
+   performance bar with a named corpus measured against main.
 2. **Task list.** The lead session creates one shared task per issue in the wave, carrying the brief.
 3. **Implement.** One teammate per issue claims its task and implements it in its own worktree
    (`../tessera-worktrees/wave-<n>/task-<issue>`, branch `task/<issue>-<slug>`) as `rust-implementer`,
@@ -127,7 +135,8 @@ implementer disagree, and they hide progress from the user.
 5. **Verify.** After `ship`, the lead runs `quality-gate` and `adversarial-tester` in parallel as one-shot
    subagents. Any major finding fails the gate; at most 2 verify cycles. A structural rewrite during a verify
    cycle gets a fresh critic before verification resumes.
-6. **Integrate.** Verified branches go to `integrator` one at a time; it squash-merges each into local main as
+6. **Integrate.** Verified branches go to `integrator` one at a time, first verified first merged (not a fixed
+   plan order, except that a downstream task merges after its upstream); it squash-merges each into local main as
    one conventional commit with the session's attribution trailer, re-runs the gate and removes the worktree.
 7. **Ship.** When every task in the wave is integrated and the gate is green on local main, the lead pushes and
    opens one PR:
@@ -138,6 +147,14 @@ implementer disagree, and they hide progress from the user.
 8. **Close out.** After the PR merges, the lead resyncs local main (wave PR rule above), comments deferred
    findings on their owning issues, starts the next wave, and hands the wave's transcripts to `flow-analyst`,
    whose retro lands in `docs/retros/`.
+
+**Changes after `ship`.** Fixes the lead sends after a critic's `ship` or after a verify pass are classified:
+
+- Doc-only and test-only changes go to the teammate; the lead reads the diff. No fresh critic.
+- When a critic's only remaining major is a doc line or an item the brief already records as a lead decision,
+  the lead checks the fix in the diff instead of spending a critique round.
+- Any other non-test code change, and every change to a hot path or a fast path, gets a fresh critic (it may be
+  scoped to the changed region) or a re-run of the adversarial differential on that region before integration.
 
 Critics and verifiers are always one-shot subagents, never long-lived teammates, so every review starts from a
 clean context.
