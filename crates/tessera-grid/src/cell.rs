@@ -284,6 +284,15 @@ impl Style {
     /// Dashed underline (SGR `4:5`); only together with
     /// [`Style::UNDERLINE`].
     pub const DASHED_UNDERLINE: u16 = 1 << 11;
+    /// Overline (SGR 53; cleared by 55 and 0). Independent of the
+    /// underline bits.
+    pub const OVERLINE: u16 = 1 << 12;
+    /// Superscript (SGR 73; cleared by 74, 75 and 0). The SGR parser never
+    /// sets it together with [`Style::SUBSCRIPT`].
+    pub const SUPERSCRIPT: u16 = 1 << 13;
+    /// Subscript (SGR 74; cleared by 73, 75 and 0). The SGR parser never
+    /// sets it together with [`Style::SUPERSCRIPT`].
+    pub const SUBSCRIPT: u16 = 1 << 14;
     /// Every underline bit: [`Style::UNDERLINE`] and the four shape bits.
     pub const UNDERLINE_STYLE_MASK: u16 = Self::UNDERLINE
         | Self::DOUBLE_UNDERLINE

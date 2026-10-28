@@ -17,9 +17,17 @@
 //! | `40`-`47` `100`-`107` | background: ANSI colour 0-7, 8-15 |
 //! | `38` `48` `58` | foreground, background, underline colour: `;5;n` / `:5:n` indexed, `;2;r;g;b` / `:2:r:g:b` / `:2:id:r:g:b` direct |
 //! | `39` `49` `59` | default foreground, background, underline colour |
+//! | `53` `55` | overline on, off |
+//! | `73` `74` `75` | superscript, subscript (each clears the other), neither |
 //!
-//! Everything else (fonts 10-20, 26, 50-57, 60-65, 73-75, unassigned
+//! Everything else (fonts 10-20, 26, 50-52, 54, 56, 57, 60-65, unassigned
 //! numbers) is ignored and parsing continues with the next parameter.
+//!
+//! Superscript and subscript are mutually exclusive, as in `WezTerm`
+//! (mintty keeps two independent bits). Only `0` (or an empty parameter)
+//! clears overline, superscript and subscript; `21`, `24` and the other
+//! "off" codes leave them alone (mintty, `WezTerm`). xterm, kitty and
+//! Alacritty ignore all five codes.
 //!
 //! # Extended colours
 //!
@@ -197,6 +205,11 @@ impl State {
                 27 => *pen = pen.without(Style::INVERSE),
                 28 => *pen = pen.without(Style::HIDDEN),
                 29 => *pen = pen.without(Style::STRIKETHROUGH),
+                53 => *pen = pen.with(Style::OVERLINE),
+                55 => *pen = pen.without(Style::OVERLINE),
+                73 => *pen = pen.without(Style::SUBSCRIPT).with(Style::SUPERSCRIPT),
+                74 => *pen = pen.without(Style::SUPERSCRIPT).with(Style::SUBSCRIPT),
+                75 => *pen = pen.without(Style::SUPERSCRIPT | Style::SUBSCRIPT),
                 // The ranges guarantee the subtraction fits in a `u8`.
                 30..=37 => pen.fg = Color::Indexed(ansi(code - 30)),
                 40..=47 => pen.bg = Color::Indexed(ansi(code - 40)),

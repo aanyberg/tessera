@@ -175,8 +175,14 @@ No palette lives in `tessera-grid` or `tessera-term`; colours stay
   `..Style::DEFAULT`; the render tests and sources were updated.
 - The renderer has what #22 needs to draw curly, dotted and dashed
   underlines in their own colour without another layout change.
-- Further SGR attributes (53 overline, 73-75 super/subscript) have no flag
-  yet; there are four free bits (12-15); #81 adds them. Advertising `Su`,
-  `Smulx` and `Setulc` in the terminfo entry (ADR 0005) is a follow-up.
+- SGR 53/55 (overline) and 73/74/75 (superscript, subscript, neither)
+  set `Style::OVERLINE`, `SUPERSCRIPT` and `SUBSCRIPT` (bits 12-14, #81);
+  bit 15 is the last free one. Superscript and subscript are mutually
+  exclusive, as in WezTerm (mintty keeps two independent bits); only SGR 0
+  (or an empty parameter, or DECSTR/RIS, which reset the pen) clears the
+  three flags (21 and 24 do not), and a colon group headed by
+  one of the five codes is ignored whole. xterm, kitty and Alacritty ignore
+  all five. Drawing them (an overline at the cell top in the underline
+  colour, superscript and subscript glyph placement) is #22.
   DECSTR resets the whole pen, underline colour and shape included, since
   #80.

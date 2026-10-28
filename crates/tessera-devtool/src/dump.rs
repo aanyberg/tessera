@@ -77,11 +77,12 @@ pub fn ansi(grid: &Grid) -> String {
 /// for the default style), where the parameters are, in this order: `1`
 /// bold, `2` dim, `3` italic, the underline (`4` single, `21` double, `4:3`
 /// curly, `4:4` dotted, `4:5` dashed), `5` blink, `7` inverse, `8` hidden,
-/// `9` strikethrough, then the foreground (`30`–`37`, `90`–`97`, `38;5;n` or
+/// `9` strikethrough, `53` overline, `73` superscript, `74` subscript,
+/// then the foreground (`30`–`37`, `90`–`97`, `38;5;n` or
 /// `38;2;r;g;b`), the background (`40`–`47`, `100`–`107`, `48;5;n` or
 /// `48;2;r;g;b`) and the underline colour (`58;5;n` or `58;2;r;g;b`). A
 /// default colour adds nothing. Fed back into `tessera_term::Terminal`, the
-/// dump reproduces every cell's style. Every row ends with `ESC[0m` and a newline. Trailing cells equal
+/// dump reproduces every cell's style (as SGR produces it). Every row ends with `ESC[0m` and a newline. Trailing cells equal
 /// to [`Cell::BLANK`] (a space in the default style), or default-style
 /// padding a wrapped wide character left, are trimmed; any other
 /// cell is kept, including a space with a background colour, a foreground
@@ -168,7 +169,8 @@ pub fn cells(grid: &Grid) -> String {
 ///   as names joined by `|` (`bold`, `dim`, `italic`, the underline shape as
 ///   one of `underline`, `double-underline`, `curly-underline`,
 ///   `dotted-underline`, `dashed-underline`, then `blink`, `inverse`,
-///   `hidden`, `strikethrough`), or `-`.
+///   `hidden`, `strikethrough`, `overline`, `superscript`, `subscript`),
+///   or `-`.
 ///
 /// A line for a row that soft-wraps is followed by `row:wrapped`. With
 /// [`DumpOptions::cursor`] the cursor's cell line ends with ` <cursor`.
@@ -285,6 +287,9 @@ fn sgr_params(style: Style) -> Vec<String> {
             (Style::INVERSE, "7"),
             (Style::HIDDEN, "8"),
             (Style::STRIKETHROUGH, "9"),
+            (Style::OVERLINE, "53"),
+            (Style::SUPERSCRIPT, "73"),
+            (Style::SUBSCRIPT, "74"),
         ]))
         .map(str::to_owned)
         .chain(color_param(style.fg, 30, 90, 38))
@@ -381,6 +386,9 @@ fn attribute_names(style: Style) -> Vec<&'static str> {
         (Style::INVERSE, "inverse"),
         (Style::HIDDEN, "hidden"),
         (Style::STRIKETHROUGH, "strikethrough"),
+        (Style::OVERLINE, "overline"),
+        (Style::SUPERSCRIPT, "superscript"),
+        (Style::SUBSCRIPT, "subscript"),
     ]))
     .collect()
 }
@@ -462,6 +470,9 @@ mod tests {
             (Style::HIDDEN, "8"),
             (Style::STRIKETHROUGH, "9"),
             (Style::UNDERLINE | Style::DOUBLE_UNDERLINE, "21"),
+            (Style::OVERLINE, "53"),
+            (Style::SUPERSCRIPT, "73"),
+            (Style::SUBSCRIPT, "74"),
         ];
         for (flag, param) in cases {
             assert_eq!(
@@ -525,6 +536,44 @@ mod tests {
         }
         let first = original.grid().line(0).expect("row 0").cells[0];
         assert_eq!(first.style.underline_style(), UnderlineStyle::Curly);
+    }
+
+    /// Every combination of overline, superscript and subscript (the last
+    /// two only one at a time, as SGR sets them), with and without the
+    /// older attributes, survives an ANSI dump fed back into a terminal.
+    #[test]
+    fn overline_and_vertical_align_round_trip() {
+        let older = [0, Style::BOLD | Style::STRIKETHROUGH | Style::INVERSE];
+        let overline = [0, Style::OVERLINE];
+        let vertical = [0, Style::SUPERSCRIPT, Style::SUBSCRIPT];
+        let mut styles = Vec::new();
+        for flags in older {
+            for over in overline {
+                for align in vertical {
+                    let mut style = styled(Color::Indexed(3), Color::Default, flags | over | align);
+                    style = style.with_underline_style(UnderlineStyle::Curly);
+                    styles.push(style);
+                }
+            }
+        }
+        let mut grid = Grid::new(1, 16);
+        for style in &styles {
+            grid.set_pen(*style);
+            grid.put_str("x");
+        }
+        let dump = ansi(&grid);
+        assert!(dump.contains(";9;53;74;"), "{dump:?}");
+        let mut copy = tessera_term::Terminal::new(1, 16);
+        copy.advance(dump.trim_end_matches('\n').as_bytes());
+        let got: Vec<Style> = copy.grid().line(0).expect("row").cells[..styles.len()]
+            .iter()
+            .map(|cell| cell.style)
+            .collect();
+        assert_eq!(got, styles, "{dump:?}");
+        assert_eq!(
+            attribute_names(Style::DEFAULT.with(Style::OVERLINE | Style::SUBSCRIPT)),
+            ["overline", "subscript"]
+        );
     }
 
     #[test]

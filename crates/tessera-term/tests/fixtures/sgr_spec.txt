@@ -22,7 +22,8 @@
 #     fg=<c> bg=<c> ul=<c> us=<style> flags=<list>
 #     <c>      `-` Color::Default | `iN` Color::Indexed(N) | `#rrggbb` Color::Rgb (lower case)
 #     <style>  none | single | double | curly | dotted | dashed       (Style::underline_style())
-#     <list>   `-` or comma list in this order: bold,dim,italic,blink,inverse,hidden,strike
+#     <list>   `-` or comma list in this order: bold,dim,italic,blink,inverse,hidden,strike,overline,superscript,
+#              subscript (the last three added by #81)
 #              (the UNDERLINE and four *_UNDERLINE bits are shown only as us=, never in flags=)
 #     default pen: fg=- bg=- ul=- us=none flags=-
 #
@@ -119,9 +120,10 @@
 #   7. `CSI > 4 ; 2 m` (XTMODKEYS), `CSI ? 4 m`, `CSI 1 SP m` are not SGR.  State::csi already returns early when
 #      `intermediates` is non-empty (csi.rs l.70-79), which covers them; keep that check ahead of the new 'm' arm.
 #      Rows NOT_SGR_* pass for free as long as that order is kept.
-#   8. Follow-ups outside #7: advertise `Su`/`Smulx`/`Setulc` in the terminfo entry (ADR 0005, kitty docs name `Su`);
-#      DECSTR (`CSI ! p`) should reset SGR in xterm but is not implemented in tessera-term; SGR 53 (overline) and
-#      73-75 are ignored because Style has no flag for them.
+#   8. Follow-ups outside #7 (all since done): the terminfo entry advertises `Su`/`Smulx`/`Setulc` (ADR 0005, kitty
+#      docs name `Su`); DECSTR (`CSI ! p`) resets SGR as in xterm (#80).
+#      SGR 53/55 (overline) and 73-75 (superscript/subscript) were ignored here; #81 adds the flags (rows OL_, VA_,
+#      OV_, RS_, TR_, CS_, UK_, HX_ and blocks OLC01-06 below).
 #
 # PARSER FACTS (probed against vte 0.15, the version tessera-vt wraps)
 #   `ESC[m` -> groups [[0]]            `ESC[1;m` -> [[1],[0]]         `ESC[;1m` -> [[0],[1]]    `ESC[1;;3m` -> [[1],[0],[3]]
@@ -167,6 +169,153 @@ RST08_leading_empty_resets | \x1b[1m++\x1b[;3m | fg=- bg=- ul=- us=none flags=it
 # cite: lead decision 5
 # note: curly underline and RGB underline colour both cleared
 RST09_reset_keeps_nothing_underline_style | \x1b[4:3;58:2::1:2:3m++\x1b[0m | fg=- bg=- ul=- us=none flags=-
+
+# ==== #81 addendum: overline (53/55), superscript/subscript (73/74/75) ====================================
+# Source: spec-researcher addendum 2026-10-28 (mintty termout.c do_sgr, WezTerm wezterm-escape-parser csi.rs and
+# wezterm-cell; xterm, kitty and Alacritty implement none of the five codes and ignore them).  Lead decisions
+# (brief #81): 73/74 are mutually exclusive as in WezTerm (mintty keeps two independent bits); only 0 or an empty
+# parameter clears the three flags; a colon group headed by 53/55/73-75 is ignored whole (D-SUB-OTHER).
+# ---- OL. overline on / off ---------------------------------------------------------------------------------
+# cite: ECMA-48 8.3.117 (53 overlined); mintty termout.c l.2313; WezTerm SgrCode::OverlineOn
+OL_01_on | \x1b[53m | fg=- bg=- ul=- us=none flags=overline
+# cite: ECMA-48 8.3.117 (55 not overlined); mintty l.2314; WezTerm OverlineOff
+OL_02_on_off_one_sgr | \x1b[53;55m | fg=- bg=- ul=- us=none flags=-
+OL_03_on_off_two_sgrs | \x1b[53m++\x1b[55m | fg=- bg=- ul=- us=none flags=-
+# note: 55 on a default pen is a no-op
+OL_04_off_when_off | \x1b[55m | fg=- bg=- ul=- us=none flags=-
+OL_05_on_twice | \x1b[53;53m | fg=- bg=- ul=- us=none flags=overline
+OL_06_off_then_on | \x1b[55;53m | fg=- bg=- ul=- us=none flags=overline
+OL_07_on_off_on | \x1b[53;55;53m | fg=- bg=- ul=- us=none flags=overline
+OL_08_on_survives_next_sgr | \x1b[53m++\x1b[1m | fg=- bg=- ul=- us=none flags=bold,overline
+
+# ---- VA. superscript / subscript ---------------------------------------------------------------------------
+# cite: mintty termout.c l.2268; WezTerm SgrCode::VerticalAlignSuperScript (73)
+VA_01_super | \x1b[73m | fg=- bg=- ul=- us=none flags=superscript
+# cite: mintty l.2269; WezTerm VerticalAlignSubScript (74)
+VA_02_sub | \x1b[74m | fg=- bg=- ul=- us=none flags=subscript
+# cite: mintty l.2270 (75 clears both); WezTerm VerticalAlignBaseLine (75)
+VA_03_super_then_75 | \x1b[73;75m | fg=- bg=- ul=- us=none flags=-
+VA_04_sub_then_75 | \x1b[74;75m | fg=- bg=- ul=- us=none flags=-
+# note: 75 on a default pen is a no-op
+VA_05_75_when_off | \x1b[75m | fg=- bg=- ul=- us=none flags=-
+# cite: D-VA-EXCL -- WezTerm single enum (wezterm-cell vertical_align); mintty would give BOTH bits (divergence, recommendation)
+VA_06_super_then_sub_exclusive | \x1b[73;74m | fg=- bg=- ul=- us=none flags=subscript
+VA_07_sub_then_super_exclusive | \x1b[74;73m | fg=- bg=- ul=- us=none flags=superscript
+VA_08_super_sub_75 | \x1b[73;74;75m | fg=- bg=- ul=- us=none flags=-
+VA_09_super_75_sub | \x1b[73;75;74m | fg=- bg=- ul=- us=none flags=subscript
+VA_10_super_twice | \x1b[73;73m | fg=- bg=- ul=- us=none flags=superscript
+VA_11_exclusive_across_sgrs | \x1b[73m++\x1b[74m | fg=- bg=- ul=- us=none flags=subscript
+VA_12_flip_flop | \x1b[74;73;75;73m | fg=- bg=- ul=- us=none flags=superscript
+
+# ---- OV. independence: overline vs super/sub, and the other attributes -------------------------------------
+# cite: mintty (separate ATTR_ bits); WezTerm (overline bit 12 vs vertical_align bits 15-16)
+OV_01_over_and_super | \x1b[53;73m | fg=- bg=- ul=- us=none flags=overline,superscript
+OV_02_over_and_sub | \x1b[53;74m | fg=- bg=- ul=- us=none flags=overline,subscript
+# note: 75 clears super/sub ONLY (mintty l.2270 mask); 55 clears overline ONLY
+OV_03_75_keeps_overline | \x1b[53;73;75m | fg=- bg=- ul=- us=none flags=overline
+OV_04_55_keeps_super | \x1b[53;73;55m | fg=- bg=- ul=- us=none flags=superscript
+OV_05_74_keeps_overline | \x1b[73;53;74m | fg=- bg=- ul=- us=none flags=overline,subscript
+# cite: mintty l.2293-2301 (21 = double underline, 24 = clear underline mask); xterm 24 clears UNDERLINE|DBL_UNDER; no emulator touches overline
+OV_06_21_keeps_overline | \x1b[53;21m | fg=- bg=- ul=- us=double flags=overline
+OV_07_24_keeps_overline | \x1b[53;4;24m | fg=- bg=- ul=- us=none flags=overline
+OV_08_21_then_24_keeps_overline | \x1b[53;21;24m | fg=- bg=- ul=- us=none flags=overline
+# note: added by the implementer (#81): 21 and 24 leave superscript/subscript alone too (mintty do_sgr 21/24 touch UNDER_MASK only;
+# note: WezTerm Sgr::Underline only)
+OV_08b_21_keeps_super | \x1b[73;21m | fg=- bg=- ul=- us=double flags=superscript
+OV_08c_21_24_keep_overline_and_sub | \x1b[53;74;21m++\x1b[24m | fg=- bg=- ul=- us=none flags=overline,subscript
+OV_09_55_keeps_underline | \x1b[4;53;55m | fg=- bg=- ul=- us=single flags=-
+OV_10_24_keeps_super_sub | \x1b[73;4;24m | fg=- bg=- ul=- us=none flags=superscript
+OV_11_curly_underline_with_super | \x1b[73;4:3m | fg=- bg=- ul=- us=curly flags=superscript
+OV_12_curly_with_overline | \x1b[4:3;53m | fg=- bg=- ul=- us=curly flags=overline
+# note: underline colour 58/59 is independent of the three flags
+OV_13_ul_colour_set_clear_keeps_overline | \x1b[53;58;5;9;59m | fg=- bg=- ul=- us=none flags=overline
+OV_14_ul_colour_with_overline | \x1b[53;4;58;5;9m | fg=- bg=- ul=i9 us=single flags=overline
+OV_15_colours_with_flags | \x1b[31;42;53;74m | fg=i1 bg=i2 ul=- us=none flags=overline,subscript
+OV_16_inverse_with_overline | \x1b[7;53m | fg=- bg=- ul=- us=none flags=inverse,overline
+# note: full house; underline off so the pen shows every non-underline flag
+OV_17_every_flag | \x1b[1;2;3;5;7;8;9;53;73m | fg=- bg=- ul=- us=none flags=bold,dim,italic,blink,inverse,hidden,strike,overline,superscript
+OV_18_every_flag_sub | \x1b[1;2;3;5;7;8;9;53;74m | fg=- bg=- ul=- us=none flags=bold,dim,italic,blink,inverse,hidden,strike,overline,subscript
+OV_19_order_does_not_matter | \x1b[74;53;9;1m | fg=- bg=- ul=- us=none flags=bold,strike,overline,subscript
+
+# ---- RS. which resets clear the flags -----------------------------------------------------------------------
+# cite: ECMA-48 8.3.117 (0 = default rendition); mintty l.2221 `attr = CATTR_DEFAULT`; WezTerm Sgr::Reset
+RS_01_zero_clears_overline | \x1b[53m++\x1b[0m | fg=- bg=- ul=- us=none flags=-
+RS_02_empty_clears_super | \x1b[73m++\x1b[m | fg=- bg=- ul=- us=none flags=-
+RS_03_zero_clears_sub_and_overline | \x1b[53;74m++\x1b[0m | fg=- bg=- ul=- us=none flags=-
+RS_04_zero_in_the_middle | \x1b[53;73;0m | fg=- bg=- ul=- us=none flags=-
+RS_05_zero_then_set | \x1b[53;0;73m | fg=- bg=- ul=- us=none flags=superscript
+# cite: xterm CASE_SGR empty slot == 0 (sgr_spec.txt RST06..RST08, vte gives an extra 0)
+RS_06_trailing_semicolon_resets | \x1b[53;m | fg=- bg=- ul=- us=none flags=-
+RS_06b_empty_slot_between | \x1b[53;;74m | fg=- bg=- ul=- us=none flags=subscript
+RS_06c_leading_empty_slot_then_set | \x1b[;53m | fg=- bg=- ul=- us=none flags=overline
+RS_06d_reset_clears_all_incl_new | \x1b[1;2;3;4;5;7;8;9;31;42;53;73;58;5;9m++\x1b[0m | fg=- bg=- ul=- us=none flags=-
+# cite: D-RESET-SCOPE -- mintty do_sgr 22,23,24,25,27,28,29,39,49,59 do not mention OVERL/SUPERSCR/SUBSCR; WezTerm same
+RS_07_normal_intensity_keeps | \x1b[53;73;1m++\x1b[22m | fg=- bg=- ul=- us=none flags=overline,superscript
+RS_08_not_italic_keeps | \x1b[53;74;3m++\x1b[23m | fg=- bg=- ul=- us=none flags=overline,subscript
+RS_09_not_blink_inverse_hidden_strike_keep | \x1b[53;73;5;7;8;9m++\x1b[25;27;28;29m | fg=- bg=- ul=- us=none flags=overline,superscript
+RS_10_default_colours_keep | \x1b[53;74;31;42m++\x1b[39;49m | fg=- bg=- ul=- us=none flags=overline,subscript
+RS_11_underline_colour_off_keeps | \x1b[53;73;58;5;9m++\x1b[59m | fg=- bg=- ul=- us=none flags=overline,superscript
+RS_12_all_the_offs_at_once | \x1b[53;73m++\x1b[22;23;24;25;27;28;29;39;49;59m | fg=- bg=- ul=- us=none flags=overline,superscript
+# note: the same offs against subscript, and against superscript without overline (critic #81 m1: each off-code meets both flags)
+RS_12b_all_the_offs_keep_sub | \x1b[53;74m++\x1b[22;23;24;25;27;28;29;39;49;59m | fg=- bg=- ul=- us=none flags=overline,subscript
+RS_12c_all_the_offs_keep_super_alone | \x1b[73m++\x1b[22;23;24;25;27;28;29;39;49;59m | fg=- bg=- ul=- us=none flags=superscript
+RS_12d_all_the_offs_keep_sub_alone | \x1b[74m++\x1b[22;23;24;25;27;28;29;39;49;59m | fg=- bg=- ul=- us=none flags=subscript
+
+# ---- TR. traps: 53/55/73/74/75 as colour operands ------------------------------------------------------------
+# cite: xterm CASE_SGR parse_extended_colors consumes the operands of 38/48; ISO 8613-6; sgr_spec.txt A-colour rows
+TR_01_38_5_53 | \x1b[38;5;53m | fg=i53 bg=- ul=- us=none flags=-
+TR_02_48_5_73 | \x1b[48;5;73m | fg=- bg=i73 ul=- us=none flags=-
+TR_03_58_5_55 | \x1b[58;5;55m | fg=- bg=- ul=i55 us=none flags=-
+TR_04_38_5_74_then_75 | \x1b[38;5;74;75m | fg=i74 bg=- ul=- us=none flags=-
+TR_05_38_2_53_73_74 | \x1b[38;2;53;73;74m | fg=#35494a bg=- ul=- us=none flags=-
+TR_06_48_2_75_55_53_then_73 | \x1b[48;2;75;55;53;73m | fg=- bg=#4b3735 ul=- us=none flags=superscript
+TR_07_colour_then_overline | \x1b[38;5;1;53m | fg=i1 bg=- ul=- us=none flags=overline
+TR_08_colon_38_5_53 | \x1b[38:5:53m | fg=i53 bg=- ul=- us=none flags=-
+TR_09_colon_38_2_empty_id | \x1b[38:2::53:73:74m | fg=#35494a bg=- ul=- us=none flags=-
+TR_10_colon_48_2_no_id | \x1b[48:2:53:73:74m | fg=- bg=#35494a ul=- us=none flags=-
+TR_11_colon_58_5_73 | \x1b[58:5:73m | fg=- bg=- ul=i73 us=none flags=-
+TR_12_colon_colour_then_flags | \x1b[38:5:53;53;74m | fg=i53 bg=- ul=- us=none flags=overline,subscript
+# note: too few values for 38;2 consumes to the end of the SGR (sgr_spec.txt), so the trailing 73 is NOT superscript
+TR_13_38_2_short_eats_73 | \x1b[38;2;53;73m | fg=- bg=- ul=- us=none flags=-
+# note: 5;3 is blink+italic, 7;3 inverse+italic: two-digit neighbours of 53/73 are not the codes
+TR_14_5_3_is_not_53 | \x1b[5;3m | fg=- bg=- ul=- us=none flags=italic,blink
+TR_15_7_3_is_not_73 | \x1b[7;3m | fg=- bg=- ul=- us=none flags=italic,inverse
+
+# ---- CS. colon sub-parameters on the new codes: whole group ignored (D-SUB-OTHER) ------------------------
+# cite: mintty do_sgr `53|SUB_PARS` matches no case; xterm CASE_SGR `item += skip` for non-38/48 groups; sgr_spec.txt D-SUB-OTHER
+CS_01_53c1_ignored | \x1b[53:1m | fg=- bg=- ul=- us=none flags=-
+CS_02_53c0_ignored | \x1b[53:0m | fg=- bg=- ul=- us=none flags=-
+CS_03_55c1_does_not_clear | \x1b[53m++\x1b[55:1m | fg=- bg=- ul=- us=none flags=overline
+CS_04_73c1_ignored | \x1b[73:1m | fg=- bg=- ul=- us=none flags=-
+CS_05_74c2_then_italic | \x1b[74:2;3m | fg=- bg=- ul=- us=none flags=italic
+CS_06_75c0_does_not_clear | \x1b[73m++\x1b[75:0m | fg=- bg=- ul=- us=none flags=superscript
+CS_07_group_inside_list | \x1b[1;53:1;3m | fg=- bg=- ul=- us=none flags=bold,italic
+CS_08_ignored_then_underline_style | \x1b[53:1;4:3m | fg=- bg=- ul=- us=curly flags=-
+CS_09_mixed_groups | \x1b[53;55:1;73:2;3m | fg=- bg=- ul=- us=none flags=italic,overline
+# note: a sub-parameter equal to 53/73 after another head is NOT the code (flattened params trap)
+CS_10_0c53_not_overline_not_reset | \x1b[3m++\x1b[0:53m | fg=- bg=- ul=- us=none flags=italic
+CS_11_1c73_not_bold_not_super | \x1b[1:73m | fg=- bg=- ul=- us=none flags=-
+CS_12_empty_head_c53 | \x1b[3m++\x1b[:53m | fg=- bg=- ul=- us=none flags=italic
+# cite: D-US-UNK (sgr_spec.txt): 4:n with n>5 is single underline; the 53 inside the group is only the sub-parameter
+CS_13_4c53_is_single_underline | \x1b[4:53m | fg=- bg=- ul=- us=single flags=-
+CS_14_4c5_then_overline | \x1b[4:5;53m | fg=- bg=- ul=- us=dashed flags=overline
+
+# ---- UK. neighbours and out-of-range numbers stay ignored -------------------------------------------------------
+# cite: xterm CASE_SGR default arm; mintty has framed (51)/encircled (52) neither here
+UK_01_neighbours_ignored | \x1b[51;52;54;56;57;60;61;62;63;64;65;72;76;77m | fg=- bg=- ul=- us=none flags=-
+UK_02_scaled_numbers_ignored | \x1b[153;173;174;175;530;730;1053;65535m | fg=- bg=- ul=- us=none flags=-
+UK_03_neighbours_do_not_disturb_flags | \x1b[53;73m++\x1b[54;56;72;76m | fg=- bg=- ul=- us=none flags=overline,superscript
+
+# ---- HX. hostile forms (added by the implementer, #81) -----------------------------------------------------
+# cite: sgr_spec.txt D-LEN (tessera-vt keeps 32 parameters, the 33rd drops the action); leading zeros are digits
+HX_01_leading_zeros | \x1b[0053;00073m | fg=- bg=- ul=- us=none flags=overline,superscript
+# note: vte saturates at 65535, which is ignored; a number ending in 53 is not 53
+HX_02_huge_ending_in_53 | \x1b[99999999999999999953;1000073m | fg=- bg=- ul=- us=none flags=-
+HX_03_32_params_last_is_73 | \x1b[53;55;53;55;53;55;53;55;53;55;53;55;53;55;53;55;53;55;53;55;53;55;53;55;53;55;53;55;53;55;53;73m | fg=- bg=- ul=- us=none flags=overline,superscript
+HX_04_33_params_dropped | \x1b[73m++\x1b[53;53;53;53;53;53;53;53;53;53;53;53;53;53;53;53;53;53;53;53;53;53;53;53;53;53;53;53;53;53;53;53;75m | fg=- bg=- ul=- us=none flags=superscript
+# note: applied, these 40 would leave overline,superscript; dropped, the pen stays default
+HX_05_40_params_dropped | \x1b[75;55;53;74;73;75;55;53;74;73;75;55;53;74;73;75;55;53;74;73;75;55;53;74;73;75;55;53;74;73;75;55;53;74;73;75;55;53;74;73m | fg=- bg=- ul=- us=none flags=-
+HX_06_colon_and_semicolon_mix | \x1b[53:53;73;74:74;55:55m | fg=- bg=- ul=- us=none flags=superscript
 
 # ---- A2. Attributes on (1..9, 21) ------------------------------------------------------------------------
 # cite: ctlseqs `Ps = 1`; xterm CASE_SGR case 1
@@ -624,8 +773,9 @@ UNK_saturated_in_the_middle | \x1b[1;99999999999;3m | fg=- bg=- ul=- us=none fla
 # cite: xterm CASE_SGR ignores the alternative-font codes
 # note: ECMA-48 10-20 select fonts; kitty, Alacritty ignore; WezTerm has Font(..) (not stored in Style)
 UNK_fonts_10_to_20 | \x1b[10;11;12;13;14;15;16;17;18;19;20m | fg=- bg=- ul=- us=none flags=-
-# cite: xterm CASE_SGR default arm. 53 overline (kitty, WezTerm support it), 51/52 framed/encircled, 73-75 super/subscript: no Style flag exists, ignore
-# note: an overline flag is out of scope for #7
+# cite: xterm CASE_SGR default arm (26, 50-52, 54, 56, 57, 60-65 ignored); 53/55 and 73/74/75 are stored since #81 (mintty, WezTerm)
+# note: the row still ends with no flags only because 55 cancels 53 and 75 cancels 73/74 (rows OL_02, VA_08); kitty and xterm
+# note: ignore all five codes.  Kept as a regression row for the codes that are still ignored.
 UNK_misc_not_stored | \x1b[26;50;51;52;53;54;55;56;57;60;61;62;63;64;65;73;74;75m | fg=- bg=- ul=- us=none flags=-
 # cite: xterm CASE_SGR
 UNK_above_107 | \x1b[76;77;88;89;98;99;108;109;110;255;1000;65535m | fg=- bg=- ul=- us=none flags=-
@@ -1261,6 +1411,76 @@ scrollback: len=1 first=("A")
 sb_cell: 0 (0,0) 'A' fg=i1 bg=- ul=- us=curly flags=-
 others: blank
 cite: scrollback stores the Line unchanged; the new bottom line is Cell::blank_with(pen) = bg only
+
+### OLC01_print_carries_flags_until_off
+size: 1x6
+feed: \x1b[53mA\x1b[55mB\x1b[73mC\x1b[74mD\x1b[75mE
+cell: (0,0) 'A' fg=- bg=- ul=- us=none flags=overline
+cell: (0,1) 'B' fg=- bg=- ul=- us=none flags=-
+cell: (0,2) 'C' fg=- bg=- ul=- us=none flags=superscript
+cell: (0,3) 'D' fg=- bg=- ul=- us=none flags=subscript
+cell: (0,4) 'E' fg=- bg=- ul=- us=none flags=-
+cell: (0,5) ' ' fg=- bg=- ul=- us=none flags=-
+cursor: (0,5)
+others: blank
+cite: ECMA-48 8.3.117 (SGR affects subsequent graphic characters); flags are per cell, copied at print time (Style in Cell)
+
+### OLC02_wide_char_and_spacer_carry_flags
+size: 1x4
+feed: \x1b[53;73m\u{4e2d}
+cell: (0,0) '中 wide' fg=- bg=- ul=- us=none flags=overline,superscript
+cell: (0,1) '<spacer>' fg=- bg=- ul=- us=none flags=overline,superscript
+cell: (0,2) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (0,3) ' ' fg=- bg=- ul=- us=none flags=-
+cursor: (0,2)
+others: blank
+cite: ADR 0008 Cell::spacer(style) copies the whole Style (sgr_spec.txt CEL07); renderer (#22) needs overline on both halves
+
+### OLC03_erase_keeps_bg_only
+size: 1x4
+feed: abcd\x1b[1;1H\x1b[53;73;44m\x1b[2K
+cell: (0,0) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,1) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,2) ' ' fg=- bg=i4 ul=- us=none flags=-
+cell: (0,3) ' ' fg=- bg=i4 ul=- us=none flags=-
+cursor: (0,0)
+others: blank
+cite: xterm ClearCells (colour pair only, no rendition flags); sgr_spec.txt BCE01. Overline/superscript on a blank erased cell must NOT survive
+
+### OLC04_rep_repeats_flags
+size: 1x6
+feed: \x1b[53;74mA\x1b[3b
+cell: (0,0) 'A' fg=- bg=- ul=- us=none flags=overline,subscript
+cell: (0,1) 'A' fg=- bg=- ul=- us=none flags=overline,subscript
+cell: (0,2) 'A' fg=- bg=- ul=- us=none flags=overline,subscript
+cell: (0,3) 'A' fg=- bg=- ul=- us=none flags=overline,subscript
+cell: (0,4) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (0,5) ' ' fg=- bg=- ul=- us=none flags=-
+cursor: (0,4)
+others: blank
+cite: xterm CASE_REP repeats with the current rendition (no SGR between print and REP); sgr_spec.txt REP01
+
+### OLC05_decsc_decrc_saves_flags
+size: 1x4
+feed: \x1b[53;74m\x1b7\x1b[0mab\x1b8X
+cell: (0,0) 'X' fg=- bg=- ul=- us=none flags=overline,subscript
+cell: (0,1) 'b' fg=- bg=- ul=- us=none flags=-
+cell: (0,2) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (0,3) ' ' fg=- bg=- ul=- us=none flags=-
+cursor: (0,1)
+others: blank
+cite: xterm CursorSave2 / CursorRestoreFlags (whole rendition); D-SAVED in sgr_spec.txt (Grid::save_cursor copies the whole pen)
+
+### OLC06_combining_mark_keeps_base_flags
+size: 1x4
+feed: \x1b[73me\x1b[74m\u{301}
+cell: (0,0) 'é cluster' fg=- bg=- ul=- us=none flags=superscript
+cell: (0,1) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (0,2) ' ' fg=- bg=- ul=- us=none flags=-
+cell: (0,3) ' ' fg=- bg=- ul=- us=none flags=-
+cursor: (0,1)
+others: blank
+cite: sgr_spec.txt CEL08 (the combining mark is appended to the base cell and never restyles it; the later 74 does not reach the base)
 
 # -- end of part C
 

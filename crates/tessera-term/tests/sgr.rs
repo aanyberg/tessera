@@ -50,7 +50,7 @@ fn color_text(color: Color) -> String {
 /// Flag bits the notation has no name for (none exist today) are printed
 /// as `?0x...`, so a stray bit can never pass as a clean pen.
 fn pen_text(style: Style) -> String {
-    const NAMES: [(u16, &str); 7] = [
+    const NAMES: [(u16, &str); 10] = [
         (Style::BOLD, "bold"),
         (Style::DIM, "dim"),
         (Style::ITALIC, "italic"),
@@ -58,6 +58,9 @@ fn pen_text(style: Style) -> String {
         (Style::INVERSE, "inverse"),
         (Style::HIDDEN, "hidden"),
         (Style::STRIKETHROUGH, "strike"),
+        (Style::OVERLINE, "overline"),
+        (Style::SUPERSCRIPT, "superscript"),
+        (Style::SUBSCRIPT, "subscript"),
     ];
     let us = match style.underline_style() {
         UnderlineStyle::None => "none",
@@ -424,7 +427,7 @@ fn check_cell_case(case: &CellCase, chunking: Chunking) -> Vec<String> {
 #[test]
 fn cell_rows_hold() {
     let cases = cell_cases();
-    assert_eq!(cases.len(), 33, "cell blocks in the fixture");
+    assert_eq!(cases.len(), 39, "cell blocks in the fixture");
     for case in &cases {
         assert!(
             !case.feeds.is_empty() && !case.cells.is_empty(),
@@ -584,6 +587,47 @@ fn sub_parameters_left_after_a_semicolon_colour_are_skipped() {
     );
     // `38;5;1` reads the index; the `:2` after it must not turn on dim.
     assert_eq!(pen(b"\x1b[38;5;1:2m"), "fg=i1 bg=- ul=- us=none flags=-");
+    // Nor may a left-over `:53`, `:73` or `:75` act as overline,
+    // superscript or "neither".
+    assert_eq!(pen(b"\x1b[38;5;1:53m"), "fg=i1 bg=- ul=- us=none flags=-");
+    assert_eq!(
+        pen(b"\x1b[48;5;2:73:53m"),
+        "fg=- bg=i2 ul=- us=none flags=-"
+    );
+    assert_eq!(
+        pen(b"\x1b[73;58;5;3:75m"),
+        "fg=- bg=- ul=i3 us=none flags=superscript"
+    );
+}
+
+/// The three #81 flags are free bits of their own: setting or clearing one
+/// touches no other bit, and the default style has none of them.
+#[test]
+fn overline_and_vertical_align_flags_are_independent_bits() {
+    let new = [Style::OVERLINE, Style::SUPERSCRIPT, Style::SUBSCRIPT];
+    let old = Style::UNDERLINE_STYLE_MASK
+        | Style::BOLD
+        | Style::DIM
+        | Style::ITALIC
+        | Style::BLINK
+        | Style::INVERSE
+        | Style::HIDDEN
+        | Style::STRIKETHROUGH;
+    for (i, flag) in new.iter().enumerate() {
+        assert_eq!(flag.count_ones(), 1, "{flag:#x}");
+        assert_eq!(flag & old, 0, "{flag:#x} overlaps an older flag");
+        assert!(!Style::DEFAULT.has(*flag));
+        let on = Style::DEFAULT.with(*flag);
+        assert_eq!(on.flags, *flag);
+        assert_eq!(on.without(*flag), Style::DEFAULT);
+        let full =
+            Style::DEFAULT.with(old | Style::OVERLINE | Style::SUPERSCRIPT | Style::SUBSCRIPT);
+        assert_eq!(full.without(*flag).flags, full.flags & !flag);
+        for other in &new[i + 1..] {
+            assert_eq!(flag & other, 0);
+        }
+    }
+    assert_eq!(std::mem::size_of::<Cell>(), 20);
 }
 
 /// The ANSI colour codes map onto indexes 0-15 in order.
@@ -613,11 +657,12 @@ fn ansi_codes_map_to_indexes() {
 // ---------------------------------------------------------------- property
 
 /// One SGR parameter: a value and whether `:` (rather than `;`) precedes
-/// it. Values cluster around the codes that consume further parameters.
+/// it. Values cluster around the codes that consume further parameters
+/// and the overline and superscript/subscript codes.
 fn sgr_param() -> impl Strategy<Value = (u16, bool)> {
     let value = prop_oneof![
         4 => 0u16..=110,
-        2 => prop::sample::select(vec![0u16, 2, 4, 5, 38, 48, 58, 255, 256]),
+        2 => prop::sample::select(vec![0u16, 2, 4, 5, 38, 48, 53, 55, 58, 73, 74, 75, 255, 256]),
         1 => any::<u16>(),
     ];
     (value, any::<bool>())
@@ -644,7 +689,8 @@ fn underline_bits_are_consistent(style: Style) -> bool {
 
 proptest! {
     /// Random parameter lists never panic, keep the underline invariant on
-    /// the pen and on printed cells, and do not depend on chunking.
+    /// the pen and on printed cells, never set superscript and subscript
+    /// together, and do not depend on chunking.
     #[test]
     fn random_sgr_keeps_the_underline_invariant(
         lists in prop::collection::vec(prop::collection::vec(sgr_param(), 0..40), 1..4),
@@ -661,6 +707,11 @@ proptest! {
             bytewise.advance(b"x");
             let pen = whole.grid().pen();
             prop_assert!(underline_bits_are_consistent(pen), "{}", pen_text(pen));
+            prop_assert!(
+                !pen.has(Style::SUPERSCRIPT | Style::SUBSCRIPT),
+                "superscript and subscript together: {}",
+                pen_text(pen)
+            );
             prop_assert_eq!(pen, bytewise.grid().pen());
         }
         for line in whole.grid().visible_lines() {

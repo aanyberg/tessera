@@ -310,6 +310,34 @@ fn cells_format_lists_every_cell_with_markers() {
     );
 }
 
+/// Overline, superscript and subscript (SGR 53, 73, 74) reach both
+/// formats: named in the `cells` attrs column and re-emitted by `ansi`.
+/// 73 does not clear overline, 0 clears everything, and 74 after 73 leaves
+/// only subscript.
+#[test]
+fn overline_and_vertical_align_reach_both_formats() {
+    let command = r"printf '\033[53mA\033[73mB\033[0m\033[74mC\033[73;74mD'";
+    let cells = devtool(
+        command,
+        &["--cols", "5", "--rows", "1", "--format", "cells"],
+    );
+    assert_eq!(cells.status.code(), Some(0));
+    assert_eq!(
+        stdout(&cells),
+        "0:0 \"A\" - fg=default bg=default ul=default attrs=overline\n\
+         0:1 \"B\" - fg=default bg=default ul=default attrs=overline|superscript\n\
+         0:2 \"C\" - fg=default bg=default ul=default attrs=subscript\n\
+         0:3 \"D\" - fg=default bg=default ul=default attrs=subscript\n\
+         0:4 \" \" - fg=default bg=default ul=default attrs=-\n"
+    );
+    let ansi = devtool(command, &["--cols", "5", "--rows", "1"]);
+    assert_eq!(ansi.status.code(), Some(0));
+    assert_eq!(
+        stdout(&ansi),
+        "\x1b[0;53mA\x1b[0;53;73mB\x1b[0;74mCD\x1b[0m\n"
+    );
+}
+
 #[test]
 fn ansi_is_the_default_format() {
     let output = devtool("printf 'hi'", &["--cols", "4", "--rows", "2"]);
