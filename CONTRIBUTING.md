@@ -82,6 +82,42 @@ cells}`), so tests can dump a `Grid` they built by hand. The crate is
 dev-only: `publish = false`, and a test checks that `tessera-ffi` and
 `tessera-app-core` never link it.
 
+## Debugging: the development window
+
+`just devwin` (`cargo run -p tessera-devwin`) opens a winit window running
+your login shell through `tessera_app_core::App`: the same views, renderer,
+keyboard encoder and session events the app uses, without Xcode or the Swift
+frontend. Use it to see renderer or emulator changes interactively, and the
+devtool when you need a reproducible dump of one command's screen for a test
+or a bug report. Cmd-V pastes (Ctrl+Shift+V off macOS, read through `pbpaste`,
+`wl-paste` or `xclip` on a helper thread, killed after 2 s), keys typed while
+it is read wait for it, other Cmd chords are dropped, the left Option key is
+Alt and the right one composes (so Nordic and German layouts can still type `@
+[ ] { } | \ $`), the window title will follow the shell once the emulator
+reports titles (OSC 0/2, #9), and the bell is printed on stderr. Dead keys
+should work (`´` then `e` types `é`; see the manual check below), but there is
+no IME, so no CJK input: allowing winit's IME would let macOS's press-and-hold
+accent menu replace key repeat (kitty and WezTerm turn
+`ApplePressAndHoldEnabled` off, which needs Objective-C calls), and composed
+input belongs to the app's terminal view (#27). It uses the default
+configuration, has no tabs, selection or copy, and like the devtool is
+dev-only: a test checks that `tessera-ffi` and `tessera-app-core` never link
+it or winit. It installs no signal handlers: Ctrl-C in the terminal that
+launched it, or `kill`, ends it without closing the session, and a child that
+ignores `SIGHUP` is orphaned; close the window instead.
+
+**Manual check (priority, not yet done):** the dead-key handling assumes
+AppKit composes a dead key into the next key event without an IME. Events
+posted to the process with `CGEventPostToPid` suggest AppKit keeps no dead-key
+state between events, in which case `´ e` gives a plain `e` and `^ Space` a
+space; a locked screen cannot settle it. Before relying on dead keys, switch
+to the German layout, run `just devwin`, start `cat -v` and type `´ e`, `^
+Space` and right-Option+n then Space. If they come out unaccented, devwin
+needs its own `UCKeyTranslate`-based dead-key state (as Zed and kitty keep) or
+an IME. Known limit: with the left Option as Meta, a US key whose Option layer
+is a dead key (`M-u`, `M-e`, `M-n`, `M-i`, `` M-` ``) may leave a composition
+pending, so the next key can come out accented.
+
 ## Swift
 
 - Swift 6 language mode, strict concurrency.

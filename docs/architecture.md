@@ -45,6 +45,7 @@ The diagram is the target design; today the core holds sessions only
 | `tessera-ffi` | `extern "C"` surface, including turning a `CAMetalLayer*` into a wgpu surface (`unsafe` allowed); `apps/macos` wraps it as TesseraKit (ADR 0012) | app-core |
 | `tessera-cli` | `tessera` binary speaking the protocol | protocol |
 | `tessera-devtool` | dev-only `tessera-devtool` binary and library: headless screen dumps for debugging and snapshot tests; never published, nothing in the app depends on it | pty, term, grid |
+| `tessera-devwin` | dev-only `tessera-devwin` binary: a winit window running a login shell through `App` (views, input, session events) for renderer and emulator work without Xcode; never published, nothing in the app depends on it | app-core, winit |
 
 ## Invariants
 
@@ -53,6 +54,8 @@ The diagram is the target design; today the core holds sessions only
    any windowing system. The frontend passes a `CAMetalLayer*` to
    `tessera-ffi`, which is the only crate that turns it into a wgpu surface;
    `tessera-render` and `tessera-app-core` see a `wgpu::Surface`.
+   Dev-only binaries (`tessera-devwin`) are exempt; tests check that
+   `tessera-ffi` and `tessera-app-core` never link them or winit.
 3. **One host API.** Built-in plugins, WASM plugins (v2) and socket clients
    all go through `tessera-plugin-api`. If a feature cannot be expressed
    there, the API grows; a side channel is never added.

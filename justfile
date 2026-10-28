@@ -56,6 +56,10 @@ xcframework: core-release
         -headers target/xcframework/include \
         -output {{xcframework}}
 
+# Open the development window: a login shell drawn by the core's renderer in a winit window (no Xcode needed)
+devwin:
+    cargo run -p tessera-devwin
+
 # Generate the Xcode project from project.yml
 xcodeproj:
     cd {{app_dir}} && xcodegen generate

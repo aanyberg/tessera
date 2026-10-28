@@ -17,6 +17,7 @@ members = [
     "crates/tessera-ffi",
     "crates/tessera-cli",
     "crates/tessera-devtool",
+    "crates/tessera-devwin",
     "xtask",
 ]
 
@@ -58,6 +59,7 @@ unicode-segmentation = "1"
 unicode-width = "0.2"
 bytemuck = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
+winit = "0.30"
 
 # external, dev
 insta = "1.43"

@@ -1,0 +1,28 @@
+[package]
+name = "tessera-devwin"
+description = "winit development window running a shell through the application core (dev-only)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Dev-only: never published and never linked into the app. The workspace
+# default already says so; the crate repeats it so moving it cannot change that.
+publish = false
+
+[dependencies]
+tessera-app-core.workspace = true
+winit.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+# Tests check the bytes a mapped key encodes to.
+tessera-term.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "tessera-devwin"
+path = "src/main.rs"
