@@ -226,6 +226,7 @@ fn red() -> Style {
         fg: Color::Indexed(1),
         bg: Color::Rgb(9, 9, 9),
         flags: Style::BOLD,
+        ..Style::DEFAULT
     }
 }
 

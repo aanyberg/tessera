@@ -46,7 +46,7 @@ pub struct ViewSize {
 /// Most columns a grid derived from a surface gets ([`grid_size_for`]).
 ///
 /// A 16384-pixel surface at backing scale 0.25 with a 4 pt font would
-/// otherwise fit 16382 columns and as many rows, about 4.3 GB of cells
+/// otherwise fit 16382 columns and as many rows, about 5.4 GB of cells
 /// once the grid follows the surface. 2048 columns of the smallest
 /// readable font still span several 8K displays.
 pub const MAX_VIEW_COLS: u16 = 2048;

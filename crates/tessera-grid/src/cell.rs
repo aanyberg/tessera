@@ -89,8 +89,9 @@ impl std::ops::BitOrAssign for CellFlags {
 
 /// A single character cell.
 ///
-/// Stays at 16 bytes (a test enforces it): `flags` fits in the padding
-/// after [`Style`].
+/// 20 bytes (a test enforces it): a 4-byte `char`, the 14-byte [`Style`]
+/// and the 1-byte `flags`, padded to the `char`'s 4-byte alignment. It was
+/// 16 bytes until [`Style`] gained an underline colour (ADR 0013).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cell {
     /// The character displayed, or `' '` when empty. For a
@@ -130,14 +131,13 @@ impl Cell {
     ///
     /// This is what erase and scroll operations fill with: the background
     /// colour of the current pen survives (background colour erase), the
-    /// rest of the attributes do not.
+    /// rest of the attributes, the underline colour included, do not.
     pub const fn blank_with(style: Style) -> Self {
         Self {
             ch: ' ',
             style: Style {
-                fg: Color::Default,
                 bg: style.bg,
-                flags: 0,
+                ..Style::DEFAULT
             },
             flags: CellFlags::EMPTY,
         }
@@ -152,13 +152,15 @@ impl Cell {
         }
     }
 
-    /// True when the cell shows a space with no attributes but background.
+    /// True when the cell shows a space with no attributes but background:
+    /// default foreground and underline colour, no flags.
     ///
     /// A [`CellFlags::SPACER`] is not blank: it is part of the wide
     /// character to its left.
     pub fn is_blank(&self) -> bool {
         self.ch == ' '
             && self.style.fg == Color::Default
+            && self.style.underline == Color::Default
             && self.style.flags == 0
             && self.flags.is_empty()
     }
@@ -195,16 +197,30 @@ impl Cell {
     }
 }
 
-/// Visual attributes of a cell.
+/// Visual attributes of a cell: what SGR sets on the pen.
 ///
-/// Stays at or below 16 bytes so a full-size grid fits comfortably in cache;
-/// a test enforces this.
+/// 14 bytes (three 4-byte [`Color`]s and the `u16` flags) and never more
+/// than 16, so a full-size grid fits comfortably in cache; a test enforces
+/// this.
+///
+/// # Underline
+///
+/// [`Style::UNDERLINE`] means "some underline". At most one of
+/// [`Style::DOUBLE_UNDERLINE`], [`Style::CURLY_UNDERLINE`],
+/// [`Style::DOTTED_UNDERLINE`] and [`Style::DASHED_UNDERLINE`] accompanies
+/// it and picks the shape; none of them means a single line. Read the shape
+/// with [`Style::underline_style`] and set it with
+/// [`Style::with_underline_style`], which keep that invariant; setting the
+/// bits by hand with [`Style::with`] does not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Style {
     /// Foreground color.
     pub fg: Color,
     /// Background color.
     pub bg: Color,
+    /// Underline color (SGR 58 / 59). [`Color::Default`] draws the
+    /// underline in the foreground colour.
+    pub underline: Color,
     /// Bitwise OR of the `Style::*` flag constants.
     pub flags: u16,
 }
@@ -214,6 +230,7 @@ impl Style {
     pub const DEFAULT: Self = Self {
         fg: Color::Default,
         bg: Color::Default,
+        underline: Color::Default,
         flags: 0,
     };
 
@@ -223,9 +240,10 @@ impl Style {
     pub const DIM: u16 = 1 << 1;
     /// Italic (SGR 3).
     pub const ITALIC: u16 = 1 << 2;
-    /// Underline (SGR 4).
+    /// Some underline (SGR 4, `4:1`..`4:5`, 21); the shape bits below pick
+    /// which. See [`Style::underline_style`].
     pub const UNDERLINE: u16 = 1 << 3;
-    /// Slow blink (SGR 5).
+    /// Blink (SGR 5 and 6).
     pub const BLINK: u16 = 1 << 4;
     /// Reverse video (SGR 7).
     pub const INVERSE: u16 = 1 << 5;
@@ -233,8 +251,62 @@ impl Style {
     pub const HIDDEN: u16 = 1 << 6;
     /// Strikethrough (SGR 9).
     pub const STRIKETHROUGH: u16 = 1 << 7;
-    /// Double underline (SGR 21).
+    /// Double underline (SGR 21, `4:2`); only together with
+    /// [`Style::UNDERLINE`].
     pub const DOUBLE_UNDERLINE: u16 = 1 << 8;
+    /// Curly underline (SGR `4:3`); only together with [`Style::UNDERLINE`].
+    pub const CURLY_UNDERLINE: u16 = 1 << 9;
+    /// Dotted underline (SGR `4:4`); only together with
+    /// [`Style::UNDERLINE`].
+    pub const DOTTED_UNDERLINE: u16 = 1 << 10;
+    /// Dashed underline (SGR `4:5`); only together with
+    /// [`Style::UNDERLINE`].
+    pub const DASHED_UNDERLINE: u16 = 1 << 11;
+    /// Every underline bit: [`Style::UNDERLINE`] and the four shape bits.
+    pub const UNDERLINE_STYLE_MASK: u16 = Self::UNDERLINE
+        | Self::DOUBLE_UNDERLINE
+        | Self::CURLY_UNDERLINE
+        | Self::DOTTED_UNDERLINE
+        | Self::DASHED_UNDERLINE;
+
+    /// The underline shape the flags describe.
+    ///
+    /// Without [`Style::UNDERLINE`] this is [`UnderlineStyle::None`]
+    /// whatever the shape bits say. Should several shape bits be set (only
+    /// possible by setting them by hand), the first of double, curly,
+    /// dotted, dashed wins.
+    pub const fn underline_style(self) -> UnderlineStyle {
+        if !self.has(Self::UNDERLINE) {
+            UnderlineStyle::None
+        } else if self.has(Self::DOUBLE_UNDERLINE) {
+            UnderlineStyle::Double
+        } else if self.has(Self::CURLY_UNDERLINE) {
+            UnderlineStyle::Curly
+        } else if self.has(Self::DOTTED_UNDERLINE) {
+            UnderlineStyle::Dotted
+        } else if self.has(Self::DASHED_UNDERLINE) {
+            UnderlineStyle::Dashed
+        } else {
+            UnderlineStyle::Single
+        }
+    }
+
+    /// Returns a copy with the underline set to `style`: every underline
+    /// bit is cleared, then [`Style::UNDERLINE`] and at most one shape bit
+    /// are set. The underline colour is left alone.
+    #[must_use]
+    pub const fn with_underline_style(self, style: UnderlineStyle) -> Self {
+        let shape = match style {
+            UnderlineStyle::None => return self.without(Self::UNDERLINE_STYLE_MASK),
+            UnderlineStyle::Single => 0,
+            UnderlineStyle::Double => Self::DOUBLE_UNDERLINE,
+            UnderlineStyle::Curly => Self::CURLY_UNDERLINE,
+            UnderlineStyle::Dotted => Self::DOTTED_UNDERLINE,
+            UnderlineStyle::Dashed => Self::DASHED_UNDERLINE,
+        };
+        self.without(Self::UNDERLINE_STYLE_MASK)
+            .with(Self::UNDERLINE | shape)
+    }
 
     /// True when every bit of `flag` is set.
     pub const fn has(self, flag: u16) -> bool {
@@ -254,6 +326,29 @@ impl Style {
         self.flags &= !flag;
         self
     }
+}
+
+/// The shape of a cell's underline, as [`Style::underline_style`] reads it
+/// from the flags.
+///
+/// SGR `4:0`..`4:5` select these in order (kitty's extension); plain SGR 4
+/// is [`UnderlineStyle::Single`], SGR 21 [`UnderlineStyle::Double`] and
+/// SGR 24 [`UnderlineStyle::None`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum UnderlineStyle {
+    /// No underline.
+    #[default]
+    None,
+    /// One straight line.
+    Single,
+    /// Two straight lines.
+    Double,
+    /// A wavy line.
+    Curly,
+    /// A dotted line.
+    Dotted,
+    /// A dashed line.
+    Dashed,
 }
 
 /// A color reference, resolved against the active theme at render time.
@@ -278,8 +373,63 @@ mod tests {
     }
 
     #[test]
-    fn cell_fits_in_16_bytes() {
-        assert!(std::mem::size_of::<Cell>() <= 16);
+    fn cell_is_20_bytes() {
+        assert_eq!(std::mem::size_of::<Cell>(), 20);
+    }
+
+    #[test]
+    fn underline_style_round_trips() {
+        let all = [
+            UnderlineStyle::None,
+            UnderlineStyle::Single,
+            UnderlineStyle::Double,
+            UnderlineStyle::Curly,
+            UnderlineStyle::Dotted,
+            UnderlineStyle::Dashed,
+        ];
+        for from in all {
+            for to in all {
+                let base = Style::DEFAULT.with(Style::BOLD).with_underline_style(from);
+                let style = base.with_underline_style(to);
+                assert_eq!(style.underline_style(), to, "{from:?} -> {to:?}");
+                assert!(style.has(Style::BOLD), "other flags survive");
+                let shapes =
+                    (style.flags & Style::UNDERLINE_STYLE_MASK & !Style::UNDERLINE).count_ones();
+                assert!(shapes <= 1, "{from:?} -> {to:?}: {shapes} shape bits");
+                assert_eq!(
+                    style.has(Style::UNDERLINE),
+                    to != UnderlineStyle::None,
+                    "{from:?} -> {to:?}"
+                );
+            }
+        }
+        // Shape bits without UNDERLINE are no underline at all.
+        assert_eq!(
+            Style::DEFAULT
+                .with(Style::CURLY_UNDERLINE)
+                .underline_style(),
+            UnderlineStyle::None
+        );
+        // Shape bits set by hand, several at once: the first of double,
+        // curly, dotted, dashed wins.
+        let all_shapes = Style::DEFAULT.with(Style::UNDERLINE_STYLE_MASK);
+        assert_eq!(all_shapes.underline_style(), UnderlineStyle::Double);
+        let without = |bits: u16| all_shapes.without(bits).underline_style();
+        assert_eq!(without(Style::DOUBLE_UNDERLINE), UnderlineStyle::Curly);
+        assert_eq!(
+            without(Style::DOUBLE_UNDERLINE | Style::CURLY_UNDERLINE),
+            UnderlineStyle::Dotted
+        );
+        assert_eq!(
+            without(Style::DOUBLE_UNDERLINE | Style::CURLY_UNDERLINE | Style::DOTTED_UNDERLINE),
+            UnderlineStyle::Dashed
+        );
+        // The renderer's bits keep their meaning.
+        assert!(
+            Style::DEFAULT
+                .with_underline_style(UnderlineStyle::Double)
+                .has(Style::UNDERLINE | Style::DOUBLE_UNDERLINE)
+        );
     }
 
     #[test]
@@ -311,15 +461,25 @@ mod tests {
         let pen = Style {
             fg: Color::Indexed(3),
             bg: Color::Rgb(1, 2, 3),
+            underline: Color::Indexed(9),
             flags: Style::BOLD,
         };
         let cell = Cell::blank_with(pen);
         assert_eq!(cell.ch, ' ');
         assert_eq!(cell.style.fg, Color::Default);
         assert_eq!(cell.style.bg, Color::Rgb(1, 2, 3));
+        assert_eq!(cell.style.underline, Color::Default);
         assert_eq!(cell.style.flags, 0);
         assert!(cell.is_blank());
         assert!(!Cell::new('x', Style::DEFAULT).is_blank());
+        let coloured_underline = Style {
+            underline: Color::Indexed(1),
+            ..Style::DEFAULT
+        };
+        assert!(
+            !Cell::new(' ', coloured_underline).is_blank(),
+            "an underline colour is an attribute"
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ mod control;
 mod csi;
 mod esc;
 pub mod keyboard;
+mod sgr;
 
 pub use keyboard::{
     Key, KeyEvent, KeyEventKind, KeyboardModes, KittyFlags, KittyFlagsMode, Modifiers,
@@ -180,14 +181,22 @@ impl State {
     /// every other action (DEL included) clears it once it has been
     /// applied, REP included.
     fn apply(&mut self, action: Action) {
-        let printing = matches!(action, Action::Print(ch) if !ch.is_control());
+        // Printing is the hot path: handle it apart from the sequences so
+        // it never reaches the drop glue of the heap-carrying variants.
+        if let Action::Print(ch) = action {
+            self.print(ch);
+            // Recorded here rather than in `print`, whose early returns
+            // would skip it.
+            self.last_printed = (!ch.is_control()).then_some(ch);
+        } else {
+            self.apply_sequence(action);
+            self.last_printed = None;
+        }
+    }
+
+    /// Applies every action but [`Action::Print`].
+    fn apply_sequence(&mut self, action: Action) {
         match action {
-            Action::Print(ch) => {
-                self.print(ch);
-                // Recorded here rather than in `print`, whose early returns
-                // would skip it. A control character is cleared below.
-                self.last_printed = Some(ch);
-            }
             Action::Execute(byte) => self.execute(byte),
             // The header overflowed the parser's storage: the sequence is
             // incomplete and must not be guessed at.
@@ -196,23 +205,22 @@ impl State {
             }
             Action::Csi {
                 params,
+                subparams,
                 intermediates,
                 action,
                 ..
-            } => self.csi(&params, &intermediates, action),
+            } => self.csi(&params, subparams, &intermediates, action),
             Action::Esc {
                 intermediates,
                 byte,
                 ..
             } => self.esc(&intermediates, byte),
-            ignored @ (Action::Osc(_)
+            ignored @ (Action::Print(_)
+            | Action::Osc(_)
             | Action::DcsStart { .. }
             | Action::DcsData(_)
             | Action::DcsEnd) => trace!(action = ?ignored, "sequence not applied yet"),
             unknown => trace!(action = ?unknown, "unknown action ignored"),
-        }
-        if !printing {
-            self.last_printed = None;
         }
     }
 

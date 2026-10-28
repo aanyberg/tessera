@@ -107,6 +107,7 @@ fn fg_bg(fg: u8, bg: u8) -> Style {
         fg: Color::Indexed(fg),
         bg: Color::Indexed(bg),
         flags: 0,
+        ..Style::DEFAULT
     }
 }
 
@@ -178,6 +179,7 @@ fn screen() -> Vec<Vec<Cell>> {
                 fg: Color::Rgb(255, 160, 0),
                 bg: Color::Rgb(0, 60, 120),
                 flags: 0,
+                ..Style::DEFAULT
             },
         ),
         ("─┼─╮", d),
@@ -619,6 +621,7 @@ fn hidden_cells_draw_only_their_background() {
         fg: Color::Indexed(1),
         bg: Color::Indexed(4),
         flags: Style::HIDDEN | Style::UNDERLINE | Style::STRIKETHROUGH | Style::BOLD,
+        ..Style::DEFAULT
     };
     let hidden = styled("Hi_─\u{1F600}", style);
     let plain: Vec<Cell> = hidden

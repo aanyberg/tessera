@@ -62,6 +62,16 @@ pub enum Action {
     Csi {
         /// Numeric parameters, sub-parameters flattened.
         params: Vec<u16>,
+        /// Which entries of `params` are sub-parameters: bit `i` is set when
+        /// `params[i]` was introduced by `:` rather than `;` (or was first).
+        ///
+        /// `CSI 4:3 m` gives `params == [4, 3]` and `subparams == 0b10`;
+        /// `CSI 38:2::1:2:3 m` gives `[38, 2, 0, 1, 2, 3]` and `0b11_1110`;
+        /// `CSI 1;4:3;5 m` gives `[1, 4, 3, 5]` and `0b100`. A parameter
+        /// whose bit is clear starts a group; the set bits that follow it
+        /// are that group's sub-parameters. `vte` keeps at most 32 entries
+        /// (more set `ignore`), so every entry has a bit.
+        subparams: u32,
         /// Intermediate bytes.
         intermediates: Vec<u8>,
         /// Final byte selecting the command.
@@ -167,6 +177,27 @@ impl Parser {
     }
 }
 
+/// Flattens `vte`'s parameter groups into one list plus the sub-parameter
+/// bitmask described on [`Action::Csi::subparams`].
+fn flatten_params(params: &vte::Params) -> (Vec<u16>, u32) {
+    let mut flat = Vec::with_capacity(params.len());
+    let mut subparams = 0u32;
+    for group in params {
+        if let Some((&head, rest)) = group.split_first() {
+            flat.push(head);
+            for &sub in rest {
+                // `vte` stores at most 32 entries, so the shift never
+                // overflows; `checked_shl` keeps that an assumption rather
+                // than a panic.
+                let index = u32::try_from(flat.len()).unwrap_or(u32::MAX);
+                subparams |= 1u32.checked_shl(index).unwrap_or(0);
+                flat.push(sub);
+            }
+        }
+    }
+    (flat, subparams)
+}
+
 struct Performer<'a> {
     sink: &'a mut dyn FnMut(Action),
     dcs: &'a mut DcsState,
@@ -213,9 +244,10 @@ impl vte::Perform for Performer<'_> {
         ignore: bool,
         action: char,
     ) {
-        let params = params.iter().flatten().copied().collect();
+        let (params, subparams) = flatten_params(params);
         (self.sink)(Action::Csi {
             params,
+            subparams,
             intermediates: intermediates.to_vec(),
             action,
             ignore,
@@ -281,8 +313,13 @@ mod tests {
     }
 
     fn csi(params: &[u16], action: char) -> Action {
+        csi_sub(params, 0, action)
+    }
+
+    fn csi_sub(params: &[u16], subparams: u32, action: char) -> Action {
         Action::Csi {
             params: params.to_vec(),
+            subparams,
             intermediates: vec![],
             action,
             ignore: false,
@@ -303,6 +340,45 @@ mod tests {
             parse(b"a\x1b[2;3Hb"),
             vec![Action::Print('a'), csi(&[2, 3], 'H'), Action::Print('b')]
         );
+    }
+
+    #[test]
+    fn subparams_mark_colon_separated_entries() {
+        assert_eq!(parse(b"\x1b[4:3m"), vec![csi_sub(&[4, 3], 0b10, 'm')]);
+        assert_eq!(
+            parse(b"\x1b[38:2::1:2:3m"),
+            vec![csi_sub(&[38, 2, 0, 1, 2, 3], 0b11_1110, 'm')]
+        );
+        assert_eq!(
+            parse(b"\x1b[1;4:3;5m"),
+            vec![csi_sub(&[1, 4, 3, 5], 0b100, 'm')]
+        );
+        assert_eq!(parse(b"\x1b[m"), vec![csi_sub(&[0], 0, 'm')]);
+    }
+
+    #[test]
+    fn subparams_edge_cases() {
+        // Semicolons only: no bit set.
+        assert_eq!(
+            parse(b"\x1b[38;2;1;2;3m"),
+            vec![csi(&[38, 2, 1, 2, 3], 'm')]
+        );
+        // A leading colon makes an empty head (0) with one sub-parameter.
+        assert_eq!(parse(b"\x1b[:1m"), vec![csi_sub(&[0, 1], 0b10, 'm')]);
+        // An empty sub-parameter slot is 0 and still a sub-parameter.
+        assert_eq!(parse(b"\x1b[4:m"), vec![csi_sub(&[4, 0], 0b10, 'm')]);
+        // A colon inside the tail of a semicolon list.
+        assert_eq!(
+            parse(b"\x1b[38;5:1m"),
+            vec![csi_sub(&[38, 5, 1], 0b100, 'm')]
+        );
+        // The 32nd entry, a sub-parameter, gets bit 31.
+        let mut input = b"\x1b[".to_vec();
+        input.extend(std::iter::repeat_n(b"1;", 30).flatten());
+        input.extend_from_slice(b"4:3m");
+        let mut params = vec![1; 30];
+        params.extend([4, 3]);
+        assert_eq!(parse(&input), vec![csi_sub(&params, 1 << 31, 'm')]);
     }
 
     #[test]

@@ -33,7 +33,7 @@
 //! combining mark, ZWJ, variation selector, skin-tone modifier, a flag's
 //! second regional indicator) joins that cell instead of taking one: the
 //! cell gets [`CellFlags::CLUSTER`] and the line's [`GraphemeTable`]
-//! holds the whole cluster text, so [`Cell`] stays 16 bytes. The width of
+//! holds the whole cluster text, so [`Cell`] stays 20 bytes. The width of
 //! a cluster is the width of its whole text, so a cluster can grow from
 //! one column to two or shrink back. Every primitive keeps wide pairs and
 //! the table consistent: overwriting, erasing, inserting or deleting
@@ -57,7 +57,7 @@ mod line;
 mod scrollback;
 mod tabs;
 
-pub use cell::{Cell, CellFlags, Color, Point, Style};
+pub use cell::{Cell, CellFlags, Color, Point, Style, UnderlineStyle};
 pub use grapheme::{GraphemeTable, MAX_CLUSTER_SCALARS, char_width};
 pub use grid::{DEFAULT_MAX_SCROLLBACK, EraseDisplay, EraseLine, Grid, ScrollRegion};
 pub use line::{Line, Mark};

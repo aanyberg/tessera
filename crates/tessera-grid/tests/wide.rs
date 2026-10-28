@@ -159,9 +159,11 @@ snapshot_rows! {
 
 // ----------------------------------------------------------- direct checks
 
+/// Wide characters and clusters add no bytes to a cell: 20 bytes is the
+/// `char`, the `Style` (with its underline colour, ADR 0013) and `flags`.
 #[test]
-fn cell_is_still_sixteen_bytes() {
-    assert!(size_of::<Cell>() <= 16, "{} bytes", size_of::<Cell>());
+fn cell_is_twenty_bytes() {
+    assert_eq!(size_of::<Cell>(), 20);
 }
 
 #[test]
@@ -171,6 +173,7 @@ fn wide_cell_and_spacer_share_the_whole_style() {
         fg: Color::Indexed(2),
         bg: Color::Rgb(1, 2, 3),
         flags: Style::BOLD | Style::UNDERLINE,
+        ..Style::DEFAULT
     };
     grid.set_pen(pen);
     grid.put_str("中🇸🇪");
