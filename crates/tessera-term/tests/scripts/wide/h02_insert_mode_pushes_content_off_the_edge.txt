@@ -1,0 +1,6 @@
+# Fixture case H02_insert_mode_pushes_content_off_the_edge (crates/tessera-grid/tests/fixtures/wide_grapheme_spec.txt).
+# d and e are lost; a b c shift to columns 2..4.
+@size 2x5
+abcde\r
+@set insert_mode true
+中

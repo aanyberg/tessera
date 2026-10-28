@@ -1,0 +1,5 @@
+# Fixture case H18_decawm_off_three_column_scalar_at_the_last_column_is_dropped (crates/tessera-grid/tests/fixtures/wide_grapheme_spec.txt).
+# Added in verification of #4. With the width clamped to 2 the scalar is a wide character with one column left: dropped, no wrap and no scroll on the bottom (only) row.
+@size 1x4
+@set auto_wrap false
+abc៘

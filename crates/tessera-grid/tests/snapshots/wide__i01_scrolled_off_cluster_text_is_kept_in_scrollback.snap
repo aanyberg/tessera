@@ -1,0 +1,14 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: "Row 0 scrolls out. scrollback_line(0).text() must be 'e'+U+0301+'中' (spacer skipped), not 'e中 '."
+---
+cells:
+>. . . .
+>. . . .
+cursor: (1,0)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=1 first=("e\u{301}中", wrapped=false)
+text:
+>
+>

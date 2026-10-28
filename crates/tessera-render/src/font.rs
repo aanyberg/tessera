@@ -1189,6 +1189,10 @@ fn first_monospace_family(db: &fontdb::Database) -> Option<String> {
 /// Characters whose default presentation is emoji: they try
 /// [`EMOJI_FAMILY`] before the system fallbacks so a monochrome symbol font
 /// does not win.
+///
+/// These are the wide (per `unicode-width`) pictographs of the symbol and
+/// emoji blocks; text-presentation pictographs such as U+263A or U+1F321
+/// are one column wide and stay with the text fonts.
 pub(crate) fn prefers_emoji(ch: char) -> bool {
     let c = u32::from(ch);
     crate::shaping::is_wide(ch) && (c >= 0x1_F000 || (0x2300..=0x2BFF).contains(&c))

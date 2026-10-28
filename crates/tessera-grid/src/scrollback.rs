@@ -17,16 +17,22 @@
 //! | item | bytes |
 //! |---|---|
 //! | `size_of::<Cell>()` | 16 |
-//! | `size_of::<Line>()` (the ring slot: two `Vec` headers and a flag) | 56 |
+//! | `size_of::<Line>()` (the ring slot: two `Vec` headers, the grapheme table pointer and a flag) | 64 |
 //! | heap for `cells` of an 80-column line (`80 × 16`, allocated exactly) | 1 280 |
-//! | **one 80-column line, total** | **1 336** |
+//! | **one 80-column line, total** | **1 344** |
 //!
-//! That is 13 360 000 bytes (≈ 12.7 MiB) for the default 10 000 lines and
-//! 1 336 000 000 bytes (≈ 1 274 MiB) for 1 000 000 lines. Lines without
-//! marks carry no `marks` heap allocation. Allocator rounding adds nothing
-//! here: on macOS 26.6 `malloc_size` reports exactly 1 280 bytes for a
-//! 1 280-byte request (and for an 80-cell `Vec<Cell>`). Wider lines scale
-//! linearly with the column count; a larger [`Cell`] scales the heap part.
+//! That is 13 440 000 bytes (≈ 12.8 MiB) for the default 10 000 lines and
+//! 1 344 000 000 bytes (≈ 1 282 MiB) for 1 000 000 lines. Lines without
+//! marks carry no `marks` heap allocation, and lines without grapheme
+//! clusters (combining marks, emoji sequences) no table allocation. A line
+//! with clusters adds, per cluster, its text (at most 32 scalars, so at
+//! most 128 bytes) and a 24-byte table entry; the table is shrunk to fit
+//! when the line scrolls off. The worst case, an 80-column line of nothing
+//! but full clusters, is about 13.5 KB, ten times a plain line.
+//! Allocator rounding adds nothing here: on macOS 26.6 `malloc_size`
+//! reports exactly 1 280 bytes for a 1 280-byte request (and for an
+//! 80-cell `Vec<Cell>`). Wider lines scale linearly with the column count;
+//! a larger [`Cell`] scales the heap part.
 //!
 //! `terminal.scrollback_lines` in `tessera-config` defaults to 10 000 and is
 //! capped at 10 000 000 on load.

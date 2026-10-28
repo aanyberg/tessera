@@ -1,0 +1,14 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: "Two wide chars fill 4 columns: cursor stays on the LAST column (the spacer) with pending_wrap armed, row not wrapped yet."
+---
+cells:
+>中/W ~ 文/W ~
+>. . . .
+cursor: (0,3)
+pending_wrap: true
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>中文
+>

@@ -1,0 +1,5 @@
+# Fixture case H12_decawm_off_mark_with_pending_attaches_to_last_cell (crates/tessera-grid/tests/fixtures/wide_grapheme_spec.txt).
+# TRAP. The existing print() does goto(row, cols-1) whenever pending && !auto_wrap, which clears pending; a following mark would then attach to 'd' (column 3) instead of 'e'. Zero-width attach must happen BEFORE that goto. Expected: e+0301, pending stays armed.
+@size 3x5
+@set auto_wrap false
+abcde\u{301}

@@ -1,0 +1,12 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: "中 at 3..4 shifts one to the right: its spacer falls off the line, so the base that lands in the last column is blanked."
+---
+cells:
+>. a b c .
+cursor: (0,0)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+> abc

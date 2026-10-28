@@ -1,0 +1,3305 @@
+# =============================================================================
+# tessera-grid: wide characters, grapheme clusters, zero-width handling
+#                 (issue #4, wave 3, milestone 0.1.0)
+# crates/tessera-grid/tests/fixtures/wide_grapheme_spec.txt
+#
+# Evidence file for the implementer and the critic. Every row cites its source.
+# It is test DATA, not a test: crates/tessera-grid/tests/wide.rs (layer: grid,
+# layer: width) and crates/tessera-term/tests/wide.rs (layer: term) are written
+# from it, same pattern as print.rs::fixture_cases_hold.
+#
+# HOW THE EXPECTED VALUES WERE PRODUCED
+#   A throw-away Rust reference model (not committed) of the RECOMMENDED
+#   algorithm below, linked against the exact crates in Cargo.lock:
+#     unicode-width        0.2.2   (UNICODE_VERSION 17.0.0)  default features (cjk on,
+#                                                             only width() is used)
+#     unicode-segmentation 1.13.3  (UNICODE_VERSION 17.0.0)  graphemes(true)
+#   The model asserts these invariants after every row (see INVARIANTS): paired
+#   WIDE/SPACER, no CLUSTER on a spacer, cursor in bounds, pending_wrap only on the
+#   last column. Every `cells:` block below was then read through by hand against
+#   the rule cited on its row. `width` rows (section A) are raw library output, not
+#   model output.
+#   The sources were READ, not run: xterm, kitty, Alacritty and WezTerm behaviour is
+#   quoted from their source (fetched 2026-10-27, master/main). No emulator was
+#   executed, so "xterm does X" below means "charproc.c / screen.c / util.c say X".
+#
+# PRIMARY SOURCES (short tags used in `cite:` lines)
+#   UAX11   https://www.unicode.org/reports/tr11/      EastAsianWidth: sec 4 (properties),
+#                                                      sec 5 (F, W => 2 cells; Na, H, N => 1;
+#                                                      A => 1 outside an East Asian context)
+#   UAX29   https://www.unicode.org/reports/tr29/      sec 3.1.1 Grapheme Cluster Boundary
+#                                                      Rules GB1..GB999 (GB4/5 controls, GB6-8
+#                                                      Hangul, GB9 Extend|ZWJ, GB9a SpacingMark,
+#                                                      GB9b Prepend, GB9c Indic conjunct,
+#                                                      GB11 emoji ZWJ, GB12/13 RI pairs).
+#                                                      Emoji_Modifier is GCB=Extend (Table 2).
+#   UTS51   https://www.unicode.org/reports/tr51/      1.4.2 ED-6 Emoji_Presentation; 1.4.3
+#                                                      ED-8a text / ED-9a emoji presentation
+#                                                      sequences (VS15 / VS16); 1.4.4 ED-12 modifier
+#                                                      base, ED-13 modifier sequence; 1.4.5 ED-14
+#                                                      flag, ED-14a tag, ED-14c keycap, ED-16 ZWJ
+#                                                      sequence; 2.4 (a modifier after a non-base is
+#                                                      free-standing); 2.5 (ZWJ fallback); 4.1
+#   UW      unicode-width 0.2.2 src/lib.rs "Rules for determining width", rule numbers
+#                                                      1 (string ligatures: emoji ZWJ, modifier,
+#                                                      presentation sequences, scripts) and 2.1-2.7
+#                                                      (char sums; 2.4 zero width; 2.5 F/W = 2;
+#                                                      2.7 everything else 1)
+#                   ~/.cargo/registry/src/*/unicode-width-0.2.2/src/lib.rs
+#   XT      https://github.com/ThomasDickey/xterm-snapshots (master)
+#                   charproc.c  doparsing() zero-width block (combining attaches to the
+#                               last written cell, else the cursor cell), dotext() (width
+#                               accounting, WrapLine, DECAWM off), WrapLine()
+#                   screen.c    ScrnWriteText() (overwriting half a wide char blanks the other
+#                               half), ClearCells() (erase widens to whole wide chars),
+#                               ScrnInsertChar()/ScrnDeleteChar() (DamagedCells + ClearCells)
+#                   util.c      addXtermCombining() under OPT_EMOJI_WIDTH (VS15 shrink /
+#                               VS16 increase base), WriteText() (INSERT => InsertChar)
+#                   ptyx.h      ResetWrap() (cursor motion clears char_was_written)
+#   KT      https://github.com/kovidgoyal/kitty/blob/master/kitty/screen.c
+#                   draw_text_loop(), draw_combining_char(), widen_cell_to_two()
+#   WZ      https://github.com/wezterm/wezterm/blob/main/term/src/terminalstate/performer.rs
+#                   flush_print() (grapheme segmentation, zero-width elision, wrap_next)
+#   AL      https://github.com/alacritty/alacritty/blob/master/alacritty_terminal/src/term/mod.rs
+#                   input() (zerowidth, LEADING_WIDE_CHAR_SPACER, WIDE_CHAR_SPACER),
+#                   write_at_cursor() (clears the other half)
+#   VT510   https://vt100.net/docs/vt510-rm/IRM.html  and  .../DECAWM.html
+#   brief   the wave-3 brief for #4 ("brief dd N" = its Design decision N)
+#   print_c0_spec  crates/tessera-term/tests/fixtures/print_c0_spec.txt (issue #5)
+#
+# ----------------------------------------------------------------------------
+# ROW SYNTAX
+#   A row starts with `### <ID>_<name>` and ends at the next `###` (comment lines that
+#   start with `# ---` between rows are section headers; skip every line starting with '#').
+#   Keys: `layer:` `size: RxC` (rows x cols, as in print_c0_spec) `step:` (repeatable, in
+#   order) `input:` (width rows) `cite:` `note:` `flags:` and the result keys below.
+#
+#   layer: width   input -> char_widths / str_width / grapheme_scalar_counts, the raw
+#                  library answers. Assert them with UnicodeWidthChar::width (none => None),
+#                  UnicodeWidthStr::width and UnicodeSegmentation::graphemes(s, true)
+#                  (scalar count of each grapheme). These pin the library version: a
+#                  failing width row after a dependency bump is the point of the row.
+#   layer: grid    steps drive tessera_grid::Grid directly (DECAWM is implicitly on, there
+#                  is no insert mode at this layer).
+#   layer: term    steps drive tessera_term::Terminal (tests/wide.rs in tessera-term; the
+#                  result is read back from terminal.grid()).
+#
+#   Payload escapes (put / feed / feed_bytewise):
+#       \u{H..}  one scalar     \\  backslash     \r  CR     \n  LF (term layer only)
+#   House rule of this file: a zero-width scalar (UnicodeWidthChar::width == Some(0)) is
+#   ALWAYS written \u{..}; everything else is literal. A decoder must panic on any other
+#   escape so typos cannot hide.
+#
+#   Grid steps (-> API)
+#     put <payload>        Grid::put_str / put_char per scalar
+#     goto R C             Grid::goto (0-based, clamps, clears pending_wrap)
+#     cr / lf              Grid::carriage_return / Grid::line_feed (LF keeps the column)
+#     ich N / dch N / ech N      insert_chars / delete_chars / erase_chars
+#     el to_end|to_start|all     erase_in_line(EraseLine::ToEnd|ToStart|All)
+#     ed below|above|all         erase_in_display(Below|Above|All)
+#     pen_bg N|none        set the pen to Style { bg: Color::Indexed(N), ..DEFAULT } (none =
+#                          back to the default pen); fg/flags stay default
+#     reset                Grid::reset
+#   Term steps (-> API)
+#     feed <payload>       one Terminal::advance call with the payload's UTF-8 bytes
+#     feed_bytewise <p>    one advance call PER BYTE (chunk independence)
+#     set auto_wrap true|false / set insert_mode true|false    Terminal::set_*
+#   The term layer also uses the grid-layer results format; `\r` and `\n` are the only
+#   controls that occur.
+#
+#   RESULT BLOCK (state after the last step)
+#     cells:               one `>` line per grid row (the `>` is not part of the line).
+#                          Cells are separated by exactly one space. A cell is a token:
+#                            .            blank: ' ', no flags, no table entry
+#                            ~            SPACER (right half of a wide cell)
+#                            X            plain cell, literal char (no flags)
+#                            X/W          WIDE base (a SPACER follows in the next column)
+#                            X+HHHH+HHHH/C   or  /WC   CLUSTER: base char X, then the further
+#                                         scalars of Line::cluster(col) as 4+ digit hex.
+#                                         Line::cluster(col) is Some(X + the scalars) exactly
+#                                         at these columns and None everywhere else (incl.
+#                                         spacers).
+#                            U+00A0       a whitespace base is written as U+HHHH, and so is a
+#                                         width-1 Prepend format character (U+0600..0604,
+#                                         U+06DD, U+110BD, U+110CD)
+#                          A trailing `@N` means the cell's bg is Color::Indexed(N); no `@`
+#                          means bg Default. Only bg is rendered: fg/attrs are default in every
+#                          row. Separately assert, in a styled unit test, that a WIDE cell and
+#                          its SPACER have equal Style (brief dd2: the spacer carries the whole
+#                          Style, not just the bg).
+#     cursor: (r,c)        0-based Grid::cursor() ; the issue text quotes 1-based
+#     pending_wrap: b      Grid::pending_wrap()
+#     wrapped_rows(0-based): [..]    rows whose Line::wrapped is true (NOTE: 0-based here,
+#                          1-based in print_c0_spec)
+#     scrollback: len=N [first=("text", wrapped=b)]   Grid::scrollback_len(), scrollback_line(0)
+#     text:                one `>` line per row = Line::text() with width-0 scalars and
+#                          non-space whitespace written \u{..}. Line::text() emits cluster text,
+#                          SKIPS spacers, and trims trailing blanks (a blank is a plain ' '
+#                          cell; a spacer or a CLUSTER cell is never trailing-blank).
+#
+# ----------------------------------------------------------------------------
+# RECOMMENDED SEMANTICS (what the model implements; D-numbers are explained below)
+#
+#   Cell model     Cell { ch, style, flags: WIDE | SPACER | CLUSTER } ; Line::graphemes maps
+#                  column -> full cluster text (base included) iff CLUSTER. A CLUSTER entry
+#                  always has >= 2 scalars (a lone scalar is a plain cell). WIDE at c <=> SPACER
+#                  at c+1. The pair never straddles the end of a line. A base is never ' '
+#                  (see the attach gate) so a CLUSTER cell is never blank. "blank" below means
+#                  Cell::blank_with(pen): ' ', default fg, bg = pen.bg, no flags, no entry.
+#                  Recommended: Cell::is_blank is true only for a plain blank (no flags).
+#
+#   put_char(ch)   w = UnicodeWidthChar::width(ch); None => return (controls).
+#     1. ATTACH   if plan_attach(ch) succeeds, apply it and return.            (D4 D7)
+#     2. if w == 0: drop it, return.                                           (D5)
+#     3. NEW CELL
+#          w == 2: if cols < 2 drop it (a wide char never fits a 1-column grid; no loop).
+#                  if pending_wrap: wrap.
+#                  else if cursor.col == cols-1 (one column left): blank the last column
+#                  (split rule first) and wrap.                                 (D1)
+#                  then split-fix both columns, write WIDE at c and SPACER at c+1 (SPACER has
+#                  the same Style as the base), advance 2; if that reaches the line end the
+#                  cursor stays on the last column with pending_wrap armed.
+#          w == 1: if pending_wrap: wrap. split-fix, write, advance 1 (existing behaviour).
+#        wrap = mark the row `wrapped`, CR, line_feed (scrolling at the bottom of the region).
+#        split-fix(c), run before cell c is overwritten: if cell c is WIDE blank c+1; if cell
+#        c is a SPACER blank c-1. An overwritten cell loses its CLUSTER entry.
+#
+#   plan_attach(ch)   (pure; this is the Grid::would_attach query, D8)
+#        b  = pending_wrap ? cursor.col : cursor.col-1   (no left cell => no attach)
+#        if cell b is a SPACER: b -= 1                  (the base of the wide cell)
+#        fail if cell b is ' '                           (D7: blanks never take a scalar)
+#        old = Line::cluster(b) or the base char ;  fail if old has >= 32 scalars   (D6)
+#        new = old + ch
+#        fail if unicode_segmentation::graphemes(new, true).count() != 1   (UAX29)
+#        raw = UnicodeWidthStr::width(new)
+#        fail if raw > 2 and old does NOT contain U+200D         (D4: after a ZWJ any width is ok)
+#        nw = clamp(raw, 1, 2) ;  ow = cell b is WIDE ? 2 : 1
+#        fail if nw > ow and b+1 >= cols                      (D3: no room to grow)
+#      apply: cluster text := new (CLUSTER set; column b is the key).
+#        nw > ow (grow):  split-fix(b+1); b becomes WIDE; b+1 becomes SPACER (Style of b);
+#                         cursor := b+2, or the last column with pending_wrap armed if b+2 == cols.
+#        nw < ow (shrink): b loses WIDE; b+1 becomes a blank (pen bg); cursor := b+1,
+#                         pending_wrap := false.
+#        nw == ow: nothing moves (cursor and pending_wrap unchanged).
+#
+#   Edits (all clear pending_wrap, like the existing grid; "blank" = pen background)
+#     left boundary L of a range (first erased/deleted cell): if cell L is a SPACER blank L-1.
+#     right boundary R (last erased cell): if cell R is WIDE blank R+1.
+#     ECH(n) [c,c+n): left(c) + right(c+n-1) then blank the range.
+#     EL to_end [c,cols): left(c).   EL to_start [0,c]: right(c).   EL all / ED: whole lines.
+#     DCH(n): left(c); shift left (cluster entries move with their cells); the cell that lands in
+#             column c, if a SPACER, is blanked (its base was deleted); pad the tail with blanks.
+#     ICH(n): left(c); shift right (entries move); the cell that lands in column c+n, if a
+#             SPACER, is blanked; if the last column now holds a WIDE base, blank it (its
+#             spacer fell off the line); the n inserted cells are blanks.
+#
+#   tessera-term State::print (layer: term), recommended order; this is everything the term
+#   must add on top of the grid:
+#        if ch.is_control(): drop                                  (existing)
+#        if grid.would_attach(ch): grid.put_char(ch); return       (NO wrap, NO goto, NO insert)
+#        w = width(ch); if w == 0: return ; if w == 2 && cols < 2: return
+#        if !auto_wrap:
+#            if pending_wrap: grid.goto(row, cols-1)               (existing)
+#            if w == 2 && cursor.col == cols-1: return             (D2)
+#        else if insert_mode && (pending_wrap || (w == 2 && cursor.col == cols-1)):
+#            if !pending_wrap: grid.erase_chars(1)                 (D1: blank the stranded column)
+#            wrap_line()                                           (existing)
+#        if insert_mode: grid.insert_chars(w)
+#        grid.put_char(ch)
+#
+# ----------------------------------------------------------------------------
+# DECISIONS FOR THE MILESTONE LEAD (recommended option first)
+#   D1  Wide char with one column left, DECAWM on (C01-C06, C15, H04).
+#       Recommend: blank the stranded last column with the PEN background, mark the row
+#       wrapped, write on the next row (Alacritty LEADING_WIDE_CHAR_SPACER). The brief says
+#       this is xterm: it is not, xterm leaves the stranded cell untouched (dotext() just
+#       WrapLines). Blanking matters because the cell would otherwise be copied out as part of
+#       the wrapped line (C04, C05). Needs no DECAWM knowledge in the grid. Alternative:
+#       leave it untouched (xterm, kitty).
+#   D2  Wide char with one column left (or pending), DECAWM OFF (C07-C11, C16).
+#       Recommend: drop the character, change nothing, pending_wrap cleared (xterm + Alacritty
+#       drop). Alternative: kitty moves the char left to cols-2 and overwrites. NOT the brief's
+#       hypothesis "overwrite the last column with a blank": nothing in xterm does that.
+#       The grid never sees this case: it is decided in State::print (it owns DECAWM).
+#   D3  Cluster GROWTH (1 -> 2: RI pair, VS16, SpacingMark; D03, D07-D13, D34).
+#       Recommend: (a) if column b+1 exists, the SPACER is written over whatever is in b+1 (a
+#       left-half there orphans its spacer, D08); text to the right is NEVER shifted, not even in
+#       insert mode (H08 documents the one-cell loss). (b) if the base is in the LAST column
+#       there is no room: the scalar is NOT attached; a zero-width one is dropped (D13), a
+#       width-1 one (the 2nd RI) is an ordinary char (D10, H14, H15). No relocation of the base,
+#       so the grid needs no DECAWM knowledge and no scrolling inside attach.
+#       Alternatives: kitty relocates the whole cluster to the next row; xterm (OPT_EMOJI_WIDTH)
+#       blanks the BASE ("disallow wrapping via VS16") and, reading `cur_col < max_col`, also
+#       refuses when the filler would land in the last column (looks like an off-by-one,
+#       D09 expects the opposite); attach-without-growth (keeps the VS16 in copied text).
+#       SHRINK (2 -> 1: VS15 on a wide emoji; D16, D17): base loses WIDE, old spacer becomes a
+#       blank, cursor moves to b+1, pending cleared (kitty halve_multicell_width, xterm 'shrink').
+#   D4  ATTACH GATE for a scalar with width > 0 or a width change. UAX29 alone is not enough:
+#       a + U+1F3FD is ONE grapheme of width 3, hangul L+L one grapheme of width 4, and the
+#       transient prefix woman+ZWJ+heart (before the VS16) is width 3 while the finished
+#       sequence is 2. Recommend: attach iff (single UAX29 grapheme) AND (raw width <= 2 OR the
+#       cluster already contains a ZWJ); cell width = clamp(raw, 1, 2). Consequences: a modifier
+#       after a non-base, a 2nd modifier, a modifier after a wide non-base and L+L jamo are NOT
+#       attached and become their own cells (D24, D26, D27, D32); every RGI ZWJ sequence stays 2
+#       cells (D02, D20, D21). Alternatives: pure UAX29 (3 or 4 columns of content in 2 cells), or
+#       xterm/Alacritty style "only width-0 scalars attach" (skin tones, flags, ZWJ joins become
+#       separate cells).
+#   D5  A zero-width scalar that does not attach is DROPPED: nothing to its left (column 0, also
+#       after CR or a soft wrap: E05-E07), blank left cell (E12, E13), GCB=Control format
+#       characters ZWSP / WJ / BOM / SHY (E16, E18), refused by the gate (E21, D13), lone jungseong
+#       filler. Only the width-1 Prepend characters (U+0600..0604, U+06DD, U+110BD, U+110CD)
+#       take a cell, and under GB9b they join whatever scalar follows, a space included, into a
+#       2-column cluster (D36, library-derived; column sums still match the library). The
+#       width-0 ones (U+0605, U+070F, U+0890..0891, U+08E2, U+0D4E, U+111C2..111C3, U+113D1,
+#       U+1193F, U+11941, U+11A84..11A89, U+11D46, U+11F02) are dropped like any zero-width
+#       scalar that does not attach.
+#   D6  Cluster size cap: 32 scalars per cluster text (E21). Longest RGI sequence is 10 scalars;
+#       xterm caps combining characters at 2 by default (max 5). Pick any cap, but pick one:
+#       Zalgo text must not grow a line's table without bound.
+#   D7  Attach TARGET. Recommend: the cell left of the cursor (the cell under the cursor when
+#       pending_wrap is armed), resolved through a SPACER to its base, and only if it is not ' '.
+#       No last-written memory, never the previous row. Costs: SPACE + mark loses the mark (E13;
+#       NBSP + mark works, E14) and a mark after cursor motion over text attaches to the text
+#       left of the cursor (E15). kitty and WezTerm drop marks after any cursor motion; xterm
+#       attaches to the cell AT the cursor; Alacritty to the cursor cell/left cell and at column 0
+#       even to cell (0,0). The brief's "previous row's last column when the row is wrapped"
+#       (dd4) is NOT recommended (E07).
+#   D8  API gap: State::print needs a pure query `Grid::would_attach(ch) -> bool` (or the
+#       equivalent) because insert / wrap / goto must be skipped for attaching scalars. Three
+#       traps in the existing print(): H05 (modifier is width 2 but attaches: insert_chars(2) opens
+#       a gap), H07 (insert_mode && pending_wrap wraps for ANY char, including a mark), H12
+#       (!auto_wrap && pending_wrap does goto(last col), which clears pending and redirects the
+#       mark to column cols-2). The brief's public_api list has no such method.
+#   D9  VS15/VS16 on a base that is not an emoji (D14): recommend attach, width unchanged
+#       (UAX29 GB9, kitty). xterm DROPS the selector unless the base is an emoji (mk_is_emoji).
+#
+# ----------------------------------------------------------------------------
+# ISSUE TEXT CORRECTIONS (verified against source)
+#   1. brief dd6: "wrap first, leaving the last column blank with the pen background (xterm)".
+#      xterm does not blank it (charproc.c dotext(): width_here 2 > width_available 1, no write,
+#      WrapLine() sets LINEWRAPPED and indexes). Blanking is Alacritty's behaviour. Recommended
+#      anyway (D1).
+#   2. brief dd6 "DECAWM off -> xterm overwrites the last column with a blank and drops the
+#      character... verify". Verified: xterm drops the wide char and writes nothing. But note
+#      xterm's dotext() works on a whole buffer: with DECAWM off it copies the buffer's LAST
+#      character into the last column (`buf[chars_chomped + offset - 1] = buf[len - 1]`), so
+#      "abcd中X" delivered in one write gives "abcX" in xterm and "abcdX" per-character. The
+#      fixture (C07-C11, C16) follows the per-character model; xterm is not an oracle beyond
+#      "the wide char is not written".
+#   3. brief Risks: "unicode-width 0.2 treats ... RI pairs as 2". Only for the STRING. A single
+#      regional indicator is width 1 (EAW=N, no special rule), so every flag is a 1 -> 2 growth
+#      case (A13, D03) and a lone RI is a narrow cell (D04). The same applies to ASCII + VS16
+#      (keycaps, A25) and SpacingMarks (A29).
+#   4. brief dd3/dd4 "a scalar that, appended to the cluster ..., forms a single grapheme per UAX
+#      #29 attaches" is necessary but not sufficient: see D4 (width gate), D5 (what happens to a
+#      zero-width scalar that does not attach), D3 (growth room), D8 (the term needs the query).
+#   5. The brief lists xterm charproc.c as the wide-character reference. xterm handles combining
+#      (width-0) characters and, with OPT_EMOJI_WIDTH, VS15/VS16, but never clusters ZWJ
+#      sequences, skin tones or regional indicators: those scalars get cells of their own. Rows
+#      D01-D03, D20-D22, D24-D27 are therefore kitty / WezTerm / UAX29 / unicode-width driven, not
+#      xterm driven. WezTerm clusters whole print batches (Graphemes::new over the buffered
+#      text), so it is not an incremental oracle either; kitty is (grapheme_segmentation_step).
+#   6. UnicodeWidthStr::width counts each C0/C1 control as width 1 while UnicodeWidthChar::width is
+#      None for it (A15). Only the char API may be used to decide "ignore this scalar".
+#   7. Width is NOT the EastAsianWidth property alone: U+1160 and U+11A8.. are EAW=W/N but width
+#      0 (Hangul V/T jamo), U+115F is 2, U+0600 (Prepend) is 1, U+00AD is 0 (UW 0.2.2 rules 2.1-
+#      2.7). Always call the crate.
+#   8. Unchecked: the brief's claim that the old render WIDE table mis-classifies 245 code
+#      points. It concerns tessera-render, not this fixture.
+#
+# ----------------------------------------------------------------------------
+# INVARIANTS for a proptest (the existing bounds.rs strategy plus put of arbitrary chars,
+# ZWJ, VS15/16, marks, modifiers, RIs, ich/dch/ech/el/ed, scroll, goto)
+#   I1  every WIDE cell at column c has c+1 < cols and a SPACER at c+1.
+#   I2  every SPACER at c has c > 0 and a WIDE cell at c-1.
+#   I3  graphemes keys == { c : cell c has CLUSTER }; each entry has 2..=32 scalars; a SPACER
+#       never has CLUSTER; entry[0] == cell.ch.
+#   I4  no scalar is lost or duplicated by attach: for a lone put_str of a single grapheme the
+#       concatenated Line::text() equals the input (modulo dropped zero-width scalars).
+#   I5  cursor.col < cols, cursor.row < rows; pending_wrap implies cursor.col == cols-1.
+#   I6  Line::text() contains no U+0020 produced by a SPACER, and its display width
+#       (sum of UnicodeWidthStr over clusters) never exceeds cols.
+#   I7  feeding a payload in one advance() or one byte per advance() gives identical grid state.
+# =============================================================================
+
+
+# ---------------------------------------------------------------- A. Widths (library facts the grid must reproduce)
+
+### A01_cjk_ideograph_is_wide
+layer: width
+input: 中
+cite: UAX11 sec 5 (EastAsianWidth W => 2 cells); UW 0.2.2 rules 2.5
+char_widths: [2]
+str_width: 2
+grapheme_scalar_counts: [1]
+
+### A02_fullwidth_latin_is_wide
+layer: width
+input: Ａ
+cite: UAX11 sec 5 (EAW=F => 2 cells); UW 0.2.2 rules 2.5
+char_widths: [2]
+str_width: 2
+grapheme_scalar_counts: [1]
+
+### A03_halfwidth_katakana_is_narrow
+layer: width
+input: ｱ
+cite: UAX11 sec 5 (EAW=H => 1 cell); UW 0.2.2 rules 2.7
+char_widths: [1]
+str_width: 1
+grapheme_scalar_counts: [1]
+
+### A04_hangul_syllable_is_wide
+layer: width
+input: 한
+cite: UAX11 sec 5 (EAW=W); UW 0.2.2 rules 2.5
+char_widths: [2]
+str_width: 2
+grapheme_scalar_counts: [1]
+
+### A05_hangul_conjoining_jamo_L_V_T
+layer: width
+input: ᄒ\u{1161}\u{11AB}
+cite: UAX11 (L jamo EAW=W); UW 0.2.2 rules 2.4 (Hangul_Syllable_Type V and T are width 0); UAX29 GB6/GB7/GB8 (one grapheme)
+note: Leading jamo is 2 cells, vowel and trailing jamo add 0: the three scalars are one 2-cell grapheme.
+char_widths: [2, 0, 0]
+str_width: 2
+grapheme_scalar_counts: [3]
+
+### A06_supplementary_plane_cjk
+layer: width
+input: 𠀀
+cite: UAX11 sec 5 (EAW=W for CJK Ext B); UW 0.2.2 rules 2.5
+char_widths: [2]
+str_width: 2
+grapheme_scalar_counts: [1]
+
+### A07_emoji_presentation_default_is_wide
+layer: width
+input: 😀
+cite: UAX11 (EAW=W); UTS51 ED-6 (Emoji_Presentation); UW 0.2.2 rules 2.5
+char_widths: [2]
+str_width: 2
+grapheme_scalar_counts: [1]
+
+### A08_text_default_pictographs_are_narrow
+layer: width
+input: ☺❤
+cite: UAX11 (EAW=N for U+263A and U+2764); UTS51 1.4.2 (text presentation by default); UW 0.2.2 rules 2.7
+char_widths: [1, 1]
+str_width: 2
+grapheme_scalar_counts: [1, 1]
+
+### A09_watch_is_wide_by_default
+layer: width
+input: ⌚
+cite: UAX11 (EAW=W for U+231A); UTS51 ED-6; UW 0.2.2 rules 2.5
+char_widths: [2]
+str_width: 2
+grapheme_scalar_counts: [1]
+
+### A10_ambiguous_is_narrow_outside_east_asian_context
+layer: width
+input: ¡★
+cite: UAX11 sec 4.2/5 (A resolves to narrow outside an East Asian context); UW 0.2.2 rules 2.6 (width() is the non-CJK variant)
+char_widths: [1, 1]
+str_width: 2
+grapheme_scalar_counts: [1, 1]
+
+### A11_combining_and_joiners_are_zero_width
+layer: width
+input: \u{301}\u{200D}\u{200C}\u{FE0E}\u{FE0F}\u{20E3}\u{E0067}\u{3099}
+cite: UW 0.2.2 rules 2.4 (Default_Ignorable and Grapheme_Extend are width 0); UAX29 Extend/ZWJ
+note: Acute, ZWJ, ZWNJ, VS15, VS16, keycap U+20E3, tag letter g, voiced-sound mark. A grid never gives any of these a cell of its own.
+char_widths: [0, 0, 0, 0, 0, 0, 0, 0]
+str_width: 0
+grapheme_scalar_counts: [8]
+
+### A12_format_controls_are_zero_width_but_not_extend
+layer: width
+input: \u{200B}\u{2060}\u{FEFF}\u{AD}
+cite: UW 0.2.2 rules 2.4; UAX29 GB4/GB5 (these are GCB=Control, so they never join a cluster)
+note: ZWSP, WORD JOINER, ZWNBSP/BOM, SOFT HYPHEN. Width 0 AND a grapheme break on both sides: nothing can be attached to or hidden in them. Recommended: dropped (D5).
+char_widths: [0, 0, 0, 0]
+str_width: 0
+grapheme_scalar_counts: [1, 1, 1, 1]
+
+### A13_regional_indicator_is_one_cell_pair_is_two
+layer: width
+input: 🇸🇪
+cite: UW 0.2.2 rules 2.7 (no RI special case: each RI is EAW=N, width 1; the pair is the plain sum 2); UAX29 GB12/GB13
+note: The brief says unicode-width "treats RI pairs as 2". True for the string, but a lone RI is 1 cell, so EVERY flag is a 1 -> 2 cluster growth case.
+char_widths: [1, 1]
+str_width: 2
+grapheme_scalar_counts: [2]
+
+### A14_emoji_modifier_alone_is_wide
+layer: width
+input: 🏽
+cite: UAX11 (EAW=W for U+1F3FB..1F3FF); UTS51 ED-12 (Emoji_Modifier); UW 0.2.2 rules 2.5
+char_widths: [2]
+str_width: 2
+grapheme_scalar_counts: [1]
+
+### A15_controls_have_no_width
+layer: width
+input: \u{0}\u{7F}\u{85}\u{1B}
+cite: UW 0.2.2 (UnicodeWidthChar::width returns None for C0/DEL/C1 controls); tessera-term State::print drops is_control() scalars before the grid sees them
+note: char_widths is none for each control, BUT str_width counts each control as 1 (unicode-width quirk: UnicodeWidthStr::width("\0") == 1). Never feed a control through the string API; the grid must ignore a None-width scalar (return without side effects) rather than unwrap.
+char_widths: [none, none, none, none]
+str_width: 4
+grapheme_scalar_counts: [1, 1, 1, 1]
+
+### A16_nbsp_is_one_cell
+layer: width
+input: \u{A0}
+cite: UW 0.2.2 rules 2.7
+char_widths: [1]
+str_width: 1
+grapheme_scalar_counts: [1]
+
+### A17_choseong_filler_is_wide_jungseong_filler_is_not
+layer: width
+input: \u{115F}\u{1160}
+cite: UW 0.2.2 rules 2.2 (U+115F HANGUL CHOSEONG FILLER has width 2) and 2.4 (U+1160 is Hangul_Syllable_Type V so width 0)
+note: Corner of the width table; U+115F is a wide 2-cell base, U+1160 alone is a zero-width scalar that would be dropped (D5).
+char_widths: [2, 0]
+str_width: 2
+grapheme_scalar_counts: [2]
+
+### A18_string_e_acute
+layer: width
+input: e\u{301}
+cite: UW 0.2.2 rules 1/2.4; UAX29 GB9
+note: str_width 1, one grapheme of 2 scalars.
+char_widths: [1, 0]
+str_width: 1
+grapheme_scalar_counts: [2]
+
+### A19_string_emoji_modifier_sequence
+layer: width
+input: 👍🏽
+cite: UW 0.2.2 rules 1 (emoji modifier sequences have width 2); UTS51 ED-13; UAX29 GB9 (Emoji_Modifier is GCB=Extend)
+note: Per-char widths are [2, 2] but the string is 2: the width of a cluster is NOT the sum of its scalar widths.
+char_widths: [2, 2]
+str_width: 2
+grapheme_scalar_counts: [2]
+
+### A20_string_emoji_zwj_family
+layer: width
+input: 👨\u{200D}👩\u{200D}👧
+cite: UW 0.2.2 rules 1 (well-formed emoji ZWJ sequences have width 2); UTS51 ED-16; UAX29 GB11
+char_widths: [2, 0, 2, 0, 2]
+str_width: 2
+grapheme_scalar_counts: [5]
+
+### A21_string_zwj_prefix_exceeds_two
+layer: width
+input: 👩\u{200D}❤
+cite: UW 0.2.2 rules 1 (an unfinished ZWJ sequence is not 'fully qualified', so it falls back to the plain sum); UTS51 ED-16/ED-17
+note: TRAP for any rule 'cluster width must be <= 2 to attach': this prefix of the (RGI) kiss sequence is 3, the whole sequence is 2. See D4 and D21.
+char_widths: [2, 0, 1]
+str_width: 3
+grapheme_scalar_counts: [3]
+
+### A22_string_emoji_presentation_sequence
+layer: width
+input: ☺\u{FE0F}
+cite: UW 0.2.2 rules 1 (emoji presentation sequences have width 2); UTS51 ED-9a (VS16)
+note: Narrow base plus VS16: 1 -> 2 cluster growth.
+char_widths: [1, 0]
+str_width: 2
+grapheme_scalar_counts: [2]
+
+### A23_string_text_presentation_sequence_on_wide_emoji
+layer: width
+input: ⌚\u{FE0E}
+cite: UW 0.2.2 rules 1 (text presentation sequences are width 1 when the base has Emoji_Presentation and is outside the Enclosed Ideographic Supplement); UTS51 ED-8a (VS15)
+note: Wide base plus VS15: 2 -> 1 cluster shrink.
+char_widths: [2, 0]
+str_width: 1
+grapheme_scalar_counts: [2]
+
+### A24_string_text_presentation_sequence_enclosed_ideographic_supplement
+layer: width
+input: 🈁\u{FE0E}
+cite: UW 0.2.2 rules 1 (exception for the Enclosed Ideographic Supplement block U+1F200..1F2FF)
+note: Stays 2: a VS15 does NOT shrink this one.
+char_widths: [2, 0]
+str_width: 2
+grapheme_scalar_counts: [2]
+
+### A25_string_keycap_sequence
+layer: width
+input: 1\u{FE0F}\u{20E3}
+cite: UW 0.2.2 rules 1 (emoji presentation sequence '1' VS16 is 2; U+20E3 is zero width); UTS51 ED-14c
+note: ASCII digit becomes a 2-cell cluster once the VS16 lands.
+char_widths: [1, 0, 0]
+str_width: 2
+grapheme_scalar_counts: [3]
+
+### A26_string_modifier_after_ascii_is_additive
+layer: width
+input: a🏽
+cite: UW 0.2.2 rules 2 (no modifier-sequence rule applies because 'a' is not an Emoji_Modifier_Base: plain sum 1 + 2); UTS51 sec 2.4 ('any other intervening character causes the emoji modifier to appear as a free-standing character'); UAX29 GB9 (still ONE grapheme)
+note: UAX29 says one grapheme (3 columns of content); UTS51 says the modifier is free-standing. See D4: recommended to keep them as separate cells.
+char_widths: [1, 2]
+str_width: 3
+grapheme_scalar_counts: [2]
+
+### A27_string_double_modifier_is_ill_formed
+layer: width
+input: 👍🏽🏽
+cite: UW 0.2.2 rules 1/2 (a second modifier makes the sequence ill-formed, so the plain sum applies: 2 + 2); UAX29 GB9 (still one grapheme); UTS51 ED-13 (a sequence has ONE modifier)
+note: str_width is 4 for the 3-scalar grapheme. Used by D26; 'CJK + modifier' (D27) is 4 for the same reason.
+char_widths: [2, 2, 2]
+str_width: 4
+grapheme_scalar_counts: [3]
+
+### A28_string_hangul_L_L_is_one_grapheme_four_wide
+layer: width
+input: ᄀᄀ
+cite: UAX29 GB6 (L x L, ONE grapheme); UW 0.2.2 rules 2.5 (sum 2 + 2)
+note: One grapheme (GB6) of width 4: would be a 4-cell cluster, which no cell pair can hold. See D4 / D32.
+char_widths: [2, 2]
+str_width: 4
+grapheme_scalar_counts: [2]
+
+### A29_string_spacing_mark_adds_a_column
+layer: width
+input: का
+cite: UW 0.2.2 rules 2.7 (U+0915 and U+093E are both width 1); UAX29 GB9a (SpacingMark x)
+note: One grapheme, 2 columns: a 1 -> 2 growth that has nothing to do with emoji.
+char_widths: [1, 1]
+str_width: 2
+grapheme_scalar_counts: [2]
+
+### A30_string_arabic_lam_alef_ligature
+layer: width
+input: لا
+cite: UW 0.2.2 rules 1 (Arabic ligature: Lam + Alef has width 1); UAX29 GB999 (TWO graphemes)
+note: KNOWN DIVERGENCE, not modelled: two grapheme clusters, library says the pair is 1 column. The grid, which works per cluster, spends 2 cells. Do not try to fix.
+char_widths: [1, 1]
+str_width: 1
+grapheme_scalar_counts: [1, 1]
+
+### A31_string_indic_conjunct
+layer: width
+input: क\u{94D}ष
+cite: UAX29 GB9c (Indic_Conjunct_Break; unicode-segmentation 1.13.3 / Unicode 17); UW 0.2.2 rules 2.4/2.7 (virama U+094D is width 0)
+note: ONE grapheme of 3 scalars, width 2. Library-derived; the grid just follows it (D35).
+char_widths: [1, 0, 1]
+str_width: 2
+grapheme_scalar_counts: [3]
+
+### A32_string_tag_sequence_flag_of_scotland
+layer: width
+input: 🏴\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}
+cite: UTS51 ED-14a (emoji tag sequence); UW 0.2.2 rules 2.4 (tag characters are Default_Ignorable)
+note: 7 scalars, one grapheme, width 2.
+char_widths: [2, 0, 0, 0, 0, 0, 0]
+str_width: 2
+grapheme_scalar_counts: [7]
+
+### A33_khmer_sign_beyyal_is_three_columns_in_the_library
+layer: width
+input: ៘
+cite: UW 0.2.2 (U+17D8 is the only scalar UnicodeWidthChar::width calls 3); verification of #4
+note: Added in verification of #4. A cell holds at most 2 columns, so tessera_grid::char_width clamps this to 2 (D4 already clamps cluster widths to 1..2). See D37, H18, H19.
+char_widths: [3]
+str_width: 3
+grapheme_scalar_counts: [1]
+
+# ---------------------------------------------------------------- B. Basic wide writes (Grid::put_char)
+
+
+### B01_cjk_pair
+layer: grid
+size: 2x8
+step: put 中文
+cite: UAX11 sec 5 (EAW=W => 2 cells); brief dd 2 (wide base + spacer; advance two columns)
+note: Headline case. Each wide char is WIDE at its column and SPACER in the next; cursor advances 4.
+cells:
+>中/W ~ 文/W ~ . . . .
+>. . . . . . . .
+cursor: (0,4)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>中文
+>
+
+### B02_fullwidth_latin
+layer: grid
+size: 2x8
+step: put Ａｂ
+cite: UAX11 sec 5 (EAW=F)
+note: Fullwidth forms are wide even though they look Latin.
+cells:
+>Ａ/W ~ ｂ/W ~ . . . .
+>. . . . . . . .
+cursor: (0,4)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>Ａｂ
+>
+
+### B03_halfwidth_katakana_is_one_cell
+layer: grid
+size: 2x8
+step: put ｱｲ
+cite: UAX11 sec 5 (EAW=H => 1)
+note: Half-width forms get plain cells, no flags.
+cells:
+>ｱ ｲ . . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>ｱｲ
+>
+
+### B04_hangul_syllables
+layer: grid
+size: 2x8
+step: put 한글
+cite: UAX11 sec 5 (EAW=W)
+cells:
+>한/W ~ 글/W ~ . . . .
+>. . . . . . . .
+cursor: (0,4)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>한글
+>
+
+### B05_hangul_conjoining_jamo_make_one_wide_cluster
+layer: grid
+size: 2x8
+step: put ᄒ\u{1161}\u{11AB}x
+cite: UAX29 GB6/GB7/GB8; UW 0.2.2 rules 2.4 (V and T jamo are width 0); UAX11
+note: The leading jamo is the wide base; the vowel and trailing jamo attach as zero-width scalars: CLUSTER text is three scalars, the cluster stays 2 cells, x follows in column 2.
+cells:
+>ᄒ+1161+11AB/WC ~ x . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>ᄒ\u{1161}\u{11AB}x
+>
+
+### B06_emoji_single
+layer: grid
+size: 2x8
+step: put 😀
+cite: UAX11 (EAW=W); UTS51 ED-6
+cells:
+>😀/W ~ . . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>😀
+>
+
+### B07_mixed_ascii_and_wide
+layer: grid
+size: 2x8
+step: put a中b
+cite: UAX11 sec 5
+note: Columns: a=0, wide=1..2, b=3. Cursor 4.
+cells:
+>a 中/W ~ b . . . .
+>. . . . . . . .
+cursor: (0,4)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a中b
+>
+
+### B08_wide_fills_line_exactly_arms_pending_wrap
+layer: grid
+size: 2x4
+step: put 中文
+cite: xterm charproc.c dotext(): do_wrap armed when the glyph ends at the last column; brief dd 2
+note: Two wide chars fill 4 columns: cursor stays on the LAST column (the spacer) with pending_wrap armed, row not wrapped yet.
+cells:
+>中/W ~ 文/W ~
+>. . . .
+cursor: (0,3)
+pending_wrap: true
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>中文
+>
+
+### B09_next_char_after_filled_row_wraps
+layer: grid
+size: 2x4
+step: put 中文X
+cite: xterm charproc.c WrapLine() (LINEWRAPPED set on the row being left)
+note: Row 0 wrapped, X at (1,0), cursor (1,1).
+cells:
+>中/W ~ 文/W ~
+>X . . .
+cursor: (1,1)
+pending_wrap: false
+wrapped_rows(0-based): [0]
+scrollback: len=0
+text:
+>中文
+>X
+
+### B10_supplementary_plane_wide
+layer: grid
+size: 2x8
+step: put 𠀀a
+cite: UAX11; UW 0.2.2 rules 2.5
+note: Non-BMP scalars (char, not UTF-16 units) are 2 cells too.
+cells:
+>𠀀/W ~ a . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>𠀀a
+>
+# ---------------------------------------------------------------- C. Wide character with one column left / DECAWM
+
+
+### C01_wide_with_one_column_left_wraps_and_blanks_last_col
+layer: grid
+size: 3x5
+step: put abcd中
+cite: xterm charproc.c dotext() (width_here 2 > width_available 1 => WrapLine() before writing, LINEWRAPPED set); alacritty term/mod.rs input() (writes a LEADING_WIDE_CHAR_SPACER blank in the last column); kitty screen.c draw_text_loop (continue_to_next_line when columns < x + char_width)
+note: Cursor is on the last column (not pending) with 1 column left. Recommended: blank the stranded last column with the pen background, mark row 0 wrapped, write at (1,0). xterm itself leaves the cell untouched (see ISSUE TEXT CORRECTIONS 1). D1.
+cells:
+>a b c d .
+>中/W ~ . . .
+>. . . . .
+cursor: (1,2)
+pending_wrap: false
+wrapped_rows(0-based): [0]
+scrollback: len=0
+text:
+>abcd
+>中
+>
+
+### C02_wide_wrap_blank_carries_pen_background
+layer: grid
+size: 3x5
+step: pen_bg 4
+step: put abcd中
+cite: brief dd 5/6 (blank with the pen background); alacritty write_at_cursor(' ') uses the cursor template bg
+note: Blank at (0,4) has bg 4 (@4); the wide pair on row 1 has bg 4 as well (spacer carries the wide cell's background). a-d were written with the pen too.
+cells:
+>a@4 b@4 c@4 d@4 .@4
+>中/W@4 ~@4 . . .
+>. . . . .
+cursor: (1,2)
+pending_wrap: false
+wrapped_rows(0-based): [0]
+scrollback: len=0
+text:
+>abcd
+>中
+>
+
+### C03_wide_when_pending_wraps_without_blanking
+layer: grid
+size: 3x5
+step: put abcde中
+cite: xterm charproc.c dotext(): do_wrap => WrapLine() then write
+note: Pending wrap case: the 'e' in the last column is a real character and stays.
+cells:
+>a b c d e
+>中/W ~ . . .
+>. . . . .
+cursor: (1,2)
+pending_wrap: false
+wrapped_rows(0-based): [0]
+scrollback: len=0
+text:
+>abcde
+>中
+>
+
+### C04_stale_last_column_is_blanked
+layer: grid
+size: 3x5
+step: put abcde
+step: goto 0 4
+step: put 中
+cite: brief dd 5/6; D1
+note: goto clears pending wrap and parks on the last column over a stale 'e'. The wide char cannot fit, so the stale cell is blanked: it would otherwise be copied out as part of the wrapped line.
+cells:
+>a b c d .
+>中/W ~ . . .
+>. . . . .
+cursor: (1,2)
+pending_wrap: false
+wrapped_rows(0-based): [0]
+scrollback: len=0
+text:
+>abcd
+>中
+>
+
+### C05_stranded_column_is_the_right_half_of_a_wide_char
+layer: grid
+size: 3x5
+step: put abc中
+step: goto 0 4
+step: put 中
+cite: brief dd 5 (splitting a wide char blanks both halves)
+note: Last column holds the SPACER of a wide char at columns 3..4. Blanking the stranded last column must also blank its base (3), or the grid is left with an unpaired WIDE.
+cells:
+>a b c . .
+>中/W ~ . . .
+>. . . . .
+cursor: (1,2)
+pending_wrap: false
+wrapped_rows(0-based): [0]
+scrollback: len=0
+text:
+>abc
+>中
+>
+
+### C06_wide_wrap_at_bottom_scrolls_and_keeps_flags
+layer: grid
+size: 2x5
+step: put abcdefghi中
+cite: xterm charproc.c WrapLine() -> xtermIndex() (scroll); brief dd 3 (table moves with the line)
+note: 'abcde' wraps into 'fghi' (cursor on column 4, not pending), then the wide char wraps at the bottom: row 0 scrolls into scrollback (wrapped=true), the old row 1 becomes row 0 wrapped.
+cells:
+>f g h i .
+>中/W ~ . . .
+cursor: (1,2)
+pending_wrap: false
+wrapped_rows(0-based): [0]
+scrollback: len=1 first=("abcde", wrapped=true)
+text:
+>fghi
+>中
+
+### C07_decawm_off_wide_with_one_column_left_is_dropped
+layer: term
+size: 3x5
+step: set auto_wrap false
+step: feed abcd中
+cite: xterm charproc.c dotext(): width_here 2 > width_available 1, WRAPAROUND clear => nothing written, do_wrap cleared; alacritty term/mod.rs input() (LINE_WRAP off: return); kitty instead shifts left to columns - width (DIVERGES)
+note: Recommended (xterm + Alacritty majority): the character is dropped; nothing in the row changes (the last column is NOT blanked here, there is no wrap to protect), cursor stays (0,4), pending_wrap false. D2.
+cells:
+>a b c d .
+>. . . . .
+>. . . . .
+cursor: (0,4)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>abcd
+>
+>
+
+### C08_decawm_off_next_narrow_char_overwrites_last_col
+layer: term
+size: 3x5
+step: set auto_wrap false
+step: feed abcd中X
+cite: xterm charproc.c dotext(); VT510 DECAWM
+note: After the dropped wide char the cursor is still on column 4: X lands there and arms pending.
+cells:
+>a b c d X
+>. . . . .
+>. . . . .
+cursor: (0,4)
+pending_wrap: true
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>abcdX
+>
+>
+
+### C09_decawm_off_pending_then_wide_clears_pending_and_drops
+layer: term
+size: 3x5
+step: set auto_wrap false
+step: feed abcde中
+cite: xterm charproc.c dotext(): `if (screen->do_wrap) { do_wrap = False; if (WRAPAROUND) WrapLine(); }` then the width check drops the char
+note: Pending wrap armed by 'e' is CONSUMED by the dropped wide char (cursor stays (0,4), pending false), nothing changes in the row.
+cells:
+>a b c d e
+>. . . . .
+>. . . . .
+cursor: (0,4)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>abcde
+>
+>
+
+### C10_decawm_off_wide_that_fits_is_written
+layer: term
+size: 3x5
+step: set auto_wrap false
+step: feed ab中
+cite: xterm charproc.c dotext()
+note: Wide char in columns 2..3, cursor 4, not pending.
+cells:
+>a b 中/W ~ .
+>. . . . .
+>. . . . .
+cursor: (0,4)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>ab中
+>
+>
+
+### C11_decawm_off_wide_filling_the_line_then_narrow_splits_it
+layer: term
+size: 3x5
+step: set auto_wrap false
+step: feed abc中X
+cite: xterm charproc.c dotext() + brief dd 5
+note: Wide pair in columns 3..4 arms pending. DECAWM off moves back to the last column (the spacer) and X overwrites it: the base in column 3 becomes a blank (pen background).
+cells:
+>a b c . X
+>. . . . .
+>. . . . .
+cursor: (0,4)
+pending_wrap: true
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>abc X
+>
+>
+
+### C12_one_column_grid_drops_wide_chars_grid
+layer: grid
+size: 2x1
+step: put 中a
+cite: xterm charproc.c dotext() ('give up - it is too big' when last_chomp > right + 1); kitty screen.c ('discard too wide character')
+note: A wide char can never fit a 1-column grid: it is dropped (no wrap, no scroll, no infinite loop), the 'a' that follows lands in column 0 and arms pending.
+cells:
+>a
+>.
+cursor: (0,0)
+pending_wrap: true
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a
+>
+
+### C13_one_column_grid_drops_wide_chars_term_with_insert_mode
+layer: term
+size: 2x1
+step: set insert_mode true
+step: feed 中a
+cite: as C12; brief dd 6 (insert mode)
+note: Trap for the term pre-wrap logic: in insert mode with DECAWM on the term must NOT wrap_line() or insert_chars(2) for a character the grid will drop. Same final state as C12.
+cells:
+>a
+>.
+cursor: (0,0)
+pending_wrap: true
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a
+>
+
+### C14_two_column_grid_one_wide_per_row
+layer: grid
+size: 3x2
+step: put 中中中
+cite: xterm charproc.c dotext()
+note: Each wide char fills a row and arms pending; rows 0 and 1 end up wrapped; cursor ends on the spacer of row 2 with pending armed.
+cells:
+>中/W ~
+>中/W ~
+>中/W ~
+cursor: (2,1)
+pending_wrap: true
+wrapped_rows(0-based): [0, 1]
+scrollback: len=0
+text:
+>中
+>中
+>中
+
+### C15_term_twin_of_c01_default_modes
+layer: term
+size: 3x5
+step: feed abcd中
+cite: as C01 (DECAWM on, replace mode: the grid does the whole job)
+note: Must equal C01 cell for cell: print() adds nothing for a wide char in default modes.
+cells:
+>a b c d .
+>中/W ~ . . .
+>. . . . .
+cursor: (1,2)
+pending_wrap: false
+wrapped_rows(0-based): [0]
+scrollback: len=0
+text:
+>abcd
+>中
+>
+
+### C16_decawm_off_insert_mode_wide_with_one_column_left_changes_nothing
+layer: term
+size: 3x5
+step: set auto_wrap false
+step: set insert_mode true
+step: feed abcd中
+cite: as C07; VT510 IRM
+note: TRAP. IRM + DECAWM off: the dropped wide char must not insert two cells or blank anything before being dropped. Same final state as C07.
+cells:
+>a b c d .
+>. . . . .
+>. . . . .
+cursor: (0,4)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>abcd
+>
+>
+# ---------------------------------------------------------------- D. Clusters: emoji sequences, flags, presentation selectors
+
+
+### D01_emoji_with_skin_tone_is_one_two_cell_cluster
+layer: grid
+size: 2x8
+step: put 👍🏽
+cite: UTS51 ED-13 (emoji modifier sequence); UAX29 GB9 (Emoji_Modifier is GCB=Extend); UW 0.2.2 rules 1 (width 2); kitty draw_text_loop (grapheme_segmentation_step add_to_current_cell); xterm does NOT cluster this (🏽 gets its own wide cell)
+note: Base 👍 is WIDE|CLUSTER with text '👍🏽'; spacer in column 1; cursor 2. The modifier (width 2 on its own) must not get a cell: the plain wide path would otherwise write a second wide char.
+cells:
+>👍+1F3FD/WC ~ . . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>👍🏽
+>
+
+### D02_zwj_family_is_one_two_cell_cluster
+layer: grid
+size: 2x8
+step: put 👨\u{200D}👩\u{200D}👧x
+cite: UTS51 ED-16 (emoji ZWJ sequence); UAX29 GB9 (ZWJ) + GB11; UW 0.2.2 rules 1 (width 2)
+note: Five scalars in one cell pair; x lands in column 2. The intermediate '👨 ZWJ 👩' prefix is also width 2 for this sequence (A20) but not for all (A21, D21).
+cells:
+>👨+200D+1F469+200D+1F467/WC ~ x . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>👨\u{200D}👩\u{200D}👧x
+>
+
+### D03_flag_pair_grows_from_one_to_two_cells
+layer: grid
+size: 2x8
+step: put 🇸🇪x
+cite: UAX29 GB12/GB13 (RI pairs); UTS51 ED-14 (emoji flag sequence); UW 0.2.2 (single RI = 1, pair = 2); kitty draw_combining_char/widen_cell_to_two
+note: The first RI is a plain narrow cell (cursor 1). The second RI joins the cluster, the cluster is now 2 cells: the cell under the cursor (column 1) becomes the SPACER and the cursor moves to 2. x lands in column 2.
+cells:
+>🇸+1F1EA/WC ~ x . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>🇸🇪x
+>
+
+### D04_single_regional_indicator_stays_narrow
+layer: grid
+size: 2x8
+step: put 🇸x
+cite: UW 0.2.2 (RI width 1)
+note: No cluster, no flags; x follows in column 1.
+cells:
+>🇸 x . . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>🇸x
+>
+
+### D05_two_flags_in_a_row
+layer: grid
+size: 2x8
+step: put 🇸🇪🇳🇴
+cite: UAX29 GB12/GB13
+note: Four cells, two clusters.
+cells:
+>🇸+1F1EA/WC ~ 🇳+1F1F4/WC ~ . . . .
+>. . . . . . . .
+cursor: (0,4)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>🇸🇪🇳🇴
+>
+
+### D06_odd_third_regional_indicator_starts_a_new_cell
+layer: grid
+size: 2x8
+step: put 🇸🇪🇳
+cite: UAX29 GB12/GB13 (pairs only: the 3rd RI breaks)
+note: Cluster pair at 0..1, lone narrow RI at 2.
+cells:
+>🇸+1F1EA/WC ~ 🇳 . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>🇸🇪🇳
+>
+
+### D07_flag_growth_overwrites_the_right_neighbour
+layer: grid
+size: 2x8
+step: put abcdef
+step: goto 0 0
+step: put 🇸🇪
+cite: brief dd 2; kitty widen_cell_to_two (zero_cells on the next cell); D3
+note: 🇸 overwrites 'a'; 🇪 attaches and grows the cluster into column 1, which held 'b': 'b' is lost (the grid does not shift text right). Cursor 2.
+cells:
+>🇸+1F1EA/WC ~ c d e f . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>🇸🇪cdef
+>
+
+### D08_flag_growth_over_the_left_half_of_a_wide_char
+layer: grid
+size: 2x8
+step: put x中
+step: goto 0 0
+step: put 🇸🇪
+cite: brief dd 5; D3
+note: 🇸 overwrites 'x' (column 0); column 1 holds the left half of 中. Growing into column 1 orphans 中's spacer (column 2): it must become a blank.
+cells:
+>🇸+1F1EA/WC ~ . . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>🇸🇪
+>
+
+### D09_flag_growth_into_the_last_column_arms_pending
+layer: grid
+size: 2x5
+step: put abc🇸🇪
+cite: brief dd 2 (advance two columns; last column => pending)
+note: 🇸 in column 3, cursor 4. 🇪 grows the cluster into column 4: pair at 3..4, cursor stays on 4, pending_wrap true.
+cells:
+>a b c 🇸+1F1EA/WC ~
+>. . . . .
+cursor: (0,4)
+pending_wrap: true
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>abc🇸🇪
+>
+
+### D10_flag_growth_at_the_last_column_is_refused
+layer: grid
+size: 2x5
+step: put abcd🇸🇪
+cite: brief Risks ('Grapheme growth at the last column has no clean answer'); D3 (recommended: refuse, no relocation); kitty would move the cluster to the next row (move_widened_char_past_multiline_chars)
+note: 🇸 sits in the last column (pending). A cluster cannot grow past the right edge, so 🇪 does NOT attach: it is an ordinary narrow char and wraps to (1,0). Row 0 is wrapped. Result: two lone RIs instead of a flag, no relocation logic, no DECAWM knowledge in the grid.
+cells:
+>a b c d 🇸
+>🇪 . . . .
+cursor: (1,1)
+pending_wrap: false
+wrapped_rows(0-based): [0]
+scrollback: len=0
+text:
+>abcd🇸
+>🇪
+
+### D11_vs16_widens_a_text_presentation_base
+layer: grid
+size: 2x8
+step: put ☺\u{FE0F}x
+cite: UTS51 ED-9a / sec 4.1 (VS16); UW 0.2.2 rules 1 (emoji presentation sequence width 2); kitty draw_combining_char (VS16 + is_emoji_presentation_base => widen_cell_to_two); xterm util.c addXtermCombining under OPT_EMOJI_WIDTH (VS16 on an emoji base => 'increase base', filler cell + cursor advance)
+note: ☺ (narrow) + VS16 => WIDE|CLUSTER pair, cursor 2, x in column 2. The brief's 'VS16 turning a narrow char wide'.
+cells:
+>☺+FE0F/WC ~ x . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>☺\u{FE0F}x
+>
+
+### D12_vs16_heart_then_text
+layer: grid
+size: 2x8
+step: put ❤\u{FE0F}x
+cite: UTS51 sec 4.1; UW 0.2.2 rules 1
+note: Same as D11 for U+2764.
+cells:
+>❤+FE0F/WC ~ x . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>❤\u{FE0F}x
+>
+
+### D13_vs16_growth_at_the_last_column_is_refused_and_dropped
+layer: grid
+size: 2x5
+step: put abcd☺\u{FE0F}
+cite: brief Risks ('Grapheme growth at the last column'); D3
+note: ☺ in the last column, pending armed. VS16 cannot widen it (no column to the right), so it does not attach; a zero-width scalar that does not attach is dropped (D5). Row unchanged, no cluster, pending still armed.
+cells:
+>a b c d ☺
+>. . . . .
+cursor: (0,4)
+pending_wrap: true
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>abcd☺
+>
+
+### D14_vs16_on_a_base_without_emoji_presentation_attaches_without_growth
+layer: grid
+size: 2x8
+step: put a\u{FE0F}b
+cite: UAX29 GB9 (VS16 is Extend); UW 0.2.2 rules 1 (the pair is not in emoji-variation-sequences so the width is the sum 1); kitty draw_combining_char (attaches); xterm addXtermCombining DROPS it (`valid = mk_is_emoji(base)` is false for 'a') - DIVERGES, D9
+note: Cluster text 'a'+FE0F, still one cell. b follows in column 1.
+cells:
+>a+FE0F/C b . . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a\u{FE0F}b
+>
+
+### D15_keycap_sequence
+layer: grid
+size: 2x8
+step: put 1\u{FE0F}\u{20E3}x
+cite: UTS51 ED-14c (emoji keycap sequence); UW 0.2.2 rules 1
+note: '1' grows to 2 cells at the VS16; U+20E3 then attaches with no further change.
+cells:
+>1+FE0F+20E3/WC ~ x . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>1\u{FE0F}\u{20E3}x
+>
+
+### D16_vs15_narrows_a_wide_emoji
+layer: grid
+size: 2x8
+step: put ⌚\u{FE0E}x
+cite: UTS51 ED-8a (VS15); UW 0.2.2 rules 1 (width 1 for text presentation sequences whose base has Emoji_Presentation); kitty draw_combining_char (VS15 => halve_multicell_width, cursor->x -= 1); xterm util.c addXtermCombining under OPT_EMOJI_WIDTH (VS15 => 'shrink base', Clear1Cell + set_cur_col(--col))
+note: ⌚ (wide) + VS15 => the cluster shrinks to 1 cell: base keeps CLUSTER but loses WIDE, the old spacer becomes a plain blank (pen bg), cursor moves back to column 1, x overwrites column 1.
+cells:
+>⌚+FE0E/C x . . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>⌚\u{FE0E}x
+>
+
+### D17_vs15_on_the_cursor_row_edge_leaves_pending_cleared
+layer: grid
+size: 2x5
+step: put abc⌚\u{FE0E}
+cite: as D16; brief dd 3
+note: Pair at 3..4 with pending armed. After VS15 the base is narrow in column 3, column 4 is blank, cursor (0,4) and pending_wrap FALSE (next char lands in column 4, no wrap).
+cells:
+>a b c ⌚+FE0E/C .
+>. . . . .
+cursor: (0,4)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>abc⌚\u{FE0E}
+>
+
+### D18_vs15_on_a_narrow_default_text_base_keeps_it_narrow
+layer: grid
+size: 2x8
+step: put ☺\u{FE0E}x
+cite: UTS51 ED-8a; UW 0.2.2 rules 1; xterm addXtermCombining (attaches, no width change since expect == actual)
+note: Already narrow: attaches, no width change.
+cells:
+>☺+FE0E/C x . . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>☺\u{FE0E}x
+>
+
+### D19_vs15_does_not_narrow_the_enclosed_ideographic_supplement
+layer: grid
+size: 2x8
+step: put 🈁\u{FE0E}x
+cite: UW 0.2.2 rules 1 (exception for U+1F200..1F2FF); A24
+note: Stays WIDE: do not hard-code 'VS15 => narrow', ask UnicodeWidthStr::width of the whole cluster.
+cells:
+>🈁+FE0E/WC ~ x . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>🈁\u{FE0E}x
+>
+
+### D20_rainbow_flag_vs16_then_zwj
+layer: grid
+size: 2x8
+step: put 🏳\u{FE0F}\u{200D}🌈x
+cite: UTS51 ED-16 (emoji ZWJ sequence 🏳️‍🌈); UAX29 GB11; UW 0.2.2 rules 1
+note: U+1F3F3 is narrow by itself; the VS16 grows it to 2, the ZWJ and 🌈 join without changing the width. Final cluster 4 scalars, 2 cells.
+cells:
+>🏳+FE0F+200D+1F308/WC ~ x . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>🏳\u{FE0F}\u{200D}🌈x
+>
+
+### D21_kiss_sequence_survives_a_width_three_prefix
+layer: grid
+size: 2x8
+step: put 👩\u{200D}❤\u{FE0F}\u{200D}💋\u{200D}👨x
+cite: UTS51 ED-16; UAX29 GB11; UW 0.2.2 rules 1; A21
+note: The prefix '👩 ZWJ ❤' is 3 wide per the library (A21) even though the finished sequence is 2. The grid must not refuse the attach because of that: after a ZWJ the next joined scalar attaches regardless of the transient width, and the cell width is clamped to 2. D4.
+cells:
+>👩+200D+2764+FE0F+200D+1F48B+200D+1F468/WC ~ x . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>👩\u{200D}❤\u{FE0F}\u{200D}💋\u{200D}👨x
+>
+
+### D22_tag_sequence_flag
+layer: grid
+size: 2x8
+step: put 🏴\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}x
+cite: UTS51 ED-14a; UAX29 GB9 (tag characters are Extend)
+note: Seven scalars, two cells.
+cells:
+>🏴+E0067+E0062+E0073+E0063+E0074+E007F/WC ~ x . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>🏴\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}x
+>
+
+### D23_text_around_an_emoji_cluster
+layer: grid
+size: 2x8
+step: put a👍🏽b
+cite: UTS51 ED-13
+note: a=0, cluster=1..2, b=3.
+cells:
+>a 👍+1F3FD/WC ~ b . . . .
+>. . . . . . . .
+cursor: (0,4)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a👍🏽b
+>
+
+### D24_emoji_modifier_after_ascii_is_its_own_cell
+layer: grid
+size: 2x8
+step: put a🏽
+cite: UTS51 sec 2.4 ('any other intervening character causes the emoji modifier to appear as a free-standing character'); UAX29 GB9 would join it; UW 0.2.2 rules 2 (a + modifier = 3, not 2)
+note: Decision D4: attach only if the joined cluster is at most 2 columns wide (or a ZWJ sequence). 'a'+🏽 would be 3 wide, so the modifier is NOT attached and is written as an ordinary wide char: 3 cells total, matching UnicodeWidthStr::width("a🏽") = 3.
+cells:
+>a 🏽/W ~ . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a🏽
+>
+
+### D25_emoji_modifier_alone
+layer: grid
+size: 2x8
+step: put 🏽
+cite: UTS51 sec 2.4; UAX11 (EAW=W)
+note: A free-standing modifier at the start of a line is just a wide char.
+cells:
+>🏽/W ~ . . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>🏽
+>
+
+### D26_second_modifier_is_free_standing
+layer: grid
+size: 2x8
+step: put 👍🏽🏽
+cite: UTS51 ED-13 (only ONE modifier belongs to a sequence); UAX29 GB9; UW 0.2.2 rules 2 (👍🏽🏽 is 4 wide, see A27)
+note: First modifier attaches, the second would make the cluster 4 wide so it is written as its own wide char.
+cells:
+>👍+1F3FD/WC ~ 🏽/W ~ . . . .
+>. . . . . . . .
+cursor: (0,4)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>👍🏽🏽
+>
+
+### D27_modifier_after_a_wide_non_base
+layer: grid
+size: 2x8
+step: put 中🏽
+cite: UTS51 sec 2.4; UW 0.2.2 rules 2 (4 wide)
+note: 中 is not an Emoji_Modifier_Base. Same outcome as D24 for a wide base: two separate wide cells.
+cells:
+>中/W ~ 🏽/W ~ . . . .
+>. . . . . . . .
+cursor: (0,4)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>中🏽
+>
+
+### D28_zwj_after_a_non_emoji_attaches_per_uax29
+layer: grid
+size: 2x8
+step: put a\u{200D}👨
+cite: UAX29 GB9 (x ZWJ always joins) and GB11 (needs Extended_Pictographic before the ZWJ, so 👨 does NOT join); UTS51 sec 2.5 ('ZWJ characters are ignored and a fallback sequence of separate emoji is displayed')
+note: ZWJ arriving when the previous cell is not an emoji. Recommended: it attaches to 'a' (cluster text a+200D, still 1 cell, invisible); 👨 then starts a new wide cell.
+cells:
+>a+200D/C 👨/W ~ . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a\u{200D}👨
+>
+
+### D29_trailing_zwj_does_not_join_following_text
+layer: grid
+size: 2x8
+step: put 👨\u{200D}x
+cite: UAX29 GB11 (ZWJ x Extended_Pictographic only)
+note: The cluster '👨 ZWJ' stays a 2-cell cell; x is a new cell in column 2.
+cells:
+>👨+200D/WC ~ x . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>👨\u{200D}x
+>
+
+### D30_zwj_at_column_zero_is_dropped
+layer: grid
+size: 2x8
+step: put \u{200D}x
+cite: D5; xterm doparsing() (combining with nothing to attach to), kitty draw_text_loop (`if (s->prev.cc)`), wezterm flush_print (zero-width grapheme elided)
+note: Nothing to attach to: dropped. x lands in column 0.
+cells:
+>x . . . . . . .
+>. . . . . . . .
+cursor: (0,1)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>x
+>
+
+### D31_second_zwj_in_a_row_attaches_and_blocks_the_join
+layer: grid
+size: 2x8
+step: put 👨\u{200D}\u{200D}👩
+cite: UAX29 GB9 + GB11 (the second ZWJ is not Extend, so ZWJ ZWJ x ExtPict has a break)
+note: Library-derived edge: both ZWJs attach to 👨; 👩 is a new wide cell. Follows from UAX29 alone.
+cells:
+>👨+200D+200D/WC ~ 👩/W ~ . . . .
+>. . . . . . . .
+cursor: (0,4)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>👨\u{200D}\u{200D}👩
+>
+
+### D32_hangul_L_after_L_is_not_attached
+layer: grid
+size: 2x8
+step: put ᄀᄀ
+cite: UAX29 GB6 (one grapheme); UW 0.2.2 rules 2.5 (width 4); A28
+note: The second leading jamo would make a 4-wide cluster, so it is written as its own wide cell. Same rule as D24.
+cells:
+>ᄀ/W ~ ᄀ/W ~ . . . .
+>. . . . . . . .
+cursor: (0,4)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>ᄀᄀ
+>
+
+### D33_hangul_syllable_plus_trailing_jamo_attaches
+layer: grid
+size: 2x8
+step: put 가\u{11A8}x
+cite: UAX29 GB8 (LV x T); UW 0.2.2 rules 2.4
+note: Precomposed LV syllable plus a width-0 trailing jamo: one wide cluster.
+cells:
+>가+11A8/WC ~ x . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>가\u{11A8}x
+>
+
+### D34_spacing_mark_grows_the_cell
+layer: grid
+size: 2x8
+step: put काx
+cite: UAX29 GB9a (SpacingMark); UW 0.2.2 rules 2.7 (1 + 1 = 2); A29; kitty draw_combining_char (SpacingMark widens a narrow base)
+flags: library-derived
+note: Follows the library: the cluster is 2 columns, so it is WIDE|CLUSTER. Not an emoji case; exists to prove growth is driven by UnicodeWidthStr, not by VS16/RI special cases.
+cells:
+>क+093E/WC ~ x . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>काx
+>
+
+### D35_indic_conjunct_cluster
+layer: grid
+size: 2x8
+step: put क\u{94D}षx
+cite: UAX29 GB9c; UW 0.2.2 rules 2.4/2.7; A31
+flags: library-derived
+note: Three scalars, one cluster, 2 columns.
+cells:
+>क+094D+0937/WC ~ x . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>क\u{94D}षx
+>
+
+### D36_prepend_joins_the_next_scalar_even_a_space
+layer: grid
+size: 2x8
+step: put \u{600} b\u{600}x
+cite: UAX29 GB9b (Prepend x anything but a control); UW 0.2.2 rules 2.7 (U+0600 is width 1, the pair sums to 2)
+flags: library-derived, known-limitation
+note: Added in critique round 1 of #4. ARABIC NUMBER SIGN takes a cell; the next scalar (here a SPACE, then an 'x') joins it per GB9b and the cluster grows to 2 columns, like D34. The space is swallowed into the cluster rather than left as a blank, but the row's column count equals the library width of the text.
+cells:
+>U+0600+0020/WC ~ b U+0600+0078/WC ~ . . .
+>. . . . . . . .
+cursor: (0,5)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>\u{600} b\u{600}x
+>
+
+### D37_three_column_scalar_is_clamped_to_a_wide_cell
+layer: grid
+size: 2x8
+step: put a៘b
+cite: UW 0.2.2 (width 3); D4 (cell width clamped to 1..2); A33
+note: Added in verification of #4. U+17D8 KHMER SIGN BEYYAL is written as an ordinary WIDE pair, so b lands in column 3.
+cells:
+>a ៘/W ~ b . . . .
+>. . . . . . . .
+cursor: (0,4)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a៘b
+>
+
+# ---------------------------------------------------------------- E. Zero-width scalars: where they attach and when they are dropped
+
+
+### E01_combining_acute_attaches_to_the_left_cell
+layer: grid
+size: 2x8
+step: put e\u{301}x
+cite: UAX29 GB9; UW 0.2.2 rules 2.4; xterm doparsing() (combining => last written cell); kitty draw_combining_char; wezterm flush_print (Graphemes)
+note: Cell 0 = e with CLUSTER; text 'e'+0301; column 1 untouched; cursor 1 after the mark, x in column 1.
+cells:
+>e+0301/C x . . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>e\u{301}x
+>
+
+### E02_stacked_marks_extend_the_same_cluster
+layer: grid
+size: 2x8
+step: put e\u{301}\u{302}x
+cite: UAX29 GB9; xterm screen->max_combining (xterm caps at 2 by default; recommended cap: D6)
+note: One cluster of three scalars.
+cells:
+>e+0301+0302/C x . . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>e\u{301}\u{302}x
+>
+
+### E03_precomposed_char_has_no_cluster
+layer: grid
+size: 2x8
+step: put éx
+cite: UAX11 (EAW=A, narrow here)
+note: A single scalar U+00E9: plain cell, no flags, no table entry.
+cells:
+>é x . . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>éx
+>
+
+### E04_mark_on_a_wide_base
+layer: grid
+size: 2x8
+step: put 中\u{301}x
+cite: UAX29 GB9; kitty draw_combining_char (walks back to the base of a multicell)
+note: The mark finds the base through the SPACER under the left neighbour; cursor does not move; x in column 2.
+cells:
+>中+0301/WC ~ x . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>中\u{301}x
+>
+
+### E05_mark_at_column_zero_of_an_empty_line_is_dropped
+layer: grid
+size: 2x8
+step: put \u{301}
+cite: D5; xterm doparsing(); kitty draw_text_loop (prev.cc is NULL); wezterm flush_print (zero-width grapheme elided); alacritty input() DOES attach it to cell (0,0) (saturating_sub) - DIVERGES, not followed
+note: Nothing at all happens: no cell written, cursor (0,0).
+cells:
+>. . . . . . . .
+>. . . . . . . .
+cursor: (0,0)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>
+>
+
+### E06_mark_at_column_zero_after_cr_is_dropped_not_attached_to_the_line
+layer: grid
+size: 2x8
+step: put ab
+step: cr
+step: put \u{301}
+cite: D5; kitty/wezterm/xterm (cursor movement resets the attach target in kitty and wezterm; xterm's last_written is reset by CR)
+note: Cursor is at column 0: nothing to the left, dropped. 'a' stays plain, cursor (0,0).
+cells:
+>a b . . . . . .
+>. . . . . . . .
+cursor: (0,0)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>ab
+>
+
+### E07_mark_after_soft_wrap_does_not_attach_to_the_previous_row
+layer: grid
+size: 3x5
+step: put abcdef
+step: cr
+step: put \u{301}
+cite: D5; brief design decision 4 ('previous row's last column only when ... wrapped -- the fixture decides')
+note: Row 0 is soft-wrapped into row 1. The cursor is at (1,0) after CR. Recommended: STILL dropped (no cross-row mutation, no kitty-style continuation lookup). D5.
+cells:
+>a b c d e
+>f . . . .
+>. . . . .
+cursor: (1,0)
+pending_wrap: false
+wrapped_rows(0-based): [0]
+scrollback: len=0
+text:
+>abcde
+>f
+>
+
+### E08_mark_after_a_wrap_attaches_to_the_first_cell_of_the_new_row
+layer: grid
+size: 3x5
+step: put abcdef\u{301}g
+cite: UAX29 GB9
+note: f is at (1,0), cursor (1,1): the mark's left neighbour is f. Cursor then moves on for g.
+cells:
+>a b c d e
+>f+0301/C g . . .
+>. . . . .
+cursor: (1,2)
+pending_wrap: false
+wrapped_rows(0-based): [0]
+scrollback: len=0
+text:
+>abcde
+>f\u{301}g
+>
+
+### E09_mark_with_pending_wrap_attaches_to_the_cell_under_the_cursor
+layer: grid
+size: 3x5
+step: put abcde\u{301}
+cite: xterm doparsing() (last_written_col = col 80 while do_wrap is armed); alacritty input() (`if !input_needs_wrap { column -= 1 }`)
+note: 'e' sits under the cursor (last column, pending). The mark attaches to 'e', NOT 'd', and pending_wrap stays armed (no wrap happens for a zero-width scalar).
+cells:
+>a b c d e+0301/C
+>. . . . .
+>. . . . .
+cursor: (0,4)
+pending_wrap: true
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>abcde\u{301}
+>
+>
+
+### E10_mark_after_pending_then_next_char_still_wraps
+layer: grid
+size: 3x5
+step: put abcde\u{301}f
+cite: as E09; xterm WrapLine()
+note: The attached mark did not disturb the pending wrap: f wraps to (1,0).
+cells:
+>a b c d e+0301/C
+>f . . . .
+>. . . . .
+cursor: (1,1)
+pending_wrap: false
+wrapped_rows(0-based): [0]
+scrollback: len=0
+text:
+>abcde\u{301}
+>f
+>
+
+### E11_mark_on_a_wide_char_that_ends_the_line
+layer: grid
+size: 3x4
+step: put ab中\u{301}
+cite: UAX29 GB9; alacritty input() (`if cell.flags.contains(WIDE_CHAR_SPACER) { column -= 1 }`)
+note: Wide pair at columns 2..3, pending armed, cursor on the spacer. The mark attaches to the BASE (column 2); cursor and pending unchanged.
+cells:
+>a b 中+0301/WC ~
+>. . . .
+>. . . .
+cursor: (0,3)
+pending_wrap: true
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>ab中\u{301}
+>
+>
+
+### E12_mark_after_a_line_feed_with_blank_left_cell_is_dropped
+layer: grid
+size: 3x8
+step: put a
+step: lf
+step: put \u{301}
+cite: D5; kitty/wezterm (LF resets the attach target); xterm would attach to the cursor cell (cur_row/cur_col) when no char was written since the move
+note: LF keeps the column: cursor (1,1), left neighbour (1,0) is a blank. Gate: only a cell that shows something (ch != ' ') can take a mark.
+cells:
+>a . . . . . . .
+>. . . . . . . .
+>. . . . . . . .
+cursor: (1,1)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a
+>
+>
+
+### E13_mark_after_a_blank_cell_is_dropped
+layer: grid
+size: 2x8
+step: put a \u{301}b
+cite: D5, D7
+flags: decision-D7
+note: 'a', SPACE, mark. The grid cannot tell a written space from an untouched cell, so a blank never takes a mark (the mark is dropped). Costs: SPACE + mark ('standalone accent') loses its mark; the commonly used standalone form NBSP + mark works (E14). D7.
+cells:
+>a . b . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a b
+>
+
+### E14_mark_after_nbsp_attaches
+layer: grid
+size: 2x8
+step: put \u{A0}\u{301}b
+cite: UAX29 GB9; UW 0.2.2 rules 2.7 (NBSP width 1)
+note: NBSP is a visible-blank base that is not ' ', so it takes the mark.
+cells:
+>U+00A0+0301/C b . . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>\u{A0}\u{301}b
+>
+
+### E15_mark_after_cursor_motion_attaches_to_the_left_cell
+layer: grid
+size: 2x8
+step: put abc
+step: goto 0 2
+step: put \u{301}
+cite: D7; kitty/wezterm would drop it (cursor motion resets the attach target); alacritty/xterm-without-char_was_written attach to the cursor-adjacent cell
+flags: decision-D7
+note: The grid has no 'last written cell' memory, so cursor motion cannot reset anything: the mark attaches to 'b' (left of the cursor). Documented divergence; the alternative needs a last-printed field in Grid.
+cells:
+>a b+0301/C c . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>ab\u{301}c
+>
+
+### E16_zwsp_is_dropped_and_does_not_join
+layer: grid
+size: 2x8
+step: put a\u{200B}b
+cite: UAX29 GB4/GB5 (ZWSP is GCB=Control: break on both sides); UW 0.2.2 rules 2.4; xterm doparsing() (`is_formatter` => ignored); wezterm flush_print (elided)
+note: Width 0 and not joinable: dropped. a, b adjacent.
+cells:
+>a b . . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>ab
+>
+
+### E17_zwnj_attaches
+layer: grid
+size: 2x8
+step: put a\u{200C}b
+cite: UAX29 GB9 (ZWNJ is Extend); UW 0.2.2 rules 2.4
+note: Attached to 'a' (cluster text a+200C, 1 cell).
+cells:
+>a+200C/C b . . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a\u{200C}b
+>
+
+### E18_other_format_controls_are_dropped
+layer: grid
+size: 2x8
+step: put a\u{AD}\u{2060}\u{FEFF}b
+cite: UAX29 GB4/GB5 (Control); UW 0.2.2 rules 2.4; xterm dotext() renders SOFT HYPHEN only at the right margin (not followed)
+note: Soft hyphen, WORD JOINER, BOM: all GCB=Control, all width 0: dropped.
+cells:
+>a b . . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>ab
+>
+
+### E19_tag_letter_attaches_to_ascii
+layer: grid
+size: 2x8
+step: put a\u{E0067}b
+cite: UAX29 GB9 (tags are Extend); UW 0.2.2 rules 2.4
+note: A stray tag letter joins the previous cell: invisible, still 1 cell.
+cells:
+>a+E0067/C b . . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a\u{E0067}b
+>
+
+### E20_vs16_at_column_zero_is_dropped
+layer: grid
+size: 2x8
+step: put \u{FE0F}a
+cite: D5
+note: a lands in column 0.
+cells:
+>a . . . . . . .
+>. . . . . . . .
+cursor: (0,1)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a
+>
+
+### E21_cluster_scalar_cap
+layer: grid
+size: 2x8
+step: put e\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}x
+cite: D6 (resource bound; xterm max_combining <= 5, charproc.c; kitty caps combining marks per cell)
+flags: decision-D6
+note: 'e' plus 40 acutes. Recommended cap: 32 scalars per cluster text; further zero-width scalars are dropped (they cannot attach and have no width). Cluster text length is 32 (e + 31 marks).
+cells:
+>e+0301+0301+0301+0301+0301+0301+0301+0301+0301+0301+0301+0301+0301+0301+0301+0301+0301+0301+0301+0301+0301+0301+0301+0301+0301+0301+0301+0301+0301+0301+0301/C x . . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>e\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}\u{301}x
+>
+
+### E23_mark_with_the_cursor_parked_on_a_spacer_attaches_to_the_base
+layer: grid
+size: 2x8
+step: put 中x
+step: goto 0 1
+step: put \u{301}
+cite: UAX29 GB9; alacritty input() (`if cell.flags.contains(WIDE_CHAR_SPACER) { column -= 1 }` is the mirror case)
+note: Cursor on the SPACER (column 1): the left neighbour is the wide BASE (column 0), which takes the mark. Cursor does not move.
+cells:
+>中+0301/WC ~ x . . . . .
+>. . . . . . . .
+cursor: (0,1)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>中\u{301}x
+>
+
+### E22_cursor_does_not_move_for_attached_scalars
+layer: grid
+size: 2x8
+step: put a
+step: put \u{301}
+step: put \u{301}
+step: put b
+cite: UAX29 GB9
+note: Same final state as put 'a' + two marks + b in one string; attach is independent of how the writes are chunked.
+cells:
+>a+0301+0301/C b . . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a\u{301}\u{301}b
+>
+# ---------------------------------------------------------------- F. Overwriting halves of a wide char, cluster table hygiene
+
+
+### F01_overwrite_left_half_with_narrow
+layer: grid
+size: 2x8
+step: put 中文
+step: goto 0 0
+step: put x
+cite: brief dd 5 (splitting a wide char blanks the orphaned half); alacritty write_at_cursor (clears the spacer when overwriting a WIDE_CHAR); xterm WriteText (blanks the other half)
+note: x in column 0; the SPACER in column 1 becomes a blank; 文 untouched. Cursor 1.
+cells:
+>x . 文/W ~ . . . .
+>. . . . . . . .
+cursor: (0,1)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>x 文
+>
+
+### F02_overwrite_right_half_with_narrow
+layer: grid
+size: 2x8
+step: put 中文
+step: goto 0 1
+step: put x
+cite: brief dd 5; alacritty write_at_cursor (`else if point.column > 0 { cell[column-1].clear_wide() }`)
+note: Cursor parked on the SPACER (goto is allowed to land there). Its base (column 0) becomes a blank; x in column 1.
+cells:
+>. x 文/W ~ . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+> x文
+>
+
+### F03_overwrite_straddling_two_wide_chars_with_a_wide_char
+layer: grid
+size: 2x8
+step: put 中文
+step: goto 0 1
+step: put 国
+cite: brief dd 5
+note: New wide pair in columns 1..2. Column 0 (base whose spacer was overwritten) and column 3 (spacer whose base was overwritten) both become blanks.
+cells:
+>. 国/W ~ . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+> 国
+>
+
+### F04_overwrite_wide_with_wide_same_place
+layer: grid
+size: 2x8
+step: put 中
+step: goto 0 0
+step: put 国
+cite: brief dd 5
+note: Clean replacement, no residue.
+cells:
+>国/W ~ . . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>国
+>
+
+### F05_overwrite_wide_with_two_narrow
+layer: grid
+size: 2x8
+step: put 中
+step: goto 0 0
+step: put ab
+cite: brief dd 5
+note: Both cells replaced; no stray flags.
+cells:
+>a b . . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>ab
+>
+
+### F06_overwrite_a_cluster_cell_drops_the_cluster
+layer: grid
+size: 2x8
+step: put e\u{301}
+step: goto 0 0
+step: put x
+cite: brief dd 3 (every mutation keeps the table consistent)
+note: x is a plain cell; Line::cluster(0) must be None afterwards (text shows 'x' only).
+cells:
+>x . . . . . . .
+>. . . . . . . .
+cursor: (0,1)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>x
+>
+
+### F07_overwrite_the_right_half_of_a_wide_cluster
+layer: grid
+size: 2x8
+step: put 👍🏽
+step: goto 0 1
+step: put x
+cite: brief dd 3 and 5
+note: The wide cluster is destroyed: base becomes a plain blank (and its table entry is dropped), x in column 1.
+cells:
+>. x . . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+> x
+>
+
+### F08_orphan_blanks_use_the_pen_background
+layer: grid
+size: 2x8
+step: put 中
+step: pen_bg 4
+step: goto 0 0
+step: put x
+cite: brief dd 5 (blank with the pen background)
+note: x and the orphaned right half both carry bg 4 (the original 中 had no bg).
+cells:
+>x@4 .@4 . . . . . .
+>. . . . . . . .
+cursor: (0,1)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>x
+>
+
+### F09_overwrite_right_half_at_the_last_column
+layer: grid
+size: 2x5
+step: put abc中
+step: goto 0 4
+step: put x
+cite: brief dd 5
+note: Wide pair at 3..4, cursor parked on the spacer (last column): base 3 blanked, x at 4, pending armed.
+cells:
+>a b c . x
+>. . . . .
+cursor: (0,4)
+pending_wrap: true
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>abc x
+>
+
+### F10_narrow_char_overwrites_a_cell_that_carried_a_flag_then_growth_again
+layer: grid
+size: 2x8
+step: put 🇸🇪
+step: goto 0 0
+step: put 🇳
+step: put 🇴
+cite: brief dd 3 and 5; UAX29 GB12/GB13
+note: 🇳 overwrites the whole old flag (base over a WIDE cell blanks its spacer); the second RI attaches again and re-grows into column 1. Result: a clean 🇳🇴 pair with exactly one table entry.
+cells:
+>🇳+1F1F4/WC ~ . . . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>🇳🇴
+>
+# ---------------------------------------------------------------- G. ICH / DCH / ECH / EL / ED through wide chars
+
+
+### G01_ech_starting_on_a_spacer_blanks_the_base_too
+layer: grid
+size: 2x6
+step: put a中b
+step: goto 0 2
+step: ech 1
+cite: brief dd 5; xterm ScrnClearCells/ClearInLine (wide halves cleared as a unit); alacritty clear_wide
+note: Range [2,3) starts on the right half; the base at column 1 is orphaned, so it is blanked too.
+cells:
+>a . . b . .
+>. . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a  b
+>
+
+### G02_ech_ending_on_a_wide_base_blanks_its_spacer
+layer: grid
+size: 2x6
+step: put a中b
+step: goto 0 0
+step: ech 2
+cite: brief dd 5
+note: Range [0,2) ends on the left half: the spacer at column 2 is orphaned and blanked.
+cells:
+>. . . b . .
+>. . . . . .
+cursor: (0,0)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>   b
+>
+
+### G03_ech_covering_both_halves
+layer: grid
+size: 2x6
+step: put a中b
+step: goto 0 1
+step: ech 2
+cite: brief dd 5
+note: Clean erase; a and b survive.
+cells:
+>a . . b . .
+>. . . . . .
+cursor: (0,1)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a  b
+>
+
+### G04_ech_one_on_the_base_blanks_the_spacer
+layer: grid
+size: 2x6
+step: put a中b
+step: goto 0 1
+step: ech 1
+cite: brief dd 5
+note: Same final row as G03, reached through the right-boundary rule.
+cells:
+>a . . b . .
+>. . . . . .
+cursor: (0,1)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a  b
+>
+
+### G05_ech_count_past_the_line_end
+layer: grid
+size: 2x6
+step: put a中b
+step: goto 0 2
+step: ech 99
+cite: brief dd 5; existing Grid::erase_chars (saturating)
+note: Erases to the end; base blanked through the left-boundary rule.
+cells:
+>a . . . . .
+>. . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a
+>
+
+### G06_ech_drops_cluster_entries
+layer: grid
+size: 2x6
+step: put e\u{301}x
+step: goto 0 0
+step: ech 1
+cite: brief dd 3
+note: Cluster gone from the table with the cell.
+cells:
+>. x . . . .
+>. . . . . .
+cursor: (0,0)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+> x
+>
+
+### G07_ech_blanks_use_the_pen_background
+layer: grid
+size: 2x6
+step: put a中b
+step: pen_bg 4
+step: goto 0 2
+step: ech 1
+cite: brief dd 5
+note: Both blanks (the erased spacer and the orphaned base) have bg 4.
+cells:
+>a .@4 .@4 b . .
+>. . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a  b
+>
+
+### G08_el_to_end_from_a_spacer
+layer: grid
+size: 2x6
+step: put a中b
+step: goto 0 2
+step: el to_end
+cite: brief dd 5; existing Grid::erase_in_line
+note: Left boundary lands between the halves: the base at column 1 is blanked; the line from column 1 on is blank.
+cells:
+>a . . . . .
+>. . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a
+>
+
+### G09_el_to_end_from_a_wide_base
+layer: grid
+size: 2x6
+step: put a中b
+step: goto 0 1
+step: el to_end
+cite: brief dd 5
+note: Clean: base and everything after.
+cells:
+>a . . . . .
+>. . . . . .
+cursor: (0,1)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a
+>
+
+### G10_el_to_start_through_a_wide_base
+layer: grid
+size: 2x6
+step: put a中b
+step: goto 0 1
+step: el to_start
+cite: brief dd 5
+note: Range [0,1] ends on the left half; the spacer at column 2 is blanked. b survives.
+cells:
+>. . . b . .
+>. . . . . .
+cursor: (0,1)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>   b
+>
+
+### G11_el_to_start_through_a_spacer
+layer: grid
+size: 2x6
+step: put a中b
+step: goto 0 2
+step: el to_start
+cite: brief dd 5
+note: Range [0,2] covers both halves.
+cells:
+>. . . b . .
+>. . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>   b
+>
+
+### G12_el_all
+layer: grid
+size: 2x6
+step: put a中b
+step: goto 0 2
+step: el all
+cite: existing Grid::erase_in_line
+note: Whole line blank, nothing left in the table.
+cells:
+>. . . . . .
+>. . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>
+>
+
+### G13_ed_below_from_a_spacer
+layer: grid
+size: 3x6
+step: put a中b
+step: goto 1 0
+step: put x中y
+step: goto 0 2
+step: ed below
+cite: brief dd 5; existing Grid::erase_in_display
+note: Cursor line is cut through the wide char (base blanked); the full line below is cleared including its wide pair.
+cells:
+>a . . . . .
+>. . . . . .
+>. . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a
+>
+>
+
+### G14_ed_above_through_a_wide_base
+layer: grid
+size: 3x6
+step: put x中y
+step: goto 1 0
+step: put a中b
+step: goto 1 1
+step: ed above
+cite: brief dd 5
+note: Line 0 cleared; on line 1 [0,1] ends on the left half so the spacer at column 2 is blanked; b survives.
+cells:
+>. . . . . .
+>. . . b . .
+>. . . . . .
+cursor: (1,1)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>
+>   b
+>
+
+### G15_dch_two_at_a_wide_base_removes_the_pair
+layer: grid
+size: 1x8
+step: put a中b中c
+step: goto 0 1
+step: dch 2
+cite: brief dd 5; existing Grid::delete_chars
+note: Whole pair removed; the rest shifts left by two; the tail is padded with blanks.
+cells:
+>a b 中/W ~ c . . .
+cursor: (0,1)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>ab中c
+
+### G16_dch_one_at_a_wide_base_blanks_the_orphaned_spacer
+layer: grid
+size: 1x8
+step: put a中b中c
+step: goto 0 1
+step: dch 1
+cite: brief dd 5
+note: Deleting only the base shifts the spacer into column 1 where it has no base: blank.
+cells:
+>a . b 中/W ~ c . .
+cursor: (0,1)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a b中c
+
+### G17_dch_one_at_a_spacer_blanks_the_base
+layer: grid
+size: 1x8
+step: put a中b中c
+step: goto 0 2
+step: dch 1
+cite: brief dd 5
+note: The base in column 1 is left without its right half: blank. Everything after the deleted cell shifts left.
+cells:
+>a . b 中/W ~ c . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a b中c
+
+### G18_dch_two_from_a_spacer
+layer: grid
+size: 1x8
+step: put a中b中c
+step: goto 0 2
+step: dch 2
+cite: brief dd 5
+note: Base (column 1) blanked; spacer and b deleted; the second wide pair shifts to columns 2..3.
+cells:
+>a . 中/W ~ c . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a 中c
+
+### G19_dch_ending_mid_wide_char
+layer: grid
+size: 1x8
+step: put a中b中c
+step: goto 0 2
+step: dch 3
+cite: brief dd 5
+note: Deletes ~, b and the base of the second 中; its spacer would shift to column 2: blanked. Base of the first 中 blanked too (left boundary).
+cells:
+>a . . c . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a  c
+
+### G20_dch_more_than_the_line
+layer: grid
+size: 1x8
+step: put a中b中c
+step: goto 0 2
+step: dch 99
+cite: existing Grid::delete_chars (clamped)
+note: Clears from column 2 on; left-boundary rule blanks the first base.
+cells:
+>a . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a
+
+### G21_dch_moves_clusters_with_their_cells
+layer: grid
+size: 1x8
+step: put ae\u{301}b
+step: goto 0 0
+step: dch 1
+cite: brief dd 3 (table keyed by column must follow the cells)
+note: e+0301 moves from column 1 to column 0 and keeps its CLUSTER text.
+cells:
+>e+0301/C b . . . . . .
+cursor: (0,0)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>e\u{301}b
+
+### G22_dch_tail_blanks_use_the_pen_background
+layer: grid
+size: 1x8
+step: put a中b
+step: pen_bg 4
+step: goto 0 1
+step: dch 2
+cite: existing Grid::delete_chars (fill with pen)
+note: Blanks appended at the end carry bg 4.
+cells:
+>a b . . . . .@4 .@4
+cursor: (0,1)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>ab
+
+### G23_ich_at_a_wide_base_shifts_the_pair
+layer: grid
+size: 1x8
+step: put a中b
+step: goto 0 1
+step: ich 1
+cite: brief dd 5; existing Grid::insert_chars
+note: Pair moves from 1..2 to 2..3 intact.
+cells:
+>a . 中/W ~ b . . .
+cursor: (0,1)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a 中b
+
+### G24_ich_between_the_halves_destroys_the_pair
+layer: grid
+size: 1x8
+step: put a中b
+step: goto 0 2
+step: ich 1
+cite: brief dd 5
+note: Inserting at the spacer separates the halves: the base (column 1) is blanked and the spacer that shifts to column 3 is blanked too.
+cells:
+>a . . . b . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a   b
+
+### G25_ich_two_shifts_everything_right
+layer: grid
+size: 1x8
+step: put a中b
+step: goto 0 0
+step: ich 2
+cite: existing Grid::insert_chars
+note: Pair moves to 3..4, intact.
+cells:
+>. . a 中/W ~ b . .
+cursor: (0,0)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>  a中b
+
+### G26_ich_pushing_the_spacer_off_the_edge_blanks_the_base
+layer: grid
+size: 1x5
+step: put abc中
+step: goto 0 0
+step: ich 1
+cite: brief dd 5
+note: 中 at 3..4 shifts one to the right: its spacer falls off the line, so the base that lands in the last column is blanked.
+cells:
+>. a b c .
+cursor: (0,0)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+> abc
+
+### G27_ich_pushing_the_whole_wide_char_off
+layer: grid
+size: 1x5
+step: put abc中
+step: goto 0 0
+step: ich 2
+cite: existing Grid::insert_chars
+note: Both halves fall off; nothing stray remains.
+cells:
+>. . a b c
+cursor: (0,0)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>  abc
+
+### G28_ich_moves_clusters_with_their_cells
+layer: grid
+size: 1x8
+step: put e\u{301}b
+step: goto 0 0
+step: ich 2
+cite: brief dd 3
+note: Cluster table entry follows the cell from column 0 to column 2.
+cells:
+>. . e+0301/C b . . . .
+cursor: (0,0)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>  e\u{301}b
+
+### G29_ich_blanks_use_the_pen_background
+layer: grid
+size: 1x8
+step: put a中b
+step: pen_bg 4
+step: goto 0 2
+step: ich 1
+cite: brief dd 5
+note: The inserted blank, the orphaned base and the orphaned spacer all have bg 4.
+cells:
+>a .@4 .@4 .@4 b . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a   b
+# ---------------------------------------------------------------- H. Insert mode (IRM), DECAWM and zero-width scalars at the term layer
+
+
+### H01_insert_mode_wide_char_inserts_two_cells
+layer: term
+size: 2x8
+step: feed abc\r
+step: set insert_mode true
+step: feed 中
+cite: VT510 IRM; xterm util.c WriteText (InsertChar(cells)); kitty screen.c (insert_characters(char_width)); brief design decision 6 (insert_chars(width))
+note: Two cells inserted, then the pair written: 中 ~ a b c.
+cells:
+>中/W ~ a b c . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>中abc
+>
+
+### H02_insert_mode_pushes_content_off_the_edge
+layer: term
+size: 2x5
+step: feed abcde\r
+step: set insert_mode true
+step: feed 中
+cite: VT510 IRM ('characters moved past the right border are lost')
+note: d and e are lost; a b c shift to columns 2..4.
+cells:
+>中/W ~ a b c
+>. . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>中abc
+>
+
+### H03_insert_mode_pending_wrap_wraps_first
+layer: term
+size: 3x5
+step: feed abcde
+step: set insert_mode true
+step: feed 中
+cite: xterm charproc.c dotext() (WrapLine before WriteText); print_c0_spec D2/H05
+note: Pending + IRM + wide: wrap first (row 0 wrapped), insert 2 on the new line, write: row 1 = 中 ~.
+cells:
+>a b c d e
+>中/W ~ . . .
+>. . . . .
+cursor: (1,2)
+pending_wrap: false
+wrapped_rows(0-based): [0]
+scrollback: len=0
+text:
+>abcde
+>中
+>
+
+### H04_insert_mode_wide_with_one_column_left_blanks_wraps_inserts
+layer: term
+size: 3x5
+step: feed abcd
+step: set insert_mode true
+step: feed 中
+cite: as H03 + C01
+note: Cursor is on the last column, not pending. The wide char does not fit: blank the stranded column (as C01), wrap, then insert and write on the new row.
+cells:
+>a b c d .
+>中/W ~ . . .
+>. . . . .
+cursor: (1,2)
+pending_wrap: false
+wrapped_rows(0-based): [0]
+scrollback: len=0
+text:
+>abcd
+>中
+>
+
+### H05_insert_mode_modifier_does_not_open_a_gap
+layer: term
+size: 2x8
+step: feed xyz\r
+step: set insert_mode true
+step: feed 👍🏽
+cite: brief dd 4 (attachment in Grid::put_char); VT510 IRM
+note: TRAP. The modifier is width 2 as a char, but it attaches to 👍 and occupies no cells. A print() that does insert_chars(width(ch)) before put_char opens a 2-cell gap here. Expected 👍🏽 ~ x y z with no hole. The term needs a pure query (Grid::would_attach or equivalent) to skip insert/wrap/goto for attaching scalars. D8.
+cells:
+>👍+1F3FD/WC ~ x y z . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>👍🏽xyz
+>
+
+### H06_insert_mode_combining_mark_inserts_nothing
+layer: term
+size: 2x8
+step: feed xyz\r
+step: set insert_mode true
+step: feed e\u{301}
+cite: brief dd 4
+note: e inserts one cell; the mark (width 0) must insert nothing: e+0301 x y z.
+cells:
+>e+0301/C x y z . . . .
+>. . . . . . . .
+cursor: (0,1)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>e\u{301}xyz
+>
+
+### H07_insert_mode_mark_with_pending_wrap_does_not_wrap
+layer: term
+size: 3x5
+step: feed abcde
+step: set insert_mode true
+step: feed \u{301}
+cite: xterm doparsing() (combining handled before dotext, so no WrapLine); print_c0_spec D2 (wrap_line only for a printing char)
+note: TRAP. The existing print() runs wrap_line() for any char when insert_mode && pending_wrap. A zero-width scalar must bypass that: it attaches to 'e', row 1 stays empty, cursor (0,4), pending still armed.
+cells:
+>a b c d e+0301/C
+>. . . . .
+>. . . . .
+cursor: (0,4)
+pending_wrap: true
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>abcde\u{301}
+>
+>
+
+### H08_insert_mode_flag_growth_overwrites_instead_of_inserting
+layer: term
+size: 2x8
+step: feed xyz\r
+step: set insert_mode true
+step: feed 🇸🇪
+cite: kitty widen_cell_to_two (overwrites the neighbour); D3/D8
+flags: known-limitation
+note: First RI inserts one cell (🇸 x y z); the second attaches and grows into the cell that held 'x', which is overwritten, not shifted: 🇸🇪 ~ y z. 'x' is lost. Accepted limitation (insert on growth would need IRM knowledge inside Grid::put_char).
+cells:
+>🇸+1F1EA/WC ~ y z . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>🇸🇪yz
+>
+
+### H09_insert_mode_wide_over_wide
+layer: term
+size: 2x8
+step: feed 中文\r
+step: set insert_mode true
+step: feed 国
+cite: VT510 IRM
+note: 国 ~ 中 ~ 文 ~.
+cells:
+>国/W ~ 中/W ~ 文/W ~ . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>国中文
+>
+
+### H10_replace_mode_wide_over_narrow_text
+layer: term
+size: 2x8
+step: feed abcdef\r中
+cite: VT510 IRM (default replace)
+note: 中 overwrites a and b; c..f untouched.
+cells:
+>中/W ~ c d e f . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>中cdef
+>
+
+### H11_replace_mode_wide_over_the_middle_of_wide_chars
+layer: term
+size: 2x8
+step: feed 中文\r
+step: feed x
+cite: brief dd 5
+note: Term layer sanity for F01 with real print(): 'x' over the base of 中.
+cells:
+>x . 文/W ~ . . . .
+>. . . . . . . .
+cursor: (0,1)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>x 文
+>
+
+### H12_decawm_off_mark_with_pending_attaches_to_last_cell
+layer: term
+size: 3x5
+step: set auto_wrap false
+step: feed abcde\u{301}
+cite: xterm doparsing() (combining handled before dotext: DECAWM state is irrelevant); alacritty input() (`!input_needs_wrap` check)
+note: TRAP. The existing print() does goto(row, cols-1) whenever pending && !auto_wrap, which clears pending; a following mark would then attach to 'd' (column 3) instead of 'e'. Zero-width attach must happen BEFORE that goto. Expected: e+0301, pending stays armed.
+cells:
+>a b c d e+0301/C
+>. . . . .
+>. . . . .
+cursor: (0,4)
+pending_wrap: true
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>abcde\u{301}
+>
+>
+
+### H13_decawm_off_vs16_at_the_last_column_is_dropped
+layer: term
+size: 3x5
+step: set auto_wrap false
+step: feed abcd☺\u{FE0F}
+cite: D3, D5
+note: Same as D13 with DECAWM off: ☺ in the last column cannot widen; the selector is dropped; pending armed.
+cells:
+>a b c d ☺
+>. . . . .
+>. . . . .
+cursor: (0,4)
+pending_wrap: true
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>abcd☺
+>
+>
+
+### H14_decawm_off_second_ri_at_the_last_column_overwrites
+layer: term
+size: 3x5
+step: set auto_wrap false
+step: feed abcd🇸🇪
+cite: D3; xterm dotext() (DECAWM off overwrites the last column)
+note: 🇸 in the last column; growth refused; 🇪 is an ordinary narrow char: pending cleared by the goto, written over the same column. Result abcd🇪, no cluster.
+cells:
+>a b c d 🇪
+>. . . . .
+>. . . . .
+cursor: (0,4)
+pending_wrap: true
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>abcd🇪
+>
+>
+
+### H15_decawm_on_flag_split_at_the_edge
+layer: term
+size: 3x5
+step: feed abcd🇸🇪
+cite: D3 (term-layer twin of D10)
+note: Same final state as D10 through the real print().
+cells:
+>a b c d 🇸
+>🇪 . . . .
+>. . . . .
+cursor: (1,1)
+pending_wrap: false
+wrapped_rows(0-based): [0]
+scrollback: len=0
+text:
+>abcd🇸
+>🇪
+>
+
+### H16_feed_bytewise_family
+layer: term
+size: 2x8
+step: feed_bytewise 👨\u{200D}👩\u{200D}👧x
+cite: tessera-vt Parser is incremental (print_c0_spec I01); the grid keeps no pending-cluster buffer
+note: One advance() call per byte must give the same state as D02: attachment is decided scalar by scalar on grid state, never on buffered input.
+cells:
+>👨+200D+1F469+200D+1F467/WC ~ x . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>👨\u{200D}👩\u{200D}👧x
+>
+
+### H17_feed_bytewise_flag_and_tone
+layer: term
+size: 2x8
+step: feed_bytewise 🇸🇪👍🏽a
+cite: as H16
+note: Same state as D03 + D01 combined.
+cells:
+>🇸+1F1EA/WC ~ 👍+1F3FD/WC ~ a . . .
+>. . . . . . . .
+cursor: (0,5)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>🇸🇪👍🏽a
+>
+
+
+### H18_decawm_off_three_column_scalar_at_the_last_column_is_dropped
+layer: term
+size: 1x4
+step: set auto_wrap false
+step: feed abc៘
+cite: D2; A33 (clamped to 2)
+note: Added in verification of #4. With the width clamped to 2 the scalar is a wide character with one column left: dropped, no wrap and no scroll on the bottom (only) row.
+cells:
+>a b c .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>abc
+
+### H19_insert_mode_three_column_scalar_inserts_two_cells
+layer: term
+size: 1x8
+step: feed abcdef\r
+step: set insert_mode true
+step: feed ៘
+cite: brief dd 6 (insert_chars(width)); A33 (clamped to 2)
+note: Added in verification of #4. Two cells are inserted and the pair is written: no third, stray cell.
+cells:
+>៘/W ~ a b c d e f
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>៘abcdef
+
+# ---------------------------------------------------------------- I. Lines and scrolling carry the table
+
+
+### I01_scrolled_off_cluster_text_is_kept_in_scrollback
+layer: grid
+size: 2x4
+step: put e\u{301}中
+step: cr
+step: lf
+step: lf
+cite: brief dd 3 (Line::text emits cluster text and skips spacers; scroll moves the table with the line); existing scrollback tests
+note: Row 0 scrolls out. scrollback_line(0).text() must be 'e'+U+0301+'中' (spacer skipped), not 'e中 '.
+cells:
+>. . . .
+>. . . .
+cursor: (1,0)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=1 first=("e\u{301}中", wrapped=false)
+text:
+>
+>
+
+### I02_reset_clears_clusters
+layer: grid
+size: 2x4
+step: put e\u{301}中
+step: reset
+cite: existing Grid::reset (RIS)
+note: After reset every line is blank and every table empty.
+cells:
+>. . . .
+>. . . .
+cursor: (0,0)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>
+>
+
+### I03_line_text_skips_spacers_and_trims_trailing_blanks
+layer: grid
+size: 2x8
+step: put a中b👍🏽
+cite: brief dd 3 (Line::text)
+note: Expected text 'a中b👍🏽' (no gaps from spacers).
+cells:
+>a 中/W ~ b 👍+1F3FD/WC ~ . .
+>. . . . . . . .
+cursor: (0,6)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a中b👍🏽
+>
+# ---------------------------------------------------------------- end
+

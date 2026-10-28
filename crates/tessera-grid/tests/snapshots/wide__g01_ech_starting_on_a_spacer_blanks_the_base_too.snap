@@ -1,0 +1,14 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: "Range [2,3) starts on the right half; the base at column 1 is orphaned, so it is blanked too."
+---
+cells:
+>a . . b . .
+>. . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a  b
+>

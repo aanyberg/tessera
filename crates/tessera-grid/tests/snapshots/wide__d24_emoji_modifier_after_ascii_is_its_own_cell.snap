@@ -1,0 +1,14 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: "Decision D4: attach only if the joined cluster is at most 2 columns wide (or a ZWJ sequence). 'a'+🏽 would be 3 wide, so the modifier is NOT attached and is written as an ordinary wide char: 3 cells total, matching UnicodeWidthStr::width(\"a🏽\") = 3."
+---
+cells:
+>a 🏽/W ~ . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a🏽
+>

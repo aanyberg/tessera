@@ -1,0 +1,4 @@
+# Fixture case H15_decawm_on_flag_split_at_the_edge (crates/tessera-grid/tests/fixtures/wide_grapheme_spec.txt).
+# Same final state as D10 through the real print().
+@size 3x5
+abcd🇸🇪

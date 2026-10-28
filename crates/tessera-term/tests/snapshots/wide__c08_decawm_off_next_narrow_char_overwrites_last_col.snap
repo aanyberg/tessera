@@ -1,0 +1,26 @@
+---
+source: crates/tessera-term/tests/wide.rs
+input_file: crates/tessera-term/tests/scripts/wide/c08_decawm_off_next_narrow_char_overwrites_last_col.txt
+---
+abcdX|
+
+
+--
+cursor: (0,4)
+pending_wrap: true
+auto_wrap: false insert_mode: false
+requests: []
+scrollback: 0
+--
+cells:
+>a b c d X
+>. . . . .
+>. . . . .
+cursor: (0,4)
+pending_wrap: true
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>abcdX
+>
+>

@@ -1,0 +1,20 @@
+---
+source: crates/tessera-term/tests/wide.rs
+input_file: crates/tessera-term/tests/scripts/wide/h19_insert_mode_three_column_scalar_inserts_two_cells.txt
+---
+៘a|bcdef
+--
+cursor: (0,2)
+pending_wrap: false
+auto_wrap: true insert_mode: true
+requests: []
+scrollback: 0
+--
+cells:
+>៘/W ~ a b c d e f
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>៘abcdef

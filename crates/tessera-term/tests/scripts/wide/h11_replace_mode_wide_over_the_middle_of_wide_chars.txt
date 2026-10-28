@@ -1,0 +1,5 @@
+# Fixture case H11_replace_mode_wide_over_the_middle_of_wide_chars (crates/tessera-grid/tests/fixtures/wide_grapheme_spec.txt).
+# Term layer sanity for F01 with real print(): 'x' over the base of 中.
+@size 2x8
+中文\r
+x

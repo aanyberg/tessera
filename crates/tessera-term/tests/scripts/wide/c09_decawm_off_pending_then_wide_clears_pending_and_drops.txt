@@ -1,0 +1,5 @@
+# Fixture case C09_decawm_off_pending_then_wide_clears_pending_and_drops (crates/tessera-grid/tests/fixtures/wide_grapheme_spec.txt).
+# Pending wrap armed by 'e' is CONSUMED by the dropped wide char (cursor stays (0,4), pending false), nothing changes in the row.
+@size 3x5
+@set auto_wrap false
+abcde中

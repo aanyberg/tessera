@@ -1,0 +1,12 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: Pair moves from 1..2 to 2..3 intact.
+---
+cells:
+>a . 中/W ~ b . . .
+cursor: (0,1)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a 中b

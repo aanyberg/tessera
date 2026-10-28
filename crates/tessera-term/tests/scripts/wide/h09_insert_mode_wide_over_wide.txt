@@ -1,0 +1,6 @@
+# Fixture case H09_insert_mode_wide_over_wide (crates/tessera-grid/tests/fixtures/wide_grapheme_spec.txt).
+# 国 ~ 中 ~ 文 ~.
+@size 2x8
+中文\r
+@set insert_mode true
+国

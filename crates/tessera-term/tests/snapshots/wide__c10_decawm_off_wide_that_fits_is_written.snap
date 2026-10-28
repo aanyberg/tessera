@@ -1,0 +1,26 @@
+---
+source: crates/tessera-term/tests/wide.rs
+input_file: crates/tessera-term/tests/scripts/wide/c10_decawm_off_wide_that_fits_is_written.txt
+---
+ab中 |
+
+
+--
+cursor: (0,4)
+pending_wrap: false
+auto_wrap: false insert_mode: false
+requests: []
+scrollback: 0
+--
+cells:
+>a b 中/W ~ .
+>. . . . .
+>. . . . .
+cursor: (0,4)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>ab中
+>
+>

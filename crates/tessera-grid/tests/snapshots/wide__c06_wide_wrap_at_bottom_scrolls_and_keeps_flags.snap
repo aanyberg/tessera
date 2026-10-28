@@ -1,0 +1,14 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: "'abcde' wraps into 'fghi' (cursor on column 4, not pending), then the wide char wraps at the bottom: row 0 scrolls into scrollback (wrapped=true), the old row 1 becomes row 0 wrapped."
+---
+cells:
+>f g h i .
+>中/W ~ . . .
+cursor: (1,2)
+pending_wrap: false
+wrapped_rows(0-based): [0]
+scrollback: len=1 first=("abcde", wrapped=true)
+text:
+>fghi
+>中

@@ -1,0 +1,4 @@
+# Fixture case H10_replace_mode_wide_over_narrow_text (crates/tessera-grid/tests/fixtures/wide_grapheme_spec.txt).
+# 中 overwrites a and b; c..f untouched.
+@size 2x8
+abcdef\r中

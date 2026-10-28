@@ -1,0 +1,6 @@
+# Fixture case H05_insert_mode_modifier_does_not_open_a_gap (crates/tessera-grid/tests/fixtures/wide_grapheme_spec.txt).
+# TRAP. The modifier is width 2 as a char, but it attaches to 👍 and occupies no cells. A print() that does insert_chars(width(ch)) before put_char opens a 2-cell gap here. Expected 👍🏽 ~ x y z with no hole. The term needs a pure query (Grid::would_attach or equivalent) to skip insert/wrap/goto for attaching scalars. D8.
+@size 2x8
+xyz\r
+@set insert_mode true
+👍🏽

@@ -1,0 +1,23 @@
+---
+source: crates/tessera-term/tests/wide.rs
+input_file: crates/tessera-term/tests/scripts/wide/h08_insert_mode_flag_growth_overwrites_instead_of_inserting.txt
+---
+🇸🇪y|z
+
+--
+cursor: (0,2)
+pending_wrap: false
+auto_wrap: true insert_mode: true
+requests: []
+scrollback: 0
+--
+cells:
+>🇸+1F1EA/WC ~ y z . . . .
+>. . . . . . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>🇸🇪yz
+>

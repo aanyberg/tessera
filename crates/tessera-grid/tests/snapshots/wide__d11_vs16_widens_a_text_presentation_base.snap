@@ -1,0 +1,14 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: "☺ (narrow) + VS16 => WIDE|CLUSTER pair, cursor 2, x in column 2. The brief's 'VS16 turning a narrow char wide'."
+---
+cells:
+>☺+FE0F/WC ~ x . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>☺\u{FE0F}x
+>

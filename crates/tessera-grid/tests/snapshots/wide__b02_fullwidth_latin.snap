@@ -1,0 +1,14 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: Fullwidth forms are wide even though they look Latin.
+---
+cells:
+>Ａ/W ~ ｂ/W ~ . . . .
+>. . . . . . . .
+cursor: (0,4)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>Ａｂ
+>

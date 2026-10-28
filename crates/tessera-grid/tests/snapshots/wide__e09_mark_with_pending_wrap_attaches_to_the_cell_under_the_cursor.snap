@@ -1,0 +1,16 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: "'e' sits under the cursor (last column, pending). The mark attaches to 'e', NOT 'd', and pending_wrap stays armed (no wrap happens for a zero-width scalar)."
+---
+cells:
+>a b c d e+0301/C
+>. . . . .
+>. . . . .
+cursor: (0,4)
+pending_wrap: true
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>abcde\u{301}
+>
+>

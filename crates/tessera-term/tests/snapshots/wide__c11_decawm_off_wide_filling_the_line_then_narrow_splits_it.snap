@@ -1,0 +1,26 @@
+---
+source: crates/tessera-term/tests/wide.rs
+input_file: crates/tessera-term/tests/scripts/wide/c11_decawm_off_wide_filling_the_line_then_narrow_splits_it.txt
+---
+abc X|
+
+
+--
+cursor: (0,4)
+pending_wrap: true
+auto_wrap: false insert_mode: false
+requests: []
+scrollback: 0
+--
+cells:
+>a b c . X
+>. . . . .
+>. . . . .
+cursor: (0,4)
+pending_wrap: true
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>abc X
+>
+>

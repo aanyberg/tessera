@@ -1,0 +1,6 @@
+# Fixture case H04_insert_mode_wide_with_one_column_left_blanks_wraps_inserts (crates/tessera-grid/tests/fixtures/wide_grapheme_spec.txt).
+# Cursor is on the last column, not pending. The wide char does not fit: blank the stranded column (as C01), wrap, then insert and write on the new row.
+@size 3x5
+abcd
+@set insert_mode true
+中

@@ -1,0 +1,14 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: "The first RI is a plain narrow cell (cursor 1). The second RI joins the cluster, the cluster is now 2 cells: the cell under the cursor (column 1) becomes the SPACER and the cursor moves to 2. x lands in column 2."
+---
+cells:
+>🇸+1F1EA/WC ~ x . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>🇸🇪x
+>

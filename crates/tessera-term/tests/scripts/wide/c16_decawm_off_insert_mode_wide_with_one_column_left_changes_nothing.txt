@@ -1,0 +1,6 @@
+# Fixture case C16_decawm_off_insert_mode_wide_with_one_column_left_changes_nothing (crates/tessera-grid/tests/fixtures/wide_grapheme_spec.txt).
+# TRAP. IRM + DECAWM off: the dropped wide char must not insert two cells or blank anything before being dropped. Same final state as C07.
+@size 3x5
+@set auto_wrap false
+@set insert_mode true
+abcd中

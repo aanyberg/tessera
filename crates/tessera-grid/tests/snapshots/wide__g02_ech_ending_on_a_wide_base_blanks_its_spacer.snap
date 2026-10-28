@@ -1,0 +1,14 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: "Range [0,2) ends on the left half: the spacer at column 2 is orphaned and blanked."
+---
+cells:
+>. . . b . .
+>. . . . . .
+cursor: (0,0)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>   b
+>

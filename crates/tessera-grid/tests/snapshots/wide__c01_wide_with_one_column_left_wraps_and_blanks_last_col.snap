@@ -1,0 +1,16 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: "Cursor is on the last column (not pending) with 1 column left. Recommended: blank the stranded last column with the pen background, mark row 0 wrapped, write at (1,0). xterm itself leaves the cell untouched (see ISSUE TEXT CORRECTIONS 1). D1."
+---
+cells:
+>a b c d .
+>中/W ~ . . .
+>. . . . .
+cursor: (1,2)
+pending_wrap: false
+wrapped_rows(0-based): [0]
+scrollback: len=0
+text:
+>abcd
+>中
+>

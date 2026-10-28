@@ -1,0 +1,26 @@
+---
+source: crates/tessera-term/tests/wide.rs
+input_file: crates/tessera-term/tests/scripts/wide/h03_insert_mode_pending_wrap_wraps_first.txt
+---
+abcde\
+中 |
+
+--
+cursor: (1,2)
+pending_wrap: false
+auto_wrap: true insert_mode: true
+requests: []
+scrollback: 0
+--
+cells:
+>a b c d e
+>中/W ~ . . .
+>. . . . .
+cursor: (1,2)
+pending_wrap: false
+wrapped_rows(0-based): [0]
+scrollback: len=0
+text:
+>abcde
+>中
+>

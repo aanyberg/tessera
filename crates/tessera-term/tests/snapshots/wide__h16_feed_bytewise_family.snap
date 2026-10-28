@@ -1,0 +1,23 @@
+---
+source: crates/tessera-term/tests/wide.rs
+input_file: crates/tessera-term/tests/scripts/wide/h16_feed_bytewise_family.txt
+---
+👨‍👩‍👧x |
+
+--
+cursor: (0,3)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0
+--
+cells:
+>👨+200D+1F469+200D+1F467/WC ~ x . . . . .
+>. . . . . . . .
+cursor: (0,3)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>👨\u{200D}👩\u{200D}👧x
+>

@@ -1,0 +1,14 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: x in column 0; the SPACER in column 1 becomes a blank; 文 untouched. Cursor 1.
+---
+cells:
+>x . 文/W ~ . . . .
+>. . . . . . . .
+cursor: (0,1)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>x 文
+>

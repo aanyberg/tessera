@@ -1,0 +1,12 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: "Inserting at the spacer separates the halves: the base (column 1) is blanked and the spacer that shifts to column 3 is blanked too."
+---
+cells:
+>a . . . b . . .
+cursor: (0,2)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a   b

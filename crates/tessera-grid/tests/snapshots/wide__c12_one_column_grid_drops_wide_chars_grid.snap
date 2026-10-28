@@ -1,0 +1,14 @@
+---
+source: crates/tessera-grid/tests/wide.rs
+description: "A wide char can never fit a 1-column grid: it is dropped (no wrap, no scroll, no infinite loop), the 'a' that follows lands in column 0 and arms pending."
+---
+cells:
+>a
+>.
+cursor: (0,0)
+pending_wrap: true
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>a
+>

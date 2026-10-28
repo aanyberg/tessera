@@ -1,0 +1,23 @@
+---
+source: crates/tessera-term/tests/wide.rs
+input_file: crates/tessera-term/tests/scripts/wide/h17_feed_bytewise_flag_and_tone.txt
+---
+🇸🇪👍🏽a |
+
+--
+cursor: (0,5)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0
+--
+cells:
+>🇸+1F1EA/WC ~ 👍+1F3FD/WC ~ a . . .
+>. . . . . . . .
+cursor: (0,5)
+pending_wrap: false
+wrapped_rows(0-based): []
+scrollback: len=0
+text:
+>🇸🇪👍🏽a
+>

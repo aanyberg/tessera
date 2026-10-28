@@ -18,7 +18,7 @@ pub use keyboard::{
     ModifyOtherKeys, encode_key, encode_key_into,
 };
 
-use tessera_grid::Grid;
+use tessera_grid::{Cell, Grid};
 use tessera_vt::{Action, Parser};
 use tracing::trace;
 
@@ -181,6 +181,11 @@ impl State {
     }
 
     /// Writes `ch` at the cursor, honouring auto-wrap and insert mode.
+    ///
+    /// Width comes from the grid ([`tessera_grid::char_width`]): a wide
+    /// character needs two columns, and a scalar that joins the previous
+    /// character's grapheme cluster ([`Grid::would_attach`]) takes none, so
+    /// it bypasses insert mode, wrapping and DECAWM entirely.
     fn print(&mut self, ch: char) {
         // The parser hands DEL (0x7F) over as a printable; like any other
         // control character it must never occupy a cell.
@@ -188,20 +193,66 @@ impl State {
             trace!(ch = ?ch, "control character dropped from print");
             return;
         }
-        if self.grid.pending_wrap() {
-            if !self.auto_wrap {
+        if self.auto_wrap && !self.insert_mode {
+            // The default modes are exactly what the grid's own write does:
+            // attach, drop zero-width scalars, wrap first when needed.
+            self.grid.put_char(ch);
+            return;
+        }
+        if self.grid.would_attach(ch) {
+            self.grid.put_char(ch);
+            return;
+        }
+        let width = match tessera_grid::char_width(ch) {
+            Some(width) if width > 0 => width,
+            _ => {
+                trace!(ch = ?ch, "zero-width scalar with nothing to join dropped");
+                return;
+            }
+        };
+        let last = self.grid.cols() - 1;
+        if width > self.grid.cols() {
+            trace!(ch = ?ch, "wide character dropped: the grid has one column");
+            return;
+        }
+        if !self.auto_wrap {
+            if self.grid.pending_wrap() {
                 // The grid always arms a pending wrap on the last column.
                 // Without DECAWM the character overwrites that column.
                 let row = self.grid.cursor().row;
-                self.grid.goto(row, self.grid.cols() - 1);
-            } else if self.insert_mode {
-                // `insert_chars` disarms the pending wrap, so wrap first and
-                // insert on the new line, as xterm does.
-                self.wrap_line();
+                self.grid.goto(row, last);
             }
+            if width == 2 && self.grid.cursor().col == last {
+                // No room and no wrap: the character is dropped (xterm).
+                return;
+            }
+            if self.insert_mode {
+                self.grid.insert_chars(width);
+            }
+            if width == 1 {
+                // `put_char` would look for a cluster to join again, now
+                // left of the cursor the goto just cleared the pending wrap
+                // for; the character was already found not to join one.
+                let pen = self.grid.pen();
+                self.grid.put_cell(Cell::new(ch, pen));
+            } else {
+                self.grid.put_char(ch);
+            }
+            return;
         }
         if self.insert_mode {
-            self.grid.insert_chars(1);
+            let stranded = width == 2 && self.grid.cursor().col == last;
+            if self.grid.pending_wrap() || stranded {
+                // `insert_chars` disarms the pending wrap, so wrap first and
+                // insert on the new line, as xterm does. A wide character
+                // with one column left first blanks that column, as the
+                // grid does in replace mode.
+                if !self.grid.pending_wrap() {
+                    self.grid.erase_chars(1);
+                }
+                self.wrap_line();
+            }
+            self.grid.insert_chars(width);
         }
         self.grid.put_char(ch);
     }
