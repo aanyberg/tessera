@@ -180,10 +180,11 @@ fn cut_or_pad(line: &mut Line, cols: u16) {
 }
 
 /// A blank as far as reflow is concerned: exactly [`Cell::BLANK`], a
-/// space with the default style, or padding ([`Cell::is_pad`]). Trailing
-/// ones end a logical line's text and rows made of them may be dropped; a
-/// space with any colour or attribute (a background fill, an underline,
-/// inverse video) is content.
+/// space with the default style, or padding ([`Cell::is_pad`]) of any
+/// background (the pen's from `put_wide`, the wide character's from a
+/// re-wrap). Trailing ones end a logical line's text and rows made
+/// of them may be dropped; any other space with a colour or attribute (a
+/// background fill, an underline, inverse video) is content.
 fn plain_blank(cell: &Cell) -> bool {
     *cell == Cell::BLANK || (cell.is_pad() && cell.ch == ' ')
 }
@@ -480,9 +481,9 @@ impl Rewrapper {
 
     /// Splits `joined[..end]` into rows of the new width, never splitting a
     /// wide character from its spacer: one that does not fit starts the
-    /// next row and leaves a padding cell ([`Cell::is_pad`]) behind. A wide
-    /// character wider
-    /// than the whole row (one column) is dropped. Clusters move with
+    /// next row and leaves a padding cell ([`Cell::is_pad`]) with the wide
+    /// character's background behind. A wide character wider than the whole
+    /// row (one column) is dropped. Clusters move with
     /// their cells. Returns the number of cells on the last row.
     fn split(&mut self, end: usize, cursor_offset: Option<usize>) -> usize {
         let cols = usize::from(self.cols);
@@ -523,15 +524,8 @@ impl Rewrapper {
                 continue;
             }
             if row.cells.len() + width > cols {
-                if row.cells.len() + 1 == cols {
-                    // The column a wide character does not fit into is
-                    // padding, so the next join drops it again.
-                    row.cells.push(Cell::pad_with(Style::DEFAULT));
-                }
-                row.cells.resize(cols, Cell::BLANK);
-                row.wrapped = true;
-                let full = std::mem::replace(&mut row, empty_row(cols));
-                self.push_row(full);
+                let pad_for = (row.cells.len() + 1 == cols).then_some(p);
+                self.break_row(&mut row, pad_for);
             }
             let col = row.cells.len();
             if holds_cursor {
@@ -557,6 +551,29 @@ impl Rewrapper {
         row.cells.resize(cols, Cell::BLANK);
         self.push_row(row);
         last_len
+    }
+
+    /// Ends the full output row `row` (wrapped), appends it to the output
+    /// and leaves `row` empty. When `pad_for` is the index in `joined` of
+    /// a wide character that does not fit in the one column left, that
+    /// column becomes padding first, so the next join drops it again. The
+    /// padding takes the character's background, as the padding a live
+    /// write leaves does ([`Cell::pad_with`], like an erase), so a coloured
+    /// band has no gap where the character wrapped (#88).
+    ///
+    /// Out of line: it runs once per row, and kept out of the per-cell
+    /// loop of [`Rewrapper::split`] it leaves that loop's registers alone
+    /// (#88).
+    #[inline(never)]
+    fn break_row(&mut self, row: &mut Line, pad_for: Option<usize>) {
+        let cols = usize::from(self.cols);
+        if let Some(p) = pad_for {
+            row.cells.push(Cell::pad_with(self.joined[p].style));
+        }
+        row.cells.resize(cols, Cell::BLANK);
+        row.wrapped = true;
+        let full = std::mem::replace(row, empty_row(cols));
+        self.push_row(full);
     }
 
     /// Places a cursor that sat `past` cells after the end of the logical
@@ -674,6 +691,49 @@ mod tests {
         assert!(line.graphemes.is_empty());
         cut_or_pad(&mut line, 5);
         assert_eq!(line.cells.len(), 5);
+    }
+
+    /// #88: the padding `split` leaves before a wide character that does
+    /// not fit takes that character's background (and nothing else, like
+    /// the padding a live write leaves), so a coloured band has no gap
+    /// where the character wrapped.
+    #[test]
+    fn split_pads_with_the_background_of_the_wide_cell() {
+        let style = Style {
+            fg: crate::Color::Indexed(2),
+            bg: crate::Color::Indexed(4),
+            ..Style::DEFAULT.with(Style::UNDERLINE)
+        };
+        let cursor = SourceCursor {
+            index: usize::MAX,
+            col: 0,
+            pending_wrap: false,
+        };
+        let mut rewrapper = Rewrapper::new(5, cursor, 100);
+        rewrapper.joined = "abcd"
+            .chars()
+            .map(|ch| Cell::new(ch, Style::DEFAULT))
+            .collect();
+        rewrapper.joined.push(Cell {
+            flags: crate::CellFlags::WIDE,
+            ..Cell::new('中', style)
+        });
+        rewrapper.joined.push(Cell::spacer(style));
+        let end = rewrapper.joined.len();
+        assert_eq!(rewrapper.split(end, None), 2);
+        let (out, _, _) = rewrapper.finish();
+        assert_eq!(out.len(), 2);
+        let pad = out[0].cells[4];
+        assert!(pad.is_pad() && out[0].wrapped);
+        assert_eq!(pad.ch, ' ');
+        assert_eq!(
+            pad.style,
+            Cell::blank_with(style).style,
+            "the pad takes the wide cell's background only"
+        );
+        assert_eq!(pad.style.bg, crate::Color::Indexed(4));
+        assert!(plain_blank(&pad), "and is still not text");
+        assert!(out[1].cells[0].is_wide());
     }
 
     /// Review round 3: one logical line spanning the whole history never

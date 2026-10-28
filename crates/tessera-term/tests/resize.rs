@@ -7,7 +7,7 @@
 mod common;
 
 use common::render_screen;
-use tessera_grid::{Point, ScrollRegion, Style};
+use tessera_grid::{Color, Point, ScrollRegion, Style};
 use tessera_term::Terminal;
 
 /// Fixture row A01 of `tessera-grid`'s `reflow_spec.txt`, through the
@@ -146,6 +146,31 @@ fn a_column_by_column_drag_keeps_every_space() {
     assert_eq!(spaces(&term), before);
 }
 
+/// #88: a background band that a wide character wraps through keeps its
+/// colour in the padding a re-wrap leaves behind (widen, then narrow
+/// back): the same cell the live write left.
+#[test]
+fn reflow_padding_keeps_the_band_colour() {
+    let mut term = Terminal::new(3, 5);
+    term.advance("\x1b[44mabcd中ef\x1b[K\x1b[0m".as_bytes());
+    let pad = |term: &Terminal| term.grid().cell(Point::new(0, 4)).copied();
+    let live = pad(&term);
+    assert!(live.is_some_and(|c| c.is_pad() && c.style.bg == Color::Indexed(4)));
+    term.resize(3, 6);
+    assert_eq!(render_screen(&term), "abcd中\\\nef |\n\n");
+    term.resize(3, 5);
+    let cell = pad(&term).expect("row 0 has five columns");
+    assert!(cell.is_pad(), "{cell:?}");
+    assert_eq!(cell.style.bg, Color::Indexed(4), "{cell:?}");
+    assert_eq!(Some(cell), live, "the cell a live write leaves");
+    assert_eq!(
+        term.grid()
+            .cell(Point::new(1, 0))
+            .map(|c| (c.ch, c.is_wide())),
+        Some(('中', true))
+    );
+}
+
 /// The padding a wrapped wide character leaves is cleared by DECALN, and
 /// insert mode pads the stranded column like replace mode.
 #[test]
@@ -166,4 +191,52 @@ fn padding_follows_the_terminal_paths() {
     assert_eq!(pad(&term), Some(true), "insert mode pads too");
     term.resize(3, 8);
     assert_eq!(screen_text(&term)[0], "abcd中");
+}
+
+/// #88, hostile drag: coloured, underlined lines of mixed CJK and ASCII,
+/// resized one column at a time from 40 down to 2 and back, keep every
+/// glyph's style, and every padding cell has the background of the wide
+/// character after it and nothing else of its style.
+#[test]
+fn a_column_drag_keeps_padding_in_the_band_colour() {
+    let mut term = Terminal::new(6, 40);
+    for n in 0..12u8 {
+        let line = format!(
+            "\x1b[4{};3{};{}m中a文bc日本 語x{n}\x1b[K\x1b[0m\r\n",
+            n % 8,
+            (n + 3) % 8,
+            if n % 2 == 0 { 4 } else { 7 }
+        );
+        term.advance(line.as_bytes());
+    }
+    let glyphs = |term: &Terminal| {
+        let mut out = Vec::new();
+        for line in term.grid().logical_lines() {
+            for cell in &line.cells {
+                if !cell.is_spacer() && !cell.is_pad() && cell.ch != ' ' {
+                    out.push((cell.ch, cell.style));
+                }
+            }
+        }
+        out
+    };
+    let before = glyphs(&term);
+    for cols in (2..40).rev().chain(3..=40) {
+        term.resize(6, cols);
+        let lines: Vec<_> = term.grid().logical_lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            for (col, cell) in line.cells.iter().enumerate() {
+                if cell.is_pad() {
+                    let wide = lines.get(i + 1).and_then(|l| l.cells.first());
+                    assert!(col + 1 == line.cells.len() && line.wrapped, "at {cols}");
+                    assert_eq!(
+                        wide.map(|w| (w.is_wide(), tessera_grid::Cell::blank_with(w.style).style)),
+                        Some((true, cell.style)),
+                        "at {cols}"
+                    );
+                }
+            }
+        }
+        assert_eq!(glyphs(&term), before, "at {cols} columns");
+    }
 }

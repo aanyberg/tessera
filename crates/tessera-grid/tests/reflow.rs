@@ -25,7 +25,7 @@ use common::{Step, assert_invariants, invariant_errors};
 use proptest::prelude::*;
 use reflow_spec::{Op, Script, check_row, render_row, render_state, rows};
 use tessera_grid::{
-    Cell, CellFlags, Color, EraseDisplay, EraseLine, Grid, Line, Mark, Point, Style,
+    Cell, CellFlags, Color, DamageRows, EraseDisplay, EraseLine, Grid, Line, Mark, Point, Style,
 };
 
 // ------------------------------------------------------------------ fixture
@@ -726,6 +726,88 @@ proptest! {
     }
 }
 
+/// Every padding cell of `grid` (primary screen and history) next to the
+/// wide cell that starts the following row, as `(pad, wide)` pairs, and
+/// whether every padding cell has one.
+fn pads_and_their_wide_cells(grid: &Grid) -> (Vec<(Cell, Cell)>, bool) {
+    let lines: Vec<&Line> = grid.logical_lines().collect();
+    let mut pairs = Vec::new();
+    let mut all = true;
+    for (i, line) in lines.iter().enumerate() {
+        for (col, cell) in line.cells.iter().enumerate() {
+            if !cell.is_pad() {
+                continue;
+            }
+            let next = (col + 1 == line.cells.len() && line.wrapped)
+                .then(|| lines.get(i + 1).and_then(|l| l.cells.first()))
+                .flatten()
+                .filter(|c| c.is_wide());
+            match next {
+                Some(wide) => pairs.push((*cell, *wide)),
+                None => all = false,
+            }
+        }
+    }
+    (pairs, all)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(96))]
+
+    /// #88: after `resize(cols - 1)` then `resize(cols)`, every padding
+    /// cell is the last column of a wrapped row followed by a wide cell,
+    /// and has that wide cell's background and nothing else of its style
+    /// (`Cell::blank_with`, as a live write pads). Lines are written with
+    /// the test pens (underline, inverse, foreground) over a random
+    /// background, and the pen changes inside lines too.
+    #[test]
+    fn round_trip_padding_takes_the_background_of_its_wide_char(
+        rows in 1..9u16,
+        cols in 3..14u16,
+        lines in text_lines(true),
+        pens in prop::collection::vec((0..5usize, 0..4u8), 0..6),
+        split_pens in prop::collection::vec((0..5usize, 0..4u8), 0..6),
+    ) {
+        let style = |choice: Option<&(usize, u8)>| {
+            let (index, bg) = choice.copied().unwrap_or((0, 0));
+            Style {
+                bg: if bg == 0 { Color::Default } else { Color::Indexed(bg) },
+                ..pen(index)
+            }
+        };
+        let mut grid = Grid::new(rows, cols);
+        // Each line is written in two halves with different pens, so a
+        // wide character's style differs from its neighbours'.
+        for (i, line) in lines.iter().enumerate() {
+            if i > 0 {
+                grid.carriage_return();
+                grid.line_feed();
+            }
+            let half = line.char_indices().nth(line.chars().count() / 2).map_or(0, |(at, _)| at);
+            grid.set_pen(style(pens.get(i)));
+            grid.put_str(&line[..half]);
+            grid.set_pen(style(split_pens.get(i)));
+            grid.put_str(&line[half..]);
+        }
+        grid.set_pen(Style::DEFAULT);
+        let texts = logical_texts(&grid);
+        grid.resize(rows, cols - 1);
+        assert_invariants("narrower", &grid);
+        grid.resize(rows, cols);
+        assert_invariants("and back", &grid);
+        prop_assert_eq!(logical_texts(&grid), texts);
+        let (pairs, all) = pads_and_their_wide_cells(&grid);
+        prop_assert!(all, "padding without a wide cell after it");
+        for (pad, wide) in pairs {
+            prop_assert_eq!(pad.style.bg, wide.style.bg);
+            prop_assert_eq!(
+                pad,
+                Cell { flags: CellFlags::PAD, ..Cell::blank_with(wide.style) }
+            );
+        }
+    }
+}
+
 // --------------------------------------------------------- direct tests
 
 #[test]
@@ -1113,25 +1195,136 @@ fn widening_the_alternate_screen_unpads_its_old_last_column() {
     assert_eq!(grid.cell(Point::new(0, 4)), Some(&Cell::BLANK));
 }
 
-/// Review round 3: the column a re-wrap strands is padding in the default
-/// style, not the pen's or the text's.
+/// Review round 3, changed by #88: the column a re-wrap strands is padding
+/// with the background of the wide character that wrapped (not the pen's,
+/// and none of its other attributes), the cell a live write would leave.
 #[test]
-fn a_rewrap_pads_with_the_default_style() {
+fn a_rewrap_pads_with_the_background_of_the_wide_char() {
+    let text = Style {
+        fg: Color::Indexed(2),
+        bg: Color::Indexed(4),
+        ..Style::DEFAULT.with(Style::UNDERLINE)
+    };
     let mut grid = Grid::new(3, 6);
-    grid.set_pen(pen(1));
+    grid.set_pen(text);
     grid.put_str("abcd中");
     grid.set_pen(pen(3));
     grid.resize(3, 5);
     let cell = grid.cell(Point::new(0, 4)).copied().unwrap();
     assert!(cell.is_pad());
-    assert_eq!(
-        Cell {
-            flags: CellFlags::EMPTY,
-            ..cell
-        },
-        Cell::BLANK
-    );
     assert_eq!(cell.flags, CellFlags::PAD);
+    assert_eq!((cell.ch, cell.style), (' ', Cell::blank_with(text).style));
+    let wide = grid.cell(Point::new(1, 0)).copied().unwrap();
+    assert!(wide.is_wide());
+    assert_eq!(wide.style, text);
+    // A live write of the same text at five columns leaves the same cell.
+    let mut live = Grid::new(3, 5);
+    live.set_pen(text);
+    live.put_str("abcd中");
+    assert_eq!(live.cell(Point::new(0, 4)).copied(), Some(cell));
+}
+
+/// #88, critic round 1: three wide characters of different styles on one
+/// logical line, each stranded by a narrower re-wrap, each leave padding in
+/// their own background (and nothing else of their style), the narrow text
+/// around them keeps its own style, and the result is stable across a
+/// further round trip.
+#[test]
+fn each_stranded_wide_char_pads_with_its_own_background() {
+    let styles = [
+        Style {
+            fg: Color::Indexed(2),
+            bg: Color::Indexed(1),
+            ..Style::DEFAULT.with(Style::UNDERLINE)
+        },
+        Style {
+            bg: Color::Rgb(10, 20, 30),
+            ..Style::DEFAULT.with(Style::INVERSE)
+        },
+        Style {
+            bg: Color::Indexed(4),
+            ..Style::DEFAULT
+        },
+    ];
+    let narrow = pen(4);
+    // At six columns: [abcd中] [ab文ab] [日].
+    let mut grid = Grid::new(4, 6);
+    grid.set_pen(narrow);
+    grid.put_str("abcd");
+    for (style, (wide, after)) in styles.iter().zip([("中", "ab"), ("文", "ab"), ("日", "")]) {
+        grid.set_pen(*style);
+        grid.put_str(wide);
+        grid.set_pen(narrow);
+        grid.put_str(after);
+    }
+    grid.set_pen(Style::DEFAULT);
+    assert_eq!(pads(&grid), 0);
+    // At five columns: [abcd_] [中ab_] [文ab_] [日], `_` padding.
+    let check = |grid: &Grid, context: &str| {
+        check_invariants(context, grid);
+        for (row, style) in (0..3).zip(styles) {
+            let pad = grid.cell(Point::new(row, 4)).copied().unwrap();
+            assert_eq!(
+                pad,
+                Cell {
+                    flags: CellFlags::PAD,
+                    ..Cell::blank_with(style)
+                },
+                "{context}: row {row}"
+            );
+            let wide = grid.cell(Point::new(row + 1, 0)).copied().unwrap();
+            assert!(wide.is_wide(), "{context}: row {}", row + 1);
+            assert_eq!(wide.style, style, "{context}: row {}", row + 1);
+        }
+        for row in 0..3 {
+            for col in [2, 3] {
+                assert_eq!(
+                    grid.cell(Point::new(row, col)).map(|c| c.style),
+                    Some(narrow),
+                    "{context}: narrow text at {row}:{col}"
+                );
+            }
+        }
+        assert_eq!(pads(grid), 3, "{context}");
+    };
+    grid.resize(4, 5);
+    check(&grid, "6 -> 5");
+    grid.resize(4, 6);
+    assert_eq!(pads(&grid), 0, "5 -> 6 joins the padding away");
+    grid.resize(4, 5);
+    check(&grid, "6 -> 5 -> 6 -> 5");
+}
+
+/// Damage regression guard (#88 after #21; it passes on the base too): a
+/// re-wrap that pads rows keeps reporting the whole screen as damaged, to
+/// an owner (`take_damage`) and to a reader that remembered a generation
+/// (`damage_since`), so padding written inside the re-wrap is never missed;
+/// a same-size resize reports nothing.
+#[test]
+fn damage_guard_a_padding_rewrap_damages_the_whole_screen() {
+    let mut grid = Grid::new(3, 6);
+    grid.set_pen(pen(1));
+    grid.put_str("abcd中ef");
+    grid.set_pen(Style::DEFAULT);
+    let _ = grid.take_damage();
+    let generation = grid.damage_generation();
+    grid.resize(3, 5);
+    assert_eq!(grid.cell(Point::new(0, 4)).map(Cell::is_pad), Some(true));
+    assert_eq!(grid.damage_since(generation), DamageRows::All);
+    assert_eq!(grid.take_damage().rows, DamageRows::All);
+    grid.resize(3, 5);
+    assert_eq!(
+        grid.take_damage().rows,
+        DamageRows::None,
+        "a same-size resize"
+    );
+    let generation = grid.damage_generation();
+    grid.resize(3, 6);
+    assert_eq!(
+        grid.damage_since(generation),
+        DamageRows::All,
+        "widening back"
+    );
 }
 
 /// Review round 3: narrowing to one column with a small history keeps only

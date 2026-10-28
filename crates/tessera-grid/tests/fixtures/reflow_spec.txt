@@ -130,8 +130,10 @@
 #           attribute is content. C01 is rewritten accordingly.
 #        c. re-wrap greedily at the new width: a WIDE|SPACER pair (and a CLUSTER cell, which is
 #           one cell) is never split; a wide pair that does not fit starts a new row and the
-#           previous row is padded with a DEFAULT PAD cell (the stranded column). A wide
-#           pair wider than the whole grid (cols == 1) is DROPPED.                    (R8)
+#           previous row is padded with a PAD cell (the stranded column) carrying the wide
+#           cell's background and nothing else of its style, the cell a live write leaves
+#           (#88; it was a DEFAULT PAD cell before). A wide pair wider than the whole grid
+#           (cols == 1) is DROPPED.                                                   (R8)
 #           Every row but the last of a logical line gets wrapped=true; the last gets false.
 #           Marks of all rows of the line are concatenated onto the FIRST output row.
 #           Rows are padded to `cols` with plain default blanks. GraphemeTable entries move
@@ -243,7 +245,10 @@
 #   C5  Lead decision 5: "stranded column is blank with the line's pen, as put_wide does." During a
 #       reflow there is no pen; recommend the default pen. And the stranded blank cannot be
 #       recognised afterwards without a heuristic (R7), which decision 4 ("blanks of a wrapped line
-#       are content") does not provide for.
+#       are content") does not provide for. AMENDED (#88, 2026-10-28): the default pen left a
+#       one-cell gap in a coloured band; the stranded PAD cell now takes the background of
+#       the wide cell it precedes (Cell::pad_with), the same cell put_wide leaves for that
+#       character, and the PAD marker (R7) replaced the heuristic.
 #   C6  Done-when proptest wording "shrink(c1) -> grow(c0) reproduces the original visible text and
 #       the cursor's logical position" cannot hold for arbitrary inputs. The generator must:
 #       (a) keep wide cells out of grids that visit cols == 1 (R8); (b) leave the cursor ON a glyph
