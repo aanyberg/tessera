@@ -726,6 +726,15 @@ impl Grid {
         self.pending_wrap = saved.pending_wrap;
     }
 
+    /// Returns the active screen's [`Grid::save_cursor`] slot to its initial
+    /// state: home position, default pen, no pending wrap, so a following
+    /// [`Grid::restore_cursor`] behaves as if nothing had been saved. The
+    /// live cursor, pen and pending wrap are untouched, and so is the other
+    /// screen's slot. DECSTR uses it.
+    pub fn reset_saved_cursor(&mut self) {
+        self.saved = SavedCursor::INITIAL;
+    }
+
     // ------------------------------------------------------- scrollback cap
 
     /// Changes how many scrollback lines are retained. Lowering the cap
@@ -1652,6 +1661,40 @@ mod tests {
         assert!(grid.pending_wrap());
         grid.put_char('d');
         assert_eq!(text(&grid), vec!["abc", "d", ""]);
+    }
+
+    #[test]
+    fn reset_saved_cursor_keeps_the_live_cursor() {
+        let mut grid = Grid::new(3, 3);
+        grid.set_pen(red_bg());
+        grid.goto(1, 1);
+        grid.save_cursor();
+        grid.put_str("ab");
+        assert!(grid.pending_wrap());
+        grid.reset_saved_cursor();
+        assert_eq!(grid.cursor(), Point::new(1, 2), "live cursor kept");
+        assert!(grid.pending_wrap(), "live pending wrap kept");
+        assert_eq!(grid.pen(), red_bg(), "live pen kept");
+        grid.restore_cursor();
+        assert_eq!(grid.cursor(), Point::new(0, 0));
+        assert_eq!(grid.pen(), Style::DEFAULT);
+        assert!(!grid.pending_wrap());
+    }
+
+    #[test]
+    fn reset_saved_cursor_leaves_the_other_screens_slot() {
+        let mut grid = Grid::new(3, 3);
+        grid.goto(2, 2);
+        grid.save_cursor();
+        grid.enter_alt_screen();
+        grid.goto(1, 1);
+        grid.save_cursor();
+        grid.reset_saved_cursor();
+        grid.restore_cursor();
+        assert_eq!(grid.cursor(), Point::new(0, 0), "alternate slot reset");
+        grid.leave_alt_screen();
+        grid.restore_cursor();
+        assert_eq!(grid.cursor(), Point::new(2, 2), "primary slot kept");
     }
 
     #[test]

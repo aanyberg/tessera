@@ -20,6 +20,10 @@
 //! | `m` | SGR | set the pen's colours and attributes (see the `sgr` module) |
 //! | `r` | DECSTBM | set the scroll region |
 //!
+//! One sequence with an intermediate is implemented: `CSI ! p` (DECSTR,
+//! soft terminal reset, see the crate documentation). Its parameters are
+//! ignored, as in xterm, so `CSI 5 ! p` resets too.
+//!
 //! Parameters follow xterm: an absent parameter and an explicit `0` both
 //! mean the default, positions are 1-based and clamp to the screen (origin
 //! mode does not exist yet, so CUP, HVP, CHA, HPA and VPA ignore the scroll
@@ -31,17 +35,18 @@
 //! the rest of the line (O(count x cols)).
 //!
 //! Everything else (an unassigned final, any private marker such as `?`,
-//! any intermediate such as `SP` or `$`, and the xterm extensions HPR, VPR,
-//! SCOSC/SCORC and SL/SR that are not in scope) is ignored and logged at
-//! trace level. The parser hands over private markers as intermediates, so
-//! one check covers both.
+//! any other intermediate such as `SP`, `$` or `"` (DECSCL is #92), and the
+//! xterm extensions HPR, VPR, SCOSC/SCORC and SL/SR that are not in scope)
+//! is ignored and logged at trace level. The parser hands over private
+//! markers as intermediates, so one check covers both.
 //!
 //! Expected behaviour per sequence and edge case is pinned by
-//! `tests/fixtures/csi_spec.txt`.
+//! `tests/fixtures/csi_spec.txt`, and for DECSTR by
+//! `tests/fixtures/decstr_spec.txt`.
 //!
 //! [`Action::Csi`]: tessera_vt::Action::Csi
 
-use tessera_grid::{Cell, EraseDisplay, EraseLine};
+use tessera_grid::{Cell, EraseDisplay, EraseLine, Style};
 use tracing::trace;
 
 use crate::State;
@@ -78,6 +83,11 @@ impl State {
         action: char,
     ) {
         if !intermediates.is_empty() {
+            if (intermediates, action) == (b"!", 'p') {
+                // DECSTR. Parameters are ignored, as in xterm.
+                self.soft_reset();
+                return;
+            }
             trace!(
                 ?action,
                 ?params,
@@ -234,6 +244,33 @@ impl State {
         for _ in 0..n {
             self.print(ch);
         }
+    }
+
+    /// DECSTR (`CSI ! p`): the soft reset described in the crate
+    /// documentation. Resets the pen, insert mode, auto-wrap, the scroll
+    /// region and the saved cursor; keeps the screen, the scrollback, the
+    /// cursor position, a pending wrap and the tab stops. REP's remembered
+    /// character is cleared by [`State::apply`], as after any sequence.
+    fn soft_reset(&mut self) {
+        // The whole pen, faint, strikeout and double underline included:
+        // DEC, kitty and WezTerm; xterm keeps those three.
+        self.grid.set_pen(Style::DEFAULT);
+        self.insert_mode = false;
+        // xterm's resource default; DEC's table 5-9 says off.
+        self.auto_wrap = true;
+        self.grid.reset_scroll_region();
+        // xterm saves the cursor after the resets above and then homes the
+        // copy; its pending wrap is cleared too (xterm copies the live one).
+        self.grid.reset_saved_cursor();
+        // #8: reset here: DECOM off, DECTCEM on, G0-G3/GL/GR and DECNRCM to
+        // their defaults, DECCKM and DECKPAM off, KAM unlocked, DECSCA off,
+        // DECLRMM off with full left/right margins, reverse wrap (?45) to
+        // its default, modifyOtherKeys and the kitty keyboard flags to their
+        // defaults (once Terminal owns KeyboardModes). Reset DECOM before
+        // the saved cursor so a DECRC lands on the screen's home.
+        // Not #8, same place: the cursor shape and blink (DECSCUSR,
+        // `CSI Ps SP q`; no issue yet) to the default, and the OSC 4 palette
+        // to the theme (xterm's ResetAnsiColorRequest; #9).
     }
 
     /// DECSTBM. The top defaults to the first row; the bottom defaults to

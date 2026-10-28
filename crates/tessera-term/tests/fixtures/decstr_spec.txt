@@ -1,0 +1,698 @@
+# =============================================================================
+# tessera-term: DECSTR soft terminal reset (CSI ! p)  (issue #80, wave 5)
+# crates/tessera-term/tests/fixtures/decstr_spec.txt   (spec-researcher output)
+#
+# Same machine-readable layout as csi_spec.txt (### ID / size / step / cite / note /
+# screen / cursor / pending_wrap / requests / scrollback), parsed by tests/spec/mod.rs
+# `parse_fixture`-style code. Extra keys the shared parser ignores and tests/decstr.rs
+# must assert by hand because render_screen cannot show them:
+#     pen:     expected Terminal::grid().pen() after the whole script ("default" = Style::DEFAULT)
+#     cellpen: style of one printed cell, "(row,col)=default|<desc>"
+#     region:  expected grid.scroll_region(): "full" or "top..=bottom" 0-based
+#     tabs:    note only
+#     flags:   xterm-quirk | decision | control | negative
+# `control` cases run WITHOUT DECSTR and prove the setup really produces the state the
+# neighbouring case claims to reset (guards against vacuous tests). `negative` cases send
+# a sequence that looks like DECSTR but must not reach it. Every other case sends DECSTR;
+# tests/decstr.rs checks that.
+#     correction: a change the implementer made after running the hand-derived row (#80).
+# Cursor is 0-based (row,col). render_screen puts `|` AFTER the cursor's cell; a row ending
+# in `\` is soft-wrapped. `set auto_wrap|insert_mode true|false` is the Terminal seam.
+#
+# PRIMARY SOURCES (all read in full for this fixture)
+#   [CTL]  xterm ctlseqs  https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+#          "CSI ! p  Soft terminal reset (DECSTR), VT220 and up."  One line only: ctlseqs has NO
+#          table of what DECSTR resets. The brief's "table in ctlseqs" does not exist.
+#   [DEC]  VT510/VT520 RM  https://vt100.net/docs/vt510-rm/DECSTR.html  Table 5-9
+#          "Terminal's Default Settings" = the state after DECSTR (list in the header notes below).
+#          DEC STD 070 is not online; xterm's comments cite its pages 5-186..5-191 (DECSC/DECRC),
+#          D-19/D-20 (DECALN) and 14-9 (DECSASD on DECSTR).
+#   [XT]   xterm source (the oracle), ThomasDickey/xterm-snapshots master:
+#            charproc.c CASE_DECSTR -> VTReset(xw, False, False) -> ReallyReset(xw, full=False, saved=False)
+#            charproc.c ReallyReset() ~L14358..L14560 (common part, then `else { /* DECSTR */ }`)
+#            charproc.c resetMarginMode(), resetCharsets(), reset_SGR_Colors()
+#            cursor.c   CursorSave2() / CursorRestoreFlags()
+#          DECSCL (`CSI 6x ; Ps " p`) also calls ReallyReset(soft): charproc.c CASE_DECSCL.
+#   [KT]   kitty   kitty/vt-parser.c (`case '!': // Soft reset` -> screen_soft_reset, rejects params)
+#                  kitty/screen.c do_screen_reset(self, is_hard_reset=false)
+#   [WZ]   WezTerm term/src/terminalstate/mod.rs `Device::SoftReset` ("xterm deviates from the
+#          documented DECSTR setting for dec_auto_wrap, so we do too")
+#
+# WHAT XTERM ACTUALLY DOES (ReallyReset, full=False) -- the authoritative reset list
+#   common to soft and hard:  cursor visible; scroll region = full + DECLRMM off (resetMarginMode);
+#     DECOM off; SGR colours reset (reset_SGR_Colors); G0-G3/GL/GR default (resetCharsets);
+#     DECCKM, KAM, DECKPAM cleared (then resource default); modifyOtherKeys back to resource;
+#     DECSCA (protected) off; DECSASD main display.
+#   soft only:  WRAPAROUND/REVERSEWRAP/REVERSEWRAP2 := resource default (autoWrap resource = True, so ON);
+#     flags INSERT INVERSE BOLD BLINK UNDERLINE INVISIBLE cleared; ResetItalics;
+#     CursorSave(xw) -- saves the live state AFTER the clears above -- then sc.row = sc.col = 0.
+#   NOT touched by soft reset: screen contents, scrollback, live cursor position, TAB STOPS (TabReset
+#     is full-only), mouse modes, alt-screen selection, title modes, bracketed paste, do_wrap
+#     (pending wrap) on the live cursor, last printed char for REP is cleared only because the
+#     parser is restarted (longjmp -> init_parser: lastchar = -1).
+#
+# DEC Table 5-9 vs xterm (the two disagree in exactly one place)
+#   DECAWM   DEC: "No autowrap"          xterm/WezTerm/tessera brief: ON (resource default)   -> follow xterm
+#   others agree: DECTCEM on, IRM replace, DECOM absolute, DECNRCM multinational, KAM unlocked,
+#   DECNKM numeric, DECCKM normal, DECSTBM full, charsets default, SGR normal, DECSCA normal,
+#   DECSC = home, DECSASD main, DECRLM LTR.
+#
+# DECISIONS FOR THE MILESTONE LEAD (recommended option first)
+#   D-WRAP   Pending-wrap flag. The brief ("pending wrap cleared") contradicts xterm: soft path never
+#            assigns screen->do_wrap, so a pending wrap SURVIVES DECSTR in xterm, kitty (cursor x kept)
+#            and WezTerm (wrap_next untouched). Recommend KEEP (rows WRAP01/WRAP02). The *saved*
+#            cursor is a different matter, see D-SAVEDWRAP.
+#   D-SAVEDWRAP  xterm's CursorSave2 stores wrap_flag = live do_wrap, so DECSTR while a wrap is pending
+#            leaves a saved cursor at (0,0) WITH wrap pending: a following DECRC then wraps the next
+#            glyph to row 1. Clearly an xterm accident (DEC: "Home position"). Recommend saved
+#            pending_wrap = false (row SAVED03, flags xterm-quirk). kitty/WezTerm invalidate the saved
+#            cursor entirely; DECRC then homes and resets the pen: same observable result.
+#   D-ATTRS  xterm only clears BOLD BLINK UNDERLINE INVERSE INVISIBLE + italic + colours. It does NOT
+#            clear ATR_FAINT (SGR 2), ATR_STRIKEOUT (9), ATR_DBL_UNDER (21): they survive DECSTR in
+#            xterm (resetRendition() would clear them but ReallyReset does not call it). DEC says
+#            "Normal rendition"; kitty and WezTerm reset the whole pen. Issue #80 says "all attribute
+#            flags". Recommend reset EVERYTHING (Style::DEFAULT) and note the xterm bug (row PEN03).
+#            Underline colour/shape (SGR 58, 4:3) do not exist in xterm; kitty/WezTerm reset them.
+#   D-PARAMS `CSI 5 ! p`: xterm's parse table dispatches CSI_EXC 'p' to CASE_DECSTR without reading
+#            params, so it resets. kitty rejects it ("DECSTR escape code with parameters is invalid").
+#            Recommend xterm (reset regardless of params), rows INTER03 and INTER04.
+#   D-TABS   Tab stops: xterm and WezTerm keep them; kitty RESETS them (init_tabstops). Follow xterm
+#            (matches the brief), row TAB01.
+#   D-DECSCL xterm's DECSCL (`CSI 61..64 ; Ps " p`) is itself a soft reset (ReallyReset(soft) +
+#            level change). The brief says `CSI " p` is "traced, no effect": true for the
+#            parameterless form tested here (param 0 is not 61..64 so xterm does nothing either),
+#            but `CSI 62 " p` is NOT a no-op in xterm. Out of scope; recommend a follow-up issue.
+#   D-ALT    xterm CursorSave stores into sc[whichBuf] only (current screen's saved cursor); WezTerm
+#            resets both screens', kitty both savepoints. tessera follows xterm: Grid::reset_saved_cursor
+#            resets only the active screen's slot (#80). Keep that when the alternate screen becomes
+#            reachable (#8); resetting both would follow WezTerm, not the oracle.
+#
+# ISSUE-TEXT ERRORS
+#   * "the state xterm's ctlseqs lists for it": ctlseqs lists nothing; the list lives in charproc.c
+#     ReallyReset and in DEC Table 5-9 (see above).
+#   * "autowrap on": correct for xterm, but DEC's own table says OFF; say so in the docs.
+#   * brief Done-when "pending wrap cleared": wrong vs xterm (D-WRAP). "scrollback unchanged",
+#     "cursor position unchanged", "tab stops unchanged" are right.
+#   * brief "keypad/cursor-key modes": tessera-term has no DECCKM/DECKPAM state (KeyboardModes in
+#     keyboard.rs is a free-standing encoder argument, not Terminal state); kitty also zeroes
+#     kitty key-encoding flags, xterm resets modifyOtherKeys. Only relevant once Terminal owns
+#     KeyboardModes; add to the "#8: reset here" marker list.
+#
+# NOT TESTABLE YET (marker list for soft_reset; `// #8: reset here`)
+#   DECOM off [XT bitclr ORIGIN; DEC 5-9]      DECTCEM on [XT cursor_set=ON]   DECNRCM / G0-G3 / GL / GR
+#   default [XT resetCharsets]                 DECCKM off, DECKPAM off [XT]    KAM unlocked [XT]
+#   DECSCA normal [XT bitclr PROTECTED]        DECLRMM off + left/right margins reset [XT resetMarginMode]
+#   reverse-wraparound (?45) := default [XT]   modifyOtherKeys := default [XT]; kitty key flags [KT]
+# =============================================================================
+
+
+### PEN01_all_sgr_state_reset
+size: 3x10
+step: feed \x1b[1;4:3;31;48;2;1;2;3;58:2::9;9;9m
+step: feed \x1b[!p
+step: feed A
+cite: [XT] ReallyReset soft: bitclr(BOLD|UNDERLINE...), reset_SGR_Colors; [DEC] Table 5-9 "SGR: Normal rendition"; brief done-list item 1 (string verbatim)
+note: Bold, curly underline, strikeout, red fg and truecolor bg all gone. A is printed after the reset and must carry Style::DEFAULT; the pen itself must be DEFAULT too. The underline colour is covered by PEN06.
+correction: (implementer, #80) the note claimed this string sets underline colour rgb(9,9,9). It does not: `58:2::9` carries only three sub-parameters, so the colour is dropped (ADR 0013), and the `;9;9` that follow are two SGR 9 (strikeout). Kept verbatim because the brief names it; PEN06 adds the all-colon form.
+screen:
+>A |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: default
+cellpen: (0,0)=default
+
+### PEN02_control_pen_set_without_decstr
+size: 3x10
+step: feed \x1b[1;4:3;31;48;2;1;2;3;58:2::9;9;9m
+step: feed A
+flags: control
+cite: same sequence as PEN01 without \x1b[!p
+note: Proves the SGR string sets a non-default pen (A must NOT be Style::DEFAULT: bold, curly underline, strikeout, fg indexed 1, bg rgb(1,2,3); tests/decstr.rs checks each field).
+correction: (implementer, #80) the note listed underline colour rgb(9,9,9) instead of strikeout; see PEN01.
+screen:
+>A |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: not default
+
+### PEN03_faint_strike_double_underline
+size: 3x10
+step: feed \x1b[2;9;21m
+step: feed \x1b[!p
+step: feed A
+flags: decision xterm-quirk
+cite: [XT] ReallyReset soft clears BOLD|BLINK|UNDERLINE|INVERSE|INVISIBLE + italics only; ATR_FAINT/ATR_STRIKEOUT/ATR_DBL_UNDER (ptyx.h SGR_MASK2) are not cleared. [DEC] Table 5-9 "Normal rendition". [KT] cursor_reset; [WZ] pen = CellAttributes::default()
+note: D-ATTRS. Recommended expectation = default pen (DEC, kitty, WezTerm). Real xterm would keep faint, strikeout and double underline on A. If the lead picks pure-xterm, flip this row to pen: faint+strike+double-underline.
+screen:
+>A |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: default
+cellpen: (0,0)=default
+
+### PEN04_inverse_blink_hidden_italic
+size: 3x10
+step: feed \x1b[3;5;7;8m
+step: feed \x1b[!p
+step: feed A
+cite: [XT] ReallyReset soft: bitclr(INSERT|INVERSE|BOLD|BLINK|UNDERLINE|INVISIBLE), ResetItalics
+note: Every flag xterm does clear, listed individually (italic, blink, inverse, invisible). Add overline (SGR 53, #81) here when it lands.
+screen:
+>A |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: default
+cellpen: (0,0)=default
+
+### PEN05_256_color_pen
+size: 3x10
+step: feed \x1b[38;5;200;48;5;17m
+step: feed \x1b[!p
+step: feed A
+cite: [XT] reset_SGR_Foreground/Background (sgr_foreground = -1, clrDirectFG/BG); 256-colour is the same field
+note: Indexed colours, not only ANSI 30-37 and truecolor, are cleared.
+screen:
+>A |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: default
+cellpen: (0,0)=default
+
+### PEN06_underline_colour_and_shape
+size: 3x10
+step: feed \x1b[4:3;58:2::9:9:9m
+step: feed \x1b[!p
+step: feed A
+cite: [KT] cursor_reset clears decoration and decoration_fg; [WZ] pen = CellAttributes::default(); xterm has no underline colour. Lead decision 3 (full Style::DEFAULT)
+note: Added by the implementer (#80): the curly shape and the truecolor underline colour rgb(9,9,9) (ADR 0013's colon form) are gone after DECSTR. PEN07 is its control.
+screen:
+>A |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: default
+cellpen: (0,0)=default
+
+### PEN07_control_underline_colour_without_decstr
+size: 3x10
+step: feed \x1b[4:3;58:2::9:9:9m
+step: feed A
+flags: control
+cite: ADR 0013 (SGR 58 colon form, 4:3 curly)
+note: Added by the implementer (#80): without DECSTR A is curly-underlined in rgb(9,9,9).
+screen:
+>A |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: not default
+cellpen: (0,0)=curly ul=rgb(9,9,9)
+
+### IRM01_insert_mode_off
+size: 2x10
+step: set insert_mode true
+step: feed abc\r
+step: feed \x1b[!p
+step: feed X
+cite: [XT] ReallyReset soft bitclr(INSERT); [DEC] Table 5-9 IRM = Replace mode
+note: X replaces 'a'. If IRM stayed on the row would be "Xabc".
+screen:
+>Xb|c
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### IRM02_control_insert_mode_stays_on
+size: 2x10
+step: set insert_mode true
+step: feed abc\rX
+flags: control
+cite: IRM semantics, ctlseqs CSI 4 h
+note: Without DECSTR the same bytes insert.
+screen:
+>Xa|bc
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### AWM01_autowrap_restored_on
+size: 2x5
+step: set auto_wrap false
+step: feed abcdefg
+step: feed \x1b[!p
+step: feed XY
+cite: [XT] ReallyReset soft bitcpy(flags, initflags, WRAPAROUND) (autoWrap resource default True); [WZ] dec_auto_wrap = true; [DEC] Table 5-9 says NO autowrap (decision: xterm)
+note: With wrap off "abcdefg" ends as "abcdg" with the cursor on (0,4) and a wrap pending: xterm arms do_wrap on the last column whatever DECAWM says (print_c0_spec.txt B01). DECSTR keeps that pending wrap (WRAP01) and turns wrap on, so X wraps to row 1 and Y follows it; the first row is soft-wrapped. With wrap still off X and Y would overwrite col 4 (AWM02). Cursor does not move at DECSTR time.
+correction: (implementer, #80) hand-derived row expected no pending wrap after "abcdefg" and had X on (0,4), Y on (1,0), cursor (1,1); corrected to xterm's do_wrap rule (print_c0_spec.txt B01/B02).
+screen:
+>abcdg\
+>XY |
+cursor: (1,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### AWM02_control_autowrap_off_overwrites
+size: 2x5
+step: set auto_wrap false
+step: feed abcdefgXY
+flags: control
+cite: DECAWM reset, ctlseqs CSI ? 7 l
+note: Without DECSTR the last column is overwritten: "abcdY", nothing on row 1. The wrap stays pending on the last column (print_c0_spec.txt B02).
+correction: (implementer, #80) pending_wrap was false; xterm arms do_wrap with DECAWM off too.
+screen:
+>abcdY|
+>
+cursor: (0,4)
+pending_wrap: true
+requests: []
+scrollback: len=0
+
+### AWM03_autowrap_already_on_stays_on
+size: 2x5
+step: feed abcde
+step: feed \x1b[!p
+step: feed f
+cite: [XT] same as WRAP01 (default already on)
+note: Smoke check that DECSTR does not turn wrap off (DEC's own table would). Identical to WRAP01 by construction; kept as the DECAWM-default-state row.
+screen:
+>abcde\
+>f |
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### REGION01_scroll_region_full
+size: 6x4
+step: feed \x1b[1;1Ha\x1b[2;1Hb\x1b[3;1Hc\x1b[4;1Hd\x1b[5;1He\x1b[6;1Hf
+step: feed \x1b[2;4r
+step: feed \x1b[!p
+step: feed \x1b[6;1H\n
+cite: [XT] resetMarginMode(): resetMargins() sets top/bottom to the full screen; [DEC] Table 5-9 DECSTBM top=1 bottom=page length
+note: After DECSTR the region is the full screen, so LF on the last row scrolls the whole screen and 'a' moves to scrollback. If the region 2..4 survived, LF on row 6 (below the region) would do nothing (REGION02). grid.scroll_region() must equal full (0..=5).
+screen:
+>b
+>c
+>d
+>e
+>f
+> |
+cursor: (5,0)
+pending_wrap: false
+requests: []
+scrollback: len=1 first=("a", wrapped=false)
+region: full
+
+### REGION02_control_region_survives_without_decstr
+size: 6x4
+step: feed \x1b[1;1Ha\x1b[2;1Hb\x1b[3;1Hc\x1b[4;1Hd\x1b[5;1He\x1b[6;1Hf
+step: feed \x1b[2;4r
+step: feed \x1b[6;1H\n
+flags: control
+cite: xtermIndex(): index below the bottom margin does not scroll; at the last screen row the cursor stays
+note: Region rows 2..4 (0-based 1..=3) active; LF on row 6 does nothing and the cursor stays on (5,0).
+screen:
+>a
+>b
+>c
+>d
+>e
+>f|
+cursor: (5,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+region: 1..=3
+
+### REGION03_cursor_not_homed
+size: 6x4
+step: feed \x1b[2;4r
+step: feed \x1b[5;3H
+step: feed \x1b[!p
+cite: [XT] soft path does not call CursorSet; unlike DECSTBM itself (which homes), DECSTR leaves the cursor
+note: DECSTBM homes the cursor; the explicit CUP afterwards moves it to (4,2); DECSTR must leave it there even though it resets the region.
+screen:
+>
+>
+>
+>
+>   |
+>
+cursor: (4,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+region: full
+
+### SAVED01_decrc_after_decstr_homes_and_resets_pen
+size: 10x20
+step: feed \x1b[6;6H\x1b[31;1m\x1b7
+step: feed \x1b[!p
+step: feed \x1b[9;9H\x1b8Z
+cite: [XT] ReallyReset soft: CursorSave(xw) then sc[whichBuf].row = sc.col = 0 (the save happens after the SGR flags/colours were cleared, so the saved pen is default); [DEC] Table 5-9 "Save cursor state DECSC: Home position"
+note: DECSC at (5,5) with red bold; DECSTR; cursor moved to (8,8); DECRC jumps to (0,0) and restores the DEFAULT pen. Z is printed there with Style::DEFAULT. Live pen after DECRC is default too.
+screen:
+>Z |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: default
+cellpen: (0,0)=default
+
+### SAVED02_control_decrc_without_decstr
+size: 10x20
+step: feed \x1b[6;6H\x1b[31;1m\x1b7
+step: feed \x1b[9;9H\x1b8Z
+flags: control
+cite: DECSC/DECRC, cursor.c CursorRestoreFlags
+note: Same setup without DECSTR: DECRC returns to (5,5) with the red bold pen; Z is red+bold there.
+screen:
+>
+>
+>
+>
+>
+>     Z |
+>
+>
+>
+>
+cursor: (5,6)
+pending_wrap: false
+requests: []
+scrollback: len=0
+cellpen: (5,5)=bold fg=indexed(1)
+
+### SAVED03_saved_pending_wrap_cleared
+size: 3x5
+step: feed abcde
+step: feed \x1b[!p
+step: feed \x1b[3;3H\x1b8
+step: feed Z
+flags: decision xterm-quirk
+cite: [XT] CursorSave2 sc->wrap_flag = screen->do_wrap (live flag, true here), restored by CursorRestoreFlags `screen->do_wrap = sc->wrap_flag`. [DEC] "Home position". D-SAVEDWRAP
+note: Recommended: DECRC after DECSTR gives cursor (0,0) with pending wrap FALSE, so Z overwrites 'a'. Real xterm would restore pending=true and Z would wrap to row 1 col 0 (row 0 stays "abcde", Z on row 1). The live pending wrap at DECSTR time is kept (WRAP01) but the saved copy is cleared.
+screen:
+>Zb|cde
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SAVED04_decrc_without_prior_decsc_same_as_after_decstr
+size: 5x10
+step: feed \x1b[3;4H\x1b[1m
+step: feed \x1b[!p
+step: feed \x1b8Z
+cite: [XT] soft path calls CursorSave, so sc.saved = True (no "never saved" branch in CursorRestoreFlags)
+note: DECSTR itself creates the saved state (home, default pen) even if no DECSC was ever issued; DECRC goes to (0,0). Identical result to the Grid's "without a prior save" behaviour.
+screen:
+>Z |
+>
+>
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: default
+cellpen: (0,0)=default
+
+### CURSOR01_position_unchanged
+size: 5x10
+step: feed \x1b[1;1Habc\x1b[2;1Hdef\x1b[3;5H
+step: feed \x1b[!p
+cite: [XT] soft path never calls CursorSet (only the saved copy is zeroed); [KT] screen_soft_reset restores x,y after do_screen_reset; [WZ] no cursor assignment
+note: Cursor stays at (2,4); screen text stays. (RIS would home the cursor and clear.)
+screen:
+>abc
+>def
+>     |
+>
+>
+cursor: (2,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CONTENT01_screen_and_scrollback_unchanged
+size: 3x5
+step: feed 1\r\n2\r\n3\r\n4
+step: feed \x1b[!p
+cite: [XT] ReallyReset(full=False, saved=False): `if (saved) screen->savedlines = 0` is skipped; no ClearScreen (full only); brief: "NOT cleared (that is RIS)"
+note: Line "1" scrolled off; both it and the visible rows survive. Cursor stays (2,1).
+screen:
+>2
+>3
+>4 |
+cursor: (2,1)
+pending_wrap: false
+requests: []
+scrollback: len=1 first=("1", wrapped=false)
+
+### WRAP01_pending_wrap_survives
+size: 2x5
+step: feed abcde
+step: feed \x1b[!p
+cite: [XT] soft path never assigns screen->do_wrap; [KT] cursor x kept; [WZ] wrap_next untouched. CONTRADICTS brief done-list ("pending wrap cleared"): D-WRAP
+note: Cursor stays on the last column with the wrap armed.
+screen:
+>abcde|
+>
+cursor: (0,4)
+pending_wrap: true
+requests: []
+scrollback: len=0
+
+### WRAP02_next_glyph_wraps_after_decstr
+size: 2x5
+step: feed abcde
+step: feed \x1b[!p
+step: feed f
+flags: decision
+cite: same as WRAP01; xterm dotext(): `if (screen->do_wrap) { do_wrap = False; if (WRAPAROUND) WrapLine }`
+note: If the lead overrules D-WRAP and clears pending wrap, this row becomes ">abcdf|" with cursor (0,4), pending_wrap false.
+screen:
+>abcde\
+>f |
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### TAB01_custom_tab_stops_kept
+size: 2x20
+step: feed \x1b[3g\x1b[1;6H\x1bH\r
+step: feed \x1b[!p
+step: feed \tX
+cite: [XT] TabReset is called only in the `full` (RIS) branch of ReallyReset; [WZ] no tab handling in SoftReset. [KT] differs: init_tabstops() in do_screen_reset (kitty resets stops on DECSTR). D-TABS
+note: TBC 3 clears all stops, HTS sets one at col 5 only. After DECSTR, HT goes to col 5 (kept). Default stops would put X at col 8.
+screen:
+>     X |
+>
+cursor: (0,6)
+pending_wrap: false
+requests: []
+scrollback: len=0
+tabs: custom stop at col 5 kept
+
+### TAB02_cleared_tab_stops_stay_cleared
+size: 2x20
+step: feed \x1b[3g
+step: feed \x1b[!p
+step: feed \tX
+cite: [XT] as TAB01
+note: With every stop cleared HT runs to the last column (19); X lands there and arms pending wrap. DECSTR must not restore the 8-column defaults (that would put X at col 8).
+screen:
+>                   X|
+>
+cursor: (0,19)
+pending_wrap: true
+requests: []
+scrollback: len=0
+
+### REP01_decstr_clears_last_printed
+size: 2x10
+step: feed a\x1b[!p\x1b[3b
+cite: [XT] VTReset longjmps into init_parser: sp->lastchar = -1 (charproc.c init_parser); also every non-printing action clears it (csi_spec.txt D-REP); [KT] last_graphic_char = 0
+note: REP after DECSTR has no character to repeat: nothing printed. Cursor stays (0,1).
+screen:
+>a |
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### REP02_control_rep_without_decstr
+size: 2x10
+step: feed a\x1b[3b
+flags: control
+cite: ctlseqs CSI Ps b (REP)
+screen:
+>aaaa |
+>
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### INTER01_other_intermediates_ignored_pen
+size: 2x10
+step: feed \x1b[31m
+step: feed \x1b[?p\x1b["p\x1b[!!p\x1b[$p\x1b[? 1$p\x1b[!q\x1b[!s
+step: feed A
+flags: negative
+cite: [XT] the parse table sends CSI ? p, CSI " p, CSI $ p to different cases (DECSCL needs params 61..64; DECRQM CSI $ p replies), `CSI ! !` is not a defined sequence
+note: None of these may reach soft_reset; parser facts: `?` arrives as intermediate [63]; `"` [34]; `!!` [33,33]; `$` [36]. `CSI ! q` and `CSI ! s` carry the DECSTR intermediate with another final and must not reset either (added by the implementer, #80, after critique). A stays RED (fg indexed 1). (xterm answers `CSI $ p`/`CSI ? 1 $ p` with DECRQM replies; tessera ignores them today, not part of #80.)
+screen:
+>A |
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+cellpen: (0,0)=fg=indexed(1)
+
+### INTER02_other_intermediates_ignored_irm
+size: 2x10
+step: set insert_mode true
+step: feed abc\r
+step: feed \x1b[?p\x1b["p\x1b[!!p
+step: feed X
+flags: negative
+cite: as INTER01
+note: Insert mode must still be on: X is inserted.
+screen:
+>Xa|bc
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### INTER03_bang_with_params_still_resets
+size: 2x10
+step: feed \x1b[31m
+step: feed \x1b[5!p
+step: feed A
+flags: decision
+cite: [XT] CASE_DECSTR ignores parameters; [KT] rejects ("DECSTR escape code with parameters is invalid"). D-PARAMS
+note: Recommended: reset, pen default.
+screen:
+>A |
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: default
+cellpen: (0,0)=default
+
+### INTER04_zero_param_also_resets
+size: 2x10
+step: feed \x1b[31m
+step: feed \x1b[0!p
+step: feed A
+cite: as INTER03
+note: Explicit 0 is the same as no parameter.
+screen:
+>A |
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: default
+cellpen: (0,0)=default
+
+### SPLIT01_decstr_split_across_feeds
+size: 2x10
+step: feed \x1b[31m\x1b[
+step: feed !
+step: feed pA
+cite: parser: Terminal::advance may be called at any byte boundary (spec::check_all runs Whole and Bytewise)
+note: The sequence is split between ESC [ , ! and p; result identical to PEN01-style.
+screen:
+>A |
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: default
+cellpen: (0,0)=default
+
+### INTERRUPT01_can_aborts_decstr
+size: 2x10
+step: feed \x1b[31m
+step: feed \x1b[!\x18p
+step: feed A
+flags: negative
+cite: ECMA-48 / vt100.net state machine: CAN (0x18) cancels the sequence; the final byte `p` then prints as text (csi_spec.txt parser facts)
+note: No reset: pen stays red and a literal 'p' is printed before A.
+screen:
+>pA |
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+cellpen: (0,1)=fg=indexed(1)
+
+# -- end of cases
+
+#> Rows to add when #8 lands (state does not exist in tessera-term yet; sources in the header list):
+#>   DECOM on + CUP, DECSTR, CUP 1;1 -> absolute (cursor (0,0) not region-relative)     [XT bitclr ORIGIN]
+#>   DECSET ?25 l (hide cursor), DECSTR -> visible                                        [XT cursor_set=ON; DEC DECTCEM]
+#>   SCS "ESC ( 0" (line drawing) + SO, DECSTR, print 'q' -> literal 'q'                  [XT resetCharsets]
+#>   DECCKM set, DECSTR -> normal cursor keys; DECKPAM set, DECSTR -> numeric keypad      [XT keyboard.flags]
+#>   DECSTR with DECOM on and DECSC saved -> DECRC lands at (0,0) with origin off          [XT bitclr ORIGIN before CursorSave]
+#>   DECLRMM on + DECSLRM, DECSTR -> left/right margins full, mode off                     [XT resetMarginMode]
+#> Rows to add with the state they need (not #8; found by the #80 adversarial run):
+#>   DECSCUSR `CSI 4 SP q` (steady underline), DECSTR -> default cursor shape and blink    [XT ReallyReset soft; no issue yet]
+#>   OSC 4 ; 1 ; rgb:00/ff/00 (palette 1 = green), DECSTR -> palette 1 back to the theme   [XT ResetAnsiColorRequest; #9]
