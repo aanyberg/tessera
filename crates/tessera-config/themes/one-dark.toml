@@ -1,0 +1,14 @@
+# One Dark: bundled Tessera theme.
+# Atom One Dark by GitHub Inc., https://github.com/atom/one-dark-syntax
+# Licence: MIT (atom/one-dark-syntax, GitHub Inc.).
+
+name = "One Dark"
+foreground = "#abb2bf"
+background = "#282c34"
+cursor = "#528bff"
+selection = "#3e4451"
+# black, red, green, yellow, blue, magenta, cyan, white; then the bright eight
+ansi = [
+    "#1e2127", "#e06c75", "#98c379", "#d19a66", "#61afef", "#c678dd", "#56b6c2", "#abb2bf",
+    "#5c6370", "#e06c75", "#98c379", "#d19a66", "#61afef", "#c678dd", "#56b6c2", "#ffffff",
+]

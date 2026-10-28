@@ -119,13 +119,26 @@ pub struct App {
     /// shared by every view's shaper (loading it takes a noticeable
     /// fraction of a second).
     fonts: Mutex<Option<Fonts>>,
+    /// The theme every view draws with, set by [`App::apply_theme`].
+    /// Written only while `views` is held (and read under it by
+    /// [`App::attach_view`]), so a view attached during a re-theme never
+    /// keeps the old colours.
+    theme: Mutex<Theme>,
 }
 
 impl App {
     /// Creates an application with the given configuration, read from (and
     /// saved to) the directory `paths` describes. No session is running and
-    /// no observer is installed.
+    /// no observer is installed. Views draw with the theme
+    /// `config.appearance.theme` names, resolved against `paths` like
+    /// [`tessera_config::ConfigStore::theme`] (a name that matches nothing
+    /// gives the default theme).
     pub fn new(config: Config, paths: ConfigPaths) -> Self {
+        let colours = tessera_config::Theme::resolve(&paths.themes_dir(), &config.appearance.theme);
+        for warning in &colours.warnings {
+            tracing::warn!(target: "tessera_app_core", "{warning}");
+        }
+        let theme = Mutex::new(view::theme_for(&config, &colours.theme));
         Self {
             config,
             paths,
@@ -136,6 +149,7 @@ impl App {
             views: Mutex::new(HashMap::new()),
             gpu: Mutex::new(None),
             fonts: Mutex::new(None),
+            theme,
         }
     }
 
@@ -523,9 +537,9 @@ impl App {
     /// GPU on `instance` (an adapter that can present to `surface`; about
     /// 100 ms) and loads the font database; later views share both. The
     /// view draws with the configured font family, font size and opacity
-    /// (see [`view::theme_for`]). A zero `size` is allowed: nothing is
-    /// drawn until a non-empty [`App::resize_view`], and the session keeps
-    /// its size meanwhile.
+    /// and the current theme's colours (see [`App::apply_theme`]). A zero
+    /// `size` is allowed: nothing is drawn until a non-empty
+    /// [`App::resize_view`], and the session keeps its size meanwhile.
     ///
     /// The session's grid follows the view: it is resized to
     /// [`view::grid_size_for`] the surface here and on every
@@ -555,7 +569,7 @@ impl App {
             return Err(Error::ViewAttached(id));
         }
         let gpu = self.gpu_for(instance, &surface)?;
-        let theme = view::theme_for(&self.config);
+        let theme = lock(&self.theme).clone();
         let fonts = self.fonts_for(&theme)?;
         let view = View::new(gpu, surface, fonts, theme, size, scale)?;
         let pty_size = view.pty_size();
@@ -645,6 +659,35 @@ impl App {
         }
     }
 
+    /// Re-themes every view, and every view attached later, with `theme`'s
+    /// colours (through [`view::theme_for`], so the configured opacity
+    /// still scales the background). Fonts are not reloaded: each view
+    /// keeps its font family and size.
+    ///
+    /// Call it with [`tessera_config::ConfigStore::theme`] whenever the
+    /// configuration watcher reports
+    /// [`tessera_config::ConfigEvent::Changed`]; the new colours show from
+    /// each view's next frame. A view's surface keeps the transparency mode
+    /// it was attached with. A theme (or opacity) that makes an opaque
+    /// background translucent is therefore see-through only in views
+    /// attached after it: an existing, opaque view shows the background's
+    /// premultiplied colour (each channel times its alpha, so darker) as
+    /// an opaque colour. Must be called on the main thread.
+    pub fn apply_theme(&self, theme: &tessera_config::Theme) {
+        let theme = view::theme_for(&self.config, theme);
+        let mut views = lock(&self.views);
+        for view in views.values_mut() {
+            view.set_theme(theme.clone());
+        }
+        *lock(&self.theme) = theme;
+    }
+
+    /// The renderer theme views draw with now: the last
+    /// [`App::apply_theme`], or the configured theme.
+    pub fn view_theme(&self) -> Theme {
+        lock(&self.theme).clone()
+    }
+
     /// Detaches and releases session `id`'s view. The session keeps its
     /// size. Must be called on the main thread.
     ///
@@ -715,6 +758,17 @@ impl App {
     pub fn panic_holding_session_lock(&self) {
         let _sessions = lock(&self.sessions);
         panic!("deliberate panic for testing");
+    }
+
+    /// The theme session `id`'s view's renderer draws with, or `None`
+    /// without a view.
+    ///
+    /// Exists only so tests can prove that [`App::apply_theme`] reaches the
+    /// renderers of views already attached.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn view_renderer_theme(&self, id: SessionId) -> Option<Theme> {
+        lock(&self.views).get(&id).map(|view| view.theme().clone())
     }
 
     /// Panics while holding the view table lock, poisoning it.

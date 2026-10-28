@@ -22,7 +22,7 @@ use tessera_grid::{Cell, Grid, Point};
 use tessera_pty::PtySize;
 pub use tessera_render::{CellMetrics, FrameStatus, PhysicalSize, RenderError, wgpu};
 use tessera_render::{
-    CursorShape, CursorState, Fonts, FrameInput, Gpu, RenderSurface, Renderer, Shaper,
+    CursorShape, CursorState, Fonts, FrameInput, Gpu, RenderSurface, Renderer, Rgba, Shaper,
     SurfaceOptions, Theme, sanitize_font_size, sanitize_scale,
 };
 
@@ -117,20 +117,35 @@ fn whole_px(v: f32) -> u32 {
     px
 }
 
-/// The theme a view draws with, from the application's configuration:
-/// the default theme with the configured font family and size (clamped
-/// like [`tessera_render::sanitize_font_size`]) and the configured opacity
-/// as the default background's alpha.
+/// The theme a view draws with: the colours of `theme` (the resolved
+/// `appearance.theme`, see [`tessera_config::ConfigStore::theme`]) and the
+/// font family and size of `config` (the size clamped like
+/// [`tessera_render::sanitize_font_size`]).
+///
+/// Colours are sRGB bytes decoded to linear ([`Rgba::from_srgb8`]) with
+/// alpha `a / 255`. The background's alpha is the theme's multiplied by
+/// `appearance.opacity`, so an opaque theme at opacity 1.0 stays opaque
+/// and a translucent theme background stays as translucent as written.
+/// Line height and padding are the renderer's defaults.
 #[must_use]
-pub fn theme_for(config: &Config) -> Theme {
+pub fn theme_for(config: &Config, theme: &tessera_config::Theme) -> Theme {
     let appearance = &config.appearance;
-    let defaults = Theme::default();
+    let background = rgba(theme.background);
     Theme {
         font_family: appearance.font_family.clone(),
         font_size: sanitize_font_size(appearance.font_size),
-        background: defaults.background.with_alpha(appearance.opacity),
-        ..defaults
+        foreground: rgba(theme.foreground),
+        background: background.with_alpha(background.a * appearance.opacity),
+        cursor: rgba(theme.cursor),
+        selection: rgba(theme.selection),
+        ansi: theme.ansi.map(rgba),
+        ..Theme::default()
     }
+}
+
+/// A theme file's sRGB colour as the renderer's linear [`Rgba`].
+fn rgba(color: tessera_config::Color) -> Rgba {
+    Rgba::from_srgb8(color.r, color.g, color.b).with_alpha(f32::from(color.a) / 255.0)
 }
 
 /// One session's surface, renderer and font size.
@@ -226,6 +241,18 @@ impl View {
         self.font_size_pt = sanitize_font_size(size_pt);
         self.renderer
             .set_font_size(self.font_size_pt, self.surface.scale());
+    }
+
+    /// Draws with `theme`'s colours, opacity and padding from the next
+    /// frame on; the font stays as it is ([`Renderer::set_theme`]).
+    pub(crate) fn set_theme(&mut self, theme: Theme) {
+        self.renderer.set_theme(theme);
+    }
+
+    /// The theme the renderer draws with.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn theme(&self) -> &Theme {
+        self.renderer.theme()
     }
 
     /// Copies what the next frame shows out of `grid`.
@@ -432,15 +459,61 @@ mod tests {
         config.appearance.font_family = "Monaco".into();
         config.appearance.font_size = 1000.0;
         config.appearance.opacity = 0.5;
-        let theme = theme_for(&config);
+        let theme = theme_for(&config, &tessera_config::Theme::default());
         assert_eq!(theme.font_family, "Monaco");
         assert!((theme.font_size - tessera_render::MAX_FONT_SIZE_PT).abs() < f32::EPSILON);
         assert!((theme.background.a - 0.5).abs() < f32::EPSILON);
         assert_eq!(
             theme.foreground,
             Theme::default().foreground,
-            "colors stay the defaults"
+            "Tessera Dark has the renderer's default colours"
         );
+    }
+
+    /// Tessera Dark at the default configuration is exactly the renderer's
+    /// default theme, so the bundled default changes nothing on screen.
+    #[test]
+    fn tessera_dark_is_the_renderer_default() {
+        let theme = theme_for(&Config::default(), &tessera_config::Theme::default());
+        assert_eq!(theme, Theme::default());
+        assert!((theme.selection.a - 0.6).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn theme_colours_and_opacity() {
+        use tessera_config::Color;
+
+        let mut source = tessera_config::Theme::bundled("Dracula").unwrap().clone();
+        let config = Config::default();
+        let theme = theme_for(&config, &source);
+        assert_eq!(theme.background, Rgba::from_srgb8(0x28, 0x2a, 0x36));
+        assert_eq!(theme.foreground, Rgba::from_srgb8(0xf8, 0xf8, 0xf2));
+        assert_eq!(theme.cursor, Rgba::from_srgb8(0xf8, 0xf8, 0xf2));
+        assert_eq!(theme.selection, Rgba::from_srgb8(0x44, 0x47, 0x5a));
+        assert_eq!(theme.ansi[9], Rgba::from_srgb8(0xff, 0x6e, 0x6e));
+        for (i, (got, want)) in theme.ansi.iter().zip(source.ansi).enumerate() {
+            assert_eq!(got.to_srgb8(), [want.r, want.g, want.b], "ansi {i}");
+        }
+        // The spec fixture's `theme_for` rows: theme alpha times opacity.
+        for (background_alpha, opacity, expected) in [
+            (0xff, 1.0, 1.0),
+            (0xff, 0.5, 0.5),
+            (0x80, 1.0, 128.0 / 255.0),
+            (0x80, 0.5, 64.0 / 255.0),
+            (0xff, 0.0, 0.0),
+        ] {
+            source.background = Color::rgb(0x28, 0x2a, 0x36).with_alpha(background_alpha);
+            let mut config = Config::default();
+            config.appearance.opacity = opacity;
+            let a = theme_for(&config, &source).background.a;
+            assert!(
+                (a - expected).abs() < 1e-6,
+                "alpha {background_alpha:#x} at opacity {opacity}: {a}"
+            );
+        }
+        source.selection = Color::rgb(0x26, 0x4f, 0x78).with_alpha(0x99);
+        let selection = theme_for(&config, &source).selection;
+        assert!((selection.a - 0.6).abs() < f32::EPSILON);
     }
 
     #[test]

@@ -1,0 +1,14 @@
+# Tessera Dark: bundled Tessera theme.
+# Tessera's original default (the xterm 16-colour palette).
+# Licence: MIT OR Apache-2.0 (project).
+
+name = "Tessera Dark"
+foreground = "#e5e5e5"
+background = "#000000"
+cursor = "#b0b0b0"
+selection = "#264f7899"
+# black, red, green, yellow, blue, magenta, cyan, white; then the bright eight
+ansi = [
+    "#000000", "#cd0000", "#00cd00", "#cdcd00", "#0000ee", "#cd00cd", "#00cdcd", "#e5e5e5",
+    "#7f7f7f", "#ff0000", "#00ff00", "#ffff00", "#5c5cff", "#ff00ff", "#00ffff", "#ffffff",
+]

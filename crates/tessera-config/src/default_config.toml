@@ -13,7 +13,12 @@ default_profile = "Default"
 confirm_close = true
 
 [appearance]
-# Theme name, resolved against themes/*.toml next to this file.
+# Theme name: a themes/*.toml file next to this file (by file stem or by the
+# theme's `name` inside it), else a bundled theme: Tessera Dark, Tessera
+# Light, Solarized Dark, Solarized Light, Dracula, Nord, Gruvbox Dark, One
+# Dark, Tokyo Night or Catppuccin Mocha. Case does not matter, and any run of
+# spaces or punctuation is one separator ("solarized-dark" is Solarized Dark;
+# "+" reads as "plus").
 theme = "Tessera Dark"
 # Font family and size in points (4 to 512).
 font_family = "Menlo"

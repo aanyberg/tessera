@@ -22,6 +22,9 @@ tessera-grid.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 # Exposes `App::panic_holding_session_lock` for tests of the FFI layer.
 test-hooks = []

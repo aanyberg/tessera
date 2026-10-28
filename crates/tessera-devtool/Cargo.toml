@@ -1,6 +1,6 @@
 [package]
 name = "tessera-devtool"
-description = "Headless screen dumps of the emulator for debugging and snapshot tests (dev-only)"
+description = "Headless screen dumps of the emulator for debugging and snapshot tests, and theme import (dev-only)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,6 +13,8 @@ publish = false
 
 [dependencies]
 clap.workspace = true
+# `theme import`: the importers and the theme file format.
+tessera-config.workspace = true
 tessera-grid.workspace = true
 tessera-pty.workspace = true
 tessera-term.workspace = true
@@ -20,6 +22,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+tempfile = "3"
 
 [lints]
 workspace = true

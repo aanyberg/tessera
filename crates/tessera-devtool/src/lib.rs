@@ -1,4 +1,5 @@
-//! Developer tooling for the Tessera core: headless screen dumps.
+//! Developer tooling for the Tessera core: headless screen dumps and theme
+//! import.
 //!
 //! The `tessera-devtool` binary runs a command in a pseudo-terminal, drives
 //! the emulator ([`tessera_term::Terminal`]) with its output and prints the
@@ -12,6 +13,9 @@
 //! binary: [`run`] spawns the command and returns the [`Terminal`], and
 //! [`dump`] formats any [`Grid`], including one built by hand. The crate is
 //! dev-only: it is never published and nothing in the app depends on it.
+//!
+//! `tessera-devtool theme import <file>` converts an iTerm2 `.itermcolors`
+//! file or a base16 scheme into a theme file (see [`theme`]).
 //!
 //! The run is bounded by a timeout (default 10 s, exit code 124; see
 //! [`run::run`] for how far extreme sizes can stretch it). On timeout only
@@ -27,3 +31,4 @@
 
 pub mod dump;
 pub mod run;
+pub mod theme;

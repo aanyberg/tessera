@@ -5,6 +5,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::load::{Loaded, Warning, load_file, write_default_if_missing};
 use crate::paths::ConfigPaths;
+use crate::theme::Theme;
 use crate::watch::{ConfigEvent, WatchOptions, Watcher};
 use crate::{Config, Error};
 
@@ -34,6 +35,8 @@ pub(crate) struct SubscriptionId(u64);
 pub(crate) struct State {
     pub(crate) config: Arc<Config>,
     pub(crate) warnings: Vec<Warning>,
+    /// Warnings of the most recent [`ConfigStore::theme`] lookup.
+    theme_warnings: Vec<Warning>,
     /// Why the most recent load failed; `None` when it succeeded.
     pub(crate) error: Option<Error>,
     /// Every live [`Watcher`]'s event channel. A change applied by any
@@ -102,6 +105,7 @@ impl ConfigStore {
             state: Arc::new(RwLock::new(State {
                 config: Arc::new(config),
                 warnings: Vec::new(),
+                theme_warnings: Vec::new(),
                 error: None,
                 subscribers: Vec::new(),
                 next_subscription: 0,
@@ -122,6 +126,38 @@ impl ConfigStore {
     /// Warnings from the most recent successful load.
     pub fn warnings(&self) -> Vec<Warning> {
         self.read().warnings.clone()
+    }
+
+    /// Every warning the store currently knows of: those of the most recent
+    /// successful load ([`ConfigStore::warnings`]) followed by those of the
+    /// most recent [`ConfigStore::theme`] lookup
+    /// ([`Warning::ThemeNotFound`], [`Warning::ThemeInvalid`]).
+    pub fn last_warnings(&self) -> Vec<Warning> {
+        let state = self.read();
+        state
+            .warnings
+            .iter()
+            .chain(&state.theme_warnings)
+            .cloned()
+            .collect()
+    }
+
+    /// The colour theme `appearance.theme` names, resolved now from the
+    /// themes directory and the bundled themes (see [`Theme::resolve`]
+    /// for the order). Never fails: a name that matches nothing gives
+    /// [`Theme::DEFAULT_NAME`]. The lookup's warnings are logged and
+    /// replace the previous lookup's in [`ConfigStore::last_warnings`].
+    ///
+    /// Reads the disk on every call, so call it when the configuration
+    /// changes (on [`ConfigEvent::Changed`]), not per frame.
+    pub fn theme(&self) -> Theme {
+        let name = self.config().appearance.theme.clone();
+        let resolved = Theme::resolve(&self.paths.themes_dir(), &name);
+        for warning in &resolved.warnings {
+            tracing::warn!(target: "tessera_config", "{warning}");
+        }
+        self.write().theme_warnings = resolved.warnings;
+        resolved.theme
     }
 
     /// Why the most recent load failed, or `None` when it succeeded.

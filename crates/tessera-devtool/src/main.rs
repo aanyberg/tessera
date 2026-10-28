@@ -6,16 +6,22 @@
 //! expired, `125` when the tool itself failed, `2` for a usage error. On
 //! timeout only the command's shell is signalled (`SIGHUP`, then `SIGKILL`
 //! 200 ms later); see [`tessera_devtool::run::run`].
+//!
+//! `tessera-devtool theme import <file> [--name <n>] [--out <dir>] [--force]`
+//! writes `<dir>/<slug>.toml` and prints its path; it exits `125` on any
+//! failure (see [`tessera_devtool::theme`]).
 
 #![forbid(unsafe_code)]
 
 use std::io::{self, Write as _};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use tessera_devtool::dump::{self, Format};
 use tessera_devtool::run::{self, RunOptions};
+use tessera_devtool::theme::{self, ImportOptions};
 
 /// Exit code when the tool itself fails (cannot spawn, cannot write).
 const TOOL_FAILURE: u8 = 125;
@@ -35,6 +41,32 @@ enum Command {
     /// argument. The tool waits for it to exit or for the timeout, then
     /// prints the grid and exits with the command's status (124 on timeout).
     Run(RunArgs),
+    /// Colour theme tools.
+    #[command(subcommand)]
+    Theme(ThemeCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum ThemeCommand {
+    /// Convert an iTerm2 `.itermcolors` file or a base16 `.yaml`/`.yml`
+    /// scheme into a theme file and print the path written.
+    Import(ImportArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct ImportArgs {
+    /// The scheme to import; the extension selects the format.
+    file: PathBuf,
+    /// Theme name (default: the file stem, or a base16 scheme's own name).
+    #[arg(long)]
+    name: Option<String>,
+    /// Directory to write `<slug>.toml` into (default: the user's themes
+    /// directory). It must exist.
+    #[arg(long, value_name = "DIR")]
+    out: Option<PathBuf>,
+    /// Replace an existing theme file.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -106,16 +138,33 @@ fn parse_seconds(value: &str) -> Result<Duration, String> {
 }
 
 fn main() -> ExitCode {
-    let Cli {
-        command: Command::Run(args),
-    } = Cli::parse();
-    match run_command(&args) {
+    let result = match Cli::parse().command {
+        Command::Run(args) => run_command(&args),
+        Command::Theme(ThemeCommand::Import(args)) => import_command(args),
+    };
+    match result {
         Ok(code) => code,
         Err(message) => {
             eprintln!("tessera-devtool: {message}");
             ExitCode::from(TOOL_FAILURE)
         }
     }
+}
+
+/// Runs `tessera-devtool theme import` and prints the path written.
+fn import_command(args: ImportArgs) -> Result<ExitCode, String> {
+    let path = theme::import(&ImportOptions {
+        input: args.file,
+        name: args.name,
+        out: args.out,
+        force: args.force,
+    })
+    .map_err(|err| err.to_string())?;
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "{}", path.display())
+        .and_then(|()| stdout.flush())
+        .map_err(|err| format!("cannot print the path: {err}"))?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Runs `tessera-devtool run` and returns the exit code to report.
@@ -163,8 +212,36 @@ mod tests {
     fn run_args(argv: &[&str]) -> RunArgs {
         let Cli {
             command: Command::Run(parsed),
-        } = Cli::try_parse_from(argv).expect("valid arguments");
+        } = Cli::try_parse_from(argv).expect("valid arguments")
+        else {
+            panic!("not a run command: {argv:?}");
+        };
         parsed
+    }
+
+    #[test]
+    fn theme_import_arguments() {
+        let Cli {
+            command: Command::Theme(ThemeCommand::Import(args)),
+        } = Cli::try_parse_from([
+            "tessera-devtool",
+            "theme",
+            "import",
+            "x.yaml",
+            "--name",
+            "N",
+            "--out",
+            "/tmp",
+            "--force",
+        ])
+        .expect("valid arguments")
+        else {
+            panic!("not an import");
+        };
+        assert_eq!(args.file, PathBuf::from("x.yaml"));
+        assert_eq!(args.name.as_deref(), Some("N"));
+        assert_eq!(args.out, Some(PathBuf::from("/tmp")));
+        assert!(args.force);
     }
 
     #[test]
