@@ -23,6 +23,14 @@
 //! written at the cursor and whose background fills cells that are erased or
 //! scrolled into view. `tessera-term` updates it from SGR sequences.
 //!
+//! # Resize
+//!
+//! [`Grid::resize`] changes the size. The primary screen re-wraps its
+//! soft-wrapped lines, scrollback included, to the new width and moves
+//! rows between screen and scrollback as the height changes; the cursor
+//! follows its character. The alternate screen is cut or padded instead.
+//! ADR 0009 records the rules and how they compare with other emulators.
+//!
 //! # Wide characters and grapheme clusters
 //!
 //! [`Grid::put_char`] places characters by their `unicode-width` 0.2 width
@@ -45,8 +53,6 @@
 //! - Origin mode (DECOM) is a terminal mode. The grid exposes
 //!   [`Grid::scroll_region`] so the emulator can translate coordinates before
 //!   calling [`Grid::goto`].
-//! - Resize and reflow are not part of this crate yet; a grid keeps the size
-//!   it was created with.
 
 #![forbid(unsafe_code)]
 
@@ -54,6 +60,7 @@ mod cell;
 mod grapheme;
 mod grid;
 mod line;
+mod reflow;
 mod scrollback;
 mod tabs;
 

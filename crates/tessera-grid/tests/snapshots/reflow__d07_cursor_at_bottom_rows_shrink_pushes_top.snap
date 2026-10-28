@@ -1,0 +1,38 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/d07_cursor_at_bottom_rows_shrink_pushes_top.txt
+---
+before:
+size: 4x5  scrollback: 0
+v>  [r0...]
+v>  [r1...]
+v>  [r2...]
+v>  [r3...]
+cursor: (3,2)  pending_wrap: false  saved: (0,0,false)  region: 0-3
+tabs: [0]
+resize 2x5:
+size: 2x5  scrollback: 2
+sb> [r0...]
+sb> [r1...]
+v>  [r2...]
+v>  [r3...]
+cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+tabs: [0]
+resize 4x5:
+size: 4x5  scrollback: 0
+v>  [r0...]
+v>  [r1...]
+v>  [r2...]
+v>  [r3...]
+cursor: (3,2)  pending_wrap: false  saved: (0,0,false)  region: 0-3
+tabs: [0]
+resize 6x5:
+size: 6x5  scrollback: 0
+v>  [r0...]
+v>  [r1...]
+v>  [r2...]
+v>  [r3...]
+v>  [.....]
+v>  [.....]
+cursor: (3,2)  pending_wrap: false  saved: (0,0,false)  region: 0-5
+tabs: [0]

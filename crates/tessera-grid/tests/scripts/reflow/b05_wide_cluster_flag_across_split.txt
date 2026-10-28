@@ -1,0 +1,7 @@
+# Fixture row B05_wide_cluster_flag_across_split (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# a flag (two regional indicators = one WIDE|CLUSTER cell + spacer) moves whole and can strand a column
+@size 3x6
+put ab🇯🇵cd
+@resize 3x3
+@resize 3x2
+@resize 3x6

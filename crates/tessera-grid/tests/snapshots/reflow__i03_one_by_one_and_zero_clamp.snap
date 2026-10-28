@@ -1,0 +1,26 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/i03_one_by_one_and_zero_clamp.txt
+---
+before:
+size: 3x3  scrollback: 0
+v>  [ab.]
+v>  [cd.]
+v>  [...]
+cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]
+resize 0x0:
+size: 1x1  scrollback: 3
+sb> [a]+
+sb> [b]
+sb> [c]+
+v>  [d]
+cursor: (0,0)  pending_wrap: true  saved: (0,0,false)  region: 0-0
+tabs: [0]
+resize 3x3:
+size: 3x3  scrollback: 0
+v>  [ab.]
+v>  [cd.]
+v>  [...]
+cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]

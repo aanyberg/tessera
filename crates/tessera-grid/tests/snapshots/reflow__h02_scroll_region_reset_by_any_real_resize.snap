@@ -1,0 +1,40 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/h02_scroll_region_reset_by_any_real_resize.txt
+---
+before:
+size: 4x6  scrollback: 0
+v>  [......]
+v>  [......]
+v>  [......]
+v>  [......]
+cursor: (0,0)  pending_wrap: false  saved: (0,0,false)  region: 1-2
+tabs: [0]
+resize 4x6:
+size: 4x6  scrollback: 0
+v>  [......]
+v>  [......]
+v>  [......]
+v>  [......]
+cursor: (0,0)  pending_wrap: false  saved: (0,0,false)  region: 1-2
+tabs: [0]
+resize 6x6:
+size: 6x6  scrollback: 0
+v>  [......]
+v>  [......]
+v>  [......]
+v>  [......]
+v>  [......]
+v>  [......]
+cursor: (0,0)  pending_wrap: false  saved: (0,0,false)  region: 0-5
+tabs: [0]
+resize 6x4:
+size: 6x4  scrollback: 0
+v>  [....]
+v>  [....]
+v>  [....]
+v>  [....]
+v>  [....]
+v>  [....]
+cursor: (0,0)  pending_wrap: false  saved: (0,0,false)  region: 0-5
+tabs: [0]

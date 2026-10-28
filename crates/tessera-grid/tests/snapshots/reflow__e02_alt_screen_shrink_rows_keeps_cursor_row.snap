@@ -1,0 +1,42 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/e02_alt_screen_shrink_rows_keeps_cursor_row.txt
+---
+before:
+size: 4x4  scrollback: 0
+v>  [a...]
+v>  [b...]
+v>  [c...]
+v>  [d...]
+cursor: (3,1)  pending_wrap: false  saved: (0,0,false)  region: 0-3
+stashed_primary:
+p>  [....]
+p>  [....]
+p>  [....]
+p>  [....]
+cursor: (0,0)  pending_wrap: false  saved: (0,0,false)
+tabs: [0]
+resize 2x4:
+size: 2x4  scrollback: 0
+v>  [c...]
+v>  [d...]
+cursor: (1,1)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+stashed_primary:
+p>  [....]
+p>  [....]
+cursor: (0,0)  pending_wrap: false  saved: (0,0,false)
+tabs: [0]
+resize 4x4:
+size: 4x4  scrollback: 0
+v>  [c...]
+v>  [d...]
+v>  [....]
+v>  [....]
+cursor: (1,1)  pending_wrap: false  saved: (0,0,false)  region: 0-3
+stashed_primary:
+p>  [....]
+p>  [....]
+p>  [....]
+p>  [....]
+cursor: (0,0)  pending_wrap: false  saved: (0,0,false)
+tabs: [0]

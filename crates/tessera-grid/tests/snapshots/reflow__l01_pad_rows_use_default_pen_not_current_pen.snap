@@ -1,0 +1,26 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/l01_pad_rows_use_default_pen_not_current_pen.txt
+---
+before:
+size: 2x4  scrollback: 0
+v>  [ab..]
+v>  [....]
+cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+tabs: [0]
+resize 4x4:
+size: 4x4  scrollback: 0
+v>  [ab..]
+v>  [....]
+v>  [....]
+v>  [....]
+cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-3
+tabs: [0]
+resize 4x6:
+size: 4x6  scrollback: 0
+v>  [ab....]
+v>  [......]
+v>  [......]
+v>  [......]
+cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-3
+tabs: [0]

@@ -1,0 +1,25 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/i01_one_column_grid.txt
+---
+before:
+size: 3x4  scrollback: 0
+v>  [abc.]
+v>  [....]
+v>  [....]
+cursor: (0,3)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]
+resize 3x1:
+size: 3x1  scrollback: 0
+v>  [a]+
+v>  [b]+
+v>  [c]
+cursor: (2,0)  pending_wrap: true  saved: (0,0,false)  region: 0-2
+tabs: [0]
+resize 3x4:
+size: 3x4  scrollback: 0
+v>  [abc.]
+v>  [....]
+v>  [....]
+cursor: (0,3)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]

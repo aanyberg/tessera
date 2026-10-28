@@ -1,0 +1,22 @@
+# Fixture row D09_scrollback_cap_full_rows_shrink_evicts_oldest (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# shrink pushes rows into a FULL history: the oldest lines are evicted
+@size 3x4
+@scrollback 2
+put h0
+cr
+lf
+put h1
+cr
+lf
+put h2
+cr
+lf
+put v0
+cr
+lf
+put v1
+cr
+lf
+put v2
+@resize 1x4
+@resize 3x4

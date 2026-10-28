@@ -1,0 +1,7 @@
+# Fixture row E03_alt_screen_wide_char_cut_by_new_edge (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# alternate screen column truncation that cuts a wide character blanks the base (no half cell survives)
+@size 2x6
+enter_alt_screen
+put ab中cd
+@resize 2x3
+@resize 2x6

@@ -1,0 +1,7 @@
+# Fixture row D03_pending_wrap_armed_on_full_row (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# cursor after the last glyph of a full row (pending wrap armed) re-arms only while the row stays full; otherwise the logical position is kept as a plain column
+@size 3x8
+put abcdefgh
+@resize 3x4
+@resize 3x12
+@resize 3x8

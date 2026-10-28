@@ -1,0 +1,6 @@
+# Fixture row B07_wide_char_strands_a_column_on_grow (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# growing can also create a stranded column: the wide char no longer fits at the end of the wider row
+@size 3x3
+put abc中
+@resize 3x4
+@resize 3x3

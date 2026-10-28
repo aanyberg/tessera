@@ -1,0 +1,30 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/k01_both_dimensions_at_once.txt
+---
+before:
+size: 4x8  scrollback: 0
+v>  [one.....]
+v>  [twotwotw]+
+v>  [otwo....]
+v>  [end.....]
+cursor: (3,3)  pending_wrap: false  saved: (0,0,false)  region: 0-3
+tabs: [0]
+resize 3x4:
+size: 3x4  scrollback: 2
+sb> [one.]
+sb> [twot]+
+v>  [wotw]+
+v>  [otwo]
+v>  [end.]
+cursor: (2,3)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]
+resize 5x10:
+size: 5x10  scrollback: 0
+v>  [one.......]
+v>  [twotwotwot]+
+v>  [wo........]
+v>  [end.......]
+v>  [..........]
+cursor: (3,3)  pending_wrap: false  saved: (0,0,false)  region: 0-4
+tabs: [0, 8]

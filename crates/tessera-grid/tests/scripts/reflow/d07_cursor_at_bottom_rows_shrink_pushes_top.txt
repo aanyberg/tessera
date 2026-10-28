@@ -1,0 +1,16 @@
+# Fixture row D07_cursor_at_bottom_rows_shrink_pushes_top (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# cursor on the last row: rows shrink pushes exactly (cursor row + 1 - new rows) top rows into scrollback; grow pulls them back and moves the cursor down
+@size 4x5
+put r0
+cr
+lf
+put r1
+cr
+lf
+put r2
+cr
+lf
+put r3
+@resize 2x5
+@resize 4x5
+@resize 6x5

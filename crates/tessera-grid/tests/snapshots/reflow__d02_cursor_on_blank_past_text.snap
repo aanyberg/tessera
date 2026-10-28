@@ -1,0 +1,39 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/d02_cursor_on_blank_past_text.txt
+---
+before:
+size: 3x8  scrollback: 0
+v>  [ab......]
+v>  [........]
+v>  [........]
+cursor: (0,5)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]
+resize 3x6:
+size: 3x6  scrollback: 0
+v>  [ab....]
+v>  [......]
+v>  [......]
+cursor: (0,5)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]
+resize 3x4:
+size: 3x4  scrollback: 0
+v>  [ab..]
+v>  [....]
+v>  [....]
+cursor: (0,3)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]
+resize 3x3:
+size: 3x3  scrollback: 0
+v>  [ab.]
+v>  [...]
+v>  [...]
+cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]
+resize 3x12:
+size: 3x12  scrollback: 0
+v>  [ab..........]
+v>  [............]
+v>  [............]
+cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0, 8]

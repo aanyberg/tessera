@@ -1,0 +1,7 @@
+# Fixture row D04_pending_wrap_with_text_continuing_to_cleared (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# pending wrap on a row that after the shrink is NOT the last full row of its line: re-armed only at the end of the logical line
+@size 3x5
+put abcde
+@resize 3x3
+@resize 3x2
+@resize 3x5

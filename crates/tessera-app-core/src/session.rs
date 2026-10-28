@@ -55,10 +55,11 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use tessera_pty::{ExitStatus, Pty, PtyEvent, PtyEvents, PtySize};
+use tessera_pty::{ExitStatus, Pty, PtyError, PtyEvent, PtyEvents, PtySize};
 use tessera_term::{Request, Terminal};
 
 use crate::input::MouseEvent;
+use crate::view::{MAX_VIEW_COLS, MAX_VIEW_ROWS};
 
 /// How long a closing session's child gets to exit after `SIGHUP` before it
 /// is sent `SIGKILL`.
@@ -422,10 +423,26 @@ impl Session {
         write_blocking(&self.pty, &self.muted, bytes)
     }
 
-    /// Resizes the PTY.
-    pub(crate) fn resize(&self, size: PtySize) -> Result<(), tessera_pty::PtyError> {
-        // TODO(#3): resize the terminal as well once `tessera_term::Terminal`
-        // exposes a resize; until then its grid keeps the spawn size.
+    /// Resizes the terminal, then the PTY.
+    ///
+    /// The grid is resized (and re-wrapped) first, so output the child
+    /// writes in answer to `SIGWINCH` lands on a grid of the new size. The
+    /// two locks are taken one after the other, never together.
+    ///
+    /// A size larger than [`MAX_VIEW_ROWS`] × [`MAX_VIEW_COLS`] (the
+    /// largest grid a view derives) is refused with
+    /// [`PtyError::InvalidSize`] before anything changes: the grid
+    /// allocates every row and every scrollback line at the full width,
+    /// so 65535 × 65535 would need tens of gigabytes. A size with zero
+    /// rows or columns leaves the terminal alone and is refused by the PTY
+    /// with the same error.
+    pub(crate) fn resize(&self, size: PtySize) -> Result<(), PtyError> {
+        if size.rows > MAX_VIEW_ROWS || size.cols > MAX_VIEW_COLS {
+            return Err(PtyError::InvalidSize(size));
+        }
+        if size.rows > 0 && size.cols > 0 {
+            lock(&self.term).resize(size.rows, size.cols);
+        }
         lock(&self.pty).resize(size)
     }
 
@@ -661,5 +678,136 @@ impl Pump {
         if outcome.is_err() {
             tracing::error!(session = %self.id, "session observer panicked; event dropped");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc::SyncSender;
+
+    use tessera_pty::PtyEvent;
+
+    use super::*;
+    use crate::{App, Config, ConfigPaths};
+
+    /// A PTY that only records the sizes it is given and rejects an empty
+    /// one, as the real PTY does. Hanging up ends its event stream.
+    struct SizePty {
+        events: Option<SyncSender<PtyEvent>>,
+        sizes: Arc<Mutex<Vec<PtySize>>>,
+    }
+
+    impl Pty for SizePty {
+        fn write(&mut self, _bytes: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn try_write(&mut self, _bytes: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn resize(&mut self, size: PtySize) -> Result<(), PtyError> {
+            if size.rows == 0 || size.cols == 0 {
+                return Err(PtyError::InvalidSize(size));
+            }
+            lock(&self.sizes).push(size);
+            Ok(())
+        }
+
+        fn size(&self) -> PtySize {
+            lock(&self.sizes).last().copied().unwrap_or_default()
+        }
+
+        fn child_pid(&self) -> Option<u32> {
+            None
+        }
+
+        fn exit_status(&self) -> Option<ExitStatus> {
+            None
+        }
+
+        fn hangup(&mut self) -> io::Result<()> {
+            if let Some(events) = self.events.take() {
+                let _ = events.send(PtyEvent::Exited(ExitStatus::Signaled(1)));
+            }
+            Ok(())
+        }
+
+        fn kill(&mut self) -> io::Result<()> {
+            self.hangup()
+        }
+    }
+
+    #[test]
+    fn app_resize_resizes_the_grid_then_the_pty() {
+        let app = App::new(Config::default(), ConfigPaths::new("/nonexistent/tessera"));
+        let (tx, rx) = mpsc::sync_channel(4);
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        let pty = SizePty {
+            events: Some(tx.clone()),
+            sizes: Arc::clone(&sizes),
+        };
+        let id = app.allocate_id();
+        app.attach(id, Box::new(pty), rx, PtySize::new(3, 8))
+            .expect("attach");
+        tx.send(PtyEvent::Output(b"abcdefghijkl".to_vec()))
+            .expect("reader alive");
+        drop(tx);
+        // The output is applied once the grid shows it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.with_terminal(id, |t| t.grid().cursor().row).unwrap() != 1 {
+            assert!(Instant::now() < deadline, "output never reached the grid");
+            thread::yield_now();
+        }
+
+        app.resize(id, PtySize::new(4, 5)).expect("resize");
+        let (rows, cols, line0) = app
+            .with_terminal(id, |t| {
+                let grid = t.grid();
+                (
+                    grid.rows(),
+                    grid.cols(),
+                    grid.line(0).expect("row 0").text(),
+                )
+            })
+            .unwrap();
+        assert_eq!((rows, cols), (4, 5));
+        assert_eq!(line0, "abcde", "the grid re-wrapped");
+        assert_eq!(&lock(&sizes)[..], [PtySize::new(4, 5)]);
+
+        let refused = app.resize(id, PtySize::new(0, 9));
+        assert!(refused.is_err(), "an empty size is refused");
+        let size = app
+            .with_terminal(id, |t| (t.grid().rows(), t.grid().cols()))
+            .unwrap();
+        assert_eq!(size, (4, 5), "a refused size leaves the grid alone");
+
+        for (rows, cols) in [
+            (MAX_VIEW_ROWS + 1, 80),
+            (24, MAX_VIEW_COLS + 1),
+            (u16::MAX, u16::MAX),
+        ] {
+            let refused = app.resize(id, PtySize::new(rows, cols));
+            assert!(
+                matches!(
+                    refused,
+                    Err(crate::Error::Pty(PtyError::InvalidSize(s))) if s == PtySize::new(rows, cols)
+                ),
+                "{rows}x{cols}: {refused:?}"
+            );
+        }
+        app.resize(id, PtySize::new(MAX_VIEW_ROWS, MAX_VIEW_COLS))
+            .expect("the largest view size is accepted");
+        let size = app
+            .with_terminal(id, |t| (t.grid().rows(), t.grid().cols()))
+            .unwrap();
+        assert_eq!(size, (MAX_VIEW_ROWS, MAX_VIEW_COLS));
+        assert_eq!(
+            lock(&sizes).last().copied(),
+            Some(PtySize::new(MAX_VIEW_ROWS, MAX_VIEW_COLS)),
+            "oversized requests never reached the PTY"
+        );
+        assert_eq!(lock(&sizes).len(), 2);
+        app.close_session(id).expect("close");
     }
 }

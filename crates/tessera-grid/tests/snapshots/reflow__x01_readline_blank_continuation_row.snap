@@ -1,0 +1,21 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/x01_readline_blank_continuation_row.txt
+---
+before:
+size: 2x10  scrollback: 0
+v>  [$.echo.hel]+
+v>  [..........]
+cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+tabs: [0, 8]
+resize 1x10:
+size: 1x10  scrollback: 0
+v>  [$.echo.hel]
+cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-0
+tabs: [0, 8]
+resize 2x10:
+size: 2x10  scrollback: 0
+v>  [$.echo.hel]
+v>  [..........]
+cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+tabs: [0, 8]

@@ -1,0 +1,6 @@
+# Fixture row B02_wide_char_stranded_blank_as_content (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# ALTERNATIVE to B01 (lead decision 4 read literally: every wrapped-row blank is content): the stranded blank becomes a real space after one round trip
+@size 3x6
+put abcd中ef
+@resize 3x5
+@resize 3x7

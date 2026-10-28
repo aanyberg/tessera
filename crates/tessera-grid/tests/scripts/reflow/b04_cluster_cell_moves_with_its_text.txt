@@ -1,0 +1,7 @@
+# Fixture row B04_cluster_cell_moves_with_its_text (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# a combining-mark cluster (one cell, Line::graphemes entry) is never split from its base across a wrap; the entry is re-keyed to the new column
+@size 3x5
+put abe\u{301}fg
+@resize 3x3
+@resize 3x2
+@resize 3x5

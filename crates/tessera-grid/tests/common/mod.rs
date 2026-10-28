@@ -27,7 +27,7 @@
 //! `cells:` has one `>` line per visible row and one token per cell,
 //! separated by one space, so every row shows its cell count:
 //!
-//! - `.` a blank (`' '`, no markers);
+//! - `.` a blank (`' '`, no markers, or only [`CellFlags::PAD`]);
 //! - `~` a spacer (the right half of a wide character);
 //! - `X` a plain cell showing `X`;
 //! - `X/W` the left half of a wide character, `X/C` a cluster cell and
@@ -106,7 +106,7 @@ pub fn render_cells(line: &Line) -> String {
 fn cell_token(line: &Line, col: usize, cell: &Cell) -> String {
     let mut token = if cell.flags == CellFlags::SPACER && cell.ch == ' ' {
         String::from("~")
-    } else if cell.flags.is_empty() && cell.ch == ' ' {
+    } else if cell.flags.difference(CellFlags::PAD).is_empty() && cell.ch == ' ' {
         String::from(".")
     } else {
         let mut token = base_token(cell.ch);
@@ -314,6 +314,8 @@ pub enum Step {
     AutoWrap(bool),
     /// `Terminal::set_insert_mode`.
     InsertMode(bool),
+    /// [`Grid::resize`] to `(rows, cols)`.
+    Resize(u16, u16),
 }
 
 /// One `### ` row of the fixture.
@@ -467,7 +469,12 @@ fn list(value: &str) -> impl Iterator<Item = &str> {
         .filter(|v| !v.is_empty())
 }
 
-fn parse_step(id: &str, step: &str) -> Step {
+/// Parses one grid or term step (`put abc`, `goto 0 7`, `el all`, …).
+///
+/// # Panics
+///
+/// On a step the fixture syntax does not define.
+pub fn parse_step(id: &str, step: &str) -> Step {
     let (name, arg) = step.split_once(' ').unwrap_or((step, ""));
     let num = |arg: &str| -> u16 {
         arg.parse()
@@ -508,6 +515,12 @@ fn parse_step(id: &str, step: &str) -> Step {
             n => Some(n.parse().expect("pen_bg index")),
         }),
         "reset" => Step::Reset,
+        "resize" => {
+            let (rows, cols) = arg
+                .split_once('x')
+                .unwrap_or_else(|| panic!("{id}: `{step}` needs <rows>x<cols>"));
+            Step::Resize(num(rows), num(cols))
+        }
         "feed" => Step::Feed {
             text: decode(arg),
             raw: arg.to_owned(),
@@ -591,6 +604,7 @@ pub fn run_grid(case: &Case) -> Grid {
 pub fn apply(grid: &mut Grid, step: &Step) {
     match step {
         Step::Put(text) => grid.put_str(text),
+        &Step::Resize(rows, cols) => grid.resize(rows, cols),
         &Step::Goto(row, col) => grid.goto(row, col),
         Step::Cr => grid.carriage_return(),
         Step::Lf => grid.line_feed(),

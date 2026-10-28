@@ -1,0 +1,25 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/b02_wide_char_stranded_blank_as_content.txt
+---
+before:
+size: 3x6  scrollback: 0
+v>  [abcd中~]+
+v>  [ef....]
+v>  [......]
+cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]
+resize 3x5:
+size: 3x5  scrollback: 0
+v>  [abcd_]+
+v>  [中~ef.]
+v>  [.....]
+cursor: (1,4)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]
+resize 3x7:
+size: 3x7  scrollback: 0
+v>  [abcd中~e]+
+v>  [f......]
+v>  [.......]
+cursor: (1,1)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]

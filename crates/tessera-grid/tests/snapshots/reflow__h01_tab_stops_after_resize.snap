@@ -1,0 +1,28 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/h01_tab_stops_after_resize.txt
+---
+before:
+size: 2x20  scrollback: 0
+v>  [....................]
+v>  [....................]
+cursor: (0,0)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+tabs: [3, 11]
+resize 2x30:
+size: 2x30  scrollback: 0
+v>  [..............................]
+v>  [..............................]
+cursor: (0,0)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+tabs: [3, 11, 24]
+resize 2x10:
+size: 2x10  scrollback: 0
+v>  [..........]
+v>  [..........]
+cursor: (0,0)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+tabs: [3]
+resize 2x24:
+size: 2x24  scrollback: 0
+v>  [........................]
+v>  [........................]
+cursor: (0,0)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+tabs: [3, 16]

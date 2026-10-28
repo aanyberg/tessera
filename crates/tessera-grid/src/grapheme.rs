@@ -202,6 +202,17 @@ impl GraphemeTable {
         });
     }
 
+    /// Removes every cluster and hands them out as `(column, text)` pairs
+    /// by ascending column, without copying the texts. The table is left
+    /// empty and without storage, like a new one.
+    pub(crate) fn take(&mut self) -> impl Iterator<Item = (usize, Box<str>)> + use<> {
+        self.entries
+            .take()
+            .into_iter()
+            .flat_map(|entries| *entries)
+            .map(|e| (usize::from(e.col), e.text))
+    }
+
     /// Trims the storage to the entries: frees an emptied table and shrinks
     /// a non-empty one to fit. Lines on screen keep their vector as it
     /// grew, so text that keeps rewriting clusters on the same row does not
@@ -290,6 +301,15 @@ mod tests {
         let mut t = table(&[(3, "a\u{301}")]);
         t.clear();
         assert!(t.is_empty());
+    }
+
+    #[test]
+    fn take_empties_the_table_in_column_order() {
+        let mut t = table(&[(4, "b\u{301}"), (1, "a\u{301}")]);
+        let taken: Vec<(usize, Box<str>)> = t.take().collect();
+        assert_eq!(taken, [(1, "a\u{301}".into()), (4, "b\u{301}".into())]);
+        assert!(t.entries.is_none(), "no storage is left behind");
+        assert_eq!(t.take().count(), 0);
     }
 
     #[test]

@@ -1,0 +1,13 @@
+# Fixture row L02_scrollback_cap_zero (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# cap 0: rows leaving the screen are discarded, grow cannot pull anything back
+@size 3x4
+@scrollback 0
+put aa
+cr
+lf
+put bb
+cr
+lf
+put cc
+@resize 1x4
+@resize 3x4

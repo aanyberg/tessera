@@ -1,0 +1,28 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/d05_cursor_below_text_rows_follows_blank_rows.txt
+---
+before:
+size: 4x6  scrollback: 0
+v>  [abcdef]+
+v>  [gh....]
+v>  [......]
+v>  [......]
+cursor: (2,0)  pending_wrap: false  saved: (0,0,false)  region: 0-3
+tabs: [0]
+resize 4x3:
+size: 4x3  scrollback: 0
+v>  [abc]+
+v>  [def]+
+v>  [gh.]
+v>  [...]
+cursor: (3,0)  pending_wrap: false  saved: (0,0,false)  region: 0-3
+tabs: [0]
+resize 4x6:
+size: 4x6  scrollback: 0
+v>  [abcdef]+
+v>  [gh....]
+v>  [......]
+v>  [......]
+cursor: (2,0)  pending_wrap: false  saved: (0,0,false)  region: 0-3
+tabs: [0]

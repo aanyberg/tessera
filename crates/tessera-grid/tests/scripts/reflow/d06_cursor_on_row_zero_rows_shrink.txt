@@ -1,0 +1,13 @@
+# Fixture row D06_cursor_on_row_zero_rows_shrink (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# cursor on row 0 with non-blank rows below it: blank rows below the cursor go first, then the TOP rows are pushed to scrollback and the cursor is clamped to row 0
+@size 5x6
+put aa
+cr
+lf
+put bb
+cr
+lf
+put cc
+goto 0 2
+@resize 2x6
+@resize 5x6

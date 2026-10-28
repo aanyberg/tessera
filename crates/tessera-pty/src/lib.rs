@@ -200,9 +200,12 @@ pub enum PtyError {
     /// A window-size update was rejected by the kernel.
     #[error("failed to resize pty: {0}")]
     Resize(String),
-    /// A size with zero rows or columns was requested; programs divide by
-    /// the window size, so such a size is never passed to the kernel.
-    #[error("pty size must have non-zero rows and cols, got {}x{}", .0.rows, .0.cols)]
+    /// A size that cannot be used was requested: zero rows or columns
+    /// (programs divide by the window size, so such a size is never passed
+    /// to the kernel), or more rows or columns than the caller allows
+    /// (`tessera-app-core` refuses sizes above the largest grid a view
+    /// derives).
+    #[error("invalid pty size {}x{}", .0.rows, .0.cols)]
     InvalidSize(PtySize),
     /// An I/O operation on the master side failed.
     #[error(transparent)]
@@ -413,7 +416,7 @@ mod tests {
     fn invalid_size_error_names_the_dimensions() {
         assert_eq!(
             PtyError::InvalidSize(PtySize::new(0, 80)).to_string(),
-            "pty size must have non-zero rows and cols, got 0x80"
+            "invalid pty size 0x80"
         );
     }
 

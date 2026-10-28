@@ -1,0 +1,8 @@
+# Fixture row E04_leave_alt_after_resize_restores_consistent_primary (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# enter alt, resize, leave alt: primary cursor/pending/saved cursor/tab stops are those of the REFLOWED primary
+@size 3x8
+put abcdefgh
+save
+enter_alt_screen
+@resize 3x5
+leave_alt_screen

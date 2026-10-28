@@ -1,0 +1,25 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/b08_cursor_on_wide_char_spacer_follows_base.txt
+---
+before:
+size: 3x6  scrollback: 0
+v>  [abcd中~]+
+v>  [ef....]
+v>  [......]
+cursor: (0,5)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]
+resize 3x5:
+size: 3x5  scrollback: 0
+v>  [abcd_]+
+v>  [中~ef.]
+v>  [.....]
+cursor: (1,0)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]
+resize 3x7:
+size: 3x7  scrollback: 0
+v>  [abcd中~e]+
+v>  [f......]
+v>  [.......]
+cursor: (0,4)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]

@@ -1,0 +1,9 @@
+# Fixture row I03_one_by_one_and_zero_clamp (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# resize to 0x0 clamps to 1x1 (like Grid::new); everything but the cursor line is in scrollback; 1x1 -> 3x3 pulls back
+@size 3x3
+put ab
+cr
+lf
+put cd
+@resize 0x0
+@resize 3x3

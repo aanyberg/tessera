@@ -1,0 +1,11 @@
+# Not a fixture row: review round 1 (lead decision, spec step 1 / L3).
+# Readline erased the continuation of a soft-wrapped command line, leaving
+# [$ echo hel]+ over an empty row. With the cursor on the prompt, shrinking
+# to one row drops the empty continuation row (clearing the wrap flag of the
+# row above) instead of pushing the prompt into history.
+@size 2x10
+put $ echo hello
+el all
+goto 0 2
+@resize 1x10
+@resize 2x10

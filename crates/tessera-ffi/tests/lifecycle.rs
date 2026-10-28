@@ -318,6 +318,11 @@ fn resize_and_clear_scrollback_accept_live_sessions() {
             tessera_session_resize(app.0, id, 0, 120, 0, 0),
             Error::InvalidArgument
         );
+        assert_eq!(
+            tessera_session_resize(app.0, id, u16::MAX, u16::MAX, 0, 0),
+            Error::InvalidArgument,
+            "an oversized grid is refused instead of allocated"
+        );
         assert_eq!(tessera_session_clear_scrollback(app.0, id), Error::Ok);
     }
     // The shell sees the new size.

@@ -1,0 +1,9 @@
+# Fixture row H01_tab_stops_after_resize (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# user tab stops below the new width are kept, user-cleared defaults stay cleared, stops beyond the old width get the default every-8 pattern
+@size 2x20
+clear_tabs
+tabset 3
+tabset 11
+@resize 2x30
+@resize 2x10
+@resize 2x24

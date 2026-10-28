@@ -1,0 +1,32 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/c02_wrapped_row_trailing_spaces_are_content.txt
+---
+before:
+size: 3x4  scrollback: 0
+v>  [ab..]+
+v>  [cd..]
+v>  [....]
+cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]
+resize 3x3:
+size: 3x3  scrollback: 0
+v>  [ab.]+
+v>  [.cd]
+v>  [...]
+cursor: (1,2)  pending_wrap: true  saved: (0,0,false)  region: 0-2
+tabs: [0]
+resize 3x4:
+size: 3x4  scrollback: 0
+v>  [ab..]+
+v>  [cd..]
+v>  [....]
+cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]
+resize 3x6:
+size: 3x6  scrollback: 0
+v>  [ab..cd]
+v>  [......]
+v>  [......]
+cursor: (0,5)  pending_wrap: true  saved: (0,0,false)  region: 0-2
+tabs: [0]

@@ -1,0 +1,6 @@
+# Fixture row K02_logical_line_spanning_scrollback_and_screen (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# a soft-wrapped line whose first rows are already in scrollback is rejoined as one logical line on grow
+@size 2x4
+put abcdefghijkl
+@resize 2x12
+@resize 2x3

@@ -18,7 +18,7 @@ impl Point {
 
 /// Width and cluster markers of a [`Cell`].
 ///
-/// A small bit set; combine with [`CellFlags::union`] or `|`. Three markers
+/// A small bit set; combine with [`CellFlags::union`] or `|`. Four markers
 /// exist:
 ///
 /// - [`CellFlags::WIDE`]: the cell holds the left half of a character two
@@ -29,6 +29,10 @@ impl Point {
 /// - [`CellFlags::CLUSTER`]: the cell's grapheme cluster has more scalars
 ///   than [`Cell::ch`]; the full text is in [`Line::graphemes`] at the
 ///   cell's column (see [`Line::cluster`]).
+/// - [`CellFlags::PAD`]: the last column of a soft-wrapped row that a wide
+///   character did not fit into, so it continued on the next row. The
+///   cell shows a blank and is not text: a resize that joins the row with
+///   the next one drops it. Writing or erasing the cell clears the marker.
 ///
 /// [`Line::graphemes`]: crate::Line::graphemes
 /// [`Line::cluster`]: crate::Line::cluster
@@ -44,6 +48,8 @@ impl CellFlags {
     pub const SPACER: Self = Self(1 << 1);
     /// The cell's text continues in the line's grapheme table.
     pub const CLUSTER: Self = Self(1 << 2);
+    /// Padding left in the last column when a wide character wrapped.
+    pub const PAD: Self = Self(1 << 3);
 
     /// The raw bits.
     pub const fn bits(self) -> u8 {
@@ -156,13 +162,13 @@ impl Cell {
     /// default foreground and underline colour, no flags.
     ///
     /// A [`CellFlags::SPACER`] is not blank: it is part of the wide
-    /// character to its left.
+    /// character to its left. A [`CellFlags::PAD`] cell is.
     pub fn is_blank(&self) -> bool {
         self.ch == ' '
             && self.style.fg == Color::Default
             && self.style.underline == Color::Default
             && self.style.flags == 0
-            && self.flags.is_empty()
+            && self.flags.difference(CellFlags::PAD).is_empty()
     }
 
     /// True for the left half of a two-column character
@@ -181,6 +187,22 @@ impl Cell {
     /// ([`CellFlags::CLUSTER`]).
     pub const fn is_cluster(&self) -> bool {
         self.flags.contains(CellFlags::CLUSTER)
+    }
+
+    /// True for the padding a wrapped wide character left in the last
+    /// column of a row ([`CellFlags::PAD`]).
+    pub const fn is_pad(&self) -> bool {
+        self.flags.contains(CellFlags::PAD)
+    }
+
+    /// The padding a wide character leaves in the last column when it
+    /// wraps: a blank with the background of `style`, marked
+    /// [`CellFlags::PAD`].
+    pub(crate) const fn pad_with(style: Style) -> Self {
+        Self {
+            flags: CellFlags::PAD,
+            ..Self::blank_with(style)
+        }
     }
 
     /// Columns the cell's character occupies starting at this cell: 2 for a

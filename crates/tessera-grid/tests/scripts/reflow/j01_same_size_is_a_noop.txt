@@ -1,0 +1,8 @@
+# Fixture row J01_same_size_is_a_noop (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# resize to the current size changes nothing: custom region, tab stops, pending wrap, wrapped flags and all
+@size 3x6
+put abcdefgh
+region 1 2
+clear_tabs
+tabset 2
+@resize 3x6

@@ -1,0 +1,2059 @@
+# =============================================================================
+# tessera-grid: resize with soft-wrap reflow   (issue #3, wave 4, milestone 0.1.0)
+# crates/tessera-grid/tests/fixtures/reflow_spec.txt
+#
+# Evidence file for the implementer and the critic. Every row cites its source.
+# It is test DATA, not a test: crates/tessera-grid/tests/reflow.rs is written from
+# it (same pattern as wide.rs::fixture_cases_hold), and one script per row goes to
+# crates/tessera-grid/tests/scripts/reflow/ (brief: "snapshot scripts for every
+# fixture case").
+#
+# HOW THE EXPECTED VALUES WERE PRODUCED
+#   A throw-away Python reference model (not committed; kept beside this file's
+#   scratchpad as model/model.py) of the RECOMMENDED algorithm below. It contains a
+#   mini Grid::put/wrap/scroll model so the `before:` blocks are what put_str would
+#   build, plus the resize algorithm. It asserts after every step: every line has
+#   `cols` cells, no split WIDE/SPACER pair, cursor in bounds, scrollback <= cap,
+#   tab-stop vector length == cols, both screens equal in size. Every row was then
+#   read through by hand against the rule cited on it. The rows are the EXPECTED
+#   OUTPUT of the recommendation, not an oracle for any emulator: where an emulator
+#   differs the row says so.
+#
+# SOURCES READ (not run; fetched 2026-10-28). "X does Y" means "X's source says Y".
+#   AL  Alacritty  bbb2cbf9  alacritty_terminal/src/grid/resize.rs (grow_lines,
+#                  shrink_lines, grow_columns, shrink_columns), grid/row.rs:53 shrink,
+#                  term/mod.rs:655 Term::resize, :2339 TabStops::resize
+#   WZ  WezTerm    e68a8ec2  term/src/screen.rs:101 rewrap_lines, :194 resize;
+#                  term/src/terminalstate/mod.rs:972 TerminalState::resize;
+#                  wezterm-surface/src/line/line.rs:214 Line::wrap, :1119 append_line
+#   KT  kitty      89960b54  kitty/resize.c (rewrap, init_src_line, find_space_in_dest_line,
+#                  update_tracked_cursors, resize_screen_buffers,
+#                  resize_screen_buffer_without_rewrap), kitty/screen.c:645 screen_resize,
+#                  kitty/options/definition.py:776 scrollback_fill_enlarged_window
+#   XT  xterm      xterm-snapshots master  screen.c:2200 ScreenResize (no reflow),
+#                  xterm.man:5326 resizeGravity ("SouthWest ... (the default)")
+#   IT  iTerm2     master  sources/VT100Screen/VT100ScreenMutableState+Resizing.m
+#                  (:1380 reallySetSize, :1575 alt-screen comment, :1325 saved cursor),
+#                  sources/VT100/VT100Grid.m (:756 numberOfLinesUsed,
+#                  :2390 restoreScreenFromLineBuffer, :2418 right margin, :2441 DWC_SKIP)
+#   TS  Tessera    crates/tessera-grid/src/{grid,line,cell,tabs,scrollback}.rs at e93317e
+#   brief  /private/tmp/.../scratchpad/wave4-briefs.md "Brief #3" ("lead decision N")
+#
+# ----------------------------------------------------------------------------
+# ROW SYNTAX
+#   A row starts with `### <ID>_<name>` and ends at the next `###`. Skip every line that
+#   starts with '#'. Keys:
+#     desc:             one sentence
+#     layer: grid       (Grid API only; a term-level script is optional, see brief)
+#     size: RxC         rows x cols BEFORE the steps (Grid::new / with_scrollback)
+#     scrollback_cap:   (optional) Grid::with_scrollback cap; default 10000
+#     step:             repeatable, applied in order, BEFORE the first resize
+#     before: / after:  indented state blocks (grammar below); `before` is the state after
+#                       the steps (derived, so a test may assert it as a sanity check)
+#     resize: RxC       a Grid::resize(rows, cols) call; the `after:` block that follows is
+#                       the state after THAT call (a row may have several resize/after pairs
+#                       that chain on each other). `resize: 0x0` passes zeros.
+#     step: leave_alt_screen   may appear between after blocks (E04)
+#     cite: / note: / flags:   free text. flags: ALTERNATIVE = not the recommendation, do
+#                       not assert it in the main test (use it only to document the cost).
+#
+#   Steps (-> Grid API)
+#     put <payload>          Grid::put_str. Payload escapes: \u{H..} one scalar, and
+#                            leading/trailing spaces are written \u{20}. A zero-width scalar
+#                            is always written \u{..}; everything else is literal. A decoder
+#                            must panic on any other escape.
+#     goto R C               Grid::goto (0-based; clears pending wrap)
+#     cr / lf                Grid::carriage_return / Grid::line_feed (LF keeps the column)
+#     el to_end|to_start|all Grid::erase_in_line (scripts only; added after review round 1 for x01)
+#     pen_bg N|none          set the pen to Style{ bg: Color::Indexed(N), ..DEFAULT } / default
+#     mark_visible_row R M   push Mark M (PromptStart|CommandStart|OutputStart) on visible row R
+#     save                   Grid::save_cursor (DECSC: position, pen, pending wrap)
+#     enter_alt_screen / leave_alt_screen
+#     region T B             Grid::set_scroll_region (cursor is NOT moved)
+#     clear_tabs             Grid::clear_all_tab_stops (no cursor motion)
+#     tabset C               tabs_mut().set(C) (no cursor motion)
+#
+#   State block (after `before:` / `after:`)
+#     size: RxC  scrollback: N       Grid::rows/cols, Grid::scrollback_len
+#     sb> [..]  (oldest first)        Grid::scrollback_line(i)
+#     v>  [..]  (top to bottom)       Grid::visible_lines / line(r)
+#     cursor: (r,c)  pending_wrap: b  saved: (r,c,b)  region: T-B
+#                                     Grid::cursor, pending_wrap; the saved-cursor slot
+#                                     (crate-private: assert through save/restore_cursor);
+#                                     Grid::scroll_region
+#     stashed_primary: p> rows ...    only while the alternate screen is active: the primary
+#                                     screen's rows / cursor / pending / saved (crate-internal;
+#                                     assert after leave_alt_screen or via a #[cfg(test)] hook)
+#     tabs: [..]                      columns where TabStops::is_set (active screen)
+#   Row syntax `[cells]` or `[cells]+` ('+' = Line::wrapped = true), then optionally
+#   ` marks=A,B`. Cells are written contiguously, EXACTLY `cols` cells per row:
+#       .          plain blank (' ', default style, no flags)
+#       X          plain cell, literal char (no digit/./~/{/}/[/]/@/+ in fixture text)
+#       X          followed by `~`: a WIDE cell then its SPACER (中~ occupies two columns)
+#       {e+0301}   a CLUSTER cell: base char then `+HHHH` for each further scalar
+#       {🇯+1F1F5}/W   a WIDE|CLUSTER cell (followed by ~ for its spacer)
+#       _          a PAD cell: the stranded column a wrapped wide char left (CellFlags::PAD)
+#       @h         suffix: cell bg is Color::Indexed(0xh), one hex digit; no suffix = default bg
+#   Line::text() of a row = trailing plain blanks trimmed, spacers skipped, clusters expanded.
+#
+# ----------------------------------------------------------------------------
+# RECOMMENDED ALGORITHM  (what the model implements; R-numbers are the disagreements below)
+#
+#   Grid::resize(rows, cols)
+#   0. rows = max(rows,1), cols = max(cols,1). Same size as now => return (O(1); region, tab
+#      stops, pending wrap, everything untouched). Otherwise the scroll region becomes the full
+#      screen and tab stops are rebuilt (step 6).                                    (R12)
+#   1. ROW STEP, at the OLD width, primary screen only (the stashed primary when the alt
+#      screen is active; shares the one scrollback). No re-wrapping, O(rows).        (R2 R3)
+#        grow by d:  p = min(d, scrollback_len). Pop the p newest scrollback lines to the TOP
+#                    of the screen (wrapped flags and marks intact), cursor.row += p, then
+#                    append d-p plain blank rows (DEFAULT pen, wrapped=false) at the BOTTOM.
+#        shrink by d: t = number of trailing rows below the cursor row that are blank,
+#                    unwrapped and mark-free. Drop min(d,t) rows from the bottom first, then push
+#                    the remaining d - min(d,t) rows from the TOP into scrollback (evicting the
+#                    oldest beyond the cap); cursor.row = max(0, cursor.row - pushed). Clear
+#                    `wrapped` on the new last visible row if rows were dropped from the bottom.
+#        pending_wrap and the cursor column are untouched by a row-only change.
+#   2. COLUMN STEP (cols changed), primary only:
+#        B = scrollback ++ visible rows (one buffer). Logical line = maximal run of rows
+#        where every row but the last has wrapped=true.
+#        a. cursor offset in its logical line = (sum of the widths of the logical line's
+#           earlier rows) + cursor.col, +1 if pending_wrap (position AFTER the last cell of
+#           the full row).
+#        b. join: concatenate the rows' cells. The LAST cell of a non-final row is dropped
+#           when it is a PAD cell (the stranded column, see R7; written `_` in the rows
+#           below).                                                                   (R7)
+#           Then trim trailing plain blanks of the whole logical line (never inner ones; BCE
+#           background on them is lost).                                              (R6)
+#           LEAD (after review round 1): "plain blank" for trimming and for blank rows is
+#           exactly Cell::BLANK (default style) or a PAD cell; a space with any colour or
+#           attribute is content. C01 is rewritten accordingly.
+#        c. re-wrap greedily at the new width: a WIDE|SPACER pair (and a CLUSTER cell, which is
+#           one cell) is never split; a wide pair that does not fit starts a new row and the
+#           previous row is padded with a DEFAULT PAD cell (the stranded column). A wide
+#           pair wider than the whole grid (cols == 1) is DROPPED.                    (R8)
+#           Every row but the last of a logical line gets wrapped=true; the last gets false.
+#           Marks of all rows of the line are concatenated onto the FIRST output row.
+#           Rows are padded to `cols` with plain default blanks. GraphemeTable entries move
+#           with their cell (re-keyed to the new column in the new Line).
+#        d. cursor: offset < text length => the cell holding that glyph (a spacer maps to its
+#           wide base); pending_wrap = false. Offset >= text length ("past the text"): let
+#           cl = cells in the last output row and t = cl + (offset - text_len).
+#             t < cols                      => (last row, t), not pending.
+#             t == cols and cl == cols      => (last row, cols-1), pending ARMED (full row).  (R5)
+#             otherwise                     => (last row, cols-1), not pending (clamp).       (R4)
+#           LEAD (after review round 1): whenever the last row is full (cl == cols) the cursor
+#           goes to (last row, cols-1) with pending ARMED, whatever t is, so the next glyph
+#           wraps instead of overwriting (and never lands on a spacer without a wrap).
+#        e. prune: let t_blank = blank unwrapped mark-free rows below the cursor row. If the
+#           reflow made the buffer longer by e rows, drop min(e, t_blank) of them from the
+#           bottom first (they would otherwise push real lines into history).
+#        f. window = last `rows` rows of the new buffer (pad blank default rows at the bottom
+#           if the buffer is shorter); everything before it is the new scrollback, oldest
+#           evicted beyond the cap. cursor.row = max(0, cursor.row - window_start).
+#           (Bottom-anchored: growing the width pulls older history into view.)       (R3)
+#   3. Combined rows+cols: step 1 then step 2 (Alacritty's order, AL resize.rs:22-32).
+#   4. ALTERNATE screen active: the alt screen gets NO reflow: rows follow step 1's shrink/grow
+#      rule with the dropped rows DISCARDED (no history) and blank default rows appended on
+#      grow; columns are cut / padded per row (a WIDE cell whose spacer is cut is blanked; its
+#      cluster entry is dropped); the cursor is clamped; pending_wrap = false if cols changed.
+#      The stashed primary gets steps 1-2 with ITS OWN cursor, pending wrap and saved cursor,
+#      sharing the scrollback. leave_alt_screen then sees equal dimensions.           (R1)
+#   5. Saved cursor (DECSC slot) of each screen: clamped to the new size only; its pending flag
+#      survives only when the column count did not change.                            (R9)
+#   6. Tab stops: new width w: stop[c] = old[c] for c < min(old,w); stop[c] = (c % 8 == 0) for
+#      c >= old width.  Scroll region = full screen.
+#   7. Pen, cursor visibility etc. are not touched. Rows added by a resize use the DEFAULT pen
+#      (a resize is not an erase).
+#
+# ----------------------------------------------------------------------------
+# EMULATOR DISAGREEMENTS AND THE RECOMMENDATION   (decisions for the lead are marked LEAD)
+#   R1  Alternate screen. XT, KT, AL, WZ do not reflow it. iTerm2 DOES: it pushes the alt grid
+#       into a line buffer and restores it at the new width (IT Resizing.m:560 and the comment at
+#       :1575: "abcd/ef.." shrunk to 3 columns becomes "d../ef."). Recommend no reflow (lead
+#       decision 1); the citation "iTerm2" in the brief is wrong, see CORRECTIONS. Alt rows shrink:
+#       XT/AL keep the cursor row and drop bottom rows, KT keeps the top rows, WZ keeps the bottom
+#       rows. Recommend the primary rule (E02) so one code path serves both.
+#   R2  Rows grow. XT pulls saved lines back by default (SouthWest gravity, xterm.man:5338;
+#       screen.c:2366-2412) and moves the cursor down; AL grow_lines pulls min(delta, history);
+#       WZ and IT refill the whole window from history after pruning blank rows under the cursor;
+#       KT does NOT pull by default (scrollback_fill_enlarged_window defaults to no).
+#       Recommend XT/AL exact-delta pulling (O(rows), blank rows under the cursor stay). (D07 D08)
+#   R3  Rows shrink with NON-BLANK rows below the cursor. XT/AL scroll only as far as the cursor
+#       needs, so the bottom rows are dropped (lost). WZ/IT keep the content: blank rows under the
+#       cursor go first, then the top rows go to history even if that pushes the cursor line off
+#       the top (WZ lets the row go negative). Recommend WZ/IT (= brief lead decision 2) with the
+#       cursor clamped to row 0.  LEAD: confirm (D06).
+#   R4  Cursor on a blank past the text, offset >= new width. KT keeps the offset and clamps to
+#       the last column (screen.c:723); AL wraps it like content onto a NEW row below
+#       (resize.rs:277-281); WZ computes x / cols (a possibly nonexistent row); IT as WZ. Recommend
+#       KT's clamp (a cursor never creates a row). LEAD: confirm (D02).
+#   R5  Pending wrap / cursor after the last glyph of a row that is exactly full at the new width.
+#       AL re-arms input_needs_wrap (resize.rs:377-381); IT and WZ put the cursor in the "right
+#       margin" x == width on the same row (IT grid.m:2418-2425, WZ screen.rs:148-166), which is
+#       pending wrap in all but name; KT clamps to cols-1 and LOSES the pending flag (screen.c:723),
+#       so the next glyph overwrites the last cell. 3 vs 1. The brief's tie-break ("if they
+#       disagree, clear it") would pick KT; recommend RE-ARM (typing after a resize must not
+#       overwrite the last glyph). Flipping to "clear" changes only pending_wrap to false in
+#       every row below (position is identical).  LEAD: confirm (D03 D04 and every row whose
+#       cursor shows pending_wrap: true after a resize).
+#   R6  Trailing blanks. KT trims never-written cells (char 0) of EVERY source row, wrapped or not
+#       (resize.c:86); WZ trims only the end of the logical line, and only when it is re-wrapped
+#       (line.rs:216-217, screen.rs:168); AL drops only cells that are_empty, so blanks with a
+#       background colour are kept as content (row.rs:53-69); IT keeps `used height` and drops
+#       unused rows. Recommend brief lead decision 4 (inner/non-final-row blanks are content,
+#       trailing blanks of the logical line are trimmed and re-padded default). Note: Tessera cannot
+#       tell a written space from an erased cell, KT can.
+#   R7  Stranded column before a wide char. AL (LEADING_WIDE_CHAR_SPACER) and IT (DWC_SKIP) mark it
+#       and remove it on join; KT leaves a blank + continuation flag; WZ leaves a short row.
+#       LEAD (after verify cycle 1, replacing the earlier "drop a blank before a wide char"
+#       heuristic, which erased genuine spaces at most widths): Tessera marks the column with
+#       CellFlags::PAD (put_wide and the re-wrap set it; any write or erase of the cell clears
+#       it) and the join drops only PAD cells, so a real space is never dropped (B03).
+#   R8  Wide char into a 1-column grid. KT skips it (resize.c:225-229); WZ overflows the row. Recommend
+#       skip (put_wide also refuses). The shrink -> grow round trip then loses that glyph, so the
+#       proptest generator must not put wide cells in grids that visit cols == 1.
+#   R9  Saved cursor. AL clamps; XT shifts its row with the scrolled lines (screen.c:2438
+#       AdjustSavedCursor); KT, IT (Resizing.m:1395-1459) and WZ (stashed primary only) track it
+#       through the reflow. Recommend clamp-only (brief decision 7): the initial slot (home) would
+#       otherwise be dragged along with the text.  LEAD: confirm (G01).
+#   R10 Marks. KT keeps the line attributes of the logical line on its first output row and resets
+#       prompt_kind afterwards (resize.c:149-153); Tessera: first row, concatenated (F01).
+#   R11 Tab stops. KT/AL/WZ agree: keep, extend with defaults. XT rebuilds nothing user-visible.
+#   R12 Scroll region reset to full screen by every real resize: XT screen.c:2458, KT screen.c:697,
+#       AL term/mod.rs:700, WZ terminalstate/mod.rs:1002. Unanimous.
+#
+# ----------------------------------------------------------------------------
+# CORRECTIONS TO THE BRIEF (the spec contradicts the brief text)
+#   C1  Lead decision 1 cites "xterm, iTerm2" for "the alternate screen truncates/pads". iTerm2
+#       reflows the alternate screen (R1). The decision itself (no reflow) still matches xterm,
+#       kitty, WezTerm and Alacritty.
+#   C2  Lead decision 2: rows grow "pull lines back ... not blank rows (xterm)". xterm pulls too,
+#       by default (resizeGravity SouthWest). Only kitty (default) and xterm with NorthWest gravity
+#       add blank rows.
+#   C3  Lead decision 3: "A cursor that lands past the new last column goes to the first cell of
+#       the continuation row." True only for a cursor ON a glyph whose cell moved. A cursor just
+#       after the text of a row that is exactly full has no continuation row (none exists): it is
+#       pending wrap on the last column (R5). A cursor on blanks far past the text is clamped (R4).
+#       "Or the position after the last cell when it sat on a blank past the text" must not mean
+#       the position after the last NON-BLANK cell: a prompt "$ " with the cursor on col 2 would
+#       jump left. Offsets past the text are preserved while they fit (D02).
+#   C4  Lead decision 4: "BCE background on such blanks is lost; every emulator does this."
+#       Alacritty keeps background-coloured trailing blanks as content (row.rs:53-69).
+#   C5  Lead decision 5: "stranded column is blank with the line's pen, as put_wide does." During a
+#       reflow there is no pen; recommend the default pen. And the stranded blank cannot be
+#       recognised afterwards without a heuristic (R7), which decision 4 ("blanks of a wrapped line
+#       are content") does not provide for.
+#   C6  Done-when proptest wording "shrink(c1) -> grow(c0) reproduces the original visible text and
+#       the cursor's logical position" cannot hold for arbitrary inputs. The generator must:
+#       (a) keep wide cells out of grids that visit cols == 1 (R8); (b) leave the cursor ON a glyph
+#       or exactly at the end of the text (a cursor parked on blanks past the text is clamped and not
+#       restored, D02); (c) not exceed the scrollback cap (evicted lines never return); (d) accept
+#       that BCE backgrounds on trailing blanks and the cursor row clamp of D06 are lost; (e) compare
+#       Line::text() per LOGICAL line, not per row. grow(c2) -> shrink(c0) additionally needs rows
+#       >= the rows the text needs at c0 or the window cuts into history (compare scrollback + screen).
+#   C7  The brief's Done-when invariant "cursor in bounds" must also include: pending_wrap implies
+#       cursor.col == cols-1; every wrapped row has a following row (the last row of the buffer is
+#       never wrapped); region is the full screen; tab-stop vector length == cols.
+#
+# ----------------------------------------------------------------------------
+# PROPERTIES TO ASSERT IN THE PROPTESTS (in addition to the rows)
+#   P1  resize never panics for rows, cols in 0..=u16::MAX (use small and extreme values) on any
+#       content, on both screens, with any scrollback cap including 0.
+#   P2  After every resize: all lines (scrollback, screen, stashed primary) have `cols` cells; no
+#       WIDE without SPACER after it / SPACER without WIDE before it; Line::graphemes keys are
+#       exactly the CLUSTER cells; cursor in bounds; scrollback_len <= cap; stashed primary has the
+#       same rows/cols as the active screen.
+#   P3  resize(r,c) twice in a row: the second call changes nothing.
+#   P4  Text conservation: concatenating Line::text of every LOGICAL line of scrollback+screen is
+#       unchanged by a column change, except for lines dropped by the cap, cut off by a 1-column grid
+#       (wide cells) and trailing blanks.
+#   P5  Round trips as in C6.
+#   P6  Row-only change: the sequence of Line::cells of scrollback ++ screen with trailing blank
+#       rows removed is unchanged (rows move between scrollback and screen, nothing is rewritten),
+#       and wrapped flags are untouched.
+#   P7  Same-size resize is a no-op (state equality, including region and tab stops).
+#
+# ----------------------------------------------------------------------------
+# ROWS
+
+### A01_wrapped_line_split_and_rejoined
+desc: a soft-wrapped line is re-split on shrink and rejoined on grow; the blank row below the cursor is pruned, not pushed to history
+layer: grid
+size: 3x8
+step: put abcdefghijkl
+  before:
+    size: 3x8  scrollback: 0
+    v>  [abcdefgh]+
+    v>  [ijkl....]
+    v>  [........]
+    cursor: (1,4)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x5
+  after:
+    size: 3x5  scrollback: 0
+    v>  [abcde]+
+    v>  [fghij]+
+    v>  [kl...]
+    cursor: (2,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x8
+  after:
+    size: 3x8  scrollback: 0
+    v>  [abcdefgh]+
+    v>  [ijkl....]
+    v>  [........]
+    cursor: (1,4)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+cite: AL resize.rs:245-388 shrink_columns, :101-242 grow_columns
+cite: WZ screen.rs:101-190 rewrap_lines (join :116-137, Line::wrap re-split :168-174)
+cite: KT resize.c:81-84 (rows joined while next_char_was_wrapped), :245-266 fast_copy_src_to_dest re-splits
+cite: IT VT100ScreenMutableState+Resizing.m:1380 reallySetSize (primary pushed to LineBuffer, restored at the new width)
+cite: XT does not reflow (screen.c ScreenResize only reallocates)
+note: Row 3 (blank, hard) lies below the cursor, so it is dropped first (lead decision 2, WZ screen.rs:216 pre-prune). After the shrink the 3-row window holds the 3 rows of the line; nothing enters scrollback. After the grow the freed row is a blank pad row at the bottom.
+
+### A02_hard_lines_are_never_joined
+desc: rows without the wrapped flag stay separate lines in both directions
+layer: grid
+size: 3x6
+step: put abcdef
+step: cr
+step: lf
+step: put xy
+  before:
+    size: 3x6  scrollback: 0
+    v>  [abcdef]
+    v>  [xy....]
+    v>  [......]
+    cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x3
+  after:
+    size: 3x3  scrollback: 0
+    v>  [abc]+
+    v>  [def]
+    v>  [xy.]
+    cursor: (2,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x6
+  after:
+    size: 3x6  scrollback: 0
+    v>  [abcdef]
+    v>  [xy....]
+    v>  [......]
+    cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+cite: AL resize.rs:123-131 (should_reflow requires WRAPLINE on the last cell)
+cite: WZ screen.rs:116-137 (was_wrapped gates the join)
+cite: KT resize.c:81-84 prev_src_line_ended_with_wrap
+cite: IT EOL_HARD vs EOL_SOFT in LineBuffer
+note: "abcdef" fills the row and arms pending wrap, then CR LF: wrapped stays false (the flag is set only when the NEXT glyph arrives, Grid::wrap), so the two rows are two logical lines.
+
+### A03_shrink_pushes_history_grow_pulls_back
+desc: window is bottom-anchored: a column shrink that adds rows pushes the oldest rows to scrollback, a grow pulls them back
+layer: grid
+size: 3x6
+step: put one
+step: cr
+step: lf
+step: put twotwotwotwo
+step: cr
+step: lf
+step: put three
+  before:
+    size: 3x6  scrollback: 1
+    sb> [one...]
+    v>  [twotwo]+
+    v>  [twotwo]
+    v>  [three.]
+    cursor: (2,5)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x3
+  after:
+    size: 3x3  scrollback: 4
+    sb> [one]
+    sb> [two]+
+    sb> [two]+
+    sb> [two]+
+    v>  [two]
+    v>  [thr]+
+    v>  [ee.]
+    cursor: (2,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x6
+  after:
+    size: 3x6  scrollback: 1
+    sb> [one...]
+    v>  [twotwo]+
+    v>  [twotwo]
+    v>  [three.]
+    cursor: (2,5)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+cite: AL resize.rs:367-369 (new_raw truncated to the scrollback cap + lines, window is the last rows), :219-227
+cite: WZ screen.rs:176-190 (prune bottom blank lines) and :314-316 (new_cursor_y = cursor_y - (len - rows))
+cite: KT resize.c:100-117 linebuf_next_dest_line pushes the top row into the history buffer
+cite: IT grid.m:2390-2400 restoreScreenFromLineBuffer fills from the bottom
+note: Before: sb=[one], visible=[twotwo+, twotwo, three]. Shrink to 3 columns: logical lines one(1 row) twotwotwotwo(4 rows) three(2 rows) = 7 rows; the window is the last 3, so 3 more rows enter scrollback (4 total). Grow back: the 12-char line re-joins into 2 rows and "one" stays in history.
+
+### B01_wide_char_lands_on_new_last_column
+desc: a wide character that would straddle the new last column moves whole to the next row; the stranded column is a PAD cell; on grow the PAD cell is dropped again
+layer: grid
+size: 3x6
+step: put abcd中ef
+  before:
+    size: 3x6  scrollback: 0
+    v>  [abcd中~]+
+    v>  [ef....]
+    v>  [......]
+    cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x5
+  after:
+    size: 3x5  scrollback: 0
+    v>  [abcd_]+
+    v>  [中~ef.]
+    v>  [.....]
+    cursor: (1,4)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x6
+  after:
+    size: 3x6  scrollback: 0
+    v>  [abcd中~]+
+    v>  [ef....]
+    v>  [......]
+    cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x7
+  after:
+    size: 3x7  scrollback: 0
+    v>  [abcd中~e]+
+    v>  [f......]
+    v>  [.......]
+    cursor: (1,1)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+cite: AL resize.rs:289-298 and :149-158 (LEADING_WIDE_CHAR_SPACER marks the stranded column and is removed on join :136-143)
+cite: WZ wezterm-surface line.rs:224 (len + cell.width() > width starts a new row; the cell is not split)
+cite: KT resize.c:180-196 find_space_in_dest_line moves a multicell whole; :118 marks the previous row continued
+cite: IT grid.m:2441-2447 (DWC_SKIP inferred when a soft-wrapped row is one cell short and the next row starts with a double-width char)
+note: REWRITTEN after verify cycle 1: the stranded column is a PAD cell (`_`, CellFlags::PAD; the Cell size is unchanged), set by the re-wrap as put_wide sets it, and the join drops only PAD cells (the role of AL's LEADING_WIDE_CHAR_SPACER and IT's DWC_SKIP). Resizing to 7: 中 needs cols 4-5 and fits, so the 7-col result has no stranded column and the text is abcd中ef.
+
+### B02_wide_char_stranded_blank_as_content
+desc: ALTERNATIVE to B01 (lead decision 4 read literally: every wrapped-row blank is content): the stranded blank becomes a real space after one round trip
+layer: grid
+size: 3x6
+step: put abcd中ef
+  before:
+    size: 3x6  scrollback: 0
+    v>  [abcd中~]+
+    v>  [ef....]
+    v>  [......]
+    cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x5
+  after:
+    size: 3x5  scrollback: 0
+    v>  [abcd_]+
+    v>  [中~ef.]
+    v>  [.....]
+    cursor: (1,4)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x7
+  after:
+    size: 3x7  scrollback: 0
+    v>  [abcd.中~]+
+    v>  [ef.....]
+    v>  [.......]
+    cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+cite: TS lead decision 4 (brief)
+cite: AL/IT/KT keep a distinct marker for the stranded cell, so they never show the gap
+note: Kept as the rejected alternative (keep the stranded column as text); with the PAD marker the stranded column is never text. Result differs from B01 at the 7-column step only: "abcd 中ef" (a gap) instead of "abcd中ef". Not recommended; included so the critic can see what the literal reading costs. Both readings satisfy the shrink(c1)->grow(c0) round-trip proptest because the original stranded blank is also a plain blank in Line::text.
+flags: ALTERNATIVE
+
+### B03_genuine_space_before_wide_char
+desc: a REAL space written in the last column followed by a wide character is text, not padding: it survives every re-wrap
+layer: grid
+size: 2x4
+step: put abc 中ef
+  before:
+    size: 2x4  scrollback: 0
+    v>  [abc.]+
+    v>  [中~ef]
+    cursor: (1,3)  pending_wrap: true  saved: (0,0,false)  region: 0-1
+    tabs: [0]
+resize: 2x3
+  after:
+    size: 2x3  scrollback: 1
+    sb> [abc]+
+    v>  [.中~]+
+    v>  [ef.]
+    cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+    tabs: [0]
+resize: 2x4
+  after:
+    size: 2x4  scrollback: 0
+    v>  [abc.]+
+    v>  [中~ef]
+    cursor: (1,3)  pending_wrap: true  saved: (0,0,false)  region: 0-1
+    tabs: [0]
+resize: 2x8
+  after:
+    size: 2x8  scrollback: 0
+    v>  [abc.中~ef]
+    v>  [........]
+    cursor: (0,7)  pending_wrap: true  saved: (0,0,false)  region: 0-1
+    tabs: [0]
+cite: TS lead decision for #3 after verify cycle 1 (2026-10-28): CellFlags::PAD marks the stranded column
+cite: AL LEADING_WIDE_CHAR_SPACER and IT DWC_SKIP are the same explicit marker
+note: REWRITTEN after verify cycle 1. Writing "abc " (4 cells, pending wrap) then 中 wraps first, leaving [abc ]+ then [中~ef]; the space is a real cell, not PAD, so no re-wrap drops it: width 3 gives [abc]+ [ 中~]+ [ef.], width 8 gives [abc 中ef] (a full row, so the cursor after the text waits on the last column with a wrap pending). The earlier heuristic (drop any blank before a wide character) erased such spaces at most widths.
+
+### B04_cluster_cell_moves_with_its_text
+desc: a combining-mark cluster (one cell, Line::graphemes entry) is never split from its base across a wrap; the entry is re-keyed to the new column
+layer: grid
+size: 3x5
+step: put abe\u{0301}fg
+  before:
+    size: 3x5  scrollback: 0
+    v>  [ab{e+0301}fg]
+    v>  [.....]
+    v>  [.....]
+    cursor: (0,4)  pending_wrap: true  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x3
+  after:
+    size: 3x3  scrollback: 0
+    v>  [ab{e+0301}]+
+    v>  [fg.]
+    v>  [...]
+    cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x2
+  after:
+    size: 3x2  scrollback: 0
+    v>  [ab]+
+    v>  [{e+0301}f]+
+    v>  [g.]
+    cursor: (2,1)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x5
+  after:
+    size: 3x5  scrollback: 0
+    v>  [ab{e+0301}fg]
+    v>  [.....]
+    v>  [.....]
+    cursor: (0,4)  pending_wrap: true  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+cite: AL: a cell carries zerowidth chars with it (grid Cell extra), resize.rs moves whole cells
+cite: WZ line.rs:224 wrap() copies cell.str() (the whole grapheme)
+cite: KT resize.c:86-100 moves a cell with its text-cache index
+cite: TS grapheme.rs GraphemeTable keyed by column
+note: Cluster token {e+0301} is ONE cell. Writing 5 cells fills the row (pending wrap armed, cursor pos 5). Width 3: [ab{e+0301}]+ [fg.]. Width 2: [ab]+ [{e+0301}f]+ [g.]. Back at width 5 the original cells and the armed pending wrap are restored (the cursor ends on the last cell of a full row). The GraphemeTable key of the cluster is 2, then 0, then 2 again.
+
+### B05_wide_cluster_flag_across_split
+desc: a flag (two regional indicators = one WIDE|CLUSTER cell + spacer) moves whole and can strand a column
+layer: grid
+size: 3x6
+step: put ab🇯🇵cd
+  before:
+    size: 3x6  scrollback: 0
+    v>  [ab{🇯+1F1F5}/W~cd]
+    v>  [......]
+    v>  [......]
+    cursor: (0,5)  pending_wrap: true  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x3
+  after:
+    size: 3x3  scrollback: 0
+    v>  [ab_]+
+    v>  [{🇯+1F1F5}/W~c]+
+    v>  [d..]
+    cursor: (2,1)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x2
+  after:
+    size: 3x2  scrollback: 0
+    v>  [ab]+
+    v>  [{🇯+1F1F5}/W~]+
+    v>  [cd]
+    cursor: (2,1)  pending_wrap: true  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x6
+  after:
+    size: 3x6  scrollback: 0
+    v>  [ab{🇯+1F1F5}/W~cd]
+    v>  [......]
+    v>  [......]
+    cursor: (0,5)  pending_wrap: true  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+cite: AL: WIDE_CHAR cell with zerowidth extras moves as a unit (resize.rs:289-298)
+cite: KT multicell moves whole (resize.c:180-196)
+cite: TS lead decision 5
+note: Flag token {🇯+1F1F5}/W followed by ~ (spacer). At width 2 the flag fits alone on a row; "c" and "d" follow on their own rows.
+
+### B06_wide_char_cannot_fit_one_column
+desc: a wide character is dropped when the target width is 1 (put_wide returns early for cols < 2); the proptest round-trip must avoid wide text at width 1
+layer: grid
+size: 3x4
+step: put a中b
+  before:
+    size: 3x4  scrollback: 0
+    v>  [a中~b]
+    v>  [....]
+    v>  [....]
+    cursor: (0,3)  pending_wrap: true  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x1
+  after:
+    size: 3x1  scrollback: 0
+    v>  [a]+
+    v>  [b]
+    v>  [.]
+    cursor: (1,0)  pending_wrap: true  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x4
+  after:
+    size: 3x4  scrollback: 0
+    v>  [ab..]
+    v>  [....]
+    v>  [....]
+    cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+cite: KT resize.c:225-229 (mc_width > dest_xnum: the cell is skipped, cursor tracked), TS put_wide cols < 2 => return
+cite: AL: min 2 columns is enforced by the front-end, grid has no rule
+cite: WZ line.rs:224 would loop pushing a row per cell
+note: Recommend kitty: the cell is lost, not substituted. The grow back cannot restore it (text "ab"). The proptest generator must exclude wide cells from any grid that visits cols == 1.
+
+### C01_hard_line_trailing_blanks_dropped_and_repadded
+desc: trailing DEFAULT blanks of a hard line are trimmed on shrink and re-padded with the default pen on grow; BCE-coloured blanks are content and move with the text
+layer: grid
+size: 2x8
+step: put ab
+step: pen_bg 4
+step: put \u{20}\u{20}\u{20}
+step: pen_bg none
+  before:
+    size: 2x8  scrollback: 0
+    v>  [ab.@4.@4.@4...]
+    v>  [........]
+    cursor: (0,5)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+    tabs: [0]
+resize: 2x4
+  after:
+    size: 2x4  scrollback: 0
+    v>  [ab.@4.@4]+
+    v>  [.@4...]
+    cursor: (1,1)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+    tabs: [0]
+resize: 2x8
+  after:
+    size: 2x8  scrollback: 0
+    v>  [ab.@4.@4.@4...]
+    v>  [........]
+    cursor: (0,5)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+    tabs: [0]
+cite: AL: Row::shrink keeps occupied cells; blanks with a background count as occupied (row.rs:53-69)
+cite: KT resize.c:86 and WZ line.rs:216-217 trim them (DIFFER)
+cite: TS lead decision for #3 after round 1 (2026-10-28): only Cell::BLANK is trimmed
+note: DEVIATION from the researcher's recommendation (R6/C4), decided by the lead after review round 1: only cells equal to Cell::BLANK (a space with the default style) are trailing blanks. The three bg-4 spaces (cols 2-4) are content, as in Alacritty: at 4 columns they wrap onto row 1 and the cursor keeps its place after them (offset 5 -> (1,1)); growing back rejoins them. The default blanks after them are trimmed and re-padded.
+
+### C02_wrapped_row_trailing_spaces_are_content
+desc: spaces inside a logical line, including at the end of a non-final row, move with the text
+layer: grid
+size: 3x4
+step: put ab  cd
+  before:
+    size: 3x4  scrollback: 0
+    v>  [ab..]+
+    v>  [cd..]
+    v>  [....]
+    cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x3
+  after:
+    size: 3x3  scrollback: 0
+    v>  [ab.]+
+    v>  [.cd]
+    v>  [...]
+    cursor: (1,2)  pending_wrap: true  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x4
+  after:
+    size: 3x4  scrollback: 0
+    v>  [ab..]+
+    v>  [cd..]
+    v>  [....]
+    cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x6
+  after:
+    size: 3x6  scrollback: 0
+    v>  [ab..cd]
+    v>  [......]
+    v>  [......]
+    cursor: (0,5)  pending_wrap: true  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+cite: WZ line.rs:216-217 (only the END of the logical line is trimmed)
+cite: KT resize.c:86 (BLANK_CHAR only; a written space is char 32 and is kept)
+cite: TS lead decision 4
+note: Rows before: [ab  ]+ [cd..]. The two spaces are real (written). Width 3: [ab ]+ [ cd]. Width 6: [ab  cd] on one row.
+
+### C03_blank_hard_rows_are_lines
+desc: blank hard rows between text rows are preserved one-for-one in both directions
+layer: grid
+size: 5x6
+step: put abcdefgh
+step: cr
+step: lf
+step: cr
+step: lf
+step: put z
+  before:
+    size: 5x6  scrollback: 0
+    v>  [abcdef]+
+    v>  [gh....]
+    v>  [......]
+    v>  [z.....]
+    v>  [......]
+    cursor: (3,1)  pending_wrap: false  saved: (0,0,false)  region: 0-4
+    tabs: [0]
+resize: 5x4
+  after:
+    size: 5x4  scrollback: 0
+    v>  [abcd]+
+    v>  [efgh]
+    v>  [....]
+    v>  [z...]
+    v>  [....]
+    cursor: (3,1)  pending_wrap: false  saved: (0,0,false)  region: 0-4
+    tabs: [0]
+resize: 5x6
+  after:
+    size: 5x6  scrollback: 0
+    v>  [abcdef]+
+    v>  [gh....]
+    v>  [......]
+    v>  [z.....]
+    v>  [......]
+    cursor: (3,1)  pending_wrap: false  saved: (0,0,false)  region: 0-4
+    tabs: [0]
+cite: AL resize.rs:189-202 only drops rows that are_clear AND were pulled
+cite: WZ screen.rs:168-174 (a short line is pushed as is)
+cite: TS lead decision 2
+
+### D01_cursor_on_last_cell_of_wrapped_row
+desc: cursor ON a glyph follows that glyph: the last cell of a wrapped row moves to the continuation row on shrink and back on grow
+layer: grid
+size: 3x8
+step: put abcdefghijkl
+step: goto 0 7
+  before:
+    size: 3x8  scrollback: 0
+    v>  [abcdefgh]+
+    v>  [ijkl....]
+    v>  [........]
+    cursor: (0,7)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x5
+  after:
+    size: 3x5  scrollback: 0
+    v>  [abcde]+
+    v>  [fghij]+
+    v>  [kl...]
+    cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x8
+  after:
+    size: 3x8  scrollback: 0
+    v>  [abcdefgh]+
+    v>  [ijkl....]
+    v>  [........]
+    cursor: (0,7)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+cite: AL resize.rs:167-188 (cursor reflowed with the cells that move) and :336-349
+cite: WZ screen.rs:125-131 logical_cursor_x = cursor_x + prior.len(); :142-146 x / physical_cols
+cite: KT resize.c:167-176 update_tracked_cursors
+cite: IT grid.m:2402-2425
+note: Cursor is on "h" (offset 7). Width 5: "h" is cell 2 of row 1, so the cursor is (1,2). Width 8 returns it to (0,7). The cursor was never pending.
+
+### D02_cursor_on_blank_past_text
+desc: cursor on a blank cell right of the text keeps its offset from the line start while it still fits, else clamps to the last column of the last row of the line
+layer: grid
+size: 3x8
+step: put ab
+step: goto 0 5
+  before:
+    size: 3x8  scrollback: 0
+    v>  [ab......]
+    v>  [........]
+    v>  [........]
+    cursor: (0,5)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x6
+  after:
+    size: 3x6  scrollback: 0
+    v>  [ab....]
+    v>  [......]
+    v>  [......]
+    cursor: (0,5)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x4
+  after:
+    size: 3x4  scrollback: 0
+    v>  [ab..]
+    v>  [....]
+    v>  [....]
+    cursor: (0,3)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x3
+  after:
+    size: 3x3  scrollback: 0
+    v>  [ab.]
+    v>  [...]
+    v>  [...]
+    cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x12
+  after:
+    size: 3x12  scrollback: 0
+    v>  [ab..........]
+    v>  [............]
+    v>  [............]
+    cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0, 8]
+cite: KT resize.c:167-176 (x >= x_limit: dest_x = dest.x + (t->x - src.x), then MIN(columns-1) at screen.c:723)
+cite: WZ screen.rs:142-146 (x / physical_cols may name a row that does not exist)
+cite: AL resize.rs:277-281 (explicit whitespace before the cursor wraps like content: DIFFERS)
+cite: IT grid.m:2402-2425
+note: Offset 5 on a 2-glyph line. Width 6: (0,5). Width 4: offset 5 >= 4: clamp to (0,3), no pending (not a full row). Width 3 likewise (0,2). Back to 12: the offset was clamped, so the cursor stays at the clamped column (0,2); it is NOT restored. Alacritty would wrap the cursor to a new row below; kitty clamps; recommend kitty (no extra row is created for a cursor).
+
+### D03_pending_wrap_armed_on_full_row
+desc: cursor after the last glyph of a full row (pending wrap armed) re-arms only while the row stays full; otherwise the logical position is kept as a plain column
+layer: grid
+size: 3x8
+step: put abcdefgh
+  before:
+    size: 3x8  scrollback: 0
+    v>  [abcdefgh]
+    v>  [........]
+    v>  [........]
+    cursor: (0,7)  pending_wrap: true  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x4
+  after:
+    size: 3x4  scrollback: 0
+    v>  [abcd]+
+    v>  [efgh]
+    v>  [....]
+    cursor: (1,3)  pending_wrap: true  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x12
+  after:
+    size: 3x12  scrollback: 0
+    v>  [abcdefgh....]
+    v>  [............]
+    v>  [............]
+    cursor: (0,8)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0, 8]
+resize: 3x8
+  after:
+    size: 3x8  scrollback: 0
+    v>  [abcdefgh]
+    v>  [........]
+    v>  [........]
+    cursor: (0,7)  pending_wrap: true  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+cite: AL resize.rs:114-117 (input_needs_wrap -> column+1 before the reflow) and :377-381 (re-armed when column == columns and the last cell is not WRAPLINE)
+cite: IT grid.m:2418-2425 (x % width == 0 and y > 0 => x = width, y -= 1: the "right margin" = pending wrap)
+cite: WZ screen.rs:148-163 (column zero => back onto the prior line at x = physical_cols)
+cite: KT screen.c:723 clamps to columns-1 with no pending flag (DIFFERS: cursor ends ON the last glyph)
+note: Offset 8 == end of text. Width 4: rows [abcd]+ [efgh]; end of text is the end of a full row => (1,3) pending armed. Width 12: [abcdefgh....] => (0,8) not pending. Width 8: full row again => (0,7) pending armed. 3 of 4 emulators agree; kitty differs. Recommend AL/IT/WZ (confirms the lead's tentative rule, brief decision 3).
+
+### D04_pending_wrap_with_text_continuing_to_cleared
+desc: pending wrap on a row that after the shrink is NOT the last full row of its line: re-armed only at the end of the logical line
+layer: grid
+size: 3x5
+step: put abcde
+  before:
+    size: 3x5  scrollback: 0
+    v>  [abcde]
+    v>  [.....]
+    v>  [.....]
+    cursor: (0,4)  pending_wrap: true  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x3
+  after:
+    size: 3x3  scrollback: 0
+    v>  [abc]+
+    v>  [de.]
+    v>  [...]
+    cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x2
+  after:
+    size: 3x2  scrollback: 0
+    v>  [ab]+
+    v>  [cd]+
+    v>  [e.]
+    cursor: (2,1)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x5
+  after:
+    size: 3x5  scrollback: 0
+    v>  [abcde]
+    v>  [.....]
+    v>  [.....]
+    cursor: (0,4)  pending_wrap: true  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+cite: AL resize.rs:377-384
+cite: IT grid.m:2418-2425
+note: Offset 5. Width 3: [abc]+ [de.] => (1,2) not pending (row 1 is not full). Width 2: [ab]+ [cd]+ [e.] => (2,1) not pending. Width 5: [abcde] full => (0,4) pending armed.
+
+### D05_cursor_below_text_rows_follows_blank_rows
+desc: cursor on an empty line under wrapped text keeps its distance from the window bottom
+layer: grid
+size: 4x6
+step: put abcdefgh
+step: cr
+step: lf
+  before:
+    size: 4x6  scrollback: 0
+    v>  [abcdef]+
+    v>  [gh....]
+    v>  [......]
+    v>  [......]
+    cursor: (2,0)  pending_wrap: false  saved: (0,0,false)  region: 0-3
+    tabs: [0]
+resize: 4x3
+  after:
+    size: 4x3  scrollback: 0
+    v>  [abc]+
+    v>  [def]+
+    v>  [gh.]
+    v>  [...]
+    cursor: (3,0)  pending_wrap: false  saved: (0,0,false)  region: 0-3
+    tabs: [0]
+resize: 4x6
+  after:
+    size: 4x6  scrollback: 0
+    v>  [abcdef]+
+    v>  [gh....]
+    v>  [......]
+    v>  [......]
+    cursor: (2,0)  pending_wrap: false  saved: (0,0,false)  region: 0-3
+    tabs: [0]
+cite: AL resize.rs:221-227 (bottom anchored)
+cite: WZ screen.rs:314-316
+cite: IT grid.m:756-758 numberOfLinesUsed = max(cursor.y+1, last non-empty line)
+note: Cursor on the empty row 2 (offset 0, blank hard line). Width 3 turns the 2-row line into 3 rows (+1 above the cursor); the blank row 3 below the cursor is pruned to pay for it, so nothing reaches scrollback and the cursor moves from row 2 to row 3.
+
+### D06_cursor_on_row_zero_rows_shrink
+desc: cursor on row 0 with non-blank rows below it: blank rows below the cursor go first, then the TOP rows are pushed to scrollback and the cursor is clamped to row 0
+layer: grid
+size: 5x6
+step: put aa
+step: cr
+step: lf
+step: put bb
+step: cr
+step: lf
+step: put cc
+step: goto 0 2
+  before:
+    size: 5x6  scrollback: 0
+    v>  [aa....]
+    v>  [bb....]
+    v>  [cc....]
+    v>  [......]
+    v>  [......]
+    cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-4
+    tabs: [0]
+resize: 2x6
+  after:
+    size: 2x6  scrollback: 1
+    sb> [aa....]
+    v>  [bb....]
+    v>  [cc....]
+    cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+    tabs: [0]
+resize: 5x6
+  after:
+    size: 5x6  scrollback: 0
+    v>  [aa....]
+    v>  [bb....]
+    v>  [cc....]
+    v>  [......]
+    v>  [......]
+    cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-4
+    tabs: [0]
+cite: WZ screen.rs:216-224 (pre-prune blank rows below the cursor) and :314-316 (window = last rows; the cursor row can go negative in WZ, Tessera clamps to 0)
+cite: brief lead decision 2
+cite: XT screen.c:2337-2349 and AL resize.rs:84-90 DIFFER: they scroll only as far as needed to keep the CURSOR row, so "cc" would be dropped and "aa" kept
+note: Rows 3 and 4 are blank and below the cursor: dropped first (2 of the 3 rows to remove). One more row must go: "aa" (the cursor row!) is pushed to history, the cursor is clamped to row 0 (now over "bb", col 2 kept). Content is preserved, the cursor is not. Grow back to 5 rows pulls "aa" and the cursor moves to row 1, still over "bb". xterm/Alacritty would keep the cursor on "aa" and LOSE "cc"; recommend following the lead (content over cursor). Only arises with non-blank rows below the cursor, which is rare outside full-screen programs.
+
+### D07_cursor_at_bottom_rows_shrink_pushes_top
+desc: cursor on the last row: rows shrink pushes exactly (cursor row + 1 - new rows) top rows into scrollback; grow pulls them back and moves the cursor down
+layer: grid
+size: 4x5
+step: put r0
+step: cr
+step: lf
+step: put r1
+step: cr
+step: lf
+step: put r2
+step: cr
+step: lf
+step: put r3
+  before:
+    size: 4x5  scrollback: 0
+    v>  [r0...]
+    v>  [r1...]
+    v>  [r2...]
+    v>  [r3...]
+    cursor: (3,2)  pending_wrap: false  saved: (0,0,false)  region: 0-3
+    tabs: [0]
+resize: 2x5
+  after:
+    size: 2x5  scrollback: 2
+    sb> [r0...]
+    sb> [r1...]
+    v>  [r2...]
+    v>  [r3...]
+    cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+    tabs: [0]
+resize: 4x5
+  after:
+    size: 4x5  scrollback: 0
+    v>  [r0...]
+    v>  [r1...]
+    v>  [r2...]
+    v>  [r3...]
+    cursor: (3,2)  pending_wrap: false  saved: (0,0,false)  region: 0-3
+    tabs: [0]
+resize: 6x5
+  after:
+    size: 6x5  scrollback: 0
+    v>  [r0...]
+    v>  [r1...]
+    v>  [r2...]
+    v>  [r3...]
+    v>  [.....]
+    v>  [.....]
+    cursor: (3,2)  pending_wrap: false  saved: (0,0,false)  region: 0-5
+    tabs: [0]
+cite: XT screen.c:2341-2349 saveEditBufLines(-amount) / :2366-2412 unsaveEditBufLines
+cite: AL resize.rs:78-98 shrink_lines, :43-69 grow_lines
+cite: IT Resizing.m:181-195 appendScreen (usedHeight)
+cite: KT scrollback_fill_enlarged_window defaults to no (options/definition.py:776): DIFFERS on grow
+note: Shrink 4 -> 2: push 2 (r0, r1), cursor row 3 -> 1. Grow 2 -> 4: pulls r1, r0 back, cursor row 1 -> 3. Grow 4 -> 6 with empty scrollback: two blank rows at the BOTTOM, cursor unchanged. kitty (default) never pulls; xterm (default SouthWest gravity, xterm.man resizeGravity), Alacritty, WezTerm and iTerm2 do.
+
+### D08_grow_rows_pulls_fewer_than_requested
+desc: history shorter than the growth: pull what exists, pad the rest with blank rows at the bottom
+layer: grid
+size: 3x4
+step: put aa
+step: cr
+step: lf
+step: put bb
+step: cr
+step: lf
+step: put cc
+step: cr
+step: lf
+step: put dd
+  before:
+    size: 3x4  scrollback: 1
+    sb> [aa..]
+    v>  [bb..]
+    v>  [cc..]
+    v>  [dd..]
+    cursor: (2,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 6x4
+  after:
+    size: 6x4  scrollback: 0
+    v>  [aa..]
+    v>  [bb..]
+    v>  [cc..]
+    v>  [dd..]
+    v>  [....]
+    v>  [....]
+    cursor: (3,2)  pending_wrap: false  saved: (0,0,false)  region: 0-5
+    tabs: [0]
+cite: AL resize.rs:54-61 from_history = min(history, lines_added); the remainder is added below
+cite: XT screen.c:2366-2374 move_down = min(delta_rows, savedlines)
+note: sb=[aa], visible=[bb,cc,dd]. Grow 3 -> 6: pull 1 (aa), then 2 blank rows at the bottom. Cursor on dd moves from row 2 to row 3.
+
+### D09_scrollback_cap_full_rows_shrink_evicts_oldest
+desc: shrink pushes rows into a FULL history: the oldest lines are evicted
+layer: grid
+size: 3x4
+scrollback_cap: 2
+step: put h0
+step: cr
+step: lf
+step: put h1
+step: cr
+step: lf
+step: put h2
+step: cr
+step: lf
+step: put v0
+step: cr
+step: lf
+step: put v1
+step: cr
+step: lf
+step: put v2
+  before:
+    size: 3x4  scrollback: 2
+    sb> [h1..]
+    sb> [h2..]
+    v>  [v0..]
+    v>  [v1..]
+    v>  [v2..]
+    cursor: (2,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 1x4
+  after:
+    size: 1x4  scrollback: 2
+    sb> [v0..]
+    sb> [v1..]
+    v>  [v2..]
+    cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-0
+    tabs: [0]
+resize: 3x4
+  after:
+    size: 3x4  scrollback: 0
+    v>  [v0..]
+    v>  [v1..]
+    v>  [v2..]
+    cursor: (2,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+cite: AL resize.rs:367-369 truncate(max_scroll_limit + lines) evicts the oldest
+cite: WZ screen.rs:176-190 (prunes blank bottom rows first, then the ring drops the oldest)
+cite: TS Scrollback::push on a full ring evicts
+note: Cap 2. h0 is already evicted: sb=[h1,h2], visible=[v0,v1,v2]. Shrink 3 -> 1 pushes v0 and v1, evicting h1 and h2. Grow 1 -> 3 pulls back only what survived; the evicted lines never return.
+
+### D10_scrollback_cap_full_columns_shrink_evicts_oldest
+desc: a column shrink that creates more history rows than the cap allows evicts the oldest rows (the top of the reflowed buffer)
+layer: grid
+size: 2x6
+scrollback_cap: 3
+step: put aaaaaa
+step: cr
+step: lf
+step: put bbbbbb
+step: cr
+step: lf
+step: put cccccc
+step: cr
+step: lf
+step: put dd
+  before:
+    size: 2x6  scrollback: 2
+    sb> [aaaaaa]
+    sb> [bbbbbb]
+    v>  [cccccc]
+    v>  [dd....]
+    cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+    tabs: [0]
+resize: 2x3
+  after:
+    size: 2x3  scrollback: 3
+    sb> [bbb]+
+    sb> [bbb]
+    sb> [ccc]+
+    v>  [ccc]
+    v>  [dd.]
+    cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+    tabs: [0]
+cite: AL resize.rs:367-369
+cite: KT history ring (history.c) drops the oldest on add
+cite: TS lead decision 8
+note: Cap 3. Before: sb=[aaaaaa,bbbbbb], visible=[cccccc,dd]. The reflowed buffer has 7 rows; the window is the last 2, the 5 history candidates are aaa+ aaa bbb+ bbb ccc+, the cap keeps the 3 newest. (A cap eviction may start history in the middle of a logical line; that is fine.)
+
+### E01_alt_screen_truncates_primary_reflows
+desc: alternate screen active: the alt screen is truncated/padded (no reflow); the stashed primary reflows with its OWN cursor; leave_alt_screen finds equal dimensions
+layer: grid
+size: 3x6
+step: put abcdefgh
+step: enter_alt_screen
+step: goto 0 0
+step: put ALT123456
+step: goto 2 1
+  before:
+    size: 3x6  scrollback: 0
+    v>  [ALT123]+
+    v>  [456...]
+    v>  [......]
+    cursor: (2,1)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    stashed_primary:
+      p>  [abcdef]+
+      p>  [gh....]
+      p>  [......]
+      cursor: (1,2)  pending_wrap: false  saved: (0,0,false)
+    tabs: [0]
+resize: 3x4
+  after:
+    size: 3x4  scrollback: 0
+    v>  [ALT1]+
+    v>  [456.]
+    v>  [....]
+    cursor: (2,1)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    stashed_primary:
+      p>  [abcd]+
+      p>  [efgh]
+      p>  [....]
+      cursor: (1,3)  pending_wrap: true  saved: (0,0,false)
+    tabs: [0]
+resize: 3x8
+  after:
+    size: 3x8  scrollback: 0
+    v>  [ALT1....]+
+    v>  [456.....]
+    v>  [........]
+    cursor: (2,1)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    stashed_primary:
+      p>  [abcdefgh]
+      p>  [........]
+      p>  [........]
+      cursor: (0,7)  pending_wrap: true  saved: (0,0,false)
+    tabs: [0]
+cite: AL term/mod.rs:676-678 (grid.resize(!is_alt, ..) / inactive_grid.resize(is_alt, ..))
+cite: WZ screen.rs:234-247 (allow_scrollback false => line.resize() truncate / invalidate)
+cite: KT screen.c:304-322 (resize_screen_buffer_without_rewrap for the alt linebuf)
+cite: XT screen.c:2320-2327 (non-visible buffer is only reallocated)
+cite: IT Resizing.m:1575-1590: iTerm2 REFLOWS the alt screen (hard lines are re-split and lines move up): DIFFERS from lead decision 1
+note: Alt rows before: [ALT123]+ [456...] (ALT123456 wrapped at 6 columns). Truncation to 4 columns cuts each row on its own: [ALT1]+ [456.]; the wrapped flag is kept as it was and the text is NOT re-joined. Stashed primary [abcdef]+ [gh....] reflows to [abcd]+ [efgh] with its own cursor. Grow to 8: alt rows are padded with blanks, the primary rejoins. The alt screen creates no scrollback.
+
+### E02_alt_screen_shrink_rows_keeps_cursor_row
+desc: alternate screen rows shrink: no history (lines scrolled off are discarded), scroll only as far as needed to keep the cursor visible
+layer: grid
+size: 4x4
+step: enter_alt_screen
+step: put a
+step: cr
+step: lf
+step: put b
+step: cr
+step: lf
+step: put c
+step: cr
+step: lf
+step: put d
+  before:
+    size: 4x4  scrollback: 0
+    v>  [a...]
+    v>  [b...]
+    v>  [c...]
+    v>  [d...]
+    cursor: (3,1)  pending_wrap: false  saved: (0,0,false)  region: 0-3
+    stashed_primary:
+      p>  [....]
+      p>  [....]
+      p>  [....]
+      p>  [....]
+      cursor: (0,0)  pending_wrap: false  saved: (0,0,false)
+    tabs: [0]
+resize: 2x4
+  after:
+    size: 2x4  scrollback: 0
+    v>  [c...]
+    v>  [d...]
+    cursor: (1,1)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+    stashed_primary:
+      p>  [....]
+      p>  [....]
+      cursor: (0,0)  pending_wrap: false  saved: (0,0,false)
+    tabs: [0]
+resize: 4x4
+  after:
+    size: 4x4  scrollback: 0
+    v>  [c...]
+    v>  [d...]
+    v>  [....]
+    v>  [....]
+    cursor: (1,1)  pending_wrap: false  saved: (0,0,false)  region: 0-3
+    stashed_primary:
+      p>  [....]
+      p>  [....]
+      p>  [....]
+      p>  [....]
+      cursor: (0,0)  pending_wrap: false  saved: (0,0,false)
+    tabs: [0]
+cite: AL resize.rs:84-90 (alt grid has max_scroll_limit 0 so scroll_up discards)
+cite: XT screen.c:2341-2349
+cite: KT: top-aligned content, cursor clamped (differs when the cursor is low)
+cite: WZ screen.rs:314-316 drops from the TOP (bottom-anchored): DIFFERS
+note: Cursor on row 3 ("d"), shrink 4 -> 2: needs 2 scrolled-off rows (a, b discarded), keeps [c, d], cursor row 1. Grow 2 -> 4: alt has no history to pull; two blank rows are appended at the bottom, cursor stays row 1.
+
+### E03_alt_screen_wide_char_cut_by_new_edge
+desc: alternate screen column truncation that cuts a wide character blanks the base (no half cell survives)
+layer: grid
+size: 2x6
+step: enter_alt_screen
+step: put ab中cd
+  before:
+    size: 2x6  scrollback: 0
+    v>  [ab中~cd]
+    v>  [......]
+    cursor: (0,5)  pending_wrap: true  saved: (0,0,false)  region: 0-1
+    stashed_primary:
+      p>  [......]
+      p>  [......]
+      cursor: (0,0)  pending_wrap: false  saved: (0,0,false)
+    tabs: [0]
+resize: 2x3
+  after:
+    size: 2x3  scrollback: 0
+    v>  [ab.]
+    v>  [...]
+    cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+    stashed_primary:
+      p>  [...]
+      p>  [...]
+      cursor: (0,0)  pending_wrap: false  saved: (0,0,false)
+    tabs: [0]
+resize: 2x6
+  after:
+    size: 2x6  scrollback: 0
+    v>  [ab....]
+    v>  [......]
+    cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+    stashed_primary:
+      p>  [......]
+      p>  [......]
+      cursor: (0,0)  pending_wrap: false  saved: (0,0,false)
+    tabs: [0]
+cite: KT resize.c:458-464 remove the multicell char split at the right edge
+cite: TS Line invariant: no split WIDE/SPACER pair
+note: Alt row [ab中~cd]: cutting to 3 columns keeps [ab.] (the base at col 2 lost its spacer and is blanked). Growing back pads blanks; the lost text is gone.
+
+### E04_leave_alt_after_resize_restores_consistent_primary
+desc: enter alt, resize, leave alt: primary cursor/pending/saved cursor/tab stops are those of the REFLOWED primary
+layer: grid
+size: 3x8
+step: put abcdefgh
+step: save
+step: enter_alt_screen
+  before:
+    size: 3x8  scrollback: 0
+    v>  [........]
+    v>  [........]
+    v>  [........]
+    cursor: (0,7)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    stashed_primary:
+      p>  [abcdefgh]
+      p>  [........]
+      p>  [........]
+      cursor: (0,7)  pending_wrap: true  saved: (0,7,true)
+    tabs: [0]
+resize: 3x5
+  after:
+    size: 3x5  scrollback: 0
+    v>  [.....]
+    v>  [.....]
+    v>  [.....]
+    cursor: (0,4)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    stashed_primary:
+      p>  [abcde]+
+      p>  [fgh..]
+      p>  [.....]
+      cursor: (1,3)  pending_wrap: false  saved: (0,4,false)
+    tabs: [0]
+step: leave_alt_screen
+  after:
+    size: 3x5  scrollback: 0
+    v>  [abcde]+
+    v>  [fgh..]
+    v>  [.....]
+    cursor: (1,3)  pending_wrap: false  saved: (0,4,false)  region: 0-2
+    tabs: [0]
+cite: AL term/mod.rs:677-678
+cite: IT Resizing.m:843-870 restorePrimaryGridWithLineBuffer
+cite: TS grid.rs leave_alt_screen debug_asserts (lines.len() == rows, cells.len() == cols)
+note: Stashed primary had pending wrap armed at (0,7) with a saved cursor at (0,7,true). After the resize the stash holds [abcde]+ [fgh..], cursor (1,3) pending false; the saved cursor is clamped only (0,4,false). The test then calls leave_alt_screen and checks Grid::rows/cols equal the stash dimensions.
+
+### F01_marks_stay_on_first_row_of_logical_line
+desc: marks sit on the first physical row of their logical line; marks of continuation rows are appended to it when rows join, and the first row keeps them when re-split
+layer: grid
+size: 4x6
+step: put abcdefghij
+step: mark_visible_row 0 PromptStart
+step: mark_visible_row 1 CommandStart
+  before:
+    size: 4x6  scrollback: 0
+    v>  [abcdef]+ marks=PromptStart
+    v>  [ghij..] marks=CommandStart
+    v>  [......]
+    v>  [......]
+    cursor: (1,4)  pending_wrap: false  saved: (0,0,false)  region: 0-3
+    tabs: [0]
+resize: 4x12
+  after:
+    size: 4x12  scrollback: 0
+    v>  [abcdefghij..] marks=PromptStart,CommandStart
+    v>  [............]
+    v>  [............]
+    v>  [............]
+    cursor: (0,10)  pending_wrap: false  saved: (0,0,false)  region: 0-3
+    tabs: [0, 8]
+resize: 4x4
+  after:
+    size: 4x4  scrollback: 0
+    v>  [abcd]+ marks=PromptStart,CommandStart
+    v>  [efgh]+
+    v>  [ij..]
+    v>  [....]
+    cursor: (2,2)  pending_wrap: false  saved: (0,0,false)  region: 0-3
+    tabs: [0]
+resize: 4x6
+  after:
+    size: 4x6  scrollback: 0
+    v>  [abcdef]+ marks=PromptStart,CommandStart
+    v>  [ghij..]
+    v>  [......]
+    v>  [......]
+    cursor: (1,4)  pending_wrap: false  saved: (0,0,false)  region: 0-3
+    tabs: [0]
+cite: KT resize.c:98-101,129 (set_dest_line_attrs on the first dest row; prompt_kind reset after use)
+cite: AL/WZ: no per-line marks (n/a)
+cite: IT PromptMarkResizeTests (marks follow the logical line)
+cite: TS lead decision 6
+note: Row 0 carries PromptStart, row 1 (its continuation) carries CommandStart. Width 12: one row with BOTH marks, in row order [PromptStart, CommandStart]. Width 4: three rows, both marks on the first row only. Marks never duplicate.
+
+### F02_marks_on_hard_lines_stay_with_their_line
+desc: a mark on a hard line moves with that line when rows scroll into/out of history
+layer: grid
+size: 3x5
+step: put aa
+step: cr
+step: lf
+step: put bb
+step: cr
+step: lf
+step: put cc
+step: mark_visible_row 0 PromptStart
+step: mark_visible_row 2 OutputStart
+  before:
+    size: 3x5  scrollback: 0
+    v>  [aa...] marks=PromptStart
+    v>  [bb...]
+    v>  [cc...] marks=OutputStart
+    cursor: (2,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 1x5
+  after:
+    size: 1x5  scrollback: 2
+    sb> [aa...] marks=PromptStart
+    sb> [bb...]
+    v>  [cc...] marks=OutputStart
+    cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-0
+    tabs: [0]
+resize: 3x5
+  after:
+    size: 3x5  scrollback: 0
+    v>  [aa...] marks=PromptStart
+    v>  [bb...]
+    v>  [cc...] marks=OutputStart
+    cursor: (2,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+cite: TS lead decision 6
+cite: KT line_attrs travel with the row (resize.c:149)
+note: Shrink 3 -> 1 with the cursor on row 2: rows 0 and 1 go to scrollback keeping their marks. Grow pulls them back with marks intact.
+
+### B07_wide_char_strands_a_column_on_grow
+desc: growing can also create a stranded column: the wide char no longer fits at the end of the wider row
+layer: grid
+size: 3x3
+step: put abc中
+  before:
+    size: 3x3  scrollback: 0
+    v>  [abc]+
+    v>  [中~.]
+    v>  [...]
+    cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x4
+  after:
+    size: 3x4  scrollback: 0
+    v>  [abc_]+
+    v>  [中~..]
+    v>  [....]
+    cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x3
+  after:
+    size: 3x3  scrollback: 0
+    v>  [abc]+
+    v>  [中~.]
+    v>  [...]
+    cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+cite: AL resize.rs:149-158 (grow_columns inserts LEADING_WIDE_CHAR_SPACER when a wide cell does not fit)
+cite: KT resize.c:180-196
+cite: WZ line.rs:224
+note: Width 3: [abc]+ [中~.]. Width 4: abc fills 3 of 4, 中 needs 2 => it moves to row 2 again and the row ends in a stranded blank: [abc.]+ [中~..]. Same layout as the narrower grid but one column wider.
+
+### B08_cursor_on_wide_char_spacer_follows_base
+desc: a cursor parked on the right half (SPACER) of a wide char maps to the wide cell's new position
+layer: grid
+size: 3x6
+step: put abcd中ef
+step: goto 0 5
+  before:
+    size: 3x6  scrollback: 0
+    v>  [abcd中~]+
+    v>  [ef....]
+    v>  [......]
+    cursor: (0,5)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x5
+  after:
+    size: 3x5  scrollback: 0
+    v>  [abcd_]+
+    v>  [中~ef.]
+    v>  [.....]
+    cursor: (1,0)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x7
+  after:
+    size: 3x7  scrollback: 0
+    v>  [abcd中~e]+
+    v>  [f......]
+    v>  [.......]
+    cursor: (0,4)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+cite: TS Grid::goto allows a spacer column; the logical glyph is the wide cell
+cite: AL resize.rs:166-188 (cursor tracked by cell index)
+note: Cursor on col 5 = the spacer of 中. Width 5: 中 starts row 1, so the cursor goes to the BASE cell (1,0). Width 7: (0,4).
+
+### G01_saved_cursor_clamped
+desc: DECSC position is clamped to the new size (rows and cols); pending flag survives only when the width is unchanged
+layer: grid
+size: 4x8
+step: put abcdefgh
+step: goto 3 6
+step: save
+step: goto 0 0
+  before:
+    size: 4x8  scrollback: 0
+    v>  [abcdefgh]
+    v>  [........]
+    v>  [........]
+    v>  [........]
+    cursor: (0,0)  pending_wrap: false  saved: (3,6,false)  region: 0-3
+    tabs: [0]
+resize: 2x5
+  after:
+    size: 2x5  scrollback: 0
+    v>  [abcde]+
+    v>  [fgh..]
+    cursor: (0,0)  pending_wrap: false  saved: (1,4,false)  region: 0-1
+    tabs: [0]
+resize: 4x8
+  after:
+    size: 4x8  scrollback: 0
+    v>  [abcdefgh]
+    v>  [........]
+    v>  [........]
+    v>  [........]
+    cursor: (0,0)  pending_wrap: false  saved: (1,4,false)  region: 0-3
+    tabs: [0]
+resize: 4x4
+  after:
+    size: 4x4  scrollback: 0
+    v>  [abcd]+
+    v>  [efgh]
+    v>  [....]
+    v>  [....]
+    cursor: (0,0)  pending_wrap: false  saved: (1,3,false)  region: 0-3
+    tabs: [0]
+resize: 2x4
+  after:
+    size: 2x4  scrollback: 0
+    v>  [abcd]+
+    v>  [efgh]
+    cursor: (0,0)  pending_wrap: false  saved: (1,3,false)  region: 0-1
+    tabs: [0]
+cite: AL resize.rs:92-93 (clamps the saved line) and :386-387 (clamps the saved column)
+cite: WZ terminalstate/mod.rs:972-1015 only re-maps the STASHED primary cursor (kept in saved_cursor while alt is active) through the rewrap and sets wrap_next = false; the live DECSC slot is otherwise untouched (never clamped): DIFFERS
+cite: IT Resizing.m:1325 clampSavedCursorToScreenSize
+cite: XT screen.c:2438 AdjustSavedCursor shifts the saved row with scrolled lines; kitty screen.c:723 tracks it through the rewrap: both DIFFER (content-tracking)
+cite: brief lead decision 7
+note: Saved (3,6,false). Clamp-only: 4x8 -> 2x5 gives (1,4); growing back does NOT restore it ((1,4) stays); then 4x4 -> (1,3) -> 2x4 stays (1,3). Content-tracking emulators (xterm, kitty, iTerm2) would move the saved position with the text; Tessera clamps only, because the initial saved slot (home, default pen) is indistinguishable from "saved at home" and would otherwise be dragged along.
+
+### G02_saved_cursor_pending_flag_row_only_resize
+desc: a row-only resize leaves cursor and saved cursor columns, pending wrap flags untouched (except row shifts)
+layer: grid
+size: 3x4
+step: put abcd
+step: save
+  before:
+    size: 3x4  scrollback: 0
+    v>  [abcd]
+    v>  [....]
+    v>  [....]
+    cursor: (0,3)  pending_wrap: true  saved: (0,3,true)  region: 0-2
+    tabs: [0]
+resize: 5x4
+  after:
+    size: 5x4  scrollback: 0
+    v>  [abcd]
+    v>  [....]
+    v>  [....]
+    v>  [....]
+    v>  [....]
+    cursor: (0,3)  pending_wrap: true  saved: (0,3,true)  region: 0-4
+    tabs: [0]
+resize: 2x4
+  after:
+    size: 2x4  scrollback: 0
+    v>  [abcd]
+    v>  [....]
+    cursor: (0,3)  pending_wrap: true  saved: (0,3,true)  region: 0-1
+    tabs: [0]
+cite: AL resize.rs:114-117 and :249-252: input_needs_wrap is only touched by the COLUMN paths
+cite: TS lead decision 8 (a row-only change does no re-wrapping)
+note: Pending wrap armed at (0,3), saved (0,3,true). Growing rows (no history): cursor stays on row 0, pending stays armed. Shrinking to 2 rows: the two blank rows go first (cursor still row 0), pending stays armed. Row-only changes never recompute pending.
+
+### H01_tab_stops_after_resize
+desc: user tab stops below the new width are kept, user-cleared defaults stay cleared, stops beyond the old width get the default every-8 pattern
+layer: grid
+size: 2x20
+step: clear_tabs
+step: tabset 3
+step: tabset 11
+  before:
+    size: 2x20  scrollback: 0
+    v>  [....................]
+    v>  [....................]
+    cursor: (0,0)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+    tabs: [3, 11]
+resize: 2x30
+  after:
+    size: 2x30  scrollback: 0
+    v>  [..............................]
+    v>  [..............................]
+    cursor: (0,0)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+    tabs: [3, 11, 24]
+resize: 2x10
+  after:
+    size: 2x10  scrollback: 0
+    v>  [..........]
+    v>  [..........]
+    cursor: (0,0)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+    tabs: [3]
+resize: 2x24
+  after:
+    size: 2x24  scrollback: 0
+    v>  [........................]
+    v>  [........................]
+    cursor: (0,0)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+    tabs: [3, 16]
+cite: KT screen.c:703-720 (init_tabstops for the new width, then memcpy of MIN(old,new) old entries)
+cite: AL term/mod.rs:681-686 + TabStops::resize :2339-2347 (extend with index % 8 == 0; shrink truncates)
+cite: WZ terminalstate/mod.rs:1007 tabs.resize(cols)
+cite: brief lead decision 7
+cite: TS tabs.rs TabStops::new / set / clear
+note: Old stops: 3, 11 (all defaults cleared). 20 -> 30: keeps 3, 11; columns 20..29 get defaults => 24. 30 -> 10: keeps 3 (11 is beyond). 10 -> 24: columns 10..23 get defaults => 16 (24 would be beyond) and the kept 3. Note column 0 is NOT a stop in the first step because it was cleared.
+
+### H02_scroll_region_reset_by_any_real_resize
+desc: a real resize (rows or cols) resets the scroll region to the full screen; a same-size call does not
+layer: grid
+size: 4x6
+step: region 1 2
+  before:
+    size: 4x6  scrollback: 0
+    v>  [......]
+    v>  [......]
+    v>  [......]
+    v>  [......]
+    cursor: (0,0)  pending_wrap: false  saved: (0,0,false)  region: 1-2
+    tabs: [0]
+resize: 4x6
+  after:
+    size: 4x6  scrollback: 0
+    v>  [......]
+    v>  [......]
+    v>  [......]
+    v>  [......]
+    cursor: (0,0)  pending_wrap: false  saved: (0,0,false)  region: 1-2
+    tabs: [0]
+resize: 6x6
+  after:
+    size: 6x6  scrollback: 0
+    v>  [......]
+    v>  [......]
+    v>  [......]
+    v>  [......]
+    v>  [......]
+    v>  [......]
+    cursor: (0,0)  pending_wrap: false  saved: (0,0,false)  region: 0-5
+    tabs: [0]
+resize: 6x4
+  after:
+    size: 6x4  scrollback: 0
+    v>  [....]
+    v>  [....]
+    v>  [....]
+    v>  [....]
+    v>  [....]
+    v>  [....]
+    cursor: (0,0)  pending_wrap: false  saved: (0,0,false)  region: 0-5
+    tabs: [0]
+cite: XT screen.c:2458 resetMargins
+cite: KT screen.c:697-698 margin_top = 0, margin_bottom = lines - 1
+cite: AL term/mod.rs:700-701
+cite: WZ terminalstate/mod.rs:1002-1003 top_and_bottom_margins = 0..rows
+cite: brief lead decision 7
+note: First resize is a no-op (same size): region stays 1-2. The row growth then resets to 0-5; the column change keeps full screen 0-5.
+
+### I01_one_column_grid
+desc: width 1: every glyph its own row; round trip back to a wide grid restores the text; a cursor after the last glyph is pending on column 0
+layer: grid
+size: 3x4
+step: put abc
+  before:
+    size: 3x4  scrollback: 0
+    v>  [abc.]
+    v>  [....]
+    v>  [....]
+    cursor: (0,3)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x1
+  after:
+    size: 3x1  scrollback: 0
+    v>  [a]+
+    v>  [b]+
+    v>  [c]
+    cursor: (2,0)  pending_wrap: true  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 3x4
+  after:
+    size: 3x4  scrollback: 0
+    v>  [abc.]
+    v>  [....]
+    v>  [....]
+    cursor: (0,3)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+cite: KT resize.c:225-229 (width-1 destination)
+cite: AL: n/a (front-end enforces >= 2 columns? unverified)
+cite: brief 1-column grids
+note: Width 1: [a]+ [b]+ [c]. The cursor sat after "abc" (offset 3 == end of text) and the last row is full (1 of 1), so the cursor is (2,0) with pending wrap ARMED. Growing back restores [abc.] and cursor (0,3), not pending.
+
+### I02_one_row_grid
+desc: height 1: all but the cursor row go to history; grow pulls them back
+layer: grid
+size: 3x5
+step: put aa
+step: cr
+step: lf
+step: put bb
+step: cr
+step: lf
+step: put cc
+  before:
+    size: 3x5  scrollback: 0
+    v>  [aa...]
+    v>  [bb...]
+    v>  [cc...]
+    cursor: (2,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 1x5
+  after:
+    size: 1x5  scrollback: 2
+    sb> [aa...]
+    sb> [bb...]
+    v>  [cc...]
+    cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-0
+    tabs: [0]
+resize: 1x3
+  after:
+    size: 1x3  scrollback: 2
+    sb> [aa.]
+    sb> [bb.]
+    v>  [cc.]
+    cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-0
+    tabs: [0]
+resize: 3x5
+  after:
+    size: 3x5  scrollback: 0
+    v>  [aa...]
+    v>  [bb...]
+    v>  [cc...]
+    cursor: (2,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+cite: XT/AL/WZ shrink rules
+cite: brief 1-row grids
+note: Rows 3 -> 1: aa and bb pushed. Then 1x5 -> 1x3 changes nothing visible; back to 3 rows pulls both lines.
+
+### I03_one_by_one_and_zero_clamp
+desc: resize to 0x0 clamps to 1x1 (like Grid::new); everything but the cursor line is in scrollback; 1x1 -> 3x3 pulls back
+layer: grid
+size: 3x3
+step: put ab
+step: cr
+step: lf
+step: put cd
+  before:
+    size: 3x3  scrollback: 0
+    v>  [ab.]
+    v>  [cd.]
+    v>  [...]
+    cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 0x0
+  after:
+    size: 1x1  scrollback: 3
+    sb> [a]+
+    sb> [b]
+    sb> [c]+
+    v>  [d]
+    cursor: (0,0)  pending_wrap: true  saved: (0,0,false)  region: 0-0
+    tabs: [0]
+resize: 3x3
+  after:
+    size: 3x3  scrollback: 0
+    v>  [ab.]
+    v>  [cd.]
+    v>  [...]
+    cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+cite: KT screen.c:645-650 lines = MAX(1, lines)
+cite: WZ screen.rs:142-143 size.rows.max(1)
+cite: TS Grid::new clamps; brief lead decision 8
+note: (0,0) means rows = 0 and cols = 0 passed to resize. cd is on the single visible cell row: width 1 splits it into [c]+ [d]; the last cell [d] is visible, "c", "ab" in history.
+
+### J01_same_size_is_a_noop
+desc: resize to the current size changes nothing: custom region, tab stops, pending wrap, wrapped flags and all
+layer: grid
+size: 3x6
+step: put abcdefgh
+step: region 1 2
+step: clear_tabs
+step: tabset 2
+  before:
+    size: 3x6  scrollback: 0
+    v>  [abcdef]+
+    v>  [gh....]
+    v>  [......]
+    cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 1-2
+    tabs: [2]
+resize: 3x6
+  after:
+    size: 3x6  scrollback: 0
+    v>  [abcdef]+
+    v>  [gh....]
+    v>  [......]
+    cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 1-2
+    tabs: [2]
+cite: AL term/mod.rs:662-665 early return
+cite: WZ screen.rs:145-150 early return
+cite: brief lead decision 8 (O(1) no-op)
+note: Region stays 1-2, the lone tab stop stays 2, cursor stays (1,2). The implementation must not rebuild anything (a Grid equality / pointer-stability check is fine).
+
+### J02_row_only_change_does_not_rewrap
+desc: a row-only change never joins or splits rows: wrapped rows pulled from history keep their flags and stay as they are
+layer: grid
+size: 3x4
+step: put abcdefghijkl
+step: cr
+step: lf
+step: put z
+  before:
+    size: 3x4  scrollback: 1
+    sb> [abcd]+
+    v>  [efgh]+
+    v>  [ijkl]
+    v>  [z...]
+    cursor: (2,1)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 5x4
+  after:
+    size: 5x4  scrollback: 0
+    v>  [abcd]+
+    v>  [efgh]+
+    v>  [ijkl]
+    v>  [z...]
+    v>  [....]
+    cursor: (3,1)  pending_wrap: false  saved: (0,0,false)  region: 0-4
+    tabs: [0]
+resize: 2x4
+  after:
+    size: 2x4  scrollback: 2
+    sb> [abcd]+
+    sb> [efgh]+
+    v>  [ijkl]
+    v>  [z...]
+    cursor: (1,1)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+    tabs: [0]
+cite: AL resize.rs:22-26 (grow_lines/shrink_lines are independent of the column paths)
+cite: TS lead decision 8
+note: Before: sb=[abcd]+, visible=[efgh]+ [ijkl] ... ; after grow, "abcd" returns to the top still flagged wrapped, so the logical line spans exactly the same rows.
+
+### K01_both_dimensions_at_once
+desc: rows and columns change in one call: rows first (at the old width), then columns, both bottom-anchored
+layer: grid
+size: 4x8
+step: put one
+step: cr
+step: lf
+step: put twotwotwotwo
+step: cr
+step: lf
+step: put end
+  before:
+    size: 4x8  scrollback: 0
+    v>  [one.....]
+    v>  [twotwotw]+
+    v>  [otwo....]
+    v>  [end.....]
+    cursor: (3,3)  pending_wrap: false  saved: (0,0,false)  region: 0-3
+    tabs: [0]
+resize: 3x4
+  after:
+    size: 3x4  scrollback: 2
+    sb> [one.]
+    sb> [twot]+
+    v>  [wotw]+
+    v>  [otwo]
+    v>  [end.]
+    cursor: (2,3)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 5x10
+  after:
+    size: 5x10  scrollback: 0
+    v>  [one.......]
+    v>  [twotwotwot]+
+    v>  [wo........]
+    v>  [end.......]
+    v>  [..........]
+    cursor: (3,3)  pending_wrap: false  saved: (0,0,false)  region: 0-4
+    tabs: [0, 8]
+cite: AL resize.rs:22-32 order: lines then columns
+cite: WZ screen.rs:216-257
+cite: KT screen_resize reflows both with one rewrap pass
+note: The final state must not depend on whether the caller sees a 3x8 intermediate state; the tests compare against the table, not against two chained calls.
+
+### K02_logical_line_spanning_scrollback_and_screen
+desc: a soft-wrapped line whose first rows are already in scrollback is rejoined as one logical line on grow
+layer: grid
+size: 2x4
+step: put abcdefghijkl
+  before:
+    size: 2x4  scrollback: 1
+    sb> [abcd]+
+    v>  [efgh]+
+    v>  [ijkl]
+    cursor: (1,3)  pending_wrap: true  saved: (0,0,false)  region: 0-1
+    tabs: [0]
+resize: 2x12
+  after:
+    size: 2x12  scrollback: 0
+    v>  [abcdefghijkl]
+    v>  [............]
+    cursor: (0,11)  pending_wrap: true  saved: (0,0,false)  region: 0-1
+    tabs: [0, 8]
+resize: 2x3
+  after:
+    size: 2x3  scrollback: 2
+    sb> [abc]+
+    sb> [def]+
+    v>  [ghi]+
+    v>  [jkl]
+    cursor: (1,2)  pending_wrap: true  saved: (0,0,false)  region: 0-1
+    tabs: [0]
+cite: AL/WZ/KT/IT: scrollback and screen are one buffer
+cite: brief lead decision 1
+note: Before: sb=[abcd]+, visible=[efgh]+ [ijkl]. Width 12: the whole line joins to ONE row [abcdefghijkl] (pending armed, cursor (0,11)); the window is padded with a blank row below. Back to width 3: 4 rows, 2 in history.
+
+### L01_pad_rows_use_default_pen_not_current_pen
+desc: rows added by a resize are plain default blanks, not BCE blanks with the pen background (a resize is not an erase)
+layer: grid
+size: 2x4
+step: put ab
+step: pen_bg 4
+  before:
+    size: 2x4  scrollback: 0
+    v>  [ab..]
+    v>  [....]
+    cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+    tabs: [0]
+resize: 4x4
+  after:
+    size: 4x4  scrollback: 0
+    v>  [ab..]
+    v>  [....]
+    v>  [....]
+    v>  [....]
+    cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-3
+    tabs: [0]
+resize: 4x6
+  after:
+    size: 4x6  scrollback: 0
+    v>  [ab....]
+    v>  [......]
+    v>  [......]
+    v>  [......]
+    cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-3
+    tabs: [0]
+cite: AL resize.rs:19-20, :34-35 (resets the cursor template to default for the duration of the resize)
+cite: WZ Line::new / Cell::blank (no pen)
+cite: TS Grid::scroll_up pads with the pen (different operation)
+note: Pen bg is 4 when the resize happens. The new rows 2-3 and the widened columns are default (no @4).
+
+### L02_scrollback_cap_zero
+desc: cap 0: rows leaving the screen are discarded, grow cannot pull anything back
+layer: grid
+size: 3x4
+scrollback_cap: 0
+step: put aa
+step: cr
+step: lf
+step: put bb
+step: cr
+step: lf
+step: put cc
+  before:
+    size: 3x4  scrollback: 0
+    v>  [aa..]
+    v>  [bb..]
+    v>  [cc..]
+    cursor: (2,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+resize: 1x4
+  after:
+    size: 1x4  scrollback: 0
+    v>  [cc..]
+    cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-0
+    tabs: [0]
+resize: 3x4
+  after:
+    size: 3x4  scrollback: 0
+    v>  [cc..]
+    v>  [....]
+    v>  [....]
+    cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+    tabs: [0]
+cite: AL/WZ ring with zero capacity
+cite: TS Scrollback::new(0) disables history
+note: Shrink 3 -> 1 discards aa and bb; grow adds two blank rows at the BOTTOM.
+
+# ----------------------------------------------------------------------------
+# NOT COVERED / UNVERIFIED (be honest about the edges of this file)
+#   - iTerm2: read the resize driver and the grid restore (Resizing.m, VT100Grid.m). LineBuffer.m
+#     (how soft/hard EOLs and DWC_SKIP are stored in history) was NOT read; the iTerm2 citations on
+#     wrapping rows come from the grid side only.
+#   - xterm has no reflow; its rows rules are from screen.c ScreenResize only. Its handling of the
+#     alternate screen's saved-lines (savedlines while whichBuf == 1) was not traced.
+#   - kitty's pager history (history.c pagerhist_rewrap_to) and multi-cell scaled text are out of
+#     scope for Tessera and were skipped.
+#   - A term-level script (Terminal::resize) is not specified here: Terminal::resize is a one-line
+#     delegation (brief); one smoke row (A01) is enough there.
+#   - Selection, display offset, hyperlinks and images are not Tessera grid state and are not modelled.
+#   - The scroll-region interaction with scroll_up (history only when the region is the full screen) is
+#     unchanged by a resize because the region is always reset to the full screen.
+#   - Performance (brief bar) is not specified by emulators; every emulator above is O(total cells) for
+#     a column change and O(rows) for a row-only change.

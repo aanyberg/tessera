@@ -1,0 +1,10 @@
+# Fixture row E01_alt_screen_truncates_primary_reflows (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# alternate screen active: the alt screen is truncated/padded (no reflow); the stashed primary reflows with its OWN cursor; leave_alt_screen finds equal dimensions
+@size 3x6
+put abcdefgh
+enter_alt_screen
+goto 0 0
+put ALT123456
+goto 2 1
+@resize 3x4
+@resize 3x8

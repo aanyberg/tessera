@@ -1,0 +1,7 @@
+# Fixture row L01_pad_rows_use_default_pen_not_current_pen (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# rows added by a resize are plain default blanks, not BCE blanks with the pen background (a resize is not an erase)
+@size 2x4
+put ab
+pen_bg 4
+@resize 4x4
+@resize 4x6

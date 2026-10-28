@@ -1,0 +1,7 @@
+# Fixture row C02_wrapped_row_trailing_spaces_are_content (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# spaces inside a logical line, including at the end of a non-final row, move with the text
+@size 3x4
+put ab  cd
+@resize 3x3
+@resize 3x4
+@resize 3x6
