@@ -1,0 +1,32 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/d04_pending_wrap_with_text_continuing_to_cleared.txt
+---
+before:
+size: 3x5  scrollback: 0
+v>  [abcde]
+v>  [.....]
+v>  [.....]
+cursor: (0,4)  pending_wrap: true  saved: (0,0,false)  region: 0-2
+tabs: [0]
+resize 3x3:
+size: 3x3  scrollback: 0
+v>  [abc]+
+v>  [de.]
+v>  [...]
+cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]
+resize 3x2:
+size: 3x2  scrollback: 0
+v>  [ab]+
+v>  [cd]+
+v>  [e.]
+cursor: (2,1)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]
+resize 3x5:
+size: 3x5  scrollback: 0
+v>  [abcde]
+v>  [.....]
+v>  [.....]
+cursor: (0,4)  pending_wrap: true  saved: (0,0,false)  region: 0-2
+tabs: [0]

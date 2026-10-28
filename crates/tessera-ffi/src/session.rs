@@ -241,9 +241,10 @@ pub unsafe extern "C" fn tessera_session_write(
     })
 }
 
-/// Tells session `session_id`'s child that its window is now `rows` x
-/// `cols` cells and `width_px` x `height_px` pixels (0 when unknown); the
-/// child receives `SIGWINCH`.
+/// Resizes session `session_id`'s terminal to `rows` x `cols` cells
+/// (re-wrapping its text) and tells its child that its window is now that
+/// size and `width_px` x `height_px` pixels (0 when unknown); the child
+/// receives `SIGWINCH`.
 ///
 /// Do not call this for a session with an attached surface
 /// (`tessera_surface_attach`): the surface decides its size. A call
@@ -253,8 +254,9 @@ pub unsafe extern "C" fn tessera_session_write(
 ///
 /// Returns `TESSERA_ERROR_NULL_POINTER` if `app` is `NULL`,
 /// `TESSERA_ERROR_SESSION_NOT_FOUND` if the id is not a live session,
-/// `TESSERA_ERROR_INVALID_ARGUMENT` for zero rows or columns,
-/// `TESSERA_ERROR_IO` if the kernel rejects the size.
+/// `TESSERA_ERROR_INVALID_ARGUMENT` for zero rows or columns or more than
+/// 1024 rows or 2048 columns (the largest grid a surface derives; nothing
+/// changes then), `TESSERA_ERROR_IO` if the kernel rejects the size.
 ///
 /// # Safety
 ///

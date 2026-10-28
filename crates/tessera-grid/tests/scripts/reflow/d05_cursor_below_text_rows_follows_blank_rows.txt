@@ -1,0 +1,8 @@
+# Fixture row D05_cursor_below_text_rows_follows_blank_rows (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# cursor on an empty line under wrapped text keeps its distance from the window bottom
+@size 4x6
+put abcdefgh
+cr
+lf
+@resize 4x3
+@resize 4x6

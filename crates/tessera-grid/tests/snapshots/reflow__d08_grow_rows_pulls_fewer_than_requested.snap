@@ -1,0 +1,22 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/d08_grow_rows_pulls_fewer_than_requested.txt
+---
+before:
+size: 3x4  scrollback: 1
+sb> [aa..]
+v>  [bb..]
+v>  [cc..]
+v>  [dd..]
+cursor: (2,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]
+resize 6x4:
+size: 6x4  scrollback: 0
+v>  [aa..]
+v>  [bb..]
+v>  [cc..]
+v>  [dd..]
+v>  [....]
+v>  [....]
+cursor: (3,2)  pending_wrap: false  saved: (0,0,false)  region: 0-5
+tabs: [0]

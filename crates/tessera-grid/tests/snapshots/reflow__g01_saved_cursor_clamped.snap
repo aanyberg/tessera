@@ -1,0 +1,40 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/g01_saved_cursor_clamped.txt
+---
+before:
+size: 4x8  scrollback: 0
+v>  [abcdefgh]
+v>  [........]
+v>  [........]
+v>  [........]
+cursor: (0,0)  pending_wrap: false  saved: (3,6,false)  region: 0-3
+tabs: [0]
+resize 2x5:
+size: 2x5  scrollback: 0
+v>  [abcde]+
+v>  [fgh..]
+cursor: (0,0)  pending_wrap: false  saved: (1,4,false)  region: 0-1
+tabs: [0]
+resize 4x8:
+size: 4x8  scrollback: 0
+v>  [abcdefgh]
+v>  [........]
+v>  [........]
+v>  [........]
+cursor: (0,0)  pending_wrap: false  saved: (1,4,false)  region: 0-3
+tabs: [0]
+resize 4x4:
+size: 4x4  scrollback: 0
+v>  [abcd]+
+v>  [efgh]
+v>  [....]
+v>  [....]
+cursor: (0,0)  pending_wrap: false  saved: (1,3,false)  region: 0-3
+tabs: [0]
+resize 2x4:
+size: 2x4  scrollback: 0
+v>  [abcd]+
+v>  [efgh]
+cursor: (0,0)  pending_wrap: false  saved: (1,3,false)  region: 0-1
+tabs: [0]

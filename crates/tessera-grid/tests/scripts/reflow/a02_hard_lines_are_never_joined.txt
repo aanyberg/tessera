@@ -1,0 +1,9 @@
+# Fixture row A02_hard_lines_are_never_joined (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# rows without the wrapped flag stay separate lines in both directions
+@size 3x6
+put abcdef
+cr
+lf
+put xy
+@resize 3x3
+@resize 3x6

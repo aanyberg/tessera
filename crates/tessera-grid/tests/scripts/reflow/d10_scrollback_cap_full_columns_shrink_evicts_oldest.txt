@@ -1,0 +1,15 @@
+# Fixture row D10_scrollback_cap_full_columns_shrink_evicts_oldest (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# a column shrink that creates more history rows than the cap allows evicts the oldest rows (the top of the reflowed buffer)
+@size 2x6
+@scrollback 3
+put aaaaaa
+cr
+lf
+put bbbbbb
+cr
+lf
+put cccccc
+cr
+lf
+put dd
+@resize 2x3

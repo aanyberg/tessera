@@ -1,0 +1,9 @@
+# Fixture row C01_hard_line_trailing_blanks_dropped_and_repadded (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# trailing DEFAULT blanks of a hard line are trimmed on shrink and re-padded with the default pen on grow; BCE-coloured blanks are content and move with the text
+@size 2x8
+put ab
+pen_bg 4
+put \u{20} \u{20}
+pen_bg none
+@resize 2x4
+@resize 2x8

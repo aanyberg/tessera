@@ -1,0 +1,12 @@
+# Fixture row K01_both_dimensions_at_once (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# rows and columns change in one call: rows first (at the old width), then columns, both bottom-anchored
+@size 4x8
+put one
+cr
+lf
+put twotwotwotwo
+cr
+lf
+put end
+@resize 3x4
+@resize 5x10

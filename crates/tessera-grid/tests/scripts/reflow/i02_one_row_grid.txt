@@ -1,0 +1,13 @@
+# Fixture row I02_one_row_grid (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# height 1: all but the cursor row go to history; grow pulls them back
+@size 3x5
+put aa
+cr
+lf
+put bb
+cr
+lf
+put cc
+@resize 1x5
+@resize 1x3
+@resize 3x5

@@ -1,0 +1,18 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/j01_same_size_is_a_noop.txt
+---
+before:
+size: 3x6  scrollback: 0
+v>  [abcdef]+
+v>  [gh....]
+v>  [......]
+cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 1-2
+tabs: [2]
+resize 3x6:
+size: 3x6  scrollback: 0
+v>  [abcdef]+
+v>  [gh....]
+v>  [......]
+cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 1-2
+tabs: [2]

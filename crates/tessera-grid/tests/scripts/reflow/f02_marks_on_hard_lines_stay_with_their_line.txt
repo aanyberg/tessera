@@ -1,0 +1,14 @@
+# Fixture row F02_marks_on_hard_lines_stay_with_their_line (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# a mark on a hard line moves with that line when rows scroll into/out of history
+@size 3x5
+put aa
+cr
+lf
+put bb
+cr
+lf
+put cc
+mark_visible_row 0 PromptStart
+mark_visible_row 2 OutputStart
+@resize 1x5
+@resize 3x5

@@ -1,0 +1,25 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/f02_marks_on_hard_lines_stay_with_their_line.txt
+---
+before:
+size: 3x5  scrollback: 0
+v>  [aa...] marks=PromptStart
+v>  [bb...]
+v>  [cc...] marks=OutputStart
+cursor: (2,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]
+resize 1x5:
+size: 1x5  scrollback: 2
+sb> [aa...] marks=PromptStart
+sb> [bb...]
+v>  [cc...] marks=OutputStart
+cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-0
+tabs: [0]
+resize 3x5:
+size: 3x5  scrollback: 0
+v>  [aa...] marks=PromptStart
+v>  [bb...]
+v>  [cc...] marks=OutputStart
+cursor: (2,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]

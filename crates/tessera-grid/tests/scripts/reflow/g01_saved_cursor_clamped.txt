@@ -1,0 +1,11 @@
+# Fixture row G01_saved_cursor_clamped (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# DECSC position is clamped to the new size (rows and cols); pending flag survives only when the width is unchanged
+@size 4x8
+put abcdefgh
+goto 3 6
+save
+goto 0 0
+@resize 2x5
+@resize 4x8
+@resize 4x4
+@resize 2x4

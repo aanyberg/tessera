@@ -1,0 +1,29 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/d06_cursor_on_row_zero_rows_shrink.txt
+---
+before:
+size: 5x6  scrollback: 0
+v>  [aa....]
+v>  [bb....]
+v>  [cc....]
+v>  [......]
+v>  [......]
+cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-4
+tabs: [0]
+resize 2x6:
+size: 2x6  scrollback: 1
+sb> [aa....]
+v>  [bb....]
+v>  [cc....]
+cursor: (0,2)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+tabs: [0]
+resize 5x6:
+size: 5x6  scrollback: 0
+v>  [aa....]
+v>  [bb....]
+v>  [cc....]
+v>  [......]
+v>  [......]
+cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-4
+tabs: [0]

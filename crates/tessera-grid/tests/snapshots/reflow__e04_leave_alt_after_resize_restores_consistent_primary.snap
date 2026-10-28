@@ -1,0 +1,35 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/e04_leave_alt_after_resize_restores_consistent_primary.txt
+---
+before:
+size: 3x8  scrollback: 0
+v>  [........]
+v>  [........]
+v>  [........]
+cursor: (0,7)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+stashed_primary:
+p>  [abcdefgh]
+p>  [........]
+p>  [........]
+cursor: (0,7)  pending_wrap: true  saved: (0,7,true)
+tabs: [0]
+resize 3x5:
+size: 3x5  scrollback: 0
+v>  [.....]
+v>  [.....]
+v>  [.....]
+cursor: (0,4)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+stashed_primary:
+p>  [abcde]+
+p>  [fgh..]
+p>  [.....]
+cursor: (1,3)  pending_wrap: false  saved: (0,4,false)
+tabs: [0]
+leave_alt_screen:
+size: 3x5  scrollback: 0
+v>  [abcde]+
+v>  [fgh..]
+v>  [.....]
+cursor: (1,3)  pending_wrap: false  saved: (0,4,false)  region: 0-2
+tabs: [0]

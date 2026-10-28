@@ -298,13 +298,15 @@ impl App {
             .map_err(|source| Error::Write { id, source })
     }
 
-    /// Informs session `id`'s child of a new window size.
+    /// Resizes session `id`'s terminal (re-wrapping its text, ADR 0009)
+    /// and informs its child of the new window size.
     ///
     /// # Errors
     ///
     /// [`Error::SessionNotFound`] if `id` is not a live session,
-    /// [`Error::Pty`] if the size has zero rows or columns or the kernel
-    /// rejects it.
+    /// [`Error::Pty`] if the size has zero rows or columns, more than
+    /// [`view::MAX_VIEW_ROWS`] rows or [`view::MAX_VIEW_COLS`] columns
+    /// (nothing changes then), or the kernel rejects it.
     pub fn resize(&self, id: SessionId, size: PtySize) -> Result<()> {
         Ok(self.session(id)?.resize(size)?)
     }

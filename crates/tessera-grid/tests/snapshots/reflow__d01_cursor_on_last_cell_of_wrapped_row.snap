@@ -1,0 +1,25 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/d01_cursor_on_last_cell_of_wrapped_row.txt
+---
+before:
+size: 3x8  scrollback: 0
+v>  [abcdefgh]+
+v>  [ijkl....]
+v>  [........]
+cursor: (0,7)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]
+resize 3x5:
+size: 3x5  scrollback: 0
+v>  [abcde]+
+v>  [fghij]+
+v>  [kl...]
+cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]
+resize 3x8:
+size: 3x8  scrollback: 0
+v>  [abcdefgh]+
+v>  [ijkl....]
+v>  [........]
+cursor: (0,7)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]

@@ -1,0 +1,26 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/g02_saved_cursor_pending_flag_row_only_resize.txt
+---
+before:
+size: 3x4  scrollback: 0
+v>  [abcd]
+v>  [....]
+v>  [....]
+cursor: (0,3)  pending_wrap: true  saved: (0,3,true)  region: 0-2
+tabs: [0]
+resize 5x4:
+size: 5x4  scrollback: 0
+v>  [abcd]
+v>  [....]
+v>  [....]
+v>  [....]
+v>  [....]
+cursor: (0,3)  pending_wrap: true  saved: (0,3,true)  region: 0-4
+tabs: [0]
+resize 2x4:
+size: 2x4  scrollback: 0
+v>  [abcd]
+v>  [....]
+cursor: (0,3)  pending_wrap: true  saved: (0,3,true)  region: 0-1
+tabs: [0]

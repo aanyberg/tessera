@@ -1,0 +1,6 @@
+# Fixture row I01_one_column_grid (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# width 1: every glyph its own row; round trip back to a wide grid restores the text; a cursor after the last glyph is pending on column 0
+@size 3x4
+put abc
+@resize 3x1
+@resize 3x4

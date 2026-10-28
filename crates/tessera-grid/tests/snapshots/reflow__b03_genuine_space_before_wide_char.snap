@@ -1,0 +1,29 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/b03_genuine_space_before_wide_char.txt
+---
+before:
+size: 2x4  scrollback: 0
+v>  [abc.]+
+v>  [中~ef]
+cursor: (1,3)  pending_wrap: true  saved: (0,0,false)  region: 0-1
+tabs: [0]
+resize 2x3:
+size: 2x3  scrollback: 1
+sb> [abc]+
+v>  [.中~]+
+v>  [ef.]
+cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+tabs: [0]
+resize 2x4:
+size: 2x4  scrollback: 0
+v>  [abc.]+
+v>  [中~ef]
+cursor: (1,3)  pending_wrap: true  saved: (0,0,false)  region: 0-1
+tabs: [0]
+resize 2x8:
+size: 2x8  scrollback: 0
+v>  [abc.中~ef]
+v>  [........]
+cursor: (0,7)  pending_wrap: true  saved: (0,0,false)  region: 0-1
+tabs: [0]

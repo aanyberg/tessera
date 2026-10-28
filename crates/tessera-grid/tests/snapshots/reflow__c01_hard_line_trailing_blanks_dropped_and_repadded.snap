@@ -1,0 +1,22 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/c01_hard_line_trailing_blanks_dropped_and_repadded.txt
+---
+before:
+size: 2x8  scrollback: 0
+v>  [ab.@4.@4.@4...]
+v>  [........]
+cursor: (0,5)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+tabs: [0]
+resize 2x4:
+size: 2x4  scrollback: 0
+v>  [ab.@4.@4]+
+v>  [.@4...]
+cursor: (1,1)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+tabs: [0]
+resize 2x8:
+size: 2x8  scrollback: 0
+v>  [ab.@4.@4.@4...]
+v>  [........]
+cursor: (0,5)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+tabs: [0]

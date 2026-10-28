@@ -1,0 +1,7 @@
+# Fixture row D01_cursor_on_last_cell_of_wrapped_row (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# cursor ON a glyph follows that glyph: the last cell of a wrapped row moves to the continuation row on shrink and back on grow
+@size 3x8
+put abcdefghijkl
+goto 0 7
+@resize 3x5
+@resize 3x8

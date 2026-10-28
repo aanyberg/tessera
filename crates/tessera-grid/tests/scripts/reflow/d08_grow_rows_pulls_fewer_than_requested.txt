@@ -1,0 +1,14 @@
+# Fixture row D08_grow_rows_pulls_fewer_than_requested (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# history shorter than the growth: pull what exists, pad the rest with blank rows at the bottom
+@size 3x4
+put aa
+cr
+lf
+put bb
+cr
+lf
+put cc
+cr
+lf
+put dd
+@resize 6x4

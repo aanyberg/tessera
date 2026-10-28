@@ -1,0 +1,9 @@
+# Fixture row J02_row_only_change_does_not_rewrap (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# a row-only change never joins or splits rows: wrapped rows pulled from history keep their flags and stay as they are
+@size 3x4
+put abcdefghijkl
+cr
+lf
+put z
+@resize 5x4
+@resize 2x4

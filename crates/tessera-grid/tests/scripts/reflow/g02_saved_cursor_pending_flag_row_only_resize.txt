@@ -1,0 +1,7 @@
+# Fixture row G02_saved_cursor_pending_flag_row_only_resize (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# a row-only resize leaves cursor and saved cursor columns, pending wrap flags untouched (except row shifts)
+@size 3x4
+put abcd
+save
+@resize 5x4
+@resize 2x4

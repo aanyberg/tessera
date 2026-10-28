@@ -52,6 +52,18 @@ impl TabStops {
         *self = Self::new(self.cols());
     }
 
+    /// Changes the number of columns covered to `cols` (a terminal
+    /// resize). Stops below both widths keep their state, set or cleared
+    /// by the user; columns beyond the old width get the default stops
+    /// every [`Self::DEFAULT_INTERVAL`] columns.
+    pub(crate) fn resize(&mut self, cols: u16) {
+        let cols = usize::from(cols);
+        let old = self.stops.len();
+        self.stops.truncate(cols);
+        self.stops
+            .extend((old..cols).map(|col| col % usize::from(Self::DEFAULT_INTERVAL) == 0));
+    }
+
     /// The column of the `n`th tab stop strictly after `col`, or `None`
     /// when fewer than `n` stops remain. `n == 0` yields `None`.
     pub fn next(&self, col: u16, n: u16) -> Option<u16> {
@@ -128,6 +140,24 @@ mod tests {
         assert!(!tabs.is_set(0));
         tabs.reset();
         assert_eq!(tabs, TabStops::new(10));
+    }
+
+    #[test]
+    fn resize_keeps_user_stops_and_extends_with_defaults() {
+        let mut tabs = TabStops::new(20);
+        tabs.clear_all();
+        tabs.set(3);
+        tabs.set(11);
+        tabs.resize(30);
+        let set: Vec<u16> = (0..30).filter(|&c| tabs.is_set(c)).collect();
+        assert_eq!(set, [3, 11, 24]);
+        tabs.resize(10);
+        assert_eq!(tabs.cols(), 10);
+        let set: Vec<u16> = (0..10).filter(|&c| tabs.is_set(c)).collect();
+        assert_eq!(set, [3]);
+        tabs.resize(24);
+        let set: Vec<u16> = (0..24).filter(|&c| tabs.is_set(c)).collect();
+        assert_eq!(set, [3, 16]);
     }
 
     #[test]

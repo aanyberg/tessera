@@ -1,0 +1,11 @@
+# Fixture row C03_blank_hard_rows_are_lines (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# blank hard rows between text rows are preserved one-for-one in both directions
+@size 5x6
+put abcdefgh
+cr
+lf
+cr
+lf
+put z
+@resize 5x4
+@resize 5x6

@@ -1,0 +1,7 @@
+# Fixture row B03_genuine_space_before_wide_char (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# a REAL space written in the last column followed by a wide character is text, not padding: it survives every re-wrap
+@size 2x4
+put abc 中ef
+@resize 2x3
+@resize 2x4
+@resize 2x8

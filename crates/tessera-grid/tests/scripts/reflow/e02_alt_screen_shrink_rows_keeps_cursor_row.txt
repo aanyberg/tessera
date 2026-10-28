@@ -1,0 +1,16 @@
+# Fixture row E02_alt_screen_shrink_rows_keeps_cursor_row (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# alternate screen rows shrink: no history (lines scrolled off are discarded), scroll only as far as needed to keep the cursor visible
+@size 4x4
+enter_alt_screen
+put a
+cr
+lf
+put b
+cr
+lf
+put c
+cr
+lf
+put d
+@resize 2x4
+@resize 4x4

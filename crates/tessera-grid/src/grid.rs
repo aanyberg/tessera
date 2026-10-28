@@ -8,6 +8,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::grapheme::MAX_CLUSTER_SCALARS;
+use crate::reflow::{self, ScreenMut, Size};
 use crate::{Cell, CellFlags, Line, Point, Scrollback, Style, TabStops, char_width};
 
 /// Default number of scrolled-off lines a grid retains.
@@ -82,6 +83,15 @@ impl SavedCursor {
         pen: Style::DEFAULT,
         pending_wrap: false,
     };
+
+    /// Clamps the saved position into a grid of `size` after a resize. The
+    /// position is not moved with the text; a saved pending wrap survives
+    /// only when the width did not change.
+    fn clamp(&mut self, size: Size, cols_changed: bool) {
+        self.cursor.row = self.cursor.row.min(size.rows - 1);
+        self.cursor.col = self.cursor.col.min(size.cols - 1);
+        self.pending_wrap &= !cols_changed;
+    }
 }
 
 /// The per-screen state the primary screen keeps while the alternate screen
@@ -137,7 +147,7 @@ pub struct Grid {
     saved: SavedCursor,
     tabs: TabStops,
     /// The stashed primary screen; `Some` exactly while the alternate screen
-    /// is active. A resize must resize this screen as well as `lines`.
+    /// is active. [`Grid::resize`] resizes it together with `lines`.
     primary: Option<Box<Screen>>,
 }
 
@@ -314,13 +324,15 @@ impl Grid {
     ///   dropped.
     /// - A two-column character writes a [`CellFlags::WIDE`] cell and a
     ///   [`CellFlags::SPACER`] and advances two columns. With one column
-    ///   left it blanks that column with the pen background and wraps
-    ///   first; on a one-column grid it is dropped.
+    ///   left it blanks that column with the pen background, marks it
+    ///   [`CellFlags::PAD`] (padding, not text) and wraps first; on a
+    ///   one-column grid it is dropped.
     ///
     /// Overwriting either half of a wide character blanks the other half.
     ///
     /// [`CellFlags::WIDE`]: crate::CellFlags::WIDE
     /// [`CellFlags::SPACER`]: crate::CellFlags::SPACER
+    /// [`CellFlags::PAD`]: crate::CellFlags::PAD
     #[inline]
     pub fn put_char(&mut self, ch: char) {
         if is_simple(ch) && self.target_is_simple() {
@@ -544,11 +556,8 @@ impl Grid {
         if self.pending_wrap {
             self.wrap();
         } else if self.cursor.col == self.cols - 1 {
-            // One column left: blank it so the wrapped line does not end
-            // in stale content, then continue on the next line.
-            let last = usize::from(self.cols - 1);
-            let pen = self.pen;
-            self.lines[usize::from(self.cursor.row)].fill(last..last + 1, pen);
+            // One column left: pad it, then continue on the next line.
+            self.pad_last_column();
             self.wrap();
         }
         let Point { row, col } = self.cursor;
@@ -566,6 +575,23 @@ impl Grid {
         );
         line.set(col + 1, Cell::spacer(cell.style));
         self.advance_to(col + 2);
+    }
+
+    /// Turns the last column of the cursor's row into padding: blanks it
+    /// with the pen background (a wide character it cuts is blanked whole)
+    /// and marks it [`CellFlags::PAD`]. This is what a wide character that
+    /// does not fit in the last column leaves behind before it wraps; the
+    /// cell is not text, so a resize that joins the row with the next one
+    /// drops it. The cursor and pending wrap are untouched.
+    ///
+    /// [`Grid::put_char`] does this itself; an emulator that wraps a wide
+    /// character on its own (insert mode) calls it before wrapping.
+    pub fn pad_last_column(&mut self) {
+        let last = usize::from(self.cols - 1);
+        let pen = self.pen;
+        let line = &mut self.lines[usize::from(self.cursor.row)];
+        line.fill(last..last + 1, pen);
+        line.cells[last] = Cell::pad_with(pen);
     }
 
     /// Moves the cursor to column `col` after a write, or arms pending
@@ -714,6 +740,93 @@ impl Grid {
         self.scrollback.clear();
     }
 
+    // ---------------------------------------------------------------- resize
+
+    /// Resizes the grid to `rows` × `cols`, re-wrapping soft-wrapped lines
+    /// to the new width (ADR 0009). A zero dimension is raised to one, as
+    /// in [`Grid::new`]; the current size is a no-op that changes nothing.
+    ///
+    /// The primary screen and the scrollback are one buffer:
+    ///
+    /// - **Rows** change first, at the old width, by moving whole rows.
+    ///   Growing pulls the newest scrollback lines back onto the top of
+    ///   the screen (blank rows at the bottom once history runs out);
+    ///   shrinking first drops blank rows below the cursor (default blanks
+    ///   only, even the empty continuation of a wrapped row, whose wrap
+    ///   flag is then cleared), then pushes rows from the top into
+    ///   scrollback (oldest lines are evicted past the cap). The cursor
+    ///   moves with the text and stops at row zero.
+    /// - **Columns:** every logical line (rows joined by
+    ///   [`Line::wrapped`]) is joined and split again at the new width.
+    ///   Trailing default blanks ([`Cell::BLANK`]) of a logical line are
+    ///   dropped and rows are padded with default blanks; every other
+    ///   cell, including a space with a colour or attribute and blanks
+    ///   inside a line, is text and moves with it. A wide character never
+    ///   straddles the edge: it starts the next row and leaves a
+    ///   [`CellFlags::PAD`] cell behind, which a later join drops again
+    ///   (only padding is ever dropped); on a one-column grid it is
+    ///   dropped. Cluster text and marks move with their cells and lines
+    ///   (marks of a joined line collect on its first row). The screen is
+    ///   the last `rows` rows of the result, so a narrower grid pushes
+    ///   lines into scrollback and a wider one pulls them back.
+    /// - **Cursor:** it stays on the character it was on. On a blank after
+    ///   the end of its line's text it keeps its distance from the text
+    ///   while that fits in the row, else it stops on the last column;
+    ///   when the line's last row is exactly full it sits on the last
+    ///   column with a wrap pending.
+    ///
+    /// The alternate screen is never re-wrapped: its rows are cut or
+    /// padded, rows leaving it are discarded and pending wrap is cleared
+    /// when the width changes, while the stashed primary screen is resized
+    /// as above with its own cursor. Every real resize resets the scroll
+    /// region to the full screen, clamps each screen's saved cursor (it is
+    /// not moved with the text) and extends the tab stops with the default
+    /// every-eight stops beyond the old width, keeping the ones below it.
+    /// The pen is unchanged; added rows and cells use the default style.
+    ///
+    /// A row-only change costs O(rows changed + rows); a column change
+    /// re-wraps the whole scrollback, O(total cells). Every scrollback
+    /// line is as wide as the grid, so a resize to a very wide grid with a
+    /// long history allocates that width for every retained line.
+    pub fn resize(&mut self, rows: u16, cols: u16) {
+        let size = Size {
+            rows: rows.max(1),
+            cols: cols.max(1),
+        };
+        if size.rows == self.rows && size.cols == self.cols {
+            return;
+        }
+        let old_cols = self.cols;
+        let cols_changed = size.cols != old_cols;
+        let active = ScreenMut {
+            lines: &mut self.lines,
+            cursor: &mut self.cursor,
+            pending_wrap: &mut self.pending_wrap,
+        };
+        match self.primary.as_deref_mut() {
+            Some(primary) => {
+                let stashed = ScreenMut {
+                    lines: &mut primary.lines,
+                    cursor: &mut primary.cursor,
+                    pending_wrap: &mut primary.pending_wrap,
+                };
+                reflow::resize_primary(stashed, &mut self.scrollback, old_cols, size);
+                primary.saved.clamp(size, cols_changed);
+                primary.tabs.resize(size.cols);
+                reflow::resize_alternate(active, old_cols, size);
+            }
+            None => reflow::resize_primary(active, &mut self.scrollback, old_cols, size),
+        }
+        self.saved.clamp(size, cols_changed);
+        self.tabs.resize(size.cols);
+        self.rows = size.rows;
+        self.cols = size.cols;
+        self.region = ScrollRegion {
+            top: 0,
+            bottom: size.rows - 1,
+        };
+    }
+
     // ------------------------------------------------------ alternate screen
 
     /// Switches to the alternate screen: a separate blank screen of the same
@@ -760,8 +873,8 @@ impl Grid {
             saved,
             tabs,
         } = *primary;
-        // A resize while on the alternate screen must resize the stashed
-        // primary screen too; catch one that forgot.
+        // `resize` keeps the stashed primary screen the size of the
+        // alternate one; catch any path that does not.
         debug_assert_eq!(lines.len(), usize::from(self.rows), "stale primary rows");
         debug_assert!(
             lines

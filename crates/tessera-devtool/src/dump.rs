@@ -30,7 +30,7 @@
 
 use std::fmt::Write as _;
 
-use tessera_grid::{Cell, Color, Grid, Line, Style, UnderlineStyle};
+use tessera_grid::{Cell, CellFlags, Color, Grid, Line, Style, UnderlineStyle};
 
 /// How a dump is rendered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -82,7 +82,8 @@ pub fn ansi(grid: &Grid) -> String {
 /// `48;2;r;g;b`) and the underline colour (`58;5;n` or `58;2;r;g;b`). A
 /// default colour adds nothing. Fed back into `tessera_term::Terminal`, the
 /// dump reproduces every cell's style. Every row ends with `ESC[0m` and a newline. Trailing cells equal
-/// to [`Cell::BLANK`] (a space in the default style) are trimmed; any other
+/// to [`Cell::BLANK`] (a space in the default style), or default-style
+/// padding a wrapped wide character left, are trimmed; any other
 /// cell is kept, including a space with a background colour, a foreground
 /// colour or attributes, so coloured areas survive. Spacers print nothing
 /// and clusters print their whole text. The cursor is never marked.
@@ -92,7 +93,7 @@ pub fn ansi_with(grid: &Grid, options: DumpOptions) -> String {
         let end = line
             .cells
             .iter()
-            .rposition(|cell| *cell != Cell::BLANK)
+            .rposition(|cell| !blank_or_padding(cell))
             .map_or(0, |i| i + 1);
         let mut current = Style::DEFAULT;
         for (col, cell) in line.cells[..end].iter().enumerate() {
@@ -160,7 +161,7 @@ pub fn cells(grid: &Grid) -> String {
 ///   recently scrolled off.
 /// - `text` is the cell's text as a Rust string literal (`"a"`, `"e\u{301}"`
 ///   for a cluster, `" "` for a spacer or blank).
-/// - `flags` lists the width markers `wide`, `spacer`, `cluster` joined by
+/// - `flags` lists the markers `wide`, `spacer`, `cluster`, `pad` joined by
 ///   `|`, or `-`.
 /// - `style` is `fg=… bg=… ul=… attrs=…` with colours (`ul` is the
 ///   underline colour) as `default`, `idx(n)` or `rgb(r,g,b)` and attributes
@@ -315,12 +316,24 @@ fn color_param(color: Color, base: u8, bright: u8, extended: u8) -> Option<Strin
     }
 }
 
+/// True for a cell the ANSI dump trims at the end of a row: [`Cell::BLANK`],
+/// or padding a wrapped wide character left ([`Cell::is_pad`]) in the
+/// default style.
+fn blank_or_padding(cell: &Cell) -> bool {
+    let unmarked = Cell {
+        flags: cell.flags.difference(CellFlags::PAD),
+        ..*cell
+    };
+    unmarked == Cell::BLANK
+}
+
 /// The cell's width markers for [`cells_with`].
 fn flag_names(cell: &Cell) -> String {
     let names: Vec<&str> = [
         (cell.is_wide(), "wide"),
         (cell.is_spacer(), "spacer"),
         (cell.is_cluster(), "cluster"),
+        (cell.is_pad(), "pad"),
     ]
     .into_iter()
     .filter_map(|(on, name)| on.then_some(name))
@@ -536,6 +549,18 @@ mod tests {
             "fg=default bg=default ul=default attrs=-"
         );
         assert_eq!(flag_names(&Cell::BLANK), "-");
+    }
+
+    /// The column a wrapped wide character leaves is padding: the ANSI
+    /// dump trims it like a blank and the cell dump names it.
+    #[test]
+    fn padding_is_trimmed_and_named() {
+        let mut grid = Grid::new(2, 5);
+        grid.put_str("abcd中");
+        let ansi = ansi_with(&grid, DumpOptions::default());
+        assert!(ansi.starts_with("abcd\x1b[0m\n"), "{ansi:?}");
+        let cells = cells_with(&grid, DumpOptions::default());
+        assert!(cells.contains(":4 \" \" pad "), "{cells}");
     }
 
     #[test]

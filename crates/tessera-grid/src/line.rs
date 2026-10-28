@@ -1,6 +1,6 @@
 //! Lines and the semantic marks shell integration attaches to them.
 
-use crate::{Cell, GraphemeTable, Style};
+use crate::{Cell, CellFlags, GraphemeTable, Style};
 
 /// Semantic annotation attached to a line by shell integration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,7 +109,7 @@ impl Line {
         let end = self
             .cells
             .iter()
-            .rposition(|c| c.ch != ' ' || !c.flags.is_empty())
+            .rposition(|c| c.ch != ' ' || !c.flags.difference(CellFlags::PAD).is_empty())
             .map_or(0, |i| i + 1);
         let mut out = String::with_capacity(end);
         for (col, cell) in self.cells[..end].iter().enumerate() {
@@ -188,6 +188,8 @@ impl Line {
             self.blank_at(cols - 1, style);
         }
         self.cells[col..col + n].fill(Cell::blank_with(style));
+        // Padding (only ever the last column) was pushed off the end or,
+        // with `col` on it, blanked: nothing to unpad.
     }
 
     /// Deletes `n` cells at `col`, shifting the rest of the line left and
@@ -209,6 +211,16 @@ impl Line {
         }
         // The deleted cells rotated to the end; their clusters are gone.
         self.cells[cols - n..].fill(Cell::blank_with(style));
+        self.unpad(col..cols - n);
+    }
+
+    /// Clears [`CellFlags::PAD`] in `range`: a padding cell that an
+    /// insertion or deletion moved away from the last column is an
+    /// ordinary blank.
+    fn unpad(&mut self, range: std::ops::Range<usize>) {
+        for cell in &mut self.cells[range] {
+            cell.flags = cell.flags.difference(CellFlags::PAD);
+        }
     }
 }
 

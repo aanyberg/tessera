@@ -1,0 +1,7 @@
+# Fixture row B08_cursor_on_wide_char_spacer_follows_base (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# a cursor parked on the right half (SPACER) of a wide char maps to the wide cell's new position
+@size 3x6
+put abcd中ef
+goto 0 5
+@resize 3x5
+@resize 3x7

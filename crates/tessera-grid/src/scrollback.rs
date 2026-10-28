@@ -166,6 +166,43 @@ impl Scrollback {
         self.head = 0;
     }
 
+    /// Removes and returns the newest line (the one most recently pushed),
+    /// for a resize that pulls history back onto the screen.
+    ///
+    /// O(1), except that the first pop from a full ring whose order wraps
+    /// around the end of its storage straightens it first (O(len), once:
+    /// the ring is not full afterwards, so it stays straight until it fills
+    /// up again).
+    pub(crate) fn pop_newest(&mut self) -> Option<Line> {
+        if self.head != 0 {
+            self.buf.rotate_left(self.head);
+            self.head = 0;
+        }
+        self.buf.pop()
+    }
+
+    /// Removes every retained line and returns them oldest first, leaving
+    /// the history empty and without storage. The cap is unchanged.
+    pub(crate) fn take_lines(&mut self) -> Vec<Line> {
+        let mut lines = mem::take(&mut self.buf);
+        lines.rotate_left(self.head);
+        self.head = 0;
+        lines
+    }
+
+    /// Replaces the history with `lines` (oldest first), keeping only the
+    /// newest [`Scrollback::cap`] of them. The storage is trimmed so it
+    /// never exceeds the cap, as [`Scrollback::push`] guarantees.
+    pub(crate) fn set_lines(&mut self, mut lines: Vec<Line>) {
+        if lines.len() > self.cap {
+            let excess = lines.len() - self.cap;
+            lines.drain(..excess);
+        }
+        lines.shrink_to(self.cap);
+        self.buf = lines;
+        self.head = 0;
+    }
+
     /// Iterates the retained lines from oldest to newest without
     /// allocating.
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Line> + Clone + '_ {
@@ -277,6 +314,45 @@ mod tests {
         sb.set_cap(4);
         assert_eq!(sb.head, head, "no rotation for an unchanged cap");
         assert_eq!(texts(&sb), "2345");
+    }
+
+    #[test]
+    fn pop_newest_straightens_a_wrapped_ring() {
+        let mut sb = Scrollback::new(4);
+        for n in 0..6 {
+            sb.push(line(n));
+        }
+        assert_ne!(sb.head, 0, "ring has wrapped");
+        assert_eq!(sb.pop_newest().map(|l| l.text()), Some("5".into()));
+        assert_eq!(sb.pop_newest().map(|l| l.text()), Some("4".into()));
+        assert_eq!(texts(&sb), "23");
+        sb.push(line(7));
+        sb.push(line(8));
+        sb.push(line(9));
+        assert_eq!(texts(&sb), "3789", "a refilled ring evicts in age order");
+        let mut empty = Scrollback::new(0);
+        assert_eq!(empty.pop_newest(), None);
+    }
+
+    #[test]
+    fn take_and_set_lines_keep_age_order_and_the_cap() {
+        let mut sb = Scrollback::new(3);
+        for n in 0..5 {
+            sb.push(line(n));
+        }
+        let lines = sb.take_lines();
+        assert_eq!(lines.iter().map(Line::text).collect::<String>(), "234");
+        assert!(sb.is_empty());
+        assert_eq!(sb.cap(), 3);
+        sb.set_lines((0..10).map(line).collect());
+        assert_eq!(texts(&sb), "789", "only the newest `cap` lines are kept");
+        assert!(sb.buf.capacity() <= 3, "storage {}", sb.buf.capacity());
+        sb.push(line(1));
+        assert_eq!(texts(&sb), "891");
+        let mut none = Scrollback::new(0);
+        none.set_lines(vec![line(1)]);
+        assert!(none.is_empty());
+        assert_eq!(none.buf.capacity(), 0);
     }
 
     #[test]

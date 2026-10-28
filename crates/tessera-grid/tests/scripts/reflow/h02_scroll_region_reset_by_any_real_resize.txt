@@ -1,0 +1,7 @@
+# Fixture row H02_scroll_region_reset_by_any_real_resize (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# a real resize (rows or cols) resets the scroll region to the full screen; a same-size call does not
+@size 4x6
+region 1 2
+@resize 4x6
+@resize 6x6
+@resize 6x4

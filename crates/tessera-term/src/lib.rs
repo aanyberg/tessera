@@ -134,6 +134,16 @@ impl Terminal {
     pub fn set_insert_mode(&mut self, on: bool) {
         self.state.insert_mode = on;
     }
+
+    /// Resizes the screen to `rows` × `cols` (a zero dimension counts as
+    /// one), re-wrapping soft-wrapped lines on the primary screen and its
+    /// scrollback and cutting or padding the alternate screen; see
+    /// [`Grid::resize`]. The scroll region becomes the full screen. Call it
+    /// before telling the child about the new size, so output written for
+    /// the new size lands on a grid that has it.
+    pub fn resize(&mut self, rows: u16, cols: u16) {
+        self.state.grid.resize(rows, cols);
+    }
 }
 
 /// Length of the incomplete UTF-8 sequence that ends `bytes`: a lead byte
@@ -289,10 +299,10 @@ impl State {
             if self.grid.pending_wrap() || stranded {
                 // `insert_chars` disarms the pending wrap, so wrap first and
                 // insert on the new line, as xterm does. A wide character
-                // with one column left first blanks that column, as the
+                // with one column left first pads that column, as the
                 // grid does in replace mode.
                 if !self.grid.pending_wrap() {
-                    self.grid.erase_chars(1);
+                    self.grid.pad_last_column();
                 }
                 self.wrap_line();
             }

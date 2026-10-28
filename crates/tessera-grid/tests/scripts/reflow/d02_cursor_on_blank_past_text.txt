@@ -1,0 +1,9 @@
+# Fixture row D02_cursor_on_blank_past_text (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# cursor on a blank cell right of the text keeps its offset from the line start while it still fits, else clamps to the last column of the last row of the line
+@size 3x8
+put ab
+goto 0 5
+@resize 3x6
+@resize 3x4
+@resize 3x3
+@resize 3x12

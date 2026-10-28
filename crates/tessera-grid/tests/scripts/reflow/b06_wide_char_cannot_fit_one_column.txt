@@ -1,0 +1,6 @@
+# Fixture row B06_wide_char_cannot_fit_one_column (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# a wide character is dropped when the target width is 1 (put_wide returns early for cols < 2); the proptest round-trip must avoid wide text at width 1
+@size 3x4
+put a中b
+@resize 3x1
+@resize 3x4

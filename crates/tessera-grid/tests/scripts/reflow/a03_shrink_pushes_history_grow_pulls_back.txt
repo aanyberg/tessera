@@ -1,0 +1,12 @@
+# Fixture row A03_shrink_pushes_history_grow_pulls_back (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# window is bottom-anchored: a column shrink that adds rows pushes the oldest rows to scrollback, a grow pulls them back
+@size 3x6
+put one
+cr
+lf
+put twotwotwotwo
+cr
+lf
+put three
+@resize 3x3
+@resize 3x6

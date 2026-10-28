@@ -1,0 +1,7 @@
+# Fixture row B01_wide_char_lands_on_new_last_column (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# a wide character that would straddle the new last column moves whole to the next row; the stranded column is a PAD cell; on grow the PAD cell is dropped again
+@size 3x6
+put abcd中ef
+@resize 3x5
+@resize 3x6
+@resize 3x7

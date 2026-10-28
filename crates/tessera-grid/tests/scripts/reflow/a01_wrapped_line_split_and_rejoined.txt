@@ -1,0 +1,6 @@
+# Fixture row A01_wrapped_line_split_and_rejoined (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# a soft-wrapped line is re-split on shrink and rejoined on grow; the blank row below the cursor is pruned, not pushed to history
+@size 3x8
+put abcdefghijkl
+@resize 3x5
+@resize 3x8

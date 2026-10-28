@@ -1,0 +1,21 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/d10_scrollback_cap_full_columns_shrink_evicts_oldest.txt
+---
+before:
+size: 2x6  scrollback: 2
+sb> [aaaaaa]
+sb> [bbbbbb]
+v>  [cccccc]
+v>  [dd....]
+cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+tabs: [0]
+resize 2x3:
+size: 2x3  scrollback: 3
+sb> [bbb]+
+sb> [bbb]
+sb> [ccc]+
+v>  [ccc]
+v>  [dd.]
+cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-1
+tabs: [0]

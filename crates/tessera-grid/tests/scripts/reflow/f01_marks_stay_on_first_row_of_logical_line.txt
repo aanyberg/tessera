@@ -1,0 +1,9 @@
+# Fixture row F01_marks_stay_on_first_row_of_logical_line (crates/tessera-grid/tests/fixtures/reflow_spec.txt).
+# marks sit on the first physical row of their logical line; marks of continuation rows are appended to it when rows join, and the first row keeps them when re-split
+@size 4x6
+put abcdefghij
+mark_visible_row 0 PromptStart
+mark_visible_row 1 CommandStart
+@resize 4x12
+@resize 4x4
+@resize 4x6

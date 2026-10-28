@@ -1,0 +1,25 @@
+---
+source: crates/tessera-grid/tests/reflow.rs
+input_file: crates/tessera-grid/tests/scripts/reflow/a02_hard_lines_are_never_joined.txt
+---
+before:
+size: 3x6  scrollback: 0
+v>  [abcdef]
+v>  [xy....]
+v>  [......]
+cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]
+resize 3x3:
+size: 3x3  scrollback: 0
+v>  [abc]+
+v>  [def]
+v>  [xy.]
+cursor: (2,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]
+resize 3x6:
+size: 3x6  scrollback: 0
+v>  [abcdef]
+v>  [xy....]
+v>  [......]
+cursor: (1,2)  pending_wrap: false  saved: (0,0,false)  region: 0-2
+tabs: [0]
