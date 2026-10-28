@@ -1,0 +1,4 @@
+# Fixture case REP04_wraps_with_autowrap (tests/fixtures/csi_spec.txt).
+# Repeats go through the normal print path: they wrap at the right margin and mark the row soft-wrapped.
+@size 3x10
+abc\x1b[12b

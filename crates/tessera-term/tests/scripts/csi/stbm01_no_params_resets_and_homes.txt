@@ -1,0 +1,5 @@
+# Fixture case STBM01_no_params_resets_and_homes (tests/fixtures/csi_spec.txt).
+# Reset to full screen and home the cursor (0,0).
+@size 6x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX\x1b[6;1HYZ01234567
+\x1b[2;4r\x1b[4;5H\x1b[rX

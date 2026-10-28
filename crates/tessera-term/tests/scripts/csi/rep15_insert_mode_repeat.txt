@@ -1,0 +1,6 @@
+# Fixture case REP15_insert_mode_repeat (tests/fixtures/csi_spec.txt).
+# IRM on: 'abc' CR 'Z' inserts (Zabc), then REP 2 inserts two more Z's: 'ZZZabc'.
+@size 2x10
+@set insert_mode true
+abc\r
+Z\x1b[2b

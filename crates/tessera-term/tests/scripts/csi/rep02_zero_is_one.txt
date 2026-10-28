@@ -1,0 +1,4 @@
+# Fixture case REP02_zero_is_one (tests/fixtures/csi_spec.txt).
+# 0 = 1.
+@size 2x10
+A\x1b[0b

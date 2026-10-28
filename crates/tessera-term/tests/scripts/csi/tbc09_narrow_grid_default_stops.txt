@@ -1,0 +1,4 @@
+# Fixture case TBC09_narrow_grid_default_stops (tests/fixtures/csi_spec.txt).
+# cols<8: only column 0 is a default stop; CBT stays at 0; after TBC 3, HT goes to the last column.
+@size 1x4
+\x1b[3g\x1b[Z\tX

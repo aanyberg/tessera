@@ -1,0 +1,5 @@
+# Fixture case REP13_auto_wrap_off (tests/fixtures/csi_spec.txt).
+# DECAWM off: repeats overwrite the last column; no wrap.
+@size 2x10
+@set auto_wrap false
+abcdefghij\x1b[3b

@@ -1,0 +1,5 @@
+# Fixture case IL11_pending_wrap_outside_kept (tests/fixtures/csi_spec.txt).
+# Pending armed on row 0 OUTSIDE region 2..5: xterm returns before ResetWrap, so pending SURVIVES the no-op and X wraps to the next row. Grid::insert_lines clears pending first (cannot be fixed without touching the grid): decision D-IL.
+@size 6x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX\x1b[6;1HYZ01234567
+\x1b[2;5r\x1b[1;10Hj\x1b[LX

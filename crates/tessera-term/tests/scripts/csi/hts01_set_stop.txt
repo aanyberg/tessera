@@ -1,0 +1,6 @@
+# Fixture case HTS01_set_stop (tests/fixtures/csi_spec.txt).
+# ESC H sets a stop at col 4: HT from 0 stops there.
+@size 2x20
+\x1b[1;1Habcdefghijklmnopqrst\x1b[2;1HuvwxyzABCDEFGHIJKLMN
+\x1b[1;5H\x1bH\x1b[1;1H
+\tX

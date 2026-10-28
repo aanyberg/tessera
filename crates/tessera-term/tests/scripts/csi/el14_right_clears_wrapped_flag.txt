@@ -1,0 +1,4 @@
+# Fixture case EL14_right_clears_wrapped_flag (tests/fixtures/csi_spec.txt).
+# 13 chars on a 10-col grid soft-wrap row 1. EL 0 on row 1 removes the wrap marker (no trailing '\' on row 1).
+@size 3x10
+abcdefghijklm\x1b[1;5H\x1b[K

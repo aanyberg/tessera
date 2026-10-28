@@ -1,0 +1,4 @@
+# Fixture case RI02_at_top_scrolls_down (tests/fixtures/csi_spec.txt).
+# At the top margin the screen scrolls DOWN: blank top row, last row lost (no scrollback).
+@size 4x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[1;5H\x1bMX

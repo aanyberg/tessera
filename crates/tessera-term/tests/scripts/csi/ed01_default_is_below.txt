@@ -1,0 +1,5 @@
+# Fixture case ED01_default_is_below (tests/fixtures/csi_spec.txt).
+# Default 0: cursor cell to end of screen, inclusive; the X then overwrites the cursor cell.
+@size 5x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
+\x1b[3;5H\x1b[JX

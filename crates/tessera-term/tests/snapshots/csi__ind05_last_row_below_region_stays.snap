@@ -1,0 +1,16 @@
+---
+source: crates/tessera-term/tests/csi.rs
+input_file: crates/tessera-term/tests/scripts/csi/ind05_last_row_below_region_stays.txt
+---
+abcdefghij
+klmnopqrst
+uvwxyzABCD
+EFGHIJKLMN
+OPQRSTUVWX
+YZ01X3|4567
+--
+cursor: (5,5)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

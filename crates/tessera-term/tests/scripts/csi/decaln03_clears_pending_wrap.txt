@@ -1,0 +1,4 @@
+# Fixture case DECALN03_clears_pending_wrap (tests/fixtures/csi_spec.txt).
+# Pending cleared: X overwrites (0,0).
+@size 3x10
+abcdefghij\x1b#8X

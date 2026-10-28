@@ -1,0 +1,12 @@
+---
+source: crates/tessera-term/tests/csi.rs
+input_file: crates/tessera-term/tests/scripts/csi/cht02_zero_is_one.txt
+---
+abcdefghXj|klmnopqrst
+uvwxyzABCDEFGHIJKLMN
+--
+cursor: (0,9)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

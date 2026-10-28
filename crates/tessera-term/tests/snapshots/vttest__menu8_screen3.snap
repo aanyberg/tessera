@@ -1,0 +1,34 @@
+---
+source: crates/tessera-term/tests/vttest.rs
+input_file: crates/tessera-term/tests/scripts/vttest/menu8_screen3.txt
+---
+A******************************************************************************B
+
+
+Test of 'Insert Mode'. The top line should be 'A*** ... ***B'. Push <RETURN> |
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--
+cursor: (3,76)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

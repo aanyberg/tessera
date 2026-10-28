@@ -1,0 +1,34 @@
+---
+source: crates/tessera-term/tests/vttest.rs
+input_file: crates/tessera-term/tests/scripts/vttest/menu8_screen7.txt
+---
+If your terminal has the ANSI 'Insert Character' function
+(the VT102 does not), then you should see a line like this
+  A B C D E F G H I J K L M N O P Q R S T U V W X Y Z
+below:
+
+  A B C D E F G H I J K L M N O P Q R S T U V W X Y Z
+
+
+
+Push <RETURN> |
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--
+cursor: (9,13)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

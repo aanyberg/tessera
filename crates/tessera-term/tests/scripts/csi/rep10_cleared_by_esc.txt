@@ -1,0 +1,4 @@
+# Fixture case REP10_cleared_by_esc (tests/fixtures/csi_spec.txt).
+# ESC 7 (DECSC) completes: clears.
+@size 2x10
+A\x1b7\x1b[3b

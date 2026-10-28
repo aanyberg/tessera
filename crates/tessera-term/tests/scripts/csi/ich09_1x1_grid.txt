@@ -1,0 +1,4 @@
+# Fixture case ICH09_1x1_grid (tests/fixtures/csi_spec.txt).
+# 1x1 grid: all three clamp to the single cell.
+@size 1x1
+a\x1b[3@\x1b[3P\x1b[3XX

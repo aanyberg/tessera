@@ -1,0 +1,14 @@
+---
+source: crates/tessera-term/tests/csi.rs
+input_file: crates/tessera-term/tests/scripts/csi/rep17_1x1_grid.txt
+---
+a|
+--
+cursor: (0,0)
+pending_wrap: true
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 3
+  "a"\
+  "a"\
+  "a"\

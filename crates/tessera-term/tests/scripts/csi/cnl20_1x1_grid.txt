@@ -1,0 +1,4 @@
+# Fixture case CNL20_1x1_grid (tests/fixtures/csi_spec.txt).
+# 1x1 grid: stays (0,0).
+@size 1x1
+\x1b[3E\x1b[3FX

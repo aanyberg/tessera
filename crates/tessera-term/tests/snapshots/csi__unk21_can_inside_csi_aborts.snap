@@ -1,0 +1,15 @@
+---
+source: crates/tessera-term/tests/csi.rs
+input_file: crates/tessera-term/tests/scripts/csi/unk21_can_inside_csi_aborts.txt
+---
+abcdefghij
+klmnopqrst
+uvwxCXA|BCD
+EFGHIJKLMN
+OPQRSTUVWX
+--
+cursor: (2,6)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

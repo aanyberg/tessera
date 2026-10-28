@@ -1,0 +1,6 @@
+# Fixture case TBC03_clear_all (tests/fixtures/csi_spec.txt).
+# CSI 3 g clears all stops: HT goes to the last column (19).
+@size 2x20
+\x1b[1;1Habcdefghijklmnopqrst\x1b[2;1HuvwxyzABCDEFGHIJKLMN
+\x1b[3g\x1b[1;1H
+\tX

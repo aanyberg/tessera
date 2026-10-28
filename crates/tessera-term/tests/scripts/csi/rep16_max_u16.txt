@@ -1,0 +1,4 @@
+# Fixture case REP16_max_u16 (tests/fixtures/csi_spec.txt).
+# 65535 repeats: terminates (bounded), final screen is full of A's after scrolling; scrollback length not asserted (65536 chars over 3 rows of 10 = 6553 lines scrolled; the cap is grid-defined).
+@size 3x10
+A\x1b[65535b

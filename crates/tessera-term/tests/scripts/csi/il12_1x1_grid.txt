@@ -1,0 +1,4 @@
+# Fixture case IL12_1x1_grid (tests/fixtures/csi_spec.txt).
+# 1x1: both blank the only row.
+@size 1x1
+a\x1b[L\x1b[MX

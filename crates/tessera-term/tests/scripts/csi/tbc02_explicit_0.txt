@@ -1,0 +1,6 @@
+# Fixture case TBC02_explicit_0 (tests/fixtures/csi_spec.txt).
+# Same with explicit 0.
+@size 2x20
+\x1b[1;1Habcdefghijklmnopqrst\x1b[2;1HuvwxyzABCDEFGHIJKLMN
+\x1b[1;9H\x1b[0g\x1b[1;1H
+\tX

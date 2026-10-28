@@ -1,0 +1,6 @@
+# Fixture case CBT06_at_col0 (tests/fixtures/csi_spec.txt).
+# Column 0: stays.
+@size 2x20
+\x1b[1;1Habcdefghijklmnopqrst\x1b[2;1HuvwxyzABCDEFGHIJKLMN
+\x1b[1;1H
+\x1b[ZX

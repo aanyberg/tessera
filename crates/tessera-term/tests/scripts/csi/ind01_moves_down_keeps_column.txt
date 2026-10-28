@@ -1,0 +1,4 @@
+# Fixture case IND01_moves_down_keeps_column (tests/fixtures/csi_spec.txt).
+# Down one row, same column.
+@size 4x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[2;5H\x1bDX

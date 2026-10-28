@@ -1,0 +1,16 @@
+---
+source: crates/tessera-term/tests/csi.rs
+input_file: crates/tessera-term/tests/scripts/csi/stbm07_bottom_clamped.txt
+---
+abcdefghij
+uvwxyzABCD
+EFGHIJKLMN
+OPQRSTUVWX
+YZ01234567
+X |
+--
+cursor: (5,1)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

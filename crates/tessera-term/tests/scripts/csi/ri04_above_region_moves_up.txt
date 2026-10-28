@@ -1,0 +1,5 @@
+# Fixture case RI04_above_region_moves_up (tests/fixtures/csi_spec.txt).
+# Row 0 above the region: RI cannot move up and cannot scroll the region (cursor not at its top): stays, no scroll.
+@size 6x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX\x1b[6;1HYZ01234567\x1b[2;4r\x1b[1;5H
+\x1bMX

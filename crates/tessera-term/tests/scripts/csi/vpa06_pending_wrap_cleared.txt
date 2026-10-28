@@ -1,0 +1,5 @@
+# Fixture case VPA06_pending_wrap_cleared (tests/fixtures/csi_spec.txt).
+# Pending armed at (3,9): VPA 1 moves to (0,9) and clears pending.
+@size 5x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
+\x1b[4;10HN\x1b[1dX

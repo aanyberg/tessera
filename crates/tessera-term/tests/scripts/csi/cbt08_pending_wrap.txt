@@ -1,0 +1,6 @@
+# Fixture case CBT08_pending_wrap (tests/fixtures/csi_spec.txt).
+# Pending armed at col 19. xterm's TabToPrevStop never calls ResetWrap, so in xterm the flag SURVIVES the move to col 16 and X wraps to row 2 (quirk). RECOMMENDED: CBT clears the pending wrap whenever it moves the cursor (grid.tab_backward does), so X lands at (0,16). The expected screen follows the RECOMMENDED behaviour. Decision D-CBT.
+@size 2x20
+\x1b[1;1Habcdefghijklmnopqrst\x1b[2;1HuvwxyzABCDEFGHIJKLMN
+\x1b[1;20Ht
+\x1b[ZX

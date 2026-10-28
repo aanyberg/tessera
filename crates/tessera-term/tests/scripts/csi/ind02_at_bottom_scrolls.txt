@@ -1,0 +1,4 @@
+# Fixture case IND02_at_bottom_scrolls (tests/fixtures/csi_spec.txt).
+# At the bottom margin the screen scrolls; top line enters scrollback; column kept.
+@size 4x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[4;5H\x1bDX

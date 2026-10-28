@@ -1,0 +1,5 @@
+# Fixture case V2S12_origin_absolute (tests/fixtures/csi_spec.txt).
+# tst_screen 'Origin mode (absolute)' screen.
+@size 24x80
+\x1b[2J\x1b[?6l\x1b[24;1HOrigin mode test. This line should be at the bottom of the screen.
+\x1b[1;1HThis line should be at the top of the screen. Push <RETURN>

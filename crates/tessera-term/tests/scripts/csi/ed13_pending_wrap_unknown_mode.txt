@@ -1,0 +1,5 @@
+# Fixture case ED13_pending_wrap_unknown_mode (tests/fixtures/csi_spec.txt).
+# Unknown mode must not touch the pending wrap (grid.erase_in_display clears it unconditionally: do not call it for unknown modes). X wraps to (2,0).
+@size 5x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
+\x1b[2;10Ht\x1b[4JX

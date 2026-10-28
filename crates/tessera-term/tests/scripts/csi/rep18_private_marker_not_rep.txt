@@ -1,0 +1,4 @@
+# Fixture case REP18_private_marker_not_rep (tests/fixtures/csi_spec.txt).
+# A private marker disables REP: grid unchanged except the first 'A'.
+@size 2x10
+A\x1b[?3b

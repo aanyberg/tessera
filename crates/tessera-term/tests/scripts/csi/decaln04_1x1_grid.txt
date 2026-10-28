@@ -1,0 +1,4 @@
+# Fixture case DECALN04_1x1_grid (tests/fixtures/csi_spec.txt).
+# 1x1: single E, cursor (0,0), no pending.
+@size 1x1
+\x1b#8

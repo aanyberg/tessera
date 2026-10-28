@@ -1,0 +1,5 @@
+# Fixture case CUU13_region_below_stops_at_top_margin (tests/fixtures/csi_spec.txt).
+# Cursor below the region (idx 5): CUU 99 passes through the region and stops at the TOP MARGIN idx 1 (cursor.c: min = top_marg when cur_row >= top_marg).
+@size 6x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX\x1b[6;1HYZ01234567
+\x1b[2;4r\x1b[6;4H\x1b[99AX

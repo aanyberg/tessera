@@ -1,0 +1,11 @@
+---
+source: crates/tessera-term/tests/csi.rs
+input_file: crates/tessera-term/tests/scripts/csi/tbc09_narrow_grid_default_stops.txt
+---
+   X|
+--
+cursor: (0,3)
+pending_wrap: true
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

@@ -1,0 +1,4 @@
+# Fixture case TBC08_1x1_grid (tests/fixtures/csi_spec.txt).
+# 1x1 grid: no panic; X printed.
+@size 1x1
+\x1bH\x1b[3g\x1b[Z\x1b[IX

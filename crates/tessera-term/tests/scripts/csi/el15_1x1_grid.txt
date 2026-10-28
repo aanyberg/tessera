@@ -1,0 +1,4 @@
+# Fixture case EL15_1x1_grid (tests/fixtures/csi_spec.txt).
+# 1x1 grid.
+@size 1x1
+a\x1b[K\x1b[1K\x1b[2KX

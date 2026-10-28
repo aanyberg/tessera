@@ -1,0 +1,5 @@
+# Fixture case REP14_insert_mode (tests/fixtures/csi_spec.txt).
+# 'abc' CUB 3 clears lastchar (c) -> REP no-op. (Keeps IRM honest: REP never repeats stale state.)
+@size 2x10
+@set insert_mode true
+abc\x1b[3D\x1b[2b

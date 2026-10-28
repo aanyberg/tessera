@@ -1,0 +1,14 @@
+---
+source: crates/tessera-term/tests/csi.rs
+input_file: crates/tessera-term/tests/scripts/csi/decaln01_fills_e_and_homes.txt
+---
+E|EEEEEEEEE
+EEEEEEEEEE
+EEEEEEEEEE
+EEEEEEEEEE
+--
+cursor: (0,0)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

@@ -1,0 +1,6 @@
+# Fixture case CHT05_on_a_stop (tests/fixtures/csi_spec.txt).
+# On a stop goes to the next one (16).
+@size 2x20
+\x1b[1;1Habcdefghijklmnopqrst\x1b[2;1HuvwxyzABCDEFGHIJKLMN
+\x1b[1;9H
+\x1b[IX

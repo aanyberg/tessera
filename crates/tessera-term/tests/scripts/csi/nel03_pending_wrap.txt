@@ -1,0 +1,4 @@
+# Fixture case NEL03_pending_wrap (tests/fixtures/csi_spec.txt).
+# Clears pending, col 0.
+@size 4x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[2;10Ht\x1bEX

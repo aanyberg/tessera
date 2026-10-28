@@ -1,0 +1,4 @@
+# Fixture case REP08_cleared_by_sgr (tests/fixtures/csi_spec.txt).
+# An (even unimplemented) SGR is a completed sequence: clears. So 'clear on every non-Print Action, including Csi/Esc/Osc/Dcs and unknown ones' is the implementable rule.
+@size 2x10
+A\x1b[1m\x1b[3b

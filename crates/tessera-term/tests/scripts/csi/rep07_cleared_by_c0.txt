@@ -1,0 +1,4 @@
+# Fixture case REP07_cleared_by_c0 (tests/fixtures/csi_spec.txt).
+# CR (any C0) completes in ground state: lastchar reset: no-op.
+@size 2x10
+A\r\x1b[3b

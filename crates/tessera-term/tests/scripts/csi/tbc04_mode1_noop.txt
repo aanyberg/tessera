@@ -1,0 +1,6 @@
+# Fixture case TBC04_mode1_noop (tests/fixtures/csi_spec.txt).
+# Only 0 and 3 are honoured (CSI 1 g, 2 g are no-ops; vttest menu 2 sends tbc(1), tbc(2)): HT still goes to 8.
+@size 2x20
+\x1b[1;1Habcdefghijklmnopqrst\x1b[2;1HuvwxyzABCDEFGHIJKLMN
+\x1b[1g\x1b[1;1H
+\tX

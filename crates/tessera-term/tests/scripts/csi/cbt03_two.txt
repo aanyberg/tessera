@@ -1,0 +1,6 @@
+# Fixture case CBT03_two (tests/fixtures/csi_spec.txt).
+# 12 -> 8 -> 0.
+@size 2x20
+\x1b[1;1Habcdefghijklmnopqrst\x1b[2;1HuvwxyzABCDEFGHIJKLMN
+\x1b[1;13H
+\x1b[2ZX

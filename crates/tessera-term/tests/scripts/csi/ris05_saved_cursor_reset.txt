@@ -1,0 +1,4 @@
+# Fixture case RIS05_saved_cursor_reset (tests/fixtures/csi_spec.txt).
+# DECRC after RIS restores the HOME position, not the pre-reset save.
+@size 3x10
+\x1b[3;6H\x1b7\x1bc\x1b8X

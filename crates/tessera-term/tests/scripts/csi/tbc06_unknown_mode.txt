@@ -1,0 +1,6 @@
+# Fixture case TBC06_unknown_mode (tests/fixtures/csi_spec.txt).
+# Unknown mode: no-op.
+@size 2x20
+\x1b[1;1Habcdefghijklmnopqrst\x1b[2;1HuvwxyzABCDEFGHIJKLMN
+\x1b[7g\x1b[1;1H
+\tX

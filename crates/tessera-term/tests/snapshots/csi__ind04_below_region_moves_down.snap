@@ -1,0 +1,16 @@
+---
+source: crates/tessera-term/tests/csi.rs
+input_file: crates/tessera-term/tests/scripts/csi/ind04_below_region_moves_down.txt
+---
+abcdefghij
+klmnopqrst
+uvwxyzABCD
+EFGHIJKLMN
+OPQRSTUVWX
+YZ01X3|4567
+--
+cursor: (5,5)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

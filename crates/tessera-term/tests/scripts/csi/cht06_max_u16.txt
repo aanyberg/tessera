@@ -1,0 +1,6 @@
+# Fixture case CHT06_max_u16 (tests/fixtures/csi_spec.txt).
+# u16 max: bounded loop.
+@size 2x20
+\x1b[1;1Habcdefghijklmnopqrst\x1b[2;1HuvwxyzABCDEFGHIJKLMN
+\x1b[1;4H
+\x1b[65535IX

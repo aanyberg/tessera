@@ -1,0 +1,5 @@
+# Fixture case ED07_below_at_origin (tests/fixtures/csi_spec.txt).
+# ED 0 at (0,0) clears everything (xterm turns it into ED 2).
+@size 5x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
+\x1b[1;1H\x1b[JX
