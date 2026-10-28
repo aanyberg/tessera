@@ -18,12 +18,24 @@ import XCTest
 /// Real input methods are a manual check (ADR 0017).
 ///
 /// Sessions run a recorder: `cat` in raw mode, writing its input to a file.
+///
+/// The view under test lives in a ``KeyControlledWindow`` that is never
+/// ordered on screen, so nothing depends on whether the machine's session is
+/// locked (test windows never key, never visible, no display-link ticks) or
+/// unlocked (they become key and visible, and the link runs): the tests set
+/// key state, occlusion and ticks themselves, the way AppKit's notifications
+/// would. Setting `TESSERA_TEST_WINDOWS_KEY=1` (`TEST_RUNNER_` prefix through
+/// xcodebuild) starts every test with the window key, as on an unlocked CI
+/// runner; the suite must pass both ways.
 @MainActor
 final class TerminalSurfaceViewTests: XCTestCase {
     private var appDelegate: AppDelegate!
     private var file: URL!
     private var view: TerminalSurfaceView!
-    private var window: NSWindow!
+    private var window: KeyControlledWindow!
+
+    /// Whether test windows start key.
+    private static let startKey = ProcessInfo.processInfo.environment["TESSERA_TEST_WINDOWS_KEY"] == "1"
 
     private static let notFound = NSRange(location: NSNotFound, length: 0)
 
@@ -34,14 +46,23 @@ final class TerminalSurfaceViewTests: XCTestCase {
         appDelegate.spawnOptions = .init(
             program: "/bin/sh", arguments: ["-c", #"stty raw -echo; printf R; exec cat > "$0""#, file.path])
         let controller = try appDelegate.newWindow()
-        window = try XCTUnwrap(controller.window)
         view = try XCTUnwrap(controller.contentView as? TerminalSurfaceView)
+        // Off the app's window, whose key and visible state follow the
+        // machine, into one the test controls.
+        window = KeyControlledWindow(contentRect: view.frame)
+        window.contentView = view
+        _ = window.makeFirstResponder(view)
+        setKey(Self.startKey)
         // The recorder prints R once raw mode is set.
         try await waitUntil("the recorder is in raw mode") { FileManager.default.fileExists(atPath: self.file.path) }
         try await Task.sleep(for: .milliseconds(100))
     }
 
     override func tearDown() async throws {
+        for extra in extraWindows + [window] {
+            extra?.close()
+        }
+        extraWindows = []
         for controller in appDelegate.windowControllers {
             controller.window?.close()
         }
@@ -105,6 +126,9 @@ final class TerminalSurfaceViewTests: XCTestCase {
         appDelegate.spawnOptions = .init(program: "/bin/zsh", arguments: ["-f"])
         let controller = try appDelegate.newWindow()
         let zsh = try XCTUnwrap(controller.contentView as? TerminalSurfaceView)
+        let zshWindow = KeyControlledWindow(contentRect: zsh.frame)
+        extraWindows.append(zshWindow)
+        zshWindow.contentView = zsh
         try await Task.sleep(for: .milliseconds(800))  // zsh -f starts its line editor
         for character in "touch \(marker.path)" {
             let text = String(character)
@@ -448,19 +472,21 @@ final class TerminalSurfaceViewTests: XCTestCase {
     func testFocusFollowsFirstResponderAndKeyWindow() {
         XCTAssertTrue(view.acceptsFirstResponder)
         XCTAssertTrue(window.initialFirstResponder === view)
-        // The hosted test app's windows never become key.
-        XCTAssertFalse(window.isKeyWindow)
+        setKey(false)
+        _ = view.resignFirstResponder()
         XCTAssertTrue(view.becomeFirstResponder())
         XCTAssertEqual(view.sentFocus, false, "first responder of a window that is not key")
-        view.windowKeyChanged(isKey: true)
+        setKey(true)
         XCTAssertEqual(view.sentFocus, true)
-        view.windowKeyChanged(isKey: false)
+        setKey(false)
         XCTAssertEqual(view.sentFocus, false)
-        view.windowKeyChanged(isKey: true)
+        setKey(true)
         XCTAssertTrue(view.resignFirstResponder())
         XCTAssertEqual(view.sentFocus, false)
-        view.windowKeyChanged(isKey: true)
+        setKey(true)
         XCTAssertEqual(view.sentFocus, false, "a key window whose first responder is elsewhere")
+        XCTAssertTrue(view.becomeFirstResponder())
+        XCTAssertEqual(view.sentFocus, true, "first responder of a key window")
     }
 
     func testLosingKeyWindowDiscardsTheComposition() async throws {
@@ -549,6 +575,8 @@ final class TerminalSurfaceViewTests: XCTestCase {
     func testRendersOnlyWhenSomethingChanged() async throws {
         try requireSurface()
         view.occlusionOverride = false
+        setKey(false)
+        _ = view.resignFirstResponder()
         view.displayLinkDidFire()
         let before = view.renderCount
         view.displayLinkDidFire()
@@ -560,7 +588,7 @@ final class TerminalSurfaceViewTests: XCTestCase {
         view.displayLinkDidFire()
         XCTAssertEqual(view.renderCount, before + 1, "output is rendered once per tick")
         _ = view.becomeFirstResponder()
-        view.windowKeyChanged(isKey: true)
+        setKey(true)
         view.displayLinkDidFire()
         XCTAssertEqual(view.renderCount, before + 2, "a focus change is rendered")
         _ = view.resignFirstResponder()
@@ -660,7 +688,8 @@ final class TerminalSurfaceViewTests: XCTestCase {
         }
         XCTAssertFalse(view.surface.isAttached)
         // Mid-retry, the view moves to another window, then the session frees up.
-        let other = try XCTUnwrap(appDelegate.newWindow().window)
+        let other = KeyControlledWindow(contentRect: view.frame)
+        extraWindows.append(other)
         try XCTUnwrap(other.contentView).addSubview(view)
         try rogue.detach()
         view.occlusionOverride = false
@@ -729,6 +758,16 @@ final class TerminalSurfaceViewTests: XCTestCase {
     }
 
     // MARK: Helpers
+
+    /// Windows a test made besides ``window``; closed in tear-down.
+    private var extraWindows: [KeyControlledWindow] = []
+
+    /// Makes the view's window key or not, and tells the view as AppKit's
+    /// `didBecomeKey`/`didResignKey` notifications would.
+    private func setKey(_ isKey: Bool) {
+        window.isKeyForTest = isKey
+        view.windowKeyChanged(isKey: isKey)
+    }
 
     /// A key-down event: `characters` with `ignoring` as the characters
     /// without modifiers (the same by default).
@@ -804,4 +843,21 @@ final class TerminalSurfaceViewTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(10))
         }
     }
+}
+
+/// A window whose key state the test sets. It is never ordered on screen and
+/// cannot become key for real, so AppKit never changes its state or sends it
+/// key notifications, whether or not the machine's session is locked.
+@MainActor
+final class KeyControlledWindow: NSWindow {
+    var isKeyForTest = false
+
+    init(contentRect: NSRect) {
+        super.init(contentRect: contentRect, styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+        isReleasedWhenClosed = false
+    }
+
+    override var isKeyWindow: Bool { isKeyForTest }
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
 }

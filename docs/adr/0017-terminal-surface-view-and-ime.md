@@ -215,7 +215,13 @@ to a file), with a sentinel key proving that nothing else was sent. The
 resize test drives 200 `setFrameSize` calls inside a simulated live resize
 and ticks by hand; the display-link test forces the occlusion state,
 because the hosted test app's windows are never on screen and a real link
-never fires there. Surface tests skip with a reason when no Metal device or
+never fires there. Whether the app's windows become key and visible depends
+on the machine (a locked agent session: never; an unlocked CI runner: yes),
+so the view under test lives in a test window that is never ordered on
+screen and reports the key state the test sets, and the tests drive key
+changes through the same entry point AppKit's notifications use. The suite
+runs with test windows starting key (`TEST_RUNNER_TESSERA_TEST_WINDOWS_KEY=1`)
+and not key, and passes both ways. Surface tests skip with a reason when no Metal device or
 renderer is available.
 
 ## Consequences
