@@ -1,0 +1,807 @@
+import AppKit
+import Carbon
+import Metal
+import TesseraKit
+import XCTest
+
+@testable import Tessera
+
+/// `TerminalSurfaceView` in a real window of the running app: keyboard and
+/// input-method handling against the bytes that reach the PTY, resize
+/// coalescing, display-link pausing and focus.
+///
+/// The keyboard cases are the #27 spec fixture (ime_input_fixture.txt, case
+/// ids in the test names). A synthetic `NSEvent` passed to
+/// `interpretKeyEvents` goes through this machine's real input source, so
+/// the tests call the `NSTextInputClient` methods AppKit would call, in
+/// AppKit's order, inside ``TerminalSurfaceView/processKeyDown(_:interpret:)``.
+/// Real input methods are a manual check (ADR 0017).
+///
+/// Sessions run a recorder: `cat` in raw mode, writing its input to a file.
+@MainActor
+final class TerminalSurfaceViewTests: XCTestCase {
+    private var appDelegate: AppDelegate!
+    private var file: URL!
+    private var view: TerminalSurfaceView!
+    private var window: NSWindow!
+
+    private static let notFound = NSRange(location: NSNotFound, length: 0)
+
+    override func setUp() async throws {
+        appDelegate = try XCTUnwrap(NSApp.delegate as? AppDelegate)
+        XCTAssertTrue(appDelegate.windowControllers.isEmpty, "a previous test left windows open")
+        file = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-view-\(UUID().uuidString).bin")
+        appDelegate.spawnOptions = .init(
+            program: "/bin/sh", arguments: ["-c", #"stty raw -echo; printf R; exec cat > "$0""#, file.path])
+        let controller = try appDelegate.newWindow()
+        window = try XCTUnwrap(controller.window)
+        view = try XCTUnwrap(controller.contentView as? TerminalSurfaceView)
+        // The recorder prints R once raw mode is set.
+        try await waitUntil("the recorder is in raw mode") { FileManager.default.fileExists(atPath: self.file.path) }
+        try await Task.sleep(for: .milliseconds(100))
+    }
+
+    override func tearDown() async throws {
+        for controller in appDelegate.windowControllers {
+            controller.window?.close()
+        }
+        appDelegate.spawnOptions = .init()
+        try? FileManager.default.removeItem(at: file)
+        appDelegate = nil
+        view = nil
+        window = nil
+    }
+
+    // MARK: Section A: Option dead keys and composition (US/ABC)
+
+    func testA1OptionAInsertsÅWithoutAlt() async throws {
+        press(key("å", ignoring: "a", code: 0, [.option])) { $0.insertText("å", replacementRange: Self.notFound) }
+        try await assertBytes([0xc3, 0xa5])
+        XCTAssertFalse(view.sentKeys.contains { $0.modifiers.contains(.alt) }, "ALT is never set on composed text (D8)")
+    }
+
+    func testOptionSpaceSendsANoBreakSpaceNotASpace() async throws {
+        // Not composed (no marked text), but the text is not the Space key's
+        // own character: sent as text only, or the core would send 20 (D2).
+        press(key("\u{a0}", ignoring: " ", code: 49, [.option])) {
+            $0.insertText("\u{a0}", replacementRange: Self.notFound)
+        }
+        try await assertBytes([0xc2, 0xa0])
+    }
+
+    // MARK: The Apple logo (U+F8FF) is text, not a function key
+
+    func testAppleLogoOptionShiftKOnUSIsText() async throws {
+        press(key("\u{F8FF}", ignoring: "K", code: 40, [.option, .shift])) {
+            $0.insertText("\u{F8FF}", replacementRange: Self.notFound)
+        }
+        XCTAssertFalse(view.sentKeys.contains { $0.modifiers.contains(.alt) }, "no Alt on committed text (D8)")
+        try await assertBytes([0xef, 0xa3, 0xbf], "U+F8FF, not ESC K")
+    }
+
+    func testAppleLogoOptionAOnSwedishIsText() async throws {
+        press(key("\u{F8FF}", ignoring: "a", code: 0, [.option])) {
+            $0.insertText("\u{F8FF}", replacementRange: Self.notFound)
+        }
+        try await assertBytes([0xef, 0xa3, 0xbf], "U+F8FF, not ESC a")
+    }
+
+    func testAppleLogoThroughTheRealInputSystem() async throws {
+        // Option-Shift-K through this machine's layout and input system.
+        let typed = Self.layoutCharacters(keyCode: 40, [.option, .shift])
+        guard typed == "\u{F8FF}" else {
+            throw XCTSkip("the current layout types \(typed.debugDescription) for Option-Shift-K, not the Apple logo")
+        }
+        view.keyDown(with: key(typed, ignoring: Self.layoutCharacters(keyCode: 40, [.shift]), code: 40, [.option, .shift]))
+        try await assertBytes([0xef, 0xa3, 0xbf])
+    }
+
+    /// On Swedish, Norwegian and Finnish layouts Option-a types the Apple
+    /// logo. Sent as ESC a, zsh would run the command line typed so far
+    /// (accept-and-hold).
+    func testAppleLogoDoesNotRunTheZshCommandLine() async throws {
+        let marker = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-ran-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: marker) }
+        appDelegate.spawnOptions = .init(program: "/bin/zsh", arguments: ["-f"])
+        let controller = try appDelegate.newWindow()
+        let zsh = try XCTUnwrap(controller.contentView as? TerminalSurfaceView)
+        try await Task.sleep(for: .milliseconds(800))  // zsh -f starts its line editor
+        for character in "touch \(marker.path)" {
+            let text = String(character)
+            zsh.processKeyDown(key(text, code: character == " " ? 49 : 0x7F)) {
+                zsh.insertText(text, replacementRange: Self.notFound)
+            }
+        }
+        zsh.processKeyDown(key("\u{F8FF}", ignoring: "a", code: 0, [.option])) {
+            zsh.insertText("\u{F8FF}", replacementRange: Self.notFound)
+        }
+        try await Task.sleep(for: .milliseconds(1500))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path), "the command line ran without Return")
+    }
+
+    func testA3DeadAcuteThenE() async throws {
+        press(key("", ignoring: "e", code: 14, [.option])) {
+            $0.setMarkedText("´", selectedRange: NSRange(location: 1, length: 0), replacementRange: Self.notFound)
+        }
+        XCTAssertTrue(view.hasMarkedText())
+        XCTAssertEqual(view.sentKeys, [], "nothing is sent while text is marked")
+        press(key("e", code: 14)) { $0.insertText("é", replacementRange: Self.notFound) }
+        XCTAssertFalse(view.hasMarkedText())
+        try await assertBytes([0xc3, 0xa9])
+    }
+
+    func testA3DeadAcuteThenEWithUnmarkFirst() async throws {
+        press(key("", ignoring: "e", code: 14, [.option])) {
+            $0.setMarkedText("´", selectedRange: NSRange(location: 1, length: 0), replacementRange: Self.notFound)
+        }
+        press(key("e", code: 14)) { view in
+            view.unmarkText()
+            view.insertText("é", replacementRange: Self.notFound)
+        }
+        try await assertBytes([0xc3, 0xa9])
+    }
+
+    func testA4DeadKeyThenNonCombiningLetter() async throws {
+        deadAcute()
+        press(key("x", code: 7)) { $0.insertText("´x", replacementRange: Self.notFound) }
+        try await assertBytes([0xc2, 0xb4, 0x78])
+    }
+
+    func testA5DeadKeyThenSpaceInsertsTheBareAccent() async throws {
+        deadAcute()
+        press(key(" ", code: 49)) { $0.insertText("´", replacementRange: Self.notFound) }
+        try await assertBytes([0xc2, 0xb4], "not 20: the text wins over the space key (D2)")
+    }
+
+    func testA6DeadKeyThenEscapeSendsNothing() async throws {
+        deadAcute()
+        press(key("\u{1b}", code: 53)) {
+            $0.setMarkedText("", selectedRange: NSRange(location: 0, length: 0), replacementRange: Self.notFound)
+        }
+        XCTAssertFalse(view.hasMarkedText())
+        deadAcute()
+        press(key("\u{1b}", code: 53)) { $0.doCommand(by: #selector(NSResponder.cancelOperation(_:))) }
+        try await assertBytes([], "the Escape that cancels a composition is the input method's (D3)")
+    }
+
+    // MARK: Section B: Swedish layout
+
+    func testB1SwedishÖ() async throws {
+        press(key("ö", code: 41)) { $0.insertText("ö", replacementRange: Self.notFound) }
+        try await assertBytes([0xc3, 0xb6])
+    }
+
+    func testB2SwedishShiftÖ() async throws {
+        press(key("Ö", ignoring: "ö", code: 41, [.shift])) { $0.insertText("Ö", replacementRange: Self.notFound) }
+        try await assertBytes([0xc3, 0x96])
+    }
+
+    func testB3SwedishÅAndÄKeys() async throws {
+        press(key("å", code: 33)) { $0.insertText("å", replacementRange: Self.notFound) }
+        press(key("ä", code: 39)) { $0.insertText("ä", replacementRange: Self.notFound) }
+        try await assertBytes([0xc3, 0xa5, 0xc3, 0xa4])
+    }
+
+    func testB4ControlÖSendsNoText() throws {
+        press(key("ö", ignoring: "ö", code: 41, [.control])) { _ in XCTFail("Control skips the input system") }
+        let sent = try XCTUnwrap(view.sentKeys.last)
+        XCTAssertNil(sent.text, "a control combination carries no text")
+        XCTAssertTrue(sent.modifiers.contains(.control))
+        XCTAssertEqual(sent.codepoint, "ö")
+        XCTAssertEqual(sent.baseLayout, ";", "the US key at the same position")
+        // What Ctrl-ö encodes to is the core's decision (today `;`, as
+        // xterm sends for Ctrl-; without modifyOtherKeys); the view's part is
+        // that no control character travels as text.
+    }
+
+    // MARK: Section C: Japanese composition
+
+    private func typeNihongo() {
+        let steps: [(String, String, UInt16)] = [
+            ("n", "n", 45), ("i", "に", 34), ("h", "にh", 4), ("o", "にほ", 31), ("n", "にほn", 45),
+            ("g", "にほんg", 5), ("o", "にほんご", 31),
+        ]
+        for (typed, preedit, code) in steps {
+            press(key(typed, code: code)) {
+                $0.setMarkedText(
+                    preedit, selectedRange: NSRange(location: (preedit as NSString).length, length: 0),
+                    replacementRange: Self.notFound)
+            }
+            XCTAssertTrue(view.hasMarkedText())
+        }
+        XCTAssertEqual(view.sentKeys, [], "nothing is sent during composition (E1)")
+        XCTAssertEqual(view.markedTextOverlay?.text, "にほんご", "the composition is drawn")
+    }
+
+    func testC1HiraganaCommittedWithReturn() async throws {
+        typeNihongo()
+        press(key("\r", code: 36)) { $0.insertText("にほんご", replacementRange: Self.notFound) }
+        XCTAssertFalse(view.hasMarkedText())
+        XCTAssertNil(view.markedTextOverlay)
+        XCTAssertEqual(view.sentKeys, [.text("にほんご")], "one text-only event, never a paste (D1)")
+        try await assertBytes(
+            [0xe3, 0x81, 0xab, 0xe3, 0x81, 0xbb, 0xe3, 0x82, 0x93, 0xe3, 0x81, 0x94], "and no 0d for the Return")
+    }
+
+    func testC2KanjiConversionWithSpaceThenReturn() async throws {
+        typeNihongo()
+        press(key(" ", code: 49)) {
+            $0.setMarkedText("日本語", selectedRange: NSRange(location: 3, length: 0), replacementRange: Self.notFound)
+        }
+        XCTAssertNotNil(view.attributedSubstring(forProposedRange: NSRange(location: 0, length: 3), actualRange: nil))
+        press(key("\r", code: 36)) { $0.insertText("日本語", replacementRange: Self.notFound) }
+        try await assertBytes([0xe6, 0x97, 0xa5, 0xe6, 0x9c, 0xac, 0xe8, 0xaa, 0x9e], "no 20 for the Space")
+    }
+
+    func testC3EscapeCancelsTheComposition() async throws {
+        typeNihongo()
+        press(key("\u{1b}", code: 53)) { view in
+            view.setMarkedText("", selectedRange: NSRange(location: 0, length: 0), replacementRange: Self.notFound)
+            view.unmarkText()
+        }
+        XCTAssertFalse(view.hasMarkedText())
+        typeNihongo()
+        press(key("\u{1b}", code: 53)) { $0.doCommand(by: #selector(NSResponder.cancelOperation(_:))) }
+        try await assertBytes([], "no 1b")
+    }
+
+    func testC4PlainEscape() async throws {
+        press(key("\u{1b}", code: 53)) { $0.doCommand(by: #selector(NSResponder.cancelOperation(_:))) }
+        try await assertBytes([0x1b])
+    }
+
+    func testC5AndC6BackspaceEditsOnlyThePreedit() async throws {
+        press(key("n", code: 45)) {
+            $0.setMarkedText("にほ", selectedRange: NSRange(location: 2, length: 0), replacementRange: Self.notFound)
+        }
+        press(key("\u{7f}", code: 51)) {
+            $0.setMarkedText("に", selectedRange: NSRange(location: 1, length: 0), replacementRange: Self.notFound)
+        }
+        press(key("\u{7f}", code: 51)) {
+            $0.setMarkedText("", selectedRange: NSRange(location: 0, length: 0), replacementRange: Self.notFound)
+        }
+        XCTAssertFalse(view.hasMarkedText())
+        try await assertBytes([], "no 7f: the last Backspace still belonged to the input method")
+    }
+
+    func testC7ArrowsInsideTheCompositionSendNothing() async throws {
+        typeNihongo()
+        press(key("\u{f702}", code: 123, [.numericPad, .function])) {
+            $0.setMarkedText("にほんご", selectedRange: NSRange(location: 2, length: 0), replacementRange: Self.notFound)
+        }
+        try await assertBytes([])
+    }
+
+    func testC8FocusLossDiscardsTheComposition() async throws {
+        press(key("n", code: 45)) {
+            $0.setMarkedText("にほ", selectedRange: NSRange(location: 2, length: 0), replacementRange: Self.notFound)
+        }
+        XCTAssertTrue(view.resignFirstResponder())
+        XCTAssertFalse(view.hasMarkedText())
+        XCTAssertNil(view.markedTextOverlay)
+        try await assertBytes([], "discarded, not committed (D5)")
+    }
+
+    // MARK: Section D: Shift-Space and editing keys
+
+    func testD1ShiftSpace() async throws {
+        press(key(" ", code: 49, [.shift])) { $0.insertText(" ", replacementRange: Self.notFound) }
+        try await assertBytes([0x20])
+    }
+
+    func testD2ShiftSpaceWhileComposing() async throws {
+        press(key("n", code: 45)) {
+            $0.setMarkedText("に", selectedRange: NSRange(location: 1, length: 0), replacementRange: Self.notFound)
+        }
+        press(key(" ", code: 49, [.shift])) {
+            $0.setMarkedText("に", selectedRange: NSRange(location: 1, length: 0), replacementRange: Self.notFound)
+        }
+        try await assertBytes([])
+    }
+
+    func testD3EditingKeysFromTheirKeyCodes() async throws {
+        let cases: [(NSEvent, Selector, [UInt8])] = [
+            (key("\r", code: 36), #selector(NSResponder.insertNewline(_:)), [0x0d]),
+            (key("\r", code: 36, [.option]), #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)), [0x1b, 0x0d]),
+            (key("\u{7f}", code: 51), #selector(NSResponder.deleteBackward(_:)), [0x7f]),
+            (key("\u{f728}", code: 117, [.function]), #selector(NSResponder.deleteForward(_:)), Array("\u{1b}[3~".utf8)),
+            (key("\t", code: 48), #selector(NSResponder.insertTab(_:)), [0x09]),
+            (key("\u{19}", ignoring: "\t", code: 48, [.shift]), #selector(NSResponder.insertBacktab(_:)), Array("\u{1b}[Z".utf8)),
+            (key("\u{1b}", code: 53), #selector(NSResponder.cancelOperation(_:)), [0x1b]),
+            (key("\u{f700}", code: 126, [.numericPad, .function]), #selector(NSResponder.moveUp(_:)), Array("\u{1b}[A".utf8)),
+            (key("\u{f701}", code: 125, [.numericPad, .function]), #selector(NSResponder.moveDown(_:)), Array("\u{1b}[B".utf8)),
+            (key("\u{f703}", code: 124, [.numericPad, .function]), #selector(NSResponder.moveRight(_:)), Array("\u{1b}[C".utf8)),
+            (key("\u{f702}", code: 123, [.numericPad, .function]), #selector(NSResponder.moveLeft(_:)), Array("\u{1b}[D".utf8)),
+        ]
+        var expected: [UInt8] = []
+        for (event, selector, bytes) in cases {
+            press(event) { $0.doCommand(by: selector) }
+            expected += bytes
+        }
+        try await assertBytes(expected)
+    }
+
+    func testD3SelectorsNameKeysWhoseKeyCodeNamesNothing() async throws {
+        // A key code no layout uses, as a remapped key or custom key binding
+        // would produce: the selector decides.
+        let selectors: [(Selector, [UInt8])] = [
+            (#selector(NSResponder.insertNewline(_:)), [0x0d]),
+            (#selector(NSResponder.insertBacktab(_:)), Array("\u{1b}[Z".utf8)),
+            (#selector(NSResponder.moveWordLeft(_:)), Array("\u{1b}[1;3D".utf8)),
+            (#selector(NSResponder.moveToEndOfLine(_:)), Array("\u{1b}[F".utf8)),
+        ]
+        var expected: [UInt8] = []
+        for (selector, bytes) in selectors {
+            press(key("", code: 0x7F)) { $0.doCommand(by: selector) }
+            expected += bytes
+        }
+        // The key code wins over a selector that disagrees with it (a remapped
+        // binding): Return stays Return (D6).
+        press(key("\r", code: 36)) { $0.doCommand(by: #selector(NSResponder.moveUp(_:))) }
+        expected += [0x0d]
+        // An unknown selector falls back to the key's own character.
+        press(key("q", code: 12)) { $0.doCommand(by: Selector(("someCustomAction:"))) }
+        expected += [0x71]
+        try await assertBytes(expected)
+    }
+
+    func testFunctionKeyPrivateUseTextIsNotSent() async throws {
+        press(key("\u{f704}", code: 122, [.function])) { $0.insertText("\u{f704}", replacementRange: Self.notFound) }
+        try await assertBytes(Array("\u{1b}OP".utf8), "F1, not U+F704")
+    }
+
+    func testCommandKeysSkipTheInputSystemAndTheSession() async throws {
+        // Command combinations that are not menu key equivalents (Cmd-V, Cmd-K,
+        // Cmd-A while there is no Edit menu) go up the responder chain; the
+        // core would encode them as `CSI u` sequences the shell prints.
+        for (character, code) in [("v", UInt16(9)), ("k", 40), ("a", 0), ("c", 8)] {
+            press(key(character, code: code, [.command])) { _ in XCTFail("Command skips the input system") }
+            press(key(character.uppercased(), ignoring: character, code: code, [.command, .shift])) { _ in
+                XCTFail("Command skips the input system")
+            }
+        }
+        XCTAssertEqual(view.sentKeys, [], "no Command key reaches the session")
+        try await assertBytes([])
+    }
+
+    func testControlLetterSendsItsControlByte() async throws {
+        press(key("\u{3}", ignoring: "c", code: 8, [.control])) { _ in XCTFail("Control skips the input system") }
+        try await assertBytes([0x03])
+    }
+
+    func testControlCharactersAreStrippedFromCommittedText() async throws {
+        // A multi-line commit (dictation, the character viewer) types its
+        // printable text: never CR, LF or another control.
+        view.insertText("ab\ncd\r\u{7}e\u{85}f\u{7f}", replacementRange: Self.notFound)
+        view.setMarkedText("に", selectedRange: NSRange(location: 1, length: 0), replacementRange: Self.notFound)
+        press(key("\r", code: 36)) { $0.insertText("に\nほ", replacementRange: Self.notFound) }
+        press(key("x", code: 7)) { $0.insertText("x\u{1b}", replacementRange: Self.notFound) }
+        // Only a control: the key itself.
+        press(key("\r", code: 36)) { $0.insertText("\r", replacementRange: Self.notFound) }
+        try await assertBytes(Array("abcdef".utf8) + [0xe3, 0x81, 0xab, 0xe3, 0x81, 0xbb, 0x78, 0x0d])
+    }
+
+    // MARK: Section E: invariants
+
+    func testE2AndE3MarkedAndSelectedRanges() {
+        XCTAssertEqual(view.markedRange(), Self.notFound)
+        XCTAssertEqual(view.selectedRange(), Self.notFound)
+        view.setMarkedText("にほ", selectedRange: NSRange(location: 1, length: 0), replacementRange: Self.notFound)
+        XCTAssertEqual(view.markedRange(), NSRange(location: 0, length: 2))
+        XCTAssertEqual(view.selectedRange(), NSRange(location: 1, length: 0))
+        view.setMarkedText("𠮷", selectedRange: NSRange(location: 2, length: 0), replacementRange: Self.notFound)
+        XCTAssertEqual(view.markedRange(), NSRange(location: 0, length: 2), "UTF-16 units")
+        view.insertText("𠮷", replacementRange: Self.notFound)
+        XCTAssertFalse(view.hasMarkedText())
+        XCTAssertEqual(view.markedRange(), Self.notFound)
+        XCTAssertEqual(view.selectedRange(), Self.notFound)
+        XCTAssertEqual(view.characterIndex(for: .zero), NSNotFound)
+        XCTAssertEqual(
+            view.attributedSubstring(forProposedRange: NSRange(location: 0, length: 1), actualRange: nil), nil)
+    }
+
+    func testE4AstralCommitOutsideAKeyPress() async throws {
+        // A commit by clicking a candidate, the character viewer or
+        // dictation arrives outside keyDown.
+        view.setMarkedText("𠮷", selectedRange: NSRange(location: 2, length: 0), replacementRange: Self.notFound)
+        view.insertText(NSAttributedString(string: "𠮷"), replacementRange: Self.notFound)
+        view.insertText("é", replacementRange: Self.notFound)
+        try await assertBytes([0xf0, 0xa0, 0xae, 0xb7, 0xc3, 0xa9])
+    }
+
+    func testE5FirstRectIsTheCompositionCellOnScreen() throws {
+        var actual = NSRange(location: 99, length: 99)
+        let rect = view.firstRect(forCharacterRange: NSRange(location: 0, length: 0), actualRange: &actual)
+        XCTAssertEqual(actual, NSRange(location: 0, length: 0))
+        let cell = view.compositionCellRect()
+        let expected = window.convertToScreen(view.convert(cell, to: nil))
+        XCTAssertEqual(rect, expected)
+        XCTAssertGreaterThan(rect.height, 0)
+        // The first cell, just inside the padding, at the top of the view.
+        let viewOnScreen = window.convertToScreen(view.convert(view.bounds, to: nil))
+        XCTAssertEqual(rect.minX, viewOnScreen.minX + TerminalSurfaceView.defaultPaddingPoints, accuracy: 0.5)
+        XCTAssertEqual(rect.maxY, viewOnScreen.maxY - TerminalSurfaceView.defaultPaddingPoints, accuracy: 0.5)
+    }
+
+    func testAHugeCompositionKeepsTheOverlayWithinTheView() {
+        view.setMarkedText(
+            String(repeating: "あ", count: 100_000), selectedRange: NSRange(location: 0, length: 0),
+            replacementRange: Self.notFound)
+        let overlay = try? XCTUnwrap(view.markedTextOverlay)
+        XCTAssertLessThanOrEqual(overlay?.frame.maxX ?? .infinity, view.bounds.width + 0.5)
+        XCTAssertLessThanOrEqual(overlay?.text.count ?? .max, TerminalSurfaceView.maxOverlayCharacters)
+        XCTAssertEqual(view.markedRange(), NSRange(location: 0, length: 100_000), "the composition itself is kept")
+    }
+
+    func testMarkedTextOverlayFollowsTheComposition() {
+        XCTAssertNil(view.markedTextOverlay)
+        view.setMarkedText("に", selectedRange: NSRange(location: 1, length: 0), replacementRange: Self.notFound)
+        let overlay = try? XCTUnwrap(view.markedTextOverlay)
+        XCTAssertEqual(overlay?.text, "に")
+        XCTAssertEqual(overlay?.frame.minX ?? 0, view.compositionCellRect().minX, accuracy: 0.5)
+        view.unmarkText()
+        XCTAssertNil(view.markedTextOverlay)
+    }
+
+    // MARK: Focus and cursor
+
+    func testFocusFollowsFirstResponderAndKeyWindow() {
+        XCTAssertTrue(view.acceptsFirstResponder)
+        XCTAssertTrue(window.initialFirstResponder === view)
+        // The hosted test app's windows never become key.
+        XCTAssertFalse(window.isKeyWindow)
+        XCTAssertTrue(view.becomeFirstResponder())
+        XCTAssertEqual(view.sentFocus, false, "first responder of a window that is not key")
+        view.windowKeyChanged(isKey: true)
+        XCTAssertEqual(view.sentFocus, true)
+        view.windowKeyChanged(isKey: false)
+        XCTAssertEqual(view.sentFocus, false)
+        view.windowKeyChanged(isKey: true)
+        XCTAssertTrue(view.resignFirstResponder())
+        XCTAssertEqual(view.sentFocus, false)
+        view.windowKeyChanged(isKey: true)
+        XCTAssertEqual(view.sentFocus, false, "a key window whose first responder is elsewhere")
+    }
+
+    func testLosingKeyWindowDiscardsTheComposition() async throws {
+        press(key("n", code: 45)) {
+            $0.setMarkedText("にほ", selectedRange: NSRange(location: 2, length: 0), replacementRange: Self.notFound)
+        }
+        view.windowKeyChanged(isKey: false)
+        XCTAssertFalse(view.hasMarkedText())
+        XCTAssertNil(view.markedTextOverlay)
+        try await assertBytes([], "discarded, not committed (D5)")
+    }
+
+    // MARK: Resize coalescing
+
+    private func requireSurface() throws {
+        guard MTLCreateSystemDefaultDevice() != nil else {
+            throw XCTSkip("no Metal device on this machine: the surface tests need a GPU")
+        }
+        guard view.surface.isAttached else {
+            throw XCTSkip("the core could not attach a renderer to the view (no GPU can present, or no font)")
+        }
+    }
+
+    func testLiveResizeReachesTheCoreAtMostOncePerTick() throws {
+        try requireSurface()
+        let resizesBefore = view.coreResizeCount
+        let ticksBefore = view.tickCount
+        view.viewWillStartLiveResize()
+        for step in 0..<200 {
+            view.setFrameSize(NSSize(width: 400 + step, height: 300 + step / 2))
+            if step % 10 == 9 {
+                view.displayLinkDidFire()
+            }
+        }
+        // A final size after the last tick, which only the end of the live
+        // resize sends.
+        view.setFrameSize(NSSize(width: 777, height: 555))
+        let resizesDuring = view.coreResizeCount - resizesBefore
+        view.viewDidEndLiveResize()
+
+        let ticks = view.tickCount - ticksBefore
+        let resizes = view.coreResizeCount - resizesBefore
+        XCTAssertGreaterThanOrEqual(ticks, 20)
+        XCTAssertLessThanOrEqual(resizesDuring, ticks, "at most one resize per tick during the live resize")
+        XCTAssertLessThanOrEqual(resizes, ticks + 1)
+        XCTAssertGreaterThanOrEqual(resizes, 2, "ticks pass resizes on during the drag")
+        XCTAssertEqual(view.surface.size, view.pixelSize, "the core has the last size")
+        XCTAssertEqual(view.pixelSize.widthPx, UInt32((777 * window.backingScaleFactor).rounded()))
+    }
+
+    func testResizeOutsideALiveResizeReachesTheCoreAtOnce() throws {
+        try requireSurface()
+        let before = view.coreResizeCount
+        view.setFrameSize(NSSize(width: 500, height: 320))
+        XCTAssertEqual(view.coreResizeCount, before + 1)
+        XCTAssertEqual(view.surface.size, view.pixelSize)
+        view.setFrameSize(NSSize(width: 500, height: 320))
+        XCTAssertEqual(view.coreResizeCount, before + 1, "an unchanged size is not sent again")
+    }
+
+    // MARK: Display link
+
+    func testOccludedWindowRendersNothingUntilVisible() async throws {
+        try requireSurface()
+        view.occlusionOverride = true
+        XCTAssertTrue(view.isDisplayLinkPaused)
+        let before = view.renderCount
+        // A second of output while occluded, with the refreshes a running
+        // link would deliver (60 Hz). The hosted test app's windows are never
+        // on screen, so a real link does not fire here at all.
+        let deadline = ContinuousClock.now + .seconds(1)
+        while ContinuousClock.now < deadline {
+            try view.session.write(Array("x".utf8))
+            view.sessionDidOutput()
+            view.displayLinkDidFire()
+            try await Task.sleep(for: .milliseconds(16))
+        }
+        XCTAssertEqual(view.renderCount, before, "no frame while occluded")
+
+        view.occlusionOverride = false
+        XCTAssertFalse(view.isDisplayLinkPaused, "the link resumes")
+        view.displayLinkDidFire()
+        XCTAssertEqual(view.renderCount, before + 1, "the next refresh renders")
+    }
+
+    func testRendersOnlyWhenSomethingChanged() async throws {
+        try requireSurface()
+        view.occlusionOverride = false
+        view.displayLinkDidFire()
+        let before = view.renderCount
+        view.displayLinkDidFire()
+        view.displayLinkDidFire()
+        XCTAssertEqual(view.renderCount, before, "nothing changed")
+        view.sessionDidOutput()
+        view.sessionDidOutput()
+        view.displayLinkDidFire()
+        view.displayLinkDidFire()
+        XCTAssertEqual(view.renderCount, before + 1, "output is rendered once per tick")
+        _ = view.becomeFirstResponder()
+        view.windowKeyChanged(isKey: true)
+        view.displayLinkDidFire()
+        XCTAssertEqual(view.renderCount, before + 2, "a focus change is rendered")
+        _ = view.resignFirstResponder()
+        view.displayLinkDidFire()
+        XCTAssertEqual(view.renderCount, before + 3, "a focus change is rendered")
+    }
+
+    func testTheLinkIdlesWithNothingToDraw() throws {
+        try requireSurface()
+        view.occlusionOverride = false
+        view.displayLinkDidFire()
+        XCTAssertTrue(view.isDisplayLinkPaused, "nothing changed: the link idles")
+        view.sessionDidOutput()
+        XCTAssertFalse(view.isDisplayLinkPaused, "output wakes it")
+        view.displayLinkDidFire()
+        XCTAssertTrue(view.isDisplayLinkPaused)
+        view.viewWillStartLiveResize()
+        view.setFrameSize(NSSize(width: 610, height: 410))
+        XCTAssertFalse(view.isDisplayLinkPaused, "a coalesced resize wakes it")
+        view.viewDidEndLiveResize()
+    }
+
+    func testTheLinkIdlesWithoutASurface() throws {
+        try requireSurface()
+        view.occlusionOverride = false
+        view.displayLinkDidFire()
+        XCTAssertTrue(view.isDisplayLinkPaused)
+        // As after a first attach that failed: no surface, no re-attach.
+        try view.surface.detach()
+        view.sessionDidOutput()
+        XCTAssertTrue(view.isDisplayLinkPaused, "nothing can be drawn: the link idles")
+    }
+
+    func testReparentingWithinTheWindowKeepsOneLinkAndOneSetOfObservers() throws {
+        let link = try XCTUnwrap(view.displayLink)
+        let observers = view.windowObserverCount
+        let host = NSView(frame: view.frame)
+        window.contentView = host
+        host.addSubview(view)
+        let relinked = try XCTUnwrap(view.displayLink)
+        XCTAssertEqual(view.windowObserverCount, observers)
+        let other = NSView(frame: host.bounds)
+        host.addSubview(other)
+        other.addSubview(view)  // straight from one superview to another
+        XCTAssertTrue(view.displayLink === relinked, "no second link")
+        XCTAssertEqual(view.windowObserverCount, observers, "no second set of observers")
+        _ = link
+        XCTAssertTrue(view.window === window)
+    }
+
+    func testAFailingReattachStopsAfterAFewAttemptsAndResumesOnResize() throws {
+        try requireSurface()
+        let interval = TerminalSurfaceView.reattachInterval
+        TerminalSurfaceView.reattachInterval = .zero
+        defer { TerminalSurfaceView.reattachInterval = interval }
+        view.occlusionOverride = false
+        view.displayLinkDidFire()
+        // Another surface object for the session detaches the core's surface,
+        // as a lost swapchain would, and then holds the session, so every
+        // re-attach fails.
+        let rogue = TesseraSurface(session: view.session)
+        try? rogue.detach()
+        view.sessionDidOutput()
+        view.displayLinkDidFire()  // the render finds the surface gone
+        XCTAssertFalse(view.surface.isAttached)
+        try rogue.attach(layer: CAMetalLayer(), widthPx: 100, heightPx: 100, scale: 1)
+        for _ in 0..<20 {
+            view.displayLinkDidFire()
+        }
+        XCTAssertEqual(view.reattachFailures, TerminalSurfaceView.maxReattachFailures, "attempts stop")
+        XCTAssertTrue(view.isDisplayLinkPaused, "the link idles after giving up")
+        // Once the session is free, a size change tries again.
+        try rogue.detach()
+        view.displayLinkDidFire()
+        XCTAssertFalse(view.surface.isAttached, "no attempt without a change")
+        view.setFrameSize(NSSize(width: view.frame.width + 10, height: view.frame.height))
+        XCTAssertFalse(view.isDisplayLinkPaused)
+        view.displayLinkDidFire()
+        XCTAssertTrue(view.surface.isAttached)
+        XCTAssertEqual(view.reattachFailures, 0)
+    }
+
+    func testASurfaceLostBeforeAWindowMoveIsRetriedInTheNewWindow() throws {
+        try requireSurface()
+        let interval = TerminalSurfaceView.reattachInterval
+        TerminalSurfaceView.reattachInterval = .zero
+        defer { TerminalSurfaceView.reattachInterval = interval }
+        view.occlusionOverride = false
+        view.displayLinkDidFire()
+        let rogue = TesseraSurface(session: view.session)
+        try? rogue.detach()
+        view.sessionDidOutput()
+        view.displayLinkDidFire()  // the render finds the surface gone
+        try rogue.attach(layer: CAMetalLayer(), widthPx: 100, heightPx: 100, scale: 1)
+        for _ in 0..<(TerminalSurfaceView.maxReattachFailures - 1) {
+            view.displayLinkDidFire()
+        }
+        XCTAssertFalse(view.surface.isAttached)
+        // Mid-retry, the view moves to another window, then the session frees up.
+        let other = try XCTUnwrap(appDelegate.newWindow().window)
+        try XCTUnwrap(other.contentView).addSubview(view)
+        try rogue.detach()
+        view.occlusionOverride = false
+        for _ in 0..<3 {
+            view.displayLinkDidFire()
+        }
+        XCTAssertTrue(view.surface.isAttached, "retried in the new window")
+    }
+
+    func testBecomingVisibleRedraws() throws {
+        try requireSurface()
+        view.occlusionOverride = false
+        view.displayLinkDidFire()
+        let before = view.renderCount
+        view.occlusionOverride = true
+        XCTAssertTrue(view.isDisplayLinkPaused)
+        view.occlusionOverride = false
+        XCTAssertFalse(view.isDisplayLinkPaused, "a window that shows again is redrawn")
+        view.displayLinkDidFire()
+        XCTAssertEqual(view.renderCount, before + 1)
+    }
+
+    func testClosingTheWindowStopsTheDisplayLinkAndDetaches() throws {
+        try requireSurface()
+        window.close()
+        XCTAssertTrue(view.isDisplayLinkPaused)
+        XCTAssertFalse(view.surface.isAttached)
+    }
+
+    // MARK: Mouse
+
+    func testPointerPositionsBecomeCells() {
+        view.cellGeometryOverride = .init(cellSize: CGSize(width: 16, height: 32), padding: 8)
+        let scale = window.backingScaleFactor
+        // 8 px of padding, then 16 x 32 px cells, from the top-left corner.
+        let point = NSPoint(x: (8 + 16 * 3 + 1) / scale, y: view.bounds.height - (8 + 32 * 2 + 1) / scale)
+        let (cell, pixels) = view.cell(at: point)
+        XCTAssertEqual(cell.col, 3)
+        XCTAssertEqual(cell.row, 2)
+        XCTAssertEqual(pixels.x, 8 + 16 * 3 + 1, accuracy: 0.01)
+        XCTAssertEqual(pixels.y, 8 + 32 * 2 + 1, accuracy: 0.01)
+        let (outside, _) = view.cell(at: NSPoint(x: -50, y: view.bounds.height + 50))
+        XCTAssertEqual(outside.col, 0)
+        XCTAssertEqual(outside.row, 0)
+    }
+
+    func testMouseAndScrollEventsReachTheSession() async throws {
+        for type in [NSEvent.EventType.leftMouseDown, .leftMouseDragged, .leftMouseUp, .rightMouseDown, .otherMouseDown] {
+            let event = try XCTUnwrap(
+                NSEvent.mouseEvent(
+                    with: type, location: NSPoint(x: 20, y: 20), modifierFlags: [], timestamp: 0,
+                    windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+            switch type {
+            case .leftMouseDown: view.mouseDown(with: event)
+            case .leftMouseDragged: view.mouseDragged(with: event)
+            case .leftMouseUp: view.mouseUp(with: event)
+            case .rightMouseDown: view.rightMouseDown(with: event)
+            default: view.otherMouseDown(with: event)
+            }
+        }
+        let scroll = try XCTUnwrap(
+            CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 1, wheel1: 3, wheel2: 0, wheel3: 0)
+                .flatMap(NSEvent.init(cgEvent:)))
+        view.scrollWheel(with: scroll)
+        try await assertBytes([], "mouse reporting is not on, and the screen has no scrollback")
+    }
+
+    // MARK: Helpers
+
+    /// A key-down event: `characters` with `ignoring` as the characters
+    /// without modifiers (the same by default).
+    private func key(
+        _ characters: String, ignoring: String? = nil, code: UInt16, _ flags: NSEvent.ModifierFlags = []
+    ) -> NSEvent {
+        NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0,
+            windowNumber: window.windowNumber, context: nil, characters: characters,
+            charactersIgnoringModifiers: ignoring ?? characters, isARepeat: false, keyCode: code)!
+    }
+
+    /// What the current keyboard layout types for `keyCode` with `flags`.
+    static func layoutCharacters(keyCode: UInt16, _ flags: NSEvent.ModifierFlags) -> String {
+        guard let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
+            let pointer = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData)
+        else { return "" }
+        let data = Unmanaged<CFData>.fromOpaque(pointer).takeUnretainedValue() as Data
+        var modifiers: UInt32 = 0
+        if flags.contains(.shift) { modifiers |= UInt32(shiftKey >> 8) }
+        if flags.contains(.option) { modifiers |= UInt32(optionKey >> 8) }
+        var deadKeys: UInt32 = 0
+        var characters = [UniChar](repeating: 0, count: 8)
+        var length = 0
+        data.withUnsafeBytes { raw in
+            guard let layout = raw.bindMemory(to: UCKeyboardLayout.self).baseAddress else { return }
+            _ = UCKeyTranslate(
+                layout, keyCode, UInt16(kUCKeyActionDown), modifiers, UInt32(LMGetKbdType()), 0, &deadKeys,
+                characters.count, &length, &characters)
+        }
+        return String(utf16CodeUnits: characters, count: length)
+    }
+
+    /// Presses `event`, with `inputSystem` making the calls AppKit's input
+    /// system would make for it.
+    private func press(_ event: NSEvent, inputSystem: (TerminalSurfaceView) -> Void) {
+        view.processKeyDown(event) { inputSystem(view) }
+    }
+
+    private func deadAcute() {
+        press(key("", ignoring: "e", code: 14, [.option])) {
+            $0.setMarkedText("´", selectedRange: NSRange(location: 1, length: 0), replacementRange: Self.notFound)
+        }
+    }
+
+    /// Asserts that exactly `expected` reached the PTY: sends a sentinel key
+    /// and compares everything before it.
+    private func assertBytes(
+        _ expected: [UInt8], _ message: String = "", file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        try view.session.send(key: .init(key: .char, codepoint: "~", text: "~"))
+        var received: [UInt8] = []
+        try await waitUntil("the sentinel arrives") {
+            received = (try? Array(Data(contentsOf: self.file))) ?? []
+            return received.last == UInt8(ascii: "~")
+        }
+        // The recorder's own "R" is output, not input: the file holds input only.
+        let hex = { (bytes: [UInt8]) in bytes.map { String(format: "%02x", $0) }.joined(separator: " ") }
+        XCTAssertEqual(hex(Array(received.dropLast())), hex(expected), message, file: file, line: line)
+    }
+
+    /// Polls `condition` on the main actor until it holds or `timeout`
+    /// passes.
+    private func waitUntil(
+        _ description: String, timeout: Duration = .seconds(5), _ condition: () -> Bool
+    ) async throws {
+        let deadline = ContinuousClock.now + timeout
+        while !condition() {
+            guard ContinuousClock.now < deadline else {
+                XCTFail("timed out after \(timeout): \(description)")
+                return
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+}

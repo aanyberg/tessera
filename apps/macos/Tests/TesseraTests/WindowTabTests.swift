@@ -222,22 +222,21 @@ final class WindowTabTests: XCTestCase {
         appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-c", "exit 3"])
         let controller = try appDelegate.newWindow()
 
-        let placeholder = try XCTUnwrap(controller.contentView as? TerminalPlaceholderView)
+        let terminal = try XCTUnwrap(controller.contentView as? TerminalSurfaceView)
         try await waitUntil("the exit status shows") {
-            placeholder.status == "shell exited with code 3"
+            terminal.status == "shell exited with code 3"
         }
         XCTAssertTrue(appDelegate.windowControllers.contains { $0 === controller })
         XCTAssertTrue(controller.window?.isVisible ?? false)
-        XCTAssertTrue(placeholder.text.hasSuffix("\nshell exited with code 3"))
     }
 
     func testKilledSessionKeepsTheTabAndShowsTheSignal() async throws {
         appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-c", "kill -KILL $$"])
         let controller = try appDelegate.newWindow()
 
-        let placeholder = try XCTUnwrap(controller.contentView as? TerminalPlaceholderView)
+        let terminal = try XCTUnwrap(controller.contentView as? TerminalSurfaceView)
         try await waitUntil("the signal shows") {
-            placeholder.status == "shell killed by signal 9"
+            terminal.status == "shell killed by signal 9"
         }
         XCTAssertTrue(appDelegate.windowControllers.contains { $0 === controller })
     }
