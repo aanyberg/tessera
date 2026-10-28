@@ -1,0 +1,12 @@
+---
+source: crates/tessera-term/tests/csi.rs
+input_file: crates/tessera-term/tests/scripts/csi/rep13_auto_wrap_off.txt
+---
+abcdefghij|
+
+--
+cursor: (0,9)
+pending_wrap: true
+auto_wrap: false insert_mode: false
+requests: []
+scrollback: 0

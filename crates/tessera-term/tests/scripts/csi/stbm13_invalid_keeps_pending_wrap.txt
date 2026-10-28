@@ -1,0 +1,5 @@
+# Fixture case STBM13_invalid_keeps_pending_wrap (tests/fixtures/csi_spec.txt).
+# An ignored DECSTBM (top == bottom) does not even clear the pending wrap: X wraps. Fine detail; implementer may accept either only if the choice is recorded.
+@size 6x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX\x1b[6;1HYZ01234567
+\x1b[4;10HN\x1b[3;3rX

@@ -1,0 +1,4 @@
+# Fixture case RIS02_clears_scrollback (tests/fixtures/csi_spec.txt).
+# xterm RIS also discards scrollback (saved lines). Grid::reset KEEPS scrollback (documented), so Terminal must call clear_scrollback after reset. Decision D-RIS.
+@size 2x10
+a\r\nb\r\nc\r\nd\x1bc

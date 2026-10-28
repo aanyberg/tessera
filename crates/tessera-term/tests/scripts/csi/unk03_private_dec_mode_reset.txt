@@ -1,0 +1,4 @@
+# Fixture case UNK03_private_dec_mode_reset (tests/fixtures/csi_spec.txt).
+# DECRST 7 ignored by #6 (the harness uses @set auto_wrap).
+@size 5x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX\x1b[3;5H\x1b[?7lX

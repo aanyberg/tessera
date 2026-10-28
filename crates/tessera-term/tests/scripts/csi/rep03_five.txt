@@ -1,0 +1,4 @@
+# Fixture case REP03_five (tests/fixtures/csi_spec.txt).
+# 'A' then 5 repeats = 6 A's.
+@size 2x10
+A\x1b[5b

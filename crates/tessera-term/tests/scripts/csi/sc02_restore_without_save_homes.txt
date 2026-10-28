@@ -1,0 +1,4 @@
+# Fixture case SC02_restore_without_save_homes (tests/fixtures/csi_spec.txt).
+# DECRC with nothing saved homes the cursor (Grid::restore_cursor does too).
+@size 5x10
+\x1b[4;8H\x1b8X

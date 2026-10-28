@@ -1,0 +1,6 @@
+# Fixture case CBT05_on_a_stop (tests/fixtures/csi_spec.txt).
+# Cursor exactly on a stop goes to the previous one (8).
+@size 2x20
+\x1b[1;1Habcdefghijklmnopqrst\x1b[2;1HuvwxyzABCDEFGHIJKLMN
+\x1b[1;17H
+\x1b[ZX

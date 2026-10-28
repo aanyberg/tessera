@@ -1,0 +1,12 @@
+---
+source: crates/tessera-term/tests/csi.rs
+input_file: crates/tessera-term/tests/scripts/csi/ris03_restores_modes.txt
+---
+abcdefghij\
+k |
+--
+cursor: (1,1)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

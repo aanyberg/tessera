@@ -1,0 +1,6 @@
+# Fixture case CBT04_exceeds (tests/fixtures/csi_spec.txt).
+# Stops at column 0; no previous-line wrap.
+@size 2x20
+\x1b[1;1Habcdefghijklmnopqrst\x1b[2;1HuvwxyzABCDEFGHIJKLMN
+\x1b[1;13H
+\x1b[99ZX

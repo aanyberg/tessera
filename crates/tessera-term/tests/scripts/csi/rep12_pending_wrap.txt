@@ -1,0 +1,4 @@
+# Fixture case REP12_pending_wrap (tests/fixtures/csi_spec.txt).
+# Pending wrap armed after the 10th char; REP's first repeat wraps (row 1 soft-wrapped), second continues: 'jj' on row 2.
+@size 3x10
+abcdefghij\x1b[2b

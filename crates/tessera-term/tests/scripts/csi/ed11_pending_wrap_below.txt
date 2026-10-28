@@ -1,0 +1,5 @@
+# Fixture case ED11_pending_wrap_below (tests/fixtures/csi_spec.txt).
+# Pending armed on the last column: ED 0 erases that cell and every row below, clears pending; X lands on (1,9) with no wrap.
+@size 5x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
+\x1b[2;10Ht\x1b[JX

@@ -1,0 +1,4 @@
+# Fixture case DECALN05_hash_other_ignored (tests/fixtures/csi_spec.txt).
+# Double-size line sequences are deferred to #8 (brief: unknown ESC ignored): grid unchanged, X appended after 'abc'.
+@size 3x10
+abc\x1b#3\x1b#4\x1b#5\x1b#6X

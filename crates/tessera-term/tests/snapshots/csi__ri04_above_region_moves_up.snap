@@ -1,0 +1,16 @@
+---
+source: crates/tessera-term/tests/csi.rs
+input_file: crates/tessera-term/tests/scripts/csi/ri04_above_region_moves_up.txt
+---
+abcdXf|ghij
+klmnopqrst
+uvwxyzABCD
+EFGHIJKLMN
+OPQRSTUVWX
+YZ01234567
+--
+cursor: (0,5)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

@@ -1,0 +1,6 @@
+# Fixture case TBC01_clear_current (tests/fixtures/csi_spec.txt).
+# CSI g clears the stop at column 8: HT from 0 now goes to 16. (X is printed after the HT.)
+@size 2x20
+\x1b[1;1Habcdefghijklmnopqrst\x1b[2;1HuvwxyzABCDEFGHIJKLMN
+\x1b[1;9H\x1b[g\x1b[1;1H
+\tX

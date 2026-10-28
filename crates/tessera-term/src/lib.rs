@@ -11,6 +11,8 @@
 #![forbid(unsafe_code)]
 
 mod control;
+mod csi;
+mod esc;
 pub mod keyboard;
 
 pub use keyboard::{
@@ -52,6 +54,7 @@ impl Terminal {
                 pending: Vec::new(),
                 auto_wrap: true,
                 insert_mode: false,
+                last_printed: None,
             },
             carry: Vec::new(),
         }
@@ -162,21 +165,54 @@ struct State {
     pending: Vec<Request>,
     auto_wrap: bool,
     insert_mode: bool,
+    /// The last non-control character handed to [`State::print`], for REP
+    /// (`CSI Ps b`), whether it took a cell, joined the previous cluster or
+    /// was dropped; REP checks the cell it left behind. Every other action
+    /// clears it once it has been applied, as xterm does, so REP only
+    /// repeats a character printed immediately before it.
+    last_printed: Option<char>,
 }
 
 impl State {
     /// Applies one parsed action.
+    ///
+    /// A printed non-control character becomes [`State::last_printed`];
+    /// every other action (DEL included) clears it once it has been
+    /// applied, REP included.
     fn apply(&mut self, action: Action) {
+        let printing = matches!(action, Action::Print(ch) if !ch.is_control());
         match action {
-            Action::Print(ch) => self.print(ch),
+            Action::Print(ch) => {
+                self.print(ch);
+                // Recorded here rather than in `print`, whose early returns
+                // would skip it. A control character is cleared below.
+                self.last_printed = Some(ch);
+            }
             Action::Execute(byte) => self.execute(byte),
-            ignored @ (Action::Csi { .. }
-            | Action::Esc { .. }
-            | Action::Osc(_)
+            // The header overflowed the parser's storage: the sequence is
+            // incomplete and must not be guessed at.
+            dropped @ (Action::Csi { ignore: true, .. } | Action::Esc { ignore: true, .. }) => {
+                trace!(action = ?dropped, "overflowing sequence dropped");
+            }
+            Action::Csi {
+                params,
+                intermediates,
+                action,
+                ..
+            } => self.csi(&params, &intermediates, action),
+            Action::Esc {
+                intermediates,
+                byte,
+                ..
+            } => self.esc(&intermediates, byte),
+            ignored @ (Action::Osc(_)
             | Action::DcsStart { .. }
             | Action::DcsData(_)
             | Action::DcsEnd) => trace!(action = ?ignored, "sequence not applied yet"),
             unknown => trace!(action = ?unknown, "unknown action ignored"),
+        }
+        if !printing {
+            self.last_printed = None;
         }
     }
 

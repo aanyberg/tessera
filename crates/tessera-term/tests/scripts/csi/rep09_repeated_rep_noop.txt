@@ -1,0 +1,4 @@
+# Fixture case REP09_repeated_rep_noop (tests/fixtures/csi_spec.txt).
+# REP itself ends in ground state and clears lastchar: the second REP does nothing (3 A's total, not 5).
+@size 2x10
+A\x1b[2b\x1b[2b

@@ -1,0 +1,34 @@
+---
+source: crates/tessera-term/tests/vttest.rs
+input_file: crates/tessera-term/tests/scripts/vttest/menu1_screen1.txt
+---
+********************************************************************************
+*++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*
+*+                                                                            +*
+*+                                                                            +*
+*+                                                                            +*
+*+                                                                            +*
+*+                                                                            +*
+*+                                                                            +*
+*+        EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE        +*
+*+        E                                                          E        +*
+*+        E The screen should be cleared,  and have an unbroken bor- E        +*
+*+        E der of *'s and +'s around the edge,   and exactly in the E        +*
+*+        E middle  there should be a frame of E's around this  text E        +*
+*+        E with  one (1) free position around it.    Push <RETURN> | E        +*
+*+        E                                                          E        +*
+*+        EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE        +*
+*+                                                                            +*
+*+                                                                            +*
+*+                                                                            +*
+*+                                                                            +*
+*+                                                                            +*
+*+                                                                            +*
+*++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*
+********************************************************************************
+--
+cursor: (13,67)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

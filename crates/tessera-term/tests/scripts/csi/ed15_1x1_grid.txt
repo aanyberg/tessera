@@ -1,0 +1,4 @@
+# Fixture case ED15_1x1_grid (tests/fixtures/csi_spec.txt).
+# 1x1 grid: clears and prints; ends with pending wrap armed.
+@size 1x1
+a\x1b[2J\x1b[1J\x1b[JX

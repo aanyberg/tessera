@@ -1,0 +1,5 @@
+# Fixture case CUP15_pending_wrap_same_cell (tests/fixtures/csi_spec.txt).
+# CUP onto the very cell the cursor already occupies still cancels the pending wrap: X overwrites the last cell, no wrap.
+@size 5x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
+\x1b[1;10Hj\x1b[1;10HX

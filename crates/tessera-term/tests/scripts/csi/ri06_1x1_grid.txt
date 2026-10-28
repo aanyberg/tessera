@@ -1,0 +1,4 @@
+# Fixture case RI06_1x1_grid (tests/fixtures/csi_spec.txt).
+# 1x1: RI scrolls down (blank), IND/NEL scroll up each time; no panic; scrollback not asserted.
+@size 1x1
+a\x1bMX\x1bDY\x1bEZ

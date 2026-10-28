@@ -1,0 +1,5 @@
+# Fixture case CUP18_ignores_scroll_region (tests/fixtures/csi_spec.txt).
+# DECOM off: CUP addresses the whole screen, so row 1 (outside the 2..4 region) is reachable.
+@size 5x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
+\x1b[2;4r\x1b[3;1H\x1b[1;1HX

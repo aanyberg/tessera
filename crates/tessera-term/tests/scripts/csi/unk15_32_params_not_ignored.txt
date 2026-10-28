@@ -1,0 +1,5 @@
+# Fixture case UNK15_32_params_not_ignored (tests/fixtures/csi_spec.txt).
+# Exactly 32 parameters are kept (ignore:false): a CUP using the first two (1;1) -> home; X at (0,0). Boundary of UNK14.
+@size 5x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX\x1b[3;5H
+\x1b[1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1HX

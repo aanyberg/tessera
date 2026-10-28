@@ -1,0 +1,6 @@
+# Fixture case CHT01_default (tests/fixtures/csi_spec.txt).
+# 3 -> 8.
+@size 2x20
+\x1b[1;1Habcdefghijklmnopqrst\x1b[2;1HuvwxyzABCDEFGHIJKLMN
+\x1b[1;4H
+\x1b[IX

@@ -1,0 +1,4 @@
+# Fixture case RIS04_pending_wrap_cleared (tests/fixtures/csi_spec.txt).
+# Pending cleared; X at (0,0).
+@size 2x10
+abcdefghij\x1bcX

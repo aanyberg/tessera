@@ -1,0 +1,6 @@
+# Fixture case CBT01_default (tests/fixtures/csi_spec.txt).
+# Default tab stops 0,8,16: from col 12 back to 8.
+@size 2x20
+\x1b[1;1Habcdefghijklmnopqrst\x1b[2;1HuvwxyzABCDEFGHIJKLMN
+\x1b[1;13H
+\x1b[ZX

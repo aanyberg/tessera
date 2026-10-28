@@ -1,0 +1,4 @@
+# Fixture case RI05_pending_wrap_cleared (tests/fixtures/csi_spec.txt).
+# RI clears pending.
+@size 4x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[3;10HD\x1bMX

@@ -1,0 +1,4 @@
+# Fixture case CUP17_1x1_home_no_params (tests/fixtures/csi_spec.txt).
+# 1x1: 'a' arms pending, 'b' wraps and scrolls (scrollback 1), CSI H clears pending, X overwrites. Row stays single.
+@size 1x1
+ab\x1b[HX

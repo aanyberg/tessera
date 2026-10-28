@@ -1,0 +1,5 @@
+# Fixture case STBM15_minimal_region_two_rows (tests/fixtures/csi_spec.txt).
+# Smallest legal region (2 rows) at idx 1..2: LF at idx 2 scrolls just those two rows.
+@size 4x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN
+\x1b[2;3r\x1b[3;1H\nX

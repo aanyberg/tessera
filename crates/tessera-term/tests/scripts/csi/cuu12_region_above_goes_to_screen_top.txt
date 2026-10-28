@@ -1,0 +1,5 @@
+# Fixture case CUU12_region_above_goes_to_screen_top (tests/fixtures/csi_spec.txt).
+# Cursor above the region (idx 0): CUU is limited by the screen top (cursor.c min = 0 when cur_row < top_marg).
+@size 6x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX\x1b[6;1HYZ01234567
+\x1b[2;4r\x1b[1;4H\x1b[99AX

@@ -1,0 +1,5 @@
+# Fixture case IL10_pending_wrap_inside_cleared (tests/fixtures/csi_spec.txt).
+# Pending armed inside the region: IL clears pending and moves to column 0; X at (2,0) afterwards, no wrap.
+@size 6x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX\x1b[6;1HYZ01234567
+\x1b[3;10HD\x1b[LX

@@ -1,0 +1,14 @@
+---
+source: crates/tessera-term/tests/csi.rs
+input_file: crates/tessera-term/tests/scripts/csi/ri05_pending_wrap_cleared.txt
+---
+abcdefghij
+klmnopqrsX|
+uvwxyzABCD
+EFGHIJKLMN
+--
+cursor: (1,9)
+pending_wrap: true
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

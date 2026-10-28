@@ -1,0 +1,5 @@
+# Fixture case SU04_exceeds_screen (tests/fixtures/csi_spec.txt).
+# Clamped to the region height: whole screen blank; 6 lines in scrollback (xterm xtermScroll: amount > limit -> limit).
+@size 6x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX\x1b[6;1HYZ01234567
+\x1b[3;5H\x1b[99SX

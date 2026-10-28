@@ -1,0 +1,4 @@
+# Fixture case REP06_cleared_by_cursor_move (tests/fixtures/csi_spec.txt).
+# xterm clears lastchar after the CUF sequence completes: REP is a no-op. This is the fixture's reading of 'whether movement clears it' (brief decision 1): ANY non-print action clears it. Alacritty keeps it; xterm is the reference.
+@size 2x10
+A\x1b[C\x1b[3b

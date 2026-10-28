@@ -1,0 +1,6 @@
+# Fixture case TBC05_mode2_noop (tests/fixtures/csi_spec.txt).
+# No-op.
+@size 2x20
+\x1b[1;1Habcdefghijklmnopqrst\x1b[2;1HuvwxyzABCDEFGHIJKLMN
+\x1b[2g\x1b[1;1H
+\tX

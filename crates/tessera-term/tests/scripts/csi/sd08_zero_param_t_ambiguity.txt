@@ -1,0 +1,5 @@
+# Fixture case SD08_zero_param_T_ambiguity (tests/fixtures/csi_spec.txt).
+# DECISION D-SD0: xterm treats CSI 0 T as 'reset mouse tracking' (CASE_TRACK_MOUSE when GetParam(0)==0), a no-op for the screen, but vte delivers CSI T and CSI 0 T identically as [0], so they cannot be told apart. Recommended: both are SD 1 (matches the caret form and ECMA-48 default).
+@size 6x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX\x1b[6;1HYZ01234567
+\x1b[3;5H\x1b[0TX

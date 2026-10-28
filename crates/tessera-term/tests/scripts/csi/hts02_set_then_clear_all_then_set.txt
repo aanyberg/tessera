@@ -1,0 +1,6 @@
+# Fixture case HTS02_set_then_clear_all_then_set (tests/fixtures/csi_spec.txt).
+# After clearing all, only col 5 is a stop.
+@size 2x20
+\x1b[1;1Habcdefghijklmnopqrst\x1b[2;1HuvwxyzABCDEFGHIJKLMN
+\x1b[3g\x1b[1;6H\x1bH\x1b[1;1H
+\tX

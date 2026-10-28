@@ -1,0 +1,6 @@
+# Fixture case HTS03_set_beyond_default_between (tests/fixtures/csi_spec.txt).
+# New stop at 10; from col 9 HT lands on 10.
+@size 2x20
+\x1b[1;1Habcdefghijklmnopqrst\x1b[2;1HuvwxyzABCDEFGHIJKLMN
+\x1b[1;11H\x1bH\x1b[1;10H
+\tX

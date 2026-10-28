@@ -1,0 +1,4 @@
+# Fixture case REP01_default_one (tests/fixtures/csi_spec.txt).
+# Default count 1: 'A' + one repeat.
+@size 2x10
+A\x1b[b

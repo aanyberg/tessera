@@ -1,0 +1,4 @@
+# Fixture case DECALN01_fills_E_and_homes (tests/fixtures/csi_spec.txt).
+# Every cell is 'E', cursor home (0,0), pending false, no soft-wrap markers (a naive put_char loop would mark every row wrapped: fill row by row with goto).
+@size 4x10
+abc\x1b#8

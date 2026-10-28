@@ -1,0 +1,4 @@
+# Fixture case SC06_restore_twice (tests/fixtures/csi_spec.txt).
+# Restore does not consume the slot.
+@size 5x10
+\x1b[2;4H\x1b7\x1b[5;10H\x1b8\x1b[3;3H\x1b8X

@@ -1,0 +1,6 @@
+# Fixture case RIS03_restores_modes (tests/fixtures/csi_spec.txt).
+# RIS must put DECAWM back on and IRM off (the Terminal-level flags, not just the grid): 'k' wraps to row 2.
+@size 2x10
+@set auto_wrap false
+@set insert_mode true
+\x1bcabcdefghijk

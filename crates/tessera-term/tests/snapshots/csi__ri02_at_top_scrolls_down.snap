@@ -1,0 +1,14 @@
+---
+source: crates/tessera-term/tests/csi.rs
+input_file: crates/tessera-term/tests/scripts/csi/ri02_at_top_scrolls_down.txt
+---
+    X |
+abcdefghij
+klmnopqrst
+uvwxyzABCD
+--
+cursor: (0,5)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

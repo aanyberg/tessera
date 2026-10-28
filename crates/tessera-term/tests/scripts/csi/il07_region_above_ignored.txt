@@ -1,0 +1,5 @@
+# Fixture case IL07_region_above_ignored (tests/fixtures/csi_spec.txt).
+# Cursor above the region: IL has no effect (vt510 IL 'no effect outside the page margins'); the column is NOT reset either (xterm returns before set_cur_col), X at (0,4).
+@size 6x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX\x1b[6;1HYZ01234567
+\x1b[2;5r\x1b[1;5H\x1b[LX

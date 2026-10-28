@@ -1,0 +1,7 @@
+# Fixture case V8S7_insert_character (tests/fixtures/csi_spec.txt).
+# tst_insdel screen 7: ICH 2 after each letter.
+@size 24x80
+\r\n\x1b[2J
+\x1b[1;1HIf your terminal has the ANSI 'Insert Character' function\r\r\n(the VT102 does not), then you should see a line like this\r\r\n  A B C D E F G H I J K L M N O P Q R S T U V W X Y Z\r\r\nbelow:\r\r\n\r\r\nZ\x08
+\x1b[2@Y\x08\x1b[2@X\x08\x1b[2@W\x08\x1b[2@V\x08\x1b[2@U\x08\x1b[2@T\x08\x1b[2@S\x08\x1b[2@R\x08\x1b[2@Q\x08\x1b[2@P\x08\x1b[2@O\x08\x1b[2@N\x08\x1b[2@M\x08\x1b[2@L\x08\x1b[2@K\x08\x1b[2@J\x08\x1b[2@I\x08\x1b[2@H\x08
+\x1b[2@G\x08\x1b[2@F\x08\x1b[2@E\x08\x1b[2@D\x08\x1b[2@C\x08\x1b[2@B\x08\x1b[2@A\x08\x1b[2@\x1b[10;1HPush <RETURN>

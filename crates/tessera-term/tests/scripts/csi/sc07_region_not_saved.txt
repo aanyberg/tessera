@@ -1,0 +1,4 @@
+# Fixture case SC07_region_not_saved (tests/fixtures/csi_spec.txt).
+# The scroll region is not part of the saved state: after restore the region 2..4 is still active, LF at idx 3 scrolls it.
+@size 6x10
+\x1b[2;4H\x1b7\x1b[2;4r\x1b[6;1H\x1b8\n\n\n\nX

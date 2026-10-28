@@ -1,0 +1,4 @@
+# Fixture case CHA08_1x1_grid (tests/fixtures/csi_spec.txt).
+# 1x1 grid clamps.
+@size 1x1
+\x1b[9G\x1b[9dX

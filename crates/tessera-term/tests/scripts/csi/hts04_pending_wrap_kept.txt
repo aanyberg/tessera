@@ -1,0 +1,6 @@
+# Fixture case HTS04_pending_wrap_kept (tests/fixtures/csi_spec.txt).
+# ESC H does not touch pending wrap: X wraps. (Setting a stop at the last column is harmless.)
+@size 2x20
+\x1b[1;1Habcdefghijklmnopqrst\x1b[2;1HuvwxyzABCDEFGHIJKLMN
+\x1b[1;20Ht\x1bH
+X

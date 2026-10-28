@@ -872,10 +872,10 @@ wrapped_rows(1-based): none
 
 ### G07_Csi_is_ignored_and_consumed_2x8
 size: 2x8
-step: feed ab\x1b[2J\x1b[5;5H\x1b[31mcd
+step: feed ab\x1b[2N\x1b[5;5~\x1b[31|cd
 cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html (VT100 Mode > Single-character functions) CSI; brief 'Action::Csi leaves the grid unchanged'
-note: CSI is parsed by tessera-vt (params never leak as text) but not applied in #5: no erase, no cursor move, no colour. Text 'abcd'. NOTE: this row is SUPERSEDED by #6 (wave 3) - delete or rewrite it there.
-flags: superseded-by-6
+note: CSI is parsed by tessera-vt (params never leak as text) and a sequence with a final that ctlseqs leaves unassigned (N, plain ~, plain |; csi_spec.txt UNK rows) changes nothing. Text 'abcd'. Rewritten by #6 (wave 3): the original payload (ED 2, CUP 5;5, SGR 31) is applied since #6 and pinned in csi_spec.txt.
+flags: rewritten-by-6
 screen:
 >abcd |
 >
@@ -887,10 +887,10 @@ wrapped_rows(1-based): none
 
 ### G08_Esc_Osc_Dcs_ignored_2x8
 size: 2x8
-step: feed a\x1bMb\x1b]0;hi\x1b\\c\x1bPqxyz\x1b\\d
+step: feed a\x1b0b\x1b]0;hi\x1b\\c\x1bPqxyz\x1b\\d
 cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html (VT100 Mode > Single-character functions); brief 'Esc/Osc/Dcs stay ignored for now'
-note: ESC M (RI), OSC 0 with ST, DCS with ST all vanish. Text 'abcd', no requests. NOTE: superseded piecemeal by #6/#9 (RI, title).
-flags: superseded-by-6, superseded-by-9
+note: ESC 0 (a final ctlseqs leaves unassigned), OSC 0 with ST, DCS with ST all vanish. Text 'abcd', no requests. #6 replaced the original ESC M (RI, applied since #6); the OSC title is superseded by #9.
+flags: rewritten-by-6, superseded-by-9
 screen:
 >abcd |
 >

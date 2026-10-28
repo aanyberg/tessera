@@ -1,0 +1,5 @@
+# Fixture case ED06_unknown_mode_ignored (tests/fixtures/csi_spec.txt).
+# Modes above 3 do nothing in xterm (do_erase_display switch has no default).
+@size 5x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
+\x1b[3;5H\x1b[4JX

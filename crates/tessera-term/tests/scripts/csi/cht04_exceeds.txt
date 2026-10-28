@@ -1,0 +1,6 @@
+# Fixture case CHT04_exceeds (tests/fixtures/csi_spec.txt).
+# Clamps at the last column (19), never wraps.
+@size 2x20
+\x1b[1;1Habcdefghijklmnopqrst\x1b[2;1HuvwxyzABCDEFGHIJKLMN
+\x1b[1;4H
+\x1b[99IX

@@ -1,0 +1,5 @@
+# Fixture case DCH07_pending_wrap_cleared (tests/fixtures/csi_spec.txt).
+# Pending armed: DCH deletes the last cell (blank), clears pending; X at (1,9) no wrap.
+@size 5x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
+\x1b[2;10Ht\x1b[PX

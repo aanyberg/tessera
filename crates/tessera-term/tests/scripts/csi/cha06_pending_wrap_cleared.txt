@@ -1,0 +1,5 @@
+# Fixture case CHA06_pending_wrap_cleared (tests/fixtures/csi_spec.txt).
+# Pending armed at col 9; CHA 10 (same column) clears it; X overwrites (0,9), no wrap.
+@size 5x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
+\x1b[1;10Hj\x1b[10GX

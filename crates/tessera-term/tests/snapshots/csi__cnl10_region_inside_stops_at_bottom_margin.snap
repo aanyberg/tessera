@@ -1,0 +1,16 @@
+---
+source: crates/tessera-term/tests/csi.rs
+input_file: crates/tessera-term/tests/scripts/csi/cnl10_region_inside_stops_at_bottom_margin.txt
+---
+abcdefghij
+klmnopqrst
+uvwxyzABCD
+XF|GHIJKLMN
+OPQRSTUVWX
+YZ01234567
+--
+cursor: (3,1)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

@@ -1,0 +1,12 @@
+---
+source: crates/tessera-term/tests/csi.rs
+input_file: crates/tessera-term/tests/scripts/csi/tbc06_unknown_mode.txt
+---
+abcdefghXj|klmnopqrst
+uvwxyzABCDEFGHIJKLMN
+--
+cursor: (0,9)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

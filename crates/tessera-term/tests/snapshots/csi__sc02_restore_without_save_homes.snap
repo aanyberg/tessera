@@ -1,0 +1,15 @@
+---
+source: crates/tessera-term/tests/csi.rs
+input_file: crates/tessera-term/tests/scripts/csi/sc02_restore_without_save_homes.txt
+---
+X |
+
+
+
+
+--
+cursor: (0,1)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

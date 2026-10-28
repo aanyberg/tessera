@@ -1,0 +1,4 @@
+# Fixture case REP05_no_preceding_char (tests/fixtures/csi_spec.txt).
+# No printed character yet: no-op (lastchar = -1).
+@size 2x10
+\x1b[5b

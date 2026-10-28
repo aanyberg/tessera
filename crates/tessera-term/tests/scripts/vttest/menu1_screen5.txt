@@ -1,0 +1,7 @@
+# Fixture case V1S5_cursor_controls_inside_csi (tests/fixtures/csi_spec.txt).
+# tst_movements 'cursor-control characters inside ESC sequences'.
+@size 24x80
+\x1b[?3l\x1b[2J
+\x1b[1;1HTest of cursor-control characters inside ESC sequences.\r\r\nBelow should be four identical lines:\r\r\n\r\r\nA B C D E F G H I\r\r\nA
+\x1b[2\x08CB\x1b[2\x08CC\x1b[2\x08CD\x1b[2\x08CE\x1b[2\x08CF\x1b[2\x08CG\x1b[2\x08CH\x1b[2\x08CI\x1b[2\x08C\r\r\nA \x1b[\r2CB\x1b[\r4CC\x1b[\r6CD\x1b[\r8CE\x1b[\r10CF\x1b[\r12CG\x1b[\r14CH
+\x1b[\r16CI\r\r\n\x1b[20lA \x1b[1\x0bAB \x1b[1\x0bAC \x1b[1\x0bAD \x1b[1\x0bAE \x1b[1\x0bAF \x1b[1\x0bAG \x1b[1\x0bAH \x1b[1\x0bAI \x1b[1\x0bA\r\r\n\r\r\nPush <RETURN>

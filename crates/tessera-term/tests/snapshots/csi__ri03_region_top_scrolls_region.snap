@@ -1,0 +1,16 @@
+---
+source: crates/tessera-term/tests/csi.rs
+input_file: crates/tessera-term/tests/scripts/csi/ri03_region_top_scrolls_region.txt
+---
+abcdefghij
+    X |
+klmnopqrst
+uvwxyzABCD
+OPQRSTUVWX
+YZ01234567
+--
+cursor: (1,5)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

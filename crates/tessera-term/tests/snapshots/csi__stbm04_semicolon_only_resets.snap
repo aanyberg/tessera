@@ -1,0 +1,16 @@
+---
+source: crates/tessera-term/tests/csi.rs
+input_file: crates/tessera-term/tests/scripts/csi/stbm04_semicolon_only_resets.txt
+---
+Xb|cdefghij
+klmnopqrst
+uvwxyzABCD
+EFGHIJKLMN
+OPQRSTUVWX
+YZ01234567
+--
+cursor: (0,1)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

@@ -1,0 +1,4 @@
+# Fixture case SC01_save_move_restore (tests/fixtures/csi_spec.txt).
+# Save at (1,3), move, restore, X at (1,3).
+@size 5x10
+\x1b[2;4H\x1b7\x1b[4;8H\x1b8X

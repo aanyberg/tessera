@@ -1,0 +1,6 @@
+# Fixture case CHT07_pending_wrap_kept (tests/fixtures/csi_spec.txt).
+# Pending armed at the last column: there is no next stop, the cursor cannot move, and xterm leaves the pending flag armed (same as HT, fixture print_c0 D1), so X wraps to row 2. grid.tab_forward clears pending: guard it.
+@size 2x20
+\x1b[1;1Habcdefghijklmnopqrst\x1b[2;1HuvwxyzABCDEFGHIJKLMN
+\x1b[1;20Ht
+\x1b[IX

@@ -1,0 +1,12 @@
+---
+source: crates/tessera-term/tests/csi.rs
+input_file: crates/tessera-term/tests/scripts/csi/tbc03_clear_all.txt
+---
+abcdefghijklmnopqrsX|
+uvwxyzABCDEFGHIJKLMN
+--
+cursor: (0,19)
+pending_wrap: true
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

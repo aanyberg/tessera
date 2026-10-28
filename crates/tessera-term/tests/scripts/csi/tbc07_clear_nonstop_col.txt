@@ -1,0 +1,6 @@
+# Fixture case TBC07_clear_nonstop_col (tests/fixtures/csi_spec.txt).
+# Clearing a column that has no stop changes nothing.
+@size 2x20
+\x1b[1;1Habcdefghijklmnopqrst\x1b[2;1HuvwxyzABCDEFGHIJKLMN
+\x1b[1;6H\x1b[g\x1b[1;1H
+\tX

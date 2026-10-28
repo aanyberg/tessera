@@ -1,4 +1,4 @@
 # Fixture case G08_Esc_Osc_Dcs_ignored_2x8 (tests/fixtures/print_c0_spec.txt).
-# ESC M (RI), OSC 0 with ST, DCS with ST all vanish. Text 'abcd', no requests. NOTE: superseded piecemeal by #6/#9 (RI, title).
+# ESC 0 (unassigned final), OSC 0 with ST, DCS with ST all vanish. Text 'abcd', no requests. #6 replaced the original ESC M (RI, applied now); the OSC title is superseded by #9.
 @size 2x8
-a\x1bMb\x1b]0;hi\x1b\\c\x1bPqxyz\x1b\\d
+a\x1b0b\x1b]0;hi\x1b\\c\x1bPqxyz\x1b\\d

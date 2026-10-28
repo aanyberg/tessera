@@ -1,0 +1,4 @@
+# Fixture case SC03_pending_wrap_saved (tests/fixtures/csi_spec.txt).
+# xterm saves the wrap flag and re-arms it on restore, so X wraps (row 2 col 0, row 1 soft-wrapped). Brief decision 2 (Grid::save_cursor saves pending_wrap) agrees.
+@size 5x10
+\x1b[2;10Ht\x1b7\x1b[4;3H\x1b8X

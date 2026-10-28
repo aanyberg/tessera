@@ -1,0 +1,5 @@
+# Fixture case STBM08_top_equals_bottom_ignored (tests/fixtures/csi_spec.txt).
+# bot > top is required (charproc.c: `if (bot > top)`), else NOTHING happens: the old region stays AND the cursor is NOT homed (X at (2,4)). Grid::set_scroll_region would reset to full screen: do not call it for top>=bottom (decision D-STBM).
+@size 6x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX\x1b[6;1HYZ01234567
+\x1b[2;4r\x1b[3;5H\x1b[3;3rX

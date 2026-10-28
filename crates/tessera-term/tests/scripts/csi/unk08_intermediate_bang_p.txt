@@ -1,0 +1,4 @@
+# Fixture case UNK08_intermediate_bang_p (tests/fixtures/csi_spec.txt).
+# DECSTR (soft reset): ignored in #6.
+@size 5x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX\x1b[3;5H\x1b[!pX

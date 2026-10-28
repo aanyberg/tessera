@@ -1,0 +1,4 @@
+# Fixture case DECALN02_resets_region (tests/fixtures/csi_spec.txt).
+# Margins reset: LF on the last row scrolls the whole screen (scrollback 1 = 'EEEEEEEEEE').
+@size 5x10
+\x1b[2;3r\x1b#8\x1b[5;1H\n

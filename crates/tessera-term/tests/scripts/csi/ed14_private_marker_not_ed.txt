@@ -1,0 +1,4 @@
+# Fixture case ED14_private_marker_not_ed (tests/fixtures/csi_spec.txt).
+# DECSED is selective erase, not ED. A handler matching only the final byte would wrongly clear the screen. Expected: grid unchanged except X.
+@size 5x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX\x1b[3;5H\x1b[?2JX

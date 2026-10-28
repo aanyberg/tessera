@@ -1,0 +1,4 @@
+# Fixture case UNK17_esc_charset_designation (tests/fixtures/csi_spec.txt).
+# SCS (intermediate '(' / ')'): not handled in #6, ignored; the text that follows stays ASCII.
+@size 5x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX\x1b[3;5H\x1b(0\x1b(B\x1b)0X

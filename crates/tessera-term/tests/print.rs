@@ -410,10 +410,12 @@ fn take_requests_drains() {
     assert_eq!(term.take_requests(), vec![], "second take is empty");
 }
 
+/// CSI sequences whose finals ctlseqs leaves unassigned, with and without
+/// a private marker. Assigned ones are applied since #6 (`tests/csi.rs`).
 #[test]
 fn csi_leaves_the_grid_unchanged() {
     assert_eq!(
-        run_script(b"ab\x1b[2J\x1b[5;5H\x1b[31m\x1b[?7lcd", 2, 8),
+        run_script(b"ab\x1b[2N\x1b[5;5~\x1b[31|\x1b[?7}cd", 2, 8),
         run_script(b"abcd", 2, 8),
     );
 }
@@ -499,12 +501,17 @@ fn ignored_control() -> impl Strategy<Value = Vec<u8>> {
     ]
 }
 
-/// A well-formed CSI sequence with random parameters and final byte.
+/// Final bytes that ctlseqs assigns to nothing without an intermediate,
+/// so a CSI ending in one stays a no-op as more sequences are wired up.
+const UNASSIGNED_CSI_FINALS: &[u8] = b"NOQUVY[\\]_jko{|}~";
+
+/// A well-formed CSI sequence with random parameters and an unassigned
+/// final byte.
 fn csi() -> impl Strategy<Value = Vec<u8>> {
     (
         prop::option::of(prop_oneof![Just(b'?'), Just(b'>'), Just(b'=')]),
         prop::collection::vec(0u16..1000, 0..4),
-        0x40..=0x7Eu8,
+        prop::sample::select(UNASSIGNED_CSI_FINALS),
     )
         .prop_map(|(private, params, final_byte)| {
             let mut out = b"\x1b[".to_vec();

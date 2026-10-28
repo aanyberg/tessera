@@ -1,0 +1,34 @@
+---
+source: crates/tessera-term/tests/vttest.rs
+input_file: crates/tessera-term/tests/scripts/vttest/menu8_screen2.txt
+---
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+Top line: A's, bottom line: X's, this line, nothing more. Push <RETURN> |
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+--
+cursor: (1,71)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

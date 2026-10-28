@@ -1,0 +1,4 @@
+# Fixture case REP11_wide_deferred_marker (tests/fixtures/csi_spec.txt).
+# Non-ASCII narrow char (U+00E9, width 1) repeats like any char. Wide characters (width 2) repeat as wide; since #4 that is asserted in tests/csi.rs (rep_repeats_a_wide_character_as_wide, rep_repeats_the_clamped_three_column_scalar_as_wide, rep_ignores_a_character_that_joined_a_cluster, rep_equals_printing_again_or_nothing), not in this row.
+@size 2x10
+\u{e9}\x1b[2b

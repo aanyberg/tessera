@@ -1,0 +1,4 @@
+# Fixture case SC08_1x1_grid (tests/fixtures/csi_spec.txt).
+# 1x1: save while pending, restore re-arms; 'b' wraps+scrolls (scrollback 1).
+@size 1x1
+a\x1b7\x1b8b

@@ -1,0 +1,6 @@
+# Fixture case CBT07_max_u16 (tests/fixtures/csi_spec.txt).
+# u16 max: loop must be bounded by the tab count, not by n.
+@size 2x20
+\x1b[1;1Habcdefghijklmnopqrst\x1b[2;1HuvwxyzABCDEFGHIJKLMN
+\x1b[1;18H
+\x1b[65535ZX
