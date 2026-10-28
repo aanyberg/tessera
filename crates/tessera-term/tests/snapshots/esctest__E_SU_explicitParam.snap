@@ -1,0 +1,40 @@
+---
+source: crates/tessera-term/tests/esctest.rs
+description: E_SU_explicitParam
+input_file: crates/tessera-term/tests/fixtures/esctest_spec.txt
+---
+klmno
+pqr|st
+uvwxy
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--
+cursor: (1,2)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 2
+  "abcde"
+  "fghij"
+-- pens
+pens: default

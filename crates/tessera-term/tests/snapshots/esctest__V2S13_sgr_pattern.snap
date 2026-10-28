@@ -1,0 +1,51 @@
+---
+source: crates/tessera-term/tests/esctest.rs
+description: V2S13_sgr_pattern
+input_file: crates/tessera-term/tests/fixtures/esctest_spec.txt
+---
+                   Graphic rendition test pattern:
+
+
+vanilla                                bold
+
+     underline                              bold underline
+
+blink                                  bold blink
+
+     underline blink                        bold underline blink
+
+negative                               bold negative
+
+     underline negative                     bold underline negative
+
+blink negative                         bold blink negative
+
+     underline blink negative               bold underline blink negative
+
+
+
+
+Dark background. Push <RETURN> |
+
+--
+cursor: (22,30)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0
+-- pens
+(3,39)-(3,42) fg=- bg=- ul=- us=none flags=bold
+(5,5)-(5,13) fg=- bg=- ul=- us=single flags=-
+(5,44)-(5,57) fg=- bg=- ul=- us=single flags=bold
+(7,0)-(7,4) fg=- bg=- ul=- us=none flags=blink
+(7,39)-(7,48) fg=- bg=- ul=- us=none flags=bold,blink
+(9,5)-(9,19) fg=- bg=- ul=- us=single flags=blink
+(9,44)-(9,63) fg=- bg=- ul=- us=single flags=bold,blink
+(11,0)-(11,7) fg=- bg=- ul=- us=none flags=inverse
+(11,39)-(11,51) fg=- bg=- ul=- us=none flags=bold,inverse
+(13,5)-(13,22) fg=- bg=- ul=- us=single flags=inverse
+(13,44)-(13,66) fg=- bg=- ul=- us=single flags=bold,inverse
+(15,0)-(15,13) fg=- bg=- ul=- us=none flags=blink,inverse
+(15,39)-(15,57) fg=- bg=- ul=- us=none flags=bold,blink,inverse
+(17,5)-(17,28) fg=- bg=- ul=- us=single flags=blink,inverse
+(17,44)-(17,72) fg=- bg=- ul=- us=single flags=bold,blink,inverse

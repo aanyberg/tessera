@@ -45,6 +45,7 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
+use tessera_grid::{Color, Style, UnderlineStyle};
 use tessera_term::{Request, Terminal};
 
 /// One step of a [`Script`].
@@ -299,6 +300,100 @@ pub fn render_state(term: &Terminal, requests: &[Request]) -> String {
     for line in (0..grid.scrollback_len()).filter_map(|i| grid.scrollback_line(i)) {
         let mark = if line.wrapped { "\\" } else { "" };
         let _ = writeln!(out, "  {:?}{mark}", line.text());
+    }
+    out
+}
+
+/// A colour in the canonical pen notation: `-`, `iN` or `#rrggbb`.
+#[allow(dead_code)] // Used by esctest.rs; print.rs and wide.rs include this module without the allow.
+pub fn color_text(color: Color) -> String {
+    match color {
+        Color::Default => "-".to_owned(),
+        Color::Indexed(n) => format!("i{n}"),
+        Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+    }
+}
+
+/// A style in the canonical pen notation of `tests/fixtures/sgr_spec.txt`:
+/// `fg=<c> bg=<c> ul=<c> us=<style> flags=<list>`, flags in a fixed order
+/// (`bold,dim,italic,blink,inverse,hidden,strike`) or `-` for none.
+///
+/// Flag bits the notation has no name for (none exist today) are printed
+/// as `?0x...`, so a stray bit can never pass as a clean pen. `tests/sgr.rs`
+/// has its own copy (it predates this one).
+#[allow(dead_code)] // Used by esctest.rs; print.rs and wide.rs include this module without the allow.
+pub fn pen_text(style: Style) -> String {
+    const NAMES: [(u16, &str); 7] = [
+        (Style::BOLD, "bold"),
+        (Style::DIM, "dim"),
+        (Style::ITALIC, "italic"),
+        (Style::BLINK, "blink"),
+        (Style::INVERSE, "inverse"),
+        (Style::HIDDEN, "hidden"),
+        (Style::STRIKETHROUGH, "strike"),
+    ];
+    let us = match style.underline_style() {
+        UnderlineStyle::None => "none",
+        UnderlineStyle::Single => "single",
+        UnderlineStyle::Double => "double",
+        UnderlineStyle::Curly => "curly",
+        UnderlineStyle::Dotted => "dotted",
+        UnderlineStyle::Dashed => "dashed",
+    };
+    let mut flags: Vec<String> = NAMES
+        .iter()
+        .filter(|(bit, _)| style.has(*bit))
+        .map(|(_, name)| (*name).to_owned())
+        .collect();
+    let known = NAMES
+        .iter()
+        .fold(Style::UNDERLINE_STYLE_MASK, |m, (b, _)| m | b);
+    if style.flags & !known != 0 {
+        flags.push(format!("?{:#x}", style.flags & !known));
+    }
+    let flags = if flags.is_empty() {
+        "-".to_owned()
+    } else {
+        flags.join(",")
+    };
+    format!(
+        "fg={} bg={} ul={} us={us} flags={flags}",
+        color_text(style.fg),
+        color_text(style.bg),
+        color_text(style.underline),
+    )
+}
+
+/// Renders the cell styles of the visible grid that differ from
+/// [`Style::default`], one line per run of equal styles within a row:
+/// `(row,col0)-(row,col1) <pen>` (0-based, inclusive, pen as [`pen_text`]),
+/// top to bottom, left to right. A grid with only default cells renders as
+/// `pens: default`.
+#[allow(dead_code)] // Used by esctest.rs; print.rs and wide.rs include this module without the allow.
+pub fn render_pens(term: &Terminal) -> String {
+    let mut out = String::new();
+    for (row, line) in (0u16..).zip(term.grid().visible_lines()) {
+        let mut col = 0;
+        while col < line.cells.len() {
+            let style = line.cells[col].style;
+            let run = line.cells[col..]
+                .iter()
+                .take_while(|cell| cell.style == style)
+                .count();
+            if style != Style::default() {
+                // Writing to a `String` cannot fail.
+                let _ = writeln!(
+                    out,
+                    "({row},{col})-({row},{}) {}",
+                    col + run - 1,
+                    pen_text(style)
+                );
+            }
+            col += run;
+        }
+    }
+    if out.is_empty() {
+        out.push_str("pens: default\n");
     }
     out
 }

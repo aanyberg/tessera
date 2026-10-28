@@ -1,0 +1,5289 @@
+# =============================================================================
+# tessera-term: esctest subset + vttest menu 2 screen 13  (issue #15, wave 5)
+# crates/tessera-term/tests/fixtures/esctest_spec.txt   (spec-researcher output)
+#
+# Same layout as csi_spec.txt (### ID / size / step / screen / cursor / pending_wrap / requests / scrollback), so
+# tests/spec/mod.rs `parse_fixture(text)` reads it unchanged. Extra keys, all ignored by that parser:
+#   source:       esctest file and function (E_* ids) or vttest function + capture (V2S13)
+#   cite:         URL(s)
+#   note:         what the esctest test does and what the row asserts
+#   chunk:        yes|no. NOT needed: all 126 cases run whole AND byte by byte in 0.06 s (debug build). Documentation only.
+#   attr:         (row,col0)-(row,col1) <pen>   0-based, inclusive; pen = sgr_spec.txt canonical text
+#                 (fg=<c> bg=<c> ul=<c> us=<style> flags=<list>). Only E_SGR_bold and V2S13 have it. Cells not listed
+#                 have the `attr_others:` pen. parse_fixture ignores these lines: esctest.rs must read them itself.
+#   flags:        free text
+# Lines starting `#>` are esctest tests that tessera-term cannot pass yet (NOT cases, never skipped tests); each names the
+# issue that will make it pass: #8 (DECSET/DECOM/SM), #80 (DECSTR), #93 (HPR/VPR), #94 (SCOSC/SCORC), #95 (SPA/EPA and
+# DEC protection), #96 (S7C1T/S8C1T, 8-bit C1), #97 (left/right margins DECLRMM/DECSLRM, DECSET 45 reverse wrap).
+#
+# HOW THE ROWS WERE PRODUCED  (tools/gen15.py, tools/model.py, tools/sec{1..4}.py, kept in the researcher scratch dir)
+#   - Byte streams are transcribed from esctest2 (https://github.com/ThomasDickey/esctest2, esctest/tests/*.py) through the
+#     helpers in esccmd.py, with esctest Point(x, y) turned into CUP row;col. V2S13 is the real vttest 2.7 (20251205) stream
+#     captured under a pty (wave 3 capture m2_13.bin).
+#   - Expected screens come from tools/model.py, an independent Python model of xterm (charproc.c/cursor.c/util.c), NOT from
+#     tessera-grid. EVERY esctest assertion (cursor via DSR 6, characters via DECRQCRA, including intermediate ones) was
+#     replayed on the model while generating: a mismatch aborts the generator. So each row equals what esctest asserts on xterm.
+#   - Conformance probe: the whole file was run through spec::parse_fixture + spec::check_case (whole and byte by byte) on
+#     main (e2fc473) in a scratch copy: 125 of 125 pass, the attr: lines match the real cell styles, and a corrupted copy of a
+#     row is detected. The same probe over the 8 rows the researcher kept pending failed 8 of 8 there; on 17c5cf3 one of them passes (#80 merged)
+#     and is live as E_DECRC_saveRestoreCursor_reset (126 cases now); the other 7 are in esctest_pending.txt.
+#
+# HOW esctest ASSERTIONS MAP TO THE FIXTURE
+#   esctest reads the cursor with DSR 6 (needs #10) and the screen with DECRQCRA checksums; tessera tests read the grid. So:
+#   GetCursorPosition() -> `cursor:` (and the `|` marker in `screen:`); AssertScreenCharsInRectEqual -> the `screen:` rows.
+#   Only the FINAL state is asserted by the fixture; esctest's intermediate asserts are replayed by the generator.
+#   Before every esctest test, esctest.py reset() puts the terminal in a known state; the fixture assumes the same on a fresh
+#   Terminal: size 25x80 (reset() does XTWINOPS 8;25;80, so 25 rows x 80 cols, NOT 24x80), tab stops at 9, 17, ... (HTS every
+#   8), DECAWM on, IRM and LNM off, no margins, cursor home, screen blank, pen default. empty() and blank() cells (NUL vs
+#   space) are not distinguished by tessera.
+#   vtLevel(4) tests are included (xterm and tessera are VT420+ in these areas); only the VT100-only ones are not special.
+#
+# ESCTEST QUIRKS KEPT VERBATIM
+#   - esccmd.HVP(row=..)/(col=..)/() send `ESC[..H` (final 'H'), not 'f' (esccmd.py l.671-683). Only HVP(Point) uses 'f'.
+#   - esccmd.SD sends final 'T' (CSI Ps T), SU sends 'S'. HPA is CSI ` (handled with CHA in csi.rs).
+#   - The 7-bit forms are used (ESC D/E/H/M); the *_8bit tests need S8C1T (ESC SP G) and are `#>`.
+#   - test_*_AfterNoWrappedInlines/AfterOneWrappedInline (CUB) depend on xterm's reverse-wrap patch level (>= 383).
+#
+# SOURCES
+#   esctest2           https://github.com/ThomasDickey/esctest2  (esctest/tests/{cup,cuu,cud,cuf,cub,cha,vpa,hpa,hpr,vpr,hvp,
+#                      cnl,cpl,ed,el,ech,ich,dch,il,dl,su,sd,rep,hts,tbc,cbt,cht,decstbm,ind,nel,ri,decaln,decrc,scorc,sgr,
+#                      save_restore_cursor}.py, esctest.py reset(), esccmd.py, escio.py). 196 tests in these files: 125 are cases
+#                      below, 71 are `#>` blocks (several tests may share one `#>` block; DECRC tests count once per class).
+#                      The original is https://github.com/gnachman/esctest; esctest2 is the maintained fork xterm is tested with.
+#   xterm ctlseqs      https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+#   xterm source       https://github.com/ThomasDickey/xterm-snapshots (charproc.c, cursor.c, util.c, tabs.c; as csi_spec.txt)
+#   vttest             https://invisible-island.net/vttest/ main.c tst_screen() (menu 2 screen 13)
+#
+# VTTEST MENU 1/2 SCREEN INVENTORY (real vttest 2.7 capture): menu 1 has SIX screens (m1_01..m1_06; m1_07 is the return to the
+#   main menu), menu 2 has FIFTEEN (m2_01..m2_15). Already ported (csi_spec.txt): m1 1,5,6; m2 1,2,12. Of the rest only
+#   menu 2 screen 13 (SGR pattern) needs no DECSET: it is the one vttest case below. Menu 1 screens 2,3,4 and menu 2 screens
+#   3-11, 14, 15 need DECCOLM / DECOM / DECSCNM / SCS (#8) and are already `#### DEFERRED` blocks in csi_spec.txt.
+#   There are no menu 1 screens 7-9.
+# =============================================================================
+
+# ---------------------------------------------------------------------------- CUP (cup.py)
+
+### E_CUP_defaultParams
+size: 25x80
+step: feed \x1b[3;6H
+step: feed \x1b[H
+source: esctest2 esctest/tests/cup.py test_CUP_DefaultParams
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cup.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: CUP(Point(6,3)) = ESC[3;6H then CUP() = ESC[H -> 1,1. esctest asserts the cursor with DSR 6; here the `cursor:` line is the final position (1,1); the 6,3 step is checked by the generator.
+chunk: no
+screen:
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CUP_rowOnly
+size: 25x80
+step: feed \x1b[3;6H
+step: feed \x1b[2H
+source: esctest2 esctest/tests/cup.py test_CUP_RowOnly
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cup.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: CUP(row=2) = ESC[2H: default column 1.
+chunk: no
+screen:
+>
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (1,0)   # 1-based row 2 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CUP_columnOnly
+size: 25x80
+step: feed \x1b[3;6H
+step: feed \x1b[;2H
+source: esctest2 esctest/tests/cup.py test_CUP_ColumnOnly
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cup.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: CUP(col=2): esctest passes row='' so the bytes are ESC[;2H: default row 1, column 2.
+chunk: no
+screen:
+>  |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,1)   # 1-based row 1 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CUP_zeroIsTreatedAsOne
+size: 25x80
+step: feed \x1b[3;6H
+step: feed \x1b[0;0H
+source: esctest2 esctest/tests/cup.py test_CUP_ZeroIsTreatedAsOne
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cup.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[0;0H -> 1,1 (xterm use_default_value: <=0 means default).
+chunk: no
+screen:
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CUP_outOfBoundsParams
+size: 25x80
+step: feed \x1b[35;90H
+source: esctest2 esctest/tests/cup.py test_CUP_OutOfBoundsParams
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cup.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: Size 25x80: ESC[35;90H clamps to the bottom-right cell (25,80).
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>                                                                                |
+cursor: (24,79)   # 1-based row 25 col 80
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_CUP_respectsOriginMode -> #8 + #97   (esctest cup.py test_CUP_RespectsOriginMode, vtLevel 4)
+#>    needs: DECSET 6 (DECOM) plus DECLRMM (DECSET 69) and DECSLRM (#97)
+#>    bytes: ESC[6;11r ESC[?69h ESC[5;10s ESC[9;7H ESC[?6h ESC[1;1H X ESC[?6l ESC[r ESC[?69l ; expect X at row 6 col 5
+
+# ---------------------------------------------------------------------------- CUU (cuu.py)
+
+### E_CUU_defaultParam
+size: 25x80
+step: feed \x1b[3;5H
+step: feed \x1b[A
+source: esctest2 esctest/tests/cuu.py test_CUU_DefaultParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cuu.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[A moves up 1.
+chunk: no
+screen:
+>
+>     |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (1,4)   # 1-based row 2 col 5
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CUU_explicitParam
+size: 25x80
+step: feed \x1b[3;1H
+step: feed \x1b[2A
+source: esctest2 esctest/tests/cuu.py test_CUU_ExplicitParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cuu.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[2A.
+chunk: no
+screen:
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CUU_stopsAtTopLine
+size: 25x80
+step: feed \x1b[3;1H
+step: feed \x1b[99A
+source: esctest2 esctest/tests/cuu.py test_CUU_StopsAtTopLine
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cuu.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[99A stops at row 1.
+chunk: no
+screen:
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CUU_stopsAtTopLineWhenBegunAboveScrollRegion
+size: 25x80
+step: feed \x1b[4;5r
+step: feed \x1b[3;1H
+step: feed \x1b[99A
+source: esctest2 esctest/tests/cuu.py test_CUU_StopsAtTopLineWhenBegunAboveScrollRegion
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cuu.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: Region 4..5, cursor on row 3 (above it): CUU goes to the top of the screen (xterm cursor.c CursorUp: stop at top margin only when starting inside or below it).
+chunk: no
+screen:
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CUU_stopsAtTopMarginInScrollRegion
+size: 25x80
+step: feed \x1b[2;4r
+step: feed \x1b[3;1H
+step: feed \x1b[99A
+source: esctest2 esctest/tests/cuu.py test_CUU_StopsAtTopMarginInScrollRegion
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cuu.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: Region 2..4, cursor on row 3: CUU stops at row 2.
+chunk: no
+screen:
+>
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (1,0)   # 1-based row 2 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+# ---------------------------------------------------------------------------- CUD (cud.py)
+
+### E_CUD_defaultParam
+size: 25x80
+step: feed \x1b[3;5H
+step: feed \x1b[B
+source: esctest2 esctest/tests/cud.py test_CUD_DefaultParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cud.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[B moves down 1.
+chunk: no
+screen:
+>
+>
+>
+>     |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (3,4)   # 1-based row 4 col 5
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CUD_explicitParam
+size: 25x80
+step: feed \x1b[3;1H
+step: feed \x1b[2B
+source: esctest2 esctest/tests/cud.py test_CUD_ExplicitParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cud.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[2B.
+chunk: no
+screen:
+>
+>
+>
+>
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (4,0)   # 1-based row 5 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CUD_stopsAtBottomLine
+size: 25x80
+step: feed \x1b[3;1H
+step: feed \x1b[25B
+source: esctest2 esctest/tests/cud.py test_CUD_StopsAtBottomLine
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cud.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[25B from row 3 stops at row 25.
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+> |
+cursor: (24,0)   # 1-based row 25 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CUD_stopsAtBottomLineWhenBegunBelowScrollRegion
+size: 25x80
+step: feed \x1b[4;5r
+step: feed \x1b[6;1H
+step: feed \x1b[25B
+source: esctest2 esctest/tests/cud.py test_CUD_StopsAtBottomLineWhenBegunBelowScrollRegion
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cud.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: Region 4..5, cursor on row 6 (below): CUD goes to the bottom of the screen.
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+> |
+cursor: (24,0)   # 1-based row 25 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CUD_stopsAtBottomMarginInScrollRegion
+size: 25x80
+step: feed \x1b[2;4r
+step: feed \x1b[3;1H
+step: feed \x1b[99B
+source: esctest2 esctest/tests/cud.py test_CUD_StopsAtBottomMarginInScrollRegion
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cud.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: Region 2..4, cursor on row 3: CUD stops at row 4.
+chunk: no
+screen:
+>
+>
+>
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (3,0)   # 1-based row 4 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+# ---------------------------------------------------------------------------- CUF (cuf.py)
+
+### E_CUF_defaultParam
+size: 25x80
+step: feed \x1b[3;5H
+step: feed \x1b[C
+source: esctest2 esctest/tests/cuf.py test_CUF_DefaultParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cuf.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[C moves right 1.
+chunk: no
+screen:
+>
+>
+>      |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (2,5)   # 1-based row 3 col 6
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CUF_explicitParam
+size: 25x80
+step: feed \x1b[2;1H
+step: feed \x1b[2C
+source: esctest2 esctest/tests/cuf.py test_CUF_ExplicitParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cuf.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[2C.
+chunk: no
+screen:
+>
+>   |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (1,2)   # 1-based row 2 col 3
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CUF_stopsAtRightSide
+size: 25x80
+step: feed \x1b[3;1H
+step: feed \x1b[80C
+source: esctest2 esctest/tests/cuf.py test_CUF_StopsAtRightSide
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cuf.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[80C from col 1 stops at col 80, no pending wrap.
+chunk: no
+screen:
+>
+>
+>                                                                                |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (2,79)   # 1-based row 3 col 80
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_CUF_stopsAtRightEdgeWhenBegunRightOfScrollRegion, E_CUF_stopsAtRightMarginInScrollRegion -> #97
+#>    (cuf.py, vtLevel 4) need DECLRMM (DECSET 69) + DECSLRM 5;10
+
+# ---------------------------------------------------------------------------- CUB (cub.py)
+
+### E_CUB_defaultParam
+size: 25x80
+step: feed \x1b[3;5H
+step: feed \x1b[D
+source: esctest2 esctest/tests/cub.py test_CUB_DefaultParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cub.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[D moves left 1.
+chunk: no
+screen:
+>
+>
+>    |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (2,3)   # 1-based row 3 col 4
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CUB_explicitParam
+size: 25x80
+step: feed \x1b[4;5H
+step: feed \x1b[2D
+source: esctest2 esctest/tests/cub.py test_CUB_ExplicitParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cub.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[2D.
+chunk: no
+screen:
+>
+>
+>
+>   |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (3,2)   # 1-based row 4 col 3
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CUB_stopsAtLeftEdge
+size: 25x80
+step: feed \x1b[3;5H
+step: feed \x1b[99D
+source: esctest2 esctest/tests/cub.py test_CUB_StopsAtLeftEdge
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cub.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[99D stops at column 1 (no reverse wrap: DECSET 45 is off by default).
+chunk: no
+screen:
+>
+>
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (2,0)   # 1-based row 3 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_CUB_stopsAtLeftEdgeWhenBegunLeftOfScrollRegion, E_CUB_stopsAtLeftMarginInScrollRegion -> #97 (DECLRMM + DECSLRM)
+#> E_CUB_afterNoWrappedInlines, E_CUB_afterOneWrappedInline -> #97 (cub.py; DECSET 45 XTREVWRAP, plus DECSET 7 from #8;
+#>    expected values depend on xterm's reverse-wrap patch level: escargs.xterm_reverse_wrap >= 383 -> (1,4)/(1,6), else (5,3)/(9,3);
+#>    tessera follows >= 383 (lead decision, wave 5): cursor (1,4) and (1,6))
+
+# ---------------------------------------------------------------------------- CHA (cha.py)
+
+### E_CHA_defaultParam
+size: 25x80
+step: feed \x1b[3;5H
+step: feed \x1b[G
+source: esctest2 esctest/tests/cha.py test_CHA_DefaultParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cha.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[G -> column 1.
+chunk: no
+screen:
+>
+>
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (2,0)   # 1-based row 3 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CHA_explicitParam
+size: 25x80
+step: feed \x1b[3;5H
+step: feed \x1b[10G
+source: esctest2 esctest/tests/cha.py test_CHA_ExplicitParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cha.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[10G.
+chunk: no
+screen:
+>
+>
+>          |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (2,9)   # 1-based row 3 col 10
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CHA_outOfBoundsLarge
+size: 25x80
+step: feed \x1b[3;5H
+step: feed \x1b[9999G
+source: esctest2 esctest/tests/cha.py test_CHA_OutOfBoundsLarge
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cha.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[9999G clamps to column 80.
+chunk: no
+screen:
+>
+>
+>                                                                                |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (2,79)   # 1-based row 3 col 80
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CHA_zeroParam
+size: 25x80
+step: feed \x1b[3;5H
+step: feed \x1b[0G
+source: esctest2 esctest/tests/cha.py test_CHA_ZeroParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cha.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[0G -> column 1.
+chunk: no
+screen:
+>
+>
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (2,0)   # 1-based row 3 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_CHA_ignoresScrollRegion, E_CHA_respectsOriginMode -> #97 (cha.py, vtLevel 4): DECLRMM/DECSLRM (+ DECOM from #8 for the second)
+
+# ---------------------------------------------------------------------------- CNL (cnl.py)
+
+### E_CNL_defaultParam
+size: 25x80
+step: feed \x1b[3;5H
+step: feed \x1b[E
+source: esctest2 esctest/tests/cnl.py test_CNL_DefaultParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cnl.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[E: down 1, column 1.
+chunk: no
+screen:
+>
+>
+>
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (3,0)   # 1-based row 4 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CNL_explicitParam
+size: 25x80
+step: feed \x1b[3;6H
+step: feed \x1b[2E
+source: esctest2 esctest/tests/cnl.py test_CNL_ExplicitParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cnl.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[2E.
+chunk: no
+screen:
+>
+>
+>
+>
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (4,0)   # 1-based row 5 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CNL_stopsAtBottomLine
+size: 25x80
+step: feed \x1b[3;6H
+step: feed \x1b[25E
+source: esctest2 esctest/tests/cnl.py test_CNL_StopsAtBottomLine
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cnl.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[25E from row 3 stops at row 25, column 1.
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+> |
+cursor: (24,0)   # 1-based row 25 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_CNL_stopsAtBottomLineWhenBegunBelowScrollRegion, E_CNL_stopsAtBottomMarginInScrollRegion -> #97 (cnl.py, vtLevel 4): both set DECLRMM + DECSLRM 5;10 and
+#>    expect column 5 (the left margin), not column 1. Without left/right margins the row logic is covered by E_CUD_* and E_CNL_stopsAtBottomLine.
+
+# ---------------------------------------------------------------------------- CPL (cpl.py)
+
+### E_CPL_defaultParam
+size: 25x80
+step: feed \x1b[3;5H
+step: feed \x1b[F
+source: esctest2 esctest/tests/cpl.py test_CPL_DefaultParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cpl.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[F: up 1, column 1.
+chunk: no
+screen:
+>
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (1,0)   # 1-based row 2 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CPL_explicitParam
+size: 25x80
+step: feed \x1b[5;6H
+step: feed \x1b[2F
+source: esctest2 esctest/tests/cpl.py test_CPL_ExplicitParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cpl.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[2F.
+chunk: no
+screen:
+>
+>
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (2,0)   # 1-based row 3 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CPL_stopsAtTopLine
+size: 25x80
+step: feed \x1b[3;6H
+step: feed \x1b[25F
+source: esctest2 esctest/tests/cpl.py test_CPL_StopsAtTopLine
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cpl.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[25F from row 3 stops at row 1.
+chunk: no
+screen:
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_CPL_stopsAtTopLineWhenBegunAboveScrollRegion, E_CPL_stopsAtTopMarginInScrollRegion -> #97 (cpl.py, vtLevel 4): DECLRMM + DECSLRM 5;10, expect column 5
+
+# ---------------------------------------------------------------------------- VPA (vpa.py)
+
+### E_VPA_defaultParams
+size: 25x80
+step: feed \x1b[6d
+step: feed \x1b[d
+source: esctest2 esctest/tests/vpa.py test_VPA_DefaultParams
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/vpa.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[6d then ESC[d -> row 1.
+chunk: no
+screen:
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_VPA_stopsAtBottomEdge
+size: 25x80
+step: feed \x1b[5;6H
+step: feed \x1b[35d
+source: esctest2 esctest/tests/vpa.py test_VPA_StopsAtBottomEdge
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/vpa.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[35d clamps to row 25, column kept.
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>      |
+cursor: (24,5)   # 1-based row 25 col 6
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_VPA_doesNotChangeColumn
+size: 25x80
+step: feed \x1b[5;6H
+step: feed \x1b[2d
+source: esctest2 esctest/tests/vpa.py test_VPA_DoesNotChangeColumn
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/vpa.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[2d keeps column 6.
+chunk: no
+screen:
+>
+>      |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (1,5)   # 1-based row 2 col 6
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_VPA_ignoresOriginMode -> #8 + #97 (vpa.py, vtLevel 4): DECOM + DECLRMM
+
+# ---------------------------------------------------------------------------- HPA (hpa.py)  [CSI `]
+
+### E_HPA_defaultParams
+size: 25x80
+step: feed \x1b[6`
+step: feed \x1b[`
+source: esctest2 esctest/tests/hpa.py test_HPA_DefaultParams
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/hpa.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[6` then ESC[` -> column 1. HPA (CSI Pm `, ctlseqs "Character Position Absolute") moves to an absolute column like CHA.
+chunk: no
+screen:
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_HPA_stopsAtRightEdge
+size: 25x80
+step: feed \x1b[6;5H
+step: feed \x1b[90`
+source: esctest2 esctest/tests/hpa.py test_HPA_StopsAtRightEdge
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/hpa.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[90` clamps to column 80.
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>                                                                                |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (5,79)   # 1-based row 6 col 80
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_HPA_doesNotChangeRow
+size: 25x80
+step: feed \x1b[6;5H
+step: feed \x1b[2`
+source: esctest2 esctest/tests/hpa.py test_HPA_DoesNotChangeRow
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/hpa.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[2` keeps row 6.
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>  |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (5,1)   # 1-based row 6 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_HPA_ignoresOriginMode -> #8 + #97 (hpa.py, vtLevel 4): DECOM + DECLRMM + DECSLRM 5;10
+#> E_HPR_defaultParams, E_HPR_stopsAtRightEdge, E_HPR_doesNotChangeRow  (hpr.py, CSI Pn a)  -> #93: tessera-term csi.rs has no 'a' arm (HPR)
+#>    bytes/expect: ESC[6;1H ESC[a -> col 7; ESC[6;5H ESC[90a -> col 80 row 6; ESC[6;5H ESC[2a -> col 7 row 6
+#> E_VPR_defaultParams, E_VPR_stopsAtBottomEdge, E_VPR_doesNotChangeColumn  (vpr.py, CSI Pn e)  -> #93: no 'e' arm (VPR)
+#>    bytes/expect: ESC[6;1H ESC[e -> row 7; ESC[6;5H ESC[35e -> row 25 col 5; ESC[6;5H ESC[2e -> row 8 col 5
+#> E_HPR_ignoresOriginMode, E_VPR_ignoresOriginMode -> #8 + #93 + #97 (DECOM, HPR/VPR, DECLRMM)
+
+# ---------------------------------------------------------------------------- HVP (hvp.py)  [CSI f; esctest bug: the row/col-only forms send 'H']
+
+### E_HVP_defaultParams
+size: 25x80
+step: feed \x1b[3;6f
+step: feed \x1b[H
+source: esctest2 esctest/tests/hvp.py test_HVP_DefaultParams
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/hvp.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: HVP(Point(6,3)) = ESC[3;6f. HVP() sends ESC[H, not f: esccmd.HVP uses final='H' unless a Point is given (esccmd.py l.671-683), so the second half tests CUP again. Kept verbatim.
+chunk: no
+screen:
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_HVP_rowOnly
+size: 25x80
+step: feed \x1b[3;6f
+step: feed \x1b[2H
+source: esctest2 esctest/tests/hvp.py test_HVP_RowOnly
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/hvp.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: HVP(row=2) sends ESC[2H (esctest quirk, see E_HVP_defaultParams).
+chunk: no
+screen:
+>
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (1,0)   # 1-based row 2 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_HVP_columnOnly
+size: 25x80
+step: feed \x1b[3;6f
+step: feed \x1b[;2H
+source: esctest2 esctest/tests/hvp.py test_HVP_ColumnOnly
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/hvp.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: HVP(col=2) sends ESC[;2H.
+chunk: no
+screen:
+>  |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,1)   # 1-based row 1 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_HVP_zeroIsTreatedAsOne
+size: 25x80
+step: feed \x1b[3;6f
+step: feed \x1b[0;0H
+source: esctest2 esctest/tests/hvp.py test_HVP_ZeroIsTreatedAsOne
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/hvp.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: HVP(col=0,row=0) sends ESC[0;0H.
+chunk: no
+screen:
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_HVP_outOfBoundsParams
+size: 25x80
+step: feed \x1b[35;90f
+source: esctest2 esctest/tests/hvp.py test_HVP_OutOfBoundsParams
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/hvp.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[35;90f clamps to (25,80). This one really uses 'f'.
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>                                                                                |
+cursor: (24,79)   # 1-based row 25 col 80
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_HVP_respectsOriginMode -> #8 + #97 (hvp.py, vtLevel 4): DECOM + DECLRMM
+
+# ---------------------------------------------------------------------------- CBT / CHT (cbt.py, cht.py)  default tab stops every 8 columns: 9, 17, 25, ...
+
+### E_CBT_oneTabStopByDefault
+size: 25x80
+step: feed \x1b[1;17H
+step: feed \x1b[Z
+source: esctest2 esctest/tests/cbt.py test_CBT_OneTabStopByDefault
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cbt.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[Z from column 17 -> 9.
+chunk: yes
+screen:
+>         |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,8)   # 1-based row 1 col 9
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CBT_explicitParameter
+size: 25x80
+step: feed \x1b[1;25H
+step: feed \x1b[2Z
+source: esctest2 esctest/tests/cbt.py test_CBT_ExplicitParameter
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cbt.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[2Z from column 25 -> 9.
+chunk: no
+screen:
+>         |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,8)   # 1-based row 1 col 9
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CBT_stopsAtLeftEdge
+size: 25x80
+step: feed \x1b[2;25H
+step: feed \x1b[5Z
+source: esctest2 esctest/tests/cbt.py test_CBT_StopsAtLeftEdge
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cbt.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[5Z from column 25 stops at column 1 (3 stops left, then the edge).
+chunk: no
+screen:
+>
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (1,0)   # 1-based row 2 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CHT_oneTabStopByDefault
+size: 25x80
+step: feed \x1b[I
+source: esctest2 esctest/tests/cht.py test_CHT_OneTabStopByDefault
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cht.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[I from column 1 -> 9.
+chunk: no
+screen:
+>         |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,8)   # 1-based row 1 col 9
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CHT_explicitParameter
+size: 25x80
+step: feed \x1b[2I
+source: esctest2 esctest/tests/cht.py test_CHT_ExplicitParameter
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cht.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[2I from column 1 -> 17.
+chunk: no
+screen:
+>                 |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,16)   # 1-based row 1 col 17
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_CBT_ignoresRegion, E_CHT_ignoresScrollingRegion -> #97 (cbt.py/cht.py, vtLevel 4): DECLRMM + DECSLRM 5;30. CHT expects the tab to stop at the right margin (30).
+
+# ---------------------------------------------------------------------------- TBC / HTS (tbc.py, hts.py)
+
+### E_TBC_default
+size: 25x80
+step: feed \t
+step: feed \x1b[g
+step: feed \x1b[1;1H
+step: feed \t
+source: esctest2 esctest/tests/tbc.py test_TBC_Default
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/tbc.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: HT to 9; ESC[g (no param = 0) clears the stop at the cursor (9); home; HT now lands on 17. TBC with no parameter is Ps = 0, clear the stop at the cursor (ctlseqs).
+chunk: no
+screen:
+>                 |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,16)   # 1-based row 1 col 17
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_TBC_0
+size: 25x80
+step: feed \t
+step: feed \x1b[0g
+step: feed \x1b[1;1H
+step: feed \t
+source: esctest2 esctest/tests/tbc.py test_TBC_0
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/tbc.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: As E_TBC_default with an explicit ESC[0g.
+chunk: no
+screen:
+>                 |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,16)   # 1-based row 1 col 17
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_TBC_3
+size: 25x80
+step: feed \x1b[3g
+step: feed \x1b[1;30H
+step: feed \x1bH
+step: feed \x1b[1;1H
+step: feed \t
+source: esctest2 esctest/tests/tbc.py test_TBC_3
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/tbc.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[3g clears all stops; HTS at column 30; HT from column 1 -> 30.
+chunk: yes
+screen:
+>                              |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,29)   # 1-based row 1 col 30
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_TBC_noOp
+size: 25x80
+step: feed \x1b[1;10H
+step: feed \x1b[0g
+step: feed \x1b[1;1H
+step: feed \t
+step: feed \t
+source: esctest2 esctest/tests/tbc.py test_TBC_NoOp
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/tbc.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: Clearing where no stop exists changes nothing.
+chunk: no
+screen:
+>                 |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,16)   # 1-based row 1 col 17
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_HTS_basic
+size: 25x80
+step: feed \x1b[3g
+step: feed \x1b[1;20H
+step: feed \x1bH
+step: feed \x1b[1;1H
+step: feed \t
+source: esctest2 esctest/tests/hts.py test_HTS_Basic
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/hts.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[3g, ESC H at column 20, HT -> 20.
+chunk: no
+screen:
+>                    |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,19)   # 1-based row 1 col 20
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_HTS_8bit -> #96 (hts.py, optionRequired xterm C1 controls): S8C1T = ESC SP G then C1 0x88 HTS; tessera-term does not
+#>    handle ESC SP G or C1 controls (control.rs has no 0x80-0x9f arms; the parser decodes UTF-8 first). Same for E_IND_8bit, E_RI_8bit, E_NEL_8bit.
+
+# ---------------------------------------------------------------------------- ED (ed.py)  prepare(): a / bcd / e at rows 1,3,5, cursor on the 'c' (row 3, col 2)
+
+### E_ED_default
+size: 25x80
+step: feed \x1b[1;1Ha\x1b[3;1Hbcd\x1b[5;1He\x1b[3;2H
+step: feed \x1b[J
+source: esctest2 esctest/tests/ed.py test_ED_Default
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ed.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[J = ED 0: from the cursor through the end of the display (cursor cell included).
+chunk: no
+screen:
+>a
+>
+>b |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (2,1)   # 1-based row 3 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_ED_0
+size: 25x80
+step: feed \x1b[1;1Ha\x1b[3;1Hbcd\x1b[5;1He\x1b[3;2H
+step: feed \x1b[0J
+source: esctest2 esctest/tests/ed.py test_ED_0
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ed.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[0J.
+chunk: no
+screen:
+>a
+>
+>b |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (2,1)   # 1-based row 3 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_ED_1
+size: 25x80
+step: feed \x1b[1;1Ha\x1b[3;1Hbcd\x1b[5;1He\x1b[3;2H
+step: feed \x1b[1J
+source: esctest2 esctest/tests/ed.py test_ED_1
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ed.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[1J: start of display through the cursor (cursor cell included): 'bc' gone, 'd' and 'e' kept.
+chunk: no
+screen:
+>
+>
+>  |d
+>
+>e
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (2,1)   # 1-based row 3 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_ED_2
+size: 25x80
+step: feed \x1b[1;1Ha\x1b[3;1Hbcd\x1b[5;1He\x1b[3;2H
+step: feed \x1b[2J
+source: esctest2 esctest/tests/ed.py test_ED_2
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ed.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[2J: whole screen; cursor does not move (stays at 3,2).
+chunk: no
+screen:
+>
+>
+>  |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (2,1)   # 1-based row 3 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_ED_3
+size: 25x80
+step: feed \x1b[1;1Ha\x1b[3;1Hbcd\x1b[5;1He\x1b[3;2H
+step: feed \x1b[3J
+source: esctest2 esctest/tests/ed.py test_ED_3
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ed.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[3J leaves the screen untouched: ctlseqs defines Ps = 3 as "Erase Saved Lines", which touches only the history.
+chunk: no
+screen:
+>a
+>
+>bc|d
+>
+>e
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (2,1)   # 1-based row 3 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_ED_doesNotRespectDECProtection
+size: 25x80
+step: feed ab\x1b[1"qc\x1b[0"q\x1b[1;1H\x1b[0J
+source: esctest2 esctest/tests/ed.py test_ED_doesNotRespectDECProtection
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ed.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: a b, DECSCA 1 (ESC[1"q), c, DECSCA 0, home, ED 0: ED ignores DECSCA so all three go. tessera-term ignores CSI with intermediates, so this passes trivially (nothing is protected).
+chunk: no
+screen:
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_ED_0_withScrollRegion, E_ED_1_withScrollRegion, E_ED_2_withScrollRegion -> #97 (ed.py, vtLevel 4): DECLRMM (ESC[?69h) + DECSLRM 2;4 + DECSTBM 2;3;
+#>    expected: region ignored, same result as E_ED_0/1/2 on the 5x3 'abcde/fghij/klmno' prepare_wide screen
+#> E_ED_respectsISOProtection -> #95 (ed.py): SPA/EPA = ESC V / ESC W; 'ab' + SPA + 'c' + EPA, home, ED 0 -> only 'c' survives.
+#>    Same for E_EL_respectsISOProtection and E_ECH_respectsISOProtection. xterm honours ISO protection; iTerm2 marks it a knownBug.
+
+# ---------------------------------------------------------------------------- EL (el.py)  prepare(): 'abcdefghij' on row 1, cursor on the 'e' (col 5)
+
+### E_EL_default
+size: 25x80
+step: feed \x1b[1;1Habcdefghij\x1b[1;5H
+step: feed \x1b[K
+source: esctest2 esctest/tests/el.py test_EL_Default
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/el.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[K = EL 0: cursor cell through end of line.
+chunk: no
+screen:
+>abcd |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,4)   # 1-based row 1 col 5
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_EL_0
+size: 25x80
+step: feed \x1b[1;1Habcdefghij\x1b[1;5H
+step: feed \x1b[0K
+source: esctest2 esctest/tests/el.py test_EL_0
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/el.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[0K.
+chunk: no
+screen:
+>abcd |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,4)   # 1-based row 1 col 5
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_EL_1
+size: 25x80
+step: feed \x1b[1;1Habcdefghij\x1b[1;5H
+step: feed \x1b[1K
+source: esctest2 esctest/tests/el.py test_EL_1
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/el.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[1K: start of line through the cursor cell.
+chunk: no
+screen:
+>     |fghij
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,4)   # 1-based row 1 col 5
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_EL_2
+size: 25x80
+step: feed \x1b[1;1Habcdefghij\x1b[1;5H
+step: feed \x1b[2K
+source: esctest2 esctest/tests/el.py test_EL_2
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/el.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[2K: whole line.
+chunk: no
+screen:
+>     |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,4)   # 1-based row 1 col 5
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_EL_doesNotRespectDECProtection
+size: 25x80
+step: feed ab\x1b[1"qc\x1b[0"q\x1b[1;1H\x1b[2K
+source: esctest2 esctest/tests/el.py test_EL_doesNotRespectDECProtection
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/el.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: As E_ED_doesNotRespectDECProtection with EL 2 (the esctest docstring says 'respects' but asserts all erased).
+chunk: no
+screen:
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_EL_ignoresScrollRegion -> #97 (el.py, vtLevel 4): DECLRMM + DECSLRM 2;4, EL 2 on row 1 still erases all 10 columns
+
+# ---------------------------------------------------------------------------- ECH (ech.py)
+
+### E_ECH_defaultParam
+size: 25x80
+step: feed abc
+step: feed \x1b[1;1H
+step: feed \x1b[X
+source: esctest2 esctest/tests/ech.py test_ECH_DefaultParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ech.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[X erases 1 char at the cursor; the cursor does not move.
+chunk: no
+screen:
+> |bc
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_ECH_explicitParam
+size: 25x80
+step: feed abc
+step: feed \x1b[1;1H
+step: feed \x1b[2X
+source: esctest2 esctest/tests/ech.py test_ECH_ExplicitParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ech.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[2X.
+chunk: no
+screen:
+> | c
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_ECH_doesNotRespectDECProtection
+size: 25x80
+step: feed ab\x1b[1"qc\x1b[0"q\x1b[1;1H\x1b[3X
+source: esctest2 esctest/tests/ech.py test_ECH_doesNotRespectDECPRotection
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ech.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ECH 3 erases all three; DECSCA ignored by tessera-term (passes trivially).
+chunk: no
+screen:
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_ECH_ignoresScrollRegion, E_ECH_outsideScrollRegion -> #97 (ech.py): DECLRMM + DECSLRM 2;4 ; expect 'ab    g' and '    efg'
+
+# ---------------------------------------------------------------------------- ICH (ich.py)
+
+### E_ICH_defaultParam
+size: 25x80
+step: feed \x1b[1;1H
+step: feed abcdefg
+step: feed \x1b[1;2H
+step: feed \x1b[@
+source: esctest2 esctest/tests/ich.py test_ICH_DefaultParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ich.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[@ inserts 1 blank at the cursor (col 2); the cursor stays.
+chunk: no
+screen:
+>a |bcdefg
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,1)   # 1-based row 1 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_ICH_explicitParam
+size: 25x80
+step: feed \x1b[1;1H
+step: feed abcdefg
+step: feed \x1b[1;2H
+step: feed \x1b[2@
+source: esctest2 esctest/tests/ich.py test_ICH_ExplicitParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ich.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[2@.
+chunk: no
+screen:
+>a | bcdefg
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,1)   # 1-based row 1 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_ICH_scrollOffRightEdge
+size: 25x80
+step: feed \x1b[1;74H
+step: feed abcdefg
+step: feed \x1b[1;75H
+step: feed \x1b[@
+source: esctest2 esctest/tests/ich.py test_ICH_ScrollOffRightEdge
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ich.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: 'abcdefg' ends at column 80 (leaves a wrap pending), CUP clears it, ESC[@ at column 75 pushes 'g' off the edge: cols 74..80 = 'a bcdef'. Row 2 stays empty (no wrap).
+chunk: yes
+screen:
+>                                                                         a |bcdef
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,74)   # 1-based row 1 col 75
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_ICH_scrollEntirelyOffRightEdge
+size: 25x80
+step: feed \x1b[1;1H
+step: feed xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+step: feed \x1b[1;1H
+step: feed \x1b[80@
+source: esctest2 esctest/tests/ich.py test_ICH_ScrollEntirelyOffRightEdge
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ich.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: 80 x's, home, ESC[80@: the row is all blank; row 2 empty.
+chunk: no
+screen:
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_ICH_isNoOpWhenCursorBeginsOutsideScrollRegion, E_ICH_scrollOffRightMarginInScrollRegion -> #97 (ich.py): DECLRMM + DECSLRM 2;5
+#>    expected 'abcdefg' unchanged / 'ab cdfg'
+
+# ---------------------------------------------------------------------------- DCH (dch.py)
+
+### E_DCH_defaultParam
+size: 25x80
+step: feed abcd
+step: feed \x1b[1;2H
+step: feed \x1b[P
+source: esctest2 esctest/tests/dch.py test_DCH_DefaultParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/dch.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[P deletes 1 at column 2; the tail shifts left.
+chunk: no
+screen:
+>ac|d
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,1)   # 1-based row 1 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_DCH_explicitParam
+size: 25x80
+step: feed abcd
+step: feed \x1b[1;2H
+step: feed \x1b[2P
+source: esctest2 esctest/tests/dch.py test_DCH_ExplicitParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/dch.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[2P.
+chunk: no
+screen:
+>ad|
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,1)   # 1-based row 1 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_DCH_worksOutsideTopBottomMargin
+size: 25x80
+step: feed abcde
+step: feed \x1b[2;3r
+step: feed \x1b[1;1H
+step: feed \x1b[99P
+step: feed \x1b[r
+source: esctest2 esctest/tests/dch.py test_DCH_WorksOutsideTopBottomMargin
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/dch.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: DCH is not limited by DECSTBM (xterm patch 316). DECSTBM homes the cursor, CUP 1,1, ESC[99P deletes the whole row. Note 'abcde' was written BEFORE DECSTBM so it sits at row 1 col 1..5 and the cursor is at col 6 when DECSTBM runs.
+chunk: no
+screen:
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_DCH_respectsMargins, E_DCH_deleteAllWithMargins, E_DCH_doesNothingOutsideLeftRightMargin -> #97 (dch.py): DECLRMM + DECSLRM 2;4
+#>    expected 'abd e' / 'ab  e' / 'abcde'
+
+# ---------------------------------------------------------------------------- IL (il.py)
+
+### E_IL_defaultParam
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[3;2H
+step: feed \x1b[L
+source: esctest2 esctest/tests/il.py test_IL_DefaultParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/il.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: Cursor on row 3: ESC[L inserts a blank line at row 3 (klmno moves to row 4) and moves the cursor to column 1 (xterm util.c InsertLine: set_cur_col(screen, ScrnLeftMargin(xw)); DeleteLine does the same).
+chunk: no
+screen:
+>abcde
+>fghij
+> |
+>klmno
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (2,0)   # 1-based row 3 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_IL_explicitParam
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[3;2H
+step: feed \x1b[2L
+source: esctest2 esctest/tests/il.py test_IL_ExplicitParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/il.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[2L.
+chunk: no
+screen:
+>abcde
+>fghij
+> |
+>
+>klmno
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (2,0)   # 1-based row 3 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_IL_scrollsOffBottom
+size: 25x80
+step: feed \x1b[1;1H0001\x1b[2;1H0002\x1b[3;1H0003\x1b[4;1H0004\x1b[5;1H0005\x1b[6;1H0006\x1b[7;1H0007\x1b[8;1H0008\x1b[9;1H0009\x1b[10;1H0010
+step: feed \x1b[11;1H0011\x1b[12;1H0012\x1b[13;1H0013\x1b[14;1H0014\x1b[15;1H0015\x1b[16;1H0016\x1b[17;1H0017\x1b[18;1H0018\x1b[19;1H0019\x1b[20;1H0020
+step: feed \x1b[21;1H0021\x1b[22;1H0022\x1b[23;1H0023\x1b[24;1H0024\x1b[25;1H0025
+step: feed \x1b[2;1H
+step: feed \x1b[L
+source: esctest2 esctest/tests/il.py test_IL_ScrollsOffBottom
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/il.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: Rows 1..25 hold 0001..0025. ESC[L at row 2: 0025 falls off the bottom, row 2 blank.
+chunk: no
+screen:
+>0001
+> |
+>0002
+>0003
+>0004
+>0005
+>0006
+>0007
+>0008
+>0009
+>0010
+>0011
+>0012
+>0013
+>0014
+>0015
+>0016
+>0017
+>0018
+>0019
+>0020
+>0021
+>0022
+>0023
+>0024
+cursor: (1,0)   # 1-based row 2 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_IL_aboveScrollRegion_noMargins
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1HfGHIj\x1b[3;1HkLMNo\x1b[4;1HpQRSt\x1b[5;1Huvwxy
+step: feed \x1b[2;4r
+step: feed \x1b[1;1H
+step: feed \x1b[L
+step: feed \x1b[r
+source: esctest2 esctest/tests/il.py test_IL_AboveScrollRegion
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/il.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: Tessera adaptation of esctest IL_AboveScrollRegion: the original also sets DECLRMM 2;4 (not available) and DECSTBM 2;4; this keeps the DECSTBM half. IL with the cursor above the region is a no-op. Region rows must be 2..4 only. flags: adapted.
+chunk: no
+flags: adapted (drops DECLRMM)
+screen:
+>a|bcde
+>fGHIj
+>kLMNo
+>pQRSt
+>uvwxy
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_IL_respectsScrollRegion, E_IL_respectsScrollRegion_over -> #97 (il.py): need DECLRMM; with left/right margins 2..4 only columns 2-4 of rows 2-4 move.
+#>    An adapted version without DECLRMM would be a different test (full-width region) and is NOT claimed as the esctest case.
+
+# ---------------------------------------------------------------------------- DL (dl.py)
+
+### E_DL_defaultParam
+size: 25x80
+step: feed \x1b[1;1H0001\x1b[2;1H0002\x1b[3;1H0003\x1b[4;1H0004\x1b[5;1H0005\x1b[6;1H0006\x1b[7;1H0007\x1b[8;1H0008\x1b[9;1H0009\x1b[10;1H0010
+step: feed \x1b[11;1H0011\x1b[12;1H0012\x1b[13;1H0013\x1b[14;1H0014\x1b[15;1H0015\x1b[16;1H0016\x1b[17;1H0017\x1b[18;1H0018\x1b[19;1H0019\x1b[20;1H0020
+step: feed \x1b[21;1H0021\x1b[22;1H0022\x1b[23;1H0023\x1b[24;1H0024\x1b[25;1H0025\x1b[2;1H
+step: feed \x1b[M
+source: esctest2 esctest/tests/dl.py test_DL_DefaultParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/dl.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: Rows 1..25 numbered; cursor row 2; ESC[M deletes it and pulls the rest up; row 25 blank. Cursor goes to column 1.
+chunk: no
+screen:
+>0001
+>0|003
+>0004
+>0005
+>0006
+>0007
+>0008
+>0009
+>0010
+>0011
+>0012
+>0013
+>0014
+>0015
+>0016
+>0017
+>0018
+>0019
+>0020
+>0021
+>0022
+>0023
+>0024
+>0025
+>
+cursor: (1,0)   # 1-based row 2 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_DL_explicitParam
+size: 25x80
+step: feed \x1b[1;1H0001\x1b[2;1H0002\x1b[3;1H0003\x1b[4;1H0004\x1b[5;1H0005\x1b[6;1H0006\x1b[7;1H0007\x1b[8;1H0008\x1b[9;1H0009\x1b[10;1H0010
+step: feed \x1b[11;1H0011\x1b[12;1H0012\x1b[13;1H0013\x1b[14;1H0014\x1b[15;1H0015\x1b[16;1H0016\x1b[17;1H0017\x1b[18;1H0018\x1b[19;1H0019\x1b[20;1H0020
+step: feed \x1b[21;1H0021\x1b[22;1H0022\x1b[23;1H0023\x1b[24;1H0024\x1b[25;1H0025\x1b[2;1H
+step: feed \x1b[2M
+source: esctest2 esctest/tests/dl.py test_DL_ExplicitParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/dl.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[2M.
+chunk: no
+screen:
+>0001
+>0|004
+>0005
+>0006
+>0007
+>0008
+>0009
+>0010
+>0011
+>0012
+>0013
+>0014
+>0015
+>0016
+>0017
+>0018
+>0019
+>0020
+>0021
+>0022
+>0023
+>0024
+>0025
+>
+>
+cursor: (1,0)   # 1-based row 2 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_DL_deleteMoreThanVisible
+size: 25x80
+step: feed \x1b[1;1H0001\x1b[2;1H0002\x1b[3;1H0003\x1b[4;1H0004\x1b[5;1H0005\x1b[6;1H0006\x1b[7;1H0007\x1b[8;1H0008\x1b[9;1H0009\x1b[10;1H0010
+step: feed \x1b[11;1H0011\x1b[12;1H0012\x1b[13;1H0013\x1b[14;1H0014\x1b[15;1H0015\x1b[16;1H0016\x1b[17;1H0017\x1b[18;1H0018\x1b[19;1H0019\x1b[20;1H0020
+step: feed \x1b[21;1H0021\x1b[22;1H0022\x1b[23;1H0023\x1b[24;1H0024\x1b[25;1H0025\x1b[2;1H
+step: feed \x1b[50M
+source: esctest2 esctest/tests/dl.py test_DL_DeleteMoreThanVisible
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/dl.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[50M from row 2 clears rows 2..25, row 1 kept.
+chunk: no
+screen:
+>0001
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (1,0)   # 1-based row 2 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_DL_inScrollRegion
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[4;1Hpqrst\x1b[5;1Huvwxy\x1b[2;3H
+step: feed \x1b[2;4r
+step: feed \x1b[2;3H
+step: feed \x1b[M
+step: feed \x1b[r
+source: esctest2 esctest/tests/dl.py test_DL_InScrollRegion
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/dl.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: Region 2..4, cursor row 2: DL removes 'fghij', rows 3,4 move up, row 4 blank, row 5 untouched.
+chunk: no
+screen:
+>a|bcde
+>klmno
+>pqrst
+>
+>uvwxy
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_DL_outsideScrollRegion
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[4;1Hpqrst\x1b[5;1Huvwxy\x1b[2;3H
+step: feed \x1b[2;4r
+step: feed \x1b[1;3H
+step: feed \x1b[M
+step: feed \x1b[r
+source: esctest2 esctest/tests/dl.py test_DL_OutsideScrollRegion
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/dl.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: Cursor on row 1 (above the region 2..4): DL is a no-op.
+chunk: no
+screen:
+>a|bcde
+>fghij
+>klmno
+>pqrst
+>uvwxy
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_DL_inLeftRightScrollRegion, E_DL_outsideLeftRightScrollRegion, E_DL_inLeftRightAndTopBottomScrollRegion, E_DL_clearOutLeftRightAndTopBottomScrollRegion,
+#> E_DL_outsideLeftRightAndTopBottomScrollRegion -> #97 (dl.py): DECLRMM + DECSLRM 2;4
+
+# ---------------------------------------------------------------------------- SU / SD (su.py, sd.py)  SU = ESC[Ps S ; SD = ESC[Ps T  (esccmd.SD sends final 'T')
+
+### E_SU_defaultParam
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[4;1Hpqrst\x1b[5;1Huvwxy\x1b[2;3H
+step: feed \x1b[S
+source: esctest2 esctest/tests/su.py test_SU_DefaultParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/su.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[S scrolls the screen up one line; the cursor does not move (stays at row 2 col 3).
+chunk: no
+screen:
+>fghij
+>klm|no
+>pqrst
+>uvwxy
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (1,2)   # 1-based row 2 col 3
+pending_wrap: false
+requests: []
+scrollback: len=1 first=("abcde", wrapped=false)
+
+### E_SU_explicitParam
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[4;1Hpqrst\x1b[5;1Huvwxy\x1b[2;3H
+step: feed \x1b[2S
+source: esctest2 esctest/tests/su.py test_SU_ExplicitParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/su.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[2S.
+chunk: no
+screen:
+>klmno
+>pqr|st
+>uvwxy
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (1,2)   # 1-based row 2 col 3
+pending_wrap: false
+requests: []
+scrollback: len=2 first=("abcde", wrapped=false)
+
+### E_SU_canClearScreen
+size: 25x80
+step: feed \x1b[1;1H0001\x1b[2;1H0002\x1b[3;1H0003\x1b[4;1H0004\x1b[5;1H0005\x1b[6;1H0006\x1b[7;1H0007\x1b[8;1H0008\x1b[9;1H0009\x1b[10;1H0010
+step: feed \x1b[11;1H0011\x1b[12;1H0012\x1b[13;1H0013\x1b[14;1H0014\x1b[15;1H0015\x1b[16;1H0016\x1b[17;1H0017\x1b[18;1H0018\x1b[19;1H0019\x1b[20;1H0020
+step: feed \x1b[21;1H0021\x1b[22;1H0022\x1b[23;1H0023\x1b[24;1H0024\x1b[25;1H0025
+step: feed \x1b[25S
+source: esctest2 esctest/tests/su.py test_SU_CanClearScreen
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/su.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[25S on a 25-row screen clears it; all 25 lines enter the scrollback (full-screen region, as csi_spec SU rows).
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>     |
+cursor: (24,4)   # 1-based row 25 col 5
+pending_wrap: false
+requests: []
+scrollback: len=25 first=("0001", wrapped=false)
+
+### E_SU_respectsTopBottomScrollRegion
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[4;1Hpqrst\x1b[5;1Huvwxy\x1b[2;3H
+step: feed \x1b[2;4r
+step: feed \x1b[2;3H
+step: feed \x1b[2S
+step: feed \x1b[r
+source: esctest2 esctest/tests/su.py test_SU_RespectsTopBottomScrollRegion
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/su.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: Region 2..4, cursor inside: SU 2 scrolls only rows 2..4.
+chunk: no
+screen:
+>a|bcde
+>pqrst
+>
+>
+>uvwxy
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_SU_outsideTopBottomScrollRegion
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[4;1Hpqrst\x1b[5;1Huvwxy\x1b[2;3H
+step: feed \x1b[2;4r
+step: feed \x1b[1;1H
+step: feed \x1b[2S
+step: feed \x1b[r
+source: esctest2 esctest/tests/su.py test_SU_OutsideTopBottomScrollRegion
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/su.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: Same with the cursor on row 1 (outside the region): SU ignores the cursor position.
+chunk: no
+screen:
+>a|bcde
+>pqrst
+>
+>
+>uvwxy
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_SD_defaultParam
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[4;1Hpqrst\x1b[5;1Huvwxy\x1b[2;3H
+step: feed \x1b[T
+source: esctest2 esctest/tests/sd.py test_SD_DefaultParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/sd.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[T scrolls down one line (SD, not mouse tracking: a single param). The cursor stays.
+chunk: no
+screen:
+>
+>abc|de
+>fghij
+>klmno
+>pqrst
+>uvwxy
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (1,2)   # 1-based row 2 col 3
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_SD_explicitParam
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[4;1Hpqrst\x1b[5;1Huvwxy\x1b[2;3H
+step: feed \x1b[2T
+source: esctest2 esctest/tests/sd.py test_SD_ExplicitParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/sd.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[2T.
+chunk: no
+screen:
+>
+>   |
+>abcde
+>fghij
+>klmno
+>pqrst
+>uvwxy
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (1,2)   # 1-based row 2 col 3
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_SD_canClearScreen
+size: 25x80
+step: feed \x1b[1;1H0001\x1b[2;1H0002\x1b[3;1H0003\x1b[4;1H0004\x1b[5;1H0005\x1b[6;1H0006\x1b[7;1H0007\x1b[8;1H0008\x1b[9;1H0009\x1b[10;1H0010
+step: feed \x1b[11;1H0011\x1b[12;1H0012\x1b[13;1H0013\x1b[14;1H0014\x1b[15;1H0015\x1b[16;1H0016\x1b[17;1H0017\x1b[18;1H0018\x1b[19;1H0019\x1b[20;1H0020
+step: feed \x1b[21;1H0021\x1b[22;1H0022\x1b[23;1H0023\x1b[24;1H0024\x1b[25;1H0025
+step: feed \x1b[25T
+source: esctest2 esctest/tests/sd.py test_SD_CanClearScreen
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/sd.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[25T clears a 25-row screen (old xterm bug fixed in patch 332).
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>     |
+cursor: (24,4)   # 1-based row 25 col 5
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_SD_respectsTopBottomScrollRegion
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[4;1Hpqrst\x1b[5;1Huvwxy\x1b[2;3H
+step: feed \x1b[2;4r
+step: feed \x1b[2;3H
+step: feed \x1b[2T
+step: feed \x1b[r
+source: esctest2 esctest/tests/sd.py test_SD_RespectsTopBottomScrollRegion
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/sd.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: Region 2..4: SD 2.
+chunk: no
+screen:
+>a|bcde
+>
+>
+>fghij
+>uvwxy
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_SD_outsideTopBottomScrollRegion
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[4;1Hpqrst\x1b[5;1Huvwxy\x1b[2;3H
+step: feed \x1b[2;4r
+step: feed \x1b[1;1H
+step: feed \x1b[2T
+step: feed \x1b[r
+source: esctest2 esctest/tests/sd.py test_SD_OutsideTopBottomScrollRegion
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/sd.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: Cursor outside the region: same result.
+chunk: no
+screen:
+>a|bcde
+>
+>
+>fghij
+>uvwxy
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_SU_respectsLeftRightScrollRegion, E_SU_outsideLeftRightScrollRegion, E_SU_leftRightAndTopBottomScrollRegion, E_SU_bigScrollLeftRightAndTopBottomScrollRegion,
+#> E_SD_respectsLeftRightScrollRegion, E_SD_outsideLeftRightScrollRegion, E_SD_leftRightAndTopBottomScrollRegion, E_SD_bigScrollLeftRightAndTopBottomScrollRegion
+#>    -> #97 (su.py/sd.py, vtLevel 4): DECLRMM + DECSLRM 2;4
+
+# ---------------------------------------------------------------------------- REP (rep.py)  ESC[Ps b
+
+### E_REP_defaultParam
+size: 25x80
+step: feed a
+step: feed \x1b[b
+source: esctest2 esctest/tests/rep.py test_REP_DefaultParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/rep.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[b repeats the last graphic character once (the 'undocumented default is 1').
+chunk: no
+screen:
+>aa |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,2)   # 1-based row 1 col 3
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_REP_explicitParam
+size: 25x80
+step: feed a
+step: feed \x1b[2b
+source: esctest2 esctest/tests/rep.py test_REP_ExplicitParam
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/rep.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[2b.
+chunk: no
+screen:
+>aaa |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,3)   # 1-based row 1 col 4
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_REP_respectsTopBottomMargins
+size: 25x80
+step: feed \x1b[2;4r
+step: feed \x1b[4;78H
+step: feed a
+step: feed \x1b[3b
+source: esctest2 esctest/tests/rep.py test_REP_RespectsTopBottomMargins
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/rep.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: Region 2..4. 'a' at row 4 col 78, REP 3 prints at 79, 80, then wraps at the bottom margin: the region scrolls up one line (old row 4 becomes row 3) and the third 'a' lands at row 4 col 1. Row 4 ends with the cursor after it.
+chunk: yes
+screen:
+>
+>
+>                                                                             aaa\
+>a |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (3,1)   # 1-based row 4 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_REP_respectsLeftRightMargins -> #97 (rep.py, vtLevel 4): DECLRMM + DECSLRM 2;4, CUP 2,1, 'a', REP 3 -> ' aaa ' / ' a   ' (wraps inside the margins)
+
+# ---------------------------------------------------------------------------- DECALN (decaln.py)  ESC # 8
+
+### E_DECALN_fillsScreen
+size: 25x80
+step: feed \x1b#8
+source: esctest2 esctest/tests/decaln.py test_DECALN_FillsScreen
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/decaln.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC#8 fills all 25x80 cells with 'E' (esctest checks the four corners and the centre; the snapshot shows all of them). Cursor homes. No cell is marked soft-wrapped.
+chunk: yes
+screen:
+>E|EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_DECALN_movesCursorHome
+size: 25x80
+step: feed \x1b[5;5H
+step: feed \x1b#8
+source: esctest2 esctest/tests/decaln.py test_DECALN_MovesCursorHome
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/decaln.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC#8 homes the cursor.
+chunk: no
+screen:
+>E|EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_DECALN_clearsMargins -> #97 (decaln.py, vtLevel 4): DECLRMM + DECSLRM 2;3 + DECSTBM 4;5, DECALN, then CUU/CUD/CUB/CUF at the old margins move freely
+#>    (xterm resets both margin pairs). Tessera resets the top/bottom margins only (esc.rs reset_scroll_region).
+
+# ---------------------------------------------------------------------------- DECSC / DECRC (decrc.py via save_restore_cursor.py)  ESC 7 / ESC 8
+
+### E_DECRC_saveRestoreCursor_basic
+size: 25x80
+step: feed \x1b[6;5H
+step: feed \x1b7
+step: feed \x1b[1;1H
+step: feed \x1b8
+source: esctest2 esctest/tests/save_restore_cursor.py test_SaveRestoreCursor_Basic (DECRCTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/save_restore_cursor.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC 7 at (5,6), home, ESC 8 -> (5,6).
+chunk: yes
+screen:
+>
+>
+>
+>
+>
+>     |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (5,4)   # 1-based row 6 col 5
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_DECRC_saveRestoreCursor_moveToHomeWhenNotSaved
+size: 25x80
+step: feed \x1b[!p
+step: feed \x1b[6;5H
+step: feed \x1b8
+source: esctest2 esctest/tests/save_restore_cursor.py test_SaveRestoreCursor_MoveToHomeWhenNotSaved (DECRCTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/save_restore_cursor.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: esctest first sends DECSTR (ESC[!p), which leaves the saved cursor at home (implemented by #80, PR #98); a fresh terminal has no saved cursor either, so ESC 8 homes it.
+chunk: no
+screen:
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_DECRC_saveRestoreCursor_reset
+size: 25x80
+step: feed a
+step: feed \x1b7
+step: feed \x1b[!p
+step: feed b
+step: feed \x1b8
+step: feed c
+source: esctest2 esctest/tests/save_restore_cursor.py test_SaveRestoreCursor_Reset (DECRCTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/save_restore_cursor.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: 'a', DECSC (ESC 7), DECSTR (ESC[!p), 'b', DECRC (ESC 8), 'c': DECSTR resets the saved cursor to home (xterm ReallyReset soft: CursorSave then sc row/col = 0), so DECRC goes to 1,1 and 'c' overwrites 'a': row 1 = 'cb'. Was a `#>` line waiting for #80; passes since #80 merged (PR #98).
+chunk: no
+screen:
+>cb|
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,1)   # 1-based row 1 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_DECRC_saveRestoreCursor_resetsOriginMode, E_DECRC_saveRestoreCursor_worksInLRM, E_DECRC_saveRestoreCursor_altVsMain -> #8 (DECOM, DECSET 47 alt screen) + #97 (DECLRMM, worksInLRM)
+#> E_DECRC_saveRestoreCursor_protection -> #95 (DECSCA/DECSERA, DEC protection next to SPA/EPA); passes vacuously today, so not worth a case
+#> E_DECRC_saveRestoreCursor_wrap -> #8 (DECRESET 7 = ESC[?7l; with the harness's `set auto_wrap false` it would read:
+#>     step: set auto_wrap true / DECSC / set auto_wrap false / DECRC / CUP(79,1) 'abcd' -> expect cursor on row 1 (xterm). Verify DECSC does not restore auto-wrap.)
+#> E_DECRC_saveRestoreCursor_reverseWrapNotAffected -> #97 (DECSET 45)
+#> E_DECRC_saveRestoreCursor_insertNotAffected -> #8 (SM/RM 4 = ESC[4h/l not wired; with `set insert_mode true/false` steps it reads: IRM on, DECSC, IRM off, DECRC, home 'a' home 'b' -> 'b'. Tessera passes with the @set translation.)
+#> E_SCORC_* (scorc.py = same class with CSI s / CSI u) -> #94: csi.rs has no 's' / 'u' arms (SCOSC/SCORC); E_SCORC_saveRestoreCursor_basic: ESC[6;5H ESC[s ESC[H ESC[u -> (5,6).
+#>     xterm: CSI s is DECSLRM while DECLRMM (#97) is set, so SCOSC must check the margin mode first.
+
+# ---------------------------------------------------------------------------- DECSTBM (decstbm.py)  ESC[Pt;Pb r  — moves the cursor home on success
+
+### E_DECSTBM_scrollsOnNewline
+size: 25x80
+step: feed \x1b[2;3r
+step: feed \x1b[2;1H
+step: feed 1\r\n
+step: feed 2
+step: feed \r\n
+source: esctest2 esctest/tests/decstbm.py test_DECSTBM_ScrollsOnNewline
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/decstbm.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: Region 2..3: '1' CRLF '2' then CRLF scrolls the region: row 2 = '2', row 3 empty, cursor row 3 col 1.
+chunk: yes
+screen:
+>
+>2
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (2,0)   # 1-based row 3 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_DECSTBM_newlineBelowRegion
+size: 25x80
+step: feed \x1b[2;3r
+step: feed \x1b[2;1H
+step: feed 1\r\n
+step: feed 2
+step: feed \x1b[4;1H
+step: feed \r\n
+source: esctest2 esctest/tests/decstbm.py test_DECSTBM_NewlineBelowRegion
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/decstbm.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: A CRLF on row 4 (below the region) just moves to row 5 and leaves the region alone.
+chunk: no
+screen:
+>
+>1
+>2
+>
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (4,0)   # 1-based row 5 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_DECSTBM_movsCursorToOrigin
+size: 25x80
+step: feed \x1b[2;3H
+step: feed \x1b[2;3r
+source: esctest2 esctest/tests/decstbm.py test_DECSTBM_MovsCursorToOrigin
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/decstbm.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: DECSTBM homes the cursor to (1,1) (DECOM off).
+chunk: no
+screen:
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_DECSTBM_topBelowBottom
+size: 25x80
+step: feed \x1b[3;3r
+step: feed 0000\r\n0001\r\n0002\r\n0003\r\n0004\r\n0005\r\n0006\r\n0007\r\n0008\r\n0009\r\n0010\r\n0011\r\n0012\r\n0013\r\n0014\r\n0015\r\n0016\r\n0017\r\n0018\r\n0019\r\n0020\r\n0021\r\n0022\r\n0023\r\n0024
+step: feed \x1b[25;1H
+step: feed \n
+source: esctest2 esctest/tests/decstbm.py test_DECSTBM_TopBelowBottom
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/decstbm.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[3;3r has top == bottom: invalid, ignored (xterm needs bottom > top). Rows are written 0000..0024 with no scrolling; LF at the last row then scrolls the whole screen (rows 1..24 now read 0001..0024, row 25 empty). The cursor is homed by neither (an ignored DECSTBM does not move it; the esctest writes from row 1 so the effect is invisible there). Final cursor (1,25).
+chunk: yes
+screen:
+>0001
+>0002
+>0003
+>0004
+>0005
+>0006
+>0007
+>0008
+>0009
+>0010
+>0011
+>0012
+>0013
+>0014
+>0015
+>0016
+>0017
+>0018
+>0019
+>0020
+>0021
+>0022
+>0023
+>0024
+> |
+cursor: (24,0)   # 1-based row 25 col 1
+pending_wrap: false
+requests: []
+scrollback: len=1 first=("0000", wrapped=false)
+
+### E_DECSTBM_defaultRestores
+size: 25x80
+step: feed \x1b[2;3r
+step: feed \x1b[2;1H
+step: feed 1\r\n
+step: feed 2
+step: feed \x1b[r
+step: feed \x1b[3;2H
+step: feed \r\n
+source: esctest2 esctest/tests/decstbm.py test_DECSTBM_DefaultRestores
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/decstbm.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[r restores the full-screen region (and homes); the CRLF at row 3 just moves to row 4. In esctest the cursor position is saved with DSR and restored with CUP(position) = (2,3).
+chunk: no
+screen:
+>
+>1
+>2
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (3,0)   # 1-based row 4 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_DECSTBM_cursorBelowRegionAtBottomTriesToScroll
+size: 25x80
+step: feed \x1b[2;3r
+step: feed \x1b[2;1H
+step: feed 1\r\n
+step: feed 2
+step: feed \x1b[25;1H
+step: feed 3\r\n
+source: esctest2 esctest/tests/decstbm.py test_DECSTBM_CursorBelowRegionAtBottomTriesToScroll
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/decstbm.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: Cursor on the last row (25, below region 2..3): CRLF cannot scroll (outside the region); cursor stays on row 25, column 1; '3' stays on row 25.
+chunk: no
+screen:
+>
+>1
+>2
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>3|
+cursor: (24,0)   # 1-based row 25 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_DECSTBM_maxSizeOfRegionIsPageSize
+size: 25x80
+step: feed \x1b[2;1H
+step: feed x
+step: feed \x1b[1;35r
+step: feed \x1b[25;1H
+step: feed \r\n
+source: esctest2 esctest/tests/decstbm.py test_DECSTBM_MaxSizeOfRegionIsPageSize
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/decstbm.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: A bottom beyond the screen is clamped to the last row (xterm: bottom > rows -> rows), so the region is the whole screen and CRLF on row 25 scrolls the screen up: 'x' moves from row 2 to row 1. Cursor stays on row 25.
+chunk: no
+screen:
+>x
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+> |
+cursor: (24,0)   # 1-based row 25 col 1
+pending_wrap: false
+requests: []
+scrollback: len=1 first=("", wrapped=false)
+
+### E_DECSTBM_topOfZeroIsTopOfScreen
+size: 25x80
+step: feed \x1b[0;3r
+step: feed \x1b[2;1H
+step: feed 1\r\n
+step: feed 2\r\n
+step: feed 3\r\n
+step: feed 4
+source: esctest2 esctest/tests/decstbm.py test_DECSTBM_TopOfZeroIsTopOfScreen
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/decstbm.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[0;3r: top 0 = default 1, so region 1..3. Writing 1..4 on rows 2,3 then scrolling leaves rows 1..3 = 2,3,4.
+chunk: no
+screen:
+>2
+>3
+>4 |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (2,1)   # 1-based row 3 col 2
+pending_wrap: false
+requests: []
+scrollback: not asserted (D-SB: xterm keeps lines scrolled off a region whose top is row 1, util.c xtermScroll scroll_all_lines = top_marg == 0, so it would hold '1' here; tessera keeps history only for a full-screen region; see csi_spec.txt D-SB)
+
+### E_DECSTBM_bottomOfZeroIsBottomOfScreen
+size: 25x80
+step: feed \x1b[3;1H
+step: feed x
+step: feed \x1b[2;0r
+step: feed \x1b[25;1H
+step: feed \r\n
+source: esctest2 esctest/tests/decstbm.py test_DECSTBM_BottomOfZeroIsBottomOfScreen
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/decstbm.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC[2;0r: bottom 0 = default (last row), region 2..25; CRLF on row 25 scrolls the region: 'x' moves from row 3 to row 2.
+chunk: no
+screen:
+>
+>x
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+> |
+cursor: (24,0)   # 1-based row 25 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+# ---------------------------------------------------------------------------- IND (ind.py)  ESC D
+
+### E_IND_basic
+size: 25x80
+step: feed \x1b[3;5H
+step: feed \x1bD
+source: esctest2 esctest/tests/ind.py test_IND_Basic
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ind.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC D: down one row, column kept.
+chunk: no
+screen:
+>
+>
+>
+>     |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (3,4)   # 1-based row 4 col 5
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_IND_scrolls
+size: 25x80
+step: feed \x1b[24;2H
+step: feed a
+step: feed \x1b[25;2H
+step: feed b
+step: feed \x1b[24;2H
+step: feed \x1bD
+step: feed \x1bD
+source: esctest2 esctest/tests/ind.py test_IND_Scrolls
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ind.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: 'a' on row 24, 'b' on row 25. First IND moves to row 25 (no scroll); the second scrolls the screen up: 'a' to row 23, 'b' to row 24. Column stays (2). The first checkpoint is verified by the generator only.
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+> a
+> b
+>  |
+cursor: (24,1)   # 1-based row 25 col 2
+pending_wrap: false
+requests: []
+scrollback: len=1 first=("", wrapped=false)
+
+### E_IND_scrollsInTopBottomRegionStartingAbove
+size: 25x80
+step: feed \x1b[4;5r
+step: feed \x1b[5;2H
+step: feed x
+step: feed \x1b[3;2H
+step: feed \x1bD
+step: feed \x1bD
+step: feed \x1bD
+source: esctest2 esctest/tests/ind.py test_IND_ScrollsInTopBottomRegionStartingAbove
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ind.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: Region 4..5, 'x' on row 5. Start on row 3 (above): IND to 4, IND to 5, IND scrolls the region: 'x' to row 4.
+chunk: no
+screen:
+>
+>
+>
+> x
+>  |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (4,1)   # 1-based row 5 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_IND_scrollsInTopBottomRegionStartingWithin
+size: 25x80
+step: feed \x1b[4;5r
+step: feed \x1b[5;2H
+step: feed x
+step: feed \x1b[4;2H
+step: feed \x1bD
+step: feed \x1bD
+source: esctest2 esctest/tests/ind.py test_IND_ScrollsInTopBottomRegionStartingWithin
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ind.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: Start on row 4: IND to 5, IND scrolls the region.
+chunk: no
+screen:
+>
+>
+>
+> x
+>  |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (4,1)   # 1-based row 5 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_IND_stopsAtBottomLineWhenBegunBelowScrollRegion
+size: 25x80
+step: feed \x1b[4;5r
+step: feed \x1b[6;1H
+step: feed x
+step: feed \x1bD\x1bD\x1bD\x1bD\x1bD\x1bD\x1bD\x1bD\x1bD\x1bD\x1bD\x1bD\x1bD\x1bD\x1bD\x1bD\x1bD\x1bD\x1bD\x1bD\x1bD\x1bD\x1bD\x1bD\x1bD
+source: esctest2 esctest/tests/ind.py test_IND_StopsAtBottomLineWhenBegunBelowScrollRegion
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ind.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: Region 4..5, cursor row 6 (below). 25 INDs: the cursor stops on row 25 and nothing scrolls ('x' stays on row 6). Cursor column: 'x' left the cursor at col 2.
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>x
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>  |
+cursor: (24,1)   # 1-based row 25 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_IND_movesDoesNotScrollOutsideLeftRight -> #97 (ind.py): DECLRMM + DECSLRM 2;5
+#> E_IND_8bit -> #96 (see E_HTS_8bit)
+
+# ---------------------------------------------------------------------------- RI (ri.py)  ESC M
+
+### E_RI_basic
+size: 25x80
+step: feed \x1b[3;5H
+step: feed \x1bM
+source: esctest2 esctest/tests/ri.py test_RI_Basic
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ri.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC M: up one row.
+chunk: no
+screen:
+>
+>     |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (1,4)   # 1-based row 2 col 5
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_RI_scrolls
+size: 25x80
+step: feed \x1b[1;2H
+step: feed a
+step: feed \x1b[2;2H
+step: feed b
+step: feed \x1b[2;2H
+step: feed \x1bM
+step: feed \x1bM
+source: esctest2 esctest/tests/ri.py test_RI_Scrolls
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ri.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: 'a' row 1, 'b' row 2. RI from row 2 moves to row 1; the second RI scrolls down at the top: a to row 2, b to row 3.
+chunk: no
+screen:
+>  |
+> a
+> b
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,1)   # 1-based row 1 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_RI_scrollsInTopBottomRegionStartingBelow
+size: 25x80
+step: feed \x1b[4;5r
+step: feed \x1b[4;2H
+step: feed x
+step: feed \x1b[6;2H
+step: feed \x1bM
+step: feed \x1bM
+step: feed \x1bM
+source: esctest2 esctest/tests/ri.py test_RI_ScrollsInTopBottomRegionStartingBelow
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ri.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: Region 4..5, 'x' on row 4. Start on row 6 (below): RI to 5, RI to 4, RI scrolls the region down: 'x' to row 5.
+chunk: no
+screen:
+>
+>
+>
+>  |
+> x
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (3,1)   # 1-based row 4 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_RI_scrollsInTopBottomRegionStartingWithin
+size: 25x80
+step: feed \x1b[4;5r
+step: feed \x1b[4;2H
+step: feed x
+step: feed \x1b[5;2H
+step: feed \x1bM
+step: feed \x1bM
+source: esctest2 esctest/tests/ri.py test_RI_ScrollsInTopBottomRegionStartingWithin
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ri.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: Start on row 5: RI to 4, RI scrolls the region down.
+chunk: no
+screen:
+>
+>
+>
+>  |
+> x
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (3,1)   # 1-based row 4 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_RI_stopsAtTopLineWhenBegunAboveScrollRegion
+size: 25x80
+step: feed \x1b[4;5r
+step: feed \x1b[3;1H
+step: feed x
+step: feed \x1bM\x1bM\x1bM\x1bM\x1bM\x1bM\x1bM\x1bM\x1bM\x1bM\x1bM\x1bM\x1bM\x1bM\x1bM\x1bM\x1bM\x1bM\x1bM\x1bM\x1bM\x1bM\x1bM\x1bM\x1bM
+source: esctest2 esctest/tests/ri.py test_RI_StopsAtTopLineWhenBegunAboveScrollRegion
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ri.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: Region 4..5, cursor row 3 (above): 25 RIs stop on row 1, nothing scrolls. 'x' stays at row 3.
+chunk: no
+screen:
+>  |
+>
+>x
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,1)   # 1-based row 1 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_RI_movesDoesNotScrollOutsideLeftRight -> #97 (ri.py): DECLRMM + DECSLRM 2;5
+#> E_RI_8bit -> #96 (see E_HTS_8bit)
+
+# ---------------------------------------------------------------------------- NEL (nel.py)  ESC E
+
+### E_NEL_basic
+size: 25x80
+step: feed \x1b[3;5H
+step: feed \x1bE
+source: esctest2 esctest/tests/nel.py test_NEL_Basic
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/nel.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: ESC E: down one row and to column 1.
+chunk: no
+screen:
+>
+>
+>
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (3,0)   # 1-based row 4 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_NEL_scrolls
+size: 25x80
+step: feed \x1b[24;2H
+step: feed a
+step: feed \x1b[25;2H
+step: feed b
+step: feed \x1b[24;2H
+step: feed \x1bE
+step: feed \x1bE
+source: esctest2 esctest/tests/nel.py test_NEL_Scrolls
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/nel.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: As E_IND_scrolls with column reset to 1.
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+> a
+> b
+> |
+cursor: (24,0)   # 1-based row 25 col 1
+pending_wrap: false
+requests: []
+scrollback: len=1 first=("", wrapped=false)
+
+### E_NEL_scrollsInTopBottomRegionStartingAbove
+size: 25x80
+step: feed \x1b[4;5r
+step: feed \x1b[5;2H
+step: feed x
+step: feed \x1b[3;2H
+step: feed \x1bE
+step: feed \x1bE
+step: feed \x1bE
+source: esctest2 esctest/tests/nel.py test_NEL_ScrollsInTopBottomRegionStartingAbove
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/nel.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: As E_IND_scrollsInTopBottomRegionStartingAbove; cursor column 1.
+chunk: no
+screen:
+>
+>
+>
+> x
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (4,0)   # 1-based row 5 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_NEL_scrollsInTopBottomRegionStartingWithin
+size: 25x80
+step: feed \x1b[4;5r
+step: feed \x1b[5;2H
+step: feed x
+step: feed \x1b[4;2H
+step: feed \x1bE
+step: feed \x1bE
+source: esctest2 esctest/tests/nel.py test_NEL_ScrollsInTopBottomRegionStartingWithin
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/nel.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: As the IND variant.
+chunk: no
+screen:
+>
+>
+>
+> x
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (4,0)   # 1-based row 5 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_NEL_stopsAtBottomLineWhenBegunBelowScrollRegion
+size: 25x80
+step: feed \x1b[4;5r
+step: feed \x1b[6;1H
+step: feed x
+step: feed \x1bE\x1bE\x1bE\x1bE\x1bE\x1bE\x1bE\x1bE\x1bE\x1bE\x1bE\x1bE\x1bE\x1bE\x1bE\x1bE\x1bE\x1bE\x1bE\x1bE\x1bE\x1bE\x1bE\x1bE\x1bE
+source: esctest2 esctest/tests/nel.py test_NEL_StopsAtBottomLineWhenBegunBelowScrollRegion
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/nel.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: 25 NELs from row 6: stops at row 25 column 1, no scroll.
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>x
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+> |
+cursor: (24,0)   # 1-based row 25 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_NEL_movesDoesNotScrollOutsideLeftRight -> #97 (nel.py): DECLRMM + DECSLRM 2;5
+#> E_NEL_8bit -> #96 (see E_HTS_8bit)
+
+# ---------------------------------------------------------------------------- SGR (sgr.py)
+
+### E_SGR_bold
+size: 25x80
+step: feed x
+step: feed \x1b[1m
+step: feed y
+source: esctest2 esctest/tests/sgr.py test_SGR_Bold
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/sgr.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: 'x', ESC[1m, 'y': esctest checks via AssertCharHasSGR that cell 1 has default fg/bg and no bold, cell 2 has default fg/bg and bold. This is the ONLY test in esctest2 sgr.py. The rest of SGR (256/truecolour/underline styles) is already pinned by sgr_spec.txt (#7).
+chunk: no
+flags: needs: attribute render (see header ATTRIBUTES)
+screen:
+>xy |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,2)   # 1-based row 1 col 3
+pending_wrap: false
+requests: []
+scrollback: len=0
+attr: (0,0)-(0,0) fg=- bg=- ul=- us=none flags=-
+attr: (0,1)-(0,1) fg=- bg=- ul=- us=none flags=bold
+attr_others: fg=- bg=- ul=- us=none flags=-
+
+### V2S13_sgr_pattern
+size: 24x80
+step: feed \x1b[1;24r\x1b[2J\x1b[1;20HGraphic rendition test pattern:\x1b[4;1H\x1b[0mvanilla\x1b[4;40H\x1b[0;1mbold\x1b[6;6H\x1b[;4munderline\x1b[6;45H
+step: feed \x1b[;1m\x1b[4mbold underline\x1b[8;1H\x1b[0;5mblink\x1b[8;40H\x1b[0;5;1mbold blink\x1b[10;6H\x1b[0;4;5munderline blink\x1b[10;45H
+step: feed \x1b[0;1;4;5mbold underline blink\x1b[12;1H\x1b[1;4;5;0;7mnegative\x1b[12;40H\x1b[0;1;7mbold negative\x1b[14;6H
+step: feed \x1b[0;4;7munderline negative\x1b[14;45H\x1b[0;1;4;7mbold underline negative\x1b[16;1H\x1b[1;4;;5;7mblink negative\x1b[16;40H
+step: feed \x1b[0;1;5;7mbold blink negative\x1b[18;6H\x1b[0;4;5;7munderline blink negative\x1b[18;45H
+step: feed \x1b[0;1;4;5;7mbold underline blink negative\x1b[m\x1b[?5l\x1b[23;1H\x1b[0KDark background. Push <RETURN>
+source: vttest main.c tst_screen() screen 13 capture vttest_capture/m2_13.bin
+cite: https://invisible-island.net/vttest/ (vttest 2.7 20251205, source https://invisible-island.net/archives/vttest/vttest.tar.gz) main.c tst_screen() 'Graphic rendition test pattern'
+note: Eight lines x two columns of SGR 0/1/4/5/7 combinations (vanilla, bold, underline, bold underline, blink, bold blink, ..., bold underline blink negative). `ESC[;4m` = [0,4] (reset then underline): empty parameters are 0. The row-16 left entry sends `1;4;;5;7`: the empty third parameter RESETS, so only blink+inverse survive although the label says 'blink negative' (the label is what vttest means; xterm applies the reset: xterm charproc.c CASE_SGR param 0 / -1 default). `ESC[?5l` (DECSCNM reset) and `ESC[1;24r` appear: the first is ignored (CSI with intermediate), the second sets the full-screen region and homes. Final line 23: 'Dark background. Push <RETURN>' with the default pen.
+chunk: yes
+flags: vttest in-scope (SGR only)
+screen:
+>                   Graphic rendition test pattern:
+>
+>
+>vanilla                                bold
+>
+>     underline                              bold underline
+>
+>blink                                  bold blink
+>
+>     underline blink                        bold underline blink
+>
+>negative                               bold negative
+>
+>     underline negative                     bold underline negative
+>
+>blink negative                         bold blink negative
+>
+>     underline blink negative               bold underline blink negative
+>
+>
+>
+>
+>Dark background. Push <RETURN> |
+>
+cursor: (22,30)   # 1-based row 23 col 31
+pending_wrap: false
+requests: []
+scrollback: len=0
+attr: (3,39)-(3,42) fg=- bg=- ul=- us=none flags=bold
+attr: (5,5)-(5,13) fg=- bg=- ul=- us=single flags=-
+attr: (5,44)-(5,57) fg=- bg=- ul=- us=single flags=bold
+attr: (7,0)-(7,4) fg=- bg=- ul=- us=none flags=blink
+attr: (7,39)-(7,48) fg=- bg=- ul=- us=none flags=bold,blink
+attr: (9,5)-(9,19) fg=- bg=- ul=- us=single flags=blink
+attr: (9,44)-(9,63) fg=- bg=- ul=- us=single flags=bold,blink
+attr: (11,0)-(11,7) fg=- bg=- ul=- us=none flags=inverse
+attr: (11,39)-(11,51) fg=- bg=- ul=- us=none flags=bold,inverse
+attr: (13,5)-(13,22) fg=- bg=- ul=- us=single flags=inverse
+attr: (13,44)-(13,66) fg=- bg=- ul=- us=single flags=bold,inverse
+attr: (15,0)-(15,13) fg=- bg=- ul=- us=none flags=blink,inverse
+attr: (15,39)-(15,57) fg=- bg=- ul=- us=none flags=bold,blink,inverse
+attr: (17,5)-(17,28) fg=- bg=- ul=- us=single flags=blink,inverse
+attr: (17,44)-(17,72) fg=- bg=- ul=- us=single flags=bold,blink,inverse
+attr_others: fg=- bg=- ul=- us=none flags=-
+
+#> V2S14_light_background_prompt (m2_14) -> #8: ESC[?5h (DECSCNM) then row 23 'Light background. Push <RETURN>'; the text is plain, the reverse-video flag is the point.
+#> V2S15_save_restore_cursor_charsets (m2_15) -> #8: SGR + DECSC/DECRC + SCS (ESC ( 0 line drawing, ESC ) B, SO/SI); the DECSC/DECRC + SGR part alone is covered by sgr_spec.txt Part C.

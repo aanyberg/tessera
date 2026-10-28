@@ -1,0 +1,38 @@
+---
+source: crates/tessera-term/tests/esctest.rs
+description: E_DECSTBM_bottomOfZeroIsBottomOfScreen
+input_file: crates/tessera-term/tests/fixtures/esctest_spec.txt
+---
+
+x
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ |
+--
+cursor: (24,0)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0
+-- pens
+pens: default
