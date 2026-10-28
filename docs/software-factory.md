@@ -109,8 +109,9 @@ Scripted workflows are not used for waves: they cannot apply judgement when a st
 implementer disagree, and they hide progress from the user.
 
 0. **Pre-flight.** Before planning, the lead checks that
-   `gh api repos/<owner>/<repo> --jq .allow_rebase_merge` prints `true`. If it does not, stop and ask the user to
-   enable rebase merging before the wave starts, not at merge time. Commands the user types with `!` may not run
+   `gh api repos/{owner}/{repo} --jq .allow_rebase_merge` prints `true`. If it does not, stop and ask the user to
+   enable rebase merging before the wave starts, not at merge time
+   (`gh api -X PATCH repos/{owner}/{repo} -F allow_rebase_merge=true`, which needs admin rights). Commands the user types with `!` may not run
    in the session; when a step needs the user, give them the exact command to run in a separate terminal, or run
    the `gh api` call from the lead with their go-ahead.
 1. **Plan.** `milestone-lead` turns open issues into waves of five parallel-safe issues and labels each issue
@@ -119,8 +120,9 @@ implementer disagree, and they hide progress from the user.
    returns one brief per issue (files, API names, ADR numbers, deps and do-not-touch lists pre-assigned). Decisions
    that constrain a later issue, and findings deferred to it, go in a comment on that issue. There is no task-board
    file in the repo. Where two issues change the same function, the planner marks one upstream and one
-   downstream (or splits them across waves); the downstream task's critique waits for the upstream merge, or is
-   limited to a `git merge-tree` check against the upstream branch until then. Hot-path issues carry a
+   downstream (or splits them across waves); the downstream task's critique waits for the upstream merge. Until then
+   it may get an advisory round limited to a `git merge-tree` check against the upstream branch; that round does
+   not count against the cap and cannot return `ship`. Hot-path issues carry a
    performance bar with a named corpus measured against main.
 2. **Task list.** The lead session creates one shared task per issue in the wave, carrying the brief.
 3. **Implement.** One teammate per issue claims its task and implements it in its own worktree
@@ -129,8 +131,10 @@ implementer disagree, and they hide progress from the user.
    researcher fails, the lead decides whether to retry or proceed from the issue text.
 4. **Critique.** For every round the lead spawns a fresh one-shot critic subagent (`rust-critic`, `swift-critic`
    or `code-critic` by area) with no memory of earlier rounds. On `revise` the owning teammate, or a
-   `revision-implementer`, fixes or refutes each finding. On `escalate` the lead (or `milestone-lead`) decides and
-   records the decision in the brief before the next round; escalations do not count against the cap. The loop
+   `revision-implementer`, fixes or refutes each finding. On `revise` where the only major is a doc line or an
+   item already recorded as a lead decision, the lead checks the fix in the diff and treats the round as `ship`;
+   verification follows. On `escalate` the lead (or `milestone-lead`) decides and
+   records the decision in the brief, under a dated `## Lead decisions (<date>)` heading, before the next round; escalations do not count against the cap. The loop
    is capped at 5 rounds.
 5. **Verify.** After `ship`, the lead runs `quality-gate` and `adversarial-tester` in parallel as one-shot
    subagents. Any major finding fails the gate; at most 2 verify cycles. A structural rewrite during a verify
@@ -151,10 +155,9 @@ implementer disagree, and they hide progress from the user.
 **Changes after `ship`.** Fixes the lead sends after a critic's `ship` or after a verify pass are classified:
 
 - Doc-only and test-only changes go to the teammate; the lead reads the diff. No fresh critic.
-- When a critic's only remaining major is a doc line or an item the brief already records as a lead decision,
-  the lead checks the fix in the diff instead of spending a critique round.
-- Any other non-test code change, and every change to a hot path or a fast path, gets a fresh critic (it may be
-  scoped to the changed region) or a re-run of the adversarial differential on that region before integration.
+- Any non-test change to a hot path or a fast path gets a fresh critic (it may be scoped to the changed region)
+  or an `adversarial-tester` run scoped to the changed region, including its differential fuzz against the
+  reference path, before integration.
 
 Critics and verifiers are always one-shot subagents, never long-lived teammates, so every review starts from a
 clean context.

@@ -18,6 +18,6 @@ Produce docs/retros/<wave>.md with:
 3. Structural lessons (collisions between parallel tasks, stale bases, loose pass criteria, spec-heavy issues).
 4. Concrete proposals: per-agent model/effort changes, prompt changes, runbook changes, each with the evidence row that motivates it.
 
-Write the retro file early (outline and cost table first, then fill sections) so a turn limit never ends the run with nothing written. Use the per-agent stats table the lead hands you when there is one instead of re-deriving it.
+Write the retro file early (outline and cost table first, then fill sections) so a turn limit never ends the run with nothing written.
 
 Never modify agents or the runbook yourself; write only the retro file.

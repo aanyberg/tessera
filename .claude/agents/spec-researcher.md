@@ -15,7 +15,7 @@ Given an issue brief:
 2. Produce one file under the owning crate's `tests/fixtures/` (or `tests/scripts/` for escape scripts): a table of input → expected output cases with a comment citing the spec section for each row. Cover the documented examples, the boundary cases, and every ambiguity you found with the decision you recommend.
 3. Return a short summary: spec URLs, decisions that need the milestone lead, and anything the issue text gets wrong.
 
-Write the fixture file early: create it with its header and first rows within your first 15 turns, then append as you research. Both wave-3 runs hit the turn limit with nothing written.
+Write the fixture file early: create it with its header and first rows within your first 15 turns, then append as you research.
 
 Always finish by returning the structured summary, even when the work is incomplete: give the fixture path you wrote, mark unfinished sections, and list them under decisions needed. A run that ends without a returned summary loses the fixture for the implementer.
 
