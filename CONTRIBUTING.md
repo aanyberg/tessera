@@ -20,7 +20,9 @@
 - `just check` must pass: `rustfmt`, `clippy -D warnings` (pedantic subset),
   `nextest`, `cargo-deny`.
 - `#![forbid(unsafe_code)]` everywhere except `tessera-pty` and `tessera-ffi`.
-  Every `unsafe` block carries a `// SAFETY:` comment.
+  Every `unsafe` block carries a `// SAFETY:` comment. The one exception
+  outside them is the counting test allocator in
+  `crates/tessera-render/tests/alloc.rs` (ADR 0016).
 - Public items are documented. Crate roots start with a purpose paragraph.
 - Dependencies point downward only (see `docs/architecture.md`). A crate that
   needs something from above it is a design smell; raise it in the PR.
@@ -187,7 +189,13 @@ configuration, has no tabs, selection or copy, and like the devtool is
 dev-only: a test checks that `tessera-ffi` and `tessera-app-core` never link
 it or winit. It installs no signal handlers: Ctrl-C in the terminal that
 launched it, or `kill`, ends it without closing the session, and a child that
-ignores `SIGHUP` is orphaned; close the window instead.
+ignores `SIGHUP` is orphaned; close the window instead. A skipped frame
+has three causes (nothing changed, paced above 240 frames per second, surface
+not ready) that the core does not tell apart yet (#101); the window retries
+one about a refresh later, at most twice in a row, so it neither loses a
+paced frame nor wakes every refresh while idle. A debug build draws visibly
+fewer frames during a flood (`cat` of a large file); judge rendering speed
+with `cargo run --release -p tessera-devwin`.
 
 **Manual check (priority, not yet done):** the dead-key handling assumes
 AppKit composes a dead key into the next key event without an IME. Events

@@ -15,6 +15,16 @@
 //! only the kernel's hangup when the PTY closes, and a child that ignores
 //! `SIGHUP` is orphaned. Close the window instead.
 //!
+//! A frame the core skips (`FrameStatus::Skipped`) has three causes since
+//! #21: nothing changed, the frame was paced (more than 240 frames per
+//! second), or the surface was not ready. They are not told apart yet
+//! (#101), so the window retries a skipped frame about one refresh later,
+//! at most [`MAX_SKIP_RETRIES`] times in a row: enough to draw a paced
+//! frame (a retry that late is never paced) without waking 60 times a
+//! second while nothing changes. A presented frame and any new output,
+//! input, resize, occlusion change or re-attached surface start the count
+//! over.
+//!
 //! Dev-only: never published, and nothing in the app or in `tessera-ffi`
 //! depends on it (a test checks). Run it with `just devwin`.
 
@@ -22,6 +32,7 @@ mod clipboard;
 mod input;
 mod mailbox;
 
+use std::cell::Cell;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -45,6 +56,12 @@ use crate::mailbox::{Mailbox, PasteDelivery};
 /// How long to wait before drawing again after a frame was skipped (the
 /// swapchain timed out) while the window is visible: about one refresh.
 const SKIPPED_FRAME_RETRY: Duration = Duration::from_millis(16);
+
+/// Most skipped frames in a row that are retried (see the module docs).
+/// One retry draws a paced frame: [`SKIPPED_FRAME_RETRY`] is longer than
+/// the core's frame interval, so the retry is due. The second covers a
+/// surface that was not ready once.
+const MAX_SKIP_RETRIES: u32 = 2;
 
 /// How long a paste waits for the clipboard tool before killing it.
 const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(2);
@@ -105,6 +122,9 @@ struct DevWin {
     occluded: bool,
     /// When to draw again after a skipped frame.
     retry_at: Option<Instant>,
+    /// Skipped frames in a row since the last presented frame or event;
+    /// see [`retry_skipped`]. A `Cell` so the `&self` event paths reset it.
+    skips: Cell<u32>,
     /// Frames in a row that needed recovery; see [`MAX_RECOVERIES`].
     recoveries: u32,
     /// A clipboard read for a paste is running; further pastes are
@@ -144,6 +164,7 @@ impl DevWin {
             held: MouseButton::None,
             occluded: false,
             retry_at: None,
+            skips: Cell::new(0),
             recoveries: 0,
             paste_in_flight: false,
             hold: InputHold::default(),
@@ -232,6 +253,7 @@ impl DevWin {
         if let Err(error) = result {
             eprintln!("tessera-devwin: resizing the view failed: {error}");
         }
+        self.skips.set(0);
         window.request_redraw();
     }
 
@@ -248,6 +270,9 @@ impl DevWin {
             self.fail(event_loop, &message);
             return;
         }
+        let mut skips = self.skips.get();
+        let retry = retry_skipped(&mut skips, &status);
+        self.skips.set(skips);
         match status {
             Ok(FrameStatus::Presented) => {}
             // Shown, but the swapchain no longer matches the window: the
@@ -258,13 +283,16 @@ impl DevWin {
             Ok(FrameStatus::Suboptimal) => self.follow_window(),
             Ok(FrameStatus::Skipped) => {
                 let size = window.inner_size();
-                if !self.occluded && size.width > 0 && size.height > 0 {
+                if retry && !self.occluded && size.width > 0 && size.height > 0 {
                     self.retry_at = Some(Instant::now() + SKIPPED_FRAME_RETRY);
                 }
             }
             // The core detached the view; give it a fresh surface.
             Err(Error::Gpu(RenderError::SurfaceLost)) => match self.attach(&window, id) {
-                Ok(()) => window.request_redraw(),
+                Ok(()) => {
+                    self.skips.set(0);
+                    window.request_redraw();
+                }
                 Err(message) => self.fail(event_loop, &message),
             },
             Err(error) => eprintln!("tessera-devwin: drawing failed: {error}"),
@@ -297,6 +325,7 @@ impl DevWin {
         let (Some(window), Some(id)) = (&self.window, self.session) else {
             return;
         };
+        self.skips.set(0);
         match self.app.send_input(id, event) {
             Ok(InputOutcome::Consumed) => window.request_redraw(),
             Ok(InputOutcome::Ignored) => {}
@@ -340,6 +369,7 @@ impl DevWin {
         let pending = self.mailbox.take();
         if let Some(window) = &self.window {
             if pending.output {
+                self.skips.set(0);
                 window.request_redraw();
             }
             if let Some(title) = &pending.title {
@@ -368,6 +398,24 @@ impl DevWin {
             eprintln!("tessera-devwin: shell exited ({status})");
             self.shut_down(event_loop);
         }
+    }
+}
+
+/// Whether a frame that came back `status` is retried, counting skipped
+/// frames in a row in `skips`: a skip adds one and is retried while the
+/// streak is at most [`MAX_SKIP_RETRIES`]; a drawn frame ends the streak;
+/// an error leaves it. The event paths reset `skips` themselves.
+fn retry_skipped(skips: &mut u32, status: &Result<FrameStatus, Error>) -> bool {
+    match status {
+        Ok(FrameStatus::Skipped) => {
+            *skips = skips.saturating_add(1);
+            *skips <= MAX_SKIP_RETRIES
+        }
+        Ok(FrameStatus::Presented | FrameStatus::Suboptimal) => {
+            *skips = 0;
+            false
+        }
+        Err(_) => false,
     }
 }
 
@@ -434,6 +482,7 @@ impl ApplicationHandler<Wake> for DevWin {
             WindowEvent::RedrawRequested => self.render(event_loop),
             WindowEvent::Occluded(occluded) => {
                 self.occluded = occluded;
+                self.skips.set(0);
                 if !occluded && let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -520,6 +569,57 @@ impl ApplicationHandler<Wake> for DevWin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A paced skip is retried once and the retry is due: the retry
+    /// interval is longer than the core's frame interval.
+    #[test]
+    fn a_paced_skip_is_retried_late_enough_to_draw() {
+        assert!(SKIPPED_FRAME_RETRY >= tessera_app_core::view::MIN_FRAME_INTERVAL);
+        let mut skips = 0;
+        assert!(
+            retry_skipped(&mut skips, &Ok(FrameStatus::Skipped)),
+            "paced"
+        );
+        assert!(
+            !retry_skipped(&mut skips, &Ok(FrameStatus::Presented)),
+            "the retry drew"
+        );
+        assert_eq!(skips, 0);
+    }
+
+    /// Nothing changed: the window retries twice, then waits for an event
+    /// instead of waking every refresh.
+    #[test]
+    fn an_unchanged_streak_stops_after_two_retries() {
+        let mut skips = 0;
+        let retried: Vec<bool> = (0..6)
+            .map(|_| retry_skipped(&mut skips, &Ok(FrameStatus::Skipped)))
+            .collect();
+        assert_eq!(retried, [true, true, false, false, false, false]);
+        // A drawn frame starts over.
+        assert!(!retry_skipped(&mut skips, &Ok(FrameStatus::Suboptimal)));
+        assert!(retry_skipped(&mut skips, &Ok(FrameStatus::Skipped)));
+        // An error neither counts nor resets.
+        let before = skips;
+        assert!(!retry_skipped(
+            &mut skips,
+            &Err(Error::NoView(SessionId::from_raw(1)))
+        ));
+        assert_eq!(skips, before);
+    }
+
+    /// The event paths reset the streak: after output (or input, a
+    /// resize, an occlusion change, a re-attach) a skip is retried again.
+    #[test]
+    fn a_new_event_starts_the_count_over() {
+        let mut skips = 0;
+        for _ in 0..3 {
+            retry_skipped(&mut skips, &Ok(FrameStatus::Skipped));
+        }
+        assert!(!retry_skipped(&mut skips, &Ok(FrameStatus::Skipped)));
+        skips = 0; // what `drain_mailbox`, `send_now`, `follow_window` do
+        assert!(retry_skipped(&mut skips, &Ok(FrameStatus::Skipped)));
+    }
 
     #[test]
     fn recovery_gives_up_after_three_frames_in_a_row() {

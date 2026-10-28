@@ -47,8 +47,16 @@ pub enum FrameStatus {
     /// [`RenderSurface::resize`] with the view's current size and scale
     /// before the next frame.
     Suboptimal,
-    /// Nothing was drawn: the surface is zero-sized, occluded, or the
-    /// swapchain timed out. Try again on the next display-link tick.
+    /// Nothing was drawn by this call. [`RenderSurface::render`] returns it
+    /// when the surface had nothing to draw into (zero-sized, occluded, or
+    /// no drawable). `tessera-app-core`'s views also return it when nothing
+    /// changed since the last presented frame, and when the frame came
+    /// sooner than their 240-frames-per-second limit allows (paced); the
+    /// three are not told apart yet. A host that renders from a display
+    /// link of up to 240 Hz is never paced and need not retry: its next
+    /// tick draws whatever is pending. A host that renders faster, or from
+    /// output notifications, must schedule another render after a skip,
+    /// since it cannot tell a paced skip from the others.
     Skipped,
 }
 

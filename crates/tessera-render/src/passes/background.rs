@@ -9,30 +9,45 @@ use tessera_grid::Cell;
 
 use super::{CellColors, Instance, Layout};
 use crate::palette::Palette;
+use crate::theme::Rgba;
 
 /// Appends the background quads of `rows` to `out`.
+#[cfg(test)]
 pub(crate) fn push(out: &mut Vec<Instance>, layout: &Layout, palette: &Palette, rows: &[&[Cell]]) {
-    let cols = layout.visible_cols();
     for (r, row) in rows.iter().take(layout.visible_rows()).enumerate() {
+        push_row(out, layout, palette, r, row);
+    }
+}
+
+/// Appends the background quads of row `r`, holding `row`, to `out`.
+pub(crate) fn push_row(
+    out: &mut Vec<Instance>,
+    layout: &Layout,
+    palette: &Palette,
+    r: usize,
+    row: &[Cell],
+) {
+    let cols = layout.visible_cols();
+    {
         // The open run: first column and color.
-        let mut run: Option<(usize, CellColors)> = None;
-        let mut flush = |run: Option<(usize, CellColors)>, end: usize| {
-            if let Some((start, colors)) = run {
+        let mut run: Option<(usize, Rgba)> = None;
+        let mut flush = |run: Option<(usize, Rgba)>, end: usize| {
+            if let Some((start, bg)) = run {
                 out.push(Instance::solid(
                     layout.cells_rect(r, start, end - start),
-                    colors.bg,
+                    bg,
                 ));
             }
         };
         for (c, cell) in row.iter().take(cols).enumerate() {
-            let colors = CellColors::resolve(palette, cell.style);
-            let continues = run.is_some_and(|(_, open)| colors.paint_bg && open.bg == colors.bg);
+            let (paint, bg) = CellColors::background(palette, cell.style);
+            let continues = run.is_some_and(|(_, open)| paint && open == bg);
             if continues {
                 continue;
             }
             flush(run.take(), c);
-            if colors.paint_bg {
-                run = Some((c, colors));
+            if paint {
+                run = Some((c, bg));
             }
         }
         flush(run, row.len().min(cols));

@@ -8,15 +8,22 @@
 //! anchored to their cell rather than to a running pen position, so a
 //! font whose advance is not a whole number of pixels never drifts off the
 //! grid.
+//!
+//! A cell whose grapheme cluster has several scalars (a combining mark, an
+//! emoji ZWJ sequence, a skin-tone modifier, VS16, a flag) is shaped from
+//! the whole cluster text in [`tessera_grid::Line::graphemes`], so the
+//! sequence is drawn as the font composes it, centred in the cell (or the
+//! two cells of a wide cluster).
 
-use tessera_grid::{Cell, Style};
+use tessera_grid::{Cell, GraphemeTable, Line, Style};
 use unicode_width::UnicodeWidthChar;
 
 use crate::atlas::GlyphKey;
 use crate::boxdraw;
 use crate::error::RenderError;
 use crate::font::{
-    FaceId, FontConfig, FontStyle, Fonts, Inner, MAX_SCALE, ResolvedFace, sanitize_font_size,
+    FaceId, FontConfig, FontStyle, Fonts, Inner, MAX_SCALE, RawGlyph, ResolvedFace,
+    sanitize_font_size,
 };
 use crate::size::sanitize_scale;
 
@@ -230,7 +237,7 @@ impl Shaper {
         self.metrics
     }
 
-    /// Shapes one line of cells.
+    /// Shapes one line of cells, each cell from its base character alone.
     ///
     /// Blank and control cells produce no glyph, nor do glyphs that draw
     /// nothing. Box-drawing and block characters (U+2500–U+259F) come from
@@ -252,16 +259,45 @@ impl Shaper {
     /// no glyph, so the wide glyph's `cell_span` stays 1. A cell is wide
     /// when the grid marks it [`Cell::is_wide`], or when it is not a
     /// cluster and its character is two columns wide on its own (cells
-    /// built without the grid's markers). Only a cell's base character is shaped: the
-    /// rest of a grapheme cluster ([`tessera_grid::Line::cluster`]) is not
-    /// drawn yet (ADR 0008).
+    /// built without the grid's markers).
+    ///
+    /// The cells carry only a cluster's base character; use
+    /// [`Self::shape_grid_line`] or [`Self::shape_line_into`] with the
+    /// line's [`GraphemeTable`] to draw whole clusters.
     pub fn shape_line(&mut self, cells: &[Cell]) -> Vec<ShapedGlyph> {
+        let mut out = Vec::with_capacity(cells.len());
+        self.shape_line_into(cells, &GraphemeTable::new(), &mut out);
+        out
+    }
+
+    /// Shapes a grid line with its grapheme clusters: [`Self::shape_line`]
+    /// on `line.cells`, with each [`tessera_grid::CellFlags::CLUSTER`] cell
+    /// shaped from its whole text ([`Line::cluster`]).
+    pub fn shape_grid_line(&mut self, line: &Line) -> Vec<ShapedGlyph> {
+        let mut out = Vec::with_capacity(line.cells.len());
+        self.shape_line_into(&line.cells, &line.graphemes, &mut out);
+        out
+    }
+
+    /// Shapes `cells` into `out`, which is cleared first and keeps its
+    /// allocation (the renderer reuses one vector per row). `clusters` is
+    /// the line's cluster table: a [`tessera_grid::CellFlags::CLUSTER`]
+    /// cell with an entry there is shaped from the whole cluster, in the
+    /// face that covers all of its scalars (the base's face when it does;
+    /// VS16 asks for emoji presentation and VS15 for text). Everything
+    /// else is as [`Self::shape_line`].
+    pub fn shape_line_into(
+        &mut self,
+        cells: &[Cell],
+        clusters: &GraphemeTable,
+        out: &mut Vec<ShapedGlyph>,
+    ) {
+        out.clear();
         let mut inner = self.fonts.lock();
         let ctx = RunContext {
             size_px: self.size_px,
             cell_width: f32_from(self.metrics.width_px),
         };
-        let mut out = Vec::with_capacity(cells.len());
         // Cells the output must cover; only filled in debug builds.
         let checked = if cfg!(debug_assertions) {
             cells.len()
@@ -276,7 +312,8 @@ impl Shaper {
                 i += 1;
                 continue;
             }
-            if boxdraw::is_builtin(cell.ch) {
+            let text = cluster_text(cell, clusters, i);
+            if text.is_none() && boxdraw::is_builtin(cell.ch) {
                 out.push(ShapedGlyph {
                     cell_index: i,
                     cell_span: 1,
@@ -295,44 +332,39 @@ impl Shaper {
                 continue;
             }
             let style = cell_style(cell);
-            // Only the base scalar of a grapheme cluster is shaped; shaping
-            // `Line::cluster` text is deferred to the render work in #21
-            // (ADR 0008).
-            let resolved = inner.resolve(cell.ch, style);
+            let resolved = resolve_cell(&mut inner, cell, text, style);
             let wide = cell_is_wide(cell);
             let isolated = wide || inner.is_color(resolved.face);
             let start = i;
             i += 1;
             while !isolated && i < cells.len() {
                 let next = &cells[i];
+                let next_text = cluster_text(next, clusters, i);
                 if next.is_spacer()
                     || is_blank(next.ch)
-                    || boxdraw::is_builtin(next.ch)
+                    || (next_text.is_none() && boxdraw::is_builtin(next.ch))
                     || cell_is_wide(next)
                     || cell_style(next) != style
-                    || inner.resolve(next.ch, style) != resolved
+                    || resolve_cell(&mut inner, next, next_text, style) != resolved
                 {
                     break;
                 }
                 i += 1;
             }
-            shape_run(
-                &mut inner,
-                &ctx,
-                &cells[start..i],
-                start,
+            let run = Run {
+                cells: &cells[start..i],
+                clusters,
+                first: start,
                 resolved,
                 wide,
-                &mut out,
-                &mut required,
-            );
+            };
+            shape_run(&mut inner, &ctx, &run, out, &mut required);
         }
         debug_assert_eq!(
-            check_partition(&out, &required),
+            check_partition(out, &required),
             Ok(()),
             "shape_line broke the cell partition"
         );
-        out
     }
 
     /// The atlas key for `glyph` at the current size.
@@ -440,55 +472,102 @@ impl Cluster {
     }
 }
 
-/// Shapes `cells` (all drawn by `resolved`) and appends the glyphs to
-/// `out`; `first` is the index of `cells[0]` in the line. In debug builds
-/// it also marks in `required` (indexed like the line) the cells the
-/// output must cover.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "internal helper threading the line's state"
-)]
-fn shape_run(
-    inner: &mut Inner,
-    ctx: &RunContext,
-    cells: &[Cell],
+/// One run of cells drawn by one face.
+struct Run<'a> {
+    /// The run's cells.
+    cells: &'a [Cell],
+    /// The line's cluster table (indexed by line column).
+    clusters: &'a GraphemeTable,
+    /// Index of `cells[0]` in the line.
     first: usize,
     resolved: ResolvedFace,
     wide: bool,
-    out: &mut Vec<ShapedGlyph>,
-    required: &mut [bool],
-) {
-    let mut text = String::with_capacity(cells.len());
-    let starts: Vec<usize> = cells
-        .iter()
-        .map(|c| {
-            let at = text.len();
-            text.push(c.ch);
-            at
-        })
-        .collect();
-    let cell_of = |byte: usize| starts.partition_point(|&s| s <= byte).saturating_sub(1);
-    let raw = inner.shape(resolved.face, &text, ctx.size_px);
-    let is_color = inner.is_color(resolved.face);
-    let face = resolved.face;
+}
 
-    // Group glyphs by cluster and anchor each cluster to its cell, centred
-    // in the cells it spans (two per cell for wide characters).
-    let mut placed = Vec::with_capacity(raw.len());
-    let mut clusters: Vec<Cluster> = Vec::new();
+/// A shaper cluster before classification: the cells `cell..cell + span`
+/// of the run and the glyphs `glyphs` of the shaper output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawCluster {
+    cell: usize,
+    span: usize,
+    glyphs: std::ops::Range<usize>,
+}
+
+/// Groups the shaper's glyphs by cluster and maps each cluster to the run
+/// cells it covers. `cell_of` maps a cluster's byte offset in the run text
+/// to its cell; a cluster spans up to the next cluster's cell (at least
+/// one), the last one to the end of the run (`cells`).
+fn group_clusters(
+    raw: &[RawGlyph],
+    cell_of: impl Fn(usize) -> usize,
+    cells: usize,
+) -> Vec<RawCluster> {
+    let mut out = Vec::new();
     let mut g = 0;
     while g < raw.len() {
         let cluster = raw[g].cluster;
         let end = g + raw[g..].iter().take_while(|r| r.cluster == cluster).count();
         let cell = cell_of(cluster);
-        let next_cell = raw.get(end).map_or(cells.len(), |r| cell_of(r.cluster));
-        let span = next_cell.saturating_sub(cell).max(1);
-        let advance: f32 = raw[g..end].iter().map(|r| r.x_advance).sum();
+        let next_cell = raw.get(end).map_or(cells, |r| cell_of(r.cluster));
+        out.push(RawCluster {
+            cell,
+            span: next_cell.saturating_sub(cell).max(1),
+            glyphs: g..end,
+        });
+        g = end;
+    }
+    out
+}
+
+/// Shapes `run` and appends the glyphs to `out`. In debug builds it also
+/// marks in `required` (indexed like the line) the cells the output must
+/// cover.
+fn shape_run(
+    inner: &mut Inner,
+    ctx: &RunContext,
+    run: &Run<'_>,
+    out: &mut Vec<ShapedGlyph>,
+    required: &mut [bool],
+) {
+    let Run {
+        cells,
+        clusters: table,
+        first,
+        resolved,
+        wide,
+    } = *run;
+    let mut text = String::with_capacity(cells.len());
+    // Byte offset of each cell's text, plus the end.
+    let mut starts: Vec<usize> = Vec::with_capacity(cells.len() + 1);
+    for (k, c) in cells.iter().enumerate() {
+        starts.push(text.len());
+        match cluster_text(c, table, first + k) {
+            Some(cluster) => text.push_str(cluster),
+            None => text.push(c.ch),
+        }
+    }
+    starts.push(text.len());
+    let cell_of = |byte: usize| {
+        starts[..cells.len()]
+            .partition_point(|&s| s <= byte)
+            .saturating_sub(1)
+    };
+    let raw = inner.shape(resolved.face, &text, ctx.size_px);
+    let is_color = inner.is_color(resolved.face);
+    let face = resolved.face;
+
+    // Anchor each cluster to its cell, centred in the cells it spans (two
+    // per cell for wide characters).
+    let mut placed = Vec::with_capacity(raw.len());
+    let mut clusters: Vec<Cluster> = Vec::new();
+    for group in group_clusters(&raw, cell_of, cells.len()) {
+        let RawCluster { cell, span, glyphs } = group;
+        let advance: f32 = raw[glyphs.clone()].iter().map(|r| r.x_advance).sum();
         let columns = if wide { 2 * span } else { span };
         let centre = (ctx.cell_width * f32_from_usize(columns) - advance) / 2.0;
         let mut pen = 0.0;
         let from = placed.len();
-        for r in &raw[g..end] {
+        for r in &raw[glyphs] {
             placed.push(Placed {
                 glyph_id: r.glyph_id,
                 x: centre + pen + r.x_offset,
@@ -497,15 +576,15 @@ fn shape_run(
             });
             pen += r.x_advance;
         }
-        let own = &cells[cell..(cell + span).min(cells.len())];
-        let kind = classify(inner, face, ctx.size_px, own, &placed[from..]);
+        let end = (cell + span).min(cells.len());
+        let own_text = &text[starts[cell]..starts[end]];
+        let kind = classify(inner, face, ctx.size_px, own_text, span, &placed[from..]);
         clusters.push(Cluster {
             cell,
             span,
             glyphs: from..placed.len(),
             kind,
         });
-        g = end;
     }
 
     let owners = partition(&clusters, &placed, ctx.cell_width);
@@ -555,26 +634,28 @@ fn shape_run(
     }
 }
 
-/// Classifies a cluster from its glyphs and the cells `own` it spans.
+/// Classifies a cluster from its glyphs, `own` (the text of the `span`
+/// cells it covers, every scalar of their grapheme clusters).
 fn classify(
     inner: &mut Inner,
     face: FaceId,
     size_px: f32,
-    own: &[Cell],
+    own: &str,
+    span: usize,
     glyphs: &[Placed],
 ) -> ClusterKind {
     if glyphs.iter().any(|p| p.ink.is_some()) {
         let substituted = glyphs.iter().filter(|p| p.ink.is_some()).any(|p| {
-            own.iter()
-                .all(|c| inner.nominal_glyph(face, c.ch) != p.glyph_id)
+            own.chars()
+                .all(|ch| inner.nominal_glyph(face, ch) != p.glyph_id)
         });
         ClusterKind::Drawing {
-            ligature: own.len() > 1 || substituted,
+            ligature: span > 1 || substituted,
         }
-    } else if own.iter().all(|c| is_default_ignorable(c.ch)) {
+    } else if own.chars().all(is_default_ignorable) {
         ClusterKind::Ignorable
-    } else if own.iter().any(|c| {
-        let nominal = inner.nominal_glyph(face, c.ch);
+    } else if own.chars().any(|ch| {
+        let nominal = inner.nominal_glyph(face, ch);
         nominal != 0 && inner.ink_extent(face, nominal, size_px).is_some()
     }) {
         ClusterKind::Spacer
@@ -732,6 +813,64 @@ fn check_partition(glyphs: &[ShapedGlyph], required: &[bool]) -> Result<(), Stri
         Some(cell) => Err(format!("cell {cell} is not covered")),
         None => Ok(()),
     }
+}
+
+/// The full cluster text of `cell` at line column `col`, when it is a
+/// cluster cell and `clusters` has its entry.
+fn cluster_text<'a>(cell: &Cell, clusters: &'a GraphemeTable, col: usize) -> Option<&'a str> {
+    if cell.is_cluster() {
+        clusters.get(col)
+    } else {
+        None
+    }
+}
+
+/// The face drawing `cell`, whose cluster text is `text` (`None` for a
+/// plain cell): the base character's face, with the presentation a
+/// variation selector asks for, when it covers every visible scalar of
+/// the cluster; else the face of the first scalar it misses, when that
+/// one covers them all; else the base character's face (the rest draw
+/// `.notdef`).
+fn resolve_cell(
+    inner: &mut Inner,
+    cell: &Cell,
+    text: Option<&str>,
+    style: FontStyle,
+) -> ResolvedFace {
+    let Some(text) = text else {
+        return inner.resolve(cell.ch, style);
+    };
+    let base = match presentation(text) {
+        Some(emoji) => inner.resolve_presented(cell.ch, style, emoji),
+        None => inner.resolve(cell.ch, style),
+    };
+    let Some(missing) = first_uncovered(inner, base.face, text) else {
+        return base;
+    };
+    let other = inner.resolve(missing, style);
+    if other != base && first_uncovered(inner, other.face, text).is_none() {
+        other
+    } else {
+        base
+    }
+}
+
+/// The first scalar of `text` that `face` has no glyph for, ignoring the
+/// ones the shaper hides (ZWJ, variation selectors).
+fn first_uncovered(inner: &mut Inner, face: FaceId, text: &str) -> Option<char> {
+    text.chars()
+        .filter(|&ch| !is_default_ignorable(ch))
+        .find(|&ch| inner.nominal_glyph(face, ch) == 0)
+}
+
+/// The presentation a cluster's variation selector asks for: emoji for
+/// VS16 (U+FE0F), text for VS15 (U+FE0E), the base's default otherwise.
+fn presentation(text: &str) -> Option<bool> {
+    text.chars().find_map(|ch| match ch {
+        '\u{FE0F}' => Some(true),
+        '\u{FE0E}' => Some(false),
+        _ => None,
+    })
 }
 
 fn cell_style(cell: &Cell) -> FontStyle {
@@ -1136,6 +1275,86 @@ mod tests {
             (4, 1, ClusterKind::Blank, None),
         ]);
         assert_eq!(merged, [Some(0), Some(1), None]);
+    }
+
+    fn raw(cluster: usize) -> RawGlyph {
+        RawGlyph {
+            glyph_id: 1,
+            cluster,
+            x_advance: 10.0,
+            x_offset: 0.0,
+            y_offset: 0.0,
+        }
+    }
+
+    /// #19 follow-up: raw glyphs are grouped by cluster without a font.
+    /// `starts` are the byte offsets of the run's cells.
+    #[test]
+    fn raw_glyphs_group_into_clusters_over_their_cells() {
+        let group = |raw: &[RawGlyph], starts: &[usize]| -> Vec<(usize, usize, usize)> {
+            let cell_of = |byte: usize| starts.partition_point(|&s| s <= byte).saturating_sub(1);
+            group_clusters(raw, cell_of, starts.len())
+                .into_iter()
+                .map(|c| (c.cell, c.span, c.glyphs.len()))
+                .collect()
+        };
+        // One glyph per cell.
+        assert_eq!(
+            group(&[raw(0), raw(1), raw(2)], &[0, 1, 2]),
+            [(0, 1, 1), (1, 1, 1), (2, 1, 1)]
+        );
+        // A base and its mark share a cluster: one cell, two glyphs.
+        assert_eq!(
+            group(&[raw(0), raw(0), raw(3)], &[0, 3]),
+            [(0, 1, 2), (1, 1, 1)]
+        );
+        // A merged cluster (Monaspace) spans every cell up to the next one.
+        assert_eq!(
+            group(&[raw(0), raw(0), raw(0), raw(3)], &[0, 1, 2, 3]),
+            [(0, 3, 3), (3, 1, 1)]
+        );
+        // The last cluster spans to the end of the run.
+        assert_eq!(
+            group(&[raw(0), raw(1)], &[0, 1, 2, 3]),
+            [(0, 1, 1), (1, 3, 1)]
+        );
+        // A cluster byte inside a multi-byte cell maps to that cell.
+        assert_eq!(group(&[raw(0), raw(5)], &[0, 4, 8]), [(0, 1, 1), (1, 2, 1)]);
+        assert_eq!(group(&[], &[0, 1]), []);
+    }
+
+    /// #19 follow-up: Cascadia Code's bold `<<=` (and `<$>`) shape as a
+    /// two-cell drawer over `<<` (with one spacer) and `=` drawn on its
+    /// own; the partition keeps that as [(0, 2), (2, 1)] rather than
+    /// handing `=` to the ligature.
+    #[test]
+    fn a_drawn_last_character_keeps_its_own_cell() {
+        let lig = ClusterKind::Drawing { ligature: true };
+        let sp = ClusterKind::Spacer;
+        // `<` draws `<<` reaching into the spacer; `=` draws itself.
+        let owners = owners_of(&[
+            (0, 1, lig, Some((0.1, 1.9))),
+            (1, 1, sp, None),
+            (2, 1, lig, Some((-0.4, 0.9))),
+        ]);
+        assert_eq!(owners, [Some(0), Some(0), Some(2)]);
+    }
+
+    /// #19 follow-up, still open (ADR 0016): a combining mark on the last
+    /// character of a leading-drawer ligature (Cascadia `->` + U+0301 on
+    /// `>`) makes that character's cluster draw (the mark has ink), so it
+    /// owns its cell and the ligature's span shrinks to one cell. The
+    /// arrow is still drawn whole; only its logical extent (cursor,
+    /// selection) changes. Pinned here so a fix is a visible change.
+    #[test]
+    fn a_mark_on_a_ligature_spacer_shortens_the_ligature() {
+        let lig = ClusterKind::Drawing { ligature: true };
+        let owners = owners_of(&[
+            (0, 1, lig, Some((0.1, 1.9))),
+            // `>` is an empty spacer glyph plus an inked mark.
+            (1, 1, lig, Some((0.3, 0.7))),
+        ]);
+        assert_eq!(owners, [Some(0), Some(1)]);
     }
 
     #[test]

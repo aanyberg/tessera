@@ -25,14 +25,15 @@ use crate::palette::Palette;
 use crate::shaping::ShapedGlyph;
 use crate::theme::Rgba;
 
-/// Appends the cursor of `frame` to `out`.
-pub(crate) fn push(
+/// Appends the cursor of `frame` to `out`; `shaped` gives a row's shaped
+/// glyphs (the block cursor redraws the ones covering its cell).
+pub(crate) fn push<'g>(
     out: &mut Vec<Instance>,
     layout: &Layout,
     palette: &Palette,
     color: Rgba,
     frame: &FrameInput<'_>,
-    shaped: &[Vec<ShapedGlyph>],
+    shaped: impl Fn(usize) -> Option<&'g [ShapedGlyph]>,
     source: &mut GlyphSource<'_>,
 ) -> Result<(), RenderError> {
     let Some((cursor, shape)) = frame.drawn_cursor() else {
@@ -51,7 +52,7 @@ pub(crate) fn push(
     }
     // Redraw the glyphs covering the cell in its background color.
     let cells = frame.rows.get(row).copied().unwrap_or_default();
-    let (Some(cell), Some(glyphs)) = (cells.get(col), shaped.get(row)) else {
+    let (Some(cell), Some(glyphs)) = (cells.get(col), shaped(row)) else {
         return Ok(());
     };
     // Scaled by the cursor's opacity: alpha 0 draws exactly nothing and
@@ -59,8 +60,8 @@ pub(crate) fn push(
     // blend of the inverted and the plain cell; the cursor color stays
     // under the glyph, an excess of a·c·(1−a)·(cursor − plain) for
     // coverage c (ADR 0010).
-    let tint = CellColors::resolve(palette, cell.style)
-        .bg
+    let tint = CellColors::background(palette, cell.style)
+        .1
         .with_alpha(color.clamped().a);
     let clip = [x, y, x + w, y + h];
     let covering = glyphs

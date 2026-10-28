@@ -6,6 +6,13 @@
 //! 24 greys from `#080808` to `#eeeeee` in steps of 10. Both are computed
 //! here rather than stored in the theme, which is what every terminal that
 //! emulates xterm does: themes customise the 16 ANSI colors only.
+//!
+//! Resolving a cell's color is on the per-cell path of every frame, so it
+//! never evaluates the sRGB transfer function: 24-bit channels go through a
+//! 256-entry sRGB-to-linear table, and dimmed colors through tables built
+//! once per palette (#21).
+
+use std::sync::LazyLock;
 
 use tessera_grid::Color;
 
@@ -54,17 +61,45 @@ pub const fn indexed_srgb(index: u8) -> Option<[u8; 3]> {
     }
 }
 
+/// Linear light of every sRGB byte: `SRGB_TO_LINEAR[b]` is exactly the
+/// channel [`Rgba::from_srgb8`] computes for `b`.
+static SRGB_TO_LINEAR: LazyLock<[f32; 256]> =
+    LazyLock::new(|| std::array::from_fn(|b| Rgba::from_srgb8(byte(b), 0, 0).r));
+
+/// [`dim`] of a channel that is sRGB byte `b`: exactly what `dim` gives for
+/// a color built with [`Rgba::from_srgb8`].
+static DIM_SRGB_TO_LINEAR: LazyLock<[f32; 256]> =
+    LazyLock::new(|| std::array::from_fn(|b| dim(Rgba::from_srgb8(byte(b), 0, 0)).r));
+
+/// `i` (below 256) as a byte.
+fn byte(i: usize) -> u8 {
+    u8::try_from(i).unwrap_or(u8::MAX)
+}
+
+/// The linear value of sRGB byte `b`, from a table: bit-exact with
+/// [`Rgba::from_srgb8`], without evaluating the transfer function.
+#[must_use]
+pub fn srgb8_to_linear(b: u8) -> f32 {
+    SRGB_TO_LINEAR[usize::from(b)]
+}
+
 /// A theme's colors resolved once into linear [`Rgba`], for a frame's
 /// worth of lookups.
 ///
 /// Built from a [`Theme`] by [`Palette::new`]; [`Palette::resolve`] gives
 /// the same answers as [`Theme::resolve`] without recomputing the cube or
-/// the sRGB decode per cell.
+/// the sRGB decode per cell, and [`Palette::resolve_dim`] the same as
+/// dimming the result, from tables.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Palette {
     indexed: [Rgba; 256],
+    indexed_dim: [Rgba; 256],
     foreground: Rgba,
+    foreground_dim: Rgba,
     background: Rgba,
+    /// The default background made opaque and dimmed (a dim cell with
+    /// inverse video draws its glyph in it).
+    background_dim: Rgba,
 }
 
 impl Palette {
@@ -75,10 +110,14 @@ impl Palette {
             let i = u8::try_from(i).unwrap_or(u8::MAX);
             theme.resolve(Color::Indexed(i), ColorSlot::Foreground)
         });
+        let foreground = theme.foreground.with_alpha(1.0);
         Self {
             indexed,
-            foreground: theme.foreground.with_alpha(1.0),
+            indexed_dim: indexed.map(dim),
+            foreground,
+            foreground_dim: dim(foreground),
             background: theme.background,
+            background_dim: dim(theme.background.with_alpha(1.0)),
         }
     }
 
@@ -110,7 +149,29 @@ impl Palette {
                 ColorSlot::Background => self.background,
             },
             Color::Indexed(i) => self.indexed(i),
-            Color::Rgb(r, g, b) => Rgba::from_srgb8(r, g, b),
+            Color::Rgb(r, g, b) => Rgba::new(
+                srgb8_to_linear(r),
+                srgb8_to_linear(g),
+                srgb8_to_linear(b),
+                1.0,
+            ),
+        }
+    }
+
+    /// `color` in `slot` made opaque and dimmed: exactly
+    /// `dim(self.resolve(color, slot).with_alpha(1.0))`, from tables.
+    #[must_use]
+    pub fn resolve_dim(&self, color: Color, slot: ColorSlot) -> Rgba {
+        match color {
+            Color::Default => match slot {
+                ColorSlot::Foreground => self.foreground_dim,
+                ColorSlot::Background => self.background_dim,
+            },
+            Color::Indexed(i) => self.indexed_dim[usize::from(i)],
+            Color::Rgb(r, g, b) => {
+                let t = &*DIM_SRGB_TO_LINEAR;
+                Rgba::new(t[usize::from(r)], t[usize::from(g)], t[usize::from(b)], 1.0)
+            }
         }
     }
 }
@@ -236,6 +297,77 @@ mod tests {
                 .to_srgb8(),
             [0x12, 0x34, 0x56]
         );
+    }
+
+    /// The table is bit-exact with the transfer function for every byte,
+    /// in both directions of use: a 24-bit color and its dimmed version.
+    #[test]
+    fn srgb_tables_are_bit_exact() {
+        let palette = Palette::new(&Theme::default());
+        for b in 0..=255u8 {
+            let reference = Rgba::from_srgb8(b, b, b);
+            assert_eq!(srgb8_to_linear(b).to_bits(), reference.r.to_bits(), "{b}");
+            let rgb = Color::Rgb(b, 255 - b, b / 2);
+            for slot in [ColorSlot::Foreground, ColorSlot::Background] {
+                let resolved = palette.resolve(rgb, slot);
+                let reference = Rgba::from_srgb8(b, 255 - b, b / 2);
+                assert_eq!(resolved, reference, "{rgb:?}");
+                let dimmed = palette.resolve_dim(rgb, slot);
+                let reference = dim(reference.with_alpha(1.0));
+                for (got, want) in [
+                    (dimmed.r, reference.r),
+                    (dimmed.g, reference.g),
+                    (dimmed.b, reference.b),
+                    (dimmed.a, reference.a),
+                ] {
+                    assert_eq!(got.to_bits(), want.to_bits(), "dim {rgb:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dim_tables_match_dimming_every_palette_color() {
+        let theme = Theme {
+            background: Rgba::new(0.1, 0.2, 0.3, 0.4),
+            ..Theme::default()
+        };
+        let palette = Palette::new(&theme);
+        let colors = (0..=255u8)
+            .map(Color::Indexed)
+            .chain([Color::Default, Color::Rgb(1, 2, 3)]);
+        for color in colors {
+            for slot in [ColorSlot::Foreground, ColorSlot::Background] {
+                let want = dim(palette.resolve(color, slot).with_alpha(1.0));
+                assert_eq!(palette.resolve_dim(color, slot), want, "{color:?} {slot:?}");
+            }
+        }
+    }
+
+    /// The per-cell path never evaluates the sRGB transfer function: no
+    /// file of it calls `f32::pow*`, and the passes neither decode sRGB
+    /// nor dim on their own (the tables above do, once per palette).
+    #[test]
+    fn no_transfer_function_on_the_per_cell_path() {
+        let pow = concat!("pow", "f");
+        let passes = [
+            ("passes/mod.rs", include_str!("passes/mod.rs")),
+            ("passes/background.rs", include_str!("passes/background.rs")),
+            ("passes/glyph.rs", include_str!("passes/glyph.rs")),
+            ("passes/decoration.rs", include_str!("passes/decoration.rs")),
+            ("passes/cursor.rs", include_str!("passes/cursor.rs")),
+        ];
+        assert_eq!(include_str!("palette.rs").matches(pow).count(), 0);
+        for (name, source) in passes {
+            for needle in [
+                pow,
+                concat!("srgb_", "decode("),
+                concat!("from_", "srgb8("),
+                " dim(",
+            ] {
+                assert_eq!(source.matches(needle).count(), 0, "{name} calls {needle}");
+            }
+        }
     }
 
     #[test]

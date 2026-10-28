@@ -79,9 +79,23 @@ impl DecorationGeometry {
 const DECORATIONS: u16 = Style::UNDERLINE | Style::DOUBLE_UNDERLINE | Style::STRIKETHROUGH;
 
 /// Appends the decoration bars of `rows` to `out`.
+#[cfg(test)]
 pub(crate) fn push(out: &mut Vec<Instance>, layout: &Layout, palette: &Palette, rows: &[&[Cell]]) {
-    let cols = layout.visible_cols();
     for (r, row) in rows.iter().take(layout.visible_rows()).enumerate() {
+        push_row(out, layout, palette, r, row);
+    }
+}
+
+/// Appends the decoration bars of row `r`, holding `row`, to `out`.
+pub(crate) fn push_row(
+    out: &mut Vec<Instance>,
+    layout: &Layout,
+    palette: &Palette,
+    r: usize,
+    row: &[Cell],
+) {
+    let cols = layout.visible_cols();
+    {
         let mut run: Option<(usize, Style, Rgba)> = None;
         let mut flush = |run: Option<(usize, Style, Rgba)>, end: usize| {
             let Some((start, style, color)) = run else {
@@ -99,7 +113,7 @@ pub(crate) fn push(out: &mut Vec<Instance>, layout: &Layout, palette: &Palette, 
         for (c, cell) in row.iter().take(cols).enumerate() {
             let decorated = cell.style.flags & DECORATIONS != 0 && !cell.style.has(Style::HIDDEN);
             let key = decorated.then(|| {
-                let fg = CellColors::resolve(palette, cell.style).fg;
+                let fg = CellColors::foreground(palette, cell.style);
                 (cell.style.flags & DECORATIONS, fg)
             });
             let continues = match (run, key) {

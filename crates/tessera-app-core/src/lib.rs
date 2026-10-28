@@ -633,6 +633,18 @@ impl App {
     /// hollow while the session is not focused ([`App::is_focused`]).
     /// Must be called on the main thread.
     ///
+    /// [`FrameStatus::Skipped`] means nothing was drawn by this call, for
+    /// one of three reasons: nothing changed since the last presented
+    /// frame (an idle terminal does no GPU work), the call came sooner than
+    /// the [`view::MIN_FRAME_INTERVAL`] schedule allows (paced, at most 240
+    /// frames per second: the newest content is drawn by a later call), or
+    /// the surface had nothing to draw into (zero-sized, occluded, no
+    /// drawable). A host that renders from a display link of up to 240 Hz
+    /// is never paced and need not retry: its next tick draws whatever is
+    /// pending. A host that renders faster, or from output notifications,
+    /// must schedule another render after a skip, since it cannot yet tell
+    /// a paced skip from the others (ADR 0016).
+    ///
     /// # Errors
     ///
     /// [`Error::SessionNotFound`] if `id` is not a live session,

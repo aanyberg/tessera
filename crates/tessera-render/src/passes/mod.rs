@@ -26,7 +26,7 @@ use bytemuck::{Pod, Zeroable};
 use tessera_grid::{Color, Style};
 
 use crate::atlas::{AtlasLayer, AtlasSlot};
-use crate::palette::{ColorSlot, Palette, dim};
+use crate::palette::{ColorSlot, Palette};
 use crate::shaping::CellMetrics;
 use crate::size::PhysicalSize;
 use crate::theme::Rgba;
@@ -232,16 +232,44 @@ impl CellColors {
     /// Inverse video swaps the resolved colors; a background that is not
     /// the theme default (explicit, or swapped in by inverse) is opaque,
     /// and so is every foreground. Dim applies to the final foreground.
+    #[cfg(test)]
     pub fn resolve(palette: &Palette, style: Style) -> Self {
-        let fg = palette.resolve(style.fg, ColorSlot::Foreground);
-        let bg = palette.resolve(style.bg, ColorSlot::Background);
-        let inverse = style.has(Style::INVERSE);
-        let (fg, bg) = if inverse { (bg, fg) } else { (fg, bg) };
-        let paint_bg = inverse || style.bg != Color::Default;
-        let fg = fg.with_alpha(1.0);
-        let fg = if style.has(Style::DIM) { dim(fg) } else { fg };
-        let bg = if paint_bg { bg.with_alpha(1.0) } else { bg };
-        Self { fg, bg, paint_bg }
+        let (paint_bg, bg) = Self::background(palette, style);
+        Self {
+            fg: Self::foreground(palette, style),
+            bg,
+            paint_bg,
+        }
+    }
+
+    /// The glyph and decoration color of `style` alone (what
+    /// [`Self::resolve`] gives as `fg`), for the passes that need nothing
+    /// else.
+    pub fn foreground(palette: &Palette, style: Style) -> Rgba {
+        let (color, slot) = if style.has(Style::INVERSE) {
+            (style.bg, ColorSlot::Background)
+        } else {
+            (style.fg, ColorSlot::Foreground)
+        };
+        if style.has(Style::DIM) {
+            palette.resolve_dim(color, slot)
+        } else {
+            palette.resolve(color, slot).with_alpha(1.0)
+        }
+    }
+
+    /// Whether the background pass paints `style`'s background, and its
+    /// color (what [`Self::resolve`] gives as `paint_bg` and `bg`).
+    pub fn background(palette: &Palette, style: Style) -> (bool, Rgba) {
+        if style.has(Style::INVERSE) {
+            let fg = palette.resolve(style.fg, ColorSlot::Foreground);
+            (true, fg.with_alpha(1.0))
+        } else if style.bg == Color::Default {
+            (false, palette.background())
+        } else {
+            let bg = palette.resolve(style.bg, ColorSlot::Background);
+            (true, bg.with_alpha(1.0))
+        }
     }
 }
 
@@ -337,6 +365,55 @@ mod tests {
         );
         assert!(explicit.paint_bg, "an explicit bg is painted even if equal");
         assert!((explicit.bg.a - 1.0).abs() < f32::EPSILON);
+    }
+
+    /// The split lookups give exactly what resolving both colors, swapping
+    /// for inverse and dimming afterwards gave (#20's formula).
+    #[test]
+    fn split_lookups_match_the_reference_formula() {
+        let theme = Theme {
+            background: Rgba::new(0.2, 0.1, 0.0, 0.5),
+            ..Theme::default()
+        };
+        let palette = Palette::new(&theme);
+        let reference = |style: Style| {
+            let fg = palette.resolve(style.fg, ColorSlot::Foreground);
+            let bg = palette.resolve(style.bg, ColorSlot::Background);
+            let inverse = style.has(Style::INVERSE);
+            let (fg, bg) = if inverse { (bg, fg) } else { (fg, bg) };
+            let paint_bg = inverse || style.bg != Color::Default;
+            let fg = fg.with_alpha(1.0);
+            let fg = if style.has(Style::DIM) {
+                crate::palette::dim(fg)
+            } else {
+                fg
+            };
+            let bg = if paint_bg { bg.with_alpha(1.0) } else { bg };
+            CellColors { fg, bg, paint_bg }
+        };
+        let colors = [
+            Color::Default,
+            Color::Indexed(3),
+            Color::Indexed(200),
+            Color::Rgb(250, 128, 7),
+        ];
+        for fg in colors {
+            for bg in colors {
+                for flags in [0, Style::INVERSE, Style::DIM, Style::INVERSE | Style::DIM] {
+                    let style = Style {
+                        fg,
+                        bg,
+                        flags,
+                        ..Style::DEFAULT
+                    };
+                    assert_eq!(
+                        CellColors::resolve(&palette, style),
+                        reference(style),
+                        "{style:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

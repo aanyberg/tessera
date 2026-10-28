@@ -7,6 +7,7 @@ use std::mem;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use crate::damage::{Damage, DamageRows, DamageTracker};
 use crate::grapheme::MAX_CLUSTER_SCALARS;
 use crate::reflow::{self, ScreenMut, Size};
 use crate::{Cell, CellFlags, Line, Point, Scrollback, Style, TabStops, char_width};
@@ -149,6 +150,8 @@ pub struct Grid {
     /// The stashed primary screen; `Some` exactly while the alternate screen
     /// is active. [`Grid::resize`] resizes it together with `lines`.
     primary: Option<Box<Screen>>,
+    /// Which visible rows changed (ADR 0016).
+    damage: DamageTracker,
 }
 
 impl Grid {
@@ -181,6 +184,7 @@ impl Grid {
             saved: SavedCursor::INITIAL,
             tabs: TabStops::new(cols),
             primary: None,
+            damage: DamageTracker::new(rows),
         }
     }
 
@@ -238,8 +242,13 @@ impl Grid {
     /// Callers must keep `cells.len() == cols()`, and the wide-character
     /// pairing and grapheme table consistent (see [`Line`]); this is how
     /// shell integration attaches marks.
+    ///
+    /// The row counts as damaged ([`Grid::damage`]) whatever the caller
+    /// does with it.
     pub fn line_mut(&mut self, row: u16) -> Option<&mut Line> {
-        self.lines.get_mut(usize::from(row))
+        let line = self.lines.get_mut(usize::from(row))?;
+        self.damage.extend_row(row);
+        Some(line)
     }
 
     /// The cell at `point`, if in range.
@@ -292,6 +301,49 @@ impl Grid {
     /// The active scroll region.
     pub fn scroll_region(&self) -> ScrollRegion {
         self.region
+    }
+
+    /// The visible rows changed since the last [`Grid::take_damage`] (all
+    /// of them for a new grid), and the current damage generation.
+    ///
+    /// Every primitive that changes a visible cell, a line's wrap flag or
+    /// the cursor position records the rows it touched: writes and edits
+    /// at the cursor its row, a cursor move the row it leaves and the row
+    /// it lands on, scrolls and line insertion the rows of the region, and
+    /// a full-screen scroll, an alternate-screen switch, a resize, a reset
+    /// or erasing the whole display everything. [`Grid::line_mut`] counts
+    /// as a change of its row. The answer may include rows that did not
+    /// change, never omits one that did (ADR 0016).
+    #[must_use]
+    pub fn damage(&self) -> Damage {
+        self.damage.current(self.cursor.row)
+    }
+
+    /// Like [`Grid::damage`], then starts over: the next call reports only
+    /// what changes after this one.
+    pub fn take_damage(&mut self) -> Damage {
+        self.damage.take(self.cursor.row)
+    }
+
+    /// The visible rows changed after `generation`, a
+    /// [`Damage::generation`] this grid reported earlier, for readers that
+    /// only hold `&Grid`. A generation this grid did not hand out (another
+    /// grid's, a clone's, or `0`) gives [`DamageRows::All`].
+    /// [`Grid::take_damage`] does not affect the answer. The cursor's row
+    /// is reported from the moment the cursor arrives on it until it leaves
+    /// (or an owner takes the damage), whether or not anything on it
+    /// changed and even if the reader already saw that change, so a reader
+    /// that needs exact answers compares that row itself.
+    #[must_use]
+    pub fn damage_since(&self, generation: u64) -> DamageRows {
+        self.damage.since(generation, self.cursor.row)
+    }
+
+    /// The current damage generation, what [`Grid::damage`] reports as
+    /// [`Damage::generation`], without computing the damaged rows.
+    #[must_use]
+    pub fn damage_generation(&self) -> u64 {
+        self.damage.generation()
     }
 
     /// The tab stops.
@@ -367,6 +419,7 @@ impl Grid {
         if self.pending_wrap {
             self.wrap();
         }
+        self.damage.touch_cursor_row();
         let Point { row, col } = self.cursor;
         let pen = self.pen;
         let line = &mut self.lines[usize::from(row)];
@@ -516,6 +569,7 @@ impl Grid {
     /// Adds `ch` to the cluster `plan` names and resizes the cell.
     fn attach(&mut self, ch: char, plan: Attach) {
         let Attach { col: base, width } = plan;
+        self.damage.touch_cursor_row();
         let pen = self.pen;
         let line = &mut self.lines[usize::from(self.cursor.row)];
         let cell = line.cells[base];
@@ -543,6 +597,7 @@ impl Grid {
                 line.blank_at(base + 1, pen);
                 self.pending_wrap = false;
                 self.cursor.col = u16::try_from(base + 1).unwrap_or(self.cols - 1);
+                // The row was touched above.
             }
             Ordering::Equal => {}
         }
@@ -560,6 +615,7 @@ impl Grid {
             self.pad_last_column();
             self.wrap();
         }
+        self.damage.touch_cursor_row();
         let Point { row, col } = self.cursor;
         let col = usize::from(col);
         let pen = self.pen;
@@ -589,6 +645,7 @@ impl Grid {
     pub fn pad_last_column(&mut self) {
         let last = usize::from(self.cols - 1);
         let pen = self.pen;
+        self.damage.touch_cursor_row();
         let line = &mut self.lines[usize::from(self.cursor.row)];
         line.fill(last..last + 1, pen);
         line.cells[last] = Cell::pad_with(pen);
@@ -597,6 +654,7 @@ impl Grid {
     /// Moves the cursor to column `col` after a write, or arms pending
     /// wrap on the last column when the write reached the end of the line.
     fn advance_to(&mut self, col: usize) {
+        // Only ever called after a write, which touched the cursor row.
         match u16::try_from(col) {
             Ok(col) if col < self.cols => {
                 self.cursor.col = col;
@@ -615,6 +673,7 @@ impl Grid {
     fn wrap(&mut self) {
         self.pending_wrap = false;
         self.lines[usize::from(self.cursor.row)].wrapped = true;
+        self.damage.touch_cursor_row();
         self.cursor.col = 0;
         self.line_feed();
     }
@@ -624,10 +683,29 @@ impl Grid {
     /// Moves the cursor to `(row, col)`, clamped to the screen (CUP).
     pub fn goto(&mut self, row: u16, col: u16) {
         self.pending_wrap = false;
-        self.cursor = Point {
+        self.move_cursor(Point {
             row: row.min(self.rows - 1),
             col: col.min(self.cols - 1),
-        };
+        });
+    }
+
+    /// Moves the cursor to `to` (in range) and records the damage: the row
+    /// it leaves and the row it lands on.
+    #[inline]
+    fn move_cursor(&mut self, to: Point) {
+        if to.row == self.cursor.row {
+            self.damage.touch_cursor_row();
+        } else {
+            self.damage.cursor_left_row(self.cursor.row);
+        }
+        self.cursor = to;
+    }
+
+    /// Moves the cursor to column `col` (in range) of its row.
+    #[inline]
+    fn move_cursor_col(&mut self, col: u16) {
+        self.damage.touch_cursor_row();
+        self.cursor.col = col;
     }
 
     /// Moves the cursor to `row` in its current column (VPA).
@@ -650,7 +728,8 @@ impl Grid {
         } else {
             0
         };
-        self.cursor.row = self.cursor.row.saturating_sub(n).max(limit);
+        let row = self.cursor.row.saturating_sub(n).max(limit);
+        self.move_cursor(Point { row, ..self.cursor });
     }
 
     /// Moves the cursor down `n` rows (CUD), stopping at the bottom of the
@@ -663,25 +742,26 @@ impl Grid {
         } else {
             self.rows - 1
         };
-        self.cursor.row = self.cursor.row.saturating_add(n).min(limit);
+        let row = self.cursor.row.saturating_add(n).min(limit);
+        self.move_cursor(Point { row, ..self.cursor });
     }
 
     /// Moves the cursor left `n` columns, stopping at column zero (CUB).
     pub fn cursor_left(&mut self, n: u16) {
         self.pending_wrap = false;
-        self.cursor.col = self.cursor.col.saturating_sub(n);
+        self.move_cursor_col(self.cursor.col.saturating_sub(n));
     }
 
     /// Moves the cursor right `n` columns, stopping at the last column (CUF).
     pub fn cursor_right(&mut self, n: u16) {
         self.pending_wrap = false;
-        self.cursor.col = self.cursor.col.saturating_add(n).min(self.cols - 1);
+        self.move_cursor_col(self.cursor.col.saturating_add(n).min(self.cols - 1));
     }
 
     /// Moves the cursor to column zero (CR).
     pub fn carriage_return(&mut self) {
         self.pending_wrap = false;
-        self.cursor.col = 0;
+        self.move_cursor_col(0);
     }
 
     /// Moves the cursor down one row (LF / IND). At the bottom of the scroll
@@ -692,7 +772,10 @@ impl Grid {
         if self.cursor.row == self.region.bottom {
             self.scroll_up(1);
         } else if self.cursor.row < self.rows - 1 {
-            self.cursor.row += 1;
+            self.move_cursor(Point {
+                row: self.cursor.row + 1,
+                ..self.cursor
+            });
         }
     }
 
@@ -704,7 +787,10 @@ impl Grid {
         if self.cursor.row == self.region.top {
             self.scroll_down(1);
         } else if self.cursor.row > 0 {
-            self.cursor.row -= 1;
+            self.move_cursor(Point {
+                row: self.cursor.row - 1,
+                ..self.cursor
+            });
         }
     }
 
@@ -805,6 +891,7 @@ impl Grid {
         if size.rows == self.rows && size.cols == self.cols {
             return;
         }
+        self.damage.resize(size.rows);
         let old_cols = self.cols;
         let cols_changed = size.cols != old_cols;
         let active = ScreenMut {
@@ -864,6 +951,7 @@ impl Grid {
         };
         self.primary = Some(Box::new(primary));
         self.pending_wrap = false;
+        self.damage.extend_all();
     }
 
     /// Returns to the primary screen, discarding the alternate screen's
@@ -897,6 +985,7 @@ impl Grid {
         self.pen = pen;
         self.saved = saved;
         self.tabs = tabs;
+        self.damage.extend_all();
     }
 
     // ------------------------------------------------------------ tab stops
@@ -923,11 +1012,12 @@ impl Grid {
         if n == 0 {
             return;
         }
-        self.cursor.col = self
+        let col = self
             .tabs
             .next(self.cursor.col, n)
             .unwrap_or(self.cols - 1)
             .min(self.cols - 1);
+        self.move_cursor_col(col);
     }
 
     /// Moves the cursor to the `n`th previous tab stop, or column zero when
@@ -937,7 +1027,8 @@ impl Grid {
         if n == 0 {
             return;
         }
-        self.cursor.col = self.tabs.previous(self.cursor.col, n).unwrap_or(0);
+        let col = self.tabs.previous(self.cursor.col, n).unwrap_or(0);
+        self.move_cursor_col(col);
     }
 
     // -------------------------------------------------------- scroll region
@@ -978,6 +1069,7 @@ impl Grid {
         if n == 0 {
             return;
         }
+        self.extend_region(top, bottom);
         let top = usize::from(top);
         let keep_history = self.region_is_full_screen() && !self.is_alt_screen();
         for i in top..top + n {
@@ -1006,6 +1098,7 @@ impl Grid {
         if n == 0 {
             return;
         }
+        self.extend_region(top, bottom);
         let (top, bottom) = (usize::from(top), usize::from(bottom));
         self.lines[top..=bottom].rotate_right(n);
         for line in &mut self.lines[top..top + n] {
@@ -1015,6 +1108,16 @@ impl Grid {
 
     fn region_is_full_screen(&self) -> bool {
         self.region.top == 0 && self.region.bottom == self.rows - 1
+    }
+
+    /// Records rows `top..=bottom` as damaged, the whole screen when that
+    /// is every row.
+    fn extend_region(&mut self, top: u16, bottom: u16) {
+        if top == 0 && bottom >= self.rows - 1 {
+            self.damage.extend_all();
+        } else {
+            self.damage.extend_rows(top, bottom);
+        }
     }
 
     // ------------------------------------------------------- line editing
@@ -1034,6 +1137,7 @@ impl Grid {
         if n == 0 {
             return;
         }
+        self.extend_region(self.cursor.row, self.region.bottom);
         self.lines[row..=bottom].rotate_right(n);
         for line in &mut self.lines[row..row + n] {
             *line = Line::blank(self.cols, self.pen);
@@ -1055,6 +1159,7 @@ impl Grid {
         if n == 0 {
             return;
         }
+        self.extend_region(self.cursor.row, self.region.bottom);
         self.lines[row..=bottom].rotate_left(n);
         for line in &mut self.lines[bottom + 1 - n..=bottom] {
             *line = Line::blank(self.cols, self.pen);
@@ -1075,6 +1180,7 @@ impl Grid {
         if n == 0 {
             return;
         }
+        self.damage.touch_cursor_row();
         self.lines[usize::from(row)].insert_blanks(col, n, self.pen);
     }
 
@@ -1089,6 +1195,7 @@ impl Grid {
         if n == 0 {
             return;
         }
+        self.damage.touch_cursor_row();
         self.lines[usize::from(row)].delete_cells(col, n, self.pen);
     }
 
@@ -1099,6 +1206,7 @@ impl Grid {
         let Point { row, col } = self.cursor;
         let col = usize::from(col);
         let end = col.saturating_add(usize::from(n));
+        self.damage.touch_cursor_row();
         self.lines[usize::from(row)].fill(col..end, self.pen);
     }
 
@@ -1111,6 +1219,7 @@ impl Grid {
         self.pending_wrap = false;
         let Point { row, col } = self.cursor;
         let (col, cols) = (usize::from(col), usize::from(self.cols));
+        self.damage.touch_cursor_row();
         let line = &mut self.lines[usize::from(row)];
         match mode {
             EraseLine::ToEnd => {
@@ -1133,18 +1242,21 @@ impl Grid {
         let row = usize::from(self.cursor.row);
         match mode {
             EraseDisplay::Below => {
+                self.extend_region(self.cursor.row, self.rows - 1);
                 self.erase_in_line(EraseLine::ToEnd);
                 for line in &mut self.lines[row + 1..] {
                     line.clear(self.pen);
                 }
             }
             EraseDisplay::Above => {
+                self.extend_region(0, self.cursor.row);
                 for line in &mut self.lines[..row] {
                     line.clear(self.pen);
                 }
                 self.erase_in_line(EraseLine::ToStart);
             }
             EraseDisplay::All => {
+                self.damage.extend_all();
                 for line in &mut self.lines {
                     line.clear(self.pen);
                 }
@@ -1158,9 +1270,14 @@ impl Grid {
     /// alternate screen is left and the stashed primary contents are
     /// discarded. Scrollback and its cap are kept.
     pub fn reset(&mut self) {
-        let scrollback = mem::replace(&mut self.scrollback, Scrollback::new(0));
-        *self = Self::with_scrollback(self.rows, self.cols, scrollback.cap());
-        self.scrollback = scrollback;
+        let fresh = Self::with_scrollback(self.rows, self.cols, self.scrollback.cap());
+        let old = mem::replace(self, fresh);
+        self.scrollback = old.scrollback;
+        // Keep the tracker (moved, not cloned: a clone starts a new range),
+        // so a reader of the old screen sees it all change rather than a
+        // grid it does not know.
+        self.damage = old.damage;
+        self.damage.extend_all();
     }
 }
 

@@ -663,12 +663,47 @@ impl Inner {
         resolved
     }
 
+    /// Like [`Self::resolve`] with the presentation decided by the caller:
+    /// `emoji` (a cluster with VS16) tries the colour emoji family first,
+    /// before even the primary family; `!emoji` (VS15) tries it only after
+    /// the system fallbacks. Not cached; such clusters are rare.
+    pub(crate) fn resolve_presented(
+        &mut self,
+        ch: char,
+        style: FontStyle,
+        emoji: bool,
+    ) -> ResolvedFace {
+        if emoji {
+            if let Some(index) = self.chain.emoji
+                && let Some(r) = self.styled_face(index, style)
+                && self.covers(r.face, ch)
+            {
+                return r;
+            }
+            return self.resolve(ch, style);
+        }
+        if !prefers_emoji(ch) {
+            return self.resolve(ch, style);
+        }
+        self.resolve_uncached_as(ch, style, false).0
+    }
+
     /// The resolved face, and whether it is final (`false` while the
     /// coverage index is still building and nothing in the chain covers
     /// `ch`).
     fn resolve_uncached(&mut self, ch: char, style: FontStyle) -> (ResolvedFace, bool) {
+        self.resolve_uncached_as(ch, style, prefers_emoji(ch))
+    }
+
+    /// [`Self::resolve_uncached`] with an explicit emoji presentation.
+    fn resolve_uncached_as(
+        &mut self,
+        ch: char,
+        style: FontStyle,
+        emoji: bool,
+    ) -> (ResolvedFace, bool) {
         let chain = self.chain.clone();
-        let tail: Vec<usize> = if prefers_emoji(ch) {
+        let tail: Vec<usize> = if emoji {
             chain
                 .emoji
                 .iter()

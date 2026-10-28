@@ -48,6 +48,13 @@
 //! through half of a wide character blanks the other half. ADR 0008
 //! records the rules and why.
 //!
+//! # Damage
+//!
+//! The grid records which visible rows each primitive changes
+//! ([`Grid::damage`], [`Grid::take_damage`], [`Grid::damage_since`]), so a
+//! renderer re-draws only those rows (ADR 0016). Writes at the cursor cost
+//! one store; everything else stamps the rows it touched.
+//!
 //! Assumptions this crate documents rather than enforces:
 //!
 //! - Origin mode (DECOM) is a terminal mode. The grid exposes
@@ -57,6 +64,7 @@
 #![forbid(unsafe_code)]
 
 mod cell;
+mod damage;
 mod grapheme;
 mod grid;
 mod line;
@@ -65,6 +73,7 @@ mod scrollback;
 mod tabs;
 
 pub use cell::{Cell, CellFlags, Color, Point, Style, UnderlineStyle};
+pub use damage::{Damage, DamageRows};
 pub use grapheme::{GraphemeTable, MAX_CLUSTER_SCALARS, char_width};
 pub use grid::{DEFAULT_MAX_SCROLLBACK, EraseDisplay, EraseLine, Grid, ScrollRegion};
 pub use line::{Line, Mark};

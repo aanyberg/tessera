@@ -1,0 +1,12 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9da2408ff6915be0aef560289984122982224424f669c0f177e4fc46fa8ad4f8 # shrinks to rows = 1, cols = 2, ops = [Put('a'), Check]
+cc 98b0a25cabf29ece8a70cb514a113f35730843e089365d688d2b9274acb68adb # shrinks to rows = 1, cols = 1, ops = [EnterAlt, Pen(0), Check, InsertLines(1), Check]
+cc 9664f1917f49c7b31a28f5437f16a1d1f3fc642721234be979e8cd9b734f26f2 # shrinks to rows = 4, cols = 1, ops = [Put('a'), Lf, Check, LineMutWrap(0), Check]
+cc 229bb2674151e8e94114b1f2823d95037d9172669405907ee839ce5729f60ae7 # shrinks to rows = 2, cols = 1, ops = [Put('a'), EnterAlt, Pen(0), Put('a'), Resize(2, 1), ScrollUp(1), Save, Check, LeaveAlt, Check]
+cc 6112c0b3d30e1137e229c9db744c529ed432fb094aced2ea3e07cb5dc4edad66 # shrinks to rows = 1, cols = 1, ops = [Isolated(0, 0, EraseChars(1))]
+cc 8582a2787bbb1cdb433d1d258852da73c64ba04fad55f6add5e46dfa3bd65b20 # shrinks to rows = 1, cols = 1, ops = [EnterAlt, Isolated(0, 0, LeaveAlt)]

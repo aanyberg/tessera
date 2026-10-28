@@ -26,10 +26,17 @@ pub enum FrameStatus {
     /// longer match its size: call `tessera_surface_resize` with the view's
     /// current size and scale before the next frame.
     Suboptimal = 1,
-    /// Nothing was drawn: the surface is zero-sized, its window is
-    /// occluded, or the layer vended no drawable. Try again on the next
-    /// display refresh. (Waiting for a drawable has no time limit on Metal:
-    /// a render waits while every drawable is in flight.)
+    /// Nothing was drawn by this call, for one of three reasons: nothing
+    /// changed since the last presented frame; the call came too soon
+    /// after the frames before it (more than 240 frames per second, or a
+    /// third call within 1/240 s), so it was paced and a later call draws
+    /// the newest content; or the surface had nothing to draw into
+    /// (zero-sized, occluded window, no drawable). The three are not told
+    /// apart yet. A host that renders from a display link of up to 240 Hz
+    /// is never paced and need not retry: its next tick draws whatever is
+    /// pending. A host that renders faster, or from output notifications,
+    /// must schedule another render after a skip. (Waiting for a drawable has no time limit on
+    /// Metal: a render waits while every drawable is in flight.)
     Skipped = 2,
 }
 
@@ -243,8 +250,11 @@ pub unsafe extern "C" fn tessera_surface_resize(
 /// it and stores what happened in `*out_status`.
 ///
 /// Call it from the view's display link. The session's terminal is locked
-/// only while its visible rows are copied out (microseconds); drawing and
-/// waiting for a drawable do not hold up the session's output. The cursor
+/// only while the changed rows are copied out (microseconds); drawing and
+/// waiting for a drawable do not hold up the session's output. A frame
+/// with nothing changed, or one that would exceed 240 frames per second,
+/// draws nothing and reports `TESSERA_FRAME_STATUS_SKIPPED` (see
+/// `TesseraFrameStatus`). The cursor
 /// is a block, drawn hollow while the session is not focused
 /// (`tessera_session_set_focus`). Main thread only.
 ///

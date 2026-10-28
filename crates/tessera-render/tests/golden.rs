@@ -7,6 +7,9 @@
 //!   cursor. Compared with the font tolerance (see [`Tolerance::Font`]).
 //! - `cursors.png`: the three cursor shapes over text, focused and then
 //!   unfocused, one strip each. Font tolerance.
+//! - `clusters.png`: grapheme clusters drawn whole: `e` + U+0301, a ZWJ
+//!   family, a VS16 heart, a skin-toned hand, `a` + U+0338. Font
+//!   tolerance.
 //! - `geometry.png`: the same screen and strips with every character
 //!   replaced by a space, so only backgrounds, decorations and cursors
 //!   remain. Must match exactly: color and geometry bugs cannot hide
@@ -409,6 +412,43 @@ fn geometry_golden_matches_exactly() {
     check_golden("geometry", size, &image, Tolerance::Exact);
 }
 
+/// The cluster row of `clusters.png`, as the grid lays it out: `e` +
+/// U+0301 (one cell), a ZWJ family (two cells), a VS16 heart, a hand with
+/// a skin tone and `a` + U+0338 (a mark Menlo cannot precompose), each
+/// followed by a plain `x` and a space.
+fn cluster_line() -> tessera_grid::Line {
+    let mut grid = tessera_grid::Grid::new(1, 24);
+    grid.put_str(
+        "e\u{301}x \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}x \
+         \u{2764}\u{FE0F}x \u{1F44D}\u{1F3FD}x a\u{338}x",
+    );
+    grid.line(0).expect("row 0").clone()
+}
+
+/// Full-cluster shaping (#21): each cluster is drawn whole, centred in its
+/// cell or cells. Font tolerance, so drawing only the base character
+/// (`e`, the man, a text heart, a yellow hand) fails: each puts dozens of
+/// differing pixels into one tile.
+#[test]
+fn clusters_golden() {
+    let Some(gpu) = gpu() else { return };
+    let mut renderer = renderer(&gpu, Theme::default());
+    let line = cluster_line();
+    let rows: [&[Cell]; 1] = [&line.cells];
+    let clusters = [line.graphemes.clone()];
+    let size = target_size(&renderer, 24, 1);
+    let frame = FrameInput::new(&rows).with_clusters(&clusters);
+    let image = render(&gpu, &mut renderer, size, &frame);
+    // Without the cluster table only base characters are drawn: the
+    // image must differ, or the golden would not be testing anything.
+    let base_only = render(&gpu, &mut renderer, size, &FrameInput::new(&rows));
+    assert!(
+        differing_pixels(&image, &base_only, 16) > 400,
+        "clusters change the row"
+    );
+    check_golden("clusters", size, &image, Tolerance::Font);
+}
+
 /// Renders one row of `text` with `cursor` and `focused`.
 fn cursor_frame(
     gpu: &Gpu,
@@ -443,10 +483,7 @@ fn invisible_cursor_draws_nothing_and_unfocused_is_hollow() {
         CursorShape::Underline,
     ] {
         let cursor = CursorState::new(0, 3, shape);
-        let hidden = CursorState {
-            visible: false,
-            ..cursor
-        };
+        let hidden = cursor.with_visible(false);
         for focused in [true, false] {
             assert_eq!(
                 cursor_frame(&gpu, &mut renderer, Some(hidden), focused),

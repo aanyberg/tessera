@@ -77,18 +77,18 @@ impl GlyphSource<'_> {
     }
 }
 
-/// Appends the glyph quads of `rows` (shaped into `shaped`, one entry per
-/// row) to `out`.
-pub(crate) fn push(
+/// Appends the glyph quads of row `r`, holding `row` shaped into
+/// `glyphs`, to `out`.
+pub(crate) fn push_row(
     out: &mut Vec<Instance>,
     layout: &Layout,
     palette: &Palette,
-    rows: &[&[Cell]],
-    shaped: &[Vec<ShapedGlyph>],
+    r: usize,
+    (row, glyphs): (&[Cell], &[ShapedGlyph]),
     source: &mut GlyphSource<'_>,
 ) -> Result<(), RenderError> {
     let cols = layout.visible_cols();
-    for (r, (row, glyphs)) in rows.iter().zip(shaped).enumerate() {
+    {
         for glyph in glyphs.iter().filter(|g| g.cell_index < cols) {
             let Some(cell) = row.get(glyph.cell_index) else {
                 continue;
@@ -96,7 +96,7 @@ pub(crate) fn push(
             if cell.style.has(Style::HIDDEN) {
                 continue;
             }
-            let fg = CellColors::resolve(palette, cell.style).fg;
+            let fg = CellColors::foreground(palette, cell.style);
             if let Some(instance) = source.instance(layout, r, glyph, fg, NO_CLIP)? {
                 out.push(instance);
             }

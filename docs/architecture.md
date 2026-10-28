@@ -102,7 +102,9 @@ under its lock, and a writer thread for queued input. Rendering must not
 delay the reader: `render_view` holds the terminal lock only to copy the
 visible rows into the view's snapshot buffer and draws after releasing it.
 Presenting can block on a drawable, so drawing under the lock would stall
-output without a bound; ADR 0014 has the measurements. `Grid::resize` and
+output without a bound; ADR 0014 has the measurements. The copy covers only
+the rows the grid reports damaged, and the view skips frames with nothing
+changed and presents at most one per 1/240 s (ADR 0016). `Grid::resize` and
 the PTY resize take their locks one after the other, never together
 (ADR 0009).
 
