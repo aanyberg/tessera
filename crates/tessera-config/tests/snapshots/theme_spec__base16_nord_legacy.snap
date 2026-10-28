@@ -1,0 +1,13 @@
+---
+source: crates/tessera-config/tests/theme_spec.rs
+expression: theme.to_toml()
+---
+name = "Nord"
+foreground = "#e5e9f0"
+background = "#2e3440"
+cursor = "#e5e9f0"
+selection = "#434c5e"
+ansi = [
+    "#2e3440", "#bf616a", "#a3be8c", "#ebcb8b", "#81a1c1", "#b48ead", "#88c0d0", "#e5e9f0",
+    "#4c566a", "#bf616a", "#a3be8c", "#ebcb8b", "#81a1c1", "#b48ead", "#88c0d0", "#8fbcbb",
+]

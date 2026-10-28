@@ -20,6 +20,8 @@ test-hooks = ["tessera-app-core/test-hooks"]
 [dev-dependencies]
 # Enables `test-hooks` for this crate's integration tests.
 tessera-ffi = { path = ".", features = ["test-hooks"] }
+# Theme values for the re-theming test of attached views.
+tessera-config.workspace = true
 
 [lints]
 workspace = true

@@ -23,7 +23,7 @@ Default appearance; profiles may override.
 | `font_family` | string | `"Menlo"` | Font family. |
 | `font_size` | float | `13.0` | Font size in points, clamped on load to `4.0`..=`512.0`. |
 | `opacity` | float | `1.0` | Window opacity, 0.0..=1.0. |
-| `theme` | string | `"Tessera Dark"` | Theme name resolved against `themes/`. |
+| `theme` | string | `"Tessera Dark"` | Colour theme, by name. Looked up first among the `*.toml` files in `themes/` next to this file (by file stem, then by the `name` key inside each file), then among the bundled themes: Tessera Dark, Tessera Light, Solarized Dark, Solarized Light, Dracula, Nord, Gruvbox Dark, One Dark, Tokyo Night and Catppuccin Mocha. Names match ignoring case, and any run of characters other than letters and digits counts as one separator, with `+` read as the word `plus`: `solarized-dark` and `SOLARIZED DARK` are Solarized Dark, `Dracula+` is `dracula-plus`, not Dracula, but `solarizeddark` is not Solarized Dark. A user file shadows a bundled theme of the same name. Unicode is not normalised, so an accented name matches only when typed in the same form (precomposed or combining) as the theme's. An unknown name falls back to Tessera Dark with a warning. |
 
 ## `[general]`
 
@@ -67,7 +67,7 @@ Optional table; *unset* by default. It belongs to the `[[profiles]]` entry it fo
 | `font_family` | string | `"Menlo"` | Font family. |
 | `font_size` | float | `13.0` | Font size in points, clamped on load to `4.0`..=`512.0`. |
 | `opacity` | float | `1.0` | Window opacity, 0.0..=1.0. |
-| `theme` | string | `"Tessera Dark"` | Theme name resolved against `themes/`. |
+| `theme` | string | `"Tessera Dark"` | Colour theme, by name. Looked up first among the `*.toml` files in `themes/` next to this file (by file stem, then by the `name` key inside each file), then among the bundled themes: Tessera Dark, Tessera Light, Solarized Dark, Solarized Light, Dracula, Nord, Gruvbox Dark, One Dark, Tokyo Night and Catppuccin Mocha. Names match ignoring case, and any run of characters other than letters and digits counts as one separator, with `+` read as the word `plus`: `solarized-dark` and `SOLARIZED DARK` are Solarized Dark, `Dracula+` is `dracula-plus`, not Dracula, but `solarizeddark` is not Solarized Dark. A user file shadows a bundled theme of the same name. Unicode is not normalised, so an accented name matches only when typed in the same form (precomposed or combining) as the theme's. An unknown name falls back to Tessera Dark with a warning. |
 
 ## `[terminal]`
 

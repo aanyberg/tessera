@@ -83,7 +83,7 @@ impl From<toml::de::Error> for ParseError {
 
 /// `text` cut to at most `max` bytes on a character boundary, with a marker
 /// when anything was dropped.
-fn truncated(text: &str, max: usize) -> String {
+pub(crate) fn truncated(text: &str, max: usize) -> String {
     const MARKER: &str = "… (truncated)";
     if text.len() <= max {
         return text.to_owned();
@@ -125,6 +125,22 @@ pub enum Warning {
         /// Human-readable description of the replacement.
         detail: String,
     },
+    /// `appearance.theme` names no user theme file and no bundled theme;
+    /// the default theme ([`Theme::DEFAULT_NAME`](crate::Theme::DEFAULT_NAME))
+    /// is used instead.
+    ThemeNotFound {
+        /// The requested name, truncated to [`MAX_WARNING_PATH_LEN`] bytes.
+        name: String,
+    },
+    /// A user theme file whose name matches `appearance.theme` could not be
+    /// loaded; the lookup continued with the next candidate (another user
+    /// file, then the bundled themes, then the default).
+    ThemeInvalid {
+        /// The file, truncated to [`MAX_WARNING_PATH_LEN`] bytes.
+        path: String,
+        /// Why it could not be loaded (bounded like a [`ParseError`]).
+        error: String,
+    },
 }
 
 impl fmt::Display for Warning {
@@ -135,6 +151,12 @@ impl fmt::Display for Warning {
                 write!(f, "{count} more unknown keys ignored")
             }
             Self::OutOfRange { path, detail } => write!(f, "`{path}` out of range: {detail}"),
+            Self::ThemeNotFound { name } => write!(
+                f,
+                "theme `{name}` not found; using `{}`",
+                crate::Theme::DEFAULT_NAME
+            ),
+            Self::ThemeInvalid { path, error } => write!(f, "theme file {path} ignored: {error}"),
         }
     }
 }
@@ -297,20 +319,27 @@ fn normalize_appearance(prefix: &str, a: &mut crate::Appearance, warnings: &mut 
 /// on the open handle and at most that many bytes are ever read, so a
 /// file that grows during the read is rejected rather than read whole.
 pub fn load_file(path: &Path) -> Result<Loaded, Error> {
-    use std::io::Read as _;
-
-    require_regular_file(path)?;
-    let file = open_regular_file(path)?;
-    let len = check_regular_file(path, &file.metadata()?)?;
-    let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
-    (&file)
-        .take(MAX_CONFIG_FILE_LEN + 1)
-        .read_to_end(&mut bytes)?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_CONFIG_FILE_LEN {
-        return Err(too_large(path, None).into());
-    }
+    let bytes = read_capped(path, MAX_CONFIG_FILE_LEN, "config file")?;
     let text = std::str::from_utf8(&bytes)?;
     Config::from_toml_lenient(text)
+}
+
+/// Reads the regular file at `path` whole, refusing one larger than `limit`
+/// bytes with an `InvalidInput` error that calls it a `what`. Never blocks
+/// on a FIFO and never reads more than `limit + 1` bytes; see
+/// [`load_file`] for the checks.
+pub(crate) fn read_capped(path: &Path, limit: u64, what: &str) -> Result<Vec<u8>, Error> {
+    use std::io::Read as _;
+
+    check_regular_file(path, &std::fs::metadata(path)?, limit, what)?;
+    let file = open_regular_file(path)?;
+    let len = check_regular_file(path, &file.metadata()?, limit, what)?;
+    let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+    (&file).take(limit + 1).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
+        return Err(too_large(path, None, limit, what).into());
+    }
+    Ok(bytes)
 }
 
 /// Opens `path` for reading without blocking on a FIFO. On Unix the open
@@ -328,32 +357,29 @@ fn open_regular_file(path: &Path) -> std::io::Result<std::fs::File> {
     options.open(path)
 }
 
-/// Fails with `InvalidInput` unless `path` (after following symlinks) is a
-/// regular file of at most [`MAX_CONFIG_FILE_LEN`] bytes; a missing path is
-/// `NotFound`. Uses `stat`, which never blocks, so it is safe to call on a
-/// FIFO.
-pub(crate) fn require_regular_file(path: &Path) -> std::io::Result<()> {
-    check_regular_file(path, &std::fs::metadata(path)?).map(|_| ())
-}
-
 /// Fails with `InvalidInput` unless `meta` describes a regular file of at
-/// most [`MAX_CONFIG_FILE_LEN`] bytes; returns its length.
-fn check_regular_file(path: &Path, meta: &std::fs::Metadata) -> std::io::Result<u64> {
+/// most `limit` bytes; returns its length.
+fn check_regular_file(
+    path: &Path,
+    meta: &std::fs::Metadata,
+    limit: u64,
+    what: &str,
+) -> std::io::Result<u64> {
     if !meta.is_file() {
         return Err(not_a_regular_file(path));
     }
-    if meta.len() > MAX_CONFIG_FILE_LEN {
-        return Err(too_large(path, Some(meta.len())));
+    if meta.len() > limit {
+        return Err(too_large(path, Some(meta.len()), limit, what));
     }
     Ok(meta.len())
 }
 
-fn too_large(path: &Path, len: Option<u64>) -> std::io::Error {
+fn too_large(path: &Path, len: Option<u64>, limit: u64, what: &str) -> std::io::Error {
     let size = len.map_or_else(String::new, |len| format!("is {len} bytes, "));
     std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
         format!(
-            "{} {size}larger than the {MAX_CONFIG_FILE_LEN}-byte limit for a config file",
+            "{} {size}larger than the {limit}-byte limit for a {what}",
             path.display()
         ),
     )
@@ -812,13 +838,24 @@ mod tests {
         let path = dir.path().join("config.toml");
         let file = std::fs::File::create(&path).unwrap();
         file.set_len(MAX_CONFIG_FILE_LEN + 1).unwrap();
-        let err = check_regular_file(&path, &file.metadata().unwrap()).unwrap_err();
+        let err = check_regular_file(
+            &path,
+            &file.metadata().unwrap(),
+            MAX_CONFIG_FILE_LEN,
+            "config file",
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("larger than"), "{err}");
         assert_eq!(
-            check_regular_file(&path, &std::fs::metadata(dir.path()).unwrap())
-                .unwrap_err()
-                .kind(),
+            check_regular_file(
+                &path,
+                &std::fs::metadata(dir.path()).unwrap(),
+                MAX_CONFIG_FILE_LEN,
+                "config file"
+            )
+            .unwrap_err()
+            .kind(),
             std::io::ErrorKind::InvalidInput
         );
     }
@@ -836,7 +873,13 @@ mod tests {
             .expect("mkfifo");
         assert!(status.success());
         let file = open_regular_file(&path).expect("non-blocking open of a FIFO");
-        let err = check_regular_file(&path, &file.metadata().unwrap()).unwrap_err();
+        let err = check_regular_file(
+            &path,
+            &file.metadata().unwrap(),
+            MAX_CONFIG_FILE_LEN,
+            "config file",
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 

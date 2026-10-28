@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use tessera_app_core::input::MouseButton;
 use tessera_app_core::session::PENDING_INPUT_BYTES;
-use tessera_app_core::view::{FrameStatus, PhysicalSize, RenderError, theme_for};
+use tessera_app_core::view::{FrameStatus, PhysicalSize, RenderError};
 use tessera_app_core::{
     App, Config, ConfigPaths, Error, InputEvent, InputOutcome, SessionId, SpawnOptions,
 };
@@ -131,7 +131,7 @@ impl DevWin {
                 let _ = waking.send_event(Wake);
             }
         })));
-        let padding_pt = theme_for(app.config()).padding;
+        let padding_pt = app.view_theme().padding;
         Self {
             app,
             mailbox,

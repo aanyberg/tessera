@@ -25,10 +25,13 @@
 //! recreated.
 //!
 //! Scope: this crate reads and watches `config.toml` and exposes the applied
-//! values (font, size, opacity, scrollback cap, theme *name*). Loading
-//! `themes/*.toml` into colours is issue #41, and routing the applied
-//! configuration into `tessera-app-core` and the windows is the
-//! application layer's job; neither is done here.
+//! values (font, size, opacity, scrollback cap, theme name). It also reads
+//! colour themes: `themes/*.toml` files and ten bundled themes, resolved
+//! from `appearance.theme` by [`ConfigStore::theme`] ([`Theme::resolve`]),
+//! and imports iTerm2 `.itermcolors` and base16 schemes
+//! ([`import_itermcolors`], [`import_base16`]); see ADR 0019. Routing the
+//! applied configuration into `tessera-app-core` and the windows is the
+//! application layer's job and is not done here.
 //!
 //! ```no_run
 //! use tessera_config::{ConfigEvent, ConfigPaths, ConfigStore, WatchOptions};
@@ -50,10 +53,21 @@
 
 #![forbid(unsafe_code)]
 
+mod import;
 mod load;
 mod paths;
 mod store;
+mod theme;
 mod watch;
+
+pub use import::{
+    ImportError, MAX_IMPORT_LEN, import_base16, import_itermcolors, read_scheme_file,
+};
+pub use theme::{
+    Color, DERIVED_SELECTION_ALPHA, InvalidColor, MAX_SLUG_LEN, MAX_THEME_DIR_ENTRIES,
+    MAX_THEME_FILE_LEN, MAX_THEME_FILES, MAX_THEME_NAME_LEN, ResolvedTheme, Theme, ThemeError,
+    ThemeSource, clip_theme_name, slug,
+};
 
 pub use load::{
     DEFAULT_CONFIG_TOML, Loaded, MAX_CONFIG_FILE_LEN, MAX_PARSE_ERROR_LEN,
@@ -144,7 +158,19 @@ impl Default for General {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct Appearance {
-    /// Theme name resolved against `themes/`.
+    /// Colour theme, by name. Looked up first among the `*.toml` files in
+    /// `themes/` next to this file (by file stem, then by the `name` key
+    /// inside each file), then among the bundled themes: Tessera Dark,
+    /// Tessera Light, Solarized Dark, Solarized Light, Dracula, Nord,
+    /// Gruvbox Dark, One Dark, Tokyo Night and Catppuccin Mocha. Names
+    /// match ignoring case, and any run of characters other than letters
+    /// and digits counts as one separator, with `+` read as the word
+    /// `plus`: `solarized-dark` and `SOLARIZED  DARK` are Solarized Dark,
+    /// `Dracula+` is `dracula-plus`, not Dracula, but `solarizeddark` is not
+    /// Solarized Dark. A user file shadows a bundled theme of the same name.
+    /// Unicode is not normalised, so an accented name matches only when
+    /// typed in the same form (precomposed or combining) as the theme's. An
+    /// unknown name falls back to Tessera Dark with a warning.
     pub theme: String,
     /// Font family.
     pub font_family: String,
@@ -167,7 +193,7 @@ impl Appearance {
 impl Default for Appearance {
     fn default() -> Self {
         Self {
-            theme: "Tessera Dark".into(),
+            theme: Theme::DEFAULT_NAME.into(),
             font_family: "Menlo".into(),
             font_size: 13.0,
             opacity: 1.0,

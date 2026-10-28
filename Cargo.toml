@@ -50,6 +50,7 @@ tessera-app-core = { path = "crates/tessera-app-core" }
 # external
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+plist = "1"
 schemars = "1"
 thiserror = "2"
 portable-pty = "0.9"

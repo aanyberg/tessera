@@ -507,3 +507,47 @@ fn freeing_the_app_detaches_every_surface() {
     // `layers` is released only now, after the core let go of it.
     drop(layers);
 }
+
+#[test]
+fn applying_a_theme_rethemes_attached_views() {
+    if !gpu_enabled() {
+        return;
+    }
+    let app = Handle::new();
+    let ids = [app.spawn_shell(), app.spawn_shell()];
+    let layers = [Layer::new(), Layer::new(), Layer::new()];
+    for (id, layer) in ids.iter().zip(&layers) {
+        assert_eq!(app.attach(*id, layer, 320, 240, 2.0), Error::Ok);
+    }
+    let background = |id: u64| {
+        app.with_core(|core| core.view_renderer_theme(SessionId::from_raw(id)))
+            .expect("the session has a view")
+            .background
+            .to_srgb8()
+    };
+    for id in ids {
+        assert_eq!(background(id), [0, 0, 0], "Tessera Dark to start with");
+    }
+
+    let dracula = tessera_config::Theme::bundled("Dracula").unwrap();
+    app.with_core(|core| core.apply_theme(dracula));
+    let expected = app.with_core(tessera_app_core::App::view_theme);
+    for id in ids {
+        let theme = app
+            .with_core(|core| core.view_renderer_theme(SessionId::from_raw(id)))
+            .unwrap();
+        assert_eq!(theme, expected, "view {id} draws with the applied theme");
+        assert_eq!(background(id), [0x28, 0x2a, 0x36]);
+        // The view keeps its own font size: only the colours changed.
+        assert!(app.view_size(id).rows > 1);
+        app.render_frames(id, 1);
+    }
+
+    // A view attached afterwards starts with the applied theme too.
+    let late = app.spawn_shell();
+    assert_eq!(app.attach(late, &layers[2], 320, 240, 2.0), Error::Ok);
+    assert_eq!(background(late), [0x28, 0x2a, 0x36]);
+    for id in ids.into_iter().chain([late]) {
+        assert_eq!(app.close(id), Error::Ok);
+    }
+}

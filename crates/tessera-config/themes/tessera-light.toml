@@ -1,0 +1,14 @@
+# Tessera Light: bundled Tessera theme.
+# Original Tessera palette (no upstream).
+# Licence: MIT OR Apache-2.0 (project; original work, no upstream).
+
+name = "Tessera Light"
+foreground = "#24292e"
+background = "#fafaf8"
+cursor = "#0b57d0"
+selection = "#cfe3ff"
+# black, red, green, yellow, blue, magenta, cyan, white; then the bright eight
+ansi = [
+    "#2b2b2b", "#c4281c", "#1a7f37", "#8a6100", "#0b57d0", "#8e3fb5", "#0a7c86", "#d4d4d0",
+    "#5f6770", "#d92d20", "#12803d", "#946800", "#1a6ce0", "#a24ec8", "#087e8b", "#ffffff",
+]

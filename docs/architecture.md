@@ -36,7 +36,7 @@ The diagram is the target design; today the core holds sessions only
 | `tessera-shell-integration` | OSC 133 / 7 / 1337 → marks and metadata | grid |
 | `tessera-search` | regex over grid + scrollback | grid |
 | `tessera-render` | wgpu pipeline, glyph atlas, shaping (ADR 0007), four passes over a `FrameInput` (ADR 0010), `Theme`; `RenderSurface` wraps a `wgpu::Surface` it is handed | grid |
-| `tessera-config` | TOML schema, defaults, load/save, watch (ADR 0004, 0006) | – |
+| `tessera-config` | TOML schema, defaults, load/save, watch (ADR 0004, 0006); themes, bundled themes and the iTerm2/base16 importers (ADR 0019) | – |
 | `tessera-plugin-api` | `Plugin`, `Host`, `Capability`, `Event` (ADR 0002) | – |
 | `tessera-plugins/*` | first-party plugins | plugin-api |
 | `tessera-protocol` | JSON-RPC request/response types (ADR 0003) | plugin-api |
@@ -44,7 +44,7 @@ The diagram is the target design; today the core holds sessions only
 | `tessera-app-core` | sessions, input, and one view per session (`view.rs`: a `View` holds `tessera-render`'s `RenderSurface` and `Renderer`; `App` shares one `Gpu`, ADR 0014); no OS UI | pty, term, config, plugin-api, render, grid (and the `hello` plugin) |
 | `tessera-ffi` | `extern "C"` surface, including turning a `CAMetalLayer*` into a wgpu surface (`unsafe` allowed); `apps/macos` wraps it as TesseraKit (ADR 0012) | app-core |
 | `tessera-cli` | `tessera` binary speaking the protocol | protocol |
-| `tessera-devtool` | dev-only `tessera-devtool` binary and library: headless screen dumps for debugging and snapshot tests; never published, nothing in the app depends on it | pty, term, grid |
+| `tessera-devtool` | dev-only `tessera-devtool` binary and library: headless screen dumps for debugging and snapshot tests, and `theme import`; never published, nothing in the app depends on it | pty, term, grid, config |
 | `tessera-devwin` | dev-only `tessera-devwin` binary: a winit window running a login shell through `App` (views, input, session events) for renderer and emulator work without Xcode; never published, nothing in the app depends on it | app-core, winit |
 
 ## Invariants

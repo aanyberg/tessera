@@ -1,0 +1,13 @@
+---
+source: crates/tessera-config/tests/theme_spec.rs
+expression: theme.to_toml()
+---
+name = "solarized-dark-patched"
+foreground = "#839496"
+background = "#002833"
+cursor = "#839496"
+selection = "#003541"
+ansi = [
+    "#003541", "#dc322f", "#859900", "#b58900", "#268bd2", "#d33682", "#2aa198", "#eee8d5",
+    "#586e75", "#cb4b16", "#586e75", "#657b83", "#839496", "#6c6ec6", "#93a1a1", "#fdf6e3",
+]

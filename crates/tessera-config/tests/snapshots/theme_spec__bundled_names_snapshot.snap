@@ -1,0 +1,16 @@
+---
+source: crates/tessera-config/tests/theme_spec.rs
+expression: "Theme::bundled_names()"
+---
+[
+    "Tessera Dark",
+    "Tessera Light",
+    "Solarized Dark",
+    "Solarized Light",
+    "Dracula",
+    "Nord",
+    "Gruvbox Dark",
+    "One Dark",
+    "Tokyo Night",
+    "Catppuccin Mocha",
+]
