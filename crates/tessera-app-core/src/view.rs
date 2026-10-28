@@ -16,15 +16,56 @@
 //! This module re-exports the few `tessera-render` and `wgpu` items a
 //! frontend needs to hand a surface over, so `tessera-ffi` depends on this
 //! crate alone.
+//!
+//! # Damage and pacing (ADR 0016)
+//!
+//! `View::capture` runs under the session's terminal lock: it asks the
+//! grid which rows changed since the last capture
+//! ([`Grid::damage_since`]), compares and copies only those into the
+//! snapshot, and adds the rows that really changed to the damage the
+//! next frame draws. `View::render` runs after the lock is released and
+//! returns [`FrameStatus::Skipped`] without touching the GPU when nothing
+//! changed since the last presented frame (no damage, same cursor, same
+//! focus, nothing the renderer must redraw on its own), so an idle
+//! terminal costs no GPU work. It also presents at most one frame per
+//! [`MIN_FRAME_INTERVAL`]: a flood of output is captured on every call but
+//! only the newest snapshot is drawn, so the reader thread never waits on
+//! the GPU and the screen updates at display rate.
+
+use std::time::{Duration, Instant};
 
 use tessera_config::Config;
-use tessera_grid::{Cell, Grid, Point};
+use tessera_grid::{Cell, DamageRows, GraphemeTable, Grid, Line, Point};
 use tessera_pty::PtySize;
 pub use tessera_render::{CellMetrics, FrameStatus, PhysicalSize, RenderError, wgpu};
 use tessera_render::{
     CursorShape, CursorState, Fonts, FrameInput, Gpu, RenderSurface, Renderer, Rgba, Shaper,
     SurfaceOptions, Theme, sanitize_font_size, sanitize_scale,
 };
+
+/// The shortest time between two presented frames of one view: one
+/// display period at 240 Hz, the fastest refresh a Mac display runs at.
+///
+/// A host that calls [`crate::App::render_view`] more often (a host
+/// rendering on every output notification) gets [`FrameStatus::Skipped`]
+/// for the extra calls; each call still captures the grid, so a later
+/// presented frame shows the newest content. Calls up to [`FRAME_SLACK`]
+/// early count as on time, and the schedule never exceeds one frame per
+/// interval on average: over any window of `T`, at most
+/// `T / MIN_FRAME_INTERVAL + 2` frames are presented. A host driven by a
+/// display link of at most 240 Hz is never paced (see [`FRAME_SLACK`]);
+/// the limit bounds hosts that render on every output notification.
+pub const MIN_FRAME_INTERVAL: Duration = Duration::from_micros(4166);
+
+/// How early a frame may come and still count as on time: half of
+/// [`MIN_FRAME_INTERVAL`]. A render is then paced only when it is the
+/// third within one interval (two consecutive gaps adding up to less
+/// than 1/240 s), which a display link of at most 240 Hz never produces
+/// unless it delivers a tick more than a whole period late. A host that
+/// renders faster than that, or in bursts closer than about half an
+/// interval, can still get a paced skip and must render again after
+/// one.
+pub const FRAME_SLACK: Duration = Duration::from_micros(2083);
 
 /// A view's geometry: the surface in physical pixels, its backing scale and
 /// the grid that fits in it.
@@ -143,6 +184,97 @@ pub fn theme_for(config: &Config, theme: &tessera_config::Theme) -> Theme {
     }
 }
 
+/// True when a frame at `now` comes too early on the schedule whose last
+/// presented frame was due at `last` (see [`MIN_FRAME_INTERVAL`]).
+fn is_paced(last: Option<Instant>, now: Instant) -> bool {
+    last.is_some_and(|t| now + FRAME_SLACK < t + MIN_FRAME_INTERVAL)
+}
+
+/// The due time to record for a frame presented at `now` after one due at
+/// `last`: an interval later, but never more than the slack behind the
+/// clock, so an idle view does not bank frames.
+fn due_time(last: Option<Instant>, now: Instant) -> Instant {
+    let earliest = now.checked_sub(FRAME_SLACK).unwrap_or(now);
+    last.map_or(earliest, |t| (t + MIN_FRAME_INTERVAL).max(earliest))
+}
+
+/// Why [`View::render`] skipped a frame without drawing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SkipReason {
+    /// Nothing changed since the last presented frame.
+    Unchanged,
+    /// A frame was presented less than [`MIN_FRAME_INTERVAL`] ago.
+    Paced,
+    /// The surface had nothing to draw into (zero-sized, occluded, no
+    /// drawable).
+    Surface,
+}
+
+/// What a view draws into.
+#[derive(Debug)]
+enum Target {
+    /// The frontend's layer.
+    Surface(RenderSurface),
+    /// A headless texture, for tests.
+    #[cfg(test)]
+    Offscreen {
+        target: tessera_render::OffscreenTarget,
+        scale: f32,
+    },
+}
+
+impl Target {
+    fn size(&self) -> PhysicalSize {
+        match self {
+            Self::Surface(surface) => surface.size(),
+            #[cfg(test)]
+            Self::Offscreen { target, .. } => target.size(),
+        }
+    }
+
+    fn scale(&self) -> f32 {
+        match self {
+            Self::Surface(surface) => surface.scale(),
+            #[cfg(test)]
+            Self::Offscreen { scale, .. } => *scale,
+        }
+    }
+
+    fn resize(&mut self, gpu: &Gpu, size: PhysicalSize, scale: f32) {
+        match self {
+            Self::Surface(surface) => surface.resize(gpu, size, scale),
+            #[cfg(test)]
+            Self::Offscreen { target, scale: s } => {
+                *target = tessera_render::OffscreenTarget::new(gpu, size, target.format());
+                *s = sanitize_scale(scale);
+            }
+        }
+    }
+
+    fn render(
+        &mut self,
+        gpu: &Gpu,
+        renderer: &mut Renderer,
+        frame: &FrameInput<'_>,
+    ) -> Result<FrameStatus, RenderError> {
+        match self {
+            Self::Surface(surface) => surface.render(gpu, renderer, frame),
+            #[cfg(test)]
+            Self::Offscreen { target, .. } => {
+                target.render(gpu, renderer, frame)?;
+                Ok(FrameStatus::Presented)
+            }
+        }
+    }
+}
+
+/// What the last presented frame showed besides the cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Shown {
+    cursor: Point,
+    focused: bool,
+}
+
 /// A theme file's sRGB colour as the renderer's linear [`Rgba`].
 fn rgba(color: tessera_config::Color) -> Rgba {
     Rgba::from_srgb8(color.r, color.g, color.b).with_alpha(f32::from(color.a) / 255.0)
@@ -157,10 +289,21 @@ fn rgba(color: tessera_config::Color) -> Rgba {
 #[derive(Debug)]
 pub(crate) struct View {
     gpu: Gpu,
-    surface: RenderSurface,
+    target: Target,
     renderer: Renderer,
     font_size_pt: f32,
     snapshot: Snapshot,
+    /// Rows that changed since the last frame the renderer drew.
+    pending: DamageRows,
+    /// Cursor and focus of the last presented frame; `None` before the
+    /// first one.
+    shown: Option<Shown>,
+    /// When the last presented frame was due on the [`MIN_FRAME_INTERVAL`]
+    /// schedule (at most [`FRAME_SLACK`] before it was actually
+    /// presented); `None` before the first one.
+    last_presented: Option<Instant>,
+    /// Why the last [`View::render`] skipped, if it did.
+    last_skip: Option<SkipReason>,
 }
 
 impl View {
@@ -179,22 +322,55 @@ impl View {
             ..SurfaceOptions::default()
         };
         let surface = RenderSurface::attach(&gpu, surface, size, scale, options)?;
+        Self::with_target(gpu, Target::Surface(surface), fonts, theme)
+    }
+
+    /// A view drawing into a headless `size` texture, for tests.
+    #[cfg(test)]
+    pub(crate) fn offscreen(
+        gpu: Gpu,
+        fonts: Fonts,
+        theme: Theme,
+        size: PhysicalSize,
+        scale: f32,
+    ) -> Result<Self, RenderError> {
+        let target = Target::Offscreen {
+            target: tessera_render::OffscreenTarget::new(
+                &gpu,
+                size,
+                wgpu::TextureFormat::Rgba8UnormSrgb,
+            ),
+            scale: sanitize_scale(scale),
+        };
+        Self::with_target(gpu, target, fonts, theme)
+    }
+
+    fn with_target(
+        gpu: Gpu,
+        target: Target,
+        fonts: Fonts,
+        theme: Theme,
+    ) -> Result<Self, RenderError> {
         let font_size_pt = sanitize_font_size(theme.font_size);
-        let shaper = Shaper::with_fonts(fonts, font_size_pt, surface.scale());
+        let shaper = Shaper::with_fonts(fonts, font_size_pt, target.scale());
         let renderer = Renderer::new(&gpu, theme, shaper)?;
         Ok(Self {
             gpu,
-            surface,
+            target,
             renderer,
             font_size_pt,
             snapshot: Snapshot::default(),
+            pending: DamageRows::All,
+            shown: None,
+            last_presented: None,
+            last_skip: None,
         })
     }
 
     /// The surface's size, scale and the grid that fits in it.
     pub(crate) fn size(&self) -> ViewSize {
-        let pixels = self.surface.size();
-        let scale = self.surface.scale();
+        let pixels = self.target.size();
+        let scale = self.target.scale();
         let (rows, cols) = grid_size_for(
             pixels,
             self.renderer.shaper().scale(),
@@ -228,23 +404,29 @@ impl View {
     }
 
     /// Reconfigures the surface for `size` and `scale` and keeps the
-    /// shaper's backing scale in step with it.
+    /// shaper's backing scale in step with it. The next frame is drawn
+    /// whole.
     pub(crate) fn resize(&mut self, size: PhysicalSize, scale: f32) {
-        self.surface.resize(&self.gpu, size, scale);
+        self.target.resize(&self.gpu, size, scale);
         self.renderer
-            .set_font_size(self.font_size_pt, self.surface.scale());
+            .set_font_size(self.font_size_pt, self.target.scale());
+        self.pending = DamageRows::All;
     }
 
     /// Changes the font size (clamped like
-    /// [`tessera_render::sanitize_font_size`]).
+    /// [`tessera_render::sanitize_font_size`]). The next frame is drawn
+    /// whole.
     pub(crate) fn set_font_size(&mut self, size_pt: f32) {
         self.font_size_pt = sanitize_font_size(size_pt);
         self.renderer
-            .set_font_size(self.font_size_pt, self.surface.scale());
+            .set_font_size(self.font_size_pt, self.target.scale());
+        self.pending = DamageRows::All;
     }
 
     /// Draws with `theme`'s colours, opacity and padding from the next
-    /// frame on; the font stays as it is ([`Renderer::set_theme`]).
+    /// frame on; the font stays as it is ([`Renderer::set_theme`]). The
+    /// renderer then reports [`Renderer::needs_redraw`], so the next
+    /// [`Self::render`] draws every row even with no damage.
     pub(crate) fn set_theme(&mut self, theme: Theme) {
         self.renderer.set_theme(theme);
     }
@@ -255,47 +437,194 @@ impl View {
         self.renderer.theme()
     }
 
-    /// Copies what the next frame shows out of `grid`.
+    /// Copies what changed in `grid` since the last capture into the
+    /// snapshot, and adds the rows that changed to the next frame's
+    /// damage.
     ///
     /// This is the only part of a frame that runs under the session's
     /// terminal lock; shaping, drawing and waiting for a drawable happen
-    /// after it is released.
+    /// after it is released. It copies only the rows the grid reports
+    /// damaged (comparing them first), so its cost follows the damage,
+    /// not the screen size.
     pub(crate) fn capture(&mut self, grid: &Grid) {
-        self.snapshot.capture(grid);
+        let changed = self.snapshot.capture(grid);
+        self.pending = self.pending.union(&changed);
     }
 
-    /// Draws the last captured snapshot and presents it.
+    /// Draws the last captured snapshot and presents it, or returns
+    /// [`FrameStatus::Skipped`] when nothing was drawn, for one of three
+    /// reasons: nothing changed since the last presented frame, the frame
+    /// came earlier than the [`MIN_FRAME_INTERVAL`] schedule allows (paced),
+    /// or the surface had nothing to draw into. The first two never touch
+    /// the GPU. Damage of a frame that was not drawn carries over to the
+    /// next; after a paced skip the caller must render again for it to be
+    /// drawn (a display link does so on its next tick).
     pub(crate) fn render(&mut self, focused: bool) -> Result<FrameStatus, RenderError> {
+        let shown = Shown {
+            cursor: self.snapshot.cursor,
+            focused,
+        };
+        let changed =
+            !self.pending.is_none() || self.shown != Some(shown) || self.renderer.needs_redraw();
+        if !changed {
+            return Ok(self.skip(SkipReason::Unchanged));
+        }
+        let now = Instant::now();
+        if is_paced(self.last_presented, now) {
+            return Ok(self.skip(SkipReason::Paced));
+        }
         let rows = self.snapshot.rows();
-        let frame = self.snapshot.frame(&rows, focused);
-        self.surface.render(&self.gpu, &mut self.renderer, &frame)
+        let frame = self
+            .snapshot
+            .frame(&rows, focused)
+            .with_damage(self.pending.clone());
+        let status = self.target.render(&self.gpu, &mut self.renderer, &frame);
+        match status {
+            Ok(FrameStatus::Presented | FrameStatus::Suboptimal) => {
+                self.pending = DamageRows::None;
+                self.shown = Some(shown);
+                self.last_presented = Some(due_time(self.last_presented, now));
+                self.last_skip = None;
+            }
+            Ok(FrameStatus::Skipped) => {
+                self.last_skip = Some(SkipReason::Surface);
+            }
+            // The renderer rebuilds everything after an error; so does
+            // the next frame here.
+            Err(_) => self.pending = DamageRows::All,
+        }
+        status
+    }
+
+    /// Records why a frame was skipped.
+    fn skip(&mut self, reason: SkipReason) -> FrameStatus {
+        self.last_skip = Some(reason);
+        FrameStatus::Skipped
+    }
+
+    /// Why the last [`Self::render`] was skipped, `None` if it drew.
+    #[cfg(test)]
+    pub(crate) fn last_skip(&self) -> Option<SkipReason> {
+        self.last_skip
+    }
+
+    /// The renderer, for its counters.
+    #[cfg(test)]
+    pub(crate) fn renderer(&self) -> &Renderer {
+        &self.renderer
+    }
+
+    /// The last frame of an offscreen view, as RGBA bytes.
+    #[cfg(test)]
+    pub(crate) fn read_back(&self) -> Vec<u8> {
+        match &self.target {
+            Target::Offscreen { target, .. } => target.read_back(&self.gpu).expect("readback"),
+            Target::Surface(_) => panic!("only offscreen views read back"),
+        }
     }
 }
 
-/// The visible rows and cursor of a grid, copied so the terminal lock is
-/// held only for the copy. The buffer is reused from frame to frame.
+/// The visible rows, their grapheme clusters and the cursor of a grid,
+/// copied so the terminal lock is held only for the copy. The buffers are
+/// reused from frame to frame, and only rows the grid reports damaged are
+/// copied again.
 #[derive(Debug, Default)]
 pub(crate) struct Snapshot {
     cells: Vec<Cell>,
+    /// Each row's cluster text ([`tessera_grid::Line::graphemes`]).
+    clusters: Vec<GraphemeTable>,
     /// Cells per row (every row of a grid has the same length).
     cols: usize,
     cursor: Point,
+    /// The grid generation of the last capture; `None` before the first.
+    generation: Option<u64>,
+    /// Rows compared by partial captures, for tests.
+    #[cfg(test)]
+    compared: usize,
 }
 
 impl Snapshot {
-    /// Replaces the snapshot with `grid`'s visible rows and cursor.
-    pub(crate) fn capture(&mut self, grid: &Grid) {
-        self.cells.clear();
-        self.cols = usize::from(grid.cols());
-        for line in grid.visible_lines() {
+    /// Brings the snapshot up to date with `grid`'s visible rows and
+    /// cursor, and returns the rows whose cells or clusters changed.
+    ///
+    /// Only the rows the grid reports changed since the last capture
+    /// ([`Grid::damage_since`]) are compared and copied; the grid's
+    /// report may include rows that did not change (the cursor row stays
+    /// reported until the cursor leaves it), and the comparison drops
+    /// those, so an idle grid returns [`DamageRows::None`]. A grid of
+    /// another size, or another grid, is copied whole and returns
+    /// [`DamageRows::All`].
+    pub(crate) fn capture(&mut self, grid: &Grid) -> DamageRows {
+        let cols = usize::from(grid.cols());
+        let lines = grid.visible_lines();
+        let rows = lines.len();
+        let damage = match self.generation {
+            Some(generation) if cols == self.cols && rows == self.clusters.len() => {
+                grid.damage_since(generation)
+            }
+            _ => DamageRows::All,
+        };
+        self.generation = Some(grid.damage_generation());
+        self.cursor = grid.cursor();
+        let range = match &damage {
+            DamageRows::None => return DamageRows::None,
+            DamageRows::Rows(range) => {
+                usize::from(*range.start())..(usize::from(*range.end()) + 1).min(rows)
+            }
+            DamageRows::All => {
+                self.copy_all(lines, cols);
+                return DamageRows::All;
+            }
+        };
+        let mut changed = DamageRows::None;
+        for r in range {
+            let line = &lines[r];
             // Rows are `cols` long by construction; pad or cut defensively
             // so `rows()` can chunk evenly.
-            let cells = &line.cells[..line.cells.len().min(self.cols)];
-            self.cells.extend_from_slice(cells);
-            self.cells
-                .resize(self.cells.len() + self.cols - cells.len(), Cell::default());
+            let src = &line.cells[..line.cells.len().min(cols)];
+            let dst = &mut self.cells[r * cols..(r + 1) * cols];
+            #[cfg(test)]
+            {
+                self.compared += 1;
+            }
+            let same = dst[..src.len()] == *src
+                && dst[src.len()..].iter().all(|c| *c == Cell::default())
+                && self.clusters[r] == line.graphemes;
+            if same {
+                continue;
+            }
+            dst[..src.len()].copy_from_slice(src);
+            dst[src.len()..].fill(Cell::default());
+            self.clusters[r].clone_from(&line.graphemes);
+            changed = changed.with_row(u16::try_from(r).unwrap_or(u16::MAX));
         }
-        self.cursor = grid.cursor();
+        changed
+    }
+
+    /// Replaces the whole snapshot with `lines`, `cols` cells each: one
+    /// straight copy, no comparison and no default fill first (this runs
+    /// under the terminal lock on every full-screen scroll and resize).
+    fn copy_all(&mut self, lines: &[Line], cols: usize) {
+        self.cols = cols;
+        self.cells.clear();
+        self.cells.reserve(lines.len() * cols);
+        for line in lines {
+            // Rows are `cols` long by construction; pad or cut defensively
+            // so `rows()` can chunk evenly.
+            let src = &line.cells[..line.cells.len().min(cols)];
+            self.cells.extend_from_slice(src);
+            if src.len() < cols {
+                self.cells
+                    .resize(self.cells.len() + cols - src.len(), Cell::default());
+            }
+        }
+        self.clusters.truncate(lines.len());
+        for (dst, line) in self.clusters.iter_mut().zip(lines) {
+            dst.clone_from(&line.graphemes);
+        }
+        let have = self.clusters.len();
+        self.clusters
+            .extend(lines[have..].iter().map(|line| line.graphemes.clone()));
     }
 
     /// The captured rows, top to bottom.
@@ -306,14 +635,16 @@ impl Snapshot {
         self.cells.chunks(self.cols).collect()
     }
 
-    /// The frame drawing `rows` (this snapshot's [`Self::rows`]): a
-    /// visible block cursor at the captured cursor position, `focused`
-    /// (an unfocused frame draws the cursor hollow), no selection and no
-    /// overlays. The viewport (#31), cursor blink and shape (#27, #29) are
-    /// still to come.
-    pub(crate) fn frame<'a>(&self, rows: &'a [&'a [Cell]], focused: bool) -> FrameInput<'a> {
+    /// The frame drawing `rows` (this snapshot's [`Self::rows`]) with the
+    /// rows' grapheme clusters: a visible block cursor at the captured
+    /// cursor position, `focused` (an unfocused frame draws the cursor
+    /// hollow), no selection and no overlays, and the default damage
+    /// ([`DamageRows::All`]). The viewport (#31), cursor blink and shape
+    /// (#27, #29) are still to come.
+    pub(crate) fn frame<'a>(&'a self, rows: &'a [&'a [Cell]], focused: bool) -> FrameInput<'a> {
         let Point { row, col } = self.cursor;
         FrameInput::new(rows)
+            .with_clusters(&self.clusters)
             .with_cursor(Some(CursorState::new(row, col, CursorShape::Block)))
             .with_focus(focused)
     }
@@ -592,6 +923,8 @@ mod tests {
         snapshot.capture(term.grid());
         let mut best = Duration::MAX;
         for _ in 0..50 {
+            // Forget the generation: time a full copy, the worst case.
+            snapshot.generation = None;
             let start = Instant::now();
             snapshot.capture(term.grid());
             best = best.min(start.elapsed());
@@ -601,6 +934,401 @@ mod tests {
         assert!(
             best < Duration::from_millis(2),
             "capturing 200x60 cells took {best:?}"
+        );
+    }
+
+    #[test]
+    fn capture_reports_only_rows_that_changed() {
+        let mut term = Terminal::new(4, 10);
+        let mut snapshot = Snapshot::default();
+        assert_eq!(
+            snapshot.capture(term.grid()),
+            DamageRows::All,
+            "first capture"
+        );
+        assert_eq!(snapshot.capture(term.grid()), DamageRows::None, "idle");
+        term.advance(b"hi");
+        assert_eq!(snapshot.capture(term.grid()), DamageRows::Rows(0..=0));
+        // The grid keeps reporting the cursor row; the comparison drops it.
+        assert_eq!(
+            term.grid().damage_since(term.grid().damage().generation),
+            DamageRows::Rows(0..=0)
+        );
+        assert_eq!(snapshot.capture(term.grid()), DamageRows::None);
+        // A cursor move changes no cells.
+        term.advance(b"\x1b[3;5H");
+        assert_eq!(snapshot.capture(term.grid()), DamageRows::None);
+        assert_eq!(snapshot.cursor, Point::new(2, 4));
+        term.advance(b"x\x1b[1;1Hy");
+        assert_eq!(snapshot.capture(term.grid()), DamageRows::Rows(0..=2));
+        assert_eq!(snapshot.rows()[2][4].ch, 'x');
+        assert_eq!(snapshot.rows()[0][0].ch, 'y');
+        // Clusters are copied with their row.
+        term.advance(b"\x1b[4;1He\xcc\x81");
+        assert_eq!(snapshot.capture(term.grid()), DamageRows::Rows(3..=3));
+        assert_eq!(snapshot.clusters[3].get(0), Some("e\u{301}"));
+        term.resize(5, 10);
+        assert_eq!(snapshot.capture(term.grid()), DamageRows::All);
+        assert_eq!(snapshot.rows().len(), 5);
+    }
+
+    /// A headless view of `rows` x `cols` Menlo 13 pt cells at 1x, or
+    /// `None` when GPU tests are skipped.
+    fn offscreen_view(rows: u16, cols: u16) -> Option<View> {
+        if std::env::var_os("TESSERA_SKIP_GPU_TESTS").is_some() {
+            return None;
+        }
+        let gpu = Gpu::headless().expect("a Metal adapter");
+        let fonts = Fonts::new(&tessera_render::FontConfig {
+            family: "Menlo".into(),
+            size_pt: 13.0,
+            scale: 1.0,
+            fallback: Vec::new(),
+        })
+        .expect("Menlo ships with macOS");
+        let theme = Theme {
+            font_family: "Menlo".into(),
+            font_size: 13.0,
+            ..Theme::default()
+        };
+        let size = PhysicalSize::new(
+            u32::from(cols) * MENLO_1X.width_px + 8,
+            u32::from(rows) * MENLO_1X.height_px + 8,
+        );
+        let view = View::offscreen(gpu, fonts, theme, size, 1.0).expect("view");
+        assert_eq!(view.cell_metrics(), MENLO_1X);
+        Some(view)
+    }
+
+    /// Waits out the frame interval, so the next render is not paced.
+    fn next_frame() {
+        std::thread::sleep(MIN_FRAME_INTERVAL + Duration::from_millis(1));
+    }
+
+    #[test]
+    fn the_same_snapshot_twice_is_presented_then_skipped() {
+        let Some(mut view) = offscreen_view(4, 20) else {
+            return;
+        };
+        let mut term = Terminal::new(4, 20);
+        term.advance(b"hello");
+        view.capture(term.grid());
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+        let frames = view.renderer().stats().frames;
+        next_frame();
+        view.capture(term.grid());
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Skipped);
+        assert_eq!(view.last_skip(), Some(SkipReason::Unchanged));
+        assert_eq!(view.renderer().stats().frames, frames, "no GPU work");
+        // Without even a capture in between.
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Skipped);
+        assert_eq!(view.last_skip(), Some(SkipReason::Unchanged));
+    }
+
+    #[test]
+    fn a_one_row_change_reshapes_exactly_that_row() {
+        let Some(mut view) = offscreen_view(6, 30) else {
+            return;
+        };
+        let mut term = Terminal::new(6, 30);
+        for row in 0..6 {
+            term.advance(format!("\x1b[{};1Hrow {row} of text", row + 1).as_bytes());
+        }
+        view.capture(term.grid());
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+        let before = view.renderer().stats();
+        next_frame();
+        term.advance(b"\x1b[3;1Hchanged");
+        view.capture(term.grid());
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+        let after = view.renderer().stats();
+        assert_eq!(after.rows_shaped - before.rows_shaped, 1, "only row 2");
+        assert_eq!(after.frames - before.frames, 1);
+    }
+
+    #[test]
+    fn cursor_and_focus_changes_draw_without_shaping() {
+        let Some(mut view) = offscreen_view(3, 10) else {
+            return;
+        };
+        let mut term = Terminal::new(3, 10);
+        term.advance(b"abc");
+        view.capture(term.grid());
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+        let shaped = view.renderer().stats().rows_shaped;
+        next_frame();
+        term.advance(b"\x1b[2;2H");
+        view.capture(term.grid());
+        assert_eq!(
+            view.render(true).expect("frame"),
+            FrameStatus::Presented,
+            "cursor moved"
+        );
+        next_frame();
+        assert_eq!(
+            view.render(false).expect("frame"),
+            FrameStatus::Presented,
+            "focus lost"
+        );
+        next_frame();
+        assert_eq!(view.render(false).expect("frame"), FrameStatus::Skipped);
+        assert_eq!(
+            view.renderer().stats().rows_shaped,
+            shaped,
+            "no row re-shaped"
+        );
+    }
+
+    #[test]
+    fn frames_within_one_interval_are_paced_and_damage_carries_over() {
+        let Some(mut view) = offscreen_view(3, 10) else {
+            return;
+        };
+        let mut term = Terminal::new(3, 10);
+        view.capture(term.grid());
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+        term.advance(b"one");
+        view.capture(term.grid());
+        // A frame was just presented: the next one is not due for an
+        // interval, and half an interval of slack does not cover that.
+        view.last_presented = Some(Instant::now());
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Skipped);
+        assert_eq!(view.last_skip(), Some(SkipReason::Paced));
+        // Within the slack of its due time it is on time, and draws the
+        // row the paced call captured.
+        let shaped = view.renderer().stats().rows_shaped;
+        view.last_presented =
+            Instant::now().checked_sub(MIN_FRAME_INTERVAL.saturating_sub(FRAME_SLACK / 2));
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+        assert_eq!(
+            view.renderer().stats().rows_shaped - shaped,
+            1,
+            "row 0 kept its damage"
+        );
+    }
+
+    /// A display link's jitter never makes its tick paced, at 60, 120,
+    /// 144, 165 and 240 Hz: hand-picked late and early ticks (one tick 3 ms
+    /// late is the case where a 1 ms slack paced the next, on-time tick,
+    /// and a host that stops its link on `Skipped` lost the burst's last
+    /// frame), then 20 000 ticks each late by a pseudo-random amount below
+    /// 95% of a period (a link delivers its ticks in order).
+    #[test]
+    fn display_link_ticks_are_never_paced() {
+        let start = Instant::now();
+        let ms = |v: f64| Duration::from_secs_f64(v / 1000.0);
+        for (period, jitter) in [
+            (16.667, &[0.0, 4.0, -4.0, 4.0, 0.0, 15.0, 0.0][..]),
+            (
+                8.333,
+                &[0.0, 3.0, 0.0, 0.0, -2.0, 4.0, -4.0, 0.0, 1.0, 7.9, 0.0][..],
+            ),
+            (6.944, &[0.0, 3.0, 0.0, -3.0, 3.0, 6.5, 0.0][..]),
+            (6.061, &[0.0, 3.0, 0.0, -3.0, 3.0, 5.7, 0.0][..]),
+            (4.167, &[0.0, 2.0, 0.0, -2.0, 2.0, 3.9, 0.0][..]),
+        ] {
+            let mut last = None;
+            for (k, j) in jitter.iter().enumerate() {
+                #[expect(clippy::cast_precision_loss, reason = "a few ticks")]
+                let now = start + ms(20.0 + period * k as f64 + j);
+                assert!(
+                    !is_paced(last, now),
+                    "tick {k} at {period} ms, jitter {j} ms"
+                );
+                last = Some(due_time(last, now));
+            }
+        }
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        for period in [16.667, 8.333, 6.944, 6.061, 4.167] {
+            let mut last = None;
+            for k in 0..20_000u32 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                #[expect(clippy::cast_precision_loss, reason = "a fraction")]
+                let late = (seed % 1000) as f64 / 1000.0 * 0.95 * period;
+                let now = start + ms(20.0 + period * f64::from(k) + late);
+                assert!(
+                    !is_paced(last, now),
+                    "tick {k} at {period} ms, {late:.2} ms late"
+                );
+                last = Some(due_time(last, now));
+            }
+        }
+        // Renders faster than the display: the schedule lets the first two
+        // through (one may come up to the slack early) and paces the rest
+        // until the next interval (4.17 ms).
+        let now = start + ms(50.0);
+        let mut last = None;
+        for k in 0..2 {
+            let t = now + ms(f64::from(k));
+            assert!(!is_paced(last, t), "render {k}");
+            last = Some(due_time(last, t));
+        }
+        assert!(is_paced(last, now + ms(2.0)));
+        assert!(is_paced(last, now + ms(3.5)));
+        assert!(!is_paced(last, now + ms(4.3)), "on time again");
+    }
+
+    /// A flood: 10 000 4 KiB reads of `yes` output while the view
+    /// captures and renders in a loop for two seconds. Frames are paced:
+    /// each presented frame is due an interval `I` (1/240 s) after the
+    /// previous one's due time, may come [`FRAME_SLACK`] (`I / 2`) early,
+    /// and its due time never lags the clock by more than the slack. So
+    /// the first and last of `n` frames are at least `(n - 1) * I - 2 *
+    /// slack = (n - 2) * I` apart, and two seconds hold at most `2 s / I +
+    /// 2 = 482` frames. A debug build presents about 350 to 481 (the loop
+    /// is fast enough to hit the limit on an idle machine) and, without
+    /// pacing, about 1 000, so removing the pacing fails the test. The
+    /// flood never starves the frames below 30 per second, and the
+    /// snapshot's memory does not grow with the output.
+    #[test]
+    fn a_flood_renders_at_display_rate() {
+        let Some(mut view) = offscreen_view(24, 80) else {
+            return;
+        };
+        let mut term = Terminal::new(24, 80);
+        let chunk: Vec<u8> = b"y\n".repeat(2048);
+        let window = Duration::from_secs(2);
+        let start = Instant::now();
+        let (mut fed, mut presented, mut calls) = (0, 0u32, 0u32);
+        let mut longest_capture = Duration::ZERO;
+        let mut capacity = None;
+        while start.elapsed() < window {
+            if fed < 10_000 {
+                term.advance(&chunk);
+                fed += 1;
+            }
+            let t = Instant::now();
+            view.capture(term.grid());
+            longest_capture = longest_capture.max(t.elapsed());
+            calls += 1;
+            if view.render(true).expect("frame") == FrameStatus::Presented {
+                presented += 1;
+            }
+            let cap = (
+                view.snapshot.cells.capacity(),
+                view.snapshot.clusters.capacity(),
+            );
+            assert!(capacity.is_none_or(|c| c == cap), "snapshot grew: {cap:?}");
+            capacity = Some(cap);
+        }
+        eprintln!(
+            "flood: {fed} reads, {calls} calls, {presented} frames presented in {window:?}; \
+             longest capture {longest_capture:?}"
+        );
+        let max = 2 * 240 + 2;
+        assert!(presented <= max, "{presented} frames > {max}: not paced");
+        assert!(presented >= 2 * 30, "{presented} frames < 60: starved");
+    }
+
+    /// The snapshot's rows and clusters exactly as `term`'s grid holds them.
+    fn assert_snapshot_is(snapshot: &Snapshot, term: &Terminal) {
+        let lines = term.grid().visible_lines();
+        let rows = snapshot.rows();
+        assert_eq!(rows.len(), lines.len());
+        for (r, (row, line)) in rows.iter().zip(lines).enumerate() {
+            assert_eq!(*row, line.cells.as_slice(), "row {r} cells");
+            assert_eq!(snapshot.clusters[r], line.graphemes, "row {r} clusters");
+        }
+        assert_eq!(snapshot.clusters.len(), lines.len());
+        assert_eq!(snapshot.cursor, term.grid().cursor());
+    }
+
+    /// A full capture (the path every full-screen scroll and resize takes,
+    /// under the terminal lock) copies the grid exactly, whatever the
+    /// snapshot held before, and compares no row on the way.
+    #[test]
+    fn a_full_capture_is_an_exact_copy_without_comparisons() {
+        let mut snapshot = Snapshot::default();
+        let mut term = Terminal::new(5, 12);
+        term.advance("e\u{301}x 中文 👍🏽\r\n\x1b[41mred\x1b[0m a\u{338}\r\n".as_bytes());
+        assert_eq!(snapshot.capture(term.grid()), DamageRows::All);
+        assert_snapshot_is(&snapshot, &term);
+        assert_eq!(snapshot.compared, 0, "no comparison on the full path");
+        // Partial captures compare only the reported rows.
+        term.advance(b"\x1b[3;1Hzz");
+        assert_eq!(snapshot.capture(term.grid()), DamageRows::Rows(2..=2));
+        assert!(snapshot.compared > 0);
+        assert_snapshot_is(&snapshot, &term);
+        // Smaller, then larger again: stale rows and clusters are replaced.
+        for (rows, cols) in [(3, 7), (8, 20), (8, 20)] {
+            term.resize(rows, cols);
+            term.advance("\x1b[1;1H❤\u{fe0f}e\u{301}".as_bytes());
+            let compared = snapshot.compared;
+            snapshot.generation = None;
+            assert_eq!(snapshot.capture(term.grid()), DamageRows::All);
+            assert_eq!(
+                snapshot.compared, compared,
+                "no comparison on the full path"
+            );
+            assert_snapshot_is(&snapshot, &term);
+        }
+    }
+
+    /// A red theme with blue text: every pixel the grid does not draw is
+    /// red, and kept rows' glyph instances must be rebuilt for the text.
+    fn red() -> Theme {
+        Theme {
+            background: tessera_render::Rgba::new(1.0, 0.0, 0.0, 1.0),
+            foreground: tessera_render::Rgba::new(0.0, 0.0, 1.0, 1.0),
+            ..Theme::default()
+        }
+    }
+
+    /// A re-theme with nothing else changed is drawn, never skipped as
+    /// unchanged: `Renderer::set_theme` makes the renderer ask for a redraw.
+    #[test]
+    fn a_theme_change_is_drawn_without_damage() {
+        let Some(mut view) = offscreen_view(3, 10) else {
+            return;
+        };
+        let mut term = Terminal::new(3, 10);
+        term.advance(b"abc");
+        view.capture(term.grid());
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+        next_frame();
+        view.capture(term.grid());
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Skipped);
+        view.set_theme(red());
+        next_frame();
+        view.capture(term.grid());
+        let shaped = view.renderer().stats().rows_shaped;
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+        assert_eq!(view.renderer().stats().rows_shaped - shaped, 3, "every row");
+        let image = view.read_back();
+        // The padding corner and a blank cell are the new background.
+        assert_eq!(image[..4], [255, 0, 0, 255], "the corner is red");
+        let last = image.len() - 4;
+        assert_eq!(image[last..], [255, 0, 0, 255]);
+        next_frame();
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Skipped);
+    }
+
+    /// A re-theme together with a one-row change draws every row in the
+    /// new theme, the changed one included: the same pixels as a new view
+    /// drawing that screen in that theme.
+    #[test]
+    fn a_theme_change_with_partial_damage_redraws_everything() {
+        let (Some(mut view), Some(mut fresh)) = (offscreen_view(3, 10), offscreen_view(3, 10))
+        else {
+            return;
+        };
+        let mut term = Terminal::new(3, 10);
+        term.advance(b"abc\r\ndef");
+        view.capture(term.grid());
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+        next_frame();
+        term.advance(b"\x1b[3;1Hxyz");
+        view.capture(term.grid());
+        view.set_theme(red());
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+        fresh.set_theme(red());
+        fresh.capture(term.grid());
+        assert_eq!(fresh.render(true).expect("frame"), FrameStatus::Presented);
+        assert!(
+            view.read_back() == fresh.read_back(),
+            "every row in the new theme"
         );
     }
 }

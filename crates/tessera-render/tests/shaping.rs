@@ -822,3 +822,99 @@ fn shaping_one_long_line_costs_the_same_as_many_short_ones() {
         "one long line took {ratio:.2}x the time of the same cells in short lines"
     );
 }
+
+// ------------------------------------------------------------ full clusters
+
+/// Shapes `text` as the grid lays it out, with the line's cluster table.
+fn shape_grid(shaper: &mut Shaper, text: &str) -> (tessera_grid::Line, Vec<ShapedGlyph>) {
+    let mut grid = tessera_grid::Grid::new(1, 12);
+    grid.put_str(text);
+    let line = grid.line(0).expect("row 0").clone();
+    let glyphs = shaper.shape_grid_line(&line);
+    (line, glyphs)
+}
+
+#[test]
+fn a_combining_mark_is_drawn_with_its_base_in_one_cell() {
+    let mut shaper = menlo(13.0, 2.0);
+    let w = shaper.cell_metrics().width_px as f32;
+    // Menlo composes `e` + U+0301 into its own `é`; U+0338 (long solidus
+    // overlay) has no precomposed form after `a`, so it stays a mark.
+    for text in ["e\u{301}x", "a\u{338}x"] {
+        let (line, glyphs) = shape_grid(&mut shaper, text);
+        assert!(line.cells[0].is_cluster(), "the grid made a cluster");
+        let whole: Vec<&ShapedGlyph> = glyphs.iter().filter(|g| g.cell_index == 0).collect();
+        assert!(
+            !whole.is_empty() && whole.iter().all(|g| g.cell_span == 1),
+            "{glyphs:?}"
+        );
+        for g in &whole {
+            assert!(
+                g.x_offset > -w / 2.0 && g.x_offset < w,
+                "inside the cell: {g:?}"
+            );
+        }
+        // Base-only shaping draws the bare base (#20's behaviour); the whole
+        // cluster draws something else (a composed glyph or a mark too).
+        let base_only = shaper.shape_line(&line.cells);
+        let bare: Vec<u16> = base_only
+            .iter()
+            .filter(|g| g.cell_index == 0)
+            .map(|g| g.glyph_id)
+            .collect();
+        let drawn: Vec<u16> = whole.iter().map(|g| g.glyph_id).collect();
+        assert_eq!(bare.len(), 1);
+        assert_ne!(drawn, bare, "{text:?}: the mark is drawn");
+    }
+    let (_, stroke) = shape_grid(&mut shaper, "a\u{338}");
+    assert_eq!(stroke.len(), 2, "base and overlay mark: {stroke:?}");
+    assert_eq!((stroke[1].cell_index, stroke[1].cell_span), (0, 1));
+}
+
+#[test]
+fn emoji_sequences_are_one_colour_glyph() {
+    let mut shaper = menlo(13.0, 2.0);
+    for (name, text) in [
+        (
+            "ZWJ family",
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}",
+        ),
+        ("skin tone", "\u{1F44D}\u{1F3FD}"),
+        ("flag", "\u{1F1F8}\u{1F1EA}"),
+        ("VS16 heart", "\u{2764}\u{FE0F}"),
+    ] {
+        let (line, glyphs) = shape_grid(&mut shaper, text);
+        assert!(
+            line.cells[0].is_cluster() && line.cells[0].is_wide(),
+            "{name}"
+        );
+        assert_eq!(glyphs.len(), 1, "{name}: one glyph, {glyphs:?}");
+        let g = glyphs[0];
+        assert_eq!((g.cell_index, g.cell_span), (0, 1), "{name}");
+        assert!(g.is_color, "{name}: drawn by the colour emoji face");
+        assert_eq!(
+            shaper.fonts().face_family(g.face_id).as_deref(),
+            Some("Apple Color Emoji"),
+            "{name}"
+        );
+        // Centred over both columns.
+        let w = shaper.cell_metrics().width_px as f32;
+        assert!(g.x_offset >= -1.0 && g.x_offset < w, "{name}: {g:?}");
+    }
+    // The base alone is a different glyph: the sequence was shaped whole.
+    let (line, whole) = shape_grid(&mut shaper, "\u{1F44D}\u{1F3FD}");
+    let base = shaper.shape_line(&line.cells);
+    assert_ne!(
+        whole[0].glyph_id, base[0].glyph_id,
+        "the modifier changed the glyph"
+    );
+}
+
+#[test]
+fn vs15_asks_for_text_presentation() {
+    let mut shaper = menlo(13.0, 2.0);
+    let (line, glyphs) = shape_grid(&mut shaper, "\u{231A}\u{FE0E}");
+    assert!(line.cells[0].is_cluster() && !line.cells[0].is_wide());
+    assert_eq!(glyphs.len(), 1, "{glyphs:?}");
+    assert!(!glyphs[0].is_color, "text presentation: {glyphs:?}");
+}

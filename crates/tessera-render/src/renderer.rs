@@ -1,18 +1,20 @@
 //! The grid renderer: shapes a [`FrameInput`], fills the glyph atlas and
-//! draws the four passes into any render target.
+//! draws the four passes into any render target, re-shaping and
+//! re-uploading only the rows the frame's damage names (ADR 0016).
 
 use std::num::NonZeroU64;
 
-use tessera_grid::{Cell, Style};
+use tessera_grid::{Cell, DamageRows, GraphemeTable, Style};
 
 use crate::atlas::{AtlasStats, DEFAULT_ATLAS_SIZE, GlyphAtlas};
+use crate::damage::{self, ROW_PASSES, Row, Slots};
 use crate::error::RenderError;
 use crate::frame::FrameInput;
 use crate::gpu::Gpu;
 use crate::palette::Palette;
 use crate::passes::glyph::GlyphSource;
 use crate::passes::{self, Instance, Layout, PassRanges};
-use crate::shaping::{CellMetrics, ShapedGlyph, Shaper};
+use crate::shaping::{CellMetrics, Shaper};
 use crate::size::PhysicalSize;
 use crate::theme::Theme;
 
@@ -36,7 +38,10 @@ const INSTANCE_SIZE: u64 = std::mem::size_of::<Instance>() as u64;
 ///
 /// Each frame clears the target to [`Theme::background`] and draws the
 /// background, glyph, decoration and cursor passes in that order, from
-/// one instance buffer rebuilt per frame (ADR 0010).
+/// one instance buffer (ADR 0010). Rows keep their shaped glyphs and
+/// instances between frames: only the rows in [`FrameInput::damage`] are
+/// shaped and uploaded again, plus every row when the layout, theme, font
+/// size or atlas contents changed under them (ADR 0016).
 #[derive(Debug)]
 pub struct Renderer {
     shaper: Shaper,
@@ -55,14 +60,60 @@ pub struct Renderer {
     max_instances: u64,
     /// One pipeline per target format seen so far.
     pipelines: Vec<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
-    /// This frame's instances; the outer allocation is reused.
-    instances: Vec<Instance>,
-    /// This frame's shaped rows. Only the outer vector is reused; each
-    /// row's glyph vector is allocated by the shaper every frame (caching
-    /// shaped rows is #21's damage tracking).
-    shaped: Vec<Vec<ShapedGlyph>>,
+    /// Every visible row's shaped glyphs and instances, kept between
+    /// frames.
+    rows: Vec<Row>,
+    /// What `rows` were built for; `None` until a frame succeeds and after
+    /// anything that invalidates them (a failed frame, a theme change).
+    built: Option<BuildKey>,
+    /// The atlas counters when `rows` last referenced valid atlas slots: a
+    /// later eviction or clear may have moved a glyph of a row that was
+    /// not rebuilt.
+    atlas_seen: (u64, u64),
+    /// Where each row's instances sit in the instance buffer.
+    slots: Slots,
+    /// A CPU copy of the instance buffer, laid out by `slots`.
+    mirror: Vec<Instance>,
+    /// The cursor's instances this frame.
+    cursor: Vec<Instance>,
     /// A row copy with `HIDDEN` cells blanked, for shaping.
     shaping_row: Vec<Cell>,
+    /// The target size the globals buffer holds, so an unchanged size is
+    /// not uploaded again.
+    globals_size: Option<PhysicalSize>,
+    /// Counters for tests and diagnostics.
+    stats: RenderStats,
+    /// Test hook: the next upload fails after the mirror was written.
+    #[cfg(test)]
+    fail_next_upload: bool,
+}
+
+/// What a renderer's cached rows depend on besides the cells.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BuildKey {
+    layout: Layout,
+    /// The shaper's pixel size: a font change that keeps the cell size
+    /// still changes every glyph.
+    size_px_bits: u32,
+    /// Rows drawn (the frame's rows that start inside the target).
+    rows: usize,
+}
+
+/// Work counters of a [`Renderer`], cumulative since it was created.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RenderStats {
+    /// Frames drawn.
+    pub frames: u64,
+    /// Rows shaped ([`Shaper::shape_line_into`] calls).
+    pub rows_shaped: u64,
+    /// Rows whose instances were rebuilt (shaped rows, plus every row when
+    /// the atlas moved glyphs under them).
+    pub rows_built: u64,
+    /// Instances written to the GPU buffer.
+    pub instances_uploaded: u64,
+    /// Times the instance buffer was laid out again (and uploaded whole).
+    pub relayouts: u64,
 }
 
 impl Renderer {
@@ -173,9 +224,17 @@ impl Renderer {
                 instance_capacity: MIN_INSTANCES,
                 max_instances: (device.limits().max_buffer_size / INSTANCE_SIZE).max(1),
                 pipelines: Vec::new(),
-                instances: Vec::new(),
-                shaped: Vec::new(),
+                rows: Vec::new(),
+                built: None,
+                atlas_seen: (0, 0),
+                slots: Slots::default(),
+                mirror: Vec::new(),
+                cursor: Vec::new(),
                 shaping_row: Vec::new(),
+                globals_size: None,
+                stats: RenderStats::default(),
+                #[cfg(test)]
+                fail_next_upload: false,
             }
         })
     }
@@ -194,6 +253,7 @@ impl Renderer {
     pub fn set_theme(&mut self, theme: Theme) {
         self.palette = Palette::new(&theme);
         self.theme = theme;
+        self.built = None;
     }
 
     /// Changes the font size or backing scale; the atlas clears itself at
@@ -222,6 +282,25 @@ impl Renderer {
         self.atlas.stats()
     }
 
+    /// How much work the frames so far did: rows shaped, instances
+    /// uploaded.
+    #[must_use]
+    pub fn stats(&self) -> RenderStats {
+        self.stats
+    }
+
+    /// True when the next frame must be drawn even if nothing in it
+    /// changed: no frame has been drawn yet (or the last one failed, or
+    /// the theme changed), or the fallback font index became ready while a
+    /// row shows a `.notdef` glyph that it may now resolve (ADR 0007). A
+    /// host that skips frames without damage asks this first.
+    #[must_use]
+    pub fn needs_redraw(&self) -> bool {
+        self.built.is_none()
+            || (self.rows.iter().any(|r| r.pending_fallback)
+                && self.shaper.fonts().fallback_index_ready())
+    }
+
     /// Draws `frame` into `view`, a `size`-pixel texture of `format`.
     ///
     /// Clears the whole view to [`Theme::background`], then draws the
@@ -229,6 +308,14 @@ impl Renderer {
     /// an sRGB `format` encodes them on write, a linear one stores them as
     /// they are (as [`Gpu::clear_view`] does). An empty `size` draws
     /// nothing.
+    ///
+    /// Only the rows in [`FrameInput::damage`] are shaped and uploaded
+    /// again; the others are drawn from what the previous frame built, so
+    /// they must not have changed since. Every row is rebuilt after a
+    /// change of layout (target size, font size, padding), theme or row
+    /// count, a failed frame, or [`DamageRows::All`]. The cursor, focus and
+    /// clear color need no damage. A row showing a `.notdef` glyph is
+    /// shaped again once the fallback font index is ready.
     ///
     /// When the atlas runs out of room mid-frame it is reset once and the
     /// frame rebuilt ([`crate::GlyphAtlas::recover_from_full`]).
@@ -241,6 +328,7 @@ impl Renderer {
     /// buffer may hold, and
     /// [`RenderError::Gpu`] when recording or submitting fails validation
     /// (for example a `view` that is not a render attachment of `format`).
+    /// After an error the next frame rebuilds every row.
     pub fn render(
         &mut self,
         gpu: &Gpu,
@@ -258,80 +346,293 @@ impl Renderer {
             self.theme.padding,
             size,
         );
-        self.atlas.begin_frame();
-        self.shaped.clear();
-        let cols = layout.visible_cols();
-        for row in frame.rows.iter().take(layout.visible_rows()) {
-            let row = &row[..row.len().min(cols)];
-            // Hidden cells are shaped as blanks, so no ligature reaches
-            // across a hidden boundary (a hidden `>` must not turn a
-            // visible `=` into an arrow).
-            let glyphs = if row.iter().any(|c| c.style.has(Style::HIDDEN)) {
-                self.shaping_row.clear();
-                self.shaping_row.extend(row.iter().map(|c| {
-                    let mut cell = *c;
-                    if cell.style.has(Style::HIDDEN) {
-                        cell.ch = ' ';
-                    }
-                    cell
-                }));
-                self.shaper.shape_line(&self.shaping_row)
-            } else {
-                self.shaper.shape_line(row)
-            };
-            self.shaped.push(glyphs);
+        let result = self
+            .prepare(gpu, &layout, frame)
+            .and_then(|ranges| self.draw(gpu, view, format, size, &ranges));
+        if result.is_err() {
+            // The mirror may hold slots the GPU never received: forget it,
+            // so the next frame lays out and uploads everything.
+            self.built = None;
+            self.mirror.clear();
         }
-        let ranges = match self.build(gpu, &layout, frame) {
-            Err(RenderError::AtlasFull(layer)) => {
-                self.atlas.recover_from_full(gpu, layer)?;
-                self.build(gpu, &layout, frame)?
-            }
-            other => other?,
-        };
-        self.draw(gpu, view, format, size, &ranges)
+        result
     }
 
-    /// Fills `self.instances` with the four passes.
-    fn build(
+    /// Shapes and builds the damaged rows and the cursor, and uploads what
+    /// changed.
+    fn prepare(
         &mut self,
         gpu: &Gpu,
         layout: &Layout,
         frame: &FrameInput<'_>,
     ) -> Result<PassRanges, RenderError> {
-        let out = &mut self.instances;
-        out.clear();
+        self.atlas.begin_frame();
+        let key = BuildKey {
+            layout: *layout,
+            size_px_bits: self.shaper.size_px().to_bits(),
+            rows: frame.rows.len().min(layout.visible_rows()),
+        };
+        let everything = self.built != Some(key);
+        self.built = None;
+        if everything {
+            // Upload all of it, cursor included, whatever the mirror says.
+            self.mirror.clear();
+        }
+        self.rows.resize_with(key.rows, Row::default);
+        let cols = layout.visible_cols();
+        let fallback_ready = self.shaper.fonts().fallback_index_ready();
+        // Rows to shape again: the damage, rows whose length changed, and
+        // rows waiting for the fallback index once it is ready.
+        let mut reshape = vec![false; key.rows];
+        for (r, flag) in reshape.iter_mut().enumerate() {
+            let row = &self.rows[r];
+            let len = frame.rows[r].len().min(cols);
+            *flag = everything
+                || damaged(&frame.damage, r)
+                || row.len != len
+                || (row.pending_fallback && fallback_ready);
+        }
+        for (r, _) in reshape.iter().enumerate().filter(|(_, f)| **f) {
+            self.shape_row(
+                r,
+                frame.rows[r],
+                frame.clusters.get(r),
+                cols,
+                fallback_ready,
+            );
+        }
+        // Rows to build: the reshaped ones, or all of them when the atlas
+        // may have moved a glyph of a row kept from an earlier frame. Only
+        // frames touch the atlas today, and a frame ends with every row
+        // valid, so this is a guard; evictions during this frame are
+        // handled below.
+        let mut build = if self.atlas_counters() == self.atlas_seen {
+            reshape
+        } else {
+            vec![true; key.rows]
+        };
+        let mut recovered = false;
+        loop {
+            let before = self.atlas_counters();
+            match self.build(gpu, layout, frame, &build) {
+                Err(RenderError::AtlasFull(layer)) if !recovered => {
+                    self.atlas.recover_from_full(gpu, layer)?;
+                    recovered = true;
+                    build = vec![true; key.rows];
+                }
+                Err(e) => return Err(e),
+                Ok(()) => {
+                    // An eviction during a partial build may have taken a
+                    // glyph of a row kept from before: build them all once
+                    // more (a full build only evicts glyphs no row uses
+                    // any more, since every row touches its glyphs).
+                    if self.atlas_counters() != before && build.iter().any(|b| !b) {
+                        build = vec![true; key.rows];
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        self.atlas_seen = self.atlas_counters();
+        let ranges = self.upload(gpu, &build)?;
+        self.built = Some(key);
+        Ok(ranges)
+    }
+
+    /// The atlas counters that change when a slot handed out earlier may
+    /// no longer hold its glyph.
+    fn atlas_counters(&self) -> (u64, u64) {
+        let stats = self.atlas.stats();
+        (stats.evicted, stats.cleared)
+    }
+
+    /// Shapes row `r` (`cells`, with cluster text `clusters`) into its
+    /// cached glyph vector.
+    fn shape_row(
+        &mut self,
+        r: usize,
+        cells: &[Cell],
+        clusters: Option<&GraphemeTable>,
+        cols: usize,
+        fallback_ready: bool,
+    ) {
+        static NO_CLUSTERS: GraphemeTable = GraphemeTable::new();
+        let cells = &cells[..cells.len().min(cols)];
+        let clusters = clusters.unwrap_or(&NO_CLUSTERS);
+        let row = &mut self.rows[r];
+        // Hidden cells are shaped as blanks, so no ligature reaches
+        // across a hidden boundary (a hidden `>` must not turn a visible
+        // `=` into an arrow).
+        if cells.iter().any(|c| c.style.has(Style::HIDDEN)) {
+            self.shaping_row.clear();
+            self.shaping_row.extend(cells.iter().map(|c| {
+                let mut cell = *c;
+                if cell.style.has(Style::HIDDEN) {
+                    cell.ch = ' ';
+                }
+                cell
+            }));
+            self.shaper
+                .shape_line_into(&self.shaping_row, clusters, &mut row.shaped);
+        } else {
+            self.shaper
+                .shape_line_into(cells, clusters, &mut row.shaped);
+        }
+        row.len = cells.len();
+        row.pending_fallback = !fallback_ready
+            && row
+                .shaped
+                .iter()
+                .any(|g| g.glyph_id == 0 && !g.face_id.is_builtin());
+        self.stats.rows_shaped += 1;
+    }
+
+    /// Rebuilds the instances of the rows flagged in `build`, and the
+    /// cursor's.
+    fn build(
+        &mut self,
+        gpu: &Gpu,
+        layout: &Layout,
+        frame: &FrameInput<'_>,
+        build: &[bool],
+    ) -> Result<(), RenderError> {
         let palette = &self.palette;
         let mut source = GlyphSource {
             shaper: &self.shaper,
             atlas: &mut self.atlas,
             gpu,
         };
-        let mark = |out: &Vec<Instance>| u32::try_from(out.len()).unwrap_or(u32::MAX);
-        passes::background::push(out, layout, palette, frame.rows);
-        let background = 0..mark(out);
-        passes::glyph::push(out, layout, palette, frame.rows, &self.shaped, &mut source)?;
-        let glyph = background.end..mark(out);
-        passes::decoration::push(out, layout, palette, frame.rows);
-        let decoration = glyph.end..mark(out);
+        for (r, row) in self.rows.iter_mut().enumerate() {
+            if !build[r] {
+                continue;
+            }
+            let cells = &frame.rows[r][..row.len];
+            let [bg, glyphs, deco] = &mut row.passes;
+            bg.clear();
+            glyphs.clear();
+            deco.clear();
+            passes::background::push_row(bg, layout, palette, r, cells);
+            passes::glyph::push_row(
+                glyphs,
+                layout,
+                palette,
+                r,
+                (cells, &row.shaped),
+                &mut source,
+            )?;
+            passes::decoration::push_row(deco, layout, palette, r, cells);
+            self.stats.rows_built += 1;
+        }
+        self.cursor.clear();
+        let rows = &self.rows;
         passes::cursor::push(
-            out,
+            &mut self.cursor,
             layout,
             palette,
             self.theme.cursor,
             frame,
-            &self.shaped,
+            |r| rows.get(r).map(|row| row.shaped.as_slice()),
             &mut source,
-        )?;
-        let cursor = decoration.end..mark(out);
+        )
+    }
+
+    /// Writes the rebuilt rows and the cursor into the instance buffer, or
+    /// lays the buffer out again and writes all of it when a row outgrew
+    /// its slot, and returns the pass ranges to draw.
+    fn upload(&mut self, gpu: &Gpu, built: &[bool]) -> Result<PassRanges, RenderError> {
+        let relayout = !self.slots.fits(&self.rows, self.cursor.len())
+            || self.mirror.len() != usize::try_from(self.slots.total()).unwrap_or(usize::MAX);
+        if relayout {
+            let counts: Vec<[usize; ROW_PASSES]> = self
+                .rows
+                .iter()
+                .map(|row| std::array::from_fn(|p| row.passes[p].len()))
+                .collect();
+            let exact = Slots::new(&counts, self.cursor.len(), false);
+            let roomy = Slots::new(&counts, self.cursor.len(), true);
+            let slots = if u64::from(roomy.total()) <= self.max_instances {
+                roomy
+            } else {
+                exact
+            };
+            self.ensure_capacity(gpu, u64::from(slots.total()))?;
+            self.slots = slots;
+            self.mirror.clear();
+            self.mirror.resize(
+                usize::try_from(self.slots.total()).unwrap_or(0),
+                damage::EMPTY,
+            );
+            self.stats.relayouts += 1;
+        }
+        // Pass by pass, so the slots of consecutive rebuilt rows (adjacent
+        // within a pass) merge into one write.
+        let mut spans: Vec<std::ops::Range<u32>> = Vec::new();
+        for p in 0..ROW_PASSES {
+            for (r, row) in self.rows.iter().enumerate() {
+                if !relayout && !built[r] {
+                    continue;
+                }
+                let slot = self.slots.row(p, r);
+                damage::fill_slot(&mut self.mirror, slot.clone(), &row.passes[p]);
+                match spans.last_mut() {
+                    Some(last) if last.end == slot.start => last.end = slot.end,
+                    _ => spans.push(slot),
+                }
+            }
+        }
+        let cursor = self.slots.cursor();
+        if relayout || !damage::slot_holds(&self.mirror, cursor.clone(), &self.cursor) {
+            damage::fill_slot(&mut self.mirror, cursor.clone(), &self.cursor);
+            spans.push(cursor);
+        }
+        if relayout {
+            spans.clear();
+            spans.push(0..self.slots.total());
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_upload) {
+            return Err(RenderError::Gpu("injected upload failure".into()));
+        }
+        let queue = gpu.queue();
+        gpu.capture_errors(|| {
+            for span in &spans {
+                let start = usize::try_from(span.start).unwrap_or(0);
+                let end = usize::try_from(span.end).unwrap_or(0);
+                if start < end {
+                    queue.write_buffer(
+                        &self.instance_buffer,
+                        u64::from(span.start) * INSTANCE_SIZE,
+                        bytemuck::cast_slice(&self.mirror[start..end]),
+                    );
+                }
+            }
+        })?;
+        self.stats.instances_uploaded += spans
+            .iter()
+            .map(|s| u64::from(s.end - s.start))
+            .sum::<u64>();
         Ok(PassRanges {
-            background,
-            glyph,
-            decoration,
-            cursor,
+            background: self.slots.section(0),
+            glyph: self.slots.section(1),
+            decoration: self.slots.section(2),
+            cursor: self.slots.cursor(),
         })
     }
 
-    /// Uploads `self.instances` and records the passes.
+    /// Grows the instance buffer to hold `needed` instances; the new
+    /// buffer and capacity replace the old ones only once it validated.
+    fn ensure_capacity(&mut self, gpu: &Gpu, needed: u64) -> Result<(), RenderError> {
+        let device = gpu.device();
+        grow_buffer(
+            (&mut self.instance_buffer, &mut self.instance_capacity),
+            needed,
+            self.max_instances,
+            |capacity| gpu.capture_errors(|| instance_buffer(device, capacity)),
+        )
+    }
+
+    /// Records the passes.
     fn draw(
         &mut self,
         gpu: &Gpu,
@@ -342,16 +643,8 @@ impl Renderer {
     ) -> Result<(), RenderError> {
         let device = gpu.device();
         let queue = gpu.queue();
-        let needed = u64::try_from(self.instances.len()).unwrap_or(u64::MAX);
-        // New GPU objects replace the old ones only once they validated,
-        // so a failed frame never leaves the renderer holding an invalid
-        // buffer or pipeline.
-        if let Some(capacity) = grown_capacity(needed, self.instance_capacity, self.max_instances)?
-        {
-            let buffer = gpu.capture_errors(|| instance_buffer(device, capacity))?;
-            self.instance_buffer = buffer;
-            self.instance_capacity = capacity;
-        }
+        // A new pipeline replaces nothing until it validated, so a failed
+        // frame never leaves the renderer holding an invalid one.
         if !self.pipelines.iter().any(|(f, _)| *f == format) {
             let pipeline = gpu.capture_errors(|| self.pipeline(device, format))?;
             self.pipelines.push((format, pipeline));
@@ -365,14 +658,10 @@ impl Renderer {
             0.0,
             0.0,
         ];
+        let globals_changed = self.globals_size != Some(size);
         gpu.capture_errors(|| {
-            queue.write_buffer(&self.globals, 0, bytemuck::cast_slice(&globals));
-            if !self.instances.is_empty() {
-                queue.write_buffer(
-                    &self.instance_buffer,
-                    0,
-                    bytemuck::cast_slice(&self.instances),
-                );
+            if globals_changed {
+                queue.write_buffer(&self.globals, 0, bytemuck::cast_slice(&globals));
             }
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("tessera.frame"),
@@ -407,7 +696,10 @@ impl Renderer {
                 }
             }
             queue.submit(Some(encoder.finish()));
-        })
+        })?;
+        self.globals_size = Some(size);
+        self.stats.frames += 1;
+        Ok(())
     }
 
     fn pipeline(&self, device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
@@ -462,6 +754,33 @@ fn grown_capacity(needed: u64, current: u64, max: u64) -> Result<Option<u64>, Re
     Ok(Some(needed.next_power_of_two().min(max)))
 }
 
+/// Grows `buffer` (with its `capacity` in instances) to hold `needed`
+/// instances with [`grown_capacity`], creating the larger buffer with
+/// `create`. The buffer and the capacity change together and only when
+/// `create` succeeds, so a failed growth is retried by the next frame.
+///
+/// # Errors
+///
+/// [`RenderError::FrameTooLarge`] from [`grown_capacity`], or `create`'s
+/// error.
+fn grow_buffer<B>(
+    (buffer, capacity): (&mut B, &mut u64),
+    needed: u64,
+    max: u64,
+    create: impl FnOnce(u64) -> Result<B, RenderError>,
+) -> Result<(), RenderError> {
+    if let Some(grown) = grown_capacity(needed, *capacity, max)? {
+        *buffer = create(grown)?;
+        *capacity = grown;
+    }
+    Ok(())
+}
+
+/// True when `damage` covers row `r`.
+fn damaged(damage: &DamageRows, r: usize) -> bool {
+    u16::try_from(r).map_or(true, |r| damage.contains(r))
+}
+
 /// A vertex buffer for `capacity` instances.
 fn instance_buffer(device: &wgpu::Device, capacity: u64) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
@@ -480,6 +799,29 @@ mod tests {
     fn renderer_is_send_and_sync() {
         fn is_send_sync<T: Send + Sync>() {}
         is_send_sync::<Renderer>();
+    }
+
+    /// The capacity is raised only together with a buffer that was
+    /// created; a failed creation leaves both as they were.
+    #[test]
+    fn capacity_is_raised_only_when_the_buffer_was_created() {
+        let mut buffer = "small";
+        let mut capacity = 1024;
+        let failed = grow_buffer((&mut buffer, &mut capacity), 1500, 1 << 20, |_| {
+            Err(RenderError::Gpu("out of memory".into()))
+        });
+        assert!(failed.is_err());
+        assert_eq!((buffer, capacity), ("small", 1024), "nothing changed");
+        grow_buffer((&mut buffer, &mut capacity), 1500, 1 << 20, |c| {
+            assert_eq!(c, 2048);
+            Ok("large")
+        })
+        .expect("grows");
+        assert_eq!((buffer, capacity), ("large", 2048));
+        grow_buffer((&mut buffer, &mut capacity), 100, 1 << 20, |_| {
+            panic!("a smaller frame does not create a buffer")
+        })
+        .expect("no growth needed");
     }
 
     #[test]
@@ -549,5 +891,130 @@ mod tests {
         );
         draw(&row(100)).expect("a small frame still renders");
         draw(&row(1500)).expect("so does one at the limit");
+    }
+
+    fn small_frame_renderer() -> Option<(Gpu, Renderer, crate::OffscreenTarget)> {
+        if std::env::var_os("TESSERA_SKIP_GPU_TESTS").is_some() {
+            return None;
+        }
+        let gpu = Gpu::headless().expect("a Metal adapter");
+        let shaper = Shaper::new(&crate::FontConfig::default()).expect("fonts");
+        let renderer = Renderer::new(&gpu, Theme::default(), shaper).expect("renderer");
+        let m = renderer.cell_metrics();
+        let size = PhysicalSize::new(20 * m.width_px + 16, 3 * m.height_px + 16);
+        let target = crate::OffscreenTarget::new(&gpu, size, wgpu::TextureFormat::Rgba8Unorm);
+        Some((gpu, renderer, target))
+    }
+
+    fn frame(rows: &[Vec<Cell>]) -> Vec<&[Cell]> {
+        rows.iter().map(Vec::as_slice).collect()
+    }
+
+    fn text_row(text: &str) -> Vec<Cell> {
+        text.chars()
+            .map(|ch| Cell::new(ch, Style::DEFAULT))
+            .collect()
+    }
+
+    /// A row that drew `.notdef` before the fallback index was ready is
+    /// shaped again once it is, without damage from the host (ADR 0007).
+    #[test]
+    fn rows_waiting_for_the_fallback_index_are_reshaped_when_it_is_ready() {
+        let Some((gpu, mut renderer, target)) = small_frame_renderer() else {
+            return;
+        };
+        let row = text_row("abc");
+        let rows: [&[Cell]; 1] = [&row];
+        target
+            .render(&gpu, &mut renderer, &FrameInput::new(&rows))
+            .expect("frame");
+        assert!(!renderer.needs_redraw());
+        // Pretend the row drew a `.notdef` while the index was building.
+        renderer.rows[0].pending_fallback = true;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !renderer.shaper().fonts().fallback_index_ready() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the index never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(renderer.needs_redraw(), "the host must draw again");
+        let shaped = renderer.stats().rows_shaped;
+        let frame = FrameInput::new(&rows).with_damage(DamageRows::None);
+        target.render(&gpu, &mut renderer, &frame).expect("frame");
+        assert_eq!(renderer.stats().rows_shaped, shaped + 1);
+        assert!(!renderer.rows[0].pending_fallback, "resolved for good");
+        assert!(!renderer.needs_redraw());
+    }
+
+    /// Each row's shaped-glyph vector is reused: re-shaping a row writes
+    /// into the same allocation.
+    #[test]
+    fn shaped_rows_reuse_their_vectors() {
+        let Some((gpu, mut renderer, target)) = small_frame_renderer() else {
+            return;
+        };
+        let rows_a = [text_row("hello world"), text_row("second row")];
+        let rows_b = [text_row("other text!"), text_row("second wor")];
+        let a = frame(&rows_a);
+        target
+            .render(&gpu, &mut renderer, &FrameInput::new(&a))
+            .expect("frame");
+        let pointers: Vec<_> = renderer.rows.iter().map(|r| r.shaped.as_ptr()).collect();
+        let instances: Vec<_> = renderer.rows.iter().map(|r| r.passes[1].as_ptr()).collect();
+        let b = frame(&rows_b);
+        target
+            .render(&gpu, &mut renderer, &FrameInput::new(&b))
+            .expect("frame");
+        assert_eq!(renderer.stats().rows_shaped, 4);
+        let after: Vec<_> = renderer.rows.iter().map(|r| r.shaped.as_ptr()).collect();
+        assert_eq!(pointers, after, "shaped vectors reused");
+        let after: Vec<_> = renderer.rows.iter().map(|r| r.passes[1].as_ptr()).collect();
+        assert_eq!(instances, after, "instance vectors reused");
+    }
+
+    /// A failed upload must not leave the mirror claiming slots the GPU
+    /// never received: the cursor slot was written to the mirror, the
+    /// upload failed, and a later frame with that same cursor must still
+    /// upload it.
+    #[test]
+    fn a_failed_upload_does_not_leave_a_stale_cursor() {
+        let Some((gpu, mut renderer, target)) = small_frame_renderer() else {
+            return;
+        };
+        let rows = [text_row("hello"), text_row("world")];
+        let rows = frame(&rows);
+        let at = |row, col| Some(crate::CursorState::new(row, col, crate::CursorShape::Block));
+        let draw = |renderer: &mut Renderer, cursor| {
+            let frame = FrameInput::new(&rows)
+                .with_cursor(cursor)
+                .with_damage(DamageRows::None);
+            target.render(&gpu, renderer, &frame)
+        };
+        target
+            .render(
+                &gpu,
+                &mut renderer,
+                &FrameInput::new(&rows).with_cursor(at(0, 0)),
+            )
+            .expect("first frame");
+        renderer.fail_next_upload = true;
+        assert!(
+            draw(&mut renderer, at(1, 2)).is_err(),
+            "the injected failure"
+        );
+        draw(&mut renderer, at(1, 2)).expect("the same frame again");
+        let drawn = target.read_back(&gpu).expect("readback");
+        let mut reference = small_frame_renderer().expect("gpu").1;
+        target
+            .render(
+                &gpu,
+                &mut reference,
+                &FrameInput::new(&rows).with_cursor(at(1, 2)),
+            )
+            .expect("reference");
+        let expected = target.read_back(&gpu).expect("readback");
+        assert!(drawn == expected, "the cursor moved on screen too");
     }
 }

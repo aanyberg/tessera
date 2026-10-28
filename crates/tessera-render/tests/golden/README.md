@@ -9,6 +9,7 @@ with `Theme::default()`; the PNGs are 8-bit RGBA, sRGB-encoded.
 | --- | --- | --- |
 | `screen.png` | 40 × 12 cells: every ANSI foreground on every ANSI background, color-cube samples, bold / dim / italic, underline / double underline / strikethrough, inverse / hidden, 24-bit color, box drawing, a block cursor | font |
 | `cursors.png` | block, beam and underline cursors over text, focused (first three strips) and unfocused (last three, all hollow) | font |
+| `clusters.png` | 24 × 1 cells: `e` + U+0301, a ZWJ family (two cells), a VS16 heart, a hand with a skin tone, `a` + U+0338, each drawn whole from the line's cluster text (#21) | font |
 | `geometry.png` | the same screen and strips with every character replaced by a space: backgrounds, decorations and cursors only | exact |
 
 **Font tolerance:** in every 16 × 16 pixel tile at most 4 pixels, and in

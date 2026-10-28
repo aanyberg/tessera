@@ -1,9 +1,10 @@
 //! GPU rendering of a grid.
 //!
 //! Turns rows of [`tessera_grid::Cell`]s plus a [`Theme`] into pixels using
-//! `wgpu` (Metal on macOS). Owns the glyph atlas, text shaping and the
-//! background / glyph / decoration / cursor passes (damage tracking is
-//! still to come). The surface it draws into is handed over by the frontend
+//! `wgpu` (Metal on macOS). Owns the glyph atlas, text shaping, the
+//! background / glyph / decoration / cursor passes and damage tracking:
+//! rows the frame does not mark damaged keep their shaped glyphs and GPU
+//! instances from the previous frame (ADR 0016). The surface it draws into is handed over by the frontend
 //! as a raw window handle, so this crate has no `AppKit` dependency and can
 //! serve a future Linux frontend unchanged.
 //!
@@ -43,6 +44,7 @@ pub use wgpu;
 
 mod atlas;
 mod boxdraw;
+mod damage;
 mod error;
 mod font;
 mod frame;
@@ -68,8 +70,8 @@ pub use gpu::Gpu;
 pub use offscreen::{
     OffscreenTarget, SUPPORTED_FORMATS, is_supported_format, padded_bytes_per_row,
 };
-pub use palette::{ColorSlot, Palette, indexed_srgb};
-pub use renderer::Renderer;
+pub use palette::{ColorSlot, Palette, indexed_srgb, srgb8_to_linear};
+pub use renderer::{RenderStats, Renderer};
 pub use shaping::{CellMetrics, ShapedGlyph, Shaper};
 pub use size::{LogicalSize, MIN_SCALE, PhysicalSize, sanitize_scale};
 pub use surface::{

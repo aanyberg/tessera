@@ -5,8 +5,13 @@
 //! scrollback, and hands the renderer slices of cells. The renderer never
 //! learns about viewports, scroll offsets or the scrollback buffer
 //! (ADR 0010).
+//!
+//! [`FrameInput::damage`] tells the renderer which rows changed since the
+//! last frame it drew, so it re-shapes and re-uploads only those
+//! (ADR 0016); [`FrameInput::clusters`] carries each row's grapheme
+//! cluster text, so combining marks and emoji sequences are shaped whole.
 
-use tessera_grid::{Cell, Point};
+use tessera_grid::{Cell, DamageRows, GraphemeTable, Point};
 
 /// How the cursor is drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -26,7 +31,12 @@ pub enum CursorShape {
 }
 
 /// Where the cursor is and how it looks this frame.
+///
+/// Built with [`CursorState::new`] (and [`CursorState::with_visible`]);
+/// the struct is `#[non_exhaustive]` so a two-column cursor (#22) can add a
+/// field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct CursorState {
     /// Row within [`FrameInput::rows`], from the top.
     pub row: u16,
@@ -49,6 +59,13 @@ impl CursorState {
             shape,
             visible: true,
         }
+    }
+
+    /// The same cursor, drawn this frame or not.
+    #[must_use]
+    pub const fn with_visible(mut self, visible: bool) -> Self {
+        self.visible = visible;
+        self
     }
 }
 
@@ -78,7 +95,7 @@ pub enum Overlay {}
 ///
 /// Build one with [`FrameInput::new`] and the `with_*` methods (or set the
 /// public fields directly).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FrameInput<'a> {
     /// The visible rows, top to bottom. Rows may differ in length; cells
@@ -94,6 +111,19 @@ pub struct FrameInput<'a> {
     /// Whether the surface has keyboard focus. An unfocused surface draws
     /// every cursor shape as [`CursorShape::HollowBlock`].
     pub focused: bool,
+    /// The grapheme cluster text of each row (`clusters[r]` for
+    /// `rows[r]`, a [`tessera_grid::Line::graphemes`] copy). A cell with
+    /// [`tessera_grid::CellFlags::CLUSTER`] is shaped from its whole
+    /// cluster when its row has an entry here, else from its base
+    /// character alone. Rows past the end of the slice have none.
+    pub clusters: &'a [GraphemeTable],
+    /// The rows that changed since the last frame this renderer drew, in
+    /// [`Self::rows`] indices: rows outside it must hold the same cells
+    /// and clusters as then, and the renderer reuses what it shaped and
+    /// built for them. [`DamageRows::All`] (the default) redraws
+    /// everything; the cursor, focus, theme, font and target size are
+    /// compared by the renderer itself, so they need no damage.
+    pub damage: DamageRows,
 }
 
 impl<'a> FrameInput<'a> {
@@ -106,6 +136,8 @@ impl<'a> FrameInput<'a> {
             selection: None,
             overlays: &[],
             focused: true,
+            clusters: &[],
+            damage: DamageRows::All,
         }
     }
 
@@ -127,6 +159,20 @@ impl<'a> FrameInput<'a> {
     #[must_use]
     pub const fn with_focus(mut self, focused: bool) -> Self {
         self.focused = focused;
+        self
+    }
+
+    /// The same frame with each row's grapheme cluster text.
+    #[must_use]
+    pub const fn with_clusters(mut self, clusters: &'a [GraphemeTable]) -> Self {
+        self.clusters = clusters;
+        self
+    }
+
+    /// The same frame with `damage`.
+    #[must_use]
+    pub fn with_damage(mut self, damage: DamageRows) -> Self {
+        self.damage = damage;
         self
     }
 
@@ -156,14 +202,13 @@ mod tests {
         assert_eq!(frame.selection, None);
         assert_eq!(frame.overlays, [] as [Overlay; 0]);
         assert_eq!(frame.drawn_cursor(), None);
+        assert_eq!(frame.damage, DamageRows::All, "full redraw by default");
+        assert_eq!(frame.clusters, &[] as &[GraphemeTable]);
     }
 
     #[test]
     fn hidden_cursor_is_not_drawn() {
-        let cursor = CursorState {
-            visible: false,
-            ..CursorState::new(1, 2, CursorShape::Beam)
-        };
+        let cursor = CursorState::new(1, 2, CursorShape::Beam).with_visible(false);
         let frame = FrameInput::new(&[]).with_cursor(Some(cursor));
         assert_eq!(frame.drawn_cursor(), None);
     }
