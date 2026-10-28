@@ -16,6 +16,7 @@ members = [
     "crates/tessera-app-core",
     "crates/tessera-ffi",
     "crates/tessera-cli",
+    "crates/tessera-devtool",
     "xtask",
 ]
 
@@ -56,6 +57,7 @@ tracing = "0.1"
 unicode-segmentation = "1"
 unicode-width = "0.2"
 bytemuck = { version = "1", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
 
 # external, dev
 insta = "1.43"

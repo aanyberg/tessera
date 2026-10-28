@@ -41,6 +41,7 @@ map; the ADRs record why.
 | `tessera-app-core` | everything above wired together, no OS UI | all of the above |
 | `tessera-ffi` | `extern "C"` surface (`unsafe` allowed) | app-core |
 | `tessera-cli` | `tessera` binary speaking the protocol | protocol |
+| `tessera-devtool` | dev-only `tessera-devtool` binary and library: headless screen dumps for debugging and snapshot tests; never published, nothing in the app depends on it | pty, term, grid |
 
 ## Invariants
 

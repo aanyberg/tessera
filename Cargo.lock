@@ -1536,6 +1536,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-devtool"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde_json",
+ "tessera-grid",
+ "tessera-pty",
+ "tessera-term",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "tessera-ffi"
 version = "0.1.0"
 dependencies = [

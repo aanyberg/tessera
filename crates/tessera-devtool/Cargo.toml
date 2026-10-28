@@ -1,0 +1,29 @@
+[package]
+name = "tessera-devtool"
+description = "Headless screen dumps of the emulator for debugging and snapshot tests (dev-only)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# Dev-only: never published and never linked into the app. The workspace
+# default already says so; the crate repeats it so moving it cannot change that.
+publish = false
+
+[dependencies]
+clap.workspace = true
+tessera-grid.workspace = true
+tessera-pty.workspace = true
+tessera-term.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "tessera-devtool"
+path = "src/main.rs"
