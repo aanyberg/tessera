@@ -161,7 +161,8 @@ pub unsafe extern "C" fn tessera_session_spawn(
     })
 }
 
-/// Closes session `session_id`: hangs up its child (killing it if it does
+/// Closes session `session_id`: detaches its surface if it has one (see
+/// `tessera_surface_detach`), hangs up its child (killing it if it does
 /// not exit within a second), joins its reader thread and forgets the id.
 /// No callback for the session runs after this returns, and
 /// `on_session_exit` is not called for it. Takes at most about two seconds.
@@ -243,6 +244,12 @@ pub unsafe extern "C" fn tessera_session_write(
 /// Tells session `session_id`'s child that its window is now `rows` x
 /// `cols` cells and `width_px` x `height_px` pixels (0 when unknown); the
 /// child receives `SIGWINCH`.
+///
+/// Do not call this for a session with an attached surface
+/// (`tessera_surface_attach`): the surface decides its size. A call
+/// leaves the child at the requested size only until the next
+/// `tessera_surface_resize` or `tessera_surface_set_font_size` resizes it
+/// to the surface again.
 ///
 /// Returns `TESSERA_ERROR_NULL_POINTER` if `app` is `NULL`,
 /// `TESSERA_ERROR_SESSION_NOT_FOUND` if the id is not a live session,

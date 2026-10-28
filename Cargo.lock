@@ -1495,9 +1495,11 @@ name = "tessera-app-core"
 version = "0.1.0"
 dependencies = [
  "tessera-config",
+ "tessera-grid",
  "tessera-plugin-api",
  "tessera-plugin-hello",
  "tessera-pty",
+ "tessera-render",
  "tessera-term",
  "thiserror 2.0.21",
  "tracing",

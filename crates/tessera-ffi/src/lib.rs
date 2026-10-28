@@ -20,6 +20,10 @@
 //!   `tessera_session_send_*`, `tessera_session_paste` and
 //!   `tessera_session_set_focus` functions as plain structs (see the
 //!   `input` module); the core decides between key bindings and PTY input.
+//! * A session is drawn into a host-owned `CAMetalLayer` through the
+//!   `tessera_surface_*` functions (see the `surface` module): attach,
+//!   resize, render each display refresh, set the font size, detach. The
+//!   session's grid follows the surface's size.
 //! * Every export runs inside `catch_unwind` (see the `panic` module): a
 //!   panic becomes `TESSERA_ERROR_PANIC`, or is logged and swallowed by
 //!   functions that return nothing.
@@ -33,6 +37,7 @@ mod error;
 mod input;
 mod panic;
 mod session;
+mod surface;
 
 use std::ffi::{CStr, c_char};
 
@@ -55,6 +60,13 @@ pub use panic::tessera_test_panic;
 pub use session::{
     SpawnOptions, tessera_session_clear_scrollback, tessera_session_close, tessera_session_resize,
     tessera_session_spawn, tessera_session_write,
+};
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use surface::tessera_test_surface_panic;
+pub use surface::{
+    FrameStatus, tessera_surface_attach, tessera_surface_detach, tessera_surface_render,
+    tessera_surface_resize, tessera_surface_set_font_size,
 };
 
 /// Returns the core version as a NUL-terminated string.
