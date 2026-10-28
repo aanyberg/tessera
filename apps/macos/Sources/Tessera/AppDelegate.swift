@@ -1,19 +1,30 @@
 import AppKit
 import TesseraKit
 
-/// Entry point. Still minimal: one window showing the core version and the
-/// state of one session started on launch, which exercises the wrapper's
-/// callback bridge end to end. Real window management arrives in M3.
+/// Entry point and application lifecycle: owns the core, the window
+/// registry and the signal handling. Each tab is a ``TerminalWindowController``
+/// running one session; ``SessionRouter`` delivers the core's events to them.
+///
+/// The app keeps running with no windows open, like other macOS apps; ⌘N or
+/// clicking the Dock icon opens a new one.
 @main
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var window: NSWindow?
-    private var label: NSTextField?
+    /// Every open tab, in the order they were opened. Each tab is a window;
+    /// AppKit owns their order within a tab bar.
+    private(set) var windowControllers: [TerminalWindowController] = []
+    /// What new windows and tabs run. Tests replace the login shell here.
+    var spawnOptions = TesseraSession.SpawnOptions()
+
     private var core: TesseraApp?
-    private var session: TesseraSession?
-    private var outputEvents = 0
-    private var lastBeep: ContinuousClock.Instant?
+    private let router = SessionRouter()
     private var terminationSignals: [any DispatchSourceSignal] = []
+    /// Where the next standalone window's top-left corner goes.
+    private var cascadePoint = NSPoint.zero
+
+    /// True when the app is the host of an XCTest bundle: no window is opened
+    /// at launch, the tests open their own.
+    static let isTestHost = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
 
     static func main() {
         let app = NSApplication.shared
@@ -24,27 +35,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        installMainMenu()
+        MainMenu.install(in: NSApp)
         terminateOnSignals()
-
-        let label = NSTextField(wrappingLabelWithString: "")
-        label.font = .monospacedSystemFont(ofSize: 15, weight: .medium)
-        label.alignment = .center
-        self.label = label
-
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 480, height: 200),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = "Tessera"
-        window.center()
-        window.contentView = label
-        window.makeKeyAndOrderFront(nil)
-        self.window = window
-
-        startCore()
+        guard !Self.isTestHost else { return }
+        openNewWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -53,20 +47,108 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+        false
     }
 
-    private func startCore() {
+    /// Clicking the Dock icon with no window open opens one. With windows
+    /// open (minimized ones included) AppKit's default applies.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard windowControllers.isEmpty else { return true }
+        openNewWindow(nil)
+        return false
+    }
+
+    // MARK: Windows and tabs
+
+    /// Opens a standalone window with a new session and returns its
+    /// controller.
+    ///
+    /// - Throws: The core's error if it or the session cannot be started.
+    @discardableResult
+    func newWindow() throws -> TerminalWindowController {
+        let controller = try makeController()
+        guard let window = controller.window else { return controller }
+        // `.preferred` would put a window that is ordered front into the
+        // key window's tab bar; a new window must stand alone.
+        window.tabbingMode = .disallowed
+        if windowControllers.count == 1 {
+            window.center()
+            cascadePoint = .zero
+        }
+        // Each standalone window opens down and to the right of the previous.
+        cascadePoint = window.cascadeTopLeft(from: cascadePoint)
+        controller.showWindow(nil)
+        window.tabbingMode = .preferred
+        return controller
+    }
+
+    /// Opens a new tab with a new session right after `window` in its tab
+    /// bar (for ⌘T, the selected tab), or a standalone window if `window` is
+    /// `nil` or not a terminal window, and returns its controller.
+    ///
+    /// - Throws: The core's error if it or the session cannot be started.
+    @discardableResult
+    func newTab(in window: NSWindow?) throws -> TerminalWindowController {
+        guard let window, windowControllers.contains(where: { $0.window === window }) else {
+            return try newWindow()
+        }
+        let controller = try makeController()
+        guard let tab = controller.window else { return controller }
+        window.addTabbedWindow(tab, ordered: .above)
+        tab.makeKeyAndOrderFront(nil)
+        return controller
+    }
+
+    /// ⌘N.
+    @objc func openNewWindow(_ sender: Any?) {
         do {
-            let core = try TesseraApp()
-            core.delegate = self
-            self.core = core
-            session = try core.spawn()
-            showStatus("login shell running")
+            try newWindow()
         } catch {
-            showStatus("could not start a session: \(error)")
+            presentOpenError(error)
         }
     }
+
+    /// ⌘T: a tab in the key window's tab bar, or in the main window's while a
+    /// panel (About, an alert) is key.
+    @objc func openNewTab(_ sender: Any?) {
+        let terminal = [NSApp.keyWindow, NSApp.mainWindow].lazy.compactMap { $0 }.first { window in
+            self.windowControllers.contains { $0.window === window }
+        }
+        do {
+            try newTab(in: terminal)
+        } catch {
+            presentOpenError(error)
+        }
+    }
+
+    private func makeController() throws -> TerminalWindowController {
+        let core = try self.core ?? startCore()
+        let session = try core.spawn(spawnOptions)
+        let controller = TerminalWindowController(session: session, title: TerminalWindowController.defaultTitle)
+        controller.delegate = self
+        // Registered before the main actor can run the session's first
+        // delivery, so no event is dropped.
+        router.register(controller)
+        windowControllers.append(controller)
+        return controller
+    }
+
+    private func startCore() throws -> TesseraApp {
+        let core = try TesseraApp()
+        core.delegate = router
+        self.core = core
+        return core
+    }
+
+    private func presentOpenError(_ error: any Error) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Could not open a terminal"
+        alert.informativeText = "\(error)"
+        alert.runModal()
+    }
+
+    // MARK: Signals
 
     /// `kill`, Ctrl-C and closing the launching terminal (`SIGTERM`, `SIGINT`,
     /// `SIGHUP`) end the process without `applicationWillTerminate`, which
@@ -90,48 +172,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             signal(signalNumber, SIG_IGN)
         }
     }
-
-    private func showStatus(_ status: String) {
-        label?.stringValue = "Tessera core v\(TesseraApp.coreVersion)\n\(status)"
-    }
-
-    private func installMainMenu() {
-        let mainMenu = NSMenu()
-        let appItem = NSMenuItem()
-        let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "About Tessera", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
-        appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "Quit Tessera", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        appItem.submenu = appMenu
-        mainMenu.addItem(appItem)
-        NSApp.mainMenu = mainMenu
-    }
 }
 
-extension AppDelegate: TesseraAppDelegate {
-    func sessionDidOutput(_ session: TesseraSession) {
-        outputEvents += 1
-        showStatus("login shell running (\(outputEvents) output events)")
-    }
-
-    func session(_ session: TesseraSession, didSetTitle title: String) {
-        window?.subtitle = title
-    }
-
-    func sessionDidRingBell(_ session: TesseraSession) {
-        // Bells are coalesced per delivery, but a program ringing continuously
-        // still gets one delivery after another: beep at most every 100 ms.
-        let now = ContinuousClock.now
-        if let lastBeep, now - lastBeep < .milliseconds(100) { return }
-        lastBeep = now
-        NSSound.beep()
-    }
-
-    func session(_ session: TesseraSession, didExitWithCode code: Int32, signal: Int32) {
-        showStatus(signal == 0 ? "shell exited with code \(code)" : "shell killed by signal \(signal)")
-        try? session.close()
-        if self.session === session {
-            self.session = nil
+extension AppDelegate: TerminalWindowControllerDelegate {
+    func terminalWindowControllerWantsNewTab(_ controller: TerminalWindowController) {
+        do {
+            try newTab(in: controller.window)
+        } catch {
+            presentOpenError(error)
         }
+    }
+
+    func terminalWindowControllerDidClose(_ controller: TerminalWindowController) {
+        router.unregister(controller.session)
+        windowControllers.removeAll { $0 === controller }
     }
 }
