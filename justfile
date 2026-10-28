@@ -65,12 +65,15 @@ app: xcframework xcodeproj
     xcodebuild -project {{app_dir}}/Tessera.xcodeproj -scheme Tessera -configuration Debug \
         -derivedDataPath {{app_dir}}/DerivedData build | tail -5
 
-# Run the TesseraKit wrapper's XCTest suite (headless, Thread Sanitizer); full log in apps/macos/build/app-test.log
+# Run the app's XCTest suites (headless, Thread Sanitizer): TesseraKitTests (wrapper), then TesseraTests (windows and tabs, hosted by Tessera.app); full logs in apps/macos/build/app-test*.log
 app-test: xcframework xcodeproj
     mkdir -p {{quote(build_dir)}}
     set -o pipefail; xcodebuild test -project {{quote(app_dir + "/Tessera.xcodeproj")}} -scheme TesseraKit -enableThreadSanitizer YES \
         -destination 'platform=macOS' -derivedDataPath {{quote(app_dir + "/DerivedData")}} 2>&1 | tee {{quote(build_dir + "/app-test.log")}} | tail -5 \
         || { echo "xcodebuild test failed; errors from {{build_dir}}/app-test.log:" >&2; grep -E 'error:|failed|ThreadSanitizer' {{quote(build_dir + "/app-test.log")}} >&2; exit 1 }
+    set -o pipefail; xcodebuild test -project {{quote(app_dir + "/Tessera.xcodeproj")}} -scheme Tessera -enableThreadSanitizer YES \
+        -destination 'platform=macOS' -derivedDataPath {{quote(app_dir + "/DerivedData")}} 2>&1 | tee {{quote(build_dir + "/app-test-tessera.log")}} | tail -5 \
+        || { echo "xcodebuild test failed; errors from {{build_dir}}/app-test-tessera.log:" >&2; grep -E 'error:|failed|ThreadSanitizer' {{quote(build_dir + "/app-test-tessera.log")}} >&2; exit 1 }
 
 # Launch the built app
 run: app

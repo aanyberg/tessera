@@ -52,7 +52,13 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.aanyberg.tessera
         SWIFT_OBJC_INTEROP_MODE: objc
-    scheme: {}
+        # Xcode's debug-dylib launcher stub is linked with `-rpath @executable_path`,
+        # which the Thread Sanitizer adds again: `ld: warning: duplicate -rpath`
+        # in every `just app-test` run. One plain executable avoids it.
+        ENABLE_DEBUG_DYLIB: NO
+    scheme:
+      testTargets:
+        - TesseraTests
   # Swift wrapper over the C module `TesseraCore` (the generated TesseraCore.h in
   # TesseraCore.xcframework). The static Rust library is linked into this framework.
   TesseraKit:
@@ -95,3 +101,20 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.aanyberg.TesseraKitTests
         GENERATE_INFOPLIST_FILE: YES
+  # App-hosted tests of the window and tab model: they run inside Tessera.app,
+  # which opens no window at launch when it hosts tests. Not linked against
+  # TesseraKit: the app already contains it, and a second copy would duplicate
+  # its types.
+  TesseraTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests/TesseraTests
+    dependencies:
+      - target: Tessera
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aanyberg.TesseraTests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Tessera.app/Contents/MacOS/Tessera"
+        BUNDLE_LOADER: "$(TEST_HOST)"
