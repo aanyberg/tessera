@@ -7,9 +7,9 @@ description: Tessera software factory. Use in the lead session when planning or 
 
 The full runbook is `docs/software-factory.md`. Read it before you delegate work. These rules are not optional:
 
-1. **PR gate.** Push a branch and open a PR only after the local pipeline has passed: critic `ship`, `quality-gate`
-   pass, `adversarial-tester` pass for product code, and a green `scripts/quality-gate.sh` on the integrated tree.
-   CI only confirms. Never push mid-review.
+1. **PR gate.** Push a branch and open a PR only after the local pipeline has passed: critic `ship` (or a round the
+   lead accepts under runbook step 4), `quality-gate` pass, `adversarial-tester` pass for product code, and a green
+   `scripts/quality-gate.sh` on the integrated tree. CI only confirms. Never push mid-review.
 2. **Waves run as an agent team.** The lead owns the shared task list. One teammate per issue implements in its
    own worktree. Do not use the Workflow tool for waves.
 3. **Fresh reviewers.** Every critique round and every verification run is a new one-shot subagent
