@@ -1,6 +1,6 @@
 ---
 name: spec-researcher
-description: Reads the external specification an issue depends on (xterm ctlseqs, kitty keyboard protocol, DEC STD 070, vttest, POSIX pty, wgpu docs) and produces a test table or fixture file before implementation starts. Use for spec-heavy issues; it does not implement.
+description: Reads the external specification an issue depends on (xterm ctlseqs, kitty keyboard protocol, DEC STD 070, vttest, POSIX pty, wgpu docs) and produces a test table or fixture file before implementation starts. Runs during planning, before the issue's "Done when" is final, for spec-heavy issues; it does not implement.
 model: sonnet
 effort: high
 tools: Read, Grep, Glob, WebFetch, WebSearch, Write, Bash

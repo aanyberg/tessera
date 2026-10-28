@@ -1,2 +1,6 @@
 [alias]
 xtask = "run -p xtask --"
+
+[build]
+# Uses sccache when installed, plain rustc otherwise; see the script.
+rustc-wrapper = "scripts/rustc-wrapper.sh"

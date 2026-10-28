@@ -15,8 +15,11 @@ Procedure:
 3. If the brief includes a spec fixture from the spec-researcher, make it the first test you turn green.
 4. Implement the issue completely, including the "Done when" bar where it is testable headlessly. Document every public item. Prefer insta snapshots for emulator behaviour and proptest for parsers.
 5. Apply every item in each of the brief's "Lead decisions" sections.
-6. If the brief carries a performance bar, measure every corpus line against main as the brief specifies and put the ratio table in your report.
-7. Before finishing, merge current main into the branch (`git merge main`) and run `scripts/quality-gate.sh <wt>`; it must pass. Read its real exit code: `scripts/quality-gate.sh <wt> > <log> 2>&1; echo $?`, never through a pipe.
-8. Commit with Conventional Commits (scope = crate name without `tessera-`) and the attribution trailer the harness requires. Never push.
+6. If the brief carries a performance bar, measure every corpus line with `cargo xtask ab` (`init --base $(git merge-base main HEAD) --crate <name> --out <scratch>/ab`, one bench case per corpus line, `bench --max-ratio <bar>`) and put its tables in your report.
+7. Before reporting, run the critics' standing checks on your own branch: every tolerance-based test (image diff, timing, count budget) fails under a mutation of each behaviour it claims to cover (name the mutations in your report); every callback or event emitted per input byte is bounded (send a flood, record memory and latency); every fast path agrees with its reference path (`cargo xtask ab diff` against the merge base, or a proptest against the slow path).
+8. Before finishing, merge current main into the branch (`git merge main`) and run `scripts/quality-gate.sh <wt>`; it must pass. Read its real exit code: `scripts/quality-gate.sh <wt> > <log> 2>&1; echo $?`, never through a pipe.
+9. Commit with Conventional Commits (scope = crate name without `tessera-`) and the attribution trailer the harness requires. Never push.
 
 Report factually: files changed, how you verified, every lead decision as done or (with the reason) not done, and every decision you made unilaterally under `open_concerns`.
+
+On `revise` you fix your own branch: fix or refute every finding (write the failing test first where you can), without widening scope, then merge main, run the gate and commit with `fix(<scope>):`. Report each finding as fixed (commit), refuted (evidence) or deferred (why), and the commit range since the reviewed commit; the next critic reviews from that range.

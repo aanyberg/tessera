@@ -8,9 +8,10 @@
   Scopes are crate names without the `tessera-` prefix, or `app` for Swift.
 - PRs are squash-merged with an explicit Conventional Commit subject
   (`gh pr merge <pr> --squash --subject "<type>(<scope>): <title> (#<pr>)"`).
-  Wave PRs from the agent team (`wave/<milestone>-<n>`) are rebase-merged
-  instead so each task's commit reaches the release notes; see
-  `docs/software-factory.md`.
+  The agent team ships each task as its own squash-merged PR from wave 5
+  on; wave PRs (`wave/<milestone>-<n>`, wave 4 and earlier) are
+  rebase-merged instead so each task's commit reaches the release notes.
+  See `docs/software-factory.md`.
 - Architecture changes get an ADR in `docs/adr/` in the same PR.
 
 ## Code
