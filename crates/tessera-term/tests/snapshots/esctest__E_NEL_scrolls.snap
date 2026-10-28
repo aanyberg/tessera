@@ -1,0 +1,39 @@
+---
+source: crates/tessera-term/tests/esctest.rs
+description: E_NEL_scrolls
+input_file: crates/tessera-term/tests/fixtures/esctest_spec.txt
+---
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ a
+ b
+ |
+--
+cursor: (24,0)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 1
+  ""
+-- pens
+pens: default

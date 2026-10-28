@@ -1,0 +1,38 @@
+---
+source: crates/tessera-term/tests/esctest.rs
+description: E_DL_explicitParam
+input_file: crates/tessera-term/tests/fixtures/esctest_spec.txt
+---
+0001
+0|004
+0005
+0006
+0007
+0008
+0009
+0010
+0011
+0012
+0013
+0014
+0015
+0016
+0017
+0018
+0019
+0020
+0021
+0022
+0023
+0024
+0025
+
+
+--
+cursor: (1,0)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0
+-- pens
+pens: default

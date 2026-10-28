@@ -1,0 +1,38 @@
+---
+source: crates/tessera-term/tests/esctest.rs
+description: E_DCH_defaultParam
+input_file: crates/tessera-term/tests/fixtures/esctest_spec.txt
+---
+ac|d
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--
+cursor: (0,1)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0
+-- pens
+pens: default

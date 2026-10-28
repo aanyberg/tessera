@@ -1,0 +1,38 @@
+---
+source: crates/tessera-term/tests/esctest.rs
+description: E_SU_outsideTopBottomScrollRegion
+input_file: crates/tessera-term/tests/fixtures/esctest_spec.txt
+---
+a|bcde
+pqrst
+
+
+uvwxy
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--
+cursor: (0,0)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0
+-- pens
+pens: default

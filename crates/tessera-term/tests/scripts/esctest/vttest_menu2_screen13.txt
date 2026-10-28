@@ -1,0 +1,10 @@
+# vttest 2.7 (20251205) menu 2 screen 13: graphic rendition test pattern (SGR 0/1/4/5/7 combinations).
+# Case V2S13_sgr_pattern in tests/fixtures/esctest_spec.txt; tests/esctest.rs requires the two to match. It lives here, not under
+# tests/scripts/vttest/, because tests/vttest.rs pins that directory to its own list.
+@size 24x80
+\x1b[1;24r\x1b[2J\x1b[1;20HGraphic rendition test pattern:\x1b[4;1H\x1b[0mvanilla\x1b[4;40H\x1b[0;1mbold\x1b[6;6H\x1b[;4munderline\x1b[6;45H
+\x1b[;1m\x1b[4mbold underline\x1b[8;1H\x1b[0;5mblink\x1b[8;40H\x1b[0;5;1mbold blink\x1b[10;6H\x1b[0;4;5munderline blink\x1b[10;45H
+\x1b[0;1;4;5mbold underline blink\x1b[12;1H\x1b[1;4;5;0;7mnegative\x1b[12;40H\x1b[0;1;7mbold negative\x1b[14;6H
+\x1b[0;4;7munderline negative\x1b[14;45H\x1b[0;1;4;7mbold underline negative\x1b[16;1H\x1b[1;4;;5;7mblink negative\x1b[16;40H
+\x1b[0;1;5;7mbold blink negative\x1b[18;6H\x1b[0;4;5;7munderline blink negative\x1b[18;45H
+\x1b[0;1;4;5;7mbold underline blink negative\x1b[m\x1b[?5l\x1b[23;1H\x1b[0KDark background. Push <RETURN>

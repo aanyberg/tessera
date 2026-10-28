@@ -1,5 +1,6 @@
 //! Reader for `tests/fixtures/csi_spec.txt`, shared by `tests/csi.rs` and
-//! `tests/vttest.rs`.
+//! `tests/vttest.rs`, and for the fixtures in the same layout
+//! (`decstr_spec.txt`, `esctest_spec.txt`).
 //!
 //! The fixture uses the layout of `print_c0_spec.txt`: a case starts with
 //! `### <id>` and lists `size:`, one or more `step:` lines, `screen:` with
@@ -214,7 +215,13 @@ pub fn check_case(case: &Case, chunking: Chunking) -> Vec<String> {
 /// Checks every case `select` keeps, whole and byte by byte, and panics
 /// with all mismatches at once. Returns how many cases were checked.
 pub fn check_all(select: impl Fn(&Case) -> bool) -> usize {
-    let cases: Vec<Case> = parse_fixture(FIXTURE).into_iter().filter(select).collect();
+    check_all_in(FIXTURE, select)
+}
+
+/// [`check_all`] for another fixture in the same layout, such as
+/// `tests/fixtures/esctest_spec.txt`.
+pub fn check_all_in(fixture: &str, select: impl Fn(&Case) -> bool) -> usize {
+    let cases: Vec<Case> = parse_fixture(fixture).into_iter().filter(select).collect();
     let errors: Vec<String> = cases
         .iter()
         .flat_map(|case| {

@@ -1,0 +1,38 @@
+---
+source: crates/tessera-term/tests/esctest.rs
+description: E_NEL_scrollsInTopBottomRegionStartingAbove
+input_file: crates/tessera-term/tests/fixtures/esctest_spec.txt
+---
+
+
+
+ x
+ |
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--
+cursor: (4,0)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0
+-- pens
+pens: default
