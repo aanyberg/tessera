@@ -43,15 +43,17 @@
 //! scrollback line in between), so readers of the input state re-clamp it
 //! against the current terminal (see `Session::scroll_offset`). The PTY
 //! lock is only ever held for one non-blocking attempt, and the writer
-//! thread releases the outbox lock before it writes.
+//! thread releases the outbox lock before it writes. The reader thread
+//! holds the terminal lock for one slice of output at a time and, between
+//! slices, lets a thread waiting for it go first (see `ADVANCE_SLICE`).
 
 use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -169,11 +171,77 @@ pub(crate) fn lock<T: ?Sized>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// A session's terminal, shared by the reader thread and the frontend's
+/// threads, with a count of the threads waiting for its lock.
+///
+/// The reader thread feeds output in slices and, between slices, gives the
+/// lock to a waiting thread (see [`ADVANCE_SLICE`]); the count tells it
+/// whether anyone is waiting, so it only gives way when someone is.
+struct SharedTerminal {
+    term: Mutex<Terminal>,
+    /// Threads inside [`SharedTerminal::lock`] that found the lock taken
+    /// and have not acquired it yet.
+    ///
+    /// Every access is `Relaxed`. The count is only a hint for the reader
+    /// thread: mutual exclusion comes from the mutex, and no other memory
+    /// is published through the count. A waiter the reader does not see
+    /// yet is seen after its next slice (or gets the lock while the reader
+    /// is between slices anyway), so a late read costs at most one slice of
+    /// waiting; a stale non-zero read costs at most [`GIVE_WAY_YIELDS`]
+    /// needless yields.
+    waiting: AtomicUsize,
+}
+
+/// Registration of one thread in [`SharedTerminal::waiting`], undone when
+/// dropped, so the count cannot leak even if acquiring the lock unwound.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl<'a> Waiting<'a> {
+    fn register(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
+        Self(count)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl SharedTerminal {
+    fn new(term: Terminal) -> Self {
+        Self {
+            term: Mutex::new(term),
+            waiting: AtomicUsize::new(0),
+        }
+    }
+
+    /// Locks the terminal for anyone but the reader thread. When the lock
+    /// is taken, this thread is counted as waiting from before it blocks
+    /// until it holds the lock. Recovers a poisoned lock as [`lock`] does.
+    fn lock(&self) -> MutexGuard<'_, Terminal> {
+        match self.term.try_lock() {
+            Ok(guard) => return guard,
+            Err(TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {}
+        }
+        let _waiting = Waiting::register(&self.waiting);
+        lock(&self.term)
+    }
+
+    /// Whether a thread is waiting in [`SharedTerminal::lock`]. A hint: it
+    /// may change as soon as it is read.
+    fn has_waiters(&self) -> bool {
+        self.waiting.load(Ordering::Relaxed) > 0
+    }
+}
+
 /// A running (or exited but not yet closed) session.
 pub(crate) struct Session {
     id: SessionId,
     pty: Arc<Mutex<Box<dyn Pty>>>,
-    term: Arc<Mutex<Terminal>>,
+    term: Arc<SharedTerminal>,
     /// Set when the application starts closing the session; the reader
     /// thread stops delivering events and pending writes give up.
     muted: Arc<AtomicBool>,
@@ -350,7 +418,7 @@ impl Session {
         observers: ObserverSlot,
     ) -> io::Result<Self> {
         let pty = Arc::new(Mutex::new(pty));
-        let term = Arc::new(Mutex::new(Terminal::new(size.rows, size.cols)));
+        let term = Arc::new(SharedTerminal::new(Terminal::new(size.rows, size.cols)));
         let muted = Arc::new(AtomicBool::new(false));
         let outbox = Arc::new(Outbox::default());
         let writer = Writer {
@@ -441,14 +509,14 @@ impl Session {
             return Err(PtyError::InvalidSize(size));
         }
         if size.rows > 0 && size.cols > 0 {
-            lock(&self.term).resize(size.rows, size.cols);
+            self.term.lock().resize(size.rows, size.cols);
         }
         lock(&self.pty).resize(size)
     }
 
     /// Runs `f` with the session's terminal locked.
     pub(crate) fn with_terminal<R>(&self, f: impl FnOnce(&Terminal) -> R) -> R {
-        f(&lock(&self.term))
+        f(&self.term.lock())
     }
 
     /// Whether the session's view has keyboard focus.
@@ -619,10 +687,84 @@ impl fmt::Debug for Session {
     }
 }
 
+/// Most bytes of PTY output the reader thread feeds the terminal while
+/// holding its lock once.
+///
+/// The native PTY reader delivers output in chunks of up to 64 KiB, and
+/// parsing a whole chunk of escape-heavy or CJK output takes milliseconds,
+/// during which the frontend's `render_view` (the first lock taker of every
+/// frame) would wait. The reader instead takes the lock once per slice of
+/// this size, so one hold lasts one slice. That bounds bytes, not time: a
+/// few sequences are expensive per byte (DECALN or `REP` on a wide screen,
+/// `RIS`, `SU`/`IL` with huge counts) and make a single slice take tens to
+/// hundreds of milliseconds (ADR 0014; #117 for DECALN, `REP` and `SU`/`IL`,
+/// #107 for `RIS`).
+///
+/// Releasing the lock is not enough on its own: `std::sync::Mutex` is not
+/// fair, and the reader, still running, would take the lock back before the
+/// waiter it just woke is scheduled. Under a flood a waiter could lose for
+/// many chunks (a macOS PTY hands out 1 KiB per read, which made this, not
+/// the chunk size, the cause of the long waits). So after each slice the
+/// reader gives way to a thread counted as waiting by `SharedTerminal::lock`
+/// (`give_way`). With nobody waiting it does not yield, so output is
+/// as fast as before. Measured waits, the throughput cost and the choice of
+/// size are in ADR 0014 ("Frame input, and how long the terminal lock is
+/// held").
+///
+/// A slice that would end inside a UTF-8 encoded character is extended to
+/// the character's end, so slices are at most three bytes longer (see
+/// `advance_slice_len`). The parser would be correct anyway
+/// (`Terminal::advance` is split-invariant), but a cut inside a character
+/// makes it copy the whole next slice to join the pieces.
+const ADVANCE_SLICE: usize = 4096;
+
+/// Most times the reader yields after a slice while a thread waits for
+/// the terminal lock (see `give_way`).
+const GIVE_WAY_YIELDS: usize = 16;
+
+/// Length of the next slice of `rest` to feed the terminal under one lock
+/// hold: [`ADVANCE_SLICE`] bytes, extended by up to three bytes so it does
+/// not end inside a UTF-8 encoded character. All of `rest` if that is no
+/// longer.
+fn advance_slice_len(rest: &[u8]) -> usize {
+    if rest.len() <= ADVANCE_SLICE {
+        return rest.len();
+    }
+    // Extend while the next byte is a continuation byte (`0b10xx_xxxx`), at
+    // most three times (the longest tail of a four-byte character). Bytes
+    // that are not valid UTF-8 just keep the plain length.
+    let limit = rest.len().min(ADVANCE_SLICE + 4);
+    match (ADVANCE_SLICE..limit).find(|&end| rest[end] & 0xC0 != 0x80) {
+        Some(end) => end,
+        None if rest.len() <= ADVANCE_SLICE + 3 => rest.len(),
+        None => ADVANCE_SLICE,
+    }
+}
+
+/// Lets a thread waiting for `term`'s lock take it before the reader takes
+/// it again, if one is waiting; returns how often it called `yield_now`
+/// (`thread::yield_now` outside tests).
+///
+/// `std::sync::Mutex` is not fair: the release just before this woke the
+/// waiter, but the reader, still running, would win the lock back before
+/// the waiter is scheduled. Yielding until the waiter has the lock (the
+/// count drops) hands it over; the bound of [`GIVE_WAY_YIELDS`] keeps a
+/// waiter that is itself descheduled from stalling output. With nobody
+/// waiting this is one relaxed load.
+fn give_way(term: &SharedTerminal, mut yield_now: impl FnMut()) -> usize {
+    for yields in 0..GIVE_WAY_YIELDS {
+        if !term.has_waiters() {
+            return yields;
+        }
+        yield_now();
+    }
+    GIVE_WAY_YIELDS
+}
+
 /// State moved onto a session's reader thread.
 struct Pump {
     id: SessionId,
-    term: Arc<Mutex<Terminal>>,
+    term: Arc<SharedTerminal>,
     muted: Arc<AtomicBool>,
     observers: ObserverSlot,
     /// Dropped when the thread ends; see [`Reader::done`].
@@ -634,11 +776,24 @@ impl Pump {
         for event in events {
             match event {
                 PtyEvent::Output(bytes) => {
-                    let requests = {
-                        let mut term = lock(&self.term);
-                        term.advance(&bytes);
-                        term.take_requests()
-                    };
+                    // The lock is taken once per slice, never for the whole
+                    // chunk, and a frame waiting for it goes first between
+                    // slices (see `ADVANCE_SLICE`). Requests are collected
+                    // in order and delivered after the chunk's one `Output`,
+                    // so observers see no more callbacks than before.
+                    let mut requests = Vec::new();
+                    let mut rest = &bytes[..];
+                    while !rest.is_empty() {
+                        let (slice, after) = rest.split_at(advance_slice_len(rest));
+                        // The reader locks the mutex directly: it never
+                        // counts as waiting, so it never makes itself yield.
+                        let mut term = lock(&self.term.term);
+                        term.advance(slice);
+                        requests.append(&mut term.take_requests());
+                        drop(term);
+                        give_way(&self.term, thread::yield_now);
+                        rest = after;
+                    }
                     self.deliver(SessionEvent::Output);
                     for request in requests {
                         match request {
@@ -809,5 +964,623 @@ mod tests {
         );
         assert_eq!(lock(&sizes).len(), 2);
         app.close_session(id).expect("close");
+    }
+
+    /// The `sgr_heavy` line of the wave 5 performance corpus: an SGR
+    /// sequence every few cells, including colon sub-parameters.
+    const SGR_HEAVY: &str = "\x1b[1;31mbold red\x1b[0m \x1b[4:3;58:2::255:0:0mcurly\x1b[0m \
+        \x1b[38;2;10;20;30;48;5;240mtrue\x1b[0m \x1b[3;9mital-strike\x1b[0m \x1b[7mrev\x1b[27m";
+
+    /// The `cjk` line of the wave 5 performance corpus: wide characters,
+    /// three UTF-8 bytes each.
+    const CJK: &str =
+        "日本語のテキストと中文的文本と한국어 텍스트を混ぜた行です。漢字かな交じり文。";
+
+    /// The largest chunk the native PTY reader delivers (one `read(2)`).
+    const PTY_CHUNK: usize = 64 * 1024;
+
+    /// What one `read(2)` of a macOS PTY master returns under a flood: the
+    /// tty layer hands out 1 KiB at a time, so the reader sees a stream of
+    /// small chunks rather than 64 KiB ones.
+    const MACOS_PTY_READ: usize = 1024;
+
+    /// `line` repeated with `\r\n` between copies until at least `len`
+    /// bytes.
+    fn repeated(line: &str, len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len + line.len() + 2);
+        while out.len() < len {
+            out.extend_from_slice(line.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+        out
+    }
+
+    /// A session on a [`SizePty`] whose output the test injects, with an
+    /// observer forwarding every event. Returns the event sender (dropping
+    /// it is not a hangup; close the session for that).
+    fn fake_session(
+        app: &App,
+        size: PtySize,
+    ) -> (SessionId, SyncSender<PtyEvent>, Receiver<SessionEvent>) {
+        let (events_tx, events) = mpsc::channel();
+        app.set_observer(Some(Box::new(move |_, event| {
+            let _ = events_tx.send(event);
+        })));
+        let (tx, rx) = mpsc::sync_channel(16);
+        let pty = SizePty {
+            events: Some(tx.clone()),
+            sizes: Arc::new(Mutex::new(Vec::new())),
+        };
+        let id = app.allocate_id();
+        app.attach(id, Box::new(pty), rx, size).expect("attach");
+        (id, tx, events)
+    }
+
+    /// Everything a frame or a scrollback view can show of `term`.
+    fn screen(term: &Terminal) -> (Vec<tessera_grid::Line>, Vec<tessera_grid::Line>, String) {
+        let grid = term.grid();
+        let scrollback = (0..grid.scrollback_len())
+            .map(|i| grid.scrollback_line(i).expect("in range").clone())
+            .collect();
+        (
+            grid.visible_lines().to_vec(),
+            scrollback,
+            format!("{:?}", grid.cursor()),
+        )
+    }
+
+    #[test]
+    fn slices_are_bounded_and_end_on_character_boundaries() {
+        for line in [SGR_HEAVY, CJK, "🦀 👨‍👩‍👧‍👦 ⣿ Åsa", "a"] {
+            let bytes = repeated(line, 5 * ADVANCE_SLICE + 7);
+            let text = std::str::from_utf8(&bytes).expect("corpus is UTF-8");
+            let mut rest = &bytes[..];
+            let mut at = 0;
+            while !rest.is_empty() {
+                let len = advance_slice_len(rest);
+                assert!(len >= ADVANCE_SLICE || len == rest.len(), "{line:?}: {len}");
+                assert!(len <= ADVANCE_SLICE + 3, "{line:?}: {len}");
+                at += len;
+                assert!(
+                    text.is_char_boundary(at),
+                    "{line:?}: slice ends inside a character at {at}"
+                );
+                rest = &rest[len..];
+            }
+            assert_eq!(at, bytes.len());
+        }
+        // Short input is one slice; bytes that are not UTF-8 keep the full
+        // length rather than an empty slice.
+        assert_eq!(advance_slice_len(b"abc"), 3);
+        assert_eq!(advance_slice_len(&[]), 0);
+        assert_eq!(
+            advance_slice_len(&[0x80; ADVANCE_SLICE + 10]),
+            ADVANCE_SLICE
+        );
+        let mut cut = vec![b'a'; ADVANCE_SLICE + 10];
+        cut[ADVANCE_SLICE - 1..ADVANCE_SLICE + 2].copy_from_slice("語".as_bytes());
+        assert_eq!(advance_slice_len(&cut), ADVANCE_SLICE + 2);
+        // A character cut by the end of the input ends the slice there.
+        assert_eq!(advance_slice_len(&cut[..=ADVANCE_SLICE]), ADVANCE_SLICE + 1);
+        // Four or more continuation bytes are not one character's tail.
+        for len in [ADVANCE_SLICE + 4, ADVANCE_SLICE + 5] {
+            assert_eq!(advance_slice_len(&vec![0x80; len]), ADVANCE_SLICE, "{len}");
+        }
+        assert_eq!(
+            advance_slice_len(&[0x80; ADVANCE_SLICE + 3]),
+            ADVANCE_SLICE + 3
+        );
+    }
+
+    #[test]
+    fn give_way_yields_only_while_someone_waits() {
+        let term = SharedTerminal::new(Terminal::new(2, 2));
+        let mut yields = 0;
+        assert_eq!(give_way(&term, || yields += 1), 0, "nobody waits");
+        assert_eq!(yields, 0);
+
+        // A waiter that never gets the lock: the bound applies.
+        let stuck = Waiting::register(&term.waiting);
+        assert_eq!(give_way(&term, || {}), GIVE_WAY_YIELDS);
+        drop(stuck);
+        assert!(!term.has_waiters(), "dropping the registration undoes it");
+
+        // A waiter that takes the lock during the third yield.
+        let mut waiter = Some(Waiting::register(&term.waiting));
+        let mut yields = 0;
+        let given = give_way(&term, || {
+            yields += 1;
+            if yields == 3 {
+                waiter.take();
+            }
+        });
+        assert_eq!(given, 3);
+    }
+
+    #[test]
+    fn a_blocked_lock_taker_is_counted_until_it_has_the_lock() {
+        let term = SharedTerminal::new(Terminal::new(2, 2));
+        drop(term.lock());
+        assert!(!term.has_waiters(), "an uncontended lock is not counted");
+
+        let held = lock(&term.term);
+        let got_it = AtomicBool::new(false);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let guard = term.lock();
+                got_it.store(true, Ordering::Release);
+                drop(guard);
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !term.has_waiters() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the blocked thread was never counted"
+                );
+                thread::yield_now();
+            }
+            assert!(!got_it.load(Ordering::Acquire));
+            drop(held);
+        });
+        assert!(got_it.load(Ordering::Acquire));
+        assert!(!term.has_waiters(), "counted only until it had the lock");
+
+        // A poisoned lock is recovered without counting anyone.
+        let poison = panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = lock(&term.term);
+            panic!("poison the terminal lock");
+        }));
+        assert!(poison.is_err());
+        drop(term.lock());
+        assert!(!term.has_waiters());
+    }
+
+    /// Several frame-like threads taking the lock while a flood of output
+    /// arrives: the reader keeps going, every thread keeps getting the
+    /// lock, and nobody waits anywhere near the time the flood takes.
+    ///
+    /// A liveness check that runs in debug builds too; its bounds are far
+    /// too loose to catch a slow handoff. The timing bar for several
+    /// waiters is `several_waiters_each_wait_briefly` (release only).
+    #[test]
+    fn several_waiters_and_the_reader_all_progress() {
+        const THREADS: usize = 4;
+        let app = App::new(Config::default(), ConfigPaths::new("/nonexistent/tessera"));
+        let (id, tx, events) = fake_session(&app, PtySize::new(24, 80));
+        let corpus = repeated(&format!("{SGR_HEAVY}\r\n{CJK}"), 8 * 1024 * 1024);
+        let chunks = corpus.chunks(PTY_CHUNK).count();
+        let done = AtomicBool::new(false);
+        let started = Instant::now();
+        let probes = thread::scope(|scope| {
+            let probes: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut waits = Vec::new();
+                        while !done.load(Ordering::Acquire) {
+                            let start = Instant::now();
+                            let acquired =
+                                app.with_terminal(id, |_| Instant::now()).expect("session");
+                            waits.push(acquired - start);
+                            thread::sleep(Duration::from_micros(200));
+                        }
+                        waits
+                    })
+                })
+                .collect();
+            for chunk in corpus.chunks(PTY_CHUNK) {
+                tx.send(PtyEvent::Output(chunk.to_vec()))
+                    .expect("reader alive");
+            }
+            for _ in 0..chunks {
+                let event = events
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("the reader stalled");
+                assert_eq!(event, SessionEvent::Output);
+            }
+            done.store(true, Ordering::Release);
+            probes
+                .into_iter()
+                .map(|probe| probe.join().expect("probe"))
+                .collect::<Vec<_>>()
+        });
+        let flood = started.elapsed();
+        for (i, waits) in probes.iter().enumerate() {
+            let max = waits.iter().max().copied().unwrap_or_default();
+            assert!(
+                waits.len() >= 5,
+                "thread {i}: only {} locks in {flood:?}",
+                waits.len()
+            );
+            assert!(
+                max < flood / 4 || max < Duration::from_millis(50),
+                "thread {i} waited {max:?} of a {flood:?} flood"
+            );
+        }
+        app.close_session(id).expect("close");
+    }
+
+    /// Split invariance through the pump: a 64 KiB chunk that ends inside a
+    /// CSI sequence (and is itself fed in slices that cut sequences and
+    /// characters), followed by its continuation, leaves the same screen,
+    /// scrollback and cursor as one `advance` of the whole stream.
+    #[test]
+    fn a_chunk_ending_mid_csi_renders_like_one_advance() {
+        let mut corpus = repeated(&format!("{SGR_HEAVY}\r\n{CJK}"), 2 * PTY_CHUNK);
+        let csi = b"\x1b[38;2;10;20";
+        let rest = b";30;48;5;240mtrue\x1b[0m tail";
+        // Fill the first chunk with whole corpus lines and pad it so it ends
+        // exactly inside the CSI.
+        let filler_len = PTY_CHUNK - csi.len();
+        let line_end = corpus[..filler_len]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .expect("a line ends in the first chunk")
+            + 1;
+        let mut first = corpus[..line_end].to_vec();
+        first.resize(filler_len, b'z');
+        first.extend_from_slice(csi);
+        assert_eq!(first.len(), PTY_CHUNK);
+        let mut second = rest.to_vec();
+        corpus.truncate(PTY_CHUNK / 2);
+        second.extend_from_slice(&corpus);
+
+        let app = App::new(Config::default(), ConfigPaths::new("/nonexistent/tessera"));
+        let (id, tx, events) = fake_session(&app, PtySize::new(24, 80));
+        tx.send(PtyEvent::Output(first.clone()))
+            .expect("reader alive");
+        tx.send(PtyEvent::Output(second.clone()))
+            .expect("reader alive");
+        for _ in 0..2 {
+            let event = events.recv_timeout(Duration::from_secs(5)).expect("output");
+            assert_eq!(event, SessionEvent::Output);
+        }
+        let pumped = app.with_terminal(id, screen).expect("session");
+
+        let mut reference = Terminal::new(24, 80);
+        let mut whole = first;
+        whole.extend_from_slice(&second);
+        reference.advance(&whole);
+        assert_eq!(pumped, screen(&reference));
+        app.close_session(id).expect("close");
+    }
+
+    /// The sliced pump against one `advance` of the same bytes, over seeded
+    /// random streams (corpus fragments, escape sequence prefixes, raw
+    /// bytes including invalid UTF-8) cut into chunks of random sizes up to
+    /// past 64 KiB, so slices and chunks end inside sequences and
+    /// characters everywhere.
+    #[test]
+    fn the_sliced_pump_matches_one_advance() {
+        /// xorshift64*: small, seeded, no dependency.
+        struct Rng(u64);
+        impl Rng {
+            fn below(&mut self, n: usize) -> usize {
+                self.0 ^= self.0 >> 12;
+                self.0 ^= self.0 << 25;
+                self.0 ^= self.0 >> 27;
+                let x = self.0.wrapping_mul(0x2545_F491_4F6C_DD1D);
+                usize::try_from(x % n as u64).expect("below n")
+            }
+        }
+        let fragments: [&[u8]; 12] = [
+            SGR_HEAVY.as_bytes(),
+            CJK.as_bytes(),
+            "🦀 👨‍👩‍👧‍👦 Z͑ͫ̓ͫ͡a̸̵ḻ̕g̐ò ⣿".as_bytes(),
+            b"\x1b[",
+            b"\x1b[38;2;1",
+            b"\x1b]0;title",
+            b"\x07",
+            b"\r\n",
+            b"\x1b[?1049h",
+            b"\x1b[?1049l",
+            b"\x1b[5;10r\x1b[2J\x1b[H",
+            b"\x1bM\t",
+        ];
+        for seed in 1..=24_u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let target = 64 * 1024 + rng.below(160 * 1024);
+            let mut stream = Vec::with_capacity(target + 512);
+            while stream.len() < target {
+                if rng.below(4) == 0 {
+                    for _ in 0..rng.below(8) {
+                        stream.push(u8::try_from(rng.below(256)).expect("byte"));
+                    }
+                } else {
+                    let fragment = fragments[rng.below(fragments.len())];
+                    let start = rng.below(fragment.len());
+                    let end = start + rng.below(fragment.len() - start + 1);
+                    stream.extend_from_slice(&fragment[start..end]);
+                }
+            }
+            let app = App::new(Config::default(), ConfigPaths::new("/nonexistent/tessera"));
+            let (id, tx, events) = fake_session(&app, PtySize::new(24, 80));
+            let mut rest = &stream[..];
+            let mut chunks = 0;
+            while !rest.is_empty() {
+                let len = (1 + rng.below(70_000)).min(rest.len());
+                tx.send(PtyEvent::Output(rest[..len].to_vec()))
+                    .expect("reader alive");
+                rest = &rest[len..];
+                chunks += 1;
+            }
+            let mut outputs = 0;
+            while outputs < chunks {
+                if events.recv_timeout(Duration::from_secs(10)).expect("event")
+                    == SessionEvent::Output
+                {
+                    outputs += 1;
+                }
+            }
+            let pumped = app.with_terminal(id, screen).expect("session");
+            let mut reference = Terminal::new(24, 80);
+            reference.advance(&stream);
+            assert_eq!(pumped, screen(&reference), "seed {seed}");
+            app.close_session(id).expect("close");
+        }
+    }
+
+    /// Bells from every slice of a chunk are delivered after the chunk's
+    /// single `Output`, in order, and a flood of chunks yields one `Output`
+    /// per chunk, not one per slice.
+    #[test]
+    fn one_output_per_chunk_then_its_requests() {
+        let app = App::new(Config::default(), ConfigPaths::new("/nonexistent/tessera"));
+        let (id, tx, events) = fake_session(&app, PtySize::new(24, 80));
+        // A bell at the start, in the middle of a slice, on a slice boundary
+        // and at the end of a chunk spanning five slices.
+        let mut chunk = repeated(SGR_HEAVY, 5 * ADVANCE_SLICE);
+        chunk.truncate(5 * ADVANCE_SLICE);
+        for at in [0, ADVANCE_SLICE / 2, 2 * ADVANCE_SLICE, chunk.len()] {
+            chunk.insert(at, 0x07);
+        }
+        tx.send(PtyEvent::Output(chunk)).expect("reader alive");
+        let mut got = Vec::new();
+        for _ in 0..5 {
+            got.push(events.recv_timeout(Duration::from_secs(5)).expect("event"));
+        }
+        assert_eq!(
+            got,
+            [
+                SessionEvent::Output,
+                SessionEvent::Bell,
+                SessionEvent::Bell,
+                SessionEvent::Bell,
+                SessionEvent::Bell
+            ]
+        );
+
+        let flood = repeated(CJK, 8 * PTY_CHUNK);
+        let chunks = flood.chunks(PTY_CHUNK).count();
+        for chunk in flood.chunks(PTY_CHUNK) {
+            tx.send(PtyEvent::Output(chunk.to_vec()))
+                .expect("reader alive");
+        }
+        for _ in 0..chunks {
+            let event = events.recv_timeout(Duration::from_secs(5)).expect("output");
+            assert_eq!(event, SessionEvent::Output);
+        }
+        assert_eq!(
+            events.recv_timeout(Duration::from_millis(100)),
+            Err(RecvTimeoutError::Timeout),
+            "no event beyond one Output per chunk"
+        );
+        app.close_session(id).expect("close");
+    }
+
+    /// The reader releases the lock between the slices of one chunk: a
+    /// thread taking it in a loop sees the chunk partly applied. Every
+    /// state it can see between slices is a line boundary, because each
+    /// line is 16 bytes and slices are 4096. Holding the lock for a whole
+    /// chunk would only ever show the state before or after it.
+    #[test]
+    fn other_lock_takers_get_in_between_slices() {
+        let app = App::new(Config::default(), ConfigPaths::new("/nonexistent/tessera"));
+        let (id, tx, events) = fake_session(&app, PtySize::new(4, 20));
+        // The last line written so far is the screen's third row: `\r\n`
+        // after each line leaves the cursor on the empty row below it.
+        let last_line = |term: &Terminal| term.grid().line(2).expect("row 2").text();
+        let mut next = 0;
+        let mut seen_partial = false;
+        for _ in 0..50 {
+            let mut chunk = Vec::with_capacity(PTY_CHUNK);
+            while chunk.len() < PTY_CHUNK {
+                chunk.extend_from_slice(format!("line {next:09}\r\n").as_bytes());
+                next += 1;
+            }
+            let before = app.with_terminal(id, last_line).expect("session");
+            let after = format!("line {:09}", next - 1);
+            let done = AtomicBool::new(false);
+            let seen = thread::scope(|scope| {
+                let probe = scope.spawn(|| {
+                    let mut seen = Vec::new();
+                    while !done.load(Ordering::Acquire) {
+                        let line = app.with_terminal(id, last_line).expect("session");
+                        if line != before && line != after && seen.last() != Some(&line) {
+                            seen.push(line);
+                        }
+                        // A frame-like pause: a thread that retakes the
+                        // lock the instant it releases it would starve the
+                        // reader, which never counts as waiting.
+                        thread::sleep(Duration::from_micros(20));
+                    }
+                    seen
+                });
+                tx.send(PtyEvent::Output(chunk)).expect("reader alive");
+                let event = events
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("output");
+                assert_eq!(event, SessionEvent::Output);
+                done.store(true, Ordering::Release);
+                probe.join().expect("probe")
+            });
+            for line in &seen {
+                assert!(line.starts_with("line "), "a torn line: {line:?}");
+            }
+            if !seen.is_empty() {
+                seen_partial = true;
+                break;
+            }
+        }
+        assert!(
+            seen_partial,
+            "the lock was never free in the middle of a chunk"
+        );
+        app.close_session(id).expect("close");
+    }
+
+    /// Feeds 50 MiB of `line` (repeated) to a fresh session in chunks of
+    /// `chunk_len` bytes while `probes` threads each take the terminal lock
+    /// every 200 µs, as `render_view` does once per frame; returns each
+    /// probe's waits, sorted.
+    fn lock_waits(line: &str, chunk_len: usize, probes: usize) -> Vec<Vec<Duration>> {
+        const VOLUME: usize = 50 * 1024 * 1024;
+        let app = App::new(Config::default(), ConfigPaths::new("/nonexistent/tessera"));
+        let (id, tx, events) = fake_session(&app, PtySize::new(24, 80));
+        let corpus = repeated(line, VOLUME);
+        let chunks = corpus.chunks(chunk_len).count();
+        let done = AtomicBool::new(false);
+        let mut waits = thread::scope(|scope| {
+            let probes: Vec<_> = (0..probes)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut waits = Vec::new();
+                        while !done.load(Ordering::Acquire) {
+                            let start = Instant::now();
+                            let acquired =
+                                app.with_terminal(id, |_| Instant::now()).expect("session");
+                            waits.push(acquired - start);
+                            thread::sleep(Duration::from_micros(200));
+                        }
+                        waits
+                    })
+                })
+                .collect();
+            for chunk in corpus.chunks(chunk_len) {
+                tx.send(PtyEvent::Output(chunk.to_vec()))
+                    .expect("reader alive");
+            }
+            for _ in 0..chunks {
+                let event = events
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("output");
+                assert_eq!(event, SessionEvent::Output);
+            }
+            done.store(true, Ordering::Release);
+            probes
+                .into_iter()
+                .map(|probe| probe.join().expect("probe"))
+                .collect::<Vec<_>>()
+        });
+        app.close_session(id).expect("close");
+        for probe in &mut waits {
+            probe.sort_unstable();
+        }
+        waits
+    }
+
+    /// The lock-hold bar of #83: while the reader parses 50 MiB each of the
+    /// `sgr_heavy` and `cjk` corpus lines, delivered in 64 KiB chunks (the
+    /// largest the native PTY reader delivers) and in 1 KiB chunks (what a
+    /// macOS PTY delivers under a flood), a thread taking the terminal lock
+    /// the way `render_view` does waits at most 2 ms at the 99th percentile
+    /// and 5 ms at worst.
+    ///
+    /// Timing-based, so run it only in release builds, one test at a time:
+    /// `cargo nextest run --release -p tessera-app-core --test-threads 1
+    /// reader_lock_hold`. In debug builds (where `scripts/quality-gate.sh`
+    /// runs the suite) it is ignored; `--run-ignored` there would run it
+    /// unoptimised, where the bar does not apply. It prints every attempt's
+    /// percentiles.
+    ///
+    /// Each case gets up to three attempts and passes on the first that
+    /// meets the bar. A measured wait includes the probe's own scheduling
+    /// delay, so on a loaded machine a single preemption of the probe (or
+    /// of the reader inside a slice) can push one sample past 5 ms; a
+    /// reader that keeps the lock (main before #83: hundreds of
+    /// milliseconds, a few dozen samples) fails every attempt.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "timing bar; run in release")]
+    fn reader_lock_hold_is_bounded() {
+        const ATTEMPTS: usize = 3;
+        let cases = [
+            ("sgr_heavy", SGR_HEAVY, PTY_CHUNK),
+            ("cjk", CJK, PTY_CHUNK),
+            ("sgr_heavy/1KiB", SGR_HEAVY, MACOS_PTY_READ),
+            ("cjk/1KiB", CJK, MACOS_PTY_READ),
+        ];
+        let mut failures = Vec::new();
+        for (name, line, chunk_len) in cases {
+            let mut misses = Vec::new();
+            for attempt in 1..=ATTEMPTS {
+                let waits = lock_waits(line, chunk_len, 1).remove(0);
+                let p99 = waits[waits.len() * 99 / 100];
+                let max = *waits.last().expect("samples");
+                eprintln!(
+                    "{name} attempt {attempt}: {} samples, p50 {:?}, p99 {p99:?}, max {max:?}",
+                    waits.len(),
+                    waits[waits.len() / 2],
+                );
+                let mut miss = Vec::new();
+                if waits.len() < 100 {
+                    miss.push(format!("only {} samples", waits.len()));
+                }
+                if p99 > Duration::from_millis(2) {
+                    miss.push(format!("p99 wait {p99:?} > 2 ms"));
+                }
+                if max > Duration::from_millis(5) {
+                    miss.push(format!("max wait {max:?} > 5 ms"));
+                }
+                if miss.is_empty() {
+                    misses.clear();
+                    break;
+                }
+                misses.push(format!("{name} attempt {attempt}: {}", miss.join(", ")));
+            }
+            failures.extend(misses);
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// Several frame-like threads at once (three and six, 64 KiB chunks of
+    /// `sgr_heavy`, 50 MiB): each one's 99th-percentile wait stays under
+    /// 5 ms, a generous bound (measured 0.2-2.8 ms on an Apple M4 at load
+    /// 10-20). A reader that never gives way makes them wait 100-300
+    /// milliseconds. Release only, like `reader_lock_hold_is_bounded`, and
+    /// with the same three attempts.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "timing bar; run in release")]
+    fn several_waiters_each_wait_briefly() {
+        const ATTEMPTS: usize = 3;
+        let mut failures = Vec::new();
+        for probes in [3, 6] {
+            let mut misses = Vec::new();
+            for attempt in 1..=ATTEMPTS {
+                let mut miss = Vec::new();
+                for (i, waits) in lock_waits(SGR_HEAVY, PTY_CHUNK, probes).iter().enumerate() {
+                    let p99 = waits[waits.len() * 99 / 100];
+                    eprintln!(
+                        "{probes} waiters attempt {attempt} thread {i}: {} samples, p99 {p99:?}, max {:?}",
+                        waits.len(),
+                        waits.last().expect("samples"),
+                    );
+                    if waits.len() < 50 {
+                        miss.push(format!("thread {i}: only {} samples", waits.len()));
+                    }
+                    if p99 > Duration::from_millis(5) {
+                        miss.push(format!("thread {i}: p99 wait {p99:?} > 5 ms"));
+                    }
+                }
+                if miss.is_empty() {
+                    misses.clear();
+                    break;
+                }
+                misses.push(format!(
+                    "{probes} waiters attempt {attempt}: {}",
+                    miss.join(", ")
+                ));
+            }
+            failures.extend(misses);
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 }

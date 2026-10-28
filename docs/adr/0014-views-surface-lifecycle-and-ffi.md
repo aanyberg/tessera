@@ -183,6 +183,95 @@ so the copy is what holds the lock. That test times the copy only; that
 not of a test. A 200×60 snapshot costs about 190 KiB
 per view.
 
+The other side of the lock is the session's reader thread (#83). It used to
+hold the lock while `Terminal::advance` parsed a whole PTY chunk, and under a
+`yes` flood `render_view` waited 4.5–5.9 ms at the 99th percentile and
+14–25 ms at worst (the issue's measurements in the app). Long holds were only
+part of the cause. `std::sync::Mutex` is not fair: the reader releases the
+lock, the waiting frame is woken, and the reader, still running, takes the
+lock again before the waiter is scheduled. A macOS PTY hands out 1 KiB per
+read, so a flood is a stream of short holds that a waiter can still lose to
+for tens of milliseconds.
+
+`Pump::run` now feeds each chunk to `advance` in slices of `ADVANCE_SLICE` =
+**4096** bytes, one lock hold per slice (a slice that would end inside a
+UTF-8 character runs to the character's end). The terminal mutex lives in a
+`SharedTerminal` that counts the threads waiting for it: every lock taker
+other than the reader (`Session::with_terminal`, which `render_view` uses,
+and `Session::resize`) tries the lock first and counts itself only when it
+is taken. After each slice the reader calls `thread::yield_now` while the
+count is non-zero, at most 16 times, which lets the woken waiter take the
+lock. With nobody waiting it does not yield at all.
+
+A slice bounds bytes, not time. For ordinary output (every wave 5 corpus
+line) a slice takes tens of microseconds, but a few sequences are expensive
+per byte, and one 4 KiB slice containing them holds the lock for long:
+DECALN on a 96×430 screen 238–504 ms, `REP` 65535 183 ms, `RIS` 37 ms, `SU`
+or `IL` 65535 10–20 ms (adversarial measurements). That is still about 16
+times shorter than holding the lock for the whole chunk, as before. Making
+`RIS` cheap is #107; bounding the cost of the others (DECALN, `REP` 65535,
+`SU`/`IL`) is #117.
+
+The handoff has a cost for lock takers that do not pace themselves. The
+reader gives way to every counted waiter and is not counted itself, so a
+thread that takes the lock again the moment it releases it wins every
+handoff and starves the session's output. Under a `yes`-style flood, one
+thread calling `with_terminal` in a tight loop cut throughput from 135 to
+70–98 MB/s; eight threads each holding it for 500 µs with no gap never let
+16 MiB finish; `App::resize` in a tight loop took 160 s instead of 0.14 s
+for 16 MiB. Paced callers, with gaps of 1 ms or more such as a display link
+at up to ~120 Hz, share the lock fairly, and no current caller loops:
+TesseraKit renders and resizes from the display link. `App::with_terminal`
+and `App::resize` document the rule.
+
+The chunk still produces one `SessionEvent::Output`, after its last slice,
+followed by its bell and title requests in order, so the observer sees no
+more callbacks than before.
+
+The rejected alternative was `try_lock` in `render_view`, drawing the
+previous snapshot when the lock is taken: under load every frame would show
+stale content, which is the stutter #83 is about, and what to draw belongs
+to the frame pacing of #21. A simpler reader-only variant, yielding after
+every 4096 bytes whether or not anyone waits, met the lock bar too. It was
+dropped because on a loaded machine each yield can hand the core to another
+process: its median wall time was up to 1.5× (load 20) and 3.7× (load 27)
+that of main, with the instruction count unchanged.
+
+Measured with `session::tests::reader_lock_hold_is_bounded` (release, Apple
+M4, a machine already loaded by other builds; load averages in brackets):
+50 MiB of the `sgr_heavy` and `cjk` corpus lines in 64 KiB chunks (the
+largest the native PTY reader delivers) and in 1 KiB chunks (what a macOS
+PTY delivers), while a probe takes the lock through `with_terminal`, the way
+`render_view` does, every 200 µs.
+
+| | 64 KiB chunks: p99 / max | 1 KiB chunks: p99 / max |
+|---|---|---|
+| before: whole chunk, never gives way [11–22] | 170–330 ms / 170–330 ms (2–5 samples) | 15–47 ms / 20–47 ms |
+| slices, never gives way [11–22] | 24–90 ms / 27–205 ms | 1.1–5.7 ms / 2–29 ms |
+| yield every 4096 bytes, whole chunk [20] | 1.7–1.9 ms / 2.7–3.1 ms | 0.18 ms / 0.27–0.34 ms |
+| slices, yield every 4096 bytes (rejected) [11–22] | 0.1–1.0 ms / 0.3–1.7 ms | 0.05–0.6 ms / 0.1–1.4 ms |
+| **slices of 4096, give way to a counted waiter** [8–17] | **0.03–0.37 ms / 0.03–1.7 ms** | **0.01–0.07 ms / 0.01–0.83 ms** |
+
+2048-byte slices measured about the same, and 8192 and 16384 were somewhat
+worse at the 99th percentile; 4096 leaves margin under the bar (p99 2 ms,
+max 5 ms) on a slower machine. On an oversubscribed machine (ten extra
+CPU-bound processes, load 13–39) the 99th percentile stayed under 0.9 ms,
+but single waits of 5–53 ms appeared: the scheduler preempts the reader
+inside a slice, or the probe itself, and no reader-side change prevents
+that. That is why the test gives each case three attempts.
+
+Throughput, as instructions retired head/main (`cargo xtask ab`, best of 15
+interleaved pairs): `cat` of 16 MiB of each of the 11 wave 5 corpus lines
+through a real PTY and `App` is 0.998–1.005, and the same bytes through
+`Terminal::advance` alone are 1.000 (`tessera-term` is unchanged). Through a
+fake PTY in 64 KiB chunks (a temporary test binary at main and at this
+change, `time -l`) every line is 0.999–1.000: with nobody waiting the reader
+adds one relaxed load per slice. With a thread taking the lock every 8 ms
+like a frame, in 64 KiB and in 1 KiB chunks, instructions are 0.991–1.018
+of main and median wall time 0.95–1.02. The rejected yield every 4096 bytes
+also kept instructions within 1.02, but its median wall time was 1.5–3.7
+times main's at load 20–27.
+
 ### Linking
 
 `libtessera_ffi.a` now needs the Objective-C runtime and five system
