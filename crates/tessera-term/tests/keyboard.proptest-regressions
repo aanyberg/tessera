@@ -1,0 +1,12 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+#
+# The seed below was produced on a pre-fix checkout (e2fc473, issue #73) by
+# raising legacy_plain_char_is_utf8 to 400_000 cases (PROPTEST_CASES has no
+# effect: the config sets its own case count). Its first drawn char is U+1F88,
+# so it also fails full_kitty_mode_round_trips on that checkout.
+cc 8020759562beee1b4b2d58023d14fb9dd7a589fde09da1b35e7411355261d3ba # shrinks to c = 'ᾈ', locks = 0
