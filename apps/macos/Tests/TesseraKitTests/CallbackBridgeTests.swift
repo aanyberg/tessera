@@ -160,6 +160,8 @@ final class CallbackBridgeTests: XCTestCase {
             (TESSERA_ERROR_SPAWN_FAILED, .spawnFailed),
             (TESSERA_ERROR_IO, .io),
             (TESSERA_ERROR_PANIC, .panic),
+            (TESSERA_ERROR_GPU, .gpu),
+            (TESSERA_ERROR_NO_SURFACE, .noSurface),
             (TesseraError(rawValue: 42), .unknown(rawValue: 42)),
         ]
         for (status, expected) in cases {

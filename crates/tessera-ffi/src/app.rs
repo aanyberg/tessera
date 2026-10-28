@@ -18,10 +18,12 @@ use crate::panic::ffi_guard;
 ///
 /// # Thread-safety contract
 ///
-/// * Every `tessera_app_*` and `tessera_session_*` function is called from
-///   one thread, the host's UI (main) thread, with the single exception of
-///   `tessera_session_write`, which may be called from any thread,
-///   concurrently with any other call except `tessera_app_free`.
+/// * Every `tessera_app_*`, `tessera_session_*` and `tessera_surface_*`
+///   function is called from one thread, the host's UI (main) thread, with
+///   the single exception of `tessera_session_write`, which may be called
+///   from any thread, concurrently with any other call except
+///   `tessera_app_free`. The surface functions create, configure and
+///   present Metal surfaces, which must happen on the main thread.
 /// * Callbacks (see `TesseraCallbacks`) fire on internal reader threads.
 ///   They must return quickly, must not call any `tessera_*` function and
 ///   must not block on the UI thread; the host marshals their work to its
@@ -82,9 +84,10 @@ pub unsafe extern "C" fn tessera_app_new(out: *mut *mut App) -> Error {
     })
 }
 
-/// Destroys an application: closes every session (hanging up, and if need
-/// be killing, its child), joins every session reader thread and releases
-/// the handle. A reader whose terminal is still held open after `SIGKILL`
+/// Destroys an application: detaches every surface (releasing the core's
+/// references to their layers), closes every session (hanging up, and if
+/// need be killing, its child), joins every session reader thread and
+/// releases the handle. A reader whose terminal is still held open after `SIGKILL`
 /// (a grandchild kept it) is detached instead of joined; it is muted and no
 /// longer holds the callback table. Returns once no callback is running or
 /// can run again; the installed `user_data` may then be freed. All sessions

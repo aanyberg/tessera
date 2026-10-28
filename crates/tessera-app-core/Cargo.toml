@@ -15,6 +15,10 @@ tessera-term.workspace = true
 tessera-config.workspace = true
 tessera-plugin-api.workspace = true
 tessera-plugin-hello.workspace = true
+# Views: one GPU surface and renderer per session (ADR 0014).
+tessera-render.workspace = true
+# Names the `Cell`s a view snapshots from the grid for the renderer.
+tessera-grid.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

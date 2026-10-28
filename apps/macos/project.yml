@@ -63,6 +63,14 @@ targets:
     dependencies:
       - framework: TesseraCore.xcframework
         embed: false
+      # What the Rust renderer in libtessera_ffi.a (wgpu's Metal backend
+      # through objc2) links against, from `cargo rustc -p tessera-ffi --lib
+      # --crate-type staticlib -- --print native-static-libs` (ADR 0014).
+      - sdk: Metal.framework
+      - sdk: QuartzCore.framework
+      - sdk: CoreGraphics.framework
+      - sdk: CoreFoundation.framework
+      - sdk: Foundation.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.aanyberg.TesseraKit

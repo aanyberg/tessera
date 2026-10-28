@@ -31,6 +31,12 @@ pub enum Error {
     /// The core panicked. The panic was caught and logged; the application
     /// handle stays valid and usable.
     Panic = 6,
+    /// The renderer failed: it could not be created (no GPU can present to
+    /// the layer, or no usable font), the layer's swapchain was lost, or
+    /// drawing a frame failed.
+    Gpu = 7,
+    /// The session has no surface attached (`tessera_surface_attach`).
+    NoSurface = 8,
 }
 
 impl From<&CoreError> for Error {
@@ -44,6 +50,9 @@ impl From<&CoreError> for Error {
             },
             CoreError::ReaderThread { .. } => Self::SpawnFailed,
             CoreError::Write { .. } => Self::Io,
+            CoreError::Gpu(_) => Self::Gpu,
+            CoreError::NoView(_) => Self::NoSurface,
+            CoreError::ViewAttached(_) => Self::InvalidArgument,
         }
     }
 }
@@ -51,7 +60,7 @@ impl From<&CoreError> for Error {
 /// Logs `error` and converts it to its status code.
 pub(crate) fn report(function: &'static str, error: &CoreError) -> Error {
     let code = Error::from(error);
-    if code == Error::SessionNotFound {
+    if matches!(code, Error::SessionNotFound | Error::NoSurface) {
         tracing::debug!(function, %error, "ffi call failed");
     } else {
         tracing::warn!(function, %error, "ffi call failed");
@@ -71,6 +80,7 @@ pub(crate) fn status(function: &'static str, result: Result<(), CoreError>) -> E
 mod tests {
     use std::io;
 
+    use tessera_app_core::view::RenderError;
     use tessera_app_core::{PtySize, SessionId};
 
     use super::*;
@@ -85,9 +95,11 @@ mod tests {
             Error::SpawnFailed,
             Error::Io,
             Error::Panic,
+            Error::Gpu,
+            Error::NoSurface,
         ];
         let values: Vec<i32> = codes.iter().map(|&code| code as i32).collect();
-        assert_eq!(values, [0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(values, [0, 1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]
@@ -129,6 +141,10 @@ mod tests {
                 },
                 Error::Io,
             ),
+            (CoreError::Gpu(RenderError::SurfaceLost), Error::Gpu),
+            (CoreError::Gpu(RenderError::NoFont("x".into())), Error::Gpu),
+            (CoreError::NoView(id), Error::NoSurface),
+            (CoreError::ViewAttached(id), Error::InvalidArgument),
         ];
         for (error, code) in cases {
             assert_eq!(Error::from(&error), code, "{error:?}");

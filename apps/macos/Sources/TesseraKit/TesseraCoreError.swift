@@ -26,6 +26,12 @@ public enum TesseraCoreError: Error, Hashable, Sendable {
     /// The core panicked. The panic was caught and logged; the application
     /// stays usable.
     case panic
+    /// The renderer failed: it could not be created (no GPU can present to
+    /// the layer, or no usable font), the layer's swapchain was lost (the
+    /// surface is then detached), or drawing a frame failed.
+    case gpu
+    /// The session has no surface attached.
+    case noSurface
     /// A code this version of the wrapper does not know.
     case unknown(rawValue: UInt32)
 
@@ -39,6 +45,8 @@ public enum TesseraCoreError: Error, Hashable, Sendable {
         case TESSERA_ERROR_SPAWN_FAILED: self = .spawnFailed
         case TESSERA_ERROR_IO: self = .io
         case TESSERA_ERROR_PANIC: self = .panic
+        case TESSERA_ERROR_GPU: self = .gpu
+        case TESSERA_ERROR_NO_SURFACE: self = .noSurface
         default: self = .unknown(rawValue: status.rawValue)
         }
     }
@@ -60,6 +68,8 @@ extension TesseraCoreError: CustomStringConvertible {
         case .spawnFailed: "the session could not be started"
         case .io: "I/O error"
         case .panic: "the core panicked (details are in the log)"
+        case .gpu: "the renderer failed (GPU or font)"
+        case .noSurface: "the session has no surface"
         case .unknown(let rawValue): "unknown core error \(rawValue)"
         }
     }

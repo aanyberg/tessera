@@ -4,13 +4,16 @@
 //! leaves hold sessions), the command registry and keybinding resolution, the
 //! configuration store, the plugin host and the control server. Frontends
 //! drive it exclusively through `tessera-ffi`. This crate has no knowledge of
-//! `AppKit`, `wgpu` or any OS window system.
+//! `AppKit` or any OS window system; it draws through `tessera-render` into
+//! surfaces the frontend creates (see the [`view`] module).
 //!
 //! Today the core manages a flat set of sessions ([`App::spawn_session`],
 //! [`App::close_session`], …) and reports what happens in them through one
 //! [`SessionObserver`]; the window, tab and pane model builds on top.
 //! Frontend input reaches a session through [`App::send_input`] (see the
-//! [`input`] module).
+//! [`input`] module). A session is drawn by at most one view
+//! ([`App::attach_view`], [`App::render_view`], …), whose size decides the
+//! session's grid size.
 //!
 //! # Threads
 //!
@@ -19,12 +22,14 @@
 //! the observer is called, and one writer thread that feeds queued
 //! frontend input to the child. Dropping the `App` closes every session
 //! and joins both threads (see the [`session`] module for the close
-//! sequence).
+//! sequence). The view methods create, configure and present Metal
+//! surfaces and must be called on the main thread (ADR 0014).
 
 #![forbid(unsafe_code)]
 
 pub mod input;
 pub mod session;
+pub mod view;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -35,6 +40,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Instant;
 
 use tessera_pty::{NativePty, Pty, PtyEvents};
+use tessera_render::{FontConfig, Fonts, Gpu, Theme};
 use tessera_term::{KeyboardModes, Terminal, encode_key};
 
 pub use input::{InputEvent, InputOutcome};
@@ -46,6 +52,7 @@ pub use tessera_pty::{ExitStatus, Program, PtyError, PtySize, SpawnOptions};
 
 use input::{Bindings, FocusEvent, MouseEvent};
 use session::{ObserverSlot, Session, lock};
+use view::{CellMetrics, FrameStatus, PhysicalSize, RenderError, View, ViewSize, wgpu};
 
 /// Application version reported to frontends and the control API.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -78,6 +85,17 @@ pub enum Error {
         #[source]
         source: io::Error,
     },
+    /// The GPU or the font system failed: no adapter or device, a surface
+    /// the adapter cannot present to, a lost swapchain, a validation error
+    /// while drawing, or no usable font for the renderer.
+    #[error("rendering failed: {0}")]
+    Gpu(#[from] RenderError),
+    /// The session has no view attached.
+    #[error("session {0} has no view")]
+    NoView(SessionId),
+    /// The session already has a view; detach it before attaching another.
+    #[error("session {0} already has a view")]
+    ViewAttached(SessionId),
 }
 
 /// Result alias for [`Error`].
@@ -91,6 +109,16 @@ pub struct App {
     next_id: AtomicU64,
     observers: ObserverSlot,
     bindings: Bindings,
+    /// At most one view per session, by session id. Never held while
+    /// `sessions` is locked.
+    views: Mutex<HashMap<SessionId, View>>,
+    /// The process's GPU, brought up by the first [`App::attach_view`] and
+    /// shared by every view after it.
+    gpu: Mutex<Option<Gpu>>,
+    /// The font database, loaded by the first [`App::attach_view`] and
+    /// shared by every view's shaper (loading it takes a noticeable
+    /// fraction of a second).
+    fonts: Mutex<Option<Fonts>>,
 }
 
 impl App {
@@ -105,6 +133,9 @@ impl App {
             next_id: AtomicU64::new(1),
             observers: Arc::new(RwLock::new(None)),
             bindings: Bindings::default(),
+            views: Mutex::new(HashMap::new()),
+            gpu: Mutex::new(None),
+            fonts: Mutex::new(None),
         }
     }
 
@@ -198,6 +229,10 @@ impl App {
         let session = lock(&self.sessions)
             .remove(&id)
             .ok_or(Error::SessionNotFound(id))?;
+        // Detach the view first; its surface is released here, before the
+        // child is hung up.
+        let view = lock(&self.views).remove(&id);
+        drop(view);
         self.close_all_of(&[session]);
         Ok(())
     }
@@ -417,6 +452,258 @@ impl App {
         Ok(self.session(id)?.with_terminal(f))
     }
 
+    /// The instance the frontend creates a view's surface on: the one the
+    /// process's GPU was brought up on, or a fresh one (from
+    /// [`Gpu::new_instance`]) before the first view exists.
+    ///
+    /// Pass the same instance to [`App::attach_view`].
+    pub fn view_instance(&self) -> wgpu::Instance {
+        lock(&self.gpu)
+            .as_ref()
+            .map_or_else(Gpu::new_instance, |gpu| gpu.instance().clone())
+    }
+
+    /// Whether session `id` has a view attached.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn has_view(&self, id: SessionId) -> Result<bool> {
+        self.session(id)?;
+        Ok(lock(&self.views).contains_key(&id))
+    }
+
+    /// Ids of the sessions that have a view, in spawn order.
+    pub fn view_ids(&self) -> Vec<SessionId> {
+        let mut ids: Vec<_> = lock(&self.views).keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// The geometry of session `id`'s view: its surface in physical
+    /// pixels, its backing scale and the grid that fits in it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session,
+    /// [`Error::NoView`] if it has no view.
+    pub fn view_size(&self, id: SessionId) -> Result<ViewSize> {
+        self.with_view(id, |view| view.size())
+    }
+
+    /// The font size session `id`'s view draws with, in points (after
+    /// [`tessera_render::sanitize_font_size`]).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session,
+    /// [`Error::NoView`] if it has no view.
+    pub fn view_font_size(&self, id: SessionId) -> Result<f32> {
+        self.with_view(id, |view| view.font_size())
+    }
+
+    /// The cell size of session `id`'s view at its current font size and
+    /// backing scale, in physical pixels.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session,
+    /// [`Error::NoView`] if it has no view.
+    pub fn view_cell_metrics(&self, id: SessionId) -> Result<CellMetrics> {
+        self.with_view(id, |view| view.cell_metrics())
+    }
+
+    /// Makes `surface` session `id`'s view, `size` physical pixels at
+    /// backing `scale`, and resizes the session to the grid that fits.
+    ///
+    /// `surface` must have been created on `instance`, which must come
+    /// from [`App::view_instance`]. The first view brings up the process's
+    /// GPU on `instance` (an adapter that can present to `surface`; about
+    /// 100 ms) and loads the font database; later views share both. The
+    /// view draws with the configured font family, font size and opacity
+    /// (see [`view::theme_for`]). A zero `size` is allowed: nothing is
+    /// drawn until a non-empty [`App::resize_view`], and the session keeps
+    /// its size meanwhile.
+    ///
+    /// The session's grid follows the view: it is resized to
+    /// [`view::grid_size_for`] the surface here and on every
+    /// [`App::resize_view`] and [`App::set_view_font_size`]. A PTY that
+    /// rejects the size is logged, not reported; the view is attached
+    /// either way.
+    ///
+    /// Must be called on the main thread.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session,
+    /// [`Error::ViewAttached`] if it already has a view,
+    /// [`Error::Gpu`] if no GPU can present to the surface or the renderer
+    /// cannot be created (no usable font); nothing is attached then.
+    pub fn attach_view(
+        &self,
+        id: SessionId,
+        instance: wgpu::Instance,
+        surface: wgpu::Surface<'static>,
+        size: PhysicalSize,
+        scale: f32,
+    ) -> Result<()> {
+        self.session(id)?;
+        let mut views = lock(&self.views);
+        if views.contains_key(&id) {
+            return Err(Error::ViewAttached(id));
+        }
+        let gpu = self.gpu_for(instance, &surface)?;
+        let theme = view::theme_for(&self.config);
+        let fonts = self.fonts_for(&theme)?;
+        let view = View::new(gpu, surface, fonts, theme, size, scale)?;
+        let pty_size = view.pty_size();
+        views.insert(id, view);
+        drop(views);
+        // A close that raced with this call (only possible when the
+        // main-thread rule is broken) must not leave a view behind.
+        if self.session(id).is_err() {
+            lock(&self.views).remove(&id);
+            return Err(Error::SessionNotFound(id));
+        }
+        self.follow_view(id, pty_size);
+        Ok(())
+    }
+
+    /// Reconfigures session `id`'s view for `size` physical pixels at
+    /// backing `scale` and resizes the session to the grid that fits.
+    ///
+    /// Call it whenever the view's size or backing scale changes (a window
+    /// resize, a move to a display with another scale), and after a frame
+    /// reported [`FrameStatus::Suboptimal`]. A zero `size` suspends drawing
+    /// ([`App::render_view`] reports [`FrameStatus::Skipped`]) and leaves
+    /// the session's size alone. Must be called on the main thread.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session,
+    /// [`Error::NoView`] if it has no view.
+    pub fn resize_view(&self, id: SessionId, size: PhysicalSize, scale: f32) -> Result<()> {
+        let pty_size = self.with_view(id, |view| {
+            view.resize(size, scale);
+            view.pty_size()
+        })?;
+        self.follow_view(id, pty_size);
+        Ok(())
+    }
+
+    /// Changes session `id`'s view to `size_pt` points (clamped like
+    /// [`tessera_render::sanitize_font_size`]; a non-finite size becomes
+    /// the default) and resizes the session to the grid that fits. Must be
+    /// called on the main thread.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session,
+    /// [`Error::NoView`] if it has no view.
+    pub fn set_view_font_size(&self, id: SessionId, size_pt: f32) -> Result<()> {
+        let pty_size = self.with_view(id, |view| {
+            view.set_font_size(size_pt);
+            view.pty_size()
+        })?;
+        self.follow_view(id, pty_size);
+        Ok(())
+    }
+
+    /// Draws session `id`'s visible screen into its view and presents it.
+    ///
+    /// The session's terminal is locked only while its visible rows and
+    /// cursor are copied out; shaping, drawing and waiting for a drawable
+    /// happen after the lock is released. The cursor is a block, drawn
+    /// hollow while the session is not focused ([`App::is_focused`]).
+    /// Must be called on the main thread.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session,
+    /// [`Error::NoView`] if it has no view, [`Error::Gpu`] if drawing
+    /// failed. A swapchain that cannot be recovered
+    /// ([`RenderError::SurfaceLost`]) also **detaches the view**: the
+    /// frontend attaches a new one. After any other GPU error the view
+    /// stays attached and the next frame may succeed.
+    pub fn render_view(&self, id: SessionId) -> Result<FrameStatus> {
+        let session = self.session(id)?;
+        let focused = session.is_focused();
+        let mut views = lock(&self.views);
+        let view = views.get_mut(&id).ok_or(Error::NoView(id))?;
+        session.with_terminal(|term| view.capture(term.grid()));
+        match view.render(focused) {
+            Ok(status) => Ok(status),
+            Err(RenderError::SurfaceLost) => {
+                let view = views.remove(&id);
+                drop(views);
+                drop(view);
+                Err(Error::Gpu(RenderError::SurfaceLost))
+            }
+            Err(error) => Err(Error::Gpu(error)),
+        }
+    }
+
+    /// Detaches and releases session `id`'s view. The session keeps its
+    /// size. Must be called on the main thread.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session,
+    /// [`Error::NoView`] if it has no view.
+    pub fn detach_view(&self, id: SessionId) -> Result<()> {
+        self.session(id)?;
+        let view = lock(&self.views).remove(&id).ok_or(Error::NoView(id))?;
+        drop(view);
+        Ok(())
+    }
+
+    /// Runs `f` on session `id`'s view.
+    fn with_view<R>(&self, id: SessionId, f: impl FnOnce(&mut View) -> R) -> Result<R> {
+        self.session(id)?;
+        let mut views = lock(&self.views);
+        let view = views.get_mut(&id).ok_or(Error::NoView(id))?;
+        Ok(f(view))
+    }
+
+    /// The process's GPU, brought up on `instance` for `surface` if this
+    /// is the first view.
+    fn gpu_for(&self, instance: wgpu::Instance, surface: &wgpu::Surface<'_>) -> Result<Gpu> {
+        let mut slot = lock(&self.gpu);
+        if let Some(gpu) = slot.as_ref() {
+            return Ok(gpu.clone());
+        }
+        let gpu = Gpu::with_compatible_surface(instance, Some(surface))?;
+        *slot = Some(gpu.clone());
+        Ok(gpu)
+    }
+
+    /// The process's font database, loaded for `theme`'s family if this is
+    /// the first view.
+    fn fonts_for(&self, theme: &Theme) -> Result<Fonts> {
+        let mut slot = lock(&self.fonts);
+        if let Some(fonts) = slot.as_ref() {
+            return Ok(fonts.clone());
+        }
+        let fonts = Fonts::new(&FontConfig {
+            family: theme.font_family.clone(),
+            size_pt: theme.font_size,
+            scale: 1.0,
+            fallback: Vec::new(),
+        })?;
+        *slot = Some(fonts.clone());
+        Ok(fonts)
+    }
+
+    /// Resizes session `id` to follow its view; `None` (an empty surface)
+    /// leaves it alone. A failure is logged: the view itself is fine.
+    fn follow_view(&self, id: SessionId, size: Option<PtySize>) {
+        if let Some(size) = size
+            && let Err(error) = self.resize(id, size)
+        {
+            tracing::warn!(session = %id, %error, ?size, "resizing a session to its view failed");
+        }
+    }
+
     /// Panics while holding the session table lock, poisoning it.
     ///
     /// Exists only so tests can prove that a panic caught at the FFI
@@ -427,11 +714,25 @@ impl App {
         let _sessions = lock(&self.sessions);
         panic!("deliberate panic for testing");
     }
+
+    /// Panics while holding the view table lock, poisoning it.
+    ///
+    /// Exists only so tests can prove that a panic inside a view call
+    /// caught at the FFI boundary leaves the views usable.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn panic_holding_view_lock(&self) {
+        let _views = lock(&self.views);
+        panic!("deliberate panic for testing");
+    }
 }
 
 impl Drop for App {
-    /// Closes every session and joins its threads.
+    /// Detaches every view, then closes every session and joins its
+    /// threads.
     fn drop(&mut self) {
+        let views: Vec<_> = lock(&self.views).drain().collect();
+        drop(views);
         let sessions: Vec<_> = lock(&self.sessions)
             .drain()
             .map(|(_, session)| session)
@@ -484,6 +785,8 @@ mod tests {
         broken: Arc<AtomicBool>,
         /// While set, `try_write` panics.
         panics: Arc<AtomicBool>,
+        /// Every size the PTY was resized to.
+        resizes: Arc<Mutex<Vec<PtySize>>>,
     }
 
     impl FakePty {
@@ -511,7 +814,8 @@ mod tests {
             self.write(bytes)
         }
 
-        fn resize(&mut self, _size: PtySize) -> Result<(), PtyError> {
+        fn resize(&mut self, size: PtySize) -> Result<(), PtyError> {
+            lock(&self.resizes).push(size);
             Ok(())
         }
 
@@ -550,6 +854,7 @@ mod tests {
         would_block: Arc<AtomicBool>,
         broken: Arc<AtomicBool>,
         panics: Arc<AtomicBool>,
+        resizes: Arc<Mutex<Vec<PtySize>>>,
     }
 
     impl Fake {
@@ -580,6 +885,7 @@ mod tests {
         let would_block = Arc::new(AtomicBool::new(false));
         let broken = Arc::new(AtomicBool::new(false));
         let panics = Arc::new(AtomicBool::new(false));
+        let resizes = Arc::new(Mutex::new(Vec::new()));
         let pty = FakePty {
             events: Arc::clone(&events),
             written: Arc::clone(&written),
@@ -589,6 +895,7 @@ mod tests {
             ignore_kill,
             broken: Arc::clone(&broken),
             panics: Arc::clone(&panics),
+            resizes: Arc::clone(&resizes),
         };
         let id = app.allocate_id();
         app.attach(id, Box::new(pty), rx, PtySize::default())
@@ -602,6 +909,7 @@ mod tests {
                 would_block,
                 broken,
                 panics,
+                resizes,
             },
         )
     }
@@ -1385,6 +1693,61 @@ mod tests {
         assert!(matches!(result, Err(Error::Write { .. })), "{result:?}");
         assert!(lock(&fake.written).is_empty());
         fake.exit(ExitStatus::Signaled(1));
+    }
+
+    #[test]
+    fn view_calls_need_a_live_session_and_a_view() {
+        let app = app();
+        let (id, _fake) = attach_fake(&app, false);
+        let size = PhysicalSize::new(800, 600);
+        let no_view = |result: Result<()>| matches!(result, Err(Error::NoView(i)) if i == id);
+        assert!(!app.has_view(id).unwrap());
+        assert!(no_view(app.resize_view(id, size, 2.0)));
+        assert!(no_view(app.set_view_font_size(id, 14.0)));
+        assert!(no_view(app.detach_view(id)));
+        assert!(matches!(app.render_view(id), Err(Error::NoView(i)) if i == id));
+        assert!(matches!(app.view_size(id), Err(Error::NoView(i)) if i == id));
+        assert!(matches!(app.view_font_size(id), Err(Error::NoView(_))));
+        assert!(matches!(app.view_cell_metrics(id), Err(Error::NoView(_))));
+        assert_eq!(app.view_ids(), Vec::<SessionId>::new());
+
+        let gone = SessionId::from_raw(99);
+        let not_found =
+            |result: Result<()>| matches!(result, Err(Error::SessionNotFound(i)) if i == gone);
+        assert!(matches!(app.has_view(gone), Err(Error::SessionNotFound(_))));
+        assert!(not_found(app.resize_view(gone, size, 1.0)));
+        assert!(not_found(app.set_view_font_size(gone, 14.0)));
+        assert!(not_found(app.detach_view(gone)));
+        assert!(matches!(
+            app.render_view(gone),
+            Err(Error::SessionNotFound(_))
+        ));
+
+        app.close_session(id).unwrap();
+        assert!(matches!(app.has_view(id), Err(Error::SessionNotFound(_))));
+        assert_eq!(app.view_ids(), Vec::<SessionId>::new());
+    }
+
+    #[test]
+    fn the_session_follows_its_view_unless_the_view_is_empty() {
+        let app = app();
+        let (id, fake) = attach_fake(&app, false);
+        let size = PtySize::new(39, 99).with_pixels(800, 600);
+        app.follow_view(id, Some(size));
+        app.follow_view(id, None);
+        assert_eq!(*lock(&fake.resizes), [size]);
+        // A session that is gone is logged, not reported.
+        app.follow_view(SessionId::from_raw(99), Some(size));
+    }
+
+    #[test]
+    fn the_view_table_survives_a_panic() {
+        let app = app();
+        let (id, _fake) = attach_fake(&app, false);
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| app.panic_holding_view_lock()));
+        assert!(result.is_err());
+        assert!(!app.has_view(id).unwrap());
+        assert!(matches!(app.detach_view(id), Err(Error::NoView(_))));
     }
 
     #[test]
