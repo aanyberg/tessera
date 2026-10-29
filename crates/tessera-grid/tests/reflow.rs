@@ -288,6 +288,12 @@ fn logical_texts(grid: &Grid) -> Vec<String> {
 /// whether it is a default blank.
 fn logical_units(grid: &Grid) -> Vec<Vec<(String, bool)>> {
     let lines: Vec<&Line> = grid.logical_lines().collect();
+    logical_units_of(&lines)
+}
+
+/// [`logical_units`] of the rows `lines` alone (the last one ends a line
+/// whatever its wrap flag).
+fn logical_units_of(lines: &[&Line]) -> Vec<Vec<(String, bool)>> {
     let mut out = Vec::new();
     let mut current = Vec::new();
     for (i, line) in lines.iter().enumerate() {
@@ -311,7 +317,10 @@ fn row_units(line: &Line, next: Option<&Line>) -> Vec<(String, bool)> {
                 Some(text) if c.is_cluster() => text.to_owned(),
                 _ => c.ch.to_string(),
             };
-            (text, *c == Cell::BLANK)
+            // Padding with nothing after it (the last row of the rows
+            // looked at) is trimmed like a default blank, as a re-wrap
+            // trims it.
+            (text, *c == Cell::BLANK || c.is_pad())
         })
         .collect()
 }
@@ -688,6 +697,281 @@ proptest! {
             copy.resize(rows, c0);
             prop_assert_eq!(logical_texts(&copy), texts.clone(), "back from {}", via);
             prop_assert_eq!(cursor_position(&copy), cursor, "back from {}", via);
+        }
+    }
+}
+
+// ------------------------------------------------- #86: screen round trips
+
+/// The visible rows of the primary screen: cells and wrap flags.
+fn screen_rows(grid: &Grid) -> Vec<(Vec<Cell>, bool)> {
+    grid.visible_lines()
+        .iter()
+        .map(|line| (line.cells.clone(), line.wrapped))
+        .collect()
+}
+
+/// Test oracle for ADR 0009's "anchored at the bottom by the cursor"
+/// (#86): the cursor is on the last row, or every row from its row to the
+/// one before the last is wrapped.
+fn cursor_anchored(grid: &Grid) -> bool {
+    let rows = grid.visible_lines();
+    rows[usize::from(grid.cursor().row)..rows.len() - 1]
+        .iter()
+        .all(|line| line.wrapped)
+}
+
+/// Test oracle for "a resize may take history back": the screen has
+/// scrolled since it was last cleared, or its cursor anchors it.
+fn anchored(grid: &Grid) -> bool {
+    grid.scrolled_since_clear() || cursor_anchored(grid)
+}
+
+/// True when the last visible row is an empty, unwrapped row below the
+/// cursor (so a narrow or shrink pushed nothing from the screen).
+fn blank_row_below_cursor(grid: &Grid) -> bool {
+    let rows = grid.visible_lines();
+    let last = rows.len() - 1;
+    usize::from(grid.cursor().row) < last
+        && !rows[last].wrapped
+        && rows[last].marks.is_empty()
+        && rows[last].cells.iter().all(|cell| *cell == Cell::BLANK)
+}
+
+/// A shell session on a `rows` x `cols` grid: `output` lines (which go to
+/// history once they leave the screen), then a line break and `scroll`
+/// more (empty lines that scroll the output up into history), and, when
+/// `clear` is set, ED 2 with the cursor on row `prompt_row` (as `clear`
+/// runs after Enter); then `after` lines, and the cursor moved up `up`
+/// rows. Trailing spaces are trimmed from every line: a wrapped row of
+/// trailing default blanks is trimmed by any re-wrap, so it cannot
+/// round-trip (ADR 0009, *Trim*).
+///
+/// Also returns whether the clear erased the continuation of a line whose
+/// head is in history (output taller than the screen): the rows written
+/// there afterwards continue that line where no re-wrap would put them,
+/// so no re-wrap gives them back after a round trip either.
+#[allow(clippy::too_many_arguments)]
+fn session(
+    rows: u16,
+    cols: u16,
+    output: &[String],
+    scroll: u16,
+    clear: bool,
+    prompt_row: u16,
+    after: &[String],
+    up: u16,
+) -> (Grid, bool) {
+    let trim = |lines: &[String]| -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.trim_end_matches(' ').to_owned())
+            .collect()
+    };
+    let mut grid = Grid::new(rows, cols);
+    write_lines(&mut grid, &trim(output));
+    for _ in 0..=scroll {
+        grid.carriage_return();
+        grid.line_feed();
+    }
+    let broke = clear && top_row_continues(&grid);
+    if clear {
+        grid.erase_in_display(EraseDisplay::All);
+        grid.goto(prompt_row.min(rows - 1), 0);
+    }
+    write_lines(&mut grid, &trim(after));
+    grid.cursor_up(up);
+    (grid, broke)
+}
+
+/// What follows the clear in [`session`]: as many lines as
+/// [`text_lines`] (the screen usually ends up anchored at the bottom), or,
+/// `short` times as often, at most two short ones (a prompt on a mostly
+/// empty screen).
+fn after_clear(wide: bool, short: u32) -> impl Strategy<Value = Vec<String>> {
+    prop_oneof![
+        1 => text_lines(wide),
+        short => prop::collection::vec(prop::collection::vec(piece(wide), 0..10), 0..3)
+            .prop_map(|lines| lines.into_iter().map(|pieces| pieces.concat()).collect()),
+    ]
+}
+
+/// The text of each logical line among `lines` alone, as
+/// [`logical_texts`] gives it (trailing default blanks and trailing empty
+/// lines dropped).
+fn texts_of<'a>(lines: impl IntoIterator<Item = &'a Line>) -> Vec<String> {
+    let lines: Vec<&Line> = lines.into_iter().collect();
+    let mut texts: Vec<String> = logical_units_of(&lines)
+        .into_iter()
+        .map(|mut units| {
+            while units.last().is_some_and(|(_, blank)| *blank) {
+                units.pop();
+            }
+            units.into_iter().map(|(text, _)| text).collect()
+        })
+        .collect();
+    while texts.last().is_some_and(String::is_empty) {
+        texts.pop();
+    }
+    texts
+}
+
+/// The logical lines of the scrollback alone and of the screen alone.
+fn split_texts(grid: &Grid) -> (Vec<String>, Vec<String>) {
+    let history = (0..grid.scrollback_len()).filter_map(|i| grid.scrollback_line(i));
+    (texts_of(history), texts_of(grid.visible_lines()))
+}
+
+/// True when the top screen row continues a wrapped line from history.
+fn top_row_continues(grid: &Grid) -> bool {
+    grid.scrollback_len()
+        .checked_sub(1)
+        .and_then(|last| grid.scrollback_line(last))
+        .is_some_and(|line| line.wrapped)
+}
+
+/// Whether the round trip through `mid` must restore `before`'s screen
+/// (ADR 0009, amendment for #86):
+///
+/// - A screen that has scrolled is one buffer anchored at the bottom: the
+///   narrow pushes rows into history and the widen pulls them back, as
+///   long as no blank row below the cursor absorbed growth on the way
+///   (that row is gone, and the widen fills from history instead).
+/// - A cleared screen anchored by its cursor before and after behaves
+///   the same.
+/// - Any other cleared screen round-trips when its top row starts its own
+///   line and the intermediate screen still holds a blank row below its
+///   cursor (nothing was pushed). The rest is ambiguous after the fact:
+///   blank rows absorbed *and* rows pushed look like rows pushed only, and
+///   the row a straddling line shares between history and the screen
+///   moves to the screen at the narrow (D4) and takes the rest of its row
+///   at the widen.
+fn round_trip_applies(before: &Grid, mid: &Grid) -> bool {
+    if before.scrolled_since_clear() {
+        !blank_row_below_cursor(before) && !blank_row_below_cursor(mid)
+    } else if cursor_anchored(before) {
+        cursor_anchored(mid)
+    } else {
+        !top_row_continues(before) && !anchored(mid) && blank_row_below_cursor(mid)
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(192))]
+
+    /// #86 Done-when property: a column change and back leaves the visible
+    /// screen as it was whenever the round trip is unambiguous
+    /// ([`round_trip_applies`]) and nothing was cut by the history cap (the
+    /// default 10 000 lines here), for screens anchored at the bottom and
+    /// for cleared screens with a prompt anywhere, history included.
+    #[test]
+    fn a_column_round_trip_restores_the_screen(
+        rows in 1..9u16,
+        c0 in 2..14u16,
+        via in 2..30u16,
+        output in text_lines(true),
+        scroll in 0..12u16,
+        clear in prop::bool::weighted(0.75),
+        prompt_row in 0..4u16,
+        after in after_clear(true, 2),
+        up in prop_oneof![1 => Just(0u16), 1 => 0..4u16],
+    ) {
+        prop_assume!(via != c0);
+        let (grid, broke) = session(rows, c0, &output, scroll, clear, prompt_row, &after, up);
+        prop_assume!(!broke);
+        let mut copy = grid.clone();
+        copy.resize(rows, via);
+        assert_invariants("there", &copy);
+        prop_assume!(round_trip_applies(&grid, &copy));
+        copy.resize(rows, c0);
+        assert_invariants("and back", &copy);
+        prop_assert_eq!(screen_rows(&copy), screen_rows(&grid), "via {} columns", via);
+    }
+
+    /// #86 repro 2 as a property: shrinking the height and growing it back
+    /// leaves the visible screen and the history as they were whenever
+    /// the round trip is unambiguous: a screen anchored at the bottom gets
+    /// back the rows it pushed, any other screen only lost blank rows and
+    /// gets them back without touching history. Repeating it changes
+    /// nothing either.
+    #[test]
+    fn a_row_round_trip_restores_the_screen(
+        rows in 2..12u16,
+        cols in 1..14u16,
+        shrink in prop_oneof![3 => 1..3u16, 1 => 1..11u16],
+        output in text_lines(false),
+        scroll in 0..12u16,
+        clear in prop::bool::weighted(0.75),
+        prompt_row in 0..6u16,
+        after in after_clear(false, 4),
+        up in prop_oneof![1 => Just(0u16), 1 => 0..4u16],
+    ) {
+        let r1 = rows - shrink.min(rows - 1);
+        let (grid, broke) = session(rows, cols, &output, scroll, clear, prompt_row, &after, up);
+        prop_assume!(!broke);
+        let history = grid.scrollback_len();
+        let mut copy = grid.clone();
+        for cycle in 0..3 {
+            copy.resize(r1, cols);
+            assert_invariants("shrunk", &copy);
+            // The cursor's row stayed on the screen (one pushed into
+            // history leaves the cursor on row 0 of other text, fixture
+            // D06), and the shrink is unambiguous.
+            let line = |g: &Grid| g.scrollback_len() + usize::from(g.cursor().row);
+            // A screen that has scrolled grows back by pulling history, so
+            // the shrink must have pushed rows only (no blank row below
+            // the cursor dropped). On a cleared screen a shrink that only
+            // dropped blank rows but left the cursor on the last row is
+            // ambiguous: the grow pulls history (lead decision D2,
+            // ghostty).
+            let applies = line(&copy) == line(&grid)
+                && if grid.scrolled_since_clear() {
+                    copy.scrollback_len() == history + usize::from(rows - r1)
+                } else {
+                    cursor_anchored(&copy) == cursor_anchored(&grid)
+                        && (cursor_anchored(&grid) || copy.scrollback_len() == history)
+                };
+            prop_assume!(applies);
+            copy.resize(rows, cols);
+            assert_invariants("grown", &copy);
+            prop_assert_eq!(screen_rows(&copy), screen_rows(&grid), "cycle {}", cycle);
+            prop_assert_eq!(copy.cursor(), grid.cursor(), "cycle {}", cycle);
+            prop_assert_eq!(copy.scrollback_len(), history, "cycle {}", cycle);
+        }
+    }
+
+    /// #86, the rule itself: a screen that is not anchored at the bottom
+    /// never takes history back, whatever the resize (narrower, wider,
+    /// taller). When the screen block still fits (a blank row is left
+    /// below the cursor, so nothing was pushed either), history and screen
+    /// keep exactly their own logical lines: the history's lines only
+    /// re-wrap where they are and the screen's lines start on its top row.
+    #[test]
+    fn history_never_refills_a_screen_not_anchored(
+        rows in 3..9u16,
+        c0 in 2..14u16,
+        size in (1..12u16, 2..30u16),
+        output in text_lines(true),
+        scroll in 0..12u16,
+        prompt_row in 0..4u16,
+        after in prop::collection::vec(prop::collection::vec(piece(true), 0..12), 1..3)
+            .prop_map(|lines| lines.into_iter().map(|p| p.concat()).collect::<Vec<_>>()),
+        up in 0..3u16,
+    ) {
+        let (mut grid, _) = session(rows, c0, &output, scroll, true, prompt_row, &after, up);
+        // A top row continuing a line from history shares its first output
+        // row with that line (D4) unless it is empty (ED 2 under a wrapped
+        // line), when it stays a blank row of its own.
+        let top_blank = grid.visible_lines()[0].cells.iter().all(|c| *c == Cell::BLANK);
+        prop_assume!(!anchored(&grid) && (!top_row_continues(&grid) || top_blank));
+        let (history, screen) = split_texts(&grid);
+        let (r1, c1) = (size.0.max(rows), size.1);
+        grid.resize(r1, c1);
+        assert_invariants("after", &grid);
+        if blank_row_below_cursor(&grid) {
+            let (history_after, screen_after) = split_texts(&grid);
+            prop_assert_eq!(history_after, history, "history keeps its lines");
+            prop_assert_eq!(screen_after, screen, "the screen keeps its lines");
         }
     }
 }
@@ -1483,4 +1767,149 @@ fn a_bounded_rewrap_keeps_marks_and_a_cursor_past_the_text() {
         }
         assert!(marked > 0, "{lines}: the kept history has marks");
     }
+}
+
+/// #86 verify cycle 1: what sets and clears `scrolled_since_clear`. Set
+/// when a line feed at the bottom of a full-screen region pushes a row of
+/// the primary screen into history; cleared by ED 2, ED 3 and RIS on the
+/// primary screen; nothing else touches it (not ED 0 or ED 1, erasing a
+/// line, cursor motion, a resize, a partial scroll region, or anything on
+/// the alternate screen).
+#[test]
+fn scrolled_since_clear_follows_scrolls_and_clears() {
+    let mut grid = Grid::new(3, 4);
+    let feed = |grid: &mut Grid, n: usize| {
+        for _ in 0..n {
+            grid.carriage_return();
+            grid.line_feed();
+        }
+    };
+    assert!(!grid.scrolled_since_clear(), "new");
+    feed(&mut grid, 2);
+    assert!(!grid.scrolled_since_clear(), "no row left the screen yet");
+    grid.set_scroll_region(0, 1);
+    grid.goto(1, 0);
+    feed(&mut grid, 3);
+    assert!(
+        !grid.scrolled_since_clear(),
+        "a partial region keeps no history"
+    );
+    grid.set_scroll_region(0, 2);
+    grid.goto(2, 0);
+    feed(&mut grid, 1);
+    assert!(grid.scrolled_since_clear(), "a row went into history");
+    for (what, op) in [
+        (
+            "ED 0 on row 0 off home",
+            &(|g: &mut Grid| {
+                let cursor = g.cursor();
+                g.goto(0, 2);
+                g.erase_in_display(EraseDisplay::Below);
+                g.goto(cursor.row, cursor.col);
+            }) as &dyn Fn(&mut Grid),
+        ),
+        (
+            "ED 0",
+            &(|g: &mut Grid| g.erase_in_display(EraseDisplay::Below)) as &dyn Fn(&mut Grid),
+        ),
+        ("ED 1", &|g: &mut Grid| {
+            g.erase_in_display(EraseDisplay::Above);
+        }),
+        ("EL 2", &|g: &mut Grid| g.erase_in_line(EraseLine::All)),
+        ("goto", &|g: &mut Grid| g.goto(0, 0)),
+        ("resize", &|g: &mut Grid| g.resize(5, 7)),
+        ("alt ED 2", &|g: &mut Grid| {
+            g.enter_alt_screen();
+            g.erase_in_display(EraseDisplay::All);
+            g.leave_alt_screen();
+        }),
+    ] {
+        op(&mut grid);
+        assert!(grid.scrolled_since_clear(), "{what} keeps it");
+    }
+    grid.erase_in_display(EraseDisplay::All);
+    assert!(!grid.scrolled_since_clear(), "ED 2 clears it");
+    grid.enter_alt_screen();
+    let rows = usize::from(grid.rows());
+    feed(&mut grid, rows * 2);
+    grid.leave_alt_screen();
+    assert!(
+        !grid.scrolled_since_clear(),
+        "the alternate screen keeps no history"
+    );
+    feed(&mut grid, rows);
+    assert!(grid.scrolled_since_clear());
+    grid.erase_in_display(EraseDisplay::Scrollback);
+    assert!(
+        grid.scrolled_since_clear(),
+        "ED 3 keeps it: the screen still shows what scrolled"
+    );
+    grid.goto(0, 0);
+    grid.erase_in_display(EraseDisplay::Below);
+    assert!(!grid.scrolled_since_clear(), "ED 0 from home clears it");
+    // A screenful written without scrolling, cursor on the last row.
+    let fill = |grid: &mut Grid| {
+        for row in 0..grid.rows() {
+            grid.goto(row, 0);
+            grid.put_str("x");
+        }
+    };
+    fill(&mut grid);
+    grid.resize(grid.rows() + 2, grid.cols());
+    assert!(!grid.scrolled_since_clear(), "a resize that pushes nothing");
+    grid.erase_in_display(EraseDisplay::All);
+    fill(&mut grid);
+    grid.resize(2, grid.cols());
+    assert!(
+        grid.scrolled_since_clear(),
+        "a resize that pushes rows sets it"
+    );
+    grid.erase_in_display(EraseDisplay::All);
+    fill(&mut grid);
+    grid.enter_alt_screen();
+    grid.resize(1, grid.cols());
+    assert!(
+        grid.scrolled_since_clear(),
+        "so does one that pushes rows of the stashed primary screen"
+    );
+    grid.leave_alt_screen();
+    grid.reset();
+    assert!(!grid.scrolled_since_clear(), "RIS clears it");
+}
+
+/// #86 verify cycle 2: RIS ends the newest history line like ED 2 (the
+/// top row that continued it is blank now). ED 0 from home on a top row
+/// that continues the newest history line is a shell redrawing that line,
+/// not a clear: the line and the bit stay; on a top row of its own it is
+/// a clear and ends the newest line (a no-op there).
+#[test]
+fn whole_screen_erases_end_the_newest_history_line() {
+    let newest = |g: &Grid| g.scrollback_line(g.scrollback_len() - 1).map(|l| l.wrapped);
+    for erase in [
+        &(|g: &mut Grid| g.reset()) as &dyn Fn(&mut Grid),
+        &|g: &mut Grid| g.erase_in_display(EraseDisplay::All),
+    ] {
+        let mut grid = Grid::new(2, 4);
+        grid.put_str("abcdefghijkl");
+        assert_eq!(newest(&grid), Some(true));
+        erase(&mut grid);
+        assert_eq!(newest(&grid), Some(false));
+        assert!(!grid.scrolled_since_clear());
+    }
+    let mut grid = Grid::new(2, 4);
+    grid.put_str("abcdefghijkl");
+    grid.goto(0, 0);
+    grid.erase_in_display(EraseDisplay::Below);
+    assert_eq!(newest(&grid), Some(true), "a redraw keeps the line");
+    assert!(grid.scrolled_since_clear(), "and the bit");
+    let mut grid = Grid::new(2, 4);
+    grid.put_str("abcdefghij");
+    for _ in 0..2 {
+        grid.carriage_return();
+        grid.line_feed();
+    }
+    grid.put_str("xy");
+    grid.goto(0, 0);
+    grid.erase_in_display(EraseDisplay::Below);
+    assert!(!grid.scrolled_since_clear(), "a clear on a row of its own");
 }

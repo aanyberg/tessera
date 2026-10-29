@@ -61,6 +61,13 @@ Rows change first, at the old width, then columns (Alacritty's order).
   `resizeGravity`; WezTerm and iTerm2 refill the whole window, kitty adds
   blank rows by default). The cursor moves down with its text. Rows that
   history cannot fill are blank default rows at the bottom.
+
+  *Amended 2026-10-29 (#86):* a screen that has not scrolled since it
+  was last cleared pulls history only when its cursor anchors it at the
+  bottom (the cursor is on the last row, or its logical line ends there);
+  any other cleared screen, such as a prompt after Ctrl-L, grows by blank
+  rows at the bottom, so shrinking by one row and growing back never
+  pulls a line that was not on the screen (below).
 - Shrinking first drops blank rows below the cursor (every cell
   `Cell::BLANK` or a `PAD` cell of any style, no marks, not wrapped), then
   pushes rows from the top into scrollback, evicting the oldest lines past
@@ -139,7 +146,9 @@ joined.
   the prompt at the top of an otherwise empty screen, the blank rows are
   dropped and the window moves up with the buffer: the prompt goes to the
   bottom and older output reappears above it, as in WezTerm. Keeping such
-  a prompt in place is a possible follow-up, not this design. History is
+  a prompt in place is a possible follow-up, not this design.
+  *For a screen cleared since it last scrolled, superseded 2026-10-29 by
+  the amendment below (#86).* History is
   cut to the cap, oldest first; a cut may start history in the middle of a
   logical line. While re-wrapping, the output never holds more than twice
   the cap plus four times the screen (at least 1024 rows): once it reaches
@@ -149,6 +158,219 @@ joined.
   margin of a second screen is what the prune may still remove afterwards;
   a row dropped this way takes its marks with it, as the history cap
   would.
+
+### Amendment 2026-10-29: a cleared screen keeps its rows (#86)
+
+Issue #86: after `ESC[H ESC[2J` the prompt sits on row 0 of an empty
+screen; narrowing 80 -> 40 columns doubled the rows of 100 history lines,
+step 2e counted that growth, dropped the 23 blank rows and moved the
+window up, so old output filled the screen and the prompt went to row
+23. Widening did not undo it, and alternating the height by one row
+pulled one more history line per cycle (row grow pulled
+`min(growth, history)` wherever the cursor was). The milestone lead
+adopted the spec researcher's fixture `reflow_after_clear_spec.txt`
+(cases R86-01..R86-10, derived from the resize code of kitty, ghostty,
+Alacritty, WezTerm and iTerm2; nothing was run in an emulator) as lead
+decisions D1-D4 of brief #86, and after verify cycle 1 the memory bit
+below (lead decisions, 2026-10-29: the bit after verify cycle 1, E1, E2
+and m1 of review round 2).
+
+**One bit of memory: `Grid::scrolled_since_clear`.** The rule cannot be
+read from the cells. zsh with a right prompt (powerlevel10k has one by
+default), scrolled to the bottom, redraws its prompt on `SIGWINCH` with
+`CR ED 0`: after a narrow re-wrapped the prompt to two rows, the redraw
+puts it back on one and leaves a blank row below the cursor. A screen
+cleared with Ctrl-L (`ESC[H ESC[2J`) has its prompt on row 0 and blank
+rows below it too. Only the amount of blank space tells them apart, and
+a rule built on that breaks one or the other (the first design, without
+memory, moved that zsh prompt from row 22 to row 11 on the widen, with
+eleven rows of output pushed into history). So the primary screen
+remembers whether rows of it have gone into history since it was last
+cleared:
+
+- *Set* when a line feed or SU with the full screen as scroll region
+  moves a row of the primary screen off its top (also with a history cap
+  of zero, which keeps nothing: harmless, and equal to the code before
+  #86 since there is nothing to pull), and when a resize pushes rows that
+  were on the primary screen into history: a height shrink that pushes,
+  or a re-wrap whose screen block is still longer than the screen after
+  the blank rows below the cursor absorbed what they could. Either way
+  the screen's content has reached its bottom. The stashed primary
+  screen behind the alternate screen counts too (lead decision E2).
+- *Cleared* when the primary screen is erased whole: ED 2, ED 0 with the
+  cursor at the home position (the `clear` of vt100, screen, tmux and
+  linux terminfo, and Node's `console.clear`; lead decision m1) unless
+  the top row continues the newest history line (below), and RIS. Each
+  also ends the newest history line (clears its wrap flag, in O(1)): the
+  top row that may have continued it is blank now, and the prompt
+  written there next is a line of its own, not glued to the old output
+  by a later re-wrap. (`Grid::reset` keeps scrollback, so only a
+  direct `Grid` user sees that for RIS; `tessera-term` clears history
+  separately.)
+- *Unchanged* by everything else: ED 3 and `clear_scrollback` (they empty
+  history but leave a screen full of scrolled output; clearing the bit
+  there brought the right-prompt jump back, lead decision E1; `clear` is
+  ED 2 plus ED 3 and is cleared by its ED 2), ED 0 anywhere but home (a
+  shell's prompt redraw: zsh's `CR ED 0` starts on the prompt's first
+  row, which on a scrolled screen is below the top), ED 0 from home when
+  the top row continues the newest history line (lead decision after
+  review round 2: a narrow made the prompt line taller than the window
+  and pushed its first row into history, so zsh's redraw starts at home;
+  that is a redraw of a line that started above the screen, not a
+  clear), ED 1, EL, cursor motion, DECSTR, a resize that
+  pushes nothing (a narrow absorbed by blank rows, any grow), a partial
+  scroll region (it keeps no history), and anything on the alternate
+  screen (it has no history; ED 2 there leaves the primary screen's bit
+  alone).
+
+It is placement state only: it is in `Debug` and `Clone`, changes no
+cell, damages no row, and a grid's other observable state is the same
+whichever way it is set until the next resize.
+
+**A screen that has scrolled** is continuous with its history and is
+resized exactly as before #86 (above): one buffer anchored at the
+bottom, blank rows below the cursor absorbing growth wherever it comes
+from, a height grow pulling history. `cargo xtask ab diff` checks it
+against the code before #86 on random scripts (cursor anywhere,
+including right prompts redrawn after every resize): no difference,
+except after an earlier ED 2 cut a wrapped history line, which now ends
+there (by design, above).
+
+The narrowed ED 0 rule has two costs. A vt100 `clear` (`ESC[H ESC[J`)
+issued while the top row continues a wrapped history line looks like
+that redraw and does not count as a clear (`ESC[2J` does; test
+`a_vt100_clear_inside_a_wrapped_line_is_not_a_clear`). And when a narrow
+makes the prompt line exactly as tall as the window, its first row is
+row 0 and starts a line of its own, so zsh's redraw from home is
+indistinguishable from a clear and counts as one: the widen then keeps
+the prompt at the top instead of pulling history back. Only tiny windows
+get there: the A/B diff's random right-prompt sessions meet it in 1,658
+of 20,000 sessions of 2-30 rows (10,167 of 20,000 with 40-80 drastic
+resizes each) and in none of 20,000 of 10-30 rows (none either with
+40-80 drastic resizes each); before the narrowing it was 2,256 of
+20,000 of 2-30 rows.
+
+Setting the bit on a resize that pushed (E2) has a cost the adversarial
+recordings show: after Ctrl-L and a screenful of output (the prompt on
+the last row), a narrow pushes the top rows into history, and from then
+on the screen is resized as before #86, so a drag back pulls the output
+from before the clear (in `zsh_clear_output.rec`, lines L089..L101) back
+onto the screen, as the code before #86 did. Without E2 such a screen,
+with a right prompt redrawn after each resize, moved its prompt from row
+22 to row 11 on the widen (test
+`a_cleared_screen_filled_to_the_bottom_stays_at_the_bottom`); a prompt
+that stays at the bottom wins. A cleared screen whose content never
+reached the bottom (the #86 repros: a narrow absorbed by the blank rows
+below the prompt) pushes nothing and keeps its rows.
+
+**A cleared screen** (no rows of it have gone into history since the
+clear; its history can still change, as a narrow re-wraps it or a grow
+of a screen anchored by its cursor pulls rows back):
+
+- **Columns (D1, step 2e).** The *screen block* is the re-wrapped rows
+  from the one holding the old top screen row's first cell to the end.
+  Only its growth counts: blank rows below the cursor absorb it first
+  (D3, unchanged; kitty and WezTerm do the same, Alacritty, ghostty and
+  iTerm2 keep the blank rows), then the block's top rows go into history.
+  Lines wholly in history only lengthen or shorten history. A block
+  shorter than the screen (a widen, or a trim) takes rows back from
+  history only when the cursor anchors the screen at the bottom (below);
+  otherwise it keeps its place and blank rows fill the bottom. kitty
+  (screen rows re-wrapped into a screen that starts at row 0,
+  `kitty/resize.c` `rewrap`), ghostty (`PageList.resizeCols` keeps the
+  rows below the cursor; its comment names this very case), Alacritty
+  (`shrink_columns` moves the cursor only for rows at or below it) and
+  iTerm2 keep the prompt on row 0 when narrowing after a clear. WezTerm
+  does not: it prunes the blank rows below the cursor and then shows the
+  last `rows` rows of the buffer (`term/src/screen.rs` `resize`), which
+  is what Tessera did before.
+- **Rows (D2, step 1).** A height grow pulls history only when the
+  cursor anchors the screen at the bottom (a shrink that pushed rows has
+  set the bit, so the grow back pulls them): ghostty's rule
+  (`PageList.resizeWithoutReflow` pulls only when the cursor is on the
+  last row); kitty never pulls by default
+  (`scrollback_fill_enlarged_window`). Alacritty's `grow_lines` and
+  WezTerm pull whatever the cursor row, which is the drift #86 reports.
+- **Anchored by the cursor.** Tessera extends ghostty's "cursor on the
+  last row" to a cursor whose logical line ends on the last row (its row
+  and every row below it but the last are wrapped; milestone lead,
+  2026-10-29), one predicate for rows and columns. The reason is the
+  cursor moved to the start of a long wrapped command line (Ctrl-A in
+  readline): a narrow pushes the top rows into history and splits the
+  command so the cursor is no longer on the last row, and a shrink does
+  the same by rows. Before #86 the widen or grow pulled those rows back;
+  under ghostty's literal rule it would not. With the wider predicate
+  such a screen stays anchored through a narrow or a shrink, so both
+  round trips restore it (test
+  `a_cursor_inside_a_wrapped_last_line_stays_anchored`, on a screen that
+  has scrolled and so pinned by the bit as well).
+- **A line straddling history and the screen (D4).** No emulator
+  documents it. The block starts at the output row holding the old top
+  row's first cell, so the cells before it on that row come onto the
+  screen with it, as a cursor there would (on a wide character dropped at
+  one column: the row the next kept cell starts). A top row that
+  continues a history line but holds only its trailing blanks (EL 2 on
+  the top row erases the continuation but not the wrap flag of the
+  history row above; ED 2 now ends that line) has no text on the screen:
+  it stays a blank row of its own, with the cursor if it was there, and
+  the line stays in history.
+
+What a round trip restores, pinned by property tests (`tests/reflow.rs`,
+`a_column_round_trip_restores_the_screen`,
+`a_row_round_trip_restores_the_screen`,
+`history_never_refills_a_screen_not_anchored`): a column or row change
+and back gives the same screen when the screen has scrolled and no
+blank row below the cursor absorbed growth on the way; when it is
+cleared and the cursor anchors it before and after; and when it is
+cleared, not anchored, starts with a line of its own and the first
+change still leaves a blank row below the cursor (nothing was pushed).
+The rest is ambiguous even with the bit: on a cleared screen a narrow
+whose growth both used up the blank rows and pushed rows into history
+leaves the same state as one that only pushed; a shrink that drops blank
+rows until the cursor reaches the last row anchors the screen, so the
+grow pulls history (ghostty does the same); and a straddling line's
+shared row moves to the screen at a narrow and takes the rest of its
+row from history at the widen. In the first two cases a second round
+trip changes nothing more; a straddling line's top row can move back by
+one row of that line per round trip, never past the line's start
+(fixture R86-10's test pins both).
+
+What changed against the code before #86, as `cargo xtask ab diff` on
+random scripts shows: nothing on a screen that has scrolled since it
+was last cleared (except after an ED 2 that cut a wrapped history line,
+by design), nothing without history, and nothing on a cleared
+screen while the cursor anchors it (widths of two columns or more).
+Elsewhere, on a cleared screen, the text is the same (ED 2 now ends the
+history line it cut, so a prompt is no longer glued to old output) and
+only where the screen sits and which blank rows exist differ. One class
+of cleared screen no longer round-trips where it did: content below the
+cursor's line (a full-screen program drawing on the primary screen after
+clearing it, `fzf --height` or a multi-line zsh buffer after Ctrl-L with
+the cursor on an upper line). After a narrow pushed rows of such a
+screen into history, its state cannot be told apart from "blank rows
+absorbed, then rows pushed", which must not pull history back; ghostty
+behaves the same (it keeps the rows below the cursor and pulls history
+only for a cursor on the last row), and such programs redraw on
+`SIGWINCH` anyway. The critic's round-1 example of this class (eight
+7-character lines on a 4x8 screen, cursor moved to row 0, narrow to 4
+columns and widen back) has scrolled, so it round-trips as before. At
+one column a line whose wide characters are dropped can end in an empty
+row below a cursor anchored by its wrapped line; on a cleared screen
+that row absorbs only the growth of the screen's own rows.
+
+vim, less, htop, tmux and other full-screen programs that switch to the
+alternate screen with DECSET 1049 draw on the primary screen today,
+because `tessera-term` does not implement 1049 yet (#8): there a resize
+re-wraps their screen like shell output, and after a clear (which they
+issue) the repaint lands below rows a narrow kept, so a window drag can
+leave copies of their screen in history. That is the accepted class
+until #8, which should land before any release; on the alternate screen
+nothing is re-wrapped.
+
+Existing fixture rows whose outcome changed: none (`D06` changed with the
+first version of this amendment and is back: its shrink pushes `aa` into
+history, which sets the bit, so the grow pulls it back).
+`reflow_spec.txt` steps 1 and 2e/f carry the new rule.
 
 ### The cursor follows its character
 
@@ -242,7 +464,8 @@ screen of the current size (its `debug_assert`s check it).
 - The edges of the model are documented in the fixture: a cursor on
   blanks past the text is clamped rather than remembered (D02), and a
   wide character resized through a one-column grid is gone (B06).
-- The property tests (`tests/reflow.rs`) check P1-P7 of the fixture:
+- The property tests (`tests/reflow.rs`) check P1-P7 of the fixture, and
+  since #86 the screen round trips above:
   resize never panics, every invariant holds on both screens after any
   sequence of operations and resizes, a repeated or same-size resize
   changes nothing, a column change keeps the text of every logical line,
