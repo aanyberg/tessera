@@ -1,7 +1,7 @@
 ---
 name: milestone-lead
 description: Planner and arbiter for a milestone (the lead session delegates to it). Turns GitHub milestone issues into a dependency-ordered queue planned in waves, pre-assigns shared scarce resources (ADR numbers, new workspace dependencies, module names), labels issues by wave, and arbitrates disputes between implementers and critics. Does not write product code.
-model: fable
+model: opus
 effort: medium
 tools: Read, Grep, Glob, Bash, Write
 disallowedTools: Edit

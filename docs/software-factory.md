@@ -9,7 +9,7 @@ by editing the agent file; the lead refers to agents by name only.
 
 | Agent | Responsibility | Model | Effort | Writes code | Commits |
 |---|---|---|---|---|---|
-| `milestone-lead` | Wave queues (`wave:<n>` labels), task briefs, pre-assigned ADR numbers/deps/modules, dispute arbitration | fable | medium | no | no |
+| `milestone-lead` | Wave queues (`wave:<n>` labels), task briefs, pre-assigned ADR numbers/deps/modules, dispute arbitration | opus | medium | no | no |
 | `spec-researcher` | Spec → test table/fixture during planning, before "Done when" is final | sonnet | high | fixtures only | no |
 | `rust-implementer` | One Rust issue in its own worktree, gate green; fixes its own branch on `revise` | opus | high | yes | branch |
 | `swift-implementer` | One macOS app issue in its own worktree; fixes its own branch on `revise` | opus | high | yes | branch |
@@ -23,7 +23,7 @@ by editing the agent file; the lead refers to agents by name only.
 | `flow-analyst` | Post-wave retro from journals and `scripts/factory-stats.sh`: cost/value per role, proposed changes | sonnet | high | retro only | no |
 
 Model aliases map to the current Claude 5 family (`fable` = claude-fable-5-1, `opus` = claude-opus-5-5,
-`sonnet` = claude-sonnet-5-5, `haiku` = claude-haiku-5-5). Fable is reserved for the lead; implementation,
+`sonnet` = claude-sonnet-5-5, `haiku` = claude-haiku-5-5). Fable is not used (token cost); planning, implementation,
 critique, adversarial testing and release engineering run on Opus. Pin a full id in the frontmatter if a role must not follow alias updates.
 
 **Effort by round.** Critique rounds 1 and 2 and verify cycle 1 run at the frontmatter effort: they find the
