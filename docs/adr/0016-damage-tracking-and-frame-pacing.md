@@ -161,7 +161,7 @@ drawable stays on the layer, so an idle terminal does no GPU work.
 It also presents at most one frame per `MIN_FRAME_INTERVAL` =
 `Duration::from_micros(4166)` (1/240 s, the fastest Mac display). A call
 that comes too early captures (the snapshot always holds the newest
-screen) and returns `Skipped`; its damage carries over. Frames are paced
+screen) and returns `Skipped` (`Paced` since #101); its damage carries over. Frames are paced
 on a schedule rather than from the last present: each presented frame is
 due an interval after the previous one's due time, may come up to
 `FRAME_SLACK` early and still count, and its due time never lags the
@@ -196,6 +196,8 @@ per second, at the limit) and about 350 under load, inside the required
 removing it fails the test.
 
 **`Skipped` has three causes, and a host cannot tell them apart yet.**
+(Superseded by the amendment "Distinct paced and not-ready statuses"
+below: the three causes are now three statuses.)
 `FrameStatus::Skipped` (and `TESSERA_FRAME_STATUS_SKIPPED`) means nothing
 was drawn by this call: nothing changed, the call was paced, or the
 surface had nothing to draw into. A host that renders from a display link
@@ -211,7 +213,8 @@ faster than 240 Hz, or in bursts closer than about half an interval, and
 then idles (no display link, no further notification) shows the paced
 call's content late, until something renders again.
 
-**The development window's retry.** `tessera-devwin` (#23) renders on
+**The development window's retry.** (Superseded by the #101 amendment
+below: the cap is gone.) `tessera-devwin` (#23) renders on
 every output and input event and retried every `Skipped` frame one refresh
 (16 ms) later while visible, which was right when `Skipped` only meant "the
 surface was not ready". With the new causes, one render with nothing new
@@ -438,6 +441,76 @@ in `tessera-term` holds one such read under 60 ms in release (best of 5:
 `Grid::clear_to_cursor` (⌘K, "Clear to Start" in Terminal.app, kitty's
 `clear_terminal to_cursor`) shares nothing with reset but its damage: it
 records `All`, since it moves every row up.
+
+### Amendment 2026-10-29: distinct paced and not-ready statuses (#101)
+
+`Skipped` covered three cases a host must treat differently, so every host
+had to retry every skip (and `tessera-devwin` capped the retries to stay
+idle). `tessera_render::FrameStatus` now has three statuses for a frame
+that drew nothing, and a host retries only the two that leave content
+pending:
+
+| status | C value | cause | host |
+|---|---|---|---|
+| `Skipped` | `SKIPPED` = 2 | nothing changed since the last presented frame | do not retry; may idle its display link until output, input, a resize, a focus or font-size change, or a re-theme (`apply_config`, `on_appearance_changed`) |
+| `Paced` | `PACED` = 3 | the frame came sooner than the `MIN_FRAME_INTERVAL` schedule allows | render again on the next refresh |
+| `NotReady` | `NOT_READY` = 4 | the surface had nothing to draw into: zero-sized, occluded, no drawable in time | render again once the surface is ready (next refresh, a resize to a non-zero size, the window showing again) |
+
+`RenderSurface::render` and `clear` report `NotReady` where they reported
+`Skipped`; they never report the other two. `View::render` reports
+`Skipped` and `Paced` itself without touching the GPU and passes the
+surface's status through; damage of a `Paced` or `NotReady` frame stays
+pending, as before, and neither moves the pacing schedule. An unchanged
+frame is `Skipped` even when it is early or the surface is not ready:
+nothing is pending, so there is nothing to retry. The view's private
+`SkipReason` and `last_skip`, which tests used to tell the causes apart,
+are gone: the status says it.
+
+The lead's decisions: two new variants, not a reason field on `Skipped`,
+so the C and Swift enums map one to one and an existing `Skipped` arm
+keeps meaning "nothing to do" (D1); the C values are appended (3, 4) and
+no existing value changes meaning, so a host compiled against the old
+header still links and reads `PRESENTED`, `SUBOPTIMAL` and `SKIPPED` as
+before (D3). Such a host sees 3 and 4 as values it does not list; the
+header asks hosts to treat an unknown value like `PACED`, and TesseraKit
+maps one to `.paced`, since rendering again is always safe and the next
+call reports `Skipped` if nothing is pending. `tessera_surface_render`
+still writes `SKIPPED` before anything else: after an error the returned
+code, not the status, says what to do.
+
+The half-interval slack stays (D2): it is what keeps a display link of up
+to 240 Hz from ever seeing `Paced`, so a display-link host renders exactly
+as before. The interim measures from #21 are retired:
+
+- `tessera-devwin` drops `MAX_SKIP_RETRIES` and its streak counter. A
+  `Paced` or `NotReady` frame schedules one redraw 16 ms later (longer than
+  the frame interval, so a retried paced frame is due) while the window is
+  visible and not empty, each time it is reported; a `Skipped` frame
+  schedules nothing, so an idle window does not wake. Each frame's
+  decision replaces a retry still scheduled from an earlier one. An
+  occluded or zero-sized window waits for the occlusion change or resize,
+  which request a redraw of their own.
+- The macOS view (`TerminalSurfaceView.render()`) keeps its display link
+  running after `.paced` and `.notReady` (it marks a frame as still
+  needed) and lets it idle after `.presented` and `.skipped` when nothing
+  else is pending. Before, it idled after every skip, so a paced frame's
+  content (only possible above 240 Hz or with late ticks) waited for the
+  next output. A `.notReady` frame on a surface whose size is zero idles
+  the link instead: it cannot become ready without the resize, and the
+  resize asks for a frame. An occluded window already pauses the link and
+  redraws when it shows again.
+
+A known gap in "nothing is pending": `Renderer::needs_redraw()` can turn
+true with no event when the fallback font index finishes loading in the
+background while a row shows a `.notdef` glyph it may now resolve. A host
+idling after `Skipped` draws that row with its next frame for another
+reason; a follow-up issue tracks waking the host for it.
+
+Residual risk: a surface that stays not ready while visible and non-empty
+(a layer that never vends a drawable) is retried every refresh, by both
+hosts, until it is; each retry acquires nothing and draws nothing. On
+Metal the acquire waits for a drawable rather than timing out, so this
+needs a layer the system has stopped servicing.
 
 ## Measurements
 

@@ -17,6 +17,12 @@ use crate::error::{self, Error};
 use crate::panic::ffi_guard;
 
 /// What `tessera_surface_render` did with a frame.
+///
+/// `SKIPPED`, `PACED` and `NOT_READY` all mean nothing was drawn; they
+/// differ in whether the host must render again (ADR 0016). Values are
+/// only ever appended: a host built against an older header that sees a
+/// value it does not list should treat it like `PACED` and render again on
+/// its next refresh.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FrameStatus {
@@ -26,18 +32,30 @@ pub enum FrameStatus {
     /// longer match its size: call `tessera_surface_resize` with the view's
     /// current size and scale before the next frame.
     Suboptimal = 1,
-    /// Nothing was drawn by this call, for one of three reasons: nothing
-    /// changed since the last presented frame; the call came too soon
-    /// after the frames before it (more than 240 frames per second, or a
-    /// third call within 1/240 s), so it was paced and a later call draws
-    /// the newest content; or the surface had nothing to draw into
-    /// (zero-sized, occluded window, no drawable). The three are not told
-    /// apart yet. A host that renders from a display link of up to 240 Hz
-    /// is never paced and need not retry: its next tick draws whatever is
-    /// pending. A host that renders faster, or from output notifications,
-    /// must schedule another render after a skip. (Waiting for a drawable has no time limit on
-    /// Metal: a render waits while every drawable is in flight.)
+    /// Nothing was drawn because nothing changed since the last presented
+    /// frame. Nothing is pending: the host need not render again until
+    /// something gives it a frame to draw (new output (`on_output`), input,
+    /// a resize, a focus or font-size change, or a re-theme
+    /// (`on_appearance_changed`)), and may pause its display link until
+    /// then. One known gap: a row showing a missing glyph can become
+    /// drawable when the fallback font index finishes loading in the
+    /// background, with no callback; it is drawn by the next frame the host
+    /// renders for another reason.
     Skipped = 2,
+    /// Nothing was drawn because the call came too soon after the frames
+    /// before it (more than 240 frames per second, or a third call within
+    /// 1/240 s). The newest content was captured but not drawn: render
+    /// again on the next refresh. A display link of up to 240 Hz is never
+    /// paced; a host that renders faster or on every output notification
+    /// is.
+    Paced = 3,
+    /// Nothing was drawn because the surface had nothing to draw into: it
+    /// is zero-sized, its window is occluded, or no drawable came in time.
+    /// What changed stays pending: render again once the surface is ready
+    /// (the next refresh, after a resize to a non-zero size, or when the
+    /// window becomes visible). Waiting for a drawable has no time limit on
+    /// Metal: a render waits while every drawable is in flight.
+    NotReady = 4,
 }
 
 impl From<CoreFrameStatus> for FrameStatus {
@@ -46,6 +64,8 @@ impl From<CoreFrameStatus> for FrameStatus {
             CoreFrameStatus::Presented => Self::Presented,
             CoreFrameStatus::Suboptimal => Self::Suboptimal,
             CoreFrameStatus::Skipped => Self::Skipped,
+            CoreFrameStatus::Paced => Self::Paced,
+            CoreFrameStatus::NotReady => Self::NotReady,
         }
     }
 }
@@ -208,8 +228,9 @@ pub unsafe extern "C" fn tessera_surface_attach(
 /// Call it from the view's layout and backing-properties-changed hooks
 /// (window resizes, moves between displays of different scale) and after
 /// a frame reported `TESSERA_FRAME_STATUS_SUBOPTIMAL`. A zero width or
-/// height suspends drawing (frames report `TESSERA_FRAME_STATUS_SKIPPED`)
-/// and leaves the session's size alone. Main thread only.
+/// height suspends drawing (frames with anything to draw report
+/// `TESSERA_FRAME_STATUS_NOT_READY` until a resize to a non-zero size) and
+/// leaves the session's size alone. Main thread only.
 ///
 /// Returns `TESSERA_ERROR_NULL_POINTER` if `app` is `NULL`,
 /// `TESSERA_ERROR_INVALID_ARGUMENT` if `scale` is not a finite positive
@@ -251,15 +272,33 @@ pub unsafe extern "C" fn tessera_surface_resize(
 ///
 /// Call it from the view's display link. The session's terminal is locked
 /// only while the changed rows are copied out (microseconds); drawing and
-/// waiting for a drawable do not hold up the session's output. A frame
-/// with nothing changed, or one that would exceed 240 frames per second,
-/// draws nothing and reports `TESSERA_FRAME_STATUS_SKIPPED` (see
-/// `TesseraFrameStatus`). The cursor
+/// waiting for a drawable do not hold up the session's output. The cursor
 /// is a block, drawn hollow while the session is not focused
 /// (`tessera_session_set_focus`). Main thread only.
 ///
+/// When the call returns `TESSERA_ERROR_OK`, `*out_status` says whether to
+/// call again (see `TesseraFrameStatus`):
+///
+/// - `TESSERA_FRAME_STATUS_PRESENTED`: drawn; render again when there is
+///   something new.
+/// - `TESSERA_FRAME_STATUS_SUBOPTIMAL`: drawn; call
+///   `tessera_surface_resize` before the next frame.
+/// - `TESSERA_FRAME_STATUS_SKIPPED`: nothing changed, nothing is pending.
+///   Do not retry; the display link may pause until new output, input, a
+///   resize, a focus or font-size change, or a re-theme
+///   (`on_appearance_changed`). See `TESSERA_FRAME_STATUS_SKIPPED` for the
+///   one known gap.
+/// - `TESSERA_FRAME_STATUS_PACED`: too soon after the previous frames
+///   (over 240 frames per second); the newest content is not drawn yet.
+///   Render again on the next refresh.
+/// - `TESSERA_FRAME_STATUS_NOT_READY`: the surface had nothing to draw
+///   into (zero-sized, occluded, no drawable); what changed is still
+///   pending. Render again once the surface is ready: on the next refresh,
+///   after a resize to a non-zero size, or when the window becomes visible.
+///
 /// `*out_status` is set to `TESSERA_FRAME_STATUS_SKIPPED` before anything
-/// else, so it reads "skipped" after any failure.
+/// else, so it reads "skipped" after any failure; the returned error, not
+/// the status, then says what to do.
 ///
 /// Returns `TESSERA_ERROR_NULL_POINTER` if `app` or `out_status` is
 /// `NULL`, `TESSERA_ERROR_SESSION_NOT_FOUND` if the id is not a live
@@ -519,6 +558,8 @@ mod tests {
             (CoreFrameStatus::Presented, FrameStatus::Presented, 0),
             (CoreFrameStatus::Suboptimal, FrameStatus::Suboptimal, 1),
             (CoreFrameStatus::Skipped, FrameStatus::Skipped, 2),
+            (CoreFrameStatus::Paced, FrameStatus::Paced, 3),
+            (CoreFrameStatus::NotReady, FrameStatus::NotReady, 4),
         ];
         for (core, c, value) in pairs {
             assert_eq!(FrameStatus::from(core), c);

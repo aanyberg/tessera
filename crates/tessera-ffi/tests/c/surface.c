@@ -3,11 +3,12 @@
  * scripts/ffi-c-test.sh: create a bare CAMetalLayer through the
  * Objective-C runtime, attach it to a /bin/sh session at 800x600 scale 1,
  * render 3 frames, resize to 1600x1200 scale 2, render 3 frames and read
- * the surface's metrics, resize to 0x0 (frames are skipped), back to
+ * the surface's metrics, resize to 0x0 (frames report NOT_READY), back to
  * 800x600, detach (metrics then report no surface) and close.
  *
- * A layer outside any window may not vend drawables, so each frame may
- * report PRESENTED or SKIPPED; the test prints which. Skipped entirely when
+ * A layer outside any window may not vend drawables, and frames rendered
+ * back to back may be paced, so each frame may report PRESENTED, SKIPPED,
+ * PACED or NOT_READY; the test prints which. Skipped entirely when
  * TESSERA_SKIP_GPU_TESTS is set, like the render suites.
  */
 
@@ -52,17 +53,20 @@ static const char *status_name(TesseraFrameStatus status) {
     case TESSERA_FRAME_STATUS_PRESENTED: return "presented";
     case TESSERA_FRAME_STATUS_SUBOPTIMAL: return "suboptimal";
     case TESSERA_FRAME_STATUS_SKIPPED: return "skipped";
+    case TESSERA_FRAME_STATUS_PACED: return "paced";
+    case TESSERA_FRAME_STATUS_NOT_READY: return "not ready";
     }
     return "unknown";
 }
 
-/* Renders `frames` frames; each must succeed and be presented or skipped. */
+/* Renders `frames` frames; each must succeed and draw nothing or be presented. */
 static int render(TesseraApp *app, uint64_t id, int frames, const char *label) {
     printf("%s:", label);
     for (int i = 0; i < frames; i++) {
         TesseraFrameStatus status = TESSERA_FRAME_STATUS_PRESENTED;
         CHECK(tessera_surface_render(app, id, &status));
-        if (status != TESSERA_FRAME_STATUS_PRESENTED && status != TESSERA_FRAME_STATUS_SKIPPED) {
+        if (status != TESSERA_FRAME_STATUS_PRESENTED && status != TESSERA_FRAME_STATUS_SKIPPED &&
+            status != TESSERA_FRAME_STATUS_PACED && status != TESSERA_FRAME_STATUS_NOT_READY) {
             fprintf(stderr, "\nframe %d of %s: unexpected status %s\n", i, label,
                     status_name(status));
             return 1;
@@ -137,10 +141,15 @@ int main(void) {
     }
 
     CHECK(tessera_surface_resize(app, id, 0, 0, 2.0f));
-    TesseraFrameStatus status = TESSERA_FRAME_STATUS_PRESENTED;
-    CHECK(tessera_surface_render(app, id, &status));
-    if (status != TESSERA_FRAME_STATUS_SKIPPED) {
-        fprintf(stderr, "a 0x0 surface should skip frames, got %s\n", status_name(status));
+    /* The frames just rendered may pace this one: render until the pacing
+     * interval (1/240 s) has passed, which a paced call costs microseconds
+     * of. */
+    TesseraFrameStatus status = TESSERA_FRAME_STATUS_PACED;
+    for (long tries = 0; status == TESSERA_FRAME_STATUS_PACED && tries < 10000000; tries++) {
+        CHECK(tessera_surface_render(app, id, &status));
+    }
+    if (status != TESSERA_FRAME_STATUS_NOT_READY) {
+        fprintf(stderr, "a 0x0 surface should not be ready, got %s\n", status_name(status));
         return 1;
     }
     printf("0x0: %s\n", status_name(status));

@@ -299,9 +299,11 @@ final class SurfaceAndInputTests: XCTestCase {
             XCTAssertEqual($0 as? TesseraCoreError, .invalidArgument)
         }
         XCTAssertEqual(surface.size?.widthPx, 1000, "a rejected size is not recorded")
-        // Zero suspends drawing.
+        // Zero suspends drawing: nothing to draw into, the frame stays
+        // pending.
         try surface.resize(widthPx: 0, heightPx: 0, scale: 1)
-        XCTAssertEqual(try surface.render(), .skipped)
+        XCTAssertEqual(try surface.render(), .notReady)
+        XCTAssertEqual(try surface.render(), .notReady)
         try surface.resize(widthPx: 1000, heightPx: 700, scale: 2)
         XCTAssertNoThrow(try surface.render())
         try surface.setFontSize(18)
@@ -448,6 +450,13 @@ final class SurfaceAndInputTests: XCTestCase {
         XCTAssertEqual(TesseraSurface.FrameStatus(TESSERA_FRAME_STATUS_PRESENTED), .presented)
         XCTAssertEqual(TesseraSurface.FrameStatus(TESSERA_FRAME_STATUS_SUBOPTIMAL), .suboptimal)
         XCTAssertEqual(TesseraSurface.FrameStatus(TESSERA_FRAME_STATUS_SKIPPED), .skipped)
-        XCTAssertEqual(TesseraSurface.FrameStatus(TesseraFrameStatus(rawValue: 9)), .skipped)
+        XCTAssertEqual(TesseraSurface.FrameStatus(TESSERA_FRAME_STATUS_PACED), .paced)
+        XCTAssertEqual(TesseraSurface.FrameStatus(TESSERA_FRAME_STATUS_NOT_READY), .notReady)
+        // The C values are appended, never renumbered (D3).
+        XCTAssertEqual(TESSERA_FRAME_STATUS_SKIPPED.rawValue, 2)
+        XCTAssertEqual(TESSERA_FRAME_STATUS_PACED.rawValue, 3)
+        XCTAssertEqual(TESSERA_FRAME_STATUS_NOT_READY.rawValue, 4)
+        // A value from a newer core is rendered again, not dropped.
+        XCTAssertEqual(TesseraSurface.FrameStatus(TesseraFrameStatus(rawValue: 9)), .paced)
     }
 }

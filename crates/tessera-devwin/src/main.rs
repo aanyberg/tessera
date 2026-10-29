@@ -15,15 +15,14 @@
 //! only the kernel's hangup when the PTY closes, and a child that ignores
 //! `SIGHUP` is orphaned. Close the window instead.
 //!
-//! A frame the core skips (`FrameStatus::Skipped`) has three causes since
-//! #21: nothing changed, the frame was paced (more than 240 frames per
-//! second), or the surface was not ready. They are not told apart yet
-//! (#101), so the window retries a skipped frame about one refresh later,
-//! at most [`MAX_SKIP_RETRIES`] times in a row: enough to draw a paced
-//! frame (a retry that late is never paced) without waking 60 times a
-//! second while nothing changes. A presented frame and any new output,
-//! input, resize, occlusion change or re-attached surface start the count
-//! over.
+//! A frame the core does not draw says whether to try again (ADR 0016):
+//! `FrameStatus::Skipped` (nothing changed) is never retried, so an idle
+//! window does not wake; `FrameStatus::Paced` (more than 240 frames per
+//! second) and `FrameStatus::NotReady` (no drawable) leave content pending
+//! and are retried about one refresh later ([`PENDING_FRAME_RETRY`]),
+//! while the window is visible and not empty. New output, input, a
+//! resize, an occlusion change or a re-attached surface request a redraw
+//! of their own.
 //!
 //! Dev-only: never published, and nothing in the app or in `tessera-ffi`
 //! depends on it (a test checks). Run it with `just devwin`.
@@ -32,7 +31,6 @@ mod clipboard;
 mod input;
 mod mailbox;
 
-use std::cell::Cell;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -53,15 +51,11 @@ use winit::window::{Window, WindowId};
 use crate::input::{CellGeometry, InputHold, KeyAction, KeyInput, KeyMods, Platform};
 use crate::mailbox::{Mailbox, PasteDelivery};
 
-/// How long to wait before drawing again after a frame was skipped (the
-/// swapchain timed out) while the window is visible: about one refresh.
-const SKIPPED_FRAME_RETRY: Duration = Duration::from_millis(16);
-
-/// Most skipped frames in a row that are retried (see the module docs).
-/// One retry draws a paced frame: [`SKIPPED_FRAME_RETRY`] is longer than
-/// the core's frame interval, so the retry is due. The second covers a
-/// surface that was not ready once.
-const MAX_SKIP_RETRIES: u32 = 2;
+/// How long to wait before drawing again after a frame that left content
+/// pending (`Paced` or `NotReady`) while the window is visible: about one
+/// refresh, longer than the core's frame interval, so a retried paced
+/// frame is due.
+const PENDING_FRAME_RETRY: Duration = Duration::from_millis(16);
 
 /// How long a paste waits for the clipboard tool before killing it.
 const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(2);
@@ -121,11 +115,8 @@ struct DevWin {
     /// The button held for drags.
     held: MouseButton,
     occluded: bool,
-    /// When to draw again after a skipped frame.
+    /// When to draw again after a frame that left content pending.
     retry_at: Option<Instant>,
-    /// Skipped frames in a row since the last presented frame or event;
-    /// see [`retry_skipped`]. A `Cell` so the `&self` event paths reset it.
-    skips: Cell<u32>,
     /// Frames in a row that needed recovery; see [`MAX_RECOVERIES`].
     recoveries: u32,
     /// A clipboard read for a paste is running; further pastes are
@@ -165,7 +156,6 @@ impl DevWin {
             held: MouseButton::None,
             occluded: false,
             retry_at: None,
-            skips: Cell::new(0),
             recoveries: 0,
             paste_in_flight: false,
             hold: InputHold::default(),
@@ -254,7 +244,6 @@ impl DevWin {
         if let Err(error) = result {
             eprintln!("tessera-devwin: resizing the view failed: {error}");
         }
-        self.skips.set(0);
         window.request_redraw();
     }
 
@@ -271,29 +260,28 @@ impl DevWin {
             self.fail(event_loop, &message);
             return;
         }
-        let mut skips = self.skips.get();
-        let retry = retry_skipped(&mut skips, &status);
-        self.skips.set(skips);
+        let size = window.inner_size();
+        let visible = !self.occluded && size.width > 0 && size.height > 0;
+        // A retry still due from an earlier frame is replaced by this
+        // frame's own decision.
+        self.retry_at = retry_at(&status, visible, Instant::now());
         match status {
-            Ok(FrameStatus::Presented) => {}
+            // Drawn, or retried (or not) through `retry_at` above.
+            Ok(
+                FrameStatus::Presented
+                | FrameStatus::Skipped
+                | FrameStatus::Paced
+                | FrameStatus::NotReady,
+            ) => {}
             // Shown, but the swapchain no longer matches the window: the
             // core's contract is to resize the view before the next frame.
             // Metal never reports it, so on macOS this is untested; #65
             // (Vulkan/Wayland, where it is common during a resize) must
             // check that the resize clears it.
             Ok(FrameStatus::Suboptimal) => self.follow_window(),
-            Ok(FrameStatus::Skipped) => {
-                let size = window.inner_size();
-                if retry && !self.occluded && size.width > 0 && size.height > 0 {
-                    self.retry_at = Some(Instant::now() + SKIPPED_FRAME_RETRY);
-                }
-            }
             // The core detached the view; give it a fresh surface.
             Err(Error::Gpu(RenderError::SurfaceLost)) => match self.attach(&window, id) {
-                Ok(()) => {
-                    self.skips.set(0);
-                    window.request_redraw();
-                }
+                Ok(()) => window.request_redraw(),
                 Err(message) => self.fail(event_loop, &message),
             },
             Err(error) => eprintln!("tessera-devwin: drawing failed: {error}"),
@@ -326,7 +314,6 @@ impl DevWin {
         let (Some(window), Some(id)) = (&self.window, self.session) else {
             return;
         };
-        self.skips.set(0);
         match self.app.send_input(id, event) {
             Ok(InputOutcome::Consumed) => window.request_redraw(),
             Ok(InputOutcome::Ignored) => {}
@@ -370,7 +357,6 @@ impl DevWin {
         let pending = self.mailbox.take();
         if let Some(window) = &self.window {
             if pending.output {
-                self.skips.set(0);
                 window.request_redraw();
             }
             if let Some(title) = &pending.title {
@@ -402,27 +388,33 @@ impl DevWin {
     }
 }
 
-/// Whether a frame that came back `status` is retried, counting skipped
-/// frames in a row in `skips`: a skip adds one and is retried while the
-/// streak is at most [`MAX_SKIP_RETRIES`]; a drawn frame ends the streak;
-/// an error leaves it. The event paths reset `skips` themselves.
-fn retry_skipped(skips: &mut u32, status: &Result<FrameStatus, Error>) -> bool {
+/// How long after a frame that came back `status` to draw again, `None`
+/// when nothing is pending: `Paced` and `NotReady` left content undrawn
+/// and are retried after [`PENDING_FRAME_RETRY`]; `Skipped` (nothing
+/// changed), drawn frames and errors are not (a suboptimal frame and a
+/// lost surface request their own redraw).
+fn retry_delay(status: &Result<FrameStatus, Error>) -> Option<Duration> {
     match status {
-        Ok(FrameStatus::Skipped) => {
-            *skips = skips.saturating_add(1);
-            *skips <= MAX_SKIP_RETRIES
+        Ok(FrameStatus::Paced | FrameStatus::NotReady) => Some(PENDING_FRAME_RETRY),
+        Ok(FrameStatus::Presented | FrameStatus::Suboptimal | FrameStatus::Skipped) | Err(_) => {
+            None
         }
-        Ok(FrameStatus::Presented | FrameStatus::Suboptimal) => {
-            *skips = 0;
-            false
-        }
-        Err(_) => false,
     }
+}
+
+/// When to draw again after a frame that came back `status` at `now`:
+/// after [`retry_delay`], but only while the window is `visible` (not
+/// occluded, not empty). A hidden or empty window waits for the occlusion
+/// change or resize, which request a redraw of their own.
+fn retry_at(status: &Result<FrameStatus, Error>, visible: bool, now: Instant) -> Option<Instant> {
+    retry_delay(status)
+        .filter(|_| visible)
+        .map(|delay| now + delay)
 }
 
 /// Counts `status` against [`MAX_RECOVERIES`] in `recoveries`: a frame
 /// that needs recovery (suboptimal, surface lost) adds one, a presented
-/// frame resets the count, a skipped one leaves it. `true` once more than
+/// frame resets the count, one that drew nothing leaves it. `true` once more than
 /// [`MAX_RECOVERIES`] frames in a row needed recovery.
 fn gives_up(recoveries: &mut u32, status: &Result<FrameStatus, Error>) -> bool {
     match status {
@@ -483,7 +475,6 @@ impl ApplicationHandler<Wake> for DevWin {
             WindowEvent::RedrawRequested => self.render(event_loop),
             WindowEvent::Occluded(occluded) => {
                 self.occluded = occluded;
-                self.skips.set(0);
                 if !occluded && let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -571,55 +562,69 @@ impl ApplicationHandler<Wake> for DevWin {
 mod tests {
     use super::*;
 
-    /// A paced skip is retried once and the retry is due: the retry
-    /// interval is longer than the core's frame interval.
+    /// Nothing changed: never retried, however many come in a row, so
+    /// an idle window waits for an event instead of waking every refresh.
     #[test]
-    fn a_paced_skip_is_retried_late_enough_to_draw() {
-        assert!(SKIPPED_FRAME_RETRY >= tessera_app_core::view::MIN_FRAME_INTERVAL);
-        let mut skips = 0;
-        assert!(
-            retry_skipped(&mut skips, &Ok(FrameStatus::Skipped)),
-            "paced"
-        );
-        assert!(
-            !retry_skipped(&mut skips, &Ok(FrameStatus::Presented)),
-            "the retry drew"
-        );
-        assert_eq!(skips, 0);
-    }
-
-    /// Nothing changed: the window retries twice, then waits for an event
-    /// instead of waking every refresh.
-    #[test]
-    fn an_unchanged_streak_stops_after_two_retries() {
-        let mut skips = 0;
-        let retried: Vec<bool> = (0..6)
-            .map(|_| retry_skipped(&mut skips, &Ok(FrameStatus::Skipped)))
-            .collect();
-        assert_eq!(retried, [true, true, false, false, false, false]);
-        // A drawn frame starts over.
-        assert!(!retry_skipped(&mut skips, &Ok(FrameStatus::Suboptimal)));
-        assert!(retry_skipped(&mut skips, &Ok(FrameStatus::Skipped)));
-        // An error neither counts nor resets.
-        let before = skips;
-        assert!(!retry_skipped(
-            &mut skips,
-            &Err(Error::NoView(SessionId::from_raw(1)))
-        ));
-        assert_eq!(skips, before);
-    }
-
-    /// The event paths reset the streak: after output (or input, a
-    /// resize, an occlusion change, a re-attach) a skip is retried again.
-    #[test]
-    fn a_new_event_starts_the_count_over() {
-        let mut skips = 0;
-        for _ in 0..3 {
-            retry_skipped(&mut skips, &Ok(FrameStatus::Skipped));
+    fn a_skipped_frame_is_not_retried() {
+        for _ in 0..100 {
+            assert_eq!(retry_delay(&Ok(FrameStatus::Skipped)), None);
         }
-        assert!(!retry_skipped(&mut skips, &Ok(FrameStatus::Skipped)));
-        skips = 0; // what `drain_mailbox`, `send_now`, `follow_window` do
-        assert!(retry_skipped(&mut skips, &Ok(FrameStatus::Skipped)));
+    }
+
+    /// A paced frame is retried, every time, late enough to be due: the
+    /// retry interval is longer than the core's frame interval.
+    #[test]
+    fn a_paced_frame_is_retried_late_enough_to_draw() {
+        assert!(PENDING_FRAME_RETRY >= tessera_app_core::view::MIN_FRAME_INTERVAL);
+        for _ in 0..100 {
+            assert_eq!(
+                retry_delay(&Ok(FrameStatus::Paced)),
+                Some(PENDING_FRAME_RETRY)
+            );
+        }
+    }
+
+    /// A surface that was not ready is retried every time: its content is
+    /// still pending, and there is no cap to give up after.
+    #[test]
+    fn a_frame_that_was_not_ready_is_retried() {
+        for _ in 0..100 {
+            assert_eq!(
+                retry_delay(&Ok(FrameStatus::NotReady)),
+                Some(PENDING_FRAME_RETRY)
+            );
+        }
+    }
+
+    /// A pending frame is retried one delay later while the window is
+    /// visible, and not at all while it is hidden or empty.
+    #[test]
+    fn a_pending_frame_is_retried_only_while_the_window_is_visible() {
+        let now = Instant::now();
+        for status in [FrameStatus::Paced, FrameStatus::NotReady] {
+            assert_eq!(
+                retry_at(&Ok(status), true, now),
+                Some(now + PENDING_FRAME_RETRY),
+                "{status:?}"
+            );
+            assert_eq!(retry_at(&Ok(status), false, now), None, "{status:?}");
+        }
+        assert_eq!(retry_at(&Ok(FrameStatus::Skipped), true, now), None);
+    }
+
+    /// Drawn frames and errors schedule no retry.
+    #[test]
+    fn drawn_frames_and_errors_are_not_retried() {
+        assert_eq!(retry_delay(&Ok(FrameStatus::Presented)), None);
+        assert_eq!(retry_delay(&Ok(FrameStatus::Suboptimal)), None);
+        assert_eq!(
+            retry_delay(&Err(Error::NoView(SessionId::from_raw(1)))),
+            None
+        );
+        assert_eq!(
+            retry_delay(&Err(Error::Gpu(RenderError::SurfaceLost))),
+            None
+        );
     }
 
     #[test]
@@ -631,11 +636,14 @@ mod tests {
         }
         assert!(gives_up(&mut count, &lost()));
 
-        // A presented frame resets; a skipped one does not.
+        // A presented frame resets; one that drew nothing does not.
         let mut count = 0;
         assert!(!gives_up(&mut count, &lost()));
         assert!(!gives_up(&mut count, &lost()));
         assert!(!gives_up(&mut count, &Ok(FrameStatus::Skipped)));
+        assert!(!gives_up(&mut count, &Ok(FrameStatus::Paced)));
+        assert!(!gives_up(&mut count, &Ok(FrameStatus::NotReady)));
+        assert_eq!(count, 2, "not reset by those");
         assert!(!gives_up(&mut count, &Ok(FrameStatus::Presented)));
         for _ in 0..MAX_RECOVERIES {
             assert!(!gives_up(&mut count, &Ok(FrameStatus::Suboptimal)));

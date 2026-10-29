@@ -5,8 +5,9 @@
 //! Argument checks run everywhere. Tests that attach a surface (and so
 //! bring up the GPU) return early when `TESSERA_SKIP_GPU_TESTS` is set,
 //! like the render suites. A layer outside any window may not vend
-//! drawables, so a frame may report `Skipped` instead of `Presented`; both
-//! are accepted.
+//! drawables, so a frame may report `NotReady` instead of `Presented`, and
+//! frames rendered back to back may be `Paced`; all are accepted where a
+//! test only needs frames to succeed.
 
 #![cfg(target_os = "macos")]
 
@@ -17,7 +18,7 @@ use std::ptr;
 use std::time::{Duration, Instant};
 
 use tessera_app_core::SessionId;
-use tessera_app_core::view::ViewSize;
+use tessera_app_core::view::{MIN_FRAME_INTERVAL, ViewSize};
 use tessera_ffi::{
     App, Error, FrameStatus, SpawnOptions, SurfaceMetrics, tessera_app_free, tessera_app_new,
     tessera_session_close, tessera_session_resize, tessera_session_spawn, tessera_session_write,
@@ -289,6 +290,13 @@ impl Handle {
         }
     }
 
+    /// Renders one frame after waiting out the pacing interval, so its
+    /// status is not `Paced`.
+    fn render_unpaced(&self, id: u64) -> (Error, FrameStatus) {
+        std::thread::sleep(2 * MIN_FRAME_INTERVAL);
+        self.render(id)
+    }
+
     /// Renders `frames` frames, each of which must succeed.
     fn render_frames(&self, id: u64, frames: usize) -> Vec<FrameStatus> {
         (0..frames)
@@ -296,7 +304,13 @@ impl Handle {
                 let (code, status) = self.render(id);
                 assert_eq!(code, Error::Ok);
                 assert!(
-                    matches!(status, FrameStatus::Presented | FrameStatus::Skipped),
+                    matches!(
+                        status,
+                        FrameStatus::Presented
+                            | FrameStatus::Skipped
+                            | FrameStatus::Paced
+                            | FrameStatus::NotReady
+                    ),
                     "{status:?}"
                 );
                 status
@@ -588,7 +602,9 @@ fn the_grid_follows_the_surface() {
     assert_eq!(app.attach(id, &layer, 0, 0, 1.0), Error::Ok);
     let empty = app.view_size(id);
     assert_eq!((empty.pixels.width, empty.pixels.height), (0, 0));
-    assert_eq!(app.render(id), (Error::Ok, FrameStatus::Skipped));
+    assert_eq!(app.render(id), (Error::Ok, FrameStatus::NotReady));
+    // Still pending, so retried: still not ready.
+    assert_eq!(app.render(id), (Error::Ok, FrameStatus::NotReady));
     app.assert_child_sees(id, 24, 80);
     assert_eq!(app.detach(id), Error::Ok);
 
@@ -622,7 +638,7 @@ fn the_grid_follows_the_surface() {
 
     // A collapsed view draws nothing and leaves the session's size alone.
     assert_eq!(app.resize(id, 0, 0, 2.0), Error::Ok);
-    assert_eq!(app.render(id), (Error::Ok, FrameStatus::Skipped));
+    assert_eq!(app.render_unpaced(id), (Error::Ok, FrameStatus::NotReady));
     app.assert_child_sees(id, at_2x.rows, at_2x.cols);
 
     assert_eq!(app.resize(id, 800, 600, 1.0), Error::Ok);

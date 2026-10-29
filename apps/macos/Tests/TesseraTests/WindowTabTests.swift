@@ -88,6 +88,8 @@ final class WindowTabTests: XCTestCase {
         }
         for view in views {
             view.occlusionOverride = false
+            // Drawn, as on screen; see `TerminalSurfaceView.frameStatusOverride`.
+            view.frameStatusOverride = .presented
             view.displayLinkDidFire()
             XCTAssertTrue(view.isDisplayLinkPaused, "idle before the change")
         }

@@ -204,11 +204,11 @@ appearance callback), has no tabs, selection or copy, and like the devtool is
 dev-only: a test checks that `tessera-ffi` and `tessera-app-core` never link
 it or winit. It installs no signal handlers: Ctrl-C in the terminal that
 launched it, or `kill`, ends it without closing the session, and a child that
-ignores `SIGHUP` is orphaned; close the window instead. A skipped frame
-has three causes (nothing changed, paced above 240 frames per second, surface
-not ready) that the core does not tell apart yet (#101); the window retries
-one about a refresh later, at most twice in a row, so it neither loses a
-paced frame nor wakes every refresh while idle. A debug build draws visibly
+ignores `SIGHUP` is orphaned; close the window instead. A frame that
+drew nothing is retried about a refresh later only when it left content
+pending (paced above 240 frames per second, or the surface not ready), never
+when nothing changed, so the window neither loses a paced frame nor wakes
+every refresh while idle (ADR 0016). A debug build draws visibly
 fewer frames during a flood (`cat` of a large file); judge rendering speed
 with `cargo run --release -p tessera-devwin`.
 

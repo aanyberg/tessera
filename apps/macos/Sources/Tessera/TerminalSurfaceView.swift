@@ -56,6 +56,12 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     var occlusionOverride: Bool? {
         didSet { updateDisplayLinkPause() }
     }
+    /// The status ``render()`` acts on instead of the one the core reported
+    /// for the frame it just rendered (tests; errors still come from the
+    /// core): the hosted test app's windows are never on screen, so their
+    /// layers vend no drawables and every real frame is `.notReady`, and
+    /// whether one is `.paced` depends on the clock. `nil` uses the core's.
+    var frameStatusOverride: TesseraSurface.FrameStatus?
 
     // MARK: State
 
@@ -495,9 +501,25 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         renderCount += 1
         refreshMetrics()
         do {
-            switch try surface.render() {
+            let status = try surface.render()
+            switch frameStatusOverride ?? status {
             case .presented, .skipped:
+                // Drawn, or nothing changed: nothing is pending, and the link
+                // idles unless something new arrived meanwhile.
                 suboptimalFrames = 0
+            case .paced:
+                // Too soon after the previous frames: the newest content is
+                // not drawn yet, so the next refresh draws it.
+                needsRender = true
+            case .notReady:
+                // No drawable (none in time, or the window just became
+                // hidden): what changed is still pending and the next refresh
+                // retries, while visible (an occluded window pauses the link
+                // and redraws when it shows again). A zero-sized surface
+                // waits instead for the resize that gives it a size, which
+                // asks for a frame itself.
+                let size = surface.size
+                needsRender = (size?.widthPx ?? 0) > 0 && (size?.heightPx ?? 0) > 0
             case .suboptimal:
                 // The drawables no longer match the layer: resend the size,
                 // a few times in a row at most, so a layer that stays
