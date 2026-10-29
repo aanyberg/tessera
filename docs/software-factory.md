@@ -95,7 +95,7 @@ adversarial run, and replace the extra rounds with mechanical checks.
 | Critic rounds | up to 5, each re-reviewing the new commits | round 1 full and strict; round 2 only if a fix added new behaviour or code paths, or a blocker was a design problem; round 2 is the last |
 | Finding severity | blocker / major / minor; any major blocked `ship` | BLOCKER or MINOR only; only blockers block |
 | Fix commits | fix or refute every finding, may widen as needed | blockers only, one commit, no new behaviour |
-| Minors | fixed in later rounds, or ad hoc | one follow-up issue labelled for the next wave that has not started, does not hold the merge |
+| Minors | fixed in later rounds, or ad hoc | one follow-up issue labelled for the lowest wave that has not started, does not hold the merge |
 | Round 3+ | spawned at `effort: "lower"` | none: remaining blockers go to the lead (`escalate`) |
 | Re-checking fixes | another critic round | `scripts/verify-branch.sh` with its load targets, the quality gate, and the mutation check the implementer reports for each fixed blocker |
 | Adversarial tester | cycle 1, up to 2 cycles; early start with critique round 2 | once after `ship` for product code; a second cycle only if the first fails, scoped to the repro; docs, infra, tooling and test-only changes exempt |
@@ -140,7 +140,7 @@ cover the result. That clears the PR gate.
 **Mechanical checks, not rounds.** Everything else about a fix is checked by scripts and by the lead's reading:
 `scripts/verify-branch.sh` with its load targets (timing-sensitive tests under load) and `scripts/quality-gate.sh`
 are scripts; the mutation check per fixed blocker is the implementer's report, and the lead re-runs each named test
-against the fix's parent (`git checkout <fix>^ -- <source files>`, run, restore) before accepting it. A fix commit that adds only a test or a doc line gets no critic: the lead reads the diff.
+against the fix's parent (`git checkout <fix>^ -- <source files>`, run, then `git checkout HEAD -- <source files>`; only once the teammate has stopped working) before accepting it. A fix commit that adds only a test or a doc line gets no critic: the lead reads the diff.
 
 **Adversarial tester, once.** After `ship` the `adversarial-tester` runs once for product code (`crates/`,
 `apps/macos/`). A second cycle runs only if the first failed (a reproduced blocker), at `effort: "lower"`, scoped to
