@@ -133,3 +133,9 @@ schema:
 clean:
     cargo clean
     rm -rf {{app_dir}}/DerivedData {{app_dir}}/Tessera.xcodeproj {{xcframework}} {{build_dir}}
+
+# #109
+# Check scripts/verify-branch.sh: derived load targets (--list-targets) and the --parallel cap, under bash and zsh
+verify-branch-test:
+    bash scripts/test-verify-branch.sh
+    zsh scripts/test-verify-branch.sh
