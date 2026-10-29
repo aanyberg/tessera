@@ -2,6 +2,9 @@
 # their wall-clock bounds flake; everything else runs in parallel.
 [test-groups]
 timing = { max-threads = 1 }
+# Tests that hold about 1.1 GB each (4095 Metal command buffers) run one at a
+# time, so two never overlap on a small CI runner.
+gpu-memory = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = 'package(tessera-config) & binary(reload)'
@@ -38,3 +41,8 @@ test-group = 'timing'
 [[profile.default.overrides]]
 filter = 'package(tessera-ffi) & binary(lifecycle) & test(close_returns_at_once_and_free_waits_for_the_closing_children)'
 test-group = 'timing'
+
+# Device loss through a full Metal command queue (#84): ~1.1 GB each.
+[[profile.default.overrides]]
+filter = '(package(tessera-app-core) & kind(lib) & test(a_loss_inside_the_frame_detaches_at_once)) | (package(tessera-render) & binary(device_loss) & test(a_device_error_loses_the_device_during_the_call_that_hit_it))'
+test-group = 'gpu-memory'

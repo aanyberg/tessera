@@ -472,10 +472,11 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
             }
         } catch TesseraCoreError.gpu {
             // Drawing failed; the next frame may succeed, or report the
-            // surface detached after a lost swapchain.
+            // surface detached after a lost swapchain or GPU device.
             needsRender = true
         } catch TesseraCoreError.noSurface {
-            // The core detached the surface (lost swapchain): attach again.
+            // The core detached the surface (lost swapchain or GPU device):
+            // attach again, on a new device after a device loss.
             wantsReattach = true
             needsRender = true
         } catch {

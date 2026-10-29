@@ -73,6 +73,9 @@ to the main thread (ADR 0014), so the `close_session` documentation asks
 the caller to detach the view on the main thread first. The exemption was
 not restricted to sessions without a view: refusing the close (or skipping
 the view) would turn a documentation rule into a surprising error.
+Closing the last session with a view (like detaching the last view) also
+drops the GPU device and queue inside the call (#84, ADR 0014), which
+waits for the GPU to go idle (about 1.4 ms measured).
 
 ### The reaper
 

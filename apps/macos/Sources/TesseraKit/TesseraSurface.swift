@@ -234,9 +234,11 @@ public final class TesseraSurface {
     /// Draws the session's visible screen and presents it.
     ///
     /// - Throws: ``TesseraCoreError/noSurface`` while detached (also once the
-    ///   core detached the surface after a lost swapchain: ``isAttached`` is
-    ///   then `false` and the host attaches again), ``TesseraCoreError/gpu``
-    ///   if drawing failed.
+    ///   core detached the surface after a lost swapchain or a lost GPU
+    ///   device: ``isAttached`` is then `false` and the host attaches again,
+    ///   on a new device after a device loss), ``TesseraCoreError/gpu`` if
+    ///   drawing failed (the frame that found the swapchain or the device
+    ///   lost reports this, and the next one ``TesseraCoreError/noSurface``).
     public func render() throws -> FrameStatus {
         var status = TESSERA_FRAME_STATUS_SKIPPED
         try check(tessera_surface_render(session.core.pointer, session.id, &status))

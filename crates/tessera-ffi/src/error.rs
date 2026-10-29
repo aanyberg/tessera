@@ -148,6 +148,7 @@ mod tests {
                 Error::Io,
             ),
             (CoreError::Gpu(RenderError::SurfaceLost), Error::Gpu),
+            (CoreError::Gpu(RenderError::DeviceLost), Error::Gpu),
             (CoreError::Gpu(RenderError::NoFont("x".into())), Error::Gpu),
             (CoreError::NoView(id), Error::NoSurface),
             (CoreError::ViewAttached(id), Error::InvalidArgument),
