@@ -54,8 +54,9 @@ while it is visible), bracketed paste (app-core wraps the paste in
 Alacritty and WezTerm do; ESC is still removed, so the text cannot end the
 paste itself), focus events (`ESC [ I` / `ESC [ O` on a change of focus
 only; setting the mode reports nothing) and every keyboard mode. **Stored
-for later issues:** the mouse modes (#12), reverse video and cursor blink
-(render follow-ups), synchronized output (an app-core capture follow-up
+for later issues:** the mouse modes (#12), reverse video and the cursor's
+blink bit (a host blink clock; the shape is drawn, see "Cursor style"
+below), synchronized output (an app-core capture follow-up
 holds frames while it is set, with a cap). Stored modes are visible in
 `Modes` now so the follow-ups need no new terminal state.
 
@@ -127,6 +128,69 @@ mode or kitty keyboard sequence with a colon sub-parameter
 (`CSI ? 25:1049 h`, `CSI 4:20 h`, `CSI > 1:2 u`) is ignored as a whole, as
 xterm accepts colons only in SGR and XTMODKEYS.
 
+**Cursor style (DECSCUSR).** Added by #113; the rows of
+`crates/tessera-term/tests/fixtures/decscusr_spec.txt` pin every point
+below. `Terminal::cursor_style() -> CursorStyle { shape: Block | Underline
+| Beam, blink }` is the style in effect: `cursor_override.unwrap_or(default)`,
+where `default` is the configured one (`[appearance] cursor_shape` and
+`cursor_blink`, set with `Terminal::set_default_cursor_style` before a
+session's first byte and again by `App::apply_config`) and
+`cursor_override: Option<CursorStyle>` is what the program asked for.
+`CSI Ps SP q` with Ps 1 to 6 sets the override (1/2 blinking/steady block,
+3/4 underline, 5/6 beam, xterm's "bar"). `Snapshot::capture` maps the shape
+to the renderer's and damages the cursor's row when it changes; the blink
+bit is recorded but not drawn yet, so a blink-only change damages nothing.
+Unfocused views draw every shape hollow and DECTCEM still hides the cursor
+whatever its shape.
+
+- *One blink bit.* DECSCUSR and DECSET/DECRST 12 share one
+  program-controlled blink bit, as in xterm (`cursor_blink_esc`, written by
+  both, last writer wins), Alacritty and kitty. `CSI ? 12 h/l` makes the
+  override `Some(shape in effect, blink on/off)` (Alacritty's
+  `get_or_insert`), so `CSI 1 SP q CSI ? 12 l` is steady and `CSI ? 12 h
+  CSI 2 SP q` is steady too. `Modes::cursor_blink` stays as the record of
+  the last program-requested bit (written by 12 and by DECSCUSR, cleared by
+  Ps 0/7 and every reset) for a later DECRQM 12 reply. The issue's first
+  wording, "blink = DECSCUSR blink || DECSET 12", was dropped: no reference
+  terminal combines two bits that way, and it would keep a cursor blinking
+  after the program turned blinking off with the other sequence. A
+  consequence: a session touched by `CSI ? 12 h/l` stops following the
+  configured shape and blink until DECSCUSR 0 or a reset.
+- *Ps 0 and 7 are the configured default* (deliberate deviations): `CSI 0
+  SP q`, `CSI SP q` and an empty first parameter (`CSI ; 5 SP q`) drop the
+  override, as in Alacritty, kitty (shape), WezTerm and Ghostty; xterm and
+  the VT510 manual make 0 a literal blinking block. Ps 7, xterm's "initial
+  resources", is the same as 0, our configured default being xterm's
+  resources. Ps 1 is always an explicit blinking block.
+- *Ps 8 and above* change nothing (xterm, Alacritty, WezTerm), not kitty's
+  parity rule. The parser saturates an oversized parameter at `u16::MAX`
+  (vte 0.15; `tests/decscusr.rs` checks it), so `CSI 4294967296 SP q` is
+  ignored too. Only the first parameter counts (`CSI 5 ; 2 SP q` is a
+  blinking beam); a colon sub-parameter anywhere (`CSI 5:1 SP q`) voids
+  the whole sequence, as for the mode sequences.
+- *Resets.* DECSTR, DECSCL with `Pl` 61 to 65 (through the same soft
+  reset) and RIS drop the override and clear `Modes::cursor_blink`, so the
+  configured default applies; the default itself is configuration and no
+  reset touches it. xterm's ctlseqs is silent on what DECSTR and RIS do to
+  the cursor style: the facts come from xterm's `charproc.c`, the common
+  part of `ReallyReset` (L14379..14384 as fetched 2026-10-29: `InitCursorShape`
+  from the resources, `cursor_blink_esc = 0`), which runs for DECSTR, DECSCL
+  and RIS alike, so there is no soft/hard difference.
+- *Live configuration.* A new default reaches the sessions without an
+  override at once (the observer's `on_appearance_changed` makes the host
+  redraw); a session with one keeps it until Ps 0/7 or a reset, which then
+  lands on the new default (Alacritty). A session that starts while a
+  configuration is applied reads it again once it is listed.
+- *Not saved with the cursor.* DECSC/DECRC, SCOSC/SCORC, the alternate
+  screens 47/1047/1048/1049 and a resize neither save, restore nor reset
+  the style: one style per terminal, not per buffer (xterm keeps it in
+  `TScreen`; `CursorSave2` stores none).
+- *Deferred:* DECRQSS `SP q` (`DCS 1 $ r Ps SP q ST`, answered from the
+  effective style) and DECRQM 12 (from `Modes::cursor_blink`) need a reply
+  channel and DCS handling; the fixture keeps their rows (Q01..Q06) as the
+  contract for that issue, and the table test counts them as skipped.
+  Until then a DECRQSS is ignored without disturbing the text after it.
+
 **Deviations from the references**, each pinned by a test:
 
 - Parser-limited: the parser reports an absent parameter and an explicit
@@ -144,6 +208,9 @@ xterm accepts colons only in SGR and XTMODKEYS.
   resource); RIS in 132-column mode asks for 80 columns.
 - Synchronized output (2026) is reset by DECSTR and RIS (the spec is
   silent).
+- DECSCUSR 0 and 7 select the configured cursor style (xterm: 0 is a
+  blinking block), and DECSET 12 shares DECSCUSR's blink bit (see "Cursor
+  style").
 - Bracketed pastes keep their line breaks; a paste that sanitises to
   nothing writes nothing, brackets included.
 

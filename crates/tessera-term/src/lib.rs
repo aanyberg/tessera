@@ -36,14 +36,16 @@
 //!   corner; the cursor visible (DECTCEM) and not blinking (DECSET 12);
 //!   synchronized output (2026) off; cursor keys (DECCKM) and keypad
 //!   (DECKPAM) to normal, `modifyOtherKeys` to 0 and both kitty keyboard
-//!   flag stacks emptied.
+//!   flag stacks emptied;
+//! - the cursor style the program set (DECSCUSR, `CSI Ps SP q`, and DECSET
+//!   12): [`Terminal::cursor_style`] is the configured default again, as
+//!   after RIS (xterm's `ReallyReset`, ADR 0020).
 //!
 //! KAM is not modelled (SM 2 is ignored), so it has nothing to reset.
 //! Still waiting on state that does not exist yet (`// #112, #95, #97,
-//! #113, #9` in `soft_reset`): the character sets G0-G3/GL/GR (SCS, #112),
-//! DECSCA (#95), DECLRMM and reverse wrap (#97), the cursor shape and
-//! blink (DECSCUSR, `CSI Ps SP q`, #113) and the ANSI palette (colours set
-//! with OSC 4) back to the theme (#9).
+//! #9` in `soft_reset`): the character sets G0-G3/GL/GR (SCS, #112),
+//! DECSCA (#95), DECLRMM and reverse wrap (#97) and the ANSI palette
+//! (colours set with OSC 4) back to the theme (#9).
 //!
 //! DECSCL (`CSI 61..65 ; Pc " p`, select conformance level) runs the same
 //! soft reset and then records the level ([`Terminal::conformance_level`])
@@ -94,6 +96,37 @@ pub enum Request {
     },
 }
 
+/// The shape of the cursor, as DECSCUSR (`CSI Ps SP q`) and the
+/// configuration name it: what the renderer draws while the cursor is
+/// visible (DECTCEM) and the view has focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum CursorShape {
+    /// A filled cell (DECSCUSR 1 and 2).
+    #[default]
+    Block,
+    /// A horizontal bar at the bottom of the cell (DECSCUSR 3 and 4).
+    Underline,
+    /// A vertical bar at the left edge of the cell (DECSCUSR 5 and 6,
+    /// xterm's "bar").
+    Beam,
+}
+
+/// How the cursor looks: its shape and whether it blinks.
+///
+/// [`Terminal::cursor_style`] reports the one in effect: the style the
+/// program asked for (DECSCUSR, DECSET/DECRST 12) or, until it asks and
+/// again after DECSCUSR 0 or 7 and after every reset, the configured
+/// default ([`Terminal::set_default_cursor_style`]). The default is a
+/// steady block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct CursorStyle {
+    /// The shape drawn.
+    pub shape: CursorShape,
+    /// Whether the cursor blinks. The terminal only records it: blinking is
+    /// the host's clock.
+    pub blink: bool,
+}
+
 /// A terminal: parser + grid + modes.
 pub struct Terminal {
     parser: Parser,
@@ -119,6 +152,8 @@ impl Terminal {
                 last_printed: None,
                 conformance_level: 4,
                 c1_8bit_replies: false,
+                cursor_override: None,
+                default_cursor_style: CursorStyle::default(),
             },
             carry: Vec::new(),
         }
@@ -205,6 +240,23 @@ impl Terminal {
     /// yet (S7C1T/S8C1T and 8-bit replies are #96).
     pub fn c1_8bit_replies(&self) -> bool {
         self.state.c1_8bit_replies
+    }
+
+    /// The cursor style in effect: the one the program set with DECSCUSR
+    /// (`CSI Ps SP q`) or DECSET/DECRST 12, or the configured default
+    /// ([`Terminal::set_default_cursor_style`]) while it has set none, after
+    /// DECSCUSR 0 or 7 and after DECSTR, DECSCL and RIS. See the `csi`
+    /// module and ADR 0020 for the details.
+    pub fn cursor_style(&self) -> CursorStyle {
+        self.state.cursor_style()
+    }
+
+    /// Sets the configured cursor style: the one in effect while the
+    /// program has asked for none, and the one DECSCUSR 0 and 7 and every
+    /// reset return to. A style the program set stays in effect until then.
+    /// Starts as a steady block.
+    pub fn set_default_cursor_style(&mut self, style: CursorStyle) {
+        self.state.default_cursor_style = style;
     }
 
     /// Whether auto-wrap mode (DECAWM) is on: [`Modes::auto_wrap`].
@@ -316,9 +368,22 @@ struct State {
     /// set by DECSCL's `Pc`, cleared by RIS. Recorded for the reply code
     /// (S7C1T/S8C1T, #96; reports, #10); nothing reads it yet.
     c1_8bit_replies: bool,
+    /// The cursor style the program asked for: set by DECSCUSR 1..=6 and
+    /// by DECSET/DECRST 12 (which keeps the shape in effect), dropped by
+    /// DECSCUSR 0 and 7, DECSTR, DECSCL and RIS. `None` follows
+    /// `default_cursor_style`.
+    cursor_override: Option<CursorStyle>,
+    /// The configured cursor style ([`Terminal::set_default_cursor_style`]):
+    /// configuration, not terminal state, so no reset touches it.
+    default_cursor_style: CursorStyle,
 }
 
 impl State {
+    /// The cursor style in effect: the program's, else the configured one.
+    fn cursor_style(&self) -> CursorStyle {
+        self.cursor_override.unwrap_or(self.default_cursor_style)
+    }
+
     /// Applies one parsed action.
     ///
     /// A printed non-control character becomes [`State::last_printed`];

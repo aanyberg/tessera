@@ -196,6 +196,7 @@ impl Config {
         if omitted > 0 {
             warnings.push(Warning::UnknownKeysOmitted { count: omitted });
         }
+        warnings.extend(invalid_cursor_shapes(text));
         warnings.extend(config.normalize());
         for w in &warnings {
             tracing::warn!(target: "tessera_config", "{w}");
@@ -263,6 +264,76 @@ fn dotted_path(path: &serde_ignored::Path<'_>) -> String {
     let mut out = String::new();
     render(path, &mut out);
     out
+}
+
+/// Deserializes `appearance.cursor_shape` without failing: a value that is
+/// not exactly one of [`CursorShape::as_str`](crate::CursorShape::as_str)
+/// (another spelling, another case, another type) gives the default shape,
+/// and [`invalid_cursor_shapes`] reports it. So a mistyped shape costs a
+/// warning, not the whole configuration.
+pub(crate) fn lenient_cursor_shape<'de, D>(deserializer: D) -> Result<crate::CursorShape, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+
+    let value = toml::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_str()
+        .and_then(crate::CursorShape::from_name)
+        .unwrap_or_default())
+}
+
+/// One [`Warning::OutOfRange`] for every `cursor_shape` in `text` that
+/// [`lenient_cursor_shape`] replaced by the default: under `[appearance]`
+/// and under each profile's `appearance`. Reads the document a second
+/// time, only when it mentions the key at all.
+fn invalid_cursor_shapes(text: &str) -> Vec<Warning> {
+    const KEY: &str = "cursor_shape";
+    if !text.contains(KEY) {
+        return Vec::new();
+    }
+    let Ok(table) = text.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let profiles = table
+        .get("profiles")
+        .and_then(toml::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let appearances = std::iter::once(("appearance".to_owned(), table.get("appearance"))).chain(
+        profiles.iter().enumerate().map(|(i, profile)| {
+            (
+                format!("profiles[{i}].appearance"),
+                profile.get("appearance"),
+            )
+        }),
+    );
+    appearances
+        .filter_map(|(prefix, appearance)| {
+            let value = appearance?.get(KEY)?;
+            if value
+                .as_str()
+                .and_then(crate::CursorShape::from_name)
+                .is_some()
+            {
+                return None;
+            }
+            let names: Vec<String> = crate::CursorShape::ALL
+                .iter()
+                .map(|shape| format!("\"{}\"", shape.as_str()))
+                .collect();
+            Some(Warning::OutOfRange {
+                path: format!("{prefix}.{KEY}"),
+                detail: format!(
+                    "{} replaced by \"{}\" (expected {})",
+                    truncated(&value.to_string(), MAX_WARNING_PATH_LEN),
+                    crate::CursorShape::default().as_str(),
+                    names.join(", ")
+                ),
+            })
+        })
+        .collect()
 }
 
 fn normalize_appearance(prefix: &str, a: &mut crate::Appearance, warnings: &mut Vec<Warning>) {
@@ -713,6 +784,83 @@ mod tests {
             let err = Config::from_toml_lenient(text).unwrap_err();
             assert!(matches!(err, Error::Parse(_)), "{text}: {err}");
         }
+    }
+
+    #[test]
+    fn cursor_shape_parses_its_three_values_and_defaults_to_block() {
+        use crate::CursorShape;
+
+        assert_eq!(
+            Config::default().appearance.cursor_shape,
+            CursorShape::Block
+        );
+        for shape in CursorShape::ALL {
+            let text = format!("[appearance]\ncursor_shape = \"{}\"\n", shape.as_str());
+            let loaded = Config::from_toml_lenient(&text).unwrap();
+            assert_eq!(loaded.config.appearance.cursor_shape, shape);
+            assert_eq!(loaded.warnings, []);
+            // `as_str` is what serde writes, and it reads back.
+            let written = loaded.config.to_toml().unwrap();
+            assert!(written.contains(&text[13..]), "{written}");
+            assert_eq!(Config::from_toml(&written).unwrap(), loaded.config);
+        }
+    }
+
+    #[test]
+    fn cursor_blink_parses_and_defaults_to_false() {
+        assert!(!Config::default().appearance.cursor_blink);
+        for blink in [true, false] {
+            let text = format!("[appearance]\ncursor_blink = {blink}\n");
+            let loaded = Config::from_toml_lenient(&text).unwrap();
+            assert_eq!(loaded.config.appearance.cursor_blink, blink);
+            assert_eq!(loaded.warnings, []);
+        }
+    }
+
+    /// Unlike a mistyped `shell_integration`, a mistyped shape is not a
+    /// type error: the key falls back to its default with a warning that
+    /// names it, and every other key still applies.
+    #[test]
+    fn an_invalid_cursor_shape_warns_and_keeps_the_default() {
+        use crate::CursorShape;
+
+        for bad in [
+            "\"bar\"",
+            "\"Block\"",
+            "\"\"",
+            "3",
+            "\"I-beam\"",
+            "[\"beam\"]",
+        ] {
+            let text = format!(
+                "[appearance]\nfont_size = 15\ncursor_shape = {bad}\ncursor_blink = true\n\
+                 [terminal]\nscrollback_lines = 7\n"
+            );
+            let loaded = Config::from_toml_lenient(&text).unwrap();
+            let appearance = &loaded.config.appearance;
+            assert_eq!(appearance.cursor_shape, CursorShape::Block, "{bad}");
+            assert_eq!(appearance.font_size, 15.0, "{bad}");
+            assert!(appearance.cursor_blink, "{bad}");
+            assert_eq!(loaded.config.terminal.scrollback_lines, 7, "{bad}");
+            assert_eq!(loaded.warnings.len(), 1, "{bad}: {:?}", loaded.warnings);
+            let Warning::OutOfRange { path, detail } = &loaded.warnings[0] else {
+                panic!("{bad}: {:?}", loaded.warnings);
+            };
+            assert_eq!(path, "appearance.cursor_shape", "{bad}");
+            assert!(detail.contains("\"block\""), "{bad}: {detail}");
+        }
+        // In a profile too, named by its index.
+        let text = "[[profiles]]\nname = \"a\"\n[profiles.appearance]\ncursor_shape = \"bar\"\n";
+        let loaded = Config::from_toml_lenient(text).unwrap();
+        let appearance = loaded.config.profiles[0].appearance.as_ref().unwrap();
+        assert_eq!(appearance.cursor_shape, CursorShape::Block);
+        assert!(matches!(
+            &loaded.warnings[..],
+            [Warning::OutOfRange { path, .. }] if path == "profiles[0].appearance.cursor_shape"
+        ));
+        // A key that only mentions the name is not checked.
+        let loaded = Config::from_toml_lenient("[appearance]\ntheme = \"cursor_shape\"\n").unwrap();
+        assert!(matches!(&loaded.warnings[..], []), "{:?}", loaded.warnings);
     }
 
     #[test]

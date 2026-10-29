@@ -27,6 +27,12 @@ font_size = 13.0
 # what is behind the window when it is translucent.
 opacity = 1.0
 blur = false
+# Cursor shape: "block", "underline" or "beam" (a vertical bar), and whether
+# it blinks. Programs may change both (vim, fish); they come back to these
+# when a program asks for the default or the terminal is reset. Blinking is
+# not drawn yet.
+cursor_shape = "block"
+cursor_blink = false
 
 [terminal]
 # Maximum number of lines kept in scrollback per pane.

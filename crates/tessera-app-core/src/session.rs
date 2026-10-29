@@ -69,7 +69,7 @@ use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
 use tessera_pty::{ExitStatus, Pty, PtyError, PtyEvent, PtyEvents, PtySize};
-use tessera_term::{Request, Terminal};
+use tessera_term::{CursorStyle, Request, Terminal};
 
 use crate::input::MouseEvent;
 use crate::view::{MAX_VIEW_COLS, MAX_VIEW_ROWS};
@@ -608,16 +608,21 @@ struct InputState {
 impl Session {
     /// Wraps a spawned PTY and starts the writer thread for its input and
     /// the reader thread for its events. Both wake `signal` when they end.
+    /// The terminal has `cursor` as its default cursor style before the
+    /// reader feeds it the first byte.
     pub(crate) fn start(
         id: SessionId,
         pty: Box<dyn Pty>,
         events: PtyEvents,
         size: PtySize,
+        cursor: CursorStyle,
         observers: ObserverSlot,
         signal: &Arc<Signal>,
     ) -> io::Result<Self> {
         let pty = Arc::new(Mutex::new(pty));
-        let term = Arc::new(SharedTerminal::new(Terminal::new(size.rows, size.cols)));
+        let mut terminal = Terminal::new(size.rows, size.cols);
+        terminal.set_default_cursor_style(cursor);
+        let term = Arc::new(SharedTerminal::new(terminal));
         let muted = Arc::new(AtomicBool::new(false));
         let outbox = Arc::new(Outbox::default());
         let writer = Writer {

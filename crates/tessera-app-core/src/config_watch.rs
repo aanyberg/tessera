@@ -92,9 +92,9 @@ pub(crate) struct Live {
 
 impl Live {
     /// Applies `config` with the colours `colours` to every view and to
-    /// the views attached later; see [`App::apply_config`]. Returns whether
-    /// anything the views draw changed (and so whether the observer was
-    /// told).
+    /// the views attached later, and its cursor style to every session;
+    /// see [`App::apply_config`]. Returns whether anything the views draw
+    /// changed (and so whether the observer was told).
     pub(crate) fn apply(&self, config: &Config, colours: &tessera_config::Theme) -> bool {
         self.apply_from(config, colours, None)
     }
@@ -118,6 +118,8 @@ impl Live {
         let font_size = sanitize_font_size(config.appearance.font_size);
         let font_changed = sanitize_font_size(applied.config.appearance.font_size).to_bits()
             != font_size.to_bits();
+        let cursor = view::cursor_style_for(config);
+        let cursor_changed = view::cursor_style_for(&applied.config) != cursor;
         let mut resizes: Vec<SessionId> = Vec::new();
         for (id, view) in views.iter_mut() {
             if theme_changed {
@@ -153,7 +155,19 @@ impl Live {
                 tracing::warn!(session = %id, %error, ?size, "resizing a session to its view failed");
             }
         }
-        let changed = theme_changed || font_changed;
+        if cursor_changed {
+            // Each terminal's lock, after the views lock is released and
+            // with the sessions lock held only to list them (ADR 0014). A
+            // session the program gave a style of its own keeps it until it
+            // asks for the default (DECSCUSR 0) or resets (ADR 0020). One
+            // that starts meanwhile reads the configuration again once
+            // listed (`App::attach`).
+            let sessions: Vec<Arc<Session>> = lock(&self.sessions).values().cloned().collect();
+            for session in sessions {
+                session.with_terminal_mut(|term| term.set_default_cursor_style(cursor));
+            }
+        }
+        let changed = theme_changed || font_changed || cursor_changed;
         if changed {
             self.notify(opaque);
         }
@@ -622,7 +636,10 @@ mod tests {
     use tessera_pty::{ExitStatus, Pty, PtyError, PtyEvent};
     use tessera_render::{Fonts, Gpu, PhysicalSize, Rgba};
 
+    use tessera_grid::DamageRows;
+
     use super::*;
+    use crate::view::Snapshot;
     use crate::{ConfigPaths, SessionEvent, SessionObserver};
 
     /// A PTY that records its sizes and whether the views lock was free
@@ -1022,6 +1039,128 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         done()
+    }
+
+    fn beam(blink: bool) -> tessera_term::CursorStyle {
+        tessera_term::CursorStyle {
+            shape: tessera_term::CursorShape::Beam,
+            blink,
+        }
+    }
+
+    fn cursor_config(shape: tessera_config::CursorShape, blink: bool) -> Config {
+        let mut config = Config::default();
+        config.appearance.cursor_shape = shape;
+        config.appearance.cursor_blink = blink;
+        config
+    }
+
+    fn cursor_style_of(app: &App, id: SessionId) -> tessera_term::CursorStyle {
+        app.with_terminal(id, tessera_term::Terminal::cursor_style)
+            .expect("live session")
+    }
+
+    /// A6: a new session starts with the configured cursor style; a
+    /// changed default reaches the sessions that follow it (also one back
+    /// on the default with DECSCUSR 0) and not one whose program set a
+    /// style; an unchanged configuration damages nothing and tells nobody.
+    #[test]
+    fn apply_config_changes_the_default_cursor_of_live_sessions() {
+        use tessera_config::CursorShape;
+
+        let app = App::new(
+            cursor_config(CursorShape::Beam, false),
+            ConfigPaths::new("/nonexistent/tessera"),
+        );
+        let recorder = Recorder::default();
+        app.set_observer(Some(Box::new(recorder.clone())));
+        let [plain, reset, styled] = [(); 3].map(|()| attach_fake(&app).id);
+        for id in [plain, reset, styled] {
+            assert_eq!(cursor_style_of(&app, id), beam(false), "before any output");
+        }
+        let feed = |id, bytes: &[u8]| {
+            app.session(id)
+                .unwrap()
+                .with_terminal_mut(|term| term.advance(bytes));
+        };
+        feed(reset, b"\x1b[3 q\x1b[0 q");
+        feed(styled, b"\x1b[5 q");
+        let mut snapshots: Vec<Snapshot> = [plain, reset, styled]
+            .iter()
+            .map(|&id| {
+                let mut snapshot = Snapshot::default();
+                app.with_terminal(id, |term| snapshot.capture(term))
+                    .unwrap();
+                snapshot
+            })
+            .collect();
+        let damage = |snapshots: &mut [Snapshot]| -> Vec<DamageRows> {
+            [plain, reset, styled]
+                .iter()
+                .zip(snapshots.iter_mut())
+                .map(|(&id, snapshot)| {
+                    app.with_terminal(id, |term| snapshot.capture(term))
+                        .unwrap()
+                })
+                .collect()
+        };
+
+        let underline = cursor_config(CursorShape::Underline, true);
+        app.apply_config(&underline, &tessera_config::Theme::default());
+        let expected = tessera_term::CursorStyle {
+            shape: tessera_term::CursorShape::Underline,
+            blink: true,
+        };
+        assert_eq!(cursor_style_of(&app, plain), expected);
+        assert_eq!(cursor_style_of(&app, reset), expected, "Ps 0 follows");
+        assert_eq!(cursor_style_of(&app, styled), beam(true), "the program's");
+        assert_eq!(recorder.take(), [true], "the views redraw");
+        assert_eq!(
+            damage(&mut snapshots),
+            [
+                DamageRows::Rows(0..=0),
+                DamageRows::Rows(0..=0),
+                DamageRows::None
+            ]
+        );
+
+        // The same configuration again: nothing changes, nobody is told.
+        app.apply_config(&underline, &tessera_config::Theme::default());
+        assert_eq!(recorder.take(), Vec::<bool>::new());
+        assert_eq!(damage(&mut snapshots), vec![DamageRows::None; 3]);
+
+        // A session started now gets the new default.
+        let fresh = attach_fake(&app).id;
+        assert_eq!(cursor_style_of(&app, fresh), expected);
+    }
+
+    /// C5: an edit of `config.toml` that changes only the cursor keys is
+    /// applied by the watch to the running sessions.
+    #[test]
+    fn a_reload_of_only_the_cursor_keys_reaches_the_sessions() {
+        let base = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(base.path().join("Tessera"));
+        std::fs::create_dir_all(paths.root()).unwrap();
+        std::fs::write(paths.config_file(), "[appearance]\nfont_size = 14.0\n").unwrap();
+        let app = App::with_config_dir(paths.clone(), WatchOptions::default());
+        assert!(app.is_watching_config());
+        let id = attach_fake(&app).id;
+        assert_eq!(
+            cursor_style_of(&app, id),
+            tessera_term::CursorStyle::default()
+        );
+        std::fs::write(
+            paths.config_file(),
+            "[appearance]\nfont_size = 14.0\ncursor_shape = \"beam\"\ncursor_blink = true\n",
+        )
+        .unwrap();
+        assert!(
+            eventually(Duration::from_secs(5), || cursor_style_of(&app, id)
+                == beam(true)),
+            "{:?}",
+            cursor_style_of(&app, id)
+        );
+        assert_eq!(app.config().appearance.font_size, 14.0);
     }
 
     /// A configuration directory made by hand after launch is picked up:

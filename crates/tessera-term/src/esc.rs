@@ -60,6 +60,9 @@ impl State {
         self.grid.reset();
         self.grid.clear_scrollback();
         self.reset_modes();
+        // The configured cursor style applies again (DECSCUSR, DECSET 12);
+        // `reset_modes` cleared the blink record.
+        self.cursor_override = None;
         self.c1_8bit_replies = false;
     }
 
