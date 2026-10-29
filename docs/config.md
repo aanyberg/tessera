@@ -20,6 +20,8 @@ Default appearance; profiles may override.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `blur` | boolean | `false` | Background blur when opacity is below 1.0. |
+| `cursor_blink` | boolean | `false` | Whether the cursor blinks, unless a program says otherwise (as for `cursor_shape`). Recorded only for now: the cursor is drawn steady. |
+| `cursor_shape` | one of `"block"`, `"underline"`, `"beam"` | `"block"` | The cursor's shape: `"block"`, `"underline"` or `"beam"` (a vertical bar), exactly as written here. A program may change it (DECSCUSR, `CSI Ps SP q`, as vim and fish do); it returns to this one when the program asks for the default or resets the terminal. Any other value is reported with a warning and the default is used. |
 | `font_family` | string | `"Menlo"` | Font family. |
 | `font_size` | float | `13.0` | Font size in points, clamped on load to `4.0`..=`512.0`. |
 | `opacity` | float | `1.0` | Window opacity, 0.0..=1.0. |
@@ -64,6 +66,8 @@ Optional table; *unset* by default. It belongs to the `[[profiles]]` entry it fo
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `blur` | boolean | `false` | Background blur when opacity is below 1.0. |
+| `cursor_blink` | boolean | `false` | Whether the cursor blinks, unless a program says otherwise (as for `cursor_shape`). Recorded only for now: the cursor is drawn steady. |
+| `cursor_shape` | one of `"block"`, `"underline"`, `"beam"` | `"block"` | The cursor's shape: `"block"`, `"underline"` or `"beam"` (a vertical bar), exactly as written here. A program may change it (DECSCUSR, `CSI Ps SP q`, as vim and fish do); it returns to this one when the program asks for the default or resets the terminal. Any other value is reported with a warning and the default is used. |
 | `font_family` | string | `"Menlo"` | Font family. |
 | `font_size` | float | `13.0` | Font size in points, clamped on load to `4.0`..=`512.0`. |
 | `opacity` | float | `1.0` | Window opacity, 0.0..=1.0. |

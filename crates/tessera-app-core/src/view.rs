@@ -44,7 +44,7 @@ use tessera_render::{
     CursorShape, CursorState, Fonts, FrameInput, Gpu, RenderSurface, Renderer, Rgba, Shaper,
     SurfaceOptions, Theme, sanitize_font_size, sanitize_scale,
 };
-use tessera_term::Terminal;
+use tessera_term::{CursorStyle, Terminal};
 
 /// The shortest time between two presented frames of one view: one
 /// display period at 240 Hz, the fastest refresh a Mac display runs at.
@@ -189,6 +189,33 @@ pub fn theme_for(config: &Config, theme: &tessera_config::Theme) -> Theme {
             .map_or(defaults.search_match_current, rgba),
         ansi: theme.ansi.map(rgba),
         ..defaults
+    }
+}
+
+/// The cursor style a session starts with and returns to (DECSCUSR 0,
+/// resets): `[appearance] cursor_shape` and `cursor_blink`
+/// ([`Terminal::set_default_cursor_style`]).
+pub(crate) fn cursor_style_for(config: &Config) -> CursorStyle {
+    let appearance = &config.appearance;
+    let shape = match appearance.cursor_shape {
+        tessera_config::CursorShape::Block => tessera_term::CursorShape::Block,
+        tessera_config::CursorShape::Underline => tessera_term::CursorShape::Underline,
+        tessera_config::CursorShape::Beam => tessera_term::CursorShape::Beam,
+    };
+    CursorStyle {
+        shape,
+        blink: appearance.cursor_blink,
+    }
+}
+
+/// The renderer's shape for the terminal's: the same three. Blinking is
+/// not drawn yet (the host's blink clock is a follow-up), so it has no
+/// counterpart here.
+fn render_shape(shape: tessera_term::CursorShape) -> CursorShape {
+    match shape {
+        tessera_term::CursorShape::Block => CursorShape::Block,
+        tessera_term::CursorShape::Underline => CursorShape::Underline,
+        tessera_term::CursorShape::Beam => CursorShape::Beam,
     }
 }
 
@@ -614,6 +641,10 @@ pub(crate) struct Snapshot {
     /// The terminal hid its cursor (DECTCEM, `CSI ? 25 l`) at the last
     /// capture.
     cursor_hidden: bool,
+    /// The cursor's shape at the last capture
+    /// ([`Terminal::cursor_style`]); its blink bit is not drawn, so not
+    /// kept.
+    cursor_shape: CursorShape,
     /// The grid generation of the last capture; `None` before the first.
     generation: Option<u64>,
     /// Rows compared by partial captures, for tests.
@@ -622,20 +653,24 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
-    /// Brings the snapshot up to date with `term`'s visible rows, cursor
-    /// and cursor visibility ([`Modes::cursor_visible`], one copy of the
-    /// terminal's modes), and returns the rows that changed: those whose
-    /// cells or clusters changed (see [`Self::capture_grid`]) and the
-    /// cursor's row when the cursor was shown or hidden.
+    /// Brings the snapshot up to date with `term`'s visible rows, cursor,
+    /// cursor visibility ([`Modes::cursor_visible`], one copy of the
+    /// terminal's modes) and cursor shape ([`Terminal::cursor_style`]),
+    /// and returns the rows that changed: those whose cells or clusters
+    /// changed (see [`Self::capture_grid`]) and the cursor's row when the
+    /// cursor was shown or hidden or changed shape. A change of the blink
+    /// bit alone damages nothing: blinking is not drawn.
     ///
     /// [`Modes::cursor_visible`]: tessera_term::Modes::cursor_visible
     pub(crate) fn capture(&mut self, term: &Terminal) -> DamageRows {
         let hidden = !term.modes().cursor_visible;
+        let shape = render_shape(term.cursor_style().shape);
         let changed = self.capture_grid(term.grid());
-        if hidden == self.cursor_hidden {
+        if hidden == self.cursor_hidden && shape == self.cursor_shape {
             return changed;
         }
         self.cursor_hidden = hidden;
+        self.cursor_shape = shape;
         changed.with_row(self.cursor.row)
     }
 
@@ -731,18 +766,18 @@ impl Snapshot {
     }
 
     /// The frame drawing `rows` (this snapshot's [`Self::rows`]) with the
-    /// rows' grapheme clusters: a block cursor at the captured cursor
-    /// position, drawn unless the terminal hid it (DECTCEM), `focused` (an
-    /// unfocused frame draws the cursor hollow), no selection and no
-    /// overlays, and the default damage
-    /// ([`DamageRows::All`]). The viewport (#31), cursor blink and shape
-    /// (#27, #29) are still to come.
+    /// rows' grapheme clusters: a cursor of the captured shape at the
+    /// captured cursor position, drawn unless the terminal hid it
+    /// (DECTCEM), `focused` (an unfocused frame draws every shape hollow),
+    /// no selection and no overlays, and the default damage
+    /// ([`DamageRows::All`]). The viewport (#31) and cursor blink (a host
+    /// clock) are still to come.
     pub(crate) fn frame<'a>(&'a self, rows: &'a [&'a [Cell]], focused: bool) -> FrameInput<'a> {
         let Point { row, col } = self.cursor;
         FrameInput::new(rows)
             .with_clusters(&self.clusters)
             .with_cursor(Some(
-                CursorState::new(row, col, CursorShape::Block).with_visible(!self.cursor_hidden),
+                CursorState::new(row, col, self.cursor_shape).with_visible(!self.cursor_hidden),
             ))
             .with_focus(focused)
     }
@@ -1012,6 +1047,230 @@ mod tests {
             unfocused.drawn_cursor(),
             Some((cursor, CursorShape::HollowBlock))
         );
+    }
+
+    /// The steady underline the cursor-style tests configure, so the
+    /// configured default and an explicit block differ.
+    const UNDERLINE: CursorStyle = CursorStyle {
+        shape: tessera_term::CursorShape::Underline,
+        blink: false,
+    };
+
+    /// The shape of the cursor `snapshot`'s focused frame carries.
+    fn frame_shape(snapshot: &Snapshot) -> Option<CursorShape> {
+        let rows = snapshot.rows();
+        snapshot
+            .frame(&rows, true)
+            .cursor
+            .map(|cursor| cursor.shape)
+    }
+
+    /// A1: each DECSCUSR shape reaches the frame; Ps 0 is the configured
+    /// default (here an underline, so it is not the block before it).
+    #[test]
+    fn decscusr_shapes_reach_the_frame() {
+        let mut term = Terminal::new(3, 4);
+        term.set_default_cursor_style(UNDERLINE);
+        let mut snapshot = Snapshot::default();
+        snapshot.capture(&term);
+        assert_eq!(frame_shape(&snapshot), Some(CursorShape::Underline));
+        for (seq, shape) in [
+            (&b"\x1b[5 q"[..], CursorShape::Beam),
+            (b"\x1b[4 q", CursorShape::Underline),
+            (b"\x1b[2 q", CursorShape::Block),
+            (b"\x1b[0 q", CursorShape::Underline),
+        ] {
+            term.advance(seq);
+            snapshot.capture(&term);
+            assert_eq!(frame_shape(&snapshot), Some(shape), "{seq:?}");
+        }
+    }
+
+    /// A2 and D-FOCUS: DECTCEM hides every shape, and an unfocused frame
+    /// draws every shape hollow.
+    #[test]
+    fn hidden_wins_over_the_shape_and_unfocused_is_hollow() {
+        for (seq, shape) in [
+            (&b"\x1b[2 q"[..], CursorShape::Block),
+            (b"\x1b[4 q", CursorShape::Underline),
+            (b"\x1b[6 q", CursorShape::Beam),
+        ] {
+            let mut term = Terminal::new(3, 4);
+            term.advance(seq);
+            let mut snapshot = Snapshot::default();
+            snapshot.capture(&term);
+            let rows = snapshot.rows();
+            let focused = snapshot.frame(&rows, true);
+            assert_eq!(focused.drawn_cursor().map(|(_, s)| s), Some(shape));
+            let unfocused = snapshot.frame(&rows, false);
+            assert_eq!(
+                unfocused.drawn_cursor().map(|(_, s)| s),
+                Some(CursorShape::HollowBlock),
+                "{seq:?} unfocused"
+            );
+            term.advance(b"\x1b[?25l");
+            snapshot.capture(&term);
+            let rows = snapshot.rows();
+            let frame = snapshot.frame(&rows, true);
+            assert_eq!(
+                frame.cursor.map(|c| (c.shape, c.visible)),
+                Some((shape, false))
+            );
+            assert_eq!(frame.drawn_cursor(), None, "{seq:?} hidden");
+        }
+    }
+
+    /// A3 and A4: a shape change damages the cursor's row and nothing
+    /// else; the same shape again, Ps 0 on the default and a change of the
+    /// blink bit alone damage nothing and leave the frame as it was.
+    #[test]
+    fn a_shape_change_damages_only_the_cursor_row() {
+        let mut term = Terminal::new(4, 6);
+        term.advance(b"ab\r\ncd\r\nef");
+        let mut snapshot = Snapshot::default();
+        snapshot.capture(&term);
+        assert_eq!(snapshot.capture(&term), DamageRows::None, "idle");
+        term.advance(b"\x1b[0 q");
+        assert_eq!(
+            snapshot.capture(&term),
+            DamageRows::None,
+            "Ps 0 on the default"
+        );
+        term.advance(b"\x1b[2 q");
+        assert_eq!(
+            snapshot.capture(&term),
+            DamageRows::None,
+            "a steady block again"
+        );
+        term.advance(b"\x1b[5 q");
+        assert_eq!(snapshot.capture(&term), DamageRows::Rows(2..=2), "beam");
+        term.advance(b"\x1b[5 q");
+        assert_eq!(snapshot.capture(&term), DamageRows::None, "beam again");
+        term.advance(b"\x1b[2 q");
+        assert_eq!(snapshot.capture(&term), DamageRows::Rows(2..=2), "block");
+        let mut steady = Snapshot::default();
+        steady.capture(&term);
+        term.advance(b"\x1b[1 q");
+        assert!(term.cursor_style().blink);
+        assert_eq!(snapshot.capture(&term), DamageRows::None, "blink only");
+        let (steady_rows, rows) = (steady.rows(), snapshot.rows());
+        assert_eq!(
+            snapshot.frame(&rows, true),
+            steady.frame(&steady_rows, true),
+            "blink only: the same frame"
+        );
+        // And a live default change reaches a session without a style.
+        term.advance(b"\x1b[0 q");
+        assert_eq!(
+            snapshot.capture(&term),
+            DamageRows::None,
+            "back to a steady block"
+        );
+        term.set_default_cursor_style(UNDERLINE);
+        assert_eq!(
+            snapshot.capture(&term),
+            DamageRows::Rows(2..=2),
+            "new default"
+        );
+        assert_eq!(frame_shape(&snapshot), Some(CursorShape::Underline));
+        term.set_default_cursor_style(UNDERLINE);
+        assert_eq!(
+            snapshot.capture(&term),
+            DamageRows::None,
+            "the same default"
+        );
+    }
+
+    /// A3 on a real view: an unchanged style is `Skipped`, a changed one
+    /// is drawn.
+    #[test]
+    fn an_unchanged_style_skips_the_frame() {
+        let Some(mut view) = offscreen_view(3, 10) else {
+            return;
+        };
+        let mut term = Terminal::new(3, 10);
+        view.capture(&term);
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+        for (seq, status) in [
+            (&b"\x1b[2 q"[..], FrameStatus::Skipped),
+            (b"\x1b[0 q", FrameStatus::Skipped),
+            (b"\x1b[1 q", FrameStatus::Skipped),
+            (b"\x1b[4 q", FrameStatus::Presented),
+            (b"\x1b[4 q", FrameStatus::Skipped),
+        ] {
+            next_frame();
+            term.advance(seq);
+            view.capture(&term);
+            assert_eq!(view.render(true).expect("frame"), status, "{seq:?}");
+        }
+    }
+
+    /// A5: the pixels of the cursor's cell after DECSCUSR 5, 4 and 2, on a
+    /// red background with a green cursor. The beam is a column band at
+    /// the cell's left edge and the underline a row band at its bottom,
+    /// each the renderer's one stroke wide (measured, and the two must
+    /// agree: the stroke is not public); the block fills the cell. The
+    /// cell to the right stays background.
+    #[test]
+    fn the_cursor_cell_shows_the_shape() {
+        let Some(mut view) = offscreen_view(2, 4) else {
+            return;
+        };
+        view.set_appearance(Theme {
+            background: tessera_render::Rgba::new(1.0, 0.0, 0.0, 1.0),
+            cursor: tessera_render::Rgba::new(0.0, 1.0, 0.0, 1.0),
+            ..view.theme().clone()
+        });
+        let width = usize::try_from(view.size().pixels.width).expect("width");
+        let pad = usize::try_from(view.padding_px()).expect("padding");
+        let metrics = view.cell_metrics();
+        let (cw, ch) = (
+            usize::try_from(metrics.width_px).expect("cell width"),
+            usize::try_from(metrics.height_px).expect("cell height"),
+        );
+        let mut term = Terminal::new(2, 4);
+        let mut draw = |seq: &[u8]| {
+            next_frame();
+            term.advance(seq);
+            view.capture(&term);
+            assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+            let image = view.read_back();
+            // The cursor's cell and the one right of it, true where green.
+            let cell = |col: usize| -> Vec<Vec<bool>> {
+                (0..ch)
+                    .map(|y| {
+                        (0..cw)
+                            .map(|x| {
+                                let at = ((pad + y) * width + pad + col * cw + x) * 4;
+                                match image[at..at + 4] {
+                                    [0, 255, 0, 255] => true,
+                                    [255, 0, 0, 255] => false,
+                                    ref other => panic!("{seq:?}: pixel {x},{y} is {other:?}"),
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect()
+            };
+            assert!(cell(1).iter().flatten().all(|g| !g), "{seq:?}: next cell");
+            cell(0)
+        };
+        let beam = draw(b"\x1b[5 q");
+        let stroke = beam[0].iter().take_while(|g| **g).count();
+        assert!((1..cw / 2).contains(&stroke), "beam {stroke} px of {cw}");
+        for row in &beam {
+            let expect: Vec<bool> = (0..cw).map(|x| x < stroke).collect();
+            assert_eq!(*row, expect, "beam: left {stroke} columns only");
+        }
+        let underline = draw(b"\x1b[4 q");
+        for (y, row) in underline.iter().enumerate() {
+            assert!(
+                row.iter().all(|g| *g == (y >= ch - stroke)),
+                "underline row {y}"
+            );
+        }
+        let block = draw(b"\x1b[2 q");
+        assert!(block.iter().flatten().all(|g| *g), "block fills the cell");
     }
 
     /// The `ascii` line of the wave's performance corpus.

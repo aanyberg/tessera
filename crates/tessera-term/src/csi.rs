@@ -32,6 +32,7 @@
 //! | `CSI > Pp ; Pv m` | XTMODKEYS | `modifyOtherKeys` (Pp 4) |
 //! | `CSI > flags u` `CSI < n u` `CSI = flags ; mode u` | kitty keyboard | push / pop / set the keyboard flags |
 //! | `CSI ! p` | DECSTR | soft terminal reset, see the crate documentation; parameters are ignored, as in xterm, so `CSI 5 ! p` resets too |
+//! | `CSI Ps SP q` | DECSCUSR | cursor style: 1..=6 blinking/steady block, underline, beam; 0, absent and 7 the configured default; anything else ignored (see `State::set_cursor_style`) |
 //! | `CSI Pl ; Pc " p` | DECSCL | select conformance level: for `Pl` 61..=65, the DECSTR soft reset, then level `Pl - 60` and the C1 reply mode from `Pc`; any other `Pl` does nothing |
 //!
 //! Parameters follow xterm: an absent parameter and an explicit `0` both
@@ -76,29 +77,30 @@
 //! its default `decTerminalID` 420, accepts only up to 64). Nothing is
 //! answered; `State::select_conformance_level` has the details.
 //!
-//! DECSET/DECRST, SM/RM, DECSCL and the kitty keyboard sequences are
+//! DECSET/DECRST, SM/RM, DECSCL, DECSCUSR and the kitty keyboard sequences are
 //! ignored as a whole when a parameter carries a colon sub-parameter
 //! (`CSI ? 25:1049 h`), as in xterm, which accepts them only in SGR and
 //! XTMODKEYS.
 //!
 //! Everything else (an unassigned final, any other private marker and
 //! final pair such as `CSI > 25 h` or `CSI ? 5 m`, any other intermediate
-//! such as `SP` or `$`, `"` with a final other than `p`, and the xterm
-//! extension SL/SR that is not in scope) is ignored and logged at trace
-//! level. The parser hands over private markers as intermediates, so one
+//! such as `$`, `SP` with a final other than `q` and `"` with one other
+//! than `p`, a private marker before `SP q`, and the xterm extension SL/SR
+//! that is not in scope) is ignored and logged at trace level. The parser hands over private markers as intermediates, so one
 //! match covers both.
 //!
 //! Expected behaviour per sequence and edge case is pinned by
 //! `tests/fixtures/csi_spec.txt`, for DECSTR by
-//! `tests/fixtures/decstr_spec.txt` and for the modes by
-//! `tests/fixtures/modes_spec.txt`.
+//! `tests/fixtures/decstr_spec.txt`, for the modes by
+//! `tests/fixtures/modes_spec.txt` and for DECSCUSR by
+//! `tests/fixtures/decscusr_spec.txt`.
 //!
 //! [`Action::Csi`]: tessera_vt::Action::Csi
 
 use tessera_grid::{Cell, EraseDisplay, EraseLine, Style};
 use tracing::trace;
 
-use crate::State;
+use crate::{CursorShape, CursorStyle, State};
 
 /// Parameter `index`, or `default` when it is absent or zero.
 fn param_or(params: &[u16], index: usize, default: u16) -> u16 {
@@ -151,7 +153,7 @@ impl State {
                     }
                 }
                 // xterm takes colon sub-parameters only in SGR and XTMODKEYS.
-                (b"?", 'h' | 'l') | ([b'>' | b'<' | b'='], 'u') if subparams != 0 => {
+                (b"?", 'h' | 'l') | ([b'>' | b'<' | b'='], 'u') | (b" ", 'q') if subparams != 0 => {
                     trace!(
                         ?action,
                         ?params,
@@ -159,6 +161,7 @@ impl State {
                     );
                 }
                 (b"?", 'h' | 'l') => self.set_dec_modes(params, action == 'h'),
+                (b" ", 'q') => self.set_cursor_style(selector(params, 0)),
                 (b">", 'm') => self.set_key_modifiers(params),
                 ([marker @ (b'>' | b'<' | b'=')], 'u') => self.kitty_keyboard(*marker, params),
                 _ => trace!(
@@ -357,12 +360,45 @@ impl State {
         // copy; its pending wrap is cleared too (xterm copies the live one).
         // DECSC and SCOSC share this slot, so DECRC and SCORC both home.
         self.grid.reset_saved_cursor();
-        // #112, #95, #97, #113, #9: reset here once the state exists:
+        // The program's cursor style (DECSCUSR and DECSET 12) gives way to
+        // the configured one; `soft_reset_modes` cleared the blink record.
+        // xterm's `ReallyReset` common part does the same for DECSTR, DECSCL
+        // and RIS (ADR 0020).
+        self.cursor_override = None;
+        // #112, #95, #97, #9: reset here once the state exists:
         // G0-G3/GL/GR and DECNRCM to their defaults (SCS, #112), DECSCA off
         // (#95), DECLRMM off with full left/right margins and reverse wrap
-        // (?45) to its default (#97), the cursor shape and blink (DECSCUSR,
-        // `CSI Ps SP q`, #113) to the default, and the OSC 4 palette to the
-        // theme (xterm's ResetAnsiColorRequest, #9).
+        // (?45) to its default (#97), and the OSC 4 palette to the theme
+        // (xterm's ResetAnsiColorRequest, #9).
+    }
+
+    /// DECSCUSR (`CSI Ps SP q`) with its first parameter `ps`: 1 and 2 a
+    /// blinking and a steady block, 3 and 4 an underline, 5 and 6 a beam
+    /// (xterm's bar). 0, an absent or empty first parameter and 7 (xterm's
+    /// "initial resources") drop the program's style, so the configured
+    /// default applies again (xterm and the VT510 manual make 0 a blinking
+    /// block; ADR 0020). Any other value changes nothing. Every accepted
+    /// value also records its blink bit in [`Modes::cursor_blink`], the one
+    /// program-controlled blink bit DECSET 12 shares (0 and 7 clear it).
+    ///
+    /// [`Modes::cursor_blink`]: crate::Modes::cursor_blink
+    fn set_cursor_style(&mut self, ps: u16) {
+        let style = |shape, blink| Some(CursorStyle { shape, blink });
+        let style = match ps {
+            0 | 7 => None,
+            1 => style(CursorShape::Block, true),
+            2 => style(CursorShape::Block, false),
+            3 => style(CursorShape::Underline, true),
+            4 => style(CursorShape::Underline, false),
+            5 => style(CursorShape::Beam, true),
+            6 => style(CursorShape::Beam, false),
+            _ => {
+                trace!(ps, "DECSCUSR style ignored");
+                return;
+            }
+        };
+        self.cursor_override = style;
+        self.modes.cursor_blink = style.is_some_and(|style| style.blink);
     }
 
     /// DECSCL (`CSI Pl ; Pc " p`), xterm's `CASE_DECSCL`. For `Pl` 61..=65

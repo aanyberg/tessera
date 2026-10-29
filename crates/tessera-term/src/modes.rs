@@ -21,7 +21,7 @@
 //! | 6 | DECOM | [`Modes::origin`]; set and reset home the cursor (to the region's top in origin mode) |
 //! | 7 | DECAWM | [`Modes::auto_wrap`]; a pending wrap stays armed |
 //! | 9, 1000, 1002, 1003 | mouse tracking | [`Modes::mouse`], one at a time; resetting any of them turns tracking off |
-//! | 12 | cursor blink | [`Modes::cursor_blink`], stored only |
+//! | 12 | cursor blink | blinking on or off with the shape in effect: [`Terminal::cursor_style`](crate::Terminal::cursor_style) becomes the program's, as after DECSCUSR, and [`Modes::cursor_blink`] records the bit DECSCUSR shares |
 //! | 25 | DECTCEM | [`Modes::cursor_visible`] |
 //! | 40 | allow 80 ⇄ 132 | [`Modes::allow_column_change`] |
 //! | 47 | alternate screen | enter; reset leaves with the cursor where it is |
@@ -85,7 +85,7 @@ use tessera_grid::EraseDisplay;
 use tracing::trace;
 
 use crate::keyboard::{KeyboardModes, KittyFlags, KittyFlagsMode, ModifyOtherKeys};
-use crate::{Request, State};
+use crate::{CursorStyle, Request, State};
 
 /// The terminal modes that are not about the keyboard, as
 /// [`Terminal::modes`](crate::Terminal::modes) reports them.
@@ -107,8 +107,13 @@ pub struct Modes {
     pub auto_wrap: bool,
     /// DECTCEM (DECSET 25): the cursor is drawn. Default on.
     pub cursor_visible: bool,
-    /// DECSET 12 (xterm's `att610` blink): the application asked for a
-    /// blinking cursor. Stored only.
+    /// The last blink bit the application asked for: set and cleared by
+    /// DECSET/DECRST 12 (xterm's `att610` blink) and by DECSCUSR (`CSI Ps
+    /// SP q`: odd Ps on, even off, 0 and 7 off), which share one bit as in
+    /// xterm; cleared by DECSTR, DECSCL and RIS. Whether the cursor blinks
+    /// is [`Terminal::cursor_style`](crate::Terminal::cursor_style), which
+    /// also counts the configured default; this is the record a DECRQM 12
+    /// reply will answer from.
     pub cursor_blink: bool,
     /// DECSCNM (DECSET 5): the whole screen is shown in reverse video.
     /// Stored only.
@@ -289,7 +294,7 @@ impl State {
             }
             7 => self.modes.auto_wrap = on,
             9 => self.set_mouse_tracking(MouseTracking::X10, on),
-            12 => self.modes.cursor_blink = on,
+            12 => self.set_cursor_blink(on),
             25 => self.modes.cursor_visible = on,
             40 => self.modes.allow_column_change = on,
             47 => {
@@ -344,6 +349,19 @@ impl State {
             2026 => self.modes.synchronized_output = on,
             _ => trace!(mode, on, "DECSET/DECRST mode ignored"),
         }
+    }
+
+    /// DECSET/DECRST 12 (xterm's `att610` blink): turns blinking on or off
+    /// and keeps the shape in effect. It shares the one program-controlled
+    /// blink bit with DECSCUSR (xterm's `cursor_blink_esc`, last writer
+    /// wins), so it records the bit in [`Modes::cursor_blink`] and makes
+    /// the style the program's: `Some(shape in effect, on)` (Alacritty's
+    /// `get_or_insert`), which then no longer follows the configured
+    /// default until DECSCUSR 0 or a reset.
+    fn set_cursor_blink(&mut self, on: bool) {
+        self.modes.cursor_blink = on;
+        let shape = self.cursor_style().shape;
+        self.cursor_override = Some(CursorStyle { shape, blink: on });
     }
 
     /// One of 9, 1000, 1002 and 1003: setting one replaces the others;

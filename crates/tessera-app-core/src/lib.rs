@@ -310,16 +310,29 @@ impl App {
         events: PtyEvents,
         size: PtySize,
     ) -> Result<SessionId> {
+        // The configured cursor style is the terminal's before its first
+        // byte (#113).
+        let cursor = view::cursor_style_for(&self.config());
         let session = Session::start(
             id,
             pty,
             events,
             size,
+            cursor,
             Arc::clone(&self.observers),
             self.reaper.signal(),
         )
         .map_err(|source| Error::ReaderThread { id, source })?;
-        lock(&self.sessions).insert(id, Arc::new(session));
+        let session = Arc::new(session);
+        lock(&self.sessions).insert(id, Arc::clone(&session));
+        // A configuration applied while the session started set the new
+        // style on the sessions it found, before this one was listed: read
+        // it again now that it is (`Live::apply` lists the sessions after
+        // it records the configuration).
+        let now = view::cursor_style_for(&self.config());
+        if now != cursor {
+            session.with_terminal_mut(|term| term.set_default_cursor_style(now));
+        }
         Ok(id)
     }
 
@@ -991,7 +1004,15 @@ impl App {
     /// a font database loaded later: the views keep the font they were
     /// attached with.
     ///
-    /// When anything the views draw changed, the observer's
+    /// A changed `cursor_shape` or `cursor_blink` becomes every session's
+    /// default cursor style ([`tessera_term::Terminal::set_default_cursor_style`]):
+    /// sessions that follow the default show it from their next frame,
+    /// and a session whose program set a style of its own (DECSCUSR,
+    /// DECSET 12) keeps it until the program asks for the default or
+    /// resets the terminal. New sessions start with the configured style.
+    ///
+    /// When anything the views draw changed, the cursor default included,
+    /// the observer's
     /// [`SessionObserver::on_appearance_changed`] is then called on this
     /// thread with whether the background is opaque.
     ///

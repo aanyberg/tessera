@@ -1,0 +1,653 @@
+# =============================================================================
+# tessera-term: DECSCUSR cursor style (CSI Ps SP q) and DECSET/DECRST ?12   (issue #113, wave 7)
+# crates/tessera-term/tests/fixtures/decscusr_spec.txt   (spec-researcher output, 2026-10-29)
+#
+# One table-driven test (tests/decscusr.rs) runs every case and reports every failing id. Layout follows
+# decstr_spec.txt / modes_spec.txt (### ID / size / step / cite / note / flags), with these keys:
+#     default:  OPTIONAL, applied with Terminal::set_default_cursor_style BEFORE the first step.
+#               "<shape> <steady|blink>", shape = block|underline|beam. Absent = "block steady"
+#               (the config defaults: cursor_shape = "block", cursor_blink = false).
+#     step: feed <bytes>            \e \x1b \\ \r \n escapes as in the other fixtures; also run each case once with
+#                                   the bytes split at every offset (Chunking), as the other tables do.
+#     step: set_default <shape> <steady|blink>   Terminal::set_default_cursor_style mid-script (live apply_config)
+#     expect:   zero or more, checked after the steps listed ABOVE it. "<shape> <steady|blink>" is
+#               Terminal::cursor_style() (the effective style: what the renderer and host see).
+#               Optional extra " modes_blink=<true|false>" asserts Terminal::modes().cursor_blink.
+#     screen:/cursor:   OPTIONAL (same rendering as csi_spec.txt: `|` after the cursor cell; 0-based (row,col)),
+#               only where "the sequence must not print or swallow text" is the point.
+#     requests: [] on every row (DECSCUSR and ?12 never queue a host request) -- tests/decscusr.rs asserts
+#               take_requests() is empty at the end of every case; rows do not repeat it.
+#     flags:    xterm-quirk | decision (D-xxx below) | control | negative | unverified | deferred
+#               (deferred = cannot run until DCS/DECRQSS or DECRQM replies exist; the test skips these and counts
+#               them, it does not drop them)
+#
+# PRIMARY SOURCES (fetched 2026-10-29)
+#   [CTL]  xterm ctlseqs https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+#          "CSI Ps SP q  Set cursor style (DECSCUSR), VT520.  Ps = 0 -> blinking block. 1 -> blinking block (default).
+#           2 -> steady block. 3 -> blinking underline. 4 -> steady underline. 5 -> blinking bar, xterm.
+#           6 -> steady bar, xterm.  7 -> initial resources, xterm. XTerm restores the initial state of the cursor
+#           using resource settings: cursorBlink, cursorUnderLine, and cursorBar."
+#          "CSI ? Ps h/l: 12 -> Start/Stop blinking cursor (AT&T 610). 13 -> read-only, set only via resource or menu.
+#           14 -> Enable/Disable XOR of blinking cursor control sequence and menu (read-only, via resource)."
+#          DECRQSS: "DCS $ q Pt ST ... xterm responds with DCS 1 $ r Pt ST for valid requests, replacing the Pt with
+#           the corresponding CSI string, or DCS 0 $ r ST for invalid requests"; the list includes "SP q => DECSCUSR".
+#          "CSI ! p  Soft terminal reset (DECSTR)" -- ctlseqs lists nothing that it resets (as noted in decstr_spec.txt).
+#   [DEC]  VT510 RM https://vt100.net/docs/vt510-rm/DECSCUSR  Ps 0, 1 or none = blink block (default), 2 steady block,
+#          3 blink underline, 4 steady underline. 5/6 (bar) do not exist in DEC; xterm's extension. "causes the cursor
+#          to be displayed in a different style when the cursor is enabled" (DECTCEM still hides it).
+#          https://vt100.net/docs/vt510-rm/DECSC.html: DECSC saves position, SGR, GL/GR charsets, wrap flag, DECOM,
+#          DECSCA, SS2/SS3 -- NOT the cursor style.
+#   [XT]   xterm source, ThomasDickey/xterm-snapshots master (line numbers as fetched 2026-10-29):
+#            charproc.c L4949..5004 CASE_DECSCUSR (the handler); ptyx.h L2486..2495 enum XtCursorStyle
+#              (DEFAULT_STYLE=0, BLINK_BLOCK=1, STEADY_BLOCK=2, BLINK_UNDERLINE=3, STEADY_UNDERLINE=4, BLINK_BAR=5,
+#              STEADY_BAR=6, INITIAL_CURSOR=7); charproc.c L176 `#define DEFAULT -1` (a missing parameter);
+#            charproc.c L7347..7381 DoStartBlinking/SetCursorBlink; L7625..7631, L8104..8106, L8488..8491 dpmodes
+#              case srm_ATT610_BLINK (set/query/reset); misc.c L5517..5519 DECRQM ?12; misc.c L4939..4950 DECRQSS " q";
+#            charproc.c L10935..10958 resource init (initial_cursor); L14379..14384 ReallyReset (COMMON part: runs for
+#              DECSTR, DECSCL and RIS): `screen->cursor_set = ON; InitCursorShape(screen, screen);
+#              screen->cursor_blink_esc = 0; SetCursorBlink(xw, screen->cursor_blink_i);`
+#            cursor.c CursorSave2 L398..416: saves row, col, flags, GL/GR, wrap_flag, colours, charsets. No cursor_shape.
+#   [KT]   kitty kitty/vt-parser.c L1426 (`case DECSCUSR`), kitty/screen.c L3378..3388 screen_set_cursor,
+#          L3779..3790 (DECRQSS " q" reply `1$r%d q`), L2063 (?12 -> `non_blinking = !val`, same field).
+#   [AL]   Alacritty alacritty_terminal: vte/ansi.rs (alacritty/vte master) L1716..1732, term/mod.rs L1835..1840
+#          (reset_state: `cursor_style = None`), L1987..1990 (?12 h: `get_or_insert(default).blinking = true`),
+#          L2204..2210 (set_cursor_style), L942..949 (`cursor_style()` = override or config default).
+#   [WZ]   WezTerm wezterm-escape-parser/src/csi.rs L257..270 (CursorStyle enum, Default = 0) and L2056..2066
+#          (cursor_style parse), term/src/terminalstate/mod.rs L1552..1560 (?12 set/reset ignored, DECRQM says
+#          "recognised, reset"), L2705..2717.
+#   [GH]   Ghostty https://ghostty.org/docs/vt/csi/decscusr: "n must be an integer between 0 and 6"; 0 = "the terminal
+#          default ... up to the terminal and is inconsistent across implementations". Silent on out of range.
+#   Not verified (no reachable authoritative source in this run): Terminal.app (long reported to ignore DECSCUSR),
+#   iTerm2 (documented to support 0..6), foot. Rows citing only xterm are therefore xterm-only.
+#
+# WHAT XTERM ACTUALLY DOES -- the facts the brief's design must be reconciled with
+#   1. ONE blink flag, not two. DECSCUSR writes screen->cursor_blink_esc (charproc.c L4999) and DECSET/DECRST 12
+#      writes the SAME field (set_bool_mode(screen->cursor_blink_esc), L7628). Last writer wins. There is no "DECSCUSR
+#      blink || ?12" in xterm; the only combination is  effective = cursor_blink (resource/menu) OR-or-XOR
+#      cursor_blink_esc  (DoStartBlinking L7347; XOR when cursorBlinkXOR, whose compiled default is True, L566).
+#      DECRQM ?12 reports cursor_blink_esc (misc.c L5518), i.e. it reflects DECSCUSR too. Alacritty and kitty have
+#      the same single-flag model (their style struct / cursor.non_blinking). WezTerm ignores ?12 entirely.
+#   2. The shape is set unconditionally; the blink bit is applied only if the resource cursorBlink is not
+#      "always"/"never" (SettableCursorBlink, L148). Irrelevant to Tessera (no such resource).
+#   3. DECSCUSR is NOT part of the saved cursor (DECSC/DECRC, alt screen 1048/1049): shape lives in TScreen, not per buffer.
+#   4. Ps 0 in xterm is a LITERAL "blinking block" (case DEFAULT_STYLE falls through to BLINK_BLOCK, L4964..4967), not
+#      "the resource default". Only Ps 7 (INITIAL_CURSOR) means "the resource default" (L4958). Alacritty (0 -> None ->
+#      config default), kitty (0 -> shape reset to config, blink on), WezTerm (CursorShape::Default) and Ghostty make
+#      0 mean "the terminal's configured default"; that is what the brief wants ("Ps 0 returns the configured default").
+#   5. Unknown Ps (8, 9, ..., 65535, and negatives cannot occur): no `case` matches, xterm changes NOTHING (but still
+#      HideCursor/redraws). Extra parameters: xterm reads GetParam(0) only. After ReallyReset (DECSTR, DECSCL, RIS) shape
+#      and blink go back to the RESOURCE values (InitCursorShape from cursor_underline/cursor_bar; cursor_blink_esc = 0;
+#      cursor_blink = initial), i.e. to the configured default, NOT to "blinking block".
+#
+# DECISIONS FOR THE MILESTONE LEAD (recommended option first; the expect: lines below encode the recommendation)
+#   D-BLINKFLAG  ONE program-controlled blink bit shared by ?12 and DECSCUSR (xterm, Alacritty, kitty), NOT
+#                "DECSCUSR blink || ?12". The brief's `cursor_style().blink = DECSCUSR blink || Modes::cursor_blink` is
+#                wrong for xterm: `CSI 1 SP q` then `CSI ? 12 l` must give STEADY (rows B03, B07), and `CSI ? 12 h`
+#                then `CSI 2 SP q` must give STEADY (B02); the OR model gives blinking in both. Recommended model:
+#                program_override: Option<CursorStyle> (None = follow the config default, like Alacritty's
+#                `cursor_style: Option`); DECSCUSR 1..6 sets Some(..); ?12 h/l materialises Some(default.shape, blink=on/off)
+#                (Alacritty `get_or_insert(default)`). cursor_style() = override.unwrap_or(default). Keep
+#                Modes::cursor_blink as the record "last program-requested blink bit" and write it from BOTH paths
+#                (DECSET 12 as today; DECSCUSR sets it to its blink bit; reset clears it) so MODE01/BLINK01 keep passing
+#                and a future DECRQM ?12 can answer from it. Rows carry `modes_blink=` for this.
+#   D-PS0        `CSI 0 SP q` and `CSI SP q` (missing Ps): recommended = clear the override, i.e. effective style becomes
+#                the CONFIGURED default (Alacritty, kitty's shape, WezTerm, Ghostty, brief). xterm and VT510 say
+#                "blinking block" literally; with the shipped defaults (block, steady) that differs from them in the blink
+#                bit only. Document in ADR 0020. Rows P01, P09. Ps 1 is always an explicit blinking block (P02).
+#   D-PS7        `CSI 7 SP q` (xterm: "initial resources"): recommended = same as Ps 0 (config default); it is the one
+#                documented xterm meaning and costs nothing (row P10). kitty treats 7 as shape-default + blink-on,
+#                Alacritty/WezTerm ignore it. If the lead prefers not to extend: ignore (then P10 expects "unchanged").
+#   D-PSHIGH     Ps >= 8: IGNORE, change nothing (xterm, Alacritty `unhandled!`, WezTerm parse error; st also).
+#                kitty instead resets the shape to default and uses parity for blink (mode >= 7 -> NO_CURSOR_SHAPE,
+#                blink = mode % 2) -- a kitty quirk, not followed. Rows P11..P13.
+#   D-EXTRA      Extra parameters (`CSI 5 ; 2 SP q`): use the FIRST, ignore the rest (xterm GetParam(0), Alacritty
+#                first, kitty HANDLER1M first). WezTerm rejects the whole sequence. Rows X01, X02. Colon sub-parameters
+#                (`CSI 5:1 SP q`): unspecified everywhere; recommend ignore the whole sequence (X05, unverified).
+#   D-RESET      DECSTR, DECSCL (61..65) and RIS all drop the program override: effective style returns to the CONFIGURED
+#                default, ?12 state included (xterm ReallyReset common part; Alacritty RIS). kitty/WezTerm soft-reset
+#                behaviour unverified. Rows R01..R07. The brief's two-tier wording ("whatever DECSTR/RIS restore") is
+#                therefore resolved: both restore the configured default; neither is special-cased.
+#   D-LIVE       A live config change (set_default_cursor_style) takes effect for sessions WITHOUT a program override
+#                and does not touch one that has one (Alacritty, brief). A later Ps 0 / DECSTR / RIS then lands on the NEW
+#                default (rows L01..L04). xterm has no live-config equivalent (resources are read once).
+#                Corollary of D-BLINKFLAG: `?12 h/l` materialises an override, so a `?12`-touched session stops following
+#                the default blink AND shape until the next reset or Ps 0 (L05, flags decision).
+#   D-DECSC      DECSC/DECRC, 1048/1049/47/1047 alt-screen switches do not save, restore or reset the style (xterm
+#                cursor.c CursorSave2; DEC DECSC page). kitty keeps shape inside its savepoint cursor copy: unverified.
+#                Rows S01..S04.
+#   D-DECRQSS    DECRQSS ` q` and DECRQM ?12 replies are NOT reachable in this wave: tessera-term ignores DCS
+#                (lib.rs `Action::DcsStart ... => "sequence not applied yet"`) and has no reply channel (no DA/DSR/DECRQM
+#                replies either). The rows Q01..Q08 are therefore flagged `deferred`; the brief's "Done when" does not need
+#                them. Recommend: keep the rows (they are the contract for the later DECRQSS issue) and have the table
+#                test count them as skipped, not drop them.
+#   D-FOCUS      Unfocused frames stay HollowBlock for every shape (existing behaviour); hidden (DECTCEM) wins over shape.
+#                Not a term concern; see the app-core section.
+#
+# ISSUE-TEXT / BRIEF ERRORS
+#   * "blink = DECSCUSR blink || DECSET 12 (Modes::cursor_blink)": not what xterm does (single flag), see D-BLINKFLAG.
+#   * "Ps >= 7 (behaviour per researcher fixture)": 7 is a real, documented xterm value (initial resources); only >= 8 is
+#     undefined. kitty is the only reference emulator that does not ignore >= 8.
+#   * "DECSTR and RIS restore (per fixture: xterm ReallyReset/soft reset)": there is no soft/hard difference for the cursor
+#     style; the restoring code is in the COMMON part of ReallyReset and runs for DECSTR, DECSCL and RIS alike.
+#   * "Ps 0 vs Ps 1 both blinking block": in xterm and the VT510 RM yes; Tessera's brief makes 0 the configured default.
+#   * ctlseqs does not state what DECSTR resets, and does not mention DECSCUSR in the DECSTR/RIS entries; the fact comes
+#     from charproc.c only (cited above). Say so in the ADR.
+#   * "bar": xterm/ctlseqs call the vertical-bar shape "bar"; Tessera config and render call it "beam". Config accepts
+#     only block|underline|beam (no "bar" alias) -- see config rows.
+# =============================================================================
+
+
+# ------------------------------------------------------------------ A. each parameter (default = block steady)
+
+### P01_ps0_returns_configured_default
+size: 3x10
+step: feed \x1b[5 q
+expect: beam blink
+step: feed \x1b[0 q
+expect: block steady
+cite: [XT] CASE_DECSCUSR case DEFAULT_STYLE (xterm literal = BLINK_BLOCK); [DEC] DECSCUSR "0, 1 or none: blink block"; [AL] ansi.rs L1719 `0 => None`; [GH] "0: terminal default". Recommended per D-PS0.
+note: With the shipped defaults (block, steady) Ps 0 yields STEADY block, where xterm/VT510 would say blinking block. The control row P01b uses a non-default default so the test cannot pass by accident.
+flags: decision D-PS0
+
+### P01b_ps0_returns_configured_default_underline_blink
+size: 3x10
+default: underline blink
+step: feed \x1b[5 q
+expect: beam blink
+step: feed \x1b[0 q
+expect: underline blink
+cite: D-PS0; [AL] term/mod.rs L942..949 (override or config default)
+flags: decision D-PS0
+
+### P02_ps1_blinking_block
+size: 3x10
+step: feed \x1b[1 q
+expect: block blink
+cite: [CTL] "1 -> blinking block (default)"; [DEC] 1 = Blink Block; [XT] case BLINK_BLOCK; [KT] screen_set_cursor mode 1: blink = 1 % 2, shape CURSOR_BLOCK; [AL] 1 | 2 -> Block, blinking = id % 2 == 1
+note: Ps 1 is explicit: it blinks even when the configured default is steady.
+
+### P03_ps2_steady_block
+size: 3x10
+default: underline blink
+step: feed \x1b[2 q
+expect: block steady
+cite: [CTL] "2 -> steady block"; [XT] case STEADY_BLOCK; [KT] mode 2; [AL]
+note: Overrides BOTH shape and blink of a non-default default.
+
+### P04_ps3_blinking_underline
+size: 3x10
+step: feed \x1b[3 q
+expect: underline blink
+cite: [CTL] "3 -> blinking underline"; [DEC] 3; [XT] case BLINK_UNDERLINE; [KT] mode 3: shape underline, blink 3 % 2; [AL] 3 | 4 -> Underline
+
+### P05_ps4_steady_underline
+size: 3x10
+step: feed \x1b[4 q
+expect: underline steady
+cite: [CTL] "4 -> steady underline"; [DEC] 4; [XT] case STEADY_UNDERLINE; [KT]; [AL]
+
+### P06_ps5_blinking_beam
+size: 3x10
+step: feed \x1b[5 q
+expect: beam blink
+cite: [CTL] "5 -> blinking bar, xterm"; [XT] case BLINK_BAR; [KT] mode 5 -> CURSOR_BEAM, blink; [AL] 5 | 6 -> Beam; [GH]
+note: xterm says "bar"; Tessera's shape is Beam.
+
+### P07_ps6_steady_beam
+size: 3x10
+default: block blink
+step: feed \x1b[6 q
+expect: beam steady
+cite: [CTL] "6 -> steady bar, xterm"; [XT] case STEADY_BAR; [KT] mode 6; [AL]
+
+### P08_each_ps_replaces_the_previous_one
+size: 3x10
+step: feed \x1b[1 q\x1b[2 q\x1b[3 q\x1b[4 q\x1b[5 q\x1b[6 q
+expect: beam steady
+step: feed \x1b[3 q
+expect: underline blink
+cite: [XT] each CASE_DECSCUSR assigns shape and blink unconditionally; last one wins
+note: No accumulation: DECSCUSR sets both shape AND blink every time.
+
+### P09_missing_ps_is_ps0
+size: 3x10
+default: underline steady
+step: feed \x1b[6 q
+step: feed \x1b[ q
+expect: underline steady
+cite: [XT] GetParam(0) == DEFAULT (-1) -> case DEFAULT -> BLINK_BLOCK (literal); [DEC] "0, 1, or none: blink block"; [AL] next_param_or(0); [GH] "omitted defaults to 0"; [KT] default 1 (CALL_CSI_HANDLER1M(.., 1)); [WZ] bare `CSI SP q` fails to parse (ignored) -- unverified
+note: Recommended per D-PS0: a missing Ps is exactly Ps 0 (-> configured default). `CSI ; SP q` (empty first parameter) is the same, row P09b.
+flags: decision D-PS0
+
+### P09b_empty_first_param_is_ps0
+size: 3x10
+step: feed \x1b[6 q\x1b[;5 q
+expect: block steady
+cite: [XT] an empty parameter is DEFAULT (-1) -> blink block (literal), only the first parameter is read; D-PS0 / D-EXTRA
+note: First (empty) parameter wins over the second (5): result is the configured default, NOT beam.
+flags: decision D-PS0 D-EXTRA
+
+### P10_ps7_initial_resources
+size: 3x10
+default: underline blink
+step: feed \x1b[5 q\x1b[7 q
+expect: underline blink
+cite: [CTL] "7 -> initial resources, xterm. XTerm restores the initial state of the cursor using resource settings"; [XT] L4958 `if value == INITIAL_CURSOR value = screen->initial_cursor`
+note: Recommended: same as Ps 0 (the configured default is our "resource"). Alternative: ignore, expect "beam blink".
+flags: decision D-PS7
+
+### P11_ps8_ignored
+size: 3x10
+step: feed \x1b[5 q\x1b[8 q
+expect: beam blink
+cite: [XT] no `case` for 8: nothing changes; [AL] `_ => unhandled!(); return`; [WZ] FromPrimitive None -> Err (sequence ignored); st rejects outside 0..6
+flags: decision D-PSHIGH
+
+### P12_ps_large_ignored
+size: 3x10
+step: feed \x1b[3 q\x1b[99 q\x1b[65535 q\x1b[4294967296 q
+expect: underline blink
+cite: as P11; the last value overflows the 16-bit parameter store: the parser saturates (ADR / csi.rs params), still >= 8
+note: [KT] differs (resets shape, blink = mode % 2); not followed.
+flags: decision D-PSHIGH
+
+### P13_ignored_sequence_does_not_eat_text
+size: 3x10
+step: feed \x1b[9 qX
+screen:
+>X |
+>
+>
+cursor: (0,1)
+cite: [XT] the CSI is consumed whole by the parser (final byte q after SP); text after it prints normally
+flags: negative
+
+### P14_style_set_while_cursor_hidden_is_kept
+size: 3x10
+step: feed \x1b[?25l\x1b[5 q
+expect: beam blink
+step: feed \x1b[?25h
+expect: beam blink
+cite: [DEC] DECSCUSR "when the cursor is enabled" (DECTCEM independent); [XT] cursor_set is a separate field from cursor_shape. modes().cursor_visible is true at the end of this row.
+
+# ------------------------------------------------------------------ X. parameters and intermediates that must not match
+
+### X01_extra_params_use_the_first
+size: 3x10
+step: feed \x1b[5;2 q
+expect: beam blink
+cite: [XT] GetParam(0) only; [AL] next_param_or(0) first, rest ignored; [KT] first parameter. [WZ] rejects (parse Err) -- not followed
+flags: decision D-EXTRA
+
+### X02_extra_params_first_is_ps_zero
+size: 3x10
+step: feed \x1b[6 q\x1b[0;5 q
+expect: block steady
+cite: as X01
+flags: decision D-EXTRA
+
+### X03_csi_without_space_is_not_decscusr
+size: 3x10
+step: feed \x1b[5 q\x1b[2q
+expect: beam blink
+cite: [CTL] `CSI Ps q` (no SP) is DECLL (load LEDs), an unrelated function; [XT] CASE_DECLL; [KT] vt-parser L1426: end_modifier must be ' '
+note: Also assert the text after still prints: feed `\x1b[2qX` leaves X at (0,0). Run as part of the row.
+flags: negative
+
+### X04_other_intermediates_and_private_markers_ignored
+size: 3x10
+step: feed \x1b[3 q
+step: feed \x1b[5"q\x1b[?5 q\x1b[>5 q\x1b[=5 q\x1b[5$q\x1b[5!q
+expect: underline blink
+cite: [CTL] `CSI Ps " q` = DECSCA, `CSI Ps $ q` etc. are different final-with-intermediate functions; [KT] rejects any start_modifier other than none or '>' (`CSI > Ps SP q` is kitty's multi-cursor, not DECSCUSR)
+note: `CSI > Ps q` (no SP) is XTVERSION in xterm; none of these may change the style. xterm's treatment of a private marker before SP q is unverified (dec_table has no SP state): rows flagged unverified.
+flags: negative unverified
+
+### X05_colon_subparam_ignored
+size: 3x10
+step: feed \x1b[3 q\x1b[5:1 q
+expect: underline blink
+cite: no source defines sub-parameters for DECSCUSR; ADR 0013 (colon sub-parameters are only meaningful for SGR). Recommend: ignore the whole sequence.
+flags: decision unverified
+
+### X06_aborted_sequence_does_not_apply
+size: 3x10
+step: feed \x1b[5\x18 qX
+screen:
+> qX |
+>
+>
+cursor: (0,3)
+cite: ECMA-48 / DEC parser: CAN (0x18) aborts the CSI; the following ` qX` is plain text. [XT] parser state machine ground on CAN
+note: Style stays at its previous value (default) -- also assert expect: block steady.
+flags: negative
+
+### X07_split_across_chunks
+size: 3x10
+step: feed \x1b[5
+step: feed  q
+expect: beam blink
+cite: parser must keep CSI state across advance() calls (Chunking in tests/common also splits at every offset)
+note: The second feed line starts with a literal space after `feed`.
+
+### X08_flood_does_not_grow_state
+size: 3x10
+step: feed \x1b[5 q\x1b[?12h\x1b[0 q   # the test repeats this step 2000 times
+expect: block steady
+cite: robustness: the style is two bytes of state; no queue, no allocation per sequence ([XT] nothing queued)
+note: Keep the repeat at 2_000, like a_flood_of_mode_sequences_requests_nothing.
+flags: negative
+
+# ------------------------------------------------------------------ B. DECSET/DECRST 12 x DECSCUSR (D-BLINKFLAG)
+
+### B01_decset12_alone_blinks_default_shape
+size: 3x10
+step: feed \x1b[?12h
+expect: block blink modes_blink=true
+step: feed \x1b[?12l
+expect: block steady modes_blink=false
+cite: [CTL] "12 -> Start/Stop blinking cursor (AT&T 610)"; [XT] dpmodes srm_ATT610_BLINK sets/clears cursor_blink_esc; [AL] ?12 h -> style.blinking = true
+note: modes_blink here is today's behaviour (MODE01 in modes_spec.txt) and must not regress.
+
+### B01b_decset12_keeps_the_default_shape
+size: 3x10
+default: beam steady
+step: feed \x1b[?12h
+expect: beam blink
+cite: [AL] get_or_insert(config default) then blinking = true: the shape comes from the default
+flags: decision D-BLINKFLAG
+
+### B02_decscusr_steady_after_decset12_wins
+size: 3x10
+step: feed \x1b[?12h\x1b[2 q
+expect: block steady modes_blink=false
+cite: [XT] ONE flag: charproc.c L4999 `cursor_blink_esc = blinks` overwrites what ?12 set; [AL] set_cursor_style replaces the whole style; [KT] non_blinking is one field
+note: The brief's OR model ("DECSCUSR blink || ?12") would report blink=true here. xterm: steady.
+flags: xterm-quirk decision D-BLINKFLAG
+
+### B03_decset12_reset_after_decscusr_blink_wins
+size: 3x10
+step: feed \x1b[1 q\x1b[?12l
+expect: block steady modes_blink=false
+cite: [XT] L8489 DoRM(DP_CRS_BLINK, cursor_blink_esc) clears the same flag DECSCUSR 1 set; [AL] ?12 l -> style.blinking = false on the materialised style
+note: OR model: still blinking. xterm: steady.
+flags: xterm-quirk decision D-BLINKFLAG
+
+### B04_decset12_after_steady_decscusr_blinks_and_keeps_shape
+size: 3x10
+step: feed \x1b[4 q\x1b[?12h
+expect: underline blink modes_blink=true
+cite: [XT] ?12 h sets only the blink flag; cursor_shape untouched (L7628); [AL] get_or_insert keeps the override's shape
+flags: decision D-BLINKFLAG
+
+### B05_decset12_reset_keeps_shape
+size: 3x10
+step: feed \x1b[5 q\x1b[?12l
+expect: beam steady
+cite: [XT] as B04 (reset); [AL]
+flags: decision D-BLINKFLAG
+
+### B06_decscusr_sets_modes_blink_bit
+size: 3x10
+step: feed \x1b[3 q
+expect: underline blink modes_blink=true
+step: feed \x1b[4 q
+expect: underline steady modes_blink=false
+cite: D-BLINKFLAG recommended record: Modes::cursor_blink mirrors the single program-controlled bit, so a later DECRQM ?12 ([XT] misc.c L5518 reports cursor_blink_esc) can answer from it
+flags: decision D-BLINKFLAG
+
+### B07_default_blink_true_program_can_turn_it_off
+size: 3x10
+default: block blink
+expect: block blink modes_blink=false
+step: feed \x1b[?12l
+expect: block steady modes_blink=false
+cite: [AL] ?12 l materialises the config default and clears blinking; [XT] differs: with cursorBlink=true and the default OR/XOR resource, `?12 l` leaves the cursor blinking (OR) or blinks it (XOR) -- the program cannot turn a resource-enabled blink off. Not followed: a config default must not defeat the program.
+note: First expect: no program sequence yet, so effective = the default (blink) while the DECSET-12 record is false.
+flags: xterm-quirk decision D-BLINKFLAG
+
+### B08_decset12_multi_param
+size: 3x10
+step: feed \x1b[?12;25h\x1b[?25;12l
+expect: block steady modes_blink=false
+cite: [CTL] CSI ? Pm h/l: several modes in one sequence ([XT] dpmodes loops over params); ?25 is DECTCEM and does not alter the style
+note: Also assert modes().cursor_visible == true before the second sequence (?25 set = shown) and false after it: split into two steps in the test if easier. (Lead edit 2026-10-29: was wrongly 'false' before.)
+
+### B09_decset12_then_ps0_returns_default
+size: 3x10
+default: underline steady
+step: feed \x1b[?12h
+expect: underline blink modes_blink=true
+step: feed \x1b[0 q
+expect: underline steady modes_blink=false
+cite: D-PS0 + D-BLINKFLAG: Ps 0 clears the override (and the ?12 record); [AL] set_cursor_style(None) discards the ?12-materialised style
+flags: decision D-PS0 D-BLINKFLAG
+
+### B10_decrst13_14_do_nothing
+size: 3x10
+step: feed \x1b[5 q\x1b[?13h\x1b[?14h\x1b[?13l\x1b[?14l
+expect: beam blink
+cite: [CTL] ?13 and ?14 are read-only, "set only via resource or menu"; [XT] dpmodes srm_CURSOR_BLINK_OPS / srm_XOR_CURSOR_BLINKS "intentionally ignored (this is user-preference)"
+flags: negative
+
+# ------------------------------------------------------------------ R. reset behaviour (D-RESET)
+
+### R01_decstr_restores_configured_default
+size: 3x10
+step: feed \x1b[5 q
+step: feed \x1b[!p
+expect: block steady modes_blink=false
+cite: [XT] ReallyReset common part, charproc.c L14379..14384: InitCursorShape + cursor_blink_esc = 0 + SetCursorBlink(cursor_blink_i), reached by CASE_DECSTR -> VTReset -> ReallyReset(xw, False, False)
+flags: decision D-RESET
+
+### R02_decstr_restores_non_default_default
+size: 3x10
+default: underline blink
+step: feed \x1b[6 q\x1b[!p
+expect: underline blink
+cite: [XT] same; InitCursorShape(screen, screen) re-derives the shape from the cursorUnderLine/cursorBar RESOURCES (= configured default), blink from cursor_blink_i (the resource), not from Ps 1
+note: A reset that returns "blinking block" regardless of config (the VT510 reading) fails this row.
+flags: decision D-RESET
+
+### R03_decstr_clears_decset12
+size: 3x10
+step: feed \x1b[?12h\x1b[!p
+expect: block steady modes_blink=false
+cite: [XT] `cursor_blink_esc = 0` in ReallyReset; existing BLINK01 row of decstr_spec.txt (do not touch that file)
+flags: decision D-RESET
+
+### R04_ris_restores_configured_default
+size: 3x10
+default: beam steady
+step: feed \x1b[3 q
+step: feed \x1bc
+expect: beam steady modes_blink=false
+cite: [XT] CASE_RIS -> VTReset(xw, True, True) -> ReallyReset(full): the cursor part is in the common section; [AL] reset_state: cursor_style = None. Existing RIS also resets Modes::default().
+flags: decision D-RESET
+
+### R05_decscl_restores_configured_default
+size: 3x10
+step: feed \x1b[5 q
+step: feed \x1b[62;1"p
+expect: block steady modes_blink=false
+cite: [XT] CASE_DECSCL -> ReallyReset(soft) (decstr_spec.txt header, D-DECSCL). tessera runs State::soft_reset for DECSCL (csi.rs select_conformance_level), so this is free once soft_reset resets the style.
+flags: decision D-RESET
+
+### R06_decscl_with_other_pl_does_not_reset
+size: 3x10
+step: feed \x1b[5 q\x1b[60;1"p\x1b[66;1"p\x1b[1"p
+expect: beam blink
+cite: [XT] DECSCL with Pl outside 61..65 does nothing (csi.rs doc comment); so no reset
+flags: negative
+
+### R07_reset_does_not_forget_the_configured_default
+size: 3x10
+default: underline steady
+step: feed \x1b[5 q\x1b[!p\x1bc\x1b[!p
+expect: underline steady
+cite: set_default_cursor_style is configuration, not terminal state: resets must not clear it
+flags: decision D-RESET
+
+### R08_decstr_keeps_cursor_visibility_unrelated
+size: 3x10
+step: feed \x1b[?25l\x1b[5 q\x1b[!p
+expect: block steady
+cite: [XT] ReallyReset sets cursor_set = ON in the same block, so DECSTR also re-shows the cursor (existing soft_reset_modes: cursor_visible = true); style is the default and visible
+note: Also assert modes().cursor_visible == true.
+
+# ------------------------------------------------------------------ S. saved cursor, alt screen, resize (D-DECSC)
+
+### S01_decsc_decrc_do_not_restore_style
+size: 3x10
+step: feed \x1b[5 q\x1b7\x1b[2 q\x1b8
+expect: block steady
+cite: [XT] cursor.c CursorSave2 L398..416 stores no cursor_shape/cursor_blink_esc; [DEC] DECSC page lists position, SGR, charsets, wrap, DECOM, DECSCA, SS2/3 only
+flags: decision D-DECSC
+
+### S02_scosc_scorc_do_not_restore_style
+size: 3x10
+step: feed \x1b[5 q\x1b[s\x1b[2 q\x1b[u
+expect: block steady
+cite: [XT] SCOSC/SCORC share the DECSC slot (csi.rs doc: "DECSC and SCOSC share this slot")
+flags: decision D-DECSC
+
+### S03_alt_screen_switch_keeps_style
+size: 3x10
+step: feed \x1b[5 q\x1b[?1049h
+expect: beam blink
+step: feed \x1b[4 q\x1b[?1049l
+expect: underline steady
+cite: [XT] cursor_shape is a TScreen field shared by both buffers; ToAlternate/FromAlternate (charproc.c ~L9529..9590) do not touch it. A program that sets a style in the alt screen and leaves without restoring keeps it (the usual vim/nvim DECSCUSR dance relies on explicit `CSI 0 SP q`/`CSI 2 SP q` on exit)
+flags: decision D-DECSC
+
+### S04_resize_keeps_style
+size: 3x10
+step: feed \x1b[6 q
+step: resize 5x20
+expect: beam steady
+cite: not a cursor-position matter; [XT] no code path touches cursor_shape on resize. (Use the Script `resize` step if tests/common has one; otherwise call Terminal::resize in the hand-written part.)
+
+# ------------------------------------------------------------------ L. config default vs program override (D-LIVE)
+
+### L01_default_applies_with_no_override
+size: 3x10
+default: beam blink
+expect: beam blink
+cite: brief: Terminal::cursor_style() returns the configured default until a program sets one; [AL] cursor_style = None -> config
+flags: decision D-LIVE
+
+### L02_live_default_change_reaches_unmodified_session
+size: 3x10
+step: set_default underline blink
+expect: underline blink
+step: set_default block steady
+expect: block steady
+cite: brief done-when 4 ("apply_config changes the default for existing sessions that did not set DECSCUSR"); [AL] override None -> follows config
+flags: decision D-LIVE
+
+### L03_live_default_change_does_not_touch_override
+size: 3x10
+step: feed \x1b[5 q
+step: set_default underline steady
+expect: beam blink
+cite: brief done-when 4 ("leaves one that did unchanged"); the program's explicit style wins until it asks for the default
+flags: decision D-LIVE
+
+### L04_after_override_ps0_follows_the_new_default
+size: 3x10
+step: feed \x1b[5 q
+step: set_default underline steady
+step: feed \x1b[0 q
+expect: underline steady
+step: set_default beam blink
+expect: beam blink
+cite: D-LIVE + D-PS0: Ps 0 clears the override, so the session follows the live default again
+flags: decision D-LIVE
+
+### L05_decset12_materialises_an_override
+size: 3x10
+step: feed \x1b[?12l
+step: set_default underline blink
+expect: block steady
+step: feed \x1b[!p
+expect: underline blink
+cite: D-BLINKFLAG corollary ([AL] get_or_insert): after ?12 the session keeps the shape (block, from the default at the time) and blink=false; a reset or Ps 0 re-attaches it to the default. Alternative (override only the blink bit, shape keeps following) is equally defensible; no emulator does it.
+flags: decision D-LIVE D-BLINKFLAG
+
+### L06_set_default_with_identical_value_is_noop
+size: 3x10
+step: set_default block steady
+expect: block steady
+cite: shipped defaults (config cursor_shape = "block", cursor_blink = false). App-core: apply_config with an unchanged style must not damage the cursor row (see app-core section).
+
+# ------------------------------------------------------------------ Q. DECRQSS / DECRQM replies (deferred: no DCS or reply channel yet)
+
+### Q01_decrqss_steady_block
+size: 3x10
+step: feed \x1b[2 q\x1bP$q q\x1b\\
+reply: \x1bP1$r2 q\x1b\\
+cite: [CTL] DECRQSS "SP q => DECSCUSR", reply `DCS 1 $ r Pt ST` with Pt the CSI string without CSI; [XT] misc.c L4939..4950: code = STEADY_BLOCK(2)/STEADY_UNDERLINE(4)/STEADY_BAR(6), minus 1 if cursor_blink_esc; [KT] L3779..3790 `1$r%d q`
+flags: deferred
+
+### Q02_decrqss_each_code
+size: 3x10
+step: feed (for Ps in 1..=6) \x1b[<Ps> q\x1bP$q q\x1b\\
+reply: \x1bP1$r<Ps> q\x1b\\ for each Ps (1,2,3,4,5,6 in order)
+cite: [XT] as Q01; round trip: the reply must be the Ps that set the state
+flags: deferred
+
+### Q03_decrqss_default_state
+size: 3x10
+step: feed \x1bP$q q\x1b\\
+reply: \x1bP1$r2 q\x1b\\
+cite: [XT] initial state with the resource defaults (steady block) answers 2; Tessera answers from the EFFECTIVE style, i.e. the configured default (block steady -> 2; underline blink default -> 3)
+note: xterm answers from the program flag only (cursor_blink_esc), ignoring the cursorBlink resource, so a resource-blink xterm still says steady; Tessera's D-BLINKFLAG model has no such split. [KT] answers 1 for NO_CURSOR_SHAPE.
+flags: deferred decision
+
+### Q04_decrqss_after_decset12
+size: 3x10
+step: feed \x1b[?12h\x1bP$q q\x1b\\
+reply: \x1bP1$r1 q\x1b\\
+cite: [XT] shared flag: ?12 h makes the answer 1 (blinking block)
+flags: deferred
+
+### Q05_decrqss_other_settings_unaffected
+size: 3x10
+step: feed \x1bP$qm\x1b\\
+cite: SGR query, not DECSCUSR: out of scope; listed so the implementer of DECRQSS keeps " q" a distinct two-byte Pt (xterm compares the whole string `" q"`)
+flags: deferred
+
+### Q06_decrqm_12
+size: 3x10
+step: feed \x1b[?12$p
+reply: \x1b[?12;2$y
+step: feed \x1b[?12h\x1b[?12$p
+reply: \x1b[?12;1$y
+step: feed \x1b[2 q\x1b[?12$p
+reply: \x1b[?12;2$y
+cite: [XT] misc.c L5518 `result = MdBool(screen->cursor_blink_esc)` (1 = set, 2 = reset); DECSCUSR changes the answer (shared flag). [WZ] always answers "reset". Hidden by D-BLINKFLAG, expressed here so DECRQM implementer inherits it.
+flags: deferred
+
+### Q07_no_reply_today
+size: 3x10
+step: feed \x1b[5 q\x1b[?12h\x1bP$q q\x1b\\
+expect: beam blink
+requests: []
+cite: DCS is ignored today (lib.rs `Action::DcsStart..`); the unsupported DECRQSS must produce no output and must not corrupt the following text. Run this row now (NOT deferred).
+flags: negative
+
+# ------------------------------------------------------------------ APP-CORE (tests live in crates/tessera-app-core/src/view.rs, not this table)
+#   Map: term Block->render Block, Underline->Underline, Beam->Beam. Unfocused: HollowBlock for every shape (D-FOCUS).
+#   A1  feed `\e[5 q` `\e[4 q` `\e[2 q` `\e[0 q` -> frame.cursor shape Beam, Underline, Block, configured default (config default underline for the last, so Block and "default" differ).
+#   A2  `\e[?25l` hides whatever the shape ([DEC] "when the cursor is enabled"; [XT] cursor_set separate).
+#   A3  a style change damages the cursor's row only: before = after cursor row, no full-screen damage ([XT] HideCursor + xtermSetCursorBox repaints the cell). An unchanged style (`\e[2 q` twice, or Ps 0 when already default) must damage nothing (L06).
+#   A4  blink is exposed, not drawn: Snapshot/frame carries no phase; asserting frame equality for blink=true vs false except any new field.
+#   A5  pixel: `\e[5 q` -> cursor colour only in the left beam-width columns of the cell; `\e[4 q` only in the bottom rows; `\e[2 q` whole cell. Beam/underline thickness is the renderer's existing constant -- the test should read it from the same constant, not hard-code.
+#   A6  apply_config: unchanged style -> no damage; changed default -> existing Ps-0-state sessions follow (L02) and overridden ones don't (L03); spawn passes the configured default before the first byte.
+#
+# CONFIG (tessera-config; tests next to the other appearance keys)
+#   C1  `cursor_shape = "block"|"underline"|"beam"` parse; default block.      C2  `cursor_blink = true|false`; default false.
+#   C3  invalid value ("bar", "Block", "", 3, "I-beam"): warning naming the key, default kept, other keys unaffected
+#       (like existing keys). Recommended: exact lowercase match, no "bar" alias (xterm's name) and no case folding,
+#       because default_config.toml and docs/config.md list exactly three values.   C4  `just config-docs-check` clean.
+#   C5  config reload changing only cursor_shape/blink must reach apply_config (hot reload) and nothing else.

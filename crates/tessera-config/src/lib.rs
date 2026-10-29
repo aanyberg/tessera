@@ -183,6 +183,59 @@ pub struct Appearance {
     pub opacity: f32,
     /// Background blur when opacity is below 1.0.
     pub blur: bool,
+    /// The cursor's shape: `"block"`, `"underline"` or `"beam"` (a
+    /// vertical bar), exactly as written here. A program may change it
+    /// (DECSCUSR, `CSI Ps SP q`, as vim and fish do); it returns to this
+    /// one when the program asks for the default or resets the terminal.
+    /// Any other value is reported with a warning and the default is used.
+    #[serde(deserialize_with = "load::lenient_cursor_shape")]
+    #[cfg_attr(feature = "schema", schemars(schema_with = "CursorShape::schema"))]
+    pub cursor_shape: CursorShape,
+    /// Whether the cursor blinks, unless a program says otherwise (as for
+    /// `cursor_shape`). Recorded only for now: the cursor is drawn steady.
+    pub cursor_blink: bool,
+}
+
+/// The cursor's shape (`[appearance] cursor_shape`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CursorShape {
+    /// A filled cell.
+    #[default]
+    Block,
+    /// A bar along the bottom of the cell.
+    Underline,
+    /// A vertical bar at the left edge of the cell (xterm's "bar").
+    Beam,
+}
+
+impl CursorShape {
+    /// Every value, in the order the documentation lists them.
+    pub const ALL: [Self; 3] = [Self::Block, Self::Underline, Self::Beam];
+
+    /// The value as written in `config.toml`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Underline => "underline",
+            Self::Beam => "beam",
+        }
+    }
+
+    /// The shape `name` is written as: exactly [`CursorShape::as_str`],
+    /// no other spelling or case.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|shape| shape.as_str() == name)
+    }
+
+    /// A plain string `enum` schema, as for [`ShellIntegration`].
+    #[cfg(feature = "schema")]
+    fn schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let values: Vec<&str> = Self::ALL.iter().map(|value| value.as_str()).collect();
+        schemars::json_schema!({ "type": "string", "enum": values })
+    }
 }
 
 impl Appearance {
@@ -200,6 +253,8 @@ impl Default for Appearance {
             font_size: 13.0,
             opacity: 1.0,
             blur: false,
+            cursor_shape: CursorShape::Block,
+            cursor_blink: false,
         }
     }
 }
