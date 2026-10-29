@@ -315,6 +315,9 @@ impl App {
     /// Resizes session `id`'s terminal (re-wrapping its text, ADR 0009)
     /// and informs its child of the new window size.
     ///
+    /// Takes the terminal lock like [`App::with_terminal`], with the same
+    /// rule: do not call it in a tight loop.
+    ///
     /// # Errors
     ///
     /// [`Error::SessionNotFound`] if `id` is not a live session,
@@ -460,6 +463,14 @@ impl App {
     ///
     /// The reader thread cannot apply output while `f` runs, so keep it
     /// short.
+    ///
+    /// Leave a gap between calls (a frame's worth, at least about 1 ms):
+    /// between slices of output the reader gives the lock to every thread
+    /// waiting for it and is not counted as waiting itself (ADR 0014), so a
+    /// caller that takes the lock again the moment it releases it can
+    /// starve the session's output. Paced callers, such as rendering and
+    /// resizing from the display link at up to ~120 Hz, share the lock
+    /// fairly.
     ///
     /// # Errors
     ///
