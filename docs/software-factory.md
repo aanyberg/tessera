@@ -184,6 +184,14 @@ Agents use these instead of rebuilding the setup in every run:
   (measured: a second worktree hit 18 of 26 dependency compilations; crates with build scripts miss).
 - **Gate pass stamps.** `scripts/quality-gate.sh` records a pass on a clean tree per commit, toolchain and gate
   script, so the implementer, critic and verifiers pay for the gate once per commit. `--force` re-runs it.
+- **Hang protection (#137, #121).** A hung test fails fast instead of stalling a run for hours. `.config/nextest.toml`
+  reports a test SLOW after 60 s and terminates it after 5 periods (300 s; 600 s for the file-watcher, shaping, GPU
+  and hdiutil tests); the slowest test in the workspace takes 12 s, so there is room for a machine under load 30+.
+  `scripts/quality-gate.sh` then fails with the terminated test names (`TIMEOUT` lines) instead of a bare exit code.
+  In CI the Rust job has `timeout-minutes: 20` and the macOS app job 15 (a normal run is 4-6 minutes), with a
+  10-minute limit on `just app-test`, whose xcodebuild calls also fail a single hung test after 120 s (300 s at
+  most). A hang below the test level (the TSan and fork deadlock of #121) is caught by the step and job limits
+  only. A new test that legitimately needs more than 300 s gets its own `slow-timeout` override there.
 - **A/B probes.** `cargo xtask ab init --base <rev> --crate <name> --out <scratch dir>` builds a probe crate that
   depends on each crate at the base revision (`base_<name>`) and in the worktree (`head_<name>`). Write cases in
   the probe's `src/cases.rs`, then `cargo xtask ab bench <dir> --case <c> [--max-ratio <bar>]` (alternating

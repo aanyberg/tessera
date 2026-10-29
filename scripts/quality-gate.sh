@@ -34,7 +34,22 @@ fi
 
 step "fmt";     cargo fmt --all --check
 step "clippy";  cargo clippy --workspace --all-targets -- -D warnings
-step "tests";   cargo nextest run --workspace
+step "tests"
+# .config/nextest.toml terminates a test after its slow-timeout (300 s by default) so a hung test cannot stall the gate
+# (#137). nextest then fails the run; say so plainly instead of leaving a bare exit code. The status is read from the
+# pipeline (pipefail), never from tee.
+nextest_log="$(mktemp)"
+if ! cargo nextest run --workspace 2>&1 | tee "$nextest_log"; then
+    if grep -q -E '^ *TIMEOUT ' "$nextest_log"; then
+        print -u2 -P "%F{red}quality gate FAILED: nextest terminated hung test(s) after their slow-timeout (.config/nextest.toml):%f"
+        grep -E '^ *TIMEOUT ' "$nextest_log" | sort -u >&2
+    else
+        print -u2 -P "%F{red}quality gate FAILED: nextest run failed%f"
+    fi
+    rm -f "$nextest_log"
+    exit 1
+fi
+rm -f "$nextest_log"
 step "rustdoc"; RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps
 step "deny";    cargo deny check
 step "ffi release build"; cargo build --release -p tessera-ffi
