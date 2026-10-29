@@ -7,9 +7,10 @@
 //!
 //! - [`fixture_cases_hold`] parses the fixture and checks every case's
 //!   screen, cursor, pending-wrap flag, requests and scrollback directly.
-//! - One snapshot test per `tests/scripts/csi/*.txt` script (one script per
-//!   fixture case, see [`every_fixture_case_has_a_script`]) pins the full
-//!   rendered state, fed both in one call and byte by byte.
+//! - [`every_script_matches_its_snapshot`] runs every
+//!   `tests/scripts/csi/*.txt` script (one script per fixture case, see
+//!   [`every_fixture_case_has_a_script`]) and pins its full rendered state
+//!   as a snapshot, fed both in one call and byte by byte.
 //! - Direct tests and property tests cover what single cases cannot:
 //!   unknown and overflowing sequences leave the grid alone, and random
 //!   sequences never panic.
@@ -48,20 +49,16 @@ fn snapshot_script(name: &str) {
     });
 }
 
-macro_rules! script_tests {
+/// Lists the scripts [`every_script_matches_its_snapshot`] runs, by file
+/// stem.
+macro_rules! script_table {
     ($($name:ident),* $(,)?) => {
-        /// Every script with a snapshot test, by file stem.
+        /// Every script with a snapshot, by file stem.
         const SCRIPTS: &[&str] = &[$(stringify!($name)),*];
-        $(
-            #[test]
-            fn $name() {
-                snapshot_script(stringify!($name));
-            }
-        )*
     };
 }
 
-script_tests! {
+script_table! {
     cup01_no_params,
     cup02_semicolon_only,
     cup03_row_only,
@@ -387,6 +384,24 @@ script_tests! {
     sco08_explicit_zero_saves,
 }
 
+/// Every listed script matches its snapshot. One test runs the whole
+/// table (one process instead of one per script) and reports every
+/// failing script.
+#[test]
+fn every_script_matches_its_snapshot() {
+    let cases = spec::parse_fixture(spec::FIXTURE);
+    let fixture_cases = cases
+        .iter()
+        .filter(|case| !spec::is_vttest(&case.id))
+        .count();
+    common::check_table(
+        "tests/scripts/csi",
+        fixture_cases,
+        SCRIPTS.iter().map(|name| (name, *name)),
+        snapshot_script,
+    );
+}
+
 #[test]
 fn every_script_has_a_test() {
     let mut on_disk: Vec<String> = std::fs::read_dir(scripts_dir())
@@ -403,7 +418,7 @@ fn every_script_has_a_test() {
     on_disk.sort();
     let mut listed: Vec<&str> = SCRIPTS.to_vec();
     listed.sort_unstable();
-    assert_eq!(on_disk, listed, "add new scripts to `script_tests!`");
+    assert_eq!(on_disk, listed, "add new scripts to `script_table!`");
 }
 
 // ------------------------------------------------------------------ fixture

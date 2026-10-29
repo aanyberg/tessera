@@ -10,8 +10,9 @@
 //!
 //! - [`fixture_rows_hold`] runs every term-layer row, fed as written and
 //!   byte by byte, and compares the render with the row's result block.
-//! - One snapshot per `tests/scripts/wide/*.txt` script (one per row) pins
-//!   the screen, the mode state and the cell-level render.
+//! - [`every_script_matches_its_snapshot`] runs every
+//!   `tests/scripts/wide/*.txt` script (one per row) and pins the screen,
+//!   the mode state and the cell-level render as a snapshot.
 //! - A property test checks that chunking never changes the result.
 
 mod common;
@@ -134,20 +135,16 @@ fn snapshot_script(name: &str) {
     });
 }
 
-macro_rules! script_tests {
+/// Lists the scripts [`every_script_matches_its_snapshot`] runs, by file
+/// stem.
+macro_rules! script_table {
     ($($name:ident),* $(,)?) => {
-        /// Every script with a snapshot test, by file stem.
+        /// Every script with a snapshot, by file stem.
         const SCRIPTS: &[&str] = &[$(stringify!($name)),*];
-        $(
-            #[test]
-            fn $name() {
-                snapshot_script(stringify!($name));
-            }
-        )*
     };
 }
 
-script_tests! {
+script_table! {
     c07_decawm_off_wide_with_one_column_left_is_dropped,
     c08_decawm_off_next_narrow_char_overwrites_last_col,
     c09_decawm_off_pending_then_wide_clears_pending_and_drops,
@@ -177,6 +174,19 @@ script_tests! {
     h19_insert_mode_three_column_scalar_inserts_two_cells,
 }
 
+/// Every listed script matches its snapshot. One test runs the whole
+/// table (one process instead of one per script) and reports every
+/// failing script.
+#[test]
+fn every_script_matches_its_snapshot() {
+    common::check_table(
+        "tests/scripts/wide",
+        term_cases().len(),
+        SCRIPTS.iter().map(|name| (name, *name)),
+        snapshot_script,
+    );
+}
+
 #[test]
 fn every_script_has_a_test() {
     let mut on_disk: Vec<String> = std::fs::read_dir(scripts_dir())
@@ -193,7 +203,7 @@ fn every_script_has_a_test() {
     on_disk.sort();
     let mut listed: Vec<&str> = SCRIPTS.to_vec();
     listed.sort_unstable();
-    assert_eq!(on_disk, listed, "add new scripts to `script_tests!`");
+    assert_eq!(on_disk, listed, "add new scripts to `script_table!`");
 }
 
 #[test]

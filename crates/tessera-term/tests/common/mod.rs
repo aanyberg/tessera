@@ -42,7 +42,8 @@
 //! [`CellFlags::SPACER`]: tessera_grid::CellFlags::SPACER
 //! [`CellFlags::CLUSTER`]: tessera_grid::CellFlags::CLUSTER
 
-use std::fmt::Write as _;
+use std::fmt::{Display, Write as _};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
 use tessera_grid::{Color, Style, UnderlineStyle};
@@ -177,6 +178,45 @@ impl Script {
         let (term, requests) = self.run(chunking);
         render_state(&term, &requests)
     }
+}
+
+/// Runs `check` on every row of a fixture table in this one test, so the
+/// table costs one test process instead of one per row.
+///
+/// A row fails when `check` panics (an `assert!`, a failed `insta`
+/// snapshot, ...). The panic is caught and the next row runs, so one run
+/// reports every failing row: each row's own panic message is printed as it
+/// happens, and the final panic lists the ids of all failing rows.
+///
+/// # Panics
+///
+/// When any row failed, or when the table did not have exactly
+/// `expected_rows` rows (so a row lost from a table cannot pass silently).
+#[allow(dead_code)] // print.rs and wide.rs include this module without the allow.
+pub fn check_table<I: Display, R>(
+    table: &str,
+    expected_rows: usize,
+    rows: impl IntoIterator<Item = (I, R)>,
+    mut check: impl FnMut(R),
+) {
+    let mut ran = 0;
+    let mut failed = Vec::new();
+    for (id, row) in rows {
+        ran += 1;
+        if catch_unwind(AssertUnwindSafe(|| check(row))).is_err() {
+            failed.push(id.to_string());
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "{table}: {} of {ran} rows failed (messages above): {}",
+        failed.len(),
+        failed.join(", ")
+    );
+    assert_eq!(
+        ran, expected_rows,
+        "{table}: rows run vs rows in the fixture"
+    );
 }
 
 /// Parses `<rows>x<cols>`.

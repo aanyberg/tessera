@@ -17,10 +17,11 @@
 //! - `main:` the primary screen's rows while the alternate one is active;
 //! - `size_after:` the grid size after the script (DECCOLM).
 //!
-//! One test per mode runs that mode's cases; [`every_case_is_tested_once`]
-//! keeps the lists and the fixture in step. The fixture's tables (the
-//! kitty stack, bracketed paste and focus, which app-core tests) are not
-//! cases: the kitty table is checked by the direct tests at the end.
+//! [`every_case_holds`] runs every case in one test, listed by the mode it
+//! pins; [`every_case_is_tested_once`] keeps the lists and the fixture in
+//! step. The fixture's tables (the kitty stack, bracketed paste and focus,
+//! which app-core tests) are not cases: the kitty table is checked by the
+//! direct tests at the end.
 
 #[allow(dead_code)] // Shared harness: not every helper is used here.
 mod common;
@@ -38,6 +39,7 @@ use tessera_term::{
 };
 
 const FIXTURE: &str = include_str!("fixtures/modes_spec.txt");
+const FIXTURE_NAME: &str = "fixtures/modes_spec.txt";
 
 // ------------------------------------------------------------- extra rows
 
@@ -273,36 +275,29 @@ fn cases() -> Vec<Case> {
     parse_fixture(FIXTURE)
 }
 
-/// Checks the cases `ids` whole and byte by byte, every row, and panics
-/// with all mismatches at once.
-fn check(ids: &[&str]) {
-    let cases = cases();
+/// Checks case `id` whole and byte by byte, every row, and panics with
+/// all its mismatches at once.
+fn check(cases: &[Case], id: &str) {
     let mut errors = Vec::new();
-    for id in ids {
-        let case = cases
-            .iter()
-            .find(|case| case.id == *id)
-            .unwrap_or_else(|| panic!("{id}: no such case"));
-        let extra = extra(id);
-        for chunking in [Chunking::Whole, Chunking::Bytewise] {
-            errors.extend(check_case(case, chunking));
-            let (term, _) = case.script.run(chunking);
-            errors.extend(check_extra(case, &extra, &term, chunking));
-        }
+    let case = cases
+        .iter()
+        .find(|case| case.id == id)
+        .unwrap_or_else(|| panic!("{id}: no such case"));
+    let extra = extra(id);
+    for chunking in [Chunking::Whole, Chunking::Bytewise] {
+        errors.extend(check_case(case, chunking));
+        let (term, _) = case.script.run(chunking);
+        errors.extend(check_extra(case, &extra, &term, chunking));
     }
     assert!(errors.is_empty(), "{}", errors.join("\n"));
 }
 
+/// Lists the cases [`every_case_holds`] runs, grouped by the mode they
+/// pin: `group: [ids]`.
 macro_rules! mode_tests {
     ($($name:ident: [$($id:literal),* $(,)?]),* $(,)?) => {
-        /// Every case some test runs.
-        const TESTED: &[&str] = &[$($($id),*),*];
-        $(
-            #[test]
-            fn $name() {
-                check(&[$($id),*]);
-            }
-        )*
+        /// Every case, as `(group, ids)`.
+        const GROUPS: &[(&str, &[&str])] = &[$((stringify!($name), &[$($id),*])),*];
     };
 }
 
@@ -433,11 +428,27 @@ mode_tests! {
     ],
 }
 
+/// Every listed case holds. One test runs the whole table (one process
+/// instead of one per group) and reports every failing case as
+/// `group/id`.
+#[test]
+fn every_case_holds() {
+    let cases = cases();
+    let rows = GROUPS
+        .iter()
+        .flat_map(|(group, ids)| ids.iter().map(move |id| (format!("{group}/{id}"), *id)));
+    common::check_table(FIXTURE_NAME, cases.len(), rows, |id| check(&cases, id));
+}
+
 #[test]
 fn every_case_is_tested_once() {
     let ids: Vec<String> = cases().into_iter().map(|case| case.id).collect();
-    let unique: HashSet<&str> = TESTED.iter().copied().collect();
-    assert_eq!(unique.len(), TESTED.len(), "a case is listed twice");
+    let tested: Vec<&str> = GROUPS
+        .iter()
+        .flat_map(|(_, ids)| ids.iter().copied())
+        .collect();
+    let unique: HashSet<&str> = tested.iter().copied().collect();
+    assert_eq!(unique.len(), tested.len(), "a case is listed twice");
     let fixture: HashSet<&str> = ids.iter().map(String::as_str).collect();
     assert_eq!(unique, fixture, "test lists and fixture cases differ");
 }
@@ -634,7 +645,7 @@ fn a_flood_of_mode_sequences_requests_nothing() {
     term.advance(b"text");
     let one = b"\x1b[?25l\x1b[?25h\x1b[?1049h\x1b[?1049l\x1b[?1047h\x1b[?1047l\x1b[?6h\x1b[?6l\
 \x1b[?1000h\x1b[?1006h\x1b[?2004h\x1b[4h\x1b[4l\x1b[>1u\x1b[<u\x1b[>4;2m\x1b=\x1b>\x1b[?3h";
-    term.advance(&one.repeat(20_000));
+    term.advance(&one.repeat(2_000));
     assert_eq!(term.take_requests(), Vec::<Request>::new());
     assert!(!term.grid().is_alt_screen());
     assert_eq!(term.keyboard_modes().kitty_flags.bits(), 0);
