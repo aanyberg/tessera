@@ -17,6 +17,8 @@ jobs:
   rust:
     name: Rust (stable)
     runs-on: macos-15
+    # A normal run is well under 20 minutes; a hang fails the job instead of stalling merges (#137).
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -39,6 +41,9 @@ jobs:
     name: macOS app
     runs-on: macos-15
     needs: rust
+    # A normal run is 4-6 minutes. just app-test hung three times (#121); the job limit is the backstop for a hang
+    # below the test level, the step limit and xcodebuild's per-test timeouts (in the justfile) report it earlier.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -49,3 +54,4 @@ jobs:
       - run: sudo xcode-select -s /Applications/Xcode_16.4.app || true
       - run: just app
       - run: just app-test
+        timeout-minutes: 10

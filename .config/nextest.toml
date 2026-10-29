@@ -1,3 +1,9 @@
+# A hung test must fail the run instead of stalling it for hours (#137): after 60 s a test is reported SLOW, after
+# five periods (300 s) it is terminated and the run fails. The slowest test of the whole workspace takes 12 s
+# (debug, measured 2026-10-29), so the default leaves 25x headroom for a machine under load 30+.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 5 }
+
 # Timing-sensitive tests run one at a time so a loaded machine cannot make
 # their wall-clock bounds flake; everything else runs in parallel.
 [test-groups]
@@ -46,3 +52,13 @@ test-group = 'timing'
 [[profile.default.overrides]]
 filter = '(package(tessera-app-core) & kind(lib) & test(a_loss_inside_the_frame_detaches_at_once)) | (package(tessera-render) & binary(device_loss) & test(a_device_error_loses_the_device_during_the_call_that_hit_it))'
 test-group = 'gpu-memory'
+
+# The slowest tests (file-watcher polling, ligature shaping at every size, GPU queues, hdiutil): 12 s at most
+# measured, 600 s before they are terminated.
+[[profile.default.overrides]]
+filter = '(package(tessera-config) & (binary(watch_themes) | binary(reload))) | (package(tessera-render) & binary(shaping)) | (package(tessera-devtool) & binary(theme)) | (package(tessera-term) & binary(wide))'
+slow-timeout = { period = "60s", terminate-after = 10 }
+
+[[profile.default.overrides]]
+filter = '(package(tessera-app-core) & kind(lib) & test(a_loss_inside_the_frame_detaches_at_once)) | (package(tessera-render) & binary(device_loss))'
+slow-timeout = { period = "60s", terminate-after = 10 }
