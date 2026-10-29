@@ -2,7 +2,7 @@
 //!
 //! Turns rows of [`tessera_grid::Cell`]s plus a [`Theme`] into pixels using
 //! `wgpu` (Metal on macOS). Owns the glyph atlas, text shaping, the
-//! background / glyph / decoration / cursor passes and damage tracking:
+//! background / overlay / glyph / decoration / cursor passes and damage tracking:
 //! rows the frame does not mark damaged keep their shaped glyphs and GPU
 //! instances from the previous frame (ADR 0016). The surface it draws into is handed over by the frontend
 //! as a raw window handle, so this crate has no `AppKit` dependency and can
@@ -20,8 +20,8 @@
 //!
 //! [`Renderer`] draws a [`FrameInput`] (rows of cells, cursor, selection,
 //! overlays; decoupled from the grid, so the caller picks the visible
-//! rows) in four passes: backgrounds, glyphs, decorations and the cursor
-//! (ADR 0010). [`Palette`] resolves cell colors against the [`Theme`].
+//! rows) in five passes: backgrounds, the selection and search overlays,
+//! glyphs, decorations and the cursor (ADR 0010). [`Palette`] resolves cell colors against the [`Theme`].
 //! [`RenderSurface::render`] presents a frame; [`OffscreenTarget::render`]
 //! draws one headless for the golden tests.
 //!
@@ -65,7 +65,9 @@ pub use font::{
     MAX_FONT_SIZE_PT, MAX_SCALE, MIN_FONT_SIZE_PT, SYSTEM_FALLBACK, StyleSupport,
     sanitize_font_size,
 };
-pub use frame::{CursorShape, CursorState, FrameInput, Overlay, Selection};
+pub use frame::{
+    CursorShape, CursorState, FrameInput, Overlay, OverlayKind, Selection, SelectionKind,
+};
 pub use gpu::Gpu;
 pub use offscreen::{
     OffscreenTarget, SUPPORTED_FORMATS, is_supported_format, padded_bytes_per_row,

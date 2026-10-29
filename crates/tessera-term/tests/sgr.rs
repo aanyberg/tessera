@@ -4,7 +4,7 @@
 //! Expected behaviour comes from `tests/fixtures/sgr_spec.txt`, a fixture
 //! that cites xterm, ECMA-48, kitty, `WezTerm` and Alacritty per row. Its
 //! styles are written in a canonical text form that does not depend on
-//! `Style`'s bit layout; [`pen_text`] prints exactly that form.
+//! `Style`'s bit layout; `common::pen_text` prints exactly that form.
 //!
 //! - [`pen_rows_hold`] runs every pen row (parts A and B), fed as written
 //!   and byte by byte, and compares the pen. Rows marked `free` document an
@@ -25,74 +25,15 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use common::{Chunking, Script, decode};
+use common::{Chunking, Script, decode, pen_text};
 use proptest::prelude::*;
-use tessera_grid::{Cell, Color, Grid, Style, UnderlineStyle};
+use tessera_grid::{Cell, Color, Grid, Style};
 use tessera_term::Terminal;
 
 const FIXTURE: &str = include_str!("fixtures/sgr_spec.txt");
 const COLOR_TABLE_CELLS: &str = include_str!("fixtures/sgr_color_table_cells.txt");
 
 // --------------------------------------------------------------- rendering
-
-/// A colour in the fixture's notation: `-`, `iN` or `#rrggbb`.
-fn color_text(color: Color) -> String {
-    match color {
-        Color::Default => "-".to_owned(),
-        Color::Indexed(n) => format!("i{n}"),
-        Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
-    }
-}
-
-/// A style in the fixture's canonical notation:
-/// `fg=<c> bg=<c> ul=<c> us=<style> flags=<list>`.
-///
-/// Flag bits the notation has no name for (none exist today) are printed
-/// as `?0x...`, so a stray bit can never pass as a clean pen.
-fn pen_text(style: Style) -> String {
-    const NAMES: [(u16, &str); 10] = [
-        (Style::BOLD, "bold"),
-        (Style::DIM, "dim"),
-        (Style::ITALIC, "italic"),
-        (Style::BLINK, "blink"),
-        (Style::INVERSE, "inverse"),
-        (Style::HIDDEN, "hidden"),
-        (Style::STRIKETHROUGH, "strike"),
-        (Style::OVERLINE, "overline"),
-        (Style::SUPERSCRIPT, "superscript"),
-        (Style::SUBSCRIPT, "subscript"),
-    ];
-    let us = match style.underline_style() {
-        UnderlineStyle::None => "none",
-        UnderlineStyle::Single => "single",
-        UnderlineStyle::Double => "double",
-        UnderlineStyle::Curly => "curly",
-        UnderlineStyle::Dotted => "dotted",
-        UnderlineStyle::Dashed => "dashed",
-    };
-    let mut flags: Vec<String> = NAMES
-        .iter()
-        .filter(|(bit, _)| style.has(*bit))
-        .map(|(_, name)| (*name).to_owned())
-        .collect();
-    let known = NAMES
-        .iter()
-        .fold(Style::UNDERLINE_STYLE_MASK, |m, (b, _)| m | b);
-    if style.flags & !known != 0 {
-        flags.push(format!("?{:#x}", style.flags & !known));
-    }
-    let flags = if flags.is_empty() {
-        "-".to_owned()
-    } else {
-        flags.join(",")
-    };
-    format!(
-        "fg={} bg={} ul={} us={us} flags={flags}",
-        color_text(style.fg),
-        color_text(style.bg),
-        color_text(style.underline),
-    )
-}
 
 /// Feeds every payload of `feeds` into `term`, in one call each or one
 /// byte per call.
@@ -427,7 +368,7 @@ fn check_cell_case(case: &CellCase, chunking: Chunking) -> Vec<String> {
 #[test]
 fn cell_rows_hold() {
     let cases = cell_cases();
-    assert_eq!(cases.len(), 39, "cell blocks in the fixture");
+    assert_eq!(cases.len(), 40, "cell blocks in the fixture");
     for case in &cases {
         assert!(
             !case.feeds.is_empty() && !case.cells.is_empty(),

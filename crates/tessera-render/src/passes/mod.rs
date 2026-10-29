@@ -1,16 +1,20 @@
-//! The four grid passes and the instance data they share.
+//! The five grid passes and the instance data they share.
 //!
-//! Every pass emits instanced quads into one [`Instance`] buffer that is
-//! rebuilt each frame; the passes are consecutive ranges of it, drawn in
-//! order with one pipeline (`shaders/quad.wgsl`):
+//! Every pass emits instanced quads into one [`Instance`] buffer; the
+//! passes are consecutive ranges of it, drawn in order with one pipeline
+//! (`shaders/quad.wgsl`):
 //!
 //! 1. [`background`]: one quad per run of cells whose background is not
 //!    the theme default (the target is cleared to that first);
-//! 2. [`glyph`]: one quad per shaped glyph, tinted coverage or
-//!    premultiplied colour;
-//! 3. [`decoration`]: underline, double underline and strikethrough bars;
-//! 4. [`cursor`]: the cursor shape, plus the cursor cell's glyph redrawn in
-//!    the background color under a block cursor.
+//! 2. [`overlay`]: the selection, then search matches and link
+//!    underlines, blended over the backgrounds;
+//! 3. [`glyph`]: one quad per shaped glyph, tinted coverage or
+//!    premultiplied colour (superscript and subscript drawn smaller);
+//! 4. [`decoration`]: underlines in five styles, overline and
+//!    strikethrough;
+//! 5. [`cursor`]: the cursor shape, plus, under a block cursor, the glyphs
+//!    and decorations of its cell or cells redrawn in the cursor's text
+//!    color.
 //!
 //! Coordinates are physical pixels from the target's top-left corner.
 //! See ADR 0010 for the layout and the color pipeline.
@@ -19,6 +23,7 @@ pub(crate) mod background;
 pub(crate) mod cursor;
 pub(crate) mod decoration;
 pub(crate) mod glyph;
+pub(crate) mod overlay;
 
 use std::ops::Range;
 
@@ -43,6 +48,12 @@ pub(crate) enum Kind {
     AlphaGlyph = 1,
     /// Premultiplied colour loaded from the colour atlas, times `color.a`.
     ColorGlyph = 2,
+    /// `color` in dashes along x: `texel` is `[period, dash length]`,
+    /// starting at the rectangle's left edge (dashed and dotted lines).
+    Dashes = 3,
+    /// A sine wave along x: `texel` is `[period, amplitude]`, the stroke
+    /// is the height minus twice the amplitude (curly underlines).
+    Wave = 4,
 }
 
 /// One quad: 64 bytes, shared by every pass.
@@ -63,18 +74,24 @@ pub(crate) struct Instance {
     pub texel: [f32; 2],
     /// A [`Kind`].
     pub kind: u32,
-    /// Keeps the struct a multiple of 16 bytes.
-    pub pad: u32,
+    /// Glyphs: atlas texels per pixel, 1 for a glyph drawn at its own
+    /// size, more for a smaller (superscript or subscript) one, which is
+    /// then filtered bilinearly instead of loaded texel for texel.
+    /// Dashes and waves: the x their pattern's phase is measured from (the
+    /// grid's left edge), so runs and cursor redraws line up. Unused by
+    /// solids.
+    pub extra: f32,
 }
 
 impl Instance {
-    /// The vertex attributes, locations 0..=4.
-    pub const ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+    /// The vertex attributes, locations 0..=5.
+    pub const ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
         0 => Float32x4,
         1 => Float32x4,
         2 => Float32x4,
         3 => Float32x2,
         4 => Uint32,
+        5 => Float32,
     ];
 
     /// A solid rectangle of `color` (straight alpha), unclipped.
@@ -85,8 +102,47 @@ impl Instance {
             color: color.premultiplied(),
             texel: [0.0; 2],
             kind: Kind::Solid as u32,
-            pad: 0,
+            extra: 0.0,
         }
+    }
+
+    /// A dashed line filling `rect`: `dash` pixels of `color` in every
+    /// `period`, the periods counted from `phase_x`.
+    pub fn dashes(rect: [f32; 4], color: Rgba, (period, dash): (f32, f32), phase_x: f32) -> Self {
+        Self {
+            texel: [period, dash],
+            kind: Kind::Dashes as u32,
+            extra: phase_x,
+            ..Self::solid(rect, color)
+        }
+    }
+
+    /// A wave of `period` and `amplitude` around the middle of `rect`,
+    /// stroked `rect` height minus twice the amplitude, its phase counted
+    /// from `phase_x`.
+    pub fn wave(
+        rect: [f32; 4],
+        color: Rgba,
+        (period, amplitude): (f32, f32),
+        phase_x: f32,
+    ) -> Self {
+        Self {
+            texel: [period, amplitude],
+            kind: Kind::Wave as u32,
+            extra: phase_x,
+            ..Self::solid(rect, color)
+        }
+    }
+
+    /// The same instance clipped to `clip` as well.
+    pub fn clipped(mut self, clip: [f32; 4]) -> Self {
+        self.clip = [
+            self.clip[0].max(clip[0]),
+            self.clip[1].max(clip[1]),
+            self.clip[2].min(clip[2]),
+            self.clip[3].min(clip[3]),
+        ];
+        self
     }
 
     /// A glyph bitmap at `origin` (its top-left pixel), clipped to `clip`.
@@ -116,8 +172,22 @@ impl Instance {
             color: tint.premultiplied(),
             texel: [texel(slot.uv[0]), texel(slot.uv[1])],
             kind: kind as u32,
-            pad: 0,
+            extra: 1.0,
         }
+    }
+
+    /// The same glyph drawn `factor` times its size (`factor` in
+    /// `0.0..1.0` shrinks it), its top-left corner moved to `origin`. The
+    /// bitmap is reused and filtered bilinearly by the shader.
+    pub fn resized(mut self, origin: [f32; 2], factor: f32) -> Self {
+        self.rect = [
+            origin[0],
+            origin[1],
+            self.rect[2] * factor,
+            self.rect[3] * factor,
+        ];
+        self.extra = 1.0 / factor;
+        self
     }
 }
 
@@ -128,16 +198,18 @@ pub(crate) const NO_CLIP: [f32; 4] = [f32::MIN, f32::MIN, f32::MAX, f32::MAX];
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PassRanges {
     pub background: Range<u32>,
+    pub overlay: Range<u32>,
     pub glyph: Range<u32>,
     pub decoration: Range<u32>,
     pub cursor: Range<u32>,
 }
 
 impl PassRanges {
-    /// The four passes with their debug labels, in draw order.
-    pub fn labelled(&self) -> [(&'static str, Range<u32>); 4] {
+    /// The five passes with their debug labels, in draw order.
+    pub fn labelled(&self) -> [(&'static str, Range<u32>); 5] {
         [
             ("tessera.background", self.background.clone()),
+            ("tessera.overlay", self.overlay.clone()),
             ("tessera.glyph", self.glyph.clone()),
             ("tessera.decoration", self.decoration.clone()),
             ("tessera.cursor", self.cursor.clone()),
@@ -174,7 +246,7 @@ impl Layout {
             baseline: px_from(metrics.baseline_px),
             target,
             stroke: px_from(scale).max(1),
-            decoration: DecorationGeometry::new(metrics),
+            decoration: DecorationGeometry::new(metrics).with_phase_x(f32_from(pad)),
         }
     }
 
@@ -258,6 +330,20 @@ impl CellColors {
         }
     }
 
+    /// The color a block cursor redraws `style`'s glyphs and decorations
+    /// in: the cell's background (after inverse video), dimmed when the
+    /// cell is DIM, as its foreground would be. Alpha is the caller's.
+    pub fn cursor_text(palette: &Palette, style: Style) -> Rgba {
+        if !style.has(Style::DIM) {
+            return Self::background(palette, style).1;
+        }
+        if style.has(Style::INVERSE) {
+            palette.resolve_dim(style.fg, ColorSlot::Foreground)
+        } else {
+            palette.resolve_dim(style.bg, ColorSlot::Background)
+        }
+    }
+
     /// Whether the background pass paints `style`'s background, and its
     /// color (what [`Self::resolve`] gives as `paint_bg` and `bg`).
     pub fn background(palette: &Palette, style: Style) -> (bool, Rgba) {
@@ -314,8 +400,8 @@ mod tests {
     #[test]
     fn instance_is_64_bytes() {
         assert_eq!(std::mem::size_of::<Instance>(), 64);
-        let end = Instance::ATTRIBUTES[4].offset + 4;
-        assert_eq!(end, 60, "kind ends before the padding word");
+        let end = Instance::ATTRIBUTES[5].offset + 4;
+        assert_eq!(end, 64, "`extra` is the last word");
     }
 
     #[test]
@@ -414,6 +500,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The cursor's text color is the cell's background after inverse,
+    /// dimmed exactly like a foreground when the cell is DIM.
+    #[test]
+    fn cursor_text_follows_inverse_and_dim() {
+        let palette = Palette::new(&Theme::default());
+        let style = Style {
+            fg: Color::Rgb(255, 255, 255),
+            bg: Color::Rgb(0, 128, 255),
+            ..Style::DEFAULT
+        };
+        let plain = CellColors::cursor_text(&palette, style);
+        assert_eq!(plain.to_srgb8(), [0, 128, 255]);
+        let dimmed = CellColors::cursor_text(&palette, style.with(Style::DIM));
+        assert_eq!(dimmed, crate::palette::dim(plain.with_alpha(1.0)));
+        let inverse = CellColors::cursor_text(&palette, style.with(Style::INVERSE));
+        assert_eq!(inverse.to_srgb8(), [255, 255, 255]);
+        let both = CellColors::cursor_text(&palette, style.with(Style::INVERSE | Style::DIM));
+        assert_eq!(both.to_srgb8(), [170, 170, 170]);
     }
 
     #[test]

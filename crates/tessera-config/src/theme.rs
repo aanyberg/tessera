@@ -9,6 +9,8 @@
 //! background = "#282a36"
 //! cursor = "#f8f8f2"          # optional; defaults to the foreground
 //! selection = "#44475a"       # optional; defaults to the foreground at alpha 0x40
+//! search_match = "#ffd86699"  # optional; defaults to the renderer's (#ffd866 at alpha 0.6)
+//! search_match_current = "#ff9f43cc"  # optional; defaults to #ff9f43 at alpha 0.8
 //! ansi = ["#21222c", "#ff5555", "#50fa7b", "#f1fa8c", "#bd93f9", "#ff79c6", "#8be9fd", "#f8f8f2",
 //!         "#6272a4", "#ff6e6e", "#69ff94", "#ffffa5", "#d6acff", "#ff92df", "#a4ffff", "#ffffff"]
 //! ```
@@ -234,6 +236,12 @@ pub struct Theme {
     pub cursor: Color,
     /// Selection highlight; its alpha is the highlight's opacity.
     pub selection: Color,
+    /// Search match highlight, or `None` for the renderer's default
+    /// (`#ffd866` at alpha 0.6). Its alpha is the highlight's opacity.
+    pub search_match: Option<Color>,
+    /// The current search match's highlight, or `None` for the renderer's
+    /// default (`#ff9f43` at alpha 0.8).
+    pub search_match_current: Option<Color>,
     /// ANSI colours 0-15: black, red, green, yellow, blue, magenta, cyan,
     /// white, then their bright variants.
     pub ansi: [Color; 16],
@@ -325,6 +333,8 @@ impl Theme {
         let cursor = color("cursor")?.unwrap_or(foreground);
         let selection =
             color("selection")?.unwrap_or_else(|| foreground.with_alpha(DERIVED_SELECTION_ALPHA));
+        let search_match = color("search_match")?;
+        let search_match_current = color("search_match_current")?;
         let ansi = match table.get("ansi") {
             None => return Err(ThemeError::MissingKey("ansi")),
             Some(toml::Value::Array(items)) => {
@@ -367,6 +377,8 @@ impl Theme {
             background,
             cursor,
             selection,
+            search_match,
+            search_match_current,
             ansi,
         })
     }
@@ -385,6 +397,12 @@ impl Theme {
         let _ = writeln!(out, "background = \"{}\"", self.background);
         let _ = writeln!(out, "cursor = \"{}\"", self.cursor);
         let _ = writeln!(out, "selection = \"{}\"", self.selection);
+        if let Some(color) = self.search_match {
+            let _ = writeln!(out, "search_match = \"{color}\"");
+        }
+        if let Some(color) = self.search_match_current {
+            let _ = writeln!(out, "search_match_current = \"{color}\"");
+        }
         out.push_str("ansi = [\n");
         for row in self.ansi.chunks(8) {
             let row: Vec<String> = row.iter().map(|c| format!("\"{c}\"")).collect();
@@ -666,5 +684,34 @@ mod tests {
             Color::from_hex("#aAfF09"),
             Some(Color::rgb(0xaa, 0xff, 0x09))
         );
+    }
+
+    /// The search highlight keys are optional; set, they parse like any
+    /// colour, survive `to_toml`, and a bad value is an error naming the
+    /// key.
+    #[test]
+    fn search_match_keys_are_optional() {
+        let base = Theme::bundled("Dracula").unwrap().to_toml();
+        let plain = Theme::parse(&base).unwrap();
+        assert_eq!(
+            (plain.search_match, plain.search_match_current),
+            (None, None)
+        );
+        assert!(
+            !base.contains("search_match"),
+            "absent keys are not written"
+        );
+        let text =
+            format!("{base}search_match = \"#112233\"\nsearch_match_current = \"#44556680\"\n");
+        let theme = Theme::parse(&text).unwrap();
+        assert_eq!(theme.search_match, Some(Color::rgb(0x11, 0x22, 0x33)));
+        assert_eq!(
+            theme.search_match_current,
+            Some(Color::rgb(0x44, 0x55, 0x66).with_alpha(0x80))
+        );
+        assert_eq!(Theme::parse(&theme.to_toml()).unwrap(), theme, "round trip");
+        let bad = format!("{base}search_match = \"red\"\n");
+        let error = Theme::parse(&bad).unwrap_err().to_string();
+        assert!(error.contains("search_match"), "{error}");
     }
 }

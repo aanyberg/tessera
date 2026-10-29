@@ -1044,6 +1044,19 @@ cursor: (0,1)
 others: blank
 cite: a printed space is Cell::new(' ', pen), unlike an erased blank which is Cell::blank_with(pen) (bg only)
 
+### CEL10_overline_and_scripts_reach_cells
+size: 1x5
+feed: \x1b[53mA\x1b[73mB\x1b[74mC\x1b[75;55mD
+cell: (0,0) 'A' fg=- bg=- ul=- us=none flags=overline
+cell: (0,1) 'B' fg=- bg=- ul=- us=none flags=overline,superscript
+cell: (0,2) 'C' fg=- bg=- ul=- us=none flags=overline,subscript
+cell: (0,3) 'D' fg=- bg=- ul=- us=none flags=-
+cell: (0,4) ' ' fg=- bg=- ul=- us=none flags=-
+cursor: (0,4)
+others: blank
+cite: ECMA-48 8.3.117 (SGR affects subsequent graphic characters); rows OL_01, VA_06 (74 replaces 73) and OV_03/OV_04 (75 and 55 clear only their own flags) of this fixture
+note: added by #22 so the pen names `overline`, `superscript` and `subscript` reach cell rows (common::pen_text NAMES)
+
 ### BCE01_el2_keeps_bg_only
 size: 2x6
 feed: abcdef\r\nghijkl\x1b[1;1H\x1b[1;3;4:3;31;44;58;5;9m\x1b[2K

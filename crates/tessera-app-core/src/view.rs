@@ -172,6 +172,7 @@ fn whole_px(v: f32) -> u32 {
 pub fn theme_for(config: &Config, theme: &tessera_config::Theme) -> Theme {
     let appearance = &config.appearance;
     let background = rgba(theme.background);
+    let defaults = Theme::default();
     Theme {
         font_family: appearance.font_family.clone(),
         font_size: sanitize_font_size(appearance.font_size),
@@ -179,8 +180,12 @@ pub fn theme_for(config: &Config, theme: &tessera_config::Theme) -> Theme {
         background: background.with_alpha(background.a * appearance.opacity),
         cursor: rgba(theme.cursor),
         selection: rgba(theme.selection),
+        search_match: theme.search_match.map_or(defaults.search_match, rgba),
+        search_match_current: theme
+            .search_match_current
+            .map_or(defaults.search_match_current, rgba),
         ansi: theme.ansi.map(rgba),
-        ..Theme::default()
+        ..defaults
     }
 }
 
@@ -845,6 +850,23 @@ mod tests {
         source.selection = Color::rgb(0x26, 0x4f, 0x78).with_alpha(0x99);
         let selection = theme_for(&config, &source).selection;
         assert!((selection.a - 0.6).abs() < f32::EPSILON);
+        // Search highlights: the renderer's defaults unless the theme sets
+        // them.
+        let defaults = Theme::default();
+        let theme = theme_for(&config, &source);
+        assert_eq!(theme.search_match, defaults.search_match);
+        assert_eq!(theme.search_match_current, defaults.search_match_current);
+        source.search_match = Some(Color::rgb(0x11, 0x22, 0x33).with_alpha(0x80));
+        source.search_match_current = Some(Color::rgb(0x44, 0x55, 0x66));
+        let theme = theme_for(&config, &source);
+        assert_eq!(
+            theme.search_match,
+            Rgba::from_srgb8(0x11, 0x22, 0x33).with_alpha(128.0 / 255.0)
+        );
+        assert_eq!(
+            theme.search_match_current,
+            Rgba::from_srgb8(0x44, 0x55, 0x66)
+        );
     }
 
     #[test]

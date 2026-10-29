@@ -356,6 +356,7 @@ mod tests {
             ("passes/glyph.rs", include_str!("passes/glyph.rs")),
             ("passes/decoration.rs", include_str!("passes/decoration.rs")),
             ("passes/cursor.rs", include_str!("passes/cursor.rs")),
+            ("passes/overlay.rs", include_str!("passes/overlay.rs")),
         ];
         assert_eq!(include_str!("palette.rs").matches(pow).count(), 0);
         for (name, source) in passes {
