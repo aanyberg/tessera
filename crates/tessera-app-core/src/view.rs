@@ -28,9 +28,11 @@
 //! changed since the last presented frame (no damage, same cursor, same
 //! focus, nothing the renderer must redraw on its own), so an idle
 //! terminal costs no GPU work. It also presents at most one frame per
-//! [`MIN_FRAME_INTERVAL`]: a flood of output is captured on every call but
+//! [`MIN_FRAME_INTERVAL`], returning [`FrameStatus::Paced`] for a call
+//! that comes too soon: a flood of output is captured on every call but
 //! only the newest snapshot is drawn, so the reader thread never waits on
-//! the GPU and the screen updates at display rate.
+//! the GPU and the screen updates at display rate. A surface with nothing
+//! to draw into reports [`FrameStatus::NotReady`].
 
 use std::time::{Duration, Instant};
 
@@ -48,8 +50,8 @@ use tessera_term::Terminal;
 /// display period at 240 Hz, the fastest refresh a Mac display runs at.
 ///
 /// A host that calls [`crate::App::render_view`] more often (a host
-/// rendering on every output notification) gets [`FrameStatus::Skipped`]
-/// for the extra calls; each call still captures the grid, so a later
+/// rendering on every output notification) gets [`FrameStatus::Paced`]
+/// for the extra calls and must render again on its next refresh; each call still captures the grid, so a later
 /// presented frame shows the newest content. Calls up to [`FRAME_SLACK`]
 /// early count as on time, and the schedule never exceeds one frame per
 /// interval on average: over any window of `T`, at most
@@ -64,8 +66,8 @@ pub const MIN_FRAME_INTERVAL: Duration = Duration::from_micros(4166);
 /// than 1/240 s), which a display link of at most 240 Hz never produces
 /// unless it delivers a tick more than a whole period late. A host that
 /// renders faster than that, or in bursts closer than about half an
-/// interval, can still get a paced skip and must render again after
-/// one.
+/// interval, can still get [`FrameStatus::Paced`] and must render again
+/// after it.
 pub const FRAME_SLACK: Duration = Duration::from_micros(2083);
 
 /// A view's geometry: the surface in physical pixels, its backing scale and
@@ -204,18 +206,6 @@ fn due_time(last: Option<Instant>, now: Instant) -> Instant {
     last.map_or(earliest, |t| (t + MIN_FRAME_INTERVAL).max(earliest))
 }
 
-/// Why [`View::render`] skipped a frame without drawing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SkipReason {
-    /// Nothing changed since the last presented frame.
-    Unchanged,
-    /// A frame was presented less than [`MIN_FRAME_INTERVAL`] ago.
-    Paced,
-    /// The surface had nothing to draw into (zero-sized, occluded, no
-    /// drawable).
-    Surface,
-}
-
 /// What a view draws into.
 #[derive(Debug)]
 enum Target {
@@ -226,6 +216,9 @@ enum Target {
     Offscreen {
         target: tessera_render::OffscreenTarget,
         scale: f32,
+        /// Stands in for a surface with no drawable: every frame is
+        /// [`FrameStatus::NotReady`] and nothing is drawn.
+        not_ready: bool,
     },
 }
 
@@ -261,7 +254,9 @@ impl Target {
         match self {
             Self::Surface(surface) => surface.resize(gpu, size, scale),
             #[cfg(test)]
-            Self::Offscreen { target, scale: s } => {
+            Self::Offscreen {
+                target, scale: s, ..
+            } => {
                 *target = tessera_render::OffscreenTarget::new(gpu, size, target.format());
                 *s = sanitize_scale(scale);
             }
@@ -276,6 +271,10 @@ impl Target {
     ) -> Result<FrameStatus, RenderError> {
         match self {
             Self::Surface(surface) => surface.render(gpu, renderer, frame),
+            #[cfg(test)]
+            Self::Offscreen {
+                not_ready: true, ..
+            } => Ok(FrameStatus::NotReady),
             #[cfg(test)]
             Self::Offscreen { target, .. } => {
                 target.render(gpu, renderer, frame)?;
@@ -325,8 +324,6 @@ pub(crate) struct View {
     /// schedule (at most [`FRAME_SLACK`] before it was actually
     /// presented); `None` before the first one.
     last_presented: Option<Instant>,
-    /// Why the last [`View::render`] skipped, if it did.
-    last_skip: Option<SkipReason>,
 }
 
 impl View {
@@ -364,6 +361,7 @@ impl View {
                 wgpu::TextureFormat::Rgba8UnormSrgb,
             ),
             scale: sanitize_scale(scale),
+            not_ready: false,
         };
         Self::with_target(gpu, target, fonts, theme)
     }
@@ -386,7 +384,6 @@ impl View {
             pending: DamageRows::All,
             shown: None,
             last_presented: None,
-            last_skip: None,
         })
     }
 
@@ -533,14 +530,15 @@ impl View {
         self.pending = self.pending.union(&changed);
     }
 
-    /// Draws the last captured snapshot and presents it, or returns
-    /// [`FrameStatus::Skipped`] when nothing was drawn, for one of three
-    /// reasons: nothing changed since the last presented frame, the frame
-    /// came earlier than the [`MIN_FRAME_INTERVAL`] schedule allows (paced),
-    /// or the surface had nothing to draw into. The first two never touch
+    /// Draws the last captured snapshot and presents it, or reports why
+    /// nothing was drawn: [`FrameStatus::Skipped`] when nothing changed
+    /// since the last presented frame, [`FrameStatus::Paced`] when the
+    /// frame came earlier than the [`MIN_FRAME_INTERVAL`] schedule allows,
+    /// and [`FrameStatus::NotReady`] when the surface had nothing to draw
+    /// into (zero-sized, occluded, no drawable). The first two never touch
     /// the GPU. Damage of a frame that was not drawn carries over to the
-    /// next; after a paced skip the caller must render again for it to be
-    /// drawn (a display link does so on its next tick).
+    /// next; after `Paced` or `NotReady` the caller must render again for
+    /// it to be drawn (a display link does so on its next tick).
     pub(crate) fn render(&mut self, focused: bool) -> Result<FrameStatus, RenderError> {
         let shown = Shown {
             cursor: self.snapshot.cursor,
@@ -549,11 +547,11 @@ impl View {
         let changed =
             !self.pending.is_none() || self.shown != Some(shown) || self.renderer.needs_redraw();
         if !changed {
-            return Ok(self.skip(SkipReason::Unchanged));
+            return Ok(FrameStatus::Skipped);
         }
         let now = Instant::now();
         if is_paced(self.last_presented, now) {
-            return Ok(self.skip(SkipReason::Paced));
+            return Ok(FrameStatus::Paced);
         }
         let rows = self.snapshot.rows();
         let frame = self
@@ -562,15 +560,13 @@ impl View {
             .with_damage(self.pending.clone());
         let status = self.target.render(&self.gpu, &mut self.renderer, &frame);
         match status {
-            Ok(FrameStatus::Presented | FrameStatus::Suboptimal) => {
+            Ok(status) if status.is_drawn() => {
                 self.pending = DamageRows::None;
                 self.shown = Some(shown);
                 self.last_presented = Some(due_time(self.last_presented, now));
-                self.last_skip = None;
             }
-            Ok(FrameStatus::Skipped) => {
-                self.last_skip = Some(SkipReason::Surface);
-            }
+            // Not drawn: the damage stays pending for the next frame.
+            Ok(_) => {}
             // The renderer rebuilds everything after an error; so does
             // the next frame here.
             Err(_) => self.pending = DamageRows::All,
@@ -578,16 +574,13 @@ impl View {
         status
     }
 
-    /// Records why a frame was skipped.
-    fn skip(&mut self, reason: SkipReason) -> FrameStatus {
-        self.last_skip = Some(reason);
-        FrameStatus::Skipped
-    }
-
-    /// Why the last [`Self::render`] was skipped, `None` if it drew.
+    /// Makes an offscreen view behave like a surface without a drawable
+    /// (`true`) or draw again (`false`).
     #[cfg(test)]
-    pub(crate) fn last_skip(&self) -> Option<SkipReason> {
-        self.last_skip
+    pub(crate) fn set_not_ready(&mut self, value: bool) {
+        if let Target::Offscreen { not_ready, .. } = &mut self.target {
+            *not_ready = value;
+        }
     }
 
     /// The renderer, for its counters.
@@ -1158,11 +1151,12 @@ mod tests {
         next_frame();
         view.capture(&term);
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Skipped);
-        assert_eq!(view.last_skip(), Some(SkipReason::Unchanged));
         assert_eq!(view.renderer().stats().frames, frames, "no GPU work");
-        // Without even a capture in between.
+        // Without even a capture in between, and however soon: an
+        // unchanged frame is never paced.
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Skipped);
-        assert_eq!(view.last_skip(), Some(SkipReason::Unchanged));
+        view.last_presented = Some(Instant::now());
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Skipped);
     }
 
     #[test]
@@ -1232,8 +1226,9 @@ mod tests {
         // A frame was just presented: the next one is not due for an
         // interval, and half an interval of slack does not cover that.
         view.last_presented = Some(Instant::now());
-        assert_eq!(view.render(true).expect("frame"), FrameStatus::Skipped);
-        assert_eq!(view.last_skip(), Some(SkipReason::Paced));
+        let frames = view.renderer().stats().frames;
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Paced);
+        assert_eq!(view.renderer().stats().frames, frames, "no GPU work");
         // Within the slack of its due time it is on time, and draws the
         // row the paced call captured.
         let shaped = view.renderer().stats().rows_shaped;
@@ -1245,6 +1240,92 @@ mod tests {
             1,
             "row 0 kept its damage"
         );
+    }
+
+    /// Real renders with new content each, on the real clock: the first
+    /// two within one interval are on time (the second within the slack),
+    /// the third is `Paced`, and after the interval the paced content is
+    /// `Presented`. A run in which drawing took so long that the three did
+    /// not fit in one interval proves nothing and is repeated.
+    #[test]
+    fn three_renders_within_one_interval_are_paced_then_presented() {
+        let Some(mut view) = offscreen_view(3, 10) else {
+            return;
+        };
+        let mut term = Terminal::new(3, 10);
+        let mut paced = 0;
+        for round in 0..20 {
+            next_frame();
+            next_frame();
+            let start = Instant::now();
+            let mut statuses = Vec::new();
+            for ch in [b"a", b"b", b"c"] {
+                term.advance(ch);
+                view.capture(&term);
+                statuses.push(view.render(true).expect("frame"));
+            }
+            let fit = Instant::now() < start + MIN_FRAME_INTERVAL;
+            assert_eq!(statuses[..2], [FrameStatus::Presented; 2], "round {round}");
+            if !fit {
+                continue;
+            }
+            assert_eq!(statuses[2], FrameStatus::Paced, "round {round}");
+            paced += 1;
+            let frames = view.renderer().stats().frames;
+            next_frame();
+            assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+            assert_eq!(view.renderer().stats().frames, frames + 1);
+            next_frame();
+            assert_eq!(view.render(true).expect("frame"), FrameStatus::Skipped);
+            if paced == 3 {
+                return;
+            }
+        }
+        panic!("three renders never fit in one interval ({paced} did)");
+    }
+
+    /// A surface without a drawable reports `NotReady`, draws nothing and
+    /// keeps the damage, which the next ready frame draws; it is not
+    /// counted on the pacing schedule.
+    #[test]
+    fn a_surface_that_is_not_ready_keeps_the_frame_pending() {
+        let Some(mut view) = offscreen_view(3, 10) else {
+            return;
+        };
+        let mut term = Terminal::new(3, 10);
+        term.advance(b"abc");
+        view.capture(&term);
+        view.set_not_ready(true);
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::NotReady);
+        assert_eq!(view.renderer().stats().frames, 0, "nothing drawn");
+        assert_eq!(view.last_presented, None, "not on the schedule");
+        // Retried at once (a not-ready frame is not paced): still not ready.
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::NotReady);
+        view.set_not_ready(false);
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+        assert_eq!(view.renderer().stats().frames, 1);
+
+        // A one-row change while not ready is drawn, that row only, by the
+        // first ready frame; the cursor stays where it was.
+        next_frame();
+        term.advance(b"\x1b[2;1Hx\x1b[1;4H");
+        view.capture(&term);
+        view.set_not_ready(true);
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::NotReady);
+        view.set_not_ready(false);
+        let shaped = view.renderer().stats().rows_shaped;
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+        assert_eq!(
+            view.renderer().stats().rows_shaped - shaped,
+            1,
+            "row 1 kept its damage"
+        );
+        assert_eq!(view.renderer().stats().frames, 2);
+
+        // Not ready with nothing pending is `Skipped`: nothing to retry.
+        next_frame();
+        view.set_not_ready(true);
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Skipped);
     }
 
     /// A display link's jitter never makes its tick paced, at 60, 120,

@@ -109,7 +109,10 @@ configuration and presentation belong there.
   `FrameStatus`: `PRESENTED` (0), `SUBOPTIMAL` (1, the host should call
   `tessera_surface_resize` with its current size) and `SKIPPED` (2, a
   zero-sized surface, an occluded window, or a layer that vended no
-  drawable). There is no drawable timeout on Metal (see below).
+  drawable). There is no drawable timeout on Metal (see below). Since #101,
+  `SKIPPED` means only "nothing changed" and a surface that had nothing to
+  draw into reports `NOT_READY` (4); a paced frame reports `PACED` (3). See
+  ADR 0016's amendment of 2026-10-29.
 
 ### The grid follows the surface
 

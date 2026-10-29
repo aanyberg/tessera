@@ -53,6 +53,10 @@ final class TerminalSurfaceViewTests: XCTestCase {
         window.contentView = view
         _ = window.makeFirstResponder(view)
         setKey(Self.startKey)
+        // A window the tests treat as visible draws its frames; the hosted
+        // app's real layer vends no drawables (`.notReady`), and the link
+        // would never idle.
+        view.frameStatusOverride = .presented
         // Never the user's clipboard.
         view.pasteboard = NSPasteboard(name: NSPasteboard.Name("com.aanyberg.tessera.tests.\(UUID().uuidString)"))
         // The recorder prints R once raw mode is set.
@@ -751,6 +755,69 @@ final class TerminalSurfaceViewTests: XCTestCase {
         view.viewDidEndLiveResize()
     }
 
+    /// The link follows what a frame reports (ADR 0016): it idles after a
+    /// frame that drew or found nothing changed, and keeps running after one
+    /// that left content pending, `.paced` or `.notReady`, until a later
+    /// refresh draws it.
+    func testTheLinkFollowsEachFrameStatus() throws {
+        try requireSurface()
+        view.occlusionOverride = false
+        view.displayLinkDidFire()
+        let cases: [(TesseraSurface.FrameStatus, paused: Bool)] = [
+            (.presented, true), (.skipped, true), (.paced, false), (.notReady, false),
+        ]
+        for (status, paused) in cases {
+            view.frameStatusOverride = status
+            view.sessionDidOutput()
+            XCTAssertFalse(view.isDisplayLinkPaused, "\(status): output wakes the link")
+            let before = view.renderCount
+            view.displayLinkDidFire()
+            XCTAssertEqual(view.renderCount, before + 1, "\(status)")
+            XCTAssertEqual(view.isDisplayLinkPaused, paused, "\(status)")
+            // The next refresh renders again only when something is pending,
+            // and then draws it.
+            view.frameStatusOverride = .presented
+            view.displayLinkDidFire()
+            XCTAssertEqual(view.renderCount, before + (paused ? 1 : 2), "\(status): retried")
+            XCTAssertTrue(view.isDisplayLinkPaused, "\(status): drawn, the link idles")
+        }
+        // Paced every time: retried on every refresh, not given up.
+        view.frameStatusOverride = .paced
+        view.sessionDidOutput()
+        let before = view.renderCount
+        for _ in 0..<10 {
+            view.displayLinkDidFire()
+        }
+        XCTAssertEqual(view.renderCount, before + 10)
+        XCTAssertFalse(view.isDisplayLinkPaused)
+    }
+
+    /// A surface without a size (either side zero) cannot become ready by
+    /// itself: a `.notReady` frame there idles the link until the resize
+    /// that gives it a size, which asks for a frame.
+    func testANotReadyFrameOnAZeroSizedSurfaceWaitsForTheResize() throws {
+        try requireSurface()
+        view.occlusionOverride = false
+        view.displayLinkDidFire()
+        let empty = [NSSize.zero, NSSize(width: 0, height: 300), NSSize(width: 480, height: 0)]
+        for size in empty {
+            view.setFrameSize(size)
+            let pixels = try XCTUnwrap(view.surface.size)
+            XCTAssertTrue(pixels.widthPx == 0 || pixels.heightPx == 0, "\(size)")
+            view.frameStatusOverride = .notReady
+            view.sessionDidOutput()
+            view.displayLinkDidFire()
+            XCTAssertTrue(view.isDisplayLinkPaused, "\(size): nothing to draw into until a resize")
+            view.frameStatusOverride = .presented
+            view.setFrameSize(NSSize(width: 480, height: 300))
+            XCTAssertFalse(view.isDisplayLinkPaused, "\(size): the resize wakes the link")
+            let before = view.renderCount
+            view.displayLinkDidFire()
+            XCTAssertEqual(view.renderCount, before + 1, "\(size): and the pending frame is drawn")
+            XCTAssertTrue(view.isDisplayLinkPaused, "\(size)")
+        }
+    }
+
     func testTheLinkIdlesWithoutASurface() throws {
         try requireSurface()
         view.occlusionOverride = false
@@ -1084,6 +1151,7 @@ final class TerminalSurfaceViewTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(200))
         // Idle: drawn, nothing left to draw, the link paused.
         printed.occlusionOverride = false
+        printed.frameStatusOverride = .presented
         printed.displayLinkDidFire()
         XCTAssertTrue(printed.isDisplayLinkPaused, "idle before ⌘K")
         let renders = printed.renderCount

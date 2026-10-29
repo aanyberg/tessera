@@ -853,7 +853,7 @@ impl App {
     /// Call it whenever the view's size or backing scale changes (a window
     /// resize, a move to a display with another scale), and after a frame
     /// reported [`FrameStatus::Suboptimal`]. A zero `size` suspends drawing
-    /// ([`App::render_view`] reports [`FrameStatus::Skipped`]) and leaves
+    /// ([`App::render_view`] reports [`FrameStatus::NotReady`]) and leaves
     /// the session's size alone. Must be called on the main thread.
     ///
     /// # Errors
@@ -895,17 +895,24 @@ impl App {
     /// hollow while the session is not focused ([`App::is_focused`]).
     /// Must be called on the main thread.
     ///
-    /// [`FrameStatus::Skipped`] means nothing was drawn by this call, for
-    /// one of three reasons: nothing changed since the last presented
-    /// frame (an idle terminal does no GPU work), the call came sooner than
-    /// the [`view::MIN_FRAME_INTERVAL`] schedule allows (paced, at most 240
-    /// frames per second: the newest content is drawn by a later call), or
-    /// the surface had nothing to draw into (zero-sized, occluded, no
-    /// drawable). A host that renders from a display link of up to 240 Hz
-    /// is never paced and need not retry: its next tick draws whatever is
-    /// pending. A host that renders faster, or from output notifications,
-    /// must schedule another render after a skip, since it cannot yet tell
-    /// a paced skip from the others (ADR 0016).
+    /// Three statuses mean nothing was drawn by this call, and say whether
+    /// to call again (ADR 0016):
+    ///
+    /// - [`FrameStatus::Skipped`]: nothing changed since the last presented
+    ///   frame, and an idle terminal does no GPU work. Nothing is pending;
+    ///   the host need not render again until output, input, a resize, a
+    ///   focus or font-size change, or a re-theme ([`App::apply_config`],
+    ///   the appearance callback), and may idle its display link (see
+    ///   [`FrameStatus::Skipped`] for the one known gap).
+    /// - [`FrameStatus::Paced`]: the call came sooner than the
+    ///   [`view::MIN_FRAME_INTERVAL`] schedule allows (at most 240 frames
+    ///   per second). The newest content was captured but not drawn: render
+    ///   again on the next refresh. A display link of up to 240 Hz is never
+    ///   paced; a host rendering faster or from output notifications is.
+    /// - [`FrameStatus::NotReady`]: the surface had nothing to draw into
+    ///   (zero-sized, occluded, no drawable in time). What changed stays
+    ///   pending: render again once the surface is ready (the next refresh,
+    ///   a resize to a non-zero size, the window becoming visible).
     ///
     /// # Errors
     ///

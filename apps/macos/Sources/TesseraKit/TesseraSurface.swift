@@ -35,22 +35,39 @@ public final class TesseraSurface {
         }
     }
 
-    /// What ``render()`` did with a frame: `TesseraFrameStatus`.
+    /// What ``render()`` did with a frame: `TesseraFrameStatus`. The three
+    /// statuses that draw nothing say whether to render again (ADR 0016).
     public enum FrameStatus: Sendable, Equatable {
         /// Drawn and queued for presentation.
         case presented
         /// Drawn and presented, but the layer's drawables no longer match its
         /// size: resize with the current size before the next frame.
         case suboptimal
-        /// Nothing drawn: a zero-sized surface, an occluded window, or no
-        /// drawable. Try again on the next display refresh.
+        /// Nothing drawn because nothing changed since the last presented
+        /// frame. Nothing is pending: do not retry; the display link may idle
+        /// until new output, input, a resize, a focus or font-size change, or
+        /// a re-theme (`TESSERA_FRAME_STATUS_SKIPPED` names one known gap).
         case skipped
+        /// Nothing drawn because the frame came too soon (over 240 frames per
+        /// second). The newest content is not drawn yet: render again on the
+        /// next display refresh.
+        case paced
+        /// Nothing drawn because the surface had nothing to draw into (zero
+        /// size, an occluded window, no drawable). What changed is still
+        /// pending: render again once the surface is ready.
+        case notReady
 
+        /// A value this wrapper does not know (from a newer core) is taken as
+        /// ``paced``: rendering again is always safe, and a frame that needed
+        /// it is not lost.
         init(_ status: TesseraFrameStatus) {
             switch status {
             case TESSERA_FRAME_STATUS_PRESENTED: self = .presented
             case TESSERA_FRAME_STATUS_SUBOPTIMAL: self = .suboptimal
-            default: self = .skipped
+            case TESSERA_FRAME_STATUS_SKIPPED: self = .skipped
+            case TESSERA_FRAME_STATUS_PACED: self = .paced
+            case TESSERA_FRAME_STATUS_NOT_READY: self = .notReady
+            default: self = .paced
             }
         }
     }

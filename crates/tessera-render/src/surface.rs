@@ -37,6 +37,11 @@ impl Default for SurfaceOptions {
 }
 
 /// What happened when a frame was requested.
+///
+/// The three statuses that draw nothing tell a host whether to render
+/// again: [`Self::Skipped`] never needs a retry, [`Self::Paced`] needs one
+/// on the next refresh, and [`Self::NotReady`] needs one once the surface
+/// can be drawn into again (ADR 0016).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 pub enum FrameStatus {
@@ -47,17 +52,37 @@ pub enum FrameStatus {
     /// [`RenderSurface::resize`] with the view's current size and scale
     /// before the next frame.
     Suboptimal,
-    /// Nothing was drawn by this call. [`RenderSurface::render`] returns it
-    /// when the surface had nothing to draw into (zero-sized, occluded, or
-    /// no drawable). `tessera-app-core`'s views also return it when nothing
-    /// changed since the last presented frame, and when the frame came
-    /// sooner than their 240-frames-per-second limit allows (paced); the
-    /// three are not told apart yet. A host that renders from a display
-    /// link of up to 240 Hz is never paced and need not retry: its next
-    /// tick draws whatever is pending. A host that renders faster, or from
-    /// output notifications, must schedule another render after a skip,
-    /// since it cannot tell a paced skip from the others.
+    /// Nothing was drawn because nothing changed since the last presented
+    /// frame. [`RenderSurface`] never returns it; `tessera-app-core`'s
+    /// views do, without touching the GPU. Nothing is pending: a host need
+    /// not render again until something gives it a frame to draw (new
+    /// output, input, a resize, a focus or font-size change, or a re-theme
+    /// from a configuration or appearance change), and may idle its display
+    /// link. One known gap: a row showing a missing glyph can become
+    /// drawable when the fallback font index finishes loading in the
+    /// background, with no such event; it is drawn by the next frame the
+    /// host renders for another reason.
     Skipped,
+    /// Nothing was drawn because the frame came sooner than the view's
+    /// 240-frames-per-second schedule allows. [`RenderSurface`] never
+    /// returns it; `tessera-app-core`'s views do. The newest content is
+    /// captured but not yet drawn: the host must render again on its next
+    /// refresh. A display link of up to 240 Hz is never paced.
+    Paced,
+    /// Nothing was drawn because the surface had nothing to draw into: it
+    /// is zero-sized, occluded, or no drawable became available in time.
+    /// What changed stays pending: the host must render again once the
+    /// surface can be drawn into (its next refresh, or after a resize to a
+    /// non-zero size or the window becoming visible).
+    NotReady,
+}
+
+impl FrameStatus {
+    /// Whether this frame drew and presented something.
+    #[must_use]
+    pub const fn is_drawn(self) -> bool {
+        matches!(self, Self::Presented | Self::Suboptimal)
+    }
 }
 
 /// A window-backed swapchain plus the configuration that drives it.
@@ -344,7 +369,7 @@ impl RenderSurface {
         draw: impl FnOnce(&Gpu, &wgpu::TextureView) -> Result<(), RenderError>,
     ) -> Result<FrameStatus, RenderError> {
         let Some((frame, suboptimal)) = self.acquire(gpu)? else {
-            return Ok(FrameStatus::Skipped);
+            return Ok(FrameStatus::NotReady);
         };
         let view = frame
             .texture
@@ -359,7 +384,7 @@ impl RenderSurface {
     }
 
     /// The next swapchain image and whether it is suboptimal, or `None`
-    /// when the frame should be skipped.
+    /// when there is none to draw into ([`FrameStatus::NotReady`]).
     fn acquire(&mut self, gpu: &Gpu) -> Result<Option<(wgpu::SurfaceTexture, bool)>, RenderError> {
         if let Some(transparent) = self.pending_transparent.take()
             && let Err(error) = self.set_transparent(gpu, transparent)
