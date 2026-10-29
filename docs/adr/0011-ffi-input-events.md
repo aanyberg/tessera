@@ -147,3 +147,33 @@ left to a later issue.
   one-byte keys costs far more than its payload (17 million queued keys
   grew the heap by about 667 MiB in testing). The PTY layer's own 1 MiB
   write queue comes on top of the outbox.
+- Closing drops pending input, in the PTY layer as well as in the outbox
+  (#75): `Pty::hangup`, `Pty::kill` and dropping the PTY close its write
+  queue before they signal the child. Queued chunks are discarded, writes
+  fail with `BrokenPipe` from then on, and the writer thread abandons the
+  chunk it is writing after the `write(2)` in progress, which carries at
+  most 1 KiB; that one slice may still reach the child. Before this,
+  dropping ten PTYs whose cooked-mode children each had 1 MiB of input
+  pending took 2 to 5 s, and the children were not reaped within 1.5 s. A
+  cooked terminal processes input byte by byte under the kernel's terminal
+  lock, so ten concurrent 1 MiB `write(2)` calls stay in the kernel for
+  seconds and `kill(2)` on the children stalls behind them. With the
+  writer slicing its writes, the drops return in under 0.1 ms, and all ten
+  children are reaped and both threads of each PTY have finished within
+  11 ms (the test allows 100 ms and 1 s).
+- One limit remains. The writer's descriptor stays blocking, so for a child
+  that ignores `SIGHUP` and never reads, the writer stays asleep in
+  `write(2)` until the child dies; a session closed through
+  `tessera-app-core` sends it `SIGKILL` once `HANGUP_GRACE` runs out. If
+  such a child starts reading first, it receives the rest of that one
+  slice, at most 1 KiB. Waking the writer was ruled out:
+  - `O_NONBLOCK` belongs to the open file description that the reader's
+    and writer's duplicates of the master share, and a master cannot be
+    reopened, so the flag cannot be set for the writer alone. Set for
+    both, it made reading output cost 35-40% more CPU. Toggling it around
+    each write cost 9-13% more instructions whenever input and output flow
+    together, and was judged too subtle.
+  - Closing the writer's duplicate of the master (the mechanism #75 first
+    proposed) is impossible on macOS under any design: `close(2)` of a
+    descriptor another thread is blocked writing to hangs the closing
+    thread instead of waking the writer.

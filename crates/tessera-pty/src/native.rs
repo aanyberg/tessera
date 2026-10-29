@@ -7,9 +7,10 @@ use std::io::{self, Read, Write};
 use std::os::fd::BorrowedFd;
 use std::os::unix::process::ExitStatusExt;
 use std::process::Child;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::thread;
+use std::thread::{self, JoinHandle};
 
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
@@ -26,6 +27,16 @@ const READ_QUEUE_CHUNKS: usize = 64;
 /// Bytes the write queue may hold before [`Pty::write`] blocks and
 /// [`Pty::try_write`] reports `WouldBlock`.
 pub const WRITE_QUEUE_BYTES: usize = 1024 * 1024;
+/// Most bytes the writer thread hands to one `write(2)`. A cooked terminal
+/// processes its input byte by byte under the kernel's terminal lock, and
+/// with several sessions doing so at once a single 1 MiB write can stay in
+/// the kernel for seconds, ignoring a close and stalling the child's exit.
+/// Writing in slices returns to the closed check after every slice. With
+/// 100 such sessions closing at once on a loaded machine, 4 KiB slices
+/// still let dropping ten of them take over 100 ms (8-16 runs in 30); 1 KiB
+/// slices did so once in 60 runs and write bulk input as fast as unsliced
+/// writes (512 B costs 16% more).
+const WRITE_SLICE: usize = 1024;
 
 /// A child process attached to a kernel pseudo-terminal.
 ///
@@ -37,9 +48,42 @@ pub const WRITE_QUEUE_BYTES: usize = 1024 * 1024;
 ///
 /// Dropping a `NativePty` whose child is still running sends it `SIGHUP`,
 /// matching what closing a terminal window does. Nothing is ever written to
-/// the child's input on close: the writer is a plain duplicate of the master
+/// the child's input on close: pending input is dropped (see
+/// [`Pty::hangup`]), and the writer is a plain duplicate of the master
 /// descriptor, so dropping it only closes a file. The reader thread outlives
 /// the handle until the child exits, so the process is always reaped.
+///
+/// # Closing and pending input
+///
+/// [`Pty::hangup`], [`Pty::kill`] and dropping the handle close the write
+/// queue before they signal the child: queued input is dropped, later
+/// writes fail with [`io::ErrorKind::BrokenPipe`], and the writer thread
+/// abandons the chunk it is writing after the `write(2)` in progress, which
+/// carries at most 1 KiB. That one slice may still reach the child after
+/// the close. The writer's descriptor stays blocking, so that `write(2)`
+/// can sleep.
+///
+/// Known limit: for a child that ignores `SIGHUP` and never reads its
+/// input, the writer stays asleep in that `write(2)` until the child dies
+/// (a session closing through `tessera-app-core` kills it after its grace
+/// period); if such a child starts reading again first, it receives the
+/// rest of that one slice, at most 1 KiB. Three facts rule out waking the
+/// writer instead:
+///
+/// - `O_NONBLOCK` belongs to the open file description, which every
+///   duplicate of the master (the reader's, the writer's) shares, and a
+///   master cannot be reopened, so it cannot be set for the writer alone.
+///   Set for both, it made reading output, the hot path, cost 35-40% more
+///   CPU, because each idle read becomes `read`, `EAGAIN`, `poll`, `read`.
+/// - On macOS, `close(2)` of a descriptor another thread is blocked writing
+///   to does not wake the writer; it hangs the closing thread, which only
+///   `SIGKILL` frees.
+/// - The writer is not usually asleep anyway: the multi-second closes this
+///   design fixes came from writers *running* in the kernel. A cooked
+///   terminal processes input byte by byte under the kernel's terminal
+///   lock, so one 1 MiB `write(2)` per session, with ten sessions at once,
+///   stays in the kernel for seconds, and `kill(2)` on the children stalls
+///   behind it. Slicing bounds that to one slice.
 ///
 /// # Exit detection
 ///
@@ -55,6 +99,39 @@ pub struct NativePty {
     pid: u32,
     size: PtySize,
     phase: Arc<Mutex<Phase>>,
+    threads: IoThreads,
+}
+
+/// Liveness of one [`NativePty`]'s reader and writer threads.
+///
+/// Obtained from [`NativePty::io_threads`] and usable after the PTY itself
+/// is dropped, so a caller (or a test) can confirm that closing a session
+/// really let both threads finish. Holding it keeps nothing alive: the
+/// threads are detached, and this only remembers their join handles.
+#[derive(Clone)]
+pub struct IoThreads {
+    handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
+}
+
+impl IoThreads {
+    /// How many of the PTY's threads (at most two) have not finished yet.
+    #[must_use]
+    pub fn running(&self) -> usize {
+        self.handles
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|handle| !handle.is_finished())
+            .count()
+    }
+}
+
+impl fmt::Debug for IoThreads {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IoThreads")
+            .field("running", &self.running())
+            .finish()
+    }
 }
 
 /// Where the child is in its life, guarded by one mutex so that signalling
@@ -117,13 +194,16 @@ impl NativePty {
 
         let reader_phase = Arc::clone(&phase);
         let reader_queue = Arc::clone(&queue);
-        thread::Builder::new()
+        let reader_thread = thread::Builder::new()
             .name(format!("pty-reader-{pid}"))
             .spawn(move || pump_output(reader, *child, &event_tx, &reader_phase, &reader_queue))?;
         let writer_queue = Arc::clone(&queue);
-        thread::Builder::new()
+        let writer_thread = thread::Builder::new()
             .name(format!("pty-writer-{pid}"))
             .spawn(move || pump_input(writer, &writer_queue))?;
+        let threads = IoThreads {
+            handles: Arc::new(Mutex::new(vec![reader_thread, writer_thread])),
+        };
 
         Ok((
             Self {
@@ -132,9 +212,16 @@ impl NativePty {
                 pid,
                 size: options.size,
                 phase,
+                threads,
             },
             event_rx,
         ))
+    }
+
+    /// A handle on this PTY's reader and writer threads that outlives it.
+    #[must_use]
+    pub fn io_threads(&self) -> IoThreads {
+        self.threads.clone()
     }
 
     fn phase(&self) -> MutexGuard<'_, Phase> {
@@ -206,26 +293,49 @@ impl Pty for NativePty {
         }
     }
 
+    /// Closes the write queue, then sends `SIGHUP`.
+    ///
+    /// Closing drops every queued chunk and stops the writer thread before
+    /// the child is signalled: a chunk being written is abandoned after the
+    /// `write(2)` in progress. At most one 1 KiB slice may still reach the
+    /// child after this returns: a `write(2)` already running when the
+    /// queue closes, or about to start (its closed check passed just before
+    /// the close), completes, at once if the child is reading or whenever
+    /// it next reads (see "Closing and pending input" on [`NativePty`]).
+    /// The writer checks again before the next slice, so there is never
+    /// more than one.
+    ///
+    /// A writer blocked in `write(2)` is not woken by closing its duplicate
+    /// of the master: on macOS that `close(2)` hangs the closing thread
+    /// instead of failing the write, so no design can rely on it.
     fn hangup(&mut self) -> io::Result<()> {
+        self.queue.close();
         self.signal_if_running(Signal::SIGHUP)
     }
 
+    /// Closes the write queue as [`Pty::hangup`] does, then sends
+    /// `SIGKILL`.
     fn kill(&mut self) -> io::Result<()> {
+        self.queue.close();
         self.signal_if_running(Signal::SIGKILL)
     }
 }
 
 impl Drop for NativePty {
     fn drop(&mut self) {
-        // Hang up a child that is still running, then close the queue so
-        // the writer thread exits. The writer's descriptor is a bare
-        // duplicate of the master, so closing it injects nothing into the
-        // child's input. The reader thread keeps its own handle on the
+        // Same order as `hangup`: drop pending input and stop the writer,
+        // then signal a child that is still running. With 1 KiB slices the
+        // reverse order is not observable from outside (the writer would
+        // stop microseconds later either way), but closing first means no
+        // slice is started after the child was told to go, and it keeps
+        // the three closing paths identical. The writer's descriptor is a
+        // bare duplicate of the master, so closing it injects nothing into
+        // the child's input. The reader thread keeps its own handle on the
         // master and reaps the child once it goes away.
+        self.queue.close();
         if let Err(err) = self.signal_if_running(Signal::SIGHUP) {
             tracing::debug!(pid = self.pid, %err, "hangup on drop failed");
         }
-        self.queue.close();
     }
 }
 
@@ -317,10 +427,15 @@ fn pump_output(
     }
 }
 
-/// Writer thread body: drains queued chunks into the master.
-fn pump_input(mut writer: File, queue: &WriteQueue) {
+/// Writer thread body: drains queued chunks into the master until the
+/// queue closes.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the thread owns its descriptor and closes it when it exits"
+)]
+fn pump_input(writer: File, queue: &WriteQueue) {
     while let Some(chunk) = queue.pop() {
-        if let Err(err) = writer.write_all(&chunk).and_then(|()| writer.flush()) {
+        if let Err(err) = write_chunk(&writer, &chunk, queue) {
             tracing::debug!(%err, "pty write failed; closing writer");
             queue.close();
             break;
@@ -328,11 +443,29 @@ fn pump_input(mut writer: File, queue: &WriteQueue) {
     }
 }
 
+/// Writes `chunk` to the master in [`WRITE_SLICE`] pieces, abandoning the
+/// rest as soon as the queue closes. The closed flag is an atomic load per
+/// `write(2)`, so the hot path takes no lock beyond the queue's own.
+fn write_chunk(mut writer: &File, mut chunk: &[u8], queue: &WriteQueue) -> io::Result<()> {
+    while !chunk.is_empty() && !queue.is_closed() {
+        match writer.write(&chunk[..chunk.len().min(WRITE_SLICE)]) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => chunk = &chunk[n..],
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
 /// Bounded FIFO of pending input, measured in bytes rather than chunks so a
 /// large paste cannot inflate the bound.
 #[derive(Default)]
 struct WriteQueue {
     state: Mutex<QueueState>,
+    /// Set once, under the state lock (so condvar waiters cannot miss it),
+    /// and read without it by the writer between partial writes.
+    closed: AtomicBool,
     /// Signalled when bytes leave the queue or it closes.
     space: Condvar,
     /// Signalled when bytes enter the queue or it closes.
@@ -343,7 +476,6 @@ struct WriteQueue {
 struct QueueState {
     chunks: VecDeque<Vec<u8>>,
     bytes: usize,
-    closed: bool,
 }
 
 impl QueueState {
@@ -362,18 +494,22 @@ impl WriteQueue {
         self.lock().bytes
     }
 
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
     /// Queues all of `bytes`, waiting for room as the writer drains. Input
     /// larger than the whole budget is fed through in budget-sized pieces.
     fn push_blocking(&self, mut bytes: &[u8]) -> io::Result<()> {
         let mut state = self.lock();
         while !bytes.is_empty() {
-            while !state.closed && state.bytes >= WRITE_QUEUE_BYTES {
+            while !self.is_closed() && state.bytes >= WRITE_QUEUE_BYTES {
                 state = self
                     .space
                     .wait(state)
                     .unwrap_or_else(PoisonError::into_inner);
             }
-            if state.closed {
+            if self.is_closed() {
                 return Err(closed_error());
             }
             let take = bytes.len().min(WRITE_QUEUE_BYTES - state.bytes);
@@ -387,7 +523,7 @@ impl WriteQueue {
     /// Queues `bytes` only if they fit in the remaining budget.
     fn try_push(&self, bytes: &[u8]) -> io::Result<()> {
         let mut state = self.lock();
-        if state.closed {
+        if self.is_closed() {
             return Err(closed_error());
         }
         if state.bytes + bytes.len() > WRITE_QUEUE_BYTES {
@@ -401,16 +537,24 @@ impl WriteQueue {
         Ok(())
     }
 
-    /// Waits for the next chunk; `None` once the queue is closed and empty.
+    fn take(&self, state: &mut QueueState) -> Option<Vec<u8>> {
+        if self.is_closed() {
+            return None;
+        }
+        let chunk = state.chunks.pop_front()?;
+        state.bytes -= chunk.len();
+        self.space.notify_all();
+        Some(chunk)
+    }
+
+    /// Waits for the next chunk; `None` once the queue is closed.
     fn pop(&self) -> Option<Vec<u8>> {
         let mut state = self.lock();
         loop {
-            if let Some(chunk) = state.chunks.pop_front() {
-                state.bytes -= chunk.len();
-                self.space.notify_all();
+            if let Some(chunk) = self.take(&mut state) {
                 return Some(chunk);
             }
-            if state.closed {
+            if self.is_closed() {
                 return None;
             }
             state = self
@@ -420,8 +564,14 @@ impl WriteQueue {
         }
     }
 
+    /// Closes the queue for good: drops every pending chunk, refuses new
+    /// input, wakes blocked producers and stops the writer.
     fn close(&self) {
-        self.lock().closed = true;
+        let mut state = self.lock();
+        self.closed.store(true, Ordering::Release);
+        state.chunks.clear();
+        state.bytes = 0;
+        drop(state);
         self.space.notify_all();
         self.data.notify_all();
     }
@@ -460,6 +610,10 @@ fn describe_program(program: &Program) -> String {
     }
 }
 
+fn io_error(err: impl fmt::Display) -> PtyError {
+    PtyError::Io(io::Error::other(err.to_string()))
+}
+
 fn convert_status(status: std::process::ExitStatus) -> ExitStatus {
     match (status.signal(), status.code()) {
         (Some(signal), _) => ExitStatus::Signaled(signal),
@@ -468,10 +622,6 @@ fn convert_status(status: std::process::ExitStatus) -> ExitStatus {
         // `wait` without `WUNTRACED`; treat anything else as failure.
         (None, None) => ExitStatus::Exited(-1),
     }
-}
-
-fn io_error(err: impl fmt::Display) -> PtyError {
-    PtyError::Io(io::Error::other(err.to_string()))
 }
 
 impl From<PtySize> for portable_pty::PtySize {
@@ -514,6 +664,26 @@ mod tests {
         assert_eq!(queue.pop().unwrap().len(), WRITE_QUEUE_BYTES / 2);
         queue.try_push(b"1").unwrap();
         assert_eq!(queue.queued_bytes(), WRITE_QUEUE_BYTES / 2 + 1);
+    }
+
+    #[test]
+    fn close_drops_pending_chunks_and_wakes_a_blocked_producer() {
+        let queue = Arc::new(WriteQueue::default());
+        queue.try_push(&vec![b'a'; WRITE_QUEUE_BYTES]).unwrap();
+        let producer = {
+            let queue = Arc::clone(&queue);
+            thread::spawn(move || queue.push_blocking(b"b"))
+        };
+        // Give the producer time to block on the full queue.
+        thread::sleep(std::time::Duration::from_millis(50));
+        queue.close();
+        assert_eq!(
+            producer.join().unwrap().unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(queue.queued_bytes(), 0, "closing kept the pending input");
+        assert!(queue.lock().chunks.is_empty());
+        assert!(queue.pop().is_none(), "writer got input after close");
     }
 
     #[test]
