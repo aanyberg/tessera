@@ -10,6 +10,11 @@ name: Fuzz
 # (`rustup toolchain install nightly-YYYY-MM-DD --profile minimal`), check
 # `cargo +nightly-YYYY-MM-DD fuzz build` locally, change FUZZ_TOOLCHAIN and
 # run the workflow once by hand (workflow_dispatch, seconds 60).
+#
+# Two traps, both fixed below: rust-toolchain.toml (stable) beats the
+# default toolchain, so RUSTUP_TOOLCHAIN selects the nightly for every step;
+# and the prebuilt cargo-fuzz is a musl binary that defaults --target to its
+# own triple, so every cargo fuzz call passes --target "$FUZZ_TRIPLE".
 
 on:
   schedule:
@@ -28,6 +33,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   FUZZ_TOOLCHAIN: nightly-2026-10-29
+  FUZZ_TRIPLE: x86_64-unknown-linux-gnu
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -59,6 +65,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.FUZZ_TOOLCHAIN }}
+      # From here on, so rust-cache keys and cargo fuzz build with the nightly
+      # instead of the stable that rust-toolchain.toml selects. Set after the
+      # install so rustup never resolves a toolchain that is not there yet.
+      - name: Select the fuzz toolchain
+        run: echo "RUSTUP_TOOLCHAIN=$FUZZ_TOOLCHAIN" >> "$GITHUB_ENV"
       # The workspace's lock, so the fuzzers test the workspace's dependency
       # versions (fuzz/Cargo.lock is not committed).
       - name: Use the workspace lock file
@@ -69,6 +80,16 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
+      - name: Show the toolchain
+        run: |
+          active="$(rustup show active-toolchain)"
+          echo "$active"
+          rustc -V
+          cargo fuzz --version
+          case "$active" in
+            "$FUZZ_TOOLCHAIN"-*) ;;
+            *) echo "::error::active toolchain is not $FUZZ_TOOLCHAIN: $active"; exit 1 ;;
+          esac
       - name: Restore the corpus
         uses: actions/cache/restore@v4
         with:
@@ -76,7 +97,7 @@ jobs:
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: fuzz-corpus-${{ matrix.target }}-
       - name: Build
-        run: cargo fuzz build "$TARGET"
+        run: cargo fuzz build --target "$FUZZ_TRIPLE" "$TARGET"
       - name: Replay the regressions
         # Files only, so a subdirectory can never turn the replay into a
         # fuzzing run (libFuzzer fuzzes when given a directory).
@@ -89,14 +110,14 @@ jobs:
             echo "no regression inputs for $TARGET"
             exit 0
           fi
-          cargo fuzz run "$TARGET" "${inputs[@]}" -- -timeout=60
+          cargo fuzz run --target "$FUZZ_TRIPLE" "$TARGET" "${inputs[@]}" -- -timeout=60
       - name: Fuzz
         run: |
           mkdir -p "fuzz/corpus/$TARGET"
-          cargo fuzz run "$TARGET" "fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET" -- \
+          cargo fuzz run --target "$FUZZ_TRIPLE" "$TARGET" "fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET" -- \
             -max_total_time="$((10#$FUZZ_SECONDS))" -timeout=60 -print_final_stats=1
       - name: Minimise the corpus
-        run: cargo fuzz cmin "$TARGET" "fuzz/corpus/$TARGET"
+        run: cargo fuzz cmin --target "$FUZZ_TRIPLE" "$TARGET" "fuzz/corpus/$TARGET"
       - name: Save the corpus
         if: ${{ !cancelled() }}
         uses: actions/cache/save@v4
