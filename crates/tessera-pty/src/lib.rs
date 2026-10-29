@@ -44,7 +44,7 @@ compile_error!("tessera-pty supports Unix platforms only");
 
 mod native;
 
-pub use native::{NativePty, WRITE_QUEUE_BYTES};
+pub use native::{IoThreads, NativePty, WRITE_QUEUE_BYTES};
 
 /// Value injected as `TERM` for every child.
 ///
@@ -345,8 +345,10 @@ impl SpawnOptions {
 /// necessarily `Sync`; wrap in a mutex to share.
 pub trait Pty: Send {
     /// Queues bytes for the child's stdin, blocking while the write queue
-    /// (bounded in bytes, see [`WRITE_QUEUE_BYTES`]) is full. Fails once the
-    /// child has exited or the writer has shut down.
+    /// (bounded in bytes, see [`WRITE_QUEUE_BYTES`]) is full. Fails with
+    /// [`io::ErrorKind::BrokenPipe`] once the child has exited, the PTY has
+    /// been hung up or killed, or the writer has shut down. Empty input is
+    /// always accepted and ignored, even then.
     fn write(&mut self, bytes: &[u8]) -> io::Result<()>;
 
     /// Like [`Pty::write`] but returns [`io::ErrorKind::WouldBlock`] instead
@@ -370,9 +372,18 @@ pub trait Pty: Send {
 
     /// Asks the child to hang up (`SIGHUP`), as closing a terminal window
     /// does. Shells save history and exit; the status arrives as an event.
+    ///
+    /// Hanging up ends the session's input first: input still queued is
+    /// dropped, never delivered, and the writer abandons what it was
+    /// writing before the signal is sent. Implementations may let a bounded
+    /// write already handed to the kernel complete (see [`NativePty`]).
+    /// From the moment this returns, [`Pty::write`] and [`Pty::try_write`]
+    /// fail with [`io::ErrorKind::BrokenPipe`] for any non-empty input;
+    /// empty input still returns `Ok` and queues nothing.
     fn hangup(&mut self) -> io::Result<()>;
 
-    /// Forcibly terminates the child (`SIGKILL`).
+    /// Forcibly terminates the child (`SIGKILL`), ending the session's input
+    /// first exactly as [`Pty::hangup`] does.
     fn kill(&mut self) -> io::Result<()>;
 }
 

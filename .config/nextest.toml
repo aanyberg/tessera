@@ -23,3 +23,8 @@ test-group = 'timing'
 [[profile.default.overrides]]
 filter = 'package(tessera-app-core) & kind(lib) & (test(close_drops_pending_input_promptly) | test(a_failed_writer_refuses_later_input) | test(a_panicking_writer_refuses_later_input))'
 test-group = 'timing'
+
+# Wall-clock bounds on closing PTYs with input pending (#75).
+[[profile.default.overrides]]
+filter = 'package(tessera-pty) & binary(close)'
+test-group = 'timing'
