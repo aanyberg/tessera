@@ -147,9 +147,10 @@ struct Handle(*mut App);
 
 impl Handle {
     fn new() -> Self {
+        common::isolate_home();
+        common::hermetic_config_dir();
         let mut app = ptr::null_mut();
         // SAFETY: `app` is writable storage for one pointer.
-        common::hermetic_config_dir();
         assert_eq!(unsafe { tessera_app_new(&raw mut app) }, Error::Ok);
         Self(app)
     }

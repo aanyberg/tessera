@@ -1,6 +1,6 @@
 [package]
 name = "tessera-shell-integration"
-description = "OSC 133/7/1337 shell-integration protocol handling"
+description = "Shell integration: zsh/bash/fish scripts, their injection on spawn, and OSC 133/7/1337 decoding"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,14 @@ publish.workspace = true
 
 [dependencies]
 tessera-grid.workspace = true
+
+[dev-dependencies]
+# The live test runs the scripts in real shells through a PTY.
+tessera-pty.workspace = true
+# Replays the live shells' output to check where the cursor ends up.
+tessera-term.workspace = true
+proptest.workspace = true
+tempfile = "3"
 
 [lints]
 workspace = true

@@ -32,6 +32,7 @@
 mod config_watch;
 pub mod input;
 pub mod session;
+mod shell_integration;
 pub mod view;
 
 use std::collections::HashMap;
@@ -50,7 +51,7 @@ pub use session::{SessionEvent, SessionId, SessionObserver};
 // Re-exported so frontends (through `tessera-ffi`) depend on this crate
 // alone, as the layering in `docs/architecture.md` requires.
 pub use config_watch::{CONFIG_DIR_POLL_INTERVAL, CONFIG_WATCH_STOP_CAP};
-pub use tessera_config::{Config, ConfigPaths, ConfigStore, WatchOptions};
+pub use tessera_config::{Config, ConfigPaths, ConfigStore, ShellIntegration, WatchOptions};
 pub use tessera_pty::{ExitStatus, Program, PtyError, PtySize, SpawnOptions};
 
 use config_watch::{Applied, ConfigWatch};
@@ -262,6 +263,17 @@ impl App {
     /// with it, so the child's `TESSERA_SESSION_ID` always matches. Events
     /// of the new session may reach the observer before this returns.
     ///
+    /// With `[terminal] shell_integration = "auto"` (the default) a zsh or
+    /// fish is started so it loads Tessera's shell integration scripts,
+    /// which are written under [`ConfigPaths::shell_integration_dir`] first
+    /// (ADR 0021; bash is started unchanged until bash support lands): the
+    /// program's file name (or, for [`Program::LoginShell`], the child's
+    /// `$SHELL`) picks the shell, and the variables the injection adds count
+    /// toward the `execve` size limit below. Nothing
+    /// changes when the child's environment already has
+    /// `TESSERA_SHELL_INTEGRATION`, when the scripts cannot be written (a
+    /// warning is logged), or for any other program.
+    ///
     /// # Errors
     ///
     /// [`Error::Pty`] when no PTY is available or the program cannot be
@@ -281,6 +293,11 @@ impl App {
             session_id: id.to_string(),
             ..options
         };
+        let options = shell_integration::apply(
+            options,
+            self.config().terminal.shell_integration,
+            &self.paths.shell_integration_dir(),
+        );
         let (pty, events) = NativePty::spawn(&options)?;
         self.attach(id, Box::new(pty), events, options.size)
     }

@@ -167,3 +167,20 @@ fuzz target="terminal" minutes="5":
     mkdir -p "fuzz/corpus/$target"
     cargo +nightly fuzz run "$target" "fuzz/corpus/$target" "fuzz/seeds/$target" -- \
         -max_total_time="$(( 10#$minutes * 60 ))" -timeout=60 -print_final_stats=1
+
+# #44
+# Check the shell integration scripts: syntax (zsh, the system /bin/bash, fish when installed), shellcheck when installed, and a startup smoke run in zsh and /bin/bash
+shell-integration-check:
+    zsh -n shell-integration/zsh/.zshenv
+    zsh -n shell-integration/zsh/tessera-integration
+    /bin/bash -n shell-integration/bash/tessera.bash
+    if command -v fish >/dev/null; then fish -n shell-integration/fish/vendor_conf.d/tessera-shell-integration.fish; else echo "fish not installed: fish -n skipped"; fi
+    if command -v shellcheck >/dev/null; then shellcheck -s bash shell-integration/bash/tessera.bash; else echo "shellcheck not installed: skipped"; fi
+    home="$(mktemp -d)"; trap 'rm -rf "$home"' EXIT; touch "$home/.zshrc"; \
+        env -i HOME="$home" PATH=/usr/bin:/bin TESSERA_SHELL_INTEGRATION=enabled TESSERA_BASH_INJECT=rcfile BASH_SILENCE_DEPRECATION_WARNING=1 \
+            /bin/bash --rcfile shell-integration/bash/tessera.bash -i </dev/null 2>/dev/null | grep -q 'ShellIntegrationVersion=1;shell=bash' \
+            || { echo "/bin/bash ($(/bin/bash -c 'echo $BASH_VERSION')) did not load tessera.bash" >&2; exit 1 }; \
+        env -i HOME="$home" PATH=/usr/bin:/bin TESSERA_SHELL_INTEGRATION=enabled ZDOTDIR="$PWD/shell-integration/zsh" \
+            zsh -i </dev/null 2>/dev/null | grep -q 'ShellIntegrationVersion=1;shell=zsh' \
+            || { echo "zsh did not load tessera-integration" >&2; exit 1 }; \
+        echo "bash $(/bin/bash -c 'echo $BASH_VERSION') and zsh $(zsh -c 'echo $ZSH_VERSION') load the scripts"

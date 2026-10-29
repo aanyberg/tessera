@@ -1,0 +1,176 @@
+# Fixture for Tessera #44 (shell integration). Copy to the repo path:
+# crates/tessera-shell-integration/tests/fixtures/osc_sequences.txt
+# Written by spec-researcher, 2026-10-28. Complete except where a row says U (unverified). Fish was NOT installed: all fish rows are source/docs only.
+#
+# Format: one case per line, `|`-separated, `#` starts a comment line. ESC=\e BEL=\a ST=\e\\ .
+#   id | input / scenario | expected | source (file@ref:line-or-function, or URL) | confidence
+# confidence: V = verified by reading source; R = verified by running on this machine
+#   (macOS 26 /bin/bash 3.2.57, /bin/zsh 5.9); U = could not verify, recommendation only.
+# Sources are local copies under ./src/ (fetched 2026-10-28 from GitHub master/main):
+#   K-zsh   kitty shell-integration/zsh/kitty-integration
+#   K-zenv  kitty shell-integration/zsh/.zshenv
+#   K-bash  kitty shell-integration/bash/kitty.bash
+#   K-fish  kitty shell-integration/fish/vendor_conf.d/kitty-shell-integration.fish
+#   K-py    kitty kitty/shell_integration.py
+#   W-sh    wezterm assets/shell-integration/wezterm.sh
+#   G-bash  ghostty src/shell-integration/bash/ghostty.bash
+
+## 1. What each reference emits for `cd /tmp; true; false; exit` (one command per line)
+# Payload = bytes between `ESC ]` and the terminator. Terminator is BEL for kitty/ghostty, BEL for
+# wezterm bash precmd marks but ST (`ESC \`) for wezterm OSC 7.
+# kitty zsh (K-zsh _ksi_deferred_init/_ksi_precmd/_ksi_preexec). Order of first prompt:
+K1  | zsh start, first precmd     | 7;kitty-shell-cwd://$HOST$PWD ; 133;A (inside PS1, `%{..%}`) ; 7;kitty-shell-cwd://$HOST$PWD (a 2nd OSC 7: init calls _ksi_report_pwd, then _ksi_precmd calls it again) | K-zsh:240-246,367 | V
+K2  | zsh `cd /tmp`               | 7;kitty-shell-cwd://$HOST/tmp (chpwd) ; 133;C;cmdline=cd\ /tmp (preexec; note C precedes the chpwd OSC 7) ; ... then precmd: 133;D;0 ; 7 again ; A | K-zsh:210-228,241 | V
+K3  | zsh `true`                  | 133;C;cmdline=true ; 133;D;0 ; 133;A (A is in PS1) | K-zsh:154,227 | V
+K4  | zsh `false`                 | 133;C;cmdline=false ; 133;D;1 ; 133;A | K-zsh:154,227 | V
+K5  | zsh kitty never emits B     | no 133;B at all (zle-line-init hook commented out, kitty issue 4428) | K-zsh:230-236 | V
+K6  | bash 4+ kitty first prompt  | PS1 prefix `\[\e]133;D;$?\a\e]133;A\a\]` : D;<status> is emitted even at the very first prompt (D;0) ; then A. kitty states it tolerates this ("only taking into account the first D after a C") | K-bash:`_ksi_prompt[ps1]` | V
+K7  | bash kitty OSC 7            | 7;kitty-shell-cwd://$HOSTNAME$PWD  (only when PWD != last reported; PROMPT_COMMAND time, so `cd /tmp && cmd` is reported after the command) ; NO percent-encoding | K-bash:`_ksi_prompt_command` | V
+K8  | bash kitty C                | 133;C;cmdline=%q-quoted-last-history-entry, written from PS0 `$(... > /dev/tty)` | K-bash:`_ksi_get_current_command` | V
+K9  | bash kitty B                | never emitted | K-bash (no `133;B`) | V
+# WezTerm bash/zsh (W-sh __wezterm_semantic_precmd/preexec, __wezterm_osc7):
+W1  | wezterm bash/zsh first prompt | 133;A;cl=m;aid=$$ ; PS1 wrapped as 133;P;k=i ... PS1 ... 133;B ; no D at first prompt (guard: executing == "") | W-sh:464-493 | V
+W2  | wezterm after a command       | 133;C; (preexec, empty param) ; later precmd: 133;D;<status>;aid=$$ then 133;A;cl=m;aid=$$ | W-sh:482,491,504 | V
+W3  | wezterm empty line            | D;<last status>;aid is emitted again (executing stays 0, != "") but there was no C: D without C | W-sh:480-483 | V
+W4  | wezterm OSC 7                 | `ESC ] 7 ; file://$HOSTNAME$PWD ESC \` when `wezterm` is not on PATH (bash script does no percent-encoding); with wezterm on PATH it runs `wezterm set-working-directory` instead | W-sh:451-458 | V
+# Ghostty bash (G-bash): same as kitty for OSC 7 (kitty-shell-cwd://, control chars stripped), A/P/B/C/D with aid=$BASHPID,
+G1  | ghostty bash D/A/B/C         | first: A;redraw=last;cl=line;aid=PID ; PS1 wrapped 133;P;k=i ... 133;B ; preexec 133;C; ; precmd 133;D;<status>;aid=PID | G-bash:139-219 | V
+G2  | ghostty bash version gate    | uses PS0 hook for bash >= 4.4, else sources bash-preexec.sh (so bash 3.2 works in ghostty via bash-preexec) | G-bash:223-281 | V
+
+## 2. bash 3.2 (macOS /bin/bash 3.2.57) matrix
+# I-bash = iTerm2 Resources/shell_integration/iterm2_shell_integration.bash (master, ShellIntegrationVersion=24)
+# BP = rcaloras/bash-preexec bash-preexec.sh (master)
+B1  | kitty.bash on bash 3.2     | `[ "${BASH_VERSINFO:-0}" -lt 4 ]` -> unsets KITTY_SHELL_INTEGRATION, prints "Bash version X too old, kitty shell integration disabled" to stderr, returns. NOTE the check compares BASH_VERSINFO[0] only. Also needs `declare -A` (bash 4.0). The user's rc files ARE still sourced first (the rc-loading block runs before the version check) | K-bash:`BASH_VERSINFO` check | V
+B2  | iTerm2 on bash 3.2          | works: vendors bash-preexec (DEBUG trap + PROMPT_COMMAND) and adds __iterm2_prompt_command as the LAST PROMPT_COMMAND entry; the script itself contains a comment about 3.2 quoting (`macOS's bash 3.2`) | I-bash:20-60,87-660,1005 | V
+B3  | bash-preexec minimum        | "We only support Bash 3.1+" (BASH_VERSINFO check); has a comment working around a 3.2 bug with `*(...)` | BP:44-46,149 | V
+B4  | WezTerm on bash 3.2         | wezterm.sh embeds the same bash-preexec (`__wezterm_install_bash_prexec`), same 3.1+ gate; so WezTerm supports 3.2 | W-sh:39-92 | V
+B5  | Ghostty on bash 3.2         | PS0 path needs bash >= 4.4 (`BASH_VERSINFO[0]>4 || ==4 && [1]>=4`); older bash sources bundled bash-preexec.sh and registers __ghostty_preexec as a preexec function | G-bash:223-281 | V
+B6  | decision                    | bash-preexec (vendored, MIT, header kept) is what iTerm2, WezTerm and Ghostty ship for 3.2, so D5 holds; a hand-written DEBUG trap + PROMPT_COMMAND ALSO works on 3.2.57 (own prototype, section 7 ordering was produced with it) and is ~15 lines. Either is OK; hand-written avoids the vendored-file/licence plumbing but loses bash-preexec's handling of existing DEBUG traps and `__bp_interactive_mode` corner cases | B2,B4,B5; proto/bash_env.sh | V (source) / R (hand-written prototype only)
+# NOTE runtime check: the sandbox classifier refused to execute downloaded third-party scripts (kitty.bash, bash-preexec) so B1-B6 are source-verified only. The implementer's live test on /bin/bash is the first runtime proof.
+B7  | bash 3.2 constructs to avoid in tessera.bash | no PS0 (added in bash 4.4), no `declare -A`, no `${var,,}`, no `printf %(...)T`, no `declare -g`, no `${var@P}`, no PROMPT_COMMAND array (arrays only from 5.1), no `local -n`, no `BASHPID` (4.0), no `read -t 0.1` fractional (4.0), `[[ =~ ]]` with quoted regex differs from 3.1 (use a variable) | bash(1) CHANGES; kitty comments K-bash `builtin declare -A`; I-bash:1005 | V (documented) / U (not run)
+B8  | `bash --posix -i` + ENV on macOS /bin/bash 3.2.57 | **DOES NOT WORK.** `ENV=probe.sh /bin/bash --posix -i` and `... --posix` never source $ENV (default prompt `bash-3.2$` stays); `/bin/sh -i` (same binary invoked as sh) does source it. So kitty's injection (K-py setup_bash_env: ENV + `--posix`) is dead on 3.2 for a bash invoked by its own name. Brief/ADR 'ENV=<script> + --posix' is WRONG for the macOS default shell | experiment: probe file printing $-, run in a PTY, this machine | R
+B9  | kitty setup_bash_env argv rules | skip injection if `-c` present (even `-ic`), if a file arg is given without `-i`, `--posix`/`--norc`/`--noprofile`/`--rcfile`/`--init-file` removed from argv and carried in KITTY_BASH_INJECT / KITTY_BASH_RCFILE / KITTY_BASH_POSIX_ENV; then `--posix` inserted at argv[1]. When HISTFILE unset (and not posix) it sets HISTFILE=~/.bash_history and KITTY_BASH_UNEXPORT_HISTFILE=1 because posix mode would default to ~/.sh_history. Tessera brief omits HISTFILE handling: add it | K-py:setup_bash_env | V
+B10 | login shell                 | when the shell is a login shell (`shopt -q login_shell`, e.g. argv0 `-bash` or `--login`) the script sources /etc/profile then first of ~/.bash_profile, ~/.bash_login, ~/.profile; otherwise /etc/bash.bashrc, /etc/bash/bashrc then $KITTY_BASH_RCFILE or ~/.bashrc. macOS: /etc/bashrc is NOT sourced by kitty's path (macOS /etc/profile sources it for login shells; for non-login nothing) | K-bash:rc loading | V
+B11 | Terminal.app macOS bash     | /etc/bashrc sets PS1 and sources /etc/bashrc_$TERM_PROGRAM; with TERM_PROGRAM=Tessera no file exists, inert | /etc/bashrc:10 (this machine) | R
+
+## 3. zsh .zshenv / ZDOTDIR injection (kitty model) edge cases
+# Test coverage in kitty: kitty_tests/shell_integration.py runs zsh with --noglobalrcs and a fresh $HOME with a .zshrc, via setup_zsh_env.
+# It has NO test for: empty ZDOTDIR, /etc/zshenv setting ZDOTDIR, unreadable rc, warn_create_global, new-user (no rc files). (grep of the test file: none of ZDOTDIR/zshenv/unreadable/warn_create appears.) All of those are handled in code only.
+Z1  | user had no ZDOTDIR             | env: ZDOTDIR=<scripts>/zsh, no KITTY_ORIG_ZDOTDIR; .zshenv does `unset ZDOTDIR` then sources ${ZDOTDIR-~}/.zshenv = ~/.zshenv | K-py:setup_zsh_env; K-zenv:8-19 | V
+Z2  | user had ZDOTDIR=/u/z           | env: KITTY_ORIG_ZDOTDIR=/u/z, ZDOTDIR=<scripts>/zsh; .zshenv `export ZDOTDIR=/u/z` (re-exports even though ZDOTDIR was in the env originally), unsets KITTY_ORIG_ZDOTDIR, sources /u/z/.zshenv | K-zenv:8-13 | V
+Z3  | user had ZDOTDIR="" (empty)     | env: KITTY_ORIG_ZDOTDIR="" (set but empty: kitty tests `is not None`, .zshenv tests `${VAR+X}`) ; .zshenv exports ZDOTDIR="" and sources "/.zshenv" (zsh treats empty as "/"; `${ZDOTDIR-~}` keeps empty). Rust: must distinguish unset from empty (Option<String>, not `.unwrap_or_default()`) | K-zenv:8-26 ; K-py:is_new_zsh_install uses `not zdotdir` for HOME fallback | V
+Z4  | /etc/zshenv sets ZDOTDIR (ZDOTDIR unset in env) | kitty runs `<zsh> --norcs --interactive -c 'echo -n $ZDOTDIR'` (only when no rc files are found in $HOME) to learn it; if rc files exist under $HOME it just injects, and KITTY_ORIG_ZDOTDIR is popped; global zshenv's value is then lost ("we try to limit the damage"). Brief says 'documented, not handled beyond kitty's approach': agree | K-py:get_zsh_zdotdir_from_global_zshenv, setup_zsh_env | V
+Z5  | no rc files anywhere (new user) | kitty does NOT inject (returns early) so zsh-newuser-install can run. If ZDOTDIR is set (non-None) and there are no rc files in it -> no injection either. BRIEF GAP: the live test "HOME at a temp dir with no rc files" would get no integration under kitty's rule. On macOS /bin/zsh 5.9 (this machine) there is no newuser-install (no /usr/share/zsh newuser scripts) so injecting anyway is harmless here, but on Linux it would suppress the first-run wizard. Recommend: replicate kitty's rule in Injection::for_shell only if it is cheap (4 `exists` checks); live test creates an empty ~/.zshrc | K-py:is_new_zsh_install | V
+Z6  | integration gate in .zshenv     | only if `[[ -o interactive ]]` and KITTY_SHELL_INTEGRATION non-empty; then `is-at-least 5.1` else prints "ZSH x is too old for kitty shell integration" and returns. macOS zsh is 5.9 | K-zenv:30-38 | V
+Z7  | unreadable / directory rc       | `[[ ! -r "$f" ]] || source -- "$f"`: skip unreadable files and directories (zsh ignores them, so does source) | K-zenv:24-28 | V
+Z8  | warn_create_global              | `builtin typeset _ksi_file=...` instead of plain assignment, and `emulate -L zsh -o no_warn_create_global -o no_aliases` inside the integration, so a user's `setopt warn_create_global` in .zshenv does not print warnings. Every builtin is `builtin`-prefixed against user aliases/functions | K-zenv:20-24; K-zsh:24 | V
+Z9  | `always` block                  | user zshenv sourced inside `{ ... } always { ... }` so the integration loads even if the user's file errors / `return`s, and the exit status stays the user's | K-zenv:15-45 | V
+Z10 | other rc files with ZDOTDIR restored | .zshenv restores ZDOTDIR before the user's .zshenv, so .zprofile/.zshrc/.zlogin are read from the user's dir. /etc/zshrc on macOS uses HISTFILE=${ZDOTDIR:-$HOME}/.zsh_history, evaluated after .zshenv, so the restore matters for history | K-zenv; /etc/zshrc:16 (this machine) | V
+Z11 | double load                      | `(( ! $+_ksi_state )) || return` guard; precmd hook installed once via `_ksi_deferred_init` which replaces itself. Tessera: use a `_tessera_si_state` guard variable | K-zsh:26-28,81-82 | V
+Z12 | fd for output                    | kitty opens a cloexec fd to $TTY via zsh/system sysopen so marks reach the terminal even when stdout is redirected (falls back to fd 1). Needed because precmd/preexec may run with redirected stdout | K-zsh:51-69 | V
+Z13 | injection env must not leak       | KITTY_SHELL_INTEGRATION is unset inside _ksi_deferred_init / bash script so children (nested shells) don't re-run; ZDOTDIR restored so children see the user's value. Tessera: unset TESSERA_SHELL_INTEGRATION after reading feature words? kitty does; but then manual `zsh` in the session is not integrated (documented limitation) | K-zsh:88-92; sw.kovidgoyal.net/kitty/shell-integration | V
+## 3b. bash injection alternatives that DO work on 3.2.57 (all experiments R, own probe scripts, PTY, HOME=temp)
+BI1 | `bash --rcfile <script> -i` (non-login) | script is sourced INSTEAD of ~/.bashrc; script must itself source /etc/bash.bashrc(if any) and ~/.bashrc. Works on 3.2 | experiment (1) | R
+BI2 | `bash --rcfile <script> -l -i` / argv0 `-bash` (login) | --rcfile is IGNORED for login shells: ~/.bash_profile (or .bash_login/.profile) is read instead; /etc/profile first. So --rcfile does not cover login shells (macOS Terminal.app-style `login -pf user bash` / `bash -l`) | experiment (2),(4); bash(1) INVOCATION | R
+BI3 | `PROMPT_COMMAND='. <script>'` exported in env | works on 3.2 for login and non-login, any argv, runs at the first prompt after all rc files. Weakness: a user rc that ASSIGNS (not appends) PROMPT_COMMAND drops it; PROMPT_COMMAND is inherited by child shells unless the script unsets/restores it; script must remove itself (idempotence guard) | experiment (3) | R
+BI4 | bash invoked with argv0 `sh` (or /bin/sh) + ENV | ENV is sourced; script does `set +o posix` and sources user rc (kitty's flow). Needs control of argv[0] (tessera-pty read-only for this issue: unverified that it exposes argv0) | experiment `/bin/sh -i` | R (ENV) / U (argv0 plumbing)
+BI5 | bash >= 4 / 5 (Homebrew) | kitty's `--posix`+ENV works there (kitty ships and tests it on bash 5; ghostty and kitty both rely on it) | K-py, kitty_tests/shell_integration.py:run_shell | V (source) / U (not run)
+BI6 | recommendation              | Injection::for_shell(bash): argv `--rcfile <scripts>/bash/tessera.bash` when argv has no --posix/-c/-l/--login/script-file and argv0 not login (`-bash`); otherwise BI3 PROMPT_COMMAND (login shells). Keep kitty's argv parsing rules (B9) for -c/-s/-i/file args. Carry user's --rcfile in TESSERA_BASH_RCFILE like kitty. Do NOT use --posix+ENV for /bin/bash 3.2 | BI1-BI3 | R
+
+## 4. fish (NOT RUN: fish absent on this machine; source and docs only)
+F1  | where vendor_conf.d is searched | `$__fish_user_data_dir/vendor_conf.d` (~/.local/share/fish/vendor_conf.d) then, for each entry E of $XDG_DATA_DIRS in order, `E/fish/vendor_conf.d`, then build-time extra confdir. fish appends `/fish` to every XDG entry | fish share/config.fish:25-47 | V
+F2  | brief error: which dir to prepend | prepend `<scripts>` (the directory CONTAINING `fish/vendor_conf.d/...`), NOT `<scripts>/fish` as the brief says. kitty: shell_integration_dir (parent of `fish/`) | F1; K-py:setup_fish_env | V
+F3  | load order vs user config | share/config.fish sources, in one loop with basename de-dup: user `~/.config/fish/conf.d/*.fish`, then `/etc/fish/conf.d`, then vendor_conf.d dirs (our dir first among XDG dirs). This all happens inside fish's own config.fish BEFORE the user's `~/.config/fish/config.fish` is read. So our vendor_conf.d file runs BEFORE user config.fish, AFTER user conf.d | fish share/config.fish:152-165 | V
+F4  | shadowing                   | a user conf.d file with the same basename (`tessera-shell-integration.fish`) shadows ours (feature: user opt-out); name collision otherwise impossible | fish share/config.fish:154-165 | V
+F5  | consequence: defer           | because we run before config.fish, kitty defers everything to the first `fish_prompt` event (`function __ksi_schedule --on-event fish_prompt` then erases itself) so that user functions/bindings/`fish_prompt` overrides exist. Recommend the same: top-level only restores XDG_DATA_DIRS and defines one self-erasing fish_prompt handler | K-fish:35-37 | V
+F6  | XDG_DATA_DIRS restore       | kitty keeps KITTY_FISH_XDG_DATA_DIR=<dir> and in the conf file removes that entry from XDG_DATA_DIRS (as a --path var), erasing the variable if it becomes empty, then erases KITTY_FISH_XDG_DATA_DIR. If it was originally unset kitty sets XDG_DATA_DIRS to just <dir>, so the vendor dirs computed by fish lose the default `/usr/local/share:/usr/share`; they are restored only for children | K-py:setup_fish_env; K-fish:5-18 | V
+F7  | recommend for F6            | if XDG_DATA_DIRS unset, set `<scripts>:/usr/local/share:/usr/share` (XDG default) and have the conf file erase the variable when TESSERA_FISH_XDG_WAS_UNSET=1; avoids hiding /usr/share/fish/vendor_* from fish itself | XDG Base Dir spec default; fish config.fish:26-28 fallback list | U (design; not run)
+F8  | fish interactive gate       | `status is-interactive || exit 0` and `not functions -q __ksi_schedule || exit 0` (idempotence) | K-fish:20-21 | V
+F9  | native marks in new fish    | fish >= 4.0 itself emits OSC 133 (prompt marks, and 4.0.1 adds the commandline to C); 4.3 adds OSC 7 on every prompt; 4.0.6 adds `set -Ua fish_features no-mark-prompt`. kitty's script skips its own A/C/D when it detects native marking (`bind --function-names | string match -q forward-char-passive`). Emitting both gives duplicate marks: the fish script must detect native support (`$version` >= 4.0 or that bind probe) and skip A/C/D; same for OSC 7 on >= 4.3 (confidence medium: relnotes pages summarised, see sources) | K-fish:96-117; fishshell.com/docs/4.7/relnotes.html | V (kitty) / medium (relnotes)
+F10 | fish events                  | kitty: `--on-event fish_prompt --on-event fish_cancel --on-event fish_posterror` for D?+A, `fish_preexec` for C (`cmdline_url=` urlescaped), `fish_postexec` for `D;$status`, `--on-variable PWD --on-event fish_prompt` for OSC 7 with `status is-command-substitution || ...`. fish_cancel (Ctrl-C at prompt) and fish_posterror give the bare `D` | K-fish:96-135 | V
+F11 | fish min version             | kitty needs 3.3+ (fallback check 3.2.0 minimum working) | K-fish:23-26 | V
+F12 | fish OSC 7 form              | kitty: `kitty-shell-cwd://$hostname$PWD` unencoded (fish `$hostname` var). Tessera: file://$hostname + `string escape --style=url -- $PWD` (leaves `/`? U: not verified which bytes --style=url keeps; test in the implementer's fish run or hand-roll with `string replace -ra`) | K-fish:133-136 | V (kitty) / U (url style)
+
+## 5. OSC 7 encoding and hostname
+# Producer rules
+P1  | Terminal.app bash+zsh (/etc/bashrc_Apple_Terminal, /etc/zshrc_Apple_Terminal on this machine) | `ESC ] 7 ; file://$HOSTNAME(bash)|$HOST(zsh) <path> BEL`. Path is percent-encoded BYTE-WISE (LC_CTYPE=C): bytes in `[/._~A-Za-z0-9-]` kept, every other byte -> `%XX` uppercase hex. Terminator BEL | /etc/bashrc_Apple_Terminal:9-34, /etc/zshrc_Apple_Terminal:15-40 | R
+P2  | iTerm2 bash                 | same unreserved set `[/._~A-Za-z0-9-]`, byte-wise; URL is `file://USER@HOST/path?machineID=1:<hmac>` (userinfo + query!); host = `hostname -f` sanitised to `[A-Za-z0-9._-]`; BEL terminator. parse_osc7 must tolerate `user@` and a `?query` | iterm2.bash:iterm2_encode_path, iterm2_print_state_data | V
+P3  | kitty (zsh/bash/fish)       | scheme is `kitty-shell-cwd://` (not file://), host = $HOST/$HOSTNAME/$hostname, path RAW (no percent-encoding), BEL. kitty's own tests cd into a dir with a `🐱` in the name and check last_reported_cwd; the reason for the odd scheme is to avoid encoding in shell | K-zsh:240; K-bash:_ksi_prompt_command; K-fish:135; kitty_test_si.py:test_zsh_integration | V
+P4  | WezTerm bash/zsh script     | `ESC ] 7 ; file://$HOSTNAME$PWD ESC \` raw, NO encoding (uses ST, not BEL), unless `wezterm` is on PATH, then `wezterm set-working-directory` builds the URL itself (url-crate encoding, hostname = system hostname) | W-sh:451-458; wezterm.org/cli/set-working-directory.html | V
+P5  | WezTerm receiver            | `Url::parse(&url).ok()` (WHATWG url crate): invalid URL ignored; raw space is auto-encoded to %20, a raw `%` stays, a raw `#` starts the fragment and `?` the query (path truncated). Hence unencoded scripts break on `#` `?` | wezterm term/src/terminalstate/performer.rs:940-941 | V (call) / documented (url crate semantics)
+P6  | Ghostty                     | accepts both `file://` and `kitty-shell-cwd://`, URI-decodes both, accepts only localhost or its own hostname | web search result (ghostty commit text; source not read) | U (secondary)
+P7  | iTerm2 receiver doc         | `OSC 7 ; [Ps] ST` with `[Ps]` 'a file URL with a hostname and a path' e.g. file://example.com/usr/bin; synonym of RemoteHost+CurrentDir | iterm2.com/documentation-escape-codes.html | V
+# Encoder behaviour on bash 3.2.57 / zsh 5.9 using the Terminal.app loop (own copy of the loop, byte-wise, LC_CTYPE=C) -> expected parse_osc7 / script round-trips
+E1  | /tmp/a b                   | /tmp/a%20b | proto/enc.bash | R
+E2  | /tmp/100%                  | /tmp/100%25 | proto/enc.bash | R
+E3  | /tmp/a#b?c                 | /tmp/a%23b%3Fc | proto/enc.bash | R
+E4  | /tmp/café (UTF-8)          | /tmp/caf%C3%A9 | proto/enc.bash, enc.zsh | R
+E5  | /tmp/🐱                    | /tmp/%F0%9F%90%B1 | proto/enc.bash, enc.zsh | R
+E6  | /tmp/a+b,c;d=e:f@g         | /tmp/a%2Bb%2Cc%3Bd%3De%3Af%40g (Terminal.app encodes all of these; `+ , ; = : @` are legal in RFC 3986 paths, so a decoder must accept both forms) | proto/enc.bash | R
+E7  | /tmp/a'b"c                 | /tmp/a%27b%22c | proto/enc.bash | R
+E8  | fast path                  | if $PWD matches ^[/._~A-Za-z0-9-]*$ skip the per-byte loop (bash 3.2 loop is O(n) forks-free but slow in long paths); not in any reference, recommendation | design | U
+# Decoder cases for parse_osc7 (input payload after `7;` -> expected). Rule from brief: empty host = local; reject non-absolute and `..` after decoding; return host without judging it.
+D1  | file:///tmp                       | Some{host:"", path:"/tmp"} | RFC 8089 s.2 (empty authority = localhost); brief | V
+D2  | file://Mac.home/tmp               | Some{host:"Mac.home", path:"/tmp"} | P1 on this machine | R
+D3  | file://Mac.home/tmp/a%20b         | path "/tmp/a b" | P1 | R
+D4  | file://h/tmp/caf%C3%A9            | path "/tmp/café" | E4 | R
+D5  | file://h/tmp/%F0%9F%90%B1         | path "/tmp/🐱" | E5 | R
+D6  | file://h/tmp/100%25               | path "/tmp/100%" | E2 | R
+D7  | file://h/tmp/a%2fb                | decoded `/` inside a segment: recommend REJECT (None): decoded path would silently change segment structure (note: none of the producers encodes `/`) | design | U
+D8  | file://h/tmp/%2e%2e/etc           | decodes to /tmp/../etc -> None (`..` after decoding, brief) | brief | V
+D9  | file://h/tmp/%zz or %4 (truncated) | recommend None (malformed escape); WHATWG url would keep it literally, kitty/ghostty unknown | design | U
+D10 | file://h/tmp/%00                  | recommend None (NUL/control bytes after decoding); a path with a newline would break scrollback marks | design | U
+D11 | file://h/tmp/%FF (invalid UTF-8)  | recommend None (Cwd.path is String); alternative lossy decode. Decision for lead | design | U
+D12 | file://user@h/tmp?machineID=1:ab  | iTerm2 form: host "h" (strip userinfo), query ignored, path "/tmp". Recommend tolerate | P2 | V
+D13 | file://h/tmp#frag                 | fragment ignored | RFC 3986 | V
+D14 | file://h                          | no path -> None (not absolute) | brief | V
+D15 | file://h/../x is covered by D8; a payload without scheme, e.g. `tmp/x` or `/tmp` | None (not a file URL; a bare absolute path is not OSC 7) | brief | V
+D16 | http://h/tmp, kitty-shell-cwd://h/tmp | http -> None. kitty-shell-cwd: recommend accept with RAW path (no decoding, since kitty never encodes) or None if lead wants file:// only; scripts here never emit it | P3 | U (decision)
+D17 | file://[::1]/tmp                  | IPv6 host literal: return host "[::1]" opaque | RFC 3986 | U
+D18 | uppercase scheme FILE://h/tmp     | scheme is case-insensitive per RFC 3986 s.3.1; recommend accept | RFC 3986 | V
+D19 | very long payload (> 4096 bytes) | cap and return None (term should cap OSC length anyway, #9) | design | U
+# Hostname source
+H1  | macOS here: `hostname` = `hostname -f` = `Mac.home`; `hostname -s` = `Mac`; bash $HOSTNAME = `Mac.home`; zsh $HOST = `Mac.home` (observed in prototype OSC 7) | R
+H2  | kitty/WezTerm/Terminal.app/Ghostty use the shell's own variable ($HOSTNAME/$HOST/$hostname): zero forks per prompt. iTerm2 uses `hostname -f` (forks) on macOS each prompt and sanitises. Nobody uses `hostname -s`. Nobody emits an empty host | sources above | V
+H3  | recommend: emit the shell variable (== hostname -f on macOS), sanitised to [A-Za-z0-9._-] (iTerm2) so a malformed hostname cannot restructure the URL; keep host non-empty so a remote (ssh) shell running the same script is distinguishable from local; the consumer (#9) compares with gethostname()/`.local` variants | design | U
+
+## 6. Handshake and OSC 133 semantics
+S1  | iTerm2 handshake form       | `OSC 1337 ; ShellIntegrationVersion=[Pn] ; [Ps] ST`, Pn = version of the script, Ps = shell name (`bash`); form without Ps is deprecated; iTerm2 offers upgrade when it sees a lower number | iterm2.com/documentation-escape-codes.html | V
+S2  | iTerm2 actual script        | `printf "1337;ShellIntegrationVersion=24;shell=bash"` wrapped in ESC ] ... BEL, emitted once at source time, AFTER the first OSC 7 (iterm2_print_state_data then iterm2_print_version_number). iTerm2's number (24) is ITS script version: Tessera's `1` is a private namespace sharing the same OSC; iTerm2 itself would nag only if Tessera's lower number were seen by iTerm2 (e.g. Tessera script run over ssh inside iTerm2!). Risk: sourcing Tessera's scripts while inside iTerm2 prints version 1 < 24. Mitigated because the script is a no-op unless TESSERA_SHELL_INTEGRATION is set | iterm2.bash:788,891 | V
+S3  | order in Tessera (recommend) | handshake first, then OSC 7, then (A ... B) of first prompt. iTerm2 prints OSC 7 then version; either order OK for the live test: assert handshake count == 1 and it precedes the first A | design / S2 | U
+S4  | kitty/wezterm do not send any handshake in 1337 | kitty uses KITTY_SHELL_INTEGRATION env + DCS `@kitty-*`; WezTerm uses OSC 1337 SetUserVar only; Ghostty none (not read) | K-*, W-sh | V
+S5  | A                           | 'Sent just before the shell prompt starts' (FinalTerm / iTerm2). Parameters seen in the wild: `k=s` (secondary/PS2 prompt; kitty, iTerm2, WezTerm `P;k=s`), `k=i`, `aid=<id>`, `cl=m|line`, `redraw=last`, `special_key=1` (kitty fish). Receiver must ignore unknown params | iterm2 docs; K-*; W-sh; G-bash | V
+S6  | B                           | 'Sent just after the prompt ends, before the user's command'. kitty never emits it (zsh line commented out); WezTerm/iTerm2/Ghostty do | iterm2 docs | V
+S7  | C                           | 'Sent just before command output starts'. kitty adds `cmdline=%q` (zsh/bash) or `cmdline_url=` (fish); iTerm2 `aid=`; WezTerm empty param (`133;C;`); Ghostty `133;C;`. Tessera: bare `133;C` (privacy D4) | iterm2 docs; K-*; W-sh:504; G-bash:219 | V
+S8  | D forms                     | `D ; [Ps]` Ps = exit status 0-255; `D` alone. After C only the form with Ps should be used. A bare D after B and before C signals an ABORTED command (any Ps ignored). A D with neither B nor C before it is ignored | iterm2.com/documentation-escape-codes.html | V
+S9  | consequence for Tessera A/B/C/D | emit bare `D` for 'prompt shown, no command ran' (empty line, Ctrl-C at the prompt): matches iTerm2's 'aborted command' meaning (D after B before C). Emit `D;<n>` only after C. Emit nothing before the first prompt (no D at startup) | S8; K-zsh:151-158 | V
+
+## 7. D with Ctrl-C / empty line, and the live-test expectation
+# Observations on this machine: zsh 5.9 and bash 3.2.57 in a PTY, my own PS1/precmd probes (proto/, tools/)
+C1  | zsh: empty Enter           | NO preexec; precmd DOES run with $? = previous command's status | experiment `precmd:$?` | R
+C2  | zsh: Ctrl-C at the prompt  | NO preexec; precmd runs with $? = 130 (status shown 130 in the next prompt). So kitty's state machine (bare `D` when state==2) yields `D` not `D;130` | experiment | R
+C3  | zsh: Ctrl-C of running `sleep 5` | preexec ran; precmd sees $? = 130 -> `D;130` | experiment | R
+C4  | bash 3.2: `$?` at the prompt after `false`, then empty Enter | stays 1 (stale status) -> kitty's `D;$?` in PS1 would report D;1 for an empty line | experiment `PS1='<$?>'` | R
+C5  | bash 3.2: Ctrl-C at the prompt | `$?` unchanged (stayed 1, NOT 130; newer bash may differ: U). kitty's bash PS1 would emit D;1 | experiment | R
+C6  | bash 3.2: Ctrl-C of running `sleep 5` | `$?` = 130 -> D;130 | experiment | R
+C7  | does C fire on an empty line? | kitty zsh: no (preexec not run). kitty bash: no (PS0 not run). WezTerm: no C but repeats `D;<status>` (executing flag stays 0). iTerm2 bash: YES, it synthesises preexec with empty command when none ran, so emits C then D. Recommend: no C | K-zsh; K-bash; W-sh:480-483; iterm2.bash __iterm2_prompt_command | V (+R for zsh/bash preexec not firing)
+C8  | kitty's rule                | zsh: state machine (0 none, 1 C open, 2 after A): D;<n> if C open, bare D if state 2, nothing at state 0; bash: always `D;$?` in PS1 and relies on the terminal taking 'only the first D after a C' | K-zsh:151-158; K-bash comment above `_ksi_prompt[ps1]+=` | V
+C9  | brief's rule 'D without a code when no command ran' | implementable in bash with a flag set by the preexec hook (DEBUG trap) and cleared by the prompt hook: confirmed working on bash 3.2.57 with a hand-written trap (section 7 list) | proto/bash_env.sh | R
+C10 | exit                        | `exit` still triggers preexec/DEBUG so a final `C` is emitted and NO `D` (shell exits before precmd). zsh and bash both observed | experiment | R
+
+## 7b. Expected payload list for the live test (`cd /tmp\rtrue\rfalse\rexit\r`) - copy into the test
+# Both lists were PRODUCED by running my own prototype scripts (proto/zsh_home/.zshrc, proto/bash_env.sh via --rcfile) on this machine, i.e. they are observed orderings of the recommended design, not kitty's output. kitty's own output differs as listed in section 1.
+# Payload = text between ESC ] and BEL. START_CWD = the spawn cwd (zsh/bash report the logical $PWD; here /private/tmp/..., NOT canonicalised).
+# live-zsh (zsh 5.9, /bin/zsh -i, HOME temp with an EMPTY .zshrc - see Z5)
+LZ  | order as observed          | 1337;ShellIntegrationVersion=1;shell=zsh | 7;file://HOST/START_CWD | 133;A | 133;B | [cd] 133;C | 7;file://HOST/tmp | 133;D;0 | 133;A | 133;B | [true] 133;C | 133;D;0 | 133;A | 133;B | [false] 133;C | 133;D;1 | 133;A | 133;B | [exit] 133;C | (end; no D)
+# live-bash (bash 3.2.57, /bin/bash --rcfile <script> -i)
+LB  | order as observed          | 1337;ShellIntegrationVersion=1;shell=bash | 7;file://HOST/START_CWD | 133;A | 133;B | [cd] 133;C | 133;D;0 | 7;file://HOST/tmp | 133;A | 133;B | [true] 133;C | 133;D;0 | 133;A | 133;B | [false] 133;C | 133;D;1 | 133;A | 133;B | [exit] 133;C | (end)
+LX  | assertions the test should make | (a) filtered to OSC 133 only, in both shells: A B C D;0 A B C D;0 A B C D;1 A B C  (the brief's 'A B C D;0 A B C D;1' omits the `cd`/`true` split: three D's are produced: 0 (cd), 0 (true), 1 (false)); (b) exactly one 1337 ShellIntegrationVersion, before the first A; (c) OSC 7 paths, in order: START_CWD then /tmp, exactly two (dedupe on unchanged PWD: kitty's zsh emits 2 at startup, a duplicate); (d) ORDER BETWEEN FAMILIES differs: zsh emits 7(/tmp) before D;0 (chpwd runs inside the command), bash emits it after D;0 (PROMPT_COMMAND). Do not assert 7-vs-133 interleaving, assert the two sub-sequences | experiment | R
+# LX(c) amended 2026-10-29 by the #44 implementer (adversarial finding B2, lead decision): the zsh and fish
+# scripts report OSC 7 at EVERY prompt as kitty does (K1/K2), not only when PWD changed, so a program that
+# reported another directory (ssh) cannot leave the terminal with a wrong one; zsh's chpwd report skips
+# subshells. The live test folds repeated reports and checks START_CWD then /tmp.
+LY  | extra live cases (recommended) | empty Enter then Ctrl-C at prompt -> two bare `D` (section: C1,C2, observed in proto: ...B | D | A | B | D | A | B...); `sleep 3` + Ctrl-C -> `C | D;130` | experiment | R
+LZ2 | skip rules                  | no fish on this machine: skip with message. If a rc file sets a custom PS1 and a `precmd`: marks still appear (zsh proto wraps PS1 once, guarded by `*133;A*`) - NOT tested with a theme that resets PS1 each precmd (kitty defers install to first precmd for that reason) | K-zsh:73-83 | U
+LZ3 | env hygiene for the live test | spawn with `env -u ZDOTDIR` equivalent: this user's login env exports ZDOTDIR=/Users/anyber11 (observed), which made zsh load the REAL ~/.zshrc (it ran Homebrew). The test must set/unset ZDOTDIR explicitly and HOME to a temp dir; `TERM_PROGRAM=Tessera` keeps /etc/zshrc_Apple_Terminal and /etc/bashrc_Apple_Terminal inert (both loaded via `/etc/zshrc_$TERM_PROGRAM`) | experiment; /etc/zshrc:74, /etc/bashrc:10 | R
+LZ4 | macOS startup noise          | /bin/bash 3.2 prints 'The default interactive shell is now zsh...' on stderr at startup unless BASH_SILENCE_DEPRECATION_WARNING=1; set it in the test env (kitty's tests do) | experiment; kitty_test_si.py:basic_shell_env | R
