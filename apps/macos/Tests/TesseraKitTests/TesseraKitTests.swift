@@ -181,6 +181,32 @@ final class TesseraKitTests: XCTestCase {
         XCTAssertNil(recorder.events[closed.id])
     }
 
+    /// Close Window closes its tabs one after another on the main actor; with
+    /// children that ignore SIGHUP each close used to wait out the hangup grace,
+    /// about a second each. The core now reaps them in the background (#79).
+    func testClosingManySessionsThatIgnoreSighupReturnsAtOnce() async throws {
+        let sessions = try (0..<20).map { _ in try sh("trap '' HUP; printf ready; exec sleep 30") }
+        let ready = sessions.map { recorder.expect($0, "trap installed") { $0 == .output } }
+        await fulfillment(of: ready, timeout: 10)
+        let start = ContinuousClock.now
+        for session in sessions {
+            try session.close()
+        }
+        let closeTime = ContinuousClock.now - start
+        // Well under a millisecond in release; generous for Thread Sanitizer.
+        XCTAssertLessThan(closeTime, .milliseconds(500))
+        // Freeing waits for the background closes, whose grace periods overlap.
+        let freeStart = ContinuousClock.now
+        app.shutdown()
+        let shutdownTime = ContinuousClock.now - freeStart
+        XCTAssertLessThan(shutdownTime, .milliseconds(2500))
+        print("closing 20 SIGHUP-ignoring sessions: close loop \(closeTime), shutdown \(shutdownTime)")
+        for session in sessions {
+            let exited = recorder.events[session.id, default: []].contains { if case .exit = $0 { true } else { false } }
+            XCTAssertFalse(exited, "no exit for a closed session")
+        }
+    }
+
     // MARK: Errors
 
     func testClosingAStaleSessionThrowsSessionNotFound() throws {

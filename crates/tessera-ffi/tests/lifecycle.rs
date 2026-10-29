@@ -9,6 +9,8 @@
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::process::Command;
 use std::ptr;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -560,6 +562,124 @@ fn freeing_with_live_sessions_is_prompt_and_joins_threads() {
         }
         assert_eq!(thread_count(), before, "threads leaked");
     }
+}
+
+#[test]
+fn close_returns_at_once_and_free_waits_for_the_closing_children() {
+    let recorder = Recorder::default();
+    let before = thread_count();
+    let app = Handle::observed(&recorder);
+    let stubborn: Vec<u64> = (0..5)
+        .map(|_| {
+            app.spawn(
+                "/bin/sh",
+                &["-c", "trap '' HUP; printf ready; while :; do sleep 1; done"],
+            )
+            .unwrap()
+        })
+        .collect();
+    drop(
+        recorder.wait_for("the stubborn children to ignore SIGHUP", |seen| {
+            stubborn.iter().all(|id| seen.output_from.contains(id))
+        }),
+    );
+    let closing = Instant::now();
+    for &id in &stubborn {
+        assert_eq!(app.close(id), Error::Ok);
+    }
+    let close_took = closing.elapsed();
+    assert!(
+        close_took < Duration::from_millis(5),
+        "5 closes took {close_took:?}"
+    );
+    for &id in &stubborn {
+        assert_eq!(app.close(id), Error::SessionNotFound);
+        assert_eq!(app.write(id, b"x"), Error::SessionNotFound);
+    }
+    // Freeing waits for the background closes, which share one grace.
+    app.free();
+    let free_took = closing.elapsed();
+    assert!(
+        free_took >= Duration::from_secs(1),
+        "freed {free_took:?} after closing"
+    );
+    assert!(
+        free_took < Duration::from_millis(1_800),
+        "freed {free_took:?} after closing"
+    );
+    assert_eq!(
+        recorder.seen().exits,
+        Vec::new(),
+        "closed sessions report no exit"
+    );
+    if alone_in_process() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while thread_count() > before && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(thread_count(), before, "threads leaked");
+    }
+}
+
+/// Set in [`record_qos`]'s slot next to the class, so a thread with no
+/// class (0) still counts as recorded.
+#[cfg(target_os = "macos")]
+const QOS_RECORDED: u64 = 1 << 32;
+
+/// Records the quality-of-service class of the thread an output callback
+/// runs on, with [`QOS_RECORDED`], into the `AtomicU64` behind `user_data`.
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn record_qos(user_data: *mut c_void, _id: u64) {
+    unsafe extern "C" {
+        fn pthread_self() -> *mut c_void;
+        fn pthread_get_qos_class_np(thread: *mut c_void, qos: *mut u32, relative: *mut i32) -> i32;
+    }
+    let mut qos = 0;
+    let mut relative = 0;
+    // SAFETY: the calling thread's own handle and two writable integers.
+    let status =
+        unsafe { pthread_get_qos_class_np(pthread_self(), &raw mut qos, &raw mut relative) };
+    assert_eq!(status, 0);
+    // SAFETY: the test passes a live `AtomicU64`.
+    let slot = unsafe { &*user_data.cast::<AtomicU64>() };
+    slot.store(QOS_RECORDED | u64::from(qos), Ordering::SeqCst);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn session_threads_run_at_user_initiated_qos() {
+    /// `QOS_CLASS_USER_INITIATED` from `<sys/qos.h>`.
+    const QOS_CLASS_USER_INITIATED: u64 = 0x19;
+    let qos = AtomicU64::new(0);
+    // A second app in the process installs nothing new and changes nothing.
+    let first = Handle::new();
+    let app = Handle::new();
+    first.free();
+    let callbacks = Callbacks {
+        user_data: ptr::from_ref(&qos).cast_mut().cast(),
+        on_session_output: Some(record_qos),
+        on_session_title: None,
+        on_session_bell: None,
+        on_session_exit: None,
+    };
+    // SAFETY: live handle; valid table; `qos` outlives the handle.
+    assert_eq!(
+        unsafe { tessera_app_set_callbacks(app.0, &raw const callbacks) },
+        Error::Ok
+    );
+    let id = app.spawn("/bin/sh", &["-c", "printf x; sleep 5"]).unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    while qos.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "no output callback");
+        thread::sleep(Duration::from_millis(2));
+    }
+    // The callback runs on the session's reader thread.
+    assert_eq!(
+        qos.load(Ordering::SeqCst),
+        QOS_RECORDED | QOS_CLASS_USER_INITIATED
+    );
+    assert_eq!(app.close(id), Error::Ok);
+    app.free();
 }
 
 #[test]

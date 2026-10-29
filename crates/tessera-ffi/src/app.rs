@@ -71,6 +71,8 @@ pub unsafe extern "C" fn tessera_app_new(out: *mut *mut App) -> Error {
         }
         // SAFETY: `out` is non-null and writable per the contract.
         unsafe { out.write(ptr::null_mut()) };
+        // Process-wide and idempotent: only the first app installs it.
+        tessera_app_core::session::set_thread_start_hook(raise_thread_qos);
         let Some(paths) = ConfigPaths::for_current_user() else {
             tracing::warn!("cannot determine the home directory");
             return Error::Io;
@@ -84,16 +86,51 @@ pub unsafe extern "C" fn tessera_app_new(out: *mut *mut App) -> Error {
     })
 }
 
+/// Gives the calling thread (a session reader or input writer, or the
+/// reaper) the `QOS_CLASS_USER_INITIATED` quality-of-service class.
+///
+/// Threads the core starts would otherwise run at the default class, below
+/// the main thread's `USER_INTERACTIVE`, and the main thread waits on locks
+/// they hold (the terminal lock while output is applied, a session's
+/// delivery lock while a callback runs): a priority inversion Xcode's Thread
+/// Performance Checker reports. `USER_INTERACTIVE` is deliberately not used:
+/// parsing output must not compete with the main thread (ADR 0018).
+#[cfg(target_os = "macos")]
+fn raise_thread_qos() {
+    // Declared inside the function so cbindgen, which reads every
+    // module-level item, does not copy it into TesseraCore.h.
+    unsafe extern "C" {
+        // <pthread/qos.h>; `qos_class_t` is an `unsigned int` enum.
+        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+    }
+    /// `QOS_CLASS_USER_INITIATED` from `<sys/qos.h>`.
+    const QOS_CLASS_USER_INITIATED: u32 = 0x19;
+    // SAFETY: takes plain integers and changes only the calling thread,
+    // which is not a workqueue thread (where the call is refused with an
+    // error, not undefined behaviour).
+    let status = unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0) };
+    if status != 0 {
+        tracing::debug!(status, "cannot set the thread's quality-of-service class");
+    }
+}
+
+/// Nothing to do where there is no quality-of-service class.
+#[cfg(not(target_os = "macos"))]
+fn raise_thread_qos() {}
+
 /// Destroys an application: detaches every surface (releasing the core's
-/// references to their layers), closes every session (hanging up, and if
-/// need be killing, its child), joins every session reader thread and
-/// releases the handle. A reader whose terminal is still held open after `SIGKILL`
-/// (a grandchild kept it) is detached instead of joined; it is muted and no
-/// longer holds the callback table. Returns once no callback is running or
-/// can run again; the installed `user_data` may then be freed. All sessions
-/// share one hangup grace period and one kill grace period, so this takes
-/// at most about two seconds however many children ignore `SIGHUP`.
-/// `NULL` is ignored.
+/// references to their layers), closes every session still open (hanging
+/// up, and if need be killing, its child), waits for those closes and for
+/// every close `tessera_session_close` left running in the background,
+/// joins every session thread and releases the handle. A session whose
+/// terminal is still held open after `SIGKILL` (a grandchild kept it) has
+/// its threads detached instead of joined; they are muted and no longer
+/// hold the callback table. Returns once no callback is running or can run
+/// again; the installed `user_data` may then be freed. Each child gets one
+/// second after its hangup before it is killed and one more after the
+/// kill, counted from its own close and running in parallel for all of
+/// them, so this blocks for at most about two seconds however many
+/// children ignore `SIGHUP`. `NULL` is ignored.
 ///
 /// # Safety
 ///

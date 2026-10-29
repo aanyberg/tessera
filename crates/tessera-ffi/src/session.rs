@@ -161,11 +161,18 @@ pub unsafe extern "C" fn tessera_session_spawn(
     })
 }
 
-/// Closes session `session_id`: detaches its surface if it has one (see
-/// `tessera_surface_detach`), hangs up its child (killing it if it does
-/// not exit within a second), joins its reader thread and forgets the id.
-/// No callback for the session runs after this returns, and
-/// `on_session_exit` is not called for it. Takes at most about two seconds.
+/// Closes session `session_id` and returns at once: detaches its surface
+/// if it has one (see `tessera_surface_detach`), drops its pending input,
+/// hangs up its child (`SIGHUP`) and forgets the id, so every later call
+/// with it returns `TESSERA_ERROR_SESSION_NOT_FOUND`. No callback for the
+/// session runs after this returns, and `on_session_exit` is not called
+/// for it, even when the child exits later. The only wait is for a
+/// callback of the session already running.
+///
+/// The child is reaped in the background: a core thread sends it `SIGKILL`
+/// if it is still running a second after the close, and joins the
+/// session's threads once it has exited. `tessera_app_free` waits for
+/// closes still in progress.
 ///
 /// Returns `TESSERA_ERROR_NULL_POINTER` if `app` is `NULL`,
 /// `TESSERA_ERROR_SESSION_NOT_FOUND` if the id is not a live session.

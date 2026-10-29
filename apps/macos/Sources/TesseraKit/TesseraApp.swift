@@ -125,12 +125,11 @@ public final class TesseraApp {
     ///
     /// Blocks until the children have exited. Sessions with a
     /// ``TesseraSession/write(_:)`` in progress on another thread are closed
-    /// first, one after another, which wakes the write and makes it fail; each
-    /// session with a write in flight can take up to about two seconds (a child
-    /// that ignores `SIGHUP`, or a cooked-mode child with a write blocked into
-    /// it, waits out the hangup and kill grace). Freeing the core then takes at
-    /// most about two seconds more, however many of the remaining children
-    /// ignore `SIGHUP`.
+    /// first, which wakes the write and makes it fail; each of those closes
+    /// returns at once. Freeing the core then waits for every close, these and
+    /// earlier ``TesseraSession/close()`` calls still reaping in the
+    /// background: at most about two seconds, however many children ignore
+    /// `SIGHUP`, because their grace periods run in parallel.
     public func shutdown() {
         // Both steps are idempotent. Waits for in-flight callbacks; `user_data` is unused once it returns.
         core.free()
