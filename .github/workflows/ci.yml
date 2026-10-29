@@ -55,3 +55,13 @@ jobs:
       - run: just app
       - run: just app-test
         timeout-minutes: 10
+      # After a failed, timed-out or cancelled test step the full xcodebuild logs name the hanging test (#121). The
+      # step limit (10 min) is below the job limit (15 min), so this step still runs after a step timeout.
+      - name: Upload app test logs
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-test-logs
+          path: apps/macos/build/app-test*.log
+          if-no-files-found: warn
+          retention-days: 14
