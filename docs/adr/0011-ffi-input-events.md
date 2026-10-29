@@ -120,7 +120,9 @@ is queued, so a single key or paste larger than 16 MiB always fails.
 Input to a child that has exited, or to a session that is closing, fails
 the same way. Closing a session closes its outbox: pending bytes are
 dropped, the writer stops within one write backoff period (20 ms) and is
-joined, so a close during a pending paste returns promptly.
+joined, so a close during a pending paste returns promptly. (Since #79 the
+close returns at once and the application's reaper joins the writer in the
+background; see ADR 0018.)
 `tessera_session_write` still writes directly and blocking, bypassing
 the outbox. Both it and the writer thread feed the PTY in 64 KiB chunks,
 so its bytes may overtake or interleave with pending keys and pastes (a

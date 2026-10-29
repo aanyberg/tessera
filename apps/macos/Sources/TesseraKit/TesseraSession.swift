@@ -65,9 +65,11 @@ public final class TesseraSession: Sendable, Identifiable {
         try TesseraCoreError.check(tessera_session_clear_scrollback(core.pointer, id))
     }
 
-    /// Hangs up the child (killing it if it does not exit within a second) and
-    /// forgets the session. No delegate call for it follows, not even the exit.
-    /// Takes at most about two seconds.
+    /// Hangs up the child and forgets the session, returning at once. No
+    /// delegate call for it follows, not even the exit, however late the child
+    /// exits. The core reaps the child in the background, killing it if it
+    /// does not exit within a second of the close; ``TesseraApp/shutdown()``
+    /// waits for closes still in progress.
     ///
     /// - Throws: ``TesseraCoreError/sessionNotFound`` if it was already closed.
     @MainActor

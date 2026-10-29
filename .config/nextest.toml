@@ -28,3 +28,13 @@ test-group = 'timing'
 [[profile.default.overrides]]
 filter = 'package(tessera-pty) & binary(close)'
 test-group = 'timing'
+
+# Non-blocking close (#79): 5 ms bounds on close_session and 500 ms on the
+# background reap.
+[[profile.default.overrides]]
+filter = 'package(tessera-app-core) & kind(lib) & (test(close_returns_at_once_) | test(closing_twenty_) | test(close_during_an_output_flood_is_prompt_and_silent) | test(close_with_input_pending_to_a_shell_that_ignores_sighup) | test(a_closed_session_that_exits_later_reports_nothing) | test(dropping_the_app_finishes_earlier_closes_within_the_same_cap) | test(a_panicking_start_hook_does_not_strand_closing_children))'
+test-group = 'timing'
+
+[[profile.default.overrides]]
+filter = 'package(tessera-ffi) & binary(lifecycle) & test(close_returns_at_once_and_free_waits_for_the_closing_children)'
+test-group = 'timing'

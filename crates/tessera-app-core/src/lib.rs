@@ -20,9 +20,11 @@
 //! [`App`] is `Send + Sync` and every method takes `&self`, so a frontend may
 //! call it from any thread. Each session runs one reader thread, on which
 //! the observer is called, and one writer thread that feeds queued
-//! frontend input to the child. Dropping the `App` closes every session
-//! and joins both threads (see the [`session`] module for the close
-//! sequence). The view methods create, configure and present Metal
+//! frontend input to the child. Closing a session returns at once; the
+//! `App`'s reaper thread, started by the first close, waits for the child
+//! and joins the session's threads. Dropping the `App` closes every
+//! session and waits for the reaper (see the [`session`] module for the
+//! close sequence). The view methods create, configure and present Metal
 //! surfaces and must be called on the main thread (ADR 0014).
 
 #![forbid(unsafe_code)]
@@ -37,7 +39,6 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
-use std::time::Instant;
 
 use tessera_pty::{NativePty, Pty, PtyEvents};
 use tessera_render::{FontConfig, Fonts, Gpu, Theme};
@@ -51,7 +52,7 @@ pub use tessera_config::{Config, ConfigPaths};
 pub use tessera_pty::{ExitStatus, Program, PtyError, PtySize, SpawnOptions};
 
 use input::{Bindings, FocusEvent, MouseEvent};
-use session::{ObserverSlot, Session, lock};
+use session::{ObserverSlot, Reaper, Session, lock};
 use view::{CellMetrics, FrameStatus, PhysicalSize, RenderError, View, ViewSize, wgpu};
 
 /// Application version reported to frontends and the control API.
@@ -124,6 +125,8 @@ pub struct App {
     /// [`App::attach_view`]), so a view attached during a re-theme never
     /// keeps the old colours.
     theme: Mutex<Theme>,
+    /// Finishes closing the sessions [`App::close_session`] hands it.
+    reaper: Reaper,
 }
 
 impl App {
@@ -150,6 +153,7 @@ impl App {
             gpu: Mutex::new(None),
             fonts: Mutex::new(None),
             theme,
+            reaper: Reaper::new(),
         }
     }
 
@@ -213,8 +217,15 @@ impl App {
         events: PtyEvents,
         size: PtySize,
     ) -> Result<SessionId> {
-        let session = Session::start(id, pty, events, size, Arc::clone(&self.observers))
-            .map_err(|source| Error::ReaderThread { id, source })?;
+        let session = Session::start(
+            id,
+            pty,
+            events,
+            size,
+            Arc::clone(&self.observers),
+            self.reaper.signal(),
+        )
+        .map_err(|source| Error::ReaderThread { id, source })?;
         lock(&self.sessions).insert(id, Arc::new(session));
         Ok(id)
     }
@@ -230,11 +241,21 @@ impl App {
             .ok_or(Error::SessionNotFound(id))
     }
 
-    /// Closes session `id`: no further event of it reaches the observer,
-    /// its child is hung up (and killed if it lingers) and its reader
-    /// thread is joined. Takes at most about
-    /// [`HANGUP_GRACE`](session::HANGUP_GRACE) +
-    /// [`KILL_GRACE`](session::KILL_GRACE).
+    /// Closes session `id` and returns without waiting for its child.
+    ///
+    /// Once this returns the id is forgotten (every call with it fails with
+    /// [`Error::SessionNotFound`]), its view is detached, its pending input
+    /// is dropped and no event of it reaches the observer, not even the
+    /// child's exit. The child has been hung up (`SIGHUP`); the `App`'s
+    /// reaper thread kills it if it is still running
+    /// [`HANGUP_GRACE`](session::HANGUP_GRACE) later and joins the
+    /// session's threads in the background. The only wait is for an
+    /// observer call of the session already in progress. May be called from
+    /// inside an observer call for the same session; any other call into
+    /// the `App` from an observer can deadlock. The view is released on the
+    /// calling thread, and a view must be released on the main thread
+    /// (ADR 0014), so a close from an observer call must come after
+    /// [`App::detach_view`] on the main thread.
     ///
     /// # Errors
     ///
@@ -247,42 +268,30 @@ impl App {
         // child is hung up.
         let view = lock(&self.views).remove(&id);
         drop(view);
-        self.close_all_of(&[session]);
+        let session = vec![session];
+        Self::begin_closing(&session);
+        self.reaper.reap(session);
         Ok(())
     }
 
-    /// Closes `sessions` against shared deadlines: all are hung up, then all
-    /// lingering children are killed at once after one
-    /// [`HANGUP_GRACE`](session::HANGUP_GRACE), and readers still running
-    /// one [`KILL_GRACE`](session::KILL_GRACE) later are detached. Closing
-    /// any number of sessions therefore takes at most about the sum of the
-    /// two grace periods.
-    fn close_all_of(&self, sessions: &[Arc<Session>]) {
+    /// Mutes and hangs up `sessions`, then waits for their observer calls
+    /// in progress. The caller hands them to the reaper, which shares the
+    /// grace periods between sessions handed over together.
+    fn begin_closing(sessions: &[Arc<Session>]) {
         for session in sessions {
             session.begin_close();
         }
-        // Barrier: taking the write lock waits out any observer call that
-        // started before the sessions were muted.
-        drop(
-            self.observers
-                .write()
-                .unwrap_or_else(PoisonError::into_inner),
-        );
-        let hangup_deadline = Instant::now() + session::HANGUP_GRACE;
-        let lingering: Vec<_> = sessions
-            .iter()
-            .filter(|session| !session.wait_until(hangup_deadline))
-            .collect();
-        for session in &lingering {
-            session.kill();
-        }
-        let kill_deadline = Instant::now() + session::KILL_GRACE;
-        for session in &lingering {
-            session.wait_until(kill_deadline);
-        }
         for session in sessions {
-            session.join_or_detach();
+            session.wait_for_delivery();
         }
+    }
+
+    /// Sessions closed but not yet reaped: their threads are neither
+    /// joined nor detached. For tests of the background close.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn closing_sessions(&self) -> usize {
+        self.reaper.closing()
     }
 
     /// Ids of the live sessions, in spawn order.
@@ -807,8 +816,11 @@ impl App {
 }
 
 impl Drop for App {
-    /// Detaches every view, then closes every session and joins its
-    /// threads.
+    /// Detaches every view, closes every session and waits for the reaper
+    /// to finish every close, including those [`App::close_session`]
+    /// started: at most about
+    /// [`HANGUP_GRACE`](session::HANGUP_GRACE) +
+    /// [`KILL_GRACE`](session::KILL_GRACE) however many sessions there are.
     fn drop(&mut self) {
         let views: Vec<_> = lock(&self.views).drain().collect();
         drop(views);
@@ -816,7 +828,11 @@ impl Drop for App {
             .drain()
             .map(|(_, session)| session)
             .collect();
-        self.close_all_of(&sessions);
+        Self::begin_closing(&sessions);
+        // Queued without starting the reaper thread: if no close started
+        // it, the shutdown runs the closes on this thread instead.
+        self.reaper.queue(sessions);
+        self.reaper.shut_down();
         // A detached reader still holds the observer slot; empty it so the
         // observer is dropped here rather than later on that thread.
         self.set_observer(None);
@@ -1107,17 +1123,349 @@ mod tests {
         ));
     }
 
+    /// How long `close_session` may take for a child that ignores
+    /// `SIGHUP` (issue #79).
+    const CLOSE_RETURNS_WITHIN: Duration = Duration::from_millis(5);
+
+    /// Slack on top of the grace periods for the reaper to finish a close.
+    /// Generous because the reaper may be scheduled late on a loaded
+    /// machine: under `taskpolicy -b` (background quality of service) fake closes finished
+    /// 1.21-1.25 s after a 1 s grace.
+    const REAP_SLACK: Duration = Duration::from_millis(500);
+
+    /// Waits until the reaper has finished every close; returns how long
+    /// that took from `since`.
+    fn wait_reaped(app: &App, since: Instant) -> Duration {
+        let deadline = Instant::now() + session::HANGUP_GRACE + session::KILL_GRACE + TIMEOUT;
+        while app.closing_sessions() > 0 {
+            assert!(Instant::now() < deadline, "closes never finished");
+            thread::sleep(Duration::from_millis(1));
+        }
+        since.elapsed()
+    }
+
     #[test]
-    fn close_kills_a_child_that_ignores_hangup() {
+    fn close_returns_at_once_and_kills_a_child_that_ignores_hangup() {
         let app = app();
         let (id, fake) = attach_fake(&app, true);
         let started = Instant::now();
         app.close_session(id).unwrap();
-        let elapsed = started.elapsed();
+        let took = started.elapsed();
+        assert!(took < CLOSE_RETURNS_WITHIN, "close took {took:?}");
         assert_eq!(fake.hangups.load(Ordering::SeqCst), 1);
+        // Closed: the id is gone at once, the child is not killed yet.
+        assert_eq!(app.session_ids(), Vec::<SessionId>::new());
+        assert!(matches!(
+            app.write(id, b"x"),
+            Err(Error::SessionNotFound(_))
+        ));
+        assert!(matches!(
+            app.resize(id, PtySize::new(30, 100)),
+            Err(Error::SessionNotFound(_))
+        ));
+        assert!(matches!(
+            app.close_session(id),
+            Err(Error::SessionNotFound(_))
+        ));
+        assert!(lock(&fake.events).is_some(), "killed before the grace");
+        assert_eq!(app.closing_sessions(), 1);
+        let reaped = wait_reaped(&app, started);
         assert!(lock(&fake.events).is_none(), "kill should end the fake");
-        assert!(elapsed >= session::HANGUP_GRACE, "closed after {elapsed:?}");
-        assert!(elapsed < session::HANGUP_GRACE + TIMEOUT);
+        assert!(reaped >= session::HANGUP_GRACE, "reaped after {reaped:?}");
+        assert!(
+            reaped < session::HANGUP_GRACE + REAP_SLACK,
+            "reaped after {reaped:?}"
+        );
+    }
+
+    /// Closes `ids` one after another, as Close Window closes its tabs, and
+    /// checks that no close waited for its child.
+    ///
+    /// Issue #79's bar is 5 ms for 20 closes, 0.25 ms each. The median close
+    /// is held to that: a loaded scheduler preempts a few closes, not most of
+    /// them. The whole loop is held to a quarter of `HANGUP_GRACE`, which a
+    /// single close waiting for a grace period would exceed, but a few
+    /// preemptions do not (20 closes took 15 ms at load 10 and 51 ms at
+    /// background priority with three test processes, against 0.2-0.5 ms
+    /// idle).
+    fn close_in_a_loop(app: &App, ids: &[SessionId]) {
+        let started = Instant::now();
+        let mut each: Vec<Duration> = ids
+            .iter()
+            .map(|&id| {
+                let close = Instant::now();
+                app.close_session(id).unwrap();
+                close.elapsed()
+            })
+            .collect();
+        let took = started.elapsed();
+        each.sort_unstable();
+        let median = each[each.len() / 2];
+        let per_close = CLOSE_RETURNS_WITHIN / 20;
+        assert!(median < per_close, "median close took {median:?}");
+        assert!(
+            took < session::HANGUP_GRACE / 4,
+            "{} closes took {took:?}",
+            ids.len()
+        );
+    }
+
+    #[test]
+    fn closing_twenty_stubborn_sessions_in_a_loop_returns_at_once() {
+        let app = app();
+        let sessions: Vec<_> = (0..20).map(|_| attach_fake(&app, true)).collect();
+        let started = Instant::now();
+        let ids: Vec<_> = sessions.iter().map(|&(id, _)| id).collect();
+        close_in_a_loop(&app, &ids);
+        assert_eq!(app.session_ids(), Vec::<SessionId>::new());
+        assert_eq!(app.closing_sessions(), 20);
+        let reaped = wait_reaped(&app, started);
+        assert!(reaped >= session::HANGUP_GRACE, "reaped after {reaped:?}");
+        // One shared grace, not twenty in a row.
+        assert!(
+            reaped < session::HANGUP_GRACE + REAP_SLACK,
+            "reaped after {reaped:?}"
+        );
+        for (_, fake) in &sessions {
+            assert!(lock(&fake.events).is_none(), "every child should be killed");
+        }
+    }
+
+    #[test]
+    fn a_closed_session_that_exits_later_reports_nothing() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, true);
+        fake.send(PtyEvent::Output(b"before".to_vec()));
+        assert_eq!(next(&events), (id, SessionEvent::Output));
+        app.close_session(id).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        // Output, a bell, a title and the exit, all after the close: the
+        // reader still applies them, but none reaches the observer.
+        fake.send(PtyEvent::Output(b"after\x07\x1b]0;title\x07".to_vec()));
+        fake.exit(ExitStatus::Exited(0));
+        let reaped = wait_reaped(&app, Instant::now());
+        assert!(reaped < REAP_SLACK, "reaped {reaped:?} after the exit");
+        assert_eq!(
+            events.recv_timeout(Duration::from_millis(100)),
+            Err(RecvTimeoutError::Timeout)
+        );
+    }
+
+    #[test]
+    fn a_session_can_close_itself_from_its_observer() {
+        let app = Arc::new(app());
+        let (tx, events) = mpsc::channel();
+        let weak = Arc::downgrade(&app);
+        app.set_observer(Some(Box::new(move |id, event| {
+            if event == SessionEvent::Bell
+                && let Some(app) = weak.upgrade()
+            {
+                let _ = tx.send((id, Some(app.close_session(id).is_ok())));
+            } else {
+                let _ = tx.send((id, None));
+            }
+        })));
+        let (id, fake) = attach_fake(&app, true);
+        let (other, other_fake) = attach_fake(&app, false);
+        fake.send(PtyEvent::Output(b"\x07".to_vec()));
+        assert_eq!(events.recv_timeout(TIMEOUT).unwrap(), (id, None));
+        // Closing from inside the bell's own call neither deadlocks nor
+        // fails, and nothing of the session follows it.
+        assert_eq!(events.recv_timeout(TIMEOUT).unwrap(), (id, Some(true)));
+        fake.send(PtyEvent::Output(b"more".to_vec()));
+        other_fake.send(PtyEvent::Output(b"x".to_vec()));
+        assert_eq!(events.recv_timeout(TIMEOUT).unwrap(), (other, None));
+        assert_eq!(app.session_ids(), vec![other]);
+        assert_eq!(
+            events.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout)
+        );
+        app.set_observer(None);
+    }
+
+    #[test]
+    fn close_waits_for_an_observer_call_in_progress() {
+        let app = app();
+        let (entered_tx, entered) = mpsc::channel();
+        let (release_tx, release) = mpsc::channel::<()>();
+        let release = Mutex::new(release);
+        let returned = Arc::new(AtomicBool::new(false));
+        let returned_in_observer = Arc::clone(&returned);
+        app.set_observer(Some(Box::new(move |_, _| {
+            let _ = entered_tx.send(());
+            let _ = lock(&release).recv_timeout(TIMEOUT);
+            returned_in_observer.store(true, Ordering::SeqCst);
+        })));
+        let (id, fake) = attach_fake(&app, false);
+        fake.send(PtyEvent::Output(b"x".to_vec()));
+        entered.recv_timeout(TIMEOUT).unwrap();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(50));
+                release_tx.send(()).unwrap();
+            });
+            app.close_session(id).unwrap();
+            // The call that was running when the close began has returned.
+            assert!(returned.load(Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn a_close_while_the_reader_is_about_to_deliver_silences_it() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, true);
+        // Stop the reader between taking the observer slot and the delivery
+        // lock, once: a close there must still silence the event.
+        let (paused_tx, paused) = mpsc::channel();
+        let (go_tx, go) = mpsc::channel::<()>();
+        let go = Mutex::new(go);
+        let fired = AtomicBool::new(false);
+        // Held until the pause is removed, so its key stays unique.
+        let session = app.session(id).unwrap();
+        session::set_delivery_pause(Some((
+            session.delivery_key(),
+            Arc::new(move || {
+                if !fired.swap(true, Ordering::SeqCst) {
+                    let _ = paused_tx.send(());
+                    let _ = lock(&go).recv_timeout(TIMEOUT);
+                }
+            }),
+        )));
+        fake.send(PtyEvent::Output(b"x".to_vec()));
+        paused.recv_timeout(TIMEOUT).expect("reader never paused");
+        let started = Instant::now();
+        app.close_session(id).unwrap();
+        // The paused reader holds no delivery lock, so the close is prompt.
+        assert!(started.elapsed() < TIMEOUT, "close waited for the reader");
+        go_tx.send(()).unwrap();
+        session::set_delivery_pause(None);
+        drop(session);
+        assert_eq!(
+            events.recv_timeout(Duration::from_millis(100)),
+            Err(RecvTimeoutError::Timeout)
+        );
+    }
+
+    #[test]
+    fn dropping_the_app_finishes_earlier_closes_within_the_same_cap() {
+        let app = app();
+        let fakes: Vec<_> = (0..4).map(|_| attach_fake(&app, true)).collect();
+        let started = Instant::now();
+        app.close_session(fakes[0].0).unwrap();
+        app.close_session(fakes[1].0).unwrap();
+        drop(app);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= session::HANGUP_GRACE,
+            "dropped after {elapsed:?}"
+        );
+        assert!(
+            elapsed < session::HANGUP_GRACE + Duration::from_millis(500),
+            "dropped after {elapsed:?}"
+        );
+        for (_, fake) in &fakes {
+            assert!(lock(&fake.events).is_none(), "every child should be killed");
+        }
+    }
+
+    /// Names of the threads that ran the start hook.
+    static HOOKED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// Makes the next reaper thread's start hook panic, once.
+    static PANIC_IN_NEXT_REAPER: AtomicBool = AtomicBool::new(false);
+
+    /// The tests' start hook: records the thread's name and panics in a
+    /// reaper when asked to. Harmless to every other test in the process
+    /// (under `cargo test`): it only records, and a panic it raises is
+    /// caught.
+    fn test_start_hook() {
+        let name = thread::current().name().unwrap_or("?").to_owned();
+        let reaper = name == "tessera-reaper";
+        lock(&HOOKED).push(name);
+        assert!(
+            !(reaper && PANIC_IN_NEXT_REAPER.swap(false, Ordering::SeqCst)),
+            "deliberate start hook panic"
+        );
+    }
+
+    /// Installs [`test_start_hook`] for the process, once.
+    fn install_test_start_hook() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| assert!(session::set_thread_start_hook(test_start_hook)));
+    }
+
+    #[test]
+    fn a_panicking_start_hook_does_not_strand_closing_children() {
+        install_test_start_hook();
+        PANIC_IN_NEXT_REAPER.store(true, Ordering::SeqCst);
+        let app = app();
+        let (id, fake) = attach_fake(&app, true);
+        let started = Instant::now();
+        app.close_session(id).unwrap();
+        // The reaper's hook panicked, yet it kills and reaps the child.
+        let reaped = wait_reaped(&app, started);
+        assert!(lock(&fake.events).is_none(), "kill should end the fake");
+        assert!(
+            reaped < session::HANGUP_GRACE + REAP_SLACK,
+            "reaped after {reaped:?}"
+        );
+        // Under nextest this process ran no other reaper, so the panic was
+        // this one's.
+        assert!(!PANIC_IN_NEXT_REAPER.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn every_core_thread_runs_the_start_hook() {
+        install_test_start_hook();
+        assert!(
+            !session::set_thread_start_hook(|| {}),
+            "only the first hook is kept"
+        );
+        let app = app();
+        let (id, _fake) = attach_fake(&app, false);
+        app.close_session(id).unwrap();
+        wait_reaped(&app, Instant::now());
+        let hooked = lock(&HOOKED).clone();
+        for name in [
+            format!("tessera-session-{id}"),
+            format!("tessera-input-{id}"),
+            "tessera-reaper".to_owned(),
+        ] {
+            assert!(hooked.contains(&name), "{name} missing from {hooked:?}");
+        }
+    }
+
+    #[test]
+    fn close_racing_resize_and_input_from_another_thread() {
+        let app = Arc::new(app());
+        for _ in 0..50 {
+            let (id, fake) = attach_fake(&app, false);
+            let racer = {
+                let app = Arc::clone(&app);
+                thread::spawn(move || {
+                    let key = InputEvent::Key(KeyEvent::new(Key::Char('k'), Modifiers::NONE));
+                    loop {
+                        let resized = app.resize(id, PtySize::new(30, 100));
+                        let typed = app.send_input(id, key.clone());
+                        match (resized, typed) {
+                            (Err(Error::SessionNotFound(_)), _) => return,
+                            (
+                                Ok(()),
+                                Ok(_) | Err(Error::Write { .. } | Error::SessionNotFound(_)),
+                            ) => {}
+                            other => panic!("unexpected {other:?}"),
+                        }
+                    }
+                })
+            };
+            thread::sleep(Duration::from_micros(200));
+            app.close_session(id).unwrap();
+            racer.join().unwrap();
+            drop(fake);
+        }
+        wait_reaped(&app, Instant::now());
     }
 
     const fn assert_send_sync<T: Send + Sync>() {}
@@ -1337,6 +1685,182 @@ mod tests {
         }
         drop(app);
         assert!(started.elapsed() < TIMEOUT, "took {:?}", started.elapsed());
+    }
+
+    /// Which of `pids` still exist, zombies included (so a pid that is
+    /// missing was reaped), from one `ps` run.
+    fn existing(pids: &[u32]) -> Vec<u32> {
+        let list = pids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let output = std::process::Command::new("/bin/ps")
+            .args(["-o", "pid=", "-p", &list])
+            .output()
+            .expect("run ps");
+        let mut found: Vec<u32> = String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .map(|pid| pid.parse().expect("ps prints pids"))
+            .collect();
+        found.sort_unstable();
+        found
+    }
+
+    /// Asserts that every one of `pids` has been reaped (`waitpid`).
+    fn assert_gone(pids: &[u32]) {
+        assert_eq!(existing(pids), Vec::<u32>::new(), "children not reaped");
+    }
+
+    /// Spawns `sh -c script` and waits until its screen shows `ready`;
+    /// returns the session and the child's pid.
+    fn spawn_ready(app: &App, script: &str) -> (SessionId, u32) {
+        let id = app.spawn_session(sh(script)).unwrap();
+        let deadline = Instant::now() + TIMEOUT;
+        while !app
+            .with_terminal(id, |term| {
+                let grid = term.grid();
+                (0..grid.rows())
+                    .filter_map(|row| grid.line(row))
+                    .any(|line| line.text().contains("ready"))
+            })
+            .unwrap()
+        {
+            assert!(Instant::now() < deadline, "{script:?} never got ready");
+            thread::sleep(Duration::from_millis(2));
+        }
+        let pid = app.session(id).unwrap().child_pid().expect("child pid");
+        (id, pid)
+    }
+
+    /// A shell that ignores `SIGHUP` and never exits on its own.
+    const STUBBORN: &str = "trap '' HUP; echo ready; exec sleep 100";
+
+    #[test]
+    fn close_returns_at_once_for_a_shell_that_ignores_sighup() {
+        let app = app();
+        let (id, pid) = spawn_ready(&app, STUBBORN);
+        let started = Instant::now();
+        app.close_session(id).unwrap();
+        let took = started.elapsed();
+        assert!(took < CLOSE_RETURNS_WITHIN, "close took {took:?}");
+        assert_eq!(app.session_ids(), Vec::<SessionId>::new());
+        assert_eq!(existing(&[pid]), vec![pid], "killed before the grace");
+        // The session's reader ends only after the child's exit, which the
+        // PTY reports after `waitpid`; `ps` then confirms the reap.
+        let reaped = wait_reaped(&app, started);
+        assert_gone(&[pid]);
+        assert!(reaped >= session::HANGUP_GRACE, "reaped after {reaped:?}");
+        let bound = session::HANGUP_GRACE + session::KILL_GRACE + REAP_SLACK;
+        assert!(reaped < bound, "reaped after {reaped:?}");
+    }
+
+    #[test]
+    fn closing_twenty_shells_that_ignore_sighup_returns_at_once() {
+        let app = app();
+        let sessions: Vec<_> = (0..20).map(|_| spawn_ready(&app, STUBBORN)).collect();
+        let started = Instant::now();
+        let ids: Vec<_> = sessions.iter().map(|&(id, _)| id).collect();
+        close_in_a_loop(&app, &ids);
+        let pids: Vec<_> = sessions.iter().map(|&(_, pid)| pid).collect();
+        let reaped = wait_reaped(&app, started);
+        assert_gone(&pids);
+        assert!(reaped >= session::HANGUP_GRACE, "reaped after {reaped:?}");
+        let bound = session::HANGUP_GRACE + session::KILL_GRACE + REAP_SLACK;
+        assert!(reaped < bound, "reaped after {reaped:?}");
+    }
+
+    #[test]
+    fn a_closed_shell_that_exits_later_reports_nothing() {
+        let app = app();
+        // When each observer call ran.
+        let stamps = Arc::new(Mutex::new(Vec::new()));
+        {
+            let stamps = Arc::clone(&stamps);
+            app.set_observer(Some(Box::new(move |_, _| {
+                lock(&stamps).push(Instant::now());
+            })));
+        }
+        let (id, pid) = spawn_ready(
+            &app,
+            "trap '' HUP; echo ready; sleep 0.3; printf '\\a'; exit 0",
+        );
+        app.close_session(id).unwrap();
+        let closed = Instant::now();
+        let reaped = wait_reaped(&app, closed);
+        assert_gone(&[pid]);
+        // It exited on its own, before the kill.
+        assert!(reaped < session::HANGUP_GRACE, "reaped after {reaped:?}");
+        let stamps = lock(&stamps);
+        assert!(!stamps.is_empty(), "the ready output was observed");
+        let late = stamps.iter().filter(|&&at| at >= closed).count();
+        assert_eq!(late, 0, "observer calls after close returned");
+    }
+
+    #[test]
+    fn close_during_an_output_flood_is_prompt_and_silent() {
+        let app = app();
+        let after_close = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicBool::new(false));
+        let (tx, events) = mpsc::channel();
+        {
+            let after_close = Arc::clone(&after_close);
+            let closed = Arc::clone(&closed);
+            app.set_observer(Some(Box::new(move |id, event| {
+                if closed.load(Ordering::SeqCst) {
+                    after_close.fetch_add(1, Ordering::SeqCst);
+                }
+                let _ = tx.send((id, event));
+            })));
+        }
+        // No `ready` marker: the flood would scroll it away before it is
+        // seen. The trap runs before `yes` starts, so flood output proves it
+        // is installed.
+        let id = app
+            .spawn_session(sh("trap '' HUP; exec yes flood"))
+            .unwrap();
+        let pid = app.session(id).unwrap().child_pid().expect("child pid");
+        // Let the flood run: many outputs, the reader busy under the lock.
+        let flooding = Instant::now();
+        let mut outputs = 0;
+        while outputs < 200 && flooding.elapsed() < TIMEOUT {
+            if let Ok((_, SessionEvent::Output)) = events.recv_timeout(TIMEOUT) {
+                outputs += 1;
+            }
+        }
+        assert_eq!(outputs, 200, "no flood");
+        let started = Instant::now();
+        app.close_session(id).unwrap();
+        closed.store(true, Ordering::SeqCst);
+        let took = started.elapsed();
+        assert!(took < CLOSE_RETURNS_WITHIN, "close took {took:?}");
+        let reaped = wait_reaped(&app, started);
+        assert_gone(&[pid]);
+        assert!(
+            reaped < session::HANGUP_GRACE + session::KILL_GRACE + REAP_SLACK,
+            "reaped after {reaped:?}"
+        );
+        assert_eq!(after_close.load(Ordering::SeqCst), 0, "events after close");
+    }
+
+    #[test]
+    fn close_with_input_pending_to_a_shell_that_ignores_sighup() {
+        let app = app();
+        let (id, pid) = spawn_ready(&app, STUBBORN);
+        // `sleep` never reads: the paste fills the terminal's input buffer
+        // and the PTY writer blocks in write(2) (ADR 0011).
+        let paste = "p".repeat(4 * 1024 * 1024);
+        let outcome = app.send_input(id, InputEvent::Paste(paste)).unwrap();
+        assert_eq!(outcome, InputOutcome::Consumed);
+        thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        app.close_session(id).unwrap();
+        let took = started.elapsed();
+        assert!(took < CLOSE_RETURNS_WITHIN, "close took {took:?}");
+        let reaped = wait_reaped(&app, started);
+        assert_gone(&[pid]);
+        let bound = session::HANGUP_GRACE + session::KILL_GRACE + REAP_SLACK;
+        assert!(reaped < bound, "reaped after {reaped:?}");
     }
 
     /// Waits until exactly `expected` has reached the fake PTY.

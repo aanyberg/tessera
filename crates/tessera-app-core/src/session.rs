@@ -21,22 +21,33 @@
 //!
 //! # Closing
 //!
-//! Closing a session *mutes* it (no observer call for it starts after that
-//! point) and hangs up the child (`SIGHUP`), then waits for an observer call
-//! already in progress to return, waits up to [`HANGUP_GRACE`] for the child
-//! to exit, escalates to `SIGKILL` and waits up to [`KILL_GRACE`] more, and
-//! finally joins the reader thread. A child that survives even `SIGKILL`'s
-//! grace period (on Linux a grandchild can hold the terminal open) is
-//! detached rather than allowed to hang the caller; being muted, it can no
-//! longer reach the observer. Muting also closes the outbox: input still
-//! pending is dropped, and the writer thread stops within one write backoff
-//! period and is joined.
+//! A session is live until the application closes it, then *closing*
+//! until the application's reaper has reaped it (ADR 0018). Closing never waits for
+//! the child. [`App::close_session`](crate::App::close_session) *mutes* the
+//! session (no observer call for it starts after that point), closes its
+//! outbox (input still pending is dropped), hangs up the child (`SIGHUP`),
+//! waits for an observer call of the session already in progress to return
+//! and hands the session to the application's reaper thread. That thread
+//! waits up to [`HANGUP_GRACE`] for the child to exit, escalates to
+//! `SIGKILL` and waits up to [`KILL_GRACE`] more, then joins the session's
+//! reader and writer threads. A child that survives even `SIGKILL`'s grace
+//! period (on Linux a grandchild can hold the terminal open) has its
+//! threads detached rather than joined; being muted, they can no longer
+//! reach the observer. Dropping the `App` closes the remaining sessions the
+//! same way and waits for the reaper to finish, which takes at most about
+//! `HANGUP_GRACE + KILL_GRACE` however many sessions are closing.
 //!
 //! # Locks
 //!
-//! A session has six locks: the PTY, the terminal, the outbox, the reader
-//! and writer handles and the input state (focus, scrollback view, last
-//! mouse position). No code path holds two of them at once: input handling reads what it needs from
+//! A session has seven locks: the PTY, the terminal, the outbox, the reader
+//! and writer handles, the input state (focus, scrollback view, last
+//! mouse position) and the delivery lock its reader thread holds around an
+//! observer call (the barrier a close waits on). No code path holds two of
+//! them at once, with one exception: a close made from inside one of the
+//! session's own observer calls holds that call's delivery lock while it
+//! takes the outbox and PTY locks (`Session::begin_close`). Nothing takes
+//! the delivery lock while holding another session lock, so this cannot
+//! form a cycle. Input handling reads what it needs from
 //! the terminal (grid size, scrollback length) under the terminal lock,
 //! releases it, then takes the input lock. A value read that way can be
 //! stale by the time it is used (the reader thread may have added a
@@ -52,9 +63,9 @@ use std::fmt;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, TryLockError};
-use std::thread::{self, JoinHandle};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, TryLockError};
+use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
 use tessera_pty::{ExitStatus, Pty, PtyError, PtyEvent, PtyEvents, PtySize};
@@ -67,8 +78,8 @@ use crate::view::{MAX_VIEW_COLS, MAX_VIEW_ROWS};
 /// is sent `SIGKILL`.
 pub const HANGUP_GRACE: Duration = Duration::from_secs(1);
 
-/// How long a closing session waits after `SIGKILL` before it detaches the
-/// reader thread instead of joining it.
+/// How long a closing session waits after `SIGKILL` before its reader and
+/// writer threads are detached instead of joined.
 pub const KILL_GRACE: Duration = Duration::from_secs(1);
 
 /// Largest piece of input offered to the PTY's write queue at once. Smaller
@@ -141,7 +152,8 @@ pub enum SessionEvent {
 /// call back into the `App` or wait for the thread that does: closing a
 /// session, replacing the observer and dropping the `App` wait for a call in
 /// progress to return, so doing any of them from (or while blocking) an
-/// observer call deadlocks.
+/// observer call can deadlock. The one exception is closing the session
+/// the call is for, which does not wait for the call it is made from.
 ///
 /// Any `Fn(SessionId, SessionEvent) + Send + Sync` closure is an observer.
 pub trait SessionObserver: Send + Sync {
@@ -169,6 +181,147 @@ pub(crate) type ObserverSlot = Arc<RwLock<Option<Box<dyn SessionObserver>>>>;
 /// at the FFI boundary must leave the application usable.
 pub(crate) fn lock<T: ?Sized>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The hook [`set_thread_start_hook`] installed, if any.
+static THREAD_START_HOOK: OnceLock<fn()> = OnceLock::new();
+
+/// Installs `hook`, which every thread this crate starts (each session's
+/// reader and input writer, and the application's reaper) runs first.
+///
+/// For thread attributes this crate cannot set itself: it forbids
+/// `unsafe`, so `tessera-ffi` installs a hook that gives these threads a
+/// quality-of-service class on macOS (ADR 0018). Process-wide; only the
+/// first hook is kept, and threads already running are not affected.
+/// Returns whether `hook` was installed.
+pub fn set_thread_start_hook(hook: fn()) -> bool {
+    THREAD_START_HOOK.set(hook).is_ok()
+}
+
+/// Runs the hook [`set_thread_start_hook`] installed, if any. A panicking
+/// hook is logged and the thread carries on: a reaper that died here would
+/// leave every closing child unkilled.
+fn run_thread_start_hook() {
+    if let Some(hook) = THREAD_START_HOOK.get()
+        && panic::catch_unwind(*hook).is_err()
+    {
+        tracing::error!("thread start hook panicked");
+    }
+}
+
+/// An event count the reaper sleeps on: bumped when a session thread ends,
+/// when sessions are handed over for reaping and when the application
+/// shuts down.
+#[derive(Debug, Default)]
+pub(crate) struct Signal {
+    epoch: Mutex<u64>,
+    changed: Condvar,
+}
+
+impl Signal {
+    /// The current count. Read it before checking what a wake-up could
+    /// change, then pass it to [`Signal::wait`], and no wake-up is lost.
+    fn epoch(&self) -> u64 {
+        *lock(&self.epoch)
+    }
+
+    /// Wakes every thread in [`Signal::wait`].
+    fn notify(&self) {
+        let mut epoch = lock(&self.epoch);
+        *epoch = epoch.wrapping_add(1);
+        self.changed.notify_all();
+    }
+
+    /// Waits until the count is no longer `seen`, or until `deadline` if
+    /// there is one.
+    fn wait(&self, seen: u64, deadline: Option<Instant>) {
+        let mut epoch = lock(&self.epoch);
+        while *epoch == seen {
+            match deadline {
+                None => {
+                    epoch = self
+                        .changed
+                        .wait(epoch)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return;
+                    }
+                    epoch = self
+                        .changed
+                        .wait_timeout(epoch, left)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0;
+                }
+            }
+        }
+    }
+}
+
+/// Dropped as the last thing a session thread does: disconnects
+/// [`Worker::done`], then wakes the reaper.
+struct Finished {
+    done: Option<Sender<()>>,
+    signal: Arc<Signal>,
+}
+
+impl Drop for Finished {
+    fn drop(&mut self) {
+        // Disconnect first, so a reaper woken by the notification sees the
+        // thread as ended.
+        drop(self.done.take());
+        self.signal.notify();
+    }
+}
+
+/// A session thread (reader or input writer).
+struct Worker {
+    handle: JoinHandle<()>,
+    /// Never receives a value; disconnects once the thread's body has
+    /// returned (or unwound), so checking it never blocks.
+    done: Receiver<()>,
+}
+
+impl Worker {
+    /// Starts `body` on a thread named `name` that runs the thread start
+    /// hook first and wakes `signal` when it ends.
+    fn spawn(
+        name: String,
+        signal: &Arc<Signal>,
+        body: impl FnOnce() + Send + 'static,
+    ) -> io::Result<Self> {
+        let (done_tx, done) = mpsc::channel();
+        let finished = Finished {
+            done: Some(done_tx),
+            signal: Arc::clone(signal),
+        };
+        let handle = thread::Builder::new().name(name).spawn(move || {
+            let _finished = finished;
+            run_thread_start_hook();
+            body();
+        })?;
+        Ok(Self { handle, done })
+    }
+
+    /// Whether the thread's body has returned. Never blocks.
+    fn has_ended(&self) -> bool {
+        matches!(self.done.try_recv(), Err(TryRecvError::Disconnected))
+    }
+
+    /// Joins the thread if it has ended (which then takes no time), or
+    /// detaches it; returns whether it was joined. `what` names it in the
+    /// log.
+    fn join_or_detach(self, id: SessionId, what: &str) -> bool {
+        if !self.has_ended() {
+            return false;
+        }
+        if self.handle.join().is_err() {
+            tracing::warn!(session = %id, "session {what} thread panicked");
+        }
+        true
+    }
 }
 
 /// A session's terminal, shared by the reader thread and the frontend's
@@ -245,9 +398,19 @@ pub(crate) struct Session {
     /// Set when the application starts closing the session; the reader
     /// thread stops delivering events and pending writes give up.
     muted: Arc<AtomicBool>,
-    reader: Mutex<Option<Reader>>,
+    /// Held by the reader thread around each observer call (and the
+    /// `muted` check before it), so taking it after muting is a barrier:
+    /// once it is acquired no observer call for this session is running
+    /// and none can start.
+    delivering: Arc<Mutex<()>>,
+    /// The reader thread's id, so a close made from inside one of this
+    /// session's observer calls does not wait for that call.
+    reader_thread: ThreadId,
+    /// Taken by the reaper when it joins or detaches the thread.
+    reader: Mutex<Option<Worker>>,
     outbox: Arc<Outbox>,
-    writer: Mutex<Option<JoinHandle<()>>>,
+    /// Taken by the reaper when it joins or detaches the thread.
+    writer: Mutex<Option<Worker>>,
     input: Mutex<InputState>,
 }
 
@@ -399,23 +562,16 @@ struct InputState {
     last_mouse: Option<MouseEvent>,
 }
 
-/// The reader thread of a session.
-struct Reader {
-    handle: JoinHandle<()>,
-    /// Never receives a value; disconnects when the reader thread ends,
-    /// which makes it a join with a timeout.
-    done: Receiver<()>,
-}
-
 impl Session {
     /// Wraps a spawned PTY and starts the writer thread for its input and
-    /// the reader thread for its events.
+    /// the reader thread for its events. Both wake `signal` when they end.
     pub(crate) fn start(
         id: SessionId,
         pty: Box<dyn Pty>,
         events: PtyEvents,
         size: PtySize,
         observers: ObserverSlot,
+        signal: &Arc<Signal>,
     ) -> io::Result<Self> {
         let pty = Arc::new(Mutex::new(pty));
         let term = Arc::new(SharedTerminal::new(Terminal::new(size.rows, size.cols)));
@@ -426,22 +582,19 @@ impl Session {
             muted: Arc::clone(&muted),
             outbox: Arc::clone(&outbox),
         };
-        let writer = thread::Builder::new()
-            .name(format!("tessera-input-{id}"))
-            .spawn(move || writer.run())?;
-        let (done_tx, done) = mpsc::channel();
+        let writer = Worker::spawn(format!("tessera-input-{id}"), signal, move || writer.run())?;
+        let delivering = Arc::new(Mutex::new(()));
         let pump = Pump {
             id,
             term: Arc::clone(&term),
             muted: Arc::clone(&muted),
+            delivering: Arc::clone(&delivering),
             observers,
-            _done: done_tx,
         };
-        let handle = match thread::Builder::new()
-            .name(format!("tessera-session-{id}"))
-            .spawn(move || pump.run(&events))
-        {
-            Ok(handle) => handle,
+        let reader = match Worker::spawn(format!("tessera-session-{id}"), signal, move || {
+            pump.run(&events);
+        }) {
+            Ok(reader) => reader,
             Err(err) => {
                 // The writer is idle; closing the outbox ends it, and the
                 // PTY (hung up when dropped) goes with it.
@@ -454,7 +607,9 @@ impl Session {
             pty,
             term,
             muted,
-            reader: Mutex::new(Some(Reader { handle, done })),
+            delivering,
+            reader_thread: reader.handle.thread().id(),
+            reader: Mutex::new(Some(reader)),
             outbox,
             writer: Mutex::new(Some(writer)),
             input: Mutex::new(InputState::default()),
@@ -599,11 +754,12 @@ impl Session {
         lock(&self.input).last_mouse
     }
 
-    /// First half of a close: stops event delivery and hangs up the child.
+    /// First step of a close: stops event delivery, drops pending input
+    /// and hangs up the child. Never waits for the child.
     ///
-    /// The caller must take the observer slot's write lock after muting
-    /// every session it closes and before waiting on any of them, so no
-    /// observer call for a muted session is still running.
+    /// The caller must then call [`Session::wait_for_delivery`] before it
+    /// reports the session closed, so no observer call for it is still
+    /// running.
     pub(crate) fn begin_close(&self) {
         self.muted.store(true, Ordering::Release);
         self.outbox.close();
@@ -612,13 +768,25 @@ impl Session {
         }
     }
 
-    /// Waits until `deadline` for the reader thread to end, which happens
-    /// once the child has exited and its terminal is closed. Returns whether
-    /// it ended. Returns `true` at once if the reader was already collected.
-    pub(crate) fn wait_until(&self, deadline: Instant) -> bool {
-        lock(&self.reader)
-            .as_ref()
-            .is_none_or(|reader| reader.wait_until(deadline))
+    /// Second step of a close: waits for an observer call of this session
+    /// that started before [`Session::begin_close`] muted it. Observer
+    /// calls are short (they must return quickly), so this is the only wait
+    /// in a close. Returns at once when called from inside one of this
+    /// session's observer calls, which is the call it would wait for.
+    pub(crate) fn wait_for_delivery(&self) {
+        if thread::current().id() != self.reader_thread {
+            drop(lock(&self.delivering));
+        }
+    }
+
+    /// Whether the reader and writer threads have both ended (or were
+    /// already joined or detached). The reader ends once the child has
+    /// exited and been reaped and its terminal is closed; the writer, once
+    /// the session is muted, within one write backoff period. Never blocks.
+    pub(crate) fn threads_ended(&self) -> bool {
+        let ended =
+            |worker: &Mutex<Option<Worker>>| lock(worker).as_ref().is_none_or(Worker::has_ended);
+        ended(&self.writer) && ended(&self.reader)
     }
 
     /// Sends `SIGKILL` to a child that outlived its hangup grace period.
@@ -629,31 +797,38 @@ impl Session {
         }
     }
 
-    /// Last step of a close: joins the reader thread if it has ended, or
-    /// detaches it if the terminal is still held open (it is muted, so it
-    /// can no longer reach the observer).
+    /// Last step of a close, run by the reaper: joins the reader and
+    /// writer threads that have ended and detaches those still running
+    /// (the terminal is still held open after `SIGKILL`; being muted, they
+    /// can no longer reach the observer). Never blocks.
     pub(crate) fn join_or_detach(&self) {
-        // Muted and with its outbox closed, the writer ends within one
-        // backoff period.
-        let writer = lock(&self.writer).take();
-        if let Some(writer) = writer
-            && writer.join().is_err()
+        if let Some(writer) = lock(&self.writer).take()
+            && !writer.join_or_detach(self.id, "writer")
         {
-            tracing::warn!(session = %self.id, "session writer thread panicked");
+            tracing::warn!(session = %self.id, "session writer still running after SIGKILL; detaching it");
         }
-        let Some(reader) = lock(&self.reader).take() else {
-            return;
-        };
-        if !reader.wait_until(Instant::now()) {
+        if let Some(reader) = lock(&self.reader).take()
+            && !reader.join_or_detach(self.id, "reader")
+        {
             tracing::warn!(
                 session = %self.id,
                 "terminal still held open after SIGKILL; detaching reader thread"
             );
-            return;
         }
-        if reader.handle.join().is_err() {
-            tracing::warn!(session = %self.id, "session reader thread panicked");
-        }
+    }
+
+    /// Identifies this session among the sessions of every `App` in the
+    /// process while it lives (the address of its delivery lock), for
+    /// [`set_delivery_pause`].
+    #[cfg(test)]
+    pub(crate) fn delivery_key(&self) -> usize {
+        Arc::as_ptr(&self.delivering).addr()
+    }
+
+    /// The child's process id, if the PTY knows it.
+    #[cfg(test)]
+    pub(crate) fn child_pid(&self) -> Option<u32> {
+        lock(&self.pty).child_pid()
     }
 }
 
@@ -665,15 +840,200 @@ impl Drop for Session {
     }
 }
 
-impl Reader {
-    /// Waits until `deadline` for the reader thread to end.
-    fn wait_until(&self, deadline: Instant) -> bool {
-        match self
-            .done
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+/// The application's reaper: one thread that finishes closing every
+/// session the application closes (ADR 0018).
+///
+/// A closed session is handed over muted and hung up. The reaper waits for
+/// its threads to end, sends `SIGKILL` to a child still running
+/// [`HANGUP_GRACE`] after the session was handed over, and joins its
+/// threads, or detaches them once [`KILL_GRACE`] has passed after the kill.
+/// Each session keeps its own deadlines, so sessions closed together share
+/// their grace periods. The thread is started by the first close and lives
+/// until [`Reaper::shut_down`]; it sleeps on [`Signal`] between deadlines
+/// and is woken by every session thread that ends.
+#[derive(Debug)]
+pub(crate) struct Reaper {
+    shared: Arc<ReaperShared>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+#[derive(Debug, Default)]
+struct ReaperShared {
+    signal: Arc<Signal>,
+    queue: Mutex<ReapQueue>,
+    /// Sessions handed over and not yet joined or detached.
+    closing: AtomicUsize,
+}
+
+#[derive(Debug, Default)]
+struct ReapQueue {
+    /// Handed over since the reaper last looked.
+    incoming: Vec<Closing>,
+    /// Set by [`Reaper::shut_down`]: finish what is queued, then stop.
+    shut_down: bool,
+}
+
+/// A session being reaped, with its deadlines.
+#[derive(Debug)]
+struct Closing {
+    session: Arc<Session>,
+    /// When the child is sent `SIGKILL` if it is still running.
+    kill_at: Instant,
+    /// When its threads are detached, set once the child was killed.
+    detach_at: Option<Instant>,
+}
+
+impl Closing {
+    /// Moves the close on as far as `now` allows; returns whether it is
+    /// finished (the threads were joined or detached).
+    fn step(&mut self, now: Instant) -> bool {
+        let finished = match self.detach_at {
+            _ if self.session.threads_ended() => true,
+            None if now >= self.kill_at => {
+                self.session.kill();
+                self.detach_at = Some(now + KILL_GRACE);
+                false
+            }
+            Some(detach_at) => now >= detach_at,
+            None => false,
+        };
+        if finished {
+            self.session.join_or_detach();
+        }
+        finished
+    }
+
+    /// [`Closing::step`], except that a panic finishes the close the hard
+    /// way: the child is sent `SIGKILL` and the threads are joined if they
+    /// have ended, else detached. Keeping the close would retry a step that
+    /// may panic again, at a deadline already past.
+    fn step_or_abandon(&mut self, now: Instant) -> bool {
+        if let Ok(finished) = panic::catch_unwind(AssertUnwindSafe(|| self.step(now))) {
+            return finished;
+        }
+        tracing::error!(session = %self.session.id, "reaping the session panicked; killing it");
+        let session = &self.session;
+        let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+            session.kill();
+            session.join_or_detach();
+        }));
+        true
+    }
+
+    /// When [`Closing::step`] next has something to do without being woken.
+    fn deadline(&self) -> Instant {
+        self.detach_at.unwrap_or(self.kill_at)
+    }
+}
+
+impl Reaper {
+    /// A reaper with no thread yet.
+    pub(crate) fn new() -> Self {
+        Self {
+            shared: Arc::default(),
+            thread: Mutex::new(None),
+        }
+    }
+
+    /// What session threads wake when they end; pass it to
+    /// [`Session::start`].
+    pub(crate) fn signal(&self) -> &Arc<Signal> {
+        &self.shared.signal
+    }
+
+    /// Hands over `sessions`, each already through [`Session::begin_close`]
+    /// and [`Session::wait_for_delivery`], and returns without waiting.
+    /// Starts the reaper thread if it is not running; if it cannot be
+    /// started the sessions stay queued (muted and hung up) until the next
+    /// call starts it or [`Reaper::shut_down`] reaps them.
+    pub(crate) fn reap(&self, sessions: Vec<Arc<Session>>) {
+        self.queue(sessions);
+        let mut thread = lock(&self.thread);
+        if thread.is_none() {
+            let shared = Arc::clone(&self.shared);
+            match thread::Builder::new()
+                .name("tessera-reaper".into())
+                .spawn(move || {
+                    run_thread_start_hook();
+                    shared.run();
+                }) {
+                Ok(handle) => *thread = Some(handle),
+                Err(err) => {
+                    tracing::error!(%err, "cannot start the session reaper; retrying on the next close");
+                }
+            }
+        }
+    }
+
+    /// Queues `sessions` like [`Reaper::reap`] without starting the
+    /// thread, for a [`Reaper::shut_down`] that follows at once.
+    pub(crate) fn queue(&self, sessions: Vec<Arc<Session>>) {
+        let kill_at = Instant::now() + HANGUP_GRACE;
+        self.shared
+            .closing
+            .fetch_add(sessions.len(), Ordering::Release);
+        lock(&self.shared.queue)
+            .incoming
+            .extend(sessions.into_iter().map(|session| Closing {
+                session,
+                kill_at,
+                detach_at: None,
+            }));
+        self.shared.signal.notify();
+    }
+
+    /// Sessions handed over and not yet joined or detached.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn closing(&self) -> usize {
+        self.shared.closing.load(Ordering::Acquire)
+    }
+
+    /// Finishes every queued close and stops the reaper thread, waiting for
+    /// both: at most about [`HANGUP_GRACE`] + [`KILL_GRACE`] after the last
+    /// hand-over. When no close started the thread (or it could not be
+    /// started), or it died, the closes still queued run on the calling
+    /// thread.
+    pub(crate) fn shut_down(&self) {
+        lock(&self.shared.queue).shut_down = true;
+        self.shared.signal.notify();
+        let thread = lock(&self.thread).take();
+        if let Some(thread) = thread
+            && thread.join().is_ok()
         {
-            Ok(()) | Err(RecvTimeoutError::Disconnected) => true,
-            Err(RecvTimeoutError::Timeout) => false,
+            return;
+        }
+        // Either there was no thread or it panicked outside a step (which
+        // `step_or_abandon` catches); what it had not taken is still queued.
+        self.shared.run();
+    }
+}
+
+impl ReaperShared {
+    /// The reaper's loop: returns once shut down with nothing left to do.
+    fn run(&self) {
+        let mut closing: Vec<Closing> = Vec::new();
+        loop {
+            let seen = self.signal.epoch();
+            let shut_down = {
+                let mut queue = lock(&self.queue);
+                closing.append(&mut queue.incoming);
+                queue.shut_down
+            };
+            let now = Instant::now();
+            closing.retain_mut(|close| {
+                let finished = close.step_or_abandon(now);
+                if finished {
+                    // Release: what the close did (the kill, the joins)
+                    // is visible to whoever sees the count drop.
+                    self.closing.fetch_sub(1, Ordering::Release);
+                }
+                !finished
+            });
+            if closing.is_empty() && shut_down {
+                return;
+            }
+            self.signal
+                .wait(seen, closing.iter().map(Closing::deadline).min());
         }
     }
 }
@@ -766,9 +1126,9 @@ struct Pump {
     id: SessionId,
     term: Arc<SharedTerminal>,
     muted: Arc<AtomicBool>,
+    /// See [`Session::delivering`].
+    delivering: Arc<Mutex<()>>,
     observers: ObserverSlot,
-    /// Dropped when the thread ends; see [`Reader::done`].
-    _done: Sender<()>,
 }
 
 impl Pump {
@@ -819,8 +1179,13 @@ impl Pump {
             .observers
             .read()
             .unwrap_or_else(PoisonError::into_inner);
-        // Checked under the read lock: a closer mutes, then takes the write
-        // lock, so once it holds that lock this check can no longer pass.
+        // Checked under the delivery lock: a closer mutes, then takes that
+        // lock, so once it has held it this check can no longer pass. Taken
+        // after the read lock, so a closer never waits for this thread while
+        // it queues for the read lock behind `set_observer`.
+        #[cfg(test)]
+        pause_before_delivery(Arc::as_ptr(&self.delivering).addr());
+        let _delivering = lock(&self.delivering);
         if self.muted.load(Ordering::Acquire) {
             return;
         }
@@ -836,9 +1201,42 @@ impl Pump {
     }
 }
 
+/// A pause for tests: the reader thread of the session it names runs it in
+/// `Pump::deliver` just before it takes the delivery lock, which is where a
+/// `muted` check outside the lock would race with a close.
+///
+/// The session is named by [`Session::delivery_key`], not its id: every
+/// `App` numbers its sessions from 1, and tests run many `App`s in one
+/// process (`cargo test`).
+#[cfg(test)]
+type DeliveryPause = (usize, Arc<dyn Fn() + Send + Sync>);
+
+#[cfg(test)]
+static DELIVERY_PAUSE: Mutex<Option<DeliveryPause>> = Mutex::new(None);
+
+/// Installs (or with `None` removes) the pause `Pump::deliver` runs before
+/// the delivery lock of the session whose [`Session::delivery_key`] it
+/// names. The caller keeps that session alive while the pause is set, so
+/// the key cannot be reused.
+#[cfg(test)]
+pub(crate) fn set_delivery_pause(pause: Option<DeliveryPause>) {
+    *lock(&DELIVERY_PAUSE) = pause;
+}
+
+#[cfg(test)]
+fn pause_before_delivery(key: usize) {
+    let pause = lock(&DELIVERY_PAUSE)
+        .as_ref()
+        .filter(|(target, _)| *target == key)
+        .map(|(_, pause)| Arc::clone(pause));
+    if let Some(pause) = pause {
+        pause();
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc::SyncSender;
+    use std::sync::mpsc::{RecvTimeoutError, SyncSender};
 
     use tessera_pty::PtyEvent;
 
