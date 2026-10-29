@@ -1614,6 +1614,240 @@ impl Grid {
         self.reset_scroll_region();
         self.scrolled_since_clear = false;
     }
+
+    // ------------------------------------------------------------ invariants
+
+    /// Panics, listing every violation, unless the grid's structural
+    /// invariants hold. For fuzzers and tests (`fuzz/` targets call it after
+    /// every chunk of input); no primitive needs it.
+    ///
+    /// Checked: at least one row and column; the active screen, the stashed
+    /// primary screen (while the alternate one is active) and every
+    /// scrollback line have `rows` lines of `cols` cells; the cursor is on
+    /// the screen and a pending wrap sits on the last column, for the live
+    /// cursor, the stashed primary one and the active screen's DECSC slot
+    /// (and the stashed primary's); a [`CellFlags::WIDE`] cell is followed
+    /// by its [`CellFlags::SPACER`] in the same row with the same style and
+    /// a spacer is a bare `' '` after a wide cell; [`CellFlags::CLUSTER`]
+    /// cells and the line's grapheme table agree, with 2 to 32 scalars
+    /// starting with the cell's character; [`CellFlags::PAD`] is only a
+    /// bare last-column blank; the scroll region satisfies
+    /// `top <= bottom < rows` and has at least two rows unless it is the
+    /// full screen (DECSTBM), which is also what origin mode counts from;
+    /// the scrollback is within its cap; the tab stops cover `cols`.
+    ///
+    /// Not checked: the alternate screen's DECSC slot while the primary
+    /// screen is active, which [`Grid::resize`] leaves alone and
+    /// [`Grid::enter_alt_screen`] clamps; damage bookkeeping; whether
+    /// graphemes are segmented as `unicode-segmentation` would.
+    ///
+    /// Costs O(total cells): fine for a fuzzer, not for a hot path.
+    ///
+    /// # Panics
+    ///
+    /// When any invariant is broken, with every violation in the message.
+    #[doc(hidden)]
+    pub fn check_invariants(&self) {
+        let errors = self.invariant_violations();
+        assert!(
+            errors.is_empty(),
+            "grid invariants broken ({}x{}, alt screen: {}): {}",
+            self.rows,
+            self.cols,
+            self.is_alt_screen(),
+            errors.join("; ")
+        );
+    }
+
+    /// Every violation [`Grid::check_invariants`] reports.
+    fn invariant_violations(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.rows == 0 || self.cols == 0 {
+            errors.push(format!("empty grid {}x{}", self.rows, self.cols));
+            return errors;
+        }
+        let (rows, cols) = (self.rows, self.cols);
+        screen_errors("screen", &self.lines, rows, cols, &mut errors);
+        cursor_errors(
+            "cursor",
+            self.cursor,
+            self.pending_wrap,
+            rows,
+            cols,
+            &mut errors,
+        );
+        let saved = self.saved;
+        cursor_errors(
+            "saved cursor",
+            saved.cursor,
+            saved.pending_wrap,
+            rows,
+            cols,
+            &mut errors,
+        );
+        if self.tabs.cols() != cols {
+            errors.push(format!("tab stops cover {} columns", self.tabs.cols()));
+        }
+        if let Some(primary) = self.primary.as_deref() {
+            screen_errors("primary", &primary.lines, rows, cols, &mut errors);
+            cursor_errors(
+                "primary cursor",
+                primary.cursor,
+                primary.pending_wrap,
+                rows,
+                cols,
+                &mut errors,
+            );
+            let saved = primary.saved;
+            cursor_errors(
+                "primary saved cursor",
+                saved.cursor,
+                saved.pending_wrap,
+                rows,
+                cols,
+                &mut errors,
+            );
+            if primary.tabs.cols() != cols {
+                errors.push(format!(
+                    "primary tab stops cover {} columns",
+                    primary.tabs.cols()
+                ));
+            }
+        }
+        let ScrollRegion { top, bottom } = self.region;
+        let full = top == 0 && bottom == rows - 1;
+        if top > bottom || bottom >= rows || (top == bottom && !full) {
+            errors.push(format!("scroll region {top}..={bottom} with {rows} rows"));
+        }
+        if self.scrollback.len() > self.scrollback.cap() {
+            errors.push(format!(
+                "scrollback {} over its cap {}",
+                self.scrollback.len(),
+                self.scrollback.cap()
+            ));
+        }
+        for (i, line) in self.scrollback.iter().enumerate() {
+            line_errors(LineAt::Scrollback(i), line, cols, &mut errors);
+        }
+        errors
+    }
+}
+
+/// Where a line sits, for [`Grid::check_invariants`] messages. Formatted
+/// only when a violation is reported, so a clean check allocates nothing
+/// per line.
+#[derive(Clone, Copy)]
+enum LineAt<'a> {
+    /// Row `.1` of the screen named `.0`.
+    Row(&'a str, usize),
+    /// Scrollback line `.0`, oldest first.
+    Scrollback(usize),
+}
+
+impl std::fmt::Display for LineAt<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Row(screen, row) => write!(f, "{screen} row {row}"),
+            Self::Scrollback(i) => write!(f, "scrollback {i}"),
+        }
+    }
+}
+
+/// [`Grid::check_invariants`] for one screen's lines.
+fn screen_errors(at: &str, lines: &[Line], rows: u16, cols: u16, errors: &mut Vec<String>) {
+    if lines.len() != usize::from(rows) {
+        errors.push(format!("{at}: {} lines, {rows} rows", lines.len()));
+    }
+    for (row, line) in lines.iter().enumerate() {
+        line_errors(LineAt::Row(at, row), line, cols, errors);
+    }
+}
+
+/// [`Grid::check_invariants`] for a cursor position and its pending wrap.
+fn cursor_errors(
+    at: &str,
+    cursor: Point,
+    pending_wrap: bool,
+    rows: u16,
+    cols: u16,
+    errors: &mut Vec<String>,
+) {
+    if cursor.row >= rows || cursor.col >= cols {
+        errors.push(format!("{at} {cursor:?} off a {rows}x{cols} screen"));
+    } else if pending_wrap && cursor.col != cols - 1 {
+        errors.push(format!(
+            "{at}: pending wrap off the last column at {cursor:?}"
+        ));
+    }
+}
+
+/// [`Grid::check_invariants`] for one line: its width and the wide, spacer,
+/// cluster and padding cells.
+fn line_errors(at: LineAt<'_>, line: &Line, cols: u16, errors: &mut Vec<String>) {
+    let cells = &line.cells;
+    if cells.len() != usize::from(cols) {
+        errors.push(format!("{at}: {} cells, {cols} columns", cells.len()));
+    }
+    for (col, cell) in cells.iter().enumerate() {
+        // Most cells have no flags: nothing below applies to them (a WIDE
+        // cell checks the cell after it, the grapheme table is checked
+        // from its own side), and skipping them keeps a full check of a
+        // long history cheap enough for a fuzzer.
+        if cell.flags == CellFlags::default() {
+            continue;
+        }
+        if cell.is_wide() {
+            match cells.get(col + 1) {
+                Some(next) if next.is_spacer() => {
+                    if next.style != cell.style {
+                        errors.push(format!("{at} col {col}: spacer style differs"));
+                    }
+                }
+                _ => errors.push(format!("{at} col {col}: WIDE without a spacer")),
+            }
+        }
+        if cell.is_spacer() {
+            if col == 0 || !cells[col - 1].is_wide() {
+                errors.push(format!("{at} col {col}: SPACER without a wide cell"));
+            }
+            if cell.ch != ' ' || cell.is_wide() || cell.is_cluster() {
+                errors.push(format!("{at} col {col}: SPACER is not a bare ' '"));
+            }
+        }
+        if cell.is_pad()
+            && (col + 1 != cells.len() || cell.ch != ' ' || cell.flags != CellFlags::PAD)
+        {
+            errors.push(format!(
+                "{at} col {col}: PAD that is not a bare last-column blank"
+            ));
+        }
+        if !cell.is_cluster() {
+            continue;
+        }
+        match line.cluster(col) {
+            None => errors.push(format!("{at} col {col}: CLUSTER without text")),
+            Some(text) => {
+                let scalars = text.chars().count();
+                if !(2..=MAX_CLUSTER_SCALARS).contains(&scalars) {
+                    errors.push(format!("{at} col {col}: cluster of {scalars} scalars"));
+                }
+                if !text.starts_with(cell.ch) || cell.ch == ' ' {
+                    errors.push(format!(
+                        "{at} col {col}: cluster base is not the cell's char"
+                    ));
+                }
+            }
+        }
+    }
+    for (col, _) in line.graphemes.iter() {
+        match cells.get(col) {
+            Some(cell) if !cell.is_cluster() => {
+                errors.push(format!("{at} col {col}: text without CLUSTER"));
+            }
+            Some(_) => {}
+            None => errors.push(format!("{at}: cluster at column {col} past the end")),
+        }
+    }
 }
 
 /// The damage tracker's generation right after the last [`Grid::reset`]:
@@ -2858,5 +3092,182 @@ mod tests {
         assert!(region.contains(4));
         assert!(!region.contains(1));
         assert!(!region.contains(5));
+    }
+
+    /// `check_invariants` accepts what the primitives build, on both
+    /// screens and after a resize (#14).
+    #[test]
+    fn check_invariants_accepts_a_used_grid() {
+        let mut grid = Grid::with_scrollback(3, 4, 2);
+        grid.check_invariants();
+        grid.put_str("ab中e\u{301}fghijklmn");
+        grid.save_cursor();
+        grid.set_scroll_region(1, 2);
+        grid.check_invariants();
+        grid.enter_alt_screen();
+        grid.put_str("中中x");
+        grid.resize(2, 3);
+        grid.check_invariants();
+        grid.leave_alt_screen();
+        grid.resize(1, 1);
+        grid.check_invariants();
+    }
+
+    /// The violations `check_invariants` reports after `corrupt` breaks a
+    /// fresh 3x4 grid holding `a中` and a cluster `e\u{301}` on row 0.
+    fn violations_after(corrupt: impl FnOnce(&mut Grid)) -> String {
+        let mut grid = Grid::with_scrollback(3, 4, 5);
+        grid.put_str("a中e\u{301}");
+        grid.goto(1, 0);
+        assert_eq!(grid.invariant_violations(), Vec::<String>::new());
+        corrupt(&mut grid);
+        grid.invariant_violations().join("; ")
+    }
+
+    /// Breaks one invariant of a grid.
+    type Corrupt = fn(&mut Grid);
+
+    /// One case per rule of `check_invariants`: the message it reports and
+    /// the corruption that breaks the rule.
+    const BROKEN_RULES: &[(&str, Corrupt)] = &[
+        ("empty grid 3x0", |g| g.cols = 0),
+        ("screen: 2 lines, 3 rows", |g| {
+            g.lines.pop();
+        }),
+        ("screen row 2: 3 cells, 4 columns", |g| {
+            g.lines[2].cells.pop();
+        }),
+        ("cursor Point { row: 3, col: 0 } off a 3x4 screen", |g| {
+            g.cursor = Point::new(3, 0);
+        }),
+        ("cursor Point { row: 1, col: 4 } off a 3x4 screen", |g| {
+            g.cursor = Point::new(1, 4);
+        }),
+        ("cursor: pending wrap off the last column", |g| {
+            g.pending_wrap = true;
+        }),
+        ("saved cursor Point { row: 0, col: 9 } off", |g| {
+            g.saved.cursor = Point::new(0, 9);
+        }),
+        ("saved cursor: pending wrap off the last column", |g| {
+            g.saved.pending_wrap = true;
+        }),
+        ("tab stops cover 2 columns", |g| g.tabs = TabStops::new(2)),
+        ("screen row 0 col 1: WIDE without a spacer", |g| {
+            g.lines[0].cells[2] = Cell::BLANK;
+        }),
+        ("screen row 0 col 1: spacer style differs", |g| {
+            g.lines[0].cells[2].style = Style::DEFAULT.with(Style::BOLD);
+        }),
+        ("screen row 1 col 1: SPACER without a wide cell", |g| {
+            g.lines[1].cells[1] = Cell::spacer(Style::DEFAULT);
+        }),
+        ("screen row 0 col 2: SPACER is not a bare ' '", |g| {
+            g.lines[0].cells[2].ch = 'x';
+        }),
+        (
+            "screen row 1 col 0: PAD that is not a bare last-column blank",
+            |g| {
+                g.lines[1].cells[0] = Cell::pad_with(Style::DEFAULT);
+            },
+        ),
+        (
+            "screen row 1 col 3: PAD that is not a bare last-column blank",
+            |g| {
+                g.lines[1].cells[3] = Cell::pad_with(Style::DEFAULT);
+                g.lines[1].cells[3].ch = 'x';
+            },
+        ),
+        ("screen row 0 col 0: CLUSTER without text", |g| {
+            g.lines[0].cells[0].flags |= CellFlags::CLUSTER;
+        }),
+        ("screen row 0 col 0: text without CLUSTER", |g| {
+            g.lines[0].graphemes.set(0, "a\u{301}".into());
+        }),
+        ("screen row 0 col 3: cluster of 1 scalars", |g| {
+            g.lines[0].graphemes.set(3, "e".into());
+        }),
+        ("screen row 0 col 3: cluster of 33 scalars", |g| {
+            let text: String = std::iter::once('e')
+                .chain(std::iter::repeat_n('\u{301}', 32))
+                .collect();
+            g.lines[0].graphemes.set(3, text.into());
+        }),
+        (
+            "screen row 0 col 3: cluster base is not the cell's char",
+            |g| {
+                g.lines[0].cells[3].ch = 'o';
+            },
+        ),
+        ("screen row 0: cluster at column 4 past the end", |g| {
+            g.lines[0].graphemes.set(4, "e\u{301}".into());
+        }),
+        ("scroll region 1..=1 with 3 rows", |g| {
+            g.region = ScrollRegion { top: 1, bottom: 1 };
+        }),
+        ("scroll region 2..=1 with 3 rows", |g| {
+            g.region = ScrollRegion { top: 2, bottom: 1 };
+        }),
+        ("scroll region 0..=3 with 3 rows", |g| {
+            g.region = ScrollRegion { top: 0, bottom: 3 };
+        }),
+        ("scrollback 0: 3 cells, 4 columns", |g| {
+            g.lines[0].cells.pop();
+            g.goto(2, 0);
+            g.line_feed();
+        }),
+        ("primary: 2 lines, 3 rows", |g| {
+            g.enter_alt_screen();
+            g.primary.as_mut().unwrap().lines.pop();
+        }),
+        ("primary row 0 col 1: WIDE without a spacer", |g| {
+            g.lines[0].cells[2] = Cell::BLANK;
+            g.enter_alt_screen();
+        }),
+        ("primary cursor Point { row: 7, col: 0 } off", |g| {
+            g.enter_alt_screen();
+            g.primary.as_mut().unwrap().cursor = Point::new(7, 0);
+        }),
+        ("primary cursor: pending wrap off the last column", |g| {
+            g.enter_alt_screen();
+            g.primary.as_mut().unwrap().pending_wrap = true;
+        }),
+        ("primary saved cursor Point { row: 0, col: 8 } off", |g| {
+            g.enter_alt_screen();
+            g.primary.as_mut().unwrap().saved.cursor = Point::new(0, 8);
+        }),
+        (
+            "primary saved cursor: pending wrap off the last column",
+            |g| {
+                g.enter_alt_screen();
+                g.primary.as_mut().unwrap().saved.pending_wrap = true;
+            },
+        ),
+        ("primary tab stops cover 9 columns", |g| {
+            g.enter_alt_screen();
+            g.primary.as_mut().unwrap().tabs = TabStops::new(9);
+        }),
+    ];
+
+    /// Every rule `check_invariants` documents is checked: corrupting one
+    /// field at a time reports exactly that rule (#14). Only "scrollback
+    /// over its cap" has no case: `Scrollback` never exceeds its cap and
+    /// its fields are private to its module.
+    #[test]
+    fn check_invariants_reports_each_broken_rule() {
+        for (expected, corrupt) in BROKEN_RULES {
+            let found = violations_after(corrupt);
+            assert!(found.contains(expected), "{expected:?} not in {found:?}");
+        }
+        // The alternate slot is not checked while the primary screen is
+        // active: `enter_alt_screen` clamps it.
+        assert_eq!(
+            violations_after(|g| g.alt_saved.cursor = Point::new(9, 9)),
+            ""
+        );
+        let mut grid = Grid::new(2, 2);
+        grid.cursor = Point::new(5, 5);
+        let outcome = std::panic::catch_unwind(|| grid.check_invariants());
+        assert!(outcome.is_err(), "check_invariants panics on a violation");
     }
 }

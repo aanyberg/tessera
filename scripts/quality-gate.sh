@@ -38,6 +38,18 @@ step "tests";   cargo nextest run --workspace
 step "rustdoc"; RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps
 step "deny";    cargo deny check
 step "ffi release build"; cargo build --release -p tessera-ffi
+# fuzz/ is not a workspace member (#14). Its lock file is the workspace's, copied in before every build so the
+# fuzzers test the workspace's dependency versions (fuzz/Cargo.lock is ignored; cargo only adds libfuzzer-sys and its dependencies).
+# Format and stable clippy always run, so a rename breaks here before merge; the libFuzzer build needs a nightly
+# toolchain and cargo-fuzz, optional for contributors (the nightly fuzz workflow always builds it).
+cp Cargo.lock fuzz/Cargo.lock
+step "fuzz fmt";    cargo fmt --manifest-path fuzz/Cargo.toml --check
+step "fuzz clippy"; cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+if [[ "$(rustup toolchain list)" == (|*$'\n')nightly* ]] && cargo +nightly fuzz --version > /dev/null 2>&1; then
+    step "fuzz build"; cargo +nightly fuzz build
+else
+    print -P "%F{yellow}== fuzz build skipped: needs a nightly toolchain and cargo-fuzz (see docs/software-factory.md)%f"
+fi
 
 # Record the pass only when the tree and HEAD are still what the gate started on.
 if [[ -n "$stamp" && -z "$(git status --porcelain)" && "$(git rev-parse HEAD)" == "$head" ]]; then

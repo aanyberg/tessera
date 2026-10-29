@@ -1,0 +1,58 @@
+# libFuzzer targets for the parser and the terminal (#14). Not a workspace
+# member (the root `Cargo.toml` excludes it): it needs a nightly toolchain and
+# cargo-fuzz, so `cargo build --workspace`, clippy and nextest never see it.
+# Run with `just fuzz <target> <minutes>`; see docs/software-factory.md.
+# Cargo.lock is not committed: it is the workspace's, copied in before every
+# build. `cargo deny` does not check this crate; libfuzzer-sys is
+# `(MIT OR Apache-2.0) AND NCSA`, accepted for a tool that is never shipped.
+[package]
+name = "tessera-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tessera-vt = { path = "../crates/tessera-vt" }
+tessera-grid = { path = "../crates/tessera-grid" }
+tessera-term = { path = "../crates/tessera-term" }
+
+# cargo-fuzz builds in release mode; keep the crates' debug assertions (the
+# grid's reset and alternate-screen checks) and overflow checks on, so the
+# fuzzers find what the debug builds would.
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true
+
+[[bin]]
+name = "parser"
+path = "fuzz_targets/parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "terminal"
+path = "fuzz_targets/terminal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunking"
+path = "fuzz_targets/chunking.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "resize"
+path = "fuzz_targets/resize.rs"
+test = false
+doc = false
+bench = false

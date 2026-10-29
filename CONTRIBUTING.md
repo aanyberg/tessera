@@ -13,6 +13,8 @@
   rebase-merged instead so each task's commit reaches the release notes.
   See `docs/software-factory.md`.
 - Architecture changes get an ADR in `docs/adr/` in the same PR.
+- Changes to `tessera-vt`, `tessera-grid` or `tessera-term` can be fuzzed with `just fuzz <target>`
+  (four libFuzzer targets in `fuzz/`; setup under "Fuzzing" in `docs/software-factory.md`).
 
 ## Code
 
