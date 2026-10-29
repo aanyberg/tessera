@@ -62,10 +62,10 @@ generation the grid never handed out (another grid's, or `0`) answers
 from a process-wide counter, and `Grid::reset` keeps its tracker, so a
 reader that stays with one grid never mistakes a new screen for an
 unchanged one. The ranges are not unique forever: the counter wraps after
-2^24 trackers, and since every new grid, every clone and every RIS (which
-builds a fresh grid before keeping the old tracker) takes one, a flood of
-`ESC c` reaches the wrap in about 16 s; a tracker past 2^40 stamps also
-runs into the next range. A reader that moved between grids could then
+2^24 trackers, and every new grid and every clone takes one (RIS takes
+none since #107: it resets in place and keeps its tracker), so the wrap
+needs 2^24 grids or clones; a tracker past 2^40 stamps also runs into the
+next range. A reader that moved between grids could then
 take a stale generation for a recent one. None does today: a view reads
 one session's grid, and that grid lives as long as the session. A cloned grid
 starts a fresh range with everything damaged (the clone and the original
@@ -389,6 +389,55 @@ Still open:
   the coverage index to hidden Apple fonts instead of drawing tofu. The
   right answer is probably to draw them procedurally like box drawing
   (ADR 0007), which is a feature with its own design.
+
+### Amendment 2026-10-29: RIS resets in place from the damage record (#107)
+
+`Grid::reset` (RIS, `ESC c`) built a fresh grid and moved the scrollback
+and the tracker into it: one allocation per row, every cell written. A
+64 KiB read of 32768 `ESC c` on a 96x430 terminal held the terminal lock
+about 568 ms, so the UI thread's snapshot waited that long.
+
+`reset` now works in place and allocates nothing at an unchanged size.
+Rewriting every cell in place is not enough: it measured 650 ms for the
+same read, slower than the rebuild, because a 96x430 screen is 41 280
+cells of 20 bytes per reset. Instead the grid remembers the damage
+generation right after its last reset (`BlankedAt`, opaque in `Debug`
+like the tracker) and asks `DamageTracker::since` which rows changed
+after it. Only those rows are cleared; every other row is still the
+default blank that reset left, because no primitive changes a visible
+row without recording it (the no-false-negatives property this ADR
+already requires and `tests/damage.rs` checks). A reset in a row after
+another therefore costs O(rows) for the stamp scan plus the cursor's
+row, not O(rows x cols). The reset is the whole screen otherwise: when
+the alternate screen is active (its rows are not the ones reset blanked),
+after a clone (another tracker's range answers `All`), after a resize or
+anything else that records `All`, and when the generation has saturated
+at `u64::MAX`.
+
+Relying on damage for content, not just for redraws, makes a missing
+damage call a correctness bug in RIS as well as a stale frame. Two
+checks guard it: debug builds assert after every reset that every row is
+the initial blank (so every test that sends RIS checks the damage record
+of everything before it), and a property test compares the in-place
+reset with the old rebuild after random histories (alternate screen,
+regions, saved cursors, tab stops, marks, pens, caps, clones, taken
+damage, resets in a row). The result is otherwise unchanged: the same
+state as `Grid::with_scrollback` of the same size and cap with the old
+scrollback attached, its newest line ended, the tracker kept and the
+whole screen damaged.
+
+Measured with `cargo xtask ab bench` against the merge base (case
+`ris_flood`: 40 rounds of 200 output lines then one 32768-RIS read, on
+96x430 with a 10 000-line cap; instructions retired, best of 15 pairs):
+head/base 0.019 (291.0 G instructions on the merge base, 5.64 G on
+the branch; wall time 22.2 s against 0.34 s, 555 ms against 8.4 ms per
+32768-RIS read). The `#[ignore]`d test `ris_flood_on_a_large_terminal_is_fast`
+in `tessera-term` holds one such read under 60 ms in release (best of 5:
+8.4 ms).
+
+`Grid::clear_to_cursor` (⌘K, "Clear to Start" in Terminal.app, kitty's
+`clear_terminal to_cursor`) shares nothing with reset but its damage: it
+records `All`, since it moves every row up.
 
 ## Measurements
 

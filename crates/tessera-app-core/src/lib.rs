@@ -344,19 +344,26 @@ impl App {
         Ok(self.session(id)?.resize(size)?)
     }
 
-    /// Discards session `id`'s scrollback and returns its view to the live
-    /// screen.
+    /// Clears session `id` to its cursor line (⌘K, "Clear to Start" in
+    /// Terminal.app): discards the scrollback and, on the primary screen,
+    /// the rows above the cursor, so the prompt line becomes the top row
+    /// (see [`tessera_term::Terminal::clear_to_cursor`]). On the alternate
+    /// screen only the scrollback goes; the full-screen application's
+    /// screen is not touched. The view returns to the live screen.
+    ///
+    /// No [`SessionEvent::Output`] is sent: like [`App::resize`], this runs
+    /// on the caller's thread, which redraws when it is done. The next
+    /// frame copies the whole screen, since the clear damages all of it.
     ///
     /// # Errors
     ///
     /// [`Error::SessionNotFound`] if `id` is not a live session.
     pub fn clear_scrollback(&self, id: SessionId) -> Result<()> {
         let session = self.session(id)?;
-        // TODO(#2): call `Grid::clear_scrollback` through the terminal once
-        // `Terminal` gives mutable access to its grid.
-        // TODO(#2, #8): every path that shrinks the scrollback (this one,
-        // ED 3, a smaller `max_scrollback`, leaving the alternate screen)
-        // must reset or clamp the session's stored scroll offset, as here.
+        session.with_terminal_mut(Terminal::clear_to_cursor);
+        // TODO(#31): every path that shrinks the scrollback (ED 3, a
+        // smaller `max_scrollback`, leaving the alternate screen) must
+        // reset or clamp the session's stored scroll offset, as here.
         session.scroll_to_bottom();
         Ok(())
     }
@@ -2456,6 +2463,43 @@ mod tests {
         assert_eq!(scroll(&app, id, -0.5), InputOutcome::Ignored);
         assert_eq!(scroll(&app, id, -0.5), InputOutcome::Consumed);
         assert_eq!(app.scroll_offset(id).unwrap(), 3);
+    }
+
+    /// ⌘K (#107): the scrollback and the rows above the cursor go, the
+    /// cursor's line becomes the top row and the view returns to the live
+    /// screen, without an event and without writing to the child.
+    #[test]
+    fn clear_scrollback_clears_to_the_cursor_line() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        fill_scrollback(&fake, &events, 40);
+        fake.send(PtyEvent::Output(b"$ prompt".to_vec()));
+        assert_eq!(next(&events), (id, SessionEvent::Output));
+        assert_eq!(scroll(&app, id, 5.0), InputOutcome::Consumed);
+        app.clear_scrollback(id).unwrap();
+        let (scrollback, top, rest_blank, cursor_row) = app
+            .with_terminal(id, |term| {
+                let grid = term.grid();
+                let lines = grid.visible_lines();
+                (
+                    grid.scrollback_len(),
+                    lines[0].text(),
+                    lines[1..].iter().all(|line| line.text().is_empty()),
+                    grid.cursor().row,
+                )
+            })
+            .unwrap();
+        assert_eq!(scrollback, 0);
+        assert_eq!(top, "$ prompt");
+        assert!(rest_blank);
+        assert_eq!(cursor_row, 0);
+        assert_eq!(app.scroll_offset(id).unwrap(), 0);
+        assert_eq!(
+            events.recv_timeout(Duration::from_millis(50)),
+            Err(RecvTimeoutError::Timeout)
+        );
+        assert_nothing_written(&app, id, &fake);
     }
 
     #[test]
