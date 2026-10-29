@@ -101,6 +101,25 @@ Agents use these instead of rebuilding the setup in every run:
   derived from the branch (`crate:kind`, one per line) and exits without building; `just verify-branch-test`
   checks that derivation and the cap under bash and zsh. The script is zsh: always brace a name before a colon
   (`${name}:lib`), because zsh reads `$name:lib` as the `:l` modifier and `$name:tests` as `:t`.
+- **Fuzzing.** `fuzz/` holds four cargo-fuzz (libFuzzer) targets outside the workspace: `parser` (raw bytes
+  into `tessera_vt::Parser`; no panic, CSI sub-parameter masks and DCS framing consistent), `terminal` (raw bytes
+  into `Terminal::advance` at a size taken from the first two bytes; `Grid::check_invariants` after every chunk,
+  at most 64 full checks per input), `chunking` (whole versus chunked input through `Terminal` give the same
+  screen, cursor, modes and hidden state) and `resize` (`0xFE rows cols` in the input calls `Terminal::resize`,
+  invariants checked around it). They need a nightly toolchain and cargo-fuzz, installed once with
+  `rustup toolchain install nightly --profile minimal` and `cargo install cargo-fuzz --locked` (stable stays the
+  default). `just fuzz <target> <minutes>` runs one target (default `terminal`, 5 minutes) on its corpus in
+  `fuzz/corpus/<target>` plus the checked-in seeds in `fuzz/seeds/<target>`; a crash lands in
+  `fuzz/artifacts/<target>`, and `cargo +nightly fuzz tmin <target> <file>` minimises it. `fuzz/Cargo.lock` is
+  not committed: the gate, `just fuzz` and the workflow copy the workspace's `Cargo.lock` in before building, so
+  the fuzzers test the workspace's dependency versions. The gate format-checks and clippies `fuzz/` on stable and
+  builds the targets when nightly and cargo-fuzz are installed. `.github/workflows/fuzz.yml` runs each target for
+  5 minutes every night (03:00 UTC, or on demand with a length) on a pinned nightly (bumping it is described in
+  the workflow), with the corpus kept in the Actions cache, after replaying `fuzz/regressions/<target>/`. A crash
+  is filed as an issue with the minimised input attached and the input is added under
+  `fuzz/regressions/<target>/`; fix it in a branch that owns the crate. `cargo deny` does not cover `fuzz/`, and
+  `libfuzzer-sys` is `(MIT OR Apache-2.0) AND NCSA`, a license outside `deny.toml`'s allow list: accepted by the
+  lead (2026-10-29) because the fuzzers are a development tool that is never distributed.
 - **Wave stats.** `scripts/factory-stats.sh --since <t> --until <t> <session dir>` prints the per-role and
   per-agent cost tables (output tokens, cache reads, tool calls, span and active minutes) for the retro.
 - **Scratch directories.** Every subagent works in its own `<scratchpad>/<agent type>-<issue>`; the scratchpad
