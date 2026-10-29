@@ -522,6 +522,41 @@ fn a_panic_inside_a_surface_call_is_caught() {
     }
 }
 
+/// A lost GPU device (an unplugged external GPU, a driver reset; injected
+/// with `App::lose_gpu_for_test`) detaches the surface on the next render,
+/// resizing it meanwhile is harmless, and attaching again draws on a new
+/// device.
+#[test]
+fn a_lost_device_detaches_the_surface_and_reattaching_recovers() {
+    if !gpu_enabled() {
+        return;
+    }
+    let app = Handle::new();
+    let id = app.spawn_shell();
+    let layer = Layer::new();
+    assert_eq!(app.attach(id, &layer, 640, 480, 2.0), Error::Ok);
+    app.render_frames(id, 2);
+
+    assert!(app.with_core(tessera_app_core::App::lose_gpu_for_test));
+    assert_eq!(app.resize(id, 800, 600, 2.0), Error::Ok);
+    assert_eq!(app.resize(id, 0, 0, 2.0), Error::Ok);
+    assert_eq!(app.set_font_size(id, 18.0), Error::Ok);
+    assert_eq!(app.render(id), (Error::Gpu, FrameStatus::Skipped));
+    assert!(app.view_ids().is_empty(), "the surface is detached");
+    assert_eq!(app.render(id), (Error::NoSurface, FrameStatus::Skipped));
+    assert_eq!(app.metrics(id).0, Error::NoSurface);
+
+    let layer = Layer::new();
+    assert_eq!(app.attach(id, &layer, 640, 480, 2.0), Error::Ok);
+    app.render_frames(id, 2);
+    assert_eq!(app.metrics_ok(id).width_px, 640);
+    assert_eq!(app.detach(id), Error::Ok);
+    assert!(
+        !app.with_core(tessera_app_core::App::lose_gpu_for_test),
+        "the last detach released the GPU"
+    );
+}
+
 #[test]
 fn the_grid_follows_the_surface() {
     if !gpu_enabled() {

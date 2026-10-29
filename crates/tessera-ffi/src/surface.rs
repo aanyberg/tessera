@@ -265,10 +265,13 @@ pub unsafe extern "C" fn tessera_surface_resize(
 /// `NULL`, `TESSERA_ERROR_SESSION_NOT_FOUND` if the id is not a live
 /// session, `TESSERA_ERROR_NO_SURFACE` if it has no surface attached, and
 /// `TESSERA_ERROR_GPU` if drawing failed. When the layer's swapchain was
-/// lost beyond recovery the surface is also **detached** (the next call
-/// returns `TESSERA_ERROR_NO_SURFACE`) and the host attaches it again;
+/// lost beyond recovery, or wgpu reported the GPU device lost, the surface
+/// is also **detached** (the next call returns `TESSERA_ERROR_NO_SURFACE`)
+/// and the host attaches it again, on a new device after a device loss;
 /// after any other GPU failure the surface stays attached and the next
-/// frame may succeed.
+/// frame may succeed. wgpu's Metal backend reports a loss only for its
+/// own limits and errors, not a real device removal such as an unplugged
+/// external GPU (ADR 0014, #138).
 ///
 /// # Safety
 ///

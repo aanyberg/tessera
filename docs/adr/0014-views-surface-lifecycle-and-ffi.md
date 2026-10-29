@@ -92,9 +92,10 @@ configuration and presentation belong there.
 - A GPU or font failure is the new `TESSERA_ERROR_GPU`
   (`Error::Gpu(RenderError)`): on attach (no adapter, unsupported surface,
   device error, no usable font) nothing is attached; on render, a
-  swapchain that cannot be recovered (`RenderError::SurfaceLost`) detaches
-  the view and the host attaches again, and any other render error leaves
-  the view attached so the next frame can succeed.
+  swapchain that cannot be recovered (`RenderError::SurfaceLost`) or a
+  lost GPU device (`RenderError::DeviceLost`, #84) detaches the view and
+  the host attaches again, and any other render error leaves the view
+  attached so the next frame can succeed.
 - A scale that is not finite and positive is
   `TESSERA_ERROR_INVALID_ARGUMENT`; a font size is clamped through
   `sanitize_font_size` (4 to 512 points, non-finite becomes 13), so a zoom
@@ -306,6 +307,62 @@ the new `tests/c/surface.c`.
   plus the font database load, on the main thread, once.
 - Every view keeps its own atlas and snapshot; the GPU, the device and the
   font database are shared.
+- Device loss (#84). `Gpu` registers a `wgpu` device-lost callback that
+  sets a flag shared by every clone; `Gpu::is_lost` is one atomic load,
+  and `Gpu::capture_errors` reports `RenderError::DeviceLost` once it is
+  set (work on a lost device raises no validation error, it does
+  nothing). `wgpu` runs the callback when a call fails inside `wgpu-hal`
+  with a device error, during that call; nothing probes the device per
+  frame. `App::render_view` detaches a view whose GPU is lost, checking
+  before the frame (so an idle view on a dead device is detached by its
+  next render instead of showing its last frame forever) and after a
+  failed one, and returns `Error::Gpu(DeviceLost)`, `TESSERA_ERROR_GPU`
+  through the FFI: the host re-attaches, as after `SurfaceLost`. The view
+  is dropped whole, so its renderer, atlas, glyph caches, instance-buffer
+  mirror, snapshot, damage and pacing state (ADR 0016) are all rebuilt
+  by `View::new` on the next attach, whose first frame draws every row.
+  An attach whose cached GPU is lost brings up a new one (fonts are kept:
+  they are CPU-side), and the last view to detach drops the cached GPU,
+  so an external GPU that went away is never reused. Views still on the
+  dead GPU keep their clone until their own next render detaches them;
+  after that the host gets `TESSERA_ERROR_NO_SURFACE`, never a loop of
+  GPU errors. Every removal (`detach_view`, a detaching render,
+  `close_session`, an attach that lost a race with a close) goes through
+  `App::remove_view`, so the last one always drops the cache; `App`'s
+  drop releases it after every view. The last clone of a `Gpu` (dropping
+  its queue waits for the GPU to go idle) is dropped after the view and
+  GPU locks are released, never under them.
+
+  Feature `test-hooks` of `tessera-render` adds `Gpu::lose_device_for_test`
+  (`wgpu::Device::destroy`, then polls until `wgpu` runs the callback; a
+  destroyed device is lost only at the next poll, so without the polling
+  the flag would not be set; after a second the hook sets it itself and
+  logs that). App-core's `test-hooks` enables it and adds
+  `App::lose_gpu_for_test`; the release `tessera-ffi` build does not. The
+  hook must run on the thread that draws: `wgpu-core` 30.0.1 deadlocks
+  when a poll releases a lost device's resources (tracker lock, then
+  snatch lock) while another thread writes to the queue (snatch lock,
+  then tracker lock), which a first version of the tests hit by losing
+  the device from a second thread. Production draws and polls only on the
+  main thread, so it cannot. The tests also lose a device through
+  `wgpu-hal`'s own error path, by filling Metal's command queue (4096
+  command buffers) so the next frame's own command buffer fails inside
+  the frame.
+
+  **Real hardware loss is not covered.** `wgpu-hal`'s Metal backend
+  (30.0.1) reports `DeviceError::Lost` in only three places: its own
+  counter of command buffers created but not submitted reaching 4096,
+  a nil internal wait or signal command buffer at submit, and a fence
+  wait with no pending command buffer. Elsewhere it unwraps a nil
+  `commandBuffer` (`begin_encoding`, `wait_for_idle`), and it never
+  checks a command buffer's completion error (it treats
+  `MTLCommandBufferStatus::Error` like `Completed`). So an unplugged
+  external GPU (device removed) probably never sets the flag, or panics
+  inside `wgpu`, which the FFI reports as `TESSERA_ERROR_PANIC`. Handling
+  real removal is a follow-up: the frontend observes
+  `MTLCopyAllDevicesWithObserver` / `MTLDeviceWasRemovedNotification` and
+  detaches the affected views, after which the last detach drops the
+  `Gpu` and the next attach brings up a new one through this path.
 - `App` stays `Send + Sync` (`View` is, through `Renderer` and
   `RenderSurface`), checked by the existing static assertion.
 - The release build of `tessera-ffi` (a gate step) now compiles `wgpu` and

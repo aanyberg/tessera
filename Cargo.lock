@@ -2504,6 +2504,7 @@ dependencies = [
  "raw-window-handle",
  "swash",
  "tessera-grid",
+ "tessera-render",
  "thiserror 2.0.21",
  "tracing",
  "unicode-width",

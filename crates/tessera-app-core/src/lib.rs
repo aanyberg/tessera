@@ -159,7 +159,9 @@ pub struct App {
     /// `sessions` is locked.
     views: Mutex<HashMap<SessionId, View>>,
     /// The process's GPU, brought up by the first [`App::attach_view`] and
-    /// shared by every view after it.
+    /// shared by every view after it. Replaced by the next attach once its
+    /// device is lost, and dropped when the last view detaches. Locked only
+    /// on its own or while `views` is held, never the other way round.
     gpu: Mutex<Option<Gpu>>,
     /// The font database, loaded by the first [`App::attach_view`] and
     /// shared by every view's shaper (loading it takes a noticeable
@@ -317,9 +319,11 @@ impl App {
             .remove(&id)
             .ok_or(Error::SessionNotFound(id))?;
         // Detach the view first; its surface is released here, before the
-        // child is hung up.
-        let view = lock(&self.views).remove(&id);
-        drop(view);
+        // child is hung up. The last view releases the GPU too.
+        let mut views = lock(&self.views);
+        let removed = self.remove_view(&mut views, id);
+        drop(views);
+        drop(removed);
         let session = vec![session];
         Self::begin_closing(&session);
         self.reaper.reap(session);
@@ -717,7 +721,9 @@ impl App {
     /// `surface` must have been created on `instance`, which must come
     /// from [`App::view_instance`]. The first view brings up the process's
     /// GPU on `instance` (an adapter that can present to `surface`; about
-    /// 100 ms) and loads the font database; later views share both. The
+    /// 100 ms) and loads the font database; later views share both. An
+    /// attach after the GPU's device was lost, or after the last view
+    /// detached, brings up a new GPU (the font database is kept). The
     /// view draws with the configured font family, font size and opacity
     /// and the current theme's colours (see [`App::apply_theme`]). A zero
     /// `size` is allowed: nothing is drawn until a non-empty
@@ -745,22 +751,50 @@ impl App {
         size: PhysicalSize,
         scale: f32,
     ) -> Result<()> {
+        self.attach_with(
+            id,
+            instance,
+            surface,
+            |surface| Some(surface),
+            |gpu, surface, fonts, theme| View::new(gpu, surface, fonts, theme, size, scale),
+        )
+    }
+
+    /// [`App::attach_view`] for any target: `surface_of` names the surface
+    /// the GPU must be able to present to (if any), and `build` makes the
+    /// view on the GPU, the fonts and the current theme.
+    fn attach_with<T>(
+        &self,
+        id: SessionId,
+        instance: wgpu::Instance,
+        target: T,
+        surface_of: impl FnOnce(&T) -> Option<&wgpu::Surface<'static>>,
+        build: impl FnOnce(Gpu, T, Fonts, Theme) -> Result<View, RenderError>,
+    ) -> Result<()> {
         self.session(id)?;
+        // Declared before the lock guard, so it is dropped after it even on
+        // an early return: dropping a GPU waits for it to go idle.
+        let retired: Option<Gpu>;
         let mut views = lock(&self.views);
         if views.contains_key(&id) {
             return Err(Error::ViewAttached(id));
         }
-        let gpu = self.gpu_for(instance, &surface)?;
+        let gpu;
+        (gpu, retired) = self.gpu_for(instance, surface_of(&target))?;
         let theme = lock(&self.theme).clone();
         let fonts = self.fonts_for(&theme)?;
-        let view = View::new(gpu, surface, fonts, theme, size, scale)?;
+        let view = build(gpu, target, fonts, theme)?;
         let pty_size = view.pty_size();
         views.insert(id, view);
         drop(views);
+        drop(retired);
         // A close that raced with this call (only possible when the
         // main-thread rule is broken) must not leave a view behind.
         if self.session(id).is_err() {
-            lock(&self.views).remove(&id);
+            let mut views = lock(&self.views);
+            let removed = self.remove_view(&mut views, id);
+            drop(views);
+            drop(removed);
             return Err(Error::SessionNotFound(id));
         }
         self.follow_view(id, pty_size);
@@ -832,22 +866,37 @@ impl App {
     /// [`Error::SessionNotFound`] if `id` is not a live session,
     /// [`Error::NoView`] if it has no view, [`Error::Gpu`] if drawing
     /// failed. A swapchain that cannot be recovered
-    /// ([`RenderError::SurfaceLost`]) also **detaches the view**: the
-    /// frontend attaches a new one. After any other GPU error the view
-    /// stays attached and the next frame may succeed.
+    /// ([`RenderError::SurfaceLost`]) and a lost GPU device
+    /// ([`RenderError::DeviceLost`], reported by the first render after
+    /// the loss, whether or not the frame had anything to draw) also
+    /// **detach the view**: the frontend attaches a new one, which after a
+    /// device loss is drawn whole on a new GPU. After any other GPU error
+    /// the view stays attached and the next frame may succeed.
     pub fn render_view(&self, id: SessionId) -> Result<FrameStatus> {
         let session = self.session(id)?;
         let focused = session.is_focused();
         let mut views = lock(&self.views);
         let view = views.get_mut(&id).ok_or(Error::NoView(id))?;
-        session.with_terminal(|term| view.capture(term.grid()));
-        match view.render(focused) {
+        // Every view on a lost device is detached by its next render, even
+        // one with nothing to draw, so none keeps showing a dead frame.
+        let result = if view.gpu().is_lost() {
+            Err(RenderError::DeviceLost)
+        } else {
+            session.with_terminal(|term| view.capture(term.grid()));
+            view.render(focused)
+        };
+        // A loss during the frame may surface as any error (or none).
+        let result = match result {
+            Err(_) if view.gpu().is_lost() => Err(RenderError::DeviceLost),
+            result => result,
+        };
+        match result {
             Ok(status) => Ok(status),
-            Err(RenderError::SurfaceLost) => {
-                let view = views.remove(&id);
+            Err(error @ (RenderError::SurfaceLost | RenderError::DeviceLost)) => {
+                let removed = self.remove_view(&mut views, id);
                 drop(views);
-                drop(view);
-                Err(Error::Gpu(RenderError::SurfaceLost))
+                drop(removed);
+                Err(Error::Gpu(error))
             }
             Err(error) => Err(Error::Gpu(error)),
         }
@@ -883,7 +932,10 @@ impl App {
     }
 
     /// Detaches and releases session `id`'s view. The session keeps its
-    /// size. Must be called on the main thread.
+    /// size. The last view to go releases the process's GPU too (the font
+    /// database stays loaded), so a GPU that went away (an external GPU
+    /// unplugged) is not reused: the next attach brings up a new one. Must
+    /// be called on the main thread.
     ///
     /// # Errors
     ///
@@ -891,9 +943,27 @@ impl App {
     /// [`Error::NoView`] if it has no view.
     pub fn detach_view(&self, id: SessionId) -> Result<()> {
         self.session(id)?;
-        let view = lock(&self.views).remove(&id).ok_or(Error::NoView(id))?;
-        drop(view);
+        let mut views = lock(&self.views);
+        let removed = self.remove_view(&mut views, id).ok_or(Error::NoView(id))?;
+        drop(views);
+        drop(removed);
         Ok(())
+    }
+
+    /// Removes session `id`'s view from `views`, and takes the cached GPU
+    /// out of its slot when it was the last one. The caller drops what this
+    /// returns after releasing the `views` lock: dropping a view's surface
+    /// and the last clone of a GPU (its queue waits for the GPU to go idle)
+    /// must not happen under a lock.
+    #[must_use = "drop it after releasing the view lock"]
+    fn remove_view(&self, views: &mut HashMap<SessionId, View>, id: SessionId) -> Option<Removed> {
+        let view = views.remove(&id)?;
+        let gpu = if views.is_empty() {
+            lock(&self.gpu).take()
+        } else {
+            None
+        };
+        Some(Removed { _view: view, gpu })
     }
 
     /// Runs `f` on session `id`'s view.
@@ -904,16 +974,23 @@ impl App {
         Ok(f(view))
     }
 
-    /// The process's GPU, brought up on `instance` for `surface` if this
-    /// is the first view.
-    fn gpu_for(&self, instance: wgpu::Instance, surface: &wgpu::Surface<'_>) -> Result<Gpu> {
+    /// The process's GPU, brought up on `instance` (for `surface`, if
+    /// given) when there is none yet or its device was lost, and the lost
+    /// one it replaced, for the caller to drop once it holds no lock.
+    /// Views still on a lost GPU keep their clone of it until their next
+    /// render detaches them.
+    fn gpu_for(
+        &self,
+        instance: wgpu::Instance,
+        surface: Option<&wgpu::Surface<'_>>,
+    ) -> Result<(Gpu, Option<Gpu>)> {
         let mut slot = lock(&self.gpu);
-        if let Some(gpu) = slot.as_ref() {
-            return Ok(gpu.clone());
+        if let Some(gpu) = slot.as_ref().filter(|gpu| !gpu.is_lost()) {
+            return Ok((gpu.clone(), None));
         }
-        let gpu = Gpu::with_compatible_surface(instance, Some(surface))?;
-        *slot = Some(gpu.clone());
-        Ok(gpu)
+        let gpu = Gpu::with_compatible_surface(instance, surface)?;
+        let retired = slot.replace(gpu.clone());
+        Ok((gpu, retired))
     }
 
     /// The process's font database, loaded for `theme`'s family if this is
@@ -965,6 +1042,19 @@ impl App {
         lock(&self.views).get(&id).map(|view| view.theme().clone())
     }
 
+    /// Loses the process GPU's device, as a GPU reset or an unplugged
+    /// external GPU would (through [`Gpu::lose_device_for_test`]). Returns
+    /// `false` when no GPU is up.
+    ///
+    /// Exists only so tests can prove that views recover from a device
+    /// loss.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn lose_gpu_for_test(&self) -> bool {
+        let gpu = lock(&self.gpu).clone();
+        gpu.inspect(Gpu::lose_device_for_test).is_some()
+    }
+
     /// Panics while holding the view table lock, poisoning it.
     ///
     /// Exists only so tests can prove that a panic inside a view call
@@ -977,6 +1067,19 @@ impl App {
     }
 }
 
+/// A view taken out of the view table, and the cached GPU when it was the
+/// last view. Dropped after the locks are released: the view first, then
+/// the GPU (fields drop in declaration order).
+#[must_use = "drop it after releasing the view lock"]
+struct Removed {
+    _view: View,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "held only to be dropped after the locks")
+    )]
+    gpu: Option<Gpu>,
+}
+
 impl Drop for App {
     /// Detaches every view, closes every session and waits for the reaper
     /// to finish every close, including those [`App::close_session`]
@@ -986,6 +1089,8 @@ impl Drop for App {
     fn drop(&mut self) {
         let views: Vec<_> = lock(&self.views).drain().collect();
         drop(views);
+        let gpu = lock(&self.gpu).take();
+        drop(gpu);
         let sessions: Vec<_> = lock(&self.sessions)
             .drain()
             .map(|(_, session)| session)
@@ -3005,5 +3110,474 @@ mod tests {
             app().config_path(),
             PathBuf::from("/nonexistent/tessera/config.toml")
         );
+    }
+
+    /// Device loss: a view on a lost GPU is detached by its next render,
+    /// the next attach brings up a new GPU, and the last detach drops the
+    /// cached one. Views are offscreen (`View::offscreen`) and attached
+    /// through the same path as [`App::attach_view`]; the device is lost
+    /// through [`App::lose_gpu_for_test`] (`wgpu::Device::destroy`).
+    mod device_loss {
+        use std::time::{Duration, Instant};
+
+        use super::*;
+        use crate::view::MIN_FRAME_INTERVAL;
+
+        /// Offscreen views are this large: a few rows of the default font.
+        const SIZE: PhysicalSize = PhysicalSize::new(240, 96);
+
+        /// How long one device-loss test may take before [`watchdog`]
+        /// fails it.
+        const LIMIT: Duration = Duration::from_secs(60);
+
+        /// Runs `f` on its own thread and fails the test if it has not returned
+        /// within `limit`: a GPU call blocked inside `wgpu` (a deadlock, a wait on
+        /// a lost device) never reaches an in-test deadline, and would hang the
+        /// suite. On a timeout it records a stack sample of the whole process
+        /// (macOS `sample`) and names the file in the failure.
+        fn watchdog(f: impl FnOnce() + Send + 'static) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                f();
+                let _ = tx.send(());
+            });
+            match rx.recv_timeout(LIMIT) {
+                Ok(()) => worker.join().expect("finished"),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    std::panic::resume_unwind(worker.join().expect_err("panicked"));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let pid = std::process::id();
+                    let file = std::env::temp_dir().join(format!("tessera-hang-{pid}.txt"));
+                    let sampled = std::process::Command::new("/usr/bin/sample")
+                        .args([pid.to_string().as_str(), "2", "-file"])
+                        .arg(&file)
+                        .output()
+                        .is_ok_and(|out| out.status.success());
+                    let dump = if sampled {
+                        format!("stack sample in {}", file.display())
+                    } else {
+                        "no stack sample (`sample` failed)".to_owned()
+                    };
+                    panic!("hung for over {LIMIT:?} inside a GPU call; {dump}");
+                }
+            }
+        }
+
+        /// An app, or `None` when GPU tests are skipped.
+        fn gpu_app() -> Option<App> {
+            if std::env::var_os("TESSERA_SKIP_GPU_TESTS").is_some() {
+                eprintln!("TESSERA_SKIP_GPU_TESTS is set; skipping");
+                return None;
+            }
+            Some(app())
+        }
+
+        /// Attaches an offscreen view to `id` the way `attach_view` attaches
+        /// a surface.
+        fn attach(app: &App, id: SessionId) -> Result<()> {
+            app.attach_with(
+                id,
+                app.view_instance(),
+                (),
+                |()| None,
+                |gpu, (), fonts, theme| View::offscreen(gpu, fonts, theme, SIZE, 1.0),
+            )
+        }
+
+        /// The GPU session `id`'s view draws with.
+        fn gpu_of(app: &App, id: SessionId) -> Gpu {
+            lock(&app.views).get(&id).expect("a view").gpu().clone()
+        }
+
+        /// The cached GPU, if one is cached.
+        fn cached(app: &App) -> Option<Gpu> {
+            lock(&app.gpu).clone()
+        }
+
+        /// Whether `a` and `b` are the same device: losing `a` loses `b`.
+        /// (`wgpu::Device` equality compares ids, which a new instance
+        /// hands out again.) Loses `a`.
+        fn same_device(a: &Gpu, b: &Gpu) -> bool {
+            assert!(!b.is_lost());
+            a.lose_device_for_test();
+            b.is_lost()
+        }
+
+        fn output(fake: &Fake, events: &Receiver<(SessionId, SessionEvent)>, text: &str) {
+            fake.send(PtyEvent::Output(text.as_bytes().to_vec()));
+            assert!(matches!(next(events), (_, SessionEvent::Output)));
+        }
+
+        /// Renders until a frame is not paced, and returns it.
+        fn render(app: &App, id: SessionId) -> Result<FrameStatus> {
+            std::thread::sleep(MIN_FRAME_INTERVAL + Duration::from_millis(1));
+            app.render_view(id)
+        }
+
+        /// Asserts that session `id`'s view shows exactly what a fresh view
+        /// of its screen draws (on another device), and that is not blank.
+        fn assert_shows_the_whole_screen(app: &App, id: SessionId) {
+            let recovered = lock(&app.views).get(&id).expect("view").read_back();
+
+            let fonts = lock(&app.fonts).clone().expect("fonts");
+            let gpu = Gpu::headless().expect("a Metal adapter");
+            let mut reference =
+                View::offscreen(gpu, fonts, app.view_theme(), SIZE, 1.0).expect("view");
+            app.with_terminal(id, |term| reference.capture(term.grid()))
+                .unwrap();
+            assert_eq!(
+                reference.render(false).expect("reference frame"),
+                FrameStatus::Presented
+            );
+            let expected = reference.read_back();
+            let background = expected[..4].to_vec();
+            assert!(
+                expected.chunks(4).any(|px| px != background.as_slice()),
+                "the reference draws the text"
+            );
+            assert!(
+                recovered == expected,
+                "the recovered frame differs from a fresh view's"
+            );
+        }
+
+        fn is_device_lost<T: fmt::Debug>(result: &Result<T>) -> bool {
+            matches!(result, Err(Error::Gpu(RenderError::DeviceLost)))
+        }
+
+        #[test]
+        fn a_lost_device_detaches_the_view_and_the_next_attach_gets_a_new_one() {
+            watchdog(|| {
+                let Some(app) = gpu_app() else { return };
+                let (id, _fake) = attach_fake(&app, false);
+                attach(&app, id).unwrap();
+                assert_eq!(render(&app, id).unwrap(), FrameStatus::Presented);
+                let old = gpu_of(&app, id);
+
+                assert!(app.lose_gpu_for_test());
+                assert!(old.is_lost());
+                let result = render(&app, id);
+                assert!(is_device_lost(&result), "{result:?}");
+                assert!(!app.has_view(id).unwrap());
+                // Once: the host is told to re-attach, not to retry forever.
+                assert!(matches!(app.render_view(id), Err(Error::NoView(_))));
+                assert!(matches!(app.view_metrics(id), Err(Error::NoView(_))));
+
+                attach(&app, id).unwrap();
+                let new = gpu_of(&app, id);
+                assert!(!new.is_lost(), "the dead device is not reused");
+                assert!(!cached(&app).expect("a GPU").is_lost());
+                assert_eq!(render(&app, id).unwrap(), FrameStatus::Presented);
+                // And it settles: an idle view does no more work.
+                assert_eq!(render(&app, id).unwrap(), FrameStatus::Skipped);
+                assert!(
+                    same_device(&new, &cached(&app).unwrap()),
+                    "the new GPU is cached"
+                );
+            });
+        }
+
+        #[test]
+        fn the_last_detach_drops_the_gpu_and_earlier_ones_keep_it() {
+            watchdog(|| {
+                let Some(app) = gpu_app() else { return };
+                let (a, _fa) = attach_fake(&app, false);
+                let (b, _fb) = attach_fake(&app, false);
+                attach(&app, a).unwrap();
+                attach(&app, b).unwrap();
+                let first = gpu_of(&app, a);
+
+                app.detach_view(a).unwrap();
+                let kept = cached(&app).expect("b keeps the GPU");
+                assert_eq!(render(&app, b).unwrap(), FrameStatus::Presented);
+                app.detach_view(b).unwrap();
+                assert!(cached(&app).is_none(), "the last detach drops the GPU");
+                assert!(lock(&app.fonts).is_some(), "fonts outlive the GPU");
+
+                attach(&app, a).unwrap();
+                let second = gpu_of(&app, a);
+                assert!(same_device(&kept, &first), "b kept the GPU a was on");
+                assert!(!second.is_lost(), "the next attach brings up a new GPU");
+                assert_eq!(render(&app, a).unwrap(), FrameStatus::Presented);
+            });
+        }
+
+        #[test]
+        fn every_view_on_a_lost_device_detaches_even_with_nothing_to_draw() {
+            watchdog(|| {
+                let Some(app) = gpu_app() else { return };
+                let (a, _fa) = attach_fake(&app, false);
+                let (b, _fb) = attach_fake(&app, false);
+                attach(&app, a).unwrap();
+                attach(&app, b).unwrap();
+                assert_eq!(render(&app, a).unwrap(), FrameStatus::Presented);
+                assert_eq!(render(&app, b).unwrap(), FrameStatus::Presented);
+                // Idle: the next frames would be skipped without touching the GPU.
+                assert_eq!(render(&app, a).unwrap(), FrameStatus::Skipped);
+
+                app.lose_gpu_for_test();
+                assert!(is_device_lost(&render(&app, a)));
+                // `a` re-attaches before `b` notices: it gets a new GPU ...
+                attach(&app, a).unwrap();
+                assert!(!gpu_of(&app, a).is_lost());
+                // ... and `b`, still on the dead one, is detached by its next
+                // render instead of showing its last frame forever.
+                assert!(gpu_of(&app, b).is_lost());
+                assert!(is_device_lost(&render(&app, b)));
+                assert!(cached(&app).is_some(), "b's loss keeps a's GPU");
+                attach(&app, b).unwrap();
+                assert_eq!(render(&app, a).unwrap(), FrameStatus::Presented);
+                assert_eq!(render(&app, b).unwrap(), FrameStatus::Presented);
+                assert!(
+                    same_device(&gpu_of(&app, a), &gpu_of(&app, b)),
+                    "one new GPU for every view"
+                );
+            });
+        }
+
+        #[test]
+        fn resizing_and_zooming_a_view_on_a_lost_device_is_harmless() {
+            watchdog(|| {
+                let Some(app) = gpu_app() else { return };
+                let (id, _fake) = attach_fake(&app, false);
+                attach(&app, id).unwrap();
+                assert_eq!(render(&app, id).unwrap(), FrameStatus::Presented);
+
+                app.lose_gpu_for_test();
+                app.resize_view(id, PhysicalSize::new(320, 160), 2.0)
+                    .unwrap();
+                app.set_view_font_size(id, 20.0).unwrap();
+                app.resize_view(id, SIZE, 1.0).unwrap();
+                assert!(is_device_lost(&render(&app, id)));
+
+                attach(&app, id).unwrap();
+                app.resize_view(id, PhysicalSize::new(320, 160), 2.0)
+                    .unwrap();
+                assert_eq!(render(&app, id).unwrap(), FrameStatus::Presented);
+            });
+        }
+
+        #[test]
+        fn repeated_losses_each_recover_onto_a_new_device() {
+            watchdog(|| {
+                let Some(app) = gpu_app() else { return };
+                let (id, _fake) = attach_fake(&app, false);
+                for _ in 0..4 {
+                    attach(&app, id).unwrap();
+                    assert!(!gpu_of(&app, id).is_lost(), "a lost device came back");
+                    assert_eq!(render(&app, id).unwrap(), FrameStatus::Presented);
+                    assert!(app.lose_gpu_for_test());
+                    assert!(is_device_lost(&render(&app, id)));
+                    assert!(!app.has_view(id).unwrap());
+                }
+            });
+        }
+
+        #[test]
+        fn detaching_during_recovery_leaves_nothing_behind() {
+            watchdog(|| {
+                let Some(app) = gpu_app() else { return };
+                let (a, _fa) = attach_fake(&app, false);
+                let (b, _fb) = attach_fake(&app, false);
+                attach(&app, a).unwrap();
+                attach(&app, b).unwrap();
+
+                app.lose_gpu_for_test();
+                assert!(is_device_lost(&render(&app, a)));
+                // The host closes `b`'s window before rendering it again.
+                app.detach_view(b).unwrap();
+                assert!(cached(&app).is_none(), "no view left: GPU dropped");
+                assert!(matches!(app.render_view(b), Err(Error::NoView(_))));
+                assert!(matches!(app.detach_view(a), Err(Error::NoView(_))));
+                assert!(!app.lose_gpu_for_test(), "nothing cached to lose");
+
+                attach(&app, b).unwrap();
+                assert!(!gpu_of(&app, b).is_lost());
+                assert_eq!(render(&app, b).unwrap(), FrameStatus::Presented);
+            });
+        }
+
+        /// The last removal takes the cached GPU out of its slot and hands
+        /// it to the caller, who drops it once no lock is held; earlier
+        /// removals leave it cached.
+        #[test]
+        fn the_last_removal_hands_the_gpu_to_the_caller() {
+            watchdog(|| {
+                let Some(app) = gpu_app() else { return };
+                let (a, _fa) = attach_fake(&app, false);
+                let (b, _fb) = attach_fake(&app, false);
+                attach(&app, a).unwrap();
+                attach(&app, b).unwrap();
+
+                let mut views = lock(&app.views);
+                let first = app.remove_view(&mut views, a).expect("a's view");
+                let last = app.remove_view(&mut views, b).expect("b's view");
+                drop(views);
+                assert!(first.gpu.is_none(), "b still used the GPU");
+                let gpu = last.gpu.as_ref().expect("the cached GPU, not dropped");
+                assert!(cached(&app).is_none());
+                // Still alive and usable here, with no lock held: the caller
+                // decides where the queue's wait for idle happens.
+                gpu.capture_errors(|| ()).expect("a live GPU");
+                drop(first);
+                drop(last);
+            });
+        }
+
+        /// Replacing a lost cached GPU hands the lost one to the caller
+        /// instead of dropping it under the GPU (and view) lock.
+        #[test]
+        fn replacing_a_lost_gpu_hands_the_old_one_to_the_caller() {
+            watchdog(|| {
+                let Some(app) = gpu_app() else { return };
+                let lost = Gpu::headless().expect("a Metal adapter");
+                lost.lose_device_for_test();
+                *lock(&app.gpu) = Some(lost);
+
+                let (gpu, retired) = app.gpu_for(app.view_instance(), None).unwrap();
+
+                assert!(!gpu.is_lost());
+                assert!(retired.expect("the lost GPU").is_lost());
+                let (again, retired) = app.gpu_for(app.view_instance(), None).unwrap();
+                assert!(retired.is_none(), "a live GPU is reused, not replaced");
+                assert!(same_device(&gpu, &again), "the new GPU is cached");
+            });
+        }
+
+        /// Closing sessions removes their views like a detach: the last one
+        /// releases the GPU.
+        #[test]
+        fn closing_the_last_session_with_a_view_drops_the_gpu() {
+            watchdog(|| {
+                let Some(app) = gpu_app() else { return };
+                let (a, _fa) = attach_fake(&app, false);
+                let (b, _fb) = attach_fake(&app, false);
+                attach(&app, a).unwrap();
+                attach(&app, b).unwrap();
+                app.close_session(a).unwrap();
+                assert!(cached(&app).is_some(), "b still draws");
+                assert_eq!(render(&app, b).unwrap(), FrameStatus::Presented);
+                app.close_session(b).unwrap();
+                assert!(cached(&app).is_none());
+            });
+        }
+
+        /// The recovered view draws every row, not just the ones damaged
+        /// since its last frame on the old device: its frame equals a fresh
+        /// view's of the same screen.
+        #[test]
+        fn a_loss_with_pending_damage_recovers_the_whole_screen() {
+            watchdog(|| {
+                let Some(app) = gpu_app() else { return };
+                let events = observe(&app);
+                let (id, fake) = attach_fake(&app, false);
+                attach(&app, id).unwrap();
+                output(&fake, &events, "first row\r\nsecond row\r\n");
+                assert_eq!(render(&app, id).unwrap(), FrameStatus::Presented);
+                // One more row of damage that the dead device never draws.
+                output(&fake, &events, "third");
+
+                app.lose_gpu_for_test();
+                assert!(is_device_lost(&render(&app, id)));
+                attach(&app, id).unwrap();
+                assert_eq!(render(&app, id).unwrap(), FrameStatus::Presented);
+                assert_shows_the_whole_screen(&app, id);
+            });
+        }
+
+        /// Fills `gpu`'s Metal command queue (4096 command buffers, as
+        /// `wgpu-hal` allows) with recorded, unsubmitted command buffers, so
+        /// the next one recorded fails with a device error and `wgpu` loses
+        /// the device right there, as a real loss does. Keep the buffers
+        /// alive until then.
+        fn fill_command_queue(gpu: &Gpu) -> Vec<wgpu::CommandBuffer> {
+            gpu.device()
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("the device goes idle");
+            let buffer = gpu.device().create_buffer(&wgpu::BufferDescriptor {
+                label: Some("fill"),
+                size: 16,
+                usage: wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            (1..4096)
+                .map(|_| {
+                    let mut encoder = gpu
+                        .device()
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                    encoder.clear_buffer(&buffer, 0, None);
+                    encoder.finish()
+                })
+                .collect()
+        }
+
+        /// The device is lost by a device error inside the frame itself
+        /// (not before it, where the render's first check would see it):
+        /// that frame already reports `DeviceLost` and detaches.
+        #[test]
+        fn a_loss_inside_the_frame_detaches_at_once() {
+            watchdog(|| {
+                let Some(app) = gpu_app() else { return };
+                let events = observe(&app);
+                let (id, fake) = attach_fake(&app, false);
+                attach(&app, id).unwrap();
+                assert_eq!(render(&app, id).unwrap(), FrameStatus::Presented);
+                let gpu = gpu_of(&app, id);
+                output(&fake, &events, "damage");
+                let held = fill_command_queue(&gpu);
+                assert!(!gpu.is_lost(), "one command buffer short of the limit");
+
+                let result = render(&app, id);
+
+                assert!(gpu.is_lost(), "the frame hit the limit");
+                assert!(is_device_lost(&result), "{result:?}");
+                assert!(!app.has_view(id).unwrap());
+                drop(held);
+                attach(&app, id).unwrap();
+                assert_eq!(render(&app, id).unwrap(), FrameStatus::Presented);
+            });
+        }
+
+        /// The device is lost while output keeps streaming in and every
+        /// frame has damage: the next render reports `DeviceLost` and
+        /// detaches, the output keeps arriving with no view (no GPU work),
+        /// and the re-attached view draws all of it.
+        ///
+        /// The loss is injected on the rendering thread: `wgpu-core`
+        /// 30.0.1 deadlocks when a lost device's resources are released
+        /// (in `Device::maintain`, holding its tracker lock, then taking the
+        /// snatch lock) while another thread writes to the queue (snatch
+        /// lock, then tracker lock). Every frame is drawn on the main
+        /// thread (ADR 0014), and `wgpu` releases them only from a poll or
+        /// submit on that thread, so this needs a hook on another thread.
+        #[test]
+        fn a_loss_during_streaming_output_detaches_and_recovers_it_all() {
+            watchdog(|| {
+                let Some(app) = gpu_app() else { return };
+                let events = observe(&app);
+                let (id, fake) = attach_fake(&app, false);
+                attach(&app, id).unwrap();
+                for frame in 0..5 {
+                    output(&fake, &events, &format!("line {frame}\r\n"));
+                    assert_eq!(render(&app, id).unwrap(), FrameStatus::Presented);
+                }
+                output(&fake, &events, "pending\r\n");
+                assert!(app.lose_gpu_for_test());
+                let start = Instant::now();
+                assert!(is_device_lost(&render(&app, id)));
+                assert!(
+                    start.elapsed() < Duration::from_secs(1),
+                    "a lost frame is cheap"
+                );
+                for frame in 0..50 {
+                    output(&fake, &events, &format!("while detached {frame}\r\n"));
+                }
+                assert!(!app.has_view(id).unwrap());
+                attach(&app, id).unwrap();
+                assert_eq!(render(&app, id).unwrap(), FrameStatus::Presented);
+                assert_shows_the_whole_screen(&app, id);
+            });
+        }
     }
 }

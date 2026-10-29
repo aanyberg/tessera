@@ -35,6 +35,13 @@ wgpu = { version = "30", default-features = false, features = ["metal", "wgsl", 
 [dev-dependencies]
 # Golden images in tests/golden (ADR 0010).
 png.workspace = true
+# Enables `test-hooks` for this crate's integration tests.
+tessera-render = { path = ".", features = ["test-hooks"] }
+
+[features]
+# Exposes `Gpu::lose_device_for_test` for fault-injection tests of
+# device loss (ADR 0014). Off in every release build.
+test-hooks = []
 
 [lints]
 workspace = true

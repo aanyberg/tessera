@@ -24,10 +24,13 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# `Gpu::lose_device_for_test` for this crate's device-loss tests.
+tessera-render = { workspace = true, features = ["test-hooks"] }
 
 [features]
-# Exposes `App::panic_holding_session_lock` for tests of the FFI layer.
-test-hooks = []
+# Exposes `App::panic_holding_session_lock` and `App::lose_gpu_for_test`
+# for tests of the FFI layer.
+test-hooks = ["tessera-render/test-hooks"]
 
 [lints]
 workspace = true

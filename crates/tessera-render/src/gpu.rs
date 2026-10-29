@@ -1,20 +1,33 @@
 //! Instance, adapter, device and queue bootstrap.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::RenderError;
 
 /// The GPU objects every surface and offscreen target shares.
 ///
-/// Cloning is cheap: `wgpu` handles are reference counted. One `Gpu` per
-/// process is the intended shape; every window's [`crate::RenderSurface`]
-/// is created against it.
+/// Cloning is cheap: `wgpu` handles are reference counted. One live `Gpu`
+/// per process is the intended shape, replaced after a loss; every
+/// window's [`crate::RenderSurface`] is created against it. Dropping the
+/// last clone drops the queue, which waits for the GPU to go idle.
+///
+/// When `wgpu` loses the device ([`wgpu::Device::destroy`], or one of the
+/// device errors `wgpu-hal` reports as a loss),
+/// [`Self::is_lost`] reports `true` for this `Gpu` and every clone of it,
+/// and nothing drawn on it is shown again; the owner drops it and brings up
+/// a new one. A real device removal (an unplugged external GPU) is
+/// probably not reported by `wgpu-hal`'s Metal backend 30.0.1, which never
+/// checks a command buffer's completion error (see
+/// [`crate::RenderError::DeviceLost`]).
 #[derive(Debug, Clone)]
 pub struct Gpu {
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// Set by the device-lost callback; shared by every clone.
+    lost: Arc<AtomicBool>,
 }
 
 impl Gpu {
@@ -64,7 +77,8 @@ impl Gpu {
     /// GPU errors that no error scope captures are logged through
     /// `tracing` instead of panicking (which is `wgpu`'s default), so a
     /// validation problem inside a frame callback never unwinds through the
-    /// frontend.
+    /// frontend. A device-lost callback is registered that makes
+    /// [`Self::is_lost`] report `true` from then on.
     pub fn with_compatible_surface(
         instance: wgpu::Instance,
         surface: Option<&wgpu::Surface<'_>>,
@@ -85,12 +99,64 @@ impl Gpu {
         device.on_uncaptured_error(Arc::new(|error: wgpu::Error| {
             tracing::error!(target: "tessera_render", %error, "uncaptured GPU error");
         }));
+        let lost = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&lost);
+        device.set_device_lost_callback(move |reason, message| {
+            flag.store(true, Ordering::Release);
+            tracing::warn!(target: "tessera_render", ?reason, %message, "GPU device lost");
+        });
         Ok(Self {
             instance,
             adapter,
             device,
             queue,
+            lost,
         })
+    }
+
+    /// Whether `wgpu` has lost the device (see
+    /// [`crate::RenderError::DeviceLost`] for what it reports as a loss).
+    ///
+    /// Once `true` it stays `true`: every later frame on this `Gpu` fails
+    /// or shows nothing, so the owner drops it, and every surface and
+    /// renderer created on it, and brings up a new one. Set by the
+    /// device-lost callback `wgpu` runs when it notices the loss, which is
+    /// at the latest the next submission or poll after it; this is one
+    /// atomic load.
+    #[must_use]
+    pub fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::Acquire)
+    }
+
+    /// Destroys the device, as a GPU reset or an unplugged external GPU
+    /// would, and waits until `wgpu` has run the device-lost callback, so
+    /// [`Self::is_lost`] is `true` when this returns.
+    ///
+    /// `wgpu` loses a destroyed device only once its queue is empty, at
+    /// the next poll; this polls until it has (or sets the flag itself
+    /// after a second, in case a backend never reports the loss). Exists
+    /// for fault-injection tests (feature `test-hooks`); never call it in
+    /// production.
+    ///
+    /// Call it on the thread that draws with this `Gpu`: `wgpu-core`
+    /// 30.0.1 deadlocks when the poll releases the lost device's resources
+    /// (tracker lock, then snatch lock) while another thread writes to the
+    /// queue (snatch lock, then tracker lock).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn lose_device_for_test(&self) {
+        self.device.destroy();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !self.is_lost() && std::time::Instant::now() < deadline {
+            // A destroyed device may report an error here; the callback is
+            // what matters.
+            let _ = self.device.poll(wgpu::PollType::Poll);
+            std::thread::yield_now();
+        }
+        if !self.is_lost() {
+            tracing::warn!(target: "tessera_render", "the device-lost callback did not run");
+            self.lost.store(true, Ordering::Release);
+        }
     }
 
     /// The instance surfaces are created from.
@@ -136,7 +202,9 @@ impl Gpu {
     }
 
     /// Runs `f` inside a validation error scope and returns any error it
-    /// raised as [`RenderError::Gpu`].
+    /// raised as [`RenderError::Gpu`], or [`RenderError::DeviceLost`] when
+    /// the device is lost by the time the scope closes (whether or not `f`
+    /// raised an error: work on a lost device does nothing).
     ///
     /// Error scopes are per thread, so independent threads sharing one
     /// `Gpu` may call this concurrently; `wgpu`'s `std` feature (enabled in
@@ -145,7 +213,11 @@ impl Gpu {
     pub fn capture_errors<T>(&self, f: impl FnOnce() -> T) -> Result<T, RenderError> {
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let out = f();
-        match pollster::block_on(scope.pop()) {
+        let error = pollster::block_on(scope.pop());
+        if self.is_lost() {
+            return Err(RenderError::DeviceLost);
+        }
+        match error {
             None => Ok(out),
             Some(error) => Err(RenderError::Gpu(error.to_string())),
         }

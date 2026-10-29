@@ -20,6 +20,20 @@ pub enum RenderError {
     /// The swapchain was lost and could not be recovered by reconfiguring.
     #[error("surface lost")]
     SurfaceLost,
+    /// The GPU device was lost: `wgpu` ran its device-lost callback
+    /// ([`crate::Gpu::is_lost`]). Nothing drawn on it is shown again: drop
+    /// the [`crate::Gpu`] and everything created on it, and start over on a
+    /// new one.
+    ///
+    /// `wgpu-hal`'s Metal backend (30.0.1) reports a loss only for its own
+    /// limits (4096 command buffers created but not submitted, a nil
+    /// internal command buffer at submit, a fence wait with nothing
+    /// pending) and after [`wgpu::Device::destroy`]. It never checks a
+    /// command buffer's completion error, so a real device removal (an
+    /// unplugged external GPU) probably does not produce this error; see
+    /// ADR 0014.
+    #[error("GPU device lost")]
+    DeviceLost,
     /// Copying a texture back to the CPU failed.
     #[error("readback failed: {0}")]
     Readback(String),

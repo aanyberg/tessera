@@ -372,6 +372,12 @@ impl View {
         })
     }
 
+    /// The GPU this view draws with; [`Gpu::is_lost`] tells
+    /// [`crate::App::render_view`] to detach it.
+    pub(crate) fn gpu(&self) -> &Gpu {
+        &self.gpu
+    }
+
     /// The surface's size, scale and the grid that fits in it.
     pub(crate) fn size(&self) -> ViewSize {
         let pixels = self.target.size();
