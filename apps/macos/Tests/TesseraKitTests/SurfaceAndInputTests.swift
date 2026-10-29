@@ -402,8 +402,11 @@ final class SurfaceAndInputTests: XCTestCase {
             surface.cellMetrics,
             .init(widthPx: metrics.cellWidthPx, heightPx: metrics.cellHeightPx, paddingPx: metrics.paddingPx))
         // The grid fits inside the padding, whole cells only.
-        XCTAssertLessThanOrEqual(UInt32(metrics.cols) * metrics.cellWidthPx + 2 * metrics.paddingPx, 800)
-        XCTAssertGreaterThan(UInt32(metrics.cols + 1) * metrics.cellWidthPx + 2 * metrics.paddingPx, 800)
+        let padding: UInt32 = 2 * metrics.paddingPx
+        let used: UInt32 = UInt32(metrics.cols) * metrics.cellWidthPx + padding
+        let oneMore: UInt32 = used + metrics.cellWidthPx
+        XCTAssertLessThanOrEqual(used, 800)
+        XCTAssertGreaterThan(oneMore, 800)
 
         // `rows` and `cols` are the session's grid.
         try session.resize(rows: 20, cols: 70)

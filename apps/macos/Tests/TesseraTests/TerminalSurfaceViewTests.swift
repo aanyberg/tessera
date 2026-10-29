@@ -449,16 +449,22 @@ final class TerminalSurfaceViewTests: XCTestCase {
         view.metrics = Self.metrics(cursorRow: 2, cursorCol: 3)
         let viewOnScreen = window.convertToScreen(view.convert(view.bounds, to: nil))
         let rect = view.firstRect(forCharacterRange: NSRange(location: 0, length: 0), actualRange: nil)
-        XCTAssertEqual(rect.minX, viewOnScreen.minX + 4 + 3 * 8, accuracy: 0.01)
-        XCTAssertEqual(rect.maxY, viewOnScreen.maxY - 4 - 2 * 16, accuracy: 0.01)
-        XCTAssertEqual(rect.width, 8, accuracy: 0.01)
-        XCTAssertEqual(rect.height, 16, accuracy: 0.01)
+        // In points: 4 of padding, 8 x 16 cells.
+        let padding: CGFloat = 4
+        let cellWidth: CGFloat = 8
+        let cellHeight: CGFloat = 16
+        let left: CGFloat = padding + 3 * cellWidth
+        let top: CGFloat = padding + 2 * cellHeight
+        XCTAssertEqual(rect.minX, viewOnScreen.minX + left, accuracy: 0.01)
+        XCTAssertEqual(rect.maxY, viewOnScreen.maxY - top, accuracy: 0.01)
+        XCTAssertEqual(rect.width, cellWidth, accuracy: 0.01)
+        XCTAssertEqual(rect.height, cellHeight, accuracy: 0.01)
 
         // On a wide character the rect spans both columns.
         view.metrics?.cursorWide = true
         let wide = view.firstRect(forCharacterRange: NSRange(location: 0, length: 0), actualRange: nil)
         XCTAssertEqual(wide.minX, rect.minX, accuracy: 0.01)
-        XCTAssertEqual(wide.width, 16, accuracy: 0.01)
+        XCTAssertEqual(wide.width, 2 * cellWidth, accuracy: 0.01)
 
         // Without a surface, the view's top-left corner.
         view.metrics = nil
@@ -514,10 +520,28 @@ final class TerminalSurfaceViewTests: XCTestCase {
     /// so geometry that used the window's scale instead of these would be
     /// off.
     private static func metrics(cursorRow: UInt16 = 0, cursorCol: UInt16 = 0) -> TesseraSurface.Metrics {
-        .init(
-            widthPx: 12 + 80 * 24 + 12, heightPx: 12 + 24 * 48 + 12, scale: 3, cellWidthPx: 24, cellHeightPx: 48,
-            baselinePx: 36, paddingPx: 12, rows: 24, cols: 80, fontSizePt: 13, cursorRow: cursorRow,
+        let padding: UInt32 = 12
+        let width: UInt32 = 2 * padding + 80 * 24
+        let height: UInt32 = 2 * padding + 24 * 48
+        return .init(
+            widthPx: width, heightPx: height, scale: 3, cellWidthPx: 24, cellHeightPx: 48,
+            baselinePx: 36, paddingPx: padding, rows: 24, cols: 80, fontSizePt: 13, cursorRow: cursorRow,
             cursorCol: cursorCol, cursorOnScreen: true, cursorWide: false)
+    }
+
+    /// ``metrics(cursorRow:cursorCol:)`` in pixels, typed for the tests'
+    /// arithmetic.
+    private static let scalePx: CGFloat = 3
+    private static let paddingPx: CGFloat = 12
+    private static let cellWidthPx: CGFloat = 24
+    private static let cellHeightPx: CGFloat = 48
+
+    /// The view point `x`, `y` pixels from the top-left corner at
+    /// ``scalePx``.
+    private func point(px x: CGFloat, _ y: CGFloat) -> NSPoint {
+        let height: CGFloat = view.bounds.height
+        let fromTop: CGFloat = y / Self.scalePx
+        return NSPoint(x: x / Self.scalePx, y: height - fromTop)
     }
 
     func testAHugeCompositionKeepsTheOverlayWithinTheView() {
@@ -802,12 +826,13 @@ final class TerminalSurfaceViewTests: XCTestCase {
         view.metrics = Self.metrics()
         // 12 px of padding, then 24 x 48 px cells, from the top-left corner,
         // at the metrics' scale of 3.
-        let point = NSPoint(x: (12 + 24 * 3 + 1) / 3, y: view.bounds.height - (12 + 48 * 2 + 1) / 3)
-        let (cell, pixels) = view.cell(at: point)
+        let x: CGFloat = Self.paddingPx + 3 * Self.cellWidthPx + 1
+        let y: CGFloat = Self.paddingPx + 2 * Self.cellHeightPx + 1
+        let (cell, pixels) = view.cell(at: point(px: x, y))
         XCTAssertEqual(cell.col, 3)
         XCTAssertEqual(cell.row, 2)
-        XCTAssertEqual(pixels.x, 12 + 24 * 3 + 1, accuracy: 0.01)
-        XCTAssertEqual(pixels.y, 12 + 48 * 2 + 1, accuracy: 0.01)
+        XCTAssertEqual(pixels.x, x, accuracy: 0.01)
+        XCTAssertEqual(pixels.y, y, accuracy: 0.01)
         let (outside, _) = view.cell(at: NSPoint(x: -50, y: view.bounds.height + 50))
         XCTAssertEqual(outside.col, 0)
         XCTAssertEqual(outside.row, 0)
@@ -817,26 +842,30 @@ final class TerminalSurfaceViewTests: XCTestCase {
         view.metrics = Self.metrics()
         // Points from the top-left corner, in pixels at scale 3.
         func cell(_ x: CGFloat, _ y: CGFloat) -> [UInt16] {
-            let (cell, _) = view.cell(at: NSPoint(x: x / 3, y: view.bounds.height - y / 3))
+            let (cell, _) = view.cell(at: point(px: x, y))
             return [cell.row, cell.col]
         }
-        let right: CGFloat = 12 + 80 * 24
-        let bottom: CGFloat = 12 + 24 * 48
+        let pad: CGFloat = Self.paddingPx
+        let width: CGFloat = Self.cellWidthPx
+        let height: CGFloat = Self.cellHeightPx
+        let right: CGFloat = pad + 80 * width
+        let bottom: CGFloat = pad + 24 * height
         // The four corner cells, just inside the grid.
-        XCTAssertEqual(cell(12, 12), [0, 0])
-        XCTAssertEqual(cell(right - 1, 12), [0, 79])
-        XCTAssertEqual(cell(12, bottom - 1), [23, 0])
+        XCTAssertEqual(cell(pad, pad), [0, 0])
+        XCTAssertEqual(cell(right - 1, pad), [0, 79])
+        XCTAssertEqual(cell(pad, bottom - 1), [23, 0])
         XCTAssertEqual(cell(right - 1, bottom - 1), [23, 79])
         // The padding band on every side belongs to the nearest cell.
         XCTAssertEqual(cell(1, 1), [0, 0])
-        XCTAssertEqual(cell(11, 150), [2, 0], "(150 - 12) / 48")
-        XCTAssertEqual(cell(right + 11, 12), [0, 79])
-        XCTAssertEqual(cell(150, bottom + 11), [23, 5], "(150 - 12) / 24")
+        XCTAssertEqual(cell(pad - 1, 150), [2, 0], "(150 - 12) / 48")
+        XCTAssertEqual(cell(right + pad - 1, pad), [0, 79])
+        XCTAssertEqual(cell(150, bottom + pad - 1), [23, 5], "(150 - 12) / 24")
         // Beyond the surface (a view larger than the grid), still clamped.
         XCTAssertEqual(cell(right + 500, bottom + 500), [23, 79])
         // A cell boundary belongs to the cell it starts.
-        XCTAssertEqual(cell(12 + 24, 12 + 48), [1, 1])
-        XCTAssertEqual(cell(12 + 24 - 0.5, 12 + 48 - 0.5), [0, 0])
+        let second: (x: CGFloat, y: CGFloat) = (pad + width, pad + height)
+        XCTAssertEqual(cell(second.x, second.y), [1, 1])
+        XCTAssertEqual(cell(second.x - 0.5, second.y - 0.5), [0, 0])
     }
 
     func testMouseAndScrollEventsReachTheSession() async throws {

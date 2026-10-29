@@ -785,11 +785,11 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     override func scrollWheel(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         let (cell, _) = cell(at: point)
-        let scale = metrics.map { CGFloat($0.scale) } ?? window?.backingScaleFactor ?? 1
+        let scale: CGFloat = metrics.map { CGFloat($0.scale) } ?? window?.backingScaleFactor ?? 1
         // A notched wheel reports lines; a trackpad reports points.
         let lines: CGFloat
         if event.hasPreciseScrollingDeltas {
-            let lineHeight = metrics.map { CGFloat($0.cellHeightPx) / scale } ?? Self.fallbackLineHeight
+            let lineHeight: CGFloat = metrics.map { CGFloat($0.cellHeightPx) / scale } ?? Self.fallbackLineHeight
             lines = event.scrollingDeltaY / lineHeight
         } else {
             lines = event.scrollingDeltaY
@@ -845,16 +845,18 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     /// the view's top-left corner. The padding band and anything outside the
     /// grid clamp to the nearest edge cell.
     func cell(at point: NSPoint) -> (cell: (col: UInt16, row: UInt16), pixels: CGPoint) {
-        let scale = metrics.map { CGFloat($0.scale) } ?? window?.backingScaleFactor ?? metalLayer.contentsScale
+        let scale: CGFloat = metrics.map { CGFloat($0.scale) } ?? window?.backingScaleFactor ?? metalLayer.contentsScale
         let fromTop = CGPoint(x: point.x, y: isFlipped ? point.y : bounds.height - point.y)
         let pixels = CGPoint(x: fromTop.x * scale, y: fromTop.y * scale)
         guard let metrics, metrics.cellWidthPx > 0, metrics.cellHeightPx > 0 else {
             return ((0, 0), pixels)
         }
         func index(_ value: CGFloat, _ size: UInt32, _ count: UInt16) -> UInt16 {
-            let cell = ((value - CGFloat(metrics.paddingPx)) / CGFloat(size)).rounded(.down)
+            let offset: CGFloat = value - CGFloat(metrics.paddingPx)
+            let cell: CGFloat = (offset / CGFloat(size)).rounded(.down)
             guard cell.isFinite, cell > 0 else { return 0 }
-            return UInt16(min(cell, CGFloat(max(count, 1) - 1)))
+            let last = CGFloat(max(count, 1) - 1)
+            return UInt16(min(cell, last))
         }
         return (
             (index(pixels.x, metrics.cellWidthPx, metrics.cols), index(pixels.y, metrics.cellHeightPx, metrics.rows)),
@@ -869,15 +871,19 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     func compositionCellRect() -> NSRect {
         guard let metrics, metrics.scale > 0 else {
             let size = CGSize(width: Self.fallbackLineHeight / 2, height: Self.fallbackLineHeight)
-            return NSRect(x: 0, y: isFlipped ? 0 : bounds.height - size.height, width: size.width, height: size.height)
+            let y: CGFloat = isFlipped ? 0 : bounds.height - size.height
+            return NSRect(x: 0, y: y, width: size.width, height: size.height)
         }
         let scale = CGFloat(metrics.scale)
-        let padding = CGFloat(metrics.paddingPx) / scale
-        let cell = CGSize(width: CGFloat(metrics.cellWidthPx) / scale, height: CGFloat(metrics.cellHeightPx) / scale)
-        let x = padding + CGFloat(metrics.cursorCol) * cell.width
-        let fromTop = padding + CGFloat(metrics.cursorRow) * cell.height
-        let y = isFlipped ? fromTop : bounds.height - fromTop - cell.height
-        return NSRect(x: x, y: y, width: cell.width * (metrics.cursorWide ? 2 : 1), height: cell.height)
+        let padding: CGFloat = CGFloat(metrics.paddingPx) / scale
+        let cellWidth: CGFloat = CGFloat(metrics.cellWidthPx) / scale
+        let cellHeight: CGFloat = CGFloat(metrics.cellHeightPx) / scale
+        let cell = CGSize(width: cellWidth, height: cellHeight)
+        let x: CGFloat = padding + CGFloat(metrics.cursorCol) * cellWidth
+        let fromTop: CGFloat = padding + CGFloat(metrics.cursorRow) * cellHeight
+        let y: CGFloat = isFlipped ? fromTop : bounds.height - fromTop - cell.height
+        let columns: CGFloat = metrics.cursorWide ? 2 : 1
+        return NSRect(x: x, y: y, width: cell.width * columns, height: cell.height)
     }
 
     // MARK: Marked text overlay
