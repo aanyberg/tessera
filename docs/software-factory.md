@@ -15,16 +15,17 @@ by editing the agent file; the lead refers to agents by name only.
 | `swift-implementer` | One macOS app issue in its own worktree; fixes blockers only on `revise` | opus | high | yes | branch |
 | `rust-critic` | One strict blocker/minor review of crates/ branches, then ship/revise/escalate; owns the "Done when" judgement | opus | high (scoped round 2: medium) | no | no |
 | `swift-critic` | One strict blocker/minor review of apps/macos branches, then ship/revise/escalate; Swift 6 concurrency, AppKit, FFI ownership | opus | high (scoped round 2: medium) | no | no |
-| `code-critic` | One strict blocker/minor review of infra and docs branches (workflows, justfile, scripts, ADRs) | opus | medium (scoped round 2: low) | no | no |
-| `adversarial-tester` | Breaks ship-ready branches with hostile input and real flows; reproduced bugs only | opus | xhigh (repro re-run: high) | scratch only | no |
+| `code-critic` | One strict blocker/minor review of infra and docs branches (workflows, justfile, scripts, ADRs) | sonnet | medium (scoped round 2: low) | no | no |
+| `adversarial-tester` | Breaks ship-ready branches with hostile input and real flows; reproduced bugs only | opus | high (risky changes: xhigh; repro re-run: medium) | scratch only | no |
 | `integrator` | Serialized: one conventional commit on `origin/main` per verified task, lockfile conflicts, PR body (wave mode: squash into local main) | sonnet | medium | conflicts only | task branch / main |
 | `docs-writer` | ADRs, CONTRIBUTING, README, generated references after merges | sonnet | medium | docs | branch |
-| `release-engineer` | CI/release workflows, justfile, packaging, tag/version guards | opus | medium | infra | branch |
+| `release-engineer` | CI/release workflows, justfile, packaging, tag/version guards | sonnet | medium | infra | branch |
 | `flow-analyst` | Post-wave retro from journals and `scripts/factory-stats.sh`: cost/value per role, proposed changes | sonnet | high | retro only | no |
 
 Model aliases map to the current Claude 5 family (`fable` = claude-fable-5-1, `opus` = claude-opus-5-5,
-`sonnet` = claude-sonnet-5-5, `haiku` = claude-haiku-5-5). Fable is not used (token cost); planning, implementation,
-critique, adversarial testing and release engineering run on Opus. Pin a full id in the frontmatter if a role must not follow alias updates.
+`sonnet` = claude-sonnet-5-5, `haiku` = claude-haiku-5-5). Fable is not used (token cost); planning, implementation
+and critique of product code, and adversarial testing run on Opus (Sonnet per spawn for low-risk changes); infra and
+docs review and release engineering run on Sonnet. Pin a full id in the frontmatter if a role must not follow alias updates.
 
 **Effort by round.** Round 1 and adversarial cycle 1 run at the frontmatter effort: they find the defects (wave 3:
 6 majors in round 1, 2 in round 2 from benchmarks and differential fuzzing, none in round 3; both verify failures in cycle 1; waves 5 and 6: critics found
@@ -32,8 +33,17 @@ most serious defects in round 1, which is why round 1 must run those benchmarks 
 tool's `effort: "lower"`, one step below the frontmatter, because it checks a fix range rather than a branch.
 Adversarial cycle 2 (only after a cycle-1 failure) is spawned the same way. Any defect a lower-effort run misses that
 a later gate catches goes into the next retro; that is the signal to revert. `code-critic` and `release-engineer` run
-at medium by the user's decision of 2026-10-28 (no retro data yet: neither ran in wave 3); revisit in the next retro
-that has runs of either.
+at medium by the user's decision of 2026-10-28 (no retro data yet: neither ran in wave 3), and on Sonnet from
+2026-10-29 to cut token cost; revisit in the next retro that has runs of either.
+
+**Adversarial cost levers (2026-10-29).** The frontmatter is `high` with `maxTurns: 80`. The lead raises a cycle-1
+run with the Agent tool's `effort: "higher"` (xhigh) when the change is risky: concurrency, FFI or render path, a
+hot or fast path, parser or pty input handling, or user-visible emulation behaviour (any one of these is risky; a
+change is low-risk only when it meets all of the low-risk list under "Review rules"). It spawns the run with
+`model: "sonnet"` for low-risk changes. Cycle 2 is `effort: "lower"` (medium) on the cycle-1 model. If a later gate
+or a release
+finds a bug an `adversarial-tester` run at the lower setting should have caught, record it in the next retro and
+revert that setting.
 
 **Mechanical checks are scripts, not agents.** `scripts/verify-branch.sh` replaced the haiku `quality-gate` agent
 (0 failures in 7 wave-3 runs, one false-positive flag); `revision-implementer` was removed after 0 uses in wave 3,
@@ -74,9 +84,9 @@ milestone-lead ── draft brief ──► spec-researcher (spec-heavy issues, 
 
 - The critic is chosen by area: `rust-critic` for crates/, `swift-critic` for apps/macos, `code-critic` for infra and docs.
 - Verification is two lenses plus a gate: `scripts/verify-branch.sh` (mechanical), `adversarial-tester` (judgement)
-  and the quality gate. The critic owns "Done when"; the adversarial tester stays at the highest effort for cycle 1
-  because it found 7 of the 9 post-ship majors in wave 1, both verify failures in wave 3, and the bugs the critics
-  missed in waves 5 and 6.
+  and the quality gate. The critic owns "Done when"; the adversarial tester runs at xhigh for risky changes in cycle 1
+  (see "Adversarial cost levers") because it found 7 of the 9 post-ship majors in wave 1, both verify failures in
+  wave 3, and the bugs the critics missed in waves 5 and 6.
 - Any blocker from any gate fails that gate. Minors never fail a gate.
 - Every branch merges current main before critique and before verification so verifiers never report stale-base
   problems as findings.
@@ -275,6 +285,14 @@ Waves run as an agent team (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, set in `.c
 Scripted workflows are not used for waves: they cannot apply judgement when a step fails or a critic and an
 implementer disagree, and they hide progress from the user. A wave is a planning batch and an ordered queue, not a
 shipping unit: up to five tasks are in flight, and each ships as soon as it is verified.
+
+**Session hygiene.** The lead's context grows with every teammate report. Teammates and subagents return a verdict, the
+blockers and a path or issue link, not the full analysis; detail goes into a file or the GitHub issue. Between waves,
+all state that matters is on GitHub (`wave:<n>` labels, merged PRs, cross-issue decisions and deferred findings in
+issue comments), so a lead session can end after a wave and a fresh one resumes by listing the milestone's open
+issues and `wave:<n>` labels and re-running pre-flight. Mid-wave state is not: the final briefs, the lead decisions
+appended to them and each task's round or cycle live in the lead session's task list, so do not replace the lead
+while tasks are in flight. Stop idle teammates, and `/clear` between unrelated tasks.
 
 0. **Pre-flight.** Before planning, the lead checks that local main equals `origin/main`
    (`git fetch origin && git rev-list --count origin/main..main` prints `0`) and that `sccache` is on `PATH`

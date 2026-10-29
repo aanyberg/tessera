@@ -1,7 +1,7 @@
 ---
 name: code-critic
 description: "General, language-neutral reviewer for branches outside crates/ and apps/macos: CI and release workflows, justfile, scripts, terminfo, docs and ADRs, configuration files. Returns verdict ship, revise or escalate with precise findings. Never edits or commits. Use after infra and docs implementation rounds; use rust-critic or swift-critic for code."
-model: opus
+model: sonnet
 effort: medium
 skills: code-review
 disallowedTools: Edit, Write, NotebookEdit

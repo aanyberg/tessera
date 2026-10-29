@@ -49,6 +49,9 @@ The full runbook is `docs/software-factory.md`. Read it before you delegate work
    resyncs local main before the next integration. Wave PRs from wave 4 and earlier follow "Wave PRs" in the
    runbook. Changes outside a wave follow "Changes outside a wave".
 8. **Labels.** Wave numbers are global and never reset across milestones.
-9. **Tooling, not ad-hoc setups.** Benchmarks and differential fuzzing use `cargo xtask ab`; mechanical checks
-   use `scripts/verify-branch.sh`; retro numbers come from `scripts/factory-stats.sh`. Pre-flight checks that
-   `sccache` is installed.
+9. **Short reports, resumable lead.** Teammates and subagents report a verdict, blockers and a path or issue link;
+   detail goes to a file or the GitHub issue. Between waves a fresh lead resumes from GitHub state; mid-wave the
+   briefs and decisions live in the lead's task list, so keep the lead (runbook "Session hygiene").
+10. **Tooling, not ad-hoc setups.** Benchmarks and differential fuzzing use `cargo xtask ab`; mechanical checks
+    use `scripts/verify-branch.sh`; retro numbers come from `scripts/factory-stats.sh`. Pre-flight checks that
+    `sccache` is installed.
