@@ -139,3 +139,28 @@ clean:
 verify-branch-test:
     bash scripts/test-verify-branch.sh
     zsh scripts/test-verify-branch.sh
+
+# #14
+# Fuzz one cargo-fuzz target (parser, terminal, chunking or resize) for <minutes> on nightly; corpus in fuzz/corpus, crashes in fuzz/artifacts
+fuzz target="terminal" minutes="5":
+    #!/usr/bin/env zsh
+    set -euo pipefail
+    target={{quote(target)}} minutes={{quote(minutes)}}
+    if [[ "$minutes" != <1-1440> ]]; then
+        print -ru2 -- "minutes must be a whole number from 1 to 1440, got '$minutes'"; exit 2
+    fi
+    if [[ "$(rustup toolchain list)" != (|*$'\n')nightly* ]]; then
+        print -ru2 -- "no nightly toolchain: rustup toolchain install nightly --profile minimal"; exit 1
+    fi
+    if ! cargo +nightly fuzz --version > /dev/null 2>&1; then
+        print -ru2 -- "no cargo-fuzz: cargo install cargo-fuzz --locked"; exit 1
+    fi
+    # The workspace's lock, so the fuzzers test the workspace's dependency versions (fuzz/Cargo.lock is ignored).
+    cp Cargo.lock fuzz/Cargo.lock
+    targets=("${(@f)$(cargo +nightly fuzz list)}")
+    if (( ! ${targets[(Ie)$target]} )); then
+        print -ru2 -- "unknown fuzz target '$target'; targets: ${targets[*]}"; exit 2
+    fi
+    mkdir -p "fuzz/corpus/$target"
+    cargo +nightly fuzz run "$target" "fuzz/corpus/$target" "fuzz/seeds/$target" -- \
+        -max_total_time="$(( 10#$minutes * 60 ))" -timeout=60 -print_final_stats=1

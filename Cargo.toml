@@ -20,6 +20,8 @@ members = [
     "crates/tessera-devwin",
     "xtask",
 ]
+# cargo-fuzz targets (#14): nightly only, built with `just fuzz`.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

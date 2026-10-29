@@ -38,6 +38,23 @@
 //! [`Action::Esc`] with `byte == b'\\'`. The 8-bit terminator (`0x9C`) ends a
 //! DCS on its own. `CAN` (`0x18`) and `SUB` (`0x1A`) abort a DCS: the parser
 //! emits [`Action::DcsEnd`] and then [`Action::Execute`] for the control byte.
+//!
+//! # Chunking
+//!
+//! [`Parser::advance`] keeps its state between calls, so input may be fed
+//! as it arrives, but the actions are **not** independent of where the input
+//! was split. `vte` 0.15 loses characters when a UTF-8 character completes
+//! across two calls and the bytes after it in its 4-byte completion buffer
+//! do not form valid UTF-8 (the next character is incomplete or invalid):
+//! `advance_partial_utf8` then consumes up to `valid_up_to` rather than the
+//! completed character's length. `"éa中"` fed as `"\xC3"` and the rest
+//! parses as `é`, `中`: the `a` is gone. Valid text split at character
+//! boundaries, ASCII, control bytes, escape sequences and DCS payloads are
+//! unaffected. `tessera_term::Terminal::advance` works around it by holding
+//! back an incomplete character at the end of each call; anything else that
+//! drives the parser directly from a byte stream must do the same until the
+//! parser does it itself (#146). The `chunking` fuzz target in `fuzz/` checks
+//! the terminal; the `parser` target does not compare split and whole input.
 
 #![forbid(unsafe_code)]
 
@@ -159,6 +176,10 @@ impl Parser {
     }
 
     /// Parses `bytes`, invoking `sink` once per decoded action.
+    ///
+    /// A UTF-8 character split across two calls can lose the characters
+    /// after it (crate docs, "Chunking"): feed whole characters, as
+    /// `tessera_term::Terminal::advance` does.
     pub fn advance(&mut self, bytes: &[u8], mut sink: impl FnMut(Action)) {
         let mut perform = Performer {
             sink: &mut sink,
@@ -652,9 +673,12 @@ mod tests {
 
     /// Byte streams that are well-formed UTF-8 in ground state.
     ///
-    /// `vte` deliberately drops bytes when an *invalid* UTF-8 sequence
-    /// straddles two `advance` calls (see `Parser::advance_partial_utf8`
-    /// upstream), so split invariance is only promised for valid text. ASCII
+    /// `vte` drops bytes when an *invalid* UTF-8 sequence straddles two
+    /// `advance` calls (see `Parser::advance_partial_utf8` upstream), so the
+    /// generator sticks to valid text. Even valid text is not split
+    /// invariant (crate docs, "Chunking"; #146): this property passes only
+    /// because the generator rarely puts a split inside a multi-byte
+    /// character that is followed by ASCII and another incomplete one. ASCII
     /// control bytes and escape introducers are still fully covered.
     fn utf8_stream() -> impl Strategy<Value = Vec<u8>> {
         let token = prop_oneof![
@@ -669,6 +693,10 @@ mod tests {
 
     proptest! {
         /// The action stream never depends on where the byte stream was split.
+        ///
+        /// Known flaky until #146: about 1 run in 300 at the default case
+        /// count hits the `vte` split-UTF-8 bug and fails; with 100 000 cases
+        /// it fails within 2 s. A failure here is that bug, not a new one.
         #[test]
         fn split_invariant(bytes in utf8_stream(), cut in 0usize..1024) {
             let whole = parse(&bytes);
