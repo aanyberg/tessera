@@ -13,6 +13,8 @@ publish.workspace = true
 tessera-pty.workspace = true
 tessera-term.workspace = true
 tessera-config.workspace = true
+# Shell integration scripts and their injection on spawn (ADR 0021).
+tessera-shell-integration.workspace = true
 tessera-plugin-api.workspace = true
 tessera-plugin-hello.workspace = true
 # Views: one GPU surface and renderer per session (ADR 0014).

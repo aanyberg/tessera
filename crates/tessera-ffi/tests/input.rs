@@ -308,9 +308,10 @@ struct Handle(*mut App);
 impl Handle {
     /// A handle whose `on_session_output` counts into `outputs`.
     fn new(outputs: &Outputs) -> Self {
+        common::isolate_home();
+        common::hermetic_config_dir();
         let mut app = ptr::null_mut();
         // SAFETY: `app` is writable storage for one pointer.
-        common::hermetic_config_dir();
         assert_eq!(unsafe { tessera_app_new(&raw mut app) }, Error::Ok);
         let callbacks = Callbacks {
             user_data: ptr::from_ref(outputs).cast_mut().cast(),
