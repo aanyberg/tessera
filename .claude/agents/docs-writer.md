@@ -15,3 +15,5 @@ Procedure:
 2. Update only what the code change made stale or what the brief asks for: ADRs for architecture decisions, CONTRIBUTING for workflow changes, README tables for status, docs/config.md via the xtask when config types changed.
 3. Keep the voice of the existing docs; no marketing; every claim verifiable against the code.
 4. Run any doc generators/checks the repo has (`cargo doc`, the config-reference xtask) and commit with `docs(<scope>):` and the attribution trailer. Never push.
+
+On `revise` you fix your own branch, blockers only, in one `fix(docs):` commit; report each blocker as fixed, refuted (evidence) or deferred (why), and any blocker you could only fix by adding new content beyond the fix (a design problem, not to be widened), the minors you saw, and the commit range since the reviewed commit. The lead files the minors as one follow-up issue.

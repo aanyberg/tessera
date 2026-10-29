@@ -7,18 +7,39 @@ description: Tessera software factory. Use in the lead session when planning or 
 
 The full runbook is `docs/software-factory.md`. Read it before you delegate work. These rules are not optional:
 
-1. **PR gate.** Push a branch and open a PR only after the local pipeline has passed: critic `ship` (or a round the
-   lead accepts under runbook step 4), `scripts/verify-branch.sh` pass, `adversarial-tester` pass for product code,
-   and a green `scripts/quality-gate.sh` on the integrated commit. CI only confirms. Never push mid-review.
+1. **PR gate.** Push a branch and open a PR only after the local pipeline has passed: critic `ship` (or the blocker
+   fix commit the review rules clear without a second round, or the applied lead decision after a round-2
+   `escalate`), `scripts/verify-branch.sh` pass,
+   `adversarial-tester` pass for product code (`crates/`, `apps/macos/`; docs, infra, tooling and test-only changes
+   are exempt), and a green `scripts/quality-gate.sh` on the integrated commit. CI only confirms. Never push
+   mid-review.
 2. **Waves run as an agent team.** The lead owns the shared task list and keeps up to five tasks in flight from
    the wave's queue; each task ships as its own PR as soon as it is verified. One teammate per issue implements in
    its own worktree and fixes its own branch on `revise`. Do not use the Workflow tool for waves.
 3. **Fresh reviewers.** Every critique round and every adversarial run is a new one-shot subagent
-   (`rust-critic`, `swift-critic`, `code-critic`, `adversarial-tester`). Never a teammate. Critique rounds 2+ get a
-   scoped brief (previous findings, responses, commit range); rounds 3+ and verify cycle 2 are spawned with
-   `effort: "lower"`. The adversarial brief carries the critic's `coverage`.
-4. **Caps.** Up to 5 critique rounds (escalations do not count) and 2 verify cycles. On `escalate`, the lead
-   decides and records the decision in the brief.
+   (`rust-critic`, `swift-critic`, `code-critic`, `adversarial-tester`). Never a teammate. The adversarial brief
+   carries the critic's `coverage` (checks run versus only read).
+4. **Review rules** (runbook "Review rules"). Round 1 is one strict full review; every finding is a BLOCKER (wrong
+   behaviour, spec or "Done when" miss, data loss or safety, flaky or hanging test, unmet perf bar, breaks a
+   sibling) or a MINOR (docs, wording, non-critical test gaps, polish). The implementer fixes blockers only, in one
+   fix commit with no new behaviour, and reports a mutation check per blocker. Minors go into one follow-up issue
+   in the milestone, labelled for the lowest wave that has not started, filed by the lead; they do not hold the
+   merge (the lead may order a cheap docs or test minor fixed now). A refuted or deferred blocker is a disagreement:
+   the lead (or `milestone-lead`) decides and records it. The lead re-runs each named mutation check against the
+   fix's parent. A second critic round runs only if the fix added new behaviour or code paths, or a blocker
+   was a design problem; it is scoped to the fix range, spawned with `effort: "lower"`, and the last: remaining
+   blockers, old or new, go to the lead as `escalate`, never round 3; round 2 never returns `revise`. The adversarial tester runs once after `ship` for product
+   code; a second cycle only if the first failed, scoped to the repro, at `effort: "lower"`; a cycle-2 failure goes to the lead. For low-risk product
+   changes (list in the runbook) the critic and the adversarial tester may run in parallel; if the critic then asks
+   for a change, only the new range is re-run. On `escalate`, the lead decides and records the decision in the brief.
+
+   | | Before | After |
+   |---|---|---|
+   | Critic rounds | up to 5 | 1, plus a scoped `lower` round 2 only for new behaviour or a design blocker |
+   | Severity | blocker / major / minor | BLOCKER / MINOR; minors never block |
+   | Fix commit | any scope | blockers only, no new behaviour |
+   | Adversarial | up to 2 cycles, early start | once after `ship`; cycle 2 only after a failure; docs, infra, tooling, test-only exempt |
+
 5. **Plan on GitHub.** `milestone-lead` labels issues `wave:<n>` and comments decisions and deferred findings on
    the issue they affect. There is no task-board file.
 6. **Exit codes.** Run the gate as `scripts/quality-gate.sh <wt> > <log> 2>&1; echo $?`. Never trust a status read

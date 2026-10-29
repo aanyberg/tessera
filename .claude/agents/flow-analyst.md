@@ -16,7 +16,7 @@ Start with `scripts/factory-stats.sh --since <first brief> --until <last merge> 
 
 Produce docs/retros/<wave>.md with:
 1. Cost table per role, from the script.
-2. Value table per gate: findings by severity, first-round revise rate, verify failures by lens, and which majors each gate caught that earlier gates missed.
+2. Value table per gate: findings by BLOCKER or MINOR, first-round revise rate, whether a second critic round ran and why, verify failures by lens, and which blockers each gate caught that earlier gates missed.
 3. Structural lessons (collisions between parallel tasks, stale bases, loose pass criteria, spec-heavy issues).
 4. Concrete proposals: per-agent model/effort changes, prompt changes, runbook changes, each with the evidence row that motivates it.
 
