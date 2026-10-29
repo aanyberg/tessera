@@ -114,6 +114,25 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     private let markedTextLayer = CATextLayer()
     private let statusLabel = NSTextField(labelWithString: "")
 
+    // Menu state (Edit and View menus).
+
+    /// Whether text is selected: Copy (and, until #30 decides otherwise,
+    /// Select All) is enabled only then. Always `false` until the selection
+    /// model (#30) sets it.
+    var hasSelection = false
+    /// Where Paste reads from. Tests use a private pasteboard, so the user's
+    /// clipboard is neither read nor changed.
+    var pasteboard: NSPasteboard = .general
+    /// Pastes handed to the session (tests).
+    private(set) var pasteCount = 0
+    /// The font size the surface was last attached with: the configured size,
+    /// which Actual Size (⌘0) returns to. `nil` before the first attach.
+    private(set) var attachedFontSizePt: Float?
+    /// The size font zoom chose, or `nil` at the configured size. The core
+    /// starts a re-attached surface (a lost swapchain, a tab moved to another
+    /// window) at the configured size, so the zoom is applied again then.
+    private(set) var zoomedFontSizePt: Float?
+
     init(session: TesseraSession, frame: NSRect = NSRect(x: 0, y: 0, width: 480, height: 200)) {
         self.session = session
         surface = TesseraSurface(session: session)
@@ -309,6 +328,7 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         do {
             try surface.attach(layer: metalLayer, widthPx: size.widthPx, heightPx: size.heightPx, scale: size.scale)
             refreshMetrics()
+            surfaceAttachedForZoom()
             wantsReattach = false
             reattachFailures = 0
             reattachGaveUpAt = nil
@@ -356,6 +376,7 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     /// surface (its first attach failed) is left alone: it draws nothing,
     /// so a transparent window would show only the desktop.
     func applyLayerOpacity(opaque: Bool) {
+        configurationDidChangeFontSize()
         guard surface.isAttached else { return }
         setWindowOpaque(opaque)
         needsRender = true
@@ -969,6 +990,185 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
             return nil
         }
         return (string.string, markedTextLayer.frame)
+    }
+}
+
+// MARK: Menu actions
+
+/// The Shell, Edit and View items that act on the terminal. The menu sends
+/// them up the responder chain, so they reach the key window's view.
+extension TerminalSurfaceView: NSMenuItemValidation {
+    /// The core's font size bounds (`tessera-render`'s `MIN_FONT_SIZE_PT` and
+    /// `MAX_FONT_SIZE_PT`). The core clamps every size; these only disable
+    /// Smaller and Bigger at either end.
+    static let fontSizeRange: ClosedRange<Float> = 4...512
+    /// One zoom step (D2).
+    static let fontSizeStep: Float = 1
+    /// The most UTF-8 a paste may have: the core's pending input (16 MiB),
+    /// which refuses a larger paste whole.
+    static let maxPasteBytes = 16 << 20
+
+    /// Whether the session's child has exited: nothing more reaches it.
+    private var hasExited: Bool { status != nil }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        switch menuItem.action {
+        case #selector(copy(_:)), #selector(selectAll(_:)):
+            return hasSelection
+        case #selector(paste(_:)), #selector(pasteAsPlainText(_:)):
+            return !hasExited && pasteboard.availableType(from: [.string]) != nil
+        case #selector(clearScrollback(_:)):
+            return !hasExited
+        case #selector(increaseFontSize(_:)):
+            guard let size = metrics?.fontSizePt else { return false }
+            return size < Self.fontSizeRange.upperBound
+        case #selector(decreaseFontSize(_:)):
+            guard let size = metrics?.fontSizePt else { return false }
+            return size > Self.fontSizeRange.lowerBound
+        case #selector(resetFontSize(_:)):
+            guard let size = metrics?.fontSizePt, let attached = attachedFontSizePt else { return false }
+            return size != attached
+        default:
+            return true
+        }
+    }
+
+    /// Copy (⌘C). Does nothing until the selection model (#30) supplies the
+    /// selected text; the item is disabled meanwhile.
+    @objc func copy(_ sender: Any?) {}
+
+    /// Select All (⌘A). Does nothing until the selection model (#30).
+    @objc override func selectAll(_ sender: Any?) {}
+
+    /// Paste (⌘V): the pasteboard's text goes to the session, which strips
+    /// what a paste must not carry and brackets it when the terminal asked
+    /// for bracketed paste (D5). No text on the pasteboard sends nothing.
+    /// A composition in progress is kept, and the paste goes ahead of it.
+    @objc func paste(_ sender: Any?) {
+        guard let text = pasteboard.string(forType: .string), !text.isEmpty else { return }
+        guard Self.fitsPasteLimit(text) else {
+            Self.log.error("paste not sent: \(text.utf16.count) UTF-16 units is more than the core takes")
+            NSSound.beep()
+            return
+        }
+        pasteCount += 1
+        do {
+            try session.paste(text)
+        } catch {
+            // Too large for the pending input, or the shell exited.
+            Self.log.error("paste not sent: \(String(describing: error), privacy: .public)")
+            NSSound.beep()
+        }
+    }
+
+    /// Whether `text` may fit the core's pending input. The core refuses a
+    /// larger paste only after the wrapper has transcoded all of it to UTF-8
+    /// (about 300 ms for 18 MiB on the main thread), so a paste that cannot
+    /// fit is refused here first. UTF-8 is never shorter than UTF-16 and at
+    /// most three times as long; the pasteboard's string is UTF-16, whose
+    /// count is free, while counting its UTF-8 takes a scan (about 15 ms for
+    /// 9 Mi characters), needed only when the text could be too long. The
+    /// core still refuses a paste that fits the limit but not the pending
+    /// input left (an earlier paste still being written).
+    static func fitsPasteLimit(_ text: String) -> Bool {
+        let units = text.utf16.count
+        if units > maxPasteBytes { return false }
+        if units <= maxPasteBytes / 3 { return true }
+        return text.utf8.count <= maxPasteBytes
+    }
+
+    /// Paste as Plain Text (⌥⇧⌘V): the same as Paste, since the pasteboard's
+    /// plain string is all a paste sends. It differs once copy modes (#47)
+    /// put styled text on the pasteboard.
+    @objc func pasteAsPlainText(_ sender: Any?) {
+        paste(sender)
+    }
+
+    /// Clear to Start (⌘K): the scrollback and the screen above the cursor
+    /// line go, so the prompt line becomes the top row. The core sends no
+    /// output event for it, so the view redraws itself; an idle terminal's
+    /// display link is paused and would otherwise keep the old screen.
+    @objc func clearScrollback(_ sender: Any?) {
+        do {
+            try session.clearScrollback()
+            needsRender = true
+        } catch {
+            Self.log.debug("clear not sent: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    /// Bigger (⌘+ and ⌘=): one step up from the surface's current size.
+    @objc func increaseFontSize(_ sender: Any?) {
+        stepFontSize(by: Self.fontSizeStep)
+    }
+
+    /// Smaller (⌘-): one step down from the surface's current size.
+    @objc func decreaseFontSize(_ sender: Any?) {
+        stepFontSize(by: -Self.fontSizeStep)
+    }
+
+    /// Actual Size (⌘0): back to the size the surface was attached with.
+    @objc func resetFontSize(_ sender: Any?) {
+        guard let attached = attachedFontSizePt else { return }
+        setFontSize(attached)
+    }
+
+    /// Zoom applies to this view only (D2); it steps from what the core
+    /// reports, so a size it clamped is where the next step starts.
+    private func stepFontSize(by step: Float) {
+        do {
+            let current = try surface.metrics().fontSizePt
+            setFontSize(current + step)
+        } catch {
+            Self.log.debug("no surface to zoom: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    private func setFontSize(_ points: Float) {
+        let size: Float = min(max(points, Self.fontSizeRange.lowerBound), Self.fontSizeRange.upperBound)
+        do {
+            try surface.setFontSize(size)
+        } catch {
+            Self.log.error("font size not set: \(String(describing: error), privacy: .public)")
+            return
+        }
+        refreshMetrics()
+        let applied = metrics?.fontSizePt ?? size
+        zoomedFontSizePt = applied == attachedFontSizePt ? nil : applied
+        // The cells changed size: redraw. `refreshMetrics` moved a
+        // composition with them.
+        needsRender = true
+    }
+
+    /// A configuration edit reached every view (#100). When it changed
+    /// `font_size`, the core set every view to the new size, a zoomed one
+    /// included, so the zoom ends and the new size is what Actual Size
+    /// returns to; any other edit leaves each view's size alone, and a zoom
+    /// with it. Which of the two happened shows only in the size: a view at
+    /// its zoom is taken to have kept it, so a new configured size equal to
+    /// the current zoom is indistinguishable from no font change, and Actual
+    /// Size still returns to the old configured size then. A view without a
+    /// surface learns the new size at its next attach (and keeps its zoom).
+    private func configurationDidChangeFontSize() {
+        refreshMetrics()
+        guard let size = metrics?.fontSizePt else { return }
+        if let zoom = zoomedFontSizePt {
+            guard size != zoom else { return }
+            zoomedFontSizePt = nil
+        }
+        attachedFontSizePt = size
+    }
+
+    /// Records the configured size a surface was attached with and applies
+    /// the zoom again after a re-attach, which starts at the configured size.
+    private func surfaceAttachedForZoom() {
+        attachedFontSizePt = metrics?.fontSizePt
+        guard let zoom = zoomedFontSizePt else { return }
+        if zoom == attachedFontSizePt {
+            zoomedFontSizePt = nil
+        } else {
+            setFontSize(zoom)
+        }
     }
 }
 

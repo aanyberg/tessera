@@ -53,12 +53,15 @@ final class TerminalSurfaceViewTests: XCTestCase {
         window.contentView = view
         _ = window.makeFirstResponder(view)
         setKey(Self.startKey)
+        // Never the user's clipboard.
+        view.pasteboard = NSPasteboard(name: NSPasteboard.Name("com.aanyberg.tessera.tests.\(UUID().uuidString)"))
         // The recorder prints R once raw mode is set.
         try await waitUntil("the recorder is in raw mode") { FileManager.default.fileExists(atPath: self.file.path) }
         try await Task.sleep(for: .milliseconds(100))
     }
 
     override func tearDown() async throws {
+        view?.pasteboard.releaseGlobally()
         for extra in extraWindows + [window] {
             extra?.close()
         }
@@ -927,6 +930,341 @@ final class TerminalSurfaceViewTests: XCTestCase {
                 .flatMap(NSEvent.init(cgEvent:)))
         view.scrollWheel(with: scroll)
         try await assertBytes([], "mouse reporting is not on, and the screen has no scrollback")
+    }
+
+    // MARK: Menu actions: Edit
+
+    private func menuItem(_ action: Selector) -> NSMenuItem {
+        NSMenuItem(title: NSStringFromSelector(action), action: action, keyEquivalent: "")
+    }
+
+    private func isEnabled(_ action: Selector) -> Bool {
+        view.validateMenuItem(menuItem(action))
+    }
+
+    func testPasteSendsThePasteboardTextToTheSession() async throws {
+        view.pasteboard.clearContents()
+        view.pasteboard.setString("echo pasted", forType: .string)
+        XCTAssertTrue(isEnabled(#selector(TerminalSurfaceView.paste(_:))))
+        XCTAssertTrue(isEnabled(#selector(TerminalSurfaceView.pasteAsPlainText(_:))))
+        view.paste(nil)
+        XCTAssertEqual(view.pasteCount, 1)
+        try await assertBytes(Array("echo pasted".utf8), "bracketed paste is off: the text as is")
+        view.pasteboard.clearContents()
+        view.pasteboard.setString("plain", forType: .string)
+        view.pasteAsPlainText(nil)
+        XCTAssertEqual(view.pasteCount, 2)
+        try await assertBytes(Array("echo pasted~plain".utf8), "after the first sentinel")
+    }
+
+    func testPasteWithNoTextOnThePasteboardSendsNothing() async throws {
+        view.pasteboard.clearContents()
+        XCTAssertFalse(isEnabled(#selector(TerminalSurfaceView.paste(_:))), "nothing to paste")
+        XCTAssertFalse(isEnabled(#selector(TerminalSurfaceView.pasteAsPlainText(_:))))
+        view.paste(nil)
+        view.pasteAsPlainText(nil)
+        // Something other than text: still nothing to paste.
+        view.pasteboard.setData(Data([1, 2, 3]), forType: .png)
+        view.paste(nil)
+        XCTAssertFalse(isEnabled(#selector(TerminalSurfaceView.paste(_:))))
+        // An empty string is no paste either.
+        view.pasteboard.clearContents()
+        view.pasteboard.setString("", forType: .string)
+        view.paste(nil)
+        XCTAssertEqual(view.pasteCount, 0, "no call into the core")
+        try await assertBytes([])
+    }
+
+    func testAPasteLargerThanTheCoreTakesIsRefusedBeforeTheCore() async throws {
+        // Past the 16 MiB of pending input a paste may take, counted in
+        // UTF-16 (free), and in UTF-8 when that could be larger: two-byte é
+        // makes 9 Mi characters 18 MiB. Neither reaches the core, which would
+        // transcode it all before refusing it.
+        for text in [String(repeating: "x", count: 16 << 20 + 1), String(repeating: "é", count: 9 << 20)] {
+            view.pasteboard.clearContents()
+            view.pasteboard.setString(text, forType: .string)
+            view.paste(nil)
+        }
+        XCTAssertEqual(view.pasteCount, 0, "no call into the core")
+        try await assertBytes([])
+    }
+
+    func testThePasteLimitCountsUTF8() {
+        let limit = TerminalSurfaceView.maxPasteBytes
+        XCTAssertTrue(TerminalSurfaceView.fitsPasteLimit(String(repeating: "x", count: limit)))
+        XCTAssertFalse(TerminalSurfaceView.fitsPasteLimit(String(repeating: "x", count: limit + 1)))
+        // é is 2 bytes, 日 3, 🎉 4 (two UTF-16 units).
+        XCTAssertTrue(TerminalSurfaceView.fitsPasteLimit(String(repeating: "é", count: limit / 2)))
+        XCTAssertFalse(TerminalSurfaceView.fitsPasteLimit(String(repeating: "é", count: limit / 2) + "x"))
+        XCTAssertTrue(TerminalSurfaceView.fitsPasteLimit(String(repeating: "日", count: limit / 3)))
+        XCTAssertFalse(TerminalSurfaceView.fitsPasteLimit(String(repeating: "日", count: limit / 3 + 1)))
+        XCTAssertTrue(TerminalSurfaceView.fitsPasteLimit(String(repeating: "🎉", count: limit / 4)))
+        XCTAssertFalse(TerminalSurfaceView.fitsPasteLimit(String(repeating: "🎉", count: limit / 4) + "x"))
+    }
+
+    func testPasteAndClearToStartAreDisabledOnceTheShellExited() {
+        view.pasteboard.clearContents()
+        view.pasteboard.setString("text", forType: .string)
+        let paste = #selector(TerminalSurfaceView.paste(_:))
+        let plain = #selector(TerminalSurfaceView.pasteAsPlainText(_:))
+        let clear = #selector(TerminalSurfaceView.clearScrollback(_:))
+        XCTAssertTrue(isEnabled(paste))
+        XCTAssertTrue(isEnabled(plain))
+        XCTAssertTrue(isEnabled(clear))
+        view.sessionDidExit(code: 0, signal: 0)
+        XCTAssertFalse(isEnabled(paste), "nothing reaches an exited shell")
+        XCTAssertFalse(isEnabled(plain))
+        XCTAssertFalse(isEnabled(clear))
+    }
+
+    func testCopyAndSelectAllAreDisabledWithoutASelection() async throws {
+        let copy = #selector(TerminalSurfaceView.copy(_:))
+        let selectAll = #selector(TerminalSurfaceView.selectAll(_:))
+        XCTAssertFalse(view.hasSelection)
+        XCTAssertFalse(isEnabled(copy))
+        XCTAssertFalse(isEnabled(selectAll))
+        // Wired, so the selection model (#30) only has to supply the text.
+        view.hasSelection = true
+        XCTAssertTrue(isEnabled(copy))
+        XCTAssertTrue(isEnabled(selectAll))
+        view.pasteboard.clearContents()
+        view.copy(nil)
+        view.selectAll(nil)
+        XCTAssertNil(view.pasteboard.string(forType: .string), "nothing to copy yet")
+        try await assertBytes([])
+    }
+
+    // MARK: Menu actions during a composition
+
+    /// Paste, ⌘K and zoom leave a composition alone (ADR 0017): the paste is
+    /// sent ahead of it, and the input method commits it later as usual.
+    func testPasteDuringACompositionIsSentAndKeepsTheComposition() async throws {
+        typeNihongo()
+        view.pasteboard.clearContents()
+        view.pasteboard.setString("ls", forType: .string)
+        view.paste(nil)
+        XCTAssertTrue(view.hasMarkedText())
+        XCTAssertEqual(view.markedTextOverlay?.text, "にほんご")
+        try await assertBytes(Array("ls".utf8), "the paste only, not the composition")
+    }
+
+    func testClearToStartAndZoomDuringACompositionKeepIt() throws {
+        try requireSurface()
+        typeNihongo()
+        view.clearScrollback(nil)
+        XCTAssertEqual(view.markedTextOverlay?.text, "にほんご")
+        let before = try XCTUnwrap(view.markedTextOverlay).frame
+        view.increaseFontSize(nil)
+        XCTAssertEqual(view.markedTextOverlay?.text, "にほんご")
+        let after = try XCTUnwrap(view.markedTextOverlay).frame
+        XCTAssertGreaterThan(after.height, before.height, "the overlay follows the larger cells")
+    }
+
+    // MARK: Menu actions: Clear to Start
+
+    func testClearToStartMovesThePromptLineToTheTopAndRedraws() async throws {
+        try requireSurface()
+        // A session that prints 100 lines, marks the file and waits.
+        let marker = file.appendingPathExtension("printed")
+        defer { try? FileManager.default.removeItem(at: marker) }
+        appDelegate.spawnOptions = .init(
+            program: "/bin/sh", arguments: ["-c", #"seq 1 100; : > "$0"; exec cat"#, marker.path])
+        let controller = try appDelegate.newWindow()
+        let printed = try XCTUnwrap(controller.contentView as? TerminalSurfaceView)
+        let other = KeyControlledWindow(contentRect: printed.frame)
+        extraWindows.append(other)
+        other.contentView = printed
+        try XCTSkipUnless(printed.surface.isAttached, "the second view has no surface")
+        try await waitUntil("seq has printed") { FileManager.default.fileExists(atPath: marker.path) }
+        try await waitUntil("the output has reached the screen") {
+            guard let metrics = try? printed.surface.metrics() else { return false }
+            return metrics.rows > 1 && metrics.cursorRow == metrics.rows - 1
+        }
+        // The rest of the output, and its delivery to the view.
+        try await Task.sleep(for: .milliseconds(200))
+        // Idle: drawn, nothing left to draw, the link paused.
+        printed.occlusionOverride = false
+        printed.displayLinkDidFire()
+        XCTAssertTrue(printed.isDisplayLinkPaused, "idle before ⌘K")
+        let renders = printed.renderCount
+        XCTAssertTrue(printed.validateMenuItem(menuItem(#selector(TerminalSurfaceView.clearScrollback(_:)))))
+
+        printed.clearScrollback(nil)
+        XCTAssertEqual(try printed.surface.metrics().cursorRow, 0, "the prompt line is the top row (#107)")
+        XCTAssertFalse(printed.isDisplayLinkPaused, "the core sends no output for it: the view wakes its link")
+        printed.displayLinkDidFire()
+        XCTAssertEqual(printed.renderCount, renders + 1, "the cleared screen is drawn")
+    }
+
+    // MARK: Menu actions: font zoom
+
+    private func fontSize(_ view: TerminalSurfaceView) throws -> Float {
+        try view.surface.metrics().fontSizePt
+    }
+
+    func testBiggerSmallerAndActualSizeStepTheFontSize() throws {
+        try requireSurface()
+        let base = try fontSize(view)
+        XCTAssertEqual(view.attachedFontSizePt, base, "recorded at attach")
+        let cell = try view.surface.metrics().cellHeightPx
+        view.occlusionOverride = false
+        view.displayLinkDidFire()
+        XCTAssertTrue(view.isDisplayLinkPaused)
+
+        view.increaseFontSize(nil)
+        XCTAssertEqual(try fontSize(view), base + 1, "1 pt a step (D2)")
+        XCTAssertEqual(view.metrics?.fontSizePt, base + 1, "the view's metrics follow at once")
+        XCTAssertGreaterThan(try view.surface.metrics().cellHeightPx, cell, "larger cells")
+        XCTAssertFalse(view.isDisplayLinkPaused, "a zoom redraws")
+        view.displayLinkDidFire()
+        view.increaseFontSize(nil)
+        XCTAssertEqual(try fontSize(view), base + 2)
+        XCTAssertTrue(isEnabled(#selector(TerminalSurfaceView.resetFontSize(_:))))
+
+        view.decreaseFontSize(nil)
+        view.decreaseFontSize(nil)
+        view.decreaseFontSize(nil)
+        XCTAssertEqual(try fontSize(view), base - 1)
+        XCTAssertEqual(view.zoomedFontSizePt, base - 1)
+
+        view.displayLinkDidFire()
+        view.resetFontSize(nil)
+        XCTAssertEqual(try fontSize(view), base, "⌘0: the size the view was attached with")
+        XCTAssertEqual(view.metrics?.fontSizePt, base)
+        XCTAssertEqual(try view.surface.metrics().cellHeightPx, cell)
+        XCTAssertNil(view.zoomedFontSizePt)
+        XCTAssertFalse(view.isDisplayLinkPaused)
+        XCTAssertFalse(isEnabled(#selector(TerminalSurfaceView.resetFontSize(_:))), "already the actual size")
+    }
+
+    func testZoomIsPerView() throws {
+        try requireSurface()
+        appDelegate.spawnOptions = .init(program: "/bin/cat")
+        let controller = try appDelegate.newWindow()
+        let second = try XCTUnwrap(controller.contentView as? TerminalSurfaceView)
+        let other = KeyControlledWindow(contentRect: second.frame)
+        extraWindows.append(other)
+        other.contentView = second
+        try XCTSkipUnless(second.surface.isAttached, "the second view has no surface")
+        let base = try fontSize(second)
+
+        view.increaseFontSize(nil)
+        view.increaseFontSize(nil)
+        XCTAssertEqual(try fontSize(view), base + 2)
+        XCTAssertEqual(try fontSize(second), base, "the other tab keeps its size")
+        second.decreaseFontSize(nil)
+        XCTAssertEqual(try fontSize(second), base - 1)
+        XCTAssertEqual(try fontSize(view), base + 2)
+    }
+
+    func testBiggerAndSmallerAreDisabledAtTheCoresBounds() throws {
+        try requireSurface()
+        let bigger = #selector(TerminalSurfaceView.increaseFontSize(_:))
+        let smaller = #selector(TerminalSurfaceView.decreaseFontSize(_:))
+        XCTAssertTrue(isEnabled(bigger))
+        XCTAssertTrue(isEnabled(smaller))
+        XCTAssertFalse(isEnabled(#selector(TerminalSurfaceView.resetFontSize(_:))), "at the actual size")
+
+        // Half a step below the largest size: one step clamps to it.
+        try view.surface.setFontSize(511.5)
+        view.increaseFontSize(nil)
+        XCTAssertEqual(try fontSize(view), 512)
+        XCTAssertFalse(isEnabled(bigger), "at the core's largest size")
+        XCTAssertTrue(isEnabled(smaller))
+        view.increaseFontSize(nil)
+        XCTAssertEqual(try fontSize(view), 512)
+
+        try view.surface.setFontSize(4.5)
+        view.decreaseFontSize(nil)
+        XCTAssertEqual(try fontSize(view), 4)
+        XCTAssertFalse(isEnabled(smaller), "at the core's smallest size")
+        XCTAssertTrue(isEnabled(bigger))
+
+        // Without a surface there is nothing to zoom.
+        view.metrics = nil
+        XCTAssertFalse(isEnabled(bigger))
+        XCTAssertFalse(isEnabled(smaller))
+        XCTAssertFalse(isEnabled(#selector(TerminalSurfaceView.resetFontSize(_:))))
+    }
+
+    func testTheZoomSurvivesMovingTheTabToAnotherWindow() throws {
+        try requireSurface()
+        let base = try fontSize(view)
+        view.increaseFontSize(nil)
+        view.increaseFontSize(nil)
+        // Leaving the window detaches the surface; the new window attaches a
+        // new one, which the core starts at the configured size.
+        let other = KeyControlledWindow(contentRect: view.frame)
+        extraWindows.append(other)
+        other.contentView = view
+        XCTAssertTrue(view.surface.isAttached)
+        XCTAssertEqual(view.attachedFontSizePt, base)
+        XCTAssertEqual(try fontSize(view), base + 2, "the zoom is applied again")
+        view.resetFontSize(nil)
+        XCTAssertEqual(try fontSize(view), base)
+    }
+
+    // MARK: Menu actions: zoom and configuration edits (#100)
+
+    /// A configuration edit reaches the view as the core would deliver it:
+    /// the core has already set every view to a new `font_size` (here
+    /// `newSize`, or no change), then reports the appearance change.
+    private func applyConfigurationEdit(fontSize newSize: Float?) throws {
+        if let newSize {
+            try view.surface.setFontSize(newSize)
+        }
+        view.applyLayerOpacity(opaque: true)
+    }
+
+    func testANewConfiguredFontSizeEndsTheZoom() throws {
+        try requireSurface()
+        let base = try fontSize(view)
+        view.increaseFontSize(nil)
+        view.increaseFontSize(nil)
+        XCTAssertEqual(view.zoomedFontSizePt, base + 2)
+        try applyConfigurationEdit(fontSize: base + 5)
+        XCTAssertNil(view.zoomedFontSizePt, "the core set the view to the new size")
+        XCTAssertEqual(view.attachedFontSizePt, base + 5, "the new actual size")
+        XCTAssertEqual(view.metrics?.fontSizePt, base + 5)
+        XCTAssertFalse(isEnabled(#selector(TerminalSurfaceView.resetFontSize(_:))), "already at the actual size")
+        view.decreaseFontSize(nil)
+        view.resetFontSize(nil)
+        XCTAssertEqual(try fontSize(view), base + 5, "⌘0 returns to the new configured size")
+    }
+
+    func testAnEditWithoutAFontSizeChangeKeepsTheZoom() throws {
+        try requireSurface()
+        let base = try fontSize(view)
+        view.increaseFontSize(nil)
+        try applyConfigurationEdit(fontSize: nil)
+        XCTAssertEqual(view.zoomedFontSizePt, base + 1, "colours only: still zoomed")
+        XCTAssertEqual(view.attachedFontSizePt, base)
+        view.resetFontSize(nil)
+        XCTAssertEqual(try fontSize(view), base)
+    }
+
+    func testANewConfiguredFontSizeBecomesTheActualSizeOfAnUnzoomedView() throws {
+        try requireSurface()
+        let base = try fontSize(view)
+        try applyConfigurationEdit(fontSize: base + 3)
+        XCTAssertNil(view.zoomedFontSizePt)
+        XCTAssertEqual(view.attachedFontSizePt, base + 3)
+        XCTAssertEqual(view.metrics?.fontSizePt, base + 3, "the view's metrics follow")
+        view.increaseFontSize(nil)
+        XCTAssertEqual(view.zoomedFontSizePt, base + 4)
+        view.resetFontSize(nil)
+        XCTAssertEqual(try fontSize(view), base + 3)
+    }
+
+    func testANewConfiguredSizeEqualToTheZoomCannotBeTold() throws {
+        // The documented edge: the size alone cannot show the edit, so the
+        // view stays zoomed and ⌘0 returns to the old configured size.
+        try requireSurface()
+        let base = try fontSize(view)
+        view.increaseFontSize(nil)
+        try applyConfigurationEdit(fontSize: base + 1)
+        XCTAssertEqual(view.zoomedFontSizePt, base + 1)
+        XCTAssertEqual(view.attachedFontSizePt, base)
     }
 
     // MARK: Helpers

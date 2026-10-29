@@ -158,8 +158,18 @@ selectors), and the view decides afterwards, with
   handles before `keyDown`) are not sent to the core: they go up the
   responder chain, ending in a beep, as in Terminal.app. The core has no
   Super bindings yet and its encoder turns Super into kitty-style `CSI u`
-  sequences (Cmd-V would type `ESC[118;9u` into the shell, and there is no
-  Edit menu until #29). Revisited when the core gains Super bindings (#43).
+  sequences (an unbound Cmd-letter would type `ESC[<code>;9u` into the
+  shell). The main menu (#29) takes Cmd-C, Cmd-V, Cmd-K, Cmd-A, the zoom
+  keys and the window and tab keys before `keyDown` sees them. Revisited
+  when the core gains Super bindings (#43).
+- **Menu actions during a composition** (#29) leave it alone: Paste sends
+  the pasteboard's text as a paste, ahead of the composition, which stays
+  marked until the input method commits or cancels it; Clear to Start and
+  font zoom keep it too, and a zoom moves its overlay and tells the input
+  method its rects moved. Discarding or committing the composition first,
+  as a text view replaces its marked text, was not chosen: the composition
+  is not yet in the terminal, and a paste must not change what the user is
+  still composing.
 - `unmarkText`, losing first responder and the window losing key status
   discard a composition without sending it
   (D5, as both reference terminals, despite the protocol's "commit"
@@ -271,7 +281,8 @@ screenshots. Rows from the fixture marked (unverified) are among them.
 | Move a window between a Retina and a non-Retina display | crisp text on both, grid size recomputed | pending |
 | Translucent theme (`#808080`, `opacity = 0.5`) | desktop shows through; does not look like `#bababa` (#20) | pending |
 | Window minimised or fully covered while `yes` runs | CPU drops (link paused); resumes on restore | pending |
-| Cmd-V, Cmd-K, Cmd-A (and Cmd-Shift variants) at a zsh prompt | nothing typed into zsh; a beep at most | pending |
+| Cmd-V, Cmd-K, Cmd-A at a zsh prompt | Cmd-V pastes the clipboard's text, Cmd-K clears to the prompt line (#29), Cmd-A does nothing until the selection model (#30); no escape sequence typed into zsh | pending |
+| Cmd-Shift variants without a menu item (Cmd-Shift-V, Cmd-Shift-K, Cmd-Shift-A) at a zsh prompt | nothing typed into zsh; a beep at most | pending |
 | Idle visible window (prompt, no output) | near-zero CPU (link idles) | pending |
 | Switch light/dark mode while composing | overlay colours follow | pending |
 | Focus loss mid Japanese composition: click another window, Cmd-Tab away, switch tab | composition disappears, nothing sent | pending |
