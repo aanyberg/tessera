@@ -1,5 +1,7 @@
 import AppKit
 import TesseraKit
+import UniformTypeIdentifiers
+import os
 
 /// Entry point and application lifecycle: owns the core, the window
 /// registry and the signal handling. Each tab is a ``TerminalWindowController``
@@ -15,6 +17,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) var windowControllers: [TerminalWindowController] = []
     /// What new windows and tabs run. Tests replace the login shell here.
     var spawnOptions = TesseraSession.SpawnOptions()
+    /// Opens the configuration file and the help page. Tests record instead,
+    /// so no editor or browser starts.
+    var opener: any ExternalOpener = WorkspaceOpener()
+    /// Creates `config.toml` where it is missing and returns its path, for
+    /// Settings…: the core's ``TesseraApp/createConfig()`` and
+    /// ``TesseraApp/configPath`` unless a test replaces it, so hosted tests
+    /// never create a configuration directory or start the core's watch of
+    /// it.
+    var configFileCreator: (@MainActor () throws -> URL)?
+
+    /// Where Tessera Help goes: the README until there is a help book.
+    static let helpURL = URL(string: "https://github.com/aanyberg/tessera#readme")!
+
+    private static let log = Logger(subsystem: "com.aanyberg.tessera", category: "app")
 
     private var core: TesseraApp?
     private let router = SessionRouter()
@@ -121,6 +137,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: Configuration and help
+
+    /// Settings… (⌘,): opens `config.toml` in the default editor, after the
+    /// core has written its commented defaults if the file is missing (and
+    /// started applying edits of it live). Replaced by the Preferences window
+    /// in #40 (D6). When no application opens it, or opening fails, Finder
+    /// shows the file instead, so the user can still find it.
+    @objc func openConfigFile(_ sender: Any?) {
+        let file: URL
+        do {
+            file = try configFileCreator?() ?? createCoreConfigFile()
+        } catch {
+            presentError("Could not open the configuration file", error)
+            return
+        }
+        guard let editor = opener.editor(for: file) else {
+            Self.log.error("no application opens \(file.path, privacy: .public); showing it in Finder")
+            opener.reveal(file)
+            return
+        }
+        opener.open(file, withApplicationAt: editor) { [weak self] error in
+            guard let error, let self else { return }
+            Self.log.error("could not open \(file.path, privacy: .public): \(String(describing: error), privacy: .public)")
+            self.opener.reveal(file)
+        }
+    }
+
+    private func createCoreConfigFile() throws -> URL {
+        let core = try self.core ?? startCore()
+        try core.createConfig()
+        return core.configPath
+    }
+
+    /// Tessera Help (⌘?): the README, in the default browser.
+    @objc func openHelp(_ sender: Any?) {
+        if !opener.openURL(Self.helpURL) {
+            Self.log.error("could not open \(Self.helpURL.absoluteString, privacy: .public)")
+        }
+    }
+
     private func makeController() throws -> TerminalWindowController {
         let core = try self.core ?? startCore()
         let session = try core.spawn(spawnOptions)
@@ -141,9 +197,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func presentOpenError(_ error: any Error) {
+        presentError("Could not open a terminal", error)
+    }
+
+    private func presentError(_ message: String, _ error: any Error) {
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "Could not open a terminal"
+        alert.messageText = message
         alert.informativeText = "\(error)"
         alert.runModal()
     }
@@ -188,3 +248,50 @@ extension AppDelegate: TerminalWindowControllerDelegate {
         windowControllers.removeAll { $0 === controller }
     }
 }
+
+/// Opens things outside the app: the configuration file and the help page.
+/// What to do when that fails is ``AppDelegate``'s; this only reaches
+/// `NSWorkspace`, so tests can stand in for it.
+@MainActor
+protocol ExternalOpener {
+    /// Opens a web page in the default browser; `false` if it could not.
+    func openURL(_ url: URL) -> Bool
+    /// The application that opens `file`: the one registered for its type,
+    /// else the default plain-text editor, as nothing claims `.toml` on a
+    /// stock system. `nil` if there is none.
+    func editor(for file: URL) -> URL?
+    /// Opens `file` with `application`; `completion` runs on the main actor
+    /// with the error, if any.
+    func open(
+        _ file: URL, withApplicationAt application: URL,
+        completion: @escaping @MainActor @Sendable ((any Error)?) -> Void)
+    /// Shows `file` selected in a Finder window.
+    func reveal(_ file: URL)
+}
+
+/// ``ExternalOpener`` through `NSWorkspace`.
+struct WorkspaceOpener: ExternalOpener {
+    func openURL(_ url: URL) -> Bool {
+        NSWorkspace.shared.open(url)
+    }
+
+    func editor(for file: URL) -> URL? {
+        let workspace = NSWorkspace.shared
+        return workspace.urlForApplication(toOpen: file) ?? workspace.urlForApplication(toOpen: .plainText)
+    }
+
+    func open(
+        _ file: URL, withApplicationAt application: URL,
+        completion: @escaping @MainActor @Sendable ((any Error)?) -> Void
+    ) {
+        let configuration = NSWorkspace.OpenConfiguration()
+        NSWorkspace.shared.open([file], withApplicationAt: application, configuration: configuration) { _, error in
+            Task { @MainActor in completion(error) }
+        }
+    }
+
+    func reveal(_ file: URL) {
+        NSWorkspace.shared.activateFileViewerSelecting([file])
+    }
+}
+

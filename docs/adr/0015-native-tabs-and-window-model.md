@@ -43,7 +43,9 @@ the order of the tabs in each bar (`NSWindow.tabGroup.windows`).
   tab; AppKit removes the tab bar's window with its last tab. ⇧⌘W (Close
   Window) sends `performClose(_:)` to every tab of the key window's tab bar.
 - The Window menu uses AppKit's tab actions: Show Previous Tab (⇧⌘[), Show
-  Next Tab (⇧⌘]), Move Tab to New Window, Merge All Windows and Show Tab Bar.
+  Next Tab (⇧⌘]), Move Tab to New Window and Merge All Windows. Show Tab
+  Bar moved to the View menu in #29, beside AppKit's Show All Tabs, as in
+  Terminal.app and Safari.
   Dragging tabs to reorder them or out into a new window is AppKit's.
 - ⌘1 to ⌘9 select `tabGroup.windows[0...8]`, and are disabled past the
   last tab.
@@ -55,7 +57,8 @@ index in its tab bar, wrapping at either end as AppKit does; ⌘1 to ⌘9 use
 the same method. The menu items still send AppKit's selectors, so anything
 else that sends them reaches the same code.
 
-The menu bar is built in `MainMenu`; #29 adds its Edit and View items there.
+The menu bar is built in `MainMenu`; #29 added its Edit, View and Help
+menus there.
 
 ### The model stays in Swift for 0.1.0
 
