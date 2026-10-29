@@ -4,7 +4,7 @@ internal import TesseraCore
 
 /// A session's on-screen surface: the `CAMetalLayer` the core draws the
 /// session into, through `tessera_surface_attach`, `_resize`, `_render`,
-/// `_set_font_size` and `_detach` (ADR 0014).
+/// `_set_font_size`, `_metrics` and `_detach` (ADR 0014).
 ///
 /// Main actor only, like the C functions. Once attached, the session's grid
 /// follows the surface: ``attach(layer:widthPx:heightPx:scale:)``,
@@ -70,9 +70,91 @@ public final class TesseraSurface {
     private var attachment: Detacher?
 
     /// The size the core last accepted from an attach or resize, or `nil`
-    /// before the first attach. Kept across a detach. Recorded here until the
-    /// core exports its own readback (#90).
+    /// before the first attach. Kept across a detach. The core's own view of
+    /// it (after clamping to the GPU's largest texture) is in ``metrics()``.
     public private(set) var size: Size?
+
+    /// The surface's geometry, font size and cursor cell, as the core reports
+    /// them (`TesseraSurfaceMetrics`). Lengths are physical pixels; divide by
+    /// ``scale`` for points. Cell `(row, col)` covers ``cellWidthPx`` x
+    /// ``cellHeightPx`` pixels from `(paddingPx + col * cellWidthPx,
+    /// paddingPx + row * cellHeightPx)`, measured from the surface's top-left
+    /// corner.
+    public struct Metrics: Sendable, Equatable {
+        /// The surface's size (after clamping to the GPU's largest texture).
+        public var widthPx: UInt32
+        public var heightPx: UInt32
+        /// The backing scale factor the surface was last attached or resized
+        /// with.
+        public var scale: Float
+        /// One cell at the current font size and scale.
+        public var cellWidthPx: UInt32
+        public var cellHeightPx: UInt32
+        /// From a cell's top to the text baseline.
+        public var baselinePx: Float
+        /// The empty band between each edge of the surface and the grid.
+        public var paddingPx: UInt32
+        /// The session's grid. It follows the surface, except after a
+        /// ``TesseraSession/resize(rows:cols:widthPx:heightPx:)`` until the
+        /// next surface resize or font-size change.
+        public var rows: UInt16
+        public var cols: UInt16
+        /// The font size in points (clamped by the core to 4...512), the
+        /// value font zoom steps from.
+        public var fontSizePt: Float
+        /// The cursor's cell on the live screen (scroll offset 0), within
+        /// ``rows`` and ``cols``.
+        public var cursorRow: UInt16
+        public var cursorCol: UInt16
+        /// Whether the cursor is on the screen the surface shows: `false`
+        /// while the view is scrolled back.
+        public var cursorOnScreen: Bool
+        /// Whether the cursor is on the left half of a two-column character,
+        /// so the caret spans ``cursorCol`` and the column after it.
+        public var cursorWide: Bool
+
+        public init(
+            widthPx: UInt32, heightPx: UInt32, scale: Float, cellWidthPx: UInt32, cellHeightPx: UInt32,
+            baselinePx: Float, paddingPx: UInt32, rows: UInt16, cols: UInt16, fontSizePt: Float,
+            cursorRow: UInt16, cursorCol: UInt16, cursorOnScreen: Bool, cursorWide: Bool
+        ) {
+            self.widthPx = widthPx
+            self.heightPx = heightPx
+            self.scale = scale
+            self.cellWidthPx = cellWidthPx
+            self.cellHeightPx = cellHeightPx
+            self.baselinePx = baselinePx
+            self.paddingPx = paddingPx
+            self.rows = rows
+            self.cols = cols
+            self.fontSizePt = fontSizePt
+            self.cursorRow = cursorRow
+            self.cursorCol = cursorCol
+            self.cursorOnScreen = cursorOnScreen
+            self.cursorWide = cursorWide
+        }
+
+        init(_ m: TesseraSurfaceMetrics) {
+            self.init(
+                widthPx: m.width_px, heightPx: m.height_px, scale: m.scale, cellWidthPx: m.cell_width_px,
+                cellHeightPx: m.cell_height_px, baselinePx: m.baseline_px, paddingPx: m.padding_px,
+                rows: m.rows, cols: m.cols, fontSizePt: m.font_size_pt, cursorRow: m.cursor_row,
+                cursorCol: m.cursor_col, cursorOnScreen: m.cursor_on_screen, cursorWide: m.cursor_wide)
+        }
+    }
+
+    /// Reads the surface's geometry, font size and cursor cell from the core
+    /// (`tessera_surface_metrics`). It locks the session's terminal briefly:
+    /// read it once per frame or resize and keep it for the mouse and input
+    /// method events in between.
+    ///
+    /// - Throws: ``TesseraCoreError/noSurface`` while detached,
+    ///   ``TesseraCoreError/sessionNotFound`` once closed.
+    public func metrics() throws -> Metrics {
+        var metrics = TesseraSurfaceMetrics()
+        try check(tessera_surface_metrics(session.core.pointer, session.id, &metrics))
+        return Metrics(metrics)
+    }
 
     /// A surface's cell geometry in physical pixels.
     public struct CellMetrics: Sendable, Equatable {
@@ -89,14 +171,19 @@ public final class TesseraSurface {
         }
     }
 
-    /// The attached surface's cell geometry, or `nil` when unknown. Always
-    /// `nil` until the C API exports it (#90: `App::view_cell_metrics` and
-    /// the theme's padding); callers fall back to approximate geometry.
-    public var cellMetrics: CellMetrics? { nil }
+    /// The attached surface's cell geometry from ``metrics()``, or `nil`
+    /// while detached. Each read calls into the core.
+    public var cellMetrics: CellMetrics? {
+        (try? metrics()).map { CellMetrics(widthPx: $0.cellWidthPx, heightPx: $0.cellHeightPx, paddingPx: $0.paddingPx) }
+    }
 
-    /// The cursor's cell on the visible screen, or `nil` when unknown. Always
-    /// `nil` until the C API exports it (#90).
-    public var cursorCell: (row: UInt16, col: UInt16)? { nil }
+    /// The cursor's cell from ``metrics()``, or `nil` while detached or while
+    /// the view is scrolled back so the cursor is not on the screen. Each
+    /// read calls into the core.
+    public var cursorCell: (row: UInt16, col: UInt16)? {
+        guard let metrics = try? metrics(), metrics.cursorOnScreen else { return nil }
+        return (metrics.cursorRow, metrics.cursorCol)
+    }
 
     /// Creates a detached surface for `session`.
     public init(session: TesseraSession) {

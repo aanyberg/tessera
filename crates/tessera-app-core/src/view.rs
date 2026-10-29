@@ -390,6 +390,14 @@ impl View {
         }
     }
 
+    /// The padding between each edge of the surface and the grid, in
+    /// physical pixels: the theme's padding at the shaper's scale (capped
+    /// at [`tessera_render::MAX_SCALE`]), rounded the way the renderer's
+    /// layout and [`grid_size_for`] round it.
+    pub(crate) fn padding_px(&self) -> u32 {
+        whole_px(self.renderer.theme().padding * self.renderer.shaper().scale())
+    }
+
     /// The font size in points, after
     /// [`tessera_render::sanitize_font_size`].
     pub(crate) fn font_size(&self) -> f32 {

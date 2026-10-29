@@ -441,10 +441,107 @@ final class TerminalSurfaceViewTests: XCTestCase {
         let expected = window.convertToScreen(view.convert(cell, to: nil))
         XCTAssertEqual(rect, expected)
         XCTAssertGreaterThan(rect.height, 0)
-        // The first cell, just inside the padding, at the top of the view.
+    }
+
+    func testFirstRectIsTheCursorCellOnScreen() throws {
+        // 3x (not the host's 1x or 2x): 12 px of padding (4 pt), 24 x 48 px
+        // cells (8 x 16 pt), cursor at row 2, column 3.
+        view.metrics = Self.metrics(cursorRow: 2, cursorCol: 3)
         let viewOnScreen = window.convertToScreen(view.convert(view.bounds, to: nil))
-        XCTAssertEqual(rect.minX, viewOnScreen.minX + TerminalSurfaceView.defaultPaddingPoints, accuracy: 0.5)
-        XCTAssertEqual(rect.maxY, viewOnScreen.maxY - TerminalSurfaceView.defaultPaddingPoints, accuracy: 0.5)
+        let rect = view.firstRect(forCharacterRange: NSRange(location: 0, length: 0), actualRange: nil)
+        // In points: 4 of padding, 8 x 16 cells.
+        let padding: CGFloat = 4
+        let cellWidth: CGFloat = 8
+        let cellHeight: CGFloat = 16
+        let left: CGFloat = padding + 3 * cellWidth
+        let top: CGFloat = padding + 2 * cellHeight
+        XCTAssertEqual(rect.minX, viewOnScreen.minX + left, accuracy: 0.01)
+        XCTAssertEqual(rect.maxY, viewOnScreen.maxY - top, accuracy: 0.01)
+        XCTAssertEqual(rect.width, cellWidth, accuracy: 0.01)
+        XCTAssertEqual(rect.height, cellHeight, accuracy: 0.01)
+
+        // On a wide character the rect spans both columns.
+        view.metrics?.cursorWide = true
+        let wide = view.firstRect(forCharacterRange: NSRange(location: 0, length: 0), actualRange: nil)
+        XCTAssertEqual(wide.minX, rect.minX, accuracy: 0.01)
+        XCTAssertEqual(wide.width, 2 * cellWidth, accuracy: 0.01)
+
+        // Without a surface, the view's top-left corner.
+        view.metrics = nil
+        let fallback = view.firstRect(forCharacterRange: NSRange(location: 0, length: 0), actualRange: nil)
+        XCTAssertEqual(fallback.minX, viewOnScreen.minX, accuracy: 0.01)
+        XCTAssertEqual(fallback.maxY, viewOnScreen.maxY, accuracy: 0.01)
+        XCTAssertGreaterThan(fallback.height, 0)
+    }
+
+    func testTheSurfaceMetricsAreReadOnAttachResizeAndRender() throws {
+        try requireSurface()
+        // Geometry only: the cursor fields may move between two reads.
+        func geometry(_ metrics: TesseraSurface.Metrics?) -> TesseraSurface.Metrics? {
+            metrics.map {
+                var copy = $0
+                (copy.cursorRow, copy.cursorCol, copy.cursorOnScreen, copy.cursorWide) = (0, 0, false, false)
+                return copy
+            }
+        }
+        let attached = try XCTUnwrap(view.metrics, "read on attach")
+        XCTAssertEqual(geometry(attached), geometry(try view.surface.metrics()))
+        XCTAssertEqual(attached.widthPx, view.pixelSize.widthPx)
+        view.metrics = nil
+        view.sessionDidOutput()
+        view.occlusionOverride = false
+        view.displayLinkDidFire()
+        XCTAssertEqual(geometry(view.metrics), geometry(try view.surface.metrics()), "read at every render")
+        view.metrics = nil
+        view.setFrameSize(NSSize(width: 500, height: 320))
+        XCTAssertEqual(view.metrics?.widthPx, view.pixelSize.widthPx, "read after a resize")
+        XCTAssertEqual(geometry(view.metrics), geometry(try view.surface.metrics()))
+        window.close()
+        XCTAssertNil(view.metrics, "gone with the surface")
+    }
+
+    func testTheCompositionFollowsMetricsReadAtARender() throws {
+        try requireSurface()
+        view.setMarkedText("に", selectedRange: NSRange(location: 1, length: 0), replacementRange: Self.notFound)
+        let before = try XCTUnwrap(view.markedTextOverlay).frame
+        // A zoom the view has not seen yet: its next render reads the
+        // larger cell and moves the overlay with it.
+        try view.surface.setFontSize(26)
+        view.sessionDidOutput()
+        view.occlusionOverride = false
+        view.displayLinkDidFire()
+        let after = try XCTUnwrap(view.markedTextOverlay).frame
+        XCTAssertGreaterThan(after.height, before.height)
+        XCTAssertEqual(after.height, view.compositionCellRect().height, accuracy: 0.01)
+    }
+
+    /// Metrics for a 3x surface with 12 px of padding and 24 x 48 px cells
+    /// (4 pt and 8 x 16 pt), 24 x 80 cells. 3x is no host's backing scale,
+    /// so geometry that used the window's scale instead of these would be
+    /// off.
+    private static func metrics(cursorRow: UInt16 = 0, cursorCol: UInt16 = 0) -> TesseraSurface.Metrics {
+        let padding: UInt32 = 12
+        let width: UInt32 = 2 * padding + 80 * 24
+        let height: UInt32 = 2 * padding + 24 * 48
+        return .init(
+            widthPx: width, heightPx: height, scale: 3, cellWidthPx: 24, cellHeightPx: 48,
+            baselinePx: 36, paddingPx: padding, rows: 24, cols: 80, fontSizePt: 13, cursorRow: cursorRow,
+            cursorCol: cursorCol, cursorOnScreen: true, cursorWide: false)
+    }
+
+    /// ``metrics(cursorRow:cursorCol:)`` in pixels, typed for the tests'
+    /// arithmetic.
+    private static let scalePx: CGFloat = 3
+    private static let paddingPx: CGFloat = 12
+    private static let cellWidthPx: CGFloat = 24
+    private static let cellHeightPx: CGFloat = 48
+
+    /// The view point `x`, `y` pixels from the top-left corner at
+    /// ``scalePx``.
+    private func point(px x: CGFloat, _ y: CGFloat) -> NSPoint {
+        let height: CGFloat = view.bounds.height
+        let fromTop: CGFloat = y / Self.scalePx
+        return NSPoint(x: x / Self.scalePx, y: height - fromTop)
     }
 
     func testAHugeCompositionKeepsTheOverlayWithinTheView() {
@@ -652,12 +749,15 @@ final class TerminalSurfaceViewTests: XCTestCase {
         let rogue = TesseraSurface(session: view.session)
         try? rogue.detach()
         view.sessionDidOutput()
+        XCTAssertNotNil(view.metrics, "kept until a read finds the surface gone")
         view.displayLinkDidFire()  // the render finds the surface gone
         XCTAssertFalse(view.surface.isAttached)
+        XCTAssertNil(view.metrics, "that render's read cleared the cached metrics")
         try rogue.attach(layer: CAMetalLayer(), widthPx: 100, heightPx: 100, scale: 1)
         for _ in 0..<20 {
             view.displayLinkDidFire()
         }
+        XCTAssertNil(view.metrics, "nothing reads them while detached")
         XCTAssertEqual(view.reattachFailures, TerminalSurfaceView.maxReattachFailures, "attempts stop")
         XCTAssertTrue(view.isDisplayLinkPaused, "the link idles after giving up")
         // Once the session is free, a size change tries again.
@@ -669,6 +769,7 @@ final class TerminalSurfaceViewTests: XCTestCase {
         view.displayLinkDidFire()
         XCTAssertTrue(view.surface.isAttached)
         XCTAssertEqual(view.reattachFailures, 0)
+        XCTAssertNotNil(view.metrics, "the re-attach read them again")
     }
 
     func testASurfaceLostBeforeAWindowMoveIsRetriedInTheNewWindow() throws {
@@ -722,18 +823,49 @@ final class TerminalSurfaceViewTests: XCTestCase {
     // MARK: Mouse
 
     func testPointerPositionsBecomeCells() {
-        view.cellGeometryOverride = .init(cellSize: CGSize(width: 16, height: 32), padding: 8)
-        let scale = window.backingScaleFactor
-        // 8 px of padding, then 16 x 32 px cells, from the top-left corner.
-        let point = NSPoint(x: (8 + 16 * 3 + 1) / scale, y: view.bounds.height - (8 + 32 * 2 + 1) / scale)
-        let (cell, pixels) = view.cell(at: point)
+        view.metrics = Self.metrics()
+        // 12 px of padding, then 24 x 48 px cells, from the top-left corner,
+        // at the metrics' scale of 3.
+        let x: CGFloat = Self.paddingPx + 3 * Self.cellWidthPx + 1
+        let y: CGFloat = Self.paddingPx + 2 * Self.cellHeightPx + 1
+        let (cell, pixels) = view.cell(at: point(px: x, y))
         XCTAssertEqual(cell.col, 3)
         XCTAssertEqual(cell.row, 2)
-        XCTAssertEqual(pixels.x, 8 + 16 * 3 + 1, accuracy: 0.01)
-        XCTAssertEqual(pixels.y, 8 + 32 * 2 + 1, accuracy: 0.01)
+        XCTAssertEqual(pixels.x, x, accuracy: 0.01)
+        XCTAssertEqual(pixels.y, y, accuracy: 0.01)
         let (outside, _) = view.cell(at: NSPoint(x: -50, y: view.bounds.height + 50))
         XCTAssertEqual(outside.col, 0)
         XCTAssertEqual(outside.row, 0)
+    }
+
+    func testTheGridsCornersAndPaddingBandMapToEdgeCells() {
+        view.metrics = Self.metrics()
+        // Points from the top-left corner, in pixels at scale 3.
+        func cell(_ x: CGFloat, _ y: CGFloat) -> [UInt16] {
+            let (cell, _) = view.cell(at: point(px: x, y))
+            return [cell.row, cell.col]
+        }
+        let pad: CGFloat = Self.paddingPx
+        let width: CGFloat = Self.cellWidthPx
+        let height: CGFloat = Self.cellHeightPx
+        let right: CGFloat = pad + 80 * width
+        let bottom: CGFloat = pad + 24 * height
+        // The four corner cells, just inside the grid.
+        XCTAssertEqual(cell(pad, pad), [0, 0])
+        XCTAssertEqual(cell(right - 1, pad), [0, 79])
+        XCTAssertEqual(cell(pad, bottom - 1), [23, 0])
+        XCTAssertEqual(cell(right - 1, bottom - 1), [23, 79])
+        // The padding band on every side belongs to the nearest cell.
+        XCTAssertEqual(cell(1, 1), [0, 0])
+        XCTAssertEqual(cell(pad - 1, 150), [2, 0], "(150 - 12) / 48")
+        XCTAssertEqual(cell(right + pad - 1, pad), [0, 79])
+        XCTAssertEqual(cell(150, bottom + pad - 1), [23, 5], "(150 - 12) / 24")
+        // Beyond the surface (a view larger than the grid), still clamped.
+        XCTAssertEqual(cell(right + 500, bottom + 500), [23, 79])
+        // A cell boundary belongs to the cell it starts.
+        let second: (x: CGFloat, y: CGFloat) = (pad + width, pad + height)
+        XCTAssertEqual(cell(second.x, second.y), [1, 1])
+        XCTAssertEqual(cell(second.x - 0.5, second.y - 0.5), [0, 0])
     }
 
     func testMouseAndScrollEventsReachTheSession() async throws {

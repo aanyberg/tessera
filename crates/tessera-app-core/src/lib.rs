@@ -102,6 +102,51 @@ pub enum Error {
 /// Result alias for [`Error`].
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// A view's geometry, font size and cursor cell, as [`App::view_metrics`]
+/// reads them in one call. Every length is in physical pixels; a frontend
+/// divides by [`ViewMetrics::scale`] for points.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViewMetrics {
+    /// The surface's size (after clamping to the GPU's largest texture).
+    pub pixels: PhysicalSize,
+    /// The surface's backing scale as last attached or resized with, after
+    /// [`tessera_render::sanitize_scale`] (raised to at least
+    /// [`tessera_render::MIN_SCALE`]; not capped, unlike the renderer's).
+    pub scale: f32,
+    /// The cell size at the view's font size and scale.
+    pub cell: CellMetrics,
+    /// The padding between the surface's edges and the first row and
+    /// column, on every side: the theme's padding at the renderer's scale
+    /// (the backing scale capped at [`tessera_render::MAX_SCALE`]), rounded
+    /// the way the renderer rounds it. Cell `(row, col)` starts at
+    /// `(padding_px + col * cell.width_px, padding_px + row * cell.height_px)`.
+    pub padding_px: u32,
+    /// Rows of the session's grid. The grid follows the view
+    /// ([`view::grid_size_for`]), except after an [`App::resize`] until the
+    /// view's next resize or font-size change.
+    pub rows: u16,
+    /// Columns of the session's grid; see [`ViewMetrics::rows`].
+    pub cols: u16,
+    /// The view's font size in points, after
+    /// [`tessera_render::sanitize_font_size`].
+    pub font_size_pt: f32,
+    /// The cursor's row on the live screen (scroll offset 0), below
+    /// [`ViewMetrics::rows`].
+    pub cursor_row: u16,
+    /// The cursor's column, below [`ViewMetrics::cols`].
+    pub cursor_col: u16,
+    /// Whether the cursor is on the screen the view shows: `false` while
+    /// the view is scrolled back ([`App::scroll_offset`] is not 0), when
+    /// [`ViewMetrics::cursor_row`] and [`ViewMetrics::cursor_col`] are
+    /// where it would be at scroll offset 0.
+    pub cursor_on_screen: bool,
+    /// Whether the cursor is on the left half of a two-column character,
+    /// so the caret covers [`ViewMetrics::cursor_col`] and the column
+    /// after it. On the right half it is `false`, though the renderer
+    /// draws the caret over both halves there too.
+    pub cursor_wide: bool,
+}
+
 /// Root application object.
 pub struct App {
     config: Config,
@@ -609,6 +654,61 @@ impl App {
     /// [`Error::NoView`] if it has no view.
     pub fn view_cell_metrics(&self, id: SessionId) -> Result<CellMetrics> {
         self.with_view(id, |view| view.cell_metrics())
+    }
+
+    /// Everything a frontend needs to map between session `id`'s view and
+    /// its cells, read in one call: the surface, its cell size and padding,
+    /// the font size, the session's grid and its cursor cell.
+    ///
+    /// Takes the session table, the view table, then the session's
+    /// terminal and input state, one after the other: the view table is released before the
+    /// terminal is locked, so this adds no edge to the order
+    /// [`App::render_view`] uses (views, then terminal). It draws nothing
+    /// and waits for no GPU work of its own, but it does wait for the view
+    /// table, which a [`App::render_view`] holds while it draws; the
+    /// main-thread rule serialises the two (ADR 0014). The terminal is held
+    /// only to read the grid size and the cursor cell, so the same pacing
+    /// rule as [`App::with_terminal`] applies: once per frame or resize,
+    /// not per mouse event. Frontends keep the result for the events in
+    /// between.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session,
+    /// [`Error::NoView`] if it has no view.
+    pub fn view_metrics(&self, id: SessionId) -> Result<ViewMetrics> {
+        let session = self.session(id)?;
+        let (size, cell, font_size_pt, padding_px) = {
+            let views = lock(&self.views);
+            let view = views.get(&id).ok_or(Error::NoView(id))?;
+            (
+                view.size(),
+                view.cell_metrics(),
+                view.font_size(),
+                view.padding_px(),
+            )
+        };
+        let scrolled_back = session.scroll_offset() > 0;
+        let (rows, cols, cursor, cursor_wide) = session.with_terminal(|term| {
+            let grid = term.grid();
+            let cursor = grid.cursor();
+            let wide = grid.cell(cursor).is_some_and(tessera_grid::Cell::is_wide);
+            (grid.rows(), grid.cols(), cursor, wide)
+        });
+        Ok(ViewMetrics {
+            pixels: size.pixels,
+            scale: size.scale,
+            cell,
+            padding_px,
+            rows,
+            cols,
+            font_size_pt,
+            cursor_row: cursor.row.min(rows.saturating_sub(1)),
+            cursor_col: cursor.col.min(cols.saturating_sub(1)),
+            // TODO(#8): also false while DECTCEM hides the cursor.
+            cursor_on_screen: !scrolled_back,
+            cursor_wide,
+        })
     }
 
     /// Makes `surface` session `id`'s view, `size` physical pixels at
@@ -2620,6 +2720,283 @@ mod tests {
         assert!(result.is_err());
         assert!(!app.has_view(id).unwrap());
         assert!(matches!(app.detach_view(id), Err(Error::NoView(_))));
+    }
+
+    /// Attaches a headless view of `size` at `scale` to session `id`, the
+    /// way [`App::attach_view`] attaches a surface, and resizes the session
+    /// to its grid; `false` when GPU tests are skipped.
+    fn attach_offscreen(app: &App, id: SessionId, size: PhysicalSize, scale: f32) -> bool {
+        if std::env::var_os("TESSERA_SKIP_GPU_TESTS").is_some() {
+            return false;
+        }
+        let theme = app.view_theme();
+        let gpu = Gpu::headless().expect("a Metal adapter");
+        let fonts = app.fonts_for(&theme).expect("the configured font");
+        let view = View::offscreen(gpu, fonts, theme, size, scale).expect("view");
+        let pty_size = view.pty_size();
+        lock(&app.views).insert(id, view);
+        app.follow_view(id, pty_size);
+        true
+    }
+
+    /// Sends `bytes` as the fake child's output and waits until the reader
+    /// has applied it.
+    fn output(fake: &Fake, events: &Receiver<(SessionId, SessionEvent)>, bytes: &[u8]) {
+        fake.send(PtyEvent::Output(bytes.to_vec()));
+        loop {
+            if matches!(next(events), (_, SessionEvent::Output)) {
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn view_metrics_need_a_live_session_and_a_view() {
+        let app = app();
+        let (id, _fake) = attach_fake(&app, false);
+        assert!(matches!(app.view_metrics(id), Err(Error::NoView(i)) if i == id));
+        let gone = SessionId::from_raw(99);
+        assert!(matches!(
+            app.view_metrics(gone),
+            Err(Error::SessionNotFound(i)) if i == gone
+        ));
+    }
+
+    #[test]
+    fn view_metrics_report_the_geometry_the_renderer_uses() {
+        let app = app();
+        let (id, _fake) = attach_fake(&app, false);
+        // 2x, so the padding (4 pt) and the cell are in physical pixels.
+        let size = PhysicalSize::new(1601, 1203);
+        if !attach_offscreen(&app, id, size, 2.0) {
+            return;
+        }
+        let metrics = app.view_metrics(id).unwrap();
+        let cell = app.view_cell_metrics(id).unwrap();
+        let view = app.view_size(id).unwrap();
+        assert_eq!(metrics.pixels, size);
+        assert!((metrics.scale - 2.0).abs() < f32::EPSILON);
+        assert_eq!(metrics.cell, cell);
+        assert_eq!(metrics.padding_px, 8);
+        assert!((metrics.font_size_pt - app.view_font_size(id).unwrap()).abs() < f32::EPSILON);
+        assert_eq!((metrics.rows, metrics.cols), (view.rows, view.cols));
+        // The grid exactly fills the surface inside the padding.
+        let used = |cells: u16, px: u32| metrics.padding_px * 2 + u32::from(cells) * px;
+        assert!(used(metrics.cols, cell.width_px) <= size.width);
+        assert!(used(metrics.cols + 1, cell.width_px) > size.width);
+        assert!(used(metrics.rows, cell.height_px) <= size.height);
+        assert!(used(metrics.rows + 1, cell.height_px) > size.height);
+    }
+
+    /// The renderer caps its scale at `MAX_SCALE` (8): at a backing scale
+    /// of 10 the padding is 4 pt x 8, not x 10, and the cell is the 8x one.
+    #[test]
+    fn view_metrics_report_the_renderers_padding_above_the_scale_cap() {
+        let app = app();
+        let (id, _fake) = attach_fake(&app, false);
+        let size = PhysicalSize::new(4000, 3000);
+        if !attach_offscreen(&app, id, size, 10.0) {
+            return;
+        }
+        let metrics = app.view_metrics(id).unwrap();
+        assert!((metrics.scale - 10.0).abs() < f32::EPSILON);
+        assert_eq!(metrics.padding_px, 32);
+        let view = app.view_size(id).unwrap();
+        assert_eq!((metrics.rows, metrics.cols), (view.rows, view.cols));
+        let used = |cells: u16, px: u32| metrics.padding_px * 2 + u32::from(cells) * px;
+        assert!(used(metrics.cols, metrics.cell.width_px) <= size.width);
+        assert!(used(metrics.cols + 1, metrics.cell.width_px) > size.width);
+        assert!(used(metrics.rows, metrics.cell.height_px) <= size.height);
+        assert!(used(metrics.rows + 1, metrics.cell.height_px) > size.height);
+    }
+
+    #[test]
+    fn view_metrics_follow_the_font_size_and_a_session_resize() {
+        let app = app();
+        let (id, _fake) = attach_fake(&app, false);
+        if !attach_offscreen(&app, id, PhysicalSize::new(800, 600), 1.0) {
+            return;
+        }
+        app.set_view_font_size(id, 26.0).unwrap();
+        let zoomed = app.view_metrics(id).unwrap();
+        assert!((zoomed.font_size_pt - 26.0).abs() < f32::EPSILON);
+        assert_eq!(zoomed.cell, app.view_cell_metrics(id).unwrap());
+        let view = app.view_size(id).unwrap();
+        assert_eq!((zoomed.rows, zoomed.cols), (view.rows, view.cols));
+        // `rows` and `cols` are the session's grid, which an explicit
+        // resize changes until the view's next resize.
+        app.resize(id, PtySize::new(10, 20)).unwrap();
+        let resized = app.view_metrics(id).unwrap();
+        assert_eq!((resized.rows, resized.cols), (10, 20));
+        app.resize_view(id, PhysicalSize::new(800, 600), 1.0)
+            .unwrap();
+        let back = app.view_metrics(id).unwrap();
+        assert_eq!((back.rows, back.cols), (view.rows, view.cols));
+    }
+
+    #[test]
+    fn view_metrics_track_the_cursor_wide_cells_and_the_scrollback() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        if !attach_offscreen(&app, id, PhysicalSize::new(800, 600), 1.0) {
+            return;
+        }
+        let cursor = |app: &App| {
+            let m = app.view_metrics(id).unwrap();
+            (
+                m.cursor_row,
+                m.cursor_col,
+                m.cursor_on_screen,
+                m.cursor_wide,
+            )
+        };
+        assert_eq!(cursor(&app), (0, 0, true, false));
+        output(&fake, &events, b"ab\r\n");
+        assert_eq!(cursor(&app), (1, 0, true, false));
+        output(&fake, &events, b"x");
+        assert_eq!(cursor(&app), (1, 1, true, false));
+        // On the left half of a wide character, then on its right half.
+        output(&fake, &events, "\u{4e2d}\x1b[2D".as_bytes());
+        assert_eq!(cursor(&app), (1, 1, true, true));
+        output(&fake, &events, b"\x1b[C");
+        assert_eq!(cursor(&app), (1, 2, true, false));
+
+        // Scrolled back, the cursor is off the screen the view shows and
+        // keeps its live position.
+        let rows = app.view_metrics(id).unwrap().rows;
+        let lines: Vec<u8> = (0..u32::from(rows) * 2)
+            .flat_map(|n| format!("line {n}\r\n").into_bytes())
+            .collect();
+        output(&fake, &events, &lines);
+        let live = cursor(&app);
+        assert_eq!(live, (rows - 1, 0, true, false));
+        let scroll = InputEvent::Scroll(input::ScrollEvent::new(3.0));
+        assert_eq!(app.send_input(id, scroll).unwrap(), InputOutcome::Consumed);
+        assert_ne!(app.scroll_offset(id).unwrap(), 0);
+        assert_eq!(cursor(&app), (rows - 1, 0, false, false));
+        let paste = InputEvent::Paste("x".into());
+        assert_eq!(app.send_input(id, paste).unwrap(), InputOutcome::Consumed);
+        assert_eq!(app.scroll_offset(id).unwrap(), 0);
+        assert_eq!(cursor(&app), live);
+    }
+
+    /// `view_metrics` takes the view table and the terminal one after the
+    /// other: while it waits for the terminal, the view table is free.
+    #[test]
+    fn view_metrics_never_hold_the_view_table_while_waiting_for_the_terminal() {
+        let app = Arc::new(app());
+        let (id, _fake) = attach_fake(&app, false);
+        if !attach_offscreen(&app, id, PhysicalSize::new(800, 600), 1.0) {
+            return;
+        }
+        let (entered, wait) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let holder = {
+            let app = Arc::clone(&app);
+            thread::spawn(move || {
+                app.with_terminal(id, |_| {
+                    entered.send(()).unwrap();
+                    released.recv().unwrap();
+                })
+                .unwrap();
+            })
+        };
+        wait.recv().unwrap();
+        let reader = {
+            let app = Arc::clone(&app);
+            thread::spawn(move || app.view_metrics(id).unwrap())
+        };
+        // Give the call time to reach the terminal lock, then probe the
+        // view table. A preempted call may hold it for a moment on its way
+        // there; one that holds it across the terminal wait fails every
+        // probe.
+        thread::sleep(Duration::from_millis(50));
+        let mut held = 0;
+        for _ in 0..40 {
+            if app.views.try_lock().is_err() {
+                held += 1;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(held < 20, "view table held in {held} of 40 probes");
+        assert!(
+            !reader.is_finished(),
+            "view_metrics did not wait for the terminal"
+        );
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        assert_eq!(reader.join().unwrap(), app.view_metrics(id).unwrap());
+    }
+
+    /// The terminal is held only for a few field reads, so under a flood of
+    /// output a call waits for at most a slice of the reader's work: of 200
+    /// calls 1 ms apart, the median stays under 2 ms and the 99th
+    /// percentile under 10 ms (in release, unthrottled: median ~40 µs, p99
+    /// ~0.3–1.4 ms; under `taskpolicy -b` at load 30: median 0.3–0.7 ms).
+    ///
+    /// The median carries the bar: a call that held the terminal for 2 ms
+    /// or more fails it on every attempt, while a throttled or
+    /// preempted test thread (`taskpolicy -b`, a loaded machine) only
+    /// stretches the tail, which gets the loose bar. Up to five attempts.
+    ///
+    /// Timing-based, so like `session::tests::reader_lock_hold_is_bounded`
+    /// it runs only in release builds (`cargo nextest run --release -p
+    /// tessera-app-core --test-threads 1 view_metrics_are_fast`); unoptimised,
+    /// one 4 KiB slice of scrolling output can hold the lock for longer than
+    /// the bar. It prints every attempt's 99th percentile.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "timing bar; run in release")]
+    fn view_metrics_are_fast_while_output_floods_the_terminal() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        if !attach_offscreen(&app, id, PhysicalSize::new(800, 600), 1.0) {
+            return;
+        }
+        let chunk: Vec<u8> = b"y\r\n".repeat(64 * 1024 / 3);
+        let median_bar = Duration::from_millis(2);
+        let tail_bar = Duration::from_millis(10);
+        let mut attempts = Vec::new();
+        for _ in 0..5 {
+            let stop = Arc::new(AtomicBool::new(false));
+            let flood = {
+                let stop = Arc::clone(&stop);
+                let sender = lock(&fake.events).clone().expect("fake child alive");
+                let chunk = chunk.clone();
+                thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        if sender.send(PtyEvent::Output(chunk.clone())).is_err() {
+                            return;
+                        }
+                    }
+                })
+            };
+            let mut waits = Vec::with_capacity(200);
+            for _ in 0..200 {
+                let start = Instant::now();
+                app.view_metrics(id).unwrap();
+                waits.push(start.elapsed());
+                thread::sleep(Duration::from_millis(1));
+            }
+            stop.store(true, Ordering::Relaxed);
+            flood.join().unwrap();
+            while events.try_recv().is_ok() {}
+            waits.sort_unstable();
+            let at = |percent: usize| waits[(waits.len() * percent / 100).min(waits.len() - 1)];
+            let (median, p90, p99) = (at(50), at(90), at(99));
+            eprintln!(
+                "view_metrics under a flood: median {median:?}, p90 {p90:?}, p99 {p99:?}, max {:?}",
+                waits[waits.len() - 1]
+            );
+            attempts.push((median, p99));
+            if median < median_bar && p99 < tail_bar {
+                return;
+            }
+        }
+        panic!(
+            "no attempt had a median under {median_bar:?} and a p99 under {tail_bar:?}: {attempts:?}"
+        );
     }
 
     #[test]

@@ -374,6 +374,76 @@ final class SurfaceAndInputTests: XCTestCase {
         XCTAssertFalse(surface.isAttached, "the core let go of the layer, and so does the wrapper")
     }
 
+    func testMetricsReportTheGridAndTheCursorAfterOutput() async throws {
+        let layer = try metalLayer()
+        let session = try app.spawn(
+            .init(program: "/bin/sh", arguments: ["-c", #"printf 'ab\r\ncd'; exec sleep 30"#]))
+        let surface = try attached(session, layer)
+
+        // The cursor ends after "cd" on the second row.
+        let deadline = ContinuousClock.now + .seconds(5)
+        while surface.cursorCell.map({ $0 != (1, 2) }) ?? true, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let cursor = try XCTUnwrap(surface.cursorCell)
+        XCTAssertEqual(cursor.row, 1)
+        XCTAssertEqual(cursor.col, 2)
+
+        let metrics = try surface.metrics()
+        XCTAssertEqual(metrics.widthPx, 800)
+        XCTAssertEqual(metrics.heightPx, 600)
+        XCTAssertEqual(metrics.scale, 2)
+        XCTAssertEqual(metrics.paddingPx, 8, "the default theme's 4 pt at 2x")
+        XCTAssertGreaterThan(metrics.cellWidthPx, 0)
+        XCTAssertGreaterThan(metrics.fontSizePt, 0)
+        XCTAssertTrue(metrics.cursorOnScreen)
+        XCTAssertFalse(metrics.cursorWide)
+        XCTAssertEqual(
+            surface.cellMetrics,
+            .init(widthPx: metrics.cellWidthPx, heightPx: metrics.cellHeightPx, paddingPx: metrics.paddingPx))
+        // The grid fits inside the padding, whole cells only.
+        let padding: UInt32 = 2 * metrics.paddingPx
+        let used: UInt32 = UInt32(metrics.cols) * metrics.cellWidthPx + padding
+        let oneMore: UInt32 = used + metrics.cellWidthPx
+        XCTAssertLessThanOrEqual(used, 800)
+        XCTAssertGreaterThan(oneMore, 800)
+
+        // `rows` and `cols` are the session's grid.
+        try session.resize(rows: 20, cols: 70)
+        let resized = try surface.metrics()
+        XCTAssertEqual(resized.rows, 20)
+        XCTAssertEqual(resized.cols, 70)
+        try surface.setFontSize(26)
+        let zoomed = try surface.metrics()
+        XCTAssertEqual(zoomed.fontSizePt, 26)
+        XCTAssertLessThan(zoomed.cols, metrics.cols, "the surface resized the grid again")
+
+        try surface.detach()
+        XCTAssertNil(surface.cellMetrics)
+        XCTAssertNil(surface.cursorCell)
+        XCTAssertThrowsError(try surface.metrics()) { XCTAssertEqual($0 as? TesseraCoreError, .noSurface) }
+        try session.close()
+        XCTAssertThrowsError(try surface.metrics()) { XCTAssertEqual($0 as? TesseraCoreError, .sessionNotFound) }
+    }
+
+    func testMetricsMirrorEveryField() {
+        let c = TesseraSurfaceMetrics(
+            width_px: 1, height_px: 2, scale: 3, cell_width_px: 4, cell_height_px: 5, baseline_px: 6, padding_px: 7,
+            rows: 8, cols: 9, font_size_pt: 10, cursor_row: 11, cursor_col: 12, cursor_on_screen: true,
+            cursor_wide: true)
+        XCTAssertEqual(
+            TesseraSurface.Metrics(c),
+            .init(
+                widthPx: 1, heightPx: 2, scale: 3, cellWidthPx: 4, cellHeightPx: 5, baselinePx: 6, paddingPx: 7,
+                rows: 8, cols: 9, fontSizePt: 10, cursorRow: 11, cursorCol: 12, cursorOnScreen: true,
+                cursorWide: true))
+        // The layout the Rust side pins (`surface_metrics_layout_is_stable`).
+        XCTAssertEqual(MemoryLayout<TesseraSurfaceMetrics>.size, 44)
+        XCTAssertEqual(MemoryLayout<TesseraSurfaceMetrics>.alignment, 4)
+        XCTAssertEqual(MemoryLayout<TesseraSurfaceMetrics>.offset(of: \.font_size_pt), 32)
+        XCTAssertEqual(MemoryLayout<TesseraSurfaceMetrics>.offset(of: \.cursor_wide), 41)
+    }
+
     func testFrameStatusMapsEveryValue() {
         XCTAssertEqual(TesseraSurface.FrameStatus(TESSERA_FRAME_STATUS_PRESENTED), .presented)
         XCTAssertEqual(TesseraSurface.FrameStatus(TESSERA_FRAME_STATUS_SUBOPTIMAL), .suboptimal)
