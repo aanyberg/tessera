@@ -8,7 +8,8 @@ description: Tessera software factory. Use in the lead session when planning or 
 The full runbook is `docs/software-factory.md`. Read it before you delegate work. These rules are not optional:
 
 1. **PR gate.** Push a branch and open a PR only after the local pipeline has passed: critic `ship` (or the blocker
-   fix commit the review rules clear without a second round), `scripts/verify-branch.sh` pass,
+   fix commit the review rules clear without a second round, or the applied lead decision after a round-2
+   `escalate`), `scripts/verify-branch.sh` pass,
    `adversarial-tester` pass for product code (`crates/`, `apps/macos/`; docs, infra, tooling and test-only changes
    are exempt), and a green `scripts/quality-gate.sh` on the integrated commit. CI only confirms. Never push
    mid-review.
@@ -22,11 +23,13 @@ The full runbook is `docs/software-factory.md`. Read it before you delegate work
    behaviour, spec or "Done when" miss, data loss or safety, flaky or hanging test, unmet perf bar, breaks a
    sibling) or a MINOR (docs, wording, non-critical test gaps, polish). The implementer fixes blockers only, in one
    fix commit with no new behaviour, and reports a mutation check per blocker. Minors go into one follow-up issue
-   labelled `wave:<n+1>`, filed by the lead; they do not hold the merge (the lead may order a cheap docs or test
-   minor fixed now). A second critic round runs only if the fix added new behaviour or code paths, or a blocker
+   in the milestone, labelled for the lowest wave that has not started, filed by the lead; they do not hold the
+   merge (the lead may order a cheap docs or test minor fixed now). A refuted or deferred blocker is a disagreement:
+   the lead (or `milestone-lead`) decides and records it. The lead re-runs each named mutation check against the
+   fix's parent. A second critic round runs only if the fix added new behaviour or code paths, or a blocker
    was a design problem; it is scoped to the fix range, spawned with `effort: "lower"`, and the last: remaining
-   blockers go to the lead (`escalate`), never round 3. The adversarial tester runs once after `ship` for product
-   code; a second cycle only if the first failed, scoped to the repro, at `effort: "lower"`. For low-risk product
+   blockers, old or new, go to the lead as `escalate`, never round 3; round 2 never returns `revise`. The adversarial tester runs once after `ship` for product
+   code; a second cycle only if the first failed, scoped to the repro, at `effort: "lower"`; a cycle-2 failure goes to the lead. For low-risk product
    changes (list in the runbook) the critic and the adversarial tester may run in parallel; if the critic then asks
    for a change, only the new range is re-run. On `escalate`, the lead decides and records the decision in the brief.
 
@@ -36,6 +39,7 @@ The full runbook is `docs/software-factory.md`. Read it before you delegate work
    | Severity | blocker / major / minor | BLOCKER / MINOR; minors never block |
    | Fix commit | any scope | blockers only, no new behaviour |
    | Adversarial | up to 2 cycles, early start | once after `ship`; cycle 2 only after a failure; docs, infra, tooling, test-only exempt |
+
 5. **Plan on GitHub.** `milestone-lead` labels issues `wave:<n>` and comments decisions and deferred findings on
    the issue they affect. There is no task-board file.
 6. **Exit codes.** Run the gate as `scripts/quality-gate.sh <wt> > <log> 2>&1; echo $?`. Never trust a status read

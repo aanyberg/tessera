@@ -15,4 +15,4 @@ Procedure:
 3. Quote every interpolated argument in justfile recipes; guard tag/version/branch consistency in the workflow; keep artifacts clean (no __MACOSX).
 4. Document the operator flow in CONTRIBUTING.md. Commit with `ci:`/`build:` and the attribution trailer. Never push and never create tags on the remote.
 
-On `revise` you fix your own branch, blockers only, in one `fix(ci):` or `fix(build):` commit with no new behaviour; report each blocker as fixed (commit), refuted (evidence) or deferred (why), the check that proves each fix, the minors you saw, and the commit range since the reviewed commit. The lead files the minors as one follow-up issue.
+On `revise` you fix your own branch, blockers only, in one `fix(ci):` or `fix(build):` commit with no new behaviour; report each blocker as fixed (commit), refuted (evidence) or deferred (why), the check that proves each fix, the minors you saw, any blocker you could only fix with new behaviour (report it as a design problem instead of widening the fix), and the commit range since the reviewed commit. The lead files the minors as one follow-up issue.

@@ -27,8 +27,8 @@ Model aliases map to the current Claude 5 family (`fable` = claude-fable-5-1, `o
 critique, adversarial testing and release engineering run on Opus. Pin a full id in the frontmatter if a role must not follow alias updates.
 
 **Effort by round.** Round 1 and adversarial cycle 1 run at the frontmatter effort: they find the defects (wave 3:
-6 majors in round 1, 2 in round 2, none in round 3; both verify failures in cycle 1; waves 5 and 6: critics found
-most serious defects in round 1). The only other critic round, the scoped round 2 (below), is spawned with the Agent
+6 majors in round 1, 2 in round 2 from benchmarks and differential fuzzing, none in round 3; both verify failures in cycle 1; waves 5 and 6: critics found
+most serious defects in round 1, which is why round 1 must run those benchmarks and diff-fuzzes itself). The only other critic round, the scoped round 2 (below), is spawned with the Agent
 tool's `effort: "lower"`, one step below the frontmatter, because it checks a fix range rather than a branch.
 Adversarial cycle 2 (only after a cycle-1 failure) is spawned the same way. Any defect a lower-effort run misses that
 a later gate catches goes into the next retro; that is the signal to revert. `code-critic` and `release-engineer` run
@@ -65,8 +65,8 @@ milestone-lead ── draft brief ──► spec-researcher (spec-heavy issues, 
                                  integrator (serialized): one commit on origin/main
                                                         │
                                                         ▼
-                         lead pushes task branch, one PR per task, squash-merge, resync;
-                         files one follow-up issue for the round's minors
+                         lead pushes task branch, one PR per task, squash-merge, resync
+                         (the round's minors are already filed as one follow-up issue, linked in the PR body)
                                                         │ merged
                                                         ▼
                                   next queued issue starts; after the wave, flow-analyst retro
@@ -95,7 +95,7 @@ adversarial run, and replace the extra rounds with mechanical checks.
 | Critic rounds | up to 5, each re-reviewing the new commits | round 1 full and strict; round 2 only if a fix added new behaviour or code paths, or a blocker was a design problem; round 2 is the last |
 | Finding severity | blocker / major / minor; any major blocked `ship` | BLOCKER or MINOR only; only blockers block |
 | Fix commits | fix or refute every finding, may widen as needed | blockers only, one commit, no new behaviour |
-| Minors | fixed in later rounds, or ad hoc | one follow-up issue labelled `wave:<n+1>`, does not hold the merge |
+| Minors | fixed in later rounds, or ad hoc | one follow-up issue labelled for the next wave that has not started, does not hold the merge |
 | Round 3+ | spawned at `effort: "lower"` | none: remaining blockers go to the lead (`escalate`) |
 | Re-checking fixes | another critic round | `scripts/verify-branch.sh` with its load targets, the quality gate, and the mutation check the implementer reports for each fixed blocker |
 | Adversarial tester | cycle 1, up to 2 cycles; early start with critique round 2 | once after `ship` for product code; a second cycle only if the first fails, scoped to the repro; docs, infra, tooling and test-only changes exempt |
@@ -114,28 +114,38 @@ builds, with counts) and the ones it only read. The adversarial brief carries it
 **The fix commit.** On `revise` the implementer fixes the blockers only, in one `fix(<scope>):` commit, and adds no
 behaviour in it: no new public item, thread, I/O path, state or option. For every fixed blocker the report names the
 mutation check: the test that fails without the fix. A blocker that cannot be fixed without new behaviour is
-reported as a design problem instead of being widened silently. The report also lists the minors it saw.
+reported as a design problem instead of being widened silently; the lead authorises the wider fix and records it as
+a lead decision, and round 2 then reviews it. A blocker the implementer refutes or defers is a disagreement with the
+critic: the lead (or `milestone-lead`) reads both arguments and the spec, decides, and records the decision under
+`## Lead decisions (<date>)`; or the lead spawns round 2 for it. The report also lists the minors it saw.
 
 **Minors.** The lead files one GitHub issue per task with every minor of the round (file, line, what, suggested fix),
-labelled `wave:<n+1>` (outside a wave: the highest existing `wave:<n>` plus one), and links it in the PR body. It
-does not hold the merge. The lead may order one specific minor fixed now when it is a cheap docs or test fix; it
-goes into the same fix commit.
+in the task's milestone and labelled for the lowest wave that has not started (`wave:<m>`; labels may already exist
+well ahead of the running wave, and the next wave number is never the highest label plus one for this), and links it
+in the PR body, so the issue is filed before the integrator writes the body. `milestone-lead` pulls open issues
+already labelled for the wave it plans into that wave and writes their briefs. The issue does not hold the merge.
+The lead may order one specific minor fixed now when it is a cheap docs or test fix; it goes into the same fix
+commit, or, when there is no fix commit because the critic shipped, it follows "Changes after `ship`".
 
 **Round 2 (rare, scoped, last).** A second critic round runs only if the fix commit added new behaviour or new code
-paths, or a blocker was a design problem. It is a fresh one-shot critic spawned with `effort: "lower"`. The brief
+paths (a safety net: the fix commit is not allowed to), or a blocker was a design problem. It is a fresh one-shot
+critic spawned with `effort: "lower"`. The brief
 carries round 1's blockers, the implementer's response to each, and the fix range; the critic checks the blockers
 first, then reviews the fix range in full, and does not re-review code outside it unless the fix touches it. It is
-the last round. Blockers that remain go to the lead as `escalate`; there is no round 3. The lead decides and records
-it in the brief, and any code that follows is read by the lead and covered by the mechanical checks and the
-adversarial run.
+the last round and never returns `revise`: every blocker it reports, old or new, comes back as `escalate`, and
+there is no round 3. The lead decides and records it in the brief under `## Lead decisions (<date>)`; the teammate
+applies the decision, the lead reads the diff, and the mechanical checks and, for product code, the adversarial run
+cover the result. That clears the PR gate.
 
-**Mechanical checks, not rounds.** Everything else about a fix is checked by scripts: `scripts/verify-branch.sh`
-with its load targets (timing-sensitive tests under load), `scripts/quality-gate.sh`, and the mutation check per
-fixed blocker. A fix commit that adds only a test or a doc line gets no critic: the lead reads the diff.
+**Mechanical checks, not rounds.** Everything else about a fix is checked by scripts and by the lead's reading:
+`scripts/verify-branch.sh` with its load targets (timing-sensitive tests under load) and `scripts/quality-gate.sh`
+are scripts; the mutation check per fixed blocker is the implementer's report, and the lead re-runs each named test
+against the fix's parent (`git checkout <fix>^ -- <source files>`, run, restore) before accepting it. A fix commit that adds only a test or a doc line gets no critic: the lead reads the diff.
 
 **Adversarial tester, once.** After `ship` the `adversarial-tester` runs once for product code (`crates/`,
 `apps/macos/`). A second cycle runs only if the first failed (a reproduced blocker), at `effort: "lower"`, scoped to
-the original repro, the fix commits and their callers. Docs, infra, tooling (`scripts/`, `justfile`, `xtask`,
+the original repro, the fix commits and their callers. If cycle 2 fails, the lead decides (fix, descope or drop the
+task) and records it in the brief; there is no cycle 3. Docs, infra, tooling (`scripts/`, `justfile`, `xtask`,
 workflows) and test-only changes are exempt.
 
 **Low-risk product changes: critic and adversarial in parallel.** The lead may start the adversarial run at the same
@@ -149,8 +159,9 @@ time as round 1 when the change is low-risk, meaning all of:
   configuration;
 - no hot or fast path.
 
-If the critic then asks for a change to product code, the adversarial run is repeated only on the new range (the fix
-commit), not on the whole branch. If the critic ships unchanged, the parallel run is the run.
+With no critic `coverage` yet, the tester runs its full plan. If the critic then asks for a change to product code,
+the adversarial run is repeated only on the new range (the fix commit), not on the whole branch, and that repeat is
+not the second cycle. If the critic ships unchanged, the parallel run is the run.
 
 ## Shared tooling
 
@@ -208,7 +219,8 @@ Agents use these instead of rebuilding the setup in every run:
 ## The PR gate
 
 A branch is pushed and a pull request opened only after the whole local pipeline has passed: critic `ship` (round 1,
-or the fix commit after a `revise` that the rules in "Review rules" clear without a second round), `scripts/verify-branch.sh` pass (including
+or the fix commit after a `revise` that "Review rules" clears without a second round, or, after a round-2 `escalate`,
+the recorded lead decision applied and checked as in "Review rules"), `scripts/verify-branch.sh` pass (including
 its load check of timing-sensitive tests), `adversarial-tester` pass for product code (`crates/`, `apps/macos/`;
 docs, infra, tooling and test-only changes are exempt), and a green `scripts/quality-gate.sh` on the integrated
 commit. CI is a confirmation, not a
@@ -293,10 +305,13 @@ shipping unit: up to five tasks are in flight, and each ships as soon as it is v
    at the frontmatter effort for round 1, with the brief and the branch. It reviews once, strictly, and sorts every
    finding into BLOCKER or MINOR (see "Review rules"). On `revise` the owning teammate fixes the blockers only, in
    one fix commit with no new behaviour, and reports the mutation check for each. The lead files the round's minors
-   as one issue labelled `wave:<n+1>`; they do not hold the merge, and the lead may order a cheap docs or test minor
-   fixed in the same fix commit. The lead reads the fix commit. A second critic round runs only if the fix added new
+   as one issue, in the milestone and labelled for the lowest wave that has not started; it does not hold the merge,
+   and the lead may order a cheap docs or test minor fixed in the same fix commit. The lead reads the fix commit and
+   re-runs each named mutation check against the fix's parent. A blocker the implementer refutes or defers is
+   decided by the lead (or `milestone-lead`) and recorded like an escalation. A second critic round runs only if the fix added new
    behaviour or new code paths, or a blocker was a design problem: a fresh critic at `effort: "lower"`, scoped to the
-   fix range, and the last round. Blockers it leaves go to the lead; there is no round 3. On `escalate` the lead
+   fix range, and the last round. It never returns `revise`: every blocker it reports comes back as `escalate`, and
+   there is no round 3. On `escalate` the lead
    (or `milestone-lead`) decides and records the decision in the brief, under a dated
    `## Lead decisions (<date>)` heading; the teammate applies it in the fix commit, and the round-2 rule above
    decides whether another critic looks.
@@ -308,8 +323,8 @@ shipping unit: up to five tasks are in flight, and each ships as soon as it is v
    it. For a low-risk product change (see "Review rules") the lead may start it at the same time as critique round 1;
    if the critic then asks for a change, the run is repeated only on the new range. A blocker from either lens
    fails the gate. Only then does a second adversarial cycle run: `effort: "lower"`, the cycle-1 repros and the fix
-   commits, scoped to the fixes and their callers. A structural rewrite during a verify cycle gets a fresh critic
-   (the lead's judgement; not a counted round) before verification resumes.
+   commits, scoped to the fixes and their callers; if it fails too, the lead decides and there is no cycle 3. A structural rewrite during a verify cycle gets a fresh critic
+   (the lead's judgement; it is not round 2 and does not permit a round 3) before verification resumes.
 6. **Integrate.** Verified branches go to `integrator` one at a time, first verified first integrated (a downstream
    task after its upstream). It squashes the branch into one conventional commit, rebases it onto `origin/main`,
    re-runs the gate and writes the PR body. Conflicts it resolved outside Cargo.lock go to the lead, who applies
@@ -330,7 +345,7 @@ shipping unit: up to five tasks are in flight, and each ships as soon as it is v
   or an `adversarial-tester` run scoped to the changed region whose prompt asks for a differential fuzz against
   the reference path (`cargo xtask ab diff`), before integration.
 - Other non-test code changes: the lead's judgement; a structural rewrite takes a fresh critic as in step 5. A change
-  after `ship` or after a verify pass is not a critic round and does not reopen the round count.
+  after `ship` or after a verify pass is not a critic round.
 
 Critics and verifiers are always one-shot subagents, never long-lived teammates, so every review starts from a
 clean context.
