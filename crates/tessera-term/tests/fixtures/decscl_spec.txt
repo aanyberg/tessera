@@ -1,0 +1,655 @@
+# =============================================================================
+# tessera-term: DECSCL select conformance level (CSI Pl ; Pc " p)  (issue #92, wave 6)
+# crates/tessera-term/tests/fixtures/decscl_spec.txt   (implementer-written, lead decision D1:
+# no spec-researcher run; xterm's CASE_DECSCL and decstr_spec.txt's D-DECSCL are the sources)
+#
+# Same machine-readable layout as decstr_spec.txt (### ID / size / step / cite / note / screen /
+# cursor / pending_wrap / requests / scrollback), parsed by tests/spec/mod.rs `parse_fixture`.
+# Extra keys the shared parser ignores and tests/decscl.rs asserts by hand:
+#     pen:     Terminal::grid().pen() after the script: "default" or "not default"
+#     cellpen: style of one cell, "(row,col)=default" or "(row,col)=fg=indexed(N)"
+#     region:  grid.scroll_region(): "full" or "top..=bottom", 0-based
+#     modes:   `field=bool` pairs for Terminal::modes(): origin, insert, auto_wrap, cursor_visible
+#     level:   Terminal::conformance_level() (1..=5; 4 on a new terminal)
+#     c1:      Terminal::c1_8bit_replies(): "7bit" (false) or "8bit" (true)
+#     flags:   control | negative | deviation
+# `control` cases run without DECSCL and prove a neighbour's setup really produces the state
+# DECSCL resets; `negative` cases send a near miss (no level, a level outside 61..65, another
+# intermediate or final, a colon sub-parameter) that must not reset anything or change the level.
+# Every other case sends a valid DECSCL (`CSI 61..65 [; digits]* " p`); tests/decscl.rs checks that.
+# Every case is run whole and byte by byte; every case expects `requests: []` (lead decision D3:
+# DECSCL is silent).
+#
+# PRIMARY SOURCES
+#   [CTL]  xterm ctlseqs  https://invisible-island.net/xterm/ctlseqs/ctlseqs.html  'CSI Pl ; Pc " p'
+#          "Set conformance level (DECSCL), VT220 and up. Pl = 61 -> level 1, e.g., VT100 ...
+#          Pl = 65 -> level 5, e.g., VT500. The second parameter selects the C1 control
+#          transmission mode. This is an optional parameter, ignored in conformance level 1.
+#          Pc = 0 -> 8-bit controls. Pc = 1 -> 7-bit controls (DEC factory default).
+#          Pc = 2 -> 8-bit controls."
+#   [XT]   xterm source (the oracle), ThomasDickey/xterm-snapshots master, charproc.c
+#          `case CASE_DECSCL:` (~L5088..5133):
+#            if (terminal_id >= 200 && GetParam(0) >= 61 && GetParam(0) <= 60 + terminal_id/100) {
+#                case_value = zero_if_default(1);        // absent Pc counts as 0
+#                ReallyReset(xw, False, False);          // the DECSTR soft reset
+#                init_parser(xw, sp);                    // REP's lastchar forgotten
+#                set_vtXX_level(screen, GetParam(0) - 60);
+#                if (new_vtXX_level > 1) switch (case_value) {
+#                    case 1: show_8bit_control(False); break;
+#                    case 0: case 2: show_8bit_control(True); break; }   // other Pc: unchanged
+#            }
+#            ResetState(sp);                             // anything else: no effect at all
+#          The parse table (VTPrsTbl.c) routes `"` + `p` to CASE_DECSCL; no Request is answered.
+#          RIS (ReallyReset full) calls show_8bit_control(False) and never touches vtXX_level
+#          (it is set from decTerminalID once, at start-up).
+#   [DEC]  VT510 RM DECSCL  https://vt100.net/docs/vt510-rm/DECSCL.html
+#          "The factory default is level 4 (VT Level 4 mode, 7-bit controls)." Level 1 is
+#          `CSI 61 " p`, "VT100 mode", with no Pc form (a VT100 has no 8-bit controls);
+#          `CSI 6n " p` and `CSI 6n ; 0 " p` / `; 2` select 8-bit controls, `; 1` 7-bit.
+#          "When you change the conformance level, the terminal performs a hard reset (RIS)."
+#   [D-DECSCL] decstr_spec.txt header: "xterm's DECSCL (`CSI 61..64 ; Ps " p`) is itself a soft
+#          reset (ReallyReset(soft) + level change) ... `CSI " p` (param 0 is not 61..64) does
+#          nothing in xterm either" -- this fixture is that follow-up.
+#
+# DECISIONS (brief #92 "Done when", recorded here)
+#   Soft, not hard: xterm (the oracle), the VT220 manual and DEC STD 070 reset softly; the
+#     VT510 note says RIS. Follow xterm: screen, scrollback, cursor position and tab stops kept.
+#   Level 65 accepted (flags: deviation): the brief accepts 61..65 with the default level 4.
+#     xterm with its default decTerminalID 420 accepts only 61..64 (GetParam(0) <= 60 + 4) and
+#     ignores 65; it accepts 65 only when started as a VT5xx.
+#   Level 61 forces 7-bit replies (flags: deviation): the brief and DEC (VT100 mode has no
+#     8-bit controls). xterm skips the Pc switch at level 1 and so keeps the previous mode.
+#   Pc absent counts as 0 (8-bit), as xterm's zero_if_default(1) and DEC's `CSI 6n " p` form.
+#     Pc 3 and up leave the mode as it was (xterm's switch has no default arm).
+#   Parameters after Pc are ignored (xterm reads only GetParam(0) and GetParam(1)).
+#   Colon sub-parameters: the whole sequence is ignored, like every non-SGR, non-XTMODKEYS
+#     sequence (ADR 0020).
+#   RIS keeps the level and turns 8-bit replies off (xterm ReallyReset full); DECSTR keeps both.
+#
+# Cursor is 0-based (row,col). render_screen puts `|` AFTER the cursor's cell.
+# =============================================================================
+
+
+# ------------------------------------------------------------------ defaults
+
+### DEFAULT01_new_terminal_is_level_4_7bit
+size: 1x10
+step: feed X
+flags: control
+cite: [DEC] "factory default is level 4 (VT Level 4 mode, 7-bit controls)"; [XT] set_vtXX_level(terminal_id / 100) with decTerminalID 420; [CTL] Pc = 1 "DEC factory default"
+note: The starting point every other row changes. Nothing sent but a glyph.
+screen:
+>X |
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+level: 4
+c1: 7bit
+
+
+# --------------------------------------------------------- each level, Pc
+
+### LEVEL61_no_pc
+size: 1x10
+step: feed \x1b[31m\x1b[61"p
+step: feed X
+cite: [CTL] Pl = 61 -> level 1, VT100; [XT] CASE_DECSCL ReallyReset(soft) then set_vtXX_level(1); [DEC] `CSI 61 " p` VT100 mode
+note: The pen set before DECSCL is gone (soft reset ran), so X is in the default style; level 1, 7-bit.
+screen:
+>X |
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: default
+cellpen: (0,0)=default
+level: 1
+c1: 7bit
+
+### LEVEL61_pc_2_still_7bit
+size: 1x10
+step: feed \x1b[62;2"p
+step: feed \x1b[31m\x1b[61;2"p
+step: feed X
+flags: deviation
+cite: [CTL] "ignored in conformance level 1"; [DEC] level 1 is VT100 mode (no 8-bit controls); brief #92 "Level 61 forces 7-bit replies regardless of Pc"; [XT] skips the switch at level 1 and would KEEP 8-bit here
+note: Starts in 8-bit mode (`CSI 62 ; 2 " p`) so the forced 7-bit is visible: neither the Pc 2 nor the earlier 8-bit mode survives level 1. xterm deviates (keeps 8-bit); tessera follows DEC.
+screen:
+>X |
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: default
+cellpen: (0,0)=default
+level: 1
+c1: 7bit
+
+### LEVEL61_pc_0_still_7bit
+size: 1x10
+step: feed \x1b[64;0"p
+step: feed \x1b[61;0"p
+step: feed X
+flags: deviation
+cite: as LEVEL61_pc_2_still_7bit
+note: Pc 0 (8-bit) is ignored at level 1 as well.
+screen:
+>X |
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+level: 1
+c1: 7bit
+
+### LEVEL62_no_pc_is_8bit
+size: 1x10
+step: feed \x1b[31m\x1b[62"p
+step: feed X
+cite: [XT] case_value = zero_if_default(1) -> 0 -> show_8bit_control(True); [DEC] `CSI 6n " p` "VT Level 4 mode, 8-bit controls"; [CTL] Pl = 62 -> level 2, VT200
+note: An absent Pc is 0: 8-bit replies.
+screen:
+>X |
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: default
+cellpen: (0,0)=default
+level: 2
+c1: 8bit
+
+### LEVEL62_pc_1_is_7bit
+size: 1x10
+step: feed \x1b[31m\x1b[62;1"p
+step: feed X
+cite: [CTL] Pc = 1 -> 7-bit controls; [XT] case 1: show_8bit_control(False); [DEC] `CSI 6n ; 1 " p` 7-bit
+note: esctest DECSCLTests uses exactly this form (`DECSCL(62, 1)`).
+screen:
+>X |
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: default
+cellpen: (0,0)=default
+level: 2
+c1: 7bit
+
+### LEVEL62_pc_0_is_8bit
+size: 1x10
+step: feed \x1b[62;0"p
+step: feed X
+cite: [CTL] Pc = 0 -> 8-bit controls; [XT] case 0; [DEC] `CSI 6n ; 0 " p`
+note: The explicit zero means the same as an absent Pc.
+screen:
+>X |
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+level: 2
+c1: 8bit
+
+### LEVEL62_pc_2_is_8bit
+size: 1x10
+step: feed \x1b[62;2"p
+step: feed X
+cite: [CTL] Pc = 2 -> 8-bit controls; [XT] case 2; [DEC] `CSI 6n ; 2 " p`
+note: -
+screen:
+>X |
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+level: 2
+c1: 8bit
+
+### LEVEL63_no_pc_is_8bit
+size: 1x10
+step: feed \x1b[31m\x1b[63"p
+step: feed X
+cite: [CTL] Pl = 63 -> level 3, VT300; [XT] CASE_DECSCL (63 <= 60 + 4)
+note: -
+screen:
+>X |
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: default
+cellpen: (0,0)=default
+level: 3
+c1: 8bit
+
+### LEVEL63_pc_1_is_7bit
+size: 1x10
+step: feed \x1b[62"p
+step: feed \x1b[63;1"p
+step: feed X
+cite: [CTL] Pc = 1; [XT] case 1: show_8bit_control(False); esctest DECSCLTests `DECSCL(63, 1)`
+note: Starts in 8-bit mode, so Pc 1 really turns it off.
+screen:
+>X |
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+level: 3
+c1: 7bit
+
+### LEVEL64_no_pc_is_8bit
+size: 1x10
+step: feed \x1b[31m\x1b[64"p
+step: feed X
+cite: [CTL] Pl = 64 -> level 4, VT400; [DEC] `CSI 64 " p` "VT Level 4 mode, 8-bit controls"
+note: Selecting the level the terminal already has still resets and still switches to 8-bit.
+screen:
+>X |
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: default
+cellpen: (0,0)=default
+level: 4
+c1: 8bit
+
+### LEVEL64_pc_1_is_7bit
+size: 1x10
+step: feed \x1b[31m\x1b[64;1"p
+step: feed X
+cite: [DEC] `CSI 64 ; 1 " p` "VT Level 4 mode, 7-bit controls"; esctest DECSCLTests `DECSCL(64, 1)`
+note: -
+screen:
+>X |
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: default
+cellpen: (0,0)=default
+level: 4
+c1: 7bit
+
+### LEVEL65_no_pc_is_8bit
+size: 1x10
+step: feed \x1b[31m\x1b[65"p
+step: feed X
+flags: deviation
+cite: [CTL] Pl = 65 -> level 5, VT500; brief #92 "1..5; xterm accepts 65 as VT500"; [XT] accepts 65 only when terminal_id >= 500 (default 420 ignores it)
+note: tessera accepts level 5 although its default level is 4; xterm with its default decTerminalID would ignore this sequence.
+screen:
+>X |
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: default
+cellpen: (0,0)=default
+level: 5
+c1: 8bit
+
+### LEVEL65_pc_1_is_7bit
+size: 1x10
+step: feed \x1b[65;1"p
+step: feed X
+flags: deviation
+cite: as LEVEL65_no_pc_is_8bit; esctest DECSCLTests `DECSCL(65, 1)`
+note: -
+screen:
+>X |
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+level: 5
+c1: 7bit
+
+
+# ----------------------------------------------------------- Pc edge cases
+
+### PC01_pc_3_keeps_8bit
+size: 1x10
+step: feed \x1b[62"p
+step: feed \x1b[63;3"p
+step: feed X
+cite: [XT] the Pc switch has only `case 1` and `case 0: case 2`; [CTL] lists 0, 1 and 2 only
+note: An unknown Pc changes the level (and resets) but leaves the C1 mode as it was: 8-bit here.
+screen:
+>X |
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+level: 3
+c1: 8bit
+
+### PC02_pc_99_keeps_7bit
+size: 1x10
+step: feed \x1b[31m\x1b[64;99"p
+step: feed X
+cite: as PC01
+note: The same from 7-bit mode: still 7-bit, but the reset ran.
+screen:
+>X |
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: default
+cellpen: (0,0)=default
+level: 4
+c1: 7bit
+
+### EXTRA01_parameter_after_pc_ignored
+size: 1x10
+step: feed \x1b[64;2"p
+step: feed \x1b[31m\x1b[62;1;7"p
+step: feed X
+cite: [XT] CASE_DECSCL reads only GetParam(0) and GetParam(1); brief #92 row `CSI 62 ; 1 ; 7 " p`
+note: The 7 is ignored: level 2 and 7-bit (Pc is the second parameter, not the last; starting from 8-bit proves Pc 1 was read). The reset ran.
+screen:
+>X |
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: default
+cellpen: (0,0)=default
+level: 2
+c1: 7bit
+
+
+# ---------------------------------------------------- the reset really runs
+
+### RESET01_pen_region_modes_reset
+size: 4x10
+step: feed ab\x1b[2;3r\x1b[?6h\x1b[31m\x1b[4h\x1b[?25lcd
+step: feed \x1b[62;1"p
+step: feed \x1b[1;1HX
+cite: [XT] CASE_DECSCL -> ReallyReset(xw, False, False), the DECSTR path (decstr_spec.txt PEN01, IRM01, REGION01, DECOM01, TCEM01); [D-DECSCL]
+note: After the reset DECOM is off, so CUP 1;1 is the screen's corner, and IRM is off, so X overwrites `a` (with IRM on the row would read `Xab`); X takes the default pen; the region is the full screen and the cursor visible again. `cd` keeps its red: the screen is not touched. RESET02 is the same script without DECSCL.
+screen:
+>Xb|
+>cd
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: default
+cellpen: (0,0)=default
+region: full
+modes: origin=false insert=false auto_wrap=true cursor_visible=true
+level: 2
+c1: 7bit
+
+### RESET02_control_setup_without_decscl
+size: 4x10
+step: feed ab\x1b[2;3r\x1b[?6h\x1b[31m\x1b[4h\x1b[?25lcd
+step: feed \x1b[1;1HX
+flags: control
+cite: as RESET01, without \x1b[62;1"p
+note: DECSET 6 homes to the region's top (row 1), `cd` lands there; CUP 1;1 is the region's top-left, so X is inserted before `cd` in red. Region 1..=2, DECOM, IRM and the hidden cursor all survive.
+screen:
+>ab
+>Xc|d
+>
+>
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: not default
+cellpen: (1,0)=fg=indexed(1)
+region: 1..=2
+modes: origin=true insert=true auto_wrap=true cursor_visible=false
+level: 4
+c1: 7bit
+
+### RESET03_autowrap_back_on
+size: 2x4
+step: feed \x1b[?7l\x1b[63"p
+step: feed abcde
+cite: [XT] ReallyReset soft: WRAPAROUND := resource default (on); decstr_spec.txt AWM01
+note: Auto-wrap is on again after DECSCL, so `e` wraps to the second row.
+screen:
+>abcd\
+>e |
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: auto_wrap=true
+level: 3
+c1: 8bit
+
+### RESET04_screen_scrollback_and_position_kept
+size: 2x10
+step: feed one\r\ntwo\r\nthree\x1b[1;2H
+step: feed \x1b[64;1"p
+step: feed Z
+cite: [XT] the soft reset touches neither the screen, the scrollback nor the live cursor (decstr_spec.txt CONTENT01, CURSOR01); [DEC] says RIS instead, xterm (the oracle) resets softly
+note: `one` stays in the scrollback, the screen keeps its text and Z lands where CUP 1;2 put the cursor before DECSCL.
+screen:
+>tZo|
+>three
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=1 first=("one", wrapped=false)
+level: 4
+c1: 7bit
+
+### SAVED01_decrc_after_decscl_homes
+size: 3x10
+step: feed \x1b[2;5H\x1b7
+step: feed \x1b[63;1"p
+step: feed \x1b8X
+cite: [XT] ReallyReset soft: CursorSave then sc.row = sc.col = 0; decstr_spec.txt SAVED01; esctest DECSCLTests test_DECSCL_RISOnChange ("saved cursor position is the origin")
+note: The DECSC slot is replaced by the home position, so DECRC goes to (0,0). SAVED02 is the control.
+screen:
+>X |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+level: 3
+c1: 7bit
+
+### SAVED02_control_decrc_without_decscl
+size: 3x10
+step: feed \x1b[2;5H\x1b7
+step: feed \x1b8X
+flags: control
+cite: as SAVED01, without DECSCL
+note: Without DECSCL DECRC returns to (1,4).
+screen:
+>
+>    X |
+>
+cursor: (1,5)
+pending_wrap: false
+requests: []
+scrollback: len=0
+level: 4
+c1: 7bit
+
+### REP01_nothing_to_repeat_after_decscl
+size: 1x10
+step: feed a\x1b[62;1"p\x1b[3b
+cite: [XT] CASE_DECSCL calls init_parser (lastchar = -1); tessera clears REP's character after any sequence
+note: REP right after DECSCL repeats nothing.
+screen:
+>a |
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+level: 2
+c1: 7bit
+
+
+# ---------------------------------------------------- no level: no effect
+
+### NOLEVEL01_bare_csi_quote_p_does_nothing
+size: 4x10
+step: feed ab\x1b[2;3r\x1b[?6h\x1b[31m\x1b[4h\x1b[?25lcd
+step: feed \x1b["p
+step: feed \x1b[1;1HX
+flags: negative
+cite: [XT] GetParam(0) is DEFAULT (-1), not >= 61: only ResetState; [D-DECSCL] "`CSI " p` ... does nothing in xterm either"; decstr_spec.txt INTER01/INTER02 send it too
+note: The RESET02 state survives whole: pen, region, DECOM, IRM, the hidden cursor; level and C1 mode unchanged.
+screen:
+>ab
+>Xc|d
+>
+>
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: not default
+cellpen: (1,0)=fg=indexed(1)
+region: 1..=2
+modes: origin=true insert=true auto_wrap=true cursor_visible=false
+level: 4
+c1: 7bit
+
+### NOLEVEL02_levels_outside_61_65_do_nothing
+size: 4x10
+step: feed ab\x1b[2;3r\x1b[?6h\x1b[31m\x1b[4h\x1b[?25lcd
+step: feed \x1b[0"p\x1b[0;2"p\x1b[60;2"p\x1b[66;2"p\x1b[1;2"p\x1b[6;2"p\x1b[600;2"p\x1b[161;2"p\x1b[65535;2"p
+step: feed \x1b[1;1HX
+flags: negative
+cite: [XT] `GetParam(0) >= 61 && GetParam(0) <= 60 + terminal_id/100`, else only ResetState; [CTL] lists 61..65 only
+note: None of 0, 60, 66, 1, 6, 600, 161 or 65535 resets anything or changes the level, and their Pc 2 does not turn 8-bit replies on.
+screen:
+>ab
+>Xc|d
+>
+>
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: not default
+cellpen: (1,0)=fg=indexed(1)
+region: 1..=2
+modes: origin=true insert=true auto_wrap=true cursor_visible=false
+level: 4
+c1: 7bit
+
+### NEAR01_other_intermediates_finals_and_subparams
+size: 4x10
+step: feed ab\x1b[2;3r\x1b[?6h\x1b[31m\x1b[4h\x1b[?25lcd
+step: feed \x1b[62:1"p\x1b[62"q\x1b[62$p\x1b[62'p\x1b[?62"p\x1b[62""p\x1b[62 p
+step: feed \x1b[1;1HX
+flags: negative
+cite: [XT] `"` + `q` is DECSCA (#95), `$ p` DECRQM, `' p`, `? "` and `""` reach other or no cases; colon sub-parameters: ADR 0020 (xterm takes them only in SGR and XTMODKEYS)
+note: None of these is DECSCL: the RESET02 state survives and the level stays 4. (DECRQM's reply is #10; nothing is answered today.)
+screen:
+>ab
+>Xc|d
+>
+>
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: not default
+cellpen: (1,0)=fg=indexed(1)
+region: 1..=2
+modes: origin=true insert=true auto_wrap=true cursor_visible=false
+level: 4
+c1: 7bit
+
+### NEAR02_decstr_with_level_param_keeps_level
+size: 1x10
+step: feed \x1b[31m\x1b[62;2!p
+step: feed X
+flags: negative
+cite: [XT] `!` + `p` is CASE_DECSTR, which ignores its parameters and never calls set_vtXX_level; decstr_spec.txt INTER03
+note: DECSTR with DECSCL's parameters resets (the pen is gone) but leaves the level at 4 and the replies 7-bit.
+screen:
+>X |
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: default
+cellpen: (0,0)=default
+level: 4
+c1: 7bit
+
+### CANCEL01_can_aborts_decscl
+size: 1x10
+step: feed \x1b[31m\x1b[62\x18"p
+step: feed X
+flags: negative
+cite: [XT] CAN in a CSI returns to ground; the `"p` after it are printed as text
+note: The cancelled sequence neither resets nor changes the level: `"p` and X are printed red.
+screen:
+>"pX |
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pen: not default
+cellpen: (0,0)=fg=indexed(1)
+level: 4
+c1: 7bit
+
+
+# --------------------------------------------------- the level persists
+
+### KEEP01_decstr_keeps_level_and_c1
+size: 1x10
+step: feed \x1b[62"p\x1b[!p
+step: feed X
+cite: [XT] ReallyReset soft (CASE_DECSTR) touches neither vtXX_level nor control_eight_bits
+note: Level 2, 8-bit survive a later DECSTR.
+screen:
+>X |
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+level: 2
+c1: 8bit
+
+### KEEP02_ris_keeps_level_and_turns_8bit_off
+size: 1x10
+step: feed \x1b[63;2"p\x1bc
+step: feed X
+cite: [XT] ReallyReset full: show_8bit_control(False); vtXX_level is set only at start-up (set_vtXX_level(terminal_id / 100))
+note: RIS (`ESC c`) keeps level 3 and turns 8-bit replies off.
+screen:
+>X |
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+level: 3
+c1: 7bit
+
+### KEEP03_last_decscl_wins
+size: 1x10
+step: feed \x1b[65;1"p\x1b[62;2"p\x1b[63"p
+step: feed X
+cite: [XT] each CASE_DECSCL sets the level outright
+note: Three in a row: level 3, 8-bit (absent Pc).
+screen:
+>X |
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+level: 3
+c1: 8bit

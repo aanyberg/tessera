@@ -1,7 +1,8 @@
-//! RIS (`ESC c`) after any history leaves the terminal exactly like a new
-//! one of the same size, however many arrive in a row (#107: the grid
-//! resets in place instead of rebuilding), and ⌘K's
-//! `Terminal::clear_to_cursor`.
+//! RIS (`ESC c`) after any history leaves the terminal like a new one of
+//! the same size, however many arrive in a row (#107: the grid resets in
+//! place instead of rebuilding), and ⌘K's `Terminal::clear_to_cursor`.
+//! The one exception is the DECSCL conformance level, which RIS keeps, as
+//! xterm does (#92); the C1 reply mode it does reset.
 
 use std::time::{Duration, Instant};
 
@@ -11,14 +12,16 @@ use tessera_term::Terminal;
 /// Everything observable about a terminal's screen and modes. `Grid`'s
 /// `Debug` covers the screen, cursor, pen, region, saved cursors, tab
 /// stops and the alternate screen, but shows only the scrollback length,
-/// so the history is compared line by line as well.
-fn state(term: &Terminal) -> (String, Vec<tessera_grid::Line>, bool, bool) {
+/// so the history is compared line by line as well. The DECSCL
+/// conformance level is left out: RIS keeps it (see the module docs).
+fn state(term: &Terminal) -> (String, Vec<tessera_grid::Line>, bool, bool, bool) {
     let grid = term.grid();
     (
         format!("{grid:?}"),
         grid.logical_lines().cloned().collect(),
         term.auto_wrap(),
         term.insert_mode(),
+        term.c1_8bit_replies(),
     )
 }
 
@@ -55,6 +58,11 @@ fn step() -> impl Strategy<Value = Step> {
             b"0123456789abcdefghij".to_vec(),
             // A sequence cut by RIS: ESC c aborts it.
             b"\x1b[38;2;1".to_vec(),
+            // DECSCL (#92): a level and the C1 reply mode, which RIS
+            // turns back to 7-bit and does not undo the level of.
+            b"\x1b[62;2\"p".to_vec(),
+            b"\x1b[65\"p".to_vec(),
+            b"\x1b[61\"p".to_vec(),
         ])
         .prop_map(Step::Bytes),
         3 => Just(Step::Bytes(b"\x1bc".to_vec())),
@@ -77,7 +85,8 @@ fn run(term: &mut Terminal, step: &Step) {
 
 proptest! {
     /// After any history and an RIS, the terminal equals a new one of its
-    /// size, and stays equal to it under the same input afterwards.
+    /// size, and stays equal to it under the same input afterwards; the
+    /// conformance level is the one before the RIS.
     #[test]
     fn ris_leaves_a_new_terminal(
         before in prop::collection::vec(step(), 0..40),
@@ -87,7 +96,9 @@ proptest! {
         for step in &before {
             run(&mut term, step);
         }
+        let level = term.conformance_level();
         term.advance(b"\x1bc");
+        prop_assert_eq!(term.conformance_level(), level, "RIS keeps the DECSCL level");
         let (rows, cols) = (term.grid().rows(), term.grid().cols());
         let mut fresh = Terminal::new(rows, cols);
         prop_assert_eq!(state(&term), state(&fresh));

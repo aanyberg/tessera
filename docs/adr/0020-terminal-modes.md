@@ -116,7 +116,9 @@ mode, auto-wrap (on), DECCKM, DECKPAM, `modifyOtherKeys` and both kitty
 stacks; it keeps reverse video, LNM, the alternate screen, bracketed paste,
 focus events and the mouse modes. Synchronized output is reset by both
 although the spec is silent: a program that died inside an update must not
-freeze the screen after `reset`.
+freeze the screen after `reset`. DECSCL (`CSI 61..65 ; Pc " p`, #92) runs
+the DECSTR reset before it sets the conformance level; RIS turns 8-bit C1
+replies off and keeps the level, as xterm does.
 
 **Unknown modes** (DECANM 2, DECSCLM ?4, KAM 2, SRM 12, ?45 and ?69 until
 #97, 1001, …) are ignored and logged at trace level; one sequence may set

@@ -43,8 +43,13 @@
 //! #113, #9` in `soft_reset`): the character sets G0-G3/GL/GR (SCS, #112),
 //! DECSCA (#95), DECLRMM and reverse wrap (#97), the cursor shape and
 //! blink (DECSCUSR, `CSI Ps SP q`, #113) and the ANSI palette (colours set
-//! with OSC 4) back to the theme (#9). DECSCL (`CSI 6x ; Pc " p`), a soft
-//! reset plus a level change in xterm, is #92.
+//! with OSC 4) back to the theme (#9).
+//!
+//! DECSCL (`CSI 61..65 ; Pc " p`, select conformance level) runs the same
+//! soft reset and then records the level ([`Terminal::conformance_level`])
+//! and the C1 reply mode its `Pc` selects ([`Terminal::c1_8bit_replies`]);
+//! any other first parameter does nothing, as in xterm. See the `csi`
+//! module for the details.
 
 #![forbid(unsafe_code)]
 
@@ -112,6 +117,8 @@ impl Terminal {
                 keyboard: KeyboardModes::default(),
                 kitty: KittyStacks::default(),
                 last_printed: None,
+                conformance_level: 4,
+                c1_8bit_replies: false,
             },
             carry: Vec::new(),
         }
@@ -180,6 +187,24 @@ impl Terminal {
             kitty_flags: self.state.kitty.get(alt).current(),
             ..self.state.keyboard
         }
+    }
+
+    /// The conformance level DECSCL (`CSI Pl ; Pc " p`) last selected:
+    /// 1 (VT100) to 5 (VT500), `Pl - 60`. A new terminal is at level 4
+    /// (VT400-class, as xterm's default `decTerminalID` 420); DECSTR and
+    /// RIS keep the level. Nothing in the emulator depends on it yet; the
+    /// DA1 answer will (#10).
+    pub fn conformance_level(&self) -> u8 {
+        self.state.conformance_level
+    }
+
+    /// Whether replies to the host should use 8-bit C1 controls (`CSI` as
+    /// the single byte `0x9B` rather than `ESC [`). DECSCL sets it from
+    /// its `Pc` (0 or absent, and 2: on; 1: off; level 1 always off) and
+    /// RIS turns it off; it starts off. Recorded only: no reply honours it
+    /// yet (S7C1T/S8C1T and 8-bit replies are #96).
+    pub fn c1_8bit_replies(&self) -> bool {
+        self.state.c1_8bit_replies
     }
 
     /// Whether auto-wrap mode (DECAWM) is on: [`Modes::auto_wrap`].
@@ -283,6 +308,14 @@ struct State {
     /// clears it once it has been applied, as xterm does, so REP only
     /// repeats a character printed immediately before it.
     last_printed: Option<char>,
+    /// The operating level DECSCL (`CSI 6n ; Pc " p`) last selected, 1..=5;
+    /// 4 (VT400-class, xterm's default `decTerminalID` 420) until then. Kept
+    /// by DECSTR and RIS, as in xterm. Only DA1 (#10) will read it.
+    conformance_level: u8,
+    /// Whether replies should use 8-bit C1 controls (`0x9B` for `ESC [`):
+    /// set by DECSCL's `Pc`, cleared by RIS. Recorded for the reply code
+    /// (S7C1T/S8C1T, #96; reports, #10); nothing reads it yet.
+    c1_8bit_replies: bool,
 }
 
 impl State {
