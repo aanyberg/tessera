@@ -1340,6 +1340,10 @@ final class TerminalSurfaceViewTests: XCTestCase {
     /// Windows a test made besides ``window``; closed in tear-down.
     private var extraWindows: [KeyControlledWindow] = []
 
+    /// Length of the recorder's file, up to and including the last sentinel
+    /// ``assertBytes(_:_:file:line:)`` saw.
+    private var checkedLength = 0
+
     /// Makes the view's window key or not, and tells the view as AppKit's
     /// `didBecomeKey`/`didResignKey` notifications would.
     private func setKey(_ isKey: Bool) {
@@ -1392,16 +1396,21 @@ final class TerminalSurfaceViewTests: XCTestCase {
     }
 
     /// Asserts that exactly `expected` reached the PTY: sends a sentinel key
-    /// and compares everything before it.
+    /// and compares everything before it. Input reaches the recorder in
+    /// order, so once the new sentinel is in the file, so is everything sent
+    /// before it. The file still ends with the previous call's sentinel until
+    /// then: only a `~` past ``checkedLength`` is the new one.
     private func assertBytes(
         _ expected: [UInt8], _ message: String = "", file: StaticString = #filePath, line: UInt = #line
     ) async throws {
         try view.session.send(key: .init(key: .char, codepoint: "~", text: "~"))
         var received: [UInt8] = []
-        try await waitUntil("the sentinel arrives") {
+        let previous = checkedLength
+        try await waitUntil("the sentinel arrives", timeout: .seconds(20)) {
             received = (try? Array(Data(contentsOf: self.file))) ?? []
-            return received.last == UInt8(ascii: "~")
+            return received.count > previous && received.last == UInt8(ascii: "~")
         }
+        checkedLength = received.count
         // The recorder's own "R" is output, not input: the file holds input only.
         let hex = { (bytes: [UInt8]) in bytes.map { String(format: "%02x", $0) }.joined(separator: " ") }
         XCTAssertEqual(hex(Array(received.dropLast())), hex(expected), message, file: file, line: line)
