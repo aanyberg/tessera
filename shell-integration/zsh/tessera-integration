@@ -1,0 +1,175 @@
+#!/bin/zsh
+#
+# Tessera shell integration for zsh (5.1+): OSC 133 prompt marks, OSC 7
+# working directory reports and a one-time OSC 1337 handshake.
+#
+# This is an autoloadable function. Shells Tessera starts load it through
+# the .zshenv next to it. To load it in other shells (after `exec zsh`, in
+# tmux, ...), add to the end of ~/.zshrc:
+#
+#   export TESSERA_SHELL_INTEGRATION=enabled
+#   autoload -Uz -- /path/to/shell-integration/zsh/tessera-integration
+#   tessera-integration
+#   unfunction tessera-integration
+#
+# TESSERA_SHELL_INTEGRATION holds space-separated feature words: `enabled`
+# (or anything else) turns it on, `0` (or unset) turns it off, `no-cwd`
+# drops the OSC 7 reports and `no-prompt-mark` the OSC 133 marks. It is read
+# at the first prompt, so ~/.zshrc can still change it, and then unset so
+# shells started from this one are not integrated twice.
+#
+# Every builtin is called through `builtin` so user functions and aliases
+# named like them cannot interfere.
+
+builtin emulate -L zsh -o no_warn_create_global -o no_aliases
+
+[[ -o interactive ]] || builtin return 0                    # non-interactive shell
+[[ -n "$TESSERA_SHELL_INTEGRATION" && "$TESSERA_SHELL_INTEGRATION" != 0 ]] ||
+    builtin return 0                                        # integration disabled
+(( ! $+_tessera_si_state )) || builtin return 0             # already loaded
+
+# 0: no OSC 133 mark written yet (no D before the first prompt).
+# 1: an OSC 133 C is open (a command is running); the next prompt closes it
+#    with D;<status>.
+# 2: a prompt is showing; if no command runs, the next prompt writes a bare D.
+builtin typeset -gi _tessera_si_state=0
+# Whether OSC 7 is on (set at the first prompt).
+builtin typeset -gi _tessera_si_cwd=0
+builtin typeset -g _tessera_si_mark_a=$'%{\e]133;A\a%}'
+builtin typeset -g _tessera_si_mark_b=$'%{\e]133;B\a%}'
+
+# A close-on-exec descriptor for the terminal, so marks reach it even when a
+# hook runs with stdout redirected (fd 1 if none can be opened). Opened
+# here, not at the first prompt, because some plugins close descriptors they
+# do not own. sysopen is the only way to get O_CLOEXEC in zsh. (kitty)
+builtin typeset -gi _tessera_si_fd
+{
+    builtin zmodload zsh/system && (( $+builtins[sysopen] )) && {
+        { [[ -w     $TTY ]] && builtin sysopen -o cloexec -wu _tessera_si_fd --     $TTY } ||
+        { [[ -w /dev/tty ]] && builtin sysopen -o cloexec -wu _tessera_si_fd -- /dev/tty }
+    }
+} 2>/dev/null || (( _tessera_si_fd = 1 ))
+
+# OSC 7: `file://<host><path>`, the path percent-encoded byte by byte with
+# Terminal.app's rule (every byte outside [/._~A-Za-z0-9-] becomes %XX), the
+# host from $HOST reduced to [A-Za-z0-9._-]. Sent at every prompt (as
+# kitty does: a program run from the shell, ssh say, may have reported
+# another directory meanwhile) and when the directory changes.
+_tessera_si_report_pwd() {
+    builtin emulate -L zsh -o no_warn_create_global -o no_aliases -o no_multibyte
+    builtin local LC_ALL=C host=${HOST//[^A-Za-z0-9._-]/} url=$PWD ch
+    builtin local -i i
+    [[ -n $host ]] || host=localhost
+    if [[ $url == *[^/._~A-Za-z0-9-]* ]]; then
+        url=
+        for (( i = 1; i <= $#PWD; i++ )); do
+            ch=$PWD[i]
+            if [[ $ch == [/._~A-Za-z0-9-] ]]; then
+                url+=$ch
+            else
+                builtin printf -v ch '%%%02X' "'$ch"
+                url+=$ch
+            fi
+        done
+    fi
+    builtin print -rnu $_tessera_si_fd -- $'\e]7;file://'"$host$url"$'\a'
+}
+
+# chpwd hook: the directory changed during a command (`cd /tmp && make`).
+# Not in a subshell or command substitution (`(cd /usr && make)`), whose
+# directory is not the shell's.
+_tessera_si_chpwd() {
+    (( ZSH_SUBSHELL )) || _tessera_si_report_pwd
+}
+
+_tessera_si_precmd() {
+    builtin local -i cmd_status=$?
+    builtin emulate -L zsh -o no_warn_create_global -o no_aliases
+
+    # A precmd hook run from zle (some plugins redraw the prompt on cd) must
+    # not close a command.
+    if ! builtin zle; then
+        if (( _tessera_si_state == 1 )); then
+            builtin print -nu $_tessera_si_fd '\e]133;D;'$cmd_status'\a'
+            (( _tessera_si_state = 2 ))
+        elif (( _tessera_si_state == 2 )); then
+            # A prompt was shown and no command ran (empty line, Ctrl-C).
+            builtin print -nu $_tessera_si_fd '\e]133;D\a'
+        fi
+    fi
+
+    (( _tessera_si_cwd )) && _tessera_si_report_pwd
+
+    if [[ -o prompt_percent ]]; then
+        builtin typeset -g precmd_functions
+        if [[ ${precmd_functions[-1]} == _tessera_si_precmd ]]; then
+            # Last hook: our marks in PS1 survive, and zsh redraws them with
+            # the prompt (reset-prompt, SIGWINCH). %{ %} keeps them out of
+            # the prompt width.
+            [[ $PS1 == *$_tessera_si_mark_a* ]] || PS1=$_tessera_si_mark_a$PS1
+            [[ $PS1 == *$_tessera_si_mark_b ]] || PS1=${PS1//$_tessera_si_mark_b}$_tessera_si_mark_b
+            (( _tessera_si_state = 2 ))
+        else
+            # A hook after us could rewrite PS1 (a theme), so do not edit it
+            # this time: move to the end for the next prompt and print A
+            # directly (no B this time).
+            precmd_functions=(${precmd_functions:#_tessera_si_precmd} _tessera_si_precmd)
+            if ! builtin zle; then
+                builtin print -nu $_tessera_si_fd '\e]133;A\a'
+                (( _tessera_si_state = 2 ))
+            fi
+        fi
+    elif ! builtin zle; then
+        # Without prompt_percent PS1 cannot carry the marks: print A only.
+        builtin print -nu $_tessera_si_fd '\e]133;A\a'
+        (( _tessera_si_state = 2 ))
+    fi
+}
+
+_tessera_si_preexec() {
+    builtin emulate -L zsh -o no_warn_create_global -o no_aliases
+    # The next precmd puts them back; a theme that rebuilds PS1 from its
+    # previous value then cannot collect copies.
+    PS1=${PS1//$_tessera_si_mark_a}
+    PS1=${PS1//$_tessera_si_mark_b}
+    # No `cmdline=`: the command line is the user's data (ADR 0021).
+    builtin print -nu $_tessera_si_fd '\e]133;C\a'
+    (( _tessera_si_state = 1 ))
+}
+
+# Installation waits for the first prompt (kitty's reason): themes and
+# frameworks loaded by ~/.zshrc reset PS1 and hooks, and ~/.zshrc can still
+# change TESSERA_SHELL_INTEGRATION.
+_tessera_si_deferred_init() {
+    builtin emulate -L zsh -o no_warn_create_global -o no_aliases
+    builtin local -a opt
+    opt=(${(s: :)TESSERA_SHELL_INTEGRATION})
+    builtin unset TESSERA_SHELL_INTEGRATION
+    builtin typeset -ag precmd_functions preexec_functions chpwd_functions
+    if (( ! $#opt || opt[(Ie)0] )); then
+        precmd_functions=(${precmd_functions:#_tessera_si_deferred_init})
+        builtin return 0
+    fi
+
+    builtin print -nu $_tessera_si_fd '\e]1337;ShellIntegrationVersion=1;shell=zsh\a'
+
+    if (( ! opt[(Ie)no-cwd] )); then
+        (( _tessera_si_cwd = 1 ))
+        chpwd_functions=(${chpwd_functions:#_tessera_si_chpwd} _tessera_si_chpwd)
+    fi
+
+    if (( ! opt[(Ie)no-prompt-mark] )); then
+        # _tessera_si_precmd also reports the directory at every prompt.
+        preexec_functions=(${preexec_functions:#_tessera_si_preexec} _tessera_si_preexec)
+        precmd_functions=(${precmd_functions:/_tessera_si_deferred_init/_tessera_si_precmd})
+        _tessera_si_precmd
+    elif (( _tessera_si_cwd )); then
+        precmd_functions=(${precmd_functions:/_tessera_si_deferred_init/_tessera_si_report_pwd})
+        _tessera_si_report_pwd
+    else
+        precmd_functions=(${precmd_functions:#_tessera_si_deferred_init})
+    fi
+}
+
+builtin typeset -ag precmd_functions
+precmd_functions+=(_tessera_si_deferred_init)

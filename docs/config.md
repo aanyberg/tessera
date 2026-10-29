@@ -71,8 +71,9 @@ Optional table; *unset* by default. It belongs to the `[[profiles]]` entry it fo
 
 ## `[terminal]`
 
-Terminal emulation limits.
+Terminal emulation limits and shell integration.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `scrollback_lines` | integer | `10000` | Maximum number of scrollback lines kept per pane. |
+| `shell_integration` | one of `"auto"`, `"off"` | `"auto"` | Shell integration for zsh and fish (bash support is to follow): `"auto"` makes the shells Tessera starts load its scripts, which mark prompts and commands and report the working directory; `"off"` starts them unchanged. A session started with `TESSERA_SHELL_INTEGRATION` in its environment is never changed. |

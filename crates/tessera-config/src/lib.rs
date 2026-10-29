@@ -76,7 +76,7 @@ pub use load::{
     MAX_UNKNOWN_KEY_WARNINGS, MAX_WARNING_PATH_LEN, ParseError, Warning, load_file, write_atomic,
     write_default_if_missing,
 };
-pub use paths::{APP_SUPPORT_DIR_NAME, CONFIG_FILE_NAME, ConfigPaths};
+pub use paths::{APP_SUPPORT_DIR_NAME, CONFIG_FILE_NAME, ConfigPaths, SHELL_INTEGRATION_DIR_NAME};
 pub use store::ConfigStore;
 pub use watch::{
     ConfigChanged, ConfigEvent, MAX_WATCH_DURATION, MIN_POLL_INTERVAL, WatchBackend, WatchGuard,
@@ -127,7 +127,7 @@ pub struct Config {
     pub general: General,
     /// Default appearance; profiles may override.
     pub appearance: Appearance,
-    /// Terminal emulation limits.
+    /// Terminal emulation limits and shell integration.
     pub terminal: Terminal,
     /// Named profiles.
     pub profiles: Vec<Profile>,
@@ -204,13 +204,56 @@ impl Default for Appearance {
     }
 }
 
-/// Terminal emulation limits.
+/// Terminal emulation limits and shell integration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct Terminal {
     /// Maximum number of scrollback lines kept per pane.
     pub scrollback_lines: u32,
+    /// Shell integration for zsh and fish (bash support is to follow):
+    /// `"auto"` makes the shells Tessera starts load its scripts, which mark
+    /// prompts and commands and report the working directory; `"off"` starts
+    /// them unchanged. A session started with `TESSERA_SHELL_INTEGRATION` in
+    /// its environment is never changed.
+    #[cfg_attr(feature = "schema", schemars(schema_with = "ShellIntegration::schema"))]
+    pub shell_integration: ShellIntegration,
+}
+
+/// Whether Tessera injects its shell integration scripts into the shells it
+/// starts (`[terminal] shell_integration`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShellIntegration {
+    /// Inject into zsh and fish; other programs (bash too, for now) are
+    /// started unchanged.
+    #[default]
+    Auto,
+    /// Never inject.
+    Off,
+}
+
+impl ShellIntegration {
+    /// Every value, in the order the documentation lists them.
+    pub const ALL: [Self; 2] = [Self::Auto, Self::Off];
+
+    /// The value as written in `config.toml`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Off => "off",
+        }
+    }
+
+    /// A plain string `enum` schema: the derived one for documented
+    /// variants (`oneOf` of `const`s) is a shape `cargo xtask config-docs`
+    /// does not render.
+    #[cfg(feature = "schema")]
+    fn schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let values: Vec<&str> = Self::ALL.iter().map(|value| value.as_str()).collect();
+        schemars::json_schema!({ "type": "string", "enum": values })
+    }
 }
 
 impl Terminal {
@@ -222,6 +265,7 @@ impl Default for Terminal {
     fn default() -> Self {
         Self {
             scrollback_lines: 10_000,
+            shell_integration: ShellIntegration::Auto,
         }
     }
 }
@@ -288,5 +332,26 @@ mod tests {
     fn round_trips() {
         let cfg = Config::default();
         assert_eq!(Config::from_toml(&cfg.to_toml().unwrap()).unwrap(), cfg);
+    }
+
+    #[test]
+    fn shell_integration_is_auto_unless_turned_off() {
+        assert_eq!(
+            Config::default().terminal.shell_integration,
+            ShellIntegration::Auto
+        );
+        for value in ShellIntegration::ALL {
+            let text = format!("[terminal]\nshell_integration = \"{}\"\n", value.as_str());
+            let loaded = Config::from_toml_lenient(&text).unwrap();
+            assert_eq!(loaded.config.terminal.shell_integration, value);
+            assert_eq!(loaded.warnings, []);
+            // `as_str` is what serde writes.
+            assert!(loaded.config.to_toml().unwrap().contains(&text[11..]));
+        }
+        // Any other value is a type mismatch, like a mistyped number.
+        for bad in ["\"on\"", "\"Auto\"", "true", "1"] {
+            let text = format!("[terminal]\nshell_integration = {bad}\n");
+            assert!(Config::from_toml_lenient(&text).is_err(), "{bad}");
+        }
     }
 }

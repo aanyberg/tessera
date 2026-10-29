@@ -31,6 +31,17 @@
 - Prefer snapshot tests (`insta`) for emulator behaviour and property tests
   for parsers.
 
+## Tests and the home directory
+
+Tests never read or write the real home directory. Tests that create an
+`App` pass it a temporary configuration root; the FFI tests, whose
+`tessera_app_new` uses `~/Library/Application Support/Tessera`, point
+`HOME` at a temporary home first (`crates/tessera-ffi/tests/hermetic`), and
+`tests/home.rs` fails if a test file forgets or if the real
+`Application Support/Tessera` changes. Changing the environment is only
+sound with one test per process, so run them with `cargo nextest` (as `just
+test` and the gate do), not plain `cargo test`.
+
 ## Adding an escape-sequence test
 
 Emulator tests in `crates/tessera-term/tests/` feed bytes into a fresh
