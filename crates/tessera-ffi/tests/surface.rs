@@ -10,6 +10,8 @@
 
 #![cfg(target_os = "macos")]
 
+mod common;
+
 use std::ffi::{CString, c_char};
 use std::ptr;
 use std::time::{Duration, Instant};
@@ -115,6 +117,19 @@ mod objc {
         pub fn as_ptr(&self) -> *mut c_void {
             self.0
         }
+
+        /// `-[CALayer isOpaque]`.
+        pub fn is_opaque(&self) -> bool {
+            // SAFETY: `-isOpaque` takes no arguments and returns a `BOOL`
+            // (one byte, 0 or 1, on every Apple ABI), read as `u8`.
+            let send = unsafe {
+                std::mem::transmute::<unsafe extern "C" fn(), unsafe extern "C" fn(Id, Sel) -> u8>(
+                    objc_msgSend,
+                )
+            };
+            // SAFETY: a live layer and a no-argument getter.
+            unsafe { send(self.0, sel(c"isOpaque")) != 0 }
+        }
     }
 
     impl Drop for Layer {
@@ -134,6 +149,7 @@ impl Handle {
     fn new() -> Self {
         let mut app = ptr::null_mut();
         // SAFETY: `app` is writable storage for one pointer.
+        common::hermetic_config_dir();
         assert_eq!(unsafe { tessera_app_new(&raw mut app) }, Error::Ok);
         Self(app)
     }
@@ -739,4 +755,82 @@ fn applying_a_theme_rethemes_attached_views() {
     for id in ids.into_iter().chain([late]) {
         assert_eq!(app.close(id), Error::Ok);
     }
+}
+
+/// A live re-theme between an opaque and a translucent background switches
+/// the compositing mode of a view that is already attached (#41's
+/// adversarial finding: it used to keep the mode it was attached with, so a
+/// translucent theme drew dark on an opaque surface). The switch is
+/// requested by `apply_config`, which may run off the main thread, and
+/// made by the next frame; the layer's `opaque` property follows.
+#[test]
+fn a_translucent_retheme_switches_an_attached_surface() {
+    use tessera_app_core::view::wgpu::CompositeAlphaMode;
+
+    if !gpu_enabled() {
+        return;
+    }
+    let app = Handle::new();
+    let id = app.spawn_shell();
+    let layer = Layer::new();
+    assert_eq!(app.attach(id, &layer, 320, 240, 2.0), Error::Ok);
+    app.render_frames(id, 1);
+    let modes = || {
+        app.with_core(|core| core.view_alpha_modes(SessionId::from_raw(id)))
+            .expect("the session has a view")
+    };
+    assert_eq!(modes(), (CompositeAlphaMode::Opaque, false));
+    assert!(layer.is_opaque());
+    // Whether this surface can be translucent at all is decided from what
+    // it supports, before anything is applied, so a switch that does not
+    // happen fails below rather than skipping.
+    let supported = app
+        .with_core(|core| core.view_supported_alpha_modes(SessionId::from_raw(id)))
+        .expect("the session has a view");
+    let translucent = [
+        CompositeAlphaMode::PreMultiplied,
+        CompositeAlphaMode::PostMultiplied,
+        CompositeAlphaMode::Inherit,
+    ];
+    if !supported.iter().any(|mode| translucent.contains(mode)) {
+        eprintln!("this surface supports no per-pixel-alpha mode ({supported:?}); skipping");
+        return;
+    }
+
+    let config = |opacity: f32| {
+        let mut config = tessera_config::Config::default();
+        config.appearance.theme = "Dracula".into();
+        config.appearance.opacity = opacity;
+        config
+    };
+    let dracula = tessera_config::Theme::bundled("Dracula").unwrap();
+    // Applied from another thread, as the configuration watch does.
+    app.with_core(|core| {
+        std::thread::scope(|scope| {
+            scope.spawn(|| core.apply_config(&config(0.5), dracula));
+        });
+    });
+    assert_eq!(
+        modes(),
+        (CompositeAlphaMode::Opaque, true),
+        "requested, not yet switched: the layer is reconfigured by the next frame"
+    );
+    // Past the frame pacing interval, so the frame really draws.
+    std::thread::sleep(Duration::from_millis(10));
+    app.render_frames(id, 1);
+    let (mode, wanted) = modes();
+    assert!(wanted);
+    assert!(
+        translucent.contains(&mode),
+        "switched by the frame: {mode:?}"
+    );
+    assert!(!layer.is_opaque(), "the layer composites with alpha now");
+
+    // And back.
+    app.with_core(|core| core.apply_config(&config(1.0), dracula));
+    std::thread::sleep(Duration::from_millis(10));
+    app.render_frames(id, 1);
+    assert_eq!(modes(), (CompositeAlphaMode::Opaque, false));
+    assert!(layer.is_opaque());
+    assert_eq!(app.close(id), Error::Ok);
 }

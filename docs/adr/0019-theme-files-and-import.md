@@ -164,19 +164,15 @@ follows the same rules:
 `Renderer::set_theme`, and keeps it for views attached later. Nothing is
 rebuilt: no new renderer, surface or font database, so a theme change is
 cheap and keeps the views' state. Fonts are not reloaded here; a font
-family change takes the font reload path (#29).
+family change takes the font reload path (#29). The amendment below
+replaces `apply_theme` with `App::apply_config` and makes the `App` call it
+itself.
 
 ## Consequences
 
-- The watcher follows `config.toml` only, so editing the file of the theme
-  in use shows on the next configuration change, not immediately. Watching
-  `themes/` is a change to the watcher's semantics, left to a later issue.
-- A view's surface keeps the transparency mode it was attached with: a
-  theme (or opacity) that turns an opaque background translucent is
-  see-through only in views attached after it. An existing view keeps its
-  opaque surface and shows the background's premultiplied RGB (each
-  channel times alpha, so darker) as an opaque colour until it is
-  re-attached.
+- ~~The watcher follows `config.toml` only~~ and ~~a view's surface keeps
+  the transparency mode it was attached with~~: both resolved by #100; see
+  the amendment below.
 - Known limits:
   - FSKit FAT32/exFAT and HFS+ volumes store file names decomposed (NFD).
     A hand-written theme file with no `name` key, whose stem was typed
@@ -199,8 +195,93 @@ family change takes the font reload path (#29).
   `ConfigEvent::Changed` to `App::apply_theme` and the configured theme at
   app start in the frontend; the transparency mode of existing views on a
   translucent re-theme (above); Unicode normalisation of theme names (NFC
-  and NFD spellings are different names today).
+  and NFD spellings are different names today). #100 resolved all but the
+  last, which stays open (it needs a normalisation table, and no new
+  dependency was taken for it).
 - iTerm2's `(Light)`/`(Dark)` dual-mode keys are ignored for now; only the
   plain keys are read.
 - Bundled themes cannot be edited in place; copying one into `themes/`
   (same name) overrides it.
+
+## Amendment 2026-10-29: live re-theme and the alpha-mode switch (#100)
+
+**`App::apply_config(&Config, &Theme)` replaces `apply_theme`** (kept as
+`apply_config(&app.config(), theme)` for existing callers). It builds the
+renderer theme from the *new* configuration (colours, the background's
+alpha times the new `appearance.opacity`, font family and size). The
+configuration has no line-height or padding keys, so those stay the
+renderer's defaults. The construction-time configuration no longer leaks
+into a re-theme: the `App`'s configuration is the live one and
+`App::config()` returns it. The `App`'s own watch calls `apply_config`
+(ADR 0006): on every `config.toml` change, and on a `themes/` change when
+the re-resolved theme differs from the one in use (compared with
+`PartialEq`), so an edit of a theme file that is not in use changes nothing.
+A theme file in use that does not load (an editor's half-written save, a
+typo; the lookup reports `Warning::ThemeInvalid`, or the file the colours
+came from still exists but fails to load) keeps the colours in use, logged,
+instead of falling back to the bundled or default theme. The save that fixes
+it applies, since the watcher keeps following the file (ADR 0006). The
+watch's start-up catch-up follows the same rule, so a read during a save
+does not flash the defaults either; the save's own event applies it. A
+broken file that matches the name only by its stem does not hold back the
+theme in use when the lookup still finds the very file the colours came
+from (by its `name` key).
+A configured `font_size` that changed sets every view to it (a zoom the user
+applied included, as Terminal.app does on a profile change) and resizes
+each session after the views lock is released. Any other change keeps each
+view's size. A font family change still applies only to views attached
+after the font database is (re)loaded (#29).
+
+**The surface follows the background's opacity.** `View::set_appearance`
+compares the new background's alpha with 1.0 and asks the surface for the
+matching compositing mode (`RenderSurface::request_transparent`). The
+switch itself (`RenderSurface::set_transparent`: `choose_alpha_mode` of the
+surface's capabilities, then `configure`) happens at the start of the
+view's next frame (in the surface's frame acquire, so `View::render` is
+unchanged). `apply_config` runs on the watch's thread, and
+reconfiguring sets `CAMetalLayer` properties (`opaque`, pixel format,
+drawable size), which belong on the main thread that draws (ADR 0014). An
+already attached view therefore turns translucent (or opaque) on its next
+frame instead of showing the premultiplied colour on an opaque surface. A
+test with a real `CAMetalLayer` checks the mode and the layer's `opaque`
+flag both ways. An offscreen test checks that a live translucent re-theme
+draws the same pixels as a view attached translucent from the start
+(`#282a36` at alpha `0x80`).
+
+**The host is told once per applied change.** After an `apply_config` that
+changed what the views draw (colours, opacity or font size), the observer's
+`on_appearance_changed(opaque)` runs on the watch's thread. In the C API
+that is `TesseraCallbacks.on_appearance_changed`, the table's new last
+field. The host makes its windows opaque or translucent to match and asks
+every view for a frame. It is called on every such change, not only when
+`opaque` flips: the app's display link idles when nothing changed, so a
+colour-only re-theme of a quiet terminal would otherwise not be drawn
+until its next output. The host needs nothing else: colours stay in the
+core, and the Preferences pane (#40) goes through the file. In the app,
+TesseraKit coalesces the callbacks into `appearanceDidChange(opaque:)` on
+the main actor, and the session router calls every tab's
+`TerminalSurfaceView.applyLayerOpacity(opaque:)`, which sets
+`window.isOpaque` and the window's background colour (invalidating its
+shadow) and requests a frame. It leaves `metalLayer.isOpaque` to the core,
+which sets it when it reconfigures the surface at the start of that frame:
+set earlier, an opaque layer would show the last translucent frame, whose
+colours are premultiplied, darkened until the next frame. A view without a
+surface (its first attach failed) keeps its window as it is.
+
+The callback is never called with the views lock or a session's delivery
+lock held. An observer may call back into the `App` (views, sizes and
+metrics, configuration, `apply_config`, closing a session, even stopping
+or restarting the watch from the watch's own thread, which then does not
+wait for itself); a test does all of these. It must not replace the
+observer (`set_observer` waits for the call) or drop the last `Arc<App>`
+(dropping replaces the observer); in the C API it must not call
+`tessera_app_free`, and, as for every callback there, no `tessera_*`
+function at all. A watch that is stopped or replaced drops the events
+still queued for it, so an older change never lands after a newer one.
+
+**Where the themes come from.** `themes/` is next to `config.toml`: in
+`~/Library/Application Support/Tessera`, or in the directory the
+`TESSERA_CONFIG_DIR` environment variable names (unset by default; ADR
+0004). A font *family* change is still not applied live; it stays on #29's
+font reload path. The configuration has no line-height or padding keys, so
+those stay at the renderer's defaults.

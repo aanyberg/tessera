@@ -4,7 +4,8 @@ use std::ffi::{CString, c_char, c_void};
 
 use tessera_app_core::{SessionEvent, SessionId, SessionObserver};
 
-/// Functions the core calls when something happens in a session.
+/// Functions the core calls when something happens in a session, or when
+/// the appearance of every view changes.
 ///
 /// Installed with `tessera_app_set_callbacks`, which copies the table: the
 /// struct itself may be freed as soon as that call returns. Every function
@@ -12,8 +13,9 @@ use tessera_app_core::{SessionEvent, SessionId, SessionObserver};
 ///
 /// # Threads
 ///
-/// Callbacks run on an internal reader thread (one per session), never on
-/// the thread that calls `tessera_*`. A callback must return quickly, must
+/// Session callbacks run on an internal reader thread (one per session),
+/// and `on_appearance_changed` on the configuration watch's thread; never
+/// on the thread that calls `tessera_*`. A callback must return quickly, must
 /// not call any `tessera_*` function, and must not wait for the thread that
 /// does (for example with a synchronous dispatch to the main queue): closing
 /// a session, replacing the callbacks and freeing the application all wait
@@ -21,7 +23,7 @@ use tessera_app_core::{SessionEvent, SessionId, SessionObserver};
 /// Marshal work to the main thread asynchronously instead.
 ///
 /// Callbacks of one session are called in order; callbacks of different
-/// sessions may run concurrently. Events of a new session can arrive before
+/// sessions, and `on_appearance_changed`, may run concurrently. Events of a new session can arrive before
 /// `tessera_session_spawn` has returned its id.
 ///
 /// # Ownership and lifetime
@@ -34,6 +36,14 @@ use tessera_app_core::{SessionEvent, SessionId, SessionObserver};
 /// * Every `const char *` handed to a callback is a NUL-terminated UTF-8
 ///   string owned by the core and valid only for the duration of that call;
 ///   copy it to keep it.
+///
+/// # ABI
+///
+/// Fields are only ever added at the end (`on_appearance_changed` was). A
+/// host compiled against an older header passes a shorter table, which
+/// this core would read past: rebuild the host against the header that
+/// ships with the core it links. Initialise the table with designated
+/// initialisers (C) or every field (Swift), so a new field is `NULL`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Callbacks {
@@ -59,6 +69,20 @@ pub struct Callbacks {
     pub on_session_exit: Option<
         unsafe extern "C" fn(user_data: *mut c_void, session_id: u64, code: i32, signal: i32),
     >,
+    /// The appearance every view draws with changed: the configuration
+    /// watch applied an edit of `config.toml` or of the theme file in use
+    /// (colours, opacity or font size). `opaque` is whether the background
+    /// is now fully opaque (`false`: translucent). The host makes its
+    /// windows and layers opaque or translucent to match (`isOpaque`,
+    /// background colour) and redraws every view: each surface switches
+    /// its compositing mode at its next frame, and a view whose display
+    /// link idles would otherwise keep the old colours until its next
+    /// output. Called on the configuration watch's thread; not called for
+    /// a configuration change that alters nothing the views draw. Like
+    /// every callback it must not call `tessera_*`: in particular
+    /// `tessera_app_set_callbacks` or `tessera_app_free` from it deadlocks,
+    /// since both wait for this call to return.
+    pub on_appearance_changed: Option<unsafe extern "C" fn(user_data: *mut c_void, opaque: bool)>,
 }
 
 /// Adapts a [`Callbacks`] table to the core's observer trait.
@@ -111,6 +135,13 @@ impl SessionObserver for CallbackObserver {
                     unsafe { callback(user_data, id, code, signal) };
                 }
             }
+        }
+    }
+
+    fn on_appearance_changed(&self, opaque: bool) {
+        if let Some(callback) = self.0.on_appearance_changed {
+            // SAFETY: host contract on `Callbacks`.
+            unsafe { callback(self.0.user_data, opaque) };
         }
     }
 }

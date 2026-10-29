@@ -1,4 +1,5 @@
-//! Live reload: watches `config.toml` and applies external edits.
+//! Live reload: watches `config.toml` and the `themes/` directory and applies
+//! external edits.
 //!
 //! Two backends share one debounce-and-apply path (ADR 0006):
 //!
@@ -16,13 +17,26 @@
 //!   (permission denied, a symlink cycle), the backend polls at
 //!   [`WatchOptions::poll_interval`] until it can register everything
 //!   again, re-reads the file, and goes back to sleeping on kernel events.
-//! - [`WatchBackend::Poll`] samples the file's metadata every
-//!   [`WatchOptions::poll_interval`]. It is the fallback on platforms without
+//!   It also registers the `themes/` directory (a theme file created,
+//!   deleted or renamed, an editor's rename-save) and the theme file
+//!   `appearance.theme` currently resolves to (an in-place write to it),
+//!   re-registered whenever the resolved file changes. A theme file that
+//!   stops loading (a half-written save) stays registered while it exists,
+//!   so the save that fixes it is seen. An in-place write to any *other*
+//!   theme file is not seen: it cannot change the theme in use.
+//! - [`WatchBackend::Poll`] samples the metadata of the file, of `themes/`
+//!   and of the theme file in use every [`WatchOptions::poll_interval`],
+//!   and of every `*.toml` file in `themes/` every twentieth interval (about
+//!   once a second by default). It is the fallback on platforms without
 //!   `kqueue` and stays available everywhere for tests.
 //!
-//! Either way the file must be quiet for [`WatchOptions::debounce`] before it
-//! is re-read, so rapid successive writes coalesce into one event; a writer
-//! that never goes quiet is read anyway after [`WatchOptions::max_wait`].
+//! Either way the files must be quiet for [`WatchOptions::debounce`] before
+//! they are re-read, so rapid successive writes coalesce into one event; a
+//! writer that never goes quiet is read anyway after
+//! [`WatchOptions::max_wait`]. A change to `config.toml` is reported as
+//! [`ConfigEvent::Changed`] (or [`ConfigEvent::Invalid`]); a change in
+//! `themes/` as [`ConfigEvent::ThemesChanged`], after which the application
+//! resolves the theme again ([`ConfigStore::theme`]).
 //!
 //! Events are applied to the [`ConfigStore`] and then sent to every watcher
 //! of that store, so one change is reported once to each of them. If the
@@ -31,8 +45,9 @@
 //! and the failure is logged at error level.
 //!
 //! **Create one watcher per process.** Each one costs a thread plus, on
-//! the native backend, a kernel queue and about five file descriptors (the
-//! queue, the stop pipe's two ends, the directory and the file). The
+//! the native backend, a kernel queue and about seven file descriptors (the
+//! queue, the stop pipe's two ends, the directory, the file, `themes/` and
+//! the theme file in use). The
 //! application should hold a single [`Watcher`] and fan its events out to
 //! every window rather than watching once per window.
 
@@ -44,6 +59,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::load::Warning;
 use crate::store::ConfigStore;
+use crate::theme::{MAX_THEME_DIR_ENTRIES, Theme, ThemeSource};
 use crate::{Config, Error};
 
 /// Lower bound for [`WatchOptions::poll_interval`]; smaller values are
@@ -79,11 +95,11 @@ pub enum WatchBackend {
 }
 
 /// Tuning for a [`Watcher`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct WatchOptions {
     /// Which backend detects changes.
     pub backend: WatchBackend,
-    /// How often the file's metadata is sampled by [`WatchBackend::Poll`],
+    /// How often the files' metadata is sampled by [`WatchBackend::Poll`],
     /// and how often [`WatchBackend::Native`] looks for the configuration
     /// directory while it is missing. Values below [`MIN_POLL_INTERVAL`]
     /// are raised to it and values above [`MAX_WATCH_DURATION`] lowered.
@@ -100,7 +116,31 @@ pub struct WatchOptions {
     /// [`Invalid`](ConfigEvent::Invalid) event precedes the eventual
     /// [`Changed`](ConfigEvent::Changed) one.
     pub max_wait: Duration,
+    /// Runs first on the watcher's thread, for thread attributes the
+    /// caller sets on every thread it owns (`tessera-app-core` passes its
+    /// thread start hook, which gives threads a quality-of-service class on
+    /// macOS). `None` by default. A hook that panics is logged and the
+    /// watcher runs on.
+    pub on_thread_start: Option<fn()>,
 }
+
+impl PartialEq for WatchOptions {
+    /// Field by field; the hooks by address ([`std::ptr::fn_addr_eq`]).
+    fn eq(&self, other: &Self) -> bool {
+        let hooks = match (self.on_thread_start, other.on_thread_start) {
+            (Some(a), Some(b)) => std::ptr::fn_addr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        self.backend == other.backend
+            && self.poll_interval == other.poll_interval
+            && self.debounce == other.debounce
+            && self.max_wait == other.max_wait
+            && hooks
+    }
+}
+
+impl Eq for WatchOptions {}
 
 impl Default for WatchOptions {
     /// Native events, 50 ms polling as the fallback, 100 ms debounce (an edit
@@ -112,6 +152,7 @@ impl Default for WatchOptions {
             poll_interval: Duration::from_millis(50),
             debounce: Duration::from_millis(100),
             max_wait: Duration::from_secs(1),
+            on_thread_start: None,
         }
     }
 }
@@ -157,13 +198,29 @@ pub enum ConfigEvent {
     /// errors prominently may want to delay the display by that much and
     /// drop it when the `Changed` arrives.
     Invalid(Error),
+    /// A `*.toml` file in the themes directory was created, deleted,
+    /// renamed or rewritten (or the directory itself was), so
+    /// [`ConfigStore::theme`] may now resolve `appearance.theme` to other
+    /// colours. The watcher does not resolve the theme itself: the
+    /// application calls [`ConfigStore::theme`] and applies the result if
+    /// it differs from the theme in use, since a change to a theme file
+    /// that is not in use leaves it the same.
+    ///
+    /// Sent at most once per settled change (debounced like `config.toml`),
+    /// and independently of [`Changed`](ConfigEvent::Changed): an edit of
+    /// `config.toml` alone never produces it, and an edit in `themes/`
+    /// alone never produces a `Changed`. The native backend sees an
+    /// in-place write only to the theme file in use (see the module
+    /// documentation); the polling backend sees writes to every theme file,
+    /// to one not in use within about twenty polling intervals.
+    ThemesChanged,
 }
 
-/// A background watcher over the store's `config.toml`.
+/// A background watcher over the store's `config.toml` and `themes/`.
 ///
 /// Hold **one per process** and fan its events out to every window: each
-/// watcher costs a thread and, natively, a kernel queue and about five file
-/// descriptors. Several watchers on one store do work (each sees every
+/// watcher costs a thread and, natively, a kernel queue and about seven
+/// file descriptors. Several watchers on one store do work (each sees every
 /// event once) but gain nothing over a single one.
 ///
 /// Dropping the watcher stops the thread. Events are delivered on a channel
@@ -180,6 +237,18 @@ pub enum ConfigEvent {
 #[derive(Debug)]
 pub struct Watcher {
     events: Receiver<ConfigEvent>,
+    guard: WatchGuard,
+}
+
+/// Keeps a [`Watcher`]'s thread running; dropping it stops the thread and
+/// waits for it to exit (it wakes at once), which closes the event
+/// channel.
+///
+/// Obtained from [`Watcher::into_parts`], for a consumer that blocks on the
+/// receiver on a thread of its own: dropping the guard elsewhere ends that
+/// thread's `recv` with a disconnection instead of leaving it waiting.
+#[derive(Debug)]
+pub struct WatchGuard {
     stop: Option<Stop>,
     thread: Option<JoinHandle<()>>,
 }
@@ -249,7 +318,9 @@ impl Watcher {
         // event. Catch up on anything written between `ConfigStore::open`
         // and now; an edit that is seen both here and by the backend loads
         // twice but is reported once, since the second load finds no change.
-        reload_and_report(&store);
+        // The first watcher of a store records the themes directory's state
+        // as its baseline here; a later one reports what changed since.
+        settle(&store);
         // `finished` starts true so a closure that is dropped unrun (the
         // spawn failed) unsubscribes without logging a spurious crash.
         let mut guard = ThreadGuard {
@@ -260,15 +331,31 @@ impl Watcher {
         let thread = std::thread::Builder::new()
             .name("tessera-config-watch".into())
             .spawn(move || {
+                if let Some(hook) = options.on_thread_start
+                    && std::panic::catch_unwind(hook).is_err()
+                {
+                    tracing::error!(target: "tessera_config", "the watcher's thread start hook panicked");
+                }
                 guard.set_finished(false);
                 backend.run(&store, &options);
                 guard.set_finished(true);
             })?;
         Ok(Self {
             events,
-            stop: Some(stop),
-            thread: Some(thread),
+            guard: WatchGuard {
+                stop: Some(stop),
+                thread: Some(thread),
+            },
         })
+    }
+
+    /// Splits the watcher into its event channel and the guard that keeps
+    /// its thread running. Once the guard is dropped (the thread stopped),
+    /// the receiver reports [`RecvTimeoutError::Disconnected`] after the
+    /// events already queued.
+    #[must_use]
+    pub fn into_parts(self) -> (Receiver<ConfigEvent>, WatchGuard) {
+        (self.events, self.guard)
     }
 
     /// The event channel; `Err` once the watcher thread has exited.
@@ -287,13 +374,56 @@ impl Watcher {
     }
 }
 
-impl Drop for Watcher {
+impl Drop for WatchGuard {
     fn drop(&mut self) {
         // Closing the stop handle wakes the thread immediately.
         drop(self.stop.take());
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+/// Re-reads `config.toml` and the themes directory's state and reports what
+/// changed to every watcher of the store ([`reload_and_report`], then
+/// [`report_themes`]).
+fn settle(store: &ConfigStore) {
+    reload_and_report(store);
+    report_themes(store);
+}
+
+/// Samples the themes directory and sends [`ConfigEvent::ThemesChanged`]
+/// to every watcher of the store when it differs from the state the store
+/// last recorded. The store keeps that state, so several watchers of one
+/// store report one change once, as with [`reload_and_report`]; the first
+/// sample of a store records a baseline and reports nothing.
+fn report_themes(store: &ConfigStore) {
+    let themes = ThemesFingerprint::of(&store.paths().themes_dir());
+    if store.record_themes(themes) {
+        store.broadcast(&ConfigEvent::ThemesChanged);
+    }
+}
+
+/// The theme file `appearance.theme` resolves to now, or `None` when it
+/// resolves to a bundled theme or the default.
+///
+/// A theme file that is there but does not load (an editor's half-written
+/// save, a typo) is still the one to follow, or the save that fixes it would
+/// go unseen: a file whose stem matches the name, else `previous` (the file
+/// followed so far, which may match by its `name` key) while it exists.
+fn active_theme_file(store: &ConfigStore, previous: Option<&Path>) -> Option<std::path::PathBuf> {
+    let name = store.config().appearance.theme.clone();
+    let themes = store.paths().themes_dir();
+    match Theme::resolve(&themes, &name).source {
+        ThemeSource::User(path) => Some(path),
+        ThemeSource::Bundled | ThemeSource::Default => crate::theme::files_named(&themes, &name)
+            .into_iter()
+            .next()
+            .or_else(|| {
+                previous
+                    .filter(|path| path.is_file())
+                    .map(Path::to_path_buf)
+            }),
     }
 }
 
@@ -324,7 +454,7 @@ fn reload_and_report(store: &ConfigStore) {
 enum Backend {
     Poll {
         stop: Receiver<()>,
-        baseline: Fingerprint,
+        baseline: PollSample,
     },
     #[cfg(any(
         target_os = "macos",
@@ -350,7 +480,8 @@ impl Backend {
                     target_os = "dragonfly"
                 ))]
                 {
-                    let (native, stop) = native::Native::open(store.paths())?;
+                    let (native, stop) =
+                        native::Native::open(store.paths(), active_theme_file(store, None))?;
                     Ok((Self::Native(native), Stop::Pipe { _tx: stop }))
                 }
                 #[cfg(not(any(
@@ -378,7 +509,7 @@ impl Backend {
         // Fingerprint first, reload (in `spawn`) second: an edit in between
         // is applied by the reload and seen as a change on the first poll,
         // where the second load finds nothing new.
-        let baseline = Fingerprint::of(&store.paths().config_file());
+        let baseline = PollSample::of(store, active_theme_file(store, None));
         (
             Self::Poll { stop, baseline },
             Stop::Channel { _tx: stop_tx },
@@ -429,6 +560,37 @@ impl Fingerprint {
     }
 }
 
+/// A cheap identity of the themes directory's state: the name and
+/// [`Fingerprint`] of every `*.toml` entry the theme lookup would consider
+/// (not hidden, UTF-8 name; at most [`MAX_THEME_DIR_ENTRIES`] listed), in
+/// name order. Following symlinks, so editing the target of a linked theme
+/// file changes it too. A missing or unreadable directory has no entries.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct ThemesFingerprint(Vec<(String, Fingerprint)>);
+
+impl ThemesFingerprint {
+    fn of(dir: &Path) -> Self {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Self::default();
+        };
+        let mut files: Vec<(String, Fingerprint)> = entries
+            .take(MAX_THEME_DIR_ENTRIES)
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                let stem = name.strip_suffix(".toml")?;
+                if stem.is_empty() || stem.starts_with('.') {
+                    return None;
+                }
+                let fingerprint = Fingerprint::of(&entry.path());
+                Some((name, fingerprint))
+            })
+            .collect();
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        Self(files)
+    }
+}
+
 #[cfg(unix)]
 fn identity_of(meta: &std::fs::Metadata) -> (u64, i64, i64) {
     use std::os::unix::fs::MetadataExt as _;
@@ -440,15 +602,50 @@ fn identity_of(_meta: &std::fs::Metadata) -> (u64, i64, i64) {
     (0, 0, 0)
 }
 
+/// How many polling ticks pass between two samples of every theme file;
+/// the ticks in between sample only `config.toml`, the themes directory
+/// itself (an entry created, deleted or renamed) and the theme file in use.
+/// A themes directory of a few thousand files then costs a full listing
+/// about once a second at the default interval, not twenty times.
+const POLL_FULL_THEMES_EVERY: u32 = 20;
+
+/// What the polling backend compares from one tick to the next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PollSample {
+    config: Fingerprint,
+    /// The themes directory's own metadata.
+    themes_dir: Fingerprint,
+    /// The theme file in use, and its metadata.
+    theme_file: Option<(std::path::PathBuf, Fingerprint)>,
+    /// Every theme file, refreshed every [`POLL_FULL_THEMES_EVERY`] ticks.
+    themes: ThemesFingerprint,
+}
+
+impl PollSample {
+    fn of(store: &ConfigStore, theme_file: Option<std::path::PathBuf>) -> Self {
+        Self {
+            config: Fingerprint::of(&store.paths().config_file()),
+            themes_dir: Fingerprint::of(&store.paths().themes_dir()),
+            theme_file: theme_file.map(|path| {
+                let fingerprint = Fingerprint::of(&path);
+                (path, fingerprint)
+            }),
+            themes: ThemesFingerprint::of(&store.paths().themes_dir()),
+        }
+    }
+}
+
 fn run_polling(
     store: &ConfigStore,
     options: &WatchOptions,
-    baseline: Fingerprint,
+    baseline: PollSample,
     stop: &Receiver<()>,
 ) {
     let path = store.paths().config_file();
+    let themes_dir = store.paths().themes_dir();
     let mut last_seen = baseline;
-    // When the file last changed, and when the current burst of changes
+    let mut tick: u32 = 0;
+    // When the files last changed, and when the current burst of changes
     // began; both `None` while nothing is pending.
     let mut quiet_since: Option<Instant> = None;
     let mut dirty_since: Option<Instant> = None;
@@ -460,7 +657,19 @@ fn run_polling(
         }
 
         let now = Instant::now();
-        let current = Fingerprint::of(&path);
+        tick = tick.wrapping_add(1);
+        let mut current = PollSample {
+            config: Fingerprint::of(&path),
+            themes_dir: Fingerprint::of(&themes_dir),
+            theme_file: last_seen
+                .theme_file
+                .as_ref()
+                .map(|(file, _)| (file.clone(), Fingerprint::of(file))),
+            themes: last_seen.themes.clone(),
+        };
+        if tick.is_multiple_of(POLL_FULL_THEMES_EVERY) {
+            current.themes = ThemesFingerprint::of(&themes_dir);
+        }
         if current != last_seen {
             last_seen = current;
             quiet_since = Some(now);
@@ -476,7 +685,20 @@ fn run_polling(
         }
         quiet_since = None;
         dirty_since = None;
-        reload_and_report(store);
+        settle(store);
+        // The configuration (or a new file) may have changed the theme in
+        // use: follow its file from now on.
+        let previous = last_seen
+            .theme_file
+            .as_ref()
+            .map(|(file, _)| file.as_path());
+        let theme_file = active_theme_file(store, previous);
+        if theme_file.as_deref() != previous {
+            last_seen.theme_file = theme_file.map(|file| {
+                let fingerprint = Fingerprint::of(&file);
+                (file, fingerprint)
+            });
+        }
     }
 }
 
@@ -500,7 +722,7 @@ mod native {
 
     use kqueue::{Event, EventData, EventFilter, FilterFlag, Ident};
 
-    use super::{WatchOptions, reload_and_report};
+    use super::{WatchOptions, active_theme_file, report_themes};
     use crate::paths::ConfigPaths;
 
     /// Longest pause after a `kqueue` error, so a stop request is never
@@ -534,6 +756,20 @@ mod native {
         /// the directory is missing, in which case the thread polls.
         link_dir: Option<PathBuf>,
         link_dir_handle: Option<File>,
+        /// The themes directory and its handle, `None` while it is missing.
+        /// Its creation is seen through the root directory's watch, so a
+        /// missing `themes/` does not make the thread poll.
+        themes: PathBuf,
+        themes_handle: Option<File>,
+        /// The theme file `appearance.theme` resolved to at the last
+        /// settle, and its handle, so an in-place write to the theme in use
+        /// (which raises no directory event) is seen. `None` while the
+        /// theme is a bundled one or the file is missing. A theme file that
+        /// is a symlink is followed to its target, but a target replaced in
+        /// its own directory is seen only on the next change of the
+        /// configuration or of `themes/`.
+        theme_file: Option<PathBuf>,
+        theme_file_handle: Option<File>,
         /// The error from the most recent [`Native::register_all`] that
         /// could not register every slot, or `None` when it registered
         /// them all. While `Some` the backend is not armed and polls, since
@@ -664,12 +900,16 @@ mod native {
     }
 
     impl Native {
-        /// Registers the directory, the file (if present) and a stop pipe.
-        /// Dropping the returned writer wakes the thread. A path that
-        /// cannot be registered yet (an unreadable `config.toml`, say) is
-        /// not a failure: the thread polls for it, as
-        /// [`ConfigStore::open`] tolerates the same conditions.
-        pub(super) fn open(paths: &ConfigPaths) -> std::io::Result<(Self, PipeWriter)> {
+        /// Registers the directory, the file (if present), the themes
+        /// directory, `theme_file` (the theme in use, if it is a user file)
+        /// and a stop pipe. Dropping the returned writer wakes the thread.
+        /// A path that cannot be registered yet (an unreadable
+        /// `config.toml`, say) is not a failure: the thread polls for it,
+        /// as [`ConfigStore::open`] tolerates the same conditions.
+        pub(super) fn open(
+            paths: &ConfigPaths,
+            theme_file: Option<PathBuf>,
+        ) -> std::io::Result<(Self, PipeWriter)> {
             let (wake, stop) = std::io::pipe()?;
             let mut queue = kqueue::Watcher::new()?;
             queue.add_fd(
@@ -688,6 +928,10 @@ mod native {
                 file_handle: None,
                 link_dir: None,
                 link_dir_handle: None,
+                themes: paths.themes_dir(),
+                themes_handle: None,
+                theme_file,
+                theme_file_handle: None,
                 register_error: None,
             };
             native.rearm();
@@ -695,7 +939,8 @@ mod native {
         }
 
         /// Re-registers the directory, (for a symlinked file) the target's
-        /// directory and then the file, so all follow their current inodes.
+        /// directory, the themes directory, the theme file in use and then
+        /// the file, so all follow their current inodes.
         /// Every slot is attempted even when an earlier one fails, so the
         /// directory watch stays armed while the file is unreadable; the
         /// first failure is returned.
@@ -732,6 +977,13 @@ mod native {
                     }
                 }
             }
+            note(register(
+                &mut self.queue,
+                &mut self.themes_handle,
+                &self.themes,
+                Kind::Dir,
+            ));
+            note(self.register_theme_file());
             // The file goes last: re-registering a directory drops its
             // pending events, so a rename-save landing between opening the
             // file and re-arming the directory it was replaced in would go
@@ -746,6 +998,24 @@ mod native {
                 Kind::File,
             ));
             failed.map_or(Ok(()), Err)
+        }
+
+        /// Registers the theme file in use, or drops the registration of the
+        /// previous one when the theme is no longer a user file. Touches no
+        /// other slot, so pending directory events survive it.
+        fn register_theme_file(&mut self) -> std::io::Result<()> {
+            if let Some(path) = self.theme_file.clone() {
+                return register(
+                    &mut self.queue,
+                    &mut self.theme_file_handle,
+                    &path,
+                    Kind::File,
+                );
+            }
+            if let Some(old) = self.theme_file_handle.take() {
+                let _ = self.queue.remove_file(&old, EventFilter::EVFILT_VNODE);
+            }
+            Ok(())
         }
 
         /// Whether everything that could produce the next change is
@@ -764,7 +1034,15 @@ mod native {
         /// once when it first appears (or changes) and the recovery once,
         /// since while it lasts this runs every `poll_interval`.
         fn rearm(&mut self) {
-            match self.register_all() {
+            let result = self.register_all();
+            self.note_registration(result);
+        }
+
+        /// Logs a registration failure once when it first appears (or
+        /// changes) and the recovery once, and keeps the failure so the
+        /// thread polls while it lasts.
+        fn note_registration(&mut self, result: std::io::Result<()>) {
+            match result {
                 Ok(()) => {
                     if self.register_error.take().is_some() {
                         tracing::info!(target: "tessera_config", "config watch registered again");
@@ -804,12 +1082,48 @@ mod native {
                     // The directory is back (it may already hold a file),
                     // or the file became readable; either way it may have
                     // changed unseen.
-                    reload_and_report(store);
+                    self.settle(store);
                 }
             }
         }
 
+        /// Reloads `config.toml`, follows the theme file `appearance.theme`
+        /// now resolves to and reports a change of `themes/`.
+        ///
+        /// Runs with the directories armed and does not re-register them
+        /// (that would drop their pending events), only the theme file, and
+        /// that before the directory is sampled. So a theme file created
+        /// after the lookup leaves a directory event for the next round, a
+        /// write after the registration raises an event on the armed file,
+        /// and nothing lands unseen between the sample and the next wait.
+        fn settle(&mut self, store: &ConfigStore) {
+            super::reload_and_report(store);
+            self.theme_file = active_theme_file(store, self.theme_file.as_deref());
+            let result = self.register_theme_file();
+            if result.is_err() {
+                self.note_registration(result);
+            }
+            report_themes(store);
+        }
+
         pub(super) fn run(mut self, store: &ConfigStore, options: &WatchOptions) {
+            // `Watcher::spawn` reloaded the file after `open`, so the theme
+            // in use may have changed. Only then is its file registered
+            // again: re-registering the same file would drop a write
+            // already pending on it. A file that did change is sampled
+            // after it is armed, so a write to it since `spawn` sampled
+            // the directory is reported here rather than lost. Anything
+            // else since then raises an event on the armed directories or
+            // file, debounced as usual.
+            let theme_file = active_theme_file(store, self.theme_file.as_deref());
+            if theme_file != self.theme_file {
+                self.theme_file = theme_file;
+                let result = self.register_theme_file();
+                if result.is_err() {
+                    self.note_registration(result);
+                }
+                report_themes(store);
+            }
             loop {
                 let Some(event) = self.next_event(store, options) else {
                     return;
@@ -835,7 +1149,7 @@ mod native {
                 // `MAX_WATCH_DURATION`, so the deadline is representable; a
                 // failure to represent it just skips the debounce.
                 let Some(deadline) = Instant::now().checked_add(options.max_wait) else {
-                    reload_and_report(store);
+                    self.settle(store);
                     continue;
                 };
                 loop {
@@ -850,7 +1164,7 @@ mod native {
                     }
                 }
 
-                reload_and_report(store);
+                self.settle(store);
             }
         }
     }

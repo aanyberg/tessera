@@ -68,6 +68,8 @@ int main(void) {
         .on_session_title = NULL,
         .on_session_bell = NULL,
         .on_session_exit = on_exit_cb,
+        /* Added at the end of the table (#100); zeroed like any omitted field. */
+        .on_appearance_changed = NULL,
     };
     CHECK(tessera_app_set_callbacks(app, &callbacks));
 
@@ -80,6 +82,14 @@ int main(void) {
     }
     CHECK(tessera_app_config_path(app, path, sizeof path, NULL));
     printf("config path: %s\n", path);
+    /* Starting wrote nothing; this creates the default config.toml. */
+    CHECK(tessera_app_create_config(app));
+    FILE *config = fopen(path, "r");
+    if (config == NULL) {
+        fprintf(stderr, "tessera_app_create_config did not create %s\n", path);
+        return 1;
+    }
+    fclose(config);
 
     if (tessera_session_close(app, 12345) != TESSERA_ERROR_SESSION_NOT_FOUND) {
         fprintf(stderr, "closing an unknown session should fail\n");

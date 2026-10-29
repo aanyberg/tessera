@@ -76,6 +76,8 @@ int main(void) {
         .on_session_title = NULL,
         .on_session_bell = NULL,
         .on_session_exit = on_exit_cb,
+        /* Added at the end of the table (#100); zeroed like any omitted field. */
+        .on_appearance_changed = NULL,
     };
     EXPECT(tessera_app_set_callbacks(app, &callbacks), TESSERA_ERROR_OK);
 

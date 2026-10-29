@@ -693,6 +693,46 @@ final class TerminalSurfaceViewTests: XCTestCase {
         XCTAssertEqual(view.renderCount, before + 3, "a focus change is rendered")
     }
 
+    /// What the session router calls on every view when the core re-themes
+    /// them (`appearanceDidChange(opaque:)`): the window and layer follow the
+    /// background's opacity, and an idle view draws the new colours.
+    func testAnAppearanceChangeFollowsOpacityAndRedraws() throws {
+        try requireSurface()
+        view.occlusionOverride = false
+        view.displayLinkDidFire()
+        XCTAssertTrue(view.isDisplayLinkPaused, "idle")
+        XCTAssertTrue(view.metalLayer.isOpaque, "the default theme is opaque")
+
+        view.applyLayerOpacity(opaque: false)
+        XCTAssertTrue(view.metalLayer.isOpaque, "the layer is the core's, switched by the next frame")
+        XCTAssertFalse(window.isOpaque)
+        XCTAssertEqual(window.backgroundColor, .clear)
+        XCTAssertFalse(view.isDisplayLinkPaused, "a re-theme wakes the link")
+        let before = view.renderCount
+        view.displayLinkDidFire()
+        XCTAssertEqual(view.renderCount, before + 1, "and is drawn")
+
+        view.applyLayerOpacity(opaque: true)
+        XCTAssertTrue(window.isOpaque)
+        XCTAssertEqual(window.backgroundColor, .windowBackgroundColor)
+        view.displayLinkDidFire()
+        XCTAssertEqual(view.renderCount, before + 2)
+    }
+
+    /// A view without a surface draws nothing, so a translucent re-theme
+    /// leaves its window opaque (not see-through onto the desktop) and its
+    /// link idle.
+    func testAnAppearanceChangeLeavesAViewWithoutASurfaceAlone() throws {
+        try requireSurface()
+        view.occlusionOverride = false
+        view.displayLinkDidFire()
+        XCTAssertTrue(view.isDisplayLinkPaused, "idle")
+        try view.surface.detach()
+        view.applyLayerOpacity(opaque: false)
+        XCTAssertTrue(window.isOpaque)
+        XCTAssertTrue(view.isDisplayLinkPaused)
+    }
+
     func testTheLinkIdlesWithNothingToDraw() throws {
         try requireSurface()
         view.occlusionOverride = false

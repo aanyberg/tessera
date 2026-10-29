@@ -246,6 +246,17 @@ impl Target {
         }
     }
 
+    /// Asks for a translucent (or opaque) swapchain from the next frame
+    /// on; see [`RenderSurface::request_transparent`]. An offscreen
+    /// texture has no compositing mode and ignores it.
+    fn request_transparent(&mut self, transparent: bool) {
+        match self {
+            Self::Surface(surface) => surface.request_transparent(transparent),
+            #[cfg(test)]
+            Self::Offscreen { .. } => {}
+        }
+    }
+
     fn resize(&mut self, gpu: &Gpu, size: PhysicalSize, scale: f32) {
         match self {
             Self::Surface(surface) => surface.resize(gpu, size, scale),
@@ -279,6 +290,12 @@ impl Target {
 struct Shown {
     cursor: Point,
     focused: bool,
+}
+
+/// Whether `theme`'s background lets what is behind the view show through,
+/// so its surface needs a per-pixel-alpha swapchain.
+pub(crate) fn is_translucent(theme: &Theme) -> bool {
+    theme.background.clamped().a < 1.0
 }
 
 /// A theme file's sRGB colour as the renderer's linear [`Rgba`].
@@ -324,7 +341,7 @@ impl View {
         scale: f32,
     ) -> Result<Self, RenderError> {
         let options = SurfaceOptions {
-            transparent: theme.background.clamped().a < 1.0,
+            transparent: is_translucent(&theme),
             ..SurfaceOptions::default()
         };
         let surface = RenderSurface::attach(&gpu, surface, size, scale, options)?;
@@ -447,8 +464,53 @@ impl View {
     /// frame on; the font stays as it is ([`Renderer::set_theme`]). The
     /// renderer then reports [`Renderer::needs_redraw`], so the next
     /// [`Self::render`] draws every row even with no damage.
-    pub(crate) fn set_theme(&mut self, theme: Theme) {
+    ///
+    /// When the background turns translucent (alpha below 1) or opaque,
+    /// the surface is switched to the matching compositing mode as the
+    /// next frame starts ([`RenderSurface::request_transparent`]), so the
+    /// layer is reconfigured on the thread that draws (the main thread)
+    /// even when this runs on another one. An opaque swapchain ignores
+    /// alpha and would show the background's premultiplied colour (each
+    /// channel times alpha, so darker) as an opaque colour.
+    pub(crate) fn set_appearance(&mut self, theme: Theme) {
+        self.target.request_transparent(is_translucent(&theme));
         self.renderer.set_theme(theme);
+    }
+
+    /// The compositing modes the surface supports; `None` for an
+    /// offscreen view.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "offscreen views (tests only) have no compositing mode"
+        )
+    )]
+    pub(crate) fn supported_alpha_modes(&self) -> Option<Vec<wgpu::CompositeAlphaMode>> {
+        match &self.target {
+            Target::Surface(surface) => Some(surface.supported_alpha_modes(&self.gpu)),
+            #[cfg(test)]
+            Target::Offscreen { .. } => None,
+        }
+    }
+
+    /// The surface's compositing mode in effect, and the one the next
+    /// frame will switch to; `None` for an offscreen view.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "offscreen views (tests only) have no compositing mode"
+        )
+    )]
+    pub(crate) fn alpha_modes(&self) -> Option<(wgpu::CompositeAlphaMode, bool)> {
+        match &self.target {
+            Target::Surface(surface) => Some((surface.alpha_mode(), surface.wants_transparent())),
+            #[cfg(test)]
+            Target::Offscreen { .. } => None,
+        }
     }
 
     /// The theme the renderer draws with.
@@ -1368,7 +1430,7 @@ mod tests {
         next_frame();
         view.capture(&term);
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Skipped);
-        view.set_theme(red());
+        view.set_appearance(red());
         next_frame();
         view.capture(&term);
         let shaped = view.renderer().stats().rows_shaped;
@@ -1399,9 +1461,9 @@ mod tests {
         next_frame();
         term.advance(b"\x1b[3;1Hxyz");
         view.capture(&term);
-        view.set_theme(red());
+        view.set_appearance(red());
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
-        fresh.set_theme(red());
+        fresh.set_appearance(red());
         fresh.capture(&term);
         assert_eq!(fresh.render(true).expect("frame"), FrameStatus::Presented);
         assert!(

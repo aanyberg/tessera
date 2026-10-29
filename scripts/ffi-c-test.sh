@@ -29,6 +29,12 @@ case "$(uname -s)" in
     *) native_libs=(-lutil -ldl -lm) ;;
 esac
 
+# tessera_app_new reads and watches its configuration directory (#100): the
+# tests use a scratch one, never the user's.
+config_dir="$(mktemp -d)"
+trap 'rm -rf "$config_dir"' EXIT
+export TESSERA_CONFIG_DIR="$config_dir"
+
 for test in lifecycle input surface; do
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -pedantic \
         -I "$include_dir" \

@@ -421,8 +421,13 @@ pub(crate) fn follow_links(path: &Path) -> std::io::Result<Option<PathBuf>> {
 /// Writes [`DEFAULT_CONFIG_TOML`] to `path` unless something already exists
 /// there.
 ///
-/// The write is atomic (temporary file plus rename) so a watcher never sees a
-/// half-written document. Returns whether a file was written. Only a
+/// The document is written and flushed to a temporary file, then
+/// hard-linked to `path`. The link fails rather than replaces, so a file
+/// another process or the user creates meanwhile is never overwritten, and
+/// a watcher never sees a half-written document. On a file system without
+/// hard links (FAT, some network shares) the file is created with
+/// `create_new` and written in place: still never replacing, not atomic.
+/// Returns whether a file was written. Only a
 /// definite "not found" counts as missing: any other error while checking
 /// (permission denied, a parent that is not a directory, ...) is returned so
 /// an existing file is never replaced by mistake. A symlink counts as
@@ -438,9 +443,85 @@ pub fn write_default_if_missing(path: &Path) -> Result<bool, Error> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    write_atomic(path, DEFAULT_CONFIG_TOML)?;
-    Ok(true)
+    write_new(path, DEFAULT_CONFIG_TOML)
 }
+
+/// Creates `path` holding `contents` unless something exists there; see
+/// [`write_default_if_missing`]. Returns whether it was created.
+fn write_new(path: &Path, contents: &str) -> Result<bool, Error> {
+    use std::io::Write as _;
+
+    /// Temporary names tried before giving up: a stale one (left by a
+    /// crash of an earlier process with the same id) is skipped.
+    const TEMP_ATTEMPTS: u32 = 16;
+
+    let name = path
+        .file_name()
+        .map_or_else(|| "config".into(), |n| n.to_string_lossy().into_owned());
+    let mut attempts = 0;
+    let (tmp, mut file) = loop {
+        let tmp = path.with_file_name(format!(
+            ".{name}.{}.{}.new",
+            std::process::id(),
+            NEW_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::File::create_new(&tmp) {
+            Ok(file) => break (tmp, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempts < TEMP_ATTEMPTS => {
+                attempts += 1;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
+    let written = file
+        .write_all(contents.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    // Only the link's `AlreadyExists` means "something is at `path`".
+    let linked = written.map(|()| std::fs::hard_link(&tmp, path));
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(Ok(())) => Ok(true),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        // No hard links here (FSKit's FAT driver: `ENOTSUP`): create in
+        // place, still exclusive; a failed write removes the partial file.
+        Ok(Err(e))
+            if e.raw_os_error()
+                .is_some_and(|n| NO_HARD_LINK_ERRNOS.contains(&n)) =>
+        {
+            let mut file = match std::fs::File::create_new(path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+                Err(e) => return Err(e.into()),
+            };
+            if let Err(e) = file
+                .write_all(contents.as_bytes())
+                .and_then(|()| file.sync_all())
+            {
+                drop(file);
+                let _ = std::fs::remove_file(path);
+                return Err(e.into());
+            }
+            Ok(true)
+        }
+        // The temporary file could not be written, or the link failed.
+        Err(e) | Ok(Err(e)) => Err(e.into()),
+    }
+}
+
+/// Numbers [`write_new`]'s temporary files within this process.
+static NEW_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// The `errno` values [`write_new`] reads as "no hard links on this file
+/// system", as `tessera-devtool theme import` does: `EPERM`, `EXDEV`,
+/// `ENOSYS`, `ENOTSUP`, `EOPNOTSUPP` (macOS numbers; the crate has no
+/// `libc` dependency).
+#[cfg(not(target_os = "linux"))]
+const NO_HARD_LINK_ERRNOS: [i32; 5] = [1, 18, 78, 45, 102];
+
+/// See the macOS table; on Linux `ENOTSUP` and `EOPNOTSUPP` are both 95.
+#[cfg(target_os = "linux")]
+const NO_HARD_LINK_ERRNOS: [i32; 4] = [1, 18, 38, 95];
 
 /// Writes `contents` to `path` via a sibling temporary file and a rename.
 ///
@@ -503,6 +584,51 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file that appears between the existence check and the write (the
+    /// user saving their own, another process) is never replaced, and no
+    /// temporary file is left behind.
+    #[test]
+    fn writing_the_default_never_replaces_a_file_created_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        assert!(write_new(&path, "first").unwrap());
+        assert!(!write_new(&path, "second").unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["config.toml"]);
+    }
+
+    /// A stale temporary file with the name the next write would use (left
+    /// by a crash of an earlier process with the same id) is skipped, not
+    /// mistaken for an existing `config.toml`.
+    #[test]
+    fn a_stale_temporary_file_does_not_count_as_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let next = NEW_FILE_SEQUENCE.load(Ordering::Relaxed);
+        let stale: Vec<_> = (next..next + 4)
+            .map(|n| {
+                dir.path()
+                    .join(format!(".config.toml.{}.{n}.new", std::process::id()))
+            })
+            .collect();
+        for file in &stale {
+            std::fs::write(file, "stale").unwrap();
+        }
+        assert!(write_new(&path, "fresh").unwrap(), "created");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh");
+        for file in &stale {
+            assert_eq!(
+                std::fs::read_to_string(file).unwrap(),
+                "stale",
+                "left alone"
+            );
+        }
+    }
 
     #[test]
     fn default_template_matches_default_config() {

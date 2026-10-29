@@ -73,6 +73,9 @@ pub struct RenderSurface {
     scale: f32,
     /// `true` once `config` has been applied with a non-empty size.
     configured: bool,
+    /// Transparency asked for by [`Self::request_transparent`], applied
+    /// at the start of the next frame.
+    pending_transparent: Option<bool>,
 }
 
 impl RenderSurface {
@@ -136,6 +139,7 @@ impl RenderSurface {
             options,
             scale: sanitize_scale(scale),
             configured: false,
+            pending_transparent: None,
         };
         this.apply(gpu);
         Ok(this)
@@ -192,6 +196,53 @@ impl RenderSurface {
         self.options = options;
         self.apply(gpu);
         Ok(())
+    }
+
+    /// Switches between a swapchain that composites with per-pixel alpha
+    /// (`transparent`) and an opaque one, and reconfigures now: the alpha
+    /// mode becomes [`choose_alpha_mode`] of the surface's capabilities
+    /// (so it stays opaque where the surface lists no per-pixel-alpha
+    /// mode). On Metal this also sets the layer's `opaque` property.
+    /// Unchanged values are a no-op. Must be called on the main thread
+    /// like every reconfiguration; see [`Self::request_transparent`] for
+    /// other threads.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_options`].
+    pub fn set_transparent(&mut self, gpu: &Gpu, transparent: bool) -> Result<(), RenderError> {
+        self.pending_transparent = None;
+        self.set_options(
+            gpu,
+            SurfaceOptions {
+                transparent,
+                ..self.options
+            },
+        )
+    }
+
+    /// Asks for [`Self::set_transparent`] at the start of the next frame
+    /// ([`Self::render`] or [`Self::clear`]) instead of now, so a change
+    /// decided on another thread reconfigures the layer on the thread that
+    /// draws. A later request replaces an earlier one; a request equal to
+    /// the options in effect does nothing.
+    pub fn request_transparent(&mut self, transparent: bool) {
+        self.pending_transparent = Some(transparent);
+    }
+
+    /// The compositing modes the adapter lists for this surface; a
+    /// per-pixel-alpha one among them is what [`Self::set_transparent`]
+    /// switches to.
+    #[must_use]
+    pub fn supported_alpha_modes(&self, gpu: &Gpu) -> Vec<wgpu::CompositeAlphaMode> {
+        self.surface.get_capabilities(gpu.adapter()).alpha_modes
+    }
+
+    /// The transparency the next frame will use: the pending request, or
+    /// the options in effect.
+    #[must_use]
+    pub fn wants_transparent(&self) -> bool {
+        self.pending_transparent.unwrap_or(self.options.transparent)
     }
 
     /// Current size in physical pixels.
@@ -310,6 +361,13 @@ impl RenderSurface {
     /// The next swapchain image and whether it is suboptimal, or `None`
     /// when the frame should be skipped.
     fn acquire(&mut self, gpu: &Gpu) -> Result<Option<(wgpu::SurfaceTexture, bool)>, RenderError> {
+        if let Some(transparent) = self.pending_transparent.take()
+            && let Err(error) = self.set_transparent(gpu, transparent)
+        {
+            // The previous configuration stays in effect; the frame is
+            // still drawn, just not with the requested transparency.
+            tracing::warn!(target: "tessera_render", %error, transparent, "switching the surface's transparency failed");
+        }
         if !self.configured {
             return Ok(None);
         }

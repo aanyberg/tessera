@@ -2,7 +2,7 @@
 
 # Configuration reference
 
-Tessera reads its settings from `~/Library/Application Support/Tessera/config.toml` and writes one with the defaults on first launch. Every key is optional: a missing key takes the default listed here, and a missing table takes the defaults of all its keys. Unknown keys produce a warning and are kept. A file that does not parse never stops Tessera: the error is reported, and until the file is fixed the defaults apply at launch and the last good configuration stays in effect while running.
+Tessera reads its settings from `~/Library/Application Support/Tessera/config.toml`, or from `config.toml` in the directory the `TESSERA_CONFIG_DIR` environment variable names (unset by default; for tests and side-by-side installs). Starting Tessera writes no configuration there: without the file the defaults apply, and the file is written, with every default commented, only when the app is asked to open it for editing (a file you create yourself is picked up within a few seconds and never replaced). Saved edits of the file, and of the theme file in use under `themes/`, apply to every open window at once. Every key is optional: a missing key takes the default listed here, and a missing table takes the defaults of all its keys. Unknown keys produce a warning and are kept. A file that does not parse never stops Tessera: the error is reported, and until the file is fixed the defaults apply at launch and the last good configuration stays in effect while running.
 
 Defaults are written as TOML values; *unset* means the key is absent unless you set it.
 

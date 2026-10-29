@@ -42,7 +42,8 @@ mod surface;
 use std::ffi::{CStr, c_char};
 
 pub use app::{
-    App, tessera_app_config_path, tessera_app_free, tessera_app_new, tessera_app_set_callbacks,
+    App, tessera_app_config_path, tessera_app_create_config, tessera_app_free, tessera_app_new,
+    tessera_app_set_callbacks,
 };
 pub use callbacks::Callbacks;
 pub use error::Error;

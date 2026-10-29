@@ -59,6 +59,14 @@ final class Recorder: TesseraAppDelegate {
     func session(_ session: TesseraSession, didExitWithCode code: Int32, signal: Int32) {
         record(.exit(code: code, signal: signal), session)
     }
+
+    /// Every `appearanceDidChange(opaque:)`, in order.
+    private(set) var appearances: [Bool] = []
+
+    func appearanceDidChange(opaque: Bool) {
+        XCTAssertTrue(Thread.isMainThread, "delegate called off the main thread")
+        appearances.append(opaque)
+    }
 }
 
 @MainActor
@@ -92,6 +100,26 @@ final class TesseraKitTests: XCTestCase {
     func testCoreVersionIsReadableOffTheMainActor() async {
         let version = await Task.detached { TesseraApp.coreVersion }.value
         XCTAssertEqual(version, TesseraApp.coreVersion)
+    }
+
+    func testStartingCreatesNothingAndCreateConfigWritesTheDefaultFileOnce() throws {
+        // A directory of this test's own: the scheme's scratch directory must
+        // stay absent, so the other tests run without the configuration watch.
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-config-\(UUID().uuidString)")
+        let previous = ProcessInfo.processInfo.environment["TESSERA_CONFIG_DIR"]
+        setenv("TESSERA_CONFIG_DIR", dir.path, 1)
+        defer {
+            if let previous { setenv("TESSERA_CONFIG_DIR", previous, 1) } else { unsetenv("TESSERA_CONFIG_DIR") }
+            try? FileManager.default.removeItem(at: dir)
+        }
+        let own = try TesseraApp()
+        defer { own.shutdown() }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dir.path), "starting creates nothing")
+        try own.createConfig()
+        let first = try String(contentsOf: own.configPath, encoding: .utf8)
+        XCTAssertTrue(first.contains("[appearance]"), first)
+        try own.createConfig()
+        XCTAssertEqual(try String(contentsOf: own.configPath, encoding: .utf8), first)
     }
 
     func testInitReportsTheConfigPath() {

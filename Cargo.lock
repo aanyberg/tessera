@@ -2443,6 +2443,7 @@ name = "tessera-ffi"
 version = "0.1.0"
 dependencies = [
  "cbindgen",
+ "tempfile",
  "tessera-app-core",
  "tessera-config",
  "tessera-ffi",

@@ -41,7 +41,7 @@ The diagram is the target design; today the core holds sessions only
 | `tessera-plugins/*` | first-party plugins | plugin-api |
 | `tessera-protocol` | JSON-RPC request/response types (ADR 0003) | plugin-api |
 | `tessera-control` | Unix socket server, consent, dispatch | protocol, app-core |
-| `tessera-app-core` | sessions, input, and one view per session (`view.rs`: a `View` holds `tessera-render`'s `RenderSurface` and `Renderer`; `App` shares one `Gpu`, ADR 0014); no OS UI | pty, term, config, plugin-api, render, grid (and the `hello` plugin) |
+| `tessera-app-core` | sessions, input, and one view per session (`view.rs`: a `View` holds `tessera-render`'s `RenderSurface` and `Renderer`; `App` shares one `Gpu`, ADR 0014); the live configuration (`config_watch.rs`: one watcher per `App` applying `config.toml` and theme edits, ADR 0006, 0019); no OS UI | pty, term, config, plugin-api, render, grid (and the `hello` plugin) |
 | `tessera-ffi` | `extern "C"` surface, including turning a `CAMetalLayer*` into a wgpu surface (`unsafe` allowed); `apps/macos` wraps it as TesseraKit (ADR 0012) | app-core |
 | `tessera-cli` | `tessera` binary speaking the protocol | protocol |
 | `tessera-devtool` | dev-only `tessera-devtool` binary and library: headless screen dumps for debugging and snapshot tests, and `theme import`; never published, nothing in the app depends on it | pty, term, grid, config |
