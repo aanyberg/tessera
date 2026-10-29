@@ -71,6 +71,42 @@ final class WindowTabTests: XCTestCase {
         XCTAssertNoThrow(try second.session.resize(rows: 24, cols: 80))
     }
 
+    /// The core's `appearanceDidChange(opaque:)` reaches every tab through the
+    /// session router, the background tab included: each window follows the
+    /// opacity and each view's display link wakes to draw the new colours.
+    func testAnAppearanceChangeReachesEveryTab() throws {
+        let first = try appDelegate.newWindow()
+        let second = try appDelegate.newTab(in: try XCTUnwrap(first.window))
+        let controllers = [first, second]
+        let views = try controllers.map { try XCTUnwrap($0.contentView as? TerminalSurfaceView) }
+        guard views.allSatisfy(\.surface.isAttached) else {
+            throw XCTSkip("the core could not attach a renderer to the views (no GPU can present, or no font)")
+        }
+        let router = SessionRouter()
+        for controller in controllers {
+            router.register(controller)
+        }
+        for view in views {
+            view.occlusionOverride = false
+            view.displayLinkDidFire()
+            XCTAssertTrue(view.isDisplayLinkPaused, "idle before the change")
+        }
+
+        router.appearanceDidChange(opaque: false)
+        for (controller, view) in zip(controllers, views) {
+            let window = try XCTUnwrap(controller.window)
+            XCTAssertFalse(window.isOpaque, "tab \(controller.session.id) is translucent")
+            XCTAssertEqual(window.backgroundColor, .clear)
+            XCTAssertFalse(view.isDisplayLinkPaused, "tab \(controller.session.id) redraws")
+            view.displayLinkDidFire()
+        }
+
+        router.appearanceDidChange(opaque: true)
+        for controller in controllers {
+            XCTAssertTrue(try XCTUnwrap(controller.window).isOpaque)
+        }
+    }
+
     func testTabBarPlusButtonAddsATabAfterThatWindow() throws {
         let windows = try openTabs(2)
         let first = try XCTUnwrap(appDelegate.windowControllers.first { $0.window === windows[0] })

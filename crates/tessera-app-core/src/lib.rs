@@ -29,6 +29,7 @@
 
 #![forbid(unsafe_code)]
 
+mod config_watch;
 pub mod input;
 pub mod session;
 pub mod view;
@@ -48,9 +49,11 @@ pub use input::{InputEvent, InputOutcome};
 pub use session::{SessionEvent, SessionId, SessionObserver};
 // Re-exported so frontends (through `tessera-ffi`) depend on this crate
 // alone, as the layering in `docs/architecture.md` requires.
-pub use tessera_config::{Config, ConfigPaths};
+pub use config_watch::{CONFIG_DIR_POLL_INTERVAL, CONFIG_WATCH_STOP_CAP};
+pub use tessera_config::{Config, ConfigPaths, ConfigStore, WatchOptions};
 pub use tessera_pty::{ExitStatus, Program, PtyError, PtySize, SpawnOptions};
 
+use config_watch::{Applied, ConfigWatch};
 use input::{Bindings, FocusEvent, MouseEvent};
 use session::{ObserverSlot, Reaper, Session, lock};
 use view::{CellMetrics, FrameStatus, PhysicalSize, RenderError, View, ViewSize, wgpu};
@@ -149,15 +152,18 @@ pub struct ViewMetrics {
 
 /// Root application object.
 pub struct App {
-    config: Config,
+    /// The configuration in effect and the colours it resolved to; shared
+    /// with the configuration watch's thread ([`App::start_config_watch`]).
+    /// Written only while `views` is held, like `theme`.
+    applied: Arc<Mutex<Applied>>,
     paths: ConfigPaths,
-    sessions: Mutex<HashMap<SessionId, Arc<Session>>>,
+    sessions: Arc<Mutex<HashMap<SessionId, Arc<Session>>>>,
     next_id: AtomicU64,
     observers: ObserverSlot,
     bindings: Bindings,
     /// At most one view per session, by session id. Never held while
     /// `sessions` is locked.
-    views: Mutex<HashMap<SessionId, View>>,
+    views: Arc<Mutex<HashMap<SessionId, View>>>,
     /// The process's GPU, brought up by the first [`App::attach_view`] and
     /// shared by every view after it. Replaced by the next attach once its
     /// device is lost, and dropped when the last view detaches. Locked only
@@ -167,13 +173,15 @@ pub struct App {
     /// shared by every view's shaper (loading it takes a noticeable
     /// fraction of a second).
     fonts: Mutex<Option<Fonts>>,
-    /// The theme every view draws with, set by [`App::apply_theme`].
+    /// The theme every view draws with, set by [`App::apply_config`].
     /// Written only while `views` is held (and read under it by
     /// [`App::attach_view`]), so a view attached during a re-theme never
     /// keeps the old colours.
-    theme: Mutex<Theme>,
+    theme: Arc<Mutex<Theme>>,
     /// Finishes closing the sessions [`App::close_session`] hands it.
     reaper: Reaper,
+    /// The configuration watch, if [`App::start_config_watch`] started one.
+    config_watch: Mutex<Option<ConfigWatch>>,
 }
 
 impl App {
@@ -183,30 +191,44 @@ impl App {
     /// `config.appearance.theme` names, resolved against `paths` like
     /// [`tessera_config::ConfigStore::theme`] (a name that matches nothing
     /// gives the default theme).
+    ///
+    /// The configuration is not watched: a frontend that reads it from a
+    /// [`ConfigStore`] passes `(*store.config()).clone()` here and then
+    /// hands the store to [`App::start_config_watch`].
     pub fn new(config: Config, paths: ConfigPaths) -> Self {
         let colours = tessera_config::Theme::resolve(&paths.themes_dir(), &config.appearance.theme);
         for warning in &colours.warnings {
             tracing::warn!(target: "tessera_app_core", "{warning}");
         }
-        let theme = Mutex::new(view::theme_for(&config, &colours.theme));
+        let theme = Arc::new(Mutex::new(view::theme_for(&config, &colours.theme)));
         Self {
-            config,
+            applied: Arc::new(Mutex::new(Applied {
+                config: Arc::new(config),
+                colours: colours.theme,
+                source: match colours.source {
+                    tessera_config::ThemeSource::User(path) => Some(path),
+                    _ => None,
+                },
+            })),
             paths,
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
             observers: Arc::new(RwLock::new(None)),
             bindings: Bindings::default(),
-            views: Mutex::new(HashMap::new()),
+            views: Arc::new(Mutex::new(HashMap::new())),
             gpu: Mutex::new(None),
             fonts: Mutex::new(None),
             theme,
             reaper: Reaper::new(),
+            config_watch: Mutex::new(None),
         }
     }
 
-    /// Current configuration.
-    pub fn config(&self) -> &Config {
-        &self.config
+    /// The configuration in effect: the one the `App` was created with,
+    /// or the last one [`App::apply_config`] applied (which the
+    /// configuration watch does on every change of `config.toml`).
+    pub fn config(&self) -> Arc<Config> {
+        self.live().config()
     }
 
     /// Path of the main configuration file, `config.toml`.
@@ -926,31 +948,47 @@ impl App {
         }
     }
 
-    /// Re-themes every view, and every view attached later, with `theme`'s
-    /// colours (through [`view::theme_for`], so the configured opacity
-    /// still scales the background). Fonts are not reloaded: each view
-    /// keeps its font family and size.
+    /// Applies `config` with the colours `theme` (the `appearance.theme`
+    /// it resolves to, [`tessera_config::ConfigStore::theme`]) to every
+    /// view and to every view attached later, and makes `config` the one
+    /// [`App::config`] returns.
     ///
-    /// Call it with [`tessera_config::ConfigStore::theme`] whenever the
-    /// configuration watcher reports
-    /// [`tessera_config::ConfigEvent::Changed`]; the new colours show from
-    /// each view's next frame. A view's surface keeps the transparency mode
-    /// it was attached with. A theme (or opacity) that makes an opaque
-    /// background translucent is therefore see-through only in views
-    /// attached after it: an existing, opaque view shows the background's
-    /// premultiplied colour (each channel times its alpha, so darker) as
-    /// an opaque colour. Must be called on the main thread.
-    pub fn apply_theme(&self, theme: &tessera_config::Theme) {
-        let theme = view::theme_for(&self.config, theme);
-        let mut views = lock(&self.views);
-        for view in views.values_mut() {
-            view.set_theme(theme.clone());
-        }
-        *lock(&self.theme) = theme;
+    /// The renderer theme is built from the *new* configuration
+    /// ([`view::theme_for`]: colours, the background's alpha times
+    /// `appearance.opacity`, font family and size; line height and padding
+    /// are the renderer's defaults, since the configuration has no keys for
+    /// them). The new colours show from each view's next frame. When the
+    /// configured `font_size` changed, every view is set to it, a size the
+    /// user zoomed to included, and its session is resized to the grid
+    /// that fits, after the views lock is released; otherwise each view
+    /// keeps its size. A background that turns translucent (or opaque)
+    /// switches each surface's compositing mode as its next frame starts,
+    /// on the thread that draws it. A font *family* change applies only to
+    /// a font database loaded later: the views keep the font they were
+    /// attached with.
+    ///
+    /// When anything the views draw changed, the observer's
+    /// [`SessionObserver::on_appearance_changed`] is then called on this
+    /// thread with whether the background is opaque.
+    ///
+    /// May be called from any thread (the configuration watch calls it
+    /// from its own, [`App::start_config_watch`]); it does no GPU work.
+    pub fn apply_config(&self, config: &Config, theme: &tessera_config::Theme) {
+        self.live().apply(config, theme);
     }
 
-    /// The renderer theme views draw with now: the last
-    /// [`App::apply_theme`], or the configured theme.
+    /// Re-themes every view with `theme`'s colours under the configuration
+    /// in effect: [`App::apply_config`] with [`App::config`]. Check, then
+    /// act: the configuration is read first and applied with `theme` after,
+    /// so a configuration the watch applies in between (on its own thread)
+    /// is replaced by the one read; call it from one thread, or use
+    /// [`App::apply_config`] with the configuration you mean.
+    pub fn apply_theme(&self, theme: &tessera_config::Theme) {
+        self.apply_config(&self.config(), theme);
+    }
+
+    /// The renderer theme views draw with now: the configured theme, or
+    /// the last [`App::apply_config`].
     pub fn view_theme(&self) -> Theme {
         lock(&self.theme).clone()
     }
@@ -1066,6 +1104,31 @@ impl App {
         lock(&self.views).get(&id).map(|view| view.theme().clone())
     }
 
+    /// The compositing mode session `id`'s surface uses now, and whether
+    /// its next frame switches to a translucent one; `None` without a view.
+    ///
+    /// Exists only so tests can prove that a translucent re-theme switches
+    /// the surfaces of views already attached.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn view_alpha_modes(&self, id: SessionId) -> Option<(wgpu::CompositeAlphaMode, bool)> {
+        lock(&self.views).get(&id).and_then(View::alpha_modes)
+    }
+
+    /// The compositing modes session `id`'s surface supports; `None`
+    /// without a view. For tests that must know whether a translucent
+    /// surface is possible before they expect one.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn view_supported_alpha_modes(
+        &self,
+        id: SessionId,
+    ) -> Option<Vec<wgpu::CompositeAlphaMode>> {
+        lock(&self.views)
+            .get(&id)
+            .and_then(View::supported_alpha_modes)
+    }
+
     /// Loses the process GPU's device, as a GPU reset or an unplugged
     /// external GPU would (through [`Gpu::lose_device_for_test`]). Returns
     /// `false` when no GPU is up.
@@ -1111,6 +1174,8 @@ impl Drop for App {
     /// [`HANGUP_GRACE`](session::HANGUP_GRACE) +
     /// [`KILL_GRACE`](session::KILL_GRACE) however many sessions there are.
     fn drop(&mut self) {
+        // First, so no change is applied to views being released.
+        self.stop_config_watch();
         let views: Vec<_> = lock(&self.views).drain().collect();
         drop(views);
         let gpu = lock(&self.gpu).take();

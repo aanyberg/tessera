@@ -261,6 +261,7 @@ fn huge_max_wait_and_poll_interval_still_observe_an_edit() {
             poll_interval,
             debounce: Duration::from_millis(50),
             max_wait: Duration::MAX,
+            ..Default::default()
         });
         std::fs::write(store.paths().config_file(), font_size_doc(24)).unwrap();
         let event = watcher
@@ -292,6 +293,7 @@ fn huge_debounce_keeps_the_thread_alive_and_stoppable() {
             poll_interval: Duration::MAX,
             debounce: Duration::MAX,
             max_wait: Duration::MAX,
+            ..Default::default()
         });
         std::fs::write(store.paths().config_file(), font_size_doc(26)).unwrap();
         assert!(
@@ -356,6 +358,7 @@ fn continuous_writes_are_applied_within_max_wait() {
             poll_interval: Duration::from_millis(10),
             debounce: Duration::from_millis(100),
             max_wait: Duration::from_millis(300),
+            ..Default::default()
         });
         let path = store.paths().config_file();
 

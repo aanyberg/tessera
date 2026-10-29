@@ -6,7 +6,10 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::ffi::{CStr, CString, c_char, c_void};
+use std::path::Path;
 use std::process::Command;
 use std::ptr;
 #[cfg(target_os = "macos")]
@@ -81,6 +84,7 @@ impl Recorder {
             on_session_title: Some(on_title),
             on_session_bell: Some(on_bell),
             on_session_exit: Some(on_exit),
+            on_appearance_changed: None,
         }
     }
 }
@@ -131,6 +135,7 @@ impl Handle {
     fn new() -> Self {
         let mut app = ptr::null_mut();
         // SAFETY: `app` is writable storage for one pointer.
+        common::hermetic_config_dir();
         assert_eq!(unsafe { tessera_app_new(&raw mut app) }, Error::Ok);
         assert!(!app.is_null());
         Self(app)
@@ -755,6 +760,7 @@ fn session_threads_run_at_user_initiated_qos() {
         on_session_title: None,
         on_session_bell: None,
         on_session_exit: None,
+        on_appearance_changed: None,
     };
     // SAFETY: live handle; valid table; `qos` outlives the handle.
     assert_eq!(
@@ -828,8 +834,8 @@ fn config_path_round_trips_through_a_buffer() {
     );
     let path = CStr::from_bytes_with_nul(&buf).unwrap().to_str().unwrap();
     assert_eq!(path.len(), len);
-    assert!(
-        path.ends_with("Library/Application Support/Tessera/config.toml"),
-        "{path}"
-    );
+    // `TESSERA_CONFIG_DIR` (set by the test harness) replaces
+    // `~/Library/Application Support/Tessera`.
+    let expected = common::hermetic_config_dir().join("config.toml");
+    assert_eq!(Path::new(path), expected, "{path}");
 }

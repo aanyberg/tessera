@@ -41,7 +41,7 @@ use tessera_app_core::input::MouseButton;
 use tessera_app_core::session::PENDING_INPUT_BYTES;
 use tessera_app_core::view::{FrameStatus, PhysicalSize, RenderError};
 use tessera_app_core::{
-    App, Config, ConfigPaths, Error, InputEvent, InputOutcome, SessionId, SpawnOptions,
+    App, ConfigPaths, Error, InputEvent, InputOutcome, SessionId, SpawnOptions, WatchOptions,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -87,7 +87,8 @@ fn main() -> ExitCode {
         }
     };
     let mut devwin = DevWin::new(
-        App::new(Config::default(), paths),
+        // The user's configuration, watched like the app's (ADR 0006).
+        App::with_config_dir(paths, WatchOptions::default()),
         event_loop.create_proxy(),
     );
     if let Err(error) = event_loop.run_app(&mut devwin) {

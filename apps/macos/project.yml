@@ -56,9 +56,6 @@ targets:
         # which the Thread Sanitizer adds again: `ld: warning: duplicate -rpath`
         # in every `just app-test` run. One plain executable avoids it.
         ENABLE_DEBUG_DYLIB: NO
-    scheme:
-      testTargets:
-        - TesseraTests
   # Swift wrapper over the C module `TesseraCore` (the generated TesseraCore.h in
   # TesseraCore.xcframework). The static Rust library is linked into this framework.
   TesseraKit:
@@ -86,9 +83,6 @@ targets:
         # libtool merges libtessera_ffi.a into TesseraKit.a; Rust's empty object
         # files (cfg_if, compiler_builtins) would each print a warning.
         OTHER_LIBTOOLFLAGS: -no_warning_for_no_symbols
-    scheme:
-      testTargets:
-        - TesseraKitTests
   TesseraKitTests:
     type: bundle.unit-test
     platform: macOS
@@ -118,3 +112,49 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Tessera.app/Contents/MacOS/Tessera"
         BUNDLE_LOADER: "$(TEST_HOST)"
+
+# Defined here rather than as target schemes so the test action alone gets
+# TESSERA_CONFIG_DIR: the core reads and watches its configuration directory
+# (#100), and the tests must neither read nor create the user's. The
+# directory and its parent never exist (no test asks for them), so the core
+# neither watches nor waits for them and the tests run without the
+# configuration watch's threads, which under the Thread Sanitizer made a
+# fork deadlock with the Thread Performance Checker likelier. ⌘R (the run
+# action) uses the user's configuration as the shipped app does.
+schemes:
+  Tessera:
+    build:
+      targets:
+        Tessera: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - TesseraTests
+      environmentVariables:
+        TESSERA_CONFIG_DIR: $(PROJECT_TEMP_DIR)/TesseraTestConfigAbsent/Tessera
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release
+  TesseraKit:
+    build:
+      targets:
+        TesseraKit: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - TesseraKitTests
+      environmentVariables:
+        TESSERA_CONFIG_DIR: $(PROJECT_TEMP_DIR)/TesseraTestConfigAbsent/Tessera
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release

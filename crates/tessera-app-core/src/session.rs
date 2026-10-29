@@ -172,6 +172,28 @@ pub enum SessionEvent {
 pub trait SessionObserver: Send + Sync {
     /// Handles one event of session `id`.
     fn on_session_event(&self, id: SessionId, event: SessionEvent);
+
+    /// The appearance every view draws with changed (theme, opacity or
+    /// font size, applied by [`App::apply_config`](crate::App::apply_config));
+    /// `opaque` is whether the background is now fully opaque. The host
+    /// makes its windows translucent or opaque to match and redraws its
+    /// views: the core switches each surface's compositing mode at its
+    /// next frame, and a host whose display link idles would otherwise not
+    /// draw the new colours until the next output.
+    ///
+    /// Called on the thread that applied the change, the configuration
+    /// watch's thread when the change came from a file
+    /// ([`App::start_config_watch`](crate::App::start_config_watch)). No
+    /// lock of the `App` is held but the observer slot's, so unlike a
+    /// session event this call may call back into the `App`: its views and
+    /// sizes, its configuration, [`App::apply_config`](crate::App::apply_config),
+    /// closing a session, stopping or restarting the watch. It must not
+    /// replace the observer (`set_observer` waits for this call) or drop
+    /// the last reference to the `App` (dropping replaces the observer),
+    /// and should return quickly. Does nothing by default.
+    fn on_appearance_changed(&self, opaque: bool) {
+        let _ = opaque;
+    }
 }
 
 impl<F> SessionObserver for F
@@ -214,7 +236,7 @@ pub fn set_thread_start_hook(hook: fn()) -> bool {
 /// Runs the hook [`set_thread_start_hook`] installed, if any. A panicking
 /// hook is logged and the thread carries on: a reaper that died here would
 /// leave every closing child unkilled.
-fn run_thread_start_hook() {
+pub(crate) fn run_thread_start_hook() {
     if let Some(hook) = THREAD_START_HOOK.get()
         && panic::catch_unwind(*hook).is_err()
     {

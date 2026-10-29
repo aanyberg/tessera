@@ -4,7 +4,7 @@ use std::ffi::c_char;
 use std::os::unix::ffi::OsStrExt;
 use std::ptr;
 
-use tessera_app_core::{App as CoreApp, Config, ConfigPaths};
+use tessera_app_core::{App as CoreApp, ConfigPaths, WatchOptions};
 
 use crate::callbacks::{CallbackObserver, Callbacks};
 use crate::error::Error;
@@ -24,7 +24,8 @@ use crate::panic::ffi_guard;
 ///   from any thread, concurrently with any other call except
 ///   `tessera_app_free`. The surface functions create, configure and
 ///   present Metal surfaces, which must happen on the main thread.
-/// * Callbacks (see `TesseraCallbacks`) fire on internal reader threads.
+/// * Callbacks (see `TesseraCallbacks`) fire on internal threads (session
+///   readers, the configuration watch).
 ///   They must return quickly, must not call any `tessera_*` function and
 ///   must not block on the UI thread; the host marshals their work to its
 ///   main thread asynchronously.
@@ -48,15 +49,35 @@ impl App {
     }
 }
 
+/// Environment variable naming the configuration directory, in place of
+/// `~/Library/Application Support/Tessera`, for tests and side-by-side
+/// installs. Read by `tessera_app_new`; an empty value is ignored.
+const CONFIG_DIR_ENV: &str = "TESSERA_CONFIG_DIR";
+
 /// Creates an application and stores its handle in `*out`.
 ///
-/// The configuration directory is `~/Library/Application Support/Tessera`;
-/// the default configuration applies (loading `config.toml` is not wired up
-/// yet). No callbacks are installed and no session is running.
+/// The configuration directory is `~/Library/Application Support/Tessera`,
+/// or the directory the `TESSERA_CONFIG_DIR` environment variable names
+/// when it is set to an absolute path (for tests and side-by-side
+/// installs; unset by default; a relative path is ignored with a warning). The application starts with the
+/// configuration `config.toml` holds and the theme its `appearance.theme`
+/// names, and watches both (and `themes/`) for the rest of its life,
+/// applying every edit to its views and reporting it through
+/// `on_appearance_changed`. Starting creates nothing on disk: a missing or
+/// invalid `config.toml` gives the defaults (logged; a repaired file is
+/// picked up by the watch), and a configuration directory that does not
+/// exist yet is looked for every two seconds (one `stat`) and watched once
+/// it appears, or at once when `tessera_app_create_config` creates it. The
+/// exception is a directory whose parent is missing too (only a
+/// `TESSERA_CONFIG_DIR` that names nothing can be): it is not looked for,
+/// and only `tessera_app_create_config` creates it and starts the watch.
+/// Neither fails the call. No callbacks are installed and no session is
+/// running.
 ///
 /// Returns `TESSERA_ERROR_NULL_POINTER` if `out` is `NULL`, and
-/// `TESSERA_ERROR_IO` if the home directory cannot be determined; `*out` is
-/// set to `NULL` on failure.
+/// `TESSERA_ERROR_IO` if neither `TESSERA_CONFIG_DIR` names a directory
+/// nor the home directory can be determined; `*out` is set to `NULL` on
+/// failure.
 ///
 /// # Safety
 ///
@@ -73,17 +94,41 @@ pub unsafe extern "C" fn tessera_app_new(out: *mut *mut App) -> Error {
         unsafe { out.write(ptr::null_mut()) };
         // Process-wide and idempotent: only the first app installs it.
         tessera_app_core::session::set_thread_start_hook(raise_thread_qos);
-        let Some(paths) = ConfigPaths::for_current_user() else {
+        let Some(paths) = config_paths() else {
             tracing::warn!("cannot determine the home directory");
             return Error::Io;
         };
         let app = Box::new(App {
-            core: CoreApp::new(Config::default(), paths),
+            // Lead decisions D1, D2: the watch lives in the core, and a
+            // missing or broken configuration is never an error here.
+            core: CoreApp::with_config_dir(paths, WatchOptions::default()),
         });
         // SAFETY: as above.
         unsafe { out.write(Box::into_raw(app)) };
         Error::Ok
     })
+}
+
+/// The configuration directory: `TESSERA_CONFIG_DIR` when set to an
+/// absolute path, otherwise the current user's.
+///
+/// A relative `TESSERA_CONFIG_DIR` is refused with a warning: it would name
+/// a different directory for every working directory the app is started
+/// from.
+fn config_paths() -> Option<ConfigPaths> {
+    match std::env::var_os(CONFIG_DIR_ENV) {
+        Some(dir) if !dir.is_empty() => {
+            if std::path::Path::new(&dir).is_absolute() {
+                return Some(ConfigPaths::new(dir));
+            }
+            tracing::warn!(
+                dir = %std::path::Path::new(&dir).display(),
+                "{CONFIG_DIR_ENV} is not an absolute path; using the default configuration directory"
+            );
+            ConfigPaths::for_current_user()
+        }
+        _ => ConfigPaths::for_current_user(),
+    }
 }
 
 /// Gives the calling thread (a session reader or input writer, or the
@@ -118,9 +163,10 @@ fn raise_thread_qos() {
 #[cfg(not(target_os = "macos"))]
 fn raise_thread_qos() {}
 
-/// Destroys an application: detaches every surface (releasing the core's
-/// references to their layers), closes every session still open (hanging
-/// up, and if need be killing, its child), waits for those closes and for
+/// Destroys an application: stops the configuration watch, detaches every
+/// surface (releasing the core's references to their layers), closes every
+/// session still open (hanging up, and if need be killing, its child),
+/// waits for those closes and for
 /// every close `tessera_session_close` left running in the background,
 /// joins every session thread and releases the handle. A session whose
 /// terminal is still held open after `SIGKILL` (a grandchild kept it) has
@@ -131,6 +177,12 @@ fn raise_thread_qos() {}
 /// kill, counted from its own close and running in parallel for all of
 /// them, so this blocks for at most about two seconds however many
 /// children ignore `SIGHUP`. `NULL` is ignored.
+///
+/// A configuration change being applied when this is called finishes
+/// first: its thread is given a second, then left to end on its own, but
+/// an `on_appearance_changed` callback it is running is waited for as long
+/// as it runs (like any callback), so a callback that blocks makes this
+/// block too.
 ///
 /// # Safety
 ///
@@ -178,6 +230,39 @@ pub unsafe extern "C" fn tessera_app_set_callbacks(
         app.core
             .set_observer(callbacks.map(|table| Box::new(CallbackObserver::new(table)) as Box<_>));
         Error::Ok
+    })
+}
+
+/// Makes the configuration editable: creates the configuration directory
+/// (see `tessera_app_new`) and a commented `config.toml` with the defaults
+/// where they are missing, and starts watching them if the application is
+/// not watching yet, so the edits the user is about to make apply live.
+/// Call it before opening `config.toml` for editing: the app's Open Config
+/// menu item (#29) and Preferences (#40) are its callers.
+/// Idempotent; an existing file is never changed.
+///
+/// Returns `TESSERA_ERROR_NULL_POINTER` if `app` is `NULL`, and
+/// `TESSERA_ERROR_IO` if the directory or the file cannot be created or the
+/// watch cannot be started.
+///
+/// # Safety
+///
+/// `app` must be `NULL` or a live handle. Main thread only, like every
+/// `tessera_app_*` call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_app_create_config(app: *mut App) -> Error {
+    ffi_guard!("tessera_app_create_config", {
+        // SAFETY: the caller passes NULL or a live handle.
+        let Some(app) = (unsafe { App::from_ptr(app) }) else {
+            return Error::NullPointer;
+        };
+        match app.core.open_config(WatchOptions::default()) {
+            Ok(_) => Error::Ok,
+            Err(error) => {
+                tracing::warn!(%error, "cannot create the configuration");
+                Error::Io
+            }
+        }
     })
 }
 

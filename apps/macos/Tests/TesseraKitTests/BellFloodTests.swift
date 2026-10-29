@@ -15,6 +15,7 @@ private final class SlowBellDelegate: TesseraAppDelegate {
         while DispatchTime.now().uptimeNanoseconds < end {}
     }
     func session(_ session: TesseraSession, didExitWithCode code: Int32, signal: Int32) {}
+    func appearanceDidChange(opaque: Bool) {}
 }
 
 /// The process's physical footprint in bytes (what Activity Monitor shows).

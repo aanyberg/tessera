@@ -22,6 +22,8 @@ test-hooks = ["tessera-app-core/test-hooks"]
 tessera-ffi = { path = ".", features = ["test-hooks"] }
 # Theme values for the re-theming test of attached views.
 tessera-config.workspace = true
+# Temporary configuration directories (`TESSERA_CONFIG_DIR`).
+tempfile = "3"
 
 [lints]
 workspace = true

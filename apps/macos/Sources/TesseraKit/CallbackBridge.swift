@@ -24,6 +24,10 @@ internal import TesseraCore
 /// queued at any time; a delivery reports what happened since the previous
 /// one; and the exit, the core's last callback for a session, is always
 /// delivered last.
+///
+/// `on_appearance_changed` (from the core's configuration watch thread) is
+/// coalesced the same way, app-wide: at most one delivery is queued, and it
+/// reports the latest `opaque`.
 @MainActor
 final class CallbackBridge {
     weak var delegate: (any TesseraAppDelegate)?
@@ -36,6 +40,11 @@ final class CallbackBridge {
     /// Events received and not yet delivered, by session. A session has an
     /// entry exactly while a delivery for it is queued on the main actor.
     private nonisolated let pending = Mutex<[UInt64: Pending]>([:])
+    /// The latest `opaque` received and not yet delivered; non-`nil` exactly
+    /// while an appearance delivery is queued.
+    private nonisolated let pendingAppearance = Mutex<Bool?>(nil)
+    /// Appearance deliveries scheduled so far (tests: a burst schedules one).
+    nonisolated let scheduledAppearanceDeliveries = Mutex<Int>(0)
 
     func register(_ session: TesseraSession) {
         guard !isShutDown else { return }
@@ -73,6 +82,9 @@ final class CallbackBridge {
             },
             on_session_exit: { userData, id, code, signal in
                 CallbackBridge.from(userData)?.receive(for: id) { $0.exit = (code, signal) }
+            },
+            on_appearance_changed: { userData, opaque in
+                CallbackBridge.from(userData)?.receiveAppearance(opaque: opaque)
             }
         )
     }
@@ -108,7 +120,28 @@ final class CallbackBridge {
         }
     }
 
+    private nonisolated func receiveAppearance(opaque: Bool) {
+        let schedule = pendingAppearance.withLock { pending in
+            defer { pending = opaque }
+            return pending == nil
+        }
+        guard schedule else { return }
+        scheduledAppearanceDeliveries.withLock { $0 += 1 }
+        Task { @MainActor in
+            self.deliverAppearance()
+        }
+    }
+
     // MARK: Main actor
+
+    private func deliverAppearance() {
+        guard let opaque = pendingAppearance.withLock({ pending in
+            defer { pending = nil }
+            return pending
+        }) else { return }
+        guard !isShutDown, let delegate else { return }
+        delegate.appearanceDidChange(opaque: opaque)
+    }
 
     private func deliver(_ id: UInt64) {
         // Taken before the delegate runs, so events arriving meanwhile

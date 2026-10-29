@@ -30,14 +30,15 @@
 //! from `appearance.theme` by [`ConfigStore::theme`] ([`Theme::resolve`]),
 //! and imports iTerm2 `.itermcolors` and base16 schemes
 //! ([`import_itermcolors`], [`import_base16`]); see ADR 0019. Routing the
-//! applied configuration into `tessera-app-core` and the windows is the
-//! application layer's job and is not done here.
+//! applied configuration into the windows is the application layer's job
+//! (`tessera-app-core` runs one watcher per application and applies each
+//! change to its views) and is not done here.
 //!
 //! ```no_run
 //! use tessera_config::{ConfigEvent, ConfigPaths, ConfigStore, WatchOptions};
 //!
 //! let paths = ConfigPaths::for_current_user().expect("home directory");
-//! let store = ConfigStore::open(paths)?;          // writes defaults on first launch
+//! let store = ConfigStore::open(paths)?;          // creates the directory and default file if missing
 //! let font_size = store.config().appearance.font_size;
 //! if let Some(error) = store.last_error() {
 //!     // show "config.toml could not be loaded; using defaults"
@@ -46,6 +47,7 @@
 //! match watcher.try_recv() {
 //!     Ok(ConfigEvent::Changed(changed)) => { /* apply changed.config to every window */ }
 //!     Ok(ConfigEvent::Invalid(error)) => { /* keep running; show the error */ }
+//!     Ok(ConfigEvent::ThemesChanged) => { /* apply store.theme() if it differs */ }
 //!     _ => {}
 //! }
 //! # Ok::<(), tessera_config::Error>(())
@@ -77,8 +79,8 @@ pub use load::{
 pub use paths::{APP_SUPPORT_DIR_NAME, CONFIG_FILE_NAME, ConfigPaths};
 pub use store::ConfigStore;
 pub use watch::{
-    ConfigChanged, ConfigEvent, MAX_WATCH_DURATION, MIN_POLL_INTERVAL, WatchBackend, WatchOptions,
-    Watcher,
+    ConfigChanged, ConfigEvent, MAX_WATCH_DURATION, MIN_POLL_INTERVAL, WatchBackend, WatchGuard,
+    WatchOptions, Watcher,
 };
 
 use std::sync::Arc;

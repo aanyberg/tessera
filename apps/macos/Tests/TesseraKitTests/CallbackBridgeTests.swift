@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import TesseraCore
 @testable import TesseraKit
 import XCTest
@@ -149,6 +150,32 @@ final class CallbackBridgeTests: XCTestCase {
         let events = try await drained()
         XCTAssertEqual(events, [])
         XCTAssertTrue(bridge.sessions.isEmpty)
+    }
+
+    func testAppearanceChangesReachTheDelegateCoalesced() async throws {
+        // From the core's configuration watch thread: a burst is one delivery
+        // with the latest state.
+        onReaderThread { callbacks in
+            for index in 0..<10_000 {
+                callbacks.on_appearance_changed!(callbacks.user_data, index % 2 == 0)
+            }
+            callbacks.on_appearance_changed!(callbacks.user_data, false)
+        }
+        _ = try await drained()
+        XCTAssertEqual(recorder.appearances, [false], "10 001 callbacks, one delivery with the latest")
+        XCTAssertEqual(bridge.scheduledAppearanceDeliveries.withLock { $0 }, 1, "and one scheduled")
+        onReaderThread { callbacks in callbacks.on_appearance_changed!(callbacks.user_data, true) }
+        _ = try await drained()
+        XCTAssertEqual(recorder.appearances, [false, true], "a later change is a new delivery")
+        // Session events are unaffected.
+        XCTAssertEqual(recorder.events[session.id, default: []], [])
+    }
+
+    func testAppearanceChangesAfterShutdownAreDropped() async throws {
+        onReaderThread { callbacks in callbacks.on_appearance_changed!(callbacks.user_data, false) }
+        bridge.shutDown()
+        _ = try await drained()
+        XCTAssertEqual(recorder.appearances, [])
     }
 
     func testEveryStatusMapsToItsCase() {

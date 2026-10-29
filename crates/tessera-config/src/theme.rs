@@ -619,6 +619,21 @@ fn find_user_theme(
     None
 }
 
+/// The `*.toml` files in `dir` whose file stem matches `name` (the files
+/// [`Theme::resolve`] tries first), in file-name order, whether or not they
+/// load. For the watcher, which keeps such a file registered while it
+/// fails to parse (a half-written save), so the save that fixes it is seen.
+pub(crate) fn files_named(dir: &Path, name: &str) -> Vec<PathBuf> {
+    if !is_lookup_name(name) || name.len() > MAX_THEME_NAME_LEN {
+        return Vec::new();
+    }
+    theme_files(dir)
+        .into_iter()
+        .filter(|(stem, _)| names_match(stem, name))
+        .map(|(_, path)| path)
+        .collect()
+}
+
 /// The `(stem, path)` of every non-hidden `*.toml` entry in `dir`, sorted
 /// by file name; at most [`MAX_THEME_DIR_ENTRIES`] entries are listed.
 fn theme_files(dir: &Path) -> Vec<(String, PathBuf)> {

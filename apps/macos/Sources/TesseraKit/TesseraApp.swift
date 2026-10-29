@@ -30,6 +30,14 @@ public protocol TesseraAppDelegate: AnyObject {
     /// session; writes now fail, and the host should ``TesseraSession/close()``
     /// it. Not sent for a session the host closed.
     func session(_ session: TesseraSession, didExitWithCode code: Int32, signal: Int32)
+    /// The core applied an edit of the configuration or of the theme in use
+    /// to every view (colours, opacity or font size). `opaque` is whether the
+    /// background is now fully opaque. Make every terminal window opaque or
+    /// translucent to match and redraw every view: each surface switches its
+    /// compositing mode at its next frame. Several changes between two
+    /// deliveries are reported once, with the latest `opaque`. Not sent after
+    /// ``TesseraApp/shutdown()``.
+    func appearanceDidChange(opaque: Bool)
 }
 
 /// The Rust core's application: its configuration and every session it runs.
@@ -58,8 +66,14 @@ public final class TesseraApp {
     // alive until `tessera_app_free` has returned.
     private let bridge: CallbackBridge
 
-    /// Creates the core application with the default configuration and no
-    /// sessions.
+    /// Creates the core application and no sessions.
+    ///
+    /// The core reads `config.toml` (and the theme it names) from
+    /// `~/Library/Application Support/Tessera`, or from the directory in the
+    /// `TESSERA_CONFIG_DIR` environment variable, and applies every later
+    /// edit of it live (see ``TesseraAppDelegate/appearanceDidChange(opaque:)``).
+    /// A missing or broken file gives the defaults rather than an error.
+    /// Creating the app writes nothing; ``createConfig()`` creates the file.
     ///
     /// - Throws: ``TesseraCoreError/io`` if the home directory cannot be
     ///   determined.
@@ -121,6 +135,17 @@ public final class TesseraApp {
         let session = TesseraSession(id: id, core: core, bridge: bridge)
         bridge.register(session)
         return session
+    }
+
+    /// Creates the configuration directory and a commented `config.toml` with
+    /// the defaults where they are missing, and starts applying edits of them
+    /// live. Call it before opening ``configPath`` for editing (⌘,,
+    /// Preferences). Idempotent: an existing file is never changed.
+    ///
+    /// - Throws: ``TesseraCoreError/io`` if the directory or the file cannot
+    ///   be created.
+    public func createConfig() throws {
+        try TesseraCoreError.check(tessera_app_create_config(core.pointer))
     }
 
     /// Closes every session and frees the core. Idempotent; afterwards every

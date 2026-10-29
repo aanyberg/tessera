@@ -184,8 +184,10 @@ should work (`´` then `e` types `é`; see the manual check below), but there is
 no IME, so no CJK input: allowing winit's IME would let macOS's press-and-hold
 accent menu replace key repeat (kitty and WezTerm turn
 `ApplePressAndHoldEnabled` off, which needs Objective-C calls), and composed
-input belongs to the app's terminal view (#27). It uses the default
-configuration, has no tabs, selection or copy, and like the devtool is
+input belongs to the app's terminal view (#27). It reads and watches your
+configuration like the app (`config.toml` and the theme in use; a
+re-theme shows from its next redraw, since it does not listen for the
+appearance callback), has no tabs, selection or copy, and like the devtool is
 dev-only: a test checks that `tessera-ffi` and `tessera-app-core` never link
 it or winit. It installs no signal handlers: Ctrl-C in the terminal that
 launched it, or `kill`, ends it without closing the session, and a child that

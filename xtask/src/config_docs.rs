@@ -633,8 +633,15 @@ fn render_document(sections: &[Section]) -> String {
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "Tessera reads its settings from `~/Library/Application Support/{APP_SUPPORT_DIR_NAME}/{CONFIG_FILE_NAME}` \
-         and writes one with the defaults on first launch. Every key is optional: a missing key \
+        "Tessera reads its settings from `~/Library/Application Support/{APP_SUPPORT_DIR_NAME}/{CONFIG_FILE_NAME}`, \
+         or from `{CONFIG_FILE_NAME}` in the directory the `TESSERA_CONFIG_DIR` environment \
+         variable names (unset by default; for tests and side-by-side installs). Starting Tessera \
+         writes no configuration there: without the file the defaults apply, and the file is \
+         written, with every default commented, only when the app is asked to open it for \
+         editing (a file you create yourself is picked up within a few seconds and never \
+         replaced). \
+         Saved edits of the file, and of the theme file in use under `themes/`, apply to every \
+         open window at once. Every key is optional: a missing key \
          takes the default listed here, and a missing table takes the defaults of all its keys. \
          Unknown keys produce a warning and are kept. A file that does not parse never stops \
          Tessera: the error is reported, and until the file is fixed the defaults apply at launch \

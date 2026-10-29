@@ -5,8 +5,8 @@ use std::sync::{Arc, RwLock};
 
 use crate::load::{Loaded, Warning, load_file, write_default_if_missing};
 use crate::paths::ConfigPaths;
-use crate::theme::Theme;
-use crate::watch::{ConfigEvent, WatchOptions, Watcher};
+use crate::theme::{ResolvedTheme, Theme};
+use crate::watch::{ConfigEvent, ThemesFingerprint, WatchOptions, Watcher};
 use crate::{Config, Error};
 
 /// Holds the configuration currently applied to the application and keeps it
@@ -46,6 +46,9 @@ pub(crate) struct State {
     /// events that can no longer come.
     subscribers: Vec<(SubscriptionId, Sender<ConfigEvent>)>,
     next_subscription: u64,
+    /// The themes directory's state when a watcher last sampled it, `None`
+    /// before the first sample; see [`ConfigStore::record_themes`].
+    themes: Option<ThemesFingerprint>,
 }
 
 impl ConfigStore {
@@ -109,6 +112,7 @@ impl ConfigStore {
                 error: None,
                 subscribers: Vec::new(),
                 next_subscription: 0,
+                themes: None,
             })),
         }
     }
@@ -149,15 +153,25 @@ impl ConfigStore {
     /// replace the previous lookup's in [`ConfigStore::last_warnings`].
     ///
     /// Reads the disk on every call, so call it when the configuration
-    /// changes (on [`ConfigEvent::Changed`]), not per frame.
+    /// or the themes change (on [`ConfigEvent::Changed`] and
+    /// [`ConfigEvent::ThemesChanged`]), not per frame.
     pub fn theme(&self) -> Theme {
+        self.resolve_theme().theme
+    }
+
+    /// [`ConfigStore::theme`] with where the theme came from and the
+    /// lookup's warnings (also logged and kept for
+    /// [`ConfigStore::last_warnings`]), so a caller can tell a theme file
+    /// that failed to load ([`Warning::ThemeInvalid`]) from a theme that
+    /// changed.
+    pub fn resolve_theme(&self) -> ResolvedTheme {
         let name = self.config().appearance.theme.clone();
         let resolved = Theme::resolve(&self.paths.themes_dir(), &name);
         for warning in &resolved.warnings {
             tracing::warn!(target: "tessera_config", "{warning}");
         }
-        self.write().theme_warnings = resolved.warnings;
-        resolved.theme
+        self.write().theme_warnings.clone_from(&resolved.warnings);
+        resolved
     }
 
     /// Why the most recent load failed, or `None` when it succeeded.
@@ -189,15 +203,17 @@ impl ConfigStore {
         }
     }
 
-    /// Starts a background watcher on `config.toml` that applies external
-    /// edits to this store and reports each one as a [`ConfigEvent`].
+    /// Starts a background watcher on `config.toml` and `themes/` that
+    /// applies external edits to this store and reports each one as a
+    /// [`ConfigEvent`] (a change in `themes/` as
+    /// [`ConfigEvent::ThemesChanged`]).
     ///
     /// Any edit made between [`ConfigStore::open`] and this call is applied
     /// before the watcher returns and reported as its first event.
     ///
     /// **Create one watcher per process** and fan its events out to every
     /// window. Several watchers on the same store each receive every event
-    /// too, but each costs a thread, a kernel queue and about five file
+    /// too, but each costs a thread, a kernel queue and about seven file
     /// descriptors, and gains nothing over a single one.
     pub fn watch(&self, options: WatchOptions) -> Result<Watcher, Error> {
         Watcher::spawn(self.clone(), options)
@@ -257,6 +273,22 @@ impl ConfigStore {
         state.config = Arc::clone(&config);
         state.warnings = loaded.warnings;
         Some(config)
+    }
+
+    /// Records the themes directory's state as a watcher sampled it.
+    ///
+    /// Returns whether it is news: `true` when it differs from the state
+    /// recorded before, `false` for the first sample (the baseline) and
+    /// when it is unchanged, so two watchers that sample the same change
+    /// report it once.
+    pub(crate) fn record_themes(&self, themes: ThemesFingerprint) -> bool {
+        let mut state = self.write();
+        let news = state
+            .themes
+            .as_ref()
+            .is_some_and(|previous| *previous != themes);
+        state.themes = Some(themes);
+        news
     }
 
     /// Remembers a failed load; the applied configuration is untouched.

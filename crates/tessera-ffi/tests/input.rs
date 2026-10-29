@@ -8,6 +8,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashSet;
 use std::ffi::{CString, c_char, c_void};
@@ -308,6 +310,7 @@ impl Handle {
     fn new(outputs: &Outputs) -> Self {
         let mut app = ptr::null_mut();
         // SAFETY: `app` is writable storage for one pointer.
+        common::hermetic_config_dir();
         assert_eq!(unsafe { tessera_app_new(&raw mut app) }, Error::Ok);
         let callbacks = Callbacks {
             user_data: ptr::from_ref(outputs).cast_mut().cast(),
@@ -315,6 +318,7 @@ impl Handle {
             on_session_title: None,
             on_session_bell: None,
             on_session_exit: None,
+            on_appearance_changed: None,
         };
         // SAFETY: live handle; valid table; `outputs` outlives the handle.
         assert_eq!(

@@ -56,4 +56,11 @@ final class SessionRouter: TesseraAppDelegate {
     func session(_ session: TesseraSession, didExitWithCode code: Int32, signal: Int32) {
         controller(for: session)?.sessionDidExit(code: code, signal: signal)
     }
+
+    /// The configuration or the theme in use changed: every tab follows.
+    func appearanceDidChange(opaque: Bool) {
+        for entry in controllers.values {
+            entry.controller?.contentView.applyLayerOpacity(opaque: opaque)
+        }
+    }
 }
