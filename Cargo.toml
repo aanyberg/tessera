@@ -83,3 +83,25 @@ missing_errors_doc = "allow"
 lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
+
+# Property tests spend most of their time inside proptest itself: in an
+# unoptimised build, generating and dropping the value trees for a few hundred
+# bytes costs several milliseconds per case, most of a tessera-term
+# property's run time (#104). Optimising proptest and its RNGs alone keeps
+# every case count and leaves our own code at opt-level 0, debug assertions on.
+# The override is workspace-wide: it also speeds up the proptests in
+# tessera-grid, tessera-vt and tessera-config.
+[profile.dev.package.proptest]
+opt-level = 3
+
+[profile.dev.package.rand]
+opt-level = 3
+
+[profile.dev.package.rand_core]
+opt-level = 3
+
+[profile.dev.package.rand_xorshift]
+opt-level = 3
+
+[profile.dev.package.chacha20]
+opt-level = 3
