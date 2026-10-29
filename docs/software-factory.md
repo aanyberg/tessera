@@ -23,9 +23,9 @@ by editing the agent file; the lead refers to agents by name only.
 | `flow-analyst` | Post-wave retro from journals and `scripts/factory-stats.sh`: cost/value per role, proposed changes | sonnet | high | retro only | no |
 
 Model aliases map to the current Claude 5 family (`fable` = claude-fable-5-1, `opus` = claude-opus-5-5,
-`sonnet` = claude-sonnet-5-5, `haiku` = claude-haiku-5-5). Fable is not used (token cost); planning, implementation,
-implementation and critique of product code and adversarial testing run on Opus; infra and docs review and release
-engineering run on Sonnet. Pin a full id in the frontmatter if a role must not follow alias updates.
+`sonnet` = claude-sonnet-5-5, `haiku` = claude-haiku-5-5). Fable is not used (token cost); planning, implementation
+and critique of product code, and adversarial testing run on Opus (Sonnet per spawn for low-risk changes); infra and
+docs review and release engineering run on Sonnet. Pin a full id in the frontmatter if a role must not follow alias updates.
 
 **Effort by round.** Round 1 and adversarial cycle 1 run at the frontmatter effort: they find the defects (wave 3:
 6 majors in round 1, 2 in round 2 from benchmarks and differential fuzzing, none in round 3; both verify failures in cycle 1; waves 5 and 6: critics found
@@ -38,8 +38,10 @@ at medium by the user's decision of 2026-10-28 (no retro data yet: neither ran i
 
 **Adversarial cost levers (2026-10-29).** The frontmatter is `high` with `maxTurns: 80`. The lead raises a cycle-1
 run with the Agent tool's `effort: "higher"` (xhigh) when the change is risky: concurrency, FFI or render path, a
-hot or fast path, parser or pty input handling, or user-visible emulation behaviour (the inverse of the low-risk list
-under "Review rules"). It spawns the run with `model: "sonnet"` for low-risk changes. If a later gate or a release
+hot or fast path, parser or pty input handling, or user-visible emulation behaviour (any one of these is risky; a
+change is low-risk only when it meets all of the low-risk list under "Review rules"). It spawns the run with
+`model: "sonnet"` for low-risk changes. Cycle 2 is `effort: "lower"` (medium) on the cycle-1 model. If a later gate
+or a release
 finds a bug an `adversarial-tester` run at the lower setting should have caught, record it in the next retro and
 revert that setting.
 
@@ -83,8 +85,8 @@ milestone-lead ── draft brief ──► spec-researcher (spec-heavy issues, 
 - The critic is chosen by area: `rust-critic` for crates/, `swift-critic` for apps/macos, `code-critic` for infra and docs.
 - Verification is two lenses plus a gate: `scripts/verify-branch.sh` (mechanical), `adversarial-tester` (judgement)
   and the quality gate. The critic owns "Done when"; the adversarial tester runs at xhigh for risky changes in cycle 1
-  (see "Adversarial cost levers") because it found 7 of the 9 post-ship majors in wave 1, both verify failures in wave 3, and the bugs the critics
-  missed in waves 5 and 6.
+  (see "Adversarial cost levers") because it found 7 of the 9 post-ship majors in wave 1, both verify failures in
+  wave 3, and the bugs the critics missed in waves 5 and 6.
 - Any blocker from any gate fails that gate. Minors never fail a gate.
 - Every branch merges current main before critique and before verification so verifiers never report stale-base
   problems as findings.
@@ -285,10 +287,12 @@ implementer disagree, and they hide progress from the user. A wave is a planning
 shipping unit: up to five tasks are in flight, and each ships as soon as it is verified.
 
 **Session hygiene.** The lead's context grows with every teammate report. Teammates and subagents return a verdict, the
-blockers and a path or issue link, not the full analysis; detail goes into a file or the GitHub issue. All wave state
-(queue, `wave:<n>` labels, decisions, deferred findings) is on GitHub, so a lead session can end after a wave or when
-its context gets heavy, and a fresh one resumes by listing the milestone's open issues and `wave:<n>` labels and
-re-running pre-flight. Stop idle teammates, and `/clear` between unrelated tasks.
+blockers and a path or issue link, not the full analysis; detail goes into a file or the GitHub issue. Between waves,
+all state that matters is on GitHub (`wave:<n>` labels, merged PRs, cross-issue decisions and deferred findings in
+issue comments), so a lead session can end after a wave and a fresh one resumes by listing the milestone's open
+issues and `wave:<n>` labels and re-running pre-flight. Mid-wave state is not: the final briefs, the lead decisions
+appended to them and each task's round or cycle live in the lead session's task list, so do not replace the lead
+while tasks are in flight. Stop idle teammates, and `/clear` between unrelated tasks.
 
 0. **Pre-flight.** Before planning, the lead checks that local main equals `origin/main`
    (`git fetch origin && git rev-list --count origin/main..main` prints `0`) and that `sccache` is on `PATH`
