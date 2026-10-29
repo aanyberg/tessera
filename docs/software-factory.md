@@ -92,9 +92,15 @@ Agents use these instead of rebuilding the setup in every run:
   Implementers measure performance bars with it, critics re-measure and diff-fuzz fast paths, the adversarial
   tester uses it for its own probes.
 - **Branch verification.** `scripts/verify-branch.sh <wt> [--base <ref>] [--allow <path>]... [--session <url>]
-  [--coauthor <line>] [--load <crate>:<target>]... [--no-load]` runs the gate
+  [--coauthor <line>] [--load <crate>:<target>]... [--no-load] [--parallel <1-8>] [--list-targets]` runs the gate
   and checks the clean tree, ancestry, Conventional Commit subjects and trailers, scope against the brief's paths
-  (a warning, for the lead), ADR number collisions, and timing-sensitive tests under load (10 parallel runs each).
+  (a warning, for the lead), ADR number collisions, and timing-sensitive tests under load (10 runs each).
+  `--parallel N` caps the load check at N test runs in flight, per target and in total (targets run one
+  after another); the default is 3 so a busy machine is not exhausted, and the lead may raise it up to 8 on a quiet
+  one. Do not improvise extra load runs beside it. `--list-targets` prints the effective cap and the load targets
+  derived from the branch (`crate:kind`, one per line) and exits without building; `just verify-branch-test`
+  checks that derivation and the cap under bash and zsh. The script is zsh: always brace a name before a colon
+  (`${name}:lib`), because zsh reads `$name:lib` as the `:l` modifier and `$name:tests` as `:t`.
 - **Wave stats.** `scripts/factory-stats.sh --since <t> --until <t> <session dir>` prints the per-role and
   per-agent cost tables (output tokens, cache reads, tool calls, span and active minutes) for the retro.
 - **Scratch directories.** Every subagent works in its own `<scratchpad>/<agent type>-<issue>`; the scratchpad
