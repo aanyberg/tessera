@@ -51,13 +51,16 @@ impl State {
     /// RIS: the grid's reset plus what xterm also resets: the scrollback
     /// and every mode (see the `modes` module: all to their defaults, both
     /// kitty keyboard stacks emptied, 132-column mode left with a request for
-    /// 80 columns).
+    /// 80 columns) and replies back to 7-bit C1 controls (xterm's
+    /// `show_8bit_control(False)`). The DECSCL conformance level is kept:
+    /// xterm sets it only at start-up.
     /// DECSTR (`CSI ! p`) is the soft variant that keeps the screen, see
     /// the crate documentation.
     fn reset(&mut self) {
         self.grid.reset();
         self.grid.clear_scrollback();
         self.reset_modes();
+        self.c1_8bit_replies = false;
     }
 
     /// DECALN: resets the scroll region, fills every cell with an `E` in

@@ -32,6 +32,7 @@
 //! | `CSI > Pp ; Pv m` | XTMODKEYS | `modifyOtherKeys` (Pp 4) |
 //! | `CSI > flags u` `CSI < n u` `CSI = flags ; mode u` | kitty keyboard | push / pop / set the keyboard flags |
 //! | `CSI ! p` | DECSTR | soft terminal reset, see the crate documentation; parameters are ignored, as in xterm, so `CSI 5 ! p` resets too |
+//! | `CSI Pl ; Pc " p` | DECSCL | select conformance level: for `Pl` 61..=65, the DECSTR soft reset, then level `Pl - 60` and the C1 reply mode from `Pc`; any other `Pl` does nothing |
 //!
 //! Parameters follow xterm: an absent parameter and an explicit `0` both
 //! mean the default, positions are 1-based and clamp to the screen, and
@@ -64,15 +65,28 @@
 //! keyboard sequences `CSI ? u`, `CSI > u`, `CSI < u` and `CSI = u` carry a
 //! private marker and never reach SCORC; the query `CSI ? u` is #10.
 //!
-//! DECSET/DECRST, SM/RM and the kitty keyboard sequences are ignored as a
-//! whole when a parameter carries a colon sub-parameter (`CSI ? 25:1049
-//! h`), as in xterm, which accepts them only in SGR and XTMODKEYS.
+//! DECSCL follows xterm's `CASE_DECSCL`: the reset is DECSTR's, soft (DEC's
+//! VT510 manual says RIS; xterm, the VT220 manual and DEC STD 070 say
+//! soft), and `Pc` 0, 2 or absent selects 8-bit C1 replies, 1 selects
+//! 7-bit and any other value keeps the mode; parameters after `Pc` are
+//! ignored. Two deviations from xterm, both from the issue (#92): level 1
+//! (`CSI 61 " p`, VT100 mode) always selects 7-bit replies, as DEC's VT100
+//! mode has no 8-bit controls (xterm keeps the previous mode), and level 5
+//! (`CSI 65 " p`) is accepted although the default level is 4 (xterm, with
+//! its default `decTerminalID` 420, accepts only up to 64). Nothing is
+//! answered; `State::select_conformance_level` has the details.
+//!
+//! DECSET/DECRST, SM/RM, DECSCL and the kitty keyboard sequences are
+//! ignored as a whole when a parameter carries a colon sub-parameter
+//! (`CSI ? 25:1049 h`), as in xterm, which accepts them only in SGR and
+//! XTMODKEYS.
 //!
 //! Everything else (an unassigned final, any other private marker and
 //! final pair such as `CSI > 25 h` or `CSI ? 5 m`, any other intermediate
-//! such as `SP`, `$` or `"` (DECSCL is #92), and the xterm extension SL/SR
-//! that is not in scope) is ignored and logged at trace level. The parser
-//! hands over private markers as intermediates, so one match covers both.
+//! such as `SP` or `$`, `"` with a final other than `p`, and the xterm
+//! extension SL/SR that is not in scope) is ignored and logged at trace
+//! level. The parser hands over private markers as intermediates, so one
+//! match covers both.
 //!
 //! Expected behaviour per sequence and edge case is pinned by
 //! `tests/fixtures/csi_spec.txt`, for DECSTR by
@@ -128,6 +142,14 @@ impl State {
             match (intermediates, action) {
                 // DECSTR. Parameters are ignored, as in xterm.
                 (b"!", 'p') => self.soft_reset(),
+                // DECSCL; sub-parameters void it, as for the mode sequences.
+                (b"\"", 'p') => {
+                    if subparams == 0 {
+                        self.select_conformance_level(params);
+                    } else {
+                        trace!(?params, "DECSCL with sub-parameters ignored");
+                    }
+                }
                 // xterm takes colon sub-parameters only in SGR and XTMODKEYS.
                 (b"?", 'h' | 'l') | ([b'>' | b'<' | b'='], 'u') if subparams != 0 => {
                     trace!(
@@ -341,6 +363,34 @@ impl State {
         // (?45) to its default (#97), the cursor shape and blink (DECSCUSR,
         // `CSI Ps SP q`, #113) to the default, and the OSC 4 palette to the
         // theme (xterm's ResetAnsiColorRequest, #9).
+    }
+
+    /// DECSCL (`CSI Pl ; Pc " p`), xterm's `CASE_DECSCL`. For `Pl` 61..=65
+    /// runs the DECSTR `State::soft_reset`, sets the conformance level
+    /// to `Pl - 60` and the C1 reply mode from `Pc`: 0 (or absent) and 2
+    /// select 8-bit replies, 1 selects 7-bit, any other value keeps the
+    /// mode, and level 1 always selects 7-bit. Any other `Pl` (absent, 0,
+    /// 60, 66, …) does nothing at all. Parameters after `Pc` are ignored
+    /// and nothing is answered.
+    fn select_conformance_level(&mut self, params: &[u16]) {
+        let level = params
+            .first()
+            .and_then(|&pl| pl.checked_sub(60))
+            .and_then(|level| u8::try_from(level).ok())
+            .filter(|level| (1..=5).contains(level));
+        let Some(level) = level else {
+            trace!(?params, "DECSCL with an unknown level ignored");
+            return;
+        };
+        self.soft_reset();
+        self.conformance_level = level;
+        match (level, selector(params, 1)) {
+            // VT100 mode has no 8-bit controls (DEC); xterm would keep the
+            // previous mode here.
+            (1, _) | (_, 1) => self.c1_8bit_replies = false,
+            (_, 0 | 2) => self.c1_8bit_replies = true,
+            (_, pc) => trace!(pc, "DECSCL C1 mode unknown, kept"),
+        }
     }
 
     /// DECSTBM. The top defaults to the first row; the bottom defaults to
