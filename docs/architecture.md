@@ -128,7 +128,7 @@ stay at the default class (ADR 0018 explains why).
    whether to pass the event on to AppKit (menu key equivalents).
 3. The PTY reader thread receives child output, `tessera-term` parses and
    applies it, emits `Request`s (bell, title).
-4. The core notifies the frontend via the `on_needs_redraw` callback.
+4. The core notifies the frontend via the `on_session_output` callback.
 5. The frontend's display link calls `tessera_surface_render`, which runs
    `App::render_view`: it copies the visible rows under the terminal lock,
    releases it, and draws the copy with `tessera-render` (ADR 0014).

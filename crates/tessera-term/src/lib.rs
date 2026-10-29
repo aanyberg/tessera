@@ -169,6 +169,18 @@ impl Terminal {
         self.state.insert_mode = on;
     }
 
+    /// Clears the screen to the cursor line (⌘K, "Clear to Start"): drops
+    /// the scrollback and, on the primary screen, the rows above the
+    /// cursor, so the cursor's line becomes the top row; on the alternate
+    /// screen only the scrollback goes. See [`Grid::clear_to_cursor`].
+    ///
+    /// REP has nothing to repeat afterwards, as after any sequence: the
+    /// cell the last character took may be gone.
+    pub fn clear_to_cursor(&mut self) {
+        self.state.grid.clear_to_cursor();
+        self.state.last_printed = None;
+    }
+
     /// Resizes the screen to `rows` × `cols` (a zero dimension counts as
     /// one), re-wrapping soft-wrapped lines on the primary screen and its
     /// scrollback and cutting or padding the alternate screen; see

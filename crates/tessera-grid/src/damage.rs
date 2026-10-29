@@ -93,8 +93,8 @@ static NEXT_BASE: AtomicU64 = AtomicU64::new(1);
 /// saturating adds, so it never wraps, but a tracker that makes more than
 /// 2^40 stamps runs into the next tracker's range, and the multiplier
 /// wraps after 2^24 trackers (each new grid and each clone takes one;
-/// `Grid::reset` keeps its tracker but builds a fresh grid, which burns
-/// one more). Either would only matter to a reader that moves
+/// `Grid::reset` keeps its tracker and takes none). Either would only
+/// matter to a reader that moves
 /// between grids, and none does today: a view reads one session's grid
 /// for its whole life.
 ///

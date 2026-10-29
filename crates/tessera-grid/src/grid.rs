@@ -156,6 +156,8 @@ pub struct Grid {
     /// screen was last cleared or created: see
     /// [`Grid::scrolled_since_clear`].
     scrolled_since_clear: bool,
+    /// When the last [`Grid::reset`] blanked the screen.
+    blanked_at: BlankedAt,
 }
 
 impl Grid {
@@ -190,6 +192,7 @@ impl Grid {
             primary: None,
             damage: DamageTracker::new(rows),
             scrolled_since_clear: false,
+            blanked_at: BlankedAt::default(),
         }
     }
 
@@ -1383,20 +1386,145 @@ impl Grid {
     }
 
     /// Returns the grid to its initial state (RIS): primary screen, blank,
-    /// home cursor, default pen, full scroll region, default tab stops. The
-    /// alternate screen is left and the stashed primary contents are
-    /// discarded. Scrollback and its cap are kept.
+    /// home cursor, default pen, full scroll region, default tab stops, both
+    /// saved-cursor slots at their initial state and
+    /// [`Grid::scrolled_since_clear`] cleared. The alternate screen is left
+    /// and the stashed primary contents are discarded. Scrollback and its
+    /// cap are kept; the newest history line is ended, as ED 2 does. The
+    /// whole screen counts as damaged, and the damage generations carry on
+    /// from before the reset.
+    ///
+    /// The result equals a fresh [`Grid::with_scrollback`] of the same size
+    /// and cap with the old scrollback attached, but is built in place: the
+    /// rows keep their allocations and nothing is allocated. Rows the damage
+    /// tracker reports unchanged since the previous reset are still the
+    /// blanks that reset left and are not rewritten, so a flood of RIS costs
+    /// O(rows) per reset after the first, not O(rows × cols) (#107).
     pub fn reset(&mut self) {
-        let fresh = Self::with_scrollback(self.rows, self.cols, self.scrollback.cap());
-        let old = mem::replace(self, fresh);
-        self.scrollback = old.scrollback;
+        let dirty = match self.primary.take() {
+            // The alternate screen is active: its rows are not the ones the
+            // previous reset blanked. The stashed primary rows are dropped.
+            Some(_) => DamageRows::All,
+            // A saturated generation no longer moves, so stamps after the
+            // last reset could not be told from it.
+            None if self.blanked_at.0 == u64::MAX => DamageRows::All,
+            None => self.damage.since(self.blanked_at.0, self.cursor.row),
+        };
+        match dirty {
+            DamageRows::None => {}
+            DamageRows::Rows(rows) => {
+                let rows = usize::from(*rows.start())..=usize::from(*rows.end());
+                for line in &mut self.lines[rows] {
+                    line.clear(Style::DEFAULT);
+                }
+            }
+            DamageRows::All => {
+                for line in &mut self.lines {
+                    line.clear(Style::DEFAULT);
+                }
+            }
+        }
+        debug_assert!(
+            self.lines.iter().all(is_initial_blank),
+            "a row changed since the last reset without damage"
+        );
+        self.cursor = Point::default();
+        self.pending_wrap = false;
+        self.pen = Style::DEFAULT;
+        self.reset_scroll_region();
+        self.saved = SavedCursor::INITIAL;
+        reset_tabs(&mut self.tabs, self.cols);
+        self.scrolled_since_clear = false;
         // The blank screen ends the newest history line, as ED 2 does.
         self.end_newest_history_line();
-        // Keep the tracker (moved, not cloned: a clone starts a new range),
-        // so a reader of the old screen sees it all change rather than a
-        // grid it does not know.
-        self.damage = old.damage;
+        // The tracker is kept, so a reader of the old screen sees it all
+        // change rather than a grid it does not know.
         self.damage.extend_all();
+        self.blanked_at = BlankedAt(self.damage.generation());
+    }
+
+    /// Clears the screen to the cursor line ("Clear to Start", ⌘K in
+    /// Terminal.app, iTerm2 and kitty): discards the scrollback and, on the
+    /// primary screen, the rows above the cursor row.
+    ///
+    /// The cursor row becomes row 0 and keeps its contents, column and
+    /// pending wrap; the rows below it move up with it and default blank
+    /// rows fill the bottom. Removed rows are dropped, not pushed into the
+    /// (now empty) scrollback. When rows were removed the scroll region
+    /// becomes the full screen (its rows no longer hold what it was set
+    /// for), the saved cursor moves up with the text (stopping at row 0)
+    /// and [`Grid::scrolled_since_clear`] is cleared, since what is left on
+    /// the screen never scrolled into history. With the cursor on row 0 only
+    /// the scrollback goes, exactly as [`Grid::clear_scrollback`].
+    ///
+    /// On the alternate screen only the primary scrollback is discarded:
+    /// the visible screen belongs to the full-screen application and is not
+    /// touched. The whole screen counts as damaged either way.
+    pub fn clear_to_cursor(&mut self) {
+        self.scrollback.clear();
+        self.damage.extend_all();
+        let removed = self.cursor.row;
+        if self.is_alt_screen() || removed == 0 {
+            return;
+        }
+        let removed_rows = usize::from(removed);
+        for line in &mut self.lines[..removed_rows] {
+            line.clear(Style::DEFAULT);
+        }
+        self.lines.rotate_left(removed_rows);
+        self.cursor.row = 0;
+        self.saved.cursor.row = self.saved.cursor.row.saturating_sub(removed);
+        self.reset_scroll_region();
+        self.scrolled_since_clear = false;
+    }
+}
+
+/// The damage tracker's generation right after the last [`Grid::reset`]:
+/// rows the tracker reports unchanged since then are still the blanks that
+/// reset left. `0` (no reset yet) is below every tracker's range, so
+/// [`DamageTracker::since`] answers every row.
+///
+/// A clone gets `0`: it also gets a fresh tracker, whose range the
+/// original's generation does not belong to, so its first reset clears
+/// every row.
+///
+/// Opaque in `Debug`, like the tracker: a reset grid and a fresh one hold
+/// the same screen and must print the same.
+#[derive(Default)]
+struct BlankedAt(u64);
+
+impl Clone for BlankedAt {
+    fn clone(&self) -> Self {
+        Self(0)
+    }
+}
+
+impl std::fmt::Debug for BlankedAt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BlankedAt")
+    }
+}
+
+/// True for a row exactly as [`Grid::reset`] leaves it: default blanks, no
+/// marks, clusters or wrap.
+fn is_initial_blank(line: &Line) -> bool {
+    line.cells.iter().all(|cell| *cell == Cell::BLANK)
+        && line.marks.is_empty()
+        && line.graphemes.is_empty()
+        && !line.wrapped
+}
+
+/// Restores the default tab stops (every [`TabStops::DEFAULT_INTERVAL`]
+/// columns) over `cols` columns, in place when they already cover `cols`
+/// (unlike [`TabStops::reset`], which reallocates), else by rebuilding.
+fn reset_tabs(tabs: &mut TabStops, cols: u16) {
+    if tabs.cols() != cols {
+        *tabs = TabStops::new(cols);
+        return;
+    }
+    tabs.clear_all();
+    for col in (0..cols).step_by(usize::from(TabStops::DEFAULT_INTERVAL)) {
+        tabs.set(col);
     }
 }
 
@@ -2198,6 +2326,352 @@ mod tests {
                 proptest::prop_assert_eq!(slow_plan(base, ch), None);
             }
         }
+    }
+
+    /// What `reset` did before #107: a fresh grid of the same size and
+    /// cap with the old scrollback attached and its newest line ended.
+    fn rebuilt(old: &Grid) -> Grid {
+        let mut fresh = Grid::with_scrollback(old.rows, old.cols, old.scrollback.cap());
+        fresh.scrollback = old.scrollback.clone();
+        fresh.end_newest_history_line();
+        fresh
+    }
+
+    /// Operations that leave state `reset` must undo or keep.
+    #[derive(Debug, Clone)]
+    enum ResetOp {
+        Put(char),
+        Goto(u16, u16),
+        Lf,
+        Ri,
+        Cr,
+        Pen(u8),
+        Save,
+        Restore,
+        SetTab,
+        ClearTabs,
+        Region(u16, u16),
+        ScrollUp(u16),
+        ScrollDown(u16),
+        InsertLines(u16),
+        DeleteLines(u16),
+        InsertChars(u16),
+        DeleteChars(u16),
+        EraseLine(u8),
+        EraseDisplay(u8),
+        PadLastColumn,
+        EnterAlt,
+        LeaveAlt,
+        Resize(u16, u16),
+        Cap(usize),
+        Mark(u16),
+        Wrap(u16),
+        TakeDamage,
+        Clone,
+        ClearToCursor,
+        Reset,
+    }
+
+    fn reset_op() -> impl proptest::strategy::Strategy<Value = ResetOp> {
+        use proptest::prelude::*;
+        let n = || prop_oneof![4 => 0..=4u16, 1 => 0..=12u16];
+        prop_oneof![
+            12 => prop::sample::select(vec![
+                'a', 'b', ' ', 'é', '中', '😀', '\u{301}', '\u{FE0F}', '\u{200D}', '\u{1F1F8}',
+            ])
+            .prop_map(ResetOp::Put),
+            3 => (n(), n()).prop_map(|(r, c)| ResetOp::Goto(r, c)),
+            4 => Just(ResetOp::Lf),
+            1 => Just(ResetOp::Ri),
+            1 => Just(ResetOp::Cr),
+            2 => any::<u8>().prop_map(ResetOp::Pen),
+            1 => Just(ResetOp::Save),
+            1 => Just(ResetOp::Restore),
+            1 => Just(ResetOp::SetTab),
+            1 => Just(ResetOp::ClearTabs),
+            2 => (n(), n()).prop_map(|(t, b)| ResetOp::Region(t, b)),
+            1 => n().prop_map(ResetOp::ScrollUp),
+            1 => n().prop_map(ResetOp::ScrollDown),
+            1 => n().prop_map(ResetOp::InsertLines),
+            1 => n().prop_map(ResetOp::DeleteLines),
+            1 => n().prop_map(ResetOp::InsertChars),
+            1 => n().prop_map(ResetOp::DeleteChars),
+            1 => (0..3u8).prop_map(ResetOp::EraseLine),
+            1 => (0..4u8).prop_map(ResetOp::EraseDisplay),
+            1 => Just(ResetOp::PadLastColumn),
+            2 => Just(ResetOp::EnterAlt),
+            1 => Just(ResetOp::LeaveAlt),
+            1 => (1..=7u16, 1..=9u16).prop_map(|(r, c)| ResetOp::Resize(r, c)),
+            1 => prop_oneof![Just(0usize), Just(1), Just(3), Just(100)].prop_map(ResetOp::Cap),
+            1 => n().prop_map(ResetOp::Mark),
+            1 => n().prop_map(ResetOp::Wrap),
+            2 => Just(ResetOp::TakeDamage),
+            1 => Just(ResetOp::Clone),
+            1 => Just(ResetOp::ClearToCursor),
+            4 => Just(ResetOp::Reset),
+        ]
+    }
+
+    /// Applies `op`; for [`ResetOp::Reset`], checks the result against
+    /// [`rebuilt`].
+    fn apply_reset_op(
+        grid: &mut Grid,
+        op: &ResetOp,
+    ) -> Result<(), proptest::test_runner::TestCaseError> {
+        use proptest::{prop_assert, prop_assert_eq};
+        let erase_line = [EraseLine::ToEnd, EraseLine::ToStart, EraseLine::All];
+        let erase_display = [
+            EraseDisplay::Below,
+            EraseDisplay::Above,
+            EraseDisplay::All,
+            EraseDisplay::Scrollback,
+        ];
+        match *op {
+            ResetOp::Put(ch) => grid.put_char(ch),
+            ResetOp::Goto(r, c) => grid.goto(r, c),
+            ResetOp::Lf => grid.line_feed(),
+            ResetOp::Ri => grid.reverse_index(),
+            ResetOp::Cr => grid.carriage_return(),
+            ResetOp::Pen(v) => {
+                grid.set_pen(Style {
+                    fg: Color::Indexed(v),
+                    bg: Color::Indexed(v.wrapping_mul(7)),
+                    flags: u16::from(v),
+                    ..Style::DEFAULT
+                });
+            }
+            ResetOp::Save => grid.save_cursor(),
+            ResetOp::Restore => grid.restore_cursor(),
+            ResetOp::SetTab => grid.set_tab_stop(),
+            ResetOp::ClearTabs => grid.clear_all_tab_stops(),
+            ResetOp::Region(t, b) => grid.set_scroll_region(t, b),
+            ResetOp::ScrollUp(n) => grid.scroll_up(n),
+            ResetOp::ScrollDown(n) => grid.scroll_down(n),
+            ResetOp::InsertLines(n) => grid.insert_lines(n),
+            ResetOp::DeleteLines(n) => grid.delete_lines(n),
+            ResetOp::InsertChars(n) => grid.insert_chars(n),
+            ResetOp::DeleteChars(n) => grid.delete_chars(n),
+            ResetOp::EraseLine(m) => grid.erase_in_line(erase_line[usize::from(m)]),
+            ResetOp::EraseDisplay(m) => grid.erase_in_display(erase_display[usize::from(m)]),
+            ResetOp::PadLastColumn => grid.pad_last_column(),
+            ResetOp::EnterAlt => grid.enter_alt_screen(),
+            ResetOp::LeaveAlt => grid.leave_alt_screen(),
+            ResetOp::Resize(r, c) => grid.resize(r, c),
+            ResetOp::Cap(cap) => grid.set_max_scrollback(cap),
+            ResetOp::Mark(row) => {
+                if let Some(line) = grid.line_mut(row) {
+                    line.marks.push(Mark::PromptStart);
+                }
+            }
+            ResetOp::Wrap(row) => {
+                if let Some(line) = grid.line_mut(row) {
+                    line.wrapped = true;
+                }
+            }
+            ResetOp::TakeDamage => drop(grid.take_damage()),
+            ResetOp::Clone => *grid = grid.clone(),
+            ResetOp::ClearToCursor => grid.clear_to_cursor(),
+            ResetOp::Reset => {
+                let expected = rebuilt(grid);
+                let generation = grid.damage_generation();
+                grid.reset();
+                prop_assert_eq!(format!("{grid:?}"), format!("{expected:?}"));
+                // `Debug` shows the scrollback's length only.
+                prop_assert!(grid.logical_lines().eq(expected.logical_lines()));
+                prop_assert!(grid.damage_generation() > generation);
+                prop_assert_eq!(grid.damage().rows, DamageRows::All);
+            }
+        }
+        Ok(())
+    }
+
+    proptest::proptest! {
+        /// `reset` in place equals the rebuild it replaced (#107), after
+        /// any history: alternate screen active, regions, saved cursors,
+        /// tab stops, marks, pens, caps, clones, taken damage, and resets
+        /// in a row with edits in between (the rows it skips).
+        #[test]
+        fn reset_in_place_equals_a_rebuilt_grid(
+            rows in 1..=7u16,
+            cols in 1..=9u16,
+            cap in proptest::prop_oneof![proptest::strategy::Just(0usize), 0..=6usize],
+            ops in proptest::collection::vec(reset_op(), 0..80),
+        ) {
+            let mut grid = Grid::with_scrollback(rows, cols, cap);
+            for op in &ops {
+                apply_reset_op(&mut grid, op)?;
+            }
+            apply_reset_op(&mut grid, &ResetOp::Reset)?;
+        }
+    }
+
+    #[test]
+    fn reset_rewrites_only_rows_changed_since_the_last_reset() {
+        let mut grid = Grid::new(4, 3);
+        grid.put_str("abc");
+        grid.reset();
+        let since = grid.damage_generation();
+        grid.goto(2, 0);
+        grid.put_char('x');
+        // Rows 0 (the cursor left it) and 2 changed; 1 and 3 did not.
+        assert_eq!(grid.damage_since(since), DamageRows::Rows(0..=2));
+        grid.reset();
+        assert_eq!(text(&grid), vec!["", "", "", ""]);
+    }
+
+    /// Rows unchanged since the last reset are not rewritten (#107): a
+    /// change that bypasses the damage bookkeeping (no primitive makes one)
+    /// survives the next reset, and debug builds catch it.
+    #[test]
+    fn reset_skips_rows_unchanged_since_the_last_reset() {
+        let mut grid = Grid::new(4, 3);
+        grid.reset();
+        grid.lines[2].cells[1] = Cell::new('x', Style::DEFAULT);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            grid.reset();
+            grid
+        }));
+        if cfg!(debug_assertions) {
+            assert!(outcome.is_err(), "the debug check reports the stale row");
+        } else {
+            let grid = outcome.expect("no check in release");
+            assert_eq!(grid.lines[2].cells[1].ch, 'x', "the row was skipped");
+        }
+    }
+
+    /// A clone has its own tracker, so its first reset clears every row
+    /// instead of trusting the original's record (#107).
+    #[test]
+    fn a_clones_first_reset_clears_every_row() {
+        let mut grid = Grid::new(4, 3);
+        grid.reset();
+        let mut clone = grid.clone();
+        assert_eq!(clone.blanked_at.0, 0);
+        clone.lines[2].cells[1] = Cell::new('x', Style::DEFAULT);
+        clone.reset();
+        assert!(clone.lines.iter().all(is_initial_blank));
+        assert_ne!(clone.blanked_at.0, 0, "the clone's own reset is recorded");
+    }
+
+    #[test]
+    fn reset_restores_tab_stops_of_the_grid_width() {
+        let mut grid = Grid::new(2, 20);
+        grid.clear_all_tab_stops();
+        grid.reset();
+        assert_eq!(grid.tabs(), &TabStops::new(20));
+        // A tab-stop table of another width (only possible through
+        // `tabs_mut`) is rebuilt at the grid's width.
+        *grid.tabs_mut() = TabStops::new(5);
+        grid.reset();
+        assert_eq!(grid.tabs(), &TabStops::new(20));
+    }
+
+    #[test]
+    fn reset_on_the_alternate_screen_drops_both_screens() {
+        let mut grid = filled(3, 2);
+        grid.reset();
+        grid.enter_alt_screen();
+        grid.put_str("zz");
+        grid.reset();
+        assert!(!grid.is_alt_screen());
+        assert_eq!(text(&grid), vec!["", "", ""]);
+    }
+
+    /// Writes `lines` one per row from the cursor, with CR LF between them
+    /// (and none after the last).
+    fn write_lines(grid: &mut Grid, lines: &[&str]) {
+        for (i, line) in lines.iter().enumerate() {
+            if i > 0 {
+                grid.carriage_return();
+                grid.line_feed();
+            }
+            grid.put_str(line);
+        }
+    }
+
+    #[test]
+    fn clear_to_cursor_moves_the_cursor_line_to_the_top() {
+        let mut grid = Grid::new(4, 3);
+        write_lines(&mut grid, &["a", "b", "c", "d", "e", "f"]);
+        assert_eq!(grid.scrollback_len(), 2);
+        assert_eq!(text(&grid), vec!["c", "d", "e", "f"]);
+        grid.set_scroll_region(1, 2);
+        grid.goto(2, 1);
+        grid.save_cursor();
+        grid.goto(1, 1);
+        grid.put_char('y');
+        let since = grid.damage_generation();
+        grid.clear_to_cursor();
+        assert_eq!(grid.scrollback_len(), 0);
+        assert_eq!(text(&grid), vec!["dy", "e", "f", ""]);
+        assert_eq!(grid.cursor(), Point::new(0, 2));
+        assert_eq!(grid.scroll_region(), ScrollRegion { top: 0, bottom: 3 });
+        assert!(!grid.scrolled_since_clear());
+        assert_eq!(grid.damage_since(since), DamageRows::All);
+        assert!(is_initial_blank(&grid.visible_lines()[3]));
+        grid.restore_cursor();
+        assert_eq!(
+            grid.cursor(),
+            Point::new(1, 1),
+            "saved row moved up with the text"
+        );
+    }
+
+    #[test]
+    fn clear_to_cursor_keeps_a_pending_wrap() {
+        let mut grid = Grid::new(4, 2);
+        write_lines(&mut grid, &["p", "qR", "s"]);
+        grid.goto(1, 1);
+        grid.put_char('R');
+        assert!(grid.pending_wrap());
+        grid.clear_to_cursor();
+        assert_eq!(text(&grid), vec!["qR", "s", "", ""]);
+        assert!(grid.pending_wrap());
+        assert_eq!(grid.cursor(), Point::new(0, 1));
+    }
+
+    #[test]
+    fn clear_to_cursor_clamps_a_saved_cursor_above_it_to_row_zero() {
+        let mut grid = Grid::new(4, 2);
+        grid.save_cursor();
+        grid.goto(3, 0);
+        grid.clear_to_cursor();
+        grid.goto(2, 1);
+        grid.restore_cursor();
+        assert_eq!(grid.cursor(), Point::new(0, 0));
+    }
+
+    #[test]
+    fn clear_to_cursor_on_row_zero_only_drops_the_scrollback() {
+        let mut grid = Grid::new(3, 2);
+        write_lines(&mut grid, &["a", "b", "c", "d"]);
+        grid.set_scroll_region(1, 2);
+        grid.goto(0, 1);
+        let before = format!("{:?}", grid.visible_lines());
+        assert!(grid.scrolled_since_clear());
+        grid.clear_to_cursor();
+        assert_eq!(grid.scrollback_len(), 0);
+        assert_eq!(format!("{:?}", grid.visible_lines()), before);
+        assert_eq!(grid.scroll_region(), ScrollRegion { top: 1, bottom: 2 });
+        assert!(
+            grid.scrolled_since_clear(),
+            "the screen still shows scrolled output"
+        );
+    }
+
+    #[test]
+    fn clear_to_cursor_on_the_alternate_screen_keeps_the_screen() {
+        let mut grid = Grid::new(3, 2);
+        write_lines(&mut grid, &["a", "b", "c", "d"]);
+        grid.enter_alt_screen();
+        write_lines(&mut grid, &["x", "y"]);
+        let before = format!("{grid:?}");
+        assert!(before.contains("len: 1"));
+        grid.clear_to_cursor();
+        assert_eq!(grid.scrollback_len(), 0);
+        assert_eq!(format!("{grid:?}"), before.replace("len: 1", "len: 0"));
+        grid.leave_alt_screen();
+        assert_eq!(text(&grid), vec!["b", "c", "d"], "the primary screen too");
     }
 
     #[test]

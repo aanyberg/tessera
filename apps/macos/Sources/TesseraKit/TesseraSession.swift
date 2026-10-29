@@ -61,7 +61,11 @@ public final class TesseraSession: Sendable, Identifiable {
             tessera_session_resize(core.pointer, id, rows, cols, widthPx, heightPx))
     }
 
-    /// Discards the session's scrollback; the visible screen is kept.
+    /// Clears the scrollback and the screen above the cursor line (⌘K,
+    /// Terminal.app's "Clear to Start"), so the prompt line becomes the top
+    /// row. On the alternate screen (a full-screen app) only the scrollback
+    /// is cleared. No ``TesseraAppDelegate/sessionDidOutput(_:)`` follows:
+    /// redraw after calling this.
     @MainActor
     public func clearScrollback() throws {
         try TesseraCoreError.check(tessera_session_clear_scrollback(core.pointer, id))

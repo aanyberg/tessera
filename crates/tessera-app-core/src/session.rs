@@ -704,6 +704,14 @@ impl Session {
         f(&self.term.lock())
     }
 
+    /// Runs `f` with the session's terminal locked for changes made on the
+    /// application's behalf rather than by child output. The lock is held
+    /// only while `f` runs; do not notify observers or take a view lock
+    /// from `f`.
+    pub(crate) fn with_terminal_mut<R>(&self, f: impl FnOnce(&mut Terminal) -> R) -> R {
+        f(&mut self.term.lock())
+    }
+
     /// Whether the session's view has keyboard focus.
     pub(crate) fn is_focused(&self) -> bool {
         lock(&self.input).focused
