@@ -1,0 +1,12 @@
+# Fixture case V1S3_autowrap_80col (tests/fixtures/csi_spec.txt).
+# tst_movements pass 0 (80 columns): autowrap test. DECSTBM 3;21, DECOM (?6h, CUP relative to the region), pending wrap with BS/HT/CR at the right margin, ?6l and ESC[r at the end; the two ESC[?3l are ignored (DECCOLM needs DECSET 40).
+@size 24x80
+\x1b[?3l
+\x1b[?3lTest of autowrap, mixing control and print characters.\r\r\nThe left/right margins should have letters in order:\r\r\n
+\x1b[3;21r\x1b[?6h\x1b[19;1HA\x1b[19;80Ha\r\n\x1b[18;80HaB\x1b[19;80HB\x08 b\r\n\x1b[19;80HC\x08\x08\t\tc\x1b[19;2H\x08C\r\n\x1b[19;80H\r\n\x1b[18;1HD\x1b[18;80Hd
+\x1b[19;1HE\x1b[19;80He\r\n\x1b[18;80HeF\x1b[19;80HF\x08 f\r\n\x1b[19;80HG\x08\x08\t\tg\x1b[19;2H\x08G\r\n\x1b[19;80H\r\n\x1b[18;1HH\x1b[18;80Hh\x1b[19;1HI
+\x1b[19;80Hi\r\n\x1b[18;80HiJ\x1b[19;80HJ\x08 j\r\n\x1b[19;80HK\x08\x08\t\tk\x1b[19;2H\x08K\r\n\x1b[19;80H\r\n\x1b[18;1HL\x1b[18;80Hl\x1b[19;1HM\x1b[19;80Hm\r\n
+\x1b[18;80HmN\x1b[19;80HN\x08 n\r\n\x1b[19;80HO\x08\x08\t\to\x1b[19;2H\x08O\r\n\x1b[19;80H\r\n\x1b[18;1HP\x1b[18;80Hp\x1b[19;1HQ\x1b[19;80Hq\r\n\x1b[18;80HqR
+\x1b[19;80HR\x08 r\r\n\x1b[19;80HS\x08\x08\t\ts\x1b[19;2H\x08S\r\n\x1b[19;80H\r\n\x1b[18;1HT\x1b[18;80Ht\x1b[19;1HU\x1b[19;80Hu\r\n\x1b[18;80HuV\x1b[19;80HV\x08 v\r\n
+\x1b[19;80HW\x08\x08\t\tw\x1b[19;2H\x08W\r\n\x1b[19;80H\r\n\x1b[18;1HX\x1b[18;80Hx\x1b[19;1HY\x1b[19;80Hy\r\n\x1b[18;80HyZ\x1b[19;80HZ\x08 z\r\n\x1b[?6l\x1b[r
+\x1b[22;1HPush <RETURN>

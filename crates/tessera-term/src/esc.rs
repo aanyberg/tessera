@@ -3,12 +3,14 @@
 //!
 //! | Sequence | Name | Effect |
 //! |---|---|---|
-//! | `ESC 7` | DECSC | save cursor, pen and pending wrap |
-//! | `ESC 8` | DECRC | restore them (home and default pen without a save) |
+//! | `ESC 7` | DECSC | save cursor, pen, pending wrap and origin mode |
+//! | `ESC 8` | DECRC | restore them (home, default pen and origin mode off without a save) |
 //! | `ESC D` | IND | down one row, scrolling at the bottom margin |
 //! | `ESC E` | NEL | IND plus carriage return |
 //! | `ESC H` | HTS | set a tab stop at the cursor column |
 //! | `ESC M` | RI | up one row, scrolling at the top margin |
+//! | `ESC =` | DECKPAM | application keypad |
+//! | `ESC >` | DECKPNM | numeric keypad |
 //! | `ESC c` | RIS | full reset, scrollback and modes included |
 //! | `ESC # 8` | DECALN | fill the screen with `E` |
 //!
@@ -27,8 +29,8 @@ impl State {
     /// sequences handled; anything else is logged and ignored.
     pub(crate) fn esc(&mut self, intermediates: &[u8], byte: u8) {
         match (intermediates, byte) {
-            // Origin mode and character sets are not saved yet: #8 extends
-            // the saved state when it adds DECOM and SCS.
+            // Character sets are not saved yet: #112 extends the saved
+            // state when it adds SCS.
             ([], b'7') => self.grid.save_cursor(),
             ([], b'8') => self.grid.restore_cursor(),
             ([], b'D') => self.grid.line_feed(),
@@ -39,19 +41,23 @@ impl State {
             ([], b'H') => self.grid.set_tab_stop(),
             ([], b'M') => self.grid.reverse_index(),
             ([], b'c') => self.reset(),
+            ([], b'=') => self.set_application_keypad(true),
+            ([], b'>') => self.set_application_keypad(false),
             ([b'#'], b'8') => self.screen_alignment(),
             _ => trace!(?intermediates, byte = ?char::from(byte), "ESC ignored"),
         }
     }
 
-    /// RIS: the grid's reset plus what xterm also resets: the scrollback,
-    /// auto-wrap (on) and insert mode (off). DECSTR (`CSI ! p`) is the soft
-    /// variant that keeps the screen, see the crate documentation.
+    /// RIS: the grid's reset plus what xterm also resets: the scrollback
+    /// and every mode (see the `modes` module: all to their defaults, both
+    /// kitty keyboard stacks emptied, 132-column mode left with a request for
+    /// 80 columns).
+    /// DECSTR (`CSI ! p`) is the soft variant that keeps the screen, see
+    /// the crate documentation.
     fn reset(&mut self) {
         self.grid.reset();
         self.grid.clear_scrollback();
-        self.auto_wrap = true;
-        self.insert_mode = false;
+        self.reset_modes();
     }
 
     /// DECALN: resets the scroll region, fills every cell with an `E` in

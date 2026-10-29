@@ -45,8 +45,8 @@ impl State {
     ///   pending the cursor already sits on the last column, so HT leaves
     ///   the pending wrap armed, as xterm and `WezTerm` do.
     /// - LF, VT and FF move down one line, scrolling at the bottom of the
-    ///   scroll region. The column is kept: newline mode (LNM) is not
-    ///   implemented yet.
+    ///   scroll region. The column is kept unless newline mode (LNM, `CSI
+    ///   20 h`) is on; then they also return the carriage.
     /// - CR moves to column zero.
     /// - NUL, SO, SI and DEL are ignored; any other byte is ignored and
     ///   logged at trace level.
@@ -59,7 +59,12 @@ impl State {
                     self.grid.tab_forward(1);
                 }
             }
-            LF | VT | FF => self.grid.line_feed(),
+            LF | VT | FF => {
+                self.grid.line_feed();
+                if self.modes.linefeed_newline {
+                    self.grid.carriage_return();
+                }
+            }
             CR => self.grid.carriage_return(),
             NUL | SO | SI | DEL => {}
             _ => trace!("control byte {byte:#04x} ignored"),

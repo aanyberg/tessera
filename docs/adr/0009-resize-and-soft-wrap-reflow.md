@@ -359,13 +359,12 @@ row below a cursor anchored by its wrapped line; on a cleared screen
 that row absorbs only the growth of the screen's own rows.
 
 vim, less, htop, tmux and other full-screen programs that switch to the
-alternate screen with DECSET 1049 draw on the primary screen today,
-because `tessera-term` does not implement 1049 yet (#8): there a resize
-re-wraps their screen like shell output, and after a clear (which they
-issue) the repaint lands below rows a narrow kept, so a window drag can
-leave copies of their screen in history. That is the accepted class
-until #8, which should land before any release; on the alternate screen
-nothing is re-wrapped.
+alternate screen with DECSET 1049 drew on the primary screen until #8
+implemented the alternate-screen modes (ADR 0020): there a resize
+re-wrapped their screen like shell output, and after a clear (which they
+issue) the repaint landed below rows a narrow kept, so a window drag
+could leave copies of their screen in history. Since #8 they draw on the
+alternate screen, where nothing is re-wrapped.
 
 Existing fixture rows whose outcome changed: none (`D06` changed with the
 first version of this amendment and is back: its shrink pushes `aa` into

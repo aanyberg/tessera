@@ -1,0 +1,63 @@
+---
+source: crates/tessera-term/tests/vttest.rs
+input_file: crates/tessera-term/tests/scripts/vttest/menu2_screen9.txt
+---
+
+
+
+
+
+
+
+
+
+
+
+Push <RETURN> |
+Jump scroll down region [12..13] size 2 Line 29
+
+
+
+
+
+
+
+
+
+
+
+--
+cursor: (11,13)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 29
+  ""
+  ""
+  ""
+  ""
+  ""
+  ""
+  ""
+  ""
+  ""
+  ""
+  ""
+  ""
+  ""
+  ""
+  ""
+  ""
+  ""
+  ""
+  ""
+  ""
+  ""
+  ""
+  ""
+  "Soft scroll up region [1..24] size 24 Line 1"
+  "Soft scroll up region [1..24] size 24 Line 2"
+  "Soft scroll up region [1..24] size 24 Line 3"
+  "Soft scroll up region [1..24] size 24 Line 4"
+  "Soft scroll up region [1..24] size 24 Line 5"
+  "Soft scroll up region [1..24] size 24 Line 6"

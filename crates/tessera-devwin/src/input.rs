@@ -296,10 +296,11 @@ pub fn map_key(
     }
     let mut key = core_key(input)?;
     if matches!(key, Key::NumLock | Key::CapsLock | Key::ScrollLock) {
-        // The encoder reports lock keys as `CSI u` even in legacy mode, the
-        // only mode the core encodes with until it tracks the terminal's
-        // keyboard modes (#8); the Mac keypad's Clear key arrives as Num
-        // Lock. Lock state still reaches the OS text.
+        // The encoder reports lock keys as `CSI u` even in legacy mode, so
+        // they are not sent at all; the Mac keypad's Clear key arrives as
+        // Num Lock. Lock state still reaches the OS text. Follow-up: send
+        // them only under kitty flag 8 (report all keys as escape codes),
+        // now that the core encodes with the terminal's keyboard modes.
         return None;
     }
     let mut text = input.text.as_deref();

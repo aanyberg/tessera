@@ -12,6 +12,9 @@
 //! - `cellpen:` the style of one cell, `(row,col)=default` or a list of
 //!   `bold`, `fg=indexed(N)`;
 //! - `region:` the scroll region, `full` or `top..=bottom`;
+//! - `modes:` `field=bool` pairs for the [`Terminal::modes`] fields
+//!   named (#8);
+//! - `kbd:` [`Terminal::keyboard_modes`], `default` or `not default`;
 //! - `flags: control` marks a case that runs without DECSTR to prove its
 //!   neighbour's setup really produces the state DECSTR resets, and
 //!   `flags: negative` one that sends a near miss (another intermediate, a
@@ -19,7 +22,8 @@
 //!
 //! One test per reset item runs that item's cases;
 //! [`every_case_is_tested_once`] keeps the lists and the fixture in step.
-//! Rows after the fixture's `#>` marker wait on #8 and are not cases.
+//! Rows after the fixture's `#>` marker wait on state that does not exist
+//! yet and are not cases.
 
 #[allow(dead_code)] // Shared harness: not every helper is used here.
 mod common;
@@ -31,7 +35,7 @@ use std::collections::HashSet;
 use common::{Chunking, Script, Step};
 use spec::{Case, check_case, parse_fixture};
 use tessera_grid::{Color, Point, ScrollRegion, Style};
-use tessera_term::{Request, Terminal};
+use tessera_term::{KeyboardModes, MouseEncoding, MouseTracking, Request, Terminal};
 
 const FIXTURE: &str = include_str!("fixtures/decstr_spec.txt");
 
@@ -43,6 +47,8 @@ struct Extra {
     pen: Option<String>,
     cellpen: Option<(Point, String)>,
     region: Option<String>,
+    modes: Option<String>,
+    kbd: Option<String>,
     flags: Vec<String>,
 }
 
@@ -74,6 +80,8 @@ fn extra(id: &str) -> Extra {
                 extra.cellpen = Some((at, style.trim().to_owned()));
             }
             "region" => extra.region = Some(raw.to_owned()),
+            "modes" => extra.modes = Some(raw.to_owned()),
+            "kbd" => extra.kbd = Some(raw.to_owned()),
             "flags" => extra.flags = raw.split_whitespace().map(str::to_owned).collect(),
             _ => {}
         }
@@ -165,6 +173,48 @@ fn check_extra(case: &Case, extra: &Extra, term: &Terminal, chunking: Chunking) 
                 grid.scroll_region()
             ));
         }
+    }
+    let modes = term.modes();
+    for pair in extra.modes.iter().flat_map(|text| text.split_whitespace()) {
+        let (field, want) = pair.split_once('=').expect("modes is `field=bool ...`");
+        let got = match field {
+            "origin" => modes.origin,
+            "cursor_visible" => modes.cursor_visible,
+            "cursor_blink" => modes.cursor_blink,
+            "synchronized_output" => modes.synchronized_output,
+            "reverse_video" => modes.reverse_video,
+            "linefeed_newline" => modes.linefeed_newline,
+            "alt_screen" => modes.alt_screen,
+            "bracketed_paste" => modes.bracketed_paste,
+            "focus_events" => modes.focus_events,
+            other => panic!("{id}: unknown mode field `{other}`"),
+        };
+        if got.to_string() != want {
+            errors.push(format!(
+                "{id} ({chunking:?}) modes {field}: expected {want}, got {got}"
+            ));
+        }
+    }
+    if extra
+        .modes
+        .iter()
+        .any(|text| text.contains("bracketed_paste=true"))
+        && (modes.mouse, modes.mouse_encoding) != (MouseTracking::Normal, MouseEncoding::Sgr)
+    {
+        errors.push(format!(
+            "{id} ({chunking:?}) mouse modes not kept: {:?}",
+            (modes.mouse, modes.mouse_encoding)
+        ));
+    }
+    let kbd_default = term.keyboard_modes() == KeyboardModes::default();
+    match (extra.kbd.as_deref(), kbd_default) {
+        (None, _) | (Some("default"), true) | (Some("not default"), false) => {}
+        (Some("default" | "not default"), _) => errors.push(format!(
+            "{id} ({chunking:?}) kbd: expected {:?}, got {:?}",
+            extra.kbd,
+            term.keyboard_modes()
+        )),
+        (Some(other), _) => panic!("{id}: unknown kbd `{other}`"),
     }
     errors
 }
@@ -300,6 +350,26 @@ decstr_tests! {
     parameters_are_ignored: [
         "INTER03_bang_with_params_still_resets",
         "INTER04_zero_param_also_resets",
+    ],
+    origin_mode_turns_off: [
+        "DECOM01_origin_mode_off_cup_absolute",
+        "DECOM02_control_origin_mode_stays_on",
+        "DECOM03_saved_origin_mode_reset_too",
+    ],
+    cursor_becomes_visible: [
+        "TCEM01_cursor_visible_again",
+        "TCEM02_control_cursor_stays_hidden",
+    ],
+    cursor_blink_and_synchronized_output_turn_off: [
+        "BLINK01_cursor_blink_and_sync_off",
+        "BLINK02_control_blink_and_sync_stay_on",
+    ],
+    keyboard_modes_reset: [
+        "KBD01_keyboard_modes_reset",
+        "KBD02_control_keyboard_modes_stay_set",
+    ],
+    paste_focus_mouse_reverse_video_lnm_and_alt_screen_kept: [
+        "KEEP01_paste_focus_mouse_reverse_lnm_alt_kept",
     ],
     split_and_cancelled_sequences: [
         "SPLIT01_decstr_split_across_feeds",

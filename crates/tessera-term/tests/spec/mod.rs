@@ -27,8 +27,8 @@ pub struct Case {
     pub cursor: Point,
     /// Expected pending-wrap flag.
     pub pending_wrap: bool,
-    /// Expected number of [`Request::Bell`]s; no other request is allowed.
-    pub bells: usize,
+    /// Expected requests, in order: `Bell` and `Resize(rows,cols)` entries.
+    pub requests: Vec<Request>,
     /// `(len, first line as (text, wrapped))`; `None` when not asserted.
     pub scrollback: Option<(usize, Option<(String, bool)>)>,
 }
@@ -71,17 +71,33 @@ fn parse_cursor(raw: &str) -> Point {
     )
 }
 
-fn parse_requests(raw: &str) -> usize {
+/// A `requests:` row: `[]`, or `Bell` and `Resize(rows,cols)` entries
+/// separated by commas.
+fn parse_requests(raw: &str) -> Vec<Request> {
     let inner = value(raw)
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
         .expect("requests is `[..]`");
-    inner
-        .split(',')
-        .map(str::trim)
-        .filter(|r| !r.is_empty())
-        .inspect(|r| assert_eq!(*r, "Bell", "unexpected request `{r}` in fixture"))
-        .count()
+    let mut requests = Vec::new();
+    let mut rest = inner.trim();
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix("Bell") {
+            requests.push(Request::Bell);
+            rest = after;
+        } else if let Some(after) = rest.strip_prefix("Resize(") {
+            let (size, after) = after.split_once(')').expect("Resize(rows,cols)");
+            let (rows, cols) = size.split_once(',').expect("Resize(rows,cols)");
+            requests.push(Request::Resize {
+                rows: rows.trim().parse().expect("Resize rows"),
+                cols: cols.trim().parse().expect("Resize cols"),
+            });
+            rest = after;
+        } else {
+            panic!("unexpected request `{rest}` in fixture");
+        }
+        rest = rest.trim_start().trim_start_matches(',').trim_start();
+    }
+    requests
 }
 
 fn parse_scrollback(raw: &str) -> Option<(usize, Option<(String, bool)>)> {
@@ -116,7 +132,7 @@ pub fn parse_fixture(text: &str) -> Vec<Case> {
         let mut size = None;
         let mut steps = Vec::new();
         let mut screen = String::new();
-        let (mut cursor, mut pending_wrap, mut bells, mut scrollback) = (None, None, None, None);
+        let (mut cursor, mut pending_wrap, mut requests, mut scrollback) = (None, None, None, None);
         while let Some(line) = lines.next_if(|l| !l.starts_with("### ") && !l.starts_with("# --")) {
             let (key, raw) = line
                 .split_once(": ")
@@ -144,7 +160,7 @@ pub fn parse_fixture(text: &str) -> Vec<Case> {
                 }
                 "cursor" => cursor = Some(parse_cursor(raw)),
                 "pending_wrap" => pending_wrap = Some(value(raw) == "true"),
-                "requests" => bells = Some(parse_requests(raw)),
+                "requests" => requests = Some(parse_requests(raw)),
                 "scrollback" => scrollback = Some(parse_scrollback(raw)),
                 _ => {}
             }
@@ -156,7 +172,7 @@ pub fn parse_fixture(text: &str) -> Vec<Case> {
             screen,
             cursor: cursor.unwrap_or_else(|| panic!("{id}: no cursor")),
             pending_wrap: pending_wrap.unwrap_or_else(|| panic!("{id}: no pending_wrap")),
-            bells: bells.unwrap_or_else(|| panic!("{id}: no requests")),
+            requests: requests.unwrap_or_else(|| panic!("{id}: no requests")),
             scrollback: scrollback.unwrap_or_else(|| panic!("{id}: no scrollback")),
         });
     }
@@ -191,8 +207,8 @@ pub fn check_case(case: &Case, chunking: Chunking) -> Vec<String> {
     );
     expect(
         "requests",
-        requests == vec![Request::Bell; case.bells],
-        format!("expected {} bell(s), got {requests:?}", case.bells),
+        requests == case.requests,
+        format!("expected {:?}, got {requests:?}", case.requests),
     );
     if let Some((len, first)) = &case.scrollback {
         expect(

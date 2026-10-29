@@ -1,0 +1,4 @@
+# Fixture case V2S14_light_background_prompt (tests/fixtures/csi_spec.txt).
+# tst_screen 'Light background' prompt. ESC[?5h DECSCNM is stored only; CUP 23;1, EL 0, text. Fed on a fresh terminal (the SGR pattern of m2_13 above it is #7's screen).
+@size 24x80
+\x1b[?5h\x1b[23;1H\x1b[0KLight background. Push <RETURN>

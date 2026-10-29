@@ -69,20 +69,26 @@ struct Attach {
     width: u16,
 }
 
-/// Cursor state captured by `save_cursor` (DECSC).
+/// Cursor state captured by `save_cursor` (DECSC): what xterm's
+/// `CursorSave` keeps besides the character sets, which do not exist yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SavedCursor {
+    /// Absolute screen position, also in origin mode.
     cursor: Point,
     pen: Style,
     pending_wrap: bool,
+    /// Origin mode (DECOM) at the time of the save.
+    origin: bool,
 }
 
 impl SavedCursor {
-    /// The slot before any save: home position, default pen.
+    /// The slot before any save: home position, default pen, origin mode
+    /// off.
     const INITIAL: Self = Self {
         cursor: Point { row: 0, col: 0 },
         pen: Style::DEFAULT,
         pending_wrap: false,
+        origin: false,
     };
 
     /// Clamps the saved position into a grid of `size` after a resize. The
@@ -92,6 +98,16 @@ impl SavedCursor {
         self.cursor.row = self.cursor.row.min(size.rows - 1);
         self.cursor.col = self.cursor.col.min(size.cols - 1);
         self.pending_wrap &= !cols_changed;
+    }
+
+    /// Clamps the saved position into a grid of `size` when the size it
+    /// was saved at is unknown (the alternate screen's slot, kept while
+    /// the primary screen is active). A saved pending wrap survives only
+    /// on the last column.
+    fn clamp_unknown(&mut self, size: Size) {
+        self.pending_wrap &= self.cursor.col == size.cols - 1;
+        self.cursor.row = self.cursor.row.min(size.rows - 1);
+        self.cursor.col = self.cursor.col.min(size.cols - 1);
     }
 }
 
@@ -103,6 +119,10 @@ struct Screen {
     cursor: Point,
     pending_wrap: bool,
     pen: Style,
+    /// Origin mode at the time of the switch, restored by
+    /// [`Grid::leave_alt_screen`] (not by
+    /// [`Grid::leave_alt_screen_in_place`]).
+    origin: bool,
     saved: SavedCursor,
     tabs: TabStops,
 }
@@ -110,8 +130,11 @@ struct Screen {
 /// The visible screen plus scrollback.
 ///
 /// Every operation is total: arguments are clamped so the grid never leaves
-/// its bounds. Coordinates are absolute screen coordinates; origin mode is
-/// resolved by the caller using [`Grid::scroll_region`].
+/// its bounds. Coordinates are absolute screen coordinates everywhere except
+/// in [`Grid::goto_origin`] and [`Grid::goto_row_origin`], the CUP and VPA
+/// entry points, which count from the top margin while origin mode
+/// ([`Grid::set_origin_mode`], DECOM) is on. The grid keeps the origin flag
+/// because DECSC saves it and DECRC restores it with the cursor.
 ///
 /// # Logical buffer
 ///
@@ -131,9 +154,11 @@ struct Screen {
 /// reporting the primary history (followed by whichever screen is active).
 /// Each screen has its own [`Grid::save_cursor`] slot, as in xterm, so a
 /// DECSC issued on the alternate screen leaves the primary screen's saved
-/// cursor intact; the alternate slot starts at its initial state (home,
-/// default pen) on every entry. The scroll region is shared by both
-/// screens. Saving the cursor around DECSET 1049 is the emulator's job.
+/// cursor intact. The alternate slot is kept across visits, as in xterm:
+/// it starts at its initial state (home, default pen) and a DECSC made on
+/// one visit is still there on the next. The scroll region and origin
+/// mode are shared by both screens. Saving the cursor around DECSET 1049
+/// is the emulator's job.
 #[derive(Debug, Clone)]
 pub struct Grid {
     rows: u16,
@@ -145,7 +170,14 @@ pub struct Grid {
     pending_wrap: bool,
     pen: Style,
     region: ScrollRegion,
+    /// Origin mode (DECOM): [`Grid::goto_origin`] counts from the top
+    /// margin and stops at the bottom one.
+    origin: bool,
+    /// The active screen's DECSC slot.
     saved: SavedCursor,
+    /// The alternate screen's DECSC slot while the primary screen is
+    /// active, kept across visits (xterm `sc[1]`).
+    alt_saved: SavedCursor,
     tabs: TabStops,
     /// The stashed primary screen; `Some` exactly while the alternate screen
     /// is active. [`Grid::resize`] resizes it together with `lines`.
@@ -187,7 +219,9 @@ impl Grid {
                 top: 0,
                 bottom: rows - 1,
             },
+            origin: false,
             saved: SavedCursor::INITIAL,
+            alt_saved: SavedCursor::INITIAL,
             tabs: TabStops::new(cols),
             primary: None,
             damage: DamageTracker::new(rows),
@@ -750,9 +784,57 @@ impl Grid {
         self.cursor.col = col;
     }
 
-    /// Moves the cursor to `row` in its current column (VPA).
+    /// Moves the cursor to `row` in its current column, clamped to the
+    /// screen. Absolute: see [`Grid::goto_row_origin`] for VPA.
     pub fn goto_row(&mut self, row: u16) {
         self.goto(row, self.cursor.col);
+    }
+
+    /// Whether origin mode (DECOM) is on. Off in a new grid.
+    pub fn origin_mode(&self) -> bool {
+        self.origin
+    }
+
+    /// Turns origin mode (DECOM) on or off, without moving the cursor (the
+    /// emulator homes it with [`Grid::goto_origin`]). While it is on,
+    /// [`Grid::goto_origin`] and [`Grid::goto_row_origin`] count rows from
+    /// the top margin and stop at the bottom one, and [`Grid::save_cursor`]
+    /// records it for [`Grid::restore_cursor`]. Every other operation is
+    /// unaffected, CUU and CUD included (they honour the margins either
+    /// way). Shared by both screens; [`Grid::reset`] turns it off.
+    pub fn set_origin_mode(&mut self, on: bool) {
+        self.origin = on;
+    }
+
+    /// The cursor's row as CUP and VPA count it: from the top margin in
+    /// origin mode, from the top of the screen otherwise. A cursor above
+    /// the region in origin mode counts as row zero.
+    pub fn origin_row(&self) -> u16 {
+        if self.origin {
+            self.cursor.row.saturating_sub(self.region.top)
+        } else {
+            self.cursor.row
+        }
+    }
+
+    /// Moves the cursor to `(row, col)` as CUP, HVP, VPA and DECSET 6 do
+    /// (xterm `CursorSet`): in origin mode `row` counts from the top margin
+    /// and is clamped to the bottom margin, otherwise this is
+    /// [`Grid::goto`]. Columns are always absolute (there are no left and
+    /// right margins yet). Clears a pending wrap.
+    pub fn goto_origin(&mut self, row: u16, col: u16) {
+        if self.origin {
+            let row = row.saturating_add(self.region.top).min(self.region.bottom);
+            self.goto(row, col);
+        } else {
+            self.goto(row, col);
+        }
+    }
+
+    /// Moves the cursor to `row` in its current column as VPA does:
+    /// [`Grid::goto_origin`] with the column kept.
+    pub fn goto_row_origin(&mut self, row: u16) {
+        self.goto_origin(row, self.cursor.col);
     }
 
     /// Moves the cursor to `col` in its current row (CHA).
@@ -836,20 +918,33 @@ impl Grid {
         }
     }
 
-    /// Saves the cursor position, pen and pending-wrap state (DECSC).
+    /// Saves the cursor position, pen, pending-wrap state and origin mode
+    /// (DECSC) in the active screen's slot.
     pub fn save_cursor(&mut self) {
         self.saved = SavedCursor {
             cursor: self.cursor,
             pen: self.pen,
             pending_wrap: self.pending_wrap,
+            origin: self.origin,
         };
     }
 
-    /// Restores what [`Grid::save_cursor`] saved (DECRC). Without a prior
-    /// save this homes the cursor and resets the pen.
+    /// Restores what [`Grid::save_cursor`] saved (DECRC): origin mode
+    /// first, then the position, the pen and the pending wrap. With origin
+    /// mode restored on, the saved (absolute) row is clamped to the bottom
+    /// margin, as xterm's `CursorRestore` does through `CursorSet`, so the
+    /// cursor lands inside the region when the region shrank above it.
+    /// Without a prior save this homes the cursor, resets the pen and turns
+    /// origin mode off.
     pub fn restore_cursor(&mut self) {
         let saved = self.saved;
-        self.goto(saved.cursor.row, saved.cursor.col);
+        self.origin = saved.origin;
+        let row = if saved.origin {
+            saved.cursor.row.min(self.region.bottom)
+        } else {
+            saved.cursor.row
+        };
+        self.goto(row, saved.cursor.col);
         self.pen = saved.pen;
         self.pending_wrap = saved.pending_wrap;
     }
@@ -1006,25 +1101,31 @@ impl Grid {
     /// Switches to the alternate screen: a separate blank screen of the same
     /// size, without scrollback. A no-op when already active.
     ///
-    /// The primary screen's lines, cursor, pending-wrap state, pen, saved
-    /// cursor and tab stops are stashed. The alternate screen starts with
-    /// the cursor in the same position, the same pen and a copy of the tab
-    /// stops; its lines are blank with the pen's background, like an erase.
-    /// Pending wrap is cleared and its saved-cursor slot starts at the
-    /// initial state (home, default pen). Unlike xterm, which keeps the
-    /// alternate slot across switches, each entry starts fresh, matching
-    /// the fresh alternate screen contents.
+    /// The primary screen's lines, cursor, pending-wrap state, pen, origin
+    /// mode, saved cursor and tab stops are stashed. The alternate screen
+    /// starts with the cursor in the same position, the same pen and origin
+    /// mode and a copy of the tab stops; its lines are blank with the pen's
+    /// background, like an erase. Pending wrap is cleared. Its saved-cursor
+    /// slot is the one the last visit left (initially home with the default
+    /// pen), as in xterm, clamped to the current size; its contents are
+    /// not kept between visits (xterm keeps them for DECSET 47).
     pub fn enter_alt_screen(&mut self) {
         if self.primary.is_some() {
             return;
         }
         let blank = vec![Line::blank(self.cols, self.pen); usize::from(self.rows)];
+        let mut alt_saved = self.alt_saved;
+        alt_saved.clamp_unknown(Size {
+            rows: self.rows,
+            cols: self.cols,
+        });
         let primary = Screen {
             lines: mem::replace(&mut self.lines, blank),
             cursor: self.cursor,
             pending_wrap: self.pending_wrap,
             pen: self.pen,
-            saved: mem::replace(&mut self.saved, SavedCursor::INITIAL),
+            origin: self.origin,
+            saved: mem::replace(&mut self.saved, alt_saved),
             tabs: self.tabs.clone(),
         };
         self.primary = Some(Box::new(primary));
@@ -1034,9 +1135,29 @@ impl Grid {
 
     /// Returns to the primary screen, discarding the alternate screen's
     /// contents and restoring the primary lines, cursor, pending-wrap state,
-    /// pen, saved cursor and tab stops exactly as they were on entry. A
-    /// no-op when the primary screen is already active.
+    /// pen, origin mode, saved cursor and tab stops as they were on entry
+    /// (the cursor moved with the text by a [`Grid::resize`] in between,
+    /// and with origin mode on clamped to the bottom margin, as
+    /// [`Grid::restore_cursor`] does).
+    /// The alternate screen's saved cursor is kept for the next visit. A
+    /// no-op when the primary screen is already active. DECSET 1049 leaves
+    /// this way; [`Grid::leave_alt_screen_in_place`] is the 47 / 1047 form.
     pub fn leave_alt_screen(&mut self) {
+        self.leave_alt(true);
+    }
+
+    /// Returns to the primary screen like [`Grid::leave_alt_screen`], but
+    /// keeps the live cursor position, pen, pending wrap and origin mode
+    /// from the alternate screen instead of restoring the primary's, as
+    /// xterm does when DECSET 47 or 1047 is reset ("the cursor should not
+    /// move", esctest). A no-op when the primary screen is already active.
+    pub fn leave_alt_screen_in_place(&mut self) {
+        self.leave_alt(false);
+    }
+
+    /// [`Grid::leave_alt_screen`] (`restore_cursor`) or
+    /// [`Grid::leave_alt_screen_in_place`].
+    fn leave_alt(&mut self, restore_cursor: bool) {
         let Some(primary) = self.primary.take() else {
             return;
         };
@@ -1045,6 +1166,7 @@ impl Grid {
             cursor,
             pending_wrap,
             pen,
+            origin,
             saved,
             tabs,
         } = *primary;
@@ -1058,10 +1180,21 @@ impl Grid {
             "stale primary cols"
         );
         self.lines = lines;
-        self.cursor = cursor;
-        self.pending_wrap = pending_wrap;
-        self.pen = pen;
-        self.saved = saved;
+        if restore_cursor {
+            // As `restore_cursor`: with origin mode restored on, the row is
+            // clamped to the bottom margin of the (shared) region, which
+            // the alternate screen may have moved (xterm `CursorRestore`).
+            let row = if origin {
+                cursor.row.min(self.region.bottom)
+            } else {
+                cursor.row
+            };
+            self.cursor = Point { row, ..cursor };
+            self.pending_wrap = pending_wrap;
+            self.pen = pen;
+            self.origin = origin;
+        }
+        self.alt_saved = mem::replace(&mut self.saved, saved);
         self.tabs = tabs;
         self.damage.extend_all();
     }
@@ -1386,8 +1519,8 @@ impl Grid {
     }
 
     /// Returns the grid to its initial state (RIS): primary screen, blank,
-    /// home cursor, default pen, full scroll region, default tab stops, both
-    /// saved-cursor slots at their initial state and
+    /// home cursor, default pen, full scroll region, origin mode off, default
+    /// tab stops, both saved-cursor slots at their initial state and
     /// [`Grid::scrolled_since_clear`] cleared. The alternate screen is left
     /// and the stashed primary contents are discarded. Scrollback and its
     /// cap are kept; the newest history line is ended, as ED 2 does. The
@@ -1432,7 +1565,11 @@ impl Grid {
         self.pending_wrap = false;
         self.pen = Style::DEFAULT;
         self.reset_scroll_region();
+        self.origin = false;
         self.saved = SavedCursor::INITIAL;
+        // The alternate screen's slot too: a fresh grid has never saved
+        // on either screen (#8).
+        self.alt_saved = SavedCursor::INITIAL;
         reset_tabs(&mut self.tabs, self.cols);
         self.scrolled_since_clear = false;
         // The blank screen ends the newest history line, as ED 2 does.
@@ -2362,6 +2499,9 @@ mod tests {
         PadLastColumn,
         EnterAlt,
         LeaveAlt,
+        LeaveAltInPlace,
+        Origin(bool),
+        GotoOrigin(u16, u16),
         Resize(u16, u16),
         Cap(usize),
         Mark(u16),
@@ -2401,6 +2541,9 @@ mod tests {
             1 => Just(ResetOp::PadLastColumn),
             2 => Just(ResetOp::EnterAlt),
             1 => Just(ResetOp::LeaveAlt),
+            1 => Just(ResetOp::LeaveAltInPlace),
+            1 => any::<bool>().prop_map(ResetOp::Origin),
+            1 => (n(), n()).prop_map(|(r, c)| ResetOp::GotoOrigin(r, c)),
             1 => (1..=7u16, 1..=9u16).prop_map(|(r, c)| ResetOp::Resize(r, c)),
             1 => prop_oneof![Just(0usize), Just(1), Just(3), Just(100)].prop_map(ResetOp::Cap),
             1 => n().prop_map(ResetOp::Mark),
@@ -2456,6 +2599,9 @@ mod tests {
             ResetOp::PadLastColumn => grid.pad_last_column(),
             ResetOp::EnterAlt => grid.enter_alt_screen(),
             ResetOp::LeaveAlt => grid.leave_alt_screen(),
+            ResetOp::LeaveAltInPlace => grid.leave_alt_screen_in_place(),
+            ResetOp::Origin(on) => grid.set_origin_mode(on),
+            ResetOp::GotoOrigin(r, c) => grid.goto_origin(r, c),
             ResetOp::Resize(r, c) => grid.resize(r, c),
             ResetOp::Cap(cap) => grid.set_max_scrollback(cap),
             ResetOp::Mark(row) => {
@@ -2487,7 +2633,8 @@ mod tests {
 
     proptest::proptest! {
         /// `reset` in place equals the rebuild it replaced (#107), after
-        /// any history: alternate screen active, regions, saved cursors,
+        /// any history: alternate screen active, regions, saved cursors
+        /// (the alternate screen's slot and origin mode included, #8),
         /// tab stops, marks, pens, caps, clones, taken damage, and resets
         /// in a row with edits in between (the rows it skips).
         #[test]
@@ -2551,6 +2698,35 @@ mod tests {
         clone.reset();
         assert!(clone.lines.iter().all(is_initial_blank));
         assert_ne!(clone.blanked_at.0, 0, "the clone's own reset is recorded");
+    }
+
+    /// The alternate screen's saved cursor is kept while the primary screen
+    /// is active, where `resize` does not see it; re-entering after a
+    /// resize clamps it, and a saved pending wrap survives only on the new
+    /// last column (#8).
+    #[test]
+    fn a_kept_alternate_slot_is_clamped_on_re_entry() {
+        let mut grid = Grid::new(3, 10);
+        grid.enter_alt_screen();
+        grid.put_str("abcdefghij");
+        assert!(grid.pending_wrap());
+        grid.save_cursor();
+        grid.leave_alt_screen();
+        grid.resize(3, 20);
+        grid.enter_alt_screen();
+        grid.restore_cursor();
+        assert_eq!(grid.cursor(), Point::new(0, 9));
+        assert!(!grid.pending_wrap(), "column 9 is no longer the last");
+
+        let mut grid = Grid::new(5, 10);
+        grid.enter_alt_screen();
+        grid.goto(4, 8);
+        grid.save_cursor();
+        grid.leave_alt_screen();
+        grid.resize(2, 4);
+        grid.enter_alt_screen();
+        grid.restore_cursor();
+        assert_eq!(grid.cursor(), Point::new(1, 3), "clamped into 2x4");
     }
 
     #[test]

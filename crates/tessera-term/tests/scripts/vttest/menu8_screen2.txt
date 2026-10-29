@@ -1,5 +1,5 @@
-# Fixture case V8S2_accordion_il_dl_ADAPTED (tests/fixtures/csi_spec.txt).
-# tst_insdel pass 0, screen 2 (IL/DL accordion), ADAPTED: DECOM removed. Original (DECOM) variant is deferred to #8; expected screen is identical (checked against tmux and the full model).
+# Fixture case V8S2_accordion_il_dl (tests/fixtures/csi_spec.txt).
+# tst_insdel pass 0, screen 2 (IL/DL accordion), as vttest sends it. RI, EL 2, DECSTBM 2;23, ESC[?6h DECOM then CUP 1;1 (= absolute row 2), IL n / DL n for n=1..24 (also n larger than the region), ESC[?6l, DECSTBM reset ESC[r. Cumulative: steps include screen 1 because the RI/EL 2 at the start act on the cursor row left by screen 1 and its Enter echo.
 @size 24x80
 \x1b[2J\x1b[?3l\x1b[2J\x1b[1;1H\x1b[1;1HAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 \x1b[2;1HBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
@@ -26,6 +26,7 @@
 \x1b[23;1HWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW
 \x1b[24;1HXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 \x1b[4;1HScreen accordion test (Insert & Delete Line). Push <RETURN>
-\r\n\x1bM\x1b[2K\x1b[2;23r\x1b[2;1H\x1b[1L\x1b[1M\x1b[2L\x1b[2M\x1b[3L\x1b[3M\x1b[4L\x1b[4M\x1b[5L\x1b[5M\x1b[6L\x1b[6M\x1b[7L\x1b[7M\x1b[8L\x1b[8M\x1b[9L\x1b[9M\x1b[10L\x1b[10M\x1b[11L
-\x1b[11M\x1b[12L\x1b[12M\x1b[13L\x1b[13M\x1b[14L\x1b[14M\x1b[15L\x1b[15M\x1b[16L\x1b[16M\x1b[17L\x1b[17M\x1b[18L\x1b[18M\x1b[19L\x1b[19M\x1b[20L\x1b[20M\x1b[21L\x1b[21M\x1b[22L
-\x1b[22M\x1b[23L\x1b[23M\x1b[24L\x1b[24M\x1b[?6l\x1b[r\x1b[2;1HTop line: A's, bottom line: X's, this line, nothing more. Push <RETURN>
+\r\n\x1bM\x1b[2K\x1b[2;23r\x1b[?6h\x1b[1;1H\x1b[1L\x1b[1M\x1b[2L\x1b[2M\x1b[3L\x1b[3M\x1b[4L\x1b[4M\x1b[5L\x1b[5M\x1b[6L\x1b[6M\x1b[7L\x1b[7M\x1b[8L\x1b[8M\x1b[9L\x1b[9M\x1b[10L\x1b[10M
+\x1b[11L\x1b[11M\x1b[12L\x1b[12M\x1b[13L\x1b[13M\x1b[14L\x1b[14M\x1b[15L\x1b[15M\x1b[16L\x1b[16M\x1b[17L\x1b[17M\x1b[18L\x1b[18M\x1b[19L\x1b[19M\x1b[20L\x1b[20M\x1b[21L\x1b[21M
+\x1b[22L\x1b[22M\x1b[23L\x1b[23M\x1b[24L\x1b[24M\x1b[?6l\x1b[r
+\x1b[2;1HTop line: A's, bottom line: X's, this line, nothing more. Push <RETURN>

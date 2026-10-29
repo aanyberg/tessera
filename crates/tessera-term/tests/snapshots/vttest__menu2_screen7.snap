@@ -1,0 +1,34 @@
+---
+source: crates/tessera-term/tests/vttest.rs
+input_file: crates/tessera-term/tests/scripts/vttest/menu2_screen7.txt
+---
+
+
+
+
+
+
+
+
+
+
+
+Push <RETURN> |
+Soft scroll down region [12..13] size 2 Line 29
+
+
+
+
+
+
+
+
+
+
+
+--
+cursor: (11,13)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

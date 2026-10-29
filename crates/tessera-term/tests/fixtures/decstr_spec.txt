@@ -684,15 +684,170 @@ requests: []
 scrollback: len=0
 cellpen: (0,1)=fg=indexed(1)
 
+# ----------------------------------------------------------------------------- modes (#8)
+# Rows added by #8 once the state existed. `modes:` lists Terminal::modes() fields as field=bool
+# (only the ones named are checked); `kbd:` is `default` or `not default` (Terminal::keyboard_modes()).
+
+### DECOM01_origin_mode_off_cup_absolute
+size: 6x10
+step: feed \x1b[?6h\x1b[!p\x1b[3;5r\x1b[1;1HX
+cite: [XT] ReallyReset common part `bitclr(&xw->flags, ORIGIN)`; [DEC] table 5-9 "DECOM absolute"
+note: After DECSTR the region 3;5 is set again: DECSTBM and CUP 1;1 are absolute, so X lands on the screen's corner, not the region's.
+screen:
+>X |
+>
+>
+>
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+region: 2..=4
+modes: origin=false
+
+### DECOM02_control_origin_mode_stays_on
+size: 6x10
+step: feed \x1b[?6h\x1b[3;5r\x1b[1;1HX
+flags: control
+cite: as DECOM01, without DECSTR
+note: With DECOM still on, CUP 1;1 is the region's top-left: X at (2,0).
+screen:
+>
+>
+>X |
+>
+>
+>
+cursor: (2,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+region: 2..=4
+modes: origin=true
+
+### DECOM03_saved_origin_mode_reset_too
+size: 6x10
+step: feed \x1b[3;5r\x1b[?6h\x1b[2;3H\x1b7\x1b[!p\x1b[3;5r\x1b8X
+cite: [XT] ReallyReset clears ORIGIN before CursorSave, then homes the copy (sc.row = sc.col = 0)
+note: The DECSC made with DECOM on is replaced by the home position with origin mode off: DECRC lands on (0,0) and leaves DECOM off.
+screen:
+>X |
+>
+>
+>
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+region: 2..=4
+modes: origin=false
+
+### TCEM01_cursor_visible_again
+size: 2x10
+step: feed \x1b[?25l\x1b[!p
+cite: [XT] ReallyReset common part `screen->cursor_set = ON`; [DEC] table 5-9 "DECTCEM cursor enabled"
+note: Only the mode changes; the screen cannot show it.
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: cursor_visible=true
+
+### TCEM02_control_cursor_stays_hidden
+size: 2x10
+step: feed \x1b[?25l
+flags: control
+cite: as TCEM01, without DECSTR
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: cursor_visible=false
+
+### BLINK01_cursor_blink_and_sync_off
+size: 2x10
+step: feed \x1b[?12;2026h\x1b[!p
+cite: [XT] ReallyReset common part `screen->cursor_blink_esc = 0`; 2026: modes_spec.txt D-2026 (spec silent; reset so a crashed update cannot freeze the screen)
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: cursor_blink=false synchronized_output=false
+
+### BLINK02_control_blink_and_sync_stay_on
+size: 2x10
+step: feed \x1b[?12;2026h
+flags: control
+cite: as BLINK01, without DECSTR
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: cursor_blink=true synchronized_output=true
+
+### KBD01_keyboard_modes_reset
+size: 2x10
+step: feed \x1b[?1h\x1b=\x1b[>4;2m\x1b[>5u\x1b[!p
+cite: [XT] ReallyReset common part `UIntClr(keyboard.flags, MODE_DECCKM|MODE_KAM|MODE_DECKPAM)`, modifyOtherKeys back to the resource (0); [KT] do_screen_reset empties the key encoding stacks
+note: DECCKM, DECKPAM, modifyOtherKeys and the kitty flags all go back to their defaults.
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+kbd: default
+
+### KBD02_control_keyboard_modes_stay_set
+size: 2x10
+step: feed \x1b[?1h\x1b=\x1b[>4;2m\x1b[>5u
+flags: control
+cite: as KBD01, without DECSTR
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+kbd: not default
+
+### KEEP01_paste_focus_mouse_reverse_lnm_alt_kept
+size: 2x10
+step: feed \x1b[?5;1000;1004;1006;2004h\x1b[20h\x1b[?1049h\x1b[!p
+cite: [XT] ReallyReset soft path touches none of them (mouse, paste_brackets, send_focus_pos, REVERSE_VIDEO and LINEFEED are full-reset only; no FromAlternate)
+note: DECSTR keeps reverse video, LNM, the alternate screen, bracketed paste, focus events and the mouse modes.
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: reverse_video=true linefeed_newline=true alt_screen=true bracketed_paste=true focus_events=true
+
 # -- end of cases
 
-#> Rows to add when #8 lands (state does not exist in tessera-term yet; sources in the header list):
-#>   DECOM on + CUP, DECSTR, CUP 1;1 -> absolute (cursor (0,0) not region-relative)     [XT bitclr ORIGIN]
-#>   DECSET ?25 l (hide cursor), DECSTR -> visible                                        [XT cursor_set=ON; DEC DECTCEM]
-#>   SCS "ESC ( 0" (line drawing) + SO, DECSTR, print 'q' -> literal 'q'                  [XT resetCharsets]
-#>   DECCKM set, DECSTR -> normal cursor keys; DECKPAM set, DECSTR -> numeric keypad      [XT keyboard.flags]
-#>   DECSTR with DECOM on and DECSC saved -> DECRC lands at (0,0) with origin off          [XT bitclr ORIGIN before CursorSave]
-#>   DECLRMM on + DECSLRM, DECSTR -> left/right margins full, mode off                     [XT resetMarginMode]
-#> Rows to add with the state they need (not #8; found by the #80 adversarial run):
-#>   DECSCUSR `CSI 4 SP q` (steady underline), DECSTR -> default cursor shape and blink    [XT ReallyReset soft; no issue yet]
+#> Rows to add with the state they need (not #8):
+#>   SCS "ESC ( 0" (line drawing) + SO, DECSTR, print 'q' -> literal 'q'                  [XT resetCharsets; #112]
+#>   DECLRMM on + DECSLRM, DECSTR -> left/right margins full, mode off                     [XT resetMarginMode; #97]
+#>   DECSCA on (CSI 1 " q), DECSTR -> unprotected                                          [XT; #95]
+#>   DECSCUSR `CSI 4 SP q` (steady underline), DECSTR -> default cursor shape and blink    [XT ReallyReset soft; #113]
 #>   OSC 4 ; 1 ; rgb:00/ff/00 (palette 1 = green), DECSTR -> palette 1 back to the theme   [XT ResetAnsiColorRequest; #9]
