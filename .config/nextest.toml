@@ -48,6 +48,11 @@ test-group = 'timing'
 filter = 'package(tessera-ffi) & binary(lifecycle) & test(close_returns_at_once_and_free_waits_for_the_closing_children)'
 test-group = 'timing'
 
+# Release-only wall-clock bars, run by the gate's release timing step (#114).
+[[profile.default.overrides]]
+filter = 'package(tessera-app-core) & kind(lib) & (test(reader_lock_hold_is_bounded) | test(view_metrics_are_fast_while_output_floods_the_terminal))'
+test-group = 'timing'
+
 # Device loss through a full Metal command queue (#84): ~1.1 GB each.
 [[profile.default.overrides]]
 filter = '(package(tessera-app-core) & kind(lib) & test(a_loss_inside_the_frame_detaches_at_once)) | (package(tessera-render) & binary(device_loss) & test(a_device_error_loses_the_device_during_the_call_that_hit_it))'

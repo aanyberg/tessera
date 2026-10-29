@@ -185,11 +185,17 @@ Agents use these instead of rebuilding the setup in every run:
 - **Gate pass stamps.** `scripts/quality-gate.sh` records a pass on a clean tree per commit, toolchain and gate
   script, so the implementer, critic and verifiers pay for the gate once per commit. `--force` re-runs it.
 - **Hang protection (#137, #121).** A hung test fails fast instead of stalling a run for hours. `.config/nextest.toml`
-  reports a test SLOW after 60 s and terminates it after 5 periods (300 s; 600 s for the file-watcher, shaping, GPU
-  and hdiutil tests); the slowest test in the workspace takes 12 s, so there is room for a machine under load 30+.
+  reports a test SLOW after 60 s and terminates it after 5 periods (300 s; 600 s for the file-watcher, shaping, term `wide`,
+  GPU and hdiutil tests); the slowest test in the workspace takes 12 s, so there is room for a machine under load 30+.
   `scripts/quality-gate.sh` then fails with the terminated test names (`TIMEOUT` lines) instead of a bare exit code.
-  In CI the Rust job has `timeout-minutes: 20` and the macOS app job 15 (a normal run is 4-6 minutes), with a
-  10-minute limit on `just app-test`, whose xcodebuild calls also fail a single hung test after 120 s (300 s at
+  `TESSERA_GATE_NEXTEST_MINUTES` (default 30) is a gate-level watchdog: nextest and its descendants are killed
+  after that long and the gate fails naming the limit (nextest runs with `--color never`, so the `TIMEOUT` report also
+  works under `CARGO_TERM_COLOR=always`). After the ffi release build the gate runs the release-only timing bars
+  `reader_lock_hold_is_bounded` and `view_metrics_are_fast_while_output_floods_the_terminal` (#114; `timing` group); a
+  failure with the 1-minute load at or above `hw.ncpu` is retried once ("failed under load, retried"), any other
+  failure fails the gate. When the macOS job's test step fails, times out or is cancelled, it uploads
+  `apps/macos/build/app-test*.log` as the `app-test-logs` artifact (#121). In CI the Rust job has `timeout-minutes: 20` and the macOS app job 15 (a normal run is 4-6 minutes),
+  with a 10-minute limit on `just app-test`, whose xcodebuild calls also fail a single hung test after 120 s (300 s at
   most). A hang below the test level (the TSan and fork deadlock of #121) is caught by the step and job limits
   only. A new test that legitimately needs more than 300 s gets its own `slow-timeout` override there.
 - **A/B probes.** `cargo xtask ab init --base <rev> --crate <name> --out <scratch dir>` builds a probe crate that
