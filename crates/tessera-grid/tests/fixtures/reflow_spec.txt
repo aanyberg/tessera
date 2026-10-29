@@ -108,6 +108,14 @@
 #        grow by d:  p = min(d, scrollback_len). Pop the p newest scrollback lines to the TOP
 #                    of the screen (wrapped flags and marks intact), cursor.row += p, then
 #                    append d-p plain blank rows (DEFAULT pen, wrapped=false) at the BOTTOM.
+#                    #86 (lead decision D2, 2026-10-28): on a screen that has NOT SCROLLED since
+#                    it was last cleared (Grid::scrolled_since_clear: set when output or a
+#                    resize pushes rows of the screen into history, cleared by ED 2, ED 0 from
+#                    home and RIS), p = 0 unless the cursor anchors it at the bottom: the
+#                    cursor is on the last row, or its row and every row below it but the last
+#                    are wrapped. ghostty's rule; kitty never pulls. A screen that has scrolled
+#                    pulls as before. No row below changed (D06's shrink pushes "aa", which
+#                    sets the bit, so its grow pulls it back as before).
 #        shrink by d: t = number of trailing rows below the cursor row that are blank,
 #                    unwrapped and mark-free. Drop min(d,t) rows from the bottom first, then push
 #                    the remaining d - min(d,t) rows from the TOP into scrollback (evicting the
@@ -150,10 +158,18 @@
 #        e. prune: let t_blank = blank unwrapped mark-free rows below the cursor row. If the
 #           reflow made the buffer longer by e rows, drop min(e, t_blank) of them from the
 #           bottom first (they would otherwise push real lines into history).
+#           #86 (lead decision D1, 2026-10-28), on a screen that has not scrolled since it was
+#           last cleared (see step 1): e counts only the SCREEN BLOCK: the rows from
+#           the one holding the old top screen row's first cell to the end (a logical line
+#           straddling history and screen splits there, D4). History growth is not counted,
+#           so narrowing after a clear does not pull old output onto the screen.
 #        f. window = last `rows` rows of the new buffer (pad blank default rows at the bottom
 #           if the buffer is shorter); everything before it is the new scrollback, oldest
 #           evicted beyond the cap. cursor.row = max(0, cursor.row - window_start).
 #           (Bottom-anchored: growing the width pulls older history into view.)       (R3)
+#           #86: on such a screen, when the screen block is shorter than `rows` and the cursor
+#           does not anchor it at the bottom (step 1), the window is the block with blank rows
+#           below it instead. A screen that has scrolled is unchanged. No row below changed.
 #   3. Combined rows+cols: step 1 then step 2 (Alacritty's order, AL resize.rs:22-32).
 #   4. ALTERNATE screen active: the alt screen gets NO reflow: rows follow step 1's shrink/grow
 #      rule with the dropped rows DISCARDED (no history) and blank default rows appended on

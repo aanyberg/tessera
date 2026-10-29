@@ -152,6 +152,10 @@ pub struct Grid {
     primary: Option<Box<Screen>>,
     /// Which visible rows changed (ADR 0016).
     damage: DamageTracker,
+    /// Whether rows of the primary screen have gone into history since the
+    /// screen was last cleared or created: see
+    /// [`Grid::scrolled_since_clear`].
+    scrolled_since_clear: bool,
 }
 
 impl Grid {
@@ -185,6 +189,7 @@ impl Grid {
             tabs: TabStops::new(cols),
             primary: None,
             damage: DamageTracker::new(rows),
+            scrolled_since_clear: false,
         }
     }
 
@@ -198,6 +203,40 @@ impl Grid {
     /// Column count.
     pub fn cols(&self) -> u16 {
         self.cols
+    }
+
+    /// Whether rows of the primary screen have gone into scrollback since
+    /// the screen was last cleared.
+    ///
+    /// - *Set* when a line feed or SU with the full screen as scroll region
+    ///   moves a row of the primary screen off its top (even with a
+    ///   scrollback cap of zero, which keeps nothing), and when a resize
+    ///   pushes rows that were on the primary screen (or the stashed one
+    ///   behind the alternate screen) into history: either way the
+    ///   screen's content has reached its bottom.
+    /// - *Cleared* when the primary screen is erased whole: ED 2
+    ///   ([`EraseDisplay::All`]), ED 0 ([`EraseDisplay::Below`]) with the
+    ///   cursor at the home position (the `clear` of vt100, screen and
+    ///   tmux terminfo, and Node's `console.clear`) unless the top row
+    ///   continues the newest history line (then a shell is redrawing a
+    ///   line that started above the screen), and RIS ([`Grid::reset`]).
+    /// - *Unchanged* by everything else: ED 3 and [`Grid::clear_scrollback`]
+    ///   (they empty history but leave a screen full of scrolled output),
+    ///   ED 0 anywhere else or on a top row that continues history (a
+    ///   shell redrawing its prompt), ED 1, erasing a
+    ///   line, moving the cursor, a resize that pushes nothing, and
+    ///   anything on the alternate screen.
+    ///
+    /// It decides where a resize puts the screen (ADR 0009, amendment of
+    /// 2026-10-29 for #86): a screen that has scrolled is continuous with
+    /// its history and is resized as one buffer anchored at the bottom; a
+    /// cleared one keeps its own rows in place and never takes history
+    /// back unless the cursor's line ends on the last row. A resize cannot
+    /// tell the two apart from the cells alone: a shell redrawing its
+    /// prompt with ED 0 leaves blank rows below the cursor just as a clear
+    /// does.
+    pub fn scrolled_since_clear(&self) -> bool {
+        self.scrolled_since_clear
     }
 
     /// Current cursor position.
@@ -831,6 +870,8 @@ impl Grid {
     }
 
     /// Discards all scrollback, keeping the cap and the visible screen.
+    /// [`Grid::scrolled_since_clear`] is unchanged: the screen still shows
+    /// whatever scrolled onto it.
     pub fn clear_scrollback(&mut self) {
         self.scrollback.clear();
     }
@@ -841,14 +882,24 @@ impl Grid {
     /// to the new width (ADR 0009). A zero dimension is raised to one, as
     /// in [`Grid::new`]; the current size is a no-op that changes nothing.
     ///
-    /// The primary screen and the scrollback are one buffer:
+    /// The primary screen and the scrollback are one buffer. The screen is
+    /// *anchored at the bottom* when rows of it have gone into history
+    /// since it was last cleared ([`Grid::scrolled_since_clear`]: output
+    /// scrolled it, or a resize pushed its rows), or when the cursor is
+    /// on the last row or its logical line ends there (every row from the
+    /// cursor's to the one before the last is wrapped); only such a screen
+    /// takes history back when it gets room for more rows (#86). A screen
+    /// that has scrolled is resized as one buffer with its history,
+    /// exactly as below without the #86 parts:
     ///
     /// - **Rows** change first, at the old width, by moving whole rows.
-    ///   Growing pulls the newest scrollback lines back onto the top of
-    ///   the screen (blank rows at the bottom once history runs out);
-    ///   shrinking first drops blank rows below the cursor (default blanks
-    ///   and [`CellFlags::PAD`] cells of any style only, even the empty
-    ///   continuation of a wrapped row, whose wrap flag is then cleared),
+    ///   Growing an anchored screen pulls the newest scrollback lines back
+    ///   onto the top of the screen (blank rows at the bottom once history
+    ///   runs out); any other screen, such as a prompt after a clear, gets
+    ///   blank rows at the bottom. Shrinking first drops blank rows below
+    ///   the cursor (default blanks and [`CellFlags::PAD`] cells of any
+    ///   style only, even the empty continuation of a wrapped row, whose
+    ///   wrap flag is then cleared),
     ///   then pushes rows from the top into scrollback (oldest lines are
     ///   evicted past the cap). The cursor moves with the text and stops
     ///   at row zero.
@@ -863,9 +914,17 @@ impl Grid {
     ///   background behind, which a later join drops again (only padding
     ///   is ever dropped); on a one-column grid it is dropped. Cluster
     ///   text and marks move with their cells and lines (marks of a
-    ///   joined line collect on its first row). The screen is
-    ///   the last `rows` rows of the result, so a narrower grid pushes
-    ///   lines into scrollback and a wider one pulls them back.
+    ///   joined line collect on its first row). On a screen that has
+    ///   scrolled the window is the last `rows` rows of the result (blank
+    ///   rows below the cursor absorb growth first). On a cleared one only
+    ///   the rows that were on the screen move it: lines wholly in
+    ///   scrollback just get longer or shorter there. When the screen's
+    ///   rows grow, blank rows below
+    ///   the cursor absorb that first and then the top rows go into
+    ///   scrollback; when they shrink, an anchored screen pulls scrollback
+    ///   back and any other keeps its place with blank rows at the bottom.
+    ///   A line straddling scrollback and the screen splits at the row
+    ///   holding the old top row's first cell.
     /// - **Cursor:** it stays on the character it was on. On a blank after
     ///   the end of its line's text it keeps its distance from the text
     ///   while that fits in the row, else it stops on the last column;
@@ -908,12 +967,26 @@ impl Grid {
                     cursor: &mut primary.cursor,
                     pending_wrap: &mut primary.pending_wrap,
                 };
-                reflow::resize_primary(stashed, &mut self.scrollback, old_cols, size);
+                self.scrolled_since_clear |= reflow::resize_primary(
+                    stashed,
+                    &mut self.scrollback,
+                    old_cols,
+                    size,
+                    self.scrolled_since_clear,
+                );
                 primary.saved.clamp(size, cols_changed);
                 primary.tabs.resize(size.cols);
                 reflow::resize_alternate(active, old_cols, size);
             }
-            None => reflow::resize_primary(active, &mut self.scrollback, old_cols, size),
+            None => {
+                self.scrolled_since_clear |= reflow::resize_primary(
+                    active,
+                    &mut self.scrollback,
+                    old_cols,
+                    size,
+                    self.scrolled_since_clear,
+                );
+            }
         }
         self.saved.clamp(size, cols_changed);
         self.tabs.resize(size.cols);
@@ -1074,6 +1147,7 @@ impl Grid {
         self.extend_region(top, bottom);
         let top = usize::from(top);
         let keep_history = self.region_is_full_screen() && !self.is_alt_screen();
+        self.scrolled_since_clear |= keep_history;
         for i in top..top + n {
             let mut departed = mem::take(&mut self.lines[i]);
             departed.graphemes.compact();
@@ -1238,10 +1312,28 @@ impl Grid {
 
     /// Blanks part of the screen (ED). Lines erased in full also lose their
     /// marks and wrap flag; the cursor's line, when only partially erased,
-    /// behaves like [`Grid::erase_in_line`].
+    /// behaves like [`Grid::erase_in_line`]. On the primary screen, an
+    /// erase of the whole screen ([`EraseDisplay::All`], or
+    /// [`EraseDisplay::Below`] from the home position when the top row
+    /// does not continue the newest scrollback line) also clears
+    /// [`Grid::scrolled_since_clear`] and ends the newest scrollback line
+    /// (clears its wrap flag), whose continuation on the top row it erased;
+    /// [`EraseDisplay::Scrollback`] is [`Grid::clear_scrollback`].
     pub fn erase_in_display(&mut self, mode: EraseDisplay) {
         self.pending_wrap = false;
         let row = usize::from(self.cursor.row);
+        let whole_screen = match mode {
+            EraseDisplay::All => true,
+            // From home it erases the whole screen, as vt100's `clear`
+            // does, unless the top row continues the newest history line:
+            // then a shell is redrawing a line that started above the
+            // screen (zsh after a narrow made its prompt taller than the
+            // window), not clearing (#86).
+            EraseDisplay::Below => {
+                self.cursor == Point::default() && !self.top_row_continues_history()
+            }
+            EraseDisplay::Above | EraseDisplay::Scrollback => false,
+        };
         match mode {
             EraseDisplay::Below => {
                 self.extend_region(self.cursor.row, self.rows - 1);
@@ -1265,6 +1357,29 @@ impl Grid {
             }
             EraseDisplay::Scrollback => self.clear_scrollback(),
         }
+        if whole_screen && !self.is_alt_screen() {
+            self.scrolled_since_clear = false;
+            self.end_newest_history_line();
+        }
+    }
+
+    /// True when the newest scrollback line is wrapped: the top row of the
+    /// primary screen continues it.
+    fn top_row_continues_history(&self) -> bool {
+        self.scrollback
+            .len()
+            .checked_sub(1)
+            .and_then(|newest| self.scrollback.get(newest))
+            .is_some_and(|line| line.wrapped)
+    }
+
+    /// Ends the newest scrollback line (clears its wrap flag) after the
+    /// top row that may have continued it was erased, so the next text on
+    /// the top row starts a line of its own (#86). O(1).
+    fn end_newest_history_line(&mut self) {
+        if let Some(newest) = self.scrollback.newest_mut() {
+            newest.wrapped = false;
+        }
     }
 
     /// Returns the grid to its initial state (RIS): primary screen, blank,
@@ -1275,6 +1390,8 @@ impl Grid {
         let fresh = Self::with_scrollback(self.rows, self.cols, self.scrollback.cap());
         let old = mem::replace(self, fresh);
         self.scrollback = old.scrollback;
+        // The blank screen ends the newest history line, as ED 2 does.
+        self.end_newest_history_line();
         // Keep the tracker (moved, not cloned: a clone starts a new range),
         // so a reader of the old screen sees it all change rather than a
         // grid it does not know.

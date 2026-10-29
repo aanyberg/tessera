@@ -181,6 +181,12 @@ impl Scrollback {
         self.buf.pop()
     }
 
+    /// The newest line (the one most recently pushed), mutably, in O(1).
+    pub(crate) fn newest_mut(&mut self) -> Option<&mut Line> {
+        let slot = self.head.checked_sub(1).or(self.buf.len().checked_sub(1))?;
+        self.buf.get_mut(slot)
+    }
+
     /// Removes every retained line and returns them oldest first, leaving
     /// the history empty and without storage. The cap is unchanged.
     pub(crate) fn take_lines(&mut self) -> Vec<Line> {
@@ -314,6 +320,28 @@ mod tests {
         sb.set_cap(4);
         assert_eq!(sb.head, head, "no rotation for an unchanged cap");
         assert_eq!(texts(&sb), "2345");
+    }
+
+    /// #86: the newest line is reachable in place, without straightening
+    /// the ring, whatever its fill and rotation.
+    #[test]
+    fn newest_mut_is_the_newest_line_in_place() {
+        assert!(Scrollback::new(0).newest_mut().is_none());
+        assert!(Scrollback::new(3).newest_mut().is_none());
+        for pushes in 1..10 {
+            let mut sb = Scrollback::new(4);
+            for n in 0..pushes {
+                sb.push(line(n));
+            }
+            let head = sb.head;
+            let newest = sb.newest_mut().map(|l| l.text());
+            assert_eq!(newest, Some((pushes - 1).to_string()), "{pushes} pushes");
+            assert_eq!(sb.head, head, "the ring is not rotated");
+            if let Some(line) = sb.newest_mut() {
+                line.wrapped = true;
+            }
+            assert!(sb.get(sb.len() - 1).is_some_and(|l| l.wrapped));
+        }
     }
 
     #[test]
