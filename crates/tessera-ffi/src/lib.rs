@@ -58,8 +58,8 @@ pub use input::{
 #[doc(hidden)]
 pub use panic::tessera_test_panic;
 pub use session::{
-    SpawnOptions, tessera_session_clear_scrollback, tessera_session_close, tessera_session_resize,
-    tessera_session_spawn, tessera_session_write,
+    MAX_COLS, MAX_ROWS, SpawnOptions, tessera_session_clear_scrollback, tessera_session_close,
+    tessera_session_resize, tessera_session_spawn, tessera_session_write,
 };
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]

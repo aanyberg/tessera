@@ -326,3 +326,114 @@ fn large_output_is_delivered_in_order() {
         assert_eq!(line.len(), 1004, "line {i} length");
     }
 }
+
+/// Number of threads in this process, from `ps -M` (one header line plus
+/// one line per thread). Only meaningful when the test runs alone in its
+/// process, as nextest runs every test.
+fn thread_count() -> usize {
+    let output = std::process::Command::new("ps")
+        .args(["-M", "-p", &std::process::id().to_string()])
+        .output()
+        .expect("run ps");
+    String::from_utf8_lossy(&output.stdout).lines().count() - 1
+}
+
+/// `true` when this process has no child at all, reaped or not; always
+/// `true` unless the test runs alone in its process (nextest), because
+/// sibling tests under `cargo test` have children of their own.
+///
+/// Must not be called while this process may have a zombie child some
+/// reader thread is about to reap: `waitpid` would reap it first.
+fn no_children() -> bool {
+    use nix::errno::Errno;
+    use nix::sys::wait::{WaitPidFlag, waitpid};
+    if std::env::var_os("NEXTEST").is_none() {
+        return true;
+    }
+    waitpid(None, Some(WaitPidFlag::WNOHANG)) == Err(Errno::ECHILD)
+}
+
+#[test]
+fn oversized_arguments_are_refused_before_forking() {
+    let alone = std::env::var_os("NEXTEST").is_some();
+    let threads = thread_count();
+    // 5 MiB in one argument: more than any `ARG_MAX` this crate runs under.
+    let options = sh("exit 0").arg("x".repeat(5 * 1024 * 1024));
+    match NativePty::spawn(&options) {
+        Err(PtyError::ArgumentsTooLong { bytes, max }) => {
+            assert!(bytes > 5 * 1024 * 1024, "counted {bytes} bytes");
+            assert!(max < bytes, "limit {max} not below {bytes}");
+            assert!(max > 0);
+        }
+        Err(other) => panic!("unexpected error: {other}"),
+        Ok((_pty, events)) => panic!("spawned; child {:?}", collect_all(&events).exit),
+    }
+    assert!(no_children(), "a child was forked for refused arguments");
+    if alone {
+        assert_eq!(thread_count(), threads, "a refused spawn left a thread");
+    }
+}
+
+#[test]
+fn oversized_environment_is_refused_before_forking() {
+    // The environment counts against the same limit as the arguments.
+    let options = sh("exit 0").env("TESSERA_HUGE", "y".repeat(5 * 1024 * 1024));
+    assert!(matches!(
+        NativePty::spawn(&options),
+        Err(PtyError::ArgumentsTooLong { .. })
+    ));
+    assert!(no_children());
+}
+
+#[test]
+fn many_small_arguments_count_their_pointers() {
+    // 200 000 empty arguments are only 200 000 bytes of strings, but the
+    // kernel also copies one pointer per argument (1.6 MB on 64-bit), which
+    // is over macOS's 1 MiB.
+    let options = sh("exit 0").args(std::iter::repeat_n("", 200_000));
+    match NativePty::spawn(&options) {
+        Err(PtyError::ArgumentsTooLong { bytes, .. }) => {
+            assert!(bytes >= 200_000 * (1 + size_of::<usize>()), "{bytes}");
+        }
+        Err(other) => panic!("unexpected error: {other}"),
+        Ok((_pty, events)) => panic!("spawned; child {:?}", collect_all(&events).exit),
+    }
+}
+
+#[test]
+fn arguments_well_under_the_limit_still_spawn() {
+    // 256 KiB fits the smallest `ARG_MAX` among supported systems (macOS
+    // reports 1 MiB, Linux a quarter of the stack limit), in 64 KiB pieces
+    // because Linux also caps each string at 128 KiB.
+    let piece = "z".repeat(64 * 1024);
+    let script = r#"[ "${#1}.${#2}.${#3}.${#4}" = 65536.65536.65536.65536 ] && exit 7"#;
+    let options = sh(script)
+        .arg("argv0")
+        .args([&piece, &piece, &piece, &piece]);
+    let (_pty, events) = NativePty::spawn(&options).unwrap();
+    assert_eq!(collect_all(&events).exit, Some(ExitStatus::Exited(7)));
+}
+
+#[test]
+fn an_argument_with_an_interior_nul_is_a_spawn_error() {
+    // Only Rust callers can build one (C strings end at the NUL).
+    let options = sh("exit 0").arg("a\0b");
+    assert!(matches!(
+        NativePty::spawn(&options),
+        Err(PtyError::Spawn { .. })
+    ));
+    assert!(no_children());
+}
+
+#[test]
+fn non_utf8_arguments_reach_the_child_unchanged() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    // `printf %s` writes the argument's bytes; `od` shows them in hex.
+    let options = sh(r#"printf '<%s>' "$(printf %s "$1" | od -An -tx1 | tr -d ' \n')""#)
+        .arg("argv0")
+        .arg(OsStr::from_bytes(b"\xff\xfe"));
+    let (_pty, events) = NativePty::spawn(&options).unwrap();
+    let collected = collect_all(&events);
+    assert!(collected.text.contains("<fffe>"), "{:?}", collected.text);
+}

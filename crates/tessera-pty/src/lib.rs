@@ -207,6 +207,24 @@ pub enum PtyError {
     /// derives).
     #[error("invalid pty size {}x{}", .0.rows, .0.cols)]
     InvalidSize(PtySize),
+    /// The child's arguments and environment together are larger than
+    /// `execve(2)` accepts, so the spawn was refused before anything was
+    /// forked. Without this check the kernel's `E2BIG` surfaces as a child
+    /// that dies of `SIGABRT` right after a "successful" spawn.
+    ///
+    /// `bytes` counts what the kernel copies: every argument and
+    /// `KEY=value` string with its terminating NUL, one pointer per string
+    /// and one terminating `NULL` per array, plus the executable's path.
+    #[error("arguments and environment take {bytes} bytes, more than the {max} allowed")]
+    ArgumentsTooLong {
+        /// Bytes the spawn would have handed to `execve(2)`.
+        bytes: usize,
+        /// The limit applied: the system's `ARG_MAX`
+        /// (`sysconf(_SC_ARG_MAX)`) less 10% for what the kernel adds
+        /// itself (on macOS the "apple" strings handed to `dyld`, and the
+        /// difference between the program name and its resolved path).
+        max: usize,
+    },
     /// An I/O operation on the master side failed.
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -428,6 +446,18 @@ mod tests {
         assert_eq!(
             PtyError::InvalidSize(PtySize::new(0, 80)).to_string(),
             "invalid pty size 0x80"
+        );
+    }
+
+    #[test]
+    fn arguments_too_long_error_names_both_sizes() {
+        assert_eq!(
+            PtyError::ArgumentsTooLong {
+                bytes: 2_000_000,
+                max: 943_718
+            }
+            .to_string(),
+            "arguments and environment take 2000000 bytes, more than the 943718 allowed"
         );
     }
 

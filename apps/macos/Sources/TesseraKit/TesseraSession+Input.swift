@@ -482,8 +482,9 @@ extension TesseraSession {
     /// bracketed as a paste.
     ///
     /// - Throws: ``TesseraCoreError/sessionNotFound`` once closed,
-    ///   ``TesseraCoreError/io`` after the child exited or when the paste
-    ///   does not fit in the free pending input (nothing is sent).
+    ///   ``TesseraCoreError/io`` after the child exited or when the paste's
+    ///   UTF-8 length, before sanitising, does not fit in the free pending
+    ///   input (16 MiB at most; nothing is sent or copied).
     @MainActor
     public func paste(_ text: String) throws {
         var text = text

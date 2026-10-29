@@ -14,6 +14,12 @@ prefix = "Tessera"
 # an invalid discriminant) are not reachable from any signature; list them
 # so their named values reach the header.
 include = ["Key", "KeyEventKind", "Modifiers", "MouseButton", "MouseEventKind"]
+# Constants are `#define`d with C-style names instead of the type prefix.
+renaming_overrides_prefixing = true
+
+[export.rename]
+"MAX_ROWS" = "TESSERA_MAX_ROWS"
+"MAX_COLS" = "TESSERA_MAX_COLS"
 
 [enum]
 # `TESSERA_ERROR_OK`, `TESSERA_ERROR_NULL_POINTER`, …: C enumerators share

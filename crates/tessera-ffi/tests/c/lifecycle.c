@@ -97,7 +97,15 @@ int main(void) {
         .height_px = 0,
     };
     uint64_t id = 0;
+    /* One row more than the header's bound is refused before anything runs. */
+    options.rows = TESSERA_MAX_ROWS + 1;
+    if (tessera_session_spawn(app, &options, &id) != TESSERA_ERROR_INVALID_ARGUMENT || id != 0) {
+        fprintf(stderr, "spawning more than TESSERA_MAX_ROWS rows should fail\n");
+        return 1;
+    }
+    options.rows = 24;
     CHECK(tessera_session_spawn(app, &options, &id));
+    CHECK(tessera_session_resize(app, id, TESSERA_MAX_ROWS, TESSERA_MAX_COLS, 0, 0));
     CHECK(tessera_session_resize(app, id, 30, 100, 0, 0));
     static const char input[] = "exit\n";
     CHECK(tessera_session_write(app, id, (const uint8_t *)input, strlen(input)));

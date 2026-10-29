@@ -52,7 +52,9 @@ public final class TesseraSession: Sendable, Identifiable {
     /// Tells the child its window is now `rows` x `cols` cells and
     /// `widthPx` x `heightPx` pixels (0 when unknown); it receives `SIGWINCH`.
     ///
-    /// - Throws: ``TesseraCoreError/invalidArgument`` for zero rows or columns.
+    /// - Throws: ``TesseraCoreError/invalidArgument`` for zero rows or columns
+    ///   or more than `TESSERA_MAX_ROWS` (1024) rows or `TESSERA_MAX_COLS`
+    ///   (2048) columns.
     @MainActor
     public func resize(rows: UInt16, cols: UInt16, widthPx: UInt16 = 0, heightPx: UInt16 = 0) throws {
         try TesseraCoreError.check(

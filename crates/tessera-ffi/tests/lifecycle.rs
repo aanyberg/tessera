@@ -466,6 +466,100 @@ fn bad_spawn_requests_fail_cleanly() {
 }
 
 #[test]
+fn spawn_sizes_are_bounded_like_resize() {
+    assert_eq!(
+        (tessera_ffi::MAX_ROWS, tessera_ffi::MAX_COLS),
+        (1024, 2048),
+        "the header documents these values"
+    );
+    let recorder = Recorder::default();
+    let app = Handle::observed(&recorder);
+    let program = c"/bin/sh";
+    let script = c"[ \"$(stty size)\" = '1024 2048' ] && exit 4";
+    let args = [c"-c".as_ptr(), script.as_ptr()];
+    let sized = |rows, cols| SpawnOptions {
+        program: program.as_ptr(),
+        args: args.as_ptr(),
+        arg_count: args.len(),
+        rows,
+        cols,
+        width_px: u16::MAX,
+        height_px: u16::MAX,
+        ..default_options()
+    };
+    for (rows, cols) in [
+        (tessera_ffi::MAX_ROWS + 1, 80),
+        (24, tessera_ffi::MAX_COLS + 1),
+        (u16::MAX, u16::MAX),
+        (u16::MAX, 0),
+    ] {
+        assert_eq!(
+            app.spawn_with(&sized(rows, cols)),
+            Err(Error::InvalidArgument),
+            "{rows}x{cols}"
+        );
+    }
+    // The bound itself spawns, with any pixel size, and the child sees it.
+    let id = app
+        .spawn_with(&sized(tessera_ffi::MAX_ROWS, tessera_ffi::MAX_COLS))
+        .unwrap();
+    assert_eq!(recorder.wait_exit(id), (4, 0));
+    assert_eq!(recorder.seen().exits.len(), 1, "only the bounded spawn ran");
+}
+
+#[test]
+fn resize_accepts_the_bound_and_refuses_one_more() {
+    let recorder = Recorder::default();
+    let app = Handle::observed(&recorder);
+    let id = app.spawn("/bin/sh", &[]).unwrap();
+    let (rows, cols) = (tessera_ffi::MAX_ROWS, tessera_ffi::MAX_COLS);
+    // SAFETY: live handle throughout.
+    unsafe {
+        assert_eq!(
+            tessera_session_resize(app.0, id, rows, cols, u16::MAX, u16::MAX),
+            Error::Ok
+        );
+        for (r, c) in [(rows + 1, cols), (rows, cols + 1)] {
+            assert_eq!(
+                tessera_session_resize(app.0, id, r, c, 0, 0),
+                Error::InvalidArgument,
+                "{r}x{c}"
+            );
+        }
+    }
+    assert_eq!(
+        app.write(id, b"[ \"$(stty size)\" = '1024 2048' ]; exit $?\n"),
+        Error::Ok
+    );
+    assert_eq!(recorder.wait_exit(id), (0, 0));
+}
+
+#[test]
+fn oversized_spawn_arguments_fail_without_starting_anything() {
+    let recorder = Recorder::default();
+    let app = Handle::observed(&recorder);
+    let alone = alone_in_process();
+    let threads = thread_count();
+    let big = "x".repeat(5 * 1024 * 1024);
+    assert_eq!(
+        app.spawn("/bin/sh", &["-c", "exit 0", "argv0", &big]),
+        Err(Error::SpawnFailed)
+    );
+    // Many small strings: each costs a pointer as well as its bytes.
+    let many: Vec<&str> = std::iter::repeat_n("", 200_000).collect();
+    assert_eq!(app.spawn("/bin/sh", &many), Err(Error::SpawnFailed));
+    if alone {
+        assert_eq!(thread_count(), threads, "a refused spawn left a thread");
+    }
+    // Nothing was forked: no exit is ever reported.
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(recorder.seen().exits, []);
+    // The application still spawns.
+    let id = app.spawn("/bin/sh", &["-c", "exit 5"]).unwrap();
+    assert_eq!(recorder.wait_exit(id), (5, 0));
+}
+
+#[test]
 fn a_missing_cwd_falls_back_to_the_home_directory() {
     let recorder = Recorder::default();
     let app = Handle::observed(&recorder);

@@ -100,6 +100,19 @@ const WRITE_BACKOFF_MAX: Duration = Duration::from_millis(20);
 /// use far more memory than this.
 pub const PENDING_INPUT_BYTES: usize = 16 * 1024 * 1024;
 
+/// Refuses a size no session may have with [`PtyError::InvalidSize`]:
+/// zero rows or columns (programs divide by the window size), or more than
+/// [`MAX_VIEW_ROWS`] rows or [`MAX_VIEW_COLS`] columns (the largest grid a
+/// view derives: the grid allocates every row and every scrollback line at
+/// full width, so 65535 × 65535 would need tens of gigabytes). Spawning
+/// and resizing apply the same bound.
+pub(crate) fn check_size(size: PtySize) -> Result<(), PtyError> {
+    if size.rows == 0 || size.cols == 0 || size.rows > MAX_VIEW_ROWS || size.cols > MAX_VIEW_COLS {
+        return Err(PtyError::InvalidSize(size));
+    }
+    Ok(())
+}
+
 /// Identifies a session within one [`App`](crate::App).
 ///
 /// Ids are handed out in increasing order starting at `1` and never reused
@@ -435,22 +448,30 @@ struct OutboxState {
     failed: Option<io::ErrorKind>,
 }
 
-impl Outbox {
-    /// Appends `bytes` whole, or refuses them without queueing anything.
-    fn push(&self, bytes: Vec<u8>) -> io::Result<()> {
-        let mut state = lock(&self.state);
-        if state.closed {
+impl OutboxState {
+    /// Refuses `len` more bytes exactly as [`Outbox::push`] would.
+    fn check_room(&self, len: usize) -> io::Result<()> {
+        if self.closed {
             return Err(closing_error());
         }
-        if let Some(kind) = state.failed {
+        if let Some(kind) = self.failed {
             return Err(io::Error::new(kind, "the session's input writer stopped"));
         }
-        if bytes.len() > PENDING_INPUT_BYTES - state.bytes {
+        if len > PENDING_INPUT_BYTES - self.bytes {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "the session's pending input is full",
             ));
         }
+        Ok(())
+    }
+}
+
+impl Outbox {
+    /// Appends `bytes` whole, or refuses them without queueing anything.
+    fn push(&self, bytes: Vec<u8>) -> io::Result<()> {
+        let mut state = lock(&self.state);
+        state.check_room(bytes.len())?;
         state.bytes += bytes.len();
         state.inputs.push_back(bytes);
         self.ready.notify_one();
@@ -622,6 +643,23 @@ impl Session {
     /// [`PENDING_INPUT_BYTES`], and with [`io::ErrorKind::BrokenPipe`] once
     /// the child has exited or the session is closing.
     pub(crate) fn queue_input(&self, bytes: Vec<u8>) -> io::Result<()> {
+        self.check_accepts_input()?;
+        self.outbox.push(bytes)
+    }
+
+    /// Fails exactly as [`Session::queue_input`] would for `len` bytes,
+    /// without queueing anything, so a caller can refuse large input
+    /// before it copies it. Only the frontend thread queues input and the
+    /// writer only frees room, so `len` bytes that pass still fit when
+    /// they are queued, unless the session closes or its child exits in
+    /// between.
+    pub(crate) fn check_input_room(&self, len: usize) -> io::Result<()> {
+        self.check_accepts_input()?;
+        lock(&self.outbox.state).check_room(len)
+    }
+
+    /// Refuses input once the session is closing or its child has exited.
+    fn check_accepts_input(&self) -> io::Result<()> {
         if self.muted.load(Ordering::Acquire) {
             return Err(closing_error());
         }
@@ -631,7 +669,7 @@ impl Session {
                 "child has exited",
             ));
         }
-        self.outbox.push(bytes)
+        Ok(())
     }
 
     /// Queues `bytes` for the child, waiting while the PTY's write queue is
@@ -652,20 +690,12 @@ impl Session {
     /// writes in answer to `SIGWINCH` lands on a grid of the new size. The
     /// two locks are taken one after the other, never together.
     ///
-    /// A size larger than [`MAX_VIEW_ROWS`] × [`MAX_VIEW_COLS`] (the
-    /// largest grid a view derives) is refused with
-    /// [`PtyError::InvalidSize`] before anything changes: the grid
-    /// allocates every row and every scrollback line at the full width,
-    /// so 65535 × 65535 would need tens of gigabytes. A size with zero
-    /// rows or columns leaves the terminal alone and is refused by the PTY
-    /// with the same error.
+    /// A size [`check_size`] refuses (zero rows or columns, or larger
+    /// than the largest grid a view derives) is refused with
+    /// [`PtyError::InvalidSize`] before anything changes.
     pub(crate) fn resize(&self, size: PtySize) -> Result<(), PtyError> {
-        if size.rows > MAX_VIEW_ROWS || size.cols > MAX_VIEW_COLS {
-            return Err(PtyError::InvalidSize(size));
-        }
-        if size.rows > 0 && size.cols > 0 {
-            self.term.lock().resize(size.rows, size.cols);
-        }
+        check_size(size)?;
+        self.term.lock().resize(size.rows, size.cols);
         lock(&self.pty).resize(size)
     }
 

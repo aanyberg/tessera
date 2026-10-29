@@ -105,9 +105,12 @@ public final class TesseraApp {
     /// delegate afterwards, once the returned session is known.
     ///
     /// - Throws: ``TesseraCoreError/invalidArgument`` for zero rows or columns,
-    ///   an empty program, a string with a NUL byte or a working directory
-    ///   that is not a file URL;
-    ///   ``TesseraCoreError/spawnFailed`` if the program cannot be started.
+    ///   more than `TESSERA_MAX_ROWS` (1024) rows or `TESSERA_MAX_COLS` (2048)
+    ///   columns, an empty program, a string with a NUL byte or a working
+    ///   directory that is not a file URL;
+    ///   ``TesseraCoreError/spawnFailed`` if the program cannot be started,
+    ///   including when its arguments and the environment together exceed
+    ///   the system's `ARG_MAX` (1 MiB on macOS, less a tenth).
     public func spawn(_ options: TesseraSession.SpawnOptions = .init()) throws -> TesseraSession {
         let app = core.pointer
         var id: UInt64 = 0

@@ -195,11 +195,18 @@ impl App {
     ///
     /// # Errors
     ///
-    /// [`Error::Pty`] when the size is invalid, no PTY is available or the
-    /// program cannot be started; [`Error::ReaderThread`] when a session
-    /// thread (reader or input writer) cannot be created (the child is
-    /// then hung up).
+    /// [`Error::Pty`] when no PTY is available or the program cannot be
+    /// started, and with [`PtyError::InvalidSize`] (as from
+    /// [`App::resize`], before anything is spawned) when the size has zero
+    /// rows or columns or more than [`view::MAX_VIEW_ROWS`] rows or
+    /// [`view::MAX_VIEW_COLS`] columns: the grid allocates every row at
+    /// full width, so an unbounded size could ask for gigabytes.
+    /// [`PtyError::ArgumentsTooLong`] when the arguments and environment
+    /// exceed what `execve(2)` accepts. [`Error::ReaderThread`] when a
+    /// session thread (reader or input writer) cannot be created (the
+    /// child is then hung up).
     pub fn spawn_session(&self, options: SpawnOptions) -> Result<SessionId> {
+        session::check_size(options.size)?;
         let id = self.allocate_id();
         let options = SpawnOptions {
             session_id: id.to_string(),
@@ -370,10 +377,12 @@ impl App {
     /// * [`InputEvent::Scroll`]: moves the scrollback view (see
     ///   [`App::scroll_offset`]); [`InputOutcome::Consumed`] only when the
     ///   offset changed.
-    /// * [`InputEvent::Paste`]: sanitised with [`input::sanitize_paste`]
-    ///   and queued like a key, **without blocking**, behind any input
-    ///   still pending, and the view returns to the live screen; text that
-    ///   sanitises to nothing is [`InputOutcome::Ignored`].
+    /// * [`InputEvent::Paste`]: as [`App::paste`]: sanitised with
+    ///   [`input::sanitize_paste`] and queued like a key, **without
+    ///   blocking**, behind any input still pending, and the view returns
+    ///   to the live screen; text that sanitises to nothing is
+    ///   [`InputOutcome::Ignored`]. The free space is checked on the raw
+    ///   length, before sanitising.
     /// * [`InputEvent::Focus`]: recorded (see [`App::is_focused`]);
     ///   [`InputOutcome::Consumed`].
     ///
@@ -412,23 +421,7 @@ impl App {
             } else {
                 InputOutcome::Ignored
             }),
-            InputEvent::Paste(text) => {
-                let text = input::sanitize_paste(&text);
-                if text.is_empty() {
-                    return Ok(InputOutcome::Ignored);
-                }
-                // TODO(#8): wrap in `CSI 200 ~` ... `CSI 201 ~` when the
-                // terminal is in bracketed-paste mode (DECSET 2004).
-                let bracketed_paste = false;
-                let bytes = if bracketed_paste {
-                    [b"\x1b[200~", text.as_bytes(), b"\x1b[201~"].concat()
-                } else {
-                    text.into_bytes()
-                };
-                session.queue_input(bytes).map_err(write_error)?;
-                session.scroll_to_bottom();
-                Ok(InputOutcome::Consumed)
-            }
+            InputEvent::Paste(text) => Self::queue_paste(&session, id, &text),
             InputEvent::Focus(focus) => {
                 // TODO(#8): report `CSI I` / `CSI O` in focus-event mode
                 // (DECSET 1004).
@@ -436,6 +429,68 @@ impl App {
                 Ok(InputOutcome::Consumed)
             }
         }
+    }
+
+    /// Pastes `text` into session `id` exactly as
+    /// [`InputEvent::Paste`] through [`App::send_input`] does, but borrows
+    /// the text: the free pending space is checked on its raw length
+    /// first, then it is sanitised straight into the buffer that is
+    /// queued, so it is copied once, and not at all when it cannot fit.
+    ///
+    /// # Errors
+    ///
+    /// As [`App::send_input`]; a paste whose raw length does not fit in
+    /// what is left of [`session::PENDING_INPUT_BYTES`] is refused even if
+    /// sanitising would have shortened it enough.
+    pub fn paste(&self, id: SessionId, text: &str) -> Result<InputOutcome> {
+        let session = self.session(id)?;
+        Self::queue_paste(&session, id, text)
+    }
+
+    /// Fails exactly as a paste or key of `len` bytes would fail now
+    /// (unknown session, closing, child exited, not enough pending space),
+    /// without queueing anything. Lets a caller refuse large input before
+    /// it validates or copies it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session;
+    /// [`Error::Write`] (kind [`io::ErrorKind::WouldBlock`] for want of
+    /// space) as from [`App::send_input`].
+    pub fn check_input_room(&self, id: SessionId, len: usize) -> Result<()> {
+        self.session(id)?
+            .check_input_room(len)
+            .map_err(|source| Error::Write { id, source })
+    }
+
+    fn queue_paste(session: &Session, id: SessionId, text: &str) -> Result<InputOutcome> {
+        let write_error = |source| Error::Write { id, source };
+        // TODO(#8): wrap in `CSI 200 ~` ... `CSI 201 ~` when the terminal
+        // is in bracketed-paste mode (DECSET 2004).
+        let bracketed_paste = false;
+        let (open, close): (&[u8], &[u8]) = if bracketed_paste {
+            (b"\x1b[200~", b"\x1b[201~")
+        } else {
+            (b"", b"")
+        };
+        // Sanitising never lengthens text, so this bounds what is queued.
+        let most = text.len().saturating_add(open.len() + close.len());
+        session.check_input_room(most).map_err(write_error)?;
+        let mut bytes = Vec::with_capacity(most);
+        bytes.extend_from_slice(open);
+        input::sanitize_paste_into(text, &mut bytes);
+        if bytes.len() == open.len() {
+            return Ok(InputOutcome::Ignored);
+        }
+        bytes.extend_from_slice(close);
+        // The outbox charges the sanitised length; do not hold the raw
+        // length's capacity behind it when sanitising removed most of it.
+        if bytes.len() < bytes.capacity() / 2 {
+            bytes.shrink_to_fit();
+        }
+        session.queue_input(bytes).map_err(write_error)?;
+        session.scroll_to_bottom();
+        Ok(InputOutcome::Consumed)
     }
 
     /// How many lines session `id`'s view is scrolled back from the live
@@ -1676,6 +1731,47 @@ mod tests {
     }
 
     #[test]
+    fn spawn_refuses_sizes_resize_would_refuse() {
+        let app = app();
+        for (rows, cols) in [
+            (0, 80),
+            (24, 0),
+            (view::MAX_VIEW_ROWS + 1, 80),
+            (24, view::MAX_VIEW_COLS + 1),
+            (u16::MAX, u16::MAX),
+        ] {
+            let size = PtySize::new(rows, cols).with_pixels(u16::MAX, u16::MAX);
+            let result = app.spawn_session(sh("exit 0").size(size));
+            assert!(
+                matches!(result, Err(Error::Pty(PtyError::InvalidSize(s))) if s == size),
+                "{rows}x{cols}: {result:?}"
+            );
+        }
+        assert_eq!(app.session_ids(), Vec::<SessionId>::new());
+        // The largest size a view derives (and `resize` accepts) spawns,
+        // with any pixel size.
+        let largest =
+            PtySize::new(view::MAX_VIEW_ROWS, view::MAX_VIEW_COLS).with_pixels(u16::MAX, u16::MAX);
+        let id = app.spawn_session(sh("exit 0").size(largest)).unwrap();
+        let grid = app
+            .with_terminal(id, |t| (t.grid().rows(), t.grid().cols()))
+            .unwrap();
+        assert_eq!(grid, (view::MAX_VIEW_ROWS, view::MAX_VIEW_COLS));
+        app.close_session(id).unwrap();
+    }
+
+    #[test]
+    fn oversized_spawn_arguments_are_refused() {
+        let app = app();
+        let result = app.spawn_session(sh("exit 0").arg("x".repeat(5 * 1024 * 1024)));
+        assert!(
+            matches!(result, Err(Error::Pty(PtyError::ArgumentsTooLong { .. }))),
+            "{result:?}"
+        );
+        assert_eq!(app.session_ids(), Vec::<SessionId>::new());
+    }
+
+    #[test]
     fn dropping_the_app_closes_live_sessions_promptly() {
         let app = app();
         let started = Instant::now();
@@ -2135,6 +2231,135 @@ mod tests {
         let marker = KeyEvent::new(Key::Char('m'), Modifiers::NONE);
         assert_eq!(key(&app, id, marker), InputOutcome::Consumed);
         written_eventually(&fake, b"a\rb[31mc\rdm");
+    }
+
+    #[test]
+    fn paste_room_is_checked_on_the_raw_length() {
+        let app = app();
+        let (id, fake) = attach_fake(&app, false);
+        fake.would_block.store(true, Ordering::SeqCst);
+        let room = 1024;
+        let filler = "f".repeat(session::PENDING_INPUT_BYTES - room);
+        assert_eq!(app.paste(id, &filler).unwrap(), InputOutcome::Consumed);
+        // Sanitising would shrink this to `room` bytes, but its raw length
+        // is checked first.
+        let shrinks = "\r\n".repeat(room);
+        assert_eq!(
+            write_error_kind(&app.paste(id, &shrinks)),
+            Some(io::ErrorKind::WouldBlock)
+        );
+        assert_eq!(
+            app.check_input_room(id, room + 1)
+                .map_err(|e| e.to_string()),
+            Err(format!(
+                "failed to write to session {id}: the session's pending input is full"
+            ))
+        );
+        app.check_input_room(id, room).unwrap();
+        // A pure-control paste that fits sends nothing.
+        assert_eq!(app.paste(id, "\x1b\x07").unwrap(), InputOutcome::Ignored);
+        let text = "p".repeat(room - 1) + "\n";
+        assert_eq!(app.paste(id, &text).unwrap(), InputOutcome::Consumed);
+        app.check_input_room(id, 0).unwrap();
+        assert!(app.check_input_room(id, 1).is_err(), "the room is used up");
+        fake.would_block.store(false, Ordering::SeqCst);
+        let mut expected = filler.into_bytes();
+        expected.extend_from_slice(text.trim_end().as_bytes());
+        expected.push(b'\r');
+        written_eventually(&fake, &expected);
+        assert!(matches!(
+            app.check_input_room(SessionId::from_raw(999), 1),
+            Err(Error::SessionNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn concurrent_pastes_are_queued_whole_or_refused_whole() {
+        const PASTE: usize = 64 * 1024;
+        let app = Arc::new(app());
+        let (id, fake) = attach_fake(&app, false);
+        fake.would_block.store(true, Ordering::SeqCst);
+        // 4 x 80 pastes of 64 KiB offer 20 MiB to 16 MiB of room.
+        let pasters: Vec<_> = (0..4u8)
+            .map(|n| {
+                let app = Arc::clone(&app);
+                thread::spawn(move || {
+                    let text = String::from(char::from(b'a' + n)).repeat(PASTE);
+                    (0..80)
+                        .filter(|_| match app.paste(id, &text) {
+                            Ok(outcome) => outcome == InputOutcome::Consumed,
+                            Err(err) => {
+                                assert_eq!(
+                                    write_error_kind(&Err(err)),
+                                    Some(io::ErrorKind::WouldBlock)
+                                );
+                                false
+                            }
+                        })
+                        .count()
+                })
+            })
+            .collect();
+        let accepted: usize = pasters.into_iter().map(|t| t.join().unwrap()).sum();
+        assert_eq!(
+            accepted * PASTE,
+            session::PENDING_INPUT_BYTES,
+            "room left over"
+        );
+        fake.would_block.store(false, Ordering::SeqCst);
+        let deadline = Instant::now() + TIMEOUT;
+        while lock(&fake.written).len() < accepted * PASTE {
+            assert!(Instant::now() < deadline, "the pastes never drained");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let written = lock(&fake.written).clone();
+        assert_eq!(written.len(), accepted * PASTE);
+        for block in written.chunks(PASTE) {
+            assert!(block.iter().all(|&b| b == block[0]), "pastes interleaved");
+        }
+    }
+
+    #[test]
+    fn closing_during_pastes_is_prompt_and_refuses_the_rest() {
+        let app = Arc::new(app());
+        let (id, _fake) = attach_fake(&app, false);
+        let (started_tx, started) = mpsc::channel();
+        let paster = {
+            let app = Arc::clone(&app);
+            thread::spawn(move || {
+                let text = "p".repeat(1024 * 1024);
+                let mut sent = 0usize;
+                loop {
+                    match app.paste(id, &text) {
+                        Ok(_) => {
+                            sent += 1;
+                            let _ = started_tx.send(());
+                        }
+                        Err(Error::SessionNotFound(_)) => return sent,
+                        Err(err @ Error::Write { .. }) => {
+                            // Full, or refused because the session is closing.
+                            assert!(write_error_kind(&Err(err)).is_some());
+                            thread::yield_now();
+                        }
+                        Err(err) => panic!("unexpected error: {err}"),
+                    }
+                }
+            })
+        };
+        // Close while pastes are still being made.
+        started.recv_timeout(TIMEOUT).expect("the first paste");
+        let closing = Instant::now();
+        app.close_session(id).unwrap();
+        assert!(
+            closing.elapsed() < Duration::from_secs(2),
+            "close took {:?}",
+            closing.elapsed()
+        );
+        assert!(paster.join().unwrap() > 0);
+        assert!(matches!(
+            app.paste(id, "late"),
+            Err(Error::SessionNotFound(_))
+        ));
     }
 
     #[test]
