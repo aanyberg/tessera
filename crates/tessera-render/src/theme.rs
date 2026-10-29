@@ -172,8 +172,9 @@ impl From<Rgba> for wgpu::Color {
 ///
 /// Opacity: `background.a` below 1.0 makes cells with the default
 /// background translucent (cells with an explicit background and all
-/// glyphs stay opaque); `cursor.a` and `selection.a` are the cursor's and
-/// the selection highlight's opacity. The font fields describe the font
+/// glyphs stay opaque); `cursor.a`, `selection.a`, `search_match.a` and
+/// `search_match_current.a` are the opacity of the cursor and of the
+/// highlights. The font fields describe the font
 /// a frontend should build its [`crate::Shaper`] with; the renderer itself
 /// draws with the shaper it is given (see [`crate::Renderer::new`]).
 #[derive(Debug, Clone, PartialEq)]
@@ -190,8 +191,14 @@ pub struct Theme {
     pub background: Rgba,
     /// Cursor color.
     pub cursor: Rgba,
-    /// Selection highlight.
+    /// Selection highlight, alpha-blended over the selected cells'
+    /// backgrounds (the text keeps its colors).
     pub selection: Rgba,
+    /// Search match highlight ([`crate::OverlayKind::Match`]), blended
+    /// like the selection.
+    pub search_match: Rgba,
+    /// The current search match ([`crate::OverlayKind::CurrentMatch`]).
+    pub search_match_current: Rgba,
     /// The 16 ANSI colors.
     pub ansi: [Rgba; 16],
     /// Padding around the grid in logical pixels.
@@ -225,7 +232,9 @@ impl Theme {
 
 impl Default for Theme {
     /// Menlo 13 pt, light grey on black, the xterm 16-color palette, a
-    /// grey cursor and a translucent blue selection.
+    /// grey cursor, a translucent blue selection and Monokai-style search
+    /// highlights: `#ffd866` at alpha 0.6 for matches and `#ff9f43` at 0.8
+    /// for the current one, readable on dark and light backgrounds.
     fn default() -> Self {
         const fn hex(rgb: u32) -> [u8; 3] {
             let [_, r, g, b] = rgb.to_be_bytes();
@@ -248,6 +257,8 @@ impl Default for Theme {
             background: srgb(0x00_0000),
             cursor: srgb(0xb0_b0b0),
             selection: srgb(0x26_4f78).with_alpha(0.6),
+            search_match: srgb(0xff_d866).with_alpha(0.6),
+            search_match_current: srgb(0xff_9f43).with_alpha(0.8),
             ansi,
             padding: 4.0,
         }

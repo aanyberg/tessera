@@ -11,10 +11,10 @@
     reason = "pixel and cell counts in these tests are small and non-negative"
 )]
 
-use tessera_grid::{Cell, Color, DamageRows, GraphemeTable, Grid, Style};
+use tessera_grid::{Cell, Color, DamageRows, GraphemeTable, Grid, Point, Style};
 use tessera_render::{
-    CursorShape, CursorState, FontConfig, FrameInput, Gpu, OffscreenTarget, PhysicalSize, Renderer,
-    Shaper, Theme,
+    CursorShape, CursorState, FontConfig, FrameInput, Gpu, OffscreenTarget, Overlay, OverlayKind,
+    PhysicalSize, Renderer, Selection, Shaper, Theme,
 };
 
 const SKIP_VAR: &str = "TESSERA_SKIP_GPU_TESTS";
@@ -184,10 +184,13 @@ fn one_damaged_row_is_the_only_row_shaped_and_uploaded() {
     assert_eq!(after.rows_shaped - before.rows_shaped, 1);
     assert_eq!(after.rows_built - before.rows_built, 1);
     assert_eq!(after.relayouts, before.relayouts, "the row fits its slot");
-    // One row's three slots (at most 64 glyph slots for 30 cells, 4 + 4
-    // background and decoration) and the cursor slot.
+    // One row's four slots (at most 64 glyph slots for 30 cells, 4 + 4 + 4
+    // background, overlay and decoration) and the cursor slot.
     let uploaded = after.instances_uploaded - before.instances_uploaded;
-    assert!(uploaded <= 64 + 4 + 4 + 16, "uploaded {uploaded} instances");
+    assert!(
+        uploaded <= 64 + 4 + 4 + 4 + 16,
+        "uploaded {uploaded} instances"
+    );
 
     let mut reference = renderer_for_reference(&gpu);
     let full = target.draw(&gpu, &mut reference, &FrameInput::new(&rows));
@@ -230,8 +233,15 @@ const SAMPLES: &[&str] = &[
 
 /// The fast path (incremental frames with exact damage) agrees with the
 /// reference path (a full frame) on every step of a random edit sequence,
-/// byte for byte, including when a row grows past its slot.
+/// byte for byte, including when a row grows past its slot. The steps
+/// also change the selection (linear, block or none) and the overlays,
+/// which the caller never reports as damage: the renderer's own coverage
+/// diff must find the rows they touch.
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one random walk; its steps share the state"
+)]
 fn incremental_frames_match_full_frames() {
     let Some(gpu) = gpu() else { return };
     let (rows_n, cols) = (8u16, 40u16);
@@ -243,6 +253,8 @@ fn incremental_frames_match_full_frames() {
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     let mut cursor = CursorState::new(0, 0, CursorShape::Block);
     let mut focused = true;
+    let mut selection: Option<Selection> = None;
+    let mut overlays: Vec<Overlay> = Vec::new();
     {
         let rows = screen.rows();
         target.draw(&gpu, &mut fast, &FrameInput::new(&rows));
@@ -269,7 +281,10 @@ fn incremental_frames_match_full_frames() {
                 Style::UNDERLINE,
                 Style::INVERSE,
                 Style::HIDDEN,
-            ][rng.below(5) as usize];
+                Style::UNDERLINE | Style::CURLY_UNDERLINE | Style::OVERLINE,
+                Style::UNDERLINE | Style::DOTTED_UNDERLINE | Style::SUPERSCRIPT,
+                Style::UNDERLINE | Style::DASHED_UNDERLINE | Style::SUBSCRIPT,
+            ][rng.below(8) as usize];
             let bg = (rng.below(3) == 0).then(|| rng.below(8) as u8);
             screen.write(row, &text, style(rng.below(16) as u8, bg, flags));
         }
@@ -287,6 +302,32 @@ fn incremental_frames_match_full_frames() {
         if rng.below(5) == 0 {
             focused = !focused;
         }
+        let point = |rng: &mut Rng| {
+            Point::new(
+                rng.below(u64::from(rows_n) + 2) as u16,
+                rng.below(u64::from(cols) + 4) as u16,
+            )
+        };
+        if rng.below(2) == 0 {
+            selection = match rng.below(3) {
+                0 => None,
+                1 => Some(Selection::linear(point(&mut rng), point(&mut rng))),
+                _ => Some(Selection::block(point(&mut rng), point(&mut rng))),
+            };
+        }
+        if rng.below(2) == 0 {
+            overlays.clear();
+            for _ in 0..rng.below(4) {
+                let at = point(&mut rng);
+                let kind = [
+                    OverlayKind::Match,
+                    OverlayKind::CurrentMatch,
+                    OverlayKind::Underline,
+                ][rng.below(3) as usize];
+                let len = rng.below(12) as u16;
+                overlays.push(Overlay::new(kind, at.row, at.col..at.col + len));
+            }
+        }
         // The grid's own damage: a write that wraps or scrolls reaches
         // past the edited rows.
         let damage = screen.grid.take_damage().rows;
@@ -301,7 +342,9 @@ fn incremental_frames_match_full_frames() {
         let frame = FrameInput::new(&rows)
             .with_clusters(&clusters)
             .with_cursor(Some(cursor))
-            .with_focus(focused);
+            .with_focus(focused)
+            .with_selection(selection)
+            .with_overlays(&overlays);
         let incremental = target.draw(&gpu, &mut fast, &frame.clone().with_damage(damage.clone()));
         let full = target.draw(&gpu, &mut reference, &frame);
         if incremental != full {
@@ -320,7 +363,8 @@ fn incremental_frames_match_full_frames() {
             }
             panic!(
                 "step {step}: incremental frame differs from the full frame in cells {cells:?} \
-                 (damage {damage:?}, cursor {cursor:?})\n{:?}",
+                 (damage {damage:?}, cursor {cursor:?}, selection {selection:?}, overlays \
+                 {overlays:?})\n{:?}",
                 screen
                     .grid
                     .visible_lines()
@@ -331,6 +375,11 @@ fn incremental_frames_match_full_frames() {
         }
     }
     assert!(partial > 20, "most steps were partial: {partial}");
+    assert!(
+        fast.stats().overlay_rows_built > 10,
+        "highlights changed on their own: {:?}",
+        fast.stats()
+    );
     // Exactly the damaged rows were shaped (no fallback is pending for
     // these characters).
     assert_eq!(fast.stats().rows_shaped, damaged_rows);

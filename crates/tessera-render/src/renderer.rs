@@ -1,18 +1,21 @@
 //! The grid renderer: shapes a [`FrameInput`], fills the glyph atlas and
-//! draws the four passes into any render target, re-shaping and
-//! re-uploading only the rows the frame's damage names (ADR 0016).
+//! draws the five passes into any render target, re-shaping and
+//! re-uploading only the rows the frame's damage names (ADR 0016), and
+//! re-building the highlights of only the rows whose selection or overlay
+//! coverage changed.
 
 use std::num::NonZeroU64;
 
 use tessera_grid::{Cell, DamageRows, GraphemeTable, Style};
 
 use crate::atlas::{AtlasStats, DEFAULT_ATLAS_SIZE, GlyphAtlas};
-use crate::damage::{self, ROW_PASSES, Row, Slots};
+use crate::damage::{self, OVERLAY_PASS, ROW_PASSES, Row, Slots};
 use crate::error::RenderError;
 use crate::frame::FrameInput;
 use crate::gpu::Gpu;
 use crate::palette::Palette;
 use crate::passes::glyph::GlyphSource;
+use crate::passes::overlay::{self, Span};
 use crate::passes::{self, Instance, Layout, PassRanges};
 use crate::shaping::{CellMetrics, Shaper};
 use crate::size::PhysicalSize;
@@ -37,11 +40,14 @@ const INSTANCE_SIZE: u64 = std::mem::size_of::<Instance>() as u64;
 /// share it.
 ///
 /// Each frame clears the target to [`Theme::background`] and draws the
-/// background, glyph, decoration and cursor passes in that order, from
-/// one instance buffer (ADR 0010). Rows keep their shaped glyphs and
-/// instances between frames: only the rows in [`FrameInput::damage`] are
-/// shaped and uploaded again, plus every row when the layout, theme, font
-/// size or atlas contents changed under them (ADR 0016).
+/// background, overlay (selection and search highlights), glyph,
+/// decoration and cursor passes in that order, from one instance buffer
+/// (ADR 0010). Rows keep their shaped glyphs and instances between
+/// frames: only the rows in [`FrameInput::damage`] are shaped and
+/// uploaded again, plus every row when the layout, theme, font size or
+/// atlas contents changed under them (ADR 0016). A row whose selection or
+/// overlay coverage differs from the previous frame's rebuilds and
+/// uploads its overlay instances only, without damage from the caller.
 #[derive(Debug)]
 pub struct Renderer {
     shaper: Shaper,
@@ -78,6 +84,17 @@ pub struct Renderer {
     cursor: Vec<Instance>,
     /// A row copy with `HIDDEN` cells blanked, for shaping.
     shaping_row: Vec<Cell>,
+    /// The frame's overlays grouped by row (indices into
+    /// [`FrameInput::overlays`]), reused from frame to frame.
+    overlay_rows: Vec<Vec<usize>>,
+    /// A row's coverage this frame, compared with [`Row::spans`].
+    spans: Vec<Span>,
+    /// The rows whose coverage changed, reused from frame to frame.
+    changed_rows: Vec<bool>,
+    /// Whether any row was built with a selection or overlay span, so a
+    /// frame without either can skip the coverage comparison when the
+    /// previous one had none too.
+    covered: bool,
     /// The target size the globals buffer holds, so an unchanged size is
     /// not uploaded again.
     globals_size: Option<PhysicalSize>,
@@ -110,6 +127,10 @@ pub struct RenderStats {
     /// Rows whose instances were rebuilt (shaped rows, plus every row when
     /// the atlas moved glyphs under them).
     pub rows_built: u64,
+    /// Rows whose overlay instances alone were rebuilt because their
+    /// selection or overlay coverage changed (rows also counted in
+    /// [`Self::rows_built`] are not counted here).
+    pub overlay_rows_built: u64,
     /// Instances written to the GPU buffer.
     pub instances_uploaded: u64,
     /// Times the instance buffer was laid out again (and uploaded whole).
@@ -148,33 +169,10 @@ impl Renderer {
                 label: Some("tessera.quad"),
                 source: wgpu::ShaderSource::Wgsl(include_str!("shaders/quad.wgsl").into()),
             });
-            let texture_entry = |binding| wgpu::BindGroupLayoutEntry {
-                binding,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            };
             let bind_group_layout =
                 device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("tessera.quad"),
-                    entries: &[
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::VERTEX,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: NonZeroU64::new(GLOBALS_SIZE),
-                            },
-                            count: None,
-                        },
-                        texture_entry(1),
-                        texture_entry(2),
-                    ],
+                    entries: &bind_group_layout_entries(),
                 });
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("tessera.quad"),
@@ -231,6 +229,10 @@ impl Renderer {
                 mirror: Vec::new(),
                 cursor: Vec::new(),
                 shaping_row: Vec::new(),
+                overlay_rows: Vec::new(),
+                spans: Vec::new(),
+                changed_rows: Vec::new(),
+                covered: false,
                 globals_size: None,
                 stats: RenderStats::default(),
                 #[cfg(test)]
@@ -304,7 +306,7 @@ impl Renderer {
     /// Draws `frame` into `view`, a `size`-pixel texture of `format`.
     ///
     /// Clears the whole view to [`Theme::background`], then draws the
-    /// background, glyph, decoration and cursor passes. Colors are linear;
+    /// background, overlay, glyph, decoration and cursor passes. Colors are linear;
     /// an sRGB `format` encodes them on write, a linear one stores them as
     /// they are (as [`Gpu::clear_view`] does). An empty `size` draws
     /// nothing.
@@ -313,9 +315,10 @@ impl Renderer {
     /// again; the others are drawn from what the previous frame built, so
     /// they must not have changed since. Every row is rebuilt after a
     /// change of layout (target size, font size, padding), theme or row
-    /// count, a failed frame, or [`DamageRows::All`]. The cursor, focus and
-    /// clear color need no damage. A row showing a `.notdef` glyph is
-    /// shaped again once the fallback font index is ready.
+    /// count, a failed frame, or [`DamageRows::All`]. The cursor, focus,
+    /// clear color, selection and overlays need no damage: a row whose
+    /// highlights changed rebuilds them alone. A row showing a `.notdef`
+    /// glyph is shaped again once the fallback font index is ready.
     ///
     /// When the atlas runs out of room mid-frame it is reset once and the
     /// frame rebuilt ([`crate::GlyphAtlas::recover_from_full`]).
@@ -411,10 +414,13 @@ impl Renderer {
         } else {
             vec![true; key.rows]
         };
+        // Rows whose selection or overlay coverage changed rebuild their
+        // overlay instances, damaged or not.
+        let highlights = self.update_coverage(frame, key.rows, cols);
         let mut recovered = false;
         loop {
             let before = self.atlas_counters();
-            match self.build(gpu, layout, frame, &build) {
+            match self.build(gpu, layout, frame, &build, highlights) {
                 Err(RenderError::AtlasFull(layer)) if !recovered => {
                     self.atlas.recover_from_full(gpu, layer)?;
                     recovered = true;
@@ -435,9 +441,60 @@ impl Renderer {
             }
         }
         self.atlas_seen = self.atlas_counters();
-        let ranges = self.upload(gpu, &build)?;
+        let ranges = self.upload(gpu, &build, highlights)?;
         self.built = Some(key);
         Ok(ranges)
+    }
+
+    /// Computes every row's selection and overlay coverage and stores it in
+    /// [`Row::spans`], and which rows' coverage changed since the last
+    /// frame in [`Self::changed_rows`]. Returns `false`, touching nothing,
+    /// when neither frame has any highlight (the common case, which then
+    /// costs nothing per row).
+    fn update_coverage(&mut self, frame: &FrameInput<'_>, rows: usize, cols: usize) -> bool {
+        let any = frame.selection.is_some() || !frame.overlays.is_empty();
+        if !any && !self.covered {
+            return false;
+        }
+        if frame.overlays.is_empty() {
+            // Nothing to group: drop the buckets of an earlier flood.
+            self.overlay_rows = Vec::new();
+        } else {
+            overlay::bucket(&mut self.overlay_rows, frame, rows);
+            self.overlay_rows.iter_mut().for_each(trim);
+        }
+        let changed = &mut self.changed_rows;
+        changed.clear();
+        changed.resize(rows, false);
+        let mut covered = false;
+        for (r, row) in self.rows.iter_mut().enumerate() {
+            self.spans.clear();
+            if any {
+                let on_row = self
+                    .overlay_rows
+                    .get(r)
+                    .into_iter()
+                    .flatten()
+                    .map(|&i| &frame.overlays[i]);
+                let index = u16::try_from(r).unwrap_or(u16::MAX);
+                overlay::row_spans(
+                    &mut self.spans,
+                    frame.selection.as_ref(),
+                    on_row,
+                    (index, frame.rows[r]),
+                    cols,
+                );
+            }
+            if self.spans != row.spans {
+                std::mem::swap(&mut self.spans, &mut row.spans);
+                trim(&mut row.spans);
+                changed[r] = true;
+            }
+            covered |= !row.spans.is_empty();
+        }
+        trim(&mut self.spans);
+        self.covered = covered;
+        true
     }
 
     /// The atlas counters that change when a slot handed out earlier may
@@ -463,16 +520,24 @@ impl Renderer {
         let row = &mut self.rows[r];
         // Hidden cells are shaped as blanks, so no ligature reaches
         // across a hidden boundary (a hidden `>` must not turn a visible
-        // `=` into an arrow).
-        if cells.iter().any(|c| c.style.has(Style::HIDDEN)) {
+        // `=` into an arrow). So is a wide character in the last visible
+        // column: its right half is past the edge, and its glyph would
+        // draw into the padding.
+        let cut_wide = cells.last().is_some_and(Cell::is_wide);
+        if cut_wide || cells.iter().any(|c| c.style.has(Style::HIDDEN)) {
+            let last = cells.len() - 1;
             self.shaping_row.clear();
-            self.shaping_row.extend(cells.iter().map(|c| {
-                let mut cell = *c;
-                if cell.style.has(Style::HIDDEN) {
-                    cell.ch = ' ';
-                }
-                cell
-            }));
+            self.shaping_row
+                .extend(cells.iter().enumerate().map(|(c, cell)| {
+                    if cut_wide && c == last {
+                        return Cell::new(' ', cell.style);
+                    }
+                    let mut cell = *cell;
+                    if cell.style.has(Style::HIDDEN) {
+                        cell.ch = ' ';
+                    }
+                    cell
+                }));
             self.shaper
                 .shape_line_into(&self.shaping_row, clusters, &mut row.shaped);
         } else {
@@ -488,7 +553,9 @@ impl Renderer {
         self.stats.rows_shaped += 1;
     }
 
-    /// Rebuilds the instances of the rows flagged in `build`, and the
+    /// Rebuilds the instances of the rows flagged in `build` and the
+    /// overlay instances of the rows whose coverage changed (when
+    /// `highlights`, see [`Self::update_coverage`]), and the
     /// cursor's.
     fn build(
         &mut self,
@@ -496,6 +563,7 @@ impl Renderer {
         layout: &Layout,
         frame: &FrameInput<'_>,
         build: &[bool],
+        highlights: bool,
     ) -> Result<(), RenderError> {
         let palette = &self.palette;
         let mut source = GlyphSource {
@@ -504,11 +572,24 @@ impl Renderer {
             gpu,
         };
         for (r, row) in self.rows.iter_mut().enumerate() {
-            if !build[r] {
+            let full = build[r];
+            let changed = highlights && self.changed_rows[r];
+            if !full && !changed {
                 continue;
             }
             let cells = &frame.rows[r][..row.len];
-            let [bg, glyphs, deco] = &mut row.passes;
+            let [bg, over, glyphs, deco] = &mut row.passes;
+            over.clear();
+            if !row.spans.is_empty() {
+                // Highlights cover the visible columns, also past the
+                // row's last cell.
+                let cells = &frame.rows[r];
+                overlay::push_row(over, layout, (palette, &self.theme), r, cells, &row.spans);
+            }
+            if !full {
+                self.stats.overlay_rows_built += 1;
+                continue;
+            }
             bg.clear();
             glyphs.clear();
             deco.clear();
@@ -532,7 +613,10 @@ impl Renderer {
             palette,
             self.theme.cursor,
             frame,
-            |r| rows.get(r).map(|row| row.shaped.as_slice()),
+            |r| {
+                rows.get(r)
+                    .map(|row| (row.shaped.as_slice(), row.spans.as_slice()))
+            },
             &mut source,
         )
     }
@@ -540,7 +624,12 @@ impl Renderer {
     /// Writes the rebuilt rows and the cursor into the instance buffer, or
     /// lays the buffer out again and writes all of it when a row outgrew
     /// its slot, and returns the pass ranges to draw.
-    fn upload(&mut self, gpu: &Gpu, built: &[bool]) -> Result<PassRanges, RenderError> {
+    fn upload(
+        &mut self,
+        gpu: &Gpu,
+        built: &[bool],
+        highlights: bool,
+    ) -> Result<PassRanges, RenderError> {
         let relayout = !self.slots.fits(&self.rows, self.cursor.len())
             || self.mirror.len() != usize::try_from(self.slots.total()).unwrap_or(usize::MAX);
         if relayout {
@@ -570,7 +659,8 @@ impl Renderer {
         let mut spans: Vec<std::ops::Range<u32>> = Vec::new();
         for p in 0..ROW_PASSES {
             for (r, row) in self.rows.iter().enumerate() {
-                if !relayout && !built[r] {
+                let rebuilt = built[r] || (p == OVERLAY_PASS && highlights && self.changed_rows[r]);
+                if !relayout && !rebuilt {
                     continue;
                 }
                 let slot = self.slots.row(p, r);
@@ -614,8 +704,9 @@ impl Renderer {
             .sum::<u64>();
         Ok(PassRanges {
             background: self.slots.section(0),
-            glyph: self.slots.section(1),
-            decoration: self.slots.section(2),
+            overlay: self.slots.section(OVERLAY_PASS),
+            glyph: self.slots.section(2),
+            decoration: self.slots.section(3),
             cursor: self.slots.cursor(),
         })
     }
@@ -776,9 +867,51 @@ fn grow_buffer<B>(
     Ok(())
 }
 
+/// Gives back most of `v`'s capacity when a flood once grew it far past
+/// what it holds now, so a frame with a few overlays does not keep the
+/// memory of one with millions. Shrinks only when the capacity is over four
+/// times the need, so a size that changes a little from frame to frame
+/// does not reallocate every frame.
+fn trim<T>(v: &mut Vec<T>) {
+    let need = v.len().max(8);
+    if v.capacity() > 4 * need {
+        v.shrink_to(2 * need);
+    }
+}
+
 /// True when `damage` covers row `r`.
 fn damaged(damage: &DamageRows, r: usize) -> bool {
     u16::try_from(r).map_or(true, |r| damage.contains(r))
+}
+
+/// The quad shader's bindings: the globals and the two atlas layers.
+fn bind_group_layout_entries() -> [wgpu::BindGroupLayoutEntry; 3] {
+    let texture_entry = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            // Read with `textureLoad` only, also for the scaled glyphs,
+            // which the shader filters itself.
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    };
+    [
+        wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: NonZeroU64::new(GLOBALS_SIZE),
+            },
+            count: None,
+        },
+        texture_entry(1),
+        texture_entry(2),
+    ]
 }
 
 /// A vertex buffer for `capacity` instances.
@@ -962,7 +1095,7 @@ mod tests {
             .render(&gpu, &mut renderer, &FrameInput::new(&a))
             .expect("frame");
         let pointers: Vec<_> = renderer.rows.iter().map(|r| r.shaped.as_ptr()).collect();
-        let instances: Vec<_> = renderer.rows.iter().map(|r| r.passes[1].as_ptr()).collect();
+        let instances: Vec<_> = renderer.rows.iter().map(|r| r.passes[2].as_ptr()).collect();
         let b = frame(&rows_b);
         target
             .render(&gpu, &mut renderer, &FrameInput::new(&b))
@@ -970,7 +1103,7 @@ mod tests {
         assert_eq!(renderer.stats().rows_shaped, 4);
         let after: Vec<_> = renderer.rows.iter().map(|r| r.shaped.as_ptr()).collect();
         assert_eq!(pointers, after, "shaped vectors reused");
-        let after: Vec<_> = renderer.rows.iter().map(|r| r.passes[1].as_ptr()).collect();
+        let after: Vec<_> = renderer.rows.iter().map(|r| r.passes[2].as_ptr()).collect();
         assert_eq!(instances, after, "instance vectors reused");
     }
 
@@ -1016,5 +1149,137 @@ mod tests {
             .expect("reference");
         let expected = target.read_back(&gpu).expect("readback");
         assert!(drawn == expected, "the cursor moved on screen too");
+    }
+
+    /// M1 (#22 review): 800 full-width overlays per row (link underlines
+    /// and matches) over cells whose foreground alternates, plus a
+    /// full-screen selection, at 24x80 and 60x200. Every row's overlay
+    /// instances stay within twice its width (the union of each mark, one
+    /// underline bar per cell), the frame renders instead of failing with
+    /// `FrameTooLarge`, and it takes seconds at most even in a debug build.
+    #[test]
+    fn an_overlay_flood_is_bounded_by_the_screen() {
+        let Some((gpu, mut renderer, _)) = small_frame_renderer() else {
+            return;
+        };
+        for (rows, cols) in [(24u16, 80u16), (60, 200)] {
+            let m = renderer.cell_metrics();
+            let size = PhysicalSize::new(
+                u32::from(cols) * m.width_px + 16,
+                u32::from(rows) * m.height_px + 16,
+            );
+            let target = crate::OffscreenTarget::new(&gpu, size, wgpu::TextureFormat::Rgba8Unorm);
+            let line: Vec<Cell> = (0..cols)
+                .map(|c| {
+                    let fg = tessera_grid::Color::Indexed(u8::try_from(c % 2).unwrap_or(0));
+                    Cell::new(
+                        'a',
+                        Style {
+                            fg,
+                            ..Style::DEFAULT
+                        },
+                    )
+                })
+                .collect();
+            let lines = vec![line; usize::from(rows)];
+            let cells = frame(&lines);
+            let kinds = [
+                crate::OverlayKind::Underline,
+                crate::OverlayKind::Match,
+                crate::OverlayKind::CurrentMatch,
+                crate::OverlayKind::Underline,
+            ];
+            let overlays: Vec<crate::Overlay> = (0..rows)
+                .flat_map(|r| {
+                    (0..800usize).map(move |i| {
+                        let start = u16::try_from(i % 3).unwrap_or(0);
+                        crate::Overlay::new(kinds[i % 4], r, start..cols)
+                    })
+                })
+                .collect();
+            let selection = crate::Selection::linear(
+                tessera_grid::Point::new(0, 0),
+                tessera_grid::Point::new(rows - 1, cols - 1),
+            );
+            let input = FrameInput::new(&cells)
+                .with_overlays(&overlays)
+                .with_selection(Some(selection));
+            let start = std::time::Instant::now();
+            target
+                .render(&gpu, &mut renderer, &input)
+                .expect("the flood renders");
+            let elapsed = start.elapsed();
+            let widest = renderer
+                .rows
+                .iter()
+                .map(|row| row.passes[OVERLAY_PASS].len())
+                .max()
+                .unwrap_or(0);
+            let cols = usize::from(cols);
+            assert!(
+                widest <= 2 * cols + 3,
+                "{rows}x{cols}: {widest} overlay instances in one row"
+            );
+            assert!(widest >= cols, "{rows}x{cols}: every cell underlined");
+            assert!(
+                elapsed < std::time::Duration::from_secs(10),
+                "{rows}x{cols}: {elapsed:?}"
+            );
+        }
+    }
+
+    /// After a flood of overlays the renderer does not keep its memory:
+    /// the next frame with few or no overlays gives the buckets and span
+    /// vectors back, and the per-frame vector of changed rows is reused
+    /// (#22 review).
+    #[test]
+    fn a_flood_does_not_keep_its_memory() {
+        let Some((gpu, mut renderer, target)) = small_frame_renderer() else {
+            return;
+        };
+        let rows = [
+            text_row("first row"),
+            text_row("second row"),
+            text_row("third"),
+        ];
+        let cells = frame(&rows);
+        let flood: Vec<crate::Overlay> = (0..30_000u16)
+            .map(|i| crate::Overlay::new(crate::OverlayKind::Match, i % 3, (i % 7)..(i % 7) + 2))
+            .collect();
+        let draw = |renderer: &mut Renderer, overlays: &[crate::Overlay]| {
+            target
+                .render(
+                    &gpu,
+                    renderer,
+                    &FrameInput::new(&cells).with_overlays(overlays),
+                )
+                .expect("frame");
+        };
+        draw(&mut renderer, &flood);
+        assert!(renderer.overlay_rows.iter().any(|b| b.capacity() >= 10_000));
+        let changed = renderer.changed_rows.as_ptr();
+        let few = [crate::Overlay::new(crate::OverlayKind::Match, 1, 0..3)];
+        draw(&mut renderer, &few);
+        assert_eq!(renderer.changed_rows.as_ptr(), changed, "reused");
+        let widest = |r: &Renderer| {
+            r.overlay_rows
+                .iter()
+                .map(Vec::capacity)
+                .chain(r.rows.iter().map(|row| row.spans.capacity()))
+                .chain([r.spans.capacity()])
+                .max()
+                .unwrap_or(0)
+        };
+        assert!(
+            widest(&renderer) <= 32,
+            "capacity kept: {}",
+            widest(&renderer)
+        );
+        draw(&mut renderer, &[]);
+        assert_eq!(
+            renderer.overlay_rows.capacity(),
+            0,
+            "no overlays, no buckets"
+        );
     }
 }

@@ -137,6 +137,8 @@ pub fn import_itermcolors(bytes: &[u8], name: &str) -> Result<Theme, ImportError
         background,
         cursor,
         selection,
+        search_match: None,
+        search_match_current: None,
         ansi,
     })
 }
@@ -588,6 +590,8 @@ pub fn import_base16(text: &str, default_name: &str) -> Result<Theme, ImportErro
         background: base[0x0],
         cursor: base[0x5],
         selection: base[0x2],
+        search_match: None,
+        search_match_current: None,
         ansi: BASE16_ANSI.map(|i| base[i]),
     })
 }

@@ -1,28 +1,36 @@
 //! What the renderer keeps between frames so a damaged frame re-shapes and
 //! re-uploads only its damaged rows (ADR 0016).
 //!
-//! Every visible row keeps its shaped glyphs and the instances of its
-//! background, glyph and decoration quads. On the GPU the instance buffer
-//! is laid out as three sections (one per pass, in draw order) of one slot
-//! per row, then a slot for the cursor:
+//! Every visible row keeps its shaped glyphs, its selection and overlay
+//! coverage, and the instances of its background, overlay, glyph and
+//! decoration quads. On the GPU the instance buffer is laid out as four
+//! sections (one per pass, in draw order) of one slot per row, then a slot
+//! for the cursor:
 //!
 //! ```text
-//! [ bg row 0 | bg row 1 | ... ][ glyph row 0 | ... ][ deco row 0 | ... ][ cursor ]
+//! [ bg row 0 | ... ][ overlay row 0 | ... ][ glyph row 0 | ... ][ deco row 0 | ... ][ cursor ]
 //! ```
 //!
 //! A slot holds its row's instances followed by empty ones (zero-sized
 //! quads that rasterise nothing), so each pass is still one draw over its
 //! section and the passes keep their order. A damaged row rewrites its
-//! slots and only those bytes are uploaded; a row that outgrows a slot
-//! makes the renderer lay the buffer out again and upload all of it.
+//! slots and only those bytes are uploaded; a row whose selection or
+//! overlay coverage changed rewrites only its overlay slot; a row that
+//! outgrows a slot makes the renderer lay the buffer out again and upload
+//! all of it.
 
 use std::ops::Range;
 
 use crate::passes::Instance;
+use crate::passes::overlay::Span;
 use crate::shaping::ShapedGlyph;
 
-/// The three per-row passes, in draw order.
-pub(crate) const ROW_PASSES: usize = 3;
+/// The four per-row passes, in draw order: background, overlay, glyph,
+/// decoration.
+pub(crate) const ROW_PASSES: usize = 4;
+
+/// Index of the overlay pass in [`Row::passes`].
+pub(crate) const OVERLAY_PASS: usize = 1;
 
 /// An instance that draws nothing: a zero-sized solid quad.
 pub(crate) const EMPTY: Instance = Instance {
@@ -31,7 +39,7 @@ pub(crate) const EMPTY: Instance = Instance {
     color: [0.0; 4],
     texel: [0.0; 2],
     kind: 0,
-    pad: 0,
+    extra: 0.0,
 };
 
 /// One row's cached work.
@@ -39,8 +47,12 @@ pub(crate) const EMPTY: Instance = Instance {
 pub(crate) struct Row {
     /// The shaped glyphs; the vector is reused from frame to frame.
     pub shaped: Vec<ShapedGlyph>,
-    /// Instances of the background, glyph and decoration passes.
+    /// Instances of the background, overlay, glyph and decoration passes.
     pub passes: [Vec<Instance>; ROW_PASSES],
+    /// The selection and overlay coverage the overlay instances were built
+    /// for, compared with the next frame's to find rows whose highlights
+    /// changed without damage.
+    pub spans: Vec<Span>,
     /// Cells in the row when it was shaped.
     pub len: usize,
     /// The row drew a `.notdef` glyph while the fallback index was still
@@ -76,7 +88,7 @@ impl Slots {
             next = next.saturating_add(u32::try_from(len).unwrap_or(u32::MAX));
             start..next
         };
-        let mins = [4, 32, 4];
+        let mins = [4, 4, 32, 4];
         let rows = std::array::from_fn(|pass| {
             counts
                 .iter()
@@ -167,34 +179,43 @@ pub(crate) fn slot_holds(mirror: &[Instance], slot: Range<u32>, instances: &[Ins
 mod tests {
     use super::*;
 
-    fn row(bg: usize, glyph: usize, deco: usize) -> Row {
+    fn row(bg: usize, overlay: usize, glyph: usize, deco: usize) -> Row {
         Row {
-            passes: [vec![EMPTY; bg], vec![EMPTY; glyph], vec![EMPTY; deco]],
+            passes: [
+                vec![EMPTY; bg],
+                vec![EMPTY; overlay],
+                vec![EMPTY; glyph],
+                vec![EMPTY; deco],
+            ],
             ..Row::default()
         }
     }
 
     #[test]
     fn sections_are_consecutive_and_in_pass_order() {
-        let slots = Slots::new(&[[1, 40, 0], [0, 3, 5]], 2, true);
+        let slots = Slots::new(&[[1, 0, 40, 0], [0, 6, 3, 5]], 2, true);
         assert_eq!(slots.row(0, 0), 0..4);
         assert_eq!(slots.row(0, 1), 4..8);
         assert_eq!(slots.section(0), 0..8);
-        assert_eq!(slots.row(1, 0), 8..72, "40 glyphs round up to 64");
-        assert_eq!(slots.row(1, 1), 72..104, "at least 32 glyph slots");
-        assert_eq!(slots.section(2), 104..116);
-        assert_eq!(slots.cursor(), 116..132);
-        assert_eq!(slots.total(), 132);
+        assert_eq!(slots.row(1, 0), 8..12, "at least 4 overlay slots");
+        assert_eq!(slots.row(1, 1), 12..20, "6 overlays round up to 8");
+        assert_eq!(slots.section(1), 8..20);
+        assert_eq!(slots.row(2, 0), 20..84, "40 glyphs round up to 64");
+        assert_eq!(slots.row(2, 1), 84..116, "at least 32 glyph slots");
+        assert_eq!(slots.section(3), 116..128);
+        assert_eq!(slots.cursor(), 128..144);
+        assert_eq!(slots.total(), 144);
     }
 
     #[test]
     fn exact_slots_have_no_headroom() {
-        let slots = Slots::new(&[[1, 40, 0], [0, 3, 5]], 2, false);
-        assert_eq!(slots.total(), 1 + 40 + 3 + 5 + 2);
-        assert!(slots.fits(&[row(1, 40, 0), row(0, 3, 5)], 2));
-        assert!(!slots.fits(&[row(1, 41, 0), row(0, 3, 5)], 2));
-        assert!(!slots.fits(&[row(1, 40, 0), row(0, 3, 5)], 3));
-        assert!(!slots.fits(&[row(1, 40, 0)], 2), "row count changed");
+        let slots = Slots::new(&[[1, 0, 40, 0], [0, 2, 3, 5]], 2, false);
+        assert_eq!(slots.total(), 1 + 40 + 2 + 3 + 5 + 2);
+        assert!(slots.fits(&[row(1, 0, 40, 0), row(0, 2, 3, 5)], 2));
+        assert!(!slots.fits(&[row(1, 0, 41, 0), row(0, 2, 3, 5)], 2));
+        assert!(!slots.fits(&[row(1, 1, 40, 0), row(0, 2, 3, 5)], 2));
+        assert!(!slots.fits(&[row(1, 0, 40, 0), row(0, 2, 3, 5)], 3));
+        assert!(!slots.fits(&[row(1, 0, 40, 0)], 2), "row count changed");
     }
 
     #[test]

@@ -1,6 +1,8 @@
 # ADR 0010: Render passes, frame input and the atlas-full policy
 
-**Status:** accepted · 2026-10-27
+**Status:** accepted · 2026-10-27 · amended 2026-10-29 (#22: overlay
+pass, selection and overlays, underline styles, overline, superscript and
+subscript, cursor redraw rules; see "Amendment: #22" at the end)
 
 ## Context
 
@@ -31,8 +33,8 @@ on the `macos-15` CI runner, whose macOS differs from developers'.
 pub struct FrameInput<'a> {
     pub rows: &'a [&'a [Cell]],
     pub cursor: Option<CursorState>,       // row, col, shape, visible
-    pub selection: Option<Selection>,      // start, end (data only, #22 draws it)
-    pub overlays: &'a [Overlay],           // uninhabited until #22
+    pub selection: Option<Selection>,      // start, end, kind (linear or block)
+    pub overlays: &'a [Overlay],           // search matches, link underlines
     pub focused: bool,
 }
 ```
@@ -47,31 +49,35 @@ methods, so #21 and #22 can add fields without breaking callers.
 The cursor's blink phase belongs to the host: it flips
 `CursorState::visible` on its own clock; the renderer has none.
 `CursorShape` is `Block`, `Beam`, `Underline` and `HollowBlock`; an
-unfocused frame draws every shape as `HollowBlock`. The cursor spans one
-column in this release; two-column cursors on wide cells come with #22,
-once #4's `Cell::is_wide()` is in.
+unfocused frame draws every shape as `HollowBlock`. On either half of a
+wide character the cursor spans both columns (#22); the renderer reads
+that from the cells, so `CursorState` has no width field.
 
-### Four passes, one instance buffer, one pipeline
+### Five passes, one instance buffer, one pipeline
 
-Each frame clears the target to `Theme::background` and draws, in order:
+Each frame clears the target to `Theme::background` and draws, in order
+(the overlay pass was added by #22, see the amendment):
 
 1. **background**: one quad per horizontal run of cells whose background
    differs from the cleared target (an explicit background, or any cell
    with inverse video);
-2. **glyph**: one quad per `ShapedGlyph`, at
+2. **overlay**: the selection, then search matches and link underlines,
+   alpha-blended over the backgrounds;
+3. **glyph**: one quad per `ShapedGlyph`, at
    `cell origin + whole-pixel x offset + bitmap bearing`, tinted with the
    owning cell's foreground (coverage layer) or drawn as is (colour
    layer). `HIDDEN` cells draw no glyph and are shaped as blanks, so no
    ligature reaches across a hidden boundary (a hidden `>` must not turn
    a visible `=` into an arrow); bold and italic were already chosen by
    the shaper;
-3. **decoration**: underline, double underline and strikethrough bars, one
-   quad per bar per run of cells with the same decorations and color;
-   hidden cells draw none;
-4. **cursor**: block (the cursor color over the cell, then the glyphs
-   covering the cell redrawn in the cell's background color, clipped to
-   the cell), beam (a stroke at the left edge), underline (a stroke at the
-   bottom), hollow block (four strokes). Strokes are one pixel per unit of
+4. **decoration**: underlines in five styles, overline and strikethrough,
+   one quad per bar per run of cells with the same decorations and
+   colors; hidden cells draw none;
+5. **cursor**: block (the cursor color over the cursor's cells, then the
+   glyphs reaching into them and the cell's decorations redrawn in the
+   cell's background color, clipped to the cursor's cells), beam (a
+   stroke at the left edge), underline (a stroke at the bottom), hollow
+   block (four strokes). Strokes are one pixel per unit of
    backing scale. The redrawn glyph is scaled by the cursor color's alpha
    like the block itself, so a cursor with alpha 0 draws exactly nothing
    and an opaque one exactly inverts the cell. In between it only
@@ -98,15 +104,21 @@ never leaves the renderer unusable. The instance is
 | 16 | `clip: [f32; 4]` | x0, y0, x1, y1; fragments outside are discarded |
 | 32 | `color: [f32; 4]` | linear, premultiplied RGBA |
 | 48 | `texel: [f32; 2]` | atlas texel of the rect's top-left (glyphs) |
-| 56 | `kind: u32` | 0 solid, 1 coverage glyph, 2 colour glyph |
-| 60 | padding | |
+| 56 | `kind: u32` | 0 solid, 1 coverage glyph, 2 colour glyph, 3 dashes, 4 wave (#22) |
+| 60 | `extra: f32` | glyphs: atlas texels per pixel, 1 at their own size, more for superscript and subscript; dashes and waves: the x their pattern's phase starts at, the grid's left edge (#22) |
 
 One WGSL shader (`shaders/quad.wgsl`) expands a triangle strip per
 instance and branches on `kind`. Glyphs sit on whole pixels and map one
 texel to one pixel, so the atlas is read with `textureLoad` (exact, no
-sampler, no filtering at glyph edges). The clip rectangle exists for the
-block cursor's redrawn glyph, which must not spill out of the cell when it
-is a ligature or a wide character; everything else is unclipped. A single
+filtering at glyph edges); the smaller superscript and subscript glyphs
+are filtered bilinearly by the shader itself, from four loads (#22). No
+sampler is bound. The clip rectangle exists for the
+block cursor's redraw, which must not spill out of the cursor's one or
+two cells when the glyph is a ligature reaching into a neighbour or has
+ink beyond its cell; everything else is unclipped. The clip is exactly
+the cursor's cells: a test fails when it is removed (a ligature's redraw
+paints its other cell) or shrunk by one pixel (a full block `█` under
+the cursor leaves cursor-coloured columns). A single
 pipeline (one per target format, created on first use) keeps the passes'
 order a matter of draw order.
 
@@ -152,8 +164,9 @@ show the branch matters, the passes are already separate ranges.
   every default-background cell and the padding, translucent. Cells with
   an explicit or inverse background are opaque, and glyphs and
   decorations always are, so text stays solid on a translucent window.
-  `Theme::cursor.a` is the cursor's opacity; `Theme::selection.a` will be
-  the selection's (#22). Only the default background carries the theme's
+  `Theme::cursor.a` is the cursor's opacity; `Theme::selection.a`,
+  `Theme::search_match.a` and `Theme::search_match_current.a` are the
+  highlights' (#22). Only the default background carries the theme's
   alpha: `Color::Default` in the foreground slot resolves opaque.
 
 ### Decoration geometry from the cell
@@ -167,6 +180,8 @@ bars one thickness apart, centred the same way; the strikethrough is
 centred 30% of the baseline height above the baseline, about half a
 monospaced face's x-height. Every bar stays inside its row. Using the
 face's own metrics is a later refinement that needs a `font.rs` accessor.
+#22 adds the curly, dotted and dashed underlines and the overline from
+the same geometry (see the amendment).
 
 ### Atlas-full policy: one reset per frame
 
@@ -232,7 +247,7 @@ Menlo combining-mark test), ignoring the cursor's alpha in the redraw and
 dropping the instance limit, makes at least one test fail.
 
 `TESSERA_UPDATE_GOLDENS=1` rewrites the goldens; `TESSERA_SKIP_GPU_TESTS=1`
-skips them like the other GPU suites. The images are about 130 KB in
+skips them like the other GPU suites. The images are about 230 KB in
 total. If CI ever disagrees beyond the tolerance, the accepted fallback is
 a per-platform golden set for the font goldens, recorded here; the exact
 golden must agree everywhere.
@@ -256,8 +271,213 @@ golden must agree everywhere.
   becomes #21's concern once shaped rows are cached.
 - A glyph whose bitmap is larger than an atlas layer is skipped (logged at
   debug level) rather than failing the frame.
-- Selection and overlays are accepted but not drawn until #22.
-- Two block-cursor edge cases are left for #22: a cell whose background
-  equals the cursor color hides the redrawn glyph (the cursor needs a
-  contrast rule or a configurable cursor-text color), and underlines and
-  other decorations are covered by the block, not redrawn on top of it.
+- Selection and overlays were accepted but not drawn until #22, which
+  draws them in the overlay pass.
+- One block-cursor edge case remains: a cell whose background equals the
+  cursor color hides the redrawn glyph (the cursor needs a contrast rule
+  or a configurable cursor-text color). The other one #20 left, underlines
+  and other decorations covered by the block, is fixed by #22: they are
+  redrawn in the cursor's text color.
+
+## Amendment: #22 (2026-10-29)
+
+### The overlay pass
+
+A fifth pass, **overlay**, sits between background and glyph. Its quads
+are alpha-blended (premultiplied, like everything else) over the cell
+backgrounds, and the glyphs are drawn on top in their own colors. So a
+selection is a highlight, not inverse video (kitty with
+`selection_foreground none`, Alacritty's default), and shaping never sees
+it: selecting part of a ligature cannot split it. That closes the ADR 0016
+open item about a mark-carrying last character shrinking a ligature's
+span: selection does not consume spans at all, and the block cursor
+selects what to redraw by ink as well as by span (below). `PassRanges`
+has five sections; the instance buffer has four per-row sections
+(background, overlay, glyph, decoration) and the cursor slot.
+
+### Selection and overlay semantics
+
+```rust
+pub struct Selection { pub start: Point, pub end: Point, pub kind: SelectionKind }
+pub enum SelectionKind { Linear, Block }
+pub struct Overlay { pub kind: OverlayKind, pub row: u16, pub cols: Range<u16> }
+#[non_exhaustive] pub enum OverlayKind { Match, CurrentMatch, Underline }
+```
+
+- **Linear**: from the earlier point's cell to the end of its row, every
+  row in between whole (over all visible columns, also past a short
+  row's last cell), and the last row up to the later point's cell,
+  inclusive. Wrapped rows are just consecutive rows; the renderer needs no
+  wrap flags. **Block**: columns `min..=max` on rows `min..=max`.
+- A span (selection or overlay) that starts on the spacer of a wide
+  character, or ends on its wide half, is widened to the whole character.
+  Anything outside the frame is clipped; nothing panics on `u16::MAX`.
+- `Match` and `CurrentMatch` fill their cells with `Theme::search_match`
+  (`#ffd866`, alpha 0.6) and `Theme::search_match_current` (`#ff9f43`,
+  alpha 0.8); theme files may set both. `Underline` is a bar one point
+  high (one pixel per unit of backing scale) at the underline position, in
+  each covered cell's foreground (a hovered link, #30).
+- Overlapping overlays of one kind draw their **union**: a cell under
+  three overlapping matches is highlighted once, as under one, so a
+  highlight's opacity never depends on how many matches overlap (search
+  for `aa` in `aaaa`), and the current match is never darkened by a
+  second match on the same cells. Different kinds stack in a fixed order,
+  bottom to top, whatever the slice order: selection, matches, the current
+  match, link underlines. The current match is thus always on top of the
+  matches, and both on top of the selection. This is a stronger contract
+  than the issue's "in slice order", and the search bar (#46) relies on
+  it: it may pass matches in any order and overlapping, and must not
+  expect a later overlay to cover an earlier one of the same kind.
+  Drawing the selection under the matches is a choice to revisit with
+  #46: Alacritty gives the selection priority over search highlights.
+- The union also bounds the work by the screen rather than by the caller.
+  After it, each kind has at most one span per two visible columns; a
+  filled kind is one quad per span and the link underline one bar per run
+  of cells with one foreground, so a row emits at most about twice its
+  width of overlay instances. The overlay pass also stops at four per
+  visible column as a guard. Measured in a release build on a 60x200
+  screen with a full-screen selection that changes every frame:
+
+  | overlays | per frame | peak memory |
+  |---|---|---|
+  | none | 1.1 ms | 32 MB |
+  | 800 full-width per row (48 000), over alternating foregrounds | 2.6 ms | 36 MB |
+  | 5 000 full-width per row (300 000) | 5.6 ms | 41 MB |
+  | 1 000 000 five cells wide | 17 ms | 57 MB |
+
+  The first version capped spans per row instead, which did not bound
+  instances: full-width link underlines over alternating foregrounds gave
+  one bar per cell per span, `FrameTooLarge` at 800 per row (review of
+  #22). The remaining cost of a flood is reading the slice, which the
+  caller produced.
+
+### The renderer diffs highlight coverage per row
+
+`FrameInput::damage` stays a statement about grid content. The renderer
+keeps each row's coverage (its list of spans) from the previous frame and
+compares it with the new one; a row whose coverage changed rebuilds and
+uploads only its overlay slot, without shaping or rebuilding its other
+passes (`RenderStats::overlay_rows_built` counts these). A damaged row
+rebuilds its overlay with the rest, so a link underline follows its
+cells' new colors. When neither the previous frame nor this one has a
+selection or overlay, the comparison is skipped entirely, so frames
+without highlights cost nothing extra per row. Making app-core track
+overlay damage was rejected: it would duplicate the state, and #30
+(selection) and #46 (search) would each have to get it right.
+
+### Underline styles, overline, superscript and subscript
+
+- `Style::underline_style()` picks single, double, curly, dotted or
+  dashed. Curly is a sine of period one cell width and amplitude
+  `max(1 px, thickness)` (less only when the cell is too short), in a band
+  centred on the single underline; dotted is thickness-sized dots at twice
+  the thickness; dashed is dashes a third of a cell long with a sixth of
+  a cell between them; double is two bars one thickness apart. Curly,
+  dotted and dashed are one quad per run, drawn by the shader (`kind` 4
+  and 3), so they cost no more instances than a single underline. Their
+  phase is counted from the grid's left edge, not from each run, so dots
+  and dashes keep their pitch across runs of different colors and under
+  the cursor also when the cell width is odd. Unit
+  tests pin every quad at 1x and 2x and keep all of them inside the cell
+  at `MIN_FONT_SIZE_PT` and 1x.
+- Underlines use the underline color (SGR 58), else the foreground; DIM
+  dims it, INVERSE does not swap it. The overline (SGR 53) is a bar of
+  underline thickness at the top of the cell in the same color. The
+  strikethrough stays in the foreground. A run is keyed by the decoration
+  flags and both colors.
+- Superscript and subscript reuse the glyph's atlas bitmap at 0.7 of its
+  size, scaled about the horizontal centre of the glyph's cells and about
+  the baseline, then moved up by 0.3 of the cell height (superscript) or
+  down by 0.2 (subscript, so a glyph sitting on the baseline ends on
+  baseline + 0.2 cell), and clipped to their row so a lowered descender
+  or a raised accent never paints into a neighbouring row (which would
+  not redraw it away unless damaged itself). Nothing is rasterised again;
+  the shader filters the bitmap bilinearly itself: four `textureLoad`s of
+  the texels around the position inside the glyph's own bitmap, clamped
+  to its edge texels so atlas neighbours never bleed in, weighted by that
+  position alone. So the same glyph draws the same pixels in any atlas
+  slot. A hardware sampler did not: its fixed-point filter weights come
+  from the absolute atlas coordinate, so the same glyph differed by one
+  step between slots and an incremental frame could differ from a fresh
+  one after an eviction (review of #22, found by a differential fuzz).
+  With both flags set, superscript wins (mintty).
+
+### Cursor redraw rules
+
+- A block cursor on either half of a wide character covers both columns
+  and redraws the whole glyph.
+- What it redraws: every glyph of the row whose cells include a cursor
+  cell (the whole ligature under a cursor on its second cell), plus every
+  glyph near the cursor whose ink reaches into it (a ligature whose last
+  character carries a mark and so owns its own cell, an italic overhang).
+  All of it is clipped to the cursor's cells.
+- The glyphs and the cell's underlines, overline and strikethrough are
+  redrawn in the cursor's text color: the cell's background after
+  INVERSE (so an inverse cell's underline shows), dimmed when the cell is
+  DIM (as its foreground would be), scaled by the cursor's alpha. A
+  hovered link's underline (an overlay) under the cursor is redrawn the
+  same way. Colour glyphs (emoji) keep their colors.
+- A wide character in the last visible column, whose right half is past
+  the target, is shaped as a blank and not drawn (it would draw into the
+  padding); its background still is.
+
+### Known limits
+
+- **Highlights reach the right edge of the window, not the left.**
+  `Layout::visible_cols` counts every column that starts inside the
+  target, including one that starts in the right padding or in pixels
+  left over after the last whole column. A selection's inner rows, a
+  block selection and an overlay up to `u16::MAX` cover all visible
+  columns, so they paint over the right margin out to the window edge,
+  while the left margin stays the background. In `selection_linear.png`
+  (24 columns of 16 px, 8 px padding, a 400 px target) the inner row's
+  highlight ends at x = 400, not at the grid's right edge, 392. This is
+  kept: Terminal.app does the same, and the rule "over all visible
+  columns" above says so. Symmetric margins are a follow-up issue.
+- **A cursor on a cut wide character's spacer draws nothing.** When a wide
+  character starts in the last visible column and its spacer's column is
+  past the target (a transient during a resize), a cursor reported on the
+  spacer is outside the visible columns and is not drawn; a cursor on the
+  wide half draws one column. Found by the adversarial run of #22; not
+  fixed after that run, by decision.
+
+### Measurements
+
+`cargo xtask ab` against the merge base (`bfea6f9`), instructions
+retired, best of 15 interleaved process pairs, Apple M4, macOS 26.6,
+load average 2 to 7 (re-measured after review round 1). ADR 0016's
+synced method: each process waits for the GPU after every frame and
+draws full frames (`DamageRows::All`) of the corpus line, Menlo 13 pt at
+2x; the per-frame cost is the difference between two frame counts (50
+and 150 at 60x200, 100 and 400 at 24x80), which removes everything a
+process pays once. "Full selection" draws a selection over the whole
+screen on head (in a transparent selection colour, so both sides draw
+the same pixels) against main, which takes the selection as data only.
+
+| line | 60x200: main per frame | head/main | 24x80: main per frame | head/main |
+|---|---|---|---|---|
+| ascii | 87.74e6 | 1.002 | 14.56e6 | 1.002 |
+| latin_diacritics | 91.38e6 | 1.003 | 15.12e6 | 1.001 |
+| cjk | 249.37e6 | 1.000 | 40.63e6 | 1.000 |
+| box_drawing | 11.10e6 | 1.011 | 2.28e6 | 1.009–1.026 |
+| hebrew | 112.60e6 | 1.001 | 18.38e6 | 1.002 |
+| arabic | 190.79e6 | 1.001 | 30.51e6 | 1.000 |
+| punctuation | 86.60e6 | 1.001 | 14.65e6 | 1.001 |
+| braille | 79.95e6 | 1.003 | 13.41e6 | 1.000 |
+| emoji | 146.93e6 | 1.000 | 23.46e6 | 1.001 |
+| sgr_heavy | 92.01e6 | 1.007 | 15.22e6 | 1.007 |
+| combining_heavy | 210.45e6 | 1.002 | 34.42e6 | 1.002 |
+| ascii, full selection | 87.75e6 | 1.002 | 14.56e6 | 1.003 |
+| cjk, full selection | 249.40e6 | 1.000 | 40.63e6 | 1.001 |
+
+The bars (1.03 without highlights, 1.25 with a full-screen selection)
+hold on every line. `box_drawing` at 24x80, the cheapest frame per cell,
+depends most on the method: 1.009 with 100 and 400 frames here, and
+1.012 to 1.026 in the review's own runs with other frame counts. `sgr_heavy`'s pixels differ by design: main drew its
+curly underline as a straight bar. The first version cost 1.05x on
+`box_drawing`, whose frames are cheap per cell, about 55 instructions per
+cell on every line: the decoration pass ran its run bookkeeping over every
+cell of rows without any decoration. It now skips such rows after one
+scan. Review round 1 briefly brought it back to 1.04: splitting `prepare` in
+two (to hand a reused vector back) changed what the compiler inlined; the
+reused vector now lives in the renderer instead.

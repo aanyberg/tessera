@@ -316,14 +316,15 @@ pub fn color_text(color: Color) -> String {
 
 /// A style in the canonical pen notation of `tests/fixtures/sgr_spec.txt`:
 /// `fg=<c> bg=<c> ul=<c> us=<style> flags=<list>`, flags in a fixed order
-/// (`bold,dim,italic,blink,inverse,hidden,strike`) or `-` for none.
+/// (`bold,dim,italic,blink,inverse,hidden,strike,overline,superscript,subscript`)
+/// or `-` for none.
 ///
 /// Flag bits the notation has no name for (none exist today) are printed
 /// as `?0x...`, so a stray bit can never pass as a clean pen. `tests/sgr.rs`
-/// has its own copy (it predates this one).
+/// uses this one too, so the two can no longer drift apart.
 #[allow(dead_code)] // Used by esctest.rs; print.rs and wide.rs include this module without the allow.
 pub fn pen_text(style: Style) -> String {
-    const NAMES: [(u16, &str); 7] = [
+    const NAMES: [(u16, &str); 10] = [
         (Style::BOLD, "bold"),
         (Style::DIM, "dim"),
         (Style::ITALIC, "italic"),
@@ -331,6 +332,9 @@ pub fn pen_text(style: Style) -> String {
         (Style::INVERSE, "inverse"),
         (Style::HIDDEN, "hidden"),
         (Style::STRIKETHROUGH, "strike"),
+        (Style::OVERLINE, "overline"),
+        (Style::SUPERSCRIPT, "superscript"),
+        (Style::SUBSCRIPT, "subscript"),
     ];
     let us = match style.underline_style() {
         UnderlineStyle::None => "none",

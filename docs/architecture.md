@@ -35,7 +35,7 @@ The diagram is the target design; today the core holds sessions only
 | `tessera-term` | applies actions to a grid, terminal modes, side-effect requests, `TERM` / terminfo (ADR 0005) | vt, grid |
 | `tessera-shell-integration` | OSC 133 / 7 / 1337 → marks and metadata | grid |
 | `tessera-search` | regex over grid + scrollback | grid |
-| `tessera-render` | wgpu pipeline, glyph atlas, shaping (ADR 0007), four passes over a `FrameInput` (ADR 0010), `Theme`; `RenderSurface` wraps a `wgpu::Surface` it is handed | grid |
+| `tessera-render` | wgpu pipeline, glyph atlas, shaping (ADR 0007), five passes over a `FrameInput` (ADR 0010), `Theme`; `RenderSurface` wraps a `wgpu::Surface` it is handed | grid |
 | `tessera-config` | TOML schema, defaults, load/save, watch (ADR 0004, 0006); themes, bundled themes and the iTerm2/base16 importers (ADR 0019) | – |
 | `tessera-plugin-api` | `Plugin`, `Host`, `Capability`, `Event` (ADR 0002) | – |
 | `tessera-plugins/*` | first-party plugins | plugin-api |

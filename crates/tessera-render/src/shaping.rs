@@ -1340,12 +1340,14 @@ mod tests {
         assert_eq!(owners, [Some(0), Some(0), Some(2)]);
     }
 
-    /// #19 follow-up, still open (ADR 0016): a combining mark on the last
-    /// character of a leading-drawer ligature (Cascadia `->` + U+0301 on
-    /// `>`) makes that character's cluster draw (the mark has ink), so it
-    /// owns its cell and the ligature's span shrinks to one cell. The
-    /// arrow is still drawn whole; only its logical extent (cursor,
-    /// selection) changes. Pinned here so a fix is a visible change.
+    /// #19 follow-up (ADR 0016): a combining mark on the last character of
+    /// a leading-drawer ligature (Cascadia `->` + U+0301 on `>`) makes that
+    /// character's cluster draw (the mark has ink), so it owns its cell
+    /// and the ligature's span shrinks to one cell. The arrow is still
+    /// drawn whole. Accepted by #22 (ADR 0010 amendment): the selection is
+    /// a background quad that never consumes spans, and the block cursor
+    /// also redraws glyphs whose ink reaches into it, so the shorter span
+    /// changes nothing on screen. Pinned so a change here is visible.
     #[test]
     fn a_mark_on_a_ligature_spacer_shortens_the_ligature() {
         let lig = ClusterKind::Drawing { ligature: true };

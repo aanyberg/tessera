@@ -14,6 +14,12 @@
 //!   replaced by a space, so only backgrounds, decorations and cursors
 //!   remain. Must match exactly: color and geometry bugs cannot hide
 //!   behind the font tolerance.
+//! - `selection_linear.png`, `selection_block.png`, `overlays.png`,
+//!   `underlines.png`, `scripts.png` and `cursor_wide.png` (#22): the
+//!   selection, search and link overlays, the underline styles and
+//!   colour, overline, superscript and subscript, and the block cursor on
+//!   wide characters, ligatures, emoji and decorated text. Font
+//!   tolerance.
 //!
 //! `TESSERA_UPDATE_GOLDENS=1` rewrites the goldens instead of comparing;
 //! `TESSERA_SKIP_GPU_TESTS=1` skips the suite like `headless_clear.rs`.
@@ -30,10 +36,10 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 
-use tessera_grid::{Cell, Color, Style};
+use tessera_grid::{Cell, CellFlags, Color, Point, Style};
 use tessera_render::{
-    CursorShape, CursorState, FontConfig, FrameInput, Gpu, OffscreenTarget, PhysicalSize, Renderer,
-    Rgba, Shaper, Theme,
+    CursorShape, CursorState, FontConfig, FrameInput, Gpu, OffscreenTarget, Overlay, OverlayKind,
+    PhysicalSize, Renderer, Rgba, Selection, Shaper, Theme,
 };
 
 const SKIP_VAR: &str = "TESSERA_SKIP_GPU_TESTS";
@@ -167,7 +173,7 @@ fn screen() -> Vec<Vec<Cell>> {
     ]);
     attrs(&[
         ("under", d.with(Style::UNDERLINE)),
-        ("double", d.with(Style::DOUBLE_UNDERLINE)),
+        ("double", d.with(Style::UNDERLINE | Style::DOUBLE_UNDERLINE)),
         ("strike", d.with(Style::STRIKETHROUGH)),
         ("u+s", red.with(Style::UNDERLINE | Style::STRIKETHROUGH)),
         ("  gap  ", d.with(Style::UNDERLINE)),
@@ -447,6 +453,318 @@ fn clusters_golden() {
         "clusters change the row"
     );
     check_golden("clusters", size, &image, Tolerance::Font);
+    // A selection on the last cell of the VS16 heart (its spacer when the
+    // heart is wide) takes the whole cluster and changes nothing outside
+    // it: the cluster is not split or re-shaped (ADR 0016 open item,
+    // closed by #22). The heart is red, so its colour survives the check.
+    let heart = line
+        .cells
+        .iter()
+        .position(|c| c.ch == '\u{2764}')
+        .expect("heart");
+    let width = if line.cells[heart].is_wide() { 2 } else { 1 };
+    let last = (heart + width - 1) as u16;
+    let selection = Selection::linear(Point::new(0, last), Point::new(0, last));
+    let selected = render(
+        &gpu,
+        &mut renderer,
+        size,
+        &frame.clone().with_selection(Some(selection)),
+    );
+    let m = renderer.cell_metrics();
+    let pad = (renderer.theme().padding * renderer.shaper().scale()).round() as u32;
+    let x0 = pad + heart as u32 * m.width_px;
+    let x1 = x0 + width as u32 * m.width_px;
+    let outside = |img: &[u8]| -> Vec<u8> {
+        img.as_chunks::<4>()
+            .0
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !(x0..x1).contains(&(*i as u32 % size.width)))
+            .flat_map(|(_, p)| *p)
+            .collect()
+    };
+    assert!(
+        outside(&selected) == outside(&image),
+        "only the cluster's cells change"
+    );
+    let inside = |img: &[u8]| -> usize {
+        img.as_chunks::<4>()
+            .0
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| {
+                (x0..x1).contains(&(*i as u32 % size.width))
+                    && (p[0].abs_diff(p[1]) > 40 || p[1].abs_diff(p[2]) > 40)
+            })
+            .count()
+    };
+    let (selected_ink, plain_ink) = (inside(&selected), inside(&image));
+    assert!(
+        plain_ink > 100 && selected_ink.abs_diff(plain_ink) * 10 < plain_ink,
+        "the heart is still drawn whole: {selected_ink} vs {plain_ink} colourful pixels"
+    );
+}
+
+/// Lines laid out by the grid (`cols` wide, text wrapping as it would in
+/// the terminal). A `\n` in the text starts the next row, and each `@@`
+/// becomes a wide character: Menlo's `W` with the WIDE flag and its
+/// SPACER. The goldens then need no fallback font (CJK and emoji come from
+/// Hiragino, Apple SD Gothic Neo and Apple Color Emoji, which differ
+/// between macOS versions), while the renderer sees exactly the cells a
+/// real wide character gives it.
+fn grid_lines(text: &[(&str, Style)], rows: u16, cols: u16) -> Vec<tessera_grid::Line> {
+    let mut grid = tessera_grid::Grid::new(rows, cols);
+    for (text, style) in text {
+        grid.set_pen(*style);
+        for (i, piece) in text.split('\n').enumerate() {
+            if i > 0 {
+                let row = grid.cursor().row + 1;
+                grid.goto(row, 0);
+            }
+            grid.put_str(piece);
+        }
+    }
+    let mut lines = grid.visible_lines().to_vec();
+    for line in &mut lines {
+        widen(&mut line.cells);
+    }
+    lines
+}
+
+/// Turns each pair of `@` cells into a wide `W` and its spacer.
+fn widen(cells: &mut [Cell]) {
+    let mut c = 0;
+    while c + 1 < cells.len() {
+        if cells[c].ch == '@' && cells[c + 1].ch == '@' {
+            let style = cells[c].style;
+            cells[c] = Cell {
+                flags: CellFlags::WIDE,
+                ..Cell::new('W', style)
+            };
+            cells[c + 1] = Cell {
+                flags: CellFlags::SPACER,
+                ..Cell::new(' ', style)
+            };
+            c += 2;
+        } else {
+            c += 1;
+        }
+    }
+}
+
+/// Renders `lines` (`cols` wide) with `selection` and `overlays`.
+fn render_lines(
+    gpu: &Gpu,
+    renderer: &mut Renderer,
+    lines: &[tessera_grid::Line],
+    cols: usize,
+    (selection, overlays): (Option<Selection>, &[Overlay]),
+) -> (PhysicalSize, Vec<u8>) {
+    let rows: Vec<&[Cell]> = lines.iter().map(|l| l.cells.as_slice()).collect();
+    let clusters: Vec<_> = lines.iter().map(|l| l.graphemes.clone()).collect();
+    let size = target_size(renderer, cols, rows.len());
+    let frame = FrameInput::new(&rows)
+        .with_clusters(&clusters)
+        .with_selection(selection)
+        .with_overlays(overlays);
+    (size, render(gpu, renderer, size, &frame))
+}
+
+/// A linear selection over three rows of one wrapped line: it starts on
+/// the right half of a wide character (taking the whole character), runs
+/// over the whole wrapped middle row and ends on the left half of another
+/// (taking its right half too).
+#[test]
+fn selection_linear_golden() {
+    let Some(gpu) = gpu() else { return };
+    let mut renderer = renderer(&gpu, Theme::default());
+    let text = "linear: a@@b crosses a wrapped row of text into @@@@ and stops";
+    let lines = grid_lines(&[(text, Style::DEFAULT)], 3, 24);
+    assert!(lines[0].wrapped && lines[1].wrapped, "one wrapped line");
+    let start = lines[0]
+        .cells
+        .iter()
+        .position(Cell::is_spacer)
+        .expect("a spacer in row 0");
+    let end = lines[2]
+        .cells
+        .iter()
+        .rposition(Cell::is_wide)
+        .expect("a wide cell in row 2");
+    let selection = Selection::linear(Point::new(0, start as u16), Point::new(2, end as u16));
+    let (size, image) = render_lines(&gpu, &mut renderer, &lines, 24, (Some(selection), &[]));
+    check_golden("selection_linear", size, &image, Tolerance::Font);
+}
+
+/// A block selection over mixed-width text: its left and right edges cut
+/// through wide characters on some rows, which are then taken whole.
+#[test]
+fn selection_block_golden() {
+    let Some(gpu) = gpu() else { return };
+    let mut renderer = renderer(&gpu, Theme::default());
+    let lines = grid_lines(
+        &[
+            ("block @@@@ selection\n", Style::DEFAULT),
+            ("over @@@@@@@@ mixed\n", Style::DEFAULT),
+            ("width ascii only\n", Style::DEFAULT),
+            ("text @@@@@@ rows", Style::DEFAULT),
+        ],
+        4,
+        24,
+    );
+    let selection = Selection::block(Point::new(3, 7), Point::new(0, 3));
+    let (size, image) = render_lines(&gpu, &mut renderer, &lines, 24, (Some(selection), &[]));
+    check_golden("selection_block", size, &image, Tolerance::Font);
+}
+
+/// Search matches, the current match and a hovered link underline on one
+/// screen, one match over an explicit background and one under a
+/// selection.
+#[test]
+fn overlays_golden() {
+    let Some(gpu) = gpu() else { return };
+    let mut renderer = renderer(&gpu, Theme::default());
+    let blue = Style {
+        bg: Color::Indexed(4),
+        ..Style::DEFAULT
+    };
+    let link = Style {
+        fg: Color::Indexed(6),
+        ..Style::DEFAULT
+    };
+    let lines = grid_lines(
+        &[
+            ("find a match, the ", Style::DEFAULT),
+            ("match", blue),
+            ("\nand the match here\n", Style::DEFAULT),
+            ("see https://example.org", link),
+        ],
+        3,
+        24,
+    );
+    let overlays = [
+        Overlay::new(OverlayKind::Match, 0, 7..12),
+        Overlay::new(OverlayKind::Match, 0, 18..23),
+        Overlay::new(OverlayKind::CurrentMatch, 1, 8..13),
+        Overlay::new(OverlayKind::Underline, 2, 4..23),
+    ];
+    let selection = Selection::linear(Point::new(1, 4), Point::new(1, 10));
+    let (size, image) = render_lines(
+        &gpu,
+        &mut renderer,
+        &lines,
+        24,
+        (Some(selection), &overlays),
+    );
+    check_golden("overlays", size, &image, Tolerance::Font);
+}
+
+/// The five underline styles, each in the foreground and in an SGR 58
+/// colour.
+#[test]
+fn underlines_golden() {
+    let Some(gpu) = gpu() else { return };
+    let mut renderer = renderer(&gpu, Theme::default());
+    let u = Style::UNDERLINE;
+    let styles = [
+        ("single", u),
+        ("double", u | Style::DOUBLE_UNDERLINE),
+        ("curly", u | Style::CURLY_UNDERLINE),
+        ("dotted", u | Style::DOTTED_UNDERLINE),
+        ("dashed", u | Style::DASHED_UNDERLINE),
+    ];
+    let mut text = Vec::new();
+    let labels: Vec<String> = styles
+        .iter()
+        .flat_map(|(name, _)| [format!("{name:<11}"), format!("{name:<11}\n")])
+        .collect();
+    for (i, (_, flags)) in styles.iter().enumerate() {
+        let plain = Style::DEFAULT.with(*flags);
+        let colored = Style {
+            underline: Color::Rgb(0xff, 0x55, 0x55),
+            ..plain
+        };
+        text.push((labels[2 * i].as_str(), plain));
+        text.push((labels[2 * i + 1].as_str(), colored));
+    }
+    let lines = grid_lines(&text, 5, 24);
+    let (size, image) = render_lines(&gpu, &mut renderer, &lines, 24, (None, &[]));
+    check_golden("underlines", size, &image, Tolerance::Font);
+}
+
+/// Overline (foreground and SGR 58 colour), superscript, subscript and
+/// both flags at once (drawn as superscript).
+#[test]
+fn scripts_golden() {
+    let Some(gpu) = gpu() else { return };
+    let mut renderer = renderer(&gpu, Theme::default());
+    let d = Style::DEFAULT;
+    let over = d.with(Style::OVERLINE);
+    let lines = grid_lines(
+        &[
+            ("overline ", over),
+            (
+                "colored\n",
+                Style {
+                    underline: Color::Rgb(0x55, 0xff, 0x55),
+                    ..over.with(Style::UNDERLINE)
+                },
+            ),
+            ("E=mc", d),
+            ("2", d.with(Style::SUPERSCRIPT)),
+            (" x", d),
+            ("n+1", d.with(Style::SUPERSCRIPT)),
+            ("\nH", d),
+            ("2", d.with(Style::SUBSCRIPT)),
+            ("O a", d),
+            ("i,j", d.with(Style::SUBSCRIPT)),
+            ("\nboth ", d),
+            ("xy", d.with(Style::SUPERSCRIPT | Style::SUBSCRIPT)),
+            (" super ", d),
+            ("xy", d.with(Style::SUPERSCRIPT)),
+        ],
+        4,
+        24,
+    );
+    let (size, image) = render_lines(&gpu, &mut renderer, &lines, 24, (None, &[]));
+    check_golden("scripts", size, &image, Tolerance::Font);
+}
+
+/// The block cursor on a wide character, on its spacer, on the second
+/// cell of `=>` (a ligature in fonts that have one), on a built-in full
+/// block (redrawn edge to edge) and on inverse underlined text, one strip
+/// each. Emoji under the cursor are pinned by a pixel test in
+/// `tests/overlay.rs` instead, so this golden needs Menlo only.
+#[test]
+fn cursor_wide_golden() {
+    let Some(gpu) = gpu() else { return };
+    let mut renderer = renderer(&gpu, Theme::default());
+    let line = |text: &str, style: Style| -> Vec<Cell> {
+        let mut grid = tessera_grid::Grid::new(1, COLS as u16);
+        grid.set_pen(Style::DEFAULT);
+        grid.put_str("cursor: ");
+        grid.set_pen(style);
+        grid.put_str(text);
+        let mut cells = grid.line(0).expect("row 0").cells.clone();
+        widen(&mut cells);
+        cells
+    };
+    let block = |col| CursorState::new(0, col, CursorShape::Block);
+    let inverse_underline = Style::DEFAULT.with(Style::INVERSE | Style::UNDERLINE);
+    let strips = [
+        (line("@@@@", Style::DEFAULT), block(8), true),
+        (line("@@@@", Style::DEFAULT), block(9), true),
+        (line("a => b", Style::DEFAULT), block(11), true),
+        (
+            line("\u{2588}\u{2588}\u{2591}", Style::DEFAULT),
+            block(9),
+            true,
+        ),
+        (line("inverse", inverse_underline), block(9), true),
+    ];
+    let (size, image) = compose(&gpu, &mut renderer, None, &strips);
+    check_golden("cursor_wide", size, &image, Tolerance::Font);
 }
 
 /// Renders one row of `text` with `cursor` and `focused`.

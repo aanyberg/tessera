@@ -11,6 +11,8 @@
 //! (ADR 0016); [`FrameInput::clusters`] carries each row's grapheme
 //! cluster text, so combining marks and emoji sequences are shaped whole.
 
+use std::ops::Range;
+
 use tessera_grid::{Cell, DamageRows, GraphemeTable, Point};
 
 /// How the cursor is drawn.
@@ -32,9 +34,9 @@ pub enum CursorShape {
 
 /// Where the cursor is and how it looks this frame.
 ///
-/// Built with [`CursorState::new`] (and [`CursorState::with_visible`]);
-/// the struct is `#[non_exhaustive]` so a two-column cursor (#22) can add a
-/// field.
+/// Built with [`CursorState::new`] (and [`CursorState::with_visible`]).
+/// A cursor on either half of a wide character covers both columns; the
+/// renderer reads that from the cells, so no field says it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct CursorState {
@@ -69,27 +71,135 @@ impl CursorState {
     }
 }
 
+/// How a [`Selection`] covers the cells between its two points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SelectionKind {
+    /// Text order: from the first point's cell to the end of its row,
+    /// every row in between whole, and the last row up to the other
+    /// point's cell (inclusive). On one row, the cells between the two
+    /// columns. Wrapped rows are consecutive rows, so a selection over a
+    /// soft-wrapped line needs nothing special.
+    #[default]
+    Linear,
+    /// A rectangle: the columns `min(col)..=max(col)` on every row
+    /// `min(row)..=max(row)`.
+    Block,
+}
+
 /// A selected range of cells, in [`FrameInput::rows`] coordinates.
 ///
-/// Data only in this release: the renderer accepts it but does not draw
-/// it yet (issue #22 adds the selection pass).
+/// Drawn by the overlay pass as a quad of [`crate::Theme::selection`]
+/// alpha-blended over each covered cell's background; the text keeps its
+/// own colors (no inverse video) and shaping is untouched, so selecting
+/// part of a ligature never splits it. `start` and `end` may come in
+/// either order. A point on the [`tessera_grid::CellFlags::SPACER`] half
+/// of a wide character takes the whole character, and so does an end on
+/// its [`tessera_grid::CellFlags::WIDE`] half; rows and columns outside
+/// the frame are clipped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Selection {
-    /// Where the selection starts.
+    /// Where the selection starts (the anchor).
     pub start: Point,
     /// Where it ends (inclusive).
     pub end: Point,
+    /// Linear (text order) or block (rectangle).
+    pub kind: SelectionKind,
 }
 
-/// Something drawn over the grid that is not a cell: search highlights,
-/// hyperlink underlines, IME preedit and the like.
-///
-/// No overlay exists yet; issue #22 adds the first ones. The type is
-/// uninhabited until then, so `&[]` is the only value of
-/// [`FrameInput::overlays`].
+impl Selection {
+    /// A linear selection from `start` to `end`, both inclusive.
+    #[must_use]
+    pub const fn linear(start: Point, end: Point) -> Self {
+        Self {
+            start,
+            end,
+            kind: SelectionKind::Linear,
+        }
+    }
+
+    /// A block selection of the rectangle with corners `start` and `end`.
+    #[must_use]
+    pub const fn block(start: Point, end: Point) -> Self {
+        Self {
+            start,
+            end,
+            kind: SelectionKind::Block,
+        }
+    }
+
+    /// The columns this selection covers on `row`, inclusive, before wide
+    /// characters are taken whole and before clipping to the frame:
+    /// `None` when the row is outside it. `last_col` is the row's last
+    /// column, where a linear selection's inner rows end.
+    #[must_use]
+    pub fn cols_on(&self, row: u16, last_col: u16) -> Option<(u16, u16)> {
+        let (top, bottom) = if (self.start.row, self.start.col) <= (self.end.row, self.end.col) {
+            (self.start, self.end)
+        } else {
+            (self.end, self.start)
+        };
+        if row < top.row || row > bottom.row {
+            return None;
+        }
+        match self.kind {
+            SelectionKind::Linear => {
+                let first = if row == top.row { top.col } else { 0 };
+                let last = if row == bottom.row {
+                    bottom.col
+                } else {
+                    last_col.max(first)
+                };
+                Some((first, last))
+            }
+            SelectionKind::Block => Some((
+                self.start.col.min(self.end.col),
+                self.start.col.max(self.end.col),
+            )),
+        }
+    }
+}
+
+/// What an [`Overlay`] draws.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
-pub enum Overlay {}
+pub enum OverlayKind {
+    /// A search match: [`crate::Theme::search_match`] over the cells.
+    Match,
+    /// The current search match: [`crate::Theme::search_match_current`]
+    /// over the cells.
+    CurrentMatch,
+    /// A thin underline in each covered cell's foreground color, at the
+    /// underline position (a hovered hyperlink).
+    Underline,
+}
+
+/// Something drawn over a run of cells that is not part of them: search
+/// matches and hyperlink underlines.
+///
+/// Overlays are drawn by the overlay pass between the cell backgrounds and
+/// the glyphs, over the [`Selection`], by kind from bottom to top: matches,
+/// the current match, link underlines. Overlapping overlays of one kind
+/// draw their union, so a cell covered by several matches is highlighted
+/// once. Like the selection, a run starting on a wide character's spacer
+/// or ending on its first half takes the whole character, and anything
+/// outside the frame is clipped.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Overlay {
+    /// What to draw.
+    pub kind: OverlayKind,
+    /// The row, in [`FrameInput::rows`] indices.
+    pub row: u16,
+    /// The columns covered (end exclusive).
+    pub cols: Range<u16>,
+}
+
+impl Overlay {
+    /// An overlay of `kind` over `cols` of `row`.
+    #[must_use]
+    pub const fn new(kind: OverlayKind, row: u16, cols: Range<u16>) -> Self {
+        Self { kind, row, cols }
+    }
+}
 
 /// Everything the renderer needs to draw one frame.
 ///
@@ -104,9 +214,10 @@ pub struct FrameInput<'a> {
     pub rows: &'a [&'a [Cell]],
     /// The cursor, if the host shows one.
     pub cursor: Option<CursorState>,
-    /// The selection, if any (not drawn yet, see [`Selection`]).
+    /// The selection, if any.
     pub selection: Option<Selection>,
-    /// Overlays drawn over the grid (none exist yet, see [`Overlay`]).
+    /// Search matches and link underlines, drawn over the selection (see
+    /// [`Overlay`] for the order and how overlaps combine).
     pub overlays: &'a [Overlay],
     /// Whether the surface has keyboard focus. An unfocused surface draws
     /// every cursor shape as [`CursorShape::HollowBlock`].
@@ -122,7 +233,9 @@ pub struct FrameInput<'a> {
     /// and clusters as then, and the renderer reuses what it shaped and
     /// built for them. [`DamageRows::All`] (the default) redraws
     /// everything; the cursor, focus, theme, font and target size are
-    /// compared by the renderer itself, so they need no damage.
+    /// compared by the renderer itself, so they need no damage; so are the
+    /// selection and the overlays, row by row (a changed selection
+    /// rebuilds only the rows whose coverage changed).
     pub damage: DamageRows,
 }
 
@@ -152,6 +265,13 @@ impl<'a> FrameInput<'a> {
     #[must_use]
     pub const fn with_selection(mut self, selection: Option<Selection>) -> Self {
         self.selection = selection;
+        self
+    }
+
+    /// The same frame with `overlays`.
+    #[must_use]
+    pub const fn with_overlays(mut self, overlays: &'a [Overlay]) -> Self {
+        self.overlays = overlays;
         self
     }
 
@@ -200,10 +320,39 @@ mod tests {
         assert!(frame.focused);
         assert_eq!(frame.cursor, None);
         assert_eq!(frame.selection, None);
-        assert_eq!(frame.overlays, [] as [Overlay; 0]);
+        assert_eq!(frame.overlays, &[] as &[Overlay]);
         assert_eq!(frame.drawn_cursor(), None);
         assert_eq!(frame.damage, DamageRows::All, "full redraw by default");
         assert_eq!(frame.clusters, &[] as &[GraphemeTable]);
+    }
+
+    #[test]
+    fn linear_selections_run_in_text_order_either_way() {
+        let a = Point::new(1, 5);
+        let b = Point::new(3, 2);
+        for sel in [Selection::linear(a, b), Selection::linear(b, a)] {
+            assert_eq!(sel.cols_on(0, 9), None);
+            assert_eq!(sel.cols_on(1, 9), Some((5, 9)), "first row to the end");
+            assert_eq!(sel.cols_on(2, 9), Some((0, 9)), "inner rows whole");
+            assert_eq!(sel.cols_on(3, 9), Some((0, 2)), "last row to the end point");
+            assert_eq!(sel.cols_on(4, 9), None);
+        }
+        let one_row = Selection::linear(Point::new(2, 7), Point::new(2, 3));
+        assert_eq!(one_row.cols_on(2, 9), Some((3, 7)));
+        // A first row starting past the row's end still yields a range.
+        let past = Selection::linear(Point::new(0, 50), Point::new(1, 0));
+        assert_eq!(past.cols_on(0, 9), Some((50, 50)));
+    }
+
+    #[test]
+    fn block_selections_are_rectangles() {
+        let sel = Selection::block(Point::new(3, 2), Point::new(1, 6));
+        assert_eq!(sel.cols_on(0, 9), None);
+        for row in 1..=3 {
+            assert_eq!(sel.cols_on(row, 9), Some((2, 6)), "row {row}");
+        }
+        assert_eq!(sel.cols_on(4, 9), None);
+        assert_eq!(SelectionKind::default(), SelectionKind::Linear);
     }
 
     #[test]

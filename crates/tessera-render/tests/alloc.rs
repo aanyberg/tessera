@@ -10,9 +10,10 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell as StdCell;
 
-use tessera_grid::{Cell, DamageRows, GraphemeTable, Style};
+use tessera_grid::{Cell, DamageRows, GraphemeTable, Point, Style};
 use tessera_render::{
-    FontConfig, FrameInput, Gpu, OffscreenTarget, PhysicalSize, Renderer, Shaper, Theme,
+    FontConfig, FrameInput, Gpu, OffscreenTarget, Overlay, OverlayKind, PhysicalSize, Renderer,
+    Selection, Shaper, Theme,
 };
 
 /// The system allocator, counting the current thread's allocations.
@@ -126,5 +127,69 @@ fn frames_stop_allocating_per_row_after_the_second() {
         "a full frame allocated {} > {budget} ({per_row} per row shaped, {} per frame)",
         full[5],
         idle[2]
+    );
+}
+
+/// Highlights cost no allocation once they settle: an undamaged frame with
+/// a selection and overlays that did not change allocates exactly what an
+/// undamaged frame without any allocates, because the coverage comparison
+/// reuses its vectors (#22 review, item 8). A frame that changes the
+/// selection stays at a fixed count too.
+#[test]
+fn highlight_frames_reuse_their_vectors() {
+    if std::env::var_os("TESSERA_SKIP_GPU_TESTS").is_some() {
+        return;
+    }
+    let gpu = Gpu::headless().expect("a Metal adapter");
+    let shaper = Shaper::new(&config()).expect("Menlo ships with macOS");
+    let mut renderer = Renderer::new(&gpu, Theme::default(), shaper).expect("renderer");
+    let m = renderer.cell_metrics();
+    let size = PhysicalSize::new(m.width_px * COLS + 8, m.height_px * ROWS + 8);
+    let target = OffscreenTarget::new(&gpu, size, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let line: Vec<Cell> = "highlight frames "
+        .chars()
+        .cycle()
+        .take(COLS as usize)
+        .map(|ch| Cell::new(ch, Style::DEFAULT))
+        .collect();
+    let rows: Vec<&[Cell]> = vec![line.as_slice(); ROWS as usize];
+    let overlays: Vec<Overlay> = (0..u16::try_from(ROWS).expect("few rows"))
+        .map(|r| Overlay::new(OverlayKind::Match, r, 0..10))
+        .collect();
+    let mut frame = |highlights: Option<(Option<Selection>, &[Overlay])>, damage| {
+        let before = allocations();
+        let (selection, overlays) = highlights.unwrap_or((None, &[]));
+        let frame = FrameInput::new(&rows)
+            .with_overlays(overlays)
+            .with_selection(selection)
+            .with_damage(damage);
+        target.render(&gpu, &mut renderer, &frame).expect("render");
+        gpu.device()
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        allocations() - before
+    };
+    frame(None, DamageRows::All);
+    let plain: Vec<u64> = (0..3).map(|_| frame(None, DamageRows::None)).collect();
+    let selection = |end: u16| Some(Selection::linear(Point::new(1, 2), Point::new(end, 5)));
+    // The selection grows and shrinks over the same rows each frame.
+    let moving: Vec<u64> = (0..6)
+        .map(|i| frame(Some((selection(2 + (i % 2)), &overlays)), DamageRows::None))
+        .collect();
+    let settled: Vec<u64> = (0..4)
+        .map(|_| frame(Some((selection(2), &overlays)), DamageRows::None))
+        .collect();
+    eprintln!(
+        "allocations: plain undamaged {plain:?}, changing highlights {moving:?}, \
+         unchanged highlights {settled:?}"
+    );
+    assert!(
+        moving[2..].iter().all(|&n| n == moving[2]),
+        "changing highlights do not settle: {moving:?}"
+    );
+    assert!(
+        settled[1..].iter().all(|&n| n == plain[2]),
+        "unchanged highlights allocate {settled:?}, a frame without any {}",
+        plain[2]
     );
 }
