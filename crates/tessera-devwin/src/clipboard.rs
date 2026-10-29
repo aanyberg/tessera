@@ -376,23 +376,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Each failing tool alone fits in the timeout; together they do not.
+    ///
+    /// With one deadline for all commands the second tool is killed at the
+    /// 1 s deadline and the third never starts: `read` returns after ~1 s.
+    /// With a deadline per command both tools fail after 0.8 s each and
+    /// the third starts at 1.6 s, writes its marker and is killed 1 s
+    /// later. The marker is the assertion that tells them apart, with no
+    /// clock involved. The elapsed bound is only a sanity check
+    /// (TIMEOUT, 10 s): under background priority at load above the core
+    /// count, a correct read was seen to take up to 14 s.
     #[test]
     fn the_deadline_covers_all_commands() {
-        // Each failing tool alone fits in the timeout; together they and
-        // the hung one do not.
-        let timeout = Duration::from_millis(300);
-        let commands = [
-            sh("sleep 0.2; exit 1"),
-            sh("sleep 0.2; exit 1"),
-            sh("sleep 5"),
-        ];
+        let dir = std::env::temp_dir().join(format!("tessera-clip-all-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("third-started");
+        let _ = std::fs::remove_file(&marker);
+        let third = format!("touch '{}'; exec sleep 30", marker.display());
+        let timeout = Duration::from_secs(1);
+        let commands = [sh("sleep 0.8; exit 1"), sh("sleep 0.8; exit 1"), sh(&third)];
         let started = Instant::now();
-        assert_eq!(
-            read(&commands, 1024, timeout),
-            Err(ClipboardError::TimedOut(timeout))
-        );
+        let result = read(&commands, 1024, timeout);
         let elapsed = started.elapsed();
-        assert!(elapsed < Duration::from_millis(600), "{elapsed:?}");
+        let third_started = marker.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(result, Err(ClipboardError::TimedOut(timeout)));
+        assert!(!third_started, "the third command started ({elapsed:?})");
+        assert!(elapsed >= timeout, "{elapsed:?}");
+        assert!(elapsed < TIMEOUT, "{elapsed:?}");
     }
 
     #[test]

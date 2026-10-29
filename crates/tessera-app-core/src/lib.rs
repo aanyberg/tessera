@@ -1528,6 +1528,12 @@ mod tests {
     /// `SIGHUP` (issue #79).
     const CLOSE_RETURNS_WITHIN: Duration = Duration::from_millis(5);
 
+    /// The bar for the median of 20 closes in a row: 1 ms. The median of
+    /// 20 closes of shells that ignore `SIGHUP` reached 315 µs at load ~13,
+    /// against issue #79's 250 µs per close; a close that waits 5 ms for its
+    /// child is still five times over.
+    const MEDIAN_CLOSE_WITHIN: Duration = Duration::from_millis(1);
+
     /// Slack on top of the grace periods for the reaper to finish a close.
     /// Generous because the reaper may be scheduled late on a loaded
     /// machine: under `taskpolicy -b` (background quality of service) fake closes finished
@@ -1583,12 +1589,14 @@ mod tests {
     /// checks that no close waited for its child.
     ///
     /// Issue #79's bar is 5 ms for 20 closes, 0.25 ms each. The median close
-    /// is held to that: a loaded scheduler preempts a few closes, not most of
-    /// them. The whole loop is held to a quarter of `HANGUP_GRACE`, which a
-    /// single close waiting for a grace period would exceed, but a few
-    /// preemptions do not (20 closes took 15 ms at load 10 and 51 ms at
-    /// background priority with three test processes, against 0.2-0.5 ms
-    /// idle).
+    /// is held to [`MEDIAN_CLOSE_WITHIN`], four times that: a loaded
+    /// scheduler slows every close a little and preempts a few, but a close
+    /// that waited for its child (a few milliseconds at the least) would
+    /// still put the median over it. The whole loop is held to a quarter of
+    /// `HANGUP_GRACE`, which a single close waiting for a grace period would
+    /// exceed, but a few preemptions do not (20 closes took 15 ms at load 10
+    /// and 51 ms at background priority with three test processes, against
+    /// 0.2-0.5 ms idle).
     fn close_in_a_loop(app: &App, ids: &[SessionId]) {
         let started = Instant::now();
         let mut each: Vec<Duration> = ids
@@ -1602,8 +1610,7 @@ mod tests {
         let took = started.elapsed();
         each.sort_unstable();
         let median = each[each.len() / 2];
-        let per_close = CLOSE_RETURNS_WITHIN / 20;
-        assert!(median < per_close, "median close took {median:?}");
+        assert!(median < MEDIAN_CLOSE_WITHIN, "median close took {median:?}");
         assert!(
             took < session::HANGUP_GRACE / 4,
             "{} closes took {took:?}",
@@ -1622,9 +1629,14 @@ mod tests {
         assert_eq!(app.closing_sessions(), 20);
         let reaped = wait_reaped(&app, started);
         assert!(reaped >= session::HANGUP_GRACE, "reaped after {reaped:?}");
-        // One shared grace, not twenty in a row.
+        // One shared grace, not twenty in a row. A reaper that runs even two
+        // graces back to back takes at least two however idle the machine,
+        // while one shared grace leaves a whole grace for scheduling delay
+        // (REAP_SLACK alone was exceeded by 0.26 s under `taskpolicy -b` at
+        // load ~10).
+        // Accepted residual: ~1% fail under `taskpolicy -b` at load above the core count (#164).
         assert!(
-            reaped < session::HANGUP_GRACE + REAP_SLACK,
+            reaped < 2 * session::HANGUP_GRACE,
             "reaped after {reaped:?}"
         );
         for (_, fake) in &sessions {
