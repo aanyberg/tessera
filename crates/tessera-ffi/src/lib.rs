@@ -65,8 +65,9 @@ pub use session::{
 #[doc(hidden)]
 pub use surface::tessera_test_surface_panic;
 pub use surface::{
-    FrameStatus, tessera_surface_attach, tessera_surface_detach, tessera_surface_render,
-    tessera_surface_resize, tessera_surface_set_font_size,
+    FrameStatus, SurfaceMetrics, tessera_surface_attach, tessera_surface_detach,
+    tessera_surface_metrics, tessera_surface_render, tessera_surface_resize,
+    tessera_surface_set_font_size,
 };
 
 /// Returns the core version as a NUL-terminated string.

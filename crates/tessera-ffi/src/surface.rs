@@ -9,8 +9,8 @@
 
 use std::ffi::{c_char, c_void};
 
-use tessera_app_core::SessionId;
 use tessera_app_core::view::{FrameStatus as CoreFrameStatus, PhysicalSize, wgpu};
+use tessera_app_core::{SessionId, ViewMetrics};
 
 use crate::app::App;
 use crate::error::{self, Error};
@@ -365,6 +365,124 @@ pub unsafe extern "C" fn tessera_surface_detach(app: *mut App, session_id: u64) 
     })
 }
 
+/// A surface's geometry, font size and cursor cell, as
+/// `tessera_surface_metrics` reads them in one call.
+///
+/// Every length is in physical pixels; divide by `scale` for points. Cell
+/// `(row, col)` covers `cell_width_px` x `cell_height_px` pixels from
+/// `(padding_px + col * cell_width_px, padding_px + row * cell_height_px)`,
+/// measured from the surface's top-left corner.
+///
+/// Read it once per frame and after every resize or font-size change, and
+/// keep it for the mouse and IME events in between: every call locks the
+/// session's terminal briefly.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SurfaceMetrics {
+    /// The surface's width (after clamping to the GPU's largest texture).
+    pub width_px: u32,
+    /// The surface's height (after clamping to the GPU's largest texture).
+    pub height_px: u32,
+    /// The surface's backing scale factor, as last passed to
+    /// `tessera_surface_attach` or `tessera_surface_resize`, after raising
+    /// it to at least 0.25.
+    pub scale: f32,
+    /// Width of one cell at the current font size and scale.
+    pub cell_width_px: u32,
+    /// Height of one cell (one line) at the current font size and scale.
+    pub cell_height_px: u32,
+    /// Distance from a cell's top to the text baseline.
+    pub baseline_px: f32,
+    /// The empty band between each edge of the surface and the grid, the
+    /// same on all four sides: the theme's padding at the renderer's scale
+    /// (`scale`, capped at 8).
+    pub padding_px: u32,
+    /// Rows of the session's grid. It follows the surface, except after a
+    /// `tessera_session_resize` until the next surface resize or font-size
+    /// change.
+    pub rows: u16,
+    /// Columns of the session's grid; see `rows`.
+    pub cols: u16,
+    /// The surface's font size in points (after clamping to 4..=512), the
+    /// value font zoom steps from.
+    pub font_size_pt: f32,
+    /// The cursor's row on the live screen (scroll offset 0), below `rows`.
+    pub cursor_row: u16,
+    /// The cursor's column, below `cols`.
+    pub cursor_col: u16,
+    /// Whether the cursor is on the screen the surface shows: `false` while
+    /// the view is scrolled back into the scrollback, when `cursor_row` and
+    /// `cursor_col` are where it would be at scroll offset 0.
+    pub cursor_on_screen: bool,
+    /// Whether the cursor is on the left half of a two-column character, so
+    /// the caret spans `cursor_col` and the column after it.
+    pub cursor_wide: bool,
+}
+
+impl From<ViewMetrics> for SurfaceMetrics {
+    fn from(m: ViewMetrics) -> Self {
+        Self {
+            width_px: m.pixels.width,
+            height_px: m.pixels.height,
+            scale: m.scale,
+            cell_width_px: m.cell.width_px,
+            cell_height_px: m.cell.height_px,
+            baseline_px: m.cell.baseline_px,
+            padding_px: m.padding_px,
+            rows: m.rows,
+            cols: m.cols,
+            font_size_pt: m.font_size_pt,
+            cursor_row: m.cursor_row,
+            cursor_col: m.cursor_col,
+            cursor_on_screen: m.cursor_on_screen,
+            cursor_wide: m.cursor_wide,
+        }
+    }
+}
+
+/// Reads session `session_id`'s surface geometry, font size and cursor cell
+/// into `*out` (see `TesseraSurfaceMetrics`).
+///
+/// Draws nothing and waits for no GPU work. It locks the session's terminal
+/// just long enough to read the grid size and cursor, so call it once per
+/// frame or resize and keep the result rather than calling it per mouse
+/// event. Main thread only.
+///
+/// Returns `TESSERA_ERROR_NULL_POINTER` if `app` or `out` is `NULL`,
+/// `TESSERA_ERROR_SESSION_NOT_FOUND` if the id is not a live session,
+/// `TESSERA_ERROR_NO_SURFACE` if it has no surface attached. `*out` is
+/// written only on success, all at once; after an error it holds what it
+/// held before.
+///
+/// # Safety
+///
+/// `app` must be `NULL` or a live handle. `out` must be `NULL` or point to
+/// a writable `TesseraSurfaceMetrics`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_surface_metrics(
+    app: *mut App,
+    session_id: u64,
+    out: *mut SurfaceMetrics,
+) -> Error {
+    ffi_guard!("tessera_surface_metrics", {
+        if out.is_null() {
+            return Error::NullPointer;
+        }
+        // SAFETY: the caller passes NULL or a live handle.
+        let Some(app) = (unsafe { App::from_ptr(app) }) else {
+            return Error::NullPointer;
+        };
+        match app.core.view_metrics(SessionId::from_raw(session_id)) {
+            Ok(metrics) => {
+                // SAFETY: non-null and writable per the contract.
+                unsafe { out.write(metrics.into()) };
+                Error::Ok
+            }
+            Err(error) => error::report("tessera_surface_metrics", &error),
+        }
+    })
+}
+
 /// Panics inside the core while it holds the view table lock, through the
 /// same guard every surface export uses. Returns [`Error::Panic`]; `app`
 /// and its surfaces stay usable.
@@ -403,6 +521,35 @@ mod tests {
             assert_eq!(FrameStatus::from(core), c);
             assert_eq!(c as i32, value);
         }
+    }
+
+    /// The C header's layout, pinned: a field added, removed or reordered
+    /// must change the Swift and C mirrors with it.
+    #[test]
+    fn surface_metrics_layout_is_stable() {
+        use std::mem::{align_of, offset_of, size_of};
+        assert_eq!(size_of::<SurfaceMetrics>(), 44);
+        assert_eq!(align_of::<SurfaceMetrics>(), 4);
+        let offsets = [
+            offset_of!(SurfaceMetrics, width_px),
+            offset_of!(SurfaceMetrics, height_px),
+            offset_of!(SurfaceMetrics, scale),
+            offset_of!(SurfaceMetrics, cell_width_px),
+            offset_of!(SurfaceMetrics, cell_height_px),
+            offset_of!(SurfaceMetrics, baseline_px),
+            offset_of!(SurfaceMetrics, padding_px),
+            offset_of!(SurfaceMetrics, rows),
+            offset_of!(SurfaceMetrics, cols),
+            offset_of!(SurfaceMetrics, font_size_pt),
+            offset_of!(SurfaceMetrics, cursor_row),
+            offset_of!(SurfaceMetrics, cursor_col),
+            offset_of!(SurfaceMetrics, cursor_on_screen),
+            offset_of!(SurfaceMetrics, cursor_wide),
+        ];
+        assert_eq!(
+            offsets,
+            [0, 4, 8, 12, 16, 20, 24, 28, 30, 32, 36, 38, 40, 41]
+        );
     }
 
     #[test]

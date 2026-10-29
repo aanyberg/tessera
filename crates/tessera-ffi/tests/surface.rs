@@ -17,13 +17,33 @@ use std::time::{Duration, Instant};
 use tessera_app_core::SessionId;
 use tessera_app_core::view::ViewSize;
 use tessera_ffi::{
-    App, Error, FrameStatus, SpawnOptions, tessera_app_free, tessera_app_new,
-    tessera_session_close, tessera_session_spawn, tessera_session_write, tessera_surface_attach,
-    tessera_surface_detach, tessera_surface_render, tessera_surface_resize,
-    tessera_surface_set_font_size, tessera_test_surface_panic, tessera_test_with_core,
+    App, Error, FrameStatus, SpawnOptions, SurfaceMetrics, tessera_app_free, tessera_app_new,
+    tessera_session_close, tessera_session_resize, tessera_session_spawn, tessera_session_write,
+    tessera_surface_attach, tessera_surface_detach, tessera_surface_metrics,
+    tessera_surface_render, tessera_surface_resize, tessera_surface_set_font_size,
+    tessera_test_surface_panic, tessera_test_with_core,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What `Handle::metrics` pre-fills: no field holds a value a surface
+/// reports.
+const SENTINEL: SurfaceMetrics = SurfaceMetrics {
+    width_px: 0xdead,
+    height_px: 0xbeef,
+    scale: -1.0,
+    cell_width_px: 0xdead,
+    cell_height_px: 0xbeef,
+    baseline_px: -1.0,
+    padding_px: 0xdead,
+    rows: 0xbeef,
+    cols: 0xdead,
+    font_size_pt: -1.0,
+    cursor_row: 0xbeef,
+    cursor_col: 0xdead,
+    cursor_on_screen: true,
+    cursor_wide: true,
+};
 const SKIP_VAR: &str = "TESSERA_SKIP_GPU_TESTS";
 
 /// `false` (with a note) when the GPU tests are switched off.
@@ -120,11 +140,22 @@ impl Handle {
 
     /// Spawns `/bin/sh` reading commands from the test.
     fn spawn_shell(&self) -> u64 {
+        self.spawn_sh(&[])
+    }
+
+    /// Spawns `/bin/sh` with `args` (after `argv[0]`).
+    fn spawn_sh(&self, args: &[&str]) -> u64 {
         let program = CString::new("/bin/sh").unwrap();
+        let owned: Vec<CString> = args.iter().map(|arg| CString::new(*arg).unwrap()).collect();
+        let pointers: Vec<*const c_char> = owned.iter().map(|arg| arg.as_ptr()).collect();
         let options = SpawnOptions {
             program: program.as_ptr(),
-            args: ptr::null::<*const c_char>(),
-            arg_count: 0,
+            args: if pointers.is_empty() {
+                ptr::null()
+            } else {
+                pointers.as_ptr()
+            },
+            arg_count: pointers.len(),
             cwd: ptr::null(),
             rows: 24,
             cols: 80,
@@ -160,6 +191,22 @@ impl Handle {
     fn set_font_size(&self, id: u64, size_pt: f32) -> Error {
         // SAFETY: live handle.
         unsafe { tessera_surface_set_font_size(self.0, id, size_pt) }
+    }
+
+    /// Reads the surface's metrics into a struct pre-filled with a
+    /// sentinel, so a failing call can be seen to leave it alone.
+    fn metrics(&self, id: u64) -> (Error, SurfaceMetrics) {
+        let mut metrics = SENTINEL;
+        // SAFETY: live handle; `metrics` is writable.
+        let code = unsafe { tessera_surface_metrics(self.0, id, &raw mut metrics) };
+        (code, metrics)
+    }
+
+    /// The metrics of a session that has a surface.
+    fn metrics_ok(&self, id: u64) -> SurfaceMetrics {
+        let (code, metrics) = self.metrics(id);
+        assert_eq!(code, Error::Ok);
+        metrics
     }
 
     fn detach(&self, id: u64) -> Error {
@@ -345,6 +392,113 @@ fn objects_that_are_not_metal_layers_are_rejected() {
     }
     assert_eq!(app.view_ids(), Vec::<u64>::new());
     assert_eq!(app.detach(id), Error::NoSurface);
+}
+
+#[test]
+fn metrics_need_a_handle_an_out_pointer_a_session_and_a_surface() {
+    let mut metrics = SENTINEL;
+    // SAFETY: a NULL handle is rejected; `metrics` is writable.
+    let code = unsafe { tessera_surface_metrics(ptr::null_mut(), 1, &raw mut metrics) };
+    assert_eq!(code, Error::NullPointer);
+    assert_eq!(metrics, SENTINEL);
+    let app = Handle::new();
+    let id = app.spawn_shell();
+    // SAFETY: live handle; a NULL out pointer is rejected.
+    let code = unsafe { tessera_surface_metrics(app.0, id, ptr::null_mut()) };
+    assert_eq!(code, Error::NullPointer);
+    // Errors leave `*out` as it was.
+    assert_eq!(app.metrics(id), (Error::NoSurface, SENTINEL));
+    assert_eq!(app.metrics(id + 100), (Error::SessionNotFound, SENTINEL));
+    if gpu_enabled() {
+        let layer = Layer::new();
+        assert_eq!(app.attach(id, &layer, 800, 600, 1.0), Error::Ok);
+        assert_eq!(app.detach(id), Error::Ok);
+        assert_eq!(app.metrics(id), (Error::NoSurface, SENTINEL));
+    }
+    assert_eq!(app.close(id), Error::Ok);
+    assert_eq!(app.metrics(id), (Error::SessionNotFound, SENTINEL));
+}
+
+#[test]
+fn metrics_report_the_surface_the_grid_and_the_cursor() {
+    if !gpu_enabled() {
+        return;
+    }
+    let app = Handle::new();
+    // A child whose output the test knows, whatever the environment's
+    // shell prompt: "ready", then each line `cat` reads (echo is off, so
+    // only `cat` writes; the terminal turns CR into NL on input and NL into
+    // CR NL on output).
+    let id = app.spawn_sh(&["-c", "stty -echo; printf ready; exec cat"]);
+    let layer = Layer::new();
+    assert_eq!(app.attach(id, &layer, 1600, 1200, 2.0), Error::Ok);
+    let metrics = app.metrics_ok(id);
+    let (size, cell, font_size) = app.with_core(|core| {
+        let id = SessionId::from_raw(id);
+        (
+            core.view_size(id).unwrap(),
+            core.view_cell_metrics(id).unwrap(),
+            core.view_font_size(id).unwrap(),
+        )
+    });
+    assert_eq!((metrics.width_px, metrics.height_px), (1600, 1200));
+    assert!((metrics.scale - 2.0).abs() < f32::EPSILON);
+    assert_eq!(
+        (metrics.cell_width_px, metrics.cell_height_px),
+        (cell.width_px, cell.height_px)
+    );
+    assert!((metrics.baseline_px - cell.baseline_px).abs() < f32::EPSILON);
+    // The default theme's 4 pt of padding at 2x.
+    assert_eq!(metrics.padding_px, 8);
+    assert!((metrics.font_size_pt - font_size).abs() < f32::EPSILON);
+    assert_eq!((metrics.rows, metrics.cols), (size.rows, size.cols));
+
+    // `rows` and `cols` are the session's grid: what an explicit resize
+    // asked for, until the surface resizes it again.
+    // SAFETY: live handle.
+    let code = unsafe { tessera_session_resize(app.0, id, 30, 90, 0, 0) };
+    assert_eq!(code, Error::Ok);
+    let resized = app.metrics_ok(id);
+    assert_eq!((resized.rows, resized.cols), (30, 90));
+    assert_eq!(app.resize(id, 1600, 1200, 2.0), Error::Ok);
+    let back = app.metrics_ok(id);
+    assert_eq!((back.rows, back.cols), (size.rows, size.cols));
+
+    // A zoom shows in the font size and the cell.
+    assert_eq!(app.set_font_size(id, 26.0), Error::Ok);
+    let zoomed = app.metrics_ok(id);
+    assert!((zoomed.font_size_pt - 26.0).abs() < f32::EPSILON);
+    assert!(zoomed.cell_width_px > metrics.cell_width_px, "{zoomed:?}");
+    assert!(zoomed.rows < metrics.rows, "{zoomed:?}");
+    assert_eq!(app.set_font_size(id, font_size), Error::Ok);
+
+    // Each line end `cat` copies back moves the cursor to the next row.
+    let ready = wait_for_cursor(&app, id, (0, 5));
+    assert!(ready.cursor_on_screen && !ready.cursor_wide, "{ready:?}");
+    app.write(id, b"\r");
+    wait_for_cursor(&app, id, (1, 0));
+    app.write(id, b"\r\n");
+    wait_for_cursor(&app, id, (3, 0));
+    assert_eq!(app.close(id), Error::Ok);
+}
+
+/// Waits until the cursor is at `(row, col)` and returns the metrics then.
+fn wait_for_cursor(app: &Handle, id: u64, (row, col): (u16, u16)) -> SurfaceMetrics {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let now = app.metrics_ok(id);
+        if (now.cursor_row, now.cursor_col) == (row, col) {
+            return now;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the cursor is at {:?}, not {:?}:\n{}",
+            (now.cursor_row, now.cursor_col),
+            (row, col),
+            app.screen(id)
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]

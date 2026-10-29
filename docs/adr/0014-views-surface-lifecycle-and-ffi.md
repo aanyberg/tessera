@@ -1,6 +1,7 @@
 # ADR 0014: Views, the surface lifecycle and its C API
 
-**Status:** accepted · 2026-10-28
+**Status:** accepted · 2026-10-28 · amended 2026-10-29 (#90: reading a
+surface's metrics back; see "Amendment: #90" at the end)
 
 ## Context
 
@@ -42,6 +43,7 @@ snapshot buffer. `App` owns at most one view per session, keyed by
 | `render_view(id) -> FrameStatus` | `tessera_surface_render(app, id, TesseraFrameStatus *out_status)` |
 | `set_view_font_size(id, size_pt)` | `tessera_surface_set_font_size(app, id, size_pt)` |
 | `detach_view(id)` | `tessera_surface_detach(app, id)` |
+| `view_metrics(id) -> ViewMetrics` (#90) | `tessera_surface_metrics(app, id, TesseraSurfaceMetrics *out)` |
 
 `App::view_instance`, `has_view`, `view_ids`, `view_size`,
 `view_font_size` and `view_cell_metrics` support the FFI, tests and #29;
@@ -311,3 +313,94 @@ the new `tests/c/surface.c`.
 - The surface tests attach real `CAMetalLayer`s; a layer outside any
   window may not vend drawables, so frames may be `SKIPPED`. Both Rust and
   C suites skip their GPU parts when `TESSERA_SKIP_GPU_TESTS` is set.
+
+## Amendment: #90, reading a surface's metrics back
+
+The frontend has to turn pointer positions into cells (mouse reporting
+#12, selection #30), put the input method's candidate window under the
+cursor, and step font zoom (#29) from the current size. None of that was
+readable through the C API, so `TerminalSurfaceView` used cell 0,0 for the
+pointer and the grid's top-left corner for the candidate window.
+
+**One call.** `tessera_surface_metrics(app, id, TesseraSurfaceMetrics *out)`
+fills a `#[repr(C)]` struct, in this field order: `width_px`, `height_px`
+(`u32`, the surface after clamping to the largest texture), `scale`
+(`f32`), `cell_width_px`, `cell_height_px` (`u32`), `baseline_px` (`f32`),
+`padding_px` (`u32`), `rows`, `cols` (`u16`), `font_size_pt` (`f32`),
+`cursor_row`, `cursor_col` (`u16`), `cursor_on_screen`, `cursor_wide`
+(`bool`). That is 44 bytes, aligned to 4. A Rust test pins the size and
+every offset; the `_Static_assert`s in `tests/c/surface.c` pin the
+generated header (its size and two offsets), and a `MemoryLayout` test in
+`TesseraKitTests` pins the struct as Swift imports it, which
+`TesseraSurface.Metrics` mirrors field by field. Five separate getters were rejected because
+the Swift wrapper would take the locks five times per read. The font size
+is in the struct because every consumer that needs cells also zooms.
+
+- `padding_px` is `round(theme.padding × renderer scale)`, where the
+  renderer's scale is `scale` capped at `MAX_SCALE` (8): the same value
+  and rounding as the renderer's `Layout::new` and `grid_size_for`
+  (`View::padding_px`). At a backing scale of 10 it is 32, not 40.
+  `scale` itself is reported as attached or resized, raised to at least
+  0.25 and not capped. Cell `(row, col)` starts at
+  `(padding_px + col × cell_width_px, padding_px + row × cell_height_px)`
+  from the surface's top-left corner.
+- `rows` and `cols` are the **session's grid**, not the surface's
+  `grid_size_for`. They are the same unless `tessera_session_resize` was
+  called on a session with a surface, which this ADR discourages; then
+  they report what the cursor and the mouse are clamped to.
+- `cursor_row` and `cursor_col` are the cursor at scroll offset 0, inside
+  the grid. `cursor_on_screen` is `false` while the view is scrolled back.
+  The core reports it, so the frontend does no scroll arithmetic. Once #8
+  tracks DECTCEM, a hidden cursor will also report `false`.
+- `cursor_wide` is `true` on the left half of a two-column character: the
+  caret spans two columns. On the right half (the spacer) it is `false`,
+  although the renderer draws the caret over both halves there.
+- Errors are `TESSERA_ERROR_NULL_POINTER` for a `NULL` `app` or `out`,
+  `TESSERA_ERROR_SESSION_NOT_FOUND` and `TESSERA_ERROR_NO_SURFACE`. `*out`
+  is written once, on success only.
+
+**Locks.** `App::view_metrics` takes the session table, then the view table,
+releases them, and then takes the session's terminal: once through
+`scroll_offset` (with the input state after it) and once to read the grid
+size and the cursor cell. It never holds the view table and the terminal
+together, so it adds no edge to the lock order. `render_view` takes the
+view table and then the terminal; `Grid::resize` and the PTY resize take
+theirs one after the other (ADR 0009). The call draws nothing and waits
+for no GPU work of its own. It does wait for the view table, though, and
+`render_view` holds that table while it draws and waits for a drawable.
+Like every `tessera_surface_*` call it is main thread only, and the main
+thread serialises it with rendering. A render in flight on another thread
+breaks that rule, and this call would wait for it. Bounding that case too
+would need a metrics copy outside the view table that every attach,
+resize, font change, detach and close path keeps up to date; it was left
+out because the main-thread rule already excludes the case. The tests
+check that the view table is free while the call waits for
+the terminal (`view_metrics_never_hold_the_view_table_while_waiting_for_the_terminal`)
+and that under a flood of child output the 99th percentile of 200 calls,
+paced 1 ms apart, stays under 2 ms (`view_metrics_are_fast_while_output_floods_the_terminal`).
+
+**The frontend caches the metrics.** Each read locks the session's
+terminal, which is subject to the pacing rule above. `TerminalSurfaceView`
+therefore reads the metrics on attach, after every resize the core accepts
+and at the start of every `render()`, and keeps them in `metrics`. Pointer
+events (`cell(at:)`) and the input method (`firstRect(forCharacterRange:)`)
+use that copy, so a mouse event never calls into the core. `cell(at:)`
+divides by `metrics.scale` and clamps the padding band and anything past the
+grid to the nearest edge cell. `firstRect` returns the cursor cell, two
+columns wide when `cursor_wide`, and falls back to the view's top-left
+corner only while no metrics are known (no surface). The copy is `nil` before the first attach and
+after the view tears its surface down (window closed, view moved out of
+it). When the core drops the surface (a lost
+swapchain, reported by that frame as `TESSERA_ERROR_GPU`, or a closed
+session), the wrapper still counts it as attached, so the next display
+tick renders again. That render's read reports no surface and clears the
+copy, and the copy stays `nil` until a re-attach (the display link does
+not render while detached). In between, for at most one tick, the copy
+holds the last metrics. A
+change seen at a read while text is marked moves the composition
+overlay and invalidates the input context's character coordinates, so
+the candidate window follows the cursor. The copy can be up to
+one frame old: output that arrived since the last render has not moved it
+yet. That is the frame the user is looking at. `TesseraSurface.cellMetrics`
+and `cursorCell` read the core on each access and are meant for callers
+outside the view.

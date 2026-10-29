@@ -24,11 +24,6 @@ import os
 final class TerminalSurfaceView: NSView, TerminalContentView {
     private static let log = Logger(subsystem: "com.aanyberg.tessera", category: "surface")
 
-    /// The theme's default padding in points on every side of the grid. The
-    /// core owns it (`Theme::padding`) and does not export it yet (#90), so
-    /// the composition cell falls back to it.
-    static let defaultPaddingPoints: CGFloat = 4
-
     let session: TesseraSession
     let surface: TesseraSurface
 
@@ -257,6 +252,7 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
                 Self.log.error("detach failed: \(String(describing: error), privacy: .public)")
             }
         }
+        metrics = nil
     }
 
     /// Whether the window is hidden from the user: minimised, occluded or
@@ -312,6 +308,7 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         let size = pixelSize
         do {
             try surface.attach(layer: metalLayer, widthPx: size.widthPx, heightPx: size.heightPx, scale: size.scale)
+            refreshMetrics()
             wantsReattach = false
             reattachFailures = 0
             reattachGaveUpAt = nil
@@ -406,6 +403,7 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         guard size != surface.size else { return }
         do {
             try surface.resize(widthPx: size.widthPx, heightPx: size.heightPx, scale: size.scale)
+            refreshMetrics()
             coreResizeCount += 1
             suboptimalFrames = 0
             needsRender = true
@@ -450,6 +448,7 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
 
     private func render() {
         renderCount += 1
+        refreshMetrics()
         do {
             switch try surface.render() {
             case .presented, .skipped:
@@ -786,11 +785,11 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     override func scrollWheel(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         let (cell, _) = cell(at: point)
-        let scale = window?.backingScaleFactor ?? 1
+        let scale = metrics.map { CGFloat($0.scale) } ?? window?.backingScaleFactor ?? 1
         // A notched wheel reports lines; a trackpad reports points.
         let lines: CGFloat
         if event.hasPreciseScrollingDeltas {
-            let lineHeight = (cellGeometry?.cellSize.height).map { $0 / scale } ?? Self.fallbackLineHeight
+            let lineHeight = metrics.map { CGFloat($0.cellHeightPx) / scale } ?? Self.fallbackLineHeight
             lines = event.scrollingDeltaY / lineHeight
         } else {
             lines = event.scrollingDeltaY
@@ -813,61 +812,72 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
 
     // MARK: Cell geometry
 
-    /// Cell size and grid origin in physical pixels.
-    struct CellGeometry: Equatable {
-        var cellSize: CGSize
-        var padding: CGFloat
+    /// The surface's metrics as last read from the core: on attach, on every
+    /// resize the core accepts and at every ``render()``, so pointer, scroll
+    /// and input-method events use them without calling into the core.
+    /// `nil` before the first attach and after `tearDown()`. When the core
+    /// drops the surface (a lost swapchain, which that frame reports as
+    /// `.gpu`, or a closed session), the next render's read finds no
+    /// surface and clears it; it stays `nil` until a re-attach, since
+    /// ``displayLinkDidFire()`` does not render while detached. While it is `nil`, pointer events carry
+    /// exact pixels and cell 0,0, and the candidate window opens at the
+    /// view's top-left corner. Tests set it to known metrics.
+    var metrics: TesseraSurface.Metrics?
+
+    /// Reads ``metrics`` from the core (`nil` once the surface is gone).
+    /// While text is marked, a change moves the composition overlay and
+    /// tells the input method the character rects moved, so its candidate
+    /// window follows the cursor.
+    private func refreshMetrics() {
+        let previous = metrics
+        metrics = try? surface.metrics()
+        guard metrics != previous, hasMarkedText() else { return }
+        updateMarkedTextLayer()
+        inputContext?.invalidateCharacterCoordinates()
     }
 
-    /// The grid's cell geometry, when known: the surface's (``TesseraSurface/cellMetrics``,
-    /// `nil` until #90 exports it) unless a test sets ``cellGeometryOverride``.
-    /// While it is unknown, pointer events carry exact pixels and cell 0,0,
-    /// and the candidate window opens at the first cell.
-    var cellGeometry: CellGeometry? {
-        if let cellGeometryOverride { return cellGeometryOverride }
-        return surface.cellMetrics.map {
-            CellGeometry(
-                cellSize: CGSize(width: CGFloat($0.widthPx), height: CGFloat($0.heightPx)),
-                padding: CGFloat($0.paddingPx))
-        }
-    }
-
-    /// Replaces the surface's cell geometry (tests).
-    var cellGeometryOverride: CellGeometry?
-
-    /// Line height in points for trackpad scrolling while the cell size is
-    /// unknown (#90; Menlo 13 pt, the default font).
+    /// Line height in points for trackpad scrolling, and the composition
+    /// cell's height, while the cell size is unknown (Menlo 13 pt, the
+    /// default font).
     static let fallbackLineHeight: CGFloat = 16
 
     /// The cell under `point` (view coordinates) and the point in pixels from
-    /// the view's top-left corner.
+    /// the view's top-left corner. The padding band and anything outside the
+    /// grid clamp to the nearest edge cell.
     func cell(at point: NSPoint) -> (cell: (col: UInt16, row: UInt16), pixels: CGPoint) {
-        let scale = window?.backingScaleFactor ?? metalLayer.contentsScale
+        let scale = metrics.map { CGFloat($0.scale) } ?? window?.backingScaleFactor ?? metalLayer.contentsScale
         let fromTop = CGPoint(x: point.x, y: isFlipped ? point.y : bounds.height - point.y)
         let pixels = CGPoint(x: fromTop.x * scale, y: fromTop.y * scale)
-        guard let geometry = cellGeometry, geometry.cellSize.width > 0, geometry.cellSize.height > 0 else {
+        guard let metrics, metrics.cellWidthPx > 0, metrics.cellHeightPx > 0 else {
             return ((0, 0), pixels)
         }
-        func index(_ value: CGFloat, _ size: CGFloat) -> UInt16 {
-            UInt16(clamping: Int(max(0, ((value - geometry.padding) / size).rounded(.down))))
+        func index(_ value: CGFloat, _ size: UInt32, _ count: UInt16) -> UInt16 {
+            let cell = ((value - CGFloat(metrics.paddingPx)) / CGFloat(size)).rounded(.down)
+            guard cell.isFinite, cell > 0 else { return 0 }
+            return UInt16(min(cell, CGFloat(max(count, 1) - 1)))
         }
-        return ((index(pixels.x, geometry.cellSize.width), index(pixels.y, geometry.cellSize.height)), pixels)
+        return (
+            (index(pixels.x, metrics.cellWidthPx, metrics.cols), index(pixels.y, metrics.cellHeightPx, metrics.rows)),
+            pixels
+        )
     }
 
     /// The rect of the cell the composition is drawn in and the candidate
-    /// window is placed under, in view coordinates: the cursor's cell when
-    /// the surface reports it, else the grid's first cell (until #90 exports
-    /// the cursor cell and the cell metrics).
+    /// window is placed under, in view coordinates: the cursor's cell (two
+    /// columns wide on a wide character), or a default-sized cell at the
+    /// view's top-left corner while the surface is not attached.
     func compositionCellRect() -> NSRect {
-        let scale = window?.backingScaleFactor ?? metalLayer.contentsScale
-        let padding = (cellGeometry?.padding).map { $0 / scale } ?? Self.defaultPaddingPoints
-        let size = cellGeometry.map { CGSize(width: $0.cellSize.width / scale, height: $0.cellSize.height / scale) }
-            ?? CGSize(width: Self.fallbackLineHeight / 2, height: Self.fallbackLineHeight)
-        let cursor = surface.cursorCell ?? (row: 0, col: 0)
-        let x = padding + CGFloat(cursor.col) * size.width
-        let fromTop = padding + CGFloat(cursor.row) * size.height
-        let y = isFlipped ? fromTop : bounds.height - fromTop - size.height
-        return NSRect(x: x, y: y, width: size.width, height: size.height)
+        guard let metrics, metrics.scale > 0 else {
+            let size = CGSize(width: Self.fallbackLineHeight / 2, height: Self.fallbackLineHeight)
+            return NSRect(x: 0, y: isFlipped ? 0 : bounds.height - size.height, width: size.width, height: size.height)
+        }
+        let scale = CGFloat(metrics.scale)
+        let padding = CGFloat(metrics.paddingPx) / scale
+        let cell = CGSize(width: CGFloat(metrics.cellWidthPx) / scale, height: CGFloat(metrics.cellHeightPx) / scale)
+        let x = padding + CGFloat(metrics.cursorCol) * cell.width
+        let fromTop = padding + CGFloat(metrics.cursorRow) * cell.height
+        let y = isFlipped ? fromTop : bounds.height - fromTop - cell.height
+        return NSRect(x: x, y: y, width: cell.width * (metrics.cursorWide ? 2 : 1), height: cell.height)
     }
 
     // MARK: Marked text overlay

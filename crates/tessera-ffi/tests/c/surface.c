@@ -2,8 +2,9 @@
  * Surface smoke test of TesseraCore.h from C, built and run by
  * scripts/ffi-c-test.sh: create a bare CAMetalLayer through the
  * Objective-C runtime, attach it to a /bin/sh session at 800x600 scale 1,
- * render 3 frames, resize to 1600x1200 scale 2, render 3 frames, resize to
- * 0x0 (frames are skipped), back to 800x600, detach and close.
+ * render 3 frames, resize to 1600x1200 scale 2, render 3 frames and read
+ * the surface's metrics, resize to 0x0 (frames are skipped), back to
+ * 800x600, detach (metrics then report no surface) and close.
  *
  * A layer outside any window may not vend drawables, so each frame may
  * report PRESENTED or SKIPPED; the test prints which. Skipped entirely when
@@ -12,6 +13,7 @@
 
 #include <objc/message.h>
 #include <objc/runtime.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -25,6 +27,11 @@ struct size {
     double width;
     double height;
 };
+
+/* The layout the Rust side pins (surface::tests); a drift breaks the build. */
+_Static_assert(sizeof(TesseraSurfaceMetrics) == 44, "TesseraSurfaceMetrics size");
+_Static_assert(offsetof(TesseraSurfaceMetrics, font_size_pt) == 32, "font_size_pt offset");
+_Static_assert(offsetof(TesseraSurfaceMetrics, cursor_wide) == 41, "cursor_wide offset");
 
 typedef id (*send_id_fn)(id, SEL);
 typedef void (*send_obj_fn)(id, SEL, void *);
@@ -115,6 +122,20 @@ int main(void) {
         return 1;
     }
 
+    TesseraSurfaceMetrics metrics = {0};
+    CHECK(tessera_surface_metrics(app, id, &metrics));
+    printf("metrics: %ux%u @%gx, cell %ux%u, padding %u, %ux%u cells, %g pt, cursor %u,%u\n",
+           metrics.width_px, metrics.height_px, (double)metrics.scale, metrics.cell_width_px,
+           metrics.cell_height_px, metrics.padding_px, (unsigned)metrics.cols,
+           (unsigned)metrics.rows, (double)metrics.font_size_pt, (unsigned)metrics.cursor_row,
+           (unsigned)metrics.cursor_col);
+    if (metrics.width_px != 1600 || metrics.height_px != 1200 || metrics.scale != 2.0f ||
+        metrics.cell_width_px == 0 || metrics.rows == 0 || metrics.cols == 0 ||
+        metrics.cursor_row >= metrics.rows || metrics.cursor_col >= metrics.cols) {
+        fprintf(stderr, "unexpected metrics\n");
+        return 1;
+    }
+
     CHECK(tessera_surface_resize(app, id, 0, 0, 2.0f));
     TesseraFrameStatus status = TESSERA_FRAME_STATUS_PRESENTED;
     CHECK(tessera_surface_render(app, id, &status));
@@ -131,6 +152,10 @@ int main(void) {
     CHECK(tessera_surface_detach(app, id));
     if (tessera_surface_detach(app, id) != TESSERA_ERROR_NO_SURFACE) {
         fprintf(stderr, "a second detach should report TESSERA_ERROR_NO_SURFACE\n");
+        return 1;
+    }
+    if (tessera_surface_metrics(app, id, &metrics) != TESSERA_ERROR_NO_SURFACE) {
+        fprintf(stderr, "metrics without a surface should report TESSERA_ERROR_NO_SURFACE\n");
         return 1;
     }
     CHECK(tessera_session_close(app, id));
