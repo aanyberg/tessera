@@ -1276,9 +1276,11 @@ pub unsafe extern "C" fn tessera_session_send_scroll(
 /// **Never blocks.** The sanitised text joins the session's pending input
 /// (16 MiB at most, shared with keys) and a core thread writes it to the
 /// child in order as the child reads; keys sent afterwards reach the child
-/// after the paste. A paste that does not fit in the free pending space is
-/// refused whole with `TESSERA_ERROR_IO`, so one paste larger than 16 MiB
-/// after sanitising always fails. Closing the session drops whatever is still pending.
+/// after the paste. A paste whose length `len` (before sanitising) does not
+/// fit in the free pending space is refused whole with `TESSERA_ERROR_IO`
+/// before its bytes are read, validated or copied, so one paste longer than
+/// 16 MiB always fails, at once and without allocating. A paste that fits is
+/// copied once. Closing the session drops whatever is still pending.
 ///
 /// Call from the UI (main) thread only.
 ///
@@ -1286,8 +1288,9 @@ pub unsafe extern "C" fn tessera_session_send_scroll(
 /// `NULL` with a non-zero `len`; `TESSERA_ERROR_INVALID_ARGUMENT` if the
 /// bytes are not UTF-8 (nothing is sent); `TESSERA_ERROR_SESSION_NOT_FOUND`
 /// if the id is not a live session; `TESSERA_ERROR_IO` if the child has
-/// exited, the session is closing or the paste does not fit in the free
-/// pending space (nothing is sent).
+/// exited, the session is closing or `len` does not fit in the free
+/// pending space (nothing is sent). These session errors are reported
+/// before the text is checked for UTF-8.
 ///
 /// # Safety
 ///
@@ -1307,15 +1310,24 @@ pub unsafe extern "C" fn tessera_session_paste(
         let Some(app) = (unsafe { App::from_ptr(app) }) else {
             return Error::NullPointer;
         };
+        let id = SessionId::from_raw(session_id);
+        if len > 0 && text.is_null() {
+            return Error::NullPointer;
+        }
+        // Refuse a paste that cannot fit before validating or copying it;
+        // sanitising never lengthens text, so the raw length bounds it.
+        if len > 0
+            && let Err(error) = app.core.check_input_room(id, len)
+        {
+            return error::report("tessera_session_paste", &error);
+        }
         // SAFETY: `text` points to `len` readable bytes per the contract.
         let text = match unsafe { utf8(text, len, Error::NullPointer) } {
             Ok(text) => text.unwrap_or_default(),
             Err(code) => return code,
         };
-        match app.core.send_input(
-            SessionId::from_raw(session_id),
-            InputEvent::Paste(text.to_owned()),
-        ) {
+        // Borrowed: the text is sanitised straight into the queued buffer.
+        match app.core.paste(id, text) {
             Ok(_) => Error::Ok,
             Err(error) => error::report("tessera_session_paste", &error),
         }

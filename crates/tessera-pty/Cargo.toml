@@ -11,9 +11,13 @@ publish.workspace = true
 
 [dependencies]
 portable-pty.workspace = true
-nix = { workspace = true, features = ["signal"] }
+nix = { workspace = true, features = ["feature", "signal"] }
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# `waitpid` proves a refused spawn left no child behind.
+nix = { workspace = true, features = ["feature", "process", "signal"] }
 
 [lints]
 workspace = true

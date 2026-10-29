@@ -118,7 +118,11 @@ reaches the child after the paste. Input that does not fit in the free
 outbox space is refused whole with `TESSERA_ERROR_IO` and nothing of it
 is queued, so a single key or paste larger than 16 MiB always fails.
 Input to a child that has exited, or to a session that is closing, fails
-the same way. Closing a session closes its outbox: pending bytes are
+the same way. A paste is judged on its raw length, before sanitising and
+before its bytes are read or copied (#74), so a paste that sanitising
+would shrink enough to fit is still refused, and a paste of control
+characters only into a full or closing session fails rather than
+returning `IGNORED`. Closing a session closes its outbox: pending bytes are
 dropped, the writer stops within one write backoff period (20 ms) and is
 joined, so a close during a pending paste returns promptly. (Since #79 the
 close returns at once and the application's reaper joins the writer in the

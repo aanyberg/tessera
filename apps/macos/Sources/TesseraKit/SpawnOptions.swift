@@ -15,7 +15,8 @@ extension TesseraSession {
         /// URL. A path that is not an existing directory falls back to the home
         /// directory.
         public var workingDirectory: URL?
-        /// Initial size in cells; both must be at least 1.
+        /// Initial size in cells: 1 to `TESSERA_MAX_ROWS` (1024) rows and 1 to
+        /// `TESSERA_MAX_COLS` (2048) columns.
         public var rows: UInt16
         public var cols: UInt16
         /// Size of the view in pixels, or 0 when unknown.

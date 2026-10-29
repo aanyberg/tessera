@@ -4,11 +4,25 @@ use std::ffi::{CStr, OsStr, c_char};
 use std::os::unix::ffi::OsStrExt;
 use std::slice;
 
+use tessera_app_core::view::{MAX_VIEW_COLS, MAX_VIEW_ROWS};
 use tessera_app_core::{PtySize, SessionId, SpawnOptions as CoreSpawnOptions};
 
 use crate::app::App;
 use crate::error::{self, Error};
 use crate::panic::ffi_guard;
+
+/// Most rows a session can have: `tessera_session_spawn` and
+/// `tessera_session_resize` refuse more with
+/// `TESSERA_ERROR_INVALID_ARGUMENT`. It is the most a surface ever derives,
+/// so a frontend that sizes sessions from their surface never meets it.
+pub const MAX_ROWS: u16 = 1024;
+
+/// Most columns a session can have; see `TESSERA_MAX_ROWS`.
+pub const MAX_COLS: u16 = 2048;
+
+// cbindgen needs literals for the header; these keep them equal to the
+// core's bounds.
+const _: () = assert!(MAX_ROWS == MAX_VIEW_ROWS && MAX_COLS == MAX_VIEW_COLS);
 
 /// What `tessera_session_spawn` starts.
 ///
@@ -32,13 +46,15 @@ pub struct SpawnOptions {
     /// that is not an existing directory also falls back to the home
     /// directory rather than failing the spawn.
     pub cwd: *const c_char,
-    /// Initial number of rows; must be at least 1.
+    /// Initial number of rows: 1 to `TESSERA_MAX_ROWS`.
     pub rows: u16,
-    /// Initial number of columns; must be at least 1.
+    /// Initial number of columns: 1 to `TESSERA_MAX_COLS`.
     pub cols: u16,
-    /// Width of the view in pixels, or 0 when unknown.
+    /// Width of the view in pixels, or 0 when unknown. Any value is
+    /// accepted; it is only reported to the child.
     pub width_px: u16,
-    /// Height of the view in pixels, or 0 when unknown.
+    /// Height of the view in pixels, or 0 when unknown. Any value is
+    /// accepted; it is only reported to the child.
     pub height_px: u16,
 }
 
@@ -49,7 +65,8 @@ impl SpawnOptions {
     ///
     /// Every pointer must satisfy the contract documented on the fields.
     unsafe fn to_core(self) -> Result<CoreSpawnOptions, Error> {
-        if self.rows == 0 || self.cols == 0 {
+        // Checked before any string is copied; the core checks again.
+        if !(1..=MAX_ROWS).contains(&self.rows) || !(1..=MAX_COLS).contains(&self.cols) {
             return Err(Error::InvalidArgument);
         }
         let size = PtySize::new(self.rows, self.cols).with_pixels(self.width_px, self.height_px);
@@ -108,10 +125,14 @@ unsafe fn os_str<'a>(ptr: *const c_char) -> &'a OsStr {
 ///
 /// Returns `TESSERA_ERROR_NULL_POINTER` if `app`, `options` or `out_id` is
 /// `NULL` (or an argument string is), `TESSERA_ERROR_INVALID_ARGUMENT` for
-/// zero rows or columns or an empty program, `TESSERA_ERROR_SPAWN_FAILED`
-/// if no PTY is available, the program cannot be started or a thread could
-/// not be created.
-/// `*out_id` is set to 0 on failure.
+/// zero rows or columns, more than `TESSERA_MAX_ROWS` (1024) rows or
+/// `TESSERA_MAX_COLS` (2048) columns, or an empty program,
+/// `TESSERA_ERROR_SPAWN_FAILED` if no PTY is available, the program cannot
+/// be started, a thread could not be created, or the arguments and the
+/// environment together exceed what the system lets a program start with
+/// (`ARG_MAX`, 1 MiB on macOS, less a tenth kept for the system; this
+/// process's whole environment counts). Nothing is left running after a
+/// failure, and `*out_id` is set to 0.
 ///
 /// # Safety
 ///
@@ -262,8 +283,10 @@ pub unsafe extern "C" fn tessera_session_write(
 /// Returns `TESSERA_ERROR_NULL_POINTER` if `app` is `NULL`,
 /// `TESSERA_ERROR_SESSION_NOT_FOUND` if the id is not a live session,
 /// `TESSERA_ERROR_INVALID_ARGUMENT` for zero rows or columns or more than
-/// 1024 rows or 2048 columns (the largest grid a surface derives; nothing
-/// changes then), `TESSERA_ERROR_IO` if the kernel rejects the size.
+/// `TESSERA_MAX_ROWS` (1024) rows or `TESSERA_MAX_COLS` (2048) columns (the
+/// largest grid a surface derives; nothing changes then),
+/// `TESSERA_ERROR_IO` if the kernel rejects the size. Any pixel size is
+/// accepted.
 ///
 /// # Safety
 ///

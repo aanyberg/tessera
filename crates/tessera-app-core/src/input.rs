@@ -23,8 +23,10 @@
 //! * **Scroll**: moves the session's scrollback view (see
 //!   [`App::scroll_offset`](crate::App::scroll_offset)), accumulating
 //!   fractional lines.
-//! * **Paste**: sanitised with [`sanitize_paste`] and queued like a key,
-//!   in order with the keys around it.
+//! * **Paste**: sanitised with [`sanitize_paste_into`] straight into the
+//!   buffer that is queued, like a key, in order with the keys around it.
+//!   Its room is checked on the raw length first, so a paste that cannot
+//!   fit is refused before anything is copied.
 //! * **Focus**: recorded (see [`App::is_focused`](crate::App::is_focused));
 //!   nothing is written until focus reporting (DECSET 1004, #8) exists.
 
@@ -266,24 +268,43 @@ impl Bindings {
 ///   editing (`^U`, `^W`, `DEL`) or an early end of a bracketed paste.
 ///
 /// Everything else, including all printable Unicode, is kept unchanged.
+/// [`sanitize_paste_into`] does the same without allocating a new string.
+#[must_use]
 pub fn sanitize_paste(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
+    let mut out = Vec::with_capacity(text.len());
+    sanitize_paste_into(text, &mut out);
+    // Only whole characters and ASCII line breaks are copied, so the
+    // result is UTF-8; checking it costs one pass, never a panic.
+    String::from_utf8(out)
+        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
+}
+
+/// Appends `text`, sanitised as [`sanitize_paste`] describes, to `out` in
+/// one pass.
+///
+/// Sanitising never lengthens text, so at most `text.len()` bytes are
+/// appended: a caller that reserves that much copies the paste exactly
+/// once. Runs of kept characters are copied as slices.
+pub fn sanitize_paste_into(text: &str, out: &mut Vec<u8>) {
+    let bytes = text.as_bytes();
+    let mut run = 0;
+    let mut chars = text.char_indices().peekable();
+    while let Some((at, ch)) = chars.next() {
+        if ch == '\t' || !ch.is_control() {
+            continue;
+        }
+        out.extend_from_slice(&bytes[run..at]);
         match ch {
             '\r' => {
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
-                }
-                out.push('\r');
+                chars.next_if(|&(_, next)| next == '\n');
+                out.push(b'\r');
             }
-            '\n' => out.push('\r'),
-            '\t' => out.push('\t'),
-            c if c.is_control() => {}
-            c => out.push(c),
+            '\n' => out.push(b'\r'),
+            _ => {}
         }
+        run = chars.peek().map_or(bytes.len(), |&(next, _)| next);
     }
-    out
+    out.extend_from_slice(&bytes[run..]);
 }
 
 #[cfg(test)]
@@ -304,6 +325,68 @@ mod tests {
         assert_eq!(sanitize_paste("\u{80}\u{9b}31m\u{9f}"), "31m");
         assert_eq!(sanitize_paste("\u{a0}é漢字🦀"), "\u{a0}é漢字🦀");
         assert_eq!(sanitize_paste("\x1b[201~evil"), "[201~evil");
+    }
+
+    /// The character-by-character sanitiser `sanitize_paste` used to be;
+    /// the slice-copying one must agree with it.
+    fn reference_sanitize(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\r' => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    out.push('\r');
+                }
+                '\n' => out.push('\r'),
+                '\t' => out.push('\t'),
+                c if c.is_control() => {}
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn sanitising_into_a_buffer_matches_the_reference_on_every_short_string() {
+        // Every string of up to five characters over an alphabet with each
+        // kind of character: line breaks, tab, C0, DEL, C1, ASCII and
+        // multi-byte text (9^5 + ... = 66 430 strings).
+        const ALPHABET: [char; 9] = ['\r', '\n', '\t', '\x1b', '\x7f', '\u{85}', 'a', 'é', '🦀'];
+        let mut text = String::new();
+        let mut out = Vec::new();
+        let mut indices = Vec::new();
+        loop {
+            text.clear();
+            text.extend(indices.iter().map(|&i: &usize| ALPHABET[i]));
+            out.clear();
+            out.extend_from_slice(b"prefix");
+            sanitize_paste_into(&text, &mut out);
+            let expected = reference_sanitize(&text);
+            assert_eq!(&out[..6], b"prefix", "{text:?}");
+            assert_eq!(&out[6..], expected.as_bytes(), "{text:?}");
+            assert!(out.len() - 6 <= text.len(), "{text:?} grew");
+            assert_eq!(sanitize_paste(&text), expected, "{text:?}");
+            // Next string in length-then-lexicographic order.
+            let mut digit = 0;
+            loop {
+                if digit == indices.len() {
+                    indices.push(0);
+                    break;
+                }
+                indices[digit] += 1;
+                if indices[digit] < ALPHABET.len() {
+                    break;
+                }
+                indices[digit] = 0;
+                digit += 1;
+            }
+            if indices.len() > 5 {
+                break;
+            }
+        }
     }
 
     #[test]

@@ -22,8 +22,8 @@ pub enum Error {
     /// The session id does not name a live session of this application.
     SessionNotFound = 3,
     /// The session could not be started: no PTY was available, the program
-    /// does not exist or is not executable, or a thread could not be
-    /// created.
+    /// does not exist or is not executable, its arguments and environment
+    /// are too large to start it with, or a thread could not be created.
     SpawnFailed = 4,
     /// An operating-system I/O call failed, for example writing to a
     /// session whose child has exited.
@@ -44,7 +44,9 @@ impl From<&CoreError> for Error {
         match error {
             CoreError::SessionNotFound(_) => Self::SessionNotFound,
             CoreError::Pty(pty) => match pty {
-                PtyError::Open(_) | PtyError::Spawn { .. } => Self::SpawnFailed,
+                PtyError::Open(_) | PtyError::Spawn { .. } | PtyError::ArgumentsTooLong { .. } => {
+                    Self::SpawnFailed
+                }
                 PtyError::InvalidSize(_) => Self::InvalidArgument,
                 PtyError::Resize(_) | PtyError::Io(_) => Self::Io,
             },
@@ -116,6 +118,10 @@ mod tests {
                     program: "x".into(),
                     reason: "y".into(),
                 }),
+                Error::SpawnFailed,
+            ),
+            (
+                CoreError::Pty(PtyError::ArgumentsTooLong { bytes: 2, max: 1 }),
                 Error::SpawnFailed,
             ),
             (
