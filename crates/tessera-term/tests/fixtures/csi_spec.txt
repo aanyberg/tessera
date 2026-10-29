@@ -107,8 +107,10 @@
 #           sc->wrap_flag` after CursorSet). Matches Grid::save_cursor (brief decision 2). The scroll
 #           region and tab stops are not saved. DECOM/charsets arrive with #8.
 #   D-HPR   Not in the issue list but implemented by xterm: HPR (`a`), VPR (`e`), SCOSC/SCORC
-#           (`CSI s`/`CSI u`), SL/SR (`CSI Ps SP @`/`A`). The brief says ignore; rows UNK13, SC09, UNK07
-#           pin "ignored". Adding HPR/VPR is one line each if the lead wants them.
+#           (`CSI s`/`CSI u`), SL/SR (`CSI Ps SP @`/`A`). The brief said ignore; UNK07 still pins SL/SR
+#           "ignored". HPR/VPR (#93) and SCOSC/SCORC (#94) are implemented since: rows UNK13 and SC09
+#           were rewritten to xterm's behaviour and the HPR, VPR and SCO rows at the end of part 1 pin
+#           them (VPR is CursorSet: it clamps to the screen, not to the bottom margin like CUD).
 #   D-COLON `CSI 1:2 H` is rejected by xterm but flattened to [1,2] by vte: unfixable in csi.rs. Row UNK18.
 #   D-SB    xterm saves scrolled-off lines whenever the TOP margin is row 1, even with a short
 #           bottom margin (xtermScroll: scroll_all_lines = top_marg == 0); Grid::scroll_up only keeps
@@ -4437,19 +4439,18 @@ pending_wrap: true
 requests: []
 scrollback: len=1 first=("a", wrapped=true)
 
-### SC09_ansi_csi_s_u_not_handled
+### SC09_ansi_csi_s_u_save_restore
 size: 5x10
 step: feed \x1b[2;4H\x1b[s\x1b[4;8H\x1b[uX
-cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI s / CSI u are not in the issue list (xterm: SCOSC/SCORC); brief: unknown CSI -> ignored
-note: Expected per the brief: CSI s / u are ignored, so X lands at (3,7). Flag for the lead: xterm implements them; adding is two lines of csi.rs and arguably correct.
-flags: decision-D-SCOSC
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI s (SCOSC), CSI u (SCORC); https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_ANSI_SC -> CursorSave, CASE_ANSI_RC -> CASE_DECRC -> CursorRestore
+note: SCOSC/SCORC are SC01 with CSI s / CSI u: save at (1,3), move, restore, X at (1,3). Pinned "ignored" until #94 (decision D-HPR); more rows under SCO at the end of part 1.
 screen:
 >
+>   X |
 >
 >
->       X |
 >
-cursor: (3,8)   # 1-based row 4 col 9
+cursor: (1,4)   # 1-based row 2 col 5
 pending_wrap: false
 requests: []
 scrollback: len=0
@@ -5043,19 +5044,18 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-### UNK13_hpr_vpr_not_in_list
+### UNK13_hpr_vpr_handled
 size: 5x10
 step: feed \x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX\x1b[3;5H\x1b[2a\x1b[2eX
-cite: Brief: unknown CSI/ESC (any final byte, any private marker, any intermediate not handled): trace and ignore; https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c (xterm itself implements several of these; the point is tessera #6 ignores them without touching the grid)
-note: HPR (a) and VPR (e) are not in the issue's list; xterm implements both (CASE_HPR/CASE_VPR). Per the brief they are ignored; lead may add them (one line each).
-flags: decision-D-HPR
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI Pm a (HPR), CSI Pm e (VPR); https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_HPR/CASE_VPR -> cursor.c CursorSet
+note: Pinned "ignored" until #93 (decision D-HPR). HPR 2 then VPR 2 from (2,4): (2,6), then (4,6); X there. More rows under HPR and VPR at the end of part 1.
 screen:
 >abcdefghij
 >klmnopqrst
->uvwxXz|ABCD
+>uvwxyzABCD
 >EFGHIJKLMN
->OPQRSTUVWX
-cursor: (2,5)   # 1-based row 3 col 6
+>OPQRSTXV|WX
+cursor: (4,7)   # 1-based row 5 col 8
 pending_wrap: false
 requests: []
 scrollback: len=0
@@ -5189,6 +5189,382 @@ screen:
 >EFGHIJKLMN
 >OPQRSTUVWX
 cursor: (2,6)   # 1-based row 3 col 7
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+# ---------------------------------------- HPR
+# The HPR, VPR and SCO rows (#93, #94) were derived by hand from xterm's source (charproc.c CASE_HPR, CASE_VPR,
+# CASE_ANSI_SC, CASE_ANSI_RC; cursor.c CursorSet, CursorSave2, CursorRestoreFlags), not by tools/model.py.
+
+### HPR01_default
+size: 5x10
+step: feed \x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
+step: feed \x1b[3;5H\x1b[aX
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI Pm a (HPR) default 1; https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_HPR -> cursor.c CursorSet(row, col + n) (clamps to the last column, ResetWrap); esctest2 esctest/tests/hpr.py
+note: One right, like CUF01.
+screen:
+>abcdefghij
+>klmnopqrst
+>uvwxyXA|BCD
+>EFGHIJKLMN
+>OPQRSTUVWX
+cursor: (2,6)   # 1-based row 3 col 7
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### HPR02_zero_is_one
+size: 5x10
+step: feed \x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
+step: feed \x1b[3;5H\x1b[0aX
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI Pm a (HPR) default 1; https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_HPR -> cursor.c CursorSet(row, col + n) (clamps to the last column, ResetWrap); esctest2 esctest/tests/hpr.py
+note: 0 = 1 (one_if_default).
+screen:
+>abcdefghij
+>klmnopqrst
+>uvwxyXA|BCD
+>EFGHIJKLMN
+>OPQRSTUVWX
+cursor: (2,6)   # 1-based row 3 col 7
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### HPR03_three
+size: 5x10
+step: feed \x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
+step: feed \x1b[3;5H\x1b[3aX
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI Pm a (HPR) default 1; https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_HPR -> cursor.c CursorSet(row, col + n) (clamps to the last column, ResetWrap); esctest2 esctest/tests/hpr.py
+note: idx 4 -> 7, row unchanged.
+screen:
+>abcdefghij
+>klmnopqrst
+>uvwxyzAXC|D
+>EFGHIJKLMN
+>OPQRSTUVWX
+cursor: (2,8)   # 1-based row 3 col 9
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### HPR04_clamp_right
+size: 5x10
+step: feed \x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
+step: feed \x1b[3;5H\x1b[99aX
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI Pm a (HPR) default 1; https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_HPR -> cursor.c CursorSet(row, col + n) (clamps to the last column, ResetWrap); esctest2 esctest/tests/hpr.py
+note: Clamps at the last column and never wraps; X then arms the pending wrap.
+screen:
+>abcdefghij
+>klmnopqrst
+>uvwxyzABCX|
+>EFGHIJKLMN
+>OPQRSTUVWX
+cursor: (2,9)   # 1-based row 3 col 10
+pending_wrap: true
+requests: []
+scrollback: len=0
+
+### HPR05_max_u16
+size: 5x10
+step: feed \x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
+step: feed \x1b[3;5H\x1b[65535aX
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI Pm a (HPR) default 1; https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_HPR -> cursor.c CursorSet(row, col + n) (clamps to the last column, ResetWrap); esctest2 esctest/tests/hpr.py
+note: u16 max: the add must saturate.
+screen:
+>abcdefghij
+>klmnopqrst
+>uvwxyzABCX|
+>EFGHIJKLMN
+>OPQRSTUVWX
+cursor: (2,9)   # 1-based row 3 col 10
+pending_wrap: true
+requests: []
+scrollback: len=0
+
+### HPR06_pending_wrap_cleared
+size: 5x10
+step: feed \x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
+step: feed \x1b[1;10Hj\x1b[aX
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI Pm a (HPR) default 1; https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_HPR -> cursor.c CursorSet(row, col + n) (clamps to the last column, ResetWrap); esctest2 esctest/tests/hpr.py
+note: Pending armed at (0,9). HPR cannot move but CursorSet still clears the wrap (ResetWrap), so X overwrites (0,9) instead of wrapping, as CUF06.
+screen:
+>abcdefghiX|
+>klmnopqrst
+>uvwxyzABCD
+>EFGHIJKLMN
+>OPQRSTUVWX
+cursor: (0,9)   # 1-based row 1 col 10
+pending_wrap: true
+requests: []
+scrollback: len=0
+
+# ---------------------------------------- VPR
+
+### VPR01_default
+size: 5x10
+step: feed \x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
+step: feed \x1b[2;5H\x1b[eX
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI Pm e (VPR) default 1; https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_VPR -> cursor.c CursorSet(row + n, col) (clamps to the last row of the SCREEN, not the bottom margin; ResetWrap; no scrolling); esctest2 esctest/tests/vpr.py
+note: One down, column unchanged.
+screen:
+>abcdefghij
+>klmnopqrst
+>uvwxXz|ABCD
+>EFGHIJKLMN
+>OPQRSTUVWX
+cursor: (2,5)   # 1-based row 3 col 6
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### VPR02_zero_is_one
+size: 5x10
+step: feed \x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
+step: feed \x1b[2;5H\x1b[0eX
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI Pm e (VPR) default 1; https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_VPR -> cursor.c CursorSet(row + n, col) (clamps to the last row of the SCREEN, not the bottom margin; ResetWrap; no scrolling); esctest2 esctest/tests/vpr.py
+note: 0 = 1 (one_if_default).
+screen:
+>abcdefghij
+>klmnopqrst
+>uvwxXz|ABCD
+>EFGHIJKLMN
+>OPQRSTUVWX
+cursor: (2,5)   # 1-based row 3 col 6
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### VPR03_three
+size: 5x10
+step: feed \x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
+step: feed \x1b[1;5H\x1b[3eX
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI Pm e (VPR) default 1; https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_VPR -> cursor.c CursorSet(row + n, col) (clamps to the last row of the SCREEN, not the bottom margin; ResetWrap; no scrolling); esctest2 esctest/tests/vpr.py
+note: Row 0 -> 3, column unchanged.
+screen:
+>abcdefghij
+>klmnopqrst
+>uvwxyzABCD
+>EFGHXJ|KLMN
+>OPQRSTUVWX
+cursor: (3,5)   # 1-based row 4 col 6
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### VPR04_clamp_bottom_no_scroll
+size: 5x10
+step: feed \x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
+step: feed \x1b[3;5H\x1b[99eX
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI Pm e (VPR) default 1; https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_VPR -> cursor.c CursorSet(row + n, col) (clamps to the last row of the SCREEN, not the bottom margin; ResetWrap; no scrolling); esctest2 esctest/tests/vpr.py
+note: Clamps at the last row; never scrolls (scrollback stays empty).
+screen:
+>abcdefghij
+>klmnopqrst
+>uvwxyzABCD
+>EFGHIJKLMN
+>OPQRXT|UVWX
+cursor: (4,5)   # 1-based row 5 col 6
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### VPR05_max_u16
+size: 5x10
+step: feed \x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
+step: feed \x1b[3;5H\x1b[65535eX
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI Pm e (VPR) default 1; https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_VPR -> cursor.c CursorSet(row + n, col) (clamps to the last row of the SCREEN, not the bottom margin; ResetWrap; no scrolling); esctest2 esctest/tests/vpr.py
+note: u16 max: the add must saturate.
+screen:
+>abcdefghij
+>klmnopqrst
+>uvwxyzABCD
+>EFGHIJKLMN
+>OPQRXT|UVWX
+cursor: (4,5)   # 1-based row 5 col 6
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### VPR06_pending_wrap_cleared
+size: 5x10
+step: feed \x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
+step: feed \x1b[1;10Hj\x1b[eX
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI Pm e (VPR) default 1; https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_VPR -> cursor.c CursorSet(row + n, col) (clamps to the last row of the SCREEN, not the bottom margin; ResetWrap; no scrolling); esctest2 esctest/tests/vpr.py
+note: Pending armed at (0,9); VPR moves to (1,9) and clears it, so X lands there and re-arms it.
+screen:
+>abcdefghij
+>klmnopqrsX|
+>uvwxyzABCD
+>EFGHIJKLMN
+>OPQRSTUVWX
+cursor: (1,9)   # 1-based row 2 col 10
+pending_wrap: true
+requests: []
+scrollback: len=0
+
+### VPR07_passes_the_bottom_margin
+size: 5x10
+step: feed \x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
+step: feed \x1b[1;3r\x1b[2;5H\x1b[9eX
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI Pm e (VPR) default 1; https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_VPR -> cursor.c CursorSet(row + n, col) (clamps to the last row of the SCREEN, not the bottom margin; ResetWrap; no scrolling); esctest2 esctest/tests/vpr.py
+note: Region rows 1-3, cursor inside it at (1,4). CUD would stop at the bottom margin (2,4); VPR is CursorSet without DECOM, so it clamps to the screen: (4,4). Origin mode (#8) will clamp it to the margin.
+screen:
+>abcdefghij
+>klmnopqrst
+>uvwxyzABCD
+>EFGHIJKLMN
+>OPQRXT|UVWX
+cursor: (4,5)   # 1-based row 5 col 6
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### VPR08_bottom_row_pending_wrap_cleared
+size: 5x10
+step: feed \x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
+step: feed \x1b[5;10Hx\x1b[ey
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI Pm e (VPR) default 1; https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_VPR -> cursor.c CursorSet(row + n, col) (clamps to the last row of the SCREEN, not the bottom margin; ResetWrap; no scrolling); esctest2 esctest/tests/vpr.py
+note: x at (4,9) arms the pending wrap on the last row. VPR cannot move (clamped to the last row) but CursorSet still clears the wrap, so y overwrites (4,9) instead of wrapping and scrolling; scrollback stays empty.
+screen:
+>abcdefghij
+>klmnopqrst
+>uvwxyzABCD
+>EFGHIJKLMN
+>OPQRSTUVWy|
+cursor: (4,9)   # 1-based row 5 col 10
+pending_wrap: true
+requests: []
+scrollback: len=0
+
+# ---------------------------------------- SCOSC / SCORC
+
+### SCO01_pending_wrap_restored
+size: 5x10
+step: feed \x1b[2;10Ht\x1b[s\x1b[4;3H\x1b[uX
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI s (SCOSC, only when DECLRMM is off), CSI u (SCORC); https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_ANSI_SC (only_default() -> CursorSave), CASE_ANSI_RC (only_default(), falls through to CASE_DECRC -> CursorRestore); esctest2 esctest/tests/scorc.py
+note: CSI s saves the wrap flag like DECSC (CursorSave2 wrap_flag) and CSI u re-arms it, so X wraps to row 2 col 0 and row 1 is soft-wrapped (as SC03).
+screen:
+>
+>         t\
+>X |
+>
+>
+cursor: (2,1)   # 1-based row 3 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SCO02_restore_without_save_homes
+size: 5x10
+step: feed \x1b[4;8H\x1b[uX
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI s (SCOSC, only when DECLRMM is off), CSI u (SCORC); https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_ANSI_SC (only_default() -> CursorSave), CASE_ANSI_RC (only_default(), falls through to CASE_DECRC -> CursorRestore); esctest2 esctest/tests/scorc.py; cursor.c CursorRestoreFlags (initial saved cursor is home)
+note: CSI u with nothing saved homes the cursor, as DECRC (SC02).
+screen:
+>X |
+>
+>
+>
+>
+cursor: (0,1)   # 1-based row 1 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SCO03_decsc_then_scorc
+size: 5x10
+step: feed \x1b[2;4H\x1b7\x1b[4;8H\x1b[uX
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI s (SCOSC, only when DECLRMM is off), CSI u (SCORC); https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_ANSI_SC (only_default() -> CursorSave), CASE_ANSI_RC (only_default(), falls through to CASE_DECRC -> CursorRestore); esctest2 esctest/tests/scorc.py
+note: One slot: DECSC saves, SCORC restores it.
+screen:
+>
+>   X |
+>
+>
+>
+cursor: (1,4)   # 1-based row 2 col 5
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SCO04_scosc_then_decrc
+size: 5x10
+step: feed \x1b[2;4H\x1b[s\x1b[4;8H\x1b8X
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI s (SCOSC, only when DECLRMM is off), CSI u (SCORC); https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_ANSI_SC (only_default() -> CursorSave), CASE_ANSI_RC (only_default(), falls through to CASE_DECRC -> CursorRestore); esctest2 esctest/tests/scorc.py
+note: One slot: SCOSC saves, DECRC restores it.
+screen:
+>
+>   X |
+>
+>
+>
+cursor: (1,4)   # 1-based row 2 col 5
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SCO05_scosc_with_params_ignored
+size: 5x10
+step: feed \x1b[2;4H\x1b[s\x1b[3;6H\x1b[1;10s\x1b[5;1H\x1b[uX
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI s (SCOSC, only when DECLRMM is off), CSI u (SCORC); https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_ANSI_SC (only_default() -> CursorSave), CASE_ANSI_RC (only_default(), falls through to CASE_DECRC -> CursorRestore); esctest2 esctest/tests/scorc.py
+note: CSI 1;10 s (DECSLRM's shape) is not only_default(): it neither saves nor moves (DECLRMM is off), so CSI u returns to the first save (1,3).
+screen:
+>
+>   X |
+>
+>
+>
+cursor: (1,4)   # 1-based row 2 col 5
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SCO06_scorc_with_param_ignored
+size: 5x10
+step: feed \x1b[2;4H\x1b[s\x1b[4;8H\x1b[1uX
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI s (SCOSC, only when DECLRMM is off), CSI u (SCORC); https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_ANSI_SC (only_default() -> CursorSave), CASE_ANSI_RC (only_default(), falls through to CASE_DECRC -> CursorRestore); esctest2 esctest/tests/scorc.py
+note: CSI 1 u is not only_default(): ignored, X at (3,7).
+deviation: xterm's CASE_ANSI_RC breaks out WITHOUT ResetState, so its parser stays in the CSI state with the old parameters and takes the next byte as another final: in xterm `CSI 1 u X` runs ECH 1 at (3,7) and prints nothing. Tessera returns to ground after every sequence, so X prints; the row pins that.
+screen:
+>
+>
+>
+>       X |
+>
+cursor: (3,8)   # 1-based row 4 col 9
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SCO07_kitty_keyboard_queries_are_not_scorc
+size: 5x10
+step: feed \x1b[2;4H\x1b[s\x1b[4;8H\x1b[?u\x1b[>1u\x1b[<u\x1b[=1;1uX
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI s (SCOSC, only when DECLRMM is off), CSI u (SCORC); https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_ANSI_SC (only_default() -> CursorSave), CASE_ANSI_RC (only_default(), falls through to CASE_DECRC -> CursorRestore); esctest2 esctest/tests/scorc.py; https://sw.kovidgoyal.net/kitty/keyboard-protocol/ (CSI ? u, CSI > flags u, CSI < u, CSI = flags ; mode u)
+note: The kitty keyboard protocol's u sequences carry a private marker and never restore the cursor; X at (3,7).
+screen:
+>
+>
+>
+>       X |
+>
+cursor: (3,8)   # 1-based row 4 col 9
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SCO08_explicit_zero_saves
+size: 5x10
+step: feed \x1b[2;4H\x1b[0s\x1b[4;8H\x1b[0uX
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI s (SCOSC, only when DECLRMM is off), CSI u (SCORC); https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_ANSI_SC (only_default() -> CursorSave), CASE_ANSI_RC (only_default(), falls through to CASE_DECRC -> CursorRestore); esctest2 esctest/tests/scorc.py
+note: Tessera's parser reports CSI 0 s exactly like CSI s, so both save and restore: X at (1,3).
+deviation: xterm stores an explicit 0 as 0, not DEFAULT, so only_default() fails: CSI 0 s is ignored, and CSI 0 u is ignored without ResetState (see SCO06), so X is taken as a CSI final (ECH 1 at (3,7)) and nothing prints; the cursor stays at (3,7). The parser cannot tell CSI 0 s from CSI s (same as D-SD0); the row pins Tessera's behaviour.
+screen:
+>
+>   X |
+>
+>
+>
+cursor: (1,4)   # 1-based row 2 col 5
 pending_wrap: false
 requests: []
 scrollback: len=0

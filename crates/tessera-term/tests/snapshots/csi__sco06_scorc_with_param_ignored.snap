@@ -1,0 +1,15 @@
+---
+source: crates/tessera-term/tests/csi.rs
+input_file: crates/tessera-term/tests/scripts/csi/sco06_scorc_with_param_ignored.txt
+---
+
+
+
+       X |
+
+--
+cursor: (3,8)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

@@ -1,0 +1,4 @@
+# Fixture case SCO08_explicit_zero_saves (tests/fixtures/csi_spec.txt).
+# Tessera's parser reports CSI 0 s exactly like CSI s, so both save and restore: X at (1,3).
+@size 5x10
+\x1b[2;4H\x1b[0s\x1b[4;8H\x1b[0uX

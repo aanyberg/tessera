@@ -21,10 +21,10 @@
 //! - insert mode (IRM) off;
 //! - auto-wrap (DECAWM) on, xterm's default; DEC's table 5-9 says off;
 //! - the scroll region (DECSTBM) to the full screen;
-//! - the saved cursor (DECSC) to the home position with the default pen and
-//!   no pending wrap (xterm would keep the live pending wrap in the copy).
-//!   Only the active screen's saved cursor is reset, as xterm resets only
-//!   `sc[whichBuf]`.
+//! - the saved cursor (DECSC, and SCOSC, which shares its slot) to the
+//!   home position with the default pen and no pending wrap (xterm would
+//!   keep the live pending wrap in the copy). Only the active screen's
+//!   saved cursor is reset, as xterm resets only `sc[whichBuf]`.
 //!
 //! It keeps the screen contents, the scrollback, the cursor position, a
 //! pending wrap and the tab stops; RIS (`ESC c`) is the reset that clears

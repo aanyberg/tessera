@@ -40,11 +40,11 @@ const PENDING: &str = include_str!("fixtures/esctest_pending.txt");
 
 /// The esctest classes the fixture must cover (issue #15): one or more
 /// `E_<class>_*` cases each. DECSC is exercised by the `DECRC` class
-/// (esctest's `save_restore_cursor.py`).
+/// and SCOSC by the `SCORC` class (esctest's `save_restore_cursor.py`).
 const CLASSES: &[&str] = &[
     "CUP", "CUU", "CUD", "CUF", "CUB", "CHA", "VPA", "CNL", "CPL", "ED", "EL", "ECH", "ICH", "DCH",
     "IL", "DL", "SU", "SD", "REP", "HTS", "TBC", "CBT", "CHT", "DECSTBM", "DECRC", "RI", "IND",
-    "NEL", "SGR", "DECALN", "HPA", "HVP",
+    "NEL", "SGR", "DECALN", "HPA", "HVP", "HPR", "VPR", "SCORC",
 ];
 
 fn cases() -> Vec<Case> {
@@ -348,11 +348,17 @@ fn fixture_is_well_formed() {
 
 /// Every `N_*` case in `esctest_pending.txt` still fails, whole and byte
 /// by byte, so the PR that makes one pass has to lift it into
-/// `esctest_spec.txt`.
+/// `esctest_spec.txt`. A file without cases passes: nothing is pending.
 #[test]
 fn pending_cases_still_fail() {
     let cases = parse_fixture(PENDING);
-    assert!(!cases.is_empty(), "esctest_pending.txt has no cases");
+    // An empty list must mean "nothing pending", not "a block the parser
+    // skipped": every `###` heading has to be a parsed case.
+    let headings = PENDING
+        .lines()
+        .filter(|line| line.starts_with("###"))
+        .count();
+    assert_eq!(cases.len(), headings, "a pending block is not `### <id>`");
     for case in &cases {
         assert!(
             case.id.starts_with("N_"),

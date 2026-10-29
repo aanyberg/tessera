@@ -1,0 +1,15 @@
+---
+source: crates/tessera-term/tests/csi.rs
+input_file: crates/tessera-term/tests/scripts/csi/sco01_pending_wrap_restored.txt
+---
+
+         t\
+X |
+
+
+--
+cursor: (2,1)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

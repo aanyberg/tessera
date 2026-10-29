@@ -1,14 +1,14 @@
 ---
 source: crates/tessera-term/tests/csi.rs
-input_file: crates/tessera-term/tests/scripts/csi/unk13_hpr_vpr_not_in_list.txt
+input_file: crates/tessera-term/tests/scripts/csi/vpr04_clamp_bottom_no_scroll.txt
 ---
 abcdefghij
 klmnopqrst
-uvwxXz|ABCD
+uvwxyzABCD
 EFGHIJKLMN
-OPQRSTUVWX
+OPQRXT|UVWX
 --
-cursor: (2,5)
+cursor: (4,5)
 pending_wrap: false
 auto_wrap: true insert_mode: false
 requests: []

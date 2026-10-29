@@ -316,7 +316,7 @@ script_tests! {
     sc06_restore_twice,
     sc07_region_not_saved,
     sc08_1x1_grid,
-    sc09_ansi_csi_s_u_not_handled,
+    sc09_ansi_csi_s_u_save_restore,
     ind01_moves_down_keeps_column,
     ind02_at_bottom_scrolls,
     ind03_region_bottom_scrolls_region,
@@ -354,7 +354,7 @@ script_tests! {
     unk10_intermediate_dollar_r,
     unk11_intermediate_quote_h,
     unk12_unhandled_finals,
-    unk13_hpr_vpr_not_in_list,
+    unk13_hpr_vpr_handled,
     unk14_ignore_flag_33_params,
     unk15_32_params_not_ignored,
     unk16_esc_unknown_finals,
@@ -363,6 +363,28 @@ script_tests! {
     unk19_c0_inside_csi_executes,
     unk20_esc_inside_csi_restarts,
     unk21_can_inside_csi_aborts,
+    hpr01_default,
+    hpr02_zero_is_one,
+    hpr03_three,
+    hpr04_clamp_right,
+    hpr05_max_u16,
+    hpr06_pending_wrap_cleared,
+    vpr01_default,
+    vpr02_zero_is_one,
+    vpr03_three,
+    vpr04_clamp_bottom_no_scroll,
+    vpr05_max_u16,
+    vpr06_pending_wrap_cleared,
+    vpr07_passes_the_bottom_margin,
+    vpr08_bottom_row_pending_wrap_cleared,
+    sco01_pending_wrap_restored,
+    sco02_restore_without_save_homes,
+    sco03_decsc_then_scorc,
+    sco04_scosc_then_decrc,
+    sco05_scosc_with_params_ignored,
+    sco06_scorc_with_param_ignored,
+    sco07_kitty_keyboard_queries_are_not_scorc,
+    sco08_explicit_zero_saves,
 }
 
 #[test]
@@ -389,7 +411,7 @@ fn every_script_has_a_test() {
 #[test]
 fn fixture_cases_hold() {
     let checked = spec::check_all(|case| !spec::is_vttest(&case.id));
-    assert_eq!(checked, 301, "part 1 case count");
+    assert_eq!(checked, 323, "part 1 case count");
 }
 
 #[test]
@@ -438,6 +460,19 @@ fn unknown_sequences_leave_the_grid_unchanged() {
         b"\x1b=",
         b"\x1b#3",
         b"\x1b(0",
+        // SCORC acts only without parameters (xterm `only_default()`), and
+        // the kitty keyboard protocol's `u` sequences carry a private
+        // marker. With nothing saved, a restore would home the cursor.
+        b"\x1b[1u",
+        b"\x1b[;u",
+        b"\x1b[1:2u",
+        b"\x1b[65535;65535u",
+        b"\x1b[?u",
+        b"\x1b[>1u",
+        b"\x1b[<u",
+        b"\x1b[<5u",
+        b"\x1b[=1;1u",
+        b"\x1b[1$u",
     ];
     let before = state(&mut filled());
     for seq in sequences {
@@ -601,6 +636,153 @@ fn decaln_keeps_the_pen() {
             .iter()
             .all(|line| line.text() == "EEE" && !line.wrapped)
     );
+}
+
+// ------------------------------------------- HPR, VPR, SCOSC, SCORC (#93, #94)
+
+/// Deterministic streams of printing, cursor moves, SGR, scroll regions,
+/// DECSTR and cursor saves and restores, written with `save` and
+/// `restore` as the save and restore sequences. Seeded xorshift, so a
+/// failure names a reproducible case.
+fn save_restore_streams(save: &[u8], restore: &[u8]) -> Vec<Vec<u8>> {
+    let tokens: &[&[u8]] = &[
+        b"a",
+        b"xyz",
+        "中".as_bytes(),
+        b"e\xcc\x81",
+        b"\r\n",
+        b"\x1b[1;31m",
+        b"\x1b[4:3;58:2::1:2:3m",
+        b"\x1b[0m",
+        b"\x1b[7m",
+        b"\x1b[2;4H",
+        b"\x1b[5;10H",
+        b"\x1b[1;10H",
+        b"\x1b[3G",
+        b"\x1b[2;4r",
+        b"\x1b[r",
+        b"\x1b[!p",
+        b"\x1b[4h",
+        b"\x1b[4l",
+        b"\x1b[3a",
+        b"\x1b[2e",
+        b"SAVE",
+        b"RESTORE",
+    ];
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    (0..400)
+        .map(|_| {
+            let len = 4 + next() % 40;
+            let mut out = Vec::new();
+            for _ in 0..len {
+                let pick = usize::try_from(next() % tokens.len() as u64).expect("small index");
+                match tokens[pick] {
+                    b"SAVE" => out.extend_from_slice(save),
+                    b"RESTORE" => out.extend_from_slice(restore),
+                    token => out.extend_from_slice(token),
+                }
+            }
+            out
+        })
+        .collect()
+}
+
+/// SCOSC/SCORC share DECSC/DECRC's slot and restore the same state
+/// (cursor, pen, pending wrap): the reference path is ESC 7 / ESC 8.
+#[test]
+fn scosc_scorc_agree_with_decsc_decrc() {
+    let ansi = save_restore_streams(b"\x1b[s", b"\x1b[u");
+    let dec = save_restore_streams(b"\x1b7", b"\x1b8");
+    for (rows, cols) in [(5, 10), (1, 1), (3, 4)] {
+        for (ansi, dec) in ansi.iter().zip(&dec) {
+            let mut a = Terminal::new(rows, cols);
+            a.advance(ansi);
+            let mut d = Terminal::new(rows, cols);
+            d.advance(dec);
+            assert_eq!(
+                grid_state(&a),
+                grid_state(&d),
+                "{rows}x{cols}: {:?}",
+                ansi.escape_ascii().to_string()
+            );
+        }
+    }
+}
+
+#[test]
+fn scorc_restores_the_pen_and_the_pending_wrap() {
+    let mut term = Terminal::new(3, 5);
+    term.advance(b"\x1b[1;31;4:3mabcde\x1b[s");
+    let pen = term.grid().pen();
+    assert!(term.grid().pending_wrap());
+    term.advance(b"\x1b[0m\x1b[3;1H");
+    assert_ne!(term.grid().pen(), pen);
+    term.advance(b"\x1b[u");
+    assert_eq!(term.grid().pen(), pen, "pen restored");
+    assert_eq!(term.grid().cursor(), Point::new(0, 4));
+    assert!(term.grid().pending_wrap(), "pending wrap restored");
+    term.advance(b"f");
+    assert_eq!(term.grid().cursor(), Point::new(1, 1), "f wrapped");
+    assert_eq!(term.grid().line(1).unwrap().cells[0].style, pen);
+}
+
+/// HPR is CUF and VPR is CUP to `row + n` (xterm `CursorSet`) from every
+/// cell, with and without a pending wrap and a scroll region, for counts
+/// from the default up to the parameter maximum.
+#[test]
+fn hpr_and_vpr_agree_with_their_reference_moves() {
+    let (rows, cols) = (5u16, 10u16);
+    let counts = [0u32, 1, 2, 3, 9, 10, 99, 65535, 99_999_999];
+    for region in [&b""[..], b"\x1b[2;4r"] {
+        for row in 0..rows {
+            for col in 0..cols {
+                for wrap in [false, true] {
+                    let start = |term: &mut Terminal| {
+                        term.advance(region);
+                        term.advance(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+                        if wrap {
+                            // Print into the last column to arm the wrap.
+                            term.advance(format!("\x1b[{};{cols}Hw", row + 1).as_bytes());
+                        }
+                    };
+                    for n in counts {
+                        let mut hpr = Terminal::new(rows, cols);
+                        start(&mut hpr);
+                        let at = hpr.grid().cursor();
+                        hpr.advance(format!("\x1b[{n}a").as_bytes());
+                        let mut cuf = Terminal::new(rows, cols);
+                        start(&mut cuf);
+                        cuf.advance(format!("\x1b[{n}C").as_bytes());
+                        assert_eq!(
+                            (hpr.grid().cursor(), hpr.grid().pending_wrap()),
+                            (cuf.grid().cursor(), cuf.grid().pending_wrap()),
+                            "HPR {n} from {at:?} (wrap {wrap}, region {region:?})"
+                        );
+
+                        let mut vpr = Terminal::new(rows, cols);
+                        start(&mut vpr);
+                        vpr.advance(format!("\x1b[{n}e").as_bytes());
+                        let step = u16::try_from(n.clamp(1, 65535)).expect("clamped");
+                        let target = at.row.saturating_add(step).min(rows - 1);
+                        let mut cup = Terminal::new(rows, cols);
+                        start(&mut cup);
+                        cup.advance(format!("\x1b[{};{}H", target + 1, at.col + 1).as_bytes());
+                        assert_eq!(
+                            grid_state(&vpr),
+                            grid_state(&cup),
+                            "VPR {n} from {at:?} (wrap {wrap}, region {region:?})"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 // --------------------------------------------------------------- properties
