@@ -1,4 +1,0 @@
-# Fixture case SC09_ansi_csi_s_u_not_handled (tests/fixtures/csi_spec.txt).
-# Expected per the brief: CSI s / u are ignored, so X lands at (3,7). Flag for the lead: xterm implements them; adding is two lines of csi.rs and arguably correct.
-@size 5x10
-\x1b[2;4H\x1b[s\x1b[4;8H\x1b[uX

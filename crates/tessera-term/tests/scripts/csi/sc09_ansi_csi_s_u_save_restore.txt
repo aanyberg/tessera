@@ -1,0 +1,4 @@
+# Fixture case SC09_ansi_csi_s_u_save_restore (tests/fixtures/csi_spec.txt).
+# SCOSC/SCORC are SC01 with CSI s / CSI u: save at (1,3), move, restore, X at (1,3). Pinned "ignored" until #94 (decision D-HPR); more rows under SCO at the end of part 1.
+@size 5x10
+\x1b[2;4H\x1b[s\x1b[4;8H\x1b[uX

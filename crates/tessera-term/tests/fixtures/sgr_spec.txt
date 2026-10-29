@@ -917,8 +917,9 @@ DEC04_second_save_wins | \x1b[1m\x1b7\x1b[3m\x1b7\x1b[0m\x1b8 | fg=- bg=- ul=- u
 DEC05_restore_twice | \x1b[31m\x1b7\x1b[0m\x1b8\x1b[0m\x1b8 | fg=i1 bg=- ul=- us=none flags=-
 # cite: restoring a default pen clears an active one, underline colour included
 DEC06_save_default_restore_resets | \x1b7\x1b[1;4:3;58;5;9;31m\x1b8 | fg=- bg=- ul=- us=none flags=-
-# cite: csi_spec.txt D-HPR: CSI s / CSI u are ignored in #6; the pen is NOT restored by them
-DEC07_scosc_is_not_decsc | \x1b[31m\x1b[s\x1b[0m\x1b[u | fg=- bg=- ul=- us=none flags=-
+# cite: xterm charproc.c CASE_ANSI_SC -> CursorSave, CASE_ANSI_RC -> CASE_DECRC -> CursorRestore: SCOSC/SCORC share the DECSC slot,
+# cite: pen included (#94; until then csi_spec.txt D-HPR pinned CSI s / CSI u as ignored)
+DEC07_scosc_scorc_restore_the_pen | \x1b[31m\x1b[s\x1b[0m\x1b[u | fg=i1 bg=- ul=- us=none flags=-
 # cite: xterm ReallyReset; csi_spec.txt D-RIS (Grid::reset resets the pen)
 RIS01_resets_pen | \x1b[1;3;4:3;31;44;58;5;9m\x1bc | fg=- bg=- ul=- us=none flags=-
 # cite: csi_spec.txt D-RIS: RIS also clears the saved cursor

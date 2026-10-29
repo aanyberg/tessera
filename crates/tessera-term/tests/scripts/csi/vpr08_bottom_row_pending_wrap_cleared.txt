@@ -1,0 +1,5 @@
+# Fixture case VPR08_bottom_row_pending_wrap_cleared (tests/fixtures/csi_spec.txt).
+# x at (4,9) arms the pending wrap on the last row. VPR cannot move (clamped to the last row) but CursorSet still clears the wrap, so y overwrites (4,9) instead of wrapping and scrolling; scrollback stays empty.
+@size 5x10
+\x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
+\x1b[5;10Hx\x1b[ey

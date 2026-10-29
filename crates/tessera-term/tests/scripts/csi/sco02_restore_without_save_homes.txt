@@ -1,0 +1,4 @@
+# Fixture case SCO02_restore_without_save_homes (tests/fixtures/csi_spec.txt).
+# CSI u with nothing saved homes the cursor, as DECRC (SC02).
+@size 5x10
+\x1b[4;8H\x1b[uX

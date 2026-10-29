@@ -10,6 +10,7 @@
 //! | `G` `` ` `` | CHA HPA | absolute column |
 //! | `d` | VPA | absolute row |
 //! | `H` `f` | CUP HVP | absolute position |
+//! | `a` `e` | HPR VPR | relative position: right / down, clamped to the screen (VPR ignores the scroll region) |
 //! | `I` `Z` | CHT CBT | tab forward / back |
 //! | `J` `K` | ED EL | erase in display / line |
 //! | `@` `P` `X` | ICH DCH ECH | insert / delete / erase characters |
@@ -19,6 +20,7 @@
 //! | `g` | TBC | clear tab stops |
 //! | `m` | SGR | set the pen's colours and attributes (see the `sgr` module) |
 //! | `r` | DECSTBM | set the scroll region |
+//! | `s` `u` | SCOSC SCORC | save / restore the cursor exactly like DECSC / DECRC, only without parameters |
 //!
 //! One sequence with an intermediate is implemented: `CSI ! p` (DECSTR,
 //! soft terminal reset, see the crate documentation). Its parameters are
@@ -34,11 +36,31 @@
 //! that many prints, each O(1) except in insert mode, where each one shifts
 //! the rest of the line (O(count x cols)).
 //!
+//! HPR and VPR are xterm's `CursorSet(row, col + n)` and
+//! `CursorSet(row + n, col)`: they clamp to the screen, not to the scroll
+//! margins (CUD stops at the bottom margin, VPR does not), and clear a
+//! pending wrap like every cursor move. Origin mode (#8) will make both
+//! relative to and clamped by the region.
+//!
+//! SCOSC (`CSI s`) and SCORC (`CSI u`) share the DECSC / DECRC slot
+//! ([`tessera_grid::Grid::save_cursor`]): cursor, pen and pending wrap, and
+//! a SCORC with nothing saved homes the cursor with the default pen. As in
+//! xterm (`only_default()`) both act only without parameters, so
+//! `CSI 1;10 s` (DECSLRM's shape) and `CSI 3 u` do nothing. xterm also
+//! leaves its parser in the CSI state after a SCORC with parameters (no
+//! `ResetState`), so it takes the next byte as another final; Tessera
+//! returns to ground as after any sequence and does not copy that. The parser
+//! reports `CSI s` and `CSI 0 s` alike, so the explicit zero saves too,
+//! where xterm ignores it. `CSI s` is SCOSC only while left/right margin
+//! mode (DECLRMM, `?69`, #97) is off; until #97 it always is. The kitty
+//! keyboard queries `CSI ? u`, `CSI > u`, `CSI < u` and `CSI = u` carry a
+//! private marker and never reach SCORC.
+//!
 //! Everything else (an unassigned final, any private marker such as `?`,
 //! any other intermediate such as `SP`, `$` or `"` (DECSCL is #92), and the
-//! xterm extensions HPR, VPR, SCOSC/SCORC and SL/SR that are not in scope)
-//! is ignored and logged at trace level. The parser hands over private
-//! markers as intermediates, so one check covers both.
+//! xterm extension SL/SR that is not in scope) is ignored and logged at
+//! trace level. The parser hands over private markers as intermediates, so
+//! one check covers both.
 //!
 //! Expected behaviour per sequence and edge case is pinned by
 //! `tests/fixtures/csi_spec.txt`, and for DECSTR by
@@ -63,6 +85,13 @@ fn param_or(params: &[u16], index: usize, default: u16) -> u16 {
 /// both mean one.
 fn count(params: &[u16], index: usize) -> u16 {
     param_or(params, index, 1)
+}
+
+/// Whether the sequence had no parameter (xterm `only_default()`, used by
+/// SCOSC and SCORC). The parser reports `CSI s` as `[0]`, so an explicit
+/// `CSI 0 s` counts as parameterless too.
+fn no_params(params: &[u16]) -> bool {
+    matches!(params, [] | [0])
 }
 
 /// Parameter `index` as a selector (ED, EL, TBC): absent means zero.
@@ -113,6 +142,17 @@ impl State {
             'G' | '`' => grid.goto_col(count(params, 0) - 1),
             'd' => grid.goto_row(count(params, 0) - 1),
             'H' | 'f' => grid.goto(count(params, 0) - 1, count(params, 1) - 1),
+            // HPR and VPR: xterm `CursorSet`, clamped to the screen rather
+            // than to the scroll margins. `goto` clamps and clears the
+            // pending wrap.
+            'a' => {
+                let cursor = grid.cursor();
+                grid.goto(cursor.row, cursor.col.saturating_add(count(params, 0)));
+            }
+            'e' => {
+                let cursor = grid.cursor();
+                grid.goto(cursor.row.saturating_add(count(params, 0)), cursor.col);
+            }
             // With a wrap pending the cursor sits on the last column and no
             // stop lies ahead: xterm leaves the wrap armed, as for HT.
             'I' if grid.pending_wrap() => {}
@@ -138,6 +178,11 @@ impl State {
                 mode => trace!(mode, "TBC mode ignored"),
             },
             'r' => self.set_scroll_region(params),
+            // SCOSC. #97: DECSLRM instead while DECLRMM (?69) is set.
+            's' if no_params(params) => grid.save_cursor(),
+            // SCORC: restores what DECRC restores.
+            'u' if no_params(params) => grid.restore_cursor(),
+            's' | 'u' => trace!(?action, ?params, "SCOSC/SCORC with parameters ignored"),
             'm' => self.sgr(params, subparams),
             _ => trace!(?action, ?params, "CSI ignored"),
         }
@@ -261,6 +306,7 @@ impl State {
         self.grid.reset_scroll_region();
         // xterm saves the cursor after the resets above and then homes the
         // copy; its pending wrap is cleared too (xterm copies the live one).
+        // DECSC and SCOSC share this slot, so DECRC and SCORC both home.
         self.grid.reset_saved_cursor();
         // #8: reset here: DECOM off, DECTCEM on, G0-G3/GL/GR and DECNRCM to
         // their defaults, DECCKM and DECKPAM off, KAM unlocked, DECSCA off,

@@ -1,0 +1,4 @@
+# Fixture case SCO01_pending_wrap_restored (tests/fixtures/csi_spec.txt).
+# CSI s saves the wrap flag like DECSC (CursorSave2 wrap_flag) and CSI u re-arms it, so X wraps to row 2 col 0 and row 1 is soft-wrapped (as SC03).
+@size 5x10
+\x1b[2;10Ht\x1b[s\x1b[4;3H\x1b[uX

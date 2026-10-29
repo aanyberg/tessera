@@ -1,0 +1,4 @@
+# Fixture case SCO06_scorc_with_param_ignored (tests/fixtures/csi_spec.txt).
+# CSI 1 u is not only_default(): ignored, X at (3,7).
+@size 5x10
+\x1b[2;4H\x1b[s\x1b[4;8H\x1b[1uX

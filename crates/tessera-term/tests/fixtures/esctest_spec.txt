@@ -7,7 +7,7 @@
 #   source:       esctest file and function (E_* ids) or vttest function + capture (V2S13)
 #   cite:         URL(s)
 #   note:         what the esctest test does and what the row asserts
-#   chunk:        yes|no. NOT needed: all 126 cases run whole AND byte by byte in 0.06 s (debug build). Documentation only.
+#   chunk:        yes|no. NOT needed: all 135 cases run whole AND byte by byte in 0.06 s (debug build). Documentation only.
 #   attr:         (row,col0)-(row,col1) <pen>   0-based, inclusive; pen = sgr_spec.txt canonical text
 #                 (fg=<c> bg=<c> ul=<c> us=<style> flags=<list>). Only E_SGR_bold and V2S13 have it. Cells not listed
 #                 have the `attr_others:` pen. parse_fixture ignores these lines: esctest.rs must read them itself.
@@ -27,6 +27,8 @@
 #     main (e2fc473) in a scratch copy: 125 of 125 pass, the attr: lines match the real cell styles, and a corrupted copy of a
 #     row is detected. The same probe over the 8 rows the researcher kept pending failed 8 of 8 there; on 17c5cf3 one of them passes (#80 merged)
 #     and is live as E_DECRC_saveRestoreCursor_reset (126 cases now); the other 7 are in esctest_pending.txt.
+#     #93/#94 made those 7 pass: they are live here as E_HPR_*, E_VPR_* and E_SCORC_saveRestoreCursor_basic, joined by
+#     E_SCORC_saveRestoreCursor_{moveToHomeWhenNotSaved,reset} (the DECRC rows with ESC[s / ESC[u); 135 cases now.
 #
 # HOW esctest ASSERTIONS MAP TO THE FIXTURE
 #   esctest reads the cursor with DSR 6 (needs #10) and the screen with DECRQCRA checksums; tessera tests read the grid. So:
@@ -1549,11 +1551,243 @@ requests: []
 scrollback: len=0
 
 #> E_HPA_ignoresOriginMode -> #8 + #97 (hpa.py, vtLevel 4): DECOM + DECLRMM + DECSLRM 5;10
-#> E_HPR_defaultParams, E_HPR_stopsAtRightEdge, E_HPR_doesNotChangeRow  (hpr.py, CSI Pn a)  -> #93: tessera-term csi.rs has no 'a' arm (HPR)
-#>    bytes/expect: ESC[6;1H ESC[a -> col 7; ESC[6;5H ESC[90a -> col 80 row 6; ESC[6;5H ESC[2a -> col 7 row 6
-#> E_VPR_defaultParams, E_VPR_stopsAtBottomEdge, E_VPR_doesNotChangeColumn  (vpr.py, CSI Pn e)  -> #93: no 'e' arm (VPR)
-#>    bytes/expect: ESC[6;1H ESC[e -> row 7; ESC[6;5H ESC[35e -> row 25 col 5; ESC[6;5H ESC[2e -> row 8 col 5
-#> E_HPR_ignoresOriginMode, E_VPR_ignoresOriginMode -> #8 + #93 + #97 (DECOM, HPR/VPR, DECLRMM)
+# ---------------------------------------------------------------------------- HPR / VPR (hpr.py, vpr.py)  CSI Pn a / CSI Pn e  [#93]
+
+### E_HPR_defaultParams
+size: 25x80
+step: feed \x1b[1;6H
+step: feed \x1b[a
+source: esctest2 esctest/tests/hpr.py test_HPR_DefaultParams
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/hpr.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: CUP(1,6) then HPR() = ESC[a: one column right, to column 7. Was N_HPR_defaultParams in esctest_pending.txt; passes since #93.
+chunk: no
+screen:
+>       |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,6)   # 1-based row 1 col 7
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_HPR_stopsAtRightEdge
+size: 25x80
+step: feed \x1b[6;5H
+step: feed \x1b[90a
+source: esctest2 esctest/tests/hpr.py test_HPR_StopsAtRightEdge
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/hpr.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: CUP(6,5) then HPR(90): clamps at the right edge, column 80, row unchanged. Was N_HPR_stopsAtRightEdge in esctest_pending.txt; passes since #93.
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>                                                                                |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (5,79)   # 1-based row 6 col 80
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_HPR_doesNotChangeRow
+size: 25x80
+step: feed \x1b[6;5H
+step: feed \x1b[2a
+source: esctest2 esctest/tests/hpr.py test_HPR_DoesNotChangeRow
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/hpr.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: CUP(6,5) then HPR(2): column 7, row 6 unchanged. Was N_HPR_doesNotChangeRow in esctest_pending.txt; passes since #93.
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>       |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (5,6)   # 1-based row 6 col 7
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_VPR_defaultParams
+size: 25x80
+step: feed \x1b[6;1H
+step: feed \x1b[e
+source: esctest2 esctest/tests/vpr.py test_VPR_DefaultParams
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/vpr.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: CUP(6,1) then VPR() = ESC[e: one row down, to row 7. Was N_VPR_defaultParams in esctest_pending.txt; passes since #93.
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (6,0)   # 1-based row 7 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_VPR_stopsAtBottomEdge
+size: 25x80
+step: feed \x1b[6;5H
+step: feed \x1b[35e
+source: esctest2 esctest/tests/vpr.py test_VPR_StopsAtBottomEdge
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/vpr.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: CUP(6,5) then VPR(35): clamps at the bottom row 25, column unchanged. Was N_VPR_stopsAtBottomEdge in esctest_pending.txt; passes since #93.
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>     |
+cursor: (24,4)   # 1-based row 25 col 5
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_VPR_doesNotChangeColumn
+size: 25x80
+step: feed \x1b[6;5H
+step: feed \x1b[2e
+source: esctest2 esctest/tests/vpr.py test_VPR_DoesNotChangeColumn
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/vpr.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: CUP(6,5) then VPR(2): row 8, column 5 unchanged. Was N_VPR_doesNotChangeColumn in esctest_pending.txt; passes since #93.
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>
+>
+>     |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (7,4)   # 1-based row 8 col 5
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_HPR_ignoresOriginMode, E_VPR_ignoresOriginMode -> #8 + #97 (DECOM, DECLRMM + DECSLRM; HPR/VPR themselves are live since #93)
 
 # ---------------------------------------------------------------------------- HVP (hvp.py)  [CSI f; esctest bug: the row/col-only forms send 'H']
 
@@ -4148,8 +4382,141 @@ scrollback: len=0
 #>     step: set auto_wrap true / DECSC / set auto_wrap false / DECRC / CUP(79,1) 'abcd' -> expect cursor on row 1 (xterm). Verify DECSC does not restore auto-wrap.)
 #> E_DECRC_saveRestoreCursor_reverseWrapNotAffected -> #97 (DECSET 45)
 #> E_DECRC_saveRestoreCursor_insertNotAffected -> #8 (SM/RM 4 = ESC[4h/l not wired; with `set insert_mode true/false` steps it reads: IRM on, DECSC, IRM off, DECRC, home 'a' home 'b' -> 'b'. Tessera passes with the @set translation.)
-#> E_SCORC_* (scorc.py = same class with CSI s / CSI u) -> #94: csi.rs has no 's' / 'u' arms (SCOSC/SCORC); E_SCORC_saveRestoreCursor_basic: ESC[6;5H ESC[s ESC[H ESC[u -> (5,6).
-#>     xterm: CSI s is DECSLRM while DECLRMM (#97) is set, so SCOSC must check the margin mode first.
+
+# ---------------------------------------------------------------------------- SCOSC / SCORC (scorc.py via save_restore_cursor.py)  CSI s / CSI u  [#94]
+# scorc.py is save_restore_cursor.py with saveCursor = SCOSC (ESC[s) and restoreCursor = SCORC (ESC[u). xterm saves and
+# restores through the DECSC/DECRC slot (charproc.c CASE_ANSI_SC -> CursorSave, CASE_ANSI_RC falls through to CASE_DECRC
+# -> CursorRestore), so each live row expects exactly what its E_DECRC_* twin expects.
+
+### E_SCORC_saveRestoreCursor_basic
+size: 25x80
+step: feed \x1b[6;5H
+step: feed \x1b[s
+step: feed \x1b[1;1H
+step: feed \x1b[u
+source: esctest2 esctest/tests/scorc.py test_SaveRestoreCursor_Basic (inherited from save_restore_cursor.py)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/scorc.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: CUP(6,5), SCOSC = ESC[s, home, SCORC = ESC[u: back to row 6 column 5. Was N_SCORC_basic in esctest_pending.txt; passes since #94.
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>     |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (5,4)   # 1-based row 6 col 5
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_SCORC_saveRestoreCursor_moveToHomeWhenNotSaved
+size: 25x80
+step: feed \x1b[!p
+step: feed \x1b[6;5H
+step: feed \x1b[u
+source: esctest2 esctest/tests/save_restore_cursor.py test_SaveRestoreCursor_MoveToHomeWhenNotSaved (SCORCTests, scorc.py)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/scorc.py ; https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/save_restore_cursor.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: E_DECRC_saveRestoreCursor_moveToHomeWhenNotSaved with SCORC (ESC[u) for DECRC: DECSTR (ESC[!p) leaves the shared saved cursor at home, so ESC[u homes. Expected screen and cursor are the DECRC row's (xterm CASE_ANSI_RC falls through to CASE_DECRC). Added with #94.
+chunk: no
+screen:
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_SCORC_saveRestoreCursor_reset
+size: 25x80
+step: feed a
+step: feed \x1b[s
+step: feed \x1b[!p
+step: feed b
+step: feed \x1b[u
+step: feed c
+source: esctest2 esctest/tests/save_restore_cursor.py test_SaveRestoreCursor_Reset (SCORCTests, scorc.py)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/scorc.py ; https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/save_restore_cursor.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: E_DECRC_saveRestoreCursor_reset with SCOSC/SCORC (ESC[s / ESC[u): 'a', ESC[s, DECSTR (resets the shared slot to home), 'b', ESC[u -> 1,1, 'c': row 1 = 'cb'. Same expectation as the DECRC row (xterm CursorSave/CursorRestore). Added with #94.
+chunk: no
+screen:
+>cb|
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,1)   # 1-based row 1 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_SCORC_saveRestoreCursor_resetsOriginMode, E_SCORC_saveRestoreCursor_altVsMain, E_SCORC_saveRestoreCursor_wrap,
+#>     E_SCORC_saveRestoreCursor_insertNotAffected -> #8 (as their E_DECRC_* twins: DECOM, DECSET 47, DECRESET 7, SM/RM 4)
+#> E_SCORC_saveRestoreCursor_worksInLRM, E_SCORC_saveRestoreCursor_reverseWrapNotAffected -> #97 (scorc.py runs worksInLRM with
+#>     shouldWork=False: while DECLRMM is set ESC[s is DECSLRM, so the second save does not happen and ESC[u returns to (2,3))
+#> E_SCORC_saveRestoreCursor_protection -> #95 (as E_DECRC_saveRestoreCursor_protection)
 
 # ---------------------------------------------------------------------------- DECSTBM (decstbm.py)  ESC[Pt;Pb r  — moves the cursor home on success
 

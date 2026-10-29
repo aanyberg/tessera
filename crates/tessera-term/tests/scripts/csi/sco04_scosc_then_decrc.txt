@@ -1,0 +1,4 @@
+# Fixture case SCO04_scosc_then_decrc (tests/fixtures/csi_spec.txt).
+# One slot: SCOSC saves, DECRC restores it.
+@size 5x10
+\x1b[2;4H\x1b[s\x1b[4;8H\x1b8X
