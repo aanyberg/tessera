@@ -4868,7 +4868,7 @@ scrollback: len=0
 size: 5x10
 step: feed \x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX\x1b[3;5H\x1b[?25hX
 cite: Brief: unknown CSI/ESC (any final byte, any private marker, any intermediate not handled): trace and ignore; https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c (xterm itself implements several of these; the point is tessera #6 ignores them without touching the grid)
-note: DECSET is #8: ignored by #6.
+note: DECSET 25 (DECTCEM, #8) only shows the cursor: the screen and cursor are unchanged.
 screen:
 >abcdefghij
 >klmnopqrst
@@ -4884,7 +4884,7 @@ scrollback: len=0
 size: 5x10
 step: feed \x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX\x1b[3;5H\x1b[?7lX
 cite: Brief: unknown CSI/ESC (any final byte, any private marker, any intermediate not handled): trace and ignore; https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c (xterm itself implements several of these; the point is tessera #6 ignores them without touching the grid)
-note: DECRST 7 ignored by #6 (the harness uses @set auto_wrap).
+note: DECRST 7 (DECAWM, #8) turns auto-wrap off; X at column 4 needs no wrap, so the screen and cursor are unchanged.
 screen:
 >abcdefghij
 >klmnopqrst
@@ -5408,7 +5408,7 @@ size: 5x10
 step: feed \x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
 step: feed \x1b[1;3r\x1b[2;5H\x1b[9eX
 cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI Pm e (VPR) default 1; https://github.com/ThomasDickey/xterm-snapshots/blob/master/charproc.c CASE_VPR -> cursor.c CursorSet(row + n, col) (clamps to the last row of the SCREEN, not the bottom margin; ResetWrap; no scrolling); esctest2 esctest/tests/vpr.py
-note: Region rows 1-3, cursor inside it at (1,4). CUD would stop at the bottom margin (2,4); VPR is CursorSet without DECOM, so it clamps to the screen: (4,4). Origin mode (#8) will clamp it to the margin.
+note: Region rows 1-3, cursor inside it at (1,4). CUD would stop at the bottom margin (2,4); VPR is CursorSet without DECOM, so it clamps to the screen: (4,4). With origin mode on it clamps to the bottom margin instead (modes_spec.txt DECOM30).
 screen:
 >abcdefghij
 >klmnopqrst
@@ -5941,7 +5941,7 @@ scrollback: len=0
 needs: ESC[?3l ignorable, ED 2, CUP; plain print
 source: vttest main.c tst_insdel pass 0, screen 1: rows filled with A..X, prompt on row 4; capture: vttest_capture/m8_01.bin
 
-### V8S2_accordion_il_dl_ADAPTED
+### V8S2_accordion_il_dl
 size: 24x80
 step: feed \x1b[2J\x1b[?3l\x1b[2J\x1b[1;1H\x1b[1;1HAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 step: feed \x1b[2;1HBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
@@ -5968,11 +5968,12 @@ step: feed \x1b[22;1HVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV
 step: feed \x1b[23;1HWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW
 step: feed \x1b[24;1HXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 step: feed \x1b[4;1HScreen accordion test (Insert & Delete Line). Push <RETURN>
-step: feed \r\n\x1bM\x1b[2K\x1b[2;23r\x1b[2;1H\x1b[1L\x1b[1M\x1b[2L\x1b[2M\x1b[3L\x1b[3M\x1b[4L\x1b[4M\x1b[5L\x1b[5M\x1b[6L\x1b[6M\x1b[7L\x1b[7M\x1b[8L\x1b[8M\x1b[9L\x1b[9M\x1b[10L\x1b[10M\x1b[11L
-step: feed \x1b[11M\x1b[12L\x1b[12M\x1b[13L\x1b[13M\x1b[14L\x1b[14M\x1b[15L\x1b[15M\x1b[16L\x1b[16M\x1b[17L\x1b[17M\x1b[18L\x1b[18M\x1b[19L\x1b[19M\x1b[20L\x1b[20M\x1b[21L\x1b[21M\x1b[22L
-step: feed \x1b[22M\x1b[23L\x1b[23M\x1b[24L\x1b[24M\x1b[?6l\x1b[r\x1b[2;1HTop line: A's, bottom line: X's, this line, nothing more. Push <RETURN>
+step: feed \r\n\x1bM\x1b[2K\x1b[2;23r\x1b[?6h\x1b[1;1H\x1b[1L\x1b[1M\x1b[2L\x1b[2M\x1b[3L\x1b[3M\x1b[4L\x1b[4M\x1b[5L\x1b[5M\x1b[6L\x1b[6M\x1b[7L\x1b[7M\x1b[8L\x1b[8M\x1b[9L\x1b[9M\x1b[10L\x1b[10M
+step: feed \x1b[11L\x1b[11M\x1b[12L\x1b[12M\x1b[13L\x1b[13M\x1b[14L\x1b[14M\x1b[15L\x1b[15M\x1b[16L\x1b[16M\x1b[17L\x1b[17M\x1b[18L\x1b[18M\x1b[19L\x1b[19M\x1b[20L\x1b[20M\x1b[21L\x1b[21M
+step: feed \x1b[22L\x1b[22M\x1b[23L\x1b[23M\x1b[24L\x1b[24M\x1b[?6l\x1b[r
+step: feed \x1b[2;1HTop line: A's, bottom line: X's, this line, nothing more. Push <RETURN>
 cite: https://invisible-island.net/vttest/ (vttest 2.7 20251205, `brew install vttest`; source https://invisible-island.net/archives/vttest/vttest.tar.gz)
-note: tst_insdel pass 0, screen 2 (IL/DL accordion), ADAPTED: DECOM removed. Original (DECOM) variant is deferred to #8; expected screen is identical (checked against tmux and the full model).
+note: tst_insdel pass 0, screen 2 (IL/DL accordion), as vttest sends it. Lifted from the deferred list by #8. Matches tmux.
 flags: vttest in-scope
 screen:
 >AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
@@ -6003,8 +6004,8 @@ cursor: (1,71)   # 1-based row 2 col 72
 pending_wrap: false
 requests: []
 scrollback: len=0
-needs: RI, EL 2, DECSTBM 2;23, IL n / DL n for n=1..24 (also n larger than the region), DECSTBM reset ESC[r. The original sets ESC[?6h then CUP 1;1 (= absolute row 2); the adaptation replaces `ESC[?6h ESC[1;1H` by `ESC[2;1H`. Cumulative: steps include screen 1 because the RI/EL 2 at the start act on the cursor row left by screen 1 and its Enter echo.
-source: vttest main.c tst_insdel pass 0, screen 2 (IL/DL accordion), ADAPTED: DECOM removed; capture: vttest_capture/m8_02.bin
+needs: RI, EL 2, DECSTBM 2;23, ESC[?6h DECOM then CUP 1;1 (= absolute row 2), IL n / DL n for n=1..24 (also n larger than the region), ESC[?6l, DECSTBM reset ESC[r. Cumulative: steps include screen 1 because the RI/EL 2 at the start act on the cursor row left by screen 1 and its Enter echo.
+source: vttest main.c tst_insdel pass 0, screen 2 (IL/DL accordion), as vttest sends it; capture: vttest_capture/m8_02.bin
 
 ### V8S3_insert_mode
 size: 24x80
@@ -6250,296 +6251,639 @@ scrollback: len=0
 needs: ED 2, BS, ICH 2: `Z BS ESC[2@ Y BS ESC[2@ ...` builds 'A B C ... Z'. Independent.
 source: vttest main.c tst_insdel screen 7: ICH 2 after each letter; capture: vttest_capture/m8_07.bin
 
+# ---------------------------------------------------------------------------- vttest screens lifted by #8 (DECOM, DECAWM, DECSCNM stored, DECCOLM ignored without DECSET 40)
+
+### V1S3_autowrap_80col
+size: 24x80
+step: feed \x1b[?3l
+step: feed \x1b[?3lTest of autowrap, mixing control and print characters.\r\r\nThe left/right margins should have letters in order:\r\r\n
+step: feed \x1b[3;21r\x1b[?6h\x1b[19;1HA\x1b[19;80Ha\r\n\x1b[18;80HaB\x1b[19;80HB\x08 b\r\n\x1b[19;80HC\x08\x08\t\tc\x1b[19;2H\x08C\r\n\x1b[19;80H\r\n\x1b[18;1HD\x1b[18;80Hd
+step: feed \x1b[19;1HE\x1b[19;80He\r\n\x1b[18;80HeF\x1b[19;80HF\x08 f\r\n\x1b[19;80HG\x08\x08\t\tg\x1b[19;2H\x08G\r\n\x1b[19;80H\r\n\x1b[18;1HH\x1b[18;80Hh\x1b[19;1HI
+step: feed \x1b[19;80Hi\r\n\x1b[18;80HiJ\x1b[19;80HJ\x08 j\r\n\x1b[19;80HK\x08\x08\t\tk\x1b[19;2H\x08K\r\n\x1b[19;80H\r\n\x1b[18;1HL\x1b[18;80Hl\x1b[19;1HM\x1b[19;80Hm\r\n
+step: feed \x1b[18;80HmN\x1b[19;80HN\x08 n\r\n\x1b[19;80HO\x08\x08\t\to\x1b[19;2H\x08O\r\n\x1b[19;80H\r\n\x1b[18;1HP\x1b[18;80Hp\x1b[19;1HQ\x1b[19;80Hq\r\n\x1b[18;80HqR
+step: feed \x1b[19;80HR\x08 r\r\n\x1b[19;80HS\x08\x08\t\ts\x1b[19;2H\x08S\r\n\x1b[19;80H\r\n\x1b[18;1HT\x1b[18;80Ht\x1b[19;1HU\x1b[19;80Hu\r\n\x1b[18;80HuV\x1b[19;80HV\x08 v\r\n
+step: feed \x1b[19;80HW\x08\x08\t\tw\x1b[19;2H\x08W\r\n\x1b[19;80H\r\n\x1b[18;1HX\x1b[18;80Hx\x1b[19;1HY\x1b[19;80Hy\r\n\x1b[18;80HyZ\x1b[19;80HZ\x08 z\r\n\x1b[?6l\x1b[r
+step: feed \x1b[22;1HPush <RETURN>
+cite: https://invisible-island.net/vttest/ (vttest 2.7 20251205, `brew install vttest`; source https://invisible-island.net/archives/vttest/vttest.tar.gz)
+note: tst_movements pass 0 (80 columns): autowrap test. Lifted from the deferred list by #8.
+flags: vttest in-scope
+screen:
+>Test of autowrap, mixing control and print characters.
+>The left/right margins should have letters in order:
+>I                                                                              i\
+>J                                                                              j
+>K                                                                              k
+>L                                                                              l
+>M                                                                              m\
+>N                                                                              n
+>O                                                                              o
+>P                                                                              p
+>Q                                                                              q\
+>R                                                                              r
+>S                                                                              s
+>T                                                                              t
+>U                                                                              u\
+>V                                                                              v
+>W                                                                              w
+>X                                                                              x
+>Y                                                                              y\
+>Z                                                                              z
+>
+>Push <RETURN> |
+>
+>
+cursor: (21,13)   # 1-based row 22 col 14
+pending_wrap: false
+requests: []
+scrollback: len=0
+needs: DECSTBM 3;21, DECOM (?6h, CUP relative to the region), pending wrap with BS/HT/CR at the right margin, ?6l and ESC[r at the end; the two ESC[?3l are ignored (DECCOLM needs DECSET 40).
+source: vttest main.c tst_movements pass 0 (80 columns): autowrap test; capture: vttest_capture/m1_03.bin
+
+### V2S4_80col_light_background
+size: 24x80
+step: feed \x1b[?3l\x1b[2J\x1b[1;1H1234567890123456789012345678901234567890123456789012345678901234567890123456789
+step: feed \x1b[3;3HThis is 80 column mode, light background.\x1b[4;4HThis is 80 column mode, light background.
+step: feed \x1b[5;5HThis is 80 column mode, light background.\x1b[6;6HThis is 80 column mode, light background.
+step: feed \x1b[7;7HThis is 80 column mode, light background.\x1b[8;8HThis is 80 column mode, light background.
+step: feed \x1b[9;9HThis is 80 column mode, light background.\x1b[10;10HThis is 80 column mode, light background.
+step: feed \x1b[11;11HThis is 80 column mode, light background.\x1b[12;12HThis is 80 column mode, light background.
+step: feed \x1b[13;13HThis is 80 column mode, light background.\x1b[14;14HThis is 80 column mode, light background.
+step: feed \x1b[15;15HThis is 80 column mode, light background.\x1b[16;16HThis is 80 column mode, light background.
+step: feed \x1b[17;17HThis is 80 column mode, light background.\x1b[18;18HThis is 80 column mode, light background.
+step: feed \x1b[19;19HThis is 80 column mode, light background.
+step: feed \x1b[20;20HThis is 80 column mode, light background.Push <RETURN>
+cite: https://invisible-island.net/vttest/ (vttest 2.7 20251205, `brew install vttest`; source https://invisible-island.net/archives/vttest/vttest.tar.gz)
+note: tst_screen '80 column mode, light background'. Lifted from the deferred list by #8.
+flags: vttest in-scope
+screen:
+>1234567890123456789012345678901234567890123456789012345678901234567890123456789
+>
+>  This is 80 column mode, light background.
+>   This is 80 column mode, light background.
+>    This is 80 column mode, light background.
+>     This is 80 column mode, light background.
+>      This is 80 column mode, light background.
+>       This is 80 column mode, light background.
+>        This is 80 column mode, light background.
+>         This is 80 column mode, light background.
+>          This is 80 column mode, light background.
+>           This is 80 column mode, light background.
+>            This is 80 column mode, light background.
+>             This is 80 column mode, light background.
+>              This is 80 column mode, light background.
+>               This is 80 column mode, light background.
+>                This is 80 column mode, light background.
+>                 This is 80 column mode, light background.
+>                  This is 80 column mode, light background.
+>                   This is 80 column mode, light background.Push <RETURN> |
+>
+>
+>
+>
+cursor: (19,73)   # 1-based row 20 col 74
+pending_wrap: false
+requests: []
+scrollback: len=0
+needs: ESC[?3l ignored (no DECSET 40), ED 2, CUP; DECSCNM from the previous screen is stored only and invisible in the text.
+source: vttest main.c tst_screen '80 column mode, light background'; capture: vttest_capture/m2_04.bin
+
+### V2S6_80col_dark_background
+size: 24x80
+step: feed \x1b[?3l\x1b[2J\x1b[1;1H1234567890123456789012345678901234567890123456789012345678901234567890123456789
+step: feed \x1b[3;3HThis is 80 column mode, dark background.\x1b[4;4HThis is 80 column mode, dark background.
+step: feed \x1b[5;5HThis is 80 column mode, dark background.\x1b[6;6HThis is 80 column mode, dark background.
+step: feed \x1b[7;7HThis is 80 column mode, dark background.\x1b[8;8HThis is 80 column mode, dark background.
+step: feed \x1b[9;9HThis is 80 column mode, dark background.\x1b[10;10HThis is 80 column mode, dark background.
+step: feed \x1b[11;11HThis is 80 column mode, dark background.\x1b[12;12HThis is 80 column mode, dark background.
+step: feed \x1b[13;13HThis is 80 column mode, dark background.\x1b[14;14HThis is 80 column mode, dark background.
+step: feed \x1b[15;15HThis is 80 column mode, dark background.\x1b[16;16HThis is 80 column mode, dark background.
+step: feed \x1b[17;17HThis is 80 column mode, dark background.\x1b[18;18HThis is 80 column mode, dark background.
+step: feed \x1b[19;19HThis is 80 column mode, dark background.\x1b[20;20HThis is 80 column mode, dark background.Push <RETURN>
+cite: https://invisible-island.net/vttest/ (vttest 2.7 20251205, `brew install vttest`; source https://invisible-island.net/archives/vttest/vttest.tar.gz)
+note: tst_screen '80 column mode, dark background'. Lifted from the deferred list by #8.
+flags: vttest in-scope
+screen:
+>1234567890123456789012345678901234567890123456789012345678901234567890123456789
+>
+>  This is 80 column mode, dark background.
+>   This is 80 column mode, dark background.
+>    This is 80 column mode, dark background.
+>     This is 80 column mode, dark background.
+>      This is 80 column mode, dark background.
+>       This is 80 column mode, dark background.
+>        This is 80 column mode, dark background.
+>         This is 80 column mode, dark background.
+>          This is 80 column mode, dark background.
+>           This is 80 column mode, dark background.
+>            This is 80 column mode, dark background.
+>             This is 80 column mode, dark background.
+>              This is 80 column mode, dark background.
+>               This is 80 column mode, dark background.
+>                This is 80 column mode, dark background.
+>                 This is 80 column mode, dark background.
+>                  This is 80 column mode, dark background.
+>                   This is 80 column mode, dark background.Push <RETURN> |
+>
+>
+>
+>
+cursor: (19,72)   # 1-based row 20 col 73
+pending_wrap: false
+requests: []
+scrollback: len=0
+needs: ESC[?3l ignored (no DECSET 40), ED 2, CUP.
+source: vttest main.c tst_screen '80 column mode, dark background'; capture: vttest_capture/m2_06.bin
+
+### V2S7_do_scrolling_jump_scroll_up_region_12_13
+size: 24x80
+step: feed \x1b[2J\x1b[?6h\x1b[?4h\x1b[12;13r\x1b[2J
+step: feed \x1b[24BSoft scroll up region [12..13] size 2 Line 1\r\nSoft scroll up region [12..13] size 2 Line 2\r\nSoft scroll up region [12..13] size 2 Line 3\r\nSoft scroll up region [12..13] size 2 Line 4\r\nSoft scroll up region [12..13] size 2 Line 5\r\nSoft scroll up region [12..13] size 2 Line 6\r\nSoft scroll up region [12..13] size 2 Line 7\r\nSoft scroll up region [12..13] size 2 Line 8\r\nSoft scroll up region [12..13] size 2 Line 9\r\nSoft scroll up region [12..13] size 2 Line 10\r\nSoft scroll up region [12..13] size 2 Line 11\r\nSoft scroll up region [12..13] size 2 Line 12\r\nSoft scroll up region [12..13] size 2 Line 13\r\nSoft scroll up region [12..13] size 2 Line 14\r\nSoft scroll up region [12..13] size 2 Line 15\r\nSoft scroll up region [12..13] size 2 Line 16\r\nSoft scroll up region [12..13] size 2 Line 17\r\nSoft scroll up region [12..13] size 2 Line 18\r\nSoft scroll up region [12..13] size 2 Line 19\r\nSoft scroll up region [12..13] size 2 Line 20\r\nSoft scroll up region [12..13] size 2 Line 21\r\nSoft scroll up region [12..13] size 2 Line 22\r\nSoft scroll up region [12..13] size 2 Line 23\r\nSoft scroll up region [12..13] size 2 Line 24\r\nSoft scroll up region [12..13] size 2 Line 25\r\nSoft scroll up region [12..13] size 2 Line 26\r\nSoft scroll up region [12..13] size 2 Line 27\r\nSoft scroll up region [12..13] size 2 Line 28\r\nSoft scroll up region [12..13] size 2 Line 29\r\n
+step: feed \x1b[24ASoft scroll down region [12..13] size 2 Line 1\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 2\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 3\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 4\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 5\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 6\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 7\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 8\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 9\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 10\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 11\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 12\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 13\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 14\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 15\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 16\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 17\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 18\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 19\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 20\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 21\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 22\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 23\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 24\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 25\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 26\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 27\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 28\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 29\r\n\x1bM\x1bMPush <RETURN>
+cite: https://invisible-island.net/vttest/ (vttest 2.7 20251205, `brew install vttest`; source https://invisible-island.net/archives/vttest/vttest.tar.gz)
+note: tst_screen 'Soft scroll up region [12..13]' (jump scroll). Lifted from the deferred list by #8. Matches tmux.
+flags: vttest in-scope
+screen:
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>Push <RETURN> |
+>Soft scroll down region [12..13] size 2 Line 29
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (11,13)   # 1-based row 12 col 14
+pending_wrap: false
+requests: []
+scrollback: len=0
+needs: ESC[?6h DECOM, ESC[?4h DECSCLM (smooth scroll, ignored), DECSTBM 12;13, CUD/CUU 24, RI.
+source: vttest main.c tst_screen 'Soft scroll up region [12..13]' (jump scroll); capture: vttest_capture/m2_07.bin
+
+### V2S8_do_scrolling_jump_scroll_region_1_24
+size: 24x80
+step: feed \x1b[2J\x1b[?6h\x1b[?4h\x1b[12;13r\x1b[2J
+step: feed \x1b[24BSoft scroll up region [12..13] size 2 Line 1\r\nSoft scroll up region [12..13] size 2 Line 2\r\nSoft scroll up region [12..13] size 2 Line 3\r\nSoft scroll up region [12..13] size 2 Line 4\r\nSoft scroll up region [12..13] size 2 Line 5\r\nSoft scroll up region [12..13] size 2 Line 6\r\nSoft scroll up region [12..13] size 2 Line 7\r\nSoft scroll up region [12..13] size 2 Line 8\r\nSoft scroll up region [12..13] size 2 Line 9\r\nSoft scroll up region [12..13] size 2 Line 10\r\nSoft scroll up region [12..13] size 2 Line 11\r\nSoft scroll up region [12..13] size 2 Line 12\r\nSoft scroll up region [12..13] size 2 Line 13\r\nSoft scroll up region [12..13] size 2 Line 14\r\nSoft scroll up region [12..13] size 2 Line 15\r\nSoft scroll up region [12..13] size 2 Line 16\r\nSoft scroll up region [12..13] size 2 Line 17\r\nSoft scroll up region [12..13] size 2 Line 18\r\nSoft scroll up region [12..13] size 2 Line 19\r\nSoft scroll up region [12..13] size 2 Line 20\r\nSoft scroll up region [12..13] size 2 Line 21\r\nSoft scroll up region [12..13] size 2 Line 22\r\nSoft scroll up region [12..13] size 2 Line 23\r\nSoft scroll up region [12..13] size 2 Line 24\r\nSoft scroll up region [12..13] size 2 Line 25\r\nSoft scroll up region [12..13] size 2 Line 26\r\nSoft scroll up region [12..13] size 2 Line 27\r\nSoft scroll up region [12..13] size 2 Line 28\r\nSoft scroll up region [12..13] size 2 Line 29\r\n
+step: feed \x1b[24ASoft scroll down region [12..13] size 2 Line 1\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 2\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 3\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 4\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 5\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 6\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 7\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 8\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 9\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 10\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 11\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 12\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 13\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 14\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 15\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 16\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 17\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 18\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 19\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 20\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 21\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 22\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 23\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 24\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 25\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 26\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 27\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 28\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 29\r\n\x1bM\x1bMPush <RETURN>
+step: feed \x1b[1;24r\x1b[2J
+step: feed \x1b[24BSoft scroll up region [1..24] size 24 Line 1\r\nSoft scroll up region [1..24] size 24 Line 2\r\nSoft scroll up region [1..24] size 24 Line 3\r\nSoft scroll up region [1..24] size 24 Line 4\r\nSoft scroll up region [1..24] size 24 Line 5\r\nSoft scroll up region [1..24] size 24 Line 6\r\nSoft scroll up region [1..24] size 24 Line 7\r\nSoft scroll up region [1..24] size 24 Line 8\r\nSoft scroll up region [1..24] size 24 Line 9\r\nSoft scroll up region [1..24] size 24 Line 10\r\nSoft scroll up region [1..24] size 24 Line 11\r\nSoft scroll up region [1..24] size 24 Line 12\r\nSoft scroll up region [1..24] size 24 Line 13\r\nSoft scroll up region [1..24] size 24 Line 14\r\nSoft scroll up region [1..24] size 24 Line 15\r\nSoft scroll up region [1..24] size 24 Line 16\r\nSoft scroll up region [1..24] size 24 Line 17\r\nSoft scroll up region [1..24] size 24 Line 18\r\nSoft scroll up region [1..24] size 24 Line 19\r\nSoft scroll up region [1..24] size 24 Line 20\r\nSoft scroll up region [1..24] size 24 Line 21\r\nSoft scroll up region [1..24] size 24 Line 22\r\nSoft scroll up region [1..24] size 24 Line 23\r\nSoft scroll up region [1..24] size 24 Line 24\r\nSoft scroll up region [1..24] size 24 Line 25\r\nSoft scroll up region [1..24] size 24 Line 26\r\nSoft scroll up region [1..24] size 24 Line 27\r\nSoft scroll up region [1..24] size 24 Line 28\r\nSoft scroll up region [1..24] size 24 Line 29\r\n
+step: feed \x1b[24ASoft scroll down region [1..24] size 24 Line 1\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 2\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 3\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 4\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 5\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 6\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 7\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 8\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 9\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 10\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 11\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 12\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 13\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 14\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 15\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 16\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 17\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 18\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 19\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 20\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 21\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 22\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 23\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 24\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 25\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 26\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 27\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 28\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 29\r\n\x1bM\x1bMPush <RETURN>
+cite: https://invisible-island.net/vttest/ (vttest 2.7 20251205, `brew install vttest`; source https://invisible-island.net/archives/vttest/vttest.tar.gz)
+note: tst_screen 'Soft scroll up region [1..24]' (jump scroll). Lifted from the deferred list by #8. Matches tmux.
+flags: vttest in-scope
+screen:
+>Push <RETURN> |
+>Soft scroll down region [1..24] size 24 Line 29
+>Soft scroll down region [1..24] size 24 Line 28
+>Soft scroll down region [1..24] size 24 Line 27
+>Soft scroll down region [1..24] size 24 Line 26
+>Soft scroll down region [1..24] size 24 Line 25
+>Soft scroll down region [1..24] size 24 Line 24
+>Soft scroll down region [1..24] size 24 Line 23
+>Soft scroll down region [1..24] size 24 Line 22
+>Soft scroll down region [1..24] size 24 Line 21
+>Soft scroll down region [1..24] size 24 Line 20
+>Soft scroll down region [1..24] size 24 Line 19
+>Soft scroll down region [1..24] size 24 Line 18
+>Soft scroll down region [1..24] size 24 Line 17
+>Soft scroll down region [1..24] size 24 Line 16
+>Soft scroll down region [1..24] size 24 Line 15
+>Soft scroll down region [1..24] size 24 Line 14
+>Soft scroll down region [1..24] size 24 Line 13
+>Soft scroll down region [1..24] size 24 Line 12
+>Soft scroll down region [1..24] size 24 Line 11
+>Soft scroll down region [1..24] size 24 Line 10
+>Soft scroll down region [1..24] size 24 Line 9
+>Soft scroll down region [1..24] size 24 Line 8
+>Soft scroll down region [1..24] size 24 Line 7
+cursor: (0,13)   # 1-based row 1 col 14
+pending_wrap: false
+requests: []
+scrollback: len=29 first=("", wrapped=false)
+needs: Cumulative from m2_07 (DECOM stays on): DECSTBM 1;24, CUD/CUU 24, RI.
+source: vttest main.c tst_screen 'Soft scroll up region [1..24]' (jump scroll); capture: vttest_capture/m2_08.bin
+
+### V2S9_do_scrolling_soft_scroll_region_12_13
+size: 24x80
+step: feed \x1b[2J\x1b[?6h\x1b[?4h\x1b[12;13r\x1b[2J
+step: feed \x1b[24BSoft scroll up region [12..13] size 2 Line 1\r\nSoft scroll up region [12..13] size 2 Line 2\r\nSoft scroll up region [12..13] size 2 Line 3\r\nSoft scroll up region [12..13] size 2 Line 4\r\nSoft scroll up region [12..13] size 2 Line 5\r\nSoft scroll up region [12..13] size 2 Line 6\r\nSoft scroll up region [12..13] size 2 Line 7\r\nSoft scroll up region [12..13] size 2 Line 8\r\nSoft scroll up region [12..13] size 2 Line 9\r\nSoft scroll up region [12..13] size 2 Line 10\r\nSoft scroll up region [12..13] size 2 Line 11\r\nSoft scroll up region [12..13] size 2 Line 12\r\nSoft scroll up region [12..13] size 2 Line 13\r\nSoft scroll up region [12..13] size 2 Line 14\r\nSoft scroll up region [12..13] size 2 Line 15\r\nSoft scroll up region [12..13] size 2 Line 16\r\nSoft scroll up region [12..13] size 2 Line 17\r\nSoft scroll up region [12..13] size 2 Line 18\r\nSoft scroll up region [12..13] size 2 Line 19\r\nSoft scroll up region [12..13] size 2 Line 20\r\nSoft scroll up region [12..13] size 2 Line 21\r\nSoft scroll up region [12..13] size 2 Line 22\r\nSoft scroll up region [12..13] size 2 Line 23\r\nSoft scroll up region [12..13] size 2 Line 24\r\nSoft scroll up region [12..13] size 2 Line 25\r\nSoft scroll up region [12..13] size 2 Line 26\r\nSoft scroll up region [12..13] size 2 Line 27\r\nSoft scroll up region [12..13] size 2 Line 28\r\nSoft scroll up region [12..13] size 2 Line 29\r\n
+step: feed \x1b[24ASoft scroll down region [12..13] size 2 Line 1\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 2\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 3\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 4\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 5\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 6\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 7\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 8\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 9\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 10\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 11\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 12\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 13\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 14\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 15\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 16\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 17\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 18\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 19\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 20\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 21\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 22\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 23\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 24\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 25\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 26\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 27\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 28\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 29\r\n\x1bM\x1bMPush <RETURN>
+step: feed \x1b[1;24r\x1b[2J
+step: feed \x1b[24BSoft scroll up region [1..24] size 24 Line 1\r\nSoft scroll up region [1..24] size 24 Line 2\r\nSoft scroll up region [1..24] size 24 Line 3\r\nSoft scroll up region [1..24] size 24 Line 4\r\nSoft scroll up region [1..24] size 24 Line 5\r\nSoft scroll up region [1..24] size 24 Line 6\r\nSoft scroll up region [1..24] size 24 Line 7\r\nSoft scroll up region [1..24] size 24 Line 8\r\nSoft scroll up region [1..24] size 24 Line 9\r\nSoft scroll up region [1..24] size 24 Line 10\r\nSoft scroll up region [1..24] size 24 Line 11\r\nSoft scroll up region [1..24] size 24 Line 12\r\nSoft scroll up region [1..24] size 24 Line 13\r\nSoft scroll up region [1..24] size 24 Line 14\r\nSoft scroll up region [1..24] size 24 Line 15\r\nSoft scroll up region [1..24] size 24 Line 16\r\nSoft scroll up region [1..24] size 24 Line 17\r\nSoft scroll up region [1..24] size 24 Line 18\r\nSoft scroll up region [1..24] size 24 Line 19\r\nSoft scroll up region [1..24] size 24 Line 20\r\nSoft scroll up region [1..24] size 24 Line 21\r\nSoft scroll up region [1..24] size 24 Line 22\r\nSoft scroll up region [1..24] size 24 Line 23\r\nSoft scroll up region [1..24] size 24 Line 24\r\nSoft scroll up region [1..24] size 24 Line 25\r\nSoft scroll up region [1..24] size 24 Line 26\r\nSoft scroll up region [1..24] size 24 Line 27\r\nSoft scroll up region [1..24] size 24 Line 28\r\nSoft scroll up region [1..24] size 24 Line 29\r\n
+step: feed \x1b[24ASoft scroll down region [1..24] size 24 Line 1\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 2\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 3\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 4\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 5\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 6\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 7\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 8\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 9\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 10\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 11\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 12\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 13\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 14\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 15\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 16\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 17\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 18\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 19\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 20\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 21\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 22\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 23\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 24\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 25\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 26\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 27\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 28\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 29\r\n\x1bM\x1bMPush <RETURN>
+step: feed \x1b[?4l\x1b[12;13r\x1b[2J
+step: feed \x1b[24BJump scroll up region [12..13] size 2 Line 1\r\nJump scroll up region [12..13] size 2 Line 2\r\nJump scroll up region [12..13] size 2 Line 3\r\nJump scroll up region [12..13] size 2 Line 4\r\nJump scroll up region [12..13] size 2 Line 5\r\nJump scroll up region [12..13] size 2 Line 6\r\nJump scroll up region [12..13] size 2 Line 7\r\nJump scroll up region [12..13] size 2 Line 8\r\nJump scroll up region [12..13] size 2 Line 9\r\nJump scroll up region [12..13] size 2 Line 10\r\nJump scroll up region [12..13] size 2 Line 11\r\nJump scroll up region [12..13] size 2 Line 12\r\nJump scroll up region [12..13] size 2 Line 13\r\nJump scroll up region [12..13] size 2 Line 14\r\nJump scroll up region [12..13] size 2 Line 15\r\nJump scroll up region [12..13] size 2 Line 16\r\nJump scroll up region [12..13] size 2 Line 17\r\nJump scroll up region [12..13] size 2 Line 18\r\nJump scroll up region [12..13] size 2 Line 19\r\nJump scroll up region [12..13] size 2 Line 20\r\nJump scroll up region [12..13] size 2 Line 21\r\nJump scroll up region [12..13] size 2 Line 22\r\nJump scroll up region [12..13] size 2 Line 23\r\nJump scroll up region [12..13] size 2 Line 24\r\nJump scroll up region [12..13] size 2 Line 25\r\nJump scroll up region [12..13] size 2 Line 26\r\nJump scroll up region [12..13] size 2 Line 27\r\nJump scroll up region [12..13] size 2 Line 28\r\nJump scroll up region [12..13] size 2 Line 29\r\n
+step: feed \x1b[24AJump scroll down region [12..13] size 2 Line 1\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 2\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 3\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 4\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 5\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 6\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 7\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 8\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 9\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 10\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 11\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 12\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 13\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 14\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 15\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 16\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 17\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 18\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 19\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 20\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 21\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 22\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 23\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 24\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 25\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 26\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 27\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 28\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 29\r\n\x1bM\x1bMPush <RETURN>
+cite: https://invisible-island.net/vttest/ (vttest 2.7 20251205, `brew install vttest`; source https://invisible-island.net/archives/vttest/vttest.tar.gz)
+note: tst_screen 'Soft scroll up region [12..13]' (soft scroll). Lifted from the deferred list by #8. Matches tmux.
+flags: vttest in-scope
+screen:
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>Push <RETURN> |
+>Jump scroll down region [12..13] size 2 Line 29
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (11,13)   # 1-based row 12 col 14
+pending_wrap: false
+requests: []
+scrollback: len=29 first=("", wrapped=false)
+needs: Cumulative from m2_07: ESC[?4l DECSCLM reset (ignored), DECSTBM 12;13 under DECOM.
+source: vttest main.c tst_screen 'Soft scroll up region [12..13]' (soft scroll); capture: vttest_capture/m2_09.bin
+
+### V2S10_do_scrolling_soft_scroll_region_1_24
+size: 24x80
+step: feed \x1b[2J\x1b[?6h\x1b[?4h\x1b[12;13r\x1b[2J
+step: feed \x1b[24BSoft scroll up region [12..13] size 2 Line 1\r\nSoft scroll up region [12..13] size 2 Line 2\r\nSoft scroll up region [12..13] size 2 Line 3\r\nSoft scroll up region [12..13] size 2 Line 4\r\nSoft scroll up region [12..13] size 2 Line 5\r\nSoft scroll up region [12..13] size 2 Line 6\r\nSoft scroll up region [12..13] size 2 Line 7\r\nSoft scroll up region [12..13] size 2 Line 8\r\nSoft scroll up region [12..13] size 2 Line 9\r\nSoft scroll up region [12..13] size 2 Line 10\r\nSoft scroll up region [12..13] size 2 Line 11\r\nSoft scroll up region [12..13] size 2 Line 12\r\nSoft scroll up region [12..13] size 2 Line 13\r\nSoft scroll up region [12..13] size 2 Line 14\r\nSoft scroll up region [12..13] size 2 Line 15\r\nSoft scroll up region [12..13] size 2 Line 16\r\nSoft scroll up region [12..13] size 2 Line 17\r\nSoft scroll up region [12..13] size 2 Line 18\r\nSoft scroll up region [12..13] size 2 Line 19\r\nSoft scroll up region [12..13] size 2 Line 20\r\nSoft scroll up region [12..13] size 2 Line 21\r\nSoft scroll up region [12..13] size 2 Line 22\r\nSoft scroll up region [12..13] size 2 Line 23\r\nSoft scroll up region [12..13] size 2 Line 24\r\nSoft scroll up region [12..13] size 2 Line 25\r\nSoft scroll up region [12..13] size 2 Line 26\r\nSoft scroll up region [12..13] size 2 Line 27\r\nSoft scroll up region [12..13] size 2 Line 28\r\nSoft scroll up region [12..13] size 2 Line 29\r\n
+step: feed \x1b[24ASoft scroll down region [12..13] size 2 Line 1\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 2\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 3\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 4\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 5\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 6\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 7\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 8\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 9\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 10\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 11\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 12\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 13\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 14\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 15\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 16\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 17\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 18\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 19\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 20\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 21\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 22\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 23\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 24\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 25\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 26\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 27\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 28\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 29\r\n\x1bM\x1bMPush <RETURN>
+step: feed \x1b[1;24r\x1b[2J
+step: feed \x1b[24BSoft scroll up region [1..24] size 24 Line 1\r\nSoft scroll up region [1..24] size 24 Line 2\r\nSoft scroll up region [1..24] size 24 Line 3\r\nSoft scroll up region [1..24] size 24 Line 4\r\nSoft scroll up region [1..24] size 24 Line 5\r\nSoft scroll up region [1..24] size 24 Line 6\r\nSoft scroll up region [1..24] size 24 Line 7\r\nSoft scroll up region [1..24] size 24 Line 8\r\nSoft scroll up region [1..24] size 24 Line 9\r\nSoft scroll up region [1..24] size 24 Line 10\r\nSoft scroll up region [1..24] size 24 Line 11\r\nSoft scroll up region [1..24] size 24 Line 12\r\nSoft scroll up region [1..24] size 24 Line 13\r\nSoft scroll up region [1..24] size 24 Line 14\r\nSoft scroll up region [1..24] size 24 Line 15\r\nSoft scroll up region [1..24] size 24 Line 16\r\nSoft scroll up region [1..24] size 24 Line 17\r\nSoft scroll up region [1..24] size 24 Line 18\r\nSoft scroll up region [1..24] size 24 Line 19\r\nSoft scroll up region [1..24] size 24 Line 20\r\nSoft scroll up region [1..24] size 24 Line 21\r\nSoft scroll up region [1..24] size 24 Line 22\r\nSoft scroll up region [1..24] size 24 Line 23\r\nSoft scroll up region [1..24] size 24 Line 24\r\nSoft scroll up region [1..24] size 24 Line 25\r\nSoft scroll up region [1..24] size 24 Line 26\r\nSoft scroll up region [1..24] size 24 Line 27\r\nSoft scroll up region [1..24] size 24 Line 28\r\nSoft scroll up region [1..24] size 24 Line 29\r\n
+step: feed \x1b[24ASoft scroll down region [1..24] size 24 Line 1\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 2\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 3\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 4\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 5\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 6\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 7\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 8\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 9\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 10\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 11\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 12\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 13\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 14\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 15\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 16\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 17\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 18\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 19\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 20\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 21\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 22\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 23\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 24\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 25\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 26\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 27\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 28\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 29\r\n\x1bM\x1bMPush <RETURN>
+step: feed \x1b[?4l\x1b[12;13r\x1b[2J
+step: feed \x1b[24BJump scroll up region [12..13] size 2 Line 1\r\nJump scroll up region [12..13] size 2 Line 2\r\nJump scroll up region [12..13] size 2 Line 3\r\nJump scroll up region [12..13] size 2 Line 4\r\nJump scroll up region [12..13] size 2 Line 5\r\nJump scroll up region [12..13] size 2 Line 6\r\nJump scroll up region [12..13] size 2 Line 7\r\nJump scroll up region [12..13] size 2 Line 8\r\nJump scroll up region [12..13] size 2 Line 9\r\nJump scroll up region [12..13] size 2 Line 10\r\nJump scroll up region [12..13] size 2 Line 11\r\nJump scroll up region [12..13] size 2 Line 12\r\nJump scroll up region [12..13] size 2 Line 13\r\nJump scroll up region [12..13] size 2 Line 14\r\nJump scroll up region [12..13] size 2 Line 15\r\nJump scroll up region [12..13] size 2 Line 16\r\nJump scroll up region [12..13] size 2 Line 17\r\nJump scroll up region [12..13] size 2 Line 18\r\nJump scroll up region [12..13] size 2 Line 19\r\nJump scroll up region [12..13] size 2 Line 20\r\nJump scroll up region [12..13] size 2 Line 21\r\nJump scroll up region [12..13] size 2 Line 22\r\nJump scroll up region [12..13] size 2 Line 23\r\nJump scroll up region [12..13] size 2 Line 24\r\nJump scroll up region [12..13] size 2 Line 25\r\nJump scroll up region [12..13] size 2 Line 26\r\nJump scroll up region [12..13] size 2 Line 27\r\nJump scroll up region [12..13] size 2 Line 28\r\nJump scroll up region [12..13] size 2 Line 29\r\n
+step: feed \x1b[24AJump scroll down region [12..13] size 2 Line 1\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 2\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 3\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 4\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 5\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 6\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 7\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 8\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 9\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 10\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 11\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 12\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 13\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 14\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 15\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 16\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 17\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 18\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 19\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 20\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 21\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 22\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 23\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 24\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 25\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 26\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 27\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 28\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 29\r\n\x1bM\x1bMPush <RETURN>
+step: feed \x1b[1;24r\x1b[2J
+step: feed \x1b[24BJump scroll up region [1..24] size 24 Line 1\r\nJump scroll up region [1..24] size 24 Line 2\r\nJump scroll up region [1..24] size 24 Line 3\r\nJump scroll up region [1..24] size 24 Line 4\r\nJump scroll up region [1..24] size 24 Line 5\r\nJump scroll up region [1..24] size 24 Line 6\r\nJump scroll up region [1..24] size 24 Line 7\r\nJump scroll up region [1..24] size 24 Line 8\r\nJump scroll up region [1..24] size 24 Line 9\r\nJump scroll up region [1..24] size 24 Line 10\r\nJump scroll up region [1..24] size 24 Line 11\r\nJump scroll up region [1..24] size 24 Line 12\r\nJump scroll up region [1..24] size 24 Line 13\r\nJump scroll up region [1..24] size 24 Line 14\r\nJump scroll up region [1..24] size 24 Line 15\r\nJump scroll up region [1..24] size 24 Line 16\r\nJump scroll up region [1..24] size 24 Line 17\r\nJump scroll up region [1..24] size 24 Line 18\r\nJump scroll up region [1..24] size 24 Line 19\r\nJump scroll up region [1..24] size 24 Line 20\r\nJump scroll up region [1..24] size 24 Line 21\r\nJump scroll up region [1..24] size 24 Line 22\r\nJump scroll up region [1..24] size 24 Line 23\r\nJump scroll up region [1..24] size 24 Line 24\r\nJump scroll up region [1..24] size 24 Line 25\r\nJump scroll up region [1..24] size 24 Line 26\r\nJump scroll up region [1..24] size 24 Line 27\r\nJump scroll up region [1..24] size 24 Line 28\r\nJump scroll up region [1..24] size 24 Line 29\r\n
+step: feed \x1b[24AJump scroll down region [1..24] size 24 Line 1\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 2\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 3\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 4\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 5\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 6\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 7\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 8\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 9\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 10\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 11\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 12\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 13\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 14\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 15\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 16\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 17\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 18\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 19\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 20\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 21\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 22\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 23\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 24\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 25\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 26\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 27\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 28\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 29\r\n\x1bM\x1bMPush <RETURN>
+cite: https://invisible-island.net/vttest/ (vttest 2.7 20251205, `brew install vttest`; source https://invisible-island.net/archives/vttest/vttest.tar.gz)
+note: tst_screen 'Soft scroll up region [1..24]' (soft scroll). Lifted from the deferred list by #8. Matches tmux.
+flags: vttest in-scope
+screen:
+>Push <RETURN> |
+>Jump scroll down region [1..24] size 24 Line 29
+>Jump scroll down region [1..24] size 24 Line 28
+>Jump scroll down region [1..24] size 24 Line 27
+>Jump scroll down region [1..24] size 24 Line 26
+>Jump scroll down region [1..24] size 24 Line 25
+>Jump scroll down region [1..24] size 24 Line 24
+>Jump scroll down region [1..24] size 24 Line 23
+>Jump scroll down region [1..24] size 24 Line 22
+>Jump scroll down region [1..24] size 24 Line 21
+>Jump scroll down region [1..24] size 24 Line 20
+>Jump scroll down region [1..24] size 24 Line 19
+>Jump scroll down region [1..24] size 24 Line 18
+>Jump scroll down region [1..24] size 24 Line 17
+>Jump scroll down region [1..24] size 24 Line 16
+>Jump scroll down region [1..24] size 24 Line 15
+>Jump scroll down region [1..24] size 24 Line 14
+>Jump scroll down region [1..24] size 24 Line 13
+>Jump scroll down region [1..24] size 24 Line 12
+>Jump scroll down region [1..24] size 24 Line 11
+>Jump scroll down region [1..24] size 24 Line 10
+>Jump scroll down region [1..24] size 24 Line 9
+>Jump scroll down region [1..24] size 24 Line 8
+>Jump scroll down region [1..24] size 24 Line 7
+cursor: (0,13)   # 1-based row 1 col 14
+pending_wrap: false
+requests: []
+scrollback: len=58 first=("", wrapped=false)
+needs: Cumulative from m2_07: DECSTBM 1;24 under DECOM.
+source: vttest main.c tst_screen 'Soft scroll up region [1..24]' (soft scroll); capture: vttest_capture/m2_10.bin
+
+### V2S11_origin_relative
+size: 24x80
+step: feed \x1b[2J\x1b[?6h\x1b[?4h\x1b[12;13r\x1b[2J
+step: feed \x1b[24BSoft scroll up region [12..13] size 2 Line 1\r\nSoft scroll up region [12..13] size 2 Line 2\r\nSoft scroll up region [12..13] size 2 Line 3\r\nSoft scroll up region [12..13] size 2 Line 4\r\nSoft scroll up region [12..13] size 2 Line 5\r\nSoft scroll up region [12..13] size 2 Line 6\r\nSoft scroll up region [12..13] size 2 Line 7\r\nSoft scroll up region [12..13] size 2 Line 8\r\nSoft scroll up region [12..13] size 2 Line 9\r\nSoft scroll up region [12..13] size 2 Line 10\r\nSoft scroll up region [12..13] size 2 Line 11\r\nSoft scroll up region [12..13] size 2 Line 12\r\nSoft scroll up region [12..13] size 2 Line 13\r\nSoft scroll up region [12..13] size 2 Line 14\r\nSoft scroll up region [12..13] size 2 Line 15\r\nSoft scroll up region [12..13] size 2 Line 16\r\nSoft scroll up region [12..13] size 2 Line 17\r\nSoft scroll up region [12..13] size 2 Line 18\r\nSoft scroll up region [12..13] size 2 Line 19\r\nSoft scroll up region [12..13] size 2 Line 20\r\nSoft scroll up region [12..13] size 2 Line 21\r\nSoft scroll up region [12..13] size 2 Line 22\r\nSoft scroll up region [12..13] size 2 Line 23\r\nSoft scroll up region [12..13] size 2 Line 24\r\nSoft scroll up region [12..13] size 2 Line 25\r\nSoft scroll up region [12..13] size 2 Line 26\r\nSoft scroll up region [12..13] size 2 Line 27\r\nSoft scroll up region [12..13] size 2 Line 28\r\nSoft scroll up region [12..13] size 2 Line 29\r\n
+step: feed \x1b[24ASoft scroll down region [12..13] size 2 Line 1\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 2\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 3\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 4\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 5\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 6\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 7\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 8\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 9\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 10\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 11\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 12\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 13\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 14\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 15\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 16\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 17\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 18\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 19\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 20\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 21\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 22\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 23\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 24\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 25\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 26\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 27\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 28\r\n\x1bM
+step: feed \x1bMSoft scroll down region [12..13] size 2 Line 29\r\n\x1bM\x1bMPush <RETURN>
+step: feed \x1b[1;24r\x1b[2J
+step: feed \x1b[24BSoft scroll up region [1..24] size 24 Line 1\r\nSoft scroll up region [1..24] size 24 Line 2\r\nSoft scroll up region [1..24] size 24 Line 3\r\nSoft scroll up region [1..24] size 24 Line 4\r\nSoft scroll up region [1..24] size 24 Line 5\r\nSoft scroll up region [1..24] size 24 Line 6\r\nSoft scroll up region [1..24] size 24 Line 7\r\nSoft scroll up region [1..24] size 24 Line 8\r\nSoft scroll up region [1..24] size 24 Line 9\r\nSoft scroll up region [1..24] size 24 Line 10\r\nSoft scroll up region [1..24] size 24 Line 11\r\nSoft scroll up region [1..24] size 24 Line 12\r\nSoft scroll up region [1..24] size 24 Line 13\r\nSoft scroll up region [1..24] size 24 Line 14\r\nSoft scroll up region [1..24] size 24 Line 15\r\nSoft scroll up region [1..24] size 24 Line 16\r\nSoft scroll up region [1..24] size 24 Line 17\r\nSoft scroll up region [1..24] size 24 Line 18\r\nSoft scroll up region [1..24] size 24 Line 19\r\nSoft scroll up region [1..24] size 24 Line 20\r\nSoft scroll up region [1..24] size 24 Line 21\r\nSoft scroll up region [1..24] size 24 Line 22\r\nSoft scroll up region [1..24] size 24 Line 23\r\nSoft scroll up region [1..24] size 24 Line 24\r\nSoft scroll up region [1..24] size 24 Line 25\r\nSoft scroll up region [1..24] size 24 Line 26\r\nSoft scroll up region [1..24] size 24 Line 27\r\nSoft scroll up region [1..24] size 24 Line 28\r\nSoft scroll up region [1..24] size 24 Line 29\r\n
+step: feed \x1b[24ASoft scroll down region [1..24] size 24 Line 1\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 2\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 3\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 4\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 5\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 6\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 7\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 8\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 9\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 10\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 11\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 12\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 13\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 14\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 15\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 16\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 17\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 18\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 19\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 20\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 21\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 22\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 23\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 24\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 25\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 26\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 27\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 28\r\n\x1bM
+step: feed \x1bMSoft scroll down region [1..24] size 24 Line 29\r\n\x1bM\x1bMPush <RETURN>
+step: feed \x1b[?4l\x1b[12;13r\x1b[2J
+step: feed \x1b[24BJump scroll up region [12..13] size 2 Line 1\r\nJump scroll up region [12..13] size 2 Line 2\r\nJump scroll up region [12..13] size 2 Line 3\r\nJump scroll up region [12..13] size 2 Line 4\r\nJump scroll up region [12..13] size 2 Line 5\r\nJump scroll up region [12..13] size 2 Line 6\r\nJump scroll up region [12..13] size 2 Line 7\r\nJump scroll up region [12..13] size 2 Line 8\r\nJump scroll up region [12..13] size 2 Line 9\r\nJump scroll up region [12..13] size 2 Line 10\r\nJump scroll up region [12..13] size 2 Line 11\r\nJump scroll up region [12..13] size 2 Line 12\r\nJump scroll up region [12..13] size 2 Line 13\r\nJump scroll up region [12..13] size 2 Line 14\r\nJump scroll up region [12..13] size 2 Line 15\r\nJump scroll up region [12..13] size 2 Line 16\r\nJump scroll up region [12..13] size 2 Line 17\r\nJump scroll up region [12..13] size 2 Line 18\r\nJump scroll up region [12..13] size 2 Line 19\r\nJump scroll up region [12..13] size 2 Line 20\r\nJump scroll up region [12..13] size 2 Line 21\r\nJump scroll up region [12..13] size 2 Line 22\r\nJump scroll up region [12..13] size 2 Line 23\r\nJump scroll up region [12..13] size 2 Line 24\r\nJump scroll up region [12..13] size 2 Line 25\r\nJump scroll up region [12..13] size 2 Line 26\r\nJump scroll up region [12..13] size 2 Line 27\r\nJump scroll up region [12..13] size 2 Line 28\r\nJump scroll up region [12..13] size 2 Line 29\r\n
+step: feed \x1b[24AJump scroll down region [12..13] size 2 Line 1\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 2\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 3\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 4\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 5\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 6\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 7\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 8\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 9\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 10\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 11\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 12\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 13\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 14\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 15\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 16\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 17\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 18\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 19\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 20\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 21\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 22\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 23\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 24\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 25\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 26\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 27\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 28\r\n\x1bM
+step: feed \x1bMJump scroll down region [12..13] size 2 Line 29\r\n\x1bM\x1bMPush <RETURN>
+step: feed \x1b[1;24r\x1b[2J
+step: feed \x1b[24BJump scroll up region [1..24] size 24 Line 1\r\nJump scroll up region [1..24] size 24 Line 2\r\nJump scroll up region [1..24] size 24 Line 3\r\nJump scroll up region [1..24] size 24 Line 4\r\nJump scroll up region [1..24] size 24 Line 5\r\nJump scroll up region [1..24] size 24 Line 6\r\nJump scroll up region [1..24] size 24 Line 7\r\nJump scroll up region [1..24] size 24 Line 8\r\nJump scroll up region [1..24] size 24 Line 9\r\nJump scroll up region [1..24] size 24 Line 10\r\nJump scroll up region [1..24] size 24 Line 11\r\nJump scroll up region [1..24] size 24 Line 12\r\nJump scroll up region [1..24] size 24 Line 13\r\nJump scroll up region [1..24] size 24 Line 14\r\nJump scroll up region [1..24] size 24 Line 15\r\nJump scroll up region [1..24] size 24 Line 16\r\nJump scroll up region [1..24] size 24 Line 17\r\nJump scroll up region [1..24] size 24 Line 18\r\nJump scroll up region [1..24] size 24 Line 19\r\nJump scroll up region [1..24] size 24 Line 20\r\nJump scroll up region [1..24] size 24 Line 21\r\nJump scroll up region [1..24] size 24 Line 22\r\nJump scroll up region [1..24] size 24 Line 23\r\nJump scroll up region [1..24] size 24 Line 24\r\nJump scroll up region [1..24] size 24 Line 25\r\nJump scroll up region [1..24] size 24 Line 26\r\nJump scroll up region [1..24] size 24 Line 27\r\nJump scroll up region [1..24] size 24 Line 28\r\nJump scroll up region [1..24] size 24 Line 29\r\n
+step: feed \x1b[24AJump scroll down region [1..24] size 24 Line 1\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 2\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 3\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 4\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 5\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 6\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 7\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 8\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 9\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 10\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 11\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 12\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 13\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 14\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 15\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 16\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 17\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 18\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 19\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 20\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 21\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 22\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 23\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 24\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 25\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 26\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 27\r\n\x1bM\x1bMJump scroll down region [1..24] size 24 Line 28\r\n\x1bM
+step: feed \x1bMJump scroll down region [1..24] size 24 Line 29\r\n\x1bM\x1bMPush <RETURN>
+step: feed \x1b[2J\x1b[23;24r\r\nOrigin mode test. This line should be at the bottom of the screen.
+step: feed \x1b[1;1HThis line should be the one above the bottom of the screen. Push <RETURN>
+cite: https://invisible-island.net/vttest/ (vttest 2.7 20251205, `brew install vttest`; source https://invisible-island.net/archives/vttest/vttest.tar.gz)
+note: tst_screen 'Origin mode (relative)'. Lifted from the deferred list by #8.
+flags: vttest in-scope
+screen:
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>This line should be the one above the bottom of the screen. Push <RETURN> |
+>Origin mode test. This line should be at the bottom of the screen.
+cursor: (22,73)   # 1-based row 23 col 74
+pending_wrap: false
+requests: []
+scrollback: len=58 first=("", wrapped=false)
+needs: Cumulative from m2_07: DECOM is still on from m2_07; DECSTBM 23;24 homes to row 23 and CUP 1;1 is region-relative (xterm CursorSet with ORIGIN; tmux disagrees).
+source: vttest main.c tst_screen 'Origin mode (relative)'; capture: vttest_capture/m2_11.bin
+
+### V2S14_light_background_prompt
+size: 24x80
+step: feed \x1b[?5h\x1b[23;1H\x1b[0KLight background. Push <RETURN>
+cite: https://invisible-island.net/vttest/ (vttest 2.7 20251205, `brew install vttest`; source https://invisible-island.net/archives/vttest/vttest.tar.gz)
+note: tst_screen 'Light background' prompt. Lifted from the deferred list by #8.
+flags: vttest in-scope
+screen:
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>Light background. Push <RETURN> |
+>
+cursor: (22,31)   # 1-based row 23 col 32
+pending_wrap: false
+requests: []
+scrollback: len=0
+needs: ESC[?5h DECSCNM is stored only; CUP 23;1, EL 0, text. Fed on a fresh terminal (the SGR pattern of m2_13 above it is #7's screen).
+source: vttest main.c tst_screen 'Light background' prompt; capture: vttest_capture/m2_14.bin
 
 # ---------------------------------------------------------------------------- DEFERRED vttest screens (NOT cases; not parsed by parse_fixture)
-# The lead should comment this list on issue #8. Streams: vttest_capture/m<menu>_<NN>.esc.txt.
+# Streams: vttest_capture/m<menu>_<NN>.esc.txt. #8 lifted the screens that need only DECOM, DECAWM,
+# DECSCNM (stored) and DECCOLM (ignored without DECSET 40); with c132 off the 132-column screens below
+# are not text-identical to their 132-wide frames, so they stay here.
 #
-#### DEFERRED V1S2_cursor_movements_132col_frame (m1_02) -> #8
+#### DEFERRED V1S2_cursor_movements_132col_frame (m1_02) -> 132 columns (needs ESC[?40h first; follow-up of #8)
 #   needs: ESC[?3h DECCOLM: resize to 132 columns, clear, home; the frame is 132 wide
 #
-#### DEFERRED V1S3_autowrap_80col (m1_03) -> #8
-#   needs: ESC[?6h DECOM (cup relative to the region 3..21), DECSTBM 3;21 (in #6), DECAWM via ?7 not used; pending-wrap/BS/HT at the right margin. Letters left A..Z, right a..z must be in order
-#   expected screen (full-xterm model; tmux 3.x renders HT and the wrap differently and is NOT an oracle here):
-#>Test of autowrap, mixing control and print characters.
-#>The left/right margins should have letters in order:
-#>I                                                                              i\
-#>J                                                                              j
-#>K                                                                              k
-#>L                                                                              l
-#>M                                                                              m\
-#>N                                                                              n
-#>O                                                                              o
-#>P                                                                              p
-#>Q                                                                              q\
-#>R                                                                              r
-#>S                                                                              s
-#>T                                                                              t
-#>U                                                                              u\
-#>V                                                                              v
-#>W                                                                              w
-#>X                                                                              x
-#>Y                                                                              y\
-#>Z                                                                              z
-#>
-#>Push <RETURN> |
-#>
-#>
-#   cursor: (21,13) pending_wrap: false
-#
-#### DEFERRED V1S4_autowrap_132col (m1_04) -> #8
+#### DEFERRED V1S4_autowrap_132col (m1_04) -> 132 columns (needs ESC[?40h first; follow-up of #8)
 #   needs: as V1S3 plus ESC[?3h (132 columns)
 #
-#### DEFERRED V2S3_132col_light_background (m2_03) -> #8
+#### DEFERRED V2S3_132col_light_background (m2_03) -> 132 columns (needs ESC[?40h first; follow-up of #8)
 #   needs: ESC[?5h DECSCNM + ESC[?3h DECCOLM 132; tab stops every 8 via HTS; text 'This is 132 column mode, light background.'
 #
-#### DEFERRED V2S4_80col_light_background (m2_04) -> #8 (optional: text-identical if ?3/?5 are ignored)
-#   needs: ESC[?3l, DECSCNM invisible in the text render
-#   expected screen (full-xterm model; matches tmux):
-#>1234567890123456789012345678901234567890123456789012345678901234567890123456789
-#>
-#>  This is 80 column mode, light background.
-#>   This is 80 column mode, light background.
-#>    This is 80 column mode, light background.
-#>     This is 80 column mode, light background.
-#>      This is 80 column mode, light background.
-#>       This is 80 column mode, light background.
-#>        This is 80 column mode, light background.
-#>         This is 80 column mode, light background.
-#>          This is 80 column mode, light background.
-#>           This is 80 column mode, light background.
-#>            This is 80 column mode, light background.
-#>             This is 80 column mode, light background.
-#>              This is 80 column mode, light background.
-#>               This is 80 column mode, light background.
-#>                This is 80 column mode, light background.
-#>                 This is 80 column mode, light background.
-#>                  This is 80 column mode, light background.
-#>                   This is 80 column mode, light background.Push <RETURN> |
-#>
-#>
-#>
-#>
-#   cursor: (19,73) pending_wrap: false
-#
-#### DEFERRED V2S5_132col_dark_background (m2_05) -> #8
+#### DEFERRED V2S5_132col_dark_background (m2_05) -> 132 columns (needs ESC[?40h first; follow-up of #8)
 #   needs: ESC[?5l + ESC[?3h
-#
-#### DEFERRED V2S6_80col_dark_background (m2_06) -> #8 (optional, as V2S4)
-#   needs: ESC[?3l, ESC[?5l
-#   expected screen (full-xterm model; matches tmux):
-#>1234567890123456789012345678901234567890123456789012345678901234567890123456789
-#>
-#>  This is 80 column mode, dark background.
-#>   This is 80 column mode, dark background.
-#>    This is 80 column mode, dark background.
-#>     This is 80 column mode, dark background.
-#>      This is 80 column mode, dark background.
-#>       This is 80 column mode, dark background.
-#>        This is 80 column mode, dark background.
-#>         This is 80 column mode, dark background.
-#>          This is 80 column mode, dark background.
-#>           This is 80 column mode, dark background.
-#>            This is 80 column mode, dark background.
-#>             This is 80 column mode, dark background.
-#>              This is 80 column mode, dark background.
-#>               This is 80 column mode, dark background.
-#>                This is 80 column mode, dark background.
-#>                 This is 80 column mode, dark background.
-#>                  This is 80 column mode, dark background.
-#>                   This is 80 column mode, dark background.Push <RETURN> |
-#>
-#>
-#>
-#>
-#   cursor: (19,72) pending_wrap: false
-#
-#### DEFERRED V2S7_do_scrolling_jump_scroll_up_region_12_13 (m2_07) -> #8
-#   needs: ESC[?6h DECOM, ESC[?4h/l DECSCLM (ignorable), DECSTBM, CUU/CUD 24, RI; cumulative from m2_07
-#   expected screen (full-xterm model; matches tmux):
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>Push <RETURN> |
-#>Soft scroll down region [12..13] size 2 Line 29
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#   cursor: (11,13) pending_wrap: false
-#
-#### DEFERRED V2S8_do_scrolling_jump_scroll_region_1_24 (m2_08) -> #8
-#   needs: ESC[?6h DECOM, ESC[?4h/l DECSCLM (ignorable), DECSTBM, CUU/CUD 24, RI; cumulative from m2_07
-#   expected screen (full-xterm model; matches tmux):
-#>Push <RETURN> |
-#>Soft scroll down region [1..24] size 24 Line 29
-#>Soft scroll down region [1..24] size 24 Line 28
-#>Soft scroll down region [1..24] size 24 Line 27
-#>Soft scroll down region [1..24] size 24 Line 26
-#>Soft scroll down region [1..24] size 24 Line 25
-#>Soft scroll down region [1..24] size 24 Line 24
-#>Soft scroll down region [1..24] size 24 Line 23
-#>Soft scroll down region [1..24] size 24 Line 22
-#>Soft scroll down region [1..24] size 24 Line 21
-#>Soft scroll down region [1..24] size 24 Line 20
-#>Soft scroll down region [1..24] size 24 Line 19
-#>Soft scroll down region [1..24] size 24 Line 18
-#>Soft scroll down region [1..24] size 24 Line 17
-#>Soft scroll down region [1..24] size 24 Line 16
-#>Soft scroll down region [1..24] size 24 Line 15
-#>Soft scroll down region [1..24] size 24 Line 14
-#>Soft scroll down region [1..24] size 24 Line 13
-#>Soft scroll down region [1..24] size 24 Line 12
-#>Soft scroll down region [1..24] size 24 Line 11
-#>Soft scroll down region [1..24] size 24 Line 10
-#>Soft scroll down region [1..24] size 24 Line 9
-#>Soft scroll down region [1..24] size 24 Line 8
-#>Soft scroll down region [1..24] size 24 Line 7
-#   cursor: (0,13) pending_wrap: false
-#
-#### DEFERRED V2S9_do_scrolling_soft_scroll_region_12_13 (m2_09) -> #8
-#   needs: ESC[?6h DECOM, ESC[?4h/l DECSCLM (ignorable), DECSTBM, CUU/CUD 24, RI; cumulative from m2_07
-#   expected screen (full-xterm model; matches tmux):
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>Push <RETURN> |
-#>Jump scroll down region [12..13] size 2 Line 29
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#   cursor: (11,13) pending_wrap: false
-#
-#### DEFERRED V2S10_do_scrolling_soft_scroll_region_1_24 (m2_10) -> #8
-#   needs: ESC[?6h DECOM, ESC[?4h/l DECSCLM (ignorable), DECSTBM, CUU/CUD 24, RI; cumulative from m2_07
-#   expected screen (full-xterm model; matches tmux):
-#>Push <RETURN> |
-#>Jump scroll down region [1..24] size 24 Line 29
-#>Jump scroll down region [1..24] size 24 Line 28
-#>Jump scroll down region [1..24] size 24 Line 27
-#>Jump scroll down region [1..24] size 24 Line 26
-#>Jump scroll down region [1..24] size 24 Line 25
-#>Jump scroll down region [1..24] size 24 Line 24
-#>Jump scroll down region [1..24] size 24 Line 23
-#>Jump scroll down region [1..24] size 24 Line 22
-#>Jump scroll down region [1..24] size 24 Line 21
-#>Jump scroll down region [1..24] size 24 Line 20
-#>Jump scroll down region [1..24] size 24 Line 19
-#>Jump scroll down region [1..24] size 24 Line 18
-#>Jump scroll down region [1..24] size 24 Line 17
-#>Jump scroll down region [1..24] size 24 Line 16
-#>Jump scroll down region [1..24] size 24 Line 15
-#>Jump scroll down region [1..24] size 24 Line 14
-#>Jump scroll down region [1..24] size 24 Line 13
-#>Jump scroll down region [1..24] size 24 Line 12
-#>Jump scroll down region [1..24] size 24 Line 11
-#>Jump scroll down region [1..24] size 24 Line 10
-#>Jump scroll down region [1..24] size 24 Line 9
-#>Jump scroll down region [1..24] size 24 Line 8
-#>Jump scroll down region [1..24] size 24 Line 7
-#   cursor: (0,13) pending_wrap: false
-#
-#### DEFERRED V2S11_origin_relative (m2_11) -> #8
-#   needs: ESC[?6h DECOM state carried over from V2S10 + DECSTBM 23;24; cumulative from m2_07
-#   expected screen (full-xterm model; tmux disagrees (tmux homes differently after DECSTBM under DECOM); model follows xterm CursorSet(ORIGIN)):
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>This line should be the one above the bottom of the screen. Push <RETURN> |
-#>Origin mode test. This line should be at the bottom of the screen.
-#   cursor: (22,73) pending_wrap: false
 #
 #### DEFERRED V2S13_sgr_pattern (m2_13) -> #7
 #   needs: SGR 0/1/4/5/7 combinations, ESC[?5 DECSCNM; text is plain ASCII but attributes are the point
 #
-#### DEFERRED V2S14_light_background_prompt (m2_14) -> #8/#7
-#   needs: DECSCNM
-#
-#### DEFERRED V2S15_save_restore_cursor_charsets (m2_15) -> #7 + #8
+#### DEFERRED V2S15_save_restore_cursor_charsets (m2_15) -> #112 (SCS)
 #   needs: SGR attributes and SCS graphics (ESC ( 0 / ESC ( B) saved/restored with DECSC/DECRC; the DECSC/DECRC part itself is in #6 (rows SC01..SC09)
 #
-#### DEFERRED V8S2_accordion_original_DECOM (m8_02) -> #8
-#   needs: ESC[?6h DECOM; same expected screen as the ADAPTED in-scope V8S2
-#   expected screen (full-xterm model; matches tmux):
-#>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
-#>Top line: A's, bottom line: X's, this line, nothing more. Push <RETURN> |
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>
-#>XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
-#   cursor: (1,71) pending_wrap: false
-#
-#### DEFERRED V8S6_double_width_staggered_dch (m8_06) -> #8
+#### DEFERRED V8S6_double_width_staggered_dch (m8_06) -> DECDWL double-width lines (no issue yet)
 #   needs: ESC#6 DECDWL double-width lines + DCH; the 80-column text cannot be represented without double-width cells
 #
-#### DEFERRED V8S8..S14_132col_pass (m8_08..m8_14) -> #8
+#### DEFERRED V8S8..S14_132col_pass (m8_08..m8_14) -> 132 columns (needs ESC[?40h first; follow-up of #8)
 #   needs: second tst_insdel pass after ESC[?3h: the same seven screens at 132 columns
 #
 #### DEFERRED menu 6 'Test of terminal reports' (m6_01 is only the submenu) -> out of scope (#9/#10 requests)

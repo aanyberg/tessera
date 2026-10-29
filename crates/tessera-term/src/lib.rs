@@ -31,16 +31,20 @@
 //! them. Its parameters are ignored, as in xterm (`CSI 5 ! p` resets too).
 //! REP has nothing to repeat afterwards, as after any sequence.
 //!
-//! Waiting on #8, which adds the state (`// #8: reset here` in
-//! `soft_reset`): origin mode (DECOM) off, cursor visible (DECTCEM),
-//! character sets G0-G3/GL/GR to their defaults (SCS), cursor keys
-//! (DECCKM) and keypad (DECKPAM) to normal; with them the smaller items
-//! xterm also resets (KAM, DECSCA, DECLRMM, reverse wrap, the keyboard
-//! protocol flags). Two more resets wait on state that does not exist yet:
-//! the cursor shape and blink (DECSCUSR, `CSI Ps SP q`) back to the
-//! default, and the ANSI palette (colours set with OSC 4) back to the
-//! theme, which belongs to #9. DECSCL (`CSI 6x ; Pc " p`), a soft reset
-//! plus a level change in xterm, is #92.
+//! - the modes on DECSTR's reset list (ADR 0020): origin mode (DECOM)
+//!   off before the saved cursor is reset, so a DECRC homes to the screen's
+//!   corner; the cursor visible (DECTCEM) and not blinking (DECSET 12);
+//!   synchronized output (2026) off; cursor keys (DECCKM) and keypad
+//!   (DECKPAM) to normal, `modifyOtherKeys` to 0 and both kitty keyboard
+//!   flag stacks emptied.
+//!
+//! KAM is not modelled (SM 2 is ignored), so it has nothing to reset.
+//! Still waiting on state that does not exist yet (`// #112, #95, #97,
+//! #113, #9` in `soft_reset`): the character sets G0-G3/GL/GR (SCS, #112),
+//! DECSCA (#95), DECLRMM and reverse wrap (#97), the cursor shape and
+//! blink (DECSCUSR, `CSI Ps SP q`, #113) and the ANSI palette (colours set
+//! with OSC 4) back to the theme (#9). DECSCL (`CSI 6x ; Pc " p`), a soft
+//! reset plus a level change in xterm, is #92.
 
 #![forbid(unsafe_code)]
 
@@ -48,12 +52,16 @@ mod control;
 mod csi;
 mod esc;
 pub mod keyboard;
+mod modes;
 mod sgr;
 
 pub use keyboard::{
     Key, KeyEvent, KeyEventKind, KeyboardModes, KittyFlags, KittyFlagsMode, Modifiers,
     ModifyOtherKeys, encode_key, encode_key_into,
 };
+pub use modes::{KITTY_STACK_DEPTH, Modes, MouseEncoding, MouseTracking};
+
+use modes::KittyStacks;
 
 use tessera_grid::{Cell, Grid};
 use tessera_vt::{Action, Parser};
@@ -67,6 +75,18 @@ pub enum Request {
     Bell,
     /// Set the window or tab title.
     SetTitle(String),
+    /// DECCOLM (DECSET 3, allowed by DECSET 40) or RIS asked for a grid
+    /// `rows` × `cols`. The terminal does not resize its grid: the host's
+    /// window and PTY decide the width (ADR 0020). A host that can resize
+    /// its window may act on it by resizing the view and the PTY together
+    /// and calling [`Terminal::resize`]; one that cannot ignores it, as
+    /// `tessera-app-core` does.
+    Resize {
+        /// Rows: the grid's current height.
+        rows: u16,
+        /// Columns: 132 or 80.
+        cols: u16,
+    },
 }
 
 /// A terminal: parser + grid + modes.
@@ -79,16 +99,18 @@ pub struct Terminal {
 }
 
 impl Terminal {
-    /// Creates a terminal with an empty grid, auto-wrap (DECAWM) on and
-    /// insert mode (IRM) off.
+    /// Creates a terminal with an empty grid and every mode at its default
+    /// ([`Modes::default`], [`KeyboardModes::default`]): auto-wrap (DECAWM)
+    /// on, insert mode (IRM) off, the cursor visible.
     pub fn new(rows: u16, cols: u16) -> Self {
         Self {
             parser: Parser::new(),
             state: State {
                 grid: Grid::new(rows, cols),
                 pending: Vec::new(),
-                auto_wrap: true,
-                insert_mode: false,
+                modes: Modes::default(),
+                keyboard: KeyboardModes::default(),
+                kitty: KittyStacks::default(),
                 last_printed: None,
             },
             carry: Vec::new(),
@@ -137,9 +159,33 @@ impl Terminal {
         &self.state.grid
     }
 
-    /// Whether auto-wrap mode (DECAWM) is on. Defaults to `true`.
+    /// The terminal modes (DECSET/DECRST, SM/RM), as a copy. See the
+    /// [`Modes`] fields for each mode and ADR 0020 for which ones the host
+    /// acts on.
+    pub fn modes(&self) -> Modes {
+        let grid = &self.state.grid;
+        Modes {
+            origin: grid.origin_mode(),
+            alt_screen: grid.is_alt_screen(),
+            ..self.state.modes
+        }
+    }
+
+    /// The modes key encoding needs, as a copy for
+    /// [`encode_key`]: DECCKM, DECKPAM, `modifyOtherKeys` and the active
+    /// screen's kitty keyboard flags.
+    pub fn keyboard_modes(&self) -> KeyboardModes {
+        let alt = self.state.grid.is_alt_screen();
+        KeyboardModes {
+            kitty_flags: self.state.kitty.get(alt).current(),
+            ..self.state.keyboard
+        }
+    }
+
+    /// Whether auto-wrap mode (DECAWM) is on: [`Modes::auto_wrap`].
+    /// Defaults to `true`.
     pub fn auto_wrap(&self) -> bool {
-        self.state.auto_wrap
+        self.state.modes.auto_wrap
     }
 
     /// Turns auto-wrap mode (DECAWM) on or off.
@@ -150,13 +196,15 @@ impl Terminal {
     /// the last column instead and no line is ever marked wrapped. Toggling
     /// the mode leaves an already pending wrap armed; the next printed
     /// character applies whichever mode is current.
+    /// Same as `CSI ? 7 h` / `CSI ? 7 l`.
     pub fn set_auto_wrap(&mut self, on: bool) {
-        self.state.auto_wrap = on;
+        self.state.modes.auto_wrap = on;
     }
 
-    /// Whether insert mode (IRM) is on. Defaults to `false`.
+    /// Whether insert mode (IRM) is on: [`Modes::insert`]. Defaults to
+    /// `false`.
     pub fn insert_mode(&self) -> bool {
-        self.state.insert_mode
+        self.state.modes.insert
     }
 
     /// Turns insert mode (IRM) on or off.
@@ -164,9 +212,9 @@ impl Terminal {
     /// In insert mode a printed character shifts the cells from the cursor
     /// to the end of the line one column right before it is written; the
     /// cell pushed past the last column is lost. Control characters are not
-    /// affected.
+    /// affected. Same as `CSI 4 h` / `CSI 4 l`.
     pub fn set_insert_mode(&mut self, on: bool) {
-        self.state.insert_mode = on;
+        self.state.modes.insert = on;
     }
 
     /// Clears the screen to the cursor line (⌘K, "Clear to Start"): drops
@@ -220,8 +268,15 @@ fn incomplete_utf8_suffix(bytes: &[u8]) -> usize {
 struct State {
     grid: Grid,
     pending: Vec<Request>,
-    auto_wrap: bool,
-    insert_mode: bool,
+    /// Every mode but the two the grid keeps: `origin` and `alt_screen`
+    /// are never written here; [`Terminal::modes`] reads them from the
+    /// grid, which saves origin mode with the cursor and owns the screens.
+    modes: Modes,
+    /// DECCKM, DECKPAM and `modifyOtherKeys`; `kitty_flags` is never
+    /// written here, [`Terminal::keyboard_modes`] reads it from `kitty`.
+    keyboard: KeyboardModes,
+    /// The kitty keyboard flag stacks of both screens.
+    kitty: KittyStacks,
     /// The last non-control character handed to [`State::print`], for REP
     /// (`CSI Ps b`), whether it took a cell, joined the previous cluster or
     /// was dropped; REP checks the cell it left behind. Every other action
@@ -293,7 +348,7 @@ impl State {
             trace!(ch = ?ch, "control character dropped from print");
             return;
         }
-        if self.auto_wrap && !self.insert_mode {
+        if self.modes.auto_wrap && !self.modes.insert {
             // The default modes are exactly what the grid's own write does:
             // attach, drop zero-width scalars, wrap first when needed.
             self.grid.put_char(ch);
@@ -315,7 +370,7 @@ impl State {
             trace!(ch = ?ch, "wide character dropped: the grid has one column");
             return;
         }
-        if !self.auto_wrap {
+        if !self.modes.auto_wrap {
             if self.grid.pending_wrap() {
                 // The grid always arms a pending wrap on the last column.
                 // Without DECAWM the character overwrites that column.
@@ -326,7 +381,7 @@ impl State {
                 // No room and no wrap: the character is dropped (xterm).
                 return;
             }
-            if self.insert_mode {
+            if self.modes.insert {
                 self.grid.insert_chars(width);
             }
             if width == 1 {
@@ -340,7 +395,7 @@ impl State {
             }
             return;
         }
-        if self.insert_mode {
+        if self.modes.insert {
             let stranded = width == 2 && self.grid.cursor().col == last;
             if self.grid.pending_wrap() || stranded {
                 // `insert_chars` disarms the pending wrap, so wrap first and

@@ -32,7 +32,7 @@ The diagram is the target design; today the core holds sessions only
 | `tessera-pty` | spawning, PTY I/O, resize (`unsafe` allowed) | – |
 | `tessera-vt` | bytes → typed `Action`s via `vte` | – |
 | `tessera-grid` | cells, lines, scrollback, cursor, selection, marks, wide cells (ADR 0008), resize with soft-wrap reflow (ADR 0009), `Style` layout (ADR 0013) | – |
-| `tessera-term` | applies actions to a grid, terminal modes, side-effect requests, `TERM` / terminfo (ADR 0005) | vt, grid |
+| `tessera-term` | applies actions to a grid, terminal modes (ADR 0020), side-effect requests, `TERM` / terminfo (ADR 0005) | vt, grid |
 | `tessera-shell-integration` | OSC 133 / 7 / 1337 → marks and metadata | grid |
 | `tessera-search` | regex over grid + scrollback | grid |
 | `tessera-render` | wgpu pipeline, glyph atlas, shaping (ADR 0007), five passes over a `FrameInput` (ADR 0010), `Theme`; `RenderSurface` wraps a `wgpu::Surface` it is handed | grid |
@@ -66,6 +66,17 @@ The diagram is the target design; today the core holds sessions only
    wrapped in `catch_unwind` and returns an error code.
 6. **`unsafe` lives in two crates**, `tessera-pty` and `tessera-ffi`, and every
    block has a `SAFETY:` comment.
+
+## Terminal modes
+
+`tessera-term`'s `Terminal` owns every terminal mode (ADR 0020): DECSET and
+SM state, the keyboard modes (DECCKM, DECKPAM, `modifyOtherKeys`, the kitty
+flag stacks) and the alternate screen, because the sequences that change
+them arrive in the output it parses. Nothing above it keeps a copy: the
+host reads `Terminal::modes()` and `Terminal::keyboard_modes()`, small
+`Copy` snapshots, under the terminal lock whenever it needs one (one copy
+per key, paste or focus event in `App::send_input`, one per frame in
+`Snapshot::capture` for the cursor's visibility).
 
 ## Views and the frontend surface
 
@@ -123,7 +134,8 @@ stay at the default class (ADR 0018 explains why).
 1. `TerminalSurfaceView` receives `keyDown`, resolves IME, fills a
    `TesseraKeyEvent` and calls `tessera_session_send_key` (ADR 0011).
 2. `tessera-app-core` (`App::send_input`) resolves keybindings; unbound
-   keys are encoded by `tessera-term` and queued for the session's PTY
+   keys are encoded by `tessera-term` with the terminal's own keyboard
+   modes (read under the terminal lock) and queued for the session's PTY
    without blocking. The returned `TesseraInputOutcome` tells the view
    whether to pass the event on to AppKit (menu key equivalents).
 3. The PTY reader thread receives child output, `tessera-term` parses and

@@ -42,6 +42,7 @@ use tessera_render::{
     CursorShape, CursorState, Fonts, FrameInput, Gpu, RenderSurface, Renderer, Rgba, Shaper,
     SurfaceOptions, Theme, sanitize_font_size, sanitize_scale,
 };
+use tessera_term::Terminal;
 
 /// The shortest time between two presented frames of one view: one
 /// display period at 240 Hz, the fastest refresh a Mac display runs at.
@@ -456,17 +457,17 @@ impl View {
         self.renderer.theme()
     }
 
-    /// Copies what changed in `grid` since the last capture into the
-    /// snapshot, and adds the rows that changed to the next frame's
-    /// damage.
+    /// Copies what changed in `term`'s grid since the last capture, and
+    /// whether its cursor is visible (DECTCEM), into the snapshot, and adds
+    /// the rows that changed to the next frame's damage.
     ///
     /// This is the only part of a frame that runs under the session's
     /// terminal lock; shaping, drawing and waiting for a drawable happen
     /// after it is released. It copies only the rows the grid reports
     /// damaged (comparing them first), so its cost follows the damage,
     /// not the screen size.
-    pub(crate) fn capture(&mut self, grid: &Grid) {
-        let changed = self.snapshot.capture(grid);
+    pub(crate) fn capture(&mut self, term: &Terminal) {
+        let changed = self.snapshot.capture(term);
         self.pending = self.pending.union(&changed);
     }
 
@@ -555,6 +556,9 @@ pub(crate) struct Snapshot {
     /// Cells per row (every row of a grid has the same length).
     cols: usize,
     cursor: Point,
+    /// The terminal hid its cursor (DECTCEM, `CSI ? 25 l`) at the last
+    /// capture.
+    cursor_hidden: bool,
     /// The grid generation of the last capture; `None` before the first.
     generation: Option<u64>,
     /// Rows compared by partial captures, for tests.
@@ -563,6 +567,23 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
+    /// Brings the snapshot up to date with `term`'s visible rows, cursor
+    /// and cursor visibility ([`Modes::cursor_visible`], one copy of the
+    /// terminal's modes), and returns the rows that changed: those whose
+    /// cells or clusters changed (see [`Self::capture_grid`]) and the
+    /// cursor's row when the cursor was shown or hidden.
+    ///
+    /// [`Modes::cursor_visible`]: tessera_term::Modes::cursor_visible
+    pub(crate) fn capture(&mut self, term: &Terminal) -> DamageRows {
+        let hidden = !term.modes().cursor_visible;
+        let changed = self.capture_grid(term.grid());
+        if hidden == self.cursor_hidden {
+            return changed;
+        }
+        self.cursor_hidden = hidden;
+        changed.with_row(self.cursor.row)
+    }
+
     /// Brings the snapshot up to date with `grid`'s visible rows and
     /// cursor, and returns the rows whose cells or clusters changed.
     ///
@@ -573,7 +594,7 @@ impl Snapshot {
     /// those, so an idle grid returns [`DamageRows::None`]. A grid of
     /// another size, or another grid, is copied whole and returns
     /// [`DamageRows::All`].
-    pub(crate) fn capture(&mut self, grid: &Grid) -> DamageRows {
+    fn capture_grid(&mut self, grid: &Grid) -> DamageRows {
         let cols = usize::from(grid.cols());
         let lines = grid.visible_lines();
         let rows = lines.len();
@@ -655,16 +676,19 @@ impl Snapshot {
     }
 
     /// The frame drawing `rows` (this snapshot's [`Self::rows`]) with the
-    /// rows' grapheme clusters: a visible block cursor at the captured
-    /// cursor position, `focused` (an unfocused frame draws the cursor
-    /// hollow), no selection and no overlays, and the default damage
+    /// rows' grapheme clusters: a block cursor at the captured cursor
+    /// position, drawn unless the terminal hid it (DECTCEM), `focused` (an
+    /// unfocused frame draws the cursor hollow), no selection and no
+    /// overlays, and the default damage
     /// ([`DamageRows::All`]). The viewport (#31), cursor blink and shape
     /// (#27, #29) are still to come.
     pub(crate) fn frame<'a>(&'a self, rows: &'a [&'a [Cell]], focused: bool) -> FrameInput<'a> {
         let Point { row, col } = self.cursor;
         FrameInput::new(rows)
             .with_clusters(&self.clusters)
-            .with_cursor(Some(CursorState::new(row, col, CursorShape::Block)))
+            .with_cursor(Some(
+                CursorState::new(row, col, CursorShape::Block).with_visible(!self.cursor_hidden),
+            ))
             .with_focus(focused)
     }
 }
@@ -672,8 +696,6 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
-
-    use tessera_term::Terminal;
 
     use super::*;
 
@@ -884,11 +906,35 @@ mod tests {
     }
 
     #[test]
+    fn dectcem_hides_the_cursor_and_damages_its_row() {
+        let mut term = Terminal::new(3, 4);
+        term.advance(b"\r\nab");
+        let mut snapshot = Snapshot::default();
+        snapshot.capture(&term);
+        let visible = |snapshot: &Snapshot| {
+            let rows = snapshot.rows();
+            snapshot
+                .frame(&rows, true)
+                .cursor
+                .map(|cursor| cursor.visible)
+        };
+        assert_eq!(visible(&snapshot), Some(true));
+        assert_eq!(snapshot.capture(&term), DamageRows::None, "idle");
+        term.advance(b"\x1b[?25l");
+        assert_eq!(snapshot.capture(&term), DamageRows::Rows(1..=1));
+        assert_eq!(visible(&snapshot), Some(false));
+        assert_eq!(snapshot.capture(&term), DamageRows::None, "still hidden");
+        term.advance(b"\x1b[?25h");
+        assert_eq!(snapshot.capture(&term), DamageRows::Rows(1..=1));
+        assert_eq!(visible(&snapshot), Some(true));
+    }
+
+    #[test]
     fn the_frame_draws_the_snapshot_with_a_block_cursor() {
         let mut term = Terminal::new(3, 4);
         term.advance(b"ab\r\ncd");
         let mut snapshot = Snapshot::default();
-        snapshot.capture(term.grid());
+        snapshot.capture(&term);
         let rows = snapshot.rows();
         let frame = snapshot.frame(&rows, true);
         let text: Vec<String> = frame
@@ -932,7 +978,7 @@ mod tests {
         let mut term = Terminal::new(3, 4);
         term.advance(b"ab\r\ncd");
         let mut snapshot = Snapshot::default();
-        snapshot.capture(term.grid());
+        snapshot.capture(&term);
         let rows = snapshot.rows();
         assert_eq!(rows.len(), 3);
         assert!(rows.iter().all(|row| row.len() == 4));
@@ -940,7 +986,7 @@ mod tests {
         assert_eq!(rows[1][1].ch, 'd');
         assert_eq!(snapshot.cursor, Point::new(1, 2));
         // Recapturing a smaller grid reuses the buffer and forgets the old rows.
-        snapshot.capture(Terminal::new(1, 2).grid());
+        snapshot.capture(&Terminal::new(1, 2));
         assert_eq!(snapshot.rows().len(), 1);
         assert_eq!(snapshot.cursor, Point::new(0, 0));
     }
@@ -956,13 +1002,13 @@ mod tests {
     fn snapshot_of_a_large_screen_is_fast() {
         let term = full_terminal(60, 200);
         let mut snapshot = Snapshot::default();
-        snapshot.capture(term.grid());
+        snapshot.capture(&term);
         let mut best = Duration::MAX;
         for _ in 0..50 {
             // Forget the generation: time a full copy, the worst case.
             snapshot.generation = None;
             let start = Instant::now();
-            snapshot.capture(term.grid());
+            snapshot.capture(&term);
             best = best.min(start.elapsed());
         }
         assert_eq!(snapshot.rows().len(), 60);
@@ -977,34 +1023,30 @@ mod tests {
     fn capture_reports_only_rows_that_changed() {
         let mut term = Terminal::new(4, 10);
         let mut snapshot = Snapshot::default();
-        assert_eq!(
-            snapshot.capture(term.grid()),
-            DamageRows::All,
-            "first capture"
-        );
-        assert_eq!(snapshot.capture(term.grid()), DamageRows::None, "idle");
+        assert_eq!(snapshot.capture(&term), DamageRows::All, "first capture");
+        assert_eq!(snapshot.capture(&term), DamageRows::None, "idle");
         term.advance(b"hi");
-        assert_eq!(snapshot.capture(term.grid()), DamageRows::Rows(0..=0));
+        assert_eq!(snapshot.capture(&term), DamageRows::Rows(0..=0));
         // The grid keeps reporting the cursor row; the comparison drops it.
         assert_eq!(
             term.grid().damage_since(term.grid().damage().generation),
             DamageRows::Rows(0..=0)
         );
-        assert_eq!(snapshot.capture(term.grid()), DamageRows::None);
+        assert_eq!(snapshot.capture(&term), DamageRows::None);
         // A cursor move changes no cells.
         term.advance(b"\x1b[3;5H");
-        assert_eq!(snapshot.capture(term.grid()), DamageRows::None);
+        assert_eq!(snapshot.capture(&term), DamageRows::None);
         assert_eq!(snapshot.cursor, Point::new(2, 4));
         term.advance(b"x\x1b[1;1Hy");
-        assert_eq!(snapshot.capture(term.grid()), DamageRows::Rows(0..=2));
+        assert_eq!(snapshot.capture(&term), DamageRows::Rows(0..=2));
         assert_eq!(snapshot.rows()[2][4].ch, 'x');
         assert_eq!(snapshot.rows()[0][0].ch, 'y');
         // Clusters are copied with their row.
         term.advance(b"\x1b[4;1He\xcc\x81");
-        assert_eq!(snapshot.capture(term.grid()), DamageRows::Rows(3..=3));
+        assert_eq!(snapshot.capture(&term), DamageRows::Rows(3..=3));
         assert_eq!(snapshot.clusters[3].get(0), Some("e\u{301}"));
         term.resize(5, 10);
-        assert_eq!(snapshot.capture(term.grid()), DamageRows::All);
+        assert_eq!(snapshot.capture(&term), DamageRows::All);
         assert_eq!(snapshot.rows().len(), 5);
     }
 
@@ -1048,11 +1090,11 @@ mod tests {
         };
         let mut term = Terminal::new(4, 20);
         term.advance(b"hello");
-        view.capture(term.grid());
+        view.capture(&term);
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
         let frames = view.renderer().stats().frames;
         next_frame();
-        view.capture(term.grid());
+        view.capture(&term);
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Skipped);
         assert_eq!(view.last_skip(), Some(SkipReason::Unchanged));
         assert_eq!(view.renderer().stats().frames, frames, "no GPU work");
@@ -1070,12 +1112,12 @@ mod tests {
         for row in 0..6 {
             term.advance(format!("\x1b[{};1Hrow {row} of text", row + 1).as_bytes());
         }
-        view.capture(term.grid());
+        view.capture(&term);
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
         let before = view.renderer().stats();
         next_frame();
         term.advance(b"\x1b[3;1Hchanged");
-        view.capture(term.grid());
+        view.capture(&term);
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
         let after = view.renderer().stats();
         assert_eq!(after.rows_shaped - before.rows_shaped, 1, "only row 2");
@@ -1089,12 +1131,12 @@ mod tests {
         };
         let mut term = Terminal::new(3, 10);
         term.advance(b"abc");
-        view.capture(term.grid());
+        view.capture(&term);
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
         let shaped = view.renderer().stats().rows_shaped;
         next_frame();
         term.advance(b"\x1b[2;2H");
-        view.capture(term.grid());
+        view.capture(&term);
         assert_eq!(
             view.render(true).expect("frame"),
             FrameStatus::Presented,
@@ -1121,10 +1163,10 @@ mod tests {
             return;
         };
         let mut term = Terminal::new(3, 10);
-        view.capture(term.grid());
+        view.capture(&term);
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
         term.advance(b"one");
-        view.capture(term.grid());
+        view.capture(&term);
         // A frame was just presented: the next one is not due for an
         // interval, and half an interval of slack does not cover that.
         view.last_presented = Some(Instant::now());
@@ -1236,7 +1278,7 @@ mod tests {
                 fed += 1;
             }
             let t = Instant::now();
-            view.capture(term.grid());
+            view.capture(&term);
             longest_capture = longest_capture.max(t.elapsed());
             calls += 1;
             if view.render(true).expect("frame") == FrameStatus::Presented {
@@ -1279,12 +1321,12 @@ mod tests {
         let mut snapshot = Snapshot::default();
         let mut term = Terminal::new(5, 12);
         term.advance("e\u{301}x 中文 👍🏽\r\n\x1b[41mred\x1b[0m a\u{338}\r\n".as_bytes());
-        assert_eq!(snapshot.capture(term.grid()), DamageRows::All);
+        assert_eq!(snapshot.capture(&term), DamageRows::All);
         assert_snapshot_is(&snapshot, &term);
         assert_eq!(snapshot.compared, 0, "no comparison on the full path");
         // Partial captures compare only the reported rows.
         term.advance(b"\x1b[3;1Hzz");
-        assert_eq!(snapshot.capture(term.grid()), DamageRows::Rows(2..=2));
+        assert_eq!(snapshot.capture(&term), DamageRows::Rows(2..=2));
         assert!(snapshot.compared > 0);
         assert_snapshot_is(&snapshot, &term);
         // Smaller, then larger again: stale rows and clusters are replaced.
@@ -1293,7 +1335,7 @@ mod tests {
             term.advance("\x1b[1;1H❤\u{fe0f}e\u{301}".as_bytes());
             let compared = snapshot.compared;
             snapshot.generation = None;
-            assert_eq!(snapshot.capture(term.grid()), DamageRows::All);
+            assert_eq!(snapshot.capture(&term), DamageRows::All);
             assert_eq!(
                 snapshot.compared, compared,
                 "no comparison on the full path"
@@ -1321,14 +1363,14 @@ mod tests {
         };
         let mut term = Terminal::new(3, 10);
         term.advance(b"abc");
-        view.capture(term.grid());
+        view.capture(&term);
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
         next_frame();
-        view.capture(term.grid());
+        view.capture(&term);
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Skipped);
         view.set_theme(red());
         next_frame();
-        view.capture(term.grid());
+        view.capture(&term);
         let shaped = view.renderer().stats().rows_shaped;
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
         assert_eq!(view.renderer().stats().rows_shaped - shaped, 3, "every row");
@@ -1352,15 +1394,15 @@ mod tests {
         };
         let mut term = Terminal::new(3, 10);
         term.advance(b"abc\r\ndef");
-        view.capture(term.grid());
+        view.capture(&term);
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
         next_frame();
         term.advance(b"\x1b[3;1Hxyz");
-        view.capture(term.grid());
+        view.capture(&term);
         view.set_theme(red());
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
         fresh.set_theme(red());
-        fresh.capture(term.grid());
+        fresh.capture(&term);
         assert_eq!(fresh.render(true).expect("frame"), FrameStatus::Presented);
         assert!(
             view.read_back() == fresh.read_back(),

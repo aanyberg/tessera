@@ -1,0 +1,13 @@
+# Fixture case V2S6_80col_dark_background (tests/fixtures/csi_spec.txt).
+# tst_screen '80 column mode, dark background'. ESC[?3l ignored (no DECSET 40), ED 2, CUP.
+@size 24x80
+\x1b[?3l\x1b[2J\x1b[1;1H1234567890123456789012345678901234567890123456789012345678901234567890123456789
+\x1b[3;3HThis is 80 column mode, dark background.\x1b[4;4HThis is 80 column mode, dark background.
+\x1b[5;5HThis is 80 column mode, dark background.\x1b[6;6HThis is 80 column mode, dark background.
+\x1b[7;7HThis is 80 column mode, dark background.\x1b[8;8HThis is 80 column mode, dark background.
+\x1b[9;9HThis is 80 column mode, dark background.\x1b[10;10HThis is 80 column mode, dark background.
+\x1b[11;11HThis is 80 column mode, dark background.\x1b[12;12HThis is 80 column mode, dark background.
+\x1b[13;13HThis is 80 column mode, dark background.\x1b[14;14HThis is 80 column mode, dark background.
+\x1b[15;15HThis is 80 column mode, dark background.\x1b[16;16HThis is 80 column mode, dark background.
+\x1b[17;17HThis is 80 column mode, dark background.\x1b[18;18HThis is 80 column mode, dark background.
+\x1b[19;19HThis is 80 column mode, dark background.\x1b[20;20HThis is 80 column mode, dark background.Push <RETURN>

@@ -7,7 +7,7 @@
 #   source:       esctest file and function (E_* ids) or vttest function + capture (V2S13)
 #   cite:         URL(s)
 #   note:         what the esctest test does and what the row asserts
-#   chunk:        yes|no. NOT needed: all 135 cases run whole AND byte by byte in 0.06 s (debug build). Documentation only.
+#   chunk:        yes|no. NOT needed: all 141 cases run whole AND byte by byte in 0.06 s (debug build). Documentation only.
 #   attr:         (row,col0)-(row,col1) <pen>   0-based, inclusive; pen = sgr_spec.txt canonical text
 #                 (fg=<c> bg=<c> ul=<c> us=<style> flags=<list>). Only E_SGR_bold and V2S13 have it. Cells not listed
 #                 have the `attr_others:` pen. parse_fixture ignores these lines: esctest.rs must read them itself.
@@ -29,6 +29,7 @@
 #     and is live as E_DECRC_saveRestoreCursor_reset (126 cases now); the other 7 are in esctest_pending.txt.
 #     #93/#94 made those 7 pass: they are live here as E_HPR_*, E_VPR_* and E_SCORC_saveRestoreCursor_basic, joined by
 #     E_SCORC_saveRestoreCursor_{moveToHomeWhenNotSaved,reset} (the DECRC rows with ESC[s / ESC[u); 135 cases now.
+#     #8 (modes) lifted E_{DECRC,SCORC}_saveRestoreCursor_{altVsMain,wrap,insertNotAffected}: 141 cases.
 #
 # HOW esctest ASSERTIONS MAP TO THE FIXTURE
 #   esctest reads the cursor with DSR 6 (needs #10) and the screen with DECRQCRA checksums; tessera tests read the grid. So:
@@ -57,9 +58,9 @@
 #   vttest             https://invisible-island.net/vttest/ main.c tst_screen() (menu 2 screen 13)
 #
 # VTTEST MENU 1/2 SCREEN INVENTORY (real vttest 2.7 capture): menu 1 has SIX screens (m1_01..m1_06; m1_07 is the return to the
-#   main menu), menu 2 has FIFTEEN (m2_01..m2_15). Already ported (csi_spec.txt): m1 1,5,6; m2 1,2,12. Of the rest only
-#   menu 2 screen 13 (SGR pattern) needs no DECSET: it is the one vttest case below. Menu 1 screens 2,3,4 and menu 2 screens
-#   3-11, 14, 15 need DECCOLM / DECOM / DECSCNM / SCS (#8) and are already `#### DEFERRED` blocks in csi_spec.txt.
+#   main menu), menu 2 has FIFTEEN (m2_01..m2_15). Already ported (csi_spec.txt): m1 1,5,6; m2 1,2,12, and since #8 m1 3;
+#   m2 4, 6-11, 14. Menu 2 screen 13 (SGR pattern) is the one vttest case below. Menu 1 screens 2, 4 and menu 2 screens 3,
+#   5 (132 columns) and 15 (SCS, #112) are `#### DEFERRED` blocks in csi_spec.txt.
 #   There are no menu 1 screens 7-9.
 # =============================================================================
 
@@ -259,7 +260,7 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_CUP_respectsOriginMode -> #8 + #97   (esctest cup.py test_CUP_RespectsOriginMode, vtLevel 4)
+#> E_CUP_respectsOriginMode -> #97 (DECOM is live since #8)   (esctest cup.py test_CUP_RespectsOriginMode, vtLevel 4)
 #>    needs: DECSET 6 (DECOM) plus DECLRMM (DECSET 69) and DECSLRM (#97)
 #>    bytes: ESC[6;11r ESC[?69h ESC[5;10s ESC[9;7H ESC[?6h ESC[1;1H X ESC[?6l ESC[r ESC[?69l ; expect X at row 6 col 5
 
@@ -1429,7 +1430,7 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_VPA_ignoresOriginMode -> #8 + #97 (vpa.py, vtLevel 4): DECOM + DECLRMM
+#> E_VPA_ignoresOriginMode -> #97 (DECOM is live since #8) (vpa.py, vtLevel 4): DECOM + DECLRMM
 
 # ---------------------------------------------------------------------------- HPA (hpa.py)  [CSI `]
 
@@ -1550,7 +1551,7 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_HPA_ignoresOriginMode -> #8 + #97 (hpa.py, vtLevel 4): DECOM + DECLRMM + DECSLRM 5;10
+#> E_HPA_ignoresOriginMode -> #97 (DECOM is live since #8) (hpa.py, vtLevel 4): DECOM + DECLRMM + DECSLRM 5;10
 # ---------------------------------------------------------------------------- HPR / VPR (hpr.py, vpr.py)  CSI Pn a / CSI Pn e  [#93]
 
 ### E_HPR_defaultParams
@@ -1787,7 +1788,7 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_HPR_ignoresOriginMode, E_VPR_ignoresOriginMode -> #8 + #97 (DECOM, DECLRMM + DECSLRM; HPR/VPR themselves are live since #93)
+#> E_HPR_ignoresOriginMode, E_VPR_ignoresOriginMode -> #97 (DECOM is live since #8) (DECOM, DECLRMM + DECSLRM; HPR/VPR themselves are live since #93)
 
 # ---------------------------------------------------------------------------- HVP (hvp.py)  [CSI f; esctest bug: the row/col-only forms send 'H']
 
@@ -1985,7 +1986,7 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_HVP_respectsOriginMode -> #8 + #97 (hvp.py, vtLevel 4): DECOM + DECLRMM
+#> E_HVP_respectsOriginMode -> #97 (DECOM is live since #8) (hvp.py, vtLevel 4): DECOM + DECLRMM
 
 # ---------------------------------------------------------------------------- CBT / CHT (cbt.py, cht.py)  default tab stops every 8 columns: 9, 17, 25, ...
 
@@ -4376,12 +4377,144 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_DECRC_saveRestoreCursor_resetsOriginMode, E_DECRC_saveRestoreCursor_worksInLRM, E_DECRC_saveRestoreCursor_altVsMain -> #8 (DECOM, DECSET 47 alt screen) + #97 (DECLRMM, worksInLRM)
+### E_DECRC_saveRestoreCursor_altVsMain
+size: 25x80
+step: feed \x1b[3;2H
+step: feed \x1b7
+step: feed \x1b[?47h
+step: feed \x1b[7;6H
+step: feed \x1b7
+step: feed \x1b[?47l
+step: feed \x1b8
+step: feed \x1b[?47h
+step: feed \x1b8
+source: esctest2 esctest/tests/save_restore_cursor.py test_SaveRestoreCursor_AltVsMain (DECRCTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/save_restore_cursor.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: CUP(2,3) (esctest Point(x,y): ESC[3;2H), save, DECSET 47 (alternate screen), CUP(6,7), save, DECRST 47, restore -> (2,3) on the main screen (esctest asserts it there), DECSET 47, restore -> (6,7): each screen keeps its own saved cursor, and the alternate screen's survives leaving it (xterm sc[whichBuf]; Grid keeps the alternate slot since #8). Was a `#>` line waiting for #8.
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>
+>      |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (6,5)   # 1-based row 7 col 6
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_DECRC_saveRestoreCursor_wrap
+size: 25x80
+step: feed \x1b[?7h
+step: feed \x1b7
+step: feed \x1b[?7l
+step: feed \x1b8
+step: feed \x1b[1;79H
+step: feed abcd
+source: esctest2 esctest/tests/save_restore_cursor.py test_SaveRestoreCursor_Wrap (DECRCTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/save_restore_cursor.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: DECSET 7, save, DECRST 7, restore, CUP(79,1), 'abcd': the save does not carry DECAWM (xterm DECSC_FLAGS), so auto-wrap stays off and c, d overwrite the last column; the cursor stays on row 1 (esctest: 'expected terminal xterm: y == 1'). Was a `#>` line waiting for #8.
+chunk: no
+screen:
+>                                                                              ad|
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,79)   # 1-based row 1 col 80
+pending_wrap: true
+requests: []
+scrollback: len=0
+
+### E_DECRC_saveRestoreCursor_insertNotAffected
+size: 25x80
+step: feed \x1b[4h
+step: feed \x1b7
+step: feed \x1b[4l
+step: feed \x1b8
+step: feed \x1b[1;1H
+step: feed a
+step: feed \x1b[1;1H
+step: feed b
+source: esctest2 esctest/tests/save_restore_cursor.py test_SaveRestoreCursor_InsertNotAffected (DECRCTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/save_restore_cursor.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: SM 4 (IRM), save, RM 4, restore, home 'a', home 'b': the save does not carry IRM, so 'b' replaces 'a' (row 1 = 'b'). Was a `#>` line waiting for #8.
+chunk: no
+screen:
+>b |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,1)   # 1-based row 1 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_DECRC_saveRestoreCursor_resetsOriginMode, E_DECRC_saveRestoreCursor_worksInLRM -> #97 (DECLRMM + DECSLRM `CSI 5;7 s`, which is
+#>     SCOSC while DECLRMM is off; DECOM itself and its save/restore are live since #8, see modes_spec.txt DECOM20..DECOM22)
 #> E_DECRC_saveRestoreCursor_protection -> #95 (DECSCA/DECSERA, DEC protection next to SPA/EPA); passes vacuously today, so not worth a case
-#> E_DECRC_saveRestoreCursor_wrap -> #8 (DECRESET 7 = ESC[?7l; with the harness's `set auto_wrap false` it would read:
-#>     step: set auto_wrap true / DECSC / set auto_wrap false / DECRC / CUP(79,1) 'abcd' -> expect cursor on row 1 (xterm). Verify DECSC does not restore auto-wrap.)
 #> E_DECRC_saveRestoreCursor_reverseWrapNotAffected -> #97 (DECSET 45)
-#> E_DECRC_saveRestoreCursor_insertNotAffected -> #8 (SM/RM 4 = ESC[4h/l not wired; with `set insert_mode true/false` steps it reads: IRM on, DECSC, IRM off, DECRC, home 'a' home 'b' -> 'b'. Tessera passes with the @set translation.)
 
 # ---------------------------------------------------------------------------- SCOSC / SCORC (scorc.py via save_restore_cursor.py)  CSI s / CSI u  [#94]
 # scorc.py is save_restore_cursor.py with saveCursor = SCOSC (ESC[s) and restoreCursor = SCORC (ESC[u). xterm saves and
@@ -4512,8 +4645,141 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_SCORC_saveRestoreCursor_resetsOriginMode, E_SCORC_saveRestoreCursor_altVsMain, E_SCORC_saveRestoreCursor_wrap,
-#>     E_SCORC_saveRestoreCursor_insertNotAffected -> #8 (as their E_DECRC_* twins: DECOM, DECSET 47, DECRESET 7, SM/RM 4)
+### E_SCORC_saveRestoreCursor_altVsMain
+size: 25x80
+step: feed \x1b[3;2H
+step: feed \x1b[s
+step: feed \x1b[?47h
+step: feed \x1b[7;6H
+step: feed \x1b[s
+step: feed \x1b[?47l
+step: feed \x1b[u
+step: feed \x1b[?47h
+step: feed \x1b[u
+source: esctest2 esctest/tests/scorc.py test_SaveRestoreCursor_AltVsMain (inherited from save_restore_cursor.py) (SCORCTests, scorc.py)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/scorc.py ; https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/save_restore_cursor.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: CUP(2,3) (esctest Point(x,y): ESC[3;2H), save, DECSET 47 (alternate screen), CUP(6,7), save, DECRST 47, restore -> (2,3) on the main screen (esctest asserts it there), DECSET 47, restore -> (6,7): each screen keeps its own saved cursor, and the alternate screen's survives leaving it (xterm sc[whichBuf]; Grid keeps the alternate slot since #8). Was a `#>` line waiting for #8. Same expectation as its E_DECRC_* twin, with SCOSC/SCORC (\x1b[s / \x1b[u).
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>
+>      |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (6,5)   # 1-based row 7 col 6
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_SCORC_saveRestoreCursor_wrap
+size: 25x80
+step: feed \x1b[?7h
+step: feed \x1b[s
+step: feed \x1b[?7l
+step: feed \x1b[u
+step: feed \x1b[1;79H
+step: feed abcd
+source: esctest2 esctest/tests/scorc.py test_SaveRestoreCursor_Wrap (inherited from save_restore_cursor.py) (SCORCTests, scorc.py)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/scorc.py ; https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/save_restore_cursor.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: DECSET 7, save, DECRST 7, restore, CUP(79,1), 'abcd': the save does not carry DECAWM (xterm DECSC_FLAGS), so auto-wrap stays off and c, d overwrite the last column; the cursor stays on row 1 (esctest: 'expected terminal xterm: y == 1'). Was a `#>` line waiting for #8. Same expectation as its E_DECRC_* twin, with SCOSC/SCORC (\x1b[s / \x1b[u).
+chunk: no
+screen:
+>                                                                              ad|
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,79)   # 1-based row 1 col 80
+pending_wrap: true
+requests: []
+scrollback: len=0
+
+### E_SCORC_saveRestoreCursor_insertNotAffected
+size: 25x80
+step: feed \x1b[4h
+step: feed \x1b[s
+step: feed \x1b[4l
+step: feed \x1b[u
+step: feed \x1b[1;1H
+step: feed a
+step: feed \x1b[1;1H
+step: feed b
+source: esctest2 esctest/tests/scorc.py test_SaveRestoreCursor_InsertNotAffected (inherited from save_restore_cursor.py) (SCORCTests, scorc.py)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/scorc.py ; https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/save_restore_cursor.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: SM 4 (IRM), save, RM 4, restore, home 'a', home 'b': the save does not carry IRM, so 'b' replaces 'a' (row 1 = 'b'). Was a `#>` line waiting for #8. Same expectation as its E_DECRC_* twin, with SCOSC/SCORC (\x1b[s / \x1b[u).
+chunk: no
+screen:
+>b |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,1)   # 1-based row 1 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_SCORC_saveRestoreCursor_resetsOriginMode -> #97 (as its E_DECRC_* twin: DECLRMM + DECSLRM)
 #> E_SCORC_saveRestoreCursor_worksInLRM, E_SCORC_saveRestoreCursor_reverseWrapNotAffected -> #97 (scorc.py runs worksInLRM with
 #>     shouldWork=False: while DECLRMM is set ESC[s is DECSLRM, so the second save does not happen and ESC[u returns to (2,3))
 #> E_SCORC_saveRestoreCursor_protection -> #95 (as E_DECRC_saveRestoreCursor_protection)
@@ -5652,5 +5918,5 @@ attr: (17,5)-(17,28) fg=- bg=- ul=- us=single flags=blink,inverse
 attr: (17,44)-(17,72) fg=- bg=- ul=- us=single flags=bold,blink,inverse
 attr_others: fg=- bg=- ul=- us=none flags=-
 
-#> V2S14_light_background_prompt (m2_14) -> #8: ESC[?5h (DECSCNM) then row 23 'Light background. Push <RETURN>'; the text is plain, the reverse-video flag is the point.
-#> V2S15_save_restore_cursor_charsets (m2_15) -> #8: SGR + DECSC/DECRC + SCS (ESC ( 0 line drawing, ESC ) B, SO/SI); the DECSC/DECRC + SGR part alone is covered by sgr_spec.txt Part C.
+# V2S14_light_background_prompt (m2_14) is a live case in csi_spec.txt since #8 (DECSCNM is stored only; the text is plain).
+#> V2S15_save_restore_cursor_charsets (m2_15) -> #112: SGR + DECSC/DECRC + SCS (ESC ( 0 line drawing, ESC ) B, SO/SI); the DECSC/DECRC + SGR part alone is covered by sgr_spec.txt Part C.

@@ -42,9 +42,9 @@ equivalents and bare modifier presses keep working. `*out` is set to
 **Routing.** A key event first goes through the binding resolver
 (`input::Bindings`, which returns nothing until the configurable key map
 lands in #43). Otherwise it is encoded with
-`encode_key(event, &KeyboardModes::default())`. `Terminal` does not track
-DECCKM, DECKPAM, `modifyOtherKeys` or kitty flags yet (#8), so until then
-application cursor keys and the kitty protocol are not honoured. A key
+`encode_key(event, &terminal.keyboard_modes())`: the session terminal's
+DECCKM, DECKPAM, `modifyOtherKeys` and kitty flags, copied under the
+terminal lock once per key (see ADR 0020). A key
 that encodes to nothing is `IGNORED`. Mouse events are validated, their
 cell clamped to the grid, recorded as the session's last mouse position
 and `IGNORED`; mouse reporting is #12 and selection is #30. Scroll events

@@ -1133,8 +1133,9 @@ unsafe fn send(
 ///
 /// A key bound to an application command runs that command (no key is
 /// bound yet). Any other key is encoded for the child (xterm and kitty
-/// keyboard protocol rules; until the terminal tracks its keyboard modes,
-/// with the default modes: normal cursor keys, numeric keypad) and queued
+/// keyboard protocol rules, in the session terminal's keyboard modes:
+/// DECCKM, DECKPAM, `modifyOtherKeys` and the kitty flags, see ADR 0020)
+/// and queued
 /// **without blocking** behind the session's pending input (16 MiB at
 /// most; a core thread writes it to the child in order, so a key sent after
 /// a paste arrives after the paste), and the session's view returns to the
@@ -1269,9 +1270,12 @@ pub unsafe extern "C" fn tessera_session_send_scroll(
 /// `"\r"` (what Return sends); every other C0 control except tab (including
 /// `ESC`), `DEL` and every C1 control (U+0080 to U+009F) is removed, so a
 /// paste cannot carry escape sequences or signals. The remaining characters
-/// are sent unchanged (`"a\nb\x1b[31mc"` sends `"a\rb[31mc"`). The view
-/// returns to the live screen. Text that sanitises to nothing sends
-/// nothing and succeeds.
+/// are sent unchanged (`"a\nb\x1b[31mc"` sends `"a\rb[31mc"`). When the
+/// child turned on bracketed paste (DECSET 2004) the text is wrapped in
+/// `ESC [ 200 ~` and `ESC [ 201 ~` and its line breaks are kept as they
+/// are (`ESC` is still removed, so the text cannot end the paste itself).
+/// The view returns to the live screen. Text that sanitises to nothing
+/// sends nothing, brackets included, and succeeds.
 ///
 /// **Never blocks.** The sanitised text joins the session's pending input
 /// (16 MiB at most, shared with keys) and a core thread writes it to the
@@ -1279,7 +1283,10 @@ pub unsafe extern "C" fn tessera_session_send_scroll(
 /// after the paste. A paste whose length `len` (before sanitising) does not
 /// fit in the free pending space is refused whole with `TESSERA_ERROR_IO`
 /// before its bytes are read, validated or copied, so one paste longer than
-/// 16 MiB always fails, at once and without allocating. A paste that fits is
+/// 16 MiB always fails, at once and without allocating. In bracketed-paste
+/// mode the 12 bytes of brackets count too: a paste for which `len` fits
+/// but `len + 12` does not is refused with `TESSERA_ERROR_IO` after it was
+/// validated, still without anything being sent. A paste that fits is
 /// copied once. Closing the session drops whatever is still pending.
 ///
 /// Call from the UI (main) thread only.
@@ -1336,13 +1343,20 @@ pub unsafe extern "C" fn tessera_session_paste(
 
 /// Tells session `session_id` whether its view has keyboard focus.
 ///
-/// The core records the state (a new session starts unfocused); nothing is
-/// sent to the child yet (focus reporting comes with the terminal modes).
+/// The core records the state (a new session starts unfocused). When the
+/// child turned on focus reporting (DECSET 1004), a change of focus also
+/// queues `ESC [ I` (gained) or `ESC [ O` (lost) for it, without blocking;
+/// a call repeating the recorded state sends nothing (see ADR 0020).
 ///
-/// Call from the UI (main) thread only.
+/// Call from the UI (main) thread only: the check and the update of the
+/// recorded state are not one atomic step, so calls from two threads could
+/// both report the same change.
 ///
 /// Returns `TESSERA_ERROR_NULL_POINTER` if `app` is `NULL`,
-/// `TESSERA_ERROR_SESSION_NOT_FOUND` if the id is not a live session.
+/// `TESSERA_ERROR_SESSION_NOT_FOUND` if the id is not a live session,
+/// `TESSERA_ERROR_IO` if a focus report could not be queued (the child has
+/// exited, the session is closing or its pending input is full); the focus
+/// state is recorded all the same.
 ///
 /// # Safety
 ///

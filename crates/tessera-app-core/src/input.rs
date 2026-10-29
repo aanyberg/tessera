@@ -12,11 +12,12 @@
 //!
 //! What each event does today:
 //!
-//! * **Key**: encoded with [`tessera_term::encode_key`] and queued for the
-//!   session's writer thread without blocking. Until the terminal tracks
-//!   its keyboard modes (#8) the encoding uses
-//!   [`KeyboardModes::default()`](tessera_term::KeyboardModes): normal
-//!   cursor keys, numeric keypad, no `modifyOtherKeys`, no kitty flags.
+//! * **Key**: encoded with [`tessera_term::encode_key`] in the session
+//!   terminal's own keyboard modes
+//!   ([`Terminal::keyboard_modes`](tessera_term::Terminal::keyboard_modes):
+//!   DECCKM, DECKPAM, `modifyOtherKeys`, kitty flags, copied under the
+//!   terminal lock once per key) and queued for the session's writer thread
+//!   without blocking.
 //! * **Mouse**: the position is clamped to the session's grid and kept as
 //!   the session's last mouse position; nothing is written. Mouse reporting
 //!   (#12) and selection (#30) build on it.
@@ -25,10 +26,17 @@
 //!   fractional lines.
 //! * **Paste**: sanitised with [`sanitize_paste_into`] straight into the
 //!   buffer that is queued, like a key, in order with the keys around it.
-//!   Its room is checked on the raw length first, so a paste that cannot
-//!   fit is refused before anything is copied.
+//!   In bracketed-paste mode (DECSET 2004) it is wrapped in `ESC [ 200 ~`
+//!   and `ESC [ 201 ~` and sanitised with [`sanitize_bracketed_paste_into`]
+//!   instead, which keeps the line breaks as they are. Its room is checked
+//!   on the raw length first, so a paste that cannot fit is refused before
+//!   anything is copied. A paste that sanitises to nothing writes nothing,
+//!   brackets included.
 //! * **Focus**: recorded (see [`App::is_focused`](crate::App::is_focused));
-//!   nothing is written until focus reporting (DECSET 1004, #8) exists.
+//!   in focus-event mode (DECSET 1004) a change is reported as `ESC [ I`
+//!   (gained) or `ESC [ O` (lost). An event that repeats the current state
+//!   reports nothing, and setting the mode does not report the current
+//!   state (xterm).
 
 use std::convert::Infallible;
 
@@ -286,11 +294,28 @@ pub fn sanitize_paste(text: &str) -> String {
 /// appended: a caller that reserves that much copies the paste exactly
 /// once. Runs of kept characters are copied as slices.
 pub fn sanitize_paste_into(text: &str, out: &mut Vec<u8>) {
+    sanitize_into(text, out, true);
+}
+
+/// Appends `text`, sanitised for a bracketed paste (DECSET 2004), to `out`
+/// in one pass: as [`sanitize_paste_into`], except that line breaks
+/// (`"\n"`, `"\r"`, `"\r\n"`) are kept as they are, as xterm, kitty,
+/// Alacritty and `WezTerm` keep them inside the brackets, where the
+/// application reads them as text rather than as Return. `ESC` is still
+/// removed, so the text cannot end the paste early with its own
+/// `ESC [ 201 ~` (what remains of one is the plain text `[201~`).
+pub fn sanitize_bracketed_paste_into(text: &str, out: &mut Vec<u8>) {
+    sanitize_into(text, out, false);
+}
+
+/// [`sanitize_paste_into`] (`normalize_breaks`: line breaks become `CR`)
+/// or [`sanitize_bracketed_paste_into`] (line breaks are kept).
+fn sanitize_into(text: &str, out: &mut Vec<u8>, normalize_breaks: bool) {
     let bytes = text.as_bytes();
     let mut run = 0;
     let mut chars = text.char_indices().peekable();
     while let Some((at, ch)) = chars.next() {
-        if ch == '\t' || !ch.is_control() {
+        if ch == '\t' || !ch.is_control() || (!normalize_breaks && matches!(ch, '\r' | '\n')) {
             continue;
         }
         out.extend_from_slice(&bytes[run..at]);
@@ -310,6 +335,26 @@ pub fn sanitize_paste_into(text: &str, out: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bracketed(text: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        sanitize_bracketed_paste_into(text, &mut out);
+        out
+    }
+
+    #[test]
+    fn a_bracketed_paste_keeps_line_breaks_and_drops_other_controls() {
+        assert_eq!(bracketed("a\nb\r\nc\rd\te"), b"a\nb\r\nc\rd\te");
+        assert_eq!(
+            bracketed("x\x1b[201~y\u{9b}201~z\x03\x7f"),
+            b"x[201~y201~z",
+            "the end marker cannot be forged"
+        );
+        assert_eq!(bracketed("\x1b\x07"), b"");
+        let mut plain = Vec::new();
+        sanitize_paste_into("a\nb\r\nc", &mut plain);
+        assert_eq!(plain, b"a\rb\rc", "unbracketed pastes still send CR");
+    }
 
     #[test]
     fn paste_maps_line_breaks_to_carriage_returns() {

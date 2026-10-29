@@ -1,5 +1,5 @@
 # Fixture case VPR07_passes_the_bottom_margin (tests/fixtures/csi_spec.txt).
-# Region rows 1-3, cursor inside it at (1,4). CUD would stop at the bottom margin (2,4); VPR is CursorSet without DECOM, so it clamps to the screen: (4,4). Origin mode (#8) will clamp it to the margin.
+# Region rows 1-3, cursor inside it at (1,4). CUD would stop at the bottom margin (2,4); VPR is CursorSet without DECOM, so it clamps to the screen: (4,4). With origin mode on it clamps to the bottom margin instead (modes_spec.txt DECOM30).
 @size 5x10
 \x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX
 \x1b[1;3r\x1b[2;5H\x1b[9eX

@@ -1,17 +1,18 @@
-//! vttest screens drivable with CSI/ESC support plus the harness's
-//! `@set auto_wrap` / `@set insert_mode` directives.
+//! vttest screens drivable with CSI/ESC support and the terminal modes.
 //!
 //! Part 2 of `tests/fixtures/csi_spec.txt` holds the byte streams vttest
 //! 2.7 (20251205) sends for each screen, captured under a pty at 80x24,
-//! with the expected screen text. `ESC[?7h/l` and `ESC[4h/l` are already
-//! translated into `@set` steps because DECSET/SM are not wired yet.
+//! with the expected screen text. In the screens added before the modes
+//! existed, `ESC[?7h/l` and `ESC[4h/l` are translated into the harness's
+//! `@set` steps; the screens lifted by #8 are fed as captured.
 //!
-//! In scope: menu 1 screens 1, 5 and 6; menu 2 screens 1, 2 and 12;
-//! menu 8 screens 1, 2 (adapted: `ESC[?6h ESC[1;1H` written as
-//! `ESC[2;1H`), 3, 4, 5 and 7. Screens that need DECCOLM, DECOM, DECSCNM,
-//! double-width lines (#8) or SGR (#7) are listed as `#### DEFERRED`
-//! blocks in the fixture; [`deferred_screens_are_listed`] keeps that list
-//! honest.
+//! In scope: menu 1 screens 1, 3, 5 and 6; menu 2 screens 1, 2, 4, 6 to
+//! 12 and 14; menu 8 screens 1 to 5 and 7 (3 and 4 on the adapted screen
+//! 2 of #6, with `ESC[?6h ESC[1;1H` written as `ESC[2;1H`). DECCOLM is
+//! ignored without DECSET 40 (xterm's default), so the 132-column screens
+//! stay listed as `#### DEFERRED` blocks in the fixture with the screens
+//! that need SGR (#7), character sets (#112) or double-width lines;
+//! [`deferred_screens_are_listed`] keeps that list honest.
 
 #[allow(dead_code)] // Shared harness: not every helper is used here.
 mod common;
@@ -63,11 +64,20 @@ macro_rules! script_tests {
 
 script_tests! {
     menu1_screen1,
+    menu1_screen3,
     menu1_screen5,
     menu1_screen6,
     menu2_screen1,
     menu2_screen2,
+    menu2_screen4,
+    menu2_screen6,
+    menu2_screen7,
+    menu2_screen8,
+    menu2_screen9,
+    menu2_screen10,
+    menu2_screen11,
     menu2_screen12,
+    menu2_screen14,
     menu8_screen1,
     menu8_screen2,
     menu8_screen3,
@@ -141,14 +151,12 @@ fn deferred_screens_are_listed() {
         for screen in screens {
             let name = format!("menu{menu}_screen{screen}");
             let in_scope = SCRIPTS.contains(&name.as_str());
-            // Menu 8 screen 2 is in scope adapted and deferred as written.
-            let both_allowed = (menu, screen) == (8, 2);
             assert!(
                 in_scope || deferred_screen(menu, screen),
                 "{name} is neither tested nor listed as deferred"
             );
             assert!(
-                both_allowed || !(in_scope && deferred_screen(menu, screen)),
+                !(in_scope && deferred_screen(menu, screen)),
                 "{name} is tested and deferred"
             );
         }

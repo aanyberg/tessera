@@ -1,0 +1,38 @@
+---
+source: crates/tessera-term/tests/esctest.rs
+description: E_DECRC_saveRestoreCursor_wrap
+input_file: crates/tessera-term/tests/fixtures/esctest_spec.txt
+---
+                                                                              ad|
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--
+cursor: (0,79)
+pending_wrap: true
+auto_wrap: false insert_mode: false
+requests: []
+scrollback: 0
+-- pens
+pens: default

@@ -1,0 +1,34 @@
+---
+source: crates/tessera-term/tests/vttest.rs
+input_file: crates/tessera-term/tests/scripts/vttest/menu2_screen4.txt
+---
+1234567890123456789012345678901234567890123456789012345678901234567890123456789
+
+  This is 80 column mode, light background.
+   This is 80 column mode, light background.
+    This is 80 column mode, light background.
+     This is 80 column mode, light background.
+      This is 80 column mode, light background.
+       This is 80 column mode, light background.
+        This is 80 column mode, light background.
+         This is 80 column mode, light background.
+          This is 80 column mode, light background.
+           This is 80 column mode, light background.
+            This is 80 column mode, light background.
+             This is 80 column mode, light background.
+              This is 80 column mode, light background.
+               This is 80 column mode, light background.
+                This is 80 column mode, light background.
+                 This is 80 column mode, light background.
+                  This is 80 column mode, light background.
+                   This is 80 column mode, light background.Push <RETURN> |
+
+
+
+
+--
+cursor: (19,73)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0

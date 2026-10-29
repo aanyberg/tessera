@@ -1,16 +1,17 @@
 //! Control sequences (`CSI ... final`): the [`Action::Csi`] half of the
 //! dispatcher.
 //!
-//! Implemented, all without intermediates or a private marker:
+//! Implemented without intermediates or a private marker:
 //!
 //! | Final | Name | Effect |
 //! |---|---|---|
 //! | `A` `B` `C` `D` | CUU CUD CUF CUB | move the cursor; CUU/CUD stop at the scroll margins |
 //! | `E` `F` | CNL CPL | CUD / CUU, then column zero |
 //! | `G` `` ` `` | CHA HPA | absolute column |
-//! | `d` | VPA | absolute row |
-//! | `H` `f` | CUP HVP | absolute position |
-//! | `a` `e` | HPR VPR | relative position: right / down, clamped to the screen (VPR ignores the scroll region) |
+//! | `d` | VPA | absolute row (from the top margin in origin mode) |
+//! | `H` `f` | CUP HVP | absolute position (row from the top margin in origin mode) |
+//! | `a` `e` | HPR VPR | relative position: right / down, clamped to the screen (VPR ignores the scroll region unless origin mode is on) |
+//! | `h` `l` | SM RM | set / reset ANSI modes: IRM (4) and LNM (20), see the `modes` module |
 //! | `I` `Z` | CHT CBT | tab forward / back |
 //! | `J` `K` | ED EL | erase in display / line |
 //! | `@` `P` `X` | ICH DCH ECH | insert / delete / erase characters |
@@ -22,15 +23,22 @@
 //! | `r` | DECSTBM | set the scroll region |
 //! | `s` `u` | SCOSC SCORC | save / restore the cursor exactly like DECSC / DECRC, only without parameters |
 //!
-//! One sequence with an intermediate is implemented: `CSI ! p` (DECSTR,
-//! soft terminal reset, see the crate documentation). Its parameters are
-//! ignored, as in xterm, so `CSI 5 ! p` resets too.
+//! With a private marker or an intermediate (the `modes` module has the
+//! details):
+//!
+//! | Sequence | Name | Effect |
+//! |---|---|---|
+//! | `CSI ? Pm h` `CSI ? Pm l` | DECSET DECRST | set / reset DEC private modes |
+//! | `CSI > Pp ; Pv m` | XTMODKEYS | `modifyOtherKeys` (Pp 4) |
+//! | `CSI > flags u` `CSI < n u` `CSI = flags ; mode u` | kitty keyboard | push / pop / set the keyboard flags |
+//! | `CSI ! p` | DECSTR | soft terminal reset, see the crate documentation; parameters are ignored, as in xterm, so `CSI 5 ! p` resets too |
 //!
 //! Parameters follow xterm: an absent parameter and an explicit `0` both
-//! mean the default, positions are 1-based and clamp to the screen (origin
-//! mode does not exist yet, so CUP, HVP, CHA, HPA and VPA ignore the scroll
-//! region), and every count saturates. Nothing here can panic on hostile
-//! input.
+//! mean the default, positions are 1-based and clamp to the screen, and
+//! every count saturates. In origin mode (DECOM, `CSI ? 6 h`) CUP, HVP,
+//! VPA and VPR count rows from the top margin and stop at the bottom one
+//! (xterm `CursorSet`); columns stay absolute, as there are no left and
+//! right margins yet (#97). Nothing here can panic on hostile input.
 //!
 //! REP is not capped, as in xterm and Alacritty: a count up to 65535 costs
 //! that many prints, each O(1) except in insert mode, where each one shifts
@@ -39,8 +47,8 @@
 //! HPR and VPR are xterm's `CursorSet(row, col + n)` and
 //! `CursorSet(row + n, col)`: they clamp to the screen, not to the scroll
 //! margins (CUD stops at the bottom margin, VPR does not), and clear a
-//! pending wrap like every cursor move. Origin mode (#8) will make both
-//! relative to and clamped by the region.
+//! pending wrap like every cursor move. In origin mode both count the row
+//! from the top margin and stop at the bottom one, as CUP does.
 //!
 //! SCOSC (`CSI s`) and SCORC (`CSI u`) share the DECSC / DECRC slot
 //! ([`tessera_grid::Grid::save_cursor`]): cursor, pen and pending wrap, and
@@ -53,18 +61,23 @@
 //! reports `CSI s` and `CSI 0 s` alike, so the explicit zero saves too,
 //! where xterm ignores it. `CSI s` is SCOSC only while left/right margin
 //! mode (DECLRMM, `?69`, #97) is off; until #97 it always is. The kitty
-//! keyboard queries `CSI ? u`, `CSI > u`, `CSI < u` and `CSI = u` carry a
-//! private marker and never reach SCORC.
+//! keyboard sequences `CSI ? u`, `CSI > u`, `CSI < u` and `CSI = u` carry a
+//! private marker and never reach SCORC; the query `CSI ? u` is #10.
 //!
-//! Everything else (an unassigned final, any private marker such as `?`,
-//! any other intermediate such as `SP`, `$` or `"` (DECSCL is #92), and the
-//! xterm extension SL/SR that is not in scope) is ignored and logged at
-//! trace level. The parser hands over private markers as intermediates, so
-//! one check covers both.
+//! DECSET/DECRST, SM/RM and the kitty keyboard sequences are ignored as a
+//! whole when a parameter carries a colon sub-parameter (`CSI ? 25:1049
+//! h`), as in xterm, which accepts them only in SGR and XTMODKEYS.
+//!
+//! Everything else (an unassigned final, any other private marker and
+//! final pair such as `CSI > 25 h` or `CSI ? 5 m`, any other intermediate
+//! such as `SP`, `$` or `"` (DECSCL is #92), and the xterm extension SL/SR
+//! that is not in scope) is ignored and logged at trace level. The parser
+//! hands over private markers as intermediates, so one match covers both.
 //!
 //! Expected behaviour per sequence and edge case is pinned by
-//! `tests/fixtures/csi_spec.txt`, and for DECSTR by
-//! `tests/fixtures/decstr_spec.txt`.
+//! `tests/fixtures/csi_spec.txt`, for DECSTR by
+//! `tests/fixtures/decstr_spec.txt` and for the modes by
+//! `tests/fixtures/modes_spec.txt`.
 //!
 //! [`Action::Csi`]: tessera_vt::Action::Csi
 
@@ -112,17 +125,27 @@ impl State {
         action: char,
     ) {
         if !intermediates.is_empty() {
-            if (intermediates, action) == (b"!", 'p') {
+            match (intermediates, action) {
                 // DECSTR. Parameters are ignored, as in xterm.
-                self.soft_reset();
-                return;
+                (b"!", 'p') => self.soft_reset(),
+                // xterm takes colon sub-parameters only in SGR and XTMODKEYS.
+                (b"?", 'h' | 'l') | ([b'>' | b'<' | b'='], 'u') if subparams != 0 => {
+                    trace!(
+                        ?action,
+                        ?params,
+                        "mode sequence with sub-parameters ignored"
+                    );
+                }
+                (b"?", 'h' | 'l') => self.set_dec_modes(params, action == 'h'),
+                (b">", 'm') => self.set_key_modifiers(params),
+                ([marker @ (b'>' | b'<' | b'=')], 'u') => self.kitty_keyboard(*marker, params),
+                _ => trace!(
+                    ?action,
+                    ?params,
+                    ?intermediates,
+                    "CSI with intermediates ignored"
+                ),
             }
-            trace!(
-                ?action,
-                ?params,
-                ?intermediates,
-                "CSI with intermediates ignored"
-            );
             return;
         }
         let grid = &mut self.grid;
@@ -140,18 +163,18 @@ impl State {
                 grid.carriage_return();
             }
             'G' | '`' => grid.goto_col(count(params, 0) - 1),
-            'd' => grid.goto_row(count(params, 0) - 1),
-            'H' | 'f' => grid.goto(count(params, 0) - 1, count(params, 1) - 1),
+            'd' => grid.goto_row_origin(count(params, 0) - 1),
+            'H' | 'f' => grid.goto_origin(count(params, 0) - 1, count(params, 1) - 1),
             // HPR and VPR: xterm `CursorSet`, clamped to the screen rather
-            // than to the scroll margins. `goto` clamps and clears the
-            // pending wrap.
+            // than to the scroll margins (to the region in origin mode).
+            // `goto_origin` clamps and clears the pending wrap.
             'a' => {
-                let cursor = grid.cursor();
-                grid.goto(cursor.row, cursor.col.saturating_add(count(params, 0)));
+                let col = grid.cursor().col.saturating_add(count(params, 0));
+                grid.goto_origin(grid.origin_row(), col);
             }
             'e' => {
-                let cursor = grid.cursor();
-                grid.goto(cursor.row.saturating_add(count(params, 0)), cursor.col);
+                let row = grid.origin_row().saturating_add(count(params, 0));
+                grid.goto_origin(row, grid.cursor().col);
             }
             // With a wrap pending the cursor sits on the last column and no
             // stop lies ahead: xterm leaves the wrap armed, as for HT.
@@ -178,6 +201,8 @@ impl State {
                 mode => trace!(mode, "TBC mode ignored"),
             },
             'r' => self.set_scroll_region(params),
+            'h' | 'l' if subparams != 0 => trace!(?params, "SM/RM with sub-parameters ignored"),
+            'h' | 'l' => self.set_ansi_modes(params, action == 'h'),
             // SCOSC. #97: DECSLRM instead while DECLRMM (?69) is set.
             's' if no_params(params) => grid.save_cursor(),
             // SCORC: restores what DECRC restores.
@@ -292,31 +317,30 @@ impl State {
     }
 
     /// DECSTR (`CSI ! p`): the soft reset described in the crate
-    /// documentation. Resets the pen, insert mode, auto-wrap, the scroll
-    /// region and the saved cursor; keeps the screen, the scrollback, the
-    /// cursor position, a pending wrap and the tab stops. REP's remembered
-    /// character is cleared by [`State::apply`], as after any sequence.
+    /// documentation. Resets the pen, the modes in the `modes` module's
+    /// list (insert mode, auto-wrap, origin mode, the cursor, the keyboard
+    /// modes, …), the scroll region and the saved cursor; keeps the
+    /// screen, the scrollback, the cursor position, a pending wrap and the
+    /// tab stops. REP's remembered character is cleared by
+    /// [`State::apply`], as after any sequence.
     fn soft_reset(&mut self) {
         // The whole pen, faint, strikeout and double underline included:
         // DEC, kitty and WezTerm; xterm keeps those three.
         self.grid.set_pen(Style::DEFAULT);
-        self.insert_mode = false;
-        // xterm's resource default; DEC's table 5-9 says off.
-        self.auto_wrap = true;
+        // Origin mode goes off here, before the saved cursor is reset, so
+        // a DECRC lands on the screen's home.
+        self.soft_reset_modes();
         self.grid.reset_scroll_region();
         // xterm saves the cursor after the resets above and then homes the
         // copy; its pending wrap is cleared too (xterm copies the live one).
         // DECSC and SCOSC share this slot, so DECRC and SCORC both home.
         self.grid.reset_saved_cursor();
-        // #8: reset here: DECOM off, DECTCEM on, G0-G3/GL/GR and DECNRCM to
-        // their defaults, DECCKM and DECKPAM off, KAM unlocked, DECSCA off,
-        // DECLRMM off with full left/right margins, reverse wrap (?45) to
-        // its default, modifyOtherKeys and the kitty keyboard flags to their
-        // defaults (once Terminal owns KeyboardModes). Reset DECOM before
-        // the saved cursor so a DECRC lands on the screen's home.
-        // Not #8, same place: the cursor shape and blink (DECSCUSR,
-        // `CSI Ps SP q`; no issue yet) to the default, and the OSC 4 palette
-        // to the theme (xterm's ResetAnsiColorRequest; #9).
+        // #112, #95, #97, #113, #9: reset here once the state exists:
+        // G0-G3/GL/GR and DECNRCM to their defaults (SCS, #112), DECSCA off
+        // (#95), DECLRMM off with full left/right margins and reverse wrap
+        // (?45) to its default (#97), the cursor shape and blink (DECSCUSR,
+        // `CSI Ps SP q`, #113) to the default, and the OSC 4 palette to the
+        // theme (xterm's ResetAnsiColorRequest, #9).
     }
 
     /// DECSTBM. The top defaults to the first row; the bottom defaults to
@@ -336,9 +360,8 @@ impl State {
             return;
         }
         self.grid.set_scroll_region(top - 1, bottom - 1);
-        // Origin mode does not exist yet, so home is the screen's corner.
-        // #8 (DECOM) homes to the region's top instead when it is set.
-        self.grid.goto(0, 0);
+        // Home: the region's top-left corner in origin mode.
+        self.grid.goto_origin(0, 0);
     }
 }
 

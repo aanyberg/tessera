@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use tessera_pty::{NativePty, Pty, PtyEvents};
 use tessera_render::{FontConfig, Fonts, Gpu, Theme};
-use tessera_term::{KeyboardModes, Terminal, encode_key};
+use tessera_term::{Terminal, encode_key};
 
 pub use input::{InputEvent, InputOutcome};
 pub use session::{SessionEvent, SessionId, SessionObserver};
@@ -422,6 +422,8 @@ impl App {
     ///
     /// * [`InputEvent::Key`]: a key bound to an application command runs it
     ///   (no key is bound yet, #43); any other key is encoded for the child
+    ///   with the terminal's keyboard modes
+    ///   ([`Terminal::keyboard_modes`], copied under the terminal lock)
     ///   and queued for the session's writer thread **without blocking**
     ///   (see the [`session`] module), and the view returns to the live
     ///   screen. A key that encodes to nothing (a bare modifier,
@@ -434,21 +436,32 @@ impl App {
     ///   [`App::scroll_offset`]); [`InputOutcome::Consumed`] only when the
     ///   offset changed.
     /// * [`InputEvent::Paste`]: as [`App::paste`]: sanitised with
-    ///   [`input::sanitize_paste`] and queued like a key, **without
-    ///   blocking**, behind any input still pending, and the view returns
-    ///   to the live screen; text that sanitises to nothing is
-    ///   [`InputOutcome::Ignored`]. The free space is checked on the raw
-    ///   length, before sanitising.
-    /// * [`InputEvent::Focus`]: recorded (see [`App::is_focused`]);
-    ///   [`InputOutcome::Consumed`].
+    ///   [`input::sanitize_paste_into`], or in bracketed-paste mode
+    ///   (DECSET 2004) wrapped in `ESC [ 200 ~` / `ESC [ 201 ~` and
+    ///   sanitised with [`input::sanitize_bracketed_paste_into`], which
+    ///   keeps line breaks; queued like a key, **without blocking**, behind
+    ///   any input still pending, and the view returns to the live screen;
+    ///   text that sanitises to nothing is [`InputOutcome::Ignored`] and
+    ///   sends nothing, brackets included. The free space is checked on the
+    ///   raw length plus the 12 bytes of brackets when bracketing, before
+    ///   sanitising.
+    /// * [`InputEvent::Focus`]: recorded (see [`App::is_focused`]); in
+    ///   focus-event mode (DECSET 1004) a change of focus also queues
+    ///   `ESC [ I` (gained) or `ESC [ O` (lost) for the child, which can
+    ///   fail like a key. An event repeating the recorded state sends
+    ///   nothing. [`InputOutcome::Consumed`]. The check and the update of
+    ///   the recorded state are not one atomic step: focus events must come
+    ///   from one thread (the frontend's main thread), or two racing events
+    ///   may both be reported.
     ///
     /// # Errors
     ///
     /// [`Error::SessionNotFound`] if `id` is not a live session;
     /// [`Error::Write`] if the child has exited, the session is being
-    /// closed, or the key or paste does not fit in what is left of
-    /// [`session::PENDING_INPUT_BYTES`] (kind
-    /// [`io::ErrorKind::WouldBlock`]); nothing of it is queued then.
+    /// closed, or the key, paste or focus report does not fit in what is
+    /// left of [`session::PENDING_INPUT_BYTES`] (kind
+    /// [`io::ErrorKind::WouldBlock`]); nothing of it is queued then (the
+    /// focus state is recorded all the same).
     pub fn send_input(&self, id: SessionId, event: InputEvent) -> Result<InputOutcome> {
         let session = self.session(id)?;
         let write_error = |source| Error::Write { id, source };
@@ -457,10 +470,10 @@ impl App {
                 if let Some(binding) = self.bindings.resolve(&key) {
                     match binding {}
                 }
-                // TODO(#8): encode with the terminal's own keyboard modes
-                // (DECCKM, DECKPAM, modifyOtherKeys, kitty flags) once
-                // `Terminal` tracks them.
-                let bytes = encode_key(&key, &KeyboardModes::default());
+                // One copy under the terminal lock, released before the
+                // write is queued.
+                let modes = session.with_terminal(Terminal::keyboard_modes);
+                let bytes = encode_key(&key, &modes);
                 if bytes.is_empty() {
                     return Ok(InputOutcome::Ignored);
                 }
@@ -479,9 +492,15 @@ impl App {
             }),
             InputEvent::Paste(text) => Self::queue_paste(&session, id, &text),
             InputEvent::Focus(focus) => {
-                // TODO(#8): report `CSI I` / `CSI O` in focus-event mode
-                // (DECSET 1004).
-                session.set_focused(focus == FocusEvent::Gained);
+                let focused = focus == FocusEvent::Gained;
+                let changed = session.is_focused() != focused;
+                session.set_focused(focused);
+                // Focus reporting (DECSET 1004) reports changes only, so a
+                // repeated event from the frontend sends nothing.
+                if changed && session.with_terminal(|term| term.modes().focus_events) {
+                    let report: &[u8] = if focused { b"\x1b[I" } else { b"\x1b[O" };
+                    session.queue_input(report.to_vec()).map_err(write_error)?;
+                }
                 Ok(InputOutcome::Consumed)
             }
         }
@@ -495,9 +514,10 @@ impl App {
     ///
     /// # Errors
     ///
-    /// As [`App::send_input`]; a paste whose raw length does not fit in
-    /// what is left of [`session::PENDING_INPUT_BYTES`] is refused even if
-    /// sanitising would have shortened it enough.
+    /// As [`App::send_input`]; a paste whose raw length (plus 12 bytes of
+    /// brackets in bracketed-paste mode) does not fit in what is left of
+    /// [`session::PENDING_INPUT_BYTES`] is refused even if sanitising would
+    /// have shortened it enough.
     pub fn paste(&self, id: SessionId, text: &str) -> Result<InputOutcome> {
         let session = self.session(id)?;
         Self::queue_paste(&session, id, text)
@@ -521,9 +541,9 @@ impl App {
 
     fn queue_paste(session: &Session, id: SessionId, text: &str) -> Result<InputOutcome> {
         let write_error = |source| Error::Write { id, source };
-        // TODO(#8): wrap in `CSI 200 ~` ... `CSI 201 ~` when the terminal
-        // is in bracketed-paste mode (DECSET 2004).
-        let bracketed_paste = false;
+        // Bracketed-paste mode (DECSET 2004), read once under the terminal
+        // lock: the whole paste is wrapped, or none of it.
+        let bracketed_paste = session.with_terminal(|term| term.modes().bracketed_paste);
         let (open, close): (&[u8], &[u8]) = if bracketed_paste {
             (b"\x1b[200~", b"\x1b[201~")
         } else {
@@ -534,7 +554,11 @@ impl App {
         session.check_input_room(most).map_err(write_error)?;
         let mut bytes = Vec::with_capacity(most);
         bytes.extend_from_slice(open);
-        input::sanitize_paste_into(text, &mut bytes);
+        if bracketed_paste {
+            input::sanitize_bracketed_paste_into(text, &mut bytes);
+        } else {
+            input::sanitize_paste_into(text, &mut bytes);
+        }
         if bytes.len() == open.len() {
             return Ok(InputOutcome::Ignored);
         }
@@ -882,7 +906,7 @@ impl App {
         let result = if view.gpu().is_lost() {
             Err(RenderError::DeviceLost)
         } else {
-            session.with_terminal(|term| view.capture(term.grid()));
+            session.with_terminal(|term| view.capture(term));
             view.render(focused)
         };
         // A loss during the frame may surface as any error (or none).
@@ -2199,6 +2223,13 @@ mod tests {
         written_eventually(fake, b"#");
     }
 
+    /// [`assert_nothing_written`] after `before` was written.
+    fn assert_nothing_written_after(fake: &Fake, before: &[u8], app: &App, id: SessionId) {
+        let marker = KeyEvent::new(Key::Char('#'), Modifiers::NONE);
+        assert_eq!(key(app, id, marker), InputOutcome::Consumed);
+        written_eventually(fake, &[before, b"#"].concat());
+    }
+
     fn key(app: &App, id: SessionId, event: KeyEvent) -> InputOutcome {
         app.send_input(id, InputEvent::Key(event)).unwrap()
     }
@@ -2586,6 +2617,76 @@ mod tests {
         assert_eq!(lost.unwrap(), InputOutcome::Consumed);
         assert!(!app.is_focused(id).unwrap());
         assert_nothing_written(&app, id, &fake);
+    }
+
+    /// Feeds `bytes` to session `id` as child output and waits until the
+    /// terminal has applied it.
+    fn feed_child(
+        events: &Receiver<(SessionId, SessionEvent)>,
+        fake: &Fake,
+        id: SessionId,
+        bytes: &[u8],
+    ) {
+        fake.send(PtyEvent::Output(bytes.to_vec()));
+        assert_eq!(next(events), (id, SessionEvent::Output));
+    }
+
+    #[test]
+    fn keys_are_encoded_with_the_terminal_s_keyboard_modes() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        let up = KeyEvent::new(Key::Up, Modifiers::NONE);
+        let escape = KeyEvent::new(Key::Escape, Modifiers::NONE);
+        assert_eq!(key(&app, id, up.clone()), InputOutcome::Consumed);
+        // DECCKM: application cursor keys.
+        feed_child(&events, &fake, id, b"\x1b[?1h");
+        assert_eq!(key(&app, id, up.clone()), InputOutcome::Consumed);
+        // kitty flags: disambiguate escape codes.
+        assert_eq!(key(&app, id, escape.clone()), InputOutcome::Consumed);
+        feed_child(&events, &fake, id, b"\x1b[>1u");
+        assert_eq!(key(&app, id, escape.clone()), InputOutcome::Consumed);
+        // RIS: every keyboard mode back to its default.
+        feed_child(&events, &fake, id, b"\x1bc");
+        assert_eq!(key(&app, id, up), InputOutcome::Consumed);
+        assert_eq!(key(&app, id, escape), InputOutcome::Consumed);
+        written_eventually(&fake, b"\x1b[A\x1bOA\x1b\x1b[27u\x1b[A\x1b");
+    }
+
+    #[test]
+    fn pastes_are_bracketed_under_decset_2004() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        feed_child(&events, &fake, id, b"\x1b[?2004h");
+        let pasted = app
+            .send_input(id, InputEvent::Paste("a\nb\x1b[201~c".into()))
+            .unwrap();
+        assert_eq!(pasted, InputOutcome::Consumed);
+        let empty = app.paste(id, "\x1b\x07").unwrap();
+        assert_eq!(empty, InputOutcome::Ignored, "nothing left: no brackets");
+        feed_child(&events, &fake, id, b"\x1b[?2004l");
+        assert_eq!(app.paste(id, "d\ne").unwrap(), InputOutcome::Consumed);
+        written_eventually(&fake, b"\x1b[200~a\nb[201~c\x1b[201~d\re");
+    }
+
+    #[test]
+    fn focus_changes_are_reported_under_decset_1004() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        let focus = |event| app.send_input(id, InputEvent::Focus(event)).unwrap();
+        assert_eq!(focus(FocusEvent::Gained), InputOutcome::Consumed);
+        // Setting the mode reports nothing, not even the current state.
+        feed_child(&events, &fake, id, b"\x1b[?1004h");
+        assert_eq!(focus(FocusEvent::Lost), InputOutcome::Consumed);
+        assert_eq!(focus(FocusEvent::Lost), InputOutcome::Consumed);
+        assert_eq!(focus(FocusEvent::Gained), InputOutcome::Consumed);
+        assert_eq!(focus(FocusEvent::Gained), InputOutcome::Consumed);
+        feed_child(&events, &fake, id, b"\x1b[?1004l");
+        assert_eq!(focus(FocusEvent::Lost), InputOutcome::Consumed);
+        assert!(!app.is_focused(id).unwrap());
+        assert_nothing_written_after(&fake, b"\x1b[O\x1b[I", &app, id);
     }
 
     #[test]
@@ -3224,7 +3325,7 @@ mod tests {
             let gpu = Gpu::headless().expect("a Metal adapter");
             let mut reference =
                 View::offscreen(gpu, fonts, app.view_theme(), SIZE, 1.0).expect("view");
-            app.with_terminal(id, |term| reference.capture(term.grid()))
+            app.with_terminal(id, |term| reference.capture(term))
                 .unwrap();
             assert_eq!(
                 reference.render(false).expect("reference frame"),

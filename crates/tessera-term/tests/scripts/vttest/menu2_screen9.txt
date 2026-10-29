@@ -1,0 +1,54 @@
+# Fixture case V2S9_do_scrolling_soft_scroll_region_12_13 (tests/fixtures/csi_spec.txt).
+# tst_screen 'Soft scroll up region [12..13]' (soft scroll). Cumulative from m2_07: ESC[?4l DECSCLM reset (ignored), DECSTBM 12;13 under DECOM.
+@size 24x80
+\x1b[2J\x1b[?6h\x1b[?4h\x1b[12;13r\x1b[2J
+\x1b[24BSoft scroll up region [12..13] size 2 Line 1\r\nSoft scroll up region [12..13] size 2 Line 2\r\nSoft scroll up region [12..13] size 2 Line 3\r\nSoft scroll up region [12..13] size 2 Line 4\r\nSoft scroll up region [12..13] size 2 Line 5\r\nSoft scroll up region [12..13] size 2 Line 6\r\nSoft scroll up region [12..13] size 2 Line 7\r\nSoft scroll up region [12..13] size 2 Line 8\r\nSoft scroll up region [12..13] size 2 Line 9\r\nSoft scroll up region [12..13] size 2 Line 10\r\nSoft scroll up region [12..13] size 2 Line 11\r\nSoft scroll up region [12..13] size 2 Line 12\r\nSoft scroll up region [12..13] size 2 Line 13\r\nSoft scroll up region [12..13] size 2 Line 14\r\nSoft scroll up region [12..13] size 2 Line 15\r\nSoft scroll up region [12..13] size 2 Line 16\r\nSoft scroll up region [12..13] size 2 Line 17\r\nSoft scroll up region [12..13] size 2 Line 18\r\nSoft scroll up region [12..13] size 2 Line 19\r\nSoft scroll up region [12..13] size 2 Line 20\r\nSoft scroll up region [12..13] size 2 Line 21\r\nSoft scroll up region [12..13] size 2 Line 22\r\nSoft scroll up region [12..13] size 2 Line 23\r\nSoft scroll up region [12..13] size 2 Line 24\r\nSoft scroll up region [12..13] size 2 Line 25\r\nSoft scroll up region [12..13] size 2 Line 26\r\nSoft scroll up region [12..13] size 2 Line 27\r\nSoft scroll up region [12..13] size 2 Line 28\r\nSoft scroll up region [12..13] size 2 Line 29\r\n
+\x1b[24ASoft scroll down region [12..13] size 2 Line 1\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 2\r\n\x1bM
+\x1bMSoft scroll down region [12..13] size 2 Line 3\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 4\r\n\x1bM
+\x1bMSoft scroll down region [12..13] size 2 Line 5\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 6\r\n\x1bM
+\x1bMSoft scroll down region [12..13] size 2 Line 7\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 8\r\n\x1bM
+\x1bMSoft scroll down region [12..13] size 2 Line 9\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 10\r\n\x1bM
+\x1bMSoft scroll down region [12..13] size 2 Line 11\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 12\r\n\x1bM
+\x1bMSoft scroll down region [12..13] size 2 Line 13\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 14\r\n\x1bM
+\x1bMSoft scroll down region [12..13] size 2 Line 15\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 16\r\n\x1bM
+\x1bMSoft scroll down region [12..13] size 2 Line 17\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 18\r\n\x1bM
+\x1bMSoft scroll down region [12..13] size 2 Line 19\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 20\r\n\x1bM
+\x1bMSoft scroll down region [12..13] size 2 Line 21\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 22\r\n\x1bM
+\x1bMSoft scroll down region [12..13] size 2 Line 23\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 24\r\n\x1bM
+\x1bMSoft scroll down region [12..13] size 2 Line 25\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 26\r\n\x1bM
+\x1bMSoft scroll down region [12..13] size 2 Line 27\r\n\x1bM\x1bMSoft scroll down region [12..13] size 2 Line 28\r\n\x1bM
+\x1bMSoft scroll down region [12..13] size 2 Line 29\r\n\x1bM\x1bMPush <RETURN>
+\x1b[1;24r\x1b[2J
+\x1b[24BSoft scroll up region [1..24] size 24 Line 1\r\nSoft scroll up region [1..24] size 24 Line 2\r\nSoft scroll up region [1..24] size 24 Line 3\r\nSoft scroll up region [1..24] size 24 Line 4\r\nSoft scroll up region [1..24] size 24 Line 5\r\nSoft scroll up region [1..24] size 24 Line 6\r\nSoft scroll up region [1..24] size 24 Line 7\r\nSoft scroll up region [1..24] size 24 Line 8\r\nSoft scroll up region [1..24] size 24 Line 9\r\nSoft scroll up region [1..24] size 24 Line 10\r\nSoft scroll up region [1..24] size 24 Line 11\r\nSoft scroll up region [1..24] size 24 Line 12\r\nSoft scroll up region [1..24] size 24 Line 13\r\nSoft scroll up region [1..24] size 24 Line 14\r\nSoft scroll up region [1..24] size 24 Line 15\r\nSoft scroll up region [1..24] size 24 Line 16\r\nSoft scroll up region [1..24] size 24 Line 17\r\nSoft scroll up region [1..24] size 24 Line 18\r\nSoft scroll up region [1..24] size 24 Line 19\r\nSoft scroll up region [1..24] size 24 Line 20\r\nSoft scroll up region [1..24] size 24 Line 21\r\nSoft scroll up region [1..24] size 24 Line 22\r\nSoft scroll up region [1..24] size 24 Line 23\r\nSoft scroll up region [1..24] size 24 Line 24\r\nSoft scroll up region [1..24] size 24 Line 25\r\nSoft scroll up region [1..24] size 24 Line 26\r\nSoft scroll up region [1..24] size 24 Line 27\r\nSoft scroll up region [1..24] size 24 Line 28\r\nSoft scroll up region [1..24] size 24 Line 29\r\n
+\x1b[24ASoft scroll down region [1..24] size 24 Line 1\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 2\r\n\x1bM
+\x1bMSoft scroll down region [1..24] size 24 Line 3\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 4\r\n\x1bM
+\x1bMSoft scroll down region [1..24] size 24 Line 5\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 6\r\n\x1bM
+\x1bMSoft scroll down region [1..24] size 24 Line 7\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 8\r\n\x1bM
+\x1bMSoft scroll down region [1..24] size 24 Line 9\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 10\r\n\x1bM
+\x1bMSoft scroll down region [1..24] size 24 Line 11\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 12\r\n\x1bM
+\x1bMSoft scroll down region [1..24] size 24 Line 13\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 14\r\n\x1bM
+\x1bMSoft scroll down region [1..24] size 24 Line 15\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 16\r\n\x1bM
+\x1bMSoft scroll down region [1..24] size 24 Line 17\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 18\r\n\x1bM
+\x1bMSoft scroll down region [1..24] size 24 Line 19\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 20\r\n\x1bM
+\x1bMSoft scroll down region [1..24] size 24 Line 21\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 22\r\n\x1bM
+\x1bMSoft scroll down region [1..24] size 24 Line 23\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 24\r\n\x1bM
+\x1bMSoft scroll down region [1..24] size 24 Line 25\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 26\r\n\x1bM
+\x1bMSoft scroll down region [1..24] size 24 Line 27\r\n\x1bM\x1bMSoft scroll down region [1..24] size 24 Line 28\r\n\x1bM
+\x1bMSoft scroll down region [1..24] size 24 Line 29\r\n\x1bM\x1bMPush <RETURN>
+\x1b[?4l\x1b[12;13r\x1b[2J
+\x1b[24BJump scroll up region [12..13] size 2 Line 1\r\nJump scroll up region [12..13] size 2 Line 2\r\nJump scroll up region [12..13] size 2 Line 3\r\nJump scroll up region [12..13] size 2 Line 4\r\nJump scroll up region [12..13] size 2 Line 5\r\nJump scroll up region [12..13] size 2 Line 6\r\nJump scroll up region [12..13] size 2 Line 7\r\nJump scroll up region [12..13] size 2 Line 8\r\nJump scroll up region [12..13] size 2 Line 9\r\nJump scroll up region [12..13] size 2 Line 10\r\nJump scroll up region [12..13] size 2 Line 11\r\nJump scroll up region [12..13] size 2 Line 12\r\nJump scroll up region [12..13] size 2 Line 13\r\nJump scroll up region [12..13] size 2 Line 14\r\nJump scroll up region [12..13] size 2 Line 15\r\nJump scroll up region [12..13] size 2 Line 16\r\nJump scroll up region [12..13] size 2 Line 17\r\nJump scroll up region [12..13] size 2 Line 18\r\nJump scroll up region [12..13] size 2 Line 19\r\nJump scroll up region [12..13] size 2 Line 20\r\nJump scroll up region [12..13] size 2 Line 21\r\nJump scroll up region [12..13] size 2 Line 22\r\nJump scroll up region [12..13] size 2 Line 23\r\nJump scroll up region [12..13] size 2 Line 24\r\nJump scroll up region [12..13] size 2 Line 25\r\nJump scroll up region [12..13] size 2 Line 26\r\nJump scroll up region [12..13] size 2 Line 27\r\nJump scroll up region [12..13] size 2 Line 28\r\nJump scroll up region [12..13] size 2 Line 29\r\n
+\x1b[24AJump scroll down region [12..13] size 2 Line 1\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 2\r\n\x1bM
+\x1bMJump scroll down region [12..13] size 2 Line 3\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 4\r\n\x1bM
+\x1bMJump scroll down region [12..13] size 2 Line 5\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 6\r\n\x1bM
+\x1bMJump scroll down region [12..13] size 2 Line 7\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 8\r\n\x1bM
+\x1bMJump scroll down region [12..13] size 2 Line 9\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 10\r\n\x1bM
+\x1bMJump scroll down region [12..13] size 2 Line 11\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 12\r\n\x1bM
+\x1bMJump scroll down region [12..13] size 2 Line 13\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 14\r\n\x1bM
+\x1bMJump scroll down region [12..13] size 2 Line 15\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 16\r\n\x1bM
+\x1bMJump scroll down region [12..13] size 2 Line 17\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 18\r\n\x1bM
+\x1bMJump scroll down region [12..13] size 2 Line 19\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 20\r\n\x1bM
+\x1bMJump scroll down region [12..13] size 2 Line 21\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 22\r\n\x1bM
+\x1bMJump scroll down region [12..13] size 2 Line 23\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 24\r\n\x1bM
+\x1bMJump scroll down region [12..13] size 2 Line 25\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 26\r\n\x1bM
+\x1bMJump scroll down region [12..13] size 2 Line 27\r\n\x1bM\x1bMJump scroll down region [12..13] size 2 Line 28\r\n\x1bM
+\x1bMJump scroll down region [12..13] size 2 Line 29\r\n\x1bM\x1bMPush <RETURN>

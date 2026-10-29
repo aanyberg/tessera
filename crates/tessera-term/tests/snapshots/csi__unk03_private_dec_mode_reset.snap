@@ -10,6 +10,6 @@ OPQRSTUVWX
 --
 cursor: (2,5)
 pending_wrap: false
-auto_wrap: true insert_mode: false
+auto_wrap: false insert_mode: false
 requests: []
 scrollback: 0

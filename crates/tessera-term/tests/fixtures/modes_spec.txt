@@ -1,0 +1,1894 @@
+# =============================================================================
+# tessera-term: terminal modes (DECSET/DECRST, SM/RM, DECKPAM, kitty keyboard)  (issue #8, wave 6)
+# crates/tessera-term/tests/fixtures/modes_spec.txt   (spec-researcher output; rows corrected by the implementer are marked
+# `IMPLEMENTER CORRECTION (#8)` in a note)
+#
+# Same machine-readable layout as decstr_spec.txt / csi_spec.txt (### ID / size / step / cite / note /
+# screen / cursor / pending_wrap / requests / scrollback), parsed by tests/spec/mod.rs. Extra keys the shared
+# parser ignores and tests/modes.rs must assert by hand because render_screen cannot show them:
+#     modes:     expected `Terminal::modes()` fields that DIFFER from Modes::default() after the whole
+#                script ("default" = all defaults: auto_wrap, cursor_visible true, rest off/None/Default)
+#     kbd:       expected `Terminal::keyboard_modes()` fields that differ from default
+#     region:    expected grid.scroll_region(): "full" or "top..=bottom" 0-based
+#     saved:     expected saved cursor of the ACTIVE screen "(row,col) wrap=<bool> origin=<bool>"  (hand-asserted)
+#     screen_is: "main" | "alt" -- which screen is active at the end (Modes::alt_screen)
+#     main:      expected rendered rows of the main screen when the active screen is the alternate one
+#     flags:     xterm-quirk | decision | control | negative | unverified
+# `control` cases run the setup WITHOUT the mode sequence and prove the later assertion is not vacuous.
+# Cursor is 0-based (row,col). render_screen puts `|` AFTER the cursor's cell; a row ending in `\` is soft-wrapped.
+# `set auto_wrap|insert_mode true|false` is the Terminal seam kept by the brief.
+#
+# PRIMARY SOURCES (read from source in this run; line numbers refer to the files as fetched 2026-10-28)
+#   [CTL]  xterm ctlseqs  https://invisible-island.net/xterm/ctlseqs/ctlseqs.html   (XTerm Patch #411, 2026/08/23)
+#   [XT]   xterm source, https://github.com/ThomasDickey/xterm-snapshots (master, charproc.c $XTermId 1.2134 2026/10/11)
+#            charproc.c  dpmodes()  L7494..L8010   (DECSET/DECRST dispatcher; CASE_DECSET = dpmodes(bitset),
+#                                                   CASE_DECRST = dpmodes(bitclr))
+#            charproc.c  set_column_mode L7463, really_set_mousemode L7432, ToAlternate/FromAlternate/SwitchBufs
+#                        L9529..L9590, ReallyReset L14355..L14560, resetMargins L1372, CASE_CUP/VPA/HPA/VPR/HPR L3943..L3980
+#            cursor.c    CursorSet L68, CursorUp/Down, CursorSave2 L398, CursorRestoreFlags L467, DECSC_FLAGS L461
+#            util.c      ClearScreen L2356
+#   [ET]   esctest2 https://github.com/ThomasDickey/esctest2/tree/master/esctest/tests/  (decset.py, save_restore_cursor.py, vpa.py ...)
+#   [DEC]  VT510 RM https://vt100.net/docs/vt510-rm/   (DECOM.html, DECAWM.html, DECTCEM.html, DECCOLM.html, LNM.html, IRM.html, DECSTR.html)
+#   [KT]   kitty keyboard protocol https://sw.kovidgoyal.net/kitty/keyboard-protocol/ ; kitty/screen.c
+#   [CNT]  Contour synchronized output https://github.com/contour-terminal/vt-extensions/blob/master/synchronized-output.md
+#
+# THE CENTRAL FACT FOR DECOM (verified in [XT] cursor.c CursorSet L68..L100 and charproc.c L3943..L3980)
+#   Every absolute positioning sequence (CUP, HVP, VPA, HPA, VPR, HPR) ends in CursorSet(screen,row,col,xw->flags).
+#   When flags&ORIGIN: row += top_marg and is clamped to bot_marg; col += lft_marg, clamped to rgt_marg.
+#   CursorSet ALWAYS calls ResetWrap(screen) (pending wrap cleared) -- also for DECOM set/reset itself.
+#   => VPA is origin-relative in xterm (esctest vpa.py "IgnoresOriginMode" asserts on the DSR CPR answer, which xterm
+#      reports origin-relative, so the test name is misleading; see decision D-VPA).
+#   CUU/CUD (cursor.c CursorUp/CursorDown) are NOT origin-dependent: they clamp to the margin only when the cursor starts
+#      inside/below it, with or without DECOM.
+# =============================================================================
+
+# ----------------------------------------------------------------------------- DECOM (?6)
+
+### DECOM01_set_homes_to_region_top
+size: 6x10
+step: feed \x1b[3;5r\x1b[6;6H\x1b[?6hX
+cite: [XT] charproc.c L7598 `case srm_DECOM: (*func)(&xw->flags, ORIGIN); CursorSet(screen,0,0,xw->flags);` -> row = 0 + top_marg; [CTL] "CSI ? 6 h  Origin Mode (DECOM)"; [DEC] DECOM.html ("cursor moves to the home position ... within the margins")
+note: DECSTBM 3;5 (rows 2..4 0-based) then DECSET 6 homes to the region's top-left, not the screen's. X lands at (2,0).
+screen:
+>
+>
+>X |
+>
+>
+>
+cursor: (2,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: origin=true
+region: 2..=4
+
+### DECOM02_set_full_screen_region_homes_to_screen_origin
+size: 6x10
+step: feed \x1b[5;6H\x1b[?6hX
+cite: [XT] charproc.c L7598 CursorSet(0,0,ORIGIN) with top_marg=0 (full region) -> (0,0)
+note: Answer to the brief's question "does DECSET 6 home with a full-screen region": yes, to (0,0). The cursor does not stay where it was.
+screen:
+>X |
+>
+>
+>
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: origin=true
+
+### DECOM03_reset_homes_to_screen_origin
+size: 6x10
+step: feed \x1b[3;5r\x1b[?6h\x1b[2;3H\x1b[?6lX
+cite: [XT] charproc.c L7598 (DECRST runs the same dpmodes arm with func=bitclr; L8066+ is XTSAVE, not DECRST); flag cleared first, then CursorSet(0,0,flags) -> absolute (0,0)
+note: With DECOM on CUP 2;3 would be region row 3 (0-based) col 2; DECRST 6 sends the cursor to the absolute home (0,0), not the region's. The region itself survives.
+screen:
+>X |
+>
+>
+>
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+region: 2..=4
+
+### DECOM04_set_clears_pending_wrap
+size: 6x10
+step: feed \x1b[4;10Ha\x1b[?6hX
+cite: [XT] CursorSet -> ResetWrap(screen) (cursor.c L68..L100) for DECSET 6; [CTL] n/a (xterm source only)
+note: After 'a' at the last column the wrap is pending. DECSET 6 homes and clears it, so X is at (0,0), not wrapped to the next line.
+screen:
+>X |
+>
+>
+>         a
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: origin=true
+
+### DECOM05_reset_clears_pending_wrap
+size: 6x10
+step: feed \x1b[?6h\x1b[4;10Ha\x1b[?6lX
+cite: [XT] same arm (DECRST) -> CursorSet -> ResetWrap
+note: With DECOM on, CUP 4;10 is region-relative; the region is the full screen so row 3. DECRST 6 clears the pending wrap and homes.
+screen:
+>X |
+>
+>
+>         a
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+
+### DECOM06_repeat_set_rehomes
+size: 6x10
+step: feed \x1b[3;5r\x1b[?6h\x1b[3;4H\x1b[?6hX
+cite: [XT] dpmodes calls CursorSet on every DECSET 6, not only on a state change (charproc.c L7598..L7601, no `if changed` guard)
+note: Setting an already-set mode homes again. Implementer: do NOT early-return when the flag already has the requested value.
+screen:
+>
+>
+>X |
+>
+>
+>
+cursor: (2,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: origin=true
+region: 2..=4
+
+### DECOM07_cup_relative_to_region
+size: 6x10
+step: feed \x1b[3;5r\x1b[?6h\x1b[2;3HX
+cite: [XT] CASE_CUP charproc.c L3948 CursorSet(row-1,col-1,flags): use_row = 1 + top_marg(2) = 3; [DEC] DECOM.html
+note: CUP 2;3 under DECOM = region row 2 col 3 -> absolute (3,2).
+screen:
+>
+>
+>
+>  X |
+>
+>
+cursor: (3,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: origin=true
+region: 2..=4
+
+### DECOM08_cup_past_bottom_clamps_to_bottom_margin
+size: 6x10
+step: feed \x1b[3;5r\x1b[?6h\x1b[9;3HX
+cite: [XT] CursorSet: `if (flags & ORIGIN) { use_row += top_marg; max_row = bot_marg; }` then clamp (cursor.c L88..L95)
+note: Answer to "does CUP with DECOM clamp to the bottom margin": yes. Row 9 -> bottom margin row 4 (0-based).
+screen:
+>
+>
+>
+>
+>  X |
+>
+cursor: (4,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: origin=true
+region: 2..=4
+
+### DECOM09_control_cup_past_bottom_without_decom
+size: 6x10
+step: feed \x1b[3;5r\x1b[9;3HX
+flags: control
+cite: [XT] CursorSet without ORIGIN clamps to max_row (cursor.c L88..L95); the same input as DECOM08 without DECSET 6
+note: Without DECOM the CUP clamps to the last SCREEN row (5), not the region bottom. Proves DECOM08 is not vacuous.
+screen:
+>
+>
+>
+>
+>
+>  X |
+cursor: (5,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+region: 2..=4
+
+### DECOM10_hvp_same_as_cup
+size: 6x10
+step: feed \x1b[3;5r\x1b[?6h\x1b[2;3fX
+cite: [XT] CASE_HVP shares CASE_CUP (the parse table maps CSI f to CASE_CUP; charproc.c L3943 handles both)
+note: HVP is CUP with DECOM too.
+screen:
+>
+>
+>
+>  X |
+>
+>
+cursor: (3,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: origin=true
+region: 2..=4
+
+### DECOM11_vpa_is_origin_relative
+size: 6x10
+step: feed \x1b[3;5r\x1b[?6h\x1b[2dX
+cite: [XT] CASE_VPA charproc.c L3952..L3956 `CursorSet(screen, one_if_default(0)-1, CursorCol(xw), xw->flags)` -> row 1 + top_marg 2 = 3. kitty/screen.c screen_cursor_to_line adds margin_top under DECOM too.
+note: Decision D-VPA: xterm's CODE makes VPA origin-relative, despite esctest2 vpa.py "test_VPA_IgnoresOriginMode" (its assertion reads the cursor back with CPR, which xterm reports origin-relative; the test would pass under either reading on xterm only if the CPR is relative). Recommend: follow the xterm source (relative). VPA 2 under region 3..5 -> absolute row 3.
+screen:
+>
+>
+>
+>X |
+>
+>
+cursor: (3,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: origin=true
+region: 2..=4
+flags: decision
+
+### DECOM12_vpa_past_bottom_clamps
+size: 6x10
+step: feed \x1b[3;5r\x1b[?6h\x1b[99dX
+cite: [XT] CursorSet clamp to bot_marg
+note: VPA 99 under DECOM clamps to the bottom margin (row 4).
+screen:
+>
+>
+>
+>
+>X |
+>
+cursor: (4,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: origin=true
+region: 2..=4
+
+### DECOM13_hpa_cha_unaffected_without_left_margin
+size: 6x10
+step: feed \x1b[3;5r\x1b[?6h\x1b[2;2H\x1b[6`X
+cite: [XT] CASE_HPA charproc.c L3958..L3962 CursorSet(CursorRow, col-1, flags): col += lft_marg, and lft_marg is 0 without DECLRMM (#97), so HPA keeps the column; the row is passed as CursorRow(xw) (origin-relative) so it is unchanged
+note: HPA 6 -> col 5 on the current row (region-relative row 1 = absolute 3). Without left/right margins DECOM has no horizontal effect.
+screen:
+>
+>
+>
+>     X |
+>
+>
+cursor: (3,6)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: origin=true
+region: 2..=4
+
+### DECOM14_cuu_cud_clamp_to_region_regardless_of_decom
+size: 6x10
+step: feed \x1b[3;5r\x1b[4;1H\x1b[9AX\x1b[9BY
+cite: [XT] cursor.c CursorUp: `min = (cur_row < top_marg) ? 0 : top_marg` ; CursorDown: `max = (cur_row > bot_marg) ? max_row : bot_marg` -- no ORIGIN test; this row has DECOM OFF (see DECOM15 for ON)
+note: Cursor starts in the region (row 3): CUU 9 stops at the top margin (2), CUD 9 at the bottom margin (4). X at (2,0), Y at (4,1) (the cursor column is 1 after X). The brief's "CUU/CUD clamp to the region while DECOM is set" is true but incomplete: they clamp the same way when it is not set.
+screen:
+>
+>
+>X
+>
+> Y |
+>
+cursor: (4,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+region: 2..=4
+
+### DECOM15_cuu_cud_same_with_decom_on
+size: 6x10
+step: feed \x1b[3;5r\x1b[?6h\x1b[2;1H\x1b[9AX\x1b[9BY
+cite: [XT] cursor.c CursorUp/CursorDown (no ORIGIN test); region-relative CUP 2;1 -> absolute row 3
+note: Same as DECOM14 but with DECOM on: identical result. Starts at region row 3, CUU stops at the top margin (2), CUD at the bottom margin (4).
+screen:
+>
+>
+>X
+>
+> Y |
+>
+cursor: (4,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: origin=true
+region: 2..=4
+
+### DECOM16_decstbm_homes_to_region_top_when_set
+size: 6x10
+step: feed \x1b[?6h\x1b[3;5rX
+cite: [XT] CASE_DECSTBM -> `CursorSet(screen, 0, 0, xw->flags)` (charproc.c, after set_tb_margins); brief done-item 'DECSTBM homes to the region's top row'; [DEC] DECSTBM.html "cursor is moved to the home position"
+note: With DECOM already set, DECSTBM 3;5 homes to the NEW region's top-left (2,0), not (0,0). Today's set_scroll_region does goto(0,0): this is the line the implementer changes (csi.rs L294 comment).
+screen:
+>
+>
+>X |
+>
+>
+>
+cursor: (2,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: origin=true
+region: 2..=4
+
+### DECOM17_decstbm_invalid_region_ignored_keeps_cursor
+size: 6x10
+step: feed \x1b[3;5r\x1b[?6h\x1b[2;2H\x1b[5;3rX
+cite: existing behaviour csi.rs set_scroll_region (bottom <= top ignored entirely, no home); [XT] CASE_DECSTBM only calls CursorSet when the margins were accepted
+note: Guard row: the empty-region rule from #6 still applies under DECOM; X is written at the unchanged cursor (3,1).
+screen:
+>
+>
+>
+> X |
+>
+>
+cursor: (3,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: origin=true
+region: 2..=4
+
+### DECOM18_ind_ri_nel_unaffected_by_origin
+size: 6x10
+step: feed \x1b[3;5r\x1b[?6h\x1b[2;1H\x1bDX
+cite: [XT] IND/RI/NEL use xtermIndex/RevIndex relative to the margins only; no ORIGIN test in cursor.c
+note: Region-relative row 2 = absolute 3; IND moves to absolute 4 (the bottom margin; no scroll because it started above it); X at (4,0). DECOM changes only absolute addressing.
+screen:
+>
+>
+>
+>
+>X |
+>
+cursor: (4,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: origin=true
+region: 2..=4
+
+### DECOM19_erase_in_display_ignores_origin
+size: 4x6
+step: feed \x1b#8\x1b[2;3r\x1b[?6h\x1b[2J
+cite: [DEC] DECOM.html / esctest decset.py test_DECSET_DECOM docstring "It does not affect the erase in display (ED) function."; [XT] do_erase_display uses absolute rows
+note: ED 2 under DECOM erases the whole screen, not just the region. (DECALN fills with E first; DECSTBM then homes into the region.)
+screen:
+>
+> |
+>
+>
+cursor: (1,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: origin=true
+region: 1..=2
+
+# ----------------------------------------------------------------------------- DECOM x DECSC / DECRC / DECSTR
+
+### DECOM20_decsc_saves_origin_decrc_restores_into_region
+size: 6x10
+step: feed \x1b[3;5r\x1b[?6h\x1b[2;3H\x1b7\x1b[?6l\x1b[1;1H\x1b8X\x1b[1;1HY
+cite: [XT] cursor.c DECSC_FLAGS = ATTRIBUTES|ORIGIN|PROTECTED (L461); CursorSave2 stores flags; CursorRestoreFlags: `if (xw->flags & ORIGIN) CursorSet(screen, sc->row - top_marg, ..., flags)` (L467..L500); esctest save_restore_cursor.py; brief done-item 'DECRC with a saved DECOM-on lands inside the region'
+note: Save at region row 2 col 3 = absolute (3,2) with DECOM on; DECRST 6 and CUP 1;1 move to (0,0); DECRC restores DECOM=on AND the position (3,2): X lands at (3,2). Then CUP 1;1 is region-relative again (DECOM restored on): Y at (2,0). The saved row is stored absolute.
+screen:
+>
+>
+>Y |
+>  X
+>
+>
+cursor: (2,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: origin=true
+region: 2..=4
+
+### DECOM21_decrc_restores_origin_off
+size: 6x10
+step: feed \x1b[2;3H\x1b7\x1b[4;6r\x1b[?6h\x1b8\x1b[1;1HX
+cite: [XT] CursorRestoreFlags clears then sets `flags & DECSC_FLAGS`: saved with ORIGIN off -> ORIGIN off; esctest save_restore_cursor.py test_SaveRestoreCursor_ResetsOriginMode
+note: Saved with DECOM off. Region 4..6 and DECOM on, then DECRC: DECOM is off again, cursor (1,2); CUP 1;1 is therefore ABSOLUTE and X lands at (0,0). The region stays.
+screen:
+>X |
+>
+>
+>
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+region: 3..=5
+
+### DECOM22_decrc_never_saved_clears_origin
+size: 6x10
+step: feed \x1b[3;5r\x1b[?6h\x1b8\x1b[1;1HX
+cite: [XT] CursorRestoreFlags with a zeroed SavedCursor (saved=False, flags=0): resetCharsets, flags &= ~DECSC_FLAGS (ORIGIN cleared), CursorSet(0,0). The initial `screen->sc[]` is zero-initialised -- NOT verified by running xterm; [XT] decset.py/save_restore_cursor.py MoveToHomeWhenNotSaved runs DECSTR first.
+note: DECRC with nothing saved homes AND turns DECOM off (follows from the same clear-then-set). X at absolute (0,0).
+flags: unverified
+screen:
+>X |
+>
+>
+>
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+region: 2..=4
+
+### DECOM23_decrc_restores_pending_wrap_after_cursorset
+size: 6x10
+step: feed \x1b[?6h\x1b[2;10Ha\x1b7\x1b[1;1H\x1b8X
+cite: [XT] CursorRestoreFlags: `screen->do_wrap = sc->wrap_flag; /* after CursorSet/ResetWrap */` (L497); existing SC03 in csi_spec.txt
+note: DECOM does not change the wrap-save rule: the pending wrap is saved and re-armed, so X wraps to (2,0).
+screen:
+>
+>         a\
+>X |
+>
+>
+>
+cursor: (2,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: origin=true
+
+### DECOM24_decsc_not_saving_autowrap_or_insert
+size: 3x10
+step: feed \x1b[?7h\x1b7\x1b[?7l\x1b8\x1b[1;9Habcd
+cite: [XT] DECSC_FLAGS excludes WRAPAROUND and INSERT (cursor.c L461); esctest save_restore_cursor.py test_SaveRestoreCursor_Wrap ("Older versions of xterm did not ... expected terminal xterm: y == 1")
+note: DECAWM is NOT part of the saved state: after DECRC it is still OFF, so 'abcd' from col 9 overwrites the last column: row 0 = 8 blanks + 'a' + 'd'. This is the esctest E_DECRC_saveRestoreCursor_wrap row.
+screen:
+>        ad|
+>
+>
+cursor: (0,9)
+pending_wrap: true
+requests: []
+scrollback: len=0
+modes: auto_wrap=false
+
+### DECOM25_decsc_not_saving_insert_mode
+size: 3x10
+step: feed \x1b[4h\x1b7\x1b[4l\x1b8\x1b[1;1Ha\x1b[1;1Hb
+cite: [XT] DECSC_FLAGS excludes INSERT; esctest save_restore_cursor.py test_SaveRestoreCursor_InsertNotAffected
+note: IRM is still OFF after DECRC, so 'b' overwrites 'a' instead of inserting ('ba'). Needs SM/RM 4 wired (this issue).
+screen:
+>b |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+
+### DECOM26_decstr_resets_origin_before_saved_cursor
+size: 6x10
+step: feed \x1b[3;5r\x1b[?6h\x1b[2;3H\x1b[!p\x1b8\x1b[1;1HX
+cite: [XT] ReallyReset: `bitclr(&xw->flags, ORIGIN)` in the common part (charproc.c L14400) BEFORE the soft path's CursorSave + sc.row=sc.col=0; esctest decset.py test_DECSET_DECOM_SoftReset; csi.rs comment "Reset DECOM before the saved cursor so a DECRC lands on the screen's home"
+note: DECSTR turns DECOM off, resets the region to the full screen and homes the saved cursor with ORIGIN off. DECRC then goes to absolute (0,0) with DECOM off; CUP 1;1 is absolute; X at (0,0).
+screen:
+>X |
+>
+>
+>
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+region: full
+
+### DECOM27_ris_resets_origin
+size: 6x10
+step: feed \x1b[3;5r\x1b[?6h\x1bc\x1b[1;1HX
+cite: [XT] ReallyReset full=True: `xw->flags = xw->initflags` (charproc.c L14510) + common `bitclr(ORIGIN)`
+note: RIS clears DECOM, the region and the screen; X at (0,0).
+screen:
+>X |
+>
+>
+>
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+region: full
+
+### DECOM28_control_decrc_without_decom_after_decsc_in_region
+size: 6x10
+step: feed \x1b[3;5r\x1b[2;3H\x1b7\x1b[1;1H\x1b8X
+flags: control
+cite: [XT] CursorRestoreFlags without ORIGIN: CursorSet(sc->row, sc->col) absolute
+note: DECOM off throughout: DECRC returns to absolute (1,2). Proves DECOM20 differs because of the saved flag, not because of the region.
+screen:
+>
+>  X |
+>
+>
+>
+>
+cursor: (1,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+region: 2..=4
+
+### DECOM29_decrc_clamps_the_saved_row_to_a_shrunk_region
+size: 10x10
+step: feed \x1b[3;8r\x1b[?6h\x1b[4;1H\x1b7\x1b[1;3r\x1b8X
+cite: [XT] cursor.c CursorRestoreFlags: `CursorSet(screen, sc->row - top_marg, sc->col, xw->flags)` with ORIGIN restored: the absolute saved row is clamped to bot_marg; added by the implementer for the #8 critic round
+note: Saved at absolute (5,0) with DECOM on inside region 2..=7; the region then shrinks to 0..=2. DECRC restores DECOM and clamps row 5 to the bottom margin 2: X at (2,0).
+screen:
+>
+>
+>X |
+>
+>
+>
+>
+>
+>
+>
+cursor: (2,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: origin=true
+region: 0..=2
+
+### DECOM30_vpr_is_origin_relative_and_stops_at_the_bottom_margin
+size: 6x10
+step: feed \x1b[3;5r\x1b[?6h\x1b[1eX\x1b[9eY
+cite: [XT] charproc.c CASE_VPR: `CursorSet(screen, CursorRow(xw) + n, CursorCol(xw), xw->flags)`, CursorRow is origin-relative; added by the implementer for the #8 critic round
+note: DECOM homes to (2,0). VPR 1 counts from the top margin: region row 1 = absolute row 3, X there. VPR 9 from region row 1 stops at the bottom margin (row 4): Y at (4,1). Without origin mode VPR would clamp to the screen (VPR07 in csi_spec.txt).
+screen:
+>
+>
+>
+>X
+> Y |
+>
+cursor: (4,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: origin=true
+region: 2..=4
+
+# ----------------------------------------------------------------------------- DECAWM (?7) -- sequence-driven rows; the print behaviour itself is in print_c0_spec.txt B01..B04
+
+### AWM01_decrst7_overwrites_last_column
+size: 3x10
+step: feed \x1b[?7l\x1b[1;9HABC
+cite: [XT] dpmodes srm_DECAWM L7603 `(*func)(&xw->flags, WRAPAROUND)`; dotext L7198 (`if do_wrap { do_wrap=False; if (flags & WRAPAROUND) WrapLine }`); esctest decset.py test_DECSET_DECAWM ("AC")
+note: Row 0 = 8 blanks, 'A' at col 8, 'C' at col 9 (B overwritten). xterm sets do_wrap even with wrap off (L7217 `do_wrap = cur_col < next_col`) -> pending_wrap true, same as print_c0_spec B01. Nothing on row 1.
+screen:
+>        AC|
+>
+>
+cursor: (0,9)
+pending_wrap: true
+requests: []
+scrollback: len=0
+modes: auto_wrap=false
+
+### AWM02_decset7_wraps
+size: 3x10
+step: feed \x1b[?7l\x1b[?7h\x1b[1;9Habc
+cite: [XT] same arms; esctest decset.py test_DECSET_DECAWM first half ("c" on row 2)
+note: Row 0 soft-wrapped after 'ab' at cols 8-9; 'c' at (1,0).
+screen:
+>        ab\
+>c |
+>
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+
+### AWM03_repeat_and_unchanged_other_state
+size: 3x10
+step: feed \x1b[1;9H\x1b[?7h\x1b[?7hab
+cite: [XT] dpmodes has no side effect besides the flag (no cursor move, no ResetWrap, no clear)
+note: DECSET 7 moves nothing: the cursor stays at (0,8) and the following 'ab' land at cols 8,9.
+screen:
+>        ab|
+>
+>
+cursor: (0,9)
+pending_wrap: true
+requests: []
+scrollback: len=0
+modes: default
+
+### AWM04_toggle_does_not_touch_pending_wrap
+size: 3x10
+step: feed \x1b[1;10Ha\x1b[?7l\x1b[?7hb
+cite: [XT] dpmodes DECAWM is the flag only; do_wrap is consumed by the next print (charproc.c L7198..L7217); matches Terminal::set_auto_wrap docs ("Toggling the mode leaves an already pending wrap armed")
+note: DECISION D-AWMPEND. xterm keeps the pending wrap across DECRST 7 / DECSET 7, so 'b' wraps to (1,0). DEC STD 070 p5-139 (quoted by esctest save_restore_cursor.py test_SaveRestoreCursor_Wrap) says resetting DECAWM clears the last-column flag: under that reading 'b' would overwrite col 9. Recommend xterm (keep; zero code, already today's behaviour).
+flags: xterm-quirk decision
+screen:
+>         a\
+>b |
+>
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+
+### AWM05_ris_and_decstr_set_autowrap_on
+size: 3x10
+step: feed \x1b[?7l\x1b[!p\x1b[1;9Habc
+cite: [XT] ReallyReset soft: bitcpy(flags, initflags, WRAPAROUND|REVERSEWRAP|REVERSEWRAP2) (resource autoWrap default true); existing decstr_spec.txt
+note: Both DECSTR and RIS leave DECAWM on. 'c' wraps.
+screen:
+>        ab\
+>c |
+>
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+
+# ----------------------------------------------------------------------------- DECTCEM (?25)
+
+### TCEM01_reset_hides_set_shows_nothing_else
+size: 3x10
+step: feed \x1b[2;4Hab\x1b[?25l
+cite: [XT] dpmodes L7650 `set_bool_mode(screen->cursor_set)`; [DEC] DECTCEM.html
+note: DECRST 25 changes only cursor_visible (Snapshot's CursorState.visible). Cursor position, pending wrap and screen untouched.
+screen:
+>
+>   ab |
+>
+cursor: (1,5)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: cursor_visible=false
+
+### TCEM02_decstr_shows_cursor
+size: 3x10
+step: feed \x1b[?25l\x1b[!p
+cite: [XT] ReallyReset common part: `screen->cursor_set = ON` ("make cursor visible", charproc.c L14378); [DEC] DECSTR.html Table 5-9
+note: DECSTR (and RIS) make the cursor visible again.
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+
+### TCEM03_ris_shows_cursor
+size: 3x10
+step: feed \x1b[?25l\x1bc
+cite: [XT] ReallyReset (common part runs for full too)
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+
+### TCEM04_control_hidden_until_reset
+size: 3x10
+step: feed \x1b[?25l
+flags: control
+cite: as TCEM01
+note: Proves cursor_visible=false is reachable (guards TCEM02/03).
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: cursor_visible=false
+
+# ----------------------------------------------------------------------------- Multi-parameter DECSET/DECRST and unknown modes
+
+### MULTI01_three_modes_in_one_sequence
+size: 3x10
+step: feed \x1b[?25l\x1b[?25;2004;1004h
+cite: [XT] dpmodes: `for (i = 0; i < nparam; ++i) { code = GetParam(i); switch ... }` (charproc.c L7508): every parameter is processed in order; brief row `CSI ? 25 ; 2004 ; 1004 h`
+note: DECSET 25 (shown again), 2004 and 1004 all set by one sequence.
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: bracketed_paste=true focus_events=true
+
+### MULTI02_unknown_mode_in_the_middle_is_skipped
+size: 3x10
+step: feed \x1b[?2004h\x1b[?25;9999;2004l
+cite: [XT] dpmodes `switch` has no default error path for unknown codes: later parameters are still processed; brief row 'unknown mode in the middle'
+note: 9999 is ignored (traced); 25 and 2004 are both reset (2004 was set first) even though 9999 sits between them.
+flags: decision
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: cursor_visible=false
+
+### MULTI03_unknown_mode_alone_changes_nothing
+size: 3x10
+step: feed \x1b[2;3H\x1b[?9999h\x1b[?9999l
+cite: [XT] dpmodes default
+screen:
+>
+>   |
+>
+cursor: (1,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+
+### MULTI04_empty_and_zero_parameters_are_unknown
+size: 3x10
+step: feed \x1b[?h\x1b[?0l\x1b[?;25l
+cite: [XT] GetParam(0) = 0 for an empty list/empty param: code 0 matches no case; `CSI ? ; 25 l` = params [0,25] -> 0 ignored, 25 reset
+note: `CSI ? h` with no parameters is a no-op; `CSI ? ; 25 l` still resets DECTCEM (second parameter). Last sequence hides the cursor.
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: cursor_visible=false
+
+### MULTI05_sm_rm_without_question_mark_are_ansi_modes
+size: 3x10
+step: feed \x1b[25l\x1b[7l\x1b[1049h
+cite: [XT] CASE_SM/CASE_RM -> modes() (ANSI); codes 25/7/1049 are not ANSI modes (only 2,4,12,20 matter), so they are ignored; [CTL] 'CSI Pm h  Set Mode (SM)' lists only 2, 4, 12, 20
+note: Negative row: the `?`-less sequences must NOT reach the DEC private table (cursor stays visible, autowrap on, no alt screen).
+flags: negative
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+
+### MULTI06_private_marker_gt_eq_lt_on_h_l_ignored
+size: 3x10
+step: feed \x1b[>25h\x1b[=25h\x1b[<25l
+cite: [XT] parse table: only `?` is a private marker for SM/RM (CASE_DECSET/DECRST); other markers go to CASE_GROUND_STATE; csi_spec.txt PARSER FACTS (markers arrive as intermediates)
+flags: negative
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+
+### MULTI07_colon_subparameters_reject_decset
+size: 3x10
+step: feed abc\x1b[?25:1049hd
+cite: [XT] charproc.c: only SGR and XTMODKEYS accept colon sub-parameters; any other sequence with one is rejected; added by the implementer for the #8 critic round
+note: CSI ? 25:1049 h is ignored as a whole: no alternate screen, d continues the line.
+flags: negative
+screen:
+>abcd |
+>
+>
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+screen_is: main
+
+### MULTI08_colon_subparameters_reject_sm
+size: 3x10
+step: feed ab\x1b[1;1H\x1b[4:20hX\ncd
+cite: [XT] as MULTI07; added by the implementer for the #8 critic round
+note: CSI 4:20 h sets neither IRM nor LNM: X replaces a, and LF keeps the column, so cd starts at (1,1).
+flags: negative
+screen:
+>Xb
+> cd |
+>
+cursor: (1,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+
+# ----------------------------------------------------------------------------- Alternate screen (47 / 1047 / 1048 / 1049)
+# xterm facts (charproc.c dpmodes L7732..L7771; ToAlternate/FromAlternate L9529..L9560; SwitchBufs L9562):
+#   47   set: ToAlternate(clearFirst=False)      reset: FromAlternate(False)                    -- no clear either way
+#   1047 set: ToAlternate(False)                 reset: `if (whichBuf) ClearScreen; FromAlternate`  -- clears alt on the way OUT
+#   1048 set: CursorSave (DECSC)                 reset: CursorRestore (DECRC)         (only when titeInhibit is off)
+#   1049 set: CursorSave; ToAlternate; ClearScreen   reset: FromAlternate; CursorRestore
+#   ToAlternate/FromAlternate are no-ops when already on / already off the alternate screen, but the OTHER calls in the arm still run:
+#   1049 set on the alt screen still does CursorSave (into the ALT slot, sc[whichBuf]) and ClearScreen; 1049 reset on the main screen
+#   still does CursorRestore (main slot). None of them touches the margins, the cursor position (except 1049-reset's restore),
+#   the pen, or do_wrap (except ClearScreen's ResetWrap). Alt-screen lines are NOT preserved by Tessera's Grid (fresh blank each entry).
+#   kitty (screen.c set_mode_from_const L2056): `if (val && on main) toggle ... else if (!val && on alt) toggle`: strict no-ops when already there; no clear.
+#   Alacritty (term/mod.rs L1946, L2009): same guard; swap_alt() copies the primary cursor to the alt grid and RESETS alt contents on entry,
+#   swaps the kitty keyboard stacks, does not touch the scroll region.
+
+### ALT01_1049_set_enters_alt_blank_cursor_kept
+size: 3x10
+step: feed abc\r\nde\x1b[?1049h
+cite: [XT] charproc.c L7732..L7745 (CursorSave; ToAlternate(True); ClearScreen); esctest decset.py doAltBuftest (cursor must not move on 47/1047; 1049 'moves the cursor on enter' is merely allowed); alacritty swap_alt copies the cursor
+note: Entering keeps the cursor where it was ((1,2)); the alternate screen is blank. Main screen content is stashed.
+screen:
+>
+>   |
+>
+cursor: (1,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: alt_screen=true
+screen_is: alt
+main:
+>abc
+>de
+>
+
+### ALT02_1049_reset_restores_saved_cursor_and_main
+size: 3x10
+step: feed abc\r\nde\x1b[?1049h\x1b[3;5HZZ\x1b[?1049lY
+cite: [XT] L7739 `FromAlternate(xw, False); CursorRestore(xw);` -> cursor from the main slot saved by the 1049 set; esctest doAltBuftest(OPT_ALTBUF_CURSOR, cursorSaved=True)
+note: Alt content ZZ is discarded, main returns, cursor back at (1,2): Y overwrites nothing, continuing 'de' -> 'deY'.
+screen:
+>abc
+>deY |
+>
+cursor: (1,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+screen_is: main
+
+### ALT03_1049_set_again_on_alt_clears_again
+size: 3x10
+step: feed \x1b[?1049hZZ\x1b[?1049h\x1b[3;3H\x1b8
+cite: [XT] L7733..L7736: CursorSave and ClearScreen run unconditionally, only ToAlternate's switch is guarded (L9529). Contrast kitty/alacritty: strict no-op.
+note: DECISION D-ALTREPEAT. xterm clears the alt screen again on a repeated 1049 set (and overwrites the ALT saved-cursor slot with the current position). Brief says 'no-op except the clear (xterm)'. Recommend xterm (cheap, matches the brief). The cursor stays at (0,2). (#8 critic round: CUP 3;3 and DECRC appended, so the overwritten alt slot is asserted: DECRC returns to (0,2), not home.)
+flags: xterm-quirk decision
+screen:
+>   |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: alt_screen=true
+screen_is: alt
+
+### ALT04_1049_reset_on_main_without_enter
+size: 3x10
+step: feed abc\x1b[?1049l
+cite: [XT] L7737..L7741 (reset branch of the 1049 arm): `FromAlternate` is a no-op on main but `CursorRestore` still runs -> cursor from sc[0] (initial: home, never saved) = (0,0); kitty set_mode_from_const L2056 and alacritty L2009 guard on 'currently on alt' and do nothing.
+note: DECISION D-1049MAIN. xterm jumps the cursor to the saved position (home if nothing was saved) and clears DECOM/attributes (DECSC_FLAGS) on a stray 1049 reset. Recommend the kitty/Alacritty behaviour (no-op when not on the alt screen): a stray reset after a crash must not move the cursor. Row shows the RECOMMENDED result; the xterm result is cursor (0,0), same screen.
+flags: decision
+screen:
+>abc |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+screen_is: main
+
+### ALT05_1047_reset_clears_alt_and_does_not_restore_cursor
+size: 3x10
+step: feed abc\x1b[?1047h\x1b[2;4HX\x1b[?1047l
+cite: [XT] L7746..L7757 `if (screen->whichBuf) ClearScreen(xw); FromAlternate(xw, False);` -- no CursorRestore; esctest decset.py test_DECSET_OPT_ALTBUF (altGetsClearedBeforeToMain=True, cursorSaved=False: 'Switch to main. Cursor should not move')
+note: Main screen is back unchanged ('abc'), the cursor STAYS at the alt screen's last position (1,4) instead of the main screen's own (0,3). Tessera's Grid::leave_alt_screen restores the primary cursor/pen/pending wrap: for 47/1047 the Terminal must override that (DECISION D-ALTCUR: capture cursor before leave, goto after; or add a Grid method). 1049 restores via DECRC instead (ALT02).
+flags: xterm-quirk decision
+screen:
+>abc
+>     |
+>
+cursor: (1,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+screen_is: main
+
+### ALT06_1047_set_after_clear_is_blank
+size: 3x10
+step: feed abc\x1b[?1047h\x1b[2;1Hdef\x1b[?1047l\x1b[?1047h
+cite: [XT] same arms; esctest decset.py doAltBuftest final assertion (altGetsClearedBeforeToMain True -> all blank)
+note: The 1047 reset cleared the alt screen, so entering again shows blank. (Also true for Tessera's fresh-alt Grid, so this row passes either way.) Cursor after the reset is wherever the alt left it (1,3); entering keeps it.
+screen:
+>
+>    |
+>
+cursor: (1,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: alt_screen=true
+screen_is: alt
+
+### ALT07_47_reset_keeps_alt_contents_in_xterm
+size: 3x10
+step: feed abc\x1b[?47h\x1b[2;1Hdef\x1b[?47l\x1b[?47h
+cite: [XT] L7759..L7771 srm_ALTBUF: no ClearScreen on either edge; esctest decset.py test_DECSET_ALTBUF (altGetsClearedBeforeToMain=False: 'def' still there on re-entry)
+note: DECISION D-ALT47. xterm keeps the alt buffer's lines between 47 visits, so the second entry shows 'def'. Tessera's Grid::enter_alt_screen always starts blank (stash model; alacritty also resets contents on entry; kitty clears on 1049 only). Row shows the XTERM result; Tessera result is a blank screen. Recommend: accept the divergence (document in ADR 0020; no program relies on stale alt contents because they all clear after entering), and keep esctest E_DECSET_ALTBUF-style rows out of the lifted set.
+note: IMPLEMENTER CORRECTION (#8): the divergence is accepted (ADR 0020), so the row now pins Tessera's result: a blank alternate screen on re-entry, cursor kept at (1,3). xterm would show 'def' on row 1.
+flags: xterm-quirk decision
+screen:
+>
+>    |
+>
+cursor: (1,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: alt_screen=true
+screen_is: alt
+
+### ALT08_scroll_region_survives_screen_switches
+size: 5x10
+step: feed \x1b[2;4r\x1b[?1049h\x1b[?1049l
+cite: [XT] ToAlternate/FromAlternate/SwitchBufs contain no margin code (L9529..L9590); alacritty swap_alt (term/mod.rs L714) does not touch scroll_region; Tessera: Screen stash has no region field
+note: Answer to 'what happens to the scroll region on switching': xterm keeps it (one set of margins for both screens). Region stays 1..=3 after a round trip. (The brief's claim that Alacritty resets: not found in swap_alt; unverified for set_mode paths.)
+screen:
+> |
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+region: 1..=3
+screen_is: main
+
+### ALT09_1048_saves_and_restores_cursor
+size: 3x10
+step: feed \x1b[2;3H\x1b[?1048h\x1b[3;1H\x1b[?1048lX
+cite: [XT] L7915..L7920 CursorSave/CursorRestore under srm_SAVE_CURSOR (only when !titeInhibit); esctest decset.py test_DECSET_SaveRestoreCursor
+note: 1048 is DECSC/DECRC: X at (1,2). It saves the same slot as ESC 7 (and, with DECOM, the origin flag).
+screen:
+>
+>  X |
+>
+cursor: (1,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+
+### ALT10_each_screen_has_its_own_saved_cursor
+size: 8x10
+step: feed \x1b[2;3H\x1b7\x1b[?47h\x1b[6;7H\x1b7\x1b[?47l\x1b8A\x1b[?47h\x1b8B
+cite: [XT] CursorSave/Restore use sc[screen->whichBuf]; esctest save_restore_cursor.py test_SaveRestoreCursor_AltVsMain ('Separate saved cursor in alternate screen versus main screen') -- brief item E_DECRC_saveRestoreCursor_altVsMain
+note: DECISION D-ALTSLOT. Main DECRC returns to (1,2) (A there). Re-entering the alt screen, xterm's alt slot still holds (5,6), so B lands at (5,6). Tessera's Grid::enter_alt_screen gives the alt screen a FRESH saved-cursor slot on every entry (grid.rs L934..L945, documented 'Unlike xterm'), so B would land at (0,0). Recommend: change the Grid to keep the alt screen's saved cursor across entries (an `alt_saved` field outside the stash), so the lifted esctest row passes unchanged. The alternative is to lift only the first half of the esctest row.
+note: IMPLEMENTER CORRECTION (#8): the hand-computed screen showed 'A' on the alternate screen, but A is printed on the MAIN screen (after 47 l) and nothing was ever printed on the alternate one, so in xterm too the alternate screen shows only B. The `main:` rows keep A.
+flags: xterm-quirk decision
+screen:
+>
+>
+>
+>
+>
+>      B |
+>
+>
+cursor: (5,7)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: alt_screen=true
+screen_is: alt
+main:
+>
+>  A
+>
+>
+>
+>
+>
+>
+
+### ALT11_alt_screen_has_no_scrollback
+size: 2x10
+step: feed \x1b[?1049h1\r\n2\r\n3\r\n4
+cite: Tessera Grid alt screen 'without scrollback' (grid.rs L926); [XT] SwitchBufs/ScrnDisownSelection: alternate buffer has no saved lines (screen->savedlines applies to buffer 0 only: `if (screen->whichBuf) no scrollback` in xtermScroll)
+note: Scrolling on the alternate screen never feeds scrollback.
+screen:
+>3
+>4 |
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: alt_screen=true
+screen_is: alt
+
+### ALT12_decstr_stays_on_alt
+size: 3x10
+step: feed \x1b[?1049hZ\x1b[!p
+cite: [XT] ReallyReset soft path has no FromAlternate call (full path only: L14503 FromAlternate(xw, True)); brief done-item 'alt screen ... untouched'
+note: DECSTR keeps the alt screen active and its contents.
+screen:
+>Z |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: alt_screen=true
+screen_is: alt
+
+### ALT13_ris_leaves_alt_and_clears
+size: 3x10
+step: feed main\x1b[?1049hZ\x1bc
+cite: [XT] ReallyReset full: `FromAlternate(xw, True); ClearScreen(xw)` (L14503..L14504)
+note: RIS leaves the alternate screen (clearing it first) and clears the main screen too, cursor home.
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+screen_is: main
+
+### ALT14_1049_reset_with_origin_clamps_into_a_shrunk_region
+size: 12x10
+step: feed \x1b[6;11r\x1b[?6h\x1b[4;1H\x1b[?1049h\x1b[1;3r\x1b[?1049lX
+cite: [XT] 1049 reset = FromAlternate + CursorRestore, which re-applies ORIGIN and clamps the saved row to bot_marg through CursorSet (cursor.c); added by the implementer for the #8 critic round
+note: DECOM on, region 5..=10, cursor at absolute row 8; 1049 h, then the shared region shrinks to 0..=2 on the alternate screen. 1049 l restores origin mode and clamps row 8 into the region: X at (2,0).
+screen:
+>
+>
+>X |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (2,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: origin=true
+region: 0..=2
+screen_is: main
+
+### ALT15_1047_reset_disarms_a_pending_wrap
+size: 3x10
+step: feed \x1b[?1047h\x1b[1;10Ha\x1b[?1047lX
+cite: [XT] 1047 reset: `ClearScreen(xw)` (ResetWrap) before FromAlternate; the cursor stays; added by the implementer for the #8 critic round
+note: 'a' on the alternate screen's last column arms a wrap; the clear before leaving disarms it and the cursor stays at (0,9), so X overwrites column 9 of the main screen instead of wrapping.
+screen:
+>         X|
+>
+>
+cursor: (0,9)
+pending_wrap: true
+requests: []
+scrollback: len=0
+modes: default
+screen_is: main
+
+# ----------------------------------------------------------------------------- DECCOLM (?3) and DECSET 40
+# hand-asserted rows: `requests:` here lists Request::Resize(rows, cols), which the shared parser does not know. Run these through tests/modes.rs by hand.
+# D2' (lead, after the #8 adversarial run): with ?40 set DECCOLM does xterm's clear/home/margin reset and records the mode, and asks
+#   the host with Request::Resize, but never resizes the grid: the view/PTY width is the single source of truth (vttest leaves ?40
+#   set and terminfo is2/rs2 send `CSI ? 3 l`, so a resizing DECCOLM desynced the grid from the window).
+# xterm (charproc.c L7559..L7589, set_column_mode L7463): `if (screen->c132) { ClearScreen unless NOCLEAR_COLM; RequestResize (window op);
+#   set/clear IN132COLUMNS; xterm_ResetDouble; resetMargins (top/bottom AND left/right); CursorSet(0,0,flags) }`. With c132 FALSE (default; ?40 reset) the
+#   whole arm is skipped: no clear, no home, no margin reset, no flag change. ?95 (DECNCSM) is honoured only at vtXX_level >= 5 (xterm default decTerminalID 420 = level 4) so it is ignored.
+#   kitty: DECSET 3 clears + homes (screen_erase_in_display 2 + cursor 1,1) but never resizes; DECRST 3 does nothing but store (screen.c L2044). Alacritty: DECCOLM reports NotSupported and ignores
+#   (term/mod.rs L2085). Ghostty: ignored unless ?40 (`enable_mode_3`); when enabled resizes to 132/80, eraseDisplay(complete), setCursorPos(1,1) (Terminal.zig deccolm).
+
+### COL01_decset3_ignored_without_40
+size: 3x10
+step: feed \x1b[2;3rabc\x1b[?3hX
+cite: [XT] charproc.c L7559 `if (screen->c132)`; esctest decset.py test_DECSET_Allow80To132 case 3 ('Try to enter 132 - should do nothing'); [KT] n/a
+note: Fully ignored: no clear ('abc' stays), no home, region 2;3 stays (DECSTBM homed to (0,0) before 'abc'), no resize, no Request, and Modes.columns_132 stays false (xterm leaves IN132COLUMNS alone).
+screen:
+>abcX |
+>
+>
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+region: 1..=2
+
+### COL02_decrst3_ignored_without_40
+size: 3x10
+step: feed \x1b[?3l\x1b[2;4Hx
+cite: as COL01
+note: DECRST 3 with ?40 off does nothing either: the cursor position set afterwards is the only effect, nothing was cleared.
+screen:
+>
+>   x |
+>
+cursor: (1,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+
+### COL03_decset40_stored
+size: 3x10
+step: feed \x1b[?40h
+cite: [XT] charproc.c srm_132COLS `set_bool_mode(screen->c132)`; esctest Allow80To132
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: allow_column_change=true
+
+### COL04_decset3_with_40_resizes_clears_homes_resets_region
+size: 3x10
+step: feed \x1b[?40h\x1b[2;3rabc\x1b[?3hX
+cite: [XT] L7559..L7576 + set_column_mode L7463..L7470; esctest decset.py test_DECSET_DECCOLM (screen erased, cursor home, margins removed, width 132); brief done-item DECCOLM
+note: HAND-ASSERTED. Grid becomes 3x132 (columns_132=true), screen cleared, region full (0..=2), cursor home so X lands at (0,0) -> cursor (0,1). host_requests: [Resize{rows:3, cols:132}] (xterm: RequestResize only when the width actually changes: `willResize`). Shown screen is the first 10 columns.
+flags: hand-asserted
+note: IMPLEMENTER CORRECTION (D2'): the lead revised D2 after the adversarial run: DECCOLM keeps the grid's width (the window and PTY decide it), so the grid stays as wide as `size:`; the clear, the margin reset, the home, `columns_132` and the Resize request are unchanged. Only the first 10 columns were ever shown here.
+screen:
+>X |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: [Resize(3,132)]
+scrollback: len=0
+modes: allow_column_change=true columns_132=true
+region: full
+
+### COL05_decrst3_with_40_back_to_80
+size: 3x10
+step: feed \x1b[?40h\x1b[?3hab\x1b[?3lX
+cite: [XT] same arm with IsSM() false: j=80; ClearScreen; RequestResize(80); clear IN132COLUMNS
+note: HAND-ASSERTED. DECSET 3 -> 3x132; DECRST 3 -> 3x80 (NOT 10: xterm returns to 80, the DECCOLM width, not the original grid width), cleared, home. X at (0,0). host_requests: [Resize(3,132), Resize(3,80)].
+flags: hand-asserted decision
+note: IMPLEMENTER CORRECTION (D2'): the lead revised D2 after the adversarial run: DECCOLM keeps the grid's width (the window and PTY decide it), so the grid stays as wide as `size:`; the clear, the margin reset, the home, `columns_132` and the Resize request are unchanged. Only the first 10 columns were ever shown here.
+screen:
+>X |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: [Resize(3,132), Resize(3,80)]
+scrollback: len=0
+modes: allow_column_change=true
+
+### COL06_decset3_when_already_132_still_clears_no_request
+size: 3x10
+step: feed \x1b[?40h\x1b[?3hab\x1b[2;4r\x1b[?3h
+cite: [XT] L7560..L7566: `willResize` is false when the width is unchanged, but ClearScreen/set_column_mode still run (outside the willResize test)
+note: HAND-ASSERTED. Second DECSET 3 clears and homes again and resets the region set just before it (CSI 2;4 r, added in the #8 critic round), pushes no second Resize.
+flags: hand-asserted
+note: IMPLEMENTER CORRECTION (D2'): the lead revised D2 after the adversarial run: DECCOLM keeps the grid's width (the window and PTY decide it), so the grid stays as wide as `size:`; the clear, the margin reset, the home, `columns_132` and the Resize request are unchanged. Only the first 10 columns were ever shown here.
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: [Resize(3,132)]
+scrollback: len=0
+modes: allow_column_change=true columns_132=true
+region: full
+
+### COL07_decset3_clears_pending_wrap_keeps_decom
+size: 3x10
+step: feed \x1b[?40h\x1b[?6h\x1b[1;10Ha\x1b[?3hX
+cite: [XT] ClearScreen -> ResetWrap, set_column_mode -> CursorSet(0,0, flags); DECOM (flags&ORIGIN) is not touched by DECCOLM
+note: HAND-ASSERTED. Pending wrap cleared, X at (0,0), origin stays true.
+flags: hand-asserted
+note: IMPLEMENTER CORRECTION (D2'): the lead revised D2 after the adversarial run: DECCOLM keeps the grid's width (the window and PTY decide it), so the grid stays as wide as `size:`; the clear, the margin reset, the home, `columns_132` and the Resize request are unchanged. Only the first 10 columns were ever shown here.
+screen:
+>X |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: [Resize(3,132)]
+scrollback: len=0
+modes: allow_column_change=true columns_132=true origin=true
+
+### COL08_decset3_after_40_reset_is_ignored_again
+size: 3x10
+step: feed \x1b[?40h\x1b[?3h\x1b[?40lab\x1b[?3l
+cite: [XT] the `c132` guard is evaluated per sequence; esctest decset.py Allow80To132 case 4 ('Try to enter 80 - should do nothing' after ?40 reset)
+note: HAND-ASSERTED. With ?40 reset the DECRST 3 does nothing: grid stays 132 wide, 'ab' stays.
+flags: hand-asserted
+note: IMPLEMENTER CORRECTION (D2'): the lead revised D2 after the adversarial run: DECCOLM keeps the grid's width (the window and PTY decide it), so the grid stays as wide as `size:`; the clear, the margin reset, the home, `columns_132` and the Resize request are unchanged. Only the first 10 columns were ever shown here.
+screen:
+>ab |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: [Resize(3,132)]
+scrollback: len=0
+modes: columns_132=true
+
+### COL09_ris_with_132_restores_80_request
+size: 3x10
+step: feed \x1b[?40h\x1b[?3h\x1bc
+cite: [XT] ReallyReset full: `if (screen->c132 && AllowWindowOps && (saveflags & IN132COLUMNS)) RequestResize(MaxRows, 80)` (L14539)
+note: DECISION D-RISCOLS (hand-asserted). xterm asks the window for 80 columns on RIS if it was in 132-column mode. Recommend: RIS resets Modes (columns_132 false, allow_column_change stays whatever xterm does -- see summary table: ?40 is NOT reset by RIS in xterm because it is a resource) and pushes Request::Resize(rows, 80); the grid itself is resized to 80 so the screen matches. Alternatively ignore (host decides). Unverified in running xterm.
+flags: hand-asserted decision unverified
+note: IMPLEMENTER CORRECTION (D2'): the lead revised D2 after the adversarial run: DECCOLM keeps the grid's width (the window and PTY decide it), so the grid stays as wide as `size:`; the clear, the margin reset, the home, `columns_132` and the Resize request are unchanged. Only the first 10 columns were ever shown here.
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: [Resize(3,132), Resize(3,80)]
+scrollback: len=0
+modes: allow_column_change=true
+
+# ----------------------------------------------------------------------------- SM / RM: IRM (4) and LNM (20)
+
+### IRM01_sm4_inserts
+size: 3x10
+step: feed abc\x1b[1;1H\x1b[4hX
+cite: [XT] CASE_SM -> modes(): `case 4: bitset(&xw->flags, INSERT)`; [CTL] 'CSI Pm h  Set Mode (SM): Ps = 4 -> Insert Mode (IRM)'; esctest sm.py test_SM_IRM
+note: Row 0 'Xabc', cursor after X. Replaces the `set insert_mode true` harness seam with the real sequence.
+screen:
+>Xa|bc
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: insert=true
+
+### IRM02_rm4_replaces
+size: 3x10
+step: feed abc\x1b[1;1H\x1b[4h\x1b[4lX
+cite: [XT] modes(): `bitclr(INSERT)`; esctest rm.py
+screen:
+>Xb|c
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+
+### IRM03_sm_multi_param_4_and_20
+size: 3x10
+step: feed \x1b[4;20h
+cite: [XT] modes() loops over all parameters like dpmodes
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: insert=true linefeed_newline=true
+
+### IRM04_unsupported_ansi_modes_ignored
+size: 3x10
+step: feed \x1b[2h\x1b[12h\x1b[2;12l
+cite: [XT] modes() case 2 (KAM: sets keyboard lock; Tessera ignores per lead D8) and 12 (SRM) -- brief D8
+note: KAM/SRM are ignored and traced; nothing else changes (no insert, no linefeed mode).
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+flags: decision
+
+### LNM01_lf_does_cr_when_set
+size: 3x10
+step: feed \x1b[20hab\ncd
+cite: [XT] charproc.c L7419 `(*func)(&xw->flags, LINEFEED)`; CASE_VMOT L3738..L3746 `xtermIndex(xw,1); if (xw->flags & LINEFEED) CarriageReturn(xw);`; esctest sm.py test_SM_LNM; vttest menu 6 (print_c0_spec D5)
+note: LF behaves as CR+LF: 'cd' at the start of row 1.
+screen:
+>ab
+>cd |
+>
+cursor: (1,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: linefeed_newline=true
+
+### LNM02_control_lf_keeps_column_when_reset
+size: 3x10
+step: feed ab\ncd
+flags: control
+cite: [XT] CASE_VMOT without LINEFEED
+note: Without LNM, LF keeps the column: 'cd' at cols 2-3 of row 1.
+screen:
+>ab
+>  cd |
+>
+cursor: (1,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+
+### LNM03_vt_and_ff_also_cr
+size: 3x10
+step: feed \x1b[20hab\x0bc\x0cd
+cite: [XT] CASE_VMOT is shared by LF, VT and FF (L3738); esctest sm.py doLinefeedModeTest(LF, VT, FF)
+note: VT: row 1 col 0 'c'; FF: row 2 col 0 'd'.
+screen:
+>ab
+>c
+>d |
+cursor: (2,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: linefeed_newline=true
+
+### LNM04_ind_and_nel_unaffected
+size: 3x10
+step: feed \x1b[20hab\x1bDc
+cite: [XT] ESC D is CASE_IND -> xtermIndex only (no LINEFEED test); the CR in NEL is unconditional
+note: IND keeps the column even with LNM set: 'c' at col 2 of row 1.
+screen:
+>ab
+>  c |
+>
+cursor: (1,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: linefeed_newline=true
+
+### LNM05_rm20_resets
+size: 3x10
+step: feed \x1b[20h\x1b[20lab\ncd
+cite: [XT] modes() bitclr(LINEFEED)
+screen:
+>ab
+>  cd |
+>
+cursor: (1,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+
+### LNM06_decstr_does_not_reset_lnm
+size: 3x10
+step: feed \x1b[20h\x1b[!pab\ncd
+cite: [XT] ReallyReset soft path clears INSERT INVERSE BOLD BLINK UNDERLINE INVISIBLE only (L14550), LINEFEED is not in the list; [DEC] DECSTR.html Table 5-9 has no LNM row
+note: LNM survives DECSTR (unlike IRM, which DECSTR clears: see IRM05).
+screen:
+>ab
+>cd |
+>
+cursor: (1,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: linefeed_newline=true
+
+### LNM07_ris_resets_lnm
+size: 3x10
+step: feed \x1b[20h\x1bcab\ncd
+cite: [XT] ReallyReset full: `xw->flags = xw->initflags` (LINEFEED is a flag; initial off)
+screen:
+>ab
+>  cd |
+>
+cursor: (1,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+
+### IRM05_decstr_resets_irm_ris_resets_irm
+size: 3x10
+step: feed abc\x1b[1;1H\x1b[4h\x1b[!pX
+cite: [XT] ReallyReset soft: `bitclr(&xw->flags, INSERT | ...)` (L14550); [DEC] DECSTR.html IRM -> Replace
+note: After DECSTR the X overwrites 'a'.
+screen:
+>Xb|c
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+
+# ----------------------------------------------------------------------------- Stored-only modes (no screen effect): hand-asserted table
+# Column legend: mode | set | reset | repeated set | DECSTR (xterm soft) | RIS (xterm full) | source
+# Every row is a script `feed` + `assert Terminal::modes()` (or keyboard_modes()) -- screen unchanged, cursor unchanged.
+#
+#  mode  field                set                       reset                     DECSTR         RIS            source
+#  1     kbd.application_cursor_keys   true            false                     RESET (false)  false          [XT] dpmodes L7509; ReallyReset common: UIntClr(keyboard.flags, MODE_DECCKM|MODE_KAM|MODE_DECKPAM) L14412
+#  66    kbd.application_keypad (DECNKM) true          false                     RESET (false)  false          [XT] dpmodes L7772 `MODE_DECKPAM` -- same flag as ESC = / ESC >. NOT in the issue text: add (one arm).
+#  5     reverse_video      true                       false                     untouched      false          [XT] dpmodes L7590 REVERSE_VIDEO; ReallyReset full `xw->flags = initflags` (L14510)
+#  6     origin             (see DECOM block)          (see DECOM block)         RESET (false)  false          [XT] L7598; L14398
+#  7     auto_wrap          true                       false                     SET (true)     true           [XT] L7603; L14549 bitcpy(initflags)
+#  3     columns_132        (see COL block)            (see COL block)           untouched      false+resize   [XT] L7559; L14537
+#  4(SM) insert             true                       false                     RESET (false)  false          [XT] modes() INSERT; L14550
+#  20(SM) linefeed_newline  true                       false                     untouched      false          [XT] L7419; L14510 initflags
+#  12    cursor_blink       true (only if the blink resource lets it: SettableCursorBlink) false   RESET (false)  false   [XT] dpmodes L7626 srm_ATT610_BLINK `set_bool_mode(screen->cursor_blink_esc)`; ReallyReset common L14382 `cursor_blink_esc = 0`. ADD to the soft_reset list in lib.rs/csi.rs.
+#  25    cursor_visible     true                       false                     SET (true)     true           [XT] L7650; L14378 `cursor_set = ON`
+#  40    allow_column_change true                      false                     untouched      untouched      [XT] L7672 c132 is a RESOURCE, not in flags: ReallyReset never writes it
+#  47    alt_screen         see ALT block              see ALT block             untouched      false (+clear) [XT] L7759
+#  1047  alt_screen         see ALT block              see ALT block             untouched      false (+clear) [XT] L7746
+#  1048  (saved cursor)     DECSC                      DECRC                     untouched      n/a            [XT] L7915
+#  1049  alt_screen         see ALT block              see ALT block             untouched      false (+clear) [XT] L7732
+#  2004  bracketed_paste    true                       false                     untouched      false          [XT] dpmodes L7956 paste_brackets; ReallyReset full L14524 `paste_brackets = OFF`
+#  1004  focus_events       true (nothing is sent)     false                     untouched      false          [XT] L7829 flag only; L14441 `send_focus_pos = OFF`
+#  9     mouse=X10          exclusive tracking         ANY reset of 9/1000/1001/1002/1003 -> None   untouched   None   [XT] L7613 set_mousemode; really_set_mousemode L7432 `send_mouse_pos = enabled ? mode : MOUSE_OFF`
+#  1000  mouse=Normal       "                          "                         untouched      None           [XT] L7807
+#  1001  (hilite; not in MouseTracking) ignore + trace "                         untouched      None           [XT] L7811; recommend NOT modelled (needs the hilite dance with the app)
+#  1002  mouse=Button       "                          "                         untouched      None           [XT] L7815
+#  1003  mouse=AnyMotion    "                          "                         untouched      None           [XT] L7819
+#  1005  mouse_encoding=Utf8   exclusive encoding      only if it names the active one -> Default   untouched   Default   [XT] L7832..L7842 `if (IsSM()) extend_coords = code; else if (extend_coords == code) extend_coords = 0`
+#  1006  mouse_encoding=Sgr    "                       "                         untouched      Default        [XT] same arm
+#  1015  mouse_encoding=Urxvt  "                       "                         untouched      Default        [XT] same arm
+#  1016  mouse_encoding=SgrPixels "                    "                         untouched      Default        [XT] same arm
+#  2026  synchronized_output  true                    false                     see D-2026     see D-2026     [CNT] synchronized-output.md; xterm patch 411 does NOT implement it (no 2026 in charproc.c nor ctlseqs)
+#
+#  CORRECTION to the brief: xterm does NOT apply the 'reset only when it names the active one' rule to the TRACKING modes (9/1000/1002/1003) -- only to the
+#  ENCODING modes (1005/1006/1015/1016). `CSI ? 1000 h CSI ? 1003 h CSI ? 1000 l` leaves xterm with tracking OFF. Alacritty only clears the matching flag
+#  (term/mod.rs L2016..L2023); kitty/WezTerm/Ghostty: unverified. See D-MOUSERESET.
+#
+#  Unknown / ignored with a trace (xterm has them, Tessera does not model them): 2 (DECANM: `CSI ? 2 l` enters VT52 mode in xterm -- DO NOT implement; ignore), 8 DECARM,
+#  10, 13, 14, 18, 19, 30, 35, 38, 41, 42, 44, 45 (#97), 67 DECBKM, 69 DECLRMM (#97), 80 DECSDM, 95 DECNCSM (honoured only at VT510 level), 1001, 1007 (alternate scroll),
+#  1010..1014, 1034..1046, 1050..1061, 2001..2003, 2005..2007, 7727. 1007 note: kitty/WezTerm/Alacritty/iTerm2 implement it (wheel -> arrow keys on the alt screen); it belongs to #12.
+
+### MODE01_set_each_stored_mode_then_reset
+size: 3x10
+step: feed \x1b[?5;12;2004;1004;2026h
+cite: table above
+note: One multi-parameter set of five stored-only modes, then (second step) reset them all. Hand-assert modes() after each step. After the set: reverse_video, cursor_blink, bracketed_paste, focus_events, synchronized_output all true. After `\x1b[?5;12;2004;1004;2026l`: all false.
+flags: hand-asserted
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: reverse_video=true cursor_blink=true bracketed_paste=true focus_events=true synchronized_output=true
+
+### MODE02_decstr_resets_blink_and_keeps_paste_focus_mouse_reverse
+size: 3x10
+step: feed \x1b[?5;12;2004;1004;1000;1006h\x1b[!p
+cite: [XT] ReallyReset soft path (see table): ?12 reset (common part L14378), ?5 ?2004 ?1004 ?1000 ?1006 untouched
+note: HAND-ASSERTED. After DECSTR: cursor_blink=false; reverse_video, bracketed_paste, focus_events, mouse=Normal, mouse_encoding=Sgr all still set.
+flags: hand-asserted
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: reverse_video=true bracketed_paste=true focus_events=true mouse=Normal mouse_encoding=Sgr
+
+### MODE03_ris_resets_every_mode
+size: 3x10
+step: feed \x1b[?5;12;2004;1004;1000;1006;25l\x1b[?6;7l\x1b[4;20h\x1b[?1;66h\x1bc
+cite: [XT] ReallyReset full (L14436..L14547): mouse/focus/paste/flags reset
+note: HAND-ASSERTED. Every field of Modes and KeyboardModes is back to Default (auto_wrap and cursor_visible true). allow_column_change (?40) is a resource and would survive in xterm; recommend RIS resets it too (Modes::default()), documented in ADR 0020.
+flags: hand-asserted decision
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+kbd: default
+
+### MOUSE01_tracking_modes_are_exclusive
+size: 3x10
+step: feed \x1b[?1000h\x1b[?1002h
+cite: [XT] L7807..L7822: each arm calls set_mousemode(mode) = send_mouse_pos := mode (a single enum value, not a bitset)
+note: HAND-ASSERTED. After 1000 then 1002: mouse=Button (1000 is gone). Likewise 9, 1003.
+flags: hand-asserted
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: mouse=Button
+
+### MOUSE02_any_tracking_reset_turns_tracking_off
+size: 3x10
+step: feed \x1b[?1003h\x1b[?1000l
+cite: [XT] L7807 (srm_VT200_MOUSE arm, reached with func=bitclr for DECRST) -> `set_mousemode(VT200_MOUSE)` with IsSM() false -> send_mouse_pos = MOUSE_OFF regardless of the current mode (really_set_mousemode L7432)
+note: DECISION D-MOUSERESET. xterm: tracking OFF although 1003 was the active mode. Alacritty: 1003 stays. Brief says 'like encodings: only clears when it names the active one': that is true for encodings only. Recommend xterm (None); no real program emits a stray `1000l` while another tracking mode is wanted, and xterm is the oracle.
+flags: xterm-quirk decision hand-asserted
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+
+### MOUSE03_encodings_exclusive_reset_matches_only_active
+size: 3x10
+step: feed \x1b[?1006h\x1b[?1015h\x1b[?1006l
+cite: [XT] L7832..L7842: `if (IsSM()) extend_coords = code; else if (extend_coords == code) extend_coords = 0;` and the comment 'a reset is only effective against the matching mode'
+note: Answer to 'what does 1006 l do when 1015 is active': nothing. mouse_encoding stays Urxvt.
+flags: hand-asserted
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: mouse_encoding=Urxvt
+
+### MOUSE04_encoding_reset_of_active_returns_default
+size: 3x10
+step: feed \x1b[?1006h\x1b[?1006l
+cite: [XT] same arm
+flags: hand-asserted
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+
+### MOUSE05_encoding_independent_of_tracking
+size: 3x10
+step: feed \x1b[?1006h\x1b[?1000h\x1b[?1000l
+cite: [XT] extend_coords and send_mouse_pos are separate fields
+note: Resetting the tracking mode leaves the encoding selected (apps set 1006 once and toggle 1000/1002/1003).
+flags: hand-asserted
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: mouse_encoding=Sgr
+
+# ----------------------------------------------------------------------------- Keyboard modes (hand-asserted: keyboard_modes())
+# Format: feed -> expected KeyboardModes {cursor, keypad, mok, kitty}. "default" = {false,false,Disabled,empty}.
+# kitty stack model (kitty/screen.c L2145..L2170, ghostty kitty/key.zig FlagStack): a stack of up to N entries per screen; "current" = top entry, flags 0 when empty.
+#   push v: append (evict the OLDEST when full) ; pop n: remove up to n entries (n >= depth -> empty -> flags 0) ; set: modifies the top entry (creates one if empty).
+#   N: kitty 8 (screen.h L173 `uint8_t main_key_encoding_flags[8], alt_key_encoding_flags[8]`), ghostty 8 (kitty/key.zig `const len = 8`), Alacritty 4096 (term/mod.rs L48).
+#   The kitty DOCS only say "Terminals should limit the size of the stack ... the oldest entry must be evicted" -- no number is documented. See D-STACKDEPTH.
+
+### KBD01_deckpam_deckpnm
+size: 3x10
+step: feed \x1b=
+cite: [XT] CASE_DECKPAM L4926 `MODE_DECKPAM`; ESC > = CASE_DECKPNM L4933; [CTL] 'ESC =  Application Keypad (DECKPAM)', 'ESC >  Normal Keypad (DECKPNM)'
+note: kbd: keypad=true. Then `\x1b>` -> false. `\x1b[?66h` / `\x1b[?66l` toggle the same flag (xterm DECNKM). The screen is unaffected.
+flags: hand-asserted
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+kbd: application_keypad=true
+
+### KBD02_decckm
+size: 3x10
+step: feed \x1b[?1h
+cite: [XT] dpmodes L7509 MODE_DECCKM; [CTL] 'Ps = 1  -> Application Cursor Keys (DECCKM)'
+flags: hand-asserted
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+kbd: application_cursor_keys=true
+
+### KBD03_decstr_resets_cursor_keys_keypad_mok_kitty
+size: 3x10
+step: feed \x1b[?1h\x1b=\x1b[>4;2m\x1b[>31u\x1b[!p
+cite: [XT] ReallyReset common part L14412 (DECCKM, KAM, DECKPAM cleared), L14420 `modify_now = modify_1st` (modifyOtherKeys back to the resource default); [KT] screen.c do_screen_reset (called by screen_soft_reset) memsets BOTH key encoding stacks
+note: All of KeyboardModes back to default. Whether DECSTR resets the kitty stacks is NOT in the kitty protocol doc; kitty's code does (both stacks), xterm has no such protocol. Recommend reset (brief agrees). Ghostty: unverified.
+flags: hand-asserted decision
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+kbd: default
+
+### KBD04_modify_other_keys_levels
+size: 3x10
+step: feed \x1b[>4;1m
+cite: [XT] CASE_SET_MOD_FKEYS L6343 -> set_mod_fkeys(4, Pv): `modify_now.other_keys = what`; [CTL] 'CSI > Pp ; Pv m ... Pp = 4 -> modifyOtherKeys'
+note: kbd: mok=Level1. `\x1b[>4;2m` -> Level2; `\x1b[>4;0m` -> Disabled; `\x1b[>4m` (no Pv) and `\x1b[>m` (no params) -> reset to the resource default = Disabled (L2382 `(what == DEFAULT) && enabled ? modify_1st : what`; no-param form loops Pp 1..5, L6360). Other Pp (0,1,2,3,6,7) are accepted by xterm for other resources and ignored here. DECISION D-MOKRANGE: Pv > 2 -> recommend ignore (xterm stores any int; Tessera's enum has 3 levels).
+flags: hand-asserted decision
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+kbd: modify_other_keys=Level1
+
+### KBD05_modify_other_keys_reset_forms
+size: 3x10
+step: feed \x1b[>4;2m\x1b[>4m
+cite: [XT] as KBD04
+note: HAND-ASSERTED. After the second sequence mok=Disabled. Same with `\x1b[>m`. A `CSI > 4 ; 2 m` followed by `CSI > 0 m` (modifyKeyboard, Pp=0) must NOT touch mok.
+flags: hand-asserted
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+kbd: default
+
+# Kitty keyboard stack. Script, expected kitty_flags (bits: 1 disambiguate, 2 event types, 4 alternate keys, 8 all keys as escape codes, 16 associated text)
+#  id                       script                                                   expected flags   source
+#  KITTY01_push             CSI > 1 u                                                 1                [KT-doc] 'CSI > flags u  # for push'
+#  KITTY02_push_default     CSI > u                                                   0 (depth 1)      [KT-doc] 'if flags omitted default to zero'; kitty vt-parser L1397 CALL_CSI_HANDLER1(push, 0); ghostty stream.zig L2679
+#  KITTY03_push_push_pop    CSI > 1 u CSI > 3 u CSI < u                               1                [KT-doc] pop defaults to 1
+#  KITTY04_pop_empty        CSI < u                                                   0                [KT-doc] 'If a pop request is received that empties the stack, all flags are reset'
+#  KITTY05_pop_99           CSI > 1 u CSI > 2 u CSI < 99 u                            0 (stack empty)  [KT-doc]; kitty screen_pop_key_encoding_flags L2162 (loop stops when no active entry); ghostty FlagStack.pop (n >= len resets)
+#  KITTY06_pop_0            CSI > 1 u CSI > 2 u CSI < 0 u                             2 (no-op)        kitty L2163 `num && ...` pops nothing for 0; ghostty stream.zig L2687 passes 0 -> pop(0). DECISION D-POP0: recommend no-op (NOT 'default 1'): both reference implementations pop nothing.
+#  KITTY07_set_replace      CSI = 5 u                                                 5                [KT-doc] mode 1 default: 'all set bits are set and all unset bits are reset'
+#  KITTY08_set_or           CSI = 5 u CSI = 2 ; 2 u                                   7                [KT-doc] mode 2
+#  KITTY09_set_andnot       CSI = 7 u CSI = 2 ; 3 u                                   5                [KT-doc] mode 3
+#  KITTY10_set_no_params    CSI = 7 u CSI = u                                         0                kitty vt-parser L1393 CALL_CSI_HANDLER2(set, 0, 1): flags default 0, mode default 1 -> replace with 0
+#  KITTY11_set_bad_mode     CSI = 7 u CSI = 1 ; 4 u                                   7 (ignored)      kitty screen_set_key_encoding_flags handles how 1,2,3 only; ghostty logs 'invalid setKittyKeyboard command'
+#  KITTY12_set_modifies_top CSI > 1 u CSI = 3 ; 2 u CSI < u                           0                kitty screen_set_key_encoding_flags: set edits the top entry (index 0 when the stack is empty); popping it empties the stack
+#  KITTY13_mask_bits        CSI > 255 u                                               31 (0x1f)        brief ('flags outside bits 0-4 are masked'); kitty masks `val & 0x7f` (bits 5,6 stored but unused); ghostty IGNORES the whole push when the value does not fit 5 bits. DECISION D-KITTYMASK: recommend mask to 0x1f (brief).
+#  KITTY14_depth_cap        push 1..9 (CSI > n u, n=1..9) then pop 1 eight times       after 9 pushes flags 9; after 8 pops flags 0 AND the oldest (1) was evicted: kitty/ghostty depth 8. With the brief's 32 the 33rd push evicts. Fixture uses depth parameter N: assert eviction at N+1.
+#  KITTY15_per_screen       CSI > 1 u ; CSI ? 1049 h ; (flags 0) ; CSI > 2 u ; (flags 2) ; CSI ? 1049 l   -> flags 1    [KT-doc] 'main and alternate screens ... separate stacks'; kitty screen_toggle_screen_buffer swaps key_encoding_flags pointers and clears neither; alacritty swap_alt swaps the stacks
+#  KITTY16_alt_stack_survives_reentry  CSI ? 1049 h ; CSI > 2 u ; CSI ? 1049 l ; CSI ? 1049 h   -> flags 2 (alt stack kept across visits)   kitty (arrays kept); alacritty inactive stack kept. Tessera's Grid stashes lines but the keyboard stacks live in Terminal state, so this is automatic; do NOT clear the alt stack on 1049 set.
+#  KITTY17_decstr           CSI > 3 u CSI ? 1049 h CSI > 4 u CSI ! p                  main 0, alt 0    kitty do_screen_reset memsets both stacks (also hard reset). Not in the kitty doc.
+#  KITTY18_ris              same then ESC c                                           0 / 0            kitty do_screen_reset; xterm n/a
+#  KITTY19_query_not_here   CSI ? u                                                   no state change  query reply is #10 (`CSI ? flags u`); must not push/pop. Negative.
+#  KITTY20_private_markers  CSI < u / CSI > u / CSI = u / CSI ? u are four different functions; plain `CSI u` (no marker, no params) is SCORC/DECRC (#94) and must NOT touch the stack. `CSI 5 u` with a param and no marker: ignored (kitty vt-parser L1382 requires !num_params for restore).
+#
+#  Not covered by the table: XTMODKEYS Pp != 4 (ignored), `CSI > Pp n` (XTMODKEYS disable; unimplemented, ignore).
+
+### PRIV01_private_4_is_decsclm_not_irm
+size: 3x10
+step: feed abc\x1b[1;1H\x1b[?4hX\x1b[?4l
+cite: [CTL] 'CSI ? Pm h: Ps = 4 -> Smooth (Slow) Scroll (DECSCLM)' vs 'CSI Pm h: Ps = 4 -> Insert Mode (IRM)'; vttest m2_07 sends `ESC [ ? 4 h` and m2_09 `ESC [ ? 4 l`; [XT] dpmodes L7547 srm_DECSCLM only toggles smooth scrolling
+note: NEGATIVE, important: `?4h` must NOT set insert mode (and `?20h` is not LNM, `?12h` is cursor blink not SRM). X overwrites 'a': 'Xbc'.
+flags: negative
+screen:
+>Xb|c
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: default
+
+### PRIV02_ansi_4_is_not_decsclm
+size: 3x10
+step: feed \x1b[4h\x1b[20h
+cite: reverse of PRIV01
+note: Plain `4h`/`20h` must not reach the private table; they set IRM/LNM only (modes: insert, linefeed_newline; cursor_blink etc. untouched).
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+modes: insert=true linefeed_newline=true
+
+# ----------------------------------------------------------------------------- app-core: bracketed paste and focus (table; tests live in tessera-app-core with the fake PTY)
+# Source for wrapper bytes: [CTL] "Bracketed Paste Mode ... ESC [ 2 0 0 ~ / ESC [ 2 0 1 ~" (PASTE_IN_BRACKET ?2004, 'CSI ? 2004 h'), [XT] charproc.c L7955, button.c L2835/L2877.
+#   input event                         modes                 bytes written to the PTY                                     source / note
+#   Paste "hi"                          2004 off              hi                                                           existing behaviour
+#   Paste "hi"                          2004 on               ESC[200~ hi ESC[201~                                         [CTL]; wezterm term/terminalstate/mod.rs L943..L966; alacritty event.rs L1376..L1389; kitty window.py L2412
+#   Paste "a\nb" / "a\r\nb"             2004 off              a CR b                                                       existing sanitize_paste (LF/CRLF -> CR)
+#   Paste "a\nb"                        2004 on               DECISION D-PASTENL. Today's sanitize_paste would give a CR b inside the brackets. wezterm: NewlineCanon::None (text untouched) when bracketed; alacritty: untouched; kitty: untouched; xterm: untouched. Recommend: keep the text's line breaks as LF inside the brackets (apps like vim/zsh treat LF as a real newline in a paste; CR would be interpreted as Enter by some readline setups). Needs a second sanitiser path (`sanitize_paste(text, bracketed)`); unverified how zsh treats CR inside brackets.
+#   Paste "x ESC[201~ y"                2004 on               ESC[200~ x y ESC[201~  (recommended) / ESC[200~ x[201~y ESC[201~ (what today's sanitiser yields)   ESC is a control character; sanitize_paste ALREADY drops every `char::is_control` (ESC, C1 incl. U+009B, DEL, C0 except TAB/CR/LF) so the end marker cannot be forged: the issue's "also strip ESC[201~" is already satisfied for safety. Cosmetic: wezterm strips the WHOLE `ESC[200~`/`ESC[201~` (also when not bracketed), kitty strips `ESC[201~` and `CSI(0x9b)201~` repeatedly, alacritty strips only ESC and ETX (0x03) leaving `[201~`. Recommend a pre-pass removing the full ESC[200~ / ESC[201~ (cheap, nicer text), then the existing control filter.
+#   Paste "a ETX b" (0x03)              2004 on               ETX removed by is_control                                    alacritty strips 0x03 explicitly because some shells end the paste on it; already covered.
+#   Paste "" (empty)                    2004 on               ESC[200~ ESC[201~                                            xterm wraps unconditionally; unverified for others. Recommend wrap (or send nothing); either safe. DECISION left to implementer; fixture asserts the wrapper.
+#   Paste with 2004 toggled mid-flight  the decision uses modes() read under the same lock as the write buffer; a paste sees one consistent value.
+#   Focus(true)                         1004 on               ESC[I                                                        [CTL] 'Ps = 1004 -> Send FocusIn/FocusOut events'; focus reports are CSI I / CSI O
+#   Focus(false)                        1004 on               ESC[O
+#   Focus(true) / Focus(false)          1004 off              (nothing)
+#   DECSET 1004 while the window is focused   -             (nothing)                                                     [XT] charproc.c L7829: the arm only stores the flag; xterm does not report the current state on enable (kitty/WezTerm/alacritty also do not). Answer to the brief's question: no immediate report.
+#   Focus(true) twice                   1004 on               ESC[I once (recommended: report TRANSITIONS only) — xterm reports each X event, which are already transitions; AppKit can deliver duplicates, so de-duplicate in app-core. DECISION D-FOCUSDEDUP.
+#   Focus(true) while 1004 set later    set 1004 after focus   (nothing until the next change)
+
+# ----------------------------------------------------------------------------- 2026 synchronized output
+#   `CSI ? 2026 h` / `CSI ? 2026 l` store Modes.synchronized_output only [CNT]. xterm patch 411 does not implement it; kitty, WezTerm, Alacritty (0.13+: queues, 150 ms), Ghostty, iTerm2, Contour do.
+#   Spec gaps (the Contour write-up is explicitly 'informal'): no timeout value, nothing about set-while-set (idempotent), RIS/DECSTR, alt-screen switch.
+#   DECISION D-2026: recommend RIS and DECSTR both reset it to false (a program that crashed between BSU and ESU must not freeze the screen after `reset`/`tput init`, which send DECSTR);
+#   alt-screen switches leave it alone; the app-core 1 s cap (brief D3) stays the safety net. Unverified against other emulators.
+
+# ----------------------------------------------------------------------------- vttest screens in csi_spec.txt `#### DEFERRED ... -> #8`
+# Evidence: the wave-3 vttest captures (…/scratchpad/wave3/csi/vttest_capture/m*_*.bin, vttest 2.7 20251205) were grepped for DEC private sequences:
+#   m1_02 [?3h | m1_03 [3;21r [?3l x2 [?6h [?6l [r | m1_04 [3;21r [?3h [?6h [?6l [r | m2_03 [?3h [?5h | m2_04 [?3l | m2_05 [?3h [?5l | m2_06 [?3l
+#   m2_07 [12;13r [?4h [?6h | m2_08 [1;24r | m2_09 [12;13r [?4l | m2_10 [1;24r | m2_11 [23;24r | m2_12 [?6l | m2_13 [1;24r [?5l | m2_14 [?5h | m2_15 [?5l | m8_02 [2;23r [?6h [?6l [r | m8_03 [4h [4l | m8_08 [?3h
+#
+#   screen                         verdict with DECCOLM ignored (c132 off)           why
+#   V1S3_autowrap_80col            LIFT                                              needs ?6h/?6l + DECSTBM 3;21; its two ?3l are ignored; ED/cup in the stream clear the screen; expected screen already in the DEFERRED block
+#   V2S4_80col_light_background    LIFT (passes today too)                           stream = ?3l, ED 2, text; ?5h belongs to the PREVIOUS screen (m2_03), DECSCNM is not rendered
+#   V2S6_80col_dark_background     LIFT (passes today too)                           same with ?3l
+#   V2S7_..._region_12_13          LIFT                                              ?6h + ?4h (DECSCLM!, see PRIV01) + DECSTBM; expected screen present
+#   V2S8, V2S9, V2S10, V2S11       LIFT                                              DECOM state carried from m2_07; V2S11 expected screen follows xterm CursorSet(ORIGIN) (csi_spec says tmux disagrees)
+#   V2S14_light_background_prompt  LIFT                                              ?5h is stored only; text 'Light background. Push <RETURN>' identical
+#   V8S2_accordion_original_DECOM  LIFT                                              ?6h, DECSTBM 2;23, [r, ?6l; expected screen present
+#   V1S2, V1S4, V2S3, V2S5, V8S8..V8S14   KEEP DEFERRED                              they send ?3h and expect a 132-column screen. With ?40 off Tessera (like xterm c132=false) ignores it, so the 132-wide drawing lands on 80 columns: NOT text-identical to the existing expected frames. vttest never sends ?40. To lift them later: add a harness step feeding ESC[?40h first and expect 132-column screens (needs `size_after`-style assertion; ~7 wide screens).
+#   V2S13_sgr_pattern              -> #7 (unchanged)   V2S15 -> #112 (SCS) as the brief says
+#   V8S6 (DECDWL)                  not #8: needs double-width lines; re-point to a new issue / leave deferred
+#   menu 6 LNM sub-test            covered by LNM01..LNM04 here; the menu-6 stream is DSR/DA replies (out of scope)
+#
+# ----------------------------------------------------------------------------- esctest `#>` rows
+#   E_DECRC_saveRestoreCursor_altVsMain   LIFT only after D-ALTSLOT (Grid keeps the alt saved-cursor slot) -- see ALT10; second half fails today
+#   E_DECRC_saveRestoreCursor_wrap        LIFT: `DECSET 7; DECSC; DECRST 7; DECRC; CUP(79,1); abcd` -> cursor on row 1 (see DECOM24: with the @set seam replaced by ESC[?7l)
+#   E_DECRC_saveRestoreCursor_insertNotAffected   LIFT (DECOM25) with ESC[4h/ESC[4l
+#   E_DECRC_saveRestoreCursor_resetsOriginMode    STAYS `#>` -> #97: the original uses DECLRMM (CSI ? 69 h) and DECSLRM (CSI 5;7 s); after #93/#94 `CSI s` is SCOSC and would save the cursor, so it can't be lifted adapted without changing the test. The adapted behaviour is DECOM21.
+#   E_VPA_ignoresOriginMode, E_HPA_ignoresOriginMode, E_CUP_respectsOriginMode, E_HVP_respectsOriginMode, E_CHA_respectsOriginMode, E_HPR/VPR_ignoresOriginMode   STAY -> #97 (all set DECLRMM).
+#     NOTE on E_VPA_ignoresOriginMode: xterm's code makes VPA origin-relative (DECOM11); the esctest passes because its assertion reads the cursor back through CPR, which xterm reports origin-relative. Tessera has no CPR yet (#10). Do not lift as a 'VPA ignores DECOM' claim.
+#   E_DECSET_DECOM / _SoftReset  (decset.py)  need DECLRMM -> #97. E_SM_IRM*, E_SM_LNM, E_DECSET_DECAWM*, E_DECSET_SaveRestoreCursor (1048), E_DECSET_OPT_ALTBUF_CURSOR (1049), E_DECSET_OPT_ALTBUF (1047, needs D-ALTCUR), E_DECSET_ALTBUF (47, D-ALT47 mismatch) are NOT in esctest_spec.txt at all today; the equivalents are IRM01/LNM01/AWM01/ALT09/ALT01..ALT05 here. Lifting them verbatim is optional.
+#   V2S14 lifts as above.
+
+# ----------------------------------------------------------------------------- DECISIONS (recommendation first)
+#   D-VPA         VPA (and HPA/VPR/HPR) go through the same origin-aware positioning as CUP: relative to the region under DECOM (DECOM11/12/13).
+#   D-AWMPEND     DECRST/DECSET 7 does not touch a pending wrap (xterm, today's behaviour; DEC STD 070 p5-139 says reset clears it). AWM04.
+#   D-ALTREPEAT   1049 set while already on alt: clear again + overwrite the alt saved-cursor slot (xterm). kitty/alacritty: strict no-op. ALT03.
+#   D-1049MAIN    1049 reset while on main: NO-OP (kitty/alacritty), deviating from xterm (jumps to the saved/home position and clears DECOM/attrs). ALT04.
+#   D-ALTCUR      47/1047 leave: cursor, pen and pending wrap stay as they were on the alt screen (xterm, esctest 'cursor should not move'); Grid::leave_alt_screen restores the primary's, so the Terminal must re-apply (or a Grid variant). 1049 restores via DECRC. ALT05.
+#   D-ALT47       47 does not preserve alt contents across visits in Tessera (fresh blank each entry; alacritty does the same): documented divergence from xterm. ALT07.
+#   D-ALTSLOT     Grid keeps the alternate screen's saved cursor across entries (xterm), so E_DECRC_..._altVsMain passes. ALT10.
+#   D-MOUSERESET  Reset of ANY tracking mode (9/1000/1002/1003) -> MouseTracking::None (xterm); encodings reset only when naming the active one. The brief's wording applies to encodings only. MOUSE02/03.
+#   D-STACKDEPTH  Kitty stack depth: kitty and Ghostty use 8 (source, not documented; Alacritty 4096). Lead D6 says 'use kitty's number': recommend 8, not the brief's 32.
+#   D-KITTYMASK   Mask flags to 0x1f (brief). kitty masks 0x7f; Ghostty rejects the whole command above 31. KITTY13.
+#   D-POP0        `CSI < 0 u` pops nothing (kitty and Ghostty); `CSI < u` pops 1; `CSI < 99 u` empties the stack and leaves flags 0. KITTY05/06.
+#   D-MOKRANGE    `CSI > 4 ; Pv m` with Pv > 2: ignore. `CSI > 4 m` and `CSI > m` reset to Disabled. KBD04/05.
+#   D-RISCOLS     RIS in 132-column mode: resize back to 80 and push Request::Resize(rows, 80) (xterm RequestResize); or leave to the host. COL09 (unverified).
+#   D-2026        RIS and DECSTR reset ?2026 (spec silent).
+#   D-PASTENL     Under 2004 keep line breaks as-is (all four reference emulators); today's sanitiser converts them to CR. Needs the lead's call; changes current behaviour.
+#   D-FOCUSDEDUP  Report focus transitions only; setting ?1004 sends nothing.
+#   ADD to scope:  ?66 (DECNKM = DECKPAM flag, xterm), ?12 reset by DECSTR, a negative test that `CSI ? 4 h` is not IRM (PRIV01), DECSTR/RIS also reset the soft items listed in the DECSTR table above, `CSI ? 2 l` (VT52) must stay ignored.
