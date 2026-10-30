@@ -5,8 +5,10 @@
 //! and Tessera's own scripts send it, or kitty's `kitty-shell-cwd://<host><raw
 //! path>`. [`parse_osc7`] decodes either into a [`Cwd`]. It judges the path
 //! (it must be absolute, decode to UTF-8 without control characters and have
-//! no `..` segment) but not the host: deciding whether a host is this machine
-//! is the terminal's job (#9), so the host comes back as sent.
+//! no `..` segment) but not the host, which comes back as sent: a report from
+//! another machine (a shell over `ssh`) is still a valid report, and
+//! [`Cwd::is_local`] lets a consumer that needs a local directory (a new tab
+//! in the same directory) require one (ADR 0022).
 
 /// Longest OSC 7 payload [`parse_osc7`] accepts, in bytes.
 ///
@@ -24,6 +26,35 @@ pub struct Cwd {
     pub host: String,
     /// The decoded absolute path.
     pub path: String,
+}
+
+impl Cwd {
+    /// Whether the report names this machine, given its host name
+    /// (`hostname`, `$HOST`): the host is empty (`file:///path`, RFC 8089),
+    /// `localhost`, or `local_hostname`. Names compare ignoring ASCII case
+    /// and a trailing `.`, and a bare name matches the same name with a
+    /// domain (`Mac` matches `Mac.local` and `Mac.lan`; `Mac.home` does not
+    /// match `Mac.lan`), since macOS reports its name with or without the
+    /// network's domain depending on the network.
+    #[must_use]
+    pub fn is_local(&self, local_hostname: &str) -> bool {
+        let host = self.host.trim_end_matches('.');
+        let local = local_hostname.trim_end_matches('.');
+        if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
+            return true;
+        }
+        if local.is_empty() {
+            return false;
+        }
+        if host.eq_ignore_ascii_case(local) {
+            return true;
+        }
+        let first_label = |name: &str| name.split('.').next().unwrap_or_default().to_owned();
+        let bare_matches = |bare: &str, full: &str| {
+            !bare.contains('.') && first_label(full).eq_ignore_ascii_case(bare)
+        };
+        bare_matches(host, local) || bare_matches(local, host)
+    }
 }
 
 /// Decodes an OSC 7 payload (the bytes after `7;`).
@@ -149,6 +180,44 @@ mod tests {
     #[test]
     fn hex_digits_in_either_case() {
         assert_eq!(parse_osc7(b"file://h/caf%c3%a9"), cwd("h", "/café"));
+    }
+
+    #[test]
+    fn is_local_accepts_this_machine_only() {
+        let at = |host: &str| Cwd {
+            host: host.into(),
+            path: "/tmp".into(),
+        };
+        for host in [
+            "",
+            "localhost",
+            "LocalHost",
+            "Mac",
+            "mac",
+            "MAC.local",
+            "Mac.lan",
+            "Mac.",
+        ] {
+            assert!(at(host).is_local("Mac"), "{host:?} vs Mac");
+        }
+        for host in ["", "localhost", "mac.local", "Mac", "mac.local."] {
+            assert!(at(host).is_local("Mac.local"), "{host:?} vs Mac.local");
+        }
+        for host in [
+            "other",
+            "Mac2",
+            "Mac.home",
+            "Macintosh.local",
+            "ac",
+            "[::1]",
+        ] {
+            assert!(!at(host).is_local("Mac.lan"), "{host:?} vs Mac.lan");
+        }
+        assert!(
+            !at("Mac").is_local(""),
+            "an unknown local name matches nothing"
+        );
+        assert!(at("").is_local(""));
     }
 
     #[test]

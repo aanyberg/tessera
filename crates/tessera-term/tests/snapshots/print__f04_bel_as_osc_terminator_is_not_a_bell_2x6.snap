@@ -8,5 +8,5 @@ x |
 cursor: (0,1)
 pending_wrap: false
 auto_wrap: true insert_mode: false
-requests: []
+requests: [SetTitle("title")]
 scrollback: 0

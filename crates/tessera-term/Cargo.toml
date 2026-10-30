@@ -13,6 +13,8 @@ publish.workspace = true
 tessera-vt.workspace = true
 tessera-grid.workspace = true
 tracing.workspace = true
+# OSC 52 clipboard payloads: strict RFC 4648 standard base64 (ADR 0022).
+base64.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

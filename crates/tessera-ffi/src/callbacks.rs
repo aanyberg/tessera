@@ -39,10 +39,10 @@ use tessera_app_core::{SessionEvent, SessionId, SessionObserver};
 ///
 /// # ABI
 ///
-/// Fields are only ever added at the end (`on_appearance_changed` was). A
-/// host compiled against an older header passes a shorter table, which
-/// this core would read past: rebuild the host against the header that
-/// ships with the core it links. Initialise the table with designated
+/// Fields are only ever added at the end (`on_appearance_changed` and
+/// `on_session_clipboard` were). A host compiled against an older header
+/// passes a shorter table, which this core would read past: rebuild the
+/// host against the header that ships with the core it links. Initialise the table with designated
 /// initialisers (C) or every field (Swift), so a new field is `NULL`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -83,6 +83,18 @@ pub struct Callbacks {
     /// `tessera_app_set_callbacks` or `tessera_app_free` from it deadlocks,
     /// since both wait for this call to return.
     pub on_appearance_changed: Option<unsafe extern "C" fn(user_data: *mut c_void, opaque: bool)>,
+    /// The session's program wrote text to the clipboard (OSC 52) and the
+    /// configuration allows it (`[terminal] clipboard_write`, default
+    /// on): the host puts it on the system pasteboard. `text` points to
+    /// `len` bytes of UTF-8, valid only during the call and NOT
+    /// NUL-terminated: the text is passed on exactly as the program sent
+    /// it, so it may contain NUL, ESC and other control characters (paste
+    /// it with bracketed paste, as for any clipboard text). At most 1 MiB.
+    /// Called at most once per chunk of output (the last write wins).
+    /// Programs can never read the clipboard.
+    pub on_session_clipboard: Option<
+        unsafe extern "C" fn(user_data: *mut c_void, session_id: u64, text: *const u8, len: usize),
+    >,
 }
 
 /// Adapts a [`Callbacks`] table to the core's observer trait.
@@ -127,6 +139,13 @@ impl SessionObserver for CallbackObserver {
                     unsafe { callback(user_data, id) };
                 }
             }
+            SessionEvent::Clipboard(text) => {
+                if let Some(callback) = callbacks.on_session_clipboard {
+                    // SAFETY: host contract on `Callbacks`; `text` outlives
+                    // the call and `len` is its length in bytes.
+                    unsafe { callback(user_data, id, text.as_ptr(), text.len()) };
+                }
+            }
             SessionEvent::Exit(status) => {
                 if let Some(callback) = callbacks.on_session_exit {
                     let code = status.code().unwrap_or(-1);
@@ -158,6 +177,18 @@ fn c_string_lossy(text: String) -> CString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The table's C layout: seven pointers, `on_session_clipboard` last,
+    /// right after `on_appearance_changed` (fields are only appended).
+    #[test]
+    fn the_clipboard_callback_is_appended_last() {
+        use std::mem::{offset_of, size_of};
+
+        let pointer = size_of::<*const c_void>();
+        assert_eq!(size_of::<Callbacks>(), 7 * pointer);
+        assert_eq!(offset_of!(Callbacks, on_appearance_changed), 5 * pointer);
+        assert_eq!(offset_of!(Callbacks, on_session_clipboard), 6 * pointer);
+    }
 
     #[test]
     fn interior_nuls_are_removed() {

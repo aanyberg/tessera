@@ -39,11 +39,13 @@
 //!
 //! # Locks
 //!
-//! A session has seven locks: the PTY, the terminal, the outbox, the reader
+//! A session has eight locks: the PTY, the terminal, the outbox, the reader
 //! and writer handles, the input state (focus, scrollback view, last
-//! mouse position) and the delivery lock its reader thread holds around an
-//! observer call (the barrier a close waits on). No code path holds two of
-//! them at once, with one exception: a close made from inside one of the
+//! mouse position), the working directory its shell last reported and the
+//! delivery lock its reader thread holds around an observer call (the
+//! barrier a close waits on). The reader thread also reads the `App`'s
+//! configuration (`Applied`) on its own, for `[terminal] clipboard_write`.
+//! No code path holds two of them at once, with one exception: a close made from inside one of the
 //! session's own observer calls holds that call's delivery lock while it
 //! takes the outbox and PTY locks (`Session::begin_close`). Nothing takes
 //! the delivery lock while holding another session lock, so this cannot
@@ -71,8 +73,10 @@ use std::time::{Duration, Instant};
 
 use tessera_grid::Grid;
 use tessera_pty::{ExitStatus, Pty, PtyError, PtyEvent, PtyEvents, PtySize};
+use tessera_shell_integration::{Cwd, parse_osc7, parse_osc1337, scripts};
 use tessera_term::{CursorStyle, Request, Terminal};
 
+use crate::config_watch::Applied;
 use crate::input::MouseEvent;
 use crate::view::{MAX_VIEW_COLS, MAX_VIEW_ROWS};
 use crate::{ScrollPosition, ScrollTarget};
@@ -154,6 +158,14 @@ pub enum SessionEvent {
     Output,
     /// The child asked for a new window or tab title.
     Title(String),
+    /// The child wrote this text to the clipboard (OSC 52), and
+    /// `[terminal] clipboard_write` allows it: the frontend puts it on the
+    /// system clipboard. Unchanged from what the program sent, control
+    /// characters and NUL included; at most
+    /// [`MAX_CLIPBOARD_BYTES`](tessera_term::MAX_CLIPBOARD_BYTES). Only the
+    /// last write of one chunk of output is reported, since each write
+    /// replaces the previous one.
+    Clipboard(String),
     /// The child rang the bell.
     Bell,
     /// The child exited. This is the last event of a session that was not
@@ -450,6 +462,60 @@ pub(crate) struct Session {
     /// Taken by the reaper when it joins or detaches the thread.
     writer: Mutex<Option<Worker>>,
     input: Mutex<InputState>,
+    /// What the shell integration scripts reported, shared with the reader
+    /// thread.
+    reports: Arc<ShellReports>,
+}
+
+/// What a session's shell integration scripts reported (ADR 0022): its
+/// working directory (OSC 7) and whether a handshake (OSC 1337) with
+/// another protocol version was already logged.
+#[derive(Debug, Default)]
+pub(crate) struct ShellReports {
+    /// The last valid OSC 7 report, host included (D-HOST: a report from
+    /// another machine is kept; [`Cwd::is_local`] tells them apart).
+    cwd: Mutex<Option<Cwd>>,
+    /// Set once a version mismatch was logged: one warning per session.
+    warned: AtomicBool,
+}
+
+impl ShellReports {
+    /// Stores the OSC 7 `payload` as the working directory when
+    /// [`parse_osc7`] accepts it; an invalid report keeps the previous one.
+    fn report_cwd(&self, payload: &[u8]) {
+        if let Some(cwd) = parse_osc7(payload) {
+            *lock(&self.cwd) = Some(cwd);
+        } else {
+            tracing::trace!("invalid OSC 7 working directory ignored");
+        }
+    }
+
+    /// The working directory last reported, if any.
+    pub(crate) fn cwd(&self) -> Option<Cwd> {
+        lock(&self.cwd).clone()
+    }
+
+    /// Checks an OSC 1337 handshake: a script speaking another protocol
+    /// version than [`scripts::PROTOCOL_VERSION`] is logged as a warning,
+    /// once per session. A malformed handshake is ignored.
+    pub(crate) fn handshake(&self, id: SessionId, payload: &[u8]) {
+        let Some(handshake) = parse_osc1337(payload) else {
+            tracing::trace!(session = %id, "malformed shell integration handshake ignored");
+            return;
+        };
+        let expected = scripts::PROTOCOL_VERSION;
+        if handshake.version != expected && !self.warned.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                session = %id,
+                version = handshake.version,
+                expected,
+                shell = %handshake.shell,
+                "the {} shell integration script speaks protocol version {}, Tessera speaks {expected}",
+                handshake.shell,
+                handshake.version,
+            );
+        }
+    }
 }
 
 /// Frontend input waiting for the writer thread, shared with it.
@@ -696,7 +762,12 @@ impl Session {
     /// Wraps a spawned PTY and starts the writer thread for its input and
     /// the reader thread for its events. Both wake `signal` when they end.
     /// The terminal has `cursor` as its default cursor style before the
-    /// reader feeds it the first byte.
+    /// reader feeds it the first byte. The reader reads `applied` for the
+    /// clipboard setting in effect.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one call site, App::attach; each argument is shared state of the App"
+    )]
     pub(crate) fn start(
         id: SessionId,
         pty: Box<dyn Pty>,
@@ -704,6 +775,7 @@ impl Session {
         size: PtySize,
         cursor: CursorStyle,
         observers: ObserverSlot,
+        applied: Arc<Mutex<Applied>>,
         signal: &Arc<Signal>,
     ) -> io::Result<Self> {
         let pty = Arc::new(Mutex::new(pty));
@@ -719,12 +791,15 @@ impl Session {
         };
         let writer = Worker::spawn(format!("tessera-input-{id}"), signal, move || writer.run())?;
         let delivering = Arc::new(Mutex::new(()));
+        let reports = Arc::new(ShellReports::default());
         let pump = Pump {
             id,
             term: Arc::clone(&term),
             muted: Arc::clone(&muted),
             delivering: Arc::clone(&delivering),
             observers,
+            applied,
+            reports: Arc::clone(&reports),
         };
         let reader = match Worker::spawn(format!("tessera-session-{id}"), signal, move || {
             pump.run(&events);
@@ -748,7 +823,13 @@ impl Session {
             outbox,
             writer: Mutex::new(Some(writer)),
             input: Mutex::new(InputState::default()),
+            reports,
         })
+    }
+
+    /// The working directory the session's shell last reported (OSC 7).
+    pub(crate) fn cwd(&self) -> Option<Cwd> {
+        self.reports.cwd()
     }
 
     /// Queues `bytes` (one key, one paste) for the writer thread; never
@@ -1395,6 +1476,11 @@ struct Pump {
     /// See [`Session::delivering`].
     delivering: Arc<Mutex<()>>,
     observers: ObserverSlot,
+    /// The `App`'s configuration, read for `[terminal] clipboard_write`
+    /// whenever a clipboard write arrives, so a change applies at once.
+    applied: Arc<Mutex<Applied>>,
+    /// See [`Session::reports`].
+    reports: Arc<ShellReports>,
 }
 
 impl Pump {
@@ -1421,12 +1507,27 @@ impl Pump {
                         rest = after;
                     }
                     self.deliver(SessionEvent::Output);
-                    for request in requests {
+                    // Each clipboard write replaces the previous one: only
+                    // the chunk's last reaches the observer, so a flood of
+                    // OSC 52 costs one pasteboard write per chunk.
+                    let last_clipboard = requests
+                        .iter()
+                        .rposition(|r| matches!(r, Request::SetClipboard(_)));
+                    for (index, request) in requests.into_iter().enumerate() {
                         match request {
                             Request::Bell => self.deliver(SessionEvent::Bell),
                             Request::SetTitle(title) => self.deliver(SessionEvent::Title(title)),
+                            Request::SetClipboard(text) if Some(index) == last_clipboard => {
+                                self.clipboard(text);
+                            }
+                            Request::SetCwd(payload) => self.reports.report_cwd(&payload),
+                            Request::ShellIntegrationHandshake(payload) => {
+                                self.reports.handshake(self.id, &payload);
+                            }
                             // `Request` is non-exhaustive; requests this
-                            // layer does not route yet are dropped.
+                            // layer does not route (DECCOLM's resize, an
+                            // earlier clipboard write of the chunk) are
+                            // dropped.
                             _ => {}
                         }
                     }
@@ -1436,6 +1537,17 @@ impl Pump {
                     break;
                 }
             }
+        }
+    }
+
+    /// Delivers a clipboard write when `[terminal] clipboard_write` allows
+    /// it now.
+    fn clipboard(&self, text: String) {
+        let allowed = lock(&self.applied).config.terminal.clipboard_write;
+        if allowed {
+            self.deliver(SessionEvent::Clipboard(text));
+        } else {
+            tracing::debug!(session = %self.id, "clipboard write refused by clipboard_write = false");
         }
     }
 
@@ -2305,5 +2417,249 @@ mod tests {
             failures.extend(misses);
         }
         assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// Output `bytes` followed by a bell, then every event up to that bell
+    /// (the bell is how a test knows the pump is done with the bytes).
+    fn pump_until_bell(
+        tx: &SyncSender<PtyEvent>,
+        events: &Receiver<SessionEvent>,
+        bytes: &[u8],
+    ) -> Vec<SessionEvent> {
+        let mut bytes = bytes.to_vec();
+        bytes.push(0x07);
+        tx.send(PtyEvent::Output(bytes)).expect("reader alive");
+        let mut seen = Vec::new();
+        loop {
+            let event = events
+                .recv_timeout(Duration::from_secs(5))
+                .expect("events up to the bell");
+            if event == SessionEvent::Bell {
+                return seen;
+            }
+            seen.push(event);
+        }
+    }
+
+    fn with_clipboard_write(on: bool) -> Config {
+        let mut config = Config::default();
+        config.terminal.clipboard_write = on;
+        config
+    }
+
+    /// `osc_spec.txt` L01, L02 and L07: OSC 52 reaches the observer as
+    /// `SessionEvent::Clipboard` only while `[terminal] clipboard_write`
+    /// allows it, and a live `apply_config` switches it both ways; titles
+    /// keep their own event.
+    #[test]
+    fn clipboard_writes_follow_the_live_clipboard_write_setting() {
+        const HELLO: &[u8] = b"\x1b]52;c;aGVsbG8=\x07";
+        let theme = tessera_config::Theme::default();
+        let app = App::new(Config::default(), ConfigPaths::new("/nonexistent/tessera"));
+        let (id, tx, events) = fake_session(&app, PtySize::new(4, 20));
+        assert_eq!(
+            pump_until_bell(&tx, &events, b"\x1b]2;t\x07\x1b]52;c;aGVsbG8=\x07"),
+            [
+                SessionEvent::Output,
+                SessionEvent::Title("t".into()),
+                SessionEvent::Clipboard("hello".into())
+            ],
+            "L01, L07"
+        );
+        app.apply_config(&with_clipboard_write(false), &theme);
+        assert_eq!(
+            pump_until_bell(&tx, &events, HELLO),
+            [SessionEvent::Output],
+            "L02 off"
+        );
+        app.apply_config(&with_clipboard_write(true), &theme);
+        assert_eq!(
+            pump_until_bell(&tx, &events, HELLO),
+            [
+                SessionEvent::Output,
+                SessionEvent::Clipboard("hello".into())
+            ],
+            "L02 on again"
+        );
+        app.close_session(id).expect("close");
+
+        // Off from the start.
+        let app = App::new(
+            with_clipboard_write(false),
+            ConfigPaths::new("/nonexistent/tessera"),
+        );
+        let (id, tx, events) = fake_session(&app, PtySize::new(4, 20));
+        assert_eq!(pump_until_bell(&tx, &events, HELLO), [SessionEvent::Output]);
+        app.close_session(id).expect("close");
+    }
+
+    /// A chunk with many clipboard writes delivers only its last one: a
+    /// flood of OSC 52 (one per 13 bytes here) costs one observer call per
+    /// chunk, not one per write.
+    #[test]
+    fn a_flood_of_clipboard_writes_delivers_the_last_one_per_chunk() {
+        let app = App::new(Config::default(), ConfigPaths::new("/nonexistent/tessera"));
+        let (id, tx, events) = fake_session(&app, PtySize::new(4, 20));
+        // "one" then 10 000 writes of "x" then "two": 130 kB in one chunk.
+        let mut flood = b"\x1b]52;c;b25l\x07".to_vec();
+        for _ in 0..10_000 {
+            flood.extend_from_slice(b"\x1b]52;c;eA==\x07");
+        }
+        flood.extend_from_slice(b"\x1b]52;c;dHdv\x07");
+        assert_eq!(
+            pump_until_bell(&tx, &events, &flood),
+            [SessionEvent::Output, SessionEvent::Clipboard("two".into())]
+        );
+        app.close_session(id).expect("close");
+    }
+
+    /// `osc_spec.txt` L04 and L05: OSC 7 updates `App::session_cwd`; an
+    /// invalid report keeps the previous value; a report from another host
+    /// is kept with its host (D-HOST); an unknown id is an error.
+    #[test]
+    fn session_cwd_follows_valid_osc_7_reports() {
+        let app = App::new(Config::default(), ConfigPaths::new("/nonexistent/tessera"));
+        let (id, tx, events) = fake_session(&app, PtySize::new(4, 20));
+        assert_eq!(
+            app.session_cwd(id).expect("live"),
+            None,
+            "L05: no report yet"
+        );
+        let unknown = SessionId::from_raw(id.get() + 100);
+        assert!(matches!(
+            app.session_cwd(unknown),
+            Err(crate::Error::SessionNotFound(_))
+        ));
+        let here = Cwd {
+            host: "h".into(),
+            path: "/a b".into(),
+        };
+        assert_eq!(
+            pump_until_bell(&tx, &events, b"\x1b]7;file://h/a%20b\x07"),
+            [SessionEvent::Output],
+            "a report is no event"
+        );
+        assert_eq!(
+            app.session_cwd(id).expect("live"),
+            Some(here.clone()),
+            "L04"
+        );
+        for invalid in [
+            &b"\x1b]7;http://x/tmp\x07"[..],
+            b"\x1b]7;file://h/a%00b\x07",
+            b"\x1b]7;file://h/tmp/../etc\x07",
+            b"\x1b]7;file://h/%2e%2e\x1b\\",
+            b"\x1b]7;\x07",
+        ] {
+            pump_until_bell(&tx, &events, invalid);
+            assert_eq!(
+                app.session_cwd(id).expect("live"),
+                Some(here.clone()),
+                "{invalid:?} keeps the previous report"
+            );
+        }
+        pump_until_bell(&tx, &events, b"\x1b]7;file://elsewhere.example/srv\x07");
+        let remote = app.session_cwd(id).expect("live").expect("a report");
+        assert_eq!(
+            (remote.host.as_str(), remote.path.as_str()),
+            ("elsewhere.example", "/srv")
+        );
+        assert!(!remote.is_local("Mac"), "D-HOST: kept, but not local");
+        app.close_session(id).expect("close");
+        assert!(app.session_cwd(id).is_err(), "closed");
+    }
+
+    /// The level and text of every event a [`Recorder`] saw.
+    type Recorded = Arc<Mutex<Vec<(tracing::Level, String)>>>;
+
+    /// A subscriber recording every event, for the handshake warning.
+    struct Recorder(Recorded);
+
+    impl tracing::Subscriber for Recorder {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Text(String);
+            impl tracing::field::Visit for Text {
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, "{}={value:?} ", field.name());
+                }
+            }
+            let mut text = Text(String::new());
+            event.record(&mut text);
+            lock(&self.0).push((*event.metadata().level(), text.0));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Runs `f` with a [`Recorder`] on this thread; its warnings.
+    fn warnings(f: impl FnOnce()) -> Vec<String> {
+        let recorded = Recorded::default();
+        tracing::subscriber::with_default(Recorder(Arc::clone(&recorded)), f);
+        let events = lock(&recorded).clone();
+        events
+            .into_iter()
+            .filter(|(level, _)| *level == tracing::Level::WARN)
+            .map(|(_, text)| text)
+            .collect()
+    }
+
+    /// `osc_spec.txt` L06: a handshake with another protocol version logs one
+    /// warning per session naming both versions; version 1 and malformed
+    /// handshakes (P1337-04..12) log nothing.
+    #[test]
+    fn a_mismatched_handshake_warns_once_per_session() {
+        let id = SessionId::from_raw(7);
+        let reports = ShellReports::default();
+        let logged = warnings(|| {
+            reports.handshake(id, b"ShellIntegrationVersion=1;shell=zsh");
+            reports.handshake(id, b"ShellIntegrationVersion=1x;shell=zsh");
+            reports.handshake(id, b"ShellIntegrationVersion=2");
+            reports.handshake(id, b"SetUserVar=a=b");
+        });
+        assert_eq!(
+            logged,
+            Vec::<String>::new(),
+            "matching or malformed: no warning"
+        );
+        let logged = warnings(|| {
+            reports.handshake(id, b"ShellIntegrationVersion=2;shell=zsh");
+            reports.handshake(id, b"ShellIntegrationVersion=18;shell=zsh");
+        });
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        let warning = &logged[0];
+        for part in ["version 2", "speaks 1", "session=7", "zsh"] {
+            assert!(warning.contains(part), "{part:?} in {warning}");
+        }
+        assert_eq!(reports.cwd(), None, "nothing else changes");
+        let other = ShellReports::default();
+        let logged = warnings(|| other.handshake(id, b"ShellIntegrationVersion=18;shell=bash"));
+        assert_eq!(logged.len(), 1, "another session warns again: {logged:?}");
+    }
+
+    /// Through the pump, a handshake is no event and leaves the screen
+    /// alone.
+    #[test]
+    fn a_handshake_through_the_pump_is_no_event() {
+        let app = App::new(Config::default(), ConfigPaths::new("/nonexistent/tessera"));
+        let (id, tx, events) = fake_session(&app, PtySize::new(4, 20));
+        let handshake = b"\x1b]1337;ShellIntegrationVersion=2;shell=zsh\x07";
+        assert_eq!(
+            pump_until_bell(&tx, &events, handshake),
+            [SessionEvent::Output]
+        );
+        let text = app
+            .with_terminal(id, |term| term.grid().visible_lines()[0].text())
+            .expect("live");
+        assert_eq!(text, "");
+        app.close_session(id).expect("close");
     }
 }

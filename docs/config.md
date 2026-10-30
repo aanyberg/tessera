@@ -79,5 +79,6 @@ Terminal emulation limits and shell integration.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
+| `clipboard_write` | boolean | `true` | Whether programs may write the clipboard (OSC 52, as tmux and Neovim do over `ssh`): up to 1 MiB of text per write. Programs can never read the clipboard. A value that is not `true` or `false` is reported with a warning and the default is used. Applies to every session at once when changed. |
 | `scrollback_lines` | integer | `10000` | Maximum number of scrollback lines kept per pane. |
 | `shell_integration` | one of `"auto"`, `"off"` | `"auto"` | Shell integration for zsh and fish (bash support is to follow): `"auto"` makes the shells Tessera starts load its scripts, which mark prompts and commands and report the working directory; `"off"` starts them unchanged. A session started with `TESSERA_SHELL_INTEGRATION` in its environment is never changed. |

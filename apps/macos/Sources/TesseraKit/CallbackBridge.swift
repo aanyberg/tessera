@@ -1,3 +1,4 @@
+import AppKit
 import Synchronization
 internal import TesseraCore
 
@@ -17,13 +18,14 @@ internal import TesseraCore
 /// read and once per BEL byte, which a program can emit far faster than any
 /// delegate runs (`yes $'\a'`): one `Task` per event would grow the main
 /// queue without bound. Each callback records its event in the session's
-/// pending set (output: a flag; title: the latest value; bell: a flag; exit:
-/// the code and signal) and schedules a delivery only if none is queued for
-/// that session. The delivery takes the whole set and reports it in a fixed
-/// order: output, title, bell, exit. So at most one delivery per session is
-/// queued at any time; a delivery reports what happened since the previous
-/// one; and the exit, the core's last callback for a session, is always
-/// delivered last.
+/// pending set (output: a flag; title and clipboard text: the latest value;
+/// bell: a flag; exit: the code and signal) and schedules a delivery only if
+/// none is queued for that session. The delivery takes the whole set and
+/// reports it in a fixed order: output, title, clipboard, bell, exit. The
+/// clipboard text (OSC 52) goes to ``pasteboard``, not to the delegate. So
+/// at most one delivery per session is queued at any time; a delivery
+/// reports what happened since the previous one; and the exit, the core's
+/// last callback for a session, is always delivered last.
 ///
 /// `on_appearance_changed` (from the core's configuration watch thread) is
 /// coalesced the same way, app-wide: at most one delivery is queued, and it
@@ -31,6 +33,8 @@ internal import TesseraCore
 @MainActor
 final class CallbackBridge {
     weak var delegate: (any TesseraAppDelegate)?
+    /// Where programs' clipboard writes go; tests inject a named pasteboard.
+    var pasteboard = NSPasteboard.general
 
     /// Sessions this application owns, by id: open sessions and exited ones
     /// not yet closed.
@@ -85,6 +89,13 @@ final class CallbackBridge {
             },
             on_appearance_changed: { userData, opaque in
                 CallbackBridge.from(userData)?.receiveAppearance(opaque: opaque)
+            },
+            on_session_clipboard: { userData, id, text, len in
+                // `text` (UTF-8, may hold NUL) is valid only during this call.
+                // Empty text never touches the clipboard (ADR 0022).
+                guard let text, len > 0 else { return }
+                let copy = String(decoding: UnsafeBufferPointer(start: text, count: len), as: UTF8.self)
+                CallbackBridge.from(userData)?.receive(for: id) { $0.clipboard = copy }
             }
         )
     }
@@ -100,6 +111,7 @@ final class CallbackBridge {
     private struct Pending: Sendable {
         var output = false
         var title: String?
+        var clipboard: String?
         var bell = false
         var exit: (code: Int32, signal: Int32)?
     }
@@ -158,6 +170,10 @@ final class CallbackBridge {
         }
         if let title = events.title, let (delegate, session) = target() {
             delegate.session(session, didSetTitle: title)
+        }
+        if let text = events.clipboard, !isShutDown, sessions[id] != nil {
+            pasteboard.clearContents()
+            pasteboard.setString(text, forType: .string)
         }
         if events.bell, let (delegate, session) = target() {
             delegate.sessionDidRingBell(session)

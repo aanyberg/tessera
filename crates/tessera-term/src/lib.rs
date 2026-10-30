@@ -4,9 +4,16 @@
 //! terminal mode state (cursor keys, bracketed paste, alternate screen, …).
 //! Bytes in, grid mutations and side-effect requests (bell, title change,
 //! clipboard write) out. The [`keyboard`] module goes the other way: it
-//! encodes key events into the bytes written to the PTY. OSC handlers for
-//! shell integration are delegated to `tessera-shell-integration` so this
-//! crate stays about VT semantics.
+//! encodes key events into the bytes written to the PTY.
+//!
+//! ## OSC
+//!
+//! Operating system commands (ADR 0022): OSC 0 and 2 set the title, OSC 52
+//! writes the clipboard (never read), OSC 133 puts prompt marks on the
+//! grid's lines, and OSC 7 (working directory) and the OSC 1337 shell
+//! integration handshake are forwarded raw as [`Request`]s for the host to
+//! parse with `tessera-shell-integration`, which this crate does not depend
+//! on. See the `osc` module for the caps and the rules.
 //!
 //! ## DECSTR
 //!
@@ -43,9 +50,9 @@
 //!
 //! KAM is not modelled (SM 2 is ignored), so it has nothing to reset.
 //! Still waiting on state that does not exist yet (`// #112, #95, #97,
-//! #9` in `soft_reset`): the character sets G0-G3/GL/GR (SCS, #112),
+//! #10` in `soft_reset`): the character sets G0-G3/GL/GR (SCS, #112),
 //! DECSCA (#95), DECLRMM and reverse wrap (#97) and the ANSI palette
-//! (colours set with OSC 4) back to the theme (#9).
+//! (colours set with OSC 4) back to the theme (#10).
 //!
 //! DECSCL (`CSI 61..65 ; Pc " p`, select conformance level) runs the same
 //! soft reset and then records the level ([`Terminal::conformance_level`])
@@ -60,6 +67,7 @@ mod csi;
 mod esc;
 pub mod keyboard;
 mod modes;
+mod osc;
 mod sgr;
 
 pub use keyboard::{
@@ -74,14 +82,46 @@ use tessera_grid::{Cell, Grid};
 use tessera_vt::{Action, Parser};
 use tracing::trace;
 
+/// Longest window title an OSC 0 or OSC 2 may set, in bytes of payload as
+/// received (before invalid UTF-8 is replaced and control characters are
+/// removed). A longer title is ignored whole, not truncated, as xterm does.
+pub const MAX_TITLE_BYTES: usize = 1024;
+
+/// Most text one OSC 52 may write to the clipboard, in decoded bytes
+/// (1 MiB). A larger write is ignored whole.
+pub const MAX_CLIPBOARD_BYTES: usize = 1 << 20;
+
+/// Longest OSC 7 or OSC 1337 payload the terminal forwards as a
+/// [`Request`], in bytes: `tessera_shell_integration::osc7::MAX_OSC7_LEN`,
+/// so a flood cannot queue megabytes the parser above would refuse anyway.
+pub const MAX_FORWARDED_OSC_BYTES: usize = 4096;
+
 /// Side effects the host must perform on behalf of the terminal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Request {
     /// Ring the bell.
     Bell,
-    /// Set the window or tab title.
+    /// Set the window or tab title (OSC 0 and OSC 2). Empty means "back to
+    /// the default title". Control and bidirectional formatting characters
+    /// are already removed (ADR 0022).
     SetTitle(String),
+    /// Write this text to the system clipboard (OSC 52 with a valid,
+    /// strictly decoded base64 payload of at most [`MAX_CLIPBOARD_BYTES`]).
+    /// The text is passed on unchanged: it may contain NUL, ESC and other
+    /// control characters. Clipboard reads (`?`) are never answered.
+    SetClipboard(String),
+    /// The shell reported its working directory (OSC 7): the raw payload
+    /// after `7;`, at most [`MAX_FORWARDED_OSC_BYTES`] bytes and never
+    /// empty. The terminal does not decode it; `tessera-app-core` parses it
+    /// with `tessera_shell_integration::parse_osc7`.
+    SetCwd(Vec<u8>),
+    /// A shell integration script announced itself (OSC 1337 whose payload
+    /// starts with `ShellIntegrationVersion=`): the raw payload after
+    /// `1337;`, at most [`MAX_FORWARDED_OSC_BYTES`] bytes. Parsed by
+    /// `tessera_shell_integration::parse_osc1337` above this crate. Every
+    /// other OSC 1337 key is ignored.
+    ShellIntegrationHandshake(Vec<u8>),
     /// DECCOLM (DECSET 3, allowed by DECSET 40) or RIS asked for a grid
     /// `rows` × `cols`. The terminal does not resize its grid: the host's
     /// window and PTY decide the width (ADR 0020). A host that can resize
@@ -424,8 +464,8 @@ impl State {
                 byte,
                 ..
             } => self.esc(&intermediates, byte),
+            Action::Osc(params) => self.osc(&params),
             ignored @ (Action::Print(_)
-            | Action::Osc(_)
             | Action::DcsStart { .. }
             | Action::DcsData(_)
             | Action::DcsEnd) => trace!(action = ?ignored, "sequence not applied yet"),

@@ -8,5 +8,5 @@ abcd |
 cursor: (0,4)
 pending_wrap: false
 auto_wrap: true insert_mode: false
-requests: []
+requests: [SetTitle("hi")]
 scrollback: 0

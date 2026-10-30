@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 import Synchronization
 import TesseraCore
 @testable import TesseraKit
@@ -13,12 +13,16 @@ final class CallbackBridgeTests: XCTestCase {
     private var bridge: CallbackBridge!
     private var session: TesseraSession!
     private var recorder: Recorder!
+    private let pasteboard = NSPasteboard(name: NSPasteboard.Name("com.aanyberg.TesseraKitTests.clipboard"))
 
     override func setUp() async throws {
         var raw: OpaquePointer?
         XCTAssertEqual(tessera_app_new(&raw), TESSERA_ERROR_OK)
         core = CoreHandle(try XCTUnwrap(raw))
         bridge = CallbackBridge()
+        // Never the user's clipboard.
+        bridge.pasteboard = pasteboard
+        pasteboard.clearContents()
         recorder = Recorder()
         bridge.delegate = recorder
         session = TesseraSession(id: 7, core: core, bridge: bridge)
@@ -26,6 +30,7 @@ final class CallbackBridgeTests: XCTestCase {
     }
 
     override func tearDown() async throws {
+        pasteboard.releaseGlobally()
         core?.free()
         bridge?.shutDown()
     }
@@ -150,6 +155,52 @@ final class CallbackBridgeTests: XCTestCase {
         let events = try await drained()
         XCTAssertEqual(events, [])
         XCTAssertTrue(bridge.sessions.isEmpty)
+    }
+
+    /// Calls `on_session_clipboard` for session 7 with `text`'s UTF-8 from a
+    /// buffer the caller overwrites as soon as the call returns.
+    private nonisolated static func writeClipboard(_ callbacks: TesseraCallbacks, _ text: String) {
+        var bytes = Array(text.utf8)
+        bytes.withUnsafeBufferPointer { callbacks.on_session_clipboard!(callbacks.user_data, 7, $0.baseAddress, $0.count) }
+        for index in bytes.indices { bytes[index] = 0x58 }
+    }
+
+    func testClipboardLastWriteWinsAndIsCopiedBeforeTheCallbackReturns() async throws {
+        // Kept alive and overwritten after the call: the bridge must have
+        // copied it by then.
+        nonisolated(unsafe) let buffer = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: 5)
+        defer { buffer.deallocate() }
+        onReaderThread { callbacks in
+            CallbackBridgeTests.writeClipboard(callbacks, "one")
+            _ = buffer.initialize(from: "hello".utf8)
+            callbacks.on_session_clipboard!(callbacks.user_data, 7, UnsafePointer(buffer.baseAddress), buffer.count)
+            buffer.update(repeating: 0x58)
+        }
+        _ = try await drained()
+        XCTAssertEqual(pasteboard.string(forType: .string), "hello")
+        XCTAssertEqual(recorder.events[session.id, default: []], [], "not a delegate event")
+    }
+
+    func testClipboardWritesAfterCloseOrShutdownAreDropped() async throws {
+        bridge.unregister(7)
+        onReaderThread { callbacks in CallbackBridgeTests.writeClipboard(callbacks, "closed") }
+        _ = try await drained()
+        XCTAssertNil(pasteboard.string(forType: .string), "closed session")
+        bridge.register(session)
+        onReaderThread { callbacks in CallbackBridgeTests.writeClipboard(callbacks, "late") }
+        bridge.shutDown()
+        _ = try await drained()
+        XCTAssertNil(pasteboard.string(forType: .string), "after shutdown")
+    }
+
+    func testEmptyClipboardTextNeverTouchesThePasteboard() async throws {
+        pasteboard.setString("keep", forType: .string)
+        onReaderThread { callbacks in
+            callbacks.on_session_clipboard!(callbacks.user_data, 7, nil, 0)
+            CallbackBridgeTests.writeClipboard(callbacks, "")
+        }
+        _ = try await drained()
+        XCTAssertEqual(pasteboard.string(forType: .string), "keep")
     }
 
     func testAppearanceChangesReachTheDelegateCoalesced() async throws {

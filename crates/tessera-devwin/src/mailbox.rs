@@ -61,6 +61,9 @@ impl Mailbox {
             SessionEvent::Title(title) => pending.title = Some(title),
             SessionEvent::Bell => pending.bells = pending.bells.saturating_add(1),
             SessionEvent::Exit(status) => pending.exit = Some(status),
+            // The dev window does not touch the system clipboard on a
+            // program's behalf: nothing to wake the event loop for.
+            SessionEvent::Clipboard(_) => return false,
         }
         !std::mem::replace(&mut state.wake_outstanding, true)
     }
