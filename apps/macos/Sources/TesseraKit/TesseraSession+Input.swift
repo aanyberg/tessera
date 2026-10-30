@@ -1,7 +1,8 @@
 internal import TesseraCore
 
 // Swift mirrors of the input structs in TesseraCore.h (ADR 0011) and the
-// `tessera_session_send_*`, `paste` and `set_focus` calls. The header is the
+// `tessera_session_send_*`, `scroll_to`, `scroll_position`, `paste` and
+// `set_focus` calls. The header is the
 // contract: every type here converts to its C struct field for field, and the
 // core validates, routes and encodes the events.
 
@@ -387,6 +388,55 @@ extension TesseraSession {
         }
     }
 
+    /// Where ``scroll(to:)`` moves the view: `TesseraScrollTarget`.
+    /// Offsets count lines above the live screen.
+    public enum ScrollTarget: Sendable, Equatable {
+        /// The oldest line in the scrollback.
+        case top
+        /// The live screen (offset 0), which follows the output.
+        case bottom
+        /// One page towards older output: the screen height less one line
+        /// (at least one line).
+        case pageUp
+        /// One page towards the live screen.
+        case pageDown
+        /// This many lines above the live screen (clamped to the history).
+        case offset(UInt64)
+
+        var cTarget: TesseraScrollTarget {
+            switch self {
+            case .top: TESSERA_SCROLL_TARGET_TOP
+            case .bottom: TESSERA_SCROLL_TARGET_BOTTOM
+            case .pageUp: TESSERA_SCROLL_TARGET_PAGE_UP
+            case .pageDown: TESSERA_SCROLL_TARGET_PAGE_DOWN
+            case .offset: TESSERA_SCROLL_TARGET_OFFSET
+            }
+        }
+
+        /// The C call's `offset` argument, used by ``offset(_:)`` only.
+        var cOffset: UInt64 {
+            if case .offset(let lines) = self { lines } else { 0 }
+        }
+    }
+
+    /// The view's place in the scrollback: `TesseraScrollPosition`.
+    public struct ScrollPosition: Sendable, Equatable {
+        /// Lines the view is scrolled back from the live screen: 0 shows the
+        /// live screen, ``history`` the oldest line.
+        public var offset: UInt64
+        /// Lines of scrollback above the live screen; 0 on the alternate
+        /// screen, which shows no scrollback.
+        public var history: UInt64
+        /// The screen's rows: the view shows this many lines.
+        public var rows: UInt16
+
+        public init(offset: UInt64, history: UInt64, rows: UInt16) {
+            self.offset = offset
+            self.history = history
+            self.rows = rows
+        }
+    }
+
     /// Whether the core used an input event: `TesseraInputOutcome`.
     public enum InputOutcome: Sendable, Equatable {
         /// The core had no use for the event; the frontend may handle it
@@ -472,6 +522,36 @@ extension TesseraSession {
             modifiers: event.modifiers.rawValue)
         try TesseraCoreError.check(tessera_session_send_scroll(core.pointer, id, &cEvent, &outcome))
         return InputOutcome(outcome)
+    }
+
+    /// Moves the view in the scrollback. Every target is clamped to the
+    /// history; on the alternate screen there is no scrollback and the view
+    /// stays live. The next frame draws the new position. A view scrolled
+    /// back keeps showing the same lines while output continues; typing,
+    /// pasting and output that clears the scrollback return it to the live
+    /// screen.
+    ///
+    /// - Throws: ``TesseraCoreError/sessionNotFound`` once closed.
+    @MainActor
+    public func scroll(to target: ScrollTarget) throws {
+        try TesseraCoreError.check(
+            tessera_session_scroll_to(core.pointer, id, target.cTarget.rawValue, target.cOffset))
+    }
+
+    /// The view's position in the scrollback, read in one look at the
+    /// terminal: enough for a scroll bar. Read it once per frame at most,
+    /// not per event. Nothing ties two reads together: output, and the
+    /// resize of a configuration edit (made on a core thread), can change
+    /// the history between them.
+    ///
+    /// - Throws: ``TesseraCoreError/sessionNotFound`` once closed.
+    @MainActor
+    public var scrollPosition: ScrollPosition {
+        get throws {
+            var position = TesseraScrollPosition()
+            try TesseraCoreError.check(tessera_session_scroll_position(core.pointer, id, &position))
+            return ScrollPosition(offset: position.offset, history: position.history, rows: position.rows)
+        }
     }
 
     /// Pastes `text`. The core sanitises it (newlines become CR; ESC, other
