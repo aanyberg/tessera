@@ -44,6 +44,8 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     private(set) var renderCount = 0
     /// Display link callbacks, real or driven by a test.
     private(set) var tickCount = 0
+    /// Attach attempts made, first attach and re-attaches.
+    private(set) var attachAttemptCount = 0
     #if DEBUG
         /// Every key event handed to the session, in order. Debug builds
         /// only (tests): a release build keeps no per-key history.
@@ -329,6 +331,7 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
 
     private func attachSurface() {
         guard !surface.isAttached, window != nil else { return }
+        attachAttemptCount += 1
         lastAttachAttempt = .now
         let size = pixelSize
         do {
@@ -460,8 +463,24 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
             needsRender = true
             updateMarkedTextLayer()
         } catch {
+            guard !reattachIfDropped(error, wasAttached: true) else { return }
             Self.log.error("resizing the surface failed: \(String(describing: error), privacy: .public)")
         }
+    }
+
+    /// Whether `error`, from a surface call made while the surface was
+    /// attached (`wasAttached`), says the core dropped the surface since: a
+    /// lost swapchain or GPU device, which the frame that found it reported
+    /// as `.gpu`. `TesseraSurface` has then let go of it too, and the display
+    /// link attaches it again, whichever call (a resize, a frame, a metrics
+    /// read) noticed first. A view that had no surface (its first attach
+    /// failed) is left alone: that attach is not retried.
+    @discardableResult
+    private func reattachIfDropped(_ error: any Error, wasAttached: Bool) -> Bool {
+        guard wasAttached, error as? TesseraCoreError == .noSurface else { return false }
+        wantsReattach = true
+        needsRender = true
+        return true
     }
 
     /// Tries re-attaching a lost surface again after giving up.
@@ -544,8 +563,7 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         } catch TesseraCoreError.noSurface {
             // The core detached the surface (lost swapchain or GPU device):
             // attach again, on a new device after a device loss.
-            wantsReattach = true
-            needsRender = true
+            reattachIfDropped(TesseraCoreError.noSurface, wasAttached: true)
         } catch {
             // The session is closed; the window closes with it.
             displayLink?.isPaused = true
@@ -898,7 +916,13 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     /// window follows the cursor.
     private func refreshMetrics() {
         let previous = metrics
-        metrics = try? surface.metrics()
+        let wasAttached = surface.isAttached
+        do {
+            metrics = try surface.metrics()
+        } catch {
+            metrics = nil
+            reattachIfDropped(error, wasAttached: wasAttached)
+        }
         guard metrics != previous, hasMarkedText() else { return }
         updateMarkedTextLayer()
         inputContext?.invalidateCharacterCoordinates()
@@ -1138,20 +1162,25 @@ extension TerminalSurfaceView: NSMenuItemValidation {
     /// Zoom applies to this view only (D2); it steps from what the core
     /// reports, so a size it clamped is where the next step starts.
     private func stepFontSize(by step: Float) {
+        let wasAttached = surface.isAttached
         do {
             let current = try surface.metrics().fontSizePt
             setFontSize(current + step)
         } catch {
+            reattachIfDropped(error, wasAttached: wasAttached)
             Self.log.debug("no surface to zoom: \(String(describing: error), privacy: .public)")
         }
     }
 
     private func setFontSize(_ points: Float) {
         let size: Float = min(max(points, Self.fontSizeRange.lowerBound), Self.fontSizeRange.upperBound)
+        let wasAttached = surface.isAttached
         do {
             try surface.setFontSize(size)
         } catch {
-            Self.log.error("font size not set: \(String(describing: error), privacy: .public)")
+            if !reattachIfDropped(error, wasAttached: wasAttached) {
+                Self.log.error("font size not set: \(String(describing: error), privacy: .public)")
+            }
             return
         }
         refreshMetrics()

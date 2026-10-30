@@ -910,6 +910,124 @@ final class TerminalSurfaceViewTests: XCTestCase {
         XCTAssertTrue(view.surface.isAttached, "retried in the new window")
     }
 
+    /// Detaches the view's surface on the core's side only, as a lost
+    /// swapchain or GPU device does (the frame that finds it reports `.gpu`):
+    /// another surface object for the session detaches it, and the view's
+    /// `TesseraSurface` holds its attachment until a call finds it gone.
+    /// Returns that other surface object.
+    private func dropTheSurfaceInTheCore() throws -> TesseraSurface {
+        let rogue = TesseraSurface(session: view.session)
+        try rogue.detach()
+        XCTAssertTrue(view.surface.isAttached, "the view has not noticed yet")
+        return rogue
+    }
+
+    /// The view is attached again, and the core holds its surface: the one
+    /// surface a session can have, so another cannot attach.
+    private func assertReattached(_ rogue: TesseraSurface, _ label: String) {
+        XCTAssertTrue(view.surface.isAttached, "\(label): re-attached")
+        XCTAssertTrue(view.surface.layer === view.metalLayer, "\(label)")
+        XCTAssertNoThrow(try view.surface.metrics(), "\(label): the core has the view's surface")
+        XCTAssertThrowsError(
+            try rogue.attach(layer: CAMetalLayer(), widthPx: 100, heightPx: 100, scale: 1),
+            "\(label): and no other")
+        XCTAssertEqual(view.surface.size, view.pixelSize, "\(label): at the view's current size")
+        XCTAssertNotNil(view.metrics, "\(label): read again")
+        XCTAssertTrue(view.isDisplayLinkPaused, "\(label): drawn, the link idles")
+    }
+
+    /// #140: the core drops the surface, `call` is the first to find it
+    /// gone, and ten display refreshes later the view is attached again.
+    /// Before, only a frame noticing first led to a re-attach; a resize only
+    /// logged, and the view stayed detached and blank until it moved to
+    /// another window.
+    private func assertReattachesAfterADropFoundBy(_ label: String, _ call: () -> Void) throws {
+        try requireSurface()
+        let interval = TerminalSurfaceView.reattachInterval
+        TerminalSurfaceView.reattachInterval = .zero
+        defer { TerminalSurfaceView.reattachInterval = interval }
+        view.occlusionOverride = false
+        view.displayLinkDidFire()
+        let rogue = try dropTheSurfaceInTheCore()
+        call()
+        XCTAssertTrue(
+            view.surface.isAttached || !view.isDisplayLinkPaused,
+            "\(label): re-attached in that tick, or the lost surface wakes the link")
+        for _ in 0..<10 {
+            view.displayLinkDidFire()
+        }
+        assertReattached(rogue, label)
+    }
+
+    private func grow() {
+        view.setFrameSize(NSSize(width: view.frame.width + 40, height: view.frame.height + 20))
+    }
+
+    func testAResizeAfterTheDropWentUnnoticedReattaches() throws {
+        try assertReattachesAfterADropFoundBy("a resize after an idle tick") {
+            view.displayLinkDidFire()  // nothing to draw: the drop goes unnoticed
+            grow()
+        }
+    }
+
+    func testAResizeBeforeAnyTickFindsTheDropAndReattaches() throws {
+        try assertReattachesAfterADropFoundBy("a resize before any tick") { grow() }
+    }
+
+    /// The issue's sequence: the `.gpu` frame left a frame pending, and the
+    /// live resize coalesced into the next tick runs before its render.
+    func testALiveResizeTickWithAFramePendingFindsTheDropAndReattaches() throws {
+        try assertReattachesAfterADropFoundBy("a live-resize tick with a frame pending") {
+            view.viewWillStartLiveResize()
+            view.sessionDidOutput()
+            grow()
+            view.displayLinkDidFire()
+            view.viewDidEndLiveResize()
+        }
+    }
+
+    func testAFrameFindsTheDropAndReattaches() throws {
+        try assertReattachesAfterADropFoundBy("a frame") { view.sessionDidOutput() }
+    }
+
+    func testAReThemesMetricsReadFindsTheDropAndReattaches() throws {
+        try assertReattachesAfterADropFoundBy("a re-theme") { view.applyLayerOpacity(opaque: true) }
+    }
+
+    func testAZoomFindsTheDropAndReattaches() throws {
+        try assertReattachesAfterADropFoundBy("a zoom") { view.increaseFontSize(nil) }
+    }
+
+    /// #140: a core that refuses every re-attach after a resize found the
+    /// surface gone is tried at most once per tick, a few times, and then the
+    /// link idles: no busy spin.
+    func testAReattachTheCoreRefusesAfterAResizeIsTriedOncePerTickThenIdles() throws {
+        try requireSurface()
+        let interval = TerminalSurfaceView.reattachInterval
+        TerminalSurfaceView.reattachInterval = .zero
+        defer { TerminalSurfaceView.reattachInterval = interval }
+        view.occlusionOverride = false
+        view.displayLinkDidFire()
+        let rogue = try dropTheSurfaceInTheCore()
+        let attempts = view.attachAttemptCount
+        view.setFrameSize(NSSize(width: view.frame.width + 40, height: view.frame.height + 20))
+        XCTAssertFalse(view.surface.isAttached, "the resize found the surface gone")
+        XCTAssertEqual(view.attachAttemptCount, attempts, "a resize does not attach by itself")
+        // The session is taken: every re-attach fails.
+        try rogue.attach(layer: CAMetalLayer(), widthPx: 100, heightPx: 100, scale: 1)
+        defer { try? rogue.detach() }
+        var perTick: [Int] = []
+        for _ in 0..<10 {
+            let before = view.attachAttemptCount
+            view.displayLinkDidFire()
+            perTick.append(view.attachAttemptCount - before)
+        }
+        let tries = TerminalSurfaceView.maxReattachFailures
+        XCTAssertEqual(perTick, Array(repeating: 1, count: tries) + Array(repeating: 0, count: 10 - tries))
+        XCTAssertFalse(view.surface.isAttached)
+        XCTAssertTrue(view.isDisplayLinkPaused, "given up: the link idles")
+    }
+
     func testBecomingVisibleRedraws() throws {
         try requireSurface()
         view.occlusionOverride = false
