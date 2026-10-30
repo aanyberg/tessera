@@ -10,10 +10,10 @@ usize_is_size_t = true
 
 [export]
 prefix = "Tessera"
-# Enums that structs carry as fixed-width integers (so C can never hand Rust
-# an invalid discriminant) are not reachable from any signature; list them
-# so their named values reach the header.
-include = ["Key", "KeyEventKind", "Modifiers", "MouseButton", "MouseEventKind"]
+# Enums that structs and arguments carry as fixed-width integers (so C can
+# never hand Rust an invalid discriminant) are not reachable from any
+# signature; list them so their named values reach the header.
+include = ["Key", "KeyEventKind", "Modifiers", "MouseButton", "MouseEventKind", "ScrollTarget"]
 # Constants are `#define`d with C-style names instead of the type prefix.
 renaming_overrides_prefixing = true
 

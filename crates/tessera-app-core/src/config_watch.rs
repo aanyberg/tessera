@@ -880,7 +880,7 @@ mod tests {
         let mut views = lock(&app.views);
         let live = views.get_mut(&session.id).unwrap();
         for view in [&mut *live, &mut fresh] {
-            view.capture(&term);
+            view.capture(&term, 0);
             assert!(view.render(true).is_ok());
         }
         let (live, fresh) = (live.read_back(), fresh.read_back());
@@ -1089,7 +1089,7 @@ mod tests {
             .iter()
             .map(|&id| {
                 let mut snapshot = Snapshot::default();
-                app.with_terminal(id, |term| snapshot.capture(term))
+                app.with_terminal(id, |term| snapshot.capture(term, 0))
                     .unwrap();
                 snapshot
             })
@@ -1099,7 +1099,7 @@ mod tests {
                 .iter()
                 .zip(snapshots.iter_mut())
                 .map(|(&id, snapshot)| {
-                    app.with_terminal(id, |term| snapshot.capture(term))
+                    app.with_terminal(id, |term| snapshot.capture(term, 0))
                         .unwrap()
                 })
                 .collect()

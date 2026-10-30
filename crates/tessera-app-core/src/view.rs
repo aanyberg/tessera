@@ -23,7 +23,10 @@
 //! grid which rows changed since the last capture
 //! ([`Grid::damage_since`]), compares and copies only those into the
 //! snapshot, and adds the rows that really changed to the damage the
-//! next frame draws. `View::render` runs after the lock is released and
+//! next frame draws. A view scrolled back into the scrollback (ADR 0023)
+//! copies the lines at its offset instead, whole when the view moved and
+//! compared otherwise, so output that leaves those lines alone damages
+//! nothing. `View::render` runs after the lock is released and
 //! returns [`FrameStatus::Skipped`] without touching the GPU when nothing
 //! changed since the last presented frame (no damage, same cursor, same
 //! focus, nothing the renderer must redraw on its own), so an idle
@@ -314,7 +317,9 @@ impl Target {
 /// What the last presented frame showed besides the cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Shown {
-    cursor: Point,
+    /// The cursor's cell; `None` while the view is scrolled back and draws
+    /// no cursor.
+    cursor: Option<Point>,
     focused: bool,
 }
 
@@ -543,17 +548,18 @@ impl View {
         self.renderer.theme()
     }
 
-    /// Copies what changed in `term`'s grid since the last capture, and
-    /// whether its cursor is visible (DECTCEM), into the snapshot, and adds
-    /// the rows that changed to the next frame's damage.
+    /// Copies what changed in the rows `term` shows `offset` lines above
+    /// its live screen (see [`Snapshot::capture`]), and whether its cursor
+    /// is visible (DECTCEM), into the snapshot, and adds the rows that
+    /// changed to the next frame's damage.
     ///
     /// This is the only part of a frame that runs under the session's
     /// terminal lock; shaping, drawing and waiting for a drawable happen
-    /// after it is released. It copies only the rows the grid reports
-    /// damaged (comparing them first), so its cost follows the damage,
-    /// not the screen size.
-    pub(crate) fn capture(&mut self, term: &Terminal) {
-        let changed = self.snapshot.capture(term);
+    /// after it is released. It copies only the rows that can have changed
+    /// (comparing them first), so its cost follows the damage and the
+    /// screen size, never the length of the scrollback.
+    pub(crate) fn capture(&mut self, term: &Terminal, offset: usize) {
+        let changed = self.snapshot.capture(term, offset);
         self.pending = self.pending.union(&changed);
     }
 
@@ -568,7 +574,7 @@ impl View {
     /// it to be drawn (a display link does so on its next tick).
     pub(crate) fn render(&mut self, focused: bool) -> Result<FrameStatus, RenderError> {
         let shown = Shown {
-            cursor: self.snapshot.cursor,
+            cursor: self.snapshot.shown_cursor(),
             focused,
         };
         let changed =
@@ -616,6 +622,12 @@ impl View {
         &self.renderer
     }
 
+    /// The last captured snapshot.
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> &Snapshot {
+        &self.snapshot
+    }
+
     /// The last frame of an offscreen view, as RGBA bytes.
     #[cfg(test)]
     pub(crate) fn read_back(&self) -> Vec<u8> {
@@ -626,10 +638,24 @@ impl View {
     }
 }
 
-/// The visible rows, their grapheme clusters and the cursor of a grid,
+/// Which lines a snapshot scrolled back into the history holds (ADR
+/// 0023), to tell a moved view from output arriving under a still one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScrolledAt {
+    /// The top row's line, numbered like [`Grid::scrollback_pushed`]
+    /// (`pushed - offset`, wrapping): the same number on the same grid is
+    /// the same line while no resize re-wraps the history.
+    top: u64,
+    /// [`Grid::scrollback_pushed`] at the capture.
+    pushed: u64,
+    /// [`Grid::scrollback_len`] at the capture.
+    len: usize,
+}
+
+/// The rows in view, their grapheme clusters and the cursor of a grid,
 /// copied so the terminal lock is held only for the copy. The buffers are
-/// reused from frame to frame, and only rows the grid reports damaged are
-/// copied again.
+/// reused from frame to frame, and only rows that can have changed are
+/// compared and copied again.
 #[derive(Debug, Default)]
 pub(crate) struct Snapshot {
     cells: Vec<Cell>,
@@ -647,31 +673,120 @@ pub(crate) struct Snapshot {
     cursor_shape: CursorShape,
     /// The grid generation of the last capture; `None` before the first.
     generation: Option<u64>,
+    /// The history lines the rows hold while the view is scrolled back;
+    /// `None` while they are the live screen.
+    scrolled: Option<ScrolledAt>,
     /// Rows compared by partial captures, for tests.
     #[cfg(test)]
     compared: usize,
 }
 
 impl Snapshot {
-    /// Brings the snapshot up to date with `term`'s visible rows, cursor,
-    /// cursor visibility ([`Modes::cursor_visible`], one copy of the
-    /// terminal's modes) and cursor shape ([`Terminal::cursor_style`]),
-    /// and returns the rows that changed: those whose cells or clusters
-    /// changed (see [`Self::capture_grid`]) and the cursor's row when the
-    /// cursor was shown or hidden or changed shape. A change of the blink
-    /// bit alone damages nothing: blinking is not drawn.
+    /// Brings the snapshot up to date with the rows `term` shows `offset`
+    /// lines above its live screen, its cursor, cursor visibility
+    /// ([`Modes::cursor_visible`], one copy of the terminal's modes) and
+    /// cursor shape ([`Terminal::cursor_style`]), and returns the rows that
+    /// changed.
+    ///
+    /// At offset 0 (and always on the alternate screen, which shows no
+    /// scrollback) the rows are the live screen: those whose cells or
+    /// clusters changed (see [`Self::capture_grid`]) and the cursor's row
+    /// when the cursor was shown or hidden or changed shape. A change of
+    /// the blink bit alone damages nothing: blinking is not drawn.
+    ///
+    /// Above it (`offset` is clamped to the scrollback) the rows are the
+    /// logical lines from `scrollback_len - offset` on: history lines, and
+    /// the top of the live screen below them while `offset` is smaller
+    /// than the screen; the cursor is not drawn, so its changes damage
+    /// nothing. See [`Self::capture_history`].
     ///
     /// [`Modes::cursor_visible`]: tessera_term::Modes::cursor_visible
-    pub(crate) fn capture(&mut self, term: &Terminal) -> DamageRows {
+    pub(crate) fn capture(&mut self, term: &Terminal, offset: usize) -> DamageRows {
         let hidden = !term.modes().cursor_visible;
         let shape = render_shape(term.cursor_style().shape);
-        let changed = self.capture_grid(term.grid());
+        let grid = term.grid();
+        let offset = if grid.is_alt_screen() {
+            0
+        } else {
+            offset.min(grid.scrollback_len())
+        };
+        if offset > 0 {
+            self.cursor_hidden = hidden;
+            self.cursor_shape = shape;
+            return self.capture_history(grid, offset);
+        }
+        if self.scrolled.take().is_some() {
+            // The rows hold history lines: copy the live screen whole.
+            self.generation = None;
+        }
+        let changed = self.capture_grid(grid);
         if hidden == self.cursor_hidden && shape == self.cursor_shape {
             return changed;
         }
         self.cursor_hidden = hidden;
         self.cursor_shape = shape;
         changed.with_row(self.cursor.row)
+    }
+
+    /// Brings the snapshot up to date with `grid`'s logical lines from
+    /// `scrollback_len - offset` on (`0 < offset <= scrollback_len`), and
+    /// returns the rows whose cells or clusters changed.
+    ///
+    /// A view that moved (another top line, a first capture, another size
+    /// or the live screen before) is copied whole and returns
+    /// [`DamageRows::All`]. A view that stayed on its lines compares
+    /// instead: every row when output moved the history (a line pushed,
+    /// one evicted or cleared), otherwise only the live rows in view that
+    /// the grid reports changed ([`Grid::damage_since`], `offset` rows
+    /// lower). So output under a view deep in the history costs one
+    /// comparison of the screen per capture, and an idle one nothing.
+    fn capture_history(&mut self, grid: &Grid, offset: usize) -> DamageRows {
+        let cols = usize::from(grid.cols());
+        let rows = usize::from(grid.rows());
+        let len = grid.scrollback_len();
+        let pushed = grid.scrollback_pushed();
+        let at = ScrolledAt {
+            top: pushed.wrapping_sub(offset as u64),
+            pushed,
+            len,
+        };
+        let first = len - offset;
+        let line = |r: usize| {
+            grid.logical_line(first + r)
+                .expect("the offset is within the scrollback, so every row is a logical line")
+        };
+        let last = self.scrolled.replace(at);
+        let generation = self.generation.replace(grid.damage_generation());
+        self.cursor = grid.cursor();
+        let (Some(last), Some(generation)) = (last, generation) else {
+            self.copy_all((0..rows).map(line), cols);
+            return DamageRows::All;
+        };
+        if last.top != at.top || cols != self.cols || rows != self.clusters.len() {
+            self.copy_all((0..rows).map(line), cols);
+            return DamageRows::All;
+        }
+        let range = if last.pushed == pushed && last.len == len {
+            // The history did not move: only live rows in view can have
+            // changed, and the grid knows which.
+            match grid.damage_since(generation) {
+                DamageRows::None => return DamageRows::None,
+                DamageRows::Rows(range) => {
+                    (usize::from(*range.start()) + offset).min(rows)
+                        ..(usize::from(*range.end()) + 1 + offset).min(rows)
+                }
+                DamageRows::All => 0..rows,
+            }
+        } else {
+            0..rows
+        };
+        let mut changed = DamageRows::None;
+        for r in range {
+            if self.sync_row(r, line(r), cols) {
+                changed = changed.with_row(u16::try_from(r).unwrap_or(u16::MAX));
+            }
+        }
+        changed
     }
 
     /// Brings the snapshot up to date with `grid`'s visible rows and
@@ -702,43 +817,57 @@ impl Snapshot {
                 usize::from(*range.start())..(usize::from(*range.end()) + 1).min(rows)
             }
             DamageRows::All => {
-                self.copy_all(lines, cols);
+                self.copy_all(lines.iter(), cols);
                 return DamageRows::All;
             }
         };
         let mut changed = DamageRows::None;
         for r in range {
-            let line = &lines[r];
-            // Rows are `cols` long by construction; pad or cut defensively
-            // so `rows()` can chunk evenly.
-            let src = &line.cells[..line.cells.len().min(cols)];
-            let dst = &mut self.cells[r * cols..(r + 1) * cols];
-            #[cfg(test)]
-            {
-                self.compared += 1;
+            if self.sync_row(r, &lines[r], cols) {
+                changed = changed.with_row(u16::try_from(r).unwrap_or(u16::MAX));
             }
-            let same = dst[..src.len()] == *src
-                && dst[src.len()..].iter().all(|c| *c == Cell::default())
-                && self.clusters[r] == line.graphemes;
-            if same {
-                continue;
-            }
-            dst[..src.len()].copy_from_slice(src);
-            dst[src.len()..].fill(Cell::default());
-            self.clusters[r].clone_from(&line.graphemes);
-            changed = changed.with_row(u16::try_from(r).unwrap_or(u16::MAX));
         }
         changed
     }
 
+    /// Makes row `r` hold `line` (`cols` cells and its clusters) and
+    /// returns whether it did not already: a comparison first, a copy only
+    /// when they differ.
+    fn sync_row(&mut self, r: usize, line: &Line, cols: usize) -> bool {
+        // Rows are `cols` long by construction; pad or cut defensively so
+        // `rows()` can chunk evenly.
+        let src = &line.cells[..line.cells.len().min(cols)];
+        let dst = &mut self.cells[r * cols..(r + 1) * cols];
+        #[cfg(test)]
+        {
+            self.compared += 1;
+        }
+        let same = dst[..src.len()] == *src
+            && dst[src.len()..].iter().all(|c| *c == Cell::default())
+            && self.clusters[r] == line.graphemes;
+        if same {
+            return false;
+        }
+        dst[..src.len()].copy_from_slice(src);
+        dst[src.len()..].fill(Cell::default());
+        self.clusters[r].clone_from(&line.graphemes);
+        true
+    }
+
     /// Replaces the whole snapshot with `lines`, `cols` cells each: one
     /// straight copy, no comparison and no default fill first (this runs
-    /// under the terminal lock on every full-screen scroll and resize).
-    fn copy_all(&mut self, lines: &[Line], cols: usize) {
+    /// under the terminal lock on every full-screen scroll, resize and
+    /// move of a scrolled-back view).
+    fn copy_all<'a>(
+        &mut self,
+        lines: impl ExactSizeIterator<Item = &'a Line> + Clone,
+        cols: usize,
+    ) {
+        let count = lines.len();
         self.cols = cols;
         self.cells.clear();
-        self.cells.reserve(lines.len() * cols);
-        for line in lines {
+        self.cells.reserve(count * cols);
+        for line in lines.clone() {
             // Rows are `cols` long by construction; pad or cut defensively
             // so `rows()` can chunk evenly.
             let src = &line.cells[..line.cells.len().min(cols)];
@@ -748,13 +877,21 @@ impl Snapshot {
                     .resize(self.cells.len() + cols - src.len(), Cell::default());
             }
         }
-        self.clusters.truncate(lines.len());
-        for (dst, line) in self.clusters.iter_mut().zip(lines) {
-            dst.clone_from(&line.graphemes);
-        }
+        self.clusters.truncate(count);
         let have = self.clusters.len();
-        self.clusters
-            .extend(lines[have..].iter().map(|line| line.graphemes.clone()));
+        for (r, line) in lines.enumerate() {
+            if r < have {
+                self.clusters[r].clone_from(&line.graphemes);
+            } else {
+                self.clusters.push(line.graphemes.clone());
+            }
+        }
+    }
+
+    /// Each captured row's cluster text, for tests.
+    #[cfg(test)]
+    pub(crate) fn clusters(&self) -> &[GraphemeTable] {
+        &self.clusters
     }
 
     /// The captured rows, top to bottom.
@@ -765,19 +902,26 @@ impl Snapshot {
         self.cells.chunks(self.cols).collect()
     }
 
+    /// The cursor cell a frame of this snapshot draws: `None` while the
+    /// view is scrolled back, where the live cursor is off the rows shown.
+    pub(crate) fn shown_cursor(&self) -> Option<Point> {
+        self.scrolled.is_none().then_some(self.cursor)
+    }
+
     /// The frame drawing `rows` (this snapshot's [`Self::rows`]) with the
     /// rows' grapheme clusters: a cursor of the captured shape at the
     /// captured cursor position, drawn unless the terminal hid it
-    /// (DECTCEM), `focused` (an unfocused frame draws every shape hollow),
-    /// no selection and no overlays, and the default damage
-    /// ([`DamageRows::All`]). The viewport (#31) and cursor blink (a host
-    /// clock) are still to come.
+    /// (DECTCEM) or the view is scrolled back, `focused` (an unfocused
+    /// frame draws every shape hollow), no selection and no overlays, and
+    /// the default damage ([`DamageRows::All`]). Cursor blink (a host
+    /// clock) is still to come.
     pub(crate) fn frame<'a>(&'a self, rows: &'a [&'a [Cell]], focused: bool) -> FrameInput<'a> {
         let Point { row, col } = self.cursor;
+        let visible = !self.cursor_hidden && self.scrolled.is_none();
         FrameInput::new(rows)
             .with_clusters(&self.clusters)
             .with_cursor(Some(
-                CursorState::new(row, col, self.cursor_shape).with_visible(!self.cursor_hidden),
+                CursorState::new(row, col, self.cursor_shape).with_visible(visible),
             ))
             .with_focus(focused)
     }
@@ -1000,7 +1144,7 @@ mod tests {
         let mut term = Terminal::new(3, 4);
         term.advance(b"\r\nab");
         let mut snapshot = Snapshot::default();
-        snapshot.capture(&term);
+        snapshot.capture(&term, 0);
         let visible = |snapshot: &Snapshot| {
             let rows = snapshot.rows();
             snapshot
@@ -1009,13 +1153,13 @@ mod tests {
                 .map(|cursor| cursor.visible)
         };
         assert_eq!(visible(&snapshot), Some(true));
-        assert_eq!(snapshot.capture(&term), DamageRows::None, "idle");
+        assert_eq!(snapshot.capture(&term, 0), DamageRows::None, "idle");
         term.advance(b"\x1b[?25l");
-        assert_eq!(snapshot.capture(&term), DamageRows::Rows(1..=1));
+        assert_eq!(snapshot.capture(&term, 0), DamageRows::Rows(1..=1));
         assert_eq!(visible(&snapshot), Some(false));
-        assert_eq!(snapshot.capture(&term), DamageRows::None, "still hidden");
+        assert_eq!(snapshot.capture(&term, 0), DamageRows::None, "still hidden");
         term.advance(b"\x1b[?25h");
-        assert_eq!(snapshot.capture(&term), DamageRows::Rows(1..=1));
+        assert_eq!(snapshot.capture(&term, 0), DamageRows::Rows(1..=1));
         assert_eq!(visible(&snapshot), Some(true));
     }
 
@@ -1024,7 +1168,7 @@ mod tests {
         let mut term = Terminal::new(3, 4);
         term.advance(b"ab\r\ncd");
         let mut snapshot = Snapshot::default();
-        snapshot.capture(&term);
+        snapshot.capture(&term, 0);
         let rows = snapshot.rows();
         let frame = snapshot.frame(&rows, true);
         let text: Vec<String> = frame
@@ -1072,7 +1216,7 @@ mod tests {
         let mut term = Terminal::new(3, 4);
         term.set_default_cursor_style(UNDERLINE);
         let mut snapshot = Snapshot::default();
-        snapshot.capture(&term);
+        snapshot.capture(&term, 0);
         assert_eq!(frame_shape(&snapshot), Some(CursorShape::Underline));
         for (seq, shape) in [
             (&b"\x1b[5 q"[..], CursorShape::Beam),
@@ -1081,7 +1225,7 @@ mod tests {
             (b"\x1b[0 q", CursorShape::Underline),
         ] {
             term.advance(seq);
-            snapshot.capture(&term);
+            snapshot.capture(&term, 0);
             assert_eq!(frame_shape(&snapshot), Some(shape), "{seq:?}");
         }
     }
@@ -1098,7 +1242,7 @@ mod tests {
             let mut term = Terminal::new(3, 4);
             term.advance(seq);
             let mut snapshot = Snapshot::default();
-            snapshot.capture(&term);
+            snapshot.capture(&term, 0);
             let rows = snapshot.rows();
             let focused = snapshot.frame(&rows, true);
             assert_eq!(focused.drawn_cursor().map(|(_, s)| s), Some(shape));
@@ -1109,7 +1253,7 @@ mod tests {
                 "{seq:?} unfocused"
             );
             term.advance(b"\x1b[?25l");
-            snapshot.capture(&term);
+            snapshot.capture(&term, 0);
             let rows = snapshot.rows();
             let frame = snapshot.frame(&rows, true);
             assert_eq!(
@@ -1128,31 +1272,31 @@ mod tests {
         let mut term = Terminal::new(4, 6);
         term.advance(b"ab\r\ncd\r\nef");
         let mut snapshot = Snapshot::default();
-        snapshot.capture(&term);
-        assert_eq!(snapshot.capture(&term), DamageRows::None, "idle");
+        snapshot.capture(&term, 0);
+        assert_eq!(snapshot.capture(&term, 0), DamageRows::None, "idle");
         term.advance(b"\x1b[0 q");
         assert_eq!(
-            snapshot.capture(&term),
+            snapshot.capture(&term, 0),
             DamageRows::None,
             "Ps 0 on the default"
         );
         term.advance(b"\x1b[2 q");
         assert_eq!(
-            snapshot.capture(&term),
+            snapshot.capture(&term, 0),
             DamageRows::None,
             "a steady block again"
         );
         term.advance(b"\x1b[5 q");
-        assert_eq!(snapshot.capture(&term), DamageRows::Rows(2..=2), "beam");
+        assert_eq!(snapshot.capture(&term, 0), DamageRows::Rows(2..=2), "beam");
         term.advance(b"\x1b[5 q");
-        assert_eq!(snapshot.capture(&term), DamageRows::None, "beam again");
+        assert_eq!(snapshot.capture(&term, 0), DamageRows::None, "beam again");
         term.advance(b"\x1b[2 q");
-        assert_eq!(snapshot.capture(&term), DamageRows::Rows(2..=2), "block");
+        assert_eq!(snapshot.capture(&term, 0), DamageRows::Rows(2..=2), "block");
         let mut steady = Snapshot::default();
-        steady.capture(&term);
+        steady.capture(&term, 0);
         term.advance(b"\x1b[1 q");
         assert!(term.cursor_style().blink);
-        assert_eq!(snapshot.capture(&term), DamageRows::None, "blink only");
+        assert_eq!(snapshot.capture(&term, 0), DamageRows::None, "blink only");
         let (steady_rows, rows) = (steady.rows(), snapshot.rows());
         assert_eq!(
             snapshot.frame(&rows, true),
@@ -1162,20 +1306,20 @@ mod tests {
         // And a live default change reaches a session without a style.
         term.advance(b"\x1b[0 q");
         assert_eq!(
-            snapshot.capture(&term),
+            snapshot.capture(&term, 0),
             DamageRows::None,
             "back to a steady block"
         );
         term.set_default_cursor_style(UNDERLINE);
         assert_eq!(
-            snapshot.capture(&term),
+            snapshot.capture(&term, 0),
             DamageRows::Rows(2..=2),
             "new default"
         );
         assert_eq!(frame_shape(&snapshot), Some(CursorShape::Underline));
         term.set_default_cursor_style(UNDERLINE);
         assert_eq!(
-            snapshot.capture(&term),
+            snapshot.capture(&term, 0),
             DamageRows::None,
             "the same default"
         );
@@ -1189,7 +1333,7 @@ mod tests {
             return;
         };
         let mut term = Terminal::new(3, 10);
-        view.capture(&term);
+        view.capture(&term, 0);
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
         for (seq, status) in [
             (&b"\x1b[2 q"[..], FrameStatus::Skipped),
@@ -1200,7 +1344,7 @@ mod tests {
         ] {
             next_frame();
             term.advance(seq);
-            view.capture(&term);
+            view.capture(&term, 0);
             assert_eq!(view.render(true).expect("frame"), status, "{seq:?}");
         }
     }
@@ -1232,7 +1376,7 @@ mod tests {
         let mut draw = |seq: &[u8]| {
             next_frame();
             term.advance(seq);
-            view.capture(&term);
+            view.capture(&term, 0);
             assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
             let image = view.read_back();
             // The cursor's cell and the one right of it, true where green.
@@ -1292,7 +1436,7 @@ mod tests {
         let mut term = Terminal::new(3, 4);
         term.advance(b"ab\r\ncd");
         let mut snapshot = Snapshot::default();
-        snapshot.capture(&term);
+        snapshot.capture(&term, 0);
         let rows = snapshot.rows();
         assert_eq!(rows.len(), 3);
         assert!(rows.iter().all(|row| row.len() == 4));
@@ -1300,7 +1444,7 @@ mod tests {
         assert_eq!(rows[1][1].ch, 'd');
         assert_eq!(snapshot.cursor, Point::new(1, 2));
         // Recapturing a smaller grid reuses the buffer and forgets the old rows.
-        snapshot.capture(&Terminal::new(1, 2));
+        snapshot.capture(&Terminal::new(1, 2), 0);
         assert_eq!(snapshot.rows().len(), 1);
         assert_eq!(snapshot.cursor, Point::new(0, 0));
     }
@@ -1316,13 +1460,13 @@ mod tests {
     fn snapshot_of_a_large_screen_is_fast() {
         let term = full_terminal(60, 200);
         let mut snapshot = Snapshot::default();
-        snapshot.capture(&term);
+        snapshot.capture(&term, 0);
         let mut best = Duration::MAX;
         for _ in 0..50 {
             // Forget the generation: time a full copy, the worst case.
             snapshot.generation = None;
             let start = Instant::now();
-            snapshot.capture(&term);
+            snapshot.capture(&term, 0);
             best = best.min(start.elapsed());
         }
         assert_eq!(snapshot.rows().len(), 60);
@@ -1337,30 +1481,30 @@ mod tests {
     fn capture_reports_only_rows_that_changed() {
         let mut term = Terminal::new(4, 10);
         let mut snapshot = Snapshot::default();
-        assert_eq!(snapshot.capture(&term), DamageRows::All, "first capture");
-        assert_eq!(snapshot.capture(&term), DamageRows::None, "idle");
+        assert_eq!(snapshot.capture(&term, 0), DamageRows::All, "first capture");
+        assert_eq!(snapshot.capture(&term, 0), DamageRows::None, "idle");
         term.advance(b"hi");
-        assert_eq!(snapshot.capture(&term), DamageRows::Rows(0..=0));
+        assert_eq!(snapshot.capture(&term, 0), DamageRows::Rows(0..=0));
         // The grid keeps reporting the cursor row; the comparison drops it.
         assert_eq!(
             term.grid().damage_since(term.grid().damage().generation),
             DamageRows::Rows(0..=0)
         );
-        assert_eq!(snapshot.capture(&term), DamageRows::None);
+        assert_eq!(snapshot.capture(&term, 0), DamageRows::None);
         // A cursor move changes no cells.
         term.advance(b"\x1b[3;5H");
-        assert_eq!(snapshot.capture(&term), DamageRows::None);
+        assert_eq!(snapshot.capture(&term, 0), DamageRows::None);
         assert_eq!(snapshot.cursor, Point::new(2, 4));
         term.advance(b"x\x1b[1;1Hy");
-        assert_eq!(snapshot.capture(&term), DamageRows::Rows(0..=2));
+        assert_eq!(snapshot.capture(&term, 0), DamageRows::Rows(0..=2));
         assert_eq!(snapshot.rows()[2][4].ch, 'x');
         assert_eq!(snapshot.rows()[0][0].ch, 'y');
         // Clusters are copied with their row.
         term.advance(b"\x1b[4;1He\xcc\x81");
-        assert_eq!(snapshot.capture(&term), DamageRows::Rows(3..=3));
+        assert_eq!(snapshot.capture(&term, 0), DamageRows::Rows(3..=3));
         assert_eq!(snapshot.clusters[3].get(0), Some("e\u{301}"));
         term.resize(5, 10);
-        assert_eq!(snapshot.capture(&term), DamageRows::All);
+        assert_eq!(snapshot.capture(&term, 0), DamageRows::All);
         assert_eq!(snapshot.rows().len(), 5);
     }
 
@@ -1404,11 +1548,11 @@ mod tests {
         };
         let mut term = Terminal::new(4, 20);
         term.advance(b"hello");
-        view.capture(&term);
+        view.capture(&term, 0);
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
         let frames = view.renderer().stats().frames;
         next_frame();
-        view.capture(&term);
+        view.capture(&term, 0);
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Skipped);
         assert_eq!(view.renderer().stats().frames, frames, "no GPU work");
         // Without even a capture in between, and however soon: an
@@ -1427,12 +1571,12 @@ mod tests {
         for row in 0..6 {
             term.advance(format!("\x1b[{};1Hrow {row} of text", row + 1).as_bytes());
         }
-        view.capture(&term);
+        view.capture(&term, 0);
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
         let before = view.renderer().stats();
         next_frame();
         term.advance(b"\x1b[3;1Hchanged");
-        view.capture(&term);
+        view.capture(&term, 0);
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
         let after = view.renderer().stats();
         assert_eq!(after.rows_shaped - before.rows_shaped, 1, "only row 2");
@@ -1446,12 +1590,12 @@ mod tests {
         };
         let mut term = Terminal::new(3, 10);
         term.advance(b"abc");
-        view.capture(&term);
+        view.capture(&term, 0);
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
         let shaped = view.renderer().stats().rows_shaped;
         next_frame();
         term.advance(b"\x1b[2;2H");
-        view.capture(&term);
+        view.capture(&term, 0);
         assert_eq!(
             view.render(true).expect("frame"),
             FrameStatus::Presented,
@@ -1478,10 +1622,10 @@ mod tests {
             return;
         };
         let mut term = Terminal::new(3, 10);
-        view.capture(&term);
+        view.capture(&term, 0);
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
         term.advance(b"one");
-        view.capture(&term);
+        view.capture(&term, 0);
         // A frame was just presented: the next one is not due for an
         // interval, and half an interval of slack does not cover that.
         view.last_presented = Some(Instant::now());
@@ -1520,7 +1664,7 @@ mod tests {
             let mut statuses = Vec::new();
             for ch in [b"a", b"b", b"c"] {
                 term.advance(ch);
-                view.capture(&term);
+                view.capture(&term, 0);
                 statuses.push(view.render(true).expect("frame"));
             }
             let fit = Instant::now() < start + MIN_FRAME_INTERVAL;
@@ -1553,7 +1697,7 @@ mod tests {
         };
         let mut term = Terminal::new(3, 10);
         term.advance(b"abc");
-        view.capture(&term);
+        view.capture(&term, 0);
         view.set_not_ready(true);
         assert_eq!(view.render(true).expect("frame"), FrameStatus::NotReady);
         assert_eq!(view.renderer().stats().frames, 0, "nothing drawn");
@@ -1568,7 +1712,7 @@ mod tests {
         // first ready frame; the cursor stays where it was.
         next_frame();
         term.advance(b"\x1b[2;1Hx\x1b[1;4H");
-        view.capture(&term);
+        view.capture(&term, 0);
         view.set_not_ready(true);
         assert_eq!(view.render(true).expect("frame"), FrameStatus::NotReady);
         view.set_not_ready(false);
@@ -1680,7 +1824,7 @@ mod tests {
                 fed += 1;
             }
             let t = Instant::now();
-            view.capture(&term);
+            view.capture(&term, 0);
             longest_capture = longest_capture.max(t.elapsed());
             calls += 1;
             if view.render(true).expect("frame") == FrameStatus::Presented {
@@ -1723,12 +1867,12 @@ mod tests {
         let mut snapshot = Snapshot::default();
         let mut term = Terminal::new(5, 12);
         term.advance("e\u{301}x 中文 👍🏽\r\n\x1b[41mred\x1b[0m a\u{338}\r\n".as_bytes());
-        assert_eq!(snapshot.capture(&term), DamageRows::All);
+        assert_eq!(snapshot.capture(&term, 0), DamageRows::All);
         assert_snapshot_is(&snapshot, &term);
         assert_eq!(snapshot.compared, 0, "no comparison on the full path");
         // Partial captures compare only the reported rows.
         term.advance(b"\x1b[3;1Hzz");
-        assert_eq!(snapshot.capture(&term), DamageRows::Rows(2..=2));
+        assert_eq!(snapshot.capture(&term, 0), DamageRows::Rows(2..=2));
         assert!(snapshot.compared > 0);
         assert_snapshot_is(&snapshot, &term);
         // Smaller, then larger again: stale rows and clusters are replaced.
@@ -1737,7 +1881,7 @@ mod tests {
             term.advance("\x1b[1;1H❤\u{fe0f}e\u{301}".as_bytes());
             let compared = snapshot.compared;
             snapshot.generation = None;
-            assert_eq!(snapshot.capture(&term), DamageRows::All);
+            assert_eq!(snapshot.capture(&term, 0), DamageRows::All);
             assert_eq!(
                 snapshot.compared, compared,
                 "no comparison on the full path"
@@ -1765,14 +1909,14 @@ mod tests {
         };
         let mut term = Terminal::new(3, 10);
         term.advance(b"abc");
-        view.capture(&term);
+        view.capture(&term, 0);
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
         next_frame();
-        view.capture(&term);
+        view.capture(&term, 0);
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Skipped);
         view.set_appearance(red());
         next_frame();
-        view.capture(&term);
+        view.capture(&term, 0);
         let shaped = view.renderer().stats().rows_shaped;
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
         assert_eq!(view.renderer().stats().rows_shaped - shaped, 3, "every row");
@@ -1796,19 +1940,498 @@ mod tests {
         };
         let mut term = Terminal::new(3, 10);
         term.advance(b"abc\r\ndef");
-        view.capture(&term);
+        view.capture(&term, 0);
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
         next_frame();
         term.advance(b"\x1b[3;1Hxyz");
-        view.capture(&term);
+        view.capture(&term, 0);
         view.set_appearance(red());
         assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
         fresh.set_appearance(red());
-        fresh.capture(&term);
+        fresh.capture(&term, 0);
         assert_eq!(fresh.render(true).expect("frame"), FrameStatus::Presented);
         assert!(
             view.read_back() == fresh.read_back(),
             "every row in the new theme"
+        );
+    }
+
+    // ------------------------------------------------- scrollback viewport
+
+    /// The text of `snapshot`'s rows, trailing blanks trimmed.
+    fn texts(snapshot: &Snapshot) -> Vec<String> {
+        snapshot
+            .rows()
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.ch)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// A 4x10 terminal with `L0`..`L{n-1}` written one per line: the first
+    /// `n - 3` lines are in the scrollback, the last three on the screen
+    /// above the cursor's empty row.
+    fn numbered_terminal(n: usize) -> Terminal {
+        let mut term = Terminal::new(4, 10);
+        for i in 0..n {
+            term.advance(format!("L{i}\r\n").as_bytes());
+        }
+        term
+    }
+
+    /// Whether `snapshot`'s focused frame draws a cursor.
+    fn cursor_drawn(snapshot: &Snapshot) -> bool {
+        let rows = snapshot.rows();
+        snapshot.frame(&rows, true).drawn_cursor().is_some()
+    }
+
+    /// The offset that keeps `top` (a [`ScrolledAt::top`]) in view: how a
+    /// session's anchor resolves while output continues.
+    fn anchored(term: &Terminal, top: u64) -> usize {
+        usize::try_from(term.grid().scrollback_pushed() - top).expect("offset")
+    }
+
+    #[test]
+    fn a_scrolled_back_snapshot_shows_the_history_at_its_offset() {
+        let term = numbered_terminal(10);
+        assert_eq!(term.grid().scrollback_len(), 7);
+        let mut snapshot = Snapshot::default();
+        assert_eq!(snapshot.capture(&term, 0), DamageRows::All);
+        assert_eq!(texts(&snapshot), ["L7", "L8", "L9", ""]);
+        assert!(cursor_drawn(&snapshot));
+        assert_eq!(snapshot.shown_cursor(), Some(Point::new(3, 0)));
+        // Two lines back: two history lines over the top of the screen.
+        assert_eq!(snapshot.capture(&term, 2), DamageRows::All);
+        assert_eq!(texts(&snapshot), ["L5", "L6", "L7", "L8"]);
+        assert!(!cursor_drawn(&snapshot), "no cursor while scrolled back");
+        assert_eq!(snapshot.shown_cursor(), None);
+        // Deeper than the screen: history only.
+        snapshot.capture(&term, 6);
+        assert_eq!(texts(&snapshot), ["L1", "L2", "L3", "L4"]);
+        // Past the oldest line: the oldest line on top.
+        snapshot.capture(&term, 1_000);
+        assert_eq!(texts(&snapshot), ["L0", "L1", "L2", "L3"]);
+        // And back to the live screen, whole, with its cursor.
+        assert_eq!(snapshot.capture(&term, 0), DamageRows::All);
+        assert_snapshot_is(&snapshot, &term);
+        assert!(cursor_drawn(&snapshot));
+    }
+
+    /// The Done-when case at the snapshot: a view 50 lines back while
+    /// 1 000 more lines arrive keeps byte-identical rows and damages
+    /// nothing; a cursor that moves or hides under it damages nothing.
+    #[test]
+    fn output_under_a_view_deep_in_the_history_damages_nothing() {
+        let mut term = numbered_terminal(200);
+        let mut snapshot = Snapshot::default();
+        snapshot.capture(&term, 50);
+        let top = snapshot.scrolled.expect("scrolled").top;
+        let before = (snapshot.cells.clone(), snapshot.clusters.clone());
+        assert_eq!(texts(&snapshot)[0], "L147");
+        for i in 200..1_200 {
+            term.advance(format!("L{i}\r\n").as_bytes());
+            assert_eq!(
+                snapshot.capture(&term, anchored(&term, top)),
+                DamageRows::None,
+                "line {i}"
+            );
+        }
+        assert_eq!(anchored(&term, top), 1_050);
+        term.advance(b"\x1b[2;3Hxy\x1b[?25l\x1b[5 q");
+        assert_eq!(snapshot.capture(&term, 1_050), DamageRows::None);
+        assert_eq!((snapshot.cells.clone(), snapshot.clusters.clone()), before);
+    }
+
+    /// A view less than a screen back shows the top of the live screen:
+    /// output there damages exactly the rows it changed, and output that
+    /// scrolls those rows into the history moves nothing.
+    #[test]
+    fn output_under_a_shallow_view_damages_the_rows_it_changes() {
+        let mut term = numbered_terminal(10);
+        let mut snapshot = Snapshot::default();
+        snapshot.capture(&term, 1);
+        assert_eq!(texts(&snapshot), ["L6", "L7", "L8", "L9"]);
+        let top = snapshot.scrolled.expect("scrolled").top;
+        // Screen row 1 (`L8`) is view row 2.
+        term.advance(b"\x1b[2;3Hx");
+        assert_eq!(snapshot.capture(&term, 1), DamageRows::Rows(2..=2));
+        assert_eq!(texts(&snapshot), ["L6", "L7", "L8x", "L9"]);
+        // The cursor row (screen row 1) stays reported; it is compared.
+        assert_eq!(snapshot.capture(&term, 1), DamageRows::None);
+        // Typing on the cursor's row: the screen's last row is not in view.
+        term.advance(b"\x1b[4;1Hhidden");
+        assert_eq!(snapshot.capture(&term, 1), DamageRows::None);
+        // Ten lines later the rows in view are all history, unchanged.
+        term.advance(&b"\r\n".repeat(10));
+        assert_eq!(
+            snapshot.capture(&term, anchored(&term, top)),
+            DamageRows::None
+        );
+        assert_eq!(texts(&snapshot), ["L6", "L7", "L8x", "L9"]);
+        // A line that was still being written when the view was taken
+        // shows its new text when it reaches the view.
+        let mut term = numbered_terminal(10);
+        term.advance(b"half");
+        snapshot.capture(&term, 3);
+        let top = snapshot.scrolled.expect("scrolled").top;
+        assert_eq!(texts(&snapshot), ["L4", "L5", "L6", "L7"]);
+        snapshot.capture(&term, 1);
+        let top_one = snapshot.scrolled.expect("scrolled").top;
+        assert_ne!(top, top_one);
+        assert_eq!(texts(&snapshot), ["L6", "L7", "L8", "L9"]);
+        snapshot.capture(&term, 0);
+        snapshot.capture(&term, 1);
+        assert_eq!(texts(&snapshot)[3], "L9");
+        term.advance(b" done\r\n\r\n");
+        let offset = anchored(&term, top_one);
+        assert_eq!(
+            snapshot.capture(&term, offset),
+            DamageRows::None,
+            "L6..L9 as they were"
+        );
+        snapshot.capture(&term, offset - 1);
+        assert_eq!(texts(&snapshot)[3], "half done");
+    }
+
+    /// Moving the view redraws every row, staying on its lines redraws
+    /// nothing, and the live screen comes back whole.
+    #[test]
+    fn moving_the_view_damages_every_row() {
+        let term = numbered_terminal(30);
+        let mut snapshot = Snapshot::default();
+        snapshot.capture(&term, 0);
+        for offset in [3, 4, 27, 1] {
+            assert_eq!(snapshot.capture(&term, offset), DamageRows::All, "{offset}");
+            assert_eq!(
+                snapshot.capture(&term, offset),
+                DamageRows::None,
+                "{offset} again"
+            );
+        }
+        assert_eq!(snapshot.capture(&term, 0), DamageRows::All);
+        assert_snapshot_is(&snapshot, &term);
+        assert_eq!(snapshot.capture(&term, 0), DamageRows::None);
+    }
+
+    /// The alternate screen shows no scrollback: any offset draws the live
+    /// alternate screen with its cursor.
+    #[test]
+    fn the_alternate_screen_shows_no_scrollback() {
+        let mut term = numbered_terminal(30);
+        term.advance(b"\x1b[?1049h\x1b[Hfull screen");
+        let mut snapshot = Snapshot::default();
+        snapshot.capture(&term, 5);
+        assert_snapshot_is(&snapshot, &term);
+        assert_eq!(texts(&snapshot)[0], "full scree");
+        assert!(cursor_drawn(&snapshot));
+        assert_eq!(
+            snapshot.capture(&term, 0),
+            DamageRows::None,
+            "the same screen"
+        );
+    }
+
+    /// Fast path against reference: after any sequence of output (lines,
+    /// edits on the screen, clears, RIS, resizes, the alternate screen)
+    /// and views (anchored, moved, live), a snapshot kept up to date shows
+    /// exactly what a fresh one does, and the damage it reports covers
+    /// every row that changed. 2 000 seeded runs of 40 steps.
+    #[test]
+    fn scrolled_captures_agree_with_a_fresh_capture() {
+        const PIECES: [&[u8]; 12] = [
+            b"line\r\n",
+            b"abcdefghij\r\n",
+            b"\r\n\r\n\r\n",
+            b"\x1b[2;2Hzz",
+            b"\x1b[1;1H\xe4\xb8\xad\xcc\x81",
+            b"\x1b[41m \x1b[0m",
+            b"\x1b[2J",
+            b"\x1b[3J",
+            b"\x1bc",
+            b"\x1b[?1049h",
+            b"\x1b[?1049l",
+            b"\x1b[2;3r\n\n\n\x1b[r",
+        ];
+        let mut seed = 0x31_u64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for run in 0..2_000 {
+            let mut term = Terminal::new(4, 6);
+            let mut snapshot = Snapshot::default();
+            let mut offset = 0;
+            for step in 0..40 {
+                match next(10) {
+                    0..=5 => {
+                        let piece = PIECES[usize::try_from(next(12)).expect("index")];
+                        term.advance(piece);
+                    }
+                    6 => {
+                        let rows = u16::try_from(1 + next(6)).expect("rows");
+                        let cols = u16::try_from(1 + next(8)).expect("cols");
+                        term.resize(rows, cols);
+                    }
+                    _ => offset = usize::try_from(next(20)).expect("offset"),
+                }
+                // Half the time the view keeps its lines, as a session's
+                // anchor does.
+                if let Some(at) = snapshot.scrolled.filter(|_| next(2) == 0) {
+                    let pushed = term.grid().scrollback_pushed();
+                    offset = usize::try_from(pushed.wrapping_sub(at.top)).unwrap_or(0);
+                }
+                let before = snapshot
+                    .rows()
+                    .iter()
+                    .map(|r| r.to_vec())
+                    .collect::<Vec<_>>();
+                let clusters_before = snapshot.clusters.clone();
+                let damage = snapshot.capture(&term, offset);
+                let mut fresh = Snapshot::default();
+                fresh.capture(&term, offset);
+                let at = format!("run {run} step {step} offset {offset}");
+                assert_eq!(snapshot.rows(), fresh.rows(), "{at}");
+                assert_eq!(snapshot.clusters, fresh.clusters, "{at}");
+                assert_eq!(snapshot.shown_cursor(), fresh.shown_cursor(), "{at}");
+                assert_eq!(cursor_drawn(&snapshot), cursor_drawn(&fresh), "{at}");
+                let rows = snapshot.rows();
+                if before.len() == rows.len() && damage != DamageRows::All {
+                    for (r, row) in rows.iter().enumerate() {
+                        let changed =
+                            before[r] != *row || clusters_before[r] != snapshot.clusters[r];
+                        let reported = damage.contains(u16::try_from(r).expect("row"));
+                        assert!(!changed || reported, "{at}: row {r} changed unreported");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The Done-when frame check: a view scrolled back is drawn once, then
+    /// skipped while output arrives under it; moving it draws again.
+    #[test]
+    fn a_still_scrolled_view_skips_frames_while_output_continues() {
+        let Some(mut view) = offscreen_view(4, 10) else {
+            return;
+        };
+        let mut term = numbered_terminal(60);
+        view.capture(&term, 0);
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+        next_frame();
+        view.capture(&term, 20);
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+        let top = view.snapshot.scrolled.expect("scrolled").top;
+        let frames = view.renderer().stats().frames;
+        for i in 0..200 {
+            next_frame();
+            // New lines, and the cursor moved and hidden under the view.
+            term.advance(
+                format!("more {i}\r\n\x1b[?25l\x1b[{};{}H", i % 4 + 1, i % 9 + 1).as_bytes(),
+            );
+            view.capture(&term, anchored(&term, top));
+            assert_eq!(
+                view.render(true).expect("frame"),
+                FrameStatus::Skipped,
+                "{i}"
+            );
+        }
+        assert_eq!(view.renderer().stats().frames, frames, "no GPU work");
+        next_frame();
+        view.capture(&term, anchored(&term, top) + 1);
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+        let shaped = view.renderer().stats().rows_shaped;
+        next_frame();
+        view.capture(&term, 0);
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+        assert_eq!(view.renderer().stats().rows_shaped - shaped, 4, "every row");
+    }
+
+    /// A 50x200 grid with `history` lines of 200-column text in its
+    /// scrollback (the perf corpus's screen; the terminal's own cap is
+    /// 10 000, so the grid is built directly).
+    fn long_history(history: usize) -> Grid {
+        let mut grid = Grid::with_scrollback(50, 200, history);
+        let mut text = String::new();
+        while text.len() < 200 {
+            text.push_str(ASCII);
+        }
+        text.truncate(200);
+        grid.goto(49, 0);
+        for _ in 0..history + 49 {
+            grid.put_str(&text);
+            grid.carriage_return();
+            grid.line_feed();
+        }
+        assert_eq!(grid.scrollback_len(), history);
+        grid
+    }
+
+    /// One frame's work under the lock and after it, as `render_view` does
+    /// it: the capture at `offset` (the grid's part of
+    /// [`Snapshot::capture`]) and the frame built from it.
+    fn capture_and_frame(snapshot: &mut Snapshot, grid: &Grid, offset: usize) -> usize {
+        let damage = if offset == 0 {
+            snapshot.scrolled = None;
+            snapshot.capture_grid(grid)
+        } else {
+            snapshot.capture_history(grid, offset)
+        };
+        let rows = snapshot.rows();
+        let frame = snapshot.frame(&rows, true);
+        std::hint::black_box(&frame);
+        usize::from(damage.is_none()) + frame.rows.len()
+    }
+
+    /// The best of `reps` full captures (and frames) at `offset`, each a
+    /// view that moved: the generation is forgotten at offset 0, and the
+    /// view alternates between `offset` and the line below it above it.
+    fn best_full_capture(grid: &Grid, offset: usize, reps: usize) -> Duration {
+        let mut snapshot = Snapshot::default();
+        let mut best = Duration::MAX;
+        for i in 0..reps {
+            snapshot.generation = None;
+            let at = if offset == 0 { 0 } else { offset + i % 2 };
+            let start = Instant::now();
+            std::hint::black_box(capture_and_frame(&mut snapshot, grid, at));
+            best = best.min(start.elapsed());
+        }
+        best
+    }
+
+    /// #31 smoothness proxy for "scrolling 100k lines of history is
+    /// smooth", headless: on a 50x200 grid with 100 000 lines of history,
+    /// stepping the view 3 lines per frame over the whole history keeps
+    /// the 99th percentile of capture + frame under 1 ms, and the cost
+    /// does not grow with the history: a capture at offset 50 000 costs
+    /// within 1.10x of one at offset 0, and one at offset 5 000 within
+    /// 1.05x between 10 000 and 100 000 lines of history (best of 400
+    /// each; three attempts, as the other release timing bars).
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "timing bar; run in release")]
+    fn scrolling_through_a_long_history_is_smooth() {
+        const ATTEMPTS: usize = 3;
+        let big = long_history(100_000);
+        let small = long_history(10_000);
+        let mut failures = Vec::new();
+        for attempt in 1..=ATTEMPTS {
+            let mut snapshot = Snapshot::default();
+            let mut times = Vec::with_capacity(100_000 / 3 + 1);
+            for offset in (0..=100_000).step_by(3) {
+                let start = Instant::now();
+                std::hint::black_box(capture_and_frame(&mut snapshot, &big, offset));
+                times.push(start.elapsed());
+            }
+            times.sort_unstable();
+            let p99 = times[times.len() * 99 / 100];
+            let live = best_full_capture(&big, 0, 400);
+            let deep = best_full_capture(&big, 50_000, 400);
+            let short = best_full_capture(&small, 5_000, 400);
+            let long = best_full_capture(&big, 5_000, 400);
+            let ratio = |a: Duration, b: Duration| a.as_secs_f64() / b.as_secs_f64();
+            eprintln!(
+                "attempt {attempt}: {} frames, p50 {:?}, p99 {p99:?}, max {:?}; full capture at 0 \
+                 {live:?}, at 50 000 {deep:?} ({:.3}x); at 5 000 with 10k history {short:?}, \
+                 100k {long:?} ({:.3}x)",
+                times.len(),
+                times[times.len() / 2],
+                times.last().expect("frames"),
+                ratio(deep, live),
+                ratio(long, short),
+            );
+            let mut miss = Vec::new();
+            if p99 >= Duration::from_millis(1) {
+                miss.push(format!("p99 {p99:?} >= 1 ms"));
+            }
+            if ratio(deep, live) > 1.10 {
+                miss.push(format!(
+                    "offset 50 000 costs {:.3}x offset 0",
+                    ratio(deep, live)
+                ));
+            }
+            if ratio(long, short) > 1.05 {
+                miss.push(format!("100k history costs {:.3}x 10k", ratio(long, short)));
+            }
+            if miss.is_empty() {
+                return;
+            }
+            failures.push(format!("attempt {attempt}: {}", miss.join(", ")));
+        }
+        panic!("{failures:#?}");
+    }
+
+    /// The history count, and so a scrolled view, does not depend on how
+    /// the output was split: the same bytes fed whole and byte by byte
+    /// push the same lines and show the same rows at the same offset.
+    #[test]
+    fn a_scrolled_view_does_not_depend_on_chunking() {
+        let mut bytes = Vec::new();
+        for i in 0..120 {
+            bytes.extend(format!("L{i} \u{4e2d}e\u{301}\x1b[41mx\x1b[0m\r\n").as_bytes());
+            if i % 17 == 0 {
+                bytes.extend(b"\x1b[2;3r\n\n\x1b[r\x1bM\x1b[S");
+            }
+        }
+        let mut whole = Terminal::new(5, 12);
+        whole.advance(&bytes);
+        let mut split = Terminal::new(5, 12);
+        for byte in &bytes {
+            split.advance(std::slice::from_ref(byte));
+        }
+        assert_eq!(
+            whole.grid().scrollback_pushed(),
+            split.grid().scrollback_pushed()
+        );
+        assert_eq!(whole.grid().scrollback_len(), split.grid().scrollback_len());
+        for offset in [1, 4, 30, 100] {
+            let (mut a, mut b) = (Snapshot::default(), Snapshot::default());
+            a.capture(&whole, offset);
+            b.capture(&split, offset);
+            assert_eq!(a.rows(), b.rows(), "offset {offset}");
+            assert_eq!(a.clusters, b.clusters, "offset {offset}");
+        }
+    }
+
+    /// A flood of output under a view scrolled back (10 000 reads of 4 KiB
+    /// of `yes` on 50x200, the view anchored as a session anchors it): no
+    /// capture is slow (99th percentile under 1 ms, as for scrolling) and
+    /// the snapshot's memory does not grow. Release only.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "timing bar; run in release")]
+    fn a_flood_under_a_scrolled_view_keeps_captures_short() {
+        let mut term = full_terminal(50, 200);
+        term.advance(&b"history\r\n".repeat(5_000));
+        let chunk: Vec<u8> = b"y\n".repeat(2048);
+        let mut snapshot = Snapshot::default();
+        snapshot.capture(&term, 1_000);
+        let top = snapshot.scrolled.expect("scrolled").top;
+        let capacity = (snapshot.cells.capacity(), snapshot.clusters.capacity());
+        let mut times = Vec::with_capacity(10_000);
+        for _ in 0..10_000 {
+            term.advance(&chunk);
+            let offset = anchored(&term, top).min(term.grid().scrollback_len());
+            let start = Instant::now();
+            std::hint::black_box(snapshot.capture(&term, offset));
+            times.push(start.elapsed());
+        }
+        times.sort_unstable();
+        let p99 = times[times.len() * 99 / 100];
+        eprintln!(
+            "flood under a scrolled view: p50 {:?}, p99 {p99:?}, max {:?}",
+            times[times.len() / 2],
+            times.last().expect("captures")
+        );
+        assert!(p99 < Duration::from_millis(1), "p99 {p99:?}");
+        assert_eq!(
+            (snapshot.cells.capacity(), snapshot.clusters.capacity()),
+            capacity,
+            "snapshot grew"
         );
     }
 }

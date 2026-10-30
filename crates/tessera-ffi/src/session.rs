@@ -1,11 +1,13 @@
-//! Sessions: spawning, input, resizing and closing.
+//! Sessions: spawning, input, resizing, scrolling and closing.
 
 use std::ffi::{CStr, OsStr, c_char};
 use std::os::unix::ffi::OsStrExt;
 use std::slice;
 
 use tessera_app_core::view::{MAX_VIEW_COLS, MAX_VIEW_ROWS};
-use tessera_app_core::{PtySize, SessionId, SpawnOptions as CoreSpawnOptions};
+use tessera_app_core::{
+    PtySize, ScrollTarget as CoreScrollTarget, SessionId, SpawnOptions as CoreSpawnOptions,
+};
 
 use crate::app::App;
 use crate::error::{self, Error};
@@ -337,5 +339,160 @@ pub unsafe extern "C" fn tessera_session_clear_scrollback(app: *mut App, session
             "tessera_session_clear_scrollback",
             app.core.clear_scrollback(SessionId::from_raw(session_id)),
         )
+    })
+}
+
+/// Where `tessera_session_scroll_to` moves a session's view in its
+/// scrollback (its `target` argument). Offsets count lines above the live
+/// screen; every target is clamped to the history.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScrollTarget {
+    /// The oldest line in the scrollback.
+    Top = 0,
+    /// The live screen (offset 0), which follows the output.
+    Bottom = 1,
+    /// One page towards older output: the screen height less one line
+    /// (at least one line).
+    PageUp = 2,
+    /// One page towards the live screen.
+    PageDown = 3,
+    /// The `offset` argument's number of lines above the live screen.
+    Offset = 4,
+}
+
+impl ScrollTarget {
+    /// The target with discriminant `raw`, or `None` when no target has
+    /// it.
+    #[must_use]
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        Some(match raw {
+            0 => Self::Top,
+            1 => Self::Bottom,
+            2 => Self::PageUp,
+            3 => Self::PageDown,
+            4 => Self::Offset,
+            _ => return None,
+        })
+    }
+
+    /// The core's target; `offset` is used by [`ScrollTarget::Offset`]
+    /// only (saturated to the platform's `size_t`, then clamped to the
+    /// history).
+    fn to_core(self, offset: u64) -> CoreScrollTarget {
+        match self {
+            Self::Top => CoreScrollTarget::Top,
+            Self::Bottom => CoreScrollTarget::Bottom,
+            Self::PageUp => CoreScrollTarget::PageUp,
+            Self::PageDown => CoreScrollTarget::PageDown,
+            Self::Offset => CoreScrollTarget::Offset(usize::try_from(offset).unwrap_or(usize::MAX)),
+        }
+    }
+}
+
+/// A session's scroll position, filled in by
+/// `tessera_session_scroll_position`: enough for a scroll bar.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScrollPosition {
+    /// Lines the view is scrolled back from the live screen: 0 shows the
+    /// live screen, `history` the oldest line.
+    pub offset: u64,
+    /// Lines of scrollback above the live screen the view can show; 0 on
+    /// the alternate screen (a full-screen application), which shows no
+    /// scrollback.
+    pub history: u64,
+    /// Rows of the screen: the view shows this many lines.
+    pub rows: u16,
+}
+
+/// Moves session `session_id`'s view in its scrollback: `target` is one of
+/// the `TesseraScrollTarget` values, and `offset` the number of lines above
+/// the live screen for `TESSERA_SCROLL_TARGET_OFFSET` (ignored for every
+/// other target). The position is clamped to the history; on the
+/// alternate screen there is no scrollback and the view stays live. The
+/// next `tessera_surface_render` draws the new position.
+///
+/// A view scrolled back stays on the lines it shows while output
+/// continues, until they leave the scrollback; output that clears the
+/// scrollback, `tessera_session_clear_scrollback`, typing and pasting
+/// return it to the live screen.
+///
+/// Call from the UI (main) thread only, like the other input calls.
+///
+/// Returns `TESSERA_ERROR_NULL_POINTER` if `app` is `NULL`,
+/// `TESSERA_ERROR_INVALID_ARGUMENT` for an unknown `target` (nothing
+/// moves), `TESSERA_ERROR_SESSION_NOT_FOUND` if the id is not a live
+/// session.
+///
+/// # Safety
+///
+/// `app` must be `NULL` or a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_session_scroll_to(
+    app: *mut App,
+    session_id: u64,
+    target: u32,
+    offset: u64,
+) -> Error {
+    ffi_guard!("tessera_session_scroll_to", {
+        // SAFETY: the caller passes NULL or a live handle.
+        let Some(app) = (unsafe { App::from_ptr(app) }) else {
+            return Error::NullPointer;
+        };
+        let Some(target) = ScrollTarget::from_raw(target) else {
+            return Error::InvalidArgument;
+        };
+        error::status(
+            "tessera_session_scroll_to",
+            app.core
+                .scroll_to(SessionId::from_raw(session_id), target.to_core(offset))
+                .map(drop),
+        )
+    })
+}
+
+/// Stores session `session_id`'s scroll position in `*out`: the offset of
+/// its view above the live screen, the lines of history it can scroll
+/// into and the screen's rows, read together. Read it after output or a
+/// scroll (once per frame at most), not per event.
+///
+/// Returns `TESSERA_ERROR_NULL_POINTER` if `app` or `out` is `NULL`,
+/// `TESSERA_ERROR_SESSION_NOT_FOUND` if the id is not a live session. On
+/// failure `*out` is zeroed (when `out` is not `NULL`).
+///
+/// # Safety
+///
+/// `app` must be `NULL` or a live handle. `out` must be `NULL` or point to
+/// a writable `TesseraScrollPosition`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_session_scroll_position(
+    app: *mut App,
+    session_id: u64,
+    out: *mut ScrollPosition,
+) -> Error {
+    ffi_guard!("tessera_session_scroll_position", {
+        if out.is_null() {
+            return Error::NullPointer;
+        }
+        // SAFETY: non-null and writable per the contract.
+        unsafe { out.write(ScrollPosition::default()) };
+        // SAFETY: the caller passes NULL or a live handle.
+        let Some(app) = (unsafe { App::from_ptr(app) }) else {
+            return Error::NullPointer;
+        };
+        match app.core.scroll_position(SessionId::from_raw(session_id)) {
+            Ok(position) => {
+                let position = ScrollPosition {
+                    offset: u64::try_from(position.offset).unwrap_or(u64::MAX),
+                    history: u64::try_from(position.history).unwrap_or(u64::MAX),
+                    rows: position.rows,
+                };
+                // SAFETY: as above.
+                unsafe { out.write(position) };
+                Error::Ok
+            }
+            Err(error) => error::report("tessera_session_scroll_position", &error),
+        }
     })
 }

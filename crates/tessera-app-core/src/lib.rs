@@ -44,7 +44,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use tessera_pty::{NativePty, Pty, PtyEvents};
 use tessera_render::{FontConfig, Fonts, Gpu, Theme};
-use tessera_term::{Terminal, encode_key};
+use tessera_term::{MouseTracking, Terminal, encode_key};
 
 pub use input::{InputEvent, InputOutcome};
 pub use session::{SessionEvent, SessionId, SessionObserver};
@@ -149,6 +149,42 @@ pub struct ViewMetrics {
     /// after it. On the right half it is `false`, though the renderer
     /// draws the caret over both halves there too.
     pub cursor_wide: bool,
+}
+
+/// Where [`App::scroll_to`] moves a session's view in its scrollback.
+///
+/// Offsets count lines above the live screen, as [`App::scroll_offset`]
+/// does, and every target is clamped to the history
+/// ([`ScrollPosition::history`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ScrollTarget {
+    /// The oldest line in the scrollback.
+    Top,
+    /// The live screen (offset 0), which follows the output.
+    Bottom,
+    /// One page towards older output: the screen height less one line (at
+    /// least one line), so the top line of the old page stays in view.
+    PageUp,
+    /// One page towards the live screen; see [`ScrollTarget::PageUp`].
+    PageDown,
+    /// This many lines above the live screen.
+    Offset(usize),
+}
+
+/// A session's scroll position, as [`App::scroll_position`] reads it in one
+/// look at the terminal: enough for a scroll bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct ScrollPosition {
+    /// Lines the view is scrolled back from the live screen: 0 shows the
+    /// live screen, [`ScrollPosition::history`] the oldest line.
+    pub offset: usize,
+    /// Lines of scrollback above the live screen the view can show; 0 on
+    /// the alternate screen, which shows no scrollback.
+    pub history: usize,
+    /// Rows of the screen (the view shows this many lines).
+    pub rows: u16,
 }
 
 /// Root application object.
@@ -462,9 +498,9 @@ impl App {
     pub fn clear_scrollback(&self, id: SessionId) -> Result<()> {
         let session = self.session(id)?;
         session.with_terminal_mut(Terminal::clear_to_cursor);
-        // TODO(#31): every path that shrinks the scrollback (ED 3, a
-        // smaller `max_scrollback`, leaving the alternate screen) must
-        // reset or clamp the session's stored scroll offset, as here.
+        // Output that clears the history (RIS, ED 3) returns the view to
+        // the live screen when it is next read (ADR 0023); this does it at
+        // once.
         session.scroll_to_bottom();
         Ok(())
     }
@@ -484,9 +520,20 @@ impl App {
     ///   clamped to the grid; see [`App::last_mouse`]); always
     ///   [`InputOutcome::Ignored`] until mouse reporting and selection
     ///   exist.
-    /// * [`InputEvent::Scroll`]: moves the scrollback view (see
-    ///   [`App::scroll_offset`]); [`InputOutcome::Consumed`] only when the
-    ///   offset changed.
+    /// * [`InputEvent::Scroll`]: on the primary screen, moves the
+    ///   scrollback view (see [`App::scroll_offset`]);
+    ///   [`InputOutcome::Consumed`] only when the offset changed. On the
+    ///   alternate screen, which has no scrollback, the wheel sends cursor
+    ///   keys instead (xterm's alternate scroll, on by default): one Up
+    ///   (towards older output) or Down per whole line, `CSI A` / `CSI B`,
+    ///   or `SS3 A` / `SS3 B` in application cursor-key mode (DECCKM),
+    ///   at most the screen height per event; fractions accumulate as on
+    ///   the primary screen. Queued like a key, and
+    ///   [`InputOutcome::Consumed`] when a key was sent. While the
+    ///   application on the alternate screen asked for mouse reports
+    ///   (DECSET 9, 1000, 1002, 1003) the wheel is left to them (#12) and
+    ///   is [`InputOutcome::Ignored`]. The view never moves on the
+    ///   alternate screen.
     /// * [`InputEvent::Paste`]: as [`App::paste`]: sanitised with
     ///   [`input::sanitize_paste_into`], or in bracketed-paste mode
     ///   (DECSET 2004) wrapped in `ESC [ 200 ~` / `ESC [ 201 ~` and
@@ -537,11 +584,35 @@ impl App {
                 session.record_mouse(mouse);
                 Ok(InputOutcome::Ignored)
             }
-            InputEvent::Scroll(scroll) => Ok(if session.scroll(scroll.delta_lines) {
-                InputOutcome::Consumed
-            } else {
-                InputOutcome::Ignored
-            }),
+            InputEvent::Scroll(scroll) => {
+                // One look at the terminal, released before anything is
+                // queued.
+                let (alt, mouse, application_cursor_keys, rows) = session.with_terminal(|term| {
+                    (
+                        term.grid().is_alt_screen(),
+                        term.modes().mouse,
+                        term.keyboard_modes().application_cursor_keys,
+                        term.grid().rows(),
+                    )
+                });
+                if !alt {
+                    return Ok(if session.scroll(scroll.delta_lines) {
+                        InputOutcome::Consumed
+                    } else {
+                        InputOutcome::Ignored
+                    });
+                }
+                if mouse != MouseTracking::None {
+                    return Ok(InputOutcome::Ignored);
+                }
+                let lines = session.take_scroll_lines(scroll.delta_lines, rows);
+                let bytes = input::alternate_scroll_keys(lines, application_cursor_keys);
+                if bytes.is_empty() {
+                    return Ok(InputOutcome::Ignored);
+                }
+                session.queue_input(bytes).map_err(write_error)?;
+                Ok(InputOutcome::Consumed)
+            }
             InputEvent::Paste(text) => Self::queue_paste(&session, id, &text),
             InputEvent::Focus(focus) => {
                 let focused = focus == FocusEvent::Gained;
@@ -626,13 +697,48 @@ impl App {
     }
 
     /// How many lines session `id`'s view is scrolled back from the live
-    /// screen: 0 at the bottom, at most the scrollback length.
+    /// screen: 0 at the bottom (and always on the alternate screen), at
+    /// most the scrollback length.
+    ///
+    /// A view scrolled back stays on the lines it shows while output
+    /// continues: each line the output pushes into the scrollback adds one
+    /// to the offset, until those lines are evicted at the scrollback cap
+    /// and the view stops at the oldest line left. The live screen (0)
+    /// follows the output. Output that clears the scrollback (RIS, ED 3),
+    /// [`App::clear_scrollback`], typing and pasting return the view to
+    /// the live screen; a resize keeps its distance from the live screen,
+    /// clamped to the re-wrapped history (ADR 0023).
     ///
     /// # Errors
     ///
     /// [`Error::SessionNotFound`] if `id` is not a live session.
     pub fn scroll_offset(&self, id: SessionId) -> Result<usize> {
         Ok(self.session(id)?.scroll_offset())
+    }
+
+    /// Moves session `id`'s view in its scrollback to `target`, clamped to
+    /// the history, and returns whether the offset changed. The next
+    /// [`App::render_view`] draws the new position. On the alternate
+    /// screen there is no scrollback: the view stays live and this returns
+    /// `false`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn scroll_to(&self, id: SessionId, target: ScrollTarget) -> Result<bool> {
+        Ok(self.session(id)?.scroll_to(target))
+    }
+
+    /// Session `id`'s scroll position: the offset ([`App::scroll_offset`]),
+    /// the lines of history it can scroll into and the screen height, read
+    /// together under the terminal lock (once per frame or output
+    /// notification, like [`App::with_terminal`]).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn scroll_position(&self, id: SessionId) -> Result<ScrollPosition> {
+        Ok(self.session(id)?.scroll_position())
     }
 
     /// Whether session `id`'s view has keyboard focus, as last reported
@@ -919,11 +1025,18 @@ impl App {
 
     /// Draws session `id`'s visible screen into its view and presents it.
     ///
-    /// The session's terminal is locked only while its visible rows and
-    /// cursor are copied out; shaping, drawing and waiting for a drawable
-    /// happen after the lock is released. The cursor is a block, drawn
-    /// hollow while the session is not focused ([`App::is_focused`]).
-    /// Must be called on the main thread.
+    /// The view shows the live screen, or while it is scrolled back
+    /// ([`App::scroll_offset`]) the scrollback lines at that offset, with
+    /// the top rows of the live screen below them when the offset is
+    /// smaller than the screen; the cursor is not drawn while scrolled
+    /// back. Moving the view redraws every row; output that does not
+    /// change the lines in view draws nothing ([`FrameStatus::Skipped`]).
+    ///
+    /// The session's terminal is locked only while the rows in view and
+    /// the cursor are copied out; shaping, drawing and waiting for a
+    /// drawable happen after the lock is released. The cursor has the
+    /// shape the terminal asks for, drawn hollow while the session is not
+    /// focused ([`App::is_focused`]). Must be called on the main thread.
     ///
     /// Three statuses mean nothing was drawn by this call, and say whether
     /// to call again (ADR 0016):
@@ -965,7 +1078,7 @@ impl App {
         let result = if view.gpu().is_lost() {
             Err(RenderError::DeviceLost)
         } else {
-            session.with_terminal(|term| view.capture(term));
+            session.with_viewport(|term, offset| view.capture(term, offset));
             view.render(focused)
         };
         // A loss during the frame may surface as any error (or none).
@@ -2953,6 +3066,358 @@ mod tests {
         assert_eq!(app.scroll_offset(id).unwrap(), 0);
     }
 
+    /// `count` numbered lines, `line {from}` on.
+    fn numbered_lines(from: usize, count: usize) -> Vec<u8> {
+        (from..from + count)
+            .flat_map(|n| format!("line {n}\r\n").into_bytes())
+            .collect()
+    }
+
+    /// The rows session `id`'s view shows now, as text: a fresh snapshot
+    /// taken the way `render_view` takes one.
+    fn view_text(app: &App, id: SessionId) -> Vec<String> {
+        app.session(id).unwrap().with_viewport(|term, offset| {
+            let mut snapshot = view::Snapshot::default();
+            snapshot.capture(term, offset);
+            snapshot
+                .rows()
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|cell| cell.ch)
+                        .collect::<String>()
+                        .trim_end()
+                        .to_owned()
+                })
+                .collect()
+        })
+    }
+
+    /// The text of the live screen's rows.
+    fn live_text(app: &App, id: SessionId) -> Vec<String> {
+        app.with_terminal(id, |term| {
+            term.grid()
+                .visible_lines()
+                .iter()
+                .map(|line| line.text().trim_end().to_owned())
+                .collect()
+        })
+        .unwrap()
+    }
+
+    /// #31 Done-when: scrolled back 50 lines, 1 000 more lines of output
+    /// leave the view's rows byte-identical (the offset grows with the
+    /// history) and its frames `Skipped`; at offset 0 the view follows the
+    /// output.
+    #[test]
+    fn a_scrolled_back_view_stays_on_its_lines_while_output_continues() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        let gpu = attach_offscreen(&app, id, PhysicalSize::new(800, 600), 1.0);
+        output(&fake, &events, &numbered_lines(0, 200));
+        let rows = app.scroll_position(id).unwrap().rows;
+        assert_eq!(scroll(&app, id, 50.0), InputOutcome::Consumed);
+        let before = view_text(&app, id);
+        let first = 200 - 50 - usize::from(rows) + 1;
+        assert_eq!(before[0], format!("line {first}"));
+        let snapshot = |app: &App| {
+            let views = lock(&app.views);
+            let snapshot = views[&id].snapshot();
+            (snapshot.rows().concat(), snapshot.clusters().to_vec())
+        };
+        let mut drawn = None;
+        if gpu {
+            assert_eq!(app.render_view(id).unwrap(), FrameStatus::Presented);
+            drawn = Some(snapshot(&app));
+        }
+        output(&fake, &events, &numbered_lines(200, 1_000));
+        assert_eq!(app.scroll_offset(id).unwrap(), 1_050);
+        assert_eq!(view_text(&app, id), before);
+        if let Some(drawn) = drawn {
+            assert_eq!(app.render_view(id).unwrap(), FrameStatus::Skipped);
+            assert_eq!(snapshot(&app), drawn, "byte-identical rows");
+        }
+        // Back at the bottom, the view follows the output.
+        assert!(app.scroll_to(id, ScrollTarget::Bottom).unwrap());
+        output(&fake, &events, b"tail\r\n");
+        assert_eq!(app.scroll_offset(id).unwrap(), 0);
+        assert_eq!(view_text(&app, id), live_text(&app, id));
+        output(&fake, &events, &numbered_lines(0, 5));
+        assert_eq!(app.scroll_offset(id).unwrap(), 0);
+        assert_eq!(view_text(&app, id), live_text(&app, id));
+    }
+
+    /// Once the lines a view shows are evicted at the scrollback cap, it
+    /// stays on the oldest line left.
+    #[test]
+    fn a_view_whose_lines_are_evicted_stays_on_the_oldest_line() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        output(&fake, &events, &numbered_lines(0, 200));
+        assert_eq!(scroll(&app, id, 50.0), InputOutcome::Consumed);
+        let cap = app
+            .with_terminal(id, |term| term.grid().max_scrollback())
+            .unwrap();
+        output(&fake, &events, &numbered_lines(200, cap));
+        let oldest = app
+            .with_terminal(id, |term| term.grid().scrollback_line(0).unwrap().text())
+            .unwrap();
+        assert_eq!(app.scroll_offset(id).unwrap(), cap);
+        assert_eq!(view_text(&app, id)[0], oldest.trim_end());
+        output(&fake, &events, &numbered_lines(0, 500));
+        assert_eq!(app.scroll_offset(id).unwrap(), cap, "still at the top");
+    }
+
+    /// RIS and ED 3 from the child clear the scrollback and return the view
+    /// to the live screen (the #107 adversarial finding), with or without
+    /// output after them; so does ⌘K.
+    #[test]
+    fn clearing_the_scrollback_returns_the_view_to_the_live_screen() {
+        for (clear, then) in [
+            (&b"\x1bc"[..], 0),
+            (b"\x1bc", 50),
+            (b"\x1b[3J", 0),
+            (b"\x1b[3J", 50),
+            (b"\x1b[H\x1b[2J\x1b[3J", 50),
+        ] {
+            let app = app();
+            let events = observe(&app);
+            let (id, fake) = attach_fake(&app, false);
+            output(&fake, &events, &numbered_lines(0, 100));
+            assert_eq!(scroll(&app, id, 20.0), InputOutcome::Consumed);
+            let mut bytes = clear.to_vec();
+            bytes.extend(numbered_lines(1_000, then));
+            output(&fake, &events, &bytes);
+            assert_eq!(
+                app.scroll_offset(id).unwrap(),
+                0,
+                "{clear:?} then {then} lines"
+            );
+            assert_eq!(view_text(&app, id), live_text(&app, id), "{clear:?}");
+            // The view scrolls again from there.
+            if then > 0 {
+                assert_eq!(scroll(&app, id, 2.0), InputOutcome::Consumed);
+                assert_eq!(app.scroll_offset(id).unwrap(), 2);
+            }
+        }
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        output(&fake, &events, &numbered_lines(0, 100));
+        assert_eq!(scroll(&app, id, 20.0), InputOutcome::Consumed);
+        app.clear_scrollback(id).unwrap();
+        output(&fake, &events, &numbered_lines(0, 50));
+        assert_eq!(app.scroll_offset(id).unwrap(), 0, "⌘K");
+    }
+
+    /// A resize keeps the view's distance from the live screen, clamped to
+    /// the re-wrapped history.
+    #[test]
+    fn a_resize_clamps_the_scroll_offset() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        output(&fake, &events, &numbered_lines(0, 100));
+        assert_eq!(scroll(&app, id, 10.0), InputOutcome::Consumed);
+        // More rows pull history back onto the screen; the view keeps 10.
+        app.resize(id, PtySize::new(30, 80)).unwrap();
+        assert_eq!(app.scroll_offset(id).unwrap(), 10);
+        // At the top, a taller screen leaves less history: clamped.
+        assert!(app.scroll_to(id, ScrollTarget::Top).unwrap());
+        let top = app.scroll_offset(id).unwrap();
+        app.resize(id, PtySize::new(60, 80)).unwrap();
+        let position = app.scroll_position(id).unwrap();
+        assert_eq!(position.history, top - 30);
+        assert_eq!(position.offset, position.history, "clamped to the history");
+        // Re-wrapping to a narrow width lengthens the history; the
+        // offset stays where it was.
+        app.resize(id, PtySize::new(60, 4)).unwrap();
+        let position = app.scroll_position(id).unwrap();
+        assert!(position.history > top, "{position:?}");
+        assert_eq!(position.offset, top - 30);
+        assert_eq!(view_text(&app, id).len(), 60);
+        // Output after the resize is anchored again.
+        output(&fake, &events, b"a\r\nb\r\n");
+        assert_eq!(app.scroll_offset(id).unwrap(), top - 28);
+    }
+
+    /// #31 alternate screen: no scrollback, so the wheel sends cursor keys
+    /// (`CSI A`/`CSI B`, or `SS3 A`/`SS3 B` under DECCKM), one per whole
+    /// line and at most a screen's height per event, and never moves the
+    /// view. With mouse reporting on it sends nothing (#12 will report
+    /// it); on the primary screen it scrolls the view as before.
+    #[test]
+    fn the_wheel_on_the_alternate_screen_sends_cursor_keys() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        output(&fake, &events, &numbered_lines(0, 40));
+        output(&fake, &events, b"\x1b[?1049h");
+        let mut expected = Vec::new();
+        assert_eq!(scroll(&app, id, 3.0), InputOutcome::Consumed);
+        expected.extend(b"\x1b[A".repeat(3));
+        assert_eq!(scroll(&app, id, -2.0), InputOutcome::Consumed);
+        expected.extend(b"\x1b[B".repeat(2));
+        // Fractions accumulate.
+        assert_eq!(scroll(&app, id, 0.5), InputOutcome::Ignored);
+        assert_eq!(scroll(&app, id, 0.5), InputOutcome::Consumed);
+        expected.extend(b"\x1b[A");
+        // At most the screen height (24 rows) per event.
+        assert_eq!(scroll(&app, id, 1e9), InputOutcome::Consumed);
+        expected.extend(b"\x1b[A".repeat(24));
+        assert_eq!(scroll(&app, id, f32::NEG_INFINITY), InputOutcome::Ignored);
+        written_eventually(&fake, &expected);
+        assert_eq!(app.scroll_offset(id).unwrap(), 0);
+        // Application cursor keys (DECCKM).
+        output(&fake, &events, b"\x1b[?1h");
+        assert_eq!(scroll(&app, id, 1.0), InputOutcome::Consumed);
+        assert_eq!(scroll(&app, id, -1.0), InputOutcome::Consumed);
+        expected.extend(b"\x1bOA\x1bOB");
+        written_eventually(&fake, &expected);
+        // Mouse reporting on: the wheel is the mouse protocol's.
+        output(&fake, &events, b"\x1b[?1000h");
+        assert_eq!(scroll(&app, id, 3.0), InputOutcome::Ignored);
+        assert_eq!(app.scroll_offset(id).unwrap(), 0);
+        assert!(!app.scroll_to(id, ScrollTarget::Top).unwrap());
+        let position = app.scroll_position(id).unwrap();
+        assert_eq!((position.offset, position.history), (0, 0));
+        assert_nothing_written_after(&fake, &expected, &app, id);
+        expected.push(b'#');
+        // Back on the primary screen the wheel scrolls the view, mouse
+        // reporting or not, and sends nothing.
+        output(&fake, &events, b"\x1b[?1049l");
+        assert_eq!(scroll(&app, id, 3.0), InputOutcome::Consumed);
+        assert_eq!(app.scroll_offset(id).unwrap(), 3);
+        output(&fake, &events, b"\x1b[?1000l\x1b[?1l");
+        assert_eq!(scroll(&app, id, 1.0), InputOutcome::Consumed);
+        assert_eq!(app.scroll_offset(id).unwrap(), 4);
+        assert_nothing_written_after(&fake, &expected, &app, id);
+    }
+
+    /// A flood of wheel events on the alternate screen to a child that
+    /// stopped reading: each event queues at most a screen's height of
+    /// keys, so the pending input fills to its bound and the next event is
+    /// refused (`WouldBlock`) instead of growing without one, and every
+    /// event returns at once.
+    #[test]
+    fn a_flood_of_alternate_screen_wheel_events_is_bounded() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        output(&fake, &events, b"\x1b[?1049h");
+        fake.would_block.store(true, Ordering::SeqCst);
+        let per_event = 24 * 3;
+        let fits = session::PENDING_INPUT_BYTES / per_event;
+        let start = Instant::now();
+        let mut slowest = Duration::ZERO;
+        let mut refused = None;
+        for n in 0..fits + 10 {
+            let t = Instant::now();
+            let result = app.send_input(id, InputEvent::Scroll(input::ScrollEvent::new(1e9)));
+            slowest = slowest.max(t.elapsed());
+            match result {
+                Ok(outcome) => assert_eq!(outcome, InputOutcome::Consumed),
+                Err(Error::Write { source, .. }) => {
+                    assert_eq!(source.kind(), io::ErrorKind::WouldBlock);
+                    refused = Some(n);
+                    break;
+                }
+                Err(other) => panic!("{other}"),
+            }
+        }
+        eprintln!(
+            "{:?} events before the bound, slowest {slowest:?}, all in {:?}",
+            refused,
+            start.elapsed()
+        );
+        // The writer may have taken one chunk before it blocked.
+        let refused = refused.expect("the pending input is bounded");
+        assert!(
+            (fits - 1..=fits + 1).contains(&refused),
+            "{refused} vs {fits}"
+        );
+        assert_eq!(app.scroll_offset(id).unwrap(), 0);
+    }
+
+    /// A program entering the alternate screen while the view is scrolled
+    /// back shows its screen, and leaving it returns to the live screen.
+    #[test]
+    fn the_alternate_screen_returns_the_view_to_the_live_screen() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        output(&fake, &events, &numbered_lines(0, 60));
+        assert_eq!(scroll(&app, id, 5.0), InputOutcome::Consumed);
+        output(&fake, &events, b"\x1b[?1049h\x1b[Hfull screen");
+        assert_eq!(app.scroll_offset(id).unwrap(), 0);
+        assert_eq!(view_text(&app, id)[0], "full screen");
+        output(&fake, &events, b"\x1b[?1049l");
+        assert_eq!(app.scroll_offset(id).unwrap(), 0);
+        assert_eq!(view_text(&app, id), live_text(&app, id));
+    }
+
+    #[test]
+    fn scroll_to_moves_the_view_and_clamps() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        let position = |app: &App| {
+            let p = app.scroll_position(id).unwrap();
+            (p.offset, p.history, p.rows)
+        };
+        assert_eq!(position(&app), (0, 0, 24));
+        assert!(!app.scroll_to(id, ScrollTarget::Top).unwrap(), "no history");
+        assert!(!app.scroll_to(id, ScrollTarget::PageUp).unwrap());
+        // 100 lines and the cursor's row on 24 rows: 77 in the history.
+        output(&fake, &events, &numbered_lines(0, 100));
+        assert_eq!(position(&app), (0, 77, 24));
+        let to = |target| app.scroll_to(id, target).unwrap();
+        assert!(to(ScrollTarget::PageUp));
+        assert_eq!(position(&app), (23, 77, 24), "a page is rows - 1");
+        assert!(to(ScrollTarget::PageUp));
+        assert!(to(ScrollTarget::PageUp));
+        assert_eq!(position(&app).0, 69);
+        assert!(to(ScrollTarget::PageUp));
+        assert_eq!(position(&app).0, 77, "clamped at the top");
+        assert!(!to(ScrollTarget::PageUp));
+        assert!(!to(ScrollTarget::Top));
+        assert!(to(ScrollTarget::PageDown));
+        assert_eq!(position(&app).0, 54);
+        assert!(to(ScrollTarget::Offset(10)));
+        assert_eq!(position(&app).0, 10);
+        assert!(!to(ScrollTarget::Offset(10)));
+        assert!(to(ScrollTarget::Offset(usize::MAX)));
+        assert_eq!(position(&app).0, 77);
+        assert_eq!(view_text(&app, id)[0], "line 0");
+        assert!(to(ScrollTarget::Bottom));
+        assert_eq!(position(&app).0, 0);
+        assert!(!to(ScrollTarget::PageDown));
+        assert!(!to(ScrollTarget::Bottom));
+        // A scroll_to drops a banked fraction of a wheel line.
+        assert_eq!(scroll(&app, id, 0.75), InputOutcome::Ignored);
+        assert!(to(ScrollTarget::Top));
+        assert!(to(ScrollTarget::Bottom));
+        assert_eq!(scroll(&app, id, 0.5), InputOutcome::Ignored);
+        // On a one-row screen a page is one line.
+        app.resize(id, PtySize::new(1, 80)).unwrap();
+        assert!(to(ScrollTarget::PageUp));
+        assert_eq!(position(&app).0, 1);
+        assert!(to(ScrollTarget::Offset(0)));
+        assert_eq!(position(&app).0, 0);
+        assert_nothing_written(&app, id, &fake);
+        let gone = SessionId::from_raw(99);
+        assert!(matches!(
+            app.scroll_to(gone, ScrollTarget::Top),
+            Err(Error::SessionNotFound(i)) if i == gone
+        ));
+        assert!(matches!(
+            app.scroll_position(gone),
+            Err(Error::SessionNotFound(i)) if i == gone
+        ));
+    }
+
     #[test]
     fn input_to_unknown_sessions_is_rejected() {
         let app = app();
@@ -3447,7 +3912,7 @@ mod tests {
             let gpu = Gpu::headless().expect("a Metal adapter");
             let mut reference =
                 View::offscreen(gpu, fonts, app.view_theme(), SIZE, 1.0).expect("view");
-            app.with_terminal(id, |term| reference.capture(term))
+            app.with_terminal(id, |term| reference.capture(term, 0))
                 .unwrap();
             assert_eq!(
                 reference.render(false).expect("reference frame"),
