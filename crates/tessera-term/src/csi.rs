@@ -365,11 +365,11 @@ impl State {
         // xterm's `ReallyReset` common part does the same for DECSTR, DECSCL
         // and RIS (ADR 0020).
         self.cursor_override = None;
-        // #112, #95, #97, #9: reset here once the state exists:
+        // #112, #95, #97, #10: reset here once the state exists:
         // G0-G3/GL/GR and DECNRCM to their defaults (SCS, #112), DECSCA off
         // (#95), DECLRMM off with full left/right margins and reverse wrap
         // (?45) to its default (#97), and the OSC 4 palette to the theme
-        // (xterm's ResetAnsiColorRequest, #9).
+        // (xterm's ResetAnsiColorRequest, #10).
     }
 
     /// DECSCUSR (`CSI Ps SP q`) with its first parameter `ps`: 1 and 2 a

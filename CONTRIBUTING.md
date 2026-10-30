@@ -191,8 +191,8 @@ or a bug report. Cmd-V pastes (Ctrl+Shift+V off macOS, read through `pbpaste`,
 `wl-paste` or `xclip` on a helper thread, killed after 2 s), keys typed while
 it is read wait for it, other Cmd chords are dropped, the left Option key is
 Alt and the right one composes (so Nordic and German layouts can still type `@
-[ ] { } | \ $`), the window title will follow the shell once the emulator
-reports titles (OSC 0/2, #9), and the bell is printed on stderr. Dead keys
+[ ] { } | \ $`), the window title follows the shell (OSC 0/2), and the
+bell is printed on stderr. Dead keys
 should work (`´` then `e` types `é`; see the manual check below), but there is
 no IME, so no CJK input: allowing winit's IME would let macOS's press-and-hold
 accent menu replace key repeat (kitty and WezTerm turn

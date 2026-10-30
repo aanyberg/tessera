@@ -187,11 +187,7 @@ final class TesseraKitTests: XCTestCase {
         let exited = recorder.expectExit(session)
         await fulfillment(of: [exited], timeout: 5)
         let events = recorder.events[session.id, default: []].filter { $0 != .output }
-        // The core ignores OSC until #9 (term: OSC handling) lands, so no title
-        // arrives yet. Once one does this fails on purpose: expect
-        // [.title("hello"), .bell, .exit(code: 0, signal: 0)] instead. The
-        // bridge's title path is covered without the core in CallbackBridgeTests.
-        XCTAssertEqual(events, [.bell, .exit(code: 0, signal: 0)], "titles arrive now (#9): update this test")
+        XCTAssertEqual(events, [.title("hello"), .bell, .exit(code: 0, signal: 0)])
     }
 
     func testOutputIsDelivered() async throws {

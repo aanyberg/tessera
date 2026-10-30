@@ -763,7 +763,7 @@ screen:
 >
 cursor: (0,1)   # 1-based row 1 col 2
 pending_wrap: false
-requests: []
+requests: [SetTitle("title")]
 scrollback: len=0
 assert: requests contains no Bell
 wrapped_rows(1-based): none
@@ -896,9 +896,9 @@ screen:
 >
 cursor: (0,4)   # 1-based row 1 col 5
 pending_wrap: false
-requests: []
+requests: [SetTitle("hi")]
 scrollback: len=0
-assert: requests == []
+assert: requests == [SetTitle("hi")]
 wrapped_rows(1-based): none
 
 

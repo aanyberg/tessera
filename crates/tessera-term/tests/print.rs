@@ -164,7 +164,7 @@ struct Case {
     screen: String,
     cursor: Point,
     pending_wrap: bool,
-    bells: usize,
+    requests: Vec<Request>,
     /// `(len, first line as (text, wrapped))`; `None` when not asserted.
     scrollback: Option<(usize, Option<(String, bool)>)>,
 }
@@ -186,7 +186,9 @@ fn parse_cursor(raw: &str) -> Point {
     )
 }
 
-fn parse_requests(raw: &str) -> usize {
+/// `[]`, or a comma list of `Bell` and `SetTitle("..")` (a title without
+/// `,`, `"` or `\`: the fixture's are plain words).
+fn parse_requests(raw: &str) -> Vec<Request> {
     let inner = value(raw)
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
@@ -195,8 +197,17 @@ fn parse_requests(raw: &str) -> usize {
         .split(',')
         .map(str::trim)
         .filter(|r| !r.is_empty())
-        .inspect(|r| assert_eq!(*r, "Bell", "unexpected request `{r}` in fixture"))
-        .count()
+        .map(|r| {
+            if r == "Bell" {
+                return Request::Bell;
+            }
+            let title = r
+                .strip_prefix("SetTitle(\"")
+                .and_then(|t| t.strip_suffix("\")"))
+                .unwrap_or_else(|| panic!("unexpected request `{r}` in fixture"));
+            Request::SetTitle(title.to_owned())
+        })
+        .collect()
 }
 
 fn parse_scrollback(raw: &str) -> Option<(usize, Option<(String, bool)>)> {
@@ -226,7 +237,7 @@ fn parse_fixture(text: &str) -> Vec<Case> {
         let mut size = None;
         let mut steps = Vec::new();
         let mut screen = String::new();
-        let (mut cursor, mut pending_wrap, mut bells, mut scrollback) = (None, None, None, None);
+        let (mut cursor, mut pending_wrap, mut requests, mut scrollback) = (None, None, None, None);
         while let Some(line) = lines.next_if(|l| !l.starts_with("### ") && !l.starts_with("# --")) {
             let (key, raw) = line
                 .split_once(": ")
@@ -253,7 +264,7 @@ fn parse_fixture(text: &str) -> Vec<Case> {
                 }
                 "cursor" => cursor = Some(parse_cursor(raw)),
                 "pending_wrap" => pending_wrap = Some(value(raw) == "true"),
-                "requests" => bells = Some(parse_requests(raw)),
+                "requests" => requests = Some(parse_requests(raw)),
                 "scrollback" => scrollback = Some(parse_scrollback(raw)),
                 _ => {}
             }
@@ -265,7 +276,7 @@ fn parse_fixture(text: &str) -> Vec<Case> {
             screen,
             cursor: cursor.unwrap_or_else(|| panic!("{id}: no cursor")),
             pending_wrap: pending_wrap.unwrap_or_else(|| panic!("{id}: no pending_wrap")),
-            bells: bells.unwrap_or_else(|| panic!("{id}: no requests")),
+            requests: requests.unwrap_or_else(|| panic!("{id}: no requests")),
             scrollback: scrollback.unwrap_or_else(|| panic!("{id}: no scrollback")),
         });
     }
@@ -300,8 +311,8 @@ fn check_case(case: &Case, chunking: Chunking) -> Vec<String> {
     );
     expect(
         "requests",
-        requests == vec![Request::Bell; case.bells],
-        format!("expected {} bell(s), got {requests:?}", case.bells),
+        requests == case.requests,
+        format!("expected {:?}, got {requests:?}", case.requests),
     );
     if let Some((len, first)) = &case.scrollback {
         expect(

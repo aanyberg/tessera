@@ -8,8 +8,11 @@
 //! [`parse_osc133`] into [`tessera_grid::Mark`] values, [`parse_osc7`] into a
 //! [`Cwd`] and [`parse_osc1337`] into a [`ShellIntegrationVersion`]. Prompt
 //! navigation, command timing and the future agent usage tracker build on
-//! the marks; the terminal routes the OSCs here (#9). See
-//! `docs/adr/0021-shell-integration-injection.md`.
+//! the marks. The terminal applies OSC 133 itself (through
+//! [`tessera_grid::Mark::from_osc133`], which [`parse_osc133`] forwards to)
+//! and hands OSC 7 and the handshake up raw for `tessera-app-core` to decode
+//! here. See `docs/adr/0021-shell-integration-injection.md` and
+//! `docs/adr/0022-osc-title-clipboard-and-shell-integration-routing.md`.
 
 #![forbid(unsafe_code)]
 
@@ -21,26 +24,18 @@ pub use inject::{Injection, Launch, Shell};
 pub use osc7::{Cwd, parse_osc7};
 use tessera_grid::Mark;
 
-/// Parses an OSC 133 payload (`A`, `B`, `C`, `D;<code>`) into a mark.
+/// Parses an OSC 133 payload (`A`, `B`, `C`, `D;<code>`, the bytes after
+/// `133;`) into a mark: [`Mark::from_osc133`], which the terminal applies
+/// itself (#9; `tessera-term` does not depend on this crate).
 ///
-/// Parameters after the letter (`A;k=s`, `C;cmdline_url=...`, `D;0;aid=1`)
-/// are ignored, except that `D`'s first parameter is its exit code (`None`
+/// Strict: the letter must end the payload or be followed by `;`, so
+/// `Afoo` is not a mark. Options after the letter are ignored, except
+/// that `A;k=s`, `A;k=c` and `A;k=r` (a secondary, continuation or right
+/// prompt) give `None`, and `D`'s first option is its exit code (`None`
 /// when it is missing or not a number).
+#[must_use]
 pub fn parse_osc133(payload: &[u8]) -> Option<Mark> {
-    match payload {
-        [b'A', ..] => Some(Mark::PromptStart),
-        [b'B', ..] => Some(Mark::CommandStart),
-        [b'C', ..] => Some(Mark::OutputStart),
-        [b'D'] => Some(Mark::CommandEnd { exit_code: None }),
-        [b'D', b';', code @ ..] => {
-            let code = code.split(|&b| b == b';').next().unwrap_or_default();
-            let exit_code = std::str::from_utf8(code)
-                .ok()
-                .and_then(|code| code.parse().ok());
-            Some(Mark::CommandEnd { exit_code })
-        }
-        _ => None,
-    }
+    Mark::from_osc133(payload)
 }
 
 /// The handshake a script sends once at startup:

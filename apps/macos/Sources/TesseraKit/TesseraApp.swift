@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 internal import TesseraCore
 
 /// Receives a ``TesseraApp``'s session events, always on the main actor.
@@ -59,6 +59,13 @@ public final class TesseraApp {
     public var delegate: (any TesseraAppDelegate)? {
         get { bridge.delegate }
         set { bridge.delegate = newValue }
+    }
+
+    /// Where programs' clipboard writes (OSC 52) go: the general pasteboard.
+    /// Written for an open session whether or not a ``delegate`` is set.
+    var pasteboard: NSPasteboard {
+        get { bridge.pasteboard }
+        set { bridge.pasteboard = newValue }
     }
 
     private let core: CoreHandle

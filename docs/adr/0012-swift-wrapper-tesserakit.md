@@ -181,9 +181,8 @@ writes from plain threads and detached tasks, a write blocked on a child
 that does not read being woken by `shutdown()`, and the bridge's copying,
 ordering, coalescing and dropping, driven through the C function pointers,
 and the bell-flood regression test.
-The core does not apply OSC titles yet (#9), so the end-to-end test expects
-the bell and the exit with no title, and fails on purpose, to be updated,
-once titles arrive.
+The end-to-end test expects the title, the bell and the exit in that order
+(the core applies OSC titles since #9, ADR 0022).
 
 ## Consequences
 

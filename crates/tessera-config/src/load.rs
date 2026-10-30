@@ -197,6 +197,7 @@ impl Config {
             warnings.push(Warning::UnknownKeysOmitted { count: omitted });
         }
         warnings.extend(invalid_cursor_shapes(text));
+        warnings.extend(invalid_clipboard_write(text));
         warnings.extend(config.normalize());
         for w in &warnings {
             tracing::warn!(target: "tessera_config", "{w}");
@@ -334,6 +335,48 @@ fn invalid_cursor_shapes(text: &str) -> Vec<Warning> {
             })
         })
         .collect()
+}
+
+/// Deserializes `terminal.clipboard_write` without failing: anything but
+/// a boolean gives the default (`true`), and [`invalid_clipboard_write`]
+/// reports it, as for [`lenient_cursor_shape`].
+pub(crate) fn lenient_clipboard_write<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+
+    let value = toml::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_bool()
+        .unwrap_or(crate::Terminal::default().clipboard_write))
+}
+
+/// A [`Warning::OutOfRange`] when `[terminal] clipboard_write` is not a
+/// boolean ([`lenient_clipboard_write`] used the default instead). Reads the
+/// document a second time, only when it mentions the key at all.
+fn invalid_clipboard_write(text: &str) -> Vec<Warning> {
+    const KEY: &str = "clipboard_write";
+    if !text.contains(KEY) {
+        return Vec::new();
+    }
+    let Ok(table) = text.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let Some(value) = table.get("terminal").and_then(|t| t.get(KEY)) else {
+        return Vec::new();
+    };
+    if value.is_bool() {
+        return Vec::new();
+    }
+    vec![Warning::OutOfRange {
+        path: format!("terminal.{KEY}"),
+        detail: format!(
+            "{} replaced by {} (expected true or false)",
+            truncated(&value.to_string(), MAX_WARNING_PATH_LEN),
+            crate::Terminal::default().clipboard_write
+        ),
+    }]
 }
 
 fn normalize_appearance(prefix: &str, a: &mut crate::Appearance, warnings: &mut Vec<Warning>) {
@@ -860,6 +903,49 @@ mod tests {
         ));
         // A key that only mentions the name is not checked.
         let loaded = Config::from_toml_lenient("[appearance]\ntheme = \"cursor_shape\"\n").unwrap();
+        assert!(matches!(&loaded.warnings[..], []), "{:?}", loaded.warnings);
+    }
+
+    #[test]
+    fn clipboard_write_parses_and_defaults_to_true() {
+        assert!(Config::default().terminal.clipboard_write);
+        assert!(
+            Config::from_toml_lenient("")
+                .unwrap()
+                .config
+                .terminal
+                .clipboard_write
+        );
+        for value in [true, false] {
+            let text = format!("[terminal]\nclipboard_write = {value}\n");
+            let loaded = Config::from_toml_lenient(&text).unwrap();
+            assert_eq!(loaded.config.terminal.clipboard_write, value);
+            assert_eq!(loaded.warnings, []);
+        }
+    }
+
+    /// A clipboard setting that is not a boolean keeps the default (writes
+    /// allowed) with a warning naming the key; every other key applies.
+    #[test]
+    fn an_invalid_clipboard_write_warns_and_keeps_the_default() {
+        for bad in ["\"false\"", "0", "\"no\"", "[false]", "1.5"] {
+            let text = format!(
+                "[terminal]\nscrollback_lines = 7\nclipboard_write = {bad}\n\
+                 [appearance]\nfont_size = 15\n"
+            );
+            let loaded = Config::from_toml_lenient(&text).unwrap();
+            assert!(loaded.config.terminal.clipboard_write, "{bad}");
+            assert_eq!(loaded.config.terminal.scrollback_lines, 7, "{bad}");
+            assert_eq!(loaded.config.appearance.font_size, 15.0, "{bad}");
+            let [Warning::OutOfRange { path, detail }] = &loaded.warnings[..] else {
+                panic!("{bad}: {:?}", loaded.warnings);
+            };
+            assert_eq!(path, "terminal.clipboard_write", "{bad}");
+            assert!(detail.contains("true or false"), "{bad}: {detail}");
+        }
+        // A key that only mentions the name is not checked.
+        let loaded =
+            Config::from_toml_lenient("[appearance]\ntheme = \"clipboard_write\"\n").unwrap();
         assert!(matches!(&loaded.warnings[..], []), "{:?}", loaded.warnings);
     }
 

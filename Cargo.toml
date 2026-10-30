@@ -63,6 +63,7 @@ unicode-width = "0.2"
 bytemuck = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 winit = "0.30"
+base64 = "0.22"
 
 # external, dev
 insta = "1.43"
@@ -106,4 +107,10 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.chacha20]
+opt-level = 3
+
+# The OSC 52 table (crates/tessera-term/tests/osc.rs) decodes two 1.4 MB
+# clipboard payloads 33 times each; unoptimised, base64 decoding is a third
+# of that file's run time and keeps it over its 0.5 s budget (#9).
+[profile.dev.package.base64]
 opt-level = 3

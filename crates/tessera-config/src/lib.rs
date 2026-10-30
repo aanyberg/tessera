@@ -273,6 +273,13 @@ pub struct Terminal {
     /// its environment is never changed.
     #[cfg_attr(feature = "schema", schemars(schema_with = "ShellIntegration::schema"))]
     pub shell_integration: ShellIntegration,
+    /// Whether programs may write the clipboard (OSC 52, as tmux and
+    /// Neovim do over `ssh`): up to 1 MiB of text per write. Programs can
+    /// never read the clipboard. A value that is not `true` or `false` is
+    /// reported with a warning and the default is used. Applies to every
+    /// session at once when changed.
+    #[serde(deserialize_with = "load::lenient_clipboard_write")]
+    pub clipboard_write: bool,
 }
 
 /// Whether Tessera injects its shell integration scripts into the shells it
@@ -321,6 +328,7 @@ impl Default for Terminal {
         Self {
             scrollback_lines: 10_000,
             shell_integration: ShellIntegration::Auto,
+            clipboard_write: true,
         }
     }
 }

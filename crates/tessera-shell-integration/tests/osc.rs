@@ -174,6 +174,141 @@ fn handshake() {
     }
 }
 
+/// The `layer: parse` rows P7-01..P7-26 and P1337-01..P1337-12 of
+/// `crates/tessera-term/tests/fixtures/osc_spec.txt` (#9), by row id: what
+/// app-core gets from the payloads the terminal forwards raw.
+#[test]
+fn osc_spec_parse_rows() {
+    let path = |path: &str| cwd("h", path);
+    let long = |extra: usize| format!("file://h/{}", "a".repeat(4087 + extra));
+    let fits = long(0);
+    let over = long(1);
+    let rows: Vec<(&str, &[u8], Option<Cwd>)> = vec![
+        ("P7-01", b"file:///tmp", cwd("", "/tmp")),
+        ("P7-02", b"file://Mac.home/tmp", cwd("Mac.home", "/tmp")),
+        ("P7-03", b"file://h/tmp/a%20b", path("/tmp/a b")),
+        ("P7-04", b"file://h/caf%C3%A9", path("/caf\u{e9}")),
+        ("P7-05", b"file://h/a%00b", None),
+        ("P7-06", b"file://h/a%0Ab", None),
+        ("P7-07", b"file://h/a%1Bb", None),
+        ("P7-08", b"file://h/a%7Fb", None),
+        ("P7-09", b"file://h/a%2Fb", None),
+        ("P7-10", b"file://h/tmp/../etc", None),
+        ("P7-11", b"file://h/tmp/%2e%2e/etc", None),
+        ("P7-12", b"file://h/tmp/..foo", path("/tmp/..foo")),
+        ("P7-13", b"file://h", None),
+        ("P7-14", b"file://h/", path("/")),
+        ("P7-15", b"file://h/a%zz", None),
+        ("P7-16", b"file://h/a%4", None),
+        ("P7-17", b"file://h/a%FF", None),
+        ("P7-18", b"file://h/%C0%AF", None),
+        ("P7-19", b"file://u@h/a?x=1#f", path("/a")),
+        ("P7-20", b"FILE://h/a", path("/a")),
+        ("P7-21", b"http://h/a", None),
+        ("P7-22", b"kitty-shell-cwd://h/a%b?c", path("/a%b?c")),
+        ("P7-23", b"file://h/a%E2%80%AEb", path("/a\u{202e}b")),
+        ("P7-24", b"file://h/a;b", path("/a;b")),
+        ("P7-25", fits.as_bytes(), path(&fits["file://h".len()..])),
+        ("P7-26", over.as_bytes(), None),
+    ];
+    assert_eq!(fits.len(), MAX_OSC7_LEN, "P7-25 is 4096 bytes");
+    let mut failures = Vec::new();
+    for (id, payload, expected) in &rows {
+        let got = parse_osc7(payload);
+        if &got != expected {
+            failures.push(format!("{id}: expected {expected:?}, got {got:?}"));
+        }
+    }
+    let version = |version: u32, shell: &str| {
+        Some(ShellIntegrationVersion {
+            version,
+            shell: shell.into(),
+        })
+    };
+    let shell_33 = format!("ShellIntegrationVersion=1;shell={}", "a".repeat(33));
+    let handshakes: Vec<(&str, &[u8], Option<ShellIntegrationVersion>)> = vec![
+        (
+            "P1337-01",
+            b"ShellIntegrationVersion=1;shell=zsh",
+            version(1, "zsh"),
+        ),
+        (
+            "P1337-02",
+            b"ShellIntegrationVersion=2;shell=bash",
+            version(2, "bash"),
+        ),
+        (
+            "P1337-03",
+            b"ShellIntegrationVersion=18;shell=zsh",
+            version(18, "zsh"),
+        ),
+        ("P1337-04", b"ShellIntegrationVersion=1", None),
+        ("P1337-05", b"ShellIntegrationVersion=;shell=zsh", None),
+        ("P1337-06", b"ShellIntegrationVersion=1x;shell=zsh", None),
+        ("P1337-07", b"ShellIntegrationVersion=-1;shell=zsh", None),
+        (
+            "P1337-08",
+            b"ShellIntegrationVersion=99999999999;shell=zsh",
+            None,
+        ),
+        ("P1337-09", b"ShellIntegrationVersion=1;shell=z sh", None),
+        (
+            "P1337-10",
+            b"ShellIntegrationVersion=1;other=x;shell=zsh",
+            version(1, "zsh"),
+        ),
+        ("P1337-11", shell_33.as_bytes(), None),
+        ("P1337-12", b"SetUserVar=a=b", None),
+    ];
+    for (id, payload, expected) in &handshakes {
+        let got = parse_osc1337(payload);
+        if &got != expected {
+            failures.push(format!("{id}: expected {expected:?}, got {got:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The `layer: parse` rows P133-01..P133-18 through the forwarder (the
+/// parser's own test is next to `Mark::from_osc133` in tessera-grid).
+#[test]
+fn parse_osc133_forwards_to_the_grid_parser() {
+    use tessera_grid::Mark;
+
+    for payload in [
+        &b"A"[..],
+        b"B",
+        b"C",
+        b"D",
+        b"D;130",
+        b"D;-1",
+        b"D;+3",
+        b"D;0;aid=1",
+        b"A;aid=1;cl=line",
+        b"A;k=s",
+        b"A;k=c",
+        b"A;k=r",
+        b"Afoo",
+        b"AB",
+        b"D0",
+        b"a",
+        b"",
+        b"L",
+        b"N",
+        b"P",
+        b"I",
+        b"Z",
+    ] {
+        assert_eq!(
+            parse_osc133(payload),
+            Mark::from_osc133(payload),
+            "{payload:?}"
+        );
+    }
+    assert_eq!(parse_osc133(b"Afoo"), None, "P133-13");
+    assert_eq!(parse_osc133(b"A;k=s"), None, "P133-10");
+}
+
 /// A path segment: any characters but `/` and controls, never `..`.
 fn segment() -> impl Strategy<Value = String> {
     "[^/\\x00-\\x1f\\x7f-\\u{9f}]{0,12}".prop_filter("not ..", |s| s != "..")

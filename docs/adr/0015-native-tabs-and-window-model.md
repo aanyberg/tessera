@@ -93,8 +93,8 @@ the source of truth.
   (`applicationShouldHandleReopen`), opens one. This replaces the earlier
   quit-on-last-window.
 - `window.title` is the session's title when the core reports one, else
-  "Terminal"; `window.subtitle` is unused. The core does not apply OSC titles
-  yet (#9), so every tab shows "Terminal" for now.
+  "Terminal"; `window.subtitle` is unused. The core applies OSC 0/2 titles
+  since #9 (ADR 0022).
 - The signal handling (`SIGTERM`, `SIGINT`, `SIGHUP` to `NSApp.terminate`,
   ADR 0012) and the 100 ms bell throttle are unchanged; the throttle moved
   into `SessionRouter`.

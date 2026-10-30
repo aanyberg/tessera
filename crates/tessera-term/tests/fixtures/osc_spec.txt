@@ -1,0 +1,2089 @@
+# =============================================================================
+# tessera-term: OSC title (0/1/2), clipboard write (52), cwd (7), prompt marks (133), handshake (1337)
+# (issue #9, wave 7)   target path: crates/tessera-term/tests/fixtures/osc_spec.txt
+# spec-researcher output (2026-10-30), finalised by the milestone lead 2026-10-30 (see LEAD DECISIONS below).
+# ONLY THE MILESTONE LEAD EDITS THIS FILE. The implementer copies it verbatim and never edits a row: a row that
+# looks wrong is REPORTED (row id, expected, actual, why) to the lead, who corrects it here.
+#
+# Same `###` row layout as modes_spec.txt / csi_spec.txt (### ID / size / step / cite / note / screen / cursor /
+# pending_wrap / requests / scrollback). tests/osc.rs needs its OWN row parser (do NOT use tests/spec/mod.rs, which
+# #143 is rewriting and whose parse_requests only knows Bell/Resize); keys the shared parser would reject are below.
+#
+# EXTRA / CHANGED KEYS (osc.rs must assert these by hand)
+#   requests:  [] or a comma list of  Bell | SetTitle("..") | SetClipboard("..") | SetCwd(b"..") |
+#              ShellIntegrationHandshake(b"..")      Strings use \xNN \\ \" \u{H..} \n \r \t escapes; b".." is Vec<u8>
+#              (bytes), the others String. `Request` is #[non_exhaustive]: compare the WHOLE list in order.
+#   marks:     semantic marks on the ACTIVE screen's rows, 0-based: `r0=[PromptStart,CommandStart] r2=[OutputStart]`;
+#              rows not listed must have NO marks. Mark names: PromptStart CommandStart OutputStart CommandEnd(None)
+#              CommandEnd(0) CommandEnd(130). Order inside [] = Line::marks order.
+#   main_marks:     same, for the stashed main screen while the alt screen is active (hand-asserted via a leave).
+#   marks_scrollback: `s0=[PromptStart]` s0 = oldest scrollback line.
+#   screen:    `not asserted` is allowed; otherwise the render_screen layout (`|` after the cursor cell, `\` = soft wrap).
+#   screen_is: main | alt          step kinds: feed <payload> | feed_bytewise <payload>   (one advance() call per byte)
+#   layer:     term (default, row of osc.rs) | parse (a pure-function row for the app-core / grid / shell-integration
+#              unit tests; NOT run by osc.rs)
+# PAYLOAD ESCAPES in `step:`   \xNN raw byte  \r \n \t \\   \u{H..} one scalar UTF-8 encoded
+#   HARNESS EXTENSIONS (osc.rs must add these to its decoder; they exist only so 1 MiB rows stay readable):
+#     @rep(C,N)      N copies of the single ASCII char C                      @rep(a,1024)
+#     @b64rep(C,N)   standard base64 (with padding) of N copies of byte C     @b64rep(a,1048576)
+#   The same @rep(..) form is allowed inside requests: strings.
+# EVERY ROW ALSO RUNS CHUNKED (lead 2026-10-30): whole / byte-at-a-time / every 2-way split for rows whose decoded
+#   input is <= 512 bytes; rows above 512 bytes run whole + byte-at-a-time + 2-way splits at the first 16 and last 16
+#   offsets; rows above 64 KiB (K32, K33) run whole + those 32 2-way splits only (no byte-at-a-time). Results must be
+#   equal across chunkings. Rows flagged `chunk-skip` are exempt (none are).
+#
+# SOURCE TAGS (fetched 2026-10-30; line numbers are for the files as fetched)
+#   [CTL]   xterm ctlseqs  https://invisible-island.net/xterm/ctlseqs/ctlseqs.html  (Operating System Commands; Ps=0/1/2/52)
+#           (text read from https://raw.githubusercontent.com/ThomasDickey/xterm-snapshots/master/ctlseqs.txt L2008-L2200)
+#   [XT-m]  xterm misc.c   do_osc L3988 (empty 0/1/2 data -> "xterm" L4126-4142; mode>65535 ignored), xtermIsPrintable L3427,
+#           ChangeGroup L6125 (`strlen(value) > 1000` -> request IGNORED, not truncated),
+#           ManipulateSelectionData L3320 (Pc parse: empty -> "s0", unknown letters skipped, `?` = query, else SET)
+#   [XT-c]  xterm charproc.c  string collection L3395-3460 (strings_max, DEF_STRINGS_MAX 20000 | 600000 in ptyx.h/main.h,
+#           over-long string IGNORED whole), CASE_BELL L3690, CASE_ST L5290 (OSC dispatched on BEL or ST only)
+#   [XT-b]  xterm button.c AppendToSelectionBuffer L4695 (base64 decoder SKIPS every non-alphabet byte, no padding needed)
+#   [AL]    Alacritty: vte crate src/ansi.rs osc_dispatch L1331-1500 (0/2 join params with ';' and trim; 1, 7, 133, 1337 not
+#           handled; 52 needs >=3 params, Pc = first byte of params[1] default 'c'); alacritty_terminal term/mod.rs
+#           clipboard_store (c -> Clipboard, p|s -> Selection, else return; base64 decode failure or non-UTF-8 -> nothing;
+#           default Osc52 = OnlyCopy; no size cap)
+#   [WZ]    WezTerm wezterm-escape-parser/src/osc.rs L100-185 (Selection::try_parse: empty -> SELECT|CUT0, c p s 0-9;
+#           2 params = ClearSelection, `?` = query, else STANDARD base64 + from_utf8, any failure = whole OSC dropped;
+#           titles: params joined with ';'), term/src/terminalstate/performer.rs L741-800 (OSC 1 stores a separate
+#           icon_title, OSC 0 sets both, OSC 2 title only; empty title stored as empty), L867-905 (133: fresh_line on A/D)
+#   [KT]    kitty kitty/vt-parser.c dispatch_osc L520-660 (0 = title+icon, 1 = icon only, 2 = title; OSC 7 stores raw
+#           bytes; 1337 = DESKTOP NOTIFY, not shell integration; 133 -> shell_prompt_marking), kitty/screen.c
+#           shell_prompt_marking L3637 (A/C set ONE `prompt_kind` attribute on the CURSOR ROW `cursor->y`, pending wrap NOT
+#           resolved, linebuf = current screen incl. alt; `A;k=s` -> SECONDARY_PROMPT which prompt navigation skips),
+#           kitty/clipboard.py parse_osc_52 L490 + from_osc52_where_field L85 (c and s -> clipboard, p -> primary,
+#           other letters dropped, empty Pc -> 's0'), kitty/options/definition.py clipboard_control (default:
+#           write-clipboard write-primary read-clipboard-ask read-primary-ask), clipboard_max_size default 512 (MB)
+#   [IT]    iTerm2 sources/VT100/VT100Terminal.m decodedBase64PasteCommand L1566 (Pc chars from "psc01234567" are all
+#           accepted and IGNORED -> general pasteboard; unknown char = parse failure; `?` never answered by default;
+#           decoded text has C0 controls other than TAB/LF/CR stripped and stops at NUL), XTERMCC_WIN_TITLE L2776
+#           (title cut at newline, control chars -> ^X), executeXtermSetKvp L4418 (`ShellIntegrationVersion` key)
+#   [BO]    Per Bothner / FinalTerm semantic prompts  https://gitlab.freedesktop.org/Per_Bothner/specifications/-/raw/master/proposals/semantic-prompts.md
+#           (A, B, C, D[;exit] plus L, N, P, I; options after ';'; `k=` kinds i c s r; unknown options ignored)
+#   [VTE]   vte 0.15.0 src/lib.rs advance_osc_string L407, osc_dispatch L575, MAX_OSC_PARAMS = 16 L45, tests L930-1050
+#   [VT]    crates/tessera-vt/src/lib.rs (osc_dispatch L278 drops `bell_terminated`; Action::Osc(Vec<Vec<u8>>) is the
+#           payload SPLIT ON ';'; OSC length unbounded, docs L25-33)
+#   [PROBE] ran a throw-away tessera-vt Parser on the exact bytes (scratchpad spec-researcher-9/probe), 2026-10-30
+#   [CODE]  read/ran crates/tessera-shell-integration (parse_osc7, parse_osc1337, parse_osc133) at 2f07dff
+#
+# FACTS THE IMPLEMENTER MUST KNOW (all [PROBE]-verified)
+#   1. Action::Osc carries the payload SPLIT ON ';' (`2;a;b` -> ["2","a","b"]). Title, OSC 7 and OSC 1337 payloads
+#      contain ';' legitimately and must be REJOINED with ';' (params[1..].join(";")). Alacritty and WezTerm do the same.
+#   2. vte keeps at most 16 params and silently drops everything after the 15th ';'. A payload with >= 15 ';' is truncated
+#      with no flag. Rule D-PARAMS: params.len() == 16 means "possibly truncated".
+#   3. vte silently drops C0 bytes 0x00-0x06, 0x08-0x17, 0x19, 0x1C-0x1F inside an OSC (TAB, LF, CR, NUL included), so a
+#      title or base64 payload can never contain them. It does NOT drop DEL (0x7F) or UTF-8 C1 (U+0080..U+009F), and bytes
+#      >= 0x80 are passed through whatever their validity.
+#   4. CAN (0x18), SUB (0x1A) and ESC inside an OSC DISPATCH the OSC collected so far (vte osc_end) and then act on the
+#      byte; xterm ABORTS the string without dispatching. The terminator is not visible in Action::Osc (dropped by [VT]).
+#   5. Raw 0x9C and UTF-8 U+009C do NOT terminate an OSC in vte (they are appended), and 0x9D / U+009D does not start one.
+#   6. ST arrives as Action::Osc followed by Action::Esc{byte:'\\'}; BEL as Action::Osc only. Neither may print or ring.
+#
+# DECISIONS FOR THE MILESTONE LEAD (recommendation first; every row that depends on one names it in `flags:`)
+#   D-OSC1      OSC 1 (icon name). RECOMMEND: ignore, no Request (xterm sets only the icon name; WezTerm/kitty keep it
+#               apart from the title; Alacritty ignores; iTerm2 shows it as the tab title only if so configured).
+#               OSC 0 -> SetTitle, OSC 2 -> SetTitle. Rows T05, T05b.
+#   D-EMPTY     `OSC 2 ; ST` (empty title). RECOMMEND: SetTitle("") (the Swift side already maps empty to the default
+#               title, TerminalWindowController.sessionDidSetTitle). xterm shows its default "xterm" ([XT-m] L4126).
+#               `OSC 2 ST` WITHOUT the ';' -> ignored (WezTerm, Alacritty; xterm also sets the default). Rows T07-T09.
+#   D-TITLE-CAP Title cap. RECOMMEND 1024 bytes of payload (measured before sanitising); a longer title is IGNORED whole,
+#               not truncated (xterm ChangeGroup: > 1000 bytes -> ignored; WezTerm/Alacritty/kitty: no cap). Alternative:
+#               truncate at a char boundary. Rows T18-T20.
+#   D-TITLE-SAN Title sanitising. RECOMMEND strip, after UTF-8 decoding: Cc (DEL, C1) and bidi/line-separator format
+#               characters U+061C U+200E U+200F U+202A-U+202E U+2066-U+2069 U+2028 U+2029 (title spoofing in the tab
+#               strip). vte already removed C0. Do not trim spaces (xterm keeps them; Alacritty trims). iTerm2 instead
+#               cuts at the first newline and shows ^X for controls. Rows T14-T16, T21.
+#   D-BADUTF8   Invalid UTF-8 in a title. RECOMMEND from_utf8_lossy (U+FFFD visible). WezTerm drops the whole OSC,
+#               Alacritty drops the bad segment. Clipboard is the opposite: invalid UTF-8 is DROPPED (K27). Rows T17, X03.
+#   D-OSCNUM    Command number matching. RECOMMEND exact ASCII match on the whole first param ("2", not "02", "+2").
+#               xterm and kitty accept leading zeros. Row T31, U01.
+#   D-CAN       CAN/SUB/ESC inside an OSC. RECOMMEND accept the vte behaviour (apply what was collected), because the
+#               terminator is not visible in tessera-vt and the brief puts tessera-vt out of scope. xterm discards. Truncated
+#               OSC 52 payloads are still caught by strict base64 (K38). If the lead wants the xterm behaviour, tessera-vt
+#               must report the terminator (a follow-up to "vt: bound OSC payloads"). Rows T25-T27, X05, K37, K38.
+#   D-PARAMS    params.len() == 16 (vte's cap) => possibly truncated. RECOMMEND: titles are applied as received
+#               (best effort, T12); OSC 7 and OSC 1337 are DROPPED (a truncated path is a different valid path). Rows W05, H08.
+#   D-FWD-CAP   Raw-forwarded requests (SetCwd, ShellIntegrationHandshake): RECOMMEND the terminal drops payloads longer
+#               than 4096 bytes (= tessera_shell_integration::osc7::MAX_OSC7_LEN) and empty payloads, so a flood cannot
+#               queue megabytes; app-core still parses with parse_osc7 / parse_osc1337. Rows W06-W08, H07.
+#   D-1337      OSC 1337 forwards ONLY payloads starting with `ShellIntegrationVersion=`; every other OSC 1337 key (File=
+#               with megabytes of image data, SetUserVar, CurrentDir, RequestAttention, ReportCellSize query, ...) is
+#               ignored and NEVER answered. The brief says "OSC 1337 handshake" so this is consistent, but the term
+#               layer must do the prefix test, not app-core. Rows H05, H06.
+#   D-SEL       OSC 52 selection parameter Pc. RECOMMEND: Pc empty, or containing at least one of c p s -> write the macOS
+#               general pasteboard once (duplicates collapse, c0/0c/sp fine); Pc made only of q and 0-7 -> ignore; ANY
+#               character outside {c p q s 0-7} -> ignore the whole sequence (iTerm2 treats it as a parse failure; xterm and
+#               kitty skip the letter). macOS has no primary selection, iTerm2 maps all of psc0-7 to the pasteboard,
+#               kitty maps c and s to the clipboard and p to PRIMARY (absent on macOS), Alacritty maps c to the clipboard
+#               and p/s to PRIMARY. Rows K01-K14.
+#   D-EMPTY52   Empty data `52;c;` (and `52;c`). RECOMMEND: ignore, no request. xterm CLEARS the selection ([CTL] "neither a
+#               base64 string nor ? then the selection is cleared"); WezTerm clears on `52;c`; kitty writes an empty
+#               string; Alacritty ignores `52;c`. A remote program can overwrite the clipboard anyway, but wiping it
+#               silently adds nothing the user asked for. Rows K18-K21.
+#   D-B64       Base64. RECOMMEND strict RFC 4648 STANDARD alphabet, padding REQUIRED and canonical, no whitespace, no
+#               URL-safe alphabet, trailing bits must be zero. Alacritty, WezTerm (allows non-zero trailing bits) and
+#               kitty ("must not silently discard invalid characters") are strict; xterm skips junk. Rows K22-K26, K39, K40.
+#   D-CAP52     OSC 52 size cap. RECOMMEND 1 MiB DECODED (1_048_576 bytes accepted, 1_048_577 dropped); reject before
+#               decoding when the base64 length exceeds 1_398_104 (= 4*ceil(cap/3)). Survey: kitty 512 MB default
+#               (clipboard_max_size), xterm string buffer 20000 bytes (600000 with sixel/regis builds, whole OSC
+#               ignored), Alacritty / WezTerm / iTerm2: no cap found. NOTE tessera-vt still buffers an unbounded OSC (its
+#               crate docs call it a known gap), so the cap bounds the Request, not the parser memory. Rows K32, K33.
+#   D-CTRL52    Clipboard content. RECOMMEND pass through UNCHANGED (embedded NUL and ESC survive; the brief's FFI test
+#               needs the NUL). iTerm2 strips C0 and stops at NUL; kitty/Alacritty/WezTerm do not. Rows K28, K29.
+#   D-READ      `OSC 52 ; Pc ; ?` and every other query (CSI 21 t, OSC 1337 ReportCellSize, ...) is never answered.
+#               Matches the brief; xterm answers only with allowWindowOps. Rows K15-K17, T35, H05.
+#   D-PARAMS52  `52` must have exactly 3 params (name, Pc, data). 4+ params (data containing ';') and 2 params (`52;data`)
+#               are ignored. Alacritty ignores the extra params, WezTerm rejects. Rows K34, K35.
+#   D-SECOND    OSC 133 `A` with `k=s`, `k=c` or `k=r` (secondary/continuation/right prompt). RECOMMEND: no mark, so a PS2
+#               never becomes a "previous prompt" target (kitty stores SECONDARY_PROMPT, which navigation skips). This
+#               changes the doc of tessera_shell_integration::parse_osc133 ("A;k=s ... are ignored"), whose tests do not
+#               cover it. If the lead prefers to keep PromptStart, flip rows M06b-M06d. Our zsh/fish scripts never emit k=.
+#   D-STRICT133 OSC 133 letter must be followed by end or ';'. RECOMMEND strict (today's parse_osc133 matches any prefix:
+#               `Afoo`, `AB` -> PromptStart, `D0` -> None). Letters L N P I Z and lower case -> None (not emitted by our
+#               scripts; N/P are prompt variants of A and could be added later). Rows M07*, P133-*.
+#   D-PENDING   A mark goes on the line the cursor is on when the OSC is PARSED, pending wrap is NOT resolved first
+#               (kitty `cursor->y`; matches the brief "applies the mark to the cursor's line"). Rows M08, M09.
+#   D-ALT       Marks received while the alternate screen is active are IGNORED (no scrollback exists there, the lines
+#               vanish on leave, and a full-screen app's stray C/D must not confuse the main screen). kitty and WezTerm
+#               record them on the alt screen but cannot navigate them. Equivalent after leaving. Rows M10, M11.
+#   D-DUP       One mark of each kind per line: a new mark REPLACES an existing mark of the same variant on that line
+#               (so a redrawn prompt, `D;1` then `D;0`, does not pile up) and is pushed last. kitty keeps one value per
+#               line. Rows M13, M14.
+#   D-FRESH     133;A does NOT fresh-line / move the cursor (Bothner's spec and WezTerm do; kitty and iTerm2 do not; our
+#               scripts end the previous line themselves). Row M16.
+#   D-HOST      OSC 7 host check (app-core, not term). RECOMMEND: App::session_cwd returns every valid report with its host;
+#               add Cwd::is_local(local_hostname) (empty host, "localhost", or the machine's hostname compared ASCII-case-
+#               insensitively, also ignoring a trailing ".local"/".lan"-style domain difference) and let consumers
+#               (new tab in same directory) require it. Not verified how Terminal.app/WezTerm/kitty compare hosts.
+#   D-HANDSHAKE major version mismatch = `version != scripts::PROTOCOL_VERSION` (1): the version is a single integer, so
+#               "major" is the integer. tracing::warn! once per session. iTerm2's own scripts send 18..: parse OK, warn.
+#   D-FLOOD     Do NOT coalesce requests in the terminal (T22 keeps order); the reader already hands them to app-core, whose
+#               delivery path is coalescing (CallbackBridge). Requests per advance() are bounded by the input length.
+#   D-TSTACK    CSI 22/23 t title stack and CSI 20/21 t title report are OUT of scope: they must stay unanswered no-ops
+#               (T35, T36). Reporting titles back is the classic escape-injection vector; do not add it.
+#
+# UNVERIFIED FACTS (rows depending on them; everything else was read from source or [PROBE]/[CODE]-run)
+#   * T16 (bidi/line-separator stripping): Tessera hardening, no reference emulator does it.
+#   * X04, T02, X08, M10, M11: checked by the lead 2026-10-30 at 9c41758 by reading (not run): control.rs execute
+#     ignores 0x9D (catch-all arm), esc.rs ignores ESC \ (catch-all arm), Grid::enter_alt_screen keeps the cursor
+#     and leave_alt_screen (1049 reset) restores it.
+#   * T25-T27, T33, X05, K37, K38: xterm's ESC/CAN behaviour inside an OSC inferred from charproc.c state handling;
+#     the generated sos_table (VTPrsTbl.c) was not read. The vte side is [PROBE]-verified.
+#   * D-HOST / L05: how Terminal.app, kitty and WezTerm compare the OSC 7 host was not read.
+#   * All screen:/cursor: lines were computed by hand from the render_screen layout and never run against osc.rs.
+# =============================================================================
+#
+# LEAD DECISIONS (2026-10-30)
+#   Accepted as recommended: D-OSC1 D-EMPTY D-TITLE-CAP D-BADUTF8 D-OSCNUM D-CAN D-PARAMS D-FWD-CAP D-1337 D-SEL
+#     D-EMPTY52 D-B64 D-CAP52 D-CTRL52 D-READ D-PARAMS52 D-SECOND D-STRICT133 D-PENDING D-ALT D-DUP D-FRESH
+#     D-HANDSHAKE D-FLOOD D-TSTACK, and P7-23 (leave parse_osc7 as it is).
+#   PENDING (security policy, decided by the lead before #9 starts): D-TITLE-SAN (rows T14 T15 T16 T21) and D-HOST
+#     (layer rows L04 L05, App::session_cwd / Cwd::is_local). Until then these rows are not final.
+#   Harness rules for tests/osc.rs:
+#     * `marks:` absent or `none` = no marks on any ACTIVE-screen row; `marks_scrollback:` absent = no marks on any
+#       scrollback line. `cursor:` / `pending_wrap:` / `screen_is:` absent = not asserted.
+#     * M10's `main_marks:` is asserted by feeding `\x1b[?1049l` after M10's other checks (M11 is the same check).
+#     * Step payloads are NOT trimmed (M01 ends in a significant space). @rep/@b64rep expand in steps and in
+#       requests: strings (K32 compares a 1 MiB string).
+#     * K32 and K33 have the SAME base64 length (1_398_104): the pre-decode length check alone cannot drop K33;
+#       the decoded-length check is what K33 tests.
+#     * The test asserts 194 rows parsed: 138 `layer: term` rows run, 56 `layer: parse` rows counted and listed as
+#       not run by osc.rs. Parse rows are hand-transcribed into unit tests (P133-* next to Mark::from_osc133 in
+#       tessera-grid; P7-* and P1337-* in tessera-shell-integration where not already covered), each test naming its
+#       row id; the critic checks coverage by id. L01-L07 are app-core / FFI / Swift tests listed in the brief.
+#   print_c0_spec.txt F04 and G08 (below): the #9 PR changes exactly those two rows' `requests:` lines (F04 ->
+#     [SetTitle("title")], G08 -> [SetTitle("hi")]) and G08's `assert:` line, their two print snapshots and
+#     print.rs's Bell-only request parser; this is a lead-sanctioned edit (#143 has merged). No other row changes.
+#
+# WHERE THE BRIEF / EXISTING FILES CONFLICT WITH THE SOURCES
+#   * print_c0_spec.txt rows F04 and G08 (and tests/scripts/print/f04_*, g08_*) expect `requests: []` for
+#     `ESC ] 2;title BEL` / `ESC ] 0;hi ST`; both will start producing SetTitle. Their notes already say "superseded by #9",
+#     but the #143/#113 do_not_touch lists keep fixtures byte-identical: #9 must edit those two rows (and print.rs's
+#     bell-only requests check) in the same PR, or #143 must be told.
+#   * The brief says OSC 1337 requests carry "the handshake"; kitty uses OSC 1337 for notifications and iTerm2 for many
+#     other keys, so D-1337 (prefix filter in the term layer) is needed to avoid forwarding image data.
+#   * The brief's "bound OSC" is not done in tessera-vt (D-CAP52 note): memory stays unbounded in the parser.
+#   * `parse_osc133` today matches by prefix (`Afoo` is a mark) - see D-STRICT133 and D-SECOND.
+# =============================================================================
+
+# ---------------------------------------------------------------------------- T. OSC 0 / 1 / 2 window and icon title
+
+### T01_osc2_bel
+size: 2x40
+step: feed \x1b]2;hello\x07
+cite: [CTL] Ps=2 'Change Window Title to Pt'; [XT-m] do_osc OSC_TitleOnly -> ChangeTitle; BEL terminator [CTL] 'XTerm accepts either BEL or ST'
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: [SetTitle("hello")]
+marks: none
+
+### T02_osc2_st
+size: 2x40
+step: feed \x1b]2;hello\x1b\\
+cite: [CTL] OSC Ps ; Pt ST; [VTE] osc_c0_st_terminated L969; [PROBE] st -> Osc + Esc{byte:92}
+note: The ESC \ that ends the string must not print and must not move the cursor.
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: [SetTitle("hello")]
+
+### T03_osc0_bel
+size: 2x40
+step: feed \x1b]0;hello\x07
+cite: [CTL] Ps=0 'Change Icon Name and Window Title to Pt'; [XT-m] do_osc OSC_IconBoth -> ChangeIconName + ChangeTitle; [WZ] SetIconNameAndWindowTitle; [KT] case 0 (set_title + set_icon); [AL] b"0" | b"2"
+note: Window title only on our side (icon name is not modelled, D-OSC1).
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: [SetTitle("hello")]
+
+### T04_osc0_st
+size: 2x40
+step: feed \x1b]0;hello\x1b\\
+cite: [CTL] Ps=0; [XT-c] CASE_ST L5290 -> do_osc
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: [SetTitle("hello")]
+
+### T05_osc1_icon_name_ignored
+size: 2x40
+step: feed \x1b]1;icon\x07
+cite: [CTL] Ps=1 'Change Icon Name to Pt' (not the window title); [WZ] performer.rs SetIconName stores icon_title only; [KT] case 1 -> set_icon only; [AL] no arm for b"1"
+note: D-OSC1: no Request. xterm, WezTerm and kitty keep the icon name apart from the window title; none of them sets the window title from OSC 1.
+flags: decision D-OSC1
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+
+### T05b_osc1_does_not_disturb_title
+size: 2x40
+step: feed \x1b]2;win\x07\x1b]1;icon\x07
+cite: [CTL] Ps=1 vs Ps=2 are independent; [WZ] performer.rs L745-L765
+note: The title set by OSC 2 is unchanged by a later OSC 1 (no second SetTitle).
+flags: decision D-OSC1
+screen: not asserted
+requests: [SetTitle("win")]
+
+### T07_osc2_empty
+size: 2x40
+step: feed \x1b]2;\x07
+cite: [XT-m] do_osc L4126-L4142 (empty data for Ps 0/1/2 -> default title "xterm"); [WZ] performer.rs SetWindowTitle stores ""; [AL] sets Some("")
+note: D-EMPTY: SetTitle("") = 'back to the default title'; the Swift side already maps an empty title to defaultTitle.
+flags: decision D-EMPTY
+screen: not asserted
+requests: [SetTitle("")]
+
+### T08_osc0_empty_st
+size: 2x40
+step: feed \x1b]0;\x1b\\
+cite: [XT-m] do_osc L4126-L4142; [KT] case 0
+flags: decision D-EMPTY
+screen: not asserted
+requests: [SetTitle("")]
+
+### T09_osc2_without_semicolon
+size: 2x40
+step: feed \x1b]2\x07
+step: feed \x1b]0\x1b\\
+cite: [WZ] osc.rs single_title_string 'wrong param count' (osc.len() < 2); [AL] osc_dispatch b"0"|b"2" needs params.len() >= 2 else unhandled; [PROBE] `ESC ] 2 BEL` -> Osc([[50]])
+note: No ';' = malformed, ignored. (xterm would set its default title; D-EMPTY.)
+flags: decision D-EMPTY
+screen:
+> |
+>
+cursor: (0,0)
+requests: []
+
+### T11_title_with_semicolons
+size: 2x40
+step: feed \x1b]2;a;b;c\x07
+cite: [AL] ansi.rs L1354 params[1..].join(";"); [WZ] osc.rs single_title_string joins osc[1..] with ';'; [XT-m] the title is everything after 'Ps;'; [PROBE] semi title -> [[2],[a],[b],[c]]
+note: FACT 1: vte splits on ';', the terminal must rejoin.
+screen: not asserted
+requests: [SetTitle("a;b;c")]
+
+### T12_title_truncated_by_vte_param_cap
+size: 2x40
+step: feed \x1b]2;1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;17\x07
+cite: [VTE] MAX_OSC_PARAMS = 16 L45, action_osc_put_param L521 (params beyond 16 are dropped); [PROBE] '7 params' -> exactly 16 params, last = "15"
+note: FACT 2: params = ["2","1".."15"] after truncation; "16;17" is lost. D-PARAMS: titles are applied as received (best effort). The expected title is the rejoined first 15 segments.
+flags: vte-limit decision D-PARAMS
+screen: not asserted
+requests: [SetTitle("1;2;3;4;5;6;7;8;9;10;11;12;13;14;15")]
+
+### T13_title_utf8
+size: 2x40
+step: feed \x1b]2;h\u{e9}llo \u{65e5}\u{672c}\u{8a9e} \u{1f980}\x07
+cite: [VTE] parse_osc_with_utf8_arguments L984; [PROBE] utf8 title; [XT-c] utf8Title L3436; [IT] title is NSString
+screen: not asserted
+requests: [SetTitle("h\u{e9}llo \u{65e5}\u{672c}\u{8a9e} \u{1f980}")]
+
+### T14_title_c0_controls_and_del
+size: 2x40
+step: feed \x1b]2;a\tb\nc\rd\x00e\x01f\x7fg\x07
+cite: [VTE] advance_osc_string L407 drops 0x00-0x06,0x08-0x17,0x19,0x1C-0x1F; [PROBE] 'ctrl in title' -> DEL (127) survives; [XT-m] xtermIsPrintable L3427 / [XT-c] sos_table ignores C0
+note: FACT 3: TAB LF CR NUL SOH are gone before the terminal sees them; the terminal must strip DEL (0x7F) itself. D-TITLE-SAN.
+flags: security decision D-TITLE-SAN
+screen:
+> |
+>
+cursor: (0,0)
+requests: [SetTitle("abcdefg")]
+
+### T15_title_c1_controls
+size: 2x40
+step: feed \x1b]2;a\u{85}b\u{9b}c\u{9d}d\u{90}e\x07
+cite: [PROBE] 'C1 inside OSC' bytes >= 0x80 pass through vte; [XT-m] ChangeGroup L6125 replaces control chars (iswcntrl) in UTF-8 titles; [IT] stringByReplacingControlCharactersWithCaretLetter
+note: U+0085 NEL, U+009B CSI, U+009D OSC, U+0090 DCS as UTF-8 must not reach the window title.
+flags: security decision D-TITLE-SAN
+screen: not asserted
+requests: [SetTitle("abcde")]
+
+### T16_title_bidi_and_line_separators
+size: 2x40
+step: feed \x1b]2;abc\u{202e}def\u{2066}g\u{200f}h\u{2028}i\u{2029}j\x07
+cite: [CTL] titles are display strings; spoofing class (Trojan Source, CVE-2021-42574); [XT-m] ChangeGroup replaces iswcntrl only (no bidi filtering) - this strip is a Tessera hardening choice
+note: U+202E RLO, U+2066 LRI, U+200F RLM, U+2028, U+2029 stripped. Unverified in any reference emulator: UNVERIFIED hardening, drop the row if the lead rejects D-TITLE-SAN's bidi half.
+flags: security hardening decision D-TITLE-SAN
+screen: not asserted
+requests: [SetTitle("abcdefghij")]
+
+### T17_title_invalid_utf8
+size: 2x40
+step: feed \x1b]2;a\xffb\xc3\x07
+cite: [WZ] osc.rs String::from_utf8(..)? -> OSC dropped; [AL] ansi.rs flat_map(str::from_utf8) drops the bad segment; [XT-m] ChangeGroup latin-1 fallback
+note: D-BADUTF8 recommends lossy: invalid byte and the truncated trailing lead byte each become U+FFFD.
+flags: decision D-BADUTF8
+screen: not asserted
+requests: [SetTitle("a\u{fffd}b\u{fffd}")]
+
+### T18_title_exactly_1024_bytes
+size: 2x40
+step: feed \x1b]2;@rep(a,1024)\x07
+cite: [XT-m] ChangeGroup L6125 'Ignore empty or too-long requests' (> 1000 bytes ignored); Tessera cap 1024 = D-TITLE-CAP
+flags: boundary decision D-TITLE-CAP
+screen: not asserted
+requests: [SetTitle("@rep(a,1024)")]
+
+### T19_title_1025_bytes_ignored
+size: 2x40
+step: feed \x1b]2;@rep(a,1025)\x07x
+cite: [XT-m] ChangeGroup L6125 (over-long request ignored, not truncated); [XT-c] strings_max L3416
+note: The previous title stays; the text after the terminator still prints.
+flags: boundary decision D-TITLE-CAP
+screen:
+>x |
+>
+cursor: (0,1)
+requests: []
+
+### T20_title_cap_counts_bytes
+size: 2x40
+step: feed \x1b]2;@rep(a,1023)\u{e9}\x07
+cite: [XT-m] ChangeGroup strlen(value) is in bytes
+note: 1023 + the 2 bytes of U+00E9 = 1025 bytes: ignored.
+flags: boundary decision D-TITLE-CAP
+screen: not asserted
+requests: []
+
+### T21_title_spaces_kept
+size: 2x40
+step: feed \x1b]2;  hi  \x07
+cite: [XT-m] ChangeGroup keeps the string as is; [AL] ansi.rs L1359 .trim() (Alacritty differs)
+note: No trimming.
+flags: decision D-TITLE-SAN
+screen: not asserted
+requests: [SetTitle("  hi  ")]
+
+### T22_two_titles_in_order
+size: 2x40
+step: feed \x1b]2;one\x07\x1b]0;two\x1b\\
+cite: [CTL] each OSC is independent; D-FLOOD: no coalescing in the terminal
+flags: decision D-FLOOD
+screen: not asserted
+requests: [SetTitle("one"), SetTitle("two")]
+
+### T23_title_then_text
+size: 2x40
+step: feed \x1b]2;t\x07abc
+cite: [XT-c] CASE_BELL L3690 (BEL in a string ends it; text after it prints normally)
+screen:
+>abc |
+>
+cursor: (0,3)
+pending_wrap: false
+requests: [SetTitle("t")]
+
+### T24_bel_terminator_never_rings
+size: 2x6
+step: feed \x1b]2;title\x07x
+cite: [XT-c] CASE_BELL L3690; print_c0_spec.txt F04 (this row replaces its `requests: []`)
+note: IMPLEMENTER CORRECTION (#9) required in print_c0_spec.txt F04 and G08, see header.
+screen:
+>x |
+>
+cursor: (0,1)
+pending_wrap: false
+requests: [SetTitle("title")]
+
+### T25_can_inside_osc
+size: 2x40
+step: feed \x1b]2;hi\x18x
+cite: [VTE] advance_osc_string L414: 0x18|0x1A -> osc_end (DISPATCH) then execute; [PROBE] can -> Osc, Execute(24); [XT-c] sos_table CAN -> CASE_GROUND_STATE (xterm discards)
+note: FACT 4. Expected = vte behaviour (D-CAN accept). xterm would produce requests [] and the same screen.
+flags: vte-divergence decision D-CAN
+screen:
+>x |
+>
+cursor: (0,1)
+requests: [SetTitle("hi")]
+
+### T26_sub_inside_osc
+size: 2x40
+step: feed \x1b]2;hi\x1ax
+cite: [VTE] advance_osc_string L414; [PROBE] sub -> Osc, Execute(26)
+note: As T25. SUB in ground state prints nothing and does not move the cursor.
+flags: vte-divergence decision D-CAN
+screen:
+>x |
+>
+cursor: (0,1)
+requests: [SetTitle("hi")]
+
+### T27_esc_inside_osc_starts_next_sequence
+size: 2x40
+step: feed \x1b]2;hi\x1b[31mx
+cite: [VTE] advance_osc_string L419-L422 (ESC -> osc_end then Escape state); [PROBE] esc-other -> Osc, Csi{m}
+note: OSC applied, then CSI 31 m applies to the 'x'. xterm drops the OSC.
+flags: vte-divergence decision D-CAN
+screen:
+>x |
+>
+cursor: (0,1)
+requests: [SetTitle("hi")]
+
+### T28_st_bytewise
+size: 2x40
+step: feed_bytewise \x1b]2;hello\x1b\\
+cite: [PROBE] 'split st'; brief done-when (split at every byte)
+screen:
+> |
+>
+cursor: (0,0)
+requests: [SetTitle("hello")]
+
+### T29_title_in_alt_screen
+size: 2x40
+step: feed \x1b[?1049h\x1b]2;alt\x07
+cite: [CTL] titles are window-level, not screen-level
+screen: not asserted
+requests: [SetTitle("alt")]
+screen_is: alt
+
+### T30_title_utf8_split_across_calls
+size: 2x40
+step: feed_bytewise \x1b]2;h\u{e9}\u{65e5}\x07
+cite: [VT] lib.rs 'Chunking' docs (vte 0.15 loses chars when a UTF-8 char completes across calls); Terminal::advance holds back an incomplete trailing character (term/src/lib.rs L137)
+note: The held-back lead byte must not corrupt the title when it ends a call inside an OSC.
+screen: not asserted
+requests: [SetTitle("h\u{e9}\u{65e5}")]
+
+### T31_osc_number_with_leading_zero
+size: 2x40
+step: feed \x1b]02;t\x07\x1b]+2;t\x07
+cite: [XT-m] do_osc L4040 accumulates digits (02 -> 2, accepted); [KT] dispatch_osc L541 (digit loop, accepted); [WZ]/[AL] exact match (rejected)
+note: D-OSCNUM recommends exact match, so both are ignored.
+flags: decision D-OSCNUM
+screen: not asserted
+requests: []
+
+### U01_unknown_and_malformed_oscs_ignored
+size: 2x40
+step: feed a\x1b]9999;foo\x07b\x1b]65536;x\x07c\x1b];x\x07d\x1b]\x07e\x1b]2x;t\x07f\x1b]ltitle\x1b\\g\x1b]3;K=V\x07h\x1b]21;t\x07i
+cite: [XT-m] do_osc: mode > 65535 ignored L4040; non-digit mode ignored; [WZ] 'unknown code' / 'zero length osc'; [AL] unhandled(params); [VTE] parse_osc_max_params
+note: OSC 9999, 65536, empty number, empty OSC, '2x', legacy `ESC ] l`, OSC 3 (X property) and OSC 21: nothing happens, text prints. 9 letters a..i.
+flags: negative decision D-OSCNUM
+screen:
+>abcdefghi |
+>
+cursor: (0,9)
+pending_wrap: false
+requests: []
+
+### T33_title_cannot_smuggle_a_sequence
+size: 2x40
+step: feed \x1b]2;\x1b[2Jx\x07
+cite: [PROBE] ESC inside OSC ends it (FACT 4); [XT-c] xterm drops the OSC and runs CSI 2 J, prints x, BEL rings
+note: The OSC ends at the ESC with an EMPTY title; CSI 2 J then runs as ordinary input, 'x' prints and the BEL is a real bell. A title can never contain ESC. (xterm: no SetTitle at all.)
+flags: security vte-divergence decision D-CAN
+screen:
+>x |
+>
+cursor: (0,1)
+requests: [SetTitle(""), Bell]
+
+### T35_title_reports_are_never_answered
+size: 2x40
+step: feed \x1b[21t\x1b[20t\x1b[22;2t\x1b[23;2t
+cite: [CTL] CSI 20 t / 21 t report icon label / title (XTWINOPS, gated by allowWindowOps); 22;Ps t / 23;Ps t title stack
+note: D-TSTACK / D-READ: no requests, no reply bytes. Today the terminal answers nothing; do not add. Assert no bytes were queued for the child if the harness can see them.
+flags: security negative out-of-scope decision D-TSTACK
+screen:
+> |
+>
+cursor: (0,0)
+requests: []
+
+### T36_title_stack_is_not_implemented
+size: 2x40
+step: feed \x1b]2;one\x07\x1b[22;2t\x1b]2;two\x07\x1b[23;2t
+cite: [CTL] CSI 22;2 t push, CSI 23;2 t pop window title
+note: Deferred: the pop does NOT re-emit 'one'. If the lead brings CSI 22/23 t into #9 the expected requests become [SetTitle("one"), SetTitle("two"), SetTitle("one")].
+flags: deferred decision D-TSTACK
+screen: not asserted
+requests: [SetTitle("one"), SetTitle("two")]
+
+
+# ---------------------------------------------------------------------------- K. OSC 52 clipboard write (read/query is never answered)
+
+### K01_c_bel
+size: 2x40
+step: feed \x1b]52;c;aGVsbG8=\x07
+cite: [CTL] Ps=52 'Pc may contain zero or more of c p q s 0-7 ... If the parameter is empty, xterm uses s 0'; [XT-m] ManipulateSelectionData L3320; [AL] clipboard_store 'c' -> Clipboard; [WZ] SetSelection; [IT] decodedBase64PasteCommand L1566
+note: base64('hello') = aGVsbG8=
+screen:
+> |
+>
+cursor: (0,0)
+requests: [SetClipboard("hello")]
+
+### K02_c_st
+size: 2x40
+step: feed \x1b]52;c;aGVsbG8=\x1b\\
+cite: [CTL] OSC Ps ; Pt ST; [VTE] osc_c0_st_terminated
+screen:
+> |
+>
+cursor: (0,0)
+requests: [SetClipboard("hello")]
+
+### K03_s
+size: 2x40
+step: feed \x1b]52;s;aGVsbG8=\x07
+cite: [KT] clipboard.py from_osc52_where_field L85 ('c','s' -> clipboard); [AL] 's' -> Selection (PRIMARY, absent on macOS); [IT] Pc ignored
+note: D-SEL: s -> general pasteboard (macOS has one).
+flags: decision D-SEL
+screen: not asserted
+requests: [SetClipboard("hello")]
+
+### K04_p
+size: 2x40
+step: feed \x1b]52;p;aGVsbG8=\x07
+cite: [KT] from_osc52_where_field 'p' -> primary_selection; [AL] 'p' -> Selection; [IT] 'p' accepted, general pasteboard; [XT-m] table 'p' -> PRIMARY
+note: D-SEL: p -> general pasteboard (iTerm2 behaviour; macOS has no primary selection, and tools such as Neovim send p for the `*` register).
+flags: decision D-SEL
+screen: not asserted
+requests: [SetClipboard("hello")]
+
+### K05_empty_selection_means_default
+size: 2x40
+step: feed \x1b]52;;aGVsbG8=\x07
+cite: [CTL] 'If the parameter is empty, xterm uses s 0'; [XT-m] L3350 base = "s0"; [KT] parse_osc_52 `where or 's0'`; [WZ] try_parse empty -> SELECT|CUT0; [AL] unwrap_or(&b'c')
+note: All four map the empty Pc to the clipboard.
+flags: decision D-SEL
+screen: not asserted
+requests: [SetClipboard("hello")]
+
+### K06_several_letters_one_write
+size: 2x40
+step: feed \x1b]52;cp;aGVsbG8=\x07
+step: feed \x1b]52;pcs;aGVsbG8=\x07
+cite: [XT-m] ManipulateSelectionData target_used[] dedupes; [KT] destinations is a set
+note: Two sequences, each lists several of c/p/s: exactly ONE SetClipboard each.
+flags: decision D-SEL
+screen: not asserted
+requests: [SetClipboard("hello"), SetClipboard("hello")]
+
+### K07_c_plus_cut_buffer
+size: 2x40
+step: feed \x1b]52;c0;aGVsbG8=\x07
+cite: [XT-m] table: c -> CLIPBOARD, 0 -> CUT_BUFFER0; [KT] 0 dropped, c kept
+note: A list with c plus a cut buffer still writes the clipboard.
+flags: decision D-SEL
+screen: not asserted
+requests: [SetClipboard("hello")]
+
+### K08_secondary_only_ignored
+size: 2x40
+step: feed \x1b]52;q;aGVsbG8=\x07
+cite: [CTL] q = secondary selection; [KT] 'q' -> ClipboardType.unknown, discarded; [AL] 'q' -> return
+flags: negative decision D-SEL
+screen: not asserted
+requests: []
+
+### K09_cut_buffers_only_ignored
+size: 2x40
+step: feed \x1b]52;0;aGVsbG8=\x07\x1b]52;17;aGVsbG8=\x07
+cite: [CTL] 0-7 = cut buffers; [KT] discarded; [AL] return; (iTerm2 would write the pasteboard)
+note: Cut buffers 0-7 are X11 concepts.
+flags: negative decision D-SEL
+screen: not asserted
+requests: []
+
+### K12_unknown_selection_letter_rejects_whole_osc
+size: 2x40
+step: feed \x1b]52;x;aGVsbG8=\x07\x1b]52;cx;aGVsbG8=\x07\x1b]52;C;aGVsbG8=\x07
+cite: [IT] decodedBase64PasteCommand 'strchr("psc01234567", *buffer)' then requires ';' (parse failure); [XT-m] skips unknown letters (would write for `cx`); [KT] drops unknown; [AL] only the first byte is looked at
+note: x, cx and upper-case C are all outside {c p q s 0-7}: ignored.
+flags: negative decision D-SEL
+screen: not asserted
+requests: []
+
+### K15_query_is_ignored
+size: 2x40
+step: feed \x1b]52;c;?\x07\x1b]52;;?\x1b\\
+cite: [CTL] '?' makes xterm reply with the selection (gated by allowWindowOps); [IT] 'Now read access is not implemented due to security issues'; [AL] clipboard_load only with Osc52::OnlyPaste|CopyPaste (default OnlyCopy)
+note: D-READ: no request and no reply bytes, even with an empty Pc.
+flags: security negative decision D-READ
+screen:
+> |
+>
+cursor: (0,0)
+requests: []
+
+### K17_query_with_trailing_data_is_not_a_query
+size: 2x40
+step: feed \x1b]52;c;?x\x07\x1b]52;c;??\x07
+cite: [XT-m] `!strcmp(buf, "?")` is an exact test; [KT] `len(data)==1 and data == b'?'`
+note: '?x' and '??' are neither '?' nor valid base64: ignored (and never answered).
+flags: negative
+screen: not asserted
+requests: []
+
+### K18_empty_payload_ignored
+size: 2x40
+step: feed \x1b]52;c;\x07
+cite: [CTL] 'If the second parameter is neither a base64 string nor ? , then the selection is cleared'; [WZ] decodes "" -> SetSelection(""); [KT] writes an empty string; [AL] base64 "" decodes to "" -> ClipboardStore("")
+note: D-EMPTY52: ignore (xterm clears).
+flags: decision D-EMPTY52
+screen: not asserted
+requests: []
+
+### K19_two_params_ignored
+size: 2x40
+step: feed \x1b]52;c\x07
+cite: [XT-m] no ';' after Pc -> nothing (L3350 `if (*buf == ';')`); [AL] `params.len() < 3` -> unhandled; [WZ] osc.len()==2 -> ClearSelection (clears)
+note: D-EMPTY52 / D-PARAMS52.
+flags: decision D-EMPTY52
+screen: not asserted
+requests: []
+
+### K20_semicolon_only_ignored
+size: 2x40
+step: feed \x1b]52;\x07\x1b]52;;\x07\x1b]52\x07
+cite: [XT-m] L3350; [AL] params.len() < 3
+note: `52;` , `52;;` and bare `52`: nothing.
+flags: negative
+screen: not asserted
+requests: []
+
+### K22_invalid_base64_character
+size: 2x40
+step: feed \x1b]52;c;aGVs!G8=\x07\x1b]52;c;====\x07
+cite: [KT] clipboard docs 'Terminals should reject data that is not valid base64 ... must not silently discard invalid characters'; [AL]/[WZ] decode error -> nothing; [XT-b] AppendToSelectionBuffer SKIPS '!' (xterm would write garbage)
+note: D-B64: strict.
+flags: negative decision D-B64
+screen: not asserted
+requests: []
+
+### K23_missing_padding
+size: 2x40
+step: feed \x1b]52;c;aGVsbG8\x07
+cite: [WZ] STANDARD canonical padding required; [AL] same; [XT-b] accepts
+note: 'aGVsbG8' is 'hello' without the '='.
+flags: negative decision D-B64
+screen: not asserted
+requests: []
+
+### K24_space_inside_payload
+size: 2x40
+step: feed \x1b]52;c;aGVs bG8=\x07
+cite: [KT] 'whitespace ... invalid'; [VTE] 0x20 is kept by vte (only C0 other than BEL/ESC/CAN/SUB is dropped)
+flags: negative decision D-B64
+screen: not asserted
+requests: []
+
+### K25_newline_inside_payload_removed_by_vte
+size: 2x40
+step: feed \x1b]52;c;aGVs\nbG8=\x07
+cite: [VTE] advance_osc_string drops LF/CR (FACT 3); [PROBE] '52 nl' -> one clean param
+note: Quirk worth pinning: wrapped base64 (76-column lines, `base64` CLI output) survives because vte removes the line breaks before the terminal sees them.
+flags: vte-quirk
+screen: not asserted
+requests: [SetClipboard("hello")]
+
+### K26_url_safe_alphabet_rejected
+size: 2x40
+step: feed \x1b]52;c;-_-_\x07
+cite: [AL]/[WZ] base64 STANDARD alphabet; RFC 4648 section 4 vs 5
+flags: negative decision D-B64
+screen: not asserted
+requests: []
+
+### K27_decoded_bytes_not_utf8
+size: 2x40
+step: feed \x1b]52;c;//4=\x07
+cite: [AL] String::from_utf8 failure -> nothing; [WZ] String::from_utf8(bytes)?; [KT] write bytes
+note: '//4=' decodes to FF FE. SetClipboard carries a String, so non-UTF-8 is dropped (brief (d)).
+flags: negative decision D-CTRL52
+screen: not asserted
+requests: []
+
+### K28_embedded_nul_survives
+size: 2x40
+step: feed \x1b]52;c;YQBi\x07
+cite: [AL]/[WZ] String keeps NUL; [IT] stops at NUL (iTerm2 differs); brief: FFI passes ptr+len because the text may contain NUL
+note: YQBi = 'a' NUL 'b'.
+flags: decision D-CTRL52
+screen: not asserted
+requests: [SetClipboard("a\x00b")]
+
+### K29_control_characters_pass_through
+size: 2x40
+step: feed \x1b]52;c;YRtbMzFtYgo=\x07
+cite: [AL]/[WZ]/[KT] no sanitising; [IT] decodedBase64PasteCommand strips C0 except TAB LF CR
+note: YRtbMzFtYgo= = 'a' ESC '[31mb' LF. Unchanged on purpose (D-CTRL52). Bracketed paste is the consumer's protection.
+flags: security decision D-CTRL52
+screen: not asserted
+requests: [SetClipboard("a\x1b[31mb\n")]
+
+### K30_unicode_text
+size: 2x40
+step: feed \x1b]52;c;aMOpbGxvIOaXpeacrOiqniDwn6aA\x07
+cite: [WZ] String::from_utf8; [AL] same
+screen: not asserted
+requests: [SetClipboard("h\u{e9}llo \u{65e5}\u{672c}\u{8a9e} \u{1f980}")]
+
+### K31_multiline_text
+size: 2x40
+step: feed \x1b]52;c;bGluZTEKbGluZTIK\x07
+cite: [WZ]/[AL] no change
+screen: not asserted
+requests: [SetClipboard("line1\nline2\n")]
+
+### K32_exactly_the_cap
+size: 2x40
+step: feed \x1b]52;c;@b64rep(a,1048576)\x07
+cite: D-CAP52 (survey: kitty 512 MB, xterm strings_max 20000, Alacritty/WezTerm/iTerm2 none)
+note: 1 MiB decoded is accepted; 1_398_104 base64 characters.
+flags: boundary decision D-CAP52
+screen: not asserted
+requests: [SetClipboard("@rep(a,1048576)")]
+
+### K33_one_byte_over_the_cap
+size: 2x40
+step: feed \x1b]52;c;@b64rep(a,1048577)\x07x
+cite: D-CAP52; [KT] over-limit write is discarded (clipboard_max_size); [XT-c] over-long string ignored whole
+note: Dropped with a trace; the 'x' after it still prints.
+flags: boundary decision D-CAP52
+screen:
+>x |
+>
+cursor: (0,1)
+requests: []
+
+### K34_extra_params_ignored
+size: 2x40
+step: feed \x1b]52;c;aGVsbG8=;junk\x07
+cite: [WZ] 'unhandled OSC 52' unless osc.len() is 2 or 3; [AL] ignores params[3..] (differs); [XT-m] the data would be 'aGVsbG8=;junk' and xterm's decoder skips ';'
+note: D-PARAMS52: exactly three params.
+flags: negative decision D-PARAMS52
+screen: not asserted
+requests: []
+
+### K35_no_selection_param
+size: 2x40
+step: feed \x1b]52;aGVsbG8=\x07
+cite: [AL] params.len() < 3; [WZ] osc.len()==2 -> ClearSelection with Pc=data -> error
+note: Looks like Pc only: ignored.
+flags: negative decision D-PARAMS52
+screen: not asserted
+requests: []
+
+### K36_bytewise
+size: 2x40
+step: feed_bytewise \x1b]52;c;aGVsbG8=\x1b\\
+cite: [PROBE]; brief done-when (split at every byte)
+screen:
+> |
+>
+cursor: (0,0)
+requests: [SetClipboard("hello")]
+
+### K37_can_after_complete_payload
+size: 2x40
+step: feed \x1b]52;c;aGVsbG8=\x18x
+cite: FACT 4 [VTE] L414; [XT-c] xterm discards
+note: Complete, valid payload ended by CAN: accepted under D-CAN.
+flags: vte-divergence decision D-CAN
+screen:
+>x |
+>
+cursor: (0,1)
+requests: [SetClipboard("hello")]
+
+### K38_can_in_the_middle_of_the_payload
+size: 2x40
+step: feed \x1b]52;c;aGVsb\x18x
+cite: FACT 4 [VTE] L414
+note: 'aGVsb' (5 chars) is not canonical base64, so the truncated-by-CAN payload is dropped by D-B64.
+flags: security decision D-CAN D-B64
+screen:
+>x |
+>
+cursor: (0,1)
+requests: []
+
+### K39_non_zero_trailing_bits
+size: 2x40
+step: feed \x1b]52;c;aGVsbG9=\x07
+cite: [AL] base64 crate STANDARD rejects (decode_allow_trailing_bits=false); [WZ] allows trailing bits (with_decode_allow_trailing_bits(true)); [XT-b] accepts
+note: 'bG9=' leaves non-zero bits in the last quantum. Strict reject recommended; WezTerm would still write 'hello'.
+flags: negative decision D-B64
+screen: not asserted
+requests: []
+
+### K40_excess_padding
+size: 2x40
+step: feed \x1b]52;c;aGVsbG8==\x07
+cite: [AL]/[WZ] canonical padding
+flags: negative decision D-B64
+screen: not asserted
+requests: []
+
+### K41_two_writes_in_order
+size: 2x40
+step: feed \x1b]52;c;b25l\x07\x1b]52;c;dHdv\x07
+cite: D-FLOOD
+flags: decision D-FLOOD
+screen: not asserted
+requests: [SetClipboard("one"), SetClipboard("two")]
+
+### K42_clipboard_from_alt_screen
+size: 2x40
+step: feed \x1b[?1049h\x1b]52;c;aGVsbG8=\x07
+cite: [CTL] selection is not screen-bound (vim in the alt screen is the main OSC 52 user)
+screen: not asserted
+requests: [SetClipboard("hello")]
+
+
+# ---------------------------------------------------------------------------- W. OSC 7 working directory (raw bytes to the host; app-core parses with parse_osc7)
+
+### W01_bel
+size: 2x40
+step: feed \x1b]7;file://host/tmp/a\x07
+cite: [WZ] osc.rs SetCurrentWorkingDirectory = "7" (raw string); [KT] vt-parser.c case 7 -> process_cwd_notification stores the raw bytes; brief (b) Request::SetCwd(Vec<u8>); shell-integration/zsh/tessera-integration L75 sends `ESC ] 7 ; file://<host><url> BEL`
+screen:
+> |
+>
+cursor: (0,0)
+requests: [SetCwd(b"file://host/tmp/a")]
+
+### W02_st
+size: 2x40
+step: feed \x1b]7;file://host/tmp/a\x1b\\
+cite: [WZ] osc.rs SetCurrentWorkingDirectory = "7" (raw string); [KT] vt-parser.c case 7 -> process_cwd_notification stores the raw bytes; brief (b) Request::SetCwd(Vec<u8>)
+screen:
+> |
+>
+cursor: (0,0)
+requests: [SetCwd(b"file://host/tmp/a")]
+
+### W03_percent_escapes_are_not_decoded_by_the_terminal
+size: 2x40
+step: feed \x1b]7;file://h/a%20b%0Ac%00d\x07
+cite: [WZ] osc.rs SetCurrentWorkingDirectory = "7" (raw string); [KT] vt-parser.c case 7 -> process_cwd_notification stores the raw bytes; brief (b) Request::SetCwd(Vec<u8>)
+note: The terminal forwards the bytes verbatim; decoding, the control-character check and the `..` check are parse_osc7's job (rows P7-*). Security: nothing in term may decode %00 / %0A.
+flags: security
+screen: not asserted
+requests: [SetCwd(b"file://h/a%20b%0Ac%00d")]
+
+### W04_raw_semicolon_is_rejoined
+size: 2x40
+step: feed \x1b]7;file://h/a;b\x07
+cite: [WZ] osc.rs SetCurrentWorkingDirectory = "7" (raw string); [KT] vt-parser.c case 7 -> process_cwd_notification stores the raw bytes; brief (b) Request::SetCwd(Vec<u8>); FACT 1 [PROBE] semi title; [CODE] parse_osc7('file://h/a;b') -> path /a;b
+note: A raw ';' in the URL splits the OSC in vte; rejoin with ';'.
+screen: not asserted
+requests: [SetCwd(b"file://h/a;b")]
+
+### W05_vte_param_cap_drops_the_request
+size: 2x40
+step: feed \x1b]7;file://h/a;b;c;d;e;f;g;h;i;j;k;l;m;n;o;p\x07
+cite: [VTE] MAX_OSC_PARAMS = 16 (FACT 2); D-PARAMS
+note: 15 ';' in the payload: vte keeps 16 params and drops the tail, so what arrives is a SHORTER valid-looking path. params.len() == 16 => drop the request (also drops a payload with exactly 14 ';' - accepted false positive).
+flags: security vte-limit decision D-PARAMS
+screen: not asserted
+requests: []
+
+### W06_empty_payload
+size: 2x40
+step: feed \x1b]7;\x07\x1b]7\x07
+cite: [CODE] parse_osc7(b"") -> None; D-FWD-CAP
+note: Nothing to forward.
+flags: negative decision D-FWD-CAP
+screen: not asserted
+requests: []
+
+### W07_exactly_4096_bytes_forwarded
+size: 2x40
+step: feed \x1b]7;file://h/@rep(a,4087)\x07
+cite: [CODE] MAX_OSC7_LEN = 4096 (osc7.rs L12); parse_osc7 accepts len 4096 (probe osc7 len4096 -> Some)
+note: 'file://h/' is 9 bytes + 4087 = 4096.
+flags: boundary decision D-FWD-CAP
+screen: not asserted
+requests: [SetCwd(b"file://h/@rep(a,4087)")]
+
+### W08_4097_bytes_dropped
+size: 2x40
+step: feed \x1b]7;file://h/@rep(a,4088)\x07
+cite: [CODE] parse_osc7 -> None above 4096 (probe osc7 len4097 -> None); D-FWD-CAP
+flags: boundary decision D-FWD-CAP
+screen: not asserted
+requests: []
+
+### W09_non_file_scheme_forwarded_raw
+size: 2x40
+step: feed \x1b]7;http://h/a\x07
+cite: [CODE] parse_osc7('http://h/a') -> None (probe)
+note: The terminal does not judge the scheme (layering, brief (b)); app-core keeps the previous cwd.
+screen: not asserted
+requests: [SetCwd(b"http://h/a")]
+
+### W10_kitty_form_forwarded_raw
+size: 2x40
+step: feed \x1b]7;kitty-shell-cwd://h/a%b?c\x07
+cite: [KT] shell-integration zsh sends kitty-shell-cwd://; [CODE] parse_osc7 -> path '/a%b?c' (probe)
+screen: not asserted
+requests: [SetCwd(b"kitty-shell-cwd://h/a%b?c")]
+
+### W11_invalid_utf8_is_bytes
+size: 2x40
+step: feed \x1b]7;file://h/\xff\x07
+cite: [CODE] Request::SetCwd(Vec<u8>); parse_osc7('..%FF') -> None
+note: Why the request carries bytes, not a String.
+screen: not asserted
+requests: [SetCwd(b"file://h/\xff")]
+
+### W12_in_alt_screen
+size: 2x40
+step: feed \x1b[?1049h\x1b]7;file://h/a\x07
+cite: [KT] the cwd is process state, not screen state
+screen: not asserted
+requests: [SetCwd(b"file://h/a")]
+screen_is: alt
+
+### W13_bytewise
+size: 2x40
+step: feed_bytewise \x1b]7;file://h/a%20b\x1b\\
+cite: brief done-when (split at every byte)
+screen:
+> |
+>
+cursor: (0,0)
+requests: [SetCwd(b"file://h/a%20b")]
+
+
+# ---------------------------------------------------------------------------- H. OSC 1337 ShellIntegrationVersion handshake (raw payload to the host; app-core parses with parse_osc1337)
+
+### H01_zsh_bel
+size: 2x40
+step: feed \x1b]1337;ShellIntegrationVersion=1;shell=zsh\x07
+cite: [IT] VT100Terminal.m executeXtermSetKvp L4432 (key ShellIntegrationVersion); shell-integration/zsh/tessera-integration L154 `ESC ] 1337 ; ShellIntegrationVersion=1;shell=zsh BEL`; brief (b)
+note: FACT 1: params are [1337, ShellIntegrationVersion=1, shell=zsh]; forwarded payload = params[1..].join(';').
+screen:
+> |
+>
+cursor: (0,0)
+requests: [ShellIntegrationHandshake(b"ShellIntegrationVersion=1;shell=zsh")]
+
+### H02_fish_st
+size: 2x40
+step: feed \x1b]1337;ShellIntegrationVersion=1;shell=fish\x1b\\
+cite: [IT] VT100Terminal.m executeXtermSetKvp L4432 (key ShellIntegrationVersion); shell-integration/zsh/tessera-integration L154 `ESC ] 1337 ; ShellIntegrationVersion=1;shell=zsh BEL`; brief (b); shell-integration/fish L65
+screen:
+> |
+>
+cursor: (0,0)
+requests: [ShellIntegrationHandshake(b"ShellIntegrationVersion=1;shell=fish")]
+
+### H03_extra_params_forwarded
+size: 2x40
+step: feed \x1b]1337;ShellIntegrationVersion=18;shell=zsh;extra=1\x07
+cite: [CODE] parse_osc1337 ignores other params after the version; iTerm2 sends its own number (18...)
+note: Forwarded raw; app-core warns on the mismatch (D-HANDSHAKE).
+flags: decision D-HANDSHAKE
+screen: not asserted
+requests: [ShellIntegrationHandshake(b"ShellIntegrationVersion=18;shell=zsh;extra=1")]
+
+### H04_mismatched_major_still_forwarded
+size: 2x40
+step: feed \x1b]1337;ShellIntegrationVersion=2;shell=bash\x07
+cite: [CODE] scripts::PROTOCOL_VERSION = 1
+note: The terminal does not compare versions (app-core logs).
+flags: decision D-HANDSHAKE
+screen: not asserted
+requests: [ShellIntegrationHandshake(b"ShellIntegrationVersion=2;shell=bash")]
+
+### H05_every_other_1337_key_is_ignored_and_never_answered
+size: 2x40
+step: feed \x1b]1337;SetUserVar=a=YmFy\x07\x1b]1337;CurrentDir=/tmp\x07\x1b]1337;RequestAttention=fireworks\x07\x1b]1337;ReportCellSize\x07\x1b]1337;File=name=eA==;size=1;inline=1:eA==\x07\x1b]1337;RemoteHost=u@h\x07\x1b]1337;SetMark\x07
+cite: [IT] executeXtermSetKvp L4418 (dozens of keys); [KT] case 1337 -> desktop_notify; [WZ] ITermProprietary; [AL] not handled
+note: D-1337 / D-READ: File= may carry megabytes; ReportCellSize is a query. None may produce a request or a reply.
+flags: security negative decision D-1337
+screen:
+> |
+>
+cursor: (0,0)
+requests: []
+
+### H06_key_must_match_exactly
+size: 2x40
+step: feed \x1b]1337;ShellIntegrationVersionX=1;shell=zsh\x07\x1b]1337;shellintegrationversion=1;shell=zsh\x07\x1b]1337;ShellIntegrationVersion\x07\x1b]1337\x07\x1b]1337;\x07
+cite: [CODE] parse_osc1337 strip_prefix(b"ShellIntegrationVersion=") (case-sensitive; probe: lower case -> None)
+note: The forward test is the `ShellIntegrationVersion=` prefix (with the '='), nothing looser.
+flags: negative decision D-1337
+screen: not asserted
+requests: []
+
+### H07_over_4096_dropped
+size: 2x40
+step: feed \x1b]1337;ShellIntegrationVersion=1;shell=zsh;pad=@rep(a,4100)\x07
+cite: D-FWD-CAP
+flags: boundary decision D-FWD-CAP
+screen: not asserted
+requests: []
+
+### H08_vte_param_cap_drops_it
+size: 2x40
+step: feed \x1b]1337;ShellIntegrationVersion=1;shell=zsh;a;b;c;d;e;f;g;h;i;j;k;l;m;n;o\x07
+cite: [VTE] MAX_OSC_PARAMS = 16 (FACT 2); D-PARAMS
+flags: vte-limit decision D-PARAMS
+screen: not asserted
+requests: []
+
+### H09_bytewise
+size: 2x40
+step: feed_bytewise \x1b]1337;ShellIntegrationVersion=1;shell=zsh\x07
+cite: brief done-when (split at every byte)
+screen: not asserted
+requests: [ShellIntegrationHandshake(b"ShellIntegrationVersion=1;shell=zsh")]
+
+### H10_handshake_is_not_printed_or_belled
+size: 2x40
+step: feed \x1b]1337;ShellIntegrationVersion=1;shell=zsh\x07ok
+cite: [XT-c] CASE_BELL L3690
+screen:
+>ok |
+>
+cursor: (0,2)
+requests: [ShellIntegrationHandshake(b"ShellIntegrationVersion=1;shell=zsh")]
+
+
+# ---------------------------------------------------------------------------- M. OSC 133 prompt marks (placed by the terminal on the cursor's line when parsed; Mark::from_osc133)
+
+### M01_prompt_start
+size: 3x20
+step: feed \x1b]133;A\x07$ 
+cite: [BO] semantic-prompts.md 'OSC 133;A/B/C/D'; [KT] screen.c shell_prompt_marking L3637; shell-integration/zsh/tessera-integration L38-L136 (A and B inside PS1, C in preexec, D;<status> in precmd, all BEL)
+note: No request, no screen change from the sequence itself.
+screen:
+>$  |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+marks: r0=[PromptStart]
+
+### M02_command_start_same_line
+size: 3x20
+step: feed \x1b]133;A\x07$ \x1b]133;B\x07
+cite: [BO] semantic-prompts.md 'OSC 133;A/B/C/D'; [KT] screen.c shell_prompt_marking L3637; shell-integration/zsh/tessera-integration L38-L136 (A and B inside PS1, C in preexec, D;<status> in precmd, all BEL)
+note: A and B on one prompt line keep arrival order.
+screen:
+>$  |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+marks: r0=[PromptStart,CommandStart]
+
+### M03_output_start_next_line
+size: 3x20
+step: feed ls\r\n\x1b]133;C\x07out
+cite: [BO] semantic-prompts.md 'OSC 133;A/B/C/D'; [KT] screen.c shell_prompt_marking L3637; shell-integration/zsh/tessera-integration L38-L136 (A and B inside PS1, C in preexec, D;<status> in precmd, all BEL)
+screen:
+>ls
+>out |
+>
+cursor: (1,3)
+pending_wrap: false
+requests: []
+marks: r1=[OutputStart]
+
+### M04_full_cycle
+size: 5x20
+step: feed \x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07
+cite: [BO] semantic-prompts.md 'OSC 133;A/B/C/D'; [KT] screen.c shell_prompt_marking L3637; shell-integration/zsh/tessera-integration L38-L136 (A and B inside PS1, C in preexec, D;<status> in precmd, all BEL)
+note: The D of the finished command and the next A share the fresh line, in arrival order.
+screen:
+>$ ls
+>out
+>$  |
+>
+>
+cursor: (2,2)
+pending_wrap: false
+requests: []
+marks: r0=[PromptStart,CommandStart] r1=[OutputStart] r2=[CommandEnd(0),PromptStart,CommandStart]
+
+### M04b_full_cycle_bytewise
+size: 5x20
+step: feed_bytewise \x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07
+cite: brief done-when (split at every byte)
+screen:
+>$ ls
+>out
+>$  |
+>
+>
+cursor: (2,2)
+pending_wrap: false
+requests: []
+marks: r0=[PromptStart,CommandStart] r1=[OutputStart] r2=[CommandEnd(0),PromptStart,CommandStart]
+
+### M05a_command_end_without_code
+size: 2x20
+step: feed \x1b]133;D\x07
+cite: [BO] semantic-prompts.md 'OSC 133;A/B/C/D'; [KT] screen.c shell_prompt_marking L3637; shell-integration/zsh/tessera-integration L38-L136 (A and B inside PS1, C in preexec, D;<status> in precmd, all BEL); [BO] 'The exit-code need not be specified'
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+marks: r0=[CommandEnd(None)]
+
+### M05_zero
+size: 2x20
+step: feed \x1b]133;D;0\x07
+cite: [BO] semantic-prompts.md 'OSC 133;A/B/C/D'; [KT] screen.c shell_prompt_marking L3637; shell-integration/zsh/tessera-integration L38-L136 (A and B inside PS1, C in preexec, D;<status> in precmd, all BEL); [CODE] parse_osc133('D;0') (probe); [BO] 'D;exit-code;options'
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+marks: r0=[CommandEnd(0)]
+
+### M05_one
+size: 2x20
+step: feed \x1b]133;D;1\x07
+cite: [BO] semantic-prompts.md 'OSC 133;A/B/C/D'; [KT] screen.c shell_prompt_marking L3637; shell-integration/zsh/tessera-integration L38-L136 (A and B inside PS1, C in preexec, D;<status> in precmd, all BEL); [CODE] parse_osc133('D;1') (probe); [BO] 'D;exit-code;options'
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+marks: r0=[CommandEnd(1)]
+
+### M05_130
+size: 2x20
+step: feed \x1b]133;D;130\x07
+cite: [BO] semantic-prompts.md 'OSC 133;A/B/C/D'; [KT] screen.c shell_prompt_marking L3637; shell-integration/zsh/tessera-integration L38-L136 (A and B inside PS1, C in preexec, D;<status> in precmd, all BEL); [CODE] parse_osc133('D;130') (probe); [BO] 'D;exit-code;options'
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+marks: r0=[CommandEnd(130)]
+
+### M05_negative
+size: 2x20
+step: feed \x1b]133;D;-1\x07
+cite: [BO] semantic-prompts.md 'OSC 133;A/B/C/D'; [KT] screen.c shell_prompt_marking L3637; shell-integration/zsh/tessera-integration L38-L136 (A and B inside PS1, C in preexec, D;<status> in precmd, all BEL); [CODE] parse_osc133('D;-1') (probe); [BO] 'D;exit-code;options'
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+marks: r0=[CommandEnd(-1)]
+
+### M05_non_numeric
+size: 2x20
+step: feed \x1b]133;D;abc\x07
+cite: [BO] semantic-prompts.md 'OSC 133;A/B/C/D'; [KT] screen.c shell_prompt_marking L3637; shell-integration/zsh/tessera-integration L38-L136 (A and B inside PS1, C in preexec, D;<status> in precmd, all BEL); [CODE] parse_osc133('D;abc') (probe); [BO] 'D;exit-code;options'
+note: Exit code is an i32; a malformed or missing code is still a CommandEnd with exit_code None (kept from parse_osc133).
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+marks: r0=[CommandEnd(None)]
+
+### M05_empty_code
+size: 2x20
+step: feed \x1b]133;D;\x07
+cite: [BO] semantic-prompts.md 'OSC 133;A/B/C/D'; [KT] screen.c shell_prompt_marking L3637; shell-integration/zsh/tessera-integration L38-L136 (A and B inside PS1, C in preexec, D;<status> in precmd, all BEL); [CODE] parse_osc133('D;') (probe); [BO] 'D;exit-code;options'
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+marks: r0=[CommandEnd(None)]
+
+### M05_overflow_u32
+size: 2x20
+step: feed \x1b]133;D;99999999999\x07
+cite: [BO] semantic-prompts.md 'OSC 133;A/B/C/D'; [KT] screen.c shell_prompt_marking L3637; shell-integration/zsh/tessera-integration L38-L136 (A and B inside PS1, C in preexec, D;<status> in precmd, all BEL); [CODE] parse_osc133('D;99999999999') (probe); [BO] 'D;exit-code;options'
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+marks: r0=[CommandEnd(None)]
+
+### M05_i32_overflow
+size: 2x20
+step: feed \x1b]133;D;2147483648\x07
+cite: [BO] semantic-prompts.md 'OSC 133;A/B/C/D'; [KT] screen.c shell_prompt_marking L3637; shell-integration/zsh/tessera-integration L38-L136 (A and B inside PS1, C in preexec, D;<status> in precmd, all BEL); [CODE] parse_osc133('D;2147483648') (probe); [BO] 'D;exit-code;options'
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+marks: r0=[CommandEnd(None)]
+
+### M05_i32_max
+size: 2x20
+step: feed \x1b]133;D;2147483647\x07
+cite: [BO] semantic-prompts.md 'OSC 133;A/B/C/D'; [KT] screen.c shell_prompt_marking L3637; shell-integration/zsh/tessera-integration L38-L136 (A and B inside PS1, C in preexec, D;<status> in precmd, all BEL); [CODE] parse_osc133('D;2147483647') (probe); [BO] 'D;exit-code;options'
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+marks: r0=[CommandEnd(2147483647)]
+
+### M05_with_aid
+size: 2x20
+step: feed \x1b]133;D;0;aid=1\x07
+cite: [BO] semantic-prompts.md 'OSC 133;A/B/C/D'; [KT] screen.c shell_prompt_marking L3637; shell-integration/zsh/tessera-integration L38-L136 (A and B inside PS1, C in preexec, D;<status> in precmd, all BEL); [CODE] parse_osc133('D;0;aid=1') (probe); [BO] 'D;exit-code;options'
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+marks: r0=[CommandEnd(0)]
+
+### M05_empty_code_with_aid
+size: 2x20
+step: feed \x1b]133;D;;aid=1\x07
+cite: [BO] semantic-prompts.md 'OSC 133;A/B/C/D'; [KT] screen.c shell_prompt_marking L3637; shell-integration/zsh/tessera-integration L38-L136 (A and B inside PS1, C in preexec, D;<status> in precmd, all BEL); [CODE] parse_osc133('D;;aid=1') (probe); [BO] 'D;exit-code;options'
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+marks: r0=[CommandEnd(None)]
+
+### M05_space_before_code
+size: 2x20
+step: feed \x1b]133;D; 1\x07
+cite: [BO] semantic-prompts.md 'OSC 133;A/B/C/D'; [KT] screen.c shell_prompt_marking L3637; shell-integration/zsh/tessera-integration L38-L136 (A and B inside PS1, C in preexec, D;<status> in precmd, all BEL); [CODE] parse_osc133('D; 1') (probe); [BO] 'D;exit-code;options'
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+marks: r0=[CommandEnd(None)]
+
+### M05_st_terminator
+size: 2x20
+step: feed \x1b]133;D;0\x1b\\
+cite: [BO] semantic-prompts.md 'OSC 133;A/B/C/D'; [KT] screen.c shell_prompt_marking L3637; shell-integration/zsh/tessera-integration L38-L136 (A and B inside PS1, C in preexec, D;<status> in precmd, all BEL); [CTL] BEL or ST
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+marks: r0=[CommandEnd(0)]
+
+### M06a_options_aid_cl
+size: 2x20
+step: feed \x1b]133;A;aid=42;cl=line\x07
+cite: [BO] 'A' options aid, cl; 'A terminal must ignore an option whose option-name it doesn't recognize'
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+marks: r0=[PromptStart]
+
+### M06a2_options_k_i_redraw
+size: 2x20
+step: feed \x1b]133;A;k=i\x07\x1b]133;A;redraw=0;special_key=1;click_events=1\x07
+cite: [BO] k= kinds 'i' is the default; [KT] parse_prompt_mark L3612 (redraw, special_key, click_events); fish 4.x emits `A;click_events=1`
+note: Two A on one line collapse to one mark (D-DUP).
+flags: decision D-DUP
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+marks: r0=[PromptStart]
+
+### M06b_secondary_prompt_gets_no_mark
+size: 2x20
+step: feed \x1b]133;A;k=s\x07
+cite: [BO] 'Prompts for continuation lines have kind c ... s ... right-aligned r'; [KT] parse_prompt_mark L3617 `k=s` -> SECONDARY_PROMPT (navigation counts PROMPT_START only)
+note: D-SECOND. Current parse_osc133 would return PromptStart (doc: 'A;k=s ... are ignored').
+flags: decision D-SECOND
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+marks: none
+
+### M06c_continuation_prompt_gets_no_mark
+size: 2x20
+step: feed \x1b]133;A;k=c\x07
+cite: [BO] 'Prompts for continuation lines have kind c ... s ... right-aligned r'; [KT] parse_prompt_mark L3617 `k=s` -> SECONDARY_PROMPT (navigation counts PROMPT_START only)
+flags: decision D-SECOND
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+marks: none
+
+### M06d_right_prompt_gets_no_mark
+size: 2x20
+step: feed \x1b]133;A;k=r\x07
+cite: [BO] 'Prompts for continuation lines have kind c ... s ... right-aligned r'; [KT] parse_prompt_mark L3617 `k=s` -> SECONDARY_PROMPT (navigation counts PROMPT_START only)
+flags: decision D-SECOND
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+marks: none
+
+### M07a_trailing_junk_after_letter
+size: 2x20
+step: feed \x1b]133;Afoo\x07\x1b]133;AB\x07\x1b]133;D0\x07
+cite: [BO] syntax `OSC 133 ; A [; options]` (letter, then ';'); [CODE] parse_osc133 matches by prefix today (probe: `Afoo` -> PromptStart, `D0` -> None)
+note: D-STRICT133.
+flags: negative decision D-STRICT133
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+marks: none
+
+### M07b_unknown_or_unsupported_letters
+size: 2x20
+step: feed \x1b]133;a\x07\x1b]133;L\x07\x1b]133;N\x07\x1b]133;P\x07\x1b]133;I\x07\x1b]133;Z\x07\x1b]133;1\x07
+cite: [BO] defines L N P I (and err= on Z) beyond A-D; our scripts emit only A B C D
+note: D-STRICT133: ignore until a consumer needs them.
+flags: negative decision D-STRICT133
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+marks: none
+
+### M07c_empty_payload
+size: 2x20
+step: feed \x1b]133;\x07\x1b]133\x07
+cite: [KT] dispatch_osc case 133: `if (limit > i)` guards the empty case; [CODE] parse_osc133(b"") -> None
+flags: negative
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+marks: none
+
+### M08_pending_wrap_mark_stays_on_the_line
+size: 3x10
+step: feed 0123456789\x1b]133;C\x07X
+cite: [KT] screen.c L3648 `line_attrs[self->cursor->y]` - no wrap resolution; Grid: pending wrap is a flag on the last column, the cursor row is still row 0
+note: D-PENDING. The C arrives while the wrap is pending: the mark is on row 0 (the line of the prompt/output end), X then wraps to row 1.
+flags: decision D-PENDING
+screen:
+>0123456789\
+>X |
+>
+cursor: (1,1)
+pending_wrap: false
+requests: []
+marks: r0=[OutputStart]
+
+### M09_after_wrap_resolved
+size: 3x10
+step: feed 0123456789X\x1b]133;C\x07
+cite: [KT] screen.c L3648
+note: The wrap was resolved by X; the cursor is on row 1.
+flags: decision D-PENDING
+screen:
+>0123456789\
+>X |
+>
+cursor: (1,1)
+pending_wrap: false
+requests: []
+marks: r1=[OutputStart]
+
+### M10_alt_screen_ignores_marks
+size: 3x10
+step: feed \x1b]133;A\x07m\x1b[?1049h\x1b]133;C\x07a
+cite: [KT] screen.c records on the alt linebuf but navigation is main-only (screen_history_scroll_to_prompt L3668 `linebuf != main_linebuf` -> false); D-ALT
+note: Active screen is the alternate one: no marks on it. The main screen keeps its A: see main_marks.
+flags: decision D-ALT
+screen:
+> a |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+marks: none
+screen_is: alt
+main_marks: r0=[PromptStart]
+
+### M11_alt_screen_leave_restores_main_marks
+size: 3x10
+step: feed \x1b]133;A\x07m\x1b[?1049h\x1b]133;C\x07a\x1b[?1049l
+cite: D-ALT
+note: Back on the main screen: the A is there, the C received on the alt screen is nowhere.
+flags: decision D-ALT
+screen:
+>m |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+marks: r0=[PromptStart]
+screen_is: main
+
+### M12_mark_moves_into_scrollback
+size: 2x10
+step: feed \x1b]133;A\x07p\r\nq\r\nr
+cite: Grid: marks live on Line and move with it (grid.rs scroll_up keeps Line); brief (a)
+note: p scrolls into the scrollback and keeps its mark.
+screen:
+>q
+>r |
+cursor: (1,1)
+pending_wrap: false
+requests: []
+marks: none
+marks_scrollback: s0=[PromptStart]
+scrollback: len=1 first=("p", wrapped=false)
+
+### M13_duplicate_prompt_start_collapses
+size: 2x20
+step: feed \x1b]133;A\x07\x1b]133;A\x07
+cite: [KT] one prompt_kind per row (screen.c L3648 overwrites); D-DUP
+note: A redrawn prompt (resize, Ctrl-L) re-sends A on the same row.
+flags: decision D-DUP
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+marks: r0=[PromptStart]
+
+### M14_second_command_end_replaces_first
+size: 2x20
+step: feed \x1b]133;D;1\x07\x1b]133;D;0\x07
+cite: D-DUP
+flags: decision D-DUP
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+marks: r0=[CommandEnd(0)]
+
+### M15_order_is_arrival_order
+size: 2x20
+step: feed \x1b]133;B\x07\x1b]133;A\x07
+cite: Line::marks is a Vec (grid line.rs L42)
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+marks: r0=[CommandStart,PromptStart]
+
+### M16_no_fresh_line
+size: 2x10
+step: feed abc\x1b]133;A\x07
+cite: [BO] 'First do a fresh-line' and [WZ] performer.rs L871 do it; [KT] shell_prompt_marking does not move the cursor; D-FRESH
+note: The cursor stays at (0,3); the mark lands on the row holding the cursor.
+flags: decision D-FRESH
+screen:
+>abc |
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+marks: r0=[PromptStart]
+
+### M17_mark_does_not_reset_pending_wrap
+size: 2x10
+step: feed 0123456789\x1b]133;A\x07
+cite: [XT-c] OSC does not touch the cursor or the wrap flag; D-PENDING
+note: pending_wrap stays true.
+flags: decision D-PENDING
+screen:
+>0123456789|
+>
+cursor: (0,9)
+pending_wrap: true
+requests: []
+marks: r0=[PromptStart]
+
+
+# ---------------------------------------------------------------------------- X. terminators, chunking, malformed input
+
+### X01_split_across_two_feeds
+size: 2x40
+step: feed \x1b]2;he
+step: feed llo\x07
+cite: [VT] Parser keeps state between advance() calls; brief done-when proptest
+screen:
+> |
+>
+cursor: (0,0)
+requests: [SetTitle("hello")]
+
+### X02_unterminated_osc_swallows_text
+size: 2x40
+step: feed \x1b]2;abc
+step: feed xyz
+cite: [XT-c] string state continues until BEL/ST/CAN/SUB/ESC (strings_max bounds it); [VTE] advance_osc_string
+note: Nothing is applied or printed while the OSC is open. An implementation that applied the title at end of input would fail this row.
+flags: negative
+screen:
+> |
+>
+cursor: (0,0)
+requests: []
+
+### X03_raw_c1_st_does_not_terminate
+size: 2x40
+step: feed \x1b]2;hi\x9cx\x07y
+cite: FACT 5 [PROBE] c1raw9c / c1utf8 -> no dispatch until a real terminator; [CTL] lists ST as 0x9C but Tessera is a UTF-8 terminal
+note: The byte 0x9C is data: invalid UTF-8 -> lossy (D-BADUTF8). Documents the current limitation; not worth supporting.
+flags: vte-limit decision D-BADUTF8
+screen:
+>y |
+>
+cursor: (0,1)
+requests: [SetTitle("hi\u{fffd}x")]
+
+### X04_c1_osc_introducer_not_supported
+size: 2x40
+step: feed \u{9d}2;hi\x07x
+cite: FACT 5 [PROBE] 'c1 osc intro utf8' -> Execute(157), Print('2'), ... Execute(7)
+note: U+009D is not an OSC introducer here: the text prints and the BEL rings. Documents the limitation. UNVERIFIED: assumes Terminal::execute(0x9D) is a no-op (not read in term/src/control.rs).
+flags: vte-limit
+screen:
+>2;hix |
+>
+cursor: (0,5)
+requests: [Bell]
+
+### X05_osc_inside_osc
+size: 2x40
+step: feed \x1b]2;a\x1b]2;b\x07x
+cite: FACT 4 [PROBE] 'nested osc' -> Osc(a), Osc(b); [XT-c] xterm: the first string is dropped (new ESC ] restarts)
+note: D-CAN.
+flags: vte-divergence decision D-CAN
+screen:
+>x |
+>
+cursor: (0,1)
+requests: [SetTitle("a"), SetTitle("b")]
+
+### X06_osc_keeps_pending_wrap
+size: 2x10
+step: feed 0123456789\x1b]2;t\x07X
+cite: [XT-c] OSC handling never calls ResetWrap/CursorSet
+note: Pending wrap survives an OSC and X wraps to row 1.
+screen:
+>0123456789\
+>X |
+cursor: (1,1)
+pending_wrap: false
+requests: [SetTitle("t")]
+
+### X07_osc_between_print_and_wrap
+size: 2x10
+step: feed abc\x1b]0;t\x07def
+cite: OSC must not move the cursor
+screen:
+>abcdef |
+>
+cursor: (0,6)
+pending_wrap: false
+requests: [SetTitle("t")]
+
+### X08_unterminated_then_esc_backslash_alone
+size: 2x40
+step: feed \x1b\\ok
+cite: [CTL] ST outside a string is a no-op
+note: A stray ST (no open OSC) does nothing and prints nothing.
+screen:
+>ok |
+>
+cursor: (0,2)
+requests: []
+
+
+# ---------------------------------------------------------------------------- P. layer: parse rows (pure functions; run in grid / shell-integration / app-core unit tests, NOT by osc.rs). Values marked [CODE] were produced by running the current code in a probe.
+
+### P7-01
+layer: parse
+call: parse_osc7(b"file:///tmp")
+expect: Some(Cwd{host:"",path:"/tmp"})
+cite: [CODE] probe run of parse_osc7 at 2f07dff; crates/tessera-shell-integration/src/osc7.rs
+
+### P7-02
+layer: parse
+call: parse_osc7(b"file://Mac.home/tmp")
+expect: Some(Cwd{host:"Mac.home",path:"/tmp"})
+cite: [CODE] probe run of parse_osc7 at 2f07dff; crates/tessera-shell-integration/src/osc7.rs
+
+### P7-03
+layer: parse
+call: parse_osc7(b"file://h/tmp/a%20b")
+expect: Some(path "/tmp/a b")
+cite: [CODE] probe run of parse_osc7 at 2f07dff; crates/tessera-shell-integration/src/osc7.rs
+
+### P7-04
+layer: parse
+call: parse_osc7(b"file://h/caf%C3%A9")
+expect: Some(path "/caf\u{e9}")
+cite: [CODE] probe run of parse_osc7 at 2f07dff; crates/tessera-shell-integration/src/osc7.rs
+
+### P7-05
+layer: parse
+call: parse_osc7(b"file://h/a%00b")
+expect: None
+cite: [CODE] probe run of parse_osc7 at 2f07dff; crates/tessera-shell-integration/src/osc7.rs
+note: NUL in path (security)
+flags: security
+
+### P7-06
+layer: parse
+call: parse_osc7(b"file://h/a%0Ab")
+expect: None
+cite: [CODE] probe run of parse_osc7 at 2f07dff; crates/tessera-shell-integration/src/osc7.rs
+note: newline
+flags: security
+
+### P7-07
+layer: parse
+call: parse_osc7(b"file://h/a%1Bb")
+expect: None
+cite: [CODE] probe run of parse_osc7 at 2f07dff; crates/tessera-shell-integration/src/osc7.rs
+note: ESC
+flags: security
+
+### P7-08
+layer: parse
+call: parse_osc7(b"file://h/a%7Fb")
+expect: None
+cite: [CODE] probe run of parse_osc7 at 2f07dff; crates/tessera-shell-integration/src/osc7.rs
+note: DEL
+flags: security
+
+### P7-09
+layer: parse
+call: parse_osc7(b"file://h/a%2Fb")
+expect: None
+cite: [CODE] probe run of parse_osc7 at 2f07dff; crates/tessera-shell-integration/src/osc7.rs
+note: encoded slash changes segments
+flags: security
+
+### P7-10
+layer: parse
+call: parse_osc7(b"file://h/tmp/../etc")
+expect: None
+cite: [CODE] probe run of parse_osc7 at 2f07dff; crates/tessera-shell-integration/src/osc7.rs
+note: `..` segment
+flags: security
+
+### P7-11
+layer: parse
+call: parse_osc7(b"file://h/tmp/%2e%2e/etc")
+expect: None
+cite: [CODE] probe run of parse_osc7 at 2f07dff; crates/tessera-shell-integration/src/osc7.rs
+note: `..` hidden by percent-encoding
+flags: security
+
+### P7-12
+layer: parse
+call: parse_osc7(b"file://h/tmp/..foo")
+expect: Some(path "/tmp/..foo")
+cite: [CODE] probe run of parse_osc7 at 2f07dff; crates/tessera-shell-integration/src/osc7.rs
+note: `..foo` is not a `..` segment
+
+### P7-13
+layer: parse
+call: parse_osc7(b"file://h")
+expect: None
+cite: [CODE] probe run of parse_osc7 at 2f07dff; crates/tessera-shell-integration/src/osc7.rs
+note: no path
+
+### P7-14
+layer: parse
+call: parse_osc7(b"file://h/")
+expect: Some(path "/")
+cite: [CODE] probe run of parse_osc7 at 2f07dff; crates/tessera-shell-integration/src/osc7.rs
+
+### P7-15
+layer: parse
+call: parse_osc7(b"file://h/a%zz")
+expect: None
+cite: [CODE] probe run of parse_osc7 at 2f07dff; crates/tessera-shell-integration/src/osc7.rs
+note: malformed escape
+
+### P7-16
+layer: parse
+call: parse_osc7(b"file://h/a%4")
+expect: None
+cite: [CODE] probe run of parse_osc7 at 2f07dff; crates/tessera-shell-integration/src/osc7.rs
+note: truncated escape
+
+### P7-17
+layer: parse
+call: parse_osc7(b"file://h/a%FF")
+expect: None
+cite: [CODE] probe run of parse_osc7 at 2f07dff; crates/tessera-shell-integration/src/osc7.rs
+note: decodes to invalid UTF-8
+
+### P7-18
+layer: parse
+call: parse_osc7(b"file://h/%C0%AF")
+expect: None
+cite: [CODE] probe run of parse_osc7 at 2f07dff; crates/tessera-shell-integration/src/osc7.rs
+note: overlong '/' (invalid UTF-8)
+flags: security
+
+### P7-19
+layer: parse
+call: parse_osc7(b"file://u@h/a?x=1#f")
+expect: Some(host "h", path "/a")
+cite: [CODE] probe run of parse_osc7 at 2f07dff; crates/tessera-shell-integration/src/osc7.rs
+note: user@ and query/fragment dropped
+
+### P7-20
+layer: parse
+call: parse_osc7(b"FILE://h/a")
+expect: Some(path "/a")
+cite: [CODE] probe run of parse_osc7 at 2f07dff; crates/tessera-shell-integration/src/osc7.rs
+note: scheme case-insensitive
+
+### P7-21
+layer: parse
+call: parse_osc7(b"http://h/a")
+expect: None
+cite: [CODE] probe run of parse_osc7 at 2f07dff; crates/tessera-shell-integration/src/osc7.rs
+
+### P7-22
+layer: parse
+call: parse_osc7(b"kitty-shell-cwd://h/a%b?c")
+expect: Some(path "/a%b?c")
+cite: [CODE] probe run of parse_osc7 at 2f07dff; crates/tessera-shell-integration/src/osc7.rs
+note: raw path
+
+### P7-23
+layer: parse
+call: parse_osc7(b"file://h/a%E2%80%AEb")
+expect: Some(path "/a\u{202e}b")
+cite: [CODE] probe run of parse_osc7 at 2f07dff; crates/tessera-shell-integration/src/osc7.rs
+note: CURRENT: bidi override ACCEPTED in a path. Not a risk for chdir; matters only if a UI shows the path. Lead: leave.
+flags: decision
+
+### P7-24
+layer: parse
+call: parse_osc7(b"file://h/a;b")
+expect: Some(path "/a;b")
+cite: [CODE] probe run of parse_osc7 at 2f07dff; crates/tessera-shell-integration/src/osc7.rs
+
+### P7-25
+layer: parse
+call: parse_osc7(b"("file://h/" + 'a'*4087)")
+expect: Some (len 4096)
+cite: [CODE] probe run of parse_osc7 at 2f07dff; crates/tessera-shell-integration/src/osc7.rs
+note: boundary
+
+### P7-26
+layer: parse
+call: parse_osc7(b"("file://h/" + 'a'*4088)")
+expect: None
+cite: [CODE] probe run of parse_osc7 at 2f07dff; crates/tessera-shell-integration/src/osc7.rs
+note: 4097 bytes
+
+### P1337-01
+layer: parse
+call: parse_osc1337(b"ShellIntegrationVersion=1;shell=zsh")
+expect: Some{version:1,shell:"zsh"}
+cite: [CODE] probe run of parse_osc1337 at 2f07dff; crates/tessera-shell-integration/src/lib.rs
+note: app-core: equal to PROTOCOL_VERSION, no warning
+
+### P1337-02
+layer: parse
+call: parse_osc1337(b"ShellIntegrationVersion=2;shell=bash")
+expect: Some{version:2,shell:"bash"}
+cite: [CODE] probe run of parse_osc1337 at 2f07dff; crates/tessera-shell-integration/src/lib.rs
+note: app-core: tracing warn (D-HANDSHAKE)
+
+### P1337-03
+layer: parse
+call: parse_osc1337(b"ShellIntegrationVersion=18;shell=zsh")
+expect: Some{version:18}
+cite: [CODE] probe run of parse_osc1337 at 2f07dff; crates/tessera-shell-integration/src/lib.rs
+note: iTerm2 numbering: warn
+
+### P1337-04
+layer: parse
+call: parse_osc1337(b"ShellIntegrationVersion=1")
+expect: None
+cite: [CODE] probe run of parse_osc1337 at 2f07dff; crates/tessera-shell-integration/src/lib.rs
+note: no shell= : no handshake, no warning
+
+### P1337-05
+layer: parse
+call: parse_osc1337(b"ShellIntegrationVersion=;shell=zsh")
+expect: None
+cite: [CODE] probe run of parse_osc1337 at 2f07dff; crates/tessera-shell-integration/src/lib.rs
+
+### P1337-06
+layer: parse
+call: parse_osc1337(b"ShellIntegrationVersion=1x;shell=zsh")
+expect: None
+cite: [CODE] probe run of parse_osc1337 at 2f07dff; crates/tessera-shell-integration/src/lib.rs
+
+### P1337-07
+layer: parse
+call: parse_osc1337(b"ShellIntegrationVersion=-1;shell=zsh")
+expect: None
+cite: [CODE] probe run of parse_osc1337 at 2f07dff; crates/tessera-shell-integration/src/lib.rs
+
+### P1337-08
+layer: parse
+call: parse_osc1337(b"ShellIntegrationVersion=99999999999;shell=zsh")
+expect: None
+cite: [CODE] probe run of parse_osc1337 at 2f07dff; crates/tessera-shell-integration/src/lib.rs
+note: u32 overflow
+
+### P1337-09
+layer: parse
+call: parse_osc1337(b"ShellIntegrationVersion=1;shell=z sh")
+expect: None
+cite: [CODE] probe run of parse_osc1337 at 2f07dff; crates/tessera-shell-integration/src/lib.rs
+note: invalid shell chars
+
+### P1337-10
+layer: parse
+call: parse_osc1337(b"ShellIntegrationVersion=1;other=x;shell=zsh")
+expect: Some{version:1,shell:"zsh"}
+cite: [CODE] probe run of parse_osc1337 at 2f07dff; crates/tessera-shell-integration/src/lib.rs
+note: other params skipped
+
+### P1337-11
+layer: parse
+call: parse_osc1337(b"ShellIntegrationVersion=1;shell=<33 x 'a'>")
+expect: None
+cite: [CODE] probe run of parse_osc1337 at 2f07dff; crates/tessera-shell-integration/src/lib.rs
+note: MAX_SHELL_NAME_LEN = 32
+
+### P1337-12
+layer: parse
+call: parse_osc1337(b"SetUserVar=a=b")
+expect: None
+cite: [CODE] probe run of parse_osc1337 at 2f07dff; crates/tessera-shell-integration/src/lib.rs
+
+### P133-01
+layer: parse
+call: Mark::from_osc133(b"A")
+expect: recommended PromptStart; current PromptStart
+cite: [CODE] probe run of parse_osc133 at 2f07dff (current behaviour); [BO]
+
+### P133-02
+layer: parse
+call: Mark::from_osc133(b"B")
+expect: recommended CommandStart; current CommandStart
+cite: [CODE] probe run of parse_osc133 at 2f07dff (current behaviour); [BO]
+
+### P133-03
+layer: parse
+call: Mark::from_osc133(b"C")
+expect: recommended OutputStart; current OutputStart
+cite: [CODE] probe run of parse_osc133 at 2f07dff (current behaviour); [BO]
+
+### P133-04
+layer: parse
+call: Mark::from_osc133(b"D")
+expect: recommended CommandEnd{None}; current CommandEnd{None}
+cite: [CODE] probe run of parse_osc133 at 2f07dff (current behaviour); [BO]
+
+### P133-05
+layer: parse
+call: Mark::from_osc133(b"D;130")
+expect: recommended same; current CommandEnd{Some(130)}
+cite: [CODE] probe run of parse_osc133 at 2f07dff (current behaviour); [BO]
+
+### P133-06
+layer: parse
+call: Mark::from_osc133(b"D;-1")
+expect: recommended same; current CommandEnd{Some(-1)}
+cite: [CODE] probe run of parse_osc133 at 2f07dff (current behaviour); [BO]
+
+### P133-07
+layer: parse
+call: Mark::from_osc133(b"D;+3")
+expect: recommended same (accepted by i32 parse); current CommandEnd{Some(3)}
+cite: [CODE] probe run of parse_osc133 at 2f07dff (current behaviour); [BO]
+
+### P133-08
+layer: parse
+call: Mark::from_osc133(b"D;0;aid=1")
+expect: recommended same; current CommandEnd{Some(0)}
+cite: [CODE] probe run of parse_osc133 at 2f07dff (current behaviour); [BO]
+
+### P133-09
+layer: parse
+call: Mark::from_osc133(b"A;aid=1;cl=line")
+expect: recommended PromptStart; current PromptStart
+cite: [CODE] probe run of parse_osc133 at 2f07dff (current behaviour); [BO]
+
+### P133-10
+layer: parse
+call: Mark::from_osc133(b"A;k=s")
+expect: recommended None; current PromptStart
+cite: [CODE] probe run of parse_osc133 at 2f07dff (current behaviour); [BO]
+flags: decision D-SECOND
+
+### P133-11
+layer: parse
+call: Mark::from_osc133(b"A;k=c")
+expect: recommended None; current PromptStart
+cite: [CODE] probe run of parse_osc133 at 2f07dff (current behaviour); [BO]
+flags: decision D-SECOND
+
+### P133-12
+layer: parse
+call: Mark::from_osc133(b"A;k=r")
+expect: recommended None; current PromptStart
+cite: [CODE] probe run of parse_osc133 at 2f07dff (current behaviour); [BO]
+flags: decision D-SECOND
+
+### P133-13
+layer: parse
+call: Mark::from_osc133(b"Afoo")
+expect: recommended None; current PromptStart
+cite: [CODE] probe run of parse_osc133 at 2f07dff (current behaviour); [BO]
+flags: decision D-STRICT133
+
+### P133-14
+layer: parse
+call: Mark::from_osc133(b"AB")
+expect: recommended None; current PromptStart
+cite: [CODE] probe run of parse_osc133 at 2f07dff (current behaviour); [BO]
+flags: decision D-STRICT133
+
+### P133-15
+layer: parse
+call: Mark::from_osc133(b"D0")
+expect: recommended None; current None
+cite: [CODE] probe run of parse_osc133 at 2f07dff (current behaviour); [BO]
+
+### P133-16
+layer: parse
+call: Mark::from_osc133(b"a")
+expect: recommended None; current None
+cite: [CODE] probe run of parse_osc133 at 2f07dff (current behaviour); [BO]
+
+### P133-17
+layer: parse
+call: Mark::from_osc133(b"")
+expect: recommended None; current None
+cite: [CODE] probe run of parse_osc133 at 2f07dff (current behaviour); [BO]
+
+### P133-18
+layer: parse
+call: Mark::from_osc133(b"L / N / P / I / Z")
+expect: recommended None; current None
+cite: [CODE] probe run of parse_osc133 at 2f07dff (current behaviour); [BO]
+flags: decision D-STRICT133
+
+
+# ---------------------------------------------------------------------------- L. layer rows for app-core / FFI / Swift tests (not parsed; listed so the critic can check coverage)
+
+# L01 clipboard_write=true: SetClipboard("x") -> SessionEvent::Clipboard("x") ([terminal] clipboard_write, brief (d)); kitty default allows write, Alacritty default OnlyCopy, WezTerm allows; iTerm2 and xterm default DENY.
+# L02 clipboard_write=false: no SessionEvent::Clipboard; apply_config(true) live -> next request is delivered; apply_config(false) live -> next is dropped (brief done-when).
+# L03 FFI on_session_clipboard receives ptr+len exactly, incl. embedded NUL (K28) and ESC (K29).
+# L04 SetCwd(b"file://h/a%20b") -> App::session_cwd(id) == Some(Cwd{host:"h", path:"/a b"}); a later SetCwd(b"http://x") or a path with %00 or '..' keeps the previous value (P7-05..P7-11, P7-21).
+# L05 session_cwd for an unknown id -> Err; for a session with no report -> Ok(None). Host handling per D-HOST (UNVERIFIED how Terminal.app/kitty/WezTerm compare hosts: not read this run).
+# L06 ShellIntegrationHandshake(b"ShellIntegrationVersion=2;shell=zsh") -> one tracing warn naming 2 vs 1 and nothing else changes; version 1 -> no log; malformed (P1337-04..12) -> no log, no state change.
+# L07 title 'SetTitle' events: unchanged path (SessionEvent::Title); empty -> Swift default title (TerminalWindowController.sessionDidSetTitle).

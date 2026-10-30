@@ -53,6 +53,7 @@ pub use session::{SessionEvent, SessionId, SessionObserver};
 pub use config_watch::{CONFIG_DIR_POLL_INTERVAL, CONFIG_WATCH_STOP_CAP};
 pub use tessera_config::{Config, ConfigPaths, ConfigStore, ShellIntegration, WatchOptions};
 pub use tessera_pty::{ExitStatus, Program, PtyError, PtySize, SpawnOptions};
+pub use tessera_shell_integration::Cwd;
 
 use config_watch::{Applied, ConfigWatch};
 use input::{Bindings, FocusEvent, MouseEvent};
@@ -356,6 +357,7 @@ impl App {
             size,
             cursor,
             Arc::clone(&self.observers),
+            Arc::clone(&self.applied),
             self.reaper.signal(),
         )
         .map_err(|source| Error::ReaderThread { id, source })?;
@@ -741,6 +743,21 @@ impl App {
         Ok(self.session(id)?.scroll_position())
     }
 
+    /// The working directory session `id`'s shell last reported with
+    /// OSC 7 (Tessera's shell integration sends one at every prompt), or
+    /// `None` before the first valid report. An invalid report (another
+    /// scheme, a path with `..`, a control character or `%00`) keeps the
+    /// previous one. Reports from another machine (a shell over `ssh`) are
+    /// kept with their host: a consumer that needs a local directory checks
+    /// [`Cwd::is_local`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn session_cwd(&self, id: SessionId) -> Result<Option<Cwd>> {
+        Ok(self.session(id)?.cwd())
+    }
+
     /// Whether session `id`'s view has keyboard focus, as last reported
     /// with [`InputEvent::Focus`]. A new session is not focused.
     ///
@@ -1123,6 +1140,9 @@ impl App {
     /// and a session whose program set a style of its own (DECSCUSR,
     /// DECSET 12) keeps it until the program asks for the default or
     /// resets the terminal. New sessions start with the configured style.
+    ///
+    /// `[terminal] clipboard_write` applies to the next clipboard write of
+    /// every session (each session reads the configuration in effect).
     ///
     /// When anything the views draw changed, the cursor default included,
     /// the observer's
