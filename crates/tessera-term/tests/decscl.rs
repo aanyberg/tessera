@@ -19,8 +19,9 @@
 //!   `flags: negative` one that sends only near misses, which must not
 //!   reset anything or change the level.
 //!
-//! One test per behaviour runs that behaviour's cases;
-//! [`every_case_is_tested_once`] keeps the lists and the fixture in step.
+//! [`every_case_holds`] runs every case in one test, listed by the
+//! behaviour it pins; [`every_case_is_tested_once`] keeps the lists and the
+//! fixture in step.
 
 #[allow(dead_code)] // Shared harness: not every helper is used here.
 mod common;
@@ -35,6 +36,7 @@ use tessera_grid::{Color, Point, ScrollRegion, Style};
 use tessera_term::{Request, Terminal};
 
 const FIXTURE: &str = include_str!("fixtures/decscl_spec.txt");
+const FIXTURE_NAME: &str = "fixtures/decscl_spec.txt";
 
 // ------------------------------------------------------------- extra rows
 
@@ -228,51 +230,44 @@ fn cases() -> Vec<Case> {
     parse_fixture(FIXTURE)
 }
 
-/// Checks the cases `ids` whole and byte by byte, every row, and panics
-/// with all mismatches at once. A `control` or `negative` case must not
+/// Checks case `id` whole and byte by byte, every row, and panics with
+/// all its mismatches at once. A `control` or `negative` case must not
 /// send a valid DECSCL and every other case must, so a control never
 /// silently tests DECSCL and a DECSCL case never silently tests nothing.
-fn check(ids: &[&str]) {
-    let cases = cases();
+fn check(cases: &[Case], id: &str) {
     let mut errors = Vec::new();
-    for id in ids {
-        let case = cases
-            .iter()
-            .find(|case| case.id == *id)
-            .unwrap_or_else(|| panic!("{id}: no such case"));
-        let extra = extra(id);
-        let without = extra
-            .flags
-            .iter()
-            .any(|flag| flag == "control" || flag == "negative");
-        assert_ne!(
-            sends_decscl(&case.script),
-            without,
-            "{id}: control and negative cases run without DECSCL, every other case with it"
-        );
-        assert!(
-            case.requests.is_empty(),
-            "{id}: DECSCL is silent (lead decision D3), every case expects `requests: []`"
-        );
-        for chunking in [Chunking::Whole, Chunking::Bytewise] {
-            errors.extend(check_case(case, chunking));
-            let (term, _) = case.script.run(chunking);
-            errors.extend(check_extra(case, &extra, &term, chunking));
-        }
+    let case = cases
+        .iter()
+        .find(|case| case.id == id)
+        .unwrap_or_else(|| panic!("{id}: no such case"));
+    let extra = extra(id);
+    let without = extra
+        .flags
+        .iter()
+        .any(|flag| flag == "control" || flag == "negative");
+    assert_ne!(
+        sends_decscl(&case.script),
+        without,
+        "{id}: control and negative cases run without DECSCL, every other case with it"
+    );
+    assert!(
+        case.requests.is_empty(),
+        "{id}: DECSCL is silent (lead decision D3), every case expects `requests: []`"
+    );
+    for chunking in [Chunking::Whole, Chunking::Bytewise] {
+        errors.extend(check_case(case, chunking));
+        let (term, _) = case.script.run(chunking);
+        errors.extend(check_extra(case, &extra, &term, chunking));
     }
     assert!(errors.is_empty(), "{}", errors.join("\n"));
 }
 
+/// Lists the cases [`every_case_holds`] runs, grouped by the behaviour they
+/// pin: `group: [ids]`.
 macro_rules! decscl_tests {
     ($($name:ident: [$($id:literal),* $(,)?]),* $(,)?) => {
-        /// Every case some test runs.
-        const TESTED: &[&str] = &[$($($id),*),*];
-        $(
-            #[test]
-            fn $name() {
-                check(&[$($id),*]);
-            }
-        )*
+        /// Every case, as `(group, ids)`.
+        const GROUPS: &[(&str, &[&str])] = &[$((stringify!($name), &[$($id),*])),*];
     };
 }
 
@@ -329,11 +324,27 @@ decscl_tests! {
     ],
 }
 
+/// Every listed case holds. One test runs the whole table (one process
+/// instead of one per group) and reports every failing case as
+/// `group/id`.
+#[test]
+fn every_case_holds() {
+    let cases = cases();
+    let rows = GROUPS
+        .iter()
+        .flat_map(|(group, ids)| ids.iter().map(move |id| (format!("{group}/{id}"), *id)));
+    common::check_table(FIXTURE_NAME, cases.len(), rows, |id| check(&cases, id));
+}
+
 #[test]
 fn every_case_is_tested_once() {
     let ids: Vec<String> = cases().into_iter().map(|case| case.id).collect();
-    let unique: HashSet<&str> = TESTED.iter().copied().collect();
-    assert_eq!(unique.len(), TESTED.len(), "a case is listed twice");
+    let tested: Vec<&str> = GROUPS
+        .iter()
+        .flat_map(|(_, ids)| ids.iter().copied())
+        .collect();
+    let unique: HashSet<&str> = tested.iter().copied().collect();
+    assert_eq!(unique.len(), tested.len(), "a case is listed twice");
     let fixture: HashSet<&str> = ids.iter().map(String::as_str).collect();
     assert_eq!(unique, fixture, "test lists and fixture cases differ");
 }

@@ -213,11 +213,14 @@ fn attributes_hold() {
 }
 
 /// The rendered state ([`render_state`] plus [`render_pens`]) of every
-/// case, identical whole and byte by byte, as `esctest__<id>.snap`.
+/// case, identical whole and byte by byte, as `esctest__<id>.snap`. Every
+/// case runs even when an earlier one fails, and the test reports every
+/// failing id.
 #[test]
 fn snapshots() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/esctest_spec.txt");
-    for case in cases() {
+    let rows = cases().into_iter().map(|case| (case.id.clone(), case));
+    common::check_table("esctest_spec.txt", case_blocks().len(), rows, |case| {
         let render = |chunking| {
             let (term, requests) = case.script.run(chunking);
             format!(
@@ -240,7 +243,7 @@ fn snapshots() {
         }, {
             insta::assert_snapshot!(case.id.as_str(), whole);
         });
-    }
+    });
 }
 
 /// Every script under `tests/scripts/esctest/` is
