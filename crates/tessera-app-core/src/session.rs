@@ -51,8 +51,9 @@
 //! the terminal (grid size, scrollback length) under the terminal lock,
 //! releases it, then takes the input lock. A value read that way can be
 //! stale by the time it is used (the reader thread may have added a
-//! scrollback line in between), so readers of the input state re-clamp it
-//! against the current terminal (see `Session::scroll_offset`). The PTY
+//! scrollback line in between), so the scroll position is stored together
+//! with the history it was read against and resolved again against the
+//! current terminal on every read (see `ScrollAnchor`, ADR 0023). The PTY
 //! lock is only ever held for one non-blocking attempt, and the writer
 //! thread releases the outbox lock before it writes. The reader thread
 //! holds the terminal lock for one slice of output at a time and, between
@@ -68,11 +69,13 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, 
 use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
+use tessera_grid::Grid;
 use tessera_pty::{ExitStatus, Pty, PtyError, PtyEvent, PtyEvents, PtySize};
 use tessera_term::{CursorStyle, Request, Terminal};
 
 use crate::input::MouseEvent;
 use crate::view::{MAX_VIEW_COLS, MAX_VIEW_ROWS};
+use crate::{ScrollPosition, ScrollTarget};
 
 /// How long a closing session's child gets to exit after `SIGHUP` before it
 /// is sent `SIGKILL`.
@@ -593,16 +596,100 @@ struct InputState {
     /// Whether the session's view has keyboard focus. A new session does
     /// not until the frontend says so.
     focused: bool,
-    /// Lines the view is scrolled back from the bottom; 0 shows the live
-    /// screen. Anchored to the bottom, so the view drifts while output
-    /// arrives (keeping it on its content is #31). May exceed the
-    /// scrollback length after the scrollback shrinks until the next read,
-    /// which clamps it and stores the result.
-    scroll_offset: usize,
+    /// Where the view is in the scrollback, anchored to the lines it shows
+    /// (ADR 0023); offset 0 is the live screen.
+    scroll: ScrollAnchor,
     /// Fraction of a line scrolled but not yet applied, in `(-1, 1)`.
     scroll_remainder: f64,
     /// The last mouse event, its cell clamped to the grid.
     last_mouse: Option<MouseEvent>,
+}
+
+/// What a scroll position is resolved against: the grid's history, read
+/// under the terminal lock (ADR 0023).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct History {
+    /// [`Grid::scrollback_pushed`].
+    pushed: u64,
+    /// [`Grid::scrollback_len`].
+    len: usize,
+    /// [`Grid::max_scrollback`].
+    cap: usize,
+    /// [`Grid::is_alt_screen`]: no scrollback is shown then.
+    alt: bool,
+    /// [`Grid::rows`].
+    rows: u16,
+}
+
+impl History {
+    /// The history of `grid` as it is now.
+    pub(crate) fn of(grid: &Grid) -> Self {
+        Self {
+            pushed: grid.scrollback_pushed(),
+            len: grid.scrollback_len(),
+            cap: grid.max_scrollback(),
+            alt: grid.is_alt_screen(),
+            rows: grid.rows(),
+        }
+    }
+
+    /// How far the view can scroll back: the whole history on the primary
+    /// screen, nothing on the alternate one.
+    fn scrollable(&self) -> usize {
+        if self.alt { 0 } else { self.len }
+    }
+}
+
+/// A view `offset` lines above the live screen, stored with the history it
+/// was taken against (ADR 0023).
+///
+/// The view keeps showing the same lines while output continues: every
+/// line pushed into history since adds one to the offset. Once those lines
+/// are evicted the view stops at the oldest line left. Offset 0 always
+/// stays live (follows the output). When the history holds fewer lines
+/// than the pushes since account for, something removed them (RIS, ED 3,
+/// ⌘K): the lines the view showed are gone and it returns to the live
+/// screen. A resize re-wraps the history, so [`Session::resize`] stores
+/// the anchor again, clamped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ScrollAnchor {
+    offset: usize,
+    /// [`Grid::scrollback_pushed`] when the offset was stored.
+    pushed: u64,
+    /// [`Grid::scrollback_len`] when the offset was stored.
+    len: usize,
+}
+
+impl ScrollAnchor {
+    /// The view at `offset` against `history`.
+    fn at(offset: usize, history: &History) -> Self {
+        Self {
+            offset,
+            pushed: history.pushed,
+            len: history.len,
+        }
+    }
+
+    /// The offset that shows the same lines in `now`, and whether the view
+    /// had to leave them (clamped to the oldest line, or returned to the
+    /// live screen after a clear).
+    fn resolve(self, now: &History) -> (usize, bool) {
+        if self.offset == 0 {
+            return (0, false);
+        }
+        if now.alt {
+            return (0, true);
+        }
+        // A reading older than the stored one (only possible across
+        // threads) counts as no output since.
+        let pushed = usize::try_from(now.pushed.saturating_sub(self.pushed)).unwrap_or(usize::MAX);
+        if now.len < self.len.saturating_add(pushed).min(now.cap) {
+            return (0, true);
+        }
+        let anchored = self.offset.saturating_add(pushed);
+        let offset = anchored.min(now.len);
+        (offset, offset != anchored)
+    }
 }
 
 impl Session {
@@ -715,14 +802,30 @@ impl Session {
     ///
     /// The grid is resized (and re-wrapped) first, so output the child
     /// writes in answer to `SIGWINCH` lands on a grid of the new size. The
-    /// two locks are taken one after the other, never together.
+    /// locks (input state, terminal, input state, PTY) are taken one after
+    /// the other, never together.
     ///
     /// A size [`check_size`] refuses (zero rows or columns, or larger
     /// than the largest grid a view derives) is refused with
     /// [`PtyError::InvalidSize`] before anything changes.
+    ///
+    /// The view's scroll position is resolved against the history before
+    /// the resize and stored again against the one after it, clamped to
+    /// it: a resize re-wraps the history, so the view keeps its distance
+    /// from the live screen rather than its lines.
     pub(crate) fn resize(&self, size: PtySize) -> Result<(), PtyError> {
         check_size(size)?;
-        self.term.lock().resize(size.rows, size.cols);
+        let seen = lock(&self.input).scroll;
+        let (offset, left, after) = {
+            let mut term = self.term.lock();
+            let before = History::of(term.grid());
+            term.resize(size.rows, size.cols);
+            let after = History::of(term.grid());
+            let (offset, left) = seen.resolve(&before);
+            let clamped = offset.min(after.scrollable());
+            (clamped, left || clamped != offset, after)
+        };
+        self.store_scroll(seen, offset, left, &after);
         lock(&self.pty).resize(size)
     }
 
@@ -749,29 +852,80 @@ impl Session {
         lock(&self.input).focused = focused;
     }
 
-    /// Lines the view is scrolled back, clamped to the current scrollback
-    /// (and stored clamped).
-    pub(crate) fn scroll_offset(&self) -> usize {
-        let max = self.with_terminal(|term| term.grid().scrollback_len());
+    /// Runs `f` with the terminal locked and the view's scroll offset
+    /// resolved against it (see [`ScrollAnchor`]): the offset `f` gets
+    /// always fits the terminal it gets. The resolved offset is stored
+    /// afterwards, unless a scroll changed the position in the meantime.
+    ///
+    /// Takes the input lock, the terminal lock, then the input lock again,
+    /// never two at once.
+    pub(crate) fn with_viewport<R>(&self, f: impl FnOnce(&Terminal, usize) -> R) -> R {
+        let seen = lock(&self.input).scroll;
+        let (result, offset, left, history) = {
+            let term = self.term.lock();
+            let history = History::of(term.grid());
+            let (offset, left) = seen.resolve(&history);
+            (f(&term, offset), offset, left, history)
+        };
+        self.store_scroll(seen, offset, left, &history);
+        result
+    }
+
+    /// Stores the view at `offset` against `history`, read after `seen`
+    /// was: kept only while the stored position is still `seen` (a scroll
+    /// stored meanwhile wins). A view that `left` its lines (clamped or
+    /// returned to the live screen) drops its banked fraction of a line.
+    fn store_scroll(&self, seen: ScrollAnchor, offset: usize, left: bool, history: &History) {
         let mut input = lock(&self.input);
-        if input.scroll_offset > max {
-            input.scroll_offset = max;
+        if input.scroll != seen {
+            return;
+        }
+        if left {
             input.scroll_remainder = 0.0;
         }
-        input.scroll_offset
+        input.scroll = ScrollAnchor::at(offset, history);
+    }
+
+    /// The history and the stored position resolved against it, for a
+    /// change of position: the terminal lock is released before the input
+    /// lock is taken, and the guard is returned for the change.
+    fn scroll_state(&self) -> (History, usize, MutexGuard<'_, InputState>) {
+        let history = self.with_terminal(|term| History::of(term.grid()));
+        let input = lock(&self.input);
+        let (offset, _) = input.scroll.resolve(&history);
+        (history, offset, input)
+    }
+
+    /// Lines the view is scrolled back, resolved against the current
+    /// history (see [`ScrollAnchor`]): 0 on the live screen and on the
+    /// alternate screen, at most the scrollback length.
+    pub(crate) fn scroll_offset(&self) -> usize {
+        self.with_viewport(|_, offset| offset)
+    }
+
+    /// The view's position, the history it can scroll into and the screen
+    /// height, read in one look at the terminal.
+    pub(crate) fn scroll_position(&self) -> ScrollPosition {
+        let (offset, history) =
+            self.with_viewport(|term, offset| (offset, History::of(term.grid())));
+        ScrollPosition {
+            offset,
+            history: history.scrollable(),
+            rows: history.rows,
+        }
     }
 
     /// Moves the view `delta` lines towards older output (negative: towards
     /// the live screen), keeping the fraction for the next call and
     /// clamping to `0..=scrollback_len`. Returns whether the visible offset
-    /// changed. A `delta` that is not finite does nothing.
+    /// changed. A `delta` that is not finite does nothing; nor does any
+    /// `delta` on the alternate screen, which has no scrollback.
     pub(crate) fn scroll(&self, delta: f32) -> bool {
         if !delta.is_finite() {
             return false;
         }
-        let max = self.with_terminal(|term| term.grid().scrollback_len());
-        let mut input = lock(&self.input);
-        let current = input.scroll_offset.min(max);
+        let (history, current, mut input) = self.scroll_state();
+        let max = history.scrollable();
         let total = input.scroll_remainder + f64::from(delta);
         let whole = total.trunc();
         let mut remainder = total - whole;
@@ -793,15 +947,62 @@ impl Session {
         if (target == max && remainder > 0.0) || (target == 0 && remainder < 0.0) {
             remainder = 0.0;
         }
-        input.scroll_offset = target;
+        input.scroll = ScrollAnchor::at(target, &history);
         input.scroll_remainder = remainder;
         target != current
+    }
+
+    /// Takes the whole lines of `delta` plus the fraction banked by earlier
+    /// calls, at most `max` either way, and banks the new fraction: the
+    /// wheel on the alternate screen, which sends cursor keys instead of
+    /// moving the view. Positive is towards older output (the wheel
+    /// turned up). Lines beyond `max` are dropped, not banked. A `delta`
+    /// that is not finite takes nothing.
+    pub(crate) fn take_scroll_lines(&self, delta: f32, max: u16) -> i32 {
+        if !delta.is_finite() {
+            return 0;
+        }
+        let mut input = lock(&self.input);
+        let total = input.scroll_remainder + f64::from(delta);
+        let whole = total.trunc();
+        let limit = f64::from(max);
+        input.scroll_remainder = if whole.abs() > limit {
+            0.0
+        } else {
+            total - whole
+        };
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "clamped to a u16 range and integral"
+        )]
+        let lines = whole.clamp(-limit, limit) as i32;
+        lines
+    }
+
+    /// Moves the view to `target` (see [`ScrollTarget`]), clamped to the
+    /// history, and drops any banked fraction of a line. Returns whether
+    /// the offset changed. On the alternate screen there is nothing to
+    /// scroll into and the view stays live.
+    pub(crate) fn scroll_to(&self, target: ScrollTarget) -> bool {
+        let (history, current, mut input) = self.scroll_state();
+        let max = history.scrollable();
+        let page = usize::from(history.rows.saturating_sub(1).max(1));
+        let offset = match target {
+            ScrollTarget::Top => max,
+            ScrollTarget::Bottom => 0,
+            ScrollTarget::PageUp => current.saturating_add(page).min(max),
+            ScrollTarget::PageDown => current.saturating_sub(page),
+            ScrollTarget::Offset(n) => n.min(max),
+        };
+        input.scroll = ScrollAnchor::at(offset, &history);
+        input.scroll_remainder = 0.0;
+        offset != current
     }
 
     /// Returns the view to the live screen, as typing does.
     pub(crate) fn scroll_to_bottom(&self) {
         let mut input = lock(&self.input);
-        input.scroll_offset = 0;
+        input.scroll = ScrollAnchor::default();
         input.scroll_remainder = 0.0;
     }
 
@@ -1307,6 +1508,65 @@ mod tests {
 
     use super::*;
     use crate::{App, Config, ConfigPaths};
+
+    /// A primary-screen history of `len` lines (cap `cap`) after `pushed`
+    /// lines went into it.
+    fn history(pushed: u64, len: usize, cap: usize) -> History {
+        History {
+            pushed,
+            len,
+            cap,
+            alt: false,
+            rows: 24,
+        }
+    }
+
+    /// ADR 0023's anchoring with a 100-line cap: the view grows with the
+    /// pushes, stops at the oldest line once its lines are evicted (500
+    /// lines of output), returns to the live screen when the history holds
+    /// fewer lines than the pushes account for (a clear), and is live on
+    /// the alternate screen. Offset 0 stays live.
+    #[test]
+    fn an_anchor_keeps_its_lines_until_they_are_evicted_or_cleared() {
+        let at = |offset, pushed, len| ScrollAnchor::at(offset, &history(pushed, len, 100));
+        let anchor = at(50, 1_000, 100);
+        assert_eq!(anchor.resolve(&history(1_000, 100, 100)), (50, false));
+        assert_eq!(anchor.resolve(&history(1_030, 100, 100)), (80, false));
+        assert_eq!(anchor.resolve(&history(1_050, 100, 100)), (100, false));
+        assert_eq!(
+            anchor.resolve(&history(1_500, 100, 100)),
+            (100, true),
+            "pinned"
+        );
+        // A history not yet full: every push lengthens it.
+        let young = at(5, 20, 20);
+        assert_eq!(young.resolve(&history(30, 30, 100)), (15, false));
+        // Fewer lines than the pushes account for: cleared (RIS, ED 3,
+        // ⌘K), with or without output since.
+        assert_eq!(anchor.resolve(&history(1_000, 0, 100)), (0, true));
+        assert_eq!(anchor.resolve(&history(1_050, 50, 100)), (0, true));
+        assert_eq!(young.resolve(&history(30, 10, 100)), (0, true));
+        // A smaller cap evicts but does not clear.
+        assert_eq!(anchor.resolve(&history(1_000, 20, 20)), (20, true));
+        assert_eq!(anchor.resolve(&history(1_000, 70, 70)), (50, false));
+        // A reading older than the anchor counts as no output.
+        assert_eq!(anchor.resolve(&history(990, 100, 100)), (50, false));
+        // The alternate screen shows no scrollback.
+        let alt = History {
+            alt: true,
+            ..history(1_000, 100, 100)
+        };
+        assert_eq!(anchor.resolve(&alt), (0, true));
+        assert_eq!(alt.scrollable(), 0);
+        // Live stays live.
+        let live = at(0, 1_000, 100);
+        assert_eq!(live.resolve(&history(1_500, 100, 100)), (0, false));
+        assert_eq!(live.resolve(&history(1_000, 0, 100)), (0, false));
+        assert_eq!(
+            ScrollAnchor::default().resolve(&history(7, 7, 100)),
+            (0, false)
+        );
+    }
 
     /// A PTY that only records the sizes it is given and rejects an empty
     /// one, as the real PTY does. Hanging up ends its event stream.

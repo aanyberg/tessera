@@ -21,9 +21,13 @@
 //! * **Mouse**: the position is clamped to the session's grid and kept as
 //!   the session's last mouse position; nothing is written. Mouse reporting
 //!   (#12) and selection (#30) build on it.
-//! * **Scroll**: moves the session's scrollback view (see
-//!   [`App::scroll_offset`](crate::App::scroll_offset)), accumulating
-//!   fractional lines.
+//! * **Scroll**: on the primary screen, moves the session's scrollback view
+//!   (see [`App::scroll_offset`](crate::App::scroll_offset)), accumulating
+//!   fractional lines. On the alternate screen, which has no scrollback,
+//!   sends one cursor key per whole line instead, Up for older output and
+//!   Down for newer, in the form DECCKM selects (xterm's alternate scroll),
+//!   unless the application asked for mouse reports, which will carry the
+//!   wheel (#12).
 //! * **Paste**: sanitised with [`sanitize_paste_into`] straight into the
 //!   buffer that is queued, like a key, in order with the keys around it.
 //!   In bracketed-paste mode (DECSET 2004) it is wrapped in `ESC [ 200 ~`
@@ -266,6 +270,23 @@ impl Bindings {
     }
 }
 
+/// The cursor keys the wheel sends on the alternate screen for `lines`
+/// whole lines (positive: towards older output, the wheel turned up): that
+/// many Up keys, or `-lines` Down keys, `CSI A` / `CSI B`, or `SS3 A` /
+/// `SS3 B` when `application_cursor_keys` (DECCKM) is set. Empty for 0.
+///
+/// These are the unmodified legacy cursor keys whatever keyboard protocol
+/// the application turned on, as xterm sends for alternate scroll.
+pub(crate) fn alternate_scroll_keys(lines: i32, application_cursor_keys: bool) -> Vec<u8> {
+    let key: &[u8] = match (lines > 0, application_cursor_keys) {
+        (true, false) => b"\x1b[A",
+        (true, true) => b"\x1bOA",
+        (false, false) => b"\x1b[B",
+        (false, true) => b"\x1bOB",
+    };
+    key.repeat(usize::try_from(lines.unsigned_abs()).unwrap_or(0))
+}
+
 /// Makes pasted text safe to write to a PTY.
 ///
 /// * Line breaks become carriage returns, which is what the Return key
@@ -438,6 +459,17 @@ mod tests {
     fn paste_keeps_nothing_from_pure_controls() {
         assert_eq!(sanitize_paste(""), "");
         assert_eq!(sanitize_paste("\x00\x1b\x07\u{85}"), "");
+    }
+
+    #[test]
+    fn alternate_scroll_sends_one_cursor_key_per_line_in_the_decckm_form() {
+        assert_eq!(alternate_scroll_keys(0, false), b"");
+        assert_eq!(alternate_scroll_keys(0, true), b"");
+        assert_eq!(alternate_scroll_keys(1, false), b"\x1b[A");
+        assert_eq!(alternate_scroll_keys(3, false), b"\x1b[A\x1b[A\x1b[A");
+        assert_eq!(alternate_scroll_keys(-2, false), b"\x1b[B\x1b[B");
+        assert_eq!(alternate_scroll_keys(2, true), b"\x1bOA\x1bOA");
+        assert_eq!(alternate_scroll_keys(-1, true), b"\x1bOB");
     }
 
     #[test]

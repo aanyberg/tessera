@@ -1,6 +1,7 @@
 //! Tests of the input API (`tessera_session_send_key`, `_send_mouse`,
-//! `_send_scroll`, `_paste`, `_set_focus`), calling the `extern "C"`
-//! functions as a frontend would.
+//! `_send_scroll`, `_paste`, `_set_focus`) and of moving the scrollback
+//! view (`tessera_session_scroll_to`, `_scroll_position`), calling the
+//! `extern "C"` functions as a frontend would.
 //!
 //! Enum round trips are pure; the end-to-end tests run `/bin/cat` or
 //! `/bin/sh` in real PTYs and observe the core through the test-only
@@ -26,8 +27,9 @@ use tessera_app_core::input::{
 };
 use tessera_ffi::{
     App, Callbacks, Error, InputOutcome, Key, KeyEvent, KeyEventKind, Modifiers, MouseButton,
-    MouseEvent, MouseEventKind, ScrollEvent, SpawnOptions, tessera_app_free, tessera_app_new,
-    tessera_app_set_callbacks, tessera_session_close, tessera_session_paste,
+    MouseEvent, MouseEventKind, ScrollEvent, ScrollPosition, ScrollTarget, SpawnOptions,
+    tessera_app_free, tessera_app_new, tessera_app_set_callbacks, tessera_session_close,
+    tessera_session_paste, tessera_session_scroll_position, tessera_session_scroll_to,
     tessera_session_send_key, tessera_session_send_mouse, tessera_session_send_scroll,
     tessera_session_set_focus, tessera_session_spawn, tessera_test_with_core,
 };
@@ -856,6 +858,103 @@ fn scroll_clamps_at_both_ends_of_the_scrollback() {
         (Error::Ok, InputOutcome::Consumed)
     );
     assert_eq!(app.scroll_offset(id), 0);
+}
+
+#[test]
+fn scroll_targets_have_stable_values() {
+    let all = [
+        ScrollTarget::Top,
+        ScrollTarget::Bottom,
+        ScrollTarget::PageUp,
+        ScrollTarget::PageDown,
+        ScrollTarget::Offset,
+    ];
+    for (raw, target) in (0..).zip(all) {
+        assert_eq!(target as u32, raw);
+        assert_eq!(ScrollTarget::from_raw(raw), Some(target));
+    }
+    for raw in [5, 6, u32::MAX] {
+        assert_eq!(ScrollTarget::from_raw(raw), None, "{raw}");
+    }
+}
+
+/// `tessera_session_scroll_to` with every target, clamped, read back with
+/// `tessera_session_scroll_position`; the failures leave the view where it
+/// was and zero the position.
+#[test]
+fn scroll_to_and_scroll_position_move_and_report_the_view() {
+    let outputs = Outputs::default();
+    let app = Handle::new(&outputs);
+    let id = app.spawn(
+        "/bin/sh",
+        &[
+            "-c",
+            "i=0; while [ $i -lt 40 ]; do echo line$i; i=$((i+1)); done; echo done; exec cat",
+        ],
+    );
+    app.wait_until("the output", |app| app.row(id, 22) == "done");
+    let position = |id| {
+        let mut out = ScrollPosition {
+            offset: 9,
+            history: 9,
+            rows: 9,
+        };
+        // SAFETY: live handle; `out` is writable.
+        let code = unsafe { tessera_session_scroll_position(app.0, id, &raw mut out) };
+        (code, out.offset, out.history, out.rows)
+    };
+    let to = |target: ScrollTarget, offset| {
+        // SAFETY: live handle.
+        unsafe { tessera_session_scroll_to(app.0, id, target as u32, offset) }
+    };
+    assert_eq!(position(id), (Error::Ok, 0, 18, 24));
+    for (target, offset, expected) in [
+        (ScrollTarget::Top, 0, 18),
+        (ScrollTarget::PageDown, 0, 0),
+        (ScrollTarget::PageUp, 0, 18),
+        (ScrollTarget::Offset, 7, 7),
+        (ScrollTarget::Offset, u64::MAX, 18),
+        (ScrollTarget::Bottom, 3, 0),
+        (ScrollTarget::Offset, 5, 5),
+    ] {
+        assert_eq!(to(target, offset), Error::Ok, "{target:?}");
+        assert_eq!(
+            position(id),
+            (Error::Ok, expected, 18, 24),
+            "{target:?} {offset}"
+        );
+        assert_eq!(u64::try_from(app.scroll_offset(id)).unwrap(), expected);
+    }
+    // SAFETY: live handle; the target value is bogus on purpose.
+    let bogus = unsafe { tessera_session_scroll_to(app.0, id, 5, 0) };
+    assert_eq!(bogus, Error::InvalidArgument);
+    assert_eq!(position(id), (Error::Ok, 5, 18, 24), "unchanged");
+    let stale = id + 100;
+    // SAFETY: live handle.
+    let gone = unsafe { tessera_session_scroll_to(app.0, stale, ScrollTarget::Top as u32, 0) };
+    assert_eq!(gone, Error::SessionNotFound);
+    assert_eq!(position(stale), (Error::SessionNotFound, 0, 0, 0));
+    // SAFETY: NULL out pointer and NULL app are rejected without access.
+    unsafe {
+        assert_eq!(
+            tessera_session_scroll_position(app.0, id, ptr::null_mut()),
+            Error::NullPointer
+        );
+        let mut out = ScrollPosition {
+            offset: 9,
+            ..ScrollPosition::default()
+        };
+        assert_eq!(
+            tessera_session_scroll_position(ptr::null_mut(), id, &raw mut out),
+            Error::NullPointer
+        );
+        assert_eq!(out, ScrollPosition::default(), "zeroed");
+        assert_eq!(
+            tessera_session_scroll_to(ptr::null_mut(), id, ScrollTarget::Top as u32, 0),
+            Error::NullPointer
+        );
+    }
+    assert_eq!(position(id).1, 5);
 }
 
 #[test]

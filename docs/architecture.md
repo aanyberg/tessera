@@ -41,7 +41,7 @@ The diagram is the target design; today the core holds sessions only
 | `tessera-plugins/*` | first-party plugins | plugin-api |
 | `tessera-protocol` | JSON-RPC request/response types (ADR 0003) | plugin-api |
 | `tessera-control` | Unix socket server, consent, dispatch | protocol, app-core |
-| `tessera-app-core` | sessions, input, and one view per session (`view.rs`: a `View` holds `tessera-render`'s `RenderSurface` and `Renderer`; `App` shares one `Gpu`, ADR 0014); the live configuration (`config_watch.rs`: one watcher per `App` applying `config.toml` and theme edits, ADR 0006, 0019); shell integration on spawn (ADR 0021); no OS UI | pty, term, config, shell-integration, plugin-api, render, grid (and the `hello` plugin) |
+| `tessera-app-core` | sessions, input, and one view per session (`view.rs`: a `View` holds `tessera-render`'s `RenderSurface` and `Renderer`; `App` shares one `Gpu`, ADR 0014), whose viewport shows the live screen or the scrollback at the session's scroll offset, anchored to its lines while output continues (ADR 0023); the live configuration (`config_watch.rs`: one watcher per `App` applying `config.toml` and theme edits, ADR 0006, 0019); shell integration on spawn (ADR 0021); no OS UI | pty, term, config, shell-integration, plugin-api, render, grid (and the `hello` plugin) |
 | `tessera-ffi` | `extern "C"` surface, including turning a `CAMetalLayer*` into a wgpu surface (`unsafe` allowed); `apps/macos` wraps it as TesseraKit (ADR 0012) | app-core |
 | `tessera-cli` | `tessera` binary speaking the protocol | protocol |
 | `tessera-devtool` | dev-only `tessera-devtool` binary and library: headless screen dumps for debugging and snapshot tests, and `theme import`; never published, nothing in the app depends on it | pty, term, grid, config |
@@ -142,8 +142,9 @@ stay at the default class (ADR 0018 explains why).
    applies it, emits `Request`s (bell, title).
 4. The core notifies the frontend via the `on_session_output` callback.
 5. The frontend's display link calls `tessera_surface_render`, which runs
-   `App::render_view`: it copies the visible rows under the terminal lock,
-   releases it, and draws the copy with `tessera-render` (ADR 0014).
+   `App::render_view`: it copies the rows in view (the live screen, or the
+   scrollback lines at the scroll offset, ADR 0023) under the terminal
+   lock, releases it, and draws the copy with `tessera-render` (ADR 0014).
 6. Events worth observing (`CommandFinished`, `TitleChanged`) are fanned out
    to plugins and socket subscribers.
 

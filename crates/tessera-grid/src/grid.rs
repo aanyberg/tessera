@@ -190,6 +190,9 @@ pub struct Grid {
     scrolled_since_clear: bool,
     /// When the last [`Grid::reset`] blanked the screen.
     blanked_at: BlankedAt,
+    /// Lines scrolled off the primary screen into history so far: see
+    /// [`Grid::scrollback_pushed`].
+    scrollback_pushed: PushedCount,
 }
 
 impl Grid {
@@ -227,6 +230,7 @@ impl Grid {
             damage: DamageTracker::new(rows),
             scrolled_since_clear: false,
             blanked_at: BlankedAt::default(),
+            scrollback_pushed: PushedCount::default(),
         }
     }
 
@@ -340,6 +344,27 @@ impl Grid {
     /// Maximum number of scrollback lines retained.
     pub fn max_scrollback(&self) -> usize {
         self.scrollback.cap()
+    }
+
+    /// How many lines have scrolled off the top of the primary screen into
+    /// history since the grid was created: a monotonic count that lets a
+    /// reader tell how far the history moved between two looks (ADR 0023).
+    ///
+    /// Counted: every line a line feed, an index or SU moves off the top
+    /// of the primary screen while the scroll region is the full screen,
+    /// including lines that evict the oldest one at the cap and lines a
+    /// zero cap discards. Not counted: lines leaving a partial scroll
+    /// region or the alternate screen (they never enter history), and
+    /// rows a [`Grid::resize`] moves between the screen and history (a
+    /// resize re-wraps the history, so a reader re-reads it whole).
+    /// Nothing resets it: [`Grid::clear_scrollback`],
+    /// [`Grid::clear_to_cursor`], [`Grid::reset`], a resize and a cap
+    /// change leave it as it is. A reader that needs to know whether
+    /// history was cleared compares [`Grid::scrollback_len`] with what the
+    /// count says it should be.
+    #[must_use]
+    pub fn scrollback_pushed(&self) -> u64 {
+        self.scrollback_pushed.0
     }
 
     /// A scrollback line; index `0` is the oldest, `scrollback_len() - 1`
@@ -1284,6 +1309,11 @@ impl Grid {
         let top = usize::from(top);
         let keep_history = self.region_is_full_screen() && !self.is_alt_screen();
         self.scrolled_since_clear |= keep_history;
+        if keep_history {
+            // `n` is at most the screen height, so this cannot overflow in
+            // any realistic lifetime; saturate rather than wrap anyway.
+            self.scrollback_pushed.0 = self.scrollback_pushed.0.saturating_add(n as u64);
+        }
         for i in top..top + n {
             let mut departed = mem::take(&mut self.lines[i]);
             departed.graphemes.compact();
@@ -1873,6 +1903,21 @@ impl Clone for BlankedAt {
 impl std::fmt::Debug for BlankedAt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("BlankedAt")
+    }
+}
+
+/// Lines scrolled off the primary screen into history so far
+/// ([`Grid::scrollback_pushed`]). A clone keeps the count.
+///
+/// Opaque in `Debug`, like [`BlankedAt`] and the damage tracker: it is
+/// bookkeeping for readers of the history, not screen state, and a reset
+/// grid and a fresh one hold the same screen and must print the same.
+#[derive(Clone, Copy, Default)]
+struct PushedCount(u64);
+
+impl std::fmt::Debug for PushedCount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PushedCount")
     }
 }
 
@@ -2704,6 +2749,7 @@ mod tests {
     fn rebuilt(old: &Grid) -> Grid {
         let mut fresh = Grid::with_scrollback(old.rows, old.cols, old.scrollback.cap());
         fresh.scrollback = old.scrollback.clone();
+        fresh.scrollback_pushed = old.scrollback_pushed;
         fresh.end_newest_history_line();
         fresh
     }
@@ -2883,6 +2929,111 @@ mod tests {
                 apply_reset_op(&mut grid, op)?;
             }
             apply_reset_op(&mut grid, &ResetOp::Reset)?;
+        }
+    }
+
+    /// #31: `scrollback_pushed` counts the lines that scroll off the top
+    /// of the primary screen, eviction and a zero cap included, and nothing
+    /// else; nothing resets it.
+    #[test]
+    fn scrollback_pushed_counts_lines_scrolled_into_history() {
+        let mut grid = Grid::with_scrollback(3, 4, 5);
+        assert_eq!(grid.scrollback_pushed(), 0);
+        // Line feeds above the bottom row push nothing.
+        grid.line_feed();
+        grid.line_feed();
+        assert_eq!(grid.scrollback_pushed(), 0);
+        // At the bottom of the screen each one pushes a line, and so does
+        // an auto-wrap off the last row.
+        for n in 1..=3 {
+            grid.line_feed();
+            assert_eq!(grid.scrollback_pushed(), n);
+        }
+        grid.put_str("abcde");
+        assert_eq!(grid.scrollback_pushed(), 4);
+        assert_eq!(grid.scrollback_len(), 4);
+        // SU with the full screen as region: one per line, at most the
+        // screen height.
+        grid.scroll_up(2);
+        assert_eq!(grid.scrollback_pushed(), 6);
+        grid.scroll_up(100);
+        assert_eq!(grid.scrollback_pushed(), 9, "SU 100 moves 3 rows");
+        // Eviction at the cap still counts.
+        assert_eq!(grid.scrollback_len(), 5);
+        // Lines leaving a partial region never enter history.
+        grid.set_scroll_region(0, 1);
+        grid.goto(1, 0);
+        grid.line_feed();
+        grid.scroll_up(2);
+        assert_eq!(grid.scrollback_pushed(), 9, "partial region");
+        grid.reset_scroll_region();
+        // Nor do lines leaving the alternate screen.
+        grid.enter_alt_screen();
+        grid.goto(2, 0);
+        grid.line_feed();
+        grid.scroll_up(3);
+        assert_eq!(grid.scrollback_pushed(), 9, "alternate screen");
+        grid.leave_alt_screen();
+        // Clearing history keeps the count.
+        grid.clear_scrollback();
+        assert_eq!((grid.scrollback_pushed(), grid.scrollback_len()), (9, 0));
+        grid.scroll_up(1);
+        grid.goto(2, 0);
+        grid.clear_to_cursor();
+        assert_eq!((grid.scrollback_pushed(), grid.scrollback_len()), (10, 0));
+        grid.scroll_up(1);
+        grid.reset();
+        assert_eq!((grid.scrollback_pushed(), grid.scrollback_len()), (11, 1));
+        // A resize moves rows between the screen and history uncounted.
+        grid.goto(2, 0);
+        grid.put_str("xy");
+        grid.resize(1, 4);
+        assert_eq!(grid.scrollback_pushed(), 11, "shrinking");
+        assert_eq!(grid.scrollback_len(), 3);
+        grid.resize(6, 2);
+        assert_eq!(grid.scrollback_pushed(), 11, "growing and re-wrapping");
+        // A cap of zero keeps nothing; the lines are still counted.
+        grid.set_max_scrollback(0);
+        assert_eq!(grid.scrollback_pushed(), 11, "a cap change");
+        grid.scroll_up(2);
+        assert_eq!((grid.scrollback_pushed(), grid.scrollback_len()), (13, 0));
+        grid.check_invariants();
+    }
+
+    proptest::proptest! {
+        /// #31: over any history, `scrollback_pushed` never goes down, and
+        /// an operation that does not clear history, resize or change the
+        /// cap leaves `min(cap, len + pushed lines)` lines: the identity a
+        /// reader uses to tell output from a clear (ADR 0023).
+        #[test]
+        fn scrollback_pushed_is_monotonic_and_accounts_for_history(
+            rows in 1..=7u16,
+            cols in 1..=9u16,
+            cap in proptest::prop_oneof![proptest::strategy::Just(0usize), 0..=6usize],
+            ops in proptest::collection::vec(reset_op(), 0..80),
+        ) {
+            use proptest::{prop_assert, prop_assert_eq};
+            let mut grid = Grid::with_scrollback(rows, cols, cap);
+            for op in &ops {
+                let (pushed, len) = (grid.scrollback_pushed(), grid.scrollback_len());
+                apply_reset_op(&mut grid, op)?;
+                prop_assert!(grid.scrollback_pushed() >= pushed, "{op:?} lowered the count");
+                let removes = matches!(
+                    op,
+                    ResetOp::EraseDisplay(3)
+                        | ResetOp::ClearToCursor
+                        | ResetOp::Resize(..)
+                        | ResetOp::Cap(_)
+                );
+                if !removes {
+                    let added = usize::try_from(grid.scrollback_pushed() - pushed).unwrap();
+                    prop_assert_eq!(
+                        grid.scrollback_len(),
+                        (len + added).min(grid.max_scrollback()),
+                        "{:?}", op
+                    );
+                }
+            }
         }
     }
 

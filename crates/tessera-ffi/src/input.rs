@@ -1233,6 +1233,16 @@ pub unsafe extern "C" fn tessera_session_send_mouse(
 /// least one line, `TESSERA_INPUT_OUTCOME_IGNORED` otherwise (including at
 /// either end).
 ///
+/// On the alternate screen (a full-screen application), which has no
+/// scrollback, the view does not move: each whole line sends a cursor key
+/// to the child instead, Up for positive deltas and Down for negative ones
+/// (`ESC [ A` / `ESC [ B`, or `ESC O A` / `ESC O B` in application
+/// cursor-key mode), at most the screen's height per call, and the outcome
+/// is `TESSERA_INPUT_OUTCOME_CONSUMED` when a key was sent. While that
+/// application asked for mouse reports the gesture sends nothing and is
+/// `TESSERA_INPUT_OUTCOME_IGNORED`. The keys are queued like typed keys and
+/// can fail the same way (`TESSERA_ERROR_IO`).
+///
 /// Call from the UI (main) thread only.
 ///
 /// Returns `TESSERA_ERROR_NULL_POINTER` if `app`, `event` or `out` is
