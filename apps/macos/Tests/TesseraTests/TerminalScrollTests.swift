@@ -249,29 +249,104 @@ final class TerminalScrollTests: XCTestCase {
 
     // MARK: Scroll bar
 
-    /// Asserts that the scroll bar shows `expected`: the knob's proportion
-    /// rows / (history + rows), and its place along the track for the
-    /// offset, to the pixel.
-    private func assertScroller(
-        shows expected: TesseraSession.ScrollPosition, _ message: String, file: StaticString = #filePath,
-        line: UInt = #line
+    /// Asserts that `scroller` shows `expected`: the knob's proportion
+    /// rows / (history + rows) and its value (0 at the oldest line, 1 at the
+    /// live screen) exactly, and the knob AppKit draws for them to the
+    /// device pixel.
+    ///
+    /// The geometry is measured against AppKit's own track, found by
+    /// moving the knob to either end, not against `rect(for: .knobSlot)`:
+    /// on macOS 15 (the CI runner) the overlay slot is the scroller's full
+    /// height while the knob travels about a point less, and AppKit floors
+    /// the knob's origin and length to device pixels (whole points at 1x).
+    /// Both ends and the knob are floored the same way, so the knob's
+    /// origin is within one device pixel of the interpolation between the
+    /// ends. Its length depends on AppKit's internal track: it is held to
+    /// the screen's share of the measured track within a pixel plus 1 % of
+    /// the track (1.4 pt of 200 observed on macOS 15 at 1x), and to at
+    /// least that share when AppKit's minimum knob length applies.
+    static func assertKnob(
+        of scroller: TerminalScroller, shows expected: TesseraSession.ScrollPosition, scale: CGFloat,
+        proportional: Bool = false, _ message: String, file: StaticString = #filePath, line: UInt = #line
     ) {
-        let scroller = view.scroller
         XCTAssertEqual(scroller.position, expected, message, file: file, line: line)
         XCTAssertFalse(scroller.isHidden, message, file: file, line: line)
         let history = Double(expected.history)
         let proportion = Double(expected.rows) / (history + Double(expected.rows))
-        XCTAssertEqual(Double(scroller.knobProportion), proportion, accuracy: 1e-9, message, file: file, line: line)
-        let pixel = 1 / (window.backingScaleFactor)
-        let slot = scroller.rect(for: .knobSlot)
-        let knob = scroller.rect(for: .knob)
-        XCTAssertGreaterThan(knob.height, 0, message, file: file, line: line)
-        // AppKit keeps a knob long enough to grab.
-        XCTAssertGreaterThanOrEqual(knob.height + pixel, slot.height * proportion, message, file: file, line: line)
         let fromTop = (history - Double(expected.offset)) / history
-        let travel = slot.height - knob.height
-        let top = scroller.isFlipped ? slot.minY + travel * fromTop : slot.maxY - knob.height - travel * fromTop
-        XCTAssertEqual(knob.minY, top, accuracy: pixel, "\(message): knob position", file: file, line: line)
+        XCTAssertEqual(Double(scroller.knobProportion), proportion, accuracy: 1e-9, message, file: file, line: line)
+        XCTAssertEqual(scroller.doubleValue, fromTop, accuracy: 1e-9, "\(message): value", file: file, line: line)
+
+        let knob = scroller.rect(for: .knob)
+        let value = scroller.doubleValue
+        scroller.doubleValue = 0
+        let atTop = scroller.rect(for: .knob)
+        scroller.doubleValue = 1
+        let atBottom = scroller.rect(for: .knob)
+        scroller.doubleValue = value
+        XCTAssertGreaterThan(knob.height, 0, message, file: file, line: line)
+        XCTAssertEqual(atTop.height, knob.height, message, file: file, line: line)
+        XCTAssertEqual(atBottom.height, knob.height, message, file: file, line: line)
+
+        let pixel = 1 / scale
+        let origin = atTop.minY + (atBottom.minY - atTop.minY) * CGFloat(fromTop)
+        XCTAssertEqual(
+            knob.minY, origin, accuracy: pixel + 1e-9, "\(message): knob position", file: file, line: line)
+        let track = abs(atBottom.minY - atTop.minY) + knob.height
+        let share = track * CGFloat(proportion)
+        let tolerance = pixel + track / 100
+        XCTAssertGreaterThanOrEqual(
+            knob.height + tolerance, share, "\(message): knob length", file: file, line: line)
+        if proportional {
+            XCTAssertEqual(knob.height, share, accuracy: tolerance, "\(message): knob length", file: file, line: line)
+        }
+    }
+
+    private func assertScroller(
+        shows expected: TesseraSession.ScrollPosition, proportional: Bool = false, _ message: String,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        Self.assertKnob(
+            of: view.scroller, shows: expected, scale: window.backingScaleFactor, proportional: proportional,
+            message, file: file, line: line)
+    }
+
+    /// A window at a chosen backing scale: AppKit rounds the knob to its
+    /// device pixels. Never on screen.
+    private final class ScaledWindow: NSWindow {
+        var scale: CGFloat = 1
+        override var backingScaleFactor: CGFloat { scale }
+    }
+
+    func testTheKnobMatchesThePositionAtEveryBackingScale() {
+        // No session: the scroller alone, as a frame would update it.
+        let positions: [TesseraSession.ScrollPosition] = [
+            .init(offset: 0, history: 1000, rows: 12), .init(offset: 11, history: 1039, rows: 12),
+            .init(offset: 400, history: 1039, rows: 12), .init(offset: 1039, history: 1039, rows: 12),
+            .init(offset: 0, history: 19, rows: 12), .init(offset: 7, history: 19, rows: 12),
+            .init(offset: 19, history: 19, rows: 12),
+        ]
+        for scale: CGFloat in [1, 2, 3] {
+            let scaled = ScaledWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 480, height: 200), styleMask: [.titled], backing: .buffered,
+                defer: false)
+            scaled.isReleasedWhenClosed = false
+            scaled.scale = scale
+            let host = NSView(frame: NSRect(x: 0, y: 0, width: 480, height: 200))
+            host.wantsLayer = true
+            scaled.contentView = host
+            let scroller = TerminalScroller()
+            scroller.frame = NSRect(
+                x: 480 - TerminalScroller.width, y: 0, width: TerminalScroller.width, height: 200)
+            host.addSubview(scroller)
+            for position in positions {
+                scroller.update(position)
+                Self.assertKnob(
+                    of: scroller, shows: position, scale: scale, proportional: position.history < 100,
+                    "\(position) at \(scale)x")
+            }
+            scaled.close()
+        }
     }
 
     func testTheScrollerFollowsOutputAndScrolling() async throws {
@@ -313,14 +388,10 @@ final class TerminalScrollTests: XCTestCase {
         tick()
         let shown = try position
         XCTAssertGreaterThan(shown.history, 0)
-        assertScroller(shows: shown, "a short history")
-        let proportional = view.scroller.rect(for: .knobSlot).height * view.scroller.knobProportion
-        XCTAssertEqual(
-            view.scroller.rect(for: .knob).height, proportional, accuracy: 1 / window.backingScaleFactor,
-            "the knob's length is the screen's share of the lines")
+        assertScroller(shows: shown, proportional: true, "a short history")
         view.scroll(to: .top)
         tick()
-        assertScroller(shows: try position, "at the top")
+        assertScroller(shows: try position, proportional: true, "at the top")
     }
 
     func testDraggingTheKnobOrClickingTheTrackMovesTheView() async throws {
