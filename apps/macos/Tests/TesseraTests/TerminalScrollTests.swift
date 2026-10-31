@@ -38,11 +38,15 @@ final class TerminalScrollTests: XCTestCase {
     }
 
     /// Opens a terminal whose child printed `lines` lines (the numbers 1 to
-    /// `lines`) and waits until all of them are in the session: with the
-    /// cursor's line, `lines + 1` lines fill the screen and the history.
+    /// `lines`), and waits until the child is ready: it prints one more,
+    /// empty, line only once raw mode is set, so with the cursor's line
+    /// `lines + 2` lines fill the screen and the history then. Writing
+    /// before that would race `stty`: the cooked terminal echoes input
+    /// itself, as well as `cat`, and holds an escape sequence until a
+    /// newline.
     private func open(lines: Int = 1000) async throws {
         appDelegate.spawnOptions = .init(
-            program: "/bin/sh", arguments: ["-c", "seq 1 \(lines); stty raw -echo; exec cat"])
+            program: "/bin/sh", arguments: ["-c", "seq 1 \(lines); stty raw -echo; printf '\\n'; exec cat"])
         let controller = try appDelegate.newWindow()
         view = try XCTUnwrap(controller.contentView as? TerminalSurfaceView)
         window = KeyControlledWindow(contentRect: view.frame)
@@ -52,9 +56,9 @@ final class TerminalScrollTests: XCTestCase {
         view.occlusionOverride = false
         // The scroll bar's visibility follows the user's setting otherwise.
         view.scroller.preferredStyleOverride = .overlay
-        try await waitUntil("the child's \(lines) lines are in the session") {
+        try await waitUntil("the child's \(lines) lines and its raw-mode line are in the session") {
             guard let position = try? self.view.session.scrollPosition else { return false }
-            return position.history + UInt64(position.rows) == UInt64(lines + 1)
+            return position.history + UInt64(position.rows) == UInt64(lines + 2)
         }
     }
 
@@ -284,11 +288,14 @@ final class TerminalScrollTests: XCTestCase {
         scroller.doubleValue = 1
         let atBottom = scroller.rect(for: .knob)
         scroller.doubleValue = value
-        XCTAssertGreaterThan(knob.height, 0, message, file: file, line: line)
-        XCTAssertEqual(atTop.height, knob.height, message, file: file, line: line)
-        XCTAssertEqual(atBottom.height, knob.height, message, file: file, line: line)
-
         let pixel = 1 / scale
+        // The same length, computed by AppKit at each place: equal up to
+        // floating-point error (at 3x one ulp apart), well under a pixel.
+        let sameLength = pixel / 1000
+        XCTAssertGreaterThan(knob.height, 0, message, file: file, line: line)
+        XCTAssertEqual(atTop.height, knob.height, accuracy: sameLength, message, file: file, line: line)
+        XCTAssertEqual(atBottom.height, knob.height, accuracy: sameLength, message, file: file, line: line)
+
         let origin = atTop.minY + (atBottom.minY - atTop.minY) * CGFloat(fromTop)
         XCTAssertEqual(
             knob.minY, origin, accuracy: pixel + 1e-9, "\(message): knob position", file: file, line: line)
@@ -358,7 +365,8 @@ final class TerminalScrollTests: XCTestCase {
         // Output at the live screen: more history, a smaller knob at the
         // bottom.
         let before = try position.history
-        try view.session.write(Array(String(repeating: "x\n", count: 50).utf8))
+        // CR LF: each line starts at the left, so none wraps.
+        try view.session.write(Array(String(repeating: "x\r\n", count: 50).utf8))
         try await waitUntil("the echo arrives") { (try? self.position.history) == before + 50 }
         tick()
         assertScroller(shows: try position, "after output")
@@ -374,7 +382,7 @@ final class TerminalScrollTests: XCTestCase {
 
         // Output under a scrolled-back view keeps it on its lines: the
         // offset and history both grow.
-        try view.session.write(Array(String(repeating: "y\n", count: 30).utf8))
+        try view.session.write(Array(String(repeating: "y\r\n", count: 30).utf8))
         try await waitUntil("the echo arrives") { (try? self.position.history) == before + 80 }
         tick()
         XCTAssertEqual(try position.offset, 430)

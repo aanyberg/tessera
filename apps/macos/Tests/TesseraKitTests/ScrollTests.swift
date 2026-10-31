@@ -4,14 +4,15 @@ import TesseraCore
 import XCTest
 
 /// `TesseraSession.scroll(to:)` and `scrollPosition` round-tripped through
-/// the C API: a 24-row session whose child printed 200 lines has 177 lines
-/// of history (201 lines, the cursor's included, less the screen).
+/// the C API: a 24-row session whose child printed 200 lines, then an empty
+/// one once its terminal is in raw mode, has 178 lines of history (202
+/// lines, the cursor's included, less the screen).
 @MainActor
 final class ScrollTests: XCTestCase {
     private var app: TesseraApp!
 
     private static let rows: UInt16 = 24
-    private static let history: UInt64 = 177
+    private static let history: UInt64 = 178
 
     override func setUp() async throws {
         app = try TesseraApp()
@@ -24,11 +25,16 @@ final class ScrollTests: XCTestCase {
 
     /// A session with ``history`` lines of history whose child then copies
     /// its input to its output (raw mode, no echo), so a test can make it
-    /// print.
+    /// print. The last line comes only after `stty`, so once the history is
+    /// complete a write cannot race the switch to raw mode (a cooked
+    /// terminal echoes input itself and holds an escape sequence until a
+    /// newline).
     private func sessionWithHistory() async throws -> TesseraSession {
         let session = try app.spawn(
-            .init(program: "/bin/sh", arguments: ["-c", "seq 1 200; stty raw -echo; exec cat"], rows: Self.rows))
-        try await waitUntil("the history is complete") {
+            .init(
+                program: "/bin/sh", arguments: ["-c", "seq 1 200; stty raw -echo; printf '\\n'; exec cat"],
+                rows: Self.rows))
+        try await waitUntil("the history and the raw-mode line are complete") {
             (try? session.scrollPosition)?.history == Self.history
         }
         return session
