@@ -20,6 +20,11 @@ import os
 ///   code. Keys pressed while text is marked belong to the input method and
 ///   send nothing of their own.
 /// - Mouse and scrolling are forwarded to the core in cell coordinates.
+/// - Scrollback: the wheel and trackpad move the view through the core;
+///   the View menu's ⌘↑/⌘↓ page and ⌘Home/⌘End jump (``scroll(to:)``);
+///   ``TerminalScroller`` shows and moves the position. Typing, pasting and
+///   starting a composition return to the live screen, and drop the rest
+///   of a trackpad gesture's momentum.
 @MainActor
 final class TerminalSurfaceView: NSView, TerminalContentView {
     private static let log = Logger(subsystem: "com.aanyberg.tessera", category: "surface")
@@ -122,6 +127,17 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     private let markedTextLayer = CATextLayer()
     private let statusLabel = NSTextField(labelWithString: "")
 
+    // Scrollback state.
+
+    /// The scroll bar along the right edge, over the text.
+    let scroller = TerminalScroller()
+    /// Momentum events are dropped until the next gesture begins: a key, a
+    /// paste or a keyboard scroll moved the view since the gesture whose
+    /// momentum is still arriving, which would otherwise carry the view
+    /// away from where the user just put it (the live screen, after
+    /// typing).
+    private(set) var ignoresMomentum = false
+
     // Menu state (Edit and View menus).
 
     /// Whether text is selected: Copy (and, until #30 decides otherwise,
@@ -165,6 +181,12 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
             statusLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
             statusLabel.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
         ])
+
+        let width = TerminalScroller.width
+        scroller.frame = NSRect(x: frame.width - width, y: 0, width: width, height: frame.height)
+        scroller.autoresizingMask = [.minXMargin, .height]
+        scroller.onScroll = { [weak self] target in self?.scroll(to: target) }
+        addSubview(scroller)
     }
 
     @available(*, unavailable)
@@ -519,6 +541,7 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     private func render() {
         renderCount += 1
         refreshMetrics()
+        updateScroller()
         do {
             let status = try surface.render()
             switch frameStatusOverride ?? status {
@@ -771,11 +794,23 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
             sentKeys.append(event)
         #endif
         do {
-            return try session.send(key: event)
+            let outcome = try session.send(key: event)
+            if outcome == .consumed {
+                movedToLiveScreen()
+            }
+            return outcome
         } catch {
             Self.log.debug("key not sent: \(String(describing: error), privacy: .public)")
             return .ignored
         }
+    }
+
+    /// The core returned the view to the live screen (a key or a paste it
+    /// sent on): redraw, since the child may echo nothing, and drop the
+    /// momentum of the gesture before.
+    private func movedToLiveScreen() {
+        ignoresMomentum = true
+        needsRender = true
     }
 
     static func modifiers(of event: NSEvent) -> TesseraSession.Modifiers {
@@ -868,7 +903,17 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         }
     }
 
+    /// Wheel and trackpad scrolling, momentum included, go to the core,
+    /// which moves the view (or sends cursor keys on the alternate screen).
+    /// After a key, a paste or a keyboard scroll, momentum events are
+    /// dropped until the next gesture begins (``ignoresMomentum``).
     override func scrollWheel(with event: NSEvent) {
+        if event.phase.contains(.began) {
+            ignoresMomentum = false
+        }
+        if ignoresMomentum, !event.momentumPhase.isEmpty {
+            return
+        }
         let point = convert(event.locationInWindow, from: nil)
         let (cell, _) = cell(at: point)
         let scale: CGFloat = metrics.map { CGFloat($0.scale) } ?? window?.backingScaleFactor ?? 1
@@ -890,9 +935,38 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
             if try session.send(scroll: scroll) == .consumed {
                 // The view moved through the scrollback.
                 needsRender = true
+                scroller.flash()
             }
         } catch {
             Self.log.debug("scroll not sent: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    // MARK: Scrollback
+
+    /// Moves the view in the scrollback (the menu's keys, the scroll bar,
+    /// a composition starting) and redraws. Like a key, it ends the
+    /// momentum of the gesture before: the view stays where it was put.
+    func scroll(to target: TesseraSession.ScrollTarget) {
+        do {
+            try session.scroll(to: target)
+        } catch {
+            Self.log.debug("scroll not sent: \(String(describing: error), privacy: .public)")
+            return
+        }
+        ignoresMomentum = true
+        needsRender = true
+        scroller.flash()
+    }
+
+    /// Shows the session's scroll position in the scroll bar. Called with
+    /// every frame, which output and scrolling ask for, so the bar follows
+    /// both with one read of the core per frame at most.
+    private func updateScroller() {
+        do {
+            scroller.update(try session.scrollPosition)
+        } catch {
+            // The session closed; the window closes with it.
         }
     }
 
@@ -1100,6 +1174,7 @@ extension TerminalSurfaceView: NSMenuItemValidation {
         pasteCount += 1
         do {
             try session.paste(text)
+            movedToLiveScreen()
         } catch {
             // Too large for the pending input, or the shell exited.
             Self.log.error("paste not sent: \(String(describing: error), privacy: .public)")
@@ -1141,6 +1216,26 @@ extension TerminalSurfaceView: NSMenuItemValidation {
         } catch {
             Self.log.debug("clear not sent: \(String(describing: error), privacy: .public)")
         }
+    }
+
+    /// Scroll to Top (⌘Home): the oldest line of the scrollback.
+    @objc func scrollToTop(_ sender: Any?) {
+        scroll(to: .top)
+    }
+
+    /// Scroll to Bottom (⌘End): the live screen.
+    @objc func scrollToBottom(_ sender: Any?) {
+        scroll(to: .bottom)
+    }
+
+    /// Page Up (⌘↑): one screen less a line towards older output.
+    @objc func scrollPageUpInHistory(_ sender: Any?) {
+        scroll(to: .pageUp)
+    }
+
+    /// Page Down (⌘↓): one screen less a line towards the live screen.
+    @objc func scrollPageDownInHistory(_ sender: Any?) {
+        scroll(to: .pageDown)
     }
 
     /// Bigger (⌘+ and ⌘=): one step up from the surface's current size.
@@ -1240,10 +1335,20 @@ extension TerminalSurfaceView: @preconcurrency NSTextInputClient {
         }
     }
 
+    /// A composition that starts while the view is scrolled back returns it
+    /// to the live screen first (#134), as typing would: the composition is
+    /// drawn, and the candidate window opens, at the live cursor.
     func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
         let text = Self.plainString(string)
+        let starts = !hasMarkedText() && !text.isEmpty
         markedText = NSMutableAttributedString(string: text)
         markedSelection = text.isEmpty ? NSRange(location: NSNotFound, length: 0) : selectedRange
+        if starts, let position = try? session.scrollPosition, position.offset > 0 {
+            scroll(to: .bottom)
+            // The cursor is on screen again: the metrics say so, and the
+            // overlay and candidate window follow them.
+            refreshMetrics()
+        }
         updateMarkedTextLayer()
     }
 

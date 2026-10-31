@@ -7,7 +7,8 @@ import XCTest
 /// equivalent, modifiers and action, ⌘= reaching Bigger through its hidden
 /// item, and the application items (Settings…, Tessera Help) without
 /// starting an editor or a browser. The terminal items' effects are tested
-/// on the view in ``TerminalSurfaceViewTests``.
+/// on the view in ``TerminalSurfaceViewTests``, the scrollback items' (and
+/// their key equivalents) in ``TerminalScrollTests``.
 @MainActor
 final class MainMenuTests: XCTestCase {
     private var appDelegate: AppDelegate!
@@ -125,6 +126,19 @@ final class MainMenuTests: XCTestCase {
             action: #selector(TerminalSurfaceView.increaseFontSize(_:)), hidden: true),
         Item(title: "Smaller", key: "-", modifiers: command, action: #selector(TerminalSurfaceView.decreaseFontSize(_:))),
         Item(title: "Actual Size", key: "0", modifiers: command, action: #selector(TerminalSurfaceView.resetFontSize(_:))),
+        .separator,
+        Item(
+            title: "Scroll to Top", key: "\u{F729}", modifiers: command,
+            action: #selector(TerminalSurfaceView.scrollToTop(_:))),
+        Item(
+            title: "Scroll to Bottom", key: "\u{F72B}", modifiers: command,
+            action: #selector(TerminalSurfaceView.scrollToBottom(_:))),
+        Item(
+            title: "Page Up", key: "\u{F700}", modifiers: command,
+            action: #selector(TerminalSurfaceView.scrollPageUpInHistory(_:))),
+        Item(
+            title: "Page Down", key: "\u{F701}", modifiers: command,
+            action: #selector(TerminalSurfaceView.scrollPageDownInHistory(_:))),
         .separator,
         Item(title: "Show Tab Bar", action: #selector(NSWindow.toggleTabBar(_:))),
     ]

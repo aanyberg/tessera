@@ -71,8 +71,8 @@ enum MainMenu {
         return menu
     }
 
-    /// Font zoom for the key window's terminal, 1 pt a step (D2), and the
-    /// tab bar.
+    /// Font zoom for the key window's terminal, 1 pt a step (D2), moving
+    /// through its scrollback, and the tab bar.
     private static func makeViewMenu() -> NSMenu {
         let menu = NSMenu(title: "View")
         menu.addItem(withTitle: "Bigger", action: #selector(TerminalSurfaceView.increaseFontSize(_:)), keyEquivalent: "+")
@@ -84,6 +84,18 @@ enum MainMenu {
         equals.allowsKeyEquivalentWhenHidden = true
         menu.addItem(withTitle: "Smaller", action: #selector(TerminalSurfaceView.decreaseFontSize(_:)), keyEquivalent: "-")
         menu.addItem(withTitle: "Actual Size", action: #selector(TerminalSurfaceView.resetFontSize(_:)), keyEquivalent: "0")
+        menu.addItem(.separator())
+        // The scrollback, as in Terminal.app's View menu; ⌘↑ and ⌘↓ page
+        // (wave 7 decision). Home and End are ⌘fn← and ⌘fn→ on a laptop.
+        let scrollItems: [(String, Selector, Int)] = [
+            ("Scroll to Top", #selector(TerminalSurfaceView.scrollToTop(_:)), NSHomeFunctionKey),
+            ("Scroll to Bottom", #selector(TerminalSurfaceView.scrollToBottom(_:)), NSEndFunctionKey),
+            ("Page Up", #selector(TerminalSurfaceView.scrollPageUpInHistory(_:)), NSUpArrowFunctionKey),
+            ("Page Down", #selector(TerminalSurfaceView.scrollPageDownInHistory(_:)), NSDownArrowFunctionKey),
+        ]
+        for (title, action, key) in scrollItems {
+            menu.addItem(withTitle: title, action: action, keyEquivalent: functionKey(key))
+        }
         menu.addItem(.separator())
         // In View, as in Terminal.app and Safari, where AppKit adds Show All
         // Tabs and Enter Full Screen. It retitles this "Hide Tab Bar" while
@@ -128,6 +140,12 @@ enum MainMenu {
             item.tag = index
         }
         return menu
+    }
+
+    /// The key equivalent for a function key (`NSUpArrowFunctionKey` and
+    /// the like): its private-use character.
+    static func functionKey(_ key: Int) -> String {
+        Unicode.Scalar(UInt32(key)).map { String(Character($0)) } ?? ""
     }
 
     private static func submenuItem(_ menu: NSMenu) -> NSMenuItem {
