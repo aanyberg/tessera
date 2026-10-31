@@ -49,6 +49,8 @@ use tessera_render::{
 };
 use tessera_term::{CursorStyle, Terminal};
 
+use crate::selection::Decorations;
+
 /// The shortest time between two presented frames of one view: one
 /// display period at 240 Hz, the fastest refresh a Mac display runs at.
 ///
@@ -352,6 +354,9 @@ pub(crate) struct View {
     /// Cursor and focus of the last presented frame; `None` before the
     /// first one.
     shown: Option<Shown>,
+    /// The selection and link underlines of the last presented frame;
+    /// `None` before the first one.
+    shown_decorations: Option<Decorations>,
     /// When the last presented frame was due on the [`MIN_FRAME_INTERVAL`]
     /// schedule (at most [`FRAME_SLACK`] before it was actually
     /// presented); `None` before the first one.
@@ -415,6 +420,7 @@ impl View {
             snapshot: Snapshot::default(),
             pending: DamageRows::All,
             shown: None,
+            shown_decorations: None,
             last_presented: None,
         })
     }
@@ -550,17 +556,26 @@ impl View {
 
     /// Copies what changed in the rows `term` shows `offset` lines above
     /// its live screen (see [`Snapshot::capture`]), and whether its cursor
-    /// is visible (DECTCEM), into the snapshot, and adds the rows that
-    /// changed to the next frame's damage.
+    /// is visible (DECTCEM), into the snapshot, adds the rows that changed
+    /// to the next frame's damage and returns them.
     ///
     /// This is the only part of a frame that runs under the session's
     /// terminal lock; shaping, drawing and waiting for a drawable happen
     /// after it is released. It copies only the rows that can have changed
     /// (comparing them first), so its cost follows the damage and the
     /// screen size, never the length of the scrollback.
-    pub(crate) fn capture(&mut self, term: &Terminal, offset: usize) {
+    pub(crate) fn capture(&mut self, term: &Terminal, offset: usize) -> DamageRows {
         let changed = self.snapshot.capture(term, offset);
         self.pending = self.pending.union(&changed);
+        changed
+    }
+
+    /// Sets what the next frame draws over the cells: the selection and
+    /// the hovered link's underlines (ADR 0025), in the captured rows'
+    /// coordinates. A frame whose decorations equal the last presented
+    /// one's needs no redraw for them.
+    pub(crate) fn set_decorations(&mut self, decorations: Decorations) {
+        self.snapshot.set_decorations(decorations);
     }
 
     /// Draws the last captured snapshot and presents it, or reports why
@@ -577,8 +592,10 @@ impl View {
             cursor: self.snapshot.shown_cursor(),
             focused,
         };
-        let changed =
-            !self.pending.is_none() || self.shown != Some(shown) || self.renderer.needs_redraw();
+        let changed = !self.pending.is_none()
+            || self.shown != Some(shown)
+            || self.shown_decorations.as_ref() != Some(self.snapshot.decorations())
+            || self.renderer.needs_redraw();
         if !changed {
             return Ok(FrameStatus::Skipped);
         }
@@ -596,6 +613,7 @@ impl View {
             Ok(status) if status.is_drawn() => {
                 self.pending = DamageRows::None;
                 self.shown = Some(shown);
+                self.shown_decorations = Some(self.snapshot.decorations().clone());
                 self.last_presented = Some(due_time(self.last_presented, now));
             }
             // Not drawn: the damage stays pending for the next frame.
@@ -676,6 +694,9 @@ pub(crate) struct Snapshot {
     /// The history lines the rows hold while the view is scrolled back;
     /// `None` while they are the live screen.
     scrolled: Option<ScrolledAt>,
+    /// The selection and link underlines frames draw, set after each
+    /// capture ([`Self::set_decorations`]).
+    decorations: Decorations,
     /// Rows compared by partial captures, for tests.
     #[cfg(test)]
     compared: usize,
@@ -888,6 +909,17 @@ impl Snapshot {
         }
     }
 
+    /// Sets the selection and link underlines frames of this snapshot
+    /// draw, in its rows' coordinates.
+    pub(crate) fn set_decorations(&mut self, decorations: Decorations) {
+        self.decorations = decorations;
+    }
+
+    /// The selection and link underlines frames of this snapshot draw.
+    pub(crate) fn decorations(&self) -> &Decorations {
+        &self.decorations
+    }
+
     /// Each captured row's cluster text, for tests.
     #[cfg(test)]
     pub(crate) fn clusters(&self) -> &[GraphemeTable] {
@@ -912,9 +944,9 @@ impl Snapshot {
     /// rows' grapheme clusters: a cursor of the captured shape at the
     /// captured cursor position, drawn unless the terminal hid it
     /// (DECTCEM) or the view is scrolled back, `focused` (an unfocused
-    /// frame draws every shape hollow), no selection and no overlays, and
-    /// the default damage ([`DamageRows::All`]). Cursor blink (a host
-    /// clock) is still to come.
+    /// frame draws every shape hollow), the selection and link underlines
+    /// last set ([`Self::set_decorations`]), and the default damage
+    /// ([`DamageRows::All`]). Cursor blink (a host clock) is still to come.
     pub(crate) fn frame<'a>(&'a self, rows: &'a [&'a [Cell]], focused: bool) -> FrameInput<'a> {
         let Point { row, col } = self.cursor;
         let visible = !self.cursor_hidden && self.scrolled.is_none();
@@ -924,6 +956,8 @@ impl Snapshot {
                 CursorState::new(row, col, self.cursor_shape).with_visible(visible),
             ))
             .with_focus(focused)
+            .with_selection(self.decorations.selection)
+            .with_overlays(&self.decorations.overlays)
     }
 }
 

@@ -2375,7 +2375,9 @@ dependencies = [
 name = "tessera-app-core"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "tempfile",
+ "tessera-app-core",
  "tessera-config",
  "tessera-grid",
  "tessera-plugin-api",

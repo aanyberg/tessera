@@ -1,0 +1,368 @@
+# =============================================================================
+# tessera-term: OSC 8 hyperlinks   (issue #30 part 2 of 3, wave 8)
+# crates/tessera-term/tests/fixtures/hyperlink_spec.txt
+# spec-researcher output (2026-10-31). STATUS: COMPLETE for 0.1.0 scope (see DECISIONS at the end).
+# ONLY THE MILESTONE LEAD EDITS A FINALISED COPY; the implementer copies it verbatim.
+#
+# Layout: `###` rows as osc_spec.txt (size / step / cite / note / screen / cursor / pending_wrap / requests /
+# scrollback) plus the keys below. tests/hyperlink.rs needs its own parser (see osc_spec.txt header).
+#   links:   per-cell link assertions: `(r,c)=uri[#id]` list; cells not listed must carry NO link.
+#            `uri` is the exact stored URI, `#id` the explicit id when present (stored separately from the URI).
+#            `none` = no cell carries a link.
+#   active:  the grid's active link after the last step: none | uri[#id]
+#   same:    groups of cells that must intern to ONE link entity: `same: (0,0)(0,2)`; `distinct: (0,0)(0,1)` the opposite
+#   links_scrollback: `s0:(0-1)=uri` oldest history line s0, columns, for rows that push lines into history
+#   rejected: true when the OSC must be ignored entirely (active link unchanged, nothing stored)
+#   links entries are `(row,col)` or `(row,c0-c1)` ranges, `=uri`, optional `#id`.
+# PAYLOAD ESCAPES and @rep(C,N): exactly as osc_spec.txt (\xNN \r \n \\ \u{H..}; @rep(a,2070) = 2070 'a'). Every row runs
+#   whole, byte-at-a-time and every 2-way split (osc_spec.txt chunking rule) and must give the same result.
+# Shorthand in `step:`: ESC ST is written \x1b\\ ; OSC 8 open = \x1b]8;<params>;<uri>\x1b\\ ; close = \x1b]8;;\x1b\\
+#
+# SOURCE TAGS (fetched 2026-10-31; read not run)
+#   GIST  https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda  "Hyperlinks (a.k.a. HTML-like anchors) in terminal emulators"
+#   VTE   https://github.com/GNOME/vte  src/vteseq.cc Terminal::set_current_hyperlink L1746-1822; src/vtedefines.hh L101
+#         VTE_HYPERLINK_URI_LENGTH_MAX 2083, L119 VTE_HYPERLINK_ID_LENGTH_MAX 250, L110 COUNT_MAX (1<<20)-2
+#   KT    https://github.com/kovidgoyal/kitty  kitty/screen.c set_active_hyperlink L1067 (empty URL closes), do_screen_reset L246
+#         (active link cleared on hard AND soft reset), screen_toggle_screen_buffer L1970 (cleared on a screen switch);
+#         kitty/hyperlink.c MAX_KEY_LEN 2048, MAX_ID_LEN 256 (key "id:url" is truncated), pool capped (HYPERLINK_MAX_NUMBER)
+#   WZ    https://github.com/wezterm/wezterm  wezterm-escape-parser/src/hyperlink.rs Hyperlink::parse (URI = osc[2..].join(';'),
+#         non-UTF-8 rejected, params without `=` are an error => whole OSC dropped, all params kept)
+#   GH    https://github.com/ghostty-org/ghostty  src/terminal/osc/parsers/hyperlink.zig (no `;` => invalid; unknown option
+#         logged and skipped; empty id ignored; empty URI + id => invalid; empty URI => hyperlink_end)
+#   OSC   crates/tessera-term/tests/fixtures/osc_spec.txt header item 3 (C0 bytes inside an OSC are dropped by the parser layer)
+#   ADR8  docs/adr/0008 (grapheme side table: the pattern the link table mirrors); 30-links brief D-STORE
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# A. PARSING
+# ---------------------------------------------------------------------------
+
+### L01_open_text_close_st
+size: 2x20
+step: feed \x1b]8;;https://a.bc/\x1b\\link\x1b]8;;\x1b\\ x
+cite: [GIST] "OSC 8 ; params ; URI ST" opens, the same with empty params and URI closes; cells printed in between carry the link
+links: (0,0-3)=https://a.bc/
+active: none
+note: cols 0-3 `link`, col 4 space, col 5 `x`: the last two have no link. The OSC itself prints nothing and does not move the cursor.
+
+### L02_bel_terminator
+size: 2x20
+step: feed \x1b]8;;https://a.bc/\x07hi\x1b]8;;\x07!
+cite: [GIST] "BEL is common in practice"; osc_spec.txt rows T01/T03 (BEL accepted for OSC)
+links: (0,0-1)=https://a.bc/
+active: none
+
+### L03_id_param
+size: 2x20
+step: feed \x1b]8;id=x1;https://a.bc/\x1b\\ab\x1b]8;;\x1b\\
+cite: [GIST] "id=" parameter; [GH] hyperlink.zig kv loop; [VTE] L1766-1783
+links: (0,0-1)=https://a.bc/#x1
+active: none
+
+### L04_other_params_ignored_id_kept
+size: 2x20
+step: feed \x1b]8;foo=bar:id=z:baz=1;https://a.bc/\x1b\\ab\x1b]8;;\x1b\\
+cite: [GIST] "Only id is currently defined", params are `key=value` pairs separated by `:`; [VTE] ignores subtokens that are not `id=`; [GH] "unknown hyperlink option" skipped
+links: (0,0-1)=https://a.bc/#z
+active: none
+note: WezTerm keeps all params; Tessera needs only id.
+
+### L05_param_without_equals_is_ignored_link_still_opens
+size: 2x20
+step: feed \x1b]8;junk;https://a.bc/\x1b\\ab\x1b]8;;\x1b\\
+cite: [VTE] L1766-1783 (a subtoken that does not start `id=` is skipped); [GH] `indexOfScalar '=' orelse break` stops param parsing but keeps the URI
+links: (0,0-1)=https://a.bc/
+active: none
+note: DISAGREEMENT: WezTerm's parse() returns Err("bad params") and drops the whole OSC. Recommend VTE/Ghostty (lenient): a reader is better served by a link than by dropped text. Lead decision D-L1.
+
+### L06_empty_id_means_no_id
+size: 2x20
+step: feed \x1b]8;id=;https://a.bc/\x1b\\ab\x1b]8;;\x1b\\
+cite: [VTE] `len < 3 continue` / empty hyperlink => auto id; [GH] `if (value.len > 0)`
+links: (0,0-1)=https://a.bc/
+active: none
+
+### L07_semicolons_inside_uri_are_kept
+size: 2x30
+step: feed \x1b]8;;https://a.bc/p;q=1;r\x1b\\x\x1b]8;;\x1b\\
+cite: [WZ] "Take everything after the params, so any further `;` are counted as part of the URI"; [VTE] token.append_remaining; [GH] URI = data[s+1..]
+links: (0,0)=https://a.bc/p;q=1;r
+active: none
+
+### L08_switch_without_closing_replaces
+size: 2x20
+step: feed \x1b]8;;https://a.bc/A\x1b\\a\x1b]8;;https://a.bc/B\x1b\\b\x1b]8;;\x1b\\c
+cite: [GIST] "It is perfectly legal to switch from one hyperlink to another without explicitly closing the first one"
+links: (0,0)=https://a.bc/A (0,1)=https://a.bc/B
+active: none
+
+### L09_close_without_open_is_harmless
+size: 2x20
+step: feed \x1b]8;;\x1b\\ab
+cite: [GIST] "closing a link that isn't open is also valid"
+links: none
+active: none
+
+### L10_empty_uri_with_params_closes
+size: 2x20
+step: feed \x1b]8;;https://a.bc/\x1b\\a\x1b]8;id=x;\x1b\\b
+cite: [VTE] L1805: `len > 0 && len <= MAX` else idx 0 (closes); [KT] set_active_hyperlink: `!url[0]` => 0
+links: (0,0)=https://a.bc/
+active: none
+note: DISAGREEMENT: Ghostty treats "empty URI + id" as invalid (ignored, the old link stays open), WezTerm builds a link with an empty URI. Recommend VTE/kitty: an empty URI ALWAYS closes. Lead decision D-L2.
+
+### L11_missing_second_semicolon_is_ignored
+size: 2x20
+step: feed \x1b]8;;https://a.bc/A\x1b\\a\x1b]8;https://a.bc/B\x1b\\b\x1b]8;;\x1b\\
+cite: [GH] no `;` => invalid; [VTE] `if (++token == endtoken) return`; [WZ] `ensure!(osc.len() >= 3)`: all three ignore the OSC
+links: (0,0-1)=https://a.bc/A
+rejected: true
+active: none
+note: Both `a` and `b` carry A: the malformed OSC changed nothing.
+
+### L12_uri_at_length_cap_accepted
+size: 2x20
+step: feed \x1b]8;;https://a.bc/@rep(a,2070)\x1b\\x\x1b]8;;\x1b\\
+cite: [GIST] "Both VTE and iTerm2 limit the URI to 2083 bytes"; [VTE] VTE_HYPERLINK_URI_LENGTH_MAX 2083, accepts `len <= MAX`
+links: (0,0)=https://a.bc/@rep(a,2070)
+active: none
+note: `https://a.bc/` is 13 bytes + 2070 = 2083, the longest accepted URI.
+
+### L13_uri_over_cap_closes_the_link
+size: 2x20
+step: feed \x1b]8;;https://a.bc/A\x1b\\a\x1b]8;;https://a.bc/@rep(a,2071)\x1b\\b
+cite: [VTE] L1815-1822: an overlong URI is "ignoring" AND `idx = get_hyperlink_idx(nullptr)`: the active link is cleared
+links: (0,0)=https://a.bc/A
+active: none
+note: 13 + 2071 = 2084 bytes. `b` has NO link (neither A nor the overlong one). AMBIGUITY: "ignore and keep A" is the other defensible choice; VTE clears, so an attacker cannot make text look as if it belongs to the previous link. Recommend VTE. Lead decision D-L3. The cap counts URI bytes only.
+
+### L14_id_at_and_over_cap
+size: 2x20
+step: feed \x1b]8;id=@rep(i,250);https://a.bc/\x1b\\a\x1b]8;;\x1b\\\x1b]8;id=@rep(i,251);https://a.bc/\x1b\\b\x1b]8;;\x1b\\
+cite: [GIST] "VTE limits id to 250 bytes"; [VTE] L1774: `len > 3 + VTE_HYPERLINK_ID_LENGTH_MAX` => "Overlong id ignored", the URI still applies with an auto id
+links: (0,0)=https://a.bc/#@rep(i,250) (0,1)=https://a.bc/
+active: none
+note: `a` keeps its 250-byte id; `b` gets the link WITHOUT an id (its id is dropped, not the link). kitty truncates the id to 256 instead; Tessera follows VTE.
+
+### L15_invalid_utf8_in_uri_rejected
+size: 2x20
+step: feed \x1b]8;;https://a.bc/\xff\x1b\\x
+cite: [WZ] String::from_utf8(uri)? fails => OSC dropped; [GIST] non-ASCII bytes are to be percent-encoded, so a raw invalid byte is malformed
+links: none
+rejected: true
+active: none
+note: Valid UTF-8 above 0x7F (L16) is accepted although the gist asks for percent-encoding.
+
+### L16_valid_utf8_in_uri_accepted_as_is
+size: 2x20
+step: feed \x1b]8;;https://a.bc/\u{e9}\x1b\\x\x1b]8;;\x1b\\
+cite: [GIST] "must not contain any bytes outside 32-126 ... percent-encoded" is a portability rule for senders; [WZ]/[GH] store the string as received
+links: (0,0)=https://a.bc/\u{e9}
+active: none
+note: Stored raw (D-SEC); the Swift side percent-encodes when it builds a URL to open.
+
+### L17_c0_byte_inside_uri_is_dropped_by_the_osc_layer
+size: 2x20
+step: feed \x1b]8;;https://a.b\x01c/\x1b\\x\x1b]8;;\x1b\\
+cite: osc_spec.txt header item 3 (vte silently drops C0 bytes 0x00-0x06, 0x08-0x17, ... inside an OSC); the 30-links brief row "control bytes rejected" is therefore already true one layer down
+links: (0,0)=https://a.bc/
+active: none
+note: BRIEF CORRECTION: nothing for hyperlink.rs to do beyond the existing OSC string rules.
+
+# ---------------------------------------------------------------------------
+# B. WHICH CELLS CARRY A LINK
+# ---------------------------------------------------------------------------
+
+### L20_link_survives_sgr_including_sgr0
+size: 2x20
+step: feed \x1b]8;;https://a.bc/\x1b\\a\x1b[1mb\x1b[0mc\x1b]8;;\x1b\\
+cite: [GIST] the hyperlink is "a cell attribute, like color or bold" but independent of them: SGR 0 resets SGR only; [KT] set_active_hyperlink is separate from the cursor SGR
+links: (0,0-2)=https://a.bc/
+active: none
+
+### L21_plain_text_over_link_drops_it
+size: 2x20
+step: feed \x1b]8;;https://a.bc/\x1b\\abc\x1b]8;;\x1b\\\rX
+cite: 30-links brief ("erasing/overwriting a cell drops the flag"); a printed cell takes the CURRENT attributes, here none
+links: (0,1-2)=https://a.bc/
+active: none
+
+### L22_ech_blanks_carry_no_link_while_link_active
+size: 2x20
+step: feed \x1b]8;;https://a.bc/\x1b\\abcd\x1b[1;1H\x1b[2X
+cite: 30-links brief ("blanks carry no link"); [KT] erase fills with a blank cell that carries no hyperlink id; [VTE] erase uses the color defaults, not the hyperlink attr
+links: (0,2-3)=https://a.bc/
+active: https://a.bc/
+note: ECH cleared cols 0-1; the active link is NOT closed by an erase.
+
+### L23_el_and_ed_blanks_carry_no_link
+size: 2x20
+step: feed \x1b]8;;https://a.bc/\x1b\\abcd\x1b[1;3H\x1b[K\x1b[2;1H\x1b[J
+cite: same as L22 (EL 0 from col 2, ED 0 from row 1)
+links: (0,0-1)=https://a.bc/
+active: https://a.bc/
+
+### L24_ich_blanks_carry_no_link_shifted_cells_keep_theirs
+size: 2x20
+step: feed \x1b]8;;https://a.bc/\x1b\\ab\x1b]8;;\x1b\\\x1b[1;1H\x1b[2@
+cite: same rule; ICH shifts cells, each cell keeps its own link flag
+links: (0,2-3)=https://a.bc/
+active: none
+note: Screen row 0 is `  ab`.
+
+### L25_text_printed_after_erase_with_active_link_is_linked
+size: 2x20
+step: feed \x1b]8;;https://a.bc/\x1b\\ab\x1b[2J\x1b[Hc
+cite: [GIST] the link stays active until closed, erasing does not close it
+links: (0,0)=https://a.bc/
+active: https://a.bc/
+
+### L26_wide_character_carries_link_on_both_halves
+size: 2x20
+step: feed \x1b]8;;https://a.bc/\x1b\\\u{4e16}\x1b]8;;\x1b\\x
+cite: 30-links brief ("both halves"); wide_grapheme_spec.txt (WIDE/SPACER pair); a hit test on the spacer must find the link
+links: (0,0-1)=https://a.bc/
+active: none
+
+### L27_cluster_carries_link_combining_appended_after_close_keeps_it
+size: 2x20
+step: feed \x1b]8;;https://a.bc/\x1b\\e\x1b]8;;\x1b\\\u{301}x
+cite: ADR8 (a combining mark joins the previous cell as a cluster); the cell keeps its own attributes, the mark does not change them
+links: (0,0)=https://a.bc/
+active: none
+note: Screen `é` `x`; only the cluster cell is linked.
+
+### L28_link_across_soft_wrap_is_one_entity
+size: 3x4
+step: feed \x1b]8;;https://a.bc/\x1b\\abcdef\x1b]8;;\x1b\\
+cite: [GIST] "a link spans several cells" and an explicit id (or one run) keeps them grouped across line breaks; [VTE] one OSC 8 run = one auto id
+links: (0,0-3)=https://a.bc/ (1,0-1)=https://a.bc/
+same: (0,0)(1,1)
+active: none
+
+### L29_link_continues_across_cursor_motion_and_newline
+size: 3x10
+step: feed \x1b]8;;https://a.bc/\x1b\\a\r\nb\x1b]8;;\x1b\\
+cite: [GIST] attribute semantics: every cell printed while open is linked
+links: (0,0)=https://a.bc/ (1,0)=https://a.bc/
+same: (0,0)(1,0)
+active: none
+
+### L30_non_adjacent_cells_of_one_run_are_one_entity
+size: 3x10
+step: feed \x1b]8;;https://a.bc/\x1b\\a\x1b[2;1Hb\x1b]8;;\x1b\\
+cite: [VTE] "groups cells from a single OSC 8 run" (auto id per OSC 8 open)
+links: (0,0)=https://a.bc/ (1,0)=https://a.bc/
+same: (0,0)(1,0)
+active: none
+
+# ---------------------------------------------------------------------------
+# C. IDENTITY: WHEN TWO CELLS ARE "THE SAME LINK" (hover grouping)
+# ---------------------------------------------------------------------------
+
+### L31_same_id_same_uri_gaps_one_entity
+size: 2x20
+step: feed \x1b]8;id=k;https://a.bc/\x1b\\a\x1b]8;;\x1b\\ \x1b]8;id=k;https://a.bc/\x1b\\b\x1b]8;;\x1b\\
+cite: [GIST] "Cells with the same URI and the same nonempty id are underlined together"
+links: (0,0)=https://a.bc/#k (0,2)=https://a.bc/#k
+same: (0,0)(0,2)
+active: none
+
+### L32_same_id_different_uri_distinct
+size: 2x20
+step: feed \x1b]8;id=k;https://a.bc/A\x1b\\a\x1b]8;id=k;https://a.bc/B\x1b\\b\x1b]8;;\x1b\\
+cite: [GIST] "Cells with different URIs are never grouped"
+links: (0,0)=https://a.bc/A#k (0,1)=https://a.bc/B#k
+distinct: (0,0)(0,1)
+active: none
+
+### L33_no_id_two_runs_same_uri_are_distinct_even_when_adjacent
+size: 2x20
+step: feed \x1b]8;;https://a.bc/\x1b\\a\x1b]8;;\x1b\\\x1b]8;;https://a.bc/\x1b\\b\x1b]8;;\x1b\\
+cite: [VTE] a fresh auto id (":N") per OSC 8 open without an id; [GIST] "Cells without an id are grouped by heuristics that differ between terminals. VTE groups cells from a single OSC 8 run. iTerm2 groups adjacent cells with the same URI."
+links: (0,0)=https://a.bc/ (0,1)=https://a.bc/
+distinct: (0,0)(0,1)
+active: none
+note: DISAGREEMENT iTerm2 vs VTE; recommend VTE (identity = one open). Visible difference only when two runs of the same URI touch. Lead decision D-L4. The id stays SEPARATE from the URI in storage (app-core's `Link.url` is the URI only).
+
+### L34_id_equality_is_exact_bytes
+size: 2x20
+step: feed \x1b]8;id=K;https://a.bc/\x1b\\a\x1b]8;id=k;https://a.bc/\x1b\\b\x1b]8;;\x1b\\
+cite: [GIST] ids are opaque strings; [VTE] strcmp on "id;uri"
+links: (0,0)=https://a.bc/#K (0,1)=https://a.bc/#k
+distinct: (0,0)(0,1)
+active: none
+
+# ---------------------------------------------------------------------------
+# D. RESET, SCREENS, HISTORY, REFLOW
+# ---------------------------------------------------------------------------
+
+### L40_ris_clears_active_link_and_cells
+size: 2x20
+step: feed \x1b]8;;https://a.bc/\x1b\\ab\x1bcx
+cite: [KT] do_screen_reset (hard): active_hyperlink_id = 0 and the grid is blanked; [VTE] reset clears m_defaults.attr.hyperlink_idx; 30-links brief ("link cleared by RIS")
+links: none
+active: none
+
+### L41_decstr_clears_active_link_keeps_cells
+size: 2x20
+step: feed \x1b]8;;https://a.bc/\x1b\\ab\x1b[!pc
+cite: [KT] do_screen_reset is shared by hard and SOFT reset (`is_hard_reset` flag) and clears active_hyperlink_id at L246; xterm: DECSTR resets "SGR / attributes" (ctlseqs has no table, decstr_spec.txt header)
+links: (0,0-1)=https://a.bc/
+active: none
+note: `c` is printed after DECSTR at the cursor (col 2, DECSTR does not home): no link. AMBIGUITY: VTE's DECSTR path was not read; recommend kitty. Lead decision D-L5.
+
+### L42_alt_screen_switch_clears_active_link_cells_keep_theirs
+size: 2x20
+step: feed \x1b]8;;https://a.bc/\x1b\\a\x1b[?1049hx\x1b[?1049l
+cite: [KT] screen_toggle_screen_buffer L1970 sets active_hyperlink_id = 0 on every switch; [VTE] the two screens use different pools and the switch resets the idx to 0 (vteseq.cc L256-265)
+links: (0,0)=https://a.bc/
+active: none
+note: `x` printed on the alt screen has no link; `a` on the main screen keeps its link after returning. Not in the 30-links brief: recommended addition.
+
+### L43_link_cells_scroll_into_history_keeping_their_link
+size: 2x10
+scrollback: 10
+step: feed \x1b]8;;https://a.bc/\x1b\\ab\x1b]8;;\x1b\\\r\nc\r\nd
+cite: ADR8 (per-line side table moves with the line); 30-links brief ("Grid::hyperlink_at(logical_line, col)")
+links: none
+links_scrollback: s0:(0-1)=https://a.bc/
+active: none
+note: `ab` is now history line 0; the screen shows `c`, `d`, neither linked.
+
+### L44_active_link_persists_across_scroll
+size: 2x10
+step: feed \x1b]8;;https://a.bc/\x1b\\a\r\nb\r\nc
+cite: the link is a pen attribute (like SGR), not tied to a row
+links: (0,0)=https://a.bc/ (1,0)=https://a.bc/
+active: https://a.bc/
+note: After the scroll the screen is `b`,`c`, both linked.
+
+### L45_reflow_keeps_links_with_their_cells
+size: 3x4
+step: feed \x1b]8;;https://a.bc/\x1b\\abcd\x1b]8;;\x1b\\
+step: resize 3x2
+cite: 30-links brief (reflow proptest: every linked cell keeps its URI); ADR8 / reflow_spec.txt (side tables follow cells through re-wrap)
+links: (0,0-1)=https://a.bc/ (1,0-1)=https://a.bc/
+active: none
+note: Screen after the resize: `ab` (soft wrap) / `cd`. Reflow back to 4 columns restores one row, still linked.
+
+### L46_mixed_link_and_plain_cells_reflow
+size: 3x4
+step: feed ab\x1b]8;;https://a.bc/\x1b\\cd\x1b]8;;\x1b\\
+step: resize 3x2
+cite: same
+links: (1,0-1)=https://a.bc/
+active: none
+note: Row 0 `ab` plain, row 1 `cd` linked.
+
+# ---------------------------------------------------------------------------
+# DECISIONS (also in selection_spec.notes.md)
+#   D-L1 params without `=`: ignore the param, keep the link (VTE, Ghostty) [WezTerm drops the OSC]
+#   D-L2 empty URI always closes, whatever params it carries (VTE, kitty) [Ghostty ignores, WezTerm stores an empty URI]
+#   D-L3 URI > 2083 bytes closes the active link (VTE); id > 250 bytes is dropped, link kept (VTE)
+#   D-L4 no-id links: identity = one OSC 8 open (VTE) [iTerm2: adjacent same-URI cells group]
+#   D-L5 DECSTR and screen switches clear the ACTIVE link (kitty verified, VTE screen switch verified)
+#   Not covered by a row (unit tests instead): table cap (recommend 65,536 live links; kitty and VTE cap their pools:
+#   VTE_HYPERLINK_COUNT_MAX (1<<20)-2, kitty HYPERLINK_MAX_NUMBER), memory bound under a 1,000,000 rewrite flood.
+# ---------------------------------------------------------------------------

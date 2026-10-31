@@ -20,6 +20,10 @@
 //!   `tessera_session_send_*`, `tessera_session_paste` and
 //!   `tessera_session_set_focus` functions as plain structs (see the
 //!   `input` module); the core decides between key bindings and PTY input.
+//! * Text selection, Copy and command-click links go through the
+//!   `tessera_session_select_*`, `tessera_session_selection_text`,
+//!   `tessera_session_link_at` and `tessera_session_set_hover` functions
+//!   (see the `selection` module), in view-relative cells.
 //! * A session is drawn into a host-owned `CAMetalLayer` through the
 //!   `tessera_surface_*` functions (see the `surface` module): attach,
 //!   resize, render each display refresh, set the font size, detach. The
@@ -36,6 +40,7 @@ mod callbacks;
 mod error;
 mod input;
 mod panic;
+mod selection;
 mod session;
 mod surface;
 
@@ -58,6 +63,12 @@ pub use input::{
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use panic::tessera_test_panic;
+pub use selection::{
+    Granularity, tessera_session_has_selection, tessera_session_link_at,
+    tessera_session_select_adjust, tessera_session_select_all, tessera_session_select_begin,
+    tessera_session_select_clear, tessera_session_select_extend, tessera_session_selection_text,
+    tessera_session_set_hover,
+};
 pub use session::{
     MAX_COLS, MAX_ROWS, ScrollPosition, ScrollTarget, SpawnOptions,
     tessera_session_clear_scrollback, tessera_session_close, tessera_session_resize,

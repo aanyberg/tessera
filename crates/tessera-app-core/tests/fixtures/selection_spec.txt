@@ -1,0 +1,1288 @@
+# =============================================================================
+# tessera-app-core: selection model and text extraction   (issue #30 part 1 of 3, wave 8)
+# crates/tessera-app-core/tests/fixtures/selection_spec.txt
+# spec-researcher output (2026-10-31). ONLY THE MILESTONE LEAD EDITS A FINALISED COPY. The implementer copies it
+# verbatim and never edits a row: a row that looks wrong is REPORTED (row id, expected, actual, why) to the lead.
+#
+# STATUS: FINAL (2026-10-31, lead decisions recorded on #30). Companion files: selection_spec.notes.md (decisions,
+# URL rules, schemes), hyperlink_spec.txt (tessera-term), selection_gestures.txt (Swift).
+#
+# ROW LAYOUT (same `###` layout as osc_spec.txt / wide_grapheme_spec.txt; tests/selection.rs needs its own parser)
+#   ### <ID>
+#   layer:   core            (App-level row; `url` rows are pure-function rows for url.rs and say so)
+#   size:    <rows>x<cols>   screen size; `scrollback: <N>` optional history cap (default 100)
+#   step:    one action per line, run in order:
+#              feed <payload>                bytes into the terminal (escapes below)
+#              begin R,C <char|word|line> [block]   App::select_begin at VIEW-relative (row,col), 0-based
+#              extend R,C                    App::select_extend
+#              all                           App::select_all
+#              adjust R,C                    shift-click: move the endpoint NEARER to R,C (tie: the start), keeping granularity
+#                                            and block-ness; no-op without a selection (NEW core call, see notes D5)
+#              clear                         App::select_clear
+#              link R,C                      App::link_at (checked by `link:`)
+#              scroll N                      view scrolled N lines back into history (0 = live)
+#              resize <rows>x<cols>
+#              clear_scrollback              App::clear_scrollback
+#   sel:     none | linear (R,C)-(R,C) | block (R,C)-(R,C)    the selection as the frame carries it AFTER the last
+#            step: view-relative rows, both ends INCLUSIVE, normalised to reading order (linear) or to
+#            top-left/bottom-right (block). Cells are reported AS CLICKED: a point on a wide character's SPACER or WIDE
+#            half is NOT widened in `sel:`; extraction and the renderer widen it (REND). Rows outside the view are
+#            clipped (`sel:` then lists the clipped part); a selection wholly outside the view is `sel: none` with
+#            `has_selection: true`. Line granularity covers the full width of every row of the logical line.
+#            `has_selection:` true|false is asserted on every row (derived from sel when omitted).
+#   link:    after a `link` step: none | <url> then the span as `(R,C)-(R,C)` per row, inclusive, view-relative
+#   text:    the App::selection_text value: `none` (no selection) or a quoted string with \n \t \\ \" \xNN \u{H} escapes
+#   cite:    the source for every expected value; `note:` is documentation.
+# PAYLOAD ESCAPES in `feed`: \xNN raw byte, \r \n \t \\, \u{H..} one scalar UTF-8 encoded.
+# A `|` is NOT used for the cursor here (selection rows do not assert the screen); the feed is described in `note:`.
+#
+# COORDINATES: every point is (row, col), 0-based, view-relative. The core converts to absolute logical-line
+# coordinates (30-core brief D-COORD). `cols` below always means the grid width of the row's `size:`.
+#
+# SOURCE TAGS (fetched 2026-10-31; "X does Y" means "X's source says Y": nothing was executed)
+#   IT-doc   https://iterm2.com/documentation-preferences-general.html  (Selection section)
+#   IT-sel   https://github.com/gnachman/iTerm2  sources/Selection/iTermSelection.m  (moveSelectionEndpointTo L571,
+#            moveSelectionEndpointToAbsRange L614, scrollbackOverflowDidChange)
+#   IT-word  sources/ContentAnalysis/iTermWordExtractor.m  (windowedRangeForLocation L100: class Other selects ONE
+#            character; classForCharacter L560-600: Whitespace / Word / Other / Null / DoubleWidthPlaceholder)
+#   IT-ext   sources/ContentAnalysis/iTermTextExtractor.m (wordSeparatorCharacterSet L52)
+#   IT-pref  sources/Settings/iTermPreferences.m L748-752, L918-919 (defaults: WordCharacters "/-+\~_.",
+#            CopySelection YES, TripleClickSelectsFullWrappedLines YES, DoubleClickPerformsSmartSelection NO)
+#   IT-mouse sources/TerminalView/PTYMouseHandler.m (mouseDownImpl L356-430: click counts, modifiers; mouseUp L500-690)
+#   IT-resize / IT-sel-clear   sources/VT100Screen/VT100ScreenMutableState+Resizing.m L121, +TerminalDelegate.m L1572/L1975
+#   KT       kitty (kitty/line.c line_url_end_at, get_url_sentinel; kitty/unicode-data.h can_strip_from_end_of_url)
+#   AL       alacritty_terminal/src/term/mod.rs  bounds_to_string L558, line_to_string L572
+#   REND     crates/tessera-render/src/frame.rs  Selection (start/end inclusive, either order; a point on a SPACER
+#            takes the whole character, an end on the WIDE half does too)
+#   ADR23    docs/adr/0023-scrollback-viewport-and-scroll-anchoring.md
+#   BRIEF    wave8-briefs/30-core.md (decisions D-COORD, D-CLEAR)
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# A. LINEAR SELECTION BY DRAG (character granularity)
+# ---------------------------------------------------------------------------
+
+### A01_linear_forward_one_row
+layer: core
+size: 3x20
+step: feed hello world
+step: begin 0,0 char
+step: extend 0,4
+sel: linear (0,0)-(0,4)
+has_selection: true
+text: "hello"
+cite: [REND] Selection ends are inclusive; [IT-sel] moveSelectionEndpointTo sets _absRange.coordRange.end = coord in Character mode
+note: Cells are selected whole (decision D1 in notes: whole-cell semantics, no half-cell snapping in 0.1.0).
+
+### A02_linear_backward_same_text
+layer: core
+size: 3x20
+step: feed hello world
+step: begin 0,4 char
+step: extend 0,0
+sel: linear (0,0)-(0,4)
+has_selection: true
+text: "hello"
+cite: [REND] start/end may come in either order; [IT-sel] moveSelectionEndpointToAbsRange keeps a "flipped" live range and normalises on read
+note: The core normalises to reading order in the frame; the anchor stays at (0,4) internally (see E rows for the anchor).
+
+### A03_click_without_drag_selects_nothing
+layer: core
+size: 3x20
+step: feed hello world
+step: begin 0,3 char
+sel: none
+has_selection: false
+text: none
+cite: iTerm2 behaviour: a plain click clears the selection and creates none (zero-length live range is not a selection) [IT-sel hasSelection: needs a live range or subselections]
+note: begin alone must not create a visible selection; the app calls extend on the first mouseDragged. A drag that returns to the anchor cell selects that ONE cell (A04), because whole-cell semantics make start==end a one-cell range once extend was called.
+
+### A04_drag_inside_anchor_cell_selects_one_cell
+layer: core
+size: 3x20
+step: feed hello world
+step: begin 0,3 char
+step: extend 0,3
+sel: linear (0,3)-(0,3)
+has_selection: true
+text: "l"
+cite: whole-cell semantics (D1); [REND] inclusive ends
+note: AMBIGUITY: iTerm2 snaps to half-cells (drag starting in the right half of a cell begins at the next cell), so a tiny drag inside one cell selects nothing there. Recommend whole-cell for 0.1.0; the Swift side only calls extend when the pointer moved to a different cell OR left the anchor cell (gesture row G05).
+
+### A05_linear_across_rows_hard_newlines
+layer: core
+size: 3x10
+step: feed abc\r\ndef\r\nghi
+step: begin 0,1 char
+step: extend 2,1
+sel: linear (0,1)-(2,1)
+has_selection: true
+text: "bc\ndef\ngh"
+cite: [IT-doc] "a terminal newline will be copied ... when the selection includes one" (hard line ends give \n between rows); interior newline is always kept
+note: Rows are separated by \n because each row ends a logical line. No trailing \n after "gh" (selection ends inside the last row).
+
+### A06_linear_across_soft_wrap_joins_without_newline
+layer: core
+size: 3x5
+step: feed 0123456789ab
+step: begin 0,3 char
+step: extend 1,2
+sel: linear (0,3)-(1,2)
+has_selection: true
+text: "34567"
+cite: [IT-doc] TripleClickSelectsFullWrappedLines treats wrapped rows as one logical line; every reference (iTerm2, kitty, WezTerm, Alacritty, xterm) joins soft-wrapped rows with no newline when copying
+note: Feed wraps at col 5 (DECAWM on): row0 "01234" wrapped, row1 "56789" wrapped, row2 "ab". The selection (0,3)-(1,2) is "34" + "567" with NO newline at the wrap.
+
+### A07_trailing_blanks_trimmed_each_line
+layer: core
+size: 3x10
+step: feed ab\r\ncd
+step: begin 0,0 char
+step: extend 1,9
+sel: linear (0,0)-(1,9)
+has_selection: true
+text: "ab\ncd"
+cite: iTerm2 / kitty / WezTerm / Terminal.app all drop never-written trailing cells on copy; xterm copies up to the last written cell of each line [see notes: trailing-blank trimming]
+note: Selection covers cells (0,2..9) and (1,2..9), which are blank; they are trimmed from each LINE (the end of a hard line), not mid-line. Decision D2: trim trailing blanks (space cells AND default-attribute empty cells) on every line end that is not a soft wrap.
+
+### A08_blank_run_inside_line_is_kept
+layer: core
+size: 2x12
+step: feed a   b
+step: begin 0,0 char
+step: extend 0,11
+sel: linear (0,0)-(0,11)
+has_selection: true
+text: "a   b"
+cite: D2: only TRAILING blanks of a hard line are trimmed; interior spaces survive
+note: Tessera's Cell has no NUL state (Cell::BLANK is ' ', crates/tessera-grid/src/cell.rs), so a written trailing space and a never-written cell are the same. iTerm2 and kitty (strip_trailing_spaces=never) DO keep written trailing spaces; Tessera cannot, so it trims them. Documented deviation, see notes D2.
+
+# ---------------------------------------------------------------------------
+# B. WIDE CELLS, CLUSTERS, PAD CELLS  (cells below: `a` col0, 世 cols1-2, `b` col3)
+# ---------------------------------------------------------------------------
+
+### B01_start_on_spacer_takes_whole_character
+layer: core
+size: 2x10
+step: feed a\u{4e16}b
+step: begin 0,2 char
+step: extend 0,3
+sel: linear (0,2)-(0,3)
+has_selection: true
+text: "\u{4e16}b"
+cite: [REND] "a point on the SPACER half of a wide character takes the whole character"; [AL] alacritty_terminal term/mod.rs line_to_string: "Include wide char when trailing spacer is selected" (cols.start -= 1)
+note: A spacer is never a character of its own: the selection starts at the wide half. Text has no space for the spacer.
+
+### B02_click_wide_half_extend_same_cell_selects_whole_character
+layer: core
+size: 2x10
+step: feed a\u{4e16}b
+step: begin 0,1 char
+step: extend 0,1
+sel: linear (0,1)-(0,1)
+has_selection: true
+text: "\u{4e16}"
+cite: [REND] "an end on its WIDE half" takes the whole character
+note: A one-cell selection on the wide half covers both cells.
+
+### B03_end_on_spacer_includes_character
+layer: core
+size: 2x10
+step: feed a\u{4e16}b
+step: begin 0,0 char
+step: extend 0,2
+sel: linear (0,0)-(0,2)
+has_selection: true
+text: "a\u{4e16}"
+cite: [REND]; [IT-word] windowedRangeForLocation: DoubleWidthPlaceholder retries at the predecessor
+
+### B04_end_on_wide_half_includes_spacer
+layer: core
+size: 2x10
+step: feed a\u{4e16}b
+step: begin 0,0 char
+step: extend 0,1
+sel: linear (0,0)-(0,1)
+has_selection: true
+text: "a\u{4e16}"
+cite: [REND] "and so does an end on its WIDE half"
+
+### B05_combining_cluster_gives_whole_text
+layer: core
+size: 2x10
+step: feed e\u{301}x
+step: begin 0,0 char
+step: extend 0,0
+sel: linear (0,0)-(0,0)
+has_selection: true
+text: "e\u{301}"
+cite: ADR 0008 (grapheme table: Cell.ch is the cluster base, the rest lives in Line::graphemes); [AL] line_to_string pushes the cell char then its zerowidth chars
+note: The extraction must read the cluster from the line's grapheme table, not just Cell::ch.
+
+### B06_zwj_emoji_cluster_wide
+layer: core
+size: 2x10
+step: feed \u{1F468}\u{200D}\u{1F469}x
+step: begin 0,1 char
+step: extend 0,1
+sel: linear (0,1)-(0,1)
+has_selection: true
+text: "\u{1F468}\u{200D}\u{1F469}"
+cite: UAX29 GB11 (one cluster), unicode-width rule 1 (width 2) as in wide_grapheme_spec.txt; [REND] spacer takes the whole character
+note: Cells: cluster at col 0 (WIDE|CLUSTER), spacer col 1, `x` col 2. Clicking the spacer selects the cluster.
+
+### B07_wide_wrap_pad_cell_is_not_text
+layer: core
+size: 3x5
+step: feed abcd\u{4e16}
+step: begin 0,0 char
+step: extend 1,1
+sel: linear (0,0)-(1,1)
+has_selection: true
+text: "abcd\u{4e16}"
+cite: crates/tessera-grid/src/cell.rs CellFlags::PAD ("padding left in the last column when a wide character wrapped"); wide_grapheme_spec.txt C01; [AL] line_to_string skips LEADING_WIDE_CHAR_SPACER
+note: Row 0 is `abcd` + PAD cell (col 4, soft wrap); row 1 is 世 (cols 0-1). The PAD cell contributes no space.
+
+### B08_cjk_double_click_selects_alnum_run_not_segmented
+layer: core
+size: 2x10
+step: feed \u{4e16}\u{754c} x
+step: begin 0,2 word
+sel: linear (0,0)-(0,3)
+has_selection: true
+text: "\u{4e16}\u{754c}"
+cite: [IT-ext] wordSeparatorCharacterSet: alphanumericCharacterSet (CJK ideographs are letters) so the pair is one run; [KT] kitty select_by_word_characters adds to "Unicode alphanumerics"
+note: AMBIGUITY: iTerm2 additionally runs a language-specific tokenizer (iTermWordExtractor languageSpecificWindowedRange, NLTokenizer) that can split CJK runs into dictionary words. Recommend NO segmentation in 0.1.0: the maximal alphanumeric run is the word.
+
+# ---------------------------------------------------------------------------
+# C. WORD AND LINE GRANULARITY   WORD_CHARS = Unicode alphanumerics + the set  / - + \ ~ _ .
+# ---------------------------------------------------------------------------
+
+### C01_double_click_word
+layer: core
+size: 2x20
+step: feed foo bar
+step: begin 0,1 word
+sel: linear (0,0)-(0,2)
+has_selection: true
+text: "foo"
+cite: [IT-word] class Word run; [IT-doc] "Double-click performs smart selection" is OFF by default so plain word selection applies [IT-pref L919]
+
+### C02_double_click_whitespace_selects_the_run
+layer: core
+size: 2x20
+step: feed foo  bar
+step: begin 0,3 word
+sel: linear (0,3)-(0,4)
+has_selection: true
+text: "  "
+cite: [IT-word] classForCharacter: whitespace is its own class, the forward/backward search takes the whole run of that class
+note: A whitespace-only selection keeps its spaces (they are not trailing: text follows).
+
+### C03_double_click_path_uses_word_chars
+layer: core
+size: 2x30
+step: feed cd /usr/local/bin-x_y.txt ok
+step: begin 0,9 word
+sel: linear (0,3)-(0,24)
+has_selection: true
+text: "/usr/local/bin-x_y.txt"
+cite: [IT-pref L751] default WordCharacters "/-+\~_."; [IT-doc] "Adding / makes double-clicking a path select the whole path"
+note: cols: `cd `=0-2, path=3-24, space=25. All of / - _ . are word characters.
+
+### C04_double_click_other_punctuation_selects_one_character
+layer: core
+size: 2x20
+step: feed a,b
+step: begin 0,1 word
+sel: linear (0,1)-(0,1)
+has_selection: true
+text: ","
+cite: [IT-word] windowedRangeForLocation L120: "Character class is other, select one character."
+note: AMBIGUITY: xterm / kitty / Alacritty select the run of non-word characters or nothing special; iTerm2 selects exactly one. Follow iTerm2 (the reference for gestures).
+
+### C05_word_stops_at_equals_colon_at
+layer: core
+size: 2x30
+step: feed key=value user@host a:b
+step: begin 0,1 word
+sel: linear (0,0)-(0,2)
+has_selection: true
+text: "key"
+cite: [IT-pref] `= @ :` are not in "/-+\~_." so they end a word
+note: DIFFERENCE: kitty's default select_by_word_characters is `@-./_~?&=%+#` (includes = @ ? & % #), Alacritty and WezTerm use boundary sets. iTerm2's set is the confirmed default; users edit it via #47.
+
+### C06_precomposed_letters_are_word_chars
+layer: core
+size: 2x20
+step: feed h\u{e9}llo w
+step: begin 0,2 word
+sel: linear (0,0)-(0,4)
+has_selection: true
+text: "h\u{e9}llo"
+cite: [IT-ext] alphanumericCharacterSet; Unicode alphanumerics = Alphabetic + Nd/Nl/No (char::is_alphanumeric in Rust)
+
+### C07_word_continues_across_soft_wrap
+layer: core
+size: 3x5
+step: feed abcdefgh
+step: begin 1,1 word
+sel: linear (0,0)-(1,2)
+has_selection: true
+text: "abcdefgh"
+cite: [IT-word] searchForwards/searchReverse eolBlock shouldStopEnumeratingWithCode(ignoringNewlines:NO) stops only at a hard line end; wrapped rows continue
+
+### C08_word_stops_at_hard_line_end
+layer: core
+size: 3x5
+step: feed abc\r\ndef
+step: begin 1,0 word
+sel: linear (1,0)-(1,2)
+has_selection: true
+text: "def"
+cite: [IT-word] same eolBlock: a hard end stops the search
+
+### C09_double_click_on_blank_area_right_of_text_selects_nothing
+layer: core
+size: 2x10
+step: feed ab
+step: begin 0,6 word
+sel: none
+has_selection: false
+text: none
+cite: [IT-word] classForCharacter returns kTextExtractorClassNull for an empty cell
+note: AMBIGUITY (D4): iTerm2's Null class path is not conclusive from the source read. Recommend: a double-click past the end of the line's text selects nothing (and clears any selection), the simplest behaviour that never produces a selection with empty text.
+
+### C10_triple_click_selects_whole_wrapped_logical_line
+layer: core
+size: 4x5
+step: feed abcdefgh\r\nxyz
+step: begin 1,2 line
+sel: linear (0,0)-(1,4)
+has_selection: true
+text: "abcdefgh"
+cite: [IT-doc] "a triple click selects a whole line, even if it was longer than one row" (TripleClickSelectsFullWrappedLines default YES [IT-pref L918]); [IT-mouse] PTYMouseHandler.m L414-420 kiTermSelectionModeWholeLine
+note: Line granularity covers the full width of each row of the logical line; no trailing newline in the text (iTerm2 CopyLastNewline default NO [IT-pref L749]).
+
+### C11_triple_click_hard_line
+layer: core
+size: 4x5
+step: feed abcdefgh\r\nxyz
+step: begin 2,0 line
+sel: linear (2,0)-(2,4)
+has_selection: true
+text: "xyz"
+cite: [IT-mouse] L414-420
+
+### C12_triple_click_then_drag_extends_by_whole_lines
+layer: core
+size: 4x5
+step: feed abcdefgh\r\nxyz
+step: begin 0,1 line
+step: extend 2,0
+sel: linear (0,0)-(2,4)
+has_selection: true
+text: "abcdefgh\nxyz"
+cite: [IT-sel] moveSelectionEndpointToAbsRange in Line/WholeLine mode moves the endpoint to the clicked line's range
+
+### C13_double_click_drag_extends_by_whole_words
+layer: core
+size: 2x20
+step: feed foo bar baz
+step: begin 0,1 word
+step: extend 0,5
+sel: linear (0,0)-(0,6)
+has_selection: true
+text: "foo bar"
+cite: [IT-sel] moveSelectionEndpointToAbsRange (word mode: endpoint = end of the word under the pointer)
+
+### C14_double_click_drag_backwards_keeps_initial_word
+layer: core
+size: 2x20
+step: feed foo bar baz
+step: begin 0,5 word
+step: extend 0,1
+sel: linear (0,0)-(0,6)
+has_selection: true
+text: "foo bar"
+cite: [IT-sel] moveSelectionEndpointToAbsRange: "range is flipped ... newRange.start = _initialAbsRange" keeps the word first double-clicked whole when dragging back over earlier words
+note: The anchor is the whole initial word `bar` (cols 4-6), not a character.
+
+# ---------------------------------------------------------------------------
+# D. BLOCK (RECTANGULAR) SELECTION
+# ---------------------------------------------------------------------------
+
+### D01_block_text_one_line_per_row_trimmed
+layer: core
+size: 4x10
+step: feed abcdef\r\nghijkl\r\nmn\r\nopqrst
+step: begin 0,1 char block
+step: extend 2,3
+sel: block (0,1)-(2,3)
+has_selection: true
+text: "bcd\nhij\nn"
+cite: [IT-sel] kiTermSelectionModeBox; [AL] alacritty selection Block; every reference joins block rows with \n and trims trailing blanks of each row (kitty strip_trailing_spaces `smart` skips rectangles, `never` is its default; Tessera trims, D2)
+note: Row 2 is `mn`: col 1 = `n`, cols 2-3 blank and trimmed.
+
+### D02_block_corners_any_direction
+layer: core
+size: 4x10
+step: feed abcdef\r\nghijkl\r\nmn\r\nopqrst
+step: begin 2,3 char block
+step: extend 0,1
+sel: block (0,1)-(2,3)
+has_selection: true
+text: "bcd\nhij\nn"
+cite: rectangle normalised to top-left/bottom-right; same text as D01
+
+### D03_block_ignores_soft_wrap_each_screen_row_is_a_line
+layer: core
+size: 3x5
+step: feed abcdefgh
+step: begin 0,1 char block
+step: extend 1,2
+sel: block (0,1)-(1,2)
+has_selection: true
+text: "bc\ngh"
+cite: [IT-sel] box mode selects a rectangle of cells; extraction is per screen row (no wrap joining); [KT] rectangle selection copies screen rows
+note: Row 0 `abcde` (wrapped) cols 1-2 = `bc`; row 1 `fgh` cols 1-2 = `gh`. A soft wrap is NOT joined inside a block.
+
+### D04_block_edge_cutting_wide_char_widens_that_row
+layer: core
+size: 3x10
+step: feed a\u{4e16}b\r\nxyzw
+step: begin 0,2 char block
+step: extend 1,3
+sel: block (0,2)-(1,3)
+has_selection: true
+text: "\u{4e16}b\nzw"
+cite: [REND] SPACER point takes the whole character; [AL] line_to_string cols.start -= 1 on a spacer
+note: Column 2 is the spacer of 世. Row 0 widens left to include the whole character; row 1 (no wide char) is just cols 2-3. The rectangle as reported stays (0,2)-(1,3); the widening is per row at extraction/render.
+
+### D05_block_over_all_blank_rows_gives_empty_lines_trimmed_at_end
+layer: core
+size: 3x10
+step: feed abc
+step: begin 0,5 char block
+step: extend 2,7
+sel: block (0,5)-(2,7)
+has_selection: true
+text: ""
+cite: D2 plus rule H03 (trailing blank lines of the whole selection are dropped)
+note: A block over only blank cells is a real selection (Copy is enabled) with empty text; the app must not replace the pasteboard with an empty string (gesture row P03).
+
+# ---------------------------------------------------------------------------
+# E. SHIFT-CLICK EXTEND (`adjust`): iTerm2 moves the endpoint NEARER the click, keeps granularity
+# ---------------------------------------------------------------------------
+
+### E01_adjust_beyond_end_moves_end
+layer: core
+size: 2x20
+step: feed hello world foo
+step: begin 0,0 char
+step: extend 0,4
+step: adjust 0,10
+sel: linear (0,0)-(0,10)
+has_selection: true
+text: "hello world"
+cite: [IT-sel] beginExtendingSelectionAt "The click point is outside the live range": click after determinant.end moves the end
+
+### E02_adjust_before_start_moves_start
+layer: core
+size: 2x20
+step: feed hello world foo
+step: begin 0,6 char
+step: extend 0,10
+step: adjust 0,2
+sel: linear (0,2)-(0,10)
+has_selection: true
+text: "llo world"
+cite: [IT-sel] beginExtendingSelectionAt: click before determinant.start flips and moves the start; the old end stays
+note: DIFFERENCE from the 30-core brief draft ("shift-click extend keeps the anchor"): after a forward drag the anchor is the START (col 6); keeping it and flipping would give (0,2)-(0,6). iTerm2 moves the nearer endpoint and the far one stays fixed, which here is the END (col 10). Recommend iTerm2 (also xterm extend-end and Terminal.app).
+
+### E03_adjust_inside_range_moves_nearer_endpoint
+layer: core
+size: 2x20
+step: feed hello world foo
+step: begin 0,0 char
+step: extend 0,10
+step: adjust 0,8
+sel: linear (0,0)-(0,8)
+has_selection: true
+text: "hello wor"
+cite: [IT-sel] beginExtendingSelectionAt "The click point is inside old live range": distanceToEnd < distanceToStart moves the end
+
+### E04_adjust_tie_moves_start
+layer: core
+size: 2x20
+step: feed hello world foo
+step: begin 0,0 char
+step: extend 0,10
+step: adjust 0,5
+sel: linear (0,5)-(0,10)
+has_selection: true
+text: " world"
+cite: [IT-sel] `if (distanceToEnd < distanceToStart) move end else move start`: a tie moves the start
+note: Distances are measured in cells along the logical line (VT100GridAbsCoordDistance), not in rows.
+
+### E05_adjust_without_selection_does_nothing
+layer: core
+size: 2x20
+step: feed hello world
+step: adjust 0,4
+sel: none
+has_selection: false
+text: none
+cite: [IT-mouse] L360 `isExtension = [selection hasSelection] && shiftPressed`; without a selection a shift-click is an ordinary click (which selects nothing)
+
+### E06_adjust_keeps_word_granularity
+layer: core
+size: 2x20
+step: feed hello world foo
+step: begin 0,0 word
+step: adjust 0,8
+sel: linear (0,0)-(0,10)
+has_selection: true
+text: "hello world"
+cite: [IT-sel] beginExtendingSelectionAt: `_selectionMode = sub.selectionMode` and the clicked point is rounded with absRangeForCurrentModeAtAbsCoord (the word `world` 6-10)
+
+### E07_adjust_keeps_line_granularity
+layer: core
+size: 4x10
+step: feed one\r\ntwo\r\nthree
+step: begin 0,1 line
+step: adjust 2,0
+sel: linear (0,0)-(2,9)
+has_selection: true
+text: "one\ntwo\nthree"
+cite: [IT-sel] same; the clicked point is rounded to its logical line
+
+### E08_adjust_keeps_block
+layer: core
+size: 4x10
+step: feed abcdef\r\nghijkl\r\nmnopqr
+step: begin 0,1 char block
+step: extend 1,3
+step: adjust 2,5
+sel: block (0,1)-(2,5)
+has_selection: true
+text: "bcdef\nhijkl\nnopqr"
+cite: [IT-sel] mode is kept (Box); the endpoint nearer the click (the end) moves
+note: Block-mode endpoint choice by linear distance is not exercised in iTerm2's source for box mode beyond `_absRange.coordRange.end = coord`; this row asserts only the unambiguous case (click beyond both corners).
+
+# ---------------------------------------------------------------------------
+# F. SELECT ALL
+# ---------------------------------------------------------------------------
+
+### F01_select_all_includes_scrollback
+layer: core
+size: 2x5
+step: feed a\r\nb\r\nc\r\nd
+step: all
+sel: linear (0,0)-(1,4)
+has_selection: true
+text: "a\nb\nc\nd"
+cite: [IT-doc] Edit > Select All; every reference selects scrollback + screen on the primary screen
+note: Screen shows `c`,`d`; `a`,`b` are history. `sel:` is the part inside the live view.
+
+### F02_select_all_at_scrolled_view_clips_to_view
+layer: core
+size: 2x5
+step: feed a\r\nb\r\nc\r\nd
+step: all
+step: scroll 2
+sel: linear (0,0)-(1,4)
+has_selection: true
+text: "a\nb\nc\nd"
+cite: ADR23 (the view shows the lines at the offset); selection is anchored in logical lines (D-COORD) so scrolling does not change it
+
+### F03_select_all_drops_trailing_blank_lines
+layer: core
+size: 4x5
+step: feed a\r\nb
+step: all
+has_selection: true
+text: "a\nb"
+cite: rule H03; iTerm2 and kitty copy no trailing blank lines (Select All over a mostly empty screen pastes the text only)
+note: Without H03 the text would be "a\nb\n\n". sel not asserted (covers all rows).
+
+### F04_select_all_on_alt_screen_is_the_alt_screen_only
+layer: core
+size: 2x5
+step: feed a\r\nb\r\nc\x1b[?1049h\x1b[Hxy
+step: all
+has_selection: true
+text: "xy"
+cite: ADR23 ("the alternate screen has no scrollback"); the main screen is stashed
+
+### F05_select_all_empty_terminal
+layer: core
+size: 2x5
+step: all
+has_selection: true
+text: ""
+cite: D4-style decision: Select All always selects; nothing to copy
+note: AMBIGUITY: recommended `has_selection: true` with empty text (Select All is always enabled, Copy then writes nothing: gesture row P03).
+
+# ---------------------------------------------------------------------------
+# G. ANCHORING AND CLEAR RULES (30-core brief D-COORD, D-CLEAR; iTerm2 differences in notes D6)
+# ---------------------------------------------------------------------------
+
+### G01_output_scrolls_selected_line_into_history_selection_survives
+layer: core
+size: 2x5
+scrollback: 10
+step: feed one\r\ntwo
+step: begin 0,0 char
+step: extend 0,2
+step: feed \r\nthree
+has_selection: true
+sel: none
+text: "one"
+cite: ADR23 (lines entering history are tracked by Grid::scrollback_pushed; absolute logical lines do not move); [IT-sel] scrollbackOverflowDidChange keeps the range while its lines remain
+note: `one` is now history line 0; the live view shows `two`/`three` so the clipped `sel:` is none.
+
+### G02_scrolling_back_shows_the_selection
+layer: core
+size: 2x5
+scrollback: 10
+step: feed one\r\ntwo
+step: begin 0,0 char
+step: extend 0,2
+step: feed \r\nthree
+step: scroll 1
+sel: linear (0,0)-(0,2)
+has_selection: true
+text: "one"
+cite: ADR23 anchoring + D-COORD
+
+### G03_change_of_selected_live_row_clears
+layer: core
+size: 3x10
+step: feed hello
+step: begin 0,0 char
+step: extend 0,4
+step: feed \rX
+sel: none
+has_selection: false
+text: none
+cite: 30-core brief D-CLEAR ("cleared on change of a selected live row")
+note: DIFFERENCE from iTerm2: its source removes the selection on SD, clear screen and width change (VT100ScreenMutableState+TerminalDelegate.m L1572 terminalScrollDown, L1975 terminalClearScreen, +Resizing.m L121) and was not seen clearing on ordinary overwrites. Keeping a selection whose text silently changed makes Copy return text the user never saw, so the draft rule is kept; lead decision D6.
+
+### G04_output_on_other_rows_keeps_selection
+layer: core
+size: 4x10
+step: feed hello\r\nabc
+step: begin 0,0 char
+step: extend 0,4
+step: feed \r\nz
+sel: linear (0,0)-(0,4)
+has_selection: true
+text: "hello"
+cite: D-CLEAR ("only *selected* rows changing clears it")
+
+### G05_rewriting_identical_text_keeps_selection
+layer: core
+size: 3x10
+step: feed hello
+step: begin 0,0 char
+step: extend 0,4
+step: feed \rh
+sel: linear (0,0)-(0,4)
+has_selection: true
+text: "hello"
+cite: D-CLEAR compares CONTENT ("changes content"), not damage
+note: AMBIGUITY (D6b): a full-screen program that repaints the same text every frame (htop, watch) would clear a damage-based rule on each repaint; content comparison avoids that. Cost: compare the selected live rows against a snapshot at each frame (only while a selection exists).
+
+### G06_cursor_motion_alone_keeps_selection
+layer: core
+size: 3x10
+step: feed hello
+step: begin 0,0 char
+step: extend 0,4
+step: feed \x1b[H\x1b[2;3H
+sel: linear (0,0)-(0,4)
+has_selection: true
+text: "hello"
+cite: D-CLEAR (cursor is not row content)
+
+### G07_history_eviction_of_a_selected_line_clears
+layer: core
+size: 2x5
+scrollback: 2
+step: feed l1\r\nl2\r\nl3\r\nl4
+step: scroll 2
+step: begin 0,0 char
+step: extend 0,1
+step: feed \r\nl5
+sel: none
+has_selection: false
+text: none
+cite: D-CLEAR ("the history evicts any selected line"); ADR23 (cap eviction)
+note: History [l1,l2]; the selection is on l1; `l5` pushes l3 and evicts l1.
+
+### G08_resize_clears
+layer: core
+size: 3x10
+step: feed hello
+step: begin 0,0 char
+step: extend 0,4
+step: resize 3x8
+sel: none
+has_selection: false
+text: none
+cite: D-CLEAR ("the grid resizes"); [IT-resize] iTerm2 +Resizing.m L121 removes the selection when the screen width is set destructively
+
+### G09_alt_screen_switch_clears_both_ways
+layer: core
+size: 3x10
+step: feed hello
+step: begin 0,0 char
+step: extend 0,4
+step: feed \x1b[?1049h
+sel: none
+has_selection: false
+text: none
+cite: D-CLEAR ("the screen switches to/from the alternate screen")
+note: The other direction is G09b.
+
+### G09b_leaving_alt_screen_clears_selection_made_on_it
+layer: core
+size: 3x10
+step: feed \x1b[?1049hhello
+step: begin 0,0 char
+step: extend 0,4
+step: feed \x1b[?1049l
+sel: none
+has_selection: false
+text: none
+cite: D-CLEAR
+
+### G10_clear_scrollback_clears
+layer: core
+size: 2x5
+scrollback: 10
+step: feed a\r\nb\r\nc
+step: begin 0,0 char
+step: extend 0,0
+step: clear_scrollback
+sel: none
+has_selection: false
+text: none
+cite: D-CLEAR ("clear_scrollback runs"); ADR23 (clear_scrollback and ED 3 empty the history)
+note: Also true when the selection was on screen rows only.
+
+### G11_ris_clears
+layer: core
+size: 3x10
+step: feed hello
+step: begin 0,0 char
+step: extend 0,4
+step: feed \x1bc
+sel: none
+has_selection: false
+text: none
+cite: D-CLEAR (RIS blanks the selected row, so its content changed); ADR23 (RIS empties history)
+
+### G12_scroll_down_over_selected_rows_clears
+layer: core
+size: 3x10
+step: feed a\r\nb\r\nc
+step: begin 0,0 char
+step: extend 1,0
+step: feed \x1b[1T
+sel: none
+has_selection: false
+text: none
+cite: [IT-sel-clear] iTerm2 terminalScrollDown calls screenRemoveSelection; here the rows' content changes so D-CLEAR applies the same way
+note: SD (`CSI T`) moves row content down: selected rows 0-1 now hold different text.
+
+### G13_output_while_scrolled_back_keeps_selection_in_view
+layer: core
+size: 2x5
+scrollback: 10
+step: feed one\r\ntwo\r\nthree
+step: scroll 1
+step: begin 0,0 char
+step: extend 0,2
+step: feed \r\nfour
+sel: linear (0,0)-(0,2)
+has_selection: true
+text: "one"
+cite: ADR23 (output while scrolled back keeps the viewed text still: the offset grows with the pushes)
+note: View at scroll 1 shows `one`/`two`; after `four` the offset becomes 2 and the view still shows the same lines.
+
+# ---------------------------------------------------------------------------
+# H. TEXT EXTRACTION DETAILS
+# ---------------------------------------------------------------------------
+
+### H01_tab_gives_spaces_not_a_tab
+layer: core
+size: 2x20
+step: feed a\tb
+step: begin 0,0 char
+step: extend 0,8
+sel: linear (0,0)-(0,8)
+has_selection: true
+text: "a       b"
+cite: crates/tessera-grid keeps tab expansion as cursor motion only (cells are spaces); [AL] line_to_string reconstructs a TAB when the cell was a tab (tab_mode); iTerm2 stores TAB_FILLER and copies "\t"
+note: DEVIATION (D7): iTerm2 and Alacritty copy a real tab, Tessera cannot know one was typed (cursor motion writes no cells). 7 spaces between a and b.
+
+### H02_blank_lines_inside_selection_are_kept
+layer: core
+size: 4x10
+step: feed a\r\n\r\nb
+step: begin 0,0 char
+step: extend 2,0
+sel: linear (0,0)-(2,0)
+has_selection: true
+text: "a\n\nb"
+cite: [AL] bounds_to_string appends \n per row; interior empty rows stay
+
+### H03_trailing_blank_lines_of_selection_are_dropped
+layer: core
+size: 4x10
+step: feed a
+step: begin 0,0 char
+step: extend 3,9
+sel: linear (0,0)-(3,9)
+has_selection: true
+text: "a"
+cite: [AL] bounds_to_string: `res.strip_suffix('\n')` removes ONE trailing newline; iTerm2 CopyLastNewline default NO drops the last terminal newline [IT-doc]. Tessera drops ALL trailing newlines produced by blank rows (stricter, D8) so Select All of a mostly empty screen pastes only text.
+
+### H04_styled_blank_cells_trim_too
+layer: core
+size: 2x10
+step: feed \x1b[41mab\x1b[K\x1b[0m
+step: begin 0,0 char
+step: extend 0,9
+sel: linear (0,0)-(0,9)
+has_selection: true
+text: "ab"
+cite: [IT-ext] erased cells with a background are null characters + attributes; trailing nulls are not copied
+
+### H05_soft_wrapped_row_end_blanks_are_kept
+layer: core
+size: 3x5
+step: feed ab   cd
+step: all
+has_selection: true
+text: "ab   cd"
+cite: [AL] line_to_string: the trailing-blank trim does not apply when the last cell has WRAPLINE; blanks at a soft wrap are interior to the logical line
+note: Row 0 = `ab` + 3 spaces (soft wrap), row 1 = `cd`.
+
+### H06_selection_ending_at_last_column_has_no_newline
+layer: core
+size: 3x5
+step: feed hello\r\nworld
+step: begin 0,0 char
+step: extend 0,4
+sel: linear (0,0)-(0,4)
+has_selection: true
+text: "hello"
+cite: [IT-doc] CopyLastNewline default NO; [AL] strip_suffix newline
+note: `hello` fills 5 columns and arms pending wrap, but the \r\n ends the line: row 0 is NOT soft-wrapped.
+
+### H07_selection_extending_into_next_row_includes_newline
+layer: core
+size: 3x5
+step: feed hello\r\nworld
+step: begin 0,0 char
+step: extend 1,0
+sel: linear (0,0)-(1,0)
+has_selection: true
+text: "hello\nw"
+cite: [AL] bounds_to_string
+
+### H08_start_in_blank_area_gives_leading_newline
+layer: core
+size: 3x10
+step: feed ab\r\ncd
+step: begin 0,5 char
+step: extend 1,0
+sel: linear (0,5)-(1,0)
+has_selection: true
+text: "\nc"
+cite: [AL] bounds_to_string: row 0 contributes "" (blank trimmed) then \n
+
+### H09_pad_and_spacer_cells_never_emit_text
+layer: core
+size: 3x5
+step: feed ab\u{4e16}\u{4e16}
+step: all
+has_selection: true
+text: "ab\u{4e16}\u{4e16}"
+cite: [AL] line_to_string skips WIDE_CHAR_SPACER | LEADING_WIDE_CHAR_SPACER
+note: Row 0 is a b 世(cols 2-3) then a PAD cell (col 4: the second 世 needs two columns, one is left), soft-wrapped; row 1 is the second 世.
+
+# ---------------------------------------------------------------------------
+# I. LINK HIT-TESTING OVER DETECTED URLS (App::link_at, view-relative; URL detection rules in selection_spec.notes.md)
+# ---------------------------------------------------------------------------
+
+### I01_url_in_one_row
+layer: core
+size: 2x40
+step: feed see https://example.com/a ok
+step: link 0,10
+link: https://example.com/a (0,4)-(0,24)
+cite: notes U1-U3 / section J (scheme at a word start, URL characters to the end); kitty url_prefixes and WezTerm default rule both match `scheme://...`
+
+### I02_cell_outside_the_url_is_none
+layer: core
+size: 2x40
+step: feed see https://example.com/a ok
+step: link 0,2
+link: none
+cite: section J (J34)
+
+### I03_url_wrapped_across_rows
+layer: core
+size: 4x12
+step: feed see https://example.com/a/b ok
+step: link 1,5
+link: https://example.com/a/b (0,4)-(0,11) (1,0)-(1,11) (2,0)-(2,2)
+cite: notes U8; [KT] kitty extend_url / next_line_starts_with_url_chars continue a URL onto the next row; WezTerm and iTerm2 match over the logical line
+note: Rows: `see https://` / `example.com/` / `a/b ok`. The span has one range per row and the hover overlay draws one Underline per range.
+
+### I04_hard_newline_ends_url
+layer: core
+size: 3x20
+step: feed https://exa\r\nmple.com
+step: link 0,2
+link: https://exa (0,0)-(0,10)
+cite: notes U8 (only SOFT wraps continue a URL)
+
+### I05_url_in_scrollback_at_scrolled_view
+layer: core
+size: 2x20
+scrollback: 10
+step: feed https://a.bc/x\r\nl2\r\nl3
+step: scroll 1
+step: link 0,3
+link: https://a.bc/x (0,0)-(0,13)
+cite: view-relative rows honour the scroll offset (30-core brief `App::link_at`)
+
+### I06_same_cell_live_view_is_none
+layer: core
+size: 2x20
+scrollback: 10
+step: feed https://a.bc/x\r\nl2\r\nl3
+step: link 0,3
+link: none
+cite: at offset 0 the view shows `l2`, `l3`
+
+### I07_url_with_wide_characters
+layer: core
+size: 2x30
+step: feed https://\u{4f8b}\u{3048}.jp/ end
+step: link 0,9
+link: https://\u{4f8b}\u{3048}.jp/ (0,0)-(0,15)
+cite: notes U24 (non-ASCII alphanumerics are URL characters); the spacer cell (col 9) of 例 resolves to the same URL
+note: Cells: `https://` 0-7, 例 8-9, え 10-11, `.jp/` 12-15.
+
+### I08_url_after_wide_character_column_accounting
+layer: core
+size: 2x30
+step: feed \u{4e16} https://a.bc
+step: link 0,3
+link: https://a.bc (0,3)-(0,14)
+cite: spans are in cells, not scalars: 世 takes cols 0-1, space col 2, URL starts col 3
+
+# ---------------------------------------------------------------------------
+# J. URL DETECTION (pure function for url.rs; rules U1-U9 in selection_spec.notes.md)
+#   layer: url    input: <one logical line, \u{H} escapes, @rep(C,N)>    at: <char index>    url: <text>|none
+#   span: <c0>-<c1>  inclusive CHAR indices of the URL in `input` (not cells: widths are I07/I08)
+#   `at` is inside the span unless the row says otherwise. Detection never panics for any input (proptest).
+#   Sources: [KT] kitty line_url_end_at / can_strip_from_end_of_url / get_url_sentinel; [WZ] wezterm default hyperlink_rules;
+#   [GHT] ghostty src/config/url.zig header comment (rules 1 and 2); Tessera rules U1-U9.
+# ---------------------------------------------------------------------------
+
+### J01_plain_url
+layer: url
+input: see https://example.com/a ok
+at: 10
+url: https://example.com/a
+span: 4-24
+cite: U1-U3; [KT] url_prefixes default `file ftp ftps gemini git gopher http https irc ircs kitty mailto news sftp ssh` (Tessera detects 5, D-SCHEMES)
+
+### J02_trailing_period_is_not_part_of_the_url
+layer: url
+input: go to https://example.com/x.
+at: 10
+url: https://example.com/x
+span: 6-26
+cite: U4; [KT] can_strip_from_end_of_url strips trailing punctuation; [GHT] rule 1 "Do not match regexes ending with ."; [WZ] bare rule must end in `[)/a-zA-Z0-9-]`
+
+### J03_trailing_comma
+layer: url
+input: see https://a.bc/x, then
+at: 6
+url: https://a.bc/x
+span: 4-17
+cite: U4; [KT]; [WZ]
+
+### J04_closing_paren_then_period
+layer: url
+input: (https://a.bc/x).
+at: 5
+url: https://a.bc/x
+span: 1-14
+cite: U4+U5: strip `.` then the unbalanced `)`; [GHT] rule 2 "(https://example.com)" (do not include the parens); [WZ] rule 1 `\((\w+://\S+)\)`
+
+### J05_balanced_parens_kept_wikipedia
+layer: url
+input: https://en.wikipedia.org/wiki/Foo_(bar)
+at: 5
+url: https://en.wikipedia.org/wiki/Foo_(bar)
+span: 0-38
+cite: U5; [GHT] rule 2 "https://en.wikipedia.org/wiki/Rust_(video_game) (include parens)"
+note: kitty differs: it keeps `)` in the URL body but, when the URL is preceded by `(`, get_url_sentinel makes the first `)` the end, which truncates this URL inside parens (J06). Tessera counts balance instead.
+
+### J06_balanced_parens_inside_surrounding_parens
+layer: url
+input: (https://en.wikipedia.org/wiki/Foo_(bar))
+at: 5
+url: https://en.wikipedia.org/wiki/Foo_(bar)
+span: 1-39
+cite: U5 (count openers and closers inside the candidate: the first `)` is balanced by `(`, the last is not and is stripped); [GHT] both cases together; kitty's sentinel rule would stop at the first `)` (documented difference)
+
+### J07_markdown_link_target
+layer: url
+input: [docs](https://a.bc/x)
+at: 10
+url: https://a.bc/x
+span: 7-20
+cite: U5; [GHT] "such as in Markdown links"
+
+### J08_square_brackets
+layer: url
+input: [https://a.bc/x]
+at: 5
+url: https://a.bc/x
+span: 1-14
+cite: U5 applies to `]` as to `)`; [WZ] rule 2 `\[(\w+://\S+)\]`; [KT] sentinel `]`
+
+### J09_angle_brackets_end_the_url
+layer: url
+input: <https://a.bc/x>
+at: 5
+url: https://a.bc/x
+span: 1-14
+cite: U3 (`<` `>` are not URL characters); [WZ] rule 4; RFC 3986 App. C recommends `<URL>` delimiters
+
+### J10_double_quotes_end_the_url
+layer: url
+input: href="https://a.bc/x"
+at: 8
+url: https://a.bc/x
+span: 6-19
+cite: U3 (`"` is not a URL character); [KT] sentinel `"`
+
+### J11_single_quotes_trailing_trimmed
+layer: url
+input: 'https://a.bc/x'
+at: 5
+url: https://a.bc/x
+span: 1-14
+cite: U4 (`'` is legal inside a URL (RFC 3986) but trailing `'` is stripped); [KT] sentinel `'`
+
+### J12_query_and_fragment_kept
+layer: url
+input: https://a.bc/p?q=1&r=2#f
+at: 12
+url: https://a.bc/p?q=1&r=2#f
+span: 0-23
+cite: U3; [WZ] `\S+`; [KT]
+
+### J13_trailing_slash_kept
+layer: url
+input: open https://a.bc/dir/ now
+at: 8
+url: https://a.bc/dir/
+span: 5-21
+cite: U4 (`/` is never stripped); [KT] can_strip excludes `/`; [WZ] bare rule ends `[)/a-zA-Z0-9-]`
+
+### J14_trailing_equals_ampersand_dash_kept
+layer: url
+input: https://a.bc/?a=&b=
+at: 3
+url: https://a.bc/?a=&b=
+span: 0-18
+cite: U4 (only . , ; : ! ? ' and " are stripped); [KT] keeps `& -` (and strips `=` only when classed as punctuation: it is a symbol)
+note: AMBIGUITY: WezTerm's bare rule would drop a trailing `=` (must end in `[)/a-zA-Z0-9-]`); kitty keeps it. Recommend keep.
+
+### J15_ipv6_host
+layer: url
+input: http://[::1]:8080/x
+at: 8
+url: http://[::1]:8080/x
+span: 0-18
+cite: U5 (`[` balances `]`); [GHT] ipv6_url_pattern
+
+### J16_unbalanced_opener_is_kept
+layer: url
+input: https://a.bc/?q=(1
+at: 3
+url: https://a.bc/?q=(1
+span: 0-17
+cite: U5 strips only unbalanced CLOSERS; [KT] keeps `(`
+
+### J17_empty_host_is_rejected
+layer: url
+input: see http:// here
+at: 6
+url: none
+cite: U6; 30-core brief ("rejects an empty host")
+
+### J18_empty_host_with_path_rejected
+layer: url
+input: http:///x
+at: 3
+url: none
+cite: U6 (http, https, ftp need a host character right after `://`)
+
+### J19_file_url_with_empty_host_is_a_url
+layer: url
+input: file:///etc/hosts
+at: 8
+url: file:///etc/hosts
+span: 0-16
+cite: U6 (file allows an empty host); [GIST] "file://... the hostname ... empty counts as local"
+
+### J20_file_url_with_host
+layer: url
+input: file://localhost/etc/hosts
+at: 12
+url: file://localhost/etc/hosts
+span: 0-25
+cite: U6; the allowlist (local host only) is applied at OPEN time (30-app D-OPEN), not here
+
+### J21_mailto
+layer: url
+input: mail mailto:a@b.co now
+at: 8
+url: mailto:a@b.co
+span: 5-17
+cite: U7; [KT] url_prefixes includes mailto; [GHT] `mailto:`
+
+### J22_mailto_without_address_rejected
+layer: url
+input: mailto: and mailto:nobody
+at: 2
+url: none
+cite: U7 (the part after `mailto:` needs `@` with text on both sides)
+
+### J23_bare_email_is_not_a_link
+layer: url
+input: write to a@b.co please
+at: 10
+url: none
+cite: U7; DIFFERENCE: [WZ] default rule 6 and iTerm2 smart selection link bare emails; 0.1.0 does not (decision D14)
+
+### J24_ftp_with_credentials
+layer: url
+input: ftp://u:p@h.io/f.txt
+at: 10
+url: ftp://u:p@h.io/f.txt
+span: 0-19
+cite: U1-U3 (`@` and `:` are URL characters)
+
+### J25_scheme_is_case_insensitive_url_kept_as_typed
+layer: url
+input: HTTP://A.BC/X
+at: 4
+url: HTTP://A.BC/X
+span: 0-12
+cite: RFC 3986 3.1 ("schemes are case-insensitive"); the text is returned as typed
+
+### J26_scheme_must_start_a_word
+layer: url
+input: xhttp://a.bc
+at: 6
+url: none
+cite: U1 (the scheme must not be preceded by an alphanumeric, `+`, `-` or `.`); avoids linking inside identifiers
+
+### J27_unsupported_schemes_are_not_detected
+layer: url
+input: ssh://host/x git://h/x javascript:alert(1) tel:123
+at: 3
+url: none
+cite: D-SCHEMES (30-core brief): detection covers http, https, ftp, file, mailto only; kitty/Ghostty also detect ssh/git/tel/magnet/... and are NOT followed
+
+### J28_two_urls_on_a_line
+layer: url
+input: https://a.bc/x https://d.ef/y
+at: 20
+url: https://d.ef/y
+span: 15-28
+cite: U3 (whitespace ends a URL)
+
+### J29_ideographic_full_stop_ends_url
+layer: url
+input: https://a.bc/x\u{3002}next
+at: 5
+url: https://a.bc/x
+span: 0-13
+cite: U3: `U+3002` is neither alphanumeric nor in the URL character set
+
+### J30_non_ascii_letters_are_url_characters
+layer: url
+input: https://\u{4f8b}\u{3048}.jp/
+at: 9
+url: https://\u{4f8b}\u{3048}.jp/
+span: 0-13
+cite: U3 (non-ASCII alphanumerics allowed: IRIs); [GHT] `\w` is Unicode-aware
+
+### J31_ellipsis_strips_all_dots
+layer: url
+input: see https://a.bc/x...
+at: 5
+url: https://a.bc/x
+span: 4-17
+cite: U4 (strip repeatedly)
+
+### J32_trailing_colon_stripped_port_kept
+layer: url
+input: https://a.bc: https://d.ef:8080/z
+at: 5
+url: https://a.bc
+span: 0-11
+cite: U4; [GHT] no_trailing_colon
+
+### J33_url_inside_html_attribute
+layer: url
+input: <a href="https://a.bc/x">
+at: 12
+url: https://a.bc/x
+span: 9-22
+cite: U3 (`"` and `>` end it)
+
+### J34_trimmed_punctuation_cell_is_not_part_of_the_link
+layer: url
+input: see https://a.bc/x.
+at: 18
+url: none
+cite: U4: the stripped `.` is outside the span (hover underline stops before it)
+
+### J35_length_cap_accepts_2083_chars
+layer: url
+input: https://a.bc/@rep(a,2070)
+at: 100
+url: https://a.bc/@rep(a,2070)
+span: 0-2082
+cite: U9; the OSC 8 cap [GIST] "Both VTE and iTerm2 limit the URI to 2083 bytes"
+note: AMBIGUITY (D15): bounding detection keeps the per-hover cost constant on a line of one huge token. Recommend the same 2083-char cap.
+
+### J36_length_over_cap_is_not_a_link
+layer: url
+input: https://a.bc/@rep(a,2071)
+at: 100
+url: none
+cite: U9
+
+### J37_scheme_alone_is_not_a_link
+layer: url
+input: use https:// here and http:
+at: 6
+url: none
+cite: U6 (`https://` with nothing after it)
