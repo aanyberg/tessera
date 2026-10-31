@@ -432,28 +432,48 @@ fn oversized_parameters_saturate_in_the_parser() {
 }
 
 /// A flood of DECSCUSR and DECSET 12 queues nothing and keeps the cost
-/// per sequence flat: 200 000 sequences (2.4 MB) take about as long per
-/// sequence as 20 000.
+/// per sequence flat: 4N units take about four times as long as N.
+///
+/// The bar is the ratio of the two sizes, each the best of three runs
+/// taken in turn, so a loaded machine that slows both alike cannot fail
+/// it. Linear cost reads ~4; the bar is 6. Quadratic cost reads 16 once
+/// it dominates: a handler that keeps every style it was sent, newest
+/// first (`Vec::insert(0, _)`), reads 12-14 at these sizes in a debug build
+/// and fails every attempt. A run that a stall hits only on the large
+/// side can still read high, so up to five attempts are made and every
+/// ratio is printed.
 #[test]
 fn a_flood_of_cursor_styles_requests_nothing_and_stays_linear() {
+    const UNITS: usize = 10_000;
+    const ATTEMPTS: usize = 5;
+    const MAX_RATIO: f64 = 6.0;
     let unit = b"\x1b[5 q\x1b[?12l\x1b[0 q\x1b[3 q";
-    let time = |n: usize| {
-        let bytes = unit.repeat(n);
+    let time = |bytes: &[u8]| {
         let mut term = Terminal::new(3, 10);
         let start = Instant::now();
-        term.advance(&bytes);
+        term.advance(bytes);
         let took = start.elapsed();
-        assert!(term.take_requests().is_empty(), "{n}: requests");
+        assert!(term.take_requests().is_empty(), "{}: requests", bytes.len());
         assert_eq!(term.cursor_style().shape, CursorShape::Underline);
         took
     };
-    let best = |n: usize| (0..3).map(|_| time(n)).min().unwrap_or(Duration::MAX);
-    let small = best(5_000);
-    let large = best(50_000);
-    eprintln!("5 000 units: {small:?}, 50 000 units: {large:?}");
-    // Linear is 10x; allow for noise, catch quadratic growth (100x).
-    assert!(
-        large < small * 30 + Duration::from_millis(20),
-        "{large:?} vs {small:?}"
-    );
+    let (small_bytes, large_bytes) = (unit.repeat(UNITS), unit.repeat(4 * UNITS));
+    let mut ratios = Vec::new();
+    for _ in 0..ATTEMPTS {
+        let (mut small, mut large) = (Duration::MAX, Duration::MAX);
+        for _ in 0..3 {
+            small = small.min(time(&small_bytes));
+            large = large.min(time(&large_bytes));
+        }
+        let ratio = large.as_secs_f64() / small.as_secs_f64().max(f64::MIN_POSITIVE);
+        eprintln!(
+            "{UNITS} units: {small:?}, {} units: {large:?}, ratio {ratio:.2}",
+            4 * UNITS
+        );
+        if ratio < MAX_RATIO {
+            return;
+        }
+        ratios.push(ratio);
+    }
+    panic!("4x the units cost more than {MAX_RATIO}x the time in every attempt: {ratios:.2?}");
 }
