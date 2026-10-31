@@ -1,0 +1,503 @@
+# =============================================================================
+# tessera app: selection, copy and link gestures   (issue #30 part 3 of 3, wave 8)
+# apps/macos/Tests/TesseraTests/Fixtures/selection_gestures.txt
+# spec-researcher output (2026-10-31). Reference behaviour: iTerm2 (source read, not run).
+# ONLY THE MILESTONE LEAD EDITS A FINALISED COPY; the implementer copies it verbatim and reports a wrong row.
+#
+# ROW LAYOUT (`###` rows like the Rust fixtures; TerminalSelectionTests.swift needs its own parser)
+#   setup:   size <rows>x<cols> then `feed <payload>` lines (escapes as osc_spec.txt: \xNN \r \n \\ \u{H..}); `scrollback: N`
+#   event:   one input per line, run in order, through the real view with synthesized NSEvents:
+#              down R,C [clicks=N] [mods=cmd,opt,shift,ctrl]   mouseDown at the CENTRE of cell (R,C); clicks is NSEvent.clickCount
+#              drag R,C [mods=..]                              mouseDragged to the centre of (R,C)
+#              drag above,C | drag below,C                     pointer above the top / below the bottom edge of the view, column C
+#              up [R,C] [mods=..]                              mouseUp (default: where the last drag/down was)
+#              move R,C [mods=..]                              mouseMoved (no button)
+#              flags <none|cmd|opt|shift|cmd,opt>              flagsChanged: the modifier set becomes this
+#              wait <N>ms                                      advance the autoscroll timer by N ms
+#              key cmd-c | cmd-a | <char>
+#              ime_marked_text <s>                             setMarkedText on the view (an IME composition is in progress)
+#              window_inactive                                 the window is not key; the next down is the activating click                               key equivalents through the responder chain
+#   expect (after the last event): sel / text / pasteboard / cursor / hover / opened / pty_input, all optional except where noted
+#              sel:       as selection_spec.txt (`none | linear (R,C)-(R,C) | block (R,C)-(R,C)`, view-relative, inclusive)
+#              text:      App::selection_text (quoted) or `none`
+#              pasteboard: `unchanged` | quoted string written to the (named, test-injected) general pasteboard
+#              cursor:    arrow | ibeam | pointing   the cursor the view shows (cursor rects / NSCursor set by the view)
+#              hover:     none | <url>               the link hovered (tessera_session_set_hover active)
+#              opened:    [] | [<url>, ...]          URLs passed to the injected opener, in order
+#              pty_input: none | any                 bytes sent to the child by the gesture (mouse reports are #12, wave 9: none here)
+#              scroll:    N                          view offset in lines above live after the last event
+#              copy_enabled / selectall_enabled: true|false   menu validation
+#   cite:    source for every expected value. `decision:` names an open item in selection_spec.notes.md.
+#
+# SOURCE TAGS (fetched 2026-10-31)
+#   IT-mouse  https://github.com/gnachman/iTerm2  sources/TerminalView/PTYMouseHandler.m  mouseDownImpl L356-430, mouseUp L500-690,
+#             mouseDragged L836-960; kRectangularSelectionModifiers = Command|Option (L29-30)
+#   IT-sel    sources/Selection/iTermSelection.m  beginExtendingSelectionAt L238, moveSelectionEndpointTo L571
+#   IT-scroll sources/Selection/iTermSelectionScrollHelper.m  scheduleSelectionScroll L39, updateSelectionScroll L57, mouseDraggedTo L104
+#   IT-pref   sources/Settings/iTermPreferences.m L748-752, L909-919 (CopySelection YES, CommandSelection (cmd-click opens URLs) YES,
+#             OptionClickMovesCursor YES, TripleClickSelectsFullWrappedLines YES, DoubleClickPerformsSmartSelection NO)
+#   IT-doc    https://iterm2.com/documentation-preferences-general.html (Selection); https://iterm2.com/documentation-smart-selection.html
+#   OSC8      https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda (hover underline, ctrl/cmd-click, security)
+#   VTE/KT/WZ link hover: kitty `detect_urls` (underline + hand cursor under the mouse), VTE VTE_HYPERLINK_CURSOR "pointer"
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# P. PLAIN POINTER GESTURES
+# ---------------------------------------------------------------------------
+
+### P01_click_drag_linear
+setup: size 3x20
+setup: feed hello world
+event: down 0,0
+event: drag 0,2
+event: drag 0,4
+event: up
+sel: linear (0,0)-(0,4)
+text: "hello"
+pasteboard: unchanged
+cursor: ibeam
+pty_input: none
+copy_enabled: true
+cite: [IT-mouse] mouseDownImpl clickCount<2 => kiTermSelectionModeCharacter, mouseDragged => moveSelectionToGridCoord; [IT-pref L748] CopySelection defaults to YES in iTerm2 but Tessera keeps copy-on-select OFF (decision 2026-10-28, #47), so the pasteboard is untouched
+note: The selection exists while dragging (live) and stays after mouseUp.
+
+### P02_drag_backwards
+setup: size 3x20
+setup: feed hello world
+event: down 0,4
+event: drag 0,0
+event: up
+sel: linear (0,0)-(0,4)
+text: "hello"
+cite: [IT-sel] moveSelectionEndpointToAbsRange (flipped live range)
+
+### P03_click_without_drag_creates_no_selection
+setup: size 3x20
+setup: feed hello world
+event: down 0,3
+event: up
+sel: none
+text: none
+copy_enabled: false
+cite: [IT-mouse] mouseDown with clickCount 1 starts a zero-length live range; mouseUp with no drag leaves no selection
+note: A plain click only clears an existing selection (P07).
+
+### P04_drag_inside_anchor_cell_creates_no_selection
+setup: size 3x20
+setup: feed hello world
+event: down 0,3
+event: drag 0,3
+event: up
+sel: none
+text: none
+cite: [IT-mouse] a drag within one cell leaves a zero-length range (iTerm2 additionally snaps to half cells); Tessera: select_extend is only called when the pointer is over a DIFFERENT cell than the last call, and the anchor cell alone is no selection
+decision: D1 (whole-cell semantics) in notes
+note: This is why selection_spec A04 (extend onto the anchor cell selects one cell) and this row agree: the VIEW never calls extend for the anchor cell unless the pointer left it and came back.
+
+### P05_double_click_word
+setup: size 3x20
+setup: feed foo bar baz
+event: down 0,5 clicks=2
+event: up
+sel: linear (0,4)-(0,6)
+text: "bar"
+cite: [IT-mouse] L408 shouldSelectWordWithClicks(2) => kiTermSelectionModeWord; [IT-doc] "Double-click performs smart selection" off by default
+pasteboard: unchanged
+
+### P06_triple_click_line_is_whole_logical_line
+setup: size 3x6
+setup: feed abcdefghij\r\nxyz
+event: down 1,1 clicks=3
+event: up
+sel: linear (0,0)-(1,5)
+text: "abcdefghij"
+cite: [IT-mouse] L414-420 clicks==3 => WholeLine when TripleClickSelectsFullWrappedLines (default YES)
+note: Rows: `abcdef` (wrap) / `ghij` / `xyz`. The logical line spans rows 0-1.
+
+### P07_click_clears_existing_selection
+setup: size 3x20
+setup: feed hello world
+event: down 0,0
+event: drag 0,4
+event: up
+event: down 2,10
+event: up
+sel: none
+text: none
+copy_enabled: false
+cite: [IT-mouse] mouseDown (new selection, append NO) clears the old subselections; a click on the selection itself clears it at mouseUp (L836-845 "delay clearing until mouse-up")
+note: iTerm2 also arms text drag-and-drop when the press lands ON the selection; Tessera has no selection drag-and-drop in 0.1.0: the click simply clears.
+
+### P08_quad_click_acts_as_triple_click
+setup: size 3x30
+setup: feed see https://a.bc/x now
+event: down 0,10 clicks=4
+event: up
+sel: linear (0,0)-(0,29)
+text: "see https://a.bc/x now"
+cite: as P08; line granularity covers the full row width
+
+### P09_shift_click_extends_nearest_endpoint
+setup: size 3x30
+setup: feed hello world foo
+event: down 0,0
+event: drag 0,4
+event: up
+event: down 0,10 mods=shift
+event: up mods=shift
+sel: linear (0,0)-(0,10)
+text: "hello world"
+cite: [IT-mouse] L360 isExtension = hasSelection && shift => beginExtendingSelectionAt; [IT-sel] beginExtendingSelectionAt (nearer endpoint moves); selection_spec.txt E01-E04
+note: The shift-click calls the NEW core `adjust` (decision D5), not select_begin.
+
+### P10_shift_click_without_selection_is_a_plain_click
+setup: size 3x30
+setup: feed hello world foo
+event: down 0,10 mods=shift
+event: up mods=shift
+sel: none
+text: none
+cite: [IT-mouse] isExtension requires hasSelection; otherwise the single-click branch runs (a click)
+
+### P11_shift_drag_extends_too
+setup: size 3x30
+setup: feed hello world foo
+event: down 0,0
+event: drag 0,4
+event: up
+event: down 0,6 mods=shift
+event: drag 0,10 mods=shift
+event: up mods=shift
+sel: linear (0,0)-(0,10)
+text: "hello world"
+cite: [IT-mouse] mouseDragged continues the extension (`_selection.live` after beginExtendingSelectionAt, moveSelectionEndpointTo)
+note: The shift-down at col 6 is INSIDE nothing (after the end at 4): the end moves to 6, the drag then moves it to 10.
+
+### P12_option_drag_block
+setup: size 4x10
+setup: feed abcdef\r\nghijkl\r\nmn\r\nopqrst
+event: down 0,1 mods=opt
+event: drag 2,3 mods=opt
+event: up mods=opt
+sel: block (0,1)-(2,3)
+text: "bcd\nhij\nn"
+cite: Terminal.app and WezTerm use Option for rectangular selection; the 30-app brief asks for "option-drag block"
+decision: D-G1 in notes. iTerm2 itself uses Command+Option (L29-30 kRectangularSelectionModifiers), plain Option in iTerm2 is a normal selection (and option-CLICK moves the cursor, OptionClickMovesCursor default YES, out of scope).
+note: Recommended rule: block when Option is held at mouseDown, OR Command+Option (iTerm2 habit). Modifiers are read at mouseDown (the mode is fixed for the drag).
+
+### P13_cmd_option_drag_block_iterm2_habit
+setup: size 4x10
+setup: feed abcdef\r\nghijkl\r\nmn\r\nopqrst
+event: down 0,1 mods=cmd,opt
+event: drag 2,3 mods=cmd,opt
+event: up mods=cmd,opt
+sel: block (0,1)-(2,3)
+text: "bcd\nhij\nn"
+cite: [IT-mouse] L29-30 + L369 kRectangularSelectionModifierMask: Command|Option exactly (Control not held) => kiTermSelectionModeBox
+note: Cmd held at mouseDown would otherwise be a link click (L11) or a non-contiguous append (iTerm2); with Option also held it is a block.
+
+### P14_mode_is_fixed_at_mouse_down
+setup: size 4x10
+setup: feed abcdef\r\nghijkl\r\nmn\r\nopqrst
+event: down 0,1
+event: drag 1,3 mods=opt
+event: up
+sel: linear (0,1)-(1,3)
+text: "bcdef\nghij"
+cite: [IT-mouse] the mode is chosen in mouseDownImpl (L366-372) and not changed by mouseDragged modifiers
+
+### P15_drag_past_right_and_left_edges_clamps_columns
+setup: size 3x10
+setup: feed hello world
+event: down 0,2
+event: drag 0,99
+event: up
+sel: linear (0,2)-(0,9)
+text: "llo worl"
+cite: [IT-mouse] the grid coordinate of the pointer is clamped to the grid width; crates/tessera-app-core clamps columns (view's `cell(at:)` already clamps, #90)
+note: 99 stands for a point to the right of the last cell. "hello world" fills cols 0-10 of a 10-col grid: `hello worl` + `d` on row 1 (soft wrap). Cols 2-9 of row 0 = `llo worl`. Text has no newline: the selection stays on row 0.
+
+### P16_drag_above_top_autoscrolls_into_history
+setup: size 3x10
+setup: scrollback: 50
+setup: feed l01\r\nl02\r\nl03\r\nl04\r\nl05\r\nl06\r\nl07\r\nl08
+event: down 2,0
+event: drag above,0
+event: wait 100ms
+event: wait 100ms
+event: wait 100ms
+scroll: 3
+cite: [IT-scroll] mouseDraggedTo L104-117: pointer above the view => direction Up, timer schedules updateSelectionScroll; scheduleSelectionScroll L39: initial delay 0.1 s, accelerates 5 % per tick; each tick scrolls max(1, elapsed/delay) lines and moves the endpoint to the new top row at the pointer's column
+note: Screen shows l06,l07,l08 (history l01-l05). The test drives a FAKE clock: ticks fire at 100 ms, 195 ms, 285 ms (delay 0.1 s then x0.95 each tick), each 1 line, so three `wait 100ms` (300 ms) give exactly 3 lines. A real timer is allowed to differ; the fake-clock assertion is the contract (D10).
+decision: D10 (autoscroll pace) in notes
+
+### P17_autoscroll_stops_on_mouse_up
+setup: size 3x10
+setup: scrollback: 50
+setup: feed l01\r\nl02\r\nl03\r\nl04\r\nl05\r\nl06\r\nl07\r\nl08
+event: down 2,0
+event: drag above,0
+event: wait 100ms
+event: up
+event: wait 500ms
+scroll: 1
+cite: [IT-scroll] mouseUp: `_selectionScrollDirection = 0` stops the timer; no further scroll after mouseUp
+note: One tick before mouseUp = 1 line; nothing afterwards.
+
+### P18_autoscroll_continues_without_pointer_motion
+setup: size 3x10
+setup: scrollback: 50
+setup: feed l01\r\nl02\r\nl03\r\nl04\r\nl05\r\nl06\r\nl07\r\nl08
+event: down 2,0
+event: drag above,0
+event: wait 100ms
+event: wait 100ms
+scroll: 2
+cite: [IT-scroll] the timer reschedules itself (scheduleSelectionScroll at the end of updateSelectionScroll) while the pointer stays outside; no mouseDragged events are needed
+
+### P19_autoscroll_extends_selection_to_the_revealed_row
+setup: size 3x10
+setup: scrollback: 50
+setup: feed l01\r\nl02\r\nl03\r\nl04\r\nl05\r\nl06\r\nl07\r\nl08
+event: down 2,1
+event: drag above,1
+event: wait 100ms
+event: wait 100ms
+event: up
+text: "04\nl05\nl06\nl07\nl0"
+cite: as P19; linear selection from (l04, col 1) to (l08, col 1) inclusive: `04` + newline + l05 + l06 + l07 + `l0`
+note: Two ticks => offset 2: the view top is l04; the endpoint is (l04, col 1), the anchor stays (l08, col 1) because it is anchored in logical lines. Text = `04` newline l05 l06 l07 and `l0`.
+
+# ---------------------------------------------------------------------------
+# K. KEYBOARD, MENU, PASTEBOARD
+# ---------------------------------------------------------------------------
+
+### K01_cmd_c_copies_selection_plain_text
+setup: size 3x20
+setup: feed hello world
+event: down 0,0
+event: drag 0,4
+event: up
+event: key cmd-c
+pasteboard: "hello"
+pty_input: none
+cite: 30-app brief (Cmd-C writes selection_text as plain text); [IT-doc] Edit > Copy
+note: Only the plain-text type (public.utf8-plain-text); no RTF/HTML in 0.1.0.
+
+### K02_cmd_c_without_selection_is_disabled_and_sends_nothing
+setup: size 3x20
+setup: feed hello world
+event: key cmd-c
+pasteboard: unchanged
+pty_input: none
+copy_enabled: false
+cite: 30-app brief (Copy enabled exactly when hasSelection); iTerm2 does not send ^C for Cmd-C
+
+### K03_cmd_a_selects_scrollback_and_screen
+setup: size 2x10
+setup: scrollback: 10
+setup: feed a\r\nb\r\nc\r\nd
+event: key cmd-a
+text: "a\nb\nc\nd"
+selectall_enabled: true
+copy_enabled: true
+cite: selection_spec.txt F01
+
+### K04_copy_of_empty_selection_leaves_pasteboard
+setup: size 2x10
+event: key cmd-a
+event: key cmd-c
+pasteboard: unchanged
+cite: selection_spec.txt F05 (Select All of an empty terminal): writing "" would destroy the user's clipboard for nothing
+decision: D11 in notes
+
+### K05_no_copy_on_select
+setup: size 3x20
+setup: feed hello world
+event: down 0,0
+event: drag 0,4
+event: up
+pasteboard: unchanged
+cite: decision 2026-10-28 (#47 adds the option); iTerm2's default is YES [IT-pref L748] so this is a documented deviation
+
+### K06_select_all_is_a_fixed_range_new_output_is_not_added
+setup: size 2x10
+setup: scrollback: 10
+setup: feed a\r\nb
+event: key cmd-a
+setup: feed \r\nc
+sel: linear (0,0)-(0,9)
+text: "a\nb"
+cite: selection_spec.txt G01 (absolute logical-line anchors: output that scrolls selected lines into history does not change them) and D-CLEAR (only a CHANGE of a selected line clears)
+note: Select All covers the lines that existed (a, b). After `c` scrolls the screen, rows are b, c: the view clips the selection to row 0. `c` is not selected.
+
+# ---------------------------------------------------------------------------
+# L. COMMAND-HOVER AND COMMAND-CLICK ON LINKS
+# ---------------------------------------------------------------------------
+
+### L01_cmd_hover_over_url_underlines_and_shows_pointing_hand
+setup: size 3x40
+setup: feed see https://a.bc/x now
+event: flags cmd
+event: move 0,10 mods=cmd
+hover: https://a.bc/x
+cursor: pointing
+cite: [OSC8] hover feedback; kitty detect_urls "Underlines URLs under the mouse and shows a hand cursor over them"; VTE_HYPERLINK_CURSOR "pointer"; [IT-doc] cmd-click on a URL follows it (CommandSelection default YES [IT-pref L909])
+note: The underline comes from the OverlayKind::Underline frame overlay (30-core set_hover); the test asserts `hover` and `cursor`.
+
+### L02_hover_requires_command
+setup: size 3x40
+setup: feed see https://a.bc/x now
+event: move 0,10
+hover: none
+cursor: ibeam
+cite: [IT-pref] iTerm2 only highlights/acts with Cmd held; every reference except kitty/WezTerm (underline on plain hover) needs a modifier. D-HOVER in 30-app brief: command-hover only
+
+### L03_releasing_command_clears_hover
+setup: size 3x40
+setup: feed see https://a.bc/x now
+event: flags cmd
+event: move 0,10 mods=cmd
+event: flags none
+hover: none
+cursor: ibeam
+cite: 30-app brief ("releasing Command or leaving the link clears both")
+
+### L04_moving_off_the_link_clears_hover
+setup: size 3x40
+setup: feed see https://a.bc/x now
+event: flags cmd
+event: move 0,10 mods=cmd
+event: move 0,2 mods=cmd
+hover: none
+cursor: ibeam
+cite: 30-app brief
+
+### L05_pressing_command_while_already_over_the_link_sets_hover
+setup: size 3x40
+setup: feed see https://a.bc/x now
+event: move 0,10
+event: flags cmd
+hover: https://a.bc/x
+cursor: pointing
+cite: 30-app brief ("tests for flagsChanged and mouseMoved paths"): the view must re-hit-test at the LAST mouse location on flagsChanged
+
+### L06_cmd_click_opens_allowed_url_without_selection_or_pty_input
+setup: size 3x40
+setup: feed see https://a.bc/x now
+event: flags cmd
+event: down 0,10 mods=cmd
+event: up mods=cmd
+opened: [https://a.bc/x]
+sel: none
+pty_input: none
+cite: [IT-mouse] L532 willFollowLink = unshifted single click && cmd && CommandSelection; 30-app brief ("A command-click never starts a selection and never reaches the PTY")
+
+### L07_cmd_click_on_text_that_is_not_a_link_does_nothing
+setup: size 3x40
+setup: feed see https://a.bc/x now
+event: flags cmd
+event: down 0,1 mods=cmd
+event: up mods=cmd
+opened: []
+sel: none
+pty_input: none
+cite: iTerm2 would try semantic history (open a file path); not in 0.1.0
+decision: D12 in notes (file-path click deferred)
+
+### L08_cmd_click_on_disallowed_scheme_does_nothing
+setup: size 3x60
+setup: feed \x1b]8;;javascript:alert(1)\x1b\\click\x1b]8;;\x1b\\ \x1b]8;;vscode://x/y\x1b\\vs\x1b]8;;\x1b\\
+event: flags cmd
+event: down 0,2 mods=cmd
+event: up mods=cmd
+event: down 0,8 mods=cmd
+event: up mods=cmd
+opened: []
+sel: none
+cite: 30-app D-OPEN allowlist; [OSC8] security: "Terminals may whitelist well-known schemes and ask for confirmation on others"; the gist suggests file/http/https as the minimum
+note: Needs 30-links (OSC 8 storage). Until then this row is skipped by the Swift test (`needs: osc8`).
+needs: osc8
+
+### L09_cmd_click_on_file_url_with_remote_host_does_nothing
+setup: size 3x60
+setup: feed \x1b]8;;file://otherhost/etc/passwd\x1b\\p\x1b]8;;\x1b\\
+event: flags cmd
+event: down 0,0 mods=cmd
+event: up mods=cmd
+opened: []
+cite: [OSC8] "match the hostname against the local host and refuse to open mismatched files ... localhost and an empty hostname count as local"
+needs: osc8
+
+### L10_cmd_click_on_file_url_with_empty_or_local_host_opens
+setup: size 3x60
+setup: feed \x1b]8;;file:///etc/hosts\x1b\\a\x1b]8;;\x1b\\ \x1b]8;;file://localhost/etc/hosts\x1b\\b\x1b]8;;\x1b\\
+event: flags cmd
+event: down 0,0 mods=cmd
+event: up mods=cmd
+event: down 0,2 mods=cmd
+event: up mods=cmd
+opened: [file:///etc/hosts, file://localhost/etc/hosts]
+cite: [OSC8] as L09; 30-app D-OPEN (empty, localhost, this Mac's host name)
+needs: osc8
+
+### L11_cmd_drag_does_not_select_or_open
+setup: size 3x40
+setup: feed see https://a.bc/x now
+event: flags cmd
+event: down 0,10 mods=cmd
+event: drag 0,20 mods=cmd
+event: up mods=cmd
+opened: []
+sel: none
+pty_input: none
+cite: [IT-mouse] L841-880 `pressingCmdOnly`: Cmd-drag is a text/semantic-history drag or a non-contiguous (append) selection in iTerm2; Tessera has neither in 0.1.0 and ignores it (no selection, no open)
+decision: D12 in notes
+
+### L12_plain_click_on_link_selects_nothing_and_does_not_open
+setup: size 3x40
+setup: feed see https://a.bc/x now
+event: down 0,10
+event: up
+opened: []
+sel: none
+cite: [IT-mouse] L532 requires cmd; [OSC8] security: "opening links only on Ctrl+click or a context menu, not a plain click"
+
+### L13_double_click_on_url_slash_selects_path_run
+setup: size 3x40
+setup: feed see https://a.bc/x now
+event: down 0,10 clicks=2
+event: up
+sel: linear (0,10)-(0,17)
+text: "//a.bc/x"
+opened: []
+cite: selection_spec.txt C03 (word chars `/ . - _ ~ + \`); cols: `:`=9 stops the run, `//a.bc/x` = cols 10-17
+note: `:` (col 9) is not a word character, `/` is, so the run is `//a.bc/x` (cols 10-17), not the whole URL.
+
+# ---------------------------------------------------------------------------
+# M. MISC
+# ---------------------------------------------------------------------------
+
+### M01_mouse_down_during_marked_text_does_not_corrupt_selection
+setup: size 3x20
+setup: feed hello
+event: ime_marked_text あ
+event: down 0,0
+event: drag 0,3
+event: up
+sel: linear (0,0)-(0,3)
+text: "hell"
+cite: 30-app brief ("mouseDown during marked text commits/cancels as AppKit does today"); NSTextInputClient: the view calls inputContext.discardMarkedText / lets AppKit commit before starting the selection
+note: `ime_marked_text <s>` is a harness event (setMarkedText). Marked text is committed or cancelled by AppKit; the selection then proceeds normally.
+
+### M02_first_mouse_click_only_focuses_the_window
+setup: size 3x20
+setup: feed hello world
+event: window_inactive
+event: down 0,0
+event: drag 0,4
+event: up
+sel: none
+cite: [IT-mouse] `_mouseDownWasFirstMouse` handling (cmd-click exception only); standard NSView acceptsFirstMouse = false: the activating click is not delivered as a mouse down
+decision: D13 in notes (recommend the AppKit default)
+

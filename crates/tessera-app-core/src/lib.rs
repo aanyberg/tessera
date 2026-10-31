@@ -13,7 +13,9 @@
 //! Frontend input reaches a session through [`App::send_input`] (see the
 //! [`input`] module). A session is drawn by at most one view
 //! ([`App::attach_view`], [`App::render_view`], …), whose size decides the
-//! session's grid size.
+//! session's grid size. Each session has one text selection and a link
+//! hover ([`App::select_begin`], [`App::selection_text`], [`App::link_at`],
+//! …; see the [`selection`] module).
 //!
 //! # Threads
 //!
@@ -31,8 +33,10 @@
 
 mod config_watch;
 pub mod input;
+pub mod selection;
 pub mod session;
 mod shell_integration;
+pub mod url;
 pub mod view;
 
 use std::collections::HashMap;
@@ -47,6 +51,7 @@ use tessera_render::{FontConfig, Fonts, Gpu, Theme};
 use tessera_term::{MouseTracking, Terminal, encode_key};
 
 pub use input::{InputEvent, InputOutcome};
+pub use selection::{Granularity, Link, Point};
 pub use session::{SessionEvent, SessionId, SessionObserver};
 // Re-exported so frontends (through `tessera-ffi`) depend on this crate
 // alone, as the layering in `docs/architecture.md` requires.
@@ -479,8 +484,18 @@ impl App {
     /// [`Error::Pty`] if the size has zero rows or columns, more than
     /// [`view::MAX_VIEW_ROWS`] rows or [`view::MAX_VIEW_COLS`] columns
     /// (nothing changes then), or the kernel rejects it.
+    ///
+    /// A resize to another number of rows or columns clears the selection
+    /// (ADR 0025).
     pub fn resize(&self, id: SessionId, size: PtySize) -> Result<()> {
-        Ok(self.session(id)?.resize(size)?)
+        let session = self.session(id)?;
+        let before = session.with_terminal(|term| (term.grid().rows(), term.grid().cols()));
+        session.resize(size)?;
+        // A resize re-wraps the text under the selection (ADR 0025).
+        if before != (size.rows, size.cols) {
+            session.selection().clear();
+        }
+        Ok(())
     }
 
     /// Clears session `id` to its cursor line (⌘K, "Clear to Start" in
@@ -488,7 +503,8 @@ impl App {
     /// the rows above the cursor, so the prompt line becomes the top row
     /// (see [`tessera_term::Terminal::clear_to_cursor`]). On the alternate
     /// screen only the scrollback goes; the full-screen application's
-    /// screen is not touched. The view returns to the live screen.
+    /// screen is not touched. The view returns to the live screen and the
+    /// selection is cleared.
     ///
     /// No [`SessionEvent::Output`] is sent: like [`App::resize`], this runs
     /// on the caller's thread, which redraws when it is done. The next
@@ -504,6 +520,8 @@ impl App {
         // the live screen when it is next read (ADR 0023); this does it at
         // once.
         session.scroll_to_bottom();
+        // The rows the selection numbered moved up (ADR 0025).
+        session.selection().clear();
         Ok(())
     }
 
@@ -741,6 +759,170 @@ impl App {
     /// [`Error::SessionNotFound`] if `id` is not a live session.
     pub fn scroll_position(&self, id: SessionId) -> Result<ScrollPosition> {
         Ok(self.session(id)?.scroll_position())
+    }
+
+    /// Starts a selection in session `id` at view-relative cell `at` (row 0
+    /// is the top row its view shows at the current scroll offset; a point
+    /// outside the grid is clamped to it): a mouse-down with
+    /// `granularity` [`Granularity::Char`] for one click,
+    /// [`Granularity::Word`] for a double-click and [`Granularity::Line`]
+    /// for a triple-click or more, and `block` for a rectangular selection.
+    /// Any selection before it is replaced.
+    ///
+    /// A single click selects nothing until [`App::select_extend`] (a
+    /// drag); a double-click selects the word, whitespace run or single
+    /// other character under it, and nothing past the end of the line's
+    /// text; a triple-click selects the whole logical line, every
+    /// soft-wrapped row of it at full width. See the [`selection`] module
+    /// for the word characters and when a selection is cleared.
+    ///
+    /// The selection is kept in absolute line numbers: it stays on its text
+    /// while output scrolls the screen and while the view scrolls. It
+    /// takes the selection lock, then the terminal lock (ADR 0025).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn select_begin(
+        &self,
+        id: SessionId,
+        at: Point,
+        granularity: Granularity,
+        block: bool,
+    ) -> Result<()> {
+        self.session(id)?.with_selection(|selection, term, offset| {
+            selection.begin(term.grid(), offset, at, granularity, block);
+        });
+        Ok(())
+    }
+
+    /// Extends session `id`'s selection to view-relative cell `at` (a
+    /// drag; clamped to the grid): it then covers the unit first clicked,
+    /// the unit under `at` and everything between, by the granularity it
+    /// began with; a block covers the rectangle. Call it when the pointer
+    /// moves to another cell, or leaves the first one: extending onto the
+    /// cell clicked selects that one cell. Nothing happens without a
+    /// selection begun.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn select_extend(&self, id: SessionId, at: Point) -> Result<()> {
+        self.session(id)?
+            .with_selection(|selection, term, offset| selection.extend(term.grid(), offset, at));
+        Ok(())
+    }
+
+    /// Moves the end of session `id`'s selection nearer to view-relative
+    /// cell `at` there (a shift-click; on a tie, the start), to the
+    /// boundary of the unit under `at` by the selection's granularity, and
+    /// keeps whether it is a block; the other end stays and a following
+    /// drag continues from it. Nothing happens without a selection.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn select_adjust(&self, id: SessionId, at: Point) -> Result<()> {
+        self.session(id)?
+            .with_selection(|selection, term, offset| selection.adjust(term.grid(), offset, at));
+        Ok(())
+    }
+
+    /// Selects everything in session `id`: the scrollback and the screen,
+    /// or only the screen while the alternate screen is shown. An empty
+    /// terminal is selected too ([`App::selection_text`] is then empty).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn select_all(&self, id: SessionId) -> Result<()> {
+        self.session(id)?
+            .with_selection(|selection, term, _| selection.select_all(term.grid()));
+        Ok(())
+    }
+
+    /// Clears session `id`'s selection.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn select_clear(&self, id: SessionId) -> Result<()> {
+        self.session(id)?.selection().clear();
+        Ok(())
+    }
+
+    /// Whether session `id` has a selection (Copy is possible): `true` also
+    /// while it is outside the rows the view shows and while its text is
+    /// empty. A selection the terminal no longer holds (see the
+    /// [`selection`] module) is cleared by this call first.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn has_selection(&self, id: SessionId) -> Result<bool> {
+        Ok(self
+            .session(id)?
+            .with_selection(|selection, term, _| selection.has_selection(term.grid())))
+    }
+
+    /// The text of session `id`'s selection, for Copy, or `None` without
+    /// one. It is cut from the cells selected:
+    ///
+    /// - soft-wrapped rows are joined with no newline; every hard line end
+    ///   gives `\n`, and so does every row of a block selection;
+    /// - every blank after the last text of a logical line is dropped
+    ///   (spaces the program wrote included: the grid does not tell them
+    ///   from never-written cells), but not the blanks inside a line or
+    ///   at a soft wrap with text after it;
+    /// - the newlines of blank rows at the end are dropped;
+    /// - a wide character is taken whole when either half is selected,
+    ///   spacer and padding cells give nothing, a grapheme cluster gives
+    ///   its whole text, and a tab gives the spaces it moved over.
+    ///
+    /// A selection of blanks only gives `Some("")`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn selection_text(&self, id: SessionId) -> Result<Option<String>> {
+        Ok(self
+            .session(id)?
+            .with_selection(|selection, term, _| selection.text(term.grid())))
+    }
+
+    /// The URL detected in session `id`'s text at view-relative cell `at`
+    /// (the view's scroll offset honoured), with the cells it covers on
+    /// each row the view shows, or `None` when there is no URL there or
+    /// `at` is outside the grid. Detection follows rules U1 to U9 of the
+    /// [`url`] module over the logical line, so a URL continues across
+    /// soft wraps; trailing punctuation is outside it.
+    ///
+    /// Looks at most [`url::MAX_URL_LEN`] characters to either side of
+    /// `at` under the terminal lock: call it per click or per hover change,
+    /// not in a tight loop.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn link_at(&self, id: SessionId, at: Point) -> Result<Option<Link>> {
+        Ok(self
+            .session(id)?
+            .with_viewport(|term, offset| selection::link_at(term.grid(), offset, at)))
+    }
+
+    /// Sets the cell the pointer hovers in session `id`'s view with the link
+    /// modifier held (view-relative), or `None` when it hovers nothing:
+    /// from the next frame on, the URL under it ([`App::link_at`]) is
+    /// underlined, one underline per row it covers, for as long as the
+    /// hover is set. The URL is looked up again every frame, so output
+    /// that moves or changes it moves the underline.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn set_hover(&self, id: SessionId, at: Option<Point>) -> Result<()> {
+        self.session(id)?.selection().set_hover(at);
+        Ok(())
     }
 
     /// The working directory session `id`'s shell last reported with
@@ -1099,7 +1281,10 @@ impl App {
         let result = if view.gpu().is_lost() {
             Err(RenderError::DeviceLost)
         } else {
-            session.with_viewport(|term, offset| view.capture(term, offset));
+            session.with_selection(|selection, term, offset| {
+                let changed = view.capture(term, offset);
+                view.set_decorations(selection.frame_decorations(term.grid(), offset, &changed));
+            });
             view.render(focused)
         };
         // A loss during the frame may surface as any error (or none).
@@ -1332,6 +1517,82 @@ impl App {
         gpu.inspect(Gpu::lose_device_for_test).is_some()
     }
 
+    /// Registers a session of `size` with no child: nothing it is sent
+    /// goes anywhere and it outputs only what [`App::feed_for_test`] feeds
+    /// it. Hanging it up (closing it) ends it.
+    ///
+    /// Exists only so tests can drive a session's terminal byte for byte.
+    ///
+    /// # Errors
+    ///
+    /// As [`App::spawn_session`] for the size and the session's threads.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn spawn_test_session(&self, size: PtySize) -> Result<SessionId> {
+        session::check_size(size)?;
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let id = self.allocate_id();
+        self.attach(id, Box::new(test_pty::NullPty::new(tx, size)), rx, size)
+    }
+
+    /// Applies `bytes` to session `id`'s terminal as if its child wrote
+    /// them, on the calling thread (no output event is sent).
+    ///
+    /// Exists only so tests can drive a session's terminal byte for byte.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn feed_for_test(&self, id: SessionId, bytes: &[u8]) -> Result<()> {
+        self.session(id)?
+            .with_terminal_mut(|term| term.advance(bytes));
+        Ok(())
+    }
+
+    /// Keeps at most `lines` lines of session `id`'s scrollback
+    /// ([`Terminal::set_max_scrollback`]).
+    ///
+    /// Exists only so tests can reach the scrollback cap with few lines
+    /// (the configuration's `scrollback_lines` is not applied yet).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn set_max_scrollback_for_test(&self, id: SessionId, lines: usize) -> Result<()> {
+        self.session(id)?
+            .with_terminal_mut(|term| term.set_max_scrollback(lines));
+        Ok(())
+    }
+
+    /// The selection and the link underlines the next frame of session
+    /// `id`'s view would draw, in its rows' coordinates, computed as
+    /// [`App::render_view`] computes them (the selection checked against
+    /// the terminal first).
+    ///
+    /// Exists only so tests can check what frames carry without a GPU.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn view_decorations_for_test(
+        &self,
+        id: SessionId,
+    ) -> Result<(
+        Option<tessera_render::Selection>,
+        Vec<tessera_render::Overlay>,
+    )> {
+        let decorations = self
+            .session(id)?
+            .with_selection(|selection, term, offset| selection.decorations(term.grid(), offset));
+        Ok((decorations.selection, decorations.overlays))
+    }
+
     /// Panics while holding the view table lock, poisoning it.
     ///
     /// Exists only so tests can prove that a panic inside a view call
@@ -1341,6 +1602,74 @@ impl App {
     pub fn panic_holding_view_lock(&self) {
         let _views = lock(&self.views);
         panic!("deliberate panic for testing");
+    }
+}
+
+/// The PTY of [`App::spawn_test_session`].
+#[cfg(any(test, feature = "test-hooks"))]
+mod test_pty {
+    use std::io;
+    use std::sync::mpsc::SyncSender;
+
+    use tessera_pty::{ExitStatus, Pty, PtyError, PtyEvent, PtySize};
+
+    /// A PTY without a child: writes are dropped, and hanging up or
+    /// killing it ends its event stream.
+    pub(crate) struct NullPty {
+        events: Option<SyncSender<PtyEvent>>,
+        size: PtySize,
+    }
+
+    impl NullPty {
+        pub(crate) fn new(events: SyncSender<PtyEvent>, size: PtySize) -> Self {
+            Self {
+                events: Some(events),
+                size,
+            }
+        }
+
+        fn end(&mut self, status: ExitStatus) {
+            if let Some(events) = self.events.take() {
+                let _ = events.try_send(PtyEvent::Exited(status));
+            }
+        }
+    }
+
+    impl Pty for NullPty {
+        fn write(&mut self, _bytes: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn try_write(&mut self, _bytes: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn resize(&mut self, size: PtySize) -> Result<(), PtyError> {
+            self.size = size;
+            Ok(())
+        }
+
+        fn size(&self) -> PtySize {
+            self.size
+        }
+
+        fn child_pid(&self) -> Option<u32> {
+            None
+        }
+
+        fn exit_status(&self) -> Option<ExitStatus> {
+            None
+        }
+
+        fn hangup(&mut self) -> io::Result<()> {
+            self.end(ExitStatus::Signaled(1));
+            Ok(())
+        }
+
+        fn kill(&mut self) -> io::Result<()> {
+            self.end(ExitStatus::Signaled(9));
+            Ok(())
+        }
     }
 }
 

@@ -398,6 +398,13 @@ impl Terminal {
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.state.grid.resize(rows, cols);
     }
+
+    /// Keeps at most `lines` lines of scrollback from now on (zero keeps
+    /// none); the oldest lines over the new cap are dropped at once. See
+    /// [`Grid::set_max_scrollback`].
+    pub fn set_max_scrollback(&mut self, lines: usize) {
+        self.state.grid.set_max_scrollback(lines);
+    }
 }
 
 /// Length of the incomplete UTF-8 sequence that ends `bytes`: a lead byte

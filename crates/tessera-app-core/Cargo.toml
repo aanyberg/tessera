@@ -26,6 +26,10 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# Enables `test-hooks` (`App::spawn_test_session`) for the integration tests.
+tessera-app-core = { path = ".", features = ["test-hooks"] }
+# URL detection and selection properties.
+proptest.workspace = true
 # `Gpu::lose_device_for_test` for this crate's device-loss tests.
 tessera-render = { workspace = true, features = ["test-hooks"] }
 

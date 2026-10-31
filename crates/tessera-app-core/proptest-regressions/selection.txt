@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9530bbb114293cb435387b2752d12ce8a7fe889f4585787e6c6216b83d513a1b # shrinks to setup = "   aa  ", from = (0, 0), to = (0, 0), offset = 0, ops = [Frame(0), Feed("  "), Frame(0)]
+cc 3c5253ea11a5c8e5b3ab083599b513348334fb53caa052cf728c1fd1be3eb7f1 # shrinks to setup = "\n\n\na  aa aa \n", from = (2, 0), to = (3, 0), offset = 0, ops = [Feed("\u{1b}[1;1Hzz\u{1b}[5;1H\n\n"), Feed("\r\n"), Frame(0), Feed("\u{1b}[H\u{1b}[2J"), Frame(0)]

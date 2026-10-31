@@ -92,6 +92,7 @@ use tessera_term::{CursorStyle, Request, Terminal};
 
 use crate::config_watch::Applied;
 use crate::input::MouseEvent;
+use crate::selection::SelectionState;
 use crate::view::{MAX_VIEW_COLS, MAX_VIEW_ROWS};
 use crate::{ScrollPosition, ScrollTarget};
 
@@ -479,6 +480,10 @@ pub(crate) struct Session {
     /// What the shell integration scripts reported, shared with the reader
     /// thread.
     reports: Arc<ShellReports>,
+    /// The selection and the link hover (ADR 0025). Taken before the
+    /// input and terminal locks, after the view table's, never the other
+    /// way round.
+    selection: Mutex<SelectionState>,
 }
 
 /// What a session's shell integration scripts reported (ADR 0022): its
@@ -871,6 +876,7 @@ impl Session {
             writer: Mutex::new(Some(writer)),
             input: Mutex::new(InputState::default()),
             reports,
+            selection: Mutex::new(SelectionState::default()),
         })
     }
 
@@ -1014,6 +1020,23 @@ impl Session {
         };
         self.store_scroll(seen, offset, left, &history);
         result
+    }
+
+    /// Runs `f` with the selection locked, then the terminal locked and
+    /// the view's scroll offset resolved against it, as
+    /// [`Session::with_viewport`] does. The selection lock is taken first
+    /// and held throughout (ADR 0025).
+    pub(crate) fn with_selection<R>(
+        &self,
+        f: impl FnOnce(&mut SelectionState, &Terminal, usize) -> R,
+    ) -> R {
+        let mut selection = lock(&self.selection);
+        self.with_viewport(|term, offset| f(&mut selection, term, offset))
+    }
+
+    /// The selection, locked, for a change that needs no terminal.
+    pub(crate) fn selection(&self) -> MutexGuard<'_, SelectionState> {
+        lock(&self.selection)
     }
 
     /// Stores the view at `offset` against `history`, read after `seen`
