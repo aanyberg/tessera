@@ -13,6 +13,7 @@
 //! | `ESC >` | DECKPNM | numeric keypad |
 //! | `ESC c` | RIS | full reset, scrollback and modes included |
 //! | `ESC # 8` | DECALN | fill the screen with `E` |
+//! | `ESC Z` | DECID | identify: the DA1 reply (see the `reports` module) |
 //!
 //! Any other escape sequence is ignored and logged at trace level. Expected
 //! behaviour is pinned by `tests/fixtures/csi_spec.txt`.
@@ -44,6 +45,8 @@ impl State {
             ([], b'=') => self.set_application_keypad(true),
             ([], b'>') => self.set_application_keypad(false),
             ([b'#'], b'8') => self.screen_alignment(),
+            // DECID: answered exactly like DA1 (xterm).
+            ([], b'Z') => self.primary_device_attributes(),
             _ => trace!(?intermediates, byte = ?char::from(byte), "ESC ignored"),
         }
     }

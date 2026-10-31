@@ -15,6 +15,21 @@
 //! parse with `tessera-shell-integration`, which this crate does not depend
 //! on. See the `osc` module for the caps and the rules.
 //!
+//! ## Device reports
+//!
+//! Queries a program sends to learn what the terminal is and what state it
+//! is in are answered with [`Request::Reply`] (ADR 0024): DA1/DA2/DA3 and
+//! DECID, XTVERSION, DSR and CPR, the DEC DSRs, DECRQM (one reply per
+//! query, 0 for an unknown mode), DECRQSS (`DCS $ q`, for SGR, DECSTBM,
+//! DECSCUSR and DECSCL), the kitty keyboard flags query `CSI ? u` and the
+//! XTWINOPS size reports (`CSI 14/16/18/19 t`; the pixel sizes once
+//! [`Terminal::set_cell_pixels`] knows the cell). Replies are always 7-bit.
+//! Tessera identifies as itself, not as xterm ([`DA2_PV`]). Reports that
+//! would echo text a program supplied (the title reports `CSI 20/21 t`,
+//! XTGETTCAP) are never answered. `CSI 22 t` and `CSI 23 t` push and pop
+//! the window title, at most [`TITLE_STACK_DEPTH`] deep; a pop sends
+//! [`Request::SetTitle`] with the restored title.
+//!
 //! ## DECSTR
 //!
 //! `CSI ! p` (soft terminal reset, sent by the terminfo `rs2` and `is2`
@@ -35,7 +50,8 @@
 //!
 //! It keeps the screen contents, the scrollback, the cursor position, a
 //! pending wrap and the tab stops; RIS (`ESC c`) is the reset that clears
-//! them. Its parameters are ignored, as in xterm (`CSI 5 ! p` resets too).
+//! them. Both keep the title stack (ADR 0024). Its parameters are ignored,
+//! as in xterm (`CSI 5 ! p` resets too).
 //! REP has nothing to repeat afterwards, as after any sequence.
 //!
 //! - the modes on DECSTR's reset list (ADR 0020): origin mode (DECOM)
@@ -64,10 +80,12 @@
 
 mod control;
 mod csi;
+mod dcs;
 mod esc;
 pub mod keyboard;
 mod modes;
 mod osc;
+mod reports;
 mod sgr;
 
 pub use keyboard::{
@@ -75,6 +93,10 @@ pub use keyboard::{
     ModifyOtherKeys, encode_key, encode_key_into,
 };
 pub use modes::{KITTY_STACK_DEPTH, Modes, MouseEncoding, MouseTracking};
+pub use reports::{DA2_PV, TITLE_STACK_DEPTH};
+
+use dcs::Dcs;
+use reports::TitleStack;
 
 use modes::KittyStacks;
 
@@ -134,6 +156,13 @@ pub enum Request {
         /// Columns: 132 or 80.
         cols: u16,
     },
+    /// Bytes to write to the child: the answer to a query it sent (DA,
+    /// DSR, DECRQM, DECRQSS, XTVERSION, window size, ...; ADR 0024).
+    /// Always 7-bit controls. One request per answered query, in the order
+    /// the queries completed; the host writes them to the PTY in that
+    /// order, after any input it already queued. The terminal never drops
+    /// one: bounding them is the host's job.
+    Reply(Vec<u8>),
 }
 
 /// The shape of the cursor, as DECSCUSR (`CSI Ps SP q`) and the
@@ -194,6 +223,10 @@ impl Terminal {
                 c1_8bit_replies: false,
                 cursor_override: None,
                 default_cursor_style: CursorStyle::default(),
+                dcs: Dcs::default(),
+                title: String::new(),
+                title_stack: TitleStack::default(),
+                cell_pixels: None,
             },
             carry: Vec::new(),
         }
@@ -267,8 +300,8 @@ impl Terminal {
     /// The conformance level DECSCL (`CSI Pl ; Pc " p`) last selected:
     /// 1 (VT100) to 5 (VT500), `Pl - 60`. A new terminal is at level 4
     /// (VT400-class, as xterm's default `decTerminalID` 420); DECSTR and
-    /// RIS keep the level. Nothing in the emulator depends on it yet; the
-    /// DA1 answer will (#10).
+    /// RIS keep the level. The device reports follow it: DA1, DA3, the DEC
+    /// DSRs and DECRQSS (ADR 0024).
     pub fn conformance_level(&self) -> u8 {
         self.state.conformance_level
     }
@@ -276,8 +309,9 @@ impl Terminal {
     /// Whether replies to the host should use 8-bit C1 controls (`CSI` as
     /// the single byte `0x9B` rather than `ESC [`). DECSCL sets it from
     /// its `Pc` (0 or absent, and 2: on; 1: off; level 1 always off) and
-    /// RIS turns it off; it starts off. Recorded only: no reply honours it
-    /// yet (S7C1T/S8C1T and 8-bit replies are #96).
+    /// RIS turns it off; it starts off. Recorded and reported (DECRQSS of
+    /// DECSCL), but every reply is still 7-bit (S7C1T/S8C1T and 8-bit
+    /// replies are #96).
     pub fn c1_8bit_replies(&self) -> bool {
         self.state.c1_8bit_replies
     }
@@ -297,6 +331,15 @@ impl Terminal {
     /// Starts as a steady block.
     pub fn set_default_cursor_style(&mut self, style: CursorStyle) {
         self.state.default_cursor_style = style;
+    }
+
+    /// Sets the size of one cell in physical pixels, for the pixel size
+    /// reports `CSI 14 t` (text area) and `CSI 16 t` (cell). Zero in either
+    /// dimension means unknown, as before the first call: both reports
+    /// then stay silent rather than answer a size a program would divide
+    /// by. The host calls it whenever its view's cell size changes.
+    pub fn set_cell_pixels(&mut self, width: u16, height: u16) {
+        self.state.cell_pixels = (width > 0 && height > 0).then_some((width, height));
     }
 
     /// Whether auto-wrap mode (DECAWM) is on: [`Modes::auto_wrap`].
@@ -402,11 +445,11 @@ struct State {
     last_printed: Option<char>,
     /// The operating level DECSCL (`CSI 6n ; Pc " p`) last selected, 1..=5;
     /// 4 (VT400-class, xterm's default `decTerminalID` 420) until then. Kept
-    /// by DECSTR and RIS, as in xterm. Only DA1 (#10) will read it.
+    /// by DECSTR and RIS, as in xterm. The device reports read it.
     conformance_level: u8,
     /// Whether replies should use 8-bit C1 controls (`0x9B` for `ESC [`):
     /// set by DECSCL's `Pc`, cleared by RIS. Recorded for the reply code
-    /// (S7C1T/S8C1T, #96; reports, #10); nothing reads it yet.
+    /// (S7C1T/S8C1T, #96); only the DECRQSS report of DECSCL reads it.
     c1_8bit_replies: bool,
     /// The cursor style the program asked for: set by DECSCUSR 1..=6 and
     /// by DECSET/DECRST 12 (which keeps the shape in effect), dropped by
@@ -416,6 +459,17 @@ struct State {
     /// The configured cursor style ([`Terminal::set_default_cursor_style`]):
     /// configuration, not terminal state, so no reset touches it.
     default_cursor_style: CursorStyle,
+    /// The device control string in progress (DECRQSS, see `dcs`).
+    dcs: Dcs,
+    /// The title the terminal last emitted as [`Request::SetTitle`] (empty
+    /// before any): what the title stack pushes.
+    title: String,
+    /// The XTWINOPS title stack (`CSI 22 t` / `CSI 23 t`). Kept by DECSTR
+    /// and RIS.
+    title_stack: TitleStack,
+    /// The cell size in pixels, `(width, height)`, both non-zero, from
+    /// [`Terminal::set_cell_pixels`]; `None` while unknown.
+    cell_pixels: Option<(u16, u16)>,
 }
 
 impl State {
@@ -464,11 +518,24 @@ impl State {
                 byte,
                 ..
             } => self.esc(&intermediates, byte),
-            Action::Osc(params) => self.osc(&params),
-            ignored @ (Action::Print(_)
-            | Action::DcsStart { .. }
-            | Action::DcsData(_)
-            | Action::DcsEnd) => trace!(action = ?ignored, "sequence not applied yet"),
+            Action::Osc(params) => {
+                let before = self.pending.len();
+                self.osc(&params);
+                // The title stack pushes the title last emitted.
+                if let Some(Request::SetTitle(title)) = self.pending[before..].last() {
+                    self.title.clone_from(title);
+                }
+            }
+            Action::DcsStart {
+                params,
+                intermediates,
+                action,
+                ignore,
+                ..
+            } => self.dcs_start(&params, &intermediates, action, ignore),
+            Action::DcsData(bytes) => self.dcs_data(&bytes),
+            Action::DcsEnd => self.dcs_end(),
+            ignored @ Action::Print(_) => trace!(action = ?ignored, "sequence not applied yet"),
             unknown => trace!(action = ?unknown, "unknown action ignored"),
         }
     }

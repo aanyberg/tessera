@@ -482,7 +482,6 @@ fn unknown_sequences_leave_the_grid_unchanged() {
         b"\x1b[;u",
         b"\x1b[1:2u",
         b"\x1b[65535;65535u",
-        b"\x1b[?u",
         b"\x1b[>1u",
         b"\x1b[<u",
         b"\x1b[<5u",

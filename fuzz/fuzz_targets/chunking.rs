@@ -11,14 +11,21 @@
 //!
 //! Compared: every visible and scrollback line (cells, styles, clusters,
 //! wrap flags), the cursor, pending wrap, pen, scroll region, the modes,
-//! the keyboard modes, the conformance level and the requests. Hidden state
+//! the keyboard modes, the conformance level and the requests, replies to
+//! the child's queries ([`Request::Reply`], #10) included. Hidden state
 //! is compared by probing: after the first comparison both terminals get
 //! the same probes, each followed by another comparison: REP (`CSI 3 b`,
 //! the last printed character), DECRC (`ESC 8`, the saved cursor), three
 //! tabs (the tab stops), a DECSET 1049 reset (back to the stashed primary
 //! screen and its cursor), DECRC and tabs there (the primary's saved cursor
-//! and stops), and DECSET 1049 with DECRC (the alternate screen's saved
-//! cursor slot, kept between visits).
+//! and stops), DECSET 1049 with DECRC (the alternate screen's saved
+//! cursor slot, kept between visits), three title pops (the title stack:
+//! each pop that finds a title requests it) and a burst of queries whose
+//! replies read the cursor, the modes, the pen and the kitty flags. The
+//! title probe starts with `ESC \`, so a string the input left open ends
+//! before it.
+//!
+//! [`Request::Reply`]: tessera_term::Request::Reply
 
 #![no_main]
 
@@ -101,7 +108,7 @@ fn assert_same(whole: &mut Terminal, chunked: &mut Terminal, stage: &str) {
 
 /// Sequences that expose hidden state, fed to both terminals in order after
 /// the input, each followed by a comparison (module docs).
-const PROBES: [(&[u8], &str); 6] = [
+const PROBES: [(&[u8], &str); 8] = [
     // REP first: any other sequence forgets the character it repeats.
     (b"\x1b[3b", "after REP"),
     (b"\x1b8", "after DECRC"),
@@ -109,6 +116,11 @@ const PROBES: [(&[u8], &str); 6] = [
     (b"\x1b[?1049l", "after leaving the alternate screen"),
     (b"\x1b8\t\t\t", "after DECRC and tabs on the primary screen"),
     (b"\x1b[?1049h\x1b8", "after DECRC on the alternate screen"),
+    (b"\x1b\\\x1b[23t\x1b[23t\x1b[23t", "after popping titles"),
+    (
+        b"\x1b[6n\x1b[?6n\x1b[?25$p\x1b[?2026$p\x1b[?u\x1bP$qm\x1b\\\x1bP$q q\x1b\\\x1b[c",
+        "after the queries",
+    ),
 ];
 
 fn probe(whole: &mut Terminal, chunked: &mut Terminal, bytes: &[u8], stage: &str) {

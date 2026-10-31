@@ -19,6 +19,20 @@
 //! directly, waiting as needed, so its bytes may overtake or interleave
 //! with pending input.
 //!
+//! # Replies
+//!
+//! The terminal's answers to the child's queries ([`Request::Reply`]: DA,
+//! DSR, DECRQM, ...; ADR 0024) go through the same outbox, queued by the
+//! reader thread after the input already there, in the order the queries
+//! arrived. The replies of one slice of output (see `ADVANCE_SLICE`) are
+//! collected under the slice's terminal lock and, after it is released,
+//! appended to the last entry still queued (or queued as one), so a flood
+//! of queries costs bytes, not entries, however the child's output is read. Queueing never waits for the child: when
+//! the outbox lacks room for them, or the session is closing or its
+//! writer stopped, they are dropped (logged at debug level and counted).
+//! So a reply to a query sent while a paste is still queued reaches the
+//! child after the paste.
+//!
 //! # Closing
 //!
 //! A session is live until the application closes it, then *closing*
@@ -524,6 +538,9 @@ struct Outbox {
     state: Mutex<OutboxState>,
     /// Signalled when input arrives or the outbox closes.
     ready: Condvar,
+    /// Replies dropped because they did not fit or the outbox no longer
+    /// accepted input.
+    dropped_replies: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -567,6 +584,35 @@ impl Outbox {
         state.inputs.push_back(bytes);
         self.ready.notify_one();
         Ok(())
+    }
+
+    /// Queues the reader thread's `reply` after the input already queued
+    /// (appended to the last queued entry, if any), or drops it (and counts it) when it does not fit or the outbox no
+    /// longer accepts input: the reader never waits for the child. The
+    /// lock it takes is only ever held briefly (the writer releases it
+    /// before it writes).
+    fn try_queue_reply(&self, session: SessionId, reply: Vec<u8>) {
+        let mut state = lock(&self.state);
+        if let Err(err) = state.check_room(reply.len()) {
+            drop(state);
+            let dropped = self.dropped_replies.fetch_add(1, Ordering::Relaxed) + 1;
+            // A flood would log once per slice: log the first and then at
+            // each power of two.
+            if dropped.is_power_of_two() {
+                tracing::debug!(%session, dropped, %err, "reply to the child dropped");
+            }
+            return;
+        }
+        state.bytes += reply.len();
+        // Joined to the entry at the back, so a child that writes one query
+        // per read costs bytes, not entries. The writer pops an entry
+        // before writing it, so the back is never the one being written
+        // and the order is unchanged.
+        match state.inputs.back_mut() {
+            Some(back) => back.extend_from_slice(&reply),
+            None => state.inputs.push_back(reply),
+        }
+        self.ready.notify_one();
     }
 
     /// Stops the writer and drops pending input.
@@ -795,6 +841,7 @@ impl Session {
         let pump = Pump {
             id,
             term: Arc::clone(&term),
+            outbox: Arc::clone(&outbox),
             muted: Arc::clone(&muted),
             delivering: Arc::clone(&delivering),
             observers,
@@ -830,6 +877,23 @@ impl Session {
     /// The working directory the session's shell last reported (OSC 7).
     pub(crate) fn cwd(&self) -> Option<Cwd> {
         self.reports.cwd()
+    }
+
+    /// The outbox's queued bytes (including an input being written), its
+    /// queued entries and the replies it dropped so far.
+    #[cfg(test)]
+    pub(crate) fn outbox_stats(&self) -> (usize, usize, usize) {
+        let state = lock(&self.outbox.state);
+        let dropped = self.outbox.dropped_replies.load(Ordering::Relaxed);
+        (state.bytes, state.inputs.len(), dropped)
+    }
+
+    /// Tells the terminal the size of one cell of the session's view in
+    /// physical pixels, for the pixel size reports (`CSI 14 t`, `CSI 16 t`);
+    /// saturated to `u16`. Zero means unknown.
+    pub(crate) fn set_cell_pixels(&self, width_px: u32, height_px: u32) {
+        let px = |n: u32| u16::try_from(n).unwrap_or(u16::MAX);
+        self.with_terminal_mut(|term| term.set_cell_pixels(px(width_px), px(height_px)));
     }
 
     /// Queues `bytes` (one key, one paste) for the writer thread; never
@@ -1472,6 +1536,9 @@ fn give_way(term: &SharedTerminal, mut yield_now: impl FnMut()) -> usize {
 struct Pump {
     id: SessionId,
     term: Arc<SharedTerminal>,
+    /// The session's outbox, for the terminal's replies (see "Replies" in
+    /// the module documentation).
+    outbox: Arc<Outbox>,
     muted: Arc<AtomicBool>,
     /// See [`Session::delivering`].
     delivering: Arc<Mutex<()>>,
@@ -1501,8 +1568,20 @@ impl Pump {
                         // counts as waiting, so it never makes itself yield.
                         let mut term = lock(&self.term.term);
                         term.advance(slice);
-                        requests.append(&mut term.take_requests());
+                        let mut replies = Vec::new();
+                        for request in term.take_requests() {
+                            match request {
+                                Request::Reply(bytes) => replies.extend_from_slice(&bytes),
+                                other => requests.push(other),
+                            }
+                        }
                         drop(term);
+                        // The slice's replies, joined, once the terminal is
+                        // unlocked: one outbox entry per slice, so a flood of
+                        // queries costs bytes, not entries.
+                        if !replies.is_empty() {
+                            self.outbox.try_queue_reply(self.id, replies);
+                        }
                         give_way(&self.term, thread::yield_now);
                         rest = after;
                     }
@@ -1527,7 +1606,7 @@ impl Pump {
                             // `Request` is non-exhaustive; requests this
                             // layer does not route (DECCOLM's resize, an
                             // earlier clipboard write of the chunk) are
-                            // dropped.
+                            // dropped. Replies were queued per slice.
                             _ => {}
                         }
                     }

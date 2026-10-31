@@ -1,0 +1,1573 @@
+# =============================================================================
+# tessera-term: device reports and the PTY reply path (DA, DSR, XTVERSION, DECRQM, DECRQSS, XTWINOPS)   (issue #10 part 1, wave 8)
+# crates/tessera-term/tests/fixtures/reports_spec.txt   (spec-researcher output, 2026-10-31)
+# Companion: reports_spec.notes.md (identity, level 5, unknown cell size, xterm-vs-spec table, "Done when" amendments).
+#
+# FORMAT (one table-driven test, tests/reports.rs, through common::check_table; every failing id is reported)
+#   ### ID               unique row id; the prefix names the group (DA, DSR, XV, RM, RQ, WO, TS, KT, RP).
+#   size: RxC            grid size (default for an omitted size would be 24x80; every row states it).
+#   step: feed <bytes>   \e \x1b \\ \r \n \xNN \u{H} escapes as in the other fixtures. The test also runs each row once
+#                        with the bytes split at EVERY offset (Chunking) and the replies must be identical.
+#   step: set cell_px <W>x<H>   Terminal::set_cell_pixels(width, height) (pixels per cell). Rows without it have the
+#                        cell size UNKNOWN (never set), which is the state before the first frame.
+#   step: set title <text>      the title the terminal last emitted (same as feeding OSC 2 ; text ST; shorthand).
+#   reply: <bytes>|none  EXACT bytes the terminal queued as Request::Reply since the previous `reply:` line (or the start),
+#                        concatenated in order. `none` = no Reply request at all. Replies are ALWAYS 7-bit (ESC [ , ESC P,
+#                        ESC \ ), also after DECSCL Pc=0/2 (S8C1T is #96's job, wave 9). `<VERSION>` stands for
+#                        env!("CARGO_PKG_VERSION") of the tessera-term crate.
+#   requests: [..]       OPTIONAL: non-Reply requests drained after the steps above it: `SetTitle("..")` and `Resize(r,c)`;
+#                        omitted = not asserted. Reply requests are never listed here.
+#   screen:/cursor:      OPTIONAL, as csi_spec.txt (`>` rows, `|` after the cursor cell), only where "the query must not print
+#                        or swallow text" is the point.
+#   cite:                the spec/source for the row. note: free text. flags: decision (D-xxx below) | xterm-quirk |
+#                        negative | unverified | security | control
+#
+# PRIMARY SOURCES (fetched 2026-10-31)
+#   [CTL]  xterm ctlseqs https://invisible-island.net/xterm/ctlseqs/ctlseqs.txt (patch 412 snapshot; section names as in the text)
+#   [XT]   xterm source, ThomasDickey/xterm-snapshots master, as fetched 2026-10-31 (version.h XTERM_PATCH 412):
+#            charproc.c L4098..4186 CASE_DA1; L4224..4283 CASE_DA2; L4284..4300 CASE_DECRPTUI (DA3); L4599..4746 CASE_DSR/CPR;
+#            L5462..5471 CASE_REPORT_VERSION (XTVERSION); L5087..5130 CASE_DECSCL; L8979.. window_ops; L9142..9235 14/16/18/19 t;
+#            L9260..9320 22/23 t; misc.c L5388..5470 do_ansi_rqm; L5470..5890 do_dec_rqm; L4880..5030 DECRQSS (do_dcs);
+#            misc.c L3252..3316 xtermFormatSGR; misc.c L7976..8030 xtermPushTitle/xtermPopTitle; ptyx.h L2371 MAX_SAVED_TITLES 10;
+#            version.c xtermVersion() -> "XTerm(412)"; xterm.man disallowedWindowOps default
+#            "GetChecksum,GetIconTitle,GetSelection,GetWinTitle,SetSelection,SetXprop" (so 14/16/18/19/22/23 t are ALLOWED by default).
+#   [DEC]  DEC STD 070 / VT510 RM https://vt100.net/docs/vt510-rm/ (DA, DSR, DECRQM, DECRPM, DECRQSS, DECSCL chapters); VT520 RM for level 5.
+#   [VT]   tmux tty-keys.c (master): reads DA1 params 4, 21, 28, 52 only when the first param is 61..65; DA2 first param 77/84/85 =
+#          mintty/tmux/urxvt; XTVERSION name prefixes "XTerm(", "iTerm2 ", "mintty ", "foot(", "kitty(", "WezTerm "; DECRPM ?2026.
+#          vim term.c (master): t_RV=ESC[>c, t_u7=ESC[6n, t_RC=ESC[?12$p, t_RS=ESC P$q q ST, t_ST/t_RT=ESC[22;2t / ESC[23;2t,
+#          t_Si/t_Ri=ESC[22;1t / ESC[23;1t, t_KS-query ESC[?u; handle_version_response: DA2 Pv >= 95 mouse drag, >= 277 SGR mouse,
+#          Pp=1 with Pv 4000..4009 = kitty, >= 2500 = "not xterm" (no xterm-specific quirks, still SGR mouse).
+#          neovim tui.c (master): ESC[?u ESC[c (kitty probe then DA1 as sentinel), ESC[0m ESC[4:3m ESC P$qm ST (curly underline
+#          probe), ESC]11;? BEL ESC[5n (bg colour then DSR 5 as sentinel), DECRQM ?69 ?2026 ?2027 ?2031 ?2048, final ESC[c at exit,
+#          ESC[22;0t / ESC[23;0t title stack.
+#   [KT]   kitty docs https://sw.kovidgoyal.net/kitty/ (keyboard protocol "Detection of support": CSI ? u then CSI c; DECRQSS m returns 4:3).
+#   [CS]   Contour synchronized-output spec https://gist.github.com/christianparpart/d8a62cc1ab659194337d73e33e3ae6ed (DECRQM ?2026
+#          answers 1 or 2 when supported, 0 when not).
+#   Not verified here (no network access to the product): iTerm2, WezTerm and Alacritty reply strings are quoted from memory only where a
+#   row says "(from memory)"; xterm rows are read from the source above.
+#
+# DECISIONS (D-xxx; the lead confirms, the rows follow the recommendation):
+#   D-ID      Tessera is NOT xterm-compatible by identity. XTVERSION = DCS > | Tessera <VERSION> ST (space, no parenthesis, so no
+#             tmux name prefix matches and tmux falls back to terminfo + DA1). DA2 = CSI > 1 ; <PV> ; 0 c with Pp=1 (VT220-class, as
+#             kitty, foot and Ghostty answer); Pc is always 0. Never Pp 77/84/85 (tmux reads them as mintty/tmux/urxvt) nor Pp=1 with
+#             Pv 4000..4009 (vim reads that as kitty).
+#   D-DA2PV   NEEDS THE LEAD (rows use the placeholder <PV> = the test's constant reports::DA2_PV, so the value can change without
+#             touching rows). vim term.c handle_version_response reads Pv: < 95 no mouse-drag reporting, 95..276 X10-style drag only,
+#             >= 277 SGR mouse, >= 2500 "not an xterm" (skips xterm-only quirks, still SGR-capable). Recommendation: Pv >= 2500, encoded
+#             `10000 + minor*100 + patch` (0.1.0 -> 10100; stays below vim's 20000 "rxvt" cut). Alternative: `major*10000+minor*100+patch`
+#             (0.1.0 -> 100), which is how Alacritty/foot encode it but would leave vim without SGR mouse.
+#   D-DA1     DA1 first parameter is 60 + conformance_level() (DECSCL changes it, as on the VT510/VT520; xterm itself keeps the
+#             decTerminalID resource and ignores DECSCL here, xterm-quirk). Level 1 (VT100) answers CSI ? 1 ; 2 c (xterm's VT100 form).
+#             Levels 2..5 answer CSI ? 6<L> ; 22 c : only features Tessera implements (22 = ANSI colour). NOT advertised: 1 (132
+#             columns: DECCOLM never resizes), 2 (printer), 3, 4 (no ReGIS/Sixel), 6 (selective erase, #95), 8, 9 (NRCS, #112), 15,
+#             16, 17, 18, 21 (#97), 28 (rectangular editing), 29, 52 (clipboard: OSC 52 is write-only, tmux would then try to read).
+#             Feature numbers are added when the issue that implements them lands.
+#   D-L5      Level 5 (reachable through CSI 65 " p, #92; xterm with id 420 rejects 65) answers as a VT525 (DEC STD 070 / xterm
+#             decTerminalID=525): DA1 CSI ? 65 ; 22 c, DECRQSS " p -> 65 ; 1 " p. Alternative (clamp to 4) rejected: the level is
+#             stored, so the reply must follow it. DA2 does NOT follow the level (xterm: it follows the resource, not DECSCL).
+#   D-DA3     CSI = c answers DCS ! | 00000000 ST (xterm DECRPTUI: site code and serial zero) at level >= 4, silence below (xterm).
+#   D-DECID   ESC Z (DECID) answers exactly like DA1 (xterm CASE_DECID -> DA1 reply).
+#   D-DSRSET  DEC DSRs answered: ?6 (DECXCPR), ?15, ?25, ?26, ?55, ?56, ?75, ?85 with xterm's level gates; ?53, ?62, ?63 and every
+#             other Ps stay silent (a documented subset; the brief allows it).
+#   D-CELLPX  Unknown cell size: CSI 14 t / CSI 16 t stay SILENT (no zero reply: a zero cell size divides by zero in clients).
+#             Once set_cell_pixels(w,h) was called with w,h > 0 they answer. 18 t and 19 t never need pixels.
+#   D-WIN2    CSI 14;2 t (whole-window pixels) is silent: Tessera's terminal does not know the window frame. CSI 15 t (screen px) silent.
+#   D-19T     CSI 19 t (screen size in characters) answers the grid size, like 18 t (there is no display behind a grid): xterm
+#             answers root-window pixels / cell pixels. Recommended because a silent 19 t makes `resize -s`-style probes time out.
+#   D-TSTACK  Supersedes ADR 0022's D-TSTACK for push/pop only (reports 20/21 t stay silent). Stack depth 10 (xterm
+#             MAX_SAVED_TITLES), a push onto a full stack drops the OLDEST entry (xterm overwrites a ring slot; the 10 most
+#             recent are kept either way). 22;0 / 22;2 / 22 push the window title; 22;1 (icon) is a no-op because the icon name is not
+#             modelled (D-OSC1); 23;0 / 23;2 / 23 pop and emit Request::SetTitle; 23;1 is a no-op; pop on an empty stack does nothing;
+#             a third parameter (22;2;N direct slot access) voids the sequence. The stored title is the one the terminal last emitted
+#             (post-sanitising); before any OSC 0/2 it is the empty string, so popping it emits SetTitle("") = the frontend default.
+#   D-RQM0    DECRQM answers for EVERY query, with 0 for modes Tessera does not know (xterm too): programs that send several queries
+#             followed by DA1 (neovim) match replies in order and must not see a missing reply.
+#   D-RQSS    DECRQSS: answers m, r, " p, SP q; every other Pt (including " q DECSCA until #95, s DECSLRM until #97, t, $|, *|) answers
+#             DCS 0 $ r ST. SGR reply uses xterm's order and its colon forms (38:5:n, 38:2::r:g:b), and reports a curly/dotted/dashed
+#             underline as 4:3/4:4/4:5 (xterm only ever prints ;4; kitty prints 4:3 and neovim's probe needs it, [VT] [KT]).
+#   D-SECURITY Replies never contain text the program supplied (no title, no icon label, no OSC payload echoed), except the colour
+#             echo of 10-colors; CSI 20/21 t, 11/13/15 t, XTGETTCAP (DCS + q), XTGETXRES and DECRQUPSS stay silent.
+#   D-ORDER   A reply is queued the moment its query completes, in query order, also inside one chunk; a query cut by a chunk
+#             boundary is answered once, when it completes (the Chunking harness checks this).
+#
+# =============================================================================
+
+# ------------------------------------------------------------------ DA. Primary, secondary, tertiary device attributes
+
+### DA01_da1_plain
+size: 24x80
+step: feed \e[c
+reply: \e[?64;22c
+cite: [CTL] "CSI Ps c Send Device Attributes (Primary DA). Ps = 0 or omitted -> request attributes"; [XT] CASE_DA1 `GetParam(0) <= 0`; D-DA1 (level 4 default, conformance_level() == 4, only implemented features)
+flags: decision
+
+### DA02_da1_ps0
+size: 24x80
+step: feed \e[0c
+reply: \e[?64;22c
+cite: [CTL] as DA01; explicit Ps = 0
+flags: decision
+
+### DA03_da1_nonzero_param_silent
+size: 24x80
+step: feed \e[1c\e[2c\e[?c\e[?0c
+reply: none
+cite: [XT] CASE_DA1 answers only when GetParam(0) <= 0; `CSI ? c` is a different (private) sequence xterm does not route to DA1
+flags: xterm-quirk negative
+
+### DA04_decid_esc_z
+size: 24x80
+step: feed \eZ
+reply: \e[?64;22c
+cite: [XT] CASE_DECID answers the DA1 reply (VT100-compatible identification, DEC STD 070 DECID); D-DECID
+flags: decision
+
+### DA05_da1_level1
+size: 24x80
+step: feed \e[61"p\e[c
+reply: \e[?1;2c
+cite: [XT] CASE_DA1 for display_da1 < 200: VT100 form `?1;2c` (xterm ties it to the resource; D-DA1 ties it to conformance_level()); [DEC] VT510 RM DA: level 1 = VT100 family
+flags: decision xterm-quirk
+
+### DA06_da1_level2
+size: 24x80
+step: feed \e[62"p\e[c
+reply: \e[?62;22c
+cite: D-DA1: 60 + level; [XT] 60 + display_da1/100
+flags: decision
+
+### DA07_da1_level3
+size: 24x80
+step: feed \e[63"p\e[c
+reply: \e[?63;22c
+cite: D-DA1
+flags: decision
+
+### DA08_da1_level4
+size: 24x80
+step: feed \e[64"p\e[c
+reply: \e[?64;22c
+cite: D-DA1
+flags: decision
+
+### DA09_da1_level5
+size: 24x80
+step: feed \e[65"p\e[c
+reply: \e[?65;22c
+cite: D-L5 (xterm id 420 refuses `CSI 65 " p`, charproc.c L5101; xterm id 525 would answer `?65;...`); #92 stores level 5
+flags: decision
+
+### DA10_da1_after_decstr_keeps_level
+size: 24x80
+step: feed \e[62"p\e[!p\e[c
+reply: \e[?62;22c
+cite: ADR 0020: DECSTR keeps the conformance level (xterm: DECSTR does not call set_vtXX_level)
+flags: control
+
+### DA11_da1_after_ris_keeps_level
+size: 24x80
+step: feed \e[62"p\ec\e[c
+reply: \e[?62;22c
+cite: ADR 0020: RIS keeps the level, as xterm
+flags: control
+
+### DA12_da1_reply_stays_7bit_after_s8c1t_decscl
+size: 24x80
+step: feed \e[64;2"p\e[c
+reply: \e[?64;22c
+cite: Brief: replies are always 7-bit until #96 (wave 9); `c1_8bit_replies()` is true here but must not change the bytes. [XT] would answer 8-bit CSI (0x9B) here; this row flips in #96
+flags: decision control
+
+### DA13_da2_plain
+size: 24x80
+step: feed \e[>c
+reply: \e[>1;<PV>;0c
+cite: [CTL] "CSI > Ps c Send Device Attributes (Secondary DA) -> CSI > Pp ; Pv ; Pc c"; [XT] CASE_DA2 `GetParam(0) <= 0`, Pc always 0; D-ID, D-DA2PV (<PV> is reports::DA2_PV)
+flags: decision
+
+### DA14_da2_ps0
+size: 24x80
+step: feed \e[>0c
+reply: \e[>1;<PV>;0c
+cite: [CTL] as DA13
+flags: decision
+
+### DA15_da2_nonzero_silent
+size: 24x80
+step: feed \e[>1c\e[>2c
+reply: none
+cite: [XT] CASE_DA2 answers only for GetParam(0) <= 0
+flags: xterm-quirk negative
+
+### DA16_da2_not_changed_by_level
+size: 24x80
+step: feed \e[61"p\e[>c
+reply: \e[>1;<PV>;0c
+cite: [XT] DA2 keys on screen->terminal_id (the resource), not on DECSCL's vtXX_level
+flags: xterm-quirk
+
+### DA17_da3_level4
+size: 24x80
+step: feed \e[=c
+reply: \eP!|00000000\e\\
+cite: [CTL] "CSI = Ps c Send Device Attributes (Tertiary DA). Ps = 0 -> report Terminal Unit ID"; [XT] CASE_DECRPTUI `vtXX_level >= 4`: `DCS ! | 0000 0000 ST`; D-DA3
+flags: decision
+
+### DA18_da3_ps0
+size: 24x80
+step: feed \e[=0c
+reply: \eP!|00000000\e\\
+cite: [XT] as DA17
+flags: decision
+
+### DA19_da3_below_level4_silent
+size: 24x80
+step: feed \e[63"p\e[=c
+reply: none
+cite: [XT] CASE_DECRPTUI requires vtXX_level >= 4
+flags: xterm-quirk negative
+
+### DA20_da3_nonzero_silent
+size: 24x80
+step: feed \e[=1c
+reply: none
+cite: [XT] CASE_DECRPTUI answers only for GetParam(0) <= 0
+flags: negative
+
+### DA21_neovim_kitty_probe_then_da1
+size: 24x80
+step: feed \e[?u\e[c
+reply: \e[?0u\e[?64;22c
+cite: [KT] keyboard protocol detection: query `CSI ? u` immediately followed by `CSI c`; a terminal that supports the protocol answers `CSI ? flags u` BEFORE the DA1 reply (here flags 0 = nothing pushed); neovim tui.c L309..314 relies on that order; D-ORDER
+flags: decision control
+
+### DA22_tmux_startup_burst
+size: 24x80
+step: feed \e[c\e[>c\e[>q
+reply: \e[?64;22c\e[>1;<PV>;0c\eP>|Tessera <VERSION>\e\\
+cite: [VT] tmux tty.c tty_send_requests sends exactly these three; each reply must arrive whole and in order (tty-keys.c matches DA, DA2, XDA by prefix); D-ID, D-ORDER
+flags: control
+
+### DA23_vim_t_rv
+size: 24x80
+step: feed \e[>c
+reply: \e[>1;<PV>;0c
+cite: [VT] vim t_RV = ESC[>c; response parsed by handle_version_response as `CSI > Pp ; Pv ; Pc c` (needs three numeric params)
+flags: control
+
+### DA24_da1_does_not_print_or_move
+size: 3x10
+step: feed ab\e[c\e[>c\e[=ccd
+screen:
+>abcd |
+>
+>
+cursor: (0,4)
+reply: \e[?64;22c\e[>1;<PV>;0c\eP!|00000000\e\\
+cite: queries consume their bytes and leave the grid alone ([XT] DA handlers only reply)
+flags: control
+
+# ------------------------------------------------------------------ DSR. Device status reports
+
+### DSR01_status_ok
+size: 24x80
+step: feed \e[5n
+reply: \e[0n
+cite: [CTL] "CSI Ps n DSR. Ps = 5 -> Status Report. Result ("OK") is CSI 0 n"; [XT] CASE_DSR case 5
+flags: control
+
+### DSR02_status_report_not_a_query
+size: 24x80
+step: feed \e[0n\e[3n\e[7n\e[8n
+reply: none
+cite: [XT] CASE_DSR handles 5 and 6 only (plus the private ones); 0 and 3 are the terminal's own answers (DEC STD 070), never answered
+flags: negative
+
+### DSR03_cpr_home
+size: 24x80
+step: feed \e[6n
+reply: \e[1;1R
+cite: [CTL] "Ps = 6 -> Report Cursor Position (CPR) [row;column]. Result is CSI r ; c R"; 1-based
+flags: control
+
+### DSR04_cpr_moved
+size: 24x80
+step: feed \e[5;10H\e[6n
+reply: \e[5;10R
+cite: [CTL] CPR; [XT] CASE_CPR value = cur_row + 1, cur_col + 1
+flags: control
+
+### DSR05_cpr_last_cell
+size: 24x80
+step: feed \e[24;80H\e[6n
+reply: \e[24;80R
+cite: [XT] CASE_CPR
+flags: control
+
+### DSR06_cpr_pending_wrap_reports_last_column
+size: 3x10
+step: feed \e[1;1Habcdefghij\e[6n
+reply: \e[1;10R
+cite: [XT] CASE_CPR reports cur_col + 1; xterm keeps the cursor on the last column with the wrap flag set, so the report is column 10, not 11. Vim's t_u7 cursor probe relies on this
+flags: xterm-quirk
+
+### DSR07_cpr_origin_mode_region_relative
+size: 24x80
+step: feed \e[5;20r\e[?6h\e[3;4H\e[6n
+reply: \e[3;4R
+cite: [XT] CASE_CPR: `if (xw->flags & ORIGIN) value -= screen->top_marg`; [DEC] VT510 RM CPR: with DECOM the report is relative to the margins (the brief: honours DECOM)
+flags: control
+
+### DSR08_cpr_origin_mode_home
+size: 24x80
+step: feed \e[5;20r\e[?6h\e[6n
+reply: \e[1;1R
+cite: [XT] CASE_CPR; DECSTBM homes the cursor, in origin mode home is the region's top-left
+flags: control
+
+### DSR09_cpr_origin_off_is_absolute
+size: 24x80
+step: feed \e[5;20r\e[?6h\e[?6l\e[3;4H\e[6n
+reply: \e[3;4R
+cite: [XT] CASE_CPR without ORIGIN; absolute row 3 (above the region) is allowed with DECOM off
+flags: control
+
+### DSR10_cpr_alt_screen
+size: 24x80
+step: feed \e[?1049h\e[7;8H\e[6n\e[?1049l\e[6n
+reply: \e[7;8R\e[1;1R
+cite: [XT] CASE_CPR reads the active screen's cursor; the primary cursor is restored after 1049 l (ADR 0020)
+flags: control
+
+### DSR11_cpr_extra_param_ignored
+size: 24x80
+step: feed \e[4;5H\e[6;1n
+reply: \e[4;5R
+cite: [XT] CASE_DSR switches on GetParam(0) only
+flags: xterm-quirk
+
+### DSR12_cpr_via_pending_wrap_in_pty_echo_loop
+size: 24x80
+step: feed \e[6n\e[6n
+reply: \e[1;1R\e[1;1R
+cite: two queries, two replies, in order (D-ORDER); programs that send several CPRs (fish, ncurses `tput u7`) must not see one swallowed
+flags: control
+
+### DSR13_decxcpr_level4_has_page
+size: 24x80
+step: feed \e[5;10H\e[?6n
+reply: \e[?5;10;1R
+cite: [CTL] "CSI ? Ps n, Ps = 6 -> Report Cursor Position (DECXCPR). The response [row;column] is returned as CSI ? r ; c R (assumes the default page, i.e., "1")"; [XT] CASE_DSR appends the page `1` when vtXX_level >= 4 (or id >= 330 and level >= 3); the ctlseqs text omits it
+flags: xterm-quirk
+
+### DSR14_decxcpr_level2_no_page
+size: 24x80
+step: feed \e[62"p\e[5;10H\e[?6n
+reply: \e[?5;10R
+cite: [XT] CASE_DSR appends the page only when vtXX_level >= 4, or terminal_id >= 330 and vtXX_level >= 3; at level 2 neither holds
+flags: xterm-quirk
+
+### DSR15_decxcpr_level3_has_page
+size: 24x80
+step: feed \e[63"p\e[5;10H\e[?6n
+reply: \e[?5;10;1R
+cite: [XT] `screen->vtXX_level >= 4 || (screen->terminal_id >= 330 && screen->vtXX_level >= 3)` with terminal_id 420
+flags: xterm-quirk
+
+### DSR16_decxcpr_origin_mode
+size: 24x80
+step: feed \e[5;20r\e[?6h\e[3;4H\e[?6n
+reply: \e[?3;4;1R
+cite: [XT] same origin subtraction as CPR
+flags: control
+
+### DSR17_dec_printer_status_level4
+size: 24x80
+step: feed \e[?15n
+reply: \e[?13n
+cite: [XT] CASE_DSR case 15 (level >= 2): reply 13 = "no printer"; [CTL] says `?10n` ready / `?11n` not ready; [DEC] VT510 RM DSR: 10 ready, 11 not ready, 13 no printer, 18 busy, 19 assigned elsewhere. xterm sends 13, which is the honest answer
+flags: xterm-quirk decision
+
+### DSR18_dec_printer_status_level1_silent
+size: 24x80
+step: feed \e[61"p\e[?15n
+reply: none
+cite: [XT] case 15 requires vtXX_level >= 2
+flags: xterm-quirk negative
+
+### DSR19_dec_udk_status
+size: 24x80
+step: feed \e[?25n
+reply: \e[?20n
+cite: [CTL] "Ps = 2 5 -> Report UDK status ... CSI ? 2 0 n (unlocked)"; [XT] case 25, level >= 2
+flags: control
+
+### DSR20_dec_keyboard_status_level4
+size: 24x80
+step: feed \e[?26n
+reply: \e[?27;1;0;0n
+cite: [CTL] "Ps = 2 6 -> Report Keyboard status ... CSI ? 2 7 ; 1 ; 0 ; 0 n (North American)"; [XT] adds the ready param at level >= 3 and the LK201 param at level >= 4
+flags: control
+
+### DSR21_dec_keyboard_status_level2
+size: 24x80
+step: feed \e[62"p\e[?26n
+reply: \e[?27;1n
+cite: [XT] case 26: 27;1, then `;0` at level >= 3, then `;0` at level >= 4
+flags: xterm-quirk
+
+### DSR22_dec_keyboard_status_level3
+size: 24x80
+step: feed \e[63"p\e[?26n
+reply: \e[?27;1;0n
+cite: [XT] case 26
+flags: xterm-quirk
+
+### DSR23_dec_locator_status
+size: 24x80
+step: feed \e[?55n
+reply: \e[?53n
+cite: [CTL] "Ps = 5 5 -> Report Locator status. CSI ? 5 0 n locator available, CSI ? 5 3 n no locator"; [XT] case 55 (level >= 3); Tessera has no DEC locator (OPT_DEC_LOCATOR off) -> 53; D-DSRSET
+flags: decision
+
+### DSR24_dec_locator_type
+size: 24x80
+step: feed \e[?56n
+reply: \e[?57;0n
+cite: [CTL] "Ps = 5 6 -> Report Locator type. CSI ? 5 7 ; 1 n Mouse, CSI ? 5 7 ; 0 n Cannot identify"; [XT] case 56
+flags: decision
+
+### DSR25_dec_locator_below_level3_silent
+size: 24x80
+step: feed \e[62"p\e[?55n\e[?56n
+reply: none
+cite: [XT] cases 55 and 56 require vtXX_level >= 3
+flags: xterm-quirk negative
+
+### DSR26_dec_data_integrity
+size: 24x80
+step: feed \e[?75n
+reply: \e[?70n
+cite: [CTL] "Ps = 7 5 -> Report data integrity. CSI ? 7 0 n (ready, no errors)"; [XT] case 75, level >= 4
+flags: control
+
+### DSR27_dec_multisession
+size: 24x80
+step: feed \e[?85n
+reply: \e[?83n
+cite: [CTL] "Ps = 8 5 -> multi-session configuration. CSI ? 8 3 n (not configured)"; [XT] case 85, level >= 4
+flags: control
+
+### DSR28_dec_data_integrity_below_level4_silent
+size: 24x80
+step: feed \e[63"p\e[?75n\e[?85n
+reply: none
+cite: [XT] cases 75 and 85 require vtXX_level >= 4
+flags: xterm-quirk negative
+
+### DSR29_dec_53_62_63_silent_by_decision
+size: 24x80
+step: feed \e[?53n\e[?62n\e[?63n\e[?63;1n\e[?1n\e[?7n
+reply: none
+cite: D-DSRSET: ?53 is not handled by xterm either; ?62 (macro space) and ?63 (memory checksum) are answerable in xterm (`CSI 0 * {` and `DCS Pt ! ~ 0000 ST`) but no probe sends them and Tessera has neither macros nor DECCKSR, so silence is deliberate
+flags: decision negative
+
+### DSR30_dsr_does_not_print_or_move
+size: 3x10
+step: feed ab\e[5n\e[6n\e[?6ncd
+screen:
+>abcd |
+>
+>
+cursor: (0,4)
+reply: \e[0n\e[1;3R\e[?1;3;1R
+cite: queries leave the grid alone
+flags: control
+
+### DSR31_neovim_bg_query_dsr_sentinel
+size: 24x80
+step: feed \e[5n
+reply: \e[0n
+cite: [VT] neovim tui.c L353 sends `OSC 11 ; ? BEL` then `CSI 5 n`: the DSR 5 reply marks "the terminal has no answer to OSC 11"; see osc_color_spec.txt OC-Q rows for the combined order. Here DSR 5 alone
+flags: control
+
+### DSR32_colon_param_voids_dsr
+size: 24x80
+step: feed \e[6:1n\e[?6:1n
+reply: none
+cite: ADR 0020 rule applied to reports: a colon sub-parameter outside SGR voids the sequence (xterm accepts colons only in SGR and XTMODKEYS)
+flags: decision negative
+
+# ------------------------------------------------------------------ XV. XTVERSION
+
+### XV01_xtversion_plain
+size: 24x80
+step: feed \e[>q
+reply: \eP>|Tessera <VERSION>\e\\
+cite: [CTL] "CSI > Ps q Ps = 0 -> Report xterm name and version (XTVERSION). The response is a DSR sequence identifying the version: DCS > | text ST"; [XT] CASE_REPORT_VERSION `GetParam(0) <= 0`, text `XTerm(412)`; D-ID
+flags: decision
+
+### XV02_xtversion_ps0
+size: 24x80
+step: feed \e[>0q
+reply: \eP>|Tessera <VERSION>\e\\
+cite: [CTL] as XV01
+flags: decision
+
+### XV03_xtversion_nonzero_silent
+size: 24x80
+step: feed \e[>1q\e[>2q
+reply: none
+cite: [XT] CASE_REPORT_VERSION only for Ps <= 0
+flags: negative
+
+### XV04_xtversion_not_decscusr
+size: 24x80
+step: feed \e[1 q\e[0 q
+reply: none
+cite: `CSI Ps SP q` (DECSCUSR) and `CSI > Ps q` (XTVERSION) share the final `q`; the intermediate/private marker tells them apart
+flags: negative control
+
+### XV05_xtversion_not_decll
+size: 24x80
+step: feed \e[q\e[0q\e[1q
+reply: none
+cite: [CTL] `CSI Ps q` = DECLL (load LEDs), ignored, never a version query
+flags: negative
+
+### XV06_xtversion_after_decscl_level1
+size: 24x80
+step: feed \e[61"p\e[>q
+reply: \eP>|Tessera <VERSION>\e\\
+cite: [XT] CASE_REPORT_VERSION has no level gate
+flags: control
+
+### XV07_xtversion_reply_is_dcs_with_st_not_bel
+size: 24x80
+step: feed \e[>q
+reply: \eP>|Tessera <VERSION>\e\\
+cite: [XT] unparseputc1(ANSI_DCS) ... unparseputc1(ANSI_ST): 7-bit `ESC P ... ESC \`; never BEL (tmux tty-keys.c waits for `ESC \`)
+flags: control
+
+# ------------------------------------------------------------------ RM. DECRQM / DECRPM (CSI Ps $ p -> CSI Ps ; Pm $ y, CSI ? Ps $ p -> CSI ? Ps ; Pm $ y)
+# Pm: 0 not recognised, 1 set, 2 reset, 3 permanently set, 4 permanently reset ([CTL] "CSI Ps $ p"; [DEC] VT510 RM DECRPM).
+# xterm does not gate DECRQM on the conformance level (CASE_RQM / CASE_DECRQM), nor does D-RQM0.
+
+### RM01_ansi_irm
+size: 24x80
+step: feed \e[4$p\e[4h\e[4$p\e[4l\e[4$p
+reply: \e[4;2$y\e[4;1$y\e[4;2$y
+cite: [CTL] DECRQM ANSI; [XT] do_ansi_rqm case 4 MdFlag(INSERT); Modes::insert
+flags: control
+
+### RM02_ansi_lnm
+size: 24x80
+step: feed \e[20$p\e[20h\e[20$p\e[20l\e[20$p
+reply: \e[20;2$y\e[20;1$y\e[20;2$y
+cite: [XT] do_ansi_rqm case 20 MdFlag(LINEFEED); Modes::linefeed_newline
+flags: control
+
+### RM03_ansi_srm_permanently_set
+size: 24x80
+step: feed \e[12$p\e[12l\e[12$p\e[12h\e[12$p
+reply: \e[12;3$y\e[12;3$y\e[12;3$y
+cite: [XT] do_ansi_rqm case 12 MdFlag(MODE_SRM) (xterm's default: set = no local echo, changeable -> 1); Tessera ignores SM/RM 12 (ADR 0020 "unknown modes"), so the value can never change: 3 (permanently set) is the DECRPM-correct report. Differs from xterm (1 then 2)
+flags: decision xterm-quirk
+
+### RM04_ansi_always_reset_set
+size: 24x80
+step: feed \e[1$p\e[5$p\e[7$p\e[10$p\e[11$p\e[13$p\e[14$p\e[15$p\e[16$p\e[17$p\e[18$p\e[19$p
+reply: \e[1;4$y\e[5;4$y\e[7;4$y\e[10;4$y\e[11;4$y\e[13;4$y\e[14;4$y\e[15;4$y\e[16;4$y\e[17;4$y\e[18;4$y\e[19;4$y
+cite: [XT] do_ansi_rqm: GATM 1, SRTM 5, VEM 7, HEM 10, PUM 11, FEAM 13, FETM 14, MATM 15, TTM 16, SATM 17, TSM 18, EBM 19 -> mdAlwaysReset (4); [DEC] VT510 RM lists them as permanently reset
+flags: control
+
+### RM05_ansi_kam_crm_permanently_reset
+size: 24x80
+step: feed \e[2$p\e[2h\e[2$p\e[3$p\e[3h\e[3$p
+reply: \e[2;4$y\e[2;4$y\e[3;4$y\e[3;4$y
+cite: [XT] answers 2 (KAM, changeable) and 2 (CRM); Tessera ignores both, so 4 (permanently reset) after the set attempt too. ADR 0020 lists KAM 2 among ignored modes. Differs from xterm
+flags: decision xterm-quirk
+
+### RM06_ansi_unknown_zero
+size: 24x80
+step: feed \e[6$p\e[8$p\e[9$p\e[21$p\e[22$p\e[99$p\e[1000$p
+reply: \e[6;0$y\e[8;0$y\e[9;0$y\e[21;0$y\e[22;0$y\e[99;0$y\e[1000;0$y
+cite: [XT] do_ansi_rqm leaves result = mdUnknown (0) for the rest; D-RQM0
+flags: control
+
+### RM07_ansi_missing_param
+size: 24x80
+step: feed \e[$p\e[0$p
+reply: \e[0;0$y\e[0;0$y
+cite: unverified: xterm's ParamPair(0) hands params[0] of an empty list (a default) to the reply; Tessera reports mode 0 as unknown, parameter echoed as 0 (the parser reports absent and 0 alike)
+flags: decision unverified
+
+### RM08_ansi_extra_params_first_only
+size: 24x80
+step: feed \e[4;20$p
+reply: \e[4;2$y
+cite: [XT] "DECRQM can only ask about one mode at a time": params[0] only
+flags: xterm-quirk
+
+### RM09_ansi_colon_voids
+size: 24x80
+step: feed \e[4:1$p\e[?25:1$p
+reply: none
+cite: ADR 0020 colon rule (`CSI 4:20 h` is ignored as a whole); applied to the query for consistency; xterm would read the first number
+flags: decision negative
+
+### RM10_ansi_saturated_param_silent
+size: 24x80
+step: feed \e[70000$p\e[?70000$p\e[?4294967296$p
+reply: none
+cite: the parser saturates a parameter at u16::MAX (ADR 0020); echoing 65535 would report a mode the program never named, so the query is ignored. Unverified for xterm (ParmType is a short)
+flags: decision negative unverified
+
+### RM11_dec_decckm
+size: 24x80
+step: feed \e[?1$p\e[?1h\e[?1$p\e[?1l\e[?1$p
+reply: \e[?1;2$y\e[?1;1$y\e[?1;2$y
+cite: [XT] do_dec_rqm srm_DECCKM MdFlag(MODE_DECCKM); KeyboardModes::decckm
+flags: control
+
+### RM12_dec_decanm_permanently_set
+size: 24x80
+step: feed \e[?2$p\e[?2l\e[?2$p
+reply: \e[?2;3$y\e[?2;3$y
+cite: [XT] srm_DECANM MdBool(vtXX_level >= 1) = set; DEC: ANSI mode set. Tessera has no VT52 mode (ADR 0020 ignores DECANM), so it can never be reset: 3. xterm says 1
+flags: decision xterm-quirk
+
+### RM13_dec_deccolm
+size: 24x80
+step: feed \e[?3$p\e[?40h\e[?3h\e[?3$p\e[?3l\e[?3$p
+reply: \e[?3;2$y\e[?3;1$y\e[?3;2$y
+cite: [XT] srm_DECCOLM MdFlag(IN132COLUMNS); ADR 0020: Modes::columns_132 recorded only while DECSET 40 is set
+flags: control
+
+### RM14_dec_deccolm_without_40_stays_reset
+size: 24x80
+step: feed \e[?3h\e[?3$p
+reply: \e[?3;2$y
+cite: ADR 0020: DECCOLM is ignored without DECSET 40 (xterm c132 false)
+flags: control
+
+### RM15_dec_decsclm_permanently_reset
+size: 24x80
+step: feed \e[?4$p\e[?4h\e[?4$p
+reply: \e[?4;4$y\e[?4;4$y
+cite: [XT] srm_DECSCLM MdFlag(SMOOTHSCROLL) (changeable, 2); Tessera ignores ?4 (ADR 0020) and only scrolls jump-style: 4
+flags: decision xterm-quirk
+
+### RM16_dec_decscnm
+size: 24x80
+step: feed \e[?5$p\e[?5h\e[?5$p\e[?5l\e[?5$p
+reply: \e[?5;2$y\e[?5;1$y\e[?5;2$y
+cite: [XT] srm_DECSCNM MdFlag(REVERSE_VIDEO); Modes::reverse_video
+flags: control
+
+### RM17_dec_decom
+size: 24x80
+step: feed \e[?6$p\e[?6h\e[?6$p\e[?6l\e[?6$p
+reply: \e[?6;2$y\e[?6;1$y\e[?6;2$y
+cite: [XT] srm_DECOM MdFlag(ORIGIN); the grid keeps the flag (ADR 0020)
+flags: control
+
+### RM18_dec_decawm_default_set
+size: 24x80
+step: feed \e[?7$p\e[?7l\e[?7$p\e[?7h\e[?7$p
+reply: \e[?7;1$y\e[?7;2$y\e[?7;1$y
+cite: [XT] srm_DECAWM MdFlag(WRAPAROUND); default on (ADR 0020)
+flags: control
+
+### RM19_dec_decarm_permanently_reset
+size: 24x80
+step: feed \e[?8$p\e[?8h\e[?8$p
+reply: \e[?8;4$y\e[?8;4$y
+cite: [XT] srm_DECARM mdAlwaysReset; Tessera ignores ?8
+flags: control
+
+### RM20_dec_x10_mouse
+size: 24x80
+step: feed \e[?9$p\e[?9h\e[?9$p\e[?9l\e[?9$p
+reply: \e[?9;2$y\e[?9;1$y\e[?9;2$y
+cite: [XT] srm_X10_MOUSE MdBool(send_mouse_pos == X10_MOUSE); Modes::mouse
+flags: control
+
+### RM21_dec_cursor_blink_12
+size: 24x80
+step: feed \e[?12$p\e[?12h\e[?12$p\e[?12l\e[?12$p
+reply: \e[?12;2$y\e[?12;1$y\e[?12;2$y
+cite: [XT] srm_ATT610_BLINK MdBool(cursor_blink_esc); ADR 0020: Modes::cursor_blink is "the record of the last program-requested bit ... for a later DECRQM 12 reply"; decscusr_spec Q06
+flags: control
+
+### RM22_dec_12_follows_decscusr
+size: 24x80
+step: feed \e[2 q\e[?12$p\e[1 q\e[?12$p\e[0 q\e[?12$p
+reply: \e[?12;2$y\e[?12;1$y\e[?12;2$y
+cite: shared blink bit (ADR 0020 "Cursor style"); decscusr_spec Q06 third step; DECSCUSR 0 clears Modes::cursor_blink so the reply is reset
+flags: decision
+
+### RM23_dec_dectcem
+size: 24x80
+step: feed \e[?25$p\e[?25l\e[?25$p\e[?25h\e[?25$p
+reply: \e[?25;1$y\e[?25;2$y\e[?25;1$y
+cite: [XT] srm_DECTCEM MdBool(cursor_set); default visible
+flags: control
+
+### RM24_dec_40
+size: 24x80
+step: feed \e[?40$p\e[?40h\e[?40$p\e[?40l\e[?40$p
+reply: \e[?40;2$y\e[?40;1$y\e[?40;2$y
+cite: [XT] srm_132COLS MdBool(c132); Modes::allow_column_change
+flags: control
+
+### RM25_dec_40_survives_ris
+size: 24x80
+step: feed \e[?40h\ec\e[?40$p
+reply: \e[?40;1$y
+cite: ADR 0020: DECSET 40 survives RIS, as xterm's resource does
+flags: control
+
+### RM26_dec_alt_screen_47_1047_1049
+size: 24x80
+step: feed \e[?47$p\e[?1047$p\e[?1049$p\e[?1049h\e[?47$p\e[?1047$p\e[?1049$p\e[?1049l\e[?47$p\e[?1047$p\e[?1049$p
+reply: \e[?47;2$y\e[?1047;2$y\e[?1049;2$y\e[?47;1$y\e[?1047;1$y\e[?1049;1$y\e[?47;2$y\e[?1047;2$y\e[?1049;2$y
+cite: [XT] srm_OPT_ALTBUF_CURSOR / srm_OPT_ALTBUF / srm_ALTBUF all MdBool(screen->whichBuf): the three report the same flag; Modes::alt_screen
+flags: control
+
+### RM27_dec_1048_unknown
+size: 24x80
+step: feed \e[?1048$p\e[?1048h\e[?1048$p
+reply: \e[?1048;0$y\e[?1048;0$y
+cite: [XT] srm_SAVE_CURSOR MdBool(saved); Tessera does not expose whether a DECSC copy exists as a mode: not recognised (0). Upgrade to 1/2 only if the grid exposes "cursor saved" cheaply
+flags: decision
+
+### RM28_dec_66_deckpam
+size: 24x80
+step: feed \e[?66$p\e=\e[?66$p\e>\e[?66$p\e[?66h\e[?66$p\e[?66l\e[?66$p
+reply: \e[?66;2$y\e[?66;1$y\e[?66;2$y\e[?66;1$y\e[?66;2$y
+cite: [XT] srm_DECNKM MdFlag(MODE_DECKPAM); ADR 0020: ESC = / ESC > and DECSET 66 are the same flag
+flags: control
+
+### RM29_dec_mouse_tracking_is_exclusive
+size: 24x80
+step: feed \e[?1000h\e[?1000$p\e[?1002$p\e[?1003$p\e[?1002h\e[?1000$p\e[?1002$p\e[?1003$p\e[?1002l\e[?1000$p\e[?1002$p
+reply: \e[?1000;1$y\e[?1002;2$y\e[?1003;2$y\e[?1000;2$y\e[?1002;1$y\e[?1003;2$y\e[?1000;2$y\e[?1002;2$y
+cite: [XT] srm_VT200_MOUSE / BTN_EVENT / ANY_EVENT MdBool(send_mouse_pos == X); ADR 0020: one tracking mode at a time, resetting any turns tracking off
+flags: control
+
+### RM30_dec_1001_highlight_unknown
+size: 24x80
+step: feed \e[?1001$p\e[?1001h\e[?1001$p
+reply: \e[?1001;0$y\e[?1001;0$y
+cite: [XT] answers MdBool(VT200_HIGHLIGHT) = 2 (xterm implements it); ADR 0020 ignores 1001. Honest answer for Tessera: not recognised
+flags: decision xterm-quirk
+
+### RM31_dec_focus_events
+size: 24x80
+step: feed \e[?1004$p\e[?1004h\e[?1004$p\e[?1004l\e[?1004$p
+reply: \e[?1004;2$y\e[?1004;1$y\e[?1004;2$y
+cite: [XT] srm_FOCUS_EVENT_MOUSE MdBool(send_focus_pos); Modes::focus_events
+flags: control
+
+### RM32_dec_mouse_encoding_last_set_wins
+size: 24x80
+step: feed \e[?1005$p\e[?1006$p\e[?1015$p\e[?1016$p\e[?1006h\e[?1006$p\e[?1015h\e[?1006$p\e[?1015$p\e[?1006l\e[?1015$p\e[?1015l\e[?1015$p
+reply: \e[?1005;2$y\e[?1006;2$y\e[?1015;2$y\e[?1016;2$y\e[?1006;1$y\e[?1006;2$y\e[?1015;1$y\e[?1015;1$y\e[?1015;2$y
+cite: [XT] srm_EXT_MODE_MOUSE / SGR_EXT / URXVT_EXT / PIXEL_POSITION_MOUSE MdBool(extend_coords == Ps); ADR 0020: the last set wins, a reset clears only the active one (so `?1006 l` while 1015 is active leaves 1015 set)
+flags: control
+
+### RM33_dec_bracketed_paste
+size: 24x80
+step: feed \e[?2004$p\e[?2004h\e[?2004$p\e[?2004l\e[?2004$p
+reply: \e[?2004;2$y\e[?2004;1$y\e[?2004;2$y
+cite: [XT] srm_PASTE_IN_BRACKET MdBool(paste_brackets); Modes::bracketed_paste
+flags: control
+
+### RM34_dec_synchronized_output_2026
+size: 24x80
+step: feed \e[?2026$p\e[?2026h\e[?2026$p\e[?2026l\e[?2026$p
+reply: \e[?2026;2$y\e[?2026;1$y\e[?2026;2$y
+cite: [CS] Contour synchronized-output spec: "DECRQM ... 1 set, 2 reset ... 0 not supported"; tmux tty-keys.c tty_keys_sync accepts 1..3 as supported; neovim tui.c queries it (L592). xterm 412 itself does NOT know ?2026 (answers 0): the brief requires the answer. Modes::synchronized_output
+flags: decision xterm-quirk
+
+### RM35_dec_sync_reset_by_decstr
+size: 24x80
+step: feed \e[?2026h\e[!p\e[?2026$p
+reply: \e[?2026;2$y
+cite: ADR 0020: DECSTR and RIS reset synchronized output
+flags: control
+
+### RM36_dec_unsupported_modes_report_zero
+size: 24x80
+step: feed \e[?45$p\e[?69$p\e[?42$p\e[?80$p\e[?1007$p\e[?2027$p\e[?2031$p\e[?2048$p\e[?9999$p
+reply: \e[?45;0$y\e[?69;0$y\e[?42;0$y\e[?80;0$y\e[?1007;0$y\e[?2027;0$y\e[?2031;0$y\e[?2048;0$y\e[?9999;0$y
+cite: D-RQM0. ?45 reverse wrap and ?69 DECLRMM (#97), ?42 DECNRCM (#112), ?80 DECSDM (no Sixel), 1007 alternate scroll, 2027 grapheme clusters, 2031 theme updates, 2048 in-band resize are not implemented; neovim tui.c L592..598 queries 69, 2026, 2027, 2031, 2048 and needs a reply (0 = unsupported) for each. Each flips to 1/2 in the issue that implements it. [XT] answers real values for 45/69/42/80/1007; Tessera answers what it implements
+flags: decision
+
+### RM37_dec_neovim_burst_then_da1
+size: 24x80
+step: feed \e[?69$p\e[?2026$p\e[?2027$p\e[?2031$p\e[?2048$p\e[c
+reply: \e[?69;0$y\e[?2026;2$y\e[?2027;0$y\e[?2031;0$y\e[?2048;0$y\e[?64;22c
+cite: [VT] neovim tui.c L592..L694: DECRQM burst, DA1 last as the "terminal has processed everything" sentinel; D-ORDER, D-RQM0
+flags: control
+
+### RM38_dec_missing_param
+size: 24x80
+step: feed \e[?$p\e[?0$p
+reply: \e[?0;0$y\e[?0;0$y
+cite: as RM07
+flags: decision unverified
+
+### RM39_dec_extra_params_first_only
+size: 24x80
+step: feed \e[?1;7$p
+reply: \e[?1;2$y
+cite: [XT] "DECRQM can only ask about one mode at a time"
+flags: xterm-quirk
+
+### RM40_dec_read_only_xterm_modes_unknown
+size: 24x80
+step: feed \e[?13$p\e[?14$p\e[?1020$p\e[?1021$p\e[?1022$p\e[?1023$p
+reply: \e[?13;0$y\e[?14;0$y\e[?1020;0$y\e[?1021;0$y\e[?1022;0$y\e[?1023;0$y
+cite: [CTL] 13/14 and 1020..1023 are xterm read-only resource reports (cursorBlink, cursorBlinkXOR, utf8, cjkWidth, emojiWidth, privateWidth); Tessera has no such resources -> 0
+flags: decision
+
+### RM41_dec_after_ris_defaults
+size: 24x80
+step: feed \e[?1h\e[?6h\e[?7l\e[?25l\e[?1004h\e[?2004h\e[?1000h\e[?1006h\e[?2026h\ec\e[?1$p\e[?6$p\e[?7$p\e[?25$p\e[?1004$p\e[?2004$p\e[?1000$p\e[?1006$p\e[?2026$p
+reply: \e[?1;2$y\e[?6;2$y\e[?7;1$y\e[?25;1$y\e[?1004;2$y\e[?2004;2$y\e[?1000;2$y\e[?1006;2$y\e[?2026;2$y
+cite: ADR 0020 "Resets": RIS resets every mode to its default (auto-wrap and cursor visible on)
+flags: control
+
+### RM42_dec_origin_survives_alt_screen_swap_report
+size: 24x80
+step: feed \e[?6h\e[?1049h\e[?6$p\e[?1049l\e[?6$p
+reply: \e[?6;1$y\e[?6;1$y
+cite: ADR 0020: origin lives with the saved cursor; 1049 saves/restores it, entering does not clear it
+flags: unverified
+
+### RM43_dec_query_does_not_print
+size: 3x10
+step: feed ab\e[?25$p\e[4$pcd
+screen:
+>abcd |
+>
+>
+cursor: (0,4)
+reply: \e[?25;1$y\e[4;2$y
+cite: queries leave the grid alone; pins that the `$` intermediate does not make the parser print `p`
+flags: control
+
+### RM44_not_decrqm_variants_silent
+size: 24x80
+step: feed \e[>25$p\e[=25$p\e[25$q\e[?25$r
+reply: none
+cite: `$ p` with a `>` or `=` introducer is not DECRQM (xterm routes only the plain and `?` forms, CASE_RQM / CASE_DECRQM); other finals after `$` are other sequences
+flags: negative
+
+# ------------------------------------------------------------------ KT. Kitty keyboard flags query (CSI ? u)
+
+### KT01_kitty_query_default
+size: 24x80
+step: feed \e[?u
+reply: \e[?0u
+cite: [KT] "CSI ? u ... the terminal responds with CSI ? flags u"; flags 0 = no enhancement active
+flags: control
+
+### KT02_kitty_query_after_push
+size: 24x80
+step: feed \e[>5u\e[?u
+reply: \e[?5u
+cite: [KT] push flags 5 (disambiguate | report alternates); reply is the top of the stack (ADR 0020: KeyboardModes::kitty_flags)
+flags: control
+
+### KT03_kitty_query_after_set_modes
+size: 24x80
+step: feed \e[=1;1u\e[?u\e[=2;2u\e[?u\e[=1;3u\e[?u
+reply: \e[?1u\e[?3u\e[?2u
+cite: [KT] `CSI = flags ; mode u`: 1 = replace, 2 = set bits, 3 = reset bits; reply always the resulting flags
+flags: control
+
+### KT04_kitty_query_after_pop
+size: 24x80
+step: feed \e[>1u\e[>2u\e[?u\e[<u\e[?u\e[<u\e[?u
+reply: \e[?2u\e[?1u\e[?0u
+cite: [KT] pop restores the previous entry; popping an empty stack leaves flags 0
+flags: control
+
+### KT05_kitty_query_per_screen_stack
+size: 24x80
+step: feed \e[>1u\e[?1049h\e[?u\e[>4u\e[?u\e[?1049l\e[?u
+reply: \e[?0u\e[?4u\e[?1u
+cite: [KT] "The main and alternate screens have independent stacks"; ADR 0020: one stack per screen, queries read the active one
+flags: control
+
+### KT06_kitty_query_masks_high_flags
+size: 24x80
+step: feed \e[>31u\e[?u\e[>255u\e[?u
+reply: \e[?31u\e[?31u
+cite: ADR 0020: flags above bit 4 are masked off (31 = bits 0..4)
+flags: control
+
+### KT07_kitty_query_with_param_silent
+size: 24x80
+step: feed \e[?1u
+note: lead edit 2026-10-31: `\e[?0u` dropped. The parser (vte 0.15) reports `CSI ? 0 u` exactly like the query `CSI ? u`, so Tessera answers it; the echo loop with a raw-echoing peer (the flags-0 reply equals the query) is an accepted risk (ADR 0024)
+reply: none
+cite: `CSI ? flags u` is the terminal's own reply form, never a query (kitty parses only the parameterless `CSI ? u`); answering would loop with a program that echoes
+flags: negative
+
+### KT08_kitty_query_after_ris
+size: 24x80
+step: feed \e[>1u\ec\e[?u
+reply: \e[?0u
+cite: ADR 0020: RIS empties both stacks
+flags: control
+
+### KT09_vim_kitty_probe
+size: 24x80
+step: feed \e[?u
+reply: \e[?0u
+cite: [VT] vim term.c L669 KS_CRK `ESC[?u`: reply parsed as `CSI ? flags u`; fixed 7-bit form
+flags: control
+
+# ------------------------------------------------------------------ RQ. DECRQSS (DCS $ q Pt ST -> DCS 1 $ r Pt' ST, or DCS 0 $ r ST)
+# [CTL] "DCS $ q Pt ST Request Status String (DECRQSS), VT420 and up ... xterm responds with DCS 1 $ r Pt ST for valid requests,
+# replacing the Pt with the corresponding CSI string, or DCS 0 $ r ST for invalid requests." The reply Pt is the setting in the form of the
+# CSI sequence that would set it, WITHOUT the CSI introducer (m, r, SP q, " p keep their intermediates and final).
+# The request ends with ST (ESC \ ) or BEL is NOT a DCS terminator; CAN/SUB abort (tessera-vt emits DcsEnd). Replies end with ESC \ .
+
+### RQ01_sgr_default
+size: 24x80
+step: feed \eP$qm\e\\
+reply: \eP1$r0m\e\\
+cite: [XT] misc.c DECRQSS `m` -> xtermFormatSGR starts with "0"; real xterm answers `DCS 1 $ r 0 m ST` for the default pen
+flags: control
+
+### RQ02_sgr_attrs_in_xterm_order
+size: 24x80
+step: feed \e[1;4;5;7;8m\eP$qm\e\\
+reply: \eP1$r0;1;4;5;7;8m\e\\
+cite: [XT] xtermFormatSGR order: 1 bold, 4 underline, 5 blink, 7 inverse, 8 invisible, then (wide attrs) 2 faint, 3 italic, 9 strike, 21 double underline, then fg, then bg. D-RQSS: Tessera pins xterm's order so the bytes can be compared against a real xterm
+flags: xterm-quirk
+
+### RQ03_sgr_wide_attrs
+size: 24x80
+step: feed \e[2;3;9m\eP$qm\e\\
+reply: \eP1$r0;2;3;9m\e\\
+cite: [XT] xtermFormatSGR (OPT_WIDE_ATTRS): faint 2, italic 3, strikeout 9
+flags: xterm-quirk
+
+### RQ04_sgr_fg_bg_ansi
+size: 24x80
+step: feed \e[31;42m\eP$qm\e\\
+reply: \eP1$r0;31;42m\e\\
+cite: [XT] fg < 16: `;3x`/`;9x`; bg < 16: `;4x`/`;10x` (fg2SGR / bg2SGR)
+flags: control
+
+### RQ05_sgr_bright_colors
+size: 24x80
+step: feed \e[91;104m\eP$qm\e\\
+reply: \eP1$r0;91;104m\e\\
+cite: [XT] fg 8..15 -> 90..97, bg 8..15 -> 100..107
+flags: control
+
+### RQ06_sgr_indexed_colon_form
+size: 24x80
+step: feed \e[38;5;100;48;5;200m\eP$qm\e\\
+reply: \eP1$r0;38:5:100;48:5:200m\e\\
+cite: [XT] xtermFormatSGR: index >= 16 -> `;38:5:n` / `;48:5:n` (colon form, in the REPLY, whatever form set it)
+flags: xterm-quirk
+
+### RQ07_sgr_indexed_below_16_collapses
+size: 24x80
+step: feed \e[38;5;3;48;5;12m\eP$qm\e\\
+reply: \eP1$r0;33;104m\e\\
+cite: [XT] the pen stores the colour; indexes below 16 print as the classic SGR, as for 30..37/90..97 (xterm cannot tell `38;5;3` from `33`)
+flags: xterm-quirk
+
+### RQ08_sgr_truecolor
+size: 24x80
+step: feed \e[38;2;1;2;3;48;2;4;5;6m\eP$qm\e\\
+reply: \eP1$r0;38:2::1:2:3;48:2::4:5:6m\e\\
+cite: [XT] xtermFormatSGR direct colour: `;38:2::R:G:B` (empty colour-space id)
+flags: xterm-quirk
+
+### RQ09_sgr_curly_underline_for_neovim
+size: 24x80
+step: feed \e[0m\e[4:3m\eP$qm\e\\
+reply: \eP1$r0;4:3m\e\\
+cite: [VT] neovim tui.c L291 sends `ESC[0m ESC[4:3m ESC P$qm ST` and treats a reply containing `4:3` as "extended underline supported" (undercurl, underline colour); [KT] kitty answers `4:3`. xterm 412 prints only `;4` (it has no curly underline). D-RQSS: report the style
+flags: decision xterm-quirk
+
+### RQ10_sgr_underline_styles
+size: 24x80
+step: feed \e[4:2m\eP$qm\e\\\e[4:3m\eP$qm\e\\\e[4:4m\eP$qm\e\\\e[4:5m\eP$qm\e\\\e[4:1m\eP$qm\e\\\e[4m\eP$qm\e\\\e[21m\eP$qm\e\\
+reply: \eP1$r0;4:2m\e\\\eP1$r0;4:3m\e\\\eP1$r0;4:4m\e\\\eP1$r0;4:5m\e\\\eP1$r0;4m\e\\\eP1$r0;4m\e\\\eP1$r0;4:2m\e\\
+cite: D-RQSS: single underline prints `4` (xterm), the styled ones print `4:n` (kitty); SGR 21 is a double underline = `4:2`. NOTE each `4:n` replaces the previous style (SGR 4 sub-parameter), so the replies are independent
+flags: decision
+
+### RQ11_sgr_underline_colour_not_reported
+size: 24x80
+step: feed \e[4m\e[58:2::9:8:7m\eP$qm\e\\
+reply: \eP1$r0;4m\e\\
+cite: [XT] has no SGR 58; kitty prints it. Deliberately omitted until a consumer needs it (neovim only probes `4:3`). Revisit with the underline colour work
+flags: decision
+
+### RQ12_sgr_after_reset
+size: 24x80
+step: feed \e[1;31;42m\e[0m\eP$qm\e\\
+reply: \eP1$r0m\e\\
+cite: [XT] reply tracks the current pen
+flags: control
+
+### RQ13_sgr_attrs_reversed_dim_not_confused
+size: 24x80
+step: feed \e[7m\e[27m\e[1m\e[22m\eP$qm\e\\
+reply: \eP1$r0m\e\\
+cite: [XT] set then cleared attributes do not appear
+flags: control
+
+### RQ14_stbm_default
+size: 24x80
+step: feed \eP$qr\e\\
+reply: \eP1$r1;24r\e\\
+cite: [XT] misc.c DECRQSS `r`: `"%d;%dr", top_marg + 1, bot_marg + 1`; full screen on a 24-row grid
+flags: control
+
+### RQ15_stbm_set
+size: 24x80
+step: feed \e[5;20r\eP$qr\e\\
+reply: \eP1$r5;20r\e\\
+cite: [XT] as RQ14
+flags: control
+
+### RQ16_stbm_after_resize_default
+size: 10x40
+step: feed \eP$qr\e\\
+reply: \eP1$r1;10r\e\\
+cite: [XT] bottom margin = last row of the grid size
+flags: control
+
+### RQ17_stbm_ignores_origin_mode
+size: 24x80
+step: feed \e[5;20r\e[?6h\eP$qr\e\\
+reply: \eP1$r5;20r\e\\
+cite: [XT] reports absolute margins whatever DECOM is
+flags: control
+
+### RQ18_decscl_default
+size: 24x80
+step: feed \eP$q"p\e\\
+reply: \eP1$r64;1"p\e\\
+cite: [XT] DECRQSS `" p`: `60 + vtXX_level`, then `;0` if control_eight_bits else `;1`; Tessera default level 4, 7-bit; [CTL] DECSCL Pc 1 = 7-bit
+flags: control
+
+### RQ19_decscl_after_set
+size: 24x80
+step: feed \e[62;1"p\eP$q"p\e\\
+reply: \eP1$r62;1"p\e\\
+cite: [XT] as RQ18; Terminal::conformance_level()
+flags: control
+
+### RQ20_decscl_level5
+size: 24x80
+step: feed \e[65;1"p\eP$q"p\e\\
+reply: \eP1$r65;1"p\e\\
+cite: D-L5 (xterm id 420 cannot reach level 5)
+flags: decision
+
+### RQ21_decscl_reports_recorded_8bit_mode
+size: 24x80
+step: feed \e[63;2"p\eP$q"p\e\\
+reply: \eP1$r63;0"p\e\\
+cite: [XT] `;0` when control_eight_bits (DECSCL Pc 0 or 2); the REPORT follows c1_8bit_replies() even though the reply bytes themselves stay 7-bit until #96. Row flips nothing in #96
+flags: decision
+
+### RQ22_decscl_level1_silent
+size: 24x80
+step: feed \e[61"p\eP$q"p\e\\
+reply: none
+cite: [XT] misc.c: `if (screen->vtXX_level < 2) { /* actually none of DECRQSS is valid for vt100's */ break; }` sends nothing at all (not even DCS 0 $ r)
+flags: xterm-quirk negative
+
+### RQ23_decscusr_rows_from_decscusr_spec
+size: 24x80
+step: feed \e[2 q\eP$q q\e\\\e[1 q\eP$q q\e\\\e[3 q\eP$q q\e\\\e[4 q\eP$q q\e\\\e[5 q\eP$q q\e\\\e[6 q\eP$q q\e\\
+reply: \eP1$r2 q\e\\\eP1$r1 q\e\\\eP1$r3 q\e\\\eP1$r4 q\e\\\eP1$r5 q\e\\\eP1$r6 q\e\\
+cite: decscusr_spec.txt Q01/Q02 (the #113 contract); [XT] DECRQSS ` q`: steady block 2, underline 4, bar 6, minus one when the blink bit is set
+flags: control
+
+### RQ24_decscusr_default_state
+size: 24x80
+step: feed \eP$q q\e\\
+reply: \eP1$r2 q\e\\
+cite: decscusr_spec.txt Q03 (configured default block steady -> 2)
+flags: decision
+
+### RQ25_decscusr_after_decset12
+size: 24x80
+step: feed \e[?12h\eP$q q\e\\
+reply: \eP1$r1 q\e\\
+cite: decscusr_spec.txt Q04: ?12 h with the default block shape -> 1
+flags: control
+
+### RQ26_decscusr_after_zero_is_configured_default
+size: 24x80
+step: feed \e[5 q\e[0 q\eP$q q\e\\
+reply: \eP1$r2 q\e\\
+cite: ADR 0020: DECSCUSR 0 drops the override; the reply is the EFFECTIVE style (configured default steady block -> 2)
+flags: decision
+
+### RQ27_vim_t_rs_cursor_style_probe
+size: 24x80
+step: feed \e[5 q\eP$q q\e\\
+reply: \eP1$r5 q\e\\
+cite: [VT] vim term.c L490 KS_CRS `ESC P$q q ESC \` reply parsed as `DCS 1 $ r <n> SP q ST` to learn the cursor blink state
+flags: control
+
+### RQ28_unknown_requests_invalid
+size: 24x80
+step: feed \eP$qx\e\\\eP$q\e\\\eP$q"q\e\\\eP$qs\e\\\eP$qt\e\\\eP$q$|\e\\\eP$q*|\e\\\eP$q*x\e\\\eP$q$}\e\\\eP$q$~\e\\
+reply: \eP0$r\e\\\eP0$r\e\\\eP0$r\e\\\eP0$r\e\\\eP0$r\e\\\eP0$r\e\\\eP0$r\e\\\eP0$r\e\\\eP0$r\e\\\eP0$r\e\\
+cite: [CTL] invalid requests answer `DCS 0 $ r ST`. D-RQSS: " q DECSCA (#95), s DECSLRM (#97), t DECSLPP, $| DECSCPP, *| DECSNLS, *x DECSACE, $} DECSASD and $~ DECSSDT are valid in xterm but not modelled by Tessera; each flips to a real answer in its issue. `$q` with an empty Pt is invalid ([XT] falls through to okay = False)
+flags: decision
+
+### RQ29_decrqss_not_dcs_q
+size: 24x80
+step: feed \eP$m\e\\\eP$\e\\\eP\e\\
+reply: none
+cite: [XT] a `$` not followed by `q` sends only CAN (0x18) to the host (misc.c `unparseputc(xw, ANSI_CAN)`); Tessera stays silent (a CAN echoed to the pty is line-discipline noise)
+flags: xterm-quirk negative decision
+
+### RQ30_decrqss_with_params_in_dcs_header
+size: 24x80
+step: feed \eP1$qm\e\\\eP0;1$qm\e\\
+reply: none
+cite: DCS parameters before `$ q` make a different DCS (DECRSPS family, `DCS Ps $ t`); the DECRQSS header has no parameters. [XT] do_dcs dispatches on the first byte of the payload and ignores header params, so xterm WOULD answer; Tessera ignores such requests (lenient parsing buys nothing)
+flags: decision negative unverified
+
+### RQ31_dcs_is_not_left_open
+size: 3x10
+step: feed ab\eP$qm\e\\cd
+screen:
+>abcd |
+>
+>
+cursor: (0,4)
+reply: \eP1$r0m\e\\
+cite: after the ST the text continues normally (decscusr_spec Q07/Q05 invariant)
+flags: control
+
+### RQ32_decrqss_split_anywhere
+size: 24x80
+step: feed \eP$q
+step: feed m\e
+step: feed \\
+reply: \eP1$r0m\e\\
+cite: D-ORDER: the DCS is answered once, when its ST arrives, however the bytes are chunked (the harness also splits every offset)
+flags: control
+
+### RQ33_decrqss_pt_over_long_ignored
+size: 24x80
+step: feed \eP$q0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\e\\
+reply: \eP0$r\e\\
+cite: D-RQSS: a request longer than 64 bytes is invalid, bounded buffer (xterm bounds DCS to its string buffer); the reply is the invalid form, never an echo of the input
+flags: decision security
+
+### RQ34_decrqss_aborted_by_can_is_still_answered
+size: 24x80
+step: feed \eP$qm\x18
+step: feed \e[6n
+reply: \eP1$r0m\e\\\e[1;1R
+cite: tessera-vt emits the same Action::DcsEnd for ST and for CAN/SUB ("whether terminated or aborted"), so the terminal cannot tell them apart; the request was complete (Pt received), so it is answered. [XT] discards an aborted string; matching that needs a flag from tessera-vt (not worth a crate change: the reply goes to the program that sent the request). The CPR after it proves CAN also executes
+flags: decision xterm-quirk
+
+### RQ35_decrqss_does_not_answer_when_data_sixel_like
+size: 24x80
+step: feed \eP0;0;8q"1;1;4;4#0;2;0;0;0#0!4~\e\\
+reply: none
+cite: other DCS (Sixel) are consumed silently; this is the dcs_flood shape of the brief's performance row (reply path must add nothing)
+flags: negative control
+
+# ------------------------------------------------------------------ WO. XTWINOPS reports (CSI Ps ; ... t)
+# [CTL] "Window manipulation (XTWINOPS) ... 14 text area size in pixels: CSI 4 ; height ; width t; 16 cell size in pixels: CSI 6 ; height ; width t;
+# 18 text area in characters: CSI 8 ; height ; width t; 19 screen in characters: CSI 9 ; height ; width t". Height comes first.
+# [XT] window_ops ewGetWinSizePixels / ewGetCharSizePixels / ewGetWinSizeChars / ewGetScreenSizeChars. Allowed in xterm by default.
+
+### WO01_18t_chars
+size: 24x80
+step: feed \e[18t
+reply: \e[8;24;80t
+cite: [CTL] 18 -> `CSI 8 ; rows ; cols t`; [XT] ewGetWinSizeChars
+flags: control
+
+### WO02_18t_other_size
+size: 10x40
+step: feed \e[18t
+reply: \e[8;10;40t
+cite: [XT] MaxRows/MaxCols; no pixel size needed
+flags: control
+
+### WO03_18t_needs_no_cell_px
+size: 24x80
+step: feed \e[18t
+reply: \e[8;24;80t
+cite: cell size unknown here on purpose (no `set cell_px`); 18 t must still answer
+flags: control
+
+### WO04_19t_screen_chars_is_grid
+size: 24x80
+step: feed \e[19t
+reply: \e[9;24;80t
+cite: [CTL] 19 -> `CSI 9 ; rows ; cols t`; [XT] answers root-window size / cell size; D-19T answers the grid
+flags: decision
+
+### WO05_14t_text_area_pixels
+size: 24x80
+step: feed \e[18t
+step: set cell_px 8x16
+step: feed \e[14t
+reply: \e[8;24;80t\e[4;384;640t
+cite: [CTL] 14 -> `CSI 4 ; height ; width t`; height = rows * cell height = 24*16 = 384, width = 80*8 = 640
+flags: control
+
+### WO06_16t_cell_pixels
+size: 24x80
+step: set cell_px 8x16
+step: feed \e[16t
+reply: \e[6;16;8t
+cite: [CTL] 16 -> `CSI 6 ; height ; width t`; [XT] ewGetCharSizePixels (height first)
+flags: control
+
+### WO07_14t_16t_unknown_cell_size_silent
+size: 24x80
+step: feed \e[14t\e[16t
+reply: none
+cite: D-CELLPX: before the first frame the cell size is unknown; silence rather than a zero cell size
+flags: decision
+
+### WO08_14t_follows_resize
+size: 24x80
+step: set cell_px 10x20
+step: feed \e[14t
+reply: \e[4;480;800t
+cite: 24*20 = 480, 80*10 = 800
+flags: control
+
+### WO09_cell_px_zero_is_unknown
+size: 24x80
+step: set cell_px 0x0
+step: feed \e[14t\e[16t
+reply: none
+cite: D-CELLPX: Terminal::set_cell_pixels(0, 0) means unknown; a view that has not laid out yet may pass zero
+flags: decision
+
+### WO10_cell_px_partial_zero_is_unknown
+size: 24x80
+step: set cell_px 8x0
+step: feed \e[14t\e[16t
+reply: none
+cite: D-CELLPX: either dimension zero -> unknown
+flags: decision
+
+### WO11_cell_px_can_change
+size: 24x80
+step: set cell_px 8x16
+step: feed \e[16t
+step: set cell_px 9x18
+step: feed \e[16t
+reply: \e[6;16;8t\e[6;18;9t
+cite: the host calls the setter on every view/font-size change (brief); the next query sees the new size
+flags: control
+
+### WO12_14t_after_grid_resize_uses_new_grid
+size: 10x40
+step: set cell_px 8x16
+step: feed \e[14t\e[18t
+reply: \e[4;160;320t\e[8;10;40t
+cite: 10*16 = 160, 40*8 = 320; the two reports agree with each other
+flags: control
+
+### WO13_14_2_window_pixels_silent
+size: 24x80
+step: set cell_px 8x16
+step: feed \e[14;2t\e[14;1t
+reply: \e[4;384;640t
+cite: D-WIN2: `14;2` (whole window incl. frame) is silent; `14;1` and `14` are the text area ([XT] ewGetWinSizePixels `switch (zero_if_default(1))`: only 2 differs)
+flags: decision
+
+### WO14_other_reports_silent
+size: 24x80
+step: set cell_px 8x16
+step: feed \e[11t\e[13t\e[13;2t\e[15t\e[20t\e[21t
+reply: none
+cite: D-SECURITY / D-WIN2: 11 (window state), 13 (position), 15 (screen px) carry nothing a program needs from a grid; 20/21 (icon label / title) are the classic title-injection vector (xterm disallows them by default via disallowedWindowOps GetIconTitle, GetWinTitle)
+flags: security negative
+
+### WO15_actions_ignored
+size: 24x80
+step: feed \e[1t\e[2t\e[3;10;10t\e[4;100;100t\e[5t\e[6t\e[7t\e[8;30;100t\e[9;1t\e[10;1t\e[24t\e[36t
+reply: none
+requests: []
+cite: window-moving/resizing ops are the host's business; the terminal neither answers nor pushes Request::Resize for them (ADR 0020: the grid follows the window and the PTY)
+flags: decision negative
+
+### WO16_18t_in_alt_screen_same_grid
+size: 24x80
+step: feed \e[?1049h\e[18t
+reply: \e[8;24;80t
+cite: [XT] MaxRows/MaxCols regardless of buffer
+flags: control
+
+### WO17_18t_with_extra_params
+size: 24x80
+step: feed \e[18;1t\e[18;2t
+reply: \e[8;24;80t\e[8;24;80t
+cite: [XT] ewGetWinSizeChars ignores further params
+flags: xterm-quirk
+
+### WO18_decscpp_width_not_a_report
+size: 24x80
+step: feed \e[18t\e[?3$p
+reply: \e[8;24;80t\e[?3;2$y
+cite: `?3` DECCOLM never resizes the grid (ADR 0020); 18 t reports the grid as is
+flags: control
+
+### WO19_t_with_colon_param_voids
+size: 24x80
+step: feed \e[18:1t\e[22:2t\e[23:2t
+reply: none
+requests: []
+cite: ADR 0020 colon rule, applied to `t`
+flags: decision negative
+
+### WO20_cell_px_rejects_overflowing_product
+size: 24x80
+step: set cell_px 65535x65535
+step: feed \e[14t
+reply: \e[4;65535;65535t
+cite: pixel counts are clamped to u16::MAX in the reply (CSI params saturate at 65535); no panic from 24*65535
+flags: decision unverified
+
+# ------------------------------------------------------------------ TS. Title stack (CSI 22 ; Ps t push, CSI 23 ; Ps t pop)
+# [CTL] "Ps = 22;0 save icon and window title on stack, 22;1 icon, 22;2 window; 23;0/1/2 restore ... 22 and 23 accept an optional third
+# parameter for direct access to the stack. Parameters in the range 1 through 10 may be used to store the title into the stack or retrieve
+# the title from the stack without pushing/popping." [XT] xtermPushTitle/xtermPopTitle, MAX_SAVED_TITLES 10. D-TSTACK.
+# `set title` below is the title already emitted. A pop emits Request::SetTitle(restored); a push emits nothing and replies nothing.
+
+### TS01_push_pop_window
+size: 24x80
+step: set title shell
+step: feed \e[22;2t\e]2;vim\e\\\e[23;2t
+reply: none
+requests: [SetTitle("vim"), SetTitle("shell")]
+cite: [CTL] 22;2 / 23;2; the vim sequence (t_ST / t_RT, vim term.c L536) and #181 item 4: quitting vim restores the pre-vim title
+flags: control
+
+### TS02_push_pop_zero_means_both_so_window
+size: 24x80
+step: set title shell
+step: feed \e[22;0t\e]0;vim\e\\\e[23;0t
+reply: none
+requests: [SetTitle("vim"), SetTitle("shell")]
+cite: [CTL] 22;0 / 23;0 (icon and window); neovim tui.c L1835/L1849 uses exactly these. The icon is not modelled (D-OSC1), the window title is
+flags: control
+
+### TS03_push_pop_without_second_param
+size: 24x80
+step: set title shell
+step: feed \e[22t\e]2;a\e\\\e[23t
+reply: none
+requests: [SetTitle("a"), SetTitle("shell")]
+cite: [XT] zero_if_default(1) -> 0 (both); [CTL] "Ps = 22" alone is the dtterm form
+flags: control
+
+### TS04_icon_only_is_noop
+size: 24x80
+step: set title shell
+step: feed \e[22;1t\e]2;x\e\\\e[23;1t
+reply: none
+requests: [SetTitle("x")]
+cite: D-TSTACK: vim's t_Si / t_Ri (`22;1t` / `23;1t`, term.c L538) must not disturb the window title; the icon title is not modelled, so both are no-ops and the pop emits nothing
+flags: decision
+
+### TS05_lifo_order
+size: 24x80
+step: set title t0
+step: feed \e[22;2t\e]2;t1\e\\\e[22;2t\e]2;t2\e\\\e[23;2t\e[23;2t
+reply: none
+requests: [SetTitle("t1"), SetTitle("t2"), SetTitle("t1"), SetTitle("t0")]
+cite: [XT] xtermPopTitle: `--used` index, last in first out
+flags: control
+
+### TS06_pop_empty_noop
+size: 24x80
+step: feed \e[23;2t\e[23t\e[23;0t
+reply: none
+requests: []
+cite: [XT] xtermPopTitle returns False when `used <= 0`: nothing changes
+flags: control
+
+### TS07_pop_more_than_pushed
+size: 24x80
+step: set title a
+step: feed \e[22;2t\e[23;2t\e[23;2t
+reply: none
+requests: [SetTitle("a")]
+cite: second pop on an empty stack is a no-op
+flags: control
+
+### TS08_push_before_any_title_restores_default
+size: 24x80
+step: feed \e[22;2t\e]2;x\e\\\e[23;2t
+reply: none
+requests: [SetTitle("x"), SetTitle("")]
+cite: D-TSTACK: the stored title was the empty one (no OSC yet); SetTitle("") = "frontend default" (ADR 0022 D-EMPTY)
+flags: decision
+
+### TS09_depth_ten_drops_oldest
+size: 24x80
+step: set title t0
+step: feed \e[22;2t\e]2;t1\e\\\e[22;2t\e]2;t2\e\\\e[22;2t\e]2;t3\e\\\e[22;2t\e]2;t4\e\\\e[22;2t\e]2;t5\e\\\e[22;2t\e]2;t6\e\\\e[22;2t\e]2;t7\e\\\e[22;2t\e]2;t8\e\\\e[22;2t\e]2;t9\e\\\e[22;2t\e]2;t10\e\\\e[22;2t\e]2;t11\e\\
+step: feed \e[23;2t\e[23;2t\e[23;2t\e[23;2t\e[23;2t\e[23;2t\e[23;2t\e[23;2t\e[23;2t\e[23;2t\e[23;2t
+reply: none
+requests: [SetTitle("t1"), SetTitle("t2"), SetTitle("t3"), SetTitle("t4"), SetTitle("t5"), SetTitle("t6"), SetTitle("t7"), SetTitle("t8"), SetTitle("t9"), SetTitle("t10"), SetTitle("t11"), SetTitle("t10"), SetTitle("t9"), SetTitle("t8"), SetTitle("t7"), SetTitle("t6"), SetTitle("t5"), SetTitle("t4"), SetTitle("t3"), SetTitle("t2"), SetTitle("t1")]
+cite: D-TSTACK, [XT] MAX_SAVED_TITLES 10. Eleven pushes save the title current at each push (t0, t1, ..., t10); the depth is 10, so t0 is dropped and t1..t10 remain. The OSC sets give the first eleven SetTitle (t1..t11); the eleven pops restore t10, t9, ..., t1 and the eleventh pop finds the stack empty (no request). xterm's ring buffer differs: its `used` counter reaches 11, so the 11th pop returns slot 0 again (the stale t10)
+flags: decision xterm-quirk
+
+### TS10_direct_slot_param_voids
+size: 24x80
+step: set title a
+step: feed \e[22;2;1t\e]2;b\e\\\e[23;2;1t\e[23;2t
+reply: none
+requests: [SetTitle("b")]
+cite: D-TSTACK: the third (slot) parameter of [CTL] is not supported; both forms are ignored whole and the plain pop finds an empty stack
+flags: decision
+
+### TS11_unknown_second_param_ignored
+size: 24x80
+step: set title a
+step: feed \e[22;3t\e]2;b\e\\\e[23;3t\e[22;9t\e[23;9t
+reply: none
+requests: [SetTitle("b")]
+cite: [XT] xtermPushTitle with an unmatched `which` switch case stores an empty item; Tessera ignores values other than 0, 1, 2 (no push, no pop)
+flags: decision
+
+### TS12_title_stack_per_terminal_survives_ris
+size: 24x80
+step: set title a
+step: feed \e[22;2t\ec\e[23;2t
+reply: none
+requests: [SetTitle("a")]
+cite: unverified: xterm keeps `saved_titles` across RIS (ReallyReset does not free it); a program that pushes then a shell `reset`s then pops still gets its title back
+flags: decision unverified
+
+### TS13_title_pop_is_not_sanitised_twice_and_not_capped_again
+size: 24x80
+step: feed \e]2;a\u{202e}b\e\\\e[22;2t\e]2;x\e\\\e[23;2t
+reply: none
+requests: [SetTitle("ab"), SetTitle("x"), SetTitle("ab")]
+cite: ADR 0022 D-TITLE-SAN: the stored title is the sanitised one (U+202E removed once); a pop re-emits exactly what the terminal emitted before
+flags: control
+
+### TS14_title_stack_bounded_memory
+size: 24x80
+step: feed (1,000,000 times) \e[22;2t
+reply: none
+cite: depth 10 bounds memory; each push stores at most MAX_TITLE_BYTES (1024) -> at most 10 KiB. Generated by the test, not stored literally
+flags: security
+
+### TS15_pop_does_not_reply_or_print
+size: 3x10
+step: set title a
+step: feed ab\e[22;2t\e[23;2tcd
+screen:
+>abcd |
+>
+>
+cursor: (0,4)
+reply: none
+requests: [SetTitle("a")]
+cite: title ops are silent on the grid and the reply path
+flags: control
+
+# ------------------------------------------------------------------ RP. Reply path behaviour
+
+### RP01_queries_in_one_chunk_replied_in_order
+size: 24x80
+step: feed \e[5n\e[6n\e[c\e[>q\e[?25$p
+reply: \e[0n\e[1;1R\e[?64;22c\eP>|Tessera <VERSION>\e\\\e[?25;1$y
+cite: D-ORDER
+flags: control
+
+### RP02_reply_independent_of_surrounding_text
+size: 3x10
+step: feed ab\e[6ncd\e[6n
+screen:
+>abcd |
+>
+>
+cursor: (0,4)
+reply: \e[1;3R\e[1;5R
+cite: each CPR sees the cursor at its own position in the stream
+flags: control
+
+### RP03_dsr_first_param_decides
+size: 24x80
+step: feed \e[1;6n\e[0;6n
+reply: none
+cite: [XT] CASE_DSR switches on GetParam(0) (1 and 0 are not handled); the second parameter is not consulted.
+flags: xterm-quirk negative
+
+### RP04_query_interrupted_by_esc_is_not_answered
+size: 24x80
+step: feed \e[6\e[c
+reply: \e[?64;22c
+cite: ESC restarts the sequence; only the `CSI c` completes (tessera-vt)
+flags: negative control
+
+### RP05_query_interrupted_by_can_is_not_answered
+size: 24x80
+step: feed \e[6\x18n\e[5\x1an
+reply: none
+cite: CAN/SUB abort a CSI; the following `n` is printed text, not a final byte
+flags: negative control
+
+### RP06_8bit_c1_csi_introducer_query
+size: 24x80
+step: feed \u{9b}6n
+reply: none
+cite: unverified: tessera-vt treats U+009B (UTF-8 C2 9B) as printable (the stream is UTF-8; a raw 0x9B byte is invalid UTF-8). No reply expected. 8-bit introducers are #96's area
+flags: unverified negative
+
+### RP07_replies_are_bytes_not_requests_of_other_kinds
+size: 24x80
+step: feed \e[6n
+reply: \e[1;1R
+requests: []
+cite: a Reply is not a SetTitle/Bell/Resize; `requests:` lists only non-Reply requests and is empty here
+flags: control
+
+### RP08_reply_with_bell_between
+size: 24x80
+step: feed \e[5n\x07\e[5n
+reply: \e[0n\e[0n
+requests: [Bell]
+cite: order of Reply and Bell relative to each other is not asserted (separate lists), only each list's own order
+flags: control
+
+### RP09_big_flood_bounded
+size: 24x80
+step: feed (1,000,000 times) \e[6n
+cite: Terminal level: 1,000,000 replies are produced (the terminal does not drop; the BOUND lives in app-core's outbox, brief "Reply routing"); the test only checks the first and last replies and that take_requests() returns them without quadratic behaviour. Generated by the test
+flags: security
+
+### RP10_reply_not_produced_by_the_terminals_own_reply_form
+size: 24x80
+step: feed \e[1;1R\e[?64;22c\e[0n\e[?1;2$y\e[?13n\e[8;24;80t\e[>1;10100;0c\eP>|Tessera 0.1.0\e\\
+note: lead edit 2026-10-31: `\e[?0u` dropped. The parser (vte 0.15) reports `CSI ? 0 u` exactly like the query `CSI ? u`, so Tessera answers it; the echo loop with a raw-echoing peer (the flags-0 reply equals the query) is an accepted risk (ADR 0024)
+reply: none
+cite: reply forms are never queries: `R`, `?...c`, `0n`, `$y`, `8;..t`, `>..c`, `DCS > |`, `?0u` all fall through as inert (no feedback loop with an echoing program). The xterm DECRQM `$p` form differs from the `$y` reply form
+flags: negative control

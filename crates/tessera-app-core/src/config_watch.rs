@@ -147,8 +147,14 @@ impl Live {
             // `resize_view`) is not undone by a stale size. The window left
             // is the one `resize_view` itself has between its view update
             // and its session resize.
-            let size: Option<PtySize> = lock(&self.views).get(&id).and_then(View::pty_size);
+            let (size, cell): (Option<PtySize>, _) = match lock(&self.views).get(&id) {
+                Some(view) => (view.pty_size(), Some(view.cell_metrics())),
+                None => (None, None),
+            };
             let session = lock(&self.sessions).get(&id).cloned();
+            if let (Some(cell), Some(session)) = (cell, &session) {
+                session.set_cell_pixels(cell.width_px, cell.height_px);
+            }
             if let (Some(size), Some(session)) = (size, session)
                 && let Err(error) = session.resize(size)
             {

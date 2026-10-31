@@ -64,7 +64,7 @@ holds frames while it is set, with a cap). Stored modes are visible in
 `c132: false`; kitty and Alacritty ignore DECCOLM entirely. With 40 set,
 DECCOLM performs xterm's side effects: it clears the screen, resets the
 scroll region and homes the cursor (origin-relative in origin mode), and
-records the mode in `Modes::columns_132` (for DECRQM, #10). It never
+records the mode in `Modes::columns_132` (DECRQM reports it, ADR 0024). It never
 resizes the grid: the window and the PTY are the single source of truth
 for the grid's width. When the mode changes to a width (132 or 80) the
 grid does not have, it pushes `Request::Resize { rows, cols }`, so a host
@@ -185,11 +185,10 @@ whatever its shape.
   screens 47/1047/1048/1049 and a resize neither save, restore nor reset
   the style: one style per terminal, not per buffer (xterm keeps it in
   `TScreen`; `CursorSave2` stores none).
-- *Deferred:* DECRQSS `SP q` (`DCS 1 $ r Ps SP q ST`, answered from the
-  effective style) and DECRQM 12 (from `Modes::cursor_blink`) need a reply
-  channel and DCS handling; the fixture keeps their rows (Q01..Q06) as the
-  contract for that issue, and the table test counts them as skipped.
-  Until then a DECRQSS is ignored without disturbing the text after it.
+- *Reported (ADR 0024, #10):* DECRQSS `SP q` (`DCS 1 $ r Ps SP q ST`)
+  answers from the effective style and DECRQM 12 from
+  `Modes::cursor_blink`; the fixture's rows Q01..Q06 run in the table
+  test.
 
 **Deviations from the references**, each pinned by a test:
 
@@ -226,4 +225,6 @@ whatever its shape.
 - `Snapshot::capture` takes the `Terminal` rather than its `Grid`, and a
   DECTCEM change damages the cursor's row so the next frame redraws.
 - Later issues add their modes to `Modes` (it is `#[non_exhaustive]`):
-  DECLRMM and reverse wrap (#97), DECRQM reports (#10) read `Modes`.
+  DECLRMM and reverse wrap (#97). DECRQM (ADR 0024) reads `Modes` and
+  answers 0 for a mode Tessera does not know, so each new mode also gets
+  its DECRQM answer.

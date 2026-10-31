@@ -182,6 +182,9 @@ pub fn parse_fixture(text: &str) -> Vec<Case> {
 /// Every mismatch between a case and what the terminal did.
 pub fn check_case(case: &Case, chunking: Chunking) -> Vec<String> {
     let (term, requests) = case.script.run(chunking);
+    // `requests:` rows list the other requests; replies have their own
+    // fixture (reports_spec.txt).
+    let (_, requests) = crate::common::split_replies(&requests);
     let grid = term.grid();
     let mut errors = Vec::new();
     let mut expect = |what: &str, ok: bool, detail: String| {

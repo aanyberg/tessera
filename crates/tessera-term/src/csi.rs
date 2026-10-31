@@ -22,6 +22,8 @@
 //! | `m` | SGR | set the pen's colours and attributes (see the `sgr` module) |
 //! | `r` | DECSTBM | set the scroll region |
 //! | `s` `u` | SCOSC SCORC | save / restore the cursor exactly like DECSC / DECRC, only without parameters |
+//! | `c` `n` | DA1 DSR | device attributes, status and cursor position reports (see the `reports` module) |
+//! | `t` | XTWINOPS | size reports and the title stack; window actions are ignored (see the `reports` module) |
 //!
 //! With a private marker or an intermediate (the `modes` module has the
 //! details):
@@ -33,6 +35,10 @@
 //! | `CSI > flags u` `CSI < n u` `CSI = flags ; mode u` | kitty keyboard | push / pop / set the keyboard flags |
 //! | `CSI ! p` | DECSTR | soft terminal reset, see the crate documentation; parameters are ignored, as in xterm, so `CSI 5 ! p` resets too |
 //! | `CSI Ps SP q` | DECSCUSR | cursor style: 1..=6 blinking/steady block, underline, beam; 0, absent and 7 the configured default; anything else ignored (see `State::set_cursor_style`) |
+//! | `CSI > c` `CSI = c` `CSI > q` | DA2 DA3 XTVERSION | identity reports (see the `reports` module) |
+//! | `CSI ? Ps n` | DEC DSR | DEC status reports |
+//! | `CSI Ps $ p` `CSI ? Ps $ p` | DECRQM | mode reports, one per query |
+//! | `CSI ? u` | kitty keyboard | the flags query |
 //! | `CSI Pl ; Pc " p` | DECSCL | select conformance level: for `Pl` 61..=65, the DECSTR soft reset, then level `Pl - 60` and the C1 reply mode from `Pc`; any other `Pl` does nothing |
 //!
 //! Parameters follow xterm: an absent parameter and an explicit `0` both
@@ -64,7 +70,7 @@
 //! where xterm ignores it. `CSI s` is SCOSC only while left/right margin
 //! mode (DECLRMM, `?69`, #97) is off; until #97 it always is. The kitty
 //! keyboard sequences `CSI ? u`, `CSI > u`, `CSI < u` and `CSI = u` carry a
-//! private marker and never reach SCORC; the query `CSI ? u` is #10.
+//! private marker and never reach SCORC.
 //!
 //! DECSCL follows xterm's `CASE_DECSCL`: the reset is DECSTR's, soft (DEC's
 //! VT510 manual says RIS; xterm, the VT220 manual and DEC STD 070 say
@@ -77,17 +83,18 @@
 //! its default `decTerminalID` 420, accepts only up to 64). Nothing is
 //! answered; `State::select_conformance_level` has the details.
 //!
-//! DECSET/DECRST, SM/RM, DECSCL, DECSCUSR and the kitty keyboard sequences are
-//! ignored as a whole when a parameter carries a colon sub-parameter
-//! (`CSI ? 25:1049 h`), as in xterm, which accepts them only in SGR and
-//! XTMODKEYS.
+//! DECSET/DECRST, SM/RM, DECSCL, DECSCUSR, the kitty keyboard sequences
+//! and every report query are ignored as a whole when a parameter carries
+//! a colon sub-parameter (`CSI ? 25:1049 h`), as in xterm, which accepts
+//! them only in SGR and XTMODKEYS.
 //!
 //! Everything else (an unassigned final, any other private marker and
 //! final pair such as `CSI > 25 h` or `CSI ? 5 m`, any other intermediate
-//! such as `$`, `SP` with a final other than `q` and `"` with one other
-//! than `p`, a private marker before `SP q`, and the xterm extension SL/SR
-//! that is not in scope) is ignored and logged at trace level. The parser hands over private markers as intermediates, so one
-//! match covers both.
+//! such as `$` with a final other than `p`, `SP` with a final other than
+//! `q` and `"` with one other than `p`, a private marker before `SP q`,
+//! and the xterm extension SL/SR that is not in scope) is ignored and
+//! logged at trace level. The parser hands over private markers as
+//! intermediates, so one match covers both.
 //!
 //! Expected behaviour per sequence and edge case is pinned by
 //! `tests/fixtures/csi_spec.txt`, for DECSTR by
@@ -128,6 +135,20 @@ fn selector(params: &[u16], index: usize) -> u16 {
     params.get(index).copied().unwrap_or(0)
 }
 
+/// Whether a colon sub-parameter voids the sequence with these
+/// intermediates and final: the mode sequences and every report query
+/// (DECSTR ignores its parameters, DECSCL checks on its own).
+fn voided_by_subparams(intermediates: &[u8], action: char) -> bool {
+    matches!(
+        (intermediates, action),
+        (b"?", 'h' | 'l' | 'u' | 'n')
+            | ([b'>' | b'<' | b'='], 'u')
+            | (b" " | b">", 'q')
+            | (b">" | b"=", 'c')
+            | (b"$" | b"?$", 'p')
+    )
+}
+
 impl State {
     /// Applies one control sequence. See the module documentation for the
     /// sequences handled; anything else is logged and ignored. `subparams`
@@ -141,36 +162,7 @@ impl State {
         action: char,
     ) {
         if !intermediates.is_empty() {
-            match (intermediates, action) {
-                // DECSTR. Parameters are ignored, as in xterm.
-                (b"!", 'p') => self.soft_reset(),
-                // DECSCL; sub-parameters void it, as for the mode sequences.
-                (b"\"", 'p') => {
-                    if subparams == 0 {
-                        self.select_conformance_level(params);
-                    } else {
-                        trace!(?params, "DECSCL with sub-parameters ignored");
-                    }
-                }
-                // xterm takes colon sub-parameters only in SGR and XTMODKEYS.
-                (b"?", 'h' | 'l') | ([b'>' | b'<' | b'='], 'u') | (b" ", 'q') if subparams != 0 => {
-                    trace!(
-                        ?action,
-                        ?params,
-                        "mode sequence with sub-parameters ignored"
-                    );
-                }
-                (b"?", 'h' | 'l') => self.set_dec_modes(params, action == 'h'),
-                (b" ", 'q') => self.set_cursor_style(selector(params, 0)),
-                (b">", 'm') => self.set_key_modifiers(params),
-                ([marker @ (b'>' | b'<' | b'=')], 'u') => self.kitty_keyboard(*marker, params),
-                _ => trace!(
-                    ?action,
-                    ?params,
-                    ?intermediates,
-                    "CSI with intermediates ignored"
-                ),
-            }
+            self.csi_with_intermediates(params, subparams, intermediates, action);
             return;
         }
         let grid = &mut self.grid;
@@ -234,7 +226,61 @@ impl State {
             'u' if no_params(params) => grid.restore_cursor(),
             's' | 'u' => trace!(?action, ?params, "SCOSC/SCORC with parameters ignored"),
             'm' => self.sgr(params, subparams),
+            'c' | 'n' | 't' if subparams != 0 => {
+                trace!(?action, ?params, "report with sub-parameters ignored");
+            }
+            'c' => self.identity_report(0, action, params),
+            'n' => self.device_status(params, false),
+            't' => self.window_ops(params),
             _ => trace!(?action, ?params, "CSI ignored"),
+        }
+    }
+
+    /// The control sequences with a private marker or an intermediate;
+    /// see the module documentation.
+    fn csi_with_intermediates(
+        &mut self,
+        params: &[u16],
+        subparams: u32,
+        intermediates: &[u8],
+        action: char,
+    ) {
+        match (intermediates, action) {
+            // DECSTR. Parameters are ignored, as in xterm.
+            (b"!", 'p') => self.soft_reset(),
+            // DECSCL; sub-parameters void it, as for the mode sequences.
+            (b"\"", 'p') => {
+                if subparams == 0 {
+                    self.select_conformance_level(params);
+                } else {
+                    trace!(?params, "DECSCL with sub-parameters ignored");
+                }
+            }
+            // xterm takes colon sub-parameters only in SGR and XTMODKEYS.
+            _ if subparams != 0 && voided_by_subparams(intermediates, action) => {
+                trace!(
+                    ?action,
+                    ?params,
+                    "mode sequence or report with sub-parameters ignored"
+                );
+            }
+            ([marker @ (b'>' | b'=')], 'c') | ([marker @ b'>'], 'q') => {
+                self.identity_report(*marker, action, params);
+            }
+            (b"?", 'n') => self.device_status(params, true),
+            (b"?", 'u') => self.kitty_keyboard_query(params),
+            (b"$", 'p') => self.request_mode(params, false),
+            (b"?$", 'p') => self.request_mode(params, true),
+            (b"?", 'h' | 'l') => self.set_dec_modes(params, action == 'h'),
+            (b" ", 'q') => self.set_cursor_style(selector(params, 0)),
+            (b">", 'm') => self.set_key_modifiers(params),
+            ([marker @ (b'>' | b'<' | b'=')], 'u') => self.kitty_keyboard(*marker, params),
+            _ => trace!(
+                ?action,
+                ?params,
+                ?intermediates,
+                "CSI with intermediates ignored"
+            ),
         }
     }
 
