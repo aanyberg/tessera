@@ -15,6 +15,8 @@
 //!   [`ClipboardError::TooLarge`].
 //! * A tool that cannot be started or exits unsuccessfully is skipped and
 //!   the next one tried; a timeout or an oversized clipboard ends the read.
+//!   One deadline covers all the tools: no tool is started once it has
+//!   passed, however late the previous one was seen to fail.
 //! * Bytes that are not UTF-8 are replaced with `U+FFFD`.
 //!
 //! # Limits
@@ -97,7 +99,8 @@ pub fn native_commands() -> Vec<ClipboardCommand> {
 pub enum ClipboardError {
     /// The clipboard holds more than this many bytes.
     TooLarge(usize),
-    /// A tool was still running at the deadline; it was killed.
+    /// The deadline passed: a tool still running then was killed, and no
+    /// later tool was started.
     TimedOut(Duration),
     /// No command could be started or succeeded.
     Unavailable,
@@ -127,6 +130,11 @@ pub fn read(
 ) -> Result<String, ClipboardError> {
     let deadline = Instant::now() + timeout;
     for command in commands {
+        // A failure that arrived after the deadline (a late wake on a
+        // loaded machine) must not start the next tool.
+        if Instant::now() >= deadline {
+            return Err(ClipboardError::TimedOut(timeout));
+        }
         match run(command, max_bytes, deadline) {
             Ok(Some(bytes)) => return Ok(text_of(bytes)),
             Ok(None) => {}
@@ -380,12 +388,17 @@ mod tests {
     ///
     /// With one deadline for all commands the second tool is killed at the
     /// 1 s deadline and the third never starts: `read` returns after ~1 s.
-    /// With a deadline per command both tools fail after 0.8 s each and
-    /// the third starts at 1.6 s, writes its marker and is killed 1 s
-    /// later. The marker is the assertion that tells them apart, with no
-    /// clock involved. The elapsed bound is only a sanity check
-    /// (TIMEOUT, 10 s): under background priority at load above the core
-    /// count, a correct read was seen to take up to 14 s.
+    /// With a deadline per command both tools fail after 0.9 s each and
+    /// the third starts at 1.8 s, writes its marker and is killed 1 s
+    /// later. The marker is the assertion that tells them apart. A correct
+    /// `read` cannot start the third tool however late it is scheduled:
+    /// the second cannot fail before 1.8 s, past the deadline, and `read`
+    /// checks the deadline before it starts each tool. So no clock bounds
+    /// the correct path; the mutant is caught as long as each failing tool
+    /// takes under 1 s (0.1 s of margin over its `sleep`). The elapsed
+    /// bound is only a sanity check against a read that never ends, far
+    /// above any stall: under background priority at load above the core
+    /// count a correct read was seen to take 14 s, and 30.6 s at load 26.
     #[test]
     fn the_deadline_covers_all_commands() {
         let dir = std::env::temp_dir().join(format!("tessera-clip-all-{}", std::process::id()));
@@ -394,7 +407,7 @@ mod tests {
         let _ = std::fs::remove_file(&marker);
         let third = format!("touch '{}'; exec sleep 30", marker.display());
         let timeout = Duration::from_secs(1);
-        let commands = [sh("sleep 0.8; exit 1"), sh("sleep 0.8; exit 1"), sh(&third)];
+        let commands = [sh("sleep 0.9; exit 1"), sh("sleep 0.9; exit 1"), sh(&third)];
         let started = Instant::now();
         let result = read(&commands, 1024, timeout);
         let elapsed = started.elapsed();
@@ -403,7 +416,21 @@ mod tests {
         assert_eq!(result, Err(ClipboardError::TimedOut(timeout)));
         assert!(!third_started, "the third command started ({elapsed:?})");
         assert!(elapsed >= timeout, "{elapsed:?}");
-        assert!(elapsed < TIMEOUT, "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(120), "{elapsed:?}");
+    }
+
+    /// A spent deadline starts no tool: with no time left, even a tool
+    /// that cannot be started (which `read` would skip) is not tried.
+    #[test]
+    fn a_spent_deadline_starts_no_command() {
+        let commands = [ClipboardCommand::new(
+            "/nonexistent/tessera-no-such-tool",
+            &[],
+        )];
+        assert_eq!(
+            read(&commands, 1024, Duration::ZERO),
+            Err(ClipboardError::TimedOut(Duration::ZERO))
+        );
     }
 
     #[test]

@@ -38,14 +38,24 @@ test-group = 'timing'
 filter = 'package(tessera-pty) & binary(close)'
 test-group = 'timing'
 
-# Non-blocking close (#79): 5 ms bounds on close_session and 500 ms on the
-# background reap.
+# Non-blocking close (#79): close_session within HANGUP_GRACE / 2 (500 ms) and a
+# 1 ms median over 20 closes (#179); the background reap within REAP_SLACK
+# (500 ms) past the graces, or both graces (2 s, best of 3 closes) for the fake
+# that ignores SIGHUP.
 [[profile.default.overrides]]
 filter = 'package(tessera-app-core) & kind(lib) & (test(close_returns_at_once_) | test(closing_twenty_) | test(close_during_an_output_flood_is_prompt_and_silent) | test(close_with_input_pending_to_a_shell_that_ignores_sighup) | test(a_closed_session_that_exits_later_reports_nothing) | test(dropping_the_app_finishes_earlier_closes_within_the_same_cap) | test(a_panicking_start_hook_does_not_strand_closing_children))'
 test-group = 'timing'
 
 [[profile.default.overrides]]
 filter = 'package(tessera-ffi) & binary(lifecycle) & test(close_returns_at_once_and_free_waits_for_the_closing_children)'
+test-group = 'timing'
+
+# Bars that are ratios or mutant margins rather than absolute times, still run one at a time (#179): the DECSCUSR
+# flood's 4N/N cost ratio and the clipboard deadline test (a per-command-deadline mutant is caught only while each
+# failing tool takes under 1 s). `resize_is_not_starved_by_a_blocked_writer` is an ordering with no clock bar and
+# runs in parallel.
+[[profile.default.overrides]]
+filter = '(package(tessera-term) & binary(decscusr) & test(=a_flood_of_cursor_styles_requests_nothing_and_stays_linear)) | (package(tessera-devwin) & test(=clipboard::tests::the_deadline_covers_all_commands))'
 test-group = 'timing'
 
 # Release-only wall-clock bars, run by the gate's release timing step (#114).

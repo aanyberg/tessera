@@ -1669,15 +1669,55 @@ mod tests {
         ));
     }
 
-    /// How long `close_session` may take for a child that ignores
-    /// `SIGHUP` (issue #79).
-    const CLOSE_RETURNS_WITHIN: Duration = Duration::from_millis(5);
+    /// How long one `close_session` may take for a child that ignores
+    /// `SIGHUP` (issues #79, #179): half of `HANGUP_GRACE`, 500 ms.
+    ///
+    /// The bar catches a close that waits for the grace period (1 s or
+    /// more, twice the bar, however idle or loaded the machine). Measured
+    /// in debug builds under `taskpolicy -b` with ten CPU burners on ten
+    /// cores (load 9.5-29, 20 runs of each test, 2026-10-31), one close
+    /// took a median of 44 µs to 6.7 ms depending on the test (the 4 MiB
+    /// paste pending is the slowest), so the bar has 75x headroom over the
+    /// slowest median; the slowest single close was 92 ms, 5.4x under it.
+    /// The old 5 ms bar failed 20 of those 80 runs.
+    ///
+    /// A close that blocks for a short while (10 ms, say) passes this
+    /// bar: one close cannot be held both under 10 ms and ten times over
+    /// its loaded tail. [`MEDIAN_CLOSE_WITHIN`] catches that class instead,
+    /// over 20 closes, where a few preempted closes do not move the median.
+    const CLOSE_RETURNS_WITHIN: Duration = match session::HANGUP_GRACE.checked_div(2) {
+        Some(bar) => bar,
+        None => panic!("HANGUP_GRACE / 2"),
+    };
 
-    /// The bar for the median of 20 closes in a row: 1 ms. The median of
-    /// 20 closes of shells that ignore `SIGHUP` reached 315 µs at load ~13,
-    /// against issue #79's 250 µs per close; a close that waits 5 ms for its
-    /// child is still five times over.
+    /// The bar for the median of 20 closes in a row: 1 ms, four times
+    /// issue #79's 250 µs per close. Under `taskpolicy -b` with ten CPU
+    /// burners (load 9.5-29, 20 runs each, 2026-10-31) the median was at
+    /// most 5.2 µs for fakes and 8.9 µs for shells that ignore `SIGHUP`,
+    /// 110x under the bar (it reached 315 µs once at load ~13 in #79's
+    /// runs, still 3x under). A close that blocks for 10 ms puts the median
+    /// ten times over it.
     const MEDIAN_CLOSE_WITHIN: Duration = Duration::from_millis(1);
+
+    /// The bound on reaping one fake that ignores `SIGHUP` (#179): both
+    /// graces, 2 s. The fake dies at the kill, one `HANGUP_GRACE` after the
+    /// close, so the bound leaves a whole `KILL_GRACE` for a late reaper. A
+    /// reaper that waited out both graces before the kill reaps at 2 s or
+    /// later and fails it however idle the machine. `HANGUP_GRACE +
+    /// REAP_SLACK` (1.5 s) failed 1 of 50 runs under `taskpolicy -b` with
+    /// ten CPU burners (1.554 s at load 11). Even 2 s failed 2 of 50 there
+    /// (2.3 s and 3.0 s): a machine-wide stall under background priority
+    /// outlasts any bound below the mutant's floor. So
+    /// [`REAP_ATTEMPTS`] fresh closes are tried, and the bound fails the
+    /// test only if every one misses it, as the mutant always does. The
+    /// tight kill timing (`HANGUP_GRACE + REAP_SLACK`, one try) stays with
+    /// `a_panicking_start_hook_does_not_strand_closing_children` and
+    /// `dropping_the_app_finishes_earlier_closes_within_the_same_cap`.
+    const FAKE_REAPED_WITHIN: Duration =
+        match session::HANGUP_GRACE.checked_add(session::KILL_GRACE) {
+            Some(bound) => bound,
+            None => panic!("HANGUP_GRACE + KILL_GRACE"),
+        };
 
     /// Slack on top of the grace periods for the reaper to finish a close.
     /// Generous because the reaper may be scheduled late on a loaded
@@ -1696,8 +1736,25 @@ mod tests {
         since.elapsed()
     }
 
+    /// How many closes [`FAKE_REAPED_WITHIN`] gets.
+    const REAP_ATTEMPTS: usize = 3;
+
     #[test]
     fn close_returns_at_once_and_kills_a_child_that_ignores_hangup() {
+        let mut attempts = Vec::new();
+        while attempts.len() < REAP_ATTEMPTS {
+            let reaped = close_and_reap_a_fake_that_ignores_hangup();
+            if reaped < FAKE_REAPED_WITHIN {
+                return;
+            }
+            attempts.push(reaped);
+        }
+        panic!("no close was reaped within {FAKE_REAPED_WITHIN:?}: {attempts:?}");
+    }
+
+    /// Closes a fake that ignores `SIGHUP` and checks everything but the
+    /// reap bound; returns how long the reap took.
+    fn close_and_reap_a_fake_that_ignores_hangup() -> Duration {
         let app = app();
         let (id, fake) = attach_fake(&app, true);
         let started = Instant::now();
@@ -1724,10 +1781,7 @@ mod tests {
         let reaped = wait_reaped(&app, started);
         assert!(lock(&fake.events).is_none(), "kill should end the fake");
         assert!(reaped >= session::HANGUP_GRACE, "reaped after {reaped:?}");
-        assert!(
-            reaped < session::HANGUP_GRACE + REAP_SLACK,
-            "reaped after {reaped:?}"
-        );
+        reaped
     }
 
     /// Closes `ids` one after another, as Close Window closes its tabs, and
@@ -2048,25 +2102,40 @@ mod tests {
         writer
     }
 
+    /// Twenty resizes on another thread all finish while a writer keeps
+    /// retrying against a full queue: the writer holds the PTY lock only
+    /// for each attempt, never across its backoff sleep.
+    ///
+    /// An ordering, not a speed bar (#179): the resizes take microseconds,
+    /// and [`TIMEOUT`] four times over only ends a failing run, so a
+    /// loaded machine cannot fail it (the old 10 ms bar on the slowest
+    /// resize failed 4 of 20 runs under `taskpolicy -b` at load 10-29). A
+    /// writer that held the lock across its sleep (the guard kept alive by
+    /// a `match` scrutinee) releases it and takes it again at once, before
+    /// a woken resize can run, so the resizes never finish.
+    /// With no clock bar it runs outside the nextest `timing` group.
     #[test]
     fn resize_is_not_starved_by_a_blocked_writer() {
         let app = Arc::new(app());
         let (id, fake) = attach_fake(&app, false);
         let writer = blocked_writer(&app, id, &fake);
-        let mut worst = Duration::ZERO;
-        for _ in 0..20 {
-            let started = Instant::now();
-            app.resize(id, PtySize::new(30, 100)).unwrap();
-            worst = worst.max(started.elapsed());
-        }
-        // One backoff period is 20 ms; holding the lock across it would make
-        // most of these calls wait that long.
-        assert!(
-            worst < Duration::from_millis(10),
-            "worst resize took {worst:?}"
-        );
+        let (done_tx, all_done) = mpsc::channel();
+        let resizer = {
+            let app = Arc::clone(&app);
+            thread::spawn(move || {
+                for _ in 0..20 {
+                    app.resize(id, PtySize::new(30, 100)).unwrap();
+                }
+                let _ = done_tx.send(());
+            })
+        };
+        let finished = all_done.recv_timeout(TIMEOUT * 4);
+        let writer_waiting = !writer.is_finished();
         fake.would_block.store(false, Ordering::SeqCst);
         writer.join().unwrap().unwrap();
+        resizer.join().unwrap();
+        assert_eq!(finished, Ok(()), "the resizes waited for the writer");
+        assert!(writer_waiting, "the writer stopped retrying");
         assert_eq!(&lock(&fake.written)[..], b"stuck");
     }
 
