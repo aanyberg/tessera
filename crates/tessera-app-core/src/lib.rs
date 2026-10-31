@@ -984,6 +984,7 @@ impl App {
         let fonts = self.fonts_for(&theme)?;
         let view = build(gpu, target, fonts, theme)?;
         let pty_size = view.pty_size();
+        let cell = view.cell_metrics();
         views.insert(id, view);
         drop(views);
         drop(retired);
@@ -996,6 +997,7 @@ impl App {
             drop(removed);
             return Err(Error::SessionNotFound(id));
         }
+        self.set_cell_pixels(id, cell);
         self.follow_view(id, pty_size);
         Ok(())
     }
@@ -1014,10 +1016,11 @@ impl App {
     /// [`Error::SessionNotFound`] if `id` is not a live session,
     /// [`Error::NoView`] if it has no view.
     pub fn resize_view(&self, id: SessionId, size: PhysicalSize, scale: f32) -> Result<()> {
-        let pty_size = self.with_view(id, |view| {
+        let (pty_size, cell) = self.with_view(id, |view| {
             view.resize(size, scale);
-            view.pty_size()
+            (view.pty_size(), view.cell_metrics())
         })?;
+        self.set_cell_pixels(id, cell);
         self.follow_view(id, pty_size);
         Ok(())
     }
@@ -1032,10 +1035,11 @@ impl App {
     /// [`Error::SessionNotFound`] if `id` is not a live session,
     /// [`Error::NoView`] if it has no view.
     pub fn set_view_font_size(&self, id: SessionId, size_pt: f32) -> Result<()> {
-        let pty_size = self.with_view(id, |view| {
+        let (pty_size, cell) = self.with_view(id, |view| {
             view.set_font_size(size_pt);
-            view.pty_size()
+            (view.pty_size(), view.cell_metrics())
         })?;
+        self.set_cell_pixels(id, cell);
         self.follow_view(id, pty_size);
         Ok(())
     }
@@ -1248,6 +1252,14 @@ impl App {
         })?;
         *slot = Some(fonts.clone());
         Ok(fonts)
+    }
+
+    /// Tells session `id`'s terminal its view's cell size, for the pixel
+    /// size reports (ADR 0024); a session that went away is skipped.
+    fn set_cell_pixels(&self, id: SessionId, cell: CellMetrics) {
+        if let Ok(session) = self.session(id) {
+            session.set_cell_pixels(cell.width_px, cell.height_px);
+        }
     }
 
     /// Resizes session `id` to follow its view; `None` (an empty surface)
@@ -2558,6 +2570,148 @@ mod tests {
         written_eventually(&fake, "é".as_bytes());
     }
 
+    /// A reply goes to the child through the outbox, after the input
+    /// queued before its query arrived (#10, ADR 0024).
+    #[test]
+    fn a_reply_is_written_after_the_input_already_queued() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        output(&fake, &events, b"\x1b[5;10H\x1b[6n");
+        written_eventually(&fake, b"\x1b[5;10R");
+        lock(&fake.written).clear();
+        fake.would_block.store(true, Ordering::SeqCst);
+        // The writer takes `x` and waits on the PTY with it; `w` stays
+        // queued, and the reply must go behind it.
+        for ch in ['x', 'w'] {
+            let event = KeyEvent::new(Key::Char(ch), Modifiers::NONE);
+            assert_eq!(key(&app, id, event), InputOutcome::Consumed);
+        }
+        output(&fake, &events, b"\x1b[5n\x1b[c");
+        let y = KeyEvent::new(Key::Char('y'), Modifiers::NONE);
+        assert_eq!(key(&app, id, y), InputOutcome::Consumed);
+        fake.would_block.store(false, Ordering::SeqCst);
+        written_eventually(&fake, b"xw\x1b[0n\x1b[?64;22cy");
+    }
+
+    /// #10's flood bar: 1,000,000 `CSI 6 n` from a child that never reads
+    /// queue each reply once, in a handful of outbox entries (never one per
+    /// reply), and 2,000,000 more overflow
+    /// [`session::PENDING_INPUT_BYTES`]: the overflow is dropped and
+    /// counted, the queued bytes never exceed the bound, and the reader
+    /// keeps delivering every chunk (the sync channel of 16 chunks would
+    /// stall this thread otherwise) and answering the terminal lock.
+    #[test]
+    fn a_query_flood_from_a_child_that_never_reads_stays_bounded() {
+        const CHUNK: usize = 64 * 1024;
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        fake.would_block.store(true, Ordering::SeqCst);
+        let session = app.session(id).unwrap();
+        let mut worst_lock = Duration::ZERO;
+        let mut flood = |queries: usize| {
+            let bytes = b"\x1b[6n".repeat(queries);
+            for chunk in bytes.chunks(CHUNK) {
+                fake.send(PtyEvent::Output(chunk.to_vec()));
+                let started = Instant::now();
+                app.with_terminal(id, |_| ()).unwrap();
+                worst_lock = worst_lock.max(started.elapsed());
+            }
+            let chunks = bytes.len().div_ceil(CHUNK);
+            let mut outputs = 0;
+            while outputs < chunks {
+                if matches!(next(&events), (_, SessionEvent::Output)) {
+                    outputs += 1;
+                }
+            }
+            bytes.len()
+        };
+        let reply = b"\x1b[1;1R".len();
+        let fed = flood(1_000_000);
+        let (bytes, entries, dropped) = session.outbox_stats();
+        eprintln!("1M queries: {bytes} bytes in {entries} entries, {dropped} dropped");
+        assert_eq!((bytes, dropped), (1_000_000 * reply, 0));
+        // At most one entry per slice (`ADVANCE_SLICE`, 4 KiB) and chunk;
+        // replies join the last queued entry, so in fact one or two.
+        assert!(entries <= fed / 4096 + fed / CHUNK + 2, "{entries} entries");
+        flood(2_000_000);
+        let (bytes, entries, dropped) = session.outbox_stats();
+        eprintln!(
+            "3M queries: {bytes} bytes in {entries} entries, {dropped} dropped, \
+             worst terminal lock wait {worst_lock:?}"
+        );
+        assert!(
+            bytes <= session::PENDING_INPUT_BYTES,
+            "{bytes} bytes queued"
+        );
+        assert!(
+            bytes + 4096 / 4 * reply > session::PENDING_INPUT_BYTES,
+            "the outbox filled up: {bytes}"
+        );
+        assert!(dropped > 0, "the overflow is dropped and counted");
+        app.close_session(id).unwrap();
+    }
+
+    /// A child that writes each query on its own (one PTY read per query)
+    /// still costs one outbox entry, not one per query: replies join the
+    /// entry at the back of the queue (#10 critic B1; 4.5M such queries
+    /// used to queue 4.2M entries, 170 MB).
+    #[test]
+    fn single_query_reads_from_a_child_that_never_reads_share_one_entry() {
+        const QUERIES: usize = 20_000;
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        fake.would_block.store(true, Ordering::SeqCst);
+        let session = app.session(id).unwrap();
+        for _ in 0..QUERIES {
+            fake.send(PtyEvent::Output(b"\x1b[5n".to_vec()));
+        }
+        let mut outputs = 0;
+        while outputs < QUERIES {
+            if matches!(next(&events), (_, SessionEvent::Output)) {
+                outputs += 1;
+            }
+        }
+        let (bytes, entries, dropped) = session.outbox_stats();
+        assert_eq!((bytes, dropped), (QUERIES * b"\x1b[0n".len(), 0));
+        // The writer holds the first reply; everything after it is one entry.
+        assert!(
+            entries <= 1,
+            "{entries} entries for {QUERIES} single-query reads"
+        );
+        app.close_session(id).unwrap();
+    }
+
+    /// The pixel size reports answer the view's cell size, which every view
+    /// change hands to the terminal (#10, D-CELLPX).
+    #[test]
+    fn the_cell_size_report_follows_the_view() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        output(&fake, &events, b"\x1b[16t\x1b[18t");
+        let rows_cols = app
+            .with_terminal(id, |t| (t.grid().rows(), t.grid().cols()))
+            .unwrap();
+        let chars = format!("\x1b[8;{};{}t", rows_cols.0, rows_cols.1);
+        written_eventually(&fake, chars.as_bytes());
+        if !attach_offscreen(&app, id, PhysicalSize::new(800, 600), 2.0) {
+            return;
+        }
+        for size_pt in [None, Some(20.0)] {
+            if let Some(size_pt) = size_pt {
+                app.set_view_font_size(id, size_pt).unwrap();
+            }
+            lock(&fake.written).clear();
+            output(&fake, &events, b"\x1b[16t");
+            let cell = app.view_cell_metrics(id).unwrap();
+            let want = format!("\x1b[6;{};{}t", cell.height_px, cell.width_px);
+            written_eventually(&fake, want.as_bytes());
+        }
+    }
+
     #[test]
     fn a_key_is_queued_while_the_child_is_not_reading() {
         let app = app();
@@ -3547,6 +3701,7 @@ mod tests {
         let fonts = app.fonts_for(&theme).expect("the configured font");
         let view = View::offscreen(gpu, fonts, theme, size, scale).expect("view");
         let pty_size = view.pty_size();
+        app.set_cell_pixels(id, view.cell_metrics());
         lock(&app.views).insert(id, view);
         app.follow_view(id, pty_size);
         true

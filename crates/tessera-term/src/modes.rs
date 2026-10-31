@@ -68,7 +68,8 @@
 //! (replace, the default), 2 (set bits) or 3 (clear bits); another mode is
 //! ignored. Bits above the five defined flags are masked off. The parser
 //! reports `CSI < 0 u` exactly like `CSI < u`, so it pops one entry (kitty
-//! pops none). The query `CSI ? u` is #10.
+//! pops none). The query `CSI ? u` answers the active screen's flags
+//! (ADR 0024).
 //!
 //! # Resets
 //!
@@ -113,7 +114,7 @@ pub struct Modes {
     /// xterm; cleared by DECSTR, DECSCL and RIS. Whether the cursor blinks
     /// is [`Terminal::cursor_style`](crate::Terminal::cursor_style), which
     /// also counts the configured default; this is the record a DECRQM 12
-    /// reply will answer from.
+    /// reply answers from.
     pub cursor_blink: bool,
     /// DECSCNM (DECSET 5): the whole screen is shown in reverse video.
     /// Stored only.

@@ -19,15 +19,22 @@
 //!   steps above it;
 //! - `screen:` (one `>` line per row) and `cursor: (row,col)` check the
 //!   screen after the last step;
-//! - `requests: []`, `reply:`, `cite:`, `note:` and `flags:` are read but
-//!   checked only as described below.
+//! - `reply: <bytes>` checks the [`Request::Reply`] bytes queued since the
+//!   previous `reply:` line, concatenated (the DECRQSS and DECRQM rows
+//!   Q01..Q06, the #113 contract #10 fulfils). Q02's `feed (for Ps in
+//!   1..=6) ...` repeats its payload with `<Ps>` replaced, and its `reply:
+//!   ... for each Ps (1,2,...)` expects the replies for those values;
+//! - `requests: []`, `cite:`, `note:` and `flags:` are read but checked
+//!   only as described below (the `deferred` flag predates #10 and is
+//!   ignored).
 //!
 //! [`every_row`] runs every row whole and byte by byte and reports every
-//! failing row id at once. Rows flagged `deferred` (DECRQSS and DECRQM
-//! replies, which need a reply channel the terminal does not have yet)
-//! are counted and listed, not run. Every row also asserts that the
-//! terminal queued no request. A few rows carry a `note:` asking for one
-//! more check than their keys express; [`row_extras`] adds those by id.
+//! failing row id at once. Every row also asserts that the terminal queued
+//! no request other than replies; replies are checked only where a row
+//! has `reply:` lines. A few rows carry a `note:` asking for one more
+//! check than their keys express; [`row_extras`] adds those by id.
+//!
+//! [`Request::Reply`]: tessera_term::Request::Reply
 //!
 //! [`Modes::cursor_blink`]: tessera_term::Modes::cursor_blink
 
@@ -38,14 +45,12 @@ use std::time::{Duration, Instant};
 
 use common::{Chunking, decode, render_screen};
 use tessera_grid::Point;
-use tessera_term::{CursorShape, CursorStyle, Terminal};
+use tessera_term::{CursorShape, CursorStyle, Request, Terminal};
 
 const FIXTURE: &str = include_str!("fixtures/decscusr_spec.txt");
 
-/// Rows in the fixture: 54 run now and 6 deferred (Q01..Q06).
+/// Rows in the fixture, Q01..Q06 included.
 const ROWS: usize = 60;
-/// Rows flagged `deferred`.
-const DEFERRED: usize = 6;
 /// How often X08 repeats its step (its comment says so).
 const FLOOD_REPEAT: usize = 2_000;
 
@@ -59,6 +64,8 @@ enum Step {
         style: CursorStyle,
         modes_blink: Option<bool>,
     },
+    /// The replies since the previous `Reply`, concatenated.
+    Reply(Vec<u8>),
 }
 
 /// One row of the fixture.
@@ -71,7 +78,6 @@ struct Row {
     steps: Vec<Step>,
     screen: Option<String>,
     cursor: Option<Point>,
-    deferred: bool,
 }
 
 fn parse_style(text: &str) -> CursorStyle {
@@ -130,9 +136,37 @@ fn strip_comment(text: &str) -> &str {
         .map_or(text, |(i, _)| &text[..i])
 }
 
+/// `(for Ps in A..=B) payload`: the payload once per Ps, `<Ps>` replaced.
+fn for_each_ps(text: &str) -> Option<Vec<u8>> {
+    let (range, payload) = text.strip_prefix("(for Ps in ")?.split_once(") ")?;
+    let (first, last) = range.split_once("..=")?;
+    let (first, last): (u16, u16) = (first.parse().ok()?, last.parse().ok()?);
+    Some(
+        (first..=last)
+            .flat_map(|ps| decode(&payload.replace("<Ps>", &ps.to_string())))
+            .collect(),
+    )
+}
+
+/// A `reply:` value: bytes, or `bytes for each Ps (a,b,...)` with `<Ps>`
+/// replaced by each value in turn.
+fn parse_reply(text: &str) -> Step {
+    let Some((payload, list)) = text.split_once(" for each Ps (") else {
+        return Step::Reply(decode(text.trim_end()));
+    };
+    let list = list.split(" in order)").next().unwrap_or(list);
+    Step::Reply(
+        list.split(',')
+            .flat_map(|ps| decode(&payload.replace("<Ps>", ps.trim())))
+            .collect(),
+    )
+}
+
 fn parse_step(arg: &str) -> Step {
     let arg = strip_comment(arg);
-    if let Some(payload) = arg.strip_prefix("feed ") {
+    if let Some(bytes) = arg.strip_prefix("feed ").and_then(for_each_ps) {
+        Step::Feed(bytes)
+    } else if let Some(payload) = arg.strip_prefix("feed ") {
         // Everything after the single space: X07's payload starts with one.
         Step::Feed(decode(payload))
     } else if let Some(style) = arg.strip_prefix("set_default ") {
@@ -159,10 +193,6 @@ fn raw_rows(text: &str) -> Vec<(String, Vec<&str>)> {
 }
 
 fn parse_row(id: String, lines: &[&str]) -> Row {
-    let deferred = lines.iter().any(|line| {
-        line.strip_prefix("flags:")
-            .is_some_and(|flags| flags.split_whitespace().any(|f| f == "deferred"))
-    });
     let mut row = Row {
         id,
         rows: 0,
@@ -171,7 +201,6 @@ fn parse_row(id: String, lines: &[&str]) -> Row {
         steps: Vec::new(),
         screen: None,
         cursor: None,
-        deferred,
     };
     let mut lines = lines.iter().peekable();
     while let Some(line) = lines.next() {
@@ -184,9 +213,6 @@ fn parse_row(id: String, lines: &[&str]) -> Row {
         let value = value.strip_prefix(' ').unwrap_or(value);
         match key {
             "size" => (row.rows, row.cols) = parse_size(value),
-            // Deferred rows use placeholders (`<Ps>`) and replies: they are
-            // the contract of a later issue, read for their keys only.
-            "step" | "expect" if row.deferred => {}
             "default" => row.default = Some(parse_style(value)),
             "step" => row.steps.push(parse_step(value)),
             "expect" => row.steps.push(parse_expect(value)),
@@ -201,7 +227,8 @@ fn parse_row(id: String, lines: &[&str]) -> Row {
             }
             "cursor" => row.cursor = Some(parse_point(value)),
             "requests" => assert_eq!(value.trim(), "[]", "{}: requests", row.id),
-            "reply" | "cite" | "note" | "flags" => {}
+            "reply" => row.steps.push(parse_reply(value)),
+            "cite" | "note" | "flags" => {}
             other => panic!("{}: unknown key `{other}`", row.id),
         }
     }
@@ -237,6 +264,17 @@ fn style_text(style: CursorStyle) -> String {
     format!("{shape} {blink}")
 }
 
+/// Moves the terminal's requests into `replies` (the reply bytes) and
+/// `others`.
+fn collect(term: &mut Terminal, replies: &mut Vec<u8>, others: &mut Vec<Request>) {
+    for request in term.take_requests() {
+        match request {
+            Request::Reply(bytes) => replies.extend(bytes),
+            other => others.push(other),
+        }
+    }
+}
+
 /// Runs `row` and returns one message per mismatch.
 fn check_row(row: &Row, chunking: Chunking) -> Vec<String> {
     let mut errors = Vec::new();
@@ -251,11 +289,25 @@ fn check_row(row: &Row, chunking: Chunking) -> Vec<String> {
     } else {
         1
     };
+    let mut replies = Vec::new();
+    let mut others = Vec::new();
     for (index, step) in row.steps.iter().enumerate() {
         match step {
             Step::Feed(bytes) => {
                 for _ in 0..repeat {
                     feed(&mut term, bytes, chunking);
+                }
+                collect(&mut term, &mut replies, &mut others);
+            }
+            Step::Reply(want) => {
+                collect(&mut term, &mut replies, &mut others);
+                let got = std::mem::take(&mut replies);
+                if got != *want {
+                    fail(format!(
+                        "reply #{index}: {} != {}",
+                        got.escape_ascii(),
+                        want.escape_ascii()
+                    ));
                 }
             }
             Step::SetDefault(style) => term.set_default_cursor_style(*style),
@@ -289,9 +341,9 @@ fn check_row(row: &Row, chunking: Chunking) -> Vec<String> {
     {
         fail(format!("cursor {:?} != {cursor:?}", term.grid().cursor()));
     }
-    let requests = term.take_requests();
-    if !requests.is_empty() {
-        fail(format!("requests {requests:?}"));
+    collect(&mut term, &mut replies, &mut others);
+    if !others.is_empty() {
+        fail(format!("requests {others:?}"));
     }
     for what in row_extras(row, &term, chunking) {
         fail(what);
@@ -342,14 +394,7 @@ fn row_extras(row: &Row, term: &Terminal, chunking: Chunking) -> Vec<String> {
 fn every_row() {
     let rows = rows();
     assert_eq!(rows.len(), ROWS, "rows in the fixture");
-    let (deferred, runnable): (Vec<&Row>, Vec<&Row>) = rows.iter().partition(|row| row.deferred);
-    let skipped: Vec<&str> = deferred.iter().map(|row| row.id.as_str()).collect();
-    eprintln!(
-        "{} deferred rows skipped: {}",
-        skipped.len(),
-        skipped.join(", ")
-    );
-    assert_eq!(deferred.len(), DEFERRED, "deferred rows: {skipped:?}");
+    let runnable: Vec<&Row> = rows.iter().collect();
     let errors: Vec<String> = runnable
         .iter()
         .flat_map(|row| {

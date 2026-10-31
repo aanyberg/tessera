@@ -12,4 +12,5 @@ cursor: (2,5)
 pending_wrap: false
 auto_wrap: true insert_mode: false
 requests: []
+replies: \x1b[0n\x1b[3;5R\x1b[?64;22c\x1b[?64;22c
 scrollback: 0

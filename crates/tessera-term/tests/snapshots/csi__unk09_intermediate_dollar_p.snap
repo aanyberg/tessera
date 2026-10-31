@@ -12,4 +12,5 @@ cursor: (2,5)
 pending_wrap: false
 auto_wrap: true insert_mode: false
 requests: []
+replies: \x1b[0;0$y
 scrollback: 0

@@ -91,9 +91,13 @@ An OSC never moves the cursor or resolves a pending wrap.
   are kept (no trimming). This is our own hardening against tab-strip
   spoofing (the Trojan Source class); no reference emulator strips the
   bidi characters.
-- D-TSTACK: the title stack (`CSI 22/23 t`) and the title reports
-  (`CSI 20/21 t`) stay unimplemented and unanswered: reporting a title back
-  is an injection vector. A pop does not re-emit an older title.
+- D-TSTACK: the title reports (`CSI 20/21 t`) stay unanswered: reporting
+  a title back is an injection vector. *Amended by ADR 0024 (#10):* the
+  title stack is implemented. `CSI 22 ; 0|2 t` pushes the title last
+  emitted (sanitised; the empty title before any), `CSI 23 ; 0|2 t` pops it
+  and re-emits it as `Request::SetTitle`; depth 10, a push onto a full
+  stack drops the oldest, a pop on an empty stack does nothing; `22;1` and
+  `23;1` (icon) and a third parameter do nothing. Nothing is replied.
 - D-FLOOD: the terminal does not coalesce titles (two OSCs give two
   requests in order); the Swift bridge coalesces deliveries.
 
@@ -182,7 +186,8 @@ the pasteboard on the main actor (`CallbackBridge`, through an injectable
 - Divergences from xterm worth knowing: CAN/SUB/ESC apply a partial OSC
   (D-CAN), empty OSC 52 data does not clear (D-EMPTY52), unknown `Pc`
   letters reject the sequence (D-SEL), titles lose bidi characters.
-- Deferred: the title stack and reports (D-TSTACK), OSC 4/10/11/12 and
+- Deferred: the title reports (D-TSTACK; the stack itself came with ADR
+  0024), OSC 4/10/11/12 and
   104/110-112 colours (#10, which owns the reply path), OSC 8 hyperlinks
   (#30), bounding OSC memory in `tessera-vt`, and the xterm treatment of
   CAN/SUB/ESC (needs the terminator from `tessera-vt`).

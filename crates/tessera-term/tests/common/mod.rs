@@ -318,9 +318,25 @@ pub fn render_screen(term: &Terminal) -> String {
     out
 }
 
+/// Splits `requests` into the bytes of every [`Request::Reply`],
+/// concatenated in order, and the other requests.
+#[allow(dead_code)] // print.rs and wide.rs include this module without the allow.
+pub fn split_replies(requests: &[Request]) -> (Vec<u8>, Vec<Request>) {
+    let mut replies = Vec::new();
+    let mut others = Vec::new();
+    for request in requests {
+        match request {
+            Request::Reply(bytes) => replies.extend_from_slice(bytes),
+            other => others.push(other.clone()),
+        }
+    }
+    (replies, others)
+}
+
 /// Renders the screen plus the state the screen cannot show: the cursor
-/// position (0-based), the pending-wrap flag, the modes, the requests and
-/// the scrollback (oldest first, with the same `\` wrap marker).
+/// position (0-based), the pending-wrap flag, the modes, the requests, the
+/// replies (a `replies:` line only when there are any, escaped) and the
+/// scrollback (oldest first, with the same `\` wrap marker).
 pub fn render_state(term: &Terminal, requests: &[Request]) -> String {
     let grid = term.grid();
     let cursor = grid.cursor();
@@ -335,7 +351,20 @@ pub fn render_state(term: &Terminal, requests: &[Request]) -> String {
         term.auto_wrap(),
         term.insert_mode()
     );
+    let (replies, requests) = split_replies(requests);
     let _ = writeln!(out, "requests: {requests:?}");
+    if !replies.is_empty() {
+        // Version-independent, so a release does not change snapshots.
+        let replies = replies
+            .escape_ascii()
+            .to_string()
+            .replace(&tessera_term::DA2_PV.to_string(), "<PV>")
+            .replace(
+                concat!("Tessera ", env!("CARGO_PKG_VERSION")),
+                "Tessera <VERSION>",
+            );
+        let _ = writeln!(out, "replies: {replies}");
+    }
     let _ = writeln!(out, "scrollback: {}", grid.scrollback_len());
     for line in (0..grid.scrollback_len()).filter_map(|i| grid.scrollback_line(i)) {
         let mark = if line.wrapped { "\\" } else { "" };

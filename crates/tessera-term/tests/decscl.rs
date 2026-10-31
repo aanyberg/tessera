@@ -256,8 +256,23 @@ fn check(cases: &[Case], id: &str) {
     );
     for chunking in [Chunking::Whole, Chunking::Bytewise] {
         errors.extend(check_case(case, chunking));
-        let (term, _) = case.script.run(chunking);
+        let (term, requests) = case.script.run(chunking);
         errors.extend(check_extra(case, &extra, &term, chunking));
+        // DECSCL itself replies nothing; the only query among the cases is
+        // NEAR01's `CSI 62 $ p`, a DECRQM of the unknown ANSI mode 62 (#10).
+        let (replies, _) = common::split_replies(&requests);
+        let want: &[u8] = if id.starts_with("NEAR01_") {
+            b"\x1b[62;0$y"
+        } else {
+            b""
+        };
+        if replies != want {
+            errors.push(format!(
+                "{id} ({chunking:?}) replies: expected {}, got {}",
+                want.escape_ascii(),
+                replies.escape_ascii()
+            ));
+        }
     }
     assert!(errors.is_empty(), "{}", errors.join("\n"));
 }

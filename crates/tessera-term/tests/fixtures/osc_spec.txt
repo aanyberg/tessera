@@ -541,22 +541,22 @@ requests: [SetTitle(""), Bell]
 size: 2x40
 step: feed \x1b[21t\x1b[20t\x1b[22;2t\x1b[23;2t
 cite: [CTL] CSI 20 t / 21 t report icon label / title (XTWINOPS, gated by allowWindowOps); 22;Ps t / 23;Ps t title stack
-note: D-TSTACK / D-READ: no requests, no reply bytes. Today the terminal answers nothing; do not add. Assert no bytes were queued for the child if the harness can see them.
-flags: security negative out-of-scope decision D-TSTACK
+note: D-TSTACK / D-READ: the title reports 20/21 t are never answered (no Reply in `requests`). Lead edit 2026-10-31 (#10, ADR 0024): the title stack is implemented, so the 22;2 t push and 23;2 t pop re-emit the title last emitted, the empty one here.
+flags: security negative decision D-TSTACK
 screen:
 > |
 >
 cursor: (0,0)
-requests: []
+requests: [SetTitle("")]
 
-### T36_title_stack_is_not_implemented
+### T36_title_stack_pop_reemits_the_title
 size: 2x40
 step: feed \x1b]2;one\x07\x1b[22;2t\x1b]2;two\x07\x1b[23;2t
 cite: [CTL] CSI 22;2 t push, CSI 23;2 t pop window title
-note: Deferred: the pop does NOT re-emit 'one'. If the lead brings CSI 22/23 t into #9 the expected requests become [SetTitle("one"), SetTitle("two"), SetTitle("one")].
-flags: deferred decision D-TSTACK
+note: Lead edit 2026-10-31 (#10, ADR 0024, amended D-TSTACK): the title stack is implemented and the pop re-emits 'one' (the row's earlier "deferred" expectation, as its note foresaw). Renamed from T36_title_stack_is_not_implemented.
+flags: decision D-TSTACK
 screen: not asserted
-requests: [SetTitle("one"), SetTitle("two")]
+requests: [SetTitle("one"), SetTitle("two"), SetTitle("one")]
 
 
 # ---------------------------------------------------------------------------- K. OSC 52 clipboard write (read/query is never answered)

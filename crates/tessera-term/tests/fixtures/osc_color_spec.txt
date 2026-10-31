@@ -1,0 +1,951 @@
+# =============================================================================
+# tessera-term: OSC colour queries, sets and resets (OSC 4, 10, 11, 12, 104, 110, 111, 112)   (issue #10 part 2, wave 8)
+# crates/tessera-term/tests/fixtures/osc_color_spec.txt   (spec-researcher output, 2026-10-31)
+# Companion: reports_spec.txt (the reply path, DA/DSR/..., same table format) and reports_spec.notes.md.
+#
+# FORMAT (one table-driven test, tests/osc_color.rs, through common::check_table; every failing id is reported;
+# each row also runs with the bytes split at every offset (Chunking))
+#   ### ID / size: RxC / step: feed <bytes> / reply: <bytes>|none / cite: / note: / flags:   as reports_spec.txt.
+#         \x07 is BEL. `reply:` is the concatenation of every Request::Reply since the previous `reply:` (or the start).
+#   step: set size <R>x<C>   Terminal::resize(rows, cols) (the grid size of the row changes; overrides must survive).
+#   step: set theme <spec>   Terminal::set_theme_colors(ThemeColors{..}); <spec> is `T` (the TEST THEME below) or `T2` (the second
+#                            theme below). Rows without it use T.
+#   expect: <k>=<#rrggbb> .. the EFFECTIVE colours (theme + overrides) after the steps above it. k = fg | bg | cursor | pal[N].
+#                            Checked against the Terminal colour API (the exact accessor names are the implementer's).
+#   overrides: <list>|none   the keys with a program override (Terminal::color_overrides()), as `fg bg cursor pal[1] pal[7]`,
+#                            in that order (fg, bg, cursor, then palette ascending); `none` = empty.
+#   gen: +1 | same           colors_generation() relative to its value at the previous `gen:` line (or the row start):
+#                            `+1` means "increased" (any increase counts), `same` unchanged. "bumps on any effective change".
+#   cite/flags               as reports_spec.txt: decision | xterm-quirk | negative | unverified | security | control
+#
+# TEST THEME T (synthetic, so a wrong index shows at once)           fg #d0d0d0   bg #101010   cursor #ffcc00
+#     palette[i] = ( i , 255 - i , i XOR 0x55 )  for i in 0..=255      e.g. pal[0]=#00ff55 pal[1]=#01fe54 pal[2]=#02fd57
+#     pal[7]=#07f852 pal[15]=#0ff05a pal[16]=#10ef45 pal[100]=#649b31 pal[200]=#c8379d pal[255]=#ff00aa
+# TEST THEME T2                                                      fg #aabbcc   bg #223344   cursor #00ff00
+#     palette[i] = ( 255 - i , i , i XOR 0xaa )
+#     pal[1]=#fe01ab pal[2]=#fd02a8
+#
+# PRIMARY SOURCES (fetched 2026-10-31)
+#   [CTL]  xterm ctlseqs https://invisible-island.net/xterm/ctlseqs/ctlseqs.txt, section "Operating System Commands":
+#          "XTerm accepts either BEL or ST for terminating OSC sequences, and when returning information, uses the same terminator
+#          used in a query." "If a ? is given rather than a name or RGB specification, xterm replies with a control sequence of the
+#          same form which can be used to set the corresponding color ... Because more than one pair of color number and specification
+#          can be given in one control sequence, xterm can make more than one reply." "Ps = 104 ; c -> Reset Color Number c ... If no
+#          parameters are given, the entire table will be reset." "Ps = 110 -> Reset VT100 text foreground color. 111 background,
+#          112 text cursor color." "Each successive parameter changes the next color in the list. The value of Ps tells the starting
+#          point in the list." (the 10;a;b chain)
+#   [XT]   xterm source (ThomasDickey/xterm-snapshots master, XTERM_PATCH 412, as fetched 2026-10-31):
+#            misc.c L4000..4180 do_osc (number parse, `final` = the query's terminator echoed), L2636..2659 ReportAnsiColorRequest
+#            (`"%d;%d;rgb:%04x/%04x/%04x"`, lowercase), L2980..3010 ChangeAnsiColorRequest (loop: atoi index, `?` queries, first error
+#            breaks the loop), L3130.. ResetAnsiColorRequest (104), L3568..3600 ReportColorRequest (`"%d;rgb:%04x/%04x/%04x"`, Ps = 10 + i),
+#            L3662..3715 ChangeColorsRequest (chain: i = start..; an empty piece (`;;`) skips one colour), L3718..3750 ResetColorsRequest;
+#            do_osc: `!need_data && !optional_data` -> a 110..119 with data is ignored; 104/105 take optional data;
+#            charproc.c L14358..14412 ReallyReset: the COMMON part (DECSTR and RIS alike) calls reset_SGR_Colors and
+#            ResetAnsiColorRequest(all) -> xterm resets the 256-colour palette on DECSTR AND RIS; it never resets the dynamic colours
+#            (10/11/12) in either; the RIS-only block does not touch colours either.
+#   [XL]   X Window System "Color Strings": rgb:<r>/<g>/<b> with 1..4 hex digits per channel, SCALED (f -> ffff); "#rgb" .. "#rrrrggggbbbb"
+#          with equal 1..4 digit groups, LEFT-JUSTIFIED (the leading digits are the most significant bits: #3a7 == #3000a0007000, so
+#          #fff is 0xf0f0f0, not white); rgbi:<f>/<f>/<f> floats 0..1; names from rgb.txt (case/space-insensitive); CIE specs.
+#   [VT]   neovim tui.c L350..353: `ESC ] 11 ; ? BEL` immediately followed by `ESC [ 5 n` (the DSR 5 reply is the "no answer to the
+#          colour query" sentinel; the colour answer, when there is one, arrives first); neovim parses the reply
+#          `OSC 11 ; rgb:rrrr/gggg/bbbb` terminated by BEL or ST. fish terminal.rs L323: `ESC ] 11 ; ? ESC \` (ST!) after `ESC [ 0 c`
+#          (DA1), `ESC [ > 0 q` (XTVERSION), `ESC [ ? u`, `ESC [ 6 n`; fish also enables `CSI ? 2031 h` (colour theme reporting).
+#          tmux queries OSC 10 / OSC 11 (tty.c, `\033]10;?\033\\` and `\033]11;?\033\\`) and parses `rgb:` replies (tty-keys.c).
+#   [KT]   kitty https://sw.kovidgoyal.net/kitty/ (escape code docs "Colors" and the dynamic colours: OSC 4/10/11/12 query replies in
+#          `rgb:rrrr/gggg/bbbb`, terminator echoed; RIS resets dynamic colours; DECSTR does not). From memory of kitty/colors.c and
+#          screen.c, not re-fetched in this run: marked "(from memory)".
+#   [WZ] [GH] [AL] [IT]  WezTerm, Ghostty, Alacritty, iTerm2: only "(from memory)" statements; none re-fetched. RIS resets the colours
+#          in Alacritty (`reset_state`), WezTerm (full reset) and Ghostty; DECSTR does not touch colours in any of them.
+#
+# DECISIONS (D-xxx; lead confirms; the rows follow the recommendation):
+#   D-REPLY     A query reply is `OSC <n> ; rgb:RRRR/GGGG/BBBB <T>` for 10/11/12 (n = 10/11/12) and `OSC 4 ; <idx> ; rgb:RRRR/GGGG/BBBB <T>`
+#               for the palette: lowercase hex, 4 digits per channel = the 8-bit value * 257 (0xd0 -> d0d0), 7-bit OSC introducer (ESC ]),
+#               <T> = BEL if the query ended with BEL, ESC \ otherwise (ST, 8-bit ST, CAN/SUB/ESC-aborted: all give ESC \ because the
+#               parser reports only "bell terminated" yes/no). Replies come out through reply_osc (7-bit) in query order.
+#   D-VTBELL    PREREQUISITE (scope amendment for the brief): tessera-vt's Action::Osc drops vte's `bell_terminated` (lib.rs L278
+#               `_bell_terminated`), so the terminal cannot echo the terminator today. The implementer must add the flag to Action::Osc
+#               (or a sibling) and update the OSC callers; ADR 0022's "the terminator is not visible" note changes with it.
+#   D-QUERY     A `?` answers only for the colours Tessera has: 4 (index 0..=255), 10, 11, 12. The chain 10;?;? answers 10 then 11
+#               (xterm); 11;?;? answers 11 then 12; 12;?;? answers 12 only (13 = pointer colour does not exist here). A piece that is
+#               neither `?` nor a valid spec leaves that colour alone (xterm) and later pieces still apply to later colours.
+#   D-SPEC      Accepted set specs (case-insensitive prefix/hex): `rgb:` with 1..4 hex digits per channel scaled to 8 bits by
+#               v * 255 / (16^n - 1) truncated through the 16-bit value (xterm), i.e. high byte of v * 65535 / (16^n - 1);
+#               `#` + 3, 6, 9 or 12 hex digits (see D-HASH). Rejected (ignored whole): everything else, including `rgbi:`, `CIE*:`,
+#               `rgb(...)`, names (D-NAMES), empty, surrounding blanks, a sign, fewer/more digits, mixed digit counts, non-hex.
+#   D-HASH      LEAD DECISION 2026-10-31: xterm/Xlib [XL] semantics. Each group is LEFT-JUSTIFIED (#f00 = #f00000; #f80 = #f08000),
+#               not CSS nibble doubling (kitty/WezTerm/Alacritty). 6 digits: as is. 9 and 12 digits: the top 8 bits of each group
+#               (#123456789 = #124578). Row OS-HASH3 follows this.
+#   D-NAMES     X11 colour names are NOT accepted in this task (ignored whole). X11 and CSS names disagree (gray 190 vs 128, green 0,255,0
+#               vs 0,128,0, maroon, purple), and a 750-entry table is a separate issue. xterm, kitty and Ghostty accept names, WezTerm
+#               (CSS names) too: file a follow-up; rows OS-NAME* flip then.
+#   D-STOP4     OSC 4 / 104 processing stops at the first malformed pair/index (xterm `break`): earlier pairs stay applied, later ones are
+#               not. An index >= 256 is malformed. (kitty skips and continues, from memory.)
+#   D-OSC4-IDX  The index is decimal digits only (1..3 chars after trimming no whitespace): `+1`, `1x`, ``, `-1`, `0x10` are malformed
+#               (xterm's atoi accepts `1x` as 1 and `` as 0: quirks Tessera does not copy). Leading zeros are fine (`001`).
+#   D-RESET     RIS drops EVERY override (palette and dynamic) and bumps the generation if any effective colour changed; DECSTR and DECSCL
+#               keep every override (the `// #10` question in soft_reset). xterm resets the palette on both and keeps the dynamic colours
+#               on both; kitty/Alacritty/WezTerm/Ghostty follow the Tessera rule (from memory). NEEDS THE LEAD (brief says "DECSTR per
+#               fixture"). Alternate-screen switches, resize and the title stack never touch colours.
+#   D-THEME-KEEP A theme change updates the defaults; overrides stay (the brief's D-THEME-KEEP) and are reported by queries; reset
+#               (104/110-112/RIS) falls back to the NEW theme. Setting an override equal to the current effective colour still records it.
+#   D-GEN       colors_generation() increases exactly when some EFFECTIVE colour changed (set to a different value, reset of an
+#               override whose value differs from the theme, theme change that alters an un-overridden colour, RIS dropping a differing
+#               override); a no-op never bumps it.
+#   D-REVERSE   DECSCNM (?5) does not swap the reported colours (xterm reports the opposite colour; kitty, Alacritty do not).
+#   D-SELECT    OSC 17/19 (selection colours), 5/105 (special colours) and 13..16/18 stay ignored (brief: out of scope), also as chain
+#               members: the chain stops at 12.
+#   D-PIECES    tessera-vt cuts an OSC after 16 pieces without a flag (ADR 0022 D-PARAMS): `4;..` with more than 7 pairs applies/answers
+#               the first 7 only. Unpaired trailing pieces are ignored.
+# =============================================================================
+
+# ------------------------------------------------------------------ OQ. Queries
+
+### OQ01_osc11_query_bel
+size: 24x80
+step: feed \e]11;?\x07
+reply: \e]11;rgb:1010/1010/1010\x07
+cite: [CTL] reply "uses the same terminator used in a query"; [XT] ReportColorRequest `%d;rgb:%04x/%04x/%04x` with 10 + index; D-REPLY (bg #101010 -> 1010)
+flags: control
+
+### OQ02_osc11_query_st
+size: 24x80
+step: feed \e]11;?\e\\
+reply: \e]11;rgb:1010/1010/1010\e\\
+cite: [CTL]; [VT] fish terminal.rs L323 sends the ST form
+flags: control
+
+### OQ03_osc10_query
+size: 24x80
+step: feed \e]10;?\x07\e]10;?\e\\
+reply: \e]10;rgb:d0d0/d0d0/d0d0\x07\e]10;rgb:d0d0/d0d0/d0d0\e\\
+cite: [XT] ReportColorRequest for the text foreground; tmux sends the ST form (tty.c), others BEL
+flags: control
+
+### OQ04_osc12_query
+size: 24x80
+step: feed \e]12;?\x07\e]12;?\e\\
+reply: \e]12;rgb:ffff/cccc/0000\x07\e]12;rgb:ffff/cccc/0000\e\\
+cite: [XT] text cursor colour is index 12; theme cursor #ffcc00 -> ffff/cccc/0000
+flags: control
+
+### OQ05_osc4_query_each_terminator
+size: 24x80
+step: feed \e]4;1;?\x07\e]4;1;?\e\\
+reply: \e]4;1;rgb:0101/fefe/5454\x07\e]4;1;rgb:0101/fefe/5454\e\\
+cite: [XT] ReportAnsiColorRequest `%d;%d;rgb:%04x/%04x/%04x` (opcode 4, index); pal[1] = #01fe54
+flags: control
+
+### OQ06_osc4_query_edges
+size: 24x80
+step: feed \e]4;0;?\x07\e]4;15;?\x07\e]4;16;?\x07\e]4;100;?\x07\e]4;200;?\x07\e]4;255;?\x07
+reply: \e]4;0;rgb:0000/ffff/5555\x07\e]4;15;rgb:0f0f/f0f0/5a5a\x07\e]4;16;rgb:1010/efef/4545\x07\e]4;100;rgb:6464/9b9b/3131\x07\e]4;200;rgb:c8c8/3737/9d9d\x07\e]4;255;rgb:ffff/0000/aaaa\x07
+cite: [XT] first, last and middle indexes of the 256-colour table; ADR/brief: palette is 256 entries
+flags: control
+
+### OQ07_osc4_two_queries_two_replies
+size: 24x80
+step: feed \e]4;1;?;2;?\x07
+reply: \e]4;1;rgb:0101/fefe/5454\x07\e]4;2;rgb:0202/fdfd/5757\x07
+cite: [CTL] "xterm can make more than one reply"; [XT] ChangeAnsiColorRequest loop; each reply carries the terminator (final) of the query
+flags: control
+
+### OQ08_osc4_mixed_set_and_query_in_order
+size: 24x80
+step: feed \e]4;1;?;2;rgb:ff/00/00;3;?\e\\
+reply: \e]4;1;rgb:0101/fefe/5454\e\\\e]4;3;rgb:0303/fcfc/5656\e\\
+expect: pal[2]=#ff0000
+overrides: pal[2]
+cite: [XT] pairs are processed left to right; the set in the middle produces no reply
+flags: control
+
+### OQ09_osc4_set_then_query_same_osc
+size: 24x80
+step: feed \e]4;1;#102030;1;?\x07
+reply: \e]4;1;rgb:1010/2020/3030\x07
+cite: [XT] ChangeAnsiColorRequest applies pair 1 before reading pair 2
+flags: control
+
+### OQ10_chain_10_query_query
+size: 24x80
+step: feed \e]10;?;?\x07
+reply: \e]10;rgb:d0d0/d0d0/d0d0\x07\e]11;rgb:1010/1010/1010\x07
+cite: [CTL] "Each successive parameter changes the next color in the list. The value of Ps tells the starting point"; [XT] ChangeColorsRequest `for (i = start; ...)`, reply number = 10 + index; D-QUERY
+flags: control
+
+### OQ11_chain_11_query_query
+size: 24x80
+step: feed \e]11;?;?\e\\
+reply: \e]11;rgb:1010/1010/1010\e\\\e]12;rgb:ffff/cccc/0000\e\\
+cite: as OQ10 starting at 11
+flags: control
+
+### OQ12_chain_12_stops_at_pointer_colour
+size: 24x80
+step: feed \e]12;?;?;?\x07
+reply: \e]12;rgb:ffff/cccc/0000\x07
+cite: D-QUERY / D-SELECT: xterm would go on to 13 (pointer fg) and 14; Tessera has no pointer colours, so the chain ends at 12
+flags: decision
+
+### OQ13_chain_set_then_query
+size: 24x80
+step: feed \e]10;#112233;?\x07
+reply: \e]11;rgb:1010/1010/1010\x07
+expect: fg=#112233 bg=#101010
+overrides: fg
+cite: [XT] chain: first piece sets colour 10, second queries colour 11
+flags: control
+
+### OQ14_chain_query_then_set
+size: 24x80
+step: feed \e]10;?;#445566\x07
+reply: \e]10;rgb:d0d0/d0d0/d0d0\x07
+expect: fg=#d0d0d0 bg=#445566
+overrides: bg
+cite: [XT]
+flags: control
+
+### OQ15_chain_empty_piece_skips_one_colour
+size: 24x80
+step: feed \e]10;;#445566\x07
+reply: none
+expect: fg=#d0d0d0 bg=#445566
+overrides: bg
+cite: [XT] ChangeColorsRequest: `names[0] == ';'` -> thisName = NULL, the colour is skipped and the next piece goes to the next colour
+flags: xterm-quirk
+
+### OQ16_query_after_set_roundtrip
+size: 24x80
+step: feed \e]11;#ff8000\x07\e]11;?\x07
+reply: \e]11;rgb:ffff/8080/0000\x07
+expect: bg=#ff8000
+cite: [XT] the reply is the 16-bit value the server holds; 8-bit 0x80 -> 8080; D-REPLY
+flags: control
+
+### OQ17_query_survives_dec_reverse_video
+size: 24x80
+step: feed \e[?5h\e]11;?\x07\e]10;?\x07
+reply: \e]11;rgb:1010/1010/1010\x07\e]10;rgb:d0d0/d0d0/d0d0\x07
+cite: D-REVERSE: [XT] ReportColorRequest reports the opposite colour under reverse video (`oppositeColor`); kitty and Alacritty (from memory) do not swap
+flags: decision xterm-quirk
+
+### OQ18_query_uppercase_hex_never_in_reply
+size: 24x80
+step: feed \e]4;7;#ABCDEF\x07\e]4;7;?\x07
+reply: \e]4;7;rgb:abab/cdcd/efef\x07
+cite: [XT] `%04x` lowercase
+flags: control
+
+### OQ19_query_with_trailing_garbage_ignored
+size: 24x80
+step: feed \e]11;?x\x07\e]11;? \x07\e]11;??\x07\e]11;?;\x07
+reply: \e]11;rgb:1010/1010/1010\x07
+cite: [XT] `strcmp(thisName, "?")`: only exactly `?` queries; `?x`, `? `, `??` are specs and fail to parse. The last form `11;?;` is a query followed by an empty piece for 12 (xterm: nothing more), so ONE reply
+flags: xterm-quirk
+
+### OQ20_queries_20_and_up_are_silent
+size: 24x80
+step: feed \e]13;?\x07\e]14;?\x07\e]15;?\x07\e]16;?\x07\e]17;?\x07\e]18;?\x07\e]19;?\x07\e]5;0;?\x07\e]105;0\x07
+reply: none
+cite: D-SELECT (the brief puts 17/19 and 5/105 out of scope; xterm answers 13..19 and 5)
+flags: decision negative
+
+### OQ21_neovim_bg_query_then_dsr
+size: 24x80
+step: feed \e]11;?\x07\e[5n
+reply: \e]11;rgb:1010/1010/1010\x07\e[0n
+cite: [VT] neovim tui.c L353: the colour answer arrives first, the DSR 5 reply after it, in that order (D-ORDER of reports_spec.txt); BEL echoed because the query used BEL
+flags: control
+
+### OQ22_fish_startup_burst
+size: 24x80
+step: feed \e[?u\e[0c\e[>0q\e[6n\e]11;?\e\\
+reply: \e[?0u\e[?64;22c\eP>|Tessera <VERSION>\e\\\e[1;1R\e]11;rgb:1010/1010/1010\e\\
+cite: [VT] fish terminal.rs L171..L323 (kitty keyboard query, DA1 as `CSI 0 c`, XTVERSION `CSI > 0 q`, CPR, OSC 11 with ST); every reply present and in order; <VERSION> as in reports_spec.txt
+flags: control
+
+### OQ23_tmux_osc10_osc11
+size: 24x80
+step: feed \e]10;?\e\\\e]11;?\e\\
+reply: \e]10;rgb:d0d0/d0d0/d0d0\e\\\e]11;rgb:1010/1010/1010\e\\
+cite: [VT] tmux tty.c colour queries; ST in, ST out
+flags: control
+
+### OQ24_osc_aborted_by_esc_still_replies_with_st
+size: 24x80
+step: feed \e]11;?\e[6n
+reply: \e]11;rgb:1010/1010/1010\e\\\e[1;1R
+cite: ADR 0022 D-CAN: ESC ends the OSC and dispatches what was collected (xterm discards it); the ESC is not a BEL, so ST is echoed; then `ESC [ 6 n` is a CPR. Consequence of the parser (D-VTBELL), recorded as a decision
+flags: decision xterm-quirk
+
+### OQ25_osc_aborted_by_can_replies
+size: 24x80
+step: feed \e]11;?\x18\e]11;?\x1a
+reply: \e]11;rgb:1010/1010/1010\e\\\e]11;rgb:1010/1010/1010\e\\
+cite: ADR 0022 D-CAN as OQ24 (CAN and SUB dispatch the collected OSC)
+flags: decision xterm-quirk
+
+### OQ26_8bit_st_terminator_replies_st
+size: 24x80
+step: feed \e]11;?\u{9c}
+reply: none
+cite: unverified: U+009C is encoded C2 9C in the UTF-8 stream; tessera-vt (vte, UTF-8 input) does not treat it as ST, so the OSC stays open and nothing is answered until a real terminator. A raw 0x9C byte is invalid UTF-8
+flags: unverified negative
+
+### OQ27_osc4_reply_for_eight_pairs_is_cut_at_seven
+size: 24x80
+step: feed \e]4;1;?;2;?;3;?;4;?;5;?;6;?;7;?;8;?\x07
+reply: \e]4;1;rgb:0101/fefe/5454\x07\e]4;2;rgb:0202/fdfd/5757\x07\e]4;3;rgb:0303/fcfc/5656\x07\e]4;4;rgb:0404/fbfb/5151\x07\e]4;5;rgb:0505/fafa/5050\x07\e]4;6;rgb:0606/f9f9/5353\x07\e]4;7;rgb:0707/f8f8/5252\x07
+cite: D-PIECES: the parser keeps 16 pieces (`4` + 7 pairs = 15 pieces; the 16th piece `8` is an unpaired index and is ignored, the 8th `?` is cut). xterm answers all eight. Recorded so the limit is visible
+flags: decision xterm-quirk
+
+### OQ28_query_inside_alt_screen_same_colours
+size: 24x80
+step: feed \e[?1049h\e]11;?\x07
+reply: \e]11;rgb:1010/1010/1010\x07
+cite: D-RESET: colours belong to the terminal, not to a screen
+flags: control
+
+# ------------------------------------------------------------------ OS. Sets: accepted specs
+
+### OS01_rgb_two_digits
+size: 24x80
+step: feed \e]11;rgb:ff/80/00\x07
+expect: bg=#ff8000
+overrides: bg
+gen: +1
+cite: [XL] rgb: scaled; [XT] AllocateTermColor via XParseColor
+flags: control
+
+### OS02_rgb_one_digit_scaled
+size: 24x80
+step: feed \e]11;rgb:f/8/0\x07\e]11;?\x07
+reply: \e]11;rgb:ffff/8888/0000\x07
+expect: bg=#ff8800
+cite: [XL] rgb:f -> ffff (scaled, not left-justified); 8 -> 8888 -> high byte 88
+flags: control
+
+### OS03_rgb_three_digits_scaled
+size: 24x80
+step: feed \e]11;rgb:fff/000/800\x07
+expect: bg=#ff0080
+cite: [XL] 3 digits: v * 65535 / 4095; 0x800 -> 0x8008 -> 0x80; D-SPEC
+flags: control
+
+### OS04_rgb_three_digits_mixed
+size: 24x80
+step: feed \e]11;rgb:123/456/789\x07
+expect: bg=#124578
+cite: [XL] 0x123 -> 0x1230 -> 12; 0x456 -> 0x4562 -> 45; 0x789 -> 0x7898 -> 78
+flags: control
+
+### OS05_rgb_four_digits_high_byte
+size: 24x80
+step: feed \e]11;rgb:1234/5678/9abc\x07
+expect: bg=#12569a
+cite: [XL] 16-bit channel -> high byte (truncation, as an X server maps to a 24-bit visual); D-SPEC
+flags: decision
+
+### OS06_rgb_four_digits_rounding_ambiguity
+size: 24x80
+step: feed \e]11;rgb:9abc/9abc/9abc\x07
+expect: bg=#9a9a9a
+cite: 0x9abc/257 = 154.7: truncation gives 0x9a, rounding 0x9b. Pinned to truncation (xterm); kitty may round (from memory)
+flags: decision unverified
+
+### OS07_rgb_prefix_case_insensitive
+size: 24x80
+step: feed \e]11;RGB:FF/00/00\x07
+expect: bg=#ff0000
+cite: [XL] the colour-space prefix is case-insensitive; hex digits any case
+flags: unverified
+
+### OS08_hash_six_digits
+size: 24x80
+step: feed \e]11;#ff8000\x07
+expect: bg=#ff8000
+cite: [XL] #rrggbb; [CTL]
+flags: control
+
+### OS-HASH3_hash_three_digits_left_justified
+size: 24x80
+step: feed \e]11;#f80\x07
+expect: bg=#f08000
+cite: D-HASH (lead decision 2026-10-31): [XL]/xterm left-justified, f000/8000/0000 -> f0,80,00. kitty/WezTerm/Alacritty would give #ff8800 (CSS doubling, from memory)
+flags: decision
+
+### OS10_hash_nine_digits_high_byte
+size: 24x80
+step: feed \e]11;#123456789\x07
+expect: bg=#124578
+cite: [XL] #rrrgggbbb: top 8 bits of each 12-bit group; the same as xterm
+flags: control
+
+### OS11_hash_twelve_digits_high_byte
+size: 24x80
+step: feed \e]11;#123456789abc\x07
+expect: bg=#12569a
+cite: [XL] #rrrrggggbbbb: top 8 bits
+flags: control
+
+### OS12_hash_uppercase
+size: 24x80
+step: feed \e]11;#FF8000\x07
+expect: bg=#ff8000
+cite: [XL] hex digits in either case
+flags: control
+
+### OS13_set_fg_cursor
+size: 24x80
+step: feed \e]10;#010203\x07\e]12;#040506\x07
+expect: fg=#010203 cursor=#040506 bg=#101010
+overrides: fg cursor
+cite: [CTL] 10 foreground, 12 cursor
+flags: control
+
+### OS14_set_palette_index
+size: 24x80
+step: feed \e]4;7;#a0b0c0\x07
+expect: pal[7]=#a0b0c0 pal[6]=#06f953 pal[8]=#08f75d
+overrides: pal[7]
+gen: +1
+cite: [CTL] "Ps = 4 ; c ; spec"; neighbours untouched
+flags: control
+
+### OS15_set_palette_edges
+size: 24x80
+step: feed \e]4;0;#000001\x07\e]4;255;#fffffe\x07
+expect: pal[0]=#000001 pal[255]=#fffffe pal[1]=#01fe54
+overrides: pal[0] pal[255]
+cite: [XT] ChangeAnsiColorRequest accepts 0 .. MAXCOLORS-1
+flags: control
+
+### OS16_set_palette_multiple_pairs
+size: 24x80
+step: feed \e]4;1;#111111;2;#222222;3;#333333\x07
+expect: pal[1]=#111111 pal[2]=#222222 pal[3]=#333333
+overrides: pal[1] pal[2] pal[3]
+cite: [CTL] "Any number of c/spec pairs may be given"
+flags: control
+
+### OS17_set_palette_leading_zero_index
+size: 24x80
+step: feed \e]4;001;#111111;02;#222222\x07
+expect: pal[1]=#111111 pal[2]=#222222
+cite: D-OSC4-IDX: decimal digits, leading zeros fine (xterm atoi)
+flags: decision
+
+### OS18_chain_sets_fg_and_bg
+size: 24x80
+step: feed \e]10;#112233;#445566\x07
+expect: fg=#112233 bg=#445566
+overrides: fg bg
+gen: +1
+cite: [CTL] chain; [XT] ChangeColorsRequest
+flags: control
+
+### OS19_chain_sets_three
+size: 24x80
+step: feed \e]10;#010101;#020202;#030303\x07
+expect: fg=#010101 bg=#020202 cursor=#030303
+overrides: fg bg cursor
+cite: [CTL] chain through 12
+flags: control
+
+### OS20_chain_stops_at_pointer_colour
+size: 24x80
+step: feed \e]11;#020202;#030303;#040404;#050505\x07
+expect: fg=#d0d0d0 bg=#020202 cursor=#030303
+overrides: bg cursor
+cite: D-SELECT: pieces for 13 and 14 (pointer colours) are ignored
+flags: decision
+
+### OS21_set_identical_to_theme_records_override
+size: 24x80
+step: feed \e]11;#101010\x07
+expect: bg=#101010
+overrides: bg
+gen: same
+cite: D-THEME-KEEP / D-GEN: recorded as an override (a later theme change must not move it) but no effective change -> generation unchanged
+flags: decision
+
+### OS22_set_twice_same_value_no_gen_bump
+size: 24x80
+step: feed \e]11;#ff0000\x07
+gen: +1
+step: feed \e]11;#ff0000\x07
+gen: same
+cite: D-GEN
+flags: control
+
+### OS23_trailing_empty_piece
+size: 24x80
+step: feed \e]11;#ff0000;\x07
+expect: bg=#ff0000
+cite: [XT] chain: the empty trailing piece is an empty name for colour 12 and is skipped (names[0] == '\0' ends the loop)
+flags: control
+
+### OS24_set_color_does_not_print
+size: 3x10
+step: feed ab\e]11;#ff0000\x07\e]4;1;#00ff00\x07cd
+screen:
+>abcd |
+>
+>
+cursor: (0,4)
+requests: []
+cite: ADR 0022: an OSC never moves the cursor or resolves a pending wrap; colour sets queue nothing for the host here (the host learns through colors_generation)
+flags: control
+
+# ------------------------------------------------------------------ OI. Sets: ignored specs and indexes
+
+### OI01_rgb_bad_hex
+size: 24x80
+step: feed \e]11;rgb:gg/00/00\x07\e]11;rgb:ff/0g/00\x07
+expect: bg=#101010
+overrides: none
+gen: same
+cite: [XL] non-hex digit -> XParseColor fails -> [XT] AllocateTermColor leaves the colour unchanged
+flags: negative
+
+### OI02_rgb_wrong_channel_count
+size: 24x80
+step: feed \e]11;rgb:ff/00\x07\e]11;rgb:ff/00/00/00\x07\e]11;rgb:ff\x07\e]11;rgb:\x07\e]11;rgb:/00/00\x07\e]11;rgb:ff//00\x07
+expect: bg=#101010
+overrides: none
+cite: [XL] exactly three channels, none empty
+flags: negative
+
+### OI03_rgb_too_many_digits
+size: 24x80
+step: feed \e]11;rgb:fffff/00/00\x07\e]11;rgb:00000000/0/0\x07
+expect: bg=#101010
+overrides: none
+cite: [XL] at most four hex digits per channel
+flags: negative
+
+### OI04_hash_bad_lengths
+size: 24x80
+step: feed \e]11;#\x07\e]11;#f\x07\e]11;#ff\x07\e]11;#ff00\x07\e]11;#ff000\x07\e]11;#ff00000\x07\e]11;#ff000000\x07\e]11;#ff00000000\x07\e]11;#ff000000000\x07\e]11;#ff00000000000\x07
+expect: bg=#101010
+overrides: none
+gen: same
+cite: [XL] only 3, 6, 9 or 12 digits (equal groups) are valid; this row tries lengths 0, 1, 2, 4, 5, 7, 8, 10, 11 and 13 (each `#` + `ff` + zeros, `#f` for 1)
+flags: negative
+
+### OI05_hash_non_hex
+size: 24x80
+step: feed \e]11;#ggg\x07\e]11;#12345g\x07\e]11;##ff0000\x07\e]11;#-f0000\x07\e]11;#+f0000\x07
+expect: bg=#101010
+overrides: none
+cite: [XL]; a sign is not a hex digit (D-SPEC)
+flags: negative
+
+### OI06_unsupported_spec_forms
+size: 24x80
+step: feed \e]11;rgbi:1.0/0/0\x07\e]11;CIEXYZ:0.5/0.5/0.5\x07\e]11;rgb(255,0,0)\x07\e]11;hsl(0,100%,50%)\x07
+expect: bg=#101010
+overrides: none
+cite: D-SPEC: [XL] defines rgbi: and CIE specs; Tessera accepts neither (kitty accepts neither either, from memory)
+flags: decision negative
+
+### OI-NAME_x11_names_are_ignored
+size: 24x80
+step: feed \e]11;red\x07\e]11;Red\x07\e]11;light goldenrod\x07\e]11;gray50\x07\e]11;DarkSlateBlue\x07
+expect: bg=#101010
+overrides: none
+cite: D-NAMES: ignored in this task (xterm [XL] would set 255,0,0 / ... ); flips with the follow-up
+flags: decision xterm-quirk
+
+### OI08_blanks_around_spec
+size: 24x80
+step: feed \e]11; #ff0000\x07\e]11;#ff0000 \x07\e]11;rgb: ff/00/00\x07
+expect: bg=#101010
+overrides: none
+cite: [XL] no trimming; D-SPEC
+flags: negative
+
+### OI09_empty_and_missing_payload
+size: 24x80
+step: feed \e]11\x07\e]11;\x07\e]10\x07\e]10;\x07\e]12;\x07\e]4\x07\e]4;\x07\e]4;1\x07\e]4;1;\x07
+reply: none
+expect: bg=#101010 fg=#d0d0d0 cursor=#ffcc00 pal[1]=#01fe54
+overrides: none
+gen: same
+cite: [XT] do_osc: an empty buffer for an OSC that needs data returns (no reset, no reply); `4;1;` has an empty name which fails to parse
+flags: negative
+
+### OI10_osc4_bad_index
+size: 24x80
+step: feed \e]4;256;#ff0000\x07\e]4;999;#ff0000\x07\e]4;-1;#ff0000\x07\e]4;x;#ff0000\x07\e]4;;#ff0000\x07\e]4;+1;#ff0000\x07\e]4;1x;#ff0000\x07\e]4;0x10;#ff0000\x07\e]4; 1;#ff0000\x07\e]4;1.5;#ff0000\x07
+expect: pal[0]=#00ff55 pal[1]=#01fe54 pal[16]=#10ef45 pal[255]=#ff00aa
+overrides: none
+gen: same
+cite: [XT] `color < 0 || color >= last` -> break; D-OSC4-IDX is stricter than xterm for `1x`, `` (atoi), `+1`
+flags: decision negative
+
+### OI11_osc4_index_without_spec_pair
+size: 24x80
+step: feed \e]4;1;#111111;2\x07
+expect: pal[1]=#111111 pal[2]=#02fd57
+overrides: pal[1]
+cite: [XT] `name = strchr(buf, ';')` is NULL for the lone `2` -> break; the complete pair before it stays applied
+flags: control
+
+### OI12_osc4_stops_at_first_bad_pair
+size: 24x80
+step: feed \e]4;1;#111111;2;bogus;3;#333333\x07
+expect: pal[1]=#111111 pal[2]=#02fd57 pal[3]=#03fc56
+overrides: pal[1]
+cite: D-STOP4: [XT] ChangeOneAnsiColor error -> "stop on any error"; pair 3 is NOT applied
+flags: decision xterm-quirk
+
+### OI13_osc4_out_of_range_index_stops_processing
+size: 24x80
+step: feed \e]4;1;#111111;256;#222222;2;#333333\x07
+expect: pal[1]=#111111 pal[2]=#02fd57
+overrides: pal[1]
+cite: D-STOP4 [XT] `color >= last` -> break
+flags: decision xterm-quirk
+
+### OI14_bad_chain_piece_leaves_that_colour_only
+size: 24x80
+step: feed \e]10;bogus;#445566\x07
+expect: fg=#d0d0d0 bg=#445566
+overrides: bg
+cite: D-QUERY: [XT] ChangeColorsRequest handles each colour independently (AllocateTermColor failure leaves that one)
+flags: decision
+
+### OI15_ignored_osc_numbers
+size: 24x80
+step: feed \e]13;#ff0000\x07\e]14;#ff0000\x07\e]17;#ff0000\x07\e]19;#ff0000\x07\e]5;0;#ff0000\x07\e]15;#ff0000\x07\e]16;#ff0000\x07\e]18;#ff0000\x07
+expect: fg=#d0d0d0 bg=#101010 cursor=#ffcc00 pal[0]=#00ff55
+overrides: none
+gen: same
+cite: D-SELECT (brief do_not_touch)
+flags: decision negative
+
+### OI16_osc_number_must_match_exactly
+size: 24x80
+step: feed \e]011;#ff0000\x07\e]+11;#ff0000\x07\e]11 ;#ff0000\x07\e]1 1;#ff0000\x07
+expect: bg=#101010
+overrides: none
+cite: ADR 0022 D-OSCNUM: the command number must match exactly (`011`, `+11` are not 11); xterm's number parse would accept `011` (mode = 11): Tessera follows its own rule
+flags: decision xterm-quirk
+
+### OI17_set_with_semicolons_in_spec
+size: 24x80
+step: feed \e]11;rgb:ff/00/00;extra\x07
+expect: bg=#ff0000 cursor=#ffcc00
+overrides: bg
+cite: [XT] the chain: piece 2 (`extra`) is a bad spec for colour 12 and leaves it alone; piece 1 applies
+flags: control
+
+# ------------------------------------------------------------------ OR. Resets (104, 110, 111, 112)
+
+### OR01_104_with_index
+size: 24x80
+step: feed \e]4;1;#111111;2;#222222\x07
+gen: +1
+step: feed \e]104;1\x07
+expect: pal[1]=#01fe54 pal[2]=#222222
+overrides: pal[2]
+gen: +1
+cite: [CTL] "Ps = 104 ; c -> Reset Color Number c"; [XT] ResetAnsiColorRequest
+flags: control
+
+### OR02_104_without_params_resets_all
+size: 24x80
+step: feed \e]4;1;#111111;2;#222222\x07\e]104\x07
+expect: pal[1]=#01fe54 pal[2]=#02fd57
+overrides: none
+cite: [CTL] "If no parameters are given, the entire table will be reset."
+flags: control
+
+### OR03_104_empty_param_resets_all
+size: 24x80
+step: feed \e]4;1;#111111\x07\e]104;\x07
+expect: pal[1]=#01fe54
+overrides: none
+cite: [XT] do_osc: `IsEmpty(buf)` with optional data -> `temp[0] = 0`, same as no parameters
+flags: xterm-quirk
+
+### OR04_104_several_indexes
+size: 24x80
+step: feed \e]4;1;#111111;2;#222222;3;#333333\x07\e]104;1;3\x07
+expect: pal[1]=#01fe54 pal[2]=#222222 pal[3]=#03fc56
+overrides: pal[2]
+cite: [CTL] "Any number of c parameters may be given"
+flags: control
+
+### OR05_104_index_out_of_range_stops
+size: 24x80
+step: feed \e]4;1;#111111;2;#222222;3;#333333\x07\e]104;1;256;3\x07
+expect: pal[1]=#01fe54 pal[2]=#222222 pal[3]=#333333
+overrides: pal[2] pal[3]
+cite: D-STOP4: [XT] ResetAnsiColorRequest: `ResetOneAnsiColor` ignores >= last but the loop only breaks on non-numbers, so xterm WOULD continue to 3; Tessera stops at the first malformed index (256 is malformed): 3 stays set. Differs from xterm for 256
+flags: decision xterm-quirk
+
+### OR06_104_non_number_stops
+size: 24x80
+step: feed \e]4;1;#111111;2;#222222;3;#333333\x07\e]104;1;x;3\x07
+expect: pal[1]=#01fe54 pal[2]=#222222 pal[3]=#333333
+overrides: pal[2] pal[3]
+cite: [XT] ResetAnsiColorRequest: `!PartS2L(buf, next)` -> break; pal[1] reset, pal[3] untouched
+flags: control
+
+### OR07_104_unset_index_is_noop
+size: 24x80
+step: feed \e]104;5\x07
+expect: pal[5]=#05fa50
+overrides: none
+gen: same
+cite: [XT] ResetOneAnsiColor only acts when a colour was allocated; D-GEN
+flags: control
+
+### OR08_110_111_112
+size: 24x80
+step: feed \e]10;#010101\x07\e]11;#020202\x07\e]12;#030303\x07\e]110\x07
+expect: fg=#d0d0d0 bg=#020202 cursor=#030303
+overrides: bg cursor
+step: feed \e]111\x07
+expect: bg=#101010 cursor=#030303
+overrides: cursor
+step: feed \e]112\x07
+expect: cursor=#ffcc00
+overrides: none
+cite: [CTL] "Ps = 110 -> Reset VT100 text foreground color. 111 ... background. 112 ... text cursor color"; each independent
+flags: control
+
+### OR09_reset_with_data_is_ignored
+size: 24x80
+step: feed \e]11;#020202\x07\e]111;foo\x07\e]111;1\x07\e]110;x\x07
+expect: bg=#020202
+overrides: bg
+cite: [XT] do_osc: `else if (!need_data && !optional_data) return;` for 110..119 (only 104/105 take optional data)
+flags: xterm-quirk
+
+### OR10_reset_with_empty_data_ok
+size: 24x80
+step: feed \e]11;#020202\x07\e]111;\x07
+expect: bg=#101010
+overrides: none
+cite: [XT] `111;` has an empty buffer, which is the "no data" case and passes
+flags: xterm-quirk
+
+### OR11_reset_without_override_is_noop
+size: 24x80
+step: feed \e]110\x07\e]111\x07\e]112\x07\e]104\x07
+expect: fg=#d0d0d0 bg=#101010 cursor=#ffcc00
+overrides: none
+gen: same
+cite: D-GEN: no effective change, no generation bump
+flags: control
+
+### OR12_reset_other_numbers_ignored
+size: 24x80
+step: feed \e]11;#020202\x07\e]113\x07\e]114\x07\e]117\x07\e]118\x07\e]119\x07\e]105\x07\e]115\x07
+expect: bg=#020202
+overrides: bg
+cite: D-SELECT: 105 (special colours) and 113..119 are out of scope and must not reset 11
+flags: decision negative
+
+### OR13_query_after_reset_is_theme
+size: 24x80
+step: feed \e]11;#020202\x07\e]111\x07\e]11;?\x07
+reply: \e]11;rgb:1010/1010/1010\x07
+cite: [XT] ResetColorsRequest restores the resource colour
+flags: control
+
+### OR14_reset_one_does_not_touch_the_others
+size: 24x80
+step: feed \e]10;#010101\x07\e]4;3;#030303\x07\e]111\x07\e]104;4\x07
+expect: fg=#010101 pal[3]=#030303
+overrides: fg pal[3]
+cite: independence of the three dynamic colours and the palette
+flags: control
+
+# ------------------------------------------------------------------ OT. Theme interaction (D-THEME-KEEP)
+
+### OT01_theme_change_keeps_overrides
+size: 24x80
+step: feed \e]11;#ff0000\x07\e]4;1;#00ff00\x07
+step: set theme T2
+expect: fg=#aabbcc bg=#ff0000 cursor=#00ff00 pal[1]=#00ff00 pal[2]=#fd02a8
+overrides: bg pal[1]
+gen: +1
+cite: D-THEME-KEEP (brief); kitty and WezTerm keep dynamic colours across a config reload (from memory); non-overridden colours follow the new theme
+flags: decision
+
+### OT02_reset_after_theme_change_lands_on_new_theme
+size: 24x80
+step: feed \e]11;#ff0000\x07
+step: set theme T2
+step: feed \e]111\x07
+expect: bg=#223344
+overrides: none
+gen: +1
+cite: D-THEME-KEEP: reset falls back to the NEW theme
+flags: decision
+
+### OT03_theme_change_without_overrides_bumps_generation
+size: 24x80
+step: set theme T2
+expect: fg=#aabbcc bg=#223344 cursor=#00ff00 pal[1]=#fe01ab
+overrides: none
+gen: +1
+cite: D-GEN: an effective colour changed
+flags: control
+
+### OT04_identical_theme_does_not_bump
+size: 24x80
+step: set theme T
+gen: same
+cite: D-GEN: re-applying the same theme changes nothing (the observer fires on every apply_config)
+flags: control
+
+### OT05_query_after_theme_change
+size: 24x80
+step: set theme T2
+step: feed \e]11;?\x07\e]10;?\x07\e]12;?\x07\e]4;1;?\x07
+reply: \e]11;rgb:2222/3333/4444\x07\e]10;rgb:aaaa/bbbb/cccc\x07\e]12;rgb:0000/ffff/0000\x07\e]4;1;rgb:fefe/0101/abab\x07
+cite: queries report the effective colours (theme as default)
+flags: control
+
+### OT06_override_equal_to_old_theme_stays_after_theme_change
+size: 24x80
+step: feed \e]11;#101010\x07
+step: set theme T2
+expect: bg=#101010
+overrides: bg
+cite: OS21: the recorded override is not the same as "no override" (D-THEME-KEEP)
+flags: decision
+
+### OT07_theme_before_first_byte
+size: 24x80
+step: set theme T2
+step: feed \e]11;?\x07
+reply: \e]11;rgb:2222/3333/4444\x07
+cite: the host pushes the theme before the session's first byte (brief: exactly like the cursor default)
+flags: control
+
+# ------------------------------------------------------------------ ORS. Resets: RIS, DECSTR, DECSCL, and unrelated sequences
+
+### ORS01_ris_drops_all_overrides
+size: 24x80
+step: feed \e]10;#010101\x07\e]11;#020202\x07\e]12;#030303\x07\e]4;1;#040404\x07
+gen: +1
+step: feed \ec
+expect: fg=#d0d0d0 bg=#101010 cursor=#ffcc00 pal[1]=#01fe54
+overrides: none
+gen: +1
+cite: D-RESET: RIS drops palette and dynamic overrides (kitty, Alacritty, WezTerm, Ghostty from memory). [XT] resets the palette but NOT fg/bg/cursor (ReallyReset common part) -- differs for 10/11/12
+flags: decision xterm-quirk
+
+### ORS02_ris_without_overrides_no_bump
+size: 24x80
+step: feed \ec
+gen: same
+cite: D-GEN
+flags: control
+
+### ORS03_decstr_keeps_overrides
+size: 24x80
+step: feed \e]11;#020202\x07\e]4;1;#040404\x07\e[!p
+expect: bg=#020202 pal[1]=#040404
+overrides: bg pal[1]
+cite: D-RESET: soft reset does not touch the colour tables (DEC STD 070 lists no colour state for DECSTR; kitty, Alacritty, WezTerm do the same, from memory). [XT] resets the palette on DECSTR (charproc.c common part) -- differs. Resolves the `// #10` comment in soft_reset
+flags: decision xterm-quirk
+
+### ORS04_decscl_keeps_overrides
+size: 24x80
+step: feed \e]11;#020202\x07\e[63"p
+expect: bg=#020202
+overrides: bg
+cite: ADR 0020: DECSCL runs the DECSTR reset first
+flags: decision
+
+### ORS05_alt_screen_keeps_overrides
+size: 24x80
+step: feed \e]11;#020202\x07\e[?1049h\e]11;?\x07\e[?1049l\e]11;?\x07
+reply: \e]11;rgb:0202/0202/0202\x07\e]11;rgb:0202/0202/0202\x07
+expect: bg=#020202
+cite: D-RESET: colours are per terminal, not per screen
+flags: control
+
+### ORS06_resize_keeps_overrides
+size: 24x80
+step: feed \e]11;#020202\x07
+step: set size 10x40
+expect: bg=#020202
+overrides: bg
+cite: Terminal::resize leaves colours alone (the step `set size RxC` calls Terminal::resize)
+flags: control
+
+### ORS07_sgr_reset_does_not_touch_overrides
+size: 24x80
+step: feed \e]11;#020202\x07\e[0m\e[39;49m
+expect: bg=#020202
+overrides: bg
+cite: [CTL] "the dynamic text foreground and background colors are used when ANSI colors are reset using SGR 39 and 49" -- they USE the dynamic colours; they do not reset them
+flags: control
+
+### ORS08_ris_keeps_theme
+size: 24x80
+step: set theme T2
+step: feed \e]11;#ff0000\x07\ec
+expect: bg=#223344 fg=#aabbcc
+cite: ADR 0020 style: the theme is configuration and no reset touches it (as the default cursor style)
+flags: control
+
+# ------------------------------------------------------------------ OZ. Limits and security
+
+### OZ01_flood_of_queries
+size: 24x80
+step: feed (1,000,000 times) \e]4;1;?\x07
+cite: the terminal queues 1,000,000 replies; the bound is app-core's outbox (reports_spec RP09). The test checks the first and last reply and linear time. Generated by the test
+flags: security
+
+### OZ02_flood_of_sets_bounded_state
+size: 24x80
+step: feed (1,000,000 times) \e]4;1;#010203\x07\e]4;1;#030201\x07
+expect: pal[1]=#030201
+overrides: pal[1]
+cite: overrides are a fixed table (256 + 3 entries); no growth per sequence. Generated by the test
+flags: security
+
+### OZ03_huge_osc_is_ignored_not_answered
+size: 24x80
+step: feed (OSC 11 ; then 1,048,576 bytes of 'a', then BEL)
+reply: none
+expect: bg=#101010
+cite: a long spec is malformed (D-SPEC) and never echoed; the parser's unbounded OSC (ADR 0022) is a separate issue. Generated by the test
+flags: security negative
+
+### OZ04_reply_never_echoes_input
+size: 24x80
+step: feed \e]11;?;evil\x07\e]4;1;?;2;?;evil\x07
+reply: \e]11;rgb:1010/1010/1010\x07\e]4;1;rgb:0101/fefe/5454\x07\e]4;2;rgb:0202/fdfd/5757\x07
+cite: D-SECURITY (reports_spec.txt): replies are built from terminal state only, never from the program's bytes (`evil` is a bad spec for colour 12 / a lone index)
+flags: security
+
+### OZ05_invalid_utf8_in_spec_ignored
+size: 24x80
+step: feed \e]11;#ff\xff0000\x07
+expect: bg=#101010
+overrides: none
+cite: D-SPEC: non-hex byte
+flags: negative
+
+### OZ06_nul_and_c0_removed_by_parser
+size: 24x80
+step: feed \e]11;#ff\x010000\x07
+expect: bg=#ff0000
+cite: ADR 0022 "Parser facts": C0 controls other than BEL, CAN, SUB and ESC are removed from the payload, so the spec is #ff0000
+flags: decision
+
+### OZ07_colour_sets_do_not_reply
+size: 24x80
+step: feed \e]11;#ff0000\x07\e]4;1;#00ff00\x07\e]104\x07\e]110\x07\e]111\x07\e]112\x07
+reply: none
+cite: only `?` produces output
+flags: control
