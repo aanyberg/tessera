@@ -40,6 +40,14 @@ via `COLORTERM`) rather than from terminfo.
    prefix makes some applications assume xterm's exact behaviour, and the
    kitty keyboard protocol is deliberately not that.
 
+   *Amended by #169 (2026-11-01):* `Se` (reset the cursor style) is `\E[0 q`,
+   not xterm-256color's `\E[2 q`. tmux turns an inner program's `CSI 0 SP q`
+   (nvim on exit) into the outer terminal's `Se`, and Tessera's DECSCUSR 0
+   is the configured cursor style (ADR 0020), whereas Ps 2 is a program's
+   steady block that stops following configuration edits. Under the default
+   `TERM=xterm-256color` tmux still sends `\E[2 q`; that entry is not ours
+   to change. `tests/decscusr.rs` reads `Se` from the entry and checks it.
+
 3. **Installation is a script, not magic.** `just terminfo-install` compiles
    the entry into `~/.terminfo`; `just terminfo-ssh user@host` streams the
    source over ssh into the remote `~/.terminfo` (`tic -x -o ~/.terminfo

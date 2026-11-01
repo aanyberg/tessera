@@ -107,7 +107,7 @@
 use tessera_grid::{Cell, EraseDisplay, EraseLine, Style};
 use tracing::trace;
 
-use crate::{CursorShape, CursorStyle, State};
+use crate::{CursorShape, State};
 
 /// Parameter `index`, or `default` when it is absent or zero.
 fn param_or(params: &[u16], index: usize, default: u16) -> u16 {
@@ -406,11 +406,11 @@ impl State {
         // copy; its pending wrap is cleared too (xterm copies the live one).
         // DECSC and SCOSC share this slot, so DECRC and SCORC both home.
         self.grid.reset_saved_cursor();
-        // The program's cursor style (DECSCUSR and DECSET 12) gives way to
-        // the configured one; `soft_reset_modes` cleared the blink record.
+        // The program's cursor shape and blink (DECSCUSR and DECSET 12) give
+        // way to the configured ones, and the blink record is cleared.
         // xterm's `ReallyReset` common part does the same for DECSTR, DECSCL
         // and RIS (ADR 0020).
-        self.cursor_override = None;
+        self.drop_cursor_overrides();
         // #112, #95, #97, #10: reset here once the state exists:
         // G0-G3/GL/GR and DECNRCM to their defaults (SCS, #112), DECSCA off
         // (#95), DECLRMM off with full left/right margins and reverse wrap
@@ -420,31 +420,34 @@ impl State {
 
     /// DECSCUSR (`CSI Ps SP q`) with its first parameter `ps`: 1 and 2 a
     /// blinking and a steady block, 3 and 4 an underline, 5 and 6 a beam
-    /// (xterm's bar). 0, an absent or empty first parameter and 7 (xterm's
-    /// "initial resources") drop the program's style, so the configured
-    /// default applies again (xterm and the VT510 manual make 0 a blinking
-    /// block; ADR 0020). Any other value changes nothing. Every accepted
-    /// value also records its blink bit in [`Modes::cursor_blink`], the one
-    /// program-controlled blink bit DECSET 12 shares (0 and 7 clear it).
+    /// (xterm's bar): each sets both the program's shape and its blink. 0,
+    /// an absent or empty first parameter and 7 (xterm's "initial
+    /// resources") drop both, so the configured default applies again
+    /// (xterm and the VT510 manual make 0 a blinking block; ADR 0020). Any
+    /// other value changes nothing. Every accepted value also records its
+    /// blink bit in [`Modes::cursor_blink`], the one program-controlled
+    /// blink bit DECSET 12 shares (0 and 7 clear it).
     ///
     /// [`Modes::cursor_blink`]: crate::Modes::cursor_blink
     fn set_cursor_style(&mut self, ps: u16) {
-        let style = |shape, blink| Some(CursorStyle { shape, blink });
-        let style = match ps {
-            0 | 7 => None,
-            1 => style(CursorShape::Block, true),
-            2 => style(CursorShape::Block, false),
-            3 => style(CursorShape::Underline, true),
-            4 => style(CursorShape::Underline, false),
-            5 => style(CursorShape::Beam, true),
-            6 => style(CursorShape::Beam, false),
+        let (shape, blink) = match ps {
+            0 | 7 => {
+                self.drop_cursor_overrides();
+                return;
+            }
+            1 => (CursorShape::Block, true),
+            2 => (CursorShape::Block, false),
+            3 => (CursorShape::Underline, true),
+            4 => (CursorShape::Underline, false),
+            5 => (CursorShape::Beam, true),
+            6 => (CursorShape::Beam, false),
             _ => {
                 trace!(ps, "DECSCUSR style ignored");
                 return;
             }
         };
-        self.cursor_override = style;
-        self.modes.cursor_blink = style.is_some_and(|style| style.blink);
+        self.shape_override = Some(shape);
+        self.set_blink_override(blink);
     }
 
     /// DECSCL (`CSI Pl ; Pc " p`), xterm's `CASE_DECSCL`. For `Pl` 61..=65
