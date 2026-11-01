@@ -192,7 +192,12 @@ pub struct Appearance {
     #[cfg_attr(feature = "schema", schemars(schema_with = "CursorShape::schema"))]
     pub cursor_shape: CursorShape,
     /// Whether the cursor blinks, unless a program says otherwise (as for
-    /// `cursor_shape`). Recorded only for now: the cursor is drawn steady.
+    /// `cursor_shape`). tmux and vim turn blinking off on their own
+    /// (`CSI ? 12 l`), so inside a running tmux a blinking cursor stays off
+    /// until this is next changed. Changing it applies to open tabs, also
+    /// where a program turned blinking on or off, but a program still
+    /// running, such as tmux, may turn it off again. Recorded only for now:
+    /// the cursor is drawn steady.
     pub cursor_blink: bool,
 }
 

@@ -164,8 +164,10 @@ impl Live {
         if cursor_changed {
             // Each terminal's lock, after the views lock is released and
             // with the sessions lock held only to list them (ADR 0014). A
-            // session the program gave a style of its own keeps it until it
-            // asks for the default (DECSCUSR 0) or resets (ADR 0020). One
+            // session the program gave a shape of its own keeps it until it
+            // asks for the default (DECSCUSR 0) or resets; a blink of its
+            // own goes when the configured blink changes, which the terminal
+            // decides against the default it holds (ADR 0020, #169). One
             // that starts meanwhile reads the configuration again once
             // listed (`App::attach`).
             let sessions: Vec<Arc<Session>> = lock(&self.sessions).values().cloned().collect();
@@ -1138,6 +1140,51 @@ mod tests {
         // A session started now gets the new default.
         let fresh = attach_fake(&app).id;
         assert_eq!(cursor_style_of(&app, fresh), expected);
+    }
+
+    /// #169 (L05 and D1 option C through `apply_config`): a tab whose
+    /// program sent `CSI ? 12 h CSI ? 12 l` (`vim -u NONE`; tmux's cnorm
+    /// sends the `?12 l`) still follows a shape edit with its blink off,
+    /// and follows an edit of `cursor_blink` too.
+    #[test]
+    fn apply_config_reaches_a_tab_that_ran_vim_or_tmux() {
+        use tessera_config::CursorShape;
+        use tessera_term::CursorShape as Shape;
+
+        let style = |shape, blink| tessera_term::CursorStyle { shape, blink };
+        let app = App::new(
+            cursor_config(CursorShape::Beam, true),
+            ConfigPaths::new("/nonexistent/tessera"),
+        );
+        let id = attach_fake(&app).id;
+        app.session(id)
+            .unwrap()
+            .with_terminal_mut(|term| term.advance(b"\x1b[?12h\x1b[?12l"));
+        assert_eq!(cursor_style_of(&app, id), beam(false), "?12 l stops it");
+
+        app.apply_config(
+            &cursor_config(CursorShape::Underline, true),
+            &tessera_config::Theme::default(),
+        );
+        assert_eq!(
+            cursor_style_of(&app, id),
+            style(Shape::Underline, false),
+            "a shape edit: the shape follows, the program's blink stays"
+        );
+
+        app.apply_config(
+            &cursor_config(CursorShape::Underline, false),
+            &tessera_config::Theme::default(),
+        );
+        app.apply_config(
+            &cursor_config(CursorShape::Underline, true),
+            &tessera_config::Theme::default(),
+        );
+        assert_eq!(
+            cursor_style_of(&app, id),
+            style(Shape::Underline, true),
+            "a blink edit: the blink follows too"
+        );
     }
 
     /// C5: an edit of `config.toml` that changes only the cursor keys is

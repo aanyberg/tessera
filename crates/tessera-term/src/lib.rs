@@ -187,10 +187,11 @@ pub enum CursorShape {
 
 /// How the cursor looks: its shape and whether it blinks.
 ///
-/// [`Terminal::cursor_style`] reports the one in effect: the style the
-/// program asked for (DECSCUSR, DECSET/DECRST 12) or, until it asks and
+/// [`Terminal::cursor_style`] reports the one in effect, shape and blink
+/// each on its own: the shape the program asked for (DECSCUSR) and the
+/// blink it asked for (DECSCUSR, DECSET/DECRST 12) or, until it asks and
 /// again after DECSCUSR 0 or 7 and after every reset, the configured
-/// default ([`Terminal::set_default_cursor_style`]). The default is a
+/// default's ([`Terminal::set_default_cursor_style`]). The default is a
 /// steady block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct CursorStyle {
@@ -226,7 +227,8 @@ impl Terminal {
                 last_printed: None,
                 conformance_level: 4,
                 c1_8bit_replies: false,
-                cursor_override: None,
+                shape_override: None,
+                blink_override: None,
                 default_cursor_style: CursorStyle::default(),
                 dcs: Dcs::default(),
                 title: String::new(),
@@ -321,20 +323,36 @@ impl Terminal {
         self.state.c1_8bit_replies
     }
 
-    /// The cursor style in effect: the one the program set with DECSCUSR
-    /// (`CSI Ps SP q`) or DECSET/DECRST 12, or the configured default
-    /// ([`Terminal::set_default_cursor_style`]) while it has set none, after
-    /// DECSCUSR 0 or 7 and after DECSTR, DECSCL and RIS. See the `csi`
-    /// module and ADR 0020 for the details.
+    /// The cursor style in effect. Its shape is the one the program set
+    /// with DECSCUSR (`CSI Ps SP q`) and its blink the one the program set
+    /// with DECSCUSR or DECSET/DECRST 12; each is the configured default's
+    /// ([`Terminal::set_default_cursor_style`]) while the program has set
+    /// none, after DECSCUSR 0 or 7 and after DECSTR, DECSCL and RIS. So
+    /// DECSET 12 never fixes the shape: a session that ran `vim` or `tmux`
+    /// (whose `cnorm` is `CSI ? 12 l CSI ? 25 h`) still follows a new
+    /// configured shape. See the `csi` module and ADR 0020 for the
+    /// details.
     pub fn cursor_style(&self) -> CursorStyle {
         self.state.cursor_style()
     }
 
     /// Sets the configured cursor style: the one in effect while the
     /// program has asked for none, and the one DECSCUSR 0 and 7 and every
-    /// reset return to. A style the program set stays in effect until then.
+    /// reset return to. A shape the program set stays in effect until then.
     /// Starts as a steady block.
+    ///
+    /// A default whose blink differs from the current one is a change of
+    /// the configured blink, which takes over from the program's: the
+    /// blink the program set (DECSCUSR, DECSET/DECRST 12) is dropped, as
+    /// DECSCUSR 0 would, and [`Modes::cursor_blink`] is cleared with it.
+    /// tmux and vim send `CSI ? 12 l` on their own, so without this a tab
+    /// that ever ran them would ignore every later edit of the configured
+    /// blink (ADR 0020). Setting a default with the same blink, the same
+    /// style included, changes nothing else.
     pub fn set_default_cursor_style(&mut self, style: CursorStyle) {
+        if style.blink != self.state.default_cursor_style.blink {
+            self.state.drop_blink_override();
+        }
         self.state.default_cursor_style = style;
     }
 
@@ -463,11 +481,17 @@ struct State {
     /// set by DECSCL's `Pc`, cleared by RIS. Recorded for the reply code
     /// (S7C1T/S8C1T, #96); only the DECRQSS report of DECSCL reads it.
     c1_8bit_replies: bool,
-    /// The cursor style the program asked for: set by DECSCUSR 1..=6 and
-    /// by DECSET/DECRST 12 (which keeps the shape in effect), dropped by
-    /// DECSCUSR 0 and 7, DECSTR, DECSCL and RIS. `None` follows
-    /// `default_cursor_style`.
-    cursor_override: Option<CursorStyle>,
+    /// The cursor shape the program asked for: set by DECSCUSR 1..=6,
+    /// dropped by DECSCUSR 0 and 7, DECSTR, DECSCL and RIS. DECSET 12 does
+    /// not touch it. `None` follows `default_cursor_style`.
+    shape_override: Option<CursorShape>,
+    /// Whether the program asked for a blinking cursor: set by DECSCUSR
+    /// 1..=6 and DECSET/DECRST 12, dropped with `shape_override` and by a
+    /// configured default with another blink
+    /// ([`Terminal::set_default_cursor_style`]). `None` follows
+    /// `default_cursor_style`. [`Modes::cursor_blink`] is
+    /// `blink_override.unwrap_or(false)`, the bit DECRQM 12 reports.
+    blink_override: Option<bool>,
     /// The configured cursor style ([`Terminal::set_default_cursor_style`]):
     /// configuration, not terminal state, so no reset touches it.
     default_cursor_style: CursorStyle,
@@ -485,9 +509,37 @@ struct State {
 }
 
 impl State {
-    /// The cursor style in effect: the program's, else the configured one.
+    /// The cursor style in effect: the program's shape and blink, each
+    /// else the configured one.
     fn cursor_style(&self) -> CursorStyle {
-        self.cursor_override.unwrap_or(self.default_cursor_style)
+        let default = self.default_cursor_style;
+        CursorStyle {
+            shape: self.shape_override.unwrap_or(default.shape),
+            blink: self.blink_override.unwrap_or(default.blink),
+        }
+    }
+
+    /// Drops the program's cursor style, shape and blink, so the
+    /// configured default applies (DECSCUSR 0 and 7, DECSTR, DECSCL and
+    /// RIS); clears the blink record [`Modes::cursor_blink`] too.
+    fn drop_cursor_overrides(&mut self) {
+        self.shape_override = None;
+        self.drop_blink_override();
+    }
+
+    /// Drops the blink the program asked for, so the configured blink
+    /// applies, and clears its record [`Modes::cursor_blink`].
+    fn drop_blink_override(&mut self) {
+        self.blink_override = None;
+        self.modes.cursor_blink = false;
+    }
+
+    /// Records the blink the program asked for (DECSCUSR 1..=6, DECSET
+    /// and DECRST 12) in [`State::blink_override`] and in its DECRQM
+    /// record [`Modes::cursor_blink`], the one bit both share.
+    fn set_blink_override(&mut self, on: bool) {
+        self.blink_override = Some(on);
+        self.modes.cursor_blink = on;
     }
 
     /// Applies one parsed action.

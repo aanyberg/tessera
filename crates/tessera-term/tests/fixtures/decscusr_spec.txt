@@ -112,6 +112,13 @@
 #                default (rows L01..L04). xterm has no live-config equivalent (resources are read once).
 #                Corollary of D-BLINKFLAG: `?12 h/l` materialises an override, so a `?12`-touched session stops following
 #                the default blink AND shape until the next reset or Ps 0 (L05, flags decision).
+#                AMENDED by #169 (user decision D1, 2026-11-01): the override is two fields, shape_override (DECSCUSR 1..6
+#                only) and blink_override (DECSCUSR 1..6 and ?12). `?12 h/l` overrides only the blink; the shape keeps
+#                following the configured default (xterm writes only cursor_blink_esc, L7628). A live edit of the
+#                configured BLINK (a default whose blink differs) drops the program's blink and its DECRQM record,
+#                whichever sequence set it (option C): tmux sends `?12l` with every cnorm, so a tmux tab would otherwise
+#                never follow a blink edit again. A shape edit leaves both overrides alone. Rows L05 (rewritten), L07,
+#                L08, T01, T02, Q09, Q10.
 #   D-DECSC      DECSC/DECRC, 1048/1049/47/1047 alt-screen switches do not save, restore or reset the style (xterm
 #                cursor.c CursorSave2; DEC DECSC page). kitty keeps shape inside its savepoint cursor copy: unverified.
 #                Rows S01..S04.
@@ -564,14 +571,17 @@ expect: beam blink
 cite: D-LIVE + D-PS0: Ps 0 clears the override, so the session follows the live default again
 flags: decision D-LIVE
 
-### L05_decset12_materialises_an_override
+### L05_decset12_overrides_only_the_blink
 size: 3x10
-step: feed \x1b[?12l
+default: beam blink
+step: feed \x1b[?12h\x1b[?12l
+expect: beam steady modes_blink=false
 step: set_default underline blink
-expect: block steady
+expect: underline steady modes_blink=false
 step: feed \x1b[!p
 expect: underline blink
-cite: D-BLINKFLAG corollary ([AL] get_or_insert): after ?12 the session keeps the shape (block, from the default at the time) and blink=false; a reset or Ps 0 re-attaches it to the default. Alternative (override only the blink bit, shape keeps following) is equally defensible; no emulator does it.
+cite: #169 D1 (user, 2026-11-01): `?12` sets only the blink; [XT] dpmodes srm_ATT610_BLINK writes cursor_blink_esc only and leaves cursor_shape alone (L7628); `vim -u NONE` sends `CSI ? 12 h CSI ? 12 l` at start-up (#169 repro L05)
+note: Rewritten by #169: #113's row expected `block steady` after the edit (Alacritty's get_or_insert froze the shape). The edit changes only the shape, so the blink stays the program's (off, as xterm's `?12 l` stops a resource blink); L07 edits the blink.
 flags: decision D-LIVE D-BLINKFLAG
 
 ### L06_set_default_with_identical_value_is_noop
@@ -579,6 +589,58 @@ size: 3x10
 step: set_default block steady
 expect: block steady
 cite: shipped defaults (config cursor_shape = "block", cursor_blink = false). App-core: apply_config with an unchanged style must not damage the cursor row (see app-core section).
+
+### L07_blink_edit_drops_the_decset12_blink
+size: 3x10
+default: block blink
+step: feed \x1b[?12l
+expect: block steady modes_blink=false
+step: set_default block steady
+expect: block steady modes_blink=false
+step: set_default block blink
+expect: block blink modes_blink=false
+cite: #169 D1 option C (user, 2026-11-01): an edit of the configured blink drops the program's blink. xterm has no live configuration.
+note: The first edit already drops the `?12 l` blink (both are steady, so it does not show); the second proves it: kept, it would read block steady.
+flags: decision D-LIVE
+
+### L08_blink_edit_drops_the_decscusr_blink_keeps_its_shape
+size: 3x10
+step: feed \x1b[5 q
+expect: beam blink modes_blink=true
+step: set_default block blink
+expect: beam blink modes_blink=false
+step: set_default block steady
+expect: beam steady modes_blink=false
+cite: #169 D1 option C: the drop is of the blink, whoever set it; the shape DECSCUSR set stays (D-LIVE, L03)
+note: Kept, the program's blink would read beam blink at the end; a shape-only edit (L03) keeps both.
+flags: decision D-LIVE
+
+# ------------------------------------------------------------------ T. tmux and vim sequences (#169)
+
+### T01_tmux_cnorm_flood_never_fixes_the_shape
+size: 3x10
+default: beam blink
+step: feed \x1b[?12l\x1b[?25h   # the test repeats this step 100 times
+expect: beam steady modes_blink=false
+step: set_default underline blink
+expect: underline steady
+cite: #169 item 2: tmux sends cnorm (`CSI ? 12 l CSI ? 25 h`, xterm-256color and tessera.terminfo) every time it shows the cursor; D1: no shape override comes of it
+note: The shape follows the shape edit, so no shape override was left behind by 100 cnorms.
+flags: decision D-LIVE
+
+### T02_tmux_nvim_quit_returns_to_the_configured_style
+size: 3x10
+default: beam blink
+step: feed \x1b[?12l\x1b[?25h
+step: feed \x1b[2 q
+expect: block steady
+step: feed \x1b[0 q
+expect: beam blink modes_blink=false
+step: set_default underline blink
+expect: underline blink
+cite: #169 item 1: nvim leaves with `CSI 0 SP q`, which tmux turns into the outer terminal's terminfo `Se`. tessera.terminfo now has `Se=\E[0 q` (was `\E[2 q`, as xterm-256color still has), so the outer terminal sees `CSI 0 SP q` and returns to the configured style, following later edits
+note: With `Se=\E[2 q` the last two expects would read block steady: a frozen steady block. The next cnorm tmux sends turns the blink off again (xterm's `?12 l`, T01); the shape stays the configured one.
+flags: decision D-PS0
 
 # ------------------------------------------------------------------ Q. DECRQSS / DECRQM replies (deferred: no DCS or reply channel yet)
 
@@ -635,6 +697,25 @@ expect: beam blink
 requests: []
 cite: DCS is ignored today (lib.rs `Action::DcsStart..`); the unsupported DECRQSS must produce no output and must not corrupt the following text. Run this row now (NOT deferred).
 flags: negative
+
+### Q09_decset12_reply_follows_a_shape_edit
+size: 3x10
+step: feed \x1b[?12h
+step: set_default underline steady
+step: feed \x1bP$q q\x1b\\\x1b[?12$p
+reply: \x1bP1$r3 q\x1b\\\x1b[?12;1$y
+cite: #169 D1: `?12 h` overrides only the blink, so after a shape edit the effective style is a blinking underline (DECRQSS answers 3) and DECRQM 12 still reports the program's bit (set)
+note: Under #113's model the reply was `1 q` (the block frozen by `?12 h`).
+flags: decision D-BLINKFLAG
+
+### Q10_blink_edit_clears_the_decrqm_record
+size: 3x10
+step: feed \x1b[?12h
+step: set_default block blink
+step: feed \x1bP$q q\x1b\\\x1b[?12$p
+reply: \x1bP1$r1 q\x1b\\\x1b[?12;2$y
+cite: #169 D1 option C: the blink edit drops the program's blink and its record, so DECRQM 12 answers reset (2) while the configured blink makes the cursor blink (DECRQSS 1), as after `CSI 0 SP q` with a blinking default (B07)
+flags: decision D-LIVE
 
 # ------------------------------------------------------------------ APP-CORE (tests live in crates/tessera-app-core/src/view.rs, not this table)
 #   Map: term Block->render Block, Underline->Underline, Beam->Beam. Unfocused: HollowBlock for every shape (D-FOCUS).

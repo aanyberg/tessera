@@ -131,13 +131,16 @@ xterm accepts colons only in SGR and XTMODKEYS.
 **Cursor style (DECSCUSR).** Added by #113; the rows of
 `crates/tessera-term/tests/fixtures/decscusr_spec.txt` pin every point
 below. `Terminal::cursor_style() -> CursorStyle { shape: Block | Underline
-| Beam, blink }` is the style in effect: `cursor_override.unwrap_or(default)`,
-where `default` is the configured one (`[appearance] cursor_shape` and
-`cursor_blink`, set with `Terminal::set_default_cursor_style` before a
-session's first byte and again by `App::apply_config`) and
-`cursor_override: Option<CursorStyle>` is what the program asked for.
-`CSI Ps SP q` with Ps 1 to 6 sets the override (1/2 blinking/steady block,
-3/4 underline, 5/6 beam, xterm's "bar"). `Snapshot::capture` maps the shape
+| Beam, blink }` is the style in effect, each half on its own:
+`shape_override.unwrap_or(default.shape)` and
+`blink_override.unwrap_or(default.blink)`, where `default` is the
+configured one (`[appearance] cursor_shape` and `cursor_blink`, set with
+`Terminal::set_default_cursor_style` before a session's first byte and
+again by `App::apply_config`) and `shape_override: Option<CursorShape>` and
+`blink_override: Option<bool>` are what the program asked for (two fields
+since #169; #113 had one `cursor_override: Option<CursorStyle>`). `CSI Ps
+SP q` with Ps 1 to 6 sets both (1/2 blinking/steady block, 3/4 underline,
+5/6 beam, xterm's "bar"). `Snapshot::capture` maps the shape
 to the renderer's and damages the cursor's row when it changes; the blink
 bit is recorded but not drawn yet, so a blink-only change damages nothing.
 Unfocused views draw every shape hollow and DECTCEM still hides the cursor
@@ -145,17 +148,45 @@ whatever its shape.
 
 - *One blink bit.* DECSCUSR and DECSET/DECRST 12 share one
   program-controlled blink bit, as in xterm (`cursor_blink_esc`, written by
-  both, last writer wins), Alacritty and kitty. `CSI ? 12 h/l` makes the
-  override `Some(shape in effect, blink on/off)` (Alacritty's
-  `get_or_insert`), so `CSI 1 SP q CSI ? 12 l` is steady and `CSI ? 12 h
+  both, last writer wins), Alacritty and kitty. `CSI ? 12 h/l` sets
+  `blink_override` only, so `CSI 1 SP q CSI ? 12 l` is steady and `CSI ? 12 h
   CSI 2 SP q` is steady too. `Modes::cursor_blink` stays as the record of
   the last program-requested bit (written by 12 and by DECSCUSR, cleared by
-  Ps 0/7 and every reset) for a later DECRQM 12 reply. The issue's first
-  wording, "blink = DECSCUSR blink || DECSET 12", was dropped: no reference
-  terminal combines two bits that way, and it would keep a cursor blinking
-  after the program turned blinking off with the other sequence. A
-  consequence: a session touched by `CSI ? 12 h/l` stops following the
-  configured shape and blink until DECSCUSR 0 or a reset.
+  Ps 0/7, every reset and a blink edit; always
+  `blink_override.unwrap_or(false)`), which DECRQM 12 reports. The issue's
+  first wording, "blink = DECSCUSR blink || DECSET 12", was dropped: no
+  reference terminal combines two bits that way, and it would keep a cursor
+  blinking after the program turned blinking off with the other sequence.
+- *`?12` never fixes the shape* (#169, user decision D1, 2026-11-01).
+  #113 made `CSI ? 12 h/l` materialise a whole override (Alacritty's
+  `get_or_insert`), so the shape in effect froze with it. tmux sends cnorm
+  (`CSI ? 12 l CSI ? 25 h`) every time it shows the cursor and `vim -u NONE`
+  sends `CSI ? 12 h CSI ? 12 l` at start-up, so every tab that ran either
+  stopped following `cursor_shape` and `cursor_blink` edits. Now the shape
+  stays whatever it was, as xterm's `?12` writes only `cursor_blink_esc`
+  and never `cursor_shape`. `CSI ? 12 l` still stops a configured blink
+  (Alacritty; xterm's default OR/XOR with a blinking resource would not),
+  so a config default cannot defeat a program that asks for a steady
+  cursor. Rejected: dropping `?12` when it equals the configured blink (it
+  still stops a configured blink in tmux, and the record would depend on
+  the configuration).
+- *A blink edit takes over from the program* (#169, D1 option C). A
+  `set_default_cursor_style` whose blink differs from the default the
+  terminal holds drops `blink_override` and clears `Modes::cursor_blink`,
+  whichever sequence set them; a default with the same blink (a shape edit,
+  or the same style again) changes nothing else. Without it a tab that
+  once ran tmux or vim would never follow a `cursor_blink` edit again. The
+  comparison is against the terminal's own default, under its lock, so
+  concurrent applies cannot make it miss or repeat a change.
+- *Consequence: no configured blink inside a running tmux.* tmux sends
+  cnorm (`CSI ? 12 l CSI ? 25 h`, in xterm-256color and in tessera.terminfo)
+  every time it shows the cursor, and vim sends `CSI ? 12 l` too. Since
+  `?12 l` stops a configured blink (above), `cursor_blink = true` is off
+  inside a running tmux. A `cursor_blink` edit turns it back on only until
+  tmux's next cnorm; after tmux exits the tab follows the configuration
+  again only once `cursor_blink` is next edited (or DECSCUSR 0 or a reset
+  arrives). Accepted with D1; dropping `?12 l` from tessera.terminfo's
+  cnorm would avoid it for `TERM=tessera` and is left to a later issue.
 - *Ps 0 and 7 are the configured default* (deliberate deviations): `CSI 0
   SP q`, `CSI SP q` and an empty first parameter (`CSI ; 5 SP q`) drop the
   override, as in Alacritty, kitty (shape), WezTerm and Ghostty; xterm and
@@ -169,17 +200,18 @@ whatever its shape.
   blinking beam); a colon sub-parameter anywhere (`CSI 5:1 SP q`) voids
   the whole sequence, as for the mode sequences.
 - *Resets.* DECSTR, DECSCL with `Pl` 61 to 65 (through the same soft
-  reset) and RIS drop the override and clear `Modes::cursor_blink`, so the
+  reset) and RIS drop both overrides and clear `Modes::cursor_blink`, so the
   configured default applies; the default itself is configuration and no
   reset touches it. xterm's ctlseqs is silent on what DECSTR and RIS do to
   the cursor style: the facts come from xterm's `charproc.c`, the common
   part of `ReallyReset` (L14379..14384 as fetched 2026-10-29: `InitCursorShape`
   from the resources, `cursor_blink_esc = 0`), which runs for DECSTR, DECSCL
   and RIS alike, so there is no soft/hard difference.
-- *Live configuration.* A new default reaches the sessions without an
+- *Live configuration.* A new default reaches the halves without an
   override at once (the observer's `on_appearance_changed` makes the host
-  redraw); a session with one keeps it until Ps 0/7 or a reset, which then
-  lands on the new default (Alacritty). A session that starts while a
+  redraw); a shape override stays until Ps 0/7 or a reset, which then
+  lands on the new default (Alacritty), and a blink override stays until
+  then or a blink edit (above). A session that starts while a
   configuration is applied reads it again once it is listed.
 - *Not saved with the cursor.* DECSC/DECRC, SCOSC/SCORC, the alternate
   screens 47/1047/1048/1049 and a resize neither save, restore nor reset
@@ -188,7 +220,12 @@ whatever its shape.
 - *Reported (ADR 0024, #10):* DECRQSS `SP q` (`DCS 1 $ r Ps SP q ST`)
   answers from the effective style and DECRQM 12 from
   `Modes::cursor_blink`; the fixture's rows Q01..Q06 run in the table
-  test.
+  test. The split changes none of their replies; Q09 (DECRQSS after `?12 h`
+  and a shape edit answers the new shape) and Q10 (a blink edit makes
+  DECRQM 12 answer reset) pin the new model.
+- *terminfo `Se`* is `CSI 0 SP q` in `tessera.terminfo` (ADR 0005), so a
+  program's "default cursor" through tmux lands on the configured style
+  rather than a steady block.
 
 **Deviations from the references**, each pinned by a test:
 
@@ -208,8 +245,9 @@ whatever its shape.
 - Synchronized output (2026) is reset by DECSTR and RIS (the spec is
   silent).
 - DECSCUSR 0 and 7 select the configured cursor style (xterm: 0 is a
-  blinking block), and DECSET 12 shares DECSCUSR's blink bit (see "Cursor
-  style").
+  blinking block), DECSET 12 shares DECSCUSR's blink bit, `CSI ? 12 l`
+  stops a configured blink, and an edit of the configured blink drops the
+  program's (see "Cursor style").
 - Bracketed pastes keep their line breaks; a paste that sanitises to
   nothing writes nothing, brackets included.
 
