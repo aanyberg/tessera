@@ -92,6 +92,7 @@ use tessera_term::{CursorStyle, Request, Terminal};
 
 use crate::config_watch::Applied;
 use crate::input::MouseEvent;
+use crate::mouse;
 use crate::selection::SelectionState;
 use crate::view::{MAX_VIEW_COLS, MAX_VIEW_ROWS};
 use crate::{ScrollPosition, ScrollTarget};
@@ -720,6 +721,9 @@ struct InputState {
     scroll_remainder: f64,
     /// The last mouse event, its cell clamped to the grid.
     last_mouse: Option<MouseEvent>,
+    /// What the program was told about the mouse: buttons held and the
+    /// position of the last report (#12).
+    mouse_reports: mouse::ReportState,
 }
 
 /// What a scroll position is resolved against: the grid's history, read
@@ -1174,13 +1178,25 @@ impl Session {
         input.scroll_remainder = 0.0;
     }
 
-    /// Clamps `event`'s cell to the grid and records it as the last mouse
-    /// event.
-    pub(crate) fn record_mouse(&self, mut event: MouseEvent) {
-        let (rows, cols) = self.with_terminal(|term| (term.grid().rows(), term.grid().cols()));
+    /// Clamps `event`'s cell to a grid of `rows` by `cols`, records it as
+    /// the last mouse event and returns it as recorded.
+    pub(crate) fn record_mouse(&self, mut event: MouseEvent, rows: u16, cols: u16) -> MouseEvent {
         event.col = event.col.min(cols.saturating_sub(1));
         event.row = event.row.min(rows.saturating_sub(1));
         lock(&self.input).last_mouse = Some(event);
+        event
+    }
+
+    /// The mouse report state (#12): buttons the program saw go down and
+    /// where the last report was.
+    pub(crate) fn mouse_reports(&self) -> mouse::ReportState {
+        lock(&self.input).mouse_reports
+    }
+
+    /// Replaces the mouse report state once a report was queued (or none
+    /// was due).
+    pub(crate) fn set_mouse_reports(&self, state: mouse::ReportState) {
+        lock(&self.input).mouse_reports = state;
     }
 
     /// The last mouse event recorded, if any.

@@ -33,6 +33,7 @@
 
 mod config_watch;
 pub mod input;
+mod mouse;
 pub mod selection;
 pub mod session;
 mod shell_integration;
@@ -48,7 +49,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use tessera_pty::{NativePty, Pty, PtyEvents};
 use tessera_render::{FontConfig, Fonts, Gpu, Theme};
-use tessera_term::{MouseTracking, Terminal, encode_key};
+use tessera_term::{Modifiers, MouseEncoding, MouseTracking, Terminal, encode_key};
 
 pub use input::{InputEvent, InputOutcome};
 pub use selection::{Granularity, Link, Point};
@@ -537,11 +538,41 @@ impl App {
     ///   screen. A key that encodes to nothing (a bare modifier,
     ///   a release in legacy mode) is [`InputOutcome::Ignored`].
     /// * [`InputEvent::Mouse`]: recorded as the last mouse event (cell
-    ///   clamped to the grid; see [`App::last_mouse`]); always
-    ///   [`InputOutcome::Ignored`] until mouse reporting and selection
-    ///   exist.
-    /// * [`InputEvent::Scroll`]: on the primary screen, moves the
-    ///   scrollback view (see [`App::scroll_offset`]);
+    ///   clamped to the grid; see [`App::last_mouse`]). While the program
+    ///   tracks the mouse (DECSET 9, 1000, 1002, 1003), the event is
+    ///   reported with [`tessera_term::encode_mouse`] in the program's
+    ///   encoding (DECSET 1005, 1006, 1015, 1016), queued like a key, and
+    ///   is [`InputOutcome::Consumed`]; every event that writes nothing is
+    ///   [`InputOutcome::Ignored`], and the frontend may then select (ADR
+    ///   0027):
+    ///   - tracking off: Ignored, and the buttons the program saw go down
+    ///     are forgotten, so leaving tracking mid-drag sends no release
+    ///     later;
+    ///   - Shift held: a press or motion is Ignored (Shift selects); Cmd
+    ///     held: Ignored, never reported (Cmd-click is a link);
+    ///   - a release is reported iff its press was, whatever the modifiers
+    ///     then (Shift and Cmd are never encoded);
+    ///   - motion is reported only in button-event mode (1002) with a
+    ///     reported button held, or any-event mode (1003), and only when
+    ///     it moves to another cell (another pixel in SGR-pixels mode)
+    ///     than the last report; a drag carries the lowest button the
+    ///     program holds;
+    ///   - what the mode or encoding cannot express (X10's releases and
+    ///     motion, a press beyond column or row 223 in the default
+    ///     encoding) is Ignored; a release is never dropped for its
+    ///     position, it is clamped instead.
+    ///
+    ///   In SGR-pixels mode the position is the pointer's pixel in the
+    ///   text area (the view's padding taken off), clamped to it.
+    /// * [`InputEvent::Scroll`]: while the program tracks the mouse in
+    ///   any mode but X10 and neither Shift nor Cmd is held, each whole
+    ///   line is one wheel report (button 64 towards older output, 65
+    ///   towards newer) over the event's cell, on either screen, at most
+    ///   the screen height per event, fractions accumulating; queued like
+    ///   a key and [`InputOutcome::Consumed`] when a report was written.
+    ///   X10 tracking or Cmd held: [`InputOutcome::Ignored`], nothing
+    ///   moves. Otherwise (tracking off, or Shift held), on the primary
+    ///   screen it moves the scrollback view (see [`App::scroll_offset`]);
     ///   [`InputOutcome::Consumed`] only when the offset changed. On the
     ///   alternate screen, which has no scrollback, the wheel sends cursor
     ///   keys instead (xterm's alternate scroll, on by default): one Up
@@ -549,11 +580,9 @@ impl App {
     ///   or `SS3 A` / `SS3 B` in application cursor-key mode (DECCKM),
     ///   at most the screen height per event; fractions accumulate as on
     ///   the primary screen. Queued like a key, and
-    ///   [`InputOutcome::Consumed`] when a key was sent. While the
-    ///   application on the alternate screen asked for mouse reports
-    ///   (DECSET 9, 1000, 1002, 1003) the wheel is left to them (#12) and
-    ///   is [`InputOutcome::Ignored`]. The view never moves on the
-    ///   alternate screen.
+    ///   [`InputOutcome::Consumed`] when a key was sent. The view never
+    ///   moves on the alternate screen. Horizontal scrolling is not
+    ///   reported.
     /// * [`InputEvent::Paste`]: as [`App::paste`]: sanitised with
     ///   [`input::sanitize_paste_into`], or in bracketed-paste mode
     ///   (DECSET 2004) wrapped in `ESC [ 200 ~` / `ESC [ 201 ~` and
@@ -577,10 +606,12 @@ impl App {
     ///
     /// [`Error::SessionNotFound`] if `id` is not a live session;
     /// [`Error::Write`] if the child has exited, the session is being
-    /// closed, or the key, paste or focus report does not fit in what is
-    /// left of [`session::PENDING_INPUT_BYTES`] (kind
-    /// [`io::ErrorKind::WouldBlock`]); nothing of it is queued then (the
-    /// focus state is recorded all the same).
+    /// closed, or the key, paste, mouse or wheel report or focus report
+    /// does not fit in what is left of [`session::PENDING_INPUT_BYTES`]
+    /// (kind [`io::ErrorKind::WouldBlock`]); nothing of it is queued then
+    /// (the focus state and the last mouse event are recorded all the
+    /// same, but a refused mouse report changes no report state: its
+    /// button is not held).
     pub fn send_input(&self, id: SessionId, event: InputEvent) -> Result<InputOutcome> {
         let session = self.session(id)?;
         let write_error = |source| Error::Write { id, source };
@@ -600,39 +631,8 @@ impl App {
                 session.scroll_to_bottom();
                 Ok(InputOutcome::Consumed)
             }
-            InputEvent::Mouse(mouse) => {
-                session.record_mouse(mouse);
-                Ok(InputOutcome::Ignored)
-            }
-            InputEvent::Scroll(scroll) => {
-                // One look at the terminal, released before anything is
-                // queued.
-                let (alt, mouse, application_cursor_keys, rows) = session.with_terminal(|term| {
-                    (
-                        term.grid().is_alt_screen(),
-                        term.modes().mouse,
-                        term.keyboard_modes().application_cursor_keys,
-                        term.grid().rows(),
-                    )
-                });
-                if !alt {
-                    return Ok(if session.scroll(scroll.delta_lines) {
-                        InputOutcome::Consumed
-                    } else {
-                        InputOutcome::Ignored
-                    });
-                }
-                if mouse != MouseTracking::None {
-                    return Ok(InputOutcome::Ignored);
-                }
-                let lines = session.take_scroll_lines(scroll.delta_lines, rows);
-                let bytes = input::alternate_scroll_keys(lines, application_cursor_keys);
-                if bytes.is_empty() {
-                    return Ok(InputOutcome::Ignored);
-                }
-                session.queue_input(bytes).map_err(write_error)?;
-                Ok(InputOutcome::Consumed)
-            }
+            InputEvent::Mouse(mouse) => self.send_mouse(id, &session, mouse),
+            InputEvent::Scroll(scroll) => self.send_scroll(id, &session, scroll),
             InputEvent::Paste(text) => Self::queue_paste(&session, id, &text),
             InputEvent::Focus(focus) => {
                 let focused = focus == FocusEvent::Gained;
@@ -647,6 +647,207 @@ impl App {
                 Ok(InputOutcome::Consumed)
             }
         }
+    }
+
+    /// [`App::send_input`] for [`InputEvent::Mouse`].
+    fn send_mouse(
+        &self,
+        id: SessionId,
+        session: &Session,
+        mouse: MouseEvent,
+    ) -> Result<InputOutcome> {
+        // One look at the terminal, released before anything is
+        // queued.
+        let (tracking, encoding, rows, cols) = session.with_terminal(|term| {
+            let modes = term.modes();
+            (
+                modes.mouse,
+                modes.mouse_encoding,
+                term.grid().rows(),
+                term.grid().cols(),
+            )
+        });
+        let mouse = session.record_mouse(mouse, rows, cols);
+        let pixels = if encoding == MouseEncoding::SgrPixels {
+            self.text_area_pixels(id, mouse.x_px, mouse.y_px, rows, cols)
+        } else {
+            mouse::PixelPoint::default()
+        };
+        let mode = mouse::Mode {
+            tracking,
+            encoding,
+            pixels,
+        };
+        let route = mouse::route_mouse(session.mouse_reports(), &mouse, &mode);
+        Self::queue_mouse_route(session, id, route)
+    }
+
+    /// [`App::send_input`] for [`InputEvent::Scroll`].
+    fn send_scroll(
+        &self,
+        id: SessionId,
+        session: &Session,
+        scroll: input::ScrollEvent,
+    ) -> Result<InputOutcome> {
+        // One look at the terminal, released before anything is
+        // queued.
+        let (alt, tracking, encoding, application_cursor_keys, rows, cols) =
+            session.with_terminal(|term| {
+                let modes = term.modes();
+                (
+                    term.grid().is_alt_screen(),
+                    modes.mouse,
+                    modes.mouse_encoding,
+                    term.keyboard_modes().application_cursor_keys,
+                    term.grid().rows(),
+                    term.grid().cols(),
+                )
+            });
+        if tracking != MouseTracking::None {
+            let shift = scroll.modifiers.contains(Modifiers::SHIFT);
+            let cmd = scroll.modifiers.contains(Modifiers::SUPER);
+            // X10 has no wheel, and Cmd is never reported.
+            if tracking == MouseTracking::X10 || cmd {
+                return Ok(InputOutcome::Ignored);
+            }
+            if !shift {
+                let cell = (
+                    scroll.col.min(cols.saturating_sub(1)),
+                    scroll.row.min(rows.saturating_sub(1)),
+                );
+                let pixels = if encoding == MouseEncoding::SgrPixels {
+                    self.wheel_pixels(id, session, cell, rows, cols)
+                } else {
+                    mouse::PixelPoint::default()
+                };
+                let mode = mouse::Mode {
+                    tracking,
+                    encoding,
+                    pixels,
+                };
+                let lines = session.take_scroll_lines(scroll.delta_lines, rows);
+                let route = mouse::route_wheel(
+                    session.mouse_reports(),
+                    lines,
+                    cell,
+                    scroll.modifiers,
+                    &mode,
+                );
+                return Self::queue_mouse_route(session, id, route);
+            }
+            // Shift: the scrollback, or the alternate-scroll keys.
+        }
+        if !alt {
+            return Ok(if session.scroll(scroll.delta_lines) {
+                InputOutcome::Consumed
+            } else {
+                InputOutcome::Ignored
+            });
+        }
+        let lines = session.take_scroll_lines(scroll.delta_lines, rows);
+        let bytes = input::alternate_scroll_keys(lines, application_cursor_keys);
+        if bytes.is_empty() {
+            return Ok(InputOutcome::Ignored);
+        }
+        session
+            .queue_input(bytes)
+            .map_err(|source| Error::Write { id, source })?;
+        Ok(InputOutcome::Consumed)
+    }
+
+    /// Queues what [`mouse::route_mouse`] or [`mouse::route_wheel`] decided
+    /// and keeps the report state it leads to; a report that cannot be
+    /// queued leaves the state as it was.
+    fn queue_mouse_route(
+        session: &Session,
+        id: SessionId,
+        route: mouse::Route,
+    ) -> Result<InputOutcome> {
+        match route {
+            mouse::Route::Report { bytes, next } => {
+                session
+                    .queue_input(bytes)
+                    .map_err(|source| Error::Write { id, source })?;
+                session.set_mouse_reports(next);
+                Ok(InputOutcome::Consumed)
+            }
+            mouse::Route::Ignore { next } => {
+                session.set_mouse_reports(next);
+                Ok(InputOutcome::Ignored)
+            }
+        }
+    }
+
+    /// The pointer at (`x_px`, `y_px`) in session `id`'s view (physical
+    /// pixels from the view's top-left corner) as a point in the text area
+    /// of a `rows` by `cols` grid, for SGR-pixels reports (DECSET 1016):
+    /// the view's padding is taken off and the text area's size is its
+    /// cells'. Without a view there is no padding and the size is unknown.
+    ///
+    /// Reads the view table, released before it returns; the caller holds
+    /// no terminal lock (views before terminal, ADR 0014).
+    fn text_area_pixels(
+        &self,
+        id: SessionId,
+        x_px: f32,
+        y_px: f32,
+        rows: u16,
+        cols: u16,
+    ) -> mouse::PixelPoint {
+        let geometry = lock(&self.views)
+            .get(&id)
+            .map(|view| (view.padding_px(), view.cell_metrics()));
+        let Some((padding, cell)) = geometry else {
+            return mouse::PixelPoint {
+                x: x_px,
+                y: y_px,
+                width: 0,
+                height: 0,
+            };
+        };
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "padding is a few pixels, exact in an f32"
+        )]
+        let padding = padding as f32;
+        mouse::PixelPoint {
+            x: x_px - padding,
+            y: y_px - padding,
+            width: u32::from(cols).saturating_mul(cell.width_px),
+            height: u32::from(rows).saturating_mul(cell.height_px),
+        }
+    }
+
+    /// The pointer's pixel for a wheel report over `cell` (col, row) in
+    /// SGR-pixels mode: [`InputEvent::Scroll`] carries no pointer position,
+    /// so this is the last mouse event's when it lies in the same cell,
+    /// else the cell's top-left pixel.
+    fn wheel_pixels(
+        &self,
+        id: SessionId,
+        session: &Session,
+        (col, row): (u16, u16),
+        rows: u16,
+        cols: u16,
+    ) -> mouse::PixelPoint {
+        if let Some(last) = session.last_mouse()
+            && (last.col, last.row) == (col, row)
+        {
+            return self.text_area_pixels(id, last.x_px, last.y_px, rows, cols);
+        }
+        let mut point = self.text_area_pixels(id, 0.0, 0.0, rows, cols);
+        // The cell's origin in the text area (the padding is already off).
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a text area is far below 2^24 pixels"
+        )]
+        {
+            let cell_w = point.width / u32::from(cols.max(1));
+            let cell_h = point.height / u32::from(rows.max(1));
+            point.x = (u32::from(col) * cell_w) as f32;
+            point.y = (u32::from(row) * cell_h) as f32;
+        }
+        point
     }
 
     /// Pastes `text` into session `id` exactly as
@@ -1734,6 +1935,9 @@ mod tests {
     use tessera_pty::{ExitStatus, PtyEvent};
 
     use super::*;
+
+    /// Mouse and wheel routing (#12), in `src/tests/mouse_routing.rs`.
+    mod mouse_routing;
 
     const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -3818,8 +4022,9 @@ mod tests {
     /// #31 alternate screen: no scrollback, so the wheel sends cursor keys
     /// (`CSI A`/`CSI B`, or `SS3 A`/`SS3 B` under DECCKM), one per whole
     /// line and at most a screen's height per event, and never moves the
-    /// view. With mouse reporting on it sends nothing (#12 will report
-    /// it); on the primary screen it scrolls the view as before.
+    /// view. With mouse reporting on it sends wheel reports instead, on
+    /// either screen (#12; the routing rows of `mouse_spec.txt` cover the
+    /// rest).
     #[test]
     fn the_wheel_on_the_alternate_screen_sends_cursor_keys() {
         let app = app();
@@ -3848,23 +4053,26 @@ mod tests {
         assert_eq!(scroll(&app, id, -1.0), InputOutcome::Consumed);
         expected.extend(b"\x1bOA\x1bOB");
         written_eventually(&fake, &expected);
-        // Mouse reporting on: the wheel is the mouse protocol's.
+        // Mouse reporting on: the wheel is the mouse protocol's (#12),
+        // three wheel-up presses, default encoding, at cell (0, 0).
         output(&fake, &events, b"\x1b[?1000h");
-        assert_eq!(scroll(&app, id, 3.0), InputOutcome::Ignored);
+        assert_eq!(scroll(&app, id, 3.0), InputOutcome::Consumed);
+        expected.extend(b"\x1b[M`!!".repeat(3));
         assert_eq!(app.scroll_offset(id).unwrap(), 0);
         assert!(!app.scroll_to(id, ScrollTarget::Top).unwrap());
         let position = app.scroll_position(id).unwrap();
         assert_eq!((position.offset, position.history), (0, 0));
         assert_nothing_written_after(&fake, &expected, &app, id);
         expected.push(b'#');
-        // Back on the primary screen the wheel scrolls the view, mouse
-        // reporting or not, and sends nothing.
+        // On the primary screen too, without moving the view; with
+        // reporting off the wheel scrolls the view and sends nothing.
         output(&fake, &events, b"\x1b[?1049l");
         assert_eq!(scroll(&app, id, 3.0), InputOutcome::Consumed);
-        assert_eq!(app.scroll_offset(id).unwrap(), 3);
+        expected.extend(b"\x1b[M`!!".repeat(3));
+        assert_eq!(app.scroll_offset(id).unwrap(), 0);
         output(&fake, &events, b"\x1b[?1000l\x1b[?1l");
         assert_eq!(scroll(&app, id, 1.0), InputOutcome::Consumed);
-        assert_eq!(app.scroll_offset(id).unwrap(), 4);
+        assert_eq!(app.scroll_offset(id).unwrap(), 1);
         assert_nothing_written_after(&fake, &expected, &app, id);
     }
 

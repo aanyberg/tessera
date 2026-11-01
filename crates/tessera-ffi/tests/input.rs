@@ -978,6 +978,83 @@ fn mouse_is_accepted_clamped_and_ignored() {
     assert_eq!(last.button, CoreMouseButton::Left);
 }
 
+/// The outcome contract a frontend routes by (#12, ADR 0027): while the
+/// child tracks the mouse, a reported event is `CONSUMED` and reaches the
+/// child; Shift and Cmd make a press `IGNORED` (selection, links); a
+/// release goes with its reported press only; the wheel is reported too.
+#[test]
+fn mouse_reports_reach_a_tracking_child_and_are_consumed() {
+    const EXPECTED: &[u8] = b"\x1b[<0;4;5M\x1b[<0;4;5m\x1b[<64;1;1M";
+    let outputs = Outputs::default();
+    let app = Handle::new(&outputs);
+    let path = scratch_path("mouse");
+    let script = format!(
+        "printf '\\033[?1002h\\033[?1006h'; stty raw -echo; echo ready; head -c {} > '{}'",
+        EXPECTED.len(),
+        path.display()
+    );
+    let id = app.spawn("/bin/sh", &["-c", &script]);
+    app.wait_until("the child to track the mouse", |app| {
+        app.row(id, 0) == "ready"
+    });
+    let with = |kind: MouseEventKind, modifiers: Modifiers| MouseEvent {
+        kind: kind as u32,
+        modifiers: modifiers as u8,
+        ..mouse_event()
+    };
+    let ignored = (Error::Ok, InputOutcome::Ignored);
+    let consumed = (Error::Ok, InputOutcome::Consumed);
+    // Shift selects and Cmd opens links: neither press is reported, so
+    // neither release is.
+    assert_eq!(
+        app.mouse(id, &with(MouseEventKind::Press, Modifiers::Shift)),
+        ignored
+    );
+    assert_eq!(
+        app.mouse(id, &with(MouseEventKind::Release, Modifiers::None)),
+        ignored
+    );
+    assert_eq!(
+        app.mouse(id, &with(MouseEventKind::Press, Modifiers::Super)),
+        ignored
+    );
+    assert_eq!(
+        app.mouse(id, &with(MouseEventKind::Release, Modifiers::Super)),
+        ignored
+    );
+    // A plain press is the program's; so is its release, Shift or not.
+    assert_eq!(
+        app.mouse(id, &with(MouseEventKind::Press, Modifiers::None)),
+        consumed
+    );
+    let motion = MouseEvent {
+        button: MouseButton::None as u32,
+        ..with(MouseEventKind::Motion, Modifiers::None)
+    };
+    // Button-event mode (1002) has no plain motion.
+    assert_eq!(app.mouse(id, &motion), ignored);
+    assert_eq!(
+        app.mouse(id, &with(MouseEventKind::Release, Modifiers::Shift)),
+        consumed
+    );
+    assert_eq!(app.scroll(id, 1.0), consumed);
+    let deadline = Instant::now() + TIMEOUT;
+    let written = loop {
+        match std::fs::read(&path) {
+            Ok(bytes) if bytes.len() >= EXPECTED.len() => break bytes,
+            _ => {
+                assert!(Instant::now() < deadline, "the child never saw the reports");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    };
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        String::from_utf8_lossy(&written),
+        String::from_utf8_lossy(EXPECTED)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------

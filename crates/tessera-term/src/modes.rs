@@ -135,11 +135,11 @@ pub struct Modes {
     pub bracketed_paste: bool,
     /// DECSET 1004: focus changes are reported as `ESC [ I` and `ESC [ O`.
     pub focus_events: bool,
-    /// The mouse tracking mode (DECSET 9, 1000, 1002, 1003). Stored only
-    /// until #12.
+    /// The mouse tracking mode (DECSET 9, 1000, 1002, 1003): which mouse
+    /// events the host reports with [`encode_mouse`](crate::encode_mouse).
     pub mouse: MouseTracking,
-    /// The mouse report encoding (DECSET 1005, 1006, 1015, 1016). Stored
-    /// only until #12.
+    /// The mouse report encoding (DECSET 1005, 1006, 1015, 1016) the host
+    /// passes to [`encode_mouse`](crate::encode_mouse).
     pub mouse_encoding: MouseEncoding,
     /// DECSET 2026: the application is in the middle of a synchronized
     /// update. Stored only.

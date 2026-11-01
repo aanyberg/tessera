@@ -36,7 +36,12 @@ routed by `App::send_input`, which returns an `InputOutcome`.
 `CONSUMED` means the core acted on the event (wrote to the PTY, ran a
 binding, moved the view) and the frontend must not handle it again.
 `IGNORED` lets the frontend handle the event itself, which is how menu key
-equivalents and bare modifier presses keep working. `*out` is set to
+equivalents and bare modifier presses keep working. For mouse events the
+outcome is the routing contract (amended for #12, ADR 0027): `CONSUMED`
+means a report was queued for a program that tracks the mouse, so the
+frontend must not select or open a link; every mouse event that writes
+nothing is `IGNORED`. The core decides, so Shift (selection) and Cmd
+(links) bypass reporting without the frontend reading the modes. `*out` is set to
 `IGNORED` before anything else, so it reads "ignored" after any failure.
 
 **Routing.** A key event first goes through the binding resolver
@@ -46,8 +51,11 @@ lands in #43). Otherwise it is encoded with
 DECCKM, DECKPAM, `modifyOtherKeys` and kitty flags, copied under the
 terminal lock once per key (see ADR 0020). A key
 that encodes to nothing is `IGNORED`. Mouse events are validated, their
-cell clamped to the grid, recorded as the session's last mouse position
-and `IGNORED`; mouse reporting is #12 and selection is #30. Scroll events
+cell clamped to the grid and recorded as the session's last mouse
+position; while the program tracks the mouse they are reported to it
+(#12, ADR 0027), otherwise `IGNORED`, and selection is #30. While the
+program tracks the mouse, scroll events become wheel reports (ADR 0027);
+otherwise scroll events
 move a per-session `scroll_offset` (positive `delta_lines` goes into the
 scrollback). Fractional lines accumulate, the offset is clamped to
 `0..=scrollback_len`, a fraction pushing past either end is dropped, and
