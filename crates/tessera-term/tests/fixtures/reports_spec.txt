@@ -58,12 +58,14 @@
 #             (0.1.0 -> 100), which is how Alacritty/foot encode it but would leave vim without SGR mouse.
 #   D-DA1     DA1 first parameter is 60 + conformance_level() (DECSCL changes it, as on the VT510/VT520; xterm itself keeps the
 #             decTerminalID resource and ignores DECSCL here, xterm-quirk). Level 1 (VT100) answers CSI ? 1 ; 2 c (xterm's VT100 form).
-#             Levels 2..5 answer CSI ? 6<L> ; 22 c : only features Tessera implements (22 = ANSI colour). NOT advertised: 1 (132
+#             Levels 2..5 answer CSI ? 6<L> ; 22 c : only features Tessera implements (22 = ANSI colour); since #97 levels 4 and 5
+#             also list 21 (horizontal scrolling: DECLRMM/DECSLRM, VT420 and up), CSI ? 6<L> ; 21 ; 22 c (margins_spec.txt RP01..RP04).
+#             NOT advertised: 1 (132
 #             columns: DECCOLM never resizes), 2 (printer), 3, 4 (no ReGIS/Sixel), 6 (selective erase, #95), 8, 9 (NRCS, #112), 15,
-#             16, 17, 18, 21 (#97), 28 (rectangular editing), 29, 52 (clipboard: OSC 52 is write-only, tmux would then try to read).
+#             16, 17, 18, 28 (rectangular editing), 29, 52 (clipboard: OSC 52 is write-only, tmux would then try to read).
 #             Feature numbers are added when the issue that implements them lands.
 #   D-L5      Level 5 (reachable through CSI 65 " p, #92; xterm with id 420 rejects 65) answers as a VT525 (DEC STD 070 / xterm
-#             decTerminalID=525): DA1 CSI ? 65 ; 22 c, DECRQSS " p -> 65 ; 1 " p. Alternative (clamp to 4) rejected: the level is
+#             decTerminalID=525): DA1 CSI ? 65 ; 21 ; 22 c (21 since #97), DECRQSS " p -> 65 ; 1 " p. Alternative (clamp to 4) rejected: the level is
 #             stored, so the reply must follow it. DA2 does NOT follow the level (xterm: it follows the resource, not DECSCL).
 #   D-DA3     CSI = c answers DCS ! | 00000000 ST (xterm DECRPTUI: site code and serial zero) at level >= 4, silence below (xterm).
 #   D-DECID   ESC Z (DECID) answers exactly like DA1 (xterm CASE_DECID -> DA1 reply).
@@ -97,14 +99,14 @@
 ### DA01_da1_plain
 size: 24x80
 step: feed \e[c
-reply: \e[?64;22c
+reply: \e[?64;21;22c
 cite: [CTL] "CSI Ps c Send Device Attributes (Primary DA). Ps = 0 or omitted -> request attributes"; [XT] CASE_DA1 `GetParam(0) <= 0`; D-DA1 (level 4 default, conformance_level() == 4, only implemented features)
 flags: decision
 
 ### DA02_da1_ps0
 size: 24x80
 step: feed \e[0c
-reply: \e[?64;22c
+reply: \e[?64;21;22c
 cite: [CTL] as DA01; explicit Ps = 0
 flags: decision
 
@@ -118,7 +120,7 @@ flags: xterm-quirk negative
 ### DA04_decid_esc_z
 size: 24x80
 step: feed \eZ
-reply: \e[?64;22c
+reply: \e[?64;21;22c
 cite: [XT] CASE_DECID answers the DA1 reply (VT100-compatible identification, DEC STD 070 DECID); D-DECID
 flags: decision
 
@@ -146,14 +148,14 @@ flags: decision
 ### DA08_da1_level4
 size: 24x80
 step: feed \e[64"p\e[c
-reply: \e[?64;22c
+reply: \e[?64;21;22c
 cite: D-DA1
 flags: decision
 
 ### DA09_da1_level5
 size: 24x80
 step: feed \e[65"p\e[c
-reply: \e[?65;22c
+reply: \e[?65;21;22c
 cite: D-L5 (xterm id 420 refuses `CSI 65 " p`, charproc.c L5101; xterm id 525 would answer `?65;...`); #92 stores level 5
 flags: decision
 
@@ -174,7 +176,7 @@ flags: control
 ### DA12_da1_reply_stays_7bit_after_s8c1t_decscl
 size: 24x80
 step: feed \e[64;2"p\e[c
-reply: \e[?64;22c
+reply: \e[?64;21;22c
 cite: Brief: replies are always 7-bit until #96 (wave 9); `c1_8bit_replies()` is true here but must not change the bytes. [XT] would answer 8-bit CSI (0x9B) here; this row flips in #96
 flags: decision control
 
@@ -237,14 +239,14 @@ flags: negative
 ### DA21_neovim_kitty_probe_then_da1
 size: 24x80
 step: feed \e[?u\e[c
-reply: \e[?0u\e[?64;22c
+reply: \e[?0u\e[?64;21;22c
 cite: [KT] keyboard protocol detection: query `CSI ? u` immediately followed by `CSI c`; a terminal that supports the protocol answers `CSI ? flags u` BEFORE the DA1 reply (here flags 0 = nothing pushed); neovim tui.c L309..314 relies on that order; D-ORDER
 flags: decision control
 
 ### DA22_tmux_startup_burst
 size: 24x80
 step: feed \e[c\e[>c\e[>q
-reply: \e[?64;22c\e[>1;<PV>;0c\eP>|Tessera <VERSION>\e\\
+reply: \e[?64;21;22c\e[>1;<PV>;0c\eP>|Tessera <VERSION>\e\\
 cite: [VT] tmux tty.c tty_send_requests sends exactly these three; each reply must arrive whole and in order (tty-keys.c matches DA, DA2, XDA by prefix); D-ID, D-ORDER
 flags: control
 
@@ -263,7 +265,7 @@ screen:
 >
 >
 cursor: (0,4)
-reply: \e[?64;22c\e[>1;<PV>;0c\eP!|00000000\e\\
+reply: \e[?64;21;22c\e[>1;<PV>;0c\eP!|00000000\e\\
 cite: queries consume their bytes and leave the grid alone ([XT] DA handlers only reply)
 flags: control
 
@@ -801,14 +803,14 @@ flags: control
 ### RM36_dec_unsupported_modes_report_zero
 size: 24x80
 step: feed \e[?45$p\e[?69$p\e[?42$p\e[?80$p\e[?1007$p\e[?2027$p\e[?2031$p\e[?2048$p\e[?9999$p
-reply: \e[?45;0$y\e[?69;0$y\e[?42;0$y\e[?80;0$y\e[?1007;0$y\e[?2027;0$y\e[?2031;0$y\e[?2048;0$y\e[?9999;0$y
-cite: D-RQM0. ?45 reverse wrap and ?69 DECLRMM (#97), ?42 DECNRCM (#112), ?80 DECSDM (no Sixel), 1007 alternate scroll, 2027 grapheme clusters, 2031 theme updates, 2048 in-band resize are not implemented; neovim tui.c L592..598 queries 69, 2026, 2027, 2031, 2048 and needs a reply (0 = unsupported) for each. Each flips to 1/2 in the issue that implements it. [XT] answers real values for 45/69/42/80/1007; Tessera answers what it implements
+reply: \e[?45;2$y\e[?69;2$y\e[?42;0$y\e[?80;0$y\e[?1007;0$y\e[?2027;0$y\e[?2031;0$y\e[?2048;0$y\e[?9999;0$y
+cite: D-RQM0. ?45 reverse wrap and ?69 DECLRMM answer their real state (reset) since #97; ?42 DECNRCM (#112), ?80 DECSDM (no Sixel), 1007 alternate scroll, 2027 grapheme clusters, 2031 theme updates, 2048 in-band resize are not implemented; neovim tui.c L592..598 queries 69, 2026, 2027, 2031, 2048 and needs a reply (0 = unsupported) for each. Each flips to 1/2 in the issue that implements it. [XT] answers real values for 45/69/42/80/1007; Tessera answers what it implements
 flags: decision
 
 ### RM37_dec_neovim_burst_then_da1
 size: 24x80
 step: feed \e[?69$p\e[?2026$p\e[?2027$p\e[?2031$p\e[?2048$p\e[c
-reply: \e[?69;0$y\e[?2026;2$y\e[?2027;0$y\e[?2031;0$y\e[?2048;0$y\e[?64;22c
+reply: \e[?69;2$y\e[?2026;2$y\e[?2027;0$y\e[?2031;0$y\e[?2048;0$y\e[?64;21;22c
 cite: [VT] neovim tui.c L592..L694: DECRQM burst, DA1 last as the "terminal has processed everything" sentinel; D-ORDER, D-RQM0
 flags: control
 
@@ -1130,8 +1132,8 @@ flags: control
 ### RQ28_unknown_requests_invalid
 size: 24x80
 step: feed \eP$qx\e\\\eP$q\e\\\eP$q"q\e\\\eP$qs\e\\\eP$qt\e\\\eP$q$|\e\\\eP$q*|\e\\\eP$q*x\e\\\eP$q$}\e\\\eP$q$~\e\\
-reply: \eP0$r\e\\\eP0$r\e\\\eP0$r\e\\\eP0$r\e\\\eP0$r\e\\\eP0$r\e\\\eP0$r\e\\\eP0$r\e\\\eP0$r\e\\\eP0$r\e\\
-cite: [CTL] invalid requests answer `DCS 0 $ r ST`. D-RQSS: " q DECSCA (#95), s DECSLRM (#97), t DECSLPP, $| DECSCPP, *| DECSNLS, *x DECSACE, $} DECSASD and $~ DECSSDT are valid in xterm but not modelled by Tessera; each flips to a real answer in its issue. `$q` with an empty Pt is invalid ([XT] falls through to okay = False)
+reply: \eP0$r\e\\\eP0$r\e\\\eP0$r\e\\\eP1$r1;80s\e\\\eP0$r\e\\\eP0$r\e\\\eP0$r\e\\\eP0$r\e\\\eP0$r\e\\\eP0$r\e\\
+cite: [CTL] invalid requests answer `DCS 0 $ r ST`. D-RQSS: " q DECSCA (#95), t DECSLPP, $| DECSCPP, *| DECSNLS, *x DECSACE, $} DECSASD and $~ DECSSDT are valid in xterm but not modelled by Tessera; each flips to a real answer in its issue (`s` DECSLRM did in #97: `1;80s`, margins_spec.txt RS01). `$q` with an empty Pt is invalid ([XT] falls through to okay = False)
 flags: decision
 
 ### RQ29_decrqss_not_dcs_q
@@ -1498,7 +1500,7 @@ flags: control
 ### RP01_queries_in_one_chunk_replied_in_order
 size: 24x80
 step: feed \e[5n\e[6n\e[c\e[>q\e[?25$p
-reply: \e[0n\e[1;1R\e[?64;22c\eP>|Tessera <VERSION>\e\\\e[?25;1$y
+reply: \e[0n\e[1;1R\e[?64;21;22c\eP>|Tessera <VERSION>\e\\\e[?25;1$y
 cite: D-ORDER
 flags: control
 
@@ -1524,7 +1526,7 @@ flags: xterm-quirk negative
 ### RP04_query_interrupted_by_esc_is_not_answered
 size: 24x80
 step: feed \e[6\e[c
-reply: \e[?64;22c
+reply: \e[?64;21;22c
 cite: ESC restarts the sequence; only the `CSI c` completes (tessera-vt)
 flags: negative control
 

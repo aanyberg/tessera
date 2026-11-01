@@ -37,6 +37,49 @@ impl ScrollRegion {
     }
 }
 
+/// Inclusive column range of the left and right margins (DECSLRM, ADR
+/// 0028): printing wraps at the right margin and returns to the left one,
+/// and scrolling, line and character insertion and deletion move only the
+/// cells between them. The full width while left/right margin mode
+/// (DECLRMM) is off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Margins {
+    /// First column inside the margins.
+    pub left: u16,
+    /// Last column inside the margins, inclusive.
+    pub right: u16,
+}
+
+impl Margins {
+    /// Number of columns between the margins.
+    pub fn width(self) -> u16 {
+        self.right.saturating_sub(self.left).saturating_add(1)
+    }
+
+    /// True when `col` lies between the margins (xterm
+    /// `ScrnIsColInMargins`).
+    pub fn contains(self, col: u16) -> bool {
+        (self.left..=self.right).contains(&col)
+    }
+}
+
+/// Which lines a cursor-left move may wrap back into at the left margin
+/// ([`Grid::cursor_back`]; xterm's reverse wraparound, DECSET 45 and 1045).
+/// The emulator chooses from its modes; both kinds need auto-wrap (DECAWM)
+/// on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ReverseWrap {
+    /// Never: the cursor stops at the left margin (CUB, BS).
+    #[default]
+    Off,
+    /// Into the line above when that line is soft-wrapped
+    /// ([`Line::wrapped`]), landing on the right margin (DECSET 45).
+    WrappedLines,
+    /// Into any line above, and from the top margin to the bottom one
+    /// (DECSET 1045, xterm's extended reverse wraparound).
+    AllLines,
+}
+
 /// Which part of the cursor's line `erase_in_line` clears (EL).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EraseLine {
@@ -170,6 +213,8 @@ pub struct Grid {
     pending_wrap: bool,
     pen: Style,
     region: ScrollRegion,
+    /// The left and right margins (DECSLRM), the full width by default.
+    margins: Margins,
     /// Origin mode (DECOM): [`Grid::goto_origin`] counts from the top
     /// margin and stops at the bottom one.
     origin: bool,
@@ -221,6 +266,10 @@ impl Grid {
             region: ScrollRegion {
                 top: 0,
                 bottom: rows - 1,
+            },
+            margins: Margins {
+                left: 0,
+                right: cols - 1,
             },
             origin: false,
             saved: SavedCursor::INITIAL,
@@ -404,6 +453,38 @@ impl Grid {
         self.region
     }
 
+    /// The left and right margins ([`Grid::set_margins`]); the full width
+    /// unless the emulator set others.
+    pub fn margins(&self) -> Margins {
+        self.margins
+    }
+
+    /// The column where the cursor's writes stop (and a wrap is armed):
+    /// the right margin while the cursor is at or left of it, else the
+    /// last column, as xterm lets text written right of the right margin
+    /// run to the edge of the screen.
+    #[inline]
+    pub fn line_end(&self) -> u16 {
+        self.line_end_from(self.cursor.col)
+    }
+
+    /// [`Grid::line_end`] for a cursor in column `col`.
+    #[inline]
+    fn line_end_from(&self, col: u16) -> u16 {
+        if col > self.margins.right {
+            self.cols - 1
+        } else {
+            self.margins.right
+        }
+    }
+
+    /// True when the margins cover every column: scrolls then move whole
+    /// lines and may feed the scrollback.
+    #[inline]
+    fn full_width(&self) -> bool {
+        self.margins.left == 0 && self.margins.right == self.cols - 1
+    }
+
     /// The visible rows changed since the last [`Grid::take_damage`] (all
     /// of them for a new grid), and the current damage generation.
     ///
@@ -461,10 +542,12 @@ impl Grid {
 
     /// Writes `ch` with the current pen at the cursor and advances it.
     ///
-    /// Writing in the last column leaves the cursor there and arms pending
-    /// wrap: the next write first moves to the start of the next line,
-    /// scrolling if at the bottom of the region, and marks the finished
-    /// line as soft-wrapped.
+    /// Writing in the last column ([`Grid::line_end`]: the right margin,
+    /// or the last column for a cursor right of the right margin) leaves
+    /// the cursor there and arms pending wrap: the next write first marks
+    /// the finished line as soft-wrapped and moves down a line as a line
+    /// feed does (scrolling at the bottom of the region), to the left
+    /// margin.
     ///
     /// The write is width-aware ([`char_width`]):
     ///
@@ -477,9 +560,10 @@ impl Grid {
     ///   dropped.
     /// - A two-column character writes a [`CellFlags::WIDE`] cell and a
     ///   [`CellFlags::SPACER`] and advances two columns. With one column
-    ///   left it blanks that column with the pen background, marks it
-    ///   [`CellFlags::PAD`] (padding, not text) and wraps first; on a
-    ///   one-column grid it is dropped.
+    ///   left before the line end it blanks that column with the pen
+    ///   background, marks it [`CellFlags::PAD`] (padding, not text) when
+    ///   it is the last column, and wraps first; on a one-column grid it is
+    ///   dropped.
     ///
     /// Overwriting either half of a wide character blanks the other half.
     ///
@@ -518,7 +602,7 @@ impl Grid {
     /// takes two columns.
     pub fn put_cell(&mut self, cell: Cell) {
         if self.pending_wrap {
-            self.wrap();
+            self.wrap_line();
         }
         self.damage.touch_cursor_row();
         let Point { row, col } = self.cursor;
@@ -536,7 +620,10 @@ impl Grid {
             line.unpair(usize::from(col), pen);
             line.set(usize::from(col), cell);
         }
-        if col + 1 < self.cols {
+        // The line ends at the right margin, or at the last column for a
+        // cursor right of the margin; without margins both are the last
+        // column, and left of the margin one comparison decides.
+        if col < self.margins.right || (col > self.margins.right && col + 1 < self.cols) {
             self.cursor.col = col + 1;
         } else {
             self.pending_wrap = true;
@@ -568,7 +655,8 @@ impl Grid {
     ///   (`UnicodeWidthStr::width`), unless the cluster already contains a
     ///   ZWJ (an emoji ZWJ sequence can be wider while it is incomplete);
     /// - when the cluster would grow from one column to two, a column is
-    ///   free to its right on the same line.
+    ///   free to its right on the same line, before the right margin (or
+    ///   the last column, for a cell right of the right margin).
     #[inline]
     pub fn would_attach(&self, ch: char) -> bool {
         char_width(ch).is_some() && self.plan_attach(ch).is_some()
@@ -635,7 +723,10 @@ impl Grid {
             return None;
         }
         let width = if raw >= 2 { 2 } else { 1 };
-        if width > cell.width() && base + 1 >= usize::from(self.cols) {
+        // Growing to two columns needs the next column before the line end
+        // (the right margin, or the last column right of it).
+        let end = usize::from(self.line_end_from(u16::try_from(base).unwrap_or(u16::MAX)));
+        if width > cell.width() && base + 1 > end {
             return None;
         }
         Some(Attach { col: base, width })
@@ -691,7 +782,8 @@ impl Grid {
                 line.unpair(base + 1, pen);
                 line.set(base + 1, Cell::spacer(cell.style));
                 line.cells[base].flags |= CellFlags::WIDE;
-                self.advance_to(base + 2);
+                let end = self.line_end_from(u16::try_from(base).unwrap_or(u16::MAX));
+                self.advance_to(base + 2, end);
             }
             Ordering::Less => {
                 line.cells[base].flags = line.cells[base].flags.difference(CellFlags::WIDE);
@@ -710,13 +802,14 @@ impl Grid {
             return;
         }
         if self.pending_wrap {
-            self.wrap();
-        } else if self.cursor.col == self.cols - 1 {
+            self.wrap_line();
+        } else if self.cursor.col == self.line_end() {
             // One column left: pad it, then continue on the next line.
-            self.pad_last_column();
-            self.wrap();
+            self.pad_line_end();
+            self.wrap_line();
         }
         self.damage.touch_cursor_row();
+        let end = self.line_end();
         let Point { row, col } = self.cursor;
         let col = usize::from(col);
         let pen = self.pen;
@@ -731,52 +824,63 @@ impl Grid {
             },
         );
         line.set(col + 1, Cell::spacer(cell.style));
-        self.advance_to(col + 2);
+        self.advance_to(col + 2, end);
     }
 
-    /// Turns the last column of the cursor's row into padding: blanks it
-    /// with the pen background (a wide character it cuts is blanked whole)
-    /// and marks it [`CellFlags::PAD`]. This is what a wide character that
-    /// does not fit in the last column leaves behind before it wraps; the
-    /// cell is not text, so a resize that joins the row with the next one
-    /// drops it. The cursor and pending wrap are untouched.
+    /// Turns the column where the cursor's line ends ([`Grid::line_end`]:
+    /// the right margin, or the last column for a cursor right of it)
+    /// into padding: blanks it with the pen background (a wide character
+    /// it cuts is blanked whole) and, when it is the last column, marks it
+    /// [`CellFlags::PAD`]. This is what a wide character that does not fit
+    /// before the line end leaves behind before it wraps; a `PAD` cell is
+    /// not text, so a resize that joins the row with the next one drops
+    /// it. A blank left at a right margin inside the row stays an ordinary
+    /// blank. The cursor and pending wrap are untouched.
     ///
     /// [`Grid::put_char`] does this itself; an emulator that wraps a wide
     /// character on its own (insert mode) calls it before wrapping.
-    pub fn pad_last_column(&mut self) {
-        let last = usize::from(self.cols - 1);
+    pub fn pad_line_end(&mut self) {
+        let end = usize::from(self.line_end());
         let pen = self.pen;
         self.damage.touch_cursor_row();
         let line = &mut self.lines[usize::from(self.cursor.row)];
-        line.fill(last..last + 1, pen);
-        line.cells[last] = Cell::pad_with(pen);
+        line.fill(end..end + 1, pen);
+        if end + 1 == line.cells.len() {
+            line.cells[end] = Cell::pad_with(pen);
+        }
     }
 
     /// Moves the cursor to column `col` after a write, or arms pending
-    /// wrap on the last column when the write reached the end of the line.
-    fn advance_to(&mut self, col: usize) {
+    /// wrap on column `end`, the line end the write started from, when the
+    /// write reached it.
+    fn advance_to(&mut self, col: usize, end: u16) {
         // Only ever called after a write, which touched the cursor row.
         match u16::try_from(col) {
-            Ok(col) if col < self.cols => {
+            Ok(col) if col <= end => {
                 self.cursor.col = col;
                 self.pending_wrap = false;
             }
             _ => {
-                self.cursor.col = self.cols - 1;
+                self.cursor.col = end;
                 self.pending_wrap = true;
             }
         }
     }
 
-    /// Resolves a pending wrap: marks the cursor's line soft-wrapped and
-    /// moves to the start of the next line, scrolling at the bottom of the
-    /// scroll region.
-    fn wrap(&mut self) {
+    /// Resolves a pending wrap the way xterm's `WrapLine` does: marks the
+    /// cursor's line soft-wrapped, moves down a line as
+    /// [`Grid::line_feed`] does (so the region scrolls at its bottom
+    /// margin only while the cursor is between the left and right
+    /// margins), then moves to the left margin. Clears a pending wrap.
+    ///
+    /// [`Grid::put_char`] does this itself before writing with a wrap
+    /// pending; an emulator that wraps on its own (insert mode) calls it.
+    pub fn wrap_line(&mut self) {
         self.pending_wrap = false;
         self.lines[usize::from(self.cursor.row)].wrapped = true;
         self.damage.touch_cursor_row();
-        self.cursor.col = 0;
         self.line_feed();
+        self.move_cursor_col(self.margins.left);
     }
 
     // -------------------------------------------------------- cursor motion
@@ -822,11 +926,13 @@ impl Grid {
 
     /// Turns origin mode (DECOM) on or off, without moving the cursor (the
     /// emulator homes it with [`Grid::goto_origin`]). While it is on,
-    /// [`Grid::goto_origin`] and [`Grid::goto_row_origin`] count rows from
-    /// the top margin and stop at the bottom one, and [`Grid::save_cursor`]
-    /// records it for [`Grid::restore_cursor`]. Every other operation is
-    /// unaffected, CUU and CUD included (they honour the margins either
-    /// way). Shared by both screens; [`Grid::reset`] turns it off.
+    /// [`Grid::goto_origin`], [`Grid::goto_row_origin`] and
+    /// [`Grid::goto_col_origin`] count rows from the top margin and columns
+    /// from the left one and stop at the bottom and right ones, a carriage
+    /// return goes to the left margin, and [`Grid::save_cursor`] records it
+    /// for [`Grid::restore_cursor`]. Every other operation is unaffected,
+    /// CUU and CUD included (they honour the margins either way). Shared by
+    /// both screens; [`Grid::reset`] turns it off.
     pub fn set_origin_mode(&mut self, on: bool) {
         self.origin = on;
     }
@@ -842,27 +948,65 @@ impl Grid {
         }
     }
 
+    /// The cursor's column as CUP, CHA and CPR count it: from the left
+    /// margin in origin mode, from the left edge otherwise. A cursor left
+    /// of the left margin in origin mode counts as column zero.
+    pub fn origin_col(&self) -> u16 {
+        if self.origin {
+            self.cursor.col.saturating_sub(self.margins.left)
+        } else {
+            self.cursor.col
+        }
+    }
+
     /// Moves the cursor to `(row, col)` as CUP, HVP, VPA and DECSET 6 do
     /// (xterm `CursorSet`): in origin mode `row` counts from the top margin
-    /// and is clamped to the bottom margin, otherwise this is
-    /// [`Grid::goto`]. Columns are always absolute (there are no left and
-    /// right margins yet). Clears a pending wrap.
+    /// and `col` from the left one, clamped to the bottom and right
+    /// margins; otherwise this is [`Grid::goto`]. Clears a pending wrap.
     pub fn goto_origin(&mut self, row: u16, col: u16) {
         if self.origin {
             let row = row.saturating_add(self.region.top).min(self.region.bottom);
+            let col = col
+                .saturating_add(self.margins.left)
+                .min(self.margins.right);
             self.goto(row, col);
         } else {
             self.goto(row, col);
         }
     }
 
-    /// Moves the cursor to `row` in its current column as VPA does:
-    /// [`Grid::goto_origin`] with the column kept.
+    /// Moves the cursor to `row` in its current column as VPA does
+    /// (xterm `CursorSet(row, CursorCol)`): in origin mode `row` counts
+    /// from the top margin and stops at the bottom one, and the column is
+    /// kept, only clamped to the right margin, also when it is left of the
+    /// left margin. Clears a pending wrap.
     pub fn goto_row_origin(&mut self, row: u16) {
-        self.goto_origin(row, self.cursor.col);
+        if self.origin {
+            let row = row.saturating_add(self.region.top).min(self.region.bottom);
+            self.goto(row, self.cursor.col.min(self.margins.right));
+        } else {
+            self.goto(row, self.cursor.col);
+        }
     }
 
-    /// Moves the cursor to `col` in its current row (CHA).
+    /// Moves the cursor to `col` in its current row as CHA and HPA do
+    /// (xterm `CursorSet(CursorRow, col)`): in origin mode `col` counts
+    /// from the left margin and stops at the right one, and the row is
+    /// kept, only clamped to the bottom margin, also when it is above the
+    /// top margin. Clears a pending wrap.
+    pub fn goto_col_origin(&mut self, col: u16) {
+        if self.origin {
+            let col = col
+                .saturating_add(self.margins.left)
+                .min(self.margins.right);
+            self.goto(self.cursor.row.min(self.region.bottom), col);
+        } else {
+            self.goto(self.cursor.row, col);
+        }
+    }
+
+    /// Moves the cursor to `col` in its current row, absolute and clamped
+    /// to the screen.
     pub fn goto_col(&mut self, col: u16) {
         self.goto(self.cursor.row, col);
     }
@@ -895,31 +1039,151 @@ impl Grid {
         self.move_cursor(Point { row, ..self.cursor });
     }
 
-    /// Moves the cursor left `n` columns, stopping at column zero (CUB).
+    /// Moves the cursor left `n` columns (CUB, BS) without reverse wrap:
+    /// [`Grid::cursor_back`] with [`ReverseWrap::Off`]. It stops at the left
+    /// margin, or at column zero when it starts left of the margin.
     pub fn cursor_left(&mut self, n: u16) {
-        self.pending_wrap = false;
-        self.move_cursor_col(self.cursor.col.saturating_sub(n));
+        self.cursor_back(n, ReverseWrap::Off);
     }
 
-    /// Moves the cursor right `n` columns, stopping at the last column (CUF).
+    /// Moves the cursor left `n` columns (CUB, BS), as xterm's `CursorBack`
+    /// does. Clears a pending wrap.
+    ///
+    /// The cursor stops at the left margin, or at column zero when it
+    /// starts left of the margin. With `wrap` other than
+    /// [`ReverseWrap::Off`] a step past that column wraps to the right
+    /// margin of the line above instead:
+    ///
+    /// - [`ReverseWrap::WrappedLines`] only into a line marked
+    ///   [`Line::wrapped`]; at a line that is not, the cursor stops at the
+    ///   left margin of the line it is on.
+    /// - [`ReverseWrap::AllLines`] into any line, and from the top margin
+    ///   to the bottom one.
+    ///
+    /// Either way a pending wrap makes the first step a no-move (it only
+    /// clears the wrap, so `BS` after the last column leaves the cursor on
+    /// it), and the cursor never wraps from row zero into the scrollback:
+    /// it stops at row zero's left margin (ADR 0028). Two of xterm's
+    /// quirks are kept: with a wrap pending a count of 2 does not move at
+    /// all, and a [`ReverseWrap::WrappedLines`] wrap that fails below the
+    /// bottom margin leaves the cursor on the line above. O(`n`).
+    pub fn cursor_back(&mut self, n: u16, wrap: ReverseWrap) {
+        let start = self.cursor;
+        let (any, wrapped_only) = match wrap {
+            ReverseWrap::Off => (false, false),
+            ReverseWrap::WrappedLines => (false, true),
+            ReverseWrap::AllLines => (true, false),
+        };
+        let reverse = any || wrapped_only;
+        // Signed, as in xterm: the walk steps one past the left margin.
+        let right = i32::from(self.margins.right);
+        let (top, bottom) = (i32::from(self.region.top), i32::from(self.region.bottom));
+        // A cursor already left of the left margin may go to column zero.
+        let left = if start.col < self.margins.left {
+            0
+        } else {
+            i32::from(self.margins.left)
+        };
+        let (mut row, mut col) = (i32::from(start.row), i32::from(start.col));
+        let mut count = i32::from(n);
+        if count > 0 {
+            if reverse && self.pending_wrap {
+                count -= 1;
+            } else {
+                col -= 1;
+            }
+        }
+        // Whether the line `row` was looked at since the last wrap.
+        let mut checked = false;
+        loop {
+            if col < left {
+                if any {
+                    col = right;
+                    if row == top {
+                        row = bottom + 1;
+                        // From the bottom margin's right end the walk
+                        // repeats every `period` steps: skip whole laps.
+                        let period = (bottom - top + 1) * (right - left + 1);
+                        count = (count - 1) % period + 1;
+                    }
+                } else if !reverse {
+                    col = left;
+                    break;
+                }
+                checked = false;
+                row -= 1;
+                if row < 0 {
+                    // xterm would read the newest scrollback line here.
+                    row = 0;
+                    col = left;
+                    break;
+                }
+            }
+            if !checked {
+                checked = true;
+                if row != i32::from(start.row) {
+                    let into = usize::try_from(row).ok().and_then(|r| self.lines.get(r));
+                    if !any && !into.is_some_and(|line| line.wrapped) {
+                        if row < bottom {
+                            row += 1;
+                        }
+                        col = left;
+                        break;
+                    }
+                    col = right;
+                }
+            }
+            // The steps that only move one column left within the row, at
+            // once (xterm takes them one by one), so the walk costs O(rows).
+            let skip = (count - 1).min(col - left).max(0);
+            count -= skip;
+            col -= skip;
+            count -= 1;
+            if count <= 0 {
+                break;
+            }
+            col -= 1;
+        }
+        self.pending_wrap = false;
+        // Both stay on the screen: `row` within 0..=bottom + 1 - 1 and
+        // `col` within 0..=right.
+        let row = u16::try_from(row).unwrap_or(0).min(self.rows - 1);
+        let col = u16::try_from(col).unwrap_or(0).min(self.cols - 1);
+        self.move_cursor(Point { row, col });
+    }
+
+    /// Moves the cursor right `n` columns (CUF), stopping at the right
+    /// margin, or at the last column when it starts right of the margin.
     pub fn cursor_right(&mut self, n: u16) {
         self.pending_wrap = false;
-        self.move_cursor_col(self.cursor.col.saturating_add(n).min(self.cols - 1));
+        let end = self.line_end();
+        self.move_cursor_col(self.cursor.col.saturating_add(n).min(end));
     }
 
-    /// Moves the cursor to column zero (CR).
+    /// Moves the cursor to the left margin (CR), or to column zero when it
+    /// is left of the margin and origin mode is off (xterm
+    /// `CarriageReturn`).
     pub fn carriage_return(&mut self) {
         self.pending_wrap = false;
-        self.move_cursor_col(0);
+        let left = self.margins.left;
+        let col = if self.origin || self.cursor.col >= left {
+            left
+        } else {
+            0
+        };
+        self.move_cursor_col(col);
     }
 
     /// Moves the cursor down one row (LF / IND). At the bottom of the scroll
-    /// region the region scrolls up instead; below the region the cursor
-    /// stops at the last row.
+    /// region the region scrolls up instead, but only while the cursor is
+    /// between the left and right margins: outside them it stays (xterm
+    /// `xtermIndex`). Below the region the cursor stops at the last row.
     pub fn line_feed(&mut self) {
         self.pending_wrap = false;
         if self.cursor.row == self.region.bottom {
-            self.scroll_up(1);
+            if self.margins.contains(self.cursor.col) {
+                self.scroll_up(1);
+            }
         } else if self.cursor.row < self.rows - 1 {
             self.move_cursor(Point {
                 row: self.cursor.row + 1,
@@ -929,12 +1193,15 @@ impl Grid {
     }
 
     /// Moves the cursor up one row (RI). At the top of the scroll region the
-    /// region scrolls down instead; above the region the cursor stops at
-    /// row zero.
+    /// region scrolls down instead, but only while the cursor is between
+    /// the left and right margins: outside them it stays. Above the region
+    /// the cursor stops at row zero.
     pub fn reverse_index(&mut self) {
         self.pending_wrap = false;
         if self.cursor.row == self.region.top {
-            self.scroll_down(1);
+            if self.margins.contains(self.cursor.col) {
+                self.scroll_down(1);
+            }
         } else if self.cursor.row > 0 {
             self.move_cursor(Point {
                 row: self.cursor.row - 1,
@@ -957,19 +1224,22 @@ impl Grid {
     /// Restores what [`Grid::save_cursor`] saved (DECRC): origin mode
     /// first, then the position, the pen and the pending wrap. With origin
     /// mode restored on, the saved (absolute) row is clamped to the bottom
-    /// margin, as xterm's `CursorRestore` does through `CursorSet`, so the
-    /// cursor lands inside the region when the region shrank above it.
-    /// Without a prior save this homes the cursor, resets the pen and turns
-    /// origin mode off.
+    /// margin and the column to the right one, as xterm's `CursorRestore`
+    /// does through `CursorSet`, so the cursor lands inside the margins when
+    /// they shrank since the save. Without a prior save this homes the
+    /// cursor, resets the pen and turns origin mode off.
     pub fn restore_cursor(&mut self) {
         let saved = self.saved;
         self.origin = saved.origin;
-        let row = if saved.origin {
-            saved.cursor.row.min(self.region.bottom)
+        let (row, col) = if saved.origin {
+            (
+                saved.cursor.row.min(self.region.bottom),
+                saved.cursor.col.min(self.margins.right),
+            )
         } else {
-            saved.cursor.row
+            (saved.cursor.row, saved.cursor.col)
         };
-        self.goto(row, saved.cursor.col);
+        self.goto(row, col);
         self.pen = saved.pen;
         self.pending_wrap = saved.pending_wrap;
     }
@@ -1058,7 +1328,8 @@ impl Grid {
     /// padded, rows leaving it are discarded and pending wrap is cleared
     /// when the width changes, while the stashed primary screen is resized
     /// as above with its own cursor. Every real resize resets the scroll
-    /// region to the full screen, clamps each screen's saved cursor (it is
+    /// region and the left and right margins to the full screen (xterm
+    /// `ScreenResize`, ADR 0028), clamps each screen's saved cursor (it is
     /// not moved with the text) and extends the tab stops with the default
     /// every-eight stops beyond the old width, keeping the ones below it.
     /// The pen is unchanged; added rows and cells use the default style.
@@ -1119,6 +1390,7 @@ impl Grid {
             top: 0,
             bottom: size.rows - 1,
         };
+        self.reset_margins();
     }
 
     // ------------------------------------------------------ alternate screen
@@ -1162,7 +1434,7 @@ impl Grid {
     /// contents and restoring the primary lines, cursor, pending-wrap state,
     /// pen, origin mode, saved cursor and tab stops as they were on entry
     /// (the cursor moved with the text by a [`Grid::resize`] in between,
-    /// and with origin mode on clamped to the bottom margin, as
+    /// and with origin mode on clamped to the bottom and right margins, as
     /// [`Grid::restore_cursor`] does).
     /// The alternate screen's saved cursor is kept for the next visit. A
     /// no-op when the primary screen is already active. DECSET 1049 leaves
@@ -1207,14 +1479,17 @@ impl Grid {
         self.lines = lines;
         if restore_cursor {
             // As `restore_cursor`: with origin mode restored on, the row is
-            // clamped to the bottom margin of the (shared) region, which
-            // the alternate screen may have moved (xterm `CursorRestore`).
-            let row = if origin {
-                cursor.row.min(self.region.bottom)
+            // clamped to the bottom margin of the (shared) region and the
+            // column to the right margin, which the alternate screen may
+            // have moved (xterm `CursorRestore`).
+            self.cursor = if origin {
+                Point {
+                    row: cursor.row.min(self.region.bottom),
+                    col: cursor.col.min(self.margins.right),
+                }
             } else {
-                cursor.row
+                cursor
             };
-            self.cursor = Point { row, ..cursor };
             self.pending_wrap = pending_wrap;
             self.pen = pen;
             self.origin = origin;
@@ -1241,8 +1516,12 @@ impl Grid {
         self.tabs.clear_all();
     }
 
-    /// Moves the cursor to the `n`th next tab stop, or the last column when
-    /// fewer remain (HT / CHT). `n == 0` is a no-op.
+    /// Moves the cursor to the `n`th next tab stop, or the right margin
+    /// when fewer remain before it (HT / CHT). As in xterm
+    /// (`TabToNextStop`), the right margin stops it even when the cursor
+    /// starts right of the margin, so HT then moves it back to the margin
+    /// (ADR 0028); without margins the right margin is the last column.
+    /// `n == 0` is a no-op.
     pub fn tab_forward(&mut self, n: u16) {
         self.pending_wrap = false;
         if n == 0 {
@@ -1252,7 +1531,7 @@ impl Grid {
             .tabs
             .next(self.cursor.col, n)
             .unwrap_or(self.cols - 1)
-            .min(self.cols - 1);
+            .min(self.margins.right);
         self.move_cursor_col(col);
     }
 
@@ -1264,6 +1543,12 @@ impl Grid {
             return;
         }
         let col = self.tabs.previous(self.cursor.col, n).unwrap_or(0);
+        // xterm `TabToPrevStop`: origin mode stops at the left margin.
+        let col = if self.origin {
+            col.max(self.margins.left)
+        } else {
+            col
+        };
         self.move_cursor_col(col);
     }
 
@@ -1295,10 +1580,41 @@ impl Grid {
         };
     }
 
+    /// Sets the left and right margins to columns `left..=right`
+    /// (DECSLRM; ADR 0028).
+    ///
+    /// Columns are clamped to the screen. A pair of fewer than two columns
+    /// is invalid and resets the margins to the full width (DECSLRM itself
+    /// ignores such a pair; the emulator checks before it calls). The
+    /// cursor is left where it is; the emulator homes it. Shared by both
+    /// screens, like the scroll region.
+    pub fn set_margins(&mut self, left: u16, right: u16) {
+        let left = left.min(self.cols - 1);
+        let right = right.min(self.cols - 1);
+        if left < right {
+            self.margins = Margins { left, right };
+        } else {
+            self.reset_margins();
+        }
+    }
+
+    /// Resets the left and right margins to the full width: what turning
+    /// left/right margin mode (DECLRMM) off, DECSTR, RIS, DECALN, DECCOLM
+    /// and a resize do.
+    pub fn reset_margins(&mut self) {
+        self.margins = Margins {
+            left: 0,
+            right: self.cols - 1,
+        };
+    }
+
     /// Scrolls the region up `n` lines (SU): lines leave through the top and
     /// blank lines enter at the bottom. When the region is the whole primary
-    /// screen the departing lines go to scrollback; on the alternate screen
-    /// they are discarded.
+    /// screen and the margins the full width, the departing lines go to
+    /// scrollback; otherwise they are discarded. Between left and right
+    /// margins narrower than the screen only the cells between them move,
+    /// and the soft-wrap flags and marks stay with their rows (xterm
+    /// `scrollInMargins`).
     pub fn scroll_up(&mut self, n: u16) {
         let ScrollRegion { top, bottom } = self.region;
         let n = usize::from(n.min(self.region.height()));
@@ -1306,6 +1622,10 @@ impl Grid {
             return;
         }
         self.extend_region(top, bottom);
+        if !self.full_width() {
+            self.scroll_rect(usize::from(top), usize::from(bottom), n, true);
+            return;
+        }
         let top = usize::from(top);
         let keep_history = self.region_is_full_screen() && !self.is_alt_screen();
         self.scrolled_since_clear |= keep_history;
@@ -1333,7 +1653,9 @@ impl Grid {
     }
 
     /// Scrolls the region down `n` lines (SD): lines leave through the
-    /// bottom and are discarded, blank lines enter at the top.
+    /// bottom and are discarded, blank lines enter at the top. Between left
+    /// and right margins narrower than the screen only the cells between
+    /// them move, as for [`Grid::scroll_up`].
     pub fn scroll_down(&mut self, n: u16) {
         let ScrollRegion { top, bottom } = self.region;
         let n = usize::from(n.min(self.region.height()));
@@ -1342,6 +1664,10 @@ impl Grid {
         }
         self.extend_region(top, bottom);
         let (top, bottom) = (usize::from(top), usize::from(bottom));
+        if !self.full_width() {
+            self.scroll_rect(top, bottom, n, false);
+            return;
+        }
         self.lines[top..=bottom].rotate_right(n);
         for line in &mut self.lines[top..top + n] {
             *line = Line::blank(self.cols, self.pen);
@@ -1362,15 +1688,149 @@ impl Grid {
         }
     }
 
+    /// Moves the cells between the left and right margins of rows
+    /// `top..=bottom` up (`up`) or down by `n` rows (`1..=bottom - top +
+    /// 1`), blanking the `n` rows' worth of cells that enter with the pen
+    /// background. Cells outside the margins, the rows' wrap flags and
+    /// marks stay. A wide character cut by either margin, in any of the
+    /// rows, is blanked whole first. The caller records the damage.
+    fn scroll_rect(&mut self, top: usize, bottom: usize, n: usize, up: bool) {
+        let span = usize::from(self.margins.left)..usize::from(self.margins.right) + 1;
+        let pen = self.pen;
+        let mut clusters = false;
+        for line in &mut self.lines[top..=bottom] {
+            line.split_wide_at_edges(span.clone(), pen);
+            clusters |= !line.graphemes.is_empty();
+        }
+        let outside = usize::from(self.cols) - span.len();
+        if n == 1 && outside < span.len() && !clusters {
+            // The common case (a line feed at the bottom margin, tmux's
+            // panes): moving whole lines and putting the narrower outside
+            // parts back moves fewer cells than copying the inside.
+            self.scroll_rect_by_rotation(top, bottom, up, span);
+        } else {
+            self.scroll_rect_by_copy(top, bottom, n, up, span);
+        }
+    }
+
+    /// [`Grid::scroll_rect`] by one row: rotates the rows, then moves the
+    /// cells outside `span`, the wrap flags and the marks back the other
+    /// way, so they stay on their rows. Same result as
+    /// [`Grid::scroll_rect_by_copy`] with `n` 1, for rows without cluster
+    /// text (the caller checks).
+    fn scroll_rect_by_rotation(
+        &mut self,
+        top: usize,
+        bottom: usize,
+        up: bool,
+        span: std::ops::Range<usize>,
+    ) {
+        let pen = self.pen;
+        let rows = &mut self.lines[top..=bottom];
+        let last = rows.len() - 1;
+        if last == 0 {
+            rows[0].fill(span, pen);
+            return;
+        }
+        // Where the outside parts move from and to, in order, and the row
+        // whose outside part is parked first and lands last.
+        let (parked, landing) = if up {
+            rows.rotate_left(1);
+            (last, 0)
+        } else {
+            rows.rotate_right(1);
+            (0, last)
+        };
+        let (wrapped, marks) = (
+            rows[parked].wrapped,
+            std::mem::take(&mut rows[parked].marks),
+        );
+        // Park the parked row's outside cells in its own inside, which is
+        // blanked at the end anyway and wider (the caller checks): no
+        // allocation.
+        let (left, right) = (span.start, span.end);
+        let cells = &mut rows[parked].cells;
+        let cols = cells.len();
+        cells.copy_within(right..cols, left + left);
+        cells.copy_within(0..left, left);
+        // One step: the outside part of `from` to `to`.
+        macro_rules! step {
+            ($to:expr, $from:expr) => {{
+                let (to, from): (&mut Line, &mut Line) = ($to, $from);
+                to.cells[..left].copy_from_slice(&from.cells[..left]);
+                to.cells[right..].copy_from_slice(&from.cells[right..]);
+                to.wrapped = from.wrapped;
+                mem::swap(&mut to.marks, &mut from.marks);
+            }};
+        }
+        // Each step moves an outside part one row towards `parked`,
+        // starting next to it.
+        if up {
+            for row in (1..=last).rev() {
+                let (head, tail) = rows.split_at_mut(row);
+                step!(&mut tail[0], &mut head[row - 1]);
+            }
+        } else {
+            for row in 0..last {
+                let (head, tail) = rows.split_at_mut(row + 1);
+                step!(&mut head[row], &mut tail[0]);
+            }
+        }
+        let (landed, parked_row) = if landing < parked {
+            let (head, tail) = rows.split_at_mut(parked);
+            (&mut head[landing], &tail[0])
+        } else {
+            let (head, tail) = rows.split_at_mut(landing);
+            (&mut tail[0], &head[parked])
+        };
+        landed.cells[..left].copy_from_slice(&parked_row.cells[left..left + left]);
+        landed.cells[right..]
+            .copy_from_slice(&parked_row.cells[left + left..left + left + cols - right]);
+        landed.wrapped = wrapped;
+        landed.marks = marks;
+        rows[parked].fill(span, pen);
+    }
+
+    /// [`Grid::scroll_rect`] by copying the cells of `span` row by row:
+    /// the reference way, for any `n`.
+    fn scroll_rect_by_copy(
+        &mut self,
+        top: usize,
+        bottom: usize,
+        n: usize,
+        up: bool,
+        span: std::ops::Range<usize>,
+    ) {
+        let pen = self.pen;
+        if up {
+            for row in top..bottom + 1 - n {
+                copy_span(&mut self.lines, row + n, row, span.clone());
+            }
+            for line in &mut self.lines[bottom + 1 - n..=bottom] {
+                line.fill(span.clone(), pen);
+            }
+        } else {
+            for row in (top + n..=bottom).rev() {
+                copy_span(&mut self.lines, row - n, row, span.clone());
+            }
+            for line in &mut self.lines[top..top + n] {
+                line.fill(span.clone(), pen);
+            }
+        }
+    }
+
     // ------------------------------------------------------- line editing
 
     /// Inserts `n` blank lines at the cursor row, pushing the lines below it
     /// down within the scroll region (IL). Lines pushed past the bottom of
     /// the region are discarded. A no-op when the cursor is outside the
-    /// region. The cursor column is left unchanged.
+    /// region or outside the left and right margins; between margins
+    /// narrower than the screen only the cells between them move (xterm
+    /// `InsertLine`). The cursor column is left unchanged (the emulator
+    /// returns it to the left margin).
     pub fn insert_lines(&mut self, n: u16) {
         self.pending_wrap = false;
-        if !self.region.contains(self.cursor.row) {
+        if !self.can_edit_lines() {
             return;
         }
         let row = usize::from(self.cursor.row);
@@ -1380,6 +1840,10 @@ impl Grid {
             return;
         }
         self.extend_region(self.cursor.row, self.region.bottom);
+        if !self.full_width() {
+            self.scroll_rect(row, bottom, n, false);
+            return;
+        }
         self.lines[row..=bottom].rotate_right(n);
         for line in &mut self.lines[row..row + n] {
             *line = Line::blank(self.cols, self.pen);
@@ -1388,11 +1852,13 @@ impl Grid {
 
     /// Deletes `n` lines starting at the cursor row, pulling the lines below
     /// up within the scroll region and filling with blanks at the bottom
-    /// (DL). A no-op when the cursor is outside the region. The cursor
-    /// column is left unchanged.
+    /// (DL). A no-op when the cursor is outside the region or outside the
+    /// left and right margins; between margins narrower than the screen
+    /// only the cells between them move. The cursor column is left
+    /// unchanged.
     pub fn delete_lines(&mut self, n: u16) {
         self.pending_wrap = false;
-        if !self.region.contains(self.cursor.row) {
+        if !self.can_edit_lines() {
             return;
         }
         let row = usize::from(self.cursor.row);
@@ -1402,43 +1868,135 @@ impl Grid {
             return;
         }
         self.extend_region(self.cursor.row, self.region.bottom);
+        if !self.full_width() {
+            self.scroll_rect(row, bottom, n, true);
+            return;
+        }
         self.lines[row..=bottom].rotate_left(n);
         for line in &mut self.lines[bottom + 1 - n..=bottom] {
             *line = Line::blank(self.cols, self.pen);
         }
     }
 
-    // ------------------------------------------------------ char editing
-
-    /// Inserts `n` blank cells at the cursor, shifting the rest of the line
-    /// right; cells pushed past the last column are lost (ICH). A wide
-    /// character split by the cursor, or whose right half is pushed off the
-    /// line, is blanked whole.
-    pub fn insert_chars(&mut self, n: u16) {
-        self.pending_wrap = false;
-        let Point { row, col } = self.cursor;
-        let (col, cols) = (usize::from(col), usize::from(self.cols));
-        let n = usize::from(n).min(cols - col);
-        if n == 0 {
-            return;
-        }
-        self.damage.touch_cursor_row();
-        self.lines[usize::from(row)].insert_blanks(col, n, self.pen);
+    /// Whether IL and DL act at the cursor: it is inside the scroll region
+    /// and between the left and right margins.
+    pub fn can_edit_lines(&self) -> bool {
+        self.region.contains(self.cursor.row) && self.margins.contains(self.cursor.col)
     }
 
-    /// Deletes `n` cells at the cursor, shifting the rest of the line left
-    /// and filling with blanks at the end (DCH). A wide character split by
-    /// either end of the deleted range is blanked whole.
-    pub fn delete_chars(&mut self, n: u16) {
-        self.pending_wrap = false;
+    // ------------------------------------------------------ char editing
+
+    /// Inserts `n` blank cells at the cursor, shifting the cells up to the
+    /// right margin right; cells pushed past the margin are lost and cells
+    /// beyond it do not move (ICH). A wide character split by the cursor,
+    /// or cut by the margin, is blanked whole. A no-op, which leaves a
+    /// pending wrap armed, when the cursor is outside the left and right
+    /// margins (xterm `InsertChar`).
+    pub fn insert_chars(&mut self, n: u16) {
         let Point { row, col } = self.cursor;
-        let (col, cols) = (usize::from(col), usize::from(self.cols));
-        let n = usize::from(n).min(cols - col);
+        if !self.margins.contains(col) {
+            return;
+        }
+        self.pending_wrap = false;
+        let (col, end) = (usize::from(col), usize::from(self.margins.right) + 1);
+        let n = usize::from(n).min(end - col);
         if n == 0 {
             return;
         }
         self.damage.touch_cursor_row();
-        self.lines[usize::from(row)].delete_cells(col, n, self.pen);
+        self.lines[usize::from(row)].insert_blanks(col, n, end, self.pen);
+    }
+
+    /// Deletes `n` cells at the cursor, shifting the cells up to the right
+    /// margin left and filling with blanks at the margin; cells beyond the
+    /// margin do not move (DCH). A wide character split by either end of
+    /// the deleted range, or cut by the margin, is blanked whole. A no-op,
+    /// which leaves a pending wrap armed, when the cursor is outside the
+    /// left and right margins (xterm `DeleteChar`).
+    pub fn delete_chars(&mut self, n: u16) {
+        let Point { row, col } = self.cursor;
+        if !self.margins.contains(col) {
+            return;
+        }
+        self.pending_wrap = false;
+        let (col, end) = (usize::from(col), usize::from(self.margins.right) + 1);
+        let n = usize::from(n).min(end - col);
+        if n == 0 {
+            return;
+        }
+        self.damage.touch_cursor_row();
+        self.lines[usize::from(row)].delete_cells(col, n, end, self.pen);
+    }
+
+    /// Inserts `n` blank columns at the cursor column in every row of the
+    /// scroll region, shifting the cells up to the right margin right and
+    /// losing those pushed past it (DECIC). A no-op when the cursor is
+    /// outside the region or outside the left and right margins. The
+    /// cursor and a pending wrap stay (xterm `xtermColScroll`).
+    pub fn insert_columns(&mut self, n: u16) {
+        self.scroll_columns(self.cursor.col, n, false);
+    }
+
+    /// Deletes `n` columns at the cursor column in every row of the scroll
+    /// region, shifting the cells up to the right margin left and filling
+    /// with blanks at the margin (DECDC). A no-op when the cursor is
+    /// outside the region or outside the left and right margins. The
+    /// cursor and a pending wrap stay.
+    pub fn delete_columns(&mut self, n: u16) {
+        self.scroll_columns(self.cursor.col, n, true);
+    }
+
+    /// Back index (DECBI, `ESC 6`): with the cursor on the left margin (and
+    /// between the margins) the region's columns from there to the right
+    /// margin move right one column and a blank column enters at the left
+    /// margin; anywhere else the cursor moves left one column, as
+    /// [`Grid::cursor_back`] with `wrap` does (xterm `xtermColIndex`).
+    pub fn back_index(&mut self, wrap: ReverseWrap) {
+        let col = self.cursor.col;
+        if self.margins.contains(col) && col == self.margins.left {
+            self.scroll_columns(col, 1, false);
+        } else {
+            self.cursor_back(1, wrap);
+        }
+    }
+
+    /// Forward index (DECFI, `ESC 9`): with the cursor on the right margin
+    /// the region's columns between the margins move left one column and a
+    /// blank column enters at the right margin; anywhere else the cursor
+    /// moves right one column, as [`Grid::cursor_right`] does.
+    pub fn forward_index(&mut self) {
+        let col = self.cursor.col;
+        if self.margins.contains(col) && col == self.margins.right {
+            self.scroll_columns(self.margins.left, 1, true);
+        } else {
+            self.cursor_right(1);
+        }
+    }
+
+    /// Inserts (`delete` false) or deletes `n` columns at column `at` in
+    /// every row of the scroll region, between `at` and the right margin,
+    /// when the cursor is in the region and between the left and right
+    /// margins (xterm `xtermColScroll`).
+    fn scroll_columns(&mut self, at: u16, n: u16, delete: bool) {
+        let Point { row, col } = self.cursor;
+        if !self.region.contains(row) || !self.margins.contains(col) {
+            return;
+        }
+        let (at, end) = (usize::from(at), usize::from(self.margins.right) + 1);
+        let n = usize::from(n).min(end - at);
+        if n == 0 {
+            return;
+        }
+        let ScrollRegion { top, bottom } = self.region;
+        self.extend_region(top, bottom);
+        let pen = self.pen;
+        for line in &mut self.lines[usize::from(top)..=usize::from(bottom)] {
+            if delete {
+                line.delete_cells(at, n, end, pen);
+            } else {
+                line.insert_blanks(at, n, end, pen);
+            }
+        }
     }
 
     /// Blanks `n` cells starting at the cursor without shifting (ECH). A
@@ -1549,7 +2107,8 @@ impl Grid {
     }
 
     /// Returns the grid to its initial state (RIS): primary screen, blank,
-    /// home cursor, default pen, full scroll region, origin mode off, default
+    /// home cursor, default pen, full scroll region and margins, origin
+    /// mode off, default
     /// tab stops, both saved-cursor slots at their initial state and
     /// [`Grid::scrolled_since_clear`] cleared. The alternate screen is left
     /// and the stashed primary contents are discarded. Scrollback and its
@@ -1595,6 +2154,7 @@ impl Grid {
         self.pending_wrap = false;
         self.pen = Style::DEFAULT;
         self.reset_scroll_region();
+        self.reset_margins();
         self.origin = false;
         self.saved = SavedCursor::INITIAL;
         // The alternate screen's slot too: a fresh grid has never saved
@@ -1654,9 +2214,9 @@ impl Grid {
     /// Checked: at least one row and column; the active screen, the stashed
     /// primary screen (while the alternate one is active) and every
     /// scrollback line have `rows` lines of `cols` cells; the cursor is on
-    /// the screen and a pending wrap sits on the last column, for the live
-    /// cursor, the stashed primary one and the active screen's DECSC slot
-    /// (and the stashed primary's); a [`CellFlags::WIDE`] cell is followed
+    /// the screen, for the live cursor, the stashed primary one and the
+    /// active screen's DECSC slot (and the stashed primary's); a
+    /// [`CellFlags::WIDE`] cell is followed
     /// by its [`CellFlags::SPACER`] in the same row with the same style and
     /// a spacer is a bare `' '` after a wide cell; [`CellFlags::CLUSTER`]
     /// cells and the line's grapheme table agree, with 2 to 32 scalars
@@ -1664,7 +2224,14 @@ impl Grid {
     /// bare last-column blank; the scroll region satisfies
     /// `top <= bottom < rows` and has at least two rows unless it is the
     /// full screen (DECSTBM), which is also what origin mode counts from;
-    /// the scrollback is within its cap; the tab stops cover `cols`.
+    /// the left and right margins satisfy `left < right < cols` unless they
+    /// are the full width (DECSLRM); the scrollback is within its cap; the
+    /// tab stops cover `cols`.
+    ///
+    /// A pending wrap may sit on any column: it is armed on the right
+    /// margin, and the margins can move (DECRST 69, a resize) while it
+    /// stays armed, as in xterm, where the next character wraps from
+    /// wherever the cursor is.
     ///
     /// Not checked: the alternate screen's DECSC slot while the primary
     /// screen is active, which [`Grid::resize`] leaves alone and
@@ -1698,41 +2265,19 @@ impl Grid {
         }
         let (rows, cols) = (self.rows, self.cols);
         screen_errors("screen", &self.lines, rows, cols, &mut errors);
-        cursor_errors(
-            "cursor",
-            self.cursor,
-            self.pending_wrap,
-            rows,
-            cols,
-            &mut errors,
-        );
+        cursor_errors("cursor", self.cursor, rows, cols, &mut errors);
         let saved = self.saved;
-        cursor_errors(
-            "saved cursor",
-            saved.cursor,
-            saved.pending_wrap,
-            rows,
-            cols,
-            &mut errors,
-        );
+        cursor_errors("saved cursor", saved.cursor, rows, cols, &mut errors);
         if self.tabs.cols() != cols {
             errors.push(format!("tab stops cover {} columns", self.tabs.cols()));
         }
         if let Some(primary) = self.primary.as_deref() {
             screen_errors("primary", &primary.lines, rows, cols, &mut errors);
-            cursor_errors(
-                "primary cursor",
-                primary.cursor,
-                primary.pending_wrap,
-                rows,
-                cols,
-                &mut errors,
-            );
+            cursor_errors("primary cursor", primary.cursor, rows, cols, &mut errors);
             let saved = primary.saved;
             cursor_errors(
                 "primary saved cursor",
                 saved.cursor,
-                saved.pending_wrap,
                 rows,
                 cols,
                 &mut errors,
@@ -1748,6 +2293,11 @@ impl Grid {
         let full = top == 0 && bottom == rows - 1;
         if top > bottom || bottom >= rows || (top == bottom && !full) {
             errors.push(format!("scroll region {top}..={bottom} with {rows} rows"));
+        }
+        let Margins { left, right } = self.margins;
+        let full = left == 0 && right == cols - 1;
+        if right >= cols || (left >= right && !full) {
+            errors.push(format!("margins {left}..={right} with {cols} columns"));
         }
         if self.scrollback.len() > self.scrollback.cap() {
             errors.push(format!(
@@ -1793,21 +2343,10 @@ fn screen_errors(at: &str, lines: &[Line], rows: u16, cols: u16, errors: &mut Ve
     }
 }
 
-/// [`Grid::check_invariants`] for a cursor position and its pending wrap.
-fn cursor_errors(
-    at: &str,
-    cursor: Point,
-    pending_wrap: bool,
-    rows: u16,
-    cols: u16,
-    errors: &mut Vec<String>,
-) {
+/// [`Grid::check_invariants`] for a cursor position.
+fn cursor_errors(at: &str, cursor: Point, rows: u16, cols: u16, errors: &mut Vec<String>) {
     if cursor.row >= rows || cursor.col >= cols {
         errors.push(format!("{at} {cursor:?} off a {rows}x{cols} screen"));
-    } else if pending_wrap && cursor.col != cols - 1 {
-        errors.push(format!(
-            "{at}: pending wrap off the last column at {cursor:?}"
-        ));
     }
 }
 
@@ -2031,6 +2570,26 @@ fn cluster_cannot_take(text: &str, ch: char) -> bool {
             .chars()
             .next_back()
             .is_some_and(|last| is_simple(last) || is_combining_diacritic(last))
+}
+
+/// Copies the cells of columns `span` of line `src` over those of line
+/// `dst` (two different lines), with their cluster text. Wrap flags and
+/// marks are not copied.
+fn copy_span(lines: &mut [Line], src: usize, dst: usize, span: std::ops::Range<usize>) {
+    let (from, to) = if src < dst {
+        let (head, tail) = lines.split_at_mut(dst);
+        (&head[src], &mut tail[0])
+    } else {
+        let (head, tail) = lines.split_at_mut(src);
+        (&tail[0], &mut head[dst])
+    };
+    to.cells[span.clone()].copy_from_slice(&from.cells[span.clone()]);
+    to.graphemes.remove_range(span.clone());
+    for (col, text) in from.graphemes.iter() {
+        if span.contains(&col) {
+            to.graphemes.set(col, text.into());
+        }
+    }
 }
 
 /// Turns a line that left the screen into a blank line of `cols` cells
@@ -2876,7 +3435,7 @@ mod tests {
             ResetOp::DeleteChars(n) => grid.delete_chars(n),
             ResetOp::EraseLine(m) => grid.erase_in_line(erase_line[usize::from(m)]),
             ResetOp::EraseDisplay(m) => grid.erase_in_display(erase_display[usize::from(m)]),
-            ResetOp::PadLastColumn => grid.pad_last_column(),
+            ResetOp::PadLastColumn => grid.pad_line_end(),
             ResetOp::EnterAlt => grid.enter_alt_screen(),
             ResetOp::LeaveAlt => grid.leave_alt_screen(),
             ResetOp::LeaveAltInPlace => grid.leave_alt_screen_in_place(),
@@ -3235,6 +3794,256 @@ mod tests {
         assert_eq!(text(&grid), vec!["b", "c", "d"], "the primary screen too");
     }
 
+    mod rect_scroll {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// The rotation fast path of a one-row margin scroll leaves exactly
+            /// what the reference copy does: cells, wide pairs, wrap flags and
+            /// marks, for any margins (the inside wider than the outside)
+            /// and region.
+            /// The dispatcher (which picks the rotation for one row when
+            /// the inside is wider and no row holds cluster text) leaves
+            /// what the copy does, clusters included.
+            #[test]
+            fn rect_scroll_matches_the_copy_with_clusters(
+                text in prop::collection::vec(
+                    prop::sample::select(vec!['a', ' ', '中', 'e', '\u{301}', '😀', '\u{fe0f}']),
+                    0..120,
+                ),
+                (left, right) in (0u16..9).prop_flat_map(|l| (Just(l), l + 1..10)),
+                (top, bottom) in (0usize..6).prop_flat_map(|t| (Just(t), t..6)),
+                up in any::<bool>(),
+            ) {
+                let mut grid = Grid::new(6, 10);
+                for ch in text {
+                    grid.put_char(ch);
+                }
+                grid.set_margins(left, right);
+                let span = usize::from(grid.margins.left)..usize::from(grid.margins.right) + 1;
+                let mut copied = grid.clone();
+                grid.scroll_rect(top, bottom, 1, up);
+                for line in &mut copied.lines[top..=bottom] {
+                    line.split_wide_at_edges(span.clone(), Style::DEFAULT);
+                }
+                copied.scroll_rect_by_copy(top, bottom, 1, up, span);
+                prop_assert_eq!(&grid.lines, &copied.lines);
+                grid.check_invariants();
+            }
+
+            #[test]
+            fn rect_scroll_by_rotation_matches_the_copy(
+                text in prop::collection::vec(
+                    prop::sample::select(vec!['a', 'b', ' ', '中', '😀']),
+                    0..120,
+                ),
+                wrapped in prop::collection::vec(any::<bool>(), 6),
+                marked in prop::collection::vec(any::<bool>(), 6),
+                (left, right) in (0u16..9).prop_flat_map(|l| (Just(l), l + 1..10)),
+                (top, bottom) in (0usize..6).prop_flat_map(|t| (Just(t), t..6)),
+                up in any::<bool>(),
+            ) {
+                let mut grid = Grid::new(6, 10);
+                for ch in text {
+                    grid.put_char(ch);
+                }
+                for row in 0..6 {
+                    grid.lines[row].wrapped = wrapped[row];
+                    if marked[row] {
+                        grid.lines[row].set_mark(Mark::PromptStart);
+                    }
+                }
+                grid.set_margins(left, right);
+                let span = usize::from(grid.margins.left)..usize::from(grid.margins.right) + 1;
+                // The rotation path's preconditions: the inside wider than
+                // the outside, no cluster text (else the copy runs).
+                prop_assume!(10 - span.len() < span.len());
+                for line in &mut grid.lines {
+                    line.split_wide_at_edges(span.clone(), Style::DEFAULT);
+                }
+                let mut copied = grid.clone();
+                grid.scroll_rect_by_rotation(top, bottom, up, span.clone());
+                copied.scroll_rect_by_copy(top, bottom, 1, up, span);
+                prop_assert_eq!(&grid.lines, &copied.lines);
+                grid.check_invariants();
+            }
+        }
+    }
+
+    mod cursor_back {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// xterm's `CursorBack` step by step: the reference for
+        /// [`Grid::cursor_back`]'s skips.
+        fn cursor_back_reference(grid: &mut Grid, n: u16, wrap: ReverseWrap) {
+            let start = grid.cursor;
+            let (any, wrapped_only) = match wrap {
+                ReverseWrap::Off => (false, false),
+                ReverseWrap::WrappedLines => (false, true),
+                ReverseWrap::AllLines => (true, false),
+            };
+            let reverse = any || wrapped_only;
+            // Signed, as in xterm: the walk steps one past the left margin.
+            let right = i32::from(grid.margins.right);
+            let (top, bottom) = (i32::from(grid.region.top), i32::from(grid.region.bottom));
+            // A cursor already left of the left margin may go to column zero.
+            let left = if start.col < grid.margins.left {
+                0
+            } else {
+                i32::from(grid.margins.left)
+            };
+            let (mut row, mut col) = (i32::from(start.row), i32::from(start.col));
+            let mut count = i32::from(n);
+            if count > 0 {
+                if reverse && grid.pending_wrap {
+                    count -= 1;
+                } else {
+                    col -= 1;
+                }
+            }
+            // Whether the line `row` was looked at since the last wrap.
+            let mut checked = false;
+            loop {
+                if col < left {
+                    if any {
+                        col = right;
+                        if row == top {
+                            row = bottom + 1;
+                        }
+                    } else if !reverse {
+                        col = left;
+                        break;
+                    }
+                    checked = false;
+                    row -= 1;
+                    if row < 0 {
+                        // xterm would read the newest scrollback line here.
+                        row = 0;
+                        col = left;
+                        break;
+                    }
+                }
+                if !checked {
+                    checked = true;
+                    if row != i32::from(start.row) {
+                        let into = usize::try_from(row).ok().and_then(|r| grid.lines.get(r));
+                        if !any && !into.is_some_and(|line| line.wrapped) {
+                            if row < bottom {
+                                row += 1;
+                            }
+                            col = left;
+                            break;
+                        }
+                        col = right;
+                    }
+                }
+                count -= 1;
+                if count <= 0 {
+                    break;
+                }
+                col -= 1;
+            }
+            grid.pending_wrap = false;
+            // Both stay on the screen: `row` within 0..=bottom + 1 - 1 and
+            // `col` within 0..=right.
+            let row = u16::try_from(row).unwrap_or(0).min(grid.rows - 1);
+            let col = u16::try_from(col).unwrap_or(0).min(grid.cols - 1);
+            grid.move_cursor(Point { row, col });
+        }
+
+        fn reverse_wrap() -> impl Strategy<Value = ReverseWrap> {
+            prop_oneof![
+                Just(ReverseWrap::Off),
+                Just(ReverseWrap::WrappedLines),
+                Just(ReverseWrap::AllLines),
+            ]
+        }
+
+        proptest! {
+            /// The skips land where the step-by-step walk does, for any
+            /// count, margins, region, wrap flags and start, a pending wrap
+            /// included.
+            #[test]
+            fn skips_match_the_step_by_step_walk(
+                (rows, cols) in (1u16..8, 2u16..12),
+                wrapped in prop::collection::vec(any::<bool>(), 8),
+                margins in (0u16..12, 0u16..12),
+                region in (0u16..8, 0u16..8),
+                start in (0u16..8, 0u16..12),
+                pending in any::<bool>(),
+                n in prop_oneof![0u16..40, Just(u16::MAX), any::<u16>()],
+                wrap in reverse_wrap(),
+            ) {
+                let mut grid = Grid::new(rows, cols);
+                for (line, &flag) in grid.lines.iter_mut().zip(&wrapped) {
+                    line.wrapped = flag;
+                }
+                grid.set_margins(margins.0, margins.1);
+                grid.set_scroll_region(region.0, region.1);
+                grid.goto(start.0, start.1);
+                grid.pending_wrap = pending;
+                let mut reference = grid.clone();
+                grid.cursor_back(n, wrap);
+                cursor_back_reference(&mut reference, n, wrap);
+                prop_assert_eq!(grid.cursor(), reference.cursor());
+                prop_assert_eq!(grid.pending_wrap(), reference.pending_wrap());
+            }
+        }
+    }
+
+    #[test]
+    fn set_margins_clamps_and_rejects_degenerate() {
+        let mut grid = Grid::new(3, 10);
+        grid.set_margins(2, 5);
+        assert_eq!(grid.margins(), Margins { left: 2, right: 5 });
+        grid.set_margins(3, 99);
+        assert_eq!(grid.margins(), Margins { left: 3, right: 9 });
+        grid.set_margins(4, 4);
+        assert_eq!(grid.margins(), Margins { left: 0, right: 9 }, "one column");
+        grid.set_margins(2, 5);
+        grid.resize(3, 12);
+        assert_eq!(grid.margins(), Margins { left: 0, right: 11 }, "resize");
+        grid.set_margins(2, 5);
+        grid.reset();
+        assert_eq!(grid.margins(), Margins { left: 0, right: 11 }, "reset");
+        assert_eq!(Margins { left: 2, right: 5 }.width(), 4);
+    }
+
+    #[test]
+    fn rect_scroll_moves_clusters_and_keeps_wrap_flags() {
+        let mut grid = filled(3, 6);
+        grid.goto(1, 2);
+        grid.put_char('e');
+        grid.put_char('\u{301}');
+        grid.lines[1].wrapped = true;
+        grid.set_margins(1, 4);
+        grid.scroll_up(1);
+        assert_eq!(grid.lines[0].cluster(2), Some("e\u{301}"), "moved up");
+        assert_eq!(grid.lines[1].cluster(2), None, "left behind");
+        assert!(grid.lines[1].wrapped, "the flag stays with its row");
+        assert_eq!(text(&grid), ["01e\u{301}110", "122221", "2    2"]);
+        grid.check_invariants();
+    }
+
+    #[test]
+    fn wide_characters_cut_by_a_margin_are_blanked_whole() {
+        let mut grid = Grid::new(2, 6);
+        grid.goto(0, 0);
+        grid.put_str("a中b中");
+        // 中 at columns 1-2 and 4-5: margins 2..=4 cut both.
+        grid.set_margins(2, 4);
+        grid.goto(1, 2);
+        grid.scroll_down(1);
+        assert_eq!(
+            text(&grid),
+            ["a", "   b"],
+            "both halves of each 中 blanked, b moved"
+        );
+        grid.check_invariants();
+    }
+
     #[test]
     fn scroll_region_helpers() {
         let region = ScrollRegion { top: 2, bottom: 4 };
@@ -3294,14 +4103,8 @@ mod tests {
         ("cursor Point { row: 1, col: 4 } off a 3x4 screen", |g| {
             g.cursor = Point::new(1, 4);
         }),
-        ("cursor: pending wrap off the last column", |g| {
-            g.pending_wrap = true;
-        }),
         ("saved cursor Point { row: 0, col: 9 } off", |g| {
             g.saved.cursor = Point::new(0, 9);
-        }),
-        ("saved cursor: pending wrap off the last column", |g| {
-            g.saved.pending_wrap = true;
         }),
         ("tab stops cover 2 columns", |g| g.tabs = TabStops::new(2)),
         ("screen row 0 col 1: WIDE without a spacer", |g| {
@@ -3362,6 +4165,15 @@ mod tests {
         ("scroll region 0..=3 with 3 rows", |g| {
             g.region = ScrollRegion { top: 0, bottom: 3 };
         }),
+        ("margins 2..=2 with 4 columns", |g| {
+            g.margins = Margins { left: 2, right: 2 };
+        }),
+        ("margins 3..=1 with 4 columns", |g| {
+            g.margins = Margins { left: 3, right: 1 };
+        }),
+        ("margins 0..=4 with 4 columns", |g| {
+            g.margins = Margins { left: 0, right: 4 };
+        }),
         ("scrollback 0: 3 cells, 4 columns", |g| {
             g.lines[0].cells.pop();
             g.goto(2, 0);
@@ -3379,21 +4191,10 @@ mod tests {
             g.enter_alt_screen();
             g.primary.as_mut().unwrap().cursor = Point::new(7, 0);
         }),
-        ("primary cursor: pending wrap off the last column", |g| {
-            g.enter_alt_screen();
-            g.primary.as_mut().unwrap().pending_wrap = true;
-        }),
         ("primary saved cursor Point { row: 0, col: 8 } off", |g| {
             g.enter_alt_screen();
             g.primary.as_mut().unwrap().saved.cursor = Point::new(0, 8);
         }),
-        (
-            "primary saved cursor: pending wrap off the last column",
-            |g| {
-                g.enter_alt_screen();
-                g.primary.as_mut().unwrap().saved.pending_wrap = true;
-            },
-        ),
         ("primary tab stops cover 9 columns", |g| {
             g.enter_alt_screen();
             g.primary.as_mut().unwrap().tabs = TabStops::new(9);

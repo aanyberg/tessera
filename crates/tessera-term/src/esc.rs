@@ -12,7 +12,9 @@
 //! | `ESC =` | DECKPAM | application keypad |
 //! | `ESC >` | DECKPNM | numeric keypad |
 //! | `ESC c` | RIS | full reset, scrollback and modes included |
-//! | `ESC # 8` | DECALN | fill the screen with `E` |
+//! | `ESC # 8` | DECALN | reset the margins, fill the screen with `E` |
+//! | `ESC 6` | DECBI | back index: at the left margin the region's columns move right, else the cursor moves left (level 4 and up) |
+//! | `ESC 9` | DECFI | forward index: at the right margin the region's columns move left, else the cursor moves right (level 4 and up) |
 //! | `ESC Z` | DECID | identify: the DA1 reply (see the `reports` module) |
 //!
 //! Any other escape sequence is ignored and logged at trace level. Expected
@@ -35,9 +37,12 @@ impl State {
             ([], b'7') => self.grid.save_cursor(),
             ([], b'8') => self.grid.restore_cursor(),
             ([], b'D') => self.grid.line_feed(),
+            // Index first, then the carriage return (xterm `CASE_NEL`): the
+            // index scrolls only for a cursor between the left and right
+            // margins, so the order matters there.
             ([], b'E') => {
-                self.grid.carriage_return();
                 self.grid.line_feed();
+                self.grid.carriage_return();
             }
             ([], b'H') => self.grid.set_tab_stop(),
             ([], b'M') => self.grid.reverse_index(),
@@ -45,6 +50,12 @@ impl State {
             ([], b'=') => self.set_application_keypad(true),
             ([], b'>') => self.set_application_keypad(false),
             ([b'#'], b'8') => self.screen_alignment(),
+            // DECBI and DECFI, VT420 and up (xterm `CASE_DECBI`/`DECFI`).
+            ([], b'6') if self.conformance_level >= 4 => {
+                let wrap = self.reverse_wrap();
+                self.grid.back_index(wrap);
+            }
+            ([], b'9') if self.conformance_level >= 4 => self.grid.forward_index(),
             // DECID: answered exactly like DA1 (xterm).
             ([], b'Z') => self.primary_device_attributes(),
             _ => trace!(?intermediates, byte = ?char::from(byte), "ESC ignored"),
@@ -69,7 +80,8 @@ impl State {
         self.c1_8bit_replies = false;
     }
 
-    /// DECALN: resets the scroll region, fills every cell with an `E` in
+    /// DECALN: resets the scroll region and the left and right margins
+    /// (xterm `resetMargins`; DECLRMM itself stays), fills every cell with an `E` in
     /// the default style (the pen is switched to the default for the fill
     /// and then restored) and homes the cursor.
     ///
@@ -82,6 +94,7 @@ impl State {
         let pen = grid.pen();
         grid.set_pen(Style::DEFAULT);
         grid.reset_scroll_region();
+        grid.reset_margins();
         for row in 0..grid.rows() {
             grid.goto(row, 0);
             for _ in 0..grid.cols() {

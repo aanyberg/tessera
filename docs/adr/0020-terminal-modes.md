@@ -121,8 +121,8 @@ freeze the screen after `reset`. DECSCL (`CSI 61..65 ; Pc " p`, #92) runs
 the DECSTR reset before it sets the conformance level; RIS turns 8-bit C1
 replies off and keeps the level, as xterm does.
 
-**Unknown modes** (DECANM 2, DECSCLM ?4, KAM 2, SRM 12, ?45 and ?69 until
-#97, 1001, …) are ignored and logged at trace level; one sequence may set
+**Unknown modes** (DECANM 2, DECSCLM ?4, KAM 2, SRM 12, 1001, …) are
+ignored and logged at trace level; one sequence may set
 several modes, and an unknown one among them does not stop the rest. A
 mode or kitty keyboard sequence with a colon sub-parameter
 (`CSI ? 25:1049 h`, `CSI 4:20 h`, `CSI > 1:2 u`) is ignored as a whole, as
@@ -263,6 +263,6 @@ whatever its shape.
 - `Snapshot::capture` takes the `Terminal` rather than its `Grid`, and a
   DECTCEM change damages the cursor's row so the next frame redraws.
 - Later issues add their modes to `Modes` (it is `#[non_exhaustive]`):
-  DECLRMM and reverse wrap (#97). DECRQM (ADR 0024) reads `Modes` and
+  DECLRMM and reverse wrap arrived with #97 (ADR 0028). DECRQM (ADR 0024) reads `Modes` and
   answers 0 for a mode Tessera does not know, so each new mode also gets
   its DECRQM answer.

@@ -8,7 +8,9 @@
 //! `Grid::take_damage` and a `&Grid` reader using `Grid::damage_since`.
 
 use proptest::prelude::*;
-use tessera_grid::{Color, DamageRows, EraseDisplay, EraseLine, Grid, Line, Point, Style};
+use tessera_grid::{
+    Color, DamageRows, EraseDisplay, EraseLine, Grid, Line, Point, ReverseWrap, Style,
+};
 
 #[derive(Debug, Clone)]
 enum Op {
@@ -34,6 +36,14 @@ enum Op {
     DeleteLines(u16),
     InsertChars(u16),
     DeleteChars(u16),
+    SetMargins(u16, u16),
+    ResetMargins,
+    Back(u16, ReverseWrap),
+    InsertColumns(u16),
+    DeleteColumns(u16),
+    BackIndex(ReverseWrap),
+    ForwardIndex,
+    WrapLine,
     EraseChars(u16),
     EraseLine(EraseLine),
     EraseDisplay(EraseDisplay),
@@ -71,6 +81,15 @@ fn ch() -> impl Strategy<Value = char> {
     ]
 }
 
+/// The three reverse wraparound kinds (#97).
+fn reverse_wrap() -> impl Strategy<Value = ReverseWrap> {
+    prop_oneof![
+        Just(ReverseWrap::Off),
+        Just(ReverseWrap::WrappedLines),
+        Just(ReverseWrap::AllLines),
+    ]
+}
+
 fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
         3 => edit(),
@@ -104,6 +123,14 @@ fn edit() -> impl Strategy<Value = Op> {
         2 => count().prop_map(Op::DeleteLines),
         2 => count().prop_map(Op::InsertChars),
         2 => count().prop_map(Op::DeleteChars),
+        2 => (count(), count()).prop_map(|(l, r)| Op::SetMargins(l, r)),
+        1 => Just(Op::ResetMargins),
+        2 => (count(), reverse_wrap()).prop_map(|(n, w)| Op::Back(n, w)),
+        1 => count().prop_map(Op::InsertColumns),
+        1 => count().prop_map(Op::DeleteColumns),
+        1 => reverse_wrap().prop_map(Op::BackIndex),
+        1 => Just(Op::ForwardIndex),
+        1 => Just(Op::WrapLine),
         2 => count().prop_map(Op::EraseChars),
         2 => prop_oneof![
             Just(EraseLine::ToEnd),
@@ -152,6 +179,14 @@ fn apply(grid: &mut Grid, op: &Op) {
         Op::DeleteLines(n) => grid.delete_lines(n),
         Op::InsertChars(n) => grid.insert_chars(n),
         Op::DeleteChars(n) => grid.delete_chars(n),
+        Op::SetMargins(l, r) => grid.set_margins(l, r),
+        Op::ResetMargins => grid.reset_margins(),
+        Op::Back(n, wrap) => grid.cursor_back(n, wrap),
+        Op::InsertColumns(n) => grid.insert_columns(n),
+        Op::DeleteColumns(n) => grid.delete_columns(n),
+        Op::BackIndex(wrap) => grid.back_index(wrap),
+        Op::ForwardIndex => grid.forward_index(),
+        Op::WrapLine => grid.wrap_line(),
         Op::EraseChars(n) => grid.erase_chars(n),
         Op::EraseLine(mode) => grid.erase_in_line(mode),
         Op::EraseDisplay(mode) => grid.erase_in_display(mode),
@@ -159,7 +194,7 @@ fn apply(grid: &mut Grid, op: &Op) {
             bg: Color::Indexed(i % 4),
             ..Style::DEFAULT
         }),
-        Op::PadLastColumn => grid.pad_last_column(),
+        Op::PadLastColumn => grid.pad_line_end(),
         Op::EnterAlt => grid.enter_alt_screen(),
         Op::LeaveAlt => grid.leave_alt_screen(),
         Op::Resize(r, c) => grid.resize(r, c),

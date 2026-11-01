@@ -30,6 +30,10 @@
 #     #93/#94 made those 7 pass: they are live here as E_HPR_*, E_VPR_* and E_SCORC_saveRestoreCursor_basic, joined by
 #     E_SCORC_saveRestoreCursor_{moveToHomeWhenNotSaved,reset} (the DECRC rows with ESC[s / ESC[u); 135 cases now.
 #     #8 (modes) lifted E_{DECRC,SCORC}_saveRestoreCursor_{altVsMain,wrap,insertNotAffected}: 141 cases.
+#     #97 (left/right margins, reverse wrap) lifted the 57 tests its `#>` blocks named, transcribed by running each
+#     esctest2 test function against Tessera through a shim of esccmd/escio/escutil (CPR for the cursor, the screen for
+#     DECRQCRA): every esctest assertion held at its point in the stream; the screens are Tessera's, so only the
+#     asserted cells and cursor are xterm's word. 198 cases.
 #
 # HOW esctest ASSERTIONS MAP TO THE FIXTURE
 #   esctest reads the cursor with DSR 6 (needs #10) and the screen with DECRQCRA checksums; tessera tests read the grid. So:
@@ -260,9 +264,43 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_CUP_respectsOriginMode -> #97 (DECOM is live since #8)   (esctest cup.py test_CUP_RespectsOriginMode, vtLevel 4)
-#>    needs: DECSET 6 (DECOM) plus DECLRMM (DECSET 69) and DECSLRM (#97)
-#>    bytes: ESC[6;11r ESC[?69h ESC[5;10s ESC[9;7H ESC[?6h ESC[1;1H X ESC[?6l ESC[r ESC[?69l ; expect X at row 6 col 5
+### E_CUP_respectsOriginMode
+size: 25x80
+step: feed \x1b[6;11r\x1b[?69h\x1b[5;10s\x1b[9;7H\x1b[?6h\x1b[1;1HX\x1b[?6l\x1b[r\x1b[?69l
+source: esctest2 esctest/tests/cup.py test_CUP_RespectsOriginMode (CUPTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cup.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+> |
+>
+>
+>
+>
+>    X
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
 
 # ---------------------------------------------------------------------------- CUU (cuu.py)
 
@@ -781,8 +819,81 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_CUF_stopsAtRightEdgeWhenBegunRightOfScrollRegion, E_CUF_stopsAtRightMarginInScrollRegion -> #97
-#>    (cuf.py, vtLevel 4) need DECLRMM (DECSET 69) + DECSLRM 5;10
+### E_CUF_stopsAtRightEdgeWhenBegunRightOfScrollRegion
+size: 25x80
+step: feed \x1b[?69h\x1b[5;10s\x1b[3;12H\x1b[80C
+source: esctest2 esctest/tests/cuf.py test_CUF_StopsAtRightEdgeWhenBegunRightOfScrollRegion (CUFTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cuf.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>
+>
+>                                                                                |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (2,79)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CUF_stopsAtRightMarginInScrollRegion
+size: 25x80
+step: feed \x1b[?69h\x1b[5;10s\x1b[3;7H\x1b[80C
+source: esctest2 esctest/tests/cuf.py test_CUF_StopsAtRightMarginInScrollRegion (CUFTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cuf.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>
+>
+>          |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (2,9)
+pending_wrap: false
+requests: []
+scrollback: len=0
 
 # ---------------------------------------------------------------------------- CUB (cub.py)
 
@@ -903,10 +1014,157 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_CUB_stopsAtLeftEdgeWhenBegunLeftOfScrollRegion, E_CUB_stopsAtLeftMarginInScrollRegion -> #97 (DECLRMM + DECSLRM)
-#> E_CUB_afterNoWrappedInlines, E_CUB_afterOneWrappedInline -> #97 (cub.py; DECSET 45 XTREVWRAP, plus DECSET 7 from #8;
-#>    expected values depend on xterm's reverse-wrap patch level: escargs.xterm_reverse_wrap >= 383 -> (1,4)/(1,6), else (5,3)/(9,3);
-#>    tessera follows >= 383 (lead decision, wave 5): cursor (1,4) and (1,6))
+### E_CUB_stopsAtLeftEdgeWhenBegunLeftOfScrollRegion
+size: 25x80
+step: feed \x1b[?69h\x1b[5;10s\x1b[3;4H\x1b[99D
+source: esctest2 esctest/tests/cub.py test_CUB_StopsAtLeftEdgeWhenBegunLeftOfScrollRegion (CUBTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cub.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>
+>
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (2,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CUB_stopsAtLeftMarginInScrollRegion
+size: 25x80
+step: feed \x1b[?69h\x1b[5;10s\x1b[3;7H\x1b[99D
+source: esctest2 esctest/tests/cub.py test_CUB_StopsAtLeftMarginInScrollRegion (CUBTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cub.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>
+>
+>     |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (2,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CUB_afterNoWrappedInlines
+size: 25x80
+step: feed \x1b[?7h\x1b[?45h\x1b[3;1H******************************************************************************\n******************************************************************************\n\x1b[5;5H\x1b[160D
+source: esctest2 esctest/tests/cub.py test_CUB_AfterNoWrappedInlines (CUBTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cub.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>
+>
+>******************************************************************************
+> |                                                                             **\
+>****************************************************************************
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (3,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CUB_afterOneWrappedInline
+size: 25x80
+step: feed \x1b[?7h\x1b[?45h\x1b[3;1H********************************************************************************************************************************************************************\n********************************************************************************************************************************************************************\x1b[400D
+source: esctest2 esctest/tests/cub.py test_CUB_AfterOneWrappedInline (CUBTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cub.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>
+>
+>********************************************************************************\
+>********************************************************************************\
+>****
+> |   ****************************************************************************\
+>********************************************************************************\
+>********
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (5,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
 
 # ---------------------------------------------------------------------------- CHA (cha.py)
 
@@ -1066,7 +1324,81 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_CHA_ignoresScrollRegion, E_CHA_respectsOriginMode -> #97 (cha.py, vtLevel 4): DECLRMM/DECSLRM (+ DECOM from #8 for the second)
+### E_CHA_ignoresScrollRegion
+size: 25x80
+step: feed \x1b[?69h\x1b[5;10s\x1b[3;5H\x1b[1G
+source: esctest2 esctest/tests/cha.py test_CHA_IgnoresScrollRegion (CHATests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cha.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>
+>
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (2,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CHA_respectsOriginMode
+size: 25x80
+step: feed \x1b[6;11r\x1b[?69h\x1b[5;10s\x1b[9;7H\x1b[?6h\x1b[1;2H\x1b[1GX\x1b[?6l\x1b[r\x1b[?69l
+source: esctest2 esctest/tests/cha.py test_CHA_RespectsOriginMode (CHATests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cha.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+> |
+>
+>
+>
+>
+>    X
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
 
 # ---------------------------------------------------------------------------- CNL (cnl.py)
 
@@ -1187,8 +1519,81 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_CNL_stopsAtBottomLineWhenBegunBelowScrollRegion, E_CNL_stopsAtBottomMarginInScrollRegion -> #97 (cnl.py, vtLevel 4): both set DECLRMM + DECSLRM 5;10 and
-#>    expect column 5 (the left margin), not column 1. Without left/right margins the row logic is covered by E_CUD_* and E_CNL_stopsAtBottomLine.
+### E_CNL_stopsAtBottomLineWhenBegunBelowScrollRegion
+size: 25x80
+step: feed \x1b[4;5r\x1b[?69h\x1b[5;10s\x1b[6;7H\x1b[25E
+source: esctest2 esctest/tests/cnl.py test_CNL_StopsAtBottomLineWhenBegunBelowScrollRegion (CNLTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cnl.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>     |
+cursor: (24,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CNL_stopsAtBottomMarginInScrollRegion
+size: 25x80
+step: feed \x1b[2;4r\x1b[?69h\x1b[5;10s\x1b[3;7H\x1b[99E
+source: esctest2 esctest/tests/cnl.py test_CNL_StopsAtBottomMarginInScrollRegion (CNLTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cnl.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>
+>
+>
+>     |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (3,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
 
 # ---------------------------------------------------------------------------- CPL (cpl.py)
 
@@ -1309,7 +1714,81 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_CPL_stopsAtTopLineWhenBegunAboveScrollRegion, E_CPL_stopsAtTopMarginInScrollRegion -> #97 (cpl.py, vtLevel 4): DECLRMM + DECSLRM 5;10, expect column 5
+### E_CPL_stopsAtTopLineWhenBegunAboveScrollRegion
+size: 25x80
+step: feed \x1b[4;5r\x1b[?69h\x1b[5;10s\x1b[3;7H\x1b[25F
+source: esctest2 esctest/tests/cpl.py test_CPL_StopsAtTopLineWhenBegunAboveScrollRegion (CPLTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cpl.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>     |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CPL_stopsAtTopMarginInScrollRegion
+size: 25x80
+step: feed \x1b[2;4r\x1b[?69h\x1b[5;10s\x1b[3;7H\x1b[99F
+source: esctest2 esctest/tests/cpl.py test_CPL_StopsAtTopMarginInScrollRegion (CPLTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cpl.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>
+>     |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (1,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
 
 # ---------------------------------------------------------------------------- VPA (vpa.py)
 
@@ -1430,7 +1909,43 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_VPA_ignoresOriginMode -> #97 (DECOM is live since #8) (vpa.py, vtLevel 4): DECOM + DECLRMM
+### E_VPA_ignoresOriginMode
+size: 25x80
+step: feed \x1b[6;11r\x1b[?69h\x1b[5;10s\x1b[9;7H\x1b[?6h\x1b[2d
+source: esctest2 esctest/tests/vpa.py test_VPA_IgnoresOriginMode (VPATests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/vpa.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>
+>     |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (6,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
 
 # ---------------------------------------------------------------------------- HPA (hpa.py)  [CSI `]
 
@@ -1551,7 +2066,44 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_HPA_ignoresOriginMode -> #97 (DECOM is live since #8) (hpa.py, vtLevel 4): DECOM + DECLRMM + DECSLRM 5;10
+### E_HPA_ignoresOriginMode
+size: 25x80
+step: feed \x1b[6;11r\x1b[?69h\x1b[5;10s\x1b[9;7H\x1b[?6h\x1b[2`
+source: esctest2 esctest/tests/hpa.py test_HPA_IgnoresOriginMode (HPATests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/hpa.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>      |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (5,5)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
 # ---------------------------------------------------------------------------- HPR / VPR (hpr.py, vpr.py)  CSI Pn a / CSI Pn e  [#93]
 
 ### E_HPR_defaultParams
@@ -1788,7 +2340,81 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_HPR_ignoresOriginMode, E_VPR_ignoresOriginMode -> #97 (DECOM is live since #8) (DECOM, DECLRMM + DECSLRM; HPR/VPR themselves are live since #93)
+### E_HPR_ignoresOriginMode
+size: 25x80
+step: feed \x1b[6;11r\x1b[?69h\x1b[5;10s\x1b[?6h\x1b[2;2HX\x1b[2aY\x1b[?6l\x1b[?69h\x1b[r
+source: esctest2 esctest/tests/hpr.py test_HPR_IgnoresOriginMode (HPRTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/hpr.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+> |
+>
+>
+>
+>
+>
+>     X  Y
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_VPR_ignoresOriginMode
+size: 25x80
+step: feed \x1b[6;11r\x1b[?69h\x1b[5;10s\x1b[?6h\x1b[2;2HX\x1b[2eY\x1b[?6l\x1b[?69h\x1b[r
+source: esctest2 esctest/tests/vpr.py test_VPR_IgnoresOriginMode (VPRTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/vpr.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+> |
+>
+>
+>
+>
+>
+>     X
+>
+>      Y
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
 
 # ---------------------------------------------------------------------------- HVP (hvp.py)  [CSI f; esctest bug: the row/col-only forms send 'H']
 
@@ -1986,7 +2612,43 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_HVP_respectsOriginMode -> #97 (DECOM is live since #8) (hvp.py, vtLevel 4): DECOM + DECLRMM
+### E_HVP_respectsOriginMode
+size: 25x80
+step: feed \x1b[6;11r\x1b[?69h\x1b[5;10s\x1b[9;7f\x1b[?6h\x1b[1;1fX\x1b[?6l\x1b[r\x1b[?69l
+source: esctest2 esctest/tests/hvp.py test_HVP_RespectsOriginMode (HVPTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/hvp.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+> |
+>
+>
+>
+>
+>    X
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
 
 # ---------------------------------------------------------------------------- CBT / CHT (cbt.py, cht.py)  default tab stops every 8 columns: 9, 17, 25, ...
 
@@ -2183,7 +2845,81 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_CBT_ignoresRegion, E_CHT_ignoresScrollingRegion -> #97 (cbt.py/cht.py, vtLevel 4): DECLRMM + DECSLRM 5;30. CHT expects the tab to stop at the right margin (30).
+### E_CBT_ignoresRegion
+size: 25x80
+step: feed \x1b[?69h\x1b[5;30s\x1b[9;7H\x1b[2Z
+source: esctest2 esctest/tests/cbt.py test_CBT_IgnoresRegion (CBTTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cbt.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>
+>
+>
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (8,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_CHT_ignoresScrollingRegion
+size: 25x80
+step: feed \x1b[?69h\x1b[5;30s\x1b[9;7H\x1b[2I\x1b[2I\x1b[9;1H\x1b[9I
+source: esctest2 esctest/tests/cht.py test_CHT_IgnoresScrollingRegion (CHTTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/cht.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>
+>
+>
+>                              |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (8,29)
+pending_wrap: false
+requests: []
+scrollback: len=0
 
 # ---------------------------------------------------------------------------- TBC / HTS (tbc.py, hts.py)
 
@@ -2633,8 +3369,120 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_ED_0_withScrollRegion, E_ED_1_withScrollRegion, E_ED_2_withScrollRegion -> #97 (ed.py, vtLevel 4): DECLRMM (ESC[?69h) + DECSLRM 2;4 + DECSTBM 2;3;
-#>    expected: region ignored, same result as E_ED_0/1/2 on the 5x3 'abcde/fghij/klmno' prepare_wide screen
+### E_ED_0_withScrollRegion
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[3;2H\x1b[?69h\x1b[2;4s\x1b[2;3r\x1b[2;3H\x1b[0J\x1b[?69l\x1b[r
+source: esctest2 esctest/tests/ed.py test_ED_0_WithScrollRegion (EDTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ed.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>a|bcde
+>fg
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_ED_1_withScrollRegion
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[3;2H\x1b[?69h\x1b[2;4s\x1b[2;3r\x1b[2;3H\x1b[1J\x1b[?69l\x1b[r
+source: esctest2 esctest/tests/ed.py test_ED_1_WithScrollRegion (EDTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ed.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+> |
+>   ij
+>klmno
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_ED_2_withScrollRegion
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[3;2H\x1b[?69h\x1b[2;4s\x1b[2;3r\x1b[2;3H\x1b[2J\x1b[?69l\x1b[r
+source: esctest2 esctest/tests/ed.py test_ED_2_WithScrollRegion (EDTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ed.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
 #> E_ED_respectsISOProtection -> #95 (ed.py): SPA/EPA = ESC V / ESC W; 'ab' + SPA + 'c' + EPA, home, ED 0 -> only 'c' survives.
 #>    Same for E_EL_respectsISOProtection and E_ECH_respectsISOProtection. xterm honours ISO protection; iTerm2 marks it a knownBug.
 
@@ -2834,7 +3682,43 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_EL_ignoresScrollRegion -> #97 (el.py, vtLevel 4): DECLRMM + DECSLRM 2;4, EL 2 on row 1 still erases all 10 columns
+### E_EL_ignoresScrollRegion
+size: 25x80
+step: feed \x1b[1;1Habcdefghij\x1b[1;5H\x1b[?69h\x1b[2;4s\x1b[1;5H\x1b[2K\x1b[?69l
+source: esctest2 esctest/tests/el.py test_EL_IgnoresScrollRegion (ELTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/el.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>     |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
 
 # ---------------------------------------------------------------------------- ECH (ech.py)
 
@@ -2956,7 +3840,81 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_ECH_ignoresScrollRegion, E_ECH_outsideScrollRegion -> #97 (ech.py): DECLRMM + DECSLRM 2;4 ; expect 'ab    g' and '    efg'
+### E_ECH_ignoresScrollRegion
+size: 25x80
+step: feed abcdefg\x1b[?69h\x1b[2;4s\x1b[1;3H\x1b[4X\x1b[?69l
+source: esctest2 esctest/tests/ech.py test_ECH_IgnoresScrollRegion (ECHTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ech.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>ab |   g
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_ECH_outsideScrollRegion
+size: 25x80
+step: feed abcdefg\x1b[?69h\x1b[2;4s\x1b[1;1H\x1b[4X\x1b[?69l
+source: esctest2 esctest/tests/ech.py test_ECH_OutsideScrollRegion (ECHTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ech.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+> |   efg
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
 
 # ---------------------------------------------------------------------------- ICH (ich.py)
 
@@ -3124,8 +4082,81 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_ICH_isNoOpWhenCursorBeginsOutsideScrollRegion, E_ICH_scrollOffRightMarginInScrollRegion -> #97 (ich.py): DECLRMM + DECSLRM 2;5
-#>    expected 'abcdefg' unchanged / 'ab cdfg'
+### E_ICH_isNoOpWhenCursorBeginsOutsideScrollRegion
+size: 25x80
+step: feed \x1b[1;1Habcdefg\x1b[?69h\x1b[2;5s\x1b[1;1H\x1b[10@\x1b[?69l
+source: esctest2 esctest/tests/ich.py test_ICH_IsNoOpWhenCursorBeginsOutsideScrollRegion (ICHTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ich.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>a|bcdefg
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_ICH_scrollOffRightMarginInScrollRegion
+size: 25x80
+step: feed \x1b[1;1Habcdefg\x1b[?69h\x1b[2;5s\x1b[1;3H\x1b[@\x1b[?69l
+source: esctest2 esctest/tests/ich.py test_ICH_ScrollOffRightMarginInScrollRegion (ICHTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ich.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>ab |cdfg
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
 
 # ---------------------------------------------------------------------------- DCH (dch.py)
 
@@ -3251,8 +4282,119 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_DCH_respectsMargins, E_DCH_deleteAllWithMargins, E_DCH_doesNothingOutsideLeftRightMargin -> #97 (dch.py): DECLRMM + DECSLRM 2;4
-#>    expected 'abd e' / 'ab  e' / 'abcde'
+### E_DCH_respectsMargins
+size: 25x80
+step: feed abcde\x1b[?69h\x1b[2;4s\x1b[1;3H\x1b[P\x1b[?69l
+source: esctest2 esctest/tests/dch.py test_DCH_RespectsMargins (DCHTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/dch.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>abd| e
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_DCH_deleteAllWithMargins
+size: 25x80
+step: feed abcde\x1b[?69h\x1b[2;4s\x1b[1;3H\x1b[99P\x1b[?69l
+source: esctest2 esctest/tests/dch.py test_DCH_DeleteAllWithMargins (DCHTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/dch.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>ab | e
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_DCH_doesNothingOutsideLeftRightMargin
+size: 25x80
+step: feed abcde\x1b[?69h\x1b[2;4s\x1b[1;1H\x1b[99P\x1b[?69l
+source: esctest2 esctest/tests/dch.py test_DCH_DoesNothingOutsideLeftRightMargin (DCHTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/dch.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>a|bcde
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
 
 # ---------------------------------------------------------------------------- IL (il.py)
 
@@ -3419,8 +4561,81 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_IL_respectsScrollRegion, E_IL_respectsScrollRegion_over -> #97 (il.py): need DECLRMM; with left/right margins 2..4 only columns 2-4 of rows 2-4 move.
-#>    An adapted version without DECLRMM would be a different test (full-width region) and is NOT claimed as the esctest case.
+### E_IL_respectsScrollRegion
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1HfGHIj\x1b[3;1HkLMNo\x1b[4;1HpQRSt\x1b[5;1Huvwxy\x1b[?69h\x1b[2;4s\x1b[2;4r\x1b[2;3H\x1b[L\x1b[?69l\x1b[r
+source: esctest2 esctest/tests/il.py test_IL_RespectsScrollRegion (ILTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/il.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>a|bcde
+>f   j
+>kGHIo
+>pLMNt
+>uvwxy
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_IL_respectsScrollRegion_over
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1HfGHIj\x1b[3;1HkLMNo\x1b[4;1HpQRSt\x1b[5;1Huvwxy\x1b[?69h\x1b[2;4s\x1b[2;4r\x1b[2;3H\x1b[99L\x1b[?69l\x1b[r
+source: esctest2 esctest/tests/il.py test_IL_RespectsScrollRegion_Over (ILTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/il.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>a|bcde
+>f   j
+>k   o
+>p   t
+>uvwxy
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
 
 # ---------------------------------------------------------------------------- DL (dl.py)
 
@@ -3631,8 +4846,195 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_DL_inLeftRightScrollRegion, E_DL_outsideLeftRightScrollRegion, E_DL_inLeftRightAndTopBottomScrollRegion, E_DL_clearOutLeftRightAndTopBottomScrollRegion,
-#> E_DL_outsideLeftRightAndTopBottomScrollRegion -> #97 (dl.py): DECLRMM + DECSLRM 2;4
+### E_DL_inLeftRightScrollRegion
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[4;1Hpqrst\x1b[5;1Huvwxy\x1b[2;3H\x1b[?69h\x1b[2;4s\x1b[2;3H\x1b[M\x1b[?69l
+source: esctest2 esctest/tests/dl.py test_DL_InLeftRightScrollRegion (DLTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/dl.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>abcde
+>fl|mnj
+>kqrso
+>pvwxt
+>u   y
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_DL_outsideLeftRightScrollRegion
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[4;1Hpqrst\x1b[5;1Huvwxy\x1b[2;3H\x1b[?69h\x1b[2;4s\x1b[2;1H\x1b[M\x1b[?69l
+source: esctest2 esctest/tests/dl.py test_DL_OutsideLeftRightScrollRegion (DLTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/dl.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>abcde
+>f|ghij
+>klmno
+>pqrst
+>uvwxy
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (1,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_DL_inLeftRightAndTopBottomScrollRegion
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[4;1Hpqrst\x1b[5;1Huvwxy\x1b[2;3H\x1b[?69h\x1b[2;4s\x1b[2;4r\x1b[2;3H\x1b[M\x1b[?69l\x1b[r
+source: esctest2 esctest/tests/dl.py test_DL_InLeftRightAndTopBottomScrollRegion (DLTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/dl.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>a|bcde
+>flmnj
+>kqrso
+>p   t
+>uvwxy
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_DL_clearOutLeftRightAndTopBottomScrollRegion
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[4;1Hpqrst\x1b[5;1Huvwxy\x1b[2;3H\x1b[?69h\x1b[2;4s\x1b[2;4r\x1b[2;3H\x1b[99M\x1b[?69l\x1b[r
+source: esctest2 esctest/tests/dl.py test_DL_ClearOutLeftRightAndTopBottomScrollRegion (DLTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/dl.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>a|bcde
+>f   j
+>k   o
+>p   t
+>uvwxy
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_DL_outsideLeftRightAndTopBottomScrollRegion
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[4;1Hpqrst\x1b[5;1Huvwxy\x1b[2;3H\x1b[?69h\x1b[2;4s\x1b[2;4r\x1b[1;1H\x1b[M\x1b[?69l\x1b[r
+source: esctest2 esctest/tests/dl.py test_DL_OutsideLeftRightAndTopBottomScrollRegion (DLTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/dl.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>a|bcde
+>fghij
+>klmno
+>pqrst
+>uvwxy
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
 
 # ---------------------------------------------------------------------------- SU / SD (su.py, sd.py)  SU = ESC[Ps S ; SD = ESC[Ps T  (esccmd.SD sends final 'T')
 
@@ -4042,9 +5444,309 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_SU_respectsLeftRightScrollRegion, E_SU_outsideLeftRightScrollRegion, E_SU_leftRightAndTopBottomScrollRegion, E_SU_bigScrollLeftRightAndTopBottomScrollRegion,
-#> E_SD_respectsLeftRightScrollRegion, E_SD_outsideLeftRightScrollRegion, E_SD_leftRightAndTopBottomScrollRegion, E_SD_bigScrollLeftRightAndTopBottomScrollRegion
-#>    -> #97 (su.py/sd.py, vtLevel 4): DECLRMM + DECSLRM 2;4
+### E_SU_respectsLeftRightScrollRegion
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[4;1Hpqrst\x1b[5;1Huvwxy\x1b[2;3H\x1b[?69h\x1b[2;4s\x1b[2;3H\x1b[2S\x1b[?69l
+source: esctest2 esctest/tests/su.py test_SU_RespectsLeftRightScrollRegion (SUTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/su.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>almne
+>fqr|sj
+>kvwxo
+>p   t
+>u   y
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (1,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_SU_outsideLeftRightScrollRegion
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[4;1Hpqrst\x1b[5;1Huvwxy\x1b[2;3H\x1b[?69h\x1b[2;4s\x1b[2;1H\x1b[2S\x1b[r\x1b[?69l
+source: esctest2 esctest/tests/su.py test_SU_OutsideLeftRightScrollRegion (SUTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/su.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>a|lmne
+>fqrsj
+>kvwxo
+>p   t
+>u   y
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_SU_leftRightAndTopBottomScrollRegion
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[4;1Hpqrst\x1b[5;1Huvwxy\x1b[2;3H\x1b[?69h\x1b[2;4s\x1b[2;4r\x1b[2;1H\x1b[2S\x1b[r\x1b[?69l
+source: esctest2 esctest/tests/su.py test_SU_LeftRightAndTopBottomScrollRegion (SUTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/su.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>a|bcde
+>fqrsj
+>k   o
+>p   t
+>uvwxy
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_SU_bigScrollLeftRightAndTopBottomScrollRegion
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[4;1Hpqrst\x1b[5;1Huvwxy\x1b[2;3H\x1b[?69h\x1b[2;4s\x1b[2;4r\x1b[2;1H\x1b[99S\x1b[r\x1b[?69l
+source: esctest2 esctest/tests/su.py test_SU_BigScrollLeftRightAndTopBottomScrollRegion (SUTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/su.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>a|bcde
+>f   j
+>k   o
+>p   t
+>uvwxy
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_SD_respectsLeftRightScrollRegion
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[4;1Hpqrst\x1b[5;1Huvwxy\x1b[2;3H\x1b[?69h\x1b[2;4s\x1b[2;3H\x1b[2T\x1b[?69l
+source: esctest2 esctest/tests/sd.py test_SD_RespectsLeftRightScrollRegion (SDTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/sd.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>a   e
+>f  | j
+>kbcdo
+>pghit
+>ulmny
+> qrs
+> vwx
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (1,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_SD_outsideLeftRightScrollRegion
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[4;1Hpqrst\x1b[5;1Huvwxy\x1b[2;3H\x1b[?69h\x1b[2;4s\x1b[2;1H\x1b[2T\x1b[r\x1b[?69l
+source: esctest2 esctest/tests/sd.py test_SD_OutsideLeftRightScrollRegion (SDTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/sd.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>a|   e
+>f   j
+>kbcdo
+>pghit
+>ulmny
+> qrs
+> vwx
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_SD_leftRightAndTopBottomScrollRegion
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[4;1Hpqrst\x1b[5;1Huvwxy\x1b[2;3H\x1b[?69h\x1b[2;4s\x1b[2;4r\x1b[2;1H\x1b[2T\x1b[r\x1b[?69l
+source: esctest2 esctest/tests/sd.py test_SD_LeftRightAndTopBottomScrollRegion (SDTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/sd.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>a|bcde
+>f   j
+>k   o
+>pghit
+>uvwxy
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_SD_bigScrollLeftRightAndTopBottomScrollRegion
+size: 25x80
+step: feed \x1b[1;1Habcde\x1b[2;1Hfghij\x1b[3;1Hklmno\x1b[4;1Hpqrst\x1b[5;1Huvwxy\x1b[2;3H\x1b[?69h\x1b[2;4s\x1b[2;4r\x1b[2;1H\x1b[99T\x1b[r\x1b[?69l
+source: esctest2 esctest/tests/sd.py test_SD_BigScrollLeftRightAndTopBottomScrollRegion (SDTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/sd.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>a|bcde
+>f   j
+>k   o
+>p   t
+>uvwxy
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
 
 # ---------------------------------------------------------------------------- REP (rep.py)  ESC[Ps b
 
@@ -4167,7 +5869,43 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_REP_respectsLeftRightMargins -> #97 (rep.py, vtLevel 4): DECLRMM + DECSLRM 2;4, CUP 2,1, 'a', REP 3 -> ' aaa ' / ' a   ' (wraps inside the margins)
+### E_REP_respectsLeftRightMargins
+size: 25x80
+step: feed \x1b[?69h\x1b[2;4s\x1b[1;2Ha\x1b[3b\x1b[?69l
+source: esctest2 esctest/tests/rep.py test_REP_RespectsLeftRightMargins (REPTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/rep.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+> aaa\
+> a |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (1,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
 
 # ---------------------------------------------------------------------------- DECALN (decaln.py)  ESC # 8
 
@@ -4248,8 +5986,43 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_DECALN_clearsMargins -> #97 (decaln.py, vtLevel 4): DECLRMM + DECSLRM 2;3 + DECSTBM 4;5, DECALN, then CUU/CUD/CUB/CUF at the old margins move freely
-#>    (xterm resets both margin pairs). Tessera resets the top/bottom margins only (esc.rs reset_scroll_region).
+### E_DECALN_clearsMargins
+size: 25x80
+step: feed \x1b[?69h\x1b[2;3s\x1b[4;5r\x1b#8\x1b[4;2H\x1b[A\x1b[5;2H\x1b[B\x1b[4;2H\x1b[D\x1b[4;3H\x1b[C
+source: esctest2 esctest/tests/decaln.py test_DECALN_ClearsMargins (DECALNTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/decaln.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEE|EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+>EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+cursor: (3,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
 
 # ---------------------------------------------------------------------------- DECSC / DECRC (decrc.py via save_restore_cursor.py)  ESC 7 / ESC 8
 
@@ -4511,10 +6284,121 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_DECRC_saveRestoreCursor_resetsOriginMode, E_DECRC_saveRestoreCursor_worksInLRM -> #97 (DECLRMM + DECSLRM `CSI 5;7 s`, which is
-#>     SCOSC while DECLRMM is off; DECOM itself and its save/restore are live since #8, see modes_spec.txt DECOM20..DECOM22)
+### E_DECRC_saveRestoreCursor_resetsOriginMode
+size: 25x80
+step: feed \x1b[6;5H\x1b7\x1b[5;7r\x1b[?69h\x1b[5;7s\x1b[?6h\x1b8\x1b[1;1HX\x1b[?69l\x1b[r\x1b[?6l
+source: esctest2 esctest/tests/decrc.py test_SaveRestoreCursor_ResetsOriginMode (DECRCTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/decrc.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>X|
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_DECRC_saveRestoreCursor_worksInLRM
+size: 25x80
+step: feed \x1b[3;2H\x1b7\x1b[?69h\x1b[1;10s\x1b[6;5H\x1b7\x1b[5;4H\x1b8
+source: esctest2 esctest/tests/decrc.py test_SaveRestoreCursor_WorksInLRM (DECRCTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/decrc.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>
+>
+>
+>
+>
+>     |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (5,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
 #> E_DECRC_saveRestoreCursor_protection -> #95 (DECSCA/DECSERA, DEC protection next to SPA/EPA); passes vacuously today, so not worth a case
-#> E_DECRC_saveRestoreCursor_reverseWrapNotAffected -> #97 (DECSET 45)
+
+### E_DECRC_saveRestoreCursor_reverseWrapNotAffected
+size: 25x80
+step: feed \x1b[?1045h\x1b7\x1b[?1045l\x1b8\x1b[2;1H\x08
+source: esctest2 esctest/tests/decrc.py test_SaveRestoreCursor_ReverseWrapNotAffected (DECRCTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/decrc.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (1,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
 
 # ---------------------------------------------------------------------------- SCOSC / SCORC (scorc.py via save_restore_cursor.py)  CSI s / CSI u  [#94]
 # scorc.py is save_restore_cursor.py with saveCursor = SCOSC (ESC[s) and restoreCursor = SCORC (ESC[u). xterm saves and
@@ -4779,9 +6663,120 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_SCORC_saveRestoreCursor_resetsOriginMode -> #97 (as its E_DECRC_* twin: DECLRMM + DECSLRM)
-#> E_SCORC_saveRestoreCursor_worksInLRM, E_SCORC_saveRestoreCursor_reverseWrapNotAffected -> #97 (scorc.py runs worksInLRM with
-#>     shouldWork=False: while DECLRMM is set ESC[s is DECSLRM, so the second save does not happen and ESC[u returns to (2,3))
+### E_SCORC_saveRestoreCursor_resetsOriginMode
+size: 25x80
+step: feed \x1b[6;5H\x1b[s\x1b[5;7r\x1b[?69h\x1b[5;7s\x1b[?6h\x1b[u\x1b[1;1HX\x1b[?69l\x1b[r\x1b[?6l
+source: esctest2 esctest/tests/scorc.py test_SaveRestoreCursor_ResetsOriginMode (SCORCTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/scorc.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>X|
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_SCORC_saveRestoreCursor_worksInLRM
+size: 25x80
+step: feed \x1b[3;2H\x1b[s\x1b[?69h\x1b[1;10s\x1b[6;5H\x1b[s\x1b[5;4H\x1b[u
+source: esctest2 esctest/tests/scorc.py test_SaveRestoreCursor_WorksInLRM (SCORCTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/scorc.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>
+>
+>  |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (2,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_SCORC_saveRestoreCursor_reverseWrapNotAffected
+size: 25x80
+step: feed \x1b[?1045h\x1b[s\x1b[?1045l\x1b[u\x1b[2;1H\x08
+source: esctest2 esctest/tests/scorc.py test_SaveRestoreCursor_ReverseWrapNotAffected (SCORCTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/scorc.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (1,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
 #> E_SCORC_saveRestoreCursor_protection -> #95 (as E_DECRC_saveRestoreCursor_protection)
 
 # ---------------------------------------------------------------------------- DECSTBM (decstbm.py)  ESC[Pt;Pb r  — moves the cursor home on success
@@ -5378,7 +7373,44 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_IND_movesDoesNotScrollOutsideLeftRight -> #97 (ind.py): DECLRMM + DECSLRM 2;5
+### E_IND_movesDoesNotScrollOutsideLeftRight
+size: 25x80
+step: feed \x1b[2;5r\x1b[?69h\x1b[2;5s\x1b[5;3Hx\x1b[5;6H\x1bD\x1b[25;6H\x1bD\x1b[5;1H\x1bD\x1b[25;1H\x1bD
+source: esctest2 esctest/tests/ind.py test_IND_MovesDoesNotScrollOutsideLeftRight (INDTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ind.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>
+>
+>
+>
+>  x
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+> |
+cursor: (24,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
 #> E_IND_8bit -> #96 (see E_HTS_8bit)
 
 # ---------------------------------------------------------------------------- RI (ri.py)  ESC M
@@ -5594,7 +7626,44 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_RI_movesDoesNotScrollOutsideLeftRight -> #97 (ri.py): DECLRMM + DECSLRM 2;5
+### E_RI_movesDoesNotScrollOutsideLeftRight
+size: 25x80
+step: feed \x1b[2;5r\x1b[?69h\x1b[2;5s\x1b[5;3Hx\x1b[2;6H\x1bM\x1b[1;6H\x1bM\x1b[2;1H\x1bM\x1b[1;1H\x1bM
+source: esctest2 esctest/tests/ri.py test_RI_MovesDoesNotScrollOutsideLeftRight (RITests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ri.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+> |
+>
+>
+>
+>  x
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
 #> E_RI_8bit -> #96 (see E_HTS_8bit)
 
 # ---------------------------------------------------------------------------- NEL (nel.py)  ESC E
@@ -5810,7 +7879,44 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_NEL_movesDoesNotScrollOutsideLeftRight -> #97 (nel.py): DECLRMM + DECSLRM 2;5
+### E_NEL_movesDoesNotScrollOutsideLeftRight
+size: 25x80
+step: feed \x1b[2;5r\x1b[?69h\x1b[2;5s\x1b[5;3Hx\x1b[5;6H\x1bE\x1b[4;6H\x1bE\x1b[25;6H\x1bE\x1b[5;1H\x1bE\x1b[25;1H\x1bE
+source: esctest2 esctest/tests/nel.py test_NEL_MovesDoesNotScrollOutsideLeftRight (NELTests)
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/nel.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #97: the byte stream is what esctest2's own test function sends (run through a shim of esccmd/escio; esctest's reset() = a fresh 25x80 terminal), and every assertion it makes (cursor via CPR, which counts from the margins in origin mode; cells via DECRQCRA) held at its point in the stream when the row was generated. Only the final state is pinned here.
+chunk: no
+screen:
+>
+>
+>
+>
+>  x
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+> |
+cursor: (24,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
 #> E_NEL_8bit -> #96 (see E_HTS_8bit)
 
 # ---------------------------------------------------------------------------- SGR (sgr.py)

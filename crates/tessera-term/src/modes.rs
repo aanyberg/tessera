@@ -16,7 +16,7 @@
 //! | Mode | Name | Effect |
 //! |---|---|---|
 //! | 1 | DECCKM | [`KeyboardModes::application_cursor_keys`] |
-//! | 3 | DECCOLM | only while 40 is set: clear, reset the margins, home, [`Modes::columns_132`] and a [`Request::Resize`]; the grid keeps its width |
+//! | 3 | DECCOLM | only while 40 is set: clear, reset the top/bottom and left/right margins, home, [`Modes::columns_132`] and a [`Request::Resize`]; the grid keeps its width |
 //! | 5 | DECSCNM | [`Modes::reverse_video`], stored only |
 //! | 6 | DECOM | [`Modes::origin`]; set and reset home the cursor (to the region's top in origin mode) |
 //! | 7 | DECAWM | [`Modes::auto_wrap`]; a pending wrap stays armed |
@@ -24,10 +24,13 @@
 //! | 12 | cursor blink | blinking on or off: the blink of [`Terminal::cursor_style`](crate::Terminal::cursor_style) becomes the program's, as after DECSCUSR, while its shape stays whatever it was (the program's or the configured one), and [`Modes::cursor_blink`] records the bit DECSCUSR shares |
 //! | 25 | DECTCEM | [`Modes::cursor_visible`] |
 //! | 40 | allow 80 ⇄ 132 | [`Modes::allow_column_change`] |
+//! | 45 | reverse wraparound | [`Modes::reverse_wrap`]: with DECAWM, BS and CUB wrap back into a soft-wrapped line above |
 //! | 47 | alternate screen | enter; reset leaves with the cursor where it is |
 //! | 66 | DECNKM | [`KeyboardModes::application_keypad`], the DECKPAM flag |
+//! | 69 | DECLRMM | [`Modes::left_right_margins`], level 4 and up only: `CSI Pl ; Pr s` sets the left and right margins (DECSLRM); reset returns them to the full width |
 //! | 1004 | focus events | [`Modes::focus_events`] |
 //! | 1005, 1006, 1015, 1016 | mouse encoding | [`Modes::mouse_encoding`], the last set wins; a reset clears only the active one |
+//! | 1045 | extended reverse wraparound | [`Modes::reverse_wrap_extended`]: as 45, into any line and from the top margin to the bottom one |
 //! | 1047 | alternate screen | as 47, and a reset clears the alternate screen first |
 //! | 1048 | save cursor | set is DECSC, reset is DECRC |
 //! | 1049 | alternate screen | set saves the cursor, enters and clears; reset leaves and restores the cursor |
@@ -37,8 +40,8 @@
 //! Every other mode, `0` and an empty parameter included, is ignored and
 //! logged at trace level; one sequence may set several modes, and an
 //! unknown one among them does not stop the others. Notably ignored: 2
-//! (DECANM: no VT52 mode), 4 (DECSCLM, smooth scroll, not IRM), 45 and 69
-//! (reverse wrap and DECLRMM, #97) and 1001 (highlight tracking).
+//! (DECANM: no VT52 mode), 4 (DECSCLM, smooth scroll, not IRM) and 1001
+//! (highlight tracking).
 //!
 //! Setting a mode again repeats its side effects (DECOM homes again, 1049
 //! clears again), as in xterm. A 1049 reset on the primary screen does
@@ -78,9 +81,11 @@
 //! a resource there); in 132-column mode it also asks the host for 80
 //! columns with a [`Request::Resize`] (the grid keeps its width). DECSTR (`CSI ! p`) resets origin
 //! mode, cursor visibility (on), cursor blink, synchronized output,
-//! insert mode, auto-wrap (on), DECCKM, DECKPAM, `modifyOtherKeys` and both
-//! kitty stacks, and keeps the rest: reverse video, LNM, the alternate
-//! screen, bracketed paste, focus events and the mouse modes.
+//! insert mode, auto-wrap (on), DECLRMM (off, with the margins back to
+//! the full width), reverse wraparound (45 and 1045, off), DECCKM,
+//! DECKPAM, `modifyOtherKeys` and both kitty stacks, and keeps the rest:
+//! reverse video, LNM, the alternate screen, bracketed paste, focus events
+//! and the mouse modes.
 
 use tessera_grid::EraseDisplay;
 use tracing::trace;
@@ -147,6 +152,19 @@ pub struct Modes {
     /// DECSET 2026: the application is in the middle of a synchronized
     /// update. Stored only.
     pub synchronized_output: bool,
+    /// DECLRMM (DECSET 69): left/right margin mode. While it is on, `CSI
+    /// Pl ; Pr s` is DECSLRM (set the left and right margins) instead of
+    /// SCOSC; turning it off resets the margins to the full width. Only at
+    /// conformance level 4 and up (ADR 0028).
+    pub left_right_margins: bool,
+    /// DECSET 45 (xterm's reverse wraparound): with auto-wrap on, BS and
+    /// CUB at the left margin continue at the right margin of the line
+    /// above when that line is soft-wrapped.
+    pub reverse_wrap: bool,
+    /// DECSET 1045 (xterm's extended reverse wraparound): as
+    /// [`Modes::reverse_wrap`], into any line, and from the top margin to
+    /// the bottom one. Wins over [`Modes::reverse_wrap`] when both are on.
+    pub reverse_wrap_extended: bool,
 }
 
 impl Default for Modes {
@@ -167,6 +185,9 @@ impl Default for Modes {
             mouse: MouseTracking::None,
             mouse_encoding: MouseEncoding::Default,
             synchronized_output: false,
+            left_right_margins: false,
+            reverse_wrap: false,
+            reverse_wrap_extended: false,
         }
     }
 }
@@ -351,6 +372,9 @@ impl State {
             }
             2004 => self.modes.bracketed_paste = on,
             2026 => self.modes.synchronized_output = on,
+            45 => self.modes.reverse_wrap = on,
+            69 => self.set_left_right_margin_mode(on),
+            1045 => self.modes.reverse_wrap_extended = on,
             _ => trace!(mode, on, "DECSET/DECRST mode ignored"),
         }
     }
@@ -366,6 +390,22 @@ impl State {
     /// stops a configured blink, as in xterm with a blinking resource.
     fn set_cursor_blink(&mut self, on: bool) {
         self.set_blink_override(on);
+    }
+
+    /// DECLRMM (DECSET 69), xterm's `set_left_right_margin_mode`: only at
+    /// conformance level 4 and up, as on the VT420 (below it the sequence
+    /// does nothing at all). Setting it leaves the margins as they are;
+    /// resetting it returns them to the full width, so DECSLRM's margins
+    /// never outlive the mode.
+    fn set_left_right_margin_mode(&mut self, on: bool) {
+        if self.conformance_level < 4 {
+            trace!(on, "DECLRMM ignored below level 4");
+            return;
+        }
+        self.modes.left_right_margins = on;
+        if !on {
+            self.grid.reset_margins();
+        }
     }
 
     /// One of 9, 1000, 1002 and 1003: setting one replaces the others;
@@ -386,7 +426,8 @@ impl State {
 
     /// DECCOLM. Ignored entirely unless DECSET 40 allows it (xterm's
     /// `c132`, default off). Then xterm's side effects, in every case: the
-    /// screen cleared, the scroll region reset and the cursor homed
+    /// screen cleared, the scroll region and the left and right margins
+    /// reset (DECLRMM stays) and the cursor homed
     /// (origin-relative in origin mode). The grid keeps its width, which
     /// the host's window and PTY decide (ADR 0020): the mode is recorded
     /// in [`Modes::columns_132`] and, when it changes to a width (132 for
@@ -403,6 +444,9 @@ impl State {
         }
         self.grid.erase_in_display(EraseDisplay::All);
         self.grid.reset_scroll_region();
+        // xterm `resetMargins`: the left and right margins too, while
+        // DECLRMM itself stays as it was.
+        self.grid.reset_margins();
         self.grid.goto_origin(0, 0);
     }
 
@@ -485,6 +529,13 @@ impl State {
         // The spec is silent; a program that died between the begin and
         // the end of an update must not freeze the screen after `reset`.
         self.modes.synchronized_output = false;
+        // xterm `ReallyReset`: `resetMarginMode` (DECLRMM off, margins to
+        // the full width) and the reverse wraparound modes to their
+        // defaults (DEC STD 070, esctest's DECSTR tests).
+        self.modes.left_right_margins = false;
+        self.grid.reset_margins();
+        self.modes.reverse_wrap = false;
+        self.modes.reverse_wrap_extended = false;
         self.keyboard = KeyboardModes::default();
         self.kitty = KittyStacks::default();
     }

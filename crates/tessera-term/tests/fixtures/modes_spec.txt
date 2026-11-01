@@ -1544,8 +1544,9 @@ modes: default
 #  (term/mod.rs L2016..L2023); kitty/WezTerm/Ghostty: unverified. See D-MOUSERESET.
 #
 #  Unknown / ignored with a trace (xterm has them, Tessera does not model them): 2 (DECANM: `CSI ? 2 l` enters VT52 mode in xterm -- DO NOT implement; ignore), 8 DECARM,
-#  10, 13, 14, 18, 19, 30, 35, 38, 41, 42, 44, 45 (#97), 67 DECBKM, 69 DECLRMM (#97), 80 DECSDM, 95 DECNCSM (honoured only at VT510 level), 1001, 1007 (alternate scroll),
-#  1010..1014, 1034..1046, 1050..1061, 2001..2003, 2005..2007, 7727. 1007 note: kitty/WezTerm/Alacritty/iTerm2 implement it (wheel -> arrow keys on the alt screen); it belongs to #12.
+#  10, 13, 14, 18, 19, 30, 35, 38, 41, 42, 44, 67 DECBKM, 80 DECSDM, 95 DECNCSM (honoured only at VT510 level), 1001, 1007 (alternate scroll),
+#  1010..1014, 1034..1044, 1046, 1050..1061, 2001..2003, 2005..2007, 7727. 1007 note: kitty/WezTerm/Alacritty/iTerm2 implement it (wheel -> arrow keys on the alt screen); it belongs to #12.
+#  45 (reverse wraparound), 69 (DECLRMM) and 1045 (extended reverse wraparound) are live since #97: margins_spec.txt.
 
 ### MODE01_set_each_stored_mode_then_reset
 size: 3x10

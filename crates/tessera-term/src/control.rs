@@ -39,21 +39,29 @@ impl State {
     /// Executes one control byte.
     ///
     /// - BEL queues exactly one [`Request::Bell`].
-    /// - BS moves one column left, never wrapping back to the previous
-    ///   line, and disarms a pending wrap.
-    /// - HT moves to the next tab stop or the last column. With a wrap
-    ///   pending the cursor already sits on the last column, so HT leaves
-    ///   the pending wrap armed, as xterm and `WezTerm` do.
+    /// - BS moves one column left, stopping at the left margin (column
+    ///   zero for a cursor left of it), and disarms a pending wrap. With
+    ///   reverse wraparound (DECSET 45 or 1045) and auto-wrap on it wraps
+    ///   back to the right margin of the line above instead
+    ///   ([`tessera_grid::Grid::cursor_back`]).
+    /// - HT moves to the next tab stop or the right margin (the last
+    ///   column without margins). With a wrap pending the cursor already
+    ///   sits on the line end, so HT leaves the pending wrap armed, as
+    ///   xterm and `WezTerm` do.
     /// - LF, VT and FF move down one line, scrolling at the bottom of the
     ///   scroll region. The column is kept unless newline mode (LNM, `CSI
     ///   20 h`) is on; then they also return the carriage.
-    /// - CR moves to column zero.
+    /// - CR moves to the left margin (column zero without margins, and for
+    ///   a cursor left of the margin outside origin mode).
     /// - NUL, SO, SI and DEL are ignored; any other byte is ignored and
     ///   logged at trace level.
     pub(crate) fn execute(&mut self, byte: u8) {
         match byte {
             BEL => self.pending.push(Request::Bell),
-            BS => self.grid.cursor_left(1),
+            BS => {
+                let wrap = self.reverse_wrap();
+                self.grid.cursor_back(1, wrap);
+            }
             HT => {
                 if !self.grid.pending_wrap() {
                     self.grid.tab_forward(1);
