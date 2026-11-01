@@ -1959,9 +1959,18 @@ mod tests {
         broken: Arc<AtomicBool>,
         /// While set, `try_write` panics.
         panics: Arc<AtomicBool>,
-        /// Every size the PTY was resized to.
+        /// The first [`RESIZES_KEPT`] sizes the PTY was resized to.
         resizes: Arc<Mutex<Vec<PtySize>>>,
+        /// How many times `try_write` was called: the writer's attempts,
+        /// each under the PTY lock.
+        attempts: Arc<AtomicUsize>,
     }
+
+    /// How many resizes a [`FakePty`] records: enough for any test that
+    /// reads them, and bounded for the resize loops of
+    /// [`resize_is_not_starved_by_a_blocked_writer`], which make about a
+    /// million a second.
+    const RESIZES_KEPT: usize = 64;
 
     impl FakePty {
         fn exit(&self, status: ExitStatus) {
@@ -1978,6 +1987,7 @@ mod tests {
         }
 
         fn try_write(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
             assert!(!self.panics.load(Ordering::SeqCst), "fake PTY write panics");
             if self.broken.load(Ordering::SeqCst) {
                 return Err(io::ErrorKind::BrokenPipe.into());
@@ -1989,7 +1999,10 @@ mod tests {
         }
 
         fn resize(&mut self, size: PtySize) -> Result<(), PtyError> {
-            lock(&self.resizes).push(size);
+            let mut resizes = lock(&self.resizes);
+            if resizes.len() < RESIZES_KEPT {
+                resizes.push(size);
+            }
             Ok(())
         }
 
@@ -2029,6 +2042,7 @@ mod tests {
         broken: Arc<AtomicBool>,
         panics: Arc<AtomicBool>,
         resizes: Arc<Mutex<Vec<PtySize>>>,
+        attempts: Arc<AtomicUsize>,
     }
 
     impl Fake {
@@ -2060,6 +2074,7 @@ mod tests {
         let broken = Arc::new(AtomicBool::new(false));
         let panics = Arc::new(AtomicBool::new(false));
         let resizes = Arc::new(Mutex::new(Vec::new()));
+        let attempts = Arc::new(AtomicUsize::new(0));
         let pty = FakePty {
             events: Arc::clone(&events),
             written: Arc::clone(&written),
@@ -2070,6 +2085,7 @@ mod tests {
             broken: Arc::clone(&broken),
             panics: Arc::clone(&panics),
             resizes: Arc::clone(&resizes),
+            attempts: Arc::clone(&attempts),
         };
         let id = app.allocate_id();
         app.attach(id, Box::new(pty), rx, PtySize::default())
@@ -2084,6 +2100,7 @@ mod tests {
                 broken,
                 panics,
                 resizes,
+                attempts,
             },
         )
     }
@@ -2206,18 +2223,30 @@ mod tests {
     /// `SIGHUP` (issues #79, #179): half of `HANGUP_GRACE`, 500 ms.
     ///
     /// The bar catches a close that waits for the grace period (1 s or
-    /// more, twice the bar, however idle or loaded the machine). Measured
-    /// in debug builds under `taskpolicy -b` with ten CPU burners on ten
-    /// cores (load 9.5-29, 20 runs of each test, 2026-10-31), one close
-    /// took a median of 44 µs to 6.7 ms depending on the test (the 4 MiB
-    /// paste pending is the slowest), so the bar has 75x headroom over the
-    /// slowest median; the slowest single close was 92 ms, 5.4x under it.
-    /// The old 5 ms bar failed 20 of those 80 runs.
+    /// more, twice the bar, however idle or loaded the machine). It is
+    /// derived from the loaded maximum, not the median (#192): in debug
+    /// builds with ten `yes` burners on ten cores at normal priority
+    /// (5-minute load 20-84 with other work, 50 runs of each of the four
+    /// tests that use it, 2026-11-01), the slowest of the 200 closes took
+    /// 1.03 ms (the fake that ignores `SIGHUP`; the slowest shell close,
+    /// with the 4 MiB paste pending, took 188 µs), so the bar has 480x
+    /// headroom over the loaded maximum.
+    ///
+    /// Under `taskpolicy -b` (background quality of service) with the same
+    /// burners, the scheduler stalls the whole process for up to seconds:
+    /// there the slowest close was 340 ms of 200 (load 35-85, 1.5x under
+    /// the bar), and 10 of those runs failed on reap bounds, none on this
+    /// one. No bar under the 1 s grace keeps 10x headroom over such stalls,
+    /// so that setting is not what the bar is derived from. (The earlier
+    /// derivation, 2026-10-31 under `taskpolicy -b` at load 9.5-29, had a
+    /// 92 ms maximum, 5.4x under the bar; the old 5 ms bar failed 20 of
+    /// its 80 runs.)
     ///
     /// A close that blocks for a short while (10 ms, say) passes this
     /// bar: one close cannot be held both under 10 ms and ten times over
-    /// its loaded tail. [`MEDIAN_CLOSE_WITHIN`] catches that class instead,
-    /// over 20 closes, where a few preempted closes do not move the median.
+    /// its tail at background priority. [`MEDIAN_CLOSE_WITHIN`] catches
+    /// that class instead, over 20 closes, where a few preempted closes do
+    /// not move the median.
     const CLOSE_RETURNS_WITHIN: Duration = match session::HANGUP_GRACE.checked_div(2) {
         Some(bar) => bar,
         None => panic!("HANGUP_GRACE / 2"),
@@ -2635,40 +2664,134 @@ mod tests {
         writer
     }
 
-    /// Twenty resizes on another thread all finish while a writer keeps
-    /// retrying against a full queue: the writer holds the PTY lock only
-    /// for each attempt, never across its backoff sleep.
+    /// Resizes session `id` on a new thread, over and over, until `stop`
+    /// is set; `done` counts the resizes that returned.
+    fn resize_until(
+        app: &Arc<App>,
+        id: SessionId,
+        stop: &Arc<AtomicBool>,
+        done: &Arc<AtomicUsize>,
+    ) -> thread::JoinHandle<()> {
+        let app = Arc::clone(app);
+        let stop = Arc::clone(stop);
+        let done = Arc::clone(done);
+        thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                app.resize(id, PtySize::new(30, 100)).unwrap();
+                done.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+    }
+
+    /// How many of its own attempts the blocked writer gets as the clock
+    /// of [`resize_is_not_starved_by_a_blocked_writer`]: at the 20 ms
+    /// backoff ceiling, half a second.
+    const WRITER_ATTEMPTS: usize = 25;
+
+    /// The longest the window of
+    /// [`resize_is_not_starved_by_a_blocked_writer`] lasts when the writer is
+    /// slower than its backoff: under `taskpolicy -b` with ten CPU burners,
+    /// 25 attempts took over 20 s in 9 of 30 runs (2026-11-01). Any window
+    /// of two attempts or more spans a whole backoff sleep, which is all
+    /// the ratio needs.
+    const WINDOW_AT_MOST: Duration = Duration::from_secs(5);
+
+    /// How many times fewer resizes the session with the blocked writer may
+    /// get than the idle one in [`resize_is_not_starved_by_a_blocked_writer`].
+    const RESIZE_SHARE: usize = 4;
+
+    /// A writer that keeps retrying against a full queue holds the PTY
+    /// lock only for each attempt, never across its backoff sleep: resizes
+    /// of its session run as often as resizes of a session with no writer.
     ///
-    /// An ordering, not a speed bar (#179): the resizes take microseconds,
-    /// and [`TIMEOUT`] four times over only ends a failing run, so a
-    /// loaded machine cannot fail it (the old 10 ms bar on the slowest
-    /// resize failed 4 of 20 runs under `taskpolicy -b` at load 10-29). A
-    /// writer that held the lock across its sleep (the guard kept alive by
-    /// a `match` scrutinee) releases it and takes it again at once, before
-    /// a woken resize can run, so the resizes never finish.
-    /// With no clock bar it runs outside the nextest `timing` group.
+    /// Two threads resize in a loop, one the session whose writer is
+    /// blocked, one an idle session, while the writer makes
+    /// [`WRITER_ATTEMPTS`] attempts (or for [`WINDOW_AT_MOST`], if that
+    /// is shorter, as long as it makes two). The writer only holds the lock for
+    /// microseconds per 20 ms attempt, so both threads get about as many
+    /// resizes; the first must get at least a [`RESIZE_SHARE`]th of the
+    /// second's.
+    ///
+    /// Clock-free (#192): the window is counted in the writer's attempts,
+    /// and the bar is a ratio between two threads that run side by side,
+    /// so load slows both alike. It catches any writer that holds the lock
+    /// for more than about three quarters of each attempt:
+    ///
+    /// - one that keeps the guard across its sleep (alive in a `match`
+    ///   scrutinee) and takes the lock again at once gets no resize
+    ///   through at all, as the old test checked;
+    /// - one that keeps it across its 20 ms sleep and then leaves a 1 ms
+    ///   gap lets resizes through only in the gaps, about a twentieth of
+    ///   the idle session's. Twenty resizes in a row passed the old test,
+    ///   all inside one gap, and no count of attempts *per resize* can see
+    ///   it either: each resize still ends before the writer's next attempt.
+    ///
+    /// Measured 2026-11-01 (debug, ten CPU burners on ten cores): the
+    /// idle session got 0.75-1.35 times the other's resizes in 50 runs at
+    /// normal priority and 0.30-1.49 times in 30 runs under `taskpolicy -b`,
+    /// all passing; the 1 ms gap writer gave 13-32 times (10 of 10 failed)
+    /// and 2.2-12.7 times under `taskpolicy -b` (9 of 10 failed). The old
+    /// 10 ms bar on the slowest resize failed 4 of 20 runs under
+    /// `taskpolicy -b` at load 10-29 (#179). With no clock bar it runs
+    /// outside the nextest `timing` group.
     #[test]
     fn resize_is_not_starved_by_a_blocked_writer() {
         let app = Arc::new(app());
         let (id, fake) = attach_fake(&app, false);
+        let (idle, _idle_fake) = attach_fake(&app, false);
         let writer = blocked_writer(&app, id, &fake);
-        let (done_tx, all_done) = mpsc::channel();
-        let resizer = {
-            let app = Arc::clone(&app);
-            thread::spawn(move || {
-                for _ in 0..20 {
-                    app.resize(id, PtySize::new(30, 100)).unwrap();
-                }
-                let _ = done_tx.send(());
-            })
+        let stop = Arc::new(AtomicBool::new(false));
+        let blocked_done = Arc::new(AtomicUsize::new(0));
+        let idle_done = Arc::new(AtomicUsize::new(0));
+        let resizers = [
+            resize_until(&app, id, &stop, &blocked_done),
+            resize_until(&app, idle, &stop, &idle_done),
+        ];
+        let counts = || {
+            (
+                blocked_done.load(Ordering::SeqCst),
+                idle_done.load(Ordering::SeqCst),
+            )
         };
-        let finished = all_done.recv_timeout(TIMEOUT * 4);
+        // Both resizers have started before the window opens.
+        let deadline = Instant::now() + TIMEOUT * 4;
+        while counts().1 == 0 {
+            assert!(Instant::now() < deadline, "the idle session never resized");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let attempts = || fake.attempts.load(Ordering::SeqCst);
+        let first = attempts();
+        let before = counts();
+        let window_ends = Instant::now() + WINDOW_AT_MOST;
+        while attempts() < first + WRITER_ATTEMPTS
+            && Instant::now() < window_ends
+            && !writer.is_finished()
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let after = counts();
+        let attempted = attempts() - first;
         let writer_waiting = !writer.is_finished();
+        stop.store(true, Ordering::SeqCst);
+        // Lets a starved resizer return, so it can see `stop`.
         fake.would_block.store(false, Ordering::SeqCst);
         writer.join().unwrap().unwrap();
-        resizer.join().unwrap();
-        assert_eq!(finished, Ok(()), "the resizes waited for the writer");
+        for resizer in resizers {
+            resizer.join().unwrap();
+        }
         assert!(writer_waiting, "the writer stopped retrying");
+        assert!(
+            attempted >= 2,
+            "the writer made {attempted} attempts in {WINDOW_AT_MOST:?}"
+        );
+        let blocked = after.0 - before.0;
+        let reference = after.1 - before.1;
+        assert!(reference > 0, "the idle session never resized");
+        assert!(
+            blocked * RESIZE_SHARE >= reference,
+            "{blocked} resizes against {reference} for the idle session \
+             in {attempted} writer attempts: the writer held the lock"
+        );
         assert_eq!(&lock(&fake.written)[..], b"stuck");
     }
 
@@ -2934,8 +3057,23 @@ mod tests {
         (id, pid)
     }
 
-    /// A shell that ignores `SIGHUP` and never exits on its own.
-    const STUBBORN: &str = "trap '' HUP; echo ready; exec sleep 100";
+    /// A shell that ignores `SIGHUP` and lives exactly as long as the test
+    /// process: it never exits on its own while its parent is alive, so
+    /// only the close's `SIGKILL` ends it, and it never reads its terminal
+    /// (each `sleep` has its descriptors on `/dev/null`, so no grandchild
+    /// holds the terminal either).
+    ///
+    /// Not `exec sleep 100`: it ended on its own when a loaded test stalled
+    /// for more than 100 s between `ready` and the paste of
+    /// [`close_with_input_pending_to_a_shell_that_ignores_sighup`], which
+    /// then failed with "child has exited" (#192; reproduced with a 101 s
+    /// stall at that point). A longer sleep only moves the stall it takes.
+    /// Not `exec tail -f /dev/null` either: a test process killed without
+    /// unwinding (nextest's slow-timeout kill, `kill -9`) left it behind
+    /// for good, reparented to launchd and deaf to `SIGHUP`. This loop
+    /// notices its parent is gone within a second.
+    const STUBBORN: &str = "trap '' HUP; echo ready; \
+        while kill -0 $PPID 2>/dev/null; do sleep 1 </dev/null >/dev/null 2>&1; done";
 
     #[test]
     fn close_returns_at_once_for_a_shell_that_ignores_sighup() {
@@ -3048,10 +3186,16 @@ mod tests {
     fn close_with_input_pending_to_a_shell_that_ignores_sighup() {
         let app = app();
         let (id, pid) = spawn_ready(&app, STUBBORN);
-        // `sleep` never reads: the paste fills the terminal's input buffer
-        // and the PTY writer blocks in write(2) (ADR 0011).
+        // The shell never reads its terminal. In canonical mode macOS
+        // discards input past `MAX_INPUT` instead of blocking the writer,
+        // so the paste is pending at the close only while it is still being
+        // transferred (4 MiB took about 0.15 s in a probe; the close comes
+        // 50 ms after it is queued). `tessera-ffi`'s `tests/input.rs` uses
+        // `stty raw -echo` where a writer must stay blocked (ADR 0011).
         let paste = "p".repeat(4 * 1024 * 1024);
-        let outcome = app.send_input(id, InputEvent::Paste(paste)).unwrap();
+        let outcome = app
+            .send_input(id, InputEvent::Paste(paste))
+            .expect("the shell never exits on its own");
         assert_eq!(outcome, InputOutcome::Consumed);
         thread::sleep(Duration::from_millis(50));
         let started = Instant::now();
