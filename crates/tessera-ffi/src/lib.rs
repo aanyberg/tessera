@@ -70,10 +70,10 @@ pub use selection::{
     tessera_session_set_hover,
 };
 pub use session::{
-    MAX_COLS, MAX_ROWS, ScrollPosition, ScrollTarget, SpawnOptions,
-    tessera_session_clear_scrollback, tessera_session_close, tessera_session_resize,
-    tessera_session_scroll_position, tessera_session_scroll_to, tessera_session_spawn,
-    tessera_session_write,
+    FOREGROUND_NAME_LEN, ForegroundProcess, MAX_COLS, MAX_ROWS, ScrollPosition, ScrollTarget,
+    SpawnOptions, tessera_session_clear_scrollback, tessera_session_close,
+    tessera_session_foreground_process, tessera_session_resize, tessera_session_scroll_position,
+    tessera_session_scroll_to, tessera_session_spawn, tessera_session_write,
 };
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]

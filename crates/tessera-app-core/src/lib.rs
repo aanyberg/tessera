@@ -58,7 +58,10 @@ pub use session::{SessionEvent, SessionId, SessionObserver};
 // alone, as the layering in `docs/architecture.md` requires.
 pub use config_watch::{CONFIG_DIR_POLL_INTERVAL, CONFIG_WATCH_STOP_CAP};
 pub use tessera_config::{Config, ConfigPaths, ConfigStore, ShellIntegration, WatchOptions};
-pub use tessera_pty::{ExitStatus, Program, PtyError, PtySize, SpawnOptions};
+pub use tessera_pty::{
+    ExitStatus, ForegroundProcess, MAX_NAME_BYTES as MAX_FOREGROUND_NAME_BYTES, Program, PtyError,
+    PtySize, SpawnOptions,
+};
 pub use tessera_shell_integration::Cwd;
 
 use config_watch::{Applied, ConfigWatch};
@@ -1139,6 +1142,28 @@ impl App {
     /// [`Error::SessionNotFound`] if `id` is not a live session.
     pub fn session_cwd(&self, id: SessionId) -> Result<Option<Cwd>> {
         Ok(self.session(id)?.cwd())
+    }
+
+    /// The job session `id`'s shell runs in the foreground, or `None` while
+    /// the shell waits at its prompt or after it has exited: the terminal's
+    /// foreground process group when it is not the shell's own, and its
+    /// leader's name (`sleep`, `vim`, `ssh`, `tmux`; empty when it cannot
+    /// be read). A frontend asks before closing a session for which this
+    /// is `Some` (ADR 0031).
+    ///
+    /// Every job counts, whatever it is. Only a shell with job control
+    /// starts jobs, so a session running a [`Program::Command`] that is
+    /// not an interactive shell never reports one.
+    ///
+    /// A snapshot that costs one `tcgetpgrp` (plus one or two process
+    /// lookups when a job runs) and never waits for the child; call it when the answer is needed, not per frame.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session (closing
+    /// sessions included).
+    pub fn foreground_process(&self, id: SessionId) -> Result<Option<ForegroundProcess>> {
+        Ok(self.session(id)?.foreground_process())
     }
 
     /// Whether session `id`'s view has keyboard focus, as last reported

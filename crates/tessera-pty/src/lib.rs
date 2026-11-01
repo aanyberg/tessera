@@ -6,8 +6,9 @@
 //! and propagates window-size changes. This is the only crate besides
 //! `tessera-ffi` that is allowed to contain `unsafe`, because it talks to the
 //! OS; the implementation stays on `portable-pty`'s safe surface except for
-//! one duplication of the master descriptor, documented at its `SAFETY:`
-//! comment.
+//! one duplication of the master descriptor and the macOS process-name
+//! lookups of [`Pty::foreground_process`] (`proc_name`, `proc_pidinfo`),
+//! each documented at its `SAFETY:` comment.
 //!
 //! The crate is Unix-only: it relies on `fork`/`exec` semantics, POSIX
 //! signals and `wait(2)` statuses, and refuses to compile elsewhere.
@@ -42,8 +43,10 @@ use std::sync::mpsc::Receiver;
 #[cfg(not(unix))]
 compile_error!("tessera-pty supports Unix platforms only");
 
+mod foreground;
 mod native;
 
+pub use foreground::{ForegroundProcess, MAX_NAME_BYTES};
 pub use native::{IoThreads, NativePty, WRITE_QUEUE_BYTES};
 
 /// Value injected as `TERM` for every child.
@@ -403,6 +406,33 @@ pub trait Pty: Send {
     /// Forcibly terminates the child (`SIGKILL`), ending the session's input
     /// first exactly as [`Pty::hangup`] does.
     fn kill(&mut self) -> io::Result<()>;
+
+    /// The job the child shell runs in the foreground, if any: the
+    /// terminal's foreground process group when it is not the child's own,
+    /// with its leader's name (see [`ForegroundProcess`]). `None` while the
+    /// shell itself owns the terminal (at its prompt), once the child has
+    /// exited, or when the implementation cannot tell; the default
+    /// implementation always returns `None`.
+    ///
+    /// Only a shell with job control (any interactive shell) moves its jobs
+    /// into groups of their own, so a program spawned directly, or run by
+    /// `sh -c`, is never reported: it runs in the child's own group. For
+    /// the same reason three busy cases read as idle: a program the shell
+    /// `exec`s (`exec sleep 100`, an rc file's `exec tmux`), which takes
+    /// over the shell's pid and group; command substitution (`echo $(sleep
+    /// 100)`, `vim $(fzf)` while `fzf` runs), whose child the shell runs in
+    /// its own group while it keeps the terminal; and a shell with job
+    /// control turned off (`set +m`). Catching them would need counting the
+    /// shell's own children in its group and noticing an `exec` by the
+    /// child's name changing; that is deferred to 0.2.0 (ADR 0031).
+    ///
+    /// Cheap (one `tcgetpgrp` and, on the busy path, one or two process
+    /// lookups; no allocation beyond the name) and non-blocking, but a snapshot: the job may finish, or a new one
+    /// start, as soon as it returns. Read it when it is needed, such as
+    /// when the user asks to close the session, rather than polling.
+    fn foreground_process(&self) -> Option<ForegroundProcess> {
+        None
+    }
 }
 
 #[cfg(test)]
