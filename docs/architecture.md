@@ -104,7 +104,9 @@ makes these calls is not in the tree yet (issue #27).
 
 Windows and tabs are not in the core yet. In 0.1.0 each tab is an `NSWindow`
 with one session, grouped by AppKit's tab bar, and the registry lives in the
-Swift shell; the core keeps only sessions (ADR 0015).
+Swift shell; the core keeps only sessions (ADR 0015). The shell also asks
+before closing a tab, a window or the app while a session runs a job, and
+saves each window's frame and tab count for the next launch (ADR 0031).
 
 ## Threading
 

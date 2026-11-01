@@ -24,6 +24,13 @@ protocol TerminalWindowControllerDelegate: AnyObject {
     func terminalWindowControllerWantsNewTab(_ controller: TerminalWindowController)
     /// The controller's window closed and its session is closed; forget it.
     func terminalWindowControllerDidClose(_ controller: TerminalWindowController)
+    /// The controller's window moved, was resized or was selected (which is
+    /// how a tab moving to another window or a merge shows): the windows'
+    /// frames or tab counts may have changed.
+    func terminalWindowControllerDidChangeLayout(_ controller: TerminalWindowController)
+    /// Asks before a tab or window whose session runs a job closes; `nil`
+    /// closes without asking.
+    var closeConfirmationPresenter: (any CloseConfirmationPresenter)? { get }
 }
 
 /// One terminal tab: one `NSWindow` running one ``TesseraSession``.
@@ -45,6 +52,14 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
     /// The tab's content, installed as the window's content view.
     let contentView: any TerminalContentView
     weak var delegate: (any TerminalWindowControllerDelegate)?
+
+    /// The close confirmation up on this tab's sheet, if any: `.tab` holds
+    /// back further closes of this tab only, `.window` (⇧⌘W) of every tab of
+    /// its window, rather than asking twice. If the tab closes underneath its
+    /// sheet (its shell exits), the alert's completion never runs and this
+    /// stays set on the dead controller; harmless, as only open tabs are
+    /// consulted.
+    private(set) var pendingClose: CloseConfirmation.Scope?
 
     /// - Parameters:
     ///   - title: The initial window title, until the session sets one.
@@ -114,11 +129,43 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
     }
 
     /// ⇧⌘W: closes every tab of this window's tab bar, and with them the
-    /// window.
+    /// window. If any of the tabs runs a job, one sheet on this tab lists
+    /// them all first (D4b), and Cancel keeps every tab.
     @objc func closeTabGroup(_ sender: Any?) {
         guard let window = window as? TerminalWindow else { return }
-        for tab in window.tabs {
-            tab.performClose(sender)
+        let tabs = window.tabs
+        let controllers = tabs.compactMap { $0.windowController as? TerminalWindowController }
+        guard !controllers.contains(where: { $0.pendingClose != nil }) else { return }
+        // `close()`, not `performClose(_:)`: the user has been asked once
+        // for all of them, or nothing in them runs.
+        let closeAll = { @MainActor in
+            for tab in tabs {
+                tab.close()
+            }
+        }
+        guard let presenter = delegate?.closeConfirmationPresenter,
+            let confirmation = CloseConfirmation(.window, sessions: controllers.map(\.session))
+        else {
+            closeAll()
+            return
+        }
+        ask(confirmation, presenter: presenter, close: closeAll)
+    }
+
+    /// Shows `confirmation` on a sheet of this tab, which it selects first,
+    /// and runs `close` if the user confirms.
+    private func ask(
+        _ confirmation: CloseConfirmation, presenter: any CloseConfirmationPresenter,
+        close: @escaping @MainActor () -> Void
+    ) {
+        guard let window else { return }
+        pendingClose = confirmation.scope
+        window.tabGroup?.selectedWindow = window
+        presenter.confirm(confirmation, sheetFor: window) { [weak self] confirmed in
+            self?.pendingClose = nil
+            if confirmed {
+                close()
+            }
         }
     }
 
@@ -130,6 +177,39 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
     }
 
     // MARK: NSWindowDelegate
+
+    /// ⌘W, the tab's close button and AppKit's own multi-tab closes (Close
+    /// Other Tabs, Close All), which ask each tab: closes at once at the
+    /// shell's prompt; while the session runs a job, asks on a sheet first
+    /// and closes only if the user confirms. A request is ignored while this
+    /// tab is already asking, or while its window asks for all its tabs
+    /// (⇧⌘W); another tab's own question holds back nothing here.
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        let group = (window as? TerminalWindow)?.tabs ?? []
+        let windowAsks = group.contains { ($0.windowController as? TerminalWindowController)?.pendingClose == .window }
+        if pendingClose != nil || windowAsks {
+            return false
+        }
+        guard let presenter = delegate?.closeConfirmationPresenter,
+            let confirmation = CloseConfirmation(.tab, sessions: [session])
+        else { return true }
+        ask(confirmation, presenter: presenter) { [weak self] in
+            self?.window?.close()
+        }
+        return false
+    }
+
+    func windowDidMove(_ notification: Notification) {
+        delegate?.terminalWindowControllerDidChangeLayout(self)
+    }
+
+    func windowDidResize(_ notification: Notification) {
+        delegate?.terminalWindowControllerDidChangeLayout(self)
+    }
+
+    func windowDidBecomeMain(_ notification: Notification) {
+        delegate?.terminalWindowControllerDidChangeLayout(self)
+    }
 
     func windowWillClose(_ notification: Notification) {
         do {

@@ -71,6 +71,45 @@ public final class TesseraSession: Sendable, Identifiable {
         try TesseraCoreError.check(tessera_session_clear_scrollback(core.pointer, id))
     }
 
+    /// A job the session's shell runs in the foreground, as
+    /// ``foregroundProcess()`` reports it.
+    public struct ForegroundProcess: Sendable, Equatable {
+        /// The job's process group id, the pid of its first process.
+        public let pid: Int32
+        /// The job's first process's name (`sleep`, `vim`, `ssh`), decoded
+        /// as UTF-8 with invalid bytes replaced, from at most 64 bytes. It is
+        /// whatever the process calls itself: it may be empty (the process
+        /// has exited while the rest of its pipeline runs on) and may hold
+        /// control characters, so never show it unfiltered.
+        public let name: String
+
+        public init(pid: Int32, name: String) {
+            self.pid = pid
+            self.name = name
+        }
+    }
+
+    /// The job the session's shell is running in the foreground, or `nil` at
+    /// the shell's prompt, once the shell has exited, and for a program that
+    /// is not an interactive shell (ADR 0031). A snapshot that never waits
+    /// for the child: ask when the user closes the session, not per frame.
+    ///
+    /// - Throws: ``TesseraCoreError/sessionNotFound`` once the session is
+    ///   closed, ``TesseraCoreError/nullPointer`` after the application shut
+    ///   down.
+    @MainActor
+    public func foregroundProcess() throws -> ForegroundProcess? {
+        var job = TesseraForegroundProcess()
+        try TesseraCoreError.check(tessera_session_foreground_process(core.pointer, id, &job))
+        guard job.running else { return nil }
+        // `name` is NUL-terminated within its 65 bytes; stop at the NUL, or
+        // at the end should the core ever fill it.
+        let name = withUnsafeBytes(of: job.name) { bytes in
+            String(decoding: bytes.prefix { $0 != 0 }, as: UTF8.self)
+        }
+        return ForegroundProcess(pid: job.pid, name: name)
+    }
+
     /// Hangs up the child and forgets the session, returning at once. No
     /// delegate call for it follows, not even the exit, however late the child
     /// exits. The core reaps the child in the background, killing it if it
