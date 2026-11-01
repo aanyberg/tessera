@@ -19,7 +19,10 @@ import os
 ///   sent as typed text (never as a paste); keys are mapped from their key
 ///   code. Keys pressed while text is marked belong to the input method and
 ///   send nothing of their own.
-/// - Mouse and scrolling are forwarded to the core in cell coordinates.
+/// - Mouse: presses, releases, drags and plain motion go to the core in cell
+///   and pixel coordinates; the core reports them to a program that tracks
+///   the mouse and says so (`.consumed`), and leaves the rest to the view.
+///   The click that activates the window is not sent.
 /// - Scrollback: the wheel and trackpad move the view through the core;
 ///   the View menu's ⌘↑/⌘↓ page and ⌘Home/⌘End jump (``scroll(to:)``);
 ///   ``TerminalScroller`` shows and moves the position. Typing, pasting and
@@ -187,6 +190,13 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         scroller.autoresizingMask = [.minXMargin, .height]
         scroller.onScroll = { [weak self] target in self?.scroll(to: target) }
         addSubview(scroller)
+
+        // Plain motion (no button held) while the window is key, for
+        // programs that track every motion (DECSET 1003). AppKit keeps the
+        // area on the visible rect, so it is never replaced.
+        addTrackingArea(
+            NSTrackingArea(
+                rect: .zero, options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect], owner: self, userInfo: nil))
     }
 
     @available(*, unavailable)
@@ -861,45 +871,104 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
 
     // MARK: Mouse
 
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    // Every pointer event goes to the core, which decides who has it
+    // (ADR 0027): `.consumed` means it wrote a mouse report, so the program
+    // tracking the mouse has the event; `.ignored` leaves it to the view
+    // (selection, #30). A press or motion with Shift (selection bypass) or
+    // Command (links) held is always `.ignored`; the release of a reported
+    // press is reported whatever the modifiers. Option is reported as Meta.
+
+    /// The click that activates an inactive window only activates it: it
+    /// reaches neither the program nor a selection, so clicking back into
+    /// a terminal running vim does not move vim's cursor (D13). AppKit then
+    /// sends neither the press nor its drags; ``pressOutcomes`` keeps a
+    /// stray release out as well.
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { false }
+
+    /// The core's outcome for the press of each button that is down, from
+    /// its press to its release. A button missing here was pressed outside
+    /// this view (or by the activating click): its drags and its release are
+    /// not sent. The selection (#30) starts only on an `.ignored` press.
+    private(set) var pressOutcomes: [TesseraSession.MouseButton: TesseraSession.InputOutcome] = [:]
+    /// Mouse events handed to the session (tests).
+    private(set) var sentMouseCount = 0
+    /// The last mouse event handed to the session (tests).
+    private(set) var lastSentMouse: TesseraSession.MouseEvent?
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
-        sendMouse(event, kind: .press, button: .left)
+        press(event, button: .left)
     }
 
-    override func mouseUp(with event: NSEvent) { sendMouse(event, kind: .release, button: .left) }
-    override func mouseDragged(with event: NSEvent) { sendMouse(event, kind: .motion, button: .left) }
-    override func rightMouseDown(with event: NSEvent) { sendMouse(event, kind: .press, button: .right) }
-    override func rightMouseUp(with event: NSEvent) { sendMouse(event, kind: .release, button: .right) }
-    override func rightMouseDragged(with event: NSEvent) { sendMouse(event, kind: .motion, button: .right) }
-    override func otherMouseDown(with event: NSEvent) { sendMouse(event, kind: .press, button: Self.button(event)) }
-    override func otherMouseUp(with event: NSEvent) { sendMouse(event, kind: .release, button: Self.button(event)) }
+    override func mouseUp(with event: NSEvent) { release(event, button: .left) }
+    override func mouseDragged(with event: NSEvent) { drag(event, button: .left) }
+    override func rightMouseDown(with event: NSEvent) { press(event, button: .right) }
+    override func rightMouseUp(with event: NSEvent) { release(event, button: .right) }
+    override func rightMouseDragged(with event: NSEvent) { drag(event, button: .right) }
+
+    override func otherMouseDown(with event: NSEvent) {
+        guard let button = Self.otherButton(event) else { return }
+        press(event, button: button)
+    }
+
+    override func otherMouseUp(with event: NSEvent) {
+        guard let button = Self.otherButton(event) else { return }
+        release(event, button: button)
+    }
+
     override func otherMouseDragged(with event: NSEvent) {
-        sendMouse(event, kind: .motion, button: Self.button(event))
+        guard let button = Self.otherButton(event) else { return }
+        drag(event, button: button)
     }
 
-    private static func button(_ event: NSEvent) -> TesseraSession.MouseButton {
+    override func mouseMoved(with event: NSEvent) {
+        sendMouse(event, kind: .motion, button: .none)
+    }
+
+    /// The button of an `otherMouse` event: middle, back or forward. Buttons
+    /// beyond forward have no report (xterm numbers none past 11), so they
+    /// are not sent rather than sent as another button.
+    static func otherButton(_ event: NSEvent) -> TesseraSession.MouseButton? {
         switch event.buttonNumber {
         case 2: .middle
         case 3: .back
         case 4: .forward
-        default: .middle
+        default: nil
         }
     }
 
+    private func press(_ event: NSEvent, button: TesseraSession.MouseButton) {
+        pressOutcomes[button] = sendMouse(event, kind: .press, button: button)
+    }
+
+    private func drag(_ event: NSEvent, button: TesseraSession.MouseButton) {
+        guard pressOutcomes[button] != nil else { return }
+        sendMouse(event, kind: .motion, button: button)
+    }
+
+    private func release(_ event: NSEvent, button: TesseraSession.MouseButton) {
+        guard pressOutcomes.removeValue(forKey: button) != nil else { return }
+        sendMouse(event, kind: .release, button: button)
+    }
+
+    /// Sends a pointer event to the session and returns whether the core
+    /// reported it to the program; `.ignored` when it could not be sent.
+    @discardableResult
     private func sendMouse(
         _ event: NSEvent, kind: TesseraSession.MouseEventKind, button: TesseraSession.MouseButton
-    ) {
+    ) -> TesseraSession.InputOutcome {
         let point = convert(event.locationInWindow, from: nil)
         let (cell, pixels) = cell(at: point)
         let mouse = TesseraSession.MouseEvent(
             kind: kind, button: button, col: cell.col, row: cell.row, xPx: Float(pixels.x), yPx: Float(pixels.y),
             modifiers: Self.modifiers(of: event))
+        sentMouseCount += 1
+        lastSentMouse = mouse
         do {
-            try session.send(mouse: mouse)
+            return try session.send(mouse: mouse)
         } catch {
             Self.log.debug("mouse event not sent: \(String(describing: error), privacy: .public)")
+            return .ignored
         }
     }
 

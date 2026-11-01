@@ -1097,13 +1097,19 @@ final class TerminalSurfaceViewTests: XCTestCase {
     }
 
     func testMouseAndScrollEventsReachTheSession() async throws {
-        for type in [NSEvent.EventType.leftMouseDown, .leftMouseDragged, .leftMouseUp, .rightMouseDown, .otherMouseDown] {
+        let types: [NSEvent.EventType] = [
+            .mouseMoved, .leftMouseDown, .leftMouseDragged, .leftMouseUp, .rightMouseDown, .otherMouseDown,
+        ]
+        for type in types {
             let event = try XCTUnwrap(
                 NSEvent.mouseEvent(
                     with: type, location: NSPoint(x: 20, y: 20), modifierFlags: [], timestamp: 0,
                     windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
             switch type {
-            case .leftMouseDown: view.mouseDown(with: event)
+            case .mouseMoved: view.mouseMoved(with: event)
+            case .leftMouseDown:
+                view.mouseDown(with: event)
+                XCTAssertEqual(view.pressOutcomes[.left], .ignored, "no program tracks the mouse: the view's press")
             case .leftMouseDragged: view.mouseDragged(with: event)
             case .leftMouseUp: view.mouseUp(with: event)
             case .rightMouseDown: view.rightMouseDown(with: event)

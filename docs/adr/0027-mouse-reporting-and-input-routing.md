@@ -100,6 +100,34 @@ screen. Programs that track the mouse on the primary screen (`fzf
 --height`) then see a row of the live screen that is not under the
 pointer. Not handled in 0.1.0.
 
+### Frontend routing
+
+`TerminalSurfaceView` (`apps/macos`) sends and routes as follows; it makes
+no reporting decision of its own.
+
+- **Every pointer event goes to the core** through
+  `TesseraSession.send(mouse:)`: presses, releases and drags of the left,
+  right and other buttons, and plain motion with no button held from an
+  `NSTrackingArea` (`.mouseMoved`, `.activeInKeyWindow`, `.inVisibleRect`),
+  so motion arrives only while the window is key. Positions are the cell
+  under the pointer and physical pixels from the view's top-left corner,
+  padding included. `otherMouse` button numbers 2, 3 and 4 are middle,
+  back and forward; higher buttons have no report and are not sent.
+- **Modifiers** map Shift, Option, Control and Command to Shift, Alt (Meta),
+  Control and Super; the core applies the bypasses.
+- **The outcome of each press** is kept per button from press to release
+  (`pressOutcomes`): `Consumed` means the program has the click, `Ignored`
+  that the view may select or open a link (#30). A release is sent for every
+  press the view saw, whatever the modifiers by then, and the core decides
+  whether it is reported.
+- **The activating click** is swallowed by AppKit: `acceptsFirstMouse`
+  returns `false`, so the click that activates an inactive window, or the
+  app, reaches neither the program nor a selection. A drag or release of a
+  button whose press the view did not see is not sent either, so a stray
+  release after that click cannot reach the core.
+- **The wheel** stays with `scrollWheel`, which sends every gesture as
+  before; a `Consumed` scroll redraws.
+
 ## Consequences
 
 - The frontend's job is to send every pointer event, plain motion included
