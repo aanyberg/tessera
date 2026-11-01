@@ -57,6 +57,7 @@ schemars = "1"
 thiserror = "2"
 portable-pty = "0.9"
 nix = { version = "0.28", default-features = false }
+libc = "0.2"
 tracing = "0.1"
 unicode-segmentation = "1"
 unicode-width = "0.2"

@@ -16,6 +16,7 @@ use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use portable_pty::{CommandBuilder, MasterPty, native_pty_system};
 
+use crate::foreground::{self, ForegroundProcess};
 use crate::{ExitStatus, Program, Pty, PtyError, PtyEvent, PtyEvents, PtySize, SpawnOptions};
 
 /// Size of the buffer each `read(2)` on the master fills.
@@ -635,6 +636,18 @@ impl Pty for NativePty {
     fn kill(&mut self) -> io::Result<()> {
         self.queue.close();
         self.signal_if_running(Signal::SIGKILL)
+    }
+
+    /// Compares `tcgetpgrp(3)` on the master with the child's pid under the
+    /// phase lock, as signalling does: the reader cannot start reaping the
+    /// child meanwhile, so its pid is not recycled under the comparison.
+    /// `None` once the child is being reaped or has been.
+    fn foreground_process(&self) -> Option<ForegroundProcess> {
+        let phase = self.phase();
+        if *phase != Phase::Running {
+            return None;
+        }
+        foreground::foreground_process(self.master.as_ref(), self.pid)
     }
 }
 

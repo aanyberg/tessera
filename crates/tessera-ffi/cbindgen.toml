@@ -22,6 +22,7 @@ renaming_overrides_prefixing = true
 [export.rename]
 "MAX_ROWS" = "TESSERA_MAX_ROWS"
 "MAX_COLS" = "TESSERA_MAX_COLS"
+"FOREGROUND_NAME_LEN" = "TESSERA_FOREGROUND_NAME_LEN"
 
 [enum]
 # `TESSERA_ERROR_OK`, `TESSERA_ERROR_NULL_POINTER`, …: C enumerators share

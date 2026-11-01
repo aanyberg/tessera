@@ -12,7 +12,8 @@
 //!   [`Terminal::set_default_cursor_style`] before the first step;
 //! - `step: feed <payload>` (the payload is everything after the one
 //!   space after `feed`, decoded by [`common::decode`]; a trailing
-//!   whitespace-and-`#` comment is dropped), `step: set_default <shape>
+//!   whitespace-and-`#` comment is dropped, and one that says `repeats
+//!   this step N times` feeds the payload N times), `step: set_default <shape>
 //!   <steady|blink>` and `step: resize RxC` run in order;
 //! - `expect: <shape> <steady|blink> [modes_blink=<bool>]` checks
 //!   [`Terminal::cursor_style`] (and [`Modes::cursor_blink`]) after the
@@ -50,14 +51,14 @@ use tessera_term::{CursorShape, CursorStyle, Request, Terminal};
 const FIXTURE: &str = include_str!("fixtures/decscusr_spec.txt");
 
 /// Rows in the fixture, Q01..Q06 included.
-const ROWS: usize = 60;
-/// How often X08 repeats its step (its comment says so).
-const FLOOD_REPEAT: usize = 2_000;
+const ROWS: usize = 66;
 
 /// One `step:` or `expect:` line of a row, in fixture order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Step {
-    Feed(Vec<u8>),
+    /// The payload, fed this many times (1 unless the step's comment says
+    /// it repeats).
+    Feed(Vec<u8>, usize),
     SetDefault(CursorStyle),
     Resize(u16, u16),
     Expect {
@@ -128,12 +129,26 @@ fn parse_expect(text: &str) -> Step {
     }
 }
 
-/// A `step:` line's argument, its trailing `<whitespace># ...` comment
-/// dropped.
-fn strip_comment(text: &str) -> &str {
+/// A `step:` line's argument and its trailing `<whitespace># ...`
+/// comment, if any, split apart.
+fn split_comment(text: &str) -> (&str, &str) {
     text.char_indices()
         .find(|&(i, c)| c.is_whitespace() && text[i..].trim_start().starts_with('#'))
-        .map_or(text, |(i, _)| &text[..i])
+        .map_or((text, ""), |(i, _)| (&text[..i], &text[i..]))
+}
+
+/// How often a step's comment says the test repeats it: `repeats this
+/// step N times`; 1 if it says nothing of the kind.
+fn repeat_count(comment: &str) -> usize {
+    comment
+        .split_once("repeats this step ")
+        .and_then(|(_, rest)| rest.split_once(" times"))
+        .map_or(1, |(count, _)| {
+            count
+                .replace('_', "")
+                .parse()
+                .unwrap_or_else(|_| panic!("`{comment}`: repeat count"))
+        })
 }
 
 /// `(for Ps in A..=B) payload`: the payload once per Ps, `<Ps>` replaced.
@@ -163,12 +178,13 @@ fn parse_reply(text: &str) -> Step {
 }
 
 fn parse_step(arg: &str) -> Step {
-    let arg = strip_comment(arg);
+    let (arg, comment) = split_comment(arg);
+    let repeat = repeat_count(comment);
     if let Some(bytes) = arg.strip_prefix("feed ").and_then(for_each_ps) {
-        Step::Feed(bytes)
+        Step::Feed(bytes, repeat)
     } else if let Some(payload) = arg.strip_prefix("feed ") {
         // Everything after the single space: X07's payload starts with one.
-        Step::Feed(decode(payload))
+        Step::Feed(decode(payload), repeat)
     } else if let Some(style) = arg.strip_prefix("set_default ") {
         Step::SetDefault(parse_style(style))
     } else if let Some(size) = arg.strip_prefix("resize ") {
@@ -243,13 +259,21 @@ fn rows() -> Vec<Row> {
         .collect()
 }
 
-fn feed(term: &mut Terminal, bytes: &[u8], chunking: Chunking) {
+/// Feeds `bytes` in one call or byte by byte and returns how many bytes
+/// reached the terminal.
+fn feed(term: &mut Terminal, bytes: &[u8], chunking: Chunking) -> usize {
     match chunking {
-        Chunking::Whole => term.advance(bytes),
+        Chunking::Whole => {
+            term.advance(bytes);
+            bytes.len()
+        }
         Chunking::Bytewise => {
+            let mut fed = 0;
             for byte in bytes {
                 term.advance(std::slice::from_ref(byte));
+                fed += 1;
             }
+            fed
         }
     }
 }
@@ -283,19 +307,21 @@ fn check_row(row: &Row, chunking: Chunking) -> Vec<String> {
     if let Some(style) = row.default {
         term.set_default_cursor_style(style);
     }
-    // X08's comment: its step runs this many times.
-    let repeat = if row.id.starts_with("X08_") {
-        FLOOD_REPEAT
-    } else {
-        1
-    };
     let mut replies = Vec::new();
     let mut others = Vec::new();
     for (index, step) in row.steps.iter().enumerate() {
         match step {
-            Step::Feed(bytes) => {
-                for _ in 0..repeat {
-                    feed(&mut term, bytes, chunking);
+            Step::Feed(bytes, repeat) => {
+                let mut fed = 0;
+                for _ in 0..*repeat {
+                    fed += feed(&mut term, bytes, chunking);
+                }
+                // X08 and T01 would pass fed once: prove the repeat ran.
+                if fed != bytes.len() * repeat {
+                    fail(format!(
+                        "step #{index}: fed {fed} bytes, not {} x {repeat}",
+                        bytes.len()
+                    ));
                 }
                 collect(&mut term, &mut replies, &mut others);
             }
@@ -414,6 +440,62 @@ fn every_row() {
         errors.join("\n")
     );
     eprintln!("{} rows passed whole and byte by byte", runnable.len());
+}
+
+/// The rows whose step comment asks for a repeat get it: X08's flood and
+/// T01's tmux `cnorm`s would pass fed once, so a comment the reader no
+/// longer understood would hide a regression.
+#[test]
+fn repeated_steps_are_read_from_their_comments() {
+    let repeats = |prefix: &str| -> Vec<usize> {
+        let row = rows()
+            .into_iter()
+            .find(|row| row.id.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no row {prefix}"));
+        row.steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Feed(_, repeat) => Some(*repeat),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(repeats("X08_"), [2_000]);
+    assert_eq!(repeats("T01_"), [100]);
+    assert_eq!(repeats("T02_"), [1, 1, 1]);
+}
+
+/// tessera.terminfo's `Se` (ADR 0005), which tmux sends to the outer
+/// terminal when a program inside asks for the default cursor (`CSI 0 SP
+/// q`, nvim on exit), returns to the configured style: T02 with the
+/// capability read from the entry rather than assumed (#169 item 1).
+#[test]
+fn terminfo_se_returns_to_the_configured_style() {
+    const TERMINFO: &str = include_str!("../../../shell-integration/terminfo/tessera.terminfo");
+    let se = TERMINFO
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .flat_map(|line| line.split(", "))
+        .find_map(|cap| cap.trim().strip_prefix("Se="))
+        .expect("tessera.terminfo has Se")
+        .trim_end_matches(',');
+    // terminfo's `\E` is ESC; the rest of this entry is literal.
+    let payload = se.replace("\\E", "\x1b");
+    let configured = CursorStyle {
+        shape: CursorShape::Beam,
+        blink: true,
+    };
+    let mut term = Terminal::new(3, 10);
+    term.set_default_cursor_style(configured);
+    term.advance(b"\x1b[2 q");
+    term.advance(payload.as_bytes());
+    assert_eq!(term.cursor_style(), configured, "Se = {se}");
+    let edited = CursorStyle {
+        shape: CursorShape::Underline,
+        blink: true,
+    };
+    term.set_default_cursor_style(edited);
+    assert_eq!(term.cursor_style(), edited, "Se = {se}: follows edits");
 }
 
 /// P12's premise, checked against the parser rather than assumed: an
