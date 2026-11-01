@@ -121,13 +121,78 @@ Alternatives rejected:
 
 ### App: confirmation and restore (34-app)
 
-The Swift half (confirmation alerts per tab, window and Cmd-Q, and the
-window-state store) is recorded here by 34-app.
+**Asking.** `TesseraSession.foregroundProcess()` wraps the C call on the
+main actor and returns `nil` for an idle shell. The app calls it only when
+the user asks to close, once per affected session, through
+`CloseConfirmation` (`apps/macos/Sources/Tessera/CloseConfirmation.swift`),
+which is `nil` when no session is busy, so an idle tab, window or app
+closes exactly as before:
+
+| request | asks when | alert |
+|---|---|---|
+| ⌘W, the tab's or window's close button (AppKit closes only the selected tab) | the tab's session runs a job | sheet on the tab, which is selected first: "Close this tab?" |
+| ⇧⌘W (`closeTabGroup`) | any tab of the window runs a job | one sheet on the current tab listing every busy tab's job (D4b) |
+| AppKit's own multi-tab closes (Close Other Tabs, Close Tabs to the Right, Close All), which close each tab through `windowShouldClose` | that tab's session runs a job | idle tabs close at once; each busy tab asks on its own sheet, as for ⌘W |
+| ⌘Q, the Dock's Quit, logging out (`applicationShouldTerminate`) | any session runs a job | one application-modal alert listing them all (D4b) |
+
+Close (Quit) is the default button and marked destructive, as Terminal.app
+makes Terminate the default; Cancel (Escape) keeps every tab and its job.
+After Close the tabs close through `NSWindow.close()`, the same
+non-blocking session close as before (ADR 0018), without asking again. A
+close request for a tab that is already asking is ignored, so ⌘W pressed
+twice asks once, and while ⇧⌘W asks, a close request for any tab of that
+window is ignored; a tab's own question holds back none of its
+neighbours, so an idle tab next to an asking one still closes. `SIGTERM`, `SIGINT` and `SIGHUP`
+still quit without asking: there may be nobody to answer. A session the
+core no longer knows counts as idle. The presenter is a protocol
+(`CloseConfirmationPresenter`), so the hosted tests record the requests
+and answer them.
+
+**Untrusted names.** A process's name is the name of the file it runs,
+which anyone can choose, so it can hold escape sequences, BEL, line
+breaks or bidirectional overrides. The alert shows
+`CloseConfirmation.displayName`: every control, format, line or paragraph
+separator and unassigned scalar becomes U+FFFD, spaces are trimmed, and an
+empty name reads "unnamed process". At most ten processes are listed,
+then "and N more". `NSAlert` text is plain text, so nothing else in a
+name is interpreted.
+
+**Window state.** `WindowStateStore` (`WindowStateStore.swift`) keeps one
+JSON value under the user-defaults key `TesseraWindowState.v1`: each
+window's frame (the selected tab's) and tab count, in the order the windows
+opened. It is saved on quit (`applicationShouldTerminate`, once the quit
+is decided, before the core shuts down) and, coalesced to one save per turn of the main run loop, when
+a window or tab opens or closes, a window moves or is resized, or a tab
+becomes main (how a tab moving between windows shows). At launch, unless
+"Close windows when quitting an application" is on
+(`NSQuitAlwaysKeepsWindows` false or unset, which is macOS's default, as
+for AppKit's own restoration; the setting can be overridden per
+application with `defaults write com.aanyberg.tessera
+NSQuitAlwaysKeepsWindows -bool true`), the windows are recreated: fresh
+login shells in the home directory (D4c), each window at its frame moved
+and shrunk to lie wholly on the screen it overlaps most, or on the main
+screen if it overlaps none, and at least 160 x 80 points. Windows whose
+frame is not finite or empty are dropped, tab counts are at least one and
+at most 64 sessions in all are started, so a damaged value cannot start
+thousands of shells; an unreadable value is ignored. No saved window means
+one new window, as before. The hosted tests never save to the user's
+defaults: the store is unset in the test host and the tests use a suite of
+their own.
+
+Not covered, accepted for 0.1.0: the order of windows in depth, which
+tab was selected, and whether a window was full screen or minimized are
+not restored (a full-screen window comes back as a normal window of the
+screen's size); ⌥⌘Q (Quit and Keep Windows) is not offered; and restore
+follows only `NSQuitAlwaysKeepsWindows`, not the logout panel's "Reopen
+windows when logging back in".
 
 ## Consequences
 
 - The frontend can ask before closing a busy session with one call per
   session; Cmd-Q calls it once per session to build its single list (D4b).
+- With macOS's default "Close windows when quitting an application" on,
+  a relaunch opens one window, as before; the windows come back only when
+  the user has turned that setting off.
 - A job that changes between the check and the close (it finishes, or a
   new one starts) is decided by the check; the close itself never waits
   (ADR 0018).

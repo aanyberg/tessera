@@ -26,6 +26,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// never create a configuration directory or start the core's watch of
     /// it.
     var configFileCreator: (@MainActor () throws -> URL)?
+    /// Asks before a busy tab or window closes and before quitting with busy
+    /// sessions (ADR 0031). Tests record instead of showing alerts.
+    var closeConfirmationPresenter: (any CloseConfirmationPresenter)? = AlertCloseConfirmationPresenter()
+    /// Where each window's frame and tab count are saved for the next launch:
+    /// the user's defaults, or `nil` when hosting tests, so tests never
+    /// overwrite the user's windows (they set a store of their own).
+    var windowStateStore: WindowStateStore?
 
     /// Where Tessera Help goes: the README until there is a help book.
     static let helpURL = URL(string: "https://github.com/aanyberg/tessera#readme")!
@@ -37,6 +44,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var terminationSignals: [any DispatchSourceSignal] = []
     /// Where the next standalone window's top-left corner goes.
     private var cascadePoint = NSPoint.zero
+    /// A coalesced save of the window state is queued.
+    private var windowStateSavePending = false
+    /// Set by a termination signal: quit without asking.
+    var terminatesWithoutConfirmation = false
 
     /// True when the app is the host of an XCTest bundle: no window is opened
     /// at launch, the tests open their own.
@@ -54,8 +65,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MainMenu.install(in: NSApp)
         terminateOnSignals()
         guard !Self.isTestHost else { return }
-        openNewWindow(nil)
+        let store = WindowStateStore(defaults: .standard)
+        windowStateStore = store
+        let restored = WindowStateStore.quitKeepsWindows(.standard) && restoreWindows(from: store.load())
+        if !restored {
+            openNewWindow(nil)
+        }
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Cmd-Q, the Dock's Quit, logging out: when any session runs a job, one
+    /// alert lists them all (D4b) and Cancel keeps everything open. A
+    /// termination signal quits without asking. Once the app quits, the
+    /// windows are saved for the next launch.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if !terminatesWithoutConfirmation, let presenter = closeConfirmationPresenter,
+            let confirmation = CloseConfirmation(.quit, sessions: windowControllers.map(\.session)),
+            !presenter.confirmQuit(confirmation)
+        {
+            return .terminateCancel
+        }
+        saveWindowState()
+        return .terminateNow
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -79,20 +110,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Opens a standalone window with a new session and returns its
     /// controller.
     ///
+    /// - Parameter frame: Where the window goes, as restored at launch;
+    ///   `nil` cascades it from the previous standalone window.
     /// - Throws: The core's error if it or the session cannot be started.
     @discardableResult
-    func newWindow() throws -> TerminalWindowController {
+    func newWindow(frame: NSRect? = nil) throws -> TerminalWindowController {
         let controller = try makeController()
         guard let window = controller.window else { return controller }
         // `.preferred` would put a window that is ordered front into the
         // key window's tab bar; a new window must stand alone.
         window.tabbingMode = .disallowed
-        if windowControllers.count == 1 {
-            window.center()
-            cascadePoint = .zero
+        if let frame {
+            window.setFrame(frame, display: false)
+            // From the zero point the window stays put; the next new window
+            // cascades from it.
+            cascadePoint = window.cascadeTopLeft(from: .zero)
+        } else {
+            if windowControllers.count == 1 {
+                window.center()
+                cascadePoint = .zero
+            }
+            // Each standalone window opens down and to the right of the
+            // previous.
+            cascadePoint = window.cascadeTopLeft(from: cascadePoint)
         }
-        // Each standalone window opens down and to the right of the previous.
-        cascadePoint = window.cascadeTopLeft(from: cascadePoint)
         controller.showWindow(nil)
         window.tabbingMode = .preferred
         return controller
@@ -177,6 +218,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: Window state
+
+    /// Recreates the windows of `state` (the one saved at the last quit) with
+    /// fresh shells: each at its saved frame, moved onto `screens` (the
+    /// visible frames of the screens, the main one first), with its saved
+    /// number of tabs (D4c). Returns whether any window opened; `false` for
+    /// no state or no window in it, so the caller opens the usual one.
+    @discardableResult
+    func restoreWindows(from state: WindowState?, screens: [NSRect] = NSScreen.screens.map(\.visibleFrame)) -> Bool {
+        guard let state else { return false }
+        var opened = false
+        do {
+            for saved in state.restorePlan(screens: screens) {
+                let first = try newWindow(frame: saved.frame)
+                opened = true
+                guard let window = first.window else { continue }
+                for _ in 1..<saved.tabCount {
+                    try newTab(in: window.tabGroup?.windows.last ?? window)
+                }
+            }
+        } catch {
+            presentOpenError(error)
+        }
+        return opened
+    }
+
+    /// Each window's frame and tab count now, in the order the windows
+    /// opened. Every tab of a window counts once, whichever is selected.
+    func currentWindowState() -> WindowState {
+        var windows: [WindowState.Window] = []
+        var indexByGroup: [ObjectIdentifier: Int] = [:]
+        for controller in windowControllers {
+            guard let window = controller.window else { continue }
+            let group = window.tabGroup.map(ObjectIdentifier.init) ?? ObjectIdentifier(window)
+            if let index = indexByGroup[group] {
+                windows[index].tabCount += 1
+            } else {
+                indexByGroup[group] = windows.count
+                let frame = (window.tabGroup?.selectedWindow ?? window).frame
+                windows.append(WindowState.Window(frame: frame, tabCount: 1))
+            }
+        }
+        return WindowState(windows: windows)
+    }
+
+    /// Saves ``currentWindowState()`` to ``windowStateStore``, if there is one.
+    func saveWindowState() {
+        windowStateSavePending = false
+        windowStateStore?.save(currentWindowState())
+    }
+
+    /// Saves the window state once the main actor is next free: a burst of
+    /// tab changes costs one save. A live resize saves once per resize
+    /// event, as the main queue runs between them while the mouse tracks.
+    private func scheduleWindowStateSave() {
+        guard windowStateStore != nil, !windowStateSavePending else { return }
+        windowStateSavePending = true
+        Task { @MainActor [weak self] in
+            self?.saveWindowState()
+        }
+    }
+
     private func makeController() throws -> TerminalWindowController {
         let core = try self.core ?? startCore()
         let session = try core.spawn(spawnOptions)
@@ -186,6 +289,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // delivery, so no event is dropped.
         router.register(controller)
         windowControllers.append(controller)
+        scheduleWindowStateSave()
         return controller
     }
 
@@ -224,8 +328,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func terminateOnSignals() {
         for signalNumber in [SIGTERM, SIGINT, SIGHUP] {
             let source = DispatchSource.makeSignalSource(signal: signalNumber, queue: .main)
-            source.setEventHandler {
-                MainActor.assumeIsolated { NSApp.terminate(nil) }
+            source.setEventHandler { [weak self] in
+                MainActor.assumeIsolated {
+                    // Nobody may be there to answer an alert.
+                    self?.terminatesWithoutConfirmation = true
+                    NSApp.terminate(nil)
+                }
             }
             source.resume()
             terminationSignals.append(source)
@@ -246,6 +354,11 @@ extension AppDelegate: TerminalWindowControllerDelegate {
     func terminalWindowControllerDidClose(_ controller: TerminalWindowController) {
         router.unregister(controller.session)
         windowControllers.removeAll { $0 === controller }
+        scheduleWindowStateSave()
+    }
+
+    func terminalWindowControllerDidChangeLayout(_ controller: TerminalWindowController) {
+        scheduleWindowStateSave()
     }
 }
 
