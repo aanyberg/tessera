@@ -194,7 +194,7 @@ issue assumed. This issue makes no Rust change (lead decision); #90
 exports them. Until then: the composition cell is the grid's first cell (inside the theme's 4 pt
 padding) rather than the cursor's, so the overlay and candidate window open
 at the top left of the terminal; mouse and scroll events carry exact pixel
-positions and cell 0,0 (the core only records the position today); trackpad
+positions and cell 0,0; trackpad
 scrolling converts points to lines with a 16 pt line; and
 `TesseraSurface.size` records what the core accepted. Once the core exports
 cell metrics and the cursor cell, `TerminalSurfaceView.cellGeometry` and
@@ -210,9 +210,10 @@ composition, dropping anything the input context commits while it
 discards. The view
 is the window's `initialFirstResponder`; `resetCursorRects` sets the I-beam
 over the view. A mouse-down makes the view first responder. `mouseDown/Up/
-Dragged`, the right and other buttons and `scrollWheel` go to the core; a
-scroll the core reports `CONSUMED` moved the view and is redrawn. Selection
-and copy are #30.
+Dragged`, the right and other buttons, plain motion and `scrollWheel` go to
+the core, which reports them to a program that tracks the mouse (ADR 0027,
+"Frontend routing"); a scroll the core reports `CONSUMED` is redrawn.
+Selection and copy are #30.
 
 ### Testing
 
