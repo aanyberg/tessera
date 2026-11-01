@@ -2497,6 +2497,7 @@ dependencies = [
 name = "tessera-pty"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "nix",
  "portable-pty",
  "thiserror 2.0.21",

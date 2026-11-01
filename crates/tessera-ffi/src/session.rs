@@ -1,4 +1,5 @@
-//! Sessions: spawning, input, resizing, scrolling and closing.
+//! Sessions: spawning, input, resizing, scrolling, the foreground job and
+//! closing.
 
 use std::ffi::{CStr, OsStr, c_char};
 use std::os::unix::ffi::OsStrExt;
@@ -6,7 +7,8 @@ use std::slice;
 
 use tessera_app_core::view::{MAX_VIEW_COLS, MAX_VIEW_ROWS};
 use tessera_app_core::{
-    PtySize, ScrollTarget as CoreScrollTarget, SessionId, SpawnOptions as CoreSpawnOptions,
+    ForegroundProcess as CoreForegroundProcess, MAX_FOREGROUND_NAME_BYTES, PtySize,
+    ScrollTarget as CoreScrollTarget, SessionId, SpawnOptions as CoreSpawnOptions,
 };
 
 use crate::app::App;
@@ -495,4 +497,167 @@ pub unsafe extern "C" fn tessera_session_scroll_position(
             Err(error) => error::report("tessera_session_scroll_position", &error),
         }
     })
+}
+
+/// Most bytes of a foreground process name, without its terminating NUL:
+/// `TesseraForegroundProcess.name` holds this many plus one.
+pub const FOREGROUND_NAME_LEN: usize = 64;
+
+// cbindgen needs a literal for the array length; these keep it equal to
+// the core's bound.
+const _: () = assert!(FOREGROUND_NAME_LEN == MAX_FOREGROUND_NAME_BYTES);
+// The `65` in `ForegroundProcess::name` is the name plus its NUL.
+const _: () = assert!(65 == FOREGROUND_NAME_LEN + 1);
+
+/// The job a session's shell runs in the foreground, as
+/// `tessera_session_foreground_process` reports it.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForegroundProcess {
+    /// `true` while a job other than the shell owns the terminal: the
+    /// frontend asks before closing the session. `false` at the shell's
+    /// prompt and after the shell has exited; `pid` is 0 and `name` empty
+    /// then.
+    pub running: bool,
+    /// The job's process group id, which is the pid of its first process.
+    pub pid: i32,
+    /// The job's first process's name (`sleep`, `vim`, `ssh`), UTF-8, at
+    /// most `TESSERA_FOREGROUND_NAME_LEN` bytes and NUL-terminated; the
+    /// bytes after the NUL are zero. Empty (a lone NUL) when it cannot be
+    /// read, for example once that process has exited while the rest of
+    /// a pipeline runs on: show a generic description then.
+    pub name: [c_char; 65],
+}
+
+impl Default for ForegroundProcess {
+    fn default() -> Self {
+        Self {
+            running: false,
+            pid: 0,
+            name: [0; 65],
+        }
+    }
+}
+
+impl ForegroundProcess {
+    /// The C description of `job`; `name` stops at its first NUL, if any,
+    /// so C reads the whole name it holds.
+    fn from_core(job: &CoreForegroundProcess) -> Self {
+        let mut out = Self {
+            running: true,
+            // Process ids are positive `pid_t`s, so this never saturates.
+            pid: i32::try_from(job.pid).unwrap_or(i32::MAX),
+            name: [0; 65],
+        };
+        let name = job.name.as_bytes();
+        let name = name
+            .iter()
+            .position(|&b| b == 0)
+            .map_or(name, |end| &name[..end]);
+        for (slot, &byte) in out
+            .name
+            .iter_mut()
+            .zip(&name[..name.len().min(FOREGROUND_NAME_LEN)])
+        {
+            *slot = byte.cast_signed();
+        }
+        out
+    }
+}
+
+/// Stores in `*out` whether session `session_id`'s shell is running a job
+/// in the foreground, and which: `running` is true while a job other than
+/// the shell (`sleep`, `vim`, `ssh`, `tmux`, any program) owns the
+/// terminal, and false at the shell's prompt and once the shell has
+/// exited. A frontend asks before closing a session that is running a job
+/// (ADR 0031).
+///
+/// Only a shell with job control starts jobs, so a session spawned with a
+/// program that is not an interactive shell never reports one. The answer
+/// is a snapshot (the job may end as soon as this returns): read it when
+/// the user asks to close, not per frame. It costs one `tcgetpgrp` (plus
+/// one or two process lookups when a job runs) and
+/// never waits for the child. Safe to call from any thread.
+///
+/// Returns `TESSERA_ERROR_NULL_POINTER` if `app` or `out` is `NULL`,
+/// `TESSERA_ERROR_SESSION_NOT_FOUND` if the id is not a live session (a
+/// closed one included). On failure `*out` is zeroed (when `out` is not
+/// `NULL`).
+///
+/// # Safety
+///
+/// `app` must be `NULL` or a live handle. `out` must be `NULL` or point to
+/// a writable `TesseraForegroundProcess`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_session_foreground_process(
+    app: *mut App,
+    session_id: u64,
+    out: *mut ForegroundProcess,
+) -> Error {
+    ffi_guard!("tessera_session_foreground_process", {
+        if out.is_null() {
+            return Error::NullPointer;
+        }
+        // SAFETY: non-null and writable per the contract.
+        unsafe { out.write(ForegroundProcess::default()) };
+        // SAFETY: the caller passes NULL or a live handle.
+        let Some(app) = (unsafe { App::from_ptr(app) }) else {
+            return Error::NullPointer;
+        };
+        match app.core.foreground_process(SessionId::from_raw(session_id)) {
+            Ok(job) => {
+                if let Some(job) = job {
+                    // SAFETY: as above.
+                    unsafe { out.write(ForegroundProcess::from_core(&job)) };
+                }
+                Error::Ok
+            }
+            Err(error) => error::report("tessera_session_foreground_process", &error),
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn c_name(job: &ForegroundProcess) -> Vec<u8> {
+        job.name
+            .iter()
+            .map(|&c| c.cast_unsigned())
+            .take_while(|&b| b != 0)
+            .collect()
+    }
+
+    #[test]
+    fn names_fill_at_most_the_limit_and_stay_terminated() {
+        let core = |name: &str| CoreForegroundProcess {
+            pid: 42,
+            name: name.to_owned(),
+        };
+        let job = ForegroundProcess::from_core(&core("vim"));
+        assert!(job.running);
+        assert_eq!(job.pid, 42);
+        assert_eq!(c_name(&job), b"vim");
+        assert!(job.name[3..].iter().all(|&c| c == 0));
+
+        let full = "n".repeat(FOREGROUND_NAME_LEN);
+        let job = ForegroundProcess::from_core(&core(&full));
+        assert_eq!(c_name(&job), full.as_bytes());
+        assert_eq!(job.name[FOREGROUND_NAME_LEN], 0, "the last byte is the NUL");
+
+        let job = ForegroundProcess::from_core(&core(&"o".repeat(200)));
+        assert_eq!(c_name(&job).len(), FOREGROUND_NAME_LEN);
+        assert_eq!(job.name[FOREGROUND_NAME_LEN], 0);
+
+        // C stops at an interior NUL; nothing after it leaks into the
+        // zeroed tail.
+        let job = ForegroundProcess::from_core(&core("ab\0cd"));
+        assert_eq!(c_name(&job), b"ab");
+        assert!(job.name[2..].iter().all(|&c| c == 0));
+
+        let job = ForegroundProcess::from_core(&core(""));
+        assert!(job.running, "a job whose name is unknown still runs");
+        assert_eq!(job.name, [0; 65]);
+    }
 }

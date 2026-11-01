@@ -86,7 +86,7 @@ use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
 use tessera_grid::Grid;
-use tessera_pty::{ExitStatus, Pty, PtyError, PtyEvent, PtyEvents, PtySize};
+use tessera_pty::{ExitStatus, ForegroundProcess, Pty, PtyError, PtyEvent, PtyEvents, PtySize};
 use tessera_shell_integration::{Cwd, parse_osc7, parse_osc1337, scripts};
 use tessera_term::{CursorStyle, Request, Terminal};
 
@@ -1273,6 +1273,14 @@ impl Session {
     #[cfg(test)]
     pub(crate) fn delivery_key(&self) -> usize {
         Arc::as_ptr(&self.delivering).addr()
+    }
+
+    /// The job the session's shell runs in the foreground, if any (see
+    /// [`Pty::foreground_process`]). Takes the PTY lock, which input
+    /// writes only hold for a non-blocking attempt, so it never waits on a
+    /// child that stops reading.
+    pub(crate) fn foreground_process(&self) -> Option<ForegroundProcess> {
+        lock(&self.pty).foreground_process()
     }
 
     /// The child's process id, if the PTY knows it.

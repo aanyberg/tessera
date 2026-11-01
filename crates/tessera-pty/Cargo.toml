@@ -15,6 +15,11 @@ nix = { workspace = true, features = ["feature", "signal"] }
 thiserror.workspace = true
 tracing.workspace = true
 
+# `proc_name` and `proc_pidinfo` for the foreground job's name (macOS only;
+# Linux reads `/proc`).
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 # `waitpid` proves a refused spawn left no child behind.
 nix = { workspace = true, features = ["feature", "process", "signal"] }
