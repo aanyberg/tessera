@@ -488,10 +488,20 @@ extension TesseraSession {
         return InputOutcome(outcome)
     }
 
-    /// Sends a mouse event. Today the core only records the position
-    /// (mouse reporting and selection come later) and returns
-    /// ``InputOutcome/ignored``.
+    /// Sends a mouse event: a press, a release, or motion with a button held
+    /// (a drag) or none. The core records the position and decides who has
+    /// the event (ADR 0027): while the program tracks the mouse (DECSET
+    /// 9/1000/1002/1003) it writes the report the program asked for, in the
+    /// encoding it set, and returns ``InputOutcome/consumed``. For a press
+    /// or motion with Shift held (selection bypass) or Command held (links),
+    /// with tracking off, or for an event the mode does not report (motion
+    /// in normal tracking, a release whose press was not reported) it writes
+    /// nothing and returns ``InputOutcome/ignored``; the frontend may then
+    /// select. The release of a reported press is reported whatever the
+    /// modifiers, Shift and Command included. Option is reported as Meta.
     ///
+    /// - Returns: ``InputOutcome/consumed`` when the core wrote a report to
+    ///   the program, ``InputOutcome/ignored`` otherwise.
     /// - Throws: ``TesseraCoreError/invalidArgument`` for a non-finite
     ///   position, ``TesseraCoreError/sessionNotFound`` once closed.
     @MainActor
@@ -505,11 +515,16 @@ extension TesseraSession {
         return InputOutcome(outcome)
     }
 
-    /// Sends a scroll gesture, which moves the session's view through the
-    /// scrollback.
+    /// Sends a scroll gesture. While the program tracks the mouse (and
+    /// Shift is not held) the core reports it as wheel buttons; otherwise it
+    /// moves the session's view through the scrollback, or sends cursor keys
+    /// on the alternate screen. While tracking, a wheel with Command held,
+    /// or any wheel in X10 mode (DECSET 9, which has no wheel buttons), is
+    /// ``InputOutcome/ignored`` and moves nothing.
     ///
     /// - Returns: ``InputOutcome/consumed`` when the view moved by at least
-    ///   one line (redraw), ``InputOutcome/ignored`` otherwise.
+    ///   one line (redraw) or the core wrote wheel reports or keys,
+    ///   ``InputOutcome/ignored`` otherwise.
     /// - Throws: ``TesseraCoreError/invalidArgument`` for a non-finite
     ///   delta, ``TesseraCoreError/sessionNotFound`` once closed.
     @MainActor
