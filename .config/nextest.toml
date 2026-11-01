@@ -52,8 +52,9 @@ test-group = 'timing'
 
 # Bars that are ratios or mutant margins rather than absolute times, still run one at a time (#179): the DECSCUSR
 # flood's 4N/N cost ratio and the clipboard deadline test (a per-command-deadline mutant is caught only while each
-# failing tool takes under 1 s). `resize_is_not_starved_by_a_blocked_writer` is an ordering with no clock bar and
-# runs in parallel.
+# failing tool takes under 1 s). `resize_is_not_starved_by_a_blocked_writer` has no clock bar and runs in parallel: its
+# ratio compares two threads running side by side over a window counted in the writer's attempts (#192), so load slows
+# both alike.
 [[profile.default.overrides]]
 filter = '(package(tessera-term) & binary(decscusr) & test(=a_flood_of_cursor_styles_requests_nothing_and_stays_linear)) | (package(tessera-devwin) & test(=clipboard::tests::the_deadline_covers_all_commands))'
 test-group = 'timing'
