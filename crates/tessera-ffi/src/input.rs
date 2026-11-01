@@ -936,10 +936,13 @@ pub struct MouseEvent {
     /// Zero-based row of the cell under the pointer, from the top of the
     /// visible screen. Values beyond the grid are clamped to its last row.
     pub row: u16,
-    /// Pointer position in pixels from the view's left edge; may be
-    /// negative or beyond the view during a drag. Must be finite.
+    /// Pointer position in physical pixels from the view's left edge,
+    /// padding included; may be negative or beyond the view during a drag.
+    /// Must be finite. SGR-pixels reports (DECSET 1016) take the padding
+    /// off and clamp the position to the text area.
     pub x_px: f32,
-    /// Pointer position in pixels from the view's top edge. Must be finite.
+    /// Pointer position in physical pixels from the view's top edge; see
+    /// `x_px`. Must be finite.
     pub y_px: f32,
     /// Bitwise OR of `TesseraModifiers` values held during the event.
     pub modifiers: u8,
@@ -957,8 +960,9 @@ pub struct ScrollEvent {
     /// accumulate across calls, so a trackpad can report small steps. Must
     /// be finite.
     pub delta_lines: f32,
-    /// Horizontal distance in pixels as measured by the frontend, kept for
-    /// pixel-precise consumers. Must be finite; 0 when unknown.
+    /// Horizontal distance as measured by the frontend. Must be finite; 0
+    /// when unknown. Not used yet: horizontal wheel reports need a defined
+    /// sign and unit for this field (ADR 0027).
     pub delta_x_px: f32,
     /// Vertical distance in pixels as measured by the frontend. Must be
     /// finite; 0 when unknown.
@@ -1186,18 +1190,43 @@ pub unsafe extern "C" fn tessera_session_send_key(
 /// whether the core used it.
 ///
 /// The event's cell is clamped to the session's grid and recorded as the
-/// session's last mouse position; nothing is sent to the child yet (mouse
-/// reporting and selection come later), so the outcome is
-/// `TESSERA_INPUT_OUTCOME_IGNORED` and the frontend keeps handling the
-/// mouse itself.
+/// session's last mouse position. Send every pointer event: presses,
+/// releases, drags and plain motion (button `TESSERA_MOUSE_BUTTON_NONE`).
+///
+/// While the program in the session tracks the mouse (DECSET 9, 1000,
+/// 1002, 1003) the core reports the event to it in the encoding it chose
+/// and stores `TESSERA_INPUT_OUTCOME_CONSUMED`: the program has the event,
+/// so the frontend must not start a selection or otherwise act on it.
+/// Every event that sends nothing stores `TESSERA_INPUT_OUTCOME_IGNORED`,
+/// and the frontend handles it itself (selection, link clicks). The core
+/// decides (ADR 0027):
+///
+/// - tracking off: `IGNORED`;
+/// - Shift held: a press or drag is `IGNORED` (Shift selects even while a
+///   program tracks the mouse); Option is reported to the program as Meta;
+/// - Cmd held: `IGNORED`, never reported (Cmd-click opens links);
+/// - a release is reported (`CONSUMED`) iff its press was, whatever the
+///   modifiers at release, so a selection that started with Shift never
+///   sends a stray release and a reported press is always released;
+/// - motion is reported only when it enters another cell (another pixel
+///   in SGR-pixels mode), and only in the modes that report it; repeated
+///   motion within a cell is `IGNORED`;
+/// - what the program's mode cannot carry (X10 releases, a press beyond
+///   column or row 223 in the default encoding) is `IGNORED`.
+///
+/// A report is queued like a key and never blocks; it can fail like one
+/// (`TESSERA_ERROR_IO`), and a press that failed does not count as
+/// reported.
 ///
 /// Call from the UI (main) thread only.
 ///
 /// Returns `TESSERA_ERROR_NULL_POINTER` if `app`, `event` or `out` is
 /// `NULL`; `TESSERA_ERROR_INVALID_ARGUMENT` for an unknown `kind` or
 /// `button` or a pixel position that is not finite;
-/// `TESSERA_ERROR_SESSION_NOT_FOUND` if the id is not a live session. On
-/// failure nothing is recorded and `*out` is
+/// `TESSERA_ERROR_SESSION_NOT_FOUND` if the id is not a live session;
+/// `TESSERA_ERROR_IO` if a report could not be queued (the child exited,
+/// the session is closing, or its pending input is full). On an invalid
+/// argument nothing is recorded; on any failure `*out` is
 /// `TESSERA_INPUT_OUTCOME_IGNORED` (when `out` is not `NULL`).
 ///
 /// # Safety
@@ -1238,10 +1267,17 @@ pub unsafe extern "C" fn tessera_session_send_mouse(
 /// to the child instead, Up for positive deltas and Down for negative ones
 /// (`ESC [ A` / `ESC [ B`, or `ESC O A` / `ESC O B` in application
 /// cursor-key mode), at most the screen's height per call, and the outcome
-/// is `TESSERA_INPUT_OUTCOME_CONSUMED` when a key was sent. While that
-/// application asked for mouse reports the gesture sends nothing and is
-/// `TESSERA_INPUT_OUTCOME_IGNORED`. The keys are queued like typed keys and
-/// can fail the same way (`TESSERA_ERROR_IO`).
+/// is `TESSERA_INPUT_OUTCOME_CONSUMED` when a key was sent. The keys are
+/// queued like typed keys and can fail the same way (`TESSERA_ERROR_IO`).
+///
+/// While the program tracks the mouse (DECSET 1000, 1002, 1003; ADR 0027)
+/// the wheel goes to it instead, on either screen and without moving the
+/// view: each whole line is one wheel report over the event's cell (button
+/// 64 for positive deltas, 65 for negative), at most the screen's height
+/// per call, `TESSERA_INPUT_OUTCOME_CONSUMED` when one was sent. With
+/// Shift held the gesture scrolls the scrollback or sends cursor keys as
+/// above; with Cmd held, or in X10 mode (DECSET 9), it does nothing and is
+/// `TESSERA_INPUT_OUTCOME_IGNORED`. `delta_x_px` is not reported.
 ///
 /// Call from the UI (main) thread only.
 ///

@@ -4,7 +4,10 @@
 //! terminal mode state (cursor keys, bracketed paste, alternate screen, …).
 //! Bytes in, grid mutations and side-effect requests (bell, title change,
 //! clipboard write) out. The [`keyboard`] module goes the other way: it
-//! encodes key events into the bytes written to the PTY.
+//! encodes key events into the bytes written to the PTY, and
+//! [`encode_mouse`] does the same for mouse reports in the tracking mode and
+//! encoding the program chose ([`Modes::mouse`], [`Modes::mouse_encoding`];
+//! ADR 0027).
 //!
 //! ## OSC
 //!
@@ -84,6 +87,7 @@ mod dcs;
 mod esc;
 pub mod keyboard;
 mod modes;
+mod mouse;
 mod osc;
 mod reports;
 mod sgr;
@@ -93,6 +97,7 @@ pub use keyboard::{
     ModifyOtherKeys, encode_key, encode_key_into,
 };
 pub use modes::{KITTY_STACK_DEPTH, Modes, MouseEncoding, MouseTracking};
+pub use mouse::{MouseReport, MouseReportButton, MouseReportKind, encode_mouse};
 pub use reports::{DA2_PV, TITLE_STACK_DEPTH};
 
 use dcs::Dcs;

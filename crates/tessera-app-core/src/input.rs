@@ -19,15 +19,21 @@
 //!   terminal lock once per key) and queued for the session's writer thread
 //!   without blocking.
 //! * **Mouse**: the position is clamped to the session's grid and kept as
-//!   the session's last mouse position; nothing is written. Mouse reporting
-//!   (#12) and selection (#30) build on it.
-//! * **Scroll**: on the primary screen, moves the session's scrollback view
-//!   (see [`App::scroll_offset`](crate::App::scroll_offset)), accumulating
+//!   the session's last mouse position. While the program tracks the mouse
+//!   the event is reported to it ([`tessera_term::encode_mouse`]) and is
+//!   [`InputOutcome::Consumed`]; Shift bypasses reporting and Cmd is never
+//!   reported, so the frontend selects or opens a link when the outcome is
+//!   [`InputOutcome::Ignored`] (ADR 0027, and
+//!   [`App::send_input`](crate::App::send_input) for every rule).
+//! * **Scroll**: while the program tracks the mouse (not in X10 mode),
+//!   one wheel report per whole line, on either screen, unless Shift (the
+//!   scrollback or cursor keys below) or Cmd (nothing) is held. Otherwise,
+//!   on the primary screen, moves the session's scrollback view (see
+//!   [`App::scroll_offset`](crate::App::scroll_offset)), accumulating
 //!   fractional lines. On the alternate screen, which has no scrollback,
 //!   sends one cursor key per whole line instead, Up for older output and
-//!   Down for newer, in the form DECCKM selects (xterm's alternate scroll),
-//!   unless the application asked for mouse reports, which will carry the
-//!   wheel (#12).
+//!   Down for newer, in the form DECCKM selects (xterm's alternate
+//!   scroll).
 //! * **Paste**: sanitised with [`sanitize_paste_into`] straight into the
 //!   buffer that is queued, like a key, in order with the keys around it.
 //!   In bracketed-paste mode (DECSET 2004) it is wrapped in `ESC [ 200 ~`
@@ -113,11 +119,13 @@ pub struct MouseEvent {
     /// Zero-based row of the cell under the pointer, counted from the top of
     /// the visible screen. Clamped like [`MouseEvent::col`].
     pub row: u16,
-    /// Pointer position in pixels from the left edge of the view; may be
-    /// negative or beyond the view during a drag. Kept as given.
+    /// Pointer position in physical pixels from the left edge of the view
+    /// (padding included); may be negative or beyond the view during a
+    /// drag. Kept as given; SGR-pixels reports (DECSET 1016) take the
+    /// view's padding off and clamp it to the text area.
     pub x_px: f32,
-    /// Pointer position in pixels from the top edge of the view; kept as
-    /// given.
+    /// Pointer position in physical pixels from the top edge of the view;
+    /// see [`MouseEvent::x_px`].
     pub y_px: f32,
     /// Modifiers held during the event.
     pub modifiers: Modifiers,
@@ -134,12 +142,13 @@ pub struct ScrollEvent {
     /// (into the scrollback); fractions accumulate across events. A value
     /// that is not finite is ignored.
     pub delta_lines: f32,
-    /// Horizontal distance in pixels as the frontend measured it, for
-    /// pixel-precise consumers (mouse reporting, #12). Not used for the
-    /// scrollback view.
+    /// Horizontal distance in pixels as the frontend measured it. Not used:
+    /// the scrollback view is vertical, and horizontal wheel reports
+    /// (buttons 66 and 67) wait for this field to have a defined sign and
+    /// unit (ADR 0027).
     pub delta_x_px: f32,
-    /// Vertical distance in pixels as the frontend measured it; see
-    /// [`ScrollEvent::delta_x_px`].
+    /// Vertical distance in pixels as the frontend measured it. Not used;
+    /// [`ScrollEvent::delta_lines`] drives the view and wheel reports.
     pub delta_y_px: f32,
     /// Whether the deltas come from a precise device (trackpad, Magic
     /// Mouse) rather than a notched wheel.

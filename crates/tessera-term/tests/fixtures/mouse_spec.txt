@@ -1,0 +1,1606 @@
+# =============================================================================
+# Mouse reporting: the encoder (tessera-term) and the routing of mouse and wheel events (tessera-app-core)   (#12, wave 9)
+# crates/tessera-term/tests/fixtures/mouse_spec.txt
+#
+# Converted from the #12 spec-researcher's tables (2026-11-01) with the milestone lead's decisions applied; every
+# expected value comes from the sources below, never from running tessera. Changes against the researcher's tables:
+# A34 (a release beyond column 223 is clamped, not dropped) and the new rows U17 and G01-G04, each citing the decision.
+#
+# SOURCES
+#   [CTL] xterm ctlseqs "Mouse Tracking" (X10 compatibility, Normal tracking, Wheel mice, Other buttons, Button-event and
+#         Any-event tracking, Extended coordinates 1005/1006/1015/1016): https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+#   [XB]  xterm button.c (ThomasDickey/xterm-snapshots master, 2026-11-01): MouseLimit, EmitMousePosition, BtnCode,
+#         EmitButtonCode, EditorButton (motion dedupe per cell), SendMousePosition; ptyx.h OriginX/OriginY.
+#   [AL]  Alacritty alacritty/src/input/mod.rs (mouse_report, normal/sgr_mouse_report, scroll_terminal).
+#   [KT]  kitty kitty/mouse.c encode_mouse_event_impl.   [GH] Ghostty src/input/mouse_encode.zig and its unit tests.
+#   [IT]  iTerm2 profile prefs (Option bypass).   [WZ] WezTerm bypass_mouse_reporting_modifiers (default SHIFT).
+#
+# DECISIONS (spec-12-mouse.md "DECISIONS"; "Lead decisions (2026-11-01)" in the wave-9 plan)
+#   Q1/Q2  Default encoding: a press, motion or wheel event beyond one-based column or row 223 is not reported (AL/KT/GH;
+#          xterm writes a NUL byte); UTF-8 (1005) likewise beyond 2015. A release is never dropped: it is clamped to the limit.
+#   Q3     SGR-pixels (1016) prints pixel + 1 (xterm), from the text area's top-left corner (inside the padding); a pointer
+#          outside the text area is clamped to its edge before the +1.
+#   Q4     Wheel buttons 64-67 are reported as presses only, never released. Back/forward (128/129) press and release.
+#   Q5     Routing: a release is sent iff its press was reported, whatever the modifiers at release time.
+#   Q6     X10 (DECSET 9): left/middle/right presses only, no modifiers; combines with any encoding.
+#   Q7     Motion is reported only when its cell (or pixel, in 1016) differs from the last report of any kind.
+#   Q8     Motion with several buttons held reports the lowest held: left, middle, right, back, forward.
+#   Q9     Horizontal wheel: the encoder has codes 66/67; the routing does not report horizontal scrolling yet, since the
+#          FFI's delta_x_px has no defined sign or unit (lead: defer to 0.2.0).
+#   Q10/D2 Shift bypasses reporting (selection); Option is reported as Meta (8); Cmd is never reported.
+#   Q11    Wheel: tracking on and no Shift reports on both screens; Shift+wheel scrolls the scrollback on the primary
+#          screen and sends the alternate-scroll cursor keys on the alternate screen; X10 + wheel is Ignored.
+#   Q12    The click that activates an inactive window is not reported: the frontend swallows it (12-app).
+#
+# FORMAT
+#   Encoder rows (tests/mouse.rs in tessera-term, one encode_mouse call each, through common::check_table):
+#     ### <id>          A default, X/N/B/M tracking modes, U UTF-8, S SGR, R urxvt, P SGR-pixels.
+#     tracking:         None | X10 | Normal | Button | AnyMotion
+#     encoding:         Default | Utf8 | Sgr | Urxvt | SgrPixels
+#     event:            press|release|motion  none|left|middle|right|back|forward|wheel-up|wheel-down|wheel-left|wheel-right
+#     mods:             - or S, A, C, Cmd joined by + (Shift, Alt/Option, Control, Command)
+#     cell: col,row     zero-based cell, as the FFI delivers it
+#     px: x,y           (P rows) pixels from the text area's top-left corner, with area: <w>x<h> (MouseReport::with_pixels)
+#     expect:           hex bytes, or text with \e for ESC, or none (encode_mouse returns None)
+#   Routing rows (src/tests/mouse.rs in tessera-app-core: App::send_input on a session with a fake PTY, 24x80):
+#     ### <id>          D sequences, W wheel routing, G routing additions.
+#     size: RxC         resize the session first (optional).
+#     step: feed <text>                         the child writes <text> (\e for ESC): mode changes, screen switches
+#     step: fill <n>                            the child writes n numbered lines (fills the scrollback)
+#     step: press|release|motion <button> <col>,<row> [mods] [px x,y] -> C|I   a mouse event and its expected outcome
+#     step: wheel <lines> <col>,<row> [mods] -> C|I                             a scroll event of <lines> (delta_lines)
+#     step: focus gained|lost -> C|I
+#     written: [<n>x ]<text>|none   the bytes queued for the child, in order; several lines concatenate
+#     offset: <n>        the scroll offset afterwards (optional)
+#     generated:         a row too large to list, checked by the named test
+#   cite:/note: are not checked. A case tessera cannot pass yet is a #> block naming the issue that will make it pass.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Encoder tables A (default), X/N/B/M (tracking modes), U (UTF-8), S (SGR), R (urxvt), P (SGR-pixels, cell 8x16, 80x24)
+# -----------------------------------------------------------------------------
+
+### A01
+tracking: Normal
+encoding: Default
+event: press left
+mods: -
+cell: 0,0
+expect: 1b 5b 4d 20 21 21
+note: ctlseqs example "CSI M ␠ ! !" (button 1 at 1,1) ; xterm
+
+### A02
+tracking: Normal
+encoding: Default
+event: release left
+mods: -
+cell: 0,0
+expect: 1b 5b 4d 23 21 21
+note: release is button 3 in non-SGR: CTL "3 = release"; XB L5604 `button = -1`; ref-agree
+
+### A03
+tracking: Normal
+encoding: Default
+event: press middle
+mods: -
+cell: 9,4
+expect: 1b 5b 4d 21 2a 25
+note: Cx=32+10=2a, Cy=32+5=25; CTL
+
+### A04
+tracking: Normal
+encoding: Default
+event: release middle
+mods: -
+cell: 9,4
+expect: 1b 5b 4d 23 2a 25
+note: the middle release also loses its button: 3; CTL, XB
+
+### A05
+tracking: Normal
+encoding: Default
+event: press right
+mods: -
+cell: 0,0
+expect: 1b 5b 4d 22 21 21
+note: CTL
+
+### A06
+tracking: Normal
+encoding: Default
+event: release right
+mods: -
+cell: 79,23
+expect: 1b 5b 4d 23 70 38
+note: one-based 80,24 => 0x70,0x38; CTL
+
+### A07
+tracking: Normal
+encoding: Default
+event: press wheel-up
+mods: -
+cell: 0,0
+expect: 1b 5b 4d 60 21 21
+note: CTL "Wheel mice": 64; XB BtnCode (`button&4 => +64`)
+
+### A08
+tracking: Normal
+encoding: Default
+event: press wheel-down
+mods: -
+cell: 0,0
+expect: 1b 5b 4d 61 21 21
+note: CTL
+
+### A09
+tracking: Normal
+encoding: Default
+event: press wheel-left
+mods: -
+cell: 0,0
+expect: 1b 5b 4d 62 21 21
+note: CTL "Other buttons": buttons 6,7 add 64
+
+### A10
+tracking: Normal
+encoding: Default
+event: press wheel-right
+mods: -
+cell: 0,0
+expect: 1b 5b 4d 63 21 21
+note: CTL
+
+### A11
+tracking: Normal
+encoding: Default
+event: press wheel-up
+mods: C
+cell: 0,0
+expect: 1b 5b 4d 70 21 21
+note: 64+16 => 80+32=0x70; XB BtnCode
+
+### A12
+tracking: Normal
+encoding: Default
+event: press left
+mods: C
+cell: 0,0
+expect: 1b 5b 4d 30 21 21
+note: Ctrl = 16: CTL "16 = Control"
+
+### A13
+tracking: Normal
+encoding: Default
+event: press left
+mods: A
+cell: 0,0
+expect: 1b 5b 4d 28 21 21
+note: Meta/Option = 8: CTL; AL/KT/GH send alt as 8
+
+### A14
+tracking: Normal
+encoding: Default
+event: press left
+mods: A+C
+cell: 0,0
+expect: 1b 5b 4d 38 21 21
+note: 24+32
+
+### A15
+tracking: Normal
+encoding: Default
+event: press left
+mods: S
+cell: 0,0
+expect: 1b 5b 4d 24 21 21
+note: enc-only: Shift = 4 (CTL); never produced by routing (D2)
+
+### A16
+tracking: Normal
+encoding: Default
+event: press left
+mods: S+A+C
+cell: 0,0
+expect: 1b 5b 4d 3c 21 21
+note: enc-only: 28+32
+
+### A17
+tracking: Normal
+encoding: Default
+event: release left
+mods: C
+cell: 0,0
+expect: 1b 5b 4d 33 21 21
+note: modifiers stay on release: 3+16=19, +32 = 0x33; XB BtnCode (state on release); GH/AL/KT agree
+
+### A18
+tracking: Normal
+encoding: Default
+event: release left
+mods: A
+cell: 0,0
+expect: 1b 5b 4d 2b 21 21
+note: 3+8
+
+### A19
+tracking: Normal
+encoding: Default
+event: press back
+mods: -
+cell: 0,0
+expect: 1b 5b 4d a0 21 21
+note: CTL "buttons 8-11 add 128"; one raw byte 0xA0 (not UTF-8)
+
+### A20
+tracking: Normal
+encoding: Default
+event: press forward
+mods: -
+cell: 0,0
+expect: 1b 5b 4d a1 21 21
+note: CTL
+
+### A21
+tracking: Normal
+encoding: Default
+event: release back
+mods: -
+cell: 0,0
+expect: 1b 5b 4d 23 21 21
+note: release is 3 for every non-wheel button: XB L5589
+
+### A22
+tracking: Normal
+encoding: Default
+event: press left
+mods: -
+cell: 94,0
+expect: 1b 5b 4d 20 7f 21
+note: one-based 95 => 127 = 0x7f (the default encoding has no boundary here; U03 is the UTF-8 boundary)
+
+### A23
+tracking: Normal
+encoding: Default
+event: press left
+mods: -
+cell: 93,0
+expect: 1b 5b 4d 20 7e 21
+note: one-based 94 => 126
+
+### A24
+tracking: Normal
+encoding: Default
+event: press left
+mods: -
+cell: 222,0
+expect: 1b 5b 4d 20 ff 21
+note: last encodable column: one-based 223 => 255; CTL "limits ... to 223 (=255-32)"
+
+### A25
+tracking: Normal
+encoding: Default
+event: press left
+mods: -
+cell: 0,222
+expect: 1b 5b 4d 20 21 ff
+note: last encodable row
+
+### A26
+tracking: Normal
+encoding: Default
+event: press left
+mods: -
+cell: 222,222
+expect: 1b 5b 4d 20 ff ff
+note: both at the limit
+
+### A27
+tracking: Normal
+encoding: Default
+event: release left
+mods: -
+cell: 222,222
+expect: 1b 5b 4d 23 ff ff
+note: release at the limit still encodes
+
+### A30
+tracking: Normal
+encoding: Default
+event: press left
+mods: -
+cell: 223,0
+expect: none
+note: Q1: drop (AL/KT/GH). xterm-nul variant (non-normative): 1b 5b 4d 20 00 21
+
+### A31
+tracking: Normal
+encoding: Default
+event: press left
+mods: -
+cell: 0,223
+expect: none
+note: Q1; xterm-nul: 1b 5b 4d 20 21 00
+
+### A32
+tracking: Normal
+encoding: Default
+event: press left
+mods: -
+cell: 5000,7000
+expect: none
+note: Q1; xterm-nul: 1b 5b 4d 20 00 00 (clamped)
+
+### A33
+tracking: Normal
+encoding: Default
+event: press wheel-up
+mods: -
+cell: 223,0
+expect: none
+note: the limit applies to wheel reports too (same encoder)
+
+### A34
+tracking: Normal
+encoding: Default
+event: release left
+mods: -
+cell: 223,0
+expect: 1b 5b 4d 23 ff 21
+note: lead decision (2026-11-01, overrides the researcher's `none`): a release is never dropped, which would leave the program with a held button; its coordinates are clamped to 223 (one-based) instead
+
+### X01
+tracking: X10
+encoding: Default
+event: press left
+mods: -
+cell: 0,0
+expect: 1b 5b 4d 20 21 21
+note: CTL X10: "Cb is button-1" sent on press only
+
+### X02
+tracking: X10
+encoding: Default
+event: press middle
+mods: -
+cell: 0,0
+expect: 1b 5b 4d 21 21 21
+
+### X03
+tracking: X10
+encoding: Default
+event: press right
+mods: -
+cell: 0,0
+expect: 1b 5b 4d 22 21 21
+
+### X04
+tracking: X10
+encoding: Default
+event: press left
+mods: C
+cell: 0,0
+expect: 1b 5b 4d 20 21 21
+note: no modifiers in X10: XB EmitButtonCode `' ' + button`; GH "X10 does not include modifiers"; Q6
+
+### X05
+tracking: X10
+encoding: Default
+event: press left
+mods: S+A+C
+cell: 0,0
+expect: 1b 5b 4d 20 21 21
+note: same
+
+### X06
+tracking: X10
+encoding: Default
+event: release left
+mods: -
+cell: 0,0
+expect: none
+note: CTL: press only; XB L741
+
+### X07
+tracking: X10
+encoding: Default
+event: press wheel-up
+mods: -
+cell: 0,0
+expect: none
+note: XB `button > 3 => return` in X10
+
+### X08
+tracking: X10
+encoding: Default
+event: press back
+mods: -
+cell: 0,0
+expect: none
+
+### X09
+tracking: X10
+encoding: Default
+event: motion left
+mods: -
+cell: 5,2
+expect: none
+
+### X10
+tracking: X10
+encoding: Default
+event: motion none
+mods: -
+cell: 5,2
+expect: none
+
+### N01
+tracking: Normal
+encoding: Default
+event: motion left
+mods: -
+cell: 5,2
+expect: none
+note: CTL: Normal reports no motion; XB VT200 branch handles only button events
+
+### N02
+tracking: Normal
+encoding: Default
+event: motion none
+mods: -
+cell: 5,2
+expect: none
+
+### B01
+tracking: Button
+encoding: Default
+event: motion left
+mods: -
+cell: 5,2
+expect: 1b 5b 4d 40 26 23
+note: CTL "CSI M @ CxCy (32+0+32)" ; Cx=32+6, Cy=32+3
+
+### B02
+tracking: Button
+encoding: Default
+event: motion middle
+mods: -
+cell: 5,2
+expect: 1b 5b 4d 41 26 23
+note: 33+32
+
+### B03
+tracking: Button
+encoding: Default
+event: motion right
+mods: -
+cell: 5,2
+expect: 1b 5b 4d 42 26 23
+note: CTL "CSI M B CxCy (32+2+32)"
+
+### B04
+tracking: Button
+encoding: Default
+event: motion left
+mods: C
+cell: 5,2
+expect: 1b 5b 4d 50 26 23
+note: 32+16+32
+
+### B05
+tracking: Button
+encoding: Default
+event: motion left
+mods: A
+cell: 5,2
+expect: 1b 5b 4d 48 26 23
+note: 32+8+32
+
+### B06
+tracking: Button
+encoding: Default
+event: motion back
+mods: -
+cell: 5,2
+expect: 1b 5b 4d c0 26 23
+note: 128+32+32 = 192 = 0xC0
+
+### B07
+tracking: Button
+encoding: Default
+event: motion none
+mods: -
+cell: 5,2
+expect: none
+note: CTL: Button-event only while a button is down; GH `.button => event.button != null`; AL
+
+### B08
+tracking: Button
+encoding: Default
+event: press left
+mods: -
+cell: 5,2
+expect: 1b 5b 4d 20 26 23
+note: presses/releases unchanged
+
+### B09
+tracking: Button
+encoding: Default
+event: release left
+mods: -
+cell: 5,2
+expect: 1b 5b 4d 23 26 23
+
+### M01
+tracking: AnyMotion
+encoding: Default
+event: motion none
+mods: -
+cell: 5,2
+expect: 1b 5b 4d 43 26 23
+note: 3+32 = 35, +32 = 67 = 'C'; XB BtnCode (`button < 0 => +3`, motion +32)
+
+### M02
+tracking: AnyMotion
+encoding: Default
+event: motion none
+mods: C
+cell: 5,2
+expect: 1b 5b 4d 53 26 23
+note: 35+16=51, +32 = 83 = 0x53
+
+### M03
+tracking: AnyMotion
+encoding: Default
+event: motion none
+mods: A
+cell: 5,2
+expect: 1b 5b 4d 4b 26 23
+note: 35+8=43, +32 = 75 = 0x4b
+
+### M04
+tracking: AnyMotion
+encoding: Default
+event: motion left
+mods: -
+cell: 5,2
+expect: 1b 5b 4d 40 26 23
+note: same as Button
+
+### M05
+tracking: AnyMotion
+encoding: Default
+event: press wheel-up
+mods: -
+cell: 5,2
+expect: 1b 5b 4d 60 26 23
+note: wheel has no motion bit
+
+### U01
+tracking: Normal
+encoding: Utf8
+event: press left
+mods: -
+cell: 0,0
+expect: 1b 5b 4d 20 21 21
+note: identical to default for small values
+
+### U02
+tracking: Normal
+encoding: Utf8
+event: press left
+mods: -
+cell: 93,0
+expect: 1b 5b 4d 20 7e 21
+note: one-based 94 => 126
+
+### U03
+tracking: Normal
+encoding: Utf8
+event: press left
+mods: -
+cell: 94,0
+expect: 1b 5b 4d 20 7f 21
+note: one-based 95 => 127, last single-byte (XB EXT_MOUSE_START = 127-32)
+
+### U04
+tracking: Normal
+encoding: Utf8
+event: press left
+mods: -
+cell: 95,0
+expect: 1b 5b 4d 20 c2 80 21
+note: one-based 96 => 128 => c2 80
+
+### U05
+tracking: Normal
+encoding: Utf8
+event: press left
+mods: -
+cell: 0,95
+expect: 1b 5b 4d 20 21 c2 80
+note: row uses the same rule
+
+### U06
+tracking: Normal
+encoding: Utf8
+event: press left
+mods: -
+cell: 222,0
+expect: 1b 5b 4d 20 c3 bf 21
+note: one-based 223 => 255 => c3 bf (the last value the default encoding can carry)
+
+### U07
+tracking: Normal
+encoding: Utf8
+event: press left
+mods: -
+cell: 223,0
+expect: 1b 5b 4d 20 c4 80 21
+note: 256 => c4 80: where default drops, UTF-8 continues
+
+### U08
+tracking: Normal
+encoding: Utf8
+event: press left
+mods: -
+cell: 299,399
+expect: 1b 5b 4d 20 c5 8c c6 b0
+note: one-based 300,400 => 332,432; 332 = 0x14c => c5 8c; 432 = 0x1b0 => c6 b0
+
+### U09
+tracking: Normal
+encoding: Utf8
+event: press left
+mods: -
+cell: 2014,0
+expect: 1b 5b 4d 20 df bf 21
+note: one-based 2015 => 2047 => df bf (limit)
+
+### U10
+tracking: Normal
+encoding: Utf8
+event: press left
+mods: -
+cell: 2015,0
+expect: none
+note: Q2: drop (xterm-nul: 1b 5b 4d 20 00 21)
+
+### U11
+tracking: Normal
+encoding: Utf8
+event: press left
+mods: -
+cell: 0,2015
+expect: none
+note: Q2
+
+### U12
+tracking: Normal
+encoding: Utf8
+event: press back
+mods: -
+cell: 0,0
+expect: 1b 5b 4d c2 a0 21 21
+note: Cb 160 as code point: c2 a0 [GH test `\u{A0}#$` for cell 2,3 (one-based 3,4)]
+
+### U13
+tracking: Normal
+encoding: Utf8
+event: press forward
+mods: -
+cell: 0,0
+expect: 1b 5b 4d c2 a1 21 21
+
+### U14
+tracking: Normal
+encoding: Utf8
+event: press wheel-up
+mods: -
+cell: 0,0
+expect: 1b 5b 4d 60 21 21
+note: 96 < 128, single byte
+
+### U15
+tracking: Button
+encoding: Utf8
+event: motion back
+mods: S+A+C
+cell: 0,0
+expect: 1b 5b 4d c3 9c 21 21
+note: enc-only: 128+28+32 = 188, +32 = 220 => c3 9c
+
+### U16
+tracking: Normal
+encoding: Utf8
+event: release left
+mods: -
+cell: 95,0
+expect: 1b 5b 4d 23 c2 80 21
+note: release is 3 here too
+
+### U17
+tracking: Normal
+encoding: Utf8
+event: release left
+mods: -
+cell: 2015,0
+expect: 1b 5b 4d 23 df bf 21
+note: lead decision Q1/Q2: a release beyond 2015 is clamped to 2015 (one-based), never dropped
+
+### S01
+tracking: Normal
+encoding: Sgr
+event: press left
+mods: -
+cell: 0,0
+expect: \e[<0;1;1M
+
+### S02
+tracking: Normal
+encoding: Sgr
+event: release left
+mods: -
+cell: 0,0
+expect: \e[<0;1;1m
+note: release keeps the button: XB `final = 'm'`
+
+### S03
+tracking: Normal
+encoding: Sgr
+event: press middle
+mods: -
+cell: 9,4
+expect: \e[<1;10;5M
+
+### S04
+tracking: Normal
+encoding: Sgr
+event: release middle
+mods: -
+cell: 9,4
+expect: \e[<1;10;5m
+
+### S05
+tracking: Normal
+encoding: Sgr
+event: press right
+mods: -
+cell: 79,23
+expect: \e[<2;80;24M
+
+### S06
+tracking: Normal
+encoding: Sgr
+event: release right
+mods: -
+cell: 79,23
+expect: \e[<2;80;24m
+
+### S07
+tracking: Normal
+encoding: Sgr
+event: press wheel-up
+mods: -
+cell: 0,0
+expect: \e[<64;1;1M
+note: wheel is `M`, never `m` (Q4)
+
+### S08
+tracking: Normal
+encoding: Sgr
+event: press wheel-down
+mods: -
+cell: 0,0
+expect: \e[<65;1;1M
+
+### S09
+tracking: Normal
+encoding: Sgr
+event: press wheel-left
+mods: -
+cell: 0,0
+expect: \e[<66;1;1M
+
+### S10
+tracking: Normal
+encoding: Sgr
+event: press wheel-right
+mods: -
+cell: 0,0
+expect: \e[<67;1;1M
+
+### S11
+tracking: Normal
+encoding: Sgr
+event: press wheel-up
+mods: C
+cell: 0,0
+expect: \e[<80;1;1M
+note: 64+16
+
+### S12
+tracking: Normal
+encoding: Sgr
+event: press left
+mods: C
+cell: 0,0
+expect: \e[<16;1;1M
+
+### S13
+tracking: Normal
+encoding: Sgr
+event: release left
+mods: C
+cell: 0,0
+expect: \e[<16;1;1m
+note: modifiers stay on release (GH/AL/KT agree)
+
+### S14
+tracking: Normal
+encoding: Sgr
+event: press left
+mods: A
+cell: 0,0
+expect: \e[<8;1;1M
+
+### S15
+tracking: Normal
+encoding: Sgr
+event: press left
+mods: A+C
+cell: 0,0
+expect: \e[<24;1;1M
+
+### S16
+tracking: Normal
+encoding: Sgr
+event: press left
+mods: S
+cell: 0,0
+expect: \e[<4;1;1M
+note: enc-only
+
+### S17
+tracking: Normal
+encoding: Sgr
+event: press left
+mods: S+A+C
+cell: 0,0
+expect: \e[<28;1;1M
+note: enc-only
+
+### S18
+tracking: Normal
+encoding: Sgr
+event: press back
+mods: -
+cell: 0,0
+expect: \e[<128;1;1M
+note: CTL Other buttons
+
+### S19
+tracking: Normal
+encoding: Sgr
+event: release back
+mods: -
+cell: 0,0
+expect: \e[<128;1;1m
+
+### S20
+tracking: Normal
+encoding: Sgr
+event: press forward
+mods: -
+cell: 0,0
+expect: \e[<129;1;1M
+
+### S21
+tracking: Normal
+encoding: Sgr
+event: release forward
+mods: -
+cell: 0,0
+expect: \e[<129;1;1m
+
+### S22
+tracking: Button
+encoding: Sgr
+event: motion left
+mods: -
+cell: 5,2
+expect: \e[<32;6;3M
+note: motion bit 32, final M
+
+### S23
+tracking: Button
+encoding: Sgr
+event: motion middle
+mods: -
+cell: 5,2
+expect: \e[<33;6;3M
+
+### S24
+tracking: Button
+encoding: Sgr
+event: motion right
+mods: -
+cell: 5,2
+expect: \e[<34;6;3M
+
+### S25
+tracking: Button
+encoding: Sgr
+event: motion left
+mods: C
+cell: 5,2
+expect: \e[<48;6;3M
+note: 32+16
+
+### S26
+tracking: Button
+encoding: Sgr
+event: motion back
+mods: -
+cell: 5,2
+expect: \e[<160;6;3M
+note: 128+32
+
+### S27
+tracking: AnyMotion
+encoding: Sgr
+event: motion none
+mods: -
+cell: 5,2
+expect: \e[<35;6;3M
+note: 3+32; XB `button < 0 => +3`
+
+### S28
+tracking: AnyMotion
+encoding: Sgr
+event: motion none
+mods: C
+cell: 5,2
+expect: \e[<51;6;3M
+
+### S29
+tracking: AnyMotion
+encoding: Sgr
+event: motion none
+mods: A
+cell: 5,2
+expect: \e[<43;6;3M
+
+### S30
+tracking: Button
+encoding: Sgr
+event: motion none
+mods: -
+cell: 5,2
+expect: none
+note: Button mode needs a held button
+
+### S31
+tracking: Normal
+encoding: Sgr
+event: press left
+mods: -
+cell: 222,222
+expect: \e[<0;223;223M
+
+### S32
+tracking: Normal
+encoding: Sgr
+event: press left
+mods: -
+cell: 223,0
+expect: \e[<0;224;1M
+note: SGR unbounded: no 223 limit (XB `mouse_limit = -1`)
+
+### S33
+tracking: Normal
+encoding: Sgr
+event: press left
+mods: -
+cell: 9999,3
+expect: \e[<0;10000;4M
+note: the FFI clamps to the grid in practice; encoder takes any u16/u32
+
+### S34
+tracking: X10
+encoding: Sgr
+event: press left
+mods: C
+cell: 0,0
+expect: \e[<0;1;1M
+note: Q6: X10 + SGR; no modifier bits
+
+### S35
+tracking: X10
+encoding: Sgr
+event: release left
+mods: -
+cell: 0,0
+expect: none
+
+### S36
+tracking: Normal
+encoding: Sgr
+event: release wheel-up
+mods: -
+cell: 0,0
+expect: none
+note: Q4
+
+### R01
+tracking: Normal
+encoding: Urxvt
+event: press left
+mods: -
+cell: 0,0
+expect: \e[32;1;1M
+
+### R02
+tracking: Normal
+encoding: Urxvt
+event: release left
+mods: -
+cell: 0,0
+expect: \e[35;1;1M
+note: release is 3 (+32); GH test "urxvt release uses legacy button 3 encoding"
+
+### R03
+tracking: Normal
+encoding: Urxvt
+event: press middle
+mods: -
+cell: 9,4
+expect: \e[33;10;5M
+
+### R04
+tracking: Normal
+encoding: Urxvt
+event: press right
+mods: -
+cell: 79,23
+expect: \e[34;80;24M
+
+### R05
+tracking: Normal
+encoding: Urxvt
+event: press wheel-up
+mods: -
+cell: 0,0
+expect: \e[96;1;1M
+note: 64+32
+
+### R06
+tracking: Normal
+encoding: Urxvt
+event: press wheel-down
+mods: -
+cell: 0,0
+expect: \e[97;1;1M
+
+### R07
+tracking: Normal
+encoding: Urxvt
+event: press wheel-left
+mods: -
+cell: 0,0
+expect: \e[98;1;1M
+
+### R08
+tracking: Normal
+encoding: Urxvt
+event: press wheel-right
+mods: -
+cell: 0,0
+expect: \e[99;1;1M
+
+### R09
+tracking: Normal
+encoding: Urxvt
+event: press left
+mods: C
+cell: 0,0
+expect: \e[48;1;1M
+note: 16+32
+
+### R10
+tracking: Normal
+encoding: Urxvt
+event: press left
+mods: A
+cell: 0,0
+expect: \e[40;1;1M
+
+### R11
+tracking: Normal
+encoding: Urxvt
+event: press left
+mods: S+A+C
+cell: 2,3
+expect: \e[60;3;4M
+note: enc-only; GH test
+
+### R12
+tracking: Normal
+encoding: Urxvt
+event: release left
+mods: C
+cell: 0,0
+expect: \e[51;1;1M
+note: 3+16+32
+
+### R13
+tracking: Normal
+encoding: Urxvt
+event: press back
+mods: -
+cell: 0,0
+expect: \e[160;1;1M
+note: 128+32
+
+### R14
+tracking: Normal
+encoding: Urxvt
+event: release back
+mods: -
+cell: 0,0
+expect: \e[35;1;1M
+
+### R15
+tracking: Button
+encoding: Urxvt
+event: motion left
+mods: -
+cell: 5,2
+expect: \e[64;6;3M
+note: 32+32
+
+### R16
+tracking: AnyMotion
+encoding: Urxvt
+event: motion none
+mods: -
+cell: 5,2
+expect: \e[67;6;3M
+note: 35+32
+
+### R17
+tracking: Normal
+encoding: Urxvt
+event: press left
+mods: -
+cell: 223,0
+expect: \e[32;224;1M
+note: no 223 limit (`mouse_limit = -1`)
+
+### R18
+tracking: Normal
+encoding: Urxvt
+event: press left
+mods: -
+cell: 9999,3
+expect: \e[32;10000;4M
+
+### R19
+tracking: X10
+encoding: Urxvt
+event: press left
+mods: C
+cell: 0,0
+expect: \e[32;1;1M
+note: Q6
+
+### P01
+tracking: Normal
+encoding: SgrPixels
+event: press left
+mods: -
+px: 0,0
+area: 640x384
+expect: \e[<0;1;1M
+note: Q3; recommendation: xterm column kitty/Ghostty (raw, no +1): `ESC[<0;0;0M`
+
+### P02
+tracking: Normal
+encoding: SgrPixels
+event: release left
+mods: -
+px: 0,0
+area: 640x384
+expect: \e[<0;1;1m
+note: `m` like 1006 kitty/Ghostty (raw, no +1): `ESC[<0;0;0m`
+
+### P03
+tracking: Normal
+encoding: SgrPixels
+event: press left
+mods: -
+px: 35,70
+area: 640x384
+expect: \e[<0;36;71M
+note: cell 4,4 (col 35/8, row 70/16) kitty/Ghostty (raw, no +1): `ESC[<0;35;70M`
+
+### P04
+tracking: Normal
+encoding: SgrPixels
+event: press right
+mods: C
+px: 35,70
+area: 640x384
+expect: \e[<18;36;71M
+note: kitty/Ghostty (raw, no +1): `ESC[<18;35;70M`
+
+### P05
+tracking: Normal
+encoding: SgrPixels
+event: press wheel-up
+mods: -
+px: 35,70
+area: 640x384
+expect: \e[<64;36;71M
+note: wheel uses the pointer pixel kitty/Ghostty (raw, no +1): `ESC[<64;35;70M`
+
+### P06
+tracking: Button
+encoding: SgrPixels
+event: motion left
+mods: -
+px: 36,70
+area: 640x384
+expect: \e[<32;37;71M
+note: kitty/Ghostty (raw, no +1): `ESC[<32;36;70M`
+
+### P07
+tracking: AnyMotion
+encoding: SgrPixels
+event: motion none
+mods: -
+px: 36,70
+area: 640x384
+expect: \e[<35;37;71M
+note: kitty/Ghostty (raw, no +1): `ESC[<35;36;70M`
+
+### P08
+tracking: Normal
+encoding: SgrPixels
+event: press left
+mods: -
+px: 639,383
+area: 640x384
+expect: \e[<0;640;384M
+note: last pixel of the text area kitty/Ghostty (raw, no +1): `ESC[<0;639;383M`
+
+### P09
+tracking: Normal
+encoding: SgrPixels
+event: press left
+mods: -
+px: -5,-5
+area: 640x384
+expect: \e[<0;1;1M
+note: Q3 (lead): a drag out of the view is clamped to the text area, [0, 639] x [0, 383] before the +1; xterm ignores such events
+note: decision Q3: clamp to [0, size-1]; xterm itself ignores events outside the text area kitty/Ghostty (raw, no +1): clamp => `ESC[<0;0;0M`
+
+### P10
+tracking: Normal
+encoding: SgrPixels
+event: press left
+mods: -
+px: 700,400
+area: 640x384
+expect: \e[<0;640;384M
+note: Q3 clamp at the far edge
+note: kitty/Ghostty (raw, no +1): clamp => `...639;383M`
+
+### P11
+tracking: X10
+encoding: SgrPixels
+event: press left
+mods: C
+px: 35,70
+area: 640x384
+expect: \e[<0;36;71M
+note: no modifiers
+
+# -----------------------------------------------------------------------------
+# Table M: sequences (motion dedupe, held buttons, mode changes). SGR (1006) unless noted.
+# -----------------------------------------------------------------------------
+
+### D01
+step: feed \e[?1003h\e[?1006h
+step: motion none 5,2 -> C
+step: motion none 5,2 -> I
+step: motion none 6,2 -> C
+step: motion none 5,2 -> C
+written: \e[<35;6;3M\e[<35;7;3M\e[<35;6;3M
+cite: XB L5612 (row == mouse_row && col == mouse_col => not changed); CTL "only if the pointer has moved to a different character cell"
+
+### D02
+step: feed \e[?1003h\e[?1006h
+step: motion none 0,0 -> C
+written: \e[<35;1;1M
+note: the baseline starts empty (xterm -1/-1), so the first motion reports
+
+### D03
+step: feed \e[?1002h\e[?1006h
+step: press left 5,2 -> C
+step: motion left 5,2 -> I
+written: \e[<0;6;3M
+note: the press sets the baseline; a drag in the same cell is suppressed
+
+### D04
+step: feed \e[?1002h\e[?1006h
+step: press left 5,2 -> C
+step: motion left 6,2 -> C
+step: motion left 6,2 -> I
+step: release left 6,2 -> C
+written: \e[<0;6;3M\e[<32;7;3M\e[<0;7;3m
+note: a release is never deduplicated (XB ButtonRelease does not compare)
+
+### D05
+step: feed \e[?1002h\e[?1006h
+step: press left 5,2 -> C
+step: release left 5,2 -> C
+step: press left 5,2 -> C
+written: \e[<0;6;3M\e[<0;6;3m\e[<0;6;3M
+note: presses and releases are never deduplicated
+
+### D06
+step: feed \e[?1000h\e[?1006h
+step: wheel 3 5,2 -> C
+written: 3x \e[<64;6;3M
+note: one report per whole line of the accumulator; never deduplicated
+
+### D07
+step: feed \e[?1003h\e[?1006h
+step: wheel 1 5,2 -> C
+step: motion none 5,2 -> I
+written: \e[<64;6;3M
+note: a wheel report sets the baseline, so motion in the same cell is suppressed
+
+### D08
+step: feed \e[?1002h\e[?1006h
+step: press left 0,0 -> C
+step: press right 0,0 -> C
+step: motion right 3,0 -> C
+written: \e[<0;1;1M\e[<2;1;1M\e[<32;4;1M
+note: Q8: the lowest held button (left) is the one a drag reports, whichever button the frontend names
+
+### D09
+step: feed \e[?1002h\e[?1006h
+step: press left 0,0 -> C
+step: press right 0,0 -> C
+step: release left 0,0 -> C
+step: motion right 3,0 -> C
+written: \e[<0;1;1M\e[<2;1;1M\e[<0;1;1m\e[<34;4;1M
+note: after the left release only right is held
+
+### D10
+step: feed \e[?1002h\e[?1006h
+step: press left 0,0 -> C
+step: feed \e[?1000h
+step: motion left 3,0 -> I
+step: release left 3,0 -> C
+written: \e[<0;1;1M\e[<0;4;1m
+note: Q5: the press was reported, so its release is; Normal mode reports no motion. Held state is dropped only when tracking turns off
+
+### D11
+step: feed \e[?1002h\e[?1006h
+step: press left 0,0 -> C
+step: feed \e[?1002l
+step: release left 0,0 -> I
+step: feed \e[?1002h
+step: release left 0,0 -> I
+written: \e[<0;1;1M
+note: brief: leaving tracking mode mid-drag drops the held button, so the release is not sent even after tracking returns
+
+### D12
+step: press left 0,0 -> I
+step: feed \e[?1002h\e[?1006h
+step: release left 0,0 -> I
+written: none
+note: Q5: the press was not reported (tracking off), so its release is not
+
+### D13
+step: feed \e[?1000h\e[?1006h
+step: press left 0,0 S -> I
+step: release left 0,0 -> I
+written: none
+note: Q5/D2: Shift bypasses the press to selection; its release is not sent (xterm would send an orphan release)
+
+### D14
+step: feed \e[?1000h\e[?1006h
+step: press left 0,0 -> C
+step: release left 0,0 S -> C
+written: \e[<0;1;1M\e[<0;1;1m
+note: Q5: the release of a reported press is sent with Shift down, without the Shift bit (xterm drops it and strands the program)
+
+### D15
+step: feed \e[?1000h\e[?1006h
+step: press left 0,0 Cmd -> I
+step: release left 0,0 -> I
+written: none
+note: brief: Cmd never reaches the PTY (Cmd-click is a link, #30); no held state is kept
+
+### D16
+step: feed \e[?1000h\e[?1006h
+step: press left 0,0 Cmd -> I
+step: release left 0,0 Cmd -> I
+written: none
+
+### D17
+step: feed \e[?9h\e[?1006h
+step: press left 0,0 -> C
+step: release left 0,0 -> I
+written: \e[<0;1;1M
+cite: CTL X10: presses only
+
+### D18
+step: feed \e[?1002h\e[?1006h
+step: press left 0,0 -> C
+step: feed \e[?1006l
+step: release left 0,0 -> C
+written: \e[<0;1;1M\e[M#!!
+note: each report uses the encoding active when it is written (the default-encoded release is 1b 5b 4d 23 21 21)
+
+### D19
+step: feed \e[?1003h\e[?1016h
+step: motion none 4,4 px 35,70 -> C
+step: motion none 4,4 px 36,70 -> C
+step: motion none 4,4 px 36,70 -> I
+written: \e[<35;36;71M\e[<35;37;71M
+note: Q7: 1016 deduplicates per pixel (kitty, Ghostty); no view, so no padding and no text-area clamp
+
+### D20
+size: 24x240
+step: feed \e[?1003h
+step: motion none 222,0 -> C
+step: motion none 223,0 -> I
+step: motion none 224,0 -> I
+written: \e[MC\xff!
+note: Q1: motion beyond column 223 is not reported in the default encoding (1b 5b 4d 43 ff 21 is column 223)
+
+### D21
+generated: flood
+note: 100,000 motion events alternating between cells (0,0) and (1,0) give 100,000 reports; 100,000 inside one cell give 1. Checked by the routing test `a_flood_of_motion_reports_only_cell_changes`
+
+### D22
+step: feed \e[?1003h\e[?1006h
+step: motion none 5,2 -> C
+step: focus lost -> C
+step: focus gained -> C
+step: motion none 5,2 -> I
+written: \e[<35;6;3M
+note: focus changes (no DECSET 1004 here) send nothing and do not reset the motion baseline
+
+#> D23 -> 12-app: the click that activates an inactive window (press and release) is swallowed by the frontend (Q12);
+#>   the core has no notion of window activation, so this row is a Swift routing test in task/12-mouse-app.
+#> M8_01 -> #96: with 8-bit controls on (S8C1T), xterm starts mouse reports with 0x9b instead of ESC [ (XB L5540);
+#>   every report above stays 7-bit until #96 adds the 8-bit CSI to encode_mouse.
+
+# -----------------------------------------------------------------------------
+# Table W: the wheel in App::send_input(Scroll), decision Q11. delta_lines > 0 (towards older output) is wheel up (64).
+# -----------------------------------------------------------------------------
+
+### W01
+step: fill 40
+step: wheel 3 0,0 -> C
+offset: 3
+written: none
+note: primary screen, tracking off: the scrollback moves (existing behaviour)
+
+### W02
+step: fill 40
+step: feed \e[?1000h\e[?1006h
+step: wheel 3 5,2 -> C
+step: wheel 1000 0,0 -> C
+offset: 0
+written: 3x \e[<64;6;3M
+written: 24x \e[<64;1;1M
+note: primary screen, tracking on: wheel reports, at most the screen height (24) per event; the view does not move
+
+### W03
+step: fill 40
+step: feed \e[?1000h\e[?1006h
+step: wheel 3 0,0 S -> C
+offset: 3
+written: none
+note: primary screen, tracking on, Shift: the scrollback moves instead (brief)
+
+### W04
+step: feed \e[?1049h
+step: wheel 2 0,0 -> C
+step: feed \e[?1h
+step: wheel -1 0,0 -> C
+written: \e[A\e[A\eOB
+note: alternate screen, tracking off: alternate-scroll cursor keys in the DECCKM form (existing behaviour)
+
+### W05
+step: feed \e[?1049h\e[?1002h\e[?1006h
+step: wheel 1 3,4 -> C
+step: wheel -2 3,4 -> C
+written: \e[<64;4;5M
+written: 2x \e[<65;4;5M
+note: alternate screen, tracking on: wheel reports (replaces the Ignored the core returned before #12)
+
+### W06
+step: feed \e[?1049h\e[?1002h\e[?1006h
+step: wheel 1 3,4 S -> C
+written: \e[A
+note: Q11 (lead): Shift+wheel on the alternate screen with tracking on sends the alternate-scroll cursor keys
+
+### W07
+step: fill 40
+step: feed \e[?9h\e[?1006h
+step: wheel 3 0,0 -> I
+step: feed \e[?1049h
+step: wheel 3 0,0 -> I
+offset: 0
+written: none
+note: Q11 (lead): X10 has no wheel; the event is Ignored on both screens (no report, no scrollback, no cursor keys)
+
+### W08
+step: fill 40
+step: feed \e[?1000h\e[?1006h
+step: wheel 3 0,0 Cmd -> I
+offset: 0
+written: none
+note: brief: Cmd never reaches the PTY
+
+### W09
+step: feed \e[?1000h\e[?1006h
+step: wheel 1 0,0 C -> C
+step: wheel 1 0,0 A -> C
+step: feed \e[?1006l
+step: wheel 1 0,0 C -> C
+written: \e[<80;1;1M\e[<72;1;1M\e[Mp!!
+note: Control adds 16, Option (Meta) 8 (A11, S11); the last is the default encoding, 1b 5b 4d 70 21 21
+
+### W10
+step: feed \e[?1000h\e[?1006h
+step: wheel 0.4 0,0 -> I
+step: wheel 0.4 0,0 -> I
+step: wheel 0.4 0,0 -> C
+step: wheel -1.5 0,0 -> C
+written: \e[<64;1;1M\e[<65;1;1M
+note: fractions accumulate (the accumulator take_scroll_lines shares); an event with no whole line writes nothing and is Ignored. The 0.2 left after the third step carries over, so -1.5 takes one line down (0.2 - 1.5 = -1.3)
+
+# -----------------------------------------------------------------------------
+# Routing additions (implementer, from the #12 brief and the lead's decisions)
+# -----------------------------------------------------------------------------
+
+### G01
+step: feed \e[?1002h\e[?1006h
+step: press left 0,0 -> C
+step: motion left 3,0 S -> I
+step: release left 3,0 -> C
+written: \e[<0;1;1M\e[<0;4;1m
+note: brief: Shift bypasses drags too; the release of the reported press is still sent
+
+### G02
+step: feed \e[?1000h\e[?1006h
+step: press left 0,0 A+C -> C
+step: release left 0,0 A+C+Cmd -> C
+written: \e[<24;1;1M\e[<24;1;1m
+note: Q5: Cmd at release does not stop the release of a reported press and is never encoded
+
+### G03
+size: 24x240
+step: feed \e[?1000h
+step: press left 222,0 -> C
+step: release left 230,0 -> C
+written: \e[M \xff!\e[M#\xff!
+note: lead decision Q1: the release of a reported press beyond column 223 is clamped to 223, never dropped
+
+### G04
+step: feed \e[?1000h\e[?1006h
+step: press back 0,0 -> C
+step: press none 0,0 -> I
+step: release back 0,0 -> C
+step: feed \e[?1000l
+step: press left 0,0 -> I
+written: \e[<128;1;1M\e[<128;1;1m
+note: back/forward press and release; a press of no button is not reportable; tracking off is Ignored
