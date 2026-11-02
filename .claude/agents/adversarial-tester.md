@@ -15,7 +15,8 @@ Attack surface, in priority order:
 2. Hostile and malformed input; boundary sizes (0, 1, u16::MAX, 1 MB, 100 MB); interleaved sequences; resource exhaustion; fd and memory growth.
 3. Concurrency and ordering (Drop order, channel backpressure, signal delivery).
 4. Platform assumptions (kqueue vs poll, Retina scale, Xcode version on CI runners).
-5. Claims in doc comments and ADRs that the code does not keep.
+5. The security and resource rules in docs/security.md: escape sequences that echo child bytes into the input, read anything back, or put unsanitised text in the UI; a paste that ends bracketed paste early; every cap in its "Current bounds" table pushed past its limit; memory and fds that do not return to baseline after opening and closing sessions, tabs or windows 100 times.
+6. Claims in doc comments and ADRs that the code does not keep.
 
 Inputs. The brief carries the critic's `coverage`. Do not repeat what it lists (re-benchmarking a corpus the critic measured, re-fuzzing a fast path it already diff-fuzzed with millions of inputs); spend your budget on what it did not reach.
 

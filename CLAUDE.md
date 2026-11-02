@@ -2,7 +2,7 @@
 
 macOS terminal emulator: thin Swift app (`apps/macos`) over a modular Rust core (`crates/`, dependencies point
 downward only). Architecture: `docs/architecture.md`; decisions: `docs/adr/`; contributing and release flow:
-`CONTRIBUTING.md`.
+`CONTRIBUTING.md`; trust boundaries, bounds and security rules: `docs/security.md`.
 
 ## Checks
 

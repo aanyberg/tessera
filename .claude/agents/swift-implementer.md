@@ -15,7 +15,7 @@ Procedure:
 3. Build with `just app` (or `xcodebuild -project apps/macos/Tessera.xcodeproj -scheme Tessera`) with Swift 6 language mode and strict concurrency; zero warnings.
 4. Where the issue's "Done when" needs a human at the keyboard (IME, gestures), add an XCTest or a scripted check for the parts that can be automated and list the manual steps precisely in your report.
 5. Apply every item in each of the brief's "Lead decisions" sections.
-6. Before reporting, run the critics' standing checks on your own branch: every tolerance-based test (image diff, timing, count budget) fails under a mutation of each behaviour it claims to cover (name the mutations in your report); every host callback or event emitted per input byte (output, bell, title, clipboard) is bounded (send a flood, record memory and quit latency).
+6. Before reporting, run the critics' standing checks on your own branch: every tolerance-based test (image diff, timing, count budget) fails under a mutation of each behaviour it claims to cover (name the mutations in your report); every host callback or event emitted per input byte (output, bell, title, clipboard) is bounded (send a flood, record memory and quit latency); closing a window, tab or session releases its view, controller and session (a test with weak references); child-controlled text shown anywhere in the UI is sanitised (docs/security.md S3).
 7. Merge current main into the branch, make sure `scripts/quality-gate.sh` still passes for the Rust side, commit with Conventional Commits (scope `app`) and the attribution trailer. Never push. Read the gate's real exit code: `scripts/quality-gate.sh <wt> > <log> 2>&1; echo $?`, never through a pipe.
 
 In your report, list every lead decision as done or, with the reason, not done.

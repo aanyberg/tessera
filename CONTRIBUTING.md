@@ -22,9 +22,13 @@
 - `just check` must pass: `rustfmt`, `clippy -D warnings` (pedantic subset),
   `nextest`, `cargo-deny`.
 - `#![forbid(unsafe_code)]` everywhere except `tessera-pty` and `tessera-ffi`.
-  Every `unsafe` block carries a `// SAFETY:` comment. The one exception
-  outside them is the counting test allocator in
-  `crates/tessera-render/tests/alloc.rs` (ADR 0016).
+  Every `unsafe` block carries a `// SAFETY:` comment. The exceptions
+  outside them are the counting test allocators in
+  `crates/tessera-render/tests/alloc.rs` (ADR 0016) and
+  `crates/tessera-grid/tests/reset.rs`.
+- The security and resource rules in `docs/security.md` hold for every change:
+  nothing the child sends is echoed into the input or read back, and every
+  buffer filled from untrusted input has a named cap.
 - Public items are documented. Crate roots start with a purpose paragraph.
 - Dependencies point downward only (see `docs/architecture.md`). A crate that
   needs something from above it is a design smell; raise it in the PR.

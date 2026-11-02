@@ -38,12 +38,11 @@ at medium by the user's decision of 2026-10-28 (no retro data yet: neither ran i
 
 **Adversarial cost levers (2026-10-29).** The frontmatter is `high` with `maxTurns: 80`. The lead raises a cycle-1
 run with the Agent tool's `effort: "higher"` (xhigh) when the change is risky: concurrency, FFI or render path, a
-hot or fast path, parser or pty input handling, or user-visible emulation behaviour (any one of these is risky; a
-change is low-risk only when it meets all of the low-risk list under "Review rules"). It spawns the run with
-`model: "sonnet"` for low-risk changes. Cycle 2 is `effort: "lower"` (medium) on the cycle-1 model. If a later gate
-or a release
-finds a bug an `adversarial-tester` run at the lower setting should have caught, record it in the next retro and
-revert that setting.
+hot or fast path, parser or pty input handling, an attack surface in `docs/security.md`, or user-visible emulation
+behaviour (any one of these is risky; a change is low-risk only when it meets all of the low-risk list under "Review
+rules"). It spawns the run with `model: "sonnet"` for low-risk changes. Cycle 2 is `effort: "lower"` (medium) on the
+cycle-1 model. If a later gate or a release finds a bug an `adversarial-tester` run at the lower setting should have
+caught, record it in the next retro and revert that setting.
 
 **Mechanical checks are scripts, not agents.** `scripts/verify-branch.sh` replaced the haiku `quality-gate` agent
 (0 failures in 7 wave-3 runs, one false-positive flag); `revision-implementer` was removed after 0 uses in wave 3,
@@ -87,6 +86,8 @@ milestone-lead ── draft brief ──► spec-researcher (spec-heavy issues, 
   and the quality gate. The critic owns "Done when"; the adversarial tester runs at xhigh for risky changes in cycle 1
   (see "Adversarial cost levers") because it found 7 of the 9 post-ship majors in wave 1, both verify failures in
   wave 3, and the bugs the critics missed in waves 5 and 6.
+- Every critic and the adversarial tester check the security and resource rules in `docs/security.md` (S1-S9); a
+  broken rule is a BLOCKER ("a safety problem"). The planner names the rules a task touches in its "Done when".
 - Any blocker from any gate fails that gate. Minors never fail a gate.
 - Every branch merges current main before critique and before verification so verifiers never report stale-base
   problems as findings.
@@ -167,7 +168,8 @@ time as round 1 when the change is low-risk, meaning all of:
 - no FFI or render path: not `tessera-ffi`, `tessera-render`, the TesseraCore wrapper or frame pacing;
 - no user-visible behaviour: no change to what the terminal emulates, draws, accepts as input or reads from
   configuration;
-- no hot or fast path.
+- no hot or fast path;
+- no attack surface: nothing in the "Attack surfaces" table of `docs/security.md`.
 
 With no critic `coverage` yet, the tester runs its full plan. If the critic then asks for a change to product code,
 the adversarial run is repeated only on the new range (the fix commit), not on the whole branch, and that repeat is
