@@ -249,9 +249,9 @@ impl State {
                 trace!(?params, "DECSLRM with sub-parameters ignored");
             }
             's' if self.modes.left_right_margins => self.set_left_right_margins(params),
-            's' if no_params(params) => grid.save_cursor(),
+            's' if no_params(params) => self.save_cursor(),
             // SCORC: restores what DECRC restores.
-            'u' if no_params(params) => grid.restore_cursor(),
+            'u' if no_params(params) => self.restore_cursor(),
             's' | 'u' => trace!(?action, ?params, "SCOSC/SCORC with parameters ignored"),
             'm' => self.sgr(params, subparams),
             'c' | 'n' | 't' if subparams != 0 => {
@@ -419,7 +419,7 @@ impl State {
             return;
         };
         for _ in 0..n {
-            self.print(ch);
+            self.put(ch);
         }
     }
 
@@ -448,8 +448,15 @@ impl State {
         // xterm's `ReallyReset` common part does the same for DECSTR, DECSCL
         // and RIS (ADR 0020).
         self.drop_cursor_overrides();
-        // #112, #95, #10: reset here once the state exists: G0-G3/GL/GR
-        // and DECNRCM to their defaults (SCS, #112), DECSCA off (#95), and
+        // G0 to G3, GL, GR and a pending single shift (xterm's
+        // `resetCharsets`), in the saved copy too: xterm saves the cursor
+        // after the resets, so the active screen's slot holds the defaults
+        // (the same slot the grid's saved cursor above is in). DECNRCM stays
+        // on, as in xterm (DEC's table 5-9 resets it).
+        self.charsets.reset();
+        let slot = usize::from(self.grid.is_alt_screen());
+        self.saved_charsets[slot] = Some(self.charsets.saved());
+        // #95, #10: reset here once the state exists: DECSCA off (#95) and
         // the OSC 4 palette to the theme (xterm's ResetAnsiColorRequest,
         // #10). DECLRMM, the margins and reverse wraparound are reset with
         // the modes above.

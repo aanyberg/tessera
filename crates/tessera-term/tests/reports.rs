@@ -425,7 +425,7 @@ fn chunkings(row: &Row) -> Vec<Chunking> {
 fn every_row() {
     let rows = rows();
     let headings = FIXTURE.lines().filter(|l| l.starts_with("### ")).count();
-    assert_eq!(headings, 196, "rows in the fixture");
+    assert_eq!(headings, 199, "rows in the fixture");
     let generated: Vec<&str> = rows
         .iter()
         .filter(|row| row.generated())

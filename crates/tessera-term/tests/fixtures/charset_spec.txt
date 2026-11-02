@@ -1,0 +1,1834 @@
+# =============================================================================
+# tessera-term: SCS character sets, shifts and DECNRCM  (issue #112, wave 9)
+# crates/tessera-term/tests/fixtures/charset_spec.txt   (spec-researcher output)
+#
+# Same machine-readable layout as csi_spec.txt / decstr_spec.txt (### ID / size / step / cite / note /
+# screen / cursor / pending_wrap / requests / scrollback), parsed by tests/spec/mod.rs. Extra keys the
+# shared parser ignores: flags (xterm-quirk | decision | control | level). `control` rows run a
+# stream without the reset or save the neighbouring row tests (proof the setup is not vacuous);
+# `level` rows start with DECSCL 61 (VT100); `decision` rows encode a choice between sources.
+# Cursor is 0-based (row,col). render_screen puts `|` AFTER the cursor's cell; a row ending in `\`
+# is soft-wrapped. Non-ASCII payload is written as \u{..}; expected screens are literal characters.
+#
+# PRIMARY SOURCES (all fetched and read for this fixture; tags used in the cite: lines)
+#   [CTL]   xterm ctlseqs  https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+#           "ESC ( C Designate G0 Character Set" (and ) * + - . /), "ESC n/o/|/}/~", "ESC N/O", SI/SO,
+#           "CSI ? 42 h/l DECNRCM", DA1 "Ps = 9 National Replacement Character sets".
+#   [XT-cs] xterm charsets.c  xtermCharSetOut() (the print-time translation) and HandleUPSS/isSevenBit
+#           https://github.com/ThomasDickey/xterm-snapshots/blob/master/charsets.c  (rev 1.131, 2026-04)
+#   [XT-tbl] xterm charsets.h  the map_NRCS_*, map_DEC_Technical, map_DEC_Supp_Graphic tables
+#   [XT-cp] xterm charproc.c  select_charset(), scs_table[], xtermDecodeSCS(), resetCharsets(),
+#           CASE_SO/SI/SS2/SS3/LS2/LS3/LS1R/LS2R/LS3R, WriteNow(), dotext(), modified_DECNRCM(),
+#           ReallyReset() (RIS, DECSTR, DECSCL), srm_DECNRCM, CASE_GSETS*/CASE_SCS*
+#   [XT-vt] xterm VTPrsTbl.c  scstable / scs96table / scs_pct_table / scs_amp_table / scs_2qt_table
+#           (which finals dispatch to which CASE_GSETS*)
+#   [XT-cu] xterm cursor.c  CursorSave2() / CursorRestoreFlags(): the saved cursor holds curgl, curgr, gsets[]
+#   [XT-fu] xterm fontutils.c  dec2ucs(): the DEC Special Graphics to Unicode table
+#   [VT510] VT510 Programmer Reference  https://vt100.net/docs/vt510-rm/SCS.html, DECNRCM.html, DECSTR.html
+#   [VTTEST] vttest 20251205 charsets.c  (KnownCharsets[]: which sets are NRCS-only, which levels)
+#   [TERMINFO] `infocmp -1 xterm-256color`: smacs=\E(0, rmacs=\E(B, sgr0=\E(B\E[m, rs2=\E[!p\E[?3;4l\E[4l\E>
+#   esctest2 (ThomasDickey/esctest2): has NO test for SCS, SO, SI or the shifts (see "ISSUE-TEXT ERRORS");
+#           it covers DECRC without a save (save_restore_cursor.py), the alt-screen saved cursor
+#           (test_SaveRestoreCursor_AltVsMain) and lists G0-G3/GL/GR in decstr.py's DECSTR table.
+#
+# HOW xterm TRANSLATES IN UTF-8 MODE (the oracle for every row; Tessera is always UTF-8)
+#   1. print time, per character (charsets.c xtermCharSetOut): skipped entirely when GL (or the single-
+#      shifted set) and GR are both ASCII. Otherwise, for a code point c <= 0xFF:
+#        cs    = (c >= 0x80) ? gsets[curgr] : gsets[curgl or curss];      seven = c & 0x7f
+#        chr   = set-specific map of `seven` (or of c for ASCII, the supplementals' default, British w/o NRC)
+#        drop  if chr == 0x7f and cs is a seven-bit set (DEL)
+#        if c >= 0x80 and 0x20 < chr < 0x80: chr |= 0x80
+#      Code points above 0xFF are never translated. So GL translates ASCII, GR translates U+0080..U+00FF.
+#   2. designation (charproc.c): the final byte is looked up in scs_table[] with the DECSCL level and
+#      DECNRCM; no row => G-set := ASCII ("unknown GSET"), but finals that never reach the lookup
+#      (ground-state finals, level-5 prefixes below level 5, level-1 non-VT100 finals) leave it alone.
+#   3. default sets in UTF-8: G0..G3 = ASCII, GL = G0, GR = G2 (resetCharsets, dft_upss = ASCII).
+#      Designating G2 therefore changes what GR does at once.
+#
+# DECISIONS FOR THE MILESTONE LEAD (recommended option first; all are rows with flags: decision)
+#   D-BRITISH  xterm's UK set (`ESC ( A`) maps # to the pound sign only with DECNRCM on or at level 1; at the
+#              default level 4 without DECNRCM it prints #. Every other terminal maps always. vttest lists
+#              British as an NRCS (tested only with DECNRCM on). Recommend xterm (row NR9C), document it.
+#   D-SS       xterm keeps a pending single shift across controls and other escapes until a printable arrives
+#              (row SS06). Recommend xterm.
+#   D-NRCM-OFF DECRST 42 keeps the designated national sets (row NR93); DEC says they need national mode.
+#   D-DECSTR   DECSTR keeps DECNRCM in xterm (row NR95); DEC table 5-9 resets it. Recommend xterm.
+#   D-UTF8-NRC xterm's modified_DECNRCM flips the UTF-8 decoder off while DECNRCM is on (bytes are then
+#              Latin-1/8-bit and GR sees raw bytes). Tessera keeps decoding UTF-8 and applies the NRCS tables
+#              to the decoded code points (so Dutch ij, florin and the other UNI() entries always map).
+#              Not testable through a byte stream; documented here and in ADR 0033.
+#   D-LEVELS   Sets that xterm offers only at level 5 (Greek, Hebrew, Turkish, Russian, Cyrillic, SCS NRCS,
+#              the ISO Latin-2/5/Greek/Hebrew/Cyrillic 96-sets) and the level-3-only JIS sets are not
+#              implemented: they behave as xterm does at level 4 (rows SU08..SU11, SG10). DECSCL 65 does not
+#              enable them. Recommend a follow-up issue if anyone needs them.
+#
+# ISSUE-TEXT ERRORS / NOTES
+#   * "esctest decscs/so/si pending cases": esctest2 has none (no scs.py, so.py or si.py) and
+#     esctest_pending.txt has no block. The runnable pieces are the vttest menu 2 screen 15 row
+#     (csi_spec.txt, V2S15) and the DECRC / alt-screen / DECSTR cases cited above.
+#   * "DECSTR and RIS reset G0-G3 = ASCII, GL = G0, GR = G2": right for xterm in UTF-8 mode. In an 8-bit
+#     xterm the default G2/G3 would be DEC Supplemental (UPSS), not ASCII (resetCharsets comment).
+#   * "ESC - . / 96-char designations ... if xterm supports them at level 4": only ESC - / . / with final A
+#     (ISO Latin-1 Supplemental) works at level 4; B F H L M are level 5 (rows SU05..SU10).
+#   * DEC Supplemental `ESC ( <` is level 2 only; from level 3 the same final is the user-preferred set
+#     (UPSS), which in xterm's UTF-8 mode is ISO Latin-1 (identity without DECNRCM): row SU04.
+#   * DA1 feature 9 (NRCS) and DECRQM ?42 replies are checked in reports_spec.txt, not here.
+# =============================================================================
+
+
+### SG01_dec_special_all_of_0x5f_to_0x7e
+size: 3x40
+step: feed \x1b(0_`abcdefghijklmnopqrstuvwxyz{|}~
+cite: [XT-cs] xtermCharSetOut case nrc_DEC_Spec_Graphic (seven > 0x5f && <= 0x7e -> dec2ucs(seven-0x5f); 0x5f -> 0); [XT-fu] fontutils.c dec2ucs table; [VT510] SCS "0" DEC Special Graphic
+note: All 32 codes 0x5f..0x7e through G0=DEC Special Graphics. 0x5f maps to a blank (xterm stores code 0; Tessera shows a space, kitty and VTE do the same). 0x60..0x7e are the Unicode box-drawing and symbol characters xterm uses in UTF-8 mode.
+screen:
+> ◆▒␉␌␍␊°±␤␋┘┐┌└┼⎺⎻─⎼⎽├┤┴┬│≤≥π≠£· |
+>
+>
+cursor: (0,32)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SG02_dec_special_leaves_other_ascii
+size: 3x100
+step: feed \x1b(0 !"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^
+cite: [XT-cs] xtermCharSetOut: `else { chr = seven; }` for the DEC Special Graphic case outside 0x5f..0x7e
+note: Space through ^ (0x20..0x5e) are not remapped; digits, capitals and punctuation print as ASCII.
+screen:
+> !"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^ |
+>
+>
+cursor: (0,63)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SG03_tput_smacs_printf_rmacs
+size: 3x40
+step: feed \x1b(0lqk\x1b(B
+cite: [TERMINFO] `infocmp -1 xterm-256color`: smacs=\E(0, rmacs=\E(B; issue #112 Done-when: `tput smacs; printf "\x6c\x71\x6b"; tput rmacs` -> ┌─┐
+note: The exact Done-when example. The bytes are 0x6c 0x71 0x6b.
+screen:
+>┌─┐ |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SG04_rmacs_returns_to_ascii
+size: 3x40
+step: feed \x1b(0lqk\x1b(Blqk
+cite: [TERMINFO] rmacs=\E(B; [VT510] SCS "B" = US ASCII
+note: After rmacs the same letters are plain ASCII again.
+screen:
+>┌─┐lqk |
+>
+>
+cursor: (0,6)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SG05_sgr0_string_resets_g0
+size: 3x40
+step: feed \x1b(0q\x1b(B\x1b[mq
+cite: [TERMINFO] xterm-256color sgr0=\E(B\E[m
+note: terminfo sgr0 designates ASCII into G0 and then clears the pen; programs rely on that to leave line-drawing mode.
+screen:
+>─q |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SG06_box_drawn_on_three_rows
+size: 3x40
+step: feed \x1b(0lqqqk\r\nx   x\r\nmqqqj\x1b(B
+cite: [CTL] ESC ( C "C = 0 DEC Special Character and Line Drawing Set"; vttest menu 3 "VT100 character set" style frame
+note: The designation survives CR and LF: it is a G-set, not a per-line attribute.
+screen:
+>┌───┐
+>│   │
+>└───┘ |
+cursor: (2,5)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SG07_designate_in_the_middle_of_a_line
+size: 3x40
+step: feed a\x1b(0qb\x1b(Bc
+cite: [XT-cp] CASE_SCS0_STATE / CASE_GSETS: designation takes effect for the next printable
+note: a is printed before the designation and c after the return to ASCII, so both are plain; q (0x71) and b (0x62) are mapped to U+2500 and U+2409.
+screen:
+>a─␉c |
+>
+>
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SG08_unknown_final_leaves_g0_alone
+size: 3x40
+step: feed \x1b(0\x1b(Dlq
+flags: xterm-quirk
+cite: [XT-vt] VTPrsTbl.c scstable: `D` is CASE_GROUND_STATE (no designation); only the finals in the xterm table dispatch
+note: `ESC ( D` is consumed as a complete sequence and ignored: G0 stays DEC Special Graphics.
+screen:
+>┌─ |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SG09_known_but_unavailable_final_selects_ascii
+size: 3x40
+step: feed \x1b(0\x1b(1q
+flags: xterm-quirk
+cite: [XT-cp] xtermDecodeSCS: a final in scstable that matches no scs_table row at the current level selects nrc_ASCII (`...unknown GSET`); "1" (DEC Alt Chars) has max_level 1
+note: Distinct from SG08: `1` dispatches to CASE_GSETS, finds no level-4 row and falls back to ASCII instead of leaving the old set.
+screen:
+>q |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SG10_level3_only_jis_roman_is_ascii_at_level_4
+size: 3x40
+step: feed \x1b(0\x1b(Jq
+flags: xterm-quirk
+cite: [XT-cp] scs_table `{ nrc_JIS_Roman, 0, J, 3, 3 ... }` max_level 3, xterm default decTerminalID 420 = level 4
+note: JIS Roman and Katakana are VT382 (level 3) sets: not available at the default level 4, so the final selects ASCII. Same path as SG09.
+screen:
+>q |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SG11_unknown_set_with_nrcs_off_is_ascii
+size: 3x40
+step: feed \x1b(0\x1b(Kq
+flags: xterm-quirk
+cite: [XT-cp] xtermDecodeSCS: German has need_nrc=1 and (xw->flags & NATIONAL) is clear -> nrc_ASCII
+note: A national set designated without DECNRCM replaces the old set with ASCII (it is not ignored).
+screen:
+>q |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SG12_g0_designation_does_not_move_the_cursor_or_clear
+size: 3x40
+step: feed ab\x1b(0cd
+cite: [CTL] ESC ( C
+note: "c" (0x63) -> ␌ (U+240C) and "d" (0x64) -> ␍ (U+240D); a designation prints nothing and keeps the cursor.
+screen:
+>ab␌␍ |
+>
+>
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LS01_so_without_designation_is_ascii
+size: 3x40
+step: feed \x0elqk
+cite: [CTL] SO "invokes the G1 character set as GL"; [XT-cp] resetCharsets: G1 = ASCII
+note: G1 is ASCII until designated: SO alone changes nothing visible.
+screen:
+>lqk |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LS02_g1_special_so_si
+size: 3x40
+step: feed \x1b)0\x0elqk\x0flqk
+cite: [CTL] SO/SI; vttest charsets.c scs(g=1) = `ESC ) 0`, SO
+note: The classic shift-out line-drawing pattern.
+screen:
+>┌─┐lqk |
+>
+>
+cursor: (0,6)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LS03_designating_g1_does_not_change_gl
+size: 3x40
+step: feed \x1b)0lqk
+cite: [XT-cp] CASE_SCS1_STATE only sets gsets[1]; curgl stays 0
+note: GL is still G0 (ASCII).
+screen:
+>lqk |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LS04_g0_designated_while_so_is_active_shows_after_si
+size: 3x40
+step: feed \x1b)0\x0e\x1b(Blq\x0flq
+cite: [XT-cp] CASE_SO: curgl = 1; CASE_SCS0_STATE sets gsets[0] only
+note: While SO is active GL is G1 (special); G0 was made ASCII in the meantime, which shows after SI.
+screen:
+>┌─lq |
+>
+>
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LS05_designating_the_invoked_set_applies_at_once
+size: 3x40
+step: feed \x1b)0\x0el\x1b)Bl
+cite: [XT-cp] gsets[1] is read at print time
+note: Designating G1 while it is invoked changes the very next character.
+screen:
+>┌l |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LS06_so_persists_across_crlf
+size: 3x40
+step: feed \x1b)0\x0el\r\nl
+cite: [XT-cp] curgl is not touched by CR or LF
+note: A locking shift stays until SI (or a reset).
+screen:
+>┌
+>┌ |
+>
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LS07_si_when_already_in_g0_is_harmless
+size: 3x40
+step: feed \x1b(0\x0f\x0fq
+cite: [XT-cp] CASE_SI: curgl = 0
+screen:
+>─ |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LS08_ls2_invokes_g2
+size: 3x40
+step: feed \x1b*0\x1bnlqk\x0flqk
+cite: [CTL] ESC n "Invoke the G2 Character Set as GL (LS2)"; [XT-cp] CASE_LS2 (ansi_level > 2)
+note: SI returns GL to G0.
+screen:
+>┌─┐lqk |
+>
+>
+cursor: (0,6)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LS09_ls3_invokes_g3
+size: 3x40
+step: feed \x1b+0\x1bolqk\x0flqk
+cite: [CTL] ESC o "Invoke the G3 Character Set as GL (LS3)"; [XT-cp] CASE_LS3
+screen:
+>┌─┐lqk |
+>
+>
+cursor: (0,6)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LS10_gl_follows_the_last_locking_shift
+size: 3x40
+step: feed \x1b*0\x1b+B\x1bnl\x1bol\x0fl
+cite: [XT-cp] CASE_LS2, CASE_LS3, CASE_SI
+note: LS2 -> G2 (special): ┌; LS3 -> G3 (ASCII): l; SI -> G0 (ASCII): l.
+screen:
+>┌ll |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LS11_so_after_ls2
+size: 3x40
+step: feed \x1b)0\x1b*0\x1bnl\x0el\x0fl
+cite: [XT-cp] one curgl variable
+screen:
+>┌┌l |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LS12_g1_g2_g3_are_independent
+size: 3x40
+step: feed \x1b)0\x1b*B\x1b+0\x0el\x1bnl\x1bol
+cite: [XT-cp] gsets[1..3]
+screen:
+>┌l┌ |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LS13_g2_designation_via_star_g3_via_plus_all_94_sets
+size: 3x40
+step: feed \x1b*0\x1b+0\x1bnl\x1boq
+cite: [CTL] ESC * C, ESC + C; [VT510] SCS table: * is G2, + is G3
+screen:
+>┌─ |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LS14_so_works_at_level_1
+size: 3x40
+step: feed \x1b[61;1"p
+step: feed \x1b)0\x0eq
+flags: level
+cite: [XT-cp] CASE_SO has no level test (VT100 has SO/SI)
+note: DECSCL 61 selects level 1 (VT100); SO/SI are VT100 controls.
+screen:
+>─ |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LS15_ls2_ignored_at_level_1
+size: 3x40
+step: feed \x1b[61;1"p
+step: feed \x1b*0\x1bnq
+flags: level
+cite: [XT-cp] CASE_LS2 requires screen->ansi_level > 2; set_vtXX_level(1) gives ansi_level 1
+note: Locking shifts 2 and 3 (and the GR ones) are VT220 and up.
+screen:
+>q |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LS16_g2_designation_at_level_1_still_works
+size: 3x40
+step: feed \x1b[61;1"p
+step: feed \x1b*0\x1bNq\x1b*0q
+flags: level
+cite: [XT-cp] CASE_SS2 requires vtXX_level > 1; select_charset has no level test
+note: SS2 is ignored at level 1, so the first q is plain; the second q is also plain because GL is still G0. Guards that SS2 is not half-applied.
+screen:
+>qq |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SS01_ss2_one_character
+size: 3x40
+step: feed \x1b*0\x1bNlqk
+cite: [CTL] ESC N "Single Shift Select of G2 Character Set (SS2) ... This affects next character only."; [XT-cp] CASE_SS2, WriteNow()
+note: Only the first character after ESC N is mapped through G2.
+screen:
+>┌qk |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SS02_ss3_one_character
+size: 3x40
+step: feed \x1b+0\x1bOlqk
+cite: [CTL] ESC O (SS3); [XT-cp] CASE_SS3
+screen:
+>┌qk |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SS03_ss_uses_its_set_not_gl
+size: 3x40
+step: feed \x1b(0\x1b*B\x1bNll
+cite: [XT-cp] WriteNow: dotext(gsets[curss], print_area, 1) then the rest with gsets[curgl]
+note: G0 = special is GL; SS2 picks G2 = ASCII for one character: l then ┌.
+screen:
+>l┌ |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SS04_ss_each_time
+size: 3x40
+step: feed \x1b*0\x1bNll\x1bNl
+cite: [XT-cp] CASE_SS2 sets curss = 2 every time
+screen:
+>┌l┌ |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SS05_ss2_then_ss3_last_wins
+size: 3x40
+step: feed \x1b*0\x1b+B\x1bN\x1bOl
+cite: [XT-cp] curss is a single variable: ESC O after ESC N replaces it
+note: G3 is ASCII, so l is plain.
+screen:
+>l |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SS06_ss_survives_a_c0_control
+size: 3x40
+step: feed \x1b*0\x1bN\rl
+flags: xterm-quirk decision
+cite: [XT-cp] curss is cleared only in WriteNow() (a printable), resetCharsets and an unsaved DECRC; CASE_CR does not touch it
+note: xterm keeps the pending single shift across controls and across other escape sequences until a printable arrives. Recommend xterm (DEC says "next character", which one reading takes as next graphic).
+screen:
+>┌ |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SS07_ris_cancels_a_pending_ss
+size: 3x40
+step: feed \x1b*0\x1bN\x1bc\x1b*0l
+cite: [XT-cp] ReallyReset -> resetCharsets: curss = 0
+note: After RIS the pending single shift is gone: l prints through GL (ASCII) although G2 is special again.
+screen:
+>l |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SS08_decstr_cancels_a_pending_ss
+size: 3x40
+step: feed \x1b*0\x1bN\x1b[!p\x1b*0l
+cite: [XT-cp] ReallyReset(soft) -> resetCharsets: curss = 0
+screen:
+>l |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SS09_ss2_ignored_at_level_1
+size: 3x40
+step: feed \x1b[61;1"p
+step: feed \x1b*0\x1bNl
+flags: level
+cite: [XT-cp] CASE_SS2: `if (screen->vtXX_level > 1) screen->curss = 2;`
+screen:
+>l |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SS10_ss_with_the_default_gr_is_g2
+size: 3x40
+step: feed \x1b*0\x1bN\u{ec}
+cite: [XT-cs] xtermCharSetOut: eight >= 128 -> rightset = gsets[curgr] (G2 by default)
+note: A Latin-1 code point uses GR (gsets[curgr]), not the single-shifted set; GR defaults to G2, so here both are the special set.
+screen:
+>┌ |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### GR01_default_gr_is_ascii_g2_latin1_unchanged
+size: 3x40
+step: feed \u{e9}\u{fc}\u{a3}
+cite: [XT-cp] resetCharsets: G2 = ASCII in UTF-8 mode (dft_upss = nrc_ASCII), curgr = 2
+note: With nothing designated, Latin-1 text prints as itself.
+screen:
+>éü£ |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### GR02_ls1r_g1_into_gr
+size: 3x40
+step: feed \x1b)0\x1b~\u{ec}\u{f1}\u{eb}
+flags: xterm-quirk
+cite: [CTL] ESC ~ "Invoke the G1 Character Set as GR (LS1R)"; [XT-cs] xtermCharSetOut: eight >= 128 -> cs = rightset; seven = eight & 0x7f; DEC Special Graphic maps seven 0x6c, 0x71, 0x6b
+note: In UTF-8 mode xterm applies GR to the code points U+0080..U+00FF (it keeps the 8-bit view of the text). U+00EC is 0xEC, seven 0x6C.
+screen:
+>┌─┐ |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### GR03_ls2r
+size: 3x40
+step: feed \x1b*0\x1b}\u{ec}
+cite: [CTL] ESC } (LS2R); [XT-cp] CASE_LS2R
+screen:
+>┌ |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### GR04_ls3r
+size: 3x40
+step: feed \x1b+0\x1b|\u{ec}
+cite: [CTL] ESC | (LS3R); [XT-cp] CASE_LS3R
+screen:
+>┌ |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### GR05_gr_leaves_ascii_alone
+size: 3x40
+step: feed \x1b)0\x1b~lq
+cite: [XT-cs] xtermCharSetOut: ASCII-range characters use leftset (G0, ASCII)
+note: GL translation applies to ASCII-range code points only; GR translation to U+0080..U+00FF only.
+screen:
+>lq |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### GR06_gl_set_leaves_latin1_alone
+size: 3x40
+step: feed \x1b(0\u{e9}q
+cite: [XT-cs] xtermCharSetOut: eight >= 128 uses rightset (G2 = ASCII) however GL is set
+note: Brief: "xterm in UTF-8 mode applies GL translation to ASCII-range code points only".
+screen:
+>é─ |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### GR07_code_points_above_ff_are_never_translated
+size: 3x40
+step: feed \x1b)0\x1b~\u{100}\u{2500}\u{65e5}
+cite: [XT-cs] xtermCharSetOut: `if (screen->utf8_mode || screen->utf8_nrc_mode) { if (*s > 255) continue; }`
+note: correction: (implementer, #112) the researcher row put the cursor at column 3; the wide character takes two columns, so it is column 4.
+screen:
+>Ā─日 |
+>
+>
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### GR08_gr_reset_by_decstr
+size: 3x40
+step: feed \x1b)0\x1b~\u{ec}\x1b[!p\u{ec}
+cite: [XT-cp] ReallyReset -> resetCharsets: curgr = 2, G1/G2 ASCII
+screen:
+>┌ì |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### GR09_gr_reset_by_ris
+size: 3x40
+step: feed \x1b)0\x1b~\u{ec}\x1bc\u{ec}
+cite: [XT-cp] ReallyReset(full) -> resetCharsets
+note: RIS clears the screen, so only the second character remains.
+screen:
+>ì |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### GR10_ls1r_ignored_at_level_1
+size: 3x40
+step: feed \x1b[61;1"p
+step: feed \x1b)0\x1b~\u{ec}
+flags: level
+cite: [XT-cp] CASE_LS1R requires ansi_level > 2
+screen:
+>ì |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### GR11_nbsp_through_a_seven_bit_gr_becomes_a_space
+size: 3x40
+step: feed \x1b)0\x1b~a\u{a0}b
+flags: xterm-quirk
+cite: [XT-cs] xtermCharSetOut: seven = 0x20, chr = seven, and the `eight >= 128 && chr > 32` fix-up does not apply to 0x20
+note: A side effect of xterm folding GR onto seven bits: U+00A0 prints as a plain space. Same arithmetic gives GR12.
+screen:
+>a b |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### GR12_u00ff_through_a_seven_bit_gr_is_dropped
+size: 3x40
+step: feed \x1b)0\x1b~a\u{ff}b
+flags: xterm-quirk
+cite: [XT-cs] xtermCharSetOut: `if (chr == ANSI_DEL && isSevenBit(cs))` removes the character from the buffer
+note: seven = 0x7F is DEL, which xterm drops for every seven-bit set.
+screen:
+>ab |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### GR13_c1_controls_in_the_gr_range_are_not_printed
+size: 3x40
+step: feed \x1b)0\x1b~a\u{85}b
+cite: [XT-cp] doparse: C1 controls are not printable in UTF-8 mode unless allowC1Printable; Tessera: ignored in 7-bit mode
+note: Guards that the translation never runs on a control character: it is not mapped to a graphic.
+screen:
+>ab |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### GR14_unmapped_gr_codes_get_bit_7_back
+size: 3x40
+step: feed \x1b)0\x1b~\u{df}\u{c1}
+flags: xterm-quirk
+cite: [XT-cs] xtermCharSetOut: `if (eight >= 128 && chr < 128 && chr > 32) chr |= 128` after the DEC Special Graphic case left chr = seven
+note: U+00DF (seven 0x5F) and U+00C1 (seven 0x41) are not in the line-drawing range, so xterm folds them to seven bits and sets bit 7 again: both print as themselves. Without the fix-up they would print as _ and A.
+screen:
+>ßÁ |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### GR15_nrcs_gr_unmapped_codes_keep_themselves
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b*K\u{e9}\u{df}
+cite: [XT-cs] as GR14, German map leaves seven 0x69 and 0x5F alone
+screen:
+>éß |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR_Dutch_4
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b(4aZ09 #@[\\]^_`{|}~
+cite: [CTL] ESC ( C "C = 4"; [XT-tbl] charsets.h map_NRCS_Dutch; [XT-cp] scs_table row, need_nrc = 1; [VT510] SCS table
+note: DECNRCM on, G0 = Dutch NRCS. The 12 characters after the plain "aZ09 " are the ASCII positions NRCS sets may replace (# @ [ \ ] ^ _ ` { | } ~); the rest of ASCII is untouched. Dutch also replaces { with the diaeresis, | with the florin and [ with ij (xterm emits those with UNI(), i.e. when it is in NRC Unicode mode; Tessera treats NRCS as always Unicode).
+screen:
+>aZ09 £¾ĳ½|^_`¨ƒ¼´ |
+>
+>
+cursor: (0,17)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR_Finnish_5
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b(5aZ09 #@[\\]^_`{|}~
+cite: [CTL] ESC ( C "C = 5"; [XT-tbl] charsets.h map_NRCS_Finnish; [XT-cp] scs_table row, need_nrc = 1; [VT510] SCS table
+note: DECNRCM on, G0 = Finnish NRCS. The 12 characters after the plain "aZ09 " are the ASCII positions NRCS sets may replace (# @ [ \ ] ^ _ ` { | } ~); the rest of ASCII is untouched.
+screen:
+>aZ09 #@ÄÖÅÜ_éäöåü |
+>
+>
+cursor: (0,17)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR_Finnish_C
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b(CaZ09 #@[\\]^_`{|}~
+cite: [CTL] ESC ( C "C = C"; [XT-tbl] charsets.h map_NRCS_Finnish; [XT-cp] scs_table row, need_nrc = 1; [VT510] SCS table
+note: DECNRCM on, G0 = Finnish NRCS. The 12 characters after the plain "aZ09 " are the ASCII positions NRCS sets may replace (# @ [ \ ] ^ _ ` { | } ~); the rest of ASCII is untouched.
+screen:
+>aZ09 #@ÄÖÅÜ_éäöåü |
+>
+>
+cursor: (0,17)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR_French_R
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b(RaZ09 #@[\\]^_`{|}~
+cite: [CTL] ESC ( C "C = R"; [XT-tbl] charsets.h map_NRCS_French; [XT-cp] scs_table row, need_nrc = 1; [VT510] SCS table
+note: DECNRCM on, G0 = French NRCS. The 12 characters after the plain "aZ09 " are the ASCII positions NRCS sets may replace (# @ [ \ ] ^ _ ` { | } ~); the rest of ASCII is untouched.
+screen:
+>aZ09 £à°ç§^_`éùè¨ |
+>
+>
+cursor: (0,17)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR_French_f
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b(faZ09 #@[\\]^_`{|}~
+cite: [CTL] ESC ( C "C = f"; [XT-tbl] charsets.h map_NRCS_French; [XT-cp] scs_table row, need_nrc = 1; [VT510] SCS table
+note: DECNRCM on, G0 = French NRCS. The 12 characters after the plain "aZ09 " are the ASCII positions NRCS sets may replace (# @ [ \ ] ^ _ ` { | } ~); the rest of ASCII is untouched.
+screen:
+>aZ09 £à°ç§^_`éùè¨ |
+>
+>
+cursor: (0,17)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR_FrenchCanadian_Q
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b(QaZ09 #@[\\]^_`{|}~
+cite: [CTL] ESC ( C "C = Q"; [XT-tbl] charsets.h map_NRCS_FrenchCanadian; [XT-cp] scs_table row, need_nrc = 1; [VT510] SCS table
+note: DECNRCM on, G0 = FrenchCanadian NRCS. The 12 characters after the plain "aZ09 " are the ASCII positions NRCS sets may replace (# @ [ \ ] ^ _ ` { | } ~); the rest of ASCII is untouched.
+screen:
+>aZ09 #àâçêî_ôéùèû |
+>
+>
+cursor: (0,17)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR_FrenchCanadian_9
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b(9aZ09 #@[\\]^_`{|}~
+cite: [CTL] ESC ( C "C = 9"; [XT-tbl] charsets.h map_NRCS_FrenchCanadian; [XT-cp] scs_table row, need_nrc = 1; [VT510] SCS table
+note: DECNRCM on, G0 = FrenchCanadian NRCS. The 12 characters after the plain "aZ09 " are the ASCII positions NRCS sets may replace (# @ [ \ ] ^ _ ` { | } ~); the rest of ASCII is untouched.
+screen:
+>aZ09 #àâçêî_ôéùèû |
+>
+>
+cursor: (0,17)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR_German_K
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b(KaZ09 #@[\\]^_`{|}~
+cite: [CTL] ESC ( C "C = K"; [XT-tbl] charsets.h map_NRCS_German; [XT-cp] scs_table row, need_nrc = 1; [VT510] SCS table
+note: DECNRCM on, G0 = German NRCS. The 12 characters after the plain "aZ09 " are the ASCII positions NRCS sets may replace (# @ [ \ ] ^ _ ` { | } ~); the rest of ASCII is untouched.
+screen:
+>aZ09 #§ÄÖÜ^_`äöüß |
+>
+>
+cursor: (0,17)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR_Italian_Y
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b(YaZ09 #@[\\]^_`{|}~
+cite: [CTL] ESC ( C "C = Y"; [XT-tbl] charsets.h map_NRCS_Italian; [XT-cp] scs_table row, need_nrc = 1; [VT510] SCS table
+note: DECNRCM on, G0 = Italian NRCS. The 12 characters after the plain "aZ09 " are the ASCII positions NRCS sets may replace (# @ [ \ ] ^ _ ` { | } ~); the rest of ASCII is untouched.
+screen:
+>aZ09 £§°çé^_ùàòèì |
+>
+>
+cursor: (0,17)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR_NorwegianDanish_E
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b(EaZ09 #@[\\]^_`{|}~
+cite: [CTL] ESC ( C "C = E"; [XT-tbl] charsets.h map_NRCS_NorwegianDanish; [XT-cp] scs_table row, need_nrc = 1; [VT510] SCS table
+note: DECNRCM on, G0 = NorwegianDanish NRCS. The 12 characters after the plain "aZ09 " are the ASCII positions NRCS sets may replace (# @ [ \ ] ^ _ ` { | } ~); the rest of ASCII is untouched.
+screen:
+>aZ09 #ÄÆØÅÜ_äæøåü |
+>
+>
+cursor: (0,17)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR_NorwegianDanish_6
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b(6aZ09 #@[\\]^_`{|}~
+cite: [CTL] ESC ( C "C = 6"; [XT-tbl] charsets.h map_NRCS_NorwegianDanish; [XT-cp] scs_table row, need_nrc = 1; [VT510] SCS table
+note: DECNRCM on, G0 = NorwegianDanish NRCS. The 12 characters after the plain "aZ09 " are the ASCII positions NRCS sets may replace (# @ [ \ ] ^ _ ` { | } ~); the rest of ASCII is untouched.
+screen:
+>aZ09 #ÄÆØÅÜ_äæøåü |
+>
+>
+cursor: (0,17)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR_NorwegianDanish_bq
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b(`aZ09 #@[\\]^_`{|}~
+cite: [CTL] ESC ( C "C = `"; [XT-tbl] charsets.h map_NRCS_NorwegianDanish; [XT-cp] scs_table row, need_nrc = 1; [VT510] SCS table
+note: DECNRCM on, G0 = NorwegianDanish NRCS. The 12 characters after the plain "aZ09 " are the ASCII positions NRCS sets may replace (# @ [ \ ] ^ _ ` { | } ~); the rest of ASCII is untouched.
+screen:
+>aZ09 #ÄÆØÅÜ_äæøåü |
+>
+>
+cursor: (0,17)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR_Spanish_Z
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b(ZaZ09 #@[\\]^_`{|}~
+cite: [CTL] ESC ( C "C = Z"; [XT-tbl] charsets.h map_NRCS_Spanish; [XT-cp] scs_table row, need_nrc = 1; [VT510] SCS table
+note: DECNRCM on, G0 = Spanish NRCS. The 12 characters after the plain "aZ09 " are the ASCII positions NRCS sets may replace (# @ [ \ ] ^ _ ` { | } ~); the rest of ASCII is untouched.
+screen:
+>aZ09 £§¡Ñ¿^_`°ñç~ |
+>
+>
+cursor: (0,17)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR_Swedish_7
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b(7aZ09 #@[\\]^_`{|}~
+cite: [CTL] ESC ( C "C = 7"; [XT-tbl] charsets.h map_NRCS_Swedish; [XT-cp] scs_table row, need_nrc = 1; [VT510] SCS table
+note: DECNRCM on, G0 = Swedish NRCS. The 12 characters after the plain "aZ09 " are the ASCII positions NRCS sets may replace (# @ [ \ ] ^ _ ` { | } ~); the rest of ASCII is untouched.
+screen:
+>aZ09 #ÉÄÖÅÜ_éäöåü |
+>
+>
+cursor: (0,17)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR_Swedish_H
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b(HaZ09 #@[\\]^_`{|}~
+cite: [CTL] ESC ( C "C = H"; [XT-tbl] charsets.h map_NRCS_Swedish; [XT-cp] scs_table row, need_nrc = 1; [VT510] SCS table
+note: DECNRCM on, G0 = Swedish NRCS. The 12 characters after the plain "aZ09 " are the ASCII positions NRCS sets may replace (# @ [ \ ] ^ _ ` { | } ~); the rest of ASCII is untouched.
+screen:
+>aZ09 #ÉÄÖÅÜ_éäöåü |
+>
+>
+cursor: (0,17)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR_Swiss_eq
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b(=aZ09 #@[\\]^_`{|}~
+cite: [CTL] ESC ( C "C = ="; [XT-tbl] charsets.h map_NRCS_Swiss; [XT-cp] scs_table row, need_nrc = 1; [VT510] SCS table
+note: DECNRCM on, G0 = Swiss NRCS. The 12 characters after the plain "aZ09 " are the ASCII positions NRCS sets may replace (# @ [ \ ] ^ _ ` { | } ~); the rest of ASCII is untouched.
+screen:
+>aZ09 ùàéçêîèôäöüû |
+>
+>
+cursor: (0,17)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR_Portuguese_pct6
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b(%6aZ09 #@[\\]^_`{|}~
+cite: [CTL] ESC ( C "C = %6"; [XT-tbl] charsets.h map_NRCS_Portuguese; [XT-cp] scs_table row, need_nrc = 1; [VT510] SCS table
+note: DECNRCM on, G0 = Portuguese NRCS. The 12 characters after the plain "aZ09 " are the ASCII positions NRCS sets may replace (# @ [ \ ] ^ _ ` { | } ~); the rest of ASCII is untouched.
+screen:
+>aZ09 #@ÃÇÕ^_`ãçõ~ |
+>
+>
+cursor: (0,17)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR90_nrcs_without_decnrcm_selects_ascii
+size: 3x60
+step: feed \x1b(K#@[\\]^_`{|}~\x1b(R#@[\\]^_`{|}~\x1b(%6#@[\\]^_`{|}~
+flags: xterm-quirk
+cite: [XT-cp] xtermDecodeSCS: need_nrc && !(flags & NATIONAL) -> nrc_ASCII
+note: Without DECNRCM (the default, "multinational mode") a national set designation selects ASCII, so every sample prints unchanged.
+screen:
+>#@[\]^_`{|}~#@[\]^_`{|}~#@[\]^_`{|}~ |
+>
+>
+cursor: (0,36)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR91_nrcs_replaces_a_previous_set_with_ascii_when_off
+size: 3x40
+step: feed \x1b(0\x1b(Rq
+cite: as SG11
+screen:
+>q |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR92_decnrcm_set_then_designate
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b(K[]
+cite: [CTL] CSI ? 42 h "Enable National Replacement Character sets (DECNRCM), VT220."
+screen:
+>ÄÜ |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR93_decnrcm_off_after_designation_keeps_the_set
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b(K
+step: feed \x1b[?42l
+step: feed [
+flags: xterm-quirk decision
+cite: [XT-cp] srm_DECNRCM only toggles flags & NATIONAL (and the UTF-8 mode swap); gsets[] are not reset; xtermCharSetOut maps German whatever NATIONAL says
+note: DECRST 42 does not undo a designation: G0 stays German (the Unicode-only entries, Dutch ij and florin, would stop mapping in xterm; Tessera keeps mapping them). DEC says a national set needs national mode; recommend xterm.
+screen:
+>Ä |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR94_ris_clears_decnrcm
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1bc
+step: feed \x1b(K[
+cite: [XT-cp] ReallyReset(full): `xw->flags = xw->initflags`
+note: After RIS DECNRCM is off again: the German designation selects ASCII.
+screen:
+>[ |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR95_decstr_keeps_decnrcm
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b[!p
+step: feed \x1b(K[
+flags: xterm-quirk decision
+cite: [XT-cp] ReallyReset soft branch clears only WRAPAROUND/REVERSEWRAP/INSERT/INVERSE/BOLD/BLINK/UNDERLINE/INVISIBLE; NATIONAL stays. [VT510] DECSTR table 5-9 says DECNRCM is reset to multinational
+note: Source disagreement: DEC resets DECNRCM, xterm does not. Recommend xterm (the oracle), flagged in the notes.
+screen:
+>Ä |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR96_decnrcm_ignored_at_level_1
+size: 3x40
+step: feed \x1b[61;1"p
+step: feed \x1b[?42h
+step: feed \x1b(0
+step: feed \x1b(Kq
+flags: level
+cite: [XT-cp] srm_DECNRCM `if (screen->vtXX_level >= 2)`; CASE_GSETS: a final outside "012AB" is ignored below level 2 (no designation change at all)
+note: At level 1 `ESC ( K` neither designates nor selects ASCII: G0 stays special.
+screen:
+>─ |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR97_decnrcm_mixed_with_other_modes
+size: 3x40
+step: feed \x1b[?25;42;7h
+step: feed \x1b(K[
+cite: [XT-cp] srm loop handles each parameter
+screen:
+>Ä |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR98_nrcs_in_g1_via_so
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b)R\x0e#@\x0f#@
+cite: [XT-tbl] map_NRCS_French
+screen:
+>£à#@ |
+>
+>
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR99_nrcs_in_g2_via_ss2
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b*K\x1bN[[
+cite: [XT-cp] WriteNow: first character through gsets[curss]
+screen:
+>Ä[ |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR9A_nrcs_gr_german
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b*K\u{c0}\u{db}\u{fb}
+flags: xterm-quirk
+cite: [XT-cs] eight >= 128 -> rightset = G2 = German; seven = 0x40, 0x5b, 0x7b; MAP results are above 0x7f so no |= 0x80
+note: U+00C0 -> 0x40 -> section sign; U+00DB -> 0x5B -> A diaeresis; U+00FB -> 0x7B -> a diaeresis.
+screen:
+>§Ää |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR9B_british_with_nrcs_is_pound
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b(A#a
+cite: [XT-cs] case nrc_British: `if ((xw->flags & NATIONAL) || vtXX_level <= 1) { ... if (chr == 0x23) chr = pound }`; [VTTEST] charsets.c lists British as cs_type 1 (NRCS, tested only with DECNRCM on)
+screen:
+>£a |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR9C_british_without_nrcs_is_plain_at_level_4
+size: 3x40
+step: feed \x1b(A#a
+flags: xterm-quirk decision
+cite: [XT-cs] same condition, DECNRCM off and vtXX_level 4: the UK set does not map # at VT220 level and above
+note: Surprising but it is what xterm does at its default decTerminalID 420: the UK set only maps # to the pound sign in NRC mode (or at level 1). Recommend xterm and document it in ADR 0033.
+screen:
+>#a |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### NR9D_british_at_level_1_is_pound_without_nrcs
+size: 3x40
+step: feed \x1b[61;1"p
+step: feed \x1b(A#a
+flags: level
+cite: [XT-cs] `|| (screen->vtXX_level <= 1)`
+note: On a VT100 there is no DECNRCM and the UK set always maps #.
+screen:
+>£a |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SU01_dec_supplemental_graphic_pct5
+size: 3x40
+step: feed \x1b(%5A$(W]_w}~
+cite: [CTL] C = % 5 "DEC Supplemental Graphics, VT300"; [XT-tbl] map_DEC_Supp_Graphic (UNI/XXX entries; UNDEF is U+2426); [VT510] SCS "% 5"
+note: In GL the characters that DEC Supplemental defines differently from ASCII: 0x28 currency sign, 0x57 OE, 0x5D Y diaeresis, 0x77 oe, 0x7D y diaeresis; the undefined positions print xterm's "undefined" glyph U+2426. 0x5F maps to itself.
+screen:
+>A␦¤ŒŸ_œÿ␦ |
+>
+>
+cursor: (0,9)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SU02_dec_supplemental_graphic_in_gr
+size: 3x40
+step: feed \x1b*%5\u{a8}\u{d7}\u{fd}
+cite: [XT-tbl] map_DEC_Supp_Graphic; GR = G2
+note: U+00A8 -> seven 0x28 -> currency sign; U+00D7 -> 0x57 -> OE; U+00FD -> 0x7D -> y diaeresis.
+screen:
+>¤Œÿ |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SU03_dec_technical_all_94
+size: 3x100
+step: feed \x1b(>!"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~
+cite: [CTL] C = > "DEC Technical, VT300"; [XT-tbl] map_DEC_Technical; [VT510] SCS ">"
+note: Every code 0x21..0x7e. The seven sigma pieces 0x31..0x37 are private-use code points U+EEEE..U+EEF4 in xterm; the undefined positions are U+2426.
+screen:
+>⎷┌─⌠⌡│⎡⎣⎤⎦⎧⎩⎫⎭⎨⎬␦␦␦␦≤≠≥∫∴∝∞÷Δ∇ΦΓ∼≃Θ×Λ⇔⇒≡ΠΨ␦Σ␦␦√ΩΞΥ⊂⊃∩∪∧∨¬αβχδεφγηιθκλ␦ν∂πψρστ␦ƒωξυζ←↑→↓ |
+>
+>
+cursor: (0,94)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SU04_upss_designation_is_latin1_at_level_4
+size: 3x40
+step: feed \x1b(<a#@
+cite: [CTL] C = < "User Preferred Selection Set, VT300"; [XT-cs] HandleUPSS: level 3 or 4 -> nrc_ISO_Latin_1_Supp, which does not map without DECNRCM
+screen:
+>a#@ |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SU05_iso_latin1_96_in_g1
+size: 3x40
+step: feed \x1b-A\x0ea#
+cite: [CTL] ESC - C "C = A ISO Latin-1 Supplemental, VT300"; [XT-cp] CASE_SCS1A_STATE + scstable96 final A -> CASE_GSETS3
+note: 96-character sets for G1 are `ESC -`, for G2 `ESC .`, for G3 `ESC /`.
+screen:
+>a# |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SU06_iso_latin1_96_is_british_latin1_with_nrcs
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b-A\x0ea#
+flags: xterm-quirk
+cite: [XT-cp] scs_table: `ESC - A` matches nrc_British_Latin_1 (need_nrc) before nrc_ISO_Latin_1_Supp when NATIONAL is set; [XT-cs] same output case as British
+screen:
+>a£ |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SU07_96_sets_in_g2_and_g3
+size: 3x40
+step: feed \x1b.A\x1b/A\x1bnx\x1boy
+cite: [CTL] ESC . C, ESC / C
+note: Identity mapping; guards that the three intermediates are accepted.
+screen:
+>xy |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SU08_level5_dquote_sets_are_ignored_at_level_4
+size: 3x40
+step: feed \x1b(0\x1b(">q
+flags: xterm-quirk
+cite: [XT-cp] CASE_GSETS_DQUOTE: `if (screen->vtXX_level >= 5)`, else only ResetState: the designation is not changed
+note: Greek NRCS (VT500) at level 4 leaves G0 alone. Contrast with SG09, where the same lookup fails inside xtermDecodeSCS and selects ASCII.
+screen:
+>─ |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SU09_level5_amp_sets_are_ignored_at_level_4
+size: 3x40
+step: feed \x1b(0\x1b(&5q
+flags: xterm-quirk
+cite: [XT-cp] CASE_GSETS_AMPRSND: `if (screen->vtXX_level >= 5)`
+screen:
+>─ |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SU10_level5_96_set_is_ignored_at_level_4
+size: 3x40
+step: feed \x1b)0\x1b-B\x0eq
+flags: xterm-quirk
+cite: [XT-cp] CASE_GSETS5: `if (screen->vtXX_level >= 5)`
+note: ISO Latin-2 (VT500) is not available at level 4.
+screen:
+>─ |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SU11_pct_level5_sets_select_ascii_or_are_ignored
+size: 3x40
+step: feed \x1b(0\x1b(%2q
+flags: xterm-quirk
+cite: [XT-cp] CASE_GSETS_PERCENT: level >= 3 decodes with sgroup 5 for 0 2 =; xtermDecodeSCS finds no level-4 row and selects ASCII
+note: Turkish NRCS (% 2): at level 4 the percent table is decoded (level >= 3) but the set is a VT500 one, so ASCII is selected.
+screen:
+>q |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SU12_unknown_intermediate_final_is_ignored
+size: 3x40
+step: feed \x1b(0\x1b(%Zq
+cite: [XT-vt] scs_pct_table: only 0 2 3 5 6 = dispatch; the others return to ground state
+note: `ESC ( % Z` is complete and ignored.
+screen:
+>─ |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC01_decsc_saves_g0
+size: 3x40
+step: feed \x1b(0\x1b7\x1b(B\x1b8q
+cite: [XT-cu] CursorSave2: saveCharsets(screen, sc->gsets); CursorRestoreFlags: restoreCharsets; issue #112 "DECSC/DECRC save and restore curgl/curgr/gsets"
+note: The cursor is back at column 0 after DECRC, so the q lands in the same cell.
+screen:
+>─ |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC02_decsc_saves_gl
+size: 3x40
+step: feed \x1b)0\x0e\x1b7\x0f\x1b8q
+cite: [XT-cu] CursorSave2: sc->curgl = screen->curgl
+note: GL = G1 (special) at save time; SI before the restore.
+screen:
+>─ |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC03_decsc_saves_gr
+size: 3x40
+step: feed \x1b)0\x1b~\x1b7\x1b}\x1b8\u{ec}
+cite: [XT-cu] sc->curgr
+screen:
+>┌ |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC04_decsc_saves_g2_g3
+size: 3x40
+step: feed \x1b*0\x1b+0\x1b7\x1b*B\x1b+B\x1b8\x1bnl\x1bol
+cite: [XT-cu] saveCharsets copies G0..G3
+screen:
+>┌┌ |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC05_decrc_without_save_resets_charsets
+size: 3x40
+step: feed \x1b(0\x1b)0\x0e\x1b8q
+cite: [XT-cu] CursorRestoreFlags: `if (sc->saved) {...} else { resetCharsets(screen); }`; esctest save_restore_cursor.py test_SaveRestoreCursor_MoveToHomeWhenNotSaved
+note: Without a prior DECSC, DECRC puts G0-G3 back to ASCII and GL/GR to G0/G2 (and homes the cursor).
+screen:
+>q |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC06_second_decsc_overwrites_the_first
+size: 3x40
+step: feed \x1b(0\x1b7\x1b(B\x1b7\x1b(0\x1b8q
+cite: [XT-cu] one-level cache (ctlseqs "this uses a one-level cache")
+screen:
+>q |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC07_scosc_scorc_share_the_slot
+size: 3x40
+step: feed \x1b(0\x1b[s\x1b(B\x1b[uq
+cite: [XT-cp] CASE_ANSI_SC -> CursorSave; CASE_ANSI_RC -> CursorRestore
+screen:
+>─ |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC08_decset_1048_saves_and_restores
+size: 3x40
+step: feed \x1b(0\x1b[?1048h\x1b(B\x1b[?1048lq
+cite: [CTL] CSI ? 1048 "Save cursor as in DECSC"; [XT-cp] srm_TITE_INHIBIT/1048 -> CursorSave/CursorRestore
+screen:
+>─ |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC09_alt_screen_has_its_own_saved_slot
+size: 3x40
+step: feed \x1b(0\x1b7\x1b[?1047h\x1b(B\x1b7\x1b[?1047l\x1b8q
+cite: [XT-cu] CursorSave stores into screen->sc[screen->whichBuf]; esctest test_SaveRestoreCursor_AltVsMain
+note: The DECSC done on the alternate screen (G0 ASCII) must not replace the main screen's (G0 special); 1047 does not save or restore the cursor itself.
+screen:
+>─ |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC10_1049_restores_the_main_slot_on_exit
+size: 3x40
+step: feed \x1b(0\x1b[?1049h\x1b8q\x1b[?1049lq
+cite: [XT-cp] srm_OPT_ALTBUF_CURSOR: set = CursorSave then ToAlternate; reset = FromAlternate then CursorRestore
+note: In the alternate screen a DECRC finds no save of its own (resets the sets); leaving restores the main screen's save from entry, which has G0 special.
+screen:
+>─ |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC11_decstr_resets_the_saved_charsets_too
+size: 3x40
+step: feed \x1b(0\x1b7\x1b[!p\x1b8q
+cite: [XT-cp] ReallyReset soft: resetCharsets then CursorSave -> the saved copy holds default sets
+screen:
+>q |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC12_control_decsc_without_decstr_restores_special
+size: 3x40
+step: feed \x1b(0\x1b7\x1b8q
+flags: control
+cite: control for SC11
+note: Proves SC11 is not vacuous.
+screen:
+>─ |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC13_ris_resets_the_saved_charsets
+size: 3x40
+step: feed \x1b(0\x1b7\x1bc\x1b8q
+cite: [XT-cp] ReallyReset(full) ends with CursorSave after resetCharsets
+screen:
+>q |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC14_decrc_does_not_restore_a_pending_ss
+size: 3x40
+step: feed \x1b*0\x1b7\x1bN\x1b8l
+flags: xterm-quirk
+cite: [XT-cu] curss is not part of SavedCursor, and CursorRestore does not clear it when the slot was saved
+note: The single shift set after DECSC is still pending after DECRC (G2 special) and applies to l.
+screen:
+>┌ |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### RS01_decstr_resets_g0_to_g3_and_gl
+size: 3x40
+step: feed \x1b(0\x1b)0\x1b*0\x1b+0\x0e\x1b[!pl\x0el\x1bnl\x1bol
+cite: [XT-cp] ReallyReset -> resetCharsets; [VT510] DECSTR table 5-9 "G0-G3 default"; esctest decstr.py header "G0, G1, G2, G3, GL, GR Default settings"
+note: After DECSTR GL is G0 (not G1 although SO was active), G1..G3 are ASCII.
+screen:
+>llll |
+>
+>
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### RS02_control_same_stream_without_decstr
+size: 3x40
+step: feed \x1b(0\x1b)0\x1b*0\x1b+0\x0el\x0el\x1bnl\x1bol
+flags: control
+cite: control for RS01
+screen:
+>┌┌┌┌ |
+>
+>
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### RS03_ris_resets_everything
+size: 3x40
+step: feed \x1b(0\x1b)0\x1b*0\x1b+0\x0e\x1bcl\x0el\x1bnl\x1bol
+cite: [XT-cp] ReallyReset(full) -> resetCharsets
+note: RIS clears the screen; the four l follow it.
+screen:
+>llll |
+>
+>
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### RS04_decscl_is_a_soft_reset_for_the_sets
+size: 3x40
+step: feed \x1b(0\x1b[64;1"pl
+cite: [XT-cp] CASE_DECSCL -> ReallyReset(soft)
+note: DECSCL runs the soft reset, so it resets G0 too.
+screen:
+>l |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### RS05_decstr_resets_gr_and_cancels_ls1r
+size: 3x40
+step: feed \x1b)0\x1b~\x1b[!p\u{ec}\x0e\u{ec}
+cite: [XT-cp] resetCharsets: curgr = 2; gsets[1] = ASCII
+screen:
+>ìì |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### PR01_wide_character_is_not_translated
+size: 3x40
+step: feed \x1b(0\u{65e5}q
+cite: [XT-cs] code points above 0xFF are skipped
+screen:
+>日─ |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### PR02_combining_mark_joins_the_translated_cell
+size: 3x40
+step: feed \x1b(0q\u{301}
+cite: [XT-cp] doparse: combining characters are added to the previous cell, translated or not
+note: The mark attaches to the cell the translation produced.
+screen:
+>─́ |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### PR03_rep_repeats_the_translated_character
+size: 3x40
+step: feed \x1b(0q\x1b[3b
+cite: [XT-cp] CASE_REP: dotext(gsets[curgl], repeated, 1) with the raw character, so it is translated again
+note: ESC ( 0, q, REP 3 gives four horizontal lines.
+screen:
+>──── |
+>
+>
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### PR04_insert_mode_inserts_the_translated_character
+size: 3x40
+step: feed \x1b(0123\x1b[1G\x1b[4hq
+cite: [XT-cp] dotext inserts after translation
+note: IRM on: the translated character is inserted at column 0 and pushes 123 right; the cursor ends after it.
+screen:
+>─1|23
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### PR05_wrap_marks_the_line_with_translated_cells
+size: 3x5
+step: feed \x1b(0qqqqqq
+cite: [XT-cp] dotext wraps after translation
+screen:
+>─────\
+>─ |
+>
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### PR06_pending_wrap_with_translated_last_cell
+size: 3x5
+step: feed \x1b(0qqqqq
+cite: [XT-cp] do_wrap set after the fifth cell
+note: The pending-wrap column is still the last cell.
+screen:
+>─────|
+>
+>
+cursor: (0,4)
+pending_wrap: true
+requests: []
+scrollback: len=0
+
+### PR07_dec_special_does_not_touch_digits_and_capitals
+size: 3x40
+step: feed \x1b(0ABC 123
+cite: [XT-cs] seven <= 0x5f
+screen:
+>ABC 123 |
+>
+>
+cursor: (0,7)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### PR08_nothing_designated_is_a_plain_pass_through
+size: 3x40
+step: feed lqk
+cite: [XT-cs] dotext skips xtermCharSetOut when both sets are ASCII
+note: Baseline for the performance path.
+screen:
+>lqk |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0

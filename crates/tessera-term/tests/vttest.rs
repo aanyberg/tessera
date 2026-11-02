@@ -7,11 +7,11 @@
 //! `@set` steps; the screens lifted by #8 are fed as captured.
 //!
 //! In scope: menu 1 screens 1, 3, 5 and 6; menu 2 screens 1, 2, 4, 6 to
-//! 12 and 14; menu 8 screens 1 to 5 and 7 (3 and 4 on the adapted screen
+//! 12, 14 and 15; menu 8 screens 1 to 5 and 7 (3 and 4 on the adapted screen
 //! 2 of #6, with `ESC[?6h ESC[1;1H` written as `ESC[2;1H`). DECCOLM is
 //! ignored without DECSET 40 (xterm's default), so the 132-column screens
 //! stay listed as `#### DEFERRED` blocks in the fixture with the screens
-//! that need SGR (#7), character sets (#112) or double-width lines;
+//! that need SGR (#7) or double-width lines;
 //! [`deferred_screens_are_listed`] keeps that list honest.
 
 #[allow(dead_code)] // Shared harness: not every helper is used here.
@@ -74,6 +74,7 @@ script_table! {
     menu2_screen11,
     menu2_screen12,
     menu2_screen14,
+    menu2_screen15,
     menu8_screen1,
     menu8_screen2,
     menu8_screen3,
