@@ -127,6 +127,25 @@ no reporting decision of its own.
   app, reaches neither the program nor a selection. A drag or release of a
   button whose press the view did not see is not sent either, so a stray
   release after that click cannot reach the core.
+- **Selection and links** (#30, ADR 0025) start only from a left press the
+  core answered `.ignored`: with tracking off, or with Shift (selection) or
+  Command (link) held. The view then takes Option, or Option with Command, as
+  a block selection, Shift with a selection as an adjust, Command alone as a
+  link click and the click count as the granularity, all read at the press;
+  a press the program took (`.consumed`) starts nothing, so Option-drag is
+  the program's while it tracks the mouse and ⇧⌥-drag selects a block. A
+  Command-click or Command-drag that is not on a link does nothing and sends
+  nothing. A link opens through `LinkPolicy` (`http`, `https`, `mailto`,
+  `ftp`, and `file` only for an empty, `localhost` or this Mac's host and an
+  existing path); because link text is program output, a local file that
+  would launch something (an application or other package, an executable or
+  script, `.command`, `.webloc` and similar) is shown in Finder instead.
+  A press while text is marked is first offered to the input method
+  (`NSTextInputContext.handleEvent`, as `NSTextView` does); if it does not
+  use it the composition is committed, the way a commit by mouse is, and
+  the click goes on. Pointer events outside the view keep arriving during a drag; one
+  above or below the view scrolls it (a timer at iTerm2's pace, stopped by
+  the release).
 - **The wheel** stays with `scrollWheel`, which sends every gesture as
   before; a `Consumed` scroll redraws. Amended by ADR 0032 (#183): while
   text is marked the event is not sent at all (no scroll, no cursor keys,

@@ -416,8 +416,6 @@ event: up mods=cmd
 opened: []
 sel: none
 cite: 30-app D-OPEN allowlist; [OSC8] security: "Terminals may whitelist well-known schemes and ask for confirmation on others"; the gist suggests file/http/https as the minimum
-note: Needs 30-links (OSC 8 storage). Until then this row is skipped by the Swift test (`needs: osc8`).
-needs: osc8
 
 ### L09_cmd_click_on_file_url_with_remote_host_does_nothing
 setup: size 3x60
@@ -427,7 +425,6 @@ event: down 0,0 mods=cmd
 event: up mods=cmd
 opened: []
 cite: [OSC8] "match the hostname against the local host and refuse to open mismatched files ... localhost and an empty hostname count as local"
-needs: osc8
 
 ### L10_cmd_click_on_file_url_with_empty_or_local_host_opens
 setup: size 3x60
@@ -439,7 +436,6 @@ event: down 0,2 mods=cmd
 event: up mods=cmd
 opened: [file:///etc/hosts, file://localhost/etc/hosts]
 cite: [OSC8] as L09; 30-app D-OPEN (empty, localhost, this Mac's host name)
-needs: osc8
 
 ### L11_cmd_drag_does_not_select_or_open
 setup: size 3x40

@@ -31,15 +31,22 @@
 //! # When it is cleared
 //!
 //! On the next look at the terminal (any of the calls above, and every
-//! frame) the selection is dropped when a selected row on the live screen
-//! no longer holds the text it held when the selection was made (cells,
-//! clusters and the soft-wrap flag are compared, so a program repainting
-//! the same text keeps it), when the history evicts or clears a selected
-//! line, when the grid changes size, and when the screen switches to or
-//! from the alternate screen. [`crate::App::clear_scrollback`] and
-//! [`crate::App::resize`] to another size clear it at once. The comparison
-//! looks only at the rows the grid reports changed since the last look,
-//! and only while a selection exists.
+//! frame) the selection is dropped when:
+//!
+//! - a selected row on the live screen no longer holds the text it held
+//!   when the selection was made (cells, clusters and the soft-wrap flag are
+//!   compared, so a program repainting the same text keeps it);
+//! - the history loses a line of it other than by eviction at its cap
+//!   (ED 3, RIS), or evicts every line of it (when it evicts only the top,
+//!   the start moves to the oldest line left, at column 0);
+//! - the grid changes size, or the screen switches to or from the alternate
+//!   screen.
+//!
+//! [`crate::App::clear_scrollback`] and [`crate::App::resize`] to another
+//! size clear it at once. The comparison looks only at the rows the grid
+//! reports changed since the last look, and only while a selection exists.
+//! [`crate::App::select_all`] stops at the last row with text, so output
+//! written below it does not clear the selection.
 
 use std::ops::Range;
 
@@ -445,16 +452,9 @@ impl Guard {
     /// the history are compared as well: a row rewritten and then scrolled
     /// off between two looks changed while it was live, and a whole-screen
     /// erase ends the newest history line.
-    fn holds(
-        &mut self,
-        lines: &Lines<'_>,
-        start: i64,
-        frame: Option<(usize, &DamageRows)>,
-    ) -> bool {
+    fn holds(&mut self, lines: &Lines<'_>, frame: Option<(usize, &DamageRows)>) -> bool {
         let grid = lines.grid;
-        if (lines.rows, lines.cols, grid.is_alt_screen()) != (self.rows, self.cols, self.alt)
-            || start < lines.first
-        {
+        if (lines.rows, lines.cols, grid.is_alt_screen()) != (self.rows, self.cols, self.alt) {
             return false;
         }
         let (pushed, len) = (grid.scrollback_pushed(), grid.scrollback_len());
@@ -483,7 +483,9 @@ impl Guard {
         };
         let history_holds = !matches!(damage, DamageRows::All)
             || self.lines.iter().zip(self.first..).all(|(kept, n)| {
-                n >= lines.top || lines.line(n).is_some_and(|line| same(line, kept))
+                n < lines.first
+                    || n >= lines.top
+                    || lines.line(n).is_some_and(|line| same(line, kept))
             });
         let holds = history_holds
             && (0..lines.rows).all(|row| {
@@ -533,6 +535,44 @@ struct Sel {
 }
 
 impl Sel {
+    /// Cuts off the lines the history evicted at its cap (LD-1): the start
+    /// moves to the oldest line left, at column 0 (a block keeps its
+    /// columns). False when no selected line is left, or when lines were
+    /// removed some other way (ED 3, RIS) and a selected one was among them:
+    /// only eviction trims.
+    ///
+    /// Lines went from the history since the guard's last look when it holds
+    /// fewer than it had plus the lines pushed meanwhile. The history is at
+    /// its cap after an eviction; a clear leaves it shorter (a clear followed
+    /// by a refill to the cap between two looks reads as an eviction).
+    fn trim_evicted(&mut self, lines: &Lines<'_>) -> bool {
+        let first = lines.first;
+        let grid = lines.grid;
+        let (len, before) = (grid.scrollback_len(), self.guard.len);
+        let pushed = grid.scrollback_pushed().saturating_sub(self.guard.pushed);
+        let removed = (u128::from(pushed) + before as u128).saturating_sub(len as u128);
+        let evicted = removed == 0 || len >= grid.max_scrollback();
+        if !evicted {
+            return self.start.min(self.anchor.0).line >= first;
+        }
+        if self.end.max(self.anchor.1).line < first {
+            return false;
+        }
+        let block = self.block;
+        let trim = |pos: &mut Pos| {
+            if pos.line < first {
+                *pos = Pos {
+                    line: first,
+                    col: if block { pos.col } else { 0 },
+                };
+            }
+        };
+        trim(&mut self.start);
+        trim(&mut self.anchor.0);
+        trim(&mut self.anchor.1);
+        true
+    }
+
     /// Selects from the anchor to `unit`.
     fn span_to(&mut self, unit: (Pos, Pos)) {
         let points = [self.anchor.0, self.anchor.1, unit.0, unit.1];
@@ -579,8 +619,7 @@ impl SelectionState {
     fn validate(&mut self, grid: &Grid, frame: Option<(usize, &DamageRows)>) {
         if let Some(sel) = &mut self.sel {
             let lines = Lines::of(grid);
-            let start = sel.start.min(sel.anchor.0).line;
-            if !sel.guard.holds(&lines, start, frame) {
+            if !sel.trim_evicted(&lines) || !sel.guard.holds(&lines, frame) {
                 self.sel = None;
             }
         }
@@ -679,16 +718,25 @@ impl SelectionState {
         sel.guard.retake(&lines, sel.start.line, sel.end.line);
     }
 
-    /// Selects every line: the history and the screen, or only the screen
-    /// on the alternate screen.
+    /// Selects every line up to the last row with text: the history and the
+    /// screen, or only the screen on the alternate screen. The blank rows
+    /// below that row are left out, so output that lands in them (the next
+    /// line of `yes` or `tail -f`, written on the cursor's blank row) does
+    /// not change a selected row and keep the selection. A terminal with no
+    /// text at all is selected whole, as it always was (its text is empty).
     pub(crate) fn select_all(&mut self, grid: &Grid) {
         let lines = Lines::of(grid);
         let start = Pos {
             line: lines.first,
             col: 0,
         };
+        let last_with_text = (lines.first..=lines.last()).rev().find(|&n| {
+            lines
+                .line(n)
+                .is_some_and(|line| !line.cells.iter().all(is_blank))
+        });
         let end = Pos {
-            line: lines.last(),
+            line: last_with_text.unwrap_or_else(|| lines.last()),
             col: lines.cols - 1,
         };
         let mut guard = self.sel.take().map(|sel| sel.guard).unwrap_or_default();
@@ -1359,7 +1407,8 @@ mod tests {
                     .filter_map(|n| Some((n, lines.line(n)?.clone())))
                     .collect()
             };
-            let start = sel.start.line;
+            let (start, end) = (sel.start.line, sel.end.line);
+            let mut seen = (term.grid().scrollback_pushed(), term.grid().scrollback_len());
             let mut snapshot = crate::view::Snapshot::default();
             let mut alive = true;
             for op in ops {
@@ -1381,11 +1430,24 @@ mod tests {
                 if !checked {
                     continue;
                 }
-                let lines = Lines::of(term.grid());
+                // Lines the history lost since the previous look: evicted at
+                // the cap (cut off, the selection lives while any line of it
+                // is left) or cleared (the selection dies if it held one).
+                let grid = term.grid();
+                let pushed = grid.scrollback_pushed() - seen.0;
+                let removed = (pushed + seen.1 as u64).saturating_sub(grid.scrollback_len() as u64);
+                let evicted = removed == 0 || grid.scrollback_len() >= grid.max_scrollback();
+                seen = (grid.scrollback_pushed(), grid.scrollback_len());
+                let lines = Lines::of(grid);
                 alive = alive
-                    && start >= lines.first
+                    && if evicted {
+                        end >= lines.first
+                    } else {
+                        start >= lines.first
+                    }
                     && reference.iter().all(|(n, line)| {
-                        lines.line(*n).is_some_and(|now| {
+                        *n < lines.first
+                            || lines.line(*n).is_some_and(|now| {
                                 now.cells == line.cells
                                     && now.graphemes == line.graphemes
                                     && now.wrapped == line.wrapped

@@ -9,9 +9,9 @@ triple-click lines, block selection, shift-click), Select All, Copy, and
 command-hover and command-click on URLs. The renderer has drawn a
 `Selection {start, end, kind}` and `OverlayKind::Underline` since #22; the
 core had no selection, no text extraction and no URL detection. This ADR
-covers the core half (part 1 of 3): OSC 8 storage is the next part (ADR
-0026) and the Swift gestures the last. The behaviour is pinned by
-`crates/tessera-app-core/tests/fixtures/selection_spec.txt` (116 rows) and
+covers the core half (part 1 of 3): OSC 8 storage is part 2 (ADR 0026) and
+the Swift gestures the last. The behaviour is pinned by
+`crates/tessera-app-core/tests/fixtures/selection_spec.txt` (123 rows) and
 the decisions in its `selection_spec.notes.md`, both from the
 spec-researcher, read against iTerm2, kitty, WezTerm, Ghostty, VTE and
 Alacritty sources.
@@ -72,9 +72,12 @@ without a selection (E05). iTerm2 does the same; the draft's "keep the
 anchor" would have moved the wrong end after a forward drag (E02). The end
 that stays becomes the anchor a following drag continues from.
 
-`App::select_all` selects the history and the screen, or only the screen
-on the alternate screen (F04); an empty terminal is selected too, with
-empty text (F05). `App::select_clear` drops the selection.
+`App::select_all` selects the history and the screen up to the last row
+with text, or only the screen on the alternate screen (F04): the blank rows
+below it are left out, so the next line of `yes` or `tail -f`, written on
+the cursor's blank row, does not change a selected row and clear the
+selection (G07f, G07g; output over the last text row still does, G07h); an
+empty terminal is selected whole, with empty text (F05). `App::select_clear` drops the selection.
 
 ### Text extraction
 
@@ -117,7 +120,18 @@ selection is dropped when:
   stricter than iTerm2, whose source clears only on SD, clear screen and
   width change: keeping a selection whose text silently changed would make
   Copy return text the user never saw;
-- the history evicts or clears a selected line (G07; RIS and ED 3 too);
+- the history drops a selected line other than by eviction at its cap: ED 3
+  and RIS clear it (G07d; the selection stays when it holds only screen
+  rows, G07e). Eviction at the cap is different (LD-1, decided 2026-11-02):
+  when it removes only the top of the selection and its end is still there
+  (G07, G07c), the start moves to the oldest line left, at column 0 (a block
+  keeps its columns), and the selection stays, so Select All and Copy during
+  continuous output copy the text that is left (iTerm2 clips a selection
+  that moves above the first line rather than dropping it). A selection with
+  no line left is cleared (G07b). The core tells the two apart at each look
+  by the history's length: lines gone while it is now at its cap were
+  evicted, otherwise they were cleared (a clear followed by a refill to the
+  cap between two looks reads as an eviction);
 - the grid's size changes (G08; `App::resize` to another size also clears
   it at once), or the screen switches to or from the alternate screen
   (G09);

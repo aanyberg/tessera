@@ -24,6 +24,13 @@ import os
 ///   and pixel coordinates; the core reports them to a program that tracks
 ///   the mouse and says so (`.consumed`), and leaves the rest to the view.
 ///   The click that activates the window is not sent.
+/// - Selection and links (#30): a press the program did not take selects
+///   through the core (a drag, a double-click word, a triple-click line,
+///   Option or ⌥⌘ for a block, Shift to adjust), scrolling the view while
+///   the pointer is above or below it. Command-hover underlines a link under
+///   the pointer and shows a pointing hand; a Command-click opens it through
+///   ``linkOpener`` when ``LinkPolicy`` allows. Copy and Select All are the
+///   Edit menu's; nothing is copied on select.
 /// - Scrollback: the wheel and trackpad move the view through the core;
 ///   the View menu's ⌘↑/⌘↓ page and ⌘Home/⌘End jump (``scroll(to:)``);
 ///   ``TerminalScroller`` shows and moves the position. Typing, pasting and
@@ -154,15 +161,37 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
 
     // Menu state (Edit and View menus).
 
-    /// Whether text is selected: Copy (and, until #30 decides otherwise,
-    /// Select All) is enabled only then. Always `false` until the selection
-    /// model (#30) sets it.
-    var hasSelection = false
+    /// Whether the core holds a selection: Copy is enabled only then. Read
+    /// from the core each time, since output that changes a selected line
+    /// drops the selection there.
+    var hasSelection: Bool { (try? session.hasSelection) ?? false }
     /// Where Paste reads from. Tests use a private pasteboard, so the user's
     /// clipboard is neither read nor changed.
     var pasteboard: NSPasteboard = .general
     /// Pastes handed to the session (tests).
     private(set) var pasteCount = 0
+
+    // Selection and link state (#30).
+
+    /// What a Command-click opens a link with. Tests record instead.
+    var linkOpener: any LinkOpening = WorkspaceLinkOpener()
+    /// Scrolls the view while a selection drag has the pointer outside it.
+    let autoscroller = SelectionAutoscroller()
+    /// The link under the pointer while Command is held (the string the core
+    /// detected), or `nil`.
+    private(set) var hoveredLink: String?
+    private var hoveredCell: GridCell?
+    /// Where the pointer last was, in view coordinates, or `nil` once it
+    /// left: Command pressed or released later re-tests this spot.
+    private var lastPointer: NSPoint?
+    /// The left-button gesture the view handles itself (the core did not
+    /// report the press to a program), from press to release.
+    private var gesture: PointerGesture?
+    #if DEBUG
+        /// Every selection call the gestures made, in order. Debug builds
+        /// only (tests).
+        private(set) var selectionCalls: [SelectionCall] = []
+    #endif
     /// The font size the surface was last attached with: the configured size,
     /// which Actual Size (⌘0) returns to. `nil` before the first attach.
     private(set) var attachedFontSizePt: Float?
@@ -202,9 +231,14 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         // Plain motion (no button held) while the window is key, for
         // programs that track every motion (DECSET 1003). AppKit keeps the
         // area on the visible rect, so it is never replaced.
+        offersMouseDownToInputContext = { [weak self] event in self?.inputContext?.handleEvent(event) ?? false }
+        // Entering and leaving end a command-hover; `cursorUpdate` restores
+        // the text cursor over a link's hand.
         addTrackingArea(
             NSTrackingArea(
-                rect: .zero, options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect], owner: self, userInfo: nil))
+                rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .cursorUpdate, .activeInKeyWindow, .inVisibleRect],
+                owner: self, userInfo: nil))
+        autoscroller.onTick = { [weak self] direction, lines in self?.autoscrollTicked(direction, lines: lines) }
     }
 
     @available(*, unavailable)
@@ -309,6 +343,8 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     /// away (or the view leaves it).
     private func tearDown() {
         observedWindow = nil
+        autoscroller.stop()
+        gesture = nil
         displayLink?.invalidate()
         displayLink = nil
         for observer in windowObservers {
@@ -656,6 +692,10 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     func windowKeyChanged(isKey: Bool) {
         if !isKey {
             discardComposition()
+            // A drag the window lost key status in goes on selecting only
+            // while it is delivered; the timer must not keep scrolling
+            // after it. The selection stays as it is.
+            autoscroller.stop()
         }
         sendFocus(isKey && isFocused)
     }
@@ -695,13 +735,17 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     /// overlapping cursor rects undefined: over an overlay scroll bar the
     /// I-beam stops at its edge.
     func cursorRects() -> [(NSRect, NSCursor)] {
-        guard !scroller.isHidden else { return [(bounds, .iBeam)] }
+        guard !scroller.isHidden else { return [(bounds, textCursor)] }
         let text = renderView.frame
         let bar = scroller.frame
         let beam = NSRect(
             x: text.minX, y: text.minY, width: max(0, min(text.maxX, bar.minX) - text.minX), height: text.height)
-        return [(beam, .iBeam), (bar, .arrow)]
+        return [(beam, textCursor), (bar, .arrow)]
     }
+
+    /// The cursor over the text: the pointing hand over a link while Command
+    /// is held, the I-beam otherwise.
+    var textCursor: NSCursor { hoveredLink == nil ? .iBeam : .pointingHand }
 
     // MARK: Keyboard
 
@@ -930,13 +974,43 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     /// The last mouse event handed to the session (tests).
     private(set) var lastSentMouse: TesseraSession.MouseEvent?
 
+    /// Offers a press to the input method while text is marked (`NSTextView`
+    /// does): it may use the click itself, for a candidate window. The test
+    /// seam: the hosted tests have no input context.
+    var offersMouseDownToInputContext: (NSEvent) -> Bool = { _ in false }
+
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
-        press(event, button: .left)
+        if hasMarkedText() {
+            // The input method uses the click, or the composition is
+            // committed (as a commit by mouse is) and the click goes on.
+            if offersMouseDownToInputContext(event) { return }
+            insertText(markedText.string, replacementRange: NSRange(location: NSNotFound, length: 0))
+            // The input method still holds the composition: tell it it ended,
+            // or its next kana repeats the committed text. What it answers
+            // with is dropped, as when a composition is discarded.
+            isDiscardingMarkedText = true
+            inputContext?.discardMarkedText()
+            isDiscardingMarkedText = false
+        }
+        let outcome = press(event, button: .left)
+        gesture = nil
+        autoscroller.stop()
+        lastPointer = convert(event.locationInWindow, from: nil)
+        if outcome == .ignored {
+            beginGesture(event)
+        }
     }
 
-    override func mouseUp(with event: NSEvent) { release(event, button: .left) }
-    override func mouseDragged(with event: NSEvent) { drag(event, button: .left) }
+    override func mouseUp(with event: NSEvent) {
+        release(event, button: .left)
+        endGesture(event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        drag(event, button: .left)
+        continueGesture(event)
+    }
     override func rightMouseDown(with event: NSEvent) { press(event, button: .right) }
     override func rightMouseUp(with event: NSEvent) { release(event, button: .right) }
     override func rightMouseDragged(with event: NSEvent) { drag(event, button: .right) }
@@ -958,6 +1032,24 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
 
     override func mouseMoved(with event: NSEvent) {
         sendMouse(event, kind: .motion, button: .none)
+        lastPointer = convert(event.locationInWindow, from: nil)
+        updateHover(modifiers: event.modifierFlags)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        lastPointer = nil
+        setHover(link: nil, cell: nil)
+    }
+
+    /// Command pressed or released with the pointer still: the link under it
+    /// is underlined, or not, without waiting for the pointer to move.
+    override func flagsChanged(with event: NSEvent) {
+        updateHover(modifiers: event.modifierFlags)
+        super.flagsChanged(with: event)
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        textCursor.set()
     }
 
     /// The button of an `otherMouse` event: middle, back or forward. Buttons
@@ -972,8 +1064,11 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         }
     }
 
-    private func press(_ event: NSEvent, button: TesseraSession.MouseButton) {
-        pressOutcomes[button] = sendMouse(event, kind: .press, button: button)
+    @discardableResult
+    private func press(_ event: NSEvent, button: TesseraSession.MouseButton) -> TesseraSession.InputOutcome {
+        let outcome = sendMouse(event, kind: .press, button: button)
+        pressOutcomes[button] = outcome
+        return outcome
     }
 
     private func drag(_ event: NSEvent, button: TesseraSession.MouseButton) {
@@ -1073,6 +1168,183 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         } catch {
             Self.log.debug("scroll not sent: \(String(describing: error), privacy: .public)")
         }
+    }
+
+    // MARK: Selection and links
+
+    /// The modifiers a link gesture needs: Command alone.
+    private static func isLinkModifier(_ flags: NSEvent.ModifierFlags) -> Bool {
+        flags.intersection([.command, .option, .shift, .control]) == .command
+    }
+
+    private func gridCell(at point: NSPoint) -> GridCell {
+        let (cell, _) = cell(at: point)
+        return GridCell(col: cell.col, row: cell.row)
+    }
+
+    /// What a click of `count` selects: a cell, a word, a whole line (the
+    /// fourth click and later too: no smart selection).
+    private static func granularity(forClicks count: Int) -> TesseraSession.SelectionGranularity {
+        switch count {
+        case ...1: .character
+        case 2: .word
+        default: .line
+        }
+    }
+
+    /// A press the program did not take. Command alone is a link click and
+    /// never a selection; Command with Option, like Option alone, selects a
+    /// block (iTerm2 uses ⌥⌘, Terminal.app and WezTerm ⌥: both work). Shift
+    /// with a selection moves its nearer end. The mode is fixed here: later
+    /// modifiers do not change it.
+    private func beginGesture(_ event: NSEvent) {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let cell = gridCell(at: lastPointer ?? .zero)
+        if flags.contains(.command), !flags.contains(.option) {
+            if Self.isLinkModifier(flags), event.clickCount == 1 {
+                gesture = .link(press: cell, moved: false)
+            }
+            return
+        }
+        if flags.contains(.shift), hasSelection {
+            select(.adjust(col: cell.col, row: cell.row))
+        } else {
+            select(
+                .begin(
+                    col: cell.col, row: cell.row, granularity: Self.granularity(forClicks: event.clickCount),
+                    block: flags.contains(.option)))
+        }
+        gesture = .selecting(last: cell)
+    }
+
+    /// A drag with the left button down.
+    private func continueGesture(_ event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        lastPointer = point
+        let cell = gridCell(at: point)
+        switch gesture {
+        case .selecting(let last)?:
+            if cell != last {
+                select(.extend(col: cell.col, row: cell.row))
+                gesture = .selecting(last: cell)
+            }
+            autoscroller.update(direction: autoscrollDirection(of: point))
+        case .link(let press, _)?:
+            if cell != press {
+                gesture = .link(press: press, moved: true)
+            }
+        case nil:
+            break
+        }
+    }
+
+    /// The left button went up: autoscroll stops, a Command-click that
+    /// stayed in its cell opens the link there.
+    private func endGesture(_ event: NSEvent) {
+        autoscroller.stop()
+        defer { gesture = nil }
+        guard case .link(let press, let moved)? = gesture, !moved else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        lastPointer = point
+        guard gridCell(at: point) == press else { return }
+        openLink(at: press)
+    }
+
+    /// Opens the link under `cell` if there is one and the policy allows
+    /// (Finder shows a file that would launch something).
+    private func openLink(at cell: GridCell) {
+        guard let link = try? session.link(col: cell.col, row: cell.row),
+            let action = LinkPolicy.action(for: link)
+        else { return }
+        switch action {
+        case .open(let url): linkOpener.open(url)
+        case .reveal(let url): linkOpener.reveal(url)
+        }
+    }
+
+    /// Whether the pointer at `point` is above or below the view, so a
+    /// selection drag scrolls.
+    private func autoscrollDirection(of point: NSPoint) -> SelectionAutoscroller.Direction? {
+        let fromTop = isFlipped ? point.y : bounds.height - point.y
+        if fromTop < 0 { return .up }
+        if fromTop > bounds.height { return .down }
+        return nil
+    }
+
+    /// One autoscroll tick: the view moves `lines` towards older output
+    /// (`.up`) or the live screen, and the selection's end follows to the
+    /// row it revealed, at the pointer's column.
+    private func autoscrollTicked(_ direction: SelectionAutoscroller.Direction, lines: Int) {
+        guard case .selecting? = gesture, let point = lastPointer,
+            let position = try? session.scrollPosition
+        else {
+            autoscroller.stop()
+            return
+        }
+        let step = UInt64(lines)
+        let target = direction == .up ? min(position.offset + step, position.history) : position.offset - min(position.offset, step)
+        if target != position.offset {
+            scroll(to: .offset(target))
+        }
+        let cell = GridCell(col: gridCell(at: point).col, row: direction == .up ? 0 : position.rows - 1)
+        select(.extend(col: cell.col, row: cell.row))
+        gesture = .selecting(last: cell)
+    }
+
+    private func select(_ call: SelectionCall) {
+        #if DEBUG
+            selectionCalls.append(call)
+        #endif
+        do {
+            switch call {
+            case .begin(let col, let row, let granularity, let block):
+                try session.selectBegin(col: col, row: row, granularity: granularity, block: block)
+            case .extend(let col, let row):
+                try session.selectExtend(col: col, row: row)
+            case .adjust(let col, let row):
+                try session.selectAdjust(col: col, row: row)
+            case .selectAll:
+                try session.selectAll()
+            }
+            needsRender = true
+        } catch {
+            Self.log.debug("selection call failed: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    /// Underlines the link under the pointer while Command is held, shows
+    /// the pointing hand over it, and clears both when Command is released,
+    /// the pointer leaves the link or a button is down.
+    private func updateHover(modifiers: NSEvent.ModifierFlags) {
+        guard Self.isLinkModifier(modifiers.intersection(.deviceIndependentFlagsMask)), gesture == nil,
+            let point = lastPointer
+        else {
+            setHover(link: nil, cell: nil)
+            return
+        }
+        let cell = gridCell(at: point)
+        if cell == hoveredCell, hoveredLink != nil { return }
+        guard let link = try? session.link(col: cell.col, row: cell.row), LinkPolicy.action(for: link) != nil else {
+            setHover(link: nil, cell: nil)
+            return
+        }
+        setHover(link: link, cell: cell)
+    }
+
+    private func setHover(link: String?, cell: GridCell?) {
+        guard link != hoveredLink || cell != hoveredCell else { return }
+        let linkChanged = link != hoveredLink
+        hoveredLink = link
+        hoveredCell = cell
+        do {
+            try session.setHover(cell.map { ($0.col, $0.row) })
+        } catch {
+            Self.log.debug("hover not sent: \(String(describing: error), privacy: .public)")
+        }
+        needsRender = true
+        guard linkChanged else { return }
+        window?.invalidateCursorRects(for: self)
+        if lastPointer != nil, window != nil { textCursor.set() }
     }
 
     // MARK: Scrollback
@@ -1280,8 +1552,10 @@ extension TerminalSurfaceView: NSMenuItemValidation {
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         switch menuItem.action {
-        case #selector(copy(_:)), #selector(selectAll(_:)):
+        case #selector(copy(_:)):
             return hasSelection
+        case #selector(selectAll(_:)):
+            return true
         case #selector(paste(_:)), #selector(pasteAsPlainText(_:)):
             return !hasExited && pasteboard.availableType(from: [.string]) != nil
         case #selector(clearScrollback(_:)):
@@ -1306,12 +1580,25 @@ extension TerminalSurfaceView: NSMenuItemValidation {
         }
     }
 
-    /// Copy (⌘C). Does nothing until the selection model (#30) supplies the
-    /// selected text; the item is disabled meanwhile.
-    @objc func copy(_ sender: Any?) {}
+    /// Copy (⌘C): the selected text goes to the pasteboard as plain text
+    /// and the selection stays. A selection of blanks only leaves the
+    /// pasteboard as it was, rather than emptying the user's clipboard for
+    /// nothing. Nothing is copied by selecting (copy-on-select is #47).
+    @objc func copy(_ sender: Any?) {
+        do {
+            guard let text = try session.selectionText(), !text.isEmpty else { return }
+            pasteboard.clearContents()
+            pasteboard.setString(text, forType: .string)
+        } catch {
+            Self.log.debug("copy failed: \(String(describing: error), privacy: .public)")
+        }
+    }
 
-    /// Select All (⌘A). Does nothing until the selection model (#30).
-    @objc override func selectAll(_ sender: Any?) {}
+    /// Select All (⌘A): the scrollback and the screen (the screen only on
+    /// the alternate screen). Lines that arrive later are not added.
+    @objc override func selectAll(_ sender: Any?) {
+        select(.selectAll)
+    }
 
     /// Paste (⌘V): the pasteboard's text goes to the session, which strips
     /// what a paste must not carry and brackets it when the terminal asked
@@ -1701,4 +1988,32 @@ private final class DisplayLinkTarget: NSObject {
         }
         view.displayLinkDidFire()
     }
+}
+
+
+/// A cell of the grid, view-relative: row 0 is the top row shown.
+private struct GridCell: Equatable {
+    var col: UInt16
+    var row: UInt16
+}
+
+/// A left-button gesture the view handles: the core did not report the press
+/// to a program.
+private enum PointerGesture {
+    /// A selection, begun or adjusted at the press; `last` is the cell the
+    /// core was last told about. The core is asked to extend only when the
+    /// pointer reaches another cell (a drag inside the cell pressed selects
+    /// nothing).
+    case selecting(last: GridCell)
+    /// A Command-click: the link under `press` opens on release if the
+    /// pointer did not leave the cell (a Command-drag does nothing).
+    case link(press: GridCell, moved: Bool)
+}
+
+/// A call a gesture or the Edit menu makes on the core's selection.
+enum SelectionCall: Equatable {
+    case begin(col: UInt16, row: UInt16, granularity: TesseraSession.SelectionGranularity, block: Bool)
+    case extend(col: UInt16, row: UInt16)
+    case adjust(col: UInt16, row: UInt16)
+    case selectAll
 }
