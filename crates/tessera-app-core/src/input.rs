@@ -282,17 +282,26 @@ impl Bindings {
 /// The cursor keys the wheel sends on the alternate screen for `lines`
 /// whole lines (positive: towards older output, the wheel turned up): that
 /// many Up keys, or `-lines` Down keys, `CSI A` / `CSI B`, or `SS3 A` /
-/// `SS3 B` when `application_cursor_keys` (DECCKM) is set. Empty for 0.
+/// `SS3 B` when `application_cursor_keys` (DECCKM) is set, each in its
+/// 8-bit form (`0x9B A`, `0x8F A`) when `eight_bit` (S8C1T). Empty for 0.
 ///
 /// These are the unmodified legacy cursor keys whatever keyboard protocol
 /// the application turned on, as xterm sends for alternate scroll.
-pub(crate) fn alternate_scroll_keys(lines: i32, application_cursor_keys: bool) -> Vec<u8> {
+pub(crate) fn alternate_scroll_keys(
+    lines: i32,
+    application_cursor_keys: bool,
+    eight_bit: bool,
+) -> Vec<u8> {
     let key: &[u8] = match (lines > 0, application_cursor_keys) {
         (true, false) => b"\x1b[A",
         (true, true) => b"\x1bOA",
         (false, false) => b"\x1b[B",
         (false, true) => b"\x1bOB",
     };
+    let mut key = key.to_vec();
+    if eight_bit {
+        tessera_term::to_8bit_controls(&mut key);
+    }
     key.repeat(usize::try_from(lines.unsigned_abs()).unwrap_or(0))
 }
 
@@ -472,13 +481,27 @@ mod tests {
 
     #[test]
     fn alternate_scroll_sends_one_cursor_key_per_line_in_the_decckm_form() {
-        assert_eq!(alternate_scroll_keys(0, false), b"");
-        assert_eq!(alternate_scroll_keys(0, true), b"");
-        assert_eq!(alternate_scroll_keys(1, false), b"\x1b[A");
-        assert_eq!(alternate_scroll_keys(3, false), b"\x1b[A\x1b[A\x1b[A");
-        assert_eq!(alternate_scroll_keys(-2, false), b"\x1b[B\x1b[B");
-        assert_eq!(alternate_scroll_keys(2, true), b"\x1bOA\x1bOA");
-        assert_eq!(alternate_scroll_keys(-1, true), b"\x1bOB");
+        assert_eq!(alternate_scroll_keys(0, false, false), b"");
+        assert_eq!(alternate_scroll_keys(0, true, false), b"");
+        assert_eq!(alternate_scroll_keys(1, false, false), b"\x1b[A");
+        assert_eq!(
+            alternate_scroll_keys(3, false, false),
+            b"\x1b[A\x1b[A\x1b[A"
+        );
+        assert_eq!(alternate_scroll_keys(-2, false, false), b"\x1b[B\x1b[B");
+        assert_eq!(alternate_scroll_keys(2, true, false), b"\x1bOA\x1bOA");
+        assert_eq!(alternate_scroll_keys(-1, true, false), b"\x1bOB");
+    }
+
+    /// In 8-bit mode (S8C1T) every key of the run is 8-bit, not only the
+    /// first (#96).
+    #[test]
+    fn alternate_scroll_keys_are_8bit_in_8bit_mode() {
+        assert_eq!(alternate_scroll_keys(0, false, true), b"");
+        assert_eq!(alternate_scroll_keys(3, false, true), b"\x9bA\x9bA\x9bA");
+        assert_eq!(alternate_scroll_keys(-2, false, true), b"\x9bB\x9bB");
+        assert_eq!(alternate_scroll_keys(2, true, true), b"\x8fA\x8fA");
+        assert_eq!(alternate_scroll_keys(-1, true, true), b"\x8fB");
     }
 
     #[test]

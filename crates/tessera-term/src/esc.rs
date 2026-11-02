@@ -16,6 +16,8 @@
 //! | `ESC 6` | DECBI | back index: at the left margin the region's columns move right, else the cursor moves left (level 4 and up) |
 //! | `ESC 9` | DECFI | forward index: at the right margin the region's columns move left, else the cursor moves right (level 4 and up) |
 //! | `ESC Z` | DECID | identify: the DA1 reply (see the `reports` module) |
+//! | `ESC SP F` | S7C1T | 7-bit replies, C1 controls in the input ignored (level 2 and up) |
+//! | `ESC SP G` | S8C1T | 8-bit replies, C1 controls in the input honoured (level 2 and up) |
 //!
 //! Any other escape sequence is ignored and logged at trace level. Expected
 //! behaviour is pinned by `tests/fixtures/csi_spec.txt`.
@@ -58,6 +60,11 @@ impl State {
             ([], b'9') if self.conformance_level >= 4 => self.grid.forward_index(),
             // DECID: answered exactly like DA1 (xterm).
             ([], b'Z') => self.primary_device_attributes(),
+            // S7C1T and S8C1T: VT200 and up (xterm `vtXX_level >= 2`). At
+            // level 1 they fall through to the ignored arm; xterm also
+            // swallows the next byte there, which Tessera does not copy.
+            ([b' '], b'F') if self.conformance_level >= 2 => self.c1_8bit_replies = false,
+            ([b' '], b'G') if self.conformance_level >= 2 => self.c1_8bit_replies = true,
             _ => trace!(?intermediates, byte = ?char::from(byte), "ESC ignored"),
         }
     }

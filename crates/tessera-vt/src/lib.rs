@@ -35,9 +35,26 @@
 //!
 //! `vte` leaves the 7-bit string terminator `ESC \` to the escape dispatcher,
 //! so a DCS closed with `ESC \` yields [`Action::DcsEnd`] followed by
-//! [`Action::Esc`] with `byte == b'\\'`. The 8-bit terminator (`0x9C`) ends a
-//! DCS on its own. `CAN` (`0x18`) and `SUB` (`0x1A`) abort a DCS: the parser
-//! emits [`Action::DcsEnd`] and then [`Action::Execute`] for the control byte.
+//! [`Action::Esc`] with `byte == b'\\'`. A lone `0x9C` byte (the 8-bit
+//! terminator) ends a DCS on its own; a `0x9C` that is part of a UTF-8
+//! character (the second byte of `C9 9C`, U+025C) is payload, like the rest
+//! of the character, and does not. `CAN` (`0x18`) and `SUB` (`0x1A`) abort a
+//! DCS: the parser emits [`Action::DcsEnd`] and then [`Action::Execute`]
+//! for the control byte.
+//!
+//! # 8-bit C1 controls
+//!
+//! The byte stream is UTF-8, so a C1 control (`0x80..=0x9F`) is ambiguous:
+//! a raw byte in that range is also a UTF-8 continuation byte. By default
+//! the parser reads it the way `vte` does, which is what a terminal in
+//! UTF-8 mode does (xterm ignores C1 controls there): a lone raw byte or a
+//! UTF-8 encoded C1 (`C2 80..=C2 9F`) in the ground state is an
+//! [`Action::Execute`] that a consumer may ignore, and in any other state
+//! it is dropped. [`Parser::advance_c1`] instead honours them while the
+//! consumer says 8-bit controls are on (S8C1T): every C1 code, raw or UTF-8
+//! encoded but never a byte of another UTF-8 character, is parsed exactly
+//! as its 7-bit form `ESC (code - 0x40)` in every state, so `0x9B` starts a
+//! CSI, `0x9C` ends a string and `0x84` is `ESC D`.
 //!
 //! # Chunking
 //!
@@ -138,7 +155,8 @@ pub enum Action {
     ///
     /// The payload is 7-bit only. `vte`'s DCS passthrough state forwards
     /// `0x00..=0x7E` (except `CAN`, `SUB` and `ESC`) and silently drops every
-    /// byte in `0x80..=0xFF` other than the `0x9C` terminator. Consumers must
+    /// byte in `0x80..=0xFF` other than a lone `0x9C` terminator; a UTF-8
+    /// character is dropped whole, even one with a `0x9C` byte. Consumers must
     /// not expect raw 8-bit or UTF-8 data here. This is harmless for Sixel,
     /// whose alphabet is `0x20..=0x7E`, but it will strip non-ASCII window and
     /// pane names from future tmux `-CC` notifications; that is tracked
@@ -150,6 +168,9 @@ pub enum Action {
 }
 
 /// Incremental parser. Feed it bytes, collect actions.
+///
+/// See the crate documentation for the memory bounds, the string
+/// terminators and the 8-bit C1 controls.
 #[derive(Default)]
 pub struct Parser {
     inner: vte::Parser,
@@ -167,6 +188,9 @@ struct DcsState {
     /// Set when the active DCS header was flagged `ignore`; payload bytes are
     /// discarded instead of buffered.
     ignoring: bool,
+    /// Set between [`Action::DcsStart`] and [`Action::DcsEnd`]: `vte` is in
+    /// its DCS passthrough state, where any `0x9C` byte would end the DCS.
+    active: bool,
 }
 
 impl Parser {
@@ -175,17 +199,41 @@ impl Parser {
         Self::default()
     }
 
-    /// Parses `bytes`, invoking `sink` once per decoded action.
+    /// Parses `bytes`, invoking `sink` once per decoded action, with 8-bit
+    /// C1 controls read as `vte` reads them (crate docs, "8-bit C1
+    /// controls").
     ///
     /// A UTF-8 character split across two calls can lose the characters
     /// after it (crate docs, "Chunking"): feed whole characters, as
     /// `tessera_term::Terminal::advance` does.
-    pub fn advance(&mut self, bytes: &[u8], mut sink: impl FnMut(Action)) {
+    pub fn advance(&mut self, bytes: &[u8], sink: impl FnMut(Action)) {
+        self.advance_c1(bytes, &mut SevenBit(sink));
+    }
+
+    /// [`Parser::advance`] for a consumer that switches 8-bit C1 controls
+    /// on and off: while [`Sink::c1_controls`] is true every C1 code is
+    /// parsed as its 7-bit form `ESC Fe` (crate docs, "8-bit C1
+    /// controls"). The parser asks before the first byte and after every
+    /// ESC and CSI sequence, so a switch followed by a C1 control in the
+    /// same call takes effect at once.
+    ///
+    /// Input with no byte in `0x80..=0x9F` is parsed in one go by `vte`
+    /// alone, whatever the mode: a C1 code needs such a byte. Other input
+    /// costs time linear in its length too, however many DCS strings and
+    /// mode switches it holds.
+    pub fn advance_c1(&mut self, bytes: &[u8], sink: &mut impl Sink) {
+        let c1 = sink.c1_controls();
         let mut perform = Performer {
-            sink: &mut sink,
+            sink,
             dcs: &mut self.dcs,
+            c1,
+            stop: false,
         };
-        self.inner.advance(&mut perform, bytes);
+        if may_hold_c1(bytes) {
+            advance_careful(&mut self.inner, &mut perform, bytes);
+        } else {
+            self.inner.advance(&mut perform, bytes);
+        }
     }
 
     /// Bytes currently held back for the next [`Action::DcsData`].
@@ -195,6 +243,32 @@ impl Parser {
     #[must_use]
     pub fn pending_dcs_len(&self) -> usize {
         self.dcs.buf.len()
+    }
+}
+
+/// What [`Parser::advance_c1`] drives: the consumer, which applies every
+/// action and owns the 8-bit C1 mode.
+pub trait Sink {
+    /// Applies one action.
+    fn action(&mut self, action: Action);
+
+    /// Whether 8-bit C1 controls are on (S8C1T). Asked before the first
+    /// byte of each [`Parser::advance_c1`] call and after every
+    /// [`Action::Esc`] and [`Action::Csi`], the only actions that may
+    /// switch them.
+    fn c1_controls(&self) -> bool;
+}
+
+/// [`Parser::advance`]'s sink: 8-bit C1 controls always off.
+struct SevenBit<F>(F);
+
+impl<F: FnMut(Action)> Sink for SevenBit<F> {
+    fn action(&mut self, action: Action) {
+        (self.0)(action);
+    }
+
+    fn c1_controls(&self) -> bool {
+        false
     }
 }
 
@@ -219,12 +293,223 @@ fn flatten_params(params: &vte::Params) -> (Vec<u16>, u32) {
     (flat, subparams)
 }
 
+/// Whether `bytes` has a byte in `0x80..=0x9F`, the only bytes a C1 code
+/// or the DCS fix in [`advance_careful`] can start at.
+///
+/// Branch-free per 32-byte block so it vectorises; it runs over every chunk
+/// of output, ASCII included.
+fn may_hold_c1(bytes: &[u8]) -> bool {
+    bytes.chunks(32).any(|block| {
+        block
+            .iter()
+            .fold(0u8, |any, &b| any | u8::from(b & 0xE0 == 0x80))
+            != 0
+    })
+}
+
+/// What [`advance_careful`] does at one place in the input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Item {
+    /// A C1 code in 8-bit mode: parse `ESC (code - 0x40)` instead.
+    Control(u8),
+    /// A UTF-8 character (or invalid sequence) with a `0x9C` byte inside a
+    /// DCS: skip it. `vte` drops bytes above `0x7F` in a DCS payload anyway,
+    /// but would end the DCS at the `0x9C`.
+    Drop,
+}
+
+/// [`Parser::advance_c1`] for input that may hold a C1 code: feeds `vte` the
+/// bytes between the places where a C1 code is translated or a character is
+/// dropped, stopping whenever the mode or the DCS state changes so what
+/// comes next is decided again.
+///
+/// The places come from two cursors that only move forward, one per kind
+/// ([`next_code`], [`next_9c_char`]), so the whole input is scanned at most
+/// once per kind however often the state changes: linear time. Every place
+/// it splits the input is a character boundary, so `vte` never sees a
+/// UTF-8 character split across two of its calls.
+fn advance_careful(inner: &mut vte::Parser, perform: &mut Performer<'_>, bytes: &[u8]) {
+    let mut codes = Cursor::default();
+    let mut drops = Cursor::default();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        // The next C1 code (8-bit mode) and the next character with a 0x9C
+        // byte (inside a DCS); a C2 9C is both, and a code wins.
+        let code = if perform.c1 {
+            codes.next(bytes, pos, next_code)
+        } else {
+            None
+        };
+        let drop = if perform.dcs.active {
+            drops.next(bytes, pos, next_9c_char)
+        } else {
+            None
+        };
+        let item = match (code, drop) {
+            (Some(code), Some(drop)) if drop.0 < code.0 => Some(drop),
+            (Some(code), _) => Some(code),
+            (None, drop) => drop,
+        };
+        let end = item.map_or(bytes.len(), |(start, _, _)| start);
+        perform.stop = false;
+        pos += inner.advance_until_terminated(perform, &bytes[pos..end]);
+        if perform.stop {
+            // The mode or the DCS state changed: what comes next may be
+            // read differently.
+            continue;
+        }
+        let Some((_, item_end, item)) = item else {
+            break;
+        };
+        if let Item::Control(code) = item {
+            inner.advance(perform, &[0x1B, code - 0x40]);
+        }
+        pos = item_end;
+    }
+}
+
+/// A place found by [`next_code`] or [`next_9c_char`]: `(start, end, what)`.
+type Place = (usize, usize, Item);
+
+/// The last result of a forward scan: the first place at or after `from`,
+/// or none up to the end.
+#[derive(Default)]
+struct Cursor {
+    scanned: Option<(usize, Option<Place>)>,
+}
+
+impl Cursor {
+    /// The first place at or after `pos`, scanning with `find` only when the
+    /// last result lies behind `pos`: the scans never overlap.
+    fn next(
+        &mut self,
+        bytes: &[u8],
+        pos: usize,
+        find: fn(&[u8], usize) -> Option<Place>,
+    ) -> Option<Place> {
+        match self.scanned {
+            Some((from, found))
+                if from <= pos && found.is_none_or(|(start, _, _)| start >= pos) =>
+            {
+                found
+            }
+            _ => {
+                let found = find(bytes, pos);
+                self.scanned = Some((pos, found));
+                found
+            }
+        }
+    }
+}
+
+/// The first C1 code at or after `from` (a character boundary): a lone
+/// byte in `0x80..=0x9F` or the UTF-8 encoding `C2 80..=C2 9F`.
+fn next_code(bytes: &[u8], from: usize) -> Option<Place> {
+    let mut at = from;
+    while let Some(offset) = bytes[at..].iter().position(|&b| b & 0xE0 == 0x80) {
+        let (start, end, unit) = unit_at(bytes, from, at + offset);
+        if let Unit::Lone(code) | Unit::Encoded(code) = unit {
+            return Some((start, end, Item::Control(code)));
+        }
+        at = end;
+    }
+    None
+}
+
+/// The first character (or invalid sequence) with a `0x9C` byte at or after
+/// `from` (a character boundary), not counting a lone `0x9C`: what a DCS
+/// payload drops. In 7-bit mode a UTF-8 encoded ST (`C2 9C`) is one of
+/// them.
+fn next_9c_char(bytes: &[u8], from: usize) -> Option<Place> {
+    let mut at = from;
+    while let Some(offset) = bytes[at..].iter().position(|&b| b == 0x9C) {
+        let (start, end, unit) = unit_at(bytes, from, at + offset);
+        if !matches!(unit, Unit::Lone(_)) {
+            return Some((start, end, Item::Drop));
+        }
+        at = end;
+    }
+    None
+}
+
+/// What the byte at an index in `0x80..=0x9F` belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unit {
+    /// A C1 code as a lone byte: not part of any UTF-8 sequence.
+    Lone(u8),
+    /// A C1 code in its UTF-8 encoding `C2 80..=C2 9F`.
+    Encoded(u8),
+    /// A byte of another UTF-8 character, or of an invalid sequence longer
+    /// than one byte (which `vte` prints as one U+FFFD).
+    Other,
+}
+
+/// The unit holding `bytes[at]` (a byte in `0x80..=0x9F`), as `(start,
+/// end, unit)`, splitting the input as [`str::from_utf8`] and `vte` do: a
+/// lead byte at most three bytes back whose sequence covers `at` claims it.
+/// No sequence starts before `floor`.
+fn unit_at(bytes: &[u8], floor: usize, at: usize) -> (usize, usize, Unit) {
+    let lone = (at, at + 1, Unit::Lone(bytes[at]));
+    let mut start = at;
+    while start > floor && at - start < 3 {
+        start -= 1;
+        let byte = bytes[start];
+        if byte & 0xC0 == 0x80 {
+            continue; // a continuation byte: keep looking for the lead
+        }
+        if byte < 0xC0 {
+            return lone; // ASCII: no sequence reaches `at`
+        }
+        let window = &bytes[start..bytes.len().min(start + 4)];
+        let len = match std::str::from_utf8(window) {
+            Ok(text) => text.chars().next().map_or(1, char::len_utf8),
+            Err(err) if err.valid_up_to() > 0 => {
+                // The first character is valid; its length is its lead's.
+                std::str::from_utf8(&window[..err.valid_up_to()])
+                    .ok()
+                    .and_then(|text| text.chars().next())
+                    .map_or(1, char::len_utf8)
+            }
+            Err(err) => err.error_len().unwrap_or(window.len()),
+        };
+        if at >= start + len {
+            return lone;
+        }
+        let unit = if len == 2 && byte == 0xC2 {
+            Unit::Encoded(bytes[at])
+        } else {
+            Unit::Other
+        };
+        return (start, start + len, unit);
+    }
+    lone
+}
+
 struct Performer<'a> {
-    sink: &'a mut dyn FnMut(Action),
+    sink: &'a mut dyn Sink,
     dcs: &'a mut DcsState,
+    /// Whether 8-bit C1 controls are on, as the sink last said.
+    c1: bool,
+    /// Set when `c1` or the DCS state changed; [`advance_careful`] stops
+    /// `vte` there (`vte::Perform::terminated`).
+    stop: bool,
 }
 
 impl Performer<'_> {
+    /// Hands `action` to the sink.
+    fn emit(&mut self, action: Action) {
+        self.sink.action(action);
+    }
+
+    /// Asks the sink for the C1 mode after a sequence that may switch it.
+    fn check_c1(&mut self) {
+        let c1 = self.sink.c1_controls();
+        if c1 != self.c1 {
+            self.c1 = c1;
+            self.stop = true;
+        }
+    }
+
     fn flush_dcs(&mut self) {
         if self.dcs.buf.is_empty() {
             return;
@@ -233,7 +518,7 @@ impl Performer<'_> {
         // behind; `put` reserves the next chunk on demand, so a parser that
         // has finished a DCS holds no payload memory at all.
         let chunk = std::mem::take(&mut self.dcs.buf);
-        (self.sink)(Action::DcsData(chunk));
+        self.emit(Action::DcsData(chunk));
     }
 }
 
@@ -242,20 +527,21 @@ impl vte::Perform for Performer<'_> {
         // `vte` dispatches a UTF-8 encoded C1 control (U+0080..=U+009F) as
         // `execute` when both bytes arrive in one `advance` call but as
         // `print` when the sequence straddles two calls. Normalise to
-        // `Execute` so the action stream never depends on chunk boundaries;
-        // this also matches xterm, which honours 8-bit C1 controls in UTF-8
-        // mode.
+        // `Execute` so the action stream never depends on chunk boundaries.
+        // (xterm in UTF-8 mode ignores U+0080..=U+009F altogether; the
+        // consumer does too unless 8-bit controls are on, and then
+        // `advance_careful` has turned them into `ESC Fe` before `vte`.)
         if ('\u{80}'..='\u{9f}').contains(&c) {
             // Range check above guarantees the value fits in a byte.
             #[allow(clippy::cast_possible_truncation)]
-            (self.sink)(Action::Execute(c as u8));
+            self.emit(Action::Execute(c as u8));
         } else {
-            (self.sink)(Action::Print(c));
+            self.emit(Action::Print(c));
         }
     }
 
     fn execute(&mut self, byte: u8) {
-        (self.sink)(Action::Execute(byte));
+        self.emit(Action::Execute(byte));
     }
 
     fn csi_dispatch(
@@ -266,25 +552,27 @@ impl vte::Perform for Performer<'_> {
         action: char,
     ) {
         let (params, subparams) = flatten_params(params);
-        (self.sink)(Action::Csi {
+        self.emit(Action::Csi {
             params,
             subparams,
             intermediates: intermediates.to_vec(),
             action,
             ignore,
         });
+        self.check_c1();
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        (self.sink)(Action::Osc(params.iter().map(|p| p.to_vec()).collect()));
+        self.emit(Action::Osc(params.iter().map(|p| p.to_vec()).collect()));
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
-        (self.sink)(Action::Esc {
+        self.emit(Action::Esc {
             intermediates: intermediates.to_vec(),
             byte,
             ignore,
         });
+        self.check_c1();
     }
 
     fn hook(&mut self, params: &vte::Params, intermediates: &[u8], ignore: bool, action: char) {
@@ -292,8 +580,10 @@ impl vte::Perform for Performer<'_> {
         // a new sequence.
         self.dcs.buf.clear();
         self.dcs.ignoring = ignore;
+        self.dcs.active = true;
+        self.stop = true;
         let params = params.iter().flatten().copied().collect();
-        (self.sink)(Action::DcsStart {
+        self.emit(Action::DcsStart {
             params,
             intermediates: intermediates.to_vec(),
             action,
@@ -317,7 +607,14 @@ impl vte::Perform for Performer<'_> {
     fn unhook(&mut self) {
         self.flush_dcs();
         self.dcs.ignoring = false;
-        (self.sink)(Action::DcsEnd);
+        self.dcs.active = false;
+        self.stop = true;
+        self.emit(Action::DcsEnd);
+    }
+
+    #[inline]
+    fn terminated(&self) -> bool {
+        self.stop
     }
 }
 
@@ -663,6 +960,220 @@ mod tests {
         assert_eq!(split, expected);
     }
 
+    /// A consumer for the tests: records the actions; 8-bit controls on
+    /// from `on`, switched at `ESC SP G` / `ESC SP F` unless `fixed`.
+    struct Recorder {
+        out: Vec<Action>,
+        on: bool,
+        fixed: bool,
+    }
+
+    impl Sink for Recorder {
+        fn action(&mut self, action: Action) {
+            if let Action::Esc {
+                intermediates,
+                byte,
+                ..
+            } = &action
+                && intermediates == b" "
+                && !self.fixed
+            {
+                match byte {
+                    b'G' => self.on = true,
+                    b'F' => self.on = false,
+                    _ => {}
+                }
+            }
+            self.out.push(action);
+        }
+
+        fn c1_controls(&self) -> bool {
+            self.on
+        }
+    }
+
+    /// Parses `bytes` with [`Parser::advance_c1`], 8-bit controls on or off
+    /// from the start, switching them on at `ESC SP G` and off at `ESC SP F`
+    /// as a consumer would.
+    fn parse_c1(bytes: &[u8], c1: bool) -> Vec<Action> {
+        let mut sink = Recorder {
+            out: Vec::new(),
+            on: c1,
+            fixed: false,
+        };
+        Parser::new().advance_c1(bytes, &mut sink);
+        sink.out
+    }
+
+    /// Parses `bytes` with 8-bit controls fixed at `c1`, whatever the
+    /// input asks for.
+    fn parse_fixed(bytes: &[u8], c1: bool) -> Vec<Action> {
+        let mut sink = Recorder {
+            out: Vec::new(),
+            on: c1,
+            fixed: true,
+        };
+        Parser::new().advance_c1(bytes, &mut sink);
+        sink.out
+    }
+
+    fn dcs_start(action: char) -> Action {
+        Action::DcsStart {
+            params: vec![0],
+            intermediates: vec![],
+            action,
+            ignore: false,
+        }
+    }
+
+    /// The reference for 8-bit mode: every C1 code (a lone byte in
+    /// `0x80..=0x9F` or its UTF-8 encoding) replaced by `ESC (code - 0x40)`
+    /// over the whole input, split exactly as `str::from_utf8` splits it.
+    fn translate_c1(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len());
+        for chunk in bytes.utf8_chunks() {
+            for ch in chunk.valid().chars() {
+                if ('\u{80}'..='\u{9f}').contains(&ch) {
+                    out.extend([0x1B, u8::try_from(u32::from(ch) - 0x40).unwrap()]);
+                } else {
+                    out.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+                }
+            }
+            match chunk.invalid() {
+                [code @ 0x80..=0x9F] => out.extend([0x1B, code - 0x40]),
+                invalid => out.extend_from_slice(invalid),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn eight_bit_c1_codes_are_their_7bit_forms() {
+        // Raw and UTF-8 encoded CSI, an 8-bit OSC with 8-bit ST, IND.
+        assert_eq!(
+            parse_c1(b"\x9b2;3H\xc2\x9b4H\x9d0;t\x9c\x84", true),
+            vec![
+                csi(&[2, 3], 'H'),
+                csi(&[4], 'H'),
+                Action::Osc(vec![b"0".to_vec(), b"t".to_vec()]),
+                st(),
+                Action::Esc {
+                    intermediates: vec![],
+                    byte: b'D',
+                    ignore: false,
+                },
+            ]
+        );
+        // The same input in 7-bit mode is what vte has always made of it.
+        assert_eq!(
+            parse_c1(b"\x9b2;3H", false),
+            vec![
+                Action::Execute(0x9b),
+                Action::Print('2'),
+                Action::Print(';'),
+                Action::Print('3'),
+                Action::Print('H'),
+            ]
+        );
+    }
+
+    #[test]
+    fn bytes_of_utf8_characters_are_never_c1_codes() {
+        // Ü (c3 9c), ⅛ (e2 85 9b), 😛 (f0 9f 98 9b), then a lone 9c (ST).
+        let out = parse_c1(b"\xc3\x9c\xe2\x85\x9b\xf0\x9f\x98\x9b\x9cx", true);
+        assert_eq!(
+            out,
+            vec![
+                Action::Print('Ü'),
+                Action::Print('⅛'),
+                Action::Print('😛'),
+                st(),
+                Action::Print('x'),
+            ]
+        );
+        // An invalid two-byte sequence (e2 9b, then ASCII) is one U+FFFD.
+        assert_eq!(
+            parse_c1(b"\xe2\x9bx", true),
+            vec![Action::Print('\u{fffd}'), Action::Print('x')]
+        );
+    }
+
+    #[test]
+    fn a_switch_applies_to_the_rest_of_the_same_call() {
+        let ind = Action::Esc {
+            intermediates: vec![],
+            byte: b'D',
+            ignore: false,
+        };
+        let s8c1t = Action::Esc {
+            intermediates: vec![b' '],
+            byte: b'G',
+            ignore: false,
+        };
+        let s7c1t = Action::Esc {
+            intermediates: vec![b' '],
+            byte: b'F',
+            ignore: false,
+        };
+        assert_eq!(
+            parse_c1(b"\x84\x1b G\x84\x1b F\x84", false),
+            vec![
+                Action::Execute(0x84),
+                s8c1t,
+                ind,
+                s7c1t,
+                Action::Execute(0x84)
+            ]
+        );
+    }
+
+    /// A 0x9C byte of a UTF-8 character does not end a DCS (U+025C is c9
+    /// 9c); a lone 0x9C still does, and in 8-bit mode the UTF-8 encoded ST
+    /// does too.
+    #[test]
+    fn dcs_ends_only_at_a_lone_or_8bit_st() {
+        let ended = [
+            dcs_start('q'),
+            Action::DcsData(b"ab".to_vec()),
+            Action::DcsEnd,
+        ];
+        // 7-bit mode: `vte`'s own 8-bit terminator; 8-bit mode: `ESC \`.
+        assert_eq!(
+            parse_c1(b"\x1bPqa\xc9\x9cb\x9cc", false),
+            [&ended[..], &[Action::Print('c')]].concat()
+        );
+        assert_eq!(
+            parse_c1(b"\x1bPqa\xc9\x9cb\x9cc", true),
+            [&ended[..], &[st(), Action::Print('c')]].concat()
+        );
+        // In 7-bit mode the UTF-8 encoded ST is payload (dropped like any
+        // other high byte); in 8-bit mode it is ST.
+        assert_eq!(
+            parse_c1(b"\x1bPqa\xc2\x9cb\x1b\\", false),
+            vec![
+                dcs_start('q'),
+                Action::DcsData(b"ab".to_vec()),
+                Action::DcsEnd,
+                st(),
+            ]
+        );
+        assert_eq!(
+            parse_c1(b"\x1bPqa\xc2\x9cb", true),
+            vec![
+                dcs_start('q'),
+                Action::DcsData(b"a".to_vec()),
+                Action::DcsEnd,
+                st(),
+                Action::Print('b'),
+            ]
+        );
+        // `Parser::advance` has the fix too.
+        assert_eq!(
+            parse(b"\x1bPq\xe4\xb8\x9cz\x1b\\")[1],
+            Action::DcsData(b"z".to_vec())
+        );
+    }
+
     #[test]
     fn apc_aborted_by_can_resumes_ground() {
         assert_eq!(
@@ -691,6 +1202,32 @@ mod tests {
         proptest::collection::vec(token, 0..256).prop_map(|t| t.concat())
     }
 
+    /// Byte streams full of C1 codes, raw and UTF-8 encoded, UTF-8
+    /// characters whose continuation bytes are in `0x80..=0x9F`, invalid
+    /// sequences and escape sequences, but no byte that could open a DCS
+    /// (`P`, `0x90`): see `c1_paths_agree_with_their_references`.
+    fn c1_stream() -> impl Strategy<Value = Vec<u8>> {
+        let c1 = 0x80u8..=0x9F;
+        let token = prop_oneof![
+            4 => prop_oneof![Just(b'a'), Just(b'1'), Just(b';'), Just(b'H'), Just(b'm'), Just(b'['),
+                Just(b']'), Just(b'\\'), Just(b'_'), Just(b' '), Just(0x07), Just(0x18), Just(b'\n')]
+                .prop_map(|b| vec![b]),
+            2 => c1.clone().prop_map(|b| vec![b]),
+            2 => c1.prop_map(|b| vec![0xC2, b]),
+            1 => Just(vec![0x1B]),
+            1 => any::<char>().prop_map(|c| c.to_string().into_bytes()),
+            1 => (0x80u32..0x800).prop_map(|c| char::from_u32(c).unwrap_or('x').to_string().into_bytes()),
+            1 => (0xC2u8..=0xF4, 0x80u8..=0x9F).prop_map(|(lead, cont)| vec![lead, cont]),
+            1 => (0xA0u8..=0xFF).prop_map(|b| vec![b]),
+        ];
+        proptest::collection::vec(token, 0..64)
+            .prop_map(|t| t.concat())
+            // `ESC` and a `P` (even with ignored bytes between them) open a
+            // DCS, and so may any 0x90 byte, which an invalid sequence can
+            // leave lone.
+            .prop_filter("no DCS", |b| !b.contains(&0x90) && !b.contains(&b'P'))
+    }
+
     proptest! {
         /// The action stream never depends on where the byte stream was split.
         ///
@@ -706,6 +1243,23 @@ mod tests {
             parser.advance(&bytes[..cut], |a| split.push(a));
             parser.advance(&bytes[cut..], |a| split.push(a));
             prop_assert_eq!(whole, split);
+        }
+
+        /// With 8-bit controls on, the careful path gives exactly what `vte` gives
+        /// for the input with every C1 code replaced by its 7-bit form over
+        /// the whole input ([`translate_c1`]); in 7-bit mode exactly what
+        /// `vte` gives for the input itself. No DCS in the input: a DCS is
+        /// where the two differ on purpose (the 0x9C fix).
+        #[test]
+        fn c1_paths_agree_with_their_references(bytes in c1_stream(), c1 in any::<bool>()) {
+            let reference = if c1 { translate_c1(&bytes) } else { bytes.clone() };
+            let mut vte_parser = vte::Parser::new();
+            let mut want = Vec::new();
+            let mut dcs = DcsState::default();
+            let mut sink = SevenBit(|a| want.push(a));
+            let mut perform = Performer { sink: &mut sink, dcs: &mut dcs, c1: false, stop: false };
+            vte_parser.advance(&mut perform, &reference);
+            prop_assert_eq!(parse_fixed(&bytes, c1), want);
         }
 
         /// A DCS payload is delivered intact, in order, in bounded chunks,

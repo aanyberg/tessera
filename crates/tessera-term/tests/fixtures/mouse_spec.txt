@@ -1478,8 +1478,6 @@ note: focus changes (no DECSET 1004 here) send nothing and do not reset the moti
 
 #> D23 -> 12-app: the click that activates an inactive window (press and release) is swallowed by the frontend (Q12);
 #>   the core has no notion of window activation, so this row is a Swift routing test in task/12-mouse-app.
-#> M8_01 -> #96: with 8-bit controls on (S8C1T), xterm starts mouse reports with 0x9b instead of ESC [ (XB L5540);
-#>   every report above stays 7-bit until #96 adds the 8-bit CSI to encode_mouse.
 
 # -----------------------------------------------------------------------------
 # Table W: the wheel in App::send_input(Scroll), decision Q11. delta_lines > 0 (towards older output) is wheel up (64).
@@ -1604,3 +1602,33 @@ step: feed \e[?1000l
 step: press left 0,0 -> I
 written: \e[<128;1;1M\e[<128;1;1m
 note: back/forward press and release; a press of no button is not reportable; tracking off is Ignored
+
+### G05
+step: feed \e G\e[?1002h\e[?1006h\e[?1004h
+step: press left 0,0 -> C
+step: motion left 3,0 -> C
+step: release left 3,0 -> C
+step: wheel 2 0,0 -> C
+step: focus gained -> C
+written: \x9b<0;1;1M\x9b<32;4;1M\x9b<0;4;1m
+written: 2x \x9b<64;1;1M
+written: \x9bI
+note: #96 (was M8_01): in 8-bit mode (S8C1T, ESC SP G) every report starts with the C1 byte 0x9b instead of ESC [ (XB L5540
+note: unparseputc1), each wheel report too, and the focus report (button.c); lead decision D8: one helper at the send point
+note: (tessera_term::to_8bit_controls), encode_mouse itself unchanged
+
+### G06
+size: 24x240
+step: feed \e G\e[?1000h
+step: press left 222,0 -> C
+step: release left 230,0 -> C
+written: \x9bM \xff!\x9bM#\xff!
+note: #96: only the introducer changes; the default encoding's payload bytes (0xff here) are left alone (as G03 in 7-bit mode)
+
+### G07
+step: feed \e G\e[?1000h\e[?1006h
+step: press left 0,0 -> C
+step: feed \e F
+step: release left 0,0 -> C
+written: \x9b<0;1;1M\e[<0;1;1m
+note: #96: S7C1T (ESC SP F) returns to 7-bit reports; the mode is read when each report is sent

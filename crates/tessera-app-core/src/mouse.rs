@@ -24,7 +24,7 @@
 
 use tessera_term::{
     Modifiers, MouseEncoding, MouseReport, MouseReportButton, MouseReportKind, MouseTracking,
-    encode_mouse,
+    encode_mouse, to_8bit_controls,
 };
 
 use crate::input::{MouseButton, MouseEvent, MouseEventKind};
@@ -112,16 +112,29 @@ pub(crate) enum Route {
     Ignore { next: ReportState },
 }
 
-/// The tracking mode and encoding the program chose, and the pointer's
-/// pixel position for SGR-pixels mode.
+/// The tracking mode and encoding the program chose, whether the session
+/// is in 8-bit mode, and the pointer's pixel position for SGR-pixels mode.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Mode {
     pub(crate) tracking: MouseTracking,
     pub(crate) encoding: MouseEncoding,
+    /// S8C1T: reports start with the C1 byte 0x9B instead of `ESC [`
+    /// ([`tessera_term::Terminal::c1_8bit_replies`]).
+    pub(crate) eight_bit: bool,
     pub(crate) pixels: PixelPoint,
 }
 
 impl Mode {
+    /// [`encode_mouse`] in this mode, in its 8-bit form when the session is
+    /// in 8-bit mode.
+    fn encode(&self, report: &MouseReport) -> Option<Vec<u8>> {
+        let mut bytes = encode_mouse(report, self.tracking, self.encoding)?;
+        if self.eight_bit {
+            to_8bit_controls(&mut bytes);
+        }
+        Some(bytes)
+    }
+
     /// The report of `kind` for `button` over `event`'s cell and pixel, with
     /// `modifiers`, and where it puts the baseline.
     fn report(
@@ -224,7 +237,7 @@ pub(crate) fn route_mouse(state: ReportState, event: &MouseEvent, mode: &Mode) -
                 cell,
                 modifiers,
             );
-            match encode_mouse(&report, mode.tracking, mode.encoding) {
+            match mode.encode(&report) {
                 Some(bytes) => Route::Report {
                     bytes,
                     next: ReportState {
@@ -279,7 +292,7 @@ pub(crate) fn route_wheel(
     let modifiers = modifiers - (Modifiers::SHIFT | Modifiers::SUPER);
     let (report, position) = mode.report(MouseReportKind::Press, button, cell, modifiers);
     let count = usize::try_from(lines.unsigned_abs()).unwrap_or(0);
-    match encode_mouse(&report, mode.tracking, mode.encoding) {
+    match mode.encode(&report) {
         Some(one) if count > 0 => Route::Report {
             bytes: one.repeat(count),
             next: ReportState {
@@ -299,7 +312,7 @@ fn report_with(
     state: ReportState,
     update: impl FnOnce(ReportState) -> ReportState,
 ) -> Route {
-    match encode_mouse(report, mode.tracking, mode.encoding) {
+    match mode.encode(report) {
         Some(bytes) => Route::Report {
             bytes,
             next: update(state),
@@ -316,6 +329,7 @@ mod tests {
         Mode {
             tracking,
             encoding: MouseEncoding::Sgr,
+            eight_bit: false,
             pixels: PixelPoint::default(),
         }
     }

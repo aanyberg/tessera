@@ -47,8 +47,12 @@
 //!   other value of the format (xterm prints `pixel + 1`; kitty and
 //!   Ghostty print the raw pixel). See [`MouseReport::with_pixels`].
 //!
-//! Reports always start with the 7-bit `ESC [`; xterm's 8-bit CSI while
-//! 8-bit controls are on is #96.
+//! Reports always start with the 7-bit `ESC [`. In 8-bit mode
+//! ([`Terminal::c1_8bit_replies`]) the host passes each report through
+//! [`to_8bit_controls`] for xterm's 8-bit CSI (`0x9B`).
+//!
+//! [`Terminal::c1_8bit_replies`]: crate::Terminal::c1_8bit_replies
+//! [`to_8bit_controls`]: crate::to_8bit_controls
 
 use crate::keyboard::Modifiers;
 use crate::modes::{MouseEncoding, MouseTracking};

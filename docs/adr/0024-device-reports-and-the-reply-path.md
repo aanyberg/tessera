@@ -1,6 +1,7 @@
 # ADR 0024: Device reports and the reply path
 
-**Status:** accepted · 2026-10-31
+**Status:** accepted · 2026-10-31 · amended 2026-11-02 (#96: 8-bit
+controls, below)
 
 ## Context
 
@@ -62,8 +63,7 @@ the fixture; the milestone lead accepted them on 2026-10-31.
   anyway.
 - **7-bit rule.** Every reply is built by `reply_csi`, `reply_dcs` or
   `reply_osc` and uses 7-bit controls (`ESC [`, `ESC P`, `ESC ]`, `ESC
-  \`), also after DECSCL selected 8-bit replies. `c1_8bit_replies` is
-  recorded and reported (DECRQSS of DECSCL) but not honoured until #96.
+  \`) unless 8-bit mode is on; see "Amendment: 8-bit controls" (#96).
 
 ### Identity
 
@@ -188,5 +188,117 @@ From the notes' table (d), each pinned by a fixture row:
   every query is answered except the silences above, and that each
   program draws its first screen within 1 s.
 - Still to come: the OSC colour queries and their echo (#10's second
-  part, which reuses `reply_osc` and the reply path), 8-bit replies
-  (#96), XTGETTCAP (not planned).
+  part, which reuses `reply_osc` and the reply path), XTGETTCAP (not
+  planned).
+
+## Amendment: 8-bit controls (#96, 2026-11-02)
+
+The contract is `crates/tessera-term/tests/fixtures/c1_spec.txt` (from the
+spec researcher's tables, with the lead's decisions of 2026-11-01), run by
+`tests/c1.rs` whole, byte by byte and at every two-way split, plus the
+esctest `*_8bit` rows in `esctest_spec.txt` and the routing rows G05-G07 in
+`mouse_spec.txt`.
+
+### The mode
+
+- **8-bit mode** is `Terminal::c1_8bit_replies()`. S8C1T (`ESC SP G`)
+  turns it on and S7C1T (`ESC SP F`) off, both only at conformance level
+  2 and up (xterm `vtXX_level >= 2`; DEC ignores them in VT Level 1).
+  DECSCL's `Pc` keeps setting it (0, 2 or absent: on; 1: off; level 1:
+  off). RIS clears it and keeps the level; DECSTR keeps it.
+- At level 1 `ESC SP G` is consumed and ignored. xterm also leaves its
+  parser in the `ESC SP` table there and swallows the next byte; Tessera
+  does not copy that.
+
+### Replies and the host's input
+
+- In 8-bit mode every reply's introducer is the raw C1 byte (`0x9B` CSI,
+  `0x90` DCS, `0x9D` OSC) and a string reply ends with `0x9C` (ST); a
+  BEL-terminated OSC reply keeps its BEL. Raw single bytes, never their
+  UTF-8 encoding: xterm's `writePtyData` writes the byte in UTF-8 mode
+  too, and esctest and vttest read raw bytes. A UTF-8-decoding receiver
+  sees invalid UTF-8; that is what S8C1T asks for.
+- The mode is read when the reply is queued, so `CSI c ESC SP F CSI c`
+  after S8C1T answers once in 8-bit and once in 7-bit form.
+- **One helper**, `tessera_term::to_8bit_controls`, does the rewrite: a
+  leading `ESC [`, `ESC O`, `ESC P` or `ESC ]` becomes `0x9B`, `0x8F`,
+  `0x90` or `0x9D`, and after `ESC P` or `ESC ]` a trailing `ESC \`
+  becomes `0x9C`. `State::reply` applies it to every reply;
+  `tessera-app-core` applies it at each send point to every key encoding,
+  mouse and wheel report, focus report, bracketed-paste marker and
+  alternate-scroll key, one sequence at a time before any repetition.
+  `KeyboardModes` and `encode_mouse` do not change. A two-byte sequence
+  is an Alt-prefixed key (`ESC [` for Alt+`[`) and stays as it is, and so
+  do the bytes between introducer and terminator (an X10 mouse report's
+  payload), C0 controls and pasted text, whose C1 controls the sanitiser
+  already removes.
+- **Deviation:** an Alt-prefixed legacy key whose key part is itself a
+  CSI or SS3 sequence, such as Alt+Shift+Tab (`ESC ESC [ Z`), stays 7-bit
+  as a whole. xterm sends the Alt `ESC` followed by an 8-bit CSI
+  (`ESC 0x9B Z`). The helper rewrites only a leading introducer; programs
+  that run in 8-bit mode read both forms.
+
+### C1 controls in the output
+
+- Honoured **only in 8-bit mode**. A default 7-bit session treats a C1
+  byte as before: an ignored control in the ground state, dropped
+  elsewhere. That is xterm's behaviour in UTF-8 mode, which ignores
+  U+0080..U+009F altogether (charproc.c), and it keeps cp1252 or Latin-1
+  text that happens to contain `0x85` or `0x9B` from moving the cursor or
+  opening a CSI. Kitty and Ghostty never honour C1; WezTerm always does.
+- In 8-bit mode a C1 code is processed exactly as its 7-bit form `ESC
+  (code - 0x40)`, in every parser state: `0x9B` starts a CSI (and
+  restarts one in progress), `0x9C` ends any string, `0x84`, `0x85`,
+  `0x88`, `0x8D` are IND, NEL, HTS and RI, `0x9A` is DECID. A C1 code is a
+  raw byte in `0x80..=0x9F` that is not part of a UTF-8 sequence, or the
+  UTF-8 encoding `C2 80..=C2 9F`; a continuation byte of another
+  character (`C3 9C` is Ü) never is. This is `tessera_vt::Parser::advance_c1`,
+  which drives a `tessera_vt::Sink`: the terminal's state applies each
+  action and answers `c1_controls()`, which the parser asks before the
+  first byte and after every ESC and CSI sequence (the only ones that can
+  switch the mode). So `ESC SP G` followed by a C1 control in the same
+  read takes effect at once, the parser does not need to know which
+  sequences switch, and nothing is added per printed character. The
+  codes with no 7-bit function (SS2, SS3, SPA, EPA until #112 and #95,
+  and the unassigned ones) reach `esc()` as ignored escapes and print
+  nothing.
+- **DCS fix.** `vte` ends a DCS at any `0x9C` byte, including the second
+  byte of a UTF-8 character such as U+025C (`C9 9C`), which used to end a
+  tmux passthrough early. Now a `0x9C` that belongs to a UTF-8 character
+  is payload (dropped with the character, as every non-ASCII payload byte
+  already was), in both modes. A lone `0x9C` still ends a DCS in 7-bit
+  mode, as it always has; in 7-bit mode the UTF-8 encoded `C2 9C` is
+  payload too.
+
+### Cost
+
+Only input that holds a byte in `0x80..=0x9F` takes the new path; for the
+rest `advance_c1` is `vte`'s `advance` after a scan for such a byte
+(branch-free per 32-byte block). The new path splits the input only at
+character boundaries and uses `vte`'s `advance_until_terminated` to stop at
+a DCS start or end and at a mode switch. Where to step in next (the next
+C1 code, the next character with a `0x9C` byte) comes from two cursors
+that only move forward, so a read is scanned at most once per cursor
+however many DCS strings and mode switches it holds: time is linear in
+the read. The first version rescanned the rest of the read at each of
+them, which made a 1 MiB flood of `ESC P q x ESC \` with one CJK
+character per 64 KiB read 320 times slower than the base (630 times in
+8-bit mode); `tests/c1.rs` `c1_aware_parsing_is_linear_in_the_read` pins
+linearity (sixteen times the read takes under 64 times as long, the
+geometric midpoint between linear and quadratic; DCS, S7C1T and DECSCL
+floods in 7-bit mode and a DCS flood in 8-bit mode). The same 1 MiB
+floods now cost 1.03 to 1.19 times the base in 64 KiB or 4 KiB reads.
+
+Measured with `cargo xtask ab` against the merge base (instructions, best
+of 7): the 11 perf-corpus lines at 0.993-1.009. The highest are
+`sgr_heavy` (1.009 whole, 1.008 in 4 KiB reads), which pays the mode
+question after every CSI, and ASCII and punctuation (1.003); the
+non-ASCII lines, which take the new path, are at 0.993-1.001. The default
+7-bit path is identical to the base on 200,000 differential seeds of C1
+bytes, UTF-8, queries and DCS strings fed in random reads, and mode
+switches mid-read give the same result as one-byte reads on 200,000
+more. A stream that switches the mode around every C1 control (`ESC SP
+G 84 ESC SP F 84` repeated) costs about 840 more instructions per switch
+than the base spends ignoring it (2.3 times its instructions, 3.4 times
+its cycles; measured on the final design), and an 8-bit DECID flood
+costs 1.2 to 1.3 times a 7-bit one per reply.

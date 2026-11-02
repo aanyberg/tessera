@@ -12,8 +12,8 @@
 #                        cell size UNKNOWN (never set), which is the state before the first frame.
 #   step: set title <text>      the title the terminal last emitted (same as feeding OSC 2 ; text ST; shorthand).
 #   reply: <bytes>|none  EXACT bytes the terminal queued as Request::Reply since the previous `reply:` line (or the start),
-#                        concatenated in order. `none` = no Reply request at all. Replies are ALWAYS 7-bit (ESC [ , ESC P,
-#                        ESC \ ), also after DECSCL Pc=0/2 (S8C1T is #96's job, wave 9). `<VERSION>` stands for
+#                        concatenated in order. `none` = no Reply request at all. Replies are 7-bit (ESC [ , ESC P, ESC \ )
+#                        unless 8-bit mode is on (DECSCL Pc 0/2/absent, S8C1T): then 0x9B, 0x90, 0x9C (#96, c1_spec.txt). `<VERSION>` stands for
 #                        env!("CARGO_PKG_VERSION") of the tessera-term crate.
 #   requests: [..]       OPTIONAL: non-Reply requests drained after the steps above it: `SetTitle("..")` and `Resize(r,c)`;
 #                        omitted = not asserted. Reply requests are never listed here.
@@ -134,36 +134,41 @@ flags: decision xterm-quirk
 ### DA06_da1_level2
 size: 24x80
 step: feed \e[62"p\e[c
-reply: \e[?62;22c
+reply: \x9b?62;22c
 cite: D-DA1: 60 + level; [XT] 60 + display_da1/100
+note: DECSCL without Pc selects 8-bit mode ([CTL] absent Pc = 0), so the reply is 8-bit (#96, c1_spec.txt)
 flags: decision
 
 ### DA07_da1_level3
 size: 24x80
 step: feed \e[63"p\e[c
-reply: \e[?63;22c
+reply: \x9b?63;22c
 cite: D-DA1
+note: DECSCL without Pc selects 8-bit mode ([CTL] absent Pc = 0), so the reply is 8-bit (#96, c1_spec.txt)
 flags: decision
 
 ### DA08_da1_level4
 size: 24x80
 step: feed \e[64"p\e[c
-reply: \e[?64;21;22c
+reply: \x9b?64;21;22c
 cite: D-DA1
+note: DECSCL without Pc selects 8-bit mode ([CTL] absent Pc = 0), so the reply is 8-bit (#96, c1_spec.txt)
 flags: decision
 
 ### DA09_da1_level5
 size: 24x80
 step: feed \e[65"p\e[c
-reply: \e[?65;21;22c
+reply: \x9b?65;21;22c
 cite: D-L5 (xterm id 420 refuses `CSI 65 " p`, charproc.c L5101; xterm id 525 would answer `?65;...`); #92 stores level 5
+note: DECSCL without Pc selects 8-bit mode ([CTL] absent Pc = 0), so the reply is 8-bit (#96, c1_spec.txt)
 flags: decision
 
 ### DA10_da1_after_decstr_keeps_level
 size: 24x80
 step: feed \e[62"p\e[!p\e[c
-reply: \e[?62;22c
+reply: \x9b?62;22c
 cite: ADR 0020: DECSTR keeps the conformance level (xterm: DECSTR does not call set_vtXX_level)
+note: DECSCL without Pc selects 8-bit mode ([CTL] absent Pc = 0), so the reply is 8-bit (#96, c1_spec.txt); DECSTR keeps 8-bit mode
 flags: control
 
 ### DA11_da1_after_ris_keeps_level
@@ -173,12 +178,12 @@ reply: \e[?62;22c
 cite: ADR 0020: RIS keeps the level, as xterm
 flags: control
 
-### DA12_da1_reply_stays_7bit_after_s8c1t_decscl
+### DA12_da1_reply_is_8bit_after_decscl_pc2
 size: 24x80
 step: feed \e[64;2"p\e[c
-reply: \e[?64;21;22c
-cite: Brief: replies are always 7-bit until #96 (wave 9); `c1_8bit_replies()` is true here but must not change the bytes. [XT] would answer 8-bit CSI (0x9B) here; this row flips in #96
-flags: decision control
+reply: \x9b?64;21;22c
+cite: [XT] DECSCL Pc 2 turns control_eight_bits on and unparseputc1 sends the raw 0x9B (flipped by #96; c1_spec.txt has the S8C1T rows)
+flags: control
 
 ### DA13_da2_plain
 size: 24x80
@@ -365,15 +370,17 @@ flags: xterm-quirk
 ### DSR14_decxcpr_level2_no_page
 size: 24x80
 step: feed \e[62"p\e[5;10H\e[?6n
-reply: \e[?5;10R
+reply: \x9b?5;10R
 cite: [XT] CASE_DSR appends the page only when vtXX_level >= 4, or terminal_id >= 330 and vtXX_level >= 3; at level 2 neither holds
+note: DECSCL without Pc selects 8-bit mode ([CTL] absent Pc = 0), so the reply is 8-bit (#96, c1_spec.txt)
 flags: xterm-quirk
 
 ### DSR15_decxcpr_level3_has_page
 size: 24x80
 step: feed \e[63"p\e[5;10H\e[?6n
-reply: \e[?5;10;1R
+reply: \x9b?5;10;1R
 cite: [XT] `screen->vtXX_level >= 4 || (screen->terminal_id >= 330 && screen->vtXX_level >= 3)` with terminal_id 420
+note: DECSCL without Pc selects 8-bit mode ([CTL] absent Pc = 0), so the reply is 8-bit (#96, c1_spec.txt)
 flags: xterm-quirk
 
 ### DSR16_decxcpr_origin_mode
@@ -414,15 +421,17 @@ flags: control
 ### DSR21_dec_keyboard_status_level2
 size: 24x80
 step: feed \e[62"p\e[?26n
-reply: \e[?27;1n
+reply: \x9b?27;1n
 cite: [XT] case 26: 27;1, then `;0` at level >= 3, then `;0` at level >= 4
+note: DECSCL without Pc selects 8-bit mode ([CTL] absent Pc = 0), so the reply is 8-bit (#96, c1_spec.txt)
 flags: xterm-quirk
 
 ### DSR22_dec_keyboard_status_level3
 size: 24x80
 step: feed \e[63"p\e[?26n
-reply: \e[?27;1;0n
+reply: \x9b?27;1;0n
 cite: [XT] case 26
+note: DECSCL without Pc selects 8-bit mode ([CTL] absent Pc = 0), so the reply is 8-bit (#96, c1_spec.txt)
 flags: xterm-quirk
 
 ### DSR23_dec_locator_status
@@ -1083,8 +1092,8 @@ flags: decision
 ### RQ21_decscl_reports_recorded_8bit_mode
 size: 24x80
 step: feed \e[63;2"p\eP$q"p\e\\
-reply: \eP1$r63;0"p\e\\
-cite: [XT] `;0` when control_eight_bits (DECSCL Pc 0 or 2); the REPORT follows c1_8bit_replies() even though the reply bytes themselves stay 7-bit until #96. Row flips nothing in #96
+reply: \x901$r63;0"p\x9c
+cite: [XT] `;0` when control_eight_bits (DECSCL Pc 0 or 2), and the reply itself is 8-bit: DCS 0x90 ... ST 0x9C (flipped by #96)
 flags: decision
 
 ### RQ22_decscl_level1_silent
@@ -1541,8 +1550,8 @@ flags: negative control
 size: 24x80
 step: feed \u{9b}6n
 reply: none
-cite: unverified: tessera-vt treats U+009B (UTF-8 C2 9B) as printable (the stream is UTF-8; a raw 0x9B byte is invalid UTF-8). No reply expected. 8-bit introducers are #96's area
-flags: unverified negative
+cite: #96 decision D1: C1 controls (raw, or UTF-8 encoded as here) are honoured only in 8-bit mode (S8C1T); this session is 7-bit, so U+009B is an ignored control and `6n` is text, as in xterm in UTF-8 mode (charproc.c: every code point 128..159 is CASE_IGNORE). In 8-bit mode it is CSI: c1_spec.txt C10
+flags: decision negative
 
 ### RP07_replies_are_bytes_not_requests_of_other_kinds
 size: 24x80

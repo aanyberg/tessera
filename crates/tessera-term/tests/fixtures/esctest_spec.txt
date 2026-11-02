@@ -34,6 +34,9 @@
 #     esctest2 test function against Tessera through a shim of esccmd/escio/escutil (CPR for the cursor, the screen for
 #     DECRQCRA): every esctest assertion held at its point in the stream; the screens are Tessera's, so only the
 #     asserted cells and cursor are xterm's word. 198 cases.
+#     #96 (8-bit C1) lifted E_HTS_8bit, E_IND_8bit, E_RI_8bit and E_NEL_8bit and ported E_S8C1T_CSI, E_APC_8bit,
+#     E_PM_8bit and E_SOS_8bit from esctest2 (transcribed through escio.CmdChar; expected cursor and screen are the
+#     esctest assertions). 206 cases.
 #
 # HOW esctest ASSERTIONS MAP TO THE FIXTURE
 #   esctest reads the cursor with DSR 6 (needs #10) and the screen with DECRQCRA checksums; tessera tests read the grid. So:
@@ -3131,8 +3134,48 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_HTS_8bit -> #96 (hts.py, optionRequired xterm C1 controls): S8C1T = ESC SP G then C1 0x88 HTS; tessera-term does not
-#>    handle ESC SP G or C1 controls (control.rs has no 0x80-0x9f arms; the parser decodes UTF-8 first). Same for E_IND_8bit, E_RI_8bit, E_NEL_8bit.
+### E_HTS_8bit
+size: 25x80
+step: feed \x1b[3g
+step: feed \x1b[1;20H
+step: feed \x1b G
+step: feed \x88
+step: feed \x1b F
+step: feed \x1b[1;1H
+step: feed \t
+source: esctest2 esctest/tests/hts.py test_HTS_8bit
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/hts.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: TBC 3, CUP(20,1), HTS as 0x88 in 8-bit mode, home, TAB: the only tab stop is column 20. C1 as a raw byte between Write(S8C1T) and Write(S7C1T) (escio.CmdChar with use8BitControls; escoding.to_binary is latin-1). Lifted by #96 (c1_spec.txt has the reply rows).
+screen:
+>                    |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,19)   # 1-based row 1 col 20
+pending_wrap: false
+requests: []
+scrollback: len=0
 
 # ---------------------------------------------------------------------------- ED (ed.py)  prepare(): a / bcd / e at rows 1,3,5, cursor on the 'c' (row 3, col 2)
 
@@ -7411,7 +7454,45 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_IND_8bit -> #96 (see E_HTS_8bit)
+### E_IND_8bit
+size: 25x80
+step: feed \x1b[3;5H
+step: feed \x1b G
+step: feed \x84
+step: feed \x1b F
+source: esctest2 esctest/tests/ind.py test_IND_8bit
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ind.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: CUP(5,3), IND as 0x84: x5 y4. C1 as a raw byte between Write(S8C1T) and Write(S7C1T) (escio.CmdChar with use8BitControls; escoding.to_binary is latin-1). Lifted by #96 (c1_spec.txt has the reply rows).
+screen:
+>
+>
+>
+>     |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (3,4)   # 1-based row 4 col 5
+pending_wrap: false
+requests: []
+scrollback: len=0
 
 # ---------------------------------------------------------------------------- RI (ri.py)  ESC M
 
@@ -7664,7 +7745,45 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_RI_8bit -> #96 (see E_HTS_8bit)
+### E_RI_8bit
+size: 25x80
+step: feed \x1b[3;5H
+step: feed \x1b G
+step: feed \x8d
+step: feed \x1b F
+source: esctest2 esctest/tests/ri.py test_RI_8bit
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ri.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: CUP(5,3), RI as 0x8D: x5 y2. C1 as a raw byte between Write(S8C1T) and Write(S7C1T) (escio.CmdChar with use8BitControls; escoding.to_binary is latin-1). Lifted by #96 (c1_spec.txt has the reply rows).
+screen:
+>
+>     |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (1,4)   # 1-based row 2 col 5
+pending_wrap: false
+requests: []
+scrollback: len=0
 
 # ---------------------------------------------------------------------------- NEL (nel.py)  ESC E
 
@@ -7917,7 +8036,214 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_NEL_8bit -> #96 (see E_HTS_8bit)
+### E_NEL_8bit
+size: 25x80
+step: feed \x1b[3;5H
+step: feed \x1b G
+step: feed \x85
+step: feed \x1b F
+source: esctest2 esctest/tests/nel.py test_NEL_8bit
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/nel.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: CUP(5,3), NEL as 0x85: x1 y4. C1 as a raw byte between Write(S8C1T) and Write(S7C1T) (escio.CmdChar with use8BitControls; escoding.to_binary is latin-1). Lifted by #96 (c1_spec.txt has the reply rows).
+screen:
+>
+>
+>
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (3,0)   # 1-based row 4 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+# ---------------------------------------------------------------------------- S8C1T, APC, PM, SOS (s8c1t.py, apc.py, pm.py, sos.py)  8-bit C1 controls [#96]
+
+### E_S8C1T_CSI
+size: 25x80
+step: feed \x1b G
+step: feed \x9b2;1H
+step: feed \x1b F
+source: esctest2 esctest/tests/s8c1t.py test_S8C1T_CSI
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/s8c1t.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: CUP(Point(1,2)) with CSI as 0x9B: x1 y2. C1 as a raw byte between Write(S8C1T) and Write(S7C1T) (escio.CmdChar with use8BitControls; escoding.to_binary is latin-1). Lifted by #96 (c1_spec.txt has the reply rows).
+screen:
+>
+> |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (1,0)   # 1-based row 2 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_APC_8bit
+size: 25x80
+step: feed \x1b G
+step: feed \x9fxyz\x9c
+step: feed A
+step: feed \x1b F
+source: esctest2 esctest/tests/apc.py test_APC_8bit
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/apc.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: WriteAPC("xyz") = 0x9F xyz 0x9C: the string is swallowed, A lands at (1,1). C1 as a raw byte between Write(S8C1T) and Write(S7C1T) (escio.CmdChar with use8BitControls; escoding.to_binary is latin-1). Lifted by #96 (c1_spec.txt has the reply rows).
+screen:
+>A |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,1)   # 1-based row 1 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_PM_8bit
+size: 25x80
+step: feed \x1b G
+step: feed \x9e
+step: feed xyz
+step: feed \x9c
+step: feed A
+step: feed \x1b F
+source: esctest2 esctest/tests/pm.py test_PM_8bit
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/pm.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: PM 0x9E, xyz, ST 0x9C: swallowed, A at (1,1). C1 as a raw byte between Write(S8C1T) and Write(S7C1T) (escio.CmdChar with use8BitControls; escoding.to_binary is latin-1). Lifted by #96 (c1_spec.txt has the reply rows).
+screen:
+>A |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,1)   # 1-based row 1 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_SOS_8bit
+size: 25x80
+step: feed \x1b G
+step: feed \x98
+step: feed xyz
+step: feed \x9c
+step: feed A
+step: feed \x1b F
+source: esctest2 esctest/tests/sos.py test_SOS_8bit
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/sos.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: SOS 0x98, xyz, ST 0x9C: swallowed, A at (1,1). C1 as a raw byte between Write(S8C1T) and Write(S7C1T) (escio.CmdChar with use8BitControls; escoding.to_binary is latin-1). Lifted by #96 (c1_spec.txt has the reply rows).
+screen:
+>A |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,1)   # 1-based row 1 col 2
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+#> E_S8C1T_SPA_EPA -> #95 (s8c1t.py test_S8C1T_SPA_EPA): SPA 0x96 / EPA 0x97 in 8-bit mode protect `c` from ECH; the
+#>    C1 bytes already reach esc() as ESC V / ESC W (#96), which #95 implements. test_S8C1T_DCS and test_DECID_8bit
+#>    read replies: c1_spec.txt R11 and C15.
 
 # ---------------------------------------------------------------------------- SGR (sgr.py)
 

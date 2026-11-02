@@ -29,7 +29,7 @@ const FIXTURE_NAME: &str = "fixtures/mouse_spec.txt";
 /// Encoder rows in the fixture.
 const ENCODER_ROWS: usize = 141;
 /// Routing rows in the fixture (checked by `tessera-app-core`).
-const ROUTING_ROWS: usize = 36;
+const ROUTING_ROWS: usize = 39;
 
 /// One encoder row.
 #[derive(Debug)]

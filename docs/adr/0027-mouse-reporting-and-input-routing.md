@@ -29,8 +29,10 @@ bytes or `None` out. It follows xterm's `BtnCode`/`EmitButtonCode`: buttons
 Control, +32 motion, code 3 for no-button motion and for a release in the
 default, UTF-8 and urxvt encodings (SGR keeps the button and ends in `m`).
 X10 reports left, middle and right presses only, without modifiers. The
-wheel is pressed only, never released. Reports are always 7-bit (`ESC [`);
-8-bit CSI while 8-bit controls are on is #96.
+wheel is pressed only, never released. `encode_mouse` always starts a
+report with the 7-bit `ESC [`; in 8-bit mode (S8C1T) `tessera-app-core`
+rewrites it to the C1 byte `0x9B` with `tessera_term::to_8bit_controls`
+before the report is queued (#96, ADR 0024).
 
 Limits: the default encoding cannot carry a one-based column or row above
 223, UTF-8 above 2015. A press, motion or wheel event beyond is not

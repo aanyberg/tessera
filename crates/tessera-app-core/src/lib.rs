@@ -49,7 +49,9 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use tessera_pty::{NativePty, Pty, PtyEvents};
 use tessera_render::{FontConfig, Fonts, Gpu, Theme};
-use tessera_term::{Modifiers, MouseEncoding, MouseTracking, Terminal, encode_key};
+use tessera_term::{
+    Modifiers, MouseEncoding, MouseTracking, Terminal, encode_key, to_8bit_controls,
+};
 
 pub use input::{InputEvent, InputOutcome};
 pub use selection::{Granularity, Link, Point};
@@ -605,6 +607,13 @@ impl App {
     ///   from one thread (the frontend's main thread), or two racing events
     ///   may both be reported.
     ///
+    /// In 8-bit mode (S8C1T, [`Terminal::c1_8bit_replies`]) every key
+    /// encoding, mouse and wheel report, focus report, bracketed-paste
+    /// marker and alternate-scroll key goes through
+    /// [`tessera_term::to_8bit_controls`] on its own, so it starts with the
+    /// C1 byte `0x9B` or `0x8F` instead of `ESC [` or `ESC O`; pasted text
+    /// and Alt-prefixed keys do not change (ADR 0024).
+    ///
     /// # Errors
     ///
     /// [`Error::SessionNotFound`] if `id` is not a live session;
@@ -625,10 +634,14 @@ impl App {
                 }
                 // One copy under the terminal lock, released before the
                 // write is queued.
-                let modes = session.with_terminal(Terminal::keyboard_modes);
-                let bytes = encode_key(&key, &modes);
+                let (modes, eight_bit) =
+                    session.with_terminal(|term| (term.keyboard_modes(), term.c1_8bit_replies()));
+                let mut bytes = encode_key(&key, &modes);
                 if bytes.is_empty() {
                     return Ok(InputOutcome::Ignored);
+                }
+                if eight_bit {
+                    to_8bit_controls(&mut bytes);
                 }
                 session.queue_input(bytes).map_err(write_error)?;
                 session.scroll_to_bottom();
@@ -643,9 +656,15 @@ impl App {
                 session.set_focused(focused);
                 // Focus reporting (DECSET 1004) reports changes only, so a
                 // repeated event from the frontend sends nothing.
-                if changed && session.with_terminal(|term| term.modes().focus_events) {
+                let (focus_events, eight_bit) = session
+                    .with_terminal(|term| (term.modes().focus_events, term.c1_8bit_replies()));
+                if changed && focus_events {
                     let report: &[u8] = if focused { b"\x1b[I" } else { b"\x1b[O" };
-                    session.queue_input(report.to_vec()).map_err(write_error)?;
+                    let mut report = report.to_vec();
+                    if eight_bit {
+                        to_8bit_controls(&mut report);
+                    }
+                    session.queue_input(report).map_err(write_error)?;
                 }
                 Ok(InputOutcome::Consumed)
             }
@@ -661,11 +680,12 @@ impl App {
     ) -> Result<InputOutcome> {
         // One look at the terminal, released before anything is
         // queued.
-        let (tracking, encoding, rows, cols) = session.with_terminal(|term| {
+        let (tracking, encoding, eight_bit, rows, cols) = session.with_terminal(|term| {
             let modes = term.modes();
             (
                 modes.mouse,
                 modes.mouse_encoding,
+                term.c1_8bit_replies(),
                 term.grid().rows(),
                 term.grid().cols(),
             )
@@ -679,6 +699,7 @@ impl App {
         let mode = mouse::Mode {
             tracking,
             encoding,
+            eight_bit,
             pixels,
         };
         let route = mouse::route_mouse(session.mouse_reports(), &mouse, &mode);
@@ -694,14 +715,15 @@ impl App {
     ) -> Result<InputOutcome> {
         // One look at the terminal, released before anything is
         // queued.
-        let (alt, tracking, encoding, application_cursor_keys, rows, cols) =
-            session.with_terminal(|term| {
+        let (alt, tracking, encoding, application_cursor_keys, eight_bit, rows, cols) = session
+            .with_terminal(|term| {
                 let modes = term.modes();
                 (
                     term.grid().is_alt_screen(),
                     modes.mouse,
                     modes.mouse_encoding,
                     term.keyboard_modes().application_cursor_keys,
+                    term.c1_8bit_replies(),
                     term.grid().rows(),
                     term.grid().cols(),
                 )
@@ -726,6 +748,7 @@ impl App {
                 let mode = mouse::Mode {
                     tracking,
                     encoding,
+                    eight_bit,
                     pixels,
                 };
                 let lines = session.take_scroll_lines(scroll.delta_lines, rows);
@@ -748,7 +771,7 @@ impl App {
             });
         }
         let lines = session.take_scroll_lines(scroll.delta_lines, rows);
-        let bytes = input::alternate_scroll_keys(lines, application_cursor_keys);
+        let bytes = input::alternate_scroll_keys(lines, application_cursor_keys, eight_bit);
         if bytes.is_empty() {
             return Ok(InputOutcome::Ignored);
         }
@@ -890,17 +913,22 @@ impl App {
         let write_error = |source| Error::Write { id, source };
         // Bracketed-paste mode (DECSET 2004), read once under the terminal
         // lock: the whole paste is wrapped, or none of it.
-        let bracketed_paste = session.with_terminal(|term| term.modes().bracketed_paste);
-        let (open, close): (&[u8], &[u8]) = if bracketed_paste {
-            (b"\x1b[200~", b"\x1b[201~")
+        let (bracketed_paste, eight_bit) =
+            session.with_terminal(|term| (term.modes().bracketed_paste, term.c1_8bit_replies()));
+        let (mut open, mut close) = if bracketed_paste {
+            (b"\x1b[200~".to_vec(), b"\x1b[201~".to_vec())
         } else {
-            (b"", b"")
+            (Vec::new(), Vec::new())
         };
+        if eight_bit {
+            to_8bit_controls(&mut open);
+            to_8bit_controls(&mut close);
+        }
         // Sanitising never lengthens text, so this bounds what is queued.
         let most = text.len().saturating_add(open.len() + close.len());
         session.check_input_room(most).map_err(write_error)?;
         let mut bytes = Vec::with_capacity(most);
-        bytes.extend_from_slice(open);
+        bytes.extend_from_slice(&open);
         if bracketed_paste {
             input::sanitize_bracketed_paste_into(text, &mut bytes);
         } else {
@@ -909,7 +937,7 @@ impl App {
         if bytes.len() == open.len() {
             return Ok(InputOutcome::Ignored);
         }
-        bytes.extend_from_slice(close);
+        bytes.extend_from_slice(&close);
         // The outbox charges the sanitised length; do not hold the raw
         // length's capacity behind it when sanitising removed most of it.
         if bytes.len() < bytes.capacity() / 2 {
@@ -3848,6 +3876,30 @@ mod tests {
         feed_child(&events, &fake, id, b"\x1b[?2004l");
         assert_eq!(app.paste(id, "d\ne").unwrap(), InputOutcome::Consumed);
         written_eventually(&fake, b"\x1b[200~a\nb[201~c\x1b[201~d\re");
+    }
+
+    /// In 8-bit mode (S8C1T) every sequence the host builds starts with a
+    /// C1 byte: keys, focus reports, both paste brackets and each
+    /// alternate-scroll key; an Alt-prefixed key and the pasted text are
+    /// left alone, and S7C1T returns to 7-bit (#96, ADR 0024).
+    #[test]
+    fn input_sequences_are_8bit_in_8bit_mode() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        feed_child(&events, &fake, id, b"\x1b G\x1b[?2004h\x1b[?1004h\x1b[?1h");
+        let up = KeyEvent::new(Key::Up, Modifiers::NONE);
+        assert_eq!(key(&app, id, up.clone()), InputOutcome::Consumed);
+        let alt_bracket = KeyEvent::new(Key::Char('['), Modifiers::ALT);
+        assert_eq!(key(&app, id, alt_bracket), InputOutcome::Consumed);
+        let focus = InputEvent::Focus(FocusEvent::Gained);
+        assert_eq!(app.send_input(id, focus).unwrap(), InputOutcome::Consumed);
+        assert_eq!(app.paste(id, "x\u{9b}y").unwrap(), InputOutcome::Consumed);
+        feed_child(&events, &fake, id, b"\x1b[?1049h");
+        assert_eq!(scroll(&app, id, 2.0), InputOutcome::Consumed);
+        feed_child(&events, &fake, id, b"\x1b F");
+        assert_eq!(key(&app, id, up), InputOutcome::Consumed);
+        written_eventually(&fake, b"\x8fA\x1b[\x9bI\x9b200~xy\x9b201~\x8fA\x8fA\x1bOA");
     }
 
     #[test]

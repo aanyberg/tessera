@@ -1,0 +1,1024 @@
+# =============================================================================
+# tessera-term: S7C1T / S8C1T (ESC SP F / ESC SP G) and 8-bit C1 controls   (issue #96, wave 9)
+# crates/tessera-term/tests/fixtures/c1_spec.txt
+#
+# Converted from the #96 spec-researcher's tables (spec-96-c1.md, 2026-11-01) with the milestone lead's decisions
+# applied. Every expected value comes from the sources below (xterm's source and ctlseqs, DEC's VT510 manual, esctest2,
+# vttest, and for the parser the vte 0.15 source that tessera-vt wraps), never from running tessera. Changes against the
+# researcher's tables:
+#   - DA1 at level 4 and 5 is `?6L;21;22c`: #97 (merged before #96) added 21 from level 4. The researcher's `?64;22c`
+#     predates it.
+#   - S6/S7: vte dispatches an OSC that CAN or SUB interrupts (osc_spec.txt T25/T26, decision D-CAN), so the 8-bit OSC
+#     does too: the title is set. The researcher wrote "no title" (xterm).
+#   - S20: a raw 0x9D in 7-bit mode is an ignored control in ground, so the payload after it is printed as text; the
+#     researcher described the 7-bit introducer case (`ESC ]` ... 0x9C), which OQ26 in osc_color_spec.txt pins.
+#   - R15/R16 (OSC colour replies) wait for #10's colour queries (wave-8 task 10-colors): `#>` lines below.
+#   - The esctest `*_8bit` cases that check only the screen (HTS, IND, NEL, RI, S8C1T_CSI, APC, PM, SOS) are E_* rows
+#     in esctest_spec.txt; the ones that read a reply (S8C1T_DCS, DECID_8bit) are rows here (R11, C15).
+#   - ECMA-48 section numbers are not cited: the researcher quoted them from memory.
+#
+# DECISIONS (lead, "Lead decisions (2026-11-01)" in the wave-9 plan)
+#   D1  8-bit C1 controls are honoured on INPUT only while 8-bit mode is on (S8C1T, or DECSCL Pc 0/2/absent at level
+#       >= 2; Terminal::c1_8bit_replies()). A default 7-bit session treats them as today (= xterm in UTF-8 mode, which
+#       ignores C1 in UTF-8: charproc.c, every code point 128..159 is CASE_IGNORE).
+#   D2  Rule P: in 8-bit mode a C1 code b (a raw byte 0x80..0x9F that is not part of a UTF-8 character, or the UTF-8
+#       encoding C2 80..C2 9F) is processed exactly as the two bytes ESC (b - 0x40), in every parser state.
+#   D3  Replies use raw single bytes (9b, not c2 9b); a BEL-terminated OSC reply stays BEL-terminated.
+#   D5  S8C1T and S7C1T act only at conformance level >= 2; DECSTR keeps the mode, RIS clears it and keeps the level.
+#   D6  xterm's level-1 quirk (the byte after an ignored ESC SP G is swallowed) is not copied.
+#   D8  Keys, mouse reports, focus reports and paste brackets go through one helper (tessera_term::to_8bit_controls) at
+#       the send point; it rewrites a leading ESC [ / ESC O / ESC P / ESC ] and, after ESC P or ESC ], a trailing ESC \.
+#   A3  The 0x9C byte of a UTF-8 character inside a DCS payload (c9 9c = U+025C) no longer ends the DCS, in both modes.
+#
+# SOURCES (fetched 2026-11-01 by the researcher)
+#   [CTL] xterm ctlseqs, "C1 (8-Bit) Control Characters", "S7C1T", "S8C1T", "DECSCL": https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+#   [XT]  xterm source (ThomasDickey/xterm-snapshots master): charproc.c unparseputc1 (a reply's C1 byte is ESC (c-0x40)
+#         unless control_eight_bits, else the raw byte), unparseseq, CASE_S7C1T/CASE_S8C1T (`vtXX_level >= 2`), DECSCL,
+#         RIS (`show_8bit_control(False)`); ptydata.c writePtyData (raw byte, also in UTF-8 mode); VTPrsTbl.c C1 entries
+#         (84 IND, 85 NEL, 88 HTS, 8d RI, 8e SS2, 8f SS3, 90 DCS, 96 SPA, 97 EPA, 98 SOS, 9a DECID, 9b CSI, 9c ST, 9d OSC,
+#         9e PM, 9f APC, every other C1 aborts with no effect); misc.c DECRQSS `" p` (`;0` when control_eight_bits);
+#         input.c (keys: ANSI_CSI / ANSI_SS3), button.c (mouse, focus, bracketed paste through unparseputc1).
+#   [DEC] VT510 RM S8C1T.html / S7C1T.html (level 4/7-bit <-> level 4/8-bit; ignored in VT Level 1), DECSCL.html.
+#   [VT]  vttest vt220.c tst_S8C1T + esc.c s8c1t(): ESC SP G, CSI 1;1 H, CSI 6 n, expects 9b 31 3b 31 52.
+#   [ET]  esctest2 esctest/tests/{hts,ind,nel,ri,s8c1t,decid,pm,apc,sos}.py: escio.CmdChar writes the raw C1 byte while
+#         use8BitControls (escoding.to_binary is latin-1), between Write(S8C1T) and Write(S7C1T).
+#   [VTE] vte 0.15.0 src/lib.rs: advance_ground executes a lone invalid byte <= 0x9F and dispatches decoded U+0080..U+009F
+#         as execute; advance_dcs_passthrough unhooks on any 0x9C byte; advance_osc_string puts every byte >= 0x20 but
+#         ESC/BEL/CAN/SUB into the payload; CAN/SUB in an OSC dispatch it (osc_end); SOS/PM/APC ignore every byte but
+#         CAN/SUB/ESC.
+#
+# FORMAT (tests/c1.rs, one table-driven test through common::check_table; every failing id is reported)
+#   ### ID               unique row id; the prefix names the group: F (mode switch), R (replies), C (C1 input),
+#                        S (strings), K (keys), M (mouse), P (focus and paste).
+#   size: RxC            grid size.
+#   step: feed <bytes>   `\e` = ESC, `\xNN` one raw byte, `\u{H}` one scalar UTF-8 encoded (`\u{9b}` = c2 9b), `\\`, `\r`,
+#                        `\n`, `\t`; `\e G` is ESC SP G (S8C1T), `\e F` ESC SP F (S7C1T). The test runs every row whole,
+#                        byte by byte and split in two at every offset of every feed step; the results must agree.
+#   reply: <bytes>|none  the exact Request::Reply bytes queued since the previous `reply:` line (or the start),
+#                        concatenated; `none` = no reply. `<PV>` = DA2_PV, `<VERSION>` = the crate version.
+#   requests: [..]       the other requests since the previous `requests:` line: `SetTitle("..")`; omitted = not checked.
+#   c1_8bit: true|false  Terminal::c1_8bit_replies() after the steps (optional).
+#   screen: / cursor:    as csi_spec.txt: one `>` line per row, `|` after the cursor's cell; cursor 0-based (row,col).
+#   key: <name> [mods]   (K rows) one key press encoded with encode_key in the keyboard modes the steps left; names are
+#                        Up, Home, Delete, Tab, Escape, F<n>, Kp5, Char:<c>; mods are ctrl, shift, alt joined by +.
+#   mouse: <press|release> <button> <col>,<row>   (M rows) one encode_mouse report, zero-based cell, in the tracking
+#                        mode and encoding the steps left.
+#   send: <bytes>        (P rows) a sequence the host sends that no encoder in this crate builds (focus, paste brackets).
+#   out7: / out8:        the bytes in 7-bit mode (what the encoder returns, or `send:`) and after to_8bit_controls.
+#   cite:/note:/source:/flags: documentation.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# F: the S7C1T / S8C1T state machine, observed through the DA1 probe `\e[c` (and DECRQSS `" p` in F17/F18)
+#    DA1 at level 4: 7-bit `\e[?64;21;22c`, 8-bit `\x9b?64;21;22c`.
+# -----------------------------------------------------------------------------
+
+### F01_s8c1t_switches_replies_to_8bit
+size: 24x80
+step: feed \e G
+step: feed \e[c
+reply: \x9b?64;21;22c
+c1_8bit: true
+cite: [CTL] S8C1T "send C1 control characters as 8-bit sequences, e.g., its responses to queries"; [XT] unparseputc1; level 4
+
+### F02_s7c1t_undoes_it
+size: 24x80
+step: feed \e G\e F\e[c
+reply: \e[?64;21;22c
+c1_8bit: false
+cite: [CTL] S7C1T; [DEC] S7C1T.html
+
+### F03_s7c1t_in_7bit_mode_is_a_no_op
+size: 24x80
+step: feed \e F\e[c
+reply: \e[?64;21;22c
+c1_8bit: false
+cite: [DEC] S7C1T from 7-bit "ignores sequence"
+
+### F04_s8c1t_twice
+size: 24x80
+step: feed \e G\e G\e[c
+reply: \x9b?64;21;22c
+cite: [DEC] S8C1T in 8-bit mode "ignores sequence"
+
+### F05_level1_ignores_s8c1t
+size: 24x80
+step: feed \e[61"p\e G\e[c
+reply: \e[?1;2c
+c1_8bit: false
+cite: [XT] CASE_S8C1T `if (screen->vtXX_level >= 2)`; [DEC] "VT Level 1 ... ignores"; level 1 DA1 is `?1;2c`
+
+### F06_level1_s8c1t_does_not_swallow_the_next_byte
+size: 3x10
+step: feed \e[61"p\e GA\e[c
+reply: \e[?1;2c
+screen:
+>A |
+>
+>
+cursor: (0,1)
+cite: decision D6: xterm leaves its parser in the ESC SP table at level 1 and swallows the `A`; Tessera consumes exactly ESC SP G
+flags: decision
+
+### F07_level2_s8c1t
+size: 24x80
+step: feed \e[62;1"p\e G\e[c
+reply: \x9b?62;22c
+cite: [XT] level 2 >= 2; level 2 DA1 `?62;22c`
+
+### F08_ris_clears_8bit_mode_keeps_level
+size: 24x80
+step: feed \e[62;1"p\e G\ec\e[c
+reply: \e[?62;22c
+c1_8bit: false
+cite: [XT] RIS calls show_8bit_control(False) and leaves vtXX_level; level 2 DA1 shows the level was kept
+
+### F09_decstr_keeps_8bit_mode
+size: 24x80
+step: feed \e G\e[!p\e[c
+reply: \x9b?64;21;22c
+c1_8bit: true
+cite: [XT] the soft reset does not call show_8bit_control
+
+### F10_s8c1t_after_a_7bit_decscl
+size: 24x80
+step: feed \e[64;1"p\e G\e[c
+reply: \x9b?64;21;22c
+
+### F11_s7c1t_after_an_8bit_decscl
+size: 24x80
+step: feed \e[64;0"p\e F\e[c
+reply: \e[?64;21;22c
+
+### F12_decscl_without_pc_is_8bit
+size: 24x80
+step: feed \e[64"p\e[c
+reply: \x9b?64;21;22c
+cite: [CTL] DECSCL "Ps = 0 -> 8-bit controls" and an absent Pc is 0 (decscl_spec.txt LEVEL64_no_pc_is_8bit)
+
+### F13_other_esc_sp_finals_change_nothing
+size: 3x10
+step: feed \e @\e H\e[c
+reply: \e[?64;21;22c
+c1_8bit: false
+screen:
+> |
+>
+>
+cursor: (0,0)
+cite: [XT] esc_sp_table: only F and G (and L/M/N, #112) do something; nothing is printed
+
+### F14_s8c1t_split_across_calls
+size: 24x80
+step: feed \e
+step: feed \x20
+step: feed G
+step: feed \e[c
+reply: \x9b?64;21;22c
+cite: chunk invariance (every split is also run by the harness)
+
+### F15_s8c1t_aborts_a_csi_in_progress
+size: 3x10
+step: feed \e[1\e Gc\e[c
+reply: \x9b?64;21;22c
+screen:
+>c |
+>
+>
+cursor: (0,1)
+cite: [VTE] ESC in CsiParam restarts the escape (anywhere); the aborted CSI sends nothing and `c` is printed
+
+### F16_switch_applies_within_the_same_chunk
+size: 24x80
+step: feed \e G\e[c
+reply: \x9b?64;21;22c
+cite: the mode is read when the query completes, not at the next advance call
+
+### F17_decrqss_decscl_in_8bit_mode
+size: 24x80
+step: feed \e G\eP$q"p\e\\
+reply: \x901$r64;0"p\x9c
+cite: [XT] misc.c DECRQSS `" p`: `;0` when control_eight_bits; the DCS opener and ST are 8-bit too
+
+### F18_decrqss_decscl_after_s7c1t
+size: 24x80
+step: feed \e G\e F\eP$q"p\e\\
+reply: \eP1$r64;1"p\e\\
+cite: [XT] `;1` when 7-bit
+
+# -----------------------------------------------------------------------------
+# R: every reply family under S8C1T (setup `\e G` at level 4 unless stated). The 7-bit forms are reports_spec.txt's.
+# -----------------------------------------------------------------------------
+
+### R01_da1
+size: 24x80
+step: feed \e G\e[c
+reply: \x9b?64;21;22c
+cite: [XT] unparseseq ANSI_CSI
+
+### R02_decid
+size: 24x80
+step: feed \e G\eZ
+reply: \x9b?64;21;22c
+cite: [XT] CASE_DECID answers like DA1
+
+### R03_da2
+size: 24x80
+step: feed \e G\e[>c
+reply: \x9b>1;<PV>;0c
+
+### R04_da3
+size: 24x80
+step: feed \e G\e[=c
+reply: \x90!|00000000\x9c
+cite: [XT] CASE_DECRPTUI: unparseputc1(ANSI_DCS) ... unparseputc1(ANSI_ST): opener and ST both 8-bit
+
+### R05_xtversion
+size: 24x80
+step: feed \e G\e[>q
+reply: \x90>|Tessera <VERSION>\x9c
+
+### R06_dsr
+size: 24x80
+step: feed \e G\e[5n
+reply: \x9b0n
+
+### R07_cpr
+size: 24x80
+step: feed \e G\e[6n
+reply: \x9b1;1R
+cite: [VT] vttest tst_S8C1T expects 9b 31 3b 31 52; [ET] s8c1t.py test_S8C1T_CSI reads the position the same way
+
+### R08_decxcpr
+size: 24x80
+step: feed \e G\e[?6n
+reply: \x9b?1;1;1R
+cite: [XT] CASE_DSR appends the page from level 4 (reports_spec.txt DSR13)
+
+### R09_decrqm
+size: 24x80
+step: feed \e G\e[?25$p
+reply: \x9b?25;1$y
+cite: the `$y` final stays 7-bit text: only the introducer is a C1
+
+### R10_decrqss_sgr
+size: 24x80
+step: feed \e G\eP$qm\e\\
+reply: \x901$r0m\x9c
+
+### R11_decrqss_decstbm_esctest_s8c1t_dcs
+size: 24x80
+step: feed \e[5;6r\e G\x90$qr\x9c
+reply: \x901$r5;6r\x9c
+source: esctest2 esctest/tests/s8c1t.py test_S8C1T_DCS (DECSTBM(5,6), S8C1T, DECRQSS("r") as DCS 0x90 ... ST 0x9C, ReadDCS == "1$r5;6r")
+cite: [ET]; the query itself is 8-bit (rule P)
+
+### R11b_decrqss_invalid
+size: 24x80
+step: feed \e G\eP$qz\e\\
+reply: \x900$r\x9c
+cite: [XT] unparseputc1(ANSI_DCS), `0$r`, unparseputc1(ANSI_ST)
+
+### R12_level5
+size: 24x80
+step: feed \e[65"p\e G\eP$q"p\e\\
+reply: \x901$r65;0"p\x9c
+cite: researcher D7: level 5 keeps the VT525 answers; the C1 mode is independent of the level above 1
+
+### R13_xtwinops_text_area_size
+size: 24x80
+step: feed \e G\e[18t
+reply: \x9b8;24;80t
+
+### R14_kitty_flags_query
+size: 24x80
+step: feed \e G\e[?u
+reply: \x9b?0u
+
+#> R15_osc_colour_query_bel -> 10-colors (wave 8): `\e G\e]10;?\x07` replies `\x9d10;<spec>\x07`: the BEL terminator is
+#>    not a C1 and stays 07 (D3; [XT] unparseputc1(final) with final = BEL). reply_osc goes through to_8bit_controls,
+#>    which leaves a trailing BEL alone (unit test in src/lib.rs).
+#> R16_osc_colour_query_st -> 10-colors (wave 8): `\e G\e]10;?\e\\` (or `\x9c`) replies `\x9d10;<spec>\x9c`.
+
+### R17_query_in_8bit_form
+size: 24x80
+step: feed \e G\x9bc
+reply: \x9b?64;21;22c
+cite: the reply's form follows the mode, not the query's form (R01 is the same query in 7-bit form)
+
+### R19_level1_decscl_forces_7bit
+size: 24x80
+step: feed \e G\e[61"p\e[c
+reply: \e[?1;2c
+c1_8bit: false
+cite: decscl_spec.txt: DECSCL 61 forces 7-bit (xterm keeps the old mode; a documented deviation, A8); level 1 never replies 8-bit
+
+### R20_title_pop_is_not_a_reply
+size: 24x80
+step: feed \e G\e]2;t\x07\e[22;0t\e[23;0t
+reply: none
+requests: [SetTitle("t"), SetTitle("t")]
+cite: a pop sends Request::SetTitle and no bytes, so there is nothing to make 8-bit
+
+### R21_silent_query_stays_silent
+size: 24x80
+step: feed \e G\e[>1c
+reply: none
+
+### R22_mode_is_read_when_each_query_completes
+size: 24x80
+step: feed \e G\e[c\e F\e[c
+reply: \x9b?64;21;22c\e[?64;21;22c
+cite: ADR 0024: a reply is queued the moment its query completes
+
+# -----------------------------------------------------------------------------
+# C: C1 controls on input. [8] rows start with `\e G`; [7] rows are 7-bit and pin today's behaviour (D1).
+#    The UTF-8 forms (`\u{84}` = c2 84) are rows of their own.
+# -----------------------------------------------------------------------------
+
+### C01_ind
+size: 24x80
+step: feed \e G\e[3;5H\x84
+cursor: (3,4)   # 1-based (4,5)
+cite: [XT] CASE_IND; [ET] ind.py test_IND_8bit (CUP(5,3), IND -> x5 y4)
+
+### C01u_ind_utf8_form
+size: 24x80
+step: feed \e G\e[3;5H\u{84}
+cursor: (3,4)
+cite: rule P: the UTF-8 form is the same control
+
+### C02_ind_scrolls
+size: 3x10
+step: feed \e Ga\r\nb\r\nc\e[3;1H\x84
+screen:
+>b
+>c
+> |
+cursor: (2,0)
+cite: ESC D equivalent: at the bottom margin IND scrolls
+
+### C03_nel
+size: 24x80
+step: feed \e G\e[3;5H\x85
+cursor: (3,0)
+cite: [ET] nel.py test_NEL_8bit (x1 y4)
+
+### C03u_nel_utf8_form
+size: 24x80
+step: feed \e G\e[3;5H\u{85}
+cursor: (3,0)
+
+### C04_hts
+size: 24x80
+step: feed \e G\e[3g\e[1;20H\x88\e[1;1H\t
+cursor: (0,19)
+cite: [ET] hts.py test_HTS_8bit (TBC 3, CUP(20,1), HTS, home, TAB -> x 20)
+
+### C04u_hts_utf8_form
+size: 24x80
+step: feed \e G\e[3g\e[1;20H\u{88}\e[1;1H\t
+cursor: (0,19)
+
+### C05_ri
+size: 24x80
+step: feed \e G\e[3;5H\x8d
+cursor: (1,4)
+cite: [ET] ri.py test_RI_8bit (x5 y2)
+
+### C05u_ri_utf8_form
+size: 24x80
+step: feed \e G\e[3;5H\u{8d}
+cursor: (1,4)
+
+### C06_ri_scrolls
+size: 3x10
+step: feed \e G\e[1;1Ha\e[1;1H\x8d
+screen:
+> |
+>a
+>
+cursor: (0,0)
+cite: ESC M equivalent: at the top margin RI scrolls down
+
+### C07_7bit_ignores_raw_c1
+size: 5x10
+step: feed \e[3;5H\x84\x85\x88\x8d
+screen:
+>
+>
+>     |
+>
+>
+cursor: (2,4)
+cite: decision D1: in 7-bit mode a C1 byte is an ignored control, as today ([VTE] advance_ground executes it; control.rs ignores it)
+flags: decision
+
+### C07u_7bit_ignores_utf8_c1
+size: 5x10
+step: feed \e[3;5H\u{84}\u{85}\u{88}\u{8d}
+screen:
+>
+>
+>     |
+>
+>
+cursor: (2,4)
+cite: decision D1; xterm in UTF-8 mode ignores U+0080..U+009F (charproc.c CASE_IGNORE)
+flags: decision
+
+### C08_7bit_hts_sets_no_stop
+size: 24x80
+step: feed \e[3g\e[1;20H\x88\e[1;1H\t
+cursor: (0,79)
+cite: negative of C04: no tab stop at column 20, so TAB goes to the right margin
+flags: decision
+
+### C09_csi
+size: 3x10
+step: feed \e G\x9b2;3H
+screen:
+>
+>   |
+>
+cursor: (1,2)
+cite: [ET] s8c1t.py test_S8C1T_CSI shape; rule P (9b = ESC [)
+
+### C10_csi_utf8_form
+size: 3x10
+step: feed \e G\u{9b}2;3H
+screen:
+>
+>   |
+>
+cursor: (1,2)
+cite: rule P (D2): the UTF-8 form is the same control
+
+### C11_7bit_raw_csi_is_ignored
+size: 3x10
+step: feed \x9b2;3H
+screen:
+>2;3H |
+>
+>
+cursor: (0,4)
+cite: decision D1: in 7-bit mode 0x9B is an ignored control ([VTE] advance_ground executes it), the rest is text
+flags: decision
+
+### C12_csi_restarts_a_csi
+size: 3x10
+step: feed \e G\e[1\x9b2;3H
+screen:
+>
+>   |
+>
+cursor: (1,2)
+cite: [XT] csi_table 9b = CASE_CSI_STATE restarts; ESC [ inside a CSI restarts it too
+
+### C13_c1_interrupts_a_csi
+size: 5x10
+step: feed \e G\e[3;5H\e[1\x84;2H
+screen:
+>
+>
+>
+>    ;2H |
+>
+cursor: (3,7)
+cite: [XT] csi_table 84 = CASE_IND + ResetState: the CSI is abandoned, IND runs, `;2H` is text (as `ESC [ 1 ESC D ; 2 H`)
+
+### C14_esc_then_c1
+size: 24x80
+step: feed \e G\e[3;5H\e\x84
+cursor: (3,4)
+cite: rule P: `ESC ESC D`; [VTE] ESC in the Escape state keeps the state, so IND runs once
+
+### C15_decid_esctest_decid_8bit
+size: 24x80
+step: feed \e G\x9a
+reply: \x9b?64;21;22c
+source: esctest2 esctest/tests/decid.py test_DECID_8bit (S8C1T, DECID as 0x9A, ReadCSI("c", prefix "?"))
+cite: [XT] 9a = CASE_DECID (ECMA-48 has SCI there; xterm wins, A7)
+
+### C16_ss2_ss3_have_no_effect_yet
+size: 3x10
+step: feed \e G\x8e\x8fA
+screen:
+>A |
+>
+>
+cursor: (0,1)
+cite: ESC N / ESC O are ignored until #112; the C1 forms must not print
+
+### C17_spa_epa_have_no_effect_yet
+size: 3x10
+step: feed \e G\x96\x97A
+screen:
+>A |
+>
+>
+cursor: (0,1)
+cite: ESC V / ESC W are ignored until #95 (which wires them through the same translation)
+
+### C18_other_c1_codes_do_nothing
+size: 3x10
+step: feed \e G\x80\x81\x82\x83\x86\x87\x89\x8a\x8b\x8c\x91\x92\x93\x94\x95\x99A
+screen:
+>A |
+>
+>
+cursor: (0,1)
+cite: [XT] VTPrsTbl.c: every other C1 = CASE_GROUND_STATE; rule P maps them to ESC @..ESC Y finals that esc() ignores
+
+### C19_a0_to_bf_are_not_c1
+size: 3x10
+step: feed \e G\xa0\xbfX
+screen:
+>��X |
+>
+>
+cursor: (0,3)
+cite: [VTE] advance_ground: a lone byte above 0x9F is invalid UTF-8 and prints U+FFFD
+
+### C20_utf8_character_with_a_9c_byte_prints
+size: 3x10
+step: feed \e G\xc3\x9c
+screen:
+>Ü |
+>
+>
+cursor: (0,1)
+cite: c3 9c is U+00DC: 0x9C here is a UTF-8 continuation byte, not ST (Ghostty stream.zig test; xterm)
+
+### C21_utf8_character_split_across_calls
+size: 3x10
+step: feed \e G\xc3
+step: feed \x9c
+screen:
+>Ü |
+>
+>
+cursor: (0,1)
+cite: Terminal::advance holds back an incomplete character
+
+### C22_three_byte_character_with_a_9b_byte
+size: 3x10
+step: feed \e G\xe2\x85\x9bX
+screen:
+>⅛X |
+>
+>
+cursor: (0,2)
+cite: e2 85 9b is U+215B: 0x9B after a lead byte is a continuation (A5)
+
+### C23_raw_csi_after_text
+size: 3x10
+step: feed \e GA\x9b1H
+screen:
+>A|
+>
+>
+cursor: (0,0)
+cite: an introducer after a complete character: CSI 1 H homes the cursor onto the A (`A|`: cursor on column 0)
+
+### C24_nul_and_del_are_not_c1
+size: 3x10
+step: feed \e G\x00\x7fA
+screen:
+>A |
+>
+>
+cursor: (0,1)
+
+### C25_decscl_switch_applies_in_the_same_read
+size: 24x80
+step: feed \e[64"p\e[3;5H\x84
+cursor: (3,4)
+cite: DECSCL without Pc selects 8-bit mode ([CTL] absent Pc = 0); the 0x84 after it in the same read is IND (#96 review: pins the parser asking for the mode after a CSI)
+
+### C26_ris_switch_applies_in_the_same_read
+size: 24x80
+step: feed \e G\ec\e[3;5H\x84
+cursor: (2,4)
+cite: [XT] RIS calls show_8bit_control(False): the 0x84 after it in the same read is an ignored 7-bit control (#96 review: pins the parser asking for the mode after an ESC)
+
+# -----------------------------------------------------------------------------
+# S: string introducers and terminators in 8-bit mode ([8] unless the id says 7bit)
+# -----------------------------------------------------------------------------
+
+### S01_osc_8bit_intro_8bit_st
+size: 3x10
+step: feed \e G\x9d0;hi\x9cX
+requests: [SetTitle("hi")]
+screen:
+>X |
+>
+>
+cursor: (0,1)
+
+### S02_osc_8bit_intro_bel
+size: 3x10
+step: feed \e G\x9d0;hi\x07X
+requests: [SetTitle("hi")]
+screen:
+>X |
+>
+>
+cursor: (0,1)
+cite: [CTL] BEL still ends an OSC
+
+### S03_osc_8bit_intro_7bit_st
+size: 3x10
+step: feed \e G\x9d0;hi\e\\X
+requests: [SetTitle("hi")]
+screen:
+>X |
+>
+>
+cursor: (0,1)
+
+### S04_osc_7bit_intro_8bit_st
+size: 3x10
+step: feed \e G\e]0;hi\x9cX
+requests: [SetTitle("hi")]
+screen:
+>X |
+>
+>
+cursor: (0,1)
+cite: rule P; in 7-bit mode the 0x9C would land in the payload ([VTE] advance_osc_string)
+
+### S05_osc_utf8_st
+size: 3x10
+step: feed \e G\e]0;hi\u{9c}X
+requests: [SetTitle("hi")]
+screen:
+>X |
+>
+>
+cursor: (0,1)
+cite: rule P: c2 9c is ST in 8-bit mode
+
+### S06_osc_interrupted_by_can
+size: 3x10
+step: feed \e G\x9d0;h\x18AX
+requests: [SetTitle("h")]
+screen:
+>AX |
+>
+>
+cursor: (0,2)
+cite: rule P makes this `\e]0;h\x18`: [VTE] advance_osc_string dispatches on CAN (osc_spec.txt T25, decision D-CAN; xterm discards the OSC)
+flags: vte-divergence
+
+### S07_osc_interrupted_by_sub
+size: 3x10
+step: feed \e G\x9d0;h\x1aAX
+requests: [SetTitle("h")]
+screen:
+>AX |
+>
+>
+cursor: (0,2)
+cite: as S06 (osc_spec.txt T26)
+flags: vte-divergence
+
+### S08_csi_inside_an_osc
+size: 3x10
+step: feed \e G\x9d0;h\x9b2;3HX
+requests: [SetTitle("h")]
+screen:
+>
+>  X |
+>
+cursor: (1,3)
+cite: rule P: `\e]0;h\e[2;3H`: [VTE] ESC ends the OSC (osc_end dispatches), then the CSI runs; xterm would discard the partial OSC (accepted, A1)
+
+### S09_dcs_8bit_intro_8bit_st
+size: 24x80
+step: feed \e G\x90$qm\x9c
+reply: \x901$r0m\x9c
+cite: [ET] s8c1t.py test_S8C1T_DCS shape
+
+### S10_dcs_8bit_intro_7bit_st
+size: 24x80
+step: feed \e G\x90$qm\e\\
+reply: \x901$r0m\x9c
+
+### S11_dcs_7bit_intro_8bit_st
+size: 24x80
+step: feed \e G\eP$qm\x9c
+reply: \x901$r0m\x9c
+
+### S12_apc_esctest_apc_8bit
+size: 3x10
+step: feed \e G\x9fxyz\x9cA
+screen:
+>A |
+>
+>
+cursor: (0,1)
+source: esctest2 esctest/tests/apc.py test_APC_8bit
+
+### S13_pm_esctest_pm_8bit
+size: 3x10
+step: feed \e G\x9exyz\x9cA
+screen:
+>A |
+>
+>
+cursor: (0,1)
+source: esctest2 esctest/tests/pm.py test_PM_8bit
+
+### S14_sos_esctest_sos_8bit
+size: 3x10
+step: feed \e G\x98xyz\x9cA
+screen:
+>A |
+>
+>
+cursor: (0,1)
+source: esctest2 esctest/tests/sos.py test_SOS_8bit
+
+### S15_apc_7bit_intro_8bit_st
+size: 3x10
+step: feed \e G\e_xyz\x9cA
+screen:
+>A |
+>
+>
+cursor: (0,1)
+cite: rule P; in 7-bit mode APC ignores 0x9C ([VTE] SosPmApcString) and would swallow the A (S15_7bit)
+
+### S15_7bit_apc_ignores_raw_st
+size: 3x10
+step: feed \e_xyz\x9cA\e\\B
+screen:
+>B |
+>
+>
+cursor: (0,1)
+cite: decision D1: 7-bit mode is unchanged; [VTE] SosPmApcString ignores every byte but CAN/SUB/ESC
+flags: decision
+
+### S16_st_alone_does_nothing
+size: 3x10
+step: feed \e G\x9cA
+screen:
+>A |
+>
+>
+cursor: (0,1)
+cite: ST in ground is a no-op (rule P: ESC \ is an ignored escape)
+
+### S17_sos_swallows_high_bytes
+size: 3x10
+step: feed \e G\x98a\xc3\xa9b\x9cA
+screen:
+>A |
+>
+>
+cursor: (0,1)
+cite: SOS content is unrestricted; the é bytes are swallowed with it
+
+### S18_utf8_text_in_an_8bit_osc
+size: 3x10
+step: feed \e G\x9d0;\xc3\xa9\x9c
+requests: [SetTitle("é")]
+cite: c3 a9 is data; its a9 byte is not a C1 (and above 0x9F anyway)
+
+### S18b_utf8_character_with_a_9c_byte_in_an_8bit_osc
+size: 3x10
+step: feed \e G\x9d0;\xc3\x9c\x9c
+requests: [SetTitle("Ü")]
+cite: c3 9c is U+00DC: its 0x9C byte is a continuation, not ST; the lone 0x9C after it is ST
+
+### S19_7bit_dcs_utf8_9c_does_not_end_the_dcs
+size: 3x10
+step: feed \ePq\xc9\x9cb\e\\A
+screen:
+>A |
+>
+>
+cursor: (0,1)
+cite: A3 (lead decision: fix): c9 9c is U+025C; its 0x9C byte must not end the DCS ([VTE] advance_dcs_passthrough unhooks on any 0x9C, so `b` used to print)
+flags: decision
+
+### S19b_8bit_dcs_utf8_9c_does_not_end_the_dcs
+size: 3x10
+step: feed \e G\ePq\xc9\x9cb\x9cA
+screen:
+>A |
+>
+>
+cursor: (0,1)
+cite: A3 in 8-bit mode: the character's 0x9C is data, the lone 0x9C is ST
+
+### S19c_7bit_dcs_lone_9c_still_ends_the_dcs
+size: 24x80
+step: feed \eP$qm\x9c
+reply: \eP1$r0m\e\\
+cite: kept: tessera-vt has always ended a DCS on a lone 0x9C byte ([VTE] advance_dcs_passthrough; tessera-vt crate docs "String terminators"); only a 0x9C inside a UTF-8 character stopped doing so
+flags: decision
+
+### S20_7bit_raw_osc_introducer_is_ignored
+size: 3x10
+step: feed \x9d0;hi\x9cX
+requests: []
+screen:
+>0;hiX |
+>
+>
+cursor: (0,5)
+cite: decision D1: in 7-bit mode 0x9D and 0x9C are ignored controls in ground ([VTE] advance_ground), so the payload is text
+flags: decision
+
+# -----------------------------------------------------------------------------
+# K: keys (encode_key) and the send-point helper. Setup steps set the keyboard modes.
+# -----------------------------------------------------------------------------
+
+### K01_up
+size: 24x80
+key: Up
+out7: \e[A
+out8: \x9bA
+cite: [XT] input.c: cursor keys are sent with a_type ANSI_CSI through unparseputc1
+
+### K02_up_application_cursor_keys
+size: 24x80
+step: feed \e[?1h
+key: Up
+out7: \eOA
+out8: \x8fA
+cite: [XT] ANSI_SS3
+
+### K03a_home
+size: 24x80
+key: Home
+out7: \e[H
+out8: \x9bH
+
+### K03b_delete
+size: 24x80
+key: Delete
+out7: \e[3~
+out8: \x9b3~
+
+### K03c_f5
+size: 24x80
+key: F5
+out7: \e[15~
+out8: \x9b15~
+
+### K04_f1
+size: 24x80
+key: F1
+out7: \eOP
+out8: \x8fP
+
+### K05_ctrl_up
+size: 24x80
+key: Up ctrl
+out7: \e[1;5A
+out8: \x9b1;5A
+
+### K06_shift_tab
+size: 24x80
+key: Tab shift
+out7: \e[Z
+out8: \x9bZ
+
+### K07_kitty_csi_u
+size: 24x80
+step: feed \e[>1u
+key: Char:a ctrl
+out7: \e[97;5u
+out8: \x9b97;5u
+cite: same helper (xterm has no kitty keys; consistency)
+
+### K08_keypad_application_mode
+size: 24x80
+step: feed \e=
+key: Kp5
+out7: \eOu
+out8: \x8fu
+
+### K09a_alt_a
+size: 24x80
+key: Char:a alt
+out7: \ea
+out8: \ea
+cite: ESC as the Alt prefix is not a C1 introducer
+
+### K09b_escape
+size: 24x80
+key: Escape
+out7: \e
+out8: \e
+
+### K09c_ctrl_c
+size: 24x80
+key: Char:c ctrl
+out7: \x03
+out8: \x03
+
+### K09d_text
+size: 24x80
+key: Char:a
+out7: a
+out8: a
+
+### K09e_alt_open_bracket
+size: 24x80
+key: Char:[ alt
+out7: \e[
+out8: \e[
+cite: decision D8: a two-byte sequence is an Alt-prefixed key, never an introducer (Alt+[, Alt+O, Alt+P, Alt+] stay 7-bit)
+flags: decision
+
+### K09f_alt_backslash
+size: 24x80
+key: Char:\\ alt
+out7: \e\\
+out8: \e\\
+cite: decision D8: the trailing ESC \ is rewritten only after a DCS or OSC introducer
+flags: decision
+
+### K10_modify_other_keys
+size: 24x80
+step: feed \e[>4;2m
+key: Char:a ctrl
+out7: \e[27;5;97~
+out8: \x9b27;5;97~
+
+# -----------------------------------------------------------------------------
+# M: mouse reports (encode_mouse). Setup steps choose the tracking mode and encoding.
+# -----------------------------------------------------------------------------
+
+### M01_default_encoding
+size: 24x80
+step: feed \e[?1000h
+mouse: press left 0,0
+out7: \e[M !!
+out8: \x9bM !!
+cite: [XT] button.c: the report's CSI goes through unparseputc1 (mouse_spec.txt A01)
+
+### M02a_sgr_press
+size: 24x80
+step: feed \e[?1000h\e[?1006h
+mouse: press left 0,0
+out7: \e[<0;1;1M
+out8: \x9b<0;1;1M
+
+### M02b_sgr_release
+size: 24x80
+step: feed \e[?1000h\e[?1006h
+mouse: release left 0,0
+out7: \e[<0;1;1m
+out8: \x9b<0;1;1m
+
+### M03a_urxvt
+size: 24x80
+step: feed \e[?1000h\e[?1015h
+mouse: press left 0,0
+out7: \e[32;1;1M
+out8: \x9b32;1;1M
+
+### M03b_utf8
+size: 24x80
+step: feed \e[?1000h\e[?1005h
+mouse: press left 0,0
+out7: \e[M !!
+out8: \x9bM !!
+
+# -----------------------------------------------------------------------------
+# P: sequences tessera-app-core builds itself, through the same helper
+# -----------------------------------------------------------------------------
+
+### P01a_focus_in
+size: 24x80
+send: \e[I
+out7: \e[I
+out8: \x9bI
+cite: [XT] button.c focus events through unparseputc1
+
+### P01b_focus_out
+size: 24x80
+send: \e[O
+out7: \e[O
+out8: \x9bO
+
+### P02a_bracketed_paste_start
+size: 24x80
+send: \e[200~
+out7: \e[200~
+out8: \x9b200~
+cite: [XT] button.c _WriteKey
+
+### P02b_bracketed_paste_end
+size: 24x80
+send: \e[201~
+out7: \e[201~
+out8: \x9b201~
+note: pasted text is sanitised as before: ESC and every C1 control (U+0080..U+009F) are removed, so a paste cannot end the
+      brackets in either mode (a raw 0x9B cannot occur: the text is a Rust string)
