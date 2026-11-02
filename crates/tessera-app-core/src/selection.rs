@@ -67,16 +67,21 @@ pub enum Granularity {
     Line,
 }
 
-/// A URL detected in the terminal's text and the cells it covers, as
-/// [`crate::App::link_at`] reports it.
+/// A link under a cell and the cells it covers, as
+/// [`crate::App::link_at`] reports it: an OSC 8 hyperlink the program
+/// wrote, or else a URL detected in the terminal's text.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Link {
-    /// The URL as written on the screen (its scheme's case kept).
+    /// The OSC 8 URI as the program sent it, or the detected URL as written
+    /// on the screen (its scheme's case kept).
     pub url: String,
-    /// The cells the URL covers, one entry per row it is on that the view
+    /// The cells the link covers, one entry per row it is on that the view
     /// shows, top to bottom: the view-relative row and its columns (end
-    /// exclusive; a wide character's two columns are both included).
-    /// Trailing punctuation that is not part of the URL is outside it.
+    /// exclusive; a wide character's two columns are both included). An OSC
+    /// 8 link covers all its cells in the view, so a row has several
+    /// entries when the cells of one link (one `id`) are not adjacent.
+    /// Trailing punctuation that is not part of a detected URL is outside
+    /// it.
     pub span: Vec<(u16, Range<u16>)>,
 }
 
@@ -272,13 +277,13 @@ impl<'a> Lines<'a> {
     }
 }
 
-/// A cell that holds no text: a space with no marker but padding (styles
-/// do not count, so an erased coloured cell is blank too).
+/// A cell that holds no text: a space with no marker but padding and a
+/// hyperlink (styles do not count, so an erased coloured cell is blank too).
 fn is_blank(cell: &Cell) -> bool {
     cell.ch == ' '
         && cell
             .flags
-            .difference(tessera_grid::CellFlags::PAD)
+            .difference(tessera_grid::CellFlags::PAD | tessera_grid::CellFlags::LINK)
             .is_empty()
 }
 
@@ -895,10 +900,49 @@ fn window(lines: &Lines<'_>, at: Pos, reach: usize) -> Option<(Vec<char>, Vec<Po
     Some((chars, cells, index))
 }
 
-/// The detected URL under view-relative `at` at scroll `offset` (see
-/// [`crate::App::link_at`]).
+/// The link under view-relative `at` at scroll `offset` (see
+/// [`crate::App::link_at`]): the OSC 8 hyperlink of the cell when it has
+/// one, else the detected URL.
 pub(crate) fn link_at(grid: &Grid, offset: usize, at: Point) -> Option<Link> {
-    link_with_reach(grid, offset, at, MAX_URL_LEN + 1)
+    osc8_link(grid, offset, at).or_else(|| link_with_reach(grid, offset, at, MAX_URL_LEN + 1))
+}
+
+/// The OSC 8 hyperlink of the cell at view-relative `at`, with every cell
+/// of the same link entity ([`tessera_grid::Hyperlink::same_link`]) that
+/// the view shows: runs of adjacent columns, row by row, top to bottom.
+fn osc8_link(grid: &Grid, offset: usize, at: Point) -> Option<Link> {
+    let lines = Lines::of(grid);
+    let pos = lines.exact(offset, at)?;
+    let link = lines.line(pos.line)?.hyperlink(usize::from(pos.col))?;
+    let top = lines.view_top(offset);
+    let mut span: Vec<(u16, Range<u16>)> = Vec::new();
+    for row in 0..lines.rows {
+        let Some(shown) = lines.line(top + i64::from(row)) else {
+            continue;
+        };
+        let mut cols: Option<Range<u16>> = None;
+        for (col, other) in shown.graphemes.links() {
+            if !other.same_link(link) {
+                continue;
+            }
+            let col = u16::try_from(col).unwrap_or(u16::MAX);
+            match &mut cols {
+                Some(run) if run.end == col => run.end = col + 1,
+                _ => {
+                    if let Some(run) = cols.replace(col..col + 1) {
+                        span.push((row, run));
+                    }
+                }
+            }
+        }
+        if let Some(run) = cols {
+            span.push((row, run));
+        }
+    }
+    Some(Link {
+        url: link.uri().to_owned(),
+        span,
+    })
 }
 
 /// [`link_at`], looking `reach` characters to either side: the cap
@@ -1009,6 +1053,107 @@ mod tests {
         state.begin(term.grid(), 0, point(0, 0), Granularity::Word, false);
         term.advance(b"\x1b[?1049h");
         assert!(!state.has_selection(term.grid()));
+    }
+
+    #[test]
+    fn osc8_links_win_over_detected_urls_and_cover_the_whole_entity() {
+        // The visible text is a URL, the link points elsewhere.
+        let term = term(
+            4,
+            20,
+            b"\x1b]8;;https://real.example/\x1b\\https://fake.example/x\x1b]8;;\x1b\\ https://plain.example/",
+        );
+        let grid = term.grid();
+        let link = link_at(grid, 0, point(1, 1)).expect("a link");
+        assert_eq!(link.url, "https://real.example/");
+        // Row 0 cols 0..20, row 1 cols 0..2 (the wrapped rest of the text).
+        assert_eq!(link.span, vec![(0, 0..20), (1, 0..2)]);
+        // Hovering any of its cells gives the same link; the detected URL
+        // after it is still found by the old path.
+        assert_eq!(link_at(grid, 0, point(0, 0)), Some(link));
+        let plain = link_at(grid, 0, point(1, 5)).expect("detected URL");
+        assert_eq!(plain.url, "https://plain.example/");
+        assert_eq!(link_at(grid, 0, point(3, 0)), None);
+    }
+
+    #[test]
+    fn osc8_link_of_a_non_url_text_and_scheme_is_reported_as_is() {
+        let term = term(
+            2,
+            20,
+            b"\x1b]8;;slack://open?id=1\x07click me\x1b]8;;\x07 x",
+        );
+        let link = link_at(term.grid(), 0, point(0, 2)).expect("a link");
+        assert_eq!(link.url, "slack://open?id=1");
+        assert_eq!(link.span, vec![(0, 0..8)]);
+        assert_eq!(
+            link_at(term.grid(), 0, point(0, 9)),
+            None,
+            "after the close"
+        );
+    }
+
+    #[test]
+    fn an_id_groups_cells_that_are_not_adjacent_and_other_ids_do_not() {
+        let term = term(
+            3,
+            12,
+            b"\x1b]8;id=k;https://a.example/\x1b\\ab\x1b]8;;\x1b\\ \x1b]8;id=k;https://a.example/\x1b\\cd\x1b]8;;\x1b\\\r\n\
+              \x1b]8;;https://a.example/\x1b\\ef\x1b]8;;\x1b\\",
+        );
+        let grid = term.grid();
+        let link = link_at(grid, 0, point(0, 1)).expect("a link");
+        assert_eq!(link.span, vec![(0, 0..2), (0, 3..5)]);
+        // The same URI without the id is another entity.
+        let other = link_at(grid, 0, point(1, 0)).expect("another link");
+        assert_eq!(other.url, "https://a.example/");
+        assert_eq!(other.span, vec![(1, 0..2)]);
+    }
+
+    #[test]
+    fn osc8_spans_follow_the_scroll_offset_and_wide_characters() {
+        let mut term = term(
+            2,
+            6,
+            b"\x1b]8;;https://a.example/\x1b\\\xe4\xb8\x96x\x1b]8;;\x1b\\\r\n",
+        );
+        term.advance(b"b\r\nc");
+        // History holds the link row; the view scrolled back by one shows it
+        // on row 0, the wide character's both cells included.
+        let link = link_at(term.grid(), 1, point(0, 1)).expect("link on the spacer");
+        assert_eq!(link.span, vec![(0, 0..3)]);
+        assert_eq!(
+            link_at(term.grid(), 0, point(0, 0)),
+            None,
+            "scrolled out of view"
+        );
+    }
+
+    #[test]
+    fn hover_underlines_every_row_of_an_osc8_link() {
+        let term = term(
+            3,
+            4,
+            b"\x1b]8;;https://a.example/\x1b\\abcdef\x1b]8;;\x1b\\",
+        );
+        let mut state = SelectionState::default();
+        state.set_hover(Some(point(1, 0)));
+        let draw = state.decorations(term.grid(), 0);
+        assert_eq!(
+            draw.overlays,
+            vec![
+                Overlay::new(OverlayKind::Underline, 0, 0..4),
+                Overlay::new(OverlayKind::Underline, 1, 0..2),
+            ]
+        );
+    }
+
+    #[test]
+    fn linked_trailing_spaces_are_not_text() {
+        let term = term(2, 10, b"\x1b]8;;https://a.example/\x1b\\ab  \x1b]8;;\x1b\\");
+        let mut state = SelectionState::default();
+        state.select_all(term.grid());
+        assert_eq!(state.text(term.grid()).as_deref(), Some("ab"));
     }
 
     /// The reference link lookup: the whole logical line, no reach limit.

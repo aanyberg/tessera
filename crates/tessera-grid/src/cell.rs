@@ -18,7 +18,7 @@ impl Point {
 
 /// Width and cluster markers of a [`Cell`].
 ///
-/// A small bit set; combine with [`CellFlags::union`] or `|`. Four markers
+/// A small bit set; combine with [`CellFlags::union`] or `|`. Five markers
 /// exist:
 ///
 /// - [`CellFlags::WIDE`]: the cell holds the left half of a character two
@@ -33,9 +33,14 @@ impl Point {
 ///   character did not fit into, so it continued on the next row. The
 ///   cell shows a blank and is not text: a resize that joins the row with
 ///   the next one drops it. Writing or erasing the cell clears the marker.
+/// - [`CellFlags::LINK`]: the cell is part of an OSC 8 hyperlink; the link
+///   itself is in [`Line::graphemes`] at the cell's column (see
+///   [`Line::hyperlink`]). Only a cell written while a link is active
+///   carries it; erasing or overwriting the cell drops it.
 ///
 /// [`Line::graphemes`]: crate::Line::graphemes
 /// [`Line::cluster`]: crate::Line::cluster
+/// [`Line::hyperlink`]: crate::Line::hyperlink
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct CellFlags(u8);
 
@@ -50,6 +55,9 @@ impl CellFlags {
     pub const CLUSTER: Self = Self(1 << 2);
     /// Padding left in the last column when a wide character wrapped.
     pub const PAD: Self = Self(1 << 3);
+    /// The cell belongs to an OSC 8 hyperlink kept in the line's link
+    /// table.
+    pub const LINK: Self = Self(1 << 4);
 
     /// The raw bits.
     pub const fn bits(self) -> u8 {
@@ -109,6 +117,9 @@ pub struct Cell {
     /// Width and cluster markers.
     pub flags: CellFlags,
 }
+
+// A hyperlink flag and a side table keep the cell at 20 bytes (ADR 0026).
+const _: () = assert!(size_of::<Cell>() == 20);
 
 impl Default for Cell {
     fn default() -> Self {
@@ -193,6 +204,12 @@ impl Cell {
     /// column of a row ([`CellFlags::PAD`]).
     pub const fn is_pad(&self) -> bool {
         self.flags.contains(CellFlags::PAD)
+    }
+
+    /// True when the cell is part of an OSC 8 hyperlink
+    /// ([`CellFlags::LINK`]).
+    pub const fn is_link(&self) -> bool {
+        self.flags.contains(CellFlags::LINK)
     }
 
     /// The padding a wide character leaves in the last column when it

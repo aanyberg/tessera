@@ -1,22 +1,33 @@
-//! Grapheme clusters that do not fit in one [`Cell::ch`], and the width
-//! queries the grid uses to place characters.
+//! Grapheme clusters that do not fit in one [`Cell::ch`], the hyperlinks of
+//! linked cells, and the width queries the grid uses to place characters.
 //!
 //! A [`Cell`] holds one scalar. When further scalars join it to form one
 //! grapheme cluster (UAX #29: a combining mark, a variation selector, an
 //! emoji modifier, a ZWJ sequence, the second regional indicator of a
 //! flag), the cell gets [`CellFlags::CLUSTER`] and the line's
 //! [`GraphemeTable`] stores the whole cluster text, base included, under
-//! the cell's column. Most lines have no clusters, so an empty table costs
-//! one pointer and no allocation.
+//! the cell's column. A cell written while an OSC 8 hyperlink is open gets
+//! [`CellFlags::LINK`] and the same table stores its [`Hyperlink`] under
+//! the column (ADR 0026), in the same allocation: a line keeps one pointer
+//! for both, which holds [`Line`] at 64 bytes (a size that is not a power of
+//! two made every row access and every scroll measurably dearer). Most
+//! lines have neither, so an empty table costs one pointer and no
+//! allocation.
 //!
 //! [`Cell`]: crate::Cell
 //! [`Cell::ch`]: crate::Cell::ch
 //! [`CellFlags::CLUSTER`]: crate::CellFlags::CLUSTER
+//! [`CellFlags::LINK`]: crate::CellFlags::LINK
+//! [`Hyperlink`]: crate::Hyperlink
+//! [`Line`]: crate::Line
 
 use std::fmt;
 use std::ops::Range;
 
 use unicode_width::UnicodeWidthChar;
+
+use crate::Hyperlink;
+use crate::hyperlink::LinkColumns;
 
 /// Most scalars one cluster may hold, base included.
 ///
@@ -51,42 +62,57 @@ struct Entry {
     text: Box<str>,
 }
 
-/// The cluster text of every [`CellFlags::CLUSTER`] cell in a [`Line`],
-/// keyed by column.
+/// What a line's table holds: the clusters and the hyperlinks, each sorted
+/// by column.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct Side {
+    clusters: Vec<Entry>,
+    links: LinkColumns,
+}
+
+/// The cluster text of every [`CellFlags::CLUSTER`] cell in a [`Line`] and
+/// the hyperlink of every [`CellFlags::LINK`] cell, keyed by column.
 ///
-/// Each entry holds the whole cluster, base scalar included, and at least
-/// two scalars (a lone scalar is a plain cell). The grid keeps it
-/// consistent with the cells: every mutation that overwrites, clears or
-/// moves cells updates the table too, so its keys are exactly the columns
-/// whose cell has [`CellFlags::CLUSTER`].
+/// Each cluster entry holds the whole cluster, base scalar included, and at
+/// least two scalars (a lone scalar is a plain cell). The grid keeps the
+/// table consistent with the cells: every mutation that overwrites, clears
+/// or moves cells updates the table too, so its keys are exactly the
+/// columns whose cell has [`CellFlags::CLUSTER`] (clusters) and
+/// [`CellFlags::LINK`] (links). A column can have both. Every edit of
+/// the cells (overwrite, erase, insert, delete, scroll) applies to both kinds;
+/// [`GraphemeTable::get`], [`GraphemeTable::len`] and
+/// [`GraphemeTable::iter`] read the clusters, [`GraphemeTable::link`] and
+/// [`GraphemeTable::links`] the links.
 ///
 /// [`CellFlags::CLUSTER`]: crate::CellFlags::CLUSTER
+/// [`CellFlags::LINK`]: crate::CellFlags::LINK
 /// [`Line`]: crate::Line
 #[derive(Clone, Default, Eq)]
 pub struct GraphemeTable {
-    /// Entries sorted by column; `None` until the line first gets a cluster
-    /// (and again after [`GraphemeTable::clear`] or when an emptied table
-    /// is compacted), so a line
-    /// without clusters allocates nothing.
-    #[expect(
-        clippy::box_collection,
-        reason = "one pointer in every Line instead of a three-word Vec header; \
-                  most lines, including every scrollback line, have no clusters"
-    )]
-    entries: Option<Box<Vec<Entry>>>,
+    /// `None` until the line first gets a cluster or a link (and again
+    /// after [`GraphemeTable::clear`] or when an emptied table is
+    /// compacted), so a line without either allocates nothing.
+    /// One pointer in every `Line` instead of two `Vec` headers: most lines,
+    /// including every scrollback line, have neither.
+    entries: Option<Box<Side>>,
 }
 
 /// Prints the clusters as a `{column: text}` map, the same for a table
 /// that never held one and one whose kept vector is empty.
 impl fmt::Debug for GraphemeTable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_map().entries(self.iter()).finish()
+        f.debug_map().entries(self.iter()).finish()?;
+        if self.has_links() {
+            f.write_str(" + links ")?;
+            f.debug_map().entries(self.links()).finish()?;
+        }
+        Ok(())
     }
 }
 
 impl PartialEq for GraphemeTable {
     fn eq(&self, other: &Self) -> bool {
-        self.slice() == other.slice()
+        self.slice() == other.slice() && self.link_slice_eq(other)
     }
 }
 
@@ -109,9 +135,9 @@ impl GraphemeTable {
         self.slice().len()
     }
 
-    /// True when the line has no clusters.
+    /// True when the line has no clusters and no hyperlinks.
     pub fn is_empty(&self) -> bool {
-        self.slice().is_empty()
+        self.slice().is_empty() && !self.has_links()
     }
 
     /// Every `(column, cluster text)` pair, by ascending column.
@@ -120,7 +146,31 @@ impl GraphemeTable {
     }
 
     fn slice(&self) -> &[Entry] {
-        self.entries.as_deref().map_or(&[], Vec::as_slice)
+        self.entries.as_deref().map_or(&[], |side| &side.clusters)
+    }
+
+    /// The hyperlink at `col`.
+    pub fn link(&self, col: usize) -> Option<&Hyperlink> {
+        self.entries.as_deref()?.links.get(col)
+    }
+
+    /// True when the line has a hyperlink.
+    pub fn has_links(&self) -> bool {
+        self.entries
+            .as_deref()
+            .is_some_and(|side| !side.links.is_empty())
+    }
+
+    /// Every `(column, hyperlink)` pair, by ascending column.
+    pub fn links(&self) -> impl Iterator<Item = (usize, &Hyperlink)> + '_ {
+        self.entries
+            .as_deref()
+            .into_iter()
+            .flat_map(|side| side.links.iter())
+    }
+
+    fn link_slice_eq(&self, other: &Self) -> bool {
+        self.links().eq(other.links())
     }
 
     /// Stores `text` as the cluster at `col`, replacing any previous one.
@@ -128,51 +178,65 @@ impl GraphemeTable {
         let Ok(col) = u16::try_from(col) else {
             return;
         };
-        let entries = self.entries.get_or_insert_with(Box::default);
+        let side = self.entries.get_or_insert_with(Box::default);
+        let entries = &mut side.clusters;
         match entries.binary_search_by_key(&col, |e| e.col) {
             Ok(i) => entries[i].text = text,
             Err(i) => entries.insert(i, Entry { col, text }),
         }
     }
 
-    /// Drops the cluster at `col`, if any.
+    /// Stores `link` as the hyperlink at `col`, replacing any previous one.
+    pub(crate) fn set_link(&mut self, col: usize, link: Hyperlink) {
+        self.entries
+            .get_or_insert_with(Box::default)
+            .links
+            .set(col, link);
+    }
+
+    /// Drops the cluster and the hyperlink at `col`, if any.
     #[inline]
     pub(crate) fn remove(&mut self, col: usize) {
         let Ok(col) = u16::try_from(col) else {
             return;
         };
-        self.edit(|entries| {
-            if let Ok(i) = entries.binary_search_by_key(&col, |e| e.col) {
-                entries.remove(i);
+        self.edit(|side| {
+            if let Ok(i) = side.clusters.binary_search_by_key(&col, |e| e.col) {
+                side.clusters.remove(i);
             }
+            side.links.remove(usize::from(col));
         });
     }
 
-    /// Drops every cluster whose column lies in `range`.
+    /// Drops every cluster and hyperlink whose column lies in `range`.
     #[inline]
     pub(crate) fn remove_range(&mut self, range: Range<usize>) {
         if self.entries.is_none() {
-            // The common case: a line without clusters.
+            // The common case: a line without clusters or links.
             return;
         }
-        self.edit(|entries| {
+        self.edit(|side| {
+            let entries = &mut side.clusters;
             let start = entries.partition_point(|e| usize::from(e.col) < range.start);
             let end = start + entries[start..].partition_point(|e| usize::from(e.col) < range.end);
             entries.drain(start..end);
+            side.links.remove_range(range);
         });
     }
 
-    /// Drops every cluster.
+    /// Drops every cluster and hyperlink.
     pub(crate) fn clear(&mut self) {
         self.entries = None;
     }
 
-    /// Moves the clusters at columns `from..end` right by `n` (insertion of
-    /// `n` cells at `from` that shifts cells up to `end`), dropping those
-    /// that land at or past `end`. Clusters at `end` and beyond stay.
+    /// Moves the clusters and hyperlinks at columns `from..end` right by
+    /// `n` (insertion of `n` cells at `from` that shifts cells up to
+    /// `end`), dropping those that land at or past `end`. Entries at `end`
+    /// and beyond stay.
     pub(crate) fn shift_right(&mut self, from: usize, n: usize, end: usize) {
-        self.edit(|entries| {
-            entries.retain_mut(|e| {
+        self.edit(|side| {
+            side.links.shift_right(from, n, end);
+            side.clusters.retain_mut(|e| {
                 let col = usize::from(e.col);
                 if col < from || col >= end {
                     return true;
@@ -188,12 +252,14 @@ impl GraphemeTable {
         });
     }
 
-    /// Removes the clusters at columns `at..at + n` and moves the ones
-    /// after them, up to `end`, left by `n` (deletion of `n` cells at `at`
-    /// that shifts cells up to `end`). Clusters at `end` and beyond stay.
+    /// Removes the clusters and hyperlinks at columns `at..at + n` and
+    /// moves the ones after them, up to `end`, left by `n` (deletion of `n`
+    /// cells at `at` that shifts cells up to `end`). Entries at `end` and
+    /// beyond stay.
     pub(crate) fn delete(&mut self, at: usize, n: usize, end: usize) {
-        self.edit(|entries| {
-            entries.retain_mut(|e| {
+        self.edit(|side| {
+            side.links.delete(at, n, end);
+            side.clusters.retain_mut(|e| {
                 let col = usize::from(e.col);
                 if col < at || col >= end {
                     true
@@ -209,35 +275,68 @@ impl GraphemeTable {
     }
 
     /// Removes every cluster and hands them out as `(column, text)` pairs
-    /// by ascending column, without copying the texts. The table is left
-    /// empty and without storage, like a new one.
+    /// by ascending column, without copying the texts. The hyperlinks stay
+    /// (see [`GraphemeTable::take_links`]); a table without any is left
+    /// without storage, like a new one.
     pub(crate) fn take(&mut self) -> impl Iterator<Item = (usize, Box<str>)> + use<> {
-        self.entries
-            .take()
+        let taken = self
+            .entries
+            .as_deref_mut()
+            .map(|side| std::mem::take(&mut side.clusters));
+        self.drop_if_empty();
+        taken
             .into_iter()
-            .flat_map(|entries| *entries)
+            .flatten()
             .map(|e| (usize::from(e.col), e.text))
     }
 
+    /// Removes every hyperlink and hands them out as `(column, link)`
+    /// pairs by ascending column; the clusters stay.
+    pub(crate) fn take_links(&mut self) -> impl Iterator<Item = (usize, Hyperlink)> + use<> {
+        let taken = self.entries.as_deref_mut().map(|side| side.links.take());
+        self.drop_if_empty();
+        taken
+            .into_iter()
+            .flatten()
+            .map(crate::hyperlink::Entry::into_parts)
+    }
+
+    /// Frees the storage when nothing is left in it.
+    fn drop_if_empty(&mut self) {
+        if self
+            .entries
+            .as_deref()
+            .is_some_and(|side| side.clusters.is_empty() && side.links.is_empty())
+        {
+            self.entries = None;
+        }
+    }
+
     /// Trims the storage to the entries: frees an emptied table and shrinks
-    /// a non-empty one to fit. Lines on screen keep their vector as it
-    /// grew, so text that keeps rewriting clusters on the same row does not
-    /// reallocate it each time; a line calls this when it scrolls into
-    /// history, so a scrollback line pays only for the clusters it holds.
+    /// a non-empty one to fit. Lines on screen keep their vectors as they
+    /// grew, so text that keeps rewriting clusters or links on the same row
+    /// does not reallocate them each time; a line calls this when it
+    /// scrolls into history, so a scrollback line pays only for what it
+    /// holds.
     pub(crate) fn compact(&mut self) {
         match &mut self.entries {
-            Some(entries) if entries.is_empty() => self.entries = None,
-            Some(entries) => entries.shrink_to_fit(),
+            Some(side) if side.clusters.is_empty() && side.links.is_empty() => {
+                self.entries = None;
+            }
+            Some(side) => {
+                side.clusters.shrink_to_fit();
+                side.links.shrink_to_fit();
+            }
             None => {}
         }
     }
 
-    /// Runs `f` on the entries, if any. An emptied vector is kept for
-    /// reuse (see [`GraphemeTable::compact`]).
+    /// Runs `f` on the entries, if any. Emptied vectors are kept for reuse
+    /// (see [`GraphemeTable::compact`]).
     #[inline]
-    fn edit(&mut self, f: impl FnOnce(&mut Vec<Entry>)) {
-        if let Some(entries) = self.entries.as_mut() {
-            f(entries);
+    fn edit(&mut self, f: impl FnOnce(&mut Side)) {
+        if let Some(side) = self.entries.as_mut() {
+            f(side);
         }
     }
 }
@@ -283,7 +382,7 @@ mod tests {
         t.remove_range(1..256);
         t.compact();
         assert_eq!(t.len(), 1, "a non-empty table keeps its entries");
-        let capacity = t.entries.as_ref().map_or(0, |e| e.capacity());
+        let capacity = t.entries.as_ref().map_or(0, |e| e.clusters.capacity());
         assert_eq!(capacity, 1, "and shrinks to them");
     }
 

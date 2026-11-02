@@ -9,8 +9,8 @@ triple-click lines, block selection, shift-click), Select All, Copy, and
 command-hover and command-click on URLs. The renderer has drawn a
 `Selection {start, end, kind}` and `OverlayKind::Underline` since #22; the
 core had no selection, no text extraction and no URL detection. This ADR
-covers the core half (part 1 of 3): OSC 8 storage is the next part and the
-Swift gestures the last. The behaviour is pinned by
+covers the core half (part 1 of 3): OSC 8 storage is the next part (ADR
+0026) and the Swift gestures the last. The behaviour is pinned by
 `crates/tessera-app-core/tests/fixtures/selection_spec.txt` (116 rows) and
 the decisions in its `selection_spec.notes.md`, both from the
 spec-researcher, read against iTerm2, kitty, WezTerm, Ghostty, VTE and
@@ -217,7 +217,8 @@ spacers and padding skipped), runs `url_at`, and reports the URL and its
 cells per view row (`(row, cols)`, end exclusive; a wide character's two
 columns included; rows outside the view omitted). The trimmed punctuation
 is outside the span (J34). Opening it, and which schemes may be opened,
-is the frontend's decision (D-OPEN, 30-app).
+is the frontend's decision (D-OPEN, 30-app). A cell that carries an OSC 8
+hyperlink (ADR 0026) reports that link instead, before detection runs.
 
 `App::set_hover(id, Option<Point>)` stores the cell the pointer hovers
 with the link modifier held. Every frame looks the link up again (the
@@ -308,8 +309,10 @@ capture-driven frame check above.
 
 - The Swift view (30-app) builds the gestures, Copy and command-click on
   the C API without a Rust change.
-- OSC 8 hyperlinks (30-links) can add explicit links to `link_at` next to
-  detection; how the two combine is that issue's decision.
+- OSC 8 hyperlinks (ADR 0026) add explicit links to `link_at` next to
+  detection: a cell with an OSC 8 link reports that link (URI, and every
+  cell of the same link entity in the view as the span, which hover
+  underlines whole) and only a cell without one runs detection.
 - Search (#28) can number its matches the same way and reuse the
   decorations path (`OverlayKind::Match`).
 - `WORD_CHARS` and copy-on-select become configuration in #47.

@@ -13,7 +13,8 @@
 //!
 //! Operating system commands (ADR 0022): OSC 0 and 2 set the title, OSC 52
 //! writes the clipboard (never read), OSC 133 puts prompt marks on the
-//! grid's lines, and OSC 7 (working directory) and the OSC 1337 shell
+//! grid's lines, OSC 8 opens and closes hyperlinks on the cells printed
+//! (ADR 0026), and OSC 7 (working directory) and the OSC 1337 shell
 //! integration handshake are forwarded raw as [`Request`]s for the host to
 //! parse with `tessera-shell-integration`, which this crate does not depend
 //! on. See the `osc` module for the caps and the rules.
@@ -45,6 +46,8 @@
 //!   underline;
 //! - insert mode (IRM) off;
 //! - auto-wrap (DECAWM) on, xterm's default; DEC's table 5-9 says off;
+//! - the open OSC 8 hyperlink closed (kitty; the cells already written keep
+//!   theirs, ADR 0026);
 //! - the scroll region (DECSTBM) to the full screen, and left/right
 //!   margin mode (DECLRMM) off with the left and right margins (DECSLRM)
 //!   at the full width;

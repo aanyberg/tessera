@@ -9,8 +9,11 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::damage::{Damage, DamageRows, DamageTracker};
 use crate::grapheme::MAX_CLUSTER_SCALARS;
+use crate::hyperlink::LinkPool;
 use crate::reflow::{self, ScreenMut, Size};
-use crate::{Cell, CellFlags, Line, Point, Scrollback, Style, TabStops, char_width};
+use crate::{
+    Cell, CellFlags, Hyperlink, Line, LinkRefused, Point, Scrollback, Style, TabStops, char_width,
+};
 
 /// Default number of scrolled-off lines a grid retains.
 pub const DEFAULT_MAX_SCROLLBACK: usize = 10_000;
@@ -238,6 +241,11 @@ pub struct Grid {
     /// Lines scrolled off the primary screen into history so far: see
     /// [`Grid::scrollback_pushed`].
     scrollback_pushed: PushedCount,
+    /// The OSC 8 hyperlink cells are written with, if one is open: see
+    /// [`Grid::begin_hyperlink`].
+    active_link: Option<Hyperlink>,
+    /// Interns and counts the hyperlinks of this grid.
+    links: LinkPool,
 }
 
 impl Grid {
@@ -280,6 +288,8 @@ impl Grid {
             scrolled_since_clear: false,
             blanked_at: BlankedAt::default(),
             scrollback_pushed: PushedCount::default(),
+            active_link: None,
+            links: LinkPool::new(),
         }
     }
 
@@ -354,6 +364,60 @@ impl Grid {
     /// Mutable access to the pen, for incremental SGR updates.
     pub fn pen_mut(&mut self) -> &mut Style {
         &mut self.pen
+    }
+
+    /// The hyperlink being written: the one the last
+    /// [`Grid::begin_hyperlink`] opened, until [`Grid::end_hyperlink`], a
+    /// refused link, a screen switch or [`Grid::reset`] closes it.
+    #[must_use]
+    pub fn hyperlink(&self) -> Option<&Hyperlink> {
+        self.active_link.as_ref()
+    }
+
+    /// Opens the OSC 8 hyperlink `uri`, with the optional `id`: cells
+    /// written from now on (by [`Grid::put_char`] and [`Grid::put_cell`])
+    /// belong to it, until it is closed. Replaces the link that was open.
+    ///
+    /// A link with an `id` is the same link ([`Hyperlink::same_link`]) as a
+    /// live one with the same `id` and URI; one without is always a new
+    /// link. An `id` longer than [`crate::MAX_ID_BYTES`] (or empty) is
+    /// dropped and the link kept.
+    ///
+    /// # Errors
+    ///
+    /// A [`LinkRefused`] when the URI is empty or longer than
+    /// [`crate::MAX_URI_BYTES`], or when [`crate::MAX_LIVE_LINKS`] links are
+    /// alive. The link that was open is closed all the same.
+    pub fn begin_hyperlink(&mut self, uri: &str, id: Option<&str>) -> Result<(), LinkRefused> {
+        self.active_link = None;
+        self.active_link = Some(self.links.open(uri, id)?);
+        Ok(())
+    }
+
+    /// Closes the open hyperlink, if any. Cells already written keep theirs.
+    pub fn end_hyperlink(&mut self) {
+        self.active_link = None;
+    }
+
+    /// Replaces the open hyperlink with `link` (a clone of one read from
+    /// the grid), or closes it with `None`. For code that suspends a link
+    /// and puts it back.
+    pub fn set_hyperlink(&mut self, link: Option<Hyperlink>) {
+        self.active_link = link;
+    }
+
+    /// The hyperlink of the cell at `col` of line `index` of the logical
+    /// buffer ([`Grid::logical_line`]), if it has one.
+    #[must_use]
+    pub fn hyperlink_at(&self, index: usize, col: u16) -> Option<&Hyperlink> {
+        self.logical_line(index)?.hyperlink(usize::from(col))
+    }
+
+    /// Hyperlink entities alive: those on the screens, in scrollback and
+    /// the open one. At most [`crate::MAX_LIVE_LINKS`].
+    #[must_use]
+    pub fn live_hyperlinks(&self) -> usize {
+        self.links.live()
     }
 
     /// Visible lines, top to bottom.
@@ -613,12 +677,12 @@ impl Grid {
             ..cell
         };
         let slot = &mut line.cells[usize::from(col)];
-        // A flagless cell has no cluster entry to drop and no other half.
-        if slot.flags.is_empty() {
+        // A flagless cell has no cluster or link entry to drop and no other
+        // half, and without an open link the new cell takes none.
+        if slot.flags.is_empty() && self.active_link.is_none() {
             *slot = cell;
         } else {
-            line.unpair(usize::from(col), pen);
-            line.set(usize::from(col), cell);
+            put_over(line, usize::from(col), cell, pen, self.active_link.as_ref());
         }
         // The line ends at the right margin, or at the last column for a
         // cursor right of the margin; without margins both are the last
@@ -752,10 +816,13 @@ impl Grid {
         if cell.flags.is_empty() {
             return is_simple(cell.ch);
         }
+        if cell.flags == CellFlags::LINK {
+            return is_simple(cell.ch);
+        }
         cell.is_spacer()
-            && col
-                .checked_sub(1)
-                .is_some_and(|base| cells[base].flags == CellFlags::WIDE)
+            && col.checked_sub(1).is_some_and(|base| {
+                cells[base].flags.difference(CellFlags::LINK) == CellFlags::WIDE
+            })
     }
 
     /// Adds `ch` to the cluster `plan` names and resizes the cell.
@@ -781,6 +848,10 @@ impl Grid {
             Ordering::Greater => {
                 line.unpair(base + 1, pen);
                 line.set(base + 1, Cell::spacer(cell.style));
+                if let Some(link) = line.graphemes.link(base).cloned() {
+                    // Both halves of a linked character are linked.
+                    line.set_link(base + 1, link);
+                }
                 line.cells[base].flags |= CellFlags::WIDE;
                 let end = self.line_end_from(u16::try_from(base).unwrap_or(u16::MAX));
                 self.advance_to(base + 2, end);
@@ -824,6 +895,10 @@ impl Grid {
             },
         );
         line.set(col + 1, Cell::spacer(cell.style));
+        if let Some(link) = &self.active_link {
+            line.set_link(col, link.clone());
+            line.set_link(col + 1, link.clone());
+        }
         self.advance_to(col + 2, end);
     }
 
@@ -1427,6 +1502,7 @@ impl Grid {
         };
         self.primary = Some(Box::new(primary));
         self.pending_wrap = false;
+        self.active_link = None;
         self.damage.extend_all();
     }
 
@@ -1496,6 +1572,7 @@ impl Grid {
         }
         self.alt_saved = mem::replace(&mut self.saved, saved);
         self.tabs = tabs;
+        self.active_link = None;
         self.damage.extend_all();
     }
 
@@ -2153,6 +2230,7 @@ impl Grid {
         self.cursor = Point::default();
         self.pending_wrap = false;
         self.pen = Style::DEFAULT;
+        self.active_link = None;
         self.reset_scroll_region();
         self.reset_margins();
         self.origin = false;
@@ -2365,6 +2443,9 @@ fn line_errors(at: LineAt<'_>, line: &Line, cols: u16, errors: &mut Vec<String>)
         if cell.flags == CellFlags::default() {
             continue;
         }
+        if cell.is_link() && line.graphemes.link(col).is_none() {
+            errors.push(format!("{at} col {col}: LINK without a hyperlink"));
+        }
         if cell.is_wide() {
             match cells.get(col + 1) {
                 Some(next) if next.is_spacer() => {
@@ -2415,6 +2496,15 @@ fn line_errors(at: LineAt<'_>, line: &Line, cols: u16, errors: &mut Vec<String>)
             }
             Some(_) => {}
             None => errors.push(format!("{at}: cluster at column {col} past the end")),
+        }
+    }
+    for (col, _) in line.graphemes.links() {
+        match cells.get(col) {
+            Some(cell) if !cell.is_link() => {
+                errors.push(format!("{at} col {col}: hyperlink without LINK"));
+            }
+            Some(_) => {}
+            None => errors.push(format!("{at}: hyperlink at column {col} past the end")),
         }
     }
 }
@@ -2572,9 +2662,22 @@ fn cluster_cannot_take(text: &str, ch: char) -> bool {
             .is_some_and(|last| is_simple(last) || is_combining_diacritic(last))
 }
 
+/// Writes `cell` at `col` over a cell that has flags, or while a link is
+/// `open`: the other half of a wide character goes, the old cluster and link
+/// go, and the cell joins `open`. Out of line, so the flagless write of
+/// plain text stays small.
+#[inline(never)]
+fn put_over(line: &mut Line, col: usize, cell: Cell, pen: Style, open: Option<&Hyperlink>) {
+    line.unpair(col, pen);
+    line.set(col, cell);
+    if let Some(link) = open {
+        line.set_link(col, link.clone());
+    }
+}
+
 /// Copies the cells of columns `span` of line `src` over those of line
-/// `dst` (two different lines), with their cluster text. Wrap flags and
-/// marks are not copied.
+/// `dst` (two different lines), with their cluster text and links. Wrap
+/// flags and marks are not copied.
 fn copy_span(lines: &mut [Line], src: usize, dst: usize, span: std::ops::Range<usize>) {
     let (from, to) = if src < dst {
         let (head, tail) = lines.split_at_mut(dst);
@@ -2588,6 +2691,11 @@ fn copy_span(lines: &mut [Line], src: usize, dst: usize, span: std::ops::Range<u
     for (col, text) in from.graphemes.iter() {
         if span.contains(&col) {
             to.graphemes.set(col, text.into());
+        }
+    }
+    for (col, link) in from.graphemes.links() {
+        if span.contains(&col) {
+            to.graphemes.set_link(col, link.clone());
         }
     }
 }

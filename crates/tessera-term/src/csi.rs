@@ -435,6 +435,9 @@ impl State {
         // The whole pen, faint, strikeout and double underline included:
         // DEC, kitty and WezTerm; xterm keeps those three.
         self.grid.set_pen(Style::DEFAULT);
+        // The open hyperlink (OSC 8) is part of what DECSTR resets (kitty);
+        // the cells already written keep theirs.
+        self.grid.end_hyperlink();
         // Origin mode goes off here, before the saved cursor is reset, so
         // a DECRC lands on the screen's home.
         self.soft_reset_modes();

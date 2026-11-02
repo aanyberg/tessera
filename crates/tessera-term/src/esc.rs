@@ -147,8 +147,8 @@ impl State {
 
     /// DECALN: resets the scroll region and the left and right margins
     /// (xterm `resetMargins`; DECLRMM itself stays), fills every cell with an `E` in
-    /// the default style (the pen is switched to the default for the fill
-    /// and then restored) and homes the cursor.
+    /// the default style (the pen is switched to the default and the open
+    /// hyperlink closed for the fill, and both restored) and homes the cursor.
     ///
     /// Each row is filled on its own, starting from column zero, so no row
     /// is marked soft-wrapped. Like ED 2, the fill replaces every line
@@ -157,7 +157,9 @@ impl State {
     fn screen_alignment(&mut self) {
         let grid = &mut self.grid;
         let pen = grid.pen();
+        let link = grid.hyperlink().cloned();
         grid.set_pen(Style::DEFAULT);
+        grid.end_hyperlink();
         grid.reset_scroll_region();
         grid.reset_margins();
         for row in 0..grid.rows() {
@@ -171,6 +173,7 @@ impl State {
             }
         }
         grid.set_pen(pen);
+        grid.set_hyperlink(link);
         grid.goto(0, 0);
     }
 }

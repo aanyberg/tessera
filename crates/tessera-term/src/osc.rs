@@ -7,6 +7,7 @@
 //! | `OSC 1 ; name` | ignored (the icon name is not modelled) |
 //! | `OSC 52 ; Pc ; base64` | [`Request::SetClipboard`]; `?` (a read) is never answered |
 //! | `OSC 7 ; url` | [`Request::SetCwd`], raw |
+//! | `OSC 8 ; params ; URI` | opens (or, with an empty URI, closes) a hyperlink |
 //! | `OSC 133 ; A/B/C/D[;options]` | a [`Mark`] on the cursor's line |
 //! | `OSC 1337 ; ShellIntegrationVersion=..` | [`Request::ShellIntegrationHandshake`], raw |
 //!
@@ -63,12 +64,39 @@
 //! left as it is. Marks received on the alternate screen are dropped, as
 //! the lines they would land on vanish when the program leaves it.
 //!
+//! # Hyperlinks
+//!
+//! `OSC 8 ; params ; URI` opens a hyperlink on the grid
+//! ([`Grid::begin_hyperlink`](tessera_grid::Grid::begin_hyperlink)): the
+//! cells printed from then on belong to it, until `OSC 8 ; ; ST` closes it
+//! (ADR 0026). `params` is a `:`-separated list of `key=value` pairs; only
+//! `id` is read (a non-empty id; the last one wins), anything else,
+//! including a piece without `=`, is ignored and the link still opens.
+//! The URI is everything after the second `;`, further semicolons
+//! included, and must be UTF-8.
+//!
+//! - A missing second `;` and a URI that is not UTF-8 are ignored: the open
+//!   link stays as it was. A payload that fills all [`MAX_OSC_PARAMS`]
+//!   pieces (the URI may have been cut) closes it instead, since a cut URI
+//!   is another URI.
+//! - An empty URI closes the open link, whatever the params.
+//! - A URI over [`tessera_grid::MAX_URI_BYTES`] closes the open link and opens none; an id
+//!   over [`tessera_grid::MAX_ID_BYTES`] is dropped and the link kept without it.
+//! - Past [`tessera_grid::MAX_LIVE_LINKS`] links alive no new one is opened, and the open
+//!   link is closed; the first refusal is logged at warn level.
+//!
+//! A link never ends by itself: RIS, DECSTR and switching to or from the
+//! alternate screen close the open one, and cells already written keep
+//! theirs. Only cells written while a link is open carry it; erasing or
+//! overwriting a cell drops its link. The text is not underlined: drawing
+//! a link is the host's business (hover, ADR 0026).
+//!
 //! [`Action::Osc`]: tessera_vt::Action::Osc
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use tessera_grid::Mark;
-use tracing::trace;
+use tessera_grid::{LinkRefused, MAX_LIVE_LINKS, Mark};
+use tracing::{trace, warn};
 
 use crate::{MAX_CLIPBOARD_BYTES, MAX_FORWARDED_OSC_BYTES, MAX_TITLE_BYTES, Request, State};
 
@@ -100,6 +128,7 @@ impl State {
                     self.pending.push(Request::SetCwd(payload));
                 }
             }
+            b"8" => self.osc_hyperlink(args, cut),
             b"133" => self.osc_mark(args),
             b"1337" => {
                 let handshake = args
@@ -171,6 +200,47 @@ impl State {
             self.pending.push(Request::SetClipboard(text));
         } else {
             trace!("OSC 52 text that is not UTF-8 dropped");
+        }
+    }
+
+    /// `OSC 8`: see "Hyperlinks" in the module documentation.
+    fn osc_hyperlink(&mut self, args: &[Vec<u8>], cut: bool) {
+        let Some((params, uri)) = args.split_first() else {
+            trace!("OSC 8 without `;` ignored");
+            return;
+        };
+        if uri.is_empty() {
+            trace!("OSC 8 without a second `;` ignored");
+            return;
+        }
+        if cut {
+            trace!("OSC 8 that may have been cut closes the link");
+            self.grid.end_hyperlink();
+            return;
+        }
+        let uri = uri.join(&b';');
+        let Ok(uri) = std::str::from_utf8(&uri) else {
+            trace!("OSC 8 with a URI that is not UTF-8 ignored");
+            return;
+        };
+        if uri.is_empty() {
+            self.grid.end_hyperlink();
+            return;
+        }
+        let id = params
+            .split(|&b| b == b':')
+            .filter_map(|piece| piece.strip_prefix(b"id="))
+            .rfind(|id| !id.is_empty())
+            .and_then(|id| std::str::from_utf8(id).ok());
+        match self.grid.begin_hyperlink(uri, id) {
+            Ok(()) => {}
+            Err(LinkRefused::TableFull { first: true }) => {
+                warn!(
+                    max = MAX_LIVE_LINKS,
+                    "hyperlink table full: new links are ignored"
+                );
+            }
+            Err(refused) => trace!(?refused, "OSC 8 link refused"),
         }
     }
 

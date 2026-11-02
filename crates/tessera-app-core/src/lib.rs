@@ -1122,10 +1122,16 @@ impl App {
             .with_selection(|selection, term, _| selection.text(term.grid())))
     }
 
-    /// The URL detected in session `id`'s text at view-relative cell `at`
-    /// (the view's scroll offset honoured), with the cells it covers on
-    /// each row the view shows, or `None` when there is no URL there or
-    /// `at` is outside the grid. Detection follows rules U1 to U9 of the
+    /// The link at view-relative cell `at` of session `id` (the view's
+    /// scroll offset honoured), with the cells it covers on each row the
+    /// view shows, or `None` when there is none there or `at` is outside
+    /// the grid.
+    ///
+    /// A cell that belongs to an OSC 8 hyperlink (ADR 0026) gives that
+    /// link: its URI as the program sent it, whatever the text says, and
+    /// every cell of the same link in the view (cells of one `id` that are
+    /// not adjacent are separate span entries). Any other cell gives the
+    /// URL detected in the text. Detection follows rules U1 to U9 of the
     /// [`url`] module over the logical line, so a URL continues across
     /// soft wraps; trailing punctuation is outside it.
     ///
@@ -1144,10 +1150,11 @@ impl App {
 
     /// Sets the cell the pointer hovers in session `id`'s view with the link
     /// modifier held (view-relative), or `None` when it hovers nothing:
-    /// from the next frame on, the URL under it ([`App::link_at`]) is
-    /// underlined, one underline per row it covers, for as long as the
-    /// hover is set. The URL is looked up again every frame, so output
-    /// that moves or changes it moves the underline.
+    /// from the next frame on, the link under it ([`App::link_at`]) is
+    /// underlined, one underline per span entry (the whole OSC 8 link, or
+    /// the detected URL), for as long as the hover is set. The link is
+    /// looked up again every frame, so output that moves or changes it
+    /// moves the underline.
     ///
     /// # Errors
     ///
