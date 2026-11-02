@@ -83,7 +83,9 @@ the fixture; the milestone lead accepted them on 2026-10-31.
   Tessera implements is advertised: 22 (ANSI colour). Never 3, 4 (no
   ReGIS/Sixel), 9 (NRCS), 21, 28 or 52 (tmux would then try to read the
   clipboard); a feature number is added by the issue that implements it.
-  `ESC Z` (DECID) answers like DA1.
+  `ESC Z` (DECID) answers like DA1. *Amended by #112 (2026-11-02):* levels 2
+  and up list 9 (NRCS) too, `CSI ? 6L ; 9 ; 22 c`, and from level 4 `9 ; 21 ;
+  22` (21: ADR 0028), because SCS and DECNRCM exist (ADR 0033).
 - **D-L5**: level 5 answers as a VT525: DA1 `CSI ? 65 ; 22 c`, DECRQSS
   `" p` → `65;Pc" p`. DA2 does not follow the level.
 - DA3 (`CSI = c`) answers `DCS ! | 00000000 ST` from level 4 (xterm).

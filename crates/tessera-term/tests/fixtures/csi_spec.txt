@@ -6857,6 +6857,49 @@ scrollback: len=0
 needs: ESC[?5h DECSCNM is stored only; CUP 23;1, EL 0, text. Fed on a fresh terminal (the SGR pattern of m2_13 above it is #7's screen).
 source: vttest main.c tst_screen 'Light background' prompt; capture: vttest_capture/m2_14.bin
 
+### V2S15_save_restore_cursor_charsets
+size: 24x80
+step: feed \x1b[?5l\x1b[2J\x1b[8;12Hnormal\x1b[8;24Hbold\x1b[8;36Hunderscored\x1b[8;48Hblinking\x1b[8;60Hreversed\x1b[10;1Hstars:\x1b[12;1Hline:\x1b[14;1Hx'es:\x1b[16;1Hdiamonds:
+step: feed \x1b[10;12H\x1b[;0m\x1b(B\x1b)B\x0f*****\x1b7\x1b[1;1H\x1b[m\x1b(B\x1b)B\x0fA\x1b8*****\x1b[10;24H\x1b[;1m\x1b(B\x1b)B\x0f*****\x1b7\x1b[1;2H\x1b[m\x1b(B\x1b)B\x0fA\x1b8*****\x1b[10;36H\x1b[;4m\x1b(B\x1b)B\x0f*****\x1b7\x1b[1;3H\x1b[m\x1b(B\x1b)B\x0fA\x1b8*****\x1b[10;48H\x1b[;5m\x1b(B\x1b)B\x0f*****\x1b7\x1b[1;4H\x1b[m\x1b(B\x1b)B\x0fA\x1b8*****\x1b[10;60H\x1b[;7m\x1b(B\x1b)B\x0f*****\x1b7\x1b[1;5H\x1b[m\x1b(B\x1b)B\x0fA\x1b8*****
+step: feed \x1b[12;12H\x1b[;0m\x1b(0\x1b)B\x0fqqqqq\x1b7\x1b[2;1H\x1b[m\x1b(B\x1b)B\x0fA\x1b8qqqqq\x1b[12;24H\x1b[;1m\x1b(0\x1b)B\x0fqqqqq\x1b7\x1b[2;2H\x1b[m\x1b(B\x1b)B\x0fA\x1b8qqqqq\x1b[12;36H\x1b[;4m\x1b(0\x1b)B\x0fqqqqq\x1b7\x1b[2;3H\x1b[m\x1b(B\x1b)B\x0fA\x1b8qqqqq\x1b[12;48H\x1b[;5m\x1b(0\x1b)B\x0fqqqqq\x1b7\x1b[2;4H\x1b[m\x1b(B\x1b)B\x0fA\x1b8qqqqq\x1b[12;60H\x1b[;7m\x1b(0\x1b)B\x0fqqqqq\x1b7\x1b[2;5H\x1b[m\x1b(B\x1b)B\x0fA\x1b8qqqqq
+step: feed \x1b[14;12H\x1b[;0m\x1b(B\x1b)B\x0fxxxxx\x1b7\x1b[3;1H\x1b[m\x1b(B\x1b)B\x0fA\x1b8xxxxx\x1b[14;24H\x1b[;1m\x1b(B\x1b)B\x0fxxxxx\x1b7\x1b[3;2H\x1b[m\x1b(B\x1b)B\x0fA\x1b8xxxxx\x1b[14;36H\x1b[;4m\x1b(B\x1b)B\x0fxxxxx\x1b7\x1b[3;3H\x1b[m\x1b(B\x1b)B\x0fA\x1b8xxxxx\x1b[14;48H\x1b[;5m\x1b(B\x1b)B\x0fxxxxx\x1b7\x1b[3;4H\x1b[m\x1b(B\x1b)B\x0fA\x1b8xxxxx\x1b[14;60H\x1b[;7m\x1b(B\x1b)B\x0fxxxxx\x1b7\x1b[3;5H\x1b[m\x1b(B\x1b)B\x0fA\x1b8xxxxx
+step: feed \x1b[16;12H\x1b[;0m\x1b(0\x1b)B\x0f`````\x1b7\x1b[4;1H\x1b[m\x1b(B\x1b)B\x0fA\x1b8`````\x1b[16;24H\x1b[;1m\x1b(0\x1b)B\x0f`````\x1b7\x1b[4;2H\x1b[m\x1b(B\x1b)B\x0fA\x1b8`````\x1b[16;36H\x1b[;4m\x1b(0\x1b)B\x0f`````\x1b7\x1b[4;3H\x1b[m\x1b(B\x1b)B\x0fA\x1b8`````\x1b[16;48H\x1b[;5m\x1b(0\x1b)B\x0f`````\x1b7\x1b[4;4H\x1b[m\x1b(B\x1b)B\x0fA\x1b8`````\x1b[16;60H\x1b[;7m\x1b(0\x1b)B\x0f`````\x1b7\x1b[4;5H\x1b[m\x1b(B\x1b)B\x0fA\x1b8`````
+step: feed \x1b[0m\x1b(B\x1b)B\x0f\x1b[21;1HTest of the SAVE/RESTORE CURSOR feature. There should\r\nbe ten characters of each flavour, and a rectangle\r\nof 5 x 4 A's filling the top left of the screen.\r\n
+cite: https://invisible-island.net/vttest/ (vttest 2.7 20251205, `brew install vttest`; source https://invisible-island.net/archives/vttest/vttest.tar.gz)
+note: tst_screen 'Test of the SAVE/RESTORE CURSOR feature' (menu 2 screen 15). Lifted from the deferred list by #112. The byte stream is built from vttest's main.c and esc.c/charsets.c (scs_normal = ESC ( B, ESC ) B, SI; scs_graphics = ESC ( 0, ESC ) B, SI), not captured under a pty; the expected screen is derived independently (ten characters of each of four flavours per column group, a 5 x 4 rectangle of A's) and the attributes the screen is really about (SGR) are checked by sgr_spec.txt Part C.
+flags: vttest in-scope
+screen:
+>AAAAA
+>AAAAA
+>AAAAA
+>AAAAA
+>
+>
+>
+>           normal      bold        underscored blinking    reversed
+>
+>stars:     **********  **********  **********  **********  **********
+>
+>line:      ──────────  ──────────  ──────────  ──────────  ──────────
+>
+>x'es:      xxxxxxxxxx  xxxxxxxxxx  xxxxxxxxxx  xxxxxxxxxx  xxxxxxxxxx
+>
+>diamonds:  ◆◆◆◆◆◆◆◆◆◆  ◆◆◆◆◆◆◆◆◆◆  ◆◆◆◆◆◆◆◆◆◆  ◆◆◆◆◆◆◆◆◆◆  ◆◆◆◆◆◆◆◆◆◆
+>
+>
+>
+>
+>Test of the SAVE/RESTORE CURSOR feature. There should
+>be ten characters of each flavour, and a rectangle
+>of 5 x 4 A's filling the top left of the screen.
+> |
+cursor: (23,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+needs: SGR + DECSC/DECRC + SCS saved and restored together: DECRC after `ESC ( 0` must bring the line-drawing set back (rows 1..4 of the screen: q and ` print as ─ and ◆ only if G0 is special after DECRC), and the `A` printed in between under ESC ( B must not leak.
+source: vttest main.c tst_screen (SAVE/RESTORE CURSOR part), charsets.c scs_normal/scs_graphics
+
 # ---------------------------------------------------------------------------- DEFERRED vttest screens (NOT cases; not parsed by parse_fixture)
 # Streams: vttest_capture/m<menu>_<NN>.esc.txt. #8 lifted the screens that need only DECOM, DECAWM,
 # DECSCNM (stored) and DECCOLM (ignored without DECSET 40); with c132 off the 132-column screens below
@@ -6876,9 +6919,6 @@ source: vttest main.c tst_screen 'Light background' prompt; capture: vttest_capt
 #
 #### DEFERRED V2S13_sgr_pattern (m2_13) -> #7
 #   needs: SGR 0/1/4/5/7 combinations, ESC[?5 DECSCNM; text is plain ASCII but attributes are the point
-#
-#### DEFERRED V2S15_save_restore_cursor_charsets (m2_15) -> #112 (SCS)
-#   needs: SGR attributes and SCS graphics (ESC ( 0 / ESC ( B) saved/restored with DECSC/DECRC; the DECSC/DECRC part itself is in #6 (rows SC01..SC09)
 #
 #### DEFERRED V8S6_double_width_staggered_dch (m8_06) -> DECDWL double-width lines (no issue yet)
 #   needs: ESC#6 DECDWL double-width lines + DCH; the 80-column text cannot be represented without double-width cells

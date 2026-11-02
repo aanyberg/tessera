@@ -3,8 +3,8 @@
 //!
 //! | Sequence | Name | Effect |
 //! |---|---|---|
-//! | `ESC 7` | DECSC | save cursor, pen, pending wrap and origin mode |
-//! | `ESC 8` | DECRC | restore them (home, default pen and origin mode off without a save) |
+//! | `ESC 7` | DECSC | save cursor, pen, pending wrap, origin mode and the character sets (G0 to G3, GL, GR) |
+//! | `ESC 8` | DECRC | restore them (home, default pen, origin mode off and default sets without a save) |
 //! | `ESC D` | IND | down one row, scrolling at the bottom margin |
 //! | `ESC E` | NEL | IND plus carriage return |
 //! | `ESC H` | HTS | set a tab stop at the cursor column |
@@ -18,6 +18,14 @@
 //! | `ESC Z` | DECID | identify: the DA1 reply (see the `reports` module) |
 //! | `ESC SP F` | S7C1T | 7-bit replies, C1 controls in the input ignored (level 2 and up) |
 //! | `ESC SP G` | S8C1T | 8-bit replies, C1 controls in the input honoured (level 2 and up) |
+//! | `ESC ( F`, `ESC ) F`, `ESC * F`, `ESC + F` | SCS | designate a 94-character set into G0 to G3 |
+//! | `ESC - F`, `ESC . F`, `ESC / F` | SCS | designate a 96-character set into G1 to G3 (level 3 and up) |
+//! | `ESC n`, `ESC o` | LS2, LS3 | invoke G2 or G3 as GL (level 2 and up) |
+//! | `ESC ~`, `ESC }`, `ESC \|` | LS1R, LS2R, LS3R | invoke G1, G2 or G3 as GR (level 2 and up) |
+//! | `ESC N`, `ESC O` | SS2, SS3 | G2 or G3 for the next printed character (level 2 and up) |
+//!
+//! SO and SI (LS1, LS0) are C0 controls, see the `control` module; the
+//! sets, the levels and DECNRCM are in the `charset` module.
 //!
 //! Any other escape sequence is ignored and logged at trace level. Expected
 //! behaviour is pinned by `tests/fixtures/csi_spec.txt`.
@@ -28,16 +36,15 @@ use tessera_grid::Style;
 use tracing::trace;
 
 use crate::State;
+use crate::charset::{self, Charsets};
 
 impl State {
     /// Applies one escape sequence. See the module documentation for the
     /// sequences handled; anything else is logged and ignored.
     pub(crate) fn esc(&mut self, intermediates: &[u8], byte: u8) {
         match (intermediates, byte) {
-            // Character sets are not saved yet: #112 extends the saved
-            // state when it adds SCS.
-            ([], b'7') => self.grid.save_cursor(),
-            ([], b'8') => self.grid.restore_cursor(),
+            ([], b'7') => self.save_cursor(),
+            ([], b'8') => self.restore_cursor(),
             ([], b'D') => self.grid.line_feed(),
             // Index first, then the carriage return (xterm `CASE_NEL`): the
             // index scrolls only for a cursor between the left and right
@@ -65,12 +72,58 @@ impl State {
             // swallows the next byte there, which Tessera does not copy.
             ([b' '], b'F') if self.conformance_level >= 2 => self.c1_8bit_replies = false,
             ([b' '], b'G') if self.conformance_level >= 2 => self.c1_8bit_replies = true,
-            _ => trace!(?intermediates, byte = ?char::from(byte), "ESC ignored"),
+            // Locking and single shifts, VT220 and up (xterm: `ansi_level >
+            // 2`, `vtXX_level > 1`).
+            ([], b'n') if self.conformance_level >= 2 => self.charsets.shift_left(2),
+            ([], b'o') if self.conformance_level >= 2 => self.charsets.shift_left(3),
+            ([], b'~') if self.conformance_level >= 2 => self.charsets.shift_right(1),
+            ([], b'}') if self.conformance_level >= 2 => self.charsets.shift_right(2),
+            ([], b'|') if self.conformance_level >= 2 => self.charsets.shift_right(3),
+            ([], b'N') if self.conformance_level >= 2 => self.charsets.single_shift(2),
+            ([], b'O') if self.conformance_level >= 2 => self.charsets.single_shift(3),
+            _ => self.select_charset(intermediates, byte),
         }
     }
 
-    /// RIS: the grid's reset plus what xterm also resets: the scrollback
-    /// and every mode (see the `modes` module: all to their defaults, both
+    /// SCS: designates a set into G0 to G3 when the sequence is one xterm
+    /// acts on at this level (see [`charset::designation`]), else logs it.
+    fn select_charset(&mut self, intermediates: &[u8], byte: u8) {
+        let level = self.conformance_level;
+        let Some((g, set)) = charset::designation(level, self.modes.nrcs, intermediates, byte)
+        else {
+            trace!(?intermediates, byte = ?char::from(byte), "ESC ignored");
+            return;
+        };
+        self.charsets.designate(g, set);
+    }
+
+    /// DECSC (`ESC 7`, `CSI s` without DECLRMM, DECSET 1048 and the first
+    /// half of 1049): the grid's saved cursor and, in the active screen's
+    /// slot, the character sets.
+    pub(crate) fn save_cursor(&mut self) {
+        self.grid.save_cursor();
+        let slot = usize::from(self.grid.is_alt_screen());
+        self.saved_charsets[slot] = Some(self.charsets.saved());
+    }
+
+    /// DECRC: the grid's, then the character sets saved for the active
+    /// screen.
+    pub(crate) fn restore_cursor(&mut self) {
+        self.grid.restore_cursor();
+        self.restore_charsets(usize::from(self.grid.is_alt_screen()));
+    }
+
+    /// Restores the sets saved in `slot`; without a save, as xterm, the
+    /// default sets (and no single shift).
+    pub(crate) fn restore_charsets(&mut self, slot: usize) {
+        match self.saved_charsets[slot] {
+            Some(saved) => self.charsets.restore(saved),
+            None => self.charsets.reset(),
+        }
+    }
+
+    /// RIS: the grid's reset plus what xterm also resets: the scrollback,
+    /// the character sets and every mode (see the `modes` module: all to their defaults, both
     /// kitty keyboard stacks emptied, 132-column mode left with a request for
     /// 80 columns) and replies back to 7-bit C1 controls (xterm's
     /// `show_8bit_control(False)`). The DECSCL conformance level is kept:
@@ -85,6 +138,11 @@ impl State {
         // DECSET 12), and the blink record is cleared.
         self.drop_cursor_overrides();
         self.c1_8bit_replies = false;
+        // The sets are the default, and so is the primary screen's saved
+        // copy (xterm saves the cursor at the end of a full reset); the
+        // alternate screen's slot has never been saved to.
+        self.charsets.reset();
+        self.saved_charsets = [Some(Charsets::default().saved()), None];
     }
 
     /// DECALN: resets the scroll region and the left and right margins
