@@ -7,7 +7,7 @@
 //! |---|---|---|
 //! | `A` `B` `C` `D` | CUU CUD CUF CUB | move the cursor; CUU/CUD stop at the scroll margins |
 //! | `E` `F` | CNL CPL | CUD / CUU, then column zero |
-//! | `G` `` ` `` | CHA HPA | absolute column |
+//! | `G` `` ` `` | CHA HPA | absolute column (from the left margin in origin mode) |
 //! | `d` | VPA | absolute row (from the top margin in origin mode) |
 //! | `H` `f` | CUP HVP | absolute position (row from the top margin in origin mode) |
 //! | `a` `e` | HPR VPR | relative position: right / down, clamped to the screen (VPR ignores the scroll region unless origin mode is on) |
@@ -21,7 +21,8 @@
 //! | `g` | TBC | clear tab stops |
 //! | `m` | SGR | set the pen's colours and attributes (see the `sgr` module) |
 //! | `r` | DECSTBM | set the scroll region |
-//! | `s` `u` | SCOSC SCORC | save / restore the cursor exactly like DECSC / DECRC, only without parameters |
+//! | `s` | DECSLRM / SCOSC | while DECLRMM (`?69`) is on: set the left and right margins; else save the cursor like DECSC, only without parameters |
+//! | `u` | SCORC | restore the cursor exactly like DECRC, only without parameters |
 //! | `c` `n` | DA1 DSR | device attributes, status and cursor position reports (see the `reports` module) |
 //! | `t` | XTWINOPS | size reports and the title stack; window actions are ignored (see the `reports` module) |
 //!
@@ -39,14 +40,17 @@
 //! | `CSI ? Ps n` | DEC DSR | DEC status reports |
 //! | `CSI Ps $ p` `CSI ? Ps $ p` | DECRQM | mode reports, one per query |
 //! | `CSI ? u` | kitty keyboard | the flags query |
+//! | `CSI Ps ' }` `CSI Ps ' ~` | DECIC DECDC | insert / delete `Ps` columns at the cursor, up to the right margin, in every row of the scroll region (level 4 and up) |
 //! | `CSI Pl ; Pc " p` | DECSCL | select conformance level: for `Pl` 61..=65, the DECSTR soft reset, then level `Pl - 60` and the C1 reply mode from `Pc`; any other `Pl` does nothing |
 //!
 //! Parameters follow xterm: an absent parameter and an explicit `0` both
 //! mean the default, positions are 1-based and clamp to the screen, and
 //! every count saturates. In origin mode (DECOM, `CSI ? 6 h`) CUP, HVP,
-//! VPA and VPR count rows from the top margin and stop at the bottom one
-//! (xterm `CursorSet`); columns stay absolute, as there are no left and
-//! right margins yet (#97). Nothing here can panic on hostile input.
+//! VPA, VPR, CHA, HPA and HPR count rows from the top margin and columns
+//! from the left one and stop at the bottom and right ones (xterm
+//! `CursorSet`). Left and right margins (DECSLRM, ADR 0028) also stop CUB,
+//! CUF and the tabs, and confine ICH, DCH, IL, DL, SU and SD; ED, EL and
+//! ECH ignore them. Nothing here can panic on hostile input.
 //!
 //! REP is not capped, as in xterm and Alacritty: a count up to 65535 costs
 //! that many prints, each O(1) except in insert mode, where each one shifts
@@ -68,7 +72,8 @@
 //! returns to ground as after any sequence and does not copy that. The parser
 //! reports `CSI s` and `CSI 0 s` alike, so the explicit zero saves too,
 //! where xterm ignores it. `CSI s` is SCOSC only while left/right margin
-//! mode (DECLRMM, `?69`, #97) is off; until #97 it always is. The kitty
+//! mode (DECLRMM, `?69`) is off; while it is on, `CSI s` with or without
+//! parameters is DECSLRM, and the bare form resets the margins. The kitty
 //! keyboard sequences `CSI ? u`, `CSI > u`, `CSI < u` and `CSI = u` carry a
 //! private marker and never reach SCORC.
 //!
@@ -91,7 +96,7 @@
 //! Everything else (an unassigned final, any other private marker and
 //! final pair such as `CSI > 25 h` or `CSI ? 5 m`, any other intermediate
 //! such as `$` with a final other than `p`, `SP` with a final other than
-//! `q` and `"` with one other than `p`, a private marker before `SP q`,
+//! `q`, `'` with one other than `}` and `~`, and `"` with one other than `p`, a private marker before `SP q`,
 //! and the xterm extension SL/SR that is not in scope) is ignored and
 //! logged at trace level. The parser hands over private markers as
 //! intermediates, so one match covers both.
@@ -99,12 +104,13 @@
 //! Expected behaviour per sequence and edge case is pinned by
 //! `tests/fixtures/csi_spec.txt`, for DECSTR by
 //! `tests/fixtures/decstr_spec.txt`, for the modes by
-//! `tests/fixtures/modes_spec.txt` and for DECSCUSR by
-//! `tests/fixtures/decscusr_spec.txt`.
+//! `tests/fixtures/modes_spec.txt`, for DECSCUSR by
+//! `tests/fixtures/decscusr_spec.txt` and for the margins by
+//! `tests/fixtures/margins_spec.txt`.
 //!
 //! [`Action::Csi`]: tessera_vt::Action::Csi
 
-use tessera_grid::{Cell, EraseDisplay, EraseLine, Style};
+use tessera_grid::{Cell, EraseDisplay, EraseLine, Point, ReverseWrap, Style};
 use tracing::trace;
 
 use crate::{CursorShape, State};
@@ -170,7 +176,10 @@ impl State {
             'A' => grid.cursor_up(count(params, 0)),
             'B' => grid.cursor_down(count(params, 0)),
             'C' => grid.cursor_right(count(params, 0)),
-            'D' => grid.cursor_left(count(params, 0)),
+            'D' => {
+                let wrap = self.reverse_wrap();
+                self.grid.cursor_back(count(params, 0), wrap);
+            }
             'E' => {
                 grid.cursor_down(count(params, 0));
                 grid.carriage_return();
@@ -179,19 +188,32 @@ impl State {
                 grid.cursor_up(count(params, 0));
                 grid.carriage_return();
             }
-            'G' | '`' => grid.goto_col(count(params, 0) - 1),
+            'G' | '`' => grid.goto_col_origin(count(params, 0) - 1),
             'd' => grid.goto_row_origin(count(params, 0) - 1),
             'H' | 'f' => grid.goto_origin(count(params, 0) - 1, count(params, 1) - 1),
-            // HPR and VPR: xterm `CursorSet`, clamped to the screen rather
-            // than to the scroll margins (to the region in origin mode).
-            // `goto_origin` clamps and clears the pending wrap.
-            'a' => {
-                let col = grid.cursor().col.saturating_add(count(params, 0));
-                grid.goto_origin(grid.origin_row(), col);
-            }
-            'e' => {
-                let row = grid.origin_row().saturating_add(count(params, 0));
-                grid.goto_origin(row, grid.cursor().col);
+            // HPR and VPR: xterm `CursorSet(CursorRow, CursorCol + n)` and
+            // `CursorSet(CursorRow + n, CursorCol)`, clamped to the screen
+            // rather than to the scroll margins (to the margins in origin
+            // mode). `CursorRow` and `CursorCol` may be negative there (a
+            // cursor above or left of the margins), so the moved coordinate
+            // is the absolute one plus `n` and the other one is kept, both
+            // only clamped to the bottom and right margins. `goto` clears
+            // the pending wrap.
+            'a' | 'e' => {
+                let n = count(params, 0);
+                let Point { row, col } = grid.cursor();
+                let (row, col) = if action == 'a' {
+                    (row, col.saturating_add(n))
+                } else {
+                    (row.saturating_add(n), col)
+                };
+                if grid.origin_mode() {
+                    let bottom = grid.scroll_region().bottom;
+                    let right = grid.margins().right;
+                    grid.goto(row.min(bottom), col.min(right));
+                } else {
+                    grid.goto(row, col);
+                }
             }
             // With a wrap pending the cursor sits on the last column and no
             // stop lies ahead: xterm leaves the wrap armed, as for HT.
@@ -220,7 +242,13 @@ impl State {
             'r' => self.set_scroll_region(params),
             'h' | 'l' if subparams != 0 => trace!(?params, "SM/RM with sub-parameters ignored"),
             'h' | 'l' => self.set_ansi_modes(params, action == 'h'),
-            // SCOSC. #97: DECSLRM instead while DECLRMM (?69) is set.
+            // DECSLRM while DECLRMM (?69) is set, else SCOSC (xterm
+            // `CASE_ANSI_SC`).
+            // Sub-parameters void it, as they void SCOSC's other forms.
+            's' if self.modes.left_right_margins && subparams != 0 => {
+                trace!(?params, "DECSLRM with sub-parameters ignored");
+            }
+            's' if self.modes.left_right_margins => self.set_left_right_margins(params),
             's' if no_params(params) => grid.save_cursor(),
             // SCORC: restores what DECRC restores.
             'u' if no_params(params) => grid.restore_cursor(),
@@ -273,6 +301,14 @@ impl State {
             (b"?$", 'p') => self.request_mode(params, true),
             (b"?", 'h' | 'l') => self.set_dec_modes(params, action == 'h'),
             (b" ", 'q') => self.set_cursor_style(selector(params, 0)),
+            // DECIC and DECDC, VT420 and up (xterm `CASE_DECIC`/`DECDC`).
+            (b"'", '}' | '~') if self.conformance_level >= 4 => {
+                if action == '}' {
+                    self.grid.insert_columns(count(params, 0));
+                } else {
+                    self.grid.delete_columns(count(params, 0));
+                }
+            }
             (b">", 'm') => self.set_key_modifiers(params),
             ([marker @ (b'>' | b'<' | b'=')], 'u') => self.kitty_keyboard(*marker, params),
             _ => trace!(
@@ -321,13 +357,13 @@ impl State {
         self.grid.erase_in_line(mode);
     }
 
-    /// IL (`L`) and DL (`M`). Inside the scroll region they edit `n` lines
-    /// and move the cursor to column zero (xterm `InsertLine` /
-    /// `DeleteLine`). Outside it they do nothing, not even disarm a pending
-    /// wrap.
+    /// IL (`L`) and DL (`M`). Inside the scroll region and between the
+    /// left and right margins they edit `n` lines and move the cursor to
+    /// the left margin (xterm `InsertLine` / `DeleteLine`). Outside them
+    /// they do nothing, not even disarm a pending wrap.
     fn edit_lines(&mut self, action: char, n: u16) {
         let grid = &mut self.grid;
-        if !grid.scroll_region().contains(grid.cursor().row) {
+        if !grid.can_edit_lines() {
             return;
         }
         if action == 'L' {
@@ -389,8 +425,9 @@ impl State {
 
     /// DECSTR (`CSI ! p`): the soft reset described in the crate
     /// documentation. Resets the pen, the modes in the `modes` module's
-    /// list (insert mode, auto-wrap, origin mode, the cursor, the keyboard
-    /// modes, …), the scroll region and the saved cursor; keeps the
+    /// list (insert mode, auto-wrap, origin mode, DECLRMM with the left and
+    /// right margins, reverse wraparound, the cursor, the keyboard modes,
+    /// …), the scroll region and the saved cursor; keeps the
     /// screen, the scrollback, the cursor position, a pending wrap and the
     /// tab stops. REP's remembered character is cleared by
     /// [`State::apply`], as after any sequence.
@@ -411,11 +448,11 @@ impl State {
         // xterm's `ReallyReset` common part does the same for DECSTR, DECSCL
         // and RIS (ADR 0020).
         self.drop_cursor_overrides();
-        // #112, #95, #97, #10: reset here once the state exists:
-        // G0-G3/GL/GR and DECNRCM to their defaults (SCS, #112), DECSCA off
-        // (#95), DECLRMM off with full left/right margins and reverse wrap
-        // (?45) to its default (#97), and the OSC 4 palette to the theme
-        // (xterm's ResetAnsiColorRequest, #10).
+        // #112, #95, #10: reset here once the state exists: G0-G3/GL/GR
+        // and DECNRCM to their defaults (SCS, #112), DECSCA off (#95), and
+        // the OSC 4 palette to the theme (xterm's ResetAnsiColorRequest,
+        // #10). DECLRMM, the margins and reverse wraparound are reset with
+        // the modes above.
     }
 
     /// DECSCUSR (`CSI Ps SP q`) with its first parameter `ps`: 1 and 2 a
@@ -475,6 +512,44 @@ impl State {
             (1, _) | (_, 1) => self.c1_8bit_replies = false,
             (_, 0 | 2) => self.c1_8bit_replies = true,
             (_, pc) => trace!(pc, "DECSCL C1 mode unknown, kept"),
+        }
+    }
+
+    /// DECSLRM (`CSI Pl ; Pr s` while DECLRMM is set), xterm's
+    /// `CASE_ANSI_SC`. The left margin defaults to the first column; the
+    /// right margin defaults to the last column and so does any right
+    /// margin beyond it. A pair whose right margin is not right of its left
+    /// one is ignored entirely: the old margins stay and the cursor does
+    /// not move. A valid pair homes the cursor (to the margins' top-left
+    /// corner in origin mode). The bare `CSI s` is DECSLRM with both
+    /// defaults, which resets the margins (tmux's `Clmg`, vttest).
+    fn set_left_right_margins(&mut self, params: &[u16]) {
+        let cols = self.grid.cols();
+        let left = count(params, 0);
+        let right = match param_or(params, 1, cols) {
+            right if right > cols => cols,
+            right => right,
+        };
+        if right <= left {
+            trace!(left, right, "DECSLRM with fewer than two columns ignored");
+            return;
+        }
+        self.grid.set_margins(left - 1, right - 1);
+        self.grid.goto_origin(0, 0);
+    }
+
+    /// The reverse wraparound BS, CUB and DECBI apply: DECSET 1045 before
+    /// 45, both only with auto-wrap on (xterm `CursorBack`'s `WRAP_MASK`).
+    pub(crate) fn reverse_wrap(&self) -> ReverseWrap {
+        let modes = &self.modes;
+        if !modes.auto_wrap {
+            ReverseWrap::Off
+        } else if modes.reverse_wrap_extended {
+            ReverseWrap::AllLines
+        } else if modes.reverse_wrap {
+            ReverseWrap::WrappedLines
+        } else {
+            ReverseWrap::Off
         }
     }
 

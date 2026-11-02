@@ -48,9 +48,13 @@ pub fn check(term: &mut Terminal, size: (u16, u16), full: bool) {
         cursor.row < size.0 && cursor.col < size.1,
         "cursor {cursor:?} off a {size:?} grid"
     );
+    // A pending wrap may sit on any column since #97: it is armed on the
+    // right margin, which DECRST 69 or a resize can move while it stays
+    // armed (ADR 0028). The margins themselves stay on the grid.
+    let margins = grid.margins();
     assert!(
-        !grid.pending_wrap() || cursor.col + 1 == size.1,
-        "pending wrap off the last column at {cursor:?}"
+        margins.left <= margins.right && margins.right < size.1,
+        "margins {margins:?} off a {size:?} grid"
     );
     if full {
         grid.check_invariants();

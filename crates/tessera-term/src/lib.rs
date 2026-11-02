@@ -45,7 +45,10 @@
 //!   underline;
 //! - insert mode (IRM) off;
 //! - auto-wrap (DECAWM) on, xterm's default; DEC's table 5-9 says off;
-//! - the scroll region (DECSTBM) to the full screen;
+//! - the scroll region (DECSTBM) to the full screen, and left/right
+//!   margin mode (DECLRMM) off with the left and right margins (DECSLRM)
+//!   at the full width;
+//! - reverse wraparound (DECSET 45 and 1045) off;
 //! - the saved cursor (DECSC, and SCOSC, which shares its slot) to the
 //!   home position with the default pen and no pending wrap (xterm would
 //!   keep the live pending wrap in the copy). Only the active screen's
@@ -68,10 +71,23 @@
 //!   after RIS (xterm's `ReallyReset`, ADR 0020).
 //!
 //! KAM is not modelled (SM 2 is ignored), so it has nothing to reset.
-//! Still waiting on state that does not exist yet (`// #112, #95, #97,
-//! #10` in `soft_reset`): the character sets G0-G3/GL/GR (SCS, #112),
-//! DECSCA (#95), DECLRMM and reverse wrap (#97) and the ANSI palette
-//! (colours set with OSC 4) back to the theme (#10).
+//! Still waiting on state that does not exist yet (`// #112, #95, #10` in
+//! `soft_reset`): the character sets G0-G3/GL/GR (SCS, #112), DECSCA
+//! (#95) and the ANSI palette (colours set with OSC 4) back to the theme
+//! (#10).
+//!
+//! ## Left and right margins
+//!
+//! From conformance level 4, DECSET 69 (DECLRMM) turns on left/right
+//! margin mode, in which `CSI Pl ; Pr s` sets the left and right margins
+//! (DECSLRM) instead of saving the cursor (SCOSC). Printing then wraps at
+//! the right margin to the left one, and scrolling, IL/DL, ICH/DCH and
+//! the VT420 column operations DECIC, DECDC, DECBI and DECFI move only the
+//! cells between the margins; only a scroll of the full width and the full
+//! screen feeds the scrollback. DECSET 45 and 1045 (reverse wraparound)
+//! let BS and CUB wrap back to the line above. DA1 lists 21 from level 4,
+//! which is what makes tmux use the margins for side-by-side panes. ADR
+//! 0028 has the rules and the deviations from xterm.
 //!
 //! DECSCL (`CSI 61..65 ; Pc " p`, select conformance level) runs the same
 //! soft reset and then records the level ([`Terminal::conformance_level`])
@@ -105,7 +121,7 @@ use reports::TitleStack;
 
 use modes::KittyStacks;
 
-use tessera_grid::{Cell, Grid};
+use tessera_grid::{Cell, Grid, Point};
 use tessera_vt::{Action, Parser};
 use tracing::trace;
 
@@ -415,7 +431,9 @@ impl Terminal {
     /// Resizes the screen to `rows` × `cols` (a zero dimension counts as
     /// one), re-wrapping soft-wrapped lines on the primary screen and its
     /// scrollback and cutting or padding the alternate screen; see
-    /// [`Grid::resize`]. The scroll region becomes the full screen. Call it
+    /// [`Grid::resize`]. The scroll region and the left and right margins
+    /// become the full screen (xterm; left/right margin mode stays on if it
+    /// was, ADR 0028). Call it
     /// before telling the child about the new size, so output written for
     /// the new size lands on a grid that has it.
     pub fn resize(&mut self, rows: u16, cols: u16) {
@@ -634,19 +652,19 @@ impl State {
                 return;
             }
         };
-        let last = self.grid.cols() - 1;
         if width > self.grid.cols() {
             trace!(ch = ?ch, "wide character dropped: the grid has one column");
             return;
         }
         if !self.modes.auto_wrap {
             if self.grid.pending_wrap() {
-                // The grid always arms a pending wrap on the last column.
-                // Without DECAWM the character overwrites that column.
-                let row = self.grid.cursor().row;
-                self.grid.goto(row, last);
+                // The grid always arms a pending wrap where the line ends
+                // (the last column or the right margin). Without DECAWM the
+                // character overwrites that column (xterm `dotext`).
+                let Point { row, col } = self.grid.cursor();
+                self.grid.goto(row, col);
             }
-            if width == 2 && self.grid.cursor().col == last {
+            if width == 2 && self.grid.cursor().col == self.grid.line_end() {
                 // No room and no wrap: the character is dropped (xterm).
                 return;
             }
@@ -665,31 +683,19 @@ impl State {
             return;
         }
         if self.modes.insert {
-            let stranded = width == 2 && self.grid.cursor().col == last;
+            let stranded = width == 2 && self.grid.cursor().col == self.grid.line_end();
             if self.grid.pending_wrap() || stranded {
                 // `insert_chars` disarms the pending wrap, so wrap first and
                 // insert on the new line, as xterm does. A wide character
                 // with one column left first pads that column, as the
                 // grid does in replace mode.
                 if !self.grid.pending_wrap() {
-                    self.grid.pad_last_column();
+                    self.grid.pad_line_end();
                 }
-                self.wrap_line();
+                self.grid.wrap_line();
             }
             self.grid.insert_chars(width);
         }
         self.grid.put_char(ch);
-    }
-
-    /// Resolves a pending wrap: marks the cursor's line soft-wrapped and
-    /// moves to the start of the next line, scrolling at the bottom of the
-    /// scroll region. Mirrors what [`Grid::put_cell`] does before a write.
-    fn wrap_line(&mut self) {
-        let row = self.grid.cursor().row;
-        if let Some(line) = self.grid.line_mut(row) {
-            line.wrapped = true;
-        }
-        self.grid.carriage_return();
-        self.grid.line_feed();
     }
 }

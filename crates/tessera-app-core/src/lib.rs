@@ -3362,7 +3362,7 @@ mod tests {
         let y = KeyEvent::new(Key::Char('y'), Modifiers::NONE);
         assert_eq!(key(&app, id, y), InputOutcome::Consumed);
         fake.would_block.store(false, Ordering::SeqCst);
-        written_eventually(&fake, b"xw\x1b[0n\x1b[?64;22cy");
+        written_eventually(&fake, b"xw\x1b[0n\x1b[?64;21;22cy");
     }
 
     /// #10's flood bar: 1,000,000 `CSI 6 n` from a child that never reads

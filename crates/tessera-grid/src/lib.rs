@@ -55,6 +55,17 @@
 //! renderer re-draws only those rows (ADR 0016). Writes at the cursor cost
 //! one store; everything else stamps the rows it touched.
 //!
+//! # Margins
+//!
+//! Besides the scroll region (top and bottom margins, DECSTBM) the grid
+//! keeps left and right margins ([`Grid::margins`], DECSLRM; ADR 0028),
+//! the full width until the emulator sets them. Printing wraps at the
+//! right margin to the left one, and scrolling, line and character
+//! insertion and deletion move only the rectangle inside both pairs of
+//! margins. Only a scroll of the full width and the full screen puts lines
+//! into the scrollback. Both pairs are shared by the primary and the
+//! alternate screen.
+//!
 //! Assumptions this crate documents rather than enforces:
 //!
 //! - Origin mode (DECOM) is a terminal mode. The grid exposes
@@ -75,7 +86,9 @@ mod tabs;
 pub use cell::{Cell, CellFlags, Color, Point, Style, UnderlineStyle};
 pub use damage::{Damage, DamageRows};
 pub use grapheme::{GraphemeTable, MAX_CLUSTER_SCALARS, char_width};
-pub use grid::{DEFAULT_MAX_SCROLLBACK, EraseDisplay, EraseLine, Grid, ScrollRegion};
+pub use grid::{
+    DEFAULT_MAX_SCROLLBACK, EraseDisplay, EraseLine, Grid, Margins, ReverseWrap, ScrollRegion,
+};
 pub use line::{Line, Mark};
 pub use scrollback::Scrollback;
 pub use tabs::TabStops;

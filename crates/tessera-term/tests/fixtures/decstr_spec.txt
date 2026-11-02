@@ -847,7 +847,7 @@ modes: reverse_video=true linefeed_newline=true alt_screen=true bracketed_paste=
 
 #> Rows to add with the state they need (not #8):
 #>   SCS "ESC ( 0" (line drawing) + SO, DECSTR, print 'q' -> literal 'q'                  [XT resetCharsets; #112]
-#>   DECLRMM on + DECSLRM, DECSTR -> left/right margins full, mode off                     [XT resetMarginMode; #97]
 #>   DECSCA on (CSI 1 " q), DECSTR -> unprotected                                          [XT; #95]
 #>   DECSCUSR `CSI 4 SP q` (steady underline), DECSTR -> default cursor shape and blink    [XT ReallyReset soft; #113]
 #>   OSC 4 ; 1 ; rgb:00/ff/00 (palette 1 = green), DECSTR -> palette 1 back to the theme   [XT ResetAnsiColorRequest; #9]
+#  (#97: DECLRMM on + DECSLRM, then DECSTR -> margins full, mode off, is margins_spec.txt RS09; reverse wrap RS-rows there.)

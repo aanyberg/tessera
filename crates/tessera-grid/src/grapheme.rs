@@ -151,6 +151,10 @@ impl GraphemeTable {
     /// Drops every cluster whose column lies in `range`.
     #[inline]
     pub(crate) fn remove_range(&mut self, range: Range<usize>) {
+        if self.entries.is_none() {
+            // The common case: a line without clusters.
+            return;
+        }
         self.edit(|entries| {
             let start = entries.partition_point(|e| usize::from(e.col) < range.start);
             let end = start + entries[start..].partition_point(|e| usize::from(e.col) < range.end);
@@ -163,17 +167,18 @@ impl GraphemeTable {
         self.entries = None;
     }
 
-    /// Moves the clusters at columns `>= from` right by `n` (insertion of
-    /// `n` cells at `from`), dropping those that land at or past `cols`.
-    pub(crate) fn shift_right(&mut self, from: usize, n: usize, cols: usize) {
+    /// Moves the clusters at columns `from..end` right by `n` (insertion of
+    /// `n` cells at `from` that shifts cells up to `end`), dropping those
+    /// that land at or past `end`. Clusters at `end` and beyond stay.
+    pub(crate) fn shift_right(&mut self, from: usize, n: usize, end: usize) {
         self.edit(|entries| {
             entries.retain_mut(|e| {
                 let col = usize::from(e.col);
-                if col < from {
+                if col < from || col >= end {
                     return true;
                 }
                 match u16::try_from(col + n) {
-                    Ok(moved) if col + n < cols => {
+                    Ok(moved) if col + n < end => {
                         e.col = moved;
                         true
                     }
@@ -184,12 +189,13 @@ impl GraphemeTable {
     }
 
     /// Removes the clusters at columns `at..at + n` and moves the ones
-    /// after them left by `n` (deletion of `n` cells at `at`).
-    pub(crate) fn delete(&mut self, at: usize, n: usize) {
+    /// after them, up to `end`, left by `n` (deletion of `n` cells at `at`
+    /// that shifts cells up to `end`). Clusters at `end` and beyond stay.
+    pub(crate) fn delete(&mut self, at: usize, n: usize, end: usize) {
         self.edit(|entries| {
             entries.retain_mut(|e| {
                 let col = usize::from(e.col);
-                if col < at {
+                if col < at || col >= end {
                     true
                 } else if col < at + n {
                     false
@@ -293,9 +299,16 @@ mod tests {
         t.shift_right(1, 3, 8);
         assert_eq!(cols(&t), [0, 5], "column 6 + 3 fell off an 8-column line");
         let mut t = table(&[(0, "a\u{301}"), (2, "b\u{301}"), (4, "c\u{301}")]);
-        t.delete(1, 2);
+        t.delete(1, 2, 8);
         assert_eq!(cols(&t), [0, 2]);
         assert_eq!(t.get(2), Some("c\u{301}"));
+        // Between margins: clusters at and past `end` stay where they are.
+        let mut t = table(&[(1, "a\u{301}"), (3, "b\u{301}"), (6, "c\u{301}")]);
+        t.shift_right(1, 2, 5);
+        assert_eq!(cols(&t), [3, 6], "column 3 + 2 fell off at end 5");
+        let mut t = table(&[(1, "a\u{301}"), (3, "b\u{301}"), (6, "c\u{301}")]);
+        t.delete(1, 1, 5);
+        assert_eq!(cols(&t), [2, 6]);
         t.remove_range(0..10);
         assert!(t.is_empty());
         let mut t = table(&[(3, "a\u{301}")]);

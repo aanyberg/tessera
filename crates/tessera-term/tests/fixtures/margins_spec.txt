@@ -1,0 +1,2219 @@
+# =============================================================================
+# tessera-term: left/right margins (DECLRMM ?69, DECSLRM), DECIC/DECDC/DECBI/DECFI, reverse wrap (?45, ?1045)   (issue #97, wave 9)
+# crates/tessera-term/tests/fixtures/margins_spec.txt   (spec-researcher output, 2026-11-01; converted by the implementer)
+#
+# FORMAT (read by tests/margins.rs)
+#   Grid rows use the csi_spec.txt layout (### ID / size / step / screen / cursor / pending_wrap / requests / scrollback),
+#   checked with tests/spec/mod.rs check_case, whole and byte by byte. `\x1b` is ESC, `\x08` BS, `\u{H}` a scalar.
+#   Reply rows (section 7: RP, RM and RS ids) use the reports_spec.txt layout: `\e` is ESC and `reply:` the exact
+#   Request::Reply bytes of the whole row, concatenated; `step: resize RxC` calls Terminal::resize. A reply row may also
+#   carry `screen:`/`cursor:`/`pending_wrap:` (RS18).
+#   `cite:`, `note:`, `flags:` and `correction:` are documentation. `correction:` marks a row the implementer changed
+#   from the researcher's model after re-reading the cited xterm function (the original value is quoted).
+#
+# HOW THE ROWS WERE PRODUCED
+#   Sections 1-6: the researcher's Python model of xterm (charproc.c, cursor.c, util.c, tabs.c, screen.c, misc.c of
+#   ThomasDickey/xterm-snapshots master, read 2026-11-01), byte streams run through it; about twenty hand-checked
+#   against esctest2. Sections 7-9: hand-written from misc.c and reports_spec.txt. Nothing was run on a real xterm.
+#
+# DECISIONS (milestone lead, 2026-11-01: the researcher's recommendations D1-D9 accepted)
+#   D1  DECLRMM, DECSLRM, DECIC, DECDC, DECBI, DECFI, DECRQSS `s` and DECRQM ?69 need conformance level >= 4 (xterm
+#       vtXX_level >= 4); DA1 lists 21 only there (`CSI ? 64 ; 21 ; 22 c`).
+#   D2  ?1045 (extended reverse wraparound) is in scope.
+#   D3  a wrap at the right margin marks the row soft-wrapped (xterm WrapLine sets LINEWRAPPED), also when the margin
+#       is not the screen edge.
+#   D4  a resize resets the margins to the full screen; DECLRMM stays set.
+#   D5  reverse wrap never enters the scrollback: at screen row 0 it stops (xterm would read the newest history line).
+#   D6  HT right of the right margin follows xterm (TabToNextStop clamps to the margin, so the cursor moves back; CM13).
+#   D7  one margin set, shared by the primary and the alternate screen (RS17).
+#   D8  a wide character that does not fit before the right margin wraps early, leaving the margin cell blank (WD01).
+#   D9  SL/SR (CSI Ps SP @ / SP A) are out of scope.
+#
+# Default state before every row: DECAWM on, IRM off, LNM off, no margins, tab stops every 8, pen default, level 4.
+# Base screen `P` (4x10): `abcdefgh / ijklmnop / qrstuvwx / yzABCDEF`. `S` = `\x1b[?69h\x1b[3;6s` (margins 3-6).
+# =============================================================================
+
+# ============================================================================================================
+# 1. MODE AND DECSLRM (model-generated)
+# ============================================================================================================
+
+### LR01_off_decslrm_with_params_is_ignored
+size: 3x10
+step: feed \x1b[3;6sabcdefghij
+cite: [CTL] "CSI s (SCOSC) ... available only when DECLRMM is disabled"; [XT charproc.c CASE_ANSI_SC] with DECLRMM off, params present: neither save nor margins
+note: Negative control for LR02: without ?69 the sequence changes nothing; row 0 fills to the screen edge and the wrap is pending.
+screen:
+>abcdefghij|
+>
+>
+cursor: (0,9)
+pending_wrap: true
+requests: []
+scrollback: len=0
+
+### LR02_on_decslrm_text_wraps_inside_margins
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6sabcdefgh
+cite: [E decset.py test_DECSET_DECLRMM] margins 2;4 write abcdefgh -> abcd / .efg / .h ; [XT charproc.c WrapLine: IND + cursor to left margin]
+note: DECSLRM homes the cursor to column 1 (outside the margins, as in xterm CursorSet(0,0)), so a and b print left of the left margin. f is in the right-margin column (pending wrap); g wraps to the LEFT margin of the next row. Row 0 is marked soft-wrapped (xterm LineSetFlag LINEWRAPPED in WrapLine).
+flags: decision D3 (wrapped flag on a margin wrap)
+screen:
+>abcdef\
+>  gh |
+>
+cursor: (1,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LR03_decslrm_homes_cursor_to_page_corner
+size: 3x10
+step: feed \x1b[2;5H\x1b[?69h\x1b[3;6s
+cite: [RM DECSLRM] "moves the cursor to column 1, line 1 of the page"; [XT charproc.c CASE_ANSI_SC: CursorSet(screen,0,0,flags)]
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LR04_decslrm_homes_to_margin_corner_in_origin_mode
+size: 5x10
+step: feed \x1b[?69h\x1b[2;4r\x1b[?6h\x1b[3;6sX
+cite: [XT CursorSet with ORIGIN: col += lft_marg, row += top_marg]; [E decset.py test_DECSET_DECOM]
+note: DECOM set homes to (top margin, column 1); DECSLRM then homes to (top margin, new left margin); X lands on row 2 col 3.
+screen:
+>
+>  X |
+>
+>
+>
+cursor: (1,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LR05_invalid_decslrm_changes_nothing_and_does_not_home
+size: 3x10
+step: feed \x1b[?69h\x1b[2;5H\x1b[5;5sX
+cite: [XT CASE_ANSI_SC: only `if (right > left)` set margins and home]; [RM DECSLRM] "Pl must be less than Pr"
+note: Equal margins are ignored entirely, the cursor is NOT homed: X prints at row 2 col 5.
+screen:
+>
+>    X |
+>
+cursor: (1,5)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LR06_bare_csi_s_with_declrmm_on_resets_margins_and_homes
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[2;5H\x1b[sabcdefghijk
+cite: [VT vttest esc.c decslrm(0,0) sends ESC [ s to reset]; [TM tty-features.c Clmg=\E[s]; [XT CASE_ANSI_SC: left=one_if_default, right=MaxCols]
+note: tmux and vttest both reset the margins with the bare form. After it the margins are 1;10 and the cursor is home: row 0 fills the whole width and k wraps to column 1.
+screen:
+>abcdefghij\
+>k |
+>
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LR07_decset69_again_keeps_margins
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[?69habcdefgh
+cite: [XT set_left_right_margin_mode: setting an already-set mode only calls xterm_ResetDouble]
+note: Same screen as LR02.
+screen:
+>abcdef\
+>  gh |
+>
+cursor: (1,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LR08_decrst69_clears_margins
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[?69labcdefghijk
+cite: [RM DECLRMM] "With DECLRMM reset ... Margins are set to the page borders"; [XT set_left_right_margin_mode: reset_lr_margins]
+note: Full-width wrap again. The cursor does not move on DECRST 69 (the text starts at the home position DECSLRM left it).
+screen:
+>abcdefghij\
+>k |
+>
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LR09_set_69_after_reset_has_full_width_margins
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[?69l\x1b[?69habcdefghijk
+cite: [XT set_left_right_margin_mode]
+note: Margins do not come back when the mode is set again.
+screen:
+>abcdefghij\
+>k |
+>
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LR10_right_past_the_screen_is_the_screen_edge
+size: 3x10
+step: feed \x1b[?69h\x1b[3;99sabcdefghijk
+cite: [XT CASE_ANSI_SC: `right > MaxCols(screen)` -> right = MaxCols]
+note: Margins 3;10: the text starts at column 1, row 0 fills, k wraps to the left margin (column 3).
+screen:
+>abcdefghij\
+>  k |
+>
+cursor: (1,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LR11_zero_params_mean_defaults
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[0;0sabcdefghijk
+cite: [XT CASE_ANSI_SC: one_if_default(0) -> 1; right==0 -> MaxCols]
+note: Same as the bare form: full width, cursor home.
+screen:
+>abcdefghij\
+>k |
+>
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LR12_omitted_right_defaults_to_the_edge
+size: 3x10
+step: feed \x1b[?69h\x1b[4sabcdefghijk
+cite: [RM DECSLRM] "Pr defaults to 80 or 132"; [XT nparam < 2]
+note: Margins 4;10: k wraps to column 4.
+screen:
+>abcdefghij\
+>   k |
+>
+cursor: (1,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LR13_omitted_left_defaults_to_one
+size: 3x10
+step: feed \x1b[?69h\x1b[;6sabcdefgh
+cite: [RM DECSLRM] "Pl defaults to 1"
+note: Margins 1;6: f is at the right margin, g wraps to column 1.
+screen:
+>abcdef\
+>gh |
+>
+cursor: (1,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LR14_equal_or_reversed_margins_ignored
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[6;3sabcdefgh
+cite: [XT CASE_ANSI_SC right > left]; [RM] "minimum size of the scrolling region is two columns"
+note: The earlier 3;6 survives (screen as LR02).
+screen:
+>abcdef\
+>  gh |
+>
+cursor: (1,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LR15_two_column_region_is_allowed
+size: 3x10
+step: feed \x1b[?69h\x1b[9;10s\x1b[1;9Habc
+cite: [RM DECSLRM] minimum two columns
+note: a, b fill columns 9-10; c wraps to column 9 of row 2.
+screen:
+>        ab\
+>        c |
+>
+cursor: (1,9)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### LR16_left_beyond_the_screen_ignored
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[12;14sabcdefgh
+cite: [XT: right clamps to MaxCols (10), 10 > 12 is false -> ignored]
+note: Screen as LR02.
+screen:
+>abcdef\
+>  gh |
+>
+cursor: (1,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+# ============================================================================================================
+# 2. CURSOR MOVEMENT AGAINST THE MARGINS (model-generated; margins 3;6 = S)
+# ============================================================================================================
+
+### CM01_cuf_inside_stops_at_right_margin
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[1;4H\x1b[99C
+cite: [E cuf.py test_CUF_StopsAtRightMarginInScrollRegion]; [XT cursor.c CursorForward max=rgt_marg]
+note: Margins 3;6 (columns 3-6).
+screen:
+>      |
+>
+>
+cursor: (0,5)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CM02_cuf_left_of_left_margin_stops_at_right_margin
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[1;1H\x1b[99C
+cite: [XT CursorForward: only cur_col > rgt_marg lifts the limit to max_col]
+note: Margins 3;6 (columns 3-6).
+screen:
+>      |
+>
+>
+cursor: (0,5)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CM03_cuf_right_of_right_margin_goes_to_screen_edge
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[1;8H\x1b[99C
+cite: [E cuf.py test_CUF_StopsAtRightEdgeWhenBegunRightOfScrollRegion]
+note: Margins 3;6 (columns 3-6).
+screen:
+>          |
+>
+>
+cursor: (0,9)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CM04_cub_inside_stops_at_left_margin
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[1;5H\x1b[99D
+cite: [E cub.py test_CUB_StopsAtLeftMarginInScrollRegion]; [XT cursor.c CursorBack]
+note: Margins 3;6 (columns 3-6).
+screen:
+>   |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CM05_cub_left_of_left_margin_goes_to_column_1
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[1;2H\x1b[99D
+cite: [E cub.py test_CUB_StopsAtLeftEdgeWhenBegunLeftOfScrollRegion]; [XT CursorBack: `if (before < left) left = 0`]
+note: Margins 3;6 (columns 3-6).
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CM06_cub_right_of_right_margin_stops_at_left_margin
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[1;8H\x1b[99D
+cite: [XT CursorBack: before >= left so the left margin still stops it]
+note: Margins 3;6 (columns 3-6).
+screen:
+>   |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CM07_cr_inside_goes_to_left_margin
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[1;5H\r
+cite: [XT cursor.c CarriageReturn]
+note: Margins 3;6 (columns 3-6).
+screen:
+>   |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CM08_cr_left_of_left_margin_goes_to_column_1
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[1;2H\r
+cite: [XT CarriageReturn: "possible to use cursor addressing outside the margins ... go to the first column"]
+note: Margins 3;6 (columns 3-6).
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CM09_cr_right_of_right_margin_goes_to_left_margin
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[1;8H\r
+cite: [XT CarriageReturn: cur_col >= left -> left]
+note: Margins 3;6 (columns 3-6).
+screen:
+>   |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CM10_bs_at_left_margin_stays
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[1;3H\x08
+cite: [E bs.py test_BS_StopsAtLeftMargin]; [VT vttest tst_other_margins]
+note: Margins 3;6 (columns 3-6).
+screen:
+>   |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CM11_bs_left_of_left_margin_moves
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[1;2H\x08
+cite: [E bs.py test_BS_MovesLeftWhenLeftOfLeftMargin]
+note: Margins 3;6 (columns 3-6).
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CM12_ht_inside_stops_at_right_margin
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[1;3H\t
+cite: [E cht.py (CHT expects the tab to stop at the right margin)]; [XT tabs.c TabToNextStop: max = rgt_marg in LRM]; [VT tst_other_margins]
+note: Margins 3;6 (columns 3-6).
+screen:
+>      |
+>
+>
+cursor: (0,5)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CM13_ht_right_of_right_margin
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[1;9H\t
+cite: [XT tabs.c TabToNextStop: next > max -> next = max, so xterm moves the cursor BACK to the right margin (col 6) from col 9]
+note: Margins 3;6 (columns 3-6).
+flags: decision D6 (xterm quirk: HT moves backwards)
+screen:
+>      |
+>
+>
+cursor: (0,5)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CM14_cha_ignores_margins
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[1;5H\x1b[10G
+cite: [E cha.py test_CHA_IgnoresScrollRegion]
+note: Margins 3;6 (columns 3-6).
+screen:
+>          |
+>
+>
+cursor: (0,9)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CM15_cup_in_origin_mode_is_relative_and_clamped_to_the_margins
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[?6h\x1b[1;1HX\x1b[1;9HY
+cite: [XT CursorSet: col += lft_marg, clamp to rgt_marg]; [E cup.py test_CUP_RespectsOriginMode]
+note: X at column 3; col 9 clamps to the right margin (column 6).
+screen:
+>  X  Y|
+>
+>
+cursor: (0,5)
+pending_wrap: true
+requests: []
+scrollback: len=0
+
+### CM16_decom_set_homes_to_left_margin
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[?6h
+cite: [XT dpmodes srm_DECOM -> CursorSet(0,0,flags)]
+note: Cursor (0,2).
+screen:
+>   |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CM17_decstbm_with_lr_margins_homes_to_page_corner
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[1;3H\x1b[1;2r
+cite: [XT CASE_DECSTBM: CursorSet(screen,0,0,flags)]
+note: Not origin mode: column 1, not the left margin.
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+# ============================================================================================================
+# 3. INDEX, SCROLL, WRAP (model-generated; base screen P, margins S)
+# ============================================================================================================
+
+### SC01_lf_at_bottom_margin_scrolls_only_the_rectangle
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[4;4H\n
+cite: [E ind.py test_IND_MovesDoesNotScrollOutsideLeftRight (inside variant)]; [XT util.c xtermScroll -> scrollInMargins when not full width]
+note: Columns 3-6 move up one row; the 2 outer columns on each side stay. No scrollback (not full width).
+screen:
+>abklmngh
+>ijstuvop
+>qrABCDwx
+>yz  |  EF
+cursor: (3,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC02_ri_at_top_scrolls_only_the_rectangle_down
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[1;4H\x1bM
+cite: [XT xtermRevScroll via RevIndex]
+screen:
+>ab  |  gh
+>ijcdefop
+>qrklmnwx
+>yzstuvEF
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC03_nel_scrolls_the_rectangle_and_returns_to_left_margin
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[4;4H\x1bE
+cite: [XT CASE_NEL: xtermIndex + CarriageReturn]; [VT tst_other_margins]
+screen:
+>abklmngh
+>ijstuvop
+>qrABCDwx
+>yz |   EF
+cursor: (3,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC04_lf_left_of_left_margin_at_bottom_row_does_not_scroll
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[4;1H\n
+cite: [E ind.py test_IND_MovesDoesNotScrollOutsideLeftRight]; [XT cursor.c xtermIndex: `IsLeftRightMode && !ScrnIsColInMargins` -> CursorDown (clamped)]
+note: Nothing moves, the cursor stays on the last row.
+screen:
+>abcdefgh
+>ijklmnop
+>qrstuvwx
+>y|zABCDEF
+cursor: (3,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC05_lf_right_of_right_margin_at_bottom_row_does_not_scroll
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[4;8H\n
+cite: [XT xtermIndex]
+screen:
+>abcdefgh
+>ijklmnop
+>qrstuvwx
+>yzABCDEF|
+cursor: (3,7)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC06_ri_left_of_left_margin_at_top_row_does_not_scroll
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[1;1H\x1bM
+cite: [E ri.py test_RI_MovesDoesNotScrollOutsideLeftRight]; [XT RevIndex]
+screen:
+>a|bcdefgh
+>ijklmnop
+>qrstuvwx
+>yzABCDEF
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC07_lf_with_top_bottom_and_left_right_margins
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[2;3r\x1b[3;4H\n
+cite: [E su.py/sd.py *_leftRightAndTopBottomScrollRegion]; [XT xtermScroll scrollInMargins(top_marg)]
+note: Rectangle rows 2-3 x columns 3-6.
+screen:
+>abcdefgh
+>ijstuvop
+>qr  |  wx
+>yzABCDEF
+cursor: (2,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC08_ri_at_top_margin_with_both_margin_kinds
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[2;3r\x1b[2;4H\x1bM
+cite: [XT RevScroll scrollInMargins(-amount, top_marg)]
+screen:
+>abcdefgh
+>ij  |  op
+>qrklmnwx
+>yzABCDEF
+cursor: (1,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC09_su_scrolls_the_rectangle_cursor_stays
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[S
+cite: [E su.py test_SU_RespectsLeftRightScrollRegion]; [XT CASE_SU -> xtermScroll]
+screen:
+>a|bklmngh
+>ijstuvop
+>qrABCDwx
+>yz    EF
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC10_sd_scrolls_the_rectangle_cursor_stays
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[T
+cite: [E sd.py test_SD_RespectsLeftRightScrollRegion]
+screen:
+>a|b    gh
+>ijcdefop
+>qrklmnwx
+>yzstuvEF
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC11_su_larger_than_the_region_blanks_the_rectangle
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[99S
+cite: [E su.py test_SU_bigScrollLeftRightAndTopBottomScrollRegion]; [XT xtermScroll: amount = min(amount, bot-top+1)]
+screen:
+>a|b    gh
+>ij    op
+>qr    wx
+>yz    EF
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC12_full_width_margins_still_feed_scrollback
+size: 2x10
+step: feed \x1b[?69h\x1b[1;10sa\r\nb\r\nc
+cite: [XT util.c xtermScroll: scroll_full_line = (left == 0 && right == max_col), computed from the margins]
+note: DECLRMM on but margins cover the full width: this is a normal scroll, line a goes to scrollback.
+screen:
+>b
+>c |
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=1 first="a"
+
+### SC13_one_column_short_of_full_width_does_not
+size: 2x10
+step: feed \x1b[?69h\x1b[1;9sa\r\nb\r\nc
+cite: [XT xtermScroll scroll_full_line false -> scrollInMargins, no scrollback]
+note: The rectangle (columns 1-9) scrolls; a is lost, not saved.
+screen:
+>b
+>c |
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC14_wrap_at_bottom_margin_scrolls_the_rectangle
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[4;3Hwxyz12
+cite: [XT WrapLine -> xtermIndex(1) then cursor to left margin]
+note: z fills the right margin, 1 wraps: the rectangle scrolls, 1 and 2 print on the new last row at the left margin.
+screen:
+>abklmngh
+>ijstuvop
+>qrwxyzwx
+>yz12 | EF\
+cursor: (3,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC15_wrap_from_right_of_margin_at_bottom_row_overwrites_not_scrolls
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[4;10Hxy
+cite: [XT WriteText: right = (cur_col > rmargin) ? last_col : rmargin; WrapLine -> xtermIndex does not scroll when the cursor is outside the margins; cursor to left margin]
+note: x at column 10 (screen edge, pending wrap); y wraps with no scroll (the cursor was outside the margins) and lands on column 3 of the same last row.
+screen:
+>abcdefgh
+>ijklmnop
+>qrstuvwx
+>yzyB|CDEF x\
+cursor: (3,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC16_tmux_pane_scroll_sequence
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[1;4r\x1b[3;6s\x1b[4;6H\n
+cite: [TM tty.c tty_margin: CSR then CMG ("\E[%i%p1%d;%p2%ds"); tty_cmd_linefeed: cursor exactly on the right margin then \n]
+note: LF with the cursor in the right-margin column scrolls the rectangle; the cursor keeps its column.
+screen:
+>abklmngh
+>ijstuvop
+>qrABCDwx
+>yz    |EF
+cursor: (3,5)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+# ============================================================================================================
+# 4. EDITING INSIDE THE MARGINS (model-generated; base screen P, margins S)
+# ============================================================================================================
+
+### ED01_il_inside_shifts_rectangle_down_and_cursor_to_left_margin
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[2;4H\x1b[L
+cite: [E il.py test_IL_RespectsScrollRegion]; [XT util.c InsertLine: set_cur_col(ScrnLeftMargin), scrollInMargins]; [RM IL] "no effect outside the page margins"
+screen:
+>abcdefgh
+>ij |   op
+>qrklmnwx
+>yzstuvEF
+cursor: (1,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### ED02_il_outside_left_right_margins_is_ignored_cursor_stays
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[2;1H\x1b[L
+cite: [E il.py test_IL_RespectsScrollRegion_over / dl.py test_DL_OutsideLeftRightAndTopBottomScrollRegion]; [XT InsertLine: `cur_col < left || cur_col > right` -> return before moving the cursor]
+screen:
+>abcdefgh
+>i|jklmnop
+>qrstuvwx
+>yzABCDEF
+cursor: (1,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### ED03_il_right_of_right_margin_is_ignored
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[2;8H\x1b[L
+cite: [XT InsertLine]
+screen:
+>abcdefgh
+>ijklmnop|
+>qrstuvwx
+>yzABCDEF
+cursor: (1,7)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### ED04_dl_inside_shifts_rectangle_up
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[2;4H\x1b[M
+cite: [E dl.py]; [XT DeleteLine]
+screen:
+>abcdefgh
+>ijs|tuvop
+>qrABCDwx
+>yz    EF
+cursor: (1,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### ED05_dl_outside_ignored
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[2;1H\x1b[M
+cite: [XT DeleteLine: `!ScrnIsColInMargins` -> return]
+screen:
+>abcdefgh
+>i|jklmnop
+>qrstuvwx
+>yzABCDEF
+cursor: (1,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### ED06_il_with_top_bottom_and_left_right_margins
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[2;3r\x1b[2;4H\x1b[L
+cite: [XT InsertLine: ScrnIsRowInMargins and bot_marg bound]
+note: Rows 2-3 only; row 4 is below the region.
+screen:
+>abcdefgh
+>ij |   op
+>qrklmnwx
+>yzABCDEF
+cursor: (1,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### ED07_il_count_larger_than_rest_of_region
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[2;4H\x1b[99L
+cite: [XT InsertLine: amount = min(amount, bot_marg - cur_row + 1)]
+screen:
+>abcdefgh
+>ij |   op
+>qr    wx
+>yz    EF
+cursor: (1,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### ED08_dl_count_larger_than_rest_of_region
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[2;4H\x1b[99M
+cite: [XT DeleteLine]
+screen:
+>abcdefgh
+>ij |   op
+>qr    wx
+>yz    EF
+cursor: (1,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### ED09_il_row_outside_top_bottom_region_ignored
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[2;3r\x1b[1;4H\x1b[L
+cite: [XT InsertLine: !ScrnIsRowInMargins]
+screen:
+>abcd|efgh
+>ijklmnop
+>qrstuvwx
+>yzABCDEF
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### ED10_ich_inside_pushes_off_right_margin
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[1;4H\x1b[2@
+cite: [E ich.py test_ICH_ScrollOffRightMarginInScrollRegion]; [RM ICH] "Any characters pushed past the right margin are discarded"; [XT InsertChar: right = ScrnRightMargin]
+screen:
+>abc | dgh
+>ijklmnop
+>qrstuvwx
+>yzABCDEF
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### ED11_ich_left_of_left_margin_is_ignored
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[1;1H\x1b[2@
+cite: [E ich.py test_ICH_IsNoOpWhenCursorBeginsOutsideScrollRegion]; [XT InsertChar: !ScrnIsColInMargins -> return]
+screen:
+>a|bcdefgh
+>ijklmnop
+>qrstuvwx
+>yzABCDEF
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### ED12_ich_right_of_right_margin_is_ignored
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[1;8H\x1b[2@
+cite: [XT InsertChar]
+screen:
+>abcdefgh|
+>ijklmnop
+>qrstuvwx
+>yzABCDEF
+cursor: (0,7)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### ED13_ich_larger_than_room
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[1;4H\x1b[99@
+cite: [XT ScrnInsertChar limit = right + 1 - cur_col]
+screen:
+>abc |  gh
+>ijklmnop
+>qrstuvwx
+>yzABCDEF
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### ED14_dch_inside_pulls_from_right_margin_blanks_at_margin
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[1;4H\x1b[2P
+cite: [E dch.py test_DCH_RespectsMargins]; [XT DeleteChar: right = ScrnRightMargin; text right of the margin is NOT pulled]
+screen:
+>abcf|  gh
+>ijklmnop
+>qrstuvwx
+>yzABCDEF
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### ED15_dch_larger_than_room
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[1;4H\x1b[99P
+cite: [E dch.py test_DCH_DeleteAllWithMargins]
+screen:
+>abc |  gh
+>ijklmnop
+>qrstuvwx
+>yzABCDEF
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### ED16_dch_outside_margins_ignored
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[1;8H\x1b[2P
+cite: [E dch.py test_DCH_DoesNothingOutsideLeftRightMargin]
+screen:
+>abcdefgh|
+>ijklmnop
+>qrstuvwx
+>yzABCDEF
+cursor: (0,7)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### ED17_ech_ignores_margins
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[1;5H\x1b[3X
+cite: [E ech.py test_ECH_IgnoresScrollRegion / OutsideScrollRegion]
+note: ECH erases cells under and after the cursor even past the right margin and even from outside the margins.
+screen:
+>abcd |  h
+>ijklmnop
+>qrstuvwx
+>yzABCDEF
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### ED18_ech_from_left_of_left_margin
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[1;1H\x1b[4X
+cite: [E ech.py test_ECH_OutsideScrollRegion]
+screen:
+> |   efgh
+>ijklmnop
+>qrstuvwx
+>yzABCDEF
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### ED19_el_0_ignores_margins
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[1;5H\x1b[K
+cite: [E el.py test_EL_IgnoresScrollRegion]
+screen:
+>abcd |
+>ijklmnop
+>qrstuvwx
+>yzABCDEF
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### ED20_el_2_ignores_margins
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[1;5H\x1b[2K
+cite: [E el.py test_EL_IgnoresScrollRegion]
+screen:
+>     |
+>ijklmnop
+>qrstuvwx
+>yzABCDEF
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### ED21_ed_0_ignores_margins
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[2;4H\x1b[J
+cite: [E ed.py test_ED_0_WithScrollRegion]
+screen:
+>abcdefgh
+>ijk |
+>
+>
+cursor: (1,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### ED22_ed_1_ignores_margins
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[2;4H\x1b[1J
+cite: [E ed.py test_ED_1_WithScrollRegion]
+screen:
+>
+>    |mnop
+>qrstuvwx
+>yzABCDEF
+cursor: (1,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### ED23_irm_insert_stops_at_right_margin
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[4h\x1b[1;4HX
+cite: [XT util.c WriteText: `if (attr_flags & INSERT) InsertChar` which honours the right margin]
+note: Characters pushed past column 6 are lost; g and h stay.
+screen:
+>abcXd|egh
+>ijklmnop
+>qrstuvwx
+>yzABCDEF
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### ED24_irm_right_of_right_margin_overwrites
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[4h\x1b[1;8HX
+cite: [XT InsertChar returns when the cursor is outside the margins, then the character overwrites]
+note: Overwrites h; no shifting.
+screen:
+>abcdefgX |
+>ijklmnop
+>qrstuvwx
+>yzABCDEF
+cursor: (0,8)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+# ============================================================================================================
+# 5. DECIC / DECDC / DECBI / DECFI (model-generated; CO12/CO13 are the esctest2 layouts: 8x8)
+# ============================================================================================================
+
+### CO01_decic_inside_all_rows_of_region
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[2;4H\x1b[1'}
+cite: [E decic.py test_DECIC_DefaultParam, test_DECIC_ScrollOffRightMarginInScrollRegion]; [XT charproc.c CASE_DECIC -> xtermColScroll]; [RM DECIC] "Columns between the cursor and the right margin shift right"
+note: Every row of the top/bottom region (here all 4) shifts, not only the cursor row. Cursor does not move.
+screen:
+>abc degh
+>ijk |lmop
+>qrs tuwx
+>yzA BCEF
+cursor: (1,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CO02_decic_outside_margins_is_ignored
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[2;1H\x1b[1'}
+cite: [E decic.py test_DECIC_IsNoOpWhenCursorBeginsOutsideScrollRegion]; [RM] "no effect outside the scrolling margins"
+screen:
+>abcdefgh
+>i|jklmnop
+>qrstuvwx
+>yzABCDEF
+cursor: (1,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CO03_decic_limited_to_top_bottom_region
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[2;3r\x1b[2;4H\x1b[1'}
+cite: [E decic.py test_DECIC_CursorWithinTopBottom]
+screen:
+>abcdefgh
+>ijk |lmop
+>qrs tuwx
+>yzABCDEF
+cursor: (1,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CO04_decic_cursor_row_above_region_ignored
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[2;3r\x1b[1;4H\x1b[1'}
+cite: [XT xtermColScroll: cur_row must be within min_row..max_row]
+screen:
+>abcd|efgh
+>ijklmnop
+>qrstuvwx
+>yzABCDEF
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CO05_decic_count_larger_than_room
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[2;4H\x1b[99'}
+cite: [E decic.py test_DECIC_ScrollEntirelyOffRightEdge]
+screen:
+>abc   gh
+>ijk |  op
+>qrs   wx
+>yzA   EF
+cursor: (1,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CO06_decdc_inside_all_rows_of_region
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[2;4H\x1b[1'~
+cite: [E decdc.py test_DECDC_DeleteWithLeftRightMargins]; [XT CASE_DECDC]
+screen:
+>abcef gh
+>ijkm|n op
+>qrsuv wx
+>yzACD EF
+cursor: (1,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CO07_decdc_outside_ignored
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[2;1H\x1b[1'~
+cite: [E decdc.py test_DECDC_IsNoOpWhenCursorBeginsOutsideScrollRegion]
+screen:
+>abcdefgh
+>i|jklmnop
+>qrstuvwx
+>yzABCDEF
+cursor: (1,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CO08_decdc_limited_to_top_bottom_region
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[2;3r\x1b[2;4H\x1b[1'~
+cite: [E decdc.py test_DECDC_CursorWithinTopBottom]
+screen:
+>abcdefgh
+>ijkm|n op
+>qrsuv wx
+>yzABCDEF
+cursor: (1,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CO09_decdc_count_larger_than_room
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[?69h\x1b[3;6s\x1b[2;4H\x1b[99'~
+cite: [E decdc.py test_DECDC_DeleteAll]
+screen:
+>abc   gh
+>ijk |  op
+>qrs   wx
+>yzA   EF
+cursor: (1,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CO10_decic_without_declrmm_is_whole_screen_width
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[2;4H\x1b[1'}
+cite: [E decic.py test_DECIC_DefaultParam]; [XT xtermColScroll with margins at 0..max_col]
+screen:
+>abc defgh
+>ijk |lmnop
+>qrs tuvwx
+>yzA BCDEF
+cursor: (1,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CO11_decdc_without_declrmm
+size: 4x10
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyzABCDEF\x1b[2;4H\x1b[1'~
+cite: [E decdc.py test_DECDC_DefaultParam]
+screen:
+>abcefgh
+>ijkm|nop
+>qrsuvwx
+>yzACDEF
+cursor: (1,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CO12_decbi_at_left_margin_scrolls_right_inside_margins
+size: 8x8
+step: feed \x1b[3;2Habcde\x1b[4;2Hfghij\x1b[5;2Hklmno\x1b[6;2Hpqrst\x1b[7;2Huvwxy\x1b[?69h\x1b[3;5s\x1b[4;6r\x1b[5;3H\x1b6
+cite: [E decbi.py test_DECBI_Scrolls] expects f.ghj / k.lmo / p.qrt on rows 4-6, rows 3 and 7 untouched; [XT util.c xtermColIndex]; [VT tst_DECBI]
+screen:
+>
+>
+> abcde
+> f ghj
+> k |lmo
+> p qrt
+> uvwxy
+>
+cursor: (4,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CO13_decfi_at_right_margin_scrolls_left_inside_margins
+size: 8x8
+step: feed \x1b[3;2Habcde\x1b[4;2Hfghij\x1b[5;2Hklmno\x1b[6;2Hpqrst\x1b[7;2Huvwxy\x1b[?69h\x1b[3;5s\x1b[4;6r\x1b[5;5H\x1b9
+cite: [E decfi.py test_DECFI_Scrolls] expects fhi.j / kmn.o / prs.t; [XT xtermColIndex]; [VT tst_DECFI]
+screen:
+>
+>
+> abcde
+> fhi j
+> kmn |o
+> prs t
+> uvwxy
+>
+cursor: (4,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CO14_decbi_inside_margins_moves_left
+size: 8x8
+step: feed \x1b[?69h\x1b[3;5s\x1b[2;5H\x1b6
+cite: [XT xtermColIndex -> CursorBack(1)]
+screen:
+>
+>    |
+>
+>
+>
+>
+>
+>
+cursor: (1,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CO15_decbi_left_of_left_margin_moves_left
+size: 8x8
+step: feed \x1b[?69h\x1b[3;5s\x1b[2;2H\x1b6
+cite: [E decbi.py test_DECBI_LeftOfMargin]: DEC STD 070 lets DECBI move when outside the margins
+screen:
+>
+> |
+>
+>
+>
+>
+>
+>
+cursor: (1,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CO16_decbi_at_screen_left_edge_outside_margins_is_ignored
+size: 8x8
+step: feed \x1b[?69h\x1b[3;5sab\x1b[2;1H\x1b6
+cite: [XT xtermColIndex: not in margins -> CursorBack, which stops at column 1]; [RM/vttest "If the cursor is at the left border of the page ... ignores DECBI"]
+screen:
+>ab
+> |
+>
+>
+>
+>
+>
+>
+cursor: (1,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CO17_decfi_right_of_right_margin_moves_right
+size: 8x8
+step: feed \x1b[?69h\x1b[3;5s\x1b[2;6H\x1b9
+cite: [E decfi.py test_DECFI_RightOfMargin]
+screen:
+>
+>       |
+>
+>
+>
+>
+>
+>
+cursor: (1,6)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CO18_decfi_at_screen_right_edge_without_margins_scrolls_screen
+size: 8x8
+step: feed \x1b[1;8Hx\x1b9
+cite: [E decfi.py test_DECFI_WholeScreenScrolls]: the docstring says ignored but the asserted result is that x moves one column left; [XT xtermColIndex: cur_col == right margin (= screen edge) -> xtermColScroll]
+correction: the model cleared the pending wrap (`pending_wrap: false`); xterm's xtermColScroll calls ScrnDeleteChar/ScrnInsertChar, which never ResetWrap, so the wrap armed by x stays armed (true). Same for DECBI, DECIC and DECDC.
+screen:
+>      x |
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,7)
+pending_wrap: true
+requests: []
+scrollback: len=0
+
+### CO19_decbi_at_screen_left_edge_without_margins_scrolls_screen
+size: 8x8
+step: feed x\x1b[1;1H\x1b6
+cite: [E decbi.py test_DECBI_WholeScreenScrolls]
+screen:
+> |x
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### CO20_decbi_plain_move_and_no_wrap
+size: 8x8
+step: feed \x1b[6;5H\x1b6
+cite: [E decbi.py test_DECBI_Basic]; [E decfi.py test_DECFI_Basic]
+screen:
+>
+>
+>
+>
+>
+>    |
+>
+>
+cursor: (5,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+# ============================================================================================================
+# 6. REVERSE WRAP ?45 AND ?1045 (model-generated; 4x10)
+# ============================================================================================================
+
+### RW01_bs_at_column_1_without_reverse_wrap_stays
+size: 4x10
+step: feed \x1b[?7h\x1b[2;1H\x08
+cite: [E bs.py test_BS_NoWrapByDefault]
+screen:
+>
+> |
+>
+>
+cursor: (1,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### RW02_45_wraps_back_into_soft_wrapped_line
+size: 4x10
+step: feed \x1b[?45habcdefghijkl\x08\x08\x08
+cite: [XT cursor.c CursorBack rev: previous line must have LINEWRAPPED]; [E decset.py test_DECSET_ReverseWraparound_Multi]; [E bs.py test_BS_AfterOneWrappedInline]
+note: Row 0 is soft-wrapped (12 chars on a 10-column screen). Three BS from column 3 of row 1: col 2, col 1, then the right edge of row 0.
+screen:
+>abcdefghij|\
+>kl
+>
+>
+cursor: (0,9)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### RW03_45_does_not_cross_into_a_hard_newline_line
+size: 4x10
+step: feed \x1b[?45habc\r\n\x08
+cite: [E bs.py test_BS_AfterNoWrappedInlines, test_BS_InitialReverseWraparound]; [XT CursorBack: `!rev2 && !LineTstWrapped(ld)` -> stay at left margin]
+note: Contrast with RW08 (?1045).
+screen:
+>abc
+> |
+>
+>
+cursor: (1,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### RW04_45_requires_decawm
+size: 4x10
+step: feed \x1b[?45habcdefghijkl\x1b[?7l\x08\x08\x08
+cite: [E bs.py test_BS_ReverseWrapRequiresDECAWM]; [XT WRAP_MASK = REVERSEWRAP | WRAPAROUND]
+note: The line was soft-wrapped while ?7 was set; with ?7 reset BS stops at column 1.
+screen:
+>abcdefghij\
+>k|l
+>
+>
+cursor: (1,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### RW05_45_bs_from_pending_wrap_stays_on_last_column
+size: 4x10
+step: feed \x1b[?45h\x1b[1;9Hab\x08X
+cite: [E decset.py test_DECSET_ReverseWraparoundLastCol_BS; bs.py test_BS_ReverseWrapStartingInDoWrapPosition]; [XT CursorBack: `(rev || rev2) && do_wrap` -> --count, column unchanged]
+note: b sits in the last column with the wrap pending; BS only clears the pending wrap, so X overwrites b ("aX").
+screen:
+>        aX|
+>
+>
+>
+cursor: (0,9)
+pending_wrap: true
+requests: []
+scrollback: len=0
+
+### RW06_without_45_bs_from_pending_wrap_moves_left
+size: 4x10
+step: feed \x1b[1;9Hab\x08X
+cite: [E bs.py test_BS_CursorStartsInDoWrapPosition]
+note: Without reverse wrap BS moves one column left from the pending-wrap position: "Xb".
+screen:
+>        Xb|
+>
+>
+>
+cursor: (0,9)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### RW07_45_with_margins_wraps_to_the_right_margin
+size: 4x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[?45habcdefgh\x08\x08\x08
+cite: [XT CursorBack: col = right (margin) after the wrap]; [E bs.py test_BS_ReverseWrapWithLeftRight (that test uses ?1045)]
+note: Needs the soft-wrap flag on row 0 (decision D3). Result column 6 of row 1 (right margin).
+flags: decision D3
+screen:
+>abcdef|\
+>  gh
+>
+>
+cursor: (0,5)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### RW08_45_with_margins_from_left_of_left_margin_goes_to_right_margin
+size: 4x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[?45habcdefg\x1b[2;1H\x08
+cite: [E bs.py test_BS_ReversewrapFromLeftEdgeToRightMargin (?1045 variant)]; [XT CursorBack: `before < left` -> left = 0, then wrap to `right`]
+note: Cursor starts at column 1 of the wrapped row 1.
+flags: decision D3
+screen:
+>abcdef|\
+>  g
+>
+>
+cursor: (0,5)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### RW09_1045_wraps_into_a_hard_newline_line
+size: 4x10
+step: feed \x1b[?1045h\x1b[2;1H\x08
+cite: [E bs.py test_BS_WrapsInWraparoundMode (uses ReverseWraparound() = 1045 on xterm >= 383)]; [XT CursorBack rev2: no wrapped check]
+screen:
+>          |
+>
+>
+>
+cursor: (0,9)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### RW10_1045_from_top_margin_row_goes_to_bottom_margin
+size: 4x10
+step: feed \x1b[?1045h\x1b[2;4r\x1b[2;1H\x08
+cite: [E bs.py test_BS_ReverseWrapGoesToBottom]; [XT CursorBack: `if (row == top) row = bottom + 1` then --row]
+note: Region rows 2-4: BS at (row 2, col 1) lands on (row 4, col 10).
+screen:
+>
+>
+>
+>          |
+cursor: (3,9)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### RW11_1045_from_screen_top_left_goes_to_bottom_right
+size: 4x10
+step: feed \x1b[?1045h\x08
+cite: [XT CursorBack rev2, top = 0 = row]
+screen:
+>
+>
+>
+>          |
+cursor: (3,9)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### RW12_1045_with_margins_goes_to_the_right_margin_one_row_up
+size: 4x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[?1045h\x1b[3;3H\x08
+cite: [E bs.py test_BS_ReverseWrapWithLeftRight]
+screen:
+>
+>      |
+>
+>
+cursor: (1,5)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### RW13_45_at_screen_top_left_stays
+size: 4x10
+step: feed \x1b[?45h\x08
+cite: [XT CursorBack with row 0: nothing above to wrap into]
+note: xterm calls getLineData(row -1), i.e. a SCROLLBACK line, which it may wrap into; Tessera must not (decision D5): stay.
+flags: decision D5
+screen:
+> |
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### RW14_cub_99_through_two_soft_wrapped_lines_stops_at_screen_top_left
+size: 4x10
+step: feed \x1b[?45hABCDEFGHIJKLMNOPQRSTUVWXY\x1b[99D
+cite: [E cub.py test_CUB_AfterOneWrappedInline]; [XT CursorBack loop, count > 1 is the same walk as repeated BS]
+note: decision D5
+screen:
+>A|BCDEFGHIJ\
+>KLMNOPQRST\
+>UVWXY
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### RW15_1045_without_decawm_does_not_wrap
+size: 4x10
+step: feed \x1b[?1045h\x1b[?7l\x1b[2;1H\x08
+cite: [XT WRAP_MASK2 = REVERSEWRAP2 | WRAPAROUND]
+screen:
+>
+> |
+>
+>
+cursor: (1,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### RW16_both_45_and_1045_set_1045_wins
+size: 4x10
+step: feed \x1b[?45h\x1b[?1045h\x1b[2;1H\x08
+cite: [XT CursorBack: `if (rev2) ... else if (!rev)` -- rev2 is tested first]
+screen:
+>          |
+>
+>
+>
+cursor: (0,9)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### RW17_cub_99_inside_margins_walks_back_through_the_wrap_and_stops_at_the_top
+size: 4x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[?45habcdefgh\x1b[99D
+cite: [XT CursorBack loop]
+note: From (row 2, col 5): left margin col 3, wrap to the right margin of row 1, walk to the left margin of row 1, row 0 does not exist: stop at (row 1, col 3).
+flags: decision D3 D5
+screen:
+>abc|def\
+>  gh
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+# ============================================================================================================
+# 7. REPORTS (hand-written; `\e` = ESC and `reply:` as in reports_spec.txt; size 24x80 unless stated)
+# ============================================================================================================
+
+### RP01_da1_level4_lists_21
+size: 24x80
+step: feed \e[c
+reply: \e[?64;21;22c
+cite: [XT charproc.c CASE_DA1 feature list is ascending]; [VT/RM DA1: 21 = horizontal scrolling]; [TM tty-keys.c reads 21 as "margins"]; reports_spec.txt D-DA1 (22 stays)
+flags: decision D1
+
+### RP02_da1_level3_has_no_21
+size: 24x80
+step: feed \e[63;1"p\e[c
+reply: \e[?63;22c
+cite: D1: DECLRMM needs level 4
+
+### RP03_da1_level2_and_1_unchanged
+size: 24x80
+step: feed \e[62;1"p\e[c\e[61;1"p\e[c
+reply: \e[?62;22c\e[?1;2c
+cite: reports_spec.txt D-DA1
+
+### RP04_decid_follows_da1
+size: 24x80
+step: feed \eZ
+reply: \e[?64;21;22c
+cite: reports_spec.txt D-DECID
+
+### RM01_decrqm_69_reset
+size: 24x80
+step: feed \e[?69$p
+reply: \e[?69;2$y
+cite: [XT misc.c do_dec_rqm srm_DECLRMM: MdFlag(flags, LEFT_RIGHT) at level >= 4]; [CTL DECRQM]
+
+### RM02_decrqm_69_set_and_reset_again
+size: 24x80
+step: feed \e[?69h\e[?69$p\e[?69l\e[?69$p
+reply: \e[?69;1$y\e[?69;2$y
+cite: [XT misc.c do_dec_rqm]
+
+### RM03_decrqm_69_below_level4_is_not_recognized
+size: 24x80
+step: feed \e[63;1"p\e[?69h\e[?69$p
+reply: \e[?69;0$y
+cite: [XT misc.c do_dec_rqm: `else { result = 0; }` below VT420]; the DECSET itself is ignored there (charproc.c srm_DECLRMM)
+flags: decision D1
+
+### RM04_decrqm_45_and_1045
+size: 24x80
+step: feed \e[?45$p\e[?1045$p\e[?45h\e[?1045h\e[?45$p\e[?1045$p
+reply: \e[?45;2$y\e[?1045;2$y\e[?45;1$y\e[?1045;1$y
+cite: [XT misc.c do_dec_rqm srm_REVERSEWRAP / REVERSEWRAP2: MdFlag(flags, ...), no level gate]
+flags: decision D2
+
+### RM05_decrqm_45_is_independent_of_decawm
+size: 24x80
+step: feed \e[?7l\e[?45h\e[?45$p
+reply: \e[?45;1$y
+cite: [XT]: the mode bit is stored; DECAWM only gates the effect (cursor.c WRAP_MASK)
+
+### RS01_decrqss_s_default
+size: 24x80
+step: feed \eP$qs\e\\
+reply: \eP1$r1;80s\e\\
+cite: [XT misc.c DECRQSS "s": `lft_marg + 1; rgt_marg + 1` + "s", level >= 4, regardless of whether DECLRMM is set]; [CTL "s => DECSLRM"]
+
+### RS02_decrqss_s_after_decslrm
+size: 24x80
+step: feed \e[?69h\e[10;40s\eP$qs\e\\
+reply: \eP1$r10;40s\e\\
+cite: [XT misc.c DECRQSS "s"]
+
+### RS03_decrqss_s_decslrm_without_mode_is_not_a_setting
+size: 24x80
+step: feed \e[10;40s\eP$qs\e\\
+reply: \eP1$r1;80s\e\\
+cite: [CTL SCOSC with DECLRMM off]; [XT CASE_ANSI_SC: only_default() required to save]
+
+### RS04_decrqss_s_below_level4_is_invalid
+size: 24x80
+step: feed \e[63;1"p\eP$qs\e\\
+reply: \eP0$r\e\\
+cite: [XT misc.c DECRQSS "s": `okay = False` below VT420]; reports_spec.txt D-RQSS lists `s` as the #97 gap
+flags: decision D1
+
+### RS05_decslrm_parameter_forms_seen_through_decrqss
+size: 24x80
+step: feed \e[?69h\e[10s\eP$qs\e\\\e[;40s\eP$qs\e\\\e[0;0s\eP$qs\e\\\e[10;99s\eP$qs\e\\\e[5;5s\eP$qs\e\\\e[40;10s\eP$qs\e\\\e[79;80s\eP$qs\e\\\e[81;90s\eP$qs\e\\
+reply: \eP1$r10;80s\e\\\eP1$r1;40s\e\\\eP1$r1;80s\e\\\eP1$r10;80s\e\\\eP1$r10;80s\e\\\eP1$r10;80s\e\\\eP1$r79;80s\e\\\eP1$r79;80s\e\\
+cite: [XT CASE_ANSI_SC]: `10` right defaults to 80; `;40` left=1; `0;0` both default; `10;99` right > 80 -> 80; `5;5` and `40;10` ignored (right <= left); `79;80` ok (two columns); `81;90` left 81 -> right clamps to 80, 80 > 81 false -> ignored (previous 79;80 stays)
+note: the earlier value survives every ignored call: the 4th reply is 10;80 (from 10;99), the 5th and 6th stay 10;80, the 7th is 79;80, the 8th stays 79;80.
+
+### RS06_bare_csi_s_resets_margins_when_declrmm_is_set
+size: 24x80
+step: feed \e[?69h\e[10;40s\e[s\eP$qs\e\\
+reply: \eP1$r1;80s\e\\
+cite: [VT esc.c decslrm(0,0) -> ESC [ s]; [TM tty-features.c Clmg]; [XT CASE_ANSI_SC]
+
+### RS07_decrst_69_clears_margins_and_keeps_nothing
+size: 24x80
+step: feed \e[?69h\e[10;40s\e[?69l\eP$qs\e\\\e[?69h\eP$qs\e\\
+reply: \eP1$r1;80s\e\\\eP1$r1;80s\e\\
+cite: [XT charproc.c set_left_right_margin_mode: reset_lr_margins on reset]; [RM DECLRMM] "Margins are set to the page borders"
+
+### RS08_decset_69_again_keeps_margins
+size: 24x80
+step: feed \e[?69h\e[10;40s\e[?69h\eP$qs\e\\
+reply: \eP1$r10;40s\e\\
+cite: [XT set_left_right_margin_mode: only xterm_ResetDouble when set]
+
+### RS09_decstr_resets_declrmm_and_margins
+size: 24x80
+step: feed \e[?69h\e[10;40s\e[!p\eP$qs\e\\\e[?69$p
+reply: \eP1$r1;80s\e\\\e[?69;2$y
+cite: [XT charproc.c ReallyReset -> resetMarginMode]; [E decset.py test_DECSET_DECLRMM_MarginsResetByDECSTR, ..._ModeResetByDECSTR]; DEC STD 070 per that docstring
+
+### RS10_ris_resets_declrmm_and_margins
+size: 24x80
+step: feed \e[?69h\e[10;40s\ec\eP$qs\e\\\e[?69$p
+reply: \eP1$r1;80s\e\\\e[?69;2$y
+cite: [XT ReallyReset(full)]
+
+### RS11_decscl_resets_declrmm_and_margins
+size: 24x80
+step: feed \e[?69h\e[10;40s\e[64;1"p\eP$qs\e\\\e[?69$p
+reply: \eP1$r1;80s\e\\\e[?69;2$y
+cite: [XT CASE_DECSCL -> ReallyReset soft]; decscl_spec.txt
+
+### RS12_deccolm_without_40_keeps_margins
+size: 24x80
+step: feed \e[?69h\e[10;40s\e[?3h\eP$qs\e\\\e[?69$p
+reply: \eP1$r10;40s\e\\\e[?69;1$y
+cite: [XT charproc.c srm_DECCOLM: nothing unless screen->c132]; modes.rs table "only while 40 is set"
+
+### RS13_deccolm_with_40_clears_margins_but_not_the_mode
+size: 24x80
+step: feed \e[?40h\e[?69h\e[10;40s\e[?3h\eP$qs\e\\\e[?69$p
+reply: \eP1$r1;80s\e\\\e[?69;1$y
+cite: [XT charproc.c set_column_mode: resetMargins; the LEFT_RIGHT flag is not touched]; [E decset.py test_DECSET_DECCOLM "Set left-right and top-bottom margins to ensure they're removed"]
+note: Tessera keeps the grid width on DECCOLM (modes.rs), so the full-width margins are 1;80 (it also emits Request::Resize).
+
+### RS14_decaln_clears_margins_not_the_mode
+size: 24x80
+step: feed \e[?69h\e[10;40s\e#8\eP$qs\e\\\e[?69$p
+reply: \eP1$r1;80s\e\\\e[?69;1$y
+cite: [XT charproc.c CASE_DECALN: resetMargins]; [E decaln.py test_DECALN_ClearsMargins]
+
+### RS15_resize_resets_margins_keeps_mode
+size: 24x80
+step: feed \e[?69h\e[10;40s
+step: resize 24x100
+step: feed \eP$qs\e\\\e[?69$p
+reply: \eP1$r1;100s\e\\\e[?69;1$y
+cite: [XT screen.c ScreenResize: resetMargins]
+flags: decision D4
+
+### RS16_resize_smaller_than_the_margins
+size: 24x80
+step: feed \e[?69h\e[50;70s
+step: resize 24x30
+step: feed \eP$qs\e\\
+reply: \eP1$r1;30s\e\\
+cite: [XT ScreenResize]; clamping would give 30;30 which DECSLRM itself forbids (right > left)
+flags: decision D4
+
+### RS17_margins_survive_the_alternate_screen
+size: 24x80
+step: feed \e[?69h\e[10;40s\e[?1049h\eP$qs\e\\\e[?1049l\eP$qs\e\\
+reply: \eP1$r10;40s\e\\\eP1$r10;40s\e\\
+cite: [XT ToAlternate/FromAlternate do not touch lft_marg/rgt_marg or the LEFT_RIGHT flag]
+flags: decision D7
+
+### RS18_xtsave_69_is_not_decslrm
+size: 3x10
+step: feed \e[?69h\e[2;5H\e[?69s
+cite: [CTL "CSI ? Pm s Save DEC Private Mode Values"]; the private marker routes it away from DECSLRM/SCOSC
+note: Must not move the cursor, set margins or save the cursor. If Tessera ignores XTSAVE entirely that already holds. Expected cursor (1,4), pending_wrap false.
+screen:
+>
+>     |
+>
+cursor: (1,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+# ============================================================================================================
+# 8. LEVEL GATE AND SCOSC/SCORC (hand-written, grid rows)
+# ============================================================================================================
+
+### LV01_level3_ignores_declrmm_and_decslrm
+size: 3x10
+step: feed \x1b[63;1"p\x1b[?69h\x1b[3;6sabcdefghij
+cite: [XT charproc.c srm_DECLRMM `vtXX_level >= 4`]; D1
+note: ?69h ignored, so `CSI 3;6 s` is SCOSC with params (ignored): row 0 fills to the edge (as LR01).
+flags: decision D1
+screen:
+>abcdefghij|
+>
+>
+cursor: (0,9)
+pending_wrap: true
+requests: []
+scrollback: len=0
+
+### LV02_level3_ignores_decbi_decfi_decic_decdc
+size: 3x10
+step: feed \x1b[63;1"pabc\x1b[1;2H\x1b9\x1b6\x1b[1'}\x1b[1'~
+cite: [XT charproc.c CASE_DECBI/DECFI/DECIC/DECDC `vtXX_level >= 4`]
+flags: decision D1
+note: all four are ignored at level 3: the row stays abc and the cursor stays on column 2.
+screen:
+>ab|c
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SCR01_scosc_scorc_work_when_declrmm_is_off
+size: 3x10
+step: feed \x1b[2;3H\x1b[s\x1b[1;1H\x1b[uX
+cite: [CTL SCOSC]; [E scorc.py test_SCORC_SaveRestoreCursor_Basic]
+screen:
+>
+>  X |
+>
+cursor: (1,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SCR02_with_declrmm_on_bare_s_is_decslrm_and_the_save_does_not_happen
+size: 3x10
+step: feed \x1b[?69h\x1b[2;3H\x1b[s\x1b[3;3H\x1b[uX
+cite: [E scorc.py test_SCORC_SaveRestoreCursor_WorksInLRM with shouldWork=False]; [XT CASE_ANSI_SC]
+note: `CSI s` resets margins and homes the cursor instead of saving; `CSI u` then restores the never-saved cursor = home (DECRC with nothing saved homes): X at (0,0). CSI u itself is not affected by DECLRMM.
+screen:
+>X |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SCR03_scosc_with_params_when_declrmm_on_is_decslrm_with_those_params
+size: 3x10
+step: feed \x1b[?69h\x1b[5;7s\x1b[1;5Habc
+cite: [E decrc.py/scorc.py ... worksInLRM uses `CSI 5;7 s`]; [XT CASE_ANSI_SC]
+note: margins 5;7: a b c fill columns 5-7 and the third char leaves the wrap pending.
+screen:
+>    abc|
+>
+>
+cursor: (0,6)
+pending_wrap: true
+requests: []
+scrollback: len=0
+
+# ============================================================================================================
+# 9. WIDE CHARACTER AT A MARGIN (hand-written; D8)
+# ============================================================================================================
+
+### WD01_wide_char_that_does_not_fit_before_the_right_margin_wraps_early
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[1;6H\u{4e2d}
+cite: [XT charproc.c WriteText `width_here > width_available` -> wrap first]; wide.rs screen-edge rule
+note: column 6 is the right margin and holds one cell: the wide char goes to the left margin of row 2, row 1 stays blank and soft-wrapped.
+flags: decision D8
+screen:
+>\
+>  中 |
+>
+cursor: (1,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### WD02_wide_char_that_exactly_fits_leaves_the_wrap_pending
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[1;5H\u{4e2d}
+cite: [XT WriteText `width_here == width_available` -> need_wrap]
+flags: decision D8
+screen:
+>    中|
+>
+>
+cursor: (0,5)
+pending_wrap: true
+requests: []
+scrollback: len=0
+
+# ============================================================================================================
+# 10. ESCTEST LIFT TABLE: the 31 `#> #97` blocks of esctest_spec.txt (53 test ids) -> source, and the row here that pins the same rule
+# ============================================================================================================
+# esctest_pending.txt has no blocks and the `#>` lines carry bytes only for some ids: transcribe the rest from
+# https://github.com/ThomasDickey/esctest2/tree/master/esctest/tests/<file>.py through the helpers in esccmd.py (Point(x,y) -> CUP y;x,
+# DECSLRM(l,r) -> CSI l;r s, DECSET(DECLRMM) -> CSI ? 69 h; esctest.py reset() before each test: 25x80, DECAWM on, tabs every 8), exactly as the
+# wave-5 rows were produced. The 25x80 rows keep esctest's own geometry; the 4x10 rows above are the same rules at hand-checkable size.
+#
+# id (esctest2 file / test)                                                                     | rule                                                   | covering row(s)
+# E_CUP_respectsOriginMode (cup.py)                                                              | origin mode relative to margins, clamped               | CM15, LR04
+# E_HPA_/E_VPA_/E_HVP_/E_HPR_/E_VPR_ ignores/respectsOriginMode (hpa vpa hvp hpr vpr)           | same                                                   | CM15 (+ model: cursor_set_col/row)
+# E_CHA_ignoresScrollRegion, E_CHA_respectsOriginMode (cha.py)                                   | CHA ignores margins; origin relative                   | CM14, CM15
+# E_CUF_stopsAtRightMarginInScrollRegion, ...RightEdgeWhenBegunRightOfScrollRegion (cuf.py)     | CUF stop at R / edge                                   | CM01, CM03 (CM02 extra)
+# E_CUB_stopsAtLeftMarginInScrollRegion, ...LeftEdgeWhenBegunLeftOfScrollRegion (cub.py)        | CUB stop at L / col 1                                  | CM04, CM05 (CM06 extra)
+# E_CUB_afterNoWrappedInlines, E_CUB_afterOneWrappedInline (cub.py; ?45, xterm >= 383)          | ?45 only into soft-wrapped rows                        | RW02, RW03, RW14
+# E_CNL_stopsAtBottom*/E_CPL_stopsAtTop* (cnl.py, cpl.py)                                        | CNL/CPL end at L (CR) and stop at the bot/top margin   | CM07 (CR rule) + SC04 (clamp)
+# E_CBT_ignoresRegion, E_CHT_ignoresScrollingRegion (cbt.py, cht.py)                             | CBT ignores margins; CHT stops at R                    | CM12, CM13
+# E_ED_0/1/2_withScrollRegion (ed.py), E_EL_ignoresScrollRegion (el.py), E_ECH_* (ech.py)        | erases ignore the margins                              | ED17-ED22
+# E_ICH_isNoOpWhenCursorBeginsOutsideScrollRegion, E_ICH_scrollOffRightMarginInScrollRegion      | ICH within L..R only                                   | ED10-ED13
+# E_DCH_respectsMargins, E_DCH_deleteAllWithMargins, E_DCH_doesNothingOutsideLeftRightMargin     | DCH within L..R only                                   | ED14-ED16
+# E_IL_respectsScrollRegion(_over), E_DL_outsideLeftRightAndTopBottomScrollRegion (il.py, dl.py)| IL/DL rectangle + no-op outside                         | ED01-ED09
+# E_SU_*/E_SD_* (8 ids: respects / outside / leftRightAndTopBottom / bigScroll; su.py, sd.py)    | SU/SD rectangle (cursor unchanged)                     | SC09-SC11, SC07, SC08
+# E_REP_respectsLeftRightMargins (rep.py)                                                        | REP wraps inside the margins                           | LR02 (REP = N prints, same wrap path)
+# E_DECALN_clearsMargins (decaln.py)                                                             | DECALN resets margins                                  | RS14
+# E_IND_/E_RI_/E_NEL_movesDoesNotScrollOutsideLeftRight (ind.py ri.py nel.py)                    | no scroll when the cursor is outside L..R              | SC04-SC06 (+ SC01-SC03 inside)
+# E_DECRC_/E_SCORC_saveRestoreCursor_resetsOriginMode, _worksInLRM (decrc.py, scorc.py)          | CSI 5;7 s is DECSLRM when ?69 on, SCOSC otherwise      | SCR01-SCR03, LR06
+# E_DECRC_/E_SCORC_saveRestoreCursor_reverseWrapNotAffected                                      | save/restore keeps the pending wrap, ?45 state not saved| RW05 + SCR01 (DECSC saves the wrap flag today)
+# NOT in the `#>` list but in esctest2 and now testable: bs.py (BS_* with ?45/?1045/margins) -> RW01-RW16; decset.py
+#   DECSET_DECLRMM*, _MarginsResetByDECSTR, _ModeResetByDECSTR, _DECCOLM -> LR02, LR07-LR09, RS09, RS13; decic/decdc/decbi/decfi.py -> CO01-CO20.
+
+# ============================================================================================================
+# 11. VTTEST (vttest 2.7 vt420.c, main menu 11 -> 3 "Test of VT420 features")
+# ============================================================================================================
+# 11.3.2 "Test cursor-movement": toggles `?69` (toggle_LRMM), DECSTBM (tb_marg 1..2 flavours: reset / top half / bottom half / middle half),
+#   DECSLRM (same four flavours), DECOM; then
+#   - "Test Back Index (DECBI)" / "Test Forward Index (DECFI)": numbers 1..N written and shifted with ESC 6 / ESC 9 four at a time -> CO12-CO20.
+#   - "Test cursor movement within margins": CUF/CUB 99-style walks to the margin from the margin; CUU/CUD to the border -> CM01-CM06.
+#   - "Test other movement (CR/HT/LF/FF) within margins": BS x N to col 1 from L, HT x N from R, IND x N down the margin, FF, NEL+CUF, RI -> CM07-CM13, SC01-SC06.
+#   Reset between sub-tests uses `ESC [ s` (decslrm(0,0)) while ?69 is set and `CSI r` for DECSTBM: LR06 pins that.
+# 11.3.3 "Test editing sequences": "Test insert/delete column (DECIC, DECDC)" with margins/origin -> CO01-CO11.
+# 11.3.x also has "Show DECRQM response for DECLRMM" / "Show DECRQSS response for DECSLRM" (menu items) -> RM01-RM03, RS01-RS05.
+# The rectangle tests (DECCRA/DECERA/DECFRA/DECSERA/DECCARA/DECRARA) also use test_with_margins() but are other issues.
+# vttest.rs in this crate replays captured menus; there is no margin capture, and none is needed: every sequence above is a row.
+
+# ============================================================================================================
+# 12. ORIGIN MODE KEEPS THE OTHER COORDINATE; ROWS ADDED IN CRITIC ROUND 1 (hand-written from the cited xterm source)
+# ============================================================================================================
+# xterm's CASE_HPA/CHA, VPA, HPR and VPR call CursorSet with CursorRow(xw) / CursorCol(xw), which are cur_row - top_marg
+# and cur_col - lft_marg in origin mode and may be NEGATIVE (a cursor above or left of the margins; the asserts are off
+# in release builds); CursorSet adds the margin back, so the kept coordinate stays where it is, clamped only to the
+# bottom/right margin. `\x1b[?6h\x1b7` saves the home cursor WITH origin mode; DECRC after a DECSTBM/DECSLRM brings
+# it back above/left of the new margins in origin mode.
+
+### OR01_cha_in_origin_mode_keeps_a_row_above_the_region
+size: 8x10
+step: feed \x1b[?6h\x1b7\x1b[3;6r\x1b8\x1b[5G
+cite: [XT charproc.c CASE_HPA: CursorSet(screen, CursorRow(xw), one_if_default(0) - 1, xw->flags)]; [XT cursor.c CursorRow, CursorSet]
+note: DECRC restores row 0 (above the region 3-6) with origin mode on; CHA 5 keeps row 0. Same as before #97 (the default path).
+screen:
+>     |
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### OR02_hpa_in_origin_mode_keeps_a_row_above_the_region
+size: 8x10
+step: feed \x1b[?6h\x1b7\x1b[3;6r\x1b8\x1b[5`
+cite: [XT CASE_HPA (HPA shares the case with CHA)]
+screen:
+>     |
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### OR03_hpr_in_origin_mode_keeps_a_row_above_the_region
+size: 8x10
+step: feed \x1b[?6h\x1b7\x1b[3;6r\x1b8\x1b[2a
+cite: [XT CASE_HPR: CursorSet(screen, CursorRow(xw), CursorCol(xw) + n, flags)]
+correction: HPR here moved the cursor to the top margin (row 2) since #93; xterm keeps row 0.
+screen:
+>   |
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### OR04_vpr_in_origin_mode_from_above_the_region
+size: 8x10
+step: feed \x1b[?6h\x1b7\x1b[3;6r\x1b8\x1b[e
+cite: [XT CASE_VPR: CursorSet(screen, CursorRow(xw) + n, CursorCol(xw), flags)]
+correction: VPR here counted from the top margin (row 3) since #93; xterm moves from row 0 to row 1.
+screen:
+>
+> |
+>
+>
+>
+>
+>
+>
+cursor: (1,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### OR05_vpa_in_origin_mode_keeps_a_column_left_of_the_left_margin
+size: 4x10
+step: feed \x1b[?6h\x1b7\x1b[?69h\x1b[3;8s\x1b8\x1b[2d
+cite: [XT CASE_VPA: CursorSet(screen, one_if_default(0) - 1, CursorCol(xw), flags)]
+note: DECSLRM 3;8 homes to (0,2) in origin mode; DECRC brings back column 0, left of the left margin; VPA 2 keeps it.
+screen:
+>
+> |
+>
+>
+cursor: (1,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### OR06_hpr_in_origin_mode_from_left_of_the_left_margin
+size: 4x10
+step: feed \x1b[?6h\x1b7\x1b[?69h\x1b[3;8s\x1b8\x1b[a
+cite: [XT CASE_HPR: CursorCol = 0 - 2 = -2, + 1, + lft_marg 2 -> column 1]
+screen:
+>  |
+>
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### OR07_cr_in_origin_mode_from_left_of_the_left_margin_goes_to_the_margin
+size: 4x10
+step: feed \x1b[?6h\x1b7\x1b[?69h\x1b[3;8s\x1b8\r
+cite: [XT cursor.c CarriageReturn: `if (xw->flags & ORIGIN) col = left`]
+screen:
+>   |
+>
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### OR08_decrc_in_origin_mode_clamps_the_column_to_the_right_margin
+size: 4x10
+step: feed \x1b[?69h\x1b[3;8s\x1b[?6h\x1b[1;6H\x1b7\x1b[3;5s\x1b8X
+cite: [XT cursor.c CursorRestoreFlags -> CursorSet(row - top, col - lft, ORIGIN): column clamped to rgt_marg]
+note: saved at column 7 (origin column 6 of margins 3-8); margins 3-5 now, so DECRC puts the cursor on column 4 (the right margin) and X arms the wrap there.
+screen:
+>    X|
+>
+>
+>
+cursor: (0,4)
+pending_wrap: true
+requests: []
+scrollback: len=0
+
+### OR09_cbt_in_origin_mode_stops_at_the_left_margin
+size: 4x20
+step: feed \x1b[?69h\x1b[4;18s\x1b[?6h\x1b[1;10H\x1b[3Z
+cite: [XT tabs.c TabToPrevStop: `if (xw->flags & ORIGIN) ... next_column = left`]
+note: origin column 10 is absolute column 12 (0-based); three tab stops back would be column 0, below the left margin (3).
+screen:
+>    |
+>
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### OR10_cbt_without_origin_mode_ignores_the_margins
+size: 4x20
+step: feed \x1b[?69h\x1b[4;18s\x1b[1;13H\x1b[3Z
+cite: [E cbt.py test_CBT_IgnoresRegion]; [XT TabToPrevStop: the clamp is origin mode only]
+screen:
+> |
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### MI01_decawm_off_wide_char_at_an_inner_right_margin_is_dropped
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[?7l\x1b[1;6H\u{4e2d}
+cite: [XT charproc.c dotext: no room before the right margin and no wrap -> the character is not written]; print_c0/wide rows for the screen edge
+screen:
+>      |
+>
+>
+cursor: (0,5)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### MI02_cluster_does_not_grow_past_the_right_margin
+size: 3x10
+step: feed \x1b[?69h\x1b[3;6s\x1b[1;6H\u{2764}\u{fe0f}
+cite: Tessera rule (Grid::would_attach): a cluster grows from one column to two only with a free column before the line end; at the screen edge the same rule refuses it (wide.rs)
+note: the heart sits on the right margin with the wrap armed; VS16 would need column 7, past the margin, so it does not join and, being zero-width, is dropped.
+screen:
+>     ❤|
+>
+>
+cursor: (0,5)
+pending_wrap: true
+requests: []
+scrollback: len=0
+
+### MI03_decslrm_with_sub_parameters_is_ignored
+size: 3x10
+step: feed \x1b[?69h\x1b[3:6sabcdefghijk
+cite: csi.rs: a colon sub-parameter voids the mode and margin sequences, as in xterm, which takes colons only in SGR and XTMODKEYS
+note: the margins stay the full width and the cursor is not homed: row 0 fills, k wraps to column 1.
+screen:
+>abcdefghij\
+>k |
+>
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### RM06_decstr_resets_reverse_wrap
+size: 24x80
+step: feed \e[?45h\e[?1045h\e[!p\e[?45$p\e[?1045$p
+reply: \e[?45;2$y\e[?1045;2$y
+cite: [XT charproc.c ReallyReset: bitcpy(&xw->flags, xw->initflags, WRAPAROUND | REVERSEWRAP | REVERSEWRAP2) on DECSTR]

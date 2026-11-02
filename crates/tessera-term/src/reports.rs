@@ -4,7 +4,7 @@
 //!
 //! | Query | Name | Reply |
 //! |---|---|---|
-//! | `CSI c`, `CSI 0 c`, `ESC Z` | DA1, DECID | `CSI ? 1 ; 2 c` at level 1, `CSI ? 6L ; 22 c` at level L = 2..=5 |
+//! | `CSI c`, `CSI 0 c`, `ESC Z` | DA1, DECID | `CSI ? 1 ; 2 c` at level 1, `CSI ? 6L ; 22 c` at level L = 2 and 3, `CSI ? 6L ; 21 ; 22 c` at L = 4 and 5 |
 //! | `CSI > c`, `CSI > 0 c` | DA2 | `CSI > 1 ; Pv ; 0 c`, Pv = [`DA2_PV`] |
 //! | `CSI = c`, `CSI = 0 c` | DA3 | `DCS ! \| 00000000 ST` at level 4 and up |
 //! | `CSI > q`, `CSI > 0 q` | XTVERSION | `DCS > \| Tessera <version> ST` |
@@ -13,7 +13,7 @@
 //! | `CSI ? Ps n` | DEC DSR | `?6` DECXCPR, `?15`, `?25`, `?26`, `?55`, `?56`, `?75`, `?85` with xterm's level gates |
 //! | `CSI Ps $ p`, `CSI ? Ps $ p` | DECRQM | `CSI Ps ; Pm $ y`, `CSI ? Ps ; Pm $ y`, one for every query |
 //! | `CSI ? u` | kitty keyboard flags | `CSI ? flags u` from the active screen's stack |
-//! | `DCS $ q Pt ST` | DECRQSS | `DCS 1 $ r ... ST` for `m`, `r`, ` q` and `" p`, `DCS 0 $ r ST` otherwise |
+//! | `DCS $ q Pt ST` | DECRQSS | `DCS 1 $ r ... ST` for `m`, `r`, `s` (level 4 and up), ` q` and `" p`, `DCS 0 $ r ST` otherwise |
 //! | `CSI 14 t`, `CSI 16 t` | XTWINOPS | text area and cell size in pixels, once [`Terminal::set_cell_pixels`] knows the cell |
 //! | `CSI 18 t`, `CSI 19 t` | XTWINOPS | `CSI 8 ; rows ; cols t`, `CSI 9 ; rows ; cols t` |
 //! | `CSI 22 ; Ps t`, `CSI 23 ; Ps t` | title stack | push / pop the window title; a pop sends [`Request::SetTitle`], nothing is replied |
@@ -32,7 +32,8 @@
 //! before the version and no parenthesis, so tmux matches none of its
 //! known terminal prefixes), DA2 answers the VT220 class `1` with a
 //! version above vim's "not an xterm" mark and Pc 0, and DA1 advertises
-//! only what Tessera implements: 22 (ANSI colour). DA1 follows DECSCL's
+//! only what Tessera implements: 22 (ANSI colour) and, from level 4, 21
+//! (horizontal scrolling: left and right margins). DA1 follows DECSCL's
 //! level, as on DEC's VT510 (xterm keeps its `decTerminalID`); level 5
 //! answers as a VT525. DA2 does not follow the level.
 //!
@@ -206,11 +207,15 @@ impl State {
         self.pending.push(Request::Reply(bytes));
     }
 
-    /// DA1 (`CSI c`, `CSI 0 c`) and DECID (`ESC Z`).
+    /// DA1 (`CSI c`, `CSI 0 c`) and DECID (`ESC Z`). From level 4 the
+    /// feature list has 21 (horizontal scrolling: DECLRMM and DECSLRM,
+    /// which work only there), in xterm's ascending order; tmux uses left
+    /// and right margins only when it sees 21 (ADR 0028).
     pub(crate) fn primary_device_attributes(&mut self) {
         match self.conformance_level {
             1 => self.reply_csi(format_args!("?1;2c")),
-            level => self.reply_csi(format_args!("?6{level};22c")),
+            level @ 2..=3 => self.reply_csi(format_args!("?6{level};22c")),
+            level => self.reply_csi(format_args!("?6{level};21;22c")),
         }
     }
 
@@ -245,7 +250,8 @@ impl State {
                 // `origin_row` subtracts the top margin in origin mode; a
                 // pending wrap keeps the cursor on the last column.
                 let row = u32::from(grid.origin_row()) + 1;
-                let col = u32::from(grid.cursor().col) + 1;
+                // From the left margin in origin mode, as xterm counts.
+                let col = u32::from(grid.origin_col()) + 1;
                 // DECXCPR appends the page from level 3 (xterm, with its
                 // default terminal id 420).
                 let page = if dec && level >= 3 { ";1" } else { "" };
@@ -318,6 +324,10 @@ impl State {
             12 => of(modes.cursor_blink),
             25 => of(modes.cursor_visible),
             40 => of(modes.allow_column_change),
+            45 => of(modes.reverse_wrap),
+            // DECLRMM exists from level 4 (xterm answers 0 below it).
+            69 if self.conformance_level >= 4 => of(modes.left_right_margins),
+            1045 => of(modes.reverse_wrap_extended),
             47 | 1047 | 1049 => of(self.grid.is_alt_screen()),
             66 => of(self.keyboard.application_keypad),
             1000 => of(modes.mouse == MouseTracking::Normal),
@@ -393,6 +403,13 @@ impl State {
                 let region = self.grid.scroll_region();
                 let (top, bottom) = (u32::from(region.top) + 1, u32::from(region.bottom) + 1);
                 self.reply_dcs(format_args!("1$r{top};{bottom}r"));
+            }
+            // DECSLRM: the margins whether or not DECLRMM is on, from level
+            // 4 (xterm; invalid below it).
+            b"s" if self.conformance_level >= 4 => {
+                let margins = self.grid.margins();
+                let (left, right) = (u32::from(margins.left) + 1, u32::from(margins.right) + 1);
+                self.reply_dcs(format_args!("1$r{left};{right}s"));
             }
             b" q" => {
                 let style = self.cursor_style();

@@ -221,53 +221,72 @@ impl Line {
         }
     }
 
-    /// Inserts `n` blanks at `col`, shifting the rest of the line right;
-    /// cells pushed past the end are lost (ICH). A wide character split by
-    /// the insertion point, or whose spacer is pushed off the end, is
-    /// blanked whole. `col + n` must not exceed the line length.
-    pub(crate) fn insert_blanks(&mut self, col: usize, n: usize, style: Style) {
+    /// Blanks a wide character cut by either edge of `span`: one whose
+    /// left half is just before `span.start` and spacer at it, or whose
+    /// left half is the last cell of `span` and spacer just after it. Both
+    /// halves become blanks of `style`'s background, so moving the cells of
+    /// `span` never splits a pair (xterm `scrollInMargins`).
+    pub(crate) fn split_wide_at_edges(&mut self, span: std::ops::Range<usize>, style: Style) {
         let cols = self.cells.len();
-        if n == 0 || col >= cols {
+        if span.start > 0 && self.cells.get(span.start).is_some_and(Cell::is_spacer) {
+            self.blank_at(span.start - 1, style);
+            self.blank_at(span.start, style);
+        }
+        if span.end > 0 && span.end < cols && self.cells[span.end].is_spacer() {
+            self.blank_at(span.end - 1, style);
+            self.blank_at(span.end, style);
+        }
+    }
+
+    /// Inserts `n` blanks at `col`, shifting the cells up to `end`
+    /// (exclusive: the right margin plus one, or the line length) right;
+    /// cells pushed past `end` are lost and cells from `end` on do not
+    /// move (ICH, DECIC). A wide character split by the insertion point,
+    /// cut by `end` or whose spacer is pushed past `end` is blanked whole.
+    /// `col + n` must not exceed `end`, nor `end` the line length.
+    pub(crate) fn insert_blanks(&mut self, col: usize, n: usize, end: usize, style: Style) {
+        let end = end.min(self.cells.len());
+        if n == 0 || col >= end {
             return;
         }
-        if self.cells[col].is_spacer() && col > 0 {
-            self.blank_at(col - 1, style);
-        }
-        self.cells[col..].rotate_right(n);
-        self.graphemes.shift_right(col, n, cols);
+        // A wide character split by `col` or cut by `end` goes whole.
+        self.split_wide_at_edges(col..end, style);
+        self.cells[col..end].rotate_right(n);
+        self.graphemes.shift_right(col, n, end);
         // The cells that wrapped around to `col..col + n` are blanked
         // below; their clusters were already dropped by the shift.
-        if self.cells.get(col + n).is_some_and(Cell::is_spacer) {
+        if col + n < end && self.cells[col + n].is_spacer() {
             self.blank_at(col + n, style);
         }
-        if self.cells[cols - 1].is_wide() {
-            self.blank_at(cols - 1, style);
+        if self.cells[end - 1].is_wide() {
+            self.blank_at(end - 1, style);
         }
         self.cells[col..col + n].fill(Cell::blank_with(style));
         // Padding (only ever the last column) was pushed off the end or,
-        // with `col` on it, blanked: nothing to unpad.
+        // with `col` on it, blanked; with `end` short of the last column
+        // it does not move: nothing to unpad.
     }
 
-    /// Deletes `n` cells at `col`, shifting the rest of the line left and
-    /// filling the end with blanks (DCH). A wide character split by either
-    /// end of the deleted range is blanked whole. `col + n` must not exceed
-    /// the line length.
-    pub(crate) fn delete_cells(&mut self, col: usize, n: usize, style: Style) {
-        let cols = self.cells.len();
-        if n == 0 || col >= cols {
+    /// Deletes `n` cells at `col`, shifting the cells up to `end`
+    /// (exclusive: the right margin plus one, or the line length) left and
+    /// filling the `n` cells before `end` with blanks; cells from `end` on
+    /// do not move (DCH, DECDC). A wide character split by either end of
+    /// the deleted range or cut by `end` is blanked whole. `col + n` must
+    /// not exceed `end`, nor `end` the line length.
+    pub(crate) fn delete_cells(&mut self, col: usize, n: usize, end: usize, style: Style) {
+        let end = end.min(self.cells.len());
+        if n == 0 || col >= end {
             return;
         }
-        if self.cells[col].is_spacer() && col > 0 {
-            self.blank_at(col - 1, style);
-        }
-        self.cells[col..].rotate_left(n);
-        self.graphemes.delete(col, n);
+        self.split_wide_at_edges(col..end, style);
+        self.cells[col..end].rotate_left(n);
+        self.graphemes.delete(col, n, end);
         if self.cells[col].is_spacer() {
             self.blank_at(col, style);
         }
         // The deleted cells rotated to the end; their clusters are gone.
-        self.cells[cols - n..].fill(Cell::blank_with(style));
-        self.unpad(col..cols - n);
+        self.cells[end - n..end].fill(Cell::blank_with(style));
+        self.unpad(col..end - n);
     }
 
     /// Clears [`CellFlags::PAD`] in `range`: a padding cell that an
