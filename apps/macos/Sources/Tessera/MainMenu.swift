@@ -58,7 +58,7 @@ enum MainMenu {
         return menu
     }
 
-    /// Copy and Select All stay disabled until the selection model (#30);
+    /// Copy is enabled while something is selected, Select All always;
     /// paste goes to the session, which sanitises it and brackets it when the
     /// terminal asks (D5).
     private static func makeEditMenu() -> NSMenu {

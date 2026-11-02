@@ -64,10 +64,10 @@ configurable key map (#43).
 | ⌘W | Shell > Close Tab | Closes the current tab |
 | ⇧⌘W | Shell > Close Window | Closes every tab of the current window |
 | ⌘K | Shell > Clear to Start | Clears the scrollback and the screen above the prompt line |
-| ⌘C | Edit > Copy | Copies the selection (once selection lands) |
+| ⌘C | Edit > Copy | Copies the selected text (plain text; nothing is copied by selecting) |
 | ⌘V | Edit > Paste | Pastes the clipboard's text (bracketed when the program asks) |
 | ⌥⇧⌘V | Edit > Paste as Plain Text | The same as Paste for now |
-| ⌘A | Edit > Select All | Selects everything (once selection lands) |
+| ⌘A | Edit > Select All | Selects the scrollback and the screen |
 | ⌘+ or ⌘= | View > Bigger | Text 1 pt larger, in the current tab |
 | ⌘- | View > Smaller | Text 1 pt smaller, in the current tab |
 | ⌘0 | View > Actual Size | Back to the configured font size |
@@ -75,6 +75,12 @@ configurable key map (#43).
 | ⇧⌘[ and ⇧⌘] | Window > Show Previous/Next Tab | Moves between tabs |
 | ⌘1 to ⌘9 | Window > Select Tab | Selects one of the first nine tabs |
 | ⌘? | Help > Tessera Help | Opens this page |
+
+Mouse: drag to select, double-click for a word, triple-click for a line, ⇧-click to move the nearer end of the
+selection, ⌥-drag (or ⌥⌘-drag) for a block. Dragging above or below the window scrolls. ⌘-hover underlines a link,
+⌘-click opens `http`, `https`, `mailto`, `ftp` and local `file` links (a local app, script or
+similar file is shown in Finder instead of launched). A program that tracks the mouse gets the clicks
+instead; hold ⇧ to select anyway.
 
 ## Development with agents
 

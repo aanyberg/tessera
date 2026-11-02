@@ -706,7 +706,22 @@ has_selection: true
 text: "hello"
 cite: D-CLEAR (cursor is not row content)
 
-### G07_history_eviction_of_a_selected_line_clears
+### G07_history_eviction_of_the_top_of_a_selection_trims_its_start
+layer: core
+size: 2x5
+scrollback: 2
+step: feed l1\r\nl2\r\nl3\r\nl4
+step: scroll 2
+step: begin 0,1 char
+step: extend 1,1
+step: feed \r\nl5
+sel: linear (0,0)-(0,1)
+has_selection: true
+text: "l2"
+cite: LD-1 (lead 2026-11-02): the start moves to the oldest line left, column 0, instead of clearing; [IT-sel] iTermSelection clips sub-selections that move above the first line (scrollbackOverflowDidChange); ADR23 (cap eviction)
+note: History [l1,l2], selection (l1,1)-(l2,1). `l5` pushes l3 and evicts l1: the selection is (l2,0)-(l2,1) = "l2".
+
+### G07b_history_eviction_of_the_whole_selection_clears
 layer: core
 size: 2x5
 scrollback: 2
@@ -718,8 +733,86 @@ step: feed \r\nl5
 sel: none
 has_selection: false
 text: none
-cite: D-CLEAR ("the history evicts any selected line"); ADR23 (cap eviction)
-note: History [l1,l2]; the selection is on l1; `l5` pushes l3 and evicts l1.
+cite: LD-1: only a selection with no line left is cleared; ADR23 (cap eviction)
+note: History [l1,l2]; the selection is on l1 only; `l5` pushes l3 and evicts l1.
+
+### G07c_select_all_during_output_keeps_the_surviving_text
+layer: core
+size: 2x5
+scrollback: 2
+step: feed l1\r\nl2\r\nl3\r\nl4
+step: all
+step: feed \r\nl5
+has_selection: true
+text: "l2\nl3\nl4"
+cite: LD-1: Select All then Copy during continuous output copies what is left of the selection
+note: Select All covers l1..l4 (history l1,l2; screen l3,l4). `l5` evicts l1 and scrolls l3 into history: the selection is l2..l4; l5 is not selected (K06).
+
+### G07f_select_all_then_output_on_the_blank_cursor_row_keeps_the_selection
+layer: core
+size: 3x8
+scrollback: 100
+step: feed l1\r\nl2\r\nl3\r\n
+step: all
+step: feed m0\r\n
+sel: linear (0,0)-(0,7)
+has_selection: true
+text: "l1\nl2\nl3"
+cite: lead decision 2026-11-02 (round 1, B1): Select All stops at the last row with text, so the next line of yes or tail -f, written on the cursor's blank row, is not a change of a selected row
+note: After `l3` and its newline the screen is l2,l3,blank (cursor on the blank row; l1 in history). Select All covers l1..l3; `m0` fills the blank row below the selection and scrolls l3 to the top row: the view clips the selection to (0,0)-(0,7). m0 is not selected (K06).
+
+### G07g_select_all_with_the_history_at_its_cap_trims_and_keeps_the_selection
+layer: core
+size: 3x8
+scrollback: 2
+step: feed l1\r\nl2\r\nl3\r\nl4\r\n
+step: all
+step: feed m0\r\n
+sel: linear (0,0)-(0,7)
+has_selection: true
+text: "l2\nl3\nl4"
+cite: lead decision 2026-11-02 (round 1, B1) with LD-1: eviction at the cap trims the start and the output below the last text row does not clear
+note: History [l1,l2] and screen l3,l4,blank before; `m0` evicts l1 (history l2,l3, screen l4,m0,blank): the selection is l2..l4.
+
+### G07h_select_all_then_output_over_the_last_text_row_clears
+layer: core
+size: 3x8
+scrollback: 100
+step: feed l1\r\nl2\r\nl3\r\n
+step: all
+step: feed \x1b[A\rm0
+sel: none
+has_selection: false
+text: none
+cite: D6 (a change of a selected live row clears); lead decision 2026-11-02 (round 1, B1): the remaining limit of the narrow rule
+note: Screen l2,l3,blank; the cursor moves up onto `l3` and overwrites it.
+
+### G07d_ed3_clears_a_selection_that_held_a_history_line
+layer: core
+size: 2x5
+scrollback: 5
+step: feed l1\r\nl2\r\nl3\r\nl4
+step: all
+step: feed \x1b[3J
+sel: none
+has_selection: false
+text: none
+cite: LD-1 limits the trim to eviction at the cap (lead 2026-11-02): ED 3 removes selected lines, which keeps clearing the selection (D-CLEAR); ADR23 (ED 3 empties the history)
+note: Select All covers l1..l4 (history l1,l2); ED 3 removes the history, so a selected line is gone.
+
+### G07e_ed3_keeps_a_selection_on_screen_rows_only
+layer: core
+size: 2x5
+scrollback: 5
+step: feed l1\r\nl2\r\nl3\r\nl4
+step: begin 0,0 char
+step: extend 1,1
+step: feed \x1b[3J
+sel: linear (0,0)-(1,1)
+has_selection: true
+text: "l3\nl4"
+cite: no selected line is removed by ED 3 (the screen stays)
+note: Screen l3,l4 selected; the history l1,l2 is erased.
 
 ### G08_resize_clears
 layer: core

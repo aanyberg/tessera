@@ -5,7 +5,7 @@
 //!
 //! The fixture's `###` layout has its own parser here. A row with a key,
 //! step or value it cannot interpret fails the test, and so does a file
-//! with another number of rows than the 116 (79 core, 37 url) it holds.
+//! with another number of rows than the 123 (86 core, 37 url) it holds.
 
 use std::fmt::Write as _;
 use std::panic::{self, AssertUnwindSafe};
@@ -15,7 +15,7 @@ use tessera_app_core::{
 };
 
 const FIXTURE: &str = include_str!("fixtures/selection_spec.txt");
-const CORE_ROWS: usize = 79;
+const CORE_ROWS: usize = 86;
 const URL_ROWS: usize = 37;
 /// The history cap of a row without `scrollback:`.
 const DEFAULT_SCROLLBACK: usize = 100;

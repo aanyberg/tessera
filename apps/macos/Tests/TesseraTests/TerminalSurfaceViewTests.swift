@@ -1211,20 +1211,21 @@ final class TerminalSurfaceViewTests: XCTestCase {
         XCTAssertFalse(isEnabled(clear))
     }
 
-    func testCopyAndSelectAllAreDisabledWithoutASelection() async throws {
+    func testCopyNeedsASelectionAndSelectAllNeedsNone() async throws {
         let copy = #selector(TerminalSurfaceView.copy(_:))
         let selectAll = #selector(TerminalSurfaceView.selectAll(_:))
         XCTAssertFalse(view.hasSelection)
         XCTAssertFalse(isEnabled(copy))
-        XCTAssertFalse(isEnabled(selectAll))
-        // Wired, so the selection model (#30) only has to supply the text.
-        view.hasSelection = true
-        XCTAssertTrue(isEnabled(copy))
-        XCTAssertTrue(isEnabled(selectAll))
+        XCTAssertTrue(isEnabled(selectAll), "there is something to select even when nothing is")
         view.pasteboard.clearContents()
         view.copy(nil)
+        XCTAssertNil(view.pasteboard.string(forType: .string), "nothing selected, nothing copied")
         view.selectAll(nil)
-        XCTAssertNil(view.pasteboard.string(forType: .string), "nothing to copy yet")
+        XCTAssertTrue(view.hasSelection)
+        XCTAssertTrue(isEnabled(copy))
+        view.copy(nil)
+        XCTAssertEqual(view.pasteboard.string(forType: .string), "R", "the recorder printed R: the screen's only text")
+        XCTAssertTrue(view.hasSelection, "copying keeps the selection")
         try await assertBytes([])
     }
 
