@@ -3,8 +3,9 @@ import QuartzCore
 import TesseraKit
 import os
 
-/// A tab's terminal: a layer-backed view whose `CAMetalLayer` the core draws
-/// the session into (ADR 0017).
+/// A tab's terminal: the core draws the session into the `CAMetalLayer` of
+/// its ``TerminalRenderView`` subview (ADR 0017), beside or under the
+/// scroll bar (ADR 0032).
 ///
 /// - Surface: attached when the view enters a window, detached when it
 ///   leaves or the window closes. Size changes reach the core through
@@ -27,7 +28,8 @@ import os
 ///   the View menu's ⌘↑/⌘↓ page and ⌘Home/⌘End jump (``scroll(to:)``);
 ///   ``TerminalScroller`` shows and moves the position. Typing, pasting and
 ///   starting a composition return to the live screen, and drop the rest
-///   of a trackpad gesture's momentum.
+///   of a trackpad gesture's momentum. Nothing scrolls while text is
+///   marked.
 @MainActor
 final class TerminalSurfaceView: NSView, TerminalContentView {
     private static let log = Logger(subsystem: "com.aanyberg.tessera", category: "surface")
@@ -132,14 +134,23 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
 
     // Scrollback state.
 
-    /// The scroll bar along the right edge, over the text.
+    /// The scroll bar along the right edge: over the text in overlay style,
+    /// beside it in legacy style (ADR 0032).
     let scroller = TerminalScroller()
     /// Momentum events are dropped until the next gesture begins: a key, a
     /// paste or a keyboard scroll moved the view since the gesture whose
     /// momentum is still arriving, which would otherwise carry the view
     /// away from where the user just put it (the live screen, after
-    /// typing).
-    private(set) var ignoresMomentum = false
+    /// typing). See ``scrollWheel(with:)`` for what counts as a new gesture.
+    private(set) var ignoresMomentum = false {
+        didSet { if ignoresMomentum && !oldValue { phasedEventSinceIgnoring = false } }
+    }
+    /// A scroll event with a gesture phase arrived since ``ignoresMomentum``
+    /// was set (a later key while it is set does not reset this): momentum
+    /// that begins now ends that gesture, not a new one.
+    private var phasedEventSinceIgnoring = false
+    /// Scroll events handed to the session (tests).
+    private(set) var sentScrollCount = 0
 
     // Menu state (Edit and View menus).
 
@@ -163,12 +174,10 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     init(session: TesseraSession, frame: NSRect = NSRect(x: 0, y: 0, width: 480, height: 200)) {
         self.session = session
         surface = TesseraSurface(session: session)
+        renderView = TerminalRenderView(frame: NSRect(origin: .zero, size: frame.size))
         super.init(frame: frame)
         wantsLayer = true
-        // The core draws every frame; AppKit must neither redraw nor stretch
-        // the layer's contents while a resize is coalesced.
-        layerContentsRedrawPolicy = .never
-        layerContentsPlacement = .topLeft
+        addSubview(renderView)
 
         markedTextLayer.isHidden = true
         markedTextLayer.contentsScale = metalLayer.contentsScale
@@ -185,11 +194,10 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
             statusLabel.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
         ])
 
-        let width = TerminalScroller.width
-        scroller.frame = NSRect(x: frame.width - width, y: 0, width: width, height: frame.height)
-        scroller.autoresizingMask = [.minXMargin, .height]
-        scroller.onScroll = { [weak self] target in self?.scroll(to: target) }
+        scroller.onScroll = { [weak self] target in self?.scrollerMoved(to: target) }
+        scroller.onStyleChange = { [weak self] in self?.scrollerStyleChanged() }
         addSubview(scroller)
+        layoutRenderViewAndScroller()
 
         // Plain motion (no button held) while the window is key, for
         // programs that track every motion (DECSET 1003). AppKit keeps the
@@ -206,30 +214,38 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
 
     // MARK: Layer
 
-    /// The backing layer the core draws into.
-    var metalLayer: CAMetalLayer {
-        // `makeBackingLayer` makes it; `wantsLayer` is set in `init`.
-        layer as! CAMetalLayer  // swiftlint:disable:this force_cast
+    /// The subview whose backing layer the core draws into: the whole view
+    /// with an overlay scroll bar, the view less the scroll bar's width
+    /// with a legacy one (ADR 0032).
+    let renderView: TerminalRenderView
+
+    /// The layer the core draws into.
+    var metalLayer: CAMetalLayer { renderView.metalLayer }
+
+    /// Lays out the render view and the scroll bar for the scroll bar's
+    /// style: a legacy scroll bar sits beside the text and takes its width
+    /// off the grid, an overlay one floats over the text. The width depends
+    /// on the style only, never on the history or the screen shown, so the
+    /// alternate screen never resizes the grid.
+    private func layoutRenderViewAndScroller() {
+        let style = scroller.effectiveStyle
+        let reserved = style == .legacy ? TerminalScroller.width(for: .legacy) : 0
+        let render = NSRect(x: 0, y: 0, width: max(0, bounds.width - reserved), height: bounds.height)
+        let width = TerminalScroller.width(for: style)
+        let bar = NSRect(x: bounds.width - width, y: 0, width: width, height: bounds.height)
+        guard render != renderView.frame || bar != scroller.frame else { return }
+        renderView.frame = render
+        scroller.frame = bar
+        window?.invalidateCursorRects(for: self)
     }
 
-    override func makeBackingLayer() -> CALayer {
-        let layer = CAMetalLayer()
-        // The core reconfigures device, pixel format, drawable size and
-        // opacity (from the theme's alpha) on attach.
-        layer.framebufferOnly = true
-        layer.isOpaque = true
-        layer.contentsGravity = .topLeft
-        layer.needsDisplayOnBoundsChange = false
-        layer.contentsScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1
-        return layer
-    }
-
-    override var isOpaque: Bool { metalLayer.isOpaque }
-
-    override var wantsUpdateLayer: Bool { true }
-
-    override func updateLayer() {
-        // Drawn by the core through the display link.
+    /// The system's "Show scroll bars" setting (or the test override)
+    /// changed: the grid takes the new width, through the same path as a
+    /// window resize (one core resize, coalesced during a live resize).
+    private func scrollerStyleChanged() {
+        layoutRenderViewAndScroller()
+        window?.invalidateCursorRects(for: self)
+        surfaceSizeChanged()
     }
 
     // MARK: Window
@@ -281,6 +297,7 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         }
         metalLayer.contentsScale = window.backingScaleFactor
         markedTextLayer.contentsScale = window.backingScaleFactor
+        layoutRenderViewAndScroller()
         attachSurface()
         let link = displayLink(target: DisplayLinkTarget(self), selector: #selector(DisplayLinkTarget.tick(_:)))
         link.add(to: .main, forMode: .common)
@@ -352,9 +369,9 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
 
     // MARK: Surface size
 
-    /// The view's size in physical pixels and its backing scale.
+    /// The render view's size in physical pixels and its backing scale.
     var pixelSize: TesseraSurface.Size {
-        let backing = convertToBacking(bounds).size
+        let backing = renderView.convertToBacking(renderView.bounds).size
         let scale = window?.backingScaleFactor ?? metalLayer.contentsScale
         return TesseraSurface.Size(
             widthPx: UInt32(max(0, backing.width.rounded())), heightPx: UInt32(max(0, backing.height.rounded())),
@@ -434,11 +451,13 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
 
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
+        layoutRenderViewAndScroller()
         surfaceSizeChanged()
     }
 
     override func layout() {
         super.layout()
+        layoutRenderViewAndScroller()
         surfaceSizeChanged()
     }
 
@@ -665,7 +684,23 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     }
 
     override func resetCursorRects() {
-        addCursorRect(bounds, cursor: .iBeam)
+        for (rect, cursor) in cursorRects() {
+            addCursorRect(rect, cursor: cursor)
+        }
+    }
+
+    /// The pointer's cursor: an I-beam over the text, an arrow over the
+    /// scroll bar while it is not hidden (an overlay one shows when the
+    /// pointer reaches it). The rects do not overlap, since AppKit leaves
+    /// overlapping cursor rects undefined: over an overlay scroll bar the
+    /// I-beam stops at its edge.
+    func cursorRects() -> [(NSRect, NSCursor)] {
+        guard !scroller.isHidden else { return [(bounds, .iBeam)] }
+        let text = renderView.frame
+        let bar = scroller.frame
+        let beam = NSRect(
+            x: text.minX, y: text.minY, width: max(0, min(text.maxX, bar.minX) - text.minX), height: text.height)
+        return [(beam, .iBeam), (bar, .arrow)]
     }
 
     // MARK: Keyboard
@@ -973,16 +1008,37 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     }
 
     /// Wheel and trackpad scrolling, momentum included, go to the core,
-    /// which moves the view (or sends cursor keys on the alternate screen).
+    /// which moves the view, sends cursor keys on the alternate screen or
+    /// reports the wheel to a program tracking the mouse (ADR 0027).
+    ///
     /// After a key, a paste or a keyboard scroll, momentum events are
-    /// dropped until the next gesture begins (``ignoresMomentum``).
+    /// dropped until the next gesture begins (``ignoresMomentum``). A new
+    /// gesture is an event whose gesture phase begins; a precise event with
+    /// no phase at all (a device or utility that sends none); or momentum
+    /// that begins with no gesture phase, unless a phased event arrived
+    /// since the key (then it is the momentum of the gesture the key
+    /// interrupted). A notched wheel sends no momentum, so it is never
+    /// dropped (ADR 0032).
+    ///
+    /// While text is marked the event is dropped whole after that
+    /// bookkeeping: the input method owns input during a composition, and
+    /// the core cannot be asked to report the wheel without scrolling.
     override func scrollWheel(with event: NSEvent) {
-        if event.phase.contains(.began) {
+        let gesture = event.phase
+        let momentum = event.momentumPhase
+        if !gesture.isEmpty {
+            phasedEventSinceIgnoring = true
+        }
+        if gesture.contains(.began)
+            || (gesture.isEmpty && momentum.isEmpty && event.hasPreciseScrollingDeltas)
+            || (gesture.isEmpty && momentum.contains(.began) && !phasedEventSinceIgnoring)
+        {
             ignoresMomentum = false
         }
-        if ignoresMomentum, !event.momentumPhase.isEmpty {
+        if ignoresMomentum, !momentum.isEmpty {
             return
         }
+        guard !hasMarkedText() else { return }
         let point = convert(event.locationInWindow, from: nil)
         let (cell, _) = cell(at: point)
         let scale: CGFloat = metrics.map { CGFloat($0.scale) } ?? window?.backingScaleFactor ?? 1
@@ -1000,11 +1056,19 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
             deltaYPx: Float(event.scrollingDeltaY * (event.hasPreciseScrollingDeltas ? scale : 1)),
             precise: event.hasPreciseScrollingDeltas, col: cell.col, row: cell.row,
             modifiers: Self.modifiers(of: event))
+        sentScrollCount += 1
         do {
+            // The core says `.consumed` for a wheel it reported to a program
+            // as well as for one that moved the view: the scroll bar shows
+            // only when the offset changed. Output that pushes lines while
+            // the view is scrolled back between the two reads can show it
+            // once for a reported wheel (accepted).
+            let before = try? session.scrollPosition
             if try session.send(scroll: scroll) == .consumed {
-                // The view moved through the scrollback.
                 needsRender = true
-                scroller.flash()
+                if let before, let after = try? session.scrollPosition, after.offset != before.offset {
+                    scroller.flash()
+                }
             }
         } catch {
             Self.log.debug("scroll not sent: \(String(describing: error), privacy: .public)")
@@ -1015,7 +1079,9 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
 
     /// Moves the view in the scrollback (the menu's keys, the scroll bar,
     /// a composition starting) and redraws. Like a key, it ends the
-    /// momentum of the gesture before: the view stays where it was put.
+    /// momentum of the gesture before: the view stays where it was put. The
+    /// scroll bar shows even if the view was already there, as feedback for
+    /// the command.
     func scroll(to target: TesseraSession.ScrollTarget) {
         do {
             try session.scroll(to: target)
@@ -1028,14 +1094,26 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         scroller.flash()
     }
 
+    /// The user dragged the scroll bar's knob or clicked its track. While
+    /// text is marked nothing moves (the input method owns input); the knob
+    /// returns to the view's position when the button goes up.
+    private func scrollerMoved(to target: TesseraSession.ScrollTarget) {
+        guard !hasMarkedText() else { return }
+        scroll(to: target)
+    }
+
     /// Shows the session's scroll position in the scroll bar. Called with
     /// every frame, which output and scrolling ask for, so the bar follows
     /// both with one read of the core per frame at most.
     private func updateScroller() {
+        let wasHidden = scroller.isHidden
         do {
             scroller.update(try session.scrollPosition)
         } catch {
             // The session closed; the window closes with it.
+        }
+        if scroller.isHidden != wasHidden {
+            window?.invalidateCursorRects(for: self)
         }
     }
 
@@ -1163,7 +1241,7 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         markedTextLayer.string = display
         // The layer tree is not flipped: its origin is the bottom left.
         let layerY = isFlipped ? bounds.height - cell.maxY : cell.minY
-        let available = max(cell.width, bounds.width - cell.minX)
+        let available = max(cell.width, renderView.frame.width - cell.minX)
         markedTextLayer.frame = CGRect(
             x: cell.minX, y: layerY, width: min(max(width, cell.width), available), height: cell.height)
         markedTextLayer.isHidden = false
@@ -1217,6 +1295,12 @@ extension TerminalSurfaceView: NSMenuItemValidation {
         case #selector(resetFontSize(_:)):
             guard let size = metrics?.fontSizePt, let attached = attachedFontSizePt else { return false }
             return size != attached
+        case #selector(scrollToTop(_:)), #selector(scrollToBottom(_:)), #selector(scrollPageUpInHistory(_:)),
+            #selector(scrollPageDownInHistory(_:)):
+            // During a composition the items are disabled, so ⌘↑/⌘↓/⌘Home/⌘End
+            // do not scroll; AppKit swallows them rather than handing them to
+            // the input method (ADR 0032).
+            return !hasMarkedText()
         default:
             return true
         }

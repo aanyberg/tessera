@@ -44,9 +44,13 @@ final class TerminalScrollTests: XCTestCase {
     /// before that would race `stty`: the cooked terminal echoes input
     /// itself, as well as `cat`, and holds an escape sequence until a
     /// newline.
-    private func open(lines: Int = 1000) async throws {
+    ///
+    /// `modes` (printf escapes) is printed before the lines, so the core
+    /// has parsed it once the lines are in the session.
+    private func open(lines: Int = 1000, modes: String = "") async throws {
         appDelegate.spawnOptions = .init(
-            program: "/bin/sh", arguments: ["-c", "seq 1 \(lines); stty raw -echo; printf '\\n'; exec cat"])
+            program: "/bin/sh",
+            arguments: ["-c", "printf '\(modes)'; seq 1 \(lines); stty raw -echo; printf '\\n'; exec cat"])
         let controller = try appDelegate.newWindow()
         view = try XCTUnwrap(controller.contentView as? TerminalSurfaceView)
         window = KeyControlledWindow(contentRect: view.frame)
@@ -428,6 +432,9 @@ final class TerminalScrollTests: XCTestCase {
         XCTAssertEqual(try position.offset, before, "a click below the knob pages down")
     }
 
+    // The line parts are deprecated (macOS draws no scroller arrows), but
+    // VoiceOver's increment and decrement buttons still reach them.
+    @available(macOS, deprecated: 10.14)
     func testOnlyADraggedKnobIgnoresNewPositions() {
         // A held click in the track pages until the knob reaches the
         // pointer: the knob must follow each page there.
@@ -520,11 +527,11 @@ final class TerminalScrollTests: XCTestCase {
         XCTAssertEqual(cell.maxY, view.bounds.height - fromTop, accuracy: 0.01)
         let overlay = try XCTUnwrap(view.markedTextOverlay)
         XCTAssertEqual(overlay.frame.minY, cell.minY, accuracy: 0.01)
-        // Scrolling back during the composition is the user's choice; the
-        // next update of the same composition does not undo it.
+        // During the composition ⌘↑ does not scroll (ADR 0032), and the
+        // next update of the composition stays put.
         try press(commandUp())
         view.setMarkedText("にほ", selectedRange: NSRange(location: 2, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
-        XCTAssertGreaterThan(try position.offset, 0)
+        XCTAssertEqual(try position.offset, 0)
         view.unmarkText()
     }
 
@@ -535,6 +542,470 @@ final class TerminalScrollTests: XCTestCase {
         XCTAssertEqual(try position.offset, 0)
         XCTAssertFalse(view.ignoresMomentum, "nothing moved, so a gesture's momentum carries on")
         view.unmarkText()
+    }
+
+    // MARK: Momentum after a key (ADR 0032)
+
+    /// A key that returns the view to the live screen, dropping momentum.
+    private func typeA() throws {
+        view.processKeyDown(
+            try XCTUnwrap(
+                NSEvent.keyEvent(
+                    with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+                    windowNumber: window.windowNumber, context: nil, characters: "a", charactersIgnoringModifiers: "a",
+                    isARepeat: false, keyCode: 0))
+        ) { view.insertText("a", replacementRange: NSRange(location: NSNotFound, length: 0)) }
+        XCTAssertEqual(try position.offset, 0, "typing returns to the live screen")
+        XCTAssertTrue(view.ignoresMomentum)
+    }
+
+    /// A notched mouse wheel's event: whole lines, no phases, not precise.
+    private func notched(_ lines: Int32) throws -> NSEvent {
+        let event = try XCTUnwrap(
+            CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 1, wheel1: lines, wheel2: 0, wheel3: 0))
+        event.setIntegerValueField(.scrollWheelEventIsContinuous, value: 0)
+        let nsEvent = try XCTUnwrap(NSEvent(cgEvent: event))
+        XCTAssertFalse(nsEvent.hasPreciseScrollingDeltas)
+        XCTAssertTrue(nsEvent.phase.isEmpty && nsEvent.momentumPhase.isEmpty)
+        return nsEvent
+    }
+
+    /// The trackpad delta that scrolls back, found with a gesture that is
+    /// then ended (the sign depends on how the system reads a synthetic
+    /// event).
+    private func backDelta() throws -> Int32 {
+        view.scrollWheel(with: try trackpad(100, phase: .began))
+        let back: Int32 = try position.offset > 0 ? 100 : -100
+        view.scrollWheel(with: try trackpad(0, phase: .ended))
+        return back
+    }
+
+    func testAPreciseEventWithoutPhasesStartsANewGestureAfterAKey() async throws {
+        try await open()
+        let back = try backDelta()
+        try typeA()
+        // A smooth-scrolling utility or a device that sends no phases.
+        view.scrollWheel(with: try trackpad(0))
+        XCTAssertFalse(view.ignoresMomentum, "a precise event with no phase is a new gesture")
+        view.scrollWheel(with: try trackpad(back, momentum: .continuous))
+        XCTAssertGreaterThan(try position.offset, 0, "the momentum after it scrolls")
+    }
+
+    func testANotchedWheelScrollsAfterAKeyAndDoesNotEndTheMomentumDrop() async throws {
+        try await open()
+        _ = try backDelta()
+        try typeA()
+        // At the live screen only one direction moves the view.
+        view.scrollWheel(with: try notched(3))
+        if try position.offset == 0 {
+            view.scrollWheel(with: try notched(-3))
+        }
+        XCTAssertGreaterThan(try position.offset, 0, "a notched wheel scrolls after a key")
+        XCTAssertTrue(view.ignoresMomentum, "a notched wheel is not a trackpad gesture")
+    }
+
+    func testMomentumWithoutAGesturePhaseScrollsAfterAKey() async throws {
+        try await open()
+        let back = try backDelta()
+        try typeA()
+        // A device whose events all carry a momentum phase and no gesture
+        // phase: its next flick is a new gesture.
+        view.scrollWheel(with: try trackpad(back, momentum: .begin))
+        view.scrollWheel(with: try trackpad(back, momentum: .continuous))
+        XCTAssertFalse(view.ignoresMomentum)
+        XCTAssertGreaterThan(try position.offset, 0, "the flick after the key scrolls")
+    }
+
+    func testMomentumOfAGestureInterruptedByAKeyIsDropped() async throws {
+        try await open()
+        let back = try backDelta()
+        // The fingers are down when the key is pressed; the gesture's
+        // remaining events mark its momentum as its own.
+        view.scrollWheel(with: try trackpad(back, phase: .began))
+        try typeA()
+        view.scrollWheel(with: try trackpad(0, phase: .changed))
+        view.scrollWheel(with: try trackpad(0, phase: .ended))
+        view.scrollWheel(with: try trackpad(back, momentum: .begin))
+        view.scrollWheel(with: try trackpad(back, momentum: .continuous))
+        XCTAssertTrue(view.ignoresMomentum)
+        XCTAssertEqual(try position.offset, 0, "the interrupted gesture's momentum is dropped")
+    }
+
+    func testMomentumAfterTwoKeysOfAnInterruptedGestureIsDropped() async throws {
+        try await open()
+        let back = try backDelta()
+        view.scrollWheel(with: try trackpad(back, phase: .began))
+        try typeA()
+        view.scrollWheel(with: try trackpad(0, phase: .changed))
+        view.scrollWheel(with: try trackpad(0, phase: .ended))
+        // A second key between the lift and the momentum: the gesture's
+        // events since the first key still mark the momentum as its own.
+        try typeA()
+        view.scrollWheel(with: try trackpad(back, momentum: .begin))
+        view.scrollWheel(with: try trackpad(back, momentum: .continuous))
+        XCTAssertTrue(view.ignoresMomentum)
+        XCTAssertEqual(try position.offset, 0, "the interrupted gesture's momentum is dropped")
+    }
+
+    // MARK: Composition (ADR 0032)
+
+    private static let scrollActions: [Selector] = [
+        #selector(TerminalSurfaceView.scrollToTop(_:)), #selector(TerminalSurfaceView.scrollToBottom(_:)),
+        #selector(TerminalSurfaceView.scrollPageUpInHistory(_:)),
+        #selector(TerminalSurfaceView.scrollPageDownInHistory(_:)),
+    ]
+
+    private func composeNi() {
+        view.setMarkedText(
+            "に", selectedRange: NSRange(location: 1, length: 0), replacementRange: NSRange(location: NSNotFound, length: 0))
+    }
+
+    func testTheViewMenuScrollItemsAreDisabledWhileComposing() async throws {
+        try await open()
+        composeNi()
+        let overlay = try XCTUnwrap(view.markedTextOverlay)
+        for action in Self.scrollActions {
+            let item = NSMenuItem(title: "", action: action, keyEquivalent: "")
+            XCTAssertFalse(view.validateMenuItem(item), "\(action) while composing")
+        }
+        // AppKit reports the key equivalent of a disabled item as handled
+        // (`performKeyEquivalent` returns true) without sending its action.
+        try press(commandUp())
+        try press(commandHome())
+        XCTAssertEqual(try position.offset, 0, "⌘↑ and ⌘Home do not scroll")
+        XCTAssertEqual(view.markedTextOverlay?.text, overlay.text)
+        XCTAssertEqual(view.markedTextOverlay?.frame, overlay.frame)
+        view.unmarkText()
+        for action in Self.scrollActions {
+            XCTAssertTrue(view.validateMenuItem(NSMenuItem(title: "", action: action, keyEquivalent: "")), "\(action)")
+        }
+        XCTAssertTrue(try press(commandUp()))
+        XCTAssertGreaterThan(try position.offset, 0, "⌘↑ pages again")
+    }
+
+    /// Wheel events in both directions, gesture, momentum and notched.
+    private func wheelBothWays() throws {
+        for delta: Int32 in [100, -100] {
+            view.scrollWheel(with: try trackpad(delta, phase: .began))
+            view.scrollWheel(with: try trackpad(delta, phase: .changed))
+            view.scrollWheel(with: try trackpad(delta, momentum: .continuous))
+            view.scrollWheel(with: try notched(delta / 30))
+        }
+    }
+
+    func testTheWheelSendsNothingWhileComposing() async throws {
+        try await open()
+        view.scroll(to: .offset(500))
+        // Starting a composition returns to the live screen, which drops
+        // momentum.
+        composeNi()
+        XCTAssertEqual(try position.offset, 0)
+        XCTAssertTrue(view.ignoresMomentum)
+        let sent = view.sentScrollCount
+        view.scrollWheel(with: try trackpad(0, phase: .began))
+        XCTAssertFalse(view.ignoresMomentum, "the phases are still followed")
+        try wheelBothWays()
+        XCTAssertEqual(view.sentScrollCount, sent, "nothing reaches the core")
+        XCTAssertEqual(try position.offset, 0)
+        view.unmarkText()
+
+        // The alternate screen: no cursor keys either.
+        try view.session.write(Array("\u{1b}[?1049h".utf8))
+        try await waitUntil("the alternate screen is shown") { (try? self.position.history) == 0 }
+        composeNi()
+        let sentAlternate = view.sentScrollCount
+        try wheelBothWays()
+        XCTAssertEqual(view.sentScrollCount, sentAlternate, "no wheel reaches the core on the alternate screen")
+        view.unmarkText()
+        view.scrollWheel(with: try notched(1))
+        XCTAssertEqual(view.sentScrollCount, sentAlternate + 1, "after the composition the wheel is sent")
+    }
+
+    func testTheScrollerMovesNothingWhileComposing() async throws {
+        try await open()
+        let scroller = view.scroller
+        scroller.update(try position)
+        composeNi()
+        scroller.doubleValue = 0
+        scroller.userMoved(part: .knob)
+        XCTAssertEqual(try position.offset, 0, "a knob drag while composing")
+        scroller.userMoved(part: .decrementPage)
+        XCTAssertEqual(try position.offset, 0, "a track click while composing")
+        view.unmarkText()
+        scroller.userMoved(part: .decrementPage)
+        XCTAssertGreaterThan(try position.offset, 0, "a track click after it")
+    }
+
+    // MARK: Flash only when the view moved (ADR 0032)
+
+    func testAWheelReportedToAProgramDoesNotShowTheScroller() async throws {
+        try await open(modes: "\\033[?1000h\\033[?1006h")
+        view.scroller.update(try position)
+        XCTAssertFalse(view.scroller.isHidden)
+        XCTAssertFalse(view.scroller.isRevealed)
+        let sent = view.sentScrollCount
+        view.scrollWheel(with: try trackpad(100, phase: .began))
+        view.scrollWheel(with: try trackpad(-100, phase: .changed))
+        XCTAssertEqual(view.sentScrollCount, sent + 2, "the wheel went to the core")
+        XCTAssertEqual(try position.offset, 0, "the program has the wheel: the view stays")
+        XCTAssertFalse(view.scroller.isRevealed, "nothing scrolled, so the scroll bar does not show")
+    }
+
+    // MARK: Cursor (ADR 0032)
+
+    func testTheCursorIsAnArrowOverTheScrollerAndAnIBeamElsewhere() async throws {
+        try await open()
+        let scroller = view.scroller
+        scroller.update(try position)
+        XCTAssertFalse(scroller.isHidden)
+        for style: NSScroller.Style in [.overlay, .legacy] {
+            scroller.preferredStyleOverride = style
+            let rects = view.cursorRects()
+            XCTAssertEqual(rects.count, 2, "\(style)")
+            let text = view.renderView.frame
+            XCTAssertEqual(
+                rects.first?.0, NSRect(x: 0, y: 0, width: min(text.maxX, scroller.frame.minX), height: text.height),
+                "\(style): the I-beam over the text, up to the scroll bar")
+            XCTAssertTrue(rects.first?.1 === NSCursor.iBeam)
+            XCTAssertEqual(rects.last?.0, scroller.frame, "\(style): the arrow over the scroll bar")
+            XCTAssertTrue(rects.last?.1 === NSCursor.arrow)
+        }
+        XCTAssertEqual(view.cursorRects().first?.0, view.renderView.frame, "legacy: the I-beam covers the grid")
+        scroller.preferredStyleOverride = .overlay
+        scroller.update(.init(offset: 0, history: 0, rows: try position.rows))
+        XCTAssertTrue(scroller.isHidden)
+        let hidden = view.cursorRects()
+        XCTAssertEqual(hidden.count, 1)
+        XCTAssertEqual(hidden.first?.0, view.bounds, "no scroll bar: the I-beam everywhere")
+        XCTAssertTrue(hidden.first?.1 === NSCursor.iBeam)
+    }
+
+    // MARK: Show scroll bars: Always (ADR 0032)
+
+    func testALegacyScrollerNarrowsTheGrid() async throws {
+        try await open()
+        try requireSurface()
+        tick()
+        let scale = window.backingScaleFactor
+        XCTAssertEqual(view.renderView.frame, view.bounds, "overlay: the grid is the whole view")
+        XCTAssertEqual(view.surface.size, view.pixelSize)
+        XCTAssertEqual(view.pixelSize.widthPx, UInt32((view.bounds.width * scale).rounded()))
+        let overlaySize = view.surface.size
+        let overlayCols = try XCTUnwrap(view.metrics).cols
+        let resizes = view.coreResizeCount
+
+        view.scroller.preferredStyleOverride = .legacy
+        XCTAssertEqual(view.coreResizeCount, resizes + 1, "one resize")
+        let legacyWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+        XCTAssertEqual(view.renderView.frame.width, view.bounds.width - legacyWidth)
+        XCTAssertFalse(view.scroller.frame.intersects(view.renderView.frame), "the scroll bar is beside the grid")
+        XCTAssertEqual(view.scroller.frame.maxX, view.bounds.maxX)
+        XCTAssertEqual(view.surface.size?.widthPx, UInt32((view.renderView.frame.width * scale).rounded()))
+        XCTAssertEqual(view.surface.size, view.pixelSize)
+        let metrics = try XCTUnwrap(view.metrics)
+        XCTAssertEqual(metrics.widthPx, view.pixelSize.widthPx)
+        XCTAssertEqual(
+            UInt32(metrics.cols), max(1, (metrics.widthPx - 2 * metrics.paddingPx) / metrics.cellWidthPx))
+        XCTAssertLessThan(metrics.cols, overlayCols, "fewer columns at the same frame")
+
+        view.scroller.preferredStyleOverride = .overlay
+        XCTAssertEqual(view.coreResizeCount, resizes + 2, "one resize back")
+        XCTAssertEqual(view.surface.size, overlaySize)
+        XCTAssertEqual(view.metrics?.cols, overlayCols)
+    }
+
+    func testTheSystemSettingChangeResizesTheGrid() async throws {
+        try await open()
+        try requireSurface()
+        let system = TerminalScroller.systemStyle
+        defer { TerminalScroller.systemStyle = system }
+        TerminalScroller.systemStyle = { .overlay }
+        view.scroller.preferredStyleOverride = nil
+        let size = view.surface.size
+        let resizes = view.coreResizeCount
+        // The setting changes; AppKit then posts its notification.
+        TerminalScroller.systemStyle = { .legacy }
+        XCTAssertEqual(view.coreResizeCount, resizes, "nothing until the notification")
+        NotificationCenter.default.post(name: NSScroller.preferredScrollerStyleDidChangeNotification, object: nil)
+        XCTAssertEqual(view.coreResizeCount, resizes + 1)
+        XCTAssertEqual(view.scroller.scrollerStyle, .legacy)
+        XCTAssertLessThan(try XCTUnwrap(view.surface.size).widthPx, try XCTUnwrap(size).widthPx)
+        XCTAssertTrue(view.scroller.isRevealed, "Always: shown")
+        TerminalScroller.systemStyle = { .overlay }
+        NotificationCenter.default.post(name: NSScroller.preferredScrollerStyleDidChangeNotification, object: nil)
+        XCTAssertEqual(view.coreResizeCount, resizes + 2)
+        XCTAssertEqual(view.surface.size, size)
+    }
+
+    func testTheAlternateScreenDoesNotResizeALegacyGrid() async throws {
+        try await open()
+        try requireSurface()
+        view.scroller.preferredStyleOverride = .legacy
+        tick()
+        let size = view.surface.size
+        let resizes = view.coreResizeCount
+        let scroller = view.scroller
+        try view.session.write(Array("\u{1b}[?1049h".utf8))
+        try await waitUntil("the alternate screen is shown") { (try? self.position.history) == 0 }
+        tick()
+        XCTAssertEqual(view.coreResizeCount, resizes, "entering the alternate screen does not resize")
+        XCTAssertEqual(view.surface.size, size)
+        XCTAssertFalse(scroller.isHidden, "Always: shown with no history")
+        XCTAssertFalse(scroller.isEnabled, "an empty track")
+        XCTAssertEqual(scroller.usableParts, .noScrollerParts, "no knob")
+        XCTAssertNil(scroller.target(for: .knob))
+        XCTAssertNil(scroller.target(for: .decrementPage))
+        try view.session.write(Array("\u{1b}[?1049l".utf8))
+        try await waitUntil("the primary screen is back") { (try? self.position.history) ?? 0 > 0 }
+        tick()
+        XCTAssertEqual(view.coreResizeCount, resizes, "leaving it does not resize")
+        XCTAssertEqual(view.surface.size, size)
+        XCTAssertTrue(scroller.isEnabled)
+        XCTAssertNotNil(scroller.target(for: .decrementPage))
+    }
+
+    func testClicksOnTheGridReachTheTerminalViewInEitherStyle() async throws {
+        try await open()
+        for style: NSScroller.Style in [.overlay, .legacy] {
+            view.scroller.preferredStyleOverride = style
+            let inGrid = NSPoint(x: 20, y: 20)
+            XCTAssertNil(view.renderView.hitTest(inGrid), "\(style)")
+            XCTAssertTrue(view.hitTest(view.convert(inGrid, to: view.superview)) === view, "\(style)")
+            XCTAssertTrue(view.surface.layer === view.metalLayer, "\(style)")
+        }
+    }
+
+    // MARK: The scroller alone
+
+    /// A scroller in a window that is never on screen, at the right edge
+    /// of a 480 x 200 host, showing `position`.
+    private func standaloneScroller(
+        _ position: TesseraSession.ScrollPosition
+    ) -> (scroller: TerminalScroller, window: NSWindow) {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 200), styleMask: [.titled], backing: .buffered,
+            defer: false)
+        window.isReleasedWhenClosed = false
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: 480, height: 200))
+        host.wantsLayer = true
+        window.contentView = host
+        let scroller = TerminalScroller()
+        scroller.preferredStyleOverride = .overlay
+        scroller.frame = NSRect(x: 480 - TerminalScroller.width, y: 0, width: TerminalScroller.width, height: 200)
+        host.addSubview(scroller)
+        scroller.update(position)
+        return (scroller, window)
+    }
+
+    @available(macOS, deprecated: 10.14)
+    func testTheLineTargetsMoveOneLine() {
+        let (scroller, window) = standaloneScroller(.init(offset: 5, history: 10, rows: 12))
+        defer { window.close() }
+        XCTAssertEqual(scroller.target(for: .decrementLine), .offset(6))
+        XCTAssertEqual(scroller.target(for: .incrementLine), .offset(4))
+        scroller.update(.init(offset: 10, history: 10, rows: 12))
+        XCTAssertEqual(scroller.target(for: .decrementLine), .offset(10), "at the oldest line")
+        scroller.update(.init(offset: 0, history: 10, rows: 12))
+        XCTAssertEqual(scroller.target(for: .incrementLine), .offset(0), "at the live screen")
+    }
+
+    func testAFadedScrollerLetsClicksThroughWithoutACommit() {
+        let (scroller, window) = standaloneScroller(.init(offset: 200, history: 500, rows: 12))
+        defer { window.close() }
+        var clock: CFTimeInterval = 1000
+        scroller.now = { clock }
+        let point = NSPoint(x: scroller.frame.midX, y: scroller.frame.midY)
+        XCTAssertNil(scroller.hitTest(point), "not shown yet")
+        scroller.flash()
+        XCTAssertTrue(scroller.isRevealed)
+        XCTAssertTrue(scroller.hitTest(point) === scroller)
+        clock += TerminalScroller.holdDuration + TerminalScroller.fadeDuration - 0.01
+        XCTAssertTrue(scroller.isRevealed, "still fading")
+        clock += 0.02
+        // No Core Animation commit in between: the finished animation is
+        // still on the layer.
+        XCTAssertFalse(scroller.isRevealed, "faded out")
+        XCTAssertNil(scroller.hitTest(point), "a click goes through")
+    }
+
+    func testAKnobClickedAndHeldStillDuringOutputDoesNotMoveTheView() async throws {
+        try await open()
+        try requireSurface()
+        view.scroller.preferredStyleOverride = .legacy
+        view.scroll(to: .offset(500))
+        tick()
+        let scroller = view.scroller
+        let knob = scroller.rect(for: .knob)
+        XCTAssertFalse(knob.isEmpty)
+        let point = scroller.convert(NSPoint(x: knob.midX, y: knob.midY), to: nil)
+        var targets: [TesseraSession.ScrollTarget] = []
+        let original = scroller.onScroll
+        scroller.onScroll = {
+            targets.append($0)
+            original?($0)
+        }
+        let start = try position
+        // AppKit's tracking loop runs until the release, which the holder
+        // posts after output has grown the history; the pointer never moves.
+        let holder = KnobHolder(view: view, window: window, point: point)
+        let timer = Timer(
+            timeInterval: 0.05, target: holder, selector: #selector(KnobHolder.fire(_:)), userInfo: nil, repeats: true)
+        RunLoop.main.add(timer, forMode: .common)
+        RunLoop.main.add(timer, forMode: .eventTracking)
+        scroller.mouseDown(with: try holder.event(.leftMouseDown))
+        timer.invalidate()
+        tick()
+        let end = try position
+        let growth = end.history - start.history
+        XCTAssertGreaterThan(growth, 0, "output arrived while the knob was held")
+        XCTAssertEqual(end.offset, start.offset + growth, "the view stays on its lines: targets \(targets)")
+        XCTAssertEqual(targets, [], "a knob clicked and released in place sends nothing")
+    }
+
+    func testAKnobActionAtTheValueAlreadySentIsNotSentAgain() {
+        let (scroller, window) = standaloneScroller(.init(offset: 200, history: 500, rows: 12))
+        defer { window.close() }
+        var targets: [TesseraSession.ScrollTarget] = []
+        scroller.onScroll = { targets.append($0) }
+        scroller.beginTracking()
+        scroller.doubleValue = 0.5
+        scroller.userMoved(part: .knob)
+        XCTAssertEqual(targets, [.offset(250)])
+        // Output grows the history while the knob is held still; AppKit
+        // sends the frozen value again on release.
+        scroller.update(.init(offset: 250 + 300, history: 800, rows: 12))
+        scroller.doubleValue = 0.5
+        scroller.userMoved(part: .knob)
+        XCTAssertEqual(targets.count, 1, "the same value is not sent again")
+        scroller.doubleValue = 0.6
+        scroller.userMoved(part: .knob)
+        XCTAssertEqual(targets.last, .offset(800 - 480), "a new value is")
+        scroller.userMoved(part: .decrementPage)
+        scroller.userMoved(part: .decrementPage)
+        XCTAssertEqual(targets.suffix(2), [.pageUp, .pageUp], "track clicks are not deduplicated")
+        scroller.endTracking()
+        scroller.beginTracking()
+        scroller.doubleValue = 0.6
+        scroller.userMoved(part: .knob)
+        XCTAssertEqual(targets.count, 5, "the first action of a new press always goes")
+        scroller.endTracking()
+    }
+
+    func testAScrollerHiddenUnderThePointerWaitsForItAgain() throws {
+        let (scroller, window) = standaloneScroller(.init(offset: 200, history: 500, rows: 12))
+        defer { window.close() }
+        let enter = NSEvent.enterExitEvent(
+            with: .mouseEntered, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber,
+            context: nil, eventNumber: 0, trackingNumber: 0, userData: nil)
+        scroller.mouseEntered(with: try XCTUnwrap(enter))
+        XCTAssertTrue(scroller.isRevealed, "under the pointer")
+        scroller.update(.init(offset: 0, history: 0, rows: 12))
+        XCTAssertTrue(scroller.isHidden, "no history")
+        scroller.update(.init(offset: 0, history: 30, rows: 12))
+        XCTAssertFalse(scroller.isHidden)
+        XCTAssertFalse(scroller.isRevealed, "not assumed to be under the pointer")
+        scroller.flash()
+        XCTAssertTrue(scroller.isRevealed, "a scroll shows it")
     }
 
     /// Polls `condition` on the main actor until it holds or a timeout
@@ -549,6 +1020,47 @@ final class TerminalScrollTests: XCTestCase {
                 return
             }
             try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+}
+
+/// Holds a knob pressed for ``TerminalScrollTests``: every 50 ms it has the
+/// child print 40 lines (ten times) and draws a frame, then posts the
+/// release at the press's point.
+@MainActor
+private final class KnobHolder: NSObject {
+    let view: TerminalSurfaceView
+    let window: NSWindow
+    let point: NSPoint
+    private var step = 0
+
+    init(view: TerminalSurfaceView, window: NSWindow, point: NSPoint) {
+        self.view = view
+        self.window = window
+        self.point = point
+    }
+
+    func event(_ type: NSEvent.EventType) throws -> NSEvent {
+        try XCTUnwrap(
+            NSEvent.mouseEvent(
+                with: type, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1,
+                pressure: type == .leftMouseUp ? 0 : 1))
+    }
+
+    @objc func fire(_ timer: Timer) {
+        step += 1
+        if step <= 10 {
+            try? view.session.write(Array(String(repeating: "x\r\n", count: 40).utf8))
+        }
+        view.sessionDidOutput()
+        view.displayLinkDidFire()
+        // A second release in case AppKit missed the first.
+        if step == 20 || step == 60, let up = try? event(.leftMouseUp) {
+            NSApp.postEvent(up, atStart: false)
+        }
+        if step > 70 {
+            timer.invalidate()
         }
     }
 }

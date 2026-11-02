@@ -64,6 +64,14 @@ attaches when it enters a window and detaches when it leaves it or the
 window closes (`NSWindow.willCloseNotification`, before the controller
 closes the session; either order is safe).
 
+Amended by ADR 0032 (#183): the backing layer is now on
+`TerminalRenderView`, a subview of `TerminalSurfaceView` with the layer
+settings above and no hit testing, so it can be narrower than the view
+when a legacy scroll bar sits beside the text. `TerminalSurfaceView` stays
+the window's content view, the responder and the owner of the session and
+surface; it is a plain layer-backed view. The reasons for a backing layer
+hold for the subview: AppKit sizes, moves and scales it with its view.
+
 ### `CADisplayLink`, not a timer
 
 Frames come from `NSView.displayLink(target:selector:)` (macOS 14+; the
@@ -209,7 +217,8 @@ unfocused cursor hollow). Losing first responder or key status discards a
 composition, dropping anything the input context commits while it
 discards. The view
 is the window's `initialFirstResponder`; `resetCursorRects` sets the I-beam
-over the view. A mouse-down makes the view first responder. `mouseDown/Up/
+over the view (over the text only while the scroll bar is shown, which
+gets the arrow: ADR 0032). A mouse-down makes the view first responder. `mouseDown/Up/
 Dragged`, the right and other buttons, plain motion and `scrollWheel` go to
 the core, which reports them to a program that tracks the mouse (ADR 0027,
 "Frontend routing"); a scroll the core reports `CONSUMED` is redrawn.
