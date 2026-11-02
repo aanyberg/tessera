@@ -128,7 +128,10 @@ no reporting decision of its own.
   button whose press the view did not see is not sent either, so a stray
   release after that click cannot reach the core.
 - **The wheel** stays with `scrollWheel`, which sends every gesture as
-  before; a `Consumed` scroll redraws.
+  before; a `Consumed` scroll redraws. Amended by ADR 0032 (#183): while
+  text is marked the event is not sent at all (no scroll, no cursor keys,
+  no report), and the scroll bar flashes only when the scroll position's
+  offset changed, not on every `Consumed` (a reported wheel moves nothing).
 
 ## Consequences
 

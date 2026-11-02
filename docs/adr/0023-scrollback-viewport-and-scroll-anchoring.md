@@ -188,7 +188,10 @@ reads of 4 KiB under a view anchored 1 000 lines back: p99 about 7 µs, bar
 
 - The frontend (task 8 of wave 7) builds ⌘↑/⌘↓/⌘Home/⌘End, an overlay
   scroller and momentum handling on `scroll_to` and `scroll_position`
-  without a Rust change.
+  without a Rust change. ADR 0032 (#183) narrows the grid beside a legacy
+  scroll bar ("Show scroll bars: Always"), lets phase-less devices scroll
+  after a key, and stops the wheel, the menu and the scroller during a
+  composition.
 - Mouse reporting (#12) takes the wheel on the alternate screen when the
   program asks for it; DECSET 1007 can later make alternate scroll
   switchable.

@@ -554,10 +554,11 @@ extension TesseraSession {
     }
 
     /// The view's position in the scrollback, read in one look at the
-    /// terminal: enough for a scroll bar. Read it once per frame at most,
-    /// not per event. Nothing ties two reads together: output, and the
-    /// resize of a configuration edit (made on a core thread), can change
-    /// the history between them.
+    /// terminal: enough for a scroll bar. Read it once per frame, plus at
+    /// most once before and once after a wheel event (to see whether the
+    /// event moved the view), not per output event. Nothing ties two reads
+    /// together: output, and the resize of a configuration edit (made on a
+    /// core thread), can change the history between them.
     ///
     /// - Throws: ``TesseraCoreError/sessionNotFound`` once closed.
     @MainActor

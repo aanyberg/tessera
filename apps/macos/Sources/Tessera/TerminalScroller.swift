@@ -2,50 +2,73 @@ import AppKit
 import QuartzCore
 import TesseraKit
 
-/// The scrollback's scroll bar: an overlay-style `NSScroller` along the
-/// terminal's right edge, drawn over the text (the grid keeps its width).
+/// The scrollback's scroll bar along the terminal's right edge, in the
+/// style the system's "Show scroll bars" setting asks for (ADR 0032).
 ///
+/// - Style: overlay (drawn over the text, which keeps its width) unless
+///   AppKit prefers legacy scrollers ("Always", or "Automatically" with a
+///   mouse); then it is a legacy scroller beside the text, whose width the
+///   terminal view takes off the grid. A change of the setting, or of
+///   ``preferredStyleOverride``, restyles it and calls ``onStyleChange``.
 /// - Knob: its proportion is rows / (history + rows), and its position the
 ///   view's offset: at the top for the oldest line, at the bottom for the
 ///   live screen. ``update(_:)`` sets both from a scroll position the
 ///   terminal view reads when it draws a frame, so output and scrolling
 ///   move it without a timer.
-/// - Visibility: hidden while there is no history (a new session, the
-///   alternate screen). It follows the system's "Show scroll bars"
-///   setting: when AppKit prefers legacy scrollers ("Always", or
-///   "Automatically" with a mouse) it stays shown; otherwise it shows when
-///   the user scrolls or points at it and fades out after a moment, like
-///   AppKit's own overlay scrollers. A faded-out scroller lets clicks
-///   through to the terminal.
+/// - Visibility: a legacy scroller is always shown (its width is the
+///   grid's, whatever the history), with an empty track and no action
+///   while there is no history (a new session, the alternate screen). An
+///   overlay scroller is hidden then; otherwise it shows when the user
+///   scrolls or points at it and fades out after a moment, like AppKit's
+///   own overlay scrollers. A faded-out scroller lets clicks through to
+///   the terminal.
 /// - Input: dragging the knob or clicking the track reports where to go
 ///   through ``onScroll``; the terminal view moves the session's view.
 @MainActor
 final class TerminalScroller: NSScroller {
     /// Called with where the user moved the knob or clicked the track.
     var onScroll: (@MainActor (TesseraSession.ScrollTarget) -> Void)?
+    /// Called after the style changed (the system setting or
+    /// ``preferredStyleOverride``): the terminal view lays out again.
+    var onStyleChange: (@MainActor () -> Void)?
 
     /// The position the knob shows (the last one passed to ``update(_:)``),
     /// or `nil` before the first.
     private(set) var position: TesseraSession.ScrollPosition?
-    /// The scroller style the visibility follows instead of AppKit's
-    /// preferred one (tests: the system setting is the user's).
+    /// The scroller style used instead of AppKit's preferred one (tests:
+    /// the system setting is the user's).
     var preferredStyleOverride: NSScroller.Style? {
-        didSet { applyVisibility() }
+        didSet { styleChanged() }
     }
     /// The knob is being dragged or the track held. While the knob is
     /// dragged, positions read meanwhile are applied once it is released,
     /// so the knob does not fight the pointer (``freezesKnob(tracking:part:)``).
     private(set) var isTracking = false
+    /// The knob value of the last knob action sent in this tracking session.
+    private var lastSentKnobValue: Double?
     private var isPointerInside = false
     private var hoverArea: NSTrackingArea?
+    /// When the current flash has faded out, or `nil` without one.
+    private var flashEnd: CFTimeInterval?
 
     /// How long a scroll keeps it shown before it fades, and the fade.
-    private static let holdDuration: CFTimeInterval = 1.0
-    private static let fadeDuration: CFTimeInterval = 0.3
+    static let holdDuration: CFTimeInterval = 1.0
+    static let fadeDuration: CFTimeInterval = 0.3
     private static let flashKey = "flash"
 
+    /// The clock the flash is timed by (tests advance their own).
+    var now: () -> CFTimeInterval = { CACurrentMediaTime() }
+    /// AppKit's preferred scroller style, read when the system says it
+    /// changed (tests stand in for the user's setting).
+    static var systemStyle: @MainActor () -> NSScroller.Style = { NSScroller.preferredScrollerStyle }
+
     /// The width of an overlay scroller at the regular size.
-    static var width: CGFloat { NSScroller.scrollerWidth(for: .regular, scrollerStyle: .overlay) }
+    static var width: CGFloat { width(for: .overlay) }
+
+    /// The width of a regular-size scroller in `style`.
+    static func width(for style: NSScroller.Style) -> CGFloat {
+        NSScroller.scrollerWidth(for: .regular, scrollerStyle: style)
+    }
 
     /// A subclass gets overlay scrollers only if it says it draws them.
     override class var isCompatibleWithOverlayScrollers: Bool { true }
@@ -53,16 +76,15 @@ final class TerminalScroller: NSScroller {
     init() {
         super.init(frame: NSRect(x: 0, y: 0, width: Self.width, height: 100))
         wantsLayer = true
-        scrollerStyle = .overlay
         knobStyle = .default
-        isEnabled = true
-        isHidden = true
+        isEnabled = false
         target = self
         action = #selector(userScrolled(_:))
         NotificationCenter.default.addObserver(
             self, selector: #selector(preferredStyleChanged(_:)),
             name: NSScroller.preferredScrollerStyleDidChangeNotification, object: nil)
-        applyVisibility()
+        scrollerStyle = effectiveStyle
+        applyHidden()
     }
 
     @available(*, unavailable)
@@ -72,19 +94,17 @@ final class TerminalScroller: NSScroller {
 
     // MARK: Position
 
-    /// Shows `position`: hidden without history, else the knob's size and
-    /// place. While the knob is dragged only the position is kept.
+    /// Shows `position`: the knob's size and place, or no knob without
+    /// history. While the knob is dragged only the position is kept.
     func update(_ position: TesseraSession.ScrollPosition) {
         guard position != self.position else { return }
         self.position = position
-        let hasHistory = position.history > 0
-        if isHidden == hasHistory {
-            isHidden = !hasHistory
-            applyVisibility()
-        }
+        applyHidden()
         guard hasHistory, !Self.freezesKnob(tracking: isTracking, part: hitPart) else { return }
         applyKnob(position)
     }
+
+    private var hasHistory: Bool { (position?.history ?? 0) > 0 }
 
     /// Whether a new position leaves the knob where it is: only while the
     /// knob itself is dragged, where it follows the pointer. A held click
@@ -105,7 +125,8 @@ final class TerminalScroller: NSScroller {
 
     /// Where the user's action on `part` moves the view, from the knob's
     /// value for the knob and a jump to a clicked spot, a page for a click
-    /// on the track, a line for a legacy scroller's arrows.
+    /// on the track, a line for a legacy scroller's arrows. The line cases
+    /// are also what VoiceOver's increment and decrement buttons reach.
     func target(for part: NSScroller.Part) -> TesseraSession.ScrollTarget? {
         guard let position, position.history > 0 else { return nil }
         switch part {
@@ -121,9 +142,17 @@ final class TerminalScroller: NSScroller {
     }
 
     /// The user acted on `part` (the action AppKit sends while the knob is
-    /// dragged or the track held; tests call it with the part).
+    /// dragged or the track held; tests call it with the part). Within one
+    /// tracking session a knob action at the value already sent, or at the
+    /// value the knob was pressed at, is not sent: AppKit sends one on
+    /// release with the value the knob was left at, which applied to a
+    /// history grown meanwhile would jump the view.
     func userMoved(part: NSScroller.Part) {
         guard let target = target(for: part) else { return }
+        if isTracking, part == .knob || part == .knobSlot {
+            guard doubleValue != lastSentKnobValue else { return }
+            lastSentKnobValue = doubleValue
+        }
         onScroll?(target)
     }
 
@@ -131,16 +160,19 @@ final class TerminalScroller: NSScroller {
         userMoved(part: hitPart)
     }
 
-    // MARK: Visibility
+    // MARK: Style and visibility
+
+    /// The style it is drawn in: the override, else AppKit's preferred one.
+    var effectiveStyle: NSScroller.Style { preferredStyleOverride ?? Self.systemStyle() }
 
     /// Whether it stays shown rather than appearing on a scroll.
-    var staysShown: Bool { (preferredStyleOverride ?? NSScroller.preferredScrollerStyle) == .legacy }
+    var staysShown: Bool { effectiveStyle == .legacy }
 
-    /// Whether it is on screen and takes clicks: it has history, and stays
+    /// Whether it is on screen and takes clicks: not hidden, and stays
     /// shown, is in use, or is showing after a scroll.
     var isRevealed: Bool {
         guard !isHidden else { return false }
-        return staysShown || isTracking || isPointerInside || layer?.animation(forKey: Self.flashKey) != nil
+        return staysShown || isTracking || isPointerInside || flashEnd.map { now() < $0 } ?? false
     }
 
     /// Shows it after a scroll and fades it out after a moment, from what
@@ -155,6 +187,27 @@ final class TerminalScroller: NSScroller {
         animation.keyTimes = [0, NSNumber(value: appear / total), NSNumber(value: Self.holdDuration / total), 1]
         animation.duration = total
         layer.add(animation, forKey: Self.flashKey)
+        // Core Animation removes a finished animation only at its next
+        // commit, which an idle terminal never makes: the end time, not
+        // the animation's presence, says whether it is still shown.
+        flashEnd = now() + total
+    }
+
+    /// Hidden only in overlay style without history. Hiding forgets the
+    /// pointer and any flash: shown again, it waits for a scroll or for
+    /// the pointer to enter.
+    private func applyHidden() {
+        isEnabled = hasHistory
+        let hidden = !hasHistory && !staysShown
+        if hidden != isHidden {
+            isHidden = hidden
+            if hidden {
+                isPointerInside = false
+                flashEnd = nil
+                layer?.removeAnimation(forKey: Self.flashKey)
+            }
+        }
+        applyVisibility()
     }
 
     /// Shown for good while it stays shown, is in use or under the
@@ -163,12 +216,26 @@ final class TerminalScroller: NSScroller {
         let shown = staysShown || isTracking || isPointerInside
         alphaValue = shown ? 1 : 0
         if shown {
+            flashEnd = nil
             layer?.removeAnimation(forKey: Self.flashKey)
         }
     }
 
+    /// Restyles it for the current style and tells the terminal view.
+    private func styleChanged() {
+        let style = effectiveStyle
+        if scrollerStyle != style {
+            scrollerStyle = style
+        }
+        applyHidden()
+        if hasHistory, let position {
+            applyKnob(position)
+        }
+        onStyleChange?()
+    }
+
     @objc private func preferredStyleChanged(_ notification: Notification) {
-        applyVisibility()
+        styleChanged()
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
@@ -203,12 +270,32 @@ final class TerminalScroller: NSScroller {
     }
 
     override func mouseDown(with event: NSEvent) {
-        isTracking = true
-        applyVisibility()
+        beginTracking()
+        // A knob pressed and released in place gets one action on release
+        // with the value it was pressed at; output meanwhile grew the
+        // history, so that value is not sent.
+        if testPart(event.locationInWindow) == .knob {  // window coordinates
+            lastSentKnobValue = doubleValue
+        }
         // Tracks the knob or the track until the button goes up, sending
         // the action as it goes.
         super.mouseDown(with: event)
+        endTracking()
+    }
+
+    /// A press on the knob or the track starts tracking (`mouseDown`;
+    /// tests call it directly instead of running AppKit's tracking loop).
+    func beginTracking() {
+        isTracking = true
+        lastSentKnobValue = nil
+        applyVisibility()
+    }
+
+    /// The button went up: the knob returns to the position last read, and
+    /// the scroller fades unless it stays shown.
+    func endTracking() {
         isTracking = false
+        lastSentKnobValue = nil
         if let position, position.history > 0 {
             applyKnob(position)
         }

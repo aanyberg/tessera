@@ -57,6 +57,9 @@ final class TerminalSurfaceViewTests: XCTestCase {
         // app's real layer vends no drawables (`.notReady`), and the link
         // would never idle.
         view.frameStatusOverride = .presented
+        // The grid's width follows the user's scroll bar setting otherwise
+        // (ADR 0032): overlay scroll bars leave it the view's.
+        view.scroller.preferredStyleOverride = .overlay
         // Never the user's clipboard.
         view.pasteboard = NSPasteboard(name: NSPasteboard.Name("com.aanyberg.tessera.tests.\(UUID().uuidString)"))
         // The recorder prints R once raw mode is set.
