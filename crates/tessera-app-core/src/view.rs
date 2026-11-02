@@ -588,6 +588,19 @@ impl View {
     /// next; after `Paced` or `NotReady` the caller must render again for
     /// it to be drawn (a display link does so on its next tick).
     pub(crate) fn render(&mut self, focused: bool) -> Result<FrameStatus, RenderError> {
+        self.render_with_clock(focused, Instant::now)
+    }
+
+    /// [`View::render`] with the pacing clock supplied: `now` is read once,
+    /// only for a frame that changed, and is the time the pacing schedule
+    /// judges and records. `render` passes [`Instant::now`]; tests pass
+    /// fixed instants so the schedule does not depend on how fast the
+    /// machine draws.
+    fn render_with_clock(
+        &mut self,
+        focused: bool,
+        now: impl FnOnce() -> Instant,
+    ) -> Result<FrameStatus, RenderError> {
         let shown = Shown {
             cursor: self.snapshot.shown_cursor(),
             focused,
@@ -599,7 +612,7 @@ impl View {
         if !changed {
             return Ok(FrameStatus::Skipped);
         }
-        let now = Instant::now();
+        let now = now();
         if is_paced(self.last_presented, now) {
             return Ok(FrameStatus::Paced);
         }
@@ -1662,16 +1675,22 @@ mod tests {
         view.capture(&term, 0);
         // A frame was just presented: the next one is not due for an
         // interval, and half an interval of slack does not cover that.
-        view.last_presented = Some(Instant::now());
+        let now = Instant::now();
+        view.last_presented = Some(now);
         let frames = view.renderer().stats().frames;
-        assert_eq!(view.render(true).expect("frame"), FrameStatus::Paced);
+        assert_eq!(
+            view.render_with_clock(true, || now).expect("frame"),
+            FrameStatus::Paced
+        );
         assert_eq!(view.renderer().stats().frames, frames, "no GPU work");
         // Within the slack of its due time it is on time, and draws the
         // row the paced call captured.
         let shaped = view.renderer().stats().rows_shaped;
-        view.last_presented =
-            Instant::now().checked_sub(MIN_FRAME_INTERVAL.saturating_sub(FRAME_SLACK / 2));
-        assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+        view.last_presented = now.checked_sub(MIN_FRAME_INTERVAL.saturating_sub(FRAME_SLACK / 2));
+        assert_eq!(
+            view.render_with_clock(true, || now).expect("frame"),
+            FrameStatus::Presented
+        );
         assert_eq!(
             view.renderer().stats().rows_shaped - shaped,
             1,
@@ -1679,46 +1698,69 @@ mod tests {
         );
     }
 
-    /// Real renders with new content each, on the real clock: the first
-    /// two within one interval are on time (the second within the slack),
-    /// the third is `Paced`, and after the interval the paced content is
-    /// `Presented`. A run in which drawing took so long that the three did
-    /// not fit in one interval proves nothing and is repeated.
+    /// Real renders with new content each, at instants the test supplies
+    /// (how long the GPU takes to draw does not count, #202): three
+    /// renders 1 ms apart are `Presented`, `Presented` (the second within
+    /// the slack) and `Paced`; the paced content is `Presented` by the
+    /// first render the schedule allows, one interval after the first
+    /// render, and not a nanosecond earlier; then nothing is left to draw
+    /// (`Skipped`). Three rounds on one schedule.
     #[test]
     fn three_renders_within_one_interval_are_paced_then_presented() {
         let Some(mut view) = offscreen_view(3, 10) else {
             return;
         };
         let mut term = Terminal::new(3, 10);
-        let mut paced = 0;
-        for round in 0..20 {
-            next_frame();
-            next_frame();
-            let start = Instant::now();
+        let mut start = Instant::now();
+        for round in 0..3 {
             let mut statuses = Vec::new();
-            for ch in [b"a", b"b", b"c"] {
+            for (k, ch) in (0..).zip([b"a", b"b", b"c"]) {
                 term.advance(ch);
                 view.capture(&term, 0);
-                statuses.push(view.render(true).expect("frame"));
+                let at = start + Duration::from_millis(k);
+                statuses.push(view.render_with_clock(true, || at).expect("frame"));
             }
-            let fit = Instant::now() < start + MIN_FRAME_INTERVAL;
-            assert_eq!(statuses[..2], [FrameStatus::Presented; 2], "round {round}");
-            if !fit {
-                continue;
-            }
-            assert_eq!(statuses[2], FrameStatus::Paced, "round {round}");
-            paced += 1;
+            assert_eq!(
+                statuses,
+                [
+                    FrameStatus::Presented,
+                    FrameStatus::Presented,
+                    FrameStatus::Paced
+                ],
+                "round {round}"
+            );
+            // The first frame was due a slack before `start`, the second an
+            // interval after that; the next may come a slack before its due
+            // time, an interval after the second's: `start + 2 I - 2 slack`,
+            // which is `start + I` (the slack is half an interval).
+            let on_time = (start + 2 * MIN_FRAME_INTERVAL)
+                .checked_sub(2 * FRAME_SLACK)
+                .expect("after start");
+            assert_eq!(on_time, start + MIN_FRAME_INTERVAL);
             let frames = view.renderer().stats().frames;
-            next_frame();
-            assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+            let early = on_time
+                .checked_sub(Duration::from_nanos(1))
+                .expect("after start");
+            assert_eq!(
+                view.render_with_clock(true, || early).expect("frame"),
+                FrameStatus::Paced,
+                "round {round}: 1 ns early"
+            );
+            assert_eq!(view.renderer().stats().frames, frames, "no GPU work");
+            assert_eq!(
+                view.render_with_clock(true, || on_time).expect("frame"),
+                FrameStatus::Presented,
+                "round {round}: on time"
+            );
             assert_eq!(view.renderer().stats().frames, frames + 1);
-            next_frame();
-            assert_eq!(view.render(true).expect("frame"), FrameStatus::Skipped);
-            if paced == 3 {
-                return;
-            }
+            assert_eq!(
+                view.render_with_clock(true, || on_time).expect("frame"),
+                FrameStatus::Skipped,
+                "round {round}: nothing left"
+            );
+            // Well clear of the schedule: the next round starts afresh.
+            start = on_time + 10 * MIN_FRAME_INTERVAL;
         }
-        panic!("three renders never fit in one interval ({paced} did)");
     }
 
     /// A surface without a drawable reports `NotReady`, draws nothing and
