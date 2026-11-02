@@ -23,8 +23,10 @@ final class ForegroundProcessTests: XCTestCase {
         XCTAssertNil(try session.foregroundProcess(), "a fresh shell runs no job")
 
         try session.write(Array("sleep 100\n".utf8))
-        let job = try await poll("sleep runs in the foreground") { try session.foregroundProcess() }
-        XCTAssertEqual(job.name, "sleep")
+        // Between fork and exec the job's process is still a copy of the shell, so wait for the name.
+        let job = try await poll("sleep runs in the foreground") {
+            try session.foregroundProcess().flatMap { $0.name == "sleep" ? $0 : nil }
+        }
         XCTAssertGreaterThan(job.pid, 0)
 
         try session.write([0x03])
