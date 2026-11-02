@@ -288,8 +288,8 @@ flags: decision xterm-quirk
 size: 24x80
 step: feed \e]11;?\u{9c}
 reply: none
-cite: unverified: U+009C is encoded C2 9C in the UTF-8 stream; tessera-vt (vte, UTF-8 input) does not treat it as ST, so the OSC stays open and nothing is answered until a real terminator. A raw 0x9C byte is invalid UTF-8
-flags: unverified negative
+cite: #96 decision D1: C1 controls (raw, or UTF-8 encoded as here, C2 9C) are honoured only in 8-bit mode; this session is 7-bit, so U+009C is OSC payload and nothing is answered until a real terminator (xterm in UTF-8 mode ignores U+0080..U+009F too). In 8-bit mode (S8C1T) it is ST and the reply is 0x9D ... 0x9C (c1_spec.txt S05 and the R16 note)
+flags: decision negative
 
 ### OQ27_osc4_reply_for_eight_pairs_is_cut_at_seven
 size: 24x80

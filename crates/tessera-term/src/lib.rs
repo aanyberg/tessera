@@ -26,8 +26,8 @@
 //! query, 0 for an unknown mode), DECRQSS (`DCS $ q`, for SGR, DECSTBM,
 //! DECSCUSR and DECSCL), the kitty keyboard flags query `CSI ? u` and the
 //! XTWINOPS size reports (`CSI 14/16/18/19 t`; the pixel sizes once
-//! [`Terminal::set_cell_pixels`] knows the cell). Replies are always 7-bit.
-//! Tessera identifies as itself, not as xterm ([`DA2_PV`]). Reports that
+//! [`Terminal::set_cell_pixels`] knows the cell). Replies are 7-bit unless
+//! 8-bit mode is on (see "8-bit C1 controls" below). Tessera identifies as itself, not as xterm ([`DA2_PV`]). Reports that
 //! would echo text a program supplied (the title reports `CSI 20/21 t`,
 //! XTGETTCAP) are never answered. `CSI 22 t` and `CSI 23 t` push and pop
 //! the window title, at most [`TITLE_STACK_DEPTH`] deep; a pop sends
@@ -89,6 +89,21 @@
 //! which is what makes tmux use the margins for side-by-side panes. ADR
 //! 0028 has the rules and the deviations from xterm.
 //!
+//! ## 8-bit C1 controls
+//!
+//! S8C1T (`ESC SP G`) turns 8-bit mode on and S7C1T (`ESC SP F`) turns it
+//! off, both from conformance level 2 (ignored at level 1); DECSCL's `Pc`
+//! sets it too, RIS clears it and DECSTR keeps it
+//! ([`Terminal::c1_8bit_replies`]). In 8-bit mode every reply starts with
+//! the single byte `0x9B`, `0x90` or `0x9D` instead of `ESC [`, `ESC P` or
+//! `ESC ]` and ends a string with `0x9C` instead of `ESC \` (a
+//! BEL-terminated reply keeps its BEL), and a C1 control in the output,
+//! raw or UTF-8 encoded, acts as its `ESC Fe` form: `0x84` is IND, `0x9B`
+//! starts a CSI, `0x9C` ends a string. A default 7-bit session ignores C1
+//! controls, as xterm does in UTF-8 mode. [`to_8bit_controls`] is the same
+//! rewrite for the keys, mouse reports, focus reports and paste brackets
+//! the host sends. ADR 0024 has the rules.
+//!
 //! DECSCL (`CSI 61..65 ; Pc " p`, select conformance level) runs the same
 //! soft reset and then records the level ([`Terminal::conformance_level`])
 //! and the C1 reply mode its `Pc` selects ([`Terminal::c1_8bit_replies`]);
@@ -122,8 +137,36 @@ use reports::TitleStack;
 use modes::KittyStacks;
 
 use tessera_grid::{Cell, Grid, Point};
-use tessera_vt::{Action, Parser};
+use tessera_vt::{Action, Parser, Sink};
 use tracing::trace;
+
+/// Rewrites `sequence`, one control sequence the terminal sends to the
+/// host, into its 8-bit form for a session in 8-bit mode
+/// ([`Terminal::c1_8bit_replies`], S8C1T): a leading `ESC [`, `ESC O`,
+/// `ESC P` or `ESC ]` becomes the single C1 byte `0x9B`, `0x8F`, `0x90` or
+/// `0x9D`, and after `ESC P` or `ESC ]` a trailing `ESC \` becomes `0x9C`.
+/// Nothing else changes: not the bytes in between (an X10 mouse report's
+/// payload), not a BEL terminator, and not a two-byte sequence, which is an
+/// Alt-prefixed key (`ESC [` for Alt+`[`), not an introducer.
+///
+/// The bytes are raw C1 bytes, not their UTF-8 encoding: a receiver that
+/// decodes UTF-8 sees invalid UTF-8, which is what S8C1T asks for. The
+/// terminal's own replies already go through it; a host applies it to
+/// each key encoding ([`encode_key`]), mouse report ([`encode_mouse`]),
+/// focus report and bracketed-paste marker separately, before repeating or
+/// joining them.
+pub fn to_8bit_controls(sequence: &mut Vec<u8>) {
+    let introducer = match sequence.as_slice() {
+        [0x1B, byte @ (b'[' | b'O' | b'P' | b']'), _, ..] => *byte,
+        _ => return,
+    };
+    sequence.remove(0);
+    sequence[0] = introducer + 0x40;
+    if matches!(introducer, b'P' | b']') && sequence.ends_with(b"\x1b\\") {
+        sequence.truncate(sequence.len() - 2);
+        sequence.push(0x9C);
+    }
+}
 
 /// Longest window title an OSC 0 or OSC 2 may set, in bytes of payload as
 /// received (before invalid UTF-8 is replaced and control characters are
@@ -281,10 +324,11 @@ impl Terminal {
         }
     }
 
-    /// Hands `bytes` to the parser and applies every action it produces.
+    /// Hands `bytes` to the parser and applies every action it produces,
+    /// with 8-bit C1 controls honoured while 8-bit mode is on
+    /// ([`Terminal::c1_8bit_replies`]; ADR 0024).
     fn feed(&mut self, bytes: &[u8]) {
-        let state = &mut self.state;
-        self.parser.advance(bytes, |action| state.apply(action));
+        self.parser.advance_c1(bytes, &mut self.state);
     }
 
     /// Drains side-effect requests accumulated since the last call.
@@ -329,12 +373,18 @@ impl Terminal {
         self.state.conformance_level
     }
 
-    /// Whether replies to the host should use 8-bit C1 controls (`CSI` as
-    /// the single byte `0x9B` rather than `ESC [`). DECSCL sets it from
-    /// its `Pc` (0 or absent, and 2: on; 1: off; level 1 always off) and
-    /// RIS turns it off; it starts off. Recorded and reported (DECRQSS of
-    /// DECSCL), but every reply is still 7-bit (S7C1T/S8C1T and 8-bit
-    /// replies are #96).
+    /// Whether 8-bit mode is on: replies to the host use 8-bit C1 controls
+    /// (`CSI` as the single byte `0x9B` rather than `ESC [`, `0x90`, `0x9D`
+    /// and `0x9C` for `ESC P`, `ESC ]` and `ESC \`), and C1 controls in the
+    /// output are honoured (`0x84` is IND, `0x9B` starts a CSI; raw or
+    /// UTF-8 encoded). S8C1T (`ESC SP G`) turns it on and S7C1T (`ESC SP
+    /// F`) off, both only from conformance level 2; DECSCL sets it from its
+    /// `Pc` (0 or absent, and 2: on; 1: off; level 1 always off) and RIS
+    /// turns it off; DECSTR keeps it. It starts off.
+    ///
+    /// The host passes the keys, mouse reports, focus reports and paste
+    /// brackets it writes through [`to_8bit_controls`] while it is on
+    /// (ADR 0024).
     pub fn c1_8bit_replies(&self) -> bool {
         self.state.c1_8bit_replies
     }
@@ -495,9 +545,10 @@ struct State {
     /// 4 (VT400-class, xterm's default `decTerminalID` 420) until then. Kept
     /// by DECSTR and RIS, as in xterm. The device reports read it.
     conformance_level: u8,
-    /// Whether replies should use 8-bit C1 controls (`0x9B` for `ESC [`):
-    /// set by DECSCL's `Pc`, cleared by RIS. Recorded for the reply code
-    /// (S7C1T/S8C1T, #96); only the DECRQSS report of DECSCL reads it.
+    /// 8-bit mode: replies use 8-bit C1 controls (`0x9B` for `ESC [`) and
+    /// C1 controls in the input are honoured. Set by S8C1T and DECSCL's
+    /// `Pc`, cleared by S7C1T, DECSCL level 1 and RIS; see
+    /// [`Terminal::c1_8bit_replies`].
     c1_8bit_replies: bool,
     /// The cursor shape the program asked for: set by DECSCUSR 1..=6,
     /// dropped by DECSCUSR 0 and 7, DECSTR, DECSCL and RIS. DECSET 12 does
@@ -524,6 +575,18 @@ struct State {
     /// The cell size in pixels, `(width, height)`, both non-zero, from
     /// [`Terminal::set_cell_pixels`]; `None` while unknown.
     cell_pixels: Option<(u16, u16)>,
+}
+
+/// The parser's consumer: [`State::apply`] for every action, and 8-bit mode
+/// ([`State::c1_8bit_replies`]) for the C1 controls in the output.
+impl Sink for State {
+    fn action(&mut self, action: Action) {
+        self.apply(action);
+    }
+
+    fn c1_controls(&self) -> bool {
+        self.c1_8bit_replies
+    }
 }
 
 impl State {
@@ -697,5 +760,57 @@ impl State {
             self.grid.insert_chars(width);
         }
         self.grid.put_char(ch);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::to_8bit_controls;
+
+    fn eight_bit(sequence: &[u8]) -> Vec<u8> {
+        let mut bytes = sequence.to_vec();
+        to_8bit_controls(&mut bytes);
+        bytes
+    }
+
+    #[test]
+    fn introducers_and_the_string_terminator_become_c1_bytes() {
+        assert_eq!(eight_bit(b"\x1b[?64;21;22c"), b"\x9b?64;21;22c");
+        assert_eq!(eight_bit(b"\x1bOA"), b"\x8fA");
+        assert_eq!(eight_bit(b"\x1bP1$r0m\x1b\\"), b"\x901$r0m\x9c");
+        assert_eq!(
+            eight_bit(b"\x1b]10;rgb:0000/0000/0000\x1b\\"),
+            b"\x9d10;rgb:0000/0000/0000\x9c"
+        );
+    }
+
+    /// A BEL-terminated OSC reply keeps its BEL (BEL is not a C1 control).
+    #[test]
+    fn a_bel_terminator_stays() {
+        assert_eq!(eight_bit(b"\x1b]10;?\x07"), b"\x9d10;?\x07");
+    }
+
+    /// Only the leading introducer and, after a DCS or OSC one, the
+    /// trailing ST change: an ESC elsewhere, a two-byte Alt-prefixed key and
+    /// a CSI ending in `ESC \` stay as they are.
+    #[test]
+    fn nothing_else_changes() {
+        for same in [
+            &b""[..],
+            b"\x1b",
+            b"\x1b[",
+            b"\x1bO",
+            b"\x1bP",
+            b"\x1b]",
+            b"\x1b\\",
+            b"\x1ba",
+            b"\x1b\x1b[A",
+            b"a\x1b[A",
+            b"\x03",
+        ] {
+            assert_eq!(eight_bit(same), same, "{same:x?}");
+        }
+        assert_eq!(eight_bit(b"\x1b[M\x1b\x1b\\"), b"\x9bM\x1b\x1b\\");
+        assert_eq!(eight_bit(b"\x1bPq\x1b[A\x1b\\"), b"\x90q\x1b[A\x9c");
     }
 }

@@ -19,11 +19,12 @@
 //! | `CSI 22 ; Ps t`, `CSI 23 ; Ps t` | title stack | push / pop the window title; a pop sends [`Request::SetTitle`], nothing is replied |
 //!
 //! The level is [`Terminal::conformance_level`] (DECSCL). Every reply is
-//! built by `State::reply_csi`, `State::reply_dcs` or `State::reply_osc`
-//! and is always 7-bit (`ESC [`, `ESC P`, `ESC ]`, `ESC \`), also after
-//! DECSCL selected 8-bit replies ([`Terminal::c1_8bit_replies`] is
-//! recorded, not honoured, until #96). A reply is queued the moment its
-//! query completes, in query order. Nothing here writes to the grid, moves
+//! built by `State::reply_csi`, `State::reply_dcs` or `State::reply_osc`:
+//! 7-bit (`ESC [`, `ESC P`, `ESC ]`, `ESC \`), or in 8-bit mode
+//! ([`Terminal::c1_8bit_replies`]: S8C1T, DECSCL) the raw C1 bytes `0x9B`,
+//! `0x90`, `0x9D` and `0x9C` ([`to_8bit_controls`]), read when the reply is
+//! queued. A reply is queued the moment its query completes, in query
+//! order. Nothing here writes to the grid, moves
 //! the cursor or disarms a pending wrap.
 //!
 //! # Identity
@@ -80,6 +81,7 @@
 //! [`Terminal::set_cell_pixels`]: crate::Terminal::set_cell_pixels
 //! [`Terminal::conformance_level`]: crate::Terminal::conformance_level
 //! [`Terminal::c1_8bit_replies`]: crate::Terminal::c1_8bit_replies
+//! [`to_8bit_controls`]: crate::to_8bit_controls
 
 use std::fmt;
 use std::io::Write as _;
@@ -192,18 +194,26 @@ impl State {
     }
 
     /// Queues a reply: `ESC ]`, `body`, `ESC \` (the OSC colour echo of
-    /// #10's second part is its first user).
+    /// #10's second part is its first user). In 8-bit mode the introducer
+    /// and the terminator are C1 bytes; a reply that ends with BEL instead
+    /// keeps it ([`crate::to_8bit_controls`]).
     #[expect(dead_code, reason = "the OSC colour queries (#10, 10-colors) use it")]
     pub(crate) fn reply_osc(&mut self, body: fmt::Arguments<'_>) {
         self.reply(b"\x1b]", body, b"\x1b\\");
     }
 
+    /// Queues `intro`, `body`, `end` as one [`Request::Reply`], in its
+    /// 8-bit form while 8-bit mode is on: the one place every reply goes
+    /// through.
     fn reply(&mut self, intro: &[u8], body: fmt::Arguments<'_>, end: &[u8]) {
         let mut bytes = Vec::with_capacity(16);
         bytes.extend_from_slice(intro);
         // Writing to a `Vec` cannot fail.
         let _ = bytes.write_fmt(body);
         bytes.extend_from_slice(end);
+        if self.c1_8bit_replies {
+            crate::to_8bit_controls(&mut bytes);
+        }
         self.pending.push(Request::Reply(bytes));
     }
 

@@ -16,7 +16,7 @@ const FIXTURE: &str = include_str!("../../../tessera-term/tests/fixtures/mouse_s
 const FIXTURE_NAME: &str = "tessera-term/tests/fixtures/mouse_spec.txt";
 
 /// Routing rows in the fixture.
-const ROUTING_ROWS: usize = 36;
+const ROUTING_ROWS: usize = 39;
 
 /// `\e` for ESC, `\xNN` for one raw byte, `\\` for a backslash; every
 /// other character is itself (UTF-8).

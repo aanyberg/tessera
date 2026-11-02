@@ -499,17 +499,18 @@ fn the_flags_zero_reply_form_is_answered_like_the_query() {
     assert_eq!(term.take_requests(), [reply.clone(), reply]);
 }
 
-/// No reply ever carries an 8-bit C1 control, whatever DECSCL selected
-/// (#96 owns 8-bit replies).
+/// Once DECSCL selects 8-bit mode, every reply uses 8-bit C1 controls:
+/// it starts with the raw byte 0x9B (CSI) or 0x90 (DCS), carries no ESC,
+/// and a DCS reply ends with 0x9C (ST) (#96, ADR 0024).
 #[test]
-fn replies_stay_7bit_after_decscl_selects_8bit() {
+fn replies_are_8bit_after_decscl_selects_8bit() {
     let queries: &[u8] = b"\x1b[c\x1b[>c\x1b[=c\x1b[>q\x1b[5n\x1b[6n\x1b[?6n\x1b[?26n\x1b[4$p\
 \x1b[?25$p\x1b[?u\x1bP$qm\x1b\\\x1bP$q\"p\x1b\\\x1b[18t";
     // Level 2 has no DA3.
-    for (decscl, count) in [
-        (&b"\x1b[64;0\"p"[..], 14),
-        (b"\x1b[65;2\"p", 14),
-        (b"\x1b[62\"p", 13),
+    for (decscl, count, dcs) in [
+        (&b"\x1b[64;0\"p"[..], 14, 4),
+        (b"\x1b[65;2\"p", 14, 4),
+        (b"\x1b[62\"p", 13, 3),
     ] {
         let mut term = Terminal::new(24, 80);
         term.advance(decscl);
@@ -524,11 +525,18 @@ fn replies_stay_7bit_after_decscl_selects_8bit() {
             })
             .collect();
         assert_eq!(replies.len(), count, "{decscl:?}");
+        let mut strings = 0;
         for reply in replies {
-            assert!(
-                reply.iter().all(|&b| b < 0x80) && reply.starts_with(b"\x1b"),
-                "{decscl:?}: {reply:?}"
-            );
+            assert!(!reply.contains(&0x1b), "{decscl:?}: ESC in {reply:x?}");
+            match reply.first() {
+                Some(0x9b) => {}
+                Some(0x90) => {
+                    assert_eq!(reply.last(), Some(&0x9c), "{decscl:?}: {reply:x?}");
+                    strings += 1;
+                }
+                _ => panic!("{decscl:?}: {reply:x?} does not start with CSI or DCS"),
+            }
         }
+        assert_eq!(strings, dcs, "{decscl:?}: DCS replies");
     }
 }

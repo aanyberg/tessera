@@ -9,5 +9,5 @@
 #
 # No blocks are pending. History: the researcher kept 8 rows here. N_DECRC_reset passed once #80 merged (PR #98) and is
 # E_DECRC_saveRestoreCursor_reset; N_HPR_* / N_VPR_* (#93) and N_SCORC_basic (#94) passed with HPR/VPR and SCOSC/SCORC
-# and are E_HPR_*, E_VPR_* and E_SCORC_saveRestoreCursor_basic. #95 and #96 have `#>` lines in esctest_spec.txt only.
+# and are E_HPR_*, E_VPR_* and E_SCORC_saveRestoreCursor_basic. #95 has `#>` lines in esctest_spec.txt only.
 # =============================================================================
