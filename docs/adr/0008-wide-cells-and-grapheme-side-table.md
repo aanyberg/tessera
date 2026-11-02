@@ -4,6 +4,11 @@
 
 Amended by ADR 0013: `Cell` is 20 bytes since `Style` carries an underline colour.
 
+Amended by ADR 0026: the side table also holds the OSC 8 hyperlink of each
+`CellFlags::LINK` cell, in the same allocation (a second vector next to the
+clusters, so `Line` stays 64 bytes). Its editing methods apply to both; `len`
+and `iter` read the clusters, `is_empty` means neither.
+
 ## Context
 
 Until issue #4 every `tessera_grid::Cell` was one column and held one

@@ -17,7 +17,7 @@
 
 use std::cmp::Ordering;
 
-use crate::{Cell, GraphemeTable, Line, Mark, Point, Scrollback, Style};
+use crate::{Cell, GraphemeTable, Hyperlink, Line, Mark, Point, Scrollback, Style};
 
 /// The parts of one screen a resize rewrites.
 pub(crate) struct ScreenMut<'a> {
@@ -449,6 +449,9 @@ struct Rewrapper {
     /// Its clusters: index into `joined` and text, by ascending index
     /// (reused).
     clusters: Vec<(usize, Box<str>)>,
+    /// Its hyperlinks: index into `joined` and link, by ascending index
+    /// (reused).
+    links: Vec<(usize, Hyperlink)>,
 }
 
 impl Rewrapper {
@@ -471,6 +474,7 @@ impl Rewrapper {
             top: None,
             joined: Vec::new(),
             clusters: Vec::new(),
+            links: Vec::new(),
         }
     }
 
@@ -530,6 +534,7 @@ impl Rewrapper {
         self.next_source += rows.len();
         self.joined.clear();
         self.clusters.clear();
+        self.links.clear();
         let mut marks: Vec<Mark> = Vec::new();
         let mut cursor_offset = None;
         let mut top_offset = None;
@@ -562,6 +567,12 @@ impl Rewrapper {
                     .take()
                     .filter(|&(col, _)| col < len)
                     .map(|(col, text)| (base + col, text)),
+            );
+            self.links.extend(
+                row.graphemes
+                    .take_links()
+                    .filter(|&(col, _)| col < len)
+                    .map(|(col, link)| (base + col, link)),
             );
             if marks.is_empty() {
                 marks = std::mem::take(&mut row.marks);
@@ -689,6 +700,8 @@ impl Rewrapper {
         // emptied vector goes back afterwards to be reused.
         let mut entries = std::mem::take(&mut self.clusters);
         let mut clusters = entries.drain(..).peekable();
+        let mut link_entries = std::mem::take(&mut self.links);
+        let mut links = link_entries.drain(..).peekable();
         let mut p = 0;
         while p < end {
             let mut cell = self.joined[p];
@@ -708,6 +721,7 @@ impl Rewrapper {
             debug_assert!(!cell.is_pad(), "padding reached the split");
             while clusters.next_if(|&(at, _)| at < p).is_some() {}
             let cluster = clusters.next_if(|&(at, _)| at == p).map(|(_, text)| text);
+            let link = take_link(&mut links, p);
             let holds_cursor = cursor_offset.is_some_and(|offset| (p..p + width).contains(&offset));
             let holds_top = TOP && (p..p + width).contains(&top_offset);
             if width > cols {
@@ -745,14 +759,25 @@ impl Rewrapper {
                 Some(text) if cell.is_cluster() => row.graphemes.set(col, text),
                 _ => cell.flags = cell.flags.difference(crate::CellFlags::CLUSTER),
             }
+            match link {
+                Some(link) if cell.is_link() => row.graphemes.set_link(col, link),
+                _ => cell.flags = cell.flags.difference(crate::CellFlags::LINK),
+            }
             row.cells.push(cell);
             if width == 2 {
-                row.cells.push(self.joined[p + 1]);
+                let mut spacer = self.joined[p + 1];
+                match take_link(&mut links, p + 1) {
+                    Some(link) if spacer.is_link() => row.graphemes.set_link(col + 1, link),
+                    _ => spacer.flags = spacer.flags.difference(crate::CellFlags::LINK),
+                }
+                row.cells.push(spacer);
             }
             p += width;
         }
         drop(clusters);
+        drop(links);
         self.clusters = entries;
+        self.links = link_entries;
         let last_len = row.cells.len();
         row.cells.resize(cols, Cell::BLANK);
         self.push_row(row);
@@ -802,6 +827,18 @@ impl Rewrapper {
             pending_wrap,
         });
     }
+}
+
+/// The link at index `at` of the joined line, skipping the ones before it
+/// (their cells were dropped).
+fn take_link(
+    links: &mut std::iter::Peekable<std::vec::Drain<'_, (usize, Hyperlink)>>,
+    at: usize,
+) -> Option<Hyperlink> {
+    while links.next_if(|&(index, _)| index < at).is_some() {}
+    links
+        .next_if(|&(index, _)| index == at)
+        .map(|(_, link)| link)
 }
 
 /// An output row with room for `cols` cells and none yet.

@@ -48,6 +48,15 @@
 //! through half of a wide character blanks the other half. ADR 0008
 //! records the rules and why.
 //!
+//! # Hyperlinks
+//!
+//! A cell written while an OSC 8 hyperlink is open ([`Grid::begin_hyperlink`])
+//! gets [`CellFlags::LINK`] and the line's [`GraphemeTable`] holds its
+//! [`Hyperlink`] under the column, in the same allocation as the cluster
+//! text. Every primitive keeps the two in step, links survive reflow and
+//! scrolling into history, and at most [`MAX_LIVE_LINKS`] links are alive at
+//! once. ADR 0026 records the rules.
+//!
 //! # Damage
 //!
 //! The grid records which visible rows each primitive changes
@@ -78,6 +87,7 @@ mod cell;
 mod damage;
 mod grapheme;
 mod grid;
+mod hyperlink;
 mod line;
 mod reflow;
 mod scrollback;
@@ -89,6 +99,7 @@ pub use grapheme::{GraphemeTable, MAX_CLUSTER_SCALARS, char_width};
 pub use grid::{
     DEFAULT_MAX_SCROLLBACK, EraseDisplay, EraseLine, Grid, Margins, ReverseWrap, ScrollRegion,
 };
+pub use hyperlink::{Hyperlink, LinkRefused, MAX_ID_BYTES, MAX_LIVE_LINKS, MAX_URI_BYTES};
 pub use line::{Line, Mark};
 pub use scrollback::Scrollback;
 pub use tabs::TabStops;

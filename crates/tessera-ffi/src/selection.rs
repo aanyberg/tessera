@@ -335,11 +335,12 @@ pub unsafe extern "C" fn tessera_session_selection_text(
     })
 }
 
-/// Copies the URL detected in session `session_id`'s text at cell
-/// (`col`, `row`) of its surface (the scroll offset honoured), for
-/// command-click: `http`, `https`, `ftp`, `file` and `mailto` URLs, across
-/// soft wraps, without trailing punctuation, as written on the screen.
-/// Opening it (and which schemes may be opened) is the caller's decision.
+/// Copies the link in session `session_id`'s text at cell (`col`, `row`)
+/// of its surface (the scroll offset honoured), for command-click: the
+/// OSC 8 hyperlink the cell belongs to (its URI as the program sent it,
+/// any scheme), else the URL detected in the text (`http`, `https`, `ftp`,
+/// `file` and `mailto` URLs, across soft wraps, without trailing
+/// punctuation, as written on the screen). Opening it (and which schemes may be opened) is the caller's decision.
 ///
 /// Stores the URL's length in bytes in `*len` and writes its UTF-8 bytes
 /// (no NUL terminator) to `buf` when `cap` holds them all; with no URL
@@ -386,8 +387,9 @@ pub unsafe extern "C" fn tessera_session_link_at(
 /// Sets the cell (`col`, `row`) the pointer hovers over session
 /// `session_id`'s surface while the link modifier (Command) is held, with
 /// `active` true; `active` false clears it (`col` and `row` are then
-/// ignored). From the next `tessera_surface_render` on, the URL under the
-/// hovered cell is underlined, one underline per row it covers.
+/// ignored). From the next `tessera_surface_render` on, the link under the
+/// hovered cell is underlined: the whole OSC 8 link, or the detected URL,
+/// one underline per row run it covers.
 ///
 /// Returns `TESSERA_ERROR_NULL_POINTER` if `app` is `NULL`,
 /// `TESSERA_ERROR_SESSION_NOT_FOUND` if the id is not a live session.

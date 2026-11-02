@@ -1,6 +1,6 @@
 //! Lines and the semantic marks shell integration attaches to them.
 
-use crate::{Cell, CellFlags, GraphemeTable, Style};
+use crate::{Cell, CellFlags, GraphemeTable, Hyperlink, Style};
 
 /// Semantic annotation attached to a line by shell integration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,12 +73,16 @@ impl Mark {
 /// the [`CellFlags::SPACER`] right after it; the pair never straddles the
 /// end of the line. A cell whose grapheme cluster has more than one scalar
 /// carries [`CellFlags::CLUSTER`] and its full text lives in
-/// [`Line::graphemes`]. Code that edits `cells` directly must keep both
-/// rules; the line's own methods and every [`Grid`] primitive do.
+/// [`Line::graphemes`]; a cell that belongs to an OSC 8 hyperlink carries
+/// [`CellFlags::LINK`] and its link lives in the same table
+/// ([`Line::hyperlink`]). Code that
+/// edits `cells` directly must keep all three rules; the line's own
+/// methods and every [`Grid`] primitive do.
 ///
 /// [`CellFlags::WIDE`]: crate::CellFlags::WIDE
 /// [`CellFlags::SPACER`]: crate::CellFlags::SPACER
 /// [`CellFlags::CLUSTER`]: crate::CellFlags::CLUSTER
+/// [`CellFlags::LINK`]: crate::CellFlags::LINK
 /// [`Grid`]: crate::Grid
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Line {
@@ -86,9 +90,11 @@ pub struct Line {
     pub cells: Vec<Cell>,
     /// Semantic marks on this line.
     pub marks: Vec<Mark>,
-    /// Cluster text of the line's [`CellFlags::CLUSTER`] cells, by column.
+    /// Cluster text of the line's [`CellFlags::CLUSTER`] cells and the
+    /// hyperlink of its [`CellFlags::LINK`] cells, by column.
     ///
     /// [`CellFlags::CLUSTER`]: crate::CellFlags::CLUSTER
+    /// [`CellFlags::LINK`]: crate::CellFlags::LINK
     pub graphemes: GraphemeTable,
     /// True when this line continues onto the next (soft wrap).
     pub wrapped: bool,
@@ -114,13 +120,21 @@ impl Line {
         self.graphemes.get(col)
     }
 
+    /// The hyperlink the cell at `col` belongs to, if any.
+    pub fn hyperlink(&self, col: usize) -> Option<&Hyperlink> {
+        self.cells
+            .get(col)
+            .filter(|cell| cell.is_link())
+            .and_then(|_| self.graphemes.link(col))
+    }
+
     /// Overwrites every cell in `range` (clamped to the line) with a blank
     /// carrying the background of `style`.
     ///
     /// A wide character cut by either end of the range is blanked whole:
     /// a range that starts on a spacer also blanks the wide cell to its
     /// left, and one that ends on a wide cell also blanks its spacer.
-    /// Clusters in the blanked cells are dropped.
+    /// Clusters and links in the blanked cells are dropped.
     pub fn fill(&mut self, range: std::ops::Range<usize>, style: Style) {
         let end = range.end.min(self.cells.len());
         let start = range.start.min(end);
@@ -136,8 +150,8 @@ impl Line {
         self.blank_raw(start..end, style);
     }
 
-    /// Resets the line to blanks and drops its marks, clusters and wrap
-    /// flag.
+    /// Resets the line to blanks and drops its marks, clusters, links and
+    /// wrap flag.
     pub fn clear(&mut self, style: Style) {
         self.cells.fill(Cell::blank_with(style));
         self.graphemes.clear();
@@ -165,7 +179,13 @@ impl Line {
         let end = self
             .cells
             .iter()
-            .rposition(|c| c.ch != ' ' || !c.flags.difference(CellFlags::PAD).is_empty())
+            .rposition(|c| {
+                c.ch != ' '
+                    || !c
+                        .flags
+                        .difference(CellFlags::PAD | CellFlags::LINK)
+                        .is_empty()
+            })
             .map_or(0, |i| i + 1);
         let mut out = String::with_capacity(end);
         for (col, cell) in self.cells[..end].iter().enumerate() {
@@ -182,8 +202,8 @@ impl Line {
 
     // ---------------------------------------------- crate-internal edits
 
-    /// Blanks the cell at `col` (if in range) and drops its cluster,
-    /// without looking at its neighbours.
+    /// Blanks the cell at `col` (if in range) and drops its cluster and
+    /// link, without looking at its neighbours.
     pub(crate) fn blank_at(&mut self, col: usize, style: Style) {
         if let Some(cell) = self.cells.get_mut(col) {
             *cell = Cell::blank_with(style);
@@ -191,11 +211,19 @@ impl Line {
         }
     }
 
-    /// Blanks `range` (already clamped) and drops its clusters, without
-    /// looking at the neighbours.
+    /// Blanks `range` (already clamped) and drops its clusters and links,
+    /// without looking at the neighbours.
     fn blank_raw(&mut self, range: std::ops::Range<usize>, style: Style) {
         self.cells[range.clone()].fill(Cell::blank_with(style));
         self.graphemes.remove_range(range);
+    }
+
+    /// Makes the cell at `col` (if in range) part of `link`.
+    pub(crate) fn set_link(&mut self, col: usize, link: Hyperlink) {
+        if let Some(cell) = self.cells.get_mut(col) {
+            cell.flags |= CellFlags::LINK;
+            self.graphemes.set_link(col, link);
+        }
     }
 
     /// Prepares cell `col` to be overwritten: when it is one half of a wide
@@ -213,7 +241,8 @@ impl Line {
         }
     }
 
-    /// Stores `cell` at `col` (if in range) and drops the old cluster there.
+    /// Stores `cell` at `col` (if in range) and drops the old cluster and
+    /// link there.
     pub(crate) fn set(&mut self, col: usize, cell: Cell) {
         if let Some(slot) = self.cells.get_mut(col) {
             *slot = cell;
