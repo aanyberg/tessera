@@ -1,0 +1,88 @@
+# Security and resource model
+
+What Tessera trusts, what it defends, and the rules every change keeps. Critics check a branch against the rules
+below (S1-S9) and the adversarial tester attacks them; a broken rule is a BLOCKER ("a safety problem"). A change
+that adds an attack surface or moves a bound updates this file in the same PR.
+
+## Trust boundaries
+
+| Source | Trust | Why |
+|---|---|---|
+| Bytes from the child (PTY output) | **untrusted** | Anything can print: a remote host over `ssh`, a `cat`ed file, `curl` output, a compromised dependency's build log. |
+| Text the user pastes | semi-trusted | The user chose to paste it, but it may come from a web page with hidden control characters. |
+| Imported themes (`.itermcolors`, `tessera-devtool theme import`) | **untrusted** | Downloaded files. |
+| `config.toml`, theme files, shell integration scripts on disk | trusted, parsed defensively | Only the same user can write them; a same-user attacker already owns the shell. Parsers still cap sizes so a broken file cannot hang the app. |
+| Control socket clients, plugins (backlog: #53, #48, #58) | **untrusted** until consent | ADR 0002 capabilities and ADR 0003 consent; not built yet. |
+| Same-uid local processes | trusted | Out of scope: they can already `ptrace` the shell. |
+
+Assets, in order: the user's input stream (an attacker who can inject bytes into it runs commands), the clipboard,
+terminal content (confidentiality: it can hold secrets), and availability (memory, CPU, the main thread).
+
+## Rules
+
+- **S1. No echo into the input.** Replies to the child's queries (ADR 0024) are built from terminal state only, never
+  from bytes the child sent. An over-long or unknown request gets a fixed answer or none.
+- **S2. Nothing is read back.** The clipboard is never reported (OSC 52 `?`), the title is never reported
+  (`CSI 20/21 t`), and no new query returns user data without an ADR that argues it.
+- **S3. Untrusted text in the chrome is sanitised.** Titles drop bidi, C0, C1 and DEL characters and are capped
+  (ADR 0022); process names are sanitised before display (ADR 0031). Any new place that shows child-controlled text
+  (tab, window, notification, menu, dialog) does the same.
+- **S4. Paste is sanitised.** Every C0 except TAB, CR and LF, plus ESC, DEL and C1 is removed before brackets are
+  added, so a paste cannot end bracketed paste early (`crates/tessera-app-core/src/input.rs`). Only
+  `tessera_session_write` is raw, by design, and the app never feeds it clipboard text.
+- **S5. Every buffer filled from untrusted input has a named cap.** A new queue, buffer, stack, table or cache fed
+  by the child, a file or a client states its cap as a constant, and a test floods it past the cap. Unbounded
+  growth is a BLOCKER even when "nobody would send that".
+- **S6. Per-byte work is bounded.** Every callback or event emitted per input byte (bell, title, clipboard, marks,
+  replies) is bounded in rate and memory, and an expensive sequence does not hold the terminal lock long (#117).
+- **S7. Memory safety.** `unsafe` only in `tessera-pty` and `tessera-ffi`, each block with a `// SAFETY:` comment
+  (CONTRIBUTING.md; the counting test allocator is the one exception). Every FFI export runs under `ffi_guard!` (`catch_unwind`); every pointer and length argument
+  is checked; sessions cross the boundary as ids, never pointers.
+- **S8. No terminal content in logs.** Logs carry lengths, ids, parameters and paths, never output, input, titles,
+  clipboard text or environment values.
+- **S9. New surfaces need an ADR first.** Opening links, the control socket, plugins, images, triggers and anything
+  that acts on child output gets its trust decision (consent, capability, allow list) in an ADR before the code.
+
+## Current bounds
+
+| Input | Cap | Where |
+|---|---|---|
+| OSC string in the parser | **none** (#213) | `crates/tessera-vt/src/lib.rs` |
+| OSC parameters | 16 | `crates/tessera-term/src/osc.rs` |
+| Title | 1024 bytes, dropped whole when longer; stack depth 10 | `crates/tessera-term/src/lib.rs`, `reports.rs` |
+| OSC 52 write | 1 MiB decoded, strict base64, UTF-8; last write per chunk | `crates/tessera-term/src/osc.rs`, `crates/tessera-app-core/src/session.rs` |
+| OSC 7 / OSC 1337 | 4096 bytes | `crates/tessera-term/src/lib.rs` |
+| DCS | streamed in 4 KiB chunks; DECRQSS request 64 bytes | `crates/tessera-vt/src/lib.rs`, `crates/tessera-term/src/dcs.rs` |
+| Grapheme cluster | 32 scalars | `crates/tessera-grid/src/grapheme.rs` |
+| Grid | 2048 columns × 1024 rows | `crates/tessera-app-core/src/view.rs`, `crates/tessera-ffi/src/session.rs` |
+| Scrollback | 10 000 lines (configured value not applied yet; #51) | `crates/tessera-grid/src/grid.rs` |
+| PTY read queue / write queue / pending input | 64 × 64 KiB / 1 MiB / 16 MiB | `crates/tessera-pty/src/native.rs`, `crates/tessera-app-core/src/session.rs` |
+| Kitty keyboard stack | 8 | `crates/tessera-term/src/modes.rs` |
+| Config / theme / import file | 16 MiB / 64 KiB (256 files) / 1 MiB | `crates/tessera-config/src/` |
+| URL candidate | 2083 characters | `crates/tessera-app-core/src/url.rs` |
+
+## Memory and leaks
+
+What runs today: an allocation-counting test for the render path (`crates/tessera-render/tests/alloc.rs`), the
+release-only timing bars under an output flood (`docs/software-factory.md`, "Hang protection"), Thread Sanitizer on
+the app's XCTest suites, and nightly libFuzzer runs of the vt, grid and term targets.
+
+What every change must keep:
+
+- Closing a session, tab or window frees what it allocated: no closed session left in a map, no Swift retain cycle
+  between a view, its window controller, its `TesseraSession` and a callback's `user_data`.
+- Lazy one-time caches (font atlas, shaping cache) are bounded and documented as such.
+- A per-session structure that grows with output is capped (S5) and its cap is in the table above.
+
+Tracked: churn and leak checks for Rust, FFI and the app (#214); FFI fuzzing, ASan and Miri for the `unsafe` crates
+(#215); memory-per-session and startup budgets (#216).
+
+## Known gaps and open decisions
+
+- The OSC buffer in the parser is unbounded (#213).
+- OSC 52 writes are on by default with no notice, multi-line paste without bracketed paste runs every line, the
+  link-opening scheme policy is undecided, and the child inherits the app's whole environment (#217).
+- The app ships ad-hoc signed and not notarized, with the App Sandbox off (a terminal must spawn arbitrary
+  programs) and hardened runtime on (#50).
+- portable-pty's `close_random_fds` allocates between `fork` and `exec`; not known to be exploitable, noted for the
+  pty owner.
