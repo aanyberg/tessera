@@ -8351,4 +8351,4 @@ attr: (17,44)-(17,72) fg=- bg=- ul=- us=single flags=bold,blink,inverse
 attr_others: fg=- bg=- ul=- us=none flags=-
 
 # V2S14_light_background_prompt (m2_14) is a live case in csi_spec.txt since #8 (DECSCNM is stored only; the text is plain).
-#> V2S15_save_restore_cursor_charsets (m2_15) -> #112: SGR + DECSC/DECRC + SCS (ESC ( 0 line drawing, ESC ) B, SO/SI); the DECSC/DECRC + SGR part alone is covered by sgr_spec.txt Part C.
+# V2S15_save_restore_cursor_charsets (m2_15) is a live case in csi_spec.txt since #112 (SCS and SO/SI exist); the DECSC/DECRC + SGR part alone is covered by sgr_spec.txt Part C.

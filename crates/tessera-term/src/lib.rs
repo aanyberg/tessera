@@ -70,11 +70,32 @@
 //!   12): [`Terminal::cursor_style`] is the configured default again, as
 //!   after RIS (xterm's `ReallyReset`, ADR 0020).
 //!
+//! - the character sets: G0 to G3 ASCII, GL = G0, GR = G2, no pending
+//!   single shift, in the saved cursor too (see "Character sets" below).
+//!   DECNRCM (`CSI ? 42`) is kept, as in xterm; DEC's table resets it.
+//!
 //! KAM is not modelled (SM 2 is ignored), so it has nothing to reset.
-//! Still waiting on state that does not exist yet (`// #112, #95, #10` in
-//! `soft_reset`): the character sets G0-G3/GL/GR (SCS, #112), DECSCA
-//! (#95) and the ANSI palette (colours set with OSC 4) back to the theme
-//! (#10).
+//! Still waiting on state that does not exist yet (`// #95, #10` in
+//! `soft_reset`): DECSCA (#95) and the ANSI palette (colours set with OSC 4)
+//! back to the theme (#10).
+//!
+//! ## Character sets
+//!
+//! SCS designates a set into G0 to G3 (`ESC ( ) * +` for 94-character
+//! sets, `ESC - . /` for 96-character ones from level 3), SO and SI (LS1,
+//! LS0), `ESC n` and `ESC o` (LS2, LS3) pick the set GL prints through,
+//! `ESC ~`, `ESC }` and `ESC |` (LS1R to LS3R) the one GR does, and `ESC N`
+//! and `ESC O` (SS2, SS3) a set for the next printed character. DEC
+//! Special Graphics (`ESC ( 0`, the terminfo `smacs`), the UK set, DEC
+//! Supplemental and Technical, ISO Latin-1 and xterm's national
+//! replacement sets up to level 4 are implemented; the national ones can
+//! be designated only while DECNRCM (`CSI ? 42 h`, [`Modes::nrcs`]) is on.
+//! DECSC and DECRC save and restore the sets and GL and GR with the cursor,
+//! one slot per screen. The output is Unicode: GL translates ASCII, GR
+//! translates `U+0080..=U+00FF` and nothing above `U+00FF` is translated,
+//! all as xterm's `xtermCharSetOut` does in UTF-8 mode. DA1 lists feature 9
+//! (NRCS) from level 2. ADR 0033 has the rules and the deviations from
+//! xterm; the `charset` module documents the translation.
 //!
 //! ## Left and right margins
 //!
@@ -112,6 +133,7 @@
 
 #![forbid(unsafe_code)]
 
+mod charset;
 mod control;
 mod csi;
 mod dcs;
@@ -131,6 +153,7 @@ pub use modes::{KITTY_STACK_DEPTH, Modes, MouseEncoding, MouseTracking};
 pub use mouse::{MouseReport, MouseReportButton, MouseReportKind, encode_mouse};
 pub use reports::{DA2_PV, TITLE_STACK_DEPTH};
 
+use charset::{Charsets, Saved};
 use dcs::Dcs;
 use reports::TitleStack;
 
@@ -284,6 +307,8 @@ impl Terminal {
                 keyboard: KeyboardModes::default(),
                 kitty: KittyStacks::default(),
                 last_printed: None,
+                charsets: Charsets::default(),
+                saved_charsets: [None; 2],
                 conformance_level: 4,
                 c1_8bit_replies: false,
                 shape_override: None,
@@ -535,12 +560,19 @@ struct State {
     keyboard: KeyboardModes,
     /// The kitty keyboard flag stacks of both screens.
     kitty: KittyStacks,
-    /// The last non-control character handed to [`State::print`], for REP
-    /// (`CSI Ps b`), whether it took a cell, joined the previous cluster or
-    /// was dropped; REP checks the cell it left behind. Every other action
+    /// The last non-control character [`State::print`] let through, for REP
+    /// (`CSI Ps b`), as printed (after the character sets): whether it took a
+    /// cell, joined the previous cluster or was dropped; REP checks the cell
+    /// it left behind. Every other action
     /// clears it once it has been applied, as xterm does, so REP only
     /// repeats a character printed immediately before it.
     last_printed: Option<char>,
+    /// G0 to G3, GL, GR and the pending single shift (see the `charset`
+    /// module).
+    charsets: Charsets,
+    /// What DECSC saved of [`State::charsets`], one slot per screen (primary
+    /// first, as the grid's saved cursor); `None` until the first DECSC.
+    saved_charsets: [Option<Saved>; 2],
     /// The operating level DECSCL (`CSI 6n ; Pc " p`) last selected, 1..=5;
     /// 4 (VT400-class, xterm's default `decTerminalID` 420) until then. Kept
     /// by DECSTR and RIS, as in xterm. The device reports read it.
@@ -632,10 +664,10 @@ impl State {
         // Printing is the hot path: handle it apart from the sequences so
         // it never reaches the drop glue of the heap-carrying variants.
         if let Action::Print(ch) = action {
-            self.print(ch);
+            let shown = self.print(ch);
             // Recorded here rather than in `print`, whose early returns
             // would skip it.
-            self.last_printed = (!ch.is_control()).then_some(ch);
+            self.last_printed = (!shown.is_control()).then_some(shown);
         } else {
             self.apply_sequence(action);
             self.last_printed = None;
@@ -685,19 +717,46 @@ impl State {
         }
     }
 
+    /// Prints `ch` through the character sets and returns what it printed:
+    /// `ch` itself, the character a set mapped it to, or a control
+    /// character when nothing was printed (a control character, or one
+    /// xterm drops, see the `charset` module).
+    ///
+    /// While GL, GR and the single shift are all ASCII, which is the
+    /// default, this is one test of [`Charsets::active`].
+    fn print(&mut self, ch: char) -> char {
+        // The parser hands DEL (0x7F) over as a printable; like any other
+        // control character it must never occupy a cell.
+        if ch.is_control() {
+            trace!(ch = ?ch, "control character dropped from print");
+            return ch;
+        }
+        let ch = if self.charsets.active {
+            let level = self.conformance_level;
+            match self.charsets.translate(ch, self.modes.nrcs, level) {
+                Some(shown) => shown,
+                None => return '\0',
+            }
+        } else {
+            ch
+        };
+        self.put(ch);
+        ch
+    }
+
     /// Writes `ch` at the cursor, honouring auto-wrap and insert mode.
     ///
     /// Width comes from the grid ([`tessera_grid::char_width`]): a wide
     /// character needs two columns, and a scalar that joins the previous
     /// character's grapheme cluster ([`Grid::would_attach`]) takes none, so
     /// it bypasses insert mode, wrapping and DECAWM entirely.
-    fn print(&mut self, ch: char) {
-        // The parser hands DEL (0x7F) over as a printable; like any other
-        // control character it must never occupy a cell.
-        if ch.is_control() {
-            trace!(ch = ?ch, "control character dropped from print");
-            return;
-        }
+    // Forced into `print`: with a call between them the per-character path
+    // costs about 2 % more instructions than before the character sets
+    // (`cargo xtask ab`, ASCII and punctuation corpora, ADR 0033); inlined it
+    // costs none.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn put(&mut self, ch: char) {
         if self.modes.auto_wrap && !self.modes.insert {
             // The default modes are exactly what the grid's own write does:
             // attach, drop zero-width scalars, wrap first when needed.

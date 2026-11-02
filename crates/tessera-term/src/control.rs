@@ -1,7 +1,7 @@
 //! C0 and C1 control functions: the [`Action::Execute`] half of the
 //! dispatcher.
 //!
-//! Only the format effectors and the bell have an effect today. Every other
+//! Only the format effectors, the bell and the shifts SO and SI have an effect. Every other
 //! control byte is ignored; the ones with no meaning to a terminal emulator
 //! silently, the rest with a trace-level log so unimplemented controls are
 //! visible while debugging.
@@ -28,9 +28,9 @@ const VT: u8 = 0x0B;
 const FF: u8 = 0x0C;
 /// Carriage return.
 const CR: u8 = 0x0D;
-/// Shift out (invoke G1). G0 and G1 are both ASCII until character sets land.
+/// Shift out: invoke G1 as GL (LS1).
 const SO: u8 = 0x0E;
-/// Shift in (invoke G0).
+/// Shift in: invoke G0 as GL (LS0).
 const SI: u8 = 0x0F;
 /// Delete. The parser reports it as a printable, but it is a no-op either way.
 const DEL: u8 = 0x7F;
@@ -53,8 +53,10 @@ impl State {
     ///   20 h`) is on; then they also return the carriage.
     /// - CR moves to the left margin (column zero without margins, and for
     ///   a cursor left of the margin outside origin mode).
-    /// - NUL, SO, SI and DEL are ignored; any other byte is ignored and
-    ///   logged at trace level.
+    /// - SO and SI make G1 and G0 the set GL prints through (see the
+    ///   `charset` module); at every conformance level, as in xterm.
+    /// - NUL and DEL are ignored; any other byte is ignored and logged at
+    ///   trace level.
     pub(crate) fn execute(&mut self, byte: u8) {
         match byte {
             BEL => self.pending.push(Request::Bell),
@@ -74,7 +76,9 @@ impl State {
                 }
             }
             CR => self.grid.carriage_return(),
-            NUL | SO | SI | DEL => {}
+            SO => self.charsets.shift_left(1),
+            SI => self.charsets.shift_left(0),
+            NUL | DEL => {}
             _ => trace!("control byte {byte:#04x} ignored"),
         }
     }

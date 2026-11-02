@@ -99,14 +99,14 @@
 ### DA01_da1_plain
 size: 24x80
 step: feed \e[c
-reply: \e[?64;21;22c
+reply: \e[?64;9;21;22c
 cite: [CTL] "CSI Ps c Send Device Attributes (Primary DA). Ps = 0 or omitted -> request attributes"; [XT] CASE_DA1 `GetParam(0) <= 0`; D-DA1 (level 4 default, conformance_level() == 4, only implemented features)
 flags: decision
 
 ### DA02_da1_ps0
 size: 24x80
 step: feed \e[0c
-reply: \e[?64;21;22c
+reply: \e[?64;9;21;22c
 cite: [CTL] as DA01; explicit Ps = 0
 flags: decision
 
@@ -120,7 +120,7 @@ flags: xterm-quirk negative
 ### DA04_decid_esc_z
 size: 24x80
 step: feed \eZ
-reply: \e[?64;21;22c
+reply: \e[?64;9;21;22c
 cite: [XT] CASE_DECID answers the DA1 reply (VT100-compatible identification, DEC STD 070 DECID); D-DECID
 flags: decision
 
@@ -134,7 +134,7 @@ flags: decision xterm-quirk
 ### DA06_da1_level2
 size: 24x80
 step: feed \e[62"p\e[c
-reply: \x9b?62;22c
+reply: \x9b?62;9;22c
 cite: D-DA1: 60 + level; [XT] 60 + display_da1/100
 note: DECSCL without Pc selects 8-bit mode ([CTL] absent Pc = 0), so the reply is 8-bit (#96, c1_spec.txt)
 flags: decision
@@ -142,7 +142,7 @@ flags: decision
 ### DA07_da1_level3
 size: 24x80
 step: feed \e[63"p\e[c
-reply: \x9b?63;22c
+reply: \x9b?63;9;22c
 cite: D-DA1
 note: DECSCL without Pc selects 8-bit mode ([CTL] absent Pc = 0), so the reply is 8-bit (#96, c1_spec.txt)
 flags: decision
@@ -150,7 +150,7 @@ flags: decision
 ### DA08_da1_level4
 size: 24x80
 step: feed \e[64"p\e[c
-reply: \x9b?64;21;22c
+reply: \x9b?64;9;21;22c
 cite: D-DA1
 note: DECSCL without Pc selects 8-bit mode ([CTL] absent Pc = 0), so the reply is 8-bit (#96, c1_spec.txt)
 flags: decision
@@ -158,7 +158,7 @@ flags: decision
 ### DA09_da1_level5
 size: 24x80
 step: feed \e[65"p\e[c
-reply: \x9b?65;21;22c
+reply: \x9b?65;9;21;22c
 cite: D-L5 (xterm id 420 refuses `CSI 65 " p`, charproc.c L5101; xterm id 525 would answer `?65;...`); #92 stores level 5
 note: DECSCL without Pc selects 8-bit mode ([CTL] absent Pc = 0), so the reply is 8-bit (#96, c1_spec.txt)
 flags: decision
@@ -166,7 +166,7 @@ flags: decision
 ### DA10_da1_after_decstr_keeps_level
 size: 24x80
 step: feed \e[62"p\e[!p\e[c
-reply: \x9b?62;22c
+reply: \x9b?62;9;22c
 cite: ADR 0020: DECSTR keeps the conformance level (xterm: DECSTR does not call set_vtXX_level)
 note: DECSCL without Pc selects 8-bit mode ([CTL] absent Pc = 0), so the reply is 8-bit (#96, c1_spec.txt); DECSTR keeps 8-bit mode
 flags: control
@@ -174,14 +174,14 @@ flags: control
 ### DA11_da1_after_ris_keeps_level
 size: 24x80
 step: feed \e[62"p\ec\e[c
-reply: \e[?62;22c
+reply: \e[?62;9;22c
 cite: ADR 0020: RIS keeps the level, as xterm
 flags: control
 
 ### DA12_da1_reply_is_8bit_after_decscl_pc2
 size: 24x80
 step: feed \e[64;2"p\e[c
-reply: \x9b?64;21;22c
+reply: \x9b?64;9;21;22c
 cite: [XT] DECSCL Pc 2 turns control_eight_bits on and unparseputc1 sends the raw 0x9B (flipped by #96; c1_spec.txt has the S8C1T rows)
 flags: control
 
@@ -244,14 +244,14 @@ flags: negative
 ### DA21_neovim_kitty_probe_then_da1
 size: 24x80
 step: feed \e[?u\e[c
-reply: \e[?0u\e[?64;21;22c
+reply: \e[?0u\e[?64;9;21;22c
 cite: [KT] keyboard protocol detection: query `CSI ? u` immediately followed by `CSI c`; a terminal that supports the protocol answers `CSI ? flags u` BEFORE the DA1 reply (here flags 0 = nothing pushed); neovim tui.c L309..314 relies on that order; D-ORDER
 flags: decision control
 
 ### DA22_tmux_startup_burst
 size: 24x80
 step: feed \e[c\e[>c\e[>q
-reply: \e[?64;21;22c\e[>1;<PV>;0c\eP>|Tessera <VERSION>\e\\
+reply: \e[?64;9;21;22c\e[>1;<PV>;0c\eP>|Tessera <VERSION>\e\\
 cite: [VT] tmux tty.c tty_send_requests sends exactly these three; each reply must arrive whole and in order (tty-keys.c matches DA, DA2, XDA by prefix); D-ID, D-ORDER
 flags: control
 
@@ -270,7 +270,7 @@ screen:
 >
 >
 cursor: (0,4)
-reply: \e[?64;21;22c\e[>1;<PV>;0c\eP!|00000000\e\\
+reply: \e[?64;9;21;22c\e[>1;<PV>;0c\eP!|00000000\e\\
 cite: queries consume their bytes and leave the grid alone ([XT] DA handlers only reply)
 flags: control
 
@@ -812,14 +812,14 @@ flags: control
 ### RM36_dec_unsupported_modes_report_zero
 size: 24x80
 step: feed \e[?45$p\e[?69$p\e[?42$p\e[?80$p\e[?1007$p\e[?2027$p\e[?2031$p\e[?2048$p\e[?9999$p
-reply: \e[?45;2$y\e[?69;2$y\e[?42;0$y\e[?80;0$y\e[?1007;0$y\e[?2027;0$y\e[?2031;0$y\e[?2048;0$y\e[?9999;0$y
-cite: D-RQM0. ?45 reverse wrap and ?69 DECLRMM answer their real state (reset) since #97; ?42 DECNRCM (#112), ?80 DECSDM (no Sixel), 1007 alternate scroll, 2027 grapheme clusters, 2031 theme updates, 2048 in-band resize are not implemented; neovim tui.c L592..598 queries 69, 2026, 2027, 2031, 2048 and needs a reply (0 = unsupported) for each. Each flips to 1/2 in the issue that implements it. [XT] answers real values for 45/69/42/80/1007; Tessera answers what it implements
+reply: \e[?45;2$y\e[?69;2$y\e[?42;2$y\e[?80;0$y\e[?1007;0$y\e[?2027;0$y\e[?2031;0$y\e[?2048;0$y\e[?9999;0$y
+cite: D-RQM0. ?45 reverse wrap and ?69 DECLRMM answer their real state (reset) since #97; ?42 DECNRCM answers its real state since #112; ?80 DECSDM (no Sixel), 1007 alternate scroll, 2027 grapheme clusters, 2031 theme updates, 2048 in-band resize are not implemented; neovim tui.c L592..598 queries 69, 2026, 2027, 2031, 2048 and needs a reply (0 = unsupported) for each. Each flips to 1/2 in the issue that implements it. [XT] answers real values for 45/69/42/80/1007; Tessera answers what it implements
 flags: decision
 
 ### RM37_dec_neovim_burst_then_da1
 size: 24x80
 step: feed \e[?69$p\e[?2026$p\e[?2027$p\e[?2031$p\e[?2048$p\e[c
-reply: \e[?69;2$y\e[?2026;2$y\e[?2027;0$y\e[?2031;0$y\e[?2048;0$y\e[?64;21;22c
+reply: \e[?69;2$y\e[?2026;2$y\e[?2027;0$y\e[?2031;0$y\e[?2048;0$y\e[?64;9;21;22c
 cite: [VT] neovim tui.c L592..L694: DECRQM burst, DA1 last as the "terminal has processed everything" sentinel; D-ORDER, D-RQM0
 flags: control
 
@@ -843,6 +843,27 @@ step: feed \e[?13$p\e[?14$p\e[?1020$p\e[?1021$p\e[?1022$p\e[?1023$p
 reply: \e[?13;0$y\e[?14;0$y\e[?1020;0$y\e[?1021;0$y\e[?1022;0$y\e[?1023;0$y
 cite: [CTL] 13/14 and 1020..1023 are xterm read-only resource reports (cursorBlink, cursorBlinkXOR, utf8, cjkWidth, emojiWidth, privateWidth); Tessera has no such resources -> 0
 flags: decision
+
+### RM45_dec_42_decnrcm
+size: 24x80
+step: feed \e[?42$p\e[?42h\e[?42$p\e[?42l\e[?42$p
+reply: \e[?42;2$y\e[?42;1$y\e[?42;2$y
+cite: [XT] misc.c do_dec_rqm `case srm_DECNRCM: result = MdFlag(xw->flags, NATIONAL)` (vtXX_level >= 2); #112 Modes::nrcs
+flags: control
+
+### RM46_dec_42_unknown_at_level_1
+size: 24x80
+step: feed \e[61;1"p\e[?42$p\e[?42h\e[?42$p
+reply: \e[?42;0$y\e[?42;0$y
+cite: [XT] charproc.c srm_DECNRCM `if (screen->vtXX_level >= 2)`: below level 2 DECSET 42 does nothing and DECRQM does not know the mode
+flags: decision
+
+### RM47_dec_42_ris_resets_decstr_keeps
+size: 24x80
+step: feed \e[?42h\e[!p\e[?42$p\ec\e[?42$p
+reply: \e[?42;1$y\e[?42;2$y
+cite: [XT] ReallyReset soft keeps `flags & NATIONAL`, the full reset restores xw->initflags; ADR 0033
+flags: xterm-quirk decision
 
 ### RM41_dec_after_ris_defaults
 size: 24x80
@@ -1509,7 +1530,7 @@ flags: control
 ### RP01_queries_in_one_chunk_replied_in_order
 size: 24x80
 step: feed \e[5n\e[6n\e[c\e[>q\e[?25$p
-reply: \e[0n\e[1;1R\e[?64;21;22c\eP>|Tessera <VERSION>\e\\\e[?25;1$y
+reply: \e[0n\e[1;1R\e[?64;9;21;22c\eP>|Tessera <VERSION>\e\\\e[?25;1$y
 cite: D-ORDER
 flags: control
 
@@ -1535,7 +1556,7 @@ flags: xterm-quirk negative
 ### RP04_query_interrupted_by_esc_is_not_answered
 size: 24x80
 step: feed \e[6\e[c
-reply: \e[?64;21;22c
+reply: \e[?64;9;21;22c
 cite: ESC restarts the sequence; only the `CSI c` completes (tessera-vt)
 flags: negative control
 

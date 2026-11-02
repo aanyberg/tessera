@@ -24,6 +24,7 @@
 //! | 12 | cursor blink | blinking on or off: the blink of [`Terminal::cursor_style`](crate::Terminal::cursor_style) becomes the program's, as after DECSCUSR, while its shape stays whatever it was (the program's or the configured one), and [`Modes::cursor_blink`] records the bit DECSCUSR shares |
 //! | 25 | DECTCEM | [`Modes::cursor_visible`] |
 //! | 40 | allow 80 ⇄ 132 | [`Modes::allow_column_change`] |
+//! | 42 | DECNRCM | [`Modes::nrcs`], level 2 and up: national replacement character sets may be designated (ADR 0033) |
 //! | 45 | reverse wraparound | [`Modes::reverse_wrap`]: with DECAWM, BS and CUB wrap back into a soft-wrapped line above |
 //! | 47 | alternate screen | enter; reset leaves with the cursor where it is |
 //! | 66 | DECNKM | [`KeyboardModes::application_keypad`], the DECKPAM flag |
@@ -165,6 +166,13 @@ pub struct Modes {
     /// [`Modes::reverse_wrap`], into any line, and from the top margin to
     /// the bottom one. Wins over [`Modes::reverse_wrap`] when both are on.
     pub reverse_wrap_extended: bool,
+    /// DECNRCM (DECSET 42): national mode. The national replacement
+    /// character sets (Dutch, French, German, ...) can only be designated
+    /// while it is on (SCS selects ASCII otherwise), and the UK set maps `#`
+    /// to `£` only then (or at level 1). Level 2 and up only, as in xterm.
+    /// DECRST 42 keeps the sets that were designated; DECSTR keeps the mode
+    /// (xterm), RIS turns it off (ADR 0033).
+    pub nrcs: bool,
 }
 
 impl Default for Modes {
@@ -188,6 +196,7 @@ impl Default for Modes {
             left_right_margins: false,
             reverse_wrap: false,
             reverse_wrap_extended: false,
+            nrcs: false,
         }
     }
 }
@@ -322,6 +331,8 @@ impl State {
             12 => self.set_cursor_blink(on),
             25 => self.modes.cursor_visible = on,
             40 => self.modes.allow_column_change = on,
+            // DECNRCM (xterm: `vtXX_level >= 2`).
+            42 if self.conformance_level >= 2 => self.modes.nrcs = on,
             47 => {
                 if on {
                     self.grid.enter_alt_screen();
@@ -351,23 +362,26 @@ impl State {
             }
             1048 => {
                 if on {
-                    self.grid.save_cursor();
+                    self.save_cursor();
                 } else {
-                    self.grid.restore_cursor();
+                    self.restore_cursor();
                 }
             }
             1049 => {
                 if on {
                     // Into the active screen's slot: the alternate one when
                     // already there, as in xterm.
-                    self.grid.save_cursor();
+                    self.save_cursor();
                     self.grid.enter_alt_screen();
                     self.grid.erase_in_display(EraseDisplay::All);
                 } else if self.grid.is_alt_screen() {
                     // Restores the cursor, pen, pending wrap and origin
                     // mode saved on entry (moved with the text by a resize
-                    // in between), which is what the DECSC above saved.
+                    // in between), which is what the DECSC above saved,
+                    // and the character sets saved with them in the
+                    // primary screen's slot.
                     self.grid.leave_alt_screen();
+                    self.restore_charsets(0);
                 }
             }
             2004 => self.modes.bracketed_paste = on,

@@ -4,7 +4,7 @@
 //!
 //! | Query | Name | Reply |
 //! |---|---|---|
-//! | `CSI c`, `CSI 0 c`, `ESC Z` | DA1, DECID | `CSI ? 1 ; 2 c` at level 1, `CSI ? 6L ; 22 c` at level L = 2 and 3, `CSI ? 6L ; 21 ; 22 c` at L = 4 and 5 |
+//! | `CSI c`, `CSI 0 c`, `ESC Z` | DA1, DECID | `CSI ? 1 ; 2 c` at level 1, `CSI ? 6L ; 9 ; 22 c` at level L = 2 and 3, `CSI ? 6L ; 9 ; 21 ; 22 c` at L = 4 and 5 |
 //! | `CSI > c`, `CSI > 0 c` | DA2 | `CSI > 1 ; Pv ; 0 c`, Pv = [`DA2_PV`] |
 //! | `CSI = c`, `CSI = 0 c` | DA3 | `DCS ! \| 00000000 ST` at level 4 and up |
 //! | `CSI > q`, `CSI > 0 q` | XTVERSION | `DCS > \| Tessera <version> ST` |
@@ -33,7 +33,8 @@
 //! before the version and no parenthesis, so tmux matches none of its
 //! known terminal prefixes), DA2 answers the VT220 class `1` with a
 //! version above vim's "not an xterm" mark and Pc 0, and DA1 advertises
-//! only what Tessera implements: 22 (ANSI colour) and, from level 4, 21
+//! only what Tessera implements: from level 2 9 (national replacement
+//! character sets, ADR 0033), 22 (ANSI colour) and, from level 4, 21
 //! (horizontal scrolling: left and right margins). DA1 follows DECSCL's
 //! level, as on DEC's VT510 (xterm keeps its `decTerminalID`); level 5
 //! answers as a VT525. DA2 does not follow the level.
@@ -217,15 +218,16 @@ impl State {
         self.pending.push(Request::Reply(bytes));
     }
 
-    /// DA1 (`CSI c`, `CSI 0 c`) and DECID (`ESC Z`). From level 4 the
-    /// feature list has 21 (horizontal scrolling: DECLRMM and DECSLRM,
+    /// DA1 (`CSI c`, `CSI 0 c`) and DECID (`ESC Z`). From level 2 the
+    /// feature list has 9 (national replacement character sets: SCS and
+    /// DECNRCM, ADR 0033) and from level 4 21 (horizontal scrolling: DECLRMM and DECSLRM,
     /// which work only there), in xterm's ascending order; tmux uses left
     /// and right margins only when it sees 21 (ADR 0028).
     pub(crate) fn primary_device_attributes(&mut self) {
         match self.conformance_level {
             1 => self.reply_csi(format_args!("?1;2c")),
-            level @ 2..=3 => self.reply_csi(format_args!("?6{level};22c")),
-            level => self.reply_csi(format_args!("?6{level};21;22c")),
+            level @ 2..=3 => self.reply_csi(format_args!("?6{level};9;22c")),
+            level => self.reply_csi(format_args!("?6{level};9;21;22c")),
         }
     }
 
@@ -334,6 +336,8 @@ impl State {
             12 => of(modes.cursor_blink),
             25 => of(modes.cursor_visible),
             40 => of(modes.allow_column_change),
+            // DECNRCM exists from level 2 (xterm answers 0 below it).
+            42 if self.conformance_level >= 2 => of(modes.nrcs),
             45 => of(modes.reverse_wrap),
             // DECLRMM exists from level 4 (xterm answers 0 below it).
             69 if self.conformance_level >= 4 => of(modes.left_right_margins),

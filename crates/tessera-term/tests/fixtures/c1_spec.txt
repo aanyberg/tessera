@@ -77,28 +77,28 @@
 size: 24x80
 step: feed \e G
 step: feed \e[c
-reply: \x9b?64;21;22c
+reply: \x9b?64;9;21;22c
 c1_8bit: true
 cite: [CTL] S8C1T "send C1 control characters as 8-bit sequences, e.g., its responses to queries"; [XT] unparseputc1; level 4
 
 ### F02_s7c1t_undoes_it
 size: 24x80
 step: feed \e G\e F\e[c
-reply: \e[?64;21;22c
+reply: \e[?64;9;21;22c
 c1_8bit: false
 cite: [CTL] S7C1T; [DEC] S7C1T.html
 
 ### F03_s7c1t_in_7bit_mode_is_a_no_op
 size: 24x80
 step: feed \e F\e[c
-reply: \e[?64;21;22c
+reply: \e[?64;9;21;22c
 c1_8bit: false
 cite: [DEC] S7C1T from 7-bit "ignores sequence"
 
 ### F04_s8c1t_twice
 size: 24x80
 step: feed \e G\e G\e[c
-reply: \x9b?64;21;22c
+reply: \x9b?64;9;21;22c
 cite: [DEC] S8C1T in 8-bit mode "ignores sequence"
 
 ### F05_level1_ignores_s8c1t
@@ -123,43 +123,43 @@ flags: decision
 ### F07_level2_s8c1t
 size: 24x80
 step: feed \e[62;1"p\e G\e[c
-reply: \x9b?62;22c
-cite: [XT] level 2 >= 2; level 2 DA1 `?62;22c`
+reply: \x9b?62;9;22c
+cite: [XT] level 2 >= 2; level 2 DA1 `?62;9;22c`
 
 ### F08_ris_clears_8bit_mode_keeps_level
 size: 24x80
 step: feed \e[62;1"p\e G\ec\e[c
-reply: \e[?62;22c
+reply: \e[?62;9;22c
 c1_8bit: false
 cite: [XT] RIS calls show_8bit_control(False) and leaves vtXX_level; level 2 DA1 shows the level was kept
 
 ### F09_decstr_keeps_8bit_mode
 size: 24x80
 step: feed \e G\e[!p\e[c
-reply: \x9b?64;21;22c
+reply: \x9b?64;9;21;22c
 c1_8bit: true
 cite: [XT] the soft reset does not call show_8bit_control
 
 ### F10_s8c1t_after_a_7bit_decscl
 size: 24x80
 step: feed \e[64;1"p\e G\e[c
-reply: \x9b?64;21;22c
+reply: \x9b?64;9;21;22c
 
 ### F11_s7c1t_after_an_8bit_decscl
 size: 24x80
 step: feed \e[64;0"p\e F\e[c
-reply: \e[?64;21;22c
+reply: \e[?64;9;21;22c
 
 ### F12_decscl_without_pc_is_8bit
 size: 24x80
 step: feed \e[64"p\e[c
-reply: \x9b?64;21;22c
+reply: \x9b?64;9;21;22c
 cite: [CTL] DECSCL "Ps = 0 -> 8-bit controls" and an absent Pc is 0 (decscl_spec.txt LEVEL64_no_pc_is_8bit)
 
 ### F13_other_esc_sp_finals_change_nothing
 size: 3x10
 step: feed \e @\e H\e[c
-reply: \e[?64;21;22c
+reply: \e[?64;9;21;22c
 c1_8bit: false
 screen:
 > |
@@ -174,13 +174,13 @@ step: feed \e
 step: feed \x20
 step: feed G
 step: feed \e[c
-reply: \x9b?64;21;22c
+reply: \x9b?64;9;21;22c
 cite: chunk invariance (every split is also run by the harness)
 
 ### F15_s8c1t_aborts_a_csi_in_progress
 size: 3x10
 step: feed \e[1\e Gc\e[c
-reply: \x9b?64;21;22c
+reply: \x9b?64;9;21;22c
 screen:
 >c |
 >
@@ -191,7 +191,7 @@ cite: [VTE] ESC in CsiParam restarts the escape (anywhere); the aborted CSI send
 ### F16_switch_applies_within_the_same_chunk
 size: 24x80
 step: feed \e G\e[c
-reply: \x9b?64;21;22c
+reply: \x9b?64;9;21;22c
 cite: the mode is read when the query completes, not at the next advance call
 
 ### F17_decrqss_decscl_in_8bit_mode
@@ -213,13 +213,13 @@ cite: [XT] `;1` when 7-bit
 ### R01_da1
 size: 24x80
 step: feed \e G\e[c
-reply: \x9b?64;21;22c
+reply: \x9b?64;9;21;22c
 cite: [XT] unparseseq ANSI_CSI
 
 ### R02_decid
 size: 24x80
 step: feed \e G\eZ
-reply: \x9b?64;21;22c
+reply: \x9b?64;9;21;22c
 cite: [XT] CASE_DECID answers like DA1
 
 ### R03_da2
@@ -303,7 +303,7 @@ reply: \x9b?0u
 ### R17_query_in_8bit_form
 size: 24x80
 step: feed \e G\x9bc
-reply: \x9b?64;21;22c
+reply: \x9b?64;9;21;22c
 cite: the reply's form follows the mode, not the query's form (R01 is the same query in 7-bit form)
 
 ### R19_level1_decscl_forces_7bit
@@ -328,7 +328,7 @@ reply: none
 ### R22_mode_is_read_when_each_query_completes
 size: 24x80
 step: feed \e G\e[c\e F\e[c
-reply: \x9b?64;21;22c\e[?64;21;22c
+reply: \x9b?64;9;21;22c\e[?64;9;21;22c
 cite: ADR 0024: a reply is queued the moment its query completes
 
 # -----------------------------------------------------------------------------
@@ -496,7 +496,7 @@ cite: rule P: `ESC ESC D`; [VTE] ESC in the Escape state keeps the state, so IND
 ### C15_decid_esctest_decid_8bit
 size: 24x80
 step: feed \e G\x9a
-reply: \x9b?64;21;22c
+reply: \x9b?64;9;21;22c
 source: esctest2 esctest/tests/decid.py test_DECID_8bit (S8C1T, DECID as 0x9A, ReadCSI("c", prefix "?"))
 cite: [XT] 9a = CASE_DECID (ECMA-48 has SCI there; xterm wins, A7)
 
