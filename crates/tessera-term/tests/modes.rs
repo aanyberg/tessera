@@ -453,6 +453,52 @@ fn every_case_is_tested_once() {
     assert_eq!(unique, fixture, "test lists and fixture cases differ");
 }
 
+// ------------------------------------------------- the table harness
+
+/// Three rows `a`, `b`, `c` that record which of them ran.
+fn table_rows() -> impl Iterator<Item = (&'static str, &'static str)> {
+    ["a", "b", "c"].into_iter().map(|id| (id, id))
+}
+
+/// An empty table never passes, even with an empty fixture (#173).
+#[test]
+#[should_panic(expected = "a table needs at least one row")]
+fn an_empty_table_fails() {
+    common::check_table("empty", 0, std::iter::empty::<(&str, ())>(), |()| {});
+}
+
+/// Unfiltered, a table whose row count differs from the fixture's fails.
+#[test]
+#[should_panic(expected = "rows run vs rows in the fixture")]
+fn a_lost_row_fails() {
+    common::check_table_filtered("abc", 4, table_rows(), |_| {}, None);
+}
+
+/// `TESSERA_TABLE_ROW` runs exactly the listed rows and skips the count.
+#[test]
+fn the_row_filter_runs_only_matching_rows() {
+    let mut ran = Vec::new();
+    common::check_table_filtered("abc", 3, table_rows(), |id| ran.push(id), Some("c,a"));
+    assert_eq!(ran, ["a", "c"]);
+    ran.clear();
+    common::check_table_filtered("abc", 3, table_rows(), |id| ran.push(id), Some("b"));
+    assert_eq!(ran, ["b"]);
+}
+
+/// A filter that matches no row fails and names itself.
+#[test]
+#[should_panic(expected = "TESSERA_TABLE_ROW=NO_SUCH_ROW matched no row")]
+fn a_row_filter_that_matches_nothing_fails() {
+    common::check_table_filtered("abc", 3, table_rows(), |_| {}, Some("NO_SUCH_ROW"));
+}
+
+/// A filtered row that fails still fails the table.
+#[test]
+#[should_panic(expected = "1 of 1 rows failed")]
+fn a_failing_filtered_row_fails() {
+    common::check_table_filtered("abc", 3, table_rows(), |id| assert_ne!(id, "b"), Some("b"));
+}
+
 // ------------------------------------------------- kitty keyboard stack
 
 /// The kitty flags after feeding `bytes` to a fresh 3x10 terminal.
@@ -637,8 +683,9 @@ fn defaults_are_xterm_s() {
 
 // ---------------------------------------------------------------- floods
 
-/// A flood of mode sequences costs O(1) each and queues nothing; the
-/// screen switches and DECCOLM toggles do not accumulate state.
+/// A flood of mode sequences queues nothing, and the screen switches,
+/// kitty pushes and pops and DECCOLM toggles leave no state behind. Its
+/// cost is not measured here.
 #[test]
 fn a_flood_of_mode_sequences_requests_nothing() {
     let mut term = Terminal::new(24, 80);

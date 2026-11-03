@@ -10,20 +10,19 @@
 //! lengths (1 to 16 bytes) come from a xorshift generator seeded by `seed`.
 //!
 //! Compared: every visible and scrollback line (cells, styles, clusters,
-//! wrap flags), the cursor, pending wrap, pen, scroll region, the modes,
-//! the keyboard modes, the conformance level and the requests, replies to
-//! the child's queries ([`Request::Reply`], #10) included. Hidden state
-//! is compared by probing: after the first comparison both terminals get
-//! the same probes, each followed by another comparison: REP (`CSI 3 b`,
-//! the last printed character), DECRC (`ESC 8`, the saved cursor), three
-//! tabs (the tab stops), a DECSET 1049 reset (back to the stashed primary
-//! screen and its cursor), DECRC and tabs there (the primary's saved cursor
-//! and stops), DECSET 1049 with DECRC (the alternate screen's saved
-//! cursor slot, kept between visits), three title pops (the title stack:
-//! each pop that finds a title requests it) and a burst of queries whose
-//! replies read the cursor, the modes, the pen and the kitty flags. The
-//! title probe starts with `ESC \`, so a string the input left open ends
-//! before it.
+//! wrap flags), the cursor, pending wrap, pen, scroll region, tab stops,
+//! the modes, the keyboard modes, the conformance level and the requests,
+//! replies to the child's queries ([`Request::Reply`], #10) included.
+//! Hidden state is compared by probing: after the first comparison both
+//! terminals get the same probes, each followed by another comparison: REP
+//! (`CSI 3 b`, the last printed character), DECRC (`ESC 8`, the saved
+//! cursor), a DECSET 1049 reset (back to the stashed primary screen, its
+//! cursor and tab stops), DECRC there (the primary's saved cursor),
+//! DECSET 1049 with DECRC (the alternate screen's saved cursor slot, kept
+//! between visits), three title pops (the title stack: each pop that finds
+//! a title requests it) and a burst of queries whose replies read the
+//! cursor, the modes, the pen and the kitty flags. The title probe starts
+//! with `ESC \`, so a string the input left open ends before it.
 //!
 //! [`Request::Reply`]: tessera_term::Request::Reply
 
@@ -83,6 +82,7 @@ fn assert_same(whole: &mut Terminal, chunked: &mut Terminal, stage: &str) {
         b.pending_wrap(),
         render(b),
     );
+    assert_eq!(a.tabs(), b.tabs(), "{stage}: tab stops differ");
     assert_eq!(whole.modes(), chunked.modes(), "{stage}: modes differ");
     assert_eq!(
         whole.keyboard_modes(),
@@ -108,13 +108,12 @@ fn assert_same(whole: &mut Terminal, chunked: &mut Terminal, stage: &str) {
 
 /// Sequences that expose hidden state, fed to both terminals in order after
 /// the input, each followed by a comparison (module docs).
-const PROBES: [(&[u8], &str); 8] = [
+const PROBES: [(&[u8], &str); 7] = [
     // REP first: any other sequence forgets the character it repeats.
     (b"\x1b[3b", "after REP"),
     (b"\x1b8", "after DECRC"),
-    (b"\t\t\t", "after tabs on the active screen"),
     (b"\x1b[?1049l", "after leaving the alternate screen"),
-    (b"\x1b8\t\t\t", "after DECRC and tabs on the primary screen"),
+    (b"\x1b8", "after DECRC on the primary screen"),
     (b"\x1b[?1049h\x1b8", "after DECRC on the alternate screen"),
     (b"\x1b\\\x1b[23t\x1b[23t\x1b[23t", "after popping titles"),
     (

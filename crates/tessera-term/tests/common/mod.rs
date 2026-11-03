@@ -188,23 +188,58 @@ impl Script {
 /// reports every failing row: each row's own panic message is printed as it
 /// happens, and the final panic lists the ids of all failing rows.
 ///
+/// To debug one row, set `TESSERA_TABLE_ROW` to its id (the row id's
+/// `Display`, matched exactly) or to a comma-separated list of ids and run
+/// the one test that holds the table, for example
+/// `TESSERA_TABLE_ROW=stored_modes/MODE03_ris_resets_every_mode cargo nextest
+/// run -p tessera-term --test modes every_case_holds`. Only the matching rows
+/// run, and the row count check becomes "at least one row matched": a filter
+/// that matches no row of the table fails the test, so a typo cannot pass.
+/// The variable applies to every table in the run, so name one test.
+///
 /// # Panics
 ///
-/// When any row failed, or when the table did not have exactly
-/// `expected_rows` rows (so a row lost from a table cannot pass silently).
-#[allow(dead_code)] // print.rs and wide.rs include this module without the allow.
+/// When `expected_rows` is zero (an empty table with an empty fixture would
+/// pass vacuously), when any row failed, or, unfiltered, when the table did
+/// not have exactly `expected_rows` rows (so a row lost from a table cannot
+/// pass silently).
 pub fn check_table<I: Display, R>(
     table: &str,
     expected_rows: usize,
     rows: impl IntoIterator<Item = (I, R)>,
-    mut check: impl FnMut(R),
+    check: impl FnMut(R),
 ) {
+    let filter = std::env::var("TESSERA_TABLE_ROW").ok();
+    check_table_filtered(table, expected_rows, rows, check, filter.as_deref());
+}
+
+/// [`check_table`] with the `TESSERA_TABLE_ROW` value passed in (`None`
+/// when unset), so the filter is testable without touching the environment.
+pub fn check_table_filtered<I: Display, R>(
+    table: &str,
+    expected_rows: usize,
+    rows: impl IntoIterator<Item = (I, R)>,
+    mut check: impl FnMut(R),
+    filter: Option<&str>,
+) {
+    assert!(
+        expected_rows > 0,
+        "{table}: a table needs at least one row (expected_rows is 0)"
+    );
+    let wanted: Option<Vec<&str>> = filter.map(|filter| filter.split(',').collect());
     let mut ran = 0;
     let mut failed = Vec::new();
     for (id, row) in rows {
+        let id = id.to_string();
+        if wanted
+            .as_ref()
+            .is_some_and(|wanted| !wanted.contains(&id.as_str()))
+        {
+            continue;
+        }
         ran += 1;
         if catch_unwind(AssertUnwindSafe(|| check(row))).is_err() {
-            failed.push(id.to_string());
+            failed.push(id);
         }
     }
     assert!(
@@ -213,10 +248,16 @@ pub fn check_table<I: Display, R>(
         failed.len(),
         failed.join(", ")
     );
-    assert_eq!(
-        ran, expected_rows,
-        "{table}: rows run vs rows in the fixture"
-    );
+    match filter {
+        None => assert_eq!(
+            ran, expected_rows,
+            "{table}: rows run vs rows in the fixture"
+        ),
+        Some(filter) => assert!(
+            ran > 0,
+            "{table}: TESSERA_TABLE_ROW={filter} matched no row"
+        ),
+    }
 }
 
 /// Parses `<rows>x<cols>`.

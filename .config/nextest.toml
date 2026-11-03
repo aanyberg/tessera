@@ -64,6 +64,11 @@ test-group = 'timing'
 filter = 'package(tessera-app-core) & kind(lib) & (test(reader_lock_hold_is_bounded) | test(view_metrics_are_fast_while_output_floods_the_terminal))'
 test-group = 'timing'
 
+# Release-only scrolling bars (#175), also run by the gate's release timing step.
+[[profile.default.overrides]]
+filter = 'package(tessera-app-core) & kind(lib) & (test(scrolling_through_a_long_history_is_smooth) | test(a_flood_under_a_scrolled_view_keeps_captures_short))'
+test-group = 'timing'
+
 # Device loss through a full Metal command queue (#84): ~1.1 GB each.
 [[profile.default.overrides]]
 filter = '(package(tessera-app-core) & kind(lib) & test(a_loss_inside_the_frame_detaches_at_once)) | (package(tessera-render) & binary(device_loss) & test(a_device_error_loses_the_device_during_the_call_that_hit_it))'

@@ -186,28 +186,38 @@ Agents use these instead of rebuilding the setup in every run:
   (measured: a second worktree hit 18 of 26 dependency compilations; crates with build scripts miss).
 - **Gate pass stamps.** `scripts/quality-gate.sh` records a pass on a clean tree per commit, toolchain and gate
   script, so the implementer, critic and verifiers pay for the gate once per commit. `--force` re-runs it.
-- **Hang protection (#137, #121).** A hung test fails fast instead of stalling a run for hours. `.config/nextest.toml`
-  reports a test SLOW after 60 s and terminates it after 5 periods (300 s; 600 s for the file-watcher, shaping, term `wide`,
-  GPU and hdiutil tests); the slowest test in the workspace takes 12 s, so there is room for a machine under load 30+.
-  `scripts/quality-gate.sh` then fails with the terminated test names (`TIMEOUT` lines) instead of a bare exit code.
-  `TESSERA_GATE_NEXTEST_MINUTES` (default 30) is a gate-level watchdog: nextest and its descendants are killed
-  after that long and the gate fails naming the limit (nextest runs with `--color never`, so the `TIMEOUT` report also
-  works under `CARGO_TERM_COLOR=always`). After the ffi release build the gate runs the release-only timing bars
-  `reader_lock_hold_is_bounded` and `view_metrics_are_fast_while_output_floods_the_terminal` (#114; `timing` group); a
-  failure with the 1-minute load at or above `hw.ncpu` is retried once ("failed under load, retried"), any other
-  failure fails the gate. When the macOS job's test step fails, times out or is cancelled, it uploads
-  `apps/macos/build/app-test*.log` as the `app-test-logs` artifact (#121). In CI the Rust job has `timeout-minutes: 20` and the macOS app job 15 (a normal run is 4-6 minutes),
-  with a 10-minute limit on `just app-test`, whose xcodebuild calls also fail a single hung test after 120 s (300 s at
-  most). A hang below the test level (the TSan and fork deadlock of #121) is caught by the step and job limits
-  only. A new test that legitimately needs more than 300 s gets its own `slow-timeout` override there.
+- **Hang protection (#137, #121, #166).** A hung test fails fast instead of stalling a run for hours.
+  `.config/nextest.toml` reports a test SLOW after 60 s and terminates it after 5 periods (300 s; 600 s for the
+  file-watcher, shaping, term `wide`, GPU and hdiutil tests); the slowest test in the workspace takes 12 s, so there
+  is room for a machine under load 30+. `scripts/quality-gate.sh` then fails with the terminated test names
+  (`TIMEOUT` lines) instead of a bare exit code. `TESSERA_GATE_NEXTEST_MINUTES` (default 30) is a gate-level
+  watchdog: nextest and its descendants are killed after that long and the gate fails naming the limit (nextest runs
+  with `--color never`, so the `TIMEOUT` report also works under `CARGO_TERM_COLOR=always`). The gate builds the test
+  binaries first (`cargo nextest run --no-run`, same arguments), so the watchdog's window covers the run and not the
+  compilation, and a watchdog whose gate was killed (SIGKILL included) exits without acting. After the ffi release
+  build the gate runs the ffi C tests (`scripts/ffi-c-test.sh`; `surface.c` skips itself under
+  `TESSERA_SKIP_GPU_TESTS`) and the release-only timing bars `reader_lock_hold_is_bounded`,
+  `view_metrics_are_fast_while_output_floods_the_terminal`, `scrolling_through_a_long_history_is_smooth` and
+  `a_flood_under_a_scrolled_view_keeps_captures_short` (#114, #175; `timing` group). A failure with the 1-minute
+  load at or above `hw.ncpu` is retried once ("failed under load, retried"), any other failure fails the gate.
+  `just quality-gate-test` checks the watchdog and that retry with a fake `cargo`, through test hooks the gate honours
+  only under `TESSERA_GATE_SELFTEST=1` (listed in the script's header). When the macOS job's test step fails, times
+  out or is cancelled, it uploads `apps/macos/build/app-test*.log` as the `app-test-logs` artifact (#121). In CI the
+  Rust job, which also runs the ffi C tests, has `timeout-minutes: 20` and the macOS app job 15 (a normal run is 4-6
+  minutes), with a 10-minute limit on `just app-test`, whose xcodebuild calls also fail a single hung test after
+  120 s (300 s at most). A hang below the test level (the TSan and fork deadlock of #121) is caught by the step and
+  job limits only. A new test that legitimately needs more than 300 s gets its own `slow-timeout` override there.
 - **A/B probes.** `cargo xtask ab init --base <rev> --crate <name> --out <scratch dir>` builds a probe crate that
   depends on each crate at the base revision (`base_<name>`) and in the worktree (`head_<name>`). Write cases in
   the probe's `src/cases.rs`, then `cargo xtask ab bench <dir> --case <c> [--max-ratio <bar>]` (alternating
   base/head processes; best-of-N wall time, instructions retired and cycles net of the measured process overhead,
   gating on instructions because a loaded machine distorts wall time; a case too small to measure or whose sides
-  compute different checksums fails the bar) and `cargo xtask ab diff <dir> --case <c> --seeds <n>` (differential fuzzing).
-  Implementers measure performance bars with it, critics re-measure and diff-fuzz fast paths, the adversarial
-  tester uses it for its own probes.
+  compute different checksums fails the bar) and `cargo xtask ab diff <dir> --case <c> --seeds <n>`
+  (differential fuzzing). Implementers measure performance bars with it, critics re-measure and diff-fuzz fast
+  paths, the adversarial tester uses it for its own probes. The instrument's noise floor is about 1%: a probe
+  build alone moves the base by that much (#175: `feed_combining_heavy` read 1.010 once and 1.000 in three other
+  probes). A bar tighter than 1.02 therefore counts as met only when three independent probe builds (a fresh
+  `ab init` each) all measure under it.
 - **Branch verification.** `scripts/verify-branch.sh <wt> [--base <ref>] [--allow <path>]... [--session <url>]
   [--coauthor <line>] [--load <crate>:<target>]... [--no-load] [--parallel <1-8>] [--list-targets]` runs the gate
   and checks the clean tree, ancestry, Conventional Commit subjects and trailers, scope against the brief's paths
@@ -218,25 +228,26 @@ Agents use these instead of rebuilding the setup in every run:
   derived from the branch (`crate:kind`, one per line) and exits without building; `just verify-branch-test`
   checks that derivation and the cap under bash and zsh. The script is zsh: always brace a name before a colon
   (`${name}:lib`), because zsh reads `$name:lib` as the `:l` modifier and `$name:tests` as `:t`.
-- **Fuzzing.** `fuzz/` holds four cargo-fuzz (libFuzzer) targets outside the workspace: `parser` (raw bytes
-  into `tessera_vt::Parser`; no panic, CSI sub-parameter masks and DCS framing consistent), `terminal` (raw bytes
-  into `Terminal::advance` at a size taken from the first two bytes; `Grid::check_invariants` after every chunk,
-  at most 64 full checks per input), `chunking` (whole versus chunked input through `Terminal` give the same
-  screen, cursor, modes and hidden state) and `resize` (`0xFE rows cols` in the input calls `Terminal::resize`,
-  invariants checked around it). They need a nightly toolchain and cargo-fuzz, installed once with
-  `rustup toolchain install nightly --profile minimal` and `cargo install cargo-fuzz --locked` (stable stays the
-  default). `just fuzz <target> <minutes>` runs one target (default `terminal`, 5 minutes) on its corpus in
+- **Fuzzing.** `fuzz/` holds four cargo-fuzz (libFuzzer) targets outside the workspace: `parser` (raw bytes into
+  `tessera_vt::Parser`; no panic, CSI sub-parameter masks and DCS framing consistent), `terminal` (raw bytes into
+  `Terminal::advance` at a size taken from the first two bytes; cheap invariants after every chunk,
+  `Grid::check_invariants` after at most 65 chunks per input: every `ceil(chunks / 64)`-th plus the last), `chunking`
+  (whole versus chunked input through `Terminal` give the same screen, cursor, tab stops, modes and hidden state) and
+  `resize` (`0xFE rows cols` in the input calls `Terminal::resize`; the full check runs after every resize and on the
+  feed right before it, on top of the same 65-check budget). They need a nightly toolchain and cargo-fuzz, installed
+  once with `rustup toolchain install nightly --profile minimal` and `cargo install cargo-fuzz --locked` (stable
+  stays the default). `just fuzz <target> <minutes>` runs one target (default `terminal`, 5 minutes) on its corpus in
   `fuzz/corpus/<target>` plus the checked-in seeds in `fuzz/seeds/<target>`; a crash lands in
-  `fuzz/artifacts/<target>`, and `cargo +nightly fuzz tmin <target> <file>` minimises it. `fuzz/Cargo.lock` is
-  not committed: the gate, `just fuzz` and the workflow copy the workspace's `Cargo.lock` in before building, so
-  the fuzzers test the workspace's dependency versions. The gate format-checks and clippies `fuzz/` on stable and
-  builds the targets when nightly and cargo-fuzz are installed. `.github/workflows/fuzz.yml` runs each target for
-  5 minutes every night (03:00 UTC, or on demand with a length) on a pinned nightly (bumping it is described in
-  the workflow), with the corpus kept in the Actions cache, after replaying `fuzz/regressions/<target>/`. A crash
-  is filed as an issue with the minimised input attached and the input is added under
-  `fuzz/regressions/<target>/`; fix it in a branch that owns the crate. `cargo deny` does not cover `fuzz/`, and
-  `libfuzzer-sys` is `(MIT OR Apache-2.0) AND NCSA`, a license outside `deny.toml`'s allow list: accepted by the
-  lead (2026-10-29) because the fuzzers are a development tool that is never distributed.
+  `fuzz/artifacts/<target>`, and `cargo +nightly fuzz tmin <target> <file>` minimises it. `fuzz/Cargo.lock` is not
+  committed: the gate, `just fuzz` and the workflow copy the workspace's `Cargo.lock` in before building, so the
+  fuzzers test the workspace's dependency versions. The gate format-checks and clippies `fuzz/` on stable and builds
+  the targets when nightly and cargo-fuzz are installed. `.github/workflows/fuzz.yml` runs each target for 5 minutes
+  every night (03:00 UTC, or on demand with a length) on a pinned nightly (bumping it is described in the workflow),
+  with the corpus kept in the Actions cache, after replaying `fuzz/regressions/<target>/`. A crash is filed as an
+  issue with the minimised input attached and the input is added under `fuzz/regressions/<target>/`; fix it in a
+  branch that owns the crate. `cargo deny` does not cover `fuzz/`, and `libfuzzer-sys` is
+  `(MIT OR Apache-2.0) AND NCSA`, a license outside `deny.toml`'s allow list: accepted by the lead (2026-10-29)
+  because the fuzzers are a development tool that is never distributed.
 - **Wave stats.** `scripts/factory-stats.sh --since <t> --until <t> <session dir>` prints the per-role and
   per-agent cost tables (output tokens, cache reads, tool calls, span and active minutes) for the retro.
 - **Scratch directories.** Every subagent works in its own `<scratchpad>/<agent type>-<issue>`; the scratchpad

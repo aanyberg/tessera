@@ -143,6 +143,11 @@ verify-branch-test:
     bash scripts/test-verify-branch.sh
     zsh scripts/test-verify-branch.sh
 
+# #166
+# Check scripts/quality-gate.sh's nextest watchdog (build outside it, orphan exit) and release timing retry, with a fake cargo
+quality-gate-test:
+    zsh scripts/test-quality-gate.sh
+
 # #14
 # Fuzz one cargo-fuzz target (parser, terminal, chunking or resize) for <minutes> on nightly; corpus in fuzz/corpus, crashes in fuzz/artifacts
 fuzz target="terminal" minutes="5":
