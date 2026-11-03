@@ -245,7 +245,7 @@ impl Layout {
             cell: [metrics.width_px.max(1), metrics.height_px.max(1)],
             baseline: px_from(metrics.baseline_px),
             target,
-            stroke: px_from(scale).max(1),
+            stroke: stroke_px(scale),
             decoration: DecorationGeometry::new(metrics).with_phase_x(f32_from(pad)),
         }
     }
@@ -278,6 +278,12 @@ impl Layout {
             f32_from(self.cell[1]),
         ]
     }
+}
+
+/// The width of beam and outline strokes, and the height of the underline
+/// cursor, at backing `scale`: one pixel per point, at least one.
+pub(crate) fn stroke_px(scale: f32) -> u32 {
+    px_from(scale).max(1)
 }
 
 /// Number of `cell`-sized steps from `origin` that start before `extent`.

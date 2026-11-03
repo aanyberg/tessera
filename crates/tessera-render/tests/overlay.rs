@@ -430,9 +430,9 @@ fn the_selection_blends_over_the_background_and_keeps_the_text() {
         with.zip(without).is_some_and(|(w, o)| w.abs_diff(o) <= 2),
         "text is not inverted: {with:?} vs {without:?}"
     );
-    // Inner rows are whole: a row shorter than the frame is highlighted
-    // past its last cell.
-    let short: [&[Cell]; 3] = [&cells[0][..1], &cells[0][..1], &cells[0][..1]];
+    // Inner rows are whole: a row shorter than the grid (the frame's
+    // longest row, here the last) is highlighted past its last cell.
+    let short: [&[Cell]; 3] = [&cells[0][..1], &cells[0][..1], cells[0]];
     let target = Target::new(&gpu, &renderer, 3, 4);
     let selection = Selection::linear(Point::new(0, 3), Point::new(2, 0));
     let image = target.draw(

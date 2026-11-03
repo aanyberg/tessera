@@ -23,11 +23,16 @@
 //!
 //! A span that starts on the right half of a wide character, or ends on
 //! its left half, is widened to the whole character, and spans are clipped
-//! to the visible columns. Shaping never sees any of this, so a selection
-//! that ends inside a ligature leaves the ligature whole. After the union
-//! every mark has at most one span per two visible columns, so a row's
-//! overlay instances are bounded by its width ([`push_row`] also stops at
-//! [`INSTANCES_PER_COLUMN`] per visible column, as a guard).
+//! to the grid's columns ([`grid_cols`]: the frame's longest row, at most
+//! the visible columns). So a linear selection's inner rows, a block
+//! selection and an overlay to `u16::MAX` cover a short row's missing
+//! cells but never the right padding or the pixels left over after the
+//! last column, which stay the background like the left padding (#124).
+//! Shaping never sees any of this, so a selection that ends inside a
+//! ligature leaves the ligature whole. After the union every mark has at
+//! most one span per two columns, so a row's overlay instances are bounded
+//! by its width ([`push_row`] also stops at [`INSTANCES_PER_COLUMN`] per
+//! visible column, as a guard).
 
 use tessera_grid::Cell;
 
@@ -57,7 +62,7 @@ pub(crate) enum Mark {
 }
 
 /// One highlight on one row: `first..=last` columns, already widened over
-/// wide characters and clipped to the visible columns.
+/// wide characters and clipped to the grid's columns ([`grid_cols`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct Span {
     /// What to draw.
@@ -80,8 +85,8 @@ impl Mark {
 }
 
 /// `first..=last` widened over the wide characters of `cells` at either
-/// end and clipped to `cols` visible columns, or `None` when nothing of it
-/// is visible.
+/// end and clipped to `cols` columns, or `None` when nothing of it is
+/// left.
 fn widened(cells: &[Cell], first: u16, last: u16, cols: usize) -> Option<(u16, u16)> {
     let max = u16::try_from(cols.checked_sub(1)?).unwrap_or(u16::MAX);
     let at = |c: u16| cells.get(usize::from(c));
@@ -99,8 +104,19 @@ fn widened(cells: &[Cell], first: u16, last: u16, cols: usize) -> Option<(u16, u
     (first <= last).then_some((first, last))
 }
 
-/// Replaces `out` with row `r`'s coverage (its `cells`, of which `cols`
-/// are visible): every span widened and clipped, then each mark's spans
+/// The columns highlights may cover in a frame of `rows`, of which `cols`
+/// are visible: the longest row's length, so a short row is highlighted to
+/// the grid's right edge and no row into the padding past it.
+pub(crate) fn grid_cols(rows: &[&[Cell]], cols: usize) -> usize {
+    rows.iter()
+        .map(|row| row.len())
+        .max()
+        .unwrap_or(0)
+        .min(cols)
+}
+
+/// Replaces `out` with row `r`'s coverage (its `cells`, highlighted over
+/// `cols` columns, see [`grid_cols`]): every span widened and clipped, then each mark's spans
 /// merged into their union (overlapping or adjacent spans become one),
 /// sorted by mark in drawing order and then by column.
 pub(crate) fn row_spans<'o>(

@@ -277,6 +277,16 @@ impl Renderer {
         self.shaper.cell_metrics()
     }
 
+    /// The width in pixels of the beam and hollow-block cursor strokes and
+    /// the height of the underline cursor (and of a link underline): one
+    /// pixel per point of the shaper's backing scale, at least one. For
+    /// tests that check drawn pixels; not a stable API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn cursor_stroke_px(&self) -> u32 {
+        passes::stroke_px(self.shaper.scale())
+    }
+
     /// The glyph atlas's counters, including
     /// [`AtlasStats::full_resets`].
     #[must_use]
@@ -463,6 +473,8 @@ impl Renderer {
             overlay::bucket(&mut self.overlay_rows, frame, rows);
             self.overlay_rows.iter_mut().for_each(trim);
         }
+        // Highlights stop at the grid's last column, never in the padding.
+        let cols = overlay::grid_cols(&frame.rows[..rows], cols);
         let changed = &mut self.changed_rows;
         changed.clear();
         changed.resize(rows, false);
@@ -581,7 +593,7 @@ impl Renderer {
             let [bg, over, glyphs, deco] = &mut row.passes;
             over.clear();
             if !row.spans.is_empty() {
-                // Highlights cover the visible columns, also past the
+                // Highlights cover the grid's columns, also past the
                 // row's last cell.
                 let cells = &frame.rows[r];
                 overlay::push_row(over, layout, (palette, &self.theme), r, cells, &row.spans);
