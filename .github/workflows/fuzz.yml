@@ -111,6 +111,11 @@ jobs:
             exit 0
           fi
           cargo fuzz run --target "$FUZZ_TRIPLE" "$TARGET" "${inputs[@]}" -- -timeout=60
+      # -timeout=60 is per input. chunking comes closest to it: it feeds
+      # every input twice (whole and chunked) and REP (`CSI b`) repeats
+      # uncapped, so its worst valid input takes about 23 s under ASan
+      # (#150). If chunking ever times out, raise its timeout or cap REP
+      # inside the harness rather than raising it for every target.
       - name: Fuzz
         run: |
           mkdir -p "fuzz/corpus/$TARGET"

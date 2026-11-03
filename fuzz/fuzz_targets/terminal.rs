@@ -1,5 +1,7 @@
-//! Raw bytes into `tessera_term::Terminal::advance`: no input panics and the
-//! grid's invariants (`Grid::check_invariants`) hold after every chunk.
+//! Raw bytes into `tessera_term::Terminal::advance`: no input panics, the
+//! cheap invariants hold after every chunk and the full ones
+//! (`Grid::check_invariants`) after at most 64 evenly spaced chunks per
+//! input plus the last one.
 //!
 //! Input layout: `[rows] [cols] [chunk] bytes...`.
 //!

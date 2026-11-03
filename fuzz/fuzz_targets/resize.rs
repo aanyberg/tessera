@@ -2,6 +2,12 @@
 //! panics and the grid's invariants hold before and after every resize, so
 //! reflow, the stashed primary screen and the saved cursors are covered.
 //!
+//! The cheap checks (size, cursor, margins) run after every step. The full
+//! ones (`Grid::check_invariants`) run after every resize, after the feed
+//! right before a resize, and otherwise within [`common::FULL_CHECKS`], so
+//! an input costs at most `FULL_CHECKS + 1` full checks plus two per
+//! honoured resize.
+//!
 //! Input layout: `[rows] [cols] bytes...`. Sizes are `rows` modulo 101 and
 //! `cols` modulo 201 (zero raised to one by the terminal). In the bytes,
 //! `0xFE r c` (a byte that never occurs in UTF-8) resizes to `r` × `c`,
@@ -73,7 +79,10 @@ fuzz_target!(|data: &[u8]| {
         match *action {
             Step::Feed(bytes) => {
                 term.advance(bytes);
-                common::check(&mut term, current, budget.due(step));
+                // In full before a resize, so a broken grid is reported as
+                // the input's fault rather than the resize's.
+                let resize_next = matches!(steps.get(step + 1), Some(Step::Resize(..)));
+                common::check(&mut term, current, budget.due(step) || resize_next);
             }
             Step::Resize(rows, cols) => {
                 term.resize(rows, cols);

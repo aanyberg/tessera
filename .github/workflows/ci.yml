@@ -31,6 +31,8 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo nextest run --workspace
+      # The C programs in crates/tessera-ffi/tests/c, against the generated header and the static library (#175).
+      - run: scripts/ffi-c-test.sh
       - run: cargo xtask config-docs --check
       - run: cargo doc --workspace --no-deps
         env:

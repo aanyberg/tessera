@@ -18,8 +18,16 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Paths copied from the base revision: enough to build every workspace member.
-const ARCHIVE_PATHS: &[&str] = &["Cargo.toml", "Cargo.lock", "crates", "xtask"];
+/// Paths copied from the base revision: enough to build every workspace
+/// member, including the top-level directories crates read at compile time
+/// (`include_str!` of `shell-integration/` scripts, #168).
+const ARCHIVE_PATHS: &[&str] = &[
+    "Cargo.toml",
+    "Cargo.lock",
+    "crates",
+    "shell-integration",
+    "xtask",
+];
 
 /// The probe's harness: argument parsing, timing and the seeded generator.
 const MAIN_TEMPLATE: &str = include_str!("ab_template/main.rs");
@@ -702,6 +710,8 @@ fn write(path: &Path, contents: &str) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     fn sample(ns: u128, instructions: Option<u64>) -> Sample {
@@ -899,5 +909,62 @@ mod tests {
             Err(Error::UnknownCrate { .. })
         ));
         let _ = fs::remove_dir_all(&out);
+    }
+
+    /// The top-level entries of `root` that a string-literal `include_str!`
+    /// or `include_bytes!` in a `.rs` file under `dir` reads.
+    fn included_top_level_paths(root: &Path, dir: &Path, found: &mut BTreeSet<String>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if path.file_name() != Some("target".as_ref()) {
+                    included_top_level_paths(root, &path, found);
+                }
+                continue;
+            }
+            if path.extension() != Some("rs".as_ref()) {
+                continue;
+            }
+            let text = read(&path).unwrap();
+            for mac in ["include_str!(", "include_bytes!("] {
+                for (at, _) in text.match_indices(mac) {
+                    let arg = text[at + mac.len()..].trim_start();
+                    let Some(literal) = arg.strip_prefix('"').and_then(|a| a.split('"').next())
+                    else {
+                        continue; // concat!(env!("OUT_DIR"), ..) and the like
+                    };
+                    let target = path.parent().unwrap().join(literal);
+                    let target = target
+                        .canonicalize()
+                        .unwrap_or_else(|err| panic!("{}: {literal}: {err}", path.display()));
+                    let relative = target.strip_prefix(root).unwrap_or_else(|_| {
+                        panic!("{}: {literal} is outside the repository", path.display())
+                    });
+                    let top = relative.components().next().unwrap();
+                    found.insert(top.as_os_str().to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_base_archive_has_every_top_level_path_crates_include() {
+        let root = crate::repo_root().canonicalize().unwrap();
+        let mut found = BTreeSet::new();
+        included_top_level_paths(&root, &root.join("crates"), &mut found);
+        // The scan works: both are read through include_str! today.
+        assert!(
+            found.contains("crates") && found.contains("shell-integration"),
+            "{found:?}"
+        );
+        let missing: Vec<_> = found
+            .iter()
+            .filter(|top| !ARCHIVE_PATHS.contains(&top.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "crates include files from {missing:?}, which ARCHIVE_PATHS does not copy \
+             from the base revision"
+        );
     }
 }
