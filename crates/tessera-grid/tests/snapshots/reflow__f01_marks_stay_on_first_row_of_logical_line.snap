@@ -20,16 +20,16 @@ cursor: (0,10)  pending_wrap: false  saved: (0,0,false)  region: 0-3
 tabs: [0, 8]
 resize 4x4:
 size: 4x4  scrollback: 0
-v>  [abcd]+ marks=PromptStart,CommandStart
-v>  [efgh]+
+v>  [abcd]+ marks=PromptStart
+v>  [efgh]+ marks=CommandStart
 v>  [ij..]
 v>  [....]
 cursor: (2,2)  pending_wrap: false  saved: (0,0,false)  region: 0-3
 tabs: [0]
 resize 4x6:
 size: 4x6  scrollback: 0
-v>  [abcdef]+ marks=PromptStart,CommandStart
-v>  [ghij..]
+v>  [abcdef]+ marks=PromptStart
+v>  [ghij..] marks=CommandStart
 v>  [......]
 v>  [......]
 cursor: (1,4)  pending_wrap: false  saved: (0,0,false)  region: 0-3

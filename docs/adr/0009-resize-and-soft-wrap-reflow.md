@@ -136,7 +136,10 @@ joined.
   the default-style padding before #88 became a default blank and was
   dropped; this is the live-write behaviour, not a regression of #88.
 - *Marks* of all rows of a logical line collect on its first row, in row
-  order (kitty keeps line attributes on the first row, R10).
+  order (kitty keeps line attributes on the first row, R10). *Superseded
+  by ADR 0022's D-MARKPOS (#181):* each mark goes to the row holding its
+  place in the text and keeps that place, a later row's mark replacing one
+  of the same kind.
 - *Window.* The screen is the last `rows` rows of the re-wrapped buffer,
   so the window stays anchored at the bottom: a narrower grid pushes lines
   into scrollback and a wider one pulls them back (Alacritty, WezTerm).

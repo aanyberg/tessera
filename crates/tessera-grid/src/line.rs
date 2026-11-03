@@ -98,6 +98,72 @@ pub struct Line {
     pub graphemes: GraphemeTable,
     /// True when this line continues onto the next (soft wrap).
     pub wrapped: bool,
+    /// Where each mark sits in the line's text, by kind (D-MARKPOS,
+    /// ADR 0022): private to the grid, kept so a re-wrap undoes itself.
+    pub(crate) anchors: MarkAnchors,
+}
+
+/// For each kind of [`Mark`] a line carries, the column in the row where
+/// it sits: the column of its place in the line's text, set when a re-wrap
+/// places it (D-MARKPOS, ADR 0022). Zero for a mark set on the row
+/// ([`Line::set_mark`]), so a re-wrap places a fresh mark on the row
+/// holding the row's first cell, and a mark placed by a re-wrap keeps its
+/// place in the text: a narrower width and back puts it on its old row
+/// again. Past the end of the row (a mark from blank rows trimmed off the
+/// end of the line) the column counts on along the line.
+///
+/// Four 14-bit columns packed into the seven bytes of padding after
+/// [`Line::wrapped`], so `Line` stays 64 bytes and a line without marks
+/// allocates nothing for it. A column saturates at [`MarkAnchors::MAX`]
+/// (16 383): a re-wrap is exact for rows up to that many columns.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MarkAnchors([u8; 7]);
+
+// `MarkAnchors` lives in the padding after `Line::wrapped`: the ring slot of
+// every scrollback line stays 64 bytes (`scrollback.rs`'s memory table).
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<Line>() == 64);
+
+impl MarkAnchors {
+    /// Bits per column.
+    const BITS: u32 = 14;
+    /// The largest column kept; larger ones saturate here.
+    pub(crate) const MAX: u16 = (1 << Self::BITS) - 1;
+
+    /// The bit offset of `mark`'s kind.
+    const fn shift(mark: &Mark) -> u32 {
+        let slot = match mark {
+            Mark::PromptStart => 0,
+            Mark::CommandStart => 1,
+            Mark::OutputStart => 2,
+            Mark::CommandEnd { .. } => 3,
+        };
+        slot * Self::BITS
+    }
+
+    /// The seven bytes as one word.
+    const fn word(self) -> u64 {
+        let b = self.0;
+        u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], 0])
+    }
+
+    /// The column of the line's mark of `mark`'s kind.
+    pub(crate) const fn get(self, mark: &Mark) -> u16 {
+        // Masked to 14 bits: fits.
+        #[allow(clippy::cast_possible_truncation)]
+        let col = ((self.word() >> Self::shift(mark)) & Self::MAX as u64) as u16;
+        col
+    }
+
+    /// Sets the column of the line's mark of `mark`'s kind, saturating at
+    /// [`MarkAnchors::MAX`].
+    pub(crate) const fn set(&mut self, mark: &Mark, col: u16) {
+        let col = if col > Self::MAX { Self::MAX } else { col };
+        let shift = Self::shift(mark);
+        let word = (self.word() & !((Self::MAX as u64) << shift)) | ((col as u64) << shift);
+        let b = word.to_le_bytes();
+        self.0 = [b[0], b[1], b[2], b[3], b[4], b[5], b[6]];
+    }
 }
 
 impl Line {
@@ -108,6 +174,7 @@ impl Line {
             marks: Vec::new(),
             graphemes: GraphemeTable::new(),
             wrapped: false,
+            anchors: MarkAnchors::default(),
         }
     }
 
@@ -156,6 +223,7 @@ impl Line {
         self.cells.fill(Cell::blank_with(style));
         self.graphemes.clear();
         self.marks.clear();
+        self.anchors = MarkAnchors::default();
         self.wrapped = false;
     }
 
@@ -164,8 +232,15 @@ impl Line {
     /// [`Mark::CommandEnd`]), so a line holds at most one of each kind and a
     /// prompt redrawn on the same line does not pile marks up.
     pub fn set_mark(&mut self, mark: Mark) {
+        self.set_mark_at(mark, 0);
+    }
+
+    /// [`Line::set_mark`] with the mark's column in the line's text
+    /// ([`MarkAnchors`]), for a re-wrap.
+    pub(crate) fn set_mark_at(&mut self, mark: Mark, anchor: u16) {
         let kind = std::mem::discriminant(&mark);
         self.marks.retain(|m| std::mem::discriminant(m) != kind);
+        self.anchors.set(&mark, anchor);
         self.marks.push(mark);
     }
 
@@ -432,6 +507,50 @@ mod tests {
             assert_eq!(Mark::from_osc133(code), end(None), "{code:?}");
         }
         assert_eq!(Mark::from_osc133(b"D;2147483647"), end(Some(i32::MAX)));
+    }
+
+    /// The four 14-bit columns are independent, saturate at the maximum
+    /// and fit in `Line`'s padding (D-MARKPOS).
+    #[test]
+    fn mark_anchors_pack_four_columns_in_the_padding() {
+        let kinds = [
+            Mark::PromptStart,
+            Mark::CommandStart,
+            Mark::OutputStart,
+            Mark::CommandEnd { exit_code: None },
+        ];
+        let mut anchors = MarkAnchors::default();
+        for (i, mark) in kinds.iter().enumerate() {
+            anchors.set(mark, 1000 * (u16::try_from(i).unwrap() + 1) + 7);
+        }
+        for (i, mark) in kinds.iter().enumerate() {
+            assert_eq!(
+                anchors.get(mark),
+                1000 * (u16::try_from(i).unwrap() + 1) + 7
+            );
+        }
+        anchors.set(&Mark::OutputStart, u16::MAX);
+        assert_eq!(anchors.get(&Mark::OutputStart), MarkAnchors::MAX);
+        assert_eq!(anchors.get(&Mark::CommandStart), 2007);
+        assert_eq!(anchors.get(&Mark::CommandEnd { exit_code: Some(1) }), 4007);
+        anchors.set(&Mark::CommandEnd { exit_code: None }, 0);
+        assert_eq!(anchors.get(&Mark::CommandEnd { exit_code: None }), 0);
+        assert_eq!(anchors.get(&Mark::OutputStart), MarkAnchors::MAX);
+        assert_eq!(std::mem::size_of::<Line>(), 64);
+    }
+
+    /// `set_mark` puts a mark at the row's first cell; `clear` forgets the
+    /// columns.
+    #[test]
+    fn set_mark_and_clear_reset_the_column() {
+        let mut line = Line::blank(4, Style::DEFAULT);
+        line.set_mark_at(Mark::PromptStart, 9);
+        assert_eq!(line.anchors.get(&Mark::PromptStart), 9);
+        line.set_mark(Mark::PromptStart);
+        assert_eq!(line.anchors.get(&Mark::PromptStart), 0);
+        line.set_mark_at(Mark::OutputStart, 3);
+        line.clear(Style::DEFAULT);
+        assert_eq!(line.anchors, MarkAnchors::default());
     }
 
     #[test]

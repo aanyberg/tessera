@@ -12,7 +12,8 @@ use crate::grapheme::MAX_CLUSTER_SCALARS;
 use crate::hyperlink::LinkPool;
 use crate::reflow::{self, ScreenMut, Size};
 use crate::{
-    Cell, CellFlags, Hyperlink, Line, LinkRefused, Point, Scrollback, Style, TabStops, char_width,
+    Cell, CellFlags, Hyperlink, Line, LinkRefused, Mark, Point, Scrollback, Style, TabStops,
+    char_width,
 };
 
 /// Default number of scrolled-off lines a grid retains.
@@ -1381,13 +1382,16 @@ impl Grid {
     ///   the next row and leaves a [`CellFlags::PAD`] cell with its
     ///   background behind, which a later join drops again (only padding
     ///   is ever dropped); on a one-column grid it is dropped. Cluster
-    ///   text and marks move with their cells and lines (marks of a
-    ///   joined line collect on its first row). On a screen that has
-    ///   scrolled the window is the last `rows` rows of the result (blank
-    ///   rows below the cursor absorb growth first). On a cleared one only
-    ///   the rows that were on the screen move it: lines wholly in
-    ///   scrollback just get longer or shorter there. When the screen's
-    ///   rows grow, blank rows below
+    ///   text and marks move with their cells: a mark goes to the row
+    ///   holding its place in the text (where it was set, the row's first
+    ///   cell) and keeps that place, so a narrower width and back restores
+    ///   it, a later row's mark replacing one of the same kind there
+    ///   (D-MARKPOS, ADR 0022). On a screen
+    ///   that has scrolled the window is the last `rows` rows of the
+    ///   result (blank rows below the cursor absorb growth first). On a
+    ///   cleared one only the rows that were on the screen move it: lines
+    ///   wholly in scrollback just get longer or shorter there. When the
+    ///   screen's rows grow, blank rows below
     ///   the cursor absorb that first and then the top rows go into
     ///   scrollback; when they shrink, an anchored screen pulls scrollback
     ///   back and any other keeps its place with blank rows at the bottom.
@@ -1818,9 +1822,10 @@ impl Grid {
             rows.rotate_right(1);
             (0, last)
         };
-        let (wrapped, marks) = (
+        let (wrapped, marks, anchors) = (
             rows[parked].wrapped,
             std::mem::take(&mut rows[parked].marks),
+            std::mem::take(&mut rows[parked].anchors),
         );
         // Park the parked row's outside cells in its own inside, which is
         // blanked at the end anyway and wider (the caller checks): no
@@ -1838,6 +1843,7 @@ impl Grid {
                 to.cells[right..].copy_from_slice(&from.cells[right..]);
                 to.wrapped = from.wrapped;
                 mem::swap(&mut to.marks, &mut from.marks);
+                mem::swap(&mut to.anchors, &mut from.anchors);
             }};
         }
         // Each step moves an outside part one row towards `parked`,
@@ -1865,6 +1871,7 @@ impl Grid {
             .copy_from_slice(&parked_row.cells[left + left..left + left + cols - right]);
         landed.wrapped = wrapped;
         landed.marks = marks;
+        landed.anchors = anchors;
         rows[parked].fill(span, pen);
     }
 
@@ -2248,19 +2255,36 @@ impl Grid {
         self.blanked_at = BlankedAt(self.damage.generation());
     }
 
-    /// Clears the screen to the cursor line ("Clear to Start", ⌘K in
-    /// Terminal.app, iTerm2 and kitty): discards the scrollback and, on the
-    /// primary screen, the rows above the cursor row.
+    /// Clears the screen to the start of the prompt ("Clear to Start", ⌘K
+    /// in Terminal.app, iTerm2 and kitty): discards the scrollback and, on
+    /// the primary screen, the rows above the kept ones (D-CLEAR-START,
+    /// ADR 0022).
     ///
-    /// The cursor row becomes row 0 and keeps its contents, column and
-    /// pending wrap; the rows below it move up with it and default blank
-    /// rows fill the bottom. Removed rows are dropped, not pushed into the
+    /// The kept rows start at the nearest row at or above the cursor row
+    /// on the screen that carries a [`Mark::PromptStart`] (shell
+    /// integration), so a two-line prompt is not cut in half (kitty's
+    /// `screen_scroll_until_cursor_prompt`). The scan up from the cursor
+    /// stops at a row with a [`Mark::OutputStart`] and no `PromptStart`: a
+    /// command is still running (`ssh`, a REPL) and its prompt is not the
+    /// one the cursor is at (kitty's `screen_cursor_at_a_shell_prompt`).
+    /// Without a `PromptStart` found, the kept rows start at the first row
+    /// of the cursor's logical line (the cursor row and the rows above it
+    /// that wrap into it), never above that `OutputStart` row, so a long
+    /// command being typed is not cut in half either. Scrollback rows are
+    /// never kept: a logical line that started in the scrollback is kept
+    /// from the screen's top row.
+    ///
+    /// The first kept row becomes row 0 and the rows keep their contents;
+    /// the cursor keeps its column and pending wrap and moves up with its
+    /// row; the rows below move up with them and default blank rows fill
+    /// the bottom. Removed rows are dropped, not pushed into the
     /// (now empty) scrollback. When rows were removed the scroll region
     /// becomes the full screen (its rows no longer hold what it was set
     /// for), the saved cursor moves up with the text (stopping at row 0)
     /// and [`Grid::scrolled_since_clear`] is cleared, since what is left on
-    /// the screen never scrolled into history. With the cursor on row 0 only
-    /// the scrollback goes, exactly as [`Grid::clear_scrollback`].
+    /// the screen never scrolled into history. When the kept rows start at
+    /// row 0 only the scrollback goes, exactly as
+    /// [`Grid::clear_scrollback`].
     ///
     /// On the alternate screen only the primary scrollback is discarded:
     /// the visible screen belongs to the full-screen application and is not
@@ -2268,26 +2292,56 @@ impl Grid {
     pub fn clear_to_cursor(&mut self) {
         self.scrollback.clear();
         self.damage.extend_all();
-        let removed = self.cursor.row;
-        if self.is_alt_screen() || removed == 0 {
+        if self.is_alt_screen() {
             return;
         }
-        let removed_rows = usize::from(removed);
+        let removed_rows = self.prompt_start_row();
+        if removed_rows == 0 {
+            return;
+        }
+        // Below the cursor row, itself a `u16`.
+        let removed = u16::try_from(removed_rows).unwrap_or(self.cursor.row);
         for line in &mut self.lines[..removed_rows] {
             line.clear(Style::DEFAULT);
         }
         self.lines.rotate_left(removed_rows);
-        self.cursor.row = 0;
+        self.cursor.row -= removed;
         self.saved.cursor.row = self.saved.cursor.row.saturating_sub(removed);
         self.reset_scroll_region();
         self.scrolled_since_clear = false;
     }
 
+    /// The first row [`Grid::clear_to_cursor`] keeps: the nearest screen
+    /// row at or above the cursor row with a [`Mark::PromptStart`], unless
+    /// a row with a [`Mark::OutputStart`] (and no `PromptStart`) comes
+    /// first; else the first screen row of the cursor's logical line, not
+    /// above that `OutputStart` row.
+    fn prompt_start_row(&self) -> usize {
+        let cursor_row = usize::from(self.cursor.row);
+        let above = &self.lines[..=cursor_row];
+        let stop = above.iter().rposition(|line| {
+            line.marks
+                .iter()
+                .any(|mark| matches!(mark, Mark::PromptStart | Mark::OutputStart))
+        });
+        if let Some(row) = stop
+            && above[row].marks.contains(&Mark::PromptStart)
+        {
+            return row;
+        }
+        let line_start = above[..cursor_row]
+            .iter()
+            .rposition(|line| !line.wrapped)
+            .map_or(0, |row| row + 1);
+        line_start.max(stop.unwrap_or(0))
+    }
+
     // ------------------------------------------------------------ invariants
 
     /// Panics, listing every violation, unless the grid's structural
-    /// invariants hold. For fuzzers and tests (`fuzz/` targets call it after
-    /// every chunk of input); no primitive needs it.
+    /// invariants hold. For fuzzers and tests (`fuzz/` targets call it at
+    /// most 64 times per input, spread over its steps, plus after its last
+    /// step: `fuzz/fuzz_targets/common/mod.rs`); no primitive needs it.
     ///
     /// Checked: at least one row and column; the active screen, the stashed
     /// primary screen (while the alternate one is active) and every
@@ -2706,6 +2760,7 @@ fn recycle(mut line: Line, cols: u16, pen: Style) -> Line {
     line.cells.clear();
     line.cells.resize(usize::from(cols), Cell::blank_with(pen));
     line.marks.clear();
+    line.anchors = crate::line::MarkAnchors::default();
     line.graphemes.clear();
     line.wrapped = false;
     line

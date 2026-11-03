@@ -35,7 +35,11 @@ impl Cwd {
     /// and a trailing `.`, and a bare name matches the same name with a
     /// domain (`Mac` matches `Mac.local` and `Mac.lan`; `Mac.home` does not
     /// match `Mac.lan`), since macOS reports its name with or without the
-    /// network's domain depending on the network.
+    /// network's domain depending on the network. So a bare local name
+    /// also matches that name under any domain: `Mac` matches
+    /// `mac.evil.com`. The answer is a display hint (whether a new tab can
+    /// open in the same directory), not a security boundary: the report
+    /// comes from the child, which can name any host it likes.
     #[must_use]
     pub fn is_local(&self, local_hostname: &str) -> bool {
         let host = self.host.trim_end_matches('.');
