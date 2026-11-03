@@ -1,0 +1,901 @@
+# =============================================================================
+# tessera-term: X11 colour names in OSC 4 / 10 / 11 / 12 sets   (issue #187, wave 8)
+# crates/tessera-term/tests/fixtures/osc_color_names_spec.txt   (spec-researcher output, 2026-11-03; do not edit osc_color_spec.txt)
+# Companion: osc_color_spec.txt (the colour-spec parser, sets, queries and resets; same table format and the same TEST THEME T / T2),
+# rgb_names.txt (the 782-entry table, name TAB r TAB g TAB b), notes.md (the research answers).
+#
+# FORMAT  exactly osc_color_spec.txt (read by tests/osc_color.rs, which the implementer points at this file too): `### ID`, `size: RxC`,
+#   `step: feed <bytes>` (\e = ESC, \x07 = BEL, \xNN, \u{H}, \t \r \n; `\x20` is a space), the generated step
+#   `step: feed (OSC 11 ; then N bytes of 'a', then BEL)` (N may carry commas), `step: set theme T|T2`, `reply: <bytes>|none`,
+#   `expect: fg|bg|cursor|pal[N]=#rrggbb ...`, `overrides: <keys>|none` (fg bg cursor pal[N] ascending), `gen: +1|same`
+#   (relative to the previous `gen:` line), `screen:`/`cursor:`/`requests: []`, and `cite:` / `note:` / `flags:` (not checked).
+#   Steps and checks interleave in fixture order, so one row can set several names in turn and check the colour after each.
+#   Rows with no `reply:` line do not check replies; rows meant to be silent say `reply: none`.
+#   Every row runs whole, byte by byte and split in two at every offset of every feed step (the generated 65,536-byte rows split only
+#   at their 64 first and last offsets). The expected values never equal the theme default of the colour they set, so `gen: +1`
+#   is meaningful; rows that repeat a value say `gen: same`.
+#   TEST THEME T: fg #d0d0d0, bg #101010, cursor #ffcc00, palette[i] = (i, 255 - i, i XOR 0x55); T2: fg #aabbcc, bg #223344, cursor #00ff00.
+#
+# SOURCES (fetched 2026-11-03; the first five are PRIMARY)
+#   [RGB]  X.org rgb.txt, https://gitlab.freedesktop.org/xorg/app/rgb (blob 7096643760e1a9bcb7887b9a8b6c17f75bf500f6, sha256 f8e3a7be...b6f0,
+#          782 lines, last changed 2023-07-10 by 0d2caece; tag rgb-1.1.1). Licence: COPYING in that repo (MIT/X11 + Open Group notice):
+#          the implementer's file header must carry it (saved next to this file as COPYING.xorg-rgb).
+#   [XS]   X server https://gitlab.freedesktop.org/xorg/xserver os/oscolor.c, OsLookupColor() (tag xorg-server-21.1.13 and main eae2c210):
+#          binary search over the BuiltinColors[] table (782 entries, the same set as [RGB]), `strncasecmp(entry, name, len)` and
+#          `len == strlen(entry)`: ASCII case-insensitive, whole-string, spaces significant. dix/dispatch.c ProcLookupColor calls it.
+#   [XP]   libX11 https://gitlab.freedesktop.org/xorg/lib/libx11 src/ParseCol.c XParseColor(): `#` specs, then the Xcms path
+#          (src/xcms/cmsColNm.c _XcmsResolveColorString: `rgb:`/`rgbi:`/CIE specs, then _XcmsLookupColorName which lowercases and
+#          REMOVES SPACES but searches only the Xcms colour database, src/xcms/Xcms.txt: three entries "cms red/green/blue"), then
+#          the LookupColor request to the server ([XS]). So a name resolves iff it is a [XS] entry (or one of the three cms names).
+#   [XT]   xterm https://github.com/ThomasDickey/xterm-snapshots (XTERM_PATCH 412, master as fetched 2026-11-03) misc.c: do_osc,
+#          ChangeAnsiColorRequest (OSC 4), ChangeColorsRequest (OSC 10..12), AllocateAnsiColor, AllocateTermColor, xtermAllocColor
+#          (the one call to XParseColor for a name, OSC 4 and 10..12 alike), xtermIsPrintable.
+#   [CSS]  CSS Color Module Level 4, section "Named Colors": https://www.w3.org/TR/css-color-4/#named-colors (148 names, all in [RGB]).
+#   [KT] [WZ] [GH] [AL]  comparison only: kitty gen/color_names.py + colors.c parse_color (lowercases AND trims blanks, 753 names,
+#          X11 values); WezTerm color-types/src/lib.rs + rgb.txt (the same 782 lines, ASCII-lowercased exact match, X11 values, plus
+#          transparent/none/clear); Ghostty src/terminal/x11_color.zig (res/rgb.txt, ASCII-case-insensitive exact match); Alacritty
+#          takes no names for OSC colours (from memory, not re-fetched).
+#
+# DECISIONS (D-Nxx; the lead confirms; the rows follow the recommendation; D-NAMES of osc_color_spec.txt is superseded)
+#   D-N1  MATCH RULE (confirmed by [XS]/[XP]/[XT], replaces the brief's "until confirmed" text): the name is compared as raw bytes,
+#         ASCII case-insensitively, over its WHOLE length, against every entry of the 782-entry table, spaces significant. The table
+#         has "dark slate gray" AND "DarkSlateGray", so both match (in any case: "DARKSLATEGRAY", "Dark Slate Gray"); "dark slategray",
+#         "darkslate gray", "dark  slate gray" do not. Tessera must NOT strip spaces (xterm does not either: that is a client-side
+#         Xcms step with a three-name database). The 106 spaced names all have a compact twin, so "strip spaces then lowercase" would
+#         accept the same names PLUS misplaced-space forms; the exact rule is the xterm one.
+#   D-N2  No trimming: a leading or trailing blank (0x20) makes an unknown name. (kitty trims; xterm does not.)
+#   D-N3  Non-ASCII: the matcher works on bytes and folds only A-Z to a-z. Any byte >= 0x80 makes the name unknown (no Unicode folding:
+#         U+212A KELVIN SIGN must not match "khaki"). Invalid UTF-8 is just such bytes.
+#   D-N4  C0 controls (0x00-0x06, 0x08-0x17, 0x19, 0x1C-0x1F: TAB LF CR NUL included) never reach the terminal (tessera-vt drops them in an
+#         OSC), so `red\x00` is `red`, `re\td` is `red`, `dark\tslate gray` is `darkslate gray` (unknown). DEL 0x7F stays and makes the
+#         name unknown. Tessera and xterm may differ for NUL (unverified, flagged).
+#   D-N5  TABLE: all 782 entries of the 2014+ rgb.txt, including the 10 CSS-4 additions (aqua crimson fuchsia indigo lime olive rebecca
+#         purple silver teal) and the 20 "x11 ..."/"web ..." aliases (gray green maroon purple, each in spaced and compact, gray also
+#         grey). Values are taken from the file (gray50 = 127, not computed). Count asserted in a test: 782. The name table the
+#         X server ships today is this table (21.1.13 and main).
+#   D-N6  LENGTH CAP: the longest entry is "light goldenrod yellow", 22 bytes. A name of 23+ bytes is rejected BEFORE the table
+#         search by a constant (MAX_NAME_LEN = 22). xterm has no such cap (it drops only > 65535 bytes, xtermAllocColor), so this is
+#         Tessera's own bound (S5); it never rejects a valid name.
+#   D-N7  UNKNOWN NAME: OSC 10/11/12 chain: that colour is skipped, later pieces still apply (D-QUERY; xterm ChangeColorsRequest
+#         ignores AllocateTermColor's result). OSC 4: processing stops at the failed pair, earlier pairs stay (D-STOP4; xterm
+#         `code < 0 -> break`). No reply, no generation bump, no override, no trace of the name (S1, S8: log the length only).
+#   D-N8  NOT ACCEPTED (ignored like any unknown name): CSS keywords (transparent, currentcolor, none, clear), xterm's
+#         XtDefaultForeground / XtDefaultBackground (OSC 10..12 only in xterm), the Xcms "cms red/green/blue", and the spec
+#         syntaxes rgbi:/CIE*/TekHVC (D-SPEC). A `?` is a query only as the WHOLE piece (OQ19), never part of a name.
+#   D-N9  X11 WINS over CSS: gray/grey (190, not 128), green (0,255,0, not 0,128,0), maroon (176,48,96, not 128,0,0), purple (160,32,240,
+#         not 128,0,128): exactly these five names differ between the 148 CSS names and rgb.txt. The CSS values stay reachable through
+#         the "web gray/green/maroon/purple" aliases. (osc_color_spec.txt's header says WezTerm uses CSS names: wrong, see [WZ].)
+#   D-N10 TERMINATORS: BEL, ST, and 8-bit ST (only in S8C1T mode) all end a name; 0x9C in 7-bit mode is payload and makes the name
+#         unknown; CAN/SUB dispatch what was collected (ADR 0022 D-CAN; xterm aborts: xterm-quirk).
+#
+# MUTATION CHECKS (measured 2026-11-03 in a scratch copy of main with a linear-scan stand-in for the lookup over rgb_names.txt; the
+#   failing rows named are those that failed; the scratch table was keyed by lowercase names)
+#   names ignored (today)                  -> 49 rows fail (every row that sets a colour by name)
+#   case-sensitive compare                 -> NA01 NA05 NA06 NB02 NC01 NC02 ND01 ND02 NE05 NE06 NF03 NG02 (every row with an upper-case letter)
+#   CSS gray/grey/green/maroon/purple      -> NB06 NB09 NC02 NF01 NF02 NG05 NH03 NL02 (green and gray appear in several rows)
+#   strip spaces before the lookup         -> ND03 NE04 NE07 NI02 NJ03
+#   trim blanks around the name            -> ND03 NI02 NJ03
+#   Unicode case folding (to_lowercase)    -> NC03 NJ05
+#   length cap of 21                       -> ND01 NI01 (the longest entry is rejected); a cap above 22 is not observable in a row:
+#                                             the flood test (1,000,000 names of 64 KiB, flat memory) and a unit test on the constant cover it
+#   unknown name stops a 10/11/12 chain    -> NH03 ;  unknown name does not stop OSC 4 -> NH04 NG07
+#   reply echoes the name                  -> NG02
+#   whole fixture against the stand-in (all 70 rows, whole / bytewise / every 2-way split): passes.
+# =============================================================================
+
+# ------------------------------------------------------------------ NA. The documented examples (brief #187 "done")
+
+### NA01_darkslategray_compact_st
+size: 24x80
+step: feed \e]11;DarkSlateGray\e\\
+expect: bg=#2f4f4f
+overrides: bg
+gen: +1
+reply: none
+cite: [OSC] OSC 11 ; DarkSlateGray ST sets the background to rgb.txt DarkSlateGray = 47 79 79 = #2f4f4f (same as rgb:2f/4f/4f); D-N1; [XL] names come from rgb.txt
+flags: control
+
+### NA02_dark_slate_gray_spaced_st
+size: 24x80
+step: feed \e]11;dark slate gray\e\\
+expect: bg=#2f4f4f
+overrides: bg
+gen: +1
+cite: rgb.txt has the line "47 79 79 <TAB><TAB>dark slate gray"; the server compares the whole name, spaces included (OsLookupColor); D-N1
+flags: control
+
+### NA03_darkslategray_lower_bel
+size: 24x80
+step: feed \e]11;darkslategray\x07
+expect: bg=#2f4f4f
+overrides: bg
+gen: +1
+cite: case-insensitive match of the compact twin "DarkSlateGray" (strncasecmp, os/oscolor.c OsLookupColor); D-N1
+flags: control
+
+### NA04_osc4_red
+size: 24x80
+step: feed \e]4;1;red\x07
+expect: pal[1]=#ff0000 pal[2]=#02fd57
+overrides: pal[1]
+gen: +1
+reply: none
+cite: [XT] ChangeAnsiColorRequest -> ChangeOneAnsiColor -> AllocateAnsiColor -> xtermAllocColor -> XParseColor: the same lookup as OSC 10..12; red = 255 0 0
+flags: control
+
+### NA05_gray50_grey50_resolve_per_rgb_txt
+size: 24x80
+step: feed \e]4;1;gray50;2;grey50;3;GRAY50\x07
+expect: pal[1]=#7f7f7f pal[2]=#7f7f7f pal[3]=#7f7f7f
+overrides: pal[1] pal[2] pal[3]
+cite: rgb.txt "127 127 127 gray50" and "grey50": 127 = 0x7f (NOT 128: CSS has no gray50); D-N1, D-N5
+flags: control
+
+### NA06_old_OI_NAME_row_flipped
+size: 24x80
+step: feed \e]11;red\x07
+expect: bg=#ff0000
+gen: +1
+step: feed \e]11;Red\x07
+expect: bg=#ff0000
+gen: same
+step: feed \e]11;light goldenrod\x07
+expect: bg=#eedd82
+gen: +1
+step: feed \e]11;gray50\x07
+expect: bg=#7f7f7f
+gen: +1
+step: feed \e]11;DarkSlateBlue\x07
+expect: bg=#483d8b
+gen: +1
+overrides: bg
+cite: the five names of OI-NAME_x11_names_are_ignored in osc_color_spec.txt (now OI-NAME_x11_names_are_accepted), which #187 flips to these results (ff0000, ff0000, eedd82, 7f7f7f, 483d8b); the second one sets the value already held, so no generation bump (D-GEN)
+flags: control decision
+
+# ------------------------------------------------------------------ NB. Names in OSC 4, 10, 11 and 12 alike
+
+### NB01_osc10_fg
+size: 24x80
+step: feed \e]10;red\x07
+expect: fg=#ff0000 bg=#101010 cursor=#ffcc00
+overrides: fg
+gen: +1
+cite: [XT] ChangeColorsRequest -> AllocateTermColor -> xtermAllocColor for index 10 (the same XParseColor call as OSC 11)
+flags: control
+
+### NB02_osc11_bg
+size: 24x80
+step: feed \e]11;DodgerBlue\x07
+expect: bg=#1e90ff fg=#d0d0d0
+overrides: bg
+gen: +1
+cite: as NB01 for index 11; DodgerBlue = 30 144 255
+flags: control
+
+### NB03_osc12_cursor
+size: 24x80
+step: feed \e]12;dark orange\x07
+expect: cursor=#ff8c00 fg=#d0d0d0 bg=#101010
+overrides: cursor
+gen: +1
+cite: as NB01 for index 12; "dark orange" = 255 140 0
+flags: control
+
+### NB04_osc4_edges_0_and_255
+size: 24x80
+step: feed \e]4;0;black;255;white\x07
+expect: pal[0]=#000000 pal[255]=#ffffff pal[1]=#01fe54
+overrides: pal[0] pal[255]
+gen: +1
+cite: [XT] ChangeAnsiColorRequest accepts 0..MAXCOLORS-1 with a name as with a spec
+flags: control
+
+### NB05_osc4_names_and_specs_mixed
+size: 24x80
+step: feed \e]4;1;red;2;rgb:00/ff/00;3;dark orange;4;#0000ff;5;gray50\x07
+expect: pal[1]=#ff0000 pal[2]=#00ff00 pal[3]=#ff8c00 pal[4]=#0000ff pal[5]=#7f7f7f
+overrides: pal[1] pal[2] pal[3] pal[4] pal[5]
+cite: [XT] one name or spec per pair, any mix; five pairs is under the 7-pair cut (D-PIECES)
+flags: control
+
+### NB06_chain_names_10_11_12
+size: 24x80
+step: feed \e]10;red;blue;green\x07
+expect: fg=#ff0000 bg=#0000ff cursor=#00ff00
+overrides: fg bg cursor
+gen: +1
+cite: [CTL] "Each successive parameter changes the next color in the list"; [XT] ChangeColorsRequest i = start..; X11 green = 0 255 0 (CSS green would be #008000) (D-N7)
+flags: control decision
+
+### NB07_chain_names_and_specs
+size: 24x80
+step: feed \e]11;white;#112233\x07
+expect: bg=#ffffff cursor=#112233 fg=#d0d0d0
+overrides: bg cursor
+cite: chain from 11: bg by name, cursor by spec
+flags: control
+
+### NB08_chain_stops_at_pointer_colour
+size: 24x80
+step: feed \e]12;red;blue;green\x07
+expect: cursor=#ff0000 fg=#d0d0d0 bg=#101010
+overrides: cursor
+cite: D-QUERY / D-SELECT (OS20): colours 13.. do not exist here, so only the first piece applies
+flags: decision
+
+### NB09_all_four_numbers_in_one_stream
+size: 24x80
+step: feed \e]4;1;red\x07\e]10;green\x07\e]11;blue\x07\e]12;yellow\x07
+expect: pal[1]=#ff0000 fg=#00ff00 bg=#0000ff cursor=#ffff00
+overrides: fg bg cursor pal[1]
+gen: +1
+cite: the four set forms side by side
+flags: control
+
+# ------------------------------------------------------------------ NC. Case: ASCII case-insensitive (the server uses strncasecmp)
+
+### NC01_case_variants_of_darkslategray
+size: 24x80
+step: feed \e]4;1;DARKSLATEGRAY;2;DaRkSlAtEgRaY;3;DARK SLATE GRAY;4;Dark Slate Gray;5;darkSLATEgray\x07
+expect: pal[1]=#2f4f4f pal[2]=#2f4f4f pal[3]=#2f4f4f pal[4]=#2f4f4f pal[5]=#2f4f4f
+overrides: pal[1] pal[2] pal[3] pal[4] pal[5]
+cite: [XS] os/oscolor.c OsLookupColor: strncasecmp(table name, input) with an exact length compare; OSC 4 stops at the first failure, so pairs 2..5 prove each variant
+flags: control
+
+### NC02_case_variants_via_osc11_each
+size: 24x80
+step: feed \e]11;RED\x07
+expect: bg=#ff0000
+step: feed \e]11;Green\x07
+expect: bg=#00ff00
+step: feed \e]11;bLuE\x07
+expect: bg=#0000ff
+step: feed \e]11;YELLOW\x07
+expect: bg=#ffff00
+overrides: bg
+cite: each name differs from the previous colour, so an unmatched case variant leaves the old value and the next expect fails
+flags: control
+
+### NC03_unicode_case_folding_is_not_ascii
+size: 24x80
+step: feed \e]11;\u{212a}haki\x07
+step: feed \e]11;\u{17f}now\x07
+step: feed \e]11;\u{130}vory\x07
+expect: fg=#d0d0d0 bg=#101010 cursor=#ffcc00
+overrides: none
+gen: same
+reply: none
+cite: D-N3: KELVIN SIGN U+212A lowercases to k in Unicode (a char::to_lowercase / eq_ignore_case would accept "Khaki"), LATIN SMALL LETTER LONG S U+017F uppercases to S ("snow"); the match is ASCII-only bytes (eq_ignore_ascii_case); [XS] strncasecmp in the C locale
+flags: negative security
+
+# ------------------------------------------------------------------ ND. Spaces: significant, exactly the variants rgb.txt lists
+
+### ND01_spaced_and_compact_twins
+size: 24x80
+step: feed \e]4;1;light goldenrod;2;LightGoldenrod;3;lightgoldenrod;4;light goldenrod yellow;5;LightGoldenrodYellow;6;lightgoldenrodyellow\x07
+expect: pal[1]=#eedd82 pal[2]=#eedd82 pal[3]=#eedd82 pal[4]=#fafad2 pal[5]=#fafad2 pal[6]=#fafad2
+overrides: pal[1] pal[2] pal[3] pal[4] pal[5] pal[6]
+cite: rgb.txt lists both "light goldenrod" and "LightGoldenrod" (238 221 130) and both "light goldenrod yellow" and "LightGoldenrodYellow" (250 250 210); 6 pairs fit under the cut of 7
+flags: control
+
+### ND02_every_spaced_name_has_a_compact_twin_sample
+size: 24x80
+step: feed \e]4;1;navy blue;2;NavyBlue;3;navyblue;4;navy;5;medium spring green;6;mediumspringgreen\x07
+expect: pal[1]=#000080 pal[2]=#000080 pal[3]=#000080 pal[4]=#000080 pal[5]=#00fa9a pal[6]=#00fa9a
+overrides: pal[1] pal[2] pal[3] pal[4] pal[5] pal[6]
+cite: all 106 spaced entries of rgb.txt have a compact twin (checked by scripts/cmp2.py); "navy blue" and "navy" are both entries (0 0 128)
+flags: control
+
+### ND03_misplaced_spaces_are_not_names
+size: 24x80
+step: feed \e]11;dark slategray\x07
+step: feed \e]11;darkslate gray\x07
+step: feed \e]11;dark  slate gray\x07
+step: feed \e]11;dark slate  gray\x07
+step: feed \e]11;dark slate gray \x07
+step: feed \e]11; dark slate gray\x07
+step: feed \e]11;d ark slate gray\x07
+step: feed \e]11;dark slate g ray\x07
+step: feed \e]11;light goldenrodyellow\x07
+step: feed \e]11;lightgoldenrod yellow\x07
+step: feed \e]11;navy  blue\x07
+expect: fg=#d0d0d0 bg=#101010 cursor=#ffcc00
+overrides: none
+gen: same
+reply: none
+cite: D-N2: [XS] OsLookupColor compares the whole string with strncasecmp and `len == strlen(entry)`: spaces are significant and never stripped; the client-side Xcms lookup strips spaces and lowers case but its only database (libX11 src/xcms/Xcms.txt) holds "cms red/green/blue", so "darkslate gray" does NOT resolve in xterm. Only names rgb.txt lists resolve
+flags: negative xterm-quirk decision
+
+### ND04_other_whitespace_in_a_name
+size: 24x80
+step: feed \e]11;dark\x20slate\x20gray\x07
+expect: bg=#2f4f4f
+gen: +1
+step: feed \e]11;red\x07
+expect: bg=#ff0000
+step: feed \e]11;dark\u{a0}slate gray\x07
+step: feed \e]11;dark\u{2003}slate gray\x07
+step: feed \e]11;dark\u{3000}slate gray\x07
+expect: bg=#ff0000
+cite: D-N2/D-N3: only the ASCII space 0x20 is a blank in a name; NBSP, EM SPACE and IDEOGRAPHIC SPACE are non-ASCII bytes and never match; \x20 is the same byte as a space
+flags: negative
+
+### ND05_tab_lf_cr_are_removed_by_the_parser
+size: 24x80
+step: feed \e]11;dark \tslate gray\x07
+expect: bg=#2f4f4f
+gen: +1
+step: feed \e]11;re\nd\x07
+expect: bg=#ff0000
+gen: +1
+step: feed \e]11;gr\rey50\x07
+expect: bg=#7f7f7f
+overrides: bg
+cite: ADR 0022 facts / osc_spec.txt FACT 3: tessera-vt (vte) drops C0 0x00-0x06, 0x08-0x17, 0x19, 0x1C-0x1F inside an OSC, TAB LF CR NUL included, so the terminal sees "dark slate gray", "red", "grey50" (OZ06 precedent). xterm: unverified (a NUL would end its C string; the other C0 bytes are not printable and do_osc returns for numbers other than 0..2)
+flags: decision xterm-quirk unverified
+
+# ------------------------------------------------------------------ NE. gray/grey numbered variants and boundaries
+
+### NE01_gray0_and_gray100_ends
+size: 24x80
+step: feed \e]4;1;gray0;2;grey0;3;gray100;4;grey100\x07
+expect: pal[1]=#000000 pal[2]=#000000 pal[3]=#ffffff pal[4]=#ffffff
+overrides: pal[1] pal[2] pal[3] pal[4]
+cite: rgb.txt gray0 = 0 0 0 and gray100 = 255 255 255; grey0..grey100 are separate lines with the same values
+flags: control
+
+### NE02_gray_steps_round_per_rgb_txt
+size: 24x80
+step: feed \e]4;1;gray1;2;gray2;3;gray10;4;gray50;5;gray99\x07
+expect: pal[1]=#030303 pal[2]=#050505 pal[3]=#1a1a1a pal[4]=#7f7f7f pal[5]=#fcfcfc
+overrides: pal[1] pal[2] pal[3] pal[4] pal[5]
+cite: rgb.txt: gray1 = #030303, gray2 = #050505, gray10 = #1a1a1a, gray50 = #7f7f7f, gray99 = #fcfcfc (round(N * 2.55); the values are in the file, not computed: an implementer must not compute them)
+flags: control
+
+### NE03_grey_spelling_all_numbers_equal_gray
+size: 24x80
+step: feed \e]4;1;grey1;2;grey2;3;grey10;4;grey50;5;grey99\x07
+expect: pal[1]=#030303 pal[2]=#050505 pal[3]=#1a1a1a pal[4]=#7f7f7f pal[5]=#fcfcfc
+overrides: pal[1] pal[2] pal[3] pal[4] pal[5]
+cite: rgb.txt greyN = grayN for N in 0..100 (checked by script)
+flags: control
+
+### NE04_gray101_and_malformed_numbers_unknown
+size: 24x80
+step: feed \e]11;gray101\x07
+step: feed \e]11;grey101\x07
+step: feed \e]11;gray1000\x07
+step: feed \e]11;gray-1\x07
+step: feed \e]11;gray+50\x07
+step: feed \e]11;gray050\x07
+step: feed \e]11;gray00\x07
+step: feed \e]11;gray 50\x07
+step: feed \e]11;grey 50\x07
+step: feed \e]11;gray_50\x07
+step: feed \e]11;gray5 0\x07
+step: feed \e]11;gray50%\x07
+step: feed \e]11;gray0x32\x07
+step: feed \e]11;gray5.0\x07
+step: feed \e]11;gray255\x07
+expect: fg=#d0d0d0 bg=#101010 cursor=#ffcc00
+overrides: none
+gen: same
+reply: none
+cite: rgb.txt stops at gray100/grey100; there is no zero padding, sign, space, percent or float form (xterm: the lookup fails, the set is ignored; for the chain/OSC 4 behaviour see NI)
+flags: negative
+
+### NE05_gray_family_names
+size: 24x80
+step: feed \e]4;1;dark gray;2;DarkGrey;3;light gray;4;LightGrey;5;dim gray;6;slate gray\x07
+expect: pal[1]=#a9a9a9 pal[2]=#a9a9a9 pal[3]=#d3d3d3 pal[4]=#d3d3d3 pal[5]=#696969 pal[6]=#708090
+overrides: pal[1] pal[2] pal[3] pal[4] pal[5] pal[6]
+cite: rgb.txt: dark gray = a9a9a9 (same as CSS darkgray), light gray = d3d3d3, dim gray = 105 105 105, slate gray = 112 128 144
+flags: control
+
+### NE06_numbered_variants_of_other_colours
+size: 24x80
+step: feed \e]4;1;red1;2;red4;3;AntiqueWhite1;4;antiquewhite4;5;DarkSlateGray1\x07
+expect: pal[1]=#ff0000 pal[2]=#8b0000 pal[3]=#ffefdb pal[4]=#8b8378 pal[5]=#97ffff
+overrides: pal[1] pal[2] pal[3] pal[4] pal[5]
+cite: rgb.txt has N=1..4 variants for the Motif-era colours (red1..red4, AntiqueWhite1..4, DarkSlateGray1..4); only compact names carry the digit
+flags: control
+
+### NE07_no_spaced_numbered_variants
+size: 24x80
+step: feed \e]11;antique white1\x07
+step: feed \e]11;antique white 1\x07
+step: feed \e]11;dark slate gray1\x07
+step: feed \e]11;red 1\x07
+step: feed \e]11;red5\x07
+step: feed \e]11;red0\x07
+expect: fg=#d0d0d0 bg=#101010 cursor=#ffcc00
+overrides: none
+gen: same
+cite: the spaced entries have no numbered siblings: "antique white1" is not in rgb.txt (the server does not strip spaces, so no twin is derived); red0 and red5 do not exist
+flags: negative
+
+# ------------------------------------------------------------------ NF. X11 versus CSS: X11 wins (lead decision D-X11)
+
+### NF01_the_five_disagreements_are_x11
+size: 24x80
+step: feed \e]4;1;gray;2;grey;3;green;4;maroon;5;purple\x07
+expect: pal[1]=#bebebe pal[2]=#bebebe pal[3]=#00ff00 pal[4]=#b03060 pal[5]=#a020f0
+overrides: pal[1] pal[2] pal[3] pal[4] pal[5]
+cite: rgb.txt: gray/grey 190 190 190, green 0 255 0, maroon 176 48 96, purple 160 32 240; CSS Color 4 named colors (https://www.w3.org/TR/css-color-4/#named-colors) has gray/grey #808080, green #008000, maroon #800000, purple #800080. These five are the ONLY name-value differences between the 148 CSS names and rgb.txt (checked by script; every CSS name is also an rgb.txt entry)
+flags: decision
+
+### NF02_x11_names_through_osc11
+size: 24x80
+step: feed \e]11;gray\x07
+expect: bg=#bebebe
+step: feed \e]11;green\x07
+expect: bg=#00ff00
+step: feed \e]11;maroon\x07
+expect: bg=#b03060
+step: feed \e]11;purple\x07
+expect: bg=#a020f0
+overrides: bg
+cite: as NF01 through OSC 11; mutation: swapping in the CSS table fails every expect
+flags: decision
+
+### NF03_web_and_x11_prefixed_aliases
+size: 24x80
+step: feed \e]4;1;web gray;2;WebGray;3;web green;4;WebMaroon;5;web purple;6;x11 gray;7;X11Green\x07
+expect: pal[1]=#808080 pal[2]=#808080 pal[3]=#008000 pal[4]=#800000 pal[5]=#800080 pal[6]=#bebebe pal[7]=#00ff00
+overrides: pal[1] pal[2] pal[3] pal[4] pal[5] pal[6] pal[7]
+cite: xorg-rgb commit ca05c39d (2014-07-06) added "web gray/green/maroon/purple" (+ WebGray, web grey..) and "x11 gray/green/maroon/purple" aliases: 20 entries, present in the 782-entry table and in the X server table. Older rgb.txt copies (752/762 entries) lack them. CSS values are reachable only through the web* names. NOTE: OSC 4 holds 7 pairs max (D-PIECES): this row uses 7
+flags: decision
+
+### NF04_css_names_added_to_rgb_txt_in_2014
+size: 24x80
+step: feed \e]4;1;aqua;2;crimson;3;fuchsia;4;indigo;5;lime;6;olive;7;rebeccapurple\x07
+expect: pal[1]=#00ffff pal[2]=#dc143c pal[3]=#ff00ff pal[4]=#4b0082 pal[5]=#00ff00 pal[6]=#808000 pal[7]=#663399
+overrides: pal[1] pal[2] pal[3] pal[4] pal[5] pal[6] pal[7]
+cite: xorg-rgb commit ee2c453a (2014-07-06) added aqua, crimson, fuchsia, indigo, lime, olive, rebecca purple/RebeccaPurple, silver, teal: in the 782 table and in the server table (CSS values, they do not collide with older X11 names). rebeccapurple = 102 51 153. An xterm on an older X server would ignore these
+flags: decision
+
+### NF05_css_only_names_and_keywords_not_in_rgb_txt
+size: 24x80
+step: feed \e]11;transparent\x07
+step: feed \e]11;currentcolor\x07
+step: feed \e]11;none\x07
+step: feed \e]11;clear\x07
+step: feed \e]11;inherit\x07
+step: feed \e]11;initial\x07
+step: feed \e]11;rebecca-purple\x07
+step: feed \e]11;darkgrey1\x07
+step: feed \e]11;lightgoldenrod2x\x07
+expect: fg=#d0d0d0 bg=#101010 cursor=#ffcc00
+overrides: none
+gen: same
+reply: none
+cite: CSS keywords are not colours in rgb.txt; WezTerm adds transparent/none/clear (color-types/src/lib.rs iter_rgb_txt), xterm and kitty do not
+flags: negative decision
+
+# ------------------------------------------------------------------ NG. Queries with names: a ? is never a name, a reply never echoes a name
+
+### NG01_query_form_still_queries
+size: 24x80
+step: feed \e]11;?\x07\e]11;?\e\\
+reply: \e]11;rgb:1010/1010/1010\x07\e]11;rgb:1010/1010/1010\e\\
+expect: fg=#d0d0d0 bg=#101010 cursor=#ffcc00
+overrides: none
+gen: same
+cite: [XT] `!strcmp(thisName, "?")` is tested BEFORE the name lookup in ChangeColorsRequest and ChangeAnsiColorRequest
+flags: control
+
+### NG02_reply_after_a_name_set_is_rgb_not_the_name
+size: 24x80
+step: feed \e]11;dark slate gray\x07
+step: feed \e]11;?\x07
+reply: \e]11;rgb:2f2f/4f4f/4f4f\x07
+step: feed \e]4;1;gray50\x07\e]4;1;?\e\\
+reply: \e]4;1;rgb:7f7f/7f7f/7f7f\e\\
+step: feed \e]10;LightGoldenrodYellow\e\\\e]10;?\x07
+reply: \e]10;rgb:fafa/fafa/d2d2\x07
+cite: [XT] ReportColorRequest / ReportAnsiColorRequest print `rgb:%04x/%04x/%04x` of the stored value (8-bit * 257); the name is not kept for the reply. S1: no reply echoes the name
+flags: control security
+
+### NG03_query_then_set_by_name_in_one_chain
+size: 24x80
+step: feed \e]10;?;red\x07
+reply: \e]10;rgb:d0d0/d0d0/d0d0\x07
+expect: fg=#d0d0d0 bg=#ff0000
+overrides: bg
+cite: [XT] chain: piece 1 queries colour 10, piece 2 sets colour 11 by name; the reply carries the terminator of the query
+flags: control
+
+### NG04_set_by_name_then_query_in_one_chain
+size: 24x80
+step: feed \e]10;red;?\e\\
+reply: \e]11;rgb:1010/1010/1010\e\\
+expect: fg=#ff0000
+overrides: fg
+cite: [XT] chain: piece 1 sets colour 10 by name, piece 2 queries colour 11 (OQ13 with a name)
+flags: control
+
+### NG05_osc4_query_set_query_with_names
+size: 24x80
+step: feed \e]4;1;?;2;green;3;?\x07
+reply: \e]4;1;rgb:0101/fefe/5454\x07\e]4;3;rgb:0303/fcfc/5656\x07
+expect: pal[2]=#00ff00
+overrides: pal[2]
+cite: [XT] ChangeAnsiColorRequest pairs left to right; replies in order; the set in the middle is silent (OQ08 with a name)
+flags: control
+
+### NG06_question_mark_in_a_name_is_not_a_query
+size: 24x80
+step: feed \e]11;red?\x07
+step: feed \e]11;?red\x07
+step: feed \e]11;gray50?\x07
+step: feed \e]11;re?d\x07
+step: feed \e]11;??\x07
+step: feed \e]11;? \x07
+step: feed \e]11; ?\x07
+reply: none
+expect: fg=#d0d0d0 bg=#101010 cursor=#ffcc00
+overrides: none
+gen: same
+cite: [XT] only the exact string "?" queries (OQ19); a name with a ? in it is a failed lookup and is ignored, silently (nothing is replied, nothing is set)
+flags: negative
+
+### NG07_osc4_stop_after_unknown_name_skips_later_query
+size: 24x80
+step: feed \e]4;1;?;2;nosuchcolour;3;?\x07
+reply: \e]4;1;rgb:0101/fefe/5454\x07
+overrides: none
+cite: D-STOP4: [XT] ChangeOneAnsiColor returns -1 for a failed name and the loop `break`s ("stop on any error"): pair 3 is never answered
+flags: decision xterm-quirk
+
+# ------------------------------------------------------------------ NH. Unknown names are ignored (no reply, no change, no generation bump)
+
+### NH01_unknown_name_in_every_set_form
+size: 24x80
+step: feed \e]10;nosuchcolour\x07\e]11;nosuchcolour\x07\e]12;nosuchcolour\x07\e]4;1;nosuchcolour\x07
+reply: none
+expect: fg=#d0d0d0 bg=#101010 cursor=#ffcc00
+overrides: none
+gen: same
+cite: [XT] AllocateTermColor / AllocateAnsiColor fail -> nothing recorded (misc.c: "AllocateTermColor #%d: %s (failed)")
+flags: negative
+
+### NH02_near_misses
+size: 24x80
+step: feed \e]11;re\x07
+step: feed \e]11;reds\x07
+step: feed \e]11;rd\x07
+step: feed \e]11;rede\x07
+step: feed \e]11;ed\x07
+step: feed \e]11;blu\x07
+step: feed \e]11;bluee\x07
+step: feed \e]11;grean\x07
+step: feed \e]11;purpl\x07
+step: feed \e]11;lime green2\x07
+step: feed \e]11;darkslategra\x07
+reply: none
+expect: fg=#d0d0d0 bg=#101010 cursor=#ffcc00
+overrides: none
+gen: same
+cite: whole-string compare (len must equal the entry length): prefixes and one-letter edits of names do not match (no prefix or fuzzy lookup)
+flags: negative
+
+### NH03_unknown_piece_in_a_chain_leaves_only_that_colour
+size: 24x80
+step: feed \e]10;bogus;green\x07
+expect: fg=#d0d0d0 bg=#00ff00 cursor=#ffcc00
+overrides: bg
+step: feed \e]10;red;bogus;blue\x07
+expect: fg=#ff0000 bg=#00ff00 cursor=#0000ff
+overrides: fg bg cursor
+cite: D-QUERY / OI14: [XT] ChangeColorsRequest calls AllocateTermColor per colour and ignores its result: the failed piece skips that colour, later pieces still apply
+flags: decision
+
+### NH04_osc4_stops_at_unknown_name
+size: 24x80
+step: feed \e]4;1;red;2;nosuchcolour;3;blue\x07
+expect: pal[1]=#ff0000 pal[2]=#02fd57 pal[3]=#03fc56
+overrides: pal[1]
+cite: D-STOP4 (OI12 with names): the failed name ends the OSC 4 processing; pair 1 stays
+flags: decision xterm-quirk
+
+### NH05_unknown_name_leaves_parser_clean
+size: 24x80
+step: feed \e]11;nosuchcolour\x07
+step: feed \e]11;red\x07
+expect: bg=#ff0000
+overrides: bg
+gen: +1
+reply: none
+cite: an ignored OSC must not poison the next one
+flags: control
+
+### NH06_xterm_internal_names_and_xcms_not_accepted
+size: 24x80
+step: feed \e]11;XtDefaultBackground\x07
+step: feed \e]11;XtDefaultForeground\x07
+step: feed \e]11;cms red\x07
+step: feed \e]11;CIEXYZ:0.3811/0.2073/0.0213\x07
+step: feed \e]11;rgbi:1/0/0\x07
+step: feed \e]11;TekHVC:0/50/50\x07
+reply: none
+expect: fg=#d0d0d0 bg=#101010 cursor=#ffcc00
+overrides: none
+gen: same
+cite: D-N8: xterm special-cases XtDefaultForeground/XtDefaultBackground in AllocateTermColor (OSC 10..12 only, restores the startup colour), and libX11 XParseColor resolves "cms red" through src/xcms/Xcms.txt and CIE/TekHVC/rgbi specs; Tessera accepts none of them (D-SPEC already rejects the spec forms)
+flags: xterm-quirk decision negative
+
+### NH07_names_that_look_like_other_syntax
+size: 24x80
+step: feed \e]11;rgb\x07
+step: feed \e]11;rgb:\x07
+step: feed \e]11;#\x07
+step: feed \e]11;ff0000\x07
+step: feed \e]11;0xff0000\x07
+step: feed \e]11;red;\x07
+expect: bg=#ff0000
+overrides: bg
+cite: bare hex and 0x forms are not X11 specs; `red;` is the name red followed by an empty piece for colour 12 (OS23), the only row here that sets
+flags: negative
+
+# ------------------------------------------------------------------ NI. Length: the longest entry is 22 bytes; longer is rejected before lookup
+
+### NI01_longest_entry_is_accepted
+size: 24x80
+step: feed \e]11;light goldenrod yellow\x07
+expect: bg=#fafad2
+overrides: bg
+gen: +1
+step: feed \e]11;LIGHT GOLDENROD YELLOW\x07
+expect: bg=#fafad2
+gen: same
+cite: D-N6: "light goldenrod yellow" is 22 bytes, the longest rgb.txt name (next: LightGoldenrodYellow, 20); 250 250 210; MAX_NAME_LEN = 22
+flags: control decision
+
+### NI02_over_the_cap_rejected
+size: 24x80
+step: feed \e]11;light goldenrod yellow \x07
+step: feed \e]11;light goldenrod yellowx\x07
+step: feed \e]11;light  goldenrod yellow\x07
+step: feed \e]11;lightgoldenrodyellowlightgoldenrodyellow\x07
+step: feed \e]11;red                      \x07
+reply: none
+expect: fg=#d0d0d0 bg=#101010 cursor=#ffcc00
+overrides: none
+gen: same
+cite: D-N6: 23 bytes and more never match anything and are dropped before the table search (S5: the cap is a constant, no allocation sized by the name); the first four are near-misses of the longest entry, the last is `red` + 22 spaces
+flags: negative security
+
+### NI03_generated_name_23_bytes_of_a
+size: 24x80
+step: feed (OSC 11 ; then 23 bytes of 'a', then BEL)
+reply: none
+expect: fg=#d0d0d0 bg=#101010 cursor=#ffcc00
+overrides: none
+gen: same
+cite: generated by the test (the step form of OZ03); the byte count is the first one past the cap
+flags: security negative
+
+### NI04_generated_name_4096_bytes
+size: 24x80
+step: feed (OSC 11 ; then 4,096 bytes of 'a', then BEL)
+reply: none
+expect: fg=#d0d0d0 bg=#101010 cursor=#ffcc00
+overrides: none
+gen: same
+cite: generated; 4,096 is the largest feed step the harness splits at every offset (SPLIT_ALL_UP_TO)
+flags: security negative
+
+### NI05_generated_name_65536_bytes
+size: 24x80
+step: feed (OSC 11 ; then 65,536 bytes of 'a', then BEL)
+reply: none
+expect: fg=#d0d0d0 bg=#101010 cursor=#ffcc00
+overrides: none
+gen: same
+cite: generated; xterm itself drops a spec longer than MAX_U_STRING = 65535 before XParseColor (misc.c xtermAllocColor); Tessera caps at 22
+flags: security negative
+
+### NI06_long_name_does_not_poison_the_next_osc
+size: 24x80
+step: feed (OSC 11 ; then 65,536 bytes of 'a', then BEL)
+step: feed \e]11;red\x07
+expect: bg=#ff0000
+overrides: bg
+gen: +1
+reply: none
+cite: an over-long name is ignored, not fatal; a later set still applies (the parser is not left mid-OSC)
+flags: security control
+
+# ------------------------------------------------------------------ NJ. Trailing junk, blanks, NUL and non-ASCII
+
+### NJ01_semicolon_ends_a_name_and_starts_the_next_colour
+size: 24x80
+step: feed \e]11;red;\x07
+expect: bg=#ff0000 cursor=#ffcc00
+overrides: bg
+cite: OS23: the empty piece after `red;` is the (empty) name of colour 12 and is skipped; `;` is a separator, never part of a name
+flags: control
+
+### NJ02_semicolon_splits_a_spaced_name
+size: 24x80
+step: feed \e]11;light;goldenrod\x07
+expect: bg=#101010 cursor=#daa520
+overrides: cursor
+cite: the chain splits at `;`: "light" (unknown, skipped) goes to colour 11, "goldenrod" (218 165 32) sets colour 12; a name never contains `;`
+flags: decision
+
+### NJ03_trailing_junk_and_blanks
+size: 24x80
+step: feed \e]11;red \x07
+step: feed \e]11; red\x07
+step: feed \e]11;red.\x07
+step: feed \e]11;red,\x07
+step: feed \e]11;red!\x07
+step: feed \e]11;red#\x07
+step: feed \e]11;red/\x07
+step: feed \e]11;red:\x07
+step: feed \e]11;red(\x07
+step: feed \e]11;red1x\x07
+step: feed \e]11;\x7fred\x07
+step: feed \e]11;red\x7f\x07
+step: feed \e]11;re\x7fd\x07
+reply: none
+expect: fg=#d0d0d0 bg=#101010 cursor=#ffcc00
+overrides: none
+gen: same
+cite: D-N2: no trimming (the server compares the whole string; kitty colors.c trim_view trims and would accept the blank forms: kitty differs); DEL 0x7f is not removed by the parser (osc_spec FACT 3) so it is part of the name
+flags: negative
+
+### NJ04_nul_and_c0_are_removed_by_the_parser
+size: 24x80
+step: feed \e]11;red\x00\x07
+expect: bg=#ff0000
+gen: +1
+step: feed \e]11;\x00dark slate gray\x07
+expect: bg=#2f4f4f
+gen: +1
+step: feed \e]11;gr\x01ey\x1f50\x07
+expect: bg=#7f7f7f
+gen: +1
+step: feed \e]11;dark slate\x00 gray\x07
+expect: bg=#2f4f4f
+gen: +1
+overrides: bg
+cite: D-N4: ADR 0022 facts (osc_spec.txt FACT 3, row OZ06 precedent): vte drops 0x00-0x06, 0x08-0x17, 0x19, 0x1C-0x1F inside an OSC before the terminal sees them, so the four names are red, "dark slate gray", "grey50", "dark slate gray". xterm may differ (unverified: its sos_table entry for NUL was not read; do_osc walks a C string, so a NUL would end the string: red, an empty name, "gr" or similar, "dark slate")
+flags: decision xterm-quirk unverified
+
+### NJ05_non_ascii_never_matches
+size: 24x80
+step: feed \e]11;r\u{e9}d\x07
+step: feed \e]11;\u{ff21}red\x07
+step: feed \e]11;red\u{200b}\x07
+step: feed \e]11;red\u{a0}\x07
+step: feed \e]11;gr\u{e1}y\x07
+step: feed \e]11;\u{212a}haki\x07
+step: feed \e]11;\u{ff32}\u{ff25}\u{ff24}\x07
+step: feed \e]11;\u{1f534}\x07
+step: feed \e]11;red\u{301}\x07
+reply: none
+expect: fg=#d0d0d0 bg=#101010 cursor=#ffcc00
+overrides: none
+gen: same
+cite: D-N3: [XS] strncasecmp over bytes; no entry contains a byte >= 0x80, so any such byte makes the name unknown. libX11 _XcmsCopyISOLatin1Lowered folds Latin-1 (e.g. 0xC0 -> 0xE0) but only for the Xcms database, which has three "cms" names; nothing folds a UTF-8 sequence to ASCII
+flags: negative security
+
+### NJ06_invalid_utf8_bytes
+size: 24x80
+step: feed \e]11;\xffred\x07
+step: feed \e]11;red\xff\x07
+step: feed \e]11;re\xc0\xafd\x07
+step: feed \e]11;gr\xe9y\x07
+step: feed \e]11;\x80\x07
+reply: none
+expect: fg=#d0d0d0 bg=#101010 cursor=#ffcc00
+overrides: none
+gen: same
+cite: D-N3: raw bytes >= 0x80 pass through vte unchanged (osc_spec FACT 3) and never match (OZ05 precedent); the matcher works on bytes, not on str, so it cannot panic or lossily convert
+flags: negative security
+
+# ------------------------------------------------------------------ NK. Terminators: BEL, ST, 8-bit ST; names ending at a C1 byte
+
+### NK01_bel_and_st_both_set
+size: 24x80
+step: feed \e]11;red\x07
+expect: bg=#ff0000
+step: feed \e]11;blue\e\\
+expect: bg=#0000ff
+overrides: bg
+reply: none
+cite: [CTL] "XTerm accepts either BEL or ST for terminating OSC sequences"; the terminator only matters for replies (OQ01/OQ02)
+flags: control
+
+### NK02_8bit_st_in_8bit_mode_sets
+size: 24x80
+step: feed \e G\x9d11;dark slate gray\x9c
+expect: bg=#2f4f4f
+overrides: bg
+gen: +1
+step: feed \x9d4;1;red\x9c
+expect: pal[1]=#ff0000
+reply: none
+cite: #96 D1: after S8C1T (ESC SP G) 0x9D opens an OSC and 0x9C is ST (c1_spec.txt S05); a name ends at the 8-bit ST like at BEL
+flags: control
+
+### NK03_8bit_st_in_7bit_mode_is_payload
+size: 24x80
+step: feed \e]11;red\x9c\x07
+expect: fg=#d0d0d0 bg=#101010 cursor=#ffcc00
+overrides: none
+gen: same
+reply: none
+step: feed \e]11;red\u{9c}\x07
+expect: fg=#d0d0d0 bg=#101010 cursor=#ffcc00
+overrides: none
+gen: same
+reply: none
+cite: #96 D1 / OQ26 / osc_spec FACT 5: raw 0x9C and U+009C do not terminate an OSC in 7-bit mode; they are part of the name "red\x9c", which is unknown; the BEL then ends the OSC. (xterm in UTF-8 mode ignores U+0080..U+009F in a string.)
+flags: negative decision
+
+### NK04_can_and_sub_dispatch_what_was_collected
+size: 24x80
+step: feed \e]11;red\x18
+expect: bg=#ff0000
+overrides: bg
+gen: +1
+step: feed \e]11;blue\x1a
+expect: bg=#0000ff
+cite: ADR 0022 D-CAN (OQ25 for queries): CAN and SUB end the OSC and dispatch what was collected; xterm ABORTS the string without dispatching, so xterm would keep the colour. Consequence of the parser, recorded as a decision
+flags: decision xterm-quirk
+
+### NK05_unterminated_name_does_nothing_yet
+size: 24x80
+step: feed \e]11;red
+expect: fg=#d0d0d0 bg=#101010 cursor=#ffcc00
+overrides: none
+gen: same
+reply: none
+cite: no terminator, no dispatch; the row ends with the OSC still open (each chunking sees the same)
+flags: negative
+
+# ------------------------------------------------------------------ NL. Names with resets, screen and generation
+
+### NL01_reset_after_a_name_set
+size: 24x80
+step: feed \e]11;red\x07\e]10;green\x07\e]12;blue\x07\e]4;1;gray50\x07
+overrides: fg bg cursor pal[1]
+gen: +1
+step: feed \e]111\x07\e]110\x07\e]112\x07\e]104;1\x07
+expect: fg=#d0d0d0 bg=#101010 cursor=#ffcc00 pal[1]=#01fe54
+overrides: none
+gen: +1
+cite: a name set is an ordinary override: 110/111/112/104 drop it (OR01, OR08)
+flags: control
+
+### NL02_name_then_spec_then_name_last_wins
+size: 24x80
+step: feed \e]11;red\x07\e]11;rgb:00/00/ff\x07\e]11;gray\x07
+expect: bg=#bebebe
+overrides: bg
+cite: sets apply in order
+flags: control
+
+### NL03_name_set_does_not_print_or_move_the_cursor
+size: 3x10
+step: feed ab\e]11;red\x07\e]4;1;dark slate gray\x07cd
+screen:
+>abcd |
+>
+>
+cursor: (0,4)
+requests: []
+cite: OS24 with names
+flags: control
+
+### NL04_theme_change_keeps_a_name_override
+size: 24x80
+step: feed \e]11;red\x07
+step: set theme T2
+expect: bg=#ff0000 fg=#aabbcc cursor=#00ff00
+overrides: bg
+cite: D-THEME-KEEP (OT01) with a name override: the theme change updates the defaults, the override stays
+flags: control

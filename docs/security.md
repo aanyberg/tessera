@@ -81,6 +81,7 @@ a low-risk change.
 | Foreground process name | 64 bytes | `crates/tessera-pty/src/foreground.rs` |
 | Kitty keyboard stack | 8 | `crates/tessera-term/src/modes.rs` |
 | OSC colour overrides | 259 slots (256 palette entries, foreground, background, cursor), fixed; replies bounded by the outbox | `crates/tessera-term/src/osc_color.rs` (`MAX_COLOR_OVERRIDES`) |
+| OSC colour name | 22 bytes (the longest X11 name), rejected before the lookup; static table, no allocation | `crates/tessera-term/src/color_names.rs` (`MAX_NAME_LEN`) |
 | Config / theme / import file | 16 MiB / 64 KiB (256 files) / 1 MiB | `crates/tessera-config/src/` |
 | Imported plist | 4096 values, 256 KiB of text | `crates/tessera-config/src/import.rs` |
 | URL candidate | 2083 characters | `crates/tessera-app-core/src/url.rs` |

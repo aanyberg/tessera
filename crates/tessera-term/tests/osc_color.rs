@@ -1,10 +1,13 @@
 //! OSC colours (#10): OSC 4, 10, 11 and 12 queries and sets, OSC 104 and
-//! 110 to 112 resets, with the theme as the default.
+//! 110 to 112 resets, with the theme as the default; X11 colour names in
+//! the sets (#187).
 //!
 //! Expected behaviour comes from `tests/fixtures/osc_color_spec.txt`, whose
 //! header cites xterm's source, ctlseqs, X11's colour strings and the
 //! programs that send each query, and lists the decisions (D-REPLY,
-//! D-SPEC, D-HASH, ...) the rows encode. Its layout, read here:
+//! D-SPEC, D-HASH, ...) the rows encode, and from
+//! `tests/fixtures/osc_color_names_spec.txt` (the names, D-N1 to D-N10)
+//! in the same layout. The layout, read here:
 //!
 //! - `### <id>` starts a row; `size: RxC` gives the terminal size;
 //! - `step: feed <payload>` feeds the payload (`\e` for ESC and the escapes
@@ -24,8 +27,9 @@
 //! - `requests: [..]`, `screen:` and `cursor:` as in `tests/reports.rs`;
 //! - `cite:`, `note:` and `flags:` are not checked.
 //!
-//! [`every_row`] runs every row whole, byte by byte and split in two at
-//! every offset of every feed step, and expects the same results each
+//! [`every_row`] and [`every_name_row`] run every row whole, byte by byte
+//! and split in two at
+//! every offset of every feed step, and expect the same results each
 //! time. A generated row repeats its step [`CHUNKED_REPEAT`] times when
 //! chunked (the input is periodic, see `tests/reports.rs`), and a feed
 //! step longer than [`SPLIT_ALL_UP_TO`] bytes is split only at its first
@@ -42,6 +46,9 @@ use tessera_term::{ColorOverrides, MAX_COLOR_OVERRIDES, Request, Rgb, Terminal, 
 
 const FIXTURE: &str = include_str!("fixtures/osc_color_spec.txt");
 const FIXTURE_NAME: &str = "fixtures/osc_color_spec.txt";
+
+const NAMES_FIXTURE: &str = include_str!("fixtures/osc_color_names_spec.txt");
+const NAMES_FIXTURE_NAME: &str = "fixtures/osc_color_names_spec.txt";
 
 /// Repetitions of a generated row's step when it is not fed whole.
 const CHUNKED_REPEAT: usize = 1_000;
@@ -339,9 +346,9 @@ fn parse_row(id: String, lines: &[&str]) -> Row {
     row
 }
 
-fn rows() -> Vec<Row> {
+fn rows(fixture: &str) -> Vec<Row> {
     let mut raw: Vec<(String, Vec<&str>)> = Vec::new();
-    for line in FIXTURE.lines() {
+    for line in fixture.lines() {
         if let Some(id) = line.strip_prefix("### ") {
             raw.push((id.trim().to_owned(), Vec::new()));
         } else if let Some((_, lines)) = raw.last_mut() {
@@ -528,22 +535,25 @@ fn chunkings(row: &Row) -> Vec<Chunking> {
     all
 }
 
-/// Every row of the fixture, whole, byte by byte and at every two-way
+/// Every row of `fixture`, whole, byte by byte and at every two-way
 /// split, through [`common::check_table`]: the rows run must be the
-/// fixture's `###` rows, generated rows included.
-#[test]
-fn every_row() {
-    let rows = rows();
-    let headings = FIXTURE.lines().filter(|l| l.starts_with("### ")).count();
-    assert_eq!(headings, 105, "rows in the fixture");
+/// fixture's `###` rows (`want_rows` of them, `want_generated` generated).
+fn check_fixture(name: &str, fixture: &str, want_rows: usize, want_generated: usize) {
+    let rows = rows(fixture);
+    let headings = fixture.lines().filter(|l| l.starts_with("### ")).count();
+    assert_eq!(headings, want_rows, "rows in {name}");
     let generated: Vec<&str> = rows
         .iter()
         .filter(|row| row.generated())
         .map(|row| row.id.as_str())
         .collect();
-    assert_eq!(generated.len(), 3, "generated rows: {generated:?}");
+    assert_eq!(
+        generated.len(),
+        want_generated,
+        "generated rows: {generated:?}"
+    );
     common::check_table(
-        FIXTURE_NAME,
+        name,
         headings,
         rows.iter().map(|row| (row.id.clone(), row)),
         |row| {
@@ -561,6 +571,19 @@ fn every_row() {
             );
         },
     );
+}
+
+/// Every row of `osc_color_spec.txt` (#10).
+#[test]
+fn every_row() {
+    check_fixture(FIXTURE_NAME, FIXTURE, 105, 3);
+}
+
+/// Every row of `osc_color_names_spec.txt` (#187): NI04 to NI06 are the
+/// generated over-long names.
+#[test]
+fn every_name_row() {
+    check_fixture(NAMES_FIXTURE_NAME, NAMES_FIXTURE, 70, 3);
 }
 
 /// The quickest of three runs of `f`.
@@ -621,6 +644,82 @@ fn the_override_table_is_fixed_size() {
         std::mem::size_of::<ColorOverrides>(),
         4 * MAX_COLOR_OVERRIDES
     );
+}
+
+/// This process's resident set in KiB, from `ps` (no `unsafe` needed).
+fn resident_kib() -> u64 {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .expect("ps runs");
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .expect("ps prints the resident set in KiB")
+}
+
+/// A flood of bogus colour names (S5, #187): `count` names of `len` bytes
+/// of `a` (unknown, and longer than the 22-byte cap past 22) set nothing,
+/// answer nothing and keep the resident set flat after a warm-up of the
+/// same names: nothing is kept per name. Returns the growth in KiB.
+fn flood_bogus_names(count: usize, len: usize) -> u64 {
+    let mut unit = b"\x1b]11;".to_vec();
+    unit.resize(unit.len() + len, b'a');
+    unit.push(0x07);
+    // About 1 MiB per read, as a busy PTY would deliver it.
+    let per_read = (1 << 20) / unit.len() + 1;
+    let read = unit.repeat(per_read);
+    let mut term = Terminal::new(24, 80);
+    term.set_theme_colors(theme_t());
+    let generation = term.colors_generation();
+    term.advance(&read);
+    let before = resident_kib();
+    for _ in 0..count.div_ceil(per_read) {
+        term.advance(&read);
+    }
+    let after = resident_kib();
+    term.advance(b"\x1b]11;red\x07");
+    assert_eq!(term.take_requests(), [], "replies to bogus names");
+    assert_eq!(
+        term.colors().bg,
+        Rgb::new(0xff, 0, 0),
+        "the next set applies"
+    );
+    assert_eq!(
+        term.colors_generation(),
+        generation + 1,
+        "only red moved it"
+    );
+    let grown = after.saturating_sub(before);
+    eprintln!("{count} names of {len} bytes: resident {before} -> {after} KiB");
+    grown
+}
+
+/// The names flood at the cap's edge and far past it: a million names of
+/// 23 bytes (22 MiB) and two thousand of 64 KiB (128 MiB) grow the
+/// resident set by less than 8 MiB, far below what keeping them would
+/// take. (A million names of 64 KiB, 64 GiB, take two minutes in a release
+/// build; the result is the same, see ADR 0024 D-NAMES.)
+///
+/// The resident set is the whole process's, so the check means something
+/// only when this test runs alone in it: under nextest (the gate, CI and
+/// `just`), which runs every test in its own process. Under plain
+/// `cargo test` the other tests' threads share the process and their
+/// memory, so the test does nothing there.
+#[test]
+fn a_flood_of_bogus_names_keeps_memory_flat() {
+    const SLACK_KIB: u64 = 8 * 1024;
+    if std::env::var_os("NEXTEST").is_none() {
+        eprintln!("skipped: the resident-set check needs nextest's process per test");
+        return;
+    }
+    for (count, len) in [(1_000_000, 23), (2_000, 1 << 16)] {
+        let grown = flood_bogus_names(count, len);
+        assert!(
+            grown < SLACK_KIB,
+            "{count} names of {len} bytes grew the resident set by {grown} KiB"
+        );
+    }
 }
 
 /// In 8-bit mode (S8C1T) a reply starts with `0x9D` and ends with `0x9C`,

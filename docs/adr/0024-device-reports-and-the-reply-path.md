@@ -337,10 +337,11 @@ byte and at every two-way split. The rules live in
 - **D-SPEC, D-HASH, D-NAMES.** `rgb:` with 1 to 4 hex digits per channel
   (the same count in each) scaled as X11 does, and `#` with 3, 6, 9 or 12
   digits in X11's left-justified groups (`#f80` is `#f08000`, not CSS's
-  `#ff8800`). X11 colour names, `rgbi:`, the CIE forms, CSS `rgb(...)`,
-  blanks and signs are ignored whole; names follow in #187, which extends
-  the one entry point `parse_color_spec`. An unparsable spec is traced
-  with its length only.
+  `#ff8800`). `rgbi:`, the CIE forms, CSS `rgb(...)`, blanks and signs
+  are ignored whole. X11 colour names were ignored here too; #187 accepts
+  them through the one entry point `parse_color_spec` (the "X11 colour
+  names" amendment below). An unparsable spec is traced with its length
+  only.
 - **D-REVERSE.** Under DECSCNM a query reports the colour itself; xterm
   reports the opposite one.
 - **D-996.** tmux's `CSI ? 996 n` (colour scheme) stays silent in 0.1.0.
@@ -400,7 +401,7 @@ fed in random reads (screens and non-reply requests compared).
 | DECSTR | resets the palette | keeps every override |
 | RIS | resets the palette, keeps 10 to 12 | drops every override |
 | `#rgb` | X11 left-justified | the same (not CSS doubling) |
-| Colour names | X11 `rgb.txt` | ignored (#187) |
+| Colour names | X11 `rgb.txt` via the X server | the same 782 names (#187) |
 | OSC 4 index `1x`, empty | `atoi`: 1, 0 | malformed: stop |
 | OSC 4 / 104 index of 4+ digits (`0001`) | `atoi`: 1 | malformed: stop |
 | `rgb:` with mixed digit counts (`rgb:f/ff/fff`) | accepted (X11) | ignored whole |
@@ -410,3 +411,67 @@ fed in random reads (screens and non-reply requests compared).
 | Query under DECSCNM | the opposite colour | the colour itself |
 | CAN/SUB/ESC-aborted query | discarded | answered with ST |
 
+## Amendment: X11 colour names (#187, 2026-11-03)
+
+The contract is `crates/tessera-term/tests/fixtures/osc_color_names_spec.txt`
+(70 rows from the spec researcher, decisions D-N1 to D-N10, confirmed by
+the lead on 2026-11-03), run by `tests/osc_color.rs` like the OSC colours
+fixture; `osc_color_spec.txt` row OI-NAME flips to the names' colours.
+The table and the lookup live in `crates/tessera-term/src/color_names.rs`.
+
+- **D-NAMES (revised).** Wherever OSC 4, 10, 11 and 12 take an `rgb:` or
+  `#` spec they take an X11 colour name: the X.org `rgb.txt` of xorg-rgb
+  1.1.1 (blob `7096643`, 2023-07-10), all 782 entries, which is also the
+  X server's built-in table (`os/oscolor.c`) that xterm's `XParseColor`
+  reaches through the `LookupColor` request. The file carries the
+  xorg-rgb MIT/X11 notice. X11 wins over CSS: `gray` and `grey` are
+  `#bebebe`, `green` `#00ff00`, `maroon` `#b03060` and `purple` `#a020f0`;
+  the CSS values stay reachable as `web gray`, `web green`, `web maroon`
+  and `web purple`. CSS adds no other name (all 148 are in `rgb.txt`);
+  CSS keywords (`transparent`), xterm's `XtDefaultForeground` and
+  `XtDefaultBackground`, and the Xcms `cms red` are not names.
+- **D-N1, D-N2, D-N3 (matching).** As the X server's `OsLookupColor`:
+  ASCII case-insensitive over the whole name, spaces significant, nothing
+  trimmed, only A to Z folded. `DarkSlateGray`, `darkslategray` and
+  `dark slate gray` match because `rgb.txt` lists both spellings; `dark
+  slategray`, ` red` and `red ` do not. libX11's Xcms step strips spaces,
+  but its database holds only the three `cms` names, so it changes no
+  `rgb.txt` lookup. A byte of 0x80 or above never matches (no Unicode
+  folding: U+212A KELVIN SIGN is not `k`).
+- **D-N6 (cap).** `MAX_NAME_LEN` = 22 bytes, the longest entry (`light
+  goldenrod yellow`); a longer piece is rejected before the search, which
+  folds the name into a 22-byte stack buffer. xterm has no such cap (it
+  drops specs over 65,535 bytes), and none is lost.
+- **D-N7 (unknown names).** As any unparsable spec: in an OSC 10 chain
+  only that colour is skipped; OSC 4 stops at the pair (D-STOP4). No
+  reply, no override, no generation bump; the trace carries the length
+  only (S8), and a reply is always the stored `rgb:` value, never the
+  name (S1).
+- **D-N4, D-N10 (parser facts).** tessera-vt drops C0 bytes inside an OSC,
+  so `re<TAB>d` is `red`, and CAN and SUB dispatch what was collected
+  (ADR 0022); xterm would ignore the first (unverified for NUL) and
+  abort the second. Rows NJ04, ND05 and NK04 record it.
+
+### Cost
+
+The lookup is a binary search, among the names with the input's first
+letter, over a `static` array of 8-byte big-endian name prefixes computed
+at compile time, then a whole compare of the few names sharing the
+input's prefix: no allocation, no lazy initialisation, nothing on the
+per-byte path. Measured with `cargo xtask ab` (instructions retired, the
+gating metric, best of 7 interleaved process pairs; the critic repeated
+it at load average 3): 10,000 `OSC 11` sets by name (16 names, 3 to 22
+bytes) against the same 10,000 sets as `rgb:` specs, both on the new
+code, at 0.95 in instructions (the names are shorter) but 1.17 in cycles
+and wall time, and 0.94 and 1.30 for a shuffled mix of all 782 names.
+The cycles gap is real, not load: the binary search's dependent loads
+and data-dependent branches cost about 80 to 100 cycles (25 to 30 ns)
+per name, once per colour set, never per byte. The `rgb:` flood and plain
+text against the base are at 1.004 and 1.000; a flood of 10,000 unknown
+names, which the base rejected without a lookup, at 1.08. A plain binary search over the names
+(a `memcmp` per step) cost 1.27 times the instructions of the `rgb:`
+flood, and the prefix array without the letter index 1.33 times its
+cycles: the search is bound by the latency of its dependent loads.
+A million 64 KiB bogus names (64 GiB, 105 s in a release build) leave the
+resident set at 4.0 MiB; the test suite runs a million 23-byte names and
+two thousand 64 KiB ones.
