@@ -126,8 +126,10 @@ impl State {
     /// the character sets and every mode (see the `modes` module: all to their defaults, both
     /// kitty keyboard stacks emptied, 132-column mode left with a request for
     /// 80 columns) and replies back to 7-bit C1 controls (xterm's
-    /// `show_8bit_control(False)`). The DECSCL conformance level is kept:
-    /// xterm sets it only at start-up.
+    /// `show_8bit_control(False)`), and every colour a program set (OSC 4,
+    /// 10, 11, 12; xterm would keep 10 to 12). The DECSCL conformance level
+    /// and the theme's colours are kept: xterm sets the level only at
+    /// start-up.
     /// DECSTR (`CSI ! p`) is the soft variant that keeps the screen, see
     /// the crate documentation.
     fn reset(&mut self) {
@@ -143,6 +145,9 @@ impl State {
         // alternate screen's slot has never been saved to.
         self.charsets.reset();
         self.saved_charsets = [Some(Charsets::default().saved()), None];
+        // Every colour a program set (OSC 4, 10, 11, 12) goes; the theme
+        // stays (ADR 0024: xterm keeps the dynamic colours here).
+        self.colors.reset_all();
     }
 
     /// DECALN: resets the scroll region and the left and right margins

@@ -120,6 +120,7 @@ impl Live {
             != font_size.to_bits();
         let cursor = view::cursor_style_for(config);
         let cursor_changed = view::cursor_style_for(&applied.config) != cursor;
+        let colours_changed = applied.colours != *colours;
         let mut resizes: Vec<SessionId> = Vec::new();
         for (id, view) in views.iter_mut() {
             if theme_changed {
@@ -161,26 +162,26 @@ impl Live {
                 tracing::warn!(session = %id, %error, ?size, "resizing a session to its view failed");
             }
         }
-        if cursor_changed {
+        if cursor_changed || colours_changed {
             // Each terminal's lock, after the views lock is released and
             // with the sessions lock held only to list them (ADR 0014). A
             // session the program gave a shape of its own keeps it until it
             // asks for the default (DECSCUSR 0) or resets; a blink of its
             // own goes when the configured blink changes, which the terminal
-            // decides against the default it holds (ADR 0020, #169). One
-            // that starts meanwhile reads the configuration again once
+            // decides against the default it holds (ADR 0020, #169). The
+            // theme's colours become what the program's colours (OSC 4,
+            // 10, 11, 12) fall back to; the program's stay (D-THEME-KEEP).
+            // One that starts meanwhile reads the configuration again once
             // listed (`App::attach`).
             //
-            // The style is read from the configuration in effect under each
-            // terminal's lock (terminal, then `applied`; #168), not taken
-            // from `config`: of two applies racing here, the one that
-            // recorded its configuration first may reach a terminal last,
-            // and must not leave it on the older style.
+            // The style and the colours are read from the configuration in
+            // effect under each terminal's lock (terminal, then `applied`;
+            // #168), not taken from `config`: of two applies racing here,
+            // the one that recorded its configuration first may reach a
+            // terminal last, and must not leave it on the older ones.
             let sessions: Vec<Arc<Session>> = lock(&self.sessions).values().cloned().collect();
             for session in sessions {
-                session.with_terminal_mut(|term| {
-                    term.set_default_cursor_style(self.cursor_style());
-                });
+                session.with_terminal_mut(|term| self.push_defaults(term));
             }
         }
         let changed = theme_changed || font_changed || cursor_changed;
@@ -212,11 +213,17 @@ impl Live {
         Arc::clone(&lock(&self.applied).config)
     }
 
-    /// The default cursor style of the configuration in effect. Called
-    /// under a terminal lock to set that terminal's default: terminal, then
-    /// `applied`, never the other way round (#168).
-    pub(crate) fn cursor_style(&self) -> tessera_term::CursorStyle {
-        view::cursor_style_for(&lock(&self.applied).config)
+    /// Sets `term`'s default cursor style and theme colours
+    /// ([`view::theme_colors_for`]) to the configuration in effect, read
+    /// once under the caller's terminal lock (terminal, then `applied`;
+    /// #168).
+    pub(crate) fn push_defaults(&self, term: &mut tessera_term::Terminal) {
+        let applied = lock(&self.applied);
+        let cursor = view::cursor_style_for(&applied.config);
+        let colours = view::theme_colors_for(&applied.colours);
+        drop(applied);
+        term.set_default_cursor_style(cursor);
+        term.set_theme_colors(colours);
     }
 
     /// Handles one watcher event.
@@ -1217,7 +1224,8 @@ mod tests {
     /// lock, so once both return every session, the new one too, has the
     /// style of the configuration in effect: an apply that recorded its
     /// configuration first but reaches a terminal last does not leave it
-    /// on its older style. Runs: `ADV_RUNS` (default 2 000).
+    /// on its older style. The same holds for the theme's colours each
+    /// apply pushes (#10). Runs: `ADV_RUNS` (default 2 000).
     #[test]
     fn racing_applies_leave_every_session_on_the_style_in_effect() {
         use tessera_config::CursorShape;
@@ -1234,6 +1242,7 @@ mod tests {
             cursor_config(CursorShape::Beam, true),
             cursor_config(CursorShape::Underline, true),
         ];
+        let themes = ["dracula", "nord", "gruvbox-dark", "one-dark"].map(bundled);
         let app = App::new(block.clone(), ConfigPaths::new("/nonexistent/tessera"));
         let busy: Vec<SessionId> = (0..3).map(|_| attach_fake(&app).id).collect();
         let stop = AtomicBool::new(false);
@@ -1258,9 +1267,9 @@ mod tests {
                 app.apply_config(&block, &theme);
                 let barrier = std::sync::Barrier::new(racing.len() + 1);
                 let fresh = std::thread::scope(|race| {
-                    for config in &racing {
+                    for (config, theme) in racing.iter().zip(&themes) {
                         let barrier = &barrier;
-                        let (app, theme) = (&app, &theme);
+                        let app = &app;
                         race.spawn(move || {
                             barrier.wait();
                             app.apply_config(config, theme);
@@ -1272,9 +1281,11 @@ mod tests {
                     attach_fake_with_output(&app, &[&output, &output]).id
                 });
                 let expected = view::cursor_style_for(&app.config());
+                let colours = view::theme_colors_for(&lock(&app.applied).colours);
                 for &id in busy.iter().chain([&fresh]) {
                     let style = cursor_style_of(&app, id);
-                    if style != expected {
+                    let same = app.with_terminal(id, |t| t.colors() == colours);
+                    if style != expected || !matches!(same, Ok(true)) {
                         disagreeing.push((run, id == fresh, style));
                     }
                 }

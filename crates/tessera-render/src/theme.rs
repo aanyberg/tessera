@@ -201,6 +201,11 @@ pub struct Theme {
     pub search_match_current: Rgba,
     /// The 16 ANSI colors.
     pub ansi: [Rgba; 16],
+    /// Colors a program set for palette entries (OSC 4), by index: `Some`
+    /// replaces entry `i` (an ANSI color, a cube color or a grey), drawn
+    /// opaque. All `None` by default. A fixed table, so a program's
+    /// overrides never grow the theme.
+    pub indexed_overrides: [Option<Rgba>; 256],
     /// Padding around the grid in logical pixels.
     pub padding: f32,
 }
@@ -209,9 +214,10 @@ impl Theme {
     /// The color `color` stands for in this theme, in `slot`.
     ///
     /// `Color::Default` is [`Self::foreground`] or [`Self::background`],
-    /// indexes `0..16` come from [`Self::ansi`], `16..=231` are the xterm
-    /// 6×6×6 color cube and `232..=255` its 24 greys (both computed, see
-    /// [`crate::Palette`]), and `Rgb` is taken as sRGB bytes. Only the
+    /// an index with an override ([`Self::indexed_overrides`]) is that
+    /// override, other indexes `0..16` come from [`Self::ansi`], `16..=231`
+    /// are the xterm 6×6×6 color cube and `232..=255` its 24 greys (both
+    /// computed, see [`crate::Palette`]), and `Rgb` is taken as sRGB bytes. Only the
     /// default background keeps the theme's alpha; every other result is
     /// opaque. [`crate::Palette`] caches the same lookup for a frame.
     #[must_use]
@@ -221,9 +227,10 @@ impl Theme {
                 ColorSlot::Foreground => self.foreground.with_alpha(1.0),
                 ColorSlot::Background => self.background,
             },
-            Color::Indexed(i) => match indexed_srgb(i) {
-                Some([r, g, b]) => Rgba::from_srgb8(r, g, b),
-                None => self.ansi[usize::from(i)].with_alpha(1.0),
+            Color::Indexed(i) => match (self.indexed_overrides[usize::from(i)], indexed_srgb(i)) {
+                (Some(color), _) => color.with_alpha(1.0),
+                (None, Some([r, g, b])) => Rgba::from_srgb8(r, g, b),
+                (None, None) => self.ansi[usize::from(i)].with_alpha(1.0),
             },
             Color::Rgb(r, g, b) => Rgba::from_srgb8(r, g, b),
         }
@@ -260,6 +267,7 @@ impl Default for Theme {
             search_match: srgb(0xff_d866).with_alpha(0.6),
             search_match_current: srgb(0xff_9f43).with_alpha(0.8),
             ansi,
+            indexed_overrides: [None; 256],
             padding: 4.0,
         }
     }
@@ -354,6 +362,25 @@ mod tests {
         );
         let rgb = theme.resolve(Color::Rgb(1, 2, 3), ColorSlot::Foreground);
         assert_eq!((rgb.to_srgb8(), rgb.a), ([1, 2, 3], 1.0));
+    }
+
+    /// An indexed override replaces that entry only, opaque, in both
+    /// slots, for an ANSI color and a computed one alike.
+    #[test]
+    fn indexed_overrides_replace_their_entry() {
+        let mut theme = Theme::default();
+        let green = Rgba::from_srgb8(0, 0xff, 0);
+        theme.indexed_overrides[1] = Some(green.with_alpha(0.5));
+        theme.indexed_overrides[200] = Some(green);
+        for slot in [ColorSlot::Foreground, ColorSlot::Background] {
+            assert_eq!(theme.resolve(Color::Indexed(1), slot), green);
+            assert_eq!(theme.resolve(Color::Indexed(200), slot), green);
+            assert_eq!(theme.resolve(Color::Indexed(2), slot), theme.ansi[2]);
+            assert_eq!(
+                theme.resolve(Color::Indexed(199), slot).to_srgb8(),
+                [0xff, 0, 0xaf]
+            );
+        }
     }
 
     #[test]

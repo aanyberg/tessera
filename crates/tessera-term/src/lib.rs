@@ -19,6 +19,14 @@
 //! parse with `tessera-shell-integration`, which this crate does not depend
 //! on. See the `osc` module for the caps and the rules.
 //!
+//! OSC 4, 10, 11 and 12 set and query (`?`) the palette and the text
+//! foreground, background and cursor colours, and OSC 104 and 110 to 112
+//! reset them (ADR 0024). The host configures the theme they fall back to
+//! ([`Terminal::set_theme_colors`]) and draws [`Terminal::colors`],
+//! rebuilding its palette when [`Terminal::colors_generation`] moves. A
+//! query's reply ends with BEL when the query did, with ST otherwise. See
+//! the `osc_color` module for the specs accepted and the rules.
+//!
 //! ## Device reports
 //!
 //! Queries a program sends to learn what the terminal is and what state it
@@ -78,9 +86,10 @@
 //!   DECNRCM (`CSI ? 42`) is kept, as in xterm; DEC's table resets it.
 //!
 //! KAM is not modelled (SM 2 is ignored), so it has nothing to reset.
-//! Still waiting on state that does not exist yet (`// #95, #10` in
-//! `soft_reset`): DECSCA (#95) and the ANSI palette (colours set with OSC 4)
-//! back to the theme (#10).
+//! Still waiting on state that does not exist yet (`// #95` in
+//! `soft_reset`): DECSCA (#95). The colours a program set (OSC 4, 10, 11,
+//! 12) are kept by DECSTR and DECSCL and dropped by RIS only, a deviation
+//! from xterm, which resets the palette on DECSTR (ADR 0024).
 //!
 //! ## Character sets
 //!
@@ -145,6 +154,7 @@ pub mod keyboard;
 mod modes;
 mod mouse;
 mod osc;
+mod osc_color;
 mod reports;
 mod sgr;
 
@@ -154,10 +164,12 @@ pub use keyboard::{
 };
 pub use modes::{KITTY_STACK_DEPTH, Modes, MouseEncoding, MouseTracking};
 pub use mouse::{MouseReport, MouseReportButton, MouseReportKind, encode_mouse};
+pub use osc_color::{ColorOverrides, MAX_COLOR_OVERRIDES, Rgb, ThemeColors};
 pub use reports::{DA2_PV, TITLE_STACK_DEPTH};
 
 use charset::{Charsets, Saved};
 use dcs::Dcs;
+use osc_color::Colors;
 use reports::TitleStack;
 
 use modes::KittyStacks;
@@ -321,6 +333,7 @@ impl Terminal {
                 title: String::new(),
                 title_stack: TitleStack::default(),
                 cell_pixels: None,
+                colors: Colors::default(),
             },
             carry: Vec::new(),
         }
@@ -610,6 +623,9 @@ struct State {
     /// The cell size in pixels, `(width, height)`, both non-zero, from
     /// [`Terminal::set_cell_pixels`]; `None` while unknown.
     cell_pixels: Option<(u16, u16)>,
+    /// The theme's colours, the program's overrides (OSC 4, 10, 11, 12)
+    /// and their generation (see the `osc_color` module).
+    colors: Colors,
 }
 
 /// The parser's consumer: [`State::apply`] for every action, and 8-bit mode
@@ -698,9 +714,13 @@ impl State {
                 byte,
                 ..
             } => self.esc(&intermediates, byte),
-            Action::Osc(params) => {
+            Action::Osc {
+                params,
+                bell_terminated,
+                ..
+            } => {
                 let before = self.pending.len();
-                self.osc(&params);
+                self.osc(&params, bell_terminated);
                 // The title stack pushes the title last emitted.
                 if let Some(Request::SetTitle(title)) = self.pending[before..].last() {
                     self.title.clone_from(title);

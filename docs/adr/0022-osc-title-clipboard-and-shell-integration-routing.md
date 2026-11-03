@@ -26,7 +26,9 @@ Three constraints shape where each goes:
   "FACTS"): the payload arrives split on `;` and cut after 16 pieces with
   no flag; C0 controls other than BEL, CAN, SUB and ESC are removed from
   it; CAN, SUB and ESC end the OSC and dispatch what was collected (xterm
-  discards it); the terminator is not visible; an OSC's length is
+  discards it); the terminator was not visible (since #10 `Action::Osc`
+  carries `bell_terminated`, so a colour query's reply ends with BEL when
+  the query did and with ST otherwise, ADR 0024); an OSC's length is
   unbounded in the parser.
 
 The fixture's rows (138 run by `tests/osc.rs` under every chunking, 56
