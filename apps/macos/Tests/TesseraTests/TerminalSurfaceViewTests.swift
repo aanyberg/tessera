@@ -1001,6 +1001,33 @@ final class TerminalSurfaceViewTests: XCTestCase {
         try assertReattachesAfterADropFoundBy("a zoom") { view.increaseFontSize(nil) }
     }
 
+    func testActualSizeFindsTheDropAndReattaches() throws {
+        try assertReattachesAfterADropFoundBy("actual size") { view.resetFontSize(nil) }
+    }
+
+    /// #177: the re-attach throttle spaces failed attempts only. A surface
+    /// the core drops right after a successful attach is attached again on
+    /// the next refresh, with the interval at its default, not a second later.
+    func testADropRightAfterASuccessfulAttachReattachesOnTheNextTick() throws {
+        try requireSurface()
+        XCTAssertEqual(TerminalSurfaceView.reattachInterval, .seconds(1), "the default interval, not shortened")
+        // A fresh attach, in another window.
+        let other = KeyControlledWindow(contentRect: view.frame)
+        extraWindows.append(other)
+        other.contentView = view
+        XCTAssertTrue(view.surface.isAttached, "attached in the new window")
+        view.occlusionOverride = false
+        let rogue = try dropTheSurfaceInTheCore()
+        view.sessionDidOutput()
+        view.displayLinkDidFire()  // the frame finds the surface gone
+        XCTAssertFalse(view.surface.isAttached)
+        let attempts = view.attachAttemptCount
+        view.displayLinkDidFire()
+        XCTAssertEqual(view.attachAttemptCount, attempts + 1, "re-attached on the next tick")
+        view.displayLinkDidFire()  // draws the frame the re-attach asked for
+        assertReattached(rogue, "a drop right after an attach")
+    }
+
     /// #140: a core that refuses every re-attach after a resize found the
     /// surface gone is tried at most once per tick, a few times, and then the
     /// link idles: no busy spin.

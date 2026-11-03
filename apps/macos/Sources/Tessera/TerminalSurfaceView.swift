@@ -421,12 +421,17 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         let size = pixelSize
         do {
             try surface.attach(layer: metalLayer, widthPx: size.widthPx, heightPx: size.heightPx, scale: size.scale)
-            refreshMetrics()
-            surfaceAttachedForZoom()
+            // Cleared before the reads below: one that finds the surface
+            // dropped again asks for the next re-attach, which this must not
+            // undo. Only failed attempts are spaced by `reattachInterval`, so
+            // a drop right after this attach re-attaches on the next tick.
             wantsReattach = false
             reattachFailures = 0
             reattachGaveUpAt = nil
             lostSurfaceAcrossMove = false
+            lastAttachAttempt = nil
+            refreshMetrics()
+            surfaceAttachedForZoom()
             needsRender = true
             applyLayerOpacity()
         } catch {
@@ -550,7 +555,10 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
             needsRender = true
             updateMarkedTextLayer()
         } catch {
-            guard !reattachIfDropped(error, wasAttached: true) else { return }
+            guard !reattachIfDropped(error, wasAttached: true) else {
+                Self.log.info("core dropped the surface; re-attaching")
+                return
+            }
             Self.log.error("resizing the surface failed: \(String(describing: error), privacy: .public)")
         }
     }
