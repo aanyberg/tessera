@@ -71,7 +71,7 @@ pub struct Callbacks {
     >,
     /// The appearance every view draws with changed: the configuration
     /// watch applied an edit of `config.toml` or of the theme file in use
-    /// (colours, opacity or font size). `opaque` is whether the background
+    /// (colours, opacity, font size or default cursor style). `opaque` is whether the background
     /// is now fully opaque (`false`: translucent). The host makes its
     /// windows and layers opaque or translucent to match (`isOpaque`,
     /// background colour) and redraws every view: each surface switches

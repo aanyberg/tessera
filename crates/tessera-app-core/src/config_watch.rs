@@ -170,9 +170,17 @@ impl Live {
             // decides against the default it holds (ADR 0020, #169). One
             // that starts meanwhile reads the configuration again once
             // listed (`App::attach`).
+            //
+            // The style is read from the configuration in effect under each
+            // terminal's lock (terminal, then `applied`; #168), not taken
+            // from `config`: of two applies racing here, the one that
+            // recorded its configuration first may reach a terminal last,
+            // and must not leave it on the older style.
             let sessions: Vec<Arc<Session>> = lock(&self.sessions).values().cloned().collect();
             for session in sessions {
-                session.with_terminal_mut(|term| term.set_default_cursor_style(cursor));
+                session.with_terminal_mut(|term| {
+                    term.set_default_cursor_style(self.cursor_style());
+                });
             }
         }
         let changed = theme_changed || font_changed || cursor_changed;
@@ -202,6 +210,13 @@ impl Live {
     /// The configuration in effect.
     pub(crate) fn config(&self) -> Arc<Config> {
         Arc::clone(&lock(&self.applied).config)
+    }
+
+    /// The default cursor style of the configuration in effect. Called
+    /// under a terminal lock to set that terminal's default: terminal, then
+    /// `applied`, never the other way round (#168).
+    pub(crate) fn cursor_style(&self) -> tessera_term::CursorStyle {
+        view::cursor_style_for(&lock(&self.applied).config)
     }
 
     /// Handles one watcher event.
@@ -718,7 +733,16 @@ mod tests {
     }
 
     fn attach_fake(app: &App) -> Session1 {
-        let (tx, rx) = mpsc::sync_channel(4);
+        attach_fake_with_output(app, &[])
+    }
+
+    /// [`attach_fake`] whose reader finds `output` waiting, one event per
+    /// chunk, as soon as it starts.
+    fn attach_fake_with_output(app: &App, output: &[&[u8]]) -> Session1 {
+        let (tx, rx) = mpsc::sync_channel(4.max(output.len()));
+        for chunk in output {
+            tx.send(PtyEvent::Output(chunk.to_vec())).unwrap();
+        }
         let resizes = Arc::new(Mutex::new(Vec::new()));
         let flag = Arc::new(AtomicBool::new(false));
         let pty = FakePty {
@@ -1184,6 +1208,84 @@ mod tests {
             cursor_style_of(&app, id),
             style(Shape::Underline, true),
             "a blink edit: the blink follows too"
+        );
+    }
+
+    /// #168 (D-APPLY-ORDER): four applies of different cursor styles race
+    /// while every terminal's lock is busy with output, and a session is
+    /// attached meanwhile (its reader busy from the start). Each terminal reads the style under its own
+    /// lock, so once both return every session, the new one too, has the
+    /// style of the configuration in effect: an apply that recorded its
+    /// configuration first but reaches a terminal last does not leave it
+    /// on its older style. Runs: `ADV_RUNS` (default 2 000).
+    #[test]
+    fn racing_applies_leave_every_session_on_the_style_in_effect() {
+        use tessera_config::CursorShape;
+
+        let runs = std::env::var("ADV_RUNS")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(2_000_usize);
+        let theme = tessera_config::Theme::default();
+        let block = cursor_config(CursorShape::Block, false);
+        let racing = [
+            cursor_config(CursorShape::Beam, false),
+            cursor_config(CursorShape::Underline, false),
+            cursor_config(CursorShape::Beam, true),
+            cursor_config(CursorShape::Underline, true),
+        ];
+        let app = App::new(block.clone(), ConfigPaths::new("/nonexistent/tessera"));
+        let busy: Vec<SessionId> = (0..3).map(|_| attach_fake(&app).id).collect();
+        let stop = AtomicBool::new(false);
+        let output = b"busy\r\n".repeat(2_000);
+        let mut disagreeing = Vec::new();
+        std::thread::scope(|scope| {
+            // Busy readers: each holds its terminal's lock for a slice of
+            // output at a time and lets a waiting thread go first between
+            // slices, as a session's reader thread does.
+            for &id in &busy {
+                let session = app.session(id).unwrap();
+                let stop = &stop;
+                scope.spawn(move || {
+                    let chunk = b"busy\r\n".repeat(16);
+                    while !stop.load(Ordering::Relaxed) {
+                        session.with_terminal_mut(|term| term.advance(&chunk));
+                        std::thread::yield_now();
+                    }
+                });
+            }
+            for run in 0..runs {
+                app.apply_config(&block, &theme);
+                let barrier = std::sync::Barrier::new(racing.len() + 1);
+                let fresh = std::thread::scope(|race| {
+                    for config in &racing {
+                        let barrier = &barrier;
+                        let (app, theme) = (&app, &theme);
+                        race.spawn(move || {
+                            barrier.wait();
+                            app.apply_config(config, theme);
+                        });
+                    }
+                    barrier.wait();
+                    // Its reader starts on output, so the attach's re-read
+                    // of the style waits for the terminal lock too.
+                    attach_fake_with_output(&app, &[&output, &output]).id
+                });
+                let expected = view::cursor_style_for(&app.config());
+                for &id in busy.iter().chain([&fresh]) {
+                    let style = cursor_style_of(&app, id);
+                    if style != expected {
+                        disagreeing.push((run, id == fresh, style));
+                    }
+                }
+                app.close_session(fresh).unwrap();
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        assert_eq!(
+            disagreeing,
+            [],
+            "(run, the session attached meanwhile, its shape) over {runs} runs"
         );
     }
 

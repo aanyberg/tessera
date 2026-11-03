@@ -76,7 +76,7 @@ a low-risk change.
 | DCS | streamed in 4 KiB chunks; DECRQSS request 64 bytes | `crates/tessera-vt/src/lib.rs`, `crates/tessera-term/src/dcs.rs` |
 | Grapheme cluster | 32 scalars | `crates/tessera-grid/src/grapheme.rs` |
 | Grid | 2048 columns × 1024 rows | `crates/tessera-app-core/src/view.rs`, `crates/tessera-ffi/src/session.rs` |
-| Scrollback | 10 000 lines (the configured value is not applied yet; #175 item 7) | `crates/tessera-grid/src/grid.rs` |
+| Scrollback | `[terminal] scrollback_lines` (default 10 000), applied when a session starts; capped at `Terminal::MAX_SCROLLBACK_LINES` (10 000 000) | `crates/tessera-config/src/lib.rs`, `crates/tessera-app-core/src/lib.rs` (`App::attach`), `crates/tessera-grid/src/grid.rs` |
 | PTY read queue / write queue / pending input | 64 × 64 KiB / 1 MiB / 16 MiB | `crates/tessera-pty/src/native.rs`, `crates/tessera-app-core/src/session.rs` |
 | Foreground process name | 64 bytes | `crates/tessera-pty/src/foreground.rs` |
 | Kitty keyboard stack | 8 | `crates/tessera-term/src/modes.rs` |

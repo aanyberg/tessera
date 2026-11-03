@@ -50,6 +50,13 @@ use tessera_term::{CursorShape, CursorStyle, Request, Terminal};
 
 const FIXTURE: &str = include_str!("fixtures/decscusr_spec.txt");
 
+/// DECSET 47, 1047 and 1048 against the style (#168 item 7), the same
+/// layout as [`FIXTURE`].
+const ALT_SCREEN_FIXTURE: &str = include_str!("fixtures/decscusr_altscreen_spec.txt");
+
+/// Rows in [`ALT_SCREEN_FIXTURE`].
+const ALT_SCREEN_ROWS: usize = 9;
+
 /// Rows in the fixture, Q01..Q06 included.
 const ROWS: usize = 66;
 
@@ -558,4 +565,28 @@ fn a_flood_of_cursor_styles_requests_nothing_and_stays_linear() {
         ratios.push(ratio);
     }
     panic!("4x the units cost more than {MAX_RATIO}x the time in every attempt: {ratios:.2?}");
+}
+
+/// D-DECSC for the alternate-screen switches `decscusr_spec.txt` has no
+/// rows for: DECSET 47, 1047 and 1048 leave the program's cursor style
+/// (and the configured default) in place, as xterm does
+/// (`decscusr_altscreen_spec.txt`, #168 item 7). Every row runs whole and
+/// byte by byte.
+#[test]
+fn alternate_screen_switches_keep_the_style() {
+    let rows = raw_rows(ALT_SCREEN_FIXTURE)
+        .into_iter()
+        .map(|(id, lines)| (id.clone(), parse_row(id, &lines)));
+    common::check_table(
+        "decscusr_altscreen_spec.txt",
+        ALT_SCREEN_ROWS,
+        rows,
+        |row| {
+            let errors: Vec<String> = [Chunking::Whole, Chunking::Bytewise]
+                .into_iter()
+                .flat_map(|chunking| check_row(&row, chunking))
+                .collect();
+            assert!(errors.is_empty(), "{}", errors.join("\n"));
+        },
+    );
 }

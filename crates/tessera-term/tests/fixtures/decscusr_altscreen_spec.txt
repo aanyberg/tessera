@@ -1,0 +1,99 @@
+# =============================================================================
+# tessera-term: DECSCUSR cursor style across the other alternate-screen switches (DECSET 47, 1047, 1048)
+# crates/tessera-term/tests/fixtures/decscusr_altscreen_spec.txt   (issue #168 item 7, wave 8)
+#
+# Same layout and keys as decscusr_spec.txt (see its header: size / default / step / expect / cite / flags);
+# run by tests/decscusr.rs `alternate_screen_switches_keep_the_style` through common::check_table, every row
+# whole and byte by byte. decscusr_spec.txt covers DECSC/DECRC, SCOSC/SCORC and 1049 (S01..S03); these rows
+# extend decision D-DECSC to the switches it names but had no rows for: 47, 1047 and 1048 do not save,
+# restore or reset the cursor style, whether the program's (DECSCUSR, DECSET 12) or the configured default.
+#
+# PRIMARY SOURCES
+#   [CTL]  xterm ctlseqs https://invisible-island.net/xterm/ctlseqs/ctlseqs.html, DECSET/DECRST:
+#          "Ps = 4 7  -> Use Alternate Screen Buffer, xterm." / "Use Normal Screen Buffer, xterm."
+#          "Ps = 1 0 4 7  -> Use Alternate Screen Buffer, xterm." / "Use Normal Screen Buffer, xterm. Clear the
+#           screen first if in the Alternate Screen Buffer."
+#          "Ps = 1 0 4 8  -> Save cursor as in DECSC, xterm." / "Restore cursor as in DECRC, xterm."
+#   [XT]   xterm charproc.c dpmodes/ToAlternate/FromAlternate: the buffer switch does not touch TScreen's
+#          cursor_shape or cursor_blink_esc, which both buffers share; cursor.c CursorSave2 (DECSC, and so 1048)
+#          saves row, col, flags, GL/GR, wrap_flag, colours and charsets, no cursor style.
+#
+# DECISION
+#   D-DECSC (decscusr_spec.txt): DECSC/DECRC and the alt-screen switches keep the style in effect; a style the
+#   program set inside the alternate screen stays after it leaves.
+# =============================================================================
+
+### A01_decset47_keeps_the_style
+size: 3x10
+step: feed \x1b[5 q\x1b[?47h
+expect: beam blink
+step: feed \x1b[?47l
+expect: beam blink
+cite: [XT] ToAlternate/FromAlternate leave cursor_shape alone; [CTL] 47 only selects the buffer
+flags: decision D-DECSC
+
+### A02_style_set_in_47_survives_leaving
+size: 3x10
+step: feed \x1b[?47h\x1b[4 q\x1b[?47l
+expect: underline steady
+cite: [XT] cursor_shape is one TScreen field for both buffers
+flags: decision D-DECSC
+
+### A03_decset1047_keeps_the_style_both_ways
+size: 3x10
+step: feed \x1b[6 q\x1b[?1047h
+expect: beam steady
+step: feed \x1b[3 q\x1b[?1047l
+expect: underline blink
+cite: [CTL] 1047 reset clears the alternate screen, nothing about the cursor; [XT] as A01
+flags: decision D-DECSC
+
+### A04_decset1048_restore_does_not_restore_the_style
+size: 3x10
+step: feed \x1b[5 q\x1b[?1048h\x1b[2 q\x1b[?1048l
+expect: block steady
+cite: [CTL] 1048 is "Save/Restore cursor as in DECSC/DECRC"; [XT] CursorSave2 saves no cursor style (S01 for ESC 7 / ESC 8)
+flags: decision D-DECSC
+
+### A05_decset1048_restore_without_a_save_keeps_the_style
+size: 3x10
+step: feed \x1b[6 q\x1b[?1048l
+expect: beam steady
+cite: [XT] CursorRestore of the never-saved slot resets position and attributes only
+flags: decision D-DECSC
+
+### A06_override_survives_47_and_ps0_returns_to_the_default
+size: 3x10
+default: underline steady
+step: feed \x1b[5 q\x1b[?47h\x1b[?47l
+expect: beam blink
+step: feed \x1b[0 q
+expect: underline steady
+cite: [XT] as A01; DECSCUSR 0 selects the configured style (decscusr_spec.txt D-PS0)
+flags: decision D-DECSC
+
+### A07_a_live_default_reaches_the_1047_screen_and_stays
+size: 3x10
+default: beam blink
+step: feed \x1b[?1047h
+expect: beam blink
+step: set_default block steady
+expect: block steady
+step: feed \x1b[?1047l
+expect: block steady
+cite: [XT] as A01; the configured default is the terminal's, not the buffer's (decscusr_spec.txt D-LIVE)
+flags: decision D-DECSC
+
+### A08_decset12_is_not_saved_by_1048
+size: 3x10
+step: feed \x1b[?12h\x1b[?1048h\x1b[?12l\x1b[?1048l
+expect: block steady modes_blink=false
+cite: [XT] cursor_blink_esc is a TScreen field, not part of CursorSave2's saved cursor
+flags: decision D-DECSC
+
+### A09_1048_around_1047_keeps_the_style_set_inside
+size: 3x10
+step: feed \x1b[?1048h\x1b[?1047h\x1b[5 q\x1b[?1047l\x1b[?1048l
+expect: beam blink
+cite: [CTL] 1048 then 1047 is what 1049 does in one step (S03 in decscusr_spec.txt); [XT] as A01 and A04
+flags: decision D-DECSC
