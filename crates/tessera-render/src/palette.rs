@@ -86,7 +86,8 @@ pub fn srgb8_to_linear(b: u8) -> f32 {
 /// A theme's colors resolved once into linear [`Rgba`], for a frame's
 /// worth of lookups.
 ///
-/// Built from a [`Theme`] by [`Palette::new`]; [`Palette::resolve`] gives
+/// Built from a [`Theme`] by [`Palette::new`], its indexed overrides
+/// ([`Theme::indexed_overrides`]) included; [`Palette::resolve`] gives
 /// the same answers as [`Theme::resolve`] without recomputing the cube or
 /// the sRGB decode per cell, and [`Palette::resolve_dim`] the same as
 /// dimming the result, from tables.
@@ -367,6 +368,36 @@ mod tests {
                 " dim(",
             ] {
                 assert_eq!(source.matches(needle).count(), 0, "{name} calls {needle}");
+            }
+        }
+    }
+
+    /// [`Palette::new`] applies the theme's indexed overrides: the entry
+    /// and its dimmed table entry change, nothing else does.
+    #[test]
+    fn indexed_overrides_reach_the_palette() {
+        let plain = Palette::new(&Theme::default());
+        let mut theme = Theme::default();
+        let green = Rgba::from_srgb8(0, 0xff, 0);
+        theme.indexed_overrides[1] = Some(green);
+        theme.indexed_overrides[255] = Some(green);
+        let palette = Palette::new(&theme);
+        for i in 0..=255u8 {
+            let color = Color::Indexed(i);
+            let slot = ColorSlot::Foreground;
+            if i == 1 || i == 255 {
+                assert_eq!(palette.resolve(color, slot), green, "{i}");
+                assert_eq!(palette.resolve_dim(color, slot), dim(green), "{i}");
+            } else {
+                assert_eq!(
+                    palette.resolve(color, slot),
+                    plain.resolve(color, slot),
+                    "{i}"
+                );
+                assert_eq!(
+                    palette.resolve_dim(color, slot),
+                    plain.resolve_dim(color, slot)
+                );
             }
         }
     }

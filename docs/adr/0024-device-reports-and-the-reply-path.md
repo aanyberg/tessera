@@ -189,9 +189,8 @@ From the notes' table (d), each pinned by a fixture row:
   (ignored) runs vim, nvim, tmux, fzf, less, htop and fish and asserts
   every query is answered except the silences above, and that each
   program draws its first screen within 1 s.
-- Still to come: the OSC colour queries and their echo (#10's second
-  part, which reuses `reply_osc` and the reply path), XTGETTCAP (not
-  planned).
+- Still to come: XTGETTCAP (not planned). The OSC colour queries and
+  their echo (#10's second part) are the "OSC colours" amendment below.
 
 ## Amendment: 8-bit controls (#96, 2026-11-02)
 
@@ -304,3 +303,110 @@ G 84 ESC SP F 84` repeated) costs about 840 more instructions per switch
 than the base spends ignoring it (2.3 times its instructions, 3.4 times
 its cycles; measured on the final design), and an 8-bit DECID flood
 costs 1.2 to 1.3 times a 7-bit one per reply.
+
+## Amendment: OSC colours (#10, 2026-11-03)
+
+The contract is `crates/tessera-term/tests/fixtures/osc_color_spec.txt`
+(105 rows from the spec researcher, with the lead's decisions of
+2026-10-31 and 2026-11-03), run by `tests/osc_color.rs` whole, byte by
+byte and at every two-way split. The rules live in
+`crates/tessera-term/src/osc_color.rs`.
+
+### What is answered and set
+
+- **D-REPLY.** `OSC 4 ; c ; ?` answers `OSC 4 ; c ; rgb:RRRR/GGGG/BBBB`,
+  and `OSC 10`, `11`, `12 ; ?` answer `OSC Ps ; rgb:RRRR/GGGG/BBBB`:
+  lowercase hex, each 8-bit channel times 257. The reply ends with BEL
+  when the query ended with BEL and with ST otherwise (`ESC \`, the 8-bit
+  ST, and the CAN, SUB or ESC that aborted it): `tessera-vt`'s
+  `Action::Osc` now carries `bell_terminated` (ADR 0022 amended). Replies
+  go through `State::reply_osc`, so in 8-bit mode they start with `0x9D`
+  and end with `0x9C` or BEL (#96 D3). They come out in query order,
+  interleaved with the other replies, and hold only the command number,
+  the index and the stored colour.
+- **D-QUERY, D-SELECT.** Only 4 (index 0..=255), 10, 11 and 12 answer.
+  The `OSC 10 ; a ; b ; c` chain goes through the foreground, the
+  background and the cursor from its start and ends at 12; an empty piece
+  skips one colour, an unparsable one leaves its colour alone. OSC 5, 13
+  to 19, 105 and 113 to 119 stay ignored (selection and special colours
+  are out of scope).
+- **D-STOP4, D-PIECES.** OSC 4 and 104 stop at the first malformed pair or
+  index (1 to 3 decimal digits below 256; xterm's `atoi` takes `1x` and
+  the empty string, Tessera does not). The parser keeps 16 pieces, so an
+  OSC 4 sees at most 7 pairs; xterm answers all of them.
+- **D-SPEC, D-HASH, D-NAMES.** `rgb:` with 1 to 4 hex digits per channel
+  (the same count in each) scaled as X11 does, and `#` with 3, 6, 9 or 12
+  digits in X11's left-justified groups (`#f80` is `#f08000`, not CSS's
+  `#ff8800`). X11 colour names, `rgbi:`, the CIE forms, CSS `rgb(...)`,
+  blanks and signs are ignored whole; names follow in #187, which extends
+  the one entry point `parse_color_spec`. An unparsable spec is traced
+  with its length only.
+- **D-REVERSE.** Under DECSCNM a query reports the colour itself; xterm
+  reports the opposite one.
+- **D-996.** tmux's `CSI ? 996 n` (colour scheme) stays silent in 0.1.0.
+
+### Theme, overrides and resets
+
+- The theme is configuration: `Terminal::set_theme_colors` (pushed by
+  `tessera-app-core` before a session's first byte, at `App::attach` and
+  on every `Live::apply` that changes the colours, read under the
+  terminal lock like the cursor default, #168). A set records an
+  override (`Terminal::color_overrides`, a fixed table of
+  `MAX_COLOR_OVERRIDES` = 259 slots, docs/security.md S5), even one equal
+  to the theme's colour. `Terminal::colors_generation` increases exactly
+  when a colour in effect changes.
+- **D-THEME-KEEP.** A new theme changes the defaults and keeps the
+  overrides; a reset then lands on the new theme.
+- **D-RESET.** RIS drops every override; DECSTR and DECSCL keep them;
+  resizes and the alternate screen never touch them. xterm resets the
+  palette on DECSTR and RIS and keeps 10 to 12 on both; kitty, Alacritty,
+  WezTerm and Ghostty drop the colours on RIS only, which Tessera follows.
+  `OSC 110` to `112` with data (other than one empty piece) are ignored,
+  as in xterm.
+
+### Drawing
+
+`tessera_render::Theme` gains `indexed_overrides` (256 `Option<Rgba>`,
+no heap), applied by `Theme::resolve` and so by `Palette::new`; the
+per-cell lookup is unchanged. `Snapshot::capture` compares the
+terminal's colour generation (one load per frame) and copies the
+overrides only when it moved and they differ, or after a re-theme:
+a program colour equal to the old theme's moves no generation, so
+`View::set_appearance` makes the next capture compare the table again; `View::render` then
+rebuilds the renderer's theme from the configured one and the overrides,
+at most once per frame and outside the terminal lock, so a flood of sets
+costs one rebuild per drawn frame. **D-BG-ALPHA:** an OSC 11 background
+keeps the theme's alpha times `appearance.opacity`, so OSC 11 never
+switches a surface between opaque and translucent.
+
+### Cost
+
+Measured with `cargo xtask ab` against the merge base (instructions
+retired, best of 7 interleaved process pairs, load average 5 to 9), on
+the 11 perf-corpus lines: `Snapshot::capture` and `Snapshot::frame` per
+frame with no override (60x200, 90 x 1000 captures) at 0.9999 to 1.0001;
+`Terminal::advance` (12 MB per line in 64 KiB reads) at 0.9996 to
+1.0002, and 1.003 on an `osc_heavy` line of titles, OSC 8 and OSC 133
+(the extra match arms); full frames rendered with 256 indexed overrides
+against none (head only, 60x200 at 2x, damage everywhere) at 0.999 to
+1.003. The default path is identical to the base on 10,000 differential
+seeds of text, SGR, titles, OSC 8 and 133 and every colour sequence form
+fed in random reads (screens and non-reply requests compared).
+
+### Deviations from xterm
+
+| Behaviour | xterm 412 | Tessera |
+|---|---|---|
+| DECSTR | resets the palette | keeps every override |
+| RIS | resets the palette, keeps 10 to 12 | drops every override |
+| `#rgb` | X11 left-justified | the same (not CSS doubling) |
+| Colour names | X11 `rgb.txt` | ignored (#187) |
+| OSC 4 index `1x`, empty | `atoi`: 1, 0 | malformed: stop |
+| OSC 4 / 104 index of 4+ digits (`0001`) | `atoi`: 1 | malformed: stop |
+| `rgb:` with mixed digit counts (`rgb:f/ff/fff`) | accepted (X11) | ignored whole |
+| OSC 104 index 256 | skipped, the loop goes on | malformed: stop |
+| More than 7 OSC 4 pairs | all answered | the first 7 (parser cap) |
+| Chain past 12 | pointer colours 13, 14 | ends at 12 |
+| Query under DECSCNM | the opposite colour | the colour itself |
+| CAN/SUB/ESC-aborted query | discarded | answered with ST |
+

@@ -358,8 +358,9 @@ impl App {
         events: PtyEvents,
         size: PtySize,
     ) -> Result<SessionId> {
-        // The configured cursor style (#113) and history size (#175) are
-        // the terminal's before its first byte. The history size applies to
+        // The configured cursor style (#113), theme colours (#10, read by
+        // `Session::start` from `applied`) and history size (#175) are the
+        // terminal's before its first byte. The history size applies to
         // sessions started after a change only (lead decision
         // D-SCROLLBACK-LIVE); it is capped like a loaded configuration's,
         // in case this one was built by hand.
@@ -384,13 +385,13 @@ impl App {
         let session = Arc::new(session);
         lock(&self.sessions).insert(id, Arc::clone(&session));
         // A configuration applied while the session started set the new
-        // style on the sessions it found, before this one was listed: read
-        // it again now that it is (`Live::apply` lists the sessions after
+        // style and theme colours on the sessions it found, before this one
+        // was listed: read them again now that it is (`Live::apply` lists the sessions after
         // it records the configuration). Read under the terminal lock, as
         // `Live::apply` does (terminal, then `applied`; #168), so an apply
         // racing this one cannot leave the session on an older style.
         let live = self.live();
-        session.with_terminal_mut(|term| term.set_default_cursor_style(live.cursor_style()));
+        session.with_terminal_mut(|term| live.push_defaults(term));
         Ok(id)
     }
 
@@ -2141,7 +2142,21 @@ mod tests {
     }
 
     fn attach_fake_with(app: &App, ignore_hangup: bool, ignore_kill: bool) -> (SessionId, Fake) {
+        attach_fake_preloaded(app, ignore_hangup, ignore_kill, &[])
+    }
+
+    /// [`attach_fake_with`] whose reader finds `preload` waiting as its
+    /// first output (if not empty), before `attach` returns.
+    fn attach_fake_preloaded(
+        app: &App,
+        ignore_hangup: bool,
+        ignore_kill: bool,
+        preload: &[u8],
+    ) -> (SessionId, Fake) {
         let (tx, rx) = mpsc::sync_channel(16);
+        if !preload.is_empty() {
+            tx.send(PtyEvent::Output(preload.to_vec())).unwrap();
+        }
         let events = Arc::new(Mutex::new(Some(tx)));
         let written = Arc::new(Mutex::new(Vec::new()));
         let hangups = Arc::new(AtomicUsize::new(0));
@@ -3415,6 +3430,72 @@ mod tests {
         written_eventually(&fake, b"xw\x1b[0n\x1b[?64;9;21;22cy");
     }
 
+    /// The reply to an OSC 10/11 query for `color`, ending with `end`.
+    fn colour_reply(ps: u8, color: tessera_config::Color, end: &str) -> String {
+        let tessera_config::Color { r, g, b, .. } = color;
+        format!("\x1b]{ps};rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}{end}")
+    }
+
+    /// #10: a session answers colour queries with the configured theme
+    /// from its very first byte (a query waiting before `attach` returns,
+    /// as fish sends at start-up), each reply ending the way its query
+    /// did; a theme applied later reaches the session and keeps the
+    /// program's colours (D-THEME-KEEP), and a reset lands on the new
+    /// theme.
+    #[test]
+    fn colour_queries_answer_the_configured_theme() {
+        let mut config = Config::default();
+        config.appearance.theme = "dracula".into();
+        let app = App::new(config.clone(), ConfigPaths::new("/nonexistent/tessera"));
+        let events = observe(&app);
+        // The sessions lock held while the session starts keeps `attach`
+        // from listing it, and so from pushing the defaults again, until
+        // its reader has answered the query: the reply shows the colours
+        // `Session::start` gave the terminal.
+        let sessions = lock(&app.sessions);
+        let (id, fake) = std::thread::scope(|scope| {
+            let attach = scope.spawn(|| {
+                attach_fake_preloaded(&app, false, false, b"\x1b]11;?\x07\x1b]10;?\x1b\\")
+            });
+            assert!(matches!(next(&events), (_, SessionEvent::Output)));
+            drop(sessions);
+            attach.join().expect("attach")
+        });
+        let dracula = tessera_config::Theme::bundled("dracula").expect("bundled");
+        let first = colour_reply(11, dracula.background, "\x07")
+            + &colour_reply(10, dracula.foreground, "\x1b\\");
+        written_eventually(&fake, first.as_bytes());
+        lock(&fake.written).clear();
+        output(&fake, &events, b"\x1b]11;#ff0000\x07");
+        let nord = tessera_config::Theme::bundled("nord").expect("bundled");
+        app.apply_config(&config, nord);
+        let colours = app.with_terminal(id, Terminal::colors).expect("live");
+        assert_eq!(colours.fg, view::theme_colors_for(nord).fg, "the new theme");
+        assert_eq!(
+            colours.bg,
+            tessera_term::Rgb::new(0xff, 0, 0),
+            "the program's"
+        );
+        output(
+            &fake,
+            &events,
+            b"\x1b]11;?\x07\x1b]10;?\x07\x1b]111\x07\x1b]11;?\x07",
+        );
+        let red = tessera_config::Color {
+            r: 0xff,
+            g: 0,
+            b: 0,
+            a: 0xff,
+        };
+        let after = [
+            colour_reply(11, red, "\x07"),
+            colour_reply(10, nord.foreground, "\x07"),
+            colour_reply(11, nord.background, "\x07"),
+        ]
+        .concat();
+        written_eventually(&fake, after.as_bytes());
+    }
+
     /// #10's flood bar: 1,000,000 `CSI 6 n` from a child that never reads
     /// queue each reply once, in a handful of outbox entries (never one per
     /// reply), and 2,000,000 more overflow
@@ -3470,6 +3551,45 @@ mod tests {
             bytes + 4096 / 4 * reply > session::PENDING_INPUT_BYTES,
             "the outbox filled up: {bytes}"
         );
+        assert!(dropped > 0, "the overflow is dropped and counted");
+        app.close_session(id).unwrap();
+    }
+
+    /// S6 for the colour queries (#10): 1,000,000 `OSC 4 ; 1 ; ?` from a
+    /// child that never reads (27 MB of replies) fill the outbox to
+    /// [`session::PENDING_INPUT_BYTES`] and no further: the overflow is
+    /// dropped and counted, every reply queued is whole, and the reader
+    /// keeps delivering every chunk.
+    #[test]
+    fn a_colour_query_flood_from_a_child_that_never_reads_stays_bounded() {
+        const CHUNK: usize = 64 * 1024;
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        fake.would_block.store(true, Ordering::SeqCst);
+        let session = app.session(id).unwrap();
+        let bytes = b"\x1b]4;1;?\x07".repeat(1_000_000);
+        for chunk in bytes.chunks(CHUNK) {
+            fake.send(PtyEvent::Output(chunk.to_vec()));
+        }
+        let mut outputs = 0;
+        while outputs < bytes.len().div_ceil(CHUNK) {
+            if matches!(next(&events), (_, SessionEvent::Output)) {
+                outputs += 1;
+            }
+        }
+        let reply = b"\x1b]4;1;rgb:cdcd/0000/0000\x07".len();
+        let (queued, entries, dropped) = session.outbox_stats();
+        eprintln!("1M colour queries: {queued} bytes in {entries} entries, {dropped} dropped");
+        assert!(
+            queued <= session::PENDING_INPUT_BYTES,
+            "{queued} bytes queued"
+        );
+        assert!(
+            queued + 4096 * reply > session::PENDING_INPUT_BYTES,
+            "filled: {queued}"
+        );
+        assert_eq!(queued % reply, 0, "whole replies only");
         assert!(dropped > 0, "the overflow is dropped and counted");
         app.close_session(id).unwrap();
     }

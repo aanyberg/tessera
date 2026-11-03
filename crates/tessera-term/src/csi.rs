@@ -459,10 +459,11 @@ impl State {
         self.charsets.reset();
         let slot = usize::from(self.grid.is_alt_screen());
         self.saved_charsets[slot] = Some(self.charsets.saved());
-        // #95, #10: reset here once the state exists: DECSCA off (#95) and
-        // the OSC 4 palette to the theme (xterm's ResetAnsiColorRequest,
-        // #10). DECLRMM, the margins and reverse wraparound are reset with
-        // the modes above.
+        // #95: reset DECSCA here once the state exists. The colours a
+        // program set (OSC 4, 10, 11, 12) stay: only RIS drops them (ADR
+        // 0024; xterm's ResetAnsiColorRequest resets the palette here too).
+        // DECLRMM, the margins and reverse wraparound are reset with the
+        // modes above.
     }
 
     /// DECSCUSR (`CSI Ps SP q`) with its first parameter `ps`: 1 and 2 a

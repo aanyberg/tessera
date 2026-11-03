@@ -194,13 +194,13 @@ impl State {
         self.reply(b"\x1bP", body, b"\x1b\\");
     }
 
-    /// Queues a reply: `ESC ]`, `body`, `ESC \` (the OSC colour echo of
-    /// #10's second part is its first user). In 8-bit mode the introducer
-    /// and the terminator are C1 bytes; a reply that ends with BEL instead
-    /// keeps it ([`crate::to_8bit_controls`]).
-    #[expect(dead_code, reason = "the OSC colour queries (#10, 10-colors) use it")]
-    pub(crate) fn reply_osc(&mut self, body: fmt::Arguments<'_>) {
-        self.reply(b"\x1b]", body, b"\x1b\\");
+    /// Queues a reply: `ESC ]`, `body`, then BEL when `bell` (the query
+    /// ended with BEL) or `ESC \` otherwise, for the OSC colour queries.
+    /// In 8-bit mode the introducer and ST are C1 bytes; a BEL stays a BEL
+    /// ([`crate::to_8bit_controls`]).
+    pub(crate) fn reply_osc(&mut self, body: fmt::Arguments<'_>, bell: bool) {
+        let end: &[u8] = if bell { b"\x07" } else { b"\x1b\\" };
+        self.reply(b"\x1b]", body, end);
     }
 
     /// Queues `intro`, `body`, `end` as one [`Request::Reply`], in its

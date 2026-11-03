@@ -10,9 +10,10 @@
 //! | `OSC 8 ; params ; URI` | opens (or, with an empty URI, closes) a hyperlink |
 //! | `OSC 133 ; A/B/C/D[;options]` | a [`Mark`] on the cursor's line |
 //! | `OSC 1337 ; ShellIntegrationVersion=..` | [`Request::ShellIntegrationHandshake`], raw |
+//! | `OSC 4`, `10`, `11`, `12`, `104`, `110`, `111`, `112` | colours: set, query (`?`), reset; see the `osc_color` module |
 //!
 //! Every other command, and any malformed one, is ignored and logged at
-//! trace level; nothing here ever writes a reply. The command number must be
+//! trace level; only the colour queries write a reply. The command number must be
 //! exactly one of the above (`02` and `+2` are not `2`). An OSC never moves
 //! the cursor or touches a pending wrap.
 //!
@@ -114,8 +115,9 @@ const HANDSHAKE_PREFIX: &[u8] = b"ShellIntegrationVersion=";
 
 impl State {
     /// Applies one operating system command, `params` being its payload
-    /// split on `;`. See the module documentation.
-    pub(crate) fn osc(&mut self, params: &[Vec<u8>]) {
+    /// split on `;` and `bell` whether BEL ended it (a colour query's reply
+    /// ends the same way). See the module documentation.
+    pub(crate) fn osc(&mut self, params: &[Vec<u8>], bell: bool) {
         let Some((command, args)) = params.split_first() else {
             return;
         };
@@ -130,6 +132,14 @@ impl State {
             }
             b"8" => self.osc_hyperlink(args, cut),
             b"133" => self.osc_mark(args),
+            b"4" => self.osc_palette(args, bell),
+            b"10" => self.osc_dynamic_colors(0, args, bell),
+            b"11" => self.osc_dynamic_colors(1, args, bell),
+            b"12" => self.osc_dynamic_colors(2, args, bell),
+            b"104" => self.osc_reset_palette(args),
+            b"110" => self.osc_reset_dynamic_color(0, args),
+            b"111" => self.osc_reset_dynamic_color(1, args),
+            b"112" => self.osc_reset_dynamic_color(2, args),
             b"1337" => {
                 let handshake = args
                     .first()

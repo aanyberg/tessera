@@ -36,6 +36,19 @@
 //! only the newest snapshot is drawn, so the reader thread never waits on
 //! the GPU and the screen updates at display rate. A surface with nothing
 //! to draw into reports [`FrameStatus::NotReady`].
+//!
+//! # Program colours
+//!
+//! The colours a program sets with OSC 4, 10, 11 and 12 are the
+//! terminal's ([`Terminal::color_overrides`]); the theme they fall back to
+//! is pushed into every terminal by [`crate::App`] ([`theme_colors_for`]).
+//! `View::capture` compares the terminal's colour generation
+//! ([`Terminal::colors_generation`], one number) and copies the overrides
+//! only when it moved, or after a re-theme (a program colour equal to the
+//! old theme's moves no generation); `View::render` then rebuilds the renderer's theme
+//! from the configured one and the overrides (`with_overrides`), at most
+//! once per frame and outside the terminal lock, so a flood of colour sets
+//! costs one rebuild per drawn frame. A re-theme keeps the overrides.
 
 use std::time::{Duration, Instant};
 
@@ -47,7 +60,7 @@ use tessera_render::{
     CursorShape, CursorState, Fonts, FrameInput, Gpu, RenderSurface, Renderer, Rgba, Shaper,
     SurfaceOptions, Theme, sanitize_font_size, sanitize_scale,
 };
-use tessera_term::{CursorStyle, Terminal};
+use tessera_term::{ColorOverrides, CursorStyle, Rgb, Terminal, ThemeColors};
 
 use crate::selection::Decorations;
 
@@ -194,6 +207,48 @@ pub fn theme_for(config: &Config, theme: &tessera_config::Theme) -> Theme {
             .map_or(defaults.search_match_current, rgba),
         ansi: theme.ansi.map(rgba),
         ..defaults
+    }
+}
+
+/// The colours a terminal falls back to while its program has set none
+/// (OSC 4, 10, 11, 12; [`Terminal::set_theme_colors`]): `theme`'s
+/// foreground, background and cursor and its 16 ANSI colours as sRGB
+/// bytes (alpha and `appearance.opacity` are the renderer's business),
+/// and entries 16 to 255 as the renderer computes them
+/// ([`tessera_render::indexed_srgb`]). So a query reports what a cell in
+/// that colour is drawn with.
+#[must_use]
+pub fn theme_colors_for(theme: &tessera_config::Theme) -> ThemeColors {
+    let rgb = |c: tessera_config::Color| Rgb::new(c.r, c.g, c.b);
+    ThemeColors {
+        fg: rgb(theme.foreground),
+        bg: rgb(theme.background),
+        cursor: rgb(theme.cursor),
+        palette: std::array::from_fn(|i| {
+            let i = u8::try_from(i).unwrap_or(u8::MAX);
+            match tessera_render::indexed_srgb(i) {
+                Some([r, g, b]) => Rgb::new(r, g, b),
+                None => rgb(theme.ansi[usize::from(i)]),
+            }
+        }),
+    }
+}
+
+/// `theme` with a program's colours (`overrides`) in place of its own:
+/// the foreground, background and cursor keep `theme`'s alpha (so an
+/// OSC 11 background is as translucent as `appearance.opacity` makes the
+/// theme's, D-BG-ALPHA), and palette entries become
+/// [`Theme::indexed_overrides`].
+#[must_use]
+pub(crate) fn with_overrides(theme: &Theme, overrides: &ColorOverrides) -> Theme {
+    let srgb = |c: Rgb| Rgba::from_srgb8(c.r, c.g, c.b);
+    let keep = |base: Rgba, over: Option<Rgb>| over.map_or(base, |c| srgb(c).with_alpha(base.a));
+    Theme {
+        foreground: keep(theme.foreground, overrides.fg),
+        background: keep(theme.background, overrides.bg),
+        cursor: keep(theme.cursor, overrides.cursor),
+        indexed_overrides: overrides.palette.map(|c| c.map(srgb)),
+        ..theme.clone()
     }
 }
 
@@ -347,6 +402,13 @@ pub(crate) struct View {
     gpu: Gpu,
     target: Target,
     renderer: Renderer,
+    /// The configured theme ([`Self::set_appearance`]), before the
+    /// program's colours: what the renderer's theme is rebuilt from.
+    base: Theme,
+    /// Rebuilds of the renderer's theme for the program's colours, for
+    /// tests.
+    #[cfg(test)]
+    colors_applied: usize,
     font_size_pt: f32,
     snapshot: Snapshot,
     /// Rows that changed since the last frame the renderer drew.
@@ -411,11 +473,14 @@ impl View {
     ) -> Result<Self, RenderError> {
         let font_size_pt = sanitize_font_size(theme.font_size);
         let shaper = Shaper::with_fonts(fonts, font_size_pt, target.scale());
-        let renderer = Renderer::new(&gpu, theme, shaper)?;
+        let renderer = Renderer::new(&gpu, theme.clone(), shaper)?;
         Ok(Self {
             gpu,
             target,
             renderer,
+            base: theme,
+            #[cfg(test)]
+            colors_applied: 0,
             font_size_pt,
             snapshot: Snapshot::default(),
             pending: DamageRows::All,
@@ -507,7 +572,22 @@ impl View {
     /// even when this runs on another one. An opaque swapchain ignores
     /// alpha and would show the background's premultiplied colour (each
     /// channel times alpha, so darker) as an opaque colour.
+    ///
+    /// The program's colours (OSC 4, 10, 11, 12) stay on top of the new
+    /// theme (D-THEME-KEEP).
     pub(crate) fn set_appearance(&mut self, theme: Theme) {
+        self.base = theme;
+        // The generation does not move for a program colour equal to the
+        // old theme's, so the copy may lack it: the next capture compares
+        // the override table again (critic B1).
+        self.snapshot.colors_generation = None;
+        self.apply_colors();
+    }
+
+    /// Gives the renderer the configured theme with the program's colours
+    /// of the last capture on top, and the surface its compositing mode.
+    fn apply_colors(&mut self) {
+        let theme = with_overrides(&self.base, self.snapshot.colors());
         self.target.request_transparent(is_translucent(&theme));
         self.renderer.set_theme(theme);
     }
@@ -548,7 +628,8 @@ impl View {
         }
     }
 
-    /// The theme the renderer draws with.
+    /// The theme the renderer draws with: the configured one with the
+    /// program's colours of the last frame.
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn theme(&self) -> &Theme {
         self.renderer.theme()
@@ -601,6 +682,15 @@ impl View {
         focused: bool,
         now: impl FnOnce() -> Instant,
     ) -> Result<FrameStatus, RenderError> {
+        if self.snapshot.take_colors_changed() {
+            // At most once per frame, whatever number of colour changes
+            // the captures since the last one saw.
+            self.apply_colors();
+            #[cfg(test)]
+            {
+                self.colors_applied += 1;
+            }
+        }
         let shown = Shown {
             cursor: self.snapshot.shown_cursor(),
             focused,
@@ -704,6 +794,14 @@ pub(crate) struct Snapshot {
     cursor_shape: CursorShape,
     /// The grid generation of the last capture; `None` before the first.
     generation: Option<u64>,
+    /// The terminal's colour generation ([`Terminal::colors_generation`])
+    /// at the last capture; `None` before the first.
+    colors_generation: Option<u64>,
+    /// The program's colours ([`Terminal::color_overrides`]), copied when
+    /// the colour generation moved.
+    colors: ColorOverrides,
+    /// `colors` changed since [`Self::take_colors_changed`] last said so.
+    colors_changed: bool,
     /// The history lines the rows hold while the view is scrolled back;
     /// `None` while they are the live screen.
     scrolled: Option<ScrolledAt>,
@@ -736,6 +834,10 @@ impl Snapshot {
     ///
     /// [`Modes::cursor_visible`]: tessera_term::Modes::cursor_visible
     pub(crate) fn capture(&mut self, term: &Terminal, offset: usize) -> DamageRows {
+        let colors = term.colors_generation();
+        if self.colors_generation != Some(colors) {
+            self.capture_colors(term, colors);
+        }
         let hidden = !term.modes().cursor_visible;
         let shape = render_shape(term.cursor_style().shape);
         let grid = term.grid();
@@ -760,6 +862,29 @@ impl Snapshot {
         self.cursor_hidden = hidden;
         self.cursor_shape = shape;
         changed.with_row(self.cursor.row)
+    }
+
+    /// Copies `term`'s colour overrides, at colour generation
+    /// `generation`. Kept out of line: it runs only when the colours
+    /// changed, and [`Self::capture`] runs every frame.
+    #[cold]
+    #[inline(never)]
+    fn capture_colors(&mut self, term: &Terminal, generation: u64) {
+        self.colors_generation = Some(generation);
+        if self.colors != *term.color_overrides() {
+            self.colors.clone_from(term.color_overrides());
+            self.colors_changed = true;
+        }
+    }
+
+    /// The program's colours at the last capture.
+    pub(crate) fn colors(&self) -> &ColorOverrides {
+        &self.colors
+    }
+
+    /// Whether the program's colours changed since the last call.
+    pub(crate) fn take_colors_changed(&mut self) -> bool {
+        std::mem::take(&mut self.colors_changed)
     }
 
     /// Brings the snapshot up to date with `grid`'s logical lines from
@@ -2029,6 +2154,259 @@ mod tests {
         assert!(
             view.read_back() == fresh.read_back(),
             "every row in the new theme"
+        );
+    }
+
+    // ------------------------------------------------- program colours (#10)
+
+    /// The default configuration theme's colours are the terminal's own
+    /// default, so a session on it reports what it draws.
+    #[test]
+    fn the_default_theme_colours_are_the_terminals_default() {
+        assert_eq!(
+            theme_colors_for(&tessera_config::Theme::default()),
+            ThemeColors::default()
+        );
+        let dracula = tessera_config::Theme::bundled("dracula").expect("bundled");
+        let colours = theme_colors_for(dracula);
+        let byte = |c: tessera_config::Color| Rgb::new(c.r, c.g, c.b);
+        assert_eq!(colours.bg, byte(dracula.background));
+        assert_eq!(colours.palette[9], byte(dracula.ansi[9]));
+        assert_eq!(colours.palette[196], Rgb::new(0xff, 0, 0));
+    }
+
+    /// Overrides replace the colours they name; the background and the
+    /// cursor keep the theme's alpha (D-BG-ALPHA), palette entries become
+    /// the theme's indexed overrides.
+    #[test]
+    fn overrides_replace_their_colours_and_keep_the_alpha() {
+        let base = Theme {
+            background: Rgba::from_srgb8(1, 2, 3).with_alpha(0.5),
+            cursor: Rgba::from_srgb8(4, 5, 6).with_alpha(0.75),
+            ..Theme::default()
+        };
+        assert_eq!(with_overrides(&base, &ColorOverrides::NONE), base);
+        let mut overrides = ColorOverrides::NONE;
+        overrides.bg = Some(Rgb::new(0xff, 0, 0));
+        overrides.cursor = Some(Rgb::new(0, 0xff, 0));
+        overrides.palette[1] = Some(Rgb::new(0, 0, 0xff));
+        let theme = with_overrides(&base, &overrides);
+        assert_eq!(
+            theme.background,
+            Rgba::from_srgb8(0xff, 0, 0).with_alpha(0.5)
+        );
+        assert_eq!(theme.cursor, Rgba::from_srgb8(0, 0xff, 0).with_alpha(0.75));
+        assert_eq!(theme.foreground, base.foreground);
+        assert_eq!(
+            theme.indexed_overrides[1],
+            Some(Rgba::from_srgb8(0, 0, 0xff))
+        );
+        assert_eq!(theme.indexed_overrides[2], None);
+        assert_eq!(theme.ansi, base.ansi);
+    }
+
+    /// A capture copies the program's colours only when the terminal's
+    /// colour generation moved and they differ: a set to the same colour
+    /// and a theme change under no override say nothing changed.
+    #[test]
+    fn captures_follow_the_colour_generation() {
+        let mut term = Terminal::new(2, 4);
+        let mut snapshot = Snapshot::default();
+        snapshot.capture(&term, 0);
+        assert!(!snapshot.take_colors_changed(), "nothing set yet");
+        term.advance(b"\x1b]11;#ff0000\x07");
+        snapshot.capture(&term, 0);
+        assert!(snapshot.take_colors_changed());
+        assert_eq!(snapshot.colors().bg, Some(Rgb::new(0xff, 0, 0)));
+        assert!(!snapshot.take_colors_changed(), "taken");
+        term.advance(b"\x1b]11;#ff0000\x07");
+        snapshot.capture(&term, 0);
+        assert!(!snapshot.take_colors_changed(), "the same colour");
+        term.set_theme_colors(ThemeColors {
+            fg: Rgb::new(1, 1, 1),
+            ..ThemeColors::default()
+        });
+        snapshot.capture(&term, 0);
+        assert!(!snapshot.take_colors_changed(), "the theme is the view's");
+        term.advance(b"\x1b]111\x07");
+        snapshot.capture(&term, 0);
+        assert!(snapshot.take_colors_changed());
+        assert!(snapshot.colors().is_empty());
+    }
+
+    /// The colour of the top left pixel of `view`'s last frame (padding,
+    /// so the default background).
+    fn corner(view: &View) -> [u8; 4] {
+        let image = view.read_back();
+        [image[0], image[1], image[2], image[3]]
+    }
+
+    /// The brief's offscreen check: `OSC 11 ; #ff0000` turns the
+    /// background red, `OSC 111` restores the theme's, a theme edit made
+    /// while it is overridden keeps the red, and a reset then lands on the
+    /// new theme. Each change is one rebuild of the renderer's theme, drawn
+    /// without any damage of its own.
+    #[test]
+    fn osc_11_and_111_recolour_the_background() {
+        let Some(mut view) = offscreen_view(3, 10) else {
+            return;
+        };
+        let mut term = Terminal::new(3, 10);
+        let frame = |view: &mut View, term: &mut Terminal, bytes: &[u8]| {
+            term.advance(bytes);
+            next_frame();
+            view.capture(term, 0);
+            assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+            corner(view)
+        };
+        assert_eq!(
+            frame(&mut view, &mut term, b""),
+            [0, 0, 0, 255],
+            "the theme"
+        );
+        let red = [255, 0, 0, 255];
+        assert_eq!(frame(&mut view, &mut term, b"\x1b]11;#ff0000\x07"), red);
+        assert_eq!(frame(&mut view, &mut term, b"\x1b]111\x07"), [0, 0, 0, 255]);
+        assert_eq!(frame(&mut view, &mut term, b"\x1b]11;#ff0000\x07"), red);
+        view.set_appearance(Theme {
+            background: Rgba::from_srgb8(0, 0, 0xff),
+            ..Theme::default()
+        });
+        assert_eq!(
+            frame(&mut view, &mut term, b""),
+            red,
+            "the program's colour stays"
+        );
+        assert_eq!(
+            frame(&mut view, &mut term, b"\x1b]111\x07"),
+            [0, 0, 255, 255],
+            "the new theme's"
+        );
+        assert_eq!(view.colors_applied, 4, "one rebuild per change");
+    }
+
+    /// How many pixels of `image` are exactly `rgba`.
+    fn count_pixels(image: &[u8], rgba: [u8; 4]) -> usize {
+        image
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|px| **px == rgba)
+            .count()
+    }
+
+    /// The brief's offscreen check: `OSC 4 ; 1 ; #00ff00` turns SGR 31
+    /// text green (a full block, drawn without antialiasing), where the
+    /// theme's palette entry 1 (`#cd0000`) is drawn without it.
+    #[test]
+    fn osc_4_recolours_sgr_31_text() {
+        let Some(mut view) = offscreen_view(1, 4) else {
+            return;
+        };
+        let mut term = Terminal::new(1, 4);
+        term.advance("\x1b[31m\u{2588}".as_bytes());
+        view.capture(&term, 0);
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+        let image = view.read_back();
+        let (theme_red, green) = ([0xcd, 0, 0, 255], [0, 255, 0, 255]);
+        assert!(count_pixels(&image, theme_red) > 0, "the theme's colour 1");
+        assert_eq!(count_pixels(&image, green), 0);
+        term.advance(b"\x1b]4;1;#00ff00\x07");
+        next_frame();
+        view.capture(&term, 0);
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+        let image = view.read_back();
+        assert!(count_pixels(&image, green) > 0, "the program's colour 1");
+        assert_eq!(count_pixels(&image, theme_red), 0);
+    }
+
+    /// D-THEME-KEEP when the program's colour equals the theme's: `OSC 4 ;
+    /// 1 ; #cd0000` (theme colour 1 already) moves no colour generation,
+    /// yet after a re-theme to `#00ff00` the program's colour still shows
+    /// (critic B1: the view's copy of the overrides was keyed on the
+    /// generation alone).
+    #[test]
+    fn a_program_colour_equal_to_the_theme_survives_a_re_theme() {
+        let Some(mut view) = offscreen_view(1, 4) else {
+            return;
+        };
+        let mut term = Terminal::new(1, 4);
+        let frame = |view: &mut View, term: &mut Terminal, bytes: &[u8]| {
+            term.advance(bytes);
+            next_frame();
+            view.capture(term, 0);
+            assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+            view.read_back()
+        };
+        let program = [0xcd, 0, 0, 255];
+        let image = frame(&mut view, &mut term, "\x1b[31m\u{2588}".as_bytes());
+        assert!(count_pixels(&image, program) > 0);
+        let generation = term.colors_generation();
+        term.advance(b"\x1b]4;1;#cd0000\x07");
+        assert_eq!(term.colors_generation(), generation, "no effective change");
+        next_frame();
+        view.capture(&term, 0);
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Skipped);
+        let green = Rgba::from_srgb8(0, 0xff, 0);
+        let mut ansi = Theme::default().ansi;
+        ansi[1] = green;
+        view.set_appearance(Theme {
+            ansi,
+            ..Theme::default()
+        });
+        let mut colours = ThemeColors::default();
+        colours.palette[1] = Rgb::new(0, 0xff, 0);
+        term.set_theme_colors(colours);
+        let image = frame(&mut view, &mut term, b"");
+        assert_eq!(
+            count_pixels(&image, [0, 255, 0, 255]),
+            0,
+            "the new theme's 1"
+        );
+        assert!(count_pixels(&image, program) > 0, "the program's colour 1");
+        assert_eq!(
+            view.theme().indexed_overrides[1],
+            Some(Rgba::from_srgb8(0xcd, 0, 0))
+        );
+    }
+
+    /// S5 and the brief's flood: a million `OSC 4 ; 1` sets with varying
+    /// colours between frames keep the terminal's and the view's colour
+    /// state the same size and rebuild the renderer's theme at most once
+    /// per frame, the last colour set winning.
+    #[test]
+    fn a_flood_of_colour_sets_rebuilds_the_theme_once_per_frame() {
+        let Some(mut view) = offscreen_view(1, 4) else {
+            return;
+        };
+        let mut term = Terminal::new(1, 4);
+        let frames = 10;
+        let per_frame = 100_000u32;
+        let mut last = Rgb::default();
+        for frame in 0..frames {
+            let mut bytes = Vec::new();
+            for i in 0..per_frame {
+                let [_, r, g, b] = (frame * per_frame + i).to_be_bytes();
+                last = Rgb::new(r, g, b);
+                bytes.extend_from_slice(format!("\x1b]4;1;#{r:02x}{g:02x}{b:02x}\x07").as_bytes());
+            }
+            term.advance(&bytes);
+            assert_eq!(term.take_requests(), []);
+            view.capture(&term, 0);
+            assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+            next_frame();
+        }
+        assert!(
+            view.colors_applied <= frames as usize,
+            "{} rebuilds",
+            view.colors_applied
+        );
+        assert_eq!(term.color_overrides().palette[1], Some(last));
+        let srgb = Rgba::from_srgb8(last.r, last.g, last.b);
+        assert_eq!(view.theme().indexed_overrides[1], Some(srgb));
+        assert_eq!(
+            std::mem::size_of::<ColorOverrides>(),
+            4 * tessera_term::MAX_COLOR_OVERRIDES
         );
     }
 
