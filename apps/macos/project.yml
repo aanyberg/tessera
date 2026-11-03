@@ -25,7 +25,12 @@ targets:
     platform: macOS
     sources:
       - path: Sources/Tessera
-      # App icon; regenerate with Icon/render.sh.
+      # App icon: the Icon Composer document (Xcode 26+) and its PNG fallback
+      # for Xcode 16, both named AppIcon; regenerate with Icon/render.sh.
+      # Xcode 16 does not know the .icon type and copies it as a plain folder.
+      - path: Resources/AppIcon.icon
+        type: file
+        buildPhase: resources
       - path: Resources/Assets.xcassets
     info:
       path: Resources/Info.plist
