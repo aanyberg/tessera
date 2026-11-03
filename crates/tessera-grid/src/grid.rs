@@ -3907,10 +3907,6 @@ mod tests {
         use proptest::prelude::*;
 
         proptest! {
-            /// The rotation fast path of a one-row margin scroll leaves exactly
-            /// what the reference copy does: cells, wide pairs, wrap flags and
-            /// marks, for any margins (the inside wider than the outside)
-            /// and region.
             /// The dispatcher (which picks the rotation for one row when
             /// the inside is wider and no row holds cluster text) leaves
             /// what the copy does, clusters included.
@@ -3940,6 +3936,10 @@ mod tests {
                 grid.check_invariants();
             }
 
+            /// The rotation fast path of a one-row margin scroll leaves exactly
+            /// what the reference copy does: cells, wide pairs, wrap flags and
+            /// marks, for any margins (the inside wider than the outside)
+            /// and region.
             #[test]
             fn rect_scroll_by_rotation_matches_the_copy(
                 text in prop::collection::vec(
@@ -3948,7 +3948,15 @@ mod tests {
                 ),
                 wrapped in prop::collection::vec(any::<bool>(), 6),
                 marked in prop::collection::vec(any::<bool>(), 6),
-                (left, right) in (0u16..9).prop_flat_map(|l| (Just(l), l + 1..10)),
+                // The rotation path's preconditions hold by construction:
+                // the inside wider than the outside (`10 - len < len`, so
+                // `len` in 6..=10) and no cluster text (else the copy runs).
+                // `left` in `0..=10 - len` and `right = left + len - 1` give
+                // exactly the (left, right) pairs of the old
+                // `l in 0..9, r in l + 1..10` draw that its
+                // `prop_assume!(10 - len < len)` accepted, without the
+                // rejections that exhausted proptest's global reject budget.
+                (left, len) in (6u16..=10).prop_flat_map(|len| (0..=10 - len, Just(len))),
                 (top, bottom) in (0usize..6).prop_flat_map(|t| (Just(t), t..6)),
                 up in any::<bool>(),
             ) {
@@ -3962,11 +3970,9 @@ mod tests {
                         grid.lines[row].set_mark(Mark::PromptStart);
                     }
                 }
-                grid.set_margins(left, right);
+                grid.set_margins(left, left + len - 1);
                 let span = usize::from(grid.margins.left)..usize::from(grid.margins.right) + 1;
-                // The rotation path's preconditions: the inside wider than
-                // the outside, no cluster text (else the copy runs).
-                prop_assume!(10 - span.len() < span.len());
+                prop_assert_eq!(span.clone(), usize::from(left)..usize::from(left + len));
                 for line in &mut grid.lines {
                     line.split_wide_at_edges(span.clone(), Style::DEFAULT);
                 }
