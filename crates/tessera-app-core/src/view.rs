@@ -1524,8 +1524,8 @@ mod tests {
     /// A5: the pixels of the cursor's cell after DECSCUSR 5, 4 and 2, on a
     /// red background with a green cursor. The beam is a column band at
     /// the cell's left edge and the underline a row band at its bottom,
-    /// each the renderer's one stroke wide (measured, and the two must
-    /// agree: the stroke is not public); the block fills the cell. The
+    /// each the renderer's stroke wide (one pixel at this 1x view, read
+    /// from `Renderer::cursor_stroke_px`); the block fills the cell. The
     /// cell to the right stays background.
     #[test]
     fn the_cursor_cell_shows_the_shape() {
@@ -1544,6 +1544,8 @@ mod tests {
             usize::try_from(metrics.width_px).expect("cell width"),
             usize::try_from(metrics.height_px).expect("cell height"),
         );
+        let stroke = usize::try_from(view.renderer().cursor_stroke_px()).expect("stroke");
+        assert_eq!(stroke, 1, "one pixel per point of backing scale at 1x");
         let mut term = Terminal::new(2, 4);
         let mut draw = |seq: &[u8]| {
             next_frame();
@@ -1572,8 +1574,6 @@ mod tests {
             cell(0)
         };
         let beam = draw(b"\x1b[5 q");
-        let stroke = beam[0].iter().take_while(|g| **g).count();
-        assert!((1..cw / 2).contains(&stroke), "beam {stroke} px of {cw}");
         for row in &beam {
             let expect: Vec<bool> = (0..cw).map(|x| x < stroke).collect();
             assert_eq!(*row, expect, "beam: left {stroke} columns only");

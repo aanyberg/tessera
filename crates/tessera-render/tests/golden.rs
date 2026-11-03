@@ -944,6 +944,114 @@ fn rows_and_columns_past_the_target_are_clipped() {
     );
 }
 
+/// #124: a linear selection's inner rows, a block selection and overlays
+/// to `u16::MAX` stop at the grid's last column. In a target with padding
+/// and pixels left over after the last column (where one more column
+/// starts), the right margin of every fully covered row stays the
+/// background, exactly like the left margin, also on a row shorter than the
+/// grid, which is highlighted to the grid's edge.
+#[test]
+fn highlights_stop_at_the_grids_last_column() {
+    const GRID: u32 = 6;
+    let Some(gpu) = gpu() else { return };
+    let (bg, mark) = ([255, 0, 0], [0, 0, 255]);
+    let color = |c: [u8; 3]| Rgba::from_srgb8(c[0], c[1], c[2]);
+    let theme = Theme {
+        background: color(bg),
+        selection: color(mark),
+        search_match: color(mark),
+        search_match_current: color(mark),
+        ..Theme::default()
+    };
+    let mut renderer = renderer(&gpu, theme);
+    let metrics = renderer.cell_metrics();
+    let pad = (renderer.theme().padding * renderer.shaper().scale()).round() as u32;
+    assert!(pad > 0, "the default theme has padding");
+    let grid = target_size(&renderer, GRID as usize, 3);
+    let size = PhysicalSize::new(grid.width + 5, grid.height);
+    let full = vec![Cell::BLANK; GRID as usize];
+    let short = vec![Cell::BLANK; 3];
+    let rows: [&[Cell]; 3] = [&full, &short, &full];
+    let last = u16::MAX;
+    let linear = Selection::linear(Point::new(0, 0), Point::new(2, GRID as u16 - 1));
+    let block = Selection::block(Point::new(0, 0), Point::new(2, last));
+    let matches: Vec<Overlay> = (0..3)
+        .map(|r| Overlay::new(OverlayKind::Match, r, 0..last))
+        .collect();
+    let current: Vec<Overlay> = (0..3)
+        .map(|r| Overlay::new(OverlayKind::CurrentMatch, r, 2..last))
+        .collect();
+    let cases: [(&str, Option<Selection>, &[Overlay], u32); 4] = [
+        ("linear selection", Some(linear), &[], 0),
+        ("block selection", Some(block), &[], 0),
+        ("matches", None, &matches, 0),
+        ("current matches", None, &current, 2),
+    ];
+    for (name, selection, overlays, first) in cases {
+        let frame = FrameInput::new(&rows)
+            .with_selection(selection)
+            .with_overlays(overlays);
+        let image = render(&gpu, &mut renderer, size, &frame);
+        for row in 0..3 {
+            let y = pad + row * metrics.height_px + metrics.height_px / 2;
+            let got: Vec<[u8; 3]> = (0..size.width)
+                .map(|x| {
+                    let p = pixel(&image, size, x, y);
+                    [p[0], p[1], p[2]]
+                })
+                .collect();
+            let cells = pad + first * metrics.width_px..pad + GRID * metrics.width_px;
+            let want: Vec<[u8; 3]> = (0..size.width)
+                .map(|x| if cells.contains(&x) { mark } else { bg })
+                .collect();
+            assert_eq!(
+                got, want,
+                "{name}, row {row}: highlighted over the grid's columns only"
+            );
+        }
+    }
+}
+
+/// A block cursor on the spacer of a wide character that the target's
+/// right edge cuts (the spacer's column is past the target, a transient
+/// while resizing) draws the character's visible half, like a cursor on
+/// its wide half; a cursor further right draws nothing.
+#[test]
+fn a_block_cursor_on_a_cut_wide_characters_spacer_draws_the_visible_half() {
+    let Some(gpu) = gpu() else { return };
+    let mut renderer = renderer(&gpu, Theme::default());
+    let mut row = styled("abcW  ", Style::DEFAULT);
+    row[3] = Cell {
+        flags: CellFlags::WIDE,
+        ..Cell::new('W', Style::DEFAULT)
+    };
+    row[4] = Cell {
+        flags: CellFlags::SPACER,
+        ..Cell::BLANK
+    };
+    let rows: [&[Cell]; 1] = [&row];
+    // Three whole columns; the fourth, the wide character, starts in the
+    // padding and its spacer's column is past the target.
+    let size = target_size(&renderer, 3, 1);
+    let mut draw = |col: Option<u16>| {
+        let cursor = col.map(|c| CursorState::new(0, c, CursorShape::Block));
+        render(
+            &gpu,
+            &mut renderer,
+            size,
+            &FrameInput::new(&rows).with_cursor(cursor),
+        )
+    };
+    let none = draw(None);
+    let wide = draw(Some(3));
+    assert_ne!(
+        wide, none,
+        "a cursor on the wide half draws its visible half"
+    );
+    assert_eq!(draw(Some(4)), wide, "and so does one on the spacer");
+    assert_eq!(draw(Some(5)), none, "past the spacer nothing is drawn");
+}
+
 /// Renders one row of `cells` and returns the target size and image.
 fn render_cells(
     gpu: &Gpu,

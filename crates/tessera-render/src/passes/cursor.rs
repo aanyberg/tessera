@@ -18,9 +18,10 @@
 //! - [`CursorShape::HollowBlock`] (and every shape while unfocused): the
 //!   cell's outline, `stroke` pixels wide.
 //!
-//! On either half of a wide character the cursor covers both columns. A
-//! cursor that is absent, not visible, or outside the target draws
-//! nothing.
+//! On either half of a wide character the cursor covers both columns, or
+//! the one in the target when the target's edge cuts the character (also
+//! for a cursor on the spacer past the edge). A cursor that is absent, not
+//! visible, or otherwise outside the target draws nothing.
 
 use tessera_grid::{Cell, Style};
 
@@ -80,11 +81,17 @@ pub(crate) fn push<'g>(
     };
     let (row, col) = (usize::from(cursor.row), usize::from(cursor.col));
     let cols = layout.visible_cols();
-    if row >= layout.visible_rows() || col >= cols {
+    if row >= layout.visible_rows() {
         return Ok(());
     }
     let cells = frame.rows.get(row).copied().unwrap_or_default();
+    // A cursor on the spacer of a wide character cut by the target's edge
+    // (its spacer's column is past the target, a transient while
+    // resizing) covers the visible half.
     let (first, count) = cursor_cells(cells, col, cols);
+    if first >= cols {
+        return Ok(());
+    }
     let rect @ [x, y, w, h] = layout.cells_rect(row, first, count);
     out.extend(
         shape_rects(rect, f32_from(layout.stroke), shape).map(|r| Instance::solid(r, color)),
@@ -199,6 +206,11 @@ mod tests {
         assert_eq!(cursor_cells(&row, 3, 4), (3, 1));
         assert_eq!(cursor_cells(&row, 9, 4), (9, 1), "past the row");
         assert_eq!(cursor_cells(&row, 1, 2), (1, 1), "spacer past the edge");
+        assert_eq!(
+            cursor_cells(&row, 2, 2),
+            (1, 1),
+            "on a spacer past the edge: the visible half"
+        );
         // A stray spacer with no wide cell before it stays one column.
         let mut stray = row.clone();
         stray[1] = Cell::BLANK;

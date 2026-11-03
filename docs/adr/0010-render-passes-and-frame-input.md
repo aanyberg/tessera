@@ -2,7 +2,9 @@
 
 **Status:** accepted · 2026-10-27 · amended 2026-10-29 (#22: overlay
 pass, selection and overlays, underline styles, overline, superscript and
-subscript, cursor redraw rules; see "Amendment: #22" at the end)
+subscript, cursor redraw rules; see "Amendment: #22" at the end) ·
+amended 2026-11-03 (#124: highlights stop at the grid's last column, a
+cursor on a cut wide character's spacer; see "Amendment: #124")
 
 ## Context
 
@@ -305,13 +307,15 @@ pub struct Overlay { pub kind: OverlayKind, pub row: u16, pub cols: Range<u16> }
 ```
 
 - **Linear**: from the earlier point's cell to the end of its row, every
-  row in between whole (over all visible columns, also past a short
-  row's last cell), and the last row up to the later point's cell,
-  inclusive. Wrapped rows are just consecutive rows; the renderer needs no
+  row in between whole (over all grid columns, also past a short row's
+  last cell; never into the padding), and the last row up to the later
+  point's cell, inclusive. The grid's columns are the frame's longest
+  row, at most the visible columns (#124). Wrapped rows are just consecutive rows; the renderer needs no
   wrap flags. **Block**: columns `min..=max` on rows `min..=max`.
 - A span (selection or overlay) that starts on the spacer of a wide
   character, or ends on its wide half, is widened to the whole character.
-  Anything outside the frame is clipped; nothing panics on `u16::MAX`.
+  Anything outside the frame (past the grid's last column) is clipped;
+  nothing panics on `u16::MAX`.
 - `Match` and `CurrentMatch` fill their cells with `Theme::search_match`
   (`#ffd866`, alpha 0.6) and `Theme::search_match_current` (`#ff9f43`,
   alpha 0.8); theme files may set both. `Underline` is a bar one point
@@ -423,23 +427,9 @@ overlay damage was rejected: it would duplicate the state, and #30
 
 ### Known limits
 
-- **Highlights reach the right edge of the window, not the left.**
-  `Layout::visible_cols` counts every column that starts inside the
-  target, including one that starts in the right padding or in pixels
-  left over after the last whole column. A selection's inner rows, a
-  block selection and an overlay up to `u16::MAX` cover all visible
-  columns, so they paint over the right margin out to the window edge,
-  while the left margin stays the background. In `selection_linear.png`
-  (24 columns of 16 px, 8 px padding, a 400 px target) the inner row's
-  highlight ends at x = 400, not at the grid's right edge, 392. This is
-  kept: Terminal.app does the same, and the rule "over all visible
-  columns" above says so. Symmetric margins are a follow-up issue.
-- **A cursor on a cut wide character's spacer draws nothing.** When a wide
-  character starts in the last visible column and its spacer's column is
-  past the target (a transient during a resize), a cursor reported on the
-  spacer is outside the visible columns and is not drawn; a cursor on the
-  wide half draws one column. Found by the adversarial run of #22; not
-  fixed after that run, by decision.
+- ~~Highlights reach the right edge of the window, not the left.~~ and
+  ~~A cursor on a cut wide character's spacer draws nothing.~~ Both
+  resolved by #124, see "Amendment: #124".
 
 ### Measurements
 
@@ -481,3 +471,78 @@ cell of rows without any decoration. It now skips such rows after one
 scan. Review round 1 briefly brought it back to 1.04: splitting `prepare` in
 two (to hand a reused vector back) changed what the compiler inlined; the
 reused vector now lives in the renderer instead.
+
+## Amendment: #124 (2026-11-03)
+
+### Highlights stop at the grid's last column
+
+`Layout::visible_cols` counts every column that starts inside the
+target, including one that starts in the right padding or in the pixels
+left over after the last whole column. Until #124 a selection's inner
+rows, a block selection and an overlay to `u16::MAX` covered all visible
+columns, so they painted over the right margin out to the window's edge
+while the left margin stayed the background. Now that selection ships
+(#30) that asymmetry is visible, so highlights stop at the **grid's**
+last column instead: the overlay pass clips every span to the frame's
+longest row (at most the visible columns). The frame carries no grid
+width, and app-core hands every row at the grid's width, so the longest
+row is the grid width; a short row in an otherwise full frame is still
+highlighted to the grid's edge. Both paddings, and the leftover pixels,
+stay the theme background. This is what iTerm2 does on the primary screen
+(selection per cell, margins in the profile background; #30 research).
+Cell backgrounds (SGR) are unchanged: they only ever covered cells.
+
+`selection_linear.png` changed in 480 pixels: x = 392 to 399 on rows 0
+and 1 (y = 8 to 67), the right padding beside the first row's tail and
+the wrapped middle row, which were the selection colour and are now the
+background. No other golden changed. `highlights_stop_at_the_grids_last_column`
+(golden.rs) checks every pixel of a row across the target for linear and
+block selections and both match kinds, with padding and 5 leftover
+pixels.
+
+### A cursor on a cut wide character's spacer
+
+When a wide character starts in the last visible column and its spacer's
+column is past the target (a transient during a resize), a cursor
+reported on the spacer now draws the visible half, exactly like a cursor
+on the wide half (one column); a cursor further right still draws
+nothing.
+
+### A test accessor for the stroke
+
+`Renderer::cursor_stroke_px` (`#[doc(hidden)]`, not a stable API) returns
+the stroke the cursor pass draws with (one pixel per point of backing
+scale, at least one), so app-core's cursor pixel test reads it instead of
+measuring it (#168 item 6).
+
+### Measurements (#124)
+
+`cargo xtask ab` against main (`e7004b4`), instructions retired, best of
+7 interleaved process pairs, Apple M4, load average 7 to 45. Full frames
+(`DamageRows::All`, GPU waited for after each) of a 60x200 screen filled
+with the corpus line, Menlo 13 pt at 2x, in a target with the padding and
+5 leftover pixels, so one more column starts in the right margin; per
+frame is the difference of 30 and 90 frames (100 and 300 for
+`box_drawing`). "Full selection" adds a linear selection over the whole
+screen, which main draws into the margin and head does not.
+
+| line | main per frame | head/main | full selection: main per frame | head/main |
+|---|---|---|---|---|
+| ascii | 89.06e6 | 1.000 | 89.07e6 | 1.002 |
+| latin_diacritics | 88.22e6 | 0.999 | 87.90e6 | 1.002 |
+| cjk | 244.18e6 | 1.000 | 242.74e6 | 1.002 |
+| box_drawing | 12.39e6 | 0.981 | 12.12e6 | 0.999 |
+| hebrew | 87.00e6 | 1.001 | 86.87e6 | 1.001 |
+| arabic | 163.80e6 | 1.000 | 163.71e6 | 0.999 |
+| punctuation | 66.15e6 | 1.001 | 66.21e6 | 1.001 |
+| braille | 68.77e6 | 1.000 | 68.74e6 | 1.000 |
+| emoji | 175.95e6 | 1.003 | 175.91e6 | 1.003 |
+| sgr_heavy | 74.52e6 | 1.002 | 74.49e6 | 1.001 |
+| combining_heavy | 132.11e6 | 1.000 | 131.85e6 | 1.001 |
+
+The bar (1.02) holds on every line. The change costs one pass over the
+rows' lengths per frame, and only while something is highlighted.
+`box_drawing`'s 100-frame runs are below `ab bench`'s size floor, so its
+per-frame ratio is the noisiest; its 300-frame whole-process ratios are
+0.990 and 0.999.
+

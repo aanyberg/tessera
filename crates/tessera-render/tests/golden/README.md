@@ -11,7 +11,7 @@ with `Theme::default()`; the PNGs are 8-bit RGBA, sRGB-encoded.
 | `cursors.png` | block, beam and underline cursors over text, focused (first three strips) and unfocused (last three, all hollow) | font |
 | `clusters.png` | 24 × 1 cells: `e` + U+0301, a ZWJ family (two cells), a VS16 heart, a hand with a skin tone, `a` + U+0338, each drawn whole from the line's cluster text (#21) | font |
 | `geometry.png` | the same screen and strips with every character replaced by a space: backgrounds, decorations and cursors only | exact |
-| `selection_linear.png` | 24 × 3 cells, one wrapped line: a linear selection starting on the right half of a wide character (the whole character is selected), covering the whole middle row and ending on the left half of another (its right half too); selection blended over the background, text in its own colour (#22) | font |
+| `selection_linear.png` | 24 × 3 cells, one wrapped line: a linear selection starting on the right half of a wide character (the whole character is selected), covering the whole middle row and ending on the left half of another (its right half too); selection blended over the background, text in its own colour (#22), stopping at the grid's last column so the right padding stays the background like the left (#124) | font |
 | `selection_block.png` | 24 × 4 cells of mixed-width text: a block selection whose edges cut through wide characters, which are taken whole (#22) | font |
 | `overlays.png` | 24 × 3 cells: two search matches (one over an explicit background), the current match over a selection, a hovered link underlined in its own colour (#22) | font |
 | `underlines.png` | 24 × 5 cells: single, double, curly, dotted and dashed underlines, each in the foreground and in an SGR 58 colour (#22) | font |
