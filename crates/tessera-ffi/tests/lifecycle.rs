@@ -665,6 +665,17 @@ fn freeing_with_live_sessions_is_prompt_and_joins_threads() {
     }
 }
 
+/// The bar for five `tessera_session_close` calls on children that ignore
+/// `SIGHUP`: half the hang-up grace, the rule app-core's own close tests
+/// use. A close that waited for even one child would take the whole grace
+/// (1 s), so this bar still proves close does not wait, while leaving
+/// room for scheduling stalls under load that broke an absolute 5 ms bar.
+const CLOSES_RETURN_WITHIN: Duration = match tessera_app_core::session::HANGUP_GRACE.checked_div(2)
+{
+    Some(bar) => bar,
+    None => panic!("HANGUP_GRACE / 2"),
+};
+
 #[test]
 fn close_returns_at_once_and_free_waits_for_the_closing_children() {
     let recorder = Recorder::default();
@@ -690,7 +701,7 @@ fn close_returns_at_once_and_free_waits_for_the_closing_children() {
     }
     let close_took = closing.elapsed();
     assert!(
-        close_took < Duration::from_millis(5),
+        close_took < CLOSES_RETURN_WITHIN,
         "5 closes took {close_took:?}"
     );
     for &id in &stubborn {
