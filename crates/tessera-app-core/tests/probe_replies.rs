@@ -27,8 +27,11 @@
 //! waits its own timeout), `CSI 11/15/20/21 t` and `14 ; 2 t`, `CSI 14 t`
 //! and `16 t` while the session has no view (the cell size is unknown),
 //! XTGETTCAP (`DCS + q`), tmux's colour scheme query `CSI ? 996 n` (a
-//! DEC DSR outside D-DSRSET) and, until #10's colour part lands, the OSC
-//! 4/10/11/12 colour queries.
+//! DEC DSR outside D-DSRSET, D-996) and the clipboard read `OSC 52 ; ?`.
+//! The OSC 4/10/11/12 colour queries are answered (#10) and their replies
+//! matched by command, index and terminator: a query that ended with BEL
+//! must read a reply that ends with BEL, one that ended with ST a reply
+//! ending with ST.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -156,8 +159,27 @@ impl Seq {
     /// intermediates and final byte. A DCS reply also by its whole header,
     /// so the status (`1$r` / `0$r`, `!|`, `>|`) counts, and by the last
     /// payload byte (a DECRQSS reply's setting: `m`, `r`, `q`, `p`), never
-    /// by the payload itself, which depends on the terminal's state.
+    /// by the payload itself, which depends on the terminal's state. An
+    /// OSC reply by its command, the index of an `OSC 4` and its
+    /// terminator (BEL or ST), not by the colour.
     fn kind(&self) -> String {
+        if self.intro == b']' {
+            let mut pieces = self.params.split(|&b| b == b';');
+            let command = pieces.next().unwrap_or_default();
+            let index = if command == b"4" { pieces.next() } else { None };
+            let end = if self.bytes.ends_with(b"\x07") {
+                "BEL"
+            } else {
+                "ST"
+            };
+            return format!(
+                "]{}{} {end}",
+                String::from_utf8_lossy(command),
+                index
+                    .map(|i| format!(";{}", String::from_utf8_lossy(i)))
+                    .unwrap_or_default()
+            );
+        }
         let marker = self
             .params
             .first()
@@ -274,7 +296,9 @@ fn deliberate_silence(seq: &Seq) -> Option<&'static str> {
             Some("colour scheme query (theme updates, ?2031, are not implemented; D-DSRSET)")
         }
         (b'P', b'q') if seq.inters == b"+" => Some("XTGETTCAP (out of scope)"),
-        (b']', _) => Some("OSC colour or clipboard query (#10 colours, not this part)"),
+        (b']', _) if seq.params.starts_with(b"52;") => {
+            Some("clipboard read (OSC 52 is never read, ADR 0022)")
+        }
         _ => None,
     }
 }
@@ -467,6 +491,20 @@ fn dcs_replies_match_by_header_status_and_setting() {
         kind(b"\x1bP>|Tessera 0.1.0\x1b\\"),
         kind(b"\x1bP!|00000000\x1b\\")
     );
+}
+
+/// OSC replies match by command, index and terminator, not by colour.
+#[test]
+fn osc_replies_match_by_command_index_and_terminator() {
+    let kind = |bytes: &[u8]| sequences(bytes)[0].kind();
+    assert_eq!(kind(b"\x1b]11;rgb:0000/0000/0000\x07"), "]11 BEL");
+    assert_eq!(
+        kind(b"\x1b]11;rgb:0000/0000/0000\x1b\\"),
+        kind(b"\x1b]11;rgb:1010/1010/1010\x1b\\")
+    );
+    assert_ne!(kind(b"\x1b]11;x\x07"), kind(b"\x1b]11;x\x1b\\"));
+    assert_ne!(kind(b"\x1b]10;x\x07"), kind(b"\x1b]11;x\x07"));
+    assert_eq!(kind(b"\x1b]4;1;rgb:0101/fefe/5454\x07"), "]4;1 BEL");
 }
 
 #[test]

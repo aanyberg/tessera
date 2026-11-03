@@ -42,6 +42,12 @@
 //! DCS: the parser emits [`Action::DcsEnd`] and then [`Action::Execute`]
 //! for the control byte.
 //!
+//! An OSC ends with BEL, ST (`ESC \\`, then [`Action::Esc`] as for a DCS,
+//! or `0x9C` in 8-bit mode), or is aborted by `CAN`, `SUB` or an `ESC`
+//! that starts another sequence; every one dispatches what was collected
+//! as [`Action::Osc`], whose `bell_terminated` says whether BEL ended it,
+//! so a reply can end the way the query did.
+//!
 //! # 8-bit C1 controls
 //!
 //! The byte stream is UTF-8, so a C1 control (`0x80..=0x9F`) is ambiguous:
@@ -114,8 +120,19 @@ pub enum Action {
         /// than the parser keeps. The header is incomplete; drop the action.
         ignore: bool,
     },
-    /// An OSC sequence split on `;`.
-    Osc(Vec<Vec<u8>>),
+    /// An OSC sequence: its payload split on `;`, and how it ended.
+    #[non_exhaustive]
+    Osc {
+        /// The payload split on `;`, at most 16 pieces (`vte`'s
+        /// `MAX_OSC_PARAMS`; the rest is dropped).
+        params: Vec<Vec<u8>>,
+        /// `true` when BEL (`0x07`) ended the sequence. `false` for every
+        /// other end: `ESC \` (followed by [`Action::Esc`] with `byte ==
+        /// b'\\'`), the 8-bit ST `0x9C`, and the `CAN`, `SUB` or `ESC` that
+        /// aborted it. A reply to an OSC query echoes the terminator this
+        /// selects (xterm: "uses the same terminator used in a query").
+        bell_terminated: bool,
+    },
     /// An ESC sequence.
     #[non_exhaustive]
     Esc {
@@ -624,8 +641,11 @@ impl vte::Perform for Performer<'_> {
         self.check_c1();
     }
 
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        self.emit(Action::Osc(params.iter().map(|p| p.to_vec()).collect()));
+    fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
+        self.emit(Action::Osc {
+            params: params.iter().map(|p| p.to_vec()).collect(),
+            bell_terminated,
+        });
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
@@ -987,13 +1007,31 @@ mod tests {
         let out = parse(&input);
         assert_eq!(out.len(), 2);
         match &out[0] {
-            Action::Osc(params) => {
+            Action::Osc { params, .. } => {
                 assert_eq!(params.len(), 3);
                 assert_eq!(params[2].len(), PAYLOAD);
             }
             other => panic!("expected Osc, got {other:?}"),
         }
         assert_eq!(out[1], st());
+    }
+
+    /// `bell_terminated` is set by BEL only: `ESC \\`, CAN, SUB, an `ESC`
+    /// that starts another sequence and (in 8-bit mode) `0x9C` all clear
+    /// it, and the payload is dispatched in every case.
+    #[test]
+    fn osc_reports_whether_bel_ended_it() {
+        let osc = |bell_terminated| Action::Osc {
+            params: vec![b"11".to_vec(), b"?".to_vec()],
+            bell_terminated,
+        };
+        assert_eq!(parse(b"\x1b]11;?\x07"), [osc(true)]);
+        assert_eq!(parse(b"\x1b]11;?\x1b\\"), [osc(false), st()]);
+        assert_eq!(parse(b"\x1b]11;?\x18"), [osc(false), Action::Execute(0x18)]);
+        assert_eq!(parse(b"\x1b]11;?\x1a"), [osc(false), Action::Execute(0x1a)]);
+        assert_eq!(parse(b"\x1b]11;?\x1b[6n"), [osc(false), csi(&[6], 'n')]);
+        assert_eq!(parse_c1(b"\x9d11;?\x9c", true), [osc(false), st()]);
+        assert_eq!(parse_c1(b"\x9d11;?\x07", true), [osc(true)]);
     }
 
     /// Documents the 7-bit limitation on [`Action::DcsData`]: high bytes
@@ -1117,7 +1155,10 @@ mod tests {
             vec![
                 csi(&[2, 3], 'H'),
                 csi(&[4], 'H'),
-                Action::Osc(vec![b"0".to_vec(), b"t".to_vec()]),
+                Action::Osc {
+                    params: vec![b"0".to_vec(), b"t".to_vec()],
+                    bell_terminated: false,
+                },
                 st(),
                 Action::Esc {
                     intermediates: vec![],

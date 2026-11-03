@@ -835,9 +835,10 @@ impl ScrollAnchor {
 impl Session {
     /// Wraps a spawned PTY and starts the writer thread for its input and
     /// the reader thread for its events. Both wake `signal` when they end.
-    /// The terminal has `cursor` as its default cursor style and keeps at
-    /// most `scrollback` lines of history (`[terminal] scrollback_lines`)
-    /// before the reader feeds it the first byte. The reader reads
+    /// The terminal has `cursor` as its default cursor style, the theme
+    /// colours of `applied` ([`crate::view::theme_colors_for`]) and keeps
+    /// at most `scrollback` lines of history (`[terminal]
+    /// scrollback_lines`) before the reader feeds it the first byte. The reader reads
     /// `applied` for the clipboard setting in effect.
     #[expect(
         clippy::too_many_arguments,
@@ -857,6 +858,7 @@ impl Session {
         let pty = Arc::new(Mutex::new(pty));
         let mut terminal = Terminal::new(size.rows, size.cols);
         terminal.set_default_cursor_style(cursor);
+        terminal.set_theme_colors(crate::view::theme_colors_for(&lock(&applied).colours));
         terminal.set_max_scrollback(scrollback);
         let term = Arc::new(SharedTerminal::new(terminal));
         let muted = Arc::new(AtomicBool::new(false));

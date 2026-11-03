@@ -77,7 +77,8 @@
 #      title or base64 payload can never contain them. It does NOT drop DEL (0x7F) or UTF-8 C1 (U+0080..U+009F), and bytes
 #      >= 0x80 are passed through whatever their validity.
 #   4. CAN (0x18), SUB (0x1A) and ESC inside an OSC DISPATCH the OSC collected so far (vte osc_end) and then act on the
-#      byte; xterm ABORTS the string without dispatching. The terminator is not visible in Action::Osc (dropped by [VT]).
+#      byte; xterm ABORTS the string without dispatching. The terminator was not visible in Action::Osc (dropped by [VT]);
+#      since #10 Action::Osc carries bell_terminated (BEL vs anything else).
 #   5. Raw 0x9C and UTF-8 U+009C do NOT terminate an OSC in vte (they are appended), and 0x9D / U+009D does not start one.
 #   6. ST arrives as Action::Osc followed by Action::Esc{byte:'\\'}; BEL as Action::Osc only. Neither may print or ring.
 #
