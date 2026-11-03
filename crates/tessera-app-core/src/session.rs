@@ -59,11 +59,23 @@
 //! delivery lock its reader thread holds around an observer call (the
 //! barrier a close waits on). The reader thread also reads the `App`'s
 //! configuration (`Applied`) on its own, for `[terminal] clipboard_write`.
-//! No code path holds two of them at once, with one exception: a close made from inside one of the
-//! session's own observer calls holds that call's delivery lock while it
-//! takes the outbox and PTY locks (`Session::begin_close`). Nothing takes
-//! the delivery lock while holding another session lock, so this cannot
-//! form a cycle. Input handling reads what it needs from
+//! No code path holds two of them at once, with these exceptions, none of
+//! which can form a cycle:
+//!
+//! - A close made from inside one of the session's own observer calls
+//!   holds that call's delivery lock while it takes the outbox and PTY
+//!   locks (`Session::begin_close`). Nothing takes the delivery lock while
+//!   holding another session lock.
+//! - A resize, and a scroll that changes the position, take the input lock
+//!   while they hold the terminal lock (`Session::resize`,
+//!   `Session::scroll_state`), so no re-wrap falls between reading the
+//!   history and storing a position against it (#175). Nothing takes the
+//!   terminal lock while holding the input lock.
+//! - Applying a cursor default reads the `App`'s configuration
+//!   (`Applied`) under the terminal lock (`Live::apply`, `App::attach`;
+//!   #168). Nothing takes a terminal lock while holding `Applied`.
+//!
+//! Other input handling reads what it needs from
 //! the terminal (grid size, scrollback length) under the terminal lock,
 //! releases it, then takes the input lock. A value read that way can be
 //! stale by the time it is used (the reader thread may have added a
@@ -204,8 +216,9 @@ pub trait SessionObserver: Send + Sync {
     /// Handles one event of session `id`.
     fn on_session_event(&self, id: SessionId, event: SessionEvent);
 
-    /// The appearance every view draws with changed (theme, opacity or
-    /// font size, applied by [`App::apply_config`](crate::App::apply_config));
+    /// The appearance every view draws with changed (theme, opacity, font
+    /// size or default cursor style, applied by
+    /// [`App::apply_config`](crate::App::apply_config));
     /// `opaque` is whether the background is now fully opaque. The host
     /// makes its windows translucent or opaque to match and redraws its
     /// views: the core switches each surface's compositing mode at its
@@ -802,8 +815,14 @@ impl ScrollAnchor {
             return (0, true);
         }
         // A reading older than the stored one (only possible across
-        // threads) counts as no output since.
-        let pushed = usize::try_from(now.pushed.saturating_sub(self.pushed)).unwrap_or(usize::MAX);
+        // threads: another thread stored the anchor after this reading was
+        // taken) cannot tell a clear from the lines it has not seen yet:
+        // keep the offset, clamped to the history it has.
+        if now.pushed < self.pushed {
+            let offset = self.offset.min(now.len);
+            return (offset, offset != self.offset);
+        }
+        let pushed = usize::try_from(now.pushed - self.pushed).unwrap_or(usize::MAX);
         if now.len < self.len.saturating_add(pushed).min(now.cap) {
             return (0, true);
         }
@@ -816,9 +835,10 @@ impl ScrollAnchor {
 impl Session {
     /// Wraps a spawned PTY and starts the writer thread for its input and
     /// the reader thread for its events. Both wake `signal` when they end.
-    /// The terminal has `cursor` as its default cursor style before the
-    /// reader feeds it the first byte. The reader reads `applied` for the
-    /// clipboard setting in effect.
+    /// The terminal has `cursor` as its default cursor style and keeps at
+    /// most `scrollback` lines of history (`[terminal] scrollback_lines`)
+    /// before the reader feeds it the first byte. The reader reads
+    /// `applied` for the clipboard setting in effect.
     #[expect(
         clippy::too_many_arguments,
         reason = "one call site, App::attach; each argument is shared state of the App"
@@ -829,6 +849,7 @@ impl Session {
         events: PtyEvents,
         size: PtySize,
         cursor: CursorStyle,
+        scrollback: usize,
         observers: ObserverSlot,
         applied: Arc<Mutex<Applied>>,
         signal: &Arc<Signal>,
@@ -836,6 +857,7 @@ impl Session {
         let pty = Arc::new(Mutex::new(pty));
         let mut terminal = Terminal::new(size.rows, size.cols);
         terminal.set_default_cursor_style(cursor);
+        terminal.set_max_scrollback(scrollback);
         let term = Arc::new(SharedTerminal::new(terminal));
         let muted = Arc::new(AtomicBool::new(false));
         let outbox = Arc::new(Outbox::default());
@@ -957,8 +979,9 @@ impl Session {
     ///
     /// The grid is resized (and re-wrapped) first, so output the child
     /// writes in answer to `SIGWINCH` lands on a grid of the new size. The
-    /// locks (input state, terminal, input state, PTY) are taken one after
-    /// the other, never together.
+    /// terminal lock and then the input-state lock are held for the
+    /// re-wrap and the scroll position (below), and released before the
+    /// PTY lock is taken.
     ///
     /// A size [`check_size`] refuses (zero rows or columns, or larger
     /// than the largest grid a view derives) is refused with
@@ -967,20 +990,29 @@ impl Session {
     /// The view's scroll position is resolved against the history before
     /// the resize and stored again against the one after it, clamped to
     /// it: a resize re-wraps the history, so the view keeps its distance
-    /// from the live screen rather than its lines.
+    /// from the live screen rather than its lines. The position is read
+    /// and stored under the terminal lock, so a scroll from another thread
+    /// (the configuration's apply thread resizes on a font size change
+    /// while the main thread scrolls) is stored either before the re-wrap,
+    /// and re-anchored by it, or after it, against the new history
+    /// (ADR 0023).
     pub(crate) fn resize(&self, size: PtySize) -> Result<(), PtyError> {
         check_size(size)?;
-        let seen = lock(&self.input).scroll;
-        let (offset, left, after) = {
+        {
             let mut term = self.term.lock();
             let before = History::of(term.grid());
             term.resize(size.rows, size.cols);
             let after = History::of(term.grid());
-            let (offset, left) = seen.resolve(&before);
+            // Terminal, then input state: the order every path that holds
+            // both takes them in.
+            let mut input = lock(&self.input);
+            let (offset, left) = input.scroll.resolve(&before);
             let clamped = offset.min(after.scrollable());
-            (clamped, left || clamped != offset, after)
-        };
-        self.store_scroll(seen, offset, left, &after);
+            if left || clamped != offset {
+                input.scroll_remainder = 0.0;
+            }
+            input.scroll = ScrollAnchor::at(clamped, &after);
+        }
         lock(&self.pty).resize(size)
     }
 
@@ -1059,11 +1091,16 @@ impl Session {
     }
 
     /// The history and the stored position resolved against it, for a
-    /// change of position: the terminal lock is released before the input
-    /// lock is taken, and the guard is returned for the change.
+    /// change of position; the input-state guard is returned for the
+    /// change. The input lock is taken before the terminal lock is
+    /// released (terminal, then input, as [`Session::resize`] takes them),
+    /// so no resize can re-wrap the history between this reading and the
+    /// position the caller stores against it.
     fn scroll_state(&self) -> (History, usize, MutexGuard<'_, InputState>) {
-        let history = self.with_terminal(|term| History::of(term.grid()));
+        let term = self.term.lock();
+        let history = History::of(term.grid());
         let input = lock(&self.input);
+        drop(term);
         let (offset, _) = input.scroll.resolve(&history);
         (history, offset, input)
     }
@@ -1784,11 +1821,24 @@ mod tests {
         assert_eq!(anchor.resolve(&history(1_000, 0, 100)), (0, true));
         assert_eq!(anchor.resolve(&history(1_050, 50, 100)), (0, true));
         assert_eq!(young.resolve(&history(30, 10, 100)), (0, true));
+        // One line short is already a clear (the boundary, #175).
+        assert_eq!(anchor.resolve(&history(1_000, 99, 100)), (0, true));
+        assert_eq!(young.resolve(&history(30, 29, 100)), (0, true));
         // A smaller cap evicts but does not clear.
         assert_eq!(anchor.resolve(&history(1_000, 20, 20)), (20, true));
         assert_eq!(anchor.resolve(&history(1_000, 70, 70)), (50, false));
-        // A reading older than the anchor counts as no output.
+        // A reading older than the anchor keeps the offset, clamped to the
+        // history it has, whether or not that history is full (#175).
         assert_eq!(anchor.resolve(&history(990, 100, 100)), (50, false));
+        assert_eq!(
+            at(50, 1_000, 60).resolve(&history(990, 50, 100)),
+            (50, false),
+            "young history"
+        );
+        assert_eq!(
+            at(50, 1_000, 60).resolve(&history(990, 40, 100)),
+            (40, true)
+        );
         // The alternate screen shows no scrollback.
         let alt = History {
             alt: true,
@@ -1804,6 +1854,86 @@ mod tests {
             ScrollAnchor::default().resolve(&history(7, 7, 100)),
             (0, false)
         );
+    }
+
+    /// Waits until `done` holds, for at most five seconds.
+    fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting: {what}");
+            thread::yield_now();
+        }
+    }
+
+    /// #175 (D-REANCHOR), staged: a scroll and a resize (the configuration
+    /// apply thread's, on a font size change) wait for the terminal lock
+    /// together, the scroll first (`hold_input` false), or for the
+    /// input-state lock once the scroll has the terminal lock or has read
+    /// the history (`hold_input` true). Whoever goes first, the view ends
+    /// one line further back than it was, on every re-wrap: a scroll stored
+    /// against the history before the re-wrap but not re-anchored by it
+    /// reads as a clear once the history is shorter (offset 0), which
+    /// re-anchoring outside the resize's terminal lock does on every
+    /// shrinking round. The second arrangement covers the lock order of
+    /// `Session::scroll_state` (no deadlock, no lost scroll); the mutex
+    /// hands the input lock to the scroll first, so it cannot force the
+    /// interleaving that order exists for (the resize re-anchoring between
+    /// the scroll's reading and its store).
+    #[test]
+    fn a_scroll_racing_a_resize_is_kept_whichever_goes_first() {
+        let app = App::new(Config::default(), ConfigPaths::new("/nonexistent/tessera"));
+        let (tx, rx) = mpsc::sync_channel(4);
+        let pty = SizePty {
+            events: Some(tx),
+            sizes: Arc::new(Mutex::new(Vec::new())),
+        };
+        let id = app.allocate_id();
+        app.attach(id, Box::new(pty), rx, PtySize::new(24, 40))
+            .expect("attach");
+        let session = app.session(id).unwrap();
+        // 400 lines of 60 columns: two rows each at 40 columns, one at 80.
+        let line = format!("{}\r\n", "y".repeat(60));
+        session.with_terminal_mut(|term| term.advance(line.repeat(400).as_bytes()));
+        let waiters = || session.term.waiting.load(Ordering::Relaxed);
+        let mut lost = Vec::new();
+        let mut cols = 40;
+        for round in 0..60 {
+            for hold_input in [false, true] {
+                cols = if cols == 40 { 80 } else { 40 };
+                session.scroll_to(ScrollTarget::Offset(5));
+                assert_eq!(session.scroll_offset(), 5);
+                let resize = || session.resize(PtySize::new(24, cols)).unwrap();
+                thread::scope(|scope| {
+                    if hold_input {
+                        let input = lock(&session.input);
+                        scope.spawn(|| session.scroll(1.0));
+                        // The scroll holds the terminal lock while it waits
+                        // for this one, or has read the history and let go.
+                        thread::sleep(Duration::from_millis(2));
+                        scope.spawn(resize);
+                        // The resize waits for the terminal lock, or has
+                        // re-wrapped and waits for this one.
+                        wait_until("the resize to start", || {
+                            session.term.term.try_lock().is_err()
+                        });
+                        thread::sleep(Duration::from_millis(15));
+                        drop(input);
+                    } else {
+                        let term = session.term.lock();
+                        scope.spawn(|| session.scroll(1.0));
+                        wait_until("the scroll to wait", || waiters() == 1);
+                        scope.spawn(resize);
+                        wait_until("the resize to wait", || waiters() == 2);
+                        drop(term);
+                    }
+                });
+                let offset = session.scroll_offset();
+                if offset != 6 {
+                    lost.push((round, hold_input, cols, offset));
+                }
+            }
+        }
+        assert_eq!(lost, [], "(round, input lock held, columns, offset)");
     }
 
     /// A PTY that only records the sizes it is given and rejects an empty

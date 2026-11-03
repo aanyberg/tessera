@@ -358,15 +358,24 @@ impl App {
         events: PtyEvents,
         size: PtySize,
     ) -> Result<SessionId> {
-        // The configured cursor style is the terminal's before its first
-        // byte (#113).
-        let cursor = view::cursor_style_for(&self.config());
+        // The configured cursor style (#113) and history size (#175) are
+        // the terminal's before its first byte. The history size applies to
+        // sessions started after a change only (lead decision
+        // D-SCROLLBACK-LIVE); it is capped like a loaded configuration's,
+        // in case this one was built by hand.
+        let config = self.config();
+        let cursor = view::cursor_style_for(&config);
+        let scrollback = config
+            .terminal
+            .scrollback_lines
+            .min(tessera_config::Terminal::MAX_SCROLLBACK_LINES);
         let session = Session::start(
             id,
             pty,
             events,
             size,
             cursor,
+            usize::try_from(scrollback).unwrap_or(usize::MAX),
             Arc::clone(&self.observers),
             Arc::clone(&self.applied),
             self.reaper.signal(),
@@ -377,11 +386,11 @@ impl App {
         // A configuration applied while the session started set the new
         // style on the sessions it found, before this one was listed: read
         // it again now that it is (`Live::apply` lists the sessions after
-        // it records the configuration).
-        let now = view::cursor_style_for(&self.config());
-        if now != cursor {
-            session.with_terminal_mut(|term| term.set_default_cursor_style(now));
-        }
+        // it records the configuration). Read under the terminal lock, as
+        // `Live::apply` does (terminal, then `applied`; #168), so an apply
+        // racing this one cannot leave the session on an older style.
+        let live = self.live();
+        session.with_terminal_mut(|term| term.set_default_cursor_style(live.cursor_style()));
         Ok(id)
     }
 
@@ -1494,7 +1503,8 @@ impl App {
     /// the top rows of the live screen below them when the offset is
     /// smaller than the screen; the cursor is not drawn while scrolled
     /// back. Moving the view redraws every row; output that does not
-    /// change the lines in view draws nothing ([`FrameStatus::Skipped`]).
+    /// change the lines in view draws nothing ([`FrameStatus::Skipped`]),
+    /// nor does a focus change while scrolled back.
     ///
     /// The session's terminal is locked only while the rows in view and
     /// the cursor are copied out; shaping, drawing and waiting for a
@@ -1542,11 +1552,15 @@ impl App {
         let result = if view.gpu().is_lost() {
             Err(RenderError::DeviceLost)
         } else {
-            session.with_selection(|selection, term, offset| {
+            let scrolled = session.with_selection(|selection, term, offset| {
                 let changed = view.capture(term, offset);
                 view.set_decorations(selection.frame_decorations(term.grid(), offset, &changed));
+                offset > 0
             });
-            view.render(focused)
+            // Focus only changes how the cursor is drawn, and a scrolled
+            // back frame draws none: drawn as focused, a focus change alone
+            // presents nothing there (#175).
+            view.render(focused || scrolled)
         };
         // A loss during the frame may surface as any error (or none).
         let result = match result {
@@ -1815,8 +1829,9 @@ impl App {
     /// Keeps at most `lines` lines of session `id`'s scrollback
     /// ([`Terminal::set_max_scrollback`]).
     ///
-    /// Exists only so tests can reach the scrollback cap with few lines
-    /// (the configuration's `scrollback_lines` is not applied yet).
+    /// Exists only so tests can change the scrollback cap of a running
+    /// session (the configuration's `scrollback_lines` applies when a
+    /// session starts).
     ///
     /// # Errors
     ///
@@ -4152,6 +4167,36 @@ mod tests {
         assert_eq!(view_text(&app, id), live_text(&app, id));
     }
 
+    /// #175 item 7: focus only changes how the cursor is drawn, so while
+    /// the view is scrolled back (no cursor) a focus change presents no
+    /// frame; on the live screen it does.
+    #[test]
+    fn a_focus_change_while_scrolled_back_presents_nothing() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        if !attach_offscreen(&app, id, PhysicalSize::new(800, 600), 1.0) {
+            return;
+        }
+        let render = || {
+            thread::sleep(view::MIN_FRAME_INTERVAL + Duration::from_millis(1));
+            app.render_view(id).unwrap()
+        };
+        let focus = |event| app.send_input(id, InputEvent::Focus(event)).unwrap();
+        output(&fake, &events, &numbered_lines(0, 100));
+        assert_eq!(scroll(&app, id, 10.0), InputOutcome::Consumed);
+        assert_eq!(render(), FrameStatus::Presented);
+        for event in [FocusEvent::Gained, FocusEvent::Lost, FocusEvent::Gained] {
+            assert_eq!(focus(event), InputOutcome::Consumed);
+            assert_eq!(render(), FrameStatus::Skipped, "{event:?} scrolled back");
+        }
+        assert!(app.scroll_to(id, ScrollTarget::Bottom).unwrap());
+        assert_eq!(render(), FrameStatus::Presented);
+        assert_eq!(focus(FocusEvent::Lost), InputOutcome::Consumed);
+        assert_eq!(render(), FrameStatus::Presented, "the cursor turns hollow");
+        assert_eq!(render(), FrameStatus::Skipped);
+    }
+
     /// Once the lines a view shows are evicted at the scrollback cap, it
     /// stays on the oldest line left.
     #[test]
@@ -4247,6 +4292,163 @@ mod tests {
         assert_eq!(app.scroll_offset(id).unwrap(), top - 28);
     }
 
+    /// #175 item 2: a resize that leaves no history (every line fits on
+    /// the taller screen) clamps the view to the live screen, so output
+    /// before the next read is followed, not scrolled back into.
+    #[test]
+    fn a_resize_that_leaves_no_history_returns_the_view_to_the_live_screen() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        output(&fake, &events, &numbered_lines(0, 40));
+        assert_eq!(scroll(&app, id, 10.0), InputOutcome::Consumed);
+        app.resize(id, PtySize::new(60, 80)).unwrap();
+        // No read between the resize and the output.
+        output(&fake, &events, &numbered_lines(40, 30));
+        assert_eq!(app.scroll_offset(id).unwrap(), 0);
+        assert_eq!(view_text(&app, id), live_text(&app, id));
+    }
+
+    /// #175 item 2: a resize that clamps the view drops the fraction of a
+    /// line banked before it, as a clamp by output does.
+    #[test]
+    fn a_resize_clamp_drops_the_banked_fraction() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        output(&fake, &events, &numbered_lines(0, 100));
+        assert!(app.scroll_to(id, ScrollTarget::Top).unwrap());
+        // Half a line back towards the live screen, banked.
+        assert_eq!(scroll(&app, id, -0.5), InputOutcome::Ignored);
+        let top = app.scroll_offset(id).unwrap();
+        app.resize(id, PtySize::new(30, 80)).unwrap();
+        assert_eq!(app.scroll_offset(id).unwrap(), top - 6, "clamped");
+        // Without the banked half, another half moves nothing.
+        assert_eq!(scroll(&app, id, -0.5), InputOutcome::Ignored);
+        assert_eq!(app.scroll_offset(id).unwrap(), top - 6);
+    }
+
+    /// #175 item 2: ⌘K followed by at least a full history of output
+    /// before the view is read: the history is as long as the pushes since
+    /// account for, so only the reset `clear_scrollback` makes returns the
+    /// view to the live screen.
+    #[test]
+    fn clear_scrollback_then_a_full_history_before_a_read_stays_live() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        app.set_max_scrollback_for_test(id, 50).unwrap();
+        output(&fake, &events, &numbered_lines(0, 100));
+        assert_eq!(scroll(&app, id, 20.0), InputOutcome::Consumed);
+        app.clear_scrollback(id).unwrap();
+        output(&fake, &events, &numbered_lines(100, 80));
+        assert_eq!(
+            app.with_terminal(id, |term| term.grid().scrollback_len())
+                .unwrap(),
+            50
+        );
+        assert_eq!(app.scroll_offset(id).unwrap(), 0);
+        assert_eq!(view_text(&app, id), live_text(&app, id));
+    }
+
+    /// #175 (D-REANCHOR): a font size change resizes the session on the
+    /// configuration's apply thread while the main thread scrolls. Every
+    /// scroll lands on the history it was taken against, or is re-anchored
+    /// by the resize: the view ends exactly as many lines back as it was
+    /// scrolled, never on the live screen (a pre-resize anchor resolved
+    /// against the shorter re-wrapped history reads as a clear). Rounds:
+    /// `ADV_ROUNDS` (default 1 500).
+    #[test]
+    fn a_resize_on_another_thread_keeps_a_scroll_made_meanwhile() {
+        // Lines scrolled at most per round, fewer than the history holds.
+        const MAX_SCROLLS: usize = 800;
+        let rounds = std::env::var("ADV_ROUNDS")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(1_500_usize);
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        app.resize(id, PtySize::new(24, 40)).unwrap();
+        // 1 000 lines of 60 columns: two rows each at 40 columns, one at
+        // 80, so every resize re-wraps the history to another length.
+        let line = format!("{}\r\n", "y".repeat(60));
+        output(&fake, &events, line.repeat(1_000).as_bytes());
+        let mut lost = Vec::new();
+        for round in 0..rounds {
+            app.scroll_to(id, ScrollTarget::Bottom).unwrap();
+            let cols = if round % 2 == 0 { 80 } else { 40 };
+            let barrier = std::sync::Barrier::new(2);
+            let resized = AtomicBool::new(false);
+            let scrolled = thread::scope(|scope| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    app.resize(id, PtySize::new(24, cols)).unwrap();
+                    resized.store(true, Ordering::SeqCst);
+                });
+                barrier.wait();
+                // Scroll until the resize is done, and once more after it.
+                let mut scrolled = 0;
+                while scrolled < MAX_SCROLLS {
+                    let done = resized.load(Ordering::SeqCst);
+                    if scroll(&app, id, 1.0) == InputOutcome::Consumed {
+                        scrolled += 1;
+                    }
+                    if done {
+                        break;
+                    }
+                }
+                scrolled
+            });
+            let offset = app.scroll_offset(id).unwrap();
+            if offset != scrolled {
+                lost.push((round, scrolled, offset));
+            }
+        }
+        assert_eq!(
+            lost,
+            [],
+            "(round, lines scrolled, offset) over {rounds} rounds"
+        );
+    }
+
+    /// #175 item 7: `[terminal] scrollback_lines` is the history size of a
+    /// session started under it.
+    #[test]
+    fn a_session_keeps_the_configured_scrollback_lines() {
+        let mut config = Config::default();
+        config.terminal.scrollback_lines = 50;
+        let app = App::new(config, ConfigPaths::new("/nonexistent/tessera"));
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        output(&fake, &events, &numbered_lines(0, 200));
+        let (len, cap) = app
+            .with_terminal(id, |term| {
+                (term.grid().scrollback_len(), term.grid().max_scrollback())
+            })
+            .unwrap();
+        assert_eq!((len, cap), (50, 50));
+        // A later edit applies to sessions started after it (lead decision
+        // D-SCROLLBACK-LIVE).
+        let mut config = Config::default();
+        config.terminal.scrollback_lines = 70;
+        app.apply_config(&config, &tessera_config::Theme::default());
+        let (later, later_fake) = attach_fake(&app, false);
+        output(&later_fake, &events, &numbered_lines(0, 200));
+        let cap_of = |id| {
+            app.with_terminal(id, |term| term.grid().max_scrollback())
+                .unwrap()
+        };
+        assert_eq!((cap_of(id), cap_of(later)), (50, 70));
+        // Past the configuration's bound, capped like a loaded one.
+        let mut config = Config::default();
+        config.terminal.scrollback_lines = u32::MAX;
+        app.apply_config(&config, &tessera_config::Theme::default());
+        let (huge, _huge_fake) = attach_fake(&app, false);
+        let bound = usize::try_from(tessera_config::Terminal::MAX_SCROLLBACK_LINES).unwrap();
+        assert_eq!(cap_of(huge), bound);
+    }
+
     /// #31 alternate screen: no scrollback, so the wheel sends cursor keys
     /// (`CSI A`/`CSI B`, or `SS3 A`/`SS3 B` under DECCKM), one per whole
     /// line and at most a screen's height per event, and never moves the
@@ -4302,6 +4504,28 @@ mod tests {
         assert_eq!(scroll(&app, id, 1.0), InputOutcome::Consumed);
         assert_eq!(app.scroll_offset(id).unwrap(), 1);
         assert_nothing_written_after(&fake, &expected, &app, id);
+    }
+
+    /// #175 item 2: on the alternate screen a wheel event past the cap of
+    /// a screen's height (24 rows) drops its fraction, and one within it
+    /// banks the fraction, at the cap too.
+    #[test]
+    fn the_alternate_screen_wheel_banks_a_fraction_only_within_the_cap() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        output(&fake, &events, b"\x1b[?1049h");
+        let mut expected = Vec::new();
+        assert_eq!(scroll(&app, id, 30.5), InputOutcome::Consumed);
+        expected.extend(b"\x1b[A".repeat(24));
+        assert_eq!(scroll(&app, id, 0.5), InputOutcome::Ignored, "dropped");
+        assert_eq!(scroll(&app, id, 0.5), InputOutcome::Consumed);
+        expected.extend(b"\x1b[A");
+        assert_eq!(scroll(&app, id, 24.5), InputOutcome::Consumed);
+        expected.extend(b"\x1b[A".repeat(24));
+        assert_eq!(scroll(&app, id, 0.5), InputOutcome::Consumed, "banked");
+        expected.extend(b"\x1b[A");
+        written_eventually(&fake, &expected);
     }
 
     /// A flood of wheel events on the alternate screen to a child that

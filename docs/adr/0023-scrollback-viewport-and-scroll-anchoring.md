@@ -71,6 +71,9 @@ it again against the terminal on every read (each frame, each
 - A resize re-wraps the history: `Session::resize` resolves the anchor
   against the history before the resize and stores it again against the
   one after, clamped, so the view keeps its distance from the live screen.
+  It reads and stores the anchor under the terminal lock it holds for the
+  re-wrap (#175), so a scroll is stored either before the re-wrap, and
+  re-anchored by it, or after it against the new history.
 - On the alternate screen the offset is 0 and the view shows the
   alternate screen; the stored anchor is reset, so leaving the alternate
   screen returns to the live primary screen.
@@ -78,10 +81,26 @@ it again against the terminal on every read (each frame, each
 
 The resolved offset is stored back after every read with a
 compare-and-store: if a scroll stored a new position between the read of
-the anchor and the store, the scroll wins. The terminal lock and the input
-lock are still never held together; the session's frontend calls (render,
-scroll, resize) all come from the main thread, so the only interleaving
-left is the reader thread adding lines, which the anchor accounts for.
+the anchor and the store, the scroll wins.
+
+Render and scroll come from the main thread, but resize does not always: a
+`font_size` edit resizes every view's session on the configuration's apply
+thread (`tessera-config-apply`, ADR 0006). A scroll that read the history
+before such a resize and stored its anchor after the re-wrap would leave an
+anchor against the longer, pre-resize history, which the next read takes
+for a clear (offset 0). So the two paths that store a position against a
+history they read take the input lock while they hold the terminal lock:
+`Session::resize` re-anchors whatever position is stored when it re-wraps,
+and a scroll (`Session::scroll_state`) holds the terminal lock until it has
+the input lock. The lock order is terminal, then input; nothing takes the
+terminal lock while holding the input lock (#175). The compare-and-store
+after a read stays: a resize changes the stored anchor (the pushed count
+never goes back), so a read resolved before it does not overwrite it.
+
+A reading of the history older than the stored anchor (fewer pushes:
+another thread stored the anchor after the reading was taken) keeps the
+offset, clamped to the history it has, rather than counting the missing
+lines as a clear.
 
 ### The snapshot copies the lines at the offset
 

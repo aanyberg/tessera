@@ -269,7 +269,8 @@ impl Default for Appearance {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct Terminal {
-    /// Maximum number of scrollback lines kept per pane.
+    /// Maximum number of scrollback lines kept per pane. Applies to sessions
+    /// started after a change; running sessions keep the size they started with.
     pub scrollback_lines: u32,
     /// Shell integration for zsh and fish (bash support is to follow):
     /// `"auto"` makes the shells Tessera starts load its scripts, which mark

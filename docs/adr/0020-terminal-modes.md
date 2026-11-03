@@ -245,9 +245,9 @@ whatever its shape.
 - Synchronized output (2026) is reset by DECSTR and RIS (the spec is
   silent).
 - DECSCUSR 0 and 7 select the configured cursor style (xterm: 0 is a
-  blinking block), DECSET 12 shares DECSCUSR's blink bit, `CSI ? 12 l`
-  stops a configured blink, and an edit of the configured blink drops the
-  program's (see "Cursor style").
+  blinking block), `CSI ? 12 l` stops a configured blink, and an edit of
+  the configured blink drops the program's (see "Cursor style"). DECSET 12
+  sharing DECSCUSR's blink bit is xterm's own behaviour, not a deviation.
 - Bracketed pastes keep their line breaks; a paste that sanitises to
   nothing writes nothing, brackets included.
 
