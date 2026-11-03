@@ -43,12 +43,20 @@
 //!   of `v * 65535 / (16^n - 1)`;
 //! - `#` and 3, 6, 9 or 12 hex digits in three equal groups,
 //!   left-justified as X11 and xterm read them (`#f80` is `#f08000`, not
-//!   CSS's `#ff8800`; 9 and 12 digits keep each group's top 8 bits).
+//!   CSS's `#ff8800`; 9 and 12 digits keep each group's top 8 bits);
+//! - an X11 colour name from the X.org `rgb.txt` (782 names, #187),
+//!   ASCII case-insensitively over the whole name, spaces significant:
+//!   `DarkSlateGray`, `darkslategray` and `dark slate gray` are the same
+//!   colour, `dark slategray` and `red ` are not names. X11 values win
+//!   where CSS differs (`gray` is `#bebebe`, `green` `#00ff00`); a name
+//!   longer than the longest entry (22 bytes) is rejected before the
+//!   search.
 //!
-//! Anything else is ignored whole: X11 colour names (#187), `rgbi:`, the
-//! CIE forms, CSS `rgb(...)`, blanks around the spec, a sign, other
-//! digit counts and non-hex bytes. An unparsable spec is traced with its
-//! length only.
+//! Anything else is ignored whole: `rgbi:`, the CIE forms, CSS `rgb(...)`
+//! and keywords (`transparent`), xterm's `XtDefaultForeground`, blanks
+//! around the spec, a sign, other digit counts and non-hex bytes. An
+//! unparsable spec is traced with its length only; a reply holds the
+//! stored colour, never the name.
 //!
 //! # Malformed input
 //!
@@ -82,7 +90,7 @@ use std::fmt;
 
 use tracing::trace;
 
-use crate::{State, Terminal};
+use crate::{State, Terminal, color_names};
 
 /// How many colours a program can override: the 256 palette entries and
 /// the text foreground, background and cursor. [`ColorOverrides`] has a
@@ -373,14 +381,15 @@ impl fmt::Display for XColor {
 /// Parses an X11-style colour spec into sRGB bytes; `None` for anything
 /// it does not accept. See "Specs" in the module documentation.
 ///
-/// The one entry point for colour specs: colour names (#187) go here.
+/// The one entry point for colour specs; names go to
+/// [`color_names::lookup`].
 pub(crate) fn parse_color_spec(spec: &[u8]) -> Option<Rgb> {
     if let Some(channels) = strip_prefix_ignore_case(spec, b"rgb:") {
         parse_rgb_channels(channels)
     } else if let Some(digits) = spec.strip_prefix(b"#") {
         parse_hash(digits)
     } else {
-        None
+        color_names::lookup(spec)
     }
 }
 
@@ -611,6 +620,17 @@ mod tests {
         ok("#FfA0b1", 0xff, 0xa0, 0xb1);
     }
 
+    /// Names reach the X11 table; a spec prefix never does.
+    #[test]
+    fn names_are_x11_colours() {
+        let rgb = |spec: &str| parse_color_spec(spec.as_bytes());
+        assert_eq!(rgb("DarkSlateGray"), Some(Rgb::new(0x2f, 0x4f, 0x4f)));
+        assert_eq!(rgb("dark slate gray"), rgb("rgb:2f/4f/4f"));
+        assert_eq!(rgb("gray"), Some(Rgb::new(0xbe, 0xbe, 0xbe)));
+        assert_eq!(rgb("rgb:red"), None);
+        assert_eq!(rgb("#red"), None);
+    }
+
     #[test]
     fn everything_else_is_rejected() {
         for spec in [
@@ -641,7 +661,9 @@ mod tests {
             "rgb:fffffffffffffffff/fffffffffffffffff/fffffffffffffffff",
             "rgb:f/ff/fff",
             "rgbi:1.0/0/0",
-            "red",
+            "red ",
+            "dark slategray",
+            "transparent",
             "rgb(255,0,0)",
             "?",
         ] {

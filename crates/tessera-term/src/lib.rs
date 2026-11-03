@@ -146,6 +146,7 @@
 #![forbid(unsafe_code)]
 
 mod charset;
+mod color_names;
 mod control;
 mod csi;
 mod dcs;
