@@ -19,7 +19,7 @@
 //! | item | bytes |
 //! |---|---|
 //! | `size_of::<Cell>()` | 20 |
-//! | `size_of::<Line>()` (the ring slot: two `Vec` headers, the grapheme table pointer and a flag) | 64 |
+//! | `size_of::<Line>()` (the ring slot: two `Vec` headers, the grapheme table pointer, a flag and the marks' columns) | 64 |
 //! | heap for `cells` of an 80-column line (`80 × 20`, requested exactly) | 1 600 |
 //! | **one 80-column line, requested** | **1 664** |
 //! | the same heap block as the allocator sizes it (`malloc_size`, macOS 26.6) | 1 792 |

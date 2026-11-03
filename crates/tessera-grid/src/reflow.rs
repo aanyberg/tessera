@@ -17,6 +17,7 @@
 
 use std::cmp::Ordering;
 
+use crate::line::MarkAnchors;
 use crate::{Cell, GraphemeTable, Hyperlink, Line, Mark, Point, Scrollback, Style};
 
 /// The parts of one screen a resize rewrites.
@@ -393,6 +394,21 @@ struct Rewrapped {
     dropped: usize,
 }
 
+/// The output rows one logical line was split into, for
+/// [`Rewrapper::place_marks`].
+#[derive(Debug, Clone, Copy)]
+struct LineRows {
+    /// Index of the first, counting the dropped rows.
+    first: usize,
+    /// Index of the last row the split produced, counting the dropped rows.
+    last: usize,
+    /// Length of the line's text in `joined` (trailing blanks trimmed).
+    end: usize,
+    /// Whether [`Rewrapper::split_plain`] split it (rows of exactly the
+    /// new width) rather than [`Rewrapper::split`].
+    plain: bool,
+}
+
 /// The cursor's place in the buffer before a re-wrap.
 #[derive(Debug, Clone, Copy)]
 struct SourceCursor {
@@ -452,6 +468,20 @@ struct Rewrapper {
     /// Its hyperlinks: index into `joined` and link, by ascending index
     /// (reused).
     links: Vec<(usize, Hyperlink)>,
+    /// Marks of its rows: index into `joined` of the row's first cell, the
+    /// row's marks and their columns ([`MarkAnchors`]), by ascending index
+    /// (reused).
+    row_marks: Vec<(usize, Vec<Mark>, MarkAnchors)>,
+    /// Whether [`Rewrapper::split`] records where it breaks rows: only when
+    /// a mark sits past the line's first cell.
+    track_breaks: bool,
+    /// Where [`Rewrapper::split`] broke rows, as indices into `joined` of
+    /// each row's first cell after the first row, ascending (reused).
+    breaks: Vec<usize>,
+    /// Index into `joined` of the first cell [`Rewrapper::split`] kept on
+    /// the line's first output row: zero unless a one-column split dropped
+    /// the wide characters the line starts with.
+    first_kept: usize,
 }
 
 impl Rewrapper {
@@ -475,6 +505,10 @@ impl Rewrapper {
             joined: Vec::new(),
             clusters: Vec::new(),
             links: Vec::new(),
+            row_marks: Vec::new(),
+            track_breaks: false,
+            breaks: Vec::new(),
+            first_kept: 0,
         }
     }
 
@@ -527,15 +561,15 @@ impl Rewrapper {
     /// cell is skipped when it is padding ([`Cell::is_pad`]): the column a
     /// wide character left behind when it did not fit, not text. Any other
     /// cell is text, a space before a wide character included. Trailing
-    /// blanks of the whole line are trimmed. Marks of
-    /// every row go to the first output row, in row order.
+    /// blanks of the whole line are trimmed. Marks stay with their rows
+    /// (D-MARKPOS, ADR 0022): see [`Rewrapper::place_marks`].
     fn logical_line(&mut self, rows: &mut [Line]) {
         let first = self.next_source;
         self.next_source += rows.len();
         self.joined.clear();
         self.clusters.clear();
         self.links.clear();
-        let mut marks: Vec<Mark> = Vec::new();
+        self.row_marks.clear();
         let mut cursor_offset = None;
         let mut top_offset = None;
         self.joined
@@ -574,10 +608,12 @@ impl Rewrapper {
                     .filter(|&(col, _)| col < len)
                     .map(|(col, link)| (base + col, link)),
             );
-            if marks.is_empty() {
-                marks = std::mem::take(&mut row.marks);
-            } else {
-                marks.append(&mut row.marks);
+            if !row.marks.is_empty() {
+                self.row_marks.push((
+                    base,
+                    std::mem::take(&mut row.marks),
+                    std::mem::take(&mut row.anchors),
+                ));
             }
         }
         let end = self
@@ -586,7 +622,17 @@ impl Rewrapper {
             .rposition(|cell| !plain_blank(cell))
             .map_or(0, |i| i + 1);
         let first_out = self.next_index();
-        let last_len = if self.joined[..end].iter().all(|c| c.flags.is_empty()) {
+        // Only a marked row after the first needs to know where `split`
+        // broke rows; the first row's first cell starts the first output
+        // row.
+        self.track_breaks = self
+            .row_marks
+            .iter()
+            .any(|(base, _, anchors)| *base > 0 || *anchors != MarkAnchors::default());
+        self.breaks.clear();
+        self.first_kept = 0;
+        let plain = self.joined[..end].iter().all(|c| c.flags.is_empty());
+        let last_len = if plain {
             self.split_plain(end, cursor_offset, top_offset)
         } else if let Some(top) = top_offset {
             self.split::<true>(end, cursor_offset, top)
@@ -602,8 +648,11 @@ impl Rewrapper {
         // with the cursor if it was on it, so the line's rows stay in
         // history and the screen keeps its rows. (A screen anchored at the
         // bottom takes its last rows whatever the block.)
+        let last_split = self.next_index() - 1;
+        let mut top_row = None;
         let top_past = top_offset.is_some_and(|offset| offset >= end);
         if top_past && !self.anchored {
+            top_row = top_offset.map(|offset| (offset, self.next_index()));
             self.top = Some(self.next_index());
             if cursor_offset.is_some_and(|offset| offset >= end) {
                 self.placed = Some(Placed {
@@ -621,14 +670,156 @@ impl Rewrapper {
                 self.place_past_text(offset - end, last_len);
             }
         }
-        // A first row already dropped (past the history cap) takes its
-        // marks with it.
-        if let Some(line) = first_out
+        let rows = LineRows {
+            first: first_out,
+            last: last_split,
+            end,
+            plain,
+        };
+        self.put_marks(rows, top_row);
+    }
+
+    /// Puts the collected marks of the line just split into `rows` on its
+    /// output rows, inline for the common cases: only the line's first row
+    /// has marks and they sit at its first cell, which starts the first
+    /// output row; or one row has marks and holds just one, placed as
+    /// [`Rewrapper::place_marks`] places it. [`Rewrapper::place_marks`]
+    /// does the rest.
+    #[inline]
+    fn put_marks(&mut self, rows: LineRows, top_row: Option<(usize, usize)>) {
+        match self.row_marks.as_slice() {
+            [] => {}
+            [(0, _, anchors)] if *anchors == MarkAnchors::default() => {
+                if let Some((_, marks, _)) = self.row_marks.pop()
+                    && let Some(line) = self.out_line(rows.first)
+                {
+                    line.marks = marks;
+                }
+            }
+            [(_, marks, _)] if marks.len() == 1 => {
+                let Some((base, marks, anchors)) = self.row_marks.pop() else {
+                    return;
+                };
+                let offset = base + usize::from(anchors.get(&marks[0]));
+                let (index, start) = self.place_of(offset, rows, top_row);
+                let col = column(offset.saturating_sub(start));
+                if let Some(line) = self.out_line(index) {
+                    if line.marks.is_empty() {
+                        line.anchors.set(&marks[0], col);
+                        line.marks = marks;
+                    } else {
+                        for mark in marks {
+                            line.set_mark_at(mark, col);
+                        }
+                    }
+                }
+            }
+            _ => self.place_marks(rows, top_row),
+        }
+    }
+
+    /// Puts the marks of a logical line's source rows, just split into
+    /// `rows`, on its output rows (D-MARKPOS, ADR 0022). A mark sits at a
+    /// place in the line's text: its row's first cell plus its column
+    /// ([`MarkAnchors`]; zero for a mark set on the row). It goes to the
+    /// output row holding that place, and its column becomes the place's
+    /// column there, so a mark stays with the text it was set on and a
+    /// narrower re-wrap and back puts it on its old row again. A place past
+    /// the end of the line's text goes to the line's last output row, or,
+    /// when the old top screen row was past the text and kept a blank row
+    /// of its own (`top_row`: its index into `joined` and its output row),
+    /// a place from that row on goes to that row. When two marks of one
+    /// kind land on one output row, the one from the later source row
+    /// replaces the other ([`Line::set_mark`], D-DUP), so a row never holds
+    /// two marks of one kind. Marks of an output row already dropped (past
+    /// the history cap) are dropped with it.
+    ///
+    /// Runs once per logical line with marks, after the split: no per-cell
+    /// work.
+    #[inline(never)]
+    fn place_marks(&mut self, rows: LineRows, top_row: Option<(usize, usize)>) {
+        let mut entries = std::mem::take(&mut self.row_marks);
+        for (base, marks, anchors) in entries.drain(..) {
+            let at = |mark: &Mark| base + usize::from(anchors.get(mark));
+            // The common case: every mark of the row sits at its first cell
+            // (it was set there, or a re-wrap left it there), so all of them
+            // land on one output row, which has none yet: the row's mark
+            // vector moves there.
+            // Each mark's place once: the first mark's here, the others'
+            // only to check that they land on the same row (a row with one
+            // mark, or with every mark at its first cell, needs no check).
+            let Some(first) = marks.first() else {
+                continue;
+            };
+            let place = self.place_of(at(first), rows, top_row);
+            let together = (anchors == MarkAnchors::default()
+                || marks[1..]
+                    .iter()
+                    .all(|mark| self.place_of(at(mark), rows, top_row).0 == place.0))
+            .then_some(place);
+            if let Some((index, start)) = together {
+                let Some(line) = self.out_line(index) else {
+                    continue;
+                };
+                if line.marks.is_empty() {
+                    if anchors != MarkAnchors::default() || base != start {
+                        for mark in &marks {
+                            line.anchors
+                                .set(mark, column(at(mark).saturating_sub(start)));
+                        }
+                    }
+                    line.marks = marks;
+                    continue;
+                }
+            }
+            for mark in marks {
+                let (index, start) = self.place_of(at(&mark), rows, top_row);
+                if let Some(line) = self.out_line(index) {
+                    let col = column(at(&mark).saturating_sub(start));
+                    line.set_mark_at(mark, col);
+                }
+            }
+        }
+        self.row_marks = entries;
+    }
+
+    /// The output row holding place `offset` of the line just split into
+    /// `rows`, and the place of that row's first cell (see
+    /// [`Rewrapper::place_marks`]).
+    fn place_of(
+        &self,
+        offset: usize,
+        rows: LineRows,
+        top_row: Option<(usize, usize)>,
+    ) -> (usize, usize) {
+        let cols = usize::from(self.cols);
+        match top_row {
+            Some((top_offset, index)) if offset >= top_offset => (index, top_offset),
+            _ if rows.plain => {
+                let row =
+                    (offset.min(rows.end.saturating_sub(1)) / cols).min(rows.last - rows.first);
+                (rows.first + row, row * cols)
+            }
+            _ => {
+                let row = if offset >= rows.end {
+                    self.breaks.len()
+                } else {
+                    self.breaks.partition_point(|&at| at <= offset)
+                };
+                let start = row
+                    .checked_sub(1)
+                    .map_or(self.first_kept, |i| self.breaks[i]);
+                (rows.first + row, start)
+            }
+        }
+    }
+
+    /// The output row at `index` (counting the dropped rows), unless it was
+    /// dropped.
+    fn out_line(&mut self, index: usize) -> Option<&mut Line> {
+        index
             .checked_sub(self.dropped)
             .and_then(|i| self.out.get_mut(i))
-        {
-            line.marks = marks;
-        }
     }
 
     /// Splits `joined[..end]`, which has no wide, spacer or cluster cells,
@@ -670,6 +861,7 @@ impl Rewrapper {
                 marks: Vec::new(),
                 graphemes: GraphemeTable::new(),
                 wrapped: i + 1 < count,
+                anchors: MarkAnchors::default(),
             });
         }
         end - (count - 1) * cols
@@ -737,11 +929,19 @@ impl Rewrapper {
                         pending_wrap: false,
                     });
                 }
+                if row.cells.is_empty() && self.breaks.is_empty() {
+                    // The first row starts after it: marks count their
+                    // column from there.
+                    self.first_kept = p + width;
+                }
                 p += width;
                 continue;
             }
             if row.cells.len() + width > cols {
                 let pad_for = (row.cells.len() + 1 == cols).then_some(p);
+                if self.track_breaks {
+                    self.breaks.push(p);
+                }
                 self.break_row(&mut row, pad_for);
             }
             let col = row.cells.len();
@@ -848,7 +1048,13 @@ fn empty_row(cols: usize) -> Line {
         marks: Vec::new(),
         graphemes: GraphemeTable::new(),
         wrapped: false,
+        anchors: MarkAnchors::default(),
     }
+}
+
+/// A mark's column in its row ([`MarkAnchors`]), saturating.
+fn column(col: usize) -> u16 {
+    u16::try_from(col).unwrap_or(u16::MAX)
 }
 
 /// A column below the new width (itself a `u16`) as a `u16`.

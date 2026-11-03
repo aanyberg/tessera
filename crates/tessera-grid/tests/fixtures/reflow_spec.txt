@@ -1397,7 +1397,7 @@ cite: TS grid.rs leave_alt_screen debug_asserts (lines.len() == rows, cells.len(
 note: Stashed primary had pending wrap armed at (0,7) with a saved cursor at (0,7,true). After the resize the stash holds [abcde]+ [fgh..], cursor (1,3) pending false; the saved cursor is clamped only (0,4,false). The test then calls leave_alt_screen and checks Grid::rows/cols equal the stash dimensions.
 
 ### F01_marks_stay_on_first_row_of_logical_line
-desc: marks sit on the first physical row of their logical line; marks of continuation rows are appended to it when rows join, and the first row keeps them when re-split
+desc: marks sit on the row holding their place in the text (D-MARKPOS, ADR 0022); marks of continuation rows join the first row when rows join, and go back to their own rows when re-split
 layer: grid
 size: 4x6
 step: put abcdefghij
@@ -1423,8 +1423,8 @@ resize: 4x12
 resize: 4x4
   after:
     size: 4x4  scrollback: 0
-    v>  [abcd]+ marks=PromptStart,CommandStart
-    v>  [efgh]+
+    v>  [abcd]+ marks=PromptStart
+    v>  [efgh]+ marks=CommandStart
     v>  [ij..]
     v>  [....]
     cursor: (2,2)  pending_wrap: false  saved: (0,0,false)  region: 0-3
@@ -1432,8 +1432,8 @@ resize: 4x4
 resize: 4x6
   after:
     size: 4x6  scrollback: 0
-    v>  [abcdef]+ marks=PromptStart,CommandStart
-    v>  [ghij..]
+    v>  [abcdef]+ marks=PromptStart
+    v>  [ghij..] marks=CommandStart
     v>  [......]
     v>  [......]
     cursor: (1,4)  pending_wrap: false  saved: (0,0,false)  region: 0-3
@@ -1442,7 +1442,7 @@ cite: KT resize.c:98-101,129 (set_dest_line_attrs on the first dest row; prompt_
 cite: AL/WZ: no per-line marks (n/a)
 cite: IT PromptMarkResizeTests (marks follow the logical line)
 cite: TS lead decision 6
-note: Row 0 carries PromptStart, row 1 (its continuation) carries CommandStart. Width 12: one row with BOTH marks, in row order [PromptStart, CommandStart]. Width 4: three rows, both marks on the first row only. Marks never duplicate.
+note: Row 0 carries PromptStart, row 1 (its continuation) carries CommandStart. Width 12: one row with BOTH marks, in row order [PromptStart, CommandStart]. Width 4: three rows; CommandStart keeps its place (offset 6, the `g`) and goes to row 1 [efgh]. Width 6: the rows of the start again. Marks never duplicate. Amended 2026-11-03 (#181, D-MARKPOS supersedes lead decision 6 and kitty's first-row rule, which loses the place on a narrower width).
 
 ### F02_marks_on_hard_lines_stay_with_their_line
 desc: a mark on a hard line moves with that line when rows scroll into/out of history

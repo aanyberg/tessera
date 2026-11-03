@@ -182,23 +182,39 @@ impl Config {
     /// are clamped with a warning.
     pub fn from_toml_lenient(text: &str) -> Result<Loaded, Error> {
         let de = toml::de::Deserializer::parse(text)?;
+        // The document again, with spans: where each warning's key is (for
+        // document order) and the values the lenient keys replaced. It
+        // parsed once already, so it parses again.
+        let root = toml::de::DeTable::parse(text)?.into_inner();
         let mut warnings = Vec::new();
         let mut omitted = 0usize;
         let mut config: Config = serde_ignored::deserialize(de, |path| {
             if warnings.len() < MAX_UNKNOWN_KEY_WARNINGS {
-                warnings.push(Warning::UnknownKey {
-                    path: truncated(&dotted_path(&path), MAX_WARNING_PATH_LEN),
-                });
+                let steps = path_steps(&path);
+                warnings.push((
+                    position(&root, &steps),
+                    Warning::UnknownKey {
+                        path: truncated(&dotted_path(&path), MAX_WARNING_PATH_LEN),
+                    },
+                ));
             } else {
                 omitted += 1;
             }
         })?;
         if omitted > 0 {
-            warnings.push(Warning::UnknownKeysOmitted { count: omitted });
+            warnings.push((usize::MAX, Warning::UnknownKeysOmitted { count: omitted }));
         }
-        warnings.extend(invalid_cursor_shapes(text));
-        warnings.extend(invalid_clipboard_write(text));
-        warnings.extend(config.normalize());
+        warnings.extend(invalid_lenient_values(text, &root));
+        warnings.extend(config.normalize().into_iter().map(|warning| {
+            let at = match &warning {
+                Warning::OutOfRange { path, .. } => position(&root, &dotted_steps(path)),
+                _ => usize::MAX,
+            };
+            (at, warning)
+        }));
+        // Stable: warnings without a place keep the order they came in.
+        warnings.sort_by_key(|&(at, _)| at);
+        let warnings: Vec<Warning> = warnings.into_iter().map(|(_, warning)| warning).collect();
         for w in &warnings {
             tracing::warn!(target: "tessera_config", "{w}");
         }
@@ -267,10 +283,106 @@ fn dotted_path(path: &serde_ignored::Path<'_>) -> String {
     out
 }
 
+/// One step of a path into the document: a key of a table or an element of
+/// an array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step<'a> {
+    Key(&'a str),
+    Index(usize),
+}
+
+/// The steps of a `serde_ignored` path, `Option` and newtype wrappers left
+/// out (as in [`dotted_path`]).
+fn path_steps<'a>(path: &'a serde_ignored::Path<'a>) -> Vec<Step<'a>> {
+    use serde_ignored::Path;
+
+    let mut steps = Vec::new();
+    let mut at = path;
+    loop {
+        at = match at {
+            Path::Root => break,
+            Path::Seq { parent, index } => {
+                steps.push(Step::Index(*index));
+                parent
+            }
+            Path::Map { parent, key } => {
+                steps.push(Step::Key(key));
+                parent
+            }
+            Path::Some { parent }
+            | Path::NewtypeStruct { parent }
+            | Path::NewtypeVariant { parent } => parent,
+        };
+    }
+    steps.reverse();
+    steps
+}
+
+/// The steps of a path as [`Config::normalize`] writes it
+/// (`profiles[0].appearance.font_size`; its keys never contain `.` or
+/// `[`).
+fn dotted_steps(path: &str) -> Vec<Step<'_>> {
+    let mut steps = Vec::new();
+    for part in path.split('.') {
+        let mut pieces = part.split('[');
+        if let Some(key) = pieces.next() {
+            steps.push(Step::Key(key));
+        }
+        for index in pieces {
+            if let Ok(index) = index.trim_end_matches(']').parse() {
+                steps.push(Step::Index(index));
+            }
+        }
+    }
+    steps
+}
+
+/// The value at `steps` in the document and where it is: the start of
+/// its key (or of the array element, for a last step that is an index).
+fn lookup<'a, 'i>(
+    root: &'a toml::de::DeTable<'i>,
+    steps: &[Step<'_>],
+) -> Option<(usize, &'a toml::Spanned<toml::de::DeValue<'i>>)> {
+    use toml::de::DeValue;
+
+    let (first, rest) = steps.split_first()?;
+    let Step::Key(key) = first else {
+        return None;
+    };
+    let (key, mut value) = root.get_key_value(*key)?;
+    let mut at = key.span().start;
+    for step in rest {
+        (at, value) = match (step, value.get_ref()) {
+            (Step::Key(key), DeValue::Table(table)) => {
+                let (key, value) = table.get_key_value(*key)?;
+                (key.span().start, value)
+            }
+            (Step::Index(index), DeValue::Array(array)) => {
+                let value = array.get(*index)?;
+                (value.span().start, value)
+            }
+            _ => return None,
+        };
+    }
+    Some((at, value))
+}
+
+/// Where the key at `steps` is in the document, for sorting warnings into
+/// document order; `usize::MAX` (last) when it is not there.
+fn position(root: &toml::de::DeTable<'_>, steps: &[Step<'_>]) -> usize {
+    lookup(root, steps).map_or(usize::MAX, |(at, _)| at)
+}
+
+/// A lenient key's value as written, for its warning.
+fn written(text: &str, value: &toml::Spanned<toml::de::DeValue<'_>>) -> String {
+    let raw = text.get(value.span()).unwrap_or_default();
+    truncated(raw, MAX_WARNING_PATH_LEN)
+}
+
 /// Deserializes `appearance.cursor_shape` without failing: a value that is
 /// not exactly one of [`CursorShape::as_str`](crate::CursorShape::as_str)
 /// (another spelling, another case, another type) gives the default shape,
-/// and [`invalid_cursor_shapes`] reports it. So a mistyped shape costs a
+/// and [`invalid_lenient_values`] reports it. So a mistyped shape costs a
 /// warning, not the whole configuration.
 pub(crate) fn lenient_cursor_shape<'de, D>(deserializer: D) -> Result<crate::CursorShape, D::Error>
 where
@@ -285,98 +397,132 @@ where
         .unwrap_or_default())
 }
 
-/// One [`Warning::OutOfRange`] for every `cursor_shape` in `text` that
-/// [`lenient_cursor_shape`] replaced by the default: under `[appearance]`
-/// and under each profile's `appearance`. Reads the document a second
-/// time, only when it mentions the key at all.
-fn invalid_cursor_shapes(text: &str) -> Vec<Warning> {
-    const KEY: &str = "cursor_shape";
-    if !text.contains(KEY) {
-        return Vec::new();
-    }
-    let Ok(table) = text.parse::<toml::Table>() else {
-        return Vec::new();
-    };
-    let profiles = table
-        .get("profiles")
-        .and_then(toml::Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    let appearances = std::iter::once(("appearance".to_owned(), table.get("appearance"))).chain(
-        profiles.iter().enumerate().map(|(i, profile)| {
-            (
-                format!("profiles[{i}].appearance"),
-                profile.get("appearance"),
-            )
-        }),
-    );
-    appearances
-        .filter_map(|(prefix, appearance)| {
-            let value = appearance?.get(KEY)?;
-            if value
-                .as_str()
-                .and_then(crate::CursorShape::from_name)
-                .is_some()
-            {
-                return None;
-            }
-            let names: Vec<String> = crate::CursorShape::ALL
-                .iter()
-                .map(|shape| format!("\"{}\"", shape.as_str()))
-                .collect();
-            Some(Warning::OutOfRange {
-                path: format!("{prefix}.{KEY}"),
-                detail: format!(
-                    "{} replaced by \"{}\" (expected {})",
-                    truncated(&value.to_string(), MAX_WARNING_PATH_LEN),
-                    crate::CursorShape::default().as_str(),
-                    names.join(", ")
-                ),
-            })
-        })
-        .collect()
+/// Deserializes `appearance.cursor_blink` without failing: anything but a
+/// boolean gives the default (`false`), and [`invalid_lenient_values`]
+/// reports it, as for [`lenient_cursor_shape`].
+pub(crate) fn lenient_cursor_blink<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(lenient_bool(deserializer)?.unwrap_or(crate::Appearance::default().cursor_blink))
 }
 
-/// Deserializes `terminal.clipboard_write` without failing: anything but
-/// a boolean gives the default (`true`), and [`invalid_clipboard_write`]
-/// reports it, as for [`lenient_cursor_shape`].
+/// Deserializes `terminal.clipboard_write` without failing, and fails
+/// closed (D-FAIL-CLOSED, ADR 0022): anything but a boolean is `false`, so
+/// a mistyped switch never leaves clipboard writes on, and
+/// [`invalid_lenient_values`] reports it.
 pub(crate) fn lenient_clipboard_write<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(lenient_bool(deserializer)?.unwrap_or(false))
+}
+
+/// A boolean, or `None` for a value of any other type.
+fn lenient_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     use serde::Deserialize as _;
 
-    let value = toml::Value::deserialize(deserializer)?;
-    Ok(value
-        .as_bool()
-        .unwrap_or(crate::Terminal::default().clipboard_write))
+    Ok(toml::Value::deserialize(deserializer)?.as_bool())
 }
 
-/// A [`Warning::OutOfRange`] when `[terminal] clipboard_write` is not a
-/// boolean ([`lenient_clipboard_write`] used the default instead). Reads the
-/// document a second time, only when it mentions the key at all.
-fn invalid_clipboard_write(text: &str) -> Vec<Warning> {
-    const KEY: &str = "clipboard_write";
-    if !text.contains(KEY) {
-        return Vec::new();
-    }
-    let Ok(table) = text.parse::<toml::Table>() else {
-        return Vec::new();
+/// One [`Warning::OutOfRange`], with where its key is, for every lenient
+/// key whose value the lenient deserializers replaced:
+/// `cursor_shape` and `cursor_blink` under `[appearance]` and under each
+/// profile's `appearance`, and `[terminal] clipboard_write`. Found in the
+/// parsed document `root`, so a key written quoted or with escapes
+/// (`"cursor\u005fshape"`) is found too, and a value that merely mentions
+/// a key's name is not.
+fn invalid_lenient_values(text: &str, root: &toml::de::DeTable<'_>) -> Vec<(usize, Warning)> {
+    use toml::de::DeValue;
+
+    const SHAPE: &str = "cursor_shape";
+    const BLINK: &str = "cursor_blink";
+    const CLIPBOARD: &str = "clipboard_write";
+
+    let shape_names = || {
+        let names: Vec<String> = crate::CursorShape::ALL
+            .iter()
+            .map(|shape| format!("\"{}\"", shape.as_str()))
+            .collect();
+        names.join(", ")
     };
-    let Some(value) = table.get("terminal").and_then(|t| t.get(KEY)) else {
-        return Vec::new();
+    let profiles = match lookup(root, &[Step::Key("profiles")]) {
+        Some((_, value)) => match value.get_ref() {
+            DeValue::Array(array) => array.len(),
+            _ => 0,
+        },
+        None => 0,
     };
-    if value.is_bool() {
-        return Vec::new();
+    let mut warnings = Vec::new();
+    let appearances = std::iter::once(("appearance".to_owned(), vec![Step::Key("appearance")]))
+        .chain((0..profiles).map(|i| {
+            (
+                format!("profiles[{i}].appearance"),
+                vec![
+                    Step::Key("profiles"),
+                    Step::Index(i),
+                    Step::Key("appearance"),
+                ],
+            )
+        }));
+    for (prefix, mut steps) in appearances {
+        steps.push(Step::Key(SHAPE));
+        if let Some((at, value)) = lookup(root, &steps) {
+            let valid = match value.get_ref() {
+                DeValue::String(name) => crate::CursorShape::from_name(name).is_some(),
+                _ => false,
+            };
+            if !valid {
+                warnings.push((
+                    at,
+                    Warning::OutOfRange {
+                        path: format!("{prefix}.{SHAPE}"),
+                        detail: format!(
+                            "{} replaced by \"{}\" (expected {})",
+                            written(text, value),
+                            crate::CursorShape::default().as_str(),
+                            shape_names()
+                        ),
+                    },
+                ));
+            }
+        }
+        steps.pop();
+        steps.push(Step::Key(BLINK));
+        if let Some((at, value)) = lookup(root, &steps)
+            && !matches!(value.get_ref(), DeValue::Boolean(_))
+        {
+            warnings.push((
+                at,
+                Warning::OutOfRange {
+                    path: format!("{prefix}.{BLINK}"),
+                    detail: format!(
+                        "{} replaced by {} (expected true or false)",
+                        written(text, value),
+                        crate::Appearance::default().cursor_blink
+                    ),
+                },
+            ));
+        }
     }
-    vec![Warning::OutOfRange {
-        path: format!("terminal.{KEY}"),
-        detail: format!(
-            "{} replaced by {} (expected true or false)",
-            truncated(&value.to_string(), MAX_WARNING_PATH_LEN),
-            crate::Terminal::default().clipboard_write
-        ),
-    }]
+    if let Some((at, value)) = lookup(root, &[Step::Key("terminal"), Step::Key(CLIPBOARD)])
+        && !matches!(value.get_ref(), DeValue::Boolean(_))
+    {
+        warnings.push((
+            at,
+            Warning::OutOfRange {
+                path: format!("terminal.{CLIPBOARD}"),
+                detail: format!(
+                    "{} replaced by false, clipboard writes refused (expected true or false)",
+                    written(text, value)
+                ),
+            },
+        ));
+    }
+    warnings
 }
 
 fn normalize_appearance(prefix: &str, a: &mut crate::Appearance, warnings: &mut Vec<Warning>) {
@@ -924,17 +1070,18 @@ mod tests {
         }
     }
 
-    /// A clipboard setting that is not a boolean keeps the default (writes
-    /// allowed) with a warning naming the key; every other key applies.
+    /// A clipboard setting that is not a boolean fails closed
+    /// (D-FAIL-CLOSED): writes are refused, with a warning naming the key;
+    /// every other key applies.
     #[test]
-    fn an_invalid_clipboard_write_warns_and_keeps_the_default() {
-        for bad in ["\"false\"", "0", "\"no\"", "[false]", "1.5"] {
+    fn an_invalid_clipboard_write_warns_and_refuses_writes() {
+        for bad in ["\"false\"", "0", "\"yes\"", "\"no\"", "[false]", "1.5", "1"] {
             let text = format!(
                 "[terminal]\nscrollback_lines = 7\nclipboard_write = {bad}\n\
                  [appearance]\nfont_size = 15\n"
             );
             let loaded = Config::from_toml_lenient(&text).unwrap();
-            assert!(loaded.config.terminal.clipboard_write, "{bad}");
+            assert!(!loaded.config.terminal.clipboard_write, "{bad}");
             assert_eq!(loaded.config.terminal.scrollback_lines, 7, "{bad}");
             assert_eq!(loaded.config.appearance.font_size, 15.0, "{bad}");
             let [Warning::OutOfRange { path, detail }] = &loaded.warnings[..] else {
@@ -942,11 +1089,182 @@ mod tests {
             };
             assert_eq!(path, "terminal.clipboard_write", "{bad}");
             assert!(detail.contains("true or false"), "{bad}: {detail}");
+            assert!(detail.starts_with(bad), "{bad}: {detail}");
+            assert!(detail.contains("replaced by false"), "{bad}: {detail}");
         }
         // A key that only mentions the name is not checked.
         let loaded =
             Config::from_toml_lenient("[appearance]\ntheme = \"clipboard_write\"\n").unwrap();
         assert!(matches!(&loaded.warnings[..], []), "{:?}", loaded.warnings);
+    }
+
+    /// The first load and a live reload go through the same lenient load:
+    /// a mistyped switch refuses writes in both, where the last good value
+    /// was `true`.
+    #[test]
+    fn clipboard_write_fails_closed_on_first_load_and_on_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::ConfigPaths::new(dir.path());
+        std::fs::create_dir_all(dir.path()).unwrap();
+        write_atomic(
+            &paths.config_file(),
+            "[terminal]\nclipboard_write = \"false\"\n",
+        )
+        .unwrap();
+        let store = crate::ConfigStore::open(paths.clone()).unwrap();
+        assert!(!store.config().terminal.clipboard_write, "first load");
+        assert_eq!(store.warnings().len(), 1);
+
+        write_atomic(&paths.config_file(), "[terminal]\nclipboard_write = true\n").unwrap();
+        store.reload().unwrap();
+        assert!(store.config().terminal.clipboard_write);
+        for bad in ["\"yes\"", "0"] {
+            write_atomic(
+                &paths.config_file(),
+                &format!("[terminal]\nclipboard_write = {bad}\n"),
+            )
+            .unwrap();
+            store.reload().unwrap();
+            assert!(!store.config().terminal.clipboard_write, "reload {bad}");
+            assert!(
+                matches!(
+                    &store.warnings()[..],
+                    [Warning::OutOfRange { path, .. }] if path == "terminal.clipboard_write"
+                ),
+                "{:?}",
+                store.warnings()
+            );
+            write_atomic(&paths.config_file(), "[terminal]\nclipboard_write = true\n").unwrap();
+            store.reload().unwrap();
+        }
+    }
+
+    /// `cursor_blink` joins the lenient keys: a mistyped value warns and
+    /// keeps the default instead of failing the whole load. `blur` keeps
+    /// the strict path (a type mismatch is an error).
+    #[test]
+    fn an_invalid_cursor_blink_warns_and_keeps_the_default() {
+        for bad in ["\"yes\"", "1", "\"true\"", "[true]"] {
+            let text = format!(
+                "[appearance]\ncursor_blink = {bad}\nfont_size = 15\ncursor_shape = \"beam\"\n"
+            );
+            let loaded = Config::from_toml_lenient(&text).unwrap();
+            let appearance = &loaded.config.appearance;
+            assert!(!appearance.cursor_blink, "{bad}");
+            assert_eq!(appearance.font_size, 15.0, "{bad}");
+            assert_eq!(appearance.cursor_shape, crate::CursorShape::Beam, "{bad}");
+            let [Warning::OutOfRange { path, detail }] = &loaded.warnings[..] else {
+                panic!("{bad}: {:?}", loaded.warnings);
+            };
+            assert_eq!(path, "appearance.cursor_blink", "{bad}");
+            assert!(detail.contains("true or false"), "{bad}: {detail}");
+        }
+        let text = "[[profiles]]\nname = \"a\"\n[profiles.appearance]\ncursor_blink = 2\n";
+        let loaded = Config::from_toml_lenient(text).unwrap();
+        assert!(matches!(
+            &loaded.warnings[..],
+            [Warning::OutOfRange { path, .. }] if path == "profiles[0].appearance.cursor_blink"
+        ));
+        assert!(Config::from_toml_lenient("[appearance]\nblur = \"yes\"\n").is_err());
+    }
+
+    /// Lenient keys are found in the parsed document, not in its text: a
+    /// quoted key, or one spelled with an escape, warns too (#168).
+    #[test]
+    fn quoted_and_escaped_lenient_keys_warn() {
+        for (key, value, path) in [
+            ("\"cursor_shape\"", "\"bar\"", "appearance.cursor_shape"),
+            (
+                "\"cursor\\u005fshape\"",
+                "\"bar\"",
+                "appearance.cursor_shape",
+            ),
+            ("'cursor_blink'", "\"yes\"", "appearance.cursor_blink"),
+            (
+                "\"cursor\\u005Fblink\"",
+                "\"yes\"",
+                "appearance.cursor_blink",
+            ),
+        ] {
+            let text = format!("[appearance]\n{key} = {value}\n");
+            let loaded = Config::from_toml_lenient(&text).unwrap();
+            assert!(
+                matches!(&loaded.warnings[..], [Warning::OutOfRange { path: p, .. }] if p == path),
+                "{text}: {:?}",
+                loaded.warnings
+            );
+        }
+        for key in ["\"clipboard_write\"", "\"clipboard\\u005Fwrite\""] {
+            let text = format!("[terminal]\n{key} = \"no\"\n");
+            let loaded = Config::from_toml_lenient(&text).unwrap();
+            assert!(!loaded.config.terminal.clipboard_write, "{text}");
+            assert_eq!(loaded.warnings.len(), 1, "{text}: {:?}", loaded.warnings);
+        }
+        // Dotted keys and inline tables reach the same values.
+        let loaded = Config::from_toml_lenient(
+            "appearance.cursor_shape = \"bar\"\nterminal = { clipboard_write = 0 }\n",
+        )
+        .unwrap();
+        let paths: Vec<_> = loaded
+            .warnings
+            .iter()
+            .map(|w| match w {
+                Warning::OutOfRange { path, .. } => path.as_str(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            paths,
+            ["appearance.cursor_shape", "terminal.clipboard_write"]
+        );
+    }
+
+    /// `Loaded::warnings` is in document order, whichever check found the
+    /// problem: unknown keys, lenient values and normalised ranges
+    /// interleave as their keys appear (#168).
+    #[test]
+    fn warnings_come_in_document_order() {
+        let text = "\
+            [[profiles]]\n\
+            name = \"a\"\n\
+            [profiles.appearance]\n\
+            cursor_shape = \"bar\"\n\
+            bogus_one = 1\n\
+            font_size = 1000\n\
+            [appearance]\n\
+            cursor_blink = \"yes\"\n\
+            bogus_two = 2\n\
+            cursor_shape = \"Block\"\n\
+            opacity = 2.0\n\
+            [terminal]\n\
+            clipboard_write = 0\n\
+            scrollback_lines = 4000000000\n\
+            [bogus_three]\n\
+            x = 1\n";
+        let loaded = Config::from_toml_lenient(text).unwrap();
+        let paths: Vec<_> = loaded
+            .warnings
+            .iter()
+            .map(|w| match w {
+                Warning::OutOfRange { path, .. } | Warning::UnknownKey { path } => path.as_str(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "profiles[0].appearance.cursor_shape",
+                "profiles[0].appearance.bogus_one",
+                "profiles[0].appearance.font_size",
+                "appearance.cursor_blink",
+                "appearance.bogus_two",
+                "appearance.cursor_shape",
+                "appearance.opacity",
+                "terminal.clipboard_write",
+                "terminal.scrollback_lines",
+                "bogus_three",
+            ]
+        );
     }
 
     #[test]

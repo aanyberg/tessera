@@ -134,7 +134,8 @@ path is added.
 Alacritty allow writes by default; xterm and iTerm2 deny) gates delivery in
 app-core: the session's reader reads the configuration in effect for each
 write, so `App::apply_config` switches it for every session at once. A
-non-boolean value warns and keeps the default. The reader delivers only the
+non-boolean value warns and counts as `false` (D-FAIL-CLOSED, amended
+2026-11-03 below). The reader delivers only the
 last write of each output chunk, since each write replaces the previous:
 a flood of OSC 52 costs one observer call per chunk. The frontend writes
 the pasteboard on the main actor (`CallbackBridge`, through an injectable
@@ -173,7 +174,73 @@ the pasteboard on the main actor (`CallbackBridge`, through an injectable
   left alone (kitty's `cursor->y`). D-ALT: marks on the alternate screen
   are dropped; its lines vanish on leave. D-DUP: `Line::set_mark` keeps one
   mark of each kind per line, the new one last, so a redrawn prompt does
-  not pile marks up. D-FRESH: `133;A` does not move the cursor.
+  not pile marks up; a re-wrap keeps the rule too (D-MARKPOS, amended
+  2026-11-03 below). D-FRESH: `133;A` does not move the cursor.
+
+### Amendment 2026-11-03: marks in reflow, Clear to Start, clipboard switch (#181, #132)
+
+The adversarial run on #9 found that a resize broke D-DUP and moved a
+prompt's marks onto the previous command's output: the re-wrap
+(`reflow.rs`, ADR 0009) put the marks of every row of a logical line on
+its first output row. zsh's PROMPT_SP makes the prompt row a soft-wrapped
+continuation of output that ends without a newline, so after a resize the
+prompt row had no `PromptStart` and the output row had two kinds of
+prompt mark it never carried.
+
+- **D-MARKPOS** (lead decision, amended after critic round 1): a mark
+  sits at a place in its line's text. A mark set on a row (`Line::set_mark`)
+  sits at the row's first cell; a re-wrap puts it on the output row holding
+  its place and records its column there (`MarkAnchors`: four 14-bit
+  columns, one per mark kind, packed into the padding of `Line`, private
+  to `tessera-grid`; `Line` stays 64 bytes), so the next re-wrap finds the
+  same place again. A mark therefore stays with the text it was
+  set on, and narrowing to any width and widening back restores every
+  row's marks exactly (tested for 80 -> 37 -> 80, 80 -> 60 -> 80 and a drag
+  80 .. 60 .. 80 over the PROMPT_SP rows). The first version anchored marks
+  only to the row: at a width that does not divide the old one a row's
+  marks landed on a row starting earlier and drifted up with every resize
+  of a window drag, back onto the output (critic round 1, E1). A place past
+  the end of its line's text (trailing blanks are trimmed) goes to the
+  line's last output row, its column counting on along the line. When two
+  marks of one kind land on one output row, the one from the later source
+  row replaces the other, as `Line::set_mark` does, so D-DUP holds after
+  any resize and a line holds at most one mark of each kind (four)
+  whatever the input: the cap is by construction (docs/security.md S5).
+  The placement runs once per logical line that has marks, after the
+  split; the per-cell loop gains nothing, and `split` records its row
+  breaks only when a mark sits past its line's first cell (S6). A column
+  saturates at 16 383, so the undo is exact for rows up to that width.
+- **D-CLEAR-START** (lead decision, #132): `Grid::clear_to_cursor` (⌘K,
+  "Clear to Start") keeps from the nearest screen row at or above the
+  cursor row with a `PromptStart`, so a two-line prompt is not cut in
+  half (kitty's `screen_scroll_until_cursor_prompt`, iTerm2 with shell
+  integration). The scan up from the cursor stops at a row with an
+  `OutputStart` and no `PromptStart` (amended after critic round 1, E2):
+  a command is still running (`ssh`, a REPL, `tail`) and the prompt above
+  is not the one the cursor is at, as kitty's
+  `screen_cursor_at_a_shell_prompt` returns "not at a prompt" when it
+  meets output first. Without a `PromptStart`, the kept rows start at the
+  first screen row of the cursor's logical line (the rows above that
+  wrap into it), never above that `OutputStart` row, so a long command
+  being typed, also on a remote host, is not cut in half; with the cursor
+  row not continuing another that is the cursor row, as in kitty. A row
+  with both marks (a command without output) is a prompt start. The
+  scrollback always goes, also when the logical line started in it; the
+  alternate screen is unchanged. A `PromptStart` wins over the
+  logical-line rule, also when the prompt sits on a continuation row
+  (PROMPT_SP): the output before it is cleared.
+- **D-FAIL-CLOSED** (lead decision): `[terminal] clipboard_write` is the
+  one security switch in the configuration, and a mistyped value
+  (`"false"`, `0`) used to warn and keep the default `true`, so writes
+  went on. A value that is not a boolean now counts as `false`, with a
+  warning, on the first load and on every live reload (one loader serves
+  both). The other lenient keys warn and keep their default:
+  `cursor_shape`, and now `cursor_blink`, whose mistyped value failed the
+  whole load (#168). `blur` keeps the strict path: a type mismatch is an
+  error. The lenient keys' warnings are found in the parsed document, not
+  by scanning its text, so a quoted or escaped key warns too, and
+  `Loaded::warnings` is sorted into document order by the position of
+  each warning's key.
 
 ## Consequences
 
