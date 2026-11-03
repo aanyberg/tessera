@@ -58,20 +58,20 @@
 //!
 //! # Chunking
 //!
-//! [`Parser::advance`] keeps its state between calls, so input may be fed
-//! as it arrives, but the actions are **not** independent of where the input
-//! was split. `vte` 0.15 loses characters when a UTF-8 character completes
-//! across two calls and the bytes after it in its 4-byte completion buffer
-//! do not form valid UTF-8 (the next character is incomplete or invalid):
-//! `advance_partial_utf8` then consumes up to `valid_up_to` rather than the
-//! completed character's length. `"éa中"` fed as `"\xC3"` and the rest
-//! parses as `é`, `中`: the `a` is gone. Valid text split at character
-//! boundaries, ASCII, control bytes, escape sequences and DCS payloads are
-//! unaffected. `tessera_term::Terminal::advance` works around it by holding
-//! back an incomplete character at the end of each call; anything else that
-//! drives the parser directly from a byte stream must do the same until the
-//! parser does it itself (#146). The `chunking` fuzz target in `fuzz/` checks
-//! the terminal; the `parser` target does not compare split and whole input.
+//! [`Parser::advance`] and [`Parser::advance_c1`] keep their state between
+//! calls, so input may be fed as it arrives, split anywhere: the actions do
+//! not depend on where the input was split. A call that ends inside a UTF-8
+//! character holds the incomplete character (at most 3 bytes) back and
+//! parses it with the start of the next call, so neither `vte` nor the
+//! 8-bit C1 and DCS `0x9C` handling ever sees a character in two pieces.
+//! `vte` 0.15 cannot be left to complete it itself: its
+//! `advance_partial_utf8` consumes up to `valid_up_to` of its 4-byte
+//! completion buffer rather than the completed character's length, so
+//! `"\xC2"` then `"\xA1\0\xC2\xA1"` lost the `NUL` (#234, #146). An
+//! invalid sequence that only the held character shows to be invalid
+//! (`E1 80` before `C2`) is parsed with it, one call later. The `chunking`
+//! fuzz target in `fuzz/` checks the terminal; the `parser` target does
+//! not compare split and whole input.
 
 #![forbid(unsafe_code)]
 
@@ -175,6 +175,17 @@ pub enum Action {
 pub struct Parser {
     inner: vte::Parser,
     dcs: DcsState,
+    /// An incomplete UTF-8 sequence held back from the end of the last
+    /// call (crate docs, "Chunking").
+    carry: Carry,
+}
+
+/// An incomplete UTF-8 sequence (1 to 3 bytes) held back from the end of
+/// one [`Parser::advance_c1`] call and parsed with the start of the next.
+#[derive(Default)]
+struct Carry {
+    bytes: [u8; 3],
+    len: usize,
 }
 
 /// Payload accumulator for the DCS currently being parsed.
@@ -203,9 +214,8 @@ impl Parser {
     /// C1 controls read as `vte` reads them (crate docs, "8-bit C1
     /// controls").
     ///
-    /// A UTF-8 character split across two calls can lose the characters
-    /// after it (crate docs, "Chunking"): feed whole characters, as
-    /// `tessera_term::Terminal::advance` does.
+    /// The input may be split anywhere: an incomplete UTF-8 character at
+    /// the end is held back for the next call (crate docs, "Chunking").
     pub fn advance(&mut self, bytes: &[u8], sink: impl FnMut(Action)) {
         self.advance_c1(bytes, &mut SevenBit(sink));
     }
@@ -222,6 +232,38 @@ impl Parser {
     /// costs time linear in its length too, however many DCS strings and
     /// mode switches it holds.
     pub fn advance_c1(&mut self, bytes: &[u8], sink: &mut impl Sink) {
+        let mut bytes = bytes;
+        // Rare: only when the last call ended inside a character. Complete
+        // it from a window of at most 4 bytes, so nothing is copied but the
+        // character; the window may end inside the next one, so repeat.
+        while self.carry.len != 0 && !bytes.is_empty() {
+            let held = self.carry.len;
+            let take = bytes.len().min(4 - held);
+            let mut window = [0u8; 4];
+            window[..held].copy_from_slice(&self.carry.bytes[..held]);
+            window[held..held + take].copy_from_slice(&bytes[..take]);
+            let len = held + take;
+            let keep = incomplete_utf8_suffix(&window[..len]);
+            self.carry.len = keep;
+            self.carry.bytes[..keep].copy_from_slice(&window[len - keep..len]);
+            self.feed(&window[..len - keep], sink);
+            bytes = &bytes[take..];
+        }
+        if self.carry.len == 0 {
+            let keep = incomplete_utf8_suffix(bytes);
+            let (now, later) = bytes.split_at(bytes.len() - keep);
+            self.carry.len = keep;
+            self.carry.bytes[..keep].copy_from_slice(later);
+            self.feed(now, sink);
+        }
+    }
+
+    /// Parses `bytes`, which never end with a character the next call could
+    /// complete ([`incomplete_utf8_suffix`]). They may end with an invalid
+    /// sequence that only the held character shows invalid; `vte` holds that
+    /// one, and since the next bytes it gets start with a lead byte, it
+    /// prints U+FFFD for it without the completion bug.
+    fn feed(&mut self, bytes: &[u8], sink: &mut impl Sink) {
         let c1 = sink.c1_controls();
         let mut perform = Performer {
             sink,
@@ -291,6 +333,26 @@ fn flatten_params(params: &vte::Params) -> (Vec<u16>, u32) {
         }
     }
     (flat, subparams)
+}
+
+/// Length of the incomplete UTF-8 sequence that ends `bytes`: a lead byte
+/// and the continuation bytes after it that are a valid start of a
+/// character but not a whole one, so at most 3. These are exactly the
+/// bytes `vte` would hold back itself (`str::from_utf8` reports them as
+/// incomplete, not invalid). Zero when `bytes` ends on a complete
+/// character, an ASCII byte or bytes already shown invalid.
+fn incomplete_utf8_suffix(bytes: &[u8]) -> usize {
+    for back in 1..=bytes.len().min(3) {
+        let start = bytes.len() - back;
+        if bytes[start] & 0xC0 == 0x80 {
+            continue; // continuation byte: keep looking for the lead
+        }
+        return match std::str::from_utf8(&bytes[start..]) {
+            Err(err) if err.valid_up_to() == 0 && err.error_len().is_none() => back,
+            _ => 0,
+        };
+    }
+    0
 }
 
 /// Whether `bytes` has a byte in `0x80..=0x9F`, the only bytes a C1 code
@@ -1182,24 +1244,146 @@ mod tests {
         );
     }
 
-    /// Byte streams that are well-formed UTF-8 in ground state.
-    ///
-    /// `vte` drops bytes when an *invalid* UTF-8 sequence straddles two
-    /// `advance` calls (see `Parser::advance_partial_utf8` upstream), so the
-    /// generator sticks to valid text. Even valid text is not split
-    /// invariant (crate docs, "Chunking"; #146): this property passes only
-    /// because the generator rarely puts a split inside a multi-byte
-    /// character that is followed by ASCII and another incomplete one. ASCII
-    /// control bytes and escape introducers are still fully covered.
+    /// Parses `bytes` with one [`Parser::advance_c1`] call per piece
+    /// between the `cuts` (clamped and sorted), with 8-bit controls
+    /// switching as in [`parse_c1`].
+    fn parse_split(bytes: &[u8], cuts: &[usize], c1: bool) -> Vec<Action> {
+        let mut cuts: Vec<usize> = cuts.iter().map(|&c| c.min(bytes.len())).collect();
+        cuts.sort_unstable();
+        let mut sink = Recorder {
+            out: Vec::new(),
+            on: c1,
+            fixed: false,
+        };
+        let mut parser = Parser::new();
+        let mut from = 0;
+        for cut in cuts.into_iter().chain([bytes.len()]) {
+            parser.advance_c1(&bytes[from..cut], &mut sink);
+            from = cut;
+        }
+        sink.out
+    }
+
+    /// #234 (#146): a character completed across two calls keeps the bytes
+    /// after it. `vte` 0.15 alone consumed every valid byte in its 4-byte
+    /// completion window but printed only the completed character, so the
+    /// `NUL` after `¡` (and the `a` after `é`) was lost.
+    #[test]
+    fn a_character_completed_across_calls_keeps_the_bytes_after_it() {
+        let bytes = [0xC2, 0xA1, 0x00, 0xC2, 0xA1];
+        let want = vec![Action::Print('¡'), Action::Execute(0), Action::Print('¡')];
+        assert_eq!(parse(&bytes), want);
+        for cut in 0..=bytes.len() {
+            assert_eq!(parse_split(&bytes, &[cut], false), want, "cut {cut}");
+        }
+        // The second seed of #234 (cut 60 splits the last but one `¡`).
+        let bytes = [
+            27, 80, 27, 80, 27, 80, 0, 0, 0, 0, 0, 27, 80, 0, 0, 0, 0, 240, 144, 128, 128, 27, 80,
+            27, 80, 0, 27, 80, 224, 160, 128, 0, 27, 80, 27, 80, 27, 80, 27, 80, 194, 128, 0, 0, 0,
+            27, 80, 0, 0, 0, 0, 27, 92, 194, 161, 0, 0, 0, 0, 194, 161, 0, 194, 161,
+        ];
+        assert_eq!(parse_split(&bytes, &[60], false), parse(&bytes));
+        let bytes = "éa中".as_bytes();
+        let want = vec![Action::Print('é'), Action::Print('a'), Action::Print('中')];
+        for cut in 0..=bytes.len() {
+            assert_eq!(parse_split(bytes, &[cut], false), want, "cut {cut}");
+        }
+        // A character completed one byte per call.
+        let cuts: Vec<usize> = (1..bytes.len()).collect();
+        assert_eq!(parse_split(bytes, &cuts, false), want);
+    }
+
+    /// #234: a `0x9C` byte of a UTF-8 character inside a DCS is payload
+    /// even when the character is split across two calls; before the fix
+    /// the second call saw a lone `0x9C` and ended the DCS there.
+    #[test]
+    fn a_split_character_with_a_9c_byte_does_not_end_a_dcs() {
+        let bytes = b"\x1bPqa\xf2\xaf\xa4\x9cb\x1b\\";
+        let want = vec![
+            dcs_start('q'),
+            Action::DcsData(b"ab".to_vec()),
+            Action::DcsEnd,
+            st(),
+        ];
+        for c1 in [false, true] {
+            assert_eq!(parse_c1(bytes, c1), want);
+            for cut in 0..=bytes.len() {
+                assert_eq!(parse_split(bytes, &[cut], c1), want, "cut {cut} c1 {c1}");
+            }
+        }
+    }
+
+    /// An incomplete character at the end of the input is held back, not
+    /// parsed, until the next call completes it or shows it invalid; the
+    /// parser holds at most 3 bytes for it.
+    #[test]
+    fn an_incomplete_character_waits_for_the_next_call() {
+        let mut parser = Parser::new();
+        let mut out = Vec::new();
+        parser.advance(b"a\xf0\x9f", |a| out.push(a));
+        assert_eq!(out, vec![Action::Print('a')]);
+        parser.advance(b"\x98", |a| out.push(a));
+        assert_eq!(out, vec![Action::Print('a')]);
+        parser.advance(b"\x80b", |a| out.push(a));
+        assert_eq!(
+            out,
+            vec![Action::Print('a'), Action::Print('😀'), Action::Print('b')]
+        );
+        // Shown invalid by the next byte: one replacement character, then
+        // the byte, as in one call.
+        let mut out = Vec::new();
+        parser.advance(b"\xe4\xb8", |a| out.push(a));
+        parser.advance(b"z", |a| out.push(a));
+        assert_eq!(out, vec![Action::Print('\u{FFFD}'), Action::Print('z')]);
+        assert_eq!(out, parse(b"\xe4\xb8z"));
+        // A sequence already invalid is parsed at once, not held.
+        let mut out = Vec::new();
+        parser.advance(b"\xf4\x91", |a| out.push(a));
+        assert_eq!(out, vec![Action::Print('\u{FFFD}'), Action::Execute(0x91)]);
+        // An invalid sequence that only the held character shows invalid
+        // (`E1 80` then a lead byte) waits with it.
+        let mut out = Vec::new();
+        parser.advance(b"\xe1\x80\xc2", |a| out.push(a));
+        assert_eq!(out, vec![]);
+        parser.advance(b"\xa1", |a| out.push(a));
+        assert_eq!(out, vec![Action::Print('\u{FFFD}'), Action::Print('¡')]);
+        assert_eq!(out, parse(b"\xe1\x80\xc2\xa1"));
+    }
+
+    /// Byte streams that are well-formed UTF-8 in ground state, rich in
+    /// multi-byte characters next to ASCII and controls: the pattern `vte`
+    /// 0.15 alone lost bytes on when a character was split (#234, #146).
     fn utf8_stream() -> impl Strategy<Value = Vec<u8>> {
         let token = prop_oneof![
             4 => (0u8..=0x7F).prop_map(|b| vec![b]),
-            1 => any::<char>().prop_map(|c| c.to_string().into_bytes()),
+            3 => any::<char>().prop_map(|c| c.to_string().into_bytes()),
+            2 => (0x80u32..0x800).prop_map(|c| char::from_u32(c).unwrap_or('x').to_string().into_bytes()),
             1 => Just(b"\x1bP".to_vec()),
             1 => Just(b"\x1b_".to_vec()),
             1 => Just(b"\x1b\\".to_vec()),
         ];
         proptest::collection::vec(token, 0..256).prop_map(|t| t.concat())
+    }
+
+    /// Hostile byte streams for the split properties: any byte, valid and
+    /// truncated UTF-8, C1 codes raw and encoded, characters with a `0x9C`
+    /// byte, DCS, APC and OSC introducers, terminators and the S7C1T/S8C1T
+    /// switches.
+    fn hostile_stream() -> impl Strategy<Value = Vec<u8>> {
+        let token = prop_oneof![
+            3 => any::<u8>().prop_map(|b| vec![b]),
+            2 => (0x20u8..=0x7E).prop_map(|b| vec![b]),
+            2 => any::<char>().prop_map(|c| c.to_string().into_bytes()),
+            1 => (0x80u8..=0x9F).prop_map(|b| vec![0xC2, b]),
+            1 => (0xC2u8..=0xF4, 0x80u8..=0xBF).prop_map(|(lead, cont)| vec![lead, cont]),
+            1 => prop_oneof![Just(&b"\xc9\x9c"[..]), Just(&b"\xe4\xb8\x9c"[..]),
+                Just(&b"\xf2\xaf\xa4\x9c"[..])].prop_map(<[u8]>::to_vec),
+            1 => prop_oneof![Just(&b"\x1bPq"[..]), Just(&b"\x90q"[..]), Just(&b"\x1b_"[..]),
+                Just(&b"\x1b]0;"[..]), Just(&b"\x1b\\"[..]), Just(&b"\x9c"[..]), Just(&b"\x07"[..]),
+                Just(&b"\x1b[1;2"[..]), Just(&b"\x1b G"[..]), Just(&b"\x1b F"[..]), Just(&b"\x18"[..])]
+                .prop_map(<[u8]>::to_vec),
+        ];
+        proptest::collection::vec(token, 0..128).prop_map(|t| t.concat())
     }
 
     /// Byte streams full of C1 codes, raw and UTF-8 encoded, UTF-8
@@ -1230,10 +1414,6 @@ mod tests {
 
     proptest! {
         /// The action stream never depends on where the byte stream was split.
-        ///
-        /// Known flaky until #146: about 1 run in 300 at the default case
-        /// count hits the `vte` split-UTF-8 bug and fails; with 100 000 cases
-        /// it fails within 2 s. A failure here is that bug, not a new one.
         #[test]
         fn split_invariant(bytes in utf8_stream(), cut in 0usize..1024) {
             let whole = parse(&bytes);
@@ -1245,13 +1425,29 @@ mod tests {
             prop_assert_eq!(whole, split);
         }
 
+        /// Any bytes at all, split anywhere into up to five calls, give the
+        /// actions of one call, with 8-bit controls on or off and switched
+        /// by the input.
+        #[test]
+        fn split_invariant_for_any_bytes(
+            bytes in hostile_stream(),
+            cuts in proptest::collection::vec(0usize..512, 0..5),
+            c1 in any::<bool>(),
+        ) {
+            prop_assert_eq!(parse_c1(&bytes, c1), parse_split(&bytes, &cuts, c1));
+        }
+
         /// With 8-bit controls on, the careful path gives exactly what `vte` gives
         /// for the input with every C1 code replaced by its 7-bit form over
         /// the whole input ([`translate_c1`]); in 7-bit mode exactly what
         /// `vte` gives for the input itself. No DCS in the input: a DCS is
-        /// where the two differ on purpose (the 0x9C fix).
+        /// where the two differ on purpose (the 0x9C fix). The input ends in
+        /// ASCII, so nothing is held back for a next call (crate docs,
+        /// "Chunking").
         #[test]
         fn c1_paths_agree_with_their_references(bytes in c1_stream(), c1 in any::<bool>()) {
+            let mut bytes = bytes;
+            bytes.push(b'a');
             let reference = if c1 { translate_c1(&bytes) } else { bytes.clone() };
             let mut vte_parser = vte::Parser::new();
             let mut want = Vec::new();
