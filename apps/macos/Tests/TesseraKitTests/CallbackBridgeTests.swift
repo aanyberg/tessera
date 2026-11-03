@@ -306,7 +306,8 @@ final class CallbackBridgeTests: XCTestCase {
         var session: TesseraSession? = TesseraSession(id: 9, core: core, bridge: other!)
         other!.register(session!)
         _ = try await holdClipboardWrite("held", session: 9, on: other!, leadSession: 9)
-        weak let weakBridge = other
+        weak var weakBridge: CallbackBridge?
+        weakBridge = other
         other!.shutDown()
         session = nil
         other = nil
