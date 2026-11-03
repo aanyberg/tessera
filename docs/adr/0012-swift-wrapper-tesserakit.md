@@ -100,6 +100,10 @@ Tests drive the C function pointers from a background thread to check this,
 and a regression test floods a real session with `yes $'\a'` and bounds the
 footprint, main-actor lag and shutdown time.
 
+A session's clipboard text (OSC 52) goes to the pasteboard, not to the
+delegate, through one throttle for the whole application: at most 10 writes
+a second, the latest held (ADR 0022 D-RATE52).
+
 On the main actor the bridge maps the session id to the `TesseraSession`
 and calls the delegate, looking both up again before each call, since the
 delegate may close the session or shut the app down from inside one. Events
