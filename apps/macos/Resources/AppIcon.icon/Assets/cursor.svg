@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+<defs><linearGradient id="terra" gradientUnits="userSpaceOnUse" x1="0" y1="200" x2="0" y2="840"><stop offset="0" stop-color="#ee8457"/><stop offset="1" stop-color="#d2623a"/></linearGradient></defs>
+<rect x="648" y="732.8" width="196" height="96" rx="26" fill="url(#terra)"/>
+</svg>
