@@ -157,11 +157,13 @@ final class CallbackBridgeTests: XCTestCase {
         XCTAssertTrue(bridge.sessions.isEmpty)
     }
 
-    /// Calls `on_session_clipboard` for session 7 with `text`'s UTF-8 from a
+    /// Calls `on_session_clipboard` for `session` with `text`'s UTF-8 from a
     /// buffer the caller overwrites as soon as the call returns.
-    private nonisolated static func writeClipboard(_ callbacks: TesseraCallbacks, _ text: String) {
+    private nonisolated static func writeClipboard(_ callbacks: TesseraCallbacks, _ text: String, session: UInt64 = 7) {
         var bytes = Array(text.utf8)
-        bytes.withUnsafeBufferPointer { callbacks.on_session_clipboard!(callbacks.user_data, 7, $0.baseAddress, $0.count) }
+        bytes.withUnsafeBufferPointer {
+            callbacks.on_session_clipboard!(callbacks.user_data, session, $0.baseAddress, $0.count)
+        }
         for index in bytes.indices { bytes[index] = 0x58 }
     }
 
@@ -201,6 +203,162 @@ final class CallbackBridgeTests: XCTestCase {
         }
         _ = try await drained()
         XCTAssertEqual(pasteboard.string(forType: .string), "keep")
+    }
+
+    // MARK: Clipboard write cap (ADR 0022 D-RATE52)
+
+    /// Lets the main actor run until `condition` holds, for at most `limit`.
+    private func until(_ limit: Duration = .seconds(2), _ condition: () -> Bool) async throws {
+        let deadline = ContinuousClock.now + limit
+        while !condition(), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+    }
+
+    /// ``writeClipboard(_:_:session:)`` on a background thread; returns once
+    /// it has.
+    private nonisolated static func writeClipboardOnReaderThread(
+        _ callbacks: TesseraCallbacks, _ text: String, session: UInt64
+    ) {
+        nonisolated(unsafe) let callbacks = callbacks
+        let done = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            writeClipboard(callbacks, text, session: session)
+            done.signal()
+        }
+        done.wait()
+    }
+
+    private var clipboard: String? { pasteboard.string(forType: .string) }
+
+    /// Has `bridge` hold `text` from `session`: a write right after one that
+    /// went to the pasteboard. Returns the text written before it. Retried
+    /// when the machine is so slow that the second write came after the
+    /// interval and went out at once.
+    private func holdClipboardWrite(
+        _ text: String, session: UInt64, on bridge: CallbackBridge, leadSession: UInt64 = 7
+    ) async throws -> String {
+        // The threads get the callback table, which holds the bridge
+        // unretained, as the core's do: not the bridge.
+        nonisolated(unsafe) let callbacks = bridge.callbacks()
+        for attempt in 0..<10 {
+            let lead = "lead \(attempt)"
+            Self.writeClipboardOnReaderThread(callbacks, lead, session: leadSession)
+            try await until { self.clipboard == lead }
+            XCTAssertEqual(clipboard, lead)
+            Self.writeClipboardOnReaderThread(callbacks, text, session: session)
+            try await until { bridge.clipboardThrottle.held != nil || self.clipboard == text }
+            if bridge.clipboardThrottle.held?.text == text {
+                XCTAssertTrue(bridge.isClipboardReleaseScheduled)
+                return lead
+            }
+            try await Task.sleep(for: ClipboardThrottle.minimumInterval * 2)
+        }
+        XCTFail("no write held in 10 attempts")
+        return ""
+    }
+
+    func testAWriteRightAfterAnotherIsHeldThenWritten() async throws {
+        let lead = try await holdClipboardWrite("held", session: 7, on: bridge)
+        let changes = pasteboard.changeCount
+        XCTAssertEqual(clipboard, lead, "held, not written yet")
+        try await until { self.clipboard == "held" }
+        XCTAssertEqual(clipboard, "held", "written once the interval passed")
+        XCTAssertEqual(pasteboard.changeCount, changes + 1)
+        XCTAssertNil(bridge.clipboardThrottle.held)
+        XCTAssertFalse(bridge.isClipboardReleaseScheduled)
+    }
+
+    func testClosingAnotherSessionLeavesTheHeldWriteHeld() async throws {
+        let other = TesseraSession(id: 8, core: core, bridge: bridge)
+        bridge.register(other)
+        let lead = try await holdClipboardWrite("kept", session: 8, on: bridge)
+        bridge.unregister(7)
+        XCTAssertEqual(clipboard, lead, "not written at another session's close")
+        XCTAssertEqual(bridge.clipboardThrottle.held?.text, "kept")
+        try await until { self.clipboard == "kept" }
+        XCTAssertEqual(clipboard, "kept", "released when due")
+    }
+
+    /// A program's last write, held, then its session closes (a clean exit
+    /// closes the tab): the write is made at the close, not lost.
+    func testAClosingSessionsOwnHeldWriteIsWrittenAtTheClose() async throws {
+        let other = TesseraSession(id: 8, core: core, bridge: bridge)
+        bridge.register(other)
+        _ = try await holdClipboardWrite("last", session: 8, on: bridge)
+        bridge.unregister(8)
+        XCTAssertEqual(clipboard, "last", "written at the close")
+        XCTAssertNil(bridge.clipboardThrottle.held)
+    }
+
+    func testAHeldWriteAtShutdownNeverReachesThePasteboard() async throws {
+        let lead = try await holdClipboardWrite("late", session: 7, on: bridge)
+        bridge.shutDown()
+        XCTAssertFalse(bridge.isClipboardReleaseScheduled, "shutdown cancels the release")
+        XCTAssertNil(bridge.clipboardThrottle.held, "and drops the held write")
+        try await Task.sleep(for: ClipboardThrottle.minimumInterval * 3)
+        XCTAssertEqual(clipboard, lead)
+    }
+
+    func testTheReleaseTimerDoesNotKeepAShutDownBridgeAlive() async throws {
+        var other: CallbackBridge? = CallbackBridge()
+        other!.pasteboard = pasteboard
+        var session: TesseraSession? = TesseraSession(id: 9, core: core, bridge: other!)
+        other!.register(session!)
+        _ = try await holdClipboardWrite("held", session: 9, on: other!, leadSession: 9)
+        weak let weakBridge = other
+        other!.shutDown()
+        session = nil
+        other = nil
+        XCTAssertNil(weakBridge, "the scheduled release does not hold the bridge")
+        try await Task.sleep(for: ClipboardThrottle.minimumInterval * 2)
+        XCTAssertNil(weakBridge, "nor after its interval")
+        XCTAssertNotEqual(clipboard, "held")
+    }
+
+    /// Two reader threads flood OSC 52 writes for two sessions, small and
+    /// 1 MiB, for over a second: the pasteboard changes at most 10 times a
+    /// second (plus slack for the boundaries; an upper bound only, so a
+    /// loaded machine cannot make it fail) and ends with the last text sent.
+    func testAClipboardFloodFromTwoSessionsIsCappedAndEndsWithTheLastWrite() async throws {
+        let other = TesseraSession(id: 8, core: core, bridge: bridge)
+        bridge.register(other)
+        let before = pasteboard.changeCount
+        let start = ContinuousClock.now
+        let finished = Mutex(0)
+        let perThread = 5_000
+        let span = Duration.milliseconds(1_200)
+        for sessionID: UInt64 in [7, 8] {
+            Thread.detachNewThread { [bridge] in
+                let callbacks = bridge!.callbacks()
+                let big = String(repeating: "x", count: 1 << 20)
+                for index in 0..<perThread {
+                    let due = start + span * index / perThread
+                    let wait = due - ContinuousClock.now
+                    if wait > .zero {
+                        Thread.sleep(forTimeInterval: Double(wait.components.attoseconds) / 1e18)
+                    }
+                    let text = index % 1_000 == 999 ? big + "\(sessionID) \(index)" : "\(sessionID) \(index)"
+                    CallbackBridgeTests.writeClipboard(callbacks, text, session: sessionID)
+                }
+                finished.withLock { $0 += 1 }
+            }
+        }
+        var heldWrites = 0
+        while finished.withLock({ $0 }) < 2 {
+            if bridge.clipboardThrottle.held != nil { heldWrites += 1 }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertGreaterThanOrEqual(ContinuousClock.now - start, .seconds(1), "the flood lasted a second")
+        onReaderThread { callbacks in CallbackBridgeTests.writeClipboard(callbacks, "the last", session: 8) }
+        try await until { self.clipboard == "the last" }
+        let elapsed = ContinuousClock.now - start
+        XCTAssertEqual(clipboard, "the last", "the last write is not lost")
+        let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
+        let changes = pasteboard.changeCount - before
+        XCTAssertLessThanOrEqual(changes, Int(seconds * 10) + 2, "\(changes) writes in \(elapsed)")
+        XCTAssertGreaterThan(heldWrites, 0, "writes were held during the flood")
+        XCTAssertNil(bridge.clipboardThrottle.held)
     }
 
     func testAppearanceChangesReachTheDelegateCoalesced() async throws {

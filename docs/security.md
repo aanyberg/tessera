@@ -71,7 +71,7 @@ a low-risk change.
 | OSC string in the parser | **none** (#213) | `crates/tessera-vt/src/lib.rs` |
 | OSC parameters | 16 | `crates/tessera-term/src/osc.rs` |
 | Title | 1024 bytes, dropped whole when longer; stack depth 10 | `crates/tessera-term/src/osc.rs`, `crates/tessera-term/src/reports.rs` |
-| OSC 52 write | 1 MiB decoded, strict base64, UTF-8; last write per chunk | `crates/tessera-term/src/osc.rs`, `crates/tessera-app-core/src/session.rs` |
+| OSC 52 write | 1 MiB decoded, strict base64, UTF-8; last write per chunk; 10 pasteboard writes per second app-wide, latest held | `crates/tessera-term/src/osc.rs`, `crates/tessera-app-core/src/session.rs`, `apps/macos/Sources/TesseraKit/CallbackBridge.swift` |
 | OSC 7 / OSC 1337 | 4096 bytes | `crates/tessera-term/src/lib.rs` |
 | DCS | streamed in 4 KiB chunks; DECRQSS request 64 bytes | `crates/tessera-vt/src/lib.rs`, `crates/tessera-term/src/dcs.rs` |
 | Grapheme cluster | 32 scalars | `crates/tessera-grid/src/grapheme.rs` |

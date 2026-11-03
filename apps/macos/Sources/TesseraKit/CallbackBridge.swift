@@ -22,10 +22,12 @@ internal import TesseraCore
 /// bell: a flag; exit: the code and signal) and schedules a delivery only if
 /// none is queued for that session. The delivery takes the whole set and
 /// reports it in a fixed order: output, title, clipboard, bell, exit. The
-/// clipboard text (OSC 52) goes to ``pasteboard``, not to the delegate. So
-/// at most one delivery per session is queued at any time; a delivery
-/// reports what happened since the previous one; and the exit, the core's
-/// last callback for a session, is always delivered last.
+/// clipboard text (OSC 52) goes to ``pasteboard``, not to the delegate,
+/// through one app-wide ``ClipboardThrottle`` (at most 10 writes a second,
+/// the latest held; ADR 0022 D-RATE52). So at most one delivery per session
+/// is queued at any time; a delivery reports what happened since the
+/// previous one; and the exit, the core's last callback for a session, is
+/// always delivered last.
 ///
 /// `on_appearance_changed` (from the core's configuration watch thread) is
 /// coalesced the same way, app-wide: at most one delivery is queued, and it
@@ -40,6 +42,13 @@ final class CallbackBridge {
     /// not yet closed.
     private(set) var sessions: [UInt64: TesseraSession] = [:]
     private var isShutDown = false
+    /// Spaces the pasteboard writes of every session (one pasteboard).
+    private(set) var clipboardThrottle = ClipboardThrottle()
+    /// Writes the held clipboard text when it falls due; at most one runs.
+    /// It holds the bridge weakly, and ``shutDown()`` cancels it.
+    private var clipboardRelease: Task<Void, Never>?
+    /// Whether a clipboard release is scheduled (tests).
+    var isClipboardReleaseScheduled: Bool { clipboardRelease != nil }
 
     /// Events received and not yet delivered, by session. A session has an
     /// entry exactly while a delivery for it is queued on the main actor.
@@ -55,17 +64,26 @@ final class CallbackBridge {
         sessions[session.id] = session
     }
 
+    /// Forgets a closed session. Its own held clipboard write, the last one
+    /// its program made, is written now rather than lost (a clean exit closes
+    /// the tab before the write would fall due).
     func unregister(_ id: UInt64) {
         sessions[id] = nil
+        guard !isShutDown, let write = clipboardThrottle.takeHeld(from: id, at: .now) else { return }
+        pasteboard.clearContents()
+        pasteboard.setString(write.text, forType: .string)
     }
 
     /// Called after `tessera_app_free` returned: drops the sessions (breaking
     /// their reference back to the bridge). Deliveries already queued still
     /// run; each takes its pending record and drops it because `isShutDown` is
-    /// set.
+    /// set. A held clipboard write is dropped.
     func shutDown() {
         isShutDown = true
         sessions.removeAll()
+        clipboardRelease?.cancel()
+        clipboardRelease = nil
+        clipboardThrottle.dropHeld()
     }
 
     /// The C callback table for this bridge. The function pointers capture
@@ -172,8 +190,7 @@ final class CallbackBridge {
             delegate.session(session, didSetTitle: title)
         }
         if let text = events.clipboard, !isShutDown, sessions[id] != nil {
-            pasteboard.clearContents()
-            pasteboard.setString(text, forType: .string)
+            offerClipboard(.init(session: id, text: text))
         }
         if events.bell, let (delegate, session) = target() {
             delegate.sessionDidRingBell(session)
@@ -181,5 +198,40 @@ final class CallbackBridge {
         if let exit = events.exit, let (delegate, session) = target() {
             delegate.session(session, didExitWithCode: exit.code, signal: exit.signal)
         }
+    }
+
+    // MARK: Clipboard
+
+    private func offerClipboard(_ write: ClipboardThrottle.Write) {
+        if let write = clipboardThrottle.offer(write, at: .now) {
+            writePasteboard(write)
+        }
+        scheduleClipboardRelease()
+    }
+
+    /// Starts the timer for a held write, unless one is already running.
+    private func scheduleClipboardRelease() {
+        guard clipboardRelease == nil, let due = clipboardThrottle.dueAt else { return }
+        clipboardRelease = Task { [weak self] in
+            try? await Task.sleep(until: due, clock: .continuous)
+            guard !Task.isCancelled else { return }
+            self?.releaseClipboard()
+        }
+    }
+
+    private func releaseClipboard() {
+        clipboardRelease = nil
+        if let write = clipboardThrottle.release(at: .now) {
+            writePasteboard(write)
+        }
+        scheduleClipboardRelease()
+    }
+
+    /// Writes a program's clipboard text, unless the bridge shut down or the
+    /// session it came from was closed in the meantime.
+    private func writePasteboard(_ write: ClipboardThrottle.Write) {
+        guard !isShutDown, sessions[write.session] != nil else { return }
+        pasteboard.clearContents()
+        pasteboard.setString(write.text, forType: .string)
     }
 }

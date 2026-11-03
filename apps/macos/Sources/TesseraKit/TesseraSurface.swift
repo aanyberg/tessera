@@ -165,7 +165,9 @@ public final class TesseraSurface {
     /// read it once per frame or resize and keep it for the mouse and input
     /// method events in between.
     ///
-    /// - Throws: ``TesseraCoreError/noSurface`` while detached,
+    /// - Throws: ``TesseraCoreError/noSurface`` while detached (also once the
+    ///   core detached the surface after a lost swapchain or a lost GPU
+    ///   device: ``isAttached`` is then `false` and the host attaches again),
     ///   ``TesseraCoreError/sessionNotFound`` once closed.
     public func metrics() throws -> Metrics {
         var metrics = TesseraSurfaceMetrics()
@@ -241,7 +243,9 @@ public final class TesseraSurface {
     /// at `scale`; the session is resized to the cells that fit. A zero size
     /// suspends drawing and keeps the session's size.
     ///
-    /// - Throws: ``TesseraCoreError/noSurface`` while detached,
+    /// - Throws: ``TesseraCoreError/noSurface`` while detached (also once the
+    ///   core detached the surface after a lost swapchain or a lost GPU
+    ///   device: ``isAttached`` is then `false` and the host attaches again),
     ///   ``TesseraCoreError/invalidArgument`` for a bad scale.
     public func resize(widthPx: UInt32, heightPx: UInt32, scale: Float) throws {
         try check(tessera_surface_resize(session.core.pointer, session.id, widthPx, heightPx, scale))
@@ -265,7 +269,9 @@ public final class TesseraSurface {
     /// Draws text at `points` (clamped by the core to 4...512; a non-finite
     /// size becomes 13) and resizes the session to the cells that fit.
     ///
-    /// - Throws: ``TesseraCoreError/noSurface`` while detached.
+    /// - Throws: ``TesseraCoreError/noSurface`` while detached (also once the
+    ///   core detached the surface after a lost swapchain or a lost GPU
+    ///   device: ``isAttached`` is then `false` and the host attaches again).
     public func setFontSize(_ points: Float) throws {
         try check(tessera_surface_set_font_size(session.core.pointer, session.id, points))
     }
