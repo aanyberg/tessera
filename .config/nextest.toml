@@ -59,6 +59,12 @@ test-group = 'timing'
 filter = '(package(tessera-term) & binary(decscusr) & test(=a_flood_of_cursor_styles_requests_nothing_and_stays_linear)) | (package(tessera-devwin) & test(=clipboard::tests::the_deadline_covers_all_commands))'
 test-group = 'timing'
 
+# The latency bound of a theme-file edit (`BOUND`, a debounce plus 500 ms with headroom; #243). Every other wait of
+# the theme tests is for state, with a 10 s deadline, and runs in parallel.
+[[profile.default.overrides]]
+filter = 'package(tessera-app-core) & binary(theme) & test(=a_theme_file_edit_applies_within_the_bound)'
+test-group = 'timing'
+
 # Release-only wall-clock bars, run by the gate's release timing step (#114).
 [[profile.default.overrides]]
 filter = 'package(tessera-app-core) & kind(lib) & (test(reader_lock_hold_is_bounded) | test(view_metrics_are_fast_while_output_floods_the_terminal))'

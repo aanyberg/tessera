@@ -430,7 +430,16 @@ fn active_theme_file(store: &ConfigStore, previous: Option<&Path>) -> Option<std
 /// Re-reads the file, applies it and reports the outcome to every watcher of
 /// the store. Nothing is sent when the file is unchanged.
 fn reload_and_report(store: &ConfigStore) {
-    let event = match store.load_from_disk() {
+    if let Some(event) = reload(store) {
+        store.broadcast(&event);
+    }
+}
+
+/// Re-reads the file and applies it: the event that reports the outcome,
+/// for the caller to send to every watcher of the store, or `None` when the
+/// file is unchanged (or the same error was reported already).
+fn reload(store: &ConfigStore) -> Option<ConfigEvent> {
+    match store.load_from_disk() {
         Ok(loaded) => {
             let warnings = loaded.warnings.clone();
             store
@@ -445,9 +454,6 @@ fn reload_and_report(store: &ConfigStore) {
                 .record_error(error.clone())
                 .then_some(ConfigEvent::Invalid(error))
         }
-    };
-    if let Some(event) = event {
-        store.broadcast(&event);
     }
 }
 
@@ -1090,6 +1096,12 @@ mod native {
         /// Reloads `config.toml`, follows the theme file `appearance.theme`
         /// now resolves to and reports a change of `themes/`.
         ///
+        /// The theme file is followed before the reload is reported: a
+        /// subscriber may react to the change at once by saving that file,
+        /// and a save that leaves it unloadable hides a file found by its
+        /// `name` key from the lookup, which would then keep following the
+        /// previous theme's file and miss the save that fixes it (#243).
+        ///
         /// Runs with the directories armed and does not re-register them
         /// (that would drop their pending events), only the theme file, and
         /// that before the directory is sampled. So a theme file created
@@ -1097,11 +1109,14 @@ mod native {
         /// write after the registration raises an event on the armed file,
         /// and nothing lands unseen between the sample and the next wait.
         fn settle(&mut self, store: &ConfigStore) {
-            super::reload_and_report(store);
+            let reloaded = super::reload(store);
             self.theme_file = active_theme_file(store, self.theme_file.as_deref());
             let result = self.register_theme_file();
             if result.is_err() {
                 self.note_registration(result);
+            }
+            if let Some(event) = reloaded {
+                store.broadcast(&event);
             }
             report_themes(store);
         }
@@ -1172,6 +1187,80 @@ mod native {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::theme::Theme;
+        use crate::watch::ConfigEvent;
+
+        /// A theme document named `name`.
+        fn theme_named(name: &str) -> String {
+            let mut theme = Theme::bundled("Nord").unwrap().clone();
+            theme.name = name.into();
+            theme.to_toml()
+        }
+
+        /// Saves `keyed.toml` half-written (it no longer loads, so its
+        /// `name` key cannot be read) the moment a `Changed` is reported.
+        fn break_keyed_on_change(paths: &ConfigPaths, event: &ConfigEvent) {
+            if matches!(event, ConfigEvent::Changed(_)) {
+                std::fs::write(
+                    paths.themes_dir().join("keyed.toml"),
+                    "name = \"Keyed Theme\"\nforeground = ",
+                )
+                .unwrap();
+            }
+        }
+
+        /// #243: a configuration that switches to a theme found by its
+        /// `name` key (file `keyed.toml`, name "Keyed Theme") is reported
+        /// only once that file is followed. A subscriber that saves the file
+        /// half-written as soon as it hears of the change (it no longer
+        /// loads, so the lookup cannot find it by name) must not leave the
+        /// watch on the previous theme's file: the save that fixes the
+        /// theme raises an event. Deterministic: the save runs inside the
+        /// broadcast, on the watcher's own thread.
+        #[test]
+        fn a_new_theme_file_is_followed_before_the_change_is_reported() {
+            let base = tempfile::tempdir().unwrap();
+            let paths = ConfigPaths::new(base.path());
+            let mine = paths.themes_dir().join("mine.toml");
+            let keyed = paths.themes_dir().join("keyed.toml");
+            std::fs::create_dir_all(paths.themes_dir()).unwrap();
+            std::fs::write(&mine, theme_named("Mine")).unwrap();
+            std::fs::write(&keyed, theme_named("Keyed Theme")).unwrap();
+            std::fs::write(paths.config_file(), "[appearance]\ntheme = \"mine\"\n").unwrap();
+            let store = ConfigStore::open(paths.clone()).unwrap();
+            let (mut native, _stop) =
+                Native::open(&paths, active_theme_file(&store, None)).unwrap();
+            assert_eq!(native.theme_file.as_deref(), Some(mine.as_path()));
+
+            store.set_on_broadcast(Some(break_keyed_on_change));
+            crate::write_atomic(
+                &paths.config_file(),
+                "[appearance]\ntheme = \"Keyed Theme\"\n",
+            )
+            .unwrap();
+            native.settle(&store);
+            assert_eq!(store.config().appearance.theme, "Keyed Theme");
+            assert_eq!(
+                std::fs::read_to_string(&keyed).unwrap(),
+                "name = \"Keyed Theme\"\nforeground = ",
+                "the subscriber saved the file"
+            );
+            assert_eq!(
+                native.theme_file.as_deref(),
+                Some(keyed.as_path()),
+                "the theme in use is followed"
+            );
+
+            // The fix, saved in place, raises an event on the followed file.
+            while native.queue.poll(None).is_some() {}
+            std::fs::write(&keyed, theme_named("Keyed Theme")).unwrap();
+            let fd = native.theme_file_handle.as_ref().map(AsRawFd::as_raw_fd);
+            let event = native.queue.poll(Some(std::time::Duration::from_secs(5)));
+            assert!(
+                matches!(&event, Some(Event { ident: Ident::Fd(got), .. }) if Some(*got) == fd),
+                "no event for the fix on the theme file ({fd:?}): {event:?}"
+            );
+        }
 
         #[test]
         fn a_directory_removed_after_opening_is_no_longer_named() {
