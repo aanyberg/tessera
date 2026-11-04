@@ -131,21 +131,26 @@ path is added.
   dropped. Bracketed paste is the consumer's protection. iTerm2 strips C0.
 - D-RATE52: the frontend writes the pasteboard at most 10 times a second
   app-wide (`ClipboardThrottle.maxWritesPerSecond`, 100 ms apart). A write
-  after 100 ms of quiet goes out at once, so a single yank has no added
-  latency; a write within the interval is held, not dropped, in one held
-  slot for the whole application (the latest from any session wins) and is
-  written when the interval since the previous write has passed, so the
-  pasteboard ends with the last write a program made. When the session
-  that made the held write closes (a clean exit closes its tab), the write
-  is made at once: at most one extra write per closing session. A held
-  write from another session is unaffected, and shutting the application
-  down drops it. Without it a `printf` loop made about 8 700 pasteboard writes a
-  second, each bumping `NSPasteboard.changeCount`, which clipboard-history
-  apps record. It is in the frontend (`CallbackBridge`, one per
-  `TesseraApp`) because the cost is the pasteboard write and there is one
-  pasteboard per application: the bridge is where every session's writes
-  meet. The core already bounds memory and per-chunk work (D-CAP52, the
-  last write per chunk).
+  at least 100 ms after the previous pasteboard write goes out at once, so a
+  single yank has no added latency; a write within the interval is held, not
+  dropped, in one held slot for the whole application (the latest from any
+  session wins) and is written when the interval since the previous write
+  has passed, so the pasteboard ends with the last write any program made.
+  When the session that made the held write closes (a clean exit closes its
+  tab), the write is made at once: at most one extra write per closing
+  session. A held write from another session is unaffected. Two writes are
+  dropped, and the pasteboard keeps what was written before: one that
+  reaches the bridge after its session closed (its delivery was still queued
+  when the tab closed), and the one held when the application shuts down.
+  With `clipboard_write` switched off live, up to 2 writes (the held write,
+  and one the core delivers before it applies the new configuration) can
+  still reach the pasteboard within about 115 ms of the edit. Without the
+  throttle a `printf` loop made about 8 700 pasteboard writes a second, each
+  bumping `NSPasteboard.changeCount`, which clipboard-history apps record.
+  It is in the frontend (`CallbackBridge`, one per `TesseraApp`) because the
+  cost is the pasteboard write and there is one pasteboard per application:
+  the bridge is where every session's writes meet. The core already bounds
+  memory and per-chunk work (D-CAP52, the last write per chunk).
 
 `[terminal] clipboard_write` (default `true`, as kitty, WezTerm and
 Alacritty allow writes by default; xterm and iTerm2 deny) gates delivery in

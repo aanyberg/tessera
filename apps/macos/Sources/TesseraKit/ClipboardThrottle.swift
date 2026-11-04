@@ -3,14 +3,18 @@
 ///
 /// Every pasteboard write bumps `NSPasteboard.changeCount`, which
 /// clipboard-history apps observe, and a `printf` loop makes thousands a
-/// second. A write after at least ``minimumInterval`` of quiet goes out at
-/// once, so a single yank has no added latency. A write within the interval
-/// is held, not dropped: one held write for the whole application, the
-/// latest from any session replacing the one before, released when the
-/// interval since the previous write has passed. So the pasteboard always
-/// ends up with the last write a program made. A session that closes with
-/// its write held has it written at the close (``takeHeld(from:at:)``): at
-/// most one extra write per closing session.
+/// second. A write at least ``minimumInterval`` after the previous
+/// pasteboard write goes out at once, so a single yank has no added
+/// latency. A write within the interval is held, not dropped: one held
+/// write for the whole application, the latest from any session replacing
+/// the one before, released when the interval since the previous write has
+/// passed. So the pasteboard ends up with the last write any program made:
+/// a session that closes with its write held has it written at the close
+/// (``takeHeld(from:at:)``), at most one extra write per closing session.
+/// Two are dropped instead, and the pasteboard keeps what was written
+/// before: a write that reaches ``CallbackBridge`` after its session closed
+/// (its delivery was still queued when the tab closed), and the write held
+/// at shutdown.
 ///
 /// Memory: the held write is one string, at most the core's 1 MiB OSC 52
 /// payload cap (ADR 0022).
@@ -47,8 +51,9 @@ struct ClipboardThrottle {
             held = write
             return nil
         }
-        // Quiet long enough; a held write (its release came late) is
-        // superseded by this newer one.
+        // The interval since the previous pasteboard write has passed; a
+        // held write (its release came late) is superseded by this newer
+        // one.
         held = nil
         lastWrite = now
         return write

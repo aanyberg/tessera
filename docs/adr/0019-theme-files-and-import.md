@@ -249,17 +249,18 @@ draws the same pixels as a view attached translucent from the start
 (`#282a36` at alpha `0x80`).
 
 **The host is told once per applied change.** After an `apply_config` that
-changed what the views draw (colours, opacity or font size), the observer's
-`on_appearance_changed(opaque)` runs on the watch's thread. In the C API
-that is `TesseraCallbacks.on_appearance_changed`, the table's new last
-field. The host makes its windows opaque or translucent to match and asks
-every view for a frame. It is called on every such change, not only when
-`opaque` flips: the app's display link idles when nothing changed, so a
-colour-only re-theme of a quiet terminal would otherwise not be drawn
-until its next output. The host needs nothing else: colours stay in the
-core, and the Preferences pane (#40) goes through the file. In the app,
-TesseraKit coalesces the callbacks into `appearanceDidChange(opaque:)` on
-the main actor, and the session router calls every tab's
+changed what the views draw (colours, opacity, font size or the default
+cursor style), the observer's `on_appearance_changed(opaque)` runs on the
+watch's thread. In the C API that is
+`TesseraCallbacks.on_appearance_changed`, the table's new last field. The
+host makes its windows opaque or translucent to match and asks every view
+for a frame. It is called on every such change, not only when `opaque`
+flips: the app's display link idles when nothing changed, so a colour-only
+re-theme of a quiet terminal would otherwise not be drawn until its next
+output. The host needs nothing else: colours stay in the core, and the
+Preferences pane (#40) goes through the file. In the app, TesseraKit
+coalesces the callbacks into `appearanceDidChange(opaque:)` on the main
+actor, and the session router calls every tab's
 `TerminalSurfaceView.applyLayerOpacity(opaque:)`, which sets
 `window.isOpaque` and the window's background colour (invalidating its
 shadow) and requests a frame. It leaves `metalLayer.isOpaque` to the core,
