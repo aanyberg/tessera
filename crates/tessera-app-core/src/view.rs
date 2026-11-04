@@ -2004,9 +2004,18 @@ mod tests {
     /// slack = (n - 2) * I` apart, and two seconds hold at most `2 s / I +
     /// 2 = 482` frames. A debug build presents about 350 to 481 (the loop
     /// is fast enough to hit the limit on an idle machine) and, without
-    /// pacing, about 1 000, so removing the pacing fails the test. The
-    /// flood never starves the frames below 30 per second, and the
-    /// snapshot's memory does not grow with the output.
+    /// pacing, about 1 000, so removing the pacing fails the test.
+    ///
+    /// The flood never starves the frames: every render of new output
+    /// that is due by the schedule (no frame presented yet, or the clock
+    /// read just before the call at least `I - slack` past the last
+    /// frame's due time) presents. That bar follows the loop's own
+    /// progress, so a slow machine (fewer calls, each later) cannot fail
+    /// it, and a render that stops presenting during the flood fails it at
+    /// its first due call (#233). The schedule is restated here rather
+    /// than taken from `is_paced`, so a mutant schedule that paces every
+    /// call cannot make the bar vacuous. The snapshot's memory does not
+    /// grow with the output.
     #[test]
     fn a_flood_renders_at_display_rate() {
         let Some(mut view) = offscreen_view(24, 80) else {
@@ -2017,10 +2026,12 @@ mod tests {
         let window = Duration::from_secs(2);
         let start = Instant::now();
         let (mut fed, mut presented, mut calls) = (0, 0u32, 0u32);
+        let (mut due, mut due_presented) = (0u32, 0u32);
         let mut longest_capture = Duration::ZERO;
         let mut capacity = None;
         while start.elapsed() < window {
-            if fed < 10_000 {
+            let advanced = fed < 10_000;
+            if advanced {
                 term.advance(&chunk);
                 fed += 1;
             }
@@ -2028,8 +2039,20 @@ mod tests {
             view.capture(&term, 0);
             longest_capture = longest_capture.max(t.elapsed());
             calls += 1;
-            if view.render(true).expect("frame") == FrameStatus::Presented {
+            let before = Instant::now();
+            let is_due = advanced
+                && view
+                    .last_presented
+                    .is_none_or(|last| before + FRAME_SLACK >= last + MIN_FRAME_INTERVAL);
+            let status = view.render(true).expect("frame");
+            if status == FrameStatus::Presented {
                 presented += 1;
+            }
+            if is_due {
+                due += 1;
+                if status == FrameStatus::Presented {
+                    due_presented += 1;
+                }
             }
             let cap = (
                 view.snapshot.cells.capacity(),
@@ -2039,12 +2062,16 @@ mod tests {
             capacity = Some(cap);
         }
         eprintln!(
-            "flood: {fed} reads, {calls} calls, {presented} frames presented in {window:?}; \
-             longest capture {longest_capture:?}"
+            "flood: {fed} reads, {calls} calls, {presented} frames presented in {window:?} \
+             ({due_presented} of {due} due renders); longest capture {longest_capture:?}"
         );
         let max = 2 * 240 + 2;
         assert!(presented <= max, "{presented} frames > {max}: not paced");
-        assert!(presented >= 2 * 30, "{presented} frames < 60: starved");
+        assert!(due >= 1, "the first render of the flood is always due");
+        assert_eq!(
+            due_presented, due,
+            "starved: {due_presented} of {due} due renders presented"
+        );
     }
 
     /// The snapshot's rows and clusters exactly as `term`'s grid holds them.

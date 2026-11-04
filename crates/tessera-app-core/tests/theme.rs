@@ -67,15 +67,35 @@ fn assert_bytes(got: [u8; 4], want: [u8; 4]) {
     assert!(close, "clear colour {got:02x?}, expected {want:02x?} (±1)");
 }
 
+/// How long a test waits for a change it expects: generous, so a loaded
+/// machine is not mistaken for a lost change, and no slower when the
+/// change comes at once (`recv_timeout` returns as soon as it arrives).
+/// How soon a theme edit applies is asserted once, against [`BOUND`], in
+/// `a_theme_file_edit_applies_within_the_bound`.
+const WAIT: Duration = Duration::from_secs(10);
+
+/// Whether `done` holds within [`WAIT`], checked every 10 ms: for a state
+/// the watch reaches without reporting an appearance change.
+fn eventually(mut done: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + WAIT;
+    while !done() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
+
 /// Waits for the watcher's next `Changed` event.
 fn next_change(watcher: &tessera_config::Watcher) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + WAIT;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         match watcher.recv_timeout(left) {
             Ok(ConfigEvent::Changed(_)) => return,
             Ok(other) => eprintln!("ignoring {other:?}"),
-            Err(e) => panic!("no Changed event within 10 s: {e}"),
+            Err(e) => panic!("no Changed event within {WAIT:?}: {e}"),
         }
     }
 }
@@ -173,9 +193,55 @@ fn background(app: &App) -> [u8; 3] {
     app.view_theme().background.to_srgb8()
 }
 
+/// Waits up to [`WAIT`] for a translucent (`false`) report, passing over
+/// opaque ones.
+fn next_translucent(changes: &std::sync::mpsc::Receiver<bool>) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        match changes.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(false) => return,
+            Ok(true) => eprintln!("translucent: an opaque change came first"),
+            Err(e) => panic!("translucent: no translucent change within {WAIT:?}: {e}"),
+        }
+    }
+}
+
+/// Counts the reports up to the one after which `app` draws `last` (within
+/// [`WAIT`] of `since`), then those that trail it for as long as `quiet`
+/// waits (800 ms); and how long after `since` `last` was drawn, if it was.
+fn count_changes(
+    changes: &std::sync::mpsc::Receiver<bool>,
+    app: &App,
+    last: [u8; 3],
+    since: Instant,
+) -> (u32, Option<Duration>) {
+    let deadline = since + WAIT;
+    let mut reported = 0_u32;
+    let mut latency = None;
+    while latency.is_none() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if changes.recv_timeout(left).is_err() {
+            break;
+        }
+        reported += 1;
+        if background(app) == last {
+            latency = Some(since.elapsed());
+        }
+    }
+    while changes.recv_timeout(Duration::from_millis(800)).is_ok() {
+        reported += 1;
+    }
+    (reported, latency)
+}
+
 /// The bound the issue sets for a theme-file edit (a debounce plus 500 ms),
 /// with headroom for a loaded machine: `recv_timeout` returns as soon as
-/// the change arrives.
+/// the change arrives. Asserted only by
+/// `a_theme_file_edit_applies_within_the_bound`, which runs in the
+/// `timing` nextest group (one at a time); every other wait is [`WAIT`].
+/// Measured with ten `yes` burners on ten cores (load average 11 to 122,
+/// 2026-11-04): median 103 ms, at most 111 ms over 100 runs, so the bound
+/// leaves 13 times the loaded maximum.
 const BOUND: Duration = Duration::from_millis(1500);
 
 /// Writes of the flood in the watch test: a fixed count, so a slow machine
@@ -221,7 +287,7 @@ fn the_config_watch_applies_edits_and_reports_appearance_changes() {
         theme_doc("Mine", "#111111"),
     )
     .unwrap();
-    assert_eq!(changes.recv_timeout(BOUND), Ok(true), "theme file edit");
+    assert_eq!(changes.recv_timeout(WAIT), Ok(true), "theme file edit");
     assert_eq!(background(&app), [0x11, 0x11, 0x11]);
     quiet("after the theme edit");
 
@@ -246,7 +312,11 @@ fn the_config_watch_applies_edits_and_reports_appearance_changes() {
         "[appearance]\ntheme = \"other\"\nopacity = 0.5\n",
     )
     .unwrap();
-    assert_eq!(changes.recv_timeout(BOUND), Ok(false), "translucent");
+    // An apply thread that handles the unrelated files' `ThemesChanged`
+    // only after the store reloaded `config.toml` (a loaded machine)
+    // applies the newly named theme at the old opacity first, an opaque
+    // change, so one may come before the translucent one.
+    next_translucent(&changes);
     assert_eq!(background(&app), [0x21, 0x21, 0x21]);
     assert!((app.view_theme().background.a - 0.5).abs() < 1e-6);
     assert_eq!(app.config().appearance.opacity, 0.5);
@@ -275,17 +345,7 @@ fn the_config_watch_applies_edits_and_reports_appearance_changes() {
     let elapsed = started.elapsed();
     let last_write = Instant::now();
     let shade = u8::try_from(0x40 + (WRITES - 1) % 0x40).unwrap();
-    // The latency is to the change that carries the last value.
-    let deadline = last_write + BOUND;
-    let mut reported = 0_u32;
-    let mut latency = None;
-    while let Ok(_opaque) = changes.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-    {
-        reported += 1;
-        if latency.is_none() && background(&app) == [shade, shade, shade] {
-            latency = Some(last_write.elapsed());
-        }
-    }
+    let (reported, latency) = count_changes(&changes, &app, [shade; 3], last_write);
     eprintln!(
         "flood: {WRITES} writes in {elapsed:?}, {reported} appearance changes, \
          the last value applied {latency:?} after the last write"
@@ -303,7 +363,41 @@ fn the_config_watch_applies_edits_and_reports_appearance_changes() {
             "flood: a {largest_gap:?} gap between writes; the coalescing bound does not apply"
         );
     }
-    assert!(latency.is_some(), "the last write was never applied");
+    assert!(
+        latency.is_some(),
+        "the last write was not applied within {WAIT:?}"
+    );
+}
+
+/// The latency bound for a theme-file edit, the only test that asserts it
+/// ([`BOUND`]; `.config/nextest.toml` runs it in the `timing` group): an
+/// in-place (non-atomic) save of the theme in use is applied and reported
+/// within the bound.
+#[test]
+fn a_theme_file_edit_applies_within_the_bound() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = ConfigPaths::new(root.path());
+    let mine = paths.themes_dir().join("mine.toml");
+    std::fs::create_dir_all(paths.themes_dir()).unwrap();
+    std::fs::write(&mine, theme_doc("Mine", "#101010")).unwrap();
+    std::fs::write(paths.config_file(), "[appearance]\ntheme = \"mine\"\n").unwrap();
+    let app = App::with_config_dir(paths.clone(), WatchOptions::default());
+    let (tx, changes) = std::sync::mpsc::channel();
+    app.set_observer(Some(Box::new(Appearance(tx))));
+    let got = changes.recv_timeout(Duration::from_millis(800));
+    assert!(got.is_err(), "start: unexpected appearance change {got:?}");
+
+    let written = Instant::now();
+    std::fs::write(&mine, theme_doc("Mine", "#111111")).unwrap();
+    let got = changes.recv_timeout(WAIT);
+    let latency = written.elapsed();
+    eprintln!("a theme edit applied {latency:?} after the write");
+    assert_eq!(got, Ok(true), "theme file edit");
+    assert_eq!(background(&app), [0x11, 0x11, 0x11]);
+    assert!(
+        latency <= BOUND,
+        "applied {latency:?} after the write: over {BOUND:?}"
+    );
 }
 
 /// A save of the theme in use that does not load (an editor's partial
@@ -337,7 +431,7 @@ fn a_broken_theme_file_keeps_the_colours_in_use() {
         "not the default theme"
     );
     std::fs::write(&mine, theme_doc("Mine", "#1a1a1a")).unwrap();
-    assert_eq!(changes.recv_timeout(BOUND), Ok(true), "the fix");
+    assert_eq!(changes.recv_timeout(WAIT), Ok(true), "the fix");
     assert_eq!(background(&app), [0x1a, 0x1a, 0x1a]);
 
     // A theme found by its `name` key (file stem `keyed`, name "Keyed
@@ -350,11 +444,7 @@ fn a_broken_theme_file_keeps_the_colours_in_use() {
         "[appearance]\ntheme = \"Keyed Theme\"\n",
     )
     .unwrap();
-    assert_eq!(
-        changes.recv_timeout(BOUND),
-        Ok(true),
-        "keyed theme selected"
-    );
+    assert_eq!(changes.recv_timeout(WAIT), Ok(true), "keyed theme selected");
     assert_eq!(background(&app), [0x1c, 0x1c, 0x1c]);
     std::fs::write(&keyed, "name = \"Keyed Theme\"\nforeground = ").unwrap();
     quiet("broken keyed save");
@@ -364,7 +454,7 @@ fn a_broken_theme_file_keeps_the_colours_in_use() {
         "not the default theme"
     );
     std::fs::write(&keyed, theme_doc("Keyed Theme", "#1d1d1d")).unwrap();
-    assert_eq!(changes.recv_timeout(BOUND), Ok(true), "the keyed fix");
+    assert_eq!(changes.recv_timeout(WAIT), Ok(true), "the keyed fix");
     assert_eq!(background(&app), [0x1d, 0x1d, 0x1d]);
 
     // A configuration naming a broken file: applied, colours kept.
@@ -373,8 +463,13 @@ fn a_broken_theme_file_keeps_the_colours_in_use() {
         "[appearance]\ntheme = \"bad\"\nfont_size = 13\n",
     )
     .unwrap();
+    // Applied (waited for, as the apply reports no appearance change), and
+    // then nothing reported.
+    assert!(
+        eventually(|| app.config().appearance.theme == "bad"),
+        "the configuration naming a broken theme was not applied within {WAIT:?}"
+    );
     quiet("config naming a broken theme");
-    assert_eq!(app.config().appearance.theme, "bad");
     assert_eq!(background(&app), [0x1d, 0x1d, 0x1d]);
     drop(app);
 
@@ -400,7 +495,7 @@ fn a_broken_theme_file_keeps_the_colours_in_use() {
         .unwrap();
     std::thread::sleep(Duration::from_millis(150));
     std::fs::write(&mine, theme_doc("Mine", "#1b1b1b")).unwrap();
-    assert_eq!(changes.recv_timeout(BOUND), Ok(true), "the fixed file");
+    assert_eq!(changes.recv_timeout(WAIT), Ok(true), "the fixed file");
     assert_eq!(background(&app), [0x1b, 0x1b, 0x1b]);
     quiet("after the fix");
 }

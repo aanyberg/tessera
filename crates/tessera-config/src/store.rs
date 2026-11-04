@@ -49,6 +49,11 @@ pub(crate) struct State {
     /// The themes directory's state when a watcher last sampled it, `None`
     /// before the first sample; see [`ConfigStore::record_themes`].
     themes: Option<ThemesFingerprint>,
+    /// Called after each [`ConfigStore::broadcast`], on the broadcasting
+    /// thread: a subscriber that reacts to an event before the watcher
+    /// thread goes on, for tests of what the watcher does after reporting.
+    #[cfg(test)]
+    on_broadcast: Option<fn(&ConfigPaths, &ConfigEvent)>,
 }
 
 impl ConfigStore {
@@ -113,6 +118,8 @@ impl ConfigStore {
                 subscribers: Vec::new(),
                 next_subscription: 0,
                 themes: None,
+                #[cfg(test)]
+                on_broadcast: None,
             })),
         }
     }
@@ -245,6 +252,19 @@ impl ConfigStore {
         self.write()
             .subscribers
             .retain(|(_, tx)| tx.send(event.clone()).is_ok());
+        #[cfg(test)]
+        {
+            let hook = self.read().on_broadcast;
+            if let Some(hook) = hook {
+                hook(&self.paths, event);
+            }
+        }
+    }
+
+    /// Sets the hook [`ConfigStore::broadcast`] calls after each event.
+    #[cfg(test)]
+    pub(crate) fn set_on_broadcast(&self, hook: Option<fn(&ConfigPaths, &ConfigEvent)>) {
+        self.write().on_broadcast = hook;
     }
 
     pub(crate) fn load_from_disk(&self) -> Result<Loaded, Error> {

@@ -1220,12 +1220,19 @@ mod tests {
 
     /// #168 (D-APPLY-ORDER): four applies of different cursor styles race
     /// while every terminal's lock is busy with output, and a session is
-    /// attached meanwhile (its reader busy from the start). Each terminal reads the style under its own
-    /// lock, so once both return every session, the new one too, has the
-    /// style of the configuration in effect: an apply that recorded its
-    /// configuration first but reaches a terminal last does not leave it
-    /// on its older style. The same holds for the theme's colours each
-    /// apply pushes (#10). Runs: `ADV_RUNS` (default 2 000).
+    /// attached meanwhile (its reader busy from the start). Each terminal
+    /// reads the style under its own lock, so once both return every
+    /// session, the new one too, has the style of the configuration in
+    /// effect: an apply that recorded its configuration first but reaches a
+    /// terminal last does not leave it on its older style. The same holds
+    /// for the theme's colours each apply pushes (#10).
+    ///
+    /// Runs: `ADV_RUNS` (default 200, about 0.4 s in debug, so the seven
+    /// threads do not load the timing tests beside it for long; #231). Both
+    /// mutants it was written for fail all 20 of 20 tries at 50 runs:
+    /// `Live::apply` pushing the `config` and colours it was given instead
+    /// of `push_defaults`, and `App::attach` without its re-read once the
+    /// session is listed.
     #[test]
     fn racing_applies_leave_every_session_on_the_style_in_effect() {
         use tessera_config::CursorShape;
@@ -1233,7 +1240,7 @@ mod tests {
         let runs = std::env::var("ADV_RUNS")
             .ok()
             .and_then(|n| n.parse().ok())
-            .unwrap_or(2_000_usize);
+            .unwrap_or(200_usize);
         let theme = tessera_config::Theme::default();
         let block = cursor_config(CursorShape::Block, false);
         let racing = [
