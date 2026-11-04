@@ -43,9 +43,9 @@
 //! terminal's ([`Terminal::color_overrides`]); the theme they fall back to
 //! is pushed into every terminal by [`crate::App`] ([`theme_colors_for`]).
 //! `View::capture` compares the terminal's colour generation
-//! ([`Terminal::colors_generation`], one number) and copies the overrides
-//! only when it moved, or after a re-theme (a program colour equal to the
-//! old theme's moves no generation); `View::render` then rebuilds the renderer's theme
+//! ([`Terminal::colors_generation`], one number, which moves on every
+//! change of the overrides, #238) and copies the overrides only when it
+//! moved, or after a re-theme; `View::render` then rebuilds the renderer's theme
 //! from the configured one and the overrides (`with_overrides`), at most
 //! once per frame and outside the terminal lock, so a flood of colour sets
 //! costs one rebuild per drawn frame. A re-theme keeps the overrides.
@@ -577,9 +577,9 @@ impl View {
     /// theme (D-THEME-KEEP).
     pub(crate) fn set_appearance(&mut self, theme: Theme) {
         self.base = theme;
-        // The generation does not move for a program colour equal to the
-        // old theme's, so the copy may lack it: the next capture compares
-        // the override table again (critic B1).
+        // Belt and braces: every override change moves the terminal's
+        // colour generation (#238), so the copy is current; the next
+        // capture compares the override table again anyway (critic B1).
         self.snapshot.colors_generation = None;
         self.apply_colors();
     }
@@ -2261,6 +2261,40 @@ mod tests {
         assert!(snapshot.colors().is_empty());
     }
 
+    /// #238 (the adversarial `adv_b1_race`): `Live::apply`'s own
+    /// interleaving. The views are re-themed (`View::set_appearance`
+    /// forgets the colour generation) and the views lock dropped; a frame
+    /// captures; the reader applies a program colour equal to the
+    /// terminal's still old theme colour; `push_defaults` then gives the
+    /// terminal a theme that moves only that overridden slot. The override
+    /// is a change of the colour generation, so the next capture copies it
+    /// and the view draws the program's colour, the one queries report.
+    #[test]
+    fn a_program_colour_set_between_re_theme_and_push_defaults_is_copied() {
+        let mut term = Terminal::new(1, 4);
+        let old = ThemeColors::default();
+        term.set_theme_colors(old.clone());
+        let mut snapshot = Snapshot::default();
+        snapshot.capture(&term, 0);
+        snapshot.colors_generation = None; // View::set_appearance(new)
+        snapshot.capture(&term, 0); // render_view before push_defaults
+        term.advance(b"\x1b]4;1;#cd0000\x07"); // the old theme's colour 1
+        let mut new = old;
+        new.palette[1] = Rgb::new(0, 0xff, 0);
+        term.set_theme_colors(new); // push_defaults
+        for _ in 0..3 {
+            snapshot.capture(&term, 0);
+        }
+        let program = Rgb::new(0xcd, 0, 0);
+        assert_eq!(term.colors().palette[1], program, "what queries report");
+        let drawn = with_overrides(&Theme::default(), snapshot.colors());
+        assert_eq!(
+            drawn.indexed_overrides[1],
+            Some(Rgba::from_srgb8(0xcd, 0, 0)),
+            "the view draws the program's colour, not the new theme's"
+        );
+    }
+
     /// The colour of the top left pixel of `view`'s last frame (padding,
     /// so the default background).
     fn corner(view: &View) -> [u8; 4] {
@@ -2348,8 +2382,9 @@ mod tests {
     }
 
     /// D-THEME-KEEP when the program's colour equals the theme's: `OSC 4 ;
-    /// 1 ; #cd0000` (theme colour 1 already) moves no colour generation,
-    /// yet after a re-theme to `#00ff00` the program's colour still shows
+    /// 1 ; #cd0000` (theme colour 1 already) records an override, which
+    /// moves the colour generation (#238) though nothing drawn changes, and
+    /// after a re-theme to `#00ff00` the program's colour still shows
     /// (critic B1: the view's copy of the overrides was keyed on the
     /// generation alone).
     #[test]
@@ -2370,10 +2405,19 @@ mod tests {
         assert!(count_pixels(&image, program) > 0);
         let generation = term.colors_generation();
         term.advance(b"\x1b]4;1;#cd0000\x07");
-        assert_eq!(term.colors_generation(), generation, "no effective change");
+        assert_eq!(
+            term.colors_generation(),
+            generation + 1,
+            "a new override, though no effective change"
+        );
         next_frame();
         view.capture(&term, 0);
-        assert_eq!(view.render(true).expect("frame"), FrameStatus::Skipped);
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+        assert_eq!(
+            view.theme().indexed_overrides[1],
+            Some(Rgba::from_srgb8(0xcd, 0, 0)),
+            "copied at once"
+        );
         let green = Rgba::from_srgb8(0, 0xff, 0);
         let mut ansi = Theme::default().ansi;
         ansi[1] = green;

@@ -425,7 +425,7 @@ fn chunkings(row: &Row) -> Vec<Chunking> {
 fn every_row() {
     let rows = rows();
     let headings = FIXTURE.lines().filter(|l| l.starts_with("### ")).count();
-    assert_eq!(headings, 199, "rows in the fixture");
+    assert_eq!(headings, 201, "rows in the fixture");
     let generated: Vec<&str> = rows
         .iter()
         .filter(|row| row.generated())
@@ -539,4 +539,21 @@ fn replies_are_8bit_after_decscl_selects_8bit() {
         }
         assert_eq!(strings, dcs, "{decscl:?}: DCS replies");
     }
+}
+
+/// #235 item 6: in a `TESSERA_TABLE_ROW` list, an id that matches no row
+/// while another does is printed on stderr and returned, and the table
+/// still passes (the id may name a row of another table).
+#[test]
+fn a_listed_row_id_that_matches_nothing_is_reported_not_failed() {
+    let rows = || ["a", "b"].map(|id| (id, id));
+    let mut ran = Vec::new();
+    let unmatched =
+        common::check_table_filtered("ab", 2, rows(), |id| ran.push(id), Some("b,NO_SUCH_ROW,a"));
+    assert_eq!(ran, ["a", "b"]);
+    assert_eq!(unmatched, ["NO_SUCH_ROW"]);
+    let unmatched = common::check_table_filtered("ab", 2, rows(), |_| {}, Some("a,b"));
+    assert_eq!(unmatched, Vec::<String>::new());
+    let unmatched = common::check_table_filtered("ab", 2, rows(), |_| {}, None);
+    assert_eq!(unmatched, Vec::<String>::new());
 }

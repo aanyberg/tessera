@@ -283,10 +283,11 @@ pub enum Request {
     },
     /// Bytes to write to the child: the answer to a query it sent (DA,
     /// DSR, DECRQM, DECRQSS, XTVERSION, window size, ...; ADR 0024).
-    /// Always 7-bit controls. One request per answered query, in the order
-    /// the queries completed; the host writes them to the PTY in that
-    /// order, after any input it already queued. The terminal never drops
-    /// one: bounding them is the host's job.
+    /// 7-bit controls, or 8-bit ones in 8-bit mode (S8C1T, see "8-bit C1
+    /// controls" in the crate documentation). One request per answered
+    /// query, in the order the queries completed; the host writes them to
+    /// the PTY in that order, after any input it already queued. The
+    /// terminal never drops one: bounding them is the host's job.
     Reply(Vec<u8>),
 }
 
@@ -532,9 +533,11 @@ impl Terminal {
         self.state.modes.insert = on;
     }
 
-    /// Clears the screen to the cursor line (⌘K, "Clear to Start"): drops
-    /// the scrollback and, on the primary screen, the rows above the
-    /// cursor, so the cursor's line becomes the top row; on the alternate
+    /// Clears the screen to the prompt (⌘K, "Clear to Start", ADR 0022
+    /// D-CLEAR-START): drops the scrollback and, on the primary screen,
+    /// the rows above the nearest prompt start at or above the cursor
+    /// (shell integration), or else above the first row of the cursor's
+    /// logical line, so that row becomes the top row; on the alternate
     /// screen only the scrollback goes. See [`Grid::clear_to_cursor`].
     ///
     /// REP has nothing to repeat afterwards, as after any sequence: the
