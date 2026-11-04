@@ -292,6 +292,11 @@ impl LinkColumns {
         }
     }
 
+    /// Keeps the links whose column `keep` accepts.
+    pub(crate) fn retain_cols(&mut self, keep: &mut impl FnMut(usize) -> bool) {
+        self.0.retain(|e| keep(usize::from(e.col)));
+    }
+
     /// Drops every link whose column lies in `range`.
     #[inline]
     pub(crate) fn remove_range(&mut self, range: Range<usize>) {

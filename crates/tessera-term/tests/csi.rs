@@ -167,7 +167,7 @@ script_table! {
     ed11_pending_wrap_below,
     ed12_pending_wrap_all,
     ed13_pending_wrap_unknown_mode,
-    ed14_private_marker_not_ed,
+    ed14_private_marker_is_decsed,
     ed15_1x1_grid,
     el01_default_is_right,
     el02_explicit_0,
@@ -181,7 +181,7 @@ script_table! {
     el10_pending_wrap_right,
     el11_pending_wrap_left,
     el12_pending_wrap_all,
-    el13_private_marker_not_el,
+    el13_private_marker_is_decsel,
     el14_right_clears_wrapped_flag,
     el15_1x1_grid,
     ich01_default,
@@ -465,7 +465,8 @@ fn unknown_sequences_leave_the_grid_unchanged() {
     let sequences: &[&[u8]] = &[
         b"\x1b[1;2;3~",
         b"\x1b[123~",
-        b"\x1b[?1J",
+        // DECSED (#95) with a mode it does not have.
+        b"\x1b[?5J",
         b"\x1b[?5;6H",
         b"\x1b[>4;2m",
         b"\x1b[1 A",

@@ -1,0 +1,1253 @@
+# =============================================================================
+# tessera-term: protected areas (SPA/EPA, DECSCA) and selective erase (DECSED/DECSEL)  (issue #95, wave 9)
+# crates/tessera-term/tests/fixtures/protect_spec.txt   (spec-researcher output, edited by the implementer: see EDITS below)
+#
+# Same layout as csi_spec.txt / esctest_spec.txt (### ID / size / step / screen / cursor / pending_wrap / requests /
+# scrollback), read by tests/spec/mod.rs `parse_fixture`. render_screen puts `|` AFTER the cursor's cell; a wide glyph is one
+# character (its spacer is not drawn). Extra keys, ignored by that parser, that tests/protect.rs asserts by hand:
+#     reply:   bytes Terminal must answer (DECRQSS / DA1), as in reports_spec.txt
+#     pstate:  "<mode>/<pen>" after the whole script: mode = off|dec|iso (the terminal-wide protection mode), pen = 0|1
+#              (the pen's PROTECTED bit). Mirrors xterm screen->protected_mode and (xw->flags & PROTECTED).
+#     flags:   xterm-quirk | decision | control | negative | flips (an existing row in another fixture that must change)
+#     source:  esctest2 file and test function when the row is a port
+# Protection is invisible in render_screen, so every row proves it BEHAVIOURALLY: print protected text, run an erase, read
+# what survived. `control` rows run the same erase without protection and prove the setup is not vacuous.
+#
+# EDITS (#95 brief, 2026-11-04): DECSERA is not implemented (descoped to #251, rectangular area operations), so section G
+# (D01-D10) and the DECSERA rows K02/K03 are `#>` pending blocks below; K03 is now the SCORC variant of K01 (DECSEL), and
+# Q09 no longer cites DECSERA. Rows are run by tests/protect.rs.
+#
+# DECISIONS (D-P*) are in spec-95-protect.md and ADR 0034; each row that depends on one names it. Summary: Tessera follows xterm exactly
+# (one terminal-wide mode off|dec|iso, one per-cell bit), because xterm is the only oracle that passes esctest2.
+#
+# SOURCES
+#   [XT]   xterm source, ThomasDickey/xterm-snapshots master (read 2026-11-04):
+#            charproc.c CASE_DECSCA ~L5133, CASE_DECSED ~L5148, CASE_DECSEL ~L5154, CASE_SPA ~L5367, CASE_EPA ~L5374,
+#                       CASE_ED/EL/ECH ~L3992..4008 (all pass OFF_PROTECT), CASE_DECSERA ~L5686 (needs vtXX_level >= 4),
+#                       ReallyReset() ~L14428 (`bitclr(&xw->flags, PROTECTED); screen->protected_mode = OFF_PROTECT;`, soft AND full)
+#            util.c     do_erase_char/do_erase_line/do_erase_display ~L2387..2500, ClearInLine2 ~L2163, ClearAbove/ClearBelow
+#            screen.c   ScrnWipeRectangle ~L3095 (`IsProtected` is true only when protected_mode == DEC_PROTECT)
+#            cursor.c   DECSC_FLAGS = ATTRIBUTES|ORIGIN|PROTECTED (L461); ptyx.h PROTECTED = AttrBIT(6), OFF/DEC/ISO_PROTECT = 0/1/2
+#            misc.c     DECRQSS `"q` ~L4903: reply digit is 1 only if (protected_mode == DEC_PROTECT) && (flags & PROTECTED)
+#            charproc.c DA1 ~L4181 `reply.a_param[count++] = 6; /* selective-erase */` for terminal_id >= 200
+#   [CTL]  xterm ctlseqs https://invisible-island.net/xterm/ctlseqs/ctlseqs.html (HTTP 403 to the fetch tool on 2026-11-04;
+#          the entries are quoted from the xterm source comments and the VT510 pages): ESC V SPA, ESC W EPA, C1 0x96/0x97,
+#          CSI Ps " q DECSCA, CSI ? Ps J DECSED, CSI ? Ps K DECSEL, CSI Pt;Pl;Pb;Pr $ { DECSERA, DCS $ q " q ST DECRQSS.
+#   [DEC]  VT510 RM https://vt100.net/docs/vt510-rm/DECSCA.html (Ps 0 default = erasable, 1 = not erasable, 2 = same as 0;
+#          "does not effect visual character attributes set by SGR"), DECSED.html ("can only erase characters defined as
+#          erasable by DECSCA"; works inside or outside the scrolling margins), DECSEL.html (same), DECSERA.html ("does not
+#          change the active cursor position", "not affected by the page margins", coordinates affected by DECOM, "does not
+#          change SGR visual attributes, DECSCA protection attributes, or line attributes"). "VT Level 4 mode only" on each.
+#   [ECMA] ECMA-48 5th ed. https://ecma-international.org/wp-content/uploads/ECMA-48_5th_edition_june_1991.pdf ; text read at
+#          https://wezfurlong.org/ecma48/ (chapter 6 modes, 7 control functions). SPA = START OF GUARDED AREA (5th ed. name;
+#          the ECMA-48 4th ed. / DEC name is "protected"), EPA = END OF GUARDED AREA. ED/EL/ECH: "Whether protected areas are
+#          erased, or unprotected areas only, depends on the setting of the ERASURE MODE" (ERM, 6.2.3: RESET = PROTECT = only
+#          unprotected data are erased, SET = ALL; initial state implementation-defined). ICH/DCH/IL/DL do not mention
+#          protection. NB xterm implements ISO protection as if ERM were permanently RESET, and has no ERM (CSI 6 h/l).
+#   [E2]   esctest2 https://github.com/ThomasDickey/esctest2 esctest/tests/{ed,el,ech,decsed,decsel,decsera,decstr,s8c1t,
+#          save_restore_cursor}.py (raw files read 2026-11-04). decsca.py does not exist: DECSCA is exercised through the rest.
+#   [DEC070] DEC STD 070 is not online; xterm cites it for DECSC/DECRC contents (cursor.c comment L440..455).
+#   Divergence notes only: VTE has no SPA/EPA/DECSCA (drops them); kitty implements none; WezTerm parses DECSCA/DECSED/DECSEL
+#   but erases regardless (grid has no protected bit); iTerm2 implements none (esctest2 marks every test a knownBug).
+#
+# CELL-LEVEL MODEL ASSUMED BY EVERY ROW (xterm): the pen has one PROTECTED bit; printing copies it into the cell (so it travels with
+# the cell through DCH/ICH/IL/DL/scroll/reflow/alt-screen); blank cells made by erase/insert never carry it. The terminal has one
+# mode off|dec|iso: SPA => iso, DECSCA (any Ps) => dec, EPA / DECSCA 0 only clear the pen bit (DECSCA 0 DOES still set dec).
+# Erase honours the cell bit iff: ED/EL/ECH: mode == iso. DECSED/DECSEL: mode != off. (xterm's DECSERA: mode == dec; #251.)
+# =============================================================================
+
+# ============================================================================ A. ISO (SPA/EPA): ED, EL, ECH honour it
+
+### P01_ed0_respects_iso_protection
+size: 3x10
+step: feed ab\eVc\eW\e[1;1H\e[J
+source: esctest2 ed.py test_ED_respectsISOProtection
+cite: [E2] ed.py; [ECMA] ED + ERM (reset = PROTECT); [XT] CASE_ED -> do_erase_display(.., OFF_PROTECT), mode iso => ClearInLine skips PROTECTED cells (ED 0 at 1;1 is turned into ED 2 by xterm, same result)
+note: 'c' was written between SPA and EPA, so it survives; 'a' and 'b' are erased.
+screen:
+> | c
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: iso/0
+
+### P02_el2_respects_iso_protection
+size: 3x10
+step: feed ab\eVc\eW\e[1;1H\e[2K
+source: esctest2 el.py test_EL_respectsISOProtection
+cite: [E2] el.py; [XT] CASE_EL -> do_erase_line(.., OFF_PROTECT), ClearLine -> ClearInLine
+screen:
+> | c
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### P03_ech_respects_iso_protection
+size: 3x10
+step: feed ab\eVc\eW\e[1;1H\e[3X
+source: esctest2 ech.py test_ECH_respectsISOProtection
+cite: [E2] ech.py; [XT] CASE_ECH -> do_erase_char(.., OFF_PROTECT) -> ClearRight -> ClearInLine
+screen:
+> | c
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### P04_c1_spa_epa_8bit_protect_from_ech
+size: 3x10
+step: feed \e G
+step: feed ab\x96c\x97
+step: feed \e F
+step: feed \e[1;1H\e[3X
+source: esctest2 s8c1t.py test_S8C1T_SPA_EPA
+cite: [E2] s8c1t.py (S8C1T, 'ab', SPA 0x96, 'c', EPA 0x97, S7C1T, home, ECH 3 -> blank blank c); c1_spec.txt C17 (the 8-bit forms already reach esc() as ESC V / ESC W since #96)
+note: xterm needs -u8 off / allowC2Controls for this test; Tessera's bytes 0x96/0x97 are C1 here because S8C1T is on (c1_spec.txt rules). flips c1_spec C17 cite/name.
+screen:
+> | c
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+flags: flips
+
+### P05_control_no_spa_everything_erased
+size: 3x10
+step: feed abc\e[1;1H\e[3X
+cite: [XT] mode off: ClearInLine does not look at attributes
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+flags: control
+pstate: off/0
+
+### P06_ed1_stops_at_protected_run
+size: 3x10
+step: feed ab\eVcd\eWef\e[1;5H\e[1J
+cite: [XT] ClearAbove: rows above via ClearInLine, cursor row cols 0..cur_col via ClearInLine, protected cells skipped; ED 1 is inclusive of the cursor cell
+note: 'cd' protected; 'e' under the cursor (col 4) is erased, 'f' (col 5) is after the cursor and stays.
+screen:
+>  cd |f
+>
+>
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### P07_ed2_multirow_keeps_only_the_protected_cell
+size: 3x10
+step: feed abc\e[2;1Hd\eVe\eWf\e[3;1Hghi\e[2J
+cite: [XT] do_erase_display case 2: ClearInLine over every row with protected_mode != OFF
+screen:
+>
+> e
+>    |
+cursor: (2,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### P08_el0_and_el1_split_around_protected_run
+size: 3x10
+step: feed ab\eVcd\eWef\e[1;2H\e[K
+cite: [XT] ClearRight(-1) -> ClearInLine2 splits the range into unprotected segments; EL 0 = cursor cell to end of line
+screen:
+>a |cd
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### P09_el1_inclusive_of_cursor_cell
+size: 3x10
+step: feed ab\eVcd\eWef\e[1;6H\e[1K
+cite: [XT] ClearLeft (cols 0..cur_col) -> ClearInLine; 'f' under the cursor (col 5) erased, 'e' erased, 'cd' kept
+screen:
+>  cd  |
+>
+>
+cursor: (0,5)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### P10_ed3_touches_no_cells
+size: 3x10
+step: feed ab\eVc\eW\e[3J
+cite: [XT] do_erase_display case 3 only clears saved lines; existing csi.rs ED 3 behaviour is unchanged by protection
+screen:
+>abc |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### P11_ech_over_a_protected_cell_disarms_the_pending_wrap
+size: 3x10
+step: feed \eVabcdefghij\eW\e[X
+cite: Tessera decision (brief "Pending wrap", ADR 0034): ECH and EL disarm a pending wrap even when every cell of the range is protected; xterm's ClearInLine2 returns before ResetWrap there (a listed deviation)
+note: 'j' on the last column is protected and the wrap is pending; ECH 1 erases nothing and the next character would print over column 10, not wrap.
+screen:
+>abcdefghij|
+>
+>
+cursor: (0,9)
+pending_wrap: false
+requests: []
+scrollback: len=0
+flags: decision
+
+### P12_iso_el0_on_a_protected_wrapped_line_ends_the_wrap
+size: 3x10
+step: feed \eVabcdefghijk\eW\e[1;5H\e[K
+cite: [XT] ClearRight: "with the right part cleared, we can't be wrapping" (LineClrWrapped), whatever was protected; grid erase_in_line_unprotected(ToEnd) clears the wrap flag as erase_in_line does
+note: every cell is protected and stays, but row 1 no longer continues onto row 2 (no trailing `\`): a copy or a re-wrap treats them as two lines.
+screen:
+>abcde|fghij
+>k
+>
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+# ============================================================================ B. DEC (DECSCA) with DECSEL / DECSED
+
+### S01_decsel0_erases_unprotected_to_the_right
+size: 3x10
+step: feed \e[1"q\e[1;1Habcdefghi\e[0"q\e[1;10HX\e[1;5H\e[?0K
+source: esctest2 decsel.py test_DECSEL_0_Protection
+cite: [E2] decsel.py (DECSCA 1, 'abcdefghij' prepare, DECSCA 0, X at col 10); [DEC] DECSEL.html "erases only those characters defined as erasable"; [XT] CASE_DECSEL -> do_erase_line(.., DEC_PROTECT)
+note: the esctest prepare writes 10 letters then overwrites the last with X; this row writes 9 so the result is the same without a pending wrap.
+screen:
+>abcde|fghi
+>
+>
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: dec/0
+
+### S02_decsel_default_param_is_0
+size: 3x10
+step: feed \e[1"q\e[1;1Habcdefghi\e[0"q\e[1;10HX\e[1;5H\e[?K
+source: esctest2 decsel.py test_DECSEL_Default_Protection
+cite: [E2] decsel.py; [DEC] DECSEL "0 (default): from the cursor through the end of the line"; [XT] zero_if_default
+screen:
+>abcde|fghi
+>
+>
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### S03_decsel1_erases_unprotected_to_the_left_inclusive
+size: 3x10
+step: feed \e[1"q\e[1;1Habcdefghij\e[0"q\e[1;1HX\e[1;5H\e[?1K
+source: esctest2 decsel.py test_DECSEL_1_Protection
+cite: [E2] decsel.py; [DEC] DECSEL Ps 1 = start of line through the cursor
+screen:
+> bcde|fghij
+>
+>
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### S04_decsel2_erases_whole_line_unprotected
+size: 3x10
+step: feed \e[1"q\e[1;1Habcdefghij\e[0"q\e[1;1HX\e[?2K
+source: esctest2 decsel.py test_DECSEL_2_Protection
+cite: [E2] decsel.py
+screen:
+> b|cdefghij
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### S05_decsel2_ignores_left_right_margins
+size: 3x10
+step: feed \e[1"q\e[1;1Habcdefghij\e[0"q\e[1;1HX\e[?69h\e[2;4s\e[1;5H\e[?2K\e[?69l
+source: esctest2 decsel.py test_DECSEL_IgnoresScrollRegion_Protection
+cite: [E2] decsel.py; [DEC] DECSEL "works inside or outside the scrolling margins"
+note: X is outside the margins (col 1) and is still erased; the protected letters survive.
+screen:
+> bcde|fghij
+>
+>
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### S06_decsel_control_without_decsca_erases_all
+size: 3x10
+step: feed abcdefghij\e[1;5H\e[?2K
+cite: [XT] mode off: DECSEL erases everything (nothing is protected)
+screen:
+>     |
+>
+>
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+flags: control
+
+### S07_decsed_default_is_below
+size: 5x10
+step: feed \e[1"q\e[1;1Ha\e[3;1Hbcd\e[5;1He\e[3;2H\e[0"q\e[5;2HX\e[3;2H\e[?J
+source: esctest2 decsed.py test_DECSED_Default_Protection
+cite: [E2] decsed.py (prepare: a / blank / bcd / blank / e, cursor on 'c'; X unprotected at row 5 col 2); [DEC] DECSED Ps 0 default = cursor through end of display
+screen:
+>a
+>
+>bc|d
+>
+>e
+cursor: (2,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### S08_decsed0_below_erases_x
+size: 5x10
+step: feed \e[1"q\e[1;1Ha\e[3;1Hbcd\e[5;1He\e[0"q\e[5;2HX\e[3;2H\e[?0J
+source: esctest2 decsed.py test_DECSED_0_Protection
+cite: [E2] decsed.py
+screen:
+>a
+>
+>bc|d
+>
+>e
+cursor: (2,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### S09_decsed1_above_erases_x
+size: 5x10
+step: feed \e[1"q\e[1;1Ha\e[3;1Hbcd\e[5;1He\e[0"q\e[1;2HX\e[3;2H\e[?1J
+source: esctest2 decsed.py test_DECSED_1_Protection
+cite: [E2] decsed.py; [DEC] DECSED Ps 1 = start of display through the cursor
+screen:
+>a
+>
+>bc|d
+>
+>e
+cursor: (2,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### S10_decsed2_whole_display
+size: 5x10
+step: feed \e[1"q\e[1;1Ha\e[3;1Hbcd\e[5;1He\e[0"q\e[1;2HX\e[?2J
+source: esctest2 decsed.py test_DECSED_2_Protection
+cite: [E2] decsed.py (no cursor move after the X)
+screen:
+>a  |
+>
+>bcd
+>
+>e
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### S11_decsed3_touches_no_cells
+size: 5x10
+step: feed \e[1"q\e[1;1Ha\e[3;1Hbcd\e[5;1He\e[0"q\e[1;2HX\e[?3J
+source: esctest2 decsed.py test_DECSED_3_Protection
+cite: [E2] decsed.py ("at least test that it doesn't touch the screen"); [XT] do_erase_display case 3 = saved lines only
+screen:
+>aX |
+>
+>bcd
+>
+>e
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### S12_decsed_decsca2_is_same_as_decsca0
+size: 5x10
+step: feed \e[1"q\e[1;1Ha\e[3;1Hbcd\e[5;1He\e[2"q\e[5;2HX\e[3;2H\e[?J
+source: esctest2 decsed.py test_DECSED_DECSCA_2
+cite: [E2] decsed.py; [DEC] DECSCA "2: same as 0"; [XT] CASE_DECSCA (GetParam(0) <= 0 || == 2 clears the bit)
+screen:
+>a
+>
+>bc|d
+>
+>e
+cursor: (2,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### S13_decsed2_ignores_margins
+size: 3x5
+step: feed \e[1"q\e[1;1Habcde\e[2;1Hfghij\e[3;1Hklmno\e[0"q\e[1;1HX\e[?69h\e[2;4s\e[2;3r\e[2;3H\e[?2J\e[?69l\e[r
+source: esctest2 decsed.py test_DECSED_2_WithScrollRegion_Protection
+cite: [E2] decsed.py (DECSTBM() at the end homes the cursor); [DEC] DECSED "works inside or outside the scrolling margins"
+screen:
+> |bcde
+>fghij
+>klmno
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### S14_decsed_control_without_decsca_erases_all
+size: 3x10
+step: feed abc\e[2;1Hdef\e[?2J
+cite: [XT] mode off: DECSED erases everything
+screen:
+>
+>    |
+>
+cursor: (1,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+flags: control
+
+### S15_unknown_ps_is_a_noop
+size: 3x10
+step: feed abc\e[?5J\e[?3K\e[?9J\e[?7K
+cite: [XT] do_erase_display / do_erase_line switch has no default arm: an unknown Ps erases nothing (same rule as csi.rs ED/EL). The mode is still not touched (only DECSCA sets dec)
+screen:
+>abc |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+
+### S16_private_markers_now_erase_for_real
+size: 5x10
+step: feed \e[1;1Habcdefghij\e[2;1Hklmnopqrst\e[3;1HuvwxyzABCD\e[4;1HEFGHIJKLMN\e[5;1HOPQRSTUVWX\e[3;5H\e[?2JX
+source: csi_spec.txt ED14_private_marker_not_ed
+cite: [XT] CASE_DECSED; nothing protected, so DECSED 2 clears the screen (csi_spec ED14 asserted the old no-op)
+note: REPLACES the expected screen of csi_spec.txt ED14 (and, row EL13 below, of EL13). The cursor does not move, X lands at (2,4).
+screen:
+>
+>
+>    X |
+>
+>
+cursor: (2,5)
+pending_wrap: false
+requests: []
+scrollback: len=0
+flags: flips
+
+### S17_private_el_now_erases_the_line
+size: 5x10
+step: feed \e[1;1Habcdefghij\e[2;1Hklmnopqrst\e[3;1HuvwxyzABCD\e[4;1HEFGHIJKLMN\e[5;1HOPQRSTUVWX\e[3;5H\e[?2KX
+source: csi_spec.txt EL13_private_marker_not_el
+cite: [XT] CASE_DECSEL; replaces the expected screen of csi_spec.txt EL13
+screen:
+>abcdefghij
+>klmnopqrst
+>    X |
+>EFGHIJKLMN
+>OPQRSTUVWX
+cursor: (2,5)
+pending_wrap: false
+requests: []
+scrollback: len=0
+flags: flips
+
+### S18_decsel0_on_a_protected_wrapped_line_ends_the_wrap
+size: 3x10
+step: feed \e[1"qabcdefghijk\e[0"q\e[1;5H\e[?K
+cite: [XT] CASE_DECSEL -> do_erase_line(0) -> ClearRight, LineClrWrapped; as P12 for DEC protection
+screen:
+>abcde|fghij
+>k
+>
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+# ============================================================================ C. DEC protection is ignored by ED / EL / ECH
+
+### N01_ed_ignores_dec_protection
+size: 3x10
+step: feed ab\e[1"qc\e[0"q\e[1;1H\e[J
+source: esctest2 ed.py test_ED_doesNotRespectDECProtection
+cite: [E2] ed.py; [XT] do_erase_display: saved_mode == DEC_PROTECT && requested OFF_PROTECT => protection ignored for the call
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: dec/0
+
+### N02_el_ignores_dec_protection
+size: 3x10
+step: feed ab\e[1"qc\e[0"q\e[1;1H\e[2K
+source: esctest2 el.py test_EL_doesNotRespectDECProtection
+cite: [E2] el.py; [XT] do_erase_line
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### N03_ech_ignores_dec_protection
+size: 3x10
+step: feed ab\e[1"qc\e[0"q\e[1;1H\e[3X
+source: esctest2 ech.py test_ECH_doesNotRespectDECPRotection
+cite: [E2] ech.py; [XT] do_erase_char
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+# ============================================================================ D. The terminal-wide mode (D-P1): who wins
+
+### M01_decsca0_after_spa_switches_to_dec_and_ech_stops_honouring
+size: 3x10
+step: feed ab\eVc\eW\e[0"q\e[1;1H\e[3X
+cite: [XT] CASE_DECSCA sets protected_mode = DEC_PROTECT for every Ps including 0; ECH asks OFF_PROTECT, so a DEC-mode terminal ignores the (ISO-written) bit
+note: THE xterm one-mode consequence: the cell bit does not remember whether SPA or DECSCA wrote it. Recommend replicating (D-P1).
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+flags: xterm-quirk decision
+pstate: dec/0
+
+### M02_spa_after_decsca_switches_to_iso_and_ech_honours_the_dec_cell
+size: 3x10
+step: feed a\e[1"qb\e[0"q\eV\eW\e[1;1H\e[3X
+cite: [XT] CASE_SPA sets protected_mode = ISO_PROTECT (EPA right after clears only the pen bit); ECH honours every PROTECTED cell in iso mode, including the one DECSCA 1 wrote
+screen:
+> |b
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+flags: xterm-quirk decision
+pstate: iso/0
+
+### M03_epa_does_not_leave_dec_mode_and_decsed_still_honours
+size: 3x10
+step: feed \e[1;1Ha\e[1"qb\e[0"q\eW\e[?2J
+cite: [XT] CASE_EPA only clears the pen bit; mode stays dec
+screen:
+> b |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: dec/0
+
+### M04_epa_does_not_leave_iso_mode
+size: 3x10
+step: feed \eVa\eWb\e[1;1H\e[2X
+cite: [XT] CASE_EPA does not touch protected_mode: after SPA..EPA the terminal stays in iso mode, so ECH keeps honouring 'a'
+screen:
+>a|
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: iso/0
+
+### M05_decsed_honours_iso_cells_xterm_vs_esctest
+size: 3x10
+step: feed a\eVb\eW\e[?2J
+source: esctest2 decsed.py test_DECSED_doesNotRespectISOProtect
+cite: [XT] do_erase_display(.., DEC_PROTECT) with saved_mode == ISO: not reset to OFF, ClearInLine honours the bit; esctest2 records this as `knownBug(terminal="xterm", reason="DECSED respects ISO protection for backward compatibility, per email from Thomas")`
+note: DECISION D-P2. The spec'd behaviour (esctest2 asserts blank blank, [DEC] DECSCA-only) is the other result: screen `>   |`. Recommend xterm.
+screen:
+> b |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+flags: xterm-quirk decision
+
+### M06_decsel_honours_iso_cells_xterm_vs_esctest
+size: 3x10
+step: feed a\eVb\eW\e[?2K
+source: esctest2 decsel.py test_DECSEL_doesNotRespectISOProtect
+cite: [XT] as M05 via do_erase_line; same esctest2 knownBug
+note: DECISION D-P2. Spec'd result would be `>   |`.
+screen:
+> b |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+flags: xterm-quirk decision
+
+### M07_decsca_unknown_ps_sets_dec_mode_leaves_pen_bit
+size: 3x10
+step: feed \e[1"q\e[7"qa\e[?2K
+cite: [XT] CASE_DECSCA: mode = DEC for any Ps; only Ps <= 0 / 2 clear and 1 sets the bit, anything else leaves it (here: still protected). [DEC] defines only 0, 1, 2
+screen:
+>a |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+flags: xterm-quirk decision
+pstate: dec/1
+
+### M08_decsca_without_param_is_0
+size: 3x10
+step: feed \e[1"q\e["qa\e[?2K
+cite: [XT] GetParam(0) <= 0 clears; [DEC] DECSCA 0 is the default
+screen:
+>  |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: dec/0
+
+### M09_decsca_uses_only_the_first_param
+size: 3x10
+step: feed \e[1;0"qa\e[?2K
+cite: [XT] CASE_DECSCA reads GetParam(0) only
+screen:
+>a |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: dec/1
+
+### M10_sgr_never_changes_protection
+size: 3x10
+step: feed \e[1"q\e[0m\e[1;31m\e[mab\e[?2K
+cite: [DEC] DECSCA "does not effect visual character attributes set by SGR" (the converse holds in xterm: SGR 0 clears only SGR_MASK|colours, not PROTECTED); brief question 3
+screen:
+>ab |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: dec/1
+
+### M11_overwriting_a_protected_cell_replaces_its_protection_with_the_pens
+size: 3x10
+step: feed \e[1"qa\e[0"q\e[1;1Hb\e[?2K
+cite: [XT] WriteText stores the pen's attributes (ATTRIBUTES includes PROTECTED) in the cell; ISO "protected against manual alteration" is keyboard-only and xterm does not block host writes
+screen:
+>  |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### M12_protection_travels_with_the_cell_dch
+size: 3x10
+step: feed ab\eVc\eWd\e[1;1H\e[P\e[5X
+cite: [XT] DCH (ScrnDeleteChar) shifts attributes with the characters and never consults protection; ECH then finds the PROTECTED cell at col 1
+note: after DCH the line is `bcd` with 'c' (protected) at col 1; ECH 5 from home erases b and d.
+screen:
+> |c
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### M13_protection_travels_with_the_cell_ich
+size: 3x10
+step: feed a\eVb\eWc\e[1;2H\e[@\e[1;1H\e[5X
+cite: [XT] ICH shifts attributes with the characters; the inserted blank is unprotected
+screen:
+> | b
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### M14_protection_travels_with_the_cell_il
+size: 3x10
+step: feed \eVabc\eW\e[1;1H\e[L\e[2;1H\e[5X
+cite: [XT] IL moves whole lines (attributes included); IL/DL are not protection-aware; ECH then honours the moved cells
+screen:
+>
+>a|bc
+>
+cursor: (1,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### M15_protection_travels_with_the_cell_through_scroll
+size: 3x10
+step: feed \e[2;1H\eVabc\eW\e[3;1H\n\e[1;1H\e[5X
+cite: [XT] scrolling moves attribute rows; the cell bit is part of the row. (Line moves from row 2 to row 1 when the screen scrolls up one line; the old top row goes to scrollback)
+screen:
+>a|bc
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=1
+
+### M16_wide_protected_char_is_atomic
+size: 3x10
+step: feed \eV\u{4e2d}\eWa\e[1;2H\e[X
+cite: [XT] ClearInLine2 reads the attribute of the targeted cell (a wide char writes the pen attrs to both its cells) and skips it; ClearCells only widens an UNPROTECTED range to cover a straddled wide pair
+note: ECH 1 on the SPACER half of a protected wide glyph erases nothing: no half-wide glyph is left behind.
+screen:
+>中|a
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+flags: decision
+
+### M17_wide_unprotected_char_control
+size: 3x10
+step: feed \u{4e2d}a\e[1;2H\e[X
+cite: [XT] ClearCells: col > 0 && charData[col] == HIDDEN_CHAR => widen to the pair; existing wide.rs behaviour, unchanged by #95
+screen:
+>  |a
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+flags: control
+
+# ============================================================================ E. DECSC / DECRC / SCOSC / SCORC / alt screen
+
+### K01_decrc_restores_the_protection_bit
+size: 3x10
+step: feed \e[1"q\e7\e[0"q\e8a\e[?2K
+source: variant of esctest2 test_SaveRestoreCursor_Protection with DECSEL instead of DECSERA (K02 is the exact port)
+cite: [E2] save_restore_cursor.py; [XT] cursor.c DECSC_FLAGS = ATTRIBUTES|ORIGIN|PROTECTED; CursorRestoreFlags restores the bit. The MODE is not saved: DECSCA 0 left it at dec, so DECSEL honours the restored cell
+screen:
+>a |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: dec/1
+
+### K03_scorc_restores_the_protection_bit
+size: 3x10
+step: feed \e[1"q\e[s\e[0"q\e[ua\e[?2K
+source: variant of esctest2 scorc.py / save_restore_cursor.py test_SaveRestoreCursor_Protection (E_SCORC_saveRestoreCursor_protection) with DECSEL instead of DECSERA, as K01 for DECRC
+cite: [E2] scorc.py inherits SaveRestoreCursorTests; [XT] SCOSC/SCORC share CursorSave/CursorRestore with DECSC/DECRC; the mode stays dec, so DECSEL honours the restored bit
+screen:
+>a |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: dec/1
+
+### K04_decrc_with_no_save_has_no_protection
+size: 3x10
+step: feed \e[1"q\e[0"q\e8a\e[?2K
+cite: [XT] with nothing saved, DECRC restores the reset state (flags without PROTECTED); control for K01
+screen:
+>  |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+flags: control
+
+### K05_alt_screen_cells_are_per_buffer_mode_is_global
+size: 3x10
+step: feed \e[1"qa\e[?1049h\e[1;1Hb\e[?2J\e[?1049l\e[?2J
+cite: [XT] the protected_mode is terminal-wide (not touched by 1049); each screen's cells keep their own bits; 1049 uses CursorSave/Restore so the pen bit is restored on exit; DECSED 2 on each screen keeps its protected cell
+note: the alt screen DECSED 2 keeps 'b'; after leaving, the main screen's DECSED 2 keeps 'a'. Final main screen: 'a' only.
+screen:
+>a |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+flags: decision
+pstate: dec/1
+
+# ============================================================================ F. Resets (DECSTR, RIS, DECSCL)
+
+### R01_decstr_turns_protection_off
+size: 3x10
+step: feed \e[1"q\e[!p\e[1;1HX\e[?2J
+source: esctest2 decstr.py test_DECSTR_DECSCA
+cite: [E2] decstr.py (DECSCA 1, DECSTR, X, DECSED 2 -> empty); [XT] ReallyReset(soft) `bitclr(&xw->flags, PROTECTED); protected_mode = OFF_PROTECT`; decstr_spec.txt header [XT bitclr PROTECTED]
+screen:
+>  |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: flips
+
+### R02_control_without_decstr_x_survives
+size: 3x10
+step: feed \e[1"q\e[1;1HX\e[?2J
+cite: control for R01
+screen:
+>X |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+flags: control
+
+### R03_decstr_clears_iso_too
+size: 3x10
+step: feed \eV\e[!p\e[1;1Hc\e[1;1H\e[X
+cite: [XT] ReallyReset clears both the pen bit and the mode; ECH then erases 'c'
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+
+### R04_control_without_decstr_iso_c_survives
+size: 3x10
+step: feed \eVc\e[1;1H\e[X
+cite: control for R03
+screen:
+>c|
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+flags: control
+
+### R05_stale_protected_cell_revives_after_decstr_xterm_quirk
+size: 3x10
+step: feed \e[1;1H\e[1"qa\e[!p\e[0"q\e[?2J
+cite: [XT] DECSTR resets the mode and pen bit but does not scan the screen; the cell keeps ATTR PROTECTED, and the next DECSCA (any Ps) sets mode dec again, so DECSED honours it
+note: DECISION D-P3. Replicating costs nothing (no scan, no epoch). The alternative (cells forget protection at DECSTR) needs a full-grid pass or an epoch counter; not worth it. Recommend replicating.
+screen:
+>a |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+flags: xterm-quirk decision
+pstate: dec/0
+
+### R06_ris_clears_protection
+size: 3x10
+step: feed \eV\ec\e[1;1Hc\e[1;1H\e[X
+cite: [XT] RIS = VTReset(full) -> ReallyReset, same bitclr + OFF_PROTECT; (RIS also clears the screen, so no stale cell exists)
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+
+### R07_decscl_is_a_soft_reset_for_protection
+size: 3x10
+step: feed \e[1"q\e[64"p\e[1;1HX\e[?2K
+cite: [XT] CASE_DECSCL -> ReallyReset(soft) (decscl_spec.txt RESET rows); same bitclr + OFF_PROTECT
+screen:
+>  |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+
+# ============================================================================ H. Reports
+
+### Q01_decrqss_decsca_fresh_is_0
+size: 3x10
+step: feed \eP$q"q\e\\
+reply: \eP1$r0"q\e\\
+cite: [XT] misc.c: `sprintf(reply, "%d%s", (mode == DEC_PROTECT) && (flags & PROTECTED) ? 1 : 0, cp)` => `0"q`; valid request, answer Ps 1 $ r
+flags: flips
+
+### Q02_decrqss_decsca_after_decsca1
+size: 3x10
+step: feed \e[1"q\eP$q"q\e\\
+reply: \eP1$r1"q\e\\
+cite: [XT] misc.c DECRQSS
+pstate: dec/1
+
+### Q03_decrqss_decsca_after_decsca0
+size: 3x10
+step: feed \e[1"q\e[0"q\eP$q"q\e\\
+reply: \eP1$r0"q\e\\
+cite: [XT] misc.c
+
+### Q04_decrqss_decsca_after_spa_is_0
+size: 3x10
+step: feed \eV\eP$q"q\e\\
+reply: \eP1$r0"q\e\\
+cite: [XT] misc.c: the digit is 1 only for DEC mode (an ISO SPA is not DECSCA); DECISION D-P4 recommends xterm
+flags: xterm-quirk decision
+
+### Q05_decrqss_decsca_after_decsca1_then_spa_is_0
+size: 3x10
+step: feed \e[1"q\eV\eP$q"q\e\\
+reply: \eP1$r0"q\e\\
+cite: [XT] misc.c: mode iso after SPA
+flags: xterm-quirk
+
+### Q06_decrqss_decsca_after_decstr_is_0
+size: 3x10
+step: feed \e[1"q\e[!p\eP$q"q\e\\
+reply: \eP1$r0"q\e\\
+cite: [XT] ReallyReset
+flags: flips
+
+### Q07_decrqss_decsca_reply_follows_s8c1t
+size: 3x10
+step: feed \e G\e[1"q\eP$q"q\e\\
+reply: \x901$r1"q\x9c
+cite: reports_spec.txt D-RQSS reply framing: DCS and ST of the reply follow S8C1T; the payload is a fixed string from terminal state (S1)
+pstate: dec/1
+
+### Q08_decrqss_unknown_neighbours_stay_invalid
+size: 3x10
+step: feed \eP$q"r\e\\\eP$q"\e\\\eP$q"qq\e\\
+reply: \eP0$r\e\\\eP0$r\e\\\eP0$r\e\\
+cite: [XT] misc.c strcmp(cp, "\"q") is exact; anything longer or shorter is invalid. reports_spec RQ28 keeps `"q` out of its invalid list after this issue
+flags: negative
+
+### Q09_da1_lists_selective_erase_6_at_level_4
+size: 3x10
+step: feed \e[c
+reply: \e[?64;6;9;21;22c
+cite: [XT] CASE_DA1: `if (screen->terminal_id >= 200) { ... a_param[count++] = 6; /* selective-erase */ ... 9 ...}`, ascending order; Tessera lists only implemented features and #95 implements DECSCA/DECSED/DECSEL (DECSERA, the rectangle form, waits for #251; xterm lists 6 for the VT220's DECSCA/DECSED/DECSEL alone)
+note: flips reports_spec DA01/DA02 and every DA row at level >= 2 (DECID too).
+flags: flips
+
+### Q10_da1_at_level_2_and_3_has_6
+size: 3x10
+step: feed \e[62;1"p\e[c\e[63;1"p\e[c
+reply: \e[?62;6;9;22c\e[?63;6;9;22c
+cite: [XT] same arm (terminal_id >= 200); Tessera's level 2/3 list is `6{level};9;22`
+note: Pc 1 keeps the replies 7-bit (DECSCL with Pc absent selects 8-bit C1 replies, csi.rs; the draft row omitted it).
+flags: flips
+
+### Q11_da1_at_level_1_has_no_6
+size: 3x10
+step: feed \e[61"p\e[c
+reply: \e[?1;2c
+cite: [XT] VT100 form `?1;2c` has no feature list
+flags: negative
+
+### Q12_decid_matches_da1
+size: 3x10
+step: feed \eZ
+reply: \e[?64;6;9;21;22c
+cite: reports_spec D-DECID
+flags: flips
+
+# -- end of cases
+
+#> ============================================================================ Pending: DECSERA (#251)
+#> DECSERA (`CSI Pt;Pl;Pb;Pr $ {`) needs rectangle infrastructure Tessera does not have yet (DECERA/DECFRA/DECCRA, `$`
+#> rectangle parsing with defaults, clamping, DECOM and validation, the level-4 gate). These rows move to #251 ("term:
+#> rectangular area operations DECERA, DECFRA, DECCRA, DECSERA") unchanged; lift them into the cases there. D-P7 (DECSERA
+#> keeps colours, D10) moves with them. Today DECSERA is an ignored CSI with an intermediate.
+#>
+#> # ============================================================================ G. DECSERA
+#>
+#> # prepare (4x5): odd rows protected: aaaaa / bbbbb unprotected / ccccc protected / ddddd unprotected; cursor then moved to 2;3
+#>
+#> ### D01_decsera_default_rect_is_the_whole_page
+#> size: 4x5
+#> step: feed \e[1"qaaaaa\r\n\e[0"qbbbbb\r\n\e[1"qccccc\r\n\e[0"qddddd\e[0"q\e[2;3H\e[${
+#> source: esctest2 decsera.py (prepare: protect odd rows; test_DECSERA_defaultArgs, test_DECSERA_basic)
+#> cite: [E2] decsera.py; [DEC] DECSERA.html defaults Pt=1 Pl=1 Pb=last line Pr=last column; [XT] CASE_DECSERA -> ScrnWipeRectangle, mode dec => protected cells skipped
+#> note: the unprotected rows are blanked; cursor and pending wrap untouched ([DEC] "does not change the active cursor position").
+#> screen:
+#> >aaaaa
+#> >   |
+#> >ccccc
+#> >
+#> cursor: (1,2)
+#> pending_wrap: false
+#> requests: []
+#> scrollback: len=0
+#> pstate: dec/0
+#>
+#> ### D02_decsera_explicit_rectangle
+#> size: 4x5
+#> step: feed \e[1"qaaaaa\r\n\e[0"qbbbbb\r\n\e[1"qccccc\r\n\e[0"qddddd\e[0"q\e[2;3H\e[2;2;4;4${
+#> source: esctest2 decsera.py test_DECSERA_basic
+#> cite: [E2] decsera.py; [DEC] DECSERA Pt;Pl;Pb;Pr = rows 2-4, columns 2-4; protected row 3 keeps its cells
+#> screen:
+#> >aaaaa
+#> >b  | b
+#> >ccccc
+#> >d   d
+#> cursor: (1,2)
+#> pending_wrap: false
+#> requests: []
+#> scrollback: len=0
+#>
+#> ### D03_decsera_invalid_rect_does_nothing
+#> size: 4x5
+#> step: feed \e[1"qaaaaa\r\n\e[0"qbbbbb\r\n\e[1"qccccc\r\n\e[0"qddddd\e[0"q\e[2;3H\e[3;3;2;2${
+#> source: esctest2 decsera.py test_DECSERA_invalidRectDoesNothing
+#> cite: [E2] decsera.py; [DEC] "Pt must be less than or equal to Pb" / "Pl <= Pr"; [XT] validRect() fails
+#> screen:
+#> >aaaaa
+#> >bbb|bb
+#> >ccccc
+#> >ddddd
+#> cursor: (1,2)
+#> pending_wrap: false
+#> requests: []
+#> scrollback: len=0
+#>
+#> ### D04_decsera_respects_origin_mode
+#> size: 4x5
+#> step: feed \e[1"qaaaaa\r\n\e[0"qbbbbb\r\n\e[1"qccccc\r\n\e[0"qddddd\e[0"q\e[2;4r\e[?6h\e[1;1;1;5${
+#> source: esctest2 decsera.py test_DECSERA_respectsOriginMode
+#> cite: [E2] decsera.py; [DEC] "coordinates ... are affected by the setting of origin mode"; [XT] xtermParseRect adds the top margin when ORIGIN is set
+#> note: row 1 of the region is absolute row 2; DECOM and DECSTBM home the cursor to (1,0).
+#> screen:
+#> >aaaaa
+#> > |
+#> >ccccc
+#> >ddddd
+#> cursor: (1,0)
+#> pending_wrap: false
+#> requests: []
+#> scrollback: len=0
+#>
+#> ### D05_decsera_clips_overlarge_rect
+#> size: 4x5
+#> step: feed \e[1"qaaaaa\r\n\e[0"qbbbbb\r\n\e[1"qccccc\r\n\e[0"qddddd\e[0"q\e[2;3H\e[2;2;99;99${
+#> source: esctest2 decsera.py test_DECSERA_overlyLargeSourceClippedToScreenSize
+#> cite: [E2] decsera.py; [XT] xtermParseRect clamp: rows 2-4, columns 2-5
+#> screen:
+#> >aaaaa
+#> >b  |
+#> >ccccc
+#> >d
+#> cursor: (1,2)
+#> pending_wrap: false
+#> requests: []
+#> scrollback: len=0
+#>
+#> ### D06_decsera_ignores_left_right_margins
+#> size: 4x5
+#> step: feed \e[1"qaaaaa\r\n\e[0"qbbbbb\r\n\e[1"qccccc\r\n\e[0"qddddd\e[0"q\e[?69h\e[2;3s\e[2;3H\e[2;1;2;5${\e[?69l
+#> source: esctest2 decsera.py test_DECSERA_ignoresMargins
+#> cite: [E2] decsera.py; [DEC] "DECSERA is not affected by the page margins"
+#> screen:
+#> >aaaaa
+#> >  |
+#> >ccccc
+#> >ddddd
+#> cursor: (1,2)
+#> pending_wrap: false
+#> requests: []
+#> scrollback: len=0
+#>
+#> ### D07_decsera_does_not_honour_iso_protection
+#> size: 3x10
+#> step: feed a\eVb\eW\e[1;1;1;2${
+#> source: esctest2 decsera.py test_DECSERA_doesNotRespectISOProtect
+#> cite: [E2] decsera.py; [XT] ScrnWipeRectangle IsProtected requires protected_mode == DEC_PROTECT; in iso mode both cells are blanked (esctest2 passes on xterm: no knownBug entry)
+#> note: the one place where xterm's DECSERA differs from its DECSED/DECSEL (M05/M06). DECISION D-P2.
+#> screen:
+#> >   |
+#> >
+#> >
+#> cursor: (0,2)
+#> pending_wrap: false
+#> requests: []
+#> scrollback: len=0
+#> flags: xterm-quirk decision
+#>
+#> ### D08_decsera_with_no_protection_in_use_blanks_the_rect
+#> size: 3x10
+#> step: feed abc\e[1;1;1;3${
+#> cite: [XT] mode off => IsProtected false
+#> screen:
+#> >    |
+#> >
+#> >
+#> cursor: (0,3)
+#> pending_wrap: false
+#> requests: []
+#> scrollback: len=0
+#> flags: control
+#>
+#> ### D09_decsera_is_ignored_below_level_4
+#> size: 3x10
+#> step: feed abc\e[62"p\e[1;1;1;3${
+#> cite: [XT] CASE_DECSERA `if (screen->vtXX_level >= 4)`; Tessera's level gate for DECLRMM/DECSLRM uses the same pattern (ADR 0028)
+#> note: DECSCL 62 is a soft reset and leaves the screen and cursor alone. DECSED/DECSEL/DECSCA are NOT level-gated in xterm.
+#> screen:
+#> >abc|
+#> >
+#> >
+#> cursor: (0,3)
+#> pending_wrap: false
+#> requests: []
+#> scrollback: len=0
+#> flags: decision
+#>
+#> ### D10_decsera_keeps_sgr_attributes_and_the_protection_bit_of_what_stays
+#> size: 3x10
+#> step: feed \e[41mabc\e[0m\e[1;1;1;3${
+#> cite: [DEC] DECSERA "does not change SGR visual attributes, DECSCA protection attributes, or line attributes"; [XT] ScrnWipeRectangle `Clear1Cell` leaves attribs (colour) untouched, unlike ED/EL which use the current background (BCE)
+#> note: the erased cells keep bg=red from the printed text. pen text is sgr_spec.txt canonical form.
+#> screen:
+#> >    |
+#> >
+#> >
+#> cursor: (0,3)
+#> pending_wrap: false
+#> requests: []
+#> scrollback: len=0
+#> attr: (0,0)-(0,2) fg=- bg=1 ul=- us=none flags=-
+#> flags: decision
+#>
+#> ### K02_decrc_protection_with_decsera
+#> size: 3x10
+#> step: feed \e[1"q\e7\e[0"q\e8a\e[1;1;1;1${
+#> source: esctest2 save_restore_cursor.py test_SaveRestoreCursor_Protection (the original, DECSERA form)
+#> cite: [E2] save_restore_cursor.py; [XT] CASE_DECSERA (level >= 4), mode dec so the protected 'a' survives
+#> screen:
+#> >a |
+#> >
+#> >
+#> cursor: (0,1)
+#> pending_wrap: false
+#> requests: []
+#> scrollback: len=0
+#> pstate: dec/1
+#>
+#> ### K03b_scorc_protection_with_decsera
+#> size: 3x10
+#> step: feed \e[1"q\e[s\e[0"q\e[ua\e[1;1;1;1${
+#> source: esctest2 scorc.py via save_restore_cursor.py test_SaveRestoreCursor_Protection (E_SCORC_saveRestoreCursor_protection; DECSERA form like the original)
+#> cite: [E2] scorc.py inherits SaveRestoreCursorTests; [XT] SCOSC/SCORC share CursorSave/CursorRestore with DECSC/DECRC
+#> screen:
+#> >a |
+#> >
+#> >
+#> cursor: (0,1)
+#> pending_wrap: false
+#> requests: []
+#> scrollback: len=0
+
+#> Not covered by rows here (xterm behaviour noted in spec-95-protect.md and ADR 0034):
+#>   - DECERA/DECFRA/DECCRA are not implemented in Tessera at all. xterm's DECERA ignores protection and DECFRA/DECERA stamp the
+#>     pen's PROTECTED bit onto the new blanks (ScrnFillRectangle uses xw->flags). If those ever land, the rows go with them.
+#>   - resize/reflow of a protected soft-wrapped line must keep the bit on each cell: tests/protect.rs protection_survives_reflow.
+#>   - pending-wrap on a fully protected ECH/EL range: xterm does not call ResetWrap (ClearInLine2 returns before it). Tessera
+#>     always disarms; not asserted.
+#>   - xterm's do_erase_display(2) resets the mode to OFF when the erase found no protected cell left (D-P5): NOT replicated.

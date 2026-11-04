@@ -1668,26 +1668,26 @@ scrollback: len=0
 ### RP01_da1_level4_lists_21
 size: 24x80
 step: feed \e[c
-reply: \e[?64;9;21;22c
+reply: \e[?64;6;9;21;22c
 cite: [XT charproc.c CASE_DA1 feature list is ascending]; [VT/RM DA1: 21 = horizontal scrolling]; [TM tty-keys.c reads 21 as "margins"]; reports_spec.txt D-DA1 (22 stays)
 flags: decision D1
 
 ### RP02_da1_level3_has_no_21
 size: 24x80
 step: feed \e[63;1"p\e[c
-reply: \e[?63;9;22c
+reply: \e[?63;6;9;22c
 cite: D1: DECLRMM needs level 4
 
 ### RP03_da1_level2_and_1_unchanged
 size: 24x80
 step: feed \e[62;1"p\e[c\e[61;1"p\e[c
-reply: \e[?62;9;22c\e[?1;2c
+reply: \e[?62;6;9;22c\e[?1;2c
 cite: reports_spec.txt D-DA1
 
 ### RP04_decid_follows_da1
 size: 24x80
 step: feed \eZ
-reply: \e[?64;9;21;22c
+reply: \e[?64;6;9;21;22c
 cite: reports_spec.txt D-DECID
 
 ### RM01_decrqm_69_reset

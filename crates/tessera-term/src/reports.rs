@@ -4,7 +4,7 @@
 //!
 //! | Query | Name | Reply |
 //! |---|---|---|
-//! | `CSI c`, `CSI 0 c`, `ESC Z` | DA1, DECID | `CSI ? 1 ; 2 c` at level 1, `CSI ? 6L ; 9 ; 22 c` at level L = 2 and 3, `CSI ? 6L ; 9 ; 21 ; 22 c` at L = 4 and 5 |
+//! | `CSI c`, `CSI 0 c`, `ESC Z` | DA1, DECID | `CSI ? 1 ; 2 c` at level 1, `CSI ? 6L ; 6 ; 9 ; 22 c` at level L = 2 and 3, `CSI ? 6L ; 6 ; 9 ; 21 ; 22 c` at L = 4 and 5 |
 //! | `CSI > c`, `CSI > 0 c` | DA2 | `CSI > 1 ; Pv ; 0 c`, Pv = [`DA2_PV`] |
 //! | `CSI = c`, `CSI = 0 c` | DA3 | `DCS ! \| 00000000 ST` at level 4 and up |
 //! | `CSI > q`, `CSI > 0 q` | XTVERSION | `DCS > \| Tessera <version> ST` |
@@ -13,7 +13,7 @@
 //! | `CSI ? Ps n` | DEC DSR | `?6` DECXCPR, `?15`, `?25`, `?26`, `?55`, `?56`, `?75`, `?85` with xterm's level gates |
 //! | `CSI Ps $ p`, `CSI ? Ps $ p` | DECRQM | `CSI Ps ; Pm $ y`, `CSI ? Ps ; Pm $ y`, one for every query |
 //! | `CSI ? u` | kitty keyboard flags | `CSI ? flags u` from the active screen's stack |
-//! | `DCS $ q Pt ST` | DECRQSS | `DCS 1 $ r ... ST` for `m`, `r`, `s` (level 4 and up), ` q` and `" p`, `DCS 0 $ r ST` otherwise |
+//! | `DCS $ q Pt ST` | DECRQSS | `DCS 1 $ r ... ST` for `m`, `r`, `s` (level 4 and up), ` q`, `" p` and `" q`, `DCS 0 $ r ST` otherwise |
 //! | `CSI 14 t`, `CSI 16 t` | XTWINOPS | text area and cell size in pixels, once [`Terminal::set_cell_pixels`] knows the cell |
 //! | `CSI 18 t`, `CSI 19 t` | XTWINOPS | `CSI 8 ; rows ; cols t`, `CSI 9 ; rows ; cols t` |
 //! | `CSI 22 ; Ps t`, `CSI 23 ; Ps t` | title stack | push / pop the window title; a pop sends [`Request::SetTitle`], nothing is replied |
@@ -33,7 +33,8 @@
 //! before the version and no parenthesis, so tmux matches none of its
 //! known terminal prefixes), DA2 answers the VT220 class `1` with a
 //! version above vim's "not an xterm" mark and Pc 0, and DA1 advertises
-//! only what Tessera implements: from level 2 9 (national replacement
+//! only what Tessera implements: from level 2 6 (selective erase: DECSCA,
+//! DECSED and DECSEL, ADR 0034), 9 (national replacement
 //! character sets, ADR 0033), 22 (ANSI colour) and, from level 4, 21
 //! (horizontal scrolling: left and right margins). DA1 follows DECSCL's
 //! level, as on DEC's VT510 (xterm keeps its `decTerminalID`); level 5
@@ -90,6 +91,7 @@ use std::io::Write as _;
 use tessera_grid::{Color, Style, UnderlineStyle};
 use tracing::trace;
 
+use crate::csi::Protection;
 use crate::{CursorShape, MouseEncoding, MouseTracking, Request, State};
 
 /// The version number DA2 reports (`CSI > 1 ; Pv ; 0 c`):
@@ -219,15 +221,16 @@ impl State {
     }
 
     /// DA1 (`CSI c`, `CSI 0 c`) and DECID (`ESC Z`). From level 2 the
-    /// feature list has 9 (national replacement character sets: SCS and
+    /// feature list has 6 (selective erase: DECSCA, DECSED and DECSEL, ADR
+    /// 0034), 9 (national replacement character sets: SCS and
     /// DECNRCM, ADR 0033) and from level 4 21 (horizontal scrolling: DECLRMM and DECSLRM,
     /// which work only there), in xterm's ascending order; tmux uses left
     /// and right margins only when it sees 21 (ADR 0028).
     pub(crate) fn primary_device_attributes(&mut self) {
         match self.conformance_level {
             1 => self.reply_csi(format_args!("?1;2c")),
-            level @ 2..=3 => self.reply_csi(format_args!("?6{level};9;22c")),
-            level => self.reply_csi(format_args!("?6{level};9;21;22c")),
+            level @ 2..=3 => self.reply_csi(format_args!("?6{level};6;9;22c")),
+            level => self.reply_csi(format_args!("?6{level};6;9;21;22c")),
         }
     }
 
@@ -445,6 +448,13 @@ impl State {
                 let level = self.conformance_level;
                 let c1 = u8::from(!self.c1_8bit_replies);
                 self.reply_dcs(format_args!("1$r6{level};{c1}\"p"));
+            }
+            // DECSCA: 1 only while DEC protection is on and the pen
+            // protects; after SPA (ISO protection) 0, as xterm (ADR 0034).
+            b"\"q" => {
+                let dec = self.protection == Protection::Dec;
+                let ps = u8::from(dec && self.grid.pen().has(Style::PROTECTED));
+                self.reply_dcs(format_args!("1$r{ps}\"q"));
             }
             _ => self.reply_dcs(format_args!("0$r")),
         }

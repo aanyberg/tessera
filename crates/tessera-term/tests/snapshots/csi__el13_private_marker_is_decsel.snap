@@ -1,10 +1,10 @@
 ---
 source: crates/tessera-term/tests/csi.rs
-input_file: crates/tessera-term/tests/scripts/csi/el13_private_marker_not_el.txt
+input_file: crates/tessera-term/tests/scripts/csi/el13_private_marker_is_decsel.txt
 ---
 abcdefghij
 klmnopqrst
-uvwxXz|ABCD
+    X |
 EFGHIJKLMN
 OPQRSTUVWX
 --

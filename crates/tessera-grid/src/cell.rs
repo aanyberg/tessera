@@ -174,12 +174,23 @@ impl Cell {
     ///
     /// A [`CellFlags::SPACER`] is not blank: it is part of the wide
     /// character to its left. A [`CellFlags::PAD`] cell is.
+    ///
+    /// [`Style::PROTECTED`] is not an attribute here: a protected space is
+    /// blank, so it trims, reflows and copies like any other (ADR 0034).
     pub fn is_blank(&self) -> bool {
         self.ch == ' '
             && self.style.fg == Color::Default
             && self.style.underline == Color::Default
-            && self.style.flags == 0
+            && self.style.flags & !Style::PROTECTED == 0
             && self.flags.difference(CellFlags::PAD).is_empty()
+    }
+
+    /// True when the cell was printed while the pen carried
+    /// [`Style::PROTECTED`] (SPA or DECSCA 1): a selective erase that
+    /// honours protection leaves it alone (ADR 0034). Both halves of a wide
+    /// character carry the bit of the pen that printed it.
+    pub const fn is_protected(&self) -> bool {
+        self.style.has(Style::PROTECTED)
     }
 
     /// True for the left half of a two-column character
@@ -310,6 +321,14 @@ impl Style {
     /// Subscript (SGR 74; cleared by 73, 75 and 0). The SGR parser never
     /// sets it together with [`Style::SUPERSCRIPT`].
     pub const SUBSCRIPT: u16 = 1 << 14;
+    /// Protected from selective erase: the pen carries it between SPA
+    /// (`ESC V`) and EPA (`ESC W`) and while DECSCA 1 (`CSI 1 " q`) is in
+    /// effect, and printing copies it into each cell, as xterm's
+    /// `PROTECTED` attribute (ADR 0034). Not a visual attribute: SGR never
+    /// sets or clears it (SGR 0 included), DECRQSS `m` never reports it,
+    /// the renderer ignores it and [`Cell::is_blank`] does not count it.
+    /// Blanks made by an erase, an insertion or a scroll never carry it.
+    pub const PROTECTED: u16 = 1 << 15;
     /// Every underline bit: [`Style::UNDERLINE`] and the four shape bits.
     pub const UNDERLINE_STYLE_MASK: u16 = Self::UNDERLINE
         | Self::DOUBLE_UNDERLINE
@@ -528,6 +547,36 @@ mod tests {
             !Cell::new(' ', coloured_underline).is_blank(),
             "an underline colour is an attribute"
         );
+    }
+
+    #[test]
+    fn protection_is_not_an_attribute_of_a_blank() {
+        let protected = Style::DEFAULT.with(Style::PROTECTED);
+        let space = Cell::new(' ', protected);
+        assert!(space.is_protected());
+        assert!(space.is_blank(), "a protected space is still blank");
+        assert!(!Cell::new(' ', protected.with(Style::BOLD)).is_blank());
+        assert!(!Cell::new('x', protected).is_blank());
+        assert!(!Cell::BLANK.is_protected());
+        assert!(
+            !Cell::blank_with(protected).is_protected(),
+            "erase blanks never carry the bit"
+        );
+        // The bit is the one free bit of `Style::flags`: every other flag
+        // is below it.
+        let others = Style::BOLD
+            | Style::DIM
+            | Style::ITALIC
+            | Style::UNDERLINE_STYLE_MASK
+            | Style::BLINK
+            | Style::INVERSE
+            | Style::HIDDEN
+            | Style::STRIKETHROUGH
+            | Style::OVERLINE
+            | Style::SUPERSCRIPT
+            | Style::SUBSCRIPT;
+        assert_eq!(others & Style::PROTECTED, 0);
+        assert_eq!(others | Style::PROTECTED, u16::MAX);
     }
 
     #[test]

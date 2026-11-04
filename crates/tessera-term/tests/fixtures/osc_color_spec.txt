@@ -261,7 +261,7 @@ flags: control
 ### OQ22_fish_startup_burst
 size: 24x80
 step: feed \e[?u\e[0c\e[>0q\e[6n\e]11;?\e\\
-reply: \e[?0u\e[?64;9;21;22c\eP>|Tessera <VERSION>\e\\\e[1;1R\e]11;rgb:1010/1010/1010\e\\
+reply: \e[?0u\e[?64;6;9;21;22c\eP>|Tessera <VERSION>\e\\\e[1;1R\e]11;rgb:1010/1010/1010\e\\
 cite: [VT] fish terminal.rs L171..L323 (kitty keyboard query, DA1 as `CSI 0 c`, XTVERSION `CSI > 0 q`, CPR, OSC 11 with ST); every reply present and in order; <VERSION> as in reports_spec.txt
 flags: control
 

@@ -59,9 +59,11 @@
 #   D-DA1     DA1 first parameter is 60 + conformance_level() (DECSCL changes it, as on the VT510/VT520; xterm itself keeps the
 #             decTerminalID resource and ignores DECSCL here, xterm-quirk). Level 1 (VT100) answers CSI ? 1 ; 2 c (xterm's VT100 form).
 #             Levels 2..5 answer CSI ? 6<L> ; 22 c : only features Tessera implements (22 = ANSI colour); since #97 levels 4 and 5
-#             also list 21 (horizontal scrolling: DECLRMM/DECSLRM, VT420 and up), CSI ? 6<L> ; 21 ; 22 c (margins_spec.txt RP01..RP04).
+#             also list 21 (horizontal scrolling: DECLRMM/DECSLRM, VT420 and up), CSI ? 6<L> ; 21 ; 22 c (margins_spec.txt RP01..RP04);
+#             since #112 levels 2..5 list 9 (NRCS) and since #95 6 (selective erase: DECSCA, DECSED, DECSEL; protect_spec.txt Q09..Q12),
+#             so level 4 answers CSI ? 64 ; 6 ; 9 ; 21 ; 22 c.
 #             NOT advertised: 1 (132
-#             columns: DECCOLM never resizes), 2 (printer), 3, 4 (no ReGIS/Sixel), 6 (selective erase, #95), 8, 9 (NRCS, #112), 15,
+#             columns: DECCOLM never resizes), 2 (printer), 3, 4 (no ReGIS/Sixel), 8, 15,
 #             16, 17, 18, 28 (rectangular editing), 29, 52 (clipboard: OSC 52 is write-only, tmux would then try to read).
 #             Feature numbers are added when the issue that implements them lands.
 #   D-L5      Level 5 (reachable through CSI 65 " p, #92; xterm with id 420 rejects 65) answers as a VT525 (DEC STD 070 / xterm
@@ -84,7 +86,8 @@
 #             (post-sanitising); before any OSC 0/2 it is the empty string, so popping it emits SetTitle("") = the frontend default.
 #   D-RQM0    DECRQM answers for EVERY query, with 0 for modes Tessera does not know (xterm too): programs that send several queries
 #             followed by DA1 (neovim) match replies in order and must not see a missing reply.
-#   D-RQSS    DECRQSS: answers m, r, " p, SP q; every other Pt (including " q DECSCA until #95, s DECSLRM until #97, t, $|, *|) answers
+#   D-RQSS    DECRQSS: answers m, r, " p, SP q, " q (DECSCA, #95: 1 only in DEC protection mode with the pen protecting, protect_spec.txt),
+#             s (DECSLRM, #97, level 4); every other Pt (t, $|, *|, ...) answers
 #             DCS 0 $ r ST. SGR reply uses xterm's order and its colon forms (38:5:n, 38:2::r:g:b), and reports a curly/dotted/dashed
 #             underline as 4:3/4:4/4:5 (xterm only ever prints ;4; kitty prints 4:3 and neovim's probe needs it, [VT] [KT]).
 #   D-SECURITY Replies never contain text the program supplied (no title, no icon label, no OSC payload echoed), except the colour
@@ -99,14 +102,14 @@
 ### DA01_da1_plain
 size: 24x80
 step: feed \e[c
-reply: \e[?64;9;21;22c
+reply: \e[?64;6;9;21;22c
 cite: [CTL] "CSI Ps c Send Device Attributes (Primary DA). Ps = 0 or omitted -> request attributes"; [XT] CASE_DA1 `GetParam(0) <= 0`; D-DA1 (level 4 default, conformance_level() == 4, only implemented features)
 flags: decision
 
 ### DA02_da1_ps0
 size: 24x80
 step: feed \e[0c
-reply: \e[?64;9;21;22c
+reply: \e[?64;6;9;21;22c
 cite: [CTL] as DA01; explicit Ps = 0
 flags: decision
 
@@ -120,7 +123,7 @@ flags: xterm-quirk negative
 ### DA04_decid_esc_z
 size: 24x80
 step: feed \eZ
-reply: \e[?64;9;21;22c
+reply: \e[?64;6;9;21;22c
 cite: [XT] CASE_DECID answers the DA1 reply (VT100-compatible identification, DEC STD 070 DECID); D-DECID
 flags: decision
 
@@ -134,7 +137,7 @@ flags: decision xterm-quirk
 ### DA06_da1_level2
 size: 24x80
 step: feed \e[62"p\e[c
-reply: \x9b?62;9;22c
+reply: \x9b?62;6;9;22c
 cite: D-DA1: 60 + level; [XT] 60 + display_da1/100
 note: DECSCL without Pc selects 8-bit mode ([CTL] absent Pc = 0), so the reply is 8-bit (#96, c1_spec.txt)
 flags: decision
@@ -142,7 +145,7 @@ flags: decision
 ### DA07_da1_level3
 size: 24x80
 step: feed \e[63"p\e[c
-reply: \x9b?63;9;22c
+reply: \x9b?63;6;9;22c
 cite: D-DA1
 note: DECSCL without Pc selects 8-bit mode ([CTL] absent Pc = 0), so the reply is 8-bit (#96, c1_spec.txt)
 flags: decision
@@ -150,7 +153,7 @@ flags: decision
 ### DA08_da1_level4
 size: 24x80
 step: feed \e[64"p\e[c
-reply: \x9b?64;9;21;22c
+reply: \x9b?64;6;9;21;22c
 cite: D-DA1
 note: DECSCL without Pc selects 8-bit mode ([CTL] absent Pc = 0), so the reply is 8-bit (#96, c1_spec.txt)
 flags: decision
@@ -158,7 +161,7 @@ flags: decision
 ### DA09_da1_level5
 size: 24x80
 step: feed \e[65"p\e[c
-reply: \x9b?65;9;21;22c
+reply: \x9b?65;6;9;21;22c
 cite: D-L5 (xterm id 420 refuses `CSI 65 " p`, charproc.c L5101; xterm id 525 would answer `?65;...`); #92 stores level 5
 note: DECSCL without Pc selects 8-bit mode ([CTL] absent Pc = 0), so the reply is 8-bit (#96, c1_spec.txt)
 flags: decision
@@ -166,7 +169,7 @@ flags: decision
 ### DA10_da1_after_decstr_keeps_level
 size: 24x80
 step: feed \e[62"p\e[!p\e[c
-reply: \x9b?62;9;22c
+reply: \x9b?62;6;9;22c
 cite: ADR 0020: DECSTR keeps the conformance level (xterm: DECSTR does not call set_vtXX_level)
 note: DECSCL without Pc selects 8-bit mode ([CTL] absent Pc = 0), so the reply is 8-bit (#96, c1_spec.txt); DECSTR keeps 8-bit mode
 flags: control
@@ -174,14 +177,14 @@ flags: control
 ### DA11_da1_after_ris_keeps_level
 size: 24x80
 step: feed \e[62"p\ec\e[c
-reply: \e[?62;9;22c
+reply: \e[?62;6;9;22c
 cite: ADR 0020: RIS keeps the level, as xterm
 flags: control
 
 ### DA12_da1_reply_is_8bit_after_decscl_pc2
 size: 24x80
 step: feed \e[64;2"p\e[c
-reply: \x9b?64;9;21;22c
+reply: \x9b?64;6;9;21;22c
 cite: [XT] DECSCL Pc 2 turns control_eight_bits on and unparseputc1 sends the raw 0x9B (flipped by #96; c1_spec.txt has the S8C1T rows)
 flags: control
 
@@ -244,14 +247,14 @@ flags: negative
 ### DA21_neovim_kitty_probe_then_da1
 size: 24x80
 step: feed \e[?u\e[c
-reply: \e[?0u\e[?64;9;21;22c
+reply: \e[?0u\e[?64;6;9;21;22c
 cite: [KT] keyboard protocol detection: query `CSI ? u` immediately followed by `CSI c`; a terminal that supports the protocol answers `CSI ? flags u` BEFORE the DA1 reply (here flags 0 = nothing pushed); neovim tui.c L309..314 relies on that order; D-ORDER
 flags: decision control
 
 ### DA22_tmux_startup_burst
 size: 24x80
 step: feed \e[c\e[>c\e[>q
-reply: \e[?64;9;21;22c\e[>1;<PV>;0c\eP>|Tessera <VERSION>\e\\
+reply: \e[?64;6;9;21;22c\e[>1;<PV>;0c\eP>|Tessera <VERSION>\e\\
 cite: [VT] tmux tty.c tty_send_requests sends exactly these three; each reply must arrive whole and in order (tty-keys.c matches DA, DA2, XDA by prefix); D-ID, D-ORDER
 flags: control
 
@@ -270,7 +273,7 @@ screen:
 >
 >
 cursor: (0,4)
-reply: \e[?64;9;21;22c\e[>1;<PV>;0c\eP!|00000000\e\\
+reply: \e[?64;6;9;21;22c\e[>1;<PV>;0c\eP!|00000000\e\\
 cite: queries consume their bytes and leave the grid alone ([XT] DA handlers only reply)
 flags: control
 
@@ -819,7 +822,7 @@ flags: decision
 ### RM37_dec_neovim_burst_then_da1
 size: 24x80
 step: feed \e[?69$p\e[?2026$p\e[?2027$p\e[?2031$p\e[?2048$p\e[c
-reply: \e[?69;2$y\e[?2026;2$y\e[?2027;0$y\e[?2031;0$y\e[?2048;0$y\e[?64;9;21;22c
+reply: \e[?69;2$y\e[?2026;2$y\e[?2027;0$y\e[?2031;0$y\e[?2048;0$y\e[?64;6;9;21;22c
 cite: [VT] neovim tui.c L592..L694: DECRQM burst, DA1 last as the "terminal has processed everything" sentinel; D-ORDER, D-RQM0
 flags: control
 
@@ -1162,8 +1165,8 @@ flags: control
 ### RQ28_unknown_requests_invalid
 size: 24x80
 step: feed \eP$qx\e\\\eP$q\e\\\eP$q"q\e\\\eP$qs\e\\\eP$qt\e\\\eP$q$|\e\\\eP$q*|\e\\\eP$q*x\e\\\eP$q$}\e\\\eP$q$~\e\\
-reply: \eP0$r\e\\\eP0$r\e\\\eP0$r\e\\\eP1$r1;80s\e\\\eP0$r\e\\\eP0$r\e\\\eP0$r\e\\\eP0$r\e\\\eP0$r\e\\\eP0$r\e\\
-cite: [CTL] invalid requests answer `DCS 0 $ r ST`. D-RQSS: " q DECSCA (#95), t DECSLPP, $| DECSCPP, *| DECSNLS, *x DECSACE, $} DECSASD and $~ DECSSDT are valid in xterm but not modelled by Tessera; each flips to a real answer in its issue (`s` DECSLRM did in #97: `1;80s`, margins_spec.txt RS01). `$q` with an empty Pt is invalid ([XT] falls through to okay = False)
+reply: \eP0$r\e\\\eP0$r\e\\\eP1$r0"q\e\\\eP1$r1;80s\e\\\eP0$r\e\\\eP0$r\e\\\eP0$r\e\\\eP0$r\e\\\eP0$r\e\\\eP0$r\e\\
+cite: [CTL] invalid requests answer `DCS 0 $ r ST`. D-RQSS: t DECSLPP, $| DECSCPP, *| DECSNLS, *x DECSACE, $} DECSASD and $~ DECSSDT are valid in xterm but not modelled by Tessera; each flips to a real answer in its issue (`s` DECSLRM did in #97: `1;80s`, margins_spec.txt RS01; `" q` DECSCA did in #95: `1$r0"q` with DEC protection off, protect_spec.txt Q01..Q08). `$q` with an empty Pt is invalid ([XT] falls through to okay = False)
 flags: decision
 
 ### RQ29_decrqss_not_dcs_q
@@ -1530,7 +1533,7 @@ flags: control
 ### RP01_queries_in_one_chunk_replied_in_order
 size: 24x80
 step: feed \e[5n\e[6n\e[c\e[>q\e[?25$p
-reply: \e[0n\e[1;1R\e[?64;9;21;22c\eP>|Tessera <VERSION>\e\\\e[?25;1$y
+reply: \e[0n\e[1;1R\e[?64;6;9;21;22c\eP>|Tessera <VERSION>\e\\\e[?25;1$y
 cite: D-ORDER
 flags: control
 
@@ -1556,7 +1559,7 @@ flags: xterm-quirk negative
 ### RP04_query_interrupted_by_esc_is_not_answered
 size: 24x80
 step: feed \e[6\e[c
-reply: \e[?64;9;21;22c
+reply: \e[?64;6;9;21;22c
 cite: ESC restarts the sequence; only the `CSI c` completes (tessera-vt)
 flags: negative control
 

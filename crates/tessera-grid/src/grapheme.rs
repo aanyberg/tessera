@@ -224,6 +224,15 @@ impl GraphemeTable {
         });
     }
 
+    /// Keeps the clusters and hyperlinks whose column `keep` accepts and
+    /// drops the others, in one pass over each kind.
+    pub(crate) fn retain_cols(&mut self, mut keep: impl FnMut(usize) -> bool) {
+        self.edit(|side| {
+            side.clusters.retain(|e| keep(usize::from(e.col)));
+            side.links.retain_cols(&mut keep);
+        });
+    }
+
     /// Drops every cluster and hyperlink.
     pub(crate) fn clear(&mut self) {
         self.entries = None;

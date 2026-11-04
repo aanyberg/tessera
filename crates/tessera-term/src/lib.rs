@@ -85,11 +85,32 @@
 //!   single shift, in the saved cursor too (see "Character sets" below).
 //!   DECNRCM (`CSI ? 42`) is kept, as in xterm; DEC's table resets it.
 //!
+//! - character protection: the protection mode off and the pen no longer
+//!   protecting (DECSCA 0, xterm's `ReallyReset`). The cells printed
+//!   protected keep their bit, so a later DECSCA or SPA honours them again
+//!   (see "Protected areas" below).
+//!
 //! KAM is not modelled (SM 2 is ignored), so it has nothing to reset.
-//! Still waiting on state that does not exist yet (`// #95` in
-//! `soft_reset`): DECSCA (#95). The colours a program set (OSC 4, 10, 11,
+//! The colours a program set (OSC 4, 10, 11,
 //! 12) are kept by DECSTR and DECSCL and dropped by RIS only, a deviation
 //! from xterm, which resets the palette on DECSTR (ADR 0024).
+//!
+//! ## Protected areas
+//!
+//! Cells printed while the pen carries
+//! [`Style::PROTECTED`](tessera_grid::Style::PROTECTED) survive a selective
+//! erase, as in xterm (ADR 0034). One terminal-wide mode decides which
+//! erases honour the bit: SPA (`ESC V`, `0x96`) selects ISO protection and
+//! makes the pen protect until EPA (`ESC W`, `0x97`); DECSCA (`CSI Ps " q`)
+//! selects DEC protection whatever `Ps` is, and its `Ps` 1 makes the pen
+//! protect, 0, 2 or none stop. In ISO mode ED, EL and ECH keep protected
+//! cells; in either mode DECSED (`CSI ? Ps J`) and DECSEL (`CSI ? Ps K`) do,
+//! and with protection off they are ED and EL. SGR never touches the bit,
+//! DECSC, SCOSC and DECSET 1049 save and restore it with the pen, and
+//! DECRQSS `" q` reports it in DEC mode. ICH, DCH, IL, DL and scrolling
+//! move protected cells like any other, printing over one replaces its
+//! protection with the pen's, and a protected wide character is erased
+//! whole or not at all. DECSERA is not implemented (#251).
 //!
 //! ## Character sets
 //!
@@ -169,6 +190,7 @@ pub use osc_color::{ColorOverrides, MAX_COLOR_OVERRIDES, Rgb, ThemeColors};
 pub use reports::{DA2_PV, TITLE_STACK_DEPTH};
 
 use charset::{Charsets, Saved};
+use csi::Protection;
 use dcs::Dcs;
 use osc_color::Colors;
 use reports::TitleStack;
@@ -335,6 +357,8 @@ impl Terminal {
                 title_stack: TitleStack::default(),
                 cell_pixels: None,
                 colors: Colors::default(),
+                protection: Protection::Off,
+                unprotected_screens: [true; 2],
             },
             carry: Vec::new(),
         }
@@ -530,6 +554,17 @@ impl Terminal {
     /// the new size lands on a grid that has it.
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.state.grid.resize(rows, cols);
+        // A re-wrap can pull protected cells back from the scrollback.
+        self.state.unprotected_screens = [false; 2];
+    }
+
+    /// The terminal-wide protection mode as `"off"`, `"dec"` (DECSCA) or
+    /// `"iso"` (SPA), for the protected-area tests (ADR 0034). Whether the
+    /// pen protects is [`Style::PROTECTED`](tessera_grid::Style::PROTECTED)
+    /// on [`Grid::pen`].
+    #[doc(hidden)]
+    pub fn protection_mode(&self) -> &'static str {
+        self.state.protection.name()
     }
 
     /// Keeps at most `lines` lines of scrollback from now on (zero keeps
@@ -627,6 +662,16 @@ struct State {
     /// The theme's colours, the program's overrides (OSC 4, 10, 11, 12)
     /// and their generation (see the `osc_color` module).
     colors: Colors,
+    /// Which erases honour protected cells (SPA, DECSCA; ADR 0034). Reset
+    /// by DECSTR, DECSCL and RIS; the cells keep their bit.
+    protection: Protection,
+    /// Per screen (primary first), true while the screen is known to hold
+    /// no protected cell, so ED, EL and ECH in ISO mode and DECSED and
+    /// DECSEL skip the scan for one. Cleared for both screens while the
+    /// pen protects and by a resize; set again by an erase of the whole
+    /// screen that left no protected cell behind with the pen not
+    /// protecting, and by RIS.
+    unprotected_screens: [bool; 2],
 }
 
 /// The parser's consumer: [`State::apply`] for every action, and 8-bit mode
