@@ -814,6 +814,43 @@ text: "l3\nl4"
 cite: no selected line is removed by ED 3 (the screen stays)
 note: Screen l3,l4 selected; the history l1,l2 is erased.
 
+### G07i_ed2_unwrapping_a_selected_history_line_onto_the_screen_clears
+layer: core
+size: 2x5
+step: feed x\r\nabcdefgh\r\n
+step: begin 0,0 line
+step: feed \x1b[2J\x1b[1;1Hfgh
+sel: none
+has_selection: false
+text: none
+cite: lead decision D4 (#191, 2026-11-04): the selection is cleared when the text it would copy changed, including the soft-wrap join between its last history row and the screen; D6 (Copy never returns text the user did not see)
+note: `abcde` (history, soft-wrapped) and `fgh` (row 0) are one logical line; the line selection copies "abcdefgh". ED 2 clears the newest history line's soft-wrap flag, so the same cells would copy "abcde\nfgh": the newest history line is guarded too.
+
+### G07j_trailing_blanks_before_wrapped_text_are_kept
+layer: core
+size: 3x8
+step: feed abc     d
+step: begin 0,0 char
+step: extend 0,7
+sel: linear (0,0)-(0,7)
+has_selection: true
+text: "abc     "
+cite: D2 (only the blanks after the last text of a logical line are dropped): `d` on the next row of the same logical line keeps them
+note: Row 0 is `abc` and five written spaces, soft-wrapped onto `d` on row 1. The selection is row 0 only.
+
+### G07k_blanking_the_wrapped_rest_of_the_line_clears
+layer: core
+size: 3x8
+step: feed abc     d
+step: begin 0,0 char
+step: extend 0,7
+step: feed \x1b[2;1H 
+sel: none
+has_selection: false
+text: none
+cite: lead decision D4 (#191, 2026-11-04): the text the selection would copy changed ("abc     " to "abc"), so it is cleared although no selected row changed
+note: As G07j, then `d` (row 1, not selected) is overwritten with a space: the blanks of row 0 become trailing. The rest of the last selected row's logical line is guarded.
+
 ### G08_resize_clears
 layer: core
 size: 3x10
@@ -1379,3 +1416,133 @@ input: use https:// here and http:
 at: 6
 url: none
 cite: U6 (`https://` with nothing after it)
+
+### J38_cjk_before_the_scheme_does_not_block_it
+layer: url
+input: \u{8a73}\u{7d30}\u{306f}https://example.com/\u{3092}\u{53c2}\u{7167}
+at: 5
+url: https://example.com/
+span: 3-22
+cite: lead decision D3 (#191, 2026-11-04) U1: only an ASCII alphanumeric, `+`, `-` or `.` before the scheme blocks it (CJK prose has no space before a URL); U3: after the host CJK ends the URL
+note: 詳細はhttps://example.com/を参照 ("see https://example.com/ for details").
+
+### J39_trailing_kana_after_the_path_ends_the_url
+layer: url
+input: see https://a.jp/x\u{3092}\u{53c2}\u{7167}
+at: 5
+url: https://a.jp/x
+span: 4-17
+cite: lead decision D3 (#191) U3: after the host a Han, kana or Hangul character ends the URL
+note: With a space before the URL the old rule linked the Japanese text after it as well.
+
+### J40_cjk_and_fullwidth_punctuation_end_the_url
+layer: url
+input: \u{ff08}https://a.jp/x\u{ff09}\u{3001}\u{3005}
+at: 3
+url: https://a.jp/x
+span: 1-14
+cite: lead decision D3 (#191) U3: CJK and fullwidth punctuation (U+3000-U+303F, U+FF00-U+FF65) end the URL after the host
+note: Fullwidth parentheses, an ideographic comma and the iteration mark 々 (U+3005, a letter, so a URL character before D3).
+
+### J41_raw_cjk_path_is_cut_where_the_cjk_starts
+layer: url
+input: https://ja.wikipedia.org/wiki/\u{65e5}\u{672c}
+at: 3
+url: https://ja.wikipedia.org/wiki/
+span: 0-29
+cite: lead decision D3 (#191): the documented cost, a path written in raw CJK is cut (the percent-encoded form, J42, is not)
+
+### J42_percent_encoded_cjk_path_is_kept
+layer: url
+input: https://ja.wikipedia.org/wiki/%E6%97%A5%E6%9C%AC
+at: 3
+url: https://ja.wikipedia.org/wiki/%E6%97%A5%E6%9C%AC
+span: 0-47
+cite: lead decision D3 (#191); RFC 3986 2.1 (percent-encoding)
+
+### J43_idn_host_keeps_cjk_and_its_cjk_path_is_cut
+layer: url
+input: https://\u{4f8b}\u{3048}.jp/\u{65e5}\u{672c}
+at: 9
+url: https://\u{4f8b}\u{3048}.jp/
+span: 0-13
+cite: lead decision D3 (#191): the host keeps IDN letters (J30 unchanged), the path after it does not
+
+### J44_cjk_text_after_a_url_is_not_underlined
+layer: core
+size: 2x30
+step: feed \u{8a73}\u{7d30}\u{306f}https://a.jp/\u{3092}\u{53c2}\u{7167}
+step: link 0,10
+link: https://a.jp/ (0,6)-(0,18)
+cite: lead decision D3 (#191) U1 and U3, through App::link_at: the three wide characters before the URL take columns 0-5, を from column 19 is outside the span
+
+### J45_cjk_after_the_top_level_domain_ends_the_url
+layer: url
+input: \u{8a73}\u{7d30}\u{306f}https://example.com\u{3092}\u{53c2}\u{7167}
+at: 5
+url: https://example.com
+span: 3-21
+cite: lead decision E1 (#191 critic round 1, 2026-11-04) U3: in the host a CJK character right after an ASCII label (letters, digits, `-` after a `.` or `:` of the host) ends the URL
+note: J38 without the trailing `/`: 詳細はhttps://example.comを参照.
+
+### J46_cjk_prose_after_a_path_less_url
+layer: url
+input: https://github.com\u{3067}\u{516c}\u{958b}
+at: 3
+url: https://github.com
+span: 0-17
+cite: lead decision E1 (#191) U3
+note: https://github.comで公開 ("published on GitHub").
+
+### J47_cjk_after_a_mailto_domain_ends_it
+layer: url
+input: mailto:a@b.jp\u{307e}\u{3067}
+at: 3
+url: mailto:a@b.jp
+span: 0-12
+cite: lead decision E1 (#191) U3, U7
+note: mailto:a@b.jpまで ("to a@b.jp").
+
+### J48_cjk_after_a_port_ends_the_url
+layer: url
+input: https://a.jp:8080\u{65e5}\u{672c}
+at: 3
+url: https://a.jp:8080
+span: 0-16
+cite: lead decision E1 (#191) U3: a port is an ASCII run after the host's `:`
+
+### J49_idn_top_level_domain_keeps_its_cjk
+layer: url
+input: https://\u{4f8b}\u{3048}.\u{30c6}\u{30b9}\u{30c8}
+at: 9
+url: https://\u{4f8b}\u{3048}.\u{30c6}\u{30b9}\u{30c8}
+span: 0-13
+cite: lead decision E1 (#191): a CJK label after a `.` is an IDN label, not prose (no ASCII before it in the label)
+note: https://例え.テスト.
+
+### J50_idn_label_after_an_ascii_label_is_kept
+layer: url
+input: https://www.\u{4f8b}\u{3048}.jp/
+at: 3
+url: https://www.\u{4f8b}\u{3048}.jp/
+span: 0-17
+cite: lead decision E1 (#191): only CJK following an ASCII character of a label ends the URL
+note: https://www.例え.jp/.
+
+### J51_cjk_host_after_userinfo_is_kept
+layer: url
+input: https://u:p@\u{4f8b}\u{3048}.jp/
+at: 3
+url: https://u:p@\u{4f8b}\u{3048}.jp/
+span: 0-17
+cite: lead decision E1 (#191): the `:` of user:password is followed by `p@`, not by the CJK, so the host keeps it
+note: https://u:p@例え.jp/.
+
+### J52_hangul_after_the_path_ends_the_url
+layer: url
+input: https://a.kr/\u{c5d0}\u{c11c}
+at: 3
+url: https://a.kr/
+span: 0-12
+cite: lead decision D3 (#191) U3: Hangul syllables (U+AC00-U+D7A3) end the URL after the host
+note: https://a.kr/에서 ("at https://a.kr/").

@@ -33,9 +33,13 @@
 //! On the next look at the terminal (any of the calls above, and every
 //! frame) the selection is dropped when:
 //!
-//! - a selected row on the live screen no longer holds the text it held
-//!   when the selection was made (cells, clusters and the soft-wrap flag are
-//!   compared, so a program repainting the same text keeps it);
+//! - a row whose change can change the copied text no longer holds what it
+//!   held when the selection was made: a selected row on the live screen,
+//!   the newest history line if selected (a whole-screen erase unwraps it
+//!   from the screen's top row), and the rest of the last selected row's
+//!   logical line (its text decides whether blanks at the selection's end
+//!   are kept). Cells, clusters and the soft-wrap flag are compared, so a
+//!   program repainting the same text keeps it;
 //! - the history loses a line of it other than by eviction at its cap
 //!   (ED 3, RIS), or evicts every line of it (when it evicts only the top,
 //!   the start moves to the oldest line left, at column 0);
@@ -401,8 +405,9 @@ struct Guard {
     len: usize,
     /// The number of `lines[0]`.
     first: i64,
-    /// The selected rows that were on the live screen when the selection
-    /// was made, as they were then.
+    /// The rows whose change can change the selection's text, as they were
+    /// when it was made ([`Guard::retake`]): at most the screen and one
+    /// history line.
     lines: Vec<Line>,
     /// The view's top line at the last frame that checked the guard, if
     /// it is unchanged since: every guarded row that view showed then
@@ -414,6 +419,17 @@ struct Guard {
 impl Guard {
     /// Takes the guard of a selection over lines `start..=end` of `lines`,
     /// reusing `self`'s buffers.
+    ///
+    /// The guarded rows are those whose change can change the text the
+    /// selection copies, from the newest history line down: the selected
+    /// rows on the live screen; the newest history line when it is
+    /// selected, whose soft-wrap flag a whole-screen erase (ED 2, RIS)
+    /// clears, splitting a selected line that wraps onto the screen; and
+    /// the rest of the last selected row's logical line below it, whose
+    /// text decides whether blanks at the end of the selection are kept
+    /// (text follows on the line) or dropped. Older history lines change
+    /// only by eviction, clearing and resizing, which the selection
+    /// handles on its own.
     fn retake(&mut self, lines: &Lines<'_>, start: i64, end: i64) {
         let grid = lines.grid;
         self.rows = lines.rows;
@@ -422,9 +438,9 @@ impl Guard {
         self.generation = grid.damage_generation();
         self.pushed = grid.scrollback_pushed();
         self.len = grid.scrollback_len();
-        self.first = start.max(lines.top);
+        self.first = start.max(lines.top - 1).max(lines.first);
         self.synced = None;
-        let last = end.min(lines.last());
+        let last = lines.logical_bottom(end.min(lines.last()));
         let count = usize::try_from(last - self.first + 1).unwrap_or(0);
         self.lines.truncate(count);
         for (i, n) in (self.first..=last).enumerate() {
@@ -1368,9 +1384,27 @@ mod tests {
                 Just("\x1b[1T".to_owned()),
                 Just("\x1b[2;4r\x1b[4H\n\x1b[r".to_owned()),
                 Just("\x1b[H\x1b[2J".to_owned()),
+                // ED 2 alone: it unwraps the newest history line.
+                Just("\x1b[2J".to_owned()),
+                Just("\x1b[2Jab".to_owned()),
                 Just("\x1b[3J".to_owned()),
                 // A rewrite of the top row, then lines that scroll it off.
                 Just("\x1b[1;1Hzz\x1b[5;1H\n\n".to_owned()),
+                // From the #30 critic's scratch test: RIS, the alternate
+                // screen both ways, ED 0, a scroll region at the top, RI at
+                // the top, a line that wraps, rewrites that scroll off.
+                Just("\x1bc".to_owned()),
+                Just("\x1b[?1049h".to_owned()),
+                Just("\x1b[?1049l".to_owned()),
+                Just("\x1b[H\x1b[J".to_owned()),
+                Just("\x1b[1;3r\x1b[3H\n\x1b[r".to_owned()),
+                Just("\x1b[1;1H\x1bM".to_owned()),
+                Just("abcabcabcab".to_owned()),
+                Just("\x1b[2;1Hzz\x1b[5;1H\n".to_owned()),
+                Just("\x1b[5;8Hq\x1b[1;1Hy\x1b[5;1H\n\n\n".to_owned()),
+                // A blank over the first cell of a row (it may hold the only
+                // text after a wrapped row's trailing blanks).
+                (1u16..6).prop_map(|r| format!("\x1b[{r};1H ")),
             ]
             .prop_map(Op::Feed),
             2 => (0usize..4).prop_map(Op::Frame),
@@ -1379,31 +1413,49 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(400))]
+        #![proptest_config(ProptestConfig::with_cases(4_000))]
 
         /// The frame path (only rows the capture found changed, damage
         /// outside the view) and the look path (damage) clear the selection
-        /// exactly when a full comparison of every guarded row would.
+        /// exactly when a full comparison of every guarded row would, with
+        /// the history at a random cap; and a selection that is kept copies
+        /// the text it copied when it was made (or, after eviction trimmed
+        /// it, the end of that text).
         #[test]
         fn validation_agrees_with_a_full_comparison(
-            setup in "[a-c \r\n]{0,40}",
+            // Lines of up to a row and a half (8 columns): some soft-wrap,
+            // and enough of them scroll wrapped lines into the history.
+            setup in proptest::collection::vec(
+                prop_oneof!["[a-c ]{1,12}", Just("\r\n".to_owned())],
+                0..16,
+            ),
             from in (0u16..5, 0u16..8),
             to in (0u16..5, 0u16..8),
             offset in 0usize..3,
+            cap in prop_oneof![Just(1_000usize), 0usize..6],
             ops in proptest::collection::vec(op(), 1..30),
         ) {
             let mut term = Terminal::new(5, 8);
-            term.advance(setup.as_bytes());
+            term.set_max_scrollback(cap);
+            term.advance(setup.concat().as_bytes());
             let mut state = SelectionState::default();
             let grid = term.grid();
             state.begin(grid, offset, point(from.0, from.1), Granularity::Char, false);
             state.extend(grid, offset, point(to.0, to.1));
             let sel = state.sel.clone().expect("selected");
-            // The reference: the selected live rows as they were, by line.
+            let original = extract(&Lines::of(grid), &sel);
+            // The reference: the rows whose change can change the text, as
+            // they were, by line: the selected live rows, the newest
+            // history line if selected, and the rest of the last selected
+            // row's logical line.
             let reference: Vec<(i64, Line)> = {
                 let lines = Lines::of(grid);
-                (sel.start.line..=sel.end.line)
-                    .filter(|&n| n >= lines.top)
+                let mut last = sel.end.line;
+                while last < lines.last() && lines.line(last).is_some_and(|l| l.wrapped) {
+                    last += 1;
+                }
+                (sel.start.line..=last)
+                    .filter(|&n| n >= lines.top - 1)
                     .filter_map(|n| Some((n, lines.line(n)?.clone())))
                     .collect()
             };
@@ -1411,6 +1463,7 @@ mod tests {
             let mut seen = (term.grid().scrollback_pushed(), term.grid().scrollback_len());
             let mut snapshot = crate::view::Snapshot::default();
             let mut alive = true;
+            let mut trimmed = false;
             for op in ops {
                 let checked = match op {
                     Op::Feed(bytes) => {
@@ -1439,7 +1492,9 @@ mod tests {
                 let evicted = removed == 0 || grid.scrollback_len() >= grid.max_scrollback();
                 seen = (grid.scrollback_pushed(), grid.scrollback_len());
                 let lines = Lines::of(grid);
+                trimmed = trimmed || start < lines.first;
                 alive = alive
+                    && !grid.is_alt_screen()
                     && if evicted {
                         end >= lines.first
                     } else {
@@ -1454,6 +1509,14 @@ mod tests {
                             })
                     });
                 prop_assert_eq!(state.sel.is_some(), alive);
+                if let Some(sel) = state.sel.as_ref().filter(|sel| sel.active) {
+                    let text = extract(&lines, sel);
+                    if trimmed {
+                        prop_assert!(original.ends_with(&text), "{:?} is not the end of {:?}", text, original);
+                    } else {
+                        prop_assert_eq!(&text, &original);
+                    }
+                }
             }
         }
     }
