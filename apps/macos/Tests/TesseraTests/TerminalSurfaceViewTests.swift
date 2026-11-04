@@ -1058,6 +1058,190 @@ final class TerminalSurfaceViewTests: XCTestCase {
         XCTAssertTrue(view.isDisplayLinkPaused, "given up: the link idles")
     }
 
+    /// Runs `body` with ``TerminalSurfaceView/reattachInterval`` at an hour:
+    /// every drop comes within it of the attach before.
+    private func withALongReattachInterval(_ body: () throws -> Void) rethrows {
+        let interval = TerminalSurfaceView.reattachInterval
+        TerminalSurfaceView.reattachInterval = .seconds(3600)
+        defer { TerminalSurfaceView.reattachInterval = interval }
+        try body()
+    }
+
+    /// Drops the view's surface in the core whenever the view holds one, and
+    /// has the next frame find it gone, for `ticks` refreshes: a device that
+    /// accepts every attach and loses the surface at the next frame. Returns
+    /// the drops made.
+    private func dropAtEveryFrame(with rogue: TesseraSurface, ticks: Int) throws -> Int {
+        var drops = 0
+        for _ in 0..<ticks {
+            if view.surface.isAttached {
+                try rogue.detach()
+                drops += 1
+                view.sessionDidOutput()
+            }
+            view.displayLinkDidFire()
+        }
+        return drops
+    }
+
+    /// #237: a core that drops the surface at the first frame after every
+    /// attach counts each drop as a failed attempt, so after a few the view
+    /// gives up and the link idles, instead of re-attaching on every tick.
+    /// A size change tries again.
+    func testASurfaceTheCoreDropsAtEveryFrameIsGivenUpOnAndTheLinkIdles() throws {
+        try requireSurface()
+        try withALongReattachInterval {
+            view.occlusionOverride = false
+            view.displayLinkDidFire()
+            let rogue = TesseraSurface(session: view.session)
+            let attempts = view.attachAttemptCount
+            let tries = TerminalSurfaceView.maxReattachFailures
+            XCTAssertEqual(try dropAtEveryFrame(with: rogue, ticks: 30), tries, "dropped, then given up on")
+            XCTAssertEqual(view.attachAttemptCount - attempts, tries - 1, "re-attached after every drop but the last")
+            XCTAssertEqual(view.reattachFailures, tries)
+            XCTAssertFalse(view.surface.isAttached)
+            XCTAssertTrue(view.isDisplayLinkPaused, "given up: the link idles")
+            grow()
+            XCTAssertFalse(view.isDisplayLinkPaused, "a size change tries again")
+            view.displayLinkDidFire()
+            XCTAssertTrue(view.surface.isAttached)
+            XCTAssertEqual(view.reattachFailures, 0)
+        }
+    }
+
+    /// #237: the same core, dropping the surface inside every re-attach,
+    /// before the view's first read of it.
+    func testASurfaceTheCoreDropsInsideEveryReattachIsGivenUpOn() throws {
+        try requireSurface()
+        try withALongReattachInterval {
+            view.occlusionOverride = false
+            view.displayLinkDidFire()
+            let rogue = try dropTheSurfaceInTheCore()
+            view.didAttachForTesting = { try? rogue.detach() }
+            defer { view.didAttachForTesting = nil }
+            let attempts = view.attachAttemptCount
+            view.sessionDidOutput()
+            for _ in 0..<20 {
+                view.displayLinkDidFire()
+            }
+            let tries = TerminalSurfaceView.maxReattachFailures
+            XCTAssertEqual(view.attachAttemptCount - attempts, tries - 1, "the frame's drop, then one per attach")
+            XCTAssertEqual(view.reattachFailures, tries)
+            XCTAssertFalse(view.surface.isAttached)
+            XCTAssertTrue(view.isDisplayLinkPaused, "given up: the link idles")
+        }
+    }
+
+    /// #237: a surface that lasted ``TerminalSurfaceView/reattachInterval``
+    /// before the core dropped it starts the count of failures again.
+    func testADropAfterTheSurfaceLastedTheIntervalStartsTheCountAgain() throws {
+        try requireSurface()
+        let rogue = TesseraSurface(session: view.session)
+        let tries = TerminalSurfaceView.maxReattachFailures
+        try withALongReattachInterval {
+            view.occlusionOverride = false
+            view.displayLinkDidFire()
+            // One drop short of giving up, ending attached.
+            for _ in 0..<(tries - 1) {
+                XCTAssertEqual(try dropAtEveryFrame(with: rogue, ticks: 2), 1)
+            }
+            XCTAssertTrue(view.surface.isAttached)
+            XCTAssertEqual(view.reattachFailures, tries - 1)
+        }
+        let interval = TerminalSurfaceView.reattachInterval
+        TerminalSurfaceView.reattachInterval = .zero  // the attach has lasted it
+        defer { TerminalSurfaceView.reattachInterval = interval }
+        XCTAssertEqual(try dropAtEveryFrame(with: rogue, ticks: 1), 1)
+        XCTAssertEqual(view.reattachFailures, 0, "not a failed attempt")
+        view.displayLinkDidFire()
+        XCTAssertTrue(view.surface.isAttached, "re-attached")
+    }
+
+    /// #237 (critic M2): an attach that is not a re-attach (the view moved to
+    /// another window with its surface fine) starts the count of failures
+    /// afresh: one drop there is retried, not given up on.
+    func testAnAttachInANewWindowStartsTheCountAfresh() throws {
+        try requireSurface()
+        let rogue = TesseraSurface(session: view.session)
+        let tries = TerminalSurfaceView.maxReattachFailures
+        try withALongReattachInterval {
+            view.occlusionOverride = false
+            view.displayLinkDidFire()
+            for _ in 0..<(tries - 1) {
+                XCTAssertEqual(try dropAtEveryFrame(with: rogue, ticks: 2), 1)
+            }
+            XCTAssertTrue(view.surface.isAttached)
+            XCTAssertEqual(view.reattachFailures, tries - 1)
+            let other = KeyControlledWindow(contentRect: view.frame)
+            extraWindows.append(other)
+            other.contentView = view
+            XCTAssertTrue(view.surface.isAttached, "attached in the new window")
+            XCTAssertEqual(view.reattachFailures, 0, "a fresh attach")
+            view.occlusionOverride = false
+            XCTAssertEqual(try dropAtEveryFrame(with: rogue, ticks: 2), 1)
+            XCTAssertEqual(view.reattachFailures, 1)
+            XCTAssertTrue(view.surface.isAttached, "re-attached, not given up on")
+        }
+    }
+
+    /// #237 (critic M1): the drop that gives up, found by a resize while a
+    /// frame is pending, leaves the link idle, not ticking with nothing to do.
+    func testGivingUpOnADropAResizeFoundIdlesTheLink() throws {
+        try requireSurface()
+        let rogue = TesseraSurface(session: view.session)
+        let tries = TerminalSurfaceView.maxReattachFailures
+        try withALongReattachInterval {
+            view.occlusionOverride = false
+            view.displayLinkDidFire()
+            for _ in 0..<(tries - 1) {
+                XCTAssertEqual(try dropAtEveryFrame(with: rogue, ticks: 2), 1)
+            }
+            XCTAssertTrue(view.surface.isAttached)
+            view.sessionDidOutput()
+            XCTAssertFalse(view.isDisplayLinkPaused, "a frame is pending")
+            try rogue.detach()
+            grow()  // finds the surface gone: the last failure allowed
+            XCTAssertFalse(view.surface.isAttached)
+            XCTAssertEqual(view.reattachFailures, tries)
+            XCTAssertTrue(view.isDisplayLinkPaused, "given up: the link idles")
+        }
+    }
+
+    /// #237: a core that drops the surface again inside the re-attach (found
+    /// by the attach's own metrics read) leaves the configured size Actual
+    /// Size returns to, and the zoom, for the next re-attach, which applies
+    /// the zoom again.
+    func testADropInsideTheReattachKeepsTheActualSizeAndTheZoom() throws {
+        try requireSurface()
+        view.occlusionOverride = false
+        view.displayLinkDidFire()
+        let configured = try XCTUnwrap(view.attachedFontSizePt)
+        view.increaseFontSize(nil)
+        let zoom = try XCTUnwrap(view.zoomedFontSizePt)
+        XCTAssertNotEqual(zoom, configured)
+        let rogue = try dropTheSurfaceInTheCore()
+        view.displayLinkDidFire()  // draws the zoom's frame, which finds the surface gone
+        XCTAssertFalse(view.surface.isAttached)
+        var dropOnce = true
+        view.didAttachForTesting = {
+            if dropOnce {
+                dropOnce = false
+                try? rogue.detach()
+            }
+        }
+        defer { view.didAttachForTesting = nil }
+        view.displayLinkDidFire()
+        XCTAssertFalse(dropOnce, "re-attached, and dropped inside the attach")
+        XCTAssertFalse(view.surface.isAttached)
+        XCTAssertEqual(view.attachedFontSizePt, configured, "Actual Size still returns to the configured size")
+        XCTAssertEqual(view.zoomedFontSizePt, zoom, "the zoom waits for the next attach")
+        view.displayLinkDidFire()
+        XCTAssertTrue(view.surface.isAttached, "re-attached")
+        XCTAssertEqual(try fontSize(view), zoom, "at the zoom")
+        XCTAssertEqual(view.attachedFontSizePt, configured)
+        XCTAssertEqual(view.zoomedFontSizePt, zoom)
+    }
+
     func testBecomingVisibleRedraws() throws {
         try requireSurface()
         view.occlusionOverride = false

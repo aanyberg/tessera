@@ -61,11 +61,15 @@ public final class TesseraSession: Sendable, Identifiable {
             tessera_session_resize(core.pointer, id, rows, cols, widthPx, heightPx))
     }
 
-    /// Clears the scrollback and the screen above the cursor line (⌘K,
-    /// Terminal.app's "Clear to Start"), so the prompt line becomes the top
-    /// row. On the alternate screen (a full-screen app) only the scrollback
-    /// is cleared. No ``TesseraAppDelegate/sessionDidOutput(_:)`` follows:
-    /// redraw after calling this.
+    /// Clears the scrollback and the screen above the prompt (⌘K,
+    /// Terminal.app's "Clear to Start"), so the prompt becomes the top row
+    /// (ADR 0022 D-CLEAR-START). The kept rows start at the nearest row at or
+    /// above the cursor with a prompt-start mark, the scan stopping at a row
+    /// where command output starts; without such a mark, at the first row of
+    /// the cursor's logical line (the rows that wrap into it). On the
+    /// alternate screen (a full-screen app) only the scrollback is cleared.
+    /// No ``TesseraAppDelegate/sessionDidOutput(_:)`` follows: redraw after
+    /// calling this.
     @MainActor
     public func clearScrollback() throws {
         try TesseraCoreError.check(tessera_session_clear_scrollback(core.pointer, id))

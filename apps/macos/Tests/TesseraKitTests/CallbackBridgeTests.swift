@@ -289,6 +289,12 @@ final class CallbackBridgeTests: XCTestCase {
         bridge.unregister(8)
         XCTAssertEqual(clipboard, "last", "written at the close")
         XCTAssertNil(bridge.clipboardThrottle.held)
+        // The release scheduled for it runs and finds nothing to write.
+        let changes = pasteboard.changeCount
+        try await until { !self.bridge.isClipboardReleaseScheduled }
+        XCTAssertFalse(bridge.isClipboardReleaseScheduled)
+        XCTAssertEqual(pasteboard.changeCount, changes, "nothing written after it")
+        XCTAssertEqual(clipboard, "last")
     }
 
     func testAHeldWriteAtShutdownNeverReachesThePasteboard() async throws {
@@ -318,14 +324,30 @@ final class CallbackBridgeTests: XCTestCase {
     }
 
     /// Two reader threads flood OSC 52 writes for two sessions, small and
-    /// 1 MiB, for over a second: the pasteboard changes at most 10 times a
-    /// second (plus slack for the boundaries; an upper bound only, so a
-    /// loaded machine cannot make it fail) and ends with the last text sent.
+    /// 1 MiB, for over a second: no 1 s window holds more than 11 pasteboard
+    /// writes (10 a second, 100 ms apart, both ends of the window included).
+    /// The writes are timed by sampling the change count: each happened
+    /// between the sample that saw it and the one before, and a window
+    /// counts only when even those bounds fit in a second, so a loaded
+    /// machine cannot make it fail. Then a write right after one that went
+    /// out is held, and released when due: the pasteboard ends with it.
     func testAClipboardFloodFromTwoSessionsIsCappedAndEndsWithTheLastWrite() async throws {
         let other = TesseraSession(id: 8, core: core, bridge: bridge)
         bridge.register(other)
-        let before = pasteboard.changeCount
         let start = ContinuousClock.now
+        // When each write happened: after `after`, by `by`.
+        var writes: [(after: ContinuousClock.Instant, by: ContinuousClock.Instant)] = []
+        var previous = (at: start, count: pasteboard.changeCount)
+        // The pasteboard is written on the main actor, as this runs: no
+        // write falls between reading the clock and the count.
+        func sample() {
+            let now = ContinuousClock.now
+            let count = pasteboard.changeCount
+            for _ in 0..<max(0, count - previous.count) {
+                writes.append((previous.at, now))
+            }
+            previous = (now, count)
+        }
         let finished = Mutex(0)
         let perThread = 5_000
         let span = Duration.milliseconds(1_200)
@@ -347,18 +369,24 @@ final class CallbackBridgeTests: XCTestCase {
         }
         var heldWrites = 0
         while finished.withLock({ $0 }) < 2 {
+            sample()
             if bridge.clipboardThrottle.held != nil { heldWrites += 1 }
             try await Task.sleep(for: .milliseconds(5))
         }
+        // The flood's held write, released when due.
+        try await until { self.bridge.clipboardThrottle.held == nil && !self.bridge.isClipboardReleaseScheduled }
+        sample()
         XCTAssertGreaterThanOrEqual(ContinuousClock.now - start, .seconds(1), "the flood lasted a second")
-        onReaderThread { callbacks in CallbackBridgeTests.writeClipboard(callbacks, "the last", session: 8) }
-        try await until { self.clipboard == "the last" }
-        let elapsed = ContinuousClock.now - start
-        XCTAssertEqual(clipboard, "the last", "the last write is not lost")
-        let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
-        let changes = pasteboard.changeCount - before
-        XCTAssertLessThanOrEqual(changes, Int(seconds * 10) + 2, "\(changes) writes in \(elapsed)")
         XCTAssertGreaterThan(heldWrites, 0, "writes were held during the flood")
+        let window = ClipboardThrottle.maxWritesPerSecond + 1
+        let crowded = zip(writes, writes.dropFirst(window)).filter { first, last in
+            last.by - first.after <= .seconds(1)
+        }
+        XCTAssertEqual(crowded.count, 0, "\(window + 1) of \(writes.count) writes within a second")
+
+        _ = try await holdClipboardWrite("the last", session: 8, on: bridge)
+        try await until { self.clipboard == "the last" }
+        XCTAssertEqual(clipboard, "the last", "the last write is not lost")
         XCTAssertNil(bridge.clipboardThrottle.held)
     }
 

@@ -108,13 +108,28 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     /// The current tick already passed a resize on to the core.
     private var resizedThisTick = false
     private var lastAttachAttempt: ContinuousClock.Instant?
-    /// Time between re-attach attempts (tests shorten it).
+    /// When the surface was last attached, or `nil` once a call found it
+    /// dropped since.
+    private var lastAttach: ContinuousClock.Instant?
+    /// Time between failed re-attach attempts, and how long an attached
+    /// surface must last for its drop not to count as a failed attempt
+    /// (tests change it).
     static var reattachInterval: Duration = .seconds(1)
     /// Consecutive re-attach attempts that may fail before the view stops
     /// trying; a later size, scale or window change tries again.
     static let maxReattachFailures = 5
-    /// Consecutive failed re-attach attempts.
+    /// Consecutive failed re-attach attempts. A drop within
+    /// ``reattachInterval`` of a successful attach counts as one, so an
+    /// attach does not reset it: the next drop does, once the surface lasted
+    /// the interval. A surface the core drops on every frame is then given
+    /// up on as one that never attaches is.
     private(set) var reattachFailures = 0
+    #if DEBUG
+        /// Runs right after every successful attach, before the view reads
+        /// the new surface's metrics (tests: a core that drops the surface
+        /// again at once).
+        var didAttachForTesting: (() -> Void)?
+    #endif
     /// The size at which re-attaching was given up, or `nil`.
     private var reattachGaveUpAt: TesseraSurface.Size?
     /// The view left its window while its surface was lost: the next window
@@ -424,16 +439,29 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
             // Cleared before the reads below: one that finds the surface
             // dropped again asks for the next re-attach, which this must not
             // undo. Only failed attempts are spaced by `reattachInterval`, so
-            // a drop right after this attach re-attaches on the next tick.
+            // a drop right after this attach re-attaches on the next tick;
+            // it counts as a failed attempt, though (`reattachIfDropped`), so
+            // a re-attach keeps `reattachFailures`. Any other attach (a new
+            // window, its surface not lost) starts the count afresh.
+            if !wantsReattach {
+                reattachFailures = 0
+            }
             wantsReattach = false
-            reattachFailures = 0
             reattachGaveUpAt = nil
             lostSurfaceAcrossMove = false
             lastAttachAttempt = nil
+            lastAttach = .now
+            #if DEBUG
+                didAttachForTesting?()
+            #endif
             refreshMetrics()
-            surfaceAttachedForZoom()
-            needsRender = true
-            applyLayerOpacity()
+            // Dropped again by that read: the surface's size is unknown, and
+            // the zoom waits for the re-attach.
+            if surface.isAttached {
+                surfaceAttachedForZoom()
+                needsRender = true
+                applyLayerOpacity()
+            }
         } catch {
             // Without a renderer (no GPU, no font) the session still runs and
             // takes input; there is just nothing to see. A first attach that
@@ -441,13 +469,7 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
             // later. Only a surface lost after attaching is (`wantsReattach`),
             // a few times, then not until the size, scale or window changes.
             if wantsReattach {
-                reattachFailures += 1
-                if reattachFailures >= Self.maxReattachFailures {
-                    wantsReattach = false
-                    reattachGaveUpAt = size
-                    Self.log.error(
-                        "re-attaching the surface failed \(self.reattachFailures) times; retrying after the next size change: \(String(describing: error), privacy: .public)")
-                }
+                countReattachFailure(at: size, error)
             } else {
                 Self.log.error("attaching the surface failed: \(String(describing: error), privacy: .public)")
             }
@@ -570,11 +592,44 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     /// link attaches it again, whichever call (a resize, a frame, a metrics
     /// read) noticed first. A view that had no surface (its first attach
     /// failed) is left alone: that attach is not retried.
+    ///
+    /// A drop within ``reattachInterval`` of the attach counts as a failed
+    /// re-attach attempt (counted once, by the first call that finds it), so
+    /// a core that drops every surface it is given is tried a few times and
+    /// then left until the size, scale or window changes, as a refused
+    /// attach is; a drop after that resets the count.
     @discardableResult
     private func reattachIfDropped(_ error: any Error, wasAttached: Bool) -> Bool {
         guard wasAttached, error as? TesseraCoreError == .noSurface else { return false }
+        // Given up on by an earlier call that found the same drop.
+        guard reattachGaveUpAt == nil else { return true }
+        if !wantsReattach, let attachedAt = lastAttach {
+            lastAttach = nil
+            if ContinuousClock.now - attachedAt < Self.reattachInterval {
+                guard !countReattachFailure(at: pixelSize, error) else { return true }
+            } else {
+                reattachFailures = 0
+            }
+        }
         wantsReattach = true
         needsRender = true
+        return true
+    }
+
+    /// Counts a failed re-attach attempt and, after the last one allowed,
+    /// stops re-attaching until the size differs from `size`. Returns
+    /// whether it gave up.
+    @discardableResult
+    private func countReattachFailure(at size: TesseraSurface.Size, _ error: any Error) -> Bool {
+        reattachFailures += 1
+        guard reattachFailures >= Self.maxReattachFailures else { return false }
+        wantsReattach = false
+        reattachGaveUpAt = size
+        // Found by a resize or a frame, with the link running: nothing is
+        // left to do, so it idles.
+        updateDisplayLinkPause()
+        Self.log.error(
+            "re-attaching the surface failed \(self.reattachFailures) times; retrying after the next size change: \(String(describing: error), privacy: .public)")
         return true
     }
 
@@ -1653,8 +1708,11 @@ extension TerminalSurfaceView: NSMenuItemValidation {
         paste(sender)
     }
 
-    /// Clear to Start (⌘K): the scrollback and the screen above the cursor
-    /// line go, so the prompt line becomes the top row. The core sends no
+    /// Clear to Start (⌘K): the scrollback and the screen above the prompt
+    /// go, so the prompt becomes the top row: from the nearest prompt-start
+    /// mark at or above the cursor (not past the start of command output),
+    /// else from the start of the cursor's logical line (ADR 0022
+    /// D-CLEAR-START, ``TesseraSession/clearScrollback()``). The core sends no
     /// output event for it, so the view redraws itself; an idle terminal's
     /// display link is paused and would otherwise keep the old screen.
     @objc func clearScrollback(_ sender: Any?) {

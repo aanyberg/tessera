@@ -67,6 +67,18 @@ final class ClipboardThrottleTests: XCTestCase {
         XCTAssertNil(throttle.release(at: at(.seconds(1))))
     }
 
+    /// #240: a write taken at a session's close counts as a pasteboard
+    /// write: the next one waits for the interval from it.
+    func testAWriteTakenAtACloseCountsAsAWrite() {
+        var throttle = ClipboardThrottle()
+        _ = throttle.offer(Write(session: 1, text: "a"), at: at(.zero))
+        XCTAssertNil(throttle.offer(Write(session: 2, text: "b"), at: at(.milliseconds(10))))
+        XCTAssertEqual(throttle.takeHeld(from: 2, at: at(.milliseconds(50))), Write(session: 2, text: "b"))
+        XCTAssertNil(throttle.offer(Write(session: 1, text: "c"), at: at(.milliseconds(60))))
+        XCTAssertEqual(throttle.held, Write(session: 1, text: "c"))
+        XCTAssertEqual(throttle.dueAt, at(.milliseconds(150)), "100 ms after the write at the close")
+    }
+
     func testDroppingTheHeldWrite() {
         var throttle = ClipboardThrottle()
         _ = throttle.offer(Write(session: 1, text: "a"), at: at(.zero))

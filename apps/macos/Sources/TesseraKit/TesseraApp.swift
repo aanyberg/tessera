@@ -30,13 +30,13 @@ public protocol TesseraAppDelegate: AnyObject {
     /// session; writes now fail, and the host should ``TesseraSession/close()``
     /// it. Not sent for a session the host closed.
     func session(_ session: TesseraSession, didExitWithCode code: Int32, signal: Int32)
-    /// The core applied an edit of the configuration or of the theme in use
-    /// to every view (colours, opacity or font size). `opaque` is whether the
-    /// background is now fully opaque. Make every terminal window opaque or
-    /// translucent to match and redraw every view: each surface switches its
-    /// compositing mode at its next frame. Several changes between two
-    /// deliveries are reported once, with the latest `opaque`. Not sent after
-    /// ``TesseraApp/shutdown()``.
+    /// The core applied an edit of the configuration or of the theme in use to
+    /// every view (colours, opacity, font size or the default cursor style).
+    /// `opaque` is whether the background is now fully opaque. Make every
+    /// terminal window opaque or translucent to match and redraw every view:
+    /// each surface switches its compositing mode at its next frame. Several
+    /// changes between two deliveries are reported once, with the latest
+    /// `opaque`. Not sent after ``TesseraApp/shutdown()``.
     func appearanceDidChange(opaque: Bool)
 }
 
