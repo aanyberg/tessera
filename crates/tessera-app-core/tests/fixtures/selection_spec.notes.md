@@ -28,13 +28,18 @@ background. Only when the advanced setting `extendBackgroundColorIntoMargins` is
 column and both paddings stay clear: **D-EDGE option (a) matches iTerm2.** No override needed.
 
 ### URL detection rules (for `url.rs`, no regex dependency)
-- U1 Scheme: `http`, `https`, `ftp`, `file`, `mailto`, ASCII case-insensitive, must not be preceded by an alphanumeric, `+`, `-` or `.`
-  (J26). `http`/`https`/`ftp`/`file` need `://`; `mailto` needs `:`. Other schemes (ssh, git, tel, magnet, javascript, ...) are NOT detected
+- U1 Scheme: `http`, `https`, `ftp`, `file`, `mailto`, ASCII case-insensitive, must not be preceded by an ASCII alphanumeric, `+`, `-`
+  or `.` (J26). Amended by #191 (lead decision D3, 2026-11-04): a non-ASCII letter before the scheme does not block it, since CJK prose
+  puts no space before a URL (J38); until #191 any Unicode alphanumeric blocked it. `http`/`https`/`ftp`/`file` need `://`; `mailto` needs `:`. Other schemes (ssh, git, tel, magnet, javascript, ...) are NOT detected
   even though kitty (`url_prefixes`), Ghostty and WezTerm detect more (J27).
 - U2 Case: return the text as typed (J25).
 - U3 Characters: the candidate runs from the scheme to the first character that is whitespace, a control, or one of `<>"` backtick `\` `^`
   `{` `}` `|`; allowed are RFC 3986 characters (`A-Za-z0-9-._~:/?#[]@!$&'()*+,;=%`) and any non-ASCII alphanumeric (IRIs, J30).
-  The ideographic full stop and other non-alphanumeric Unicode ends it (J29).
+  The ideographic full stop and other non-alphanumeric Unicode ends it (J29). Amended by #191 (lead decisions D3 and E1, 2026-11-04):
+  a CJK character (`url::is_cjk`: Han, kana, Hangul, CJK symbols and punctuation, fullwidth and halfwidth forms) ends it after the host
+  (the text up to the first `/`, `?` or `#`: J39-J42, J52), and in the host right after an ASCII label or port (letters, digits and `-`
+  after a `.` or `:` of the host: J45-J48). An IDN host keeps its CJK (J30, J43, J49-J51). A raw CJK path is cut (J41), a
+  percent-encoded one is not (J42). ADR 0025 has the rule as implemented.
 - U4 Trailing trim, repeated until stable: strip a final `.` `,` `;` `:` `!` `?` `'` `"` (J02, J03, J11, J31, J32). NOT stripped: `/` `-` `_` `~` `=`
   `&` `%` `*` `)` `]` (unless U5) (J13, J14). kitty strips every trailing punctuation class except `/ & - ) ] } *` (`can_strip_from_end_of_url`);
   Tessera uses a smaller, fixed set so `a=&b=` and `x_` survive. WezTerm's bare rule would drop a trailing `=` (J14 ambiguity).

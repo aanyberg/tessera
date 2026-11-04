@@ -1,6 +1,7 @@
 # ADR 0025: Selection, URL detection and link hit-testing
 
-**Status:** accepted · 2026-10-31
+**Status:** accepted · 2026-10-31 · amended 2026-11-04 (#191: the guarded
+rows, CJK around URLs, the lookup's fast path)
 
 ## Context
 
@@ -11,7 +12,8 @@ command-hover and command-click on URLs. The renderer has drawn a
 core had no selection, no text extraction and no URL detection. This ADR
 covers the core half (part 1 of 3): OSC 8 storage is part 2 (ADR 0026) and
 the Swift gestures the last. The behaviour is pinned by
-`crates/tessera-app-core/tests/fixtures/selection_spec.txt` (123 rows) and
+`crates/tessera-app-core/tests/fixtures/selection_spec.txt` (123 rows; 141
+since #191) and
 the decisions in its `selection_spec.notes.md`, both from the
 spec-researcher, read against iTerm2, kitty, WezTerm, Ghostty, VTE and
 Alacritty sources.
@@ -112,14 +114,29 @@ Copying stays an explicit Copy.
 On every look at the terminal (each selection call and every frame) the
 selection is dropped when:
 
-- a selected row on the live screen no longer holds the text it held when
-  the selection was made (D6). Cells, clusters and the soft-wrap flag of
-  the **whole row** are compared, not damage (D6b), so a full-screen
-  program repainting the same text keeps it (G05) while one rewriting a
-  selected line drops it (G03), even outside the selected columns. This is
-  stricter than iTerm2, whose source clears only on SD, clear screen and
-  width change: keeping a selection whose text silently changed would make
-  Copy return text the user never saw;
+- a **guarded row** no longer holds what it held when the selection was
+  made (D6). The guarded rows are every row whose change can change the
+  text the selection copies (#191, lead decision D4, 2026-11-04):
+  - the selected rows on the live screen;
+  - the newest history line, when it is selected: a whole-screen erase
+    (ED 2, RIS) clears its soft-wrap flag, which splits a selected line
+    that wraps from the history onto the screen's top row (`abcdefgh`
+    would copy as `abcde\nfgh`, G07i);
+  - the rest of the last selected row's logical line below the selection:
+    whether blanks at the end of the selection are kept or dropped (D2)
+    depends on text after them on the same logical line (G07j, G07k).
+
+  Older history lines are not guarded: they change only by eviction,
+  clearing and resizing, handled below. Cells, clusters and the soft-wrap
+  flag of each **whole row** are compared, not damage (D6b), so a
+  full-screen program repainting the same text keeps it (G05) while one
+  rewriting a selected line drops it (G03), even outside the selected
+  columns. This is stricter than iTerm2, whose source clears only on SD,
+  clear screen and width change: keeping a selection whose text silently
+  changed would make Copy return text the user never saw. The guarantee:
+  while the selection is kept, Copy returns the text it would have returned
+  when it was made, or, after eviction trimmed its start, the end of that
+  text;
 - the history drops a selected line other than by eviction at its cap: ED 3
   and RIS clear it (G07d; the selection stays when it holds only screen
   rows, G07e). Eviction at the cap is different (LD-1, decided 2026-11-02):
@@ -140,17 +157,17 @@ selection is dropped when:
 
 Every guarded row is compared where it is now: on the live screen, or in
 the history when it scrolled there since the last look (a row rewritten and
-then scrolled off between two looks changed while it was live). History
+then scrolled off between two looks changed while it was live, and a
+guarded newest history line is unwrapped by a whole-screen erase). History
 lines change otherwise only by eviction, clearing and resizing, each
-handled above, and by a whole-screen erase (ED 2, RIS) clearing the newest
-history line's soft-wrap flag; the history copies are therefore compared
-when the history moved or the whole screen changed. A switch to the
+handled above; the guarded rows in the history are therefore compared when
+the history moved or the whole screen changed. A switch to the
 alternate screen and back between two looks restores the same rows and is
 not seen; the text is then still the text selected.
 
-**Cost.** The selection keeps a copy of its rows that were on the live
-screen when it was made (at most the screen) and, at each look, compares
-only rows that can have changed:
+**Cost.** The selection keeps a copy of its guarded rows (at most the
+screen and one history line) and, at each look, compares only rows that
+can have changed:
 
 - outside a frame (`has_selection`, `selection_text`, the gesture calls):
   the rows the grid reports damaged since the last look
@@ -164,8 +181,17 @@ only rows that can have changed:
   compares nothing. Rows outside the view use the damage.
 
 Without a selection nothing is compared. A property test drives random
-output, frames at random offsets and looks, and holds both paths to a full
-comparison of every guarded row.
+output (RIS, the alternate screen, ED 0 and ED 2, scroll regions and
+wrapping lines among it), frames at random offsets and looks, with the
+history at a random cap of 0 to 5 lines or 1 000, and holds both paths to
+a full comparison of every guarded row; it also checks that a kept
+selection copies the text it copied when it was made (or the end of it).
+
+The gestures themselves run under the terminal lock and cost what their
+unit costs: a word drag re-reads the word on every extend, about 12 ms on a
+single 2.5-million-character word, and Select All and word expansion are
+linear in the history or the line. They are user-initiated, one per event,
+so this is accepted rather than bounded.
 
 ### URL detection (`url.rs`)
 
@@ -173,12 +199,33 @@ comparison of every guarded row.
 logical line by rules U1 to U9 of the notes:
 
 - **U1** schemes `http://`, `https://`, `ftp://`, `file://`, `mailto:`,
-  ASCII case-insensitive, not preceded by an alphanumeric, `+`, `-` or
-  `.` (J26); ssh, git, tel, javascript and others are not detected (J27);
+  ASCII case-insensitive, not preceded by an ASCII alphanumeric, `+`, `-`
+  or `.` (J26); ssh, git, tel, javascript and others are not detected
+  (J27). A non-ASCII letter before the scheme does not block it (#191,
+  lead decision D3, 2026-11-04): CJK prose puts no space before a URL, so
+  `詳細はhttps://example.com/を参照` is linked (J38). Until #191 any
+  Unicode alphanumeric blocked it;
 - **U2** the URL is returned as typed (J25);
 - **U3** it runs to the first character that is not an RFC 3986 character
   (`A-Za-z0-9-._~:/?#[]@!$&'()*+,;=%`) or a non-ASCII alphanumeric (IRIs,
-  J30); `U+3002` ends it (J29);
+  J30); `U+3002` ends it (J29). **After the host** (the text from the
+  scheme to the first `/`, `?` or `#`) a CJK character also ends it (D3):
+  the blocks of Han (with radicals, strokes and compatibility ideographs),
+  Hiragana, Katakana and Hangul, CJK symbols and punctuation
+  (U+3000-U+303F, U+3200-U+33FF) and the fullwidth and halfwidth forms
+  (U+FF00-U+FFEF) (`url::is_cjk`; blocks, not script tables, so no
+  dependency). CJK prose follows a URL without a space (J39, J40, J52).
+  **In the host** a CJK character ends it only right after an ASCII label
+  or port: letters, digits and `-` that follow a `.` or `:` of the host
+  (#191 critic round 1, lead decision E1, 2026-11-04), so a URL with no
+  path stops before the prose too (`https://example.comを参照`,
+  `mailto:a@b.jpまで`, `https://a.jp:8080日本`: J45-J48). No top-level
+  domain mixes ASCII and CJK, so an IDN host keeps its letters: a CJK
+  label starts right after its `.` (`例え.jp`, `www.例え.jp`, `例え.テスト`;
+  J30, J43, J49, J50), and the `:` of `user:password@` is followed by
+  `password@`, not by the host (J51). The cost: a path written in raw CJK
+  (`/wiki/日本`) is cut where the CJK starts (J41); its percent-encoded
+  form, which browsers copy, is not (J42);
 - **U4** a trailing `. , ; : ! ? ' "` is stripped, repeatedly (J31);
 - **U5** a trailing `)` or `]` is stripped while the URL holds more of it
   than of its opener (Wikipedia's `Foo_(bar)` keeps its parenthesis, J05;
@@ -198,22 +245,42 @@ When several candidates contain `at` (a URL quoted in another's query),
 the earliest that passes every rule wins.
 
 **Cost of one lookup.** Because of U9 a lookup reads at most 2083
-characters to either side of `at`: a window of n <= 4168 characters. It
-does O(n) work on it once (the run of URL characters, prefix sums of
-`)`-minus-`(` and `]`-minus-`[`, the next `@` from each position, and one
-walk down from the run's end over trailing punctuation and closers,
-keeping the least prefix sum seen per closer) and then O(log n) per scheme
-start before `at`: U5's "more closers than openers" for a candidate
-starting at `s` and ending at `e` is `sum[e] - sum[s] > 0`, so the end U4
-and U5 trim it to is a binary search in that walk. That is about 9 n
-operations: on 2083-character lines of `ftp://` starts and `)`, the worst
-measured was 18 748 steps and 66 microseconds (release, load about 50). A first version
-recounted the brackets for every stripped closer of every candidate:
-2083 characters of 220 `ftp://` and 763 `)` cost 160 ms, under the
-terminal lock on every hovered frame. A test counts the steps of a lookup
-on such lines and holds them under 64 per character; property tests hold
-the lookup to a straight reading of the rules, and the App's windowed
-cell walk to one over the whole logical line.
+characters to either side of `at`: a window of n <= 4168 characters. Every
+scheme has its `:` at most six characters after its start, so without a
+`:` from the start of the run of URL characters around `at` to six
+characters past it there is no candidate, and the lookup ends after that
+scan, without allocating (#191: the #30 critic measured a hover over
+plain text at 41 ns before the lookup built its window for every point and
+166 ns after). Otherwise it walks the candidate starts from the run's
+first character to `at`, keeping the counts of `)`-minus-`(` and
+`]`-minus-`[` before the start as it goes. Matched schemes never overlap
+(no scheme's tail starts another), so the scheme ends it asks about only
+increase, and so do the host ends after them and the `@` after those: the
+next separator, CJK cut and `@` are found by forward-only scans that read
+the window about once (a position that is no CJK cut for one candidate is
+none for a later one, whose host covers it too). Each distinct candidate
+end gets one walk down over trailing punctuation and closers, recording for
+each closer the least `)`-minus-`(` (or `]`-minus-`[`) count of the text
+before it at that closer and every closer above it. The ends are few, at
+most five per lookup: the starts whose scheme ends at or before `at` share
+three, and as schemes are at least six characters long and never overlap,
+at most two starts lie within a scheme's length of `at`. U5's "more
+closers than openers" for a candidate starting at `s` and ending at a
+closer `e` is the count at `e` minus the count at `s` being positive, so
+the end U4 and U5 trim a candidate to is a binary search in its end's
+walk: O(log n) per scheme start before `at`. The lookup allocates nothing
+but the closer lists of a candidate that ends in closers, at most the
+window. A first version recounted the brackets for every stripped closer
+of every candidate: 2083 characters of 220 `ftp://` and 763 `)` cost
+160 ms, under the terminal lock on every hovered frame; #30's prefix-sum
+version did that line in about 66 microseconds, and the current one costs
+about 410 000 instructions there (see the measurements). A test counts the steps of a lookup
+on such lines and holds them under 64 per character; that count is the
+code's own, so the same lines are also a `cargo xtask ab` case, whose
+instruction counts come from the processor (see the measurements).
+Property tests hold the lookup to a straight reading of the rules on lines
+of up to 80 and of 2 000 to 4 500 characters, and the App's windowed cell
+walk to one over the whole logical line.
 
 **Why no regex dependency.** The rules are a scheme match, a character
 class scan and two trimming loops; a regex would express U1 to U3 but not
@@ -318,6 +385,44 @@ code matches the base again. A first version of the frame check compared
 every row the grid reported damaged, which for a cursor move is the range
 between its old and new row: 1.95x with a selection, hence the
 capture-driven frame check above.
+
+### URL lookups (#191)
+
+`cargo xtask ab` against the merge base `d0b49a1`, release, instructions
+retired, best of 7 interleaved process pairs, Apple M4, load average 14 to
+120 (re-run after lead decision E1 at load 60 to 80). `url::url_at` at every position of a 200-character line of the
+corpus line (`plain`, bar 0.5), of that line with
+` https://example.com/a/b?q=1 ` inserted in the middle (`url`, bar 1.05),
+and at the positions inside that URL only (`inside`, bar 1.05); the
+`sgr_heavy` line is its visible text. Head against base:
+
+| corpus | plain | url | inside |
+|---|---|---|---|
+| ascii | 0.192 | 0.372 | 0.894 |
+| latin_diacritics | 0.212 | 0.356 | 0.893 |
+| cjk | 0.202 | 0.244 | 0.894 |
+| box_drawing | 0.867 | 0.885 | 0.894 |
+| hebrew | 0.313 | 0.380 | 0.894 |
+| arabic | 0.315 | 0.372 | 0.894 |
+| punctuation | 0.364 | 0.464 | 0.894 |
+| braille | 0.847 | 0.879 | 0.894 |
+| emoji | 0.903 | 0.896 | 0.894 |
+| sgr_heavy | 0.195 | 0.378 | 0.894 |
+| combining_heavy | 0.323 | 0.524 | 0.894 |
+
+The box-drawing, braille and emoji lines hold no URL character, so both
+sides return at the first check (is the point a URL character?): the 0.5
+bar cannot apply to them (waived, lead decision E2, 2026-11-04), and the head's smaller entry (the body kept out
+of line) is what makes it 0.85 to 0.90. Lines of `ftp://` starts and `)`
+(the step test's lines, 2 083 characters, lookups at four points) cost
+1.14 to 1.19x base (1.16 for 220 and 763 after E1), about 410 000 instructions per lookup on 220 starts
+and 763 closers: the forward scans for each candidate's host end replace
+the base's per-position tables, which the plain and URL lines no longer
+pay for. `cargo xtask ab diff` over 40 000 seeds of random lines (up to
+4 500 characters) agrees with base on every line D3 and E1 cannot change
+(no non-ASCII alphanumeric right before a scheme, no CJK after a scheme:
+2 846 of the first 10 000 seeds, so about 11 400), and over 10 000 seeds
+with a copy of the in-tree reference on all.
 
 ## Consequences
 

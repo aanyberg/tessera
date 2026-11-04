@@ -5,7 +5,7 @@
 //!
 //! The fixture's `###` layout has its own parser here. A row with a key,
 //! step or value it cannot interpret fails the test, and so does a file
-//! with another number of rows than the 123 (86 core, 37 url) it holds.
+//! with another number of rows than the 141 (90 core, 51 url) it holds.
 
 use std::fmt::Write as _;
 use std::panic::{self, AssertUnwindSafe};
@@ -15,8 +15,8 @@ use tessera_app_core::{
 };
 
 const FIXTURE: &str = include_str!("fixtures/selection_spec.txt");
-const CORE_ROWS: usize = 86;
-const URL_ROWS: usize = 37;
+const CORE_ROWS: usize = 90;
+const URL_ROWS: usize = 51;
 /// The history cap of a row without `scrollback:`.
 const DEFAULT_SCROLLBACK: usize = 100;
 
@@ -541,4 +541,65 @@ fn a_selected_row_rewritten_then_scrolled_into_history_clears() {
         .unwrap();
     assert!(!app.has_selection(id).unwrap());
     assert_eq!(app.selection_text(id).unwrap(), None);
+}
+
+#[test]
+fn select_all_then_copy_during_continuous_output_at_the_cap_copies_text() {
+    // #191 (LD-1, ADR 0025 "When the selection is cleared"): a real PTY,
+    // a shell printing about 100 lines a second, the history at a cap of
+    // 500 lines. Every new line evicts the oldest; Select All must still
+    // copy the text that is left, 20 times out of 20. The shell loop ends
+    // when the test process does (`kill -0 $PPID`), even on a kill -9.
+    let app = app();
+    let script = "i=0; while [ $i -lt 700 ]; do echo fill $i; i=$((i+1)); done; \
+                  i=0; while kill -0 $PPID 2>/dev/null; do echo line $i; i=$((i+1)); sleep 0.01; done";
+    let options = tessera_app_core::SpawnOptions::command("/bin/sh", "select-all-flood")
+        .args(["-c", script])
+        .env("TERM", "xterm-256color");
+    let options = tessera_app_core::SpawnOptions {
+        size: PtySize::new(24, 80),
+        ..options
+    };
+    let id = app.spawn_session(options).expect("spawn the shell");
+    app.set_max_scrollback_for_test(id, 500).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    // Wait until the history is at its cap and the slow loop has started.
+    loop {
+        let (len, looping) = app
+            .with_terminal(id, |term| {
+                let grid = term.grid();
+                let looping = (0..grid.rows())
+                    .filter_map(|row| grid.line(row))
+                    .any(|line| line.cells.first().is_some_and(|c| c.ch == 'l'));
+                (grid.scrollback_len(), looping)
+            })
+            .unwrap();
+        if len == 500 && looping {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the shell did not fill the history ({len} lines)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let pushed_at = |app: &App| {
+        app.with_terminal(id, |term| term.grid().scrollback_pushed())
+            .unwrap()
+    };
+    app.select_all(id).unwrap();
+    let before = pushed_at(&app);
+    for copied in 0..20 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let text = app.selection_text(id).unwrap();
+        assert!(
+            text.as_deref().is_some_and(|t| t.contains("line ")),
+            "Copy {copied} after Select All got {:?}",
+            text.map(|t| t.chars().take(80).collect::<String>())
+        );
+    }
+    // The output kept evicting lines meanwhile (the test exercised the trim).
+    let after = pushed_at(&app);
+    app.close_session(id).unwrap();
+    assert!(after > before, "no line evicted during the copies");
 }
