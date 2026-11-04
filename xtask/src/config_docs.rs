@@ -645,7 +645,8 @@ fn render_document(sections: &[Section]) -> String {
          takes the default listed here, and a missing table takes the defaults of all its keys. \
          Unknown keys produce a warning and are kept. A file that does not parse never stops \
          Tessera: the error is reported, and until the file is fixed the defaults apply at launch \
-         and the last good configuration stays in effect while running."
+         (with `clipboard_write` off, since the file may turn it off) and the last good \
+         configuration stays in effect while running."
     );
     let _ = writeln!(out);
     let _ = writeln!(

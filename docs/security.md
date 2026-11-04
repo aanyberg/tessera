@@ -76,7 +76,7 @@ a low-risk change.
 | DCS | streamed in 4 KiB chunks; DECRQSS request 64 bytes | `crates/tessera-vt/src/lib.rs`, `crates/tessera-term/src/dcs.rs` |
 | Grapheme cluster | 32 scalars | `crates/tessera-grid/src/grapheme.rs` |
 | Grid | 2048 columns × 1024 rows | `crates/tessera-app-core/src/view.rs`, `crates/tessera-ffi/src/session.rs` |
-| Scrollback | `[terminal] scrollback_lines` (default 10 000), applied when a session starts; capped at `Terminal::MAX_SCROLLBACK_LINES` (10 000 000) | `crates/tessera-config/src/lib.rs`, `crates/tessera-app-core/src/lib.rs` (`App::attach`), `crates/tessera-grid/src/grid.rs` |
+| Scrollback | `[terminal] scrollback_lines` (default 10 000), applied when a session starts; capped at `Terminal::MAX_SCROLLBACK_LINES` (10 000 000); a width change re-wraps the whole history under the terminal lock (~0.2 ms per 1 000 lines, 2-4 s and ~18 GB at the cap; user-chosen, documented in docs/config.md) | `crates/tessera-config/src/lib.rs`, `crates/tessera-app-core/src/lib.rs` (`App::attach`), `crates/tessera-grid/src/grid.rs` |
 | PTY read queue / write queue / pending input | 64 × 64 KiB / 1 MiB / 16 MiB | `crates/tessera-pty/src/native.rs`, `crates/tessera-app-core/src/session.rs` |
 | Foreground process name | 64 bytes | `crates/tessera-pty/src/foreground.rs` |
 | Kitty keyboard stack | 8 | `crates/tessera-term/src/modes.rs` |
@@ -106,8 +106,10 @@ Tracked: churn and leak checks for Rust, FFI and the app (#214); FFI fuzzing, AS
 ## Known gaps and open decisions
 
 - The OSC buffer in the parser is unbounded (#213).
-- OSC 52 writes are on by default with no notice, multi-line paste without bracketed paste runs every line, the
-  link-opening scheme policy is undecided, and the child inherits the app's whole environment (#217).
+- OSC 52 writes are on by default with no notice (only a `config.toml` that exists but does not load at launch turns
+  them off until it loads: the store fails closed, `crates/tessera-config/src/store.rs`), multi-line paste without
+  bracketed paste runs every line, the link-opening scheme policy is undecided, and the child inherits the app's
+  whole environment (#217).
 - An unknown OSC command's bytes are traced uncapped (`crates/tessera-term/src/osc.rs`; S8). No subscriber is
   installed in the app today, so nothing is written.
 - The app ships ad-hoc signed and not notarized, with the App Sandbox off (a terminal must spawn arbitrary

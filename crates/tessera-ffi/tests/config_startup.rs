@@ -2,7 +2,8 @@
 //! it: the theme `config.toml` names (here a file in `themes/`) is the one
 //! views draw with, an edit of that theme file reaches the views and the
 //! `on_appearance_changed` callback, and a missing or broken configuration
-//! starts with the defaults instead of failing. Starting creates nothing
+//! starts with the defaults instead of failing (a broken one with
+//! clipboard writes refused until it is fixed). Starting creates nothing
 //! on disk; `tessera_app_create_config` creates the configuration and
 //! starts watching it.
 //!
@@ -173,6 +174,30 @@ fn missing_directory_until_created(root: &Path) {
     drop(tx);
 }
 
+/// A configuration directory that appears with a broken `config.toml`
+/// after the start (the path that waits for the directory) refuses
+/// clipboard writes too: its store's first load fails.
+fn directory_appearing_with_a_broken_file(root: &Path) {
+    let late = root.join("Late");
+    let app = new_app(&late);
+    assert!(clipboard_write(app), "no directory: the defaults");
+    std::fs::create_dir_all(&late).unwrap();
+    std::fs::write(
+        late.join("config.toml"),
+        "[terminal]\nclipboard_write = no\n",
+    )
+    .unwrap();
+    // The directory is looked for every two seconds.
+    let deadline = Instant::now() + tessera_app_core::CONFIG_DIR_POLL_INTERVAL * 3 + BOUND;
+    while clipboard_write(app) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!clipboard_write(app), "the late broken file refuses writes");
+    assert!(with_core(app, tessera_app_core::App::is_watching_config));
+    // SAFETY: live handle, freed once.
+    unsafe { tessera_app_free(app) };
+}
+
 /// A directory without `config.toml` is watched and not written to.
 fn directory_without_a_file(root: &Path) {
     // A directory without config.toml is watched, and still not written.
@@ -189,8 +214,39 @@ fn directory_without_a_file(root: &Path) {
     unsafe { tessera_app_free(app) };
 }
 
-/// A `config.toml` that does not parse gives the defaults; the repair applies.
+/// Whether `app` lets programs write the clipboard.
+fn clipboard_write(app: *mut App) -> bool {
+    with_core(app, |core| core.config().terminal.clipboard_write)
+}
+
+/// A `config.toml` that does not parse gives the defaults with clipboard
+/// writes refused (D8); the repair applies.
 fn broken_config(root: &Path) {
+    // The ways a user turning writes off gets the syntax wrong, and a file
+    // that is not UTF-8: each refuses writes at launch.
+    for (i, bytes) in [
+        &b"[terminal]\nclipboard_write = False\n"[..],
+        b"[terminal]\nclipboard_write = off\n",
+        b"[terminal]\nclipboard_write =\n",
+        b"[terminal]\nclipboard_write = false\nclipboard_write = false\n",
+        b"[terminal]\nclipboard_write = false\n# caf\xE9\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let dir = root.join(format!("Refusing{i}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), bytes).unwrap();
+        let app = new_app(&dir);
+        assert!(
+            !clipboard_write(app),
+            "{:?}",
+            String::from_utf8_lossy(bytes)
+        );
+        // SAFETY: live handle, freed once.
+        unsafe { tessera_app_free(app) };
+    }
+
     // A config.toml that does not parse: the defaults, not an error.
     let broken = root.join("Broken");
     std::fs::create_dir_all(&broken).unwrap();
@@ -205,6 +261,10 @@ fn broken_config(root: &Path) {
         with_core(app, |core| core.config().appearance.theme.clone()),
         "Tessera Dark"
     );
+    assert!(
+        !clipboard_write(app),
+        "a broken file refuses clipboard writes"
+    );
     // Repairing it applies it.
     let (tx, changes) = mpsc::channel();
     install(app, &tx);
@@ -215,6 +275,7 @@ fn broken_config(root: &Path) {
     .unwrap();
     expect_change(&changes, "repaired config");
     assert_eq!(background(app), [0x2e, 0x34, 0x40]);
+    assert!(clipboard_write(app), "the repaired file allows them");
     // SAFETY: live handle, freed once.
     unsafe { tessera_app_free(app) };
     drop(tx);
@@ -248,5 +309,6 @@ fn the_configured_theme_applies_at_start_and_edits_apply_live() {
     missing_directory_until_created(root.path());
     directory_without_a_file(root.path());
     broken_config(root.path());
+    directory_appearing_with_a_broken_file(root.path());
     uncreatable_directory(root.path());
 }
