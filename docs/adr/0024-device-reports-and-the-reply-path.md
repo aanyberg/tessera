@@ -355,7 +355,8 @@ byte and at every two-way split. The rules live in
   override (`Terminal::color_overrides`, a fixed table of
   `MAX_COLOR_OVERRIDES` = 259 slots, docs/security.md S5), even one equal
   to the theme's colour. `Terminal::colors_generation` increases exactly
-  when a colour in effect changes.
+  when an override or a colour in effect changes (D-GEN, amended by #238
+  below).
 - **D-THEME-KEEP.** A new theme changes the defaults and keeps the
   overrides; a reset then lands on the new theme.
 - **D-RESET.** RIS drops every override; DECSTR and DECSCL keep them;
@@ -371,9 +372,10 @@ byte and at every two-way split. The rules live in
 no heap), applied by `Theme::resolve` and so by `Palette::new`; the
 per-cell lookup is unchanged. `Snapshot::capture` compares the
 terminal's colour generation (one load per frame) and copies the
-overrides only when it moved and they differ, or after a re-theme:
-a program colour equal to the old theme's moves no generation, so
-`View::set_appearance` makes the next capture compare the table again; `View::render` then
+overrides only when it moved and they differ, or after a re-theme
+(`View::set_appearance` makes the next capture compare the table again;
+since #238 every override change moves the generation, see below);
+`View::render` then
 rebuilds the renderer's theme from the configured one and the overrides,
 at most once per frame and outside the terminal lock, so a flood of sets
 costs one rebuild per drawn frame. **D-BG-ALPHA:** an OSC 11 background
@@ -475,3 +477,26 @@ cycles: the search is bound by the latency of its dependent loads.
 A million 64 KiB bogus names (64 GiB, 105 s in a release build) leave the
 resident set at 4.0 MiB; the test suite runs a million 23-byte names and
 two thousand 64 KiB ones.
+
+## Amendment: colour generation and over-long queries (#238, #189, 2026-11-04)
+
+- **D-GEN (#238).** `Terminal::colors_generation` now increases whenever
+  the override table changes (an override recorded, changed or dropped,
+  whatever its value) or a colour in effect changes (a theme change that
+  moves a colour no program overrides). Before, it moved only on an
+  effective change, so a program colour equal to the theme's moved
+  nothing. In `Live::apply` the views are re-themed and the views lock
+  dropped before `push_defaults` reaches the terminal; a set in that gap
+  equal to the old theme's colour, then a theme that moves only that
+  slot, left the view drawing the new theme's colour while queries
+  reported the program's, until the next bump. Setting an override to
+  the value it already holds, resetting a colour with no override and a
+  theme change that moves only overridden colours still move nothing, so
+  a flood of identical sets costs one bump (S6). Row OS21 and the view
+  test `a_program_colour_set_between_re_theme_and_push_defaults_is_copied`
+  pin it.
+- **Over-long queries (#189 d).** The parser keeps 32 parameters; a DSR,
+  CPR, DECXCPR, DECRQM or ANSI RQM with 33 or more is flagged `ignore` and
+  gets no reply (S1: an over-long request is never answered from a cut
+  header), while 32 still answer their first parameter. Rows RP11 and
+  RP12.

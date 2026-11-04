@@ -722,6 +722,35 @@ fn a_flood_of_bogus_names_keeps_memory_flat() {
     }
 }
 
+/// The full-size names flood of #187 (#249): a million bogus names of
+/// 64 KiB each (64 GiB through the parser) grow the resident set by less
+/// than 8 MiB. About two minutes in a release build, so ignored; run it
+/// on demand with
+///
+/// ```text
+/// cargo nextest run --release -p tessera-term --run-ignored only \
+///     a_full_size_flood_of_bogus_names_keeps_memory_flat
+/// ```
+///
+/// (nextest, for the process per test the resident-set check needs, see
+/// [`a_flood_of_bogus_names_keeps_memory_flat`]).
+#[test]
+#[ignore = "64 GiB of input: about two minutes in release, run on demand"]
+fn a_full_size_flood_of_bogus_names_keeps_memory_flat() {
+    const SLACK_KIB: u64 = 8 * 1024;
+    if std::env::var_os("NEXTEST").is_none() {
+        eprintln!("skipped: the resident-set check needs nextest's process per test");
+        return;
+    }
+    let started = Instant::now();
+    let grown = flood_bogus_names(1_000_000, 1 << 16);
+    eprintln!("took {:?}", started.elapsed());
+    assert!(
+        grown < SLACK_KIB,
+        "a million names of 64 KiB grew the resident set by {grown} KiB"
+    );
+}
+
 /// In 8-bit mode (S8C1T) a reply starts with `0x9D` and ends with `0x9C`,
 /// or with the BEL the query ended with (#96 D3; OQ26's note).
 #[test]
@@ -762,13 +791,14 @@ fn a_new_terminal_has_the_default_theme() {
     assert!(term.color_overrides().is_empty());
 }
 
-/// D-GEN for the resets and theme changes the fixture rows do not split
-/// out: `OSC 104` without an index bumps when it drops a differing
-/// override; dropping overrides equal to the theme (104, 104 ; c, 111)
-/// does not; a theme change that moves only the foreground bumps, one that
-/// moves only an overridden entry does not.
+/// D-GEN (#238) for the resets and theme changes the fixture rows do not
+/// split out: `OSC 104` without an index bumps when it drops an override;
+/// sets equal to the theme record overrides and bump, the same sets again
+/// do not; dropping overrides equal to the theme (104 ; c, 104, 111) bumps,
+/// resets with nothing overridden do not; a theme change that moves only
+/// the foreground bumps, one that moves only an overridden entry does not.
 #[test]
-fn the_generation_moves_exactly_with_the_colours_in_effect() {
+fn the_generation_moves_exactly_with_the_overrides_and_colours_in_effect() {
     let mut term = Terminal::new(2, 4);
     term.set_theme_colors(theme_t());
     let mut last = term.colors_generation();
@@ -782,10 +812,14 @@ fn the_generation_moves_exactly_with_the_colours_in_effect() {
     term.advance(b"\x1b]104\x07");
     step(&mut term, "104 drops a differing override", true);
     term.advance(b"\x1b]4;1;#01fe54\x07\x1b]4;2;#02fd57\x07\x1b]11;#101010\x07");
-    step(&mut term, "sets equal to the theme", false);
+    step(&mut term, "sets equal to the theme", true);
+    term.advance(b"\x1b]4;1;#01fe54\x07\x1b]4;2;#02fd57\x07\x1b]11;#101010\x07");
+    step(&mut term, "the same sets again", false);
     term.advance(b"\x1b]104;1\x07\x1b]104\x07\x1b]111\x07");
-    step(&mut term, "resets of overrides equal to the theme", false);
+    step(&mut term, "resets of overrides equal to the theme", true);
     assert!(term.color_overrides().is_empty());
+    term.advance(b"\x1b]104;1\x07\x1b]104\x07\x1b]110\x07\x1b]111\x07\x1b]112\x07\x1bc");
+    step(&mut term, "resets with nothing overridden", false);
     let mut theme = theme_t();
     theme.fg = Rgb::new(1, 2, 3);
     term.set_theme_colors(theme.clone());
@@ -795,4 +829,269 @@ fn the_generation_moves_exactly_with_the_colours_in_effect() {
     theme.palette[5] = Rgb::new(9, 9, 9);
     term.set_theme_colors(theme);
     step(&mut term, "a theme moving only an overridden entry", false);
+}
+
+/// S6 and #238: a flood of 100,000 identical `OSC 4 ; 1 ; #cd0000` (the
+/// default theme's colour 1) records one override and moves the
+/// generation once, for the first set; the rest cost nothing and queue
+/// nothing.
+#[test]
+fn a_flood_of_identical_sets_moves_the_generation_once() {
+    let mut term = Terminal::new(2, 4);
+    let generation = term.colors_generation();
+    term.advance(&b"\x1b]4;1;#cd0000\x07".repeat(100_000));
+    assert_eq!(term.colors_generation(), generation + 1);
+    assert_eq!(
+        term.color_overrides().palette[1],
+        Some(Rgb::new(0xcd, 0, 0))
+    );
+    assert_eq!(term.take_requests(), []);
+    term.advance(&b"\x1b]4;1;#cd0000\x07".repeat(1_000));
+    assert_eq!(
+        term.colors_generation(),
+        generation + 1,
+        "the same set again"
+    );
+}
+
+/// The colour-generation property (D-GEN, #238).
+mod generation {
+    use proptest::prelude::*;
+
+    use super::{Rgb, Terminal, ThemeColors, theme_t, theme_t2};
+
+    /// What a step does. Slots 0 to 3 are palette entries 0 to 3, 4 to 6
+    /// the foreground, background and cursor; a colour is picked from the
+    /// themes' so that sets equal to the theme in effect are common.
+    #[derive(Debug, Clone)]
+    enum Op {
+        /// Sets `slot` to colour `color` (see [`color`]), twice when
+        /// `twice`.
+        Set { slot: u8, color: u8, twice: bool },
+        /// `OSC 104 ; c` or `OSC 110` to `112`.
+        Reset(u8),
+        /// `OSC 104` without an index.
+        ResetPalette,
+        /// RIS.
+        Ris,
+        /// One of [`themes`].
+        Theme(usize),
+    }
+
+    /// The themes a step can switch to: T, T2, and T with T2's
+    /// foreground, background, cursor or palette entry 1 (moving one slot
+    /// only).
+    fn themes() -> [ThemeColors; 6] {
+        let (t, t2) = (theme_t(), theme_t2());
+        let mut fg = t.clone();
+        fg.fg = t2.fg;
+        let mut bg = t.clone();
+        bg.bg = t2.bg;
+        let mut cursor = t.clone();
+        cursor.cursor = t2.cursor;
+        let mut pal1 = t.clone();
+        pal1.palette[1] = t2.palette[1];
+        [t, t2, fg, bg, cursor, pal1]
+    }
+
+    /// Colour `n` for `slot`: T's, T2's, black or white.
+    fn color(slot: u8, n: u8) -> Rgb {
+        let pick = |theme: ThemeColors| match slot {
+            4 => theme.fg,
+            5 => theme.bg,
+            6 => theme.cursor,
+            i => theme.palette[usize::from(i)],
+        };
+        match n {
+            0 => pick(theme_t()),
+            1 => pick(theme_t2()),
+            2 => Rgb::new(0, 0, 0),
+            _ => Rgb::new(0xff, 0xff, 0xff),
+        }
+    }
+
+    fn set_bytes(slot: u8, Rgb { r, g, b }: Rgb) -> Vec<u8> {
+        let spec = format!("#{r:02x}{g:02x}{b:02x}");
+        match slot {
+            4..=6 => format!("\x1b]{};{spec}\x07", 10 + u32::from(slot - 4)),
+            i => format!("\x1b]4;{i};{spec}\x07"),
+        }
+        .into_bytes()
+    }
+
+    fn reset_bytes(slot: u8) -> Vec<u8> {
+        match slot {
+            4..=6 => format!("\x1b]{}\x07", 110 + u32::from(slot - 4)),
+            i => format!("\x1b]104;{i}\x07"),
+        }
+        .into_bytes()
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            4 => (0u8..7, 0u8..4, any::<bool>())
+                .prop_map(|(slot, color, twice)| Op::Set { slot, color, twice }),
+            2 => (0u8..7).prop_map(Op::Reset),
+            1 => Just(Op::ResetPalette),
+            1 => Just(Op::Ris),
+            2 => (0usize..6).prop_map(Op::Theme),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(10_000))]
+
+        /// Across random sets, resets, RIS and theme changes the
+        /// generation never decreases, a repeated set never moves it, and
+        /// whenever the overrides or the colours in effect differ from the
+        /// step before it has moved. With the generation monotonic, that
+        /// means two points with the same generation have the same
+        /// overrides and colours (#238: a host that copies on a move never
+        /// misses an override).
+        #[test]
+        fn the_generation_moves_with_every_override_and_colour_change(
+            ops in prop::collection::vec(op(), 1..40),
+        ) {
+            let themes = themes();
+            let mut term = Terminal::new(2, 4);
+            term.set_theme_colors(themes[0].clone());
+            let mut last = (
+                term.colors_generation(),
+                term.color_overrides().clone(),
+                term.colors(),
+            );
+            for op in &ops {
+                match *op {
+                    Op::Set { slot, color: n, twice } => {
+                        let bytes = set_bytes(slot, color(slot, n));
+                        term.advance(&bytes);
+                        if twice {
+                            let before = term.colors_generation();
+                            term.advance(&bytes);
+                            prop_assert_eq!(term.colors_generation(), before, "{:?}: repeat", op);
+                        }
+                    }
+                    Op::Reset(slot) => term.advance(&reset_bytes(slot)),
+                    Op::ResetPalette => term.advance(b"\x1b]104\x07"),
+                    Op::Ris => term.advance(b"\x1bc"),
+                    Op::Theme(k) => term.set_theme_colors(themes[k].clone()),
+                }
+                let now = (
+                    term.colors_generation(),
+                    term.color_overrides().clone(),
+                    term.colors(),
+                );
+                prop_assert!(now.0 >= last.0, "{:?}: generation went back", op);
+                if now.0 == last.0 {
+                    prop_assert_eq!(&now.1, &last.1, "{:?}: overrides moved, generation did not", op);
+                    prop_assert_eq!(&now.2, &last.2, "{:?}: colours moved, generation did not", op);
+                }
+                last = now;
+            }
+        }
+    }
+}
+
+/// S8 (#249): a colour spec or index that is not understood (an unknown
+/// name, a long one past the 22-byte cap, a bad `rgb:`, a malformed `OSC 4`
+/// or `OSC 104` index) is traced with its length only, never its bytes, in
+/// `OSC 4`, `OSC 104` and the `OSC 10` chain: every event carries only a
+/// `message` and a `len` field, and no field holds the input in any form. A
+/// test-local subscriber records every event's fields (D7: no new
+/// dependency).
+mod length_only_trace {
+    use std::fmt;
+    use std::sync::{Arc, Mutex};
+
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    use super::Terminal;
+
+    /// One event: each field's name and `Debug` text.
+    type Fields = Vec<(&'static str, String)>;
+
+    /// Every event's fields, in order.
+    #[derive(Clone, Default)]
+    struct Recorder(Arc<Mutex<Vec<Fields>>>);
+
+    /// Collects an event's fields.
+    struct Collect(Fields);
+
+    impl Visit for Collect {
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            self.0.push((field.name(), format!("{value:?}")));
+        }
+    }
+
+    impl Subscriber for Recorder {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let mut fields = Collect(Vec::new());
+            event.record(&mut fields);
+            self.0.lock().expect("recorder lock").push(fields.0);
+        }
+        fn enter(&self, _: &Id) {}
+        fn exit(&self, _: &Id) {}
+    }
+
+    /// The events tracing `bytes` fed to a new terminal.
+    fn events(bytes: &[u8]) -> Vec<Fields> {
+        let recorder = Recorder::default();
+        tracing::subscriber::with_default(recorder.clone(), || {
+            let mut term = Terminal::new(2, 4);
+            term.advance(bytes);
+            assert_eq!(term.take_requests(), [], "no reply");
+            assert!(term.color_overrides().is_empty(), "nothing set");
+        });
+        let events = recorder.0.lock().expect("recorder lock");
+        events.clone()
+    }
+
+    #[test]
+    fn unknown_colour_specs_are_traced_by_length_only() {
+        let long = format!("secretname{}", "x".repeat(54));
+        // `secret` as `Debug` prints bytes: `115, 101, 99, 114, 101, 116`.
+        let secret_bytes = format!("{:?}", b"secret")
+            .trim_matches(['[', ']'])
+            .to_owned();
+        for (head, piece, tail) in [
+            ("4;1;", "secretname", ""),
+            ("4;1;", long.as_str(), ""),
+            ("10;", "secretname", ""),
+            ("11;", long.as_str(), ""),
+            ("10;;;", "secretname", ""),
+            ("12;", "rgb:secretname", ""),
+            ("4;", "secret", ";#000000"),
+            ("104;", "secret", ""),
+        ] {
+            let osc = format!("{head}{piece}{tail}");
+            let events = events(format!("\x1b]{osc}\x07").as_bytes());
+            let len = piece.len().to_string();
+            assert!(
+                events.iter().any(|e| e
+                    .iter()
+                    .any(|(name, value)| *name == "len" && *value == len)),
+                "OSC {osc}: no event with len={len}: {events:?}"
+            );
+            for (name, value) in events.iter().flatten() {
+                assert!(
+                    matches!(*name, "message" | "len"),
+                    "OSC {osc}: the trace has a field {name}={value}"
+                );
+                assert!(
+                    !value.contains("secret") && !value.contains(&secret_bytes),
+                    "OSC {osc}: the trace holds the input: {name}={value}"
+                );
+            }
+        }
+    }
 }

@@ -20,7 +20,9 @@
 //! colours on neither). Resizes, the alternate screen and DECSCNM leave
 //! them alone; a query reports the colour itself, never the opposite one
 //! under DECSCNM (D-REVERSE). [`Terminal::colors_generation`] increases
-//! whenever an effective colour changes, and only then.
+//! whenever an override or an effective colour changes, and only then
+//! (D-GEN): a set equal to the theme's colour moves it, a repeated set of
+//! the same colour does not.
 //!
 //! # Queries
 //!
@@ -255,7 +257,8 @@ impl Slot {
 pub(crate) struct Colors {
     theme: ThemeColors,
     overrides: ColorOverrides,
-    /// Increased by every change of an effective colour.
+    /// Increased by every change of an override or of an effective
+    /// colour.
     generation: u64,
 }
 
@@ -303,22 +306,21 @@ impl Colors {
             .unwrap_or_else(|| self.theme_of(slot))
     }
 
-    /// Records the program's colour for `slot`.
+    /// Records the program's colour for `slot`. Any change of the override
+    /// moves the generation, even to the theme's colour: a host copies the
+    /// overrides when it moves, and a later theme change keeps this one
+    /// (#238). The same colour again moves nothing.
     fn set(&mut self, slot: Slot, color: Rgb) {
-        let before = self.effective(slot);
-        *self.override_mut(slot) = Some(color);
-        if before != color {
+        let previous = self.override_mut(slot).replace(color);
+        if previous != Some(color) {
             self.generation += 1;
         }
     }
 
-    /// Drops the program's colour for `slot`; returns whether the colour
-    /// in effect changed (the caller bumps the generation).
+    /// Drops the program's colour for `slot`; returns whether there was
+    /// one (the caller bumps the generation).
     fn drop_override(&mut self, slot: Slot) -> bool {
-        let theme = self.theme_of(slot);
-        self.override_mut(slot)
-            .take()
-            .is_some_and(|color| color != theme)
+        self.override_mut(slot).take().is_some()
     }
 
     /// Drops the program's colour for `slot`.
@@ -567,12 +569,15 @@ impl Terminal {
         self.state.colors.overrides.apply(&self.state.colors.theme)
     }
 
-    /// A counter that increases whenever a colour in effect
-    /// ([`Terminal::colors`]) changes: a set to another colour, a reset or
-    /// RIS dropping an override that differed from the theme, or a theme
-    /// change that moved a colour no program overrides. Setting a colour
-    /// it already has, or a theme equal to the current one, leaves it. A
-    /// host compares it frame to frame and rebuilds its palette only when
+    /// A counter that increases whenever the program's overrides
+    /// ([`Terminal::color_overrides`]) or a colour in effect
+    /// ([`Terminal::colors`]) change: a set that records a new override
+    /// value (even one equal to the theme's colour), a reset or RIS
+    /// dropping an override, or a theme change that moved a colour no
+    /// program overrides. Setting an override to the value it already
+    /// holds, a reset of a colour not overridden, or a theme that moves
+    /// only overridden colours leaves it. A host compares it frame to
+    /// frame and copies the overrides and rebuilds its palette only when
     /// it moved.
     #[must_use]
     pub fn colors_generation(&self) -> u64 {

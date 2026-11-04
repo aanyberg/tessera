@@ -1606,3 +1606,17 @@ note: lead edit 2026-10-31: `\e[?0u` dropped. The parser (vte 0.15) reports `CSI
 reply: none
 cite: reply forms are never queries: `R`, `?...c`, `0n`, `$y`, `8;..t`, `>..c`, `DCS > |`, `?0u` all fall through as inert (no feedback loop with an echoing program). The xterm DECRQM `$p` form differs from the `$y` reply form
 flags: negative control
+
+### RP11_32_parameters_still_answer_the_first
+size: 24x80
+step: feed \e[5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5n\e[6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6n\e[?6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6n\e[?25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25$p\e[4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4$p
+reply: \e[0n\e[1;1R\e[?1;1;1R\e[?25;1$y\e[4;2$y
+cite: the parser (vte) keeps 32 parameters: a DSR, CPR, DECXCPR, DECRQM or ANSI RQM with 32 answers its first one and ignores the rest, as with 2 (#189 d)
+flags: control
+
+### RP12_33_parameters_get_no_reply
+size: 24x80
+step: feed \e[5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5;5n\e[6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6n\e[?6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6;6n\e[?25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25;25$p\e[4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4;4$p\e[5n
+reply: \e[0n
+cite: S1 / ADR 0013 overflow rule: one parameter past the parser's 32 flags the sequence `ignore` and it is dropped whole, so an over-long DSR, CPR, DECXCPR, DECRQM or ANSI RQM gets no reply at all (never one built from a cut header); the trailing DSR 5 shows the parser recovered (#189 d; the issue's '17+' predates the count, the cut is 33)
+flags: security negative
