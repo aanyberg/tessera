@@ -366,6 +366,10 @@ decstr_tests! {
     paste_focus_mouse_reverse_video_lnm_and_alt_screen_kept: [
         "KEEP01_paste_focus_mouse_reverse_lnm_alt_kept",
     ],
+    character_protection_turns_off: [
+        "DECSCA01_decstr_stops_the_pen_protecting",
+        "DECSCA02_control_x_stays_protected",
+    ],
     split_and_cancelled_sequences: [
         "SPLIT01_decstr_split_across_feeds",
         "INTERRUPT01_can_aborts_decstr",

@@ -259,10 +259,10 @@ esctest `*_8bit` rows in `esctest_spec.txt` and the routing rows G05-G07 in
   first byte and after every ESC and CSI sequence (the only ones that can
   switch the mode). So `ESC SP G` followed by a C1 control in the same
   read takes effect at once, the parser does not need to know which
-  sequences switch, and nothing is added per printed character. The
-  codes with no 7-bit function (SS2, SS3, SPA, EPA until #112 and #95,
-  and the unassigned ones) reach `esc()` as ignored escapes and print
-  nothing.
+  sequences switch, and nothing is added per printed character. Every
+  C1 code reaches `esc()` as its `ESC Fe` form: SS2 and SS3 act since
+  #112 (ADR 0033), SPA and EPA since #95 (ADR 0034), and the unassigned
+  ones are ignored escapes that print nothing.
 - **DCS fix.** `vte` ends a DCS at any `0x9C` byte, including the second
   byte of a UTF-8 character such as U+025C (`C9 9C`), which used to end a
   tmux passthrough early. Now a `0x9C` that belongs to a UTF-8 character

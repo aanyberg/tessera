@@ -1268,3 +1268,104 @@ fn hidden_base_does_not_take_a_visible_mark_with_it() {
     let (_, nothing) = render_cells(&gpu, &mut renderer, &[Cell::BLANK; 2], None);
     assert_ne!(image, nothing, "the visible mark draws");
 }
+
+/// [`Style::PROTECTED`] (SPA, DECSCA; ADR 0034) is not a visual attribute:
+/// a screen of styled text, coloured backgrounds, wide characters (`@@`
+/// pairs and CJK), ligature candidates, a selection and a cursor draws bit
+/// for bit the same when every other
+/// character is protected and when all are, so no pass groups, shapes,
+/// decorates or colours cells by the bit. Run with Menlo and, where
+/// installed, with a font that has ligatures (a protection change inside a
+/// ligature must not split it).
+#[test]
+fn protection_draws_like_the_same_cells_unprotected() {
+    let Some(gpu) = gpu() else { return };
+    let d = Style::DEFAULT;
+    let text = [
+        ("plain a => b fi != -> ", d),
+        ("bold\n", d.with(Style::BOLD)),
+        ("italic ", d.with(Style::ITALIC)),
+        ("dim ", d.with(Style::DIM)),
+        ("under", d.with(Style::UNDERLINE)),
+        (
+            " curly",
+            d.with_underline_style(tessera_grid::UnderlineStyle::Curly),
+        ),
+        ("\nstrike ", d.with(Style::STRIKETHROUGH)),
+        ("over ", d.with(Style::OVERLINE)),
+        ("x", d),
+        ("2", d.with(Style::SUPERSCRIPT)),
+        ("y", d.with(Style::SUBSCRIPT)),
+        (" inv", d.with(Style::INVERSE)),
+        ("\n@@ wide @@@@ ", d),
+        ("hid", d.with(Style::HIDDEN)),
+        (" colour", fg_bg(1, 4)),
+        ("\n|||| \u{2588}\u{2591} e\u{301} ", d),
+        ("\u{4e2d}\u{6587}", fg_bg(2, 5)),
+    ];
+    let protect = |lines: &[tessera_grid::Line], every: usize| -> Vec<tessera_grid::Line> {
+        let mut lines = lines.to_vec();
+        for line in &mut lines {
+            let mut nth = 0;
+            for col in 0..line.cells.len() {
+                // A spacer takes its wide cell's style: the pair stays one.
+                if line.cells[col].is_spacer() && col > 0 {
+                    line.cells[col].style = line.cells[col - 1].style;
+                    continue;
+                }
+                if nth % every == 0 {
+                    line.cells[col].style = line.cells[col].style.with(Style::PROTECTED);
+                }
+                nth += 1;
+            }
+        }
+        lines
+    };
+    let families = ["Menlo", "Cascadia Code", "JetBrains Mono", "Fira Code"];
+    let mut drawn = 0;
+    for family in families {
+        let Some(mut renderer) = renderer_with(&gpu, Theme::default(), family) else {
+            continue;
+        };
+        let lines = grid_lines(&text, 5, 32);
+        let spacers = lines
+            .iter()
+            .flat_map(|l| &l.cells)
+            .filter(|c| c.is_spacer())
+            .count();
+        assert!(
+            spacers >= 5,
+            "the screen has wide characters ({spacers} spacers)"
+        );
+        let size = target_size(&renderer, 32, lines.len());
+        let mut frame_of = |lines: &[tessera_grid::Line]| -> Vec<u8> {
+            let rows: Vec<&[Cell]> = lines.iter().map(|l| l.cells.as_slice()).collect();
+            let clusters: Vec<_> = lines.iter().map(|l| l.graphemes.clone()).collect();
+            let frame = FrameInput::new(&rows)
+                .with_clusters(&clusters)
+                .with_selection(Some(Selection::linear(Point::new(1, 3), Point::new(2, 6))))
+                .with_cursor(Some(CursorState::new(0, 9, CursorShape::Block)))
+                .with_focus(true);
+            let target = OffscreenTarget::new(&gpu, size, FORMAT);
+            target.render(&gpu, &mut renderer, &frame).expect("render");
+            target.read_back(&gpu).expect("readback")
+        };
+        let plain = frame_of(&lines);
+        for every in [1, 2, 3] {
+            let protected = protect(&lines, every);
+            assert!(
+                protected
+                    .iter()
+                    .flat_map(|l| &l.cells)
+                    .any(Cell::is_protected),
+                "the variant protects something"
+            );
+            assert!(
+                plain == frame_of(&protected),
+                "{family}: protecting every {every}th character changed the frame"
+            );
+        }
+        drawn += 1;
+    }
+    assert!(drawn > 0, "Menlo ships with macOS");
+}

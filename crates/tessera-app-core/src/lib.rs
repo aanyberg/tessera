@@ -3427,7 +3427,7 @@ mod tests {
         let y = KeyEvent::new(Key::Char('y'), Modifiers::NONE);
         assert_eq!(key(&app, id, y), InputOutcome::Consumed);
         fake.would_block.store(false, Ordering::SeqCst);
-        written_eventually(&fake, b"xw\x1b[0n\x1b[?64;9;21;22cy");
+        written_eventually(&fake, b"xw\x1b[0n\x1b[?64;6;9;21;22cy");
     }
 
     /// The reply to an OSC 10/11 query for `color`, ending with `end`.

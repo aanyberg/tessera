@@ -1,0 +1,38 @@
+---
+source: crates/tessera-term/tests/esctest.rs
+description: E_S8C1T_SPA_EPA
+input_file: crates/tessera-term/tests/fixtures/esctest_spec.txt
+---
+ | c
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--
+cursor: (0,0)
+pending_wrap: false
+auto_wrap: true insert_mode: false
+requests: []
+scrollback: 0
+-- pens
+(0,2)-(0,2) fg=- bg=- ul=- us=none flags=?0x8000

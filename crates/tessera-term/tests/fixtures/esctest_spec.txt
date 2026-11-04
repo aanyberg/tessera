@@ -37,6 +37,9 @@
 #     #96 (8-bit C1) lifted E_HTS_8bit, E_IND_8bit, E_RI_8bit and E_NEL_8bit and ported E_S8C1T_CSI, E_APC_8bit,
 #     E_PM_8bit and E_SOS_8bit from esctest2 (transcribed through escio.CmdChar; expected cursor and screen are the
 #     esctest assertions). 206 cases.
+#     #95 (protected areas) lifted E_ED_respectsISOProtection, E_EL_respectsISOProtection, E_ECH_respectsISOProtection
+#     and E_S8C1T_SPA_EPA (protect_spec.txt P01..P04); the two saveRestoreCursor_protection tests use DECSERA and wait
+#     for #251. 210 cases.
 #
 # HOW esctest ASSERTIONS MAP TO THE FIXTURE
 #   esctest reads the cursor with DSR 6 (needs #10) and the screen with DECRQCRA checksums; tessera tests read the grid. So:
@@ -3379,7 +3382,7 @@ size: 25x80
 step: feed ab\x1b[1"qc\x1b[0"q\x1b[1;1H\x1b[0J
 source: esctest2 esctest/tests/ed.py test_ED_doesNotRespectDECProtection
 cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ed.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
-note: a b, DECSCA 1 (ESC[1"q), c, DECSCA 0, home, ED 0: ED ignores DECSCA so all three go. tessera-term ignores CSI with intermediates, so this passes trivially (nothing is protected).
+note: a b, DECSCA 1 (ESC[1"q), c, DECSCA 0, home, ED 0: ED ignores DEC protection (only DECSED honours it), so all three go (#95, ADR 0034).
 chunk: no
 screen:
 > |
@@ -3526,8 +3529,42 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_ED_respectsISOProtection -> #95 (ed.py): SPA/EPA = ESC V / ESC W; 'ab' + SPA + 'c' + EPA, home, ED 0 -> only 'c' survives.
-#>    Same for E_EL_respectsISOProtection and E_ECH_respectsISOProtection. xterm honours ISO protection; iTerm2 marks it a knownBug.
+### E_ED_respectsISOProtection
+size: 25x80
+step: feed ab\x1bVc\x1bW\x1b[1;1H\x1b[0J
+source: esctest2 esctest/tests/ed.py test_ED_respectsISOProtection
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html ; protect_spec.txt
+note: a b, SPA (ESC V), c, EPA (ESC W), home, ED 0: ISO protection keeps c (xterm; iTerm2 marks it a knownBug). Lifted by #95 (protect_spec.txt P01).
+screen:
+> | c
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
 
 # ---------------------------------------------------------------------------- EL (el.py)  prepare(): 'abcdefghij' on row 1, cursor on the 'e' (col 5)
 
@@ -3725,6 +3762,43 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
+### E_EL_respectsISOProtection
+size: 25x80
+step: feed ab\x1bVc\x1bW\x1b[1;1H\x1b[2K
+source: esctest2 esctest/tests/el.py test_EL_respectsISOProtection
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html ; protect_spec.txt
+note: As E_ED_respectsISOProtection with EL 2. Lifted by #95 (protect_spec.txt P02).
+screen:
+> | c
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
 ### E_EL_ignoresScrollRegion
 size: 25x80
 step: feed \x1b[1;1Habcdefghij\x1b[1;5H\x1b[?69h\x1b[2;4s\x1b[1;5H\x1b[2K\x1b[?69l
@@ -3850,10 +3924,47 @@ size: 25x80
 step: feed ab\x1b[1"qc\x1b[0"q\x1b[1;1H\x1b[3X
 source: esctest2 esctest/tests/ech.py test_ECH_doesNotRespectDECPRotection
 cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ech.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
-note: ECH 3 erases all three; DECSCA ignored by tessera-term (passes trivially).
+note: ECH 3 erases all three: ECH ignores DEC protection (#95, ADR 0034).
 chunk: no
 screen:
 > |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E_ECH_respectsISOProtection
+size: 25x80
+step: feed ab\x1bVc\x1bW\x1b[1;1H\x1b[3X
+source: esctest2 esctest/tests/ech.py test_ECH_respectsISOProtection
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html ; protect_spec.txt
+note: As E_ED_respectsISOProtection with ECH 3. Lifted by #95 (protect_spec.txt P03).
+screen:
+> | c
 >
 >
 >
@@ -6403,7 +6514,8 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_DECRC_saveRestoreCursor_protection -> #95 (DECSCA/DECSERA, DEC protection next to SPA/EPA); passes vacuously today, so not worth a case
+#> E_DECRC_saveRestoreCursor_protection -> #251 (DECSERA: the esctest original erases with DECSERA, which needs the rectangle
+#>    operations; #95 proves the DECRC half with DECSEL, protect_spec.txt K01)
 
 ### E_DECRC_saveRestoreCursor_reverseWrapNotAffected
 size: 25x80
@@ -6820,7 +6932,7 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_SCORC_saveRestoreCursor_protection -> #95 (as E_DECRC_saveRestoreCursor_protection)
+#> E_SCORC_saveRestoreCursor_protection -> #251 (as E_DECRC_saveRestoreCursor_protection; protect_spec.txt K03 for SCORC)
 
 # ---------------------------------------------------------------------------- DECSTBM (decstbm.py)  ESC[Pt;Pb r  — moves the cursor home on success
 
@@ -8241,9 +8353,47 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_S8C1T_SPA_EPA -> #95 (s8c1t.py test_S8C1T_SPA_EPA): SPA 0x96 / EPA 0x97 in 8-bit mode protect `c` from ECH; the
-#>    C1 bytes already reach esc() as ESC V / ESC W (#96), which #95 implements. test_S8C1T_DCS and test_DECID_8bit
-#>    read replies: c1_spec.txt R11 and C15.
+### E_S8C1T_SPA_EPA
+size: 25x80
+step: feed \x1b G
+step: feed ab\x96c\x97
+step: feed \x1b F
+step: feed \x1b[1;1H\x1b[3X
+source: esctest2 esctest/tests/s8c1t.py test_S8C1T_SPA_EPA
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/ ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html ; protect_spec.txt
+note: S8C1T, a b, SPA as 0x96, c, EPA as 0x97, S7C1T, home, ECH 3: c survives. C1 as a raw byte between Write(S8C1T) and Write(S7C1T). Lifted by #95 (protect_spec.txt P04).
+screen:
+> | c
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,0)   # 1-based row 1 col 1
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+# test_S8C1T_DCS and test_DECID_8bit read replies: c1_spec.txt R11 and C15.
 
 # ---------------------------------------------------------------------------- SGR (sgr.py)
 

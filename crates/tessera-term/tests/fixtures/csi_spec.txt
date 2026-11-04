@@ -2020,18 +2020,18 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-### ED14_private_marker_not_ed
+### ED14_private_marker_is_decsed
 size: 5x10
 step: feed \x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX\x1b[3;5H\x1b[?2JX
-cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI ? Ps J (DECSED) is a different function; brief: any private marker is unknown -> ignored
-note: DECSED is selective erase, not ED. A handler matching only the final byte would wrongly clear the screen. Expected: grid unchanged except X.
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI ? Ps J (DECSED) is selective erase; xterm CASE_DECSED; protect_spec.txt S16
+note: Flipped by #95 (was ED14_private_marker_not_ed, a no-op): DECSED 2 with nothing protected erases the whole screen like ED 2; the cursor stays, X lands at (2,4).
 flags: trap
 screen:
->abcdefghij
->klmnopqrst
->uvwxXz|ABCD
->EFGHIJKLMN
->OPQRSTUVWX
+>
+>
+>    X |
+>
+>
 cursor: (2,5)   # 1-based row 3 col 6
 pending_wrap: false
 requests: []
@@ -2255,16 +2255,16 @@ pending_wrap: true
 requests: []
 scrollback: len=0
 
-### EL13_private_marker_not_el
+### EL13_private_marker_is_decsel
 size: 5x10
 step: feed \x1b[1;1Habcdefghij\x1b[2;1Hklmnopqrst\x1b[3;1HuvwxyzABCD\x1b[4;1HEFGHIJKLMN\x1b[5;1HOPQRSTUVWX\x1b[3;5H\x1b[?2KX
-cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI ? Ps K (DECSEL)
-note: DECSEL is a different function: ignored.
+cite: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html CSI ? Ps K (DECSEL); xterm CASE_DECSEL; protect_spec.txt S17
+note: Flipped by #95 (was EL13_private_marker_not_el, a no-op): DECSEL 2 with nothing protected erases the line like EL 2.
 flags: trap
 screen:
 >abcdefghij
 >klmnopqrst
->uvwxXz|ABCD
+>    X |
 >EFGHIJKLMN
 >OPQRSTUVWX
 cursor: (2,5)   # 1-based row 3 col 6

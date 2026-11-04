@@ -1,12 +1,12 @@
 ---
 source: crates/tessera-term/tests/csi.rs
-input_file: crates/tessera-term/tests/scripts/csi/ed14_private_marker_not_ed.txt
+input_file: crates/tessera-term/tests/scripts/csi/ed14_private_marker_is_decsed.txt
 ---
-abcdefghij
-klmnopqrst
-uvwxXz|ABCD
-EFGHIJKLMN
-OPQRSTUVWX
+
+
+    X |
+
+
 --
 cursor: (2,5)
 pending_wrap: false

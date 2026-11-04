@@ -4,7 +4,7 @@
 //!
 //! | Parameter | Effect |
 //! |---|---|
-//! | `0` | reset: default colours, default underline colour, no attributes |
+//! | `0` | reset: default colours, default underline colour, no attributes (the protection SPA and DECSCA set is not an attribute and stays) |
 //! | `1` `2` `3` | bold, dim, italic (bold and dim may both be set) |
 //! | `4` | single underline |
 //! | `4:0` .. `4:5` | no, single, double, curly, dotted, dashed underline; `4:n` with `n > 5` is single |
@@ -188,7 +188,14 @@ impl State {
                 continue;
             }
             match code {
-                0 => *pen = Style::DEFAULT,
+                // DECSCA's and SPA's protection is not a rendition: SGR 0
+                // keeps it (xterm; ADR 0034).
+                0 => {
+                    *pen = Style {
+                        flags: pen.flags & Style::PROTECTED,
+                        ..Style::DEFAULT
+                    };
+                }
                 1 => *pen = pen.with(Style::BOLD),
                 2 => *pen = pen.with(Style::DIM),
                 3 => *pen = pen.with(Style::ITALIC),

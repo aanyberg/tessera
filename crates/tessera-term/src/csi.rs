@@ -13,8 +13,8 @@
 //! | `a` `e` | HPR VPR | relative position: right / down, clamped to the screen (VPR ignores the scroll region unless origin mode is on) |
 //! | `h` `l` | SM RM | set / reset ANSI modes: IRM (4) and LNM (20), see the `modes` module |
 //! | `I` `Z` | CHT CBT | tab forward / back |
-//! | `J` `K` | ED EL | erase in display / line |
-//! | `@` `P` `X` | ICH DCH ECH | insert / delete / erase characters |
+//! | `J` `K` | ED EL | erase in display / line (keeping protected cells in ISO protection mode) |
+//! | `@` `P` `X` | ICH DCH ECH | insert / delete / erase characters (ECH keeps protected cells in ISO protection mode) |
 //! | `L` `M` | IL DL | insert / delete lines inside the scroll region |
 //! | `S` `T` `^` | SU SD | scroll the region up / down (`T` with more than one parameter is mouse tracking, ignored) |
 //! | `b` | REP | repeat the last printed character |
@@ -42,6 +42,8 @@
 //! | `CSI ? u` | kitty keyboard | the flags query |
 //! | `CSI Ps ' }` `CSI Ps ' ~` | DECIC DECDC | insert / delete `Ps` columns at the cursor, up to the right margin, in every row of the scroll region (level 4 and up) |
 //! | `CSI Pl ; Pc " p` | DECSCL | select conformance level: for `Pl` 61..=65, the DECSTR soft reset, then level `Pl - 60` and the C1 reply mode from `Pc`; any other `Pl` does nothing |
+//! | `CSI Ps " q` | DECSCA | DEC protection mode; `Ps` 1 makes the pen protect, absent, 0 and 2 stop it, others leave it (ADR 0034) |
+//! | `CSI ? Ps J` `CSI ? Ps K` | DECSED DECSEL | ED and EL that keep protected cells while protection is on (ADR 0034) |
 //!
 //! Parameters follow xterm: an absent parameter and an explicit `0` both
 //! mean the default, positions are 1-based and clamp to the screen, and
@@ -88,7 +90,7 @@
 //! its default `decTerminalID` 420, accepts only up to 64). Nothing is
 //! answered; `State::select_conformance_level` has the details.
 //!
-//! DECSET/DECRST, SM/RM, DECSCL, DECSCUSR, the kitty keyboard sequences
+//! DECSET/DECRST, SM/RM, DECSCL, DECSCUSR, DECSCA, the kitty keyboard sequences
 //! and every report query are ignored as a whole when a parameter carries
 //! a colon sub-parameter (`CSI ? 25:1049 h`), as in xterm, which accepts
 //! them only in SGR and XTMODKEYS.
@@ -96,7 +98,7 @@
 //! Everything else (an unassigned final, any other private marker and
 //! final pair such as `CSI > 25 h` or `CSI ? 5 m`, any other intermediate
 //! such as `$` with a final other than `p`, `SP` with a final other than
-//! `q`, `'` with one other than `}` and `~`, and `"` with one other than `p`, a private marker before `SP q`,
+//! `q`, `'` with one other than `}` and `~`, and `"` with one other than `p` and `q`, a private marker before `SP q`,
 //! and the xterm extension SL/SR that is not in scope) is ignored and
 //! logged at trace level. The parser hands over private markers as
 //! intermediates, so one match covers both.
@@ -105,8 +107,9 @@
 //! `tests/fixtures/csi_spec.txt`, for DECSTR by
 //! `tests/fixtures/decstr_spec.txt`, for the modes by
 //! `tests/fixtures/modes_spec.txt`, for DECSCUSR by
-//! `tests/fixtures/decscusr_spec.txt` and for the margins by
-//! `tests/fixtures/margins_spec.txt`.
+//! `tests/fixtures/decscusr_spec.txt`, for the margins by
+//! `tests/fixtures/margins_spec.txt` and for protection and selective
+//! erase by `tests/fixtures/protect_spec.txt`.
 //!
 //! [`Action::Csi`]: tessera_vt::Action::Csi
 
@@ -114,6 +117,33 @@ use tessera_grid::{Cell, EraseDisplay, EraseLine, Point, ReverseWrap, Style};
 use tracing::trace;
 
 use crate::{CursorShape, State};
+
+/// The terminal-wide protection mode (xterm's `protected_mode`; ADR
+/// 0034): which erases honour the cells printed with
+/// [`Style::PROTECTED`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Protection {
+    /// No protection: every erase erases every cell. The initial mode, and
+    /// the one DECSTR, DECSCL and RIS return to.
+    Off,
+    /// DEC protection (DECSCA): DECSED and DECSEL keep protected cells;
+    /// ED, EL and ECH erase them.
+    Dec,
+    /// ISO protection (SPA): ED, EL, ECH, DECSED and DECSEL all keep
+    /// protected cells.
+    Iso,
+}
+
+impl Protection {
+    /// The mode's name as `tests/fixtures/protect_spec.txt` writes it.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Dec => "dec",
+            Self::Iso => "iso",
+        }
+    }
+}
 
 /// Parameter `index`, or `default` when it is absent or zero.
 fn param_or(params: &[u16], index: usize, default: u16) -> u16 {
@@ -149,7 +179,7 @@ fn voided_by_subparams(intermediates: &[u8], action: char) -> bool {
         (intermediates, action),
         (b"?", 'h' | 'l' | 'u' | 'n')
             | ([b'>' | b'<' | b'='], 'u')
-            | (b" " | b">", 'q')
+            | (b" " | b">" | b"\"", 'q')
             | (b">" | b"=", 'c')
             | (b"$" | b"?$", 'p')
     )
@@ -220,11 +250,11 @@ impl State {
             'I' if grid.pending_wrap() => {}
             'I' => grid.tab_forward(count(params, 0)),
             'Z' => grid.tab_backward(count(params, 0)),
-            'J' => self.erase_in_display(selector(params, 0)),
-            'K' => self.erase_in_line(selector(params, 0)),
+            'J' => self.erase_in_display(selector(params, 0), false),
+            'K' => self.erase_in_line(selector(params, 0), false),
             '@' => grid.insert_chars(count(params, 0)),
             'P' => grid.delete_chars(count(params, 0)),
-            'X' => grid.erase_chars(count(params, 0)),
+            'X' => self.erase_chars(count(params, 0)),
             'L' | 'M' => self.edit_lines(action, count(params, 0)),
             'S' => grid.scroll_up(count(params, 0)),
             // xterm reads `CSI 0 T` as a mouse-tracking reset, but the parser
@@ -299,7 +329,16 @@ impl State {
             (b"?", 'u') => self.kitty_keyboard_query(params),
             (b"$", 'p') => self.request_mode(params, false),
             (b"?$", 'p') => self.request_mode(params, true),
-            (b"?", 'h' | 'l') => self.set_dec_modes(params, action == 'h'),
+            (b"?", 'h' | 'l') => {
+                self.set_dec_modes(params, action == 'h');
+                // DECSET 1048 and 1049 restore a saved pen.
+                self.note_pen();
+            }
+            // DECSED and DECSEL (xterm `CASE_DECSED` / `CASE_DECSEL`).
+            (b"?", 'J') => self.erase_in_display(selector(params, 0), true),
+            (b"?", 'K') => self.erase_in_line(selector(params, 0), true),
+            // DECSCA (xterm `CASE_DECSCA`).
+            (b"\"", 'q') => self.select_character_protection(params),
             (b" ", 'q') => self.set_cursor_style(selector(params, 0)),
             // DECIC and DECDC, VT420 and up (xterm `CASE_DECIC`/`DECDC`).
             (b"'", '}' | '~') if self.conformance_level >= 4 => {
@@ -320,10 +359,85 @@ impl State {
         }
     }
 
-    /// ED. Modes 0, 1 and 2 erase below, above and all. Mode 3 discards the
+    /// Whether an erase honours protected cells now: DECSED and DECSEL
+    /// (`selective`) in either protection mode, ED, EL and ECH only in the
+    /// ISO one (xterm; ADR 0034); and only while the active screen may hold
+    /// a protected cell at all, so an erase pays one comparison while
+    /// protection is off.
+    fn honours_protection(&self, selective: bool) -> bool {
+        let mode_honours = if selective {
+            self.protection != Protection::Off
+        } else {
+            self.protection == Protection::Iso
+        };
+        mode_honours && !self.unprotected_screens[usize::from(self.grid.is_alt_screen())]
+    }
+
+    /// Records that the active screen was erased in full: when no
+    /// protected cell stayed (`kept` false) and the pen will not print new
+    /// ones, the screen holds none, so later erases skip the scan.
+    fn note_screen_erased(&mut self, kept: bool) {
+        if !kept && !self.grid.pen().has(Style::PROTECTED) {
+            self.unprotected_screens[usize::from(self.grid.is_alt_screen())] = true;
+        }
+    }
+
+    /// Records that the pen may carry [`Style::PROTECTED`] after anything
+    /// that sets it (SPA, DECSCA, DECRC, SCORC, DECSET 1048 and 1049):
+    /// while it does, both screens may receive protected cells.
+    pub(crate) fn note_pen(&mut self) {
+        if self.grid.pen().has(Style::PROTECTED) {
+            self.unprotected_screens = [false; 2];
+        }
+    }
+
+    /// SPA (`ESC V`, `0x96`): ISO protection mode, and the pen protects
+    /// what it prints until EPA.
+    pub(crate) fn start_protected_area(&mut self) {
+        self.protection = Protection::Iso;
+        let pen = self.grid.pen_mut();
+        *pen = pen.with(Style::PROTECTED);
+        self.note_pen();
+    }
+
+    /// EPA (`ESC W`, `0x97`): the pen stops protecting; the mode stays.
+    pub(crate) fn end_protected_area(&mut self) {
+        let pen = self.grid.pen_mut();
+        *pen = pen.without(Style::PROTECTED);
+    }
+
+    /// DECSCA (`CSI Ps " q`), xterm's `CASE_DECSCA`: DEC protection mode
+    /// for any `Ps`; the first parameter 1 makes the pen protect, absent,
+    /// 0 and 2 make it stop, any other value leaves it. Later parameters
+    /// are ignored.
+    fn select_character_protection(&mut self, params: &[u16]) {
+        self.protection = Protection::Dec;
+        let pen = self.grid.pen_mut();
+        match params.first() {
+            None | Some(0 | 2) => *pen = pen.without(Style::PROTECTED),
+            Some(1) => *pen = pen.with(Style::PROTECTED),
+            Some(&ps) => trace!(ps, "DECSCA attribute unknown, protection kept"),
+        }
+        self.note_pen();
+    }
+
+    /// ECH: [`tessera_grid::Grid::erase_chars`], or in ISO protection mode
+    /// its form that keeps protected cells.
+    fn erase_chars(&mut self, n: u16) {
+        if self.honours_protection(false) {
+            self.grid.erase_chars_unprotected(n);
+        } else {
+            self.grid.erase_chars(n);
+        }
+    }
+
+    /// ED (`selective` false) and DECSED (`CSI ? Ps J`, true). Modes 0, 1
+    /// and 2 erase below, above and all, keeping protected cells when
+    /// [`State::honours_protection`] says so. Mode 3 discards the
     /// scrollback without touching the screen or the pending wrap, as in
-    /// xterm. Any other mode does nothing at all.
-    fn erase_in_display(&mut self, mode: u16) {
+    /// xterm (whose DECSED shares `do_erase_display`). Any other mode does
+    /// nothing at all.
+    fn erase_in_display(&mut self, mode: u16, selective: bool) {
         let mode = match mode {
             0 => EraseDisplay::Below,
             1 => EraseDisplay::Above,
@@ -335,26 +449,40 @@ impl State {
                 return;
             }
             mode => {
-                trace!(mode, "ED mode ignored");
+                trace!(mode, selective, "ED mode ignored");
                 return;
             }
         };
-        self.grid.erase_in_display(mode);
+        let kept = if self.honours_protection(selective) {
+            self.grid.erase_in_display_unprotected(mode)
+        } else {
+            self.grid.erase_in_display(mode);
+            false
+        };
+        if mode == EraseDisplay::All {
+            self.note_screen_erased(kept);
+        }
     }
 
-    /// EL. Modes 0, 1 and 2 erase to the end, to the start and the whole
-    /// line. Any other mode does nothing at all.
-    fn erase_in_line(&mut self, mode: u16) {
+    /// EL (`selective` false) and DECSEL (`CSI ? Ps K`, true). Modes 0, 1
+    /// and 2 erase to the end, to the start and the whole line, keeping
+    /// protected cells when [`State::honours_protection`] says so. Any
+    /// other mode does nothing at all.
+    fn erase_in_line(&mut self, mode: u16, selective: bool) {
         let mode = match mode {
             0 => EraseLine::ToEnd,
             1 => EraseLine::ToStart,
             2 => EraseLine::All,
             mode => {
-                trace!(mode, "EL mode ignored");
+                trace!(mode, selective, "EL mode ignored");
                 return;
             }
         };
-        self.grid.erase_in_line(mode);
+        if self.honours_protection(selective) {
+            self.grid.erase_in_line_unprotected(mode);
+        } else {
+            self.grid.erase_in_line(mode);
+        }
     }
 
     /// IL (`L`) and DL (`M`). Inside the scroll region and between the
@@ -459,7 +587,11 @@ impl State {
         self.charsets.reset();
         let slot = usize::from(self.grid.is_alt_screen());
         self.saved_charsets[slot] = Some(self.charsets.saved());
-        // #95: reset DECSCA here once the state exists. The colours a
+        // Protection off (xterm `ReallyReset`: `bitclr(PROTECTED)`,
+        // `OFF_PROTECT`); the pen bit went with the pen above. Cells keep
+        // their bit, so a later DECSCA or SPA honours them again (ADR 0034).
+        self.protection = Protection::Off;
+        // The colours a
         // program set (OSC 4, 10, 11, 12) stay: only RIS drops them (ADR
         // 0024; xterm's ResetAnsiColorRequest resets the palette here too).
         // DECLRMM, the margins and reverse wraparound are reset with the

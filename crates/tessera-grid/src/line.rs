@@ -217,6 +217,90 @@ impl Line {
         self.blank_raw(start..end, style);
     }
 
+    /// [`Line::fill`] for the cells of `range` that are not protected
+    /// ([`Cell::is_protected`]); returns whether `range` held a protected
+    /// cell, which is kept as it is. Each run of unprotected cells is
+    /// filled on its own, so a wide character cut by a run's end is still
+    /// blanked whole; a protected wide character is never cut, because
+    /// both its halves carry the bit (xterm `ClearInLine2`). Without a
+    /// protected cell in `range` this is exactly [`Line::fill`].
+    ///
+    /// One pass over the cells and at most one over the line's cluster and
+    /// link table, however many runs there are: the runs are blanked
+    /// without touching the table, and the entries of the cells blanked
+    /// are dropped together afterwards (S6: a screen of alternating
+    /// protected clusters costs a constant times ED 2, not one table edit
+    /// per run).
+    pub(crate) fn fill_unprotected(&mut self, range: std::ops::Range<usize>, style: Style) -> bool {
+        let end = range.end.min(self.cells.len());
+        let start = range.start.min(end);
+        let Some(first) = self.cells[start..end]
+            .iter()
+            .position(Cell::is_protected)
+            .map(|at| start + at)
+        else {
+            self.fill(start..end, style);
+            return false;
+        };
+        let blank = Cell::blank_with(style);
+        // The columns blanked lie in `lo..hi`; `side` is whether one of them
+        // had a cluster or a link.
+        let (mut lo, mut hi, mut side) = (start, end, false);
+        let mut blank_run = |cells: &mut [Cell], from: usize, to: usize| {
+            if from == to {
+                return;
+            }
+            // A wide character cut by either end of the run goes whole, as
+            // in `fill`; it is unprotected, as both halves share a style.
+            let from = if cells[from].is_spacer() && from > 0 {
+                from - 1
+            } else {
+                from
+            };
+            let to = if cells[to - 1].is_wide() && to < cells.len() {
+                to + 1
+            } else {
+                to
+            };
+            lo = lo.min(from);
+            hi = hi.max(to);
+            for cell in &mut cells[from..to] {
+                side |= cell.is_cluster() || cell.is_link();
+                *cell = blank;
+            }
+        };
+        let mut run = start;
+        for col in first..end {
+            if self.cells[col].is_protected() {
+                blank_run(&mut self.cells, run, col);
+                run = col + 1;
+            }
+        }
+        blank_run(&mut self.cells, run, end);
+        if side {
+            let cells = &self.cells;
+            self.graphemes
+                .retain_cols(|col| col < lo || col >= hi || cells[col].is_protected());
+        }
+        true
+    }
+
+    /// [`Line::clear`] that keeps the protected cells
+    /// ([`Cell::is_protected`]) and their clusters and links; returns
+    /// whether there was one. The marks and the wrap flag go either way,
+    /// as the line counts as erased in full.
+    pub(crate) fn clear_unprotected(&mut self, style: Style) -> bool {
+        if !self.cells.iter().any(Cell::is_protected) {
+            self.clear(style);
+            return false;
+        }
+        self.fill_unprotected(0..self.cells.len(), style);
+        self.marks.clear();
+        self.anchors = MarkAnchors::default();
+        self.wrapped = false;
+        true
+    }
+
     /// Resets the line to blanks and drops its marks, clusters, links and
     /// wrap flag.
     pub fn clear(&mut self, style: Style) {

@@ -16,6 +16,8 @@
 //! | `ESC 6` | DECBI | back index: at the left margin the region's columns move right, else the cursor moves left (level 4 and up) |
 //! | `ESC 9` | DECFI | forward index: at the right margin the region's columns move left, else the cursor moves right (level 4 and up) |
 //! | `ESC Z` | DECID | identify: the DA1 reply (see the `reports` module) |
+//! | `ESC V` | SPA | start of protected (guarded) area: ISO protection mode, and the pen protects what it prints (ADR 0034) |
+//! | `ESC W` | EPA | end of protected area: the pen stops protecting; the mode stays |
 //! | `ESC SP F` | S7C1T | 7-bit replies, C1 controls in the input ignored (level 2 and up) |
 //! | `ESC SP G` | S8C1T | 8-bit replies, C1 controls in the input honoured (level 2 and up) |
 //! | `ESC ( F`, `ESC ) F`, `ESC * F`, `ESC + F` | SCS | designate a 94-character set into G0 to G3 |
@@ -37,6 +39,7 @@ use tracing::trace;
 
 use crate::State;
 use crate::charset::{self, Charsets};
+use crate::csi::Protection;
 
 impl State {
     /// Applies one escape sequence. See the module documentation for the
@@ -67,6 +70,10 @@ impl State {
             ([], b'9') if self.conformance_level >= 4 => self.grid.forward_index(),
             // DECID: answered exactly like DA1 (xterm).
             ([], b'Z') => self.primary_device_attributes(),
+            // SPA and EPA (xterm `CASE_SPA` / `CASE_EPA`); their 8-bit forms
+            // 0x96 and 0x97 arrive here as ESC V and ESC W (ADR 0024).
+            ([], b'V') => self.start_protected_area(),
+            ([], b'W') => self.end_protected_area(),
             // S7C1T and S8C1T: VT200 and up (xterm `vtXX_level >= 2`). At
             // level 1 they fall through to the ignored arm; xterm also
             // swallows the next byte there, which Tessera does not copy.
@@ -111,6 +118,8 @@ impl State {
     pub(crate) fn restore_cursor(&mut self) {
         self.grid.restore_cursor();
         self.restore_charsets(usize::from(self.grid.is_alt_screen()));
+        // The saved pen may protect (DECSCA 1 or SPA before the save).
+        self.note_pen();
     }
 
     /// Restores the sets saved in `slot`; without a save, as xterm, the
@@ -148,6 +157,10 @@ impl State {
         // Every colour a program set (OSC 4, 10, 11, 12) goes; the theme
         // stays (ADR 0024: xterm keeps the dynamic colours here).
         self.colors.reset_all();
+        // Protection off, and no protected cell is left anywhere: the
+        // screens and the scrollback are gone (ADR 0034).
+        self.protection = Protection::Off;
+        self.unprotected_screens = [true; 2];
     }
 
     /// DECALN: resets the scroll region and the left and right margins

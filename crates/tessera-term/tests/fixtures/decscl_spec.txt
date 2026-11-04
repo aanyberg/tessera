@@ -552,7 +552,7 @@ step: feed ab\x1b[2;3r\x1b[?6h\x1b[31m\x1b[4h\x1b[?25lcd
 step: feed \x1b[62:1"p\x1b[62"q\x1b[62$p\x1b[62'p\x1b[?62"p\x1b[62""p\x1b[62 p
 step: feed \x1b[1;1HX
 flags: negative
-cite: [XT] `"` + `q` is DECSCA (#95), `$ p` DECRQM, `' p`, `? "` and `""` reach other or no cases; colon sub-parameters: ADR 0020 (xterm takes them only in SGR and XTMODKEYS)
+cite: [XT] `"` + `q` is DECSCA (#95: `62"q` selects DEC protection mode and leaves the pen's protection, harmless here; protect_spec.txt M07), `$ p` DECRQM, `' p`, `? "` and `""` reach other or no cases; colon sub-parameters: ADR 0020 (xterm takes them only in SGR and XTMODKEYS)
 note: None of these is DECSCL: the RESET02 state survives and the level stays 4. (DECRQM's reply is #10; nothing is answered today.)
 screen:
 >ab
