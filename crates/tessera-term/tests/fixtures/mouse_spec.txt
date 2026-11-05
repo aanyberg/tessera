@@ -1465,7 +1465,7 @@ note: Q1: motion beyond column 223 is not reported in the default encoding (1b 5
 
 ### D21
 generated: flood
-note: 100,000 motion events alternating between cells (0,0) and (1,0) give 100,000 reports; 100,000 inside one cell give 1. Checked by the routing test `a_flood_of_motion_reports_only_cell_changes`
+note: 200,000 any-motion events: 100,000 across 10 cells, 10,000 in each, give 10 reports (one per cell); 100,000 alternating between cells (0,0) and (1,0) give 100,000. Checked by the routing test `every_routing_row` (its `flood`)
 
 ### D22
 step: feed \e[?1003h\e[?1006h
@@ -1632,3 +1632,42 @@ step: feed \e F
 step: release left 0,0 -> C
 written: \x9b<0;1;1M\e[<0;1;1m
 note: #96: S7C1T (ESC SP F) returns to 7-bit reports; the mode is read when each report is sent
+
+### G08
+step: feed \e[?1003h\e[?1006h
+step: press left 1,0 -> C
+step: motion left 2,0 -> C
+step: release left 3,0 -> C
+step: motion none 3,0 -> I
+step: motion none 4,0 -> C
+written: \e[<0;2;1M\e[<32;3;1M\e[<0;4;1m\e[<35;5;1M
+note: #194.1 (ADR 0027: every report moves the motion baseline): the release at 3,0 is the last report, so motion in its
+note: cell is suppressed and motion out of it reports
+
+### G09
+size: 5x10
+step: feed \e[?1000h\e[?1006h
+step: wheel 1 50,20 -> C
+step: wheel -1 9,4 -> C
+written: \e[<64;10;5M\e[<65;10;5M
+note: #194.2: the wheel's cell is clamped to the grid (10 columns, 5 rows) as a mouse event's is (Q11, ADR 0027), so
+note: both reports name the bottom-right cell
+
+### G10
+step: feed \e[?1003h\e[?1006h
+step: motion none 3,4 -> C
+step: feed \e[?1016h
+step: motion none 0,0 px 3,4 -> C
+step: motion none 0,0 px 3,4 -> I
+written: 2x \e[<35;4;5M
+note: #194.3: after 1006 -> 1016 the baseline is a cell, the motion a pixel: never the same position, so the motion
+note: reports although its bytes equal the last report's (no view: no padding, unknown cell size)
+
+### G11
+step: feed \e[?1003h\e[?1016h
+step: motion none 0,0 px 3,4 -> C
+step: feed \e[?1006h
+step: motion none 3,4 px 0,0 -> C
+step: motion none 3,4 px 9,9 -> I
+written: 2x \e[<35;4;5M
+note: #194.3: 1016 -> 1006, the same the other way round; then 1006 dedupes per cell again, whatever the pixel

@@ -636,8 +636,9 @@ impl App {
     /// does not fit in what is left of [`session::PENDING_INPUT_BYTES`]
     /// (kind [`io::ErrorKind::WouldBlock`]); nothing of it is queued then
     /// (the focus state and the last mouse event are recorded all the
-    /// same, but a refused mouse report changes no report state: its
-    /// button is not held).
+    /// same; a refused press or motion changes no report state, so its
+    /// button is not held, and a refused release still forgets its
+    /// button, so later motion is no drag).
     pub fn send_input(&self, id: SessionId, event: InputEvent) -> Result<InputOutcome> {
         let session = self.session(id)?;
         let write_error = |source| Error::Write { id, source };
@@ -686,11 +687,18 @@ impl App {
     }
 
     /// [`App::send_input`] for [`InputEvent::Mouse`].
+    ///
+    /// Locks, one after the other: the terminal (the modes and the grid
+    /// size), the view table in SGR-pixels mode only (the padding), then
+    /// the input state once, for recording the event, reading the report
+    /// state, queueing the report and storing the state it leads to
+    /// ([`Session::report_mouse`]), so two threads sending to one session
+    /// never lose each other's held buttons (#194.11).
     fn send_mouse(
         &self,
         id: SessionId,
         session: &Session,
-        mouse: MouseEvent,
+        mut mouse: MouseEvent,
     ) -> Result<InputOutcome> {
         // One look at the terminal, released before anything is
         // queued.
@@ -704,7 +712,8 @@ impl App {
                 term.grid().cols(),
             )
         });
-        let mouse = session.record_mouse(mouse, rows, cols);
+        mouse.col = mouse.col.min(cols.saturating_sub(1));
+        mouse.row = mouse.row.min(rows.saturating_sub(1));
         let pixels = if encoding == MouseEncoding::SgrPixels {
             self.text_area_pixels(id, mouse.x_px, mouse.y_px, rows, cols)
         } else {
@@ -716,11 +725,21 @@ impl App {
             eight_bit,
             pixels,
         };
-        let route = mouse::route_mouse(session.mouse_reports(), &mouse, &mode);
-        Self::queue_mouse_route(session, id, route)
+        Self::report_outcome(
+            id,
+            session.report_mouse(Some(mouse), |state| {
+                mouse::route_mouse(state, &mouse, &mode)
+            }),
+        )
     }
 
     /// [`App::send_input`] for [`InputEvent::Scroll`].
+    ///
+    /// A wheel report locks, one after the other: the terminal once; in
+    /// SGR-pixels mode the input state once for the last pointer and the
+    /// view table once for its pixel; the input state once for the whole
+    /// lines; then the input state once for reading, queueing and storing
+    /// the report state, as [`App::send_input`] for a mouse event does.
     fn send_scroll(
         &self,
         id: SessionId,
@@ -766,14 +785,13 @@ impl App {
                     pixels,
                 };
                 let lines = session.take_scroll_lines(scroll.delta_lines, rows);
-                let route = mouse::route_wheel(
-                    session.mouse_reports(),
-                    lines,
-                    cell,
-                    scroll.modifiers,
-                    &mode,
+                let modifiers = scroll.modifiers;
+                return Self::report_outcome(
+                    id,
+                    session.report_mouse(None, |state| {
+                        mouse::route_wheel(state, lines, cell, modifiers, &mode)
+                    }),
                 );
-                return Self::queue_mouse_route(session, id, route);
             }
             // Shift: the scrollback, or the alternate-scroll keys.
         }
@@ -795,26 +813,13 @@ impl App {
         Ok(InputOutcome::Consumed)
     }
 
-    /// Queues what [`mouse::route_mouse`] or [`mouse::route_wheel`] decided
-    /// and keeps the report state it leads to; a report that cannot be
-    /// queued leaves the state as it was.
-    fn queue_mouse_route(
-        session: &Session,
-        id: SessionId,
-        route: mouse::Route,
-    ) -> Result<InputOutcome> {
-        match route {
-            mouse::Route::Report { bytes, next } => {
-                session
-                    .queue_input(bytes)
-                    .map_err(|source| Error::Write { id, source })?;
-                session.set_mouse_reports(next);
-                Ok(InputOutcome::Consumed)
-            }
-            mouse::Route::Ignore { next } => {
-                session.set_mouse_reports(next);
-                Ok(InputOutcome::Ignored)
-            }
+    /// The outcome of [`Session::report_mouse`] for session `id`: consumed
+    /// when a report was queued.
+    fn report_outcome(id: SessionId, reported: io::Result<bool>) -> Result<InputOutcome> {
+        match reported {
+            Ok(true) => Ok(InputOutcome::Consumed),
+            Ok(false) => Ok(InputOutcome::Ignored),
+            Err(source) => Err(Error::Write { id, source }),
         }
     }
 

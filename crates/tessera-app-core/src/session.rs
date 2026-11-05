@@ -72,6 +72,13 @@
 //!   `Session::with_viewport`), so no re-wrap falls between reading the
 //!   history and reading or storing a position against it (#175, #231).
 //!   Nothing takes the terminal lock while holding the input lock.
+//! - A mouse or wheel event queues its report while it holds the input
+//!   lock, so the report state it read is the one it stores
+//!   (`Session::report_mouse`, #194.11): the input lock, then the PTY lock
+//!   (the exit check) and the outbox lock, one after the other. The PTY
+//!   and outbox locks are leaves: nothing is locked while either is held,
+//!   except by a close's delivery-lock holder above, which never takes
+//!   the input lock.
 //! - Applying a cursor default reads the `App`'s configuration
 //!   (`Applied`) under the terminal lock (`Live::apply`, `App::attach`;
 //!   #168). Nothing takes a terminal lock while holding `Applied`.
@@ -1229,25 +1236,55 @@ impl Session {
         input.scroll_remainder = 0.0;
     }
 
-    /// Clamps `event`'s cell to a grid of `rows` by `cols`, records it as
-    /// the last mouse event and returns it as recorded.
-    pub(crate) fn record_mouse(&self, mut event: MouseEvent, rows: u16, cols: u16) -> MouseEvent {
-        event.col = event.col.min(cols.saturating_sub(1));
-        event.row = event.row.min(rows.saturating_sub(1));
-        lock(&self.input).last_mouse = Some(event);
-        event
+    /// Records `event` (its cell already clamped to the grid) as the last
+    /// mouse event, if there is one, then routes one mouse or wheel event
+    /// and queues its report, all under one hold of the input lock
+    /// (#194.11): `route` decides from the mouse report state (#12), the
+    /// report is queued as [`Session::queue_input`] queues it, and the
+    /// state `route` chose is stored, its `refused` state when the report
+    /// could not be queued. Two threads routing events for one session
+    /// therefore never store over each other's held buttons.
+    ///
+    /// Returns whether a report was queued; the error is
+    /// [`Session::queue_input`]'s. `route` must not lock anything: queueing
+    /// takes the PTY and outbox locks under the input lock, and neither is
+    /// held while the input lock is taken (see the module documentation).
+    pub(crate) fn report_mouse(
+        &self,
+        event: Option<MouseEvent>,
+        route: impl FnOnce(mouse::ReportState) -> mouse::Route,
+    ) -> io::Result<bool> {
+        let mut input = lock(&self.input);
+        if event.is_some() {
+            input.last_mouse = event;
+        }
+        match route(input.mouse_reports) {
+            mouse::Route::Report {
+                bytes,
+                next,
+                refused,
+            } => match self.queue_input(bytes) {
+                Ok(()) => {
+                    input.mouse_reports = next;
+                    Ok(true)
+                }
+                Err(err) => {
+                    input.mouse_reports = refused;
+                    Err(err)
+                }
+            },
+            mouse::Route::Ignore { next } => {
+                input.mouse_reports = next;
+                Ok(false)
+            }
+        }
     }
 
     /// The mouse report state (#12): buttons the program saw go down and
     /// where the last report was.
+    #[cfg(test)]
     pub(crate) fn mouse_reports(&self) -> mouse::ReportState {
         lock(&self.input).mouse_reports
-    }
-
-    /// Replaces the mouse report state once a report was queued (or none
-    /// was due).
-    pub(crate) fn set_mouse_reports(&self, state: mouse::ReportState) {
-        lock(&self.input).mouse_reports = state;
     }
 
     /// The last mouse event recorded, if any.

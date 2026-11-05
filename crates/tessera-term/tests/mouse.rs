@@ -29,7 +29,7 @@ const FIXTURE_NAME: &str = "fixtures/mouse_spec.txt";
 /// Encoder rows in the fixture.
 const ENCODER_ROWS: usize = 141;
 /// Routing rows in the fixture (checked by `tessera-app-core`).
-const ROUTING_ROWS: usize = 39;
+const ROUTING_ROWS: usize = 43;
 
 /// One encoder row.
 #[derive(Debug)]
@@ -410,6 +410,41 @@ proptest! {
             ),
             _ => {}
         }
+    }
+
+    /// The SGR and urxvt digits, written without the formatter (#194.10),
+    /// are exactly what `format!` writes, over the whole coordinate range.
+    #[test]
+    fn sgr_and_urxvt_digits_match_the_formatter(
+        report in any_report(),
+        col in any::<u32>(),
+        row in any::<u32>(),
+        x in any::<u32>(),
+        y in any::<u32>(),
+        encoding in prop::sample::select(vec![
+            MouseEncoding::Sgr,
+            MouseEncoding::SgrPixels,
+            MouseEncoding::Urxvt,
+        ]),
+    ) {
+        let mut report = report;
+        report.col = col;
+        report.row = row;
+        report.x_px = x;
+        report.y_px = y;
+        let Some(bytes) = encode_mouse(&report, MouseTracking::AnyMotion, encoding) else {
+            return Ok(());
+        };
+        let got = decode_report(&bytes, encoding);
+        let (x, y) = if encoding == MouseEncoding::SgrPixels { (x, y) } else { (col, row) };
+        prop_assert_eq!((got.x, got.y), (x.saturating_add(1), y.saturating_add(1)));
+        let want = if encoding == MouseEncoding::Urxvt {
+            format!("\x1b[{};{};{}M", got.code + 32, got.x, got.y)
+        } else {
+            let last = if got.sgr_release { 'm' } else { 'M' };
+            format!("\x1b[<{};{};{}{last}", got.code, got.x, got.y)
+        };
+        prop_assert_eq!(String::from_utf8_lossy(&bytes), want);
     }
 
     /// A press, motion or wheel event the legacy encodings cannot express is
