@@ -8,7 +8,10 @@ import XCTest
 @MainActor
 final class ClipboardTests: XCTestCase {
     func testOSC52WriteReachesTheInjectedPasteboard() async throws {
-        let pasteboard = NSPasteboard(name: NSPasteboard.Name("com.aanyberg.TesseraTests.clipboard"))
+        // A name of its own: a fixed one is shared by every test run on the
+        // machine.
+        let pasteboard = NSPasteboard(
+            name: NSPasteboard.Name("com.aanyberg.TesseraTests.clipboard.\(UUID().uuidString)"))
         defer { pasteboard.releaseGlobally() }
         // Older content of another type must go: the write replaces it all.
         pasteboard.clearContents()

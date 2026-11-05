@@ -141,15 +141,17 @@ path is added.
   has passed, so the pasteboard ends with the last write any program made.
   When the session that made the held write closes (a clean exit closes its
   tab), the write is made at once: at most one extra write per closing
-  session. A held write from another session is unaffected. Two writes are
-  dropped, and the pasteboard keeps what was written before: one that
-  reaches the bridge after its session closed (its delivery was still queued
-  when the tab closed), and the one held when the application shuts down.
-  With `clipboard_write` switched off live, up to 2 writes (the held write,
-  and one the core delivers before it applies the new configuration) can
-  still reach the pasteboard within about 115 ms of the edit. Without the
-  throttle a `printf` loop made about 8 700 pasteboard writes a second, each
-  bumping `NSPasteboard.changeCount`, which clipboard-history apps record.
+  session. A held write from another session is unaffected. Two kinds of
+  write are dropped, and the pasteboard keeps what was written before: a
+  write that reaches the bridge after its session closed (its delivery was
+  still queued when the tab closed), and the write held when the
+  application shuts down. With `clipboard_write` switched off live, up to 2
+  writes (one the core delivers before it applies the new configuration,
+  then the held write) can still reach the pasteboard within about 200 ms
+  of the edit: the configuration watcher's 100 ms debounce, then the held
+  write's 100 ms interval. Without the throttle a `printf` loop made about
+  8 700 pasteboard writes a second, each bumping `NSPasteboard.changeCount`,
+  which clipboard-history apps record.
   It is in the frontend (`CallbackBridge`, one per `TesseraApp`) because the
   cost is the pasteboard write and there is one pasteboard per application:
   the bridge is where every session's writes meet. The core already bounds

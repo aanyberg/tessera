@@ -11,10 +11,10 @@
 /// passed. So the pasteboard ends up with the last write any program made:
 /// a session that closes with its write held has it written at the close
 /// (``takeHeld(from:at:)``), at most one extra write per closing session.
-/// Two are dropped instead, and the pasteboard keeps what was written
-/// before: a write that reaches ``CallbackBridge`` after its session closed
-/// (its delivery was still queued when the tab closed), and the write held
-/// at shutdown.
+/// Two kinds of write are dropped instead, and the pasteboard keeps what
+/// was written before: a write that reaches ``CallbackBridge`` after its
+/// session closed (its delivery was still queued when the tab closed), and
+/// the write held at shutdown.
 ///
 /// Memory: the held write is one string, at most the core's 1 MiB OSC 52
 /// payload cap (ADR 0022).
