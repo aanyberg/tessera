@@ -639,6 +639,17 @@ mod tests {
         assert_eq!(translated(&mut charsets, "\u{ff}"), "\u{ff}");
     }
 
+    /// With DECNRCM a Latin-1 GR folds `U+00FF` onto DEL like any other
+    /// set, but only the seven-bit ones drop it (xterm `isSevenBit`).
+    #[test]
+    fn only_a_seven_bit_set_drops_the_del_decnrcm_makes_of_u00ff() {
+        let mut charsets = Charsets::default();
+        charsets.designate(2, Set::Latin1);
+        assert_eq!(charsets.translate('\u{ff}', true, 4), Some('\u{ff}'));
+        charsets.designate(2, Set::British);
+        assert_eq!(charsets.translate('\u{ff}', true, 4), None);
+    }
+
     #[test]
     fn nothing_above_u00ff_is_translated_but_it_still_takes_a_single_shift() {
         let mut charsets = Charsets::default();
@@ -681,7 +692,12 @@ mod tests {
         // `<` is DEC Supplemental at level 2, the user-preferred set (ISO
         // Latin-1) after.
         assert_eq!(set(2, false, b"(", b'<'), Some((0, Set::DecSupplemental)));
+        assert_eq!(set(3, false, b"(", b'<'), Some((0, Set::Latin1)));
         assert_eq!(set(4, false, b"(", b'<'), Some((0, Set::Latin1)));
+        // From level 5 the user-preferred set is ASCII in UTF-8 mode
+        // (xterm's HandleUPSS keeps `gsets_upss`), with DECNRCM or not.
+        assert_eq!(set(5, false, b"(", b'<'), Some((0, Set::Ascii)));
+        assert_eq!(set(5, true, b"(", b'<'), Some((0, Set::Ascii)));
         // 96-sets.
         assert_eq!(set(4, false, b"-", b'A'), Some((1, Set::Latin1)));
         assert_eq!(set(4, true, b"/", b'A'), Some((3, Set::British)));

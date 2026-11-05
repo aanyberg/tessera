@@ -872,7 +872,7 @@ scrollback: len=0
 # -- end of cases
 
 #> Rows to add with the state they need (not #8):
-#>   SCS "ESC ( 0" (line drawing) + SO, DECSTR, print 'q' -> literal 'q'                  [XT resetCharsets; #112]
 #>   DECSCUSR `CSI 4 SP q` (steady underline), DECSTR -> default cursor shape and blink    [XT ReallyReset soft; #113]
 #>   OSC 4 ; 1 ; rgb:00/ff/00 (palette 1 = green), DECSTR -> palette 1 back to the theme   [XT ResetAnsiColorRequest; #9]
+#  (#112: SCS + SO, then DECSTR -> G0..G3 ASCII and GL = G0, is charset_spec.txt RS01; GR and LS1R are RS05.)
 #  (#97: DECLRMM on + DECSLRM, then DECSTR -> margins full, mode off, is margins_spec.txt RS09; reverse wrap RS-rows there.)

@@ -24,7 +24,7 @@ const FIXTURE: &str = include_str!("fixtures/charset_spec.txt");
 const FIXTURE_NAME: &str = "fixtures/charset_spec.txt";
 
 /// `###` rows in the fixture, so a row lost from it cannot pass silently.
-const ROWS: usize = 123;
+const ROWS: usize = 132;
 
 /// How the feed steps of a case reach [`Terminal::advance`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

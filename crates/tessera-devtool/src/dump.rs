@@ -88,6 +88,9 @@ pub fn ansi(grid: &Grid) -> String {
 /// cell is kept, including a space with a background colour, a foreground
 /// colour or attributes, so coloured areas survive. Spacers print nothing
 /// and clusters print their whole text. The cursor is never marked.
+/// Protection ([`Style::PROTECTED`]) is not written: SGR has no parameter
+/// for it, so a cell that differs from the previous one only in it
+/// continues the run.
 pub fn ansi_with(grid: &Grid, options: DumpOptions) -> String {
     let mut out = String::new();
     for (_, line) in rows(grid, options) {
@@ -101,9 +104,12 @@ pub fn ansi_with(grid: &Grid, options: DumpOptions) -> String {
             if cell.is_spacer() {
                 continue;
             }
-            if cell.style != current {
-                push_sgr(&mut out, cell.style);
-                current = cell.style;
+            // Protection (ADR 0034) is not a visual attribute and SGR
+            // cannot set it, so a change of it alone starts no new run.
+            let style = cell.style.without(Style::PROTECTED);
+            if style != current {
+                push_sgr(&mut out, style);
+                current = style;
             }
             out.push_str(&cell_text(line, col, cell));
         }
@@ -598,6 +604,24 @@ mod tests {
             "fg=default bg=default ul=default attrs=-"
         );
         assert_eq!(flag_names(&Cell::BLANK), "-");
+    }
+
+    /// Protection alone starts no SGR run: `a` and `b` share the bold
+    /// run though only `b` is protected, and the protected `x` and the
+    /// plain `c` share the default run.
+    #[test]
+    fn a_protection_only_change_starts_no_sgr_run() {
+        let mut grid = Grid::new(1, 8);
+        let bold = styled(Color::Default, Color::Default, Style::BOLD);
+        grid.set_pen(bold);
+        grid.put_str("a");
+        grid.set_pen(bold.with(Style::PROTECTED));
+        grid.put_str("b");
+        grid.set_pen(Style::DEFAULT.with(Style::PROTECTED));
+        grid.put_str("x");
+        grid.set_pen(Style::DEFAULT);
+        grid.put_str("c");
+        assert_eq!(ansi(&grid), "\x1b[0;1mab\x1b[0mxc\x1b[0m\n");
     }
 
     /// The column a wrapped wide character leaves is padding: the ANSI

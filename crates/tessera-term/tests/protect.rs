@@ -656,39 +656,76 @@ mod properties {
             }
             term.grid().check_invariants();
         }
+    }
 
-        /// The same for ISO mode and ED 2, EL 2 and ECH, for histories
-        /// that end in ISO mode: EPA (which does not reset the flag) stops
-        /// the pen protecting, and the erase keeps exactly the protected
-        /// cells it covers.
-        #[test]
-        fn iso_erases_after_any_history_keep_every_protected_cell(
-            ops in prop::collection::vec(op(), 1..30),
-            erase in prop::sample::select(ISO_ERASES),
-        ) {
-            let mut term = Terminal::new(4, 8);
-            for op in &ops {
-                match op {
-                    Op::Feed(bytes) => term.advance(bytes),
-                    Op::Resize(rows, cols) => term.resize(*rows, *cols),
-                }
+    /// Generated histories that run [`iso_erase_keeps_every_protected_cell`],
+    /// and the share of them that must end in ISO mode (at least 1 in 2).
+    const ISO_CASES: u32 = 1024;
+
+    /// The ISO-mode half of the DECSED property: for a history that ends
+    /// in ISO mode, EPA (which does not reset the flag) stops the pen
+    /// protecting, and ED 2, EL 2 or ECH keep exactly the protected cells
+    /// they cover. Returns whether the history ended in ISO mode (the
+    /// others check nothing here: the DECSED property covers DEC mode).
+    fn iso_erase_keeps_every_protected_cell(
+        ops: &[Op],
+        spa_last: bool,
+        erase: &[u8],
+    ) -> Result<bool, TestCaseError> {
+        let mut term = Terminal::new(4, 8);
+        for op in ops {
+            match op {
+                Op::Feed(bytes) => term.advance(bytes),
+                Op::Resize(rows, cols) => term.resize(*rows, *cols),
             }
-            // About one history in seven ends in ISO mode; the others
-            // check nothing here (the DECSED property covers DEC mode).
-            if term.protection_mode() != "iso" {
-                return Ok(());
-            }
-            term.advance(b"\x1bW");
-            let before: Vec<_> = protected(&term)
-                .into_iter()
-                .filter(|&(r, _, _)| erase == b"\x1b[2J" || r == 0)
-                .collect();
-            term.advance(erase);
-            let after: Vec<_> = protected(&term)
-                .into_iter()
-                .filter(|&(r, _, _)| erase == b"\x1b[2J" || r == 0)
-                .collect();
-            prop_assert_eq!(after, before);
         }
+        // A trailing SPA switches to ISO mode without printing a cell, so
+        // the screen and the flag are still the ones the history left.
+        if spa_last {
+            term.advance(b"\x1bV");
+        }
+        if term.protection_mode() != "iso" {
+            return Ok(false);
+        }
+        term.advance(b"\x1bW");
+        let covered = |term: &Terminal| -> Vec<_> {
+            protected(term)
+                .into_iter()
+                .filter(|&(r, _, _)| erase == b"\x1b[2J" || r == 0)
+                .collect()
+        };
+        let before = covered(&term);
+        term.advance(erase);
+        prop_assert_eq!(covered(&term), before);
+        Ok(true)
+    }
+
+    /// [`iso_erase_keeps_every_protected_cell`] over [`ISO_CASES`]
+    /// histories, of which at least half must reach ISO mode (#257: a
+    /// history ends in ISO mode by itself only about once in seven, so
+    /// three in four end with an SPA).
+    #[test]
+    fn iso_erases_after_any_history_keep_every_protected_cell() {
+        let strategy = (
+            prop::collection::vec(op(), 1..30),
+            prop::bool::weighted(0.75),
+            prop::sample::select(ISO_ERASES),
+        );
+        let iso = std::cell::Cell::new(0u32);
+        let mut runner =
+            proptest::test_runner::TestRunner::new(ProptestConfig::with_cases(ISO_CASES));
+        runner
+            .run(&strategy, |(ops, spa_last, erase)| {
+                if iso_erase_keeps_every_protected_cell(&ops, spa_last, erase)? {
+                    iso.set(iso.get() + 1);
+                }
+                Ok(())
+            })
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        assert!(
+            iso.get() * 2 >= ISO_CASES,
+            "only {} of {ISO_CASES} histories reached ISO mode",
+            iso.get()
+        );
     }
 }

@@ -79,8 +79,8 @@ impl State {
             // swallows the next byte there, which Tessera does not copy.
             ([b' '], b'F') if self.conformance_level >= 2 => self.c1_8bit_replies = false,
             ([b' '], b'G') if self.conformance_level >= 2 => self.c1_8bit_replies = true,
-            // Locking and single shifts, VT220 and up (xterm: `ansi_level >
-            // 2`, `vtXX_level > 1`).
+            // Locking and single shifts, VT220 and up
+            // (xterm: `ansi_level > 2`, `vtXX_level > 1`).
             ([], b'n') if self.conformance_level >= 2 => self.charsets.shift_left(2),
             ([], b'o') if self.conformance_level >= 2 => self.charsets.shift_left(3),
             ([], b'~') if self.conformance_level >= 2 => self.charsets.shift_right(1),
@@ -132,15 +132,14 @@ impl State {
     }
 
     /// RIS: the grid's reset plus what xterm also resets: the scrollback,
-    /// the character sets and every mode (see the `modes` module: all to their defaults, both
-    /// kitty keyboard stacks emptied, 132-column mode left with a request for
-    /// 80 columns) and replies back to 7-bit C1 controls (xterm's
-    /// `show_8bit_control(False)`), and every colour a program set (OSC 4,
-    /// 10, 11, 12; xterm would keep 10 to 12). The DECSCL conformance level
-    /// and the theme's colours are kept: xterm sets the level only at
-    /// start-up.
-    /// DECSTR (`CSI ! p`) is the soft variant that keeps the screen, see
-    /// the crate documentation.
+    /// the character sets and every mode (see the `modes` module: all to
+    /// their defaults, both kitty keyboard stacks emptied, 132-column mode
+    /// left with a request for 80 columns) and replies back to 7-bit C1
+    /// controls (xterm's `show_8bit_control(False)`), and every colour a
+    /// program set (OSC 4, 10, 11, 12; xterm would keep 10 to 12). The
+    /// DECSCL conformance level and the theme's colours are kept: xterm sets
+    /// the level only at start-up. DECSTR (`CSI ! p`) is the soft variant
+    /// that keeps the screen, see the crate documentation.
     fn reset(&mut self) {
         self.grid.reset();
         self.grid.clear_scrollback();
@@ -150,8 +149,9 @@ impl State {
         self.drop_cursor_overrides();
         self.c1_8bit_replies = false;
         // The sets are the default, and so is the primary screen's saved
-        // copy (xterm saves the cursor at the end of a full reset); the
-        // alternate screen's slot has never been saved to.
+        // copy (xterm saves the cursor at the end of a full reset). The
+        // alternate screen's slot is cleared, as the grid clears that
+        // screen's saved cursor; xterm keeps it (ADR 0033, row SC18).
         self.charsets.reset();
         self.saved_charsets = [Some(Charsets::default().saved()), None];
         // Every colour a program set (OSC 4, 10, 11, 12) goes; the theme

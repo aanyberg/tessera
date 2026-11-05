@@ -66,6 +66,21 @@ changes `ì` to `┌` because G2 is GR. REP repeats the character as printed
 (translated), through the same cell check as before. DEC Special Graphics
 `_` (0x5F) prints a space (xterm stores code 0).
 
+**REP after a single shift deviates from xterm (#223).** xterm's
+`CASE_REP` keeps the raw character (`sp->lastchar`, stored before any
+translation) and translates each repeat again through the current GL; the
+single shift is already used up by then (`WriteNow` clears `curss`). So
+right after SS2 or SS3 the two differ: `ESC * 0 ESC N l ESC [ 2 b` prints
+`┌ll` in xterm and `┌┌┌` here, and `ESC ( 0 ESC * B ESC N l ESC [ 2 b`
+prints `l┌┌` in xterm and `lll` here (rows SC15 and SC16). Without a single
+shift they agree, because the raw character through GL is the translated
+one (rows PR03 and SC17). GNOME VTE matches neither: it stores the
+unmapped character (`c_unmapped`) and maps it again on REP, as xterm
+does, but its SS2 and SS3 do nothing (`#if 0`), so it shows `lll` for
+SC15 and `┌┌┌` for SC16. Following xterm would mean keeping the raw character on the print
+path (`State::print`, the hot path) for a case that needs a single shift
+immediately before REP, which no known program sends.
+
 **UTF-8 and NRCS.** xterm's `modified_DECNRCM` turns its UTF-8 decoder off
 while DECNRCM is on, so GR then sees raw bytes and the NRCS tables'
 Unicode-only entries (Dutch ij and florin) only apply in that mode.
@@ -94,9 +109,20 @@ entry and exit of 1049 are the same operations. The saved sets live in
 nothing of character sets.
 
 **Resets.** RIS: sets, GL, GR, the single shift, DECNRCM and the primary
-screen's saved copy to defaults. DECSTR and DECSCL: the sets, GL, GR, the
-single shift and the active screen's saved copy to defaults; DECNRCM is
-kept, as xterm (DEC's table 5-9 resets it). A pending single shift
+screen's saved copy to defaults, and the alternate screen's saved copy
+cleared (as the grid clears that screen's saved cursor). DECSTR and DECSCL:
+the sets, GL, GR, the single shift and the active screen's saved copy to
+defaults; DECNRCM is kept, as xterm (DEC's table 5-9 resets it).
+
+**RIS and the alternate screen's slot deviate from xterm (#223).** xterm's
+full reset (`ReallyReset`) leaves the alternate screen (`FromAlternate`)
+before `CursorSave`, so it writes only the primary slot (`sc[0]`) and never
+clears `sc[1]`: after `ESC [ ? 1047 h ESC ( 0 ESC 7 ESC c ESC [ ? 1047 h ESC 8`
+xterm restores G0 = DEC Special Graphics (and the slot's cursor position
+and attributes), while Tessera finds nothing saved and resets the sets
+(row SC18; SC19 is the same stream without the RIS). A saved state that
+outlives a hard reset is an accident of xterm's code, not specified
+anywhere, and clearing it is the safer reset. A pending single shift
 survives control characters and other escape sequences until the next
 printed character, as in xterm (`WriteNow`).
 
@@ -137,3 +163,9 @@ encode DA1 changed with it.
   Latin-1 text with G2 designated would then differ from xterm.
 - *Reset DECNRCM on DECSTR* (DEC table 5-9): safer for `reset(1)` after a
   program that left NRC mode on, but not xterm's behaviour. RIS clears it.
+- *REP through GL again, as xterm*: needs the raw character beside
+  `last_printed` on every printed character; rejected for the hot path
+  (above).
+- *Keep the alternate screen's saved slot across RIS, as xterm*: would
+  also mean keeping the grid's saved cursor for that screen; rejected
+  (above).

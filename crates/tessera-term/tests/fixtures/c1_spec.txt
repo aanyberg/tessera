@@ -500,15 +500,25 @@ reply: \x9b?64;6;9;21;22c
 source: esctest2 esctest/tests/decid.py test_DECID_8bit (S8C1T, DECID as 0x9A, ReadCSI("c", prefix "?"))
 cite: [XT] 9a = CASE_DECID (ECMA-48 has SCI there; xterm wins, A7)
 
-### C16_ss2_ss3_have_no_effect_yet
+### C16_8bit_ss2_ss3_shift_one_character
 size: 3x10
-step: feed \e G\x8e\x8fA
+step: feed \e G\x1b*0\x1b+0\x8el\x8fq
 screen:
->A |
+>┌─ |
 >
 >
-cursor: (0,1)
-cite: ESC N / ESC O are ignored until #112; the C1 forms must not print
+cursor: (0,2)
+cite: [XT] 8e = CASE_SS2, 8f = CASE_SS3 (curss = 2 / 3, used by the next printed character in WriteNow); rule P makes them ESC N / ESC O (#112, ADR 0033). G2 and G3 are DEC Special Graphics, so l and q print as line drawing; C16c is the control
+
+### C16c_8bit_ss2_ss3_with_ascii_g2_g3_print_ascii
+size: 3x10
+step: feed \e G\x8el\x8fq
+screen:
+>lq |
+>
+>
+cursor: (0,2)
+cite: control for C16: the same shifts with G2 and G3 left ASCII print l and q as themselves, and neither C1 byte prints
 
 ### C17_spa_epa_act_as_esc_v_and_esc_w
 size: 3x10
