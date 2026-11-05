@@ -310,8 +310,9 @@ pub struct Overlay { pub kind: OverlayKind, pub row: u16, pub cols: Range<u16> }
   row in between whole (over all grid columns, also past a short row's
   last cell; never into the padding), and the last row up to the later
   point's cell, inclusive. The grid's columns are the frame's longest
-  row, at most the visible columns (#124). Wrapped rows are just consecutive rows; the renderer needs no
-  wrap flags. **Block**: columns `min..=max` on rows `min..=max`.
+  row, at most the visible columns (#124). Wrapped rows are just
+  consecutive rows; the renderer needs no wrap flags. **Block**: columns
+  `min..=max` on rows `min..=max`.
 - A span (selection or overlay) that starts on the spacer of a wide
   character, or ends on its wide half, is widened to the whole character.
   Anything outside the frame (past the grid's last column) is clipped;
@@ -463,8 +464,9 @@ the same pixels) against main, which takes the selection as data only.
 The bars (1.03 without highlights, 1.25 with a full-screen selection)
 hold on every line. `box_drawing` at 24x80, the cheapest frame per cell,
 depends most on the method: 1.009 with 100 and 400 frames here, and
-1.012 to 1.026 in the review's own runs with other frame counts. `sgr_heavy`'s pixels differ by design: main drew its
-curly underline as a straight bar. The first version cost 1.05x on
+1.012 to 1.026 in the review's own runs with other frame counts.
+`sgr_heavy`'s pixels differ by design: main drew its curly underline as a
+straight bar. The first version cost 1.05x on
 `box_drawing`, whose frames are cheap per cell, about 55 instructions per
 cell on every line: the decoration pass ran its run bookkeeping over every
 cell of rows without any decoration. It now skips such rows after one
@@ -495,10 +497,10 @@ Cell backgrounds (SGR) are unchanged: they only ever covered cells.
 `selection_linear.png` changed in 480 pixels: x = 392 to 399 on rows 0
 and 1 (y = 8 to 67), the right padding beside the first row's tail and
 the wrapped middle row, which were the selection colour and are now the
-background. No other golden changed. `highlights_stop_at_the_grids_last_column`
-(golden.rs) checks every pixel of a row across the target for linear and
-block selections and both match kinds, with padding and 5 leftover
-pixels.
+background. No other golden changed.
+`highlights_stop_at_the_grids_last_column` (golden.rs) checks every pixel
+of a row across the target for linear and block selections and both match
+kinds, with padding and 5 leftover pixels.
 
 ### A cursor on a cut wide character's spacer
 
@@ -546,3 +548,77 @@ rows' lengths per frame, and only while something is highlighted.
 per-frame ratio is the noisiest; its 300-frame whole-process ratios are
 0.990 and 0.999.
 
+
+## Amendment: #246 and #247 (2026-11-05)
+
+### The highlight width rule in the public docs (#246)
+
+`Selection`, `Overlay` and `FrameInput::rows` now say what the #124
+amendment decided: highlights stop at the frame's longest *visible* row
+(rows past the target's bottom do not count), so producers pass every row
+at the grid's width. `rows_past_the_bottom_do_not_widen_highlights`
+(overlay.rs) pins that the overlay pass measures only the visible rows; it
+fails when `grid_cols` is handed all of `FrameInput::rows`.
+
+### The cursor's draw covers its instances, not its slot (#247)
+
+The cursor pass's draw range is the cursor's instances, no longer its
+whole slot. The slot is roomy (at least 16 instances, the rest `EMPTY`),
+so until #247 every frame drew it even with no cursor, and a frame with
+nothing else to draw still issued one draw of zero-sized quads. A fresh
+renderer, whose first layout is empty, issued none for the same frame.
+
+That mattered for one reason, found by the #124 adversarial run: on
+Apple's Metal GPU (M4, macOS 26), a render pass that draws anything, even
+degenerate quads, stores a translucent sRGB clear colour differently from
+a pass that only clears. With the background `(0.816, 0.059, 0.933)` at
+alpha 0.42 the premultiplied green, 0.0247 linear, encodes to 43.55: 44
+from a clear-only pass, 43 from a pass with a draw. So a view whose rows
+went from some to none (a target smaller than its padding, after a scale
+change from 3 to 1.75) differed from a fresh view by one step of green in
+every pixel. The clear value itself is computed once
+(`Rgba::to_clear_color`) and was identical on both paths.
+
+Both paths now issue the same passes for the same frame: a frame with no
+visible row and no cursor draws nothing but the clear, and the
+fresh-versus-incremental comparisons stay bit-exact, with no tolerance.
+The draw loop skips empty ranges itself, so nothing depends on how a
+backend treats a zero-instance draw. Frames that draw anything are
+unchanged: all ten goldens render byte-identical to main's.
+`a_frame_without_rows_after_a_scale_change_matches_a_fresh_renderer`
+(damage.rs) fails on main; `the_cursor_draw_covers_only_its_instances`
+(renderer.rs) pins that a shown cursor is drawn, a hidden one issues no
+draw although its slot stays, and a frame without visible rows draws no
+pass.
+
+The clear-only versus drawing pass difference itself remains a property
+of the GPU: in a window, a frame without visible rows (only possible
+while the target is smaller than the padding) may show its translucent
+background one step off the padding of a frame with rows. Invisible, and
+not worth an extra draw per frame.
+
+### Measurements (#247)
+
+`cargo xtask ab` against main (`75a122e`), instructions retired, best of
+7 interleaved process pairs, Apple M4, load average 6 to 18; #124's
+`frame_build` cases (full frames of a 60x200 screen of the corpus line,
+Menlo 13 pt at 2x, GPU waited for after every frame), the per-frame cost
+the difference of 30 and 90 frames (100 and 300 for `box_drawing`). The
+checksums include the last frame's pixels, equal on both sides.
+
+| line | main per frame | head/main | full selection: main per frame | head/main |
+|---|---|---|---|---|
+| ascii | 89.42e6 | 0.995 | 89.20e6 | 1.000 |
+| latin_diacritics | 88.06e6 | 0.998 | 88.30e6 | 1.000 |
+| cjk | 243.09e6 | 1.000 | 242.87e6 | 1.000 |
+| box_drawing | 12.13e6 | 0.997 | 12.13e6 | 1.000 |
+| hebrew | 87.09e6 | 0.997 | 86.84e6 | 1.001 |
+| arabic | 163.69e6 | 1.001 | 163.90e6 | 0.999 |
+| punctuation | 66.18e6 | 1.002 | 66.22e6 | 1.001 |
+| braille | 68.77e6 | 1.000 | 68.77e6 | 0.998 |
+| emoji | 175.98e6 | 1.000 | 176.79e6 | 0.997 |
+| sgr_heavy | 74.50e6 | 0.999 | 74.46e6 | 0.996 |
+| combining_heavy | 131.99e6 | 0.999 | 132.05e6 | 0.999 |
+
+Every line is within noise of 1.00. Full selection on `punctuation` first
+read 1.023 from one inflated base run; 15 pairs gave 1.001.

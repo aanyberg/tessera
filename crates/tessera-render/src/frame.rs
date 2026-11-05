@@ -94,8 +94,11 @@ pub enum SelectionKind {
 /// part of a ligature never splits it. `start` and `end` may come in
 /// either order. A point on the [`tessera_grid::CellFlags::SPACER`] half
 /// of a wide character takes the whole character, and so does an end on
-/// its [`tessera_grid::CellFlags::WIDE`] half; rows and columns outside
-/// the frame are clipped.
+/// its [`tessera_grid::CellFlags::WIDE`] half. Rows outside the frame
+/// are clipped, and so are columns past its longest visible row (at most
+/// the visible columns): highlights stop at the grid's last column, never
+/// in the padding, so producers pass every row at the grid's width
+/// (ADR 0010, #124).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Selection {
     /// Where the selection starts (the anchor).
@@ -182,7 +185,8 @@ pub enum OverlayKind {
 /// draw their union, so a cell covered by several matches is highlighted
 /// once. Like the selection, a run starting on a wide character's spacer
 /// or ending on its first half takes the whole character, and anything
-/// outside the frame is clipped.
+/// outside the frame is clipped, columns past its longest visible row
+/// included (see [`Selection`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Overlay {
     /// What to draw.
@@ -210,7 +214,9 @@ impl Overlay {
 pub struct FrameInput<'a> {
     /// The visible rows, top to bottom. Rows may differ in length; cells
     /// past the target's right edge and rows past its bottom are not
-    /// drawn.
+    /// drawn. The longest visible row is the grid's width as far as
+    /// highlights go (they stop at its end), so pass every row at the
+    /// grid's width.
     pub rows: &'a [&'a [Cell]],
     /// The cursor, if the host shows one.
     pub cursor: Option<CursorState>,

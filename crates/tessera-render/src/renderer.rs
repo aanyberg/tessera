@@ -719,7 +719,15 @@ impl Renderer {
             overlay: self.slots.section(OVERLAY_PASS),
             glyph: self.slots.section(2),
             decoration: self.slots.section(3),
-            cursor: self.slots.cursor(),
+            // The cursor's own instances, not its whole slot: the rest is
+            // EMPTY, and a pass that draws even those stores a
+            // translucent clear one step off a pass that only clears
+            // (Metal, #247), so a frame with nothing to draw draws nothing.
+            cursor: {
+                let slot = self.slots.cursor();
+                let used = u32::try_from(self.cursor.len()).unwrap_or(u32::MAX);
+                slot.start..slot.start.saturating_add(used).min(slot.end)
+            },
         })
     }
 
@@ -1161,6 +1169,56 @@ mod tests {
             .expect("reference");
         let expected = target.read_back(&gpu).expect("readback");
         assert!(drawn == expected, "the cursor moved on screen too");
+    }
+
+    /// The cursor's draw covers exactly its instances (#247): a shown
+    /// cursor on a frame with rows is drawn, a hidden one issues no draw,
+    /// and a frame without visible rows after one with rows (whose
+    /// layout still has a roomy cursor slot) draws no pass at all.
+    #[test]
+    fn the_cursor_draw_covers_only_its_instances() {
+        let Some((gpu, mut renderer, target)) = small_frame_renderer() else {
+            return;
+        };
+        let rows = [text_row("hello"), text_row("world")];
+        let rows = frame(&rows);
+        let at = Some(crate::CursorState::new(1, 2, crate::CursorShape::Block));
+        let ranges = |renderer: &mut Renderer, size, cursor| {
+            let layout = Layout::new(
+                renderer.shaper.cell_metrics(),
+                renderer.shaper.scale(),
+                renderer.theme.padding,
+                size,
+            );
+            let frame = FrameInput::new(&rows).with_cursor(cursor);
+            renderer.prepare(&gpu, &layout, &frame).expect("prepare")
+        };
+        let shown = ranges(&mut renderer, target.size(), at);
+        assert!(!shown.cursor.is_empty(), "a shown cursor is drawn");
+        assert_eq!(shown.cursor.len(), renderer.cursor.len());
+        assert_eq!(shown.cursor.start, renderer.slots.cursor().start);
+        let hidden = ranges(&mut renderer, target.size(), None);
+        assert!(hidden.cursor.is_empty(), "a hidden cursor draws nothing");
+        assert!(
+            !renderer.slots.cursor().is_empty(),
+            "although its slot is still there"
+        );
+        // Smaller than the padding: no row is visible.
+        let tiny = ranges(&mut renderer, PhysicalSize::new(40, 4), at);
+        assert!(
+            tiny.labelled().iter().all(|(_, r)| r.is_empty()),
+            "nothing to draw: {:?}",
+            tiny.labelled()
+        );
+        assert!(!renderer.slots.cursor().is_empty(), "the roomy slot");
+        // The shown cursor's pixels: the frame differs from one without it.
+        let draw = |renderer: &mut Renderer, cursor| {
+            let frame = FrameInput::new(&rows).with_cursor(cursor);
+            target.render(&gpu, renderer, &frame).expect("render");
+            target.read_back(&gpu).expect("readback")
+        };
+        let (with, without) = (draw(&mut renderer, at), draw(&mut renderer, None));
+        assert!(with != without, "the cursor is on screen");
     }
 
     /// M1 (#22 review): 800 full-width overlays per row (link underlines
