@@ -610,6 +610,69 @@ fn selections_take_wide_characters_whole_and_clip_at_the_frame() {
     assert!(image == plain, "overlays outside the frame draw nothing");
 }
 
+/// Highlights stop at the longest *visible* row (#246): a row the frame
+/// passes past the target's bottom is not drawn and does not widen the
+/// grid, so a linear selection's whole row, a block selection and an
+/// overlay to `u16::MAX` end at the visible rows' 4 columns, not at the
+/// hidden row's 8.
+#[test]
+fn rows_past_the_bottom_do_not_widen_highlights() {
+    let Some(gpu) = gpu() else { return };
+    let theme = Theme::default();
+    let mut renderer = menlo(&gpu);
+    let screen = Screen::with(
+        &[
+            ("ab", Style::DEFAULT),
+            ("cd", Style::DEFAULT),
+            ("efghijkl", Style::DEFAULT),
+        ],
+        8,
+    );
+    let all = screen.rows();
+    let cells = [&all[0][..4], &all[1][..4], all[2]];
+    // No bottom padding: the third row starts at the target's bottom
+    // edge, so it is not visible (a row starting inside the padding is).
+    let mut target = Target::new(&gpu, &renderer, 2, 8);
+    target.size.height -= target.pad;
+    target.texture = OffscreenTarget::new(&gpu, target.size, FORMAT);
+    let highlight = blended(theme.selection, theme.background);
+    let matched = blended(theme.search_match, theme.background);
+    let at = |image: &[u8], row, col| {
+        let (x, y) = target.origin(row, col);
+        // Bottom-left corner: no glyph ink there.
+        target.pixel(image, x + 1, y + target.cell[1] - 2)
+    };
+    let selections = [
+        Selection::linear(Point::new(0, 1), Point::new(1, 0)),
+        Selection::block(Point::new(0, 1), Point::new(1, u16::MAX)),
+    ];
+    for selection in selections {
+        let image = target.draw(
+            &gpu,
+            &mut renderer,
+            &FrameInput::new(&cells).with_selection(Some(selection)),
+        );
+        assert!(near(at(&image, 0, 3), highlight, 2), "{selection:?} col 3");
+        for col in 4..8 {
+            assert!(
+                near(at(&image, 0, col), rgb(theme.background), 1),
+                "{selection:?} stops at the visible rows' width, col {col}"
+            );
+        }
+    }
+    let overlays = [Overlay::new(OverlayKind::Match, 0, 1..u16::MAX)];
+    let image = target.draw(
+        &gpu,
+        &mut renderer,
+        &FrameInput::new(&cells).with_overlays(&overlays),
+    );
+    assert!(near(at(&image, 0, 3), matched, 2), "match col 3");
+    assert!(
+        near(at(&image, 0, 4), rgb(theme.background), 1),
+        "the match stops at the visible rows' width"
+    );
+}
+
 /// The ADR 0016 open item: a selection on the last character of a
 /// ligature does not shorten the ligature. Shaping never sees the
 /// selection, so the image differs from the unselected one only inside

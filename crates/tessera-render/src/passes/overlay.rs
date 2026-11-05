@@ -116,9 +116,10 @@ pub(crate) fn grid_cols(rows: &[&[Cell]], cols: usize) -> usize {
 }
 
 /// Replaces `out` with row `r`'s coverage (its `cells`, highlighted over
-/// `cols` columns, see [`grid_cols`]): every span widened and clipped, then each mark's spans
-/// merged into their union (overlapping or adjacent spans become one),
-/// sorted by mark in drawing order and then by column.
+/// `cols` columns, see [`grid_cols`]): every span widened and clipped,
+/// then each mark's spans merged into their union (overlapping or
+/// adjacent spans become one), sorted by mark in drawing order and then
+/// by column.
 pub(crate) fn row_spans<'o>(
     out: &mut Vec<Span>,
     selection: Option<&Selection>,

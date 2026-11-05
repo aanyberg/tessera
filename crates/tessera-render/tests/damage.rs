@@ -462,3 +462,47 @@ fn a_theme_change_rebuilds_every_row() {
     let full = target.draw(&gpu, &mut reference, &FrameInput::new(&rows));
     assert!(red == full, "the new theme is drawn on every row");
 }
+
+/// A frame that shows no row (the target is smaller than the padding)
+/// after frames that did is drawn exactly as a fresh renderer draws it,
+/// translucent clear colour included (#247). Here a 2-row frame at scale
+/// 3 is followed by a scale change to 1.75 and a target 18 pixels high:
+/// the incremental renderer once kept the roomy cursor slot of its last
+/// layout and issued a draw of empty instances, and a Metal pass that
+/// draws anything encodes this clear colour one step lower in green
+/// (43 instead of 44) than a pass that only clears.
+#[test]
+fn a_frame_without_rows_after_a_scale_change_matches_a_fresh_renderer() {
+    let Some(gpu) = gpu() else { return };
+    let theme = Theme {
+        background: tessera_render::Rgba::new(0.815_686_3, 0.058_823_53, 0.933_333_34, 0.42),
+        padding: 13.0,
+        ..Theme::default()
+    };
+    let new = |scale: f32| {
+        let mut r = Renderer::new(&gpu, theme.clone(), menlo()).expect("renderer");
+        r.set_font_size(15.0, scale);
+        r
+    };
+    let mut screen = Screen::new(2, 4);
+    screen.write(0, "ab", Style::DEFAULT);
+    screen.write(1, "cd", Style::DEFAULT);
+    let rows = screen.rows();
+    let mut incremental = new(3.0);
+    let big = OffscreenTarget::new(&gpu, PhysicalSize::new(255, 98), FORMAT);
+    big.render(&gpu, &mut incremental, &FrameInput::new(&rows))
+        .expect("render");
+    incremental.set_font_size(15.0, 1.75);
+    let small = PhysicalSize::new(290, 18);
+    let draw = |renderer: &mut Renderer| {
+        let target = OffscreenTarget::new(&gpu, small, FORMAT);
+        target
+            .render(&gpu, renderer, &FrameInput::new(&rows))
+            .expect("render");
+        target.read_back(&gpu).expect("readback")
+    };
+    let inc = draw(&mut incremental);
+    let fresh = draw(&mut new(1.75));
+    assert_eq!(&inc[..4], &fresh[..4], "first pixel");
+    assert!(inc == fresh, "every pixel");
+}
