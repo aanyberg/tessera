@@ -20,7 +20,8 @@
 #     killed; a run that starts no test within the limit is stopped, with the restarted host outside its group;
 #   - a TSan hang and a hang outside the runtime in one attempt fail without a rerun, in either order;
 #   - a process under the products path that predates the run survives a hang and a SIGINT to the watchdog's group;
-#   - a TSan hang reruns only the hung test, once, with the other arguments kept and the run's -only-testing replaced
+#   - a TSan hang, also in macOS 15's shape (the runtime yielding through libsystem_pthread), reruns only the hung
+#     test, once, with the other arguments kept and the run's -only-testing replaced
 #     ("TSan hang in ..., retried"), and passes when that rerun passes; a TSan hang plus another failure fails without
 #     a rerun; a second hang in the rerun fails, keeping both samples.
 # Every case runs through the app-test recipe's pipeline (`set -o pipefail; ... | tee | tail`) and checks that no fake
@@ -133,7 +134,8 @@ EOF
 # `sample <pid> <seconds> -file <path>`: a call graph shaped like a real TSan host's. Both variants have the runtime's
 # background thread and a thread blocked in an interceptor (`__tsan::` frames, as in every TSan process); the main
 # thread hangs inside the runtime (`__tsan::SlotLock`) when FAKE_SAMPLE_TSAN gives this call 1, in a condition wait
-# otherwise.
+# otherwise; with 15 the main thread waits and another thread is stuck in the runtime as on macOS 15 (CI, PR #294),
+# yielding through libsystem_pthread's `cthread_yield`.
 cat > "$work/bin/sample" <<'EOF'
 #!/bin/sh
 echo "$1" >> "$FAKE_WORK/sampled"
@@ -141,6 +143,30 @@ echo "$1" >> "$FAKE_WORK/sampled"
 n=$(wc -l < "$FAKE_WORK/sampled" | tr -d " ")
 tsan="$(echo "${FAKE_SAMPLE_TSAN:-0}" | cut -d, -f"$n")"
 [ -n "$tsan" ] || tsan="$(echo "${FAKE_SAMPLE_TSAN:-0}" | awk -F, '{ print $NF }')"
+extra=""
+if [ "$tsan" = 15 ]; then
+    # macOS 15 (CI's PR #294 sample): the runtime semaphore yields through libsystem_pthread's cthread_yield.
+    tsan=0
+    extra="    5974 Thread_4   DispatchQueue_99: NSPersistentUI Work  (serial)
+    + 5974 start_wqthread  (in libsystem_pthread.dylib) + 8  [0x0]
+    +   5974 _pthread_wqthread  (in libsystem_pthread.dylib) + 292  [0x0]
+    +     5974 _dispatch_client_callout  (in libdispatch.dylib) + 16  [0x0]
+    +       5974 __tsan::dispatch_callback_wrap(void*)  (in libclang_rt.tsan_osx_dynamic.dylib) + 672  [0x0]
+    +         5974 __tsan::invoke_and_release_block(void*)  (in libclang_rt.tsan_osx_dynamic.dylib) + 32  [0x0]
+    +           5974 ___NSPersistentUIDispatchQueueAsync_block_invoke  (in AppKit) + 76  [0x0]
+    +             5974 -[NSPersistentUIWindowInfo initWithWindowID:]  (in AppKit) + 60  [0x0]
+    +               5974 wrap_arc4random_buf  (in libclang_rt.tsan_osx_dynamic.dylib) + 212  [0x0]
+    +                 5974 ccrng_crypto_generate  (in libcorecrypto.dylib) + 292  [0x0]
+    +                   5974 wrap_os_unfair_lock_unlock  (in libclang_rt.tsan_osx_dynamic.dylib) + 192  [0x0]
+    +                     5974 __tsan::Release(__tsan::ThreadState*, unsigned long, unsigned long)  (in libclang_rt.tsan_osx_dynamic.dylib) + 48  [0x0]
+    +                       5974 __tsan::SlotLock(__tsan::ThreadState*)  (in libclang_rt.tsan_osx_dynamic.dylib) + 140  [0x0]
+    +                         5973 __sanitizer::Semaphore::Wait()  (in libclang_rt.tsan_osx_dynamic.dylib) + 40  [0x0]
+    +                         ! 5971 cthread_yield  (in libsystem_pthread.dylib) + 36  [0x0]
+    +                         ! : 5970 swtch_pri  (in libsystem_kernel.dylib) + 8  [0x0]
+    +                         ! : 1 DYLD-STUB\$\$swtch_pri  (in libsystem_pthread.dylib) + 0  [0x0]
+    +                         ! 2 cthread_yield  (in libsystem_pthread.dylib) + 28  [0x0]
+    +                         1 __sanitizer::Semaphore::Wait()  (in libclang_rt.tsan_osx_dynamic.dylib) + 40  [0x0]"
+fi
 if [ "$tsan" = 1 ]; then
     hang="    +             900 __tsan::SlotLock(__tsan::ThreadState*)  (in libclang_rt.tsan_osx_dynamic.dylib) + 96  [0x1]
     +               900 __sanitizer::FutexWait(__sanitizer::atomic_uint32_t*, unsigned int)  (in libclang_rt.tsan_osx_dynamic.dylib) + 40  [0x2]
@@ -177,6 +203,7 @@ $hang
     +     900 __tsan_thread_start_func  (in libclang_rt.tsan_osx_dynamic.dylib) + 144  [0x0]
     +       900 wrap_read  (in libclang_rt.tsan_osx_dynamic.dylib) + 364  [0x0]
     +         900 read  (in libsystem_kernel.dylib) + 8  [0x0]
+$extra
 
 Total number in stack (recursive counted multiple, when >=5):
 SAMPLE
@@ -279,6 +306,7 @@ start_interrupt
 start_case continue hang-continue 0
 start_case stuck hang-stuck 0
 start_case tsan-pass hang,pass 1
+start_case tsan-macos15 hang,pass 15
 start_case tsan-other hang-fail,pass 1
 start_case tsan-stuck hang-stuck,pass 1
 start_case tsan-twice hang,hang 1
@@ -375,6 +403,15 @@ else
     not_ok "the rerun's arguments: $rerun"
 fi
 check_no_strays "a TSan hang then a pass"
+
+load_case tsan-macos15
+if (( st == 0 )) && [[ "$(runs)" == 2 && "$tail" == *"TSan hang in -[FakeTests.HangTests testHangs] (#278), retried"* \
+    && "$out" == *"Thread_4"*"NSPersistentUI Work"*"stuck in the TSan runtime"*"cthread_yield"* ]]; then
+    ok "a macOS 15 TSan hang (the runtime semaphore yielding through cthread_yield) is classified TSan and rerun"
+else
+    not_ok "a macOS 15 TSan hang: exit $st, $(runs) runs: $out"
+fi
+check_no_strays "a macOS 15 TSan hang"
 
 load_case tsan-other
 if (( st != 0 )) && [[ "$(runs)" == 1 \

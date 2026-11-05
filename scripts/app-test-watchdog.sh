@@ -217,11 +217,13 @@ keep_sample() {
 # This attempt's hangs, one description each, joined with "; ".
 hangs() { cut -f2 "$state/test" | paste -s -d ';' - | sed 's/;/; /g'; }
 
-# Succeeds when a thread in the samples file $1 is stuck inside the Thread Sanitizer runtime, and prints that thread and its
-# innermost frames. Every TSan process has `__tsan::` frames (its background thread, the trampolines of each thread
-# and blocking interceptor), so a match on the name alone would retry every hang. A thread counts when the leaf
-# holding at least half its samples, without its trailing libsystem_kernel/libsystem_platform frames (the wait
-# itself), ends in a `__tsan::` or `__sanitizer::` function: SlotLock, a runtime mutex or futex wait, a fork hook.
+# Succeeds when a thread in the samples file $1 is stuck inside the Thread Sanitizer runtime, and prints that thread
+# and its innermost frames. Every TSan process has `__tsan::` frames (its background thread, the trampolines of each
+# thread and blocking interceptor), so a match on the name alone would retry every hang. A thread counts when the leaf
+# holding at least half its samples, without its trailing wait frames (libsystem_kernel and libsystem_platform, and
+# libsystem_pthread's `cthread_yield` and its `swtch_pri` stub, through which macOS 15's runtime semaphore yields),
+# ends in a `__tsan::` or `__sanitizer::` function: SlotLock, a runtime mutex, semaphore or futex wait, a fork hook.
+# `_pthread_cond_wait` is not a wait frame here: under it sits the interceptor trampoline every blocked thread has.
 tsan_hang() {
     perl -e '
         use strict; use warnings;
@@ -229,7 +231,8 @@ tsan_hang() {
         sub leaf {
             my @path = @stack;
             return if !@path || $path[-1]{count} * 2 < $total;
-            pop @path while @path && $path[-1]{text} =~ /\(in libsystem_(kernel|platform)\.dylib\)/;
+            pop @path while @path && ($path[-1]{text} =~ /\(in libsystem_(kernel|platform)\.dylib\)/
+                || $path[-1]{text} =~ /^(cthread_yield|DYLD-STUB\$\$\w+) .*\(in libsystem_pthread\.dylib\)/);
             return unless @path && $path[-1]{text} =~ /^(__tsan::|__sanitizer::|_ZN6__tsan|_ZN11__sanitizer)/;
             $found = 1;
             print "$thread stuck in the TSan runtime ($stack[-1]{count} of $total samples):\n";
