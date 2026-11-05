@@ -5,7 +5,10 @@
 //! The VT-level rows are in `tessera-term/tests/hyperlink.rs`.
 
 use proptest::prelude::*;
-use tessera_grid::{EraseDisplay, EraseLine, Grid, Hyperlink, LinkRefused, MAX_LIVE_LINKS};
+use tessera_grid::{
+    EraseDisplay, EraseLine, Grid, Hyperlink, LinkRefused, MAX_ID_BYTES, MAX_LINK_TABLE_BYTES,
+    MAX_LIVE_LINKS, MAX_URI_BYTES,
+};
 
 /// The link URI of each cell of row `row`.
 fn uris(grid: &Grid, row: u16) -> Vec<Option<String>> {
@@ -214,6 +217,20 @@ fn the_open_link_ends_with_a_screen_switch_and_a_reset_but_cells_keep_theirs() {
 }
 
 #[test]
+fn entering_the_alternate_screen_again_closes_the_open_link() {
+    let mut grid = Grid::new(2, 6);
+    grid.enter_alt_screen();
+    grid.begin_hyperlink("https://a.bc/", None).unwrap();
+    grid.put_char('a');
+    // A repeated DECSET 47 or 1049: no switch, but the link closes (D-L5).
+    grid.enter_alt_screen();
+    assert!(grid.hyperlink().is_none());
+    grid.put_char('b');
+    assert_eq!(linked(&grid, 0), [0]);
+    grid.check_invariants();
+}
+
+#[test]
 fn refused_links_close_the_open_one() {
     let mut grid = Grid::new(2, 6);
     grid.begin_hyperlink("https://a.bc/", None).unwrap();
@@ -279,28 +296,250 @@ fn links_stop_at_the_live_cap_and_the_refusal_is_reported_once() {
     let line = grid.line(cursor.row).unwrap();
     assert!(line.hyperlink(usize::from(cursor.col) - 1).is_none());
     assert_eq!(grid.live_hyperlinks(), MAX_LIVE_LINKS);
+    // A cell lets go and the table refills: the same run of refusals, not
+    // reported again (the table never drained to three quarters).
+    for round in 0..100 {
+        grid.goto(0, 0);
+        grid.erase_chars(1);
+        assert_eq!(grid.live_hyperlinks(), MAX_LIVE_LINKS - 1);
+        grid.begin_hyperlink(&format!("https://a.bc/refill/{round}"), None)
+            .unwrap();
+        grid.put_char('x');
+        assert_eq!(
+            grid.begin_hyperlink("https://a.bc/again", None),
+            Err(LinkRefused::TableFull { first: false }),
+            "round {round}"
+        );
+    }
     // Room again once cells let go: the next refusal is reported anew.
     grid.erase_in_display(EraseDisplay::All);
     grid.clear_scrollback();
     assert_eq!(grid.live_hyperlinks(), 0);
     grid.begin_hyperlink("https://a.bc/room", None).unwrap();
+    grid.put_char('x');
+    for i in 1..MAX_LIVE_LINKS {
+        grid.begin_hyperlink(&format!("https://a.bc/{i}"), None)
+            .unwrap();
+        grid.put_char('x');
+    }
+    assert_eq!(
+        grid.begin_hyperlink("https://a.bc/next", None),
+        Err(LinkRefused::TableFull { first: true }),
+        "reported anew"
+    );
+}
+
+/// A URI of exactly `len` bytes, distinct per `i`.
+fn long_uri(i: usize, len: usize) -> String {
+    let head = format!("https://a.bc/{i}/");
+    format!("{head}{}", "u".repeat(len - head.len()))
+}
+
+#[test]
+fn links_with_long_uris_and_ids_stop_at_the_table_byte_cap() {
+    // 65 536 maximal links, each in a cell of its own: the byte cap, not
+    // the count, stops them; every one past it is refused and counted, and
+    // the first refusal is the reported one.
+    let mut grid = Grid::with_scrollback(10, 200, 1000);
+    let size = MAX_URI_BYTES + MAX_ID_BYTES;
+    let (mut opened, mut refused) = (0, 0);
+    for i in 0..MAX_LIVE_LINKS {
+        let id = format!("{i:0>MAX_ID_BYTES$}");
+        match grid.begin_hyperlink(&long_uri(i, MAX_URI_BYTES), Some(&id)) {
+            Ok(()) => opened += 1,
+            Err(LinkRefused::TableFull { first }) => {
+                assert_eq!(first, refused == 0, "link {i}");
+                refused += 1;
+            }
+            Err(other) => panic!("link {i}: {other:?}"),
+        }
+        grid.put_char('x');
+        assert!(grid.hyperlink_bytes() <= MAX_LINK_TABLE_BYTES);
+    }
+    grid.end_hyperlink();
+    assert_eq!(opened, MAX_LINK_TABLE_BYTES / size);
+    assert_eq!(refused, MAX_LIVE_LINKS - opened);
+    assert_eq!(grid.live_hyperlinks(), opened);
+    assert_eq!(grid.hyperlink_bytes(), opened * size);
+    // Short links fit in what is left, until it is gone.
+    let left = MAX_LINK_TABLE_BYTES - grid.hyperlink_bytes();
+    grid.begin_hyperlink(&"u".repeat(left), None).unwrap();
+    grid.put_char('x');
+    assert_eq!(grid.hyperlink_bytes(), MAX_LINK_TABLE_BYTES);
+    assert!(matches!(
+        grid.begin_hyperlink("u", None),
+        Err(LinkRefused::TableFull { first: false })
+    ));
+    grid.erase_in_display(EraseDisplay::All);
+    grid.clear_scrollback();
+    assert_eq!((grid.live_hyperlinks(), grid.hyperlink_bytes()), (0, 0));
+    grid.check_invariants();
+}
+
+#[test]
+fn churning_id_links_over_one_cell_gives_their_bytes_back() {
+    // The table nearly full of history, and a fresh maximal `id` link
+    // written over one screen cell, again and again: each dead link's
+    // bytes come back, so none is refused and the table stays in its cap.
+    let mut grid = Grid::with_scrollback(10, 200, 1000);
+    let size = MAX_URI_BYTES + MAX_ID_BYTES;
+    let id = |i: usize| format!("{i:0>MAX_ID_BYTES$}");
+    let held = MAX_LINK_TABLE_BYTES / size - 2;
+    for i in 0..held {
+        grid.begin_hyperlink(&long_uri(i, MAX_URI_BYTES), Some(&id(i)))
+            .unwrap();
+        grid.put_char('x');
+    }
+    for i in held..held + 20_000 {
+        grid.begin_hyperlink(&long_uri(i, MAX_URI_BYTES), Some(&id(i)))
+            .expect("the dead links gave their bytes back");
+        // Past the end of the filled cells on the last row.
+        grid.goto(9, 199);
+        grid.put_char('x');
+        assert!(grid.hyperlink_bytes() <= MAX_LINK_TABLE_BYTES);
+        assert_eq!(grid.live_hyperlinks(), held + 1);
+    }
+    grid.check_invariants();
 }
 
 // ------------------------------------------------------------------ reflow
 
 /// `(character, URI)` of every cell with text in the logical buffer, in
-/// order: what a resize must keep.
+/// order: what a resize must keep. The spacer half of a wide character is
+/// listed as `'\0'` with its own link, so a spacer that loses its link
+/// shows.
 fn text_and_links(grid: &Grid) -> Vec<(char, Option<String>)> {
     let mut out = Vec::new();
     for line in grid.logical_lines() {
         for (col, cell) in line.cells.iter().enumerate() {
-            if cell.is_spacer() || cell.is_pad() || cell.ch == ' ' {
+            if cell.is_pad() || (cell.ch == ' ' && !cell.is_spacer()) {
                 continue;
             }
-            out.push((cell.ch, line.hyperlink(col).map(|l| l.uri().to_owned())));
+            let ch = if cell.is_spacer() { '\0' } else { cell.ch };
+            out.push((ch, line.hyperlink(col).map(|l| l.uri().to_owned())));
         }
     }
     out
+}
+
+#[test]
+fn the_spacer_half_keeps_its_link_through_a_reflow() {
+    // `中` lands on the next row at 3 columns and back at 9.
+    let mut grid = Grid::new(4, 9);
+    grid.put_str("ab");
+    grid.begin_hyperlink("https://a.bc/", None).unwrap();
+    grid.put_str("\u{4e2d}");
+    grid.end_hyperlink();
+    for cols in [3, 2, 9] {
+        grid.resize(4, cols);
+        grid.check_invariants();
+        let line = grid
+            .logical_lines()
+            .find(|line| line.cells.iter().any(|c| c.ch == '\u{4e2d}'))
+            .expect("the wide character");
+        let col = line.cells.iter().position(|c| c.ch == '\u{4e2d}').unwrap();
+        let (base, spacer) = (line.hyperlink(col), line.hyperlink(col + 1));
+        assert!(line.cells[col + 1].is_spacer() && line.cells[col + 1].is_link());
+        assert!(
+            base.zip(spacer).is_some_and(|(b, s)| b.same_link(s)),
+            "{cols} columns: {base:?} / {spacer:?}"
+        );
+    }
+}
+
+/// The text of the logical buffer, history first, one entry per logical
+/// line (rows joined across soft wraps): what Select All copies.
+fn logical_text(grid: &Grid) -> Vec<String> {
+    let mut out = vec![String::new()];
+    for line in grid.logical_lines() {
+        out.last_mut().expect("one").push_str(&line.text());
+        if !line.wrapped {
+            out.push(String::new());
+        }
+    }
+    out
+}
+
+#[test]
+fn a_trailing_linked_space_does_not_add_a_row_when_narrowing() {
+    for linked_space in [false, true] {
+        let mut grid = Grid::new(4, 10);
+        grid.begin_hyperlink("https://a.bc/", None).unwrap();
+        grid.put_str("ab");
+        if !linked_space {
+            grid.end_hyperlink();
+        }
+        grid.put_str("  ");
+        grid.end_hyperlink();
+        grid.carriage_return();
+        grid.line_feed();
+        grid.put_str("cd");
+        grid.resize(4, 2);
+        grid.check_invariants();
+        // `ab` stays one row: its trailing spaces are dropped, linked or
+        // not, so `cd` is the next row.
+        let rows: Vec<String> = grid.logical_lines().map(tessera_grid::Line::text).collect();
+        assert_eq!(rows[..2], ["ab", "cd"], "linked spaces: {linked_space}");
+        assert_eq!(logical_text(&grid)[..2], ["ab", "cd"]);
+    }
+}
+
+#[test]
+fn narrowing_keeps_the_oldest_history_row_with_trailing_linked_spaces() {
+    // 4 000 random buffers, each written twice: once with its trailing
+    // spaces linked, once without. Narrowed to two columns both must keep
+    // the same rows: a linked space that counted as text would add rows
+    // and push the oldest history row out of the capped scrollback.
+    let mut seed: u64 = 0x2224;
+    let mut next = |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    let mut losses = 0;
+    for case in 0..4000 {
+        let lines: Vec<(String, usize)> = (0..2 + next(8))
+            .map(|_| {
+                let text: String = (0..=next(6))
+                    .map(|_| char::from(b'a' + u8::try_from(next(26)).unwrap()))
+                    .collect();
+                (text, usize::try_from(next(4)).unwrap())
+            })
+            .collect();
+        let write = |link_spaces: bool| {
+            let mut grid = Grid::with_scrollback(3, 10, 6);
+            for (i, (text, spaces)) in lines.iter().enumerate() {
+                grid.begin_hyperlink(&format!("https://a.bc/{i}"), None)
+                    .unwrap();
+                grid.put_str(text);
+                if !link_spaces {
+                    grid.end_hyperlink();
+                }
+                grid.put_str(&" ".repeat(*spaces));
+                grid.end_hyperlink();
+                grid.carriage_return();
+                grid.line_feed();
+            }
+            grid.resize(3, 2);
+            grid.check_invariants();
+            grid
+        };
+        let (linked, plain) = (write(true), write(false));
+        if logical_text(&linked) != logical_text(&plain)
+            || linked.scrollback_len() != plain.scrollback_len()
+        {
+            losses += 1;
+            if losses == 1 {
+                eprintln!(
+                    "case {case}: {lines:?}\nlinked {:?}\nplain  {:?}",
+                    logical_text(&linked),
+                    logical_text(&plain)
+                );
+            }
+        }
+    }
+    assert_eq!(losses, 0, "of 4000 cases");
 }
 
 proptest! {

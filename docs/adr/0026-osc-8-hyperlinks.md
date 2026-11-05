@@ -54,7 +54,8 @@ that join a cell do not change its link.
 ### Entities and the pool
 
 A `Hyperlink` is a cheap clone of one `Arc`: URI, optional `id`, and a
-reference to the pool's live counter. All cells of one OSC 8 open share
+reference to the pool's shared state (the live and byte counters and the
+`id` index). All cells of one OSC 8 open share
 it, so "the same link" is pointer identity (`same_link`); `==` compares
 URI and `id`.
 
@@ -67,23 +68,54 @@ URI and `id`.
   entity. Ids are compared as exact bytes.
 - The grid's `LinkPool` keeps a `HashMap<(id, uri), Weak<..>>` of the
   entities that have an `id` (the strings are shared with the entity, not
-  copied) and a counter of **live** entities, decremented when the last
-  holder drops. An entity lives while a cell on a screen or in
-  scrollback, or the grid's active link, holds it: erasing the cell or
-  evicting its history line frees it.
-- **Cap: `MAX_LIVE_LINKS` = 65 536 live entities.** At the cap
-  `Grid::begin_hyperlink` returns `LinkRefused::TableFull { first }`;
-  `tessera-term` closes the open link (so text after a refused link is not
-  taken for part of the previous one) and logs the first refusal of each
-  run at warn level, later ones at trace. An existing entity can still be
-  reopened by `id` at the cap. Dead index entries are swept when they are
-  at least as many as the live ones (floor 1 024), so the index never
-  holds more than twice the live links plus the floor: a flood of
-  1 000 000 links rewritten over one cell stays at two live entities and a
-  1 024-entry index (`tests/hyperlink.rs`, `hyperlink.rs` unit tests).
-  Worst case at the cap is 65 536 links of up to 2 083 + 250 bytes, about
-  150 MB, only if a program keeps that many distinct maximal links on the
-  screen and in history at once.
+  copied), a counter of **live** entities and a counter of their URI and
+  `id` bytes. An entity lives while a cell on a screen or in scrollback, or
+  the grid's active link, holds it: erasing the cell or evicting its
+  history line frees it. When the last holder drops, the entity takes its
+  count and bytes off the counters and removes its own index entry (only
+  if that entry still points at a dead entity, so a successor opened under
+  the same `id` keeps its entry). The index therefore never holds a dead
+  entry for longer than the drop takes: 1 000 000 id'd links rewritten
+  over one cell leave one live entity and one index entry
+  (`hyperlink.rs` unit tests).
+- **Caps: `MAX_LIVE_LINKS` = 65 536 live entities and
+  `MAX_LINK_TABLE_BYTES` = 16 MiB of their URI and `id` text.** A link
+  that would pass either is refused: `Grid::begin_hyperlink` returns
+  `LinkRefused::TableFull { first }` for both caps; `tessera-term` closes
+  the open link (so text after a refused link is not taken for part of the
+  previous one) and logs the first refusal of a run at warn level, later
+  ones at trace. A run ends, and the next refusal is reported again, only
+  when a link is created while the table is below three quarters of both
+  caps (49 152 links and 12 MiB); refilling one freed slot at the cap
+  1 000 times gives one warning, not 1 000 (`tests/hyperlink.rs` in both
+  crates). An existing entity can still be reopened by `id` at either cap
+  and costs no bytes.
+- The byte cap is what bounds memory: 16 MiB holds 7 191 maximal links
+  (2 083 + 250 bytes), long before the count cap. Measured peak RSS
+  (`/usr/bin/time -l`, best of 7, release, a 200x50 terminal with 10 000
+  lines of history full of text): 44.3 MB without links; 68.8 MB after
+  65 536 attempts at distinct maximal links of one character each (7 191
+  created, the rest refused); still 68.8 MB after 300 000 more distinct
+  maximal `id`'d links reopened over one cell. Before the byte cap the
+  same 65 536 links took 261.9 MB (all created) and the churn 477.7 MB, so
+  the link entities and their text now take about 25 MB at most instead
+  of the 150 MB this ADR first estimated (which was also low). The
+  per-cell entries come on top and are not capped by the table: 16 bytes
+  per linked cell, so one link over all of a 10 000 x 200 history adds
+  about 32 MB, and that grows with the scrollback cap until run-length
+  entries land (below).
+- Holders keep links alive, so **history can starve new links**: a
+  program that leaves 65 536 links or 16 MiB of link text in scrollback
+  gets every new link refused (the text still prints, unlinked) until
+  those lines are evicted, erased or cleared (`ED 3`, RIS). That is the
+  price of a hard bound without evicting links that cells still show.
+- **A clone shares the table.** `Grid::clone` (and `LinkPool::clone`)
+  shares the entities, both counters and the index with the original: a
+  link opened on either counts against the same caps, and dropping the
+  clone gives its holders' counts back. Nothing in the product clones a
+  live grid; tests and snapshots that do see one table.
+- Entries stay one per column (no run-length entries); a run-length
+  table is a 0.2.0 issue.
 
 ### The open link, and what ends it
 
@@ -95,8 +127,12 @@ motion. It ends with an OSC 8 with an empty URI, and with:
 
 - **RIS** (`Grid::reset`), **DECSTR** (`State::soft_reset`) and **every
   switch to or from the alternate screen** (D-L5, kitty; VTE also resets
-  its index on a screen switch). Cells already written keep their links.
-- A refused link (empty URI, URI over the cap, table full).
+  its index on a screen switch). A redundant `DECSET 47`, `1047` or `1049`
+  while the alternate screen is already active closes the open link too,
+  so a set always ends the link whether or not it switches. Cells already
+  written keep their links.
+- A refused link (empty URI, URI over the cap, a control in the URI,
+  table full).
 
 DECALN suspends the link for its `E` fill and restores it. Erased cells
 (ECH, EL, ED, ICH's blanks, scroll fills) carry no link whether or not one
@@ -109,17 +145,25 @@ text written while no link is open drops its link.
 only `id` is read (the last non-empty one wins), anything else, including a
 piece without `=`, is skipped and the link still opens (D-L1: VTE and
 Ghostty; WezTerm drops the whole OSC). The URI is everything after the
-second `;`, further semicolons included, and must be UTF-8 (C0 bytes are
-already dropped by the OSC layer, so there is nothing to reject for them).
+second `;`, further semicolons included, and must be UTF-8. Its length is
+summed from the parser's pieces before they are joined, so an over-long
+URI is refused without a copy. A URI that contains a C0 control, DEL, a
+C1 control (U+0080 to U+009F) or a bidirectional formatting character
+(U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069) is refused: such a
+URI shows the user one target and opens another (the Trojan Source
+spoofing of a hover tooltip or a copied link), and no real URI needs them
+unencoded. The OSC layer already drops C0 bytes, and NUL handling is
+unchanged; the grid checks C0 too, for callers other than the parser.
 
 | Input | Result |
 |---|---|
 | no second `;` (`OSC 8 ; URI`) | ignored, the open link stays |
-| URI not UTF-8 | ignored, the open link stays |
+| URI not UTF-8 | ignored, the open link stays (if it is also over 2 083 bytes, the length check comes first: the link closes) |
 | empty URI, whatever the params | closes (D-L2: VTE, kitty) |
 | URI over 2 083 bytes | closes the open link, opens none (D-L3: VTE; a long URI cannot make text look as if it belonged to the previous link) |
+| URI with C1, DEL or bidi formatting characters | closes the open link, opens none; the text after it prints unlinked |
 | `id` over 250 bytes (or empty) | dropped, the link opens without it |
-| payload fills the parser's 16 pieces (a URI with 14 or more `;` may be cut) | closes the open link: a cut URI is another URI |
+| payload fills the parser's 16 pieces (`MAX_OSC_PARAMS`): a URI with 13 or more `;` (`8`, the params and 14 URI pieces); 12 still opens | closes the open link: a cut URI is another URI |
 
 Non-ASCII UTF-8 in a URI is stored as received (the specification asks
 senders to percent-encode; the Swift side encodes when it builds a `URL`).
@@ -132,7 +176,13 @@ Lines moving into history keep their table, so links survive
 clusters (`take_links`) and set on the output row at the column the cell
 lands on, and a `LINK` cell that lost its entry (never produced by the
 grid's own edits) loses the flag. Lines with a linked cell take the
-general split path instead of `split_plain`, like lines with clusters. The
+general split path instead of `split_plain`, like lines with clusters.
+Trailing blanks are trimmed when rows are joined, and a linked space with
+the default style counts as blank (`plain_blank` ignores `LINK`): a
+trailing linked space does not keep a row alive, so narrowing gives the
+same row count with or without it and the oldest history row is not
+pushed out by one (4 000 random grids narrowed to two columns, no loss).
+The trimmed space loses its link. The
 alternate screen's cut keeps links of the columns that remain.
 
 ### Hit-testing and hover
@@ -191,6 +241,18 @@ until it is hovered with Command held.
 - `GraphemeTable::is_empty` now also means "no links"; `len` and `iter` are
   clusters only.
 - Search and selection text are unaffected: a link is not text.
+- #224 (byte cap, eager index removal, re-arm rule,
+  control rejection, `plain_blank`) measured with `cargo xtask ab` against
+  the merge base, retired instructions, best of 15 pairs: a 200x50
+  terminal with 10 000 lines of history of one corpus line, rewrapped
+  200 -> 80 -> 200 columns 60 times: ascii 0.977, latin 0.984, cjk 0.991,
+  box 0.978, hebrew 0.977, arabic 0.978, punctuation 0.977, braille 0.978,
+  emoji 0.999, sgr 0.974, combining 1.007, and 1.002 for a line of three
+  OSC 8 links; 1 MiB of short open/close links (half with an `id`) fed 8
+  times, 1.025. The entity's index removal runs in an out-of-line
+  `extern "C"` function so that a link's drop cannot unwind: with an
+  unwinding drop every loop that drops links carries cleanup for it, and
+  the CJK reflow measured 1.030 to 1.036.
 - Not done: drawing links by default, a tooltip, `file:` host checks (the
   Swift side, 30-app), links across the alternate-screen switch, and
   OSC 8 inside tmux passthrough (tmux strips it unless configured).

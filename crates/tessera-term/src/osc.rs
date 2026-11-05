@@ -79,12 +79,22 @@
 //! - A missing second `;` and a URI that is not UTF-8 are ignored: the open
 //!   link stays as it was. A payload that fills all [`MAX_OSC_PARAMS`]
 //!   pieces (the URI may have been cut) closes it instead, since a cut URI
-//!   is another URI.
+//!   is another URI: `8`, the params and 14 URI pieces, so a URI with 13 or
+//!   more `;` closes the link and one with 12 opens.
 //! - An empty URI closes the open link, whatever the params.
-//! - A URI over [`tessera_grid::MAX_URI_BYTES`] closes the open link and opens none; an id
-//!   over [`tessera_grid::MAX_ID_BYTES`] is dropped and the link kept without it.
-//! - Past [`tessera_grid::MAX_LIVE_LINKS`] links alive no new one is opened, and the open
-//!   link is closed; the first refusal is logged at warn level.
+//! - A URI over [`tessera_grid::MAX_URI_BYTES`] closes the open link and
+//!   opens none (the length is summed from the pieces, so an over-long URI
+//!   is never copied); an id over [`tessera_grid::MAX_ID_BYTES`] is dropped
+//!   and the link kept without it.
+//! - A URI with a control character (DEL or C1; C0 never reaches an OSC)
+//!   or a bidirectional formatting character closes the open link and opens
+//!   none ([`LinkRefused::ControlInUri`]). The text after it prints as
+//!   usual, unlinked.
+//! - Past [`tessera_grid::MAX_LIVE_LINKS`] links alive, or
+//!   [`tessera_grid::MAX_LINK_TABLE_BYTES`] of URI and id text, no new one
+//!   is opened, and the open link is closed. The first refusal is logged at
+//!   warn level, and again only after the table has drained below three
+//!   quarters of both caps; the others at trace level.
 //!
 //! A link never ends by itself: RIS, DECSTR and switching to or from the
 //! alternate screen close the open one, and cells already written keep
@@ -96,7 +106,7 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use tessera_grid::{LinkRefused, MAX_LIVE_LINKS, Mark};
+use tessera_grid::{LinkRefused, MAX_LINK_TABLE_BYTES, MAX_LIVE_LINKS, MAX_URI_BYTES, Mark};
 use tracing::{trace, warn};
 
 use crate::{MAX_CLIPBOARD_BYTES, MAX_FORWARDED_OSC_BYTES, MAX_TITLE_BYTES, Request, State};
@@ -228,6 +238,13 @@ impl State {
             self.grid.end_hyperlink();
             return;
         }
+        // Summed before joining: an over-long URI is refused without a copy.
+        let len = joined_len(uri);
+        if len > MAX_URI_BYTES {
+            trace!(len, "OSC 8 with an over-long URI closes the link");
+            self.grid.end_hyperlink();
+            return;
+        }
         let uri = uri.join(&b';');
         let Ok(uri) = std::str::from_utf8(&uri) else {
             trace!("OSC 8 with a URI that is not UTF-8 ignored");
@@ -246,7 +263,10 @@ impl State {
             Ok(()) => {}
             Err(LinkRefused::TableFull { first: true }) => {
                 warn!(
-                    max = MAX_LIVE_LINKS,
+                    max_links = MAX_LIVE_LINKS,
+                    max_bytes = MAX_LINK_TABLE_BYTES,
+                    live = self.grid.live_hyperlinks(),
+                    bytes = self.grid.hyperlink_bytes(),
                     "hyperlink table full: new links are ignored"
                 );
             }
