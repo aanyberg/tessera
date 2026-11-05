@@ -500,8 +500,14 @@ two thousand 64 KiB ones.
   a flood of identical sets costs one bump (S6). Row OS21 and the view
   test `a_program_colour_set_between_re_theme_and_push_defaults_is_copied`
   pin it.
-- **Over-long queries (#189 d).** The parser keeps 32 parameters; a DSR,
-  CPR, DECXCPR, DECRQM or ANSI RQM with 33 or more is flagged `ignore` and
-  gets no reply (S1: an over-long request is never answered from a cut
-  header), while 32 still answer their first parameter. Rows RP11 and
-  RP12.
+- **Over-long queries (#189 d).** The parser keeps 32 parameter entries;
+  a DSR, CPR, DECXCPR, DECRQM or ANSI RQM with 33 or more entries (a
+  defaulted entry counts, so `CSI 6 ;;;…n` with 33 slots is one) is
+  flagged `ignore` and gets no reply (S1: an over-long request is never
+  answered from a cut header), while 32 still answer their first
+  parameter. Rows RP11 and RP12. This is vte's rule (the `vte` crate's
+  `MAX_PARAMS` 32 sets `ignoring` on the 33rd entry; GNOME VTE's
+  `VTE_PARSER_ARG_MAX` 32 and `params_overflow` do the same), not
+  xterm's: xterm keeps 30 parameters (`NPARAM`), drops the rest without
+  ignoring the sequence and answers from the first. Tessera follows vte
+  (S1); checked against both sources (#260).

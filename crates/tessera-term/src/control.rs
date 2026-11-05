@@ -1,10 +1,10 @@
 //! C0 and C1 control functions: the [`Action::Execute`] half of the
 //! dispatcher.
 //!
-//! Only the format effectors, the bell and the shifts SO and SI have an effect. Every other
-//! control byte is ignored; the ones with no meaning to a terminal emulator
-//! silently, the rest with a trace-level log so unimplemented controls are
-//! visible while debugging.
+//! Only the format effectors, the bell and the shifts SO and SI have an
+//! effect. Every other control byte is ignored; the ones with no meaning to
+//! a terminal emulator silently, the rest with a trace-level log so
+//! unimplemented controls are visible while debugging.
 //!
 //! [`Action::Execute`]: tessera_vt::Action::Execute
 

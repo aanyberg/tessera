@@ -218,12 +218,12 @@ impl Line {
     }
 
     /// [`Line::fill`] for the cells of `range` that are not protected
-    /// ([`Cell::is_protected`]); returns whether `range` held a protected
-    /// cell, which is kept as it is. Each run of unprotected cells is
-    /// filled on its own, so a wide character cut by a run's end is still
-    /// blanked whole; a protected wide character is never cut, because
-    /// both its halves carry the bit (xterm `ClearInLine2`). Without a
-    /// protected cell in `range` this is exactly [`Line::fill`].
+    /// ([`Cell::is_protected`]); a protected cell is kept as it is. Each
+    /// run of unprotected cells is filled on its own, so a wide character
+    /// cut by a run's end is still blanked whole; a protected wide
+    /// character is never cut, because both its halves carry the bit
+    /// (xterm `ClearInLine2`). Without a protected cell in `range` this is
+    /// exactly [`Line::fill`].
     ///
     /// One pass over the cells and at most one over the line's cluster and
     /// link table, however many runs there are: the runs are blanked
@@ -231,7 +231,7 @@ impl Line {
     /// are dropped together afterwards (S6: a screen of alternating
     /// protected clusters costs a constant times ED 2, not one table edit
     /// per run).
-    pub(crate) fn fill_unprotected(&mut self, range: std::ops::Range<usize>, style: Style) -> bool {
+    pub(crate) fn fill_unprotected(&mut self, range: std::ops::Range<usize>, style: Style) {
         let end = range.end.min(self.cells.len());
         let start = range.start.min(end);
         let Some(first) = self.cells[start..end]
@@ -240,7 +240,7 @@ impl Line {
             .map(|at| start + at)
         else {
             self.fill(start..end, style);
-            return false;
+            return;
         };
         let blank = Cell::blank_with(style);
         // The columns blanked lie in `lo..hi`; `side` is whether one of them
@@ -282,7 +282,6 @@ impl Line {
             self.graphemes
                 .retain_cols(|col| col < lo || col >= hi || cells[col].is_protected());
         }
-        true
     }
 
     /// [`Line::clear`] that keeps the protected cells

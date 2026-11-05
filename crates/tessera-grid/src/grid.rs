@@ -2136,16 +2136,16 @@ impl Grid {
 
     /// [`Grid::erase_chars`] that leaves protected cells
     /// ([`Cell::is_protected`]) as they are (ECH in ISO protection mode,
-    /// ADR 0034); returns whether the range held one. The pending wrap is
-    /// disarmed even when every cell was protected. A protected wide
-    /// character is kept whole, also when the range covers only its spacer.
-    pub fn erase_chars_unprotected(&mut self, n: u16) -> bool {
+    /// ADR 0034). The pending wrap is disarmed even when every cell was
+    /// protected. A protected wide character is kept whole, also when the
+    /// range covers only its spacer.
+    pub fn erase_chars_unprotected(&mut self, n: u16) {
         self.pending_wrap = false;
         let Point { row, col } = self.cursor;
         let col = usize::from(col);
         let end = col.saturating_add(usize::from(n));
         self.damage.touch_cursor_row();
-        self.lines[usize::from(row)].fill_unprotected(col..end, self.pen)
+        self.lines[usize::from(row)].fill_unprotected(col..end, self.pen);
     }
 
     // --------------------------------------------------------------- erase
@@ -2174,10 +2174,9 @@ impl Grid {
 
     /// [`Grid::erase_in_line`] that leaves protected cells
     /// ([`Cell::is_protected`]) as they are (EL in ISO protection mode,
-    /// DECSEL; ADR 0034); returns whether the erased part held one. Marks,
-    /// the wrap flag and the pending wrap change exactly as for
-    /// [`Grid::erase_in_line`].
-    pub fn erase_in_line_unprotected(&mut self, mode: EraseLine) -> bool {
+    /// DECSEL; ADR 0034). Marks, the wrap flag and the pending wrap change
+    /// exactly as for [`Grid::erase_in_line`].
+    pub fn erase_in_line_unprotected(&mut self, mode: EraseLine) {
         self.pending_wrap = false;
         let Point { row, col } = self.cursor;
         let (col, cols) = (usize::from(col), usize::from(self.cols));
@@ -2186,12 +2185,12 @@ impl Grid {
         match mode {
             EraseLine::ToEnd => {
                 line.wrapped = false;
-                line.fill_unprotected(col..cols, self.pen)
+                line.fill_unprotected(col..cols, self.pen);
             }
             EraseLine::ToStart => line.fill_unprotected(0..col + 1, self.pen),
             EraseLine::All => {
                 line.wrapped = false;
-                line.fill_unprotected(0..cols, self.pen)
+                line.fill_unprotected(0..cols, self.pen);
             }
         }
     }
@@ -2211,11 +2210,15 @@ impl Grid {
 
     /// [`Grid::erase_in_display`] that leaves protected cells
     /// ([`Cell::is_protected`]) as they are (ED in ISO protection mode,
-    /// DECSED; ADR 0034); returns whether the erased part held one. Marks,
-    /// wrap flags, the pending wrap and the history bookkeeping change
-    /// exactly as for [`Grid::erase_in_display`]: a line erased in full
-    /// loses its marks and wrap flag even when protected cells stay on it.
-    /// [`EraseDisplay::Scrollback`] touches no cell and returns `false`.
+    /// DECSED; ADR 0034); returns whether a line it erased in full kept a
+    /// protected cell, which for [`EraseDisplay::All`] (every line erased in
+    /// full) is whether the screen still holds one; the partly erased
+    /// cursor line of [`EraseDisplay::Below`] and [`EraseDisplay::Above`]
+    /// is not counted. Marks, wrap flags, the pending wrap and the history
+    /// bookkeeping change exactly as for [`Grid::erase_in_display`]: a line
+    /// erased in full loses its marks and wrap flag even when protected
+    /// cells stay on it. [`EraseDisplay::Scrollback`] touches no cell and
+    /// returns `false`.
     pub fn erase_in_display_unprotected(&mut self, mode: EraseDisplay) -> bool {
         self.erase_display(mode, true)
     }
@@ -2253,23 +2256,22 @@ impl Grid {
         let kept = match mode {
             EraseDisplay::Below => {
                 self.extend_region(self.cursor.row, self.rows - 1);
-                let kept = if selective {
-                    self.erase_in_line_unprotected(EraseLine::ToEnd)
+                if selective {
+                    self.erase_in_line_unprotected(EraseLine::ToEnd);
                 } else {
                     self.erase_in_line(EraseLine::ToEnd);
-                    false
-                };
-                clear(&mut self.lines[row + 1..]) | kept
+                }
+                clear(&mut self.lines[row + 1..])
             }
             EraseDisplay::Above => {
                 self.extend_region(0, self.cursor.row);
                 let kept = clear(&mut self.lines[..row]);
                 if selective {
-                    self.erase_in_line_unprotected(EraseLine::ToStart) | kept
+                    self.erase_in_line_unprotected(EraseLine::ToStart);
                 } else {
                     self.erase_in_line(EraseLine::ToStart);
-                    kept
                 }
+                kept
             }
             EraseDisplay::All => {
                 self.damage.extend_all();

@@ -4,9 +4,10 @@
 #
 # Same machine-readable layout as csi_spec.txt / decstr_spec.txt (### ID / size / step / cite / note /
 # screen / cursor / pending_wrap / requests / scrollback), parsed by tests/spec/mod.rs. Extra keys the
-# shared parser ignores: flags (xterm-quirk | decision | control | level). `control` rows run a
+# shared parser ignores: flags (xterm-quirk | decision | control | level) and, on a `decision` row that deviates
+# from xterm, xterm_screen (what xterm shows instead; documentation only). `control` rows run a
 # stream without the reset or save the neighbouring row tests (proof the setup is not vacuous);
-# `level` rows start with DECSCL 61 (VT100); `decision` rows encode a choice between sources.
+# `level` rows start with a DECSCL (61 = VT100, 65 = VT500); `decision` rows encode a choice between sources.
 # Cursor is 0-based (row,col). render_screen puts `|` AFTER the cursor's cell; a row ending in `\`
 # is soft-wrapped. Non-ASCII payload is written as \u{..}; expected screens are literal characters.
 #
@@ -824,6 +825,37 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
+### GR16_u00ff_through_a_latin1_gr_with_decnrcm_is_kept
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b*<a\u{ff}b
+cite: [XT-cs] xtermCharSetOut: HandleUPSS makes the level-4 `ESC * <` nrc_ISO_Latin_1_Supp; with NATIONAL `chr = seven` = 0x7F, which isSevenBit(nrc_ISO_Latin_1_Supp) = False keeps, and the `eight >= 128` fix-up sets bit 7 again
+note: The one way a Latin-1 set yields DEL: DECNRCM folds GR onto seven bits. Latin-1 is not a seven-bit set, so U+00FF survives (#223); GR17 is the seven-bit control.
+screen:
+>aÿb |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### GR17_u00ff_through_british_latin1_gr_with_decnrcm_is_dropped
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b.Aa\u{ff}b
+flags: control
+cite: [XT-cp] scs_table: `ESC . A` with DECNRCM is nrc_British_Latin_1; [XT-cs] isSevenBit(nrc_British_Latin_1) = True, so the DEL from `chr = seven` is dropped
+note: Control for GR16: the same stream through a seven-bit 96-set loses U+00FF.
+screen:
+>ab |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
 ### NR_Dutch_4
 size: 3x40
 step: feed \x1b[?42h
@@ -1464,6 +1496,38 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
+### SU13_upss_designation_is_ascii_at_level_5
+size: 3x40
+step: feed \x1b[65;1"p\x1b[?42h
+step: feed \x1b(<a#@
+flags: level
+cite: [XT-cs] HandleUPSS: from level 5 the set is gsets_upss, which resetCharsets makes nrc_ASCII in UTF-8 mode; [XT-cp] scs_table nrc_DEC_UPSS `<` levels 3 to 9
+note: With DECNRCM on, ISO Latin-1 would map # to £ (SU14), so the row tells ASCII from Latin-1 at level 5 (#223).
+screen:
+>a#@ |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SU14_upss_designation_with_decnrcm_maps_the_pound_at_level_4
+size: 3x40
+step: feed \x1b[?42h
+step: feed \x1b(<a#@
+flags: control
+cite: [XT-cs] HandleUPSS: level 3 or 4 -> nrc_ISO_Latin_1_Supp; xtermCharSetOut case nrc_ISO_Latin_1_Supp with NATIONAL: `chr = seven`, 0x23 -> the pound sign
+note: Control for SU13: at level 4 the same stream is Latin-1, which DECNRCM makes map #.
+screen:
+>a£@ |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
 ### SC01_decsc_saves_g0
 size: 3x40
 step: feed \x1b(0\x1b7\x1b(B\x1b8q
@@ -1648,6 +1712,82 @@ cite: [XT-cu] curss is not part of SavedCursor, and CursorRestore does not clear
 note: The single shift set after DECSC is still pending after DECRC (G2 special) and applies to l.
 screen:
 >┌ |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC15_rep_after_single_shift_repeats_the_translated_character
+size: 3x40
+step: feed \x1b*0\x1bNl\x1b[2b
+flags: decision
+cite: [XT-cp] CASE_REP re-translates sp->lastchar (the raw 'l') through gsets[curgl]; curss is already 0 (WriteNow). Tessera deviates (ADR 0033); GNOME VTE also maps the stored unmapped character again (vte.cc c_unmapped) but ignores SS2/SS3, so it shows lll
+note: Tessera: ┌┌┌. xterm: ┌ll (G2 special applies to the shifted 'l' only; the repeats go through GL = ASCII).
+screen:
+>┌┌┌ |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+xterm_screen: ┌ll
+
+### SC16_rep_after_single_shift_to_a_plainer_set
+size: 3x40
+step: feed \x1b(0\x1b*B\x1bNl\x1b[2b
+flags: decision
+cite: [XT-cp] CASE_REP, as SC15: xterm re-translates 'l' through GL (G0 = DEC special) and gives l┌┌; the single shift (G2 ASCII) applied to the first 'l' only
+note: Tessera: lll. xterm: l┌┌. The deviation is not only "special graphics after a single shift".
+screen:
+>lll |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+xterm_screen: l┌┌
+
+### SC17_rep_without_single_shift_agrees_with_xterm
+size: 3x40
+step: feed \x1b(0l\x1b[2b
+flags: control
+cite: [XT-cp] CASE_REP; without curss the raw 'l' through GL is the translated cell. Same as PR03
+screen:
+>┌┌┌ |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### SC18_ris_clears_the_alternate_screens_saved_charsets
+size: 3x40
+step: feed \x1b[?1047h\x1b(0\x1b7\x1bc\x1b[?1047h\x1b8q
+flags: decision
+cite: [XT-cp] ReallyReset(full): FromAlternate, then CursorSave into sc[whichBuf] = sc[0]; sc[1] is never written and its `saved` flag never cleared ([XT-cu] CursorSave). Tessera clears the alternate slot on RIS (ADR 0033)
+note: Tessera: q (RIS cleared the alternate slot, so DECRC resets the sets). xterm: ─ (the slot still holds G0 = DEC special).
+screen:
+>q |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+xterm_screen: ─
+
+### SC19_control_alt_slot_survives_leaving_the_alternate_screen
+size: 3x40
+step: feed \x1b[?1047h\x1b(0\x1b7\x1b[?1047l\x1b[?1047h\x1b8q
+flags: control
+cite: [XT-cu] CursorSave/CursorRestore per whichBuf: the alternate slot survives leaving and re-entering the alternate screen. Proves SC18's setup saves a slot
+screen:
+>─ |
 >
 >
 cursor: (0,1)

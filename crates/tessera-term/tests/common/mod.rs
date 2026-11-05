@@ -206,6 +206,9 @@ impl Script {
 /// pass vacuously), when any row failed, or, unfiltered, when the table did
 /// not have exactly `expected_rows` rows (so a row lost from a table cannot
 /// pass silently).
+///
+/// `tessera-grid`'s `tests/common/table.rs` holds a copy of this and of
+/// [`check_table_filtered`] (#173, #270): change both together.
 pub fn check_table<I: Display, R>(
     table: &str,
     expected_rows: usize,

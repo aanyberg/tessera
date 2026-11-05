@@ -36,7 +36,7 @@ const FIXTURE: &str = include_str!("fixtures/c1_spec.txt");
 const FIXTURE_NAME: &str = "fixtures/c1_spec.txt";
 
 /// `###` rows in the fixture, so a row lost from it cannot pass silently.
-const ROWS: usize = 119;
+const ROWS: usize = 120;
 
 /// What an output row encodes.
 #[derive(Debug, Clone)]
