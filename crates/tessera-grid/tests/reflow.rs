@@ -11,13 +11,17 @@
 //!   setup steps and after every resize with the row's blocks.
 //! - One snapshot per `tests/scripts/reflow/*.txt` script (one script per
 //!   fixture row, see [`every_fixture_row_has_a_script`]) pins the same
-//!   states in review-friendly form.
+//!   states in review-friendly form. [`every_script_matches_its_snapshot`]
+//!   runs every script in one test; `TESSERA_TABLE_ROW=<script stem>` runs
+//!   one alone.
 //! - Property tests check the fixture's properties P1-P7 on random content
 //!   and sizes.
 
 mod common;
 #[path = "common/reflow.rs"]
 mod reflow_spec;
+#[path = "common/table.rs"]
+mod table;
 
 use std::path::{Path, PathBuf};
 
@@ -93,73 +97,103 @@ fn snapshot_script(name: &str) {
     });
 }
 
-macro_rules! script_tests {
-    ($($name:ident),* $(,)?) => {
-        /// Every script with a snapshot test, by file stem.
-        const SCRIPTS: &[&str] = &[$(stringify!($name)),*];
-        $(
-            #[test]
-            fn $name() {
-                snapshot_script(stringify!($name));
+/// Every entry of `tests/scripts/reflow`, sorted by file name.
+fn script_dir_entries() -> Vec<PathBuf> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(scripts_dir())
+        .expect("tests/scripts/reflow exists")
+        .map(|entry| entry.expect("readable directory entry").path())
+        .collect();
+    entries.sort();
+    entries
+}
+
+/// The scripts with no fixture row (lead decisions), by file stem, so
+/// deleting one fails [`every_fixture_row_has_a_script`].
+const EXTRA_SCRIPTS: &[&str] = &["x01_readline_blank_continuation_row"];
+
+/// The table over a listing of `tests/scripts/reflow`: its label, its row
+/// count and one `(stem, stem)` row per `.txt` script.
+///
+/// The row count is the number of entries, so a file that is not a `.txt`
+/// script fails the table, and the label then names those entries.
+fn script_table(entries: &[PathBuf]) -> (String, usize, Vec<(String, String)>) {
+    let mut scripts = Vec::new();
+    let mut others = Vec::new();
+    for path in entries {
+        let stem = path.file_stem().and_then(|stem| stem.to_str());
+        match stem {
+            Some(stem) if path.extension().is_some_and(|ext| ext == "txt") => {
+                scripts.push((stem.to_owned(), stem.to_owned()));
             }
-        )*
+            _ => others.push(path.file_name().map_or_else(
+                || path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            )),
+        }
+    }
+    let label = if others.is_empty() {
+        "reflow scripts".to_owned()
+    } else {
+        format!("reflow scripts (not .txt scripts: {})", others.join(", "))
     };
+    (label, entries.len(), scripts)
 }
 
-script_tests! {
-    a01_wrapped_line_split_and_rejoined,
-    x01_readline_blank_continuation_row,
-    a02_hard_lines_are_never_joined,
-    a03_shrink_pushes_history_grow_pulls_back,
-    b01_wide_char_lands_on_new_last_column,
-    b02_wide_char_stranded_blank_as_content,
-    b03_genuine_space_before_wide_char,
-    b04_cluster_cell_moves_with_its_text,
-    b05_wide_cluster_flag_across_split,
-    b06_wide_char_cannot_fit_one_column,
-    c01_hard_line_trailing_blanks_dropped_and_repadded,
-    c02_wrapped_row_trailing_spaces_are_content,
-    c03_blank_hard_rows_are_lines,
-    d01_cursor_on_last_cell_of_wrapped_row,
-    d02_cursor_on_blank_past_text,
-    d03_pending_wrap_armed_on_full_row,
-    d04_pending_wrap_with_text_continuing_to_cleared,
-    d05_cursor_below_text_rows_follows_blank_rows,
-    d06_cursor_on_row_zero_rows_shrink,
-    d07_cursor_at_bottom_rows_shrink_pushes_top,
-    d08_grow_rows_pulls_fewer_than_requested,
-    d09_scrollback_cap_full_rows_shrink_evicts_oldest,
-    d10_scrollback_cap_full_columns_shrink_evicts_oldest,
-    e01_alt_screen_truncates_primary_reflows,
-    e02_alt_screen_shrink_rows_keeps_cursor_row,
-    e03_alt_screen_wide_char_cut_by_new_edge,
-    e04_leave_alt_after_resize_restores_consistent_primary,
-    f01_marks_stay_on_first_row_of_logical_line,
-    f02_marks_on_hard_lines_stay_with_their_line,
-    b07_wide_char_strands_a_column_on_grow,
-    b08_cursor_on_wide_char_spacer_follows_base,
-    g01_saved_cursor_clamped,
-    g02_saved_cursor_pending_flag_row_only_resize,
-    h01_tab_stops_after_resize,
-    h02_scroll_region_reset_by_any_real_resize,
-    i01_one_column_grid,
-    i02_one_row_grid,
-    i03_one_by_one_and_zero_clamp,
-    j01_same_size_is_a_noop,
-    j02_row_only_change_does_not_rewrap,
-    k01_both_dimensions_at_once,
-    k02_logical_line_spanning_scrollback_and_screen,
-    l01_pad_rows_use_default_pen_not_current_pen,
-    l02_scrollback_cap_zero,
+/// Every `tests/scripts/reflow/*.txt` script matches its snapshot, in one
+/// test (see [`table::check_table`]): a failure names every failing script,
+/// and `TESSERA_TABLE_ROW=<script stem>` runs one script alone.
+///
+/// The row count is the number of entries in the directory (see
+/// [`script_table`]), so a script the table skips, or a file that is not a
+/// `.txt` script, fails it.
+#[test]
+fn every_script_matches_its_snapshot() {
+    let (label, expected_rows, scripts) = script_table(&script_dir_entries());
+    table::check_table(&label, expected_rows, scripts, |name| {
+        snapshot_script(&name);
+    });
 }
 
-/// Each fixture row has a script with exactly its size, cap and steps, and
-/// every script on disk has a snapshot test.
+/// A listing with only scripts gives one row per script and the plain label.
+#[test]
+fn the_script_table_has_a_row_per_script() {
+    let (label, expected_rows, scripts) =
+        script_table(&[PathBuf::from("dir/a.txt"), PathBuf::from("dir/b.txt")]);
+    assert_eq!(label, "reflow scripts");
+    assert_eq!(expected_rows, 2);
+    assert_eq!(
+        scripts,
+        [("a".into(), "a".into()), ("b".into(), "b".into())]
+    );
+}
+
+/// A stray file (Finder's `.DS_Store`, a `.snap.new`, a subdirectory) fails
+/// the table and is named.
+#[test]
+#[should_panic(
+    expected = "reflow scripts (not .txt scripts: .DS_Store, a.snap.new): rows run vs rows in the fixture"
+)]
+fn a_stray_file_among_the_scripts_fails_by_name() {
+    let (label, expected_rows, scripts) = script_table(&[
+        PathBuf::from("dir/.DS_Store"),
+        PathBuf::from("dir/a.snap.new"),
+        PathBuf::from("dir/a.txt"),
+    ]);
+    table::check_table_filtered(&label, expected_rows, scripts, |_| {}, None);
+}
+
+/// Each fixture row has a script with exactly its size, cap and steps; the
+/// scripts on disk are exactly the fixture rows and [`EXTRA_SCRIPTS`], so
+/// deleting any script fails by name; and every `reflow__*.snap` has a
+/// script, so an orphaned snapshot fails too.
+/// ([`every_script_matches_its_snapshot`] runs every script on disk.)
 #[test]
 fn every_fixture_row_has_a_script() {
     let mut errors = Vec::new();
+    let mut pinned: Vec<String> = EXTRA_SCRIPTS.iter().map(|&name| name.to_owned()).collect();
     for row in rows() {
         let name = row.id.to_ascii_lowercase();
+        pinned.push(name.clone());
         let path = scripts_dir().join(format!("{name}.txt"));
         if !path.exists() {
             errors.push(format!(
@@ -171,20 +205,112 @@ fn every_fixture_row_has_a_script() {
         if Script::load(&path) != row.to_script() {
             errors.push(format!("{name}: script differs from the fixture row"));
         }
-        if !SCRIPTS.contains(&name.as_str()) {
-            errors.push(format!("{name}: add it to `script_tests!`"));
+    }
+    let (_, _, on_disk) = script_table(&script_dir_entries());
+    let on_disk: Vec<String> = on_disk.into_iter().map(|(name, _)| name).collect();
+    for name in EXTRA_SCRIPTS {
+        if !on_disk.iter().any(|script| script == name) {
+            errors.push(format!("{name}: no script (listed in EXTRA_SCRIPTS)"));
         }
     }
-    let on_disk = std::fs::read_dir(scripts_dir())
-        .expect("tests/scripts/reflow exists")
-        .count();
-    if on_disk != SCRIPTS.len() {
-        errors.push(format!(
-            "{on_disk} scripts on disk, {} tested",
-            SCRIPTS.len()
-        ));
+    for name in &on_disk {
+        if !pinned.contains(name) {
+            errors.push(format!(
+                "{name}: script with no fixture row; add it to EXTRA_SCRIPTS"
+            ));
+        }
+    }
+    let snapshots = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots");
+    for entry in std::fs::read_dir(snapshots).expect("tests/snapshots exists") {
+        let file = entry.expect("readable directory entry").file_name();
+        let file = file.to_string_lossy();
+        let Some(name) = file
+            .strip_prefix("reflow__")
+            .and_then(|rest| rest.strip_suffix(".snap"))
+        else {
+            continue;
+        };
+        if !on_disk.iter().any(|script| script == name) {
+            errors.push(format!("{file}: snapshot with no script"));
+        }
     }
     assert!(errors.is_empty(), "{}", errors.join("\n"));
+}
+
+// --------------------------------------------------------- table helper
+
+/// Three rows `a`, `b`, `c`, each its own id.
+fn abc() -> [(&'static str, &'static str); 3] {
+    ["a", "b", "c"].map(|id| (id, id))
+}
+
+/// Unfiltered, every row runs once, in order.
+#[test]
+fn the_table_runs_every_row() {
+    let mut ran = Vec::new();
+    table::check_table_filtered("abc", 3, abc(), |id| ran.push(id), None);
+    assert_eq!(ran, ["a", "b", "c"]);
+}
+
+/// An empty table cannot pass vacuously.
+#[test]
+#[should_panic(expected = "abc: a table needs at least one row (expected_rows is 0)")]
+fn a_table_expecting_no_rows_fails() {
+    table::check_table_filtered("abc", 0, [] as [(&str, &str); 0], |_| {}, None);
+}
+
+/// Unfiltered, a table whose row count differs from the fixture's fails.
+#[test]
+#[should_panic(expected = "abc: rows run vs rows in the fixture")]
+fn a_lost_row_fails() {
+    table::check_table_filtered("abc", 4, abc(), |_| {}, None);
+}
+
+/// Every failing row runs and is named, not only the first.
+#[test]
+#[should_panic(expected = "abc: 2 of 3 rows failed (messages above): a, c")]
+fn every_failing_row_is_named() {
+    table::check_table_filtered("abc", 3, abc(), |id| assert_eq!(id, "b"), None);
+}
+
+/// `TESSERA_TABLE_ROW` runs exactly the listed rows and skips the count.
+#[test]
+fn the_row_filter_runs_only_matching_rows() {
+    let mut ran = Vec::new();
+    table::check_table_filtered("abc", 3, abc(), |id| ran.push(id), Some("c,a"));
+    assert_eq!(ran, ["a", "c"]);
+    ran.clear();
+    table::check_table_filtered("abc", 3, abc(), |id| ran.push(id), Some("b"));
+    assert_eq!(ran, ["b"]);
+}
+
+/// A filter that matches no row fails and names itself.
+#[test]
+#[should_panic(expected = "abc: TESSERA_TABLE_ROW=NO_SUCH_ROW matched no row")]
+fn a_row_filter_that_matches_nothing_fails() {
+    table::check_table_filtered("abc", 3, abc(), |_| {}, Some("NO_SUCH_ROW"));
+}
+
+/// A filtered row that fails still fails the table.
+#[test]
+#[should_panic(expected = "abc: 1 of 1 rows failed (messages above): b")]
+fn a_failing_filtered_row_fails() {
+    table::check_table_filtered("abc", 3, abc(), |id| assert_ne!(id, "b"), Some("b"));
+}
+
+/// A listed id that matches no row while another does is returned (and
+/// printed), not failed: it may name another table's row.
+#[test]
+fn a_listed_row_id_that_matches_nothing_is_reported_not_failed() {
+    let mut ran = Vec::new();
+    let unmatched =
+        table::check_table_filtered("abc", 3, abc(), |id| ran.push(id), Some("b,NO_SUCH_ROW,a"));
+    assert_eq!(ran, ["a", "b"]);
+    assert_eq!(unmatched, ["NO_SUCH_ROW"]);
+    let unmatched = table::check_table_filtered("abc", 3, abc(), |_| {}, Some("a,b"));
+    assert_eq!(unmatched, Vec::<String>::new());
+    let unmatched = table::check_table_filtered("abc", 3, abc(), |_| {}, None);
+    assert_eq!(unmatched, Vec::<String>::new());
 }
 
 // ------------------------------------------------------------- invariants
