@@ -35,6 +35,25 @@
 - Prefer snapshot tests (`insta`) for emulator behaviour and property tests
   for parsers.
 
+## Which tests to run
+
+Pick the cheapest check that covers the change while you work; the full gate runs once before a push.
+
+| Stage | Command | Covers |
+|---|---|---|
+| Iterating | `cargo nextest run -p <crate>` | one crate |
+| After a change | `just test-affected` (`--clippy` to lint too; `--base <ref>`; `-- <nextest args>`) | every crate your change touches since the merge base with `main` (committed, staged, unstaged and untracked), plus every crate that depends on them |
+| Swift or `tessera-ffi` surface | `just app-test` | the XCTest suites (Xcode, Thread Sanitizer); the gate does not run them, CI does |
+| Docs, scripts, CI | the matching check: `actionlint`, `just config-docs-check` | no Rust test is affected |
+| `shell-integration/` | `just test-affected` (selects `tessera-shell-integration` and `tessera-term`, which read it), plus `just terminfo-check` for the terminfo entry | the shell scripts and the terminfo entry |
+| Before any push or PR | `scripts/quality-gate.sh <worktree>` | everything: fmt, clippy, workspace tests, rustdoc, deny, FFI build and C tests, release timing tests, fuzz fmt and clippy |
+
+`just test-affected --list` prints the affected crates without running anything. A change to a root manifest,
+`Cargo.lock`, the toolchain pin or the nextest, clippy, rustfmt or deny config affects every crate. Dependencies point
+downward only, so a change in `tessera-vt` or `tessera-grid` reaches most of the workspace and a change in
+`tessera-cli` only itself. The targeted run is a feedback loop, not a gate: it can miss what only the whole workspace
+shows (build scripts, the FFI header, the Swift consumers).
+
 ## Tests and the home directory
 
 Tests never read or write the real home directory. Tests that create an

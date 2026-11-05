@@ -28,6 +28,14 @@ test:
 deny:
     cargo deny check
 
+# Inner loop: tests of the crates your change touches (vs main) and every crate that depends on them; `just test-affected --clippy` lints them first. Not a gate: scripts/quality-gate.sh still runs before a push
+test-affected *args:
+    scripts/affected-tests.sh {{args}}
+
+# Check scripts/affected-tests.sh: change-to-crate mapping and dependents, in a throwaway workspace
+affected-tests-test:
+    zsh scripts/test-affected-tests.sh
+
 # Regenerate docs/config.md from the tessera-config types (doc comments and defaults)
 config-docs:
     cargo xtask config-docs
