@@ -273,6 +273,11 @@ impl Default for Appearance {
 pub struct Terminal {
     /// Maximum number of scrollback lines kept per pane. Applies to sessions
     /// started after a change; running sessions keep the size they started with.
+    /// Large values cost time on every width change: resizing a window
+    /// re-wraps the whole history while the terminal is locked, about 0.2 ms
+    /// per 1,000 lines (1-4 ms at 10,000 lines, 14-41 ms at 100,000), so at
+    /// the 10,000,000 limit a full history takes about 18 GB of memory and
+    /// each resize stalls the pane for 2-4 seconds.
     pub scrollback_lines: u32,
     /// Shell integration for zsh and fish (bash support is to follow):
     /// `"auto"` makes the shells Tessera starts load its scripts, which mark
@@ -285,7 +290,12 @@ pub struct Terminal {
     /// Neovim do over `ssh`): up to 1 MiB of text per write. Programs can
     /// never read the clipboard. A value that is not `true` or `false` is
     /// reported with a warning and counts as `false`: writes are refused
-    /// until it is fixed. Applies to every session at once when changed.
+    /// until it is fixed. When Tessera starts with a `config.toml` that does
+    /// not load at all (a syntax error anywhere in it, such as
+    /// `clipboard_write = off` without quotes, a duplicate key, or a file
+    /// that is not UTF-8), writes are refused as well until the file is
+    /// fixed, while the other defaults apply. Applies to every session at
+    /// once when changed.
     #[serde(deserialize_with = "load::lenient_clipboard_write")]
     pub clipboard_write: bool,
 }

@@ -20,6 +20,14 @@ use crate::{Config, Error};
 /// to [`Config::default()`] when `config.toml` cannot be loaded, and a reload
 /// that fails keeps the last good configuration. In both cases
 /// [`ConfigStore::last_error`] holds the error until a later load succeeds.
+///
+/// A failed load fails closed for clipboard writes while the store has
+/// never loaded successfully (D8; docs/security.md): `config.toml` exists
+/// but cannot be applied at launch, so the user's
+/// `terminal.clipboard_write` setting is unknown, and the store holds its
+/// configuration with `clipboard_write = false` until a load succeeds.
+/// Once a load has succeeded (a missing file counts: it applies the
+/// defaults), a failed load keeps the last good configuration unchanged.
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
     paths: ConfigPaths,
@@ -39,6 +47,9 @@ pub(crate) struct State {
     theme_warnings: Vec<Warning>,
     /// Why the most recent load failed; `None` when it succeeded.
     pub(crate) error: Option<Error>,
+    /// Whether a load has succeeded on this store ([`ConfigStore::apply`]
+    /// ran). Until one has, [`ConfigStore::record_error`] fails closed.
+    loaded: bool,
     /// Every live [`Watcher`]'s event channel. A change applied by any
     /// watcher thread is sent to all of them, so several watchers on one
     /// store each see every event. A watcher thread removes its own entry
@@ -64,9 +75,11 @@ impl ConfigStore {
     ///
     /// A `config.toml` that cannot be loaded (it does not parse, is not
     /// UTF-8, is unreadable, or is a directory) does not fail the open: the
-    /// defaults are applied, the error is logged and kept in
-    /// [`ConfigStore::last_error`], and a watcher or [`ConfigStore::reload`]
-    /// picks up the repaired file later. A `profiles/` or `themes/`
+    /// defaults are applied with `terminal.clipboard_write = false` (writes
+    /// are refused until the file is fixed, since the file may turn them
+    /// off), the error is logged and kept in [`ConfigStore::last_error`],
+    /// and a watcher or [`ConfigStore::reload`] applies the repaired file
+    /// later. A `profiles/` or `themes/`
     /// directory that cannot be created (a read-only root, say) is logged
     /// and otherwise ignored. Only a failure to create the root or to write
     /// the default file is returned as an error, since without them nothing
@@ -96,7 +109,7 @@ impl ConfigStore {
                     target: "tessera_config",
                     path = %file.display(),
                     %error,
-                    "config could not be loaded; using defaults until it is fixed"
+                    "config could not be loaded; using defaults, with clipboard writes refused, until it is fixed"
                 );
                 store.record_error(error);
             }
@@ -107,6 +120,11 @@ impl ConfigStore {
     /// A store that never touches disk, holding `config` as the applied
     /// value. `paths` is still used by [`ConfigStore::watch`] and
     /// [`ConfigStore::reload`].
+    ///
+    /// `config` does not count as a successful load: if the first load
+    /// ([`ConfigStore::reload`] or a watcher's) fails, the store fails
+    /// closed and holds `config` with `terminal.clipboard_write = false`,
+    /// as [`ConfigStore::open`] does with the defaults.
     pub fn in_memory(paths: ConfigPaths, config: Config) -> Self {
         Self {
             paths,
@@ -115,6 +133,7 @@ impl ConfigStore {
                 warnings: Vec::new(),
                 theme_warnings: Vec::new(),
                 error: None,
+                loaded: false,
                 subscribers: Vec::new(),
                 next_subscription: 0,
                 themes: None,
@@ -184,7 +203,7 @@ impl ConfigStore {
     /// Why the most recent load failed, or `None` when it succeeded.
     ///
     /// Set by [`ConfigStore::open`] (the file could not be loaded; defaults are
-    /// applied), by [`ConfigStore::reload`] and by a [`Watcher`] (the last
+    /// applied, clipboard writes refused), by [`ConfigStore::reload`] and by a [`Watcher`] (the last
     /// good configuration stays applied). Cleared by the next successful
     /// load, which also reports a `Changed` event or a `Some` reload result
     /// even when the configuration itself did not change, so the application
@@ -199,7 +218,9 @@ impl ConfigStore {
     /// applied configuration when it differs from the current one or when
     /// this load recovered from an earlier failure, `None` when nothing
     /// changed. On a parse error the current configuration is kept and the
-    /// error is both returned and remembered in [`ConfigStore::last_error`].
+    /// error is both returned and remembered in [`ConfigStore::last_error`];
+    /// when no load has succeeded on this store yet, the kept configuration
+    /// has `terminal.clipboard_write` set to `false` (see [`ConfigStore`]).
     pub fn reload(&self) -> Result<Option<Arc<Config>>, Error> {
         match self.load_from_disk() {
             Ok(loaded) => Ok(self.apply(loaded)),
@@ -285,6 +306,7 @@ impl ConfigStore {
     /// previous failure.
     pub(crate) fn apply(&self, loaded: Loaded) -> Option<Arc<Config>> {
         let mut state = self.write();
+        state.loaded = true;
         let recovered = state.error.take().is_some();
         if !recovered && *state.config == loaded.config && state.warnings == loaded.warnings {
             return None;
@@ -311,7 +333,10 @@ impl ConfigStore {
         news
     }
 
-    /// Remembers a failed load; the applied configuration is untouched.
+    /// Remembers a failed load. The applied configuration is untouched,
+    /// except that while no load has succeeded on this store its
+    /// `terminal.clipboard_write` is set to `false` (fail closed; see
+    /// [`ConfigStore`]), which is logged once.
     ///
     /// Returns whether the error is news: `false` when the store already
     /// holds an error with the same text, so two watchers that both load
@@ -324,6 +349,16 @@ impl ConfigStore {
             .as_ref()
             .is_some_and(|previous| previous.to_string() == error.to_string());
         state.error = Some(error);
+        if !state.loaded && state.config.terminal.clipboard_write {
+            let mut config = (*state.config).clone();
+            config.terminal.clipboard_write = false;
+            state.config = Arc::new(config);
+            tracing::warn!(
+                target: "tessera_config",
+                path = %self.paths.config_file().display(),
+                "config.toml could not be loaded at launch; clipboard writes (OSC 52) are refused until it loads"
+            );
+        }
         !same
     }
 
@@ -344,6 +379,142 @@ impl ConfigStore {
 mod tests {
     use super::*;
     use crate::load::DEFAULT_CONFIG_TOML;
+
+    /// [`Config::default()`] with clipboard writes refused: what a store
+    /// holds after its first load failed (D8).
+    fn refusing_defaults() -> Config {
+        let mut config = Config::default();
+        config.terminal.clipboard_write = false;
+        config
+    }
+
+    /// Files that exist but cannot be applied, by what is wrong with them.
+    /// The first five are the ways a user turning clipboard writes off can
+    /// get the syntax wrong (#233 item 7); every one is a load error, not a
+    /// lenient-key warning.
+    const BROKEN: &[(&str, &[u8])] = &[
+        ("False", b"[terminal]\nclipboard_write = False\n"),
+        ("no", b"[terminal]\nclipboard_write = no\n"),
+        ("off", b"[terminal]\nclipboard_write = off\n"),
+        ("empty value", b"[terminal]\nclipboard_write =\n"),
+        (
+            "duplicate key",
+            b"[terminal]\nclipboard_write = false\nclipboard_write = false\n",
+        ),
+        (
+            "not UTF-8",
+            b"[terminal]\nclipboard_write = false\n# caf\xE9\n",
+        ),
+        (
+            "unrelated syntax error",
+            b"[terminal]\nclipboard_write = false\n[appearance\nfont_size = 20\n",
+        ),
+    ];
+
+    /// D8: a file that exists but cannot be loaded at launch refuses
+    /// clipboard writes, through [`ConfigStore::open`] and through the
+    /// app-core path (an in-memory store with the defaults, then
+    /// [`ConfigStore::reload`]); the error is reported, and the repaired
+    /// file applies normally.
+    #[test]
+    fn a_broken_file_at_launch_refuses_clipboard_writes_until_repaired() {
+        for &(what, bytes) in BROKEN {
+            for via_reload in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let paths = ConfigPaths::new(dir.path());
+                std::fs::write(paths.config_file(), bytes).unwrap();
+                let store = if via_reload {
+                    let store = ConfigStore::in_memory(paths.clone(), Config::default());
+                    assert!(store.reload().is_err(), "{what}: reload reports the error");
+                    store
+                } else {
+                    ConfigStore::open(paths.clone()).unwrap()
+                };
+                assert!(
+                    !store.config().terminal.clipboard_write,
+                    "{what} (reload: {via_reload}): writes refused"
+                );
+                assert_eq!(*store.config(), refusing_defaults(), "{what}");
+                assert!(
+                    matches!(store.last_error(), Some(Error::Parse(_) | Error::Utf8(_))),
+                    "{what}: {:?}",
+                    store.last_error()
+                );
+                // Still refused on a second failure.
+                assert!(store.reload().is_err());
+                assert!(!store.config().terminal.clipboard_write, "{what}");
+
+                std::fs::write(paths.config_file(), "[appearance]\nfont_size = 20\n").unwrap();
+                let applied = store.reload().unwrap().expect("the repair is reported");
+                assert!(applied.terminal.clipboard_write, "{what}: repaired");
+                assert_eq!(applied.appearance.font_size, 20.0);
+                assert!(store.last_error().is_none());
+            }
+        }
+    }
+
+    /// A missing file is a successful load of the defaults: writes on, at
+    /// launch and after a later broken file (that is a failed reload, which
+    /// keeps the last good configuration).
+    #[test]
+    fn a_missing_file_allows_clipboard_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(dir.path());
+        let store = ConfigStore::in_memory(paths.clone(), Config::default());
+        assert!(store.reload().unwrap().is_none(), "nothing changed");
+        assert!(store.config().terminal.clipboard_write);
+        assert!(store.last_error().is_none());
+        std::fs::write(paths.config_file(), BROKEN[0].1).unwrap();
+        assert!(store.reload().is_err());
+        assert!(store.config().terminal.clipboard_write, "last good kept");
+
+        // `open` writes the commented default file, which allows writes.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConfigStore::open(ConfigPaths::new(dir.path())).unwrap();
+        assert!(store.config().terminal.clipboard_write);
+    }
+
+    /// A reload to a broken file keeps the last good value of the switch,
+    /// `true` or `false`: only a store that never loaded fails closed.
+    #[test]
+    fn a_broken_reload_keeps_the_last_good_clipboard_switch() {
+        for good in [true, false] {
+            for &(what, bytes) in BROKEN {
+                let dir = tempfile::tempdir().unwrap();
+                let paths = ConfigPaths::new(dir.path());
+                std::fs::write(
+                    paths.config_file(),
+                    format!("[terminal]\nclipboard_write = {good}\n[appearance]\nfont_size = 20\n"),
+                )
+                .unwrap();
+                let store = ConfigStore::open(paths.clone()).unwrap();
+                assert_eq!(store.config().terminal.clipboard_write, good);
+                std::fs::write(paths.config_file(), bytes).unwrap();
+                assert!(store.reload().is_err(), "{what}");
+                assert_eq!(store.config().terminal.clipboard_write, good, "{what}");
+                assert_eq!(store.config().appearance.font_size, 20.0, "{what}");
+                assert!(store.last_error().is_some());
+            }
+        }
+    }
+
+    /// A watcher's first load fails closed too when nothing loaded before
+    /// it (an in-memory store watched without a reload).
+    #[test]
+    fn a_watchers_first_failed_load_refuses_clipboard_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(dir.path());
+        std::fs::write(paths.config_file(), BROKEN[1].1).unwrap();
+        let store = ConfigStore::in_memory(paths, Config::default());
+        let _watcher = store
+            .watch(WatchOptions {
+                backend: crate::WatchBackend::Poll,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(store.last_error().is_some());
+        assert!(!store.config().terminal.clipboard_write);
+    }
 
     #[test]
     fn open_writes_defaults_and_creates_dirs() {
@@ -382,7 +553,7 @@ mod tests {
         std::fs::write(paths.config_file(), "[appearance\n").unwrap();
 
         let store = ConfigStore::open(paths.clone()).unwrap();
-        assert_eq!(*store.config(), Config::default());
+        assert_eq!(*store.config(), refusing_defaults());
         assert!(
             matches!(store.last_error(), Some(Error::Parse(_))),
             "{:?}",
@@ -413,7 +584,7 @@ mod tests {
         )
         .unwrap();
         let store = ConfigStore::open(paths).unwrap();
-        assert_eq!(*store.config(), Config::default());
+        assert_eq!(*store.config(), refusing_defaults());
         assert!(
             matches!(store.last_error(), Some(Error::Utf8(_))),
             "{:?}",
@@ -428,7 +599,7 @@ mod tests {
         let paths = ConfigPaths::new(dir.path());
         std::fs::create_dir(paths.config_file()).unwrap();
         let store = ConfigStore::open(paths).unwrap();
-        assert_eq!(*store.config(), Config::default());
+        assert_eq!(*store.config(), refusing_defaults());
         assert!(
             matches!(store.last_error(), Some(Error::Io(_))),
             "{:?}",
@@ -446,7 +617,7 @@ mod tests {
                 .unwrap();
             if std::fs::read(paths.config_file()).is_err() {
                 let store = ConfigStore::open(paths.clone()).unwrap();
-                assert_eq!(*store.config(), Config::default());
+                assert_eq!(*store.config(), refusing_defaults());
                 assert!(matches!(store.last_error(), Some(Error::Io(_))));
                 std::fs::set_permissions(
                     paths.config_file(),

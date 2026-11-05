@@ -181,25 +181,34 @@ impl Config {
     /// (for example [`Terminal::MAX_SCROLLBACK_LINES`](crate::Terminal::MAX_SCROLLBACK_LINES))
     /// are clamped with a warning.
     pub fn from_toml_lenient(text: &str) -> Result<Loaded, Error> {
-        let de = toml::de::Deserializer::parse(text)?;
-        // The document again, with spans: where each warning's key is (for
-        // document order) and the values the lenient keys replaced. It
-        // parsed once already, so it parses again.
-        let root = toml::de::DeTable::parse(text)?.into_inner();
+        // Parsed once (#233 item 6). The deserializer consumes its tree,
+        // and the warnings need the document with spans afterwards (where
+        // each warning's key is, for document order, and the values the
+        // lenient keys replaced), so they get a copy of the part they can
+        // look at: see `position_tree`.
+        let document = toml::de::DeTable::parse(text)?;
+        let root = position_tree(document.get_ref());
+        let de = toml::de::Deserializer::from(document);
         let mut warnings = Vec::new();
         let mut omitted = 0usize;
-        let mut config: Config = serde_ignored::deserialize(de, |path| {
+        let config = serde_ignored::deserialize(de, |path| {
             if warnings.len() < MAX_UNKNOWN_KEY_WARNINGS {
                 let steps = path_steps(&path);
                 warnings.push((
                     position(&root, &steps),
                     Warning::UnknownKey {
-                        path: truncated(&dotted_path(&path), MAX_WARNING_PATH_LEN),
+                        path: escaped(&dotted_path(&path), MAX_WARNING_PATH_LEN),
                     },
                 ));
             } else {
                 omitted += 1;
             }
+        });
+        // A deserializer made from a parsed tree does not know the text, so
+        // its errors lack the quoted line `Deserializer::parse` gives them.
+        let mut config: Config = config.map_err(|mut error| {
+            error.set_input(Some(text));
+            error
         })?;
         if omitted > 0 {
             warnings.push((usize::MAX, Warning::UnknownKeysOmitted { count: omitted }));
@@ -248,6 +257,35 @@ impl Config {
         }
         warnings
     }
+}
+
+/// The top-level keys of [`Config`], as written in `config.toml`. A test
+/// checks them against the serialised defaults.
+const CONFIG_KEYS: [&str; 5] = ["general", "appearance", "terminal", "profiles", "plugins"];
+
+/// The part of `document` the warnings look up, copied: every top-level
+/// key with its span, and the value only under the keys of [`Config`].
+///
+/// Warnings name a key only where the deserializer looked, and it never
+/// looks inside the value of an unknown top-level key (that key itself is
+/// the warning), so such a value is replaced by a placeholder. A file full
+/// of unknown tables thus costs one copy of its top-level keys rather than
+/// of the whole tree. Copying is cheaper than parsing the text again (a
+/// 16 MiB file loads in 0.53-0.73x the instructions it took with two
+/// parses), and the copy borrows its strings from the text unless they
+/// hold escapes.
+fn position_tree<'i>(document: &toml::de::DeTable<'i>) -> toml::de::DeTable<'i> {
+    document
+        .iter()
+        .map(|(key, value)| {
+            let value = if CONFIG_KEYS.contains(&key.get_ref().as_ref()) {
+                value.clone()
+            } else {
+                toml::Spanned::new(value.span(), toml::de::DeValue::Boolean(false))
+            };
+            (key.clone(), value)
+        })
+        .collect()
 }
 
 /// Renders a `serde_ignored` path the way [`Config::normalize`] names
@@ -373,10 +411,33 @@ fn position(root: &toml::de::DeTable<'_>, steps: &[Step<'_>]) -> usize {
     lookup(root, steps).map_or(usize::MAX, |(at, _)| at)
 }
 
-/// A lenient key's value as written, for its warning.
+/// A lenient key's value as written, for its warning: escaped and capped
+/// by [`escaped`], since a multi-line string or array would otherwise put
+/// line breaks into the log line.
 fn written(text: &str, value: &toml::Spanned<toml::de::DeValue<'_>>) -> String {
     let raw = text.get(value.span()).unwrap_or_default();
-    truncated(raw, MAX_WARNING_PATH_LEN)
+    escaped(raw, MAX_WARNING_PATH_LEN)
+}
+
+/// `text` with every control character (C0, DEL and C1: `\n`, `\t`,
+/// `\u{1b}`, ...) written as its Rust escape, so a warning stays on one
+/// line, then [`truncated`] to at most `max` bytes. Only as much of `text`
+/// is escaped as can survive the cut, so a huge value costs at most `max`
+/// characters of work.
+pub(crate) fn escaped(text: &str, max: usize) -> String {
+    let mut out = String::with_capacity(text.len().min(max + 1));
+    for c in text.chars() {
+        // Past `max`, `truncated` cuts the rest anyway (and adds its marker).
+        if out.len() > max {
+            break;
+        }
+        if c.is_control() {
+            out.extend(c.escape_debug());
+        } else {
+            out.push(c);
+        }
+    }
+    truncated(&out, max)
 }
 
 /// Deserializes `appearance.cursor_shape` without failing: a value that is
@@ -957,6 +1018,132 @@ mod tests {
     fn type_mismatch_is_an_error() {
         let err = Config::from_toml_lenient("[appearance]\nfont_size = \"big\"\n").unwrap_err();
         assert!(matches!(err, Error::Parse(_)));
+        // The deserializer works on the parsed tree, not the text (#233
+        // item 6); the error still names the line and quotes it.
+        let shown = err.to_string();
+        assert!(shown.contains("line 2"), "{shown}");
+        assert!(shown.contains("font_size = \"big\""), "{shown}");
+        let Error::Parse(parse) = &err else {
+            panic!("{err:?}")
+        };
+        assert_eq!(parse.span(), Some(25..30));
+    }
+
+    /// [`CONFIG_KEYS`] are exactly the top-level keys of [`Config`], so
+    /// the position tree keeps every value a warning can point into.
+    #[test]
+    fn config_keys_are_the_top_level_keys() {
+        let table = toml::Table::try_from(Config::default()).unwrap();
+        let mut keys: Vec<&str> = table.keys().map(String::as_str).collect();
+        let mut expected = CONFIG_KEYS.to_vec();
+        keys.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(keys, expected);
+    }
+
+    /// Unknown top-level tables keep their place among the warnings
+    /// although their values are not copied for the lookups.
+    #[test]
+    fn unknown_top_level_tables_keep_document_order() {
+        let text = "[zeta]\nk = 1\n[appearance]\nfnt = 1\n[alpha.beta]\nk = 1\n[terminal]\nclipboard_write = 1\n";
+        let loaded = Config::from_toml_lenient(text).unwrap();
+        let shown: Vec<String> = loaded.warnings.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            shown,
+            [
+                "unknown key `zeta` ignored",
+                "unknown key `appearance.fnt` ignored",
+                "unknown key `alpha` ignored",
+                "`terminal.clipboard_write` out of range: 1 replaced by false, clipboard writes refused (expected true or false)",
+            ]
+        );
+    }
+
+    /// A lenient value written over several lines, or holding a tab or a
+    /// C1 control, gives a one-line warning with the controls escaped
+    /// (S8; #233 item 3).
+    #[test]
+    fn a_multi_line_value_gives_a_one_line_warning() {
+        for (value, shown) in [
+            ("\"\"\"a\nb\"\"\"", "\"\"\"a\\nb\"\"\""),
+            ("[\n  1,\n  2,\n]", "[\\n  1,\\n  2,\\n]"),
+            ("\"a\tb\"", "\"a\\tb\""),
+            ("'a\u{85}b\u{9b}c'", "'a\\u{85}b\\u{9b}c'"),
+            ("\"\"\"a\r\nb\"\"\"", "\"\"\"a\\r\\nb\"\"\""),
+        ] {
+            for key in [
+                "[terminal]\nclipboard_write",
+                "[appearance]\ncursor_blink",
+                "[appearance]\ncursor_shape",
+            ] {
+                let text = format!("{key} = {value}\n");
+                let loaded = Config::from_toml_lenient(&text).unwrap();
+                let [warning @ Warning::OutOfRange { detail, .. }] = &loaded.warnings[..] else {
+                    panic!("{text:?}: {:?}", loaded.warnings);
+                };
+                assert!(detail.starts_with(shown), "{text:?}: {detail}");
+                let line = warning.to_string();
+                assert!(!line.chars().any(char::is_control), "{text:?}: {line:?}");
+            }
+        }
+    }
+
+    /// A long multi-line value is escaped and still capped at
+    /// [`MAX_WARNING_PATH_LEN`] bytes of value, with the truncation marker.
+    #[test]
+    fn an_escaped_value_stays_capped() {
+        for unit in ["\n", "a", "\n\t", "é\n"] {
+            let value = format!("\"\"\"{}\"\"\"", unit.repeat(1 << 16));
+            let text = format!("[terminal]\nclipboard_write = {value}\n");
+            let loaded = Config::from_toml_lenient(&text).unwrap();
+            let [Warning::OutOfRange { detail, .. }] = &loaded.warnings[..] else {
+                panic!("{:?}", loaded.warnings);
+            };
+            let written = detail
+                .split_once(" replaced by")
+                .map_or(detail.as_str(), |(written, _)| written);
+            assert!(
+                written.len() <= MAX_WARNING_PATH_LEN,
+                "{unit:?}: {}",
+                written.len()
+            );
+            assert!(written.ends_with("(truncated)"), "{unit:?}: {written}");
+            assert!(!detail.chars().any(char::is_control), "{unit:?}");
+        }
+    }
+
+    /// An unknown key with a control character in it (a quoted key with an
+    /// escape) is escaped in its warning too.
+    #[test]
+    fn an_unknown_key_with_a_newline_gives_a_one_line_warning() {
+        let loaded = Config::from_toml_lenient("[appearance]\n\"a\\nb\" = 1\n").unwrap();
+        assert_eq!(
+            loaded.warnings,
+            [Warning::UnknownKey {
+                path: "appearance.a\\nb".into()
+            }]
+        );
+    }
+
+    proptest::proptest! {
+        /// [`escaped`] never leaves a control character, never exceeds
+        /// its cap, and equals escaping the whole text before the cut.
+        #[test]
+        fn escaping_is_one_line_and_capped(text in "\\PC{0,40}|[\\x00-\\x7f\\u{80}-\\u{a0}é]{0,600}", max in 16usize..300) {
+            let out = escaped(&text, max);
+            proptest::prop_assert!(out.len() <= max, "{} > {max}", out.len());
+            proptest::prop_assert!(!out.chars().any(char::is_control), "{:?}", out);
+            // The reference: escape the whole text, then cut (for text
+            // without controls, plain truncation).
+            let full: String = text
+                .chars()
+                .flat_map(|c| {
+                    let escape: Vec<char> = if c.is_control() { c.escape_debug().collect() } else { vec![c] };
+                    escape
+                })
+                .collect();
+            proptest::prop_assert_eq!(out, truncated(&full, max));
+        }
     }
 
     #[test]
