@@ -60,7 +60,7 @@ export FAKE_WORK="$work"
 PATH="$work/bin:$PATH"
 export PATH
 
-# Fixture repository: four packages and two nextest overrides on main.
+# Fixture repository: five packages and three nextest overrides on main.
 repo="$work/repo"
 mkdir -p "$repo"
 cd "$repo"
@@ -73,6 +73,12 @@ test-group = 'timing'
 
 [[profile.default.overrides]]
 filter = 'package(tessera-term) & kind(lib) & test(slow)'
+test-group = 'timing'
+
+# Two alternatives, each with its own package and suite (#192): devwin is bin-only, so its alternative is `bins`;
+# term is also named by the `slow` override above.
+[[profile.default.overrides]]
+filter = '(package(tessera-term) & binary(decscusr) & test(=flood)) | (package(tessera-devwin) & test(=clipboard::tests::deadline))'
 test-group = 'timing'
 EOF
 package() { # <name> <file under src>
@@ -123,13 +129,22 @@ change crates/tessera-render/tests/plain.rs 'fn plain() { assert_eq!(1 + 1, 2); 
 change crates/tessera-app-core/src/clock.rs 'pub fn now() -> std::time::Instant { std::time::Instant::now() }'
 commit
 
+branch term-devwin
+change crates/tessera-term/tests/decscusr.rs 'fn flood() { let _ = std::time::Instant::now(); }'
+change crates/tessera-devwin/src/clipboard.rs "$timed_test_module"
+commit
+
+branch devwin-only
+change crates/tessera-devwin/src/clipboard.rs '// untimed change'
+commit
+
 branch overrides
 change crates/tessera-config/README.md 'notes'
 change crates/tessera-term/src/lib.rs '// untimed change'
 commit
 
 branch everything
-for b in app-core-lib render-golden render-helper devwin-bin overrides; do
+for b in app-core-lib render-golden render-helper devwin-bin term-devwin overrides; do
     git merge -q --no-edit "$b"
 done
 
@@ -166,9 +181,11 @@ list render-golden;     expect 'render test file' "$header${nl}tessera-render:go
 list render-helper;     expect 'render test helper' "$header${nl}tessera-render:tests" --list-targets
 list devwin-bin;        expect 'bin-only crate' "$header${nl}tessera-devwin:bins" --list-targets
 list test-only-untimed; expect 'untimed test-only change' "$header" --list-targets
-list overrides;         expect 'nextest overrides' "$header${nl}tessera-config:reload${nl}tessera-term:lib" --list-targets
+list term-devwin;       expect 'one alternative per package, each with its own suite (#192)' "$header${nl}tessera-devwin:bins${nl}tessera-term:decscusr${nl}tessera-term:lib" --list-targets
+list devwin-only;       expect 'a bin-only package named by an alternative is a bins target' "$header${nl}tessera-devwin:bins" --list-targets
+list overrides;         expect 'nextest overrides' "$header${nl}tessera-config:reload${nl}tessera-term:decscusr${nl}tessera-term:lib" --list-targets
 list everything
-all="tessera-app-core:lib${nl}tessera-config:reload${nl}tessera-devwin:bins${nl}tessera-render:golden${nl}tessera-render:tests${nl}tessera-term:lib"
+all="tessera-app-core:lib${nl}tessera-config:reload${nl}tessera-devwin:bins${nl}tessera-render:golden${nl}tessera-render:tests${nl}tessera-term:decscusr${nl}tessera-term:lib"
 expect 'every trigger' "$header${nl}$all" --list-targets
 expect 'explicit --load and --parallel' "# parallel: 8${nl}tessera-app-core:lib${nl}tessera-app-core:lib-extra${nl}${all#*"$nl"}" \
     --list-targets --parallel 8 --load tessera-app-core:lib-extra --load tessera-app-core:lib
@@ -194,6 +211,48 @@ if [ "$rc" -eq 0 ] && grep -q -- '--parallel <N>' "$work/help" && grep -q -- '--
 else
     not_ok "--help: exit $rc or flags missing"
 fi
+
+# Commit trailers: only the tip commit lands (the integrator squashes the branch), so a problem below it is a WARN.
+# The fixture's gate fails (fake cargo); only the `commits` lines matter.
+trailers='Co-Authored-By: A <a@example.com>
+Claude-Session: https://example.com/s/1'
+git_commit() { git add -A; git commit -q --allow-empty -m "$1"; }
+branch squashed-wip
+change crates/tessera-config/README.md 'one'
+git_commit 'wip'
+change crates/tessera-config/README.md 'two'
+git_commit "fix(config): tip
+
+$trailers"
+branch bad-tip
+change crates/tessera-config/README.md 'one'
+git_commit "fix(config): first
+
+$trailers"
+change crates/tessera-config/README.md 'two'
+git_commit 'wip'
+trailer_check() { # <case> <branch> <expected> <verify-branch args>...: expected is `pass`, `pass+warn` or `fail`
+    name="$1" br="$2" want="$3"
+    shift 3
+    git -C "$repo" switch -q "$br"
+    for runner in bash zsh; do
+        "$runner" "$script" "$repo" --no-load "$@" > "$work/tr.log" 2>&1 || true
+        pass_n="$(grep -c 'PASS.* commits$' "$work/tr.log" || true)"
+        fail_n="$(grep -c 'FAIL.* commits:$' "$work/tr.log" || true)"
+        warn_n="$(grep -c 'WARN.* commits below the tip' "$work/tr.log" || true)"
+        case "$want" in
+            pass) good=$([ "$pass_n$fail_n$warn_n" = 100 ] && echo y || true) ;;
+            pass+warn) good=$([ "$pass_n$fail_n$warn_n" = 101 ] && echo y || true) ;;
+            fail) good=$([ "$pass_n$fail_n" = 01 ] && echo y || true) ;;
+        esac
+        if [ "${good:-}" = y ]; then ok "$name ($runner)"; else not_ok "$name ($runner): $(cat "$work/tr.log")"; fi
+    done
+}
+trailer_check 'a wip commit below a good tip warns and passes' squashed-wip pass+warn
+trailer_check 'a tip without trailers fails' bad-tip fail
+trailer_check 'an exact --session that the tip lacks fails' squashed-wip fail --session https://example.com/s/2
+trailer_check 'an exact --session the tip has passes (the lower wip commit warns)' squashed-wip pass+warn --session https://example.com/s/1 --coauthor 'Co-Authored-By: A <a@example.com>'
+trailer_check 'a single commit without trailers fails' app-core-lib fail
 
 # The load check runs 2 tests x 10 runs and never has more than --parallel of them in flight. The fixture's gate
 # and commit trailers may pass or fail (exit 0 or 1); only the load line and the samples matter here.

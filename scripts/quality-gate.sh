@@ -11,7 +11,7 @@
 # Self-test hooks (scripts/test-quality-gate.sh, `just quality-gate-test`; #166) are honoured only when
 # TESSERA_GATE_SELFTEST=1, and a run without it ignores every TESSERA_GATE_TEST_* variable:
 #   TESSERA_GATE_TEST_STEP             run one step and exit, without the stamp or any other step:
-#                                      `tests` (the workspace nextest run) or `release-timing`
+#                                      `tests` (the workspace nextest run), `release-timing` or `ffi-c-tests`
 #   TESSERA_GATE_TEST_TIMING_RESULTS   comma-separated exit codes returned by successive release timing runs
 #                                      instead of running nextest
 #   TESSERA_GATE_TEST_LOAD             the 1-minute load average the release timing retry reads
@@ -42,8 +42,10 @@ selftest=""
 nextest_minutes="${TESSERA_GATE_NEXTEST_MINUTES:-30}"
 [[ "$nextest_minutes" == <1-> ]] || { print -u2 "TESSERA_GATE_NEXTEST_MINUTES must be a positive integer, got '$nextest_minutes'"; exit 2; }
 watchdog_seconds=$(( nextest_minutes * 60 ))
+watchdog_var=TESSERA_GATE_NEXTEST_MINUTES  # the variable that set the limit, named when the watchdog fires
 if [[ -n "$selftest" && -n "${TESSERA_GATE_TEST_WATCHDOG_SECONDS:-}" ]]; then
     watchdog_seconds="$TESSERA_GATE_TEST_WATCHDOG_SECONDS"
+    watchdog_var=TESSERA_GATE_TEST_WATCHDOG_SECONDS
     [[ "$watchdog_seconds" == <1-> ]] || { print -u2 "TESSERA_GATE_TEST_WATCHDOG_SECONDS must be a positive integer, got '$watchdog_seconds'"; exit 2; }
 fi
 nextest_log="$(mktemp)"
@@ -116,7 +118,7 @@ report_nextest_failure() {
     if [[ "$nextest_phase" == build ]]; then
         print -u2 -P "%F{red}quality gate FAILED: building the tests failed%f"
     elif [[ "$1" == 124 ]]; then
-        print -u2 -P "%F{red}quality gate FAILED: nextest was killed by the gate watchdog after ${nextest_minutes} minutes (TESSERA_GATE_NEXTEST_MINUTES)%f"
+        print -u2 -P "%F{red}quality gate FAILED: nextest was killed by the gate watchdog after ${watchdog_seconds} s (${watchdog_var})%f"
     elif grep -q -E '^ *TIMEOUT ' "$nextest_log"; then
         print -u2 -P "%F{red}quality gate FAILED: nextest terminated hung test(s) after their slow-timeout (.config/nextest.toml):%f"
         grep -E '^ *TIMEOUT ' "$nextest_log" | sort -u >&2
@@ -129,10 +131,24 @@ tests_step() {
     run_nextest --workspace || { report_nextest_failure $?; exit 1; }
 }
 
+# The C programs run under the same watchdog as nextest (a hung C test would otherwise stall the gate; #235).
+ffi_c_tests_step() {
+    # `watchdog` truncates $nextest_log: nothing in it survives this step, so no later step may rely on it.
+    local st=0
+    watchdog "$watchdog_seconds" scripts/ffi-c-test.sh "$dir" || st=$?
+    (( st == 0 )) && return 0
+    if (( st == 124 )); then
+        print -u2 -P "%F{red}quality gate FAILED: the ffi C tests were killed by the gate watchdog after ${watchdog_seconds} s (${watchdog_var})%f"
+    else
+        print -u2 -P "%F{red}quality gate FAILED: the ffi C tests failed (exit $st)%f"
+    fi
+    exit 1
+}
+
 # Timing bars that only run in release builds (#114, #175): the reader lock hold, the view metrics under an output
 # flood, scrolling through a long history and captures under a flood while scrolled back. They are in the `timing`
 # test group (one at a time). A failure under load (1-min load average >= the core count) is retried once; a second
-# failure, or any failure below that load, fails the gate.
+# failure, any failure below that load and any failure of the build (`--no-run`) fail the gate.
 timing_stub=(${(s:,:)${TESSERA_GATE_TEST_TIMING_RESULTS:-}})
 release_timing() {
     if [[ -n "$selftest" && -n "${TESSERA_GATE_TEST_TIMING_RESULTS:-}" ]]; then
@@ -158,7 +174,8 @@ release_timing_step() {
     release_timing && release_status=0 || release_status=$?
     if (( release_status != 0 )); then
         load="$(load_1min)"
-        if (( load >= $(sysctl -n hw.ncpu) )); then
+        # A failed build is not a timing failure: load does not explain it, so it is never retried.
+        if [[ "$nextest_phase" != build ]] && (( load >= $(sysctl -n hw.ncpu) )); then
             print -P "%F{yellow}release timing tests failed under load ${load}, retried%f"
             release_timing || { report_nextest_failure $?; exit 1; }
         else
@@ -172,7 +189,8 @@ if [[ -n "$selftest" && -n "${TESSERA_GATE_TEST_STEP:-}" ]]; then
     case "$TESSERA_GATE_TEST_STEP" in
         tests) step "tests"; tests_step ;;
         release-timing) step "release timing tests"; release_timing_step ;;
-        *) print -u2 "TESSERA_GATE_TEST_STEP must be tests or release-timing, got '$TESSERA_GATE_TEST_STEP'"; exit 2 ;;
+        ffi-c-tests) step "ffi C tests"; ffi_c_tests_step ;;
+        *) print -u2 "TESSERA_GATE_TEST_STEP must be tests, release-timing or ffi-c-tests, got '$TESSERA_GATE_TEST_STEP'"; exit 2 ;;
     esac
     print -P "%F{green}quality gate self-test step $TESSERA_GATE_TEST_STEP passed%f"
     exit 0
@@ -196,7 +214,7 @@ step "deny";    cargo deny check
 step "ffi release build"; cargo build --release -p tessera-ffi
 # The C programs in crates/tessera-ffi/tests/c against the generated header (#175); surface.c skips itself when
 # TESSERA_SKIP_GPU_TESTS is set.
-step "ffi C tests"; scripts/ffi-c-test.sh "$dir"
+step "ffi C tests"; ffi_c_tests_step
 step "release timing tests"; release_timing_step
 # fuzz/ is not a workspace member (#14). Its lock file is the workspace's, copied in before every build so the
 # fuzzers test the workspace's dependency versions (fuzz/Cargo.lock is ignored; cargo only adds libfuzzer-sys and its dependencies).
