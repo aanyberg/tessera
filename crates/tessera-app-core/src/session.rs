@@ -192,7 +192,9 @@ pub enum SessionEvent {
     /// The child wrote output and the terminal has applied it; the frontend
     /// should redraw.
     Output,
-    /// The child asked for a new window or tab title.
+    /// The child asked for a new window or tab title (OSC 0 or 2, or a
+    /// title-stack pop, `CSI 23 t`). Only the last title of one chunk of
+    /// output is reported, since each title replaces the previous one.
     Title(String),
     /// The child wrote this text to the clipboard (OSC 52), and
     /// `[terminal] clipboard_write` allows it: the frontend puts it on the
@@ -1624,6 +1626,86 @@ impl fmt::Debug for Session {
 /// makes it copy the whole next slice to join the pieces.
 const ADVANCE_SLICE: usize = 4096;
 
+/// The requests of one chunk of output, collected for delivery after its
+/// `Output` event, in the order the terminal made them.
+///
+/// Holds at most one title: each title replaces the previous one, which
+/// is dropped as it arrives, so a chunk of title-stack pushes and pops
+/// (`CSI 22 t` `CSI 23 t`: 10 bytes per title of up to
+/// [`MAX_TITLE_BYTES`](tessera_term::MAX_TITLE_BYTES), 8 with the 8-bit
+/// CSI byte `0x9B` that S8C1T mode honours) holds one title, not one per
+/// pop (#263). The kept title is delivered where the last one
+/// arrived among the other requests.
+#[derive(Debug, Default)]
+struct ChunkRequests {
+    /// Every request but the titles, in order.
+    requests: Vec<Request>,
+    /// The chunk's last title and the number of `requests` made before it.
+    title: Option<(usize, String)>,
+}
+
+impl ChunkRequests {
+    /// Adds `request`; a title replaces the chunk's previous title.
+    fn push(&mut self, request: Request) {
+        match request {
+            Request::SetTitle(title) => self.title = Some((self.requests.len(), title)),
+            other => self.requests.push(other),
+        }
+    }
+
+    /// Hands every request to `f` in order, the kept title at its place.
+    fn for_each(self, mut f: impl FnMut(Request)) {
+        let mut title = self.title;
+        for (index, request) in self.requests.into_iter().enumerate() {
+            if let Some((_, last)) = title.take_if(|(at, _)| *at == index) {
+                f(Request::SetTitle(last));
+            }
+            f(request);
+        }
+        if let Some((_, last)) = title {
+            f(Request::SetTitle(last));
+        }
+    }
+}
+
+/// Feeds one chunk of output to `term` as the reader thread does and
+/// returns its requests; `reply` gets each slice's replies, joined.
+///
+/// The lock is taken once per slice, never for the whole chunk, and a
+/// frame waiting for it goes first between slices (see [`ADVANCE_SLICE`]).
+fn advance_chunk(
+    term: &SharedTerminal,
+    bytes: &[u8],
+    mut reply: impl FnMut(Vec<u8>),
+) -> ChunkRequests {
+    let mut requests = ChunkRequests::default();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let (slice, after) = rest.split_at(advance_slice_len(rest));
+        // The reader locks the mutex directly: it never counts as waiting,
+        // so it never makes itself yield.
+        let mut locked = lock(&term.term);
+        locked.advance(slice);
+        let mut replies = Vec::new();
+        for request in locked.take_requests() {
+            match request {
+                Request::Reply(bytes) => replies.extend_from_slice(&bytes),
+                other => requests.push(other),
+            }
+        }
+        drop(locked);
+        // The slice's replies, joined, once the terminal is unlocked: one
+        // outbox entry per slice, so a flood of queries costs bytes, not
+        // entries.
+        if !replies.is_empty() {
+            reply(replies);
+        }
+        give_way(term, thread::yield_now);
+        rest = after;
+    }
+    requests
+}
+
 /// Most times the reader yields after a slice while a thread waits for
 /// the terminal lock (see `give_way`).
 const GIVE_WAY_YIELDS: usize = 16;
@@ -1690,69 +1772,40 @@ impl Pump {
         for event in events {
             match event {
                 PtyEvent::Output(bytes) => {
-                    // The lock is taken once per slice, never for the whole
-                    // chunk, and a frame waiting for it goes first between
-                    // slices (see `ADVANCE_SLICE`). Requests are collected
-                    // in order and delivered after the chunk's one `Output`,
-                    // so observers see no more callbacks than before.
-                    let mut requests = Vec::new();
-                    let mut rest = &bytes[..];
-                    while !rest.is_empty() {
-                        let (slice, after) = rest.split_at(advance_slice_len(rest));
-                        // The reader locks the mutex directly: it never
-                        // counts as waiting, so it never makes itself yield.
-                        let mut term = lock(&self.term.term);
-                        term.advance(slice);
-                        let mut replies = Vec::new();
-                        for request in term.take_requests() {
-                            match request {
-                                Request::Reply(bytes) => replies.extend_from_slice(&bytes),
-                                other => requests.push(other),
-                            }
-                        }
-                        drop(term);
-                        // The slice's replies, joined, once the terminal is
-                        // unlocked: one outbox entry per slice, so a flood of
-                        // queries costs bytes, not entries.
-                        if !replies.is_empty() {
-                            self.outbox.try_queue_reply(self.id, replies);
-                        }
-                        give_way(&self.term, thread::yield_now);
-                        rest = after;
-                    }
+                    // Requests are collected in order and delivered after
+                    // the chunk's one `Output`, so observers see no more
+                    // callbacks than before.
+                    let requests = advance_chunk(&self.term, &bytes, |replies| {
+                        self.outbox.try_queue_reply(self.id, replies);
+                    });
                     self.deliver(SessionEvent::Output);
                     // Each clipboard write replaces the previous one: only
                     // the chunk's last reaches the observer, so a flood of
-                    // OSC 52 costs one pasteboard write per chunk.
-                    let last_clipboard = requests
+                    // OSC 52 costs one pasteboard write per chunk. Titles
+                    // are replaced as they arrive (see `ChunkRequests`).
+                    let mut clipboard_writes = requests
+                        .requests
                         .iter()
-                        .rposition(|r| matches!(r, Request::SetClipboard(_)));
-                    // Likewise each title replaces the previous one: a
-                    // flood of OSC 0/2 or title-stack pops (`CSI 23 t`)
-                    // costs one observer call per chunk, the last title.
-                    let last_title = requests
-                        .iter()
-                        .rposition(|r| matches!(r, Request::SetTitle(_)));
-                    for (index, request) in requests.into_iter().enumerate() {
-                        match request {
-                            Request::Bell => self.deliver(SessionEvent::Bell),
-                            Request::SetTitle(title) if Some(index) == last_title => {
-                                self.deliver(SessionEvent::Title(title));
-                            }
-                            Request::SetClipboard(text) if Some(index) == last_clipboard => {
+                        .filter(|r| matches!(r, Request::SetClipboard(_)))
+                        .count();
+                    requests.for_each(|request| match request {
+                        Request::Bell => self.deliver(SessionEvent::Bell),
+                        Request::SetTitle(title) => self.deliver(SessionEvent::Title(title)),
+                        Request::SetClipboard(text) => {
+                            clipboard_writes -= 1;
+                            if clipboard_writes == 0 {
                                 self.clipboard(text);
                             }
-                            Request::SetCwd(payload) => self.reports.report_cwd(&payload),
-                            Request::ShellIntegrationHandshake(payload) => {
-                                self.reports.handshake(self.id, &payload);
-                            }
-                            // `Request` is non-exhaustive; requests this
-                            // layer does not route (DECCOLM's resize, an
-                            // earlier title or clipboard write of the
-                            // chunk) are dropped. Replies were queued per slice.
-                            _ => {}
                         }
-                    }
+                        Request::SetCwd(payload) => self.reports.report_cwd(&payload),
+                        Request::ShellIntegrationHandshake(payload) => {
+                            self.reports.handshake(self.id, &payload);
+                        }
+                        // `Request` is non-exhaustive; requests this layer
+                        // does not route (DECCOLM's resize) are dropped.
+                        // Replies were queued per slice.
+                        _ => {}
+                    });
                 }
                 PtyEvent::Exited(status) => {
                     self.deliver(SessionEvent::Exit(status));
@@ -1846,28 +1899,46 @@ pub(crate) enum LockPause {
     Viewport,
 }
 
-/// A test pause: the session ([`Session::delivery_key`]), where it pauses
-/// and what it runs there.
+/// A test pause: where a session pauses and what it runs there.
 #[cfg(test)]
-pub(crate) type LockPauseHook = (usize, LockPause, Arc<dyn Fn() + Send + Sync>);
+pub(crate) type LockPauseHook = (LockPause, Arc<dyn Fn() + Send + Sync>);
+
+/// The installed pauses, one per session, keyed by
+/// [`Session::delivery_key`]: tests that run in parallel in one process
+/// (plain `cargo test`) each pause only their own session (#263).
+#[cfg(test)]
+static LOCK_PAUSE: Mutex<std::collections::BTreeMap<usize, LockPauseHook>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// Installs the pause a session method runs at a [`LockPause`] point, for
+/// the session whose [`Session::delivery_key`] is `key`, until the
+/// returned guard is dropped (also when the test panics, so no pause is
+/// left behind for a later session at the same address). The caller
+/// keeps that session alive while the guard lives.
+#[cfg(test)]
+#[must_use = "the pause is removed when the guard is dropped"]
+pub(crate) fn set_lock_pause(key: usize, pause: LockPauseHook) -> LockPauseGuard {
+    lock(&LOCK_PAUSE).insert(key, pause);
+    LockPauseGuard(key)
+}
+
+/// Removes a session's lock pause when dropped (see [`set_lock_pause`]).
+#[cfg(test)]
+pub(crate) struct LockPauseGuard(usize);
 
 #[cfg(test)]
-static LOCK_PAUSE: Mutex<Option<LockPauseHook>> = Mutex::new(None);
-
-/// Installs (or with `None` removes) the pause a session method runs at a
-/// [`LockPause`] point, for the session whose [`Session::delivery_key`] it
-/// names. The caller keeps that session alive while the pause is set.
-#[cfg(test)]
-pub(crate) fn set_lock_pause(pause: Option<LockPauseHook>) {
-    *lock(&LOCK_PAUSE) = pause;
+impl Drop for LockPauseGuard {
+    fn drop(&mut self) {
+        lock(&LOCK_PAUSE).remove(&self.0);
+    }
 }
 
 #[cfg(test)]
 fn pause_at(key: usize, at: LockPause) {
     let pause = lock(&LOCK_PAUSE)
-        .as_ref()
-        .filter(|(target, point, _)| *target == key && *point == at)
-        .map(|(_, _, pause)| Arc::clone(pause));
+        .get(&key)
+        .filter(|(point, _)| *point == at)
+        .map(|(_, pause)| Arc::clone(pause));
     if let Some(pause) = pause {
         pause();
     }
@@ -2090,11 +2161,10 @@ mod tests {
                     });
                 }
             };
-            set_lock_pause(Some((
+            let pause = set_lock_pause(
                 session.delivery_key(),
-                LockPause::ScrollState,
-                Arc::new(pause),
-            )));
+                (LockPause::ScrollState, Arc::new(pause)),
+            );
             thread::scope(|scope| {
                 scope.spawn(|| session.scroll(1.0));
                 wait_until("the scroll to pause", || paused.load(Ordering::SeqCst));
@@ -2103,7 +2173,7 @@ mod tests {
                     resized.store(true, Ordering::SeqCst);
                 });
             });
-            set_lock_pause(None);
+            drop(pause);
             let offset = session.scroll_offset();
             if offset != 6 {
                 lost.push((round, cols, offset));
@@ -2137,19 +2207,101 @@ mod tests {
                     }
                 }
             };
-            set_lock_pause(Some((
+            let pause = set_lock_pause(
                 session.delivery_key(),
-                LockPause::Viewport,
-                Arc::new(pause),
-            )));
+                (LockPause::Viewport, Arc::new(pause)),
+            );
             let read = session.scroll_offset();
-            set_lock_pause(None);
+            drop(pause);
             let stored = session.scroll_offset();
             if read != stored || read == 0 {
                 wrong.push((round, cols, read, stored));
             }
         }
         assert_eq!(wrong, [], "(round, columns, read, stored)");
+    }
+
+    /// #263 item 7: lock pauses are kept per session, so tests running in
+    /// parallel in one process (plain `cargo test`) cannot clear or replace
+    /// each other's: a pause installed and removed for one session leaves
+    /// another session's pause in place, and each runs only for its own
+    /// session.
+    #[test]
+    fn lock_pauses_are_kept_per_session() {
+        let (_one_app, one) = rewrapping_session();
+        let (_two_app, two) = rewrapping_session();
+        let counter = || {
+            let count = Arc::new(AtomicUsize::new(0));
+            let hook = {
+                let count = Arc::clone(&count);
+                move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }
+            };
+            (count, Arc::new(hook))
+        };
+        let (one_count, one_hook) = counter();
+        let (two_count, two_hook) = counter();
+        let one_pause = set_lock_pause(one.delivery_key(), (LockPause::Viewport, one_hook));
+        let two_pause = set_lock_pause(two.delivery_key(), (LockPause::Viewport, two_hook));
+        two.scroll_offset();
+        drop(two_pause);
+        one.scroll_offset();
+        two.scroll_offset();
+        drop(one_pause);
+        one.scroll_offset();
+        assert_eq!(
+            (
+                one_count.load(Ordering::SeqCst),
+                two_count.load(Ordering::SeqCst)
+            ),
+            (1, 1)
+        );
+    }
+
+    /// #263 M1: the view's readers and `Session::resize` take the terminal
+    /// lock before the input lock, so none can hold the input lock while
+    /// waiting for the terminal (mutant MI: `with_viewport` taking the
+    /// input lock first, which can deadlock with a resize; or `resize`
+    /// taking it first, which can deadlock with every reader). The test holds
+    /// the terminal itself, starts each reader on another thread and, once
+    /// the reader counts as waiting for the terminal, checks that the input
+    /// lock is free. No timing: the count is raised only once the reader
+    /// is about to block on the terminal.
+    #[test]
+    fn view_readers_wait_for_the_terminal_without_the_input_lock() {
+        type Reader = dyn Fn(&Session) + Sync;
+        let (_app, session) = rewrapping_session();
+        session.scroll_to(ScrollTarget::Offset(5));
+        let readers: [(&str, &Reader); 4] = [
+            ("with_viewport", &|s| {
+                s.scroll_offset();
+            }),
+            ("with_selection", &|s| {
+                s.with_selection(|_, _, _| ());
+            }),
+            ("scroll_state", &|s| {
+                s.scroll(1.0);
+            }),
+            ("resize", &|s| {
+                s.resize(PtySize::new(24, 80)).expect("resize");
+            }),
+        ];
+        let mut held = Vec::new();
+        for (name, reader) in readers {
+            let term = session.term.lock();
+            thread::scope(|scope| {
+                scope.spawn(|| reader(&session));
+                wait_until("the reader to wait for the terminal", || {
+                    session.term.waiting.load(Ordering::SeqCst) > 0
+                });
+                if session.input.try_lock().is_err() {
+                    held.push(name);
+                }
+                drop(term);
+            });
+        }
+        assert_eq!(held, [] as [&str; 0], "readers holding the input lock");
     }
 
     /// A PTY that only records the sizes it is given and rejects an empty
@@ -3022,6 +3174,62 @@ mod tests {
             [SessionEvent::Output]
         );
         app.close_session(id).expect("close");
+    }
+
+    /// #263 M3: 64 KiB of title-stack pushes and pops in one chunk (10
+    /// bytes each), fed through the reader's own chunk loop, leave one title
+    /// in the chunk's requests, the last (6 554 titles of 1 KiB each would
+    /// hold 6.4 MiB).
+    #[test]
+    fn a_chunk_of_title_pops_keeps_one_title() {
+        let term = SharedTerminal::new(Terminal::new(4, 20));
+        let long = "t".repeat(tessera_term::MAX_TITLE_BYTES);
+        lock(&term.term).advance(format!("\x1b]2;{long}\x07").as_bytes());
+        let _ = lock(&term.term).take_requests();
+        let pair = b"\x1b[22t\x1b[23t";
+        let chunk = pair.repeat((64 * 1024usize).div_ceil(pair.len()));
+        assert!(chunk.len() >= 64 * 1024, "{}", chunk.len());
+        let requests = advance_chunk(&term, &chunk, |_| {});
+        let held = requests
+            .requests
+            .iter()
+            .filter(|r| matches!(r, Request::SetTitle(_)))
+            .count()
+            + usize::from(requests.title.is_some());
+        assert_eq!(held, 1, "titles held by the chunk");
+        let mut delivered = Vec::new();
+        requests.for_each(|request| delivered.push(request));
+        assert_eq!(delivered, [Request::SetTitle(long)]);
+    }
+
+    /// The kept title is delivered where the chunk's last title arrived
+    /// among its other requests: before a bell that followed it, after one
+    /// that preceded it, and last when nothing followed.
+    #[test]
+    fn the_kept_title_keeps_its_place_among_the_requests() {
+        let order = |requests: Vec<Request>| {
+            let mut chunk = ChunkRequests::default();
+            for request in requests {
+                chunk.push(request);
+            }
+            let mut delivered = Vec::new();
+            chunk.for_each(|request| delivered.push(request));
+            delivered
+        };
+        let title = |t: &str| Request::SetTitle(t.into());
+        assert_eq!(
+            order(vec![title("a"), Request::Bell, title("b"), Request::Bell]),
+            [Request::Bell, title("b"), Request::Bell]
+        );
+        assert_eq!(
+            order(vec![Request::Bell, title("a")]),
+            [Request::Bell, title("a")]
+        );
+        assert_eq!(
+            order(vec![title("a"), Request::Bell]),
+            [title("a"), Request::Bell]
+        );
+        assert_eq!(order(vec![Request::Bell]), [Request::Bell]);
     }
 
     /// `osc_spec.txt` L04 and L05: OSC 7 updates `App::session_cwd`; an

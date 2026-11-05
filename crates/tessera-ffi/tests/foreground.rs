@@ -3,6 +3,11 @@
 //! `sleep 100` runs, then none again after Ctrl-C; `NULL` pointers and
 //! unknown or closed sessions fail and zero `*out`.
 //!
+//! The shell starts with `ENV=/dev/null` (no startup file of the user's) and
+//! the prompt [`PROMPT`]; the first idle check runs once the prompt is on
+//! the screen, so it checks a shell that is at its prompt, not one still
+//! starting up (#203).
+//!
 //! Waits are bounded by attempts (each sleeps [`POLL`]), not by a clock.
 
 #![cfg(unix)]
@@ -11,13 +16,15 @@ mod common;
 
 use std::ffi::{CStr, c_char};
 use std::ptr;
+use std::sync::Once;
 use std::thread;
 use std::time::Duration;
 
 use tessera_ffi::{
     App, Error, FOREGROUND_NAME_LEN, ForegroundProcess, SpawnOptions, tessera_app_free,
     tessera_app_new, tessera_session_close, tessera_session_foreground_process,
-    tessera_session_spawn, tessera_session_write,
+    tessera_session_select_all, tessera_session_selection_text, tessera_session_spawn,
+    tessera_session_write,
 };
 
 /// Pause between two polls.
@@ -27,10 +34,23 @@ const POLL: Duration = Duration::from_millis(10);
 /// for a loaded machine, as the other wall-clock bars keep (#190).
 const ATTEMPTS: usize = 1000;
 
-/// An app with an interactive `/bin/sh` session.
+/// The shell's prompt (`PS1`), which [`wait_for_prompt`] looks for.
+const PROMPT: &str = "tessera-ffi-ready$ ";
+
+/// An app with an interactive `/bin/sh` session, started with
+/// `ENV=/dev/null` and [`PROMPT`].
 fn app_with_shell() -> (*mut App, u64) {
+    static SHELL_ENV: Once = Once::new();
     common::isolate_home();
     common::hermetic_config_dir();
+    // SAFETY: every test in this binary starts through this function, and
+    // `call_once` makes the others wait until these writes are done, so
+    // they finish before any test creates an app or spawns a child: no
+    // other thread reads the environment while they run.
+    SHELL_ENV.call_once(|| unsafe {
+        std::env::set_var("ENV", "/dev/null");
+        std::env::set_var("PS1", PROMPT);
+    });
     let mut app: *mut App = ptr::null_mut();
     // SAFETY: `app` is writable storage for one pointer.
     assert_eq!(unsafe { tessera_app_new(&raw mut app) }, Error::Ok);
@@ -76,6 +96,34 @@ fn write(app: *mut App, id: u64, bytes: &[u8]) {
     );
 }
 
+/// The session's text (scrollback and screen), read through a select-all.
+fn text(app: *mut App, id: u64) -> String {
+    // SAFETY: live handle.
+    assert_eq!(unsafe { tessera_session_select_all(app, id) }, Error::Ok);
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut len = 0;
+    // SAFETY: live handle; `buf` is writable for its length and `len` for
+    // one `size_t`.
+    let status = unsafe {
+        tessera_session_selection_text(app, id, buf.as_mut_ptr(), buf.len(), &raw mut len)
+    };
+    assert_eq!(status, Error::Ok);
+    buf.truncate(len);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Waits until the shell's prompt is on the screen.
+fn wait_for_prompt(app: *mut App, id: u64) {
+    let prompt = PROMPT.trim_end();
+    for _ in 0..ATTEMPTS {
+        if text(app, id).contains(prompt) {
+            return;
+        }
+        thread::sleep(POLL);
+    }
+    panic!("no prompt; the session shows {:?}", text(app, id));
+}
+
 fn wait_for(
     app: *mut App,
     id: u64,
@@ -97,11 +145,13 @@ fn wait_for(
 #[test]
 fn a_running_job_is_reported_with_its_name() {
     let (app, id) = app_with_shell();
-    let idle = wait_for(app, id, |job| !job.running);
+    wait_for_prompt(app, id);
+    let (status, idle) = job(app, id);
+    assert_eq!(status, Error::Ok);
     assert_eq!(
         idle,
         ForegroundProcess::default(),
-        "an idle shell zeroes *out"
+        "a shell at its prompt zeroes *out"
     );
 
     write(app, id, b"sleep 100\n");

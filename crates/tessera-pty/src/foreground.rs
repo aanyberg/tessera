@@ -19,7 +19,7 @@ use portable_pty::MasterPty;
 
 /// Most bytes [`ForegroundProcess::name`] holds. Longer names are cut at
 /// the last whole character that fits.
-pub const MAX_NAME_BYTES: usize = 64;
+pub const MAX_FOREGROUND_NAME_BYTES: usize = 64;
 
 /// A job running in the foreground of a session's terminal instead of its
 /// shell (see [`Pty::foreground_process`](crate::Pty::foreground_process)).
@@ -31,7 +31,7 @@ pub struct ForegroundProcess {
     /// of its group runs on.
     pub pid: u32,
     /// The group leader's name, lossily decoded as UTF-8 and at most
-    /// [`MAX_NAME_BYTES`] bytes long. Empty when the name cannot be read:
+    /// [`MAX_FOREGROUND_NAME_BYTES`] bytes long. Empty when the name cannot be read:
     /// the leader has exited while the rest of its group runs on, or the
     /// platform offers no lookup.
     pub name: String,
@@ -57,16 +57,38 @@ fn process_name(pid: u32) -> Option<String> {
     platform::process_name(pid).map(|bytes| truncated_name(&bytes))
 }
 
-/// `bytes` decoded lossily as UTF-8 and cut to at most [`MAX_NAME_BYTES`]
-/// bytes at a character boundary.
+/// `bytes` decoded lossily as UTF-8 and cut to at most
+/// [`MAX_FOREGROUND_NAME_BYTES`] bytes at a character boundary. An
+/// incomplete UTF-8 sequence at the end is dropped first: the kernel cuts
+/// names at a byte count (31 bytes on macOS, 15 on Linux), which can split
+/// the last character, and that piece would otherwise decode as a trailing
+/// U+FFFD (#203).
 fn truncated_name(bytes: &[u8]) -> String {
-    let mut name = String::from_utf8_lossy(bytes).into_owned();
-    let mut end = name.len().min(MAX_NAME_BYTES);
+    let mut name = String::from_utf8_lossy(without_cut_character(bytes)).into_owned();
+    let mut end = name.len().min(MAX_FOREGROUND_NAME_BYTES);
     while !name.is_char_boundary(end) {
         end -= 1;
     }
     name.truncate(end);
     name
+}
+
+/// `bytes` without an incomplete UTF-8 sequence at its end: a lead byte
+/// followed by fewer continuation bytes than it announces. Invalid bytes
+/// are kept (they decode as U+FFFD), and so is everything else.
+fn without_cut_character(bytes: &[u8]) -> &[u8] {
+    // An incomplete sequence is at most three bytes (of a four-byte
+    // character), so its lead byte is one of the last three.
+    let tail = bytes.len().saturating_sub(3);
+    let Some(lead) = (tail..bytes.len()).rev().find(|&i| bytes[i] & 0xC0 != 0x80) else {
+        return bytes;
+    };
+    match std::str::from_utf8(&bytes[lead..]) {
+        // `error_len` is `None` exactly when the input ends inside a
+        // sequence that is valid so far.
+        Err(error) if error.error_len().is_none() => &bytes[..lead],
+        _ => bytes,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -201,8 +223,32 @@ mod tests {
         assert_eq!(truncated_name(b"vi\xffm"), "vi\u{fffd}m");
         // A replacement character never pushes the name over the limit.
         let name = truncated_name(&[0xff; 64]);
-        assert!(name.len() <= MAX_NAME_BYTES, "{}", name.len());
+        assert!(name.len() <= MAX_FOREGROUND_NAME_BYTES, "{}", name.len());
         assert_eq!(name, "\u{fffd}".repeat(21));
+    }
+
+    /// #203 items 8 and 9: an executable named `a` and eight emoji (33
+    /// bytes) is cut by the macOS kernel to 31 bytes, inside the eighth
+    /// emoji; the name decodes to the seven whole ones, with no trailing
+    /// U+FFFD. Every cut of a multi-byte character is dropped, invalid
+    /// bytes still decode as U+FFFD, and a whole last character is kept.
+    #[test]
+    fn a_character_cut_by_the_kernel_is_dropped() {
+        let full = format!("a{}", "\u{1f600}".repeat(8));
+        let cut = &full.as_bytes()[..31];
+        assert_eq!(truncated_name(cut), format!("a{}", "\u{1f600}".repeat(7)));
+        for (character, keep) in [("\u{e9}", 1), ("\u{20ac}", 2), ("\u{1f600}", 3)] {
+            for piece in 1..=keep {
+                let bytes = [b"vim".as_slice(), &character.as_bytes()[..piece]].concat();
+                assert_eq!(truncated_name(&bytes), "vim", "{character} cut at {piece}");
+            }
+            let whole = format!("vim{character}");
+            assert_eq!(truncated_name(whole.as_bytes()), whole);
+        }
+        assert_eq!(truncated_name(b"vi\xff"), "vi\u{fffd}");
+        assert_eq!(truncated_name(b"vi\xf0\x9f\x98\xff"), "vi\u{fffd}\u{fffd}");
+        assert_eq!(truncated_name(b"\x9f\x98"), "\u{fffd}\u{fffd}");
+        assert_eq!(truncated_name(b""), "");
     }
 
     #[test]

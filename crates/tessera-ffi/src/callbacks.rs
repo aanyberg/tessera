@@ -56,7 +56,9 @@ pub struct Callbacks {
     pub on_session_output: Option<unsafe extern "C" fn(user_data: *mut c_void, session_id: u64)>,
     /// The session's program set its window or tab title. `title` is a
     /// NUL-terminated UTF-8 string valid only during the call (any NUL the
-    /// program sent is removed).
+    /// program sent is removed). Called with the last title of each chunk
+    /// read from the PTY only, since each title replaces the previous one:
+    /// a program that sets many titles at once causes one call.
     pub on_session_title:
         Option<unsafe extern "C" fn(user_data: *mut c_void, session_id: u64, title: *const c_char)>,
     /// The session's program rang the bell.

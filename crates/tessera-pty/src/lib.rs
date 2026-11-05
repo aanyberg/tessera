@@ -46,7 +46,7 @@ compile_error!("tessera-pty supports Unix platforms only");
 mod foreground;
 mod native;
 
-pub use foreground::{ForegroundProcess, MAX_NAME_BYTES};
+pub use foreground::{ForegroundProcess, MAX_FOREGROUND_NAME_BYTES};
 pub use native::{IoThreads, NativePty, WRITE_QUEUE_BYTES};
 
 /// Value injected as `TERM` for every child.
@@ -416,8 +416,13 @@ pub trait Pty: Send {
     ///
     /// Only a shell with job control (any interactive shell) moves its jobs
     /// into groups of their own, so a program spawned directly, or run by
-    /// `sh -c`, is never reported: it runs in the child's own group. For
-    /// the same reason three busy cases read as idle: a program the shell
+    /// `sh -c`, is not reported while it runs in the child's own group. It
+    /// is reported only if it hands the terminal to a process group of its
+    /// own (`tcsetpgrp`); unlike an interactive shell it may not take the
+    /// terminal back when that group's job ends, and then a job is
+    /// reported (with an empty name once the group has exited) until the
+    /// program exits or takes the terminal back. Since the answer follows
+    /// the groups, three busy cases read as idle: a program the shell
     /// `exec`s (`exec sleep 100`, an rc file's `exec tmux`), which takes
     /// over the shell's pid and group; command substitution (`echo $(sleep
     /// 100)`, `vim $(fzf)` while `fzf` runs), whose child the shell runs in
