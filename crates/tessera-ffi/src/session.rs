@@ -318,11 +318,14 @@ pub unsafe extern "C" fn tessera_session_resize(
 }
 
 /// Clears session `session_id`'s scrollback and the screen above the
-/// cursor line (⌘K, Terminal.app's "Clear to Start"): the prompt line
-/// becomes the top row. On the alternate screen (a full-screen
-/// application) only the scrollback is cleared and the screen is kept. The
-/// view returns to the live screen. No `on_session_output` follows: the
-/// caller redraws, and that frame repaints the whole screen.
+/// prompt (⌘K, Terminal.app's "Clear to Start", ADR 0022): the kept rows,
+/// which become the top rows, start at the nearest row at or above the
+/// cursor with a shell integration `PromptStart` mark (the scan stops at
+/// a row with an `OutputStart` and no `PromptStart`), or without one at
+/// the first row of the cursor's logical line. On the alternate screen (a
+/// full-screen application) only the scrollback is cleared and the screen
+/// is kept. The view returns to the live screen. No `on_session_output`
+/// follows: the caller redraws, and that frame repaints the whole screen.
 ///
 /// Returns `TESSERA_ERROR_NULL_POINTER` if `app` is `NULL`,
 /// `TESSERA_ERROR_SESSION_NOT_FOUND` if the id is not a live session.

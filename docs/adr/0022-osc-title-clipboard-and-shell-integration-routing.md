@@ -101,7 +101,10 @@ An OSC never moves the cursor or resolves a pending wrap.
   stack drops the oldest, a pop on an empty stack does nothing; `22;1` and
   `23;1` (icon) and a third parameter do nothing. Nothing is replied.
 - D-FLOOD: the terminal does not coalesce titles (two OSCs give two
-  requests in order); the Swift bridge coalesces deliveries.
+  requests in order); the Swift bridge coalesces deliveries. *Amended
+  (#189 b):* the session delivers only the last title of each chunk of
+  output, as it does clipboard writes, so a flood of OSC 0/2 or `CSI 23 t`
+  costs one observer call per chunk (docs/security.md S6).
 
 ### Clipboard (OSC 52)
 
@@ -250,7 +253,12 @@ prompt mark it never carried.
   scrollback always goes, also when the logical line started in it; the
   alternate screen is unchanged. A `PromptStart` wins over the
   logical-line rule, also when the prompt sits on a continuation row
-  (PROMPT_SP): the output before it is cleared.
+  (PROMPT_SP): the output before it is cleared. Without shell integration
+  (accepted, #233): zsh's PROMPT_SP makes the prompt a soft-wrapped
+  continuation of output that ended without a newline, so the prompt is
+  part of that output's logical line and ⌘K keeps the output's wrapped
+  rows above it. Integration is on by default for zsh, and with it the
+  `PromptStart` mark decides.
 - **D-FAIL-CLOSED** (lead decision): `[terminal] clipboard_write` is the
   one security switch in the configuration, and a mistyped value
   (`"false"`, `0`) used to warn and keep the default `true`, so writes
