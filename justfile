@@ -80,15 +80,22 @@ app: xcframework xcodeproj
 # xcodebuild fails a single hung test after 120 s (300 s at most) instead of stalling the run (#121)
 test_timeouts := "-test-timeouts-enabled YES -default-test-execution-time-allowance 120 -maximum-test-execution-time-allowance 300"
 
+# scripts/app-test-watchdog.sh ends a hung test host after TESSERA_APP_TEST_HANG_SECONDS (150) with a stack sample in apps/macos/build/app-test-hang-sample.log (#228)
 # Run the app's XCTest suites (headless, Thread Sanitizer): TesseraKitTests (wrapper), then TesseraTests (windows and tabs, hosted by Tessera.app); full logs in apps/macos/build/app-test*.log
 app-test: xcframework xcodeproj
     mkdir -p {{quote(build_dir)}}
-    set -o pipefail; xcodebuild test -project {{quote(app_dir + "/Tessera.xcodeproj")}} -scheme TesseraKit -enableThreadSanitizer YES {{test_timeouts}} \
+    rm -f {{quote(build_dir + "/app-test-hang-sample.log")}}
+    set -o pipefail; scripts/app-test-watchdog.sh xcodebuild test -project {{quote(app_dir + "/Tessera.xcodeproj")}} -scheme TesseraKit -enableThreadSanitizer YES {{test_timeouts}} \
         -destination 'platform=macOS' -derivedDataPath {{quote(app_dir + "/DerivedData")}} 2>&1 | tee {{quote(build_dir + "/app-test.log")}} | tail -5 \
-        || { echo "xcodebuild test failed; errors from {{build_dir}}/app-test.log:" >&2; grep -E 'error:|failed|ThreadSanitizer' {{quote(build_dir + "/app-test.log")}} >&2; exit 1 }
-    set -o pipefail; xcodebuild test -project {{quote(app_dir + "/Tessera.xcodeproj")}} -scheme Tessera -enableThreadSanitizer YES {{test_timeouts}} \
+        || { echo "xcodebuild test failed; errors from {{build_dir}}/app-test.log:" >&2; grep -E 'error:|failed|ThreadSanitizer|app-test watchdog' {{quote(build_dir + "/app-test.log")}} >&2; exit 1 }
+    set -o pipefail; scripts/app-test-watchdog.sh xcodebuild test -project {{quote(app_dir + "/Tessera.xcodeproj")}} -scheme Tessera -enableThreadSanitizer YES {{test_timeouts}} \
         -destination 'platform=macOS' -derivedDataPath {{quote(app_dir + "/DerivedData")}} 2>&1 | tee {{quote(build_dir + "/app-test-tessera.log")}} | tail -5 \
-        || { echo "xcodebuild test failed; errors from {{build_dir}}/app-test-tessera.log:" >&2; grep -E 'error:|failed|ThreadSanitizer' {{quote(build_dir + "/app-test-tessera.log")}} >&2; exit 1 }
+        || { echo "xcodebuild test failed; errors from {{build_dir}}/app-test-tessera.log:" >&2; grep -E 'error:|failed|ThreadSanitizer|app-test watchdog' {{quote(build_dir + "/app-test-tessera.log")}} >&2; exit 1 }
+
+# #228
+# Check scripts/app-test-watchdog.sh with a fake xcodebuild: a host that hangs and ignores SIGTERM is killed, named and sampled; a __tsan hang is retried once
+app-test-watchdog-test:
+    zsh scripts/test-app-test-watchdog.sh
 
 # Launch the built app
 run: app

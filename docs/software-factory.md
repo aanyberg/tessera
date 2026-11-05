@@ -186,7 +186,7 @@ Agents use these instead of rebuilding the setup in every run:
   (measured: a second worktree hit 18 of 26 dependency compilations; crates with build scripts miss).
 - **Gate pass stamps.** `scripts/quality-gate.sh` records a pass on a clean tree per commit, toolchain and gate
   script, so the implementer, critic and verifiers pay for the gate once per commit. `--force` re-runs it.
-- **Hang protection (#137, #121, #166).** A hung test fails fast instead of stalling a run for hours.
+- **Hang protection (#137, #121, #166, #228).** A hung test fails fast instead of stalling a run for hours.
   `.config/nextest.toml` reports a test SLOW after 60 s and terminates it after 5 periods (300 s; 600 s for the
   file-watcher, shaping, term `wide`, GPU and hdiutil tests); the slowest test in the workspace takes 12 s, so there
   is room for a machine under load 30+. `scripts/quality-gate.sh` then fails with the terminated test names
@@ -208,8 +208,15 @@ Agents use these instead of rebuilding the setup in every run:
   `apps/macos/build/app-test*.log` as the `app-test-logs` artifact (#121). In CI the Rust job, which also runs the ffi
   C tests, has `timeout-minutes: 20` and the macOS app job 15 (a normal run is 4-6 minutes), with a 10-minute limit on
   `just app-test`, whose xcodebuild calls also fail a single hung test after 120 s (300 s at most). A hang below the
-  test level (the TSan and fork deadlock of #121) is caught by the step and job limits only. A new test that
-  legitimately needs more than 300 s gets its own `slow-timeout` override there.
+  test level, where the test host itself deadlocks and xcodebuild waits for it (the TSan and `fork` deadlock of #121
+  and #228, caused by #278), is ended by `scripts/app-test-watchdog.sh`, which wraps both xcodebuild calls: when no
+  test line follows a started test for `TESSERA_APP_TEST_HANG_SECONDS` (default 150), it samples the host into
+  `apps/macos/build/app-test-hang-sample.log` (uploaded with the `app-test-logs` artifact when the step fails), kills
+  it and names the test and the limit. If each hang's sample has a thread stuck inside the TSan runtime and the hung
+  tests are the run's only failures, it reruns only them once (`-only-testing`); a retried run that passes leaves only
+  the "TSan hang in <test> (#278), retried" line in the CI log. Any other hang fails the run.
+  `just app-test-watchdog-test` checks it with a fake `xcodebuild` and `sample`. A new test that legitimately needs
+  more than 300 s gets its own `slow-timeout` override there.
 - **A/B probes.** `cargo xtask ab init --base <rev> --crate <name> --out <scratch dir>` builds a probe crate that
   depends on each crate at the base revision (`base_<name>`) and in the worktree (`head_<name>`). Write cases in
   the probe's `src/cases.rs`, then `cargo xtask ab bench <dir> --case <c> [--max-ratio <bar>]` (alternating
