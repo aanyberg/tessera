@@ -74,8 +74,8 @@ xcodeproj:
 
 # Build the macOS app (debug)
 app: xcframework xcodeproj
-    xcodebuild -project {{app_dir}}/Tessera.xcodeproj -scheme Tessera -configuration Debug \
-        -derivedDataPath {{app_dir}}/DerivedData build | tail -5
+    set -o pipefail; xcodebuild -project {{quote(app_dir + "/Tessera.xcodeproj")}} -scheme Tessera -configuration Debug \
+        -derivedDataPath {{quote(app_dir + "/DerivedData")}} build 2>&1 | tail -5
 
 # xcodebuild fails a single hung test after 120 s (300 s at most) instead of stalling the run (#121)
 test_timeouts := "-test-timeouts-enabled YES -default-test-execution-time-allowance 120 -maximum-test-execution-time-allowance 300"
