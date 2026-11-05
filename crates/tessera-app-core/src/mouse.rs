@@ -18,9 +18,13 @@
 //! (the frontend selects), Cmd is never reported (Cmd-click opens links),
 //! and tracking off forgets the held buttons and the baseline, so leaving
 //! tracking mode mid-drag never sends a release later. The decision is
-//! returned with the state to keep, which the caller stores only once the
-//! report is queued: a report refused for want of room
-//! ([`std::io::ErrorKind::WouldBlock`]) leaves no trace.
+//! returned with the state to keep once the report is queued and the state
+//! to keep if it is refused for want of room
+//! ([`std::io::ErrorKind::WouldBlock`]): a refused press or motion leaves
+//! no trace, and a refused release still forgets its button, so a button
+//! that is up no longer drags (#194.4). The caller reads the state,
+//! routes, queues and stores under one lock of the session's input state,
+//! so events from two threads cannot lose each other's buttons (#194.11).
 
 use tessera_term::{
     Modifiers, MouseEncoding, MouseReport, MouseReportButton, MouseReportKind, MouseTracking,
@@ -105,8 +109,13 @@ pub(crate) struct PixelPoint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Route {
     /// Queue `bytes` for the program, then keep `next`: the event is
-    /// consumed.
-    Report { bytes: Vec<u8>, next: ReportState },
+    /// consumed. Keep `refused` instead when the bytes cannot be queued:
+    /// the state as it was, except that a release forgets its button.
+    Report {
+        bytes: Vec<u8>,
+        next: ReportState,
+        refused: ReportState,
+    },
     /// Write nothing and keep `next` (a release forgets its button, tracking
     /// off forgets everything): the event is ignored.
     Ignore { next: ReportState },
@@ -244,6 +253,10 @@ pub(crate) fn route_mouse(state: ReportState, event: &MouseEvent, mode: &Mode) -
                         baseline: Some(position),
                         ..released
                     },
+                    // The button is up whether or not the program hears
+                    // of it: holding it on would turn later motion into
+                    // a drag (#194.4).
+                    refused: released,
                 },
                 None => Route::Ignore { next: released },
             }
@@ -299,13 +312,15 @@ pub(crate) fn route_wheel(
                 baseline: Some(position),
                 ..state
             },
+            refused: state,
         },
         _ => Route::Ignore { next: state },
     }
 }
 
 /// [`Route::Report`] with the state `update` makes of `state` when the
-/// mode reports `report`, else [`Route::Ignore`] with `state`.
+/// mode reports `report` (and `state` if it is refused), else
+/// [`Route::Ignore`] with `state`.
 fn report_with(
     report: &MouseReport,
     mode: &Mode,
@@ -316,6 +331,7 @@ fn report_with(
         Some(bytes) => Route::Report {
             bytes,
             next: update(state),
+            refused: state,
         },
         None => Route::Ignore { next: state },
     }
@@ -342,7 +358,7 @@ mod tests {
     /// returns the bytes.
     fn step(state: &mut ReportState, event: &MouseEvent, mode: &Mode) -> Option<Vec<u8>> {
         match route_mouse(*state, event, mode) {
-            Route::Report { bytes, next } => {
+            Route::Report { bytes, next, .. } => {
                 *state = next;
                 Some(bytes)
             }
@@ -375,6 +391,31 @@ mod tests {
         assert_eq!(state, ReportState::default());
     }
 
+    /// What a refused report keeps: nothing of a press or motion, and a
+    /// release's button forgotten (#194.4).
+    #[test]
+    fn a_refused_release_still_forgets_its_button() {
+        let button = mode(MouseTracking::Button);
+        let mut state = ReportState::default();
+        let press = event(MouseEventKind::Press, MouseButton::Left, 0);
+        let Route::Report { refused, .. } = route_mouse(state, &press, &button) else {
+            panic!("press not reported");
+        };
+        assert_eq!(refused, state);
+        assert!(step(&mut state, &press, &button).is_some());
+        let drag = event(MouseEventKind::Motion, MouseButton::Left, 3);
+        let Route::Report { refused, .. } = route_mouse(state, &drag, &button) else {
+            panic!("drag not reported");
+        };
+        assert_eq!(refused, state);
+        let release = event(MouseEventKind::Release, MouseButton::Left, 3);
+        let Route::Report { refused, .. } = route_mouse(state, &release, &button) else {
+            panic!("release not reported");
+        };
+        assert!(!refused.holds(MouseButton::Left));
+        assert_eq!(refused.baseline, state.baseline, "nothing was reported");
+    }
+
     #[test]
     fn an_x10_release_forgets_the_button_without_a_report() {
         let mode = mode(MouseTracking::X10);
@@ -391,7 +432,7 @@ mod tests {
     fn the_wheel_sends_one_press_per_line_and_nothing_in_x10() {
         let state = ReportState::default();
         let normal = mode(MouseTracking::Normal);
-        let Route::Report { bytes, next } =
+        let Route::Report { bytes, next, .. } =
             route_wheel(state, -2, (1, 0), Modifiers::CTRL, &normal)
         else {
             panic!("not reported");
