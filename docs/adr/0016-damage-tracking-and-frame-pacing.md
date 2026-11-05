@@ -261,8 +261,10 @@ from frame to frame) and the instances of its background, glyph and
 decoration quads (three reused vectors). The instance buffer is laid out
 as one section per pass, in draw order, of one slot per row, then a slot
 for the cursor; a slot holds its row's instances followed by empty ones
-(zero-sized quads that rasterise nothing), so each pass is still one draw
-over its section and the draw order of ADR 0010 holds. A slot has room to
+(zero-sized quads that rasterise nothing), so each pass is still at most
+one draw over its section (the cursor pass over its used instances only,
+ADR 0010 #247); a pass with nothing to draw issues none. The draw order of
+ADR 0010 holds. A slot has room to
 grow (the next power of two, at least 4 background, 32 glyph and 4
 decoration instances); a row that outgrows its slot lays the buffer out
 again and uploads it whole. A CPU mirror of the buffer means a frame

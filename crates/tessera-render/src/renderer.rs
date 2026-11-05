@@ -103,6 +103,9 @@ pub struct Renderer {
     /// Test hook: the next upload fails after the mirror was written.
     #[cfg(test)]
     fail_next_upload: bool,
+    /// Test probe: the draw calls the last drawn frame issued.
+    #[cfg(test)]
+    last_frame_draws: u32,
 }
 
 /// What a renderer's cached rows depend on besides the cells.
@@ -237,6 +240,8 @@ impl Renderer {
                 stats: RenderStats::default(),
                 #[cfg(test)]
                 fail_next_upload: false,
+                #[cfg(test)]
+                last_frame_draws: 0,
             }
         })
     }
@@ -770,6 +775,8 @@ impl Renderer {
             0.0,
         ];
         let globals_changed = self.globals_size != Some(size);
+        #[cfg(test)]
+        let mut draws = 0u32;
         gpu.capture_errors(|| {
             if globals_changed {
                 queue.write_buffer(&self.globals, 0, bytemuck::cast_slice(&globals));
@@ -801,6 +808,10 @@ impl Renderer {
                     if range.is_empty() {
                         continue;
                     }
+                    #[cfg(test)]
+                    {
+                        draws += 1;
+                    }
                     pass.push_debug_group(label);
                     pass.draw(0..4, range);
                     pass.pop_debug_group();
@@ -810,6 +821,10 @@ impl Renderer {
         })?;
         self.globals_size = Some(size);
         self.stats.frames += 1;
+        #[cfg(test)]
+        {
+            self.last_frame_draws = draws;
+        }
         Ok(())
     }
 
@@ -1219,6 +1234,37 @@ mod tests {
         };
         let (with, without) = (draw(&mut renderer, at), draw(&mut renderer, None));
         assert!(with != without, "the cursor is on screen");
+    }
+
+    /// #265: the draw loop skips empty ranges itself, so no frame depends
+    /// on how a backend treats a zero-instance draw (ADR 0010, #247). On
+    /// Metal such a draw leaves the pixels alone, so only the draw calls
+    /// show the skip: a frame without visible rows or cursor issues none,
+    /// a hidden cursor's pass issues no draw, a shown one draws.
+    #[test]
+    fn the_draw_loop_skips_empty_ranges() {
+        let Some((gpu, mut renderer, target)) = small_frame_renderer() else {
+            return;
+        };
+        let rows = [text_row("hello"), text_row("world")];
+        let rows = frame(&rows);
+        let at = Some(crate::CursorState::new(1, 2, crate::CursorShape::Block));
+        let mut draws = |target: &crate::OffscreenTarget, cursor| {
+            let frame = FrameInput::new(&rows).with_cursor(cursor);
+            target.render(&gpu, &mut renderer, &frame).expect("render");
+            renderer.last_frame_draws
+        };
+        assert_eq!(draws(&target, at), 5, "rows and a cursor: every pass");
+        assert_eq!(draws(&target, None), 4, "a hidden cursor's pass is skipped");
+        // Smaller than the padding: no row is visible, every range is empty.
+        let tiny = crate::OffscreenTarget::new(
+            &gpu,
+            PhysicalSize::new(40, 4),
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+        assert_eq!(draws(&tiny, at), 0, "nothing to draw: only the clear");
+        assert_eq!(draws(&tiny, None), 0, "nor without a cursor");
+        assert_eq!(draws(&target, at), 5, "and back");
     }
 
     /// M1 (#22 review): 800 full-width overlays per row (link underlines

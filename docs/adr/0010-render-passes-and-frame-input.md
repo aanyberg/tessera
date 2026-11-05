@@ -569,7 +569,7 @@ nothing else to draw still issued one draw of zero-sized quads. A fresh
 renderer, whose first layout is empty, issued none for the same frame.
 
 That mattered for one reason, found by the #124 adversarial run: on
-Apple's Metal GPU (M4, macOS 26), a render pass that draws anything, even
+Apple's Metal GPU (M4, macOS 27.2), a render pass that draws anything, even
 degenerate quads, stores a translucent sRGB clear colour differently from
 a pass that only clears. With the background `(0.816, 0.059, 0.933)` at
 alpha 0.42 the premultiplied green, 0.0247 linear, encodes to 43.55: 44
@@ -583,8 +583,13 @@ Both paths now issue the same passes for the same frame: a frame with no
 visible row and no cursor draws nothing but the clear, and the
 fresh-versus-incremental comparisons stay bit-exact, with no tolerance.
 The draw loop skips empty ranges itself, so nothing depends on how a
-backend treats a zero-instance draw. Frames that draw anything are
-unchanged: all ten goldens render byte-identical to main's.
+backend treats a zero-instance draw. On Metal such a draw changes no
+pixel, so no image comparison can pin the skip:
+`the_draw_loop_skips_empty_ranges` (renderer.rs, #265) counts the draw
+calls a frame issues, through a counter compiled into test builds only,
+and fails without the skip (a hidden cursor's frame issues five draws, not
+four; a frame without visible rows five, not none). Frames that draw
+anything are unchanged: all ten goldens render byte-identical to main's.
 `a_frame_without_rows_after_a_scale_change_matches_a_fresh_renderer`
 (damage.rs) fails on main; `the_cursor_draw_covers_only_its_instances`
 (renderer.rs) pins that a shown cursor is drawn, a hidden one issues no
