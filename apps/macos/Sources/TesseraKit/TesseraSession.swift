@@ -65,8 +65,10 @@ public final class TesseraSession: Sendable, Identifiable {
     /// Terminal.app's "Clear to Start"), so the prompt becomes the top row
     /// (ADR 0022 D-CLEAR-START). The kept rows start at the nearest row at or
     /// above the cursor with a prompt-start mark, the scan stopping at a row
-    /// where command output starts; without such a mark, at the first row of
-    /// the cursor's logical line (the rows that wrap into it). On the
+    /// where command output starts and no prompt does (a row with both marks
+    /// is a prompt start); without such a mark, at the first row of the
+    /// cursor's logical line (the rows that wrap into it), never above the
+    /// row where the scan stopped. On the
     /// alternate screen (a full-screen app) only the scrollback is cleared.
     /// No ``TesseraAppDelegate/sessionDidOutput(_:)`` follows: redraw after
     /// calling this.
@@ -94,9 +96,14 @@ public final class TesseraSession: Sendable, Identifiable {
     }
 
     /// The job the session's shell is running in the foreground, or `nil` at
-    /// the shell's prompt, once the shell has exited, and for a program that
-    /// is not an interactive shell (ADR 0031). A snapshot that never waits
-    /// for the child: ask when the user closes the session, not per frame.
+    /// the shell's prompt and once the shell has exited (ADR 0031). A session
+    /// spawned with a program that is not an interactive shell reports a job
+    /// only if that program hands the terminal to a process group of its own
+    /// (`tcsetpgrp`); unlike a shell it may not take the terminal back, and
+    /// then the job stays reported (with an empty name once that group has
+    /// exited) until the program exits or takes the terminal back. A snapshot
+    /// that never waits for the child: ask when the user closes the session,
+    /// not per frame.
     ///
     /// - Throws: ``TesseraCoreError/sessionNotFound`` once the session is
     ///   closed, ``TesseraCoreError/nullPointer`` after the application shut

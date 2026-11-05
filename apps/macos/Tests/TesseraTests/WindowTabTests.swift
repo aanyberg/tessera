@@ -308,8 +308,9 @@ final class WindowTabTests: XCTestCase {
         ]
         for (action, key, modifiers) in expected {
             let menuItem = try XCTUnwrap(item(action), "no item for \(action)")
-            XCTAssertEqual(menuItem.keyEquivalent, key, "\(action)")
-            XCTAssertEqual(menuItem.keyEquivalentModifierMask, modifiers, "\(action)")
+            let authored = authoredKeyEquivalent(of: menuItem)
+            XCTAssertEqual(authored.key, key, "\(action)")
+            XCTAssertEqual(authored.modifiers, modifiers, "\(action)")
         }
         for action in [
             #selector(NSWindow.moveTabToNewWindow(_:)), #selector(NSWindow.mergeAllWindows(_:)),
@@ -318,7 +319,7 @@ final class WindowTabTests: XCTestCase {
             XCTAssertNotNil(item(action), "no item for \(action)")
         }
         let numbered = items.filter { $0.action == #selector(TerminalWindowController.selectTabAtIndex(_:)) }
-        XCTAssertEqual(numbered.map(\.keyEquivalent), (1...9).map(String.init))
+        XCTAssertEqual(numbered.map { authoredKeyEquivalent(of: $0).key }, (1...9).map(String.init))
         XCTAssertEqual(numbered.map(\.tag), Array(0..<9))
         XCTAssertTrue(NSApp.windowsMenu?.items.contains { $0.action == #selector(NSWindow.selectNextTab(_:)) } ?? false)
     }

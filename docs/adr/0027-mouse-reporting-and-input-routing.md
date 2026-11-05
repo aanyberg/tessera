@@ -112,7 +112,7 @@ pointer. Not handled in 0.1.0.
 `TerminalSurfaceView` (`apps/macos`) sends and routes as follows; it makes
 no reporting decision of its own.
 
-- **Every pointer event goes to the core** through
+- **Every pointer event over the text goes to the core** through
   `TesseraSession.send(mouse:)`: presses, releases and drags of the left,
   right and other buttons, and plain motion with no button held from an
   `NSTrackingArea` (`.mouseMoved`, `.activeInKeyWindow`, `.inVisibleRect`),
@@ -120,18 +120,34 @@ no reporting decision of its own.
   under the pointer and physical pixels from the view's top-left corner,
   padding included. `otherMouse` button numbers 2, 3 and 4 are middle,
   back and forward; higher buttons have no report and are not sent.
+  Amended by #197 and #210: a press or a plain motion is not sent when no
+  cell can be named for it, outside the render view (the legacy scroller's
+  strip; the edges as AppKit's hit test draws them) or while the cell size
+  is unknown (no surface, or between a lost surface and its re-attach).
+  The drags and the release of a press that was sent always are, clamped
+  to the grid's edge, or at the last position the core took while the cell
+  size is unknown.
 - **Modifiers** map Shift, Option, Control and Command to Shift, Alt (Meta),
   Control and Super; the core applies the bypasses.
 - **The outcome of each press** is kept per button from press to release
   (`pressOutcomes`): `Consumed` means the program has the click, `Ignored`
   that the view may select or open a link (#30). A release is sent for every
-  press the view saw, whatever the modifiers by then, and the core decides
-  whether it is reported.
+  press the view sent, whatever the modifiers by then, and the core decides
+  whether it is reported; the record stays until the core accepts the
+  release, so a release it refuses (a position that is not a number) does
+  not lose the button. A button still held when the view leaves its window,
+  the window closes or its tab is switched away from (AppKit posts no
+  notification for that; the view observes the tab group's selected window)
+  is released to the core at the last position it took, since AppKit sends
+  the release, if at all, elsewhere.
 - **The activating click** is swallowed by AppKit: `acceptsFirstMouse`
   returns `false`, so the click that activates an inactive window, or the
   app, reaches neither the program nor a selection. A drag or release of a
-  button whose press the view did not see is not sent either, so a stray
-  release after that click cannot reach the core.
+  button whose press the view did not send is not sent either, so a stray
+  release after that click cannot reach the core. AppKit has no first mouse
+  for the right and other buttons, so the view drops their presses itself
+  while its window is not key (#197): vim's `mousemodel=extend` acts on a
+  right-click.
 - **Selection and links** (#30, ADR 0025) start only from a left press the
   core answered `.ignored`: with tracking off, or with Shift (selection) or
   Command (link) held. The view then takes Option, or Option with Command, as
