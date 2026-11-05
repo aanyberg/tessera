@@ -206,6 +206,11 @@ struct Screen {
 /// one visit is still there on the next. The scroll region and origin
 /// mode are shared by both screens. Saving the cursor around DECSET 1049
 /// is the emulator's job.
+///
+/// A clone shares its hyperlink entities, their counts against
+/// [`crate::MAX_LIVE_LINKS`] and [`crate::MAX_LINK_TABLE_BYTES`] and the
+/// `id` index with the original (ADR 0026): links opened in either count
+/// toward both.
 #[derive(Debug, Clone)]
 pub struct Grid {
     rows: u16,
@@ -386,9 +391,12 @@ impl Grid {
     ///
     /// # Errors
     ///
-    /// A [`LinkRefused`] when the URI is empty or longer than
-    /// [`crate::MAX_URI_BYTES`], or when [`crate::MAX_LIVE_LINKS`] links are
-    /// alive. The link that was open is closed all the same.
+    /// A [`LinkRefused`] when the URI is empty, longer than
+    /// [`crate::MAX_URI_BYTES`] or holds a control or bidirectional
+    /// formatting character ([`LinkRefused::ControlInUri`]), or when
+    /// [`crate::MAX_LIVE_LINKS`] links are alive or the new one's text would
+    /// take [`Grid::hyperlink_bytes`] past [`crate::MAX_LINK_TABLE_BYTES`].
+    /// The link that was open is closed all the same.
     pub fn begin_hyperlink(&mut self, uri: &str, id: Option<&str>) -> Result<(), LinkRefused> {
         self.active_link = None;
         self.active_link = Some(self.links.open(uri, id)?);
@@ -419,6 +427,13 @@ impl Grid {
     #[must_use]
     pub fn live_hyperlinks(&self) -> usize {
         self.links.live()
+    }
+
+    /// Bytes of URI and `id` text the live hyperlink entities hold. At most
+    /// [`crate::MAX_LINK_TABLE_BYTES`].
+    #[must_use]
+    pub fn hyperlink_bytes(&self) -> usize {
+        self.links.bytes()
     }
 
     /// Visible lines, top to bottom.
@@ -1475,7 +1490,9 @@ impl Grid {
     // ------------------------------------------------------ alternate screen
 
     /// Switches to the alternate screen: a separate blank screen of the same
-    /// size, without scrollback. A no-op when already active.
+    /// size, without scrollback. A no-op when already active, but for the
+    /// open hyperlink: that is closed either way (a repeated DECSET 47 or
+    /// 1049 closes it too, ADR 0026 D-L5).
     ///
     /// The primary screen's lines, cursor, pending-wrap state, pen, origin
     /// mode, saved cursor and tab stops are stashed. The alternate screen
@@ -1486,6 +1503,7 @@ impl Grid {
     /// pen), as in xterm, clamped to the current size; its contents are
     /// not kept between visits (xterm keeps them for DECSET 47).
     pub fn enter_alt_screen(&mut self) {
+        self.active_link = None;
         if self.primary.is_some() {
             return;
         }

@@ -230,13 +230,22 @@ fn cut_or_pad(line: &mut Line, cols: u16) {
 }
 
 /// A blank as far as reflow is concerned: exactly [`Cell::BLANK`], a
-/// space with the default style, or padding ([`Cell::is_pad`]) of any
+/// space with the default style, linked or not ([`CellFlags::LINK`]: a
+/// link is not text, ADR 0026), or padding ([`Cell::is_pad`]) of any
 /// background (the pen's from `put_wide`, the wide character's from a
 /// re-wrap). Trailing ones end a logical line's text and rows made
-/// of them may be dropped; any other space with a colour or attribute (a
-/// background fill, an underline, inverse video) is content.
+/// of them may be dropped, links and all; any other space with a colour or
+/// attribute (a background fill, an underline, inverse video) is content.
+///
+/// [`CellFlags::LINK`]: crate::CellFlags::LINK
 fn plain_blank(cell: &Cell) -> bool {
-    *cell == Cell::BLANK || (cell.is_pad() && cell.ch == ' ')
+    // One compare with `LINK` masked off: `Cell::BLANK` has no flags, so
+    // this is `*cell == Cell::BLANK` for an unlinked cell.
+    Cell {
+        flags: cell.flags.difference(crate::CellFlags::LINK),
+        ..*cell
+    } == Cell::BLANK
+        || (cell.is_pad() && cell.ch == ' ')
 }
 
 /// Converts a row index known to be below `rows` (or clamps it there).
@@ -1124,6 +1133,17 @@ mod tests {
         assert!(!plain_blank(&Cell {
             flags: crate::CellFlags::PAD,
             ..Cell::new('x', Style::DEFAULT)
+        }));
+        let linked = |cell: Cell| Cell {
+            flags: cell.flags | crate::CellFlags::LINK,
+            ..cell
+        };
+        assert!(plain_blank(&linked(Cell::BLANK)), "a link is not text");
+        assert!(!plain_blank(&linked(Cell::blank_with(bg))));
+        assert!(!plain_blank(&linked(Cell::new('x', Style::DEFAULT))));
+        assert!(!plain_blank(&Cell {
+            flags: crate::CellFlags::LINK | crate::CellFlags::WIDE,
+            ..Cell::BLANK
         }));
     }
 

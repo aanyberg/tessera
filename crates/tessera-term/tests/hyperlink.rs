@@ -34,6 +34,8 @@ mod common;
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::{check_table, decode};
 use tessera_grid::{Grid, Hyperlink, Line};
@@ -569,4 +571,130 @@ fn past_the_cap_new_links_are_ignored_and_close_the_open_one() {
     assert!(line.hyperlink(usize::from(cursor.col) - 1).is_none());
     // A link that exists can still be reopened by id once it is alive.
     assert_eq!(term.grid().live_hyperlinks(), tessera_grid::MAX_LIVE_LINKS);
+}
+
+/// A `tracing` subscriber that counts warn-level events.
+struct WarnCounter(Arc<AtomicUsize>);
+
+impl tracing::Subscriber for WarnCounter {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() == tracing::Level::WARN
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        if *event.metadata().level() == tracing::Level::WARN {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Opens `MAX_LIVE_LINKS` links of a cell each, from the cursor on.
+fn fill_to_the_cap(term: &mut Terminal, tag: &str) {
+    let first = term.grid().live_hyperlinks();
+    for i in first..tessera_grid::MAX_LIVE_LINKS {
+        term.advance(&open(&format!("https://a.bc/{tag}/{i}")));
+        term.advance(b"x");
+    }
+    term.advance(b"\x1b]8;;\x1b\\");
+    assert_eq!(term.grid().live_hyperlinks(), tessera_grid::MAX_LIVE_LINKS);
+}
+
+#[test]
+fn refilling_at_the_cap_warns_once_per_run_until_the_table_drains() {
+    let warns = Arc::new(AtomicUsize::new(0));
+    let subscriber = WarnCounter(Arc::clone(&warns));
+    tracing::subscriber::with_default(subscriber, || {
+        let mut term = Terminal::new(10, 200);
+        term.set_max_scrollback(1000);
+        fill_to_the_cap(&mut term, "a");
+        term.advance(&open("https://a.bc/one-too-many"));
+        assert_eq!(warns.load(Ordering::Relaxed), 1);
+        // A program that frees one link and opens another, 1 000 times:
+        // every refill hits the cap again, but the table never drained
+        // below three quarters, so this is the same run of refusals.
+        for round in 0..1000 {
+            term.advance(b"\x1b[1;1H\x1b[X");
+            assert_eq!(
+                term.grid().live_hyperlinks(),
+                tessera_grid::MAX_LIVE_LINKS - 1
+            );
+            term.advance(&open(&format!("https://a.bc/refill/{round}")));
+            term.advance(b"x");
+            term.advance(&open(&format!("https://a.bc/refused/{round}")));
+            assert!(term.grid().hyperlink().is_none(), "round {round}");
+        }
+        assert_eq!(warns.load(Ordering::Relaxed), 1, "one warn for the run");
+        // Drained (ED 2 and ED 3) and filled again: a new run, warned anew.
+        term.advance(b"\x1b[2J\x1b[3J\x1b[H");
+        assert_eq!(term.grid().live_hyperlinks(), 0);
+        fill_to_the_cap(&mut term, "b");
+        term.advance(&open("https://a.bc/one-too-many"));
+        term.advance(&open("https://a.bc/two-too-many"));
+        assert_eq!(warns.load(Ordering::Relaxed), 2);
+    });
+}
+
+#[test]
+fn decaln_keeps_the_open_link_for_the_text_after_it() {
+    let mut term = Terminal::new(2, 4);
+    term.advance(&open("https://a.bc/"));
+    term.advance(b"\x1b#8y");
+    let grid = term.grid();
+    assert_eq!(grid.hyperlink().map(Hyperlink::uri), Some("https://a.bc/"));
+    let row = grid.line(0).unwrap();
+    assert_eq!(row.text(), "yEEE");
+    assert_eq!(row.hyperlink(0).map(Hyperlink::uri), Some("https://a.bc/"));
+    assert!((1..4).all(|col| row.hyperlink(col).is_none()), "the fill");
+    assert!(grid.line(1).unwrap().hyperlink(0).is_none());
+}
+
+#[test]
+fn a_repeated_alternate_screen_set_closes_the_open_link() {
+    for set in ["\x1b[?1049h", "\x1b[?47h", "\x1b[?1047h"] {
+        let mut term = Terminal::new(2, 6);
+        term.advance(set.as_bytes());
+        term.advance(&open("https://a.bc/"));
+        term.advance(b"a");
+        term.advance(set.as_bytes());
+        assert!(term.grid().hyperlink().is_none(), "{set:?}");
+        term.advance(b"\x1b[1;2Hb");
+        let row = term.grid().line(0).unwrap();
+        assert!(row.hyperlink(1).is_none(), "{set:?}");
+    }
+}
+
+#[test]
+fn controls_and_bidi_formatting_in_a_uri_refuse_the_link_and_the_text_prints() {
+    for ch in [
+        '\u{7f}', '\u{80}', '\u{85}', '\u{9b}', '\u{9f}', '\u{200e}', '\u{200f}', '\u{202a}',
+        '\u{202e}', '\u{2066}', '\u{2069}',
+    ] {
+        let mut term = Terminal::new(2, 10);
+        term.advance(&open("https://a.bc/"));
+        term.advance(b"a");
+        term.advance(&open(&format!("https://a.bc/{ch}x")));
+        assert!(term.grid().hyperlink().is_none(), "{ch:?}");
+        term.advance(b"b");
+        let row = term.grid().line(0).unwrap();
+        assert_eq!(row.text(), "ab", "{ch:?}");
+        assert!(row.hyperlink(0).is_some() && row.hyperlink(1).is_none());
+        assert_eq!(term.grid().live_hyperlinks(), 1, "{ch:?}");
+    }
+    // NUL is dropped by the parser, as before: the link opens without it.
+    let mut term = Terminal::new(2, 10);
+    term.advance(b"\x1b]8;;https://a.bc/a\0b\x1b\\");
+    let link = term.grid().hyperlink().map(|l| l.uri().to_owned());
+    assert_eq!(link.as_deref(), Some("https://a.bc/ab"));
 }

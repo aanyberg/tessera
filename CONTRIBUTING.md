@@ -24,8 +24,9 @@
 - `#![forbid(unsafe_code)]` everywhere except `tessera-pty` and `tessera-ffi`.
   Every `unsafe` block carries a `// SAFETY:` comment. The exceptions
   outside them are the counting test allocators in
-  `crates/tessera-render/tests/alloc.rs` (ADR 0016) and
-  `crates/tessera-grid/tests/reset.rs`.
+  `crates/tessera-render/tests/alloc.rs` (ADR 0016),
+  `crates/tessera-grid/tests/reset.rs` and
+  `crates/tessera-term/tests/osc8_alloc.rs`.
 - The security and resource rules in `docs/security.md` hold for every change:
   nothing the child sends is echoed into the input or read back, and every
   buffer filled from untrusted input has a named cap.

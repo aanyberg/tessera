@@ -56,8 +56,8 @@ a low-risk change.
 - **S6. Per-byte work is bounded.** Every callback or event emitted per input byte (bell, title, clipboard, marks,
   replies) is bounded in rate and memory, and an expensive sequence does not hold the terminal lock long (#117).
 - **S7. Memory safety.** `unsafe` only in `tessera-pty` and `tessera-ffi`, each block with a `// SAFETY:` comment;
-  the counting test allocators in `crates/tessera-render/tests/alloc.rs` and `crates/tessera-grid/tests/reset.rs`
-  are the exceptions (CONTRIBUTING.md). Every FFI export that can panic runs under `ffi_guard!` (`catch_unwind`);
+  the counting test allocators in `crates/tessera-render/tests/alloc.rs`, `crates/tessera-grid/tests/reset.rs` and
+  `crates/tessera-term/tests/osc8_alloc.rs` are the exceptions (CONTRIBUTING.md). Every FFI export that can panic runs under `ffi_guard!` (`catch_unwind`);
   every pointer and length argument is checked; sessions cross the boundary as ids, never pointers.
 - **S8. No terminal content in logs.** Logs carry lengths, ids, parameters and paths, never output, input, titles,
   clipboard text or environment values. Child-controlled bytes that must be logged are capped and escaped.
@@ -85,6 +85,7 @@ a low-risk change.
 | Config / theme / import file | 16 MiB / 64 KiB (256 files) / 1 MiB | `crates/tessera-config/src/` |
 | Imported plist | 4096 values, 256 KiB of text | `crates/tessera-config/src/import.rs` |
 | URL candidate | 2083 characters | `crates/tessera-app-core/src/url.rs` |
+| OSC 8 link table | 65 536 live links (`MAX_LIVE_LINKS`), URI 2 083 bytes, id 250 bytes, 16 MiB of URI + id text (`MAX_LINK_TABLE_BYTES`); the id index loses an entry with its link's last cell; a URI with C0, DEL, C1 or bidi formatting controls is refused | `crates/tessera-grid/src/hyperlink.rs`, `crates/tessera-term/src/osc.rs` |
 
 ## Memory and leaks
 

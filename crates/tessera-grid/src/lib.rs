@@ -54,8 +54,9 @@
 //! gets [`CellFlags::LINK`] and the line's [`GraphemeTable`] holds its
 //! [`Hyperlink`] under the column, in the same allocation as the cluster
 //! text. Every primitive keeps the two in step, links survive reflow and
-//! scrolling into history, and at most [`MAX_LIVE_LINKS`] links are alive at
-//! once. ADR 0026 records the rules.
+//! scrolling into history, and at most [`MAX_LIVE_LINKS`] links holding at
+//! most [`MAX_LINK_TABLE_BYTES`] of text are alive at once. ADR 0026 records
+//! the rules.
 //!
 //! # Damage
 //!
@@ -99,7 +100,9 @@ pub use grapheme::{GraphemeTable, MAX_CLUSTER_SCALARS, char_width};
 pub use grid::{
     DEFAULT_MAX_SCROLLBACK, EraseDisplay, EraseLine, Grid, Margins, ReverseWrap, ScrollRegion,
 };
-pub use hyperlink::{Hyperlink, LinkRefused, MAX_ID_BYTES, MAX_LIVE_LINKS, MAX_URI_BYTES};
+pub use hyperlink::{
+    Hyperlink, LinkRefused, MAX_ID_BYTES, MAX_LINK_TABLE_BYTES, MAX_LIVE_LINKS, MAX_URI_BYTES,
+};
 pub use line::{Line, Mark};
 pub use scrollback::Scrollback;
 pub use tabs::TabStops;
