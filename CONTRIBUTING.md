@@ -44,7 +44,8 @@ Pick the cheapest check that covers the change while you work; the full gate run
 | Iterating | `cargo nextest run -p <crate>` | one crate |
 | After a change | `just test-affected` (`--clippy` to lint too; `--base <ref>`; `-- <nextest args>`) | every crate your change touches since the merge base with `main` (committed, staged, unstaged and untracked), plus every crate that depends on them |
 | Swift or `tessera-ffi` surface | `just app-test` | the XCTest suites (Xcode, Thread Sanitizer); the gate does not run them, CI does |
-| Docs, scripts, CI, terminfo | the matching check: `actionlint`, `just terminfo-check`, `just config-docs-check` | no Rust test is affected |
+| Docs, scripts, CI | the matching check: `actionlint`, `just config-docs-check` | no Rust test is affected |
+| `shell-integration/` | `just test-affected` (selects `tessera-shell-integration` and `tessera-term`, which read it), plus `just terminfo-check` for the terminfo entry | the shell scripts and the terminfo entry |
 | Before any push or PR | `scripts/quality-gate.sh <worktree>` | everything: fmt, clippy, workspace tests, rustdoc, deny, FFI build and C tests, release timing tests, fuzz fmt and clippy |
 
 `just test-affected --list` prints the affected crates without running anything. A change to a root manifest,

@@ -17,8 +17,10 @@
 # Not covered, and said so in the output:
 #   apps/macos          the Swift app: `just app-test` (needs Xcode)
 #   fuzz/               not a workspace member: `scripts/quality-gate.sh` runs its fmt and clippy
-#   everything else     docs, scripts, CI, terminfo, shell integration: no Rust test is affected; run the check that
-#                       matches the file (actionlint, `just terminfo-check`, `just config-docs-check`)
+#   everything else     docs, scripts, CI: no Rust test is affected; run the check that matches the file
+#                       (actionlint, `just terminfo-check`, `just config-docs-check`)
+# shell-integration/ is read by Rust tests (the scripts by tessera-shell-integration, the terminfo entry by
+# tessera-term), so a change there selects both crates and their dependents.
 # Exit status: the clippy or nextest status, 2 on a usage error or when git/jq/cargo fail.
 set -euo pipefail
 
@@ -42,7 +44,7 @@ cd "$root"
 root="$(pwd -P)"
 mb="$(git merge-base "$base" HEAD)" || { print -u2 "no merge base with '$base'"; exit 2; }
 
-files=("${(@f)$( { git diff --name-only "$mb"; git ls-files --others --exclude-standard; } | sort -u )}")
+files=("${(@f)$( { git -c core.quotePath=false diff --no-renames --name-only "$mb"; git -c core.quotePath=false ls-files --others --exclude-standard; } | sort -u )}")
 files=("${(@)files:#}")
 if (( ${#files} == 0 )); then
     print -u2 "no changes since $base (${mb:0:7})"
@@ -80,6 +82,9 @@ for f in $files; do
     case "$f" in
         Cargo.toml|Cargo.lock|rust-toolchain|rust-toolchain.toml|clippy.toml|.clippy.toml|rustfmt.toml|.rustfmt.toml|deny.toml|.config/nextest.toml|.cargo/*)
             whole=1 ;;
+        # Rust tests read these files: the shell scripts (tessera-shell-integration) and the terminfo entry (tessera-term).
+        shell-integration/*)
+            for n in tessera-shell-integration tessera-term; do [[ -n "${pkg_dir[$n]:-}" ]] && hit[$n]=1; done ;;
         apps/macos/*) app=1 ;;
         fuzz/*) fuzz=1 ;;
         *)

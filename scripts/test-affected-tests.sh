@@ -22,14 +22,16 @@ chmod +x "$work/bin/cargo"
 export PATH="$work/bin:$PATH"
 
 git init -q -b main .
-print '[workspace]\nresolver = "3"\nmembers = ["crates/a", "crates/b", "crates/c", "crates/d"]' > Cargo.toml
-for n in a b c d; do
+print '[workspace]\nresolver = "3"\nmembers = ["crates/a", "crates/b", "crates/c", "crates/d", "crates/term", "crates/shell"]' > Cargo.toml
+typeset -A pkgname=(a a b b c c d d term tessera-term shell tessera-shell-integration)
+for n in ${(k)pkgname}; do
     mkdir -p crates/$n/src && : > crates/$n/src/lib.rs
-    print "[package]\nname = \"$n\"\nversion = \"0.1.0\"\nedition = \"2021\"\n" > crates/$n/Cargo.toml
+    print "[package]\nname = \"${pkgname[$n]}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n" > crates/$n/Cargo.toml
 done
 print '[dependencies]\na = { path = "../a" }' >> crates/b/Cargo.toml
 print '[dependencies]\nb = { path = "../b" }' >> crates/c/Cargo.toml
-mkdir -p apps/macos docs && : > apps/macos/x.swift && : > docs/x.md
+mkdir -p apps/macos docs shell-integration/terminfo && : > apps/macos/x.swift && : > docs/x.md && : > shell-integration/terminfo/t.terminfo
+echo "// movable" > crates/d/src/movable.rs
 git add -A && git commit -q -m base
 git checkout -q -b topic
 
@@ -57,13 +59,19 @@ echo '//' >> crates/d/src/lib.rs
 expect "an unrelated crate stays out" "d"
 reset
 echo '# x' >> Cargo.toml
-expect "a root manifest affects every crate" "a b c d" "workspace-wide"
+expect "a root manifest affects every crate" "a b c d tessera-shell-integration tessera-term" "workspace-wide"
 reset
 echo y >> apps/macos/x.swift
 expect "an app change affects no crate and points at app-test" "" "just app-test"
 reset
 echo y >> docs/x.md
 expect "a docs change affects no crate" "" "no crate owns: docs/x.md"
+reset
+echo y >> shell-integration/terminfo/t.terminfo
+expect "a shell-integration change selects the crates that read it" "tessera-shell-integration tessera-term"
+reset
+git mv crates/d/src/movable.rs crates/c/src/moved.rs
+expect "a file moved between crates selects both" "c d"
 reset
 echo '//' >> crates/b/src/lib.rs && git add -A && git commit -q -m b
 expect "committed changes count" "b c"
