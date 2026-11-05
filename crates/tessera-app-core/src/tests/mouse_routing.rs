@@ -6,8 +6,9 @@
 //! outcome, `written:` the bytes the child must have received, in order, and
 //! `offset:` the scroll offset afterwards. The encoder rows of the same
 //! fixture are `tessera-term`'s. The tests after it cover what a table row
-//! cannot: the flood, a report refused for want of room, and SGR-pixels
-//! reports through a real view.
+//! cannot: the flood (row D21, generated), a report refused for want of
+//! room, two threads sending to one session, and SGR-pixels reports
+//! through a real view.
 
 use super::*;
 use input::ScrollEvent;
@@ -16,7 +17,7 @@ const FIXTURE: &str = include_str!("../../../tessera-term/tests/fixtures/mouse_s
 const FIXTURE_NAME: &str = "tessera-term/tests/fixtures/mouse_spec.txt";
 
 /// Routing rows in the fixture.
-const ROUTING_ROWS: usize = 39;
+const ROUTING_ROWS: usize = 43;
 
 /// `\e` for ESC, `\xNN` for one raw byte, `\\` for a backslash; every
 /// other character is itself (UTF-8).
@@ -251,9 +252,10 @@ fn motion(col: u16) -> InputEvent {
     ))
 }
 
-/// Fixture row D21 and the brief's flood: 100,000 any-motion events
-/// write exactly one report per change of cell, each event returns at
-/// once, and what is queued is the reports and nothing else.
+/// Fixture row D21, run by [`every_routing_row`] (#194.8: once, not also
+/// as a test of its own): 200,000 any-motion events write exactly one
+/// report per change of cell, each event returns at once, and what is
+/// queued is the reports and nothing else.
 fn flood() {
     const EVENTS: usize = 100_000;
     let app = app();
@@ -297,11 +299,6 @@ fn flood() {
     assert_nothing_written_after(&fake, &expected, &app, id);
 }
 
-#[test]
-fn a_flood_of_motion_reports_only_cell_changes() {
-    flood();
-}
-
 /// A report that does not fit in the pending input fails with
 /// `WouldBlock` at once and leaves no trace: a press refused is not held,
 /// so its release is not sent, and motion refused does not move the
@@ -342,6 +339,125 @@ fn a_report_refused_for_room_leaves_no_trace() {
     assert!(session.mouse_reports().holds(MouseButton::Left));
     let expected = [fill.as_bytes(), b"\x1b[<0;3;1M"].concat();
     assert_nothing_written_after(&fake, &expected, &app, id);
+}
+
+/// A release refused for want of room still forgets its button (#194.4):
+/// with left and right held, a refused left release leaves right the
+/// lowest button held, so the next drag carries right, not the left
+/// button that is already up, and left's later release sends nothing.
+#[test]
+fn a_release_refused_for_room_still_forgets_its_button() {
+    let app = app();
+    let events = observe(&app);
+    let (id, fake) = attach_fake(&app, false);
+    output(&fake, &events, b"\x1b[?1002h\x1b[?1006h");
+    let mouse = |kind, button, col| {
+        let event = InputEvent::Mouse(input::MouseEvent::new(kind, button, col, 0));
+        app.send_input(id, event)
+    };
+    assert_eq!(
+        mouse(MouseEventKind::Press, MouseButton::Left, 0).unwrap(),
+        InputOutcome::Consumed
+    );
+    assert_eq!(
+        mouse(MouseEventKind::Press, MouseButton::Right, 0).unwrap(),
+        InputOutcome::Consumed
+    );
+    let presses = b"\x1b[<0;1;1M\x1b[<2;1;1M";
+    written_eventually(&fake, presses);
+    // Fill the pending input to 3 bytes below its bound: the release does
+    // not fit.
+    fake.would_block.store(true, Ordering::SeqCst);
+    let fill = "x".repeat(session::PENDING_INPUT_BYTES - 3);
+    assert_eq!(app.paste(id, &fill).unwrap(), InputOutcome::Consumed);
+    let refused = mouse(MouseEventKind::Release, MouseButton::Left, 0);
+    assert!(
+        matches!(&refused, Err(Error::Write { source, .. }) if source.kind() == io::ErrorKind::WouldBlock),
+        "{refused:?}"
+    );
+    let session = app.session(id).unwrap();
+    assert!(!session.mouse_reports().holds(MouseButton::Left));
+    assert!(session.mouse_reports().holds(MouseButton::Right));
+    fake.would_block.store(false, Ordering::SeqCst);
+    written_eventually(&fake, &[&presses[..], fill.as_bytes()].concat());
+    // The frontend still sends the drag with a button held.
+    assert_eq!(
+        mouse(MouseEventKind::Motion, MouseButton::Right, 2).unwrap(),
+        InputOutcome::Consumed
+    );
+    assert_eq!(
+        mouse(MouseEventKind::Release, MouseButton::Left, 2).unwrap(),
+        InputOutcome::Ignored
+    );
+    let expected = [&presses[..], fill.as_bytes(), b"\x1b[<34;3;1M"].concat();
+    assert_nothing_written_after(&fake, &expected, &app, id);
+}
+
+/// Two threads sending to one session (#194.11): each presses and
+/// releases its own button 20,000 times. The report state is read,
+/// routed, queued and stored under one input lock, so neither thread
+/// stores over the other's held button: every release is reported, none
+/// comes back Ignored, and nothing is held at the end.
+#[test]
+fn two_threads_never_lose_each_others_held_buttons() {
+    const ROUNDS: usize = 20_000;
+    let app = app();
+    let events = observe(&app);
+    let (id, fake) = attach_fake(&app, false);
+    output(&fake, &events, b"\x1b[?1000h\x1b[?1006h");
+    let start = std::sync::Barrier::new(2);
+    let ignored: Vec<usize> = thread::scope(|scope| {
+        let workers: Vec<_> = [MouseButton::Left, MouseButton::Right]
+            .into_iter()
+            .map(|button| {
+                let (app, start) = (&app, &start);
+                scope.spawn(move || {
+                    let event =
+                        |kind| InputEvent::Mouse(input::MouseEvent::new(kind, button, 0, 0));
+                    start.wait();
+                    let mut ignored = 0;
+                    for _ in 0..ROUNDS {
+                        let press = app.send_input(id, event(MouseEventKind::Press));
+                        assert_eq!(press.unwrap(), InputOutcome::Consumed);
+                        let release = app.send_input(id, event(MouseEventKind::Release));
+                        if release.unwrap() == InputOutcome::Ignored {
+                            ignored += 1;
+                        }
+                    }
+                    ignored
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().expect("worker panicked"))
+            .collect()
+    });
+    assert_eq!(
+        ignored,
+        [0, 0],
+        "releases Ignored (left, right) of {ROUNDS} each"
+    );
+    let session = app.session(id).unwrap();
+    let state = session.mouse_reports();
+    assert!(!state.holds(MouseButton::Left) && !state.holds(MouseButton::Right));
+    // Every report reached the child: 20,000 of each of the four.
+    let one = [
+        &b"\x1b[<0;1;1M"[..],
+        b"\x1b[<0;1;1m",
+        b"\x1b[<2;1;1M",
+        b"\x1b[<2;1;1m",
+    ]
+    .concat();
+    let deadline = Instant::now() + TIMEOUT;
+    while lock(&fake.written).len() < ROUNDS * one.len() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        lock(&fake.written).len(),
+        ROUNDS * one.len(),
+        "bytes written"
+    );
 }
 
 /// SGR-pixels (1016) through a real view: the pixel is counted from the

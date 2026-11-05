@@ -71,6 +71,11 @@ const RELEASE_CODE: u32 = 3;
 /// Added to the button code of motion.
 const MOTION_BIT: u32 = 32;
 
+/// Room for the longest report any encoding writes: with the largest code
+/// (189) and two ten-digit coordinates an SGR report is 29 bytes
+/// (`ESC[<189;4294967295;4294967295M`) and a urxvt one 28.
+const MAX_REPORT_LEN: usize = 32;
+
 /// The mouse button a report is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
@@ -279,7 +284,8 @@ pub fn encode_mouse(
     };
     // One-based from here on.
     let (x, y) = (x.saturating_add(1), y.saturating_add(1));
-    let mut out = Vec::with_capacity(16);
+    // Every report fits, so it is written in place with one allocation.
+    let mut out = Vec::with_capacity(MAX_REPORT_LEN);
     match encoding {
         MouseEncoding::Default | MouseEncoding::Utf8 => {
             let limit = if encoding == MouseEncoding::Default {
@@ -304,13 +310,25 @@ pub fn encode_mouse(
             }
         }
         MouseEncoding::Sgr | MouseEncoding::SgrPixels => {
-            let last = if release { 'm' } else { 'M' };
-            out.extend_from_slice(format!("\x1b[<{code};{x};{y}{last}").as_bytes());
+            out.extend_from_slice(b"\x1b[<");
+            push_decimal(&mut out, code);
+            out.push(b';');
+            push_decimal(&mut out, x);
+            out.push(b';');
+            push_decimal(&mut out, y);
+            out.push(if release { b'm' } else { b'M' });
         }
         MouseEncoding::Urxvt => {
-            out.extend_from_slice(format!("\x1b[{};{x};{y}M", code + 32).as_bytes());
+            out.extend_from_slice(b"\x1b[");
+            push_decimal(&mut out, code + 32);
+            out.push(b';');
+            push_decimal(&mut out, x);
+            out.push(b';');
+            push_decimal(&mut out, y);
+            out.push(b'M');
         }
     }
+    debug_assert!(out.len() <= MAX_REPORT_LEN, "a report outgrew its buffer");
     Some(out)
 }
 
@@ -325,6 +343,24 @@ fn modifier_bits(modifiers: Modifiers) -> u32 {
     .filter(|&(modifier, _)| modifiers.contains(modifier))
     .map(|(_, bit)| bit)
     .sum()
+}
+
+/// Pushes the decimal digits of `value`, as `write!` would, without the
+/// formatting machinery or a temporary string.
+fn push_decimal(out: &mut Vec<u8>, value: u32) {
+    // u32::MAX has 10 digits.
+    let mut digits = [0u8; 10];
+    let mut start = digits.len();
+    let mut rest = value;
+    loop {
+        start -= 1;
+        digits[start] = b'0' + u8::try_from(rest % 10).expect("a digit");
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&digits[start..]);
 }
 
 /// Pushes `value` as one raw byte: the default encoding's limit and the
@@ -357,6 +393,31 @@ mod tests {
         assert_eq!(clamp_pixel(700.0, 640), 639);
         assert_eq!(clamp_pixel(1e12, 0), u32::MAX);
         assert_eq!(clamp_pixel(f32::INFINITY, 0), u32::MAX);
+    }
+
+    #[test]
+    fn decimals_match_the_formatter() {
+        let decimal = |value| {
+            let mut out = Vec::new();
+            push_decimal(&mut out, value);
+            String::from_utf8(out).expect("ASCII digits")
+        };
+        for value in [
+            0,
+            1,
+            9,
+            10,
+            99,
+            100,
+            223,
+            999,
+            1000,
+            65_535,
+            u32::MAX - 1,
+            u32::MAX,
+        ] {
+            assert_eq!(decimal(value), value.to_string());
+        }
     }
 
     #[test]

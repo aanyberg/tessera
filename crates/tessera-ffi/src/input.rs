@@ -1202,8 +1202,9 @@ pub unsafe extern "C" fn tessera_session_send_key(
 /// decides (ADR 0027):
 ///
 /// - tracking off: `IGNORED`;
-/// - Shift held: a press or drag is `IGNORED` (Shift selects even while a
-///   program tracks the mouse); Option is reported to the program as Meta;
+/// - Shift held: a press or any motion, a drag or plain motion, is
+///   `IGNORED` (Shift selects even while a program tracks the mouse);
+///   Option is reported to the program as Meta;
 /// - Cmd held: `IGNORED`, never reported (Cmd-click opens links);
 /// - a release is reported (`CONSUMED`) iff its press was, whatever the
 ///   modifiers at release, so a selection that started with Shift never
@@ -1215,8 +1216,9 @@ pub unsafe extern "C" fn tessera_session_send_key(
 ///   column or row 223 in the default encoding) is `IGNORED`.
 ///
 /// A report is queued like a key and never blocks; it can fail like one
-/// (`TESSERA_ERROR_IO`), and a press that failed does not count as
-/// reported.
+/// (`TESSERA_ERROR_IO`): a press that failed does not count as reported,
+/// and a release that failed still counts as released, so later motion is
+/// no drag of its button.
 ///
 /// Call from the UI (main) thread only.
 ///

@@ -19,6 +19,12 @@
 //! which probes ran. Every child runs with `HOME`, `XDG_CONFIG_HOME` and
 //! `TMUX_TMPDIR` in a temporary directory, so nothing reads or writes the
 //! real home directory.
+//!
+//! Each probe runs twice: with `TERM=xterm-256color`, the default (ADR
+//! 0005), and with `TERM=tessera` and `TERMINFO` set to the entry from
+//! `shell-integration/terminfo/tessera.terminfo` compiled with `tic -x`
+//! into the temporary directory (#194.9), as the app bundles it. Without
+//! `tic` the `tessera` runs are skipped with a message.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -45,6 +51,46 @@ fn which(name: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
+/// The terminal type a probe's child runs with.
+#[derive(Debug, Clone)]
+struct Term {
+    /// `TERM`.
+    name: &'static str,
+    /// `TERMINFO`, for an entry that is not installed.
+    terminfo: Option<PathBuf>,
+}
+
+impl Term {
+    /// `TERM=xterm-256color`, from the system's terminfo.
+    fn xterm() -> Self {
+        Self {
+            name: "xterm-256color",
+            terminfo: None,
+        }
+    }
+
+    /// `TERM=tessera`, its entry compiled with `tic -x` into `dir`.
+    fn tessera(dir: &Path) -> Result<Self, String> {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../shell-integration/terminfo/tessera.terminfo");
+        let terminfo = dir.join("terminfo");
+        let status = Command::new("tic")
+            .arg("-x")
+            .arg("-o")
+            .arg(&terminfo)
+            .arg(&source)
+            .status()
+            .map_err(|e| format!("tic: {e}"))?;
+        if !status.success() {
+            return Err(format!("tic {}: {status}", source.display()));
+        }
+        Ok(Self {
+            name: "tessera",
+            terminfo: Some(terminfo),
+        })
+    }
+}
+
 /// A program running in a session of its own `App`.
 struct Running {
     app: App,
@@ -52,20 +98,24 @@ struct Running {
 }
 
 impl Running {
-    /// Starts `program` with `args` at 80x24, its home in `home`.
-    fn start(program: &Path, args: &[&str], home: &Path) -> Self {
+    /// Starts `program` with `args` at 80x24 under `term`, its home in
+    /// `home`.
+    fn start(program: &Path, args: &[&str], home: &Path, term: &Term) -> Self {
         let app = App::new(
             Config::default(),
             ConfigPaths::new(home.join("tessera-config")),
         );
-        let options = SpawnOptions::command(program, "mouse-probe")
+        let mut options = SpawnOptions::command(program, "mouse-probe")
             .args(args)
             .cwd(home)
-            .env("TERM", "xterm-256color")
+            .env("TERM", term.name)
             .env("HOME", home)
             .env("XDG_CONFIG_HOME", home)
             .env("TMUX_TMPDIR", home)
             .env("SHELL", "/bin/sh");
+        if let Some(terminfo) = &term.terminfo {
+            options = options.env("TERMINFO", terminfo);
+        }
         let options = SpawnOptions {
             size: PtySize::new(24, 80),
             ..options
@@ -129,7 +179,7 @@ impl Drop for Running {
 }
 
 /// vim: a click moves the cursor to the clicked cell.
-fn vim(program: &Path, home: &Path) -> Result<String, String> {
+fn vim(program: &Path, home: &Path, term: &Term) -> Result<String, String> {
     let file = home.join("numbers.txt");
     let lines = (1..=30).fold(String::new(), |mut text, n| {
         let _ = writeln!(text, "line {n:02}");
@@ -141,6 +191,7 @@ fn vim(program: &Path, home: &Path) -> Result<String, String> {
         program,
         &["-u", "NONE", "-i", "NONE", "-N", "-c", "set mouse=a", &file],
         home,
+        term,
     );
     if !vim.wait(|vim| {
         vim.screen()
@@ -171,7 +222,7 @@ fn vim(program: &Path, home: &Path) -> Result<String, String> {
 }
 
 /// tmux: a click in the inactive pane makes it active.
-fn tmux(program: &Path, home: &Path) -> Result<String, String> {
+fn tmux(program: &Path, home: &Path, term: &Term) -> Result<String, String> {
     let socket = format!("tessera-test-{}", std::process::id());
     let tmux = Running::start(
         program,
@@ -191,6 +242,7 @@ fn tmux(program: &Path, home: &Path) -> Result<String, String> {
             "-h",
         ],
         home,
+        term,
     );
     let query = |format: &str| {
         Command::new(program)
@@ -236,8 +288,8 @@ fn tmux(program: &Path, home: &Path) -> Result<String, String> {
 }
 
 /// htop: a click on a column header makes it the sort column.
-fn htop(program: &Path, home: &Path) -> Result<String, String> {
-    let htop = Running::start(program, &[], home);
+fn htop(program: &Path, home: &Path, term: &Term) -> Result<String, String> {
+    let htop = Running::start(program, &[], home, term);
     let header = |htop: &Running| {
         htop.screen()
             .iter()
@@ -319,7 +371,7 @@ fn htop(program: &Path, home: &Path) -> Result<String, String> {
     }
 }
 
-type ProbeFn = fn(&Path, &Path) -> Result<String, String>;
+type ProbeFn = fn(&Path, &Path, &Term) -> Result<String, String>;
 
 #[test]
 #[ignore = "live: runs vim, tmux and htop; not part of the gate"]
@@ -336,13 +388,27 @@ fn programs_respond_to_mouse_reports() {
             eprintln!("SKIP {name}: not installed ({install})");
             continue;
         };
-        let home = tempfile::tempdir().expect("temp dir");
-        match probe(&program, home.path()) {
-            Ok(what) => {
-                eprintln!("RAN {name}: {what}");
-                ran.push(name);
+        for tessera in [false, true] {
+            let home = tempfile::tempdir().expect("temp dir");
+            let term = if tessera {
+                match Term::tessera(home.path()) {
+                    Ok(term) => term,
+                    Err(why) => {
+                        eprintln!("SKIP {name} with TERM=tessera: {why}");
+                        continue;
+                    }
+                }
+            } else {
+                Term::xterm()
+            };
+            let label = format!("{name} with TERM={}", term.name);
+            match probe(&program, home.path(), &term) {
+                Ok(what) => {
+                    eprintln!("RAN {label}: {what}");
+                    ran.push(label);
+                }
+                Err(why) => failures.push(format!("{label}: {why}")),
             }
-            Err(why) => failures.push(format!("{name}: {why}")),
         }
     }
     eprintln!("probes that ran and passed: {ran:?}");

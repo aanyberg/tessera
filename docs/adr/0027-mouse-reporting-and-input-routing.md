@@ -56,8 +56,13 @@ cell's top-left pixel.
 program; every event that writes nothing is `Ignored`, and the frontend may
 then select or open a link. Per session the core keeps the buttons whose
 press it reported and the position of the last report
-(`tessera-app-core/src/mouse.rs`), updated only once a report is queued, so
-a report refused for want of room (`WouldBlock`) leaves no trace.
+(`tessera-app-core/src/mouse.rs`). The state is read, the event routed, its
+report queued and the new state stored under one hold of the session's
+input-state lock, so two threads sending to one session never store over
+each other's held buttons (#194). A press or motion refused for want of
+room (`WouldBlock`) leaves no trace; a refused release still forgets its
+button, which is up whether or not the program heard of it, so later
+motion is no drag of it (#194).
 
 | event | tracking off | tracking on, no modifier | Shift held | Cmd held |
 |---|---|---|---|---|
@@ -86,8 +91,8 @@ a report refused for want of room (`WouldBlock`) leaves no trace.
   off clears the held buttons and the baseline, so a drag interrupted by
   `DECRST 1002` sends no release after `DECSET 1002`. The check is lazy (on
   the next event, not on the mode change): a program that turns tracking
-  off and on again between two mouse events, as tmux does on redraws,
-  keeps its held buttons and still gets its release.
+  off and on again between two mouse events keeps its held buttons and
+  still gets its release.
 - **Activating click.** The click that activates an inactive window is not
   reported, press nor release. The core has no notion of window activation;
   the frontend swallows the event (the Swift half of #12 records its
@@ -158,9 +163,17 @@ no reporting decision of its own.
   (an `NSTrackingArea`), and to start a selection only on `Ignored`.
   Routing is covered by Rust tests on a fake PTY (the routing rows of the
   fixture) and an FFI test with a real child.
-- One extra lock of the session's input state per mouse event, and the
-  terminal lock once to read the modes, as for a key. SGR-pixels events also
-  read the view table for the padding and cell size.
+- Locks per mouse event, one after the other (#194): the terminal lock once
+  to read the modes and grid size, as for a key; in SGR-pixels mode the
+  view table once for the padding and cell size; then the session's
+  input-state lock once, held while the event is recorded, routed, its
+  report queued (the PTY lock for the exit check and the outbox lock, taken
+  and released under it) and the new report state stored. A wheel event
+  that reports takes, after the terminal lock, in SGR-pixels mode the
+  input-state lock once for the last pointer and the view table once for
+  its pixel, then the input-state lock once for the whole lines, before
+  that last section: two input-state locks, three in SGR-pixels mode, and
+  the view table at most once.
 - Programs that use the default encoding on grids wider than 223 columns
   never see presses beyond it; their releases arrive clamped. Programs
   that care use SGR (tmux, vim with `ttymouse=sgr`, ncurses through the

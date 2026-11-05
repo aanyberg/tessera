@@ -96,6 +96,57 @@ fn main() -> ExitCode {
 #[derive(Debug, Clone, Copy)]
 struct Wake;
 
+/// The mouse buttons held down, as a set (#194.12): releasing one of two
+/// held buttons leaves the other dragging, as in xterm.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct HeldButtons(u8);
+
+impl HeldButtons {
+    /// The buttons a drag can carry, lowest first (xterm's order).
+    const ORDER: [MouseButton; 5] = [
+        MouseButton::Left,
+        MouseButton::Middle,
+        MouseButton::Right,
+        MouseButton::Back,
+        MouseButton::Forward,
+    ];
+
+    /// `button`'s bit, 0 for [`MouseButton::None`].
+    fn bit(button: MouseButton) -> u8 {
+        Self::ORDER
+            .iter()
+            .position(|&held| held == button)
+            .map_or(0, |index| 1 << index)
+    }
+
+    /// Marks `button` held (`down`) or released.
+    fn set(&mut self, button: MouseButton, down: bool) {
+        let bit = Self::bit(button);
+        if down {
+            self.0 |= bit;
+        } else {
+            self.0 &= !bit;
+        }
+    }
+
+    /// Applies a winit `MouseInput` event: `button` pressed or released.
+    /// A button the terminal does not report changes nothing.
+    fn apply(&mut self, state: ElementState, button: winit::event::MouseButton) {
+        if let Some(mapped) = input::mouse_button(button) {
+            self.set(mapped, state == ElementState::Pressed);
+        }
+    }
+
+    /// The button motion carries: the lowest one held, or
+    /// [`MouseButton::None`] when none is.
+    fn drag_button(self) -> MouseButton {
+        Self::ORDER
+            .into_iter()
+            .find(|&button| self.0 & Self::bit(button) != 0)
+            .unwrap_or(MouseButton::None)
+    }
+}
+
 /// The window, its session and the input state winit does not keep.
 struct DevWin {
     app: App,
@@ -112,8 +163,8 @@ struct DevWin {
     modifiers: KeyMods,
     /// Last pointer position, physical pixels.
     cursor: (f64, f64),
-    /// The button held for drags.
-    held: MouseButton,
+    /// The buttons held, for drags.
+    held: HeldButtons,
     occluded: bool,
     /// When to draw again after a frame that left content pending.
     retry_at: Option<Instant>,
@@ -153,7 +204,7 @@ impl DevWin {
             session: None,
             modifiers: KeyMods::default(),
             cursor: (0.0, 0.0),
-            held: MouseButton::None,
+            held: HeldButtons::default(),
             occluded: false,
             retry_at: None,
             recoveries: 0,
@@ -505,20 +556,13 @@ impl ApplicationHandler<Wake> for DevWin {
                 self.cursor = (position.x, position.y);
                 self.send(input::mouse_motion(
                     self.cursor,
-                    self.held,
+                    self.held.drag_button(),
                     self.geometry(),
                     self.modifiers.held,
                 ));
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                let mapped = input::mouse_button(button);
-                match state {
-                    ElementState::Pressed => self.held = mapped.unwrap_or(self.held),
-                    ElementState::Released if mapped == Some(self.held) => {
-                        self.held = MouseButton::None;
-                    }
-                    ElementState::Released => {}
-                }
+                self.held.apply(state, button);
                 if let Some(event) = input::mouse_input(
                     state,
                     button,
@@ -561,6 +605,62 @@ impl ApplicationHandler<Wake> for DevWin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #194.12: press left, press right, release right: the motion after
+    /// it is still a left drag (a single held button lost it, and 1002
+    /// then dropped the motion); releasing left too ends the drag.
+    #[test]
+    fn held_buttons_are_a_set() {
+        let mut held = HeldButtons::default();
+        assert_eq!(held.drag_button(), MouseButton::None);
+        held.set(MouseButton::Left, true);
+        held.set(MouseButton::Right, true);
+        assert_eq!(held.drag_button(), MouseButton::Left);
+        held.set(MouseButton::Right, false);
+        assert_eq!(held.drag_button(), MouseButton::Left);
+        let geometry = CellGeometry {
+            cell_width: 10.0,
+            cell_height: 20.0,
+            padding: 0.0,
+        };
+        let motion = input::mouse_motion(
+            (35.0, 5.0),
+            held.drag_button(),
+            geometry,
+            winit::keyboard::ModifiersState::empty(),
+        );
+        let tessera_app_core::InputEvent::Mouse(motion) = motion else {
+            panic!("{motion:?}");
+        };
+        assert_eq!(motion.button, MouseButton::Left);
+        assert_eq!((motion.col, motion.row), (3, 0));
+        // Releasing the lower button leaves the higher one dragging.
+        held.set(MouseButton::Middle, true);
+        held.set(MouseButton::Left, false);
+        assert_eq!(held.drag_button(), MouseButton::Middle);
+        held.set(MouseButton::Middle, false);
+        assert_eq!(held.drag_button(), MouseButton::None);
+        // A button the set does not know changes nothing.
+        held.set(MouseButton::None, true);
+        assert_eq!(held, HeldButtons::default());
+    }
+
+    /// The `MouseInput` handler's update (#194.12): press left, press
+    /// right, release right as winit events, and left still drags.
+    #[test]
+    fn mouse_input_events_release_only_their_button() {
+        use winit::event::MouseButton as W;
+        let mut held = HeldButtons::default();
+        held.apply(ElementState::Pressed, W::Left);
+        held.apply(ElementState::Pressed, W::Right);
+        held.apply(ElementState::Released, W::Right);
+        assert_eq!(held.drag_button(), MouseButton::Left);
+        held.apply(ElementState::Released, W::Left);
+        assert_eq!(held.drag_button(), MouseButton::None);
+        // A button the terminal does not report changes nothing.
+        held.apply(ElementState::Pressed, W::Other(9));
+        assert_eq!(held, HeldButtons::default());
+    }
 
     /// Nothing changed: never retried, however many come in a row, so
     /// an idle window waits for an event instead of waking every refresh.
