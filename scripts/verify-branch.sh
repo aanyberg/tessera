@@ -9,8 +9,9 @@
 #   gate      scripts/quality-gate.sh exits 0 (reuses a recorded pass for the same commit, toolchain and gate script)
 #   clean     the worktree has no uncommitted or untracked changes
 #   base      the branch contains <base> (default: main)
-#   commits   every commit in <base>..HEAD has a Conventional Commit subject and the Co-Authored-By and
-#             Claude-Session trailers (with --coauthor / --session, those exact lines)
+#   commits   the tip commit (HEAD) has a Conventional Commit subject and the Co-Authored-By and Claude-Session
+#             trailers (with --coauthor / --session, those exact lines); the integrator squashes the branch into one
+#             commit, so a problem in an earlier commit of <base>..HEAD is a WARN, not a FAIL
 #   scope     with --allow: changed paths outside every allowed file or directory (WARN: the lead decides)
 #   adr       no ADR added or renamed on the branch shares its number with another ADR on the branch or on <base>
 #             (paths the branch deletes or renames away do not count)
@@ -83,13 +84,13 @@ package_of() {
         d="${d:h}"
     done
 }
-typeset -A targets touched
+typeset -A targets touched pkgdir
 for t in $loads; do targets[$t]=1; done
 for f in $changed; do
     pkg="$(package_of "$f")"
     [[ -n "$pkg" ]] || continue
     dir="${pkg%% *}" name="${pkg#* }"
-    touched[$name]=1
+    touched[$name]=1 pkgdir[$name]="$dir"
     [[ -f "$f" ]] || continue
     rel="${f#${dir}/}"
     if [[ "$rel" == tests/*/* ]]; then
@@ -105,12 +106,39 @@ for f in $changed; do
         fi
     fi
 done
+# A nextest override filter is an expression such as `(package(a) & binary(b) & test(x)) | (package(c) & test(y))`.
+# Each top-level `|` alternative names its own package and suite, so a target pairs a package with the binary of the
+# same alternative, never the last binary of the line with another alternative's package (#192). An alternative with
+# no binary(...) selects its package's lib, or its bins when the package has no src/lib.rs. Prints
+# "<package> <binary or empty>" per alternative of a filter line.
+filter_targets() {
+    perl -e '
+        my $e = $ARGV[0]; my ($d, $cur, @alt) = (0, "");
+        for my $c (split //, $e) {
+            $d++ if $c eq "("; $d-- if $c eq ")";
+            if ($c eq "|" && $d == 0) { push @alt, $cur; $cur = ""; next }
+            $cur .= $c;
+        }
+        push @alt, $cur;
+        for my $a (@alt) {
+            $a =~ s/^\s+|\s+$//g;
+            my ($p) = $a =~ /package\(([^)]*)\)/ or next;
+            my ($b) = $a =~ /binary\(([^)]*)\)/;
+            print "$p ", $b // "", "\n";
+        }
+    ' -- "$1"
+}
 if [[ -f .config/nextest.toml ]]; then
     while IFS= read -r line; do
-        p="$(print -r -- "$line" | sed -n 's/.*package(\([^)]*\)).*/\1/p')"
-        [[ -n "$p" && -n "${touched[$p]:-}" ]] || continue
-        b="$(print -r -- "$line" | sed -n 's/.*binary(\([^)]*\)).*/\1/p')"
-        if [[ -n "$b" ]]; then targets[${p}:${b}]=1; else targets[${p}:lib]=1; fi
+        expr="${line#filter*=}"
+        expr="${${expr## #}%% #}"
+        expr="${expr#\'}" expr="${expr%\'}"
+        while IFS=' ' read -r p b; do
+            [[ -n "$p" && -n "${touched[$p]:-}" ]] || continue
+            if [[ -n "$b" ]]; then targets[${p}:${b}]=1
+            elif [[ -f "${pkgdir[$p]}/src/lib.rs" ]]; then targets[${p}:lib]=1
+            else targets[${p}:bins]=1; fi
+        done < <(filter_targets "$expr")
     done < <(grep '^filter' .config/nextest.toml)
 fi
 
@@ -139,9 +167,12 @@ if [[ -z "$(git status --porcelain)" ]]; then pass "clean"; else fail "clean:"; 
 # base
 if git merge-base --is-ancestor "$base" HEAD; then pass "base contains $base"; else fail "base: HEAD does not contain $base (merge it first)"; fi
 
-# commits
+# commits: the integrator squashes the branch into one commit with the message from the brief, so only the tip (HEAD)
+# is the commit that lands: its subject and trailers FAIL. The commits below it are squashed away; their problems are
+# WARNs (a single-commit branch, such as the integrator's, has only the tip).
 conventional='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?!?: .+'
-bad=()
+head_sha="$(git rev-list --no-merges -1 "$base..HEAD")"  # the newest non-merge commit
+bad=() squashed=()
 for sha in $(git rev-list --no-merges "$base..HEAD"); do
     subject="$(git log -1 --format=%s "$sha")"
     body="$(git log -1 --format=%B "$sha")"
@@ -157,9 +188,12 @@ for sha in $(git rev-list --no-merges "$base..HEAD"); do
     else
         print -r -- "$body" | grep -q '^Claude-Session: ' || problems+=("no Claude-Session")
     fi
-    (( ${#problems} )) && bad+=("${sha:0:7} $subject (${(j:, :)problems})")
+    (( ${#problems} )) || continue
+    if [[ "$sha" == "$head_sha" ]]; then bad+=("${sha:0:7} $subject (${(j:, :)problems})")
+    else squashed+=("${sha:0:7} $subject (${(j:, :)problems})"); fi
 done
 if (( ${#bad} )); then fail "commits:"; print -l -- "  "${^bad}; else pass "commits"; fi
+if (( ${#squashed} )); then warn "commits below the tip (the integrator squashes them; only the tip lands):"; print -l -- "  "${^squashed}; fi
 
 # scope
 if (( ${#allow} )); then

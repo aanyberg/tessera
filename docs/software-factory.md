@@ -191,22 +191,25 @@ Agents use these instead of rebuilding the setup in every run:
   file-watcher, shaping, term `wide`, GPU and hdiutil tests); the slowest test in the workspace takes 12 s, so there
   is room for a machine under load 30+. `scripts/quality-gate.sh` then fails with the terminated test names
   (`TIMEOUT` lines) instead of a bare exit code. `TESSERA_GATE_NEXTEST_MINUTES` (default 30) is a gate-level
-  watchdog: nextest and its descendants are killed after that long and the gate fails naming the limit (nextest runs
-  with `--color never`, so the `TIMEOUT` report also works under `CARGO_TERM_COLOR=always`). The gate builds the test
-  binaries first (`cargo nextest run --no-run`, same arguments), so the watchdog's window covers the run and not the
-  compilation, and a watchdog whose gate was killed (SIGKILL included) exits without acting. After the ffi release
-  build the gate runs the ffi C tests (`scripts/ffi-c-test.sh`; `surface.c` skips itself under
-  `TESSERA_SKIP_GPU_TESTS`) and the release-only timing bars `reader_lock_hold_is_bounded`,
+  watchdog: nextest, the ffi C tests and their descendants are killed after that long and the gate fails naming the
+  limit in seconds and the variable that set it (nextest runs with `--color never`, so the `TIMEOUT` report also
+  works under `CARGO_TERM_COLOR=always`). The gate builds the test binaries first (`cargo nextest run --no-run`, same
+  arguments), so the watchdog's window covers the run and not the compilation, and a watchdog whose gate was killed
+  (SIGKILL included) exits without acting. After the ffi release build the gate runs the ffi C tests
+  (`scripts/ffi-c-test.sh`, under the same watchdog; `surface.c` skips itself under `TESSERA_SKIP_GPU_TESTS`) and the
+  release-only timing bars `reader_lock_hold_is_bounded`,
   `view_metrics_are_fast_while_output_floods_the_terminal`, `scrolling_through_a_long_history_is_smooth` and
   `a_flood_under_a_scrolled_view_keeps_captures_short` (#114, #175; `timing` group). A failure with the 1-minute
-  load at or above `hw.ncpu` is retried once ("failed under load, retried"), any other failure fails the gate.
-  `just quality-gate-test` checks the watchdog and that retry with a fake `cargo`, through test hooks the gate honours
-  only under `TESSERA_GATE_SELFTEST=1` (listed in the script's header). When the macOS job's test step fails, times
-  out or is cancelled, it uploads `apps/macos/build/app-test*.log` as the `app-test-logs` artifact (#121). In CI the
-  Rust job, which also runs the ffi C tests, has `timeout-minutes: 20` and the macOS app job 15 (a normal run is 4-6
-  minutes), with a 10-minute limit on `just app-test`, whose xcodebuild calls also fail a single hung test after
-  120 s (300 s at most). A hang below the test level (the TSan and fork deadlock of #121) is caught by the step and
-  job limits only. A new test that legitimately needs more than 300 s gets its own `slow-timeout` override there.
+  load at or above `hw.ncpu` is retried once ("failed under load, retried"), any other failure fails the gate,
+  and so does a failed build of the timing tests (load does not explain it). `just quality-gate-test` checks, with a
+  fake `cargo`, the watchdog (nextest and the ffi C step), that retry and that the hooks are inert without
+  `TESSERA_GATE_SELFTEST=1`, through test hooks the gate honours only under `TESSERA_GATE_SELFTEST=1` (listed in the
+  script's header). When the macOS job's test step fails, times out or is cancelled, it uploads
+  `apps/macos/build/app-test*.log` as the `app-test-logs` artifact (#121). In CI the Rust job, which also runs the ffi
+  C tests, has `timeout-minutes: 20` and the macOS app job 15 (a normal run is 4-6 minutes), with a 10-minute limit on
+  `just app-test`, whose xcodebuild calls also fail a single hung test after 120 s (300 s at most). A hang below the
+  test level (the TSan and fork deadlock of #121) is caught by the step and job limits only. A new test that
+  legitimately needs more than 300 s gets its own `slow-timeout` override there.
 - **A/B probes.** `cargo xtask ab init --base <rev> --crate <name> --out <scratch dir>` builds a probe crate that
   depends on each crate at the base revision (`base_<name>`) and in the worktree (`head_<name>`). Write cases in
   the probe's `src/cases.rs`, then `cargo xtask ab bench <dir> --case <c> [--max-ratio <bar>]` (alternating
@@ -220,7 +223,8 @@ Agents use these instead of rebuilding the setup in every run:
   `ab init` each) all measure under it.
 - **Branch verification.** `scripts/verify-branch.sh <wt> [--base <ref>] [--allow <path>]... [--session <url>]
   [--coauthor <line>] [--load <crate>:<target>]... [--no-load] [--parallel <1-8>] [--list-targets]` runs the gate
-  and checks the clean tree, ancestry, Conventional Commit subjects and trailers, scope against the brief's paths
+  and checks the clean tree, ancestry, the tip commit's Conventional Commit subject and trailers (the integrator
+  squashes the branch, so a problem in a commit below the tip is a warning), scope against the brief's paths
   (a warning, for the lead), ADR number collisions, and timing-sensitive tests under load (10 runs each).
   `--parallel N` caps the load check at N test runs in flight, per target and in total (targets run one
   after another); the default is 3 so a busy machine is not exhausted, and the lead may raise it up to 8 on a quiet
