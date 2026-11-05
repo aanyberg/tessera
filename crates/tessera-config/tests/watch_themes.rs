@@ -18,6 +18,13 @@ fn limit() -> Duration {
     WatchOptions::default().debounce + Duration::from_millis(500)
 }
 
+/// How long a test waits for an event that is due when it does not assert
+/// the issue's bound ([`limit`], asserted only by
+/// `editing_the_theme_in_use_is_reported_once_within_the_bound`): long
+/// enough for a starved process (`taskpolicy -b` on a loaded machine; #253
+/// item 9). `recv_timeout` returns as soon as the event arrives.
+const EVENTUALLY: Duration = Duration::from_secs(5);
+
 /// How long to wait to be sure no (further) event comes: the polling
 /// interval, the debounce and generous scheduling slack.
 const QUIET: Duration = Duration::from_millis(600);
@@ -75,7 +82,7 @@ fn drain(watcher: &Watcher, window: Duration) -> Vec<ConfigEvent> {
 }
 
 fn expect_themes_changed(watcher: &Watcher, backend: WatchBackend, what: &str) {
-    expect_themes_changed_within(watcher, backend, what, limit());
+    expect_themes_changed_within(watcher, backend, what, EVENTUALLY);
 }
 
 fn expect_themes_changed_within(
@@ -117,7 +124,7 @@ fn editing_the_theme_in_use_is_reported_once_within_the_bound() {
         // In place: no directory event; the native backend must watch the
         // file itself.
         write(&mine, &theme_doc("Mine", "#111111"));
-        expect_themes_changed(&watcher, backend, "in-place write");
+        expect_themes_changed_within(&watcher, backend, "in-place write", limit());
         assert_eq!(background(&store), "#111111", "{backend:?}");
         let rest = drain(&watcher, QUIET);
         assert!(
@@ -130,11 +137,11 @@ fn editing_the_theme_in_use_is_reported_once_within_the_bound() {
         let tmp = mine.with_extension("toml.tmp");
         write(&tmp, &theme_doc("Mine", "#121212"));
         std::fs::rename(&tmp, &mine).unwrap();
-        expect_themes_changed(&watcher, backend, "rename-save");
+        expect_themes_changed_within(&watcher, backend, "rename-save", limit());
         assert_eq!(background(&store), "#121212", "{backend:?}");
         assert!(drain(&watcher, QUIET).is_empty(), "{backend:?}");
         write(&mine, &theme_doc("Mine", "#131313"));
-        expect_themes_changed(&watcher, backend, "write after rename-save");
+        expect_themes_changed_within(&watcher, backend, "write after rename-save", limit());
         assert_eq!(background(&store), "#131313", "{backend:?}");
     }
 }
@@ -149,10 +156,11 @@ fn editing_an_unrelated_theme_file_is_at_most_one_event_and_no_changed() {
         // Pinned per backend: the native one does not watch a theme file
         // that is not in use; the polling one sees it at its next full
         // listing, every twenty intervals, then debounces. The wait allows
-        // four times that for a throttled machine; it ends at the event.
+        // four times that for a throttled machine, and at least
+        // [`EVENTUALLY`] (#262 N2); it ends at the event.
         let events = if backend == WatchBackend::Poll {
             let defaults = WatchOptions::default();
-            let bound = defaults.poll_interval * 20 * 4 + defaults.debounce;
+            let bound = (defaults.poll_interval * 20 * 4 + defaults.debounce).max(EVENTUALLY);
             let first = watcher
                 .recv_timeout(bound)
                 .unwrap_or_else(|e| panic!("Poll: unused-file write unseen within {bound:?}: {e}"));
@@ -234,7 +242,7 @@ fn the_watched_theme_file_follows_appearance_theme() {
     for backend in BACKENDS {
         let (_dir, store, watcher) = setup(backend, "mine");
         write(&store.paths().config_file(), &config_doc("other"));
-        let event = watcher.recv_timeout(limit()).expect("config change");
+        let event = watcher.recv_timeout(EVENTUALLY).expect("config change");
         assert!(matches!(event, ConfigEvent::Changed(_)), "{event:?}");
         assert_eq!(background(&store), "#202020");
         assert!(drain(&watcher, QUIET).is_empty(), "{backend:?}");
@@ -341,11 +349,8 @@ fn an_edit_right_after_the_watch_starts_is_seen() {
                 &store.paths().themes_dir().join("mine.toml"),
                 &theme_doc("Mine", "#171717"),
             );
-            let event = watcher.recv_timeout(limit()).unwrap_or_else(|e| {
-                panic!(
-                    "{backend:?}: round {round}: no event within {:?}: {e}",
-                    limit()
-                )
+            let event = watcher.recv_timeout(EVENTUALLY).unwrap_or_else(|e| {
+                panic!("{backend:?}: round {round}: no event within {EVENTUALLY:?}: {e}")
             });
             assert!(
                 matches!(event, ConfigEvent::ThemesChanged),
@@ -370,14 +375,7 @@ fn a_broken_theme_file_stays_watched_until_it_is_fixed() {
                 // The configuration names it already; found by `name` key
                 // once it exists.
                 write(&path, &theme_doc("Keyed Theme", "#181818"));
-                // A new file: the polling backend sees the directory change
-                // on its next tick; extra room for a throttled machine.
-                expect_themes_changed_within(
-                    &watcher,
-                    backend,
-                    "keyed theme created",
-                    limit() + Duration::from_millis(500),
-                );
+                expect_themes_changed(&watcher, backend, "keyed theme created");
                 drain(&watcher, QUIET);
                 assert_eq!(background(&store), "#181818");
             }
@@ -429,6 +427,154 @@ fn a_theme_file_broken_from_the_start_is_followed_by_its_stem() {
         );
         assert_eq!(background(&store), "#1e1e1e", "{backend:?}");
     }
+}
+
+/// Waits up to [`EVENTUALLY`] for a `ThemesChanged` after which the store
+/// resolves background `background`.
+fn expect_theme_applied(watcher: &Watcher, store: &ConfigStore, background_hex: &str, what: &str) {
+    let started = Instant::now();
+    loop {
+        let left = EVENTUALLY.saturating_sub(started.elapsed());
+        match watcher.recv_timeout(left) {
+            Ok(ConfigEvent::ThemesChanged) if background(store) == background_hex => return,
+            Ok(_) => {}
+            Err(error) => panic!(
+                "{what}: {background_hex} not applied within {EVENTUALLY:?} (now {}): {error}",
+                background(store)
+            ),
+        }
+    }
+}
+
+/// Waits for the `Changed` of switching `config.toml` to `theme`, then
+/// for the watcher to go quiet.
+fn switch_theme(store: &ConfigStore, watcher: &Watcher, theme: &str, what: &str) {
+    tessera_config::write_atomic(&store.paths().config_file(), &config_doc(theme)).unwrap();
+    let started = Instant::now();
+    loop {
+        let left = EVENTUALLY.saturating_sub(started.elapsed());
+        match watcher.recv_timeout(left) {
+            Ok(ConfigEvent::Changed(_)) => break,
+            Ok(_) => {}
+            Err(error) => panic!("{what}: no Changed for the switch: {error}"),
+        }
+    }
+    drain(watcher, QUIET);
+}
+
+// #253 item 8: a name-keyed theme (`keyed.toml`, name "Keyed Theme") whose
+// file could not be loaded when the watcher last settled is still seen when
+// an in-place write completes it, which raises no event on the directory.
+// Before the fix the native backend lost each of these for good.
+
+/// Created empty after the switch (an editor's "New File"), then filled.
+#[test]
+fn a_keyed_theme_created_empty_then_filled_is_applied() {
+    for backend in BACKENDS {
+        let (_dir, store, watcher) = setup(backend, "mine");
+        let keyed = store.paths().themes_dir().join("keyed.toml");
+        switch_theme(&store, &watcher, "Keyed Theme", "create-empty");
+        write(&keyed, "");
+        drain(&watcher, QUIET);
+        write(&keyed, &theme_doc("Keyed Theme", "#1d1d1d"));
+        expect_theme_applied(
+            &watcher,
+            &store,
+            "#1d1d1d",
+            &format!("{backend:?}: create-empty-then-fill"),
+        );
+    }
+}
+
+/// In use, deleted, recreated empty, then filled.
+#[test]
+fn a_keyed_theme_removed_then_recreated_is_applied() {
+    for backend in BACKENDS {
+        let (_dir, store, watcher) = setup(backend, "mine");
+        let keyed = store.paths().themes_dir().join("keyed.toml");
+        write(&keyed, &theme_doc("Keyed Theme", "#1c1c1c"));
+        drain(&watcher, QUIET);
+        switch_theme(&store, &watcher, "Keyed Theme", "rm-then-recreate");
+        assert_eq!(background(&store), "#1c1c1c", "{backend:?}");
+        std::fs::remove_file(&keyed).unwrap();
+        drain(&watcher, QUIET);
+        write(&keyed, "");
+        drain(&watcher, QUIET);
+        write(&keyed, &theme_doc("Keyed Theme", "#1e1e1e"));
+        expect_theme_applied(
+            &watcher,
+            &store,
+            "#1e1e1e",
+            &format!("{backend:?}: rm-then-recreate"),
+        );
+    }
+}
+
+/// Saved in chunks around a switch: truncated with the first chunk written
+/// while another theme is in use, the switch settles on the unloadable
+/// file, and the rest is appended in place.
+#[test]
+fn a_keyed_theme_saved_in_chunks_around_the_switch_is_applied() {
+    for backend in BACKENDS {
+        let (_dir, store, watcher) = setup(backend, "mine");
+        let keyed = store.paths().themes_dir().join("keyed.toml");
+        let doc = theme_doc("Keyed Theme", "#1f1f1f");
+        let (first, rest) = doc.split_at(doc.len() / 2);
+        write(&keyed, first);
+        drain(&watcher, QUIET);
+        switch_theme(&store, &watcher, "Keyed Theme", "chunked");
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&keyed)
+                .unwrap();
+            file.write_all(rest.as_bytes()).unwrap();
+        }
+        expect_theme_applied(
+            &watcher,
+            &store,
+            "#1f1f1f",
+            &format!("{backend:?}: chunked save"),
+        );
+    }
+}
+
+/// S5 for #253 item 8: however many theme files fail to load, the native
+/// backend follows at most `MAX_UNLOADABLE_FOLLOWED` of them (one file
+/// descriptor each), and still sees the newest being completed.
+#[test]
+fn a_flood_of_unloadable_theme_files_is_followed_up_to_the_cap() {
+    let (_dir, store, watcher) = setup(WatchBackend::Native, "mine");
+    let themes = store.paths().themes_dir();
+    // The lookup lists at most `MAX_THEME_DIR_ENTRIES` (256) entries, cut
+    // in `readdir` order (name-hash order on APFS) before it sorts them,
+    // so which of these 301 files it sees depends on their names. For
+    // these names `keyed.toml` is among them on every run; other names or
+    // more files could leave it out.
+    for i in 0..300 {
+        write(&themes.join(format!("zz-broken-{i:03}.toml")), "name = ");
+    }
+    drain(&watcher, QUIET);
+    let before = open_descriptors();
+    switch_theme(&store, &watcher, "Keyed Theme", "flood");
+    let keyed = themes.join("keyed.toml");
+    write(&keyed, "");
+    drain(&watcher, QUIET);
+    let after = open_descriptors();
+    // `mine.toml` is no longer followed, up to eight unloadable files are,
+    // and nothing else changed.
+    assert!(
+        after <= before + 8,
+        "{after} descriptors open, {before} before the switch"
+    );
+    write(&keyed, &theme_doc("Keyed Theme", "#1c1c1c"));
+    expect_theme_applied(&watcher, &store, "#1c1c1c", "the newest of a flood");
+}
+
+/// Descriptors open in this process.
+fn open_descriptors() -> usize {
+    std::fs::read_dir("/dev/fd").unwrap().count()
 }
 
 /// `WatchOptions::on_thread_start` runs on the watcher's thread (the core

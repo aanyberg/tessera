@@ -20,10 +20,15 @@
 //!   It also registers the `themes/` directory (a theme file created,
 //!   deleted or renamed, an editor's rename-save) and the theme file
 //!   `appearance.theme` currently resolves to (an in-place write to it),
-//!   re-registered whenever the resolved file changes. A theme file that
-//!   stops loading (a half-written save) stays registered while it exists,
-//!   so the save that fixes it is seen. An in-place write to any *other*
-//!   theme file is not seen: it cannot change the theme in use.
+//!   re-registered at every settle. A theme file that stops loading (a
+//!   half-written save) stays registered while it exists, so the save that
+//!   fixes it is seen. While the configured theme is not found as a
+//!   loadable user file, the theme files in `themes/` that do not load (an
+//!   empty file an editor just created, one being saved in chunks) are
+//!   registered too, newest first and at most eight
+//!   (`MAX_UNLOADABLE_FOLLOWED`), since one of them may turn out to be the
+//!   configured theme by its `name` key once it is complete (#253 item 8). An in-place write to any *other* theme
+//!   file is not seen: it cannot change the theme in use.
 //! - [`WatchBackend::Poll`] samples the metadata of the file, of `themes/`
 //!   and of the theme file in use every [`WatchOptions::poll_interval`],
 //!   and of every `*.toml` file in `themes/` every twentieth interval (about
@@ -38,8 +43,13 @@
 //! `themes/` as [`ConfigEvent::ThemesChanged`], after which the application
 //! resolves the theme again ([`ConfigStore::theme`]).
 //!
-//! Events are applied to the [`ConfigStore`] and then sent to every watcher
-//! of that store, so one change is reported once to each of them. If the
+//! Each re-read settles in one order: `config.toml` is loaded, the theme
+//! file it names is followed (registered, or recorded as the poll
+//! baseline), and only then is the change applied to the [`ConfigStore`]
+//! and sent to every watcher of that store, so one change is reported once
+//! to each of them, and a theme save made in reaction to the event is seen
+//! (#243, #253 items 1 to 3). The same holds for the catch-up the watcher
+//! does when it starts. If the
 //! watcher thread ever dies unexpectedly its channel is closed, so a
 //! consumer sees [`RecvTimeoutError::Disconnected`] rather than silence,
 //! and the failure is logged at error level.
@@ -47,7 +57,8 @@
 //! **Create one watcher per process.** Each one costs a thread plus, on
 //! the native backend, a kernel queue and about seven file descriptors (the
 //! queue, the stop pipe's two ends, the directory, the file, `themes/` and
-//! the theme file in use). The
+//! the theme file in use), plus at most eight
+//! (`MAX_UNLOADABLE_FOLLOWED`) while the configured theme's file does not load. The
 //! application should hold a single [`Watcher`] and fan its events out to
 //! every window rather than watching once per window.
 
@@ -58,7 +69,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::load::Warning;
-use crate::store::ConfigStore;
+use crate::store::{ConfigStore, FromDisk};
 use crate::theme::{MAX_THEME_DIR_ENTRIES, Theme, ThemeSource};
 use crate::{Config, Error};
 
@@ -307,7 +318,7 @@ impl Watcher {
     pub(crate) fn spawn(store: ConfigStore, options: WatchOptions) -> Result<Self, Error> {
         let options = options.clamped();
         let (subscription, events) = store.subscribe();
-        let (backend, stop) = match Backend::new(&store, options.backend) {
+        let (mut backend, stop) = match Backend::new(&store, options.backend) {
             Ok(backend) => backend,
             Err(error) => {
                 store.unsubscribe(subscription);
@@ -316,11 +327,13 @@ impl Watcher {
         };
         // The backend is armed, so from here on every edit produces an
         // event. Catch up on anything written between `ConfigStore::open`
-        // and now; an edit that is seen both here and by the backend loads
-        // twice but is reported once, since the second load finds no change.
-        // The first watcher of a store records the themes directory's state
-        // as its baseline here; a later one reports what changed since.
-        settle(&store);
+        // and now, following the theme file the catch-up leaves in use
+        // before it is published (#253 item 1); an edit that is seen both
+        // here and by the backend loads twice but is reported once, since
+        // the second load finds no change. The first watcher of a store
+        // records the themes directory's state as its baseline here; a
+        // later one reports what changed since.
+        backend.catch_up(&store);
         // `finished` starts true so a closure that is dropped unrun (the
         // spawn failed) unsubscribes without logging a spurious crash.
         let mut guard = ThreadGuard {
@@ -384,19 +397,37 @@ impl Drop for WatchGuard {
     }
 }
 
-/// Re-reads `config.toml` and the themes directory's state and reports what
-/// changed to every watcher of the store ([`reload_and_report`], then
-/// [`report_themes`]).
-fn settle(store: &ConfigStore) {
-    reload_and_report(store);
+/// Re-reads `config.toml`, has `follow` start watching the theme file the
+/// outcome leaves in use, then applies the outcome to the store, reports it
+/// to every watcher of the store and reports a change of `themes/`
+/// ([`report_themes`]).
+///
+/// `follow` gets the theme name the outcome leaves in use and runs before
+/// the outcome is applied or sent (#243, #253 items 1-3). A subscriber may
+/// react to the change at once by saving that theme file, and so may any
+/// thread that reads [`ConfigStore::config`] once it is applied; a save
+/// that leaves a file found by its `name` key unloadable hides it from the
+/// lookup, which would then miss the save that fixes it. Following first
+/// means such a save lands on a watched file, and the themes directory is
+/// sampled after that, so a write between the two is reported here.
+fn settle(store: &ConfigStore, follow: impl FnOnce(&str)) {
+    let outcome = store.load_from_disk();
+    let name = match &outcome {
+        Ok(from) => from.loaded.config.appearance.theme.clone(),
+        Err(_) => store.config().appearance.theme.clone(),
+    };
+    follow(&name);
+    if let Some(event) = apply(store, outcome) {
+        store.broadcast(&event);
+    }
     report_themes(store);
 }
 
 /// Samples the themes directory and sends [`ConfigEvent::ThemesChanged`]
 /// to every watcher of the store when it differs from the state the store
 /// last recorded. The store keeps that state, so several watchers of one
-/// store report one change once, as with [`reload_and_report`]; the first
-/// sample of a store records a baseline and reports nothing.
+/// store report one change once, as with [`settle`]; the first sample of
+/// a store records a baseline and reports nothing.
 fn report_themes(store: &ConfigStore) {
     let themes = ThemesFingerprint::of(&store.paths().themes_dir());
     if store.record_themes(themes) {
@@ -404,52 +435,97 @@ fn report_themes(store: &ConfigStore) {
     }
 }
 
-/// The theme file `appearance.theme` resolves to now, or `None` when it
+/// The theme file `name` resolves to in `themes`, or `None` when it
 /// resolves to a bundled theme or the default.
 ///
 /// A theme file that is there but does not load (an editor's half-written
 /// save, a typo) is still the one to follow, or the save that fixes it would
 /// go unseen: a file whose stem matches the name, else `previous` (the file
 /// followed so far, which may match by its `name` key) while it exists.
-fn active_theme_file(store: &ConfigStore, previous: Option<&Path>) -> Option<std::path::PathBuf> {
-    let name = store.config().appearance.theme.clone();
-    let themes = store.paths().themes_dir();
-    match Theme::resolve(&themes, &name).source {
+/// Files that may match by a `name` key no one can read yet are in
+/// [`theme_files_to_follow`].
+fn active_theme_file(
+    themes: &Path,
+    name: &str,
+    previous: Option<&Path>,
+) -> Option<std::path::PathBuf> {
+    match Theme::resolve(themes, name).source {
         ThemeSource::User(path) => Some(path),
-        ThemeSource::Bundled | ThemeSource::Default => crate::theme::files_named(&themes, &name)
-            .into_iter()
-            .next()
-            .or_else(|| {
-                previous
-                    .filter(|path| path.is_file())
-                    .map(Path::to_path_buf)
-            }),
+        ThemeSource::Bundled | ThemeSource::Default => fallback_theme_file(themes, name, previous),
     }
 }
 
-/// Re-reads the file, applies it and reports the outcome to every watcher of
-/// the store. Nothing is sent when the file is unchanged.
-fn reload_and_report(store: &ConfigStore) {
-    if let Some(event) = reload(store) {
-        store.broadcast(&event);
-    }
+/// [`active_theme_file`] for a name that does not resolve to a user file.
+fn fallback_theme_file(
+    themes: &Path,
+    name: &str,
+    previous: Option<&Path>,
+) -> Option<std::path::PathBuf> {
+    crate::theme::files_named(themes, name)
+        .into_iter()
+        .next()
+        .or_else(|| {
+            previous
+                .filter(|path| path.is_file())
+                .map(Path::to_path_buf)
+        })
 }
 
-/// Re-reads the file and applies it: the event that reports the outcome,
-/// for the caller to send to every watcher of the store, or `None` when the
-/// file is unchanged (or the same error was reported already).
-fn reload(store: &ConfigStore) -> Option<ConfigEvent> {
-    match store.load_from_disk() {
-        Ok(loaded) => {
-            let warnings = loaded.warnings.clone();
+/// What the native backend follows for the theme `name`: the file of
+/// [`active_theme_file`] and, while that is not a user file the lookup
+/// loaded, the theme files it could not load
+/// ([`crate::theme::unloadable_to_follow`], at most
+/// [`crate::theme::MAX_UNLOADABLE_FOLLOWED`]), without the first.
+///
+/// One of those may be the theme asked for, half-written: created empty
+/// and then filled, deleted and recreated, or saved in chunks while the
+/// switch settled. Its `name` key cannot be read yet, and the in-place
+/// write that completes it raises no event on the directory, so without a
+/// watch on the file itself it would be lost for good (#253 item 8). The
+/// event on it starts a settle, which looks the theme up again.
+#[cfg_attr(
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )),
+    allow(dead_code)
+)]
+fn theme_files_to_follow(
+    themes: &Path,
+    name: &str,
+    previous: Option<&Path>,
+) -> (Option<std::path::PathBuf>, Vec<std::path::PathBuf>) {
+    let (user, unloadable) = crate::theme::unloadable_to_follow(themes, name);
+    if user.is_some() {
+        return (user, Vec::new());
+    }
+    let file = fallback_theme_file(themes, name, previous);
+    let unloadable = unloadable
+        .into_iter()
+        .filter(|path| Some(path) != file.as_ref())
+        .collect();
+    (file, unloadable)
+}
+
+/// Applies a load's outcome: the event that reports it, for the caller to
+/// send to every watcher of the store, or `None` when the file is
+/// unchanged (or the same error was reported already).
+fn apply(store: &ConfigStore, outcome: Result<FromDisk, Error>) -> Option<ConfigEvent> {
+    match outcome {
+        Ok(from) => {
+            let warnings = from.loaded.warnings.clone();
             store
-                .apply(loaded)
+                .apply(from)
                 .map(|config| ConfigEvent::Changed(ConfigChanged { config, warnings }))
         }
         Err(error) => {
-            tracing::warn!(target: "tessera_config", %error, "config changed but failed to load");
             // Two watchers of one store both load the same broken file; only
-            // the first to record the error reports it, as with `apply`.
+            // the first to record the error reports (and logs) it, as with
+            // `apply`.
             store
                 .record_error(error.clone())
                 .then_some(ConfigEvent::Invalid(error))
@@ -486,8 +562,7 @@ impl Backend {
                     target_os = "dragonfly"
                 ))]
                 {
-                    let (native, stop) =
-                        native::Native::open(store.paths(), active_theme_file(store, None))?;
+                    let (native, stop) = native::Native::open(store.paths(), &store.config())?;
                     Ok((Self::Native(native), Stop::Pipe { _tx: stop }))
                 }
                 #[cfg(not(any(
@@ -515,11 +590,33 @@ impl Backend {
         // Fingerprint first, reload (in `spawn`) second: an edit in between
         // is applied by the reload and seen as a change on the first poll,
         // where the second load finds nothing new.
-        let baseline = PollSample::of(store, active_theme_file(store, None));
+        let themes = store.paths().themes_dir();
+        let name = store.config().appearance.theme.clone();
+        let baseline = PollSample::of(store, active_theme_file(&themes, &name, None));
         (
             Self::Poll { stop, baseline },
             Stop::Channel { _tx: stop_tx },
         )
+    }
+
+    /// The catch-up in [`Watcher::spawn`]: a [`settle`] that follows the
+    /// theme file it leaves in use, from the baseline the backend took when
+    /// it was armed.
+    fn catch_up(&mut self, store: &ConfigStore) {
+        match self {
+            Self::Poll { baseline, .. } => {
+                settle(store, |name| follow_polled_theme(store, baseline, name));
+            }
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd",
+                target_os = "dragonfly"
+            ))]
+            Self::Native(native) => native.settle(store),
+        }
     }
 
     fn run(self, store: &ConfigStore, options: &WatchOptions) {
@@ -691,20 +788,25 @@ fn run_polling(
         }
         quiet_since = None;
         dirty_since = None;
-        settle(store);
-        // The configuration (or a new file) may have changed the theme in
-        // use: follow its file from now on.
-        let previous = last_seen
-            .theme_file
-            .as_ref()
-            .map(|(file, _)| file.as_path());
-        let theme_file = active_theme_file(store, previous);
-        if theme_file.as_deref() != previous {
-            last_seen.theme_file = theme_file.map(|file| {
-                let fingerprint = Fingerprint::of(&file);
-                (file, fingerprint)
-            });
-        }
+        settle(store, |name| {
+            follow_polled_theme(store, &mut last_seen, name);
+        });
+    }
+}
+
+/// Points the polling backend's `sample` at the theme file `name` resolves
+/// to now, before the settle publishes it (see [`settle`]). A file that
+/// did not change keeps its fingerprint, so a write to it since the last
+/// tick is still seen; a new one is sampled now, after which every write
+/// to it shows on a tick.
+fn follow_polled_theme(store: &ConfigStore, sample: &mut PollSample, name: &str) {
+    let previous = sample.theme_file.as_ref().map(|(file, _)| file.as_path());
+    let theme_file = active_theme_file(&store.paths().themes_dir(), name, previous);
+    if theme_file.as_deref() != previous {
+        sample.theme_file = theme_file.map(|file| {
+            let fingerprint = Fingerprint::of(&file);
+            (file, fingerprint)
+        });
     }
 }
 
@@ -728,7 +830,7 @@ mod native {
 
     use kqueue::{Event, EventData, EventFilter, FilterFlag, Ident};
 
-    use super::{WatchOptions, active_theme_file, report_themes};
+    use super::{WatchOptions, theme_files_to_follow};
     use crate::paths::ConfigPaths;
 
     /// Longest pause after a `kqueue` error, so a stop request is never
@@ -776,6 +878,15 @@ mod native {
         /// configuration or of `themes/`.
         theme_file: Option<PathBuf>,
         theme_file_handle: Option<File>,
+        /// While `theme_file` is not a user file the lookup loaded: theme
+        /// files that do not load, one of which may be the theme asked for
+        /// half-written (see [`theme_files_to_follow`]), and the handles of
+        /// those registered. At most
+        /// [`crate::theme::MAX_UNLOADABLE_FOLLOWED`]. Best effort: one that
+        /// cannot be registered (unreadable, say) is skipped rather than
+        /// making the backend poll, since it may well be unrelated.
+        unloadable: Vec<PathBuf>,
+        unloadable_handles: Vec<File>,
         /// The error from the most recent [`Native::register_all`] that
         /// could not register every slot, or `None` when it registered
         /// them all. While `Some` the backend is not armed and polls, since
@@ -845,9 +956,14 @@ mod native {
         match std::fs::metadata(path) {
             Ok(meta) if kind.matches(meta.file_type()) => {}
             Ok(_) => {
+                // S8: the unloadable follow reaches here with arbitrary
+                // `themes/` entry names.
                 tracing::debug!(
                     target: "tessera_config",
-                    path = %path.display(),
+                    path = %crate::load::escaped(
+                        &path.display().to_string(),
+                        crate::load::MAX_WARNING_PATH_LEN
+                    ),
                     "not a regular {kind:?}; not watched"
                 );
                 return Ok(());
@@ -907,15 +1023,18 @@ mod native {
 
     impl Native {
         /// Registers the directory, the file (if present), the themes
-        /// directory, `theme_file` (the theme in use, if it is a user file)
-        /// and a stop pipe. Dropping the returned writer wakes the thread.
-        /// A path that cannot be registered yet (an unreadable
-        /// `config.toml`, say) is not a failure: the thread polls for it,
-        /// as [`ConfigStore::open`] tolerates the same conditions.
+        /// directory, the theme files `config` follows (see
+        /// [`theme_files_to_follow`]) and a stop pipe. Dropping the
+        /// returned writer wakes the thread. A path that cannot be
+        /// registered yet (an unreadable `config.toml`, say) is not a
+        /// failure: the thread polls for it, as [`ConfigStore::open`]
+        /// tolerates the same conditions.
         pub(super) fn open(
             paths: &ConfigPaths,
-            theme_file: Option<PathBuf>,
+            config: &crate::Config,
         ) -> std::io::Result<(Self, PipeWriter)> {
+            let (theme_file, unloadable) =
+                theme_files_to_follow(&paths.themes_dir(), &config.appearance.theme, None);
             let (wake, stop) = std::io::pipe()?;
             let mut queue = kqueue::Watcher::new()?;
             queue.add_fd(
@@ -938,6 +1057,8 @@ mod native {
                 themes_handle: None,
                 theme_file,
                 theme_file_handle: None,
+                unloadable,
+                unloadable_handles: Vec::new(),
                 register_error: None,
             };
             native.rearm();
@@ -1006,10 +1127,28 @@ mod native {
             failed.map_or(Ok(()), Err)
         }
 
-        /// Registers the theme file in use, or drops the registration of the
-        /// previous one when the theme is no longer a user file. Touches no
-        /// other slot, so pending directory events survive it.
+        /// Registers the theme file in use and the unloadable ones followed
+        /// with it, or drops the registrations of the previous ones. Touches
+        /// no other slot, so pending directory events survive it.
         fn register_theme_file(&mut self) -> std::io::Result<()> {
+            for old in self.unloadable_handles.drain(..) {
+                let _ = self.queue.remove_file(&old, EventFilter::EVFILT_VNODE);
+            }
+            for path in &self.unloadable {
+                let mut slot = None;
+                match register(&mut self.queue, &mut slot, path, Kind::File) {
+                    Ok(()) => self.unloadable_handles.extend(slot),
+                    Err(error) => tracing::debug!(
+                        target: "tessera_config",
+                        path = %crate::load::escaped(
+                            &path.display().to_string(),
+                            crate::load::MAX_WARNING_PATH_LEN
+                        ),
+                        %error,
+                        "unloadable theme file not watched"
+                    ),
+                }
+            }
             if let Some(path) = self.theme_file.clone() {
                 return register(
                     &mut self.queue,
@@ -1093,52 +1232,36 @@ mod native {
             }
         }
 
-        /// Reloads `config.toml`, follows the theme file `appearance.theme`
-        /// now resolves to and reports a change of `themes/`.
-        ///
-        /// The theme file is followed before the reload is reported: a
-        /// subscriber may react to the change at once by saving that file,
-        /// and a save that leaves it unloadable hides a file found by its
-        /// `name` key from the lookup, which would then keep following the
-        /// previous theme's file and miss the save that fixes it (#243).
+        /// [`super::settle`]: reloads `config.toml`, follows the theme files
+        /// the outcome's `appearance.theme` resolves to before the outcome
+        /// is applied and reported (#243, #253 items 1-3), and reports a
+        /// change of `themes/`.
         ///
         /// Runs with the directories armed and does not re-register them
-        /// (that would drop their pending events), only the theme file, and
-        /// that before the directory is sampled. So a theme file created
+        /// (that would drop their pending events), only the theme files,
+        /// and that before the directory is sampled. So a theme file created
         /// after the lookup leaves a directory event for the next round, a
         /// write after the registration raises an event on the armed file,
         /// and nothing lands unseen between the sample and the next wait.
-        fn settle(&mut self, store: &ConfigStore) {
-            let reloaded = super::reload(store);
-            self.theme_file = active_theme_file(store, self.theme_file.as_deref());
+        /// `Watcher::spawn` runs it once before the thread starts, to catch
+        /// up on what changed since `ConfigStore::open` (#253 item 1).
+        pub(super) fn settle(&mut self, store: &ConfigStore) {
+            super::settle(store, |name| self.follow(name));
+        }
+
+        /// Follows the theme files `name` resolves to now.
+        fn follow(&mut self, name: &str) {
+            let (file, unloadable) =
+                theme_files_to_follow(&self.themes, name, self.theme_file.as_deref());
+            self.theme_file = file;
+            self.unloadable = unloadable;
             let result = self.register_theme_file();
             if result.is_err() {
                 self.note_registration(result);
             }
-            if let Some(event) = reloaded {
-                store.broadcast(&event);
-            }
-            report_themes(store);
         }
 
         pub(super) fn run(mut self, store: &ConfigStore, options: &WatchOptions) {
-            // `Watcher::spawn` reloaded the file after `open`, so the theme
-            // in use may have changed. Only then is its file registered
-            // again: re-registering the same file would drop a write
-            // already pending on it. A file that did change is sampled
-            // after it is armed, so a write to it since `spawn` sampled
-            // the directory is reported here rather than lost. Anything
-            // else since then raises an event on the armed directories or
-            // file, debounced as usual.
-            let theme_file = active_theme_file(store, self.theme_file.as_deref());
-            if theme_file != self.theme_file {
-                self.theme_file = theme_file;
-                let result = self.register_theme_file();
-                if result.is_err() {
-                    self.note_registration(result);
-                }
-                report_themes(store);
-            }
             loop {
                 let Some(event) = self.next_event(store, options) else {
                     return;
@@ -1228,8 +1351,7 @@ mod native {
             std::fs::write(&keyed, theme_named("Keyed Theme")).unwrap();
             std::fs::write(paths.config_file(), "[appearance]\ntheme = \"mine\"\n").unwrap();
             let store = ConfigStore::open(paths.clone()).unwrap();
-            let (mut native, _stop) =
-                Native::open(&paths, active_theme_file(&store, None)).unwrap();
+            let (mut native, _stop) = Native::open(&paths, &store.config()).unwrap();
             assert_eq!(native.theme_file.as_deref(), Some(mine.as_path()));
 
             store.set_on_broadcast(Some(break_keyed_on_change));
@@ -1315,12 +1437,280 @@ mod native {
             std::fs::rename(&tmp, &target).unwrap();
             assert!(!still_names(&link, &handle).unwrap(), "target replaced");
         }
+
+        /// Records every event's fields, `name=value`, at every level.
+        struct Capture(std::sync::Mutex<String>);
+
+        struct Fields<'a>(&'a mut String);
+
+        impl tracing::field::Visit for Fields<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write as _;
+                let _ = write!(self.0, "{}={value:?} ", field.name());
+            }
+        }
+
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+            fn event(&self, event: &tracing::Event<'_>) {
+                event.record(&mut Fields(&mut self.0.lock().unwrap()));
+            }
+
+            fn enter(&self, _: &tracing::span::Id) {}
+
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        /// S8: a `themes/` entry that is not a regular file (a directory
+        /// named like a theme, which the unloadable follow hands to
+        /// `register`) is logged with its name escaped, so a raw ESC or a
+        /// bidi override in it never reaches the log.
+        #[test]
+        fn a_hostile_entry_name_is_escaped_in_the_not_watched_log() {
+            let dir = tempfile::tempdir().unwrap();
+            let entry = dir.path().join("x\u{1b}[31m\u{202e}evil.toml");
+            std::fs::create_dir(&entry).unwrap();
+            let mut queue = kqueue::Watcher::new().unwrap();
+            let mut slot = None;
+
+            let capture = std::sync::Arc::new(Capture(std::sync::Mutex::new(String::new())));
+            tracing::subscriber::with_default(std::sync::Arc::clone(&capture), || {
+                register(&mut queue, &mut slot, &entry, Kind::File).unwrap();
+            });
+            assert!(slot.is_none(), "a directory is not registered as a file");
+
+            let logged = capture.0.lock().unwrap().clone();
+            assert!(logged.contains("not watched"), "{logged:?}");
+            assert!(logged.contains("evil.toml"), "{logged:?}");
+            assert!(!logged.contains('\u{1b}'), "raw ESC logged: {logged:?}");
+            assert!(
+                !logged.contains('\u{202e}'),
+                "raw U+202E logged: {logged:?}"
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::ConfigPaths;
+
+    /// A theme document named `name` with background `background`.
+    fn theme_doc(name: &str, background: &str) -> String {
+        let mut theme = Theme::bundled("Nord").unwrap().clone();
+        theme.name = name.into();
+        let doc = theme.to_toml();
+        let line = doc
+            .lines()
+            .find(|line| line.starts_with("background"))
+            .unwrap()
+            .to_owned();
+        doc.replace(&line, &format!("background = \"{background}\""))
+    }
+
+    /// `themes/keyed.toml` half-written: it no longer loads, so its `name`
+    /// key cannot be read.
+    const HALF_WRITTEN: &str = "name = \"Keyed Theme\"\nforeground = ";
+
+    /// How a reactor saves `keyed.toml` so that the lookup no longer finds
+    /// it: half-written ([`HALF_WRITTEN`]), or whole under an interim
+    /// `name`. Only the first is a file the lookup cannot load, which the
+    /// native backend also follows for #253 item 8; the second shows the
+    /// order alone.
+    fn broken_keyed(half_written: bool) -> String {
+        if half_written {
+            HALF_WRITTEN.to_owned()
+        } else {
+            theme_doc("Interim", "#1c1c1c")
+        }
+    }
+
+    /// Saves `keyed.toml` as [`arm_break`] said, once: the first call after
+    /// it consumes its marker file, which lives in `profiles/` since no
+    /// watcher watches that (an event in the root would start a settle that
+    /// finds the fix anyway).
+    fn break_keyed_once(paths: &ConfigPaths) {
+        let marker = paths.profiles_dir().join("break-keyed-once");
+        if let Ok(half_written) = std::fs::read_to_string(&marker)
+            && std::fs::remove_file(&marker).is_ok()
+        {
+            std::fs::write(
+                paths.themes_dir().join("keyed.toml"),
+                broken_keyed(half_written == "half"),
+            )
+            .unwrap();
+        }
+    }
+
+    fn arm_break(paths: &ConfigPaths, half_written: bool) {
+        let mode = if half_written { "half" } else { "renamed" };
+        std::fs::write(paths.profiles_dir().join("break-keyed-once"), mode).unwrap();
+    }
+
+    /// Where the configuration's change is seen first: by a subscriber of
+    /// the watcher's `Changed`, or by a reader of [`ConfigStore::config`]
+    /// as soon as the store applies it (#253 item 3).
+    #[derive(Debug, Clone, Copy)]
+    enum Reactor {
+        Subscriber,
+        Reader,
+    }
+
+    /// A store using theme `mine` (themes `mine.toml` and `keyed.toml`,
+    /// the latter found only by its `name` key "Keyed Theme"), with
+    /// `reactor` saving `keyed.toml` half-written the first time it sees
+    /// a change once [`arm_break`] ran.
+    fn keyed_store(reactor: Reactor) -> (tempfile::TempDir, ConfigPaths, ConfigStore) {
+        let base = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(base.path());
+        std::fs::create_dir_all(paths.themes_dir()).unwrap();
+        std::fs::write(
+            paths.themes_dir().join("mine.toml"),
+            theme_doc("Mine", "#101010"),
+        )
+        .unwrap();
+        std::fs::write(
+            paths.themes_dir().join("keyed.toml"),
+            theme_doc("Keyed Theme", "#1c1c1c"),
+        )
+        .unwrap();
+        std::fs::write(paths.config_file(), "[appearance]\ntheme = \"mine\"\n").unwrap();
+        let store = ConfigStore::open(paths.clone()).unwrap();
+        match reactor {
+            Reactor::Subscriber => store.set_on_broadcast(Some(|paths, event| {
+                if matches!(event, ConfigEvent::Changed(_)) {
+                    break_keyed_once(paths);
+                }
+            })),
+            Reactor::Reader => store.set_on_apply(Some(break_keyed_once)),
+        }
+        (base, paths, store)
+    }
+
+    /// Generous for scheduling stalls on a loaded machine, and far below
+    /// the poll backend's full themes scan at the interval the tests use
+    /// (see [`options`]), so only a followed theme file passes.
+    const EVENTUALLY: Duration = Duration::from_secs(5);
+
+    /// A poll interval of 500 ms puts the full themes scan
+    /// ([`POLL_FULL_THEMES_EVERY`] ticks) at 10 s, beyond [`EVENTUALLY`].
+    fn options(backend: WatchBackend) -> WatchOptions {
+        WatchOptions {
+            backend,
+            poll_interval: Duration::from_millis(500),
+            ..WatchOptions::default()
+        }
+    }
+
+    /// Fixes `keyed.toml` in place and waits for a `ThemesChanged` after
+    /// which the store resolves the fixed theme: the fix was seen. The
+    /// caller has consumed the events of the settle the reactor ran in, so
+    /// a `ThemesChanged` from here on reports the fix (the store resolves
+    /// from disk, so it alone cannot tell).
+    fn assert_fix_is_seen(
+        paths: &ConfigPaths,
+        store: &ConfigStore,
+        watcher: &Watcher,
+        half_written: bool,
+        what: &str,
+    ) {
+        let keyed = paths.themes_dir().join("keyed.toml");
+        assert_eq!(
+            std::fs::read_to_string(&keyed).unwrap(),
+            broken_keyed(half_written),
+            "{what}: the reactor ran"
+        );
+        std::fs::write(&keyed, theme_doc("Keyed Theme", "#1d1d1d")).unwrap();
+        let fixed = Theme::load(&keyed).unwrap();
+        let started = Instant::now();
+        loop {
+            let left = EVENTUALLY.saturating_sub(started.elapsed());
+            match watcher.recv_timeout(left) {
+                Ok(ConfigEvent::ThemesChanged) if store.theme() == fixed => return,
+                Ok(_) => {}
+                Err(error) => panic!("{what}: the fix was not seen within {EVENTUALLY:?}: {error}"),
+            }
+        }
+    }
+
+    /// Every backend, reactor and kind of broken save.
+    fn cases() -> impl Iterator<Item = (WatchBackend, Reactor, bool)> {
+        [WatchBackend::Native, WatchBackend::Poll]
+            .into_iter()
+            .flat_map(|backend| {
+                [Reactor::Subscriber, Reactor::Reader]
+                    .into_iter()
+                    .flat_map(move |reactor| [false, true].map(|half| (backend, reactor, half)))
+            })
+    }
+
+    /// #253 items 1 and 3, at start-up: a configuration switched to the
+    /// keyed theme between `ConfigStore::open` and `watch` is caught up on
+    /// by `Watcher::spawn`, whose subscriber (or reader) breaks the theme
+    /// file at once; the in-place save that fixes it must still be seen,
+    /// on both backends. The critic-243 probe, made a test.
+    #[test]
+    fn a_theme_switch_caught_up_at_start_up_is_followed_before_it_is_published() {
+        for (backend, reactor, half_written) in cases() {
+            let what = format!("{backend:?}, {reactor:?}, half-written {half_written}");
+            let (_base, paths, store) = keyed_store(reactor);
+            crate::write_atomic(
+                &paths.config_file(),
+                "[appearance]\ntheme = \"Keyed Theme\"\n",
+            )
+            .unwrap();
+            arm_break(&paths, half_written);
+            let watcher = store.watch(options(backend)).unwrap();
+            assert_eq!(store.config().appearance.theme, "Keyed Theme", "{what}");
+            // The catch-up ran in `watch`; its events are queued.
+            while watcher.try_recv().is_ok() {}
+            assert_fix_is_seen(&paths, &store, &watcher, half_written, &what);
+        }
+    }
+
+    /// #253 items 2 and 3, while running: the same switch made after the
+    /// watcher started.
+    #[test]
+    fn a_theme_switch_while_running_is_followed_before_it_is_published() {
+        for (backend, reactor, half_written) in cases() {
+            let what = format!("{backend:?}, {reactor:?}, half-written {half_written}");
+            let (_base, paths, store) = keyed_store(reactor);
+            let watcher = store.watch(options(backend)).unwrap();
+            arm_break(&paths, half_written);
+            crate::write_atomic(
+                &paths.config_file(),
+                "[appearance]\ntheme = \"Keyed Theme\"\n",
+            )
+            .unwrap();
+            // The settle that applies the switch sends `Changed` and then,
+            // since the reactor changed `keyed.toml` before the themes
+            // directory was sampled, `ThemesChanged`.
+            let mut changed = false;
+            let started = Instant::now();
+            loop {
+                let left = EVENTUALLY.saturating_sub(started.elapsed());
+                match watcher.recv_timeout(left) {
+                    Ok(ConfigEvent::Changed(_)) => changed = true,
+                    Ok(ConfigEvent::ThemesChanged) if changed => break,
+                    Ok(_) => {}
+                    Err(error) => panic!("{what}: no Changed and ThemesChanged: {error}"),
+                }
+            }
+            assert_fix_is_seen(&paths, &store, &watcher, half_written, &what);
+        }
+    }
 
     #[test]
     fn options_are_clamped() {

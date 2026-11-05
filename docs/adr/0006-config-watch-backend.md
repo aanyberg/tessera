@@ -136,8 +136,8 @@ blocks on the watcher's channel (`Watcher::into_parts` hands it the
 receiver and keeps the thread's `WatchGuard` in the `App`), so it never
 wakes while idle. On `Changed` it applies the new configuration with the
 re-resolved theme (`App::apply_config`). On `ThemesChanged` it re-resolves
-and applies only a theme that differs. On `Invalid` it logs and keeps the
-last good configuration. Dropping the `App` drops the guard first. That
+and applies only a theme that differs. On `Invalid` it keeps the last good
+configuration (the store logged the error; amendment 2026-11-05). Dropping the `App` drops the guard first. That
 stops the watcher and disconnects the channel, and the apply thread is
 joined within `CONFIG_WATCH_STOP_CAP` (1 s; past it the thread is left to
 end on its own, logged, which only an observer callback that blocks can
@@ -163,3 +163,71 @@ generating a backtrace for one of them (TSan's slot locks against libc's
 locale lock), and fewer waking threads make that rarer. Starting a watch on a store whose
 configuration differs from the `App`'s applies it (`reconcile`). See ADR
 0004 for the startup load.
+
+## Amendment 2026-11-05: settle order, unloadable themes, fail-closed rules (#253, #262)
+
+**Settle order.** Every settle (a debounced change, and the catch-up a
+watcher does when it starts) runs in one order on both backends: load
+`config.toml`; follow the theme file the loaded configuration names (the
+native backend registers it, the polling backend records it as the
+baseline it samples); only then apply the result to the store and send it
+to the watchers. A consumer that saves the theme file in reaction to
+`Changed` (or a script that switches the theme and then writes its file)
+is therefore always seen, at start-up too. The amendment of 2026-10-29
+looked the theme file up after the store had published the change (#243,
+#253 items 1 to 3).
+
+This supersedes two sentences of that amendment. The native backend now
+re-registers the theme file in use, and every unloadable one it follows
+(below), at every settle, the catch-up included, not only when the lookup
+names a different file. Re-registering drops an event already pending on
+the file. That is safe because the settle samples the themes directory
+(`report_themes`: the metadata of every `*.toml` entry the lookup
+considers) after the registration: a write that landed before it, whose
+event was dropped, has changed that sample and is reported as
+`ThemesChanged` by the same settle, and a write after it raises an event
+on the new registration. The directories are still never re-armed for
+the theme file. A theme file that is neither in use nor unloadable is
+still not registered.
+
+**Unloadable theme files.** The native backend follows a theme file only
+when it can tell it is the one in use: by its stem, by its `name` key, or
+as the previous lookup's file. A file that does not load when a settle runs
+(created empty by an editor's New File, recreated after `rm`, saved in
+chunks around a switch) has no readable `name`, so nothing was registered
+and its completing in-place save was lost for good (#253 item 8). While
+the configured theme is not found as a user file, the backend now also
+registers the `*.toml` files in `themes/` that fail to load, newest
+modification first, at most `MAX_UNLOADABLE_FOLLOWED` (8; S5: a directory
+of thousands of broken files costs at most eight descriptors), so the save
+that completes the configured theme raises an event. These are kept to the
+same best-effort rule as the theme file: one that cannot be registered is
+logged at debug level and skipped. The polling backend needs none of this;
+its full scan every twentieth tick sees the save. A native watcher costs
+about seven descriptors, plus at most eight while the configured theme
+does not load.
+
+**Opacity on `ThemesChanged`.** The apply thread applies a re-resolved theme
+with the store's configuration, the one whose `appearance.theme` it
+resolved, not with the configuration it applied last. A `ThemesChanged`
+handled after the store reloaded a `config.toml` that names another theme
+and opacity (its `Changed` still queued) therefore applies the new theme
+at the new opacity, not at the old one first (#253 item 4); the `Changed`
+then changes nothing.
+
+**Fail-closed rules (D8, docs/security.md).** A `config.toml` that does
+not load before any load has succeeded keeps clipboard writes (OSC 52)
+off. Two cases are added: a `config.toml` symlink whose target is missing
+is a failed load, like a symlink loop, not a missing file (#262 item 1),
+so at launch it refuses writes and while running it keeps the last good
+configuration; and while writes are refused this way, an empty (or
+whitespace-only) file applies the defaults with writes still off, since a
+save that truncates first leaves the file empty for a moment (#262 item
+9). Only a non-empty file that loads turns them on. Under the settled
+rule that a missing file is a successful load, a broken file made or
+edited while running (after a successful load) keeps writes as they were
+until it is fixed or Tessera restarts (#262 N1). A failed load is logged
+once, by the store, when it differs from the previous failure (#262 item
+6); the text it quotes from the file is escaped (controls, U+2028 and
+U+2029, and the bidirectional formatting controls) before it is logged or
+reported, as are theme lookup warnings (#262 items 4, 5 and 10; S8).

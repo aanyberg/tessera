@@ -7,17 +7,22 @@
 //! are preserved; they never fail a load.
 //!
 //! Loading is resilient: a `config.toml` that cannot be read or does not
-//! parse never prevents the store from opening (defaults apply and
-//! [`ConfigStore::last_error`] reports why), and an invalid edit while
-//! running keeps the last good configuration until the file is repaired.
+//! parse never prevents the store from opening (defaults apply, with
+//! `terminal.clipboard_write` off until a non-empty version of the file
+//! loads, and [`ConfigStore::last_error`] reports why), and an invalid edit
+//! while running keeps the last good configuration until the file is
+//! repaired. A `config.toml` symlink whose target is missing counts as a
+//! file that does not load, not as a missing one. Each failure is logged
+//! once, with the text it quotes from the file escaped.
 //! Watching uses kernel file events where available and polling elsewhere;
 //! see ADR 0006.
 //!
 //! Typical use from the application layer: **one watcher per process**, with
 //! the application fanning each event out to its windows. Several watchers
 //! on the same store also work (every one receives every event), but each
-//! costs a thread, a kernel queue and about five file descriptors, so do
-//! not create one per window.
+//! costs a thread, a kernel queue and about seven file descriptors (up to
+//! eight more while the configured theme's file does not load), so do not
+//! create one per window.
 //!
 //! A `config.toml` that is a symlink (into a dotfiles checkout, say) is
 //! respected: defaults are never written over it, saves go through to its
@@ -73,8 +78,8 @@ pub use theme::{
 
 pub use load::{
     DEFAULT_CONFIG_TOML, Loaded, MAX_CONFIG_FILE_LEN, MAX_PARSE_ERROR_LEN,
-    MAX_UNKNOWN_KEY_WARNINGS, MAX_WARNING_PATH_LEN, ParseError, Warning, load_file, write_atomic,
-    write_default_if_missing,
+    MAX_UNKNOWN_KEY_WARNINGS, MAX_WARNING_PATH_LEN, ParseError, Warning, escaped, load_file,
+    write_atomic, write_default_if_missing,
 };
 pub use paths::{APP_SUPPORT_DIR_NAME, CONFIG_FILE_NAME, ConfigPaths, SHELL_INTEGRATION_DIR_NAME};
 pub use store::ConfigStore;
@@ -292,9 +297,12 @@ pub struct Terminal {
     /// reported with a warning and counts as `false`: writes are refused
     /// until it is fixed. When Tessera starts with a `config.toml` that does
     /// not load at all (a syntax error anywhere in it, such as
-    /// `clipboard_write = off` without quotes, a duplicate key, or a file
-    /// that is not UTF-8), writes are refused as well until the file is
-    /// fixed, while the other defaults apply. Applies to every session at
+    /// `clipboard_write = off` without quotes, a duplicate key, a file that
+    /// is not UTF-8, or a `config.toml` symlink whose target is missing),
+    /// writes are refused as well until the file is fixed, while the other
+    /// defaults apply; emptying the file does not turn them back on (a save
+    /// that truncates first leaves it empty for a moment), only a version
+    /// of it with something in it that loads. Applies to every session at
     /// once when changed.
     #[serde(deserialize_with = "load::lenient_clipboard_write")]
     pub clipboard_write: bool,

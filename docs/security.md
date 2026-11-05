@@ -84,6 +84,7 @@ a low-risk change.
 | OSC colour name | 22 bytes (the longest X11 name), rejected before the lookup; static table, no allocation | `crates/tessera-term/src/color_names.rs` (`MAX_NAME_LEN`) |
 | Config / theme / import file | 16 MiB / 64 KiB (256 files) / 1 MiB | `crates/tessera-config/src/` |
 | Imported plist | 4096 values, 256 KiB of text | `crates/tessera-config/src/import.rs` |
+| Unloadable theme files followed | 8 extra kqueue descriptors per watcher (`MAX_UNLOADABLE_FOLLOWED`), newest first, only while the configured theme is not found as a loadable user file | `crates/tessera-config/src/theme.rs`, `crates/tessera-config/src/watch.rs` |
 | URL candidate | 2083 characters | `crates/tessera-app-core/src/url.rs` |
 | OSC 8 link table | 65 536 live links (`MAX_LIVE_LINKS`), URI 2 083 bytes, id 250 bytes, 16 MiB of URI + id text (`MAX_LINK_TABLE_BYTES`); the id index loses an entry with its link's last cell; a URI with C0, DEL, C1 or bidi formatting controls is refused | `crates/tessera-grid/src/hyperlink.rs`, `crates/tessera-term/src/osc.rs` |
 

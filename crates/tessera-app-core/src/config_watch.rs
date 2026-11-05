@@ -11,7 +11,8 @@
 //! - [`ConfigEvent::ThemesChanged`]: resolves the theme again and applies
 //!   it only when it differs from the theme in use, so editing a theme file
 //!   that is not in use changes nothing on screen.
-//! - [`ConfigEvent::Invalid`]: logged; the last good configuration stays.
+//! - [`ConfigEvent::Invalid`]: the last good configuration stays (the
+//!   store logged the error, once).
 //!
 //! Applying runs on that thread. It changes the views' colours and font
 //! size under the views lock (no GPU work), resizes the sessions whose grid
@@ -53,6 +54,11 @@ pub const CONFIG_WATCH_STOP_CAP: Duration = Duration::from_secs(1);
 /// watched without a restart. Slow, since an idle application should not
 /// wake up often.
 pub const CONFIG_DIR_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How many times a [`ConfigEvent::ThemesChanged`] looks the theme up when
+/// the store's configuration keeps changing under the lookup (each lookup
+/// reads `themes/` once, at most 256 files).
+const THEME_LOOKUP_ATTEMPTS: u32 = 3;
 
 /// The configuration views draw with, the colours it resolved to and the
 /// renderer theme built from both, kept together so a change replaces all
@@ -239,7 +245,8 @@ impl Live {
                 self.apply_theme_if_changed(store);
             }
             ConfigEvent::Invalid(error) => {
-                tracing::warn!(
+                // The store logged it as a warning when it recorded it.
+                tracing::debug!(
                     target: "tessera_app_core",
                     %error,
                     "config.toml could not be loaded; keeping the last good configuration"
@@ -312,10 +319,18 @@ impl Live {
             && previous.is_file()
             && let Err(error) = tessera_config::Theme::load(&previous)
         {
+            // S8: the path is a `themes/` entry name, and an I/O error
+            // (too large, not a regular file) quotes it.
             tracing::warn!(
                 target: "tessera_app_core",
-                path = %previous.display(),
-                %error,
+                path = %tessera_config::escaped(
+                    &previous.display().to_string(),
+                    tessera_config::MAX_WARNING_PATH_LEN
+                ),
+                error = %tessera_config::escaped(
+                    &error.to_string(),
+                    tessera_config::MAX_PARSE_ERROR_LEN
+                ),
                 "the theme file in use does not load; keeping its colours"
             );
             return Lookup::KeepBroken;
@@ -326,13 +341,32 @@ impl Live {
     /// Looks the theme up again and applies it if it differs from the
     /// colours in use (lead decision D3). Returns `false` when the theme
     /// file in use does not load (the colours in use are kept).
+    ///
+    /// The theme is applied with the store's configuration, the one the
+    /// lookup resolved the name of, not the one in effect: when the store
+    /// reloaded `config.toml` before this event was handled (its `Changed`
+    /// still queued), the newly named theme is applied at the new opacity
+    /// at once, not at the old one first (#253 item 4). A configuration
+    /// that changes during the lookup is looked up again, at most
+    /// [`THEME_LOOKUP_ATTEMPTS`] times; past that the last lookup is
+    /// applied with the configuration read just before it, and the queued
+    /// `Changed` corrects it.
     fn apply_theme_if_changed(&self, store: &ConfigStore) -> bool {
-        let Lookup::Use(colours, source) = self.look_up(store, true) else {
+        let mut attempts = 0;
+        let (config, lookup) = loop {
+            attempts += 1;
+            let config = store.config();
+            let lookup = self.look_up(store, true);
+            if attempts == THEME_LOOKUP_ATTEMPTS || Arc::ptr_eq(&config, &store.config()) {
+                break (config, lookup);
+            }
+        };
+        let Lookup::Use(colours, source) = lookup else {
             return false;
         };
-        let (config, same) = {
+        let same = {
             let applied = lock(&self.applied);
-            (Arc::clone(&applied.config), applied.colours == colours)
+            applied.colours == colours && *applied.config == *config
         };
         if same {
             lock(&self.applied).source = source;
@@ -397,9 +431,9 @@ impl ConfigWatch {
                         continue;
                     }
                     let store = ConfigStore::in_memory(paths, Config::default());
-                    if let Err(error) = store.reload() {
-                        tracing::warn!(target: "tessera_app_core", %error, "config.toml could not be loaded");
-                    }
+                    // A file that does not load is logged by the store, once
+                    // (#262 item 6); the defaults stay, writes refused.
+                    let _ = store.reload();
                     let (events, guard) = match store.watch(with_hook(options)) {
                         Ok(watcher) => watcher.into_parts(),
                         Err(error) => {
@@ -517,8 +551,11 @@ impl App {
     /// `options`).
     ///
     /// Starting creates nothing on disk: `config.toml` is read if it is
-    /// there, and a missing or invalid file gives the defaults (logged; an
-    /// invalid one is picked up once repaired). A configuration directory
+    /// there. A missing file gives the defaults. A file that does not load
+    /// (invalid TOML or values, unreadable, a symlink loop or a dangling
+    /// symlink) gives the defaults with clipboard writes (OSC 52) refused,
+    /// logged once, until a version of it loads; an empty file does not
+    /// turn them back on (ADR 0006). A configuration directory
     /// that does not exist yet is looked for every
     /// [`CONFIG_DIR_POLL_INTERVAL`] (one `stat`) and watched, its
     /// configuration applied, once it appears: created by hand, by
@@ -529,14 +566,9 @@ impl App {
     pub fn with_config_dir(paths: ConfigPaths, options: WatchOptions) -> Self {
         let store = ConfigStore::in_memory(paths, Config::default());
         let paths = store.paths().clone();
-        if let Err(error) = store.reload() {
-            tracing::warn!(
-                target: "tessera_app_core",
-                %error,
-                path = %paths.config_file().display(),
-                "config.toml could not be loaded; using the defaults until it is fixed"
-            );
-        }
+        // A file that does not load is logged by the store, once (#262
+        // item 6).
+        let _ = store.reload();
         let app = Self::new((*store.config()).clone(), paths.clone());
         let parent_exists = paths.root().parent().is_none_or(Path::is_dir);
         let started = if paths.root().is_dir() {
@@ -1059,6 +1091,179 @@ mod tests {
         );
         assert!(paths.config_file().is_file());
         assert!(app.is_watching_config());
+    }
+
+    /// #253 item 4 (critic OC2), staged without a watcher: a
+    /// `ThemesChanged` handled after the store reloaded a `config.toml`
+    /// that names another theme and a translucent opacity (its `Changed`
+    /// still queued) applies the new theme at the new opacity, one
+    /// translucent report; the `Changed` that follows changes nothing.
+    #[test]
+    fn themes_changed_after_a_reload_applies_the_new_theme_at_the_new_opacity() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(root.path());
+        std::fs::create_dir_all(paths.themes_dir()).unwrap();
+        std::fs::write(
+            paths.themes_dir().join("mine.toml"),
+            theme_doc("Mine", "#101010"),
+        )
+        .unwrap();
+        std::fs::write(
+            paths.themes_dir().join("other.toml"),
+            theme_doc("Other", "#212121"),
+        )
+        .unwrap();
+        std::fs::write(paths.config_file(), "[appearance]\ntheme = \"mine\"\n").unwrap();
+        let store = ConfigStore::open(paths.clone()).unwrap();
+        let app = App::new((*store.config()).clone(), paths.clone());
+        let recorder = Recorder::default();
+        app.set_observer(Some(Box::new(recorder.clone())));
+        let live = app.live();
+        live.reconcile(&store);
+        assert_eq!(recorder.take(), Vec::<bool>::new(), "nothing to reconcile");
+
+        std::fs::write(
+            paths.config_file(),
+            "[appearance]\ntheme = \"other\"\nopacity = 0.5\n",
+        )
+        .unwrap();
+        store.reload().unwrap();
+        live.handle(&store, ConfigEvent::ThemesChanged);
+        assert_eq!(recorder.take(), [false], "one translucent report");
+        let theme = app.view_theme();
+        assert_eq!(theme.background.to_srgb8(), [0x21, 0x21, 0x21]);
+        assert_eq!(theme.background.a, 0.5, "the new opacity, exactly");
+        assert_eq!(app.config().appearance.opacity, 0.5);
+
+        live.apply_changed(&store, &store.config());
+        assert_eq!(recorder.take(), Vec::<bool>::new(), "the Changed after it");
+    }
+
+    /// Records the fields of every warning (and error) logged on the
+    /// thread it is the default subscriber of, `name=value`.
+    struct WarningText(Mutex<String>);
+
+    struct Fields<'a>(&'a mut String);
+
+    impl tracing::field::Visit for Fields<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, "{}={value:?} ", field.name());
+        }
+    }
+
+    impl tracing::Subscriber for WarningText {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            // More verbose levels compare greater.
+            if *event.metadata().level() <= tracing::Level::WARN {
+                event.record(&mut Fields(&mut lock(&self.0)));
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// S8: the warning that the theme file in use no longer loads escapes
+    /// its path and its error (an oversized file's error quotes the path),
+    /// so a file name carrying an OSC 52 request, an SGR sequence and a
+    /// bidi override cannot reach the log raw.
+    #[test]
+    fn a_hostile_theme_file_name_is_escaped_when_it_stops_loading() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(root.path());
+        std::fs::create_dir_all(paths.themes_dir()).unwrap();
+        let hostile = paths
+            .themes_dir()
+            .join("\u{1b}]52;c;aGk=\u{7} \u{1b}[31m\u{9b}\u{202e}\u{2028}evil.toml");
+        std::fs::write(&hostile, theme_doc("Keyed", "#101010")).unwrap();
+        std::fs::write(paths.config_file(), "[appearance]\ntheme = \"Keyed\"\n").unwrap();
+        let store = ConfigStore::open(paths.clone()).unwrap();
+        let app = App::new((*store.config()).clone(), paths.clone());
+        let live = app.live();
+        live.reconcile(&store);
+        assert_eq!(
+            app.view_theme().background,
+            Rgba::from_srgb8(0x10, 0x10, 0x10),
+            "the hostile file is the theme in use"
+        );
+
+        let oversized =
+            "#".repeat(usize::try_from(tessera_config::MAX_THEME_FILE_LEN).unwrap() + 1);
+        for (case, broken) in [
+            ("half-written", "name = \"Keyed\"\nforeground = "),
+            ("oversized", &oversized),
+        ] {
+            std::fs::write(&hostile, broken).unwrap();
+            let capture = Arc::new(WarningText(Mutex::new(String::new())));
+            tracing::subscriber::with_default(Arc::clone(&capture), || {
+                live.handle(&store, ConfigEvent::ThemesChanged);
+            });
+            let logged = lock(&capture.0).clone();
+            assert!(logged.contains("does not load"), "{case}: {logged:?}");
+            assert!(logged.contains("evil.toml"), "{case}: {logged:?}");
+            for c in logged.chars() {
+                let raw = c.is_control()
+                    || matches!(
+                        c,
+                        '\u{2028}' | '\u{2029}' | '\u{061c}' | '\u{200e}' | '\u{200f}'
+                    )
+                    || ('\u{202a}'..='\u{202e}').contains(&c)
+                    || ('\u{2066}'..='\u{2069}').contains(&c);
+                assert!(!raw, "{case}: raw {c:?} logged: {logged:?}");
+            }
+            assert_eq!(
+                app.view_theme().background,
+                Rgba::from_srgb8(0x10, 0x10, 0x10),
+                "{case}: its colours are kept"
+            );
+        }
+    }
+
+    /// Counts the warnings (and errors) logged on the thread it is the
+    /// default subscriber of.
+    struct WarningCount(std::sync::atomic::AtomicUsize);
+
+    impl tracing::Subscriber for WarningCount {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            // More verbose levels compare greater.
+            if *event.metadata().level() <= tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// #262 item 6 at the application's start: a `config.toml` that does
+    /// not load is one warning (the store's), not one from the store and
+    /// one from `App::with_config_dir`; and clipboard writes are refused.
+    #[test]
+    fn a_broken_file_at_start_is_one_warning() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(root.path());
+        std::fs::write(paths.config_file(), "[terminal\nclipboard_write = true\n").unwrap();
+        let count = Arc::new(WarningCount(std::sync::atomic::AtomicUsize::new(0)));
+        let app = tracing::subscriber::with_default(Arc::clone(&count), || {
+            App::with_config_dir(paths.clone(), WatchOptions::default())
+        });
+        assert_eq!(count.0.load(Ordering::SeqCst), 1, "one warning at start");
+        assert!(!app.config().terminal.clipboard_write, "writes refused");
     }
 
     fn theme_doc(name: &str, background: &str) -> String {
