@@ -19,12 +19,16 @@
 //!   letters and CJK or fullwidth punctuation, so `https://a.jp/を参照` stops
 //!   before `を`. In the host a CJK character ends it only right after an
 //!   ASCII label or port (letters, digits and `-` after a `.` or `:` of the
-//!   host): `https://example.comを参照` stops before `を`, while an IDN host
-//!   keeps its CJK (`https://例え.jp/`, `https://www.例え.テスト`). A path
-//!   written in raw CJK (`/wiki/日本`) is cut where the CJK starts; a
-//!   percent-encoded one is not;
+//!   host): `https://example.comを参照` stops before `を`, while a label
+//!   that starts with CJK keeps it (`https://例え.jp/`,
+//!   `https://www.例え.テスト`). A path written in raw CJK (`/wiki/日本`) is
+//!   cut where the CJK starts; a percent-encoded one is not. The zero-width
+//!   joiner and the bidirectional controls are no URL characters, so they
+//!   end it too (see [`is_hidden_url_end`] for the cells that hide them;
+//!   other zero-width scalars can stay in a link's text);
 //! - **U4** a trailing `.` `,` `;` `:` `!` `?` `'` `"` is stripped, again and
-//!   again;
+//!   again, and so is a trailing `-` of a URL that a CJK character ended
+//!   (`https://a.jp-日本` is `https://a.jp`);
 //! - **U5** a trailing `)` or `]` is stripped while the URL holds more of
 //!   that closer than of its opener (`Foo_(bar)` keeps its parenthesis,
 //!   `(url)` loses the outer one); U4 and U5 repeat until neither applies;
@@ -59,7 +63,7 @@ const SCHEMES: [(&str, Scheme); 5] = [
 ];
 
 /// The most characters from a scheme's first to its `:` (`mailto:`).
-const COLON_REACH: usize = 6;
+pub(crate) const COLON_REACH: usize = 6;
 
 /// The most distinct candidate ends one lookup can have ([`Window`]'s
 /// `trims`).
@@ -76,12 +80,34 @@ enum Scheme {
     Mailto,
 }
 
+/// Bit `b` is set when ASCII `b` is an RFC 3986 character
+/// (`A-Za-z0-9-._~:/?#[]@!$&'()*+,;=%`).
+const ASCII_URL_CHARS: u128 = {
+    let class = b"-._~:/?#[]@!$&'()*+,;=%";
+    let mut mask = 0u128;
+    let mut b = 0u8;
+    while b < 128 {
+        if b.is_ascii_alphanumeric() {
+            mask |= 1 << b;
+        }
+        b += 1;
+    }
+    let mut i = 0;
+    while i < class.len() {
+        mask |= 1 << class[i];
+        i += 1;
+    }
+    mask
+};
+
 /// Whether `c` can be part of a URL (U3): an RFC 3986 character or a
 /// non-ASCII alphanumeric.
 #[must_use]
 pub fn is_url_char(c: char) -> bool {
     if c.is_ascii() {
-        c.is_ascii_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=%".contains(c)
+        // One bit test, not a scan of the class string: the hover walk
+        // asks this of every cell it reads.
+        (ASCII_URL_CHARS >> u32::from(c)) & 1 != 0
     } else {
         c.is_alphanumeric()
     }
@@ -89,21 +115,23 @@ pub fn is_url_char(c: char) -> bool {
 
 /// Whether `c` ends a URL after its host (U3): a character of one of the
 /// blocks of Han ideographs (with their radicals, strokes and
-/// compatibility forms), Hiragana, Katakana (halfwidth included), Hangul
-/// (jamo, syllables, halfwidth), CJK symbols and punctuation
-/// (U+3000-U+303F, enclosed and compatibility U+3200-U+33FF) or the
-/// fullwidth and halfwidth forms (U+FF00-U+FFEF). Blocks, not Unicode
-/// scripts: no table dependency, and a block's punctuation and letters
-/// are treated alike.
+/// compatibility forms), Hiragana, Katakana (halfwidth included),
+/// Bopomofo (U+3100-U+312F, extended U+31A0-U+31BF), Hangul (jamo,
+/// syllables, halfwidth), CJK symbols and punctuation (U+3000-U+303F,
+/// enclosed and compatibility U+3200-U+33FF) or the fullwidth and
+/// halfwidth forms (U+FF00-U+FFEF). Blocks, not Unicode scripts: no table
+/// dependency, and a block's punctuation and letters are treated alike.
 #[must_use]
 pub fn is_cjk(c: char) -> bool {
+    // Most of what this is asked about is ASCII: one compare.
+    if u32::from(c) < 0x1100 {
+        return false;
+    }
     matches!(
         u32::from(c),
         0x1100..=0x11FF
             | 0x2E80..=0x2FDF
-            | 0x3000..=0x30FF
-            | 0x3130..=0x319F
-            | 0x31C0..=0x4DBF
+            | 0x3000..=0x4DBF
             | 0x4E00..=0x9FFF
             | 0xA960..=0xA97F
             | 0xAC00..=0xD7FF
@@ -111,6 +139,26 @@ pub fn is_cjk(c: char) -> bool {
             | 0xFF00..=0xFFEF
             | 0x1_B000..=0x1_B16F
             | 0x2_0000..=0x3_FFFF
+    )
+}
+
+/// Whether `c`, joined to the character before it in a grapheme cluster,
+/// ends a URL there (U3): the zero-width joiner (U+200D) and the
+/// bidirectional controls (U+061C, U+200E, U+200F, U+202A-U+202E,
+/// U+2066-U+2069). None is a URL character, but a terminal cell keeps a
+/// zero-width scalar in the cluster of the character before it, so a
+/// caller that passes one `char` per cell (the cluster's base) passes a
+/// cell holding one of these as a character that is not a URL character:
+/// `https://go` + ZWJ + `od.com` must not open a host its text hides.
+/// Other zero-width scalars that join a cluster (ZWNJ, variation
+/// selectors, CGJ, tag characters) are no hidden ends: they stay in a
+/// link's text, unseen, but make no host its text does not show (UTS 46
+/// ignores VS and CGJ, CONTEXTJ rejects ZWNJ after Latin, tags are invalid).
+#[must_use]
+pub fn is_hidden_url_end(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200D}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
     )
 }
 
@@ -229,6 +277,9 @@ struct Trim {
     /// trailing punctuation nor a closer, if that end still contains the
     /// point.
     stop: Option<usize>,
+    /// (`stop` and the closers count a trailing `-` as punctuation when
+    /// `end` is a CJK cut, U4.)
+    ///
     /// The ends `e` above `stop` where `text[e - 1]` is `)`, from the
     /// last down, each with the least `)`-minus-`(` count of `text[..e]`
     /// at it and every such end above it: a candidate whose count at its
@@ -333,12 +384,14 @@ impl<'a> Window<'a> {
                 });
         let (mut stop, mut parens, mut squares) = (None, Vec::new(), Vec::new());
         let mut least = (i32::MAX, i32::MAX);
+        // A candidate ends inside the window only at a CJK cut (U3).
+        let cut = end < self.text.len();
         for e in (self.at + 1..=end).rev() {
             steps(1);
             // `p` and `q` are the counts of `text[..e]`.
             let c = self.text[e - 1];
             match c {
-                c if is_trailing_punctuation(c) => {}
+                c if is_trailing_punctuation(c) || (cut && c == '-') => {}
                 ')' => {
                     least.0 = least.0.min(p);
                     parens.push((e, least.0));
@@ -543,6 +596,7 @@ mod tests {
             .find(|&i| is_cjk(text[i]) && after_label(i))
             .or_else(|| (host_end..text.len()).find(|&i| is_cjk(text[i])))
             .unwrap_or(text.len());
+        let at_cut = cut < text.len();
         let text = &text[..cut];
         if text.len() > MAX_URL_LEN {
             return None;
@@ -550,7 +604,7 @@ mod tests {
         let mut len = text.len();
         loop {
             match text[..len].last() {
-                Some(&c) if is_trailing_punctuation(c) => len -= 1,
+                Some(&c) if is_trailing_punctuation(c) || (at_cut && c == '-') => len -= 1,
                 Some(&closer @ (')' | ']')) => {
                     let opener = if closer == ')' { '(' } else { '[' };
                     let count = |c| text[..len].iter().filter(|&&x| x == c).count();
@@ -694,6 +748,51 @@ mod tests {
     }
 
     #[test]
+    fn the_label_cache_reads_a_long_label_once() {
+        // 297 `mailto:` starts sharing one host whose last label is 2 000
+        // letters long before a CJK character: every candidate asks about
+        // that CJK character, and without the cached label each would walk
+        // the 2 000 letters back again (about 150 steps per character).
+        let mut line = chars(&"mailto:".repeat(297));
+        line.push('.');
+        line.extend(std::iter::repeat_n('a', 2_000));
+        line.push('日');
+        let window = line.len() as u64;
+        for at in [0, 500, line.len() / 2, line.len() - 2] {
+            let steps = cost(&line, at);
+            assert!(
+                steps <= 20 * window,
+                "at {at}: {steps} steps for {window} chars"
+            );
+            assert_eq!(url_at(&line, at), reference(&line, at), "at {at}");
+        }
+    }
+
+    #[test]
+    fn the_ascii_url_class_is_the_rfc_3986_set() {
+        for b in 0u8..128 {
+            let c = char::from(b);
+            let want = c.is_ascii_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=%".contains(c);
+            assert_eq!(is_url_char(c), want, "{c:?}");
+        }
+    }
+
+    #[test]
+    fn hidden_url_ends_are_no_url_characters() {
+        for c in [
+            '\u{061C}', '\u{200D}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202E}', '\u{2066}',
+            '\u{2069}',
+        ] {
+            assert!(is_hidden_url_end(c), "{c:?}");
+            assert!(!is_url_char(c), "{c:?}");
+        }
+        // A combining mark stays in the cluster's URL (an IRI's `é`).
+        for c in ['\u{0301}', '\u{202F}', '\u{2065}', '\u{206A}', 'a', '-'] {
+            assert!(!is_hidden_url_end(c), "{c:?}");
+        }
+    }
+
+    #[test]
     fn nested_and_rejected_candidates() {
         // The outer URL wins over one quoted in its query.
         assert_eq!(
@@ -774,6 +873,36 @@ mod tests {
             ("https://a.kr/에서", 3, Some("https://a.kr/")),
             ("https://a.jp/ａｂｃ", 3, Some("https://a.jp/")),
             ("https://a.jp/x\u{20000}", 3, Some("https://a.jp/x")),
+            // Hangul Jamo, first and last, are CJK; the letter just below
+            // the block is not.
+            ("https://a.kr/x\u{1100}", 3, Some("https://a.kr/x")),
+            ("https://a.kr/x\u{11FF}", 3, Some("https://a.kr/x")),
+            ("https://a.kr/x\u{10FF}", 3, Some("https://a.kr/x\u{10FF}")),
+            // Bopomofo and its extension are CJK.
+            ("https://a.tw/ㄅㄆ", 3, Some("https://a.tw/")),
+            ("https://a.twㄅㄆ", 3, Some("https://a.tw")),
+            ("https://a.tw/x\u{31A0}", 3, Some("https://a.tw/x")),
+            // A `-` inside the label before the CJK is the label's; a
+            // trailing one is dropped at the cut, and only there.
+            ("https://x.co-jp日本", 3, Some("https://x.co-jp")),
+            ("https://a.jp-日本", 3, Some("https://a.jp")),
+            ("https://a.jp/x--日", 3, Some("https://a.jp/x")),
+            ("https://a.jp/x-.日", 3, Some("https://a.jp/x")),
+            ("https://a.jp/x-", 3, Some("https://a.jp/x-")),
+            ("https://a.jp/x- 日", 3, Some("https://a.jp/x-")),
+            // The ZWJ and bidi controls end it.
+            ("https://go\u{200D}od.com/", 3, Some("https://go")),
+            ("https://a.com/\u{202E}moc.live", 3, Some("https://a.com/")),
+            // The accepted costs of E1 (ADR 0025 U3): a CJK character right
+            // after an ASCII label cuts an IDN label that mixes the two, and
+            // a host with no `.` or `:` before its CJK (or a `.` right before
+            // it) keeps the prose.
+            ("https://www.a日本.jp", 3, Some("https://www.a")),
+            ("https://localhostで", 3, Some("https://localhostで")),
+            ("https://[::1]日本", 3, Some("https://[::1]日本")),
+            ("https://example.com.を", 3, Some("https://example.com.を")),
+            ("https://u:p日本@x.jp/", 3, Some("https://u:p")),
+            ("mailto:a.b日本@x.jp", 3, None),
             ("xhttps://a.bc/", 3, None),
             // A point on the cut CJK text is outside the URL.
             ("https://a.jp/を参照", 14, None),
@@ -815,7 +944,7 @@ mod tests {
                     Just("ftp://".to_owned()),
                     Just("file://".to_owned()),
                     Just("mailto:".to_owned()),
-                    "[a-c@./:()\\[\\]?#,'\" \u{4e16}\u{3002}\u{3092}\u{ff01}\u{e9}\u{43f}\u{d55c}\u{ff41}\u{20000}x+-]{0,6}",
+                    "[a-c@./:()\\[\\]?#,'\" \u{4e16}\u{3002}\u{3092}\u{ff01}\u{e9}\u{43f}\u{d55c}\u{ff41}\u{20000}\u{3105}\u{200d}x+-]{0,6}",
                 ],
                 0..12,
             ),
@@ -854,7 +983,7 @@ mod tests {
                     3 => Just("https://".to_owned()),
                     1 => Just("mailto:".to_owned()),
                     1 => Just("file://".to_owned()),
-                    8 => "[a()\\[\\]/.,:?#@]{1,40}",
+                    8 => "[a()\\[\\]/.,:?#@-]{1,40}",
                     1 => "[\u{65e5}\u{3092} ]{1,3}",
                 ],
                 80..140,

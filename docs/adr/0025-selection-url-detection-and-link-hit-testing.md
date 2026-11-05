@@ -104,7 +104,9 @@ empty terminal is selected whole, with empty text (F05). `App::select_clear` dro
   motion in the grid, so the core cannot know one was there. iTerm2 and
   Alacritty copy a real tab;
 - a selection of blanks only gives `Some("")` (D05, F05). The frontend
-  leaves the pasteboard alone then (D11, 30-app).
+  leaves the pasteboard alone then (D11, 30-app). On the alternate screen
+  a selection with no text gives `None` (#254): a full-screen program's
+  blank screen holds nothing to copy.
 
 **Copy-on-select is off** and has no option (#47): iTerm2's default is on.
 Copying stays an explicit Copy.
@@ -125,6 +127,15 @@ selection is dropped when:
   - the rest of the last selected row's logical line below the selection:
     whether blanks at the end of the selection are kept or dropped (D2)
     depends on text after them on the same logical line (G07j, G07k).
+    When that logical line is still open (its last row is the screen's
+    bottom row and soft-wrapped), the row that continues it does not exist
+    yet: the selection is cleared as soon as any row is added below the
+    bottom row (#254, the #191 adversarial repros, where a later scroll put
+    text after the selected blanks). The row added may stay blank, or the
+    selection may end in no blanks; its text did not change then, and it is
+    cleared anyway (G07k's over-clear). Clearing
+    too often is safe, keeping a stale copy is not (lead decision,
+    2026-11-05).
 
   Older history lines are not guarded: they change only by eviction,
   clearing and resizing, handled below. Cells, clusters and the soft-wrap
@@ -146,9 +157,13 @@ selection is dropped when:
   continuous output copy the text that is left (iTerm2 clips a selection
   that moves above the first line rather than dropping it). A selection with
   no line left is cleared (G07b). The core tells the two apart at each look
-  by the history's length: lines gone while it is now at its cap were
-  evicted, otherwise they were cleared (a clear followed by a refill to the
-  cap between two looks reads as an eviction);
+  by `Grid::history_clear_generation`, a count the grid bumps on every
+  history clear (ED 3, RIS, ⌘K's `clear_to_cursor`) and never on the
+  scroll path (#225): if it moved since the last look the history was
+  cleared, otherwise lines gone were evicted. ED 3 followed by output that
+  refills the history to its cap before the next look is a clear (until
+  #225 the history's length decided, and that read as an eviction). A
+  clear and an eviction between the same two looks count as a clear;
 - the grid's size changes (G08; `App::resize` to another size also clears
   it at once), or the screen switches to or from the alternate screen
   (G09);
@@ -211,7 +226,8 @@ logical line by rules U1 to U9 of the notes:
   J30); `U+3002` ends it (J29). **After the host** (the text from the
   scheme to the first `/`, `?` or `#`) a CJK character also ends it (D3):
   the blocks of Han (with radicals, strokes and compatibility ideographs),
-  Hiragana, Katakana and Hangul, CJK symbols and punctuation
+  Hiragana, Katakana, Bopomofo (U+3100-U+312F, extended U+31A0-U+31BF;
+  #254) and Hangul, CJK symbols and punctuation
   (U+3000-U+303F, U+3200-U+33FF) and the fullwidth and halfwidth forms
   (U+FF00-U+FFEF) (`url::is_cjk`; blocks, not script tables, so no
   dependency). CJK prose follows a URL without a space (J39, J40, J52).
@@ -223,10 +239,36 @@ logical line by rules U1 to U9 of the notes:
   domain mixes ASCII and CJK, so an IDN host keeps its letters: a CJK
   label starts right after its `.` (`例え.jp`, `www.例え.jp`, `例え.テスト`;
   J30, J43, J49, J50), and the `:` of `user:password@` is followed by
-  `password@`, not by the host (J51). The cost: a path written in raw CJK
-  (`/wiki/日本`) is cut where the CJK starts (J41); its percent-encoded
-  form, which browsers copy, is not (J42);
-- **U4** a trailing `. , ; : ! ? ' "` is stripped, repeatedly (J31);
+  `password@`, not by the host (J51). The costs, as measured (#254, and
+  tests in `url.rs`): a path written in raw CJK (`/wiki/日本`) is cut where
+  the CJK starts (J41), while its percent-encoded form, which browsers
+  copy, is not (J42); an IDN label that mixes ASCII and CJK is cut at its
+  CJK (`https://www.a日本.jp` links `https://www.a`), and so is a password
+  (`https://u:p日本@x.jp/` links `https://u:p`) and a mail address
+  (`mailto:a.b日本@x.jp` is no link: no `@` is left); a host with no
+  ASCII label before its CJK, or a `.` right before it, keeps the prose
+  (`https://localhostで`, `https://[::1]日本` and `https://example.com.を`
+  are linked whole). A zero-width joiner (U+200D) and the bidi controls
+  (U+061C, U+200E, U+200F, U+202A-U+202E, U+2066-U+2069;
+  `url::is_hidden_url_end`) end a URL anywhere (#254): neither is a URL
+  character, and in the cells the terminal drops a bidi control (it joins
+  no cluster), while a ZWJ joins the cluster of the character before it,
+  so that cell ends the link (`https://go`, U+200D, `od.com/` links `https://g`): a
+  joiner cannot splice two runs of text into one host. Other invisible
+  scalars that join a cluster (GCB=Extend: ZWNJ U+200C, the variation
+  selectors, CGJ U+034F, the tag characters U+E0020-U+E007F) stay in the
+  link's text, as the cluster does; none of them makes a host the text
+  does not show (UTS 46 maps the variation selectors and CGJ away,
+  CONTEXTJ rejects a ZWNJ after Latin, tags are invalid in a host), so S3
+  holds. ZWSP, WJ, BOM, SHY and the bidi controls are GCB=Control: the
+  terminal drops them when they are printed, and the link is the text the
+  cells show. The hover walk reads each cell's base scalar and checks for
+  a hidden end only where it can change the answer (see "Hover and
+  eviction" below);
+- **U4** a trailing `. , ; : ! ? ' "` is stripped, repeatedly (J31); so
+  is a trailing `-` of a URL that U3 cut at a CJK character (#254:
+  `https://a.jp-日本` links `https://a.jp`, while `https://a.jp/x-` keeps
+  its `-`);
 - **U5** a trailing `)` or `]` is stripped while the URL holds more of it
   than of its opener (Wikipedia's `Foo_(bar)` keeps its parenthesis, J05;
   `(url)` loses the outer one, J06). kitty instead ends at the first closer
@@ -268,7 +310,14 @@ at most two starts lie within a scheme's length of `at`. U5's "more
 closers than openers" for a candidate starting at `s` and ending at a
 closer `e` is the count at `e` minus the count at `s` being positive, so
 the end U4 and U5 trim a candidate to is a binary search in its end's
-walk: O(log n) per scheme start before `at`. The lookup allocates nothing
+walk: O(log n) per scheme start before `at`. A CJK cut in the host asks
+whether the ASCII label before it follows a `.` or `:`; the answer is
+cached for that CJK position, since every later candidate asks about the
+same one (#254: 297 `mailto:` starts sharing a host whose last label is
+2 000 letters long took 612 921 steps for a lookup in the middle of the
+4 081 characters without the cache, about 150 per character, and take
+30 630 with it, 7.5 per character; a test holds that line under 20 per
+character). The lookup allocates nothing
 but the closer lists of a candidate that ends in closers, at most the
 window. A first version recounted the brackets for every stripped closer
 of every candidate: 2083 characters of 220 `ftp://` and 763 `)` cost
@@ -280,7 +329,12 @@ code's own, so the same lines are also a `cargo xtask ab` case, whose
 instruction counts come from the processor (see the measurements).
 Property tests hold the lookup to a straight reading of the rules on lines
 of up to 80 and of 2 000 to 4 500 characters, and the App's windowed cell
-walk to one over the whole logical line.
+walk to one over the whole logical line. The cell walk does the same
+`:` pre-scan before it collects anything (#254): from the point it walks
+back over the run of URL characters only, and when that run holds no `:`
+it reads at most six characters on for one; without one there is no
+URL, so hovering a long line of plain text costs its run of URL
+characters, not a window of 4 168 cells.
 
 **Why no regex dependency.** The rules are a scheme match, a character
 class scan and two trimming loops; a regex would express U1 to U3 but not
@@ -423,6 +477,70 @@ pay for. `cargo xtask ab diff` over 40 000 seeds of random lines (up to
 (no non-ASCII alphanumeric right before a scheme, no CJK after a scheme:
 2 846 of the first 10 000 seeds, so about 11 400), and over 10 000 seeds
 with a copy of the in-tree reference on all.
+
+### Hover and eviction (#254)
+
+`cargo xtask ab` against `5e2511d` (its crates are those of the merge base
+`72deca5`), release, instructions retired net of process overhead, best
+of 15 interleaved process pairs, Apple M4, load average 4 to 15. `u_<shape>` is `url::url_at` at the
+shape's points; `h_<shape>` is `App::link_at` (the hover: cell window and
+`url_at`) on the same text fed into a 200-column test session. Shapes:
+`plain` (a 200-character line with one https URL, every position), `ftp`
+(220 `ftp://` and 763 `)`, four points), `mailto` (297 `mailto:`, a
+2 000-letter label and a CJK end, four points), `e1idn` and `e1dota` (the
+E1 CJK shapes, every position), `nocolon_run` (2 000 letters, no `:`,
+every tenth position) and `nocolon_prose` (the ascii corpus line cycled to
+2 000 characters, no `:`, every tenth position). The `x_` shapes are
+hovers over cells that hold clusters, fed into ten rows and looked up at
+every tenth column: `x_comb` (`https://a.b/` and 1 900 `e` + U+0301),
+`x_bigcl` (`https://a.b/` and 1 000 cells of `a` with 31 combining marks)
+and `x_comb_nocolon` (2 000 `e` + U+0301, no `:`). Head against base (bar
+1.05):
+
+| shape | `url_at` | cycles | hover | cycles |
+|---|---|---|---|---|
+| plain | 0.569 | 0.549 | 0.368 | 0.340 |
+| ftp | 0.479 | 0.438 | 0.732 | 0.702 |
+| mailto | 0.726 | 0.658 | 1.001 | 0.943 |
+| e1idn | 0.779 | 0.761 | 0.283 | 0.284 |
+| e1dota | 0.681 | 0.612 | 0.257 | 0.256 |
+| nocolon_run | 0.791 | 0.502 | 0.484 | 0.476 |
+| nocolon_prose | 0.578 | 0.492 | 0.010 | 0.011 |
+| x_comb | | | 0.925 | 0.967 |
+| x_bigcl | | | 0.908 | 1.011 |
+| x_comb_nocolon | | | 0.485 | 0.469 |
+
+`fs_<line>` feeds 1 500 lines of a corpus line (cycled to about 190
+columns) into a 60x200 session that holds a selection of its first 59
+rows, with a look (`has_selection`) after every line (bar 1.03): 1.000 on
+all eleven corpus lines (cycles 0.92 to 1.09 under load). The generation
+compare replaces a length compare, so the feed path is unchanged.
+
+Three codegen findings shaped the code. `is_url_char` tested ASCII
+characters by scanning the class string (`str::contains`); a `matches!`
+over the same set slowed the `rposition` scan of `url_at` (1.47x on
+`nocolon_run`), and a 128-bit mask (one shift and one test) made it 0.79.
+Merging `is_cjk`'s ranges (Bopomofo) changed its inlining; an early
+`< 0x1100` exit gives ASCII one compare. A first hover window walked the
+run of URL characters twice (1.62x on `h_ftp`) and looked each cell's line
+up again; it now collects on the way back and keeps the current row.
+With no `:` in the run of URL characters before the point, nor within
+`COLON_REACH` characters after it, the hover stops after that walk and
+builds no window for `url_at`, hence 0.010 on prose.
+
+Reading each cell's cluster to find a hidden URL end (U3) cost 1.26x to
+2.47x on the `x_` shapes, since a cell that holds a cluster has its text
+in the line's side table. The walk, the `:` pre-scan and the window
+therefore read base scalars, and only a URL that `url_at` finds on them
+is checked: the cells outside its span (every cell of the window when it
+finds none), since a hidden end there can change which start wins, the
+U1 letter before a scheme or the U4 `-` strip at a CJK cut, and the
+link's text, scanned once for the lead bytes of a hidden end. A hidden
+end in either sends the lookup to the exact path, which reads every cell
+of the window with its cluster and runs `url_at` again. A scan per
+cluster inside the span was still 1.14x on `x_bigcl`. A differential run
+of the base against the head (`url_at` on 220 000 lines, the hover on
+45 000 sessions) found no difference.
 
 ## Consequences
 
