@@ -15,7 +15,7 @@ use tessera_app_core::{
 };
 
 const FIXTURE: &str = include_str!("fixtures/selection_spec.txt");
-const CORE_ROWS: usize = 90;
+const CORE_ROWS: usize = 91;
 const URL_ROWS: usize = 51;
 /// The history cap of a row without `scrollback:`.
 const DEFAULT_SCROLLBACK: usize = 100;

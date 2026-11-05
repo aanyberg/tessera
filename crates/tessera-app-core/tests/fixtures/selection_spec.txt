@@ -851,6 +851,19 @@ text: none
 cite: lead decision D4 (#191, 2026-11-04): the text the selection would copy changed ("abc     " to "abc"), so it is cleared although no selected row changed
 note: As G07j, then `d` (row 1, not selected) is overwritten with a space: the blanks of row 0 become trailing. The rest of the last selected row's logical line is guarded.
 
+### G07l_select_all_with_no_history_then_continuous_output_clears
+layer: core
+size: 3x8
+scrollback: 0
+step: feed l1\r\nl2\r\nl3
+step: all
+step: feed \r\nm1\r\nm2\r\nm3\r\nm4
+sel: none
+has_selection: false
+text: none
+cite: lead decision (#225 Done-when, round 1 m4, 2026-11-05) with LD-1: with no history every line output pushes off the screen is evicted at once; when no selected line is left the selection is cleared
+note: Select All covers l1..l3, all on screen. `m1` pushes l1 off (gone, cap 0: the selection is l2..l3); `m2` and `m3` push l2 and l3 off: no selected line is left.
+
 ### G08_resize_clears
 layer: core
 size: 3x10

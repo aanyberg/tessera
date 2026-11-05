@@ -39,10 +39,16 @@
 //!   from the screen's top row), and the rest of the last selected row's
 //!   logical line (its text decides whether blanks at the selection's end
 //!   are kept). Cells, clusters and the soft-wrap flag are compared, so a
-//!   program repainting the same text keeps it;
-//! - the history loses a line of it other than by eviction at its cap
-//!   (ED 3, RIS), or evicts every line of it (when it evicts only the top,
-//!   the start moves to the oldest line left, at column 0);
+//!   program repainting the same text keeps it. When that logical line
+//!   still runs on past the screen's bottom row (its last row there is
+//!   soft-wrapped), a row scrolling in below it clears the selection too.
+//!   Any change to those rows clears, also where the copy would not have
+//!   changed (a selection ending on text does not depend on the rest of
+//!   its line): clearing too often is safe, keeping a stale copy is not;
+//! - the history is cleared (ED 3, RIS, [`Grid::clear_to_cursor`]) while it
+//!   held a line of it, or evicts every line of it at its cap (when it
+//!   evicts only the top, the start moves to the oldest line left, at
+//!   column 0). [`Grid::history_clear_generation`] tells the two apart;
 //! - the grid changes size, or the screen switches to or from the alternate
 //!   screen.
 //!
@@ -403,8 +409,15 @@ struct Guard {
     /// look: when either moved, every guarded row is compared.
     pushed: u64,
     len: usize,
+    /// [`Grid::history_clear_generation`] at the last look: when it moved,
+    /// lines left the history by clearing, not only by eviction.
+    clears: u64,
     /// The number of `lines[0]`.
     first: i64,
+    /// Whether the last guarded row was soft-wrapped on the screen's
+    /// bottom row: its logical line continues on a row that does not
+    /// exist yet, and a row scrolling in below it becomes part of it.
+    open: bool,
     /// The rows whose change can change the selection's text, as they were
     /// when it was made ([`Guard::retake`]): at most the screen and one
     /// history line.
@@ -429,7 +442,9 @@ impl Guard {
     /// text decides whether blanks at the end of the selection are kept
     /// (text follows on the line) or dropped. Older history lines change
     /// only by eviction, clearing and resizing, which the selection
-    /// handles on its own.
+    /// handles on its own. When that logical line runs past the screen's
+    /// bottom row, the guard is open: a row scrolling in below it fails it
+    /// ([`Guard::holds`]).
     fn retake(&mut self, lines: &Lines<'_>, start: i64, end: i64) {
         let grid = lines.grid;
         self.rows = lines.rows;
@@ -438,9 +453,11 @@ impl Guard {
         self.generation = grid.damage_generation();
         self.pushed = grid.scrollback_pushed();
         self.len = grid.scrollback_len();
+        self.clears = grid.history_clear_generation();
         self.first = start.max(lines.top - 1).max(lines.first);
         self.synced = None;
         let last = lines.logical_bottom(end.min(lines.last()));
+        self.open = last == lines.last() && lines.line(last).is_some_and(|line| line.wrapped);
         let count = usize::try_from(last - self.first + 1).unwrap_or(0);
         self.lines.truncate(count);
         for (i, n) in (self.first..=last).enumerate() {
@@ -467,10 +484,15 @@ impl Guard {
     /// the history moved or the whole screen changed, the guarded lines in
     /// the history are compared as well: a row rewritten and then scrolled
     /// off between two looks changed while it was live, and a whole-screen
-    /// erase ends the newest history line.
+    /// erase ends the newest history line. An open guard fails once a row
+    /// exists below its last row: that row continues the guarded line.
     fn holds(&mut self, lines: &Lines<'_>, frame: Option<(usize, &DamageRows)>) -> bool {
         let grid = lines.grid;
         if (lines.rows, lines.cols, grid.is_alt_screen()) != (self.rows, self.cols, self.alt) {
+            return false;
+        }
+        let guarded_last = self.first + i64::try_from(self.lines.len()).unwrap_or(i64::MAX) - 1;
+        if self.open && lines.last() > guarded_last {
             return false;
         }
         let (pushed, len) = (grid.scrollback_pushed(), grid.scrollback_len());
@@ -483,6 +505,7 @@ impl Guard {
         self.generation = grid.damage_generation();
         self.pushed = pushed;
         self.len = len;
+        self.clears = grid.history_clear_generation();
         let view = frame.map(|(offset, changed)| (lines.view_top(offset), changed));
         let synced = view.filter(|(top, _)| self.synced == Some(*top));
         let rows = i64::from(lines.rows);
@@ -553,22 +576,14 @@ struct Sel {
 impl Sel {
     /// Cuts off the lines the history evicted at its cap (LD-1): the start
     /// moves to the oldest line left, at column 0 (a block keeps its
-    /// columns). False when no selected line is left, or when lines were
-    /// removed some other way (ED 3, RIS) and a selected one was among them:
-    /// only eviction trims.
-    ///
-    /// Lines went from the history since the guard's last look when it holds
-    /// fewer than it had plus the lines pushed meanwhile. The history is at
-    /// its cap after an eviction; a clear leaves it shorter (a clear followed
-    /// by a refill to the cap between two looks reads as an eviction).
+    /// columns). False when no selected line is left, or when the history
+    /// was cleared since the guard's last look (ED 3, RIS,
+    /// [`Grid::clear_to_cursor`]: [`Grid::history_clear_generation`] moved)
+    /// and a selected line is gone: only eviction trims. A clear and an
+    /// eviction between the same two looks count as a clear.
     fn trim_evicted(&mut self, lines: &Lines<'_>) -> bool {
         let first = lines.first;
-        let grid = lines.grid;
-        let (len, before) = (grid.scrollback_len(), self.guard.len);
-        let pushed = grid.scrollback_pushed().saturating_sub(self.guard.pushed);
-        let removed = (u128::from(pushed) + before as u128).saturating_sub(len as u128);
-        let evicted = removed == 0 || len >= grid.max_scrollback();
-        if !evicted {
+        if lines.grid.history_clear_generation() != self.guard.clears {
             return self.start.min(self.anchor.0).line >= first;
         }
         if self.end.max(self.anchor.1).line < first {
@@ -780,12 +795,14 @@ impl SelectionState {
         self.sel.as_ref().is_some_and(|sel| sel.active)
     }
 
-    /// The selected text, or `None` without a selection; see
+    /// The selected text, or `None` without a selection and for a
+    /// selection on the alternate screen that holds no text; see
     /// [`crate::App::selection_text`] for the rules.
     pub(crate) fn text(&mut self, grid: &Grid) -> Option<String> {
         self.validate(grid, None);
         let sel = self.sel.as_ref().filter(|sel| sel.active)?;
-        Some(extract(&Lines::of(grid), sel))
+        let text = extract(&Lines::of(grid), sel);
+        (!text.is_empty() || !grid.is_alt_screen()).then_some(text)
     }
 
     /// Stores the hovered cell (view-relative), or none.
@@ -930,38 +947,171 @@ fn extract(lines: &Lines<'_>, sel: &Sel) -> String {
     out
 }
 
-/// The characters of the logical line around `at`, one per character
-/// cell (a cluster's base scalar), with the cell each starts at: at most
-/// `reach` characters to either side of `at`'s, and `at`'s index in
-/// them. `None` on padding and outside the grid.
+/// The character a cell (at column `col` of `line`) stands for in URL
+/// detection: its cluster's base scalar, or the first hidden URL end in its
+/// cluster ([`url::is_hidden_url_end`]: a ZWJ joined to the character
+/// before it), which is no URL character.
+fn url_char(line: &Line, col: u16, cell: &Cell) -> char {
+    if cell.is_cluster()
+        && let Some(hidden) = line.cluster(usize::from(col)).and_then(hidden_url_end)
+    {
+        return hidden;
+    }
+    cell.ch
+}
+
+/// The first hidden URL end ([`url::is_hidden_url_end`]) in `text`.
+/// Each starts with byte `0xD8` or `0xE2` in UTF-8, which a combining mark
+/// (`0xCC` to `0xCF` for U+0300-U+036F) and an ASCII character never hold,
+/// so most texts cost one byte scan.
+fn hidden_url_end(text: &str) -> Option<char> {
+    // No early exit, so the scan vectorises.
+    let leads = text
+        .bytes()
+        .fold(0u8, |n, b| n | u8::from(b == 0xD8) | u8::from(b == 0xE2));
+    if leads == 0 {
+        return None;
+    }
+    text.chars().find(|&c| url::is_hidden_url_end(c))
+}
+
+/// Whether a cell of `cells` hides a URL end ([`url_char`] differs from
+/// its base scalar).
+fn hides_url_end(lines: &Lines<'_>, cells: &[Pos]) -> bool {
+    let mut row: Option<(i64, &Line)> = None;
+    cells.iter().any(|&p| {
+        let line = match row {
+            Some((n, line)) if n == p.line => line,
+            _ => match lines.line(p.line) {
+                Some(line) => {
+                    row = Some((p.line, line));
+                    line
+                }
+                None => return false,
+            },
+        };
+        line.cells.get(usize::from(p.col)).is_some_and(|cell| {
+            cell.is_cluster()
+                && line
+                    .cluster(usize::from(p.col))
+                    .and_then(hidden_url_end)
+                    .is_some()
+        })
+    })
+}
+
+/// The character before `pos` on its logical line, as
+/// [`Lines::prev_char`] finds it, with its base scalar if that is a URL
+/// character (a cell that hides a URL end is found later, see
+/// [`link_with_reach`]). `row` is the line of `pos` and moves along with
+/// it, so the walk looks a line up once per row, not once per cell.
+fn prev_url_char<'a>(lines: &Lines<'a>, row: &mut &'a Line, pos: Pos) -> Option<(Pos, char)> {
+    let mut pos = pos;
+    loop {
+        if pos.col == 0 {
+            let above = lines.line(pos.line - 1)?;
+            if !above.wrapped {
+                return None;
+            }
+            *row = above;
+            pos = Pos {
+                line: pos.line - 1,
+                col: lines.cols,
+            };
+        }
+        pos.col -= 1;
+        let cell = row.cells.get(usize::from(pos.col))?;
+        if !cell.is_spacer() && !cell.is_pad() {
+            return url::is_url_char(cell.ch).then_some((pos, cell.ch));
+        }
+    }
+}
+
+/// The character after `pos`, as [`Lines::next_char`] finds it; otherwise
+/// as [`prev_url_char`].
+fn next_url_char<'a>(lines: &Lines<'a>, row: &mut &'a Line, pos: Pos) -> Option<(Pos, char)> {
+    let mut pos = Pos {
+        col: pos.col + 1,
+        ..pos
+    };
+    loop {
+        if pos.col >= lines.cols {
+            if !row.wrapped {
+                return None;
+            }
+            *row = lines.line(pos.line + 1)?;
+            pos = Pos {
+                line: pos.line + 1,
+                col: 0,
+            };
+        }
+        let cell = row.cells.get(usize::from(pos.col))?;
+        if !cell.is_spacer() && !cell.is_pad() {
+            return url::is_url_char(cell.ch).then_some((pos, cell.ch));
+        }
+        pos.col += 1;
+    }
+}
+
+/// The run of URL characters of the logical line around `at`, one base
+/// scalar per character cell, with the cell each starts at: at most
+/// `reach` characters to either side of `at`'s, and `at`'s index in them.
+/// `None` on padding, outside the grid, on a cell whose [`url_char`] is no
+/// URL character, and when no scheme's `:` can be near `at` (none from the
+/// run's start to [`url::COLON_REACH`] characters past `at`): then no URL
+/// contains `at`, and the walk back over the run is all the lookup reads.
+///
+/// Only `at`'s cell is checked for a hidden URL end here. Another cell
+/// that hides one is no URL character either, so the run of [`url_char`]s
+/// is this run cut at that cell: the `:` check over base scalars sees
+/// every `:` it would, and [`link_with_reach`] deals with the cut.
 fn window(lines: &Lines<'_>, at: Pos, reach: usize) -> Option<(Vec<char>, Vec<Pos>, usize)> {
     let at = lines.char_at(at)?;
-    let mut before = Vec::new();
-    let mut pos = at;
-    while before.len() < reach {
-        let Some(prev) = lines.prev_char(pos) else {
+    let line = lines.line(at.line)?;
+    let here = url_char(line, at.col, lines.cell(at)?);
+    if !url::is_url_char(here) {
+        return None;
+    }
+    // Back to the run's start, noting a `:`.
+    let (mut cells, mut chars) = (Vec::new(), Vec::new());
+    let (mut pos, mut row, mut colon) = (at, line, here == ':');
+    while cells.len() < reach {
+        let Some((prev, c)) = prev_url_char(lines, &mut row, pos) else {
             break;
         };
-        before.push(prev);
+        colon |= c == ':';
+        cells.push(prev);
+        chars.push(c);
         pos = prev;
     }
-    before.reverse();
-    let index = before.len();
-    let mut cells = before;
+    let back = cells.len();
+    if !colon {
+        let (mut pos, mut row) = (at, line);
+        let found = (0..url::COLON_REACH).any(|_| match next_url_char(lines, &mut row, pos) {
+            Some((next, c)) => {
+                pos = next;
+                c == ':'
+            }
+            None => false,
+        });
+        if !found {
+            return None;
+        }
+    }
+    cells.reverse();
+    chars.reverse();
     cells.push(at);
-    let mut pos = at;
+    chars.push(here);
+    let (mut pos, mut row) = (at, line);
     for _ in 0..reach {
-        let Some(next) = lines.next_char(pos) else {
+        let Some((next, c)) = next_url_char(lines, &mut row, pos) else {
             break;
         };
         cells.push(next);
+        chars.push(c);
         pos = next;
     }
-    let chars = cells
-        .iter()
-        .map(|&p| lines.cell(p).map_or(' ', |c| c.ch))
-        .collect();
-    Some((chars, cells, index))
+    Some((chars, cells, back))
 }
 
 /// The link under view-relative `at` at scroll `offset` (see
@@ -1012,15 +1162,51 @@ fn osc8_link(grid: &Grid, offset: usize, at: Point) -> Option<Link> {
 /// [`link_at`], looking `reach` characters to either side: the cap
 /// (U9) makes [`MAX_URL_LEN`] + 1 enough to give what the whole logical
 /// line would.
+///
+/// The window holds base scalars, and a cell that hides a URL end
+/// ([`url_char`]) ends the run of URL characters there, which can change
+/// the answer. The lookup checks the cells outside the span it found here
+/// (all of them when it found none), and [`link_of`] those inside as it
+/// reads their clusters anyway: a cluster cell costs one more lookup only
+/// outside the link. When a cell hides an end, the lookup runs again on
+/// every cell's [`url_char`], which gives the answer the whole logical
+/// line of [`url_char`]s would.
 fn link_with_reach(grid: &Grid, offset: usize, at: Point, reach: usize) -> Option<Link> {
     let lines = Lines::of(grid);
     let pos = lines.exact(offset, at)?;
-    let (chars, cells, index) = window(&lines, pos, reach)?;
+    let (mut chars, cells, index) = window(&lines, pos, reach)?;
+    match url::url_at(&chars, index) {
+        Some(span)
+            if !hides_url_end(&lines, &cells[..span.start])
+                && !hides_url_end(&lines, &cells[span.end..]) =>
+        {
+            let (link, hidden) = link_of(&lines, offset, &cells[span])?;
+            if !hidden {
+                return Some(link);
+            }
+        }
+        None if !hides_url_end(&lines, &cells) => return None,
+        _ => {}
+    }
+    for (c, &p) in chars.iter_mut().zip(&cells) {
+        if let Some(line) = lines.line(p.line)
+            && let Some(cell) = line.cells.get(usize::from(p.col))
+        {
+            *c = url_char(line, p.col, cell);
+        }
+    }
     let span = url::url_at(&chars, index)?;
+    link_of(&lines, offset, &cells[span]).map(|(link, _)| link)
+}
+
+/// The link whose characters start at `cells`: their text (clusters
+/// whole) and their cells in the view at scroll `offset`, row by row, and
+/// whether one of the clusters hides a URL end ([`url_char`]).
+fn link_of(lines: &Lines<'_>, offset: usize, cells: &[Pos]) -> Option<(Link, bool)> {
     let mut text = String::new();
     let top = lines.view_top(offset);
     let mut rows: Vec<(u16, Range<u16>)> = Vec::new();
-    for &p in &cells[span] {
+    for &p in cells {
         let line = lines.line(p.line)?;
         match line.cluster(usize::from(p.col)) {
             Some(cluster) if lines.cell(p).is_some_and(Cell::is_cluster) => text.push_str(cluster),
@@ -1039,10 +1225,15 @@ fn link_with_reach(grid: &Grid, offset: usize, at: Point, reach: usize) -> Optio
             _ => rows.push((row, p.col..end)),
         }
     }
-    Some(Link {
-        url: text,
-        span: rows,
-    })
+    // A hidden end is in a cluster: no base scalar of a URL cell is one.
+    let hidden = hidden_url_end(&text).is_some();
+    Some((
+        Link {
+            url: text,
+            span: rows,
+        },
+        hidden,
+    ))
 }
 
 #[cfg(test)]
@@ -1220,17 +1411,48 @@ mod tests {
         assert_eq!(state.text(term.grid()).as_deref(), Some("ab"));
     }
 
-    /// The reference link lookup: the whole logical line, no reach limit.
+    /// The reference link lookup: every character of the whole logical
+    /// line, from its first row, no reach limit and no pre-scan.
     fn reference_link(grid: &Grid, at: Point) -> Option<Link> {
-        link_with_reach(grid, 0, at, usize::MAX)
+        let lines = Lines::of(grid);
+        let at = lines.char_at(lines.exact(0, at)?)?;
+        let first = Pos {
+            line: lines.logical_top(at.line),
+            col: 0,
+        };
+        let mut cells = Vec::new();
+        let mut next = lines
+            .cell(first)
+            .filter(|c| !c.is_spacer() && !c.is_pad())
+            .map(|_| first)
+            .or_else(|| lines.next_char(first));
+        while let Some(pos) = next {
+            cells.push(pos);
+            next = lines.next_char(pos);
+        }
+        let index = cells.iter().position(|&p| p == at)?;
+        let chars: Vec<char> = cells
+            .iter()
+            .map(|&p| {
+                let line = lines.line(p.line).expect("a line");
+                url_char(line, p.col, lines.cell(p).expect("a cell"))
+            })
+            .collect();
+        let span = url::url_at(&chars, index)?;
+        let (link, hidden) = link_of(&lines, 0, &cells[span])?;
+        assert!(!hidden, "a link holds a hidden URL end: {:?}", link.url);
+        Some(link)
     }
 
     #[test]
     fn a_hover_lookup_reads_a_bounded_window_of_a_huge_line() {
-        // One logical line of 2 000 rows of URL characters (no newline):
-        // the lookup walks at most the cap to either side.
+        // One logical line of 2 000 rows of URL characters (no newline)
+        // with a `:` at the point: the lookup walks at most the cap to
+        // either side.
+        let mut bytes = vec![b'a'; 2_000 * 200 - 1];
+        bytes[1_000 * 200 + 100] = b':';
         let mut term = Terminal::new(2_000, 200);
-        term.advance(&vec![b'a'; 2_000 * 200 - 1]);
+        term.advance(&bytes);
         let lines = Lines::of(term.grid());
         let at = Pos {
             line: lines.top + 1_000,
@@ -1240,6 +1462,273 @@ mod tests {
         assert_eq!(chars.len(), 2 * (MAX_URL_LEN + 1) + 1);
         assert_eq!(index, MAX_URL_LEN + 1);
         assert_eq!(link_at(term.grid(), 0, point(1_000, 100)), None);
+    }
+
+    #[test]
+    fn a_hover_with_no_colon_near_builds_no_window() {
+        // No `:` in the run before the point or within a scheme's reach
+        // after it: no window. A `:` past a space, or seven characters on,
+        // is out of reach; six on is in it.
+        for (text, at, some) in [
+            ("aaaa aaaaaaaaaa", 7, false),
+            ("aaaaaaa a:", 3, false),
+            ("aaaaaaaaaaa:aaa", 4, false),
+            ("aaaaaaaaaa:aaaa", 4, true),
+            ("aa:aaaaaaaaaaaa", 9, true),
+        ] {
+            let term = term(2, 20, text.as_bytes());
+            let lines = Lines::of(term.grid());
+            let at = Pos {
+                line: lines.top,
+                col: at,
+            };
+            assert_eq!(
+                window(&lines, at, MAX_URL_LEN + 1).is_some(),
+                some,
+                "{text} at {}",
+                at.col
+            );
+        }
+        // The run stops at characters that are no URL characters.
+        let term = term(2, 30, b"x https://a.bc/d y");
+        let lines = Lines::of(term.grid());
+        let (chars, cells, index) = window(
+            &lines,
+            Pos {
+                line: lines.top,
+                col: 9,
+            },
+            MAX_URL_LEN + 1,
+        )
+        .expect("a window");
+        assert_eq!(chars.iter().collect::<String>(), "https://a.bc/d");
+        assert_eq!((cells[0].col, index), (2, 7));
+    }
+
+    #[test]
+    fn a_zwj_or_bidi_control_in_a_cell_ends_the_url() {
+        // The ZWJ joins the `o` before it: that cell ends the URL, so no
+        // joiner splices a host the text hides into the link. Bidi
+        // controls break no cluster and join none: the terminal drops them,
+        // so the link is the text the cells show.
+        for (bytes, want) in [
+            ("see https://go\u{200d}od.com/ ok", "https://g"),
+            (
+                "see https://a.com/x\u{202e}moc.live ok",
+                "https://a.com/xmoc.live",
+            ),
+            ("see https://a.com/\u{2067}x ok", "https://a.com/x"),
+            // A combining mark stays (an IRI's `é`).
+            (
+                "see https://caf\u{0065}\u{0301}.fr/ ok",
+                "https://cafe\u{301}.fr/",
+            ),
+        ] {
+            let term = term(2, 40, bytes.as_bytes());
+            let link = link_at(term.grid(), 0, point(0, 6)).expect("a link");
+            assert_eq!(link.url, want, "{bytes:?}");
+            assert_eq!(Some(link), reference_link(term.grid(), point(0, 6)));
+        }
+        // The hover walk reads base scalars: a hidden end in the cell under
+        // the pointer, in the link it finds, before it or right after it
+        // changes the answer as the cell's [`url_char`] would.
+        for (bytes, col, want) in [
+            // The cell holding `o` + ZWJ, and the one after it.
+            ("see https://go\u{200d}od.com/ ok", 13, None),
+            ("see https://go\u{200d}od.com/ ok", 14, None),
+            ("see https://go\u{200d}od.com/ ok", 15, None),
+            // The letter before the scheme hides an end: no letter to U1.
+            ("see a\u{200d}https://b.com ok", 8, Some("https://b.com")),
+            ("see ab\u{200d}https://b.com ok", 8, Some("https://b.com")),
+            // With the letter, the first scheme is no start and the second
+            // one's URL is the link; without it the first one's is.
+            (
+                "see a\u{200d}https://x.com/https://y.com ok",
+                28,
+                Some("https://x.com/https://y.com"),
+            ),
+            (
+                "see ahttps://x.com/https://y.com ok",
+                28,
+                Some("https://y.com"),
+            ),
+            // The CJK cut cell hides one: the `-` before it is no longer at
+            // a CJK cut (U4), the run just ends there.
+            (
+                "see https://a.jp-\u{65e5}\u{200d} ok",
+                6,
+                Some("https://a.jp-"),
+            ),
+            ("see https://a.jp-\u{65e5} ok", 6, Some("https://a.jp")),
+        ] {
+            let term = term(2, 40, bytes.as_bytes());
+            let link = link_at(term.grid(), 0, point(0, col));
+            assert_eq!(
+                link.as_ref().map(|l| l.url.as_str()),
+                want,
+                "{bytes:?} at {col}"
+            );
+            assert_eq!(
+                link,
+                reference_link(term.grid(), point(0, col)),
+                "{bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_alternate_screen_selection_with_no_text_is_none() {
+        let mut term = term(3, 10, b"\x1b[?1049h");
+        let mut state = SelectionState::default();
+        state.select_all(term.grid());
+        assert!(state.has_selection(term.grid()));
+        assert_eq!(state.text(term.grid()), None);
+        // With text it copies it; on the primary screen blanks copy as "".
+        term.advance(b"ab");
+        state.select_all(term.grid());
+        assert_eq!(state.text(term.grid()).as_deref(), Some("ab"));
+        let term = self::term(3, 10, b"");
+        state.select_all(term.grid());
+        assert_eq!(state.text(term.grid()).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn ed3_then_a_refill_to_the_cap_in_one_look_is_a_clear() {
+        // History l1..l3 at its cap of 3, screen s1, s2; a block selection
+        // from the newest history line to the screen. ED 3 removes l3, and
+        // three more lines refill the history to its cap before the next
+        // look: the history at its cap must not read as an eviction (which
+        // would trim the start to s1 and keep the selection).
+        for block in [false, true] {
+            let mut term = term(2, 5, b"l1\r\nl2\r\nl3\r\ns1\r\ns2");
+            term.set_max_scrollback(3);
+            let mut state = SelectionState::default();
+            state.begin(term.grid(), 1, point(0, 0), Granularity::Char, block);
+            state.extend(term.grid(), 0, point(1, 1));
+            assert_eq!(state.text(term.grid()).as_deref(), Some("l3\ns1\ns2"));
+            term.advance(b"\x1b[3J\r\nx\r\ny\r\nz");
+            assert_eq!(term.grid().scrollback_len(), term.grid().max_scrollback());
+            assert!(!state.has_selection(term.grid()), "block {block}");
+        }
+        // Eviction alone, to the same history, still trims.
+        let mut term = term(2, 5, b"l1\r\nl2\r\nl3\r\ns1\r\ns2");
+        term.set_max_scrollback(3);
+        let mut state = SelectionState::default();
+        state.begin(term.grid(), 1, point(0, 0), Granularity::Char, true);
+        state.extend(term.grid(), 0, point(1, 1));
+        term.advance(b"\r\nx\r\ny\r\nz");
+        assert_eq!(state.text(term.grid()).as_deref(), Some("s1\ns2"));
+    }
+
+    #[test]
+    fn select_all_with_no_history_then_continuous_output_clears() {
+        // `scrollback: 0`: every line output pushes off the screen is
+        // gone. Select All, then output that scrolls every selected line
+        // off: no line of it is left.
+        let mut term = term(3, 8, b"");
+        term.set_max_scrollback(0);
+        term.advance(b"l1\r\nl2\r\nl3");
+        let mut state = SelectionState::default();
+        state.select_all(term.grid());
+        assert_eq!(state.text(term.grid()).as_deref(), Some("l1\nl2\nl3"));
+        term.advance(b"\r\nm1");
+        assert_eq!(state.text(term.grid()).as_deref(), Some("l2\nl3"));
+        term.advance(b"\r\nm2\r\nm3\r\nm4");
+        assert!(!state.has_selection(term.grid()));
+        assert_eq!(state.text(term.grid()), None);
+    }
+
+    /// Feeds `steps` one by one, and after each requires Copy to give
+    /// nothing or `first` (the adversarial-tester's #191 oracle).
+    fn copy_stays(app: &crate::App, id: crate::SessionId, first: &str, steps: &[&str]) {
+        for (i, step) in steps.iter().enumerate() {
+            app.feed_for_test(id, step.as_bytes()).unwrap();
+            let text = app.selection_text(id).unwrap();
+            assert!(
+                text.as_deref().is_none_or(|text| text == first),
+                "after step {i} {step:?}: {text:?}, selected {first:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_continuation_row_scrolling_in_under_a_wrapped_bottom_row_clears() {
+        // adv191_repro.rs: the last selected row is soft-wrapped on the
+        // screen's bottom row with no row after it yet; a line feed
+        // scrolls one in below it, and text there would keep the blanks
+        // after the selection's end.
+        let app = crate::App::new(
+            crate::Config::default(),
+            crate::ConfigPaths::new("/nonexistent/tessera"),
+        );
+        let id = app.spawn_test_session(crate::PtySize::new(2, 11)).unwrap();
+        app.set_max_scrollback_for_test(id, 0).unwrap();
+        for c in [
+            "\x1b[?69h\x1b[2;4se\u{301}\x1b[1J\x1b7\x1b[?5l👨\u{200d}👩\u{200d}👧\x1b[?6l",
+            "w0rd日本\x1b[B",
+            "e\u{301}\x1b[62\"p\x1b[7m",
+        ] {
+            app.feed_for_test(id, c.as_bytes()).unwrap();
+        }
+        app.select_begin(id, point(1, 5), Granularity::Char, false)
+            .unwrap();
+        app.select_extend(id, point(2, 0)).unwrap();
+        let first = app.selection_text(id).unwrap().expect("selected");
+        assert_eq!(first, " 本e\u{301}");
+        copy_stays(
+            &app,
+            id,
+            &first,
+            &[
+                "\x1b[?2026l",
+                "\n",
+                "\x1b[?5l",
+                "\x1b[3'}",
+                "ａ",
+                "ｂ",
+                "a",
+                "b",
+            ],
+        );
+    }
+
+    #[test]
+    fn select_all_over_a_wrapped_bottom_row_then_a_scroll_clears() {
+        // adv191_repro2.rs: Select All whose last row is soft-wrapped on
+        // the bottom row; SU scrolls a continuation row in and text lands
+        // there.
+        let app = crate::App::new(
+            crate::Config::default(),
+            crate::ConfigPaths::new("/nonexistent/tessera"),
+        );
+        let id = app.spawn_test_session(crate::PtySize::new(2, 9)).unwrap();
+        app.set_max_scrollback_for_test(id, 2).unwrap();
+        for c in [
+            "\x1b[?1049l",
+            "👍🏽ab\x1b[2J日本",
+            "\x1b[H👍🏽👍🏽xyz\x1b[2;1H日本",
+            "hello  \nhello \t日本\r\n\r\n",
+            "👍🏽\t\x1b[S\t日本",
+            "xyz\x1b[2J\x1b[?1049l\x1b[K👍🏽\x1b[1;1Hzze\u{301}\x1b[K",
+            "\x1b[2;1H",
+            "https://ex.com/a(b)xyz👍🏽",
+            "\x1b[2J\r\nab\r\n\x1b[1;1Hzz\t\x1b[2J👍🏽",
+            "xyz\x1b[2;1H\x1b[K\t\x1b[Hab",
+            "\x1bM",
+            "ab",
+        ] {
+            app.feed_for_test(id, c.as_bytes()).unwrap();
+        }
+        app.scroll_to(id, crate::ScrollTarget::Offset(5)).unwrap();
+        app.select_all(id).unwrap();
+        let first = app.selection_text(id).unwrap().expect("selected");
+        assert_eq!(first, "\n\n  ab\nab");
+        copy_stays(
+            &app,
+            id,
+            &first,
+            &["\x1b[2;1H", "\x1b[S", "a", "b", "x", "y", "z", "日", "本"],
+        );
     }
 
     #[test]
@@ -1388,6 +1877,9 @@ mod tests {
                 Just("\x1b[2J".to_owned()),
                 Just("\x1b[2Jab".to_owned()),
                 Just("\x1b[3J".to_owned()),
+                // ED 3, then lines that may refill the history to its cap
+                // before the next look (#225: a clear, not an eviction).
+                Just("\x1b[3J\x1b[5;1H\n\n\n\n\n\n".to_owned()),
                 // A rewrite of the top row, then lines that scroll it off.
                 Just("\x1b[1;1Hzz\x1b[5;1H\n\n".to_owned()),
                 // From the #30 critic's scratch test: RIS, the alternate
@@ -1418,21 +1910,29 @@ mod tests {
         /// The frame path (only rows the capture found changed, damage
         /// outside the view) and the look path (damage) clear the selection
         /// exactly when a full comparison of every guarded row would, with
-        /// the history at a random cap; and a selection that is kept copies
+        /// the history at a random cap, for a linear or a block selection;
+        /// and a selection that is kept copies
         /// the text it copied when it was made (or, after eviction trimmed
         /// it, the end of that text).
         #[test]
         fn validation_agrees_with_a_full_comparison(
             // Lines of up to a row and a half (8 columns): some soft-wrap,
-            // and enough of them scroll wrapped lines into the history.
+            // and enough of them scroll wrapped lines into the history. A
+            // scroll down (SD) can leave a wrapped row at the bottom with
+            // its continuation gone: an open last line.
             setup in proptest::collection::vec(
-                prop_oneof!["[a-c ]{1,12}", Just("\r\n".to_owned())],
+                prop_oneof![
+                    4 => "[a-c ]{1,12}",
+                    4 => Just("\r\n".to_owned()),
+                    1 => Just("\x1b[T".to_owned()),
+                ],
                 0..16,
             ),
             from in (0u16..5, 0u16..8),
             to in (0u16..5, 0u16..8),
             offset in 0usize..3,
             cap in prop_oneof![Just(1_000usize), 0usize..6],
+            block in proptest::bool::weighted(0.25),
             ops in proptest::collection::vec(op(), 1..30),
         ) {
             let mut term = Terminal::new(5, 8);
@@ -1440,7 +1940,7 @@ mod tests {
             term.advance(setup.concat().as_bytes());
             let mut state = SelectionState::default();
             let grid = term.grid();
-            state.begin(grid, offset, point(from.0, from.1), Granularity::Char, false);
+            state.begin(grid, offset, point(from.0, from.1), Granularity::Char, block);
             state.extend(grid, offset, point(to.0, to.1));
             let sel = state.sel.clone().expect("selected");
             let original = extract(&Lines::of(grid), &sel);
@@ -1448,26 +1948,38 @@ mod tests {
             // they were, by line: the selected live rows, the newest
             // history line if selected, and the rest of the last selected
             // row's logical line.
-            let reference: Vec<(i64, Line)> = {
+            // If that logical line is still open (its last row is the
+            // bottom row and wrapped), any row added below it may continue
+            // it: the selection dies when one is.
+            let (reference, last, open): (Vec<(i64, Line)>, i64, bool) = {
                 let lines = Lines::of(grid);
                 let mut last = sel.end.line;
                 while last < lines.last() && lines.line(last).is_some_and(|l| l.wrapped) {
                     last += 1;
                 }
-                (sel.start.line..=last)
+                let open = last == lines.last() && lines.line(last).is_some_and(|l| l.wrapped);
+                let rows = (sel.start.line..=last)
                     .filter(|&n| n >= lines.top - 1)
                     .filter_map(|n| Some((n, lines.line(n)?.clone())))
-                    .collect()
+                    .collect();
+                (rows, last, open)
             };
+            // `kept` is the first line still selected: eviction trims it.
             let (start, end) = (sel.start.line, sel.end.line);
-            let mut seen = (term.grid().scrollback_pushed(), term.grid().scrollback_len());
+            let mut kept = start;
+            let mut clears = term.grid().history_clear_generation();
             let mut snapshot = crate::view::Snapshot::default();
             let mut alive = true;
             let mut trimmed = false;
             for op in ops {
                 let checked = match op {
                     Op::Feed(bytes) => {
+                        // The clear generation counts ED 3 and RIS, and
+                        // nothing else in this alphabet.
+                        let before = term.grid().history_clear_generation();
                         term.advance(bytes.as_bytes());
+                        let clearing = bytes.matches("\x1b[3J").count() + bytes.matches("\x1bc").count();
+                        prop_assert_eq!(term.grid().history_clear_generation() - before, clearing as u64);
                         false
                     }
                     Op::Frame(offset) => {
@@ -1483,23 +1995,25 @@ mod tests {
                 if !checked {
                     continue;
                 }
-                // Lines the history lost since the previous look: evicted at
-                // the cap (cut off, the selection lives while any line of it
-                // is left) or cleared (the selection dies if it held one).
+                // Lines the history lost since the previous look: cleared
+                // (the clear generation moved: the selection dies if it held
+                // one) or else evicted at the cap (cut off, the selection
+                // lives while any line of it is left).
                 let grid = term.grid();
-                let pushed = grid.scrollback_pushed() - seen.0;
-                let removed = (pushed + seen.1 as u64).saturating_sub(grid.scrollback_len() as u64);
-                let evicted = removed == 0 || grid.scrollback_len() >= grid.max_scrollback();
-                seen = (grid.scrollback_pushed(), grid.scrollback_len());
+                let cleared = grid.history_clear_generation() != clears;
+                clears = grid.history_clear_generation();
                 let lines = Lines::of(grid);
                 trimmed = trimmed || start < lines.first;
                 alive = alive
                     && !grid.is_alt_screen()
-                    && if evicted {
-                        end >= lines.first
+                    && if cleared {
+                        kept >= lines.first
                     } else {
-                        start >= lines.first
+                        end >= lines.first
                     }
+                    && !(open && lines.last() > last);
+                kept = kept.max(lines.first);
+                alive = alive
                     && reference.iter().all(|(n, line)| {
                         *n < lines.first
                             || lines.line(*n).is_some_and(|now| {
@@ -1533,7 +2047,7 @@ mod tests {
                 prop_oneof![
                     Just("https://".to_owned()),
                     Just("mailto:".to_owned()),
-                    "[a-c@./()\\[\\] \u{4e16}\u{301}]{0,5}",
+                    "[a-c@./()\\[\\] \u{4e16}\u{301}\u{200d}]{0,5}",
                     Just("\r\n".to_owned()),
                 ],
                 0..10,

@@ -247,6 +247,9 @@ pub struct Grid {
     /// Lines scrolled off the primary screen into history so far: see
     /// [`Grid::scrollback_pushed`].
     scrollback_pushed: PushedCount,
+    /// Times the history was cleared: see
+    /// [`Grid::history_clear_generation`].
+    history_clears: ClearCount,
     /// The OSC 8 hyperlink cells are written with, if one is open: see
     /// [`Grid::begin_hyperlink`].
     active_link: Option<Hyperlink>,
@@ -294,6 +297,7 @@ impl Grid {
             scrolled_since_clear: false,
             blanked_at: BlankedAt::default(),
             scrollback_pushed: PushedCount::default(),
+            history_clears: ClearCount::default(),
             active_link: None,
             links: LinkPool::new(),
         }
@@ -494,6 +498,23 @@ impl Grid {
     #[must_use]
     pub fn scrollback_pushed(&self) -> u64 {
         self.scrollback_pushed.0
+    }
+
+    /// How many times the history has been cleared since the grid was
+    /// created: a monotonic count that tells a reader whether lines left
+    /// the history between two looks by clearing rather than by eviction
+    /// at the cap.
+    ///
+    /// Bumped by every [`Grid::clear_scrollback`] (ED 3, and RIS, which
+    /// clears the history after [`Grid::reset`]) and by
+    /// [`Grid::clear_to_cursor`], which drops the history too, whether or
+    /// not the history held lines. Never bumped on the scroll path:
+    /// eviction at the cap, lines a zero cap discards and
+    /// [`Grid::set_max_scrollback`] dropping the oldest lines are not
+    /// clears. [`Grid::reset`] keeps the history and does not bump it.
+    #[must_use]
+    pub fn history_clear_generation(&self) -> u64 {
+        self.history_clears.0
     }
 
     /// A scrollback line; index `0` is the oldest, `scrollback_len() - 1`
@@ -1358,6 +1379,7 @@ impl Grid {
     /// whatever scrolled onto it.
     pub fn clear_scrollback(&mut self) {
         self.scrollback.clear();
+        self.history_clears.bump();
     }
 
     // ---------------------------------------------------------------- resize
@@ -2385,6 +2407,7 @@ impl Grid {
     /// touched. The whole screen counts as damaged either way.
     pub fn clear_to_cursor(&mut self) {
         self.scrollback.clear();
+        self.history_clears.bump();
         self.damage.extend_all();
         if self.is_alt_screen() {
             return;
@@ -2691,6 +2714,24 @@ impl std::fmt::Debug for BlankedAt {
 /// grid and a fresh one hold the same screen and must print the same.
 #[derive(Clone, Copy, Default)]
 struct PushedCount(u64);
+
+/// Times the history was cleared ([`Grid::history_clear_generation`]).
+/// Opaque in `Debug`, like [`PushedCount`]: RIS bumps it, and the grid it
+/// leaves must print as a fresh one does.
+#[derive(Clone, Copy, Default)]
+struct ClearCount(u64);
+
+impl ClearCount {
+    fn bump(&mut self) {
+        self.0 = self.0.wrapping_add(1);
+    }
+}
+
+impl std::fmt::Debug for ClearCount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClearCount")
+    }
+}
 
 impl std::fmt::Debug for PushedCount {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -3746,6 +3787,40 @@ mod tests {
             }
             apply_reset_op(&mut grid, &ResetOp::Reset)?;
         }
+    }
+
+    /// #225: the history clear generation counts ED 3, RIS and
+    /// `clear_to_cursor`, and no scroll, eviction or reset.
+    #[test]
+    fn the_history_clear_generation_counts_clears_not_evictions() {
+        let mut grid = Grid::with_scrollback(2, 4, 2);
+        assert_eq!(grid.history_clear_generation(), 0);
+        // Scrolling, eviction at the cap, a lower cap and a reset are no
+        // clears.
+        for _ in 0..6 {
+            grid.line_feed();
+        }
+        grid.scroll_up(2);
+        grid.set_max_scrollback(1);
+        grid.reset();
+        assert_eq!(grid.history_clear_generation(), 0);
+        // Each clear counts, an empty history's too.
+        grid.clear_scrollback();
+        assert_eq!(grid.history_clear_generation(), 1);
+        grid.clear_scrollback();
+        assert_eq!(grid.history_clear_generation(), 2);
+        grid.clear_to_cursor();
+        assert_eq!(grid.history_clear_generation(), 3);
+        // A clone keeps it; `Debug` does not show it.
+        assert_eq!(grid.clone().history_clear_generation(), 3);
+        assert_eq!(
+            format!("{grid:?}"),
+            format!("{:?}", {
+                let mut other = grid.clone();
+                other.history_clears = ClearCount::default();
+                other
+            })
+        );
     }
 
     /// #31: `scrollback_pushed` counts the lines that scroll off the top

@@ -1125,7 +1125,8 @@ impl App {
     ///   spacer and padding cells give nothing, a grapheme cluster gives
     ///   its whole text, and a tab gives the spaces it moved over.
     ///
-    /// A selection of blanks only gives `Some("")`.
+    /// A selection of blanks only gives `Some("")`, or `None` on the
+    /// alternate screen.
     ///
     /// # Errors
     ///
