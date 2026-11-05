@@ -13,7 +13,10 @@ final class CallbackBridgeTests: XCTestCase {
     private var bridge: CallbackBridge!
     private var session: TesseraSession!
     private var recorder: Recorder!
-    private let pasteboard = NSPasteboard(name: NSPasteboard.Name("com.aanyberg.TesseraKitTests.clipboard"))
+    /// A name of its own per test: a fixed one is shared by every test run
+    /// on the machine (another worktree's, say), which then writes it too.
+    private let pasteboard = NSPasteboard(
+        name: NSPasteboard.Name("com.aanyberg.TesseraKitTests.clipboard.\(UUID().uuidString)"))
 
     override func setUp() async throws {
         var raw: OpaquePointer?
@@ -35,16 +38,27 @@ final class CallbackBridgeTests: XCTestCase {
         bridge?.shutDown()
     }
 
-    /// Runs `body` on a plain background thread and blocks the main thread
-    /// until it returns, so every event it emits is queued before any can be
-    /// delivered.
-    private func onReaderThread(_ body: @escaping @Sendable (TesseraCallbacks) -> Void) {
+    /// Runs `body` on a new thread and blocks the calling (main) thread until
+    /// it returns. The thread runs at the main thread's quality of service: a
+    /// semaphore donates no priority, so a lower one is a priority inversion
+    /// (the Thread Performance Checker reports it).
+    private nonisolated static func blockingOnThread(_ body: @escaping @Sendable () -> Void) {
         let done = DispatchSemaphore(value: 0)
-        Thread.detachNewThread { [bridge] in
-            body(bridge!.callbacks())
+        let thread = Thread {
+            body()
             done.signal()
         }
+        thread.qualityOfService = .userInteractive
+        thread.start()
         done.wait()
+    }
+
+    /// Runs `body` on a background thread (``blockingOnThread(_:)``) and
+    /// blocks the main thread until it returns, so every event it emits is
+    /// queued before any can be delivered.
+    private func onReaderThread(_ body: @escaping @Sendable (TesseraCallbacks) -> Void) {
+        nonisolated(unsafe) let callbacks = bridge.callbacks()
+        Self.blockingOnThread { body(callbacks) }
     }
 
     /// Lets queued main-actor deliveries run, then returns the session's events.
@@ -207,12 +221,34 @@ final class CallbackBridgeTests: XCTestCase {
 
     // MARK: Clipboard write cap (ADR 0022 D-RATE52)
 
-    /// Lets the main actor run until `condition` holds, for at most `limit`.
-    private func until(_ limit: Duration = .seconds(2), _ condition: () -> Bool) async throws {
+    /// Lets the main actor run until `condition` holds; fails the test if it
+    /// does not within `limit`. The limit is a failure bound, not a timing
+    /// claim: a passing run returns as soon as the condition holds, and a
+    /// starved main actor (load average 70 and more) must not fail it.
+    private func until(
+        _ limit: Duration = .seconds(10), _ condition: () -> Bool,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
         let deadline = ContinuousClock.now + limit
-        while !condition(), ContinuousClock.now < deadline {
+        while !condition() {
+            guard ContinuousClock.now < deadline else {
+                XCTFail("condition not met within \(limit)", file: file, line: line)
+                return
+            }
             try await Task.sleep(for: .milliseconds(1))
         }
+    }
+
+    func testUntilFailsAtItsDeadline() async throws {
+        let start = ContinuousClock.now
+        try await until { true }
+        // Strict: the test fails unless `until` records its failure; any
+        // other failure is not expected.
+        let options = XCTExpectedFailure.Options()
+        options.issueMatcher = { $0.compactDescription.contains("condition not met within") }
+        XCTExpectFailure("a condition that never holds fails at the deadline", options: options)
+        try await until(.milliseconds(20)) { false }
+        XCTAssertGreaterThanOrEqual(ContinuousClock.now - start, .milliseconds(20), "not before it")
     }
 
     /// ``writeClipboard(_:_:session:)`` on a background thread; returns once
@@ -221,12 +257,7 @@ final class CallbackBridgeTests: XCTestCase {
         _ callbacks: TesseraCallbacks, _ text: String, session: UInt64
     ) {
         nonisolated(unsafe) let callbacks = callbacks
-        let done = DispatchSemaphore(value: 0)
-        Thread.detachNewThread {
-            writeClipboard(callbacks, text, session: session)
-            done.signal()
-        }
-        done.wait()
+        blockingOnThread { writeClipboard(callbacks, text, session: session) }
     }
 
     private var clipboard: String? { pasteboard.string(forType: .string) }
@@ -256,6 +287,42 @@ final class CallbackBridgeTests: XCTestCase {
         }
         XCTFail("no write held in 10 attempts")
         return ""
+    }
+
+    /// Has `bridge` hold a write, lets the timer release it, and offers
+    /// `text` from `session` right after the release: `text` must be held,
+    /// since the release counts as a write. Retried when the machine is so
+    /// slow that `text` may have come more than the interval after the
+    /// release (then it goes out at once, rightly).
+    private func offerRightAfterARelease(_ text: String, session: UInt64) async throws {
+        nonisolated(unsafe) let callbacks = bridge.callbacks()
+        for attempt in 0..<10 {
+            let released = "released \(attempt)"
+            _ = try await holdClipboardWrite(released, session: 7, on: bridge)
+            // The last instant the write was seen held: the release came
+            // after it.
+            var stillHeld = ContinuousClock.now
+            let deadline = stillHeld + .seconds(10)
+            while bridge.clipboardThrottle.held != nil {
+                guard ContinuousClock.now < deadline else {
+                    XCTFail("the held write was not released within 10 s")
+                    return
+                }
+                stillHeld = .now
+                try await Task.sleep(for: .milliseconds(1))
+            }
+            XCTAssertEqual(clipboard, released)
+            Self.writeClipboardOnReaderThread(callbacks, text, session: session)
+            try await until { self.bridge.clipboardThrottle.held != nil || self.clipboard == text }
+            if ContinuousClock.now - stillHeld < ClipboardThrottle.minimumInterval {
+                // Offered within the interval after the release.
+                XCTAssertEqual(bridge.clipboardThrottle.held?.text, text, "held right after a release")
+                XCTAssertEqual(clipboard, released, "not written at once")
+                return
+            }
+            try await Task.sleep(for: ClipboardThrottle.minimumInterval * 2)
+        }
+        XCTFail("no write offered within the interval after a release in 10 attempts")
     }
 
     func testAWriteRightAfterAnotherIsHeldThenWritten() async throws {
@@ -324,13 +391,16 @@ final class CallbackBridgeTests: XCTestCase {
     }
 
     /// Two reader threads flood OSC 52 writes for two sessions, small and
-    /// 1 MiB, for over a second: no 1 s window holds more than 11 pasteboard
-    /// writes (10 a second, 100 ms apart, both ends of the window included).
-    /// The writes are timed by sampling the change count: each happened
-    /// between the sample that saw it and the one before, and a window
-    /// counts only when even those bounds fit in a second, so a loaded
-    /// machine cannot make it fail. Then a write right after one that went
-    /// out is held, and released when due: the pasteboard ends with it.
+    /// 1 MiB, for over a second: every two consecutive pasteboard writes are
+    /// at least 100 ms apart, so no 1 s window holds more than 11 (10 a
+    /// second, both ends of the window included). The writes are timed by
+    /// sampling the change count: each happened between the sample that saw
+    /// it and the one before, and a gap or window counts as too short only
+    /// when even those outer bounds are, so a loaded machine cannot make it
+    /// fail. Then a write offered right after a timer release is held (the
+    /// release counts as a write; in the flood a later offer usually beats
+    /// the timer, so this is checked on its own), and released when due:
+    /// the pasteboard ends with it.
     func testAClipboardFloodFromTwoSessionsIsCappedAndEndsWithTheLastWrite() async throws {
         let other = TesseraSession(id: 8, core: core, bridge: bridge)
         bridge.register(other)
@@ -383,8 +453,15 @@ final class CallbackBridgeTests: XCTestCase {
             last.by - first.after <= .seconds(1)
         }
         XCTAssertEqual(crowded.count, 0, "\(window + 1) of \(writes.count) writes within a second")
+        // The sampling runs on the main actor, as the throttle and the
+        // pasteboard write do, so a write's throttle instant lies within its
+        // sample bounds too.
+        let close = zip(writes, writes.dropFirst()).filter { first, second in
+            second.by - first.after < ClipboardThrottle.minimumInterval
+        }
+        XCTAssertEqual(close.count, 0, "\(close.count) of \(writes.count) writes under 100 ms after the one before")
 
-        _ = try await holdClipboardWrite("the last", session: 8, on: bridge)
+        try await offerRightAfterARelease("the last", session: 8)
         try await until { self.clipboard == "the last" }
         XCTAssertEqual(clipboard, "the last", "the last write is not lost")
         XCTAssertNil(bridge.clipboardThrottle.held)
