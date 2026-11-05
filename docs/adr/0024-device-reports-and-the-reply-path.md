@@ -60,7 +60,9 @@ the fixture; the milestone lead accepted them on 2026-10-31.
   ms, so the case is not part of the gated `reader_lock_hold_is_bounded`.
 - A reply to a query sent while a paste is still queued reaches the child
   after the paste. Accepted: the program is reading its input in order
-  anyway.
+  anyway. Appending the reply to that queued entry can reallocate it
+  under the outbox lock, a one-off copy of at most `PENDING_INPUT_BYTES`
+  (accepted, #189 g).
 - **7-bit rule.** Every reply is built by `reply_csi`, `reply_dcs` or
   `reply_osc` and uses 7-bit controls (`ESC [`, `ESC P`, `ESC ]`, `ESC
   \`) unless 8-bit mode is on; see "Amendment: 8-bit controls" (#96).
@@ -114,7 +116,10 @@ the fixture; the milestone lead accepted them on 2026-10-31.
   the grid in characters; `14 t` and `16 t` answer in pixels once
   `Terminal::set_cell_pixels` has both dimensions above zero (**D-CELLPX**),
   saturated at 65535. `tessera-app-core` passes each view's cell size on
-  attach, resize, font size change and configured font size change.
+  attach, resize, font size change and configured font size change. A
+  detached view's cell size stays (#189 e, kept): a detach is usually
+  followed by a re-attach (#178), and until then `14 t` and `16 t` answer
+  the last view's cell, as a transient wrong answer would be worse.
 - **D-TSTACK** (amends ADR 0022): `22 ; 0|2 t` pushes the title last
   emitted, `23 ; 0|2 t` pops it and re-emits it as `Request::SetTitle`;
   depth 10, a push onto a full stack drops the oldest, a pop on an empty

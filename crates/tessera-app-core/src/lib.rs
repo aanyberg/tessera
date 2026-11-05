@@ -514,10 +514,14 @@ impl App {
         Ok(())
     }
 
-    /// Clears session `id` to its cursor line (⌘K, "Clear to Start" in
+    /// Clears session `id` to its prompt (⌘K, "Clear to Start" in
     /// Terminal.app): discards the scrollback and, on the primary screen,
-    /// the rows above the cursor, so the prompt line becomes the top row
-    /// (see [`tessera_term::Terminal::clear_to_cursor`]). On the alternate
+    /// the rows above the kept ones, which become the top rows (ADR 0022,
+    /// D-CLEAR-START; see [`tessera_term::Terminal::clear_to_cursor`]). The
+    /// kept rows start at the nearest row at or above the cursor with a
+    /// shell integration `PromptStart` mark, the scan stopping at a row
+    /// with an `OutputStart` and no `PromptStart`; without such a mark,
+    /// at the first row of the cursor's logical line. On the alternate
     /// screen only the scrollback goes; the full-screen application's
     /// screen is not touched. The view returns to the live screen and the
     /// selection is cleared.
@@ -3625,6 +3629,57 @@ mod tests {
         app.close_session(id).unwrap();
     }
 
+    /// #231 item 7: a Cmd-click that queued behind a resize (the
+    /// configuration's apply thread re-wrapping on a font size change)
+    /// finds the link the view shows at its stored position, not one on
+    /// the live screen. The pause runs the whole resize just before
+    /// `App::link_at`'s look takes the terminal lock; every line holds its
+    /// own URL, so a look at the wrong offset finds a different one. 120
+    /// rounds, 60 of them shrinking the history (40 to 80 columns).
+    #[test]
+    fn a_link_lookup_behind_a_resize_finds_the_link_in_the_view() {
+        use std::fmt::Write as _;
+        let app = app();
+        let (id, _fake) = attach_fake(&app, false);
+        app.resize(id, PtySize::new(24, 40)).unwrap();
+        let session = app.session(id).unwrap();
+        // 60 columns each: two rows at 40 columns, one at 80.
+        let mut text = String::new();
+        for n in 0..400 {
+            write!(text, "https://example.com/{n:03}/{}\r\n", "y".repeat(36)).unwrap();
+        }
+        session.with_terminal_mut(|term| term.advance(text.as_bytes()));
+        let top = Point { row: 0, col: 0 };
+        let url = |link: Option<Link>| link.map(|link| link.url);
+        let mut wrong = Vec::new();
+        let mut cols = 40;
+        for round in 0..120 {
+            cols = if cols == 40 { 80 } else { 40 };
+            session.scroll_to(ScrollTarget::Offset(5));
+            let armed = AtomicBool::new(true);
+            let pause = {
+                let session = Arc::clone(&session);
+                move || {
+                    if armed.swap(false, Ordering::SeqCst) {
+                        session.resize(PtySize::new(24, cols)).unwrap();
+                    }
+                }
+            };
+            session::set_lock_pause(Some((
+                session.delivery_key(),
+                session::LockPause::Viewport,
+                Arc::new(pause),
+            )));
+            let clicked = url(app.link_at(id, top).unwrap());
+            session::set_lock_pause(None);
+            let shown = url(app.link_at(id, top).unwrap());
+            if clicked != shown || clicked.is_none() {
+                wrong.push((round, cols, clicked, shown));
+            }
+        }
+        assert_eq!(wrong, [], "(round, columns, clicked, shown)");
+    }
+
     /// The pixel size reports answer the view's cell size, which every view
     /// change hands to the terminal (#10, D-CELLPX).
     #[test]
@@ -3651,6 +3706,36 @@ mod tests {
             let want = format!("\x1b[6;{};{}t", cell.height_px, cell.width_px);
             written_eventually(&fake, want.as_bytes());
         }
+    }
+
+    /// #189 e (kept by design, ADR 0024): after `detach_view` the pixel
+    /// size reports still answer the detached view's cell, since a detach
+    /// is usually followed by a re-attach (#178) and a transient wrong
+    /// answer is worse than a stale one.
+    #[test]
+    fn the_cell_size_report_keeps_the_last_view_after_a_detach() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        if !attach_offscreen(&app, id, PhysicalSize::new(800, 600), 2.0) {
+            return;
+        }
+        app.set_view_font_size(id, 20.0).unwrap();
+        let cell = app.view_cell_metrics(id).unwrap();
+        app.detach_view(id).unwrap();
+        let (rows, cols) = app
+            .with_terminal(id, |t| (t.grid().rows(), t.grid().cols()))
+            .unwrap();
+        lock(&fake.written).clear();
+        output(&fake, &events, b"\x1b[16t\x1b[14t");
+        let want = format!(
+            "\x1b[6;{};{}t\x1b[4;{};{}t",
+            cell.height_px,
+            cell.width_px,
+            u32::from(rows) * cell.height_px,
+            u32::from(cols) * cell.width_px
+        );
+        written_eventually(&fake, want.as_bytes());
     }
 
     #[test]
@@ -4145,9 +4230,10 @@ mod tests {
         assert_eq!(app.scroll_offset(id).unwrap(), 3);
     }
 
-    /// ⌘K (#107): the scrollback and the rows above the cursor go, the
-    /// cursor's line becomes the top row and the view returns to the live
-    /// screen, without an event and without writing to the child.
+    /// ⌘K (#107), without shell integration marks: the scrollback and the
+    /// rows above the cursor's logical line go (ADR 0022, D-CLEAR-START),
+    /// the cursor's line becomes the top row and the view returns to the
+    /// live screen, without an event and without writing to the child.
     #[test]
     fn clear_scrollback_clears_to_the_cursor_line() {
         let app = app();

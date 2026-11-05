@@ -66,11 +66,12 @@
 //!   holds that call's delivery lock while it takes the outbox and PTY
 //!   locks (`Session::begin_close`). Nothing takes the delivery lock while
 //!   holding another session lock.
-//! - A resize, and a scroll that changes the position, take the input lock
-//!   while they hold the terminal lock (`Session::resize`,
-//!   `Session::scroll_state`), so no re-wrap falls between reading the
-//!   history and storing a position against it (#175). Nothing takes the
-//!   terminal lock while holding the input lock.
+//! - A resize, a scroll that changes the position and a read of the view
+//!   take the input lock while they hold the terminal lock
+//!   (`Session::resize`, `Session::scroll_state`,
+//!   `Session::with_viewport`), so no re-wrap falls between reading the
+//!   history and reading or storing a position against it (#175, #231).
+//!   Nothing takes the terminal lock while holding the input lock.
 //! - Applying a cursor default reads the `App`'s configuration
 //!   (`Applied`) under the terminal lock (`Live::apply`, `App::attach`;
 //!   #168). Nothing takes a terminal lock while holding `Applied`.
@@ -1044,19 +1045,28 @@ impl Session {
     /// Runs `f` with the terminal locked and the view's scroll offset
     /// resolved against it (see [`ScrollAnchor`]): the offset `f` gets
     /// always fits the terminal it gets. The resolved offset is stored
-    /// afterwards, unless a scroll changed the position in the meantime.
+    /// afterwards, unless the view returned to the live screen in the
+    /// meantime ([`Session::scroll_to_bottom`]).
     ///
-    /// Takes the input lock, the terminal lock, then the input lock again,
-    /// never two at once.
+    /// Takes the terminal lock and, while holding it, the input lock twice:
+    /// to read the stored position before `f` runs and to store the
+    /// resolved one after it (terminal, then input, as [`Session::resize`]
+    /// takes them). `f` runs without the input lock. A resize on another
+    /// thread (the configuration's apply thread, on a font size change)
+    /// therefore re-anchors either before the position is read or after it
+    /// is stored, never between: a read that queued behind a resize gets
+    /// the re-anchored position, not the old one resolved against the
+    /// re-wrapped history (#231).
     pub(crate) fn with_viewport<R>(&self, f: impl FnOnce(&Terminal, usize) -> R) -> R {
+        #[cfg(test)]
+        pause_at(self.delivery_key(), LockPause::Viewport);
+        let term = self.term.lock();
+        let history = History::of(term.grid());
         let seen = lock(&self.input).scroll;
-        let (result, offset, left, history) = {
-            let term = self.term.lock();
-            let history = History::of(term.grid());
-            let (offset, left) = seen.resolve(&history);
-            (f(&term, offset), offset, left, history)
-        };
+        let (offset, left) = seen.resolve(&history);
+        let result = f(&term, offset);
         self.store_scroll(seen, offset, left, &history);
+        drop(term);
         result
     }
 
@@ -1077,8 +1087,8 @@ impl Session {
         lock(&self.selection)
     }
 
-    /// Stores the view at `offset` against `history`, read after `seen`
-    /// was: kept only while the stored position is still `seen` (a scroll
+    /// Stores the view at `offset` against `history`, read when `seen`
+    /// was: kept only while the stored position is still `seen` (a change
     /// stored meanwhile wins). A view that `left` its lines (clamped or
     /// returned to the live screen) drops its banked fraction of a line.
     fn store_scroll(&self, seen: ScrollAnchor, offset: usize, left: bool, history: &History) {
@@ -1101,6 +1111,8 @@ impl Session {
     fn scroll_state(&self) -> (History, usize, MutexGuard<'_, InputState>) {
         let term = self.term.lock();
         let history = History::of(term.grid());
+        #[cfg(test)]
+        pause_at(self.delivery_key(), LockPause::ScrollState);
         let input = lock(&self.input);
         drop(term);
         let (offset, _) = input.scroll.resolve(&history);
@@ -1678,10 +1690,18 @@ impl Pump {
                     let last_clipboard = requests
                         .iter()
                         .rposition(|r| matches!(r, Request::SetClipboard(_)));
+                    // Likewise each title replaces the previous one: a
+                    // flood of OSC 0/2 or title-stack pops (`CSI 23 t`)
+                    // costs one observer call per chunk, the last title.
+                    let last_title = requests
+                        .iter()
+                        .rposition(|r| matches!(r, Request::SetTitle(_)));
                     for (index, request) in requests.into_iter().enumerate() {
                         match request {
                             Request::Bell => self.deliver(SessionEvent::Bell),
-                            Request::SetTitle(title) => self.deliver(SessionEvent::Title(title)),
+                            Request::SetTitle(title) if Some(index) == last_title => {
+                                self.deliver(SessionEvent::Title(title));
+                            }
                             Request::SetClipboard(text) if Some(index) == last_clipboard => {
                                 self.clipboard(text);
                             }
@@ -1691,8 +1711,8 @@ impl Pump {
                             }
                             // `Request` is non-exhaustive; requests this
                             // layer does not route (DECCOLM's resize, an
-                            // earlier clipboard write of the chunk) are
-                            // dropped. Replies were queued per slice.
+                            // earlier title or clipboard write of the
+                            // chunk) are dropped. Replies were queued per slice.
                             _ => {}
                         }
                     }
@@ -1772,6 +1792,45 @@ fn pause_before_delivery(key: usize) {
         .as_ref()
         .filter(|(target, _)| *target == key)
         .map(|(_, pause)| Arc::clone(pause));
+    if let Some(pause) = pause {
+        pause();
+    }
+}
+
+/// A point between two lock steps of a session method where a test pauses
+/// the calling thread, to stage a race the lock order exists for.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockPause {
+    /// `Session::scroll_state`, after the history is read under the
+    /// terminal lock and before the input lock is taken.
+    ScrollState,
+    /// `Session::with_viewport`, before the terminal lock is taken.
+    Viewport,
+}
+
+/// A test pause: the session ([`Session::delivery_key`]), where it pauses
+/// and what it runs there.
+#[cfg(test)]
+pub(crate) type LockPauseHook = (usize, LockPause, Arc<dyn Fn() + Send + Sync>);
+
+#[cfg(test)]
+static LOCK_PAUSE: Mutex<Option<LockPauseHook>> = Mutex::new(None);
+
+/// Installs (or with `None` removes) the pause a session method runs at a
+/// [`LockPause`] point, for the session whose [`Session::delivery_key`] it
+/// names. The caller keeps that session alive while the pause is set.
+#[cfg(test)]
+pub(crate) fn set_lock_pause(pause: Option<LockPauseHook>) {
+    *lock(&LOCK_PAUSE) = pause;
+}
+
+#[cfg(test)]
+fn pause_at(key: usize, at: LockPause) {
+    let pause = lock(&LOCK_PAUSE)
+        .as_ref()
+        .filter(|(target, point, _)| *target == key && *point == at)
+        .map(|(_, _, pause)| Arc::clone(pause));
     if let Some(pause) = pause {
         pause();
     }
@@ -1874,13 +1933,18 @@ mod tests {
     /// the history (`hold_input` true). Whoever goes first, the view ends
     /// one line further back than it was, on every re-wrap: a scroll stored
     /// against the history before the re-wrap but not re-anchored by it
-    /// reads as a clear once the history is shorter (offset 0), which
-    /// re-anchoring outside the resize's terminal lock does on every
-    /// shrinking round. The second arrangement covers the lock order of
-    /// `Session::scroll_state` (no deadlock, no lost scroll); the mutex
-    /// hands the input lock to the scroll first, so it cannot force the
+    /// reads as a clear once the history is shorter (offset 0). What this
+    /// pins is a resize that reads the stored position before it takes the
+    /// terminal lock (the shape before #175), which loses the scroll on
+    /// every shrinking round; it does not tell a resize that re-anchors
+    /// under its terminal lock from one that releases it and then stores
+    /// only if the position is unchanged (#231).
+    /// The second arrangement checks that `Session::scroll_state`'s lock
+    /// order neither deadlocks nor loses a scroll here; the mutex hands
+    /// the input lock to the scroll first, so it cannot force the
     /// interleaving that order exists for (the resize re-anchoring between
-    /// the scroll's reading and its store).
+    /// the scroll's reading and its store): see
+    /// `a_resize_paused_inside_a_scroll_waits_for_its_store`.
     #[test]
     fn a_scroll_racing_a_resize_is_kept_whichever_goes_first() {
         let app = App::new(Config::default(), ConfigPaths::new("/nonexistent/tessera"));
@@ -1936,6 +2000,119 @@ mod tests {
             }
         }
         assert_eq!(lost, [], "(round, input lock held, columns, offset)");
+    }
+
+    /// A session of 24 rows by 40 columns holding 400 lines of 60 columns
+    /// (two rows each at 40 columns, one at 80), whose reader has already
+    /// stopped (its event stream is closed), so only a test's own threads
+    /// wait for the terminal lock.
+    fn rewrapping_session() -> (App, Arc<Session>) {
+        let app = App::new(Config::default(), ConfigPaths::new("/nonexistent/tessera"));
+        let (tx, _unused) = mpsc::sync_channel(4);
+        let (closed, rx) = mpsc::sync_channel(4);
+        drop(closed);
+        let pty = SizePty {
+            events: Some(tx),
+            sizes: Arc::new(Mutex::new(Vec::new())),
+        };
+        let id = app.allocate_id();
+        app.attach(id, Box::new(pty), rx, PtySize::new(24, 40))
+            .expect("attach");
+        let session = app.session(id).unwrap();
+        let line = format!("{}\r\n", "y".repeat(60));
+        session.with_terminal_mut(|term| term.advance(line.repeat(400).as_bytes()));
+        (app, session)
+    }
+
+    /// #231 item 1: a scroll paused between reading the history (under the
+    /// terminal lock) and taking the input lock still holds the terminal
+    /// lock, so a resize started in the pause waits for the scroll's store
+    /// and then re-anchors it: the view ends one line further back on every
+    /// re-wrap. The pause lasts until the resize either waits for the
+    /// terminal lock or has finished, so the test needs no timing: released
+    /// before the input lock (mutant M10), the terminal lets the resize run
+    /// whole in the pause, and the scroll stores its position against the
+    /// history from before the re-wrap.
+    #[test]
+    fn a_resize_paused_inside_a_scroll_waits_for_its_store() {
+        let (_app, session) = rewrapping_session();
+        let mut lost = Vec::new();
+        let mut cols = 40;
+        for round in 0..20 {
+            cols = if cols == 40 { 80 } else { 40 };
+            session.scroll_to(ScrollTarget::Offset(5));
+            let paused = Arc::new(AtomicBool::new(false));
+            let resized = Arc::new(AtomicBool::new(false));
+            let pause = {
+                let (paused, resized) = (Arc::clone(&paused), Arc::clone(&resized));
+                let term = Arc::clone(&session.term);
+                move || {
+                    paused.store(true, Ordering::SeqCst);
+                    wait_until("the resize to wait or finish", || {
+                        resized.load(Ordering::SeqCst) || term.waiting.load(Ordering::SeqCst) > 0
+                    });
+                }
+            };
+            set_lock_pause(Some((
+                session.delivery_key(),
+                LockPause::ScrollState,
+                Arc::new(pause),
+            )));
+            thread::scope(|scope| {
+                scope.spawn(|| session.scroll(1.0));
+                wait_until("the scroll to pause", || paused.load(Ordering::SeqCst));
+                scope.spawn(|| {
+                    session.resize(PtySize::new(24, cols)).unwrap();
+                    resized.store(true, Ordering::SeqCst);
+                });
+            });
+            set_lock_pause(None);
+            let offset = session.scroll_offset();
+            if offset != 6 {
+                lost.push((round, cols, offset));
+            }
+        }
+        assert_eq!(lost, [], "(round, columns, offset)");
+    }
+
+    /// #231 items 2 and 7: a read of the view that queued behind a resize
+    /// (the configuration's apply thread re-wrapping on a font size change)
+    /// gets the re-anchored position, the one stored. The pause runs the
+    /// whole resize just before `Session::with_viewport` takes the terminal
+    /// lock; a read of the stored position before that point resolves the
+    /// old anchor against the re-wrapped history, which reads as a clear
+    /// (offset 0) whenever the history got shorter. 120 rounds, 60 of them
+    /// shrinking the history (40 to 80 columns).
+    #[test]
+    fn a_view_read_behind_a_resize_gets_the_stored_position() {
+        let (_app, session) = rewrapping_session();
+        let mut wrong = Vec::new();
+        let mut cols = 40;
+        for round in 0..120 {
+            cols = if cols == 40 { 80 } else { 40 };
+            session.scroll_to(ScrollTarget::Offset(5));
+            let armed = AtomicBool::new(true);
+            let pause = {
+                let session = Arc::clone(&session);
+                move || {
+                    if armed.swap(false, Ordering::SeqCst) {
+                        session.resize(PtySize::new(24, cols)).unwrap();
+                    }
+                }
+            };
+            set_lock_pause(Some((
+                session.delivery_key(),
+                LockPause::Viewport,
+                Arc::new(pause),
+            )));
+            let read = session.scroll_offset();
+            set_lock_pause(None);
+            let stored = session.scroll_offset();
+            if read != stored || read == 0 {
+                wrong.push((round, cols, read, stored));
+            }
+        }
+        assert_eq!(wrong, [], "(round, columns, read, stored)");
     }
 
     /// A PTY that only records the sizes it is given and rejects an empty
@@ -2767,6 +2944,45 @@ mod tests {
         assert_eq!(
             pump_until_bell(&tx, &events, &flood),
             [SessionEvent::Output, SessionEvent::Clipboard("two".into())]
+        );
+        app.close_session(id).expect("close");
+    }
+
+    /// #189 b (S6): a chunk with many titles delivers only its last one,
+    /// whether they come as OSC 0/2 or as title-stack pops (`CSI 23 t`): a
+    /// flood of 200 000 titles in one chunk (1.5 MB) costs one observer
+    /// call. Each chunk delivers its own last title, and the bell that ends
+    /// the chunk still arrives.
+    #[test]
+    fn a_flood_of_titles_delivers_the_last_one_per_chunk() {
+        let app = App::new(Config::default(), ConfigPaths::new("/nonexistent/tessera"));
+        let (id, tx, events) = fake_session(&app, PtySize::new(4, 20));
+        let mut flood = b"\x1b]0;one\x07".to_vec();
+        for _ in 0..100_000 {
+            // A set, then a push and a pop of it: two titles.
+            flood.extend_from_slice(b"\x1b]2;x\x07\x1b[22t\x1b[23t");
+        }
+        flood.extend_from_slice(b"\x1b]2;two\x07");
+        let started = Instant::now();
+        let seen = pump_until_bell(&tx, &events, &flood);
+        let elapsed = started.elapsed();
+        assert_eq!(
+            seen,
+            [SessionEvent::Output, SessionEvent::Title("two".into())]
+        );
+        eprintln!("{} bytes of titles delivered in {elapsed:?}", flood.len());
+        // The last title of a chunk may be a pop.
+        assert_eq!(
+            pump_until_bell(
+                &tx,
+                &events,
+                b"\x1b]2;three\x07\x1b[22t\x1b]2;four\x07\x1b[23t"
+            ),
+            [SessionEvent::Output, SessionEvent::Title("three".into())]
+        );
+        assert_eq!(
+            pump_until_bell(&tx, &events, b"no title"),
+            [SessionEvent::Output]
         );
         app.close_session(id).expect("close");
     }
