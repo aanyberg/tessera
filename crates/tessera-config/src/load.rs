@@ -42,9 +42,11 @@ pub const MAX_WARNING_PATH_LEN: usize = 256;
 
 /// A TOML syntax error or a type mismatch on a known key.
 ///
-/// Wraps the message of [`toml::de::Error`] truncated to
-/// [`MAX_PARSE_ERROR_LEN`] bytes, so logging or displaying it is always
-/// cheap. The byte span of the problem in the source, when known, is kept
+/// Wraps the message of [`toml::de::Error`] on one line, with control
+/// characters, line separators and bidirectional formatting characters
+/// escaped (`toml` quotes the offending line of the file, and the message
+/// spans several lines), truncated to [`MAX_PARSE_ERROR_LEN`] bytes, so
+/// logging or displaying it is always cheap and safe. The byte span of the problem in the source, when known, is kept
 /// intact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
@@ -75,7 +77,9 @@ impl std::error::Error for ParseError {}
 impl From<toml::de::Error> for ParseError {
     fn from(error: toml::de::Error) -> Self {
         Self {
-            message: truncated(&error.to_string(), MAX_PARSE_ERROR_LEN),
+            // Escaped (S8): `toml` quotes the offending line, which may hold
+            // any character the file does (#262 item 10).
+            message: escaped(&error.to_string(), MAX_PARSE_ERROR_LEN),
             span: error.span(),
         }
     }
@@ -420,11 +424,19 @@ fn written(text: &str, value: &toml::Spanned<toml::de::DeValue<'_>>) -> String {
 }
 
 /// `text` with every control character (C0, DEL and C1: `\n`, `\t`,
-/// `\u{1b}`, ...) written as its Rust escape, so a warning stays on one
-/// line, then [`truncated`] to at most `max` bytes. Only as much of `text`
-/// is escaped as can survive the cut, so a huge value costs at most `max`
-/// characters of work.
-pub(crate) fn escaped(text: &str, max: usize) -> String {
+/// `\u{1b}`, ...), the line and paragraph separators (U+2028, U+2029) and
+/// the bidirectional formatting characters (U+061C, U+200E, U+200F,
+/// U+202A..=U+202E, U+2066..=U+2069) written as their Rust escapes, so a
+/// warning stays on one line and cannot reorder the text around it, then
+/// cut to at most `max` bytes on a character boundary (with a marker when
+/// cut). Only as much of `text` is escaped as can survive the cut, so a
+/// huge value costs at most `max` characters of work.
+///
+/// Every file-derived text this crate logs or reports goes through it
+/// (docs/security.md S8); callers that log such text themselves (a theme
+/// file's path or load error) use it too, with [`MAX_WARNING_PATH_LEN`] or
+/// [`MAX_PARSE_ERROR_LEN`] as `max`.
+pub fn escaped(text: &str, max: usize) -> String {
     let mut out = String::with_capacity(text.len().min(max + 1));
     for c in text.chars() {
         // Past `max`, `truncated` cuts the rest anyway (and adds its marker).
@@ -433,11 +445,30 @@ pub(crate) fn escaped(text: &str, max: usize) -> String {
         }
         if c.is_control() {
             out.extend(c.escape_debug());
+        } else if needs_unicode_escape(c) {
+            out.extend(c.escape_unicode());
         } else {
             out.push(c);
         }
     }
     truncated(&out, max)
+}
+
+/// Whether [`escaped`] writes `c` (not a control character) as `\u{..}`:
+/// a line or paragraph separator, which some log viewers break lines at,
+/// or a bidirectional formatting character.
+fn needs_unicode_escape(c: char) -> bool {
+    matches!(c, '\u{2028}' | '\u{2029}') || is_bidi_control(c)
+}
+
+/// The bidirectional formatting characters (Unicode category Cf): the
+/// marks (U+061C, U+200E, U+200F), embeddings and overrides
+/// (U+202A..=U+202E) and isolates (U+2066..=U+2069).
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
 }
 
 /// Deserializes `appearance.cursor_shape` without failing: a value that is
@@ -640,9 +671,15 @@ fn normalize_appearance(prefix: &str, a: &mut crate::Appearance, warnings: &mut 
 /// on the open handle and at most that many bytes are ever read, so a
 /// file that grows during the read is rejected rather than read whole.
 pub fn load_file(path: &Path) -> Result<Loaded, Error> {
+    load_file_noting_empty(path).map(|(loaded, _)| loaded)
+}
+
+/// [`load_file`], and whether the file held nothing but whitespace.
+pub(crate) fn load_file_noting_empty(path: &Path) -> Result<(Loaded, bool), Error> {
     let bytes = read_capped(path, MAX_CONFIG_FILE_LEN, "config file")?;
     let text = std::str::from_utf8(&bytes)?;
-    Config::from_toml_lenient(text)
+    let empty = text.trim().is_empty();
+    Config::from_toml_lenient(text).map(|loaded| (loaded, empty))
 }
 
 /// Reads the regular file at `path` whole, refusing one larger than `limit`
@@ -1126,24 +1163,90 @@ mod tests {
     }
 
     proptest::proptest! {
-        /// [`escaped`] never leaves a control character, never exceeds
-        /// its cap, and equals escaping the whole text before the cut.
+        /// [`escaped`] never leaves a control character, a line separator
+        /// or a bidirectional formatting character, never exceeds its cap,
+        /// and equals escaping the whole text before the cut.
         #[test]
-        fn escaping_is_one_line_and_capped(text in "\\PC{0,40}|[\\x00-\\x7f\\u{80}-\\u{a0}é]{0,600}", max in 16usize..300) {
+        fn escaping_is_one_line_and_capped(
+            text in "\\PC{0,40}|[\\x00-\\x7f\\u{80}-\\u{a0}é\\u{61c}\\u{200b}-\\u{200f}\\u{2028}-\\u{202f}\\u{2066}-\\u{2069}]{0,600}",
+            max in 16usize..300,
+        ) {
             let out = escaped(&text, max);
             proptest::prop_assert!(out.len() <= max, "{} > {max}", out.len());
             proptest::prop_assert!(!out.chars().any(char::is_control), "{:?}", out);
+            proptest::prop_assert!(
+                !out.chars().any(|c| matches!(c, '\u{2028}' | '\u{2029}') || is_bidi_control(c)),
+                "{:?}", out
+            );
             // The reference: escape the whole text, then cut (for text
-            // without controls, plain truncation).
+            // without controls, plain truncation). Spelled out rather than
+            // through `needs_unicode_escape`, so a code point dropped from
+            // it is caught.
             let full: String = text
                 .chars()
                 .flat_map(|c| {
-                    let escape: Vec<char> = if c.is_control() { c.escape_debug().collect() } else { vec![c] };
+                    let escape: Vec<char> = if c.is_control() {
+                        c.escape_debug().collect()
+                    } else if matches!(
+                        c,
+                        '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+                    ) {
+                        c.escape_unicode().collect()
+                    } else {
+                        vec![c]
+                    };
                     escape
                 })
                 .collect();
             proptest::prop_assert_eq!(out, truncated(&full, max));
         }
+    }
+
+    /// #262 items 4 and 10: a line separator, a right-to-left override and
+    /// a raw ESC reach neither a warning nor a parse error unescaped, and
+    /// the parse error (which quotes the line) is one line.
+    #[test]
+    fn separators_bidi_controls_and_esc_are_escaped_in_warnings_and_parse_errors() {
+        let hostile = "x\u{2028}y\u{202e}z\u{1b}[31m";
+        let raw = |text: &str| {
+            text.chars().any(|c| {
+                c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') || is_bidi_control(c)
+            })
+        };
+        // A warning naming a key: an unknown quoted key, whose escapes
+        // TOML decodes (raw controls are not valid inside a TOML string).
+        let spelled = r"x\u2028y\u202Ez\u001B[31m";
+        // A warning quoting the source text of a value: U+2028 and U+202E
+        // are valid raw inside a TOML string, ESC only as an escape.
+        let quoted = "x\u{2028}y\u{202e}z\\u001B[31m";
+        for (text, expected) in [
+            (
+                format!("[appearance]\n\"{spelled}\" = 1\n"),
+                "x\\u{2028}y\\u{202e}z\\u{1b}[31m",
+            ),
+            (
+                format!("[terminal]\nclipboard_write = \"{quoted}\"\n"),
+                "x\\u{2028}y\\u{202e}z",
+            ),
+        ] {
+            let loaded = Config::from_toml_lenient(&text).unwrap();
+            let [warning] = &loaded.warnings[..] else {
+                panic!("{text:?}: {:?}", loaded.warnings);
+            };
+            let line = warning.to_string();
+            assert!(!raw(&line), "{text:?}: {line:?}");
+            assert!(line.contains(expected), "{line}");
+        }
+        // A parse error quoting the line: a bare key with the hostile
+        // characters in a comment after a syntax error on the same line.
+        let text = format!("[terminal]\nclipboard_write = off # {hostile}\n");
+        let error = Config::from_toml_lenient(&text).unwrap_err();
+        let line = error.to_string();
+        assert!(!raw(&line), "{line:?}");
+        assert!(
+            line.contains("\\u{2028}") && line.contains("\\u{1b}"),
+            "{line}"
+        );
     }
 
     #[test]

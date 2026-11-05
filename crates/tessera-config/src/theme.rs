@@ -27,7 +27,7 @@ use std::sync::LazyLock;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::load::{
-    MAX_PARSE_ERROR_LEN, MAX_WARNING_PATH_LEN, ParseError, Warning, read_capped, truncated,
+    MAX_PARSE_ERROR_LEN, MAX_WARNING_PATH_LEN, ParseError, Warning, escaped, read_capped, truncated,
 };
 
 /// Largest theme file that is read, in bytes. A real theme is about 1 KiB;
@@ -446,6 +446,17 @@ impl Theme {
     /// unreadable directory just has no user themes.
     #[must_use]
     pub fn resolve(themes_dir: &Path, name: &str) -> ResolvedTheme {
+        Self::resolve_noting(themes_dir, name, &mut Vec::new())
+    }
+
+    /// [`Theme::resolve`], also pushing onto `unloadable` every user file
+    /// the lookup read that did not load, whether or not it matched by
+    /// stem (for the watcher; see [`unloadable_to_follow`]).
+    fn resolve_noting(
+        themes_dir: &Path,
+        name: &str,
+        unloadable: &mut Vec<PathBuf>,
+    ) -> ResolvedTheme {
         let mut warnings = Vec::new();
         // A name longer than any imported theme's (the importers clip names
         // to this length) is not compared at all: doing so against every
@@ -453,7 +464,9 @@ impl Theme {
         // theme with a longer `name` is still found by its file stem or by
         // a name within the cap that has the same slug.
         if is_lookup_name(name) && name.len() <= MAX_THEME_NAME_LEN {
-            if let Some((theme, path)) = find_user_theme(themes_dir, name, &mut warnings) {
+            if let Some((theme, path)) =
+                find_user_theme(themes_dir, name, &mut warnings, unloadable)
+            {
                 return ResolvedTheme {
                     theme,
                     source: ThemeSource::User(path),
@@ -469,7 +482,7 @@ impl Theme {
             }
         }
         warnings.push(Warning::ThemeNotFound {
-            name: truncated(name, MAX_WARNING_PATH_LEN),
+            name: escaped(name, MAX_WARNING_PATH_LEN),
         });
         ResolvedTheme {
             theme: Self::default(),
@@ -579,6 +592,7 @@ fn find_user_theme(
     dir: &Path,
     name: &str,
     warnings: &mut Vec<Warning>,
+    unloadable: &mut Vec<PathBuf>,
 ) -> Option<(Theme, PathBuf)> {
     let files = theme_files(dir);
     let (by_stem, others): (Vec<_>, Vec<_>) =
@@ -589,16 +603,15 @@ fn find_user_theme(
         match Theme::load(path) {
             Ok(theme) => return Some((theme, path.clone())),
             Err(error) => {
-                tracing::warn!(
-                    target: "tessera_config",
-                    path = %path.display(),
-                    %error,
-                    "theme file could not be loaded"
-                );
-                warnings.push(Warning::ThemeInvalid {
-                    path: truncated(&path.display().to_string(), MAX_WARNING_PATH_LEN),
-                    error: truncated(&error.to_string(), MAX_PARSE_ERROR_LEN),
-                });
+                // Escaped (S8): the error may quote the file, and a file
+                // name may hold any character but `/`.
+                let warning = Warning::ThemeInvalid {
+                    path: escaped(&path.display().to_string(), MAX_WARNING_PATH_LEN),
+                    error: escaped(&error.to_string(), MAX_PARSE_ERROR_LEN),
+                };
+                tracing::warn!(target: "tessera_config", "{warning}");
+                warnings.push(warning);
+                unloadable.push(path.clone());
             }
         }
     }
@@ -608,12 +621,15 @@ fn find_user_theme(
             Ok(_) => {}
             // A broken file that does not match by stem may not be the one
             // asked for; it is not reported.
-            Err(error) => tracing::debug!(
-                target: "tessera_config",
-                path = %path.display(),
-                %error,
-                "theme file skipped"
-            ),
+            Err(error) => {
+                tracing::debug!(
+                    target: "tessera_config",
+                    path = %escaped(&path.display().to_string(), MAX_WARNING_PATH_LEN),
+                    error = %escaped(&error.to_string(), MAX_PARSE_ERROR_LEN),
+                    "theme file skipped"
+                );
+                unloadable.push(path.clone());
+            }
         }
     }
     None
@@ -632,6 +648,46 @@ pub(crate) fn files_named(dir: &Path, name: &str) -> Vec<PathBuf> {
         .filter(|(stem, _)| names_match(stem, name))
         .map(|(_, path)| path)
         .collect()
+}
+
+/// Most theme files that do not load which the native watcher keeps
+/// registered while the theme in use is not a user file (see
+/// [`unloadable_to_follow`]): one file descriptor each.
+pub(crate) const MAX_UNLOADABLE_FOLLOWED: usize = 8;
+
+/// For the watcher: the user file `name` resolves to (`None` for a bundled
+/// theme or the default) and, when there is none, the theme files that the
+/// lookup could not load, most recently modified first and at most
+/// [`MAX_UNLOADABLE_FOLLOWED`].
+///
+/// An unloadable file may be the theme asked for, half-written (created
+/// empty and then filled, deleted and recreated, saved in chunks): its
+/// `name` key cannot be read yet, so nothing else ties it to `name`, and
+/// an in-place write that completes it raises no event on the directory.
+/// The watcher follows these files too, so that write is seen and the
+/// lookup retried (#253 item 8).
+pub(crate) fn unloadable_to_follow(dir: &Path, name: &str) -> (Option<PathBuf>, Vec<PathBuf>) {
+    let mut unloadable = Vec::new();
+    if let ThemeSource::User(path) = Theme::resolve_noting(dir, name, &mut unloadable).source {
+        return (Some(path), Vec::new());
+    }
+    let mut dated: Vec<(Option<std::time::SystemTime>, PathBuf)> = unloadable
+        .into_iter()
+        .map(|path| {
+            let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+            (modified, path)
+        })
+        .collect();
+    // Newest first: a file just created or truncated is the likeliest.
+    dated.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    (
+        None,
+        dated
+            .into_iter()
+            .take(MAX_UNLOADABLE_FOLLOWED)
+            .map(|(_, path)| path)
+            .collect(),
+    )
 }
 
 /// The `(stem, path)` of every non-hidden `*.toml` entry in `dir`, sorted
@@ -728,5 +784,43 @@ mod tests {
         let bad = format!("{base}search_match = \"red\"\n");
         let error = Theme::parse(&bad).unwrap_err().to_string();
         assert!(error.contains("search_match"), "{error}");
+    }
+
+    /// #262 items 4 and 5: a theme warning never carries a raw line
+    /// separator, bidi override or escape, neither from the configured name
+    /// ([`Warning::ThemeNotFound`]) nor from a theme file's name or the
+    /// parse error that quotes its line ([`Warning::ThemeInvalid`]).
+    #[test]
+    fn theme_warnings_escape_separators_bidi_controls_and_esc() {
+        const HOSTILE: [char; 3] = ['\u{2028}', '\u{202e}', '\u{1b}'];
+        let raw = |text: &str| text.chars().any(|c| HOSTILE.contains(&c));
+        let dir = tempfile::tempdir().unwrap();
+
+        let missing = "gone\u{2028}x\u{202e}y\u{1b}[31m";
+        let resolved = Theme::resolve(dir.path(), missing);
+        let [Warning::ThemeNotFound { .. }] = resolved.warnings.as_slice() else {
+            panic!("{:?}", resolved.warnings);
+        };
+        let text = resolved.warnings[0].to_string();
+        assert!(!raw(&text), "{text:?}");
+        assert!(text.contains(r"gone\u{2028}x\u{202e}y\u{1b}[31m"), "{text}");
+
+        let name = "bad\u{2028}\u{202e}\u{1b}";
+        std::fs::write(
+            dir.path().join(format!("{name}.toml")),
+            "background = nope\u{202e}\u{2028}\u{1b}[31m\n",
+        )
+        .unwrap();
+        let resolved = Theme::resolve(dir.path(), name);
+        let Some(Warning::ThemeInvalid { .. }) = resolved.warnings.first() else {
+            panic!("{:?}", resolved.warnings);
+        };
+        for warning in &resolved.warnings {
+            let text = warning.to_string();
+            assert!(!raw(&text), "{text:?}");
+        }
+        let text = resolved.warnings[0].to_string();
+        assert!(text.contains(r"bad\u{2028}\u{202e}\u{1b}.toml"), "{text}");
+        assert!(text.contains(r"nope\u{202e}\u{2028}\u{1b}"), "{text}");
     }
 }

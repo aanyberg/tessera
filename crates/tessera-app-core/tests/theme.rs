@@ -193,19 +193,6 @@ fn background(app: &App) -> [u8; 3] {
     app.view_theme().background.to_srgb8()
 }
 
-/// Waits up to [`WAIT`] for a translucent (`false`) report, passing over
-/// opaque ones.
-fn next_translucent(changes: &std::sync::mpsc::Receiver<bool>) {
-    let deadline = Instant::now() + WAIT;
-    loop {
-        match changes.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(false) => return,
-            Ok(true) => eprintln!("translucent: an opaque change came first"),
-            Err(e) => panic!("translucent: no translucent change within {WAIT:?}: {e}"),
-        }
-    }
-}
-
 /// Counts the reports up to the one after which `app` draws `last` (within
 /// [`WAIT`] of `since`), then those that trail it for as long as `quiet`
 /// waits (800 ms); and how long after `since` `last` was drawn, if it was.
@@ -240,9 +227,12 @@ fn count_changes(
 /// `a_theme_file_edit_applies_within_the_bound`, which runs in the
 /// `timing` nextest group (one at a time); every other wait is [`WAIT`].
 /// Measured with ten `yes` burners on ten cores (load average 11 to 122,
-/// 2026-11-04): median 103 ms, at most 111 ms over 100 runs, so the bound
-/// leaves 13 times the loaded maximum.
-const BOUND: Duration = Duration::from_millis(1500);
+/// 2026-11-04): median 103 ms, at most 111 ms over 100 runs. Under
+/// background quality of service (`taskpolicy -b`) with sibling theme tests
+/// running, the process is starved and edits arrived 1.78 to 3.29 s late
+/// (#253 item 9), so the bound is 5 s, the bound of every other due event
+/// in the configuration tests.
+const BOUND: Duration = Duration::from_secs(5);
 
 /// Writes of the flood in the watch test: a fixed count, so a slow machine
 /// (`taskpolicy -b`) floods as hard, just for longer.
@@ -312,13 +302,13 @@ fn the_config_watch_applies_edits_and_reports_appearance_changes() {
         "[appearance]\ntheme = \"other\"\nopacity = 0.5\n",
     )
     .unwrap();
-    // An apply thread that handles the unrelated files' `ThemesChanged`
-    // only after the store reloaded `config.toml` (a loaded machine)
-    // applies the newly named theme at the old opacity first, an opaque
-    // change, so one may come before the translucent one.
-    next_translucent(&changes);
+    // One translucent report, even when the apply thread handles the
+    // unrelated files' `ThemesChanged` only after the store reloaded
+    // `config.toml` (a loaded machine): that applies the newly named theme
+    // at the new opacity, not at the old one first (#253 item 4).
+    assert_eq!(changes.recv_timeout(WAIT), Ok(false), "config edit");
     assert_eq!(background(&app), [0x21, 0x21, 0x21]);
-    assert!((app.view_theme().background.a - 0.5).abs() < 1e-6);
+    assert_eq!(app.view_theme().background.a, 0.5);
     assert_eq!(app.config().appearance.opacity, 0.5);
 
     // An invalid file keeps the last good configuration.

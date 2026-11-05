@@ -18,23 +18,13 @@ fn font_size_doc(size: u32) -> String {
     format!("[appearance]\nfont_size = {size}\n")
 }
 
-/// Bound for a step the native backend recovers through its poll fallback
-/// (a removed directory coming back, a file becoming readable again). The
-/// fallback samples every `poll_interval` and reloads straight after a
-/// successful re-arm, or within one debounce after a directory event it
-/// sees on the way; `max_wait` only matters for a continuous writer. That is
-/// at most `poll_interval + debounce`, times four for scheduling stalls on
-/// loaded CI runners (600 ms with the defaults). The poll backend has no
-/// separate recovery path, so it keeps [`LIMIT`]. `recv_timeout` returns as
-/// soon as the event arrives, so the headroom costs nothing when the
-/// backend is on time.
-fn recovery_limit(backend: WatchBackend) -> Duration {
-    if backend == WatchBackend::Poll {
-        return LIMIT;
-    }
-    let defaults = WatchOptions::default();
-    (defaults.poll_interval + defaults.debounce) * 4
-}
+/// How long a test waits for an event that is due (#253 item 9, #262 N2).
+/// Only `font_size_edit_is_observed_within_500ms` asserts a latency
+/// ([`LIMIT`]); every other wait only needs the event to arrive, so it is
+/// long enough for a starved process (`taskpolicy -b` on a loaded machine).
+/// `recv_timeout` returns as soon as the event arrives, so the headroom
+/// costs nothing when the backend is on time.
+const EVENTUALLY: Duration = Duration::from_secs(5);
 
 fn options(backend: WatchBackend) -> WatchOptions {
     WatchOptions {
@@ -54,6 +44,13 @@ fn expect_changed(event: ConfigEvent, backend: WatchBackend) -> tessera_config::
     match event {
         ConfigEvent::Changed(changed) => changed,
         other => panic!("{backend:?}: expected Changed, got {other:?}"),
+    }
+}
+
+fn expect_invalid(event: ConfigEvent, backend: WatchBackend) {
+    match event {
+        ConfigEvent::Invalid(_) => {}
+        other => panic!("{backend:?}: expected Invalid, got {other:?}"),
     }
 }
 
@@ -98,7 +95,7 @@ fn rapid_writes_are_debounced_into_one_event() {
             std::thread::sleep(Duration::from_millis(5));
         }
 
-        let event = watcher.recv_timeout(LIMIT).expect("one event");
+        let event = watcher.recv_timeout(EVENTUALLY).expect("one event");
         let changed = expect_changed(event, backend);
         assert_eq!(
             changed.config.appearance.font_size, 20.0,
@@ -121,20 +118,20 @@ fn rename_save_and_delete_are_observed() {
         let tmp = path.with_extension("toml.new");
         std::fs::write(&tmp, font_size_doc(18)).unwrap();
         std::fs::rename(&tmp, &path).unwrap();
-        let changed = expect_changed(watcher.recv_timeout(LIMIT).expect("rename"), backend);
+        let changed = expect_changed(watcher.recv_timeout(EVENTUALLY).expect("rename"), backend);
         assert_eq!(changed.config.appearance.font_size, 18.0);
 
         // An in-place write to the renamed-in file is still seen.
         std::fs::write(&path, font_size_doc(19)).unwrap();
-        let changed = expect_changed(watcher.recv_timeout(LIMIT).expect("write"), backend);
+        let changed = expect_changed(watcher.recv_timeout(EVENTUALLY).expect("write"), backend);
         assert_eq!(changed.config.appearance.font_size, 19.0);
 
         // Deleting the file applies the defaults; recreating it is seen too.
         std::fs::remove_file(&path).unwrap();
-        let changed = expect_changed(watcher.recv_timeout(LIMIT).expect("delete"), backend);
+        let changed = expect_changed(watcher.recv_timeout(EVENTUALLY).expect("delete"), backend);
         assert_eq!(*changed.config, Config::default());
         std::fs::write(&path, font_size_doc(21)).unwrap();
-        let changed = expect_changed(watcher.recv_timeout(LIMIT).expect("recreate"), backend);
+        let changed = expect_changed(watcher.recv_timeout(EVENTUALLY).expect("recreate"), backend);
         assert_eq!(changed.config.appearance.font_size, 21.0);
     }
 }
@@ -146,7 +143,7 @@ fn invalid_edit_reports_error_and_keeps_last_good_config() {
         let path = store.paths().config_file();
 
         std::fs::write(&path, "[appearance\n").unwrap();
-        let event = watcher.recv_timeout(LIMIT).expect("event");
+        let event = watcher.recv_timeout(EVENTUALLY).expect("event");
         assert!(
             matches!(event, ConfigEvent::Invalid(_)),
             "{backend:?}: got {event:?}"
@@ -155,7 +152,7 @@ fn invalid_edit_reports_error_and_keeps_last_good_config() {
         assert!(store.last_error().is_some());
 
         std::fs::write(&path, font_size_doc(15)).unwrap();
-        let changed = expect_changed(watcher.recv_timeout(LIMIT).expect("event"), backend);
+        let changed = expect_changed(watcher.recv_timeout(EVENTUALLY).expect("event"), backend);
         assert_eq!(changed.config.appearance.font_size, 15.0);
         assert!(store.last_error().is_none());
     }
@@ -168,12 +165,12 @@ fn repairing_file_to_unchanged_config_still_emits_changed() {
         let path = store.paths().config_file();
 
         std::fs::write(&path, "[appearance\n").unwrap();
-        let event = watcher.recv_timeout(LIMIT).expect("event");
+        let event = watcher.recv_timeout(EVENTUALLY).expect("event");
         assert!(matches!(event, ConfigEvent::Invalid(_)), "{event:?}");
 
         // Repair to a document equal to what is applied (the defaults).
         std::fs::write(&path, "").unwrap();
-        let changed = expect_changed(watcher.recv_timeout(LIMIT).expect("recovery"), backend);
+        let changed = expect_changed(watcher.recv_timeout(EVENTUALLY).expect("recovery"), backend);
         assert_eq!(*changed.config, Config::default());
         assert!(
             store.last_error().is_none(),
@@ -235,7 +232,7 @@ fn zero_poll_interval_does_not_spin_and_still_works() {
     });
     std::fs::write(store.paths().config_file(), font_size_doc(22)).unwrap();
     let changed = expect_changed(
-        watcher.recv_timeout(LIMIT).expect("event"),
+        watcher.recv_timeout(EVENTUALLY).expect("event"),
         WatchBackend::Poll,
     );
     assert_eq!(changed.config.appearance.font_size, 22.0);
@@ -265,7 +262,7 @@ fn huge_max_wait_and_poll_interval_still_observe_an_edit() {
         });
         std::fs::write(store.paths().config_file(), font_size_doc(24)).unwrap();
         let event = watcher
-            .recv_timeout(LIMIT)
+            .recv_timeout(EVENTUALLY)
             .unwrap_or_else(|e| panic!("{backend:?}: no event within 500 ms: {e}"));
         let changed = expect_changed(event, backend);
         assert_eq!(changed.config.appearance.font_size, 24.0);
@@ -273,7 +270,7 @@ fn huge_max_wait_and_poll_interval_still_observe_an_edit() {
         // A second edit proves the thread survived the first debounce.
         std::fs::write(store.paths().config_file(), font_size_doc(25)).unwrap();
         let event = watcher
-            .recv_timeout(LIMIT)
+            .recv_timeout(EVENTUALLY)
             .unwrap_or_else(|e| panic!("{backend:?}: thread died after the first edit: {e}"));
         assert_eq!(
             expect_changed(event, backend).config.appearance.font_size,
@@ -344,7 +341,7 @@ fn native_backend_is_event_driven_not_polled() {
     });
     std::fs::write(store.paths().config_file(), font_size_doc(23)).unwrap();
     let changed = expect_changed(
-        watcher.recv_timeout(LIMIT).expect("kernel event"),
+        watcher.recv_timeout(EVENTUALLY).expect("kernel event"),
         WatchBackend::Native,
     );
     assert_eq!(changed.config.appearance.font_size, 23.0);
@@ -406,7 +403,7 @@ fn every_watcher_on_a_store_receives_every_event() {
         std::fs::write(store.paths().config_file(), font_size_doc(17)).unwrap();
         for (name, watcher) in [("first", &first), ("second", &second)] {
             let event = watcher
-                .recv_timeout(LIMIT)
+                .recv_timeout(EVENTUALLY)
                 .unwrap_or_else(|e| panic!("{backend:?}: {name} watcher saw nothing: {e}"));
             let changed = expect_changed(event, backend);
             assert_eq!(
@@ -422,7 +419,7 @@ fn every_watcher_on_a_store_receives_every_event() {
         // Dropping one watcher does not affect the other.
         drop(first);
         std::fs::write(store.paths().config_file(), font_size_doc(18)).unwrap();
-        let changed = expect_changed(second.recv_timeout(LIMIT).expect("second"), backend);
+        let changed = expect_changed(second.recv_timeout(EVENTUALLY).expect("second"), backend);
         assert_eq!(changed.config.appearance.font_size, 18.0);
     }
 }
@@ -438,7 +435,7 @@ fn invalid_edit_is_reported_once_to_each_of_two_watchers() {
         std::fs::write(store.paths().config_file(), "[appearance\n").unwrap();
         for (name, watcher) in [("first", &first), ("second", &second)] {
             let event = watcher
-                .recv_timeout(LIMIT)
+                .recv_timeout(EVENTUALLY)
                 .unwrap_or_else(|e| panic!("{backend:?}: {name} watcher saw nothing: {e}"));
             assert!(
                 matches!(event, ConfigEvent::Invalid(_)),
@@ -453,7 +450,7 @@ fn invalid_edit_is_reported_once_to_each_of_two_watchers() {
         // A different error after the first is still news.
         std::fs::write(store.paths().config_file(), "[x\n").unwrap();
         for watcher in [&first, &second] {
-            let event = watcher.recv_timeout(LIMIT).expect("second error");
+            let event = watcher.recv_timeout(EVENTUALLY).expect("second error");
             assert!(matches!(event, ConfigEvent::Invalid(_)), "{event:?}");
         }
     }
@@ -479,14 +476,16 @@ fn symlink_target_deleted_and_recreated_is_followed() {
         assert_eq!(store.config().appearance.font_size, 10.0);
         let watcher = store.watch(options(backend)).unwrap();
 
+        // A dangling link is an error, not a missing file (#262 item 1):
+        // the last good configuration stays.
         std::fs::remove_file(&target).unwrap();
-        let changed = expect_changed(watcher.recv_timeout(LIMIT).expect("delete"), backend);
-        assert_eq!(*changed.config, Config::default(), "{backend:?}");
+        expect_invalid(watcher.recv_timeout(EVENTUALLY).expect("delete"), backend);
+        assert_eq!(store.config().appearance.font_size, 10.0, "{backend:?}");
 
         std::fs::write(&target, font_size_doc(14)).unwrap();
         let changed = expect_changed(
             watcher
-                .recv_timeout(LIMIT)
+                .recv_timeout(EVENTUALLY)
                 .unwrap_or_else(|e| panic!("{backend:?}: recreated target not seen: {e}")),
             backend,
         );
@@ -494,7 +493,7 @@ fn symlink_target_deleted_and_recreated_is_followed() {
 
         // An in-place edit of the recreated target is still seen too.
         std::fs::write(&target, font_size_doc(15)).unwrap();
-        let changed = expect_changed(watcher.recv_timeout(LIMIT).expect("edit"), backend);
+        let changed = expect_changed(watcher.recv_timeout(EVENTUALLY).expect("edit"), backend);
         assert_eq!(changed.config.appearance.font_size, 15.0, "{backend:?}");
 
         // The link itself survived all of this.
@@ -525,21 +524,21 @@ fn symlink_target_directory_removed_and_recreated_is_followed() {
         let watcher = store.watch(options(backend)).unwrap();
 
         std::fs::remove_dir_all(&dotfiles).unwrap();
-        let changed = expect_changed(watcher.recv_timeout(LIMIT).expect("removed"), backend);
-        assert_eq!(*changed.config, Config::default(), "{backend:?}");
+        expect_invalid(watcher.recv_timeout(EVENTUALLY).expect("removed"), backend);
+        assert_eq!(store.config().appearance.font_size, 10.0, "{backend:?}");
 
         std::fs::create_dir(&dotfiles).unwrap();
         std::fs::write(&target, font_size_doc(16)).unwrap();
         let changed = expect_changed(
             watcher
-                .recv_timeout(recovery_limit(backend))
+                .recv_timeout(EVENTUALLY)
                 .unwrap_or_else(|e| panic!("{backend:?}: restored checkout not seen: {e}")),
             backend,
         );
         assert_eq!(changed.config.appearance.font_size, 16.0, "{backend:?}");
 
         std::fs::write(&target, font_size_doc(17)).unwrap();
-        let changed = expect_changed(watcher.recv_timeout(LIMIT).expect("after"), backend);
+        let changed = expect_changed(watcher.recv_timeout(EVENTUALLY).expect("after"), backend);
         assert_eq!(changed.config.appearance.font_size, 17.0, "{backend:?}");
     }
 }
@@ -571,7 +570,7 @@ fn symlink_target_rename_save_then_in_place_write_is_observed() {
             std::fs::rename(&tmp, &target).unwrap();
             let changed = expect_changed(
                 watcher
-                    .recv_timeout(LIMIT)
+                    .recv_timeout(EVENTUALLY)
                     .unwrap_or_else(|e| panic!("{backend:?} #{i}: rename-save not seen: {e}")),
                 backend,
             );
@@ -584,7 +583,7 @@ fn symlink_target_rename_save_then_in_place_write_is_observed() {
             std::fs::write(&target, font_size_doc((saved + 1).into())).unwrap();
             let changed = expect_changed(
                 watcher
-                    .recv_timeout(LIMIT)
+                    .recv_timeout(EVENTUALLY)
                     .unwrap_or_else(|e| panic!("{backend:?} #{i}: in-place write not seen: {e}")),
                 backend,
             );
@@ -609,14 +608,14 @@ fn removing_and_recreating_the_root_directory_is_followed() {
         assert_eq!(changed.config.appearance.font_size, 25.0);
 
         std::fs::remove_dir_all(paths.root()).unwrap();
-        let changed = expect_changed(watcher.recv_timeout(LIMIT).expect("removed"), backend);
+        let changed = expect_changed(watcher.recv_timeout(EVENTUALLY).expect("removed"), backend);
         assert_eq!(*changed.config, Config::default());
 
         std::fs::create_dir_all(paths.root()).unwrap();
         std::fs::write(paths.config_file(), font_size_doc(30)).unwrap();
         let changed = expect_changed(
             watcher
-                .recv_timeout(recovery_limit(backend))
+                .recv_timeout(EVENTUALLY)
                 .unwrap_or_else(|e| panic!("{backend:?}: recreated: {e}")),
             backend,
         );
@@ -625,7 +624,7 @@ fn removing_and_recreating_the_root_directory_is_followed() {
         // And kernel events are back in use afterwards: a further write is
         // still seen.
         std::fs::write(paths.config_file(), font_size_doc(31)).unwrap();
-        let changed = expect_changed(watcher.recv_timeout(LIMIT).expect("after"), backend);
+        let changed = expect_changed(watcher.recv_timeout(EVENTUALLY).expect("after"), backend);
         assert_eq!(changed.config.appearance.font_size, 31.0);
     }
 }
@@ -645,7 +644,7 @@ fn unreadable_then_restored_file_is_followed() {
         let (_dir, store, watcher) = open_watched(options(backend));
         let path = store.paths().config_file();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        match watcher.recv_timeout(LIMIT) {
+        match watcher.recv_timeout(EVENTUALLY) {
             Ok(ConfigEvent::Invalid(_)) => {}
             other => panic!("{backend:?}: expected Invalid, got {other:?}"),
         }
@@ -656,7 +655,7 @@ fn unreadable_then_restored_file_is_followed() {
         // though the content is the same.
         let changed = expect_changed(
             watcher
-                .recv_timeout(recovery_limit(backend))
+                .recv_timeout(EVENTUALLY)
                 .unwrap_or_else(|e| panic!("{backend:?}: recovery not seen: {e}")),
             backend,
         );
@@ -667,7 +666,7 @@ fn unreadable_then_restored_file_is_followed() {
         std::fs::write(&path, font_size_doc(45)).unwrap();
         let changed = expect_changed(
             watcher
-                .recv_timeout(LIMIT)
+                .recv_timeout(EVENTUALLY)
                 .unwrap_or_else(|e| panic!("{backend:?}: edit after recovery not seen: {e}")),
             backend,
         );
@@ -701,7 +700,7 @@ fn watch_starts_over_an_unopenable_file_and_recovers() {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let changed = expect_changed(
             watcher
-                .recv_timeout(recovery_limit(backend))
+                .recv_timeout(EVENTUALLY)
                 .unwrap_or_else(|e| panic!("{backend:?}: recovery not seen: {e}")),
             backend,
         );
@@ -723,11 +722,75 @@ fn watch_starts_over_an_unopenable_file_and_recovers() {
         std::fs::write(&other, font_size_doc(22)).unwrap();
         let changed = expect_changed(
             watcher
-                .recv_timeout(recovery_limit(backend))
+                .recv_timeout(EVENTUALLY)
                 .unwrap_or_else(|e| panic!("{backend:?}: resolved cycle not seen: {e}")),
             backend,
         );
         assert_eq!(changed.config.appearance.font_size, 22.0, "{backend:?}");
+    }
+}
+
+/// #262 item 9, the adversarial e2e case `inplace:150,10,300,0`: launched
+/// with a `config.toml` that does not load (so clipboard writes are
+/// refused), the same broken file is saved in place ten times by an editor
+/// that truncates it, leaves it empty for 150 ms (a debounce: the watcher
+/// reads the empty file) and then writes it, 300 ms apart. Writes stay
+/// refused throughout, sampled continuously, on both backends.
+#[test]
+fn in_place_saves_from_a_broken_launch_never_turn_clipboard_writes_on() {
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    const BROKEN: &[u8] =
+        b"# my config\n[appearance]\nfont_size = 14\n[terminal]\nclipboard_write = False\n";
+    for backend in BACKENDS {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(dir.path());
+        std::fs::write(paths.config_file(), BROKEN).unwrap();
+        // As `App::with_config_dir` opens it.
+        let store = ConfigStore::in_memory(paths.clone(), Config::default());
+        assert!(store.reload().is_err(), "{backend:?}");
+        assert!(!store.config().terminal.clipboard_write, "{backend:?}");
+        let watcher = store.watch(options(backend)).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let on = Arc::new(AtomicUsize::new(0));
+        let sampler = {
+            let (store, stop, on) = (store.clone(), Arc::clone(&stop), Arc::clone(&on));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if store.config().terminal.clipboard_write {
+                        on.fetch_add(1, Ordering::Relaxed);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+        let mut events = 0;
+        for _ in 0..10 {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(paths.config_file())
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+            file.write_all(BROKEN).unwrap();
+            drop(file);
+            std::thread::sleep(Duration::from_millis(300));
+            while watcher.try_recv().is_ok() {
+                events += 1;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        stop.store(true, Ordering::Relaxed);
+        sampler.join().unwrap();
+        assert_eq!(
+            on.load(Ordering::Relaxed),
+            0,
+            "{backend:?}: writes turned on ({events} events)"
+        );
+        assert!(!store.config().terminal.clipboard_write, "{backend:?}");
+        assert!(events > 0, "{backend:?}: the watcher saw no save at all");
     }
 }
 

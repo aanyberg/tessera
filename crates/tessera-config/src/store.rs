@@ -3,7 +3,7 @@
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, RwLock};
 
-use crate::load::{Loaded, Warning, load_file, write_default_if_missing};
+use crate::load::{Loaded, Warning, load_file_noting_empty, write_default_if_missing};
 use crate::paths::ConfigPaths;
 use crate::theme::{ResolvedTheme, Theme};
 use crate::watch::{ConfigEvent, ThemesFingerprint, WatchOptions, Watcher};
@@ -28,6 +28,11 @@ use crate::{Config, Error};
 /// configuration with `clipboard_write = false` until a load succeeds.
 /// Once a load has succeeded (a missing file counts: it applies the
 /// defaults), a failed load keeps the last good configuration unchanged.
+/// A `config.toml` symlink whose target is missing is a failed load, not a
+/// missing file (#262 item 1). While writes are refused this way, a file
+/// that is empty (or only whitespace) applies the defaults but keeps them
+/// refused: it is what a save that truncates before it writes leaves for a
+/// moment, so only a load of a non-empty file turns them on (#262 item 9).
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
     paths: ConfigPaths,
@@ -48,8 +53,12 @@ pub(crate) struct State {
     /// Why the most recent load failed; `None` when it succeeded.
     pub(crate) error: Option<Error>,
     /// Whether a load has succeeded on this store ([`ConfigStore::apply`]
-    /// ran). Until one has, [`ConfigStore::record_error`] fails closed.
+    /// ran, other than for an empty file while `refusing`). Until one has,
+    /// [`ConfigStore::record_error`] fails closed.
     loaded: bool,
+    /// Whether clipboard writes are refused because a load failed before
+    /// any succeeded; cleared by the first load of a non-empty file.
+    refusing: bool,
     /// Every live [`Watcher`]'s event channel. A change applied by any
     /// watcher thread is sent to all of them, so several watchers on one
     /// store each see every event. A watcher thread removes its own entry
@@ -65,6 +74,20 @@ pub(crate) struct State {
     /// thread goes on, for tests of what the watcher does after reporting.
     #[cfg(test)]
     on_broadcast: Option<fn(&ConfigPaths, &ConfigEvent)>,
+    /// Called by [`ConfigStore::apply`] once the new configuration is in
+    /// place, on the applying thread with the store unlocked: a reader of
+    /// [`ConfigStore::config`] that reacts before the event is sent.
+    #[cfg(test)]
+    on_apply: Option<fn(&ConfigPaths)>,
+}
+
+/// A load of `config.toml` from disk, before it is applied.
+#[derive(Debug)]
+pub(crate) struct FromDisk {
+    pub(crate) loaded: Loaded,
+    /// Whether the file held nothing but whitespace (a missing file is not
+    /// empty: it is a successful load of the defaults).
+    pub(crate) empty: bool,
 }
 
 impl ConfigStore {
@@ -105,12 +128,7 @@ impl ConfigStore {
                 store.apply(loaded);
             }
             Err(error) => {
-                tracing::error!(
-                    target: "tessera_config",
-                    path = %file.display(),
-                    %error,
-                    "config could not be loaded; using defaults, with clipboard writes refused, until it is fixed"
-                );
+                // Logged there, once (#262 item 6).
                 store.record_error(error);
             }
         }
@@ -134,11 +152,14 @@ impl ConfigStore {
                 theme_warnings: Vec::new(),
                 error: None,
                 loaded: false,
+                refusing: false,
                 subscribers: Vec::new(),
                 next_subscription: 0,
                 themes: None,
                 #[cfg(test)]
                 on_broadcast: None,
+                #[cfg(test)]
+                on_apply: None,
             })),
         }
     }
@@ -242,7 +263,8 @@ impl ConfigStore {
     /// **Create one watcher per process** and fan its events out to every
     /// window. Several watchers on the same store each receive every event
     /// too, but each costs a thread, a kernel queue and about seven file
-    /// descriptors, and gains nothing over a single one.
+    /// descriptors (up to eight more while the configured theme's file does
+    /// not load), and gains nothing over a single one.
     pub fn watch(&self, options: WatchOptions) -> Result<Watcher, Error> {
         Watcher::spawn(self.clone(), options)
     }
@@ -288,32 +310,80 @@ impl ConfigStore {
         self.write().on_broadcast = hook;
     }
 
-    pub(crate) fn load_from_disk(&self) -> Result<Loaded, Error> {
-        match load_file(&self.paths.config_file()) {
-            Ok(loaded) => Ok(loaded),
-            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(Loaded {
-                config: Config::default(),
-                warnings: Vec::new(),
-            }),
+    /// Sets the hook [`ConfigStore::apply`] calls once a new configuration
+    /// is in place.
+    #[cfg(test)]
+    pub(crate) fn set_on_apply(&self, hook: Option<fn(&ConfigPaths)>) {
+        self.write().on_apply = hook;
+    }
+
+    /// Reads `config.toml`. A missing file is the defaults; a symlink whose
+    /// target is missing is an error, like a symlink cycle, since the file
+    /// the user keeps their settings in is somewhere and could not be read
+    /// (#262 item 1).
+    pub(crate) fn load_from_disk(&self) -> Result<FromDisk, Error> {
+        let file = self.paths.config_file();
+        match load_file_noting_empty(&file) {
+            Ok((loaded, empty)) => Ok(FromDisk { loaded, empty }),
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                if std::fs::symlink_metadata(&file).is_ok() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "config.toml is a symlink whose target is missing",
+                    )
+                    .into());
+                }
+                Ok(FromDisk {
+                    loaded: Loaded {
+                        config: Config::default(),
+                        warnings: Vec::new(),
+                    },
+                    empty: false,
+                })
+            }
             Err(e) => Err(e),
         }
     }
 
     /// Replaces the applied configuration and clears any remembered error.
     ///
+    /// While clipboard writes are refused after a failed load, an empty
+    /// file is applied with them still refused and does not count as a
+    /// successful load (see [`ConfigStore`]).
+    ///
     /// Returns `None` when the configuration is unchanged and no error was
     /// pending; `Some` when it changed or when this load recovers from a
     /// previous failure.
-    pub(crate) fn apply(&self, loaded: Loaded) -> Option<Arc<Config>> {
+    pub(crate) fn apply(&self, from: FromDisk) -> Option<Arc<Config>> {
+        let FromDisk {
+            loaded: Loaded {
+                mut config,
+                warnings,
+            },
+            empty,
+        } = from;
         let mut state = self.write();
-        state.loaded = true;
+        if empty && state.refusing {
+            config.terminal.clipboard_write = false;
+        } else {
+            state.loaded = true;
+            state.refusing = false;
+        }
         let recovered = state.error.take().is_some();
-        if !recovered && *state.config == loaded.config && state.warnings == loaded.warnings {
+        if !recovered && *state.config == config && state.warnings == warnings {
             return None;
         }
-        let config = Arc::new(loaded.config);
+        let config = Arc::new(config);
         state.config = Arc::clone(&config);
-        state.warnings = loaded.warnings;
+        state.warnings = warnings;
+        #[cfg(test)]
+        {
+            let hook = state.on_apply;
+            drop(state);
+            if let Some(hook) = hook {
+                hook(&self.paths);
+            }
+        }
         Some(config)
     }
 
@@ -333,10 +403,16 @@ impl ConfigStore {
         news
     }
 
-    /// Remembers a failed load. The applied configuration is untouched,
-    /// except that while no load has succeeded on this store its
+    /// Remembers a failed load and logs it, once per error: a file that
+    /// stays broken across several loads (two watchers, a reload and a
+    /// watcher) is one warning (#262 item 6). The applied configuration is
+    /// untouched, except that while no load has succeeded on this store its
     /// `terminal.clipboard_write` is set to `false` (fail closed; see
-    /// [`ConfigStore`]), which is logged once.
+    /// [`ConfigStore`]), which the warning says.
+    ///
+    /// Turning writes off sends no [`ConfigEvent::Changed`]: the caller
+    /// reports the error as [`ConfigEvent::Invalid`], and a consumer reads
+    /// the setting from [`ConfigStore::config`] when it acts (#262 item 7).
     ///
     /// Returns whether the error is news: `false` when the store already
     /// holds an error with the same text, so two watchers that both load
@@ -348,17 +424,34 @@ impl ConfigStore {
             .error
             .as_ref()
             .is_some_and(|previous| previous.to_string() == error.to_string());
-        state.error = Some(error);
-        if !state.loaded && state.config.terminal.clipboard_write {
-            let mut config = (*state.config).clone();
-            config.terminal.clipboard_write = false;
-            state.config = Arc::new(config);
-            tracing::warn!(
-                target: "tessera_config",
-                path = %self.paths.config_file().display(),
-                "config.toml could not be loaded at launch; clipboard writes (OSC 52) are refused until it loads"
-            );
+        if !state.loaded {
+            state.refusing = true;
+            if state.config.terminal.clipboard_write {
+                let mut config = (*state.config).clone();
+                config.terminal.clipboard_write = false;
+                state.config = Arc::new(config);
+            }
         }
+        // The error's text is escaped where it quotes the file (a parse
+        // error; S8), and an I/O error's names only the system's reason.
+        if !same {
+            if state.loaded {
+                tracing::warn!(
+                    target: "tessera_config",
+                    path = %self.paths.config_file().display(),
+                    %error,
+                    "config.toml could not be loaded; keeping the last good configuration"
+                );
+            } else {
+                tracing::warn!(
+                    target: "tessera_config",
+                    path = %self.paths.config_file().display(),
+                    %error,
+                    "config.toml could not be loaded; using the defaults, with clipboard writes (OSC 52) refused until it loads"
+                );
+            }
+        }
+        state.error = Some(error);
         !same
     }
 
@@ -565,12 +658,21 @@ mod tests {
             "the broken file is left for the user to fix"
         );
 
-        // Repairing the file to something equal to the applied defaults still
-        // counts as a change, so the app can clear its error state.
+        // Emptying the file clears the error (reported, so the app can
+        // clear its error state) but keeps clipboard writes refused: an
+        // empty file is what a truncating save leaves for a moment (#262
+        // item 9).
         std::fs::write(paths.config_file(), "").unwrap();
         let applied = store.reload().unwrap().expect("recovery is reported");
-        assert_eq!(*applied, Config::default());
+        assert_eq!(*applied, refusing_defaults());
         assert!(store.last_error().is_none());
+        assert!(store.reload().unwrap().is_none(), "and only once");
+
+        // Repairing the file to something equal to the defaults turns them
+        // on.
+        std::fs::write(paths.config_file(), "# nothing set\n").unwrap();
+        let applied = store.reload().unwrap().expect("repair is reported");
+        assert_eq!(*applied, Config::default());
         assert!(store.reload().unwrap().is_none(), "and only once");
     }
 
@@ -718,5 +820,176 @@ mod tests {
             Config::default()
         );
         assert!(store.last_error().is_none());
+    }
+
+    /// What a subscriber records of an event at `WARN` or above: every
+    /// field, `name=value`, the values as they would be formatted.
+    struct Capture(std::sync::Mutex<Vec<String>>);
+
+    struct Fields<'a>(&'a mut String);
+
+    use std::fmt::Write as _;
+
+    impl tracing::field::Visit for Fields<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            let _ = write!(self.0, "{}={value} ", field.name());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let _ = write!(self.0, "{}={value:?} ", field.name());
+        }
+    }
+
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            // More verbose levels compare greater.
+            if *event.metadata().level() > tracing::Level::WARN {
+                return;
+            }
+            let mut line = String::new();
+            event.record(&mut Fields(&mut line));
+            self.0.lock().unwrap().push(line);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// The warnings and errors `f` logs on this thread.
+    fn logged_warnings(f: impl FnOnce()) -> Vec<String> {
+        let capture = std::sync::Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
+        tracing::subscriber::with_default(std::sync::Arc::clone(&capture), f);
+        capture.0.lock().unwrap().clone()
+    }
+
+    /// #262 item 6: a broken `config.toml` at open is one warning, which
+    /// says writes are refused and why, and loading the same broken file
+    /// again logs nothing more.
+    #[test]
+    fn a_broken_file_at_open_is_one_warning() {
+        for (case, bytes) in BROKEN {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = ConfigPaths::new(dir.path());
+            std::fs::write(paths.config_file(), bytes).unwrap();
+            let mut store = None;
+            let lines = logged_warnings(|| store = Some(ConfigStore::open(paths.clone()).unwrap()));
+            let [line] = &lines[..] else {
+                panic!("{case}: {lines:#?}");
+            };
+            assert!(
+                line.contains("clipboard writes (OSC 52) refused"),
+                "{case}: {line}"
+            );
+            let error = store.as_ref().unwrap().last_error().unwrap().to_string();
+            assert!(line.contains(&error), "{case}: {line}");
+            let again = logged_warnings(|| {
+                assert!(store.as_ref().unwrap().reload().is_err());
+            });
+            assert_eq!(again, Vec::<String>::new(), "{case}");
+        }
+    }
+
+    /// #262 items 4 and 10 at the log: a parse error quoting a line with a
+    /// raw ESC, a line separator and a right-to-left override reaches the
+    /// warning escaped, on one line.
+    #[test]
+    fn a_parse_error_is_logged_escaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(dir.path());
+        std::fs::write(
+            paths.config_file(),
+            "[terminal]\nclipboard_write = off # \u{1b}]52;c;x\u{7}\u{2028}\u{202e}\n",
+        )
+        .unwrap();
+        let lines = logged_warnings(|| drop(ConfigStore::open(paths.clone()).unwrap()));
+        let [line] = &lines[..] else {
+            panic!("{lines:#?}");
+        };
+        assert!(
+            !line.chars().any(|c| c.is_control()
+                || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}')),
+            "{line:?}"
+        );
+        assert!(
+            line.contains("\\u{1b}]52") && line.contains("\\u{202e}"),
+            "{line}"
+        );
+    }
+
+    /// #262 item 1: a `config.toml` symlink whose target is missing fails
+    /// closed at launch, like a symlink cycle, rather than counting as a
+    /// missing file; no default file is written through the link, and a
+    /// target that appears later applies normally.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_at_launch_refuses_clipboard_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Tessera");
+        std::fs::create_dir(&root).unwrap();
+        let target = dir.path().join("dotfiles").join("tessera.toml");
+        std::os::unix::fs::symlink(&target, root.join("config.toml")).unwrap();
+        let store = ConfigStore::open(ConfigPaths::new(&root)).unwrap();
+        assert_eq!(*store.config(), refusing_defaults());
+        assert!(
+            matches!(store.last_error(), Some(Error::Io(_))),
+            "{:?}",
+            store.last_error()
+        );
+        assert!(!target.exists(), "nothing written through the link");
+        assert!(store.reload().is_err(), "still dangling");
+        assert_eq!(*store.config(), refusing_defaults());
+
+        std::fs::create_dir(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "[appearance]\nfont_size = 15\n").unwrap();
+        let applied = store.reload().unwrap().expect("the target appeared");
+        assert_eq!(applied.appearance.font_size, 15.0);
+        assert!(applied.terminal.clipboard_write);
+    }
+
+    /// #262 item 9: while writes are refused after a failed load, an empty
+    /// or whitespace-only file keeps them refused, however often it loads;
+    /// only a non-empty file turns them on. Without a failure first, an
+    /// empty file is the defaults with writes on.
+    #[test]
+    fn an_empty_file_turns_clipboard_writes_on_only_without_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(dir.path());
+        std::fs::write(paths.config_file(), "").unwrap();
+        let store = ConfigStore::open(paths.clone()).unwrap();
+        assert_eq!(*store.config(), Config::default(), "a clean launch");
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(dir.path());
+        std::fs::write(paths.config_file(), "[terminal\n").unwrap();
+        let store = ConfigStore::open(paths.clone()).unwrap();
+        for empty in ["", " \n\t\r\n", ""] {
+            std::fs::write(paths.config_file(), empty).unwrap();
+            let _ = store.reload().unwrap();
+            assert_eq!(*store.config(), refusing_defaults(), "{empty:?}");
+            assert!(store.last_error().is_none());
+        }
+        // Broken again: still refused (the store never loaded).
+        std::fs::write(paths.config_file(), "[terminal\n").unwrap();
+        assert!(store.reload().is_err());
+        assert_eq!(*store.config(), refusing_defaults());
+        std::fs::write(paths.config_file(), "[terminal]\n").unwrap();
+        assert_eq!(*store.reload().unwrap().unwrap(), Config::default());
+        // Once a non-empty file loaded, an empty one is just the defaults.
+        std::fs::write(paths.config_file(), "").unwrap();
+        assert_eq!(store.reload().unwrap(), None);
+        assert_eq!(*store.config(), Config::default());
     }
 }
