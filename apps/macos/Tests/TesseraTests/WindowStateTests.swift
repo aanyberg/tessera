@@ -4,16 +4,30 @@ import XCTest
 
 @testable import Tessera
 
-/// User defaults of a suite of the test's own that count the window state's
-/// saves.
+/// User defaults kept in memory that count the window state's saves.
+///
+/// Nothing reaches the suite named at `init`: a suite's file stays in
+/// ~/Library/Preferences even after its domain is removed, as cfprefsd
+/// writes the empty domain back after the test host quits. The typed
+/// getters and setters (`bool(forKey:)`, `data(forKey:)`, `set(_:forKey:)`
+/// with a `Bool`) go through these three overrides.
 final class CountingDefaults: UserDefaults, @unchecked Sendable {
     private(set) var stateSaves = 0
+    private var values: [String: Any] = [:]
+
+    override func object(forKey defaultName: String) -> Any? {
+        values[defaultName]
+    }
 
     override func set(_ value: Any?, forKey defaultName: String) {
         if defaultName == WindowStateStore.key {
             stateSaves += 1
         }
-        super.set(value, forKey: defaultName)
+        values[defaultName] = value
+    }
+
+    override func removeObject(forKey defaultName: String) {
+        values[defaultName] = nil
     }
 }
 
@@ -42,8 +56,8 @@ final class WindowStateTests: XCTestCase {
         XCTAssertTrue(appDelegate.windowControllers.isEmpty)
         appDelegate.spawnOptions = .init()
         appDelegate = nil
-        defaults.removePersistentDomain(forName: suiteName)
         defaults = nil
+        XCTAssertNil(UserDefaults.standard.persistentDomain(forName: suiteName), "nothing was written to the suite")
     }
 
     private static let screen = CGRect(x: 0, y: 0, width: 1440, height: 875)
@@ -79,10 +93,8 @@ final class WindowStateTests: XCTestCase {
         XCTAssertFalse(WindowStateStore.quitKeepsWindows(defaults), "Close windows when quitting: on")
         defaults.set(true, forKey: "NSQuitAlwaysKeepsWindows")
         XCTAssertTrue(WindowStateStore.quitKeepsWindows(defaults), "Close windows when quitting: off")
+        // In memory, so a global NSQuitAlwaysKeepsWindows does not show here.
         defaults.removeObject(forKey: "NSQuitAlwaysKeepsWindows")
-        guard defaults.object(forKey: "NSQuitAlwaysKeepsWindows") == nil else {
-            throw XCTSkip("this Mac sets NSQuitAlwaysKeepsWindows globally; the unset case cannot be checked")
-        }
         XCTAssertFalse(WindowStateStore.quitKeepsWindows(defaults), "unset, macOS's default: no restore, as AppKit")
     }
 
