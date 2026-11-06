@@ -137,17 +137,27 @@ Workflow, commit conventions and the release process are in [`CONTRIBUTING.md`](
 
 ### Architecture
 
-```
-Tessera.app (Swift, thin)   windows · tabs · menus · Preferences · input
-        │  C ABI (tessera-ffi)
-tessera-app-core            workspace model · commands · config · plugin host · control
-  pty · vt · grid · term · render (wgpu/Metal) · search · shell-integration
-  config · plugin-api · protocol · control
+A thin Swift shell over a modular Rust core. Dependencies point downward only, everything below the shell is
+OS-agnostic, plugins and the control socket share one host API, and everything that crosses a boundary is
+`serde`-serializable. The full picture, the crate map and the data flow are in
+[`docs/architecture.md`](docs/architecture.md), and the decisions behind them in [`docs/adr/`](docs/adr/).
+
+<details>
+<summary>Layers at a glance</summary>
+
+```mermaid
+flowchart TB
+    app["Tessera.app (Swift): windows · tabs · menus · input"]
+    ffi["tessera-ffi: C ABI"]
+    core["tessera-app-core: sessions · commands · config · plugin host · control"]
+    engine["pty · vt · grid · term · render (wgpu/Metal) · search · shell-integration"]
+    contracts["config · plugin-api · protocol · control"]
+    app --> ffi --> core
+    core --> engine
+    core --> contracts
 ```
 
-Dependencies point downward only; everything below the Swift shell is OS-agnostic; plugins and the control socket
-share one host API; everything that crosses a boundary is `serde`-serializable. Details in
-[`docs/architecture.md`](docs/architecture.md) and the ADRs in [`docs/adr/`](docs/adr/).
+</details>
 
 ### Development with agents
 
