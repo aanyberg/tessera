@@ -26,8 +26,6 @@ Requires macOS 15 or later, on Apple silicon or Intel.
    [latest release](https://github.com/aanyberg/tessera/releases/latest) and unzip it.
 2. Move `Tessera.app` to `/Applications` and open it.
 
-Releases are Developer ID signed and notarized, so Tessera opens without a Gatekeeper warning.
-
 ## User guide
 
 ### Windows, tabs and shortcuts
@@ -105,12 +103,7 @@ rules are in [`docs/security.md`](docs/security.md).
 
 ## Roadmap
 
-Scheduled work is tracked in [GitHub milestones](https://github.com/aanyberg/tessera/milestones):
-
-- [0.1.0](https://github.com/aanyberg/tessera/milestone/1): the daily-drivable basics. A headless emulator that
-  passes the vttest basics, a Metal renderer, native windows with tabs, and `config.toml` from disk.
-- [0.2.0](https://github.com/aanyberg/tessera/milestone/2): the product surface. Splits, profiles, a Preferences
-  window, themes, transparency and blur, search, and the first built-in plugins.
+Scheduled work is tracked in [GitHub milestones](https://github.com/aanyberg/tessera/milestones).
 
 **Where it is heading.** The core is built so a terminal can be driven and extended, not only used: a control socket
 and a `tessera` command-line client, an MCP server so agents can work with your terminals (with your consent), a
