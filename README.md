@@ -92,8 +92,8 @@ Work is tracked in [GitHub milestones](https://github.com/aanyberg/tessera/miles
 
 | Milestone | Scope |
 |---|---|
-| [0.1.0](https://github.com/aanyberg/tessera/milestone/1) | Daily-drivable basics: headless emulator passing vttest basics, wgpu renderer, native window with tabs, one profile, `config.toml` from disk |
-| [0.2.0](https://github.com/aanyberg/tessera/milestone/2) | Product surface: splits, profiles, Preferences window, themes, transparency/blur, shell integration marks, search, built-in plugin host, signed builds |
+| [0.1.0](https://github.com/aanyberg/tessera/milestone/1) | Daily-drivable basics: headless emulator passing vttest basics, wgpu renderer, native window with tabs, one profile, `config.toml` from disk, Developer ID signed and notarized download once the release secrets are added |
+| [0.2.0](https://github.com/aanyberg/tessera/milestone/2) | Product surface: splits, profiles, Preferences window, themes, transparency/blur, shell integration marks, search, built-in plugin host |
 | [Backlog](https://github.com/aanyberg/tessera/milestone/3) | Control socket and CLI, MCP adapter, agent-usage plugin, WASM plugins, images, tmux, Linux frontend |
 
 A 1.0.0 milestone will be defined once the 0.x releases are stable.

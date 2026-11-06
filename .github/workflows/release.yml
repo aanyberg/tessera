@@ -1,9 +1,14 @@
 # Release: on a `v*` tag, build the universal TesseraCore.xcframework, archive
-# Tessera.app with xcodebuild (ad-hoc signed, not notarized), zip it and attach
-# it to a GitHub Release whose notes come from git-cliff (cliff.toml).
+# Tessera.app with xcodebuild, zip it and attach it to a GitHub Release whose
+# notes come from git-cliff (cliff.toml).
 #
-# Developer ID signing and notarization are tracked for 0.2.0; until then users
-# must strip the quarantine attribute before launching (see CONTRIBUTING.md).
+# When the six APPLE_* repository secrets exist (CONTRIBUTING.md, "Release
+# signing") the app is re-signed with the Developer ID certificate and the
+# hardened runtime, notarized with notarytool and stapled before it is zipped.
+# Without them (forks, tags before the secrets were added) those steps are
+# skipped with a notice and the ad-hoc signed build ships as before; users then
+# strip the quarantine attribute (see CONTRIBUTING.md). The temporary keychain
+# holding the certificate is deleted at the end of the job, even on failure.
 name: Release
 
 on:
@@ -26,8 +31,10 @@ defaults:
 
 jobs:
   release:
-    name: Unsigned universal Tessera.app
+    name: Universal Tessera.app
     runs-on: macos-15
+    # Notarization normally takes minutes; notarytool below gives up after 45.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
@@ -74,6 +81,42 @@ jobs:
           fi
           echo "HEAD is on $DEFAULT_BRANCH; Cargo.toml version $cargo_version matches the tag"
 
+      - name: Detect signing credentials
+        id: signing
+        env:
+          EVENT: ${{ github.event_name }}
+          IS_FORK: ${{ github.event.repository.fork }}
+          P12: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # Only presence is tested; the values are never printed.
+          names=(APPLE_DEVELOPER_ID_P12_BASE64 APPLE_DEVELOPER_ID_P12_PASSWORD APPLE_NOTARY_KEY_P8_BASE64 APPLE_NOTARY_KEY_ID APPLE_NOTARY_ISSUER_ID APPLE_TEAM_ID)
+          values=("$P12" "$P12_PASSWORD" "$NOTARY_KEY" "$NOTARY_KEY_ID" "$NOTARY_ISSUER_ID" "$TEAM_ID")
+          missing=()
+          for i in "${!names[@]}"; do
+            # A secret holding only whitespace or a newline counts as unset.
+            [[ -n "${values[$i]//[[:space:]]/}" ]] || missing+=("${names[$i]}")
+          done
+          enabled=false
+          if [[ "$EVENT" != push ]]; then
+            echo "::notice title=Developer ID signing skipped::signing never runs for '$EVENT' events, only for tag pushes; shipping the ad-hoc signed build"
+          elif [[ "$IS_FORK" == true ]]; then
+            echo "::notice title=Developer ID signing skipped::signing never runs in a fork; shipping the ad-hoc signed build"
+          elif (( ${#missing[@]} == ${#names[@]} )); then
+            echo "::notice title=Developer ID signing skipped::no APPLE_* signing secrets are set; shipping the ad-hoc signed, not notarized build (CONTRIBUTING.md, Release signing)"
+          elif (( ${#missing[@]} > 0 )); then
+            echo "::error::signing secrets are only partly set; missing: ${missing[*]}. Set all six or none (CONTRIBUTING.md, Release signing)"
+            exit 1
+          else
+            enabled=true
+            echo "All signing secrets present: the app will be Developer ID signed and notarized"
+          fi
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
@@ -89,8 +132,113 @@ jobs:
       - name: Build universal TesseraCore.xcframework
         run: just xcframework
 
+      # The archive is always built ad-hoc signed (hardened runtime on); with
+      # credentials the next steps replace that signature in place.
       - name: Archive Tessera.app (Release, ad-hoc signed)
         run: just archive "${{ steps.version.outputs.short }}" "${{ steps.version.outputs.build }}"
+
+      - name: Import the Developer ID certificate into a temporary keychain
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          P12: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          umask 077
+          keychain="$RUNNER_TEMP/tessera-release.keychain-db"
+          p12="$RUNNER_TEMP/developer-id.p12"
+          # Recorded first so the cleanup step finds the keychain even if a later command fails.
+          echo "KEYCHAIN_PATH=$keychain" >> "$GITHUB_ENV"
+          echo "P12_PATH=$p12" >> "$GITHUB_ENV"
+          keychain_password="$(openssl rand -base64 24)"
+          echo "::add-mask::$keychain_password"
+          printf '%s' "$P12" | base64 --decode > "$p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          # Stay unlocked for the whole job (6 h) so codesign never prompts.
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$p12" -k "$keychain" -P "$P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security > /dev/null
+          rm -f "$p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" > /dev/null
+          # Put it first in the user search list so codesign resolves the chain.
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          identities="$(security find-identity -p codesigning "$keychain" | grep '"Developer ID Application:' || true)"
+          if [[ -z "$identities" ]]; then
+            echo "::error::the .p12 holds no 'Developer ID Application' identity (a 'Developer ID Installer' or development certificate does not sign apps)"
+            exit 1
+          fi
+          # Sign by SHA-1 so the identity name never needs quoting.
+          awk 'NR == 1 {print "SIGN_IDENTITY=" $2}' <<< "$identities" >> "$GITHUB_ENV"
+          echo "Imported $(wc -l <<< "$identities" | tr -d ' ') Developer ID Application identity(ies) into the temporary keychain"
+
+      - name: Sign Tessera.app (Developer ID, hardened runtime)
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          app="apps/macos/build/Tessera.xcarchive/Products/Applications/Tessera.app"
+          test -d "$app"
+          sign=(codesign --force --timestamp --options runtime --keychain "$KEYCHAIN_PATH" --sign "$SIGN_IDENTITY")
+          # Nested code (none today: TesseraKit is static) is signed inside-out, never with --deep.
+          while IFS= read -r nested; do
+            [[ -n "$nested" ]] || continue
+            echo "signing nested code: $nested"
+            "${sign[@]}" "$nested"
+          done < <(find "$app/Contents" -depth \( -name '*.framework' -o -name '*.xpc' -o -name '*.appex' -o -name '*.app' -o -name '*.dylib' \))
+          # Entitlements: see CONTRIBUTING.md, Release signing (none beyond the file the ad-hoc build already uses).
+          "${sign[@]}" --entitlements apps/macos/Resources/Tessera.entitlements "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          details="$(codesign -dvv "$app" 2>&1)"
+          grep -q '^Authority=Developer ID Application:' <<< "$details" || { echo "::error::signature is not from a Developer ID Application certificate"; exit 1; }
+          grep -q '^TeamIdentifier='"$TEAM_ID"'$' <<< "$details" || { echo "::error::TeamIdentifier does not match APPLE_TEAM_ID"; exit 1; }
+          grep -q 'flags=.*(runtime)' <<< "$details" || { echo "::error::hardened runtime flag missing"; exit 1; }
+          grep -q '^Timestamp=' <<< "$details" || { echo "::error::no secure timestamp (notarization requires one)"; exit 1; }
+          # A debuggable build is rejected by the notary service; fail here with a clearer message.
+          if codesign -d --entitlements :- "$app" 2> /dev/null | grep -q 'com.apple.security.get-task-allow'; then
+            echo "::error::get-task-allow entitlement present in a release build"
+            exit 1
+          fi
+          echo "Signed $app (Team ID matches, hardened runtime, secure timestamp)"
+
+      - name: Notarize and staple Tessera.app
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          umask 077
+          app="apps/macos/build/Tessera.xcarchive/Products/Applications/Tessera.app"
+          key="$RUNNER_TEMP/AuthKey.p8"
+          echo "NOTARY_KEY_PATH=$key" >> "$GITHUB_ENV"
+          printf '%s' "$NOTARY_KEY" | base64 --decode > "$key"
+          auth=(--key "$key" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID")
+          # A separate zip for the notary service; the release zip is built by `just package` after stapling.
+          submit_zip="$RUNNER_TEMP/notarize/Tessera-notarize.zip"
+          result="$RUNNER_TEMP/notarize/submit.json"
+          mkdir -p "$RUNNER_TEMP/notarize"
+          ditto -c -k --keepParent --norsrc "$app" "$submit_zip"
+          # notarytool exits non-zero for a rejection and for a transport error; inspect the JSON either way.
+          rc=0
+          xcrun notarytool submit "$submit_zip" "${auth[@]}" --wait --timeout 45m --output-format json > "$result" || rc=$?
+          id="$(plutil -extract id raw -o - -- "$result" 2> /dev/null || true)"
+          status="$(plutil -extract status raw -o - -- "$result" 2> /dev/null || true)"
+          echo "notarytool exit $rc, submission '${id:-none}', status '${status:-none}'"
+          if [[ "$status" != Accepted ]]; then
+            echo "::error::notarization status is '${status:-unknown}', not Accepted"
+            cat "$result" || true
+            if [[ -n "$id" ]]; then
+              xcrun notarytool log "$id" "${auth[@]}" || true
+            fi
+            exit 1
+          fi
+          # The ticket can lag behind the Accepted status on Apple's CDN; retry the staple a few times.
+          for attempt in 1 2 3 4 5; do
+            if xcrun stapler staple "$app"; then break; fi
+            if (( attempt == 5 )); then echo "::error::stapler could not attach the ticket"; exit 1; fi
+            sleep 20
+          done
+          xcrun stapler validate "$app"
 
       - name: Zip the app
         run: just package "${{ steps.version.outputs.tag }}"
@@ -100,28 +248,55 @@ jobs:
           ZIP: ${{ steps.version.outputs.zip }}
           SHORT: ${{ steps.version.outputs.short }}
           BUILD: ${{ steps.version.outputs.build }}
+          SIGNED: ${{ steps.signing.outputs.enabled }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
+          # AppleDouble debris would mean a clean unzip is not what users get.
+          if unzip -Z1 "$ZIP" | grep -q '^__MACOSX/'; then
+            echo "::error::$ZIP contains a __MACOSX tree"
+            exit 1
+          fi
           dir="$RUNNER_TEMP/smoke"
           rm -rf "$dir" && mkdir -p "$dir"
           ditto -x -k "$ZIP" "$dir"
           app="$dir/Tessera.app"
           test -d "$app"
-          # Simulate a browser download, then the documented workaround.
-          xattr -w com.apple.quarantine "0083;00000000;Safari;" "$app"
-          xattr -dr com.apple.quarantine "$app"
-          codesign --verify --deep --strict "$app"
+          # Simulate a browser download (flags;hex timestamp;agent;).
+          xattr -w com.apple.quarantine "0083;$(printf '%x' "$(date +%s)");Safari;" "$app"
+          launch_app="$app"
+          if [[ "$SIGNED" == true ]]; then
+            # Notarized: Gatekeeper must accept the quarantined app as downloaded, no workaround.
+            xattr -p com.apple.quarantine "$app"
+            codesign --verify --deep --strict --verbose=2 "$app"
+            details="$(codesign -dvv "$app" 2>&1)"
+            grep -E '^(Identifier|Authority|TeamIdentifier|Timestamp|CodeDirectory)' <<< "$details"
+            grep -q '^TeamIdentifier='"$TEAM_ID"'$' <<< "$details"
+            assessment="$(spctl --assess --type execute --verbose=4 "$app" 2>&1)" || { echo "$assessment"; echo "::error::Gatekeeper rejects the quarantined app"; exit 1; }
+            echo "$assessment"
+            grep -q 'source=Notarized Developer ID' <<< "$assessment"
+            xcrun stapler validate "$app"
+            # Launch a pristine extraction: opening a quarantined app on a headless runner can wait on a Gatekeeper dialog.
+            launch_dir="$RUNNER_TEMP/smoke-launch"
+            rm -rf "$launch_dir" && mkdir -p "$launch_dir"
+            ditto -x -k "$ZIP" "$launch_dir"
+            launch_app="$launch_dir/Tessera.app"
+          else
+            echo "::notice title=Gatekeeper checks skipped::spctl and stapler checks need the Developer ID build; checking the ad-hoc build with the documented quarantine workaround"
+            xattr -dr com.apple.quarantine "$app"
+            codesign --verify --deep --strict --verbose=2 "$app"
+          fi
           archs="$(lipo -archs "$app/Contents/MacOS/Tessera")"
           echo "archs: $archs"
           [[ "$archs" == *arm64* && "$archs" == *x86_64* ]]
           [[ "$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")" == "$SHORT" ]]
           [[ "$(plutil -extract CFBundleVersion raw "$app/Contents/Info.plist")" == "$BUILD" ]]
           # Launch through LaunchServices and make sure the process stays up.
-          open "$app"
+          open "$launch_app"
           sleep 5
-          pid="$(pgrep -n -f "$app/Contents/MacOS/Tessera")"
+          pid="$(pgrep -n -f "$launch_app/Contents/MacOS/Tessera")"
           test -n "$pid"
           echo "Tessera.app launched (pid $pid)"
-          pkill -f "$app/Contents/MacOS/Tessera"
+          pkill -f "$launch_app/Contents/MacOS/Tessera"
 
       - name: Checksum
         env:
@@ -132,17 +307,23 @@ jobs:
         env:
           TAG: ${{ steps.version.outputs.tag }}
           ZIP: ${{ steps.version.outputs.zip }}
+          SIGNED: ${{ steps.signing.outputs.enabled }}
         run: |
           notes="$RUNNER_TEMP/notes.md"
           {
             echo "## Install"
             echo
-            echo "This build is ad-hoc signed and not notarized (signing and notarization land in 0.2.0)."
-            echo "Download \`$(basename "$ZIP")\`, unzip it, then remove the quarantine attribute before launching:"
-            echo
-            echo '```sh'
-            echo 'xattr -dr com.apple.quarantine Tessera.app'
-            echo '```'
+            if [[ "$SIGNED" == true ]]; then
+              echo "This build is signed with a Developer ID certificate and notarized by Apple."
+              echo "Download \`$(basename "$ZIP")\`, unzip it and open \`Tessera.app\`."
+            else
+              echo "This build is ad-hoc signed and not notarized."
+              echo "Download \`$(basename "$ZIP")\`, unzip it, then remove the quarantine attribute before launching:"
+              echo
+              echo '```sh'
+              echo 'xattr -dr com.apple.quarantine Tessera.app'
+              echo '```'
+            fi
             echo
             # Explicit tag + range (not `git-cliff --current`, which fails when
             # HEAD carries a second tag, e.g. an rc promoted to the final
@@ -168,3 +349,13 @@ jobs:
             [[ "$PRERELEASE" == true ]] && flags+=(--prerelease)
             gh release create "$TAG" "${flags[@]}" "${assets[@]}"
           fi
+
+      # Always, also after a failure or cancellation: nothing secret outlives the job.
+      - name: Delete the temporary keychain and key files
+        if: always() && steps.signing.outputs.enabled == 'true'
+        run: |
+          if [[ -n "${KEYCHAIN_PATH:-}" ]]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi
+          rm -f "${P12_PATH:-}" "${NOTARY_KEY_PATH:-}"
+          rm -rf "$RUNNER_TEMP/notarize"
