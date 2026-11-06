@@ -1,6 +1,6 @@
 # Tessera
 
-A native macOS terminal emulator with iTerm2's product sensibility, built on a fast, modular Rust core.
+A native macOS terminal emulator with a polished, approachable interface, built on a fast, modular Rust core.
 
 > **Status:** approaching 0.1.0, the first daily-drivable release. Windows, tabs, scrollback, selection, links,
 > themes and `config.toml` work today. Splits, a Preferences window, search and profiles in the UI are planned for
@@ -8,14 +8,15 @@ A native macOS terminal emulator with iTerm2's product sensibility, built on a f
 
 ## Why Tessera
 
-- **iTerm2** is the most intuitive terminal on macOS, but it is a large Objective-C codebase that is slow in places
-  and hard to extend.
-- **WezTerm** has an excellent Rust core and deep configurability, but a non-native UI and Lua-only configuration
-  that most people never touch.
+Tessera started from a gap. Terminals that feel at home on a Mac (native windows and tabs, a real Preferences window,
+profiles, shell integration) tend to be large, older codebases that are hard to extend and slow in places. Terminals
+with a fast, well-built core tend to bring their own non-native interface and expect you to configure everything in a
+scripting language.
 
-Tessera aims to keep what makes iTerm2 approachable (native windows and tabs, a real Preferences window, profiles,
-shell integration) and builds it on a Rust core that is designed from the first commit for plugins, external control and
-future frontends on other platforms.
+Tessera aims to offer both: the native, approachable feel on top of a small Rust core. That core is designed from the
+first commit for what a terminal rarely gets: plugins that share one API with external control (a socket and a
+command-line client, so scripts and agents can drive your terminals, with your consent), and frontends for other
+platforms on the same core.
 
 ## Install
 
@@ -36,7 +37,7 @@ xattr -dr com.apple.quarantine /Applications/Tessera.app
 
 ### Windows, tabs and shortcuts
 
-The menu bar follows Terminal.app, and the shortcuts are fixed until the configurable key map
+The menu bar follows the standard macOS layout, and the shortcuts are fixed until the configurable key map
 ([#43](https://github.com/aanyberg/tessera/issues/43)).
 
 | Shortcut | Menu item | What it does |
