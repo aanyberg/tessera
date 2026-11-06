@@ -60,15 +60,16 @@ final class MainMenuTests: XCTestCase {
             self.hidden = hidden
         }
 
-        init(_ item: NSMenuItem) {
+        @MainActor init(_ item: NSMenuItem) {
             if item.isSeparatorItem {
                 self = .separator
                 return
             }
-            let modifiers = item.keyEquivalentModifierMask.intersection(.deviceIndependentFlagsMask)
+            let (key, mask) = authoredKeyEquivalent(of: item)
+            let modifiers = mask.intersection(.deviceIndependentFlagsMask)
             // A hidden item counts only if its key equivalent works (D3).
             let hidden = item.isHidden && item.allowsKeyEquivalentWhenHidden
-            self.init(title: item.title, key: item.keyEquivalent, modifiers: modifiers, action: item.action, hidden: hidden)
+            self.init(title: item.title, key: key, modifiers: modifiers, action: item.action, hidden: hidden)
             if item.isHidden && !hidden {
                 self.title += " (hidden, key equivalent off)"
             }
@@ -207,7 +208,7 @@ final class MainMenuTests: XCTestCase {
     func testTheTabItemsSelectTheFirstNineTabs() throws {
         let menu = try XCTUnwrap(try installedMenu("Window").item(withTitle: "Select Tab")?.submenu)
         XCTAssertEqual(menu.items.map(\.title), (1...9).map { "Tab \($0)" })
-        XCTAssertEqual(menu.items.map(\.keyEquivalent), (1...9).map(String.init))
+        XCTAssertEqual(menu.items.map { authoredKeyEquivalent(of: $0).key }, (1...9).map(String.init))
         XCTAssertEqual(menu.items.map(\.tag), Array(0..<9))
         XCTAssertTrue(menu.items.allSatisfy { $0.action == #selector(TerminalWindowController.selectTabAtIndex(_:)) })
     }
@@ -230,12 +231,17 @@ final class MainMenuTests: XCTestCase {
     private func viewMenuActions(for event: NSEvent) throws -> [String] {
         let menu = try installedMenu("View")
         let recorder = ZoomRecorder()
+        // The events are a US keyboard's: match them against the key
+        // equivalents as set, not as localised to the current layout.
+        let localised = menu.items.map(\.allowsAutomaticKeyEquivalentLocalization)
         for item in menu.items {
             item.target = recorder
+            item.allowsAutomaticKeyEquivalentLocalization = false
         }
         defer {
-            for item in menu.items {
+            for (item, localises) in zip(menu.items, localised) {
                 item.target = nil
+                item.allowsAutomaticKeyEquivalentLocalization = localises
             }
         }
         XCTAssertTrue(try XCTUnwrap(NSApp.mainMenu).performKeyEquivalent(with: event), "\(event) is a key equivalent")
@@ -340,4 +346,16 @@ final class ZoomRecorder: NSObject {
     @objc func increaseFontSize(_ sender: Any?) { actions.append(NSStringFromSelector(#selector(increaseFontSize(_:)))) }
     @objc func decreaseFontSize(_ sender: Any?) { actions.append(NSStringFromSelector(#selector(decreaseFontSize(_:)))) }
     @objc func resetFontSize(_ sender: Any?) { actions.append(NSStringFromSelector(#selector(resetFontSize(_:)))) }
+}
+
+/// `item`'s key equivalent and modifiers as the menu sets them. AppKit
+/// localises them to the current keyboard layout (⌘} reads as ⇧⌘ä on a
+/// Swedish one, the hidden ⌘= as ⌘`), so they are read with that
+/// localisation off, then it is restored: the tests pass on any layout.
+@MainActor
+func authoredKeyEquivalent(of item: NSMenuItem) -> (key: String, modifiers: NSEvent.ModifierFlags) {
+    let localises = item.allowsAutomaticKeyEquivalentLocalization
+    item.allowsAutomaticKeyEquivalentLocalization = false
+    defer { item.allowsAutomaticKeyEquivalentLocalization = localises }
+    return (item.keyEquivalent, item.keyEquivalentModifierMask)
 }

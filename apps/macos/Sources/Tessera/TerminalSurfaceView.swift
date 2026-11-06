@@ -336,13 +336,17 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         windowObservers.append(
             center.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) {
                 [weak self] _ in
-                MainActor.assumeIsolated { self?.tearDown() }
+                MainActor.assumeIsolated { self?.windowWillClose() }
             })
         for (name, isKey) in [(NSWindow.didBecomeKeyNotification, true), (NSWindow.didResignKeyNotification, false)] {
             windowObservers.append(
                 center.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
                     MainActor.assumeIsolated { self?.windowKeyChanged(isKey: isKey) }
                 })
+        }
+        // Called as the group's selection changes, on the main thread.
+        tabSelectionObservation = window.observe(\.tabGroup?.selectedWindow) { [weak self] _, _ in
+            MainActor.assumeIsolated { self?.tabSelectionChanged() }
         }
         metalLayer.contentsScale = window.backingScaleFactor
         markedTextLayer.contentsScale = window.backingScaleFactor
@@ -354,9 +358,31 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         updateDisplayLinkPause()
     }
 
+    /// The window closes: tears down, deactivates the view's input context
+    /// and then takes the view out of the closed window. An active input
+    /// context (AppKit activates the one of the key window's first
+    /// responder) retains this view until it is deactivated, and AppKit may
+    /// keep a closed window alive after its controller is gone (seen on the
+    /// macOS 15 CI runner), the window holding its content view; either
+    /// would keep a closed tab's view and session alive. The view leaves
+    /// once the main actor is next free, so the closing window never draws
+    /// without it. A closed window is never shown again.
+    private func windowWillClose() {
+        tearDown()
+        inputContext?.deactivate()
+        let closedWindow = window
+        Task { @MainActor [weak self, weak closedWindow] in
+            guard let self, let closedWindow, window === closedWindow else { return }
+            removeFromSuperview()
+        }
+    }
+
     /// Stops the display link and detaches the surface; the window is going
     /// away (or the view leaves it).
     private func tearDown() {
+        releaseHeldButtons()
+        tabSelectionObservation?.invalidate()
+        tabSelectionObservation = nil
         observedWindow = nil
         autoscroller.stop()
         gesture = nil
@@ -763,6 +789,13 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         sendFocus(isKey && isFocused)
     }
 
+    /// Another tab of the window's group was selected: AppKit sends a
+    /// button held meanwhile no release here, so the core gets it now.
+    private func tabSelectionChanged() {
+        guard let window, let selected = window.tabGroup?.selectedWindow, selected !== window else { return }
+        releaseHeldButtons()
+    }
+
     /// Ends a composition without committing it (D5). The input context may
     /// answer the discard with `insertText`; nothing it commits meanwhile is
     /// sent.
@@ -1013,8 +1046,8 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
 
     // MARK: Mouse
 
-    // Every pointer event goes to the core, which decides who has it
-    // (ADR 0027): `.consumed` means it wrote a mouse report, so the program
+    // Every pointer event over the text goes to the core, which decides who
+    // has it (ADR 0027): `.consumed` means it wrote a mouse report, so the program
     // tracking the mouse has the event; `.ignored` leaves it to the view
     // (selection, #30). A press or motion with Shift (selection bypass) or
     // Command (links) held is always `.ignored`; the release of a reported
@@ -1024,18 +1057,35 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     /// reaches neither the program nor a selection, so clicking back into
     /// a terminal running vim does not move vim's cursor (D13). AppKit then
     /// sends neither the press nor its drags; ``pressOutcomes`` keeps a
-    /// stray release out as well.
+    /// stray release out as well. AppKit has no first mouse for the other
+    /// buttons: a right or other press reaches a window that is not key (a
+    /// background window, an inactive app), so ``press(_:button:)`` drops
+    /// it there itself (vim's `mousemodel=extend` acts on a right-click).
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { false }
 
     /// The core's outcome for the press of each button that is down, from
-    /// its press to its release. A button missing here was pressed outside
-    /// this view (or by the activating click): its drags and its release are
-    /// not sent. The selection (#30) starts only on an `.ignored` press.
+    /// its press until the core takes its release. A button missing here
+    /// was pressed outside this view (or by the activating click), or its
+    /// press was not offered to the core: its drags and its release are not
+    /// sent either. A press the core refused (a closed session, a full
+    /// input queue) is kept as `.ignored`; the core never saw it, so it
+    /// ignores the drags and the release that follow. The selection (#30)
+    /// starts only on an `.ignored` press.
     private(set) var pressOutcomes: [TesseraSession.MouseButton: TesseraSession.InputOutcome] = [:]
-    /// Mouse events handed to the session (tests).
-    private(set) var sentMouseCount = 0
-    /// The last mouse event handed to the session (tests).
-    private(set) var lastSentMouse: TesseraSession.MouseEvent?
+    /// The cell and pixel of the last pointer event the core took. While
+    /// ``metrics`` is `nil` the pointer's cell is unknown, so the drags and
+    /// the release of a press sent before go there, as do the releases
+    /// ``releaseHeldButtons()`` sends without an event.
+    private var lastMousePosition: (col: UInt16, row: UInt16, xPx: Float, yPx: Float)?
+    /// Watches the selected tab of the window's tab group: a tab switched
+    /// away from while a button is held gets no release from AppKit.
+    private var tabSelectionObservation: NSKeyValueObservation?
+    #if DEBUG
+        /// Mouse events handed to the session (tests).
+        private(set) var sentMouseCount = 0
+        /// The last mouse event handed to the session (tests).
+        private(set) var lastSentMouse: TesseraSession.MouseEvent?
+    #endif
 
     /// Offers a press to the input method while text is marked (`NSTextView`
     /// does): it may use the click itself, for a candidate window. The test
@@ -1094,7 +1144,9 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     }
 
     override func mouseMoved(with event: NSEvent) {
-        sendMouse(event, kind: .motion, button: .none)
+        if reportsPointer(at: event) {
+            sendMouse(event, kind: .motion, button: .none)
+        }
         lastPointer = convert(event.locationInWindow, from: nil)
         updateHover(modifiers: event.modifierFlags)
     }
@@ -1127,9 +1179,19 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         }
     }
 
+    /// Sends a press, unless no cell can be named for it: while ``metrics``
+    /// is `nil` (no surface, or between a lost surface and its re-attach)
+    /// or outside the render view (the legacy scroller's strip, which
+    /// takes only left clicks). A right or other press in a window that is
+    /// not key is dropped (see ``acceptsFirstMouse(for:)``). A press not
+    /// offered is `.ignored` and leaves no record, so neither its drags nor
+    /// its release are sent. A press the core refuses is recorded as
+    /// `.ignored` (see ``pressOutcomes``).
     @discardableResult
     private func press(_ event: NSEvent, button: TesseraSession.MouseButton) -> TesseraSession.InputOutcome {
-        let outcome = sendMouse(event, kind: .press, button: button)
+        if button != .left, window?.isKeyWindow != true { return .ignored }
+        guard reportsPointer(at: event) else { return .ignored }
+        let outcome = sendMouse(event, kind: .press, button: button) ?? .ignored
         pressOutcomes[button] = outcome
         return outcome
     }
@@ -1139,29 +1201,79 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         sendMouse(event, kind: .motion, button: button)
     }
 
+    /// Sends the release of a press that was sent; its record goes only
+    /// once the core takes it, so a release the core refuses (a position
+    /// that is not a number) does not leave the program's button held.
     private func release(_ event: NSEvent, button: TesseraSession.MouseButton) {
-        guard pressOutcomes.removeValue(forKey: button) != nil else { return }
-        sendMouse(event, kind: .release, button: button)
+        guard pressOutcomes[button] != nil else { return }
+        guard sendMouse(event, kind: .release, button: button) != nil else { return }
+        pressOutcomes[button] = nil
+    }
+
+    /// Releases every button whose press was sent and whose release has not
+    /// reached the core, at the last position the core took and with no
+    /// modifiers: the view leaves its window or its tab is switched away
+    /// from, and AppKit sends the release, if at all, to another window.
+    private func releaseHeldButtons() {
+        guard let position = lastMousePosition else { return }
+        for button in pressOutcomes.keys.sorted(by: { $0.rawValue < $1.rawValue }) {
+            let mouse = TesseraSession.MouseEvent(
+                kind: .release, button: button, col: position.col, row: position.row, xPx: position.xPx,
+                yPx: position.yPx, modifiers: [])
+            if send(mouse) != nil {
+                pressOutcomes[button] = nil
+            }
+        }
+    }
+
+    /// Whether a press or a motion with no button held at `event` is sent:
+    /// only over the render view while its cell size is known. The drags
+    /// and the release of a press that was sent always are. The test is
+    /// AppKit's hit test (`isMousePoint(_:in:)`): in this unflipped view
+    /// a point on the top edge (y == maxY, the top pixel row) is inside and
+    /// one on the bottom edge is not.
+    private func reportsPointer(at event: NSEvent) -> Bool {
+        metrics != nil && isMousePoint(convert(event.locationInWindow, from: nil), in: renderView.frame)
     }
 
     /// Sends a pointer event to the session and returns whether the core
-    /// reported it to the program; `.ignored` when it could not be sent.
+    /// reported it to the program, or `nil` when it was not sent or the
+    /// core refused it. While ``metrics`` is `nil` it goes to the last
+    /// position the core took (``lastMousePosition``), and is not sent
+    /// when there is none.
     @discardableResult
     private func sendMouse(
         _ event: NSEvent, kind: TesseraSession.MouseEventKind, button: TesseraSession.MouseButton
-    ) -> TesseraSession.InputOutcome {
-        let point = convert(event.locationInWindow, from: nil)
-        let (cell, pixels) = cell(at: point)
+    ) -> TesseraSession.InputOutcome? {
+        let position: (col: UInt16, row: UInt16, xPx: Float, yPx: Float)
+        if metrics != nil {
+            let (cell, pixels) = cell(at: convert(event.locationInWindow, from: nil))
+            position = (cell.col, cell.row, Float(pixels.x), Float(pixels.y))
+        } else if let lastMousePosition {
+            position = lastMousePosition
+        } else {
+            return nil
+        }
         let mouse = TesseraSession.MouseEvent(
-            kind: kind, button: button, col: cell.col, row: cell.row, xPx: Float(pixels.x), yPx: Float(pixels.y),
-            modifiers: Self.modifiers(of: event))
-        sentMouseCount += 1
-        lastSentMouse = mouse
+            kind: kind, button: button, col: position.col, row: position.row, xPx: position.xPx,
+            yPx: position.yPx, modifiers: Self.modifiers(of: event))
+        return send(mouse)
+    }
+
+    /// Hands `mouse` to the session: its outcome, or `nil` when the core
+    /// refused it. The position of one it took is ``lastMousePosition``.
+    private func send(_ mouse: TesseraSession.MouseEvent) -> TesseraSession.InputOutcome? {
+        #if DEBUG
+            sentMouseCount += 1
+            lastSentMouse = mouse
+        #endif
         do {
-            return try session.send(mouse: mouse)
+            let outcome = try session.send(mouse: mouse)
+            lastMousePosition = (mouse.col, mouse.row, mouse.xPx, mouse.yPx)
+            return outcome
         } catch {
             Self.log.debug("mouse event not sent: \(String(describing: error), privacy: .public)")
-            return .ignored
+            return nil
         }
     }
 
@@ -1461,9 +1573,11 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     /// drops the surface (a lost swapchain, which that frame reports as
     /// `.gpu`, or a closed session), the next render's read finds no
     /// surface and clears it; it stays `nil` until a re-attach, since
-    /// ``displayLinkDidFire()`` does not render while detached. While it is `nil`, pointer events carry
-    /// exact pixels and cell 0,0, and the candidate window opens at the
-    /// view's top-left corner. Tests set it to known metrics.
+    /// ``displayLinkDidFire()`` does not render while detached. While it is
+    /// `nil` no press or plain motion is sent to the core (the drags and the
+    /// release of a press sent before go to the last position it took), and
+    /// the candidate window opens at the view's top-left corner. Tests set
+    /// it to known metrics.
     var metrics: TesseraSurface.Metrics?
 
     /// Reads ``metrics`` from the core (`nil` once the surface is gone).
@@ -1710,9 +1824,10 @@ extension TerminalSurfaceView: NSMenuItemValidation {
 
     /// Clear to Start (⌘K): the scrollback and the screen above the prompt
     /// go, so the prompt becomes the top row: from the nearest prompt-start
-    /// mark at or above the cursor (not past the start of command output),
-    /// else from the start of the cursor's logical line (ADR 0022
-    /// D-CLEAR-START, ``TesseraSession/clearScrollback()``). The core sends no
+    /// mark at or above the cursor (not past a row where command output
+    /// starts; a row with both marks is a prompt start), else from the start
+    /// of the cursor's logical line, never above that output-start row
+    /// (ADR 0022 D-CLEAR-START, ``TesseraSession/clearScrollback()``). The core sends no
     /// output event for it, so the view redraws itself; an idle terminal's
     /// display link is paused and would otherwise keep the old screen.
     @objc func clearScrollback(_ sender: Any?) {
