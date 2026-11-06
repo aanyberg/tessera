@@ -1,8 +1,9 @@
 # Tessera
 
 macOS terminal emulator: thin Swift app (`apps/macos`) over a modular Rust core (`crates/`, dependencies point
-downward only). Architecture: `docs/architecture.md`; decisions: `docs/adr/`; contributing and release flow:
-`CONTRIBUTING.md`; trust boundaries, bounds and security rules: `docs/security.md`.
+downward only). Architecture: `docs/architecture.md`; decisions: `docs/adr/`; contributing:
+`CONTRIBUTING.md`; tests: `docs/testing.md`; debugging tools: `docs/debugging.md`; releases: `docs/releasing.md`; trust
+boundaries, bounds and security rules: `docs/security.md`.
 
 ## Checks
 
