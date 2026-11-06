@@ -87,8 +87,8 @@ URI and `id`.
   ones at trace. A run ends, and the next refusal is reported again, only
   when a link is created while the table is below three quarters of both
   caps (49 152 links and 12 MiB); refilling one freed slot at the cap
-  1 000 times gives one warning, not 1 000 (`tests/hyperlink.rs` in both
-  crates). An existing entity can still be reopened by `id` at either cap
+  1 000 times gives one warning, not 1 000 (`tests/hyperlink.rs` in
+  `tessera-grid`, `tests/hyperlink_warn.rs` in `tessera-term`). An existing entity can still be reopened by `id` at either cap
   and costs no bytes.
 - The byte cap is what bounds memory: 16 MiB holds 7 191 maximal links
   (2 083 + 250 bytes), long before the count cap. Measured peak RSS
