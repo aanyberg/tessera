@@ -8,11 +8,13 @@
 # Needs python3, rsvg-convert (`brew install librsvg`) and Xcode 26 or later
 # (Icon Composer's ictool). The layout is seeded, so the output is reproducible
 # for a given ictool and rsvg-convert; other versions may differ in a few bytes.
+# Last checked with Xcode 27.0 (27A5252f) and its Icon Composer 2.0 (ictool),
+# rsvg-convert 2.63.4 (librsvg, Homebrew) on cairo 1.18.6, pango 1.58.2.
 # With PREVIEW=<dir>, also renders the dark, tinted and clear appearances there.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 icon="$here/../Resources/AppIcon.icon"
-set="$here/../Resources/Assets.xcassets/AppIcon.appiconset"
+iconset="$here/../Resources/Assets.xcassets/AppIcon.appiconset"
 ictool="$(xcode-select -p)/../Applications/Icon Composer.app/Contents/Executables/ictool"
 [[ -x "$ictool" ]] || {
     echo "render.sh: needs Xcode 26 or later selected (no ictool at $ictool)" >&2
@@ -40,7 +42,7 @@ cat > "$tmp/legacy.svg" <<EOF
 </svg>
 EOF
 for px in 16 32 64 128 256 512 1024; do
-    rsvg-convert -w "$px" -h "$px" "$tmp/legacy.svg" -o "$set/icon_$px.png"
+    rsvg-convert -w "$px" -h "$px" "$tmp/legacy.svg" -o "$iconset/icon_$px.png"
 done
 
 if [[ -n "${PREVIEW:-}" ]]; then
