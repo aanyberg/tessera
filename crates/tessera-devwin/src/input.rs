@@ -28,7 +28,7 @@
 //!   (winit's `text_with_all_modifiers`): `´` then `e` is `é`, `^` then
 //!   Space is `^`. Under Ctrl or Alt a dead key is an ordinary key. That
 //!   macOS composes across events without an IME is not yet confirmed on
-//!   real typing (CONTRIBUTING lists the manual check).
+//!   real typing.
 //! * There is no IME, so no CJK or other input-method input. Allowing
 //!   winit's IME routes every key through `interpretKeyEvents`, where
 //!   macOS's press-and-hold accent menu replaces key repeat for held
