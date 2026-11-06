@@ -6,10 +6,10 @@
 # (a Thread Sanitizer lock, a host that ignores SIGTERM) xcodebuild waits for it and the run stalls until CI's step
 # limit. This wrapper follows the command's output (passed through unchanged). Once a test has started
 # ("Test Case '-[X y]' started.") and no test line has followed for TESSERA_APP_TEST_HANG_SECONDS (default 150, 30 s
-# past xcodebuild's 120 s allowance; with -test-iterations the line reads "started (Iteration n of m)."; the clock stops
-# at the "Test Suite 'All tests'" (or 'Selected tests') result, after which xcodebuild only writes its results), it:
+# past xcodebuild's 120 s allowance; with -test-iterations the line reads "started (Iteration n of m)."), it:
 #   - writes a `sample` (10 s) of each test host to the sample log (default apps/macos/build/app-test-hang-sample.log,
-#     appended to, never truncated: `just app-test` removes it before its first run);
+#     appended to, never truncated: `just app-test` removes it before its first run). A `sample` that has not returned
+#     after TESSERA_APP_TEST_SAMPLE_SECONDS (default 60) is killed and the log says "sample timed out";
 #   - kill -9s the hosts and their descendants. xcodebuild then restarts the host and goes on with the next test, and
 #     each later hang is handled the same way; when no test starts within the limit after a kill, the command's
 #     process group and any host left are killed;
@@ -19,9 +19,14 @@
 #     instead of any -only-testing/-skip-testing), and prints "TSan hang in <test> (#278), retried"; the run then
 #     passes if the rerun does. A hang outside the TSan runtime, a run with other failures or that did not finish
 #     after the kill, or a second hang exits 1 with a line naming the test and the limit.
+# The clock stops at the "Test Suite 'All tests'" (or 'Selected tests') result, after which xcodebuild only writes its
+# results, but only while no test host is alive: a host that is still running more than the limit after that line
+# (a TSan finalisation, a deadlock at exit) is sampled and killed the same way, and fails the run (never retried:
+# no test is to blame).
 # Test hosts are the processes whose arguments contain <derivedDataPath>/Build/Products/ (Tessera.app, which
-# launchd parents), except those already running when the command started (a `just run` Tessera), and the command's
-# `xctest` descendants. Otherwise the exit status is the command's own.
+# launchd parents), except those already running when the command started (a `just run` Tessera: same PID and same
+# start time), and the command's `xctest` descendants. Otherwise the exit status is the command's own.
+# On SIGINT, SIGTERM, SIGHUP or SIGALRM the hosts and the command are killed and the state directory is removed.
 # `sample` is looked up on PATH (the self-test, scripts/test-app-test-watchdog.sh, puts a fake one there).
 set -eu
 usage() { print -u2 "usage: scripts/app-test-watchdog.sh [--sample-log <file>] <command> [args]..."; exit 2; }
@@ -36,6 +41,8 @@ fi
 (( $# )) || usage
 limit="${TESSERA_APP_TEST_HANG_SECONDS:-150}"
 [[ "$limit" == <1-> ]] || { print -u2 "TESSERA_APP_TEST_HANG_SECONDS must be a positive integer, got '$limit'"; exit 2; }
+sample_limit="${TESSERA_APP_TEST_SAMPLE_SECONDS:-60}"
+[[ "$sample_limit" == <1-> ]] || { print -u2 "TESSERA_APP_TEST_SAMPLE_SECONDS must be a positive integer, got '$sample_limit'"; exit 2; }
 
 products=""
 args=("$@")
@@ -47,7 +54,23 @@ done
 [[ -n "$products" ]] || print -u2 "app-test watchdog: no -derivedDataPath; only xctest hosts can be found"
 
 state="$(mktemp -d "${TMPDIR:-/tmp}/app-test-watchdog.XXXXXX")"
-trap 'rm -rf "$state"' EXIT
+# zsh skips the EXIT trap when a signal kills it, so the signals are trapped too: the monitor (which kills the hosts
+# and the command on SIGTERM) is stopped, then the state directory removed.
+monitor_pid=""
+cleanup() {
+    setopt localoptions noerrexit
+    trap - EXIT
+    if [[ -n "$monitor_pid" ]]; then
+        kill -TERM "$monitor_pid" 2>/dev/null
+        wait "$monitor_pid" 2>/dev/null
+    fi
+    rm -rf "$state"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 142' ALRM
+trap 'exit 143' TERM
 
 # Runs the command once under the monitor. Exit status: the command's own, or 124 after a hang; then $state/test
 # holds one "<test>\t<description>" line per hang, $state/hang-<n> the samples of the n-th hang and $state/sample all
@@ -55,18 +78,20 @@ trap 'rm -rf "$state"' EXIT
 # "** TEST ..." result and $state/stopped when the monitor stopped the command.
 monitor() {
     rm -f "$state/test" "$state/sample" "$state/failed" "$state/ended" "$state/stopped" "$state"/hang-*(N)
+    # In the background so that a trapped signal ends the wait at once (zsh holds traps back until a foreground command ends).
     perl -e '
         use strict; use warnings;
         use POSIX qw(:sys_wait_h);
         use IO::Select; use Time::HiRes qw(time sleep);
-        my ($limit, $products, $state, @cmd) = @ARGV;
+        my ($limit, $slimit, $products, $state, @cmd) = @ARGV;
         my $parent = getppid();
         $| = 1;
-        # Processes under the products path that predate this run (a `just run` Tessera and its shells) are never hosts.
+        # Processes under the products path that predate this run (a `just run` Tessera and its shells) are never hosts:
+        # %pre maps their PID to their start time, and a PID that was reused by a newer process does not match.
         my %pre;
         if ($products ne "") {
-            my (undef, $a0) = table();
-            for my $p (keys %$a0) { $pre{$p} = 1 if index($a0->{$p}, $products) >= 0; }
+            my (undef, $a0, $s0) = table();
+            for my $p (keys %$a0) { $pre{$p} = $s0->{$p} if index($a0->{$p}, $products) >= 0; }
         }
         pipe(my $r, my $w) or die "pipe: $!";
         my $pid = fork() // die "fork: $!";
@@ -77,13 +102,13 @@ monitor() {
         }
         close $w;
         sub table {
-            my (%kids, %args);
-            open(my $ps, "-|", "ps", "-A", "-o", "pid=,ppid=,args=") or return ({}, {});
+            my (%kids, %args, %start);
+            open(my $ps, "-|", "ps", "-A", "-o", "pid=,ppid=,lstart=,args=") or return ({}, {}, {});
             while (<$ps>) {
-                next unless /^\s*(\d+)\s+(\d+)\s?(.*)$/;
-                push @{$kids{$2}}, $1; $args{$1} = $3;
+                next unless /^\s*(\d+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s?(.*)$/;
+                push @{$kids{$2}}, $1; $args{$1} = $4; $start{$1} = $3;
             }
-            return (\%kids, \%args);
+            return (\%kids, \%args, \%start);
         }
         sub below {
             my ($kids, @todo) = @_; my @all;
@@ -91,10 +116,13 @@ monitor() {
             return @all;
         }
         sub hosts {
-            my ($kids, $args) = table();
+            my ($kids, $args, $start) = table();
             my %h;
             if ($products ne "") {
-                for my $p (keys %$args) { $h{$p} = 1 if $p != $pid && $p != $$ && !$pre{$p} && index($args->{$p}, $products) >= 0; }
+                for my $p (keys %$args) {
+                    next if $p == $pid || $p == $$ || (defined $pre{$p} && $pre{$p} eq $start->{$p});
+                    $h{$p} = 1 if index($args->{$p}, $products) >= 0;
+                }
             }
             for my $p (below($kids, $pid)) {
                 my ($exe) = split " ", ($args->{$p} // "");
@@ -110,6 +138,8 @@ monitor() {
             ($kids) = table();
             kill "KILL", below($kids, @h);
         }
+        # The pid of a running `sample` (its own process group), killed with everything else.
+        my $sampler = 0;
         sub stop_group {
             kill "TERM", -$pid;
             for (1 .. 50) { last if waitpid($pid, WNOHANG) == $pid; sleep 0.1; }
@@ -119,14 +149,41 @@ monitor() {
         # Kills the test hosts and their descendants (a host that launchd parents is outside the command'"'"'s process
         # group), then the group.
         sub stop_all {
+            kill "KILL", -$sampler if $sampler;
             my ($k, $a2, @h) = hosts(); kill_hosts($k, @h);
             stop_group();
         }
-        $SIG{INT} = $SIG{TERM} = sub { stop_all(); exit 130; };
+        my $stopping = 0;
+        $SIG{INT} = $SIG{TERM} = sub { return if $stopping++; stop_all(); exit 130; };
+
+        # Runs `sample` on pid $_[0] for at most $slimit s (TERM, then KILL for its own process group): (exit status, timed out).
+        sub run_sample {
+            my ($h) = @_;
+            my $sp = fork();
+            return (255, 0) unless defined $sp;
+            if (!$sp) { setpgrp(0, 0); { no warnings "exec"; exec "sample", $h, "10", "-file", "$state/sample-$h"; } exit 127; }
+            $sampler = $sp;
+            my ($rc, $timed_out, $deadline) = (0, 0, time + $slimit);
+            while (1) {
+                if (waitpid($sp, WNOHANG) == $sp) { $rc = $? >> 8; last; }
+                if (time > $deadline) {
+                    ($timed_out, $rc) = (1, 1);
+                    kill "TERM", -$sp;
+                    for (1 .. 20) { last if waitpid($sp, WNOHANG) == $sp; sleep 0.1; }
+                    kill "KILL", -$sp;
+                    waitpid($sp, 0) if kill 0, $sp;
+                    last;
+                }
+                sleep 0.1;
+            }
+            $sampler = 0;
+            return ($rc, $timed_out);
+        }
 
         my $sel = IO::Select->new($r);
         # $progress: a test started since the last host was killed.
-        my ($buf, $current, $finished, $last, $fired, $progress, $failing) = ("", undef, 0, undef, 0, 0, 0);
+        # $final: the run'"'"'s last suite result was printed; $polled: when the hosts were last looked for then.
+        my ($buf, $current, $finished, $last, $fired, $progress, $failing, $final, $polled) = ("", undef, 0, undef, 0, 0, 0, 0, 0);
         sub note { my ($file, $text) = @_; open(my $f, ">>", "$state/$file") or die; print $f "$text\n"; close $f; }
         my $open = 1;
         my ($status, $exited);
@@ -148,11 +205,12 @@ monitor() {
                         note("failed", "$1.$2") if $line =~ /^Test Case \x27-\[(?:[^ \]]*\.)?([^ .\]]+) ([^ \]]+)\]\x27 failed/;
                         note("ended", $line) if $line =~ /^\*\* TEST /;
                         if ($line =~ /^Test Case \x27(-\[.+\])\x27 started( \(Iteration \d+ of \d+\))?\./) {
-                            ($current, $finished, $last, $progress) = ($1, 0, time, 1);
+                            ($current, $finished, $last, $progress, $final) = ($1, 0, time, 1, 0);
                         }
                         elsif ($line =~ /^Test Case \x27(-\[.+\])\x27 (passed|failed|skipped)/) { $finished = 1; $last = time if defined $last; }
-                        # The run'"'"'s last tests ended: xcodebuild may take minutes to write its results after restarts.
-                        elsif ($line =~ /^(\*\* TEST |Test session results|Test Suite \x27(All|Selected) tests\x27 (passed|failed))/) { $last = undef; }
+                        # The run'"'"'s last tests ended: xcodebuild may take minutes to write its results after restarts, so
+                        # from here the clock runs only while a test host is alive (see $final below).
+                        elsif ($line =~ /^(\*\* TEST |Test session results|Test Suite \x27(All|Selected) tests\x27 (passed|failed))/) { ($final, $last) = (1, time); }
                         elsif ($line =~ /^Test (Suite|Case) / && defined $last) { $last = time; }
                     }
                 }
@@ -163,6 +221,11 @@ monitor() {
             # A descendant that keeps the pipe open does not hold the run past the command'"'"'s exit.
             last if defined $exited && (!$open || time - $exited > 5);
             if (getppid() != $parent) { stop_all(); exit 1; }
+            if ($final && defined $last && time - $polled >= 1) {
+                $polled = time;
+                my (undef, undef, @alive) = hosts();
+                $last = time unless @alive;
+            }
             next unless defined $last && time - $last > $limit;
             if ($fired && !$progress) {
                 print STDERR "app-test watchdog: no test started within $limit s after the host was killed; stopping the command\n";
@@ -172,9 +235,10 @@ monitor() {
             # xcodebuild restarts a killed host and goes on with the next test; the clock stays armed, so a run
             # that does not go on is stopped at the next check.
             ($fired, $progress) = ($fired + 1, 0);
-            my $what = $finished ? "the test host stalled for more than $limit s after $current ended"
+            my $what = $final ? "the test host kept running for more than $limit s after the run'"'"'s last test result"
+                     : $finished ? "the test host stalled for more than $limit s after $current ended"
                                  : "$current ran longer than $limit s";
-            open(my $t, ">>", "$state/test") or die; print $t "$current\t$what\n"; close $t;
+            open(my $t, ">>", "$state/test") or die; print $t (($final ? "(after the last test)" : $current) . "\t$what\n"); close $t;
             my ($kids, $args, @h) = hosts();
             # Each hang'"'"'s samples in a file of their own (hang-<n>, n as in $state/test), classified on their own.
             my $hang = "$state/hang-$fired";
@@ -182,10 +246,14 @@ monitor() {
             print $s "no test host found (products path: $products)\n" unless @h;
             for my $h (@h) {
                 print $s "== sample of pid $h: " . ($args->{$h} // "?") . "\n"; close $s;
-                my $rc = system("sample", $h, "10", "-file", "$state/sample-$h") >> 8;
+                my ($rc, $timed_out) = run_sample($h);
                 open($s, ">>", $hang) or die;
                 if (open(my $in, "<", "$state/sample-$h")) { print $s $_ while <$in>; close $in; }
-                else { print $s "sample failed (exit $rc)\n"; }
+                elsif (!$timed_out) { print $s "sample failed (exit $rc)\n"; }
+                if ($timed_out) {
+                    print $s "sample timed out after $slimit s\n";
+                    print STDERR "app-test watchdog: sample of pid $h timed out after $slimit s; killed it\n";
+                }
             }
             close $s;
             open(my $all, ">>", "$state/sample") or die; open(my $one, "<", $hang) or die;
@@ -201,7 +269,12 @@ monitor() {
         }
         $status = $? unless defined $status;
         exit($status & 127 ? 128 + ($status & 127) : $status >> 8);
-    ' "$limit" "$products" "$state" "$@"
+    ' "$limit" "$sample_limit" "$products" "$state" "$@" &
+    monitor_pid=$!
+    local rc=0
+    wait "$monitor_pid" || rc=$?
+    monitor_pid=""
+    return $rc
 }
 
 # Appends this attempt's samples to the sample log under a header naming its hangs.
@@ -268,7 +341,9 @@ fail() {
 tsan_reports=() outside=() n=0
 while IFS=$'\t' read -r t desc; do
     (( ++n ))
-    if report="$(tsan_hang "$state/hang-$n")"; then tsan_reports+=("$report"); else outside+=("$desc"); fi
+    # A host that outlived the run's last test is nobody's test to rerun.
+    if [[ "$t" == "(after the last test)" ]]; then outside+=("$desc")
+    elif report="$(tsan_hang "$state/hang-$n")"; then tsan_reports+=("$report"); else outside+=("$desc"); fi
 done < "$state/test"
 (( ${#outside} == 0 )) || fail "${(j:; :)outside}"
 print -u2 -r -- "${(F)tsan_reports}"
