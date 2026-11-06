@@ -1,6 +1,7 @@
 //! End-to-end tests against real kernel PTYs.
 //!
-//! Every test spawns `/bin/sh` or the login shell, so they only run on Unix.
+//! Every test spawns `/bin/sh`, the login shell or `/bin/sleep`, so they only
+//! run on Unix.
 //! Each is bounded by [`TIMEOUT`] so a regression hangs for seconds, not
 //! forever.
 
@@ -436,4 +437,43 @@ fn non_utf8_arguments_reach_the_child_unchanged() {
     let (_pty, events) = NativePty::spawn(&options).unwrap();
     let collected = collect_all(&events);
     assert!(collected.text.contains("<fffe>"), "{:?}", collected.text);
+}
+
+fn child_pid(pty: &NativePty) -> nix::unistd::Pid {
+    nix::unistd::Pid::from_raw(i32::try_from(pty.child_pid().unwrap()).unwrap())
+}
+
+#[test]
+fn the_child_leads_its_own_session_on_the_pty_as_controlling_terminal() {
+    // A shell is the wrong probe: bash (and so `/bin/sh` on macOS) takes a
+    // controlling terminal itself when it starts as a session leader without
+    // one, so `sh -c 'exec 3</dev/tty'` passes even when the spawn gave none
+    // and zsh or fish would run without job control (no Ctrl-C). `sleep`
+    // opens nothing, so whatever terminal it has came from the spawn; `ps`
+    // reads the terminal and its foreground group from the kernel.
+    let options = SpawnOptions::command("/bin/sleep", "test-session").args(["30"]);
+    let (pty, _events) = NativePty::spawn(&options).unwrap();
+    let pid = child_pid(&pty);
+    assert_eq!(nix::unistd::getsid(Some(pid)), Ok(pid), "session leader");
+    assert_eq!(nix::unistd::getpgid(Some(pid)), Ok(pid), "group leader");
+    assert_ne!(
+        nix::unistd::getsid(Some(pid)),
+        nix::unistd::getsid(None),
+        "a new session, not ours"
+    );
+    let ps = std::process::Command::new("ps")
+        .args(["-o", "tpgid=,tty=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    let ps = String::from_utf8_lossy(&ps.stdout);
+    let fields: Vec<&str> = ps.split_whitespace().collect();
+    assert_eq!(
+        fields.first().copied(),
+        Some(pid.to_string().as_str()),
+        "the child's group is the terminal's foreground group: {ps:?}"
+    );
+    assert!(
+        fields.get(1).is_some_and(|tty| !tty.starts_with('?')),
+        "the child has a controlling terminal: {ps:?}"
+    );
 }
