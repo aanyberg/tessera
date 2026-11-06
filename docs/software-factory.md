@@ -214,8 +214,14 @@ Agents use these instead of rebuilding the setup in every run:
   `apps/macos/build/app-test-hang-sample.log` (uploaded with the `app-test-logs` artifact when the step fails), kills
   it and names the test and the limit. If each hang's sample has a thread stuck inside the TSan runtime and the hung
   tests are the run's only failures, it reruns only them once (`-only-testing`); a retried run that passes leaves only
-  the "TSan hang in <test> (#278), retried" line in the CI log. Any other hang fails the run.
-  `just app-test-watchdog-test` checks it with a fake `xcodebuild` and `sample`. A new test that legitimately needs
+  the "TSan hang in <test> (#278), retried" line in the CI log. Any other hang fails the run, including a test host
+  still alive `TESSERA_APP_TEST_HANG_SECONDS` after the run's last suite result (never retried). A `sample` that has
+  not returned after `TESSERA_APP_TEST_SAMPLE_SECONDS` (default 60) is killed ("sample timed out" in the log). The
+  watchdog never kills a process that was already running from the products path when the run started (for example
+  `just run`'s Tessera; it is matched by PID and start time), and on SIGINT, SIGTERM, SIGHUP or SIGALRM it kills the
+  hosts and removes its state directory.
+  `just app-test-watchdog-test` checks it with a fake `xcodebuild`, `sample` and `ps`, with timing bounds that grow
+  with the machine's load. A new test that legitimately needs
   more than 300 s gets its own `slow-timeout` override there.
 - **A/B probes.** `cargo xtask ab init --base <rev> --crate <name> --out <scratch dir>` builds a probe crate that
   depends on each crate at the base revision (`base_<name>`) and in the worktree (`head_<name>`). Write cases in
