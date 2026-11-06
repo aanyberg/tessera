@@ -56,9 +56,8 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
     /// The close confirmation up on this tab's sheet, if any: `.tab` holds
     /// back further closes of this tab only, `.window` (⇧⌘W) of every tab of
     /// its window, rather than asking twice. If the tab closes underneath its
-    /// sheet (its shell exits), the alert's completion never runs and this
-    /// stays set on the dead controller; harmless, as only open tabs are
-    /// consulted.
+    /// sheet (its shell exits, or ⇧⌘W on another tab closes it), the sheet
+    /// ends as Cancel (``windowWillClose(_:)``).
     private(set) var pendingClose: CloseConfirmation.Scope?
 
     /// - Parameters:
@@ -130,12 +129,14 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
 
     /// ⇧⌘W: closes every tab of this window's tab bar, and with them the
     /// window. If any of the tabs runs a job, one sheet on this tab lists
-    /// them all first (D4b), and Cancel keeps every tab.
+    /// them all first (D4b), and Cancel keeps every tab. Ignored while this
+    /// tab asks or the window already asks; another tab's question about
+    /// itself stays up beside this one, and Close closes that tab too.
     @objc func closeTabGroup(_ sender: Any?) {
         guard let window = window as? TerminalWindow else { return }
         let tabs = window.tabs
         let controllers = tabs.compactMap { $0.windowController as? TerminalWindowController }
-        guard !controllers.contains(where: { $0.pendingClose != nil }) else { return }
+        guard pendingClose == nil, !controllers.contains(where: { $0.pendingClose == .window }) else { return }
         // `close()`, not `performClose(_:)`: the user has been asked once
         // for all of them, or nothing in them runs.
         let closeAll = { @MainActor in
@@ -212,6 +213,14 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
     }
 
     func windowWillClose(_ notification: Notification) {
+        // A tab closing under its close sheet (its shell exited, or ⇧⌘W on
+        // another tab closed it): the sheet answers Cancel, or the alert and
+        // its modal session would outlive the tab.
+        if let window {
+            for sheet in window.sheets {
+                window.endSheet(sheet, returnCode: .cancel)
+            }
+        }
         do {
             try session.close()
         } catch TesseraCoreError.sessionNotFound {

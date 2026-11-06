@@ -185,6 +185,37 @@ final class CloseConfirmationTests: XCTestCase {
         XCTAssertFalse(windows.contains { $0.isVisible })
     }
 
+    /// ⇧⌘W on a tab while another tab of the window asks about itself:
+    /// the window asks on the current tab, listing every busy tab, and
+    /// Close closes them all, the one asking included. Sent to the tab
+    /// that asks, ⇧⌘W is ignored, as ⌘W is.
+    func testClosingAWindowWhileOneOfItsTabsAsksAsksForTheWindow() async throws {
+        let windows = try openTabs(3)
+        try await start("sleep 100", in: try controller(of: windows[1]))
+        try await start("cat", in: try controller(of: windows[2]))
+        windows[1].performClose(nil)
+        XCTAssertEqual(presenter.sheets.count, 1)
+        let asking = try controller(of: windows[1])
+
+        asking.closeTabGroup(nil)
+        XCTAssertEqual(presenter.sheets.count, 1, "the asking tab does not ask a second time")
+
+        let closing = try controller(of: windows[0])
+        closing.closeTabGroup(nil)
+
+        XCTAssertEqual(presenter.sheets.count, 2, "the window asks while a tab asks")
+        let sheet = try XCTUnwrap(presenter.sheets.dropFirst().first)
+        XCTAssertEqual(sheet.confirmation, CloseConfirmation(scope: .window, processNames: ["sleep", "cat"]))
+        XCTAssertTrue(sheet.window === windows[0])
+        XCTAssertEqual(asking.pendingClose, .tab, "the tab's own question stays")
+        XCTAssertEqual(closing.pendingClose, .window)
+
+        sheet.answer(true)
+        XCTAssertTrue(appDelegate.windowControllers.isEmpty, "Close closes every tab")
+        presenter.sheets[0].answer(true)
+        XCTAssertTrue(appDelegate.windowControllers.isEmpty)
+    }
+
     func testClosingAWindowOfIdleTabsDoesNotAsk() throws {
         let windows = try openTabs(3)
 
@@ -214,6 +245,104 @@ final class CloseConfirmationTests: XCTestCase {
 
     func testCloseAllClosesTheIdleTabsAndAsksEveryBusyOne() async throws {
         try await checkAppKitClose("closeAll:", on: nil, keeps: [])
+    }
+
+    /// Close All (⌥⌘W, the alternate AppKit adds to Close Tab) over two
+    /// windows: every idle tab closes, every busy tab of either window asks
+    /// once on its own sheet, and a second Close All while they ask adds
+    /// none. Cancel keeps a tab; Close closes it.
+    func testCloseAllAsksOncePerBusyTabOfEveryWindow() async throws {
+        let selector = NSSelectorFromString("closeAll:")
+        guard NSApp.responds(to: selector) else {
+            throw XCTSkip("NSApplication does not answer closeAll: on this macOS")
+        }
+        let first = try openTabs(2)
+        let second = try openTabs(3)
+        let busy = [first[1], second[0], second[1]]
+        for window in busy {
+            try await start("sleep 100", in: try controller(of: window))
+        }
+
+        NSApp.perform(selector, with: nil)
+
+        XCTAssertFalse(first[0].isVisible, "idle tabs close")
+        XCTAssertFalse(second[2].isVisible, "idle tabs close")
+        XCTAssertEqual(
+            Set(presenter.sheets.map { ObjectIdentifier($0.window) }), Set(busy.map(ObjectIdentifier.init)),
+            "every busy tab asks")
+        XCTAssertEqual(presenter.sheets.count, 3, "once each")
+        XCTAssertTrue(
+            presenter.sheets.allSatisfy { $0.confirmation == CloseConfirmation(scope: .tab, processNames: ["sleep"]) })
+
+        NSApp.perform(selector, with: nil)
+        XCTAssertEqual(presenter.sheets.count, 3, "a second Close All while they ask asks nothing more")
+
+        for sheet in presenter.sheets {
+            sheet.answer(sheet.window !== second[1])
+        }
+        XCTAssertEqual(
+            appDelegate.windowControllers.compactMap(\.window).map(ObjectIdentifier.init), [ObjectIdentifier(second[1])],
+            "Cancel keeps its tab, Close closes the others")
+    }
+
+    /// The shell of a tab exits cleanly while the tab's close sheet (a real
+    /// `NSAlert`) is up: the tab closes, the sheet ends as Cancel, and the
+    /// alert and the tab's controller are freed. (The closed window itself
+    /// may outlive them: AppKit keeps it as the previous key window.)
+    func testATabWhoseShellExitsUnderItsSheetFreesTheSheetAndTheTab() async throws {
+        appDelegate.closeConfirmationPresenter = AlertCloseConfirmationPresenter()
+        weak var weakController: TerminalWindowController?
+        weak var weakSheet: NSWindow?
+        var window: NSWindow?
+        func openAndAsk() async throws {
+            let controller = try appDelegate.newWindow()
+            weakController = controller
+            window = controller.window
+            try await start("sleep 100", in: controller)
+            autoreleasepool {
+                controller.window?.performClose(nil)
+                weakSheet = controller.window?.attachedSheet
+            }
+        }
+        try await openAndAsk()
+        XCTAssertNotNil(weakSheet, "the busy tab asks on a sheet")
+
+        // As the router delivers a clean exit, in a pool of its own: the
+        // test's own pool would keep what AppKit autoreleases until the
+        // test ends.
+        autoreleasepool { weakController?.sessionDidExit(code: 0, signal: 0) }
+
+        XCTAssertTrue(appDelegate.windowControllers.isEmpty, "the tab closed")
+        XCTAssertEqual(window?.sheets.count, 0, "its sheet ended")
+        try? await waitUntil("the closed tab's sheet and controller are freed") {
+            weakSheet == nil && weakController == nil
+        }
+        XCTAssertNil(weakSheet, "the alert's panel")
+        XCTAssertNil(weakController, "the tab's controller")
+        window = nil
+    }
+
+    /// The window's sheet (⇧⌘W, a real `NSAlert`) is up on a tab whose shell
+    /// then exits cleanly: the sheet ends as Cancel, not Close, so the
+    /// window's busy tab stays open with its job, and nothing still asks.
+    func testAWindowSheetEndedByItsTabClosingCancels() async throws {
+        appDelegate.closeConfirmationPresenter = AlertCloseConfirmationPresenter()
+        let windows = try openTabs(2)
+        let asking = try controller(of: windows[0])
+        let busy = try controller(of: windows[1])
+        try await start("sleep 100", in: busy)
+        autoreleasepool { asking.closeTabGroup(nil) }
+        XCTAssertNotNil(windows[0].attachedSheet, "the window asks on a sheet")
+        XCTAssertEqual(asking.pendingClose, .window)
+
+        autoreleasepool { asking.sessionDidExit(code: 0, signal: 0) }
+
+        XCTAssertEqual(windows[0].sheets.count, 0, "the sheet ended")
+        XCTAssertEqual(appDelegate.windowControllers.map(ObjectIdentifier.init), [ObjectIdentifier(busy)], "the busy tab stays")
+        XCTAssertTrue(windows[1].isVisible)
+        XCTAssertEqual(try busy.session.foregroundProcess()?.name, "sleep", "and its job")
+        XCTAssertNil(busy.pendingClose)
+        XCTAssertNil(asking.pendingClose, "the ended sheet asks no more")
     }
 
     /// ⌘W on an idle tab closes it while another tab of the window asks.

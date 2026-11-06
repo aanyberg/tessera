@@ -66,10 +66,11 @@ Consequences of the mechanism, accepted:
   programs such as `tmux` or `ssh` in the core or the app.
 
 **Name.** The name is the group leader's (the job's first process, `cat`
-in `cat | less`): `proc_name` on macOS (at most 31 bytes, as the kernel stores it). The kernel refuses
-`proc_name` for another user's process, which is what `sudo vim` leaves in
-the foreground, so it falls back to the 16-byte command name from
-`proc_pidinfo(PROC_PIDT_SHORTBSDINFO)`, which it reports for any process.
+in `cat | less`): `proc_name` on macOS (at most 31 bytes, as the kernel
+stores it). The kernel refuses `proc_name` for another user's process,
+which is what `sudo vim` leaves in the foreground, so it falls back to the
+16-byte command name from `proc_pidinfo(PROC_PIDT_SHORTBSDINFO)`, which it
+reports for any process.
 Linux reads `/proc/<pid>/comm`; other Unix systems report no name. Names are
 decoded lossily as UTF-8 and cut to 64 bytes (`MAX_NAME_BYTES`) at a
 character boundary. When the leader has exited while the rest of its
@@ -140,11 +141,19 @@ makes Terminate the default; Cancel (Escape) keeps every tab and its job.
 After Close the tabs close through `NSWindow.close()`, the same
 non-blocking session close as before (ADR 0018), without asking again. A
 close request for a tab that is already asking is ignored, so ⌘W pressed
-twice asks once, and while ⇧⌘W asks, a close request for any tab of that
-window is ignored; a tab's own question holds back none of its
-neighbours, so an idle tab next to an asking one still closes. `SIGTERM`, `SIGINT` and `SIGHUP`
-still quit without asking: there may be nobody to answer. A session the
-core no longer knows counts as idle. The presenter is a protocol
+twice asks once (⇧⌘W on that tab too), and while ⇧⌘W asks, a close
+request for any tab of that window is ignored. A tab's own question holds
+back none of its neighbours: an idle tab next to an asking one still
+closes, and ⇧⌘W on another tab asks for the whole window on that tab,
+beside the first sheet, rather than doing nothing; its Close closes the
+asking tab too. Close All (⌥⌘W, the alternate AppKit adds to Close Tab)
+asks every window's tabs in turn, so each busy tab asks once on its own
+sheet and a second ⌥⌘W while they ask adds none. A tab that closes under
+its own sheet (its shell exits cleanly, or the window's Close closes it)
+ends the sheet as Cancel in `windowWillClose`, so the alert and its modal
+session do not outlive the tab. `SIGTERM`, `SIGINT` and `SIGHUP` still
+quit without asking: there may be nobody to answer. A session the core no
+longer knows counts as idle. The presenter is a protocol
 (`CloseConfirmationPresenter`), so the hosted tests record the requests
 and answer them.
 
@@ -161,10 +170,11 @@ name is interpreted.
 JSON value under the user-defaults key `TesseraWindowState.v1`: each
 window's frame (the selected tab's) and tab count, in the order the windows
 opened. It is saved on quit (`applicationShouldTerminate`, once the quit
-is decided, before the core shuts down) and, coalesced to one save per turn of the main run loop, when
-a window or tab opens or closes, a window moves or is resized, or a tab
-becomes main (how a tab moving between windows shows). At launch, unless
-"Close windows when quitting an application" is on
+is decided, before the core shuts down) and, coalesced to one save per
+turn of the main run loop, when a window or tab opens or closes, a window
+moves or is resized, or a tab becomes main (how a tab moving between
+windows shows). At launch, unless "Close windows when quitting an
+application" is on
 (`NSQuitAlwaysKeepsWindows` false or unset, which is macOS's default, as
 for AppKit's own restoration; the setting can be overridden per
 application with `defaults write com.aanyberg.tessera
@@ -177,7 +187,7 @@ at most 64 sessions in all are started, so a damaged value cannot start
 thousands of shells; an unreadable value is ignored. No saved window means
 one new window, as before. The hosted tests never save to the user's
 defaults: the store is unset in the test host and the tests use a suite of
-their own.
+their own, kept in memory, so no file is left in `~/Library/Preferences`.
 
 Not covered, accepted for 0.1.0: the order of windows in depth, which
 tab was selected, and whether a window was full screen or minimized are
