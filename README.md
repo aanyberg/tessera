@@ -26,12 +26,7 @@ Requires macOS 15 or later, on Apple silicon or Intel.
    [latest release](https://github.com/aanyberg/tessera/releases/latest) and unzip it.
 2. Move `Tessera.app` to `/Applications` and open it.
 
-Releases are Developer ID signed and notarized once the project's signing secrets are in place. Until then a release
-is ad-hoc signed, and macOS will refuse to open it; run this once and open it again:
-
-```sh
-xattr -dr com.apple.quarantine /Applications/Tessera.app
-```
+Releases are Developer ID signed and notarized, so Tessera opens without a Gatekeeper warning.
 
 ## User guide
 
@@ -39,6 +34,9 @@ xattr -dr com.apple.quarantine /Applications/Tessera.app
 
 The menu bar follows the standard macOS layout, and the shortcuts are fixed until the configurable key map
 ([#43](https://github.com/aanyberg/tessera/issues/43)).
+
+<details>
+<summary>Keyboard shortcuts</summary>
 
 | Shortcut | Menu item | What it does |
 |---|---|---|
@@ -59,6 +57,8 @@ The menu bar follows the standard macOS layout, and the shortcuts are fixed unti
 | ⇧⌘[ and ⇧⌘] | Window > Show Previous/Next Tab | Moves between tabs |
 | ⌘1 to ⌘9 | Window > Select Tab | Selects one of the first nine tabs |
 | ⌘? | Help > Tessera Help | Opens this page |
+
+</details>
 
 Closing a window or tab that is running a job asks first (`confirm_close`).
 
