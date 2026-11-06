@@ -67,9 +67,17 @@ Layout, from the scroller's effective style (the test override, else
   shown: entering or leaving the alternate screen never reflows the grid or
   sends SIGWINCH. A legacy scroller is therefore always shown, with no
   history and on the alternate screen too: it is disabled, draws its track
-  with no knob, and takes no action (`target(for:)` is `nil`). Nothing else
-  paints the strip, as in Terminal.app. An overlay scroller is hidden with
-  no history, as before.
+  with no knob, and takes no action (`target(for:)` is `nil`). AppKit
+  draws only a track inset 3 pt into the strip (at about 7% alpha in dark
+  appearance) and leaves the rest of the scroller's layer empty, so on a
+  translucent theme the desktop showed through (#210). The scroller's
+  backing layer is therefore filled with `NSColor.controlBackgroundColor`,
+  resolved for the scroller's effective appearance, in legacy style: every
+  pixel of the strip is opaque in light and dark appearance. A layer colour
+  is not dynamic, so it is applied again when the style or the appearance
+  changes (`viewDidChangeEffectiveAppearance`). An overlay scroller is
+  hidden with no history, as before; its layer is not filled, and its
+  track is AppKit's, over the text.
 - `NSScroller.preferredScrollerStyleDidChangeNotification` and a change of
   the test override go through one path: the scroller restyles itself and
   calls `onStyleChange`, and the view lays out again and passes the render
@@ -135,6 +143,11 @@ flashes unconditionally, as feedback for an explicit command.
   undefined: over an overlay scroller the I-beam stops at its left edge.
   The window's cursor rects are invalidated when the scroller's hidden
   state, frame or style changes.
+- **No per-frame sets.** `update(_:)` runs whenever the position read at a
+  frame changed, so once per frame while output streams into a scrolled
+  back view. It applies the hidden state, `isEnabled` and the visibility
+  only when the history's presence or the style changed since it last did;
+  the pointer and tracking apply the visibility themselves (#210).
 - **Hidden under the pointer.** When the scroller becomes hidden it forgets
   the pointer and any flash; shown again it is not assumed to be under the
   pointer, and waits for a scroll or `mouseEntered`.
@@ -170,6 +183,18 @@ flashes unconditionally, as feedback for an explicit command.
   action), so during a composition ⌘↑/⌘↓/⌘Home/⌘End are swallowed rather
   than handed to the input method. Handing them on would need the menu's
   key equivalents to stand aside, a change to the menu, not to this view.
+  Whether the input method should get these keys, checked with a real
+  Japanese input method, is deferred to 0.2.0 (#210 item 5).
+- Accepted: in overlay style the I-beam cursor rect stops at the scroller's
+  left edge rather than covering the render view (the rects must not
+  overlap). A faded-out overlay scroller lets clicks through to the
+  terminal while the cursor over its strip is an arrow (#210 item 6).
+- Accepted: a key, fingers resting on the trackpad without moving (a phased
+  event), a second key, then momentum from a momentum-only device (a
+  second pointing device): that momentum is dropped until a new gesture
+  starts, because the resting touch counts as a gesture seen since the
+  flag was set. It needs two pointing devices; a single key followed by a
+  resting touch drops it likewise, as it did before #183 (#210 item 9).
 - Not covered: the horizontal wheel and DECSET 1007 (ADR 0023, 0027).
 
 ## Manual checks
@@ -182,7 +207,10 @@ flashes unconditionally, as feedback for an explicit command.
   with and without a mouse) while a shell and while vim run: one resize,
   the program redraws at the new width, no stray strip.
 - A legacy scroller with a translucent theme, in light and dark
-  appearance: the track is drawn and the knob is visible.
+  appearance: the whole strip, its edges included, is opaque (the desktop
+  does not show through) and the knob is visible; switching between light
+  and dark with the window open, the strip's colour follows without a
+  resize. In overlay style the track over the text is unchanged.
 - Trackpad momentum through a long history, then typing during it: the
   view stays on the live screen; mouse-wheel notches still scroll after
   typing; a phase-less device scrolls again after typing.

@@ -160,6 +160,7 @@ final class TerminalScrollTests: XCTestCase {
         event.setIntegerValueField(.scrollWheelEventMomentumPhase, value: Int64(momentum?.rawValue ?? 0))
         let nsEvent = try XCTUnwrap(NSEvent(cgEvent: event))
         XCTAssertTrue(nsEvent.hasPreciseScrollingDeltas)
+        assertConverted(nsEvent, deltaY)
         return nsEvent
     }
 
@@ -567,7 +568,26 @@ final class TerminalScrollTests: XCTestCase {
         let nsEvent = try XCTUnwrap(NSEvent(cgEvent: event))
         XCTAssertFalse(nsEvent.hasPreciseScrollingDeltas)
         XCTAssertTrue(nsEvent.phase.isEmpty && nsEvent.momentumPhase.isEmpty)
+        assertConverted(nsEvent, lines)
         return nsEvent
+    }
+
+    /// The event system kept a synthetic scroll's delta: non-zero with the
+    /// sign it was made with (zero stays zero). A device utility on the
+    /// host (BetterTouchTool, Logi Options) can rewrite synthetic scroll
+    /// events; without this, such a host fails the scroll tests later and
+    /// without saying why (#210).
+    private func assertConverted(
+        _ event: NSEvent, _ delta: Int32, file: StaticString = #filePath, line: UInt = #line
+    ) {
+        guard delta != 0 else {
+            XCTAssertEqual(event.scrollingDeltaY, 0, "a zero delta stays zero", file: file, line: line)
+            return
+        }
+        let message = "the host converted a synthetic scroll of \(delta) to scrollingDeltaY \(event.scrollingDeltaY): "
+            + "a device utility may be rewriting scroll events"
+        XCTAssertNotEqual(event.scrollingDeltaY, 0, message, file: file, line: line)
+        XCTAssertEqual(event.scrollingDeltaY < 0, delta < 0, message, file: file, line: line)
     }
 
     /// The trackpad delta that scrolls back, found with a gesture that is
@@ -928,6 +948,95 @@ final class TerminalScrollTests: XCTestCase {
         XCTAssertNil(scroller.hitTest(point), "a click goes through")
     }
 
+    func testAPositionThatKeepsTheHistoryAndStyleSetsNoScrollerProperty() {
+        for style: NSScroller.Style in [.overlay, .legacy] {
+            let (scroller, window) = standaloneScroller(.init(offset: 0, history: 0, rows: 12))
+            defer { window.close() }
+            let name = style == .legacy ? "legacy" : "overlay"
+            scroller.preferredStyleOverride = style
+            let sets = PropertySetCounter(scroller)
+            // Output streaming into the scrollback while the view is
+            // scrolled back: one new position per frame.
+            for frame in 0..<100 {
+                scroller.update(.init(offset: UInt64(50 + frame), history: UInt64(500 + frame), rows: 12))
+                if frame == 0 {
+                    XCTAssertGreaterThan(sets.count, 0, "\(name): history appeared, so the first one sets")
+                    sets.count = 0
+                }
+            }
+            XCTAssertEqual(sets.count, 0, "\(name): 99 positions with history in one style set nothing")
+            scroller.update(.init(offset: 0, history: 0, rows: 12))
+            XCTAssertGreaterThan(sets.count, 0, "\(name): history gone, so it sets again")
+            sets.count = 0
+            scroller.preferredStyleOverride = style == .legacy ? .overlay : .legacy
+            XCTAssertGreaterThan(sets.count, 0, "\(name): a new style sets again")
+            XCTAssertEqual(scroller.isHidden, style == .legacy, "and applies it: overlay without history is hidden")
+        }
+    }
+
+    /// The scroller as drawn: the lowest alpha over every pixel of its
+    /// bounds, and the colour of its left edge at mid height (outside the
+    /// track AppKit draws).
+    private func strip(of scroller: NSScroller) throws -> (minAlpha: CGFloat, edge: NSColor) {
+        let bitmap = try XCTUnwrap(scroller.bitmapImageRepForCachingDisplay(in: scroller.bounds))
+        scroller.cacheDisplay(in: scroller.bounds, to: bitmap)
+        var minAlpha: CGFloat = 1
+        for y in 0..<bitmap.pixelsHigh {
+            for x in 0..<bitmap.pixelsWide {
+                minAlpha = min(minAlpha, bitmap.colorAt(x: x, y: y)?.alphaComponent ?? 0)
+            }
+        }
+        let edge = try XCTUnwrap(bitmap.colorAt(x: 0, y: bitmap.pixelsHigh / 2)?.usingColorSpace(.sRGB))
+        return (minAlpha, edge)
+    }
+
+    func testALegacyStripIsOpaqueAndFollowsTheAppearance() throws {
+        // Created while the system asks for legacy scrollers: filled from
+        // the start, with no style change to apply it.
+        let system = TerminalScroller.systemStyle
+        defer { TerminalScroller.systemStyle = system }
+        TerminalScroller.systemStyle = { .legacy }
+        XCTAssertNotNil(TerminalScroller().layer?.backgroundColor, "Show scroll bars: Always, a new scroller is filled")
+        TerminalScroller.systemStyle = system
+        let (scroller, window) = standaloneScroller(.init(offset: 100, history: 0, rows: 12))
+        defer { window.close() }
+        scroller.preferredStyleOverride = .legacy
+        let width = TerminalScroller.width(for: .legacy)
+        scroller.frame = NSRect(x: 480 - width, y: 0, width: width, height: 200)
+        // One scroller through both appearances and back: the strip's fill
+        // follows a change of appearance, not only the first one.
+        for history: UInt64 in [0, 500] {
+            scroller.update(.init(offset: history / 5, history: history, rows: 12))
+            var brightness: [CGFloat] = []
+            for name in [NSAppearance.Name.aqua, .darkAqua, .aqua] {
+                scroller.appearance = NSAppearance(named: name)
+                let (minAlpha, edge) = try strip(of: scroller)
+                XCTAssertEqual(minAlpha, 1, "\(name.rawValue), history \(history): every pixel of the strip is opaque")
+                brightness.append(edge.brightnessComponent)
+            }
+            XCTAssertGreaterThan(brightness[0], 0.5, "history \(history): light appearance, a light strip")
+            XCTAssertLessThan(brightness[1], 0.5, "history \(history): dark appearance, a dark strip")
+            XCTAssertEqual(brightness[2], brightness[0], accuracy: 0.01, "history \(history): light again")
+        }
+        // An overlay scroller is drawn over the text: AppKit's track only,
+        // nothing filled behind it.
+        scroller.appearance = NSAppearance(named: .darkAqua)
+        scroller.preferredStyleOverride = .overlay
+        scroller.frame = NSRect(x: 480 - TerminalScroller.width, y: 0, width: TerminalScroller.width, height: 200)
+        XCTAssertNil(scroller.layer?.backgroundColor, "overlay: no strip fill")
+        XCTAssertLessThan(try strip(of: scroller).minAlpha, 1, "overlay: the text shows around and through the track")
+        // Back to legacy in the appearance the app is not in: the fill is
+        // the scroller's appearance's, not the app's.
+        let appIsDark = NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        scroller.appearance = NSAppearance(named: appIsDark ? .aqua : .darkAqua)
+        scroller.preferredStyleOverride = .legacy
+        scroller.frame = NSRect(x: 480 - width, y: 0, width: width, height: 200)
+        let (minAlpha, edge) = try strip(of: scroller)
+        XCTAssertEqual(minAlpha, 1, "legacy again: opaque again")
+        XCTAssertEqual(
+            edge.brightnessComponent < 0.5, !appIsDark, "legacy again: the strip follows the scroller's appearance")
+    }
+
     func testAKnobClickedAndHeldStillDuringOutputDoesNotMoveTheView() async throws {
         try await open()
         try requireSurface()
@@ -1021,6 +1130,22 @@ final class TerminalScrollTests: XCTestCase {
             }
             try await Task.sleep(for: .milliseconds(10))
         }
+    }
+}
+
+/// Counts the sets of a scroller's `alphaValue`, `isEnabled` and `isHidden`
+/// (key-value observation reports every set, even to the same value).
+@MainActor
+private final class PropertySetCounter {
+    var count = 0
+    private var observations: [NSKeyValueObservation] = []
+
+    init(_ scroller: NSScroller) {
+        observations = [
+            scroller.observe(\.alphaValue) { [weak self] _, _ in MainActor.assumeIsolated { self?.count += 1 } },
+            scroller.observe(\.isEnabled) { [weak self] _, _ in MainActor.assumeIsolated { self?.count += 1 } },
+            scroller.observe(\.isHidden) { [weak self] _, _ in MainActor.assumeIsolated { self?.count += 1 } },
+        ]
     }
 }
 

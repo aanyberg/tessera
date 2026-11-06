@@ -50,6 +50,9 @@ final class TerminalScroller: NSScroller {
     private var hoverArea: NSTrackingArea?
     /// When the current flash has faded out, or `nil` without one.
     private var flashEnd: CFTimeInterval?
+    /// The history and style ``applyHidden()`` last applied, or `nil`
+    /// before the first: a position that changes neither sets nothing.
+    private var applied: (hasHistory: Bool, style: NSScroller.Style)?
 
     /// How long a scroll keeps it shown before it fades, and the fade.
     static let holdDuration: CFTimeInterval = 1.0
@@ -84,6 +87,7 @@ final class TerminalScroller: NSScroller {
             self, selector: #selector(preferredStyleChanged(_:)),
             name: NSScroller.preferredScrollerStyleDidChangeNotification, object: nil)
         scrollerStyle = effectiveStyle
+        applyStripBackground()
         applyHidden()
     }
 
@@ -195,8 +199,14 @@ final class TerminalScroller: NSScroller {
 
     /// Hidden only in overlay style without history. Hiding forgets the
     /// pointer and any flash: shown again, it waits for a scroll or for
-    /// the pointer to enter.
+    /// the pointer to enter. Nothing is set unless the history's presence
+    /// or the style changed since the last time, so a position read every
+    /// frame while output streams sets no AppKit property; the pointer and
+    /// tracking apply their own visibility.
     private func applyHidden() {
+        let style = effectiveStyle
+        if let applied, applied.hasHistory == hasHistory, applied.style == style { return }
+        applied = (hasHistory, style)
         isEnabled = hasHistory
         let hidden = !hasHistory && !staysShown
         if hidden != isHidden {
@@ -227,6 +237,7 @@ final class TerminalScroller: NSScroller {
         if scrollerStyle != style {
             scrollerStyle = style
         }
+        applyStripBackground()
         applyHidden()
         if hasHistory, let position {
             applyKnob(position)
@@ -236,6 +247,35 @@ final class TerminalScroller: NSScroller {
 
     @objc private func preferredStyleChanged(_ notification: Notification) {
         styleChanged()
+    }
+
+    /// The fill of a legacy scroller's whole strip. AppKit draws only a
+    /// track inset 3 pt into the strip, nearly transparent (about 7%
+    /// alpha) in dark appearance, and leaves the rest of its layer empty,
+    /// so on a translucent theme the desktop showed through (ADR 0032).
+    static let legacyStripBackground = NSColor.controlBackgroundColor
+
+    /// Fills the backing layer behind AppKit's track with
+    /// ``legacyStripBackground``, resolved for the current appearance, in
+    /// legacy style; nothing in overlay style, which is drawn over the
+    /// text. A layer colour is not dynamic: a change of style or
+    /// appearance applies it again.
+    private func applyStripBackground() {
+        guard let layer else { return }
+        guard scrollerStyle == .legacy else {
+            layer.backgroundColor = nil
+            return
+        }
+        var color: CGColor?
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            color = Self.legacyStripBackground.cgColor
+        }
+        layer.backgroundColor = color
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyStripBackground()
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
