@@ -130,6 +130,65 @@ final class TerminalSelectionCallTests: XCTestCase {
         XCTAssertEqual(rig.opener.opened.map(\.absoluteString), ["https://a.bc/x"])
     }
 
+    func testCommandClickOpensTheLinkUnderThePressWhenOutputScrollsBeforeTheRelease() async throws {
+        let rig = try await rig(cols: 40, feed: "x\r\nhttps://a.bc/one\r\nhttps://a.bc/two")
+        defer { rig.close() }
+        try rig.perform("down 1,5 mods=cmd")
+        try await rig.feedLater(Array("\r\n".utf8))
+        XCTAssertEqual(
+            try rig.session.link(col: 5, row: 1), "https://a.bc/two",
+            "the output scrolled the screen up a line: another link is under the pointer now")
+        try rig.perform("up mods=cmd")
+        XCTAssertEqual(rig.opener.opened.map(\.absoluteString), ["https://a.bc/one"], "the link that was pressed opens")
+    }
+
+    func testNoSelectionOrLinkClickBeginsWhileTheCellSizeIsUnknown() async throws {
+        // The link starts at cell 0,0, where every point lands with no
+        // cell size.
+        let rig = try await rig(cols: 40, feed: "https://a.bc/x now")
+        defer { rig.close() }
+        rig.view.metrics = nil
+        try rig.perform("down 0,20 clicks=2")
+        try rig.perform("drag 0,25")
+        try rig.perform("up")
+        XCTAssertFalse(try rig.session.hasSelection, "a double-click would select the word at 0,0")
+        #if DEBUG
+            XCTAssertEqual(rig.view.selectionCalls, [], "no selection call at all")
+        #endif
+        try rig.perform("flags cmd")
+        try rig.perform("down 0,20 mods=cmd")
+        try rig.perform("up mods=cmd")
+        XCTAssertEqual(rig.opener.opened, [], "a Command-click would open the link at 0,0")
+    }
+
+    func testCommandHoverIsOnlyOverTheTextWhileItsCellSizeIsKnown() async throws {
+        // The link ends in the last column, next to a legacy scroll bar.
+        let rig = try await rig(cols: 30, feed: "https://a.bc/" + String(repeating: "x", count: 17))
+        defer { rig.close() }
+        let view = rig.view
+        view.scroller.preferredStyleOverride = .legacy
+        XCTAssertNotNil(try rig.session.link(col: 29, row: 0), "the grid kept its link in the last column")
+        let y = view.bounds.height - 10
+        func hover(at point: NSPoint) throws -> String? {
+            view.mouseMoved(
+                with: try XCTUnwrap(
+                    NSEvent.mouseEvent(
+                        with: .mouseMoved, location: point, modifierFlags: .command, timestamp: 0, windowNumber: 0,
+                        context: nil, eventNumber: 0, clickCount: 0, pressure: 0)))
+            return view.hoveredLink
+        }
+        let text = view.renderView.frame
+        let bar = view.scroller.frame
+        XCTAssertGreaterThanOrEqual(bar.minX, text.maxX, "legacy: the scroll bar is beside the text")
+        XCTAssertNotNil(try hover(at: NSPoint(x: text.maxX - 1, y: y)), "the text's last column hovers")
+        XCTAssertNil(try hover(at: NSPoint(x: bar.midX, y: y)), "the scroll bar beside it does not")
+        XCTAssertNotNil(try hover(at: NSPoint(x: 5, y: y)))
+        view.metrics = nil
+        try rig.perform("flags cmd")
+        XCTAssertNil(view.hoveredLink, "no cell size: Command finds no link at 0,0")
+        XCTAssertNil(try hover(at: NSPoint(x: 5, y: y)), "and neither does a move")
+    }
+
     func testCommandHoverIsOnlyForLinksThePolicyAllows() async throws {
         let rig = try await rig(cols: 60, feed: "file://otherhost/etc/passwd ftp://h/f")
         defer { rig.close() }
@@ -271,10 +330,25 @@ final class TerminalSelectionCallTests: XCTestCase {
         try file("b.fileloc")
         try file("c.terminal")
         try file("d.tool")
+        try file("e.pkg")
+        try file("f.mpkg")
+        try file("g.dmg")
+        try file("h.jar")
+        // Stored URLs, judged by type: the URL inside goes to its scheme's
+        // handler, whatever the scheme.
+        try file("j.url", "[InternetShortcut]\nURL=x-tessera-test://hello\n")
+        try file("k.vncloc")
+        try file("l.afploc")
+        // Disk images under another name than `.dmg`.
+        try file("m.img")
+        try file("n.iso")
         try folder("folder")
         try folder("Foo.app")
         try folder("Doc.rtfd")
         try folder("Plug.bundle")
+        // A folder's type says nothing of its name: only the extension
+        // rule shows it (a `.jar` file's type is executable already).
+        try folder("i.jar")
         for (alias, target) in [("alias-to-app", "Foo.app"), ("alias-to-txt", "notes.txt")] {
             let data = try directory.appendingPathComponent(target).bookmarkData(options: .suitableForBookmarkFile)
             try URL.writeBookmarkData(data, to: directory.appendingPathComponent(alias))
@@ -301,6 +375,7 @@ final class TerminalSelectionCallTests: XCTestCase {
         }
         for revealed in [
             "run.command", "script.sh", "tool", "link.webloc", "a.inetloc", "b.fileloc", "c.terminal", "d.tool",
+            "e.pkg", "f.mpkg", "g.dmg", "h.jar", "i.jar", "j.url", "k.vncloc", "l.afploc", "m.img", "n.iso",
             "Foo.app", "Doc.rtfd", "Plug.bundle", "link-to-app", "link-to-tool.txt", "link-to-webloc.txt", "readme.txt",
             "alias-to-app", "alias-to-txt",
         ] {
@@ -326,6 +401,35 @@ final class TerminalSelectionCallTests: XCTestCase {
         }
         XCTAssertEqual(rig.opener.opened.map(\.lastPathComponent), ["notes.txt"])
         XCTAssertEqual(rig.opener.revealed.map(\.lastPathComponent), ["run.command", "Foo.app"])
+    }
+
+    func testCommandHoverOverFileLinksNeverLooksThemUpAndAClickDoes() async throws {
+        let directory = try makeFiles()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let names = ["notes.txt", "run.command", "missing.txt"]
+        let feed = names.map { directory.appendingPathComponent($0).absoluteString }.joined(separator: "\r\n")
+        let rig = try await rig(rows: 4, cols: 200, feed: feed)
+        defer { rig.close() }
+        let files = CountingFileManager()
+        rig.view.linkFileManager = files
+        try rig.perform("flags cmd")
+        for row in 0..<names.count {
+            for col in [8, 10, 20, 30, 40] {
+                try rig.perform("move \(row),\(col) mods=cmd")
+                XCTAssertNotNil(rig.view.hoveredLink, "\(names[row]) at column \(col) is underlined")
+            }
+        }
+        try rig.perform("flags none")
+        try rig.perform("flags cmd")
+        XCTAssertNotNil(rig.view.hoveredLink, "Command pressed again over the link")
+        XCTAssertEqual(files.lookups, 0, "a hover never touches the file system")
+        for row in 0..<names.count {
+            try rig.perform("down \(row),10 mods=cmd")
+            try rig.perform("up mods=cmd")
+        }
+        XCTAssertGreaterThan(files.lookups, 0, "a click looks the file up, through the view's file manager")
+        XCTAssertEqual(rig.opener.opened.map(\.lastPathComponent), ["notes.txt"])
+        XCTAssertEqual(rig.opener.revealed.map(\.lastPathComponent), ["run.command"])
     }
 
     // MARK: Click during a composition
@@ -366,4 +470,29 @@ final class TerminalSelectionCallTests: XCTestCase {
             XCTAssertEqual(received, [])
         }
     #endif
+}
+
+/// Counts the file system lookups a link's policy makes through it.
+final class CountingFileManager: FileManager, @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    /// `fileExists` and `isExecutableFile` calls so far.
+    var lookups: Int { lock.withLock { count } }
+
+    private func counted<T>(_ body: () -> T) -> T {
+        lock.withLock { count += 1 }
+        return body()
+    }
+
+    override func fileExists(atPath path: String) -> Bool {
+        counted { super.fileExists(atPath: path) }
+    }
+
+    override func fileExists(atPath path: String, isDirectory: UnsafeMutablePointer<ObjCBool>?) -> Bool {
+        counted { super.fileExists(atPath: path, isDirectory: isDirectory) }
+    }
+
+    override func isExecutableFile(atPath path: String) -> Bool {
+        counted { super.isExecutableFile(atPath: path) }
+    }
 }

@@ -28,8 +28,10 @@ import os
 ///   through the core (a drag, a double-click word, a triple-click line,
 ///   Option or ⌥⌘ for a block, Shift to adjust), scrolling the view while
 ///   the pointer is above or below it. Command-hover underlines a link under
-///   the pointer and shows a pointing hand; a Command-click opens it through
-///   ``linkOpener`` when ``LinkPolicy`` allows. Copy and Select All are the
+///   the pointer and shows a pointing hand; a Command-click opens the link
+///   that was under the press through ``linkOpener`` when ``LinkPolicy``
+///   allows (a `file:` link is looked up on disk only then). No gesture
+///   begins while the cell size is unknown. Copy and Select All are the
 ///   Edit menu's; nothing is copied on select.
 /// - Scrollback: the wheel and trackpad move the view through the core;
 ///   the View menu's ⌘↑/⌘↓ page and ⌘Home/⌘End jump (``scroll(to:)``);
@@ -190,6 +192,8 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
 
     /// What a Command-click opens a link with. Tests record instead.
     var linkOpener: any LinkOpening = WorkspaceLinkOpener()
+    /// What a Command-click looks `file:` links up with. Tests count.
+    var linkFileManager: FileManager = .default
     /// Scrolls the view while a selection drag has the pointer outside it.
     let autoscroller = SelectionAutoscroller()
     /// The link under the pointer while Command is held (the string the core
@@ -839,6 +843,12 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         return [(beam, textCursor), (bar, .arrow)]
     }
 
+    /// The cursor ``cursorRects()`` puts at `point` (view coordinates,
+    /// AppKit's hit test), or the arrow where no rect does.
+    func cursor(at point: NSPoint) -> NSCursor {
+        cursorRects().first { isMousePoint(point, in: $0.0) }?.1 ?? .arrow
+    }
+
     /// The cursor over the text: the pointing hand over a link while Command
     /// is held, the I-beam otherwise.
     var textCursor: NSCursor { hoveredLink == nil ? .iBeam : .pointingHand }
@@ -1110,7 +1120,9 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         gesture = nil
         autoscroller.stop()
         lastPointer = convert(event.locationInWindow, from: nil)
-        if outcome == .ignored {
+        // With no cell size every point is cell 0,0: no selection or link
+        // click starts there.
+        if outcome == .ignored, metrics != nil {
             beginGesture(event)
         }
     }
@@ -1163,8 +1175,10 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         super.flagsChanged(with: event)
     }
 
+    /// The tracking area covers the whole view, scroll bar included: the
+    /// cursor is the one ``cursorRects()`` gives for the pointer's spot.
     override func cursorUpdate(with event: NSEvent) {
-        textCursor.set()
+        cursor(at: convert(event.locationInWindow, from: nil)).set()
     }
 
     /// The button of an `otherMouse` event: middle, back or forward. Buttons
@@ -1377,7 +1391,9 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         let cell = gridCell(at: lastPointer ?? .zero)
         if flags.contains(.command), !flags.contains(.option) {
             if Self.isLinkModifier(flags), event.clickCount == 1 {
-                gesture = .link(press: cell, moved: false)
+                // The link is the one under the press: output that scrolls
+                // the screen before the release does not change it.
+                gesture = .link(press: cell, link: try? session.link(col: cell.col, row: cell.row), moved: false)
             }
             return
         }
@@ -1404,9 +1420,9 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
                 gesture = .selecting(last: cell)
             }
             autoscroller.update(direction: autoscrollDirection(of: point))
-        case .link(let press, _)?:
+        case .link(let press, let link, _)?:
             if cell != press {
-                gesture = .link(press: press, moved: true)
+                gesture = .link(press: press, link: link, moved: true)
             }
         case nil:
             break
@@ -1414,23 +1430,22 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     }
 
     /// The left button went up: autoscroll stops, a Command-click that
-    /// stayed in its cell opens the link there.
+    /// stayed in its cell opens the link that was there at the press.
     private func endGesture(_ event: NSEvent) {
         autoscroller.stop()
         defer { gesture = nil }
-        guard case .link(let press, let moved)? = gesture, !moved else { return }
+        guard case .link(let press, let link, let moved)? = gesture, !moved else { return }
         let point = convert(event.locationInWindow, from: nil)
         lastPointer = point
-        guard gridCell(at: point) == press else { return }
-        openLink(at: press)
+        guard gridCell(at: point) == press, let link else { return }
+        openLink(link)
     }
 
-    /// Opens the link under `cell` if there is one and the policy allows
-    /// (Finder shows a file that would launch something).
-    private func openLink(at cell: GridCell) {
-        guard let link = try? session.link(col: cell.col, row: cell.row),
-            let action = LinkPolicy.action(for: link)
-        else { return }
+    /// Opens `link` if the policy allows (Finder shows a file that would
+    /// launch something). A `file:` link is looked up on disk here, on the
+    /// click, never on hover.
+    private func openLink(_ link: String) {
+        guard let action = LinkPolicy.action(for: link, fileManager: linkFileManager) else { return }
         switch action {
         case .open(let url): linkOpener.open(url)
         case .reveal(let url): linkOpener.reveal(url)
@@ -1489,17 +1504,21 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
 
     /// Underlines the link under the pointer while Command is held, shows
     /// the pointing hand over it, and clears both when Command is released,
-    /// the pointer leaves the link or a button is down.
+    /// the pointer leaves the link or a button is down. The policy is asked
+    /// about the URL alone (``LinkPolicy/allows(_:localHostName:)``): a hover
+    /// never touches the file system, where a hung mount would stall the
+    /// pointer. Only the text hovers, while its cell size is known: a click
+    /// opens nothing elsewhere.
     private func updateHover(modifiers: NSEvent.ModifierFlags) {
         guard Self.isLinkModifier(modifiers.intersection(.deviceIndependentFlagsMask)), gesture == nil,
-            let point = lastPointer
+            let point = lastPointer, metrics != nil, isMousePoint(point, in: renderView.frame)
         else {
             setHover(link: nil, cell: nil)
             return
         }
         let cell = gridCell(at: point)
         if cell == hoveredCell, hoveredLink != nil { return }
-        guard let link = try? session.link(col: cell.col, row: cell.row), LinkPolicy.action(for: link) != nil else {
+        guard let link = try? session.link(col: cell.col, row: cell.row), LinkPolicy.allows(link) else {
             setHover(link: nil, cell: nil)
             return
         }
@@ -1519,7 +1538,7 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         needsRender = true
         guard linkChanged else { return }
         window?.invalidateCursorRects(for: self)
-        if lastPointer != nil, window != nil { textCursor.set() }
+        if let point = lastPointer, window != nil { cursor(at: point).set() }
     }
 
     // MARK: Scrollback
@@ -2186,9 +2205,10 @@ private enum PointerGesture {
     /// pointer reaches another cell (a drag inside the cell pressed selects
     /// nothing).
     case selecting(last: GridCell)
-    /// A Command-click: the link under `press` opens on release if the
-    /// pointer did not leave the cell (a Command-drag does nothing).
-    case link(press: GridCell, moved: Bool)
+    /// A Command-click: `link`, the link under `press` when the button went
+    /// down (`nil` for none), opens on release if the pointer did not leave
+    /// the cell (a Command-drag does nothing).
+    case link(press: GridCell, link: String?, moved: Bool)
 }
 
 /// A call a gesture or the Edit menu makes on the core's selection.

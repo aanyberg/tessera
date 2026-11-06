@@ -800,6 +800,96 @@ final class TerminalScrollTests: XCTestCase {
         XCTAssertTrue(hidden.first?.1 === NSCursor.iBeam)
     }
 
+    /// The tracking area spans the scroll bar too: its cursor update shows
+    /// the arrow there, not the I-beam.
+    func testACursorUpdateOverTheScrollerShowsTheArrow() async throws {
+        try await open()
+        let scroller = view.scroller
+        scroller.update(try position)
+        func update(at point: NSPoint) throws -> NSCursor {
+            NSCursor.crosshair.set()
+            let event = try XCTUnwrap(
+                NSEvent.enterExitEvent(
+                    with: .cursorUpdate, location: view.convert(point, to: nil), modifierFlags: [], timestamp: 0,
+                    windowNumber: window.windowNumber, context: nil, eventNumber: 0, trackingNumber: 0, userData: nil))
+            view.cursorUpdate(with: event)
+            return NSCursor.current
+        }
+        for style: NSScroller.Style in [.overlay, .legacy] {
+            scroller.preferredStyleOverride = style
+            XCTAssertFalse(scroller.isHidden, "\(style)")
+            let bar = scroller.frame
+            let text = view.renderView.frame
+            XCTAssertTrue(try update(at: NSPoint(x: bar.midX, y: bar.midY)) === NSCursor.arrow, "\(style): over the scroll bar")
+            XCTAssertTrue(try update(at: NSPoint(x: text.minX + 1, y: text.midY)) === NSCursor.iBeam, "\(style): over the text")
+        }
+        scroller.preferredStyleOverride = .overlay
+        scroller.update(.init(offset: 0, history: 0, rows: try position.rows))
+        XCTAssertTrue(scroller.isHidden)
+        XCTAssertTrue(
+            try update(at: NSPoint(x: view.bounds.maxX - 1, y: view.bounds.midY)) === NSCursor.iBeam,
+            "no scroll bar: the I-beam up to the edge")
+        // AppKit's hit test, as for the pointer reports: in this unflipped
+        // view the top edge is inside, the bottom edge is not; where no
+        // rect is, the arrow.
+        let bounds = view.bounds
+        XCTAssertTrue(view.cursor(at: NSPoint(x: bounds.midX, y: bounds.maxY)) === NSCursor.iBeam, "top edge")
+        XCTAssertTrue(view.cursor(at: NSPoint(x: bounds.midX, y: bounds.minY)) === NSCursor.arrow, "bottom edge")
+        XCTAssertTrue(view.cursor(at: NSPoint(x: bounds.minX - 5, y: bounds.midY)) === NSCursor.arrow, "outside")
+    }
+
+    /// The hover sets the cursor itself when the link under the pointer
+    /// changes: leaving a link for the scroll bar beside it shows the arrow.
+    func testLeavingALinkForTheScrollerShowsTheArrow() async throws {
+        try await open(lines: 100)
+        try requireSurface()
+        let scroller = view.scroller
+        for style: NSScroller.Style in [.overlay, .legacy] {
+            scroller.preferredStyleOverride = style
+            tick()
+            scroller.update(try position)
+            XCTAssertFalse(scroller.isHidden, "\(style)")
+            let metrics = try XCTUnwrap(view.metrics)
+            // A link that ends in the last column, on a line of its own.
+            let url = "https://a.bc/" + String(repeating: "x", count: Int(metrics.cols) - 13)
+            try view.session.write(Array("\r\n\(url)".utf8))
+            var row: UInt16?
+            try await waitUntil("\(style): the link is in the last column") {
+                row = (0..<metrics.rows).last { (try? self.view.session.link(col: metrics.cols - 1, row: $0)) == url }
+                return row != nil
+            }
+            let fromTop = (CGFloat(metrics.paddingPx) + (CGFloat(try XCTUnwrap(row)) + 0.5) * CGFloat(metrics.cellHeightPx))
+                / CGFloat(metrics.scale)
+            let y = view.bounds.height - fromTop
+            func move(to point: NSPoint) throws {
+                view.mouseMoved(
+                    with: try XCTUnwrap(
+                        NSEvent.mouseEvent(
+                            with: .mouseMoved, location: view.convert(point, to: nil), modifierFlags: .command,
+                            timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 0,
+                            pressure: 0)))
+            }
+            let onLink = NSPoint(x: scroller.frame.minX - 1, y: y)
+            if style == .legacy {
+                XCTAssertEqual(view.cell(at: onLink).cell.col, metrics.cols - 1, "legacy: the last column")
+            }
+            try move(to: onLink)
+            XCTAssertEqual(view.hoveredLink, url, "\(style)")
+            XCTAssertTrue(NSCursor.current === NSCursor.pointingHand, "\(style): the hand over the link")
+            NSCursor.crosshair.set()
+            try move(to: NSPoint(x: scroller.frame.midX, y: y))
+            if style == .legacy {
+                XCTAssertNil(view.hoveredLink, "legacy: the scroll bar beside the text hovers nothing")
+                XCTAssertTrue(NSCursor.current === NSCursor.arrow, "legacy: the arrow over the scroll bar")
+            } else {
+                // An overlay bar floats over the text: the link stays, and
+                // the cursor rects give the arrow there.
+                XCTAssertEqual(view.hoveredLink, url, "overlay")
+            }
+            view.mouseExited(with: NSEvent())
+        }
+    }
+
     // MARK: Show scroll bars: Always (ADR 0032)
 
     func testALegacyScrollerNarrowsTheGrid() async throws {
