@@ -2,13 +2,12 @@
 # Tessera.app with xcodebuild, zip it and attach it to a GitHub Release whose
 # notes come from git-cliff (cliff.toml).
 #
-# When the six APPLE_* repository secrets exist (docs/releasing.md, "Release
-# signing") the app is re-signed with the Developer ID certificate and the
-# hardened runtime, notarized with notarytool and stapled before it is zipped.
-# Without them (forks, tags before the secrets were added) those steps are
-# skipped with a notice and the ad-hoc signed build ships as before; users then
-# strip the quarantine attribute (see docs/releasing.md). The temporary keychain
-# holding the certificate is deleted at the end of the job, even on failure.
+# When the six APPLE_* repository secrets exist the app is re-signed with the
+# Developer ID certificate and the hardened runtime, notarized with notarytool
+# and stapled before it is zipped. Without them (forks, tags before the secrets
+# were added) those steps are skipped with a notice and the ad-hoc signed build
+# ships as before; users then strip the quarantine attribute. The temporary
+# keychain holding the certificate is deleted at the end of the job, even on failure.
 name: Release
 
 on:
@@ -107,9 +106,9 @@ jobs:
           elif [[ "$IS_FORK" == true ]]; then
             echo "::notice title=Developer ID signing skipped::signing never runs in a fork; shipping the ad-hoc signed build"
           elif (( ${#missing[@]} == ${#names[@]} )); then
-            echo "::notice title=Developer ID signing skipped::no APPLE_* signing secrets are set; shipping the ad-hoc signed, not notarized build (docs/releasing.md, Release signing)"
+            echo "::notice title=Developer ID signing skipped::no APPLE_* signing secrets are set; shipping the ad-hoc signed, not notarized build"
           elif (( ${#missing[@]} > 0 )); then
-            echo "::error::signing secrets are only partly set; missing: ${missing[*]}. Set all six or none (docs/releasing.md, Release signing)"
+            echo "::error::signing secrets are only partly set; missing: ${missing[*]}. Set all six or none"
             exit 1
           else
             enabled=true
@@ -185,7 +184,7 @@ jobs:
             echo "signing nested code: $nested"
             "${sign[@]}" "$nested"
           done < <(find "$app/Contents" -depth \( -name '*.framework' -o -name '*.xpc' -o -name '*.appex' -o -name '*.app' -o -name '*.dylib' \))
-          # Entitlements: see docs/releasing.md, Release signing (none beyond the file the ad-hoc build already uses).
+          # Entitlements: none beyond the file the ad-hoc build already uses.
           "${sign[@]}" --entitlements apps/macos/Resources/Tessera.entitlements "$app"
           codesign --verify --deep --strict --verbose=2 "$app"
           details="$(codesign -dvv "$app" 2>&1)"
