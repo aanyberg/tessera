@@ -114,7 +114,9 @@ Tracked: churn and leak checks for Rust, FFI and the app (#214); FFI fuzzing, AS
   whole environment (#217).
 - An unknown OSC command's bytes are traced uncapped (`crates/tessera-term/src/osc.rs`; S8). No subscriber is
   installed in the app today, so nothing is written.
-- The app ships ad-hoc signed and not notarized, with the App Sandbox off (a terminal must spawn arbitrary
-  programs) and hardened runtime on (#50).
+- The app ships Developer ID signed and notarized when the six release secrets exist, ad-hoc signed and not
+  notarized otherwise, always with the App Sandbox off (a terminal must spawn arbitrary programs) and hardened
+  runtime on (#50). The signing secrets reach only the release job, on tag pushes from the main repository; fork
+  and `pull_request` runs never see them and never sign.
 - portable-pty's `close_random_fds` allocates between `fork` and `exec`; not known to be exploitable, noted for the
   pty owner.
