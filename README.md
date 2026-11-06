@@ -133,7 +133,8 @@ just app-test  # TesseraKit XCTest suite (headless, Thread Sanitizer)
 just run       # launch Tessera.app
 ```
 
-Workflow, commit conventions and the release process are in [`CONTRIBUTING.md`](CONTRIBUTING.md).
+Workflow and commit conventions are in [`CONTRIBUTING.md`](CONTRIBUTING.md); testing, debugging and releasing are
+under [`docs/`](docs/).
 
 ### Architecture
 
