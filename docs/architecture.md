@@ -5,25 +5,33 @@ is the map; the ADRs record why.
 
 ## Layers
 
-```
-┌──────────────────────────── Tessera.app (Swift) ─────────────────────────────┐
-│ NSWindow · tab bar · split handles · menus · Preferences (SwiftUI) · dialogs │
-│ TerminalSurfaceView (NSView + CAMetalLayer) · keyboard / IME / mouse events  │
-└─────────────────────────────────────┬────────────────────────────────────────┘
-                                      │ C ABI: crates/tessera-ffi (cbindgen)
-┌─────────────────────────────────────┴────────────────────────────────────────┐
-│ tessera-app-core   windows → tabs → pane tree → sessions · commands ·        │
-│                    keybindings · config store · plugin host · control server │
-├──────────────┬──────────────┬──────────────┬───────────────┬─────────────────┤
-│ tessera-pty  │ tessera-vt   │ tessera-grid │ tessera-render│ tessera-search  │
-│ tessera-term (vt + grid + modes)  ·  tessera-shell-integration (OSC 133/7)   │
-├──────────────┴──────────────┴──────────────┴───────────────┴─────────────────┤
-│ tessera-config · tessera-plugin-api · tessera-protocol · tessera-control     │
-└──────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph shell["Tessera.app (Swift)"]
+        ui["NSWindow · tab bar · menus · Preferences · dialogs"]
+        view["TerminalSurfaceView: CAMetalLayer · keyboard · IME · mouse"]
+    end
+    ffi["tessera-ffi: C ABI (cbindgen)"]
+    core["tessera-app-core: sessions · commands · keybindings · config store · plugin host · control server"]
+    subgraph engine["Terminal engine"]
+        pty["tessera-pty"]
+        term["tessera-term (vt + grid + modes)"]
+        render["tessera-render (wgpu / Metal)"]
+        search["tessera-search"]
+        si["tessera-shell-integration"]
+    end
+    subgraph contracts["Configuration and contracts"]
+        config["tessera-config"]
+        api["tessera-plugin-api"]
+        proto["tessera-protocol"]
+        control["tessera-control"]
+    end
+    shell --> ffi --> core
+    core --> engine
+    core --> contracts
 ```
 
-The diagram is the target design; today the core holds sessions only
-(ADR 0015).
+The diagram is the target design; today the core holds sessions only (ADR 0015).
 
 ## Crates
 
@@ -153,6 +161,23 @@ stay at the default class (ADR 0018 explains why).
    it, and draws the copy with `tessera-render` (ADR 0014).
 6. Events worth observing (`CommandFinished`, `TitleChanged`) are fanned out
    to plugins and socket subscribers.
+
+```mermaid
+sequenceDiagram
+    participant V as TerminalSurfaceView
+    participant C as tessera-app-core
+    participant T as tessera-term
+    participant P as PTY and child
+    participant R as tessera-render
+    V->>C: tessera_session_send_key
+    C->>T: encode key with the terminal's modes
+    C-->>P: queue input, never blocking
+    P->>T: child output (reader thread)
+    T-->>C: requests: bell, title, clipboard, cwd
+    C-->>V: on_session_output
+    V->>C: tessera_surface_render (display link)
+    C->>R: copy visible rows under the lock, draw after releasing it
+```
 
 ## Future frontends
 
