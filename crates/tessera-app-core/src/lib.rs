@@ -61,8 +61,8 @@ pub use session::{SessionEvent, SessionId, SessionObserver};
 pub use config_watch::{CONFIG_DIR_POLL_INTERVAL, CONFIG_WATCH_STOP_CAP};
 pub use tessera_config::{Config, ConfigPaths, ConfigStore, ShellIntegration, WatchOptions};
 pub use tessera_pty::{
-    ExitStatus, ForegroundProcess, MAX_NAME_BYTES as MAX_FOREGROUND_NAME_BYTES, Program, PtyError,
-    PtySize, SpawnOptions,
+    ExitStatus, ForegroundProcess, MAX_FOREGROUND_NAME_BYTES, Program, PtyError, PtySize,
+    SpawnOptions,
 };
 pub use tessera_shell_integration::Cwd;
 
@@ -1208,7 +1208,13 @@ impl App {
     ///
     /// Every job counts, whatever it is. Only a shell with job control
     /// starts jobs, so a session running a [`Program::Command`] that is
-    /// not an interactive shell never reports one.
+    /// not an interactive shell reports one only if that program hands the
+    /// terminal to a process group of its own (`tcsetpgrp`). An
+    /// interactive shell always takes the terminal back when its job ends;
+    /// such a program may not, and then reports a job (with an empty name
+    /// once that group has exited) until the program exits or takes the
+    /// terminal back: the answer is the terminal's foreground group,
+    /// whether or not that group still has processes.
     ///
     /// A snapshot that costs one `tcgetpgrp` (plus one or two process
     /// lookups when a job runs) and never waits for the child; call it when the answer is needed, not per frame.
@@ -1647,10 +1653,12 @@ impl App {
     }
 
     /// Detaches and releases session `id`'s view. The session keeps its
-    /// size. The last view to go releases the process's GPU too (the font
-    /// database stays loaded), so a GPU that went away (an external GPU
-    /// unplugged) is not reused: the next attach brings up a new one. Must
-    /// be called on the main thread.
+    /// size, and its terminal keeps the view's cell size, so the pixel
+    /// size reports (`CSI 14 t`, `CSI 16 t`) answer as before until a
+    /// view is attached again (ADR 0024). The last view to go releases
+    /// the process's GPU too (the font database stays loaded), so a GPU
+    /// that went away (an external GPU unplugged) is not reused: the next
+    /// attach brings up a new one. Must be called on the main thread.
     ///
     /// # Errors
     ///
@@ -3671,13 +3679,12 @@ mod tests {
                     }
                 }
             };
-            session::set_lock_pause(Some((
+            let pause = session::set_lock_pause(
                 session.delivery_key(),
-                session::LockPause::Viewport,
-                Arc::new(pause),
-            )));
+                (session::LockPause::Viewport, Arc::new(pause)),
+            );
             let clicked = url(app.link_at(id, top).unwrap());
-            session::set_lock_pause(None);
+            drop(pause);
             let shown = url(app.link_at(id, top).unwrap());
             if clicked != shown || clicked.is_none() {
                 wrong.push((round, cols, clicked, shown));
@@ -3717,7 +3724,9 @@ mod tests {
     /// #189 e (kept by design, ADR 0024): after `detach_view` the pixel
     /// size reports still answer the detached view's cell, since a detach
     /// is usually followed by a re-attach (#178) and a transient wrong
-    /// answer is worse than a stale one.
+    /// answer is worse than a stale one. Needs a GPU: skipped (it passes
+    /// without checking) under `TESSERA_SKIP_GPU_TESTS`, like every
+    /// offscreen-view test here.
     #[test]
     fn the_cell_size_report_keeps_the_last_view_after_a_detach() {
         let app = app();
@@ -4964,6 +4973,7 @@ mod tests {
     /// to its grid; `false` when GPU tests are skipped.
     fn attach_offscreen(app: &App, id: SessionId, size: PhysicalSize, scale: f32) -> bool {
         if std::env::var_os("TESSERA_SKIP_GPU_TESTS").is_some() {
+            eprintln!("TESSERA_SKIP_GPU_TESTS is set; skipping");
             return false;
         }
         let theme = app.view_theme();

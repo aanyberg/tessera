@@ -529,6 +529,11 @@ pub struct ForegroundProcess {
     /// bytes after the NUL are zero. Empty (a lone NUL) when it cannot be
     /// read, for example once that process has exited while the rest of
     /// a pipeline runs on: show a generic description then.
+    ///
+    /// The name is the executable's file name, which anyone who can create
+    /// a file chooses: it may hold control characters (ESC, BEL, newline)
+    /// and bidirectional formatting characters. Escape or replace them
+    /// before showing the name (docs/security.md S3).
     pub name: [c_char; 65],
 }
 
@@ -576,7 +581,11 @@ impl ForegroundProcess {
 /// (ADR 0031).
 ///
 /// Only a shell with job control starts jobs, so a session spawned with a
-/// program that is not an interactive shell never reports one. The answer
+/// program that is not an interactive shell reports one only if that
+/// program hands the terminal to a process group of its own (`tcsetpgrp`);
+/// unlike an interactive shell it may not take the terminal back, and then
+/// `running` stays true (with an empty `name` once that group has exited)
+/// until the program exits or takes the terminal back. The answer
 /// is a snapshot (the job may end as soon as this returns): read it when
 /// the user asks to close, not per frame. It costs one `tcgetpgrp` (plus
 /// one or two process lookups when a job runs) and
