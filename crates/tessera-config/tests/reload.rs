@@ -733,9 +733,17 @@ fn watch_starts_over_an_unopenable_file_and_recovers() {
 /// #262 item 9, the adversarial e2e case `inplace:150,10,300,0`: launched
 /// with a `config.toml` that does not load (so clipboard writes are
 /// refused), the same broken file is saved in place ten times by an editor
-/// that truncates it, leaves it empty for 150 ms (a debounce: the watcher
-/// reads the empty file) and then writes it, 300 ms apart. Writes stay
-/// refused throughout, sampled continuously, on both backends.
+/// that truncates it, leaves it empty long enough for the watcher to read
+/// the empty file, and then writes it. Writes stay refused throughout,
+/// sampled continuously, on both backends.
+///
+/// Each round waits for the watcher to read the empty file (the read
+/// clears the recorded error, so it is reported as `Changed`) and then the
+/// broken one (`Invalid`, news again). A fixed 150 ms empty window is not
+/// enough: the polling backend reads a change one tick plus a debounce
+/// after it, 100 to 200 ms, so on a loaded machine it can miss every
+/// window, see only the broken file, which it rightly does not report, and
+/// leave the empty file untested (#296).
 #[test]
 fn in_place_saves_from_a_broken_launch_never_turn_clipboard_writes_on() {
     use std::io::Write;
@@ -766,31 +774,37 @@ fn in_place_saves_from_a_broken_launch_never_turn_clipboard_writes_on() {
                 }
             })
         };
-        let mut events = 0;
-        for _ in 0..10 {
+        for round in 0..10 {
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .truncate(true)
                 .open(paths.config_file())
                 .unwrap();
-            std::thread::sleep(Duration::from_millis(150));
+            let empty = expect_changed(
+                watcher
+                    .recv_timeout(EVENTUALLY)
+                    .unwrap_or_else(|e| panic!("{backend:?} {round}: empty file unread: {e}")),
+                backend,
+            );
+            assert!(
+                !empty.config.terminal.clipboard_write,
+                "{backend:?} {round}: the empty file turned writes on"
+            );
             file.write_all(BROKEN).unwrap();
             drop(file);
-            std::thread::sleep(Duration::from_millis(300));
-            while watcher.try_recv().is_ok() {
-                events += 1;
+            match watcher.recv_timeout(EVENTUALLY) {
+                Ok(ConfigEvent::Invalid(_)) => {}
+                other => panic!("{backend:?} {round}: expected Invalid, got {other:?}"),
             }
         }
-        std::thread::sleep(Duration::from_millis(500));
         stop.store(true, Ordering::Relaxed);
         sampler.join().unwrap();
         assert_eq!(
             on.load(Ordering::Relaxed),
             0,
-            "{backend:?}: writes turned on ({events} events)"
+            "{backend:?}: writes turned on"
         );
         assert!(!store.config().terminal.clipboard_write, "{backend:?}");
-        assert!(events > 0, "{backend:?}: the watcher saw no save at all");
     }
 }
 
