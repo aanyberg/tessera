@@ -1016,28 +1016,37 @@ final class PaneTests: XCTestCase {
         for pane in [left, right] {
             try await start("yes", in: pane)
         }
+        // The sizes the resizing visits: every (window width, window
+        // height, divider) combination once per cycle, the periods being
+        // coprime.
+        let widths: [CGFloat] = [900, 1200]
+        let heights: [CGFloat] = [600, 600, 800]
+        let dividers: [CGFloat] = [200, 300, 400, 500, 600]
+        let cycle = widths.count * heights.count * dividers.count
         var step = 0
         // One step of window and divider resizing.
         func resize() {
             step += 1
-            let width: CGFloat = step % 2 == 0 ? 1200 : 900
-            window.setContentSize(NSSize(width: width, height: step % 3 == 0 ? 800 : 600))
-            splitView.setPosition(CGFloat(200 + (step * 37) % 400), ofDividerAt: 0)
+            window.setContentSize(NSSize(width: widths[step % widths.count], height: heights[step % heights.count]))
+            splitView.setPosition(dividers[step % dividers.count], ofDividerAt: 0)
             controller.paneContainer.layoutSubtreeIfNeeded()
         }
-        // A second of it first: the panes' drawables and glyph atlases
-        // reach every size, a one-off step of up to about 150 MB that then
-        // swings up and down with the sizes, so the budget below measures
-        // growth past the warm-up's highest footprint.
+        // A full cycle first: the panes' drawables, glyph atlases and
+        // re-wrapped scrollback reach every size, a one-off step of up to
+        // about 450 MB under TSan that then swings up and down with the
+        // sizes, so the budget below measures growth past the warm-up's
+        // highest footprint. Counted in steps, not time: a slow runner that
+        // got through a few sizes in a time-based warm-up measured the rest
+        // of that step as growth (#319).
         var baseline = Self.physFootprint()
-        let warmUp = ContinuousClock.now + .seconds(1)
-        while ContinuousClock.now < warmUp {
+        while step < cycle {
             resize()
             try await Task.sleep(for: .milliseconds(20))
             baseline = max(baseline, Self.physFootprint())
         }
         var peak = baseline
         var worstLag: Duration = .zero
+        let floodStart = step
         let end = ContinuousClock.now + .seconds(3)
         while ContinuousClock.now < end {
             resize()
@@ -1066,8 +1075,11 @@ final class PaneTests: XCTestCase {
         let closeTime = ContinuousClock.now - closeStart
 
         let growthMB = Double(peak - baseline) / 1_048_576
-        print("pane flood: \(step) resize steps, growth \(Int(growthMB)) MB, worst lag \(worstLag), close \(closeTime)")
-        XCTAssertGreaterThan(step, 30, "the resizing kept up (79 steps under TSan locally)")
+        let floodSteps = step - floodStart
+        print("pane flood: \(floodSteps) resize steps, growth \(Int(growthMB)) MB, worst lag \(worstLag), close \(closeTime)")
+        // 65 steps under TSan locally, 32 with the test host in the
+        // background policy beside CPU burners, 27 with it starved.
+        XCTAssertGreaterThanOrEqual(floodSteps, 10, "the resizing kept up")
         XCTAssertLessThan(growthMB, 100, "footprint grew \(growthMB) MB during the flood")
         XCTAssertLessThan(worstLag, .milliseconds(500), "main actor lagged \(worstLag)")
         XCTAssertLessThan(closeTime, .seconds(3), "closing took \(closeTime)")
