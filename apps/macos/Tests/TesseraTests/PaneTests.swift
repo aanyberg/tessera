@@ -1613,9 +1613,9 @@ extension PaneTests {
     }
 
     /// The standing flood check on a maximized tab: `yes` in the maximized
-    /// pane and in a hidden one while the window resizes. Memory stays
-    /// bounded, the main actor keeps up, the hidden pane is never resized,
-    /// and closing the tab is quick.
+    /// pane and in a hidden one. Without resizing, memory stays bounded;
+    /// while the window resizes, the main actor keeps up, the hidden pane is
+    /// never resized, and closing the tab is quick.
     func testAFloodInAMaximizedTabStaysBoundedAndClosesQuickly() async throws {
         defer { appDelegate.paneDimming = 0 }
         appDelegate.paneDimming = 0.5
@@ -1630,65 +1630,70 @@ extension PaneTests {
         }
         let hiddenSize = hidden.view.frame.size
         let hiddenResizes = hidden.view.coreResizeCount
-        let sizes = [NSSize(width: 900, height: 600), NSSize(width: 1200, height: 800), NSSize(width: 1000, height: 700)]
-        var step = 0
-        func resize() {
-            step += 1
-            window.setContentSize(sizes[step % sizes.count])
-            controller.paneContainer.layoutSubtreeIfNeeded()
-        }
-        // Warm up until the footprint levels off, counted in size cycles,
-        // not in time or a fixed number of steps: the flood's one-off step
-        // (the shown pane's history re-wrapped at each width; where the
-        // window renders, as on CI, its drawables and atlases at each size)
-        // must be over before the baseline is taken. A fixed 9 steps ended
-        // mid-step on a slow runner, which then measured 121 MB of it as
-        // growth (#325). Levelled off: the highest footprints of the last
-        // five cycles lie within 4 MB of each other, neither rising nor
-        // falling (a big leak pages out and falls, and must not read as
-        // flat); the baseline is the highest of them. A leak never levels
-        // off and fails here, within 50 cycles, before it can page out.
-        var highs: [UInt64] = []  // each warm-up cycle's highest footprint
+
+        // Phase 1, the flood at a fixed size: memory. Warm up until the
+        // footprint levels off: the highest footprints of the last twelve
+        // 250 ms slices lie within 4 MB of each other. A leak of 1 KB per
+        // hidden-pane output (about 3 MB/s here) never levels off and fails
+        // within 15 s; a one-off drop (an allocator purge, seen on CI) only
+        // delays it. The baseline is the highest of those slices, and the
+        // next 5 s must not grow past it by the budget.
+        var highs: [UInt64] = []  // each warm-up slice's highest footprint
         func spreadMB() -> Double {
-            let last = highs.suffix(5)
+            let last = highs.suffix(12)
             return Double((last.max() ?? 0) - (last.min() ?? 0)) / 1_048_576
         }
-        while highs.count < 5 || spreadMB() >= 4 {
-            guard highs.count < 50 else {
-                let last = highs.suffix(5).map { $0 >> 20 }
-                XCTFail("the footprint never levelled off in 50 size cycles: the last five peaked at \(last) MB")
+        while highs.count < 12 || spreadMB() >= 4 {
+            guard highs.count < 60 else {
+                let last = highs.suffix(12).map { $0 >> 20 }
+                XCTFail("the footprint never levelled off in 15 s of flood: the last 3 s peaked at \(last) MB")
                 return
             }
             var high: UInt64 = 0
-            for _ in sizes {
-                resize()
+            let sliceEnd = ContinuousClock.now + .milliseconds(250)
+            while ContinuousClock.now < sliceEnd {
                 try await Task.sleep(for: .milliseconds(20))
                 high = max(high, Self.physFootprint())
             }
             highs.append(high)
         }
-        let baseline = highs.suffix(5).max() ?? 0
+        let baseline = highs.suffix(12).max() ?? 0
         var peak = baseline
+        let floodEnd = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < floodEnd {
+            try await Task.sleep(for: .milliseconds(20))
+            peak = max(peak, Self.physFootprint())
+        }
+        let growthMB = Double(peak - baseline) / 1_048_576
+        XCTAssertLessThan(growthMB, 20, "footprint grew \(growthMB) MB during the flood")
+
+        // Phase 2, the flood while the window resizes: what a maximized tab
+        // adds, not memory. Resizing a rendering window saw-tooths the
+        // footprint on CI whether or not a tab is maximized (#326), so no
+        // footprint budget here.
+        let sizes = [NSSize(width: 900, height: 600), NSSize(width: 1200, height: 800), NSSize(width: 1000, height: 700)]
+        var step = 0
         var worstLag: Duration = .zero
-        let end = ContinuousClock.now + .seconds(2)
-        while ContinuousClock.now < end {
-            resize()
+        let resizeEnd = ContinuousClock.now + .seconds(2)
+        while ContinuousClock.now < resizeEnd {
+            step += 1
+            window.setContentSize(sizes[step % sizes.count])
+            controller.paneContainer.layoutSubtreeIfNeeded()
             let start = ContinuousClock.now
             try await Task.sleep(for: .milliseconds(20))
             worstLag = max(worstLag, ContinuousClock.now - start - .milliseconds(20))
-            peak = max(peak, Self.physFootprint())
         }
+        XCTAssertGreaterThan(step, sizes.count, "the window resized")
         XCTAssertEqual(hidden.view.frame.size, hiddenSize, "the hidden pane is not resized")
         XCTAssertEqual(hidden.view.coreResizeCount, hiddenResizes)
+        XCTAssertTrue(hidden.view.isHiddenOrHasHiddenAncestor, "the hidden pane stays hidden")
         XCTAssertTrue(controller.isZoomed)
 
         let closeStart = ContinuousClock.now
         window.close()
         try await waitUntil("the tab closed") { appDelegate.windowControllers.isEmpty }
         let closeTime = ContinuousClock.now - closeStart
-        let growthMB = Double(peak - baseline) / 1_048_576
-        print("maximized flood: warm-up \(highs.count) size cycles, growth \(Int(growthMB)) MB, worst lag \(worstLag), close \(closeTime)")
-        XCTAssertLessThan(growthMB, 100, "footprint grew \(growthMB) MB during the flood")
+        print("maximized flood: warm-up \(highs.count) slices, growth \(Int(growthMB)) MB, \(step) resizes, worst lag \(worstLag), close \(closeTime)")
         XCTAssertLessThan(worstLag, .milliseconds(500), "main actor lagged \(worstLag)")
         XCTAssertLessThan(closeTime, .seconds(3), "closing took \(closeTime)")
     }
