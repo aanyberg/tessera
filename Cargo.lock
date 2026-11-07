@@ -2378,6 +2378,7 @@ dependencies = [
  "tessera-plugin-hello",
  "tessera-pty",
  "tessera-render",
+ "tessera-search",
  "tessera-shell-integration",
  "tessera-term",
  "thiserror 2.0.21",
@@ -2521,8 +2522,10 @@ dependencies = [
 name = "tessera-search"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "regex",
  "tessera-grid",
+ "tessera-term",
 ]
 
 [[package]]

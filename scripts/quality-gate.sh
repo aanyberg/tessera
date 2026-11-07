@@ -160,7 +160,7 @@ release_timing() {
         print -r -- "-- release timing run (self-test): exit $st"
         return "$st"
     fi
-    run_nextest --release -p tessera-app-core -E 'kind(lib) & (test(reader_lock_hold_is_bounded) | test(view_metrics_are_fast_while_output_floods_the_terminal) | test(scrolling_through_a_long_history_is_smooth) | test(a_flood_under_a_scrolled_view_keeps_captures_short))'
+    run_nextest --release -p tessera-app-core -E 'kind(lib) & (test(reader_lock_hold_is_bounded) | test(view_metrics_are_fast_while_output_floods_the_terminal) | test(scrolling_through_a_long_history_is_smooth) | test(a_flood_under_a_scrolled_view_keeps_captures_short) | test(search_lock_hold_is_bounded) | test(a_million_lines_))'
 }
 load_1min() {
     if [[ -n "$selftest" && -n "${TESSERA_GATE_TEST_LOAD:-}" ]]; then

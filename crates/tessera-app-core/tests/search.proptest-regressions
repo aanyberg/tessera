@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 33fc9483d00c5a590327a06f64010889a62beebcb55c66552562e31f2c5cc915 # shrinks to ops = [Feed(" "), Feed("   a a a a  "), Resize(2, 3)], regex = false, scrollback = 1
+cc 2052c34f2b04c3f123c3f176da49e50a83349afdc07e359dad8a1d5c50f6a0b5 # shrinks to ops = [Resize(5, 3), Step, Feed(" aaab  "), Feed("\r\naaa a a a  a   a  a a aa  a a一 aaa "), Step, Feed("\u{1b}[2;3H\r\na aa\r\n  a   aa aa a")], regex = true, scrollback = 14

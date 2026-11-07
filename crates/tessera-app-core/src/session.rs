@@ -99,7 +99,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, TryLockError};
 use std::thread::{self, JoinHandle, ThreadId};
@@ -113,6 +113,7 @@ use tessera_term::{CursorStyle, Request, Terminal};
 use crate::config_watch::Applied;
 use crate::input::MouseEvent;
 use crate::mouse;
+use crate::search::{SearchState, TerminalSource};
 use crate::selection::SelectionState;
 use crate::view::{MAX_VIEW_COLS, MAX_VIEW_ROWS};
 use crate::{ScrollPosition, ScrollTarget};
@@ -492,6 +493,13 @@ impl SharedTerminal {
     }
 }
 
+impl TerminalSource for Session {
+    fn read_terminal<R>(&self, f: impl FnOnce(&Terminal, u64) -> R) -> R {
+        let term = self.term.lock();
+        f(&term, self.resizes())
+    }
+}
+
 /// A running (or exited but not yet closed) session.
 pub(crate) struct Session {
     id: SessionId,
@@ -521,6 +529,12 @@ pub(crate) struct Session {
     /// input and terminal locks, after the view table's, never the other
     /// way round.
     selection: Mutex<SelectionState>,
+    /// The scrollback search (ADR 0038). Taken before the terminal lock,
+    /// never while it or the selection lock is held.
+    search: Mutex<SearchState>,
+    /// Resizes so far, counted under the terminal lock: a resize re-wraps
+    /// the history, so the search's matches hold only until the next one.
+    resizes: AtomicU64,
 }
 
 /// What a session's shell integration scripts reported (ADR 0022): its
@@ -928,6 +942,8 @@ impl Session {
             input: Mutex::new(InputState::default()),
             reports,
             selection: Mutex::new(SelectionState::default()),
+            search: Mutex::new(SearchState::default()),
+            resizes: AtomicU64::new(0),
         })
     }
 
@@ -1027,6 +1043,7 @@ impl Session {
             let mut term = self.term.lock();
             let before = History::of(term.grid());
             term.resize(size.rows, size.cols);
+            self.resizes.fetch_add(1, Ordering::Relaxed);
             let after = History::of(term.grid());
             // Terminal, then input state: the order every path that holds
             // both takes them in.
@@ -1102,6 +1119,18 @@ impl Session {
     ) -> R {
         let mut selection = lock(&self.selection);
         self.with_viewport(|term, offset| f(&mut selection, term, offset))
+    }
+
+    /// The search, locked (ADR 0038): take it before the terminal lock,
+    /// never while holding it or the selection lock.
+    pub(crate) fn search(&self) -> MutexGuard<'_, SearchState> {
+        lock(&self.search)
+    }
+
+    /// Resizes so far; read it under the terminal lock (as
+    /// [`Session::with_viewport`] gives it) to pair it with the grid.
+    pub(crate) fn resizes(&self) -> u64 {
+        self.resizes.load(Ordering::Relaxed)
     }
 
     /// The selection, locked, for a change that needs no terminal.
