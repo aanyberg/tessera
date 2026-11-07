@@ -54,8 +54,9 @@ mod surface;
 use std::ffi::{CStr, c_char};
 
 pub use app::{
-    App, tessera_app_config_path, tessera_app_create_config, tessera_app_dim_inactive_panes,
-    tessera_app_free, tessera_app_new, tessera_app_set_callbacks,
+    App, DisplayOptions, tessera_app_config_path, tessera_app_create_config,
+    tessera_app_dim_inactive_panes, tessera_app_free, tessera_app_new, tessera_app_set_callbacks,
+    tessera_app_set_display_options,
 };
 pub use callbacks::Callbacks;
 pub use config::{
@@ -96,9 +97,10 @@ pub use selection::{
 pub use session::MAX_PROFILE_NAME_LEN;
 pub use session::{
     FOREGROUND_NAME_LEN, ForegroundProcess, MAX_COLS, MAX_ROWS, ScrollPosition, ScrollTarget,
-    SpawnOptions, tessera_session_clear_scrollback, tessera_session_close,
-    tessera_session_foreground_process, tessera_session_resize, tessera_session_scroll_position,
-    tessera_session_scroll_to, tessera_session_spawn, tessera_session_write,
+    SessionAppearance, SpawnOptions, tessera_session_appearance, tessera_session_clear_scrollback,
+    tessera_session_close, tessera_session_foreground_process, tessera_session_resize,
+    tessera_session_scroll_position, tessera_session_scroll_to, tessera_session_spawn,
+    tessera_session_write,
 };
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]

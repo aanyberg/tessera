@@ -215,6 +215,11 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     /// This pane's search and its find bar (#46b), from the first ⌘F.
     /// See TerminalSurfaceView+Find.swift.
     var findController: FindController?
+    /// The blur under the render view while the session's appearance asks
+    /// for it, and that appearance as last read, `nil` before the first
+    /// attach (#42). See TerminalSurfaceView+Backdrop.swift, the only writer.
+    var backdrop: PaneBackdropView?
+    var backgroundAppearance: TesseraSession.Appearance?
     /// The left-button gesture the view handles itself (the core did not
     /// report the press to a program), from press to release.
     private var gesture: PointerGesture?
@@ -514,7 +519,7 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
             if surface.isAttached {
                 surfaceAttachedForZoom()
                 needsRender = true
-                applyLayerOpacity()
+                updateBackdrop()
             }
         } catch {
             // Without a renderer (no GPU, no font) the session still runs and
@@ -532,38 +537,23 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         updateDisplayLinkPause()
     }
 
-    /// The core makes the layer non-opaque for a translucent theme; the
-    /// window must then be transparent too, or it shows its own background
-    /// through the layer. On attach the window follows the layer the core
-    /// has just configured.
-    private func applyLayerOpacity() {
-        setWindowOpaque(metalLayer.isOpaque)
-    }
-
-    /// The core re-themed every view (a live edit of the configuration or
-    /// of the theme in use): the window follows `opaque`, and a frame is
-    /// requested, since an idle view would otherwise keep its old colours
-    /// until its next output. The layer is left to the core, which sets its
-    /// `opaque` property when it reconfigures the surface at the start of
-    /// that frame, the one that draws the new colours: made opaque here
-    /// already, the layer would show its last translucent frame
-    /// (premultiplied, so darkened) as opaque until then. A view without a
-    /// surface (its first attach failed) is left alone: it draws nothing,
-    /// so a transparent window would show only the desktop.
-    func applyLayerOpacity(opaque: Bool) {
+    /// The core re-styled the views (a live edit of the configuration or of
+    /// the theme in use, or new display options): the pane reads its
+    /// session's appearance again, the window follows every pane
+    /// (``updateBackdrop()``), and a frame is requested, since an idle view
+    /// would otherwise keep its old colours until its next output. The layer
+    /// is left to the core, which sets its `opaque` property when it
+    /// reconfigures the surface at the start of that frame, the one that
+    /// draws the new colours: made opaque here already, the layer would show
+    /// its last translucent frame (premultiplied, so darkened) as opaque
+    /// until then. A view without a surface (its first attach failed, or the
+    /// metrics read just found it dropped) draws nothing: it counts as
+    /// opaque and gets no blur until a surface attaches.
+    func appearanceDidChange() {
         configurationDidChangeFontSize()
+        updateBackdrop()
         guard surface.isAttached else { return }
-        setWindowOpaque(opaque)
         needsRender = true
-    }
-
-    /// Makes the window opaque, or transparent with a clear background,
-    /// and has its shadow recomputed when that changes.
-    private func setWindowOpaque(_ opaque: Bool) {
-        guard let window, window.isOpaque != opaque else { return }
-        window.isOpaque = opaque
-        window.backgroundColor = opaque ? .windowBackgroundColor : .clear
-        window.invalidateShadow()
     }
 
     override func setFrameSize(_ newSize: NSSize) {

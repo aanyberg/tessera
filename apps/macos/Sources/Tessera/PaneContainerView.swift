@@ -299,6 +299,18 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
         }
     }
 
+    // MARK: Opacity
+
+    /// The window is opaque only while every pane of the tab is, hidden ones
+    /// behind a maximized pane included (ADR 0043, E7): a translucent pane
+    /// in an opaque window would show the window's background, not the
+    /// desktop. An opaque pane in a transparent window covers its frame, so
+    /// a mixed tab draws right.
+    func paneOpacityDidChange() {
+        guard let window else { return }
+        TerminalSurfaceView.setWindow(window, opaque: panes.allSatisfy(\.view.isBackgroundOpaque))
+    }
+
     /// The pane next to `pane` toward `direction`, as laid out now, or `nil`
     /// at the edge of the tab. A pane with no visible size is passed over.
     func neighbour(of pane: Pane, toward direction: PaneDirection) -> Pane? {
@@ -390,6 +402,8 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
         // font is larger than its sibling's): lay out again with the clamps.
         paneMinimumSizeDidChange()
         updateDimming()
+        // A pane came or went: the window follows the panes now here.
+        paneOpacityDidChange()
     }
 
     @discardableResult

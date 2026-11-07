@@ -58,7 +58,8 @@ an older look back. The app-wide theme (`App::view_theme`,
 **One opacity switch.** AppKit windows share one opacity setting in the
 host, so `on_appearance_changed` reports opaque only while every live view
 is opaque (with no view, the default profile's). An opaque session in a
-translucent window still draws its own opaque background. Blur is #42's.
+translucent window still draws its own opaque background. ADR 0043
+replaces this with opacity per tab window and adds blur per pane.
 
 **Menus without registry commands (the E5 choice).** ADR 0036's command
 registry has integer parameters only, so a profile, which is chosen by
@@ -95,4 +96,5 @@ restored windows start with the default profile.
 - A parameterised registry command with a string parameter would let the
   profile items take key bindings; that is a later registry change.
 - #42 (transparency and blur) builds on `theme_for` and
-  `ProfileAppearance`, with a session appearance getter in the FFI.
+  `ProfileAppearance`, with a session appearance getter in the FFI
+  (ADR 0043).

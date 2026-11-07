@@ -60,11 +60,12 @@ final class SessionRouter: TesseraAppDelegate {
         controller(for: session)?.session(session, didExitWithCode: code, signal: signal)
     }
 
-    /// The configuration or the theme in use changed: every pane of every
-    /// tab follows.
+    /// The configuration, the theme in use or the display options changed:
+    /// every pane of every tab reads its own session's appearance (ADR 0043),
+    /// so `opaque`, which is every view's at once, is not needed.
     func appearanceDidChange(opaque: Bool) {
         for (id, entry) in controllers {
-            entry.controller?.panes.first { $0.session.id == id }?.view.applyLayerOpacity(opaque: opaque)
+            entry.controller?.panes.first { $0.session.id == id }?.view.appearanceDidChange()
         }
     }
 

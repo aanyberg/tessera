@@ -25,7 +25,9 @@ use crate::panic::ffi_guard;
 ///   `tessera_app_free`. The surface functions create, configure and
 ///   present Metal surfaces, which must happen on the main thread.
 /// * Callbacks (see `TesseraCallbacks`) fire on internal threads (session
-///   readers, the configuration watch).
+///   readers, the configuration watch), except `on_appearance_changed`
+///   from `tessera_app_set_display_options`, which fires on the calling
+///   thread before that call returns.
 ///   They must return quickly, must not call any `tessera_*` function and
 ///   must not block on the UI thread; the host marshals their work to its
 ///   main thread asynchronously.
@@ -351,6 +353,63 @@ pub unsafe extern "C" fn tessera_app_dim_inactive_panes(app: *const App, out: *m
         let dim = app.core.config().appearance.dim_inactive_panes;
         // SAFETY: as above.
         unsafe { out.write(dim) };
+        Error::Ok
+    })
+}
+
+/// The system's display settings that change how the core styles every
+/// session (ADR 0043), as the frontend reads them from the operating
+/// system. Each flag is a `uint8_t`, 0 for off and any other value for on
+/// (ADR 0011), so any byte pattern, a `memset` included, is valid. A field
+/// added later is off when zeroed, so a frontend that zero-initialises the
+/// struct keeps today's behaviour. The struct carries no size: fields are
+/// only ever appended, and only with the header and the core shipped
+/// together, so a frontend never passes a smaller struct than the core
+/// reads.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DisplayOptions {
+    /// Non-zero when the system asks for less transparency (macOS:
+    /// Accessibility, Display, Reduce transparency): every session's
+    /// background is drawn opaque and none is blurred, whatever the
+    /// configuration asks for.
+    pub reduce_transparency: u8,
+}
+
+/// Applies the system's display settings in `*options` to every session,
+/// open and future, at once; they stay in effect until the next call and
+/// survive configuration reloads. Call it at start and whenever the system
+/// setting changes. A call that changes nothing does nothing; otherwise
+/// sessions whose look changed are redrawn and `on_appearance_changed` is
+/// called (on the calling thread) when the opacity or blur of any session
+/// changed. `on_config_applied` is not called.
+///
+/// Returns `TESSERA_ERROR_NULL_POINTER` if `app` or `options` is `NULL`.
+///
+/// # Safety
+///
+/// `app` must be `NULL` or a live handle. `options` must be `NULL` or point
+/// to a readable `TesseraDisplayOptions`. Main thread only, like every
+/// `tessera_app_*` call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_app_set_display_options(
+    app: *const App,
+    options: *const DisplayOptions,
+) -> Error {
+    ffi_guard!("tessera_app_set_display_options", {
+        if options.is_null() {
+            return Error::NullPointer;
+        }
+        // SAFETY: non-null and readable per the contract.
+        let options = unsafe { options.read() };
+        // SAFETY: the caller passes NULL or a live handle.
+        let Some(app) = (unsafe { App::from_ptr(app) }) else {
+            return Error::NullPointer;
+        };
+        app.core
+            .set_display_options(tessera_app_core::DisplayOptions {
+                reduce_transparency: options.reduce_transparency != 0,
+            });
         Error::Ok
     })
 }

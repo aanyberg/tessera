@@ -691,6 +691,78 @@ pub unsafe extern "C" fn tessera_session_foreground_process(
     })
 }
 
+/// How a session's background is drawn, as `tessera_session_appearance`
+/// reports it (ADR 0043).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionAppearance {
+    /// `true` when the background is fully opaque: the frontend can draw
+    /// the session's view, and a window whose every view is opaque, as
+    /// opaque.
+    pub opaque: bool,
+    /// `true` when the frontend should blur what shows through the
+    /// translucent background (`blur` of the session's profile or
+    /// `[appearance]`). Never true while `opaque` is.
+    pub blur: bool,
+}
+
+impl Default for SessionAppearance {
+    /// What a failed call reports: an opaque background, nothing blurred.
+    fn default() -> Self {
+        Self {
+            opaque: true,
+            blur: false,
+        }
+    }
+}
+
+/// Stores in `*out` how session `session_id`'s background is drawn now: it
+/// follows the session's profile, the configuration in effect and
+/// `tessera_app_set_display_options`. Read it when the session's view is
+/// created and again on `on_appearance_changed`. Cheap (one lock). Main
+/// thread only, like every `tessera_session_*` call but
+/// `tessera_session_write`.
+///
+/// Returns `TESSERA_ERROR_NULL_POINTER` if `app` or `out` is `NULL`,
+/// `TESSERA_ERROR_SESSION_NOT_FOUND` if the id is not a live session. On
+/// failure `*out` is set to opaque with no blur (when `out` is not `NULL`).
+///
+/// # Safety
+///
+/// `app` must be `NULL` or a live handle. `out` must be `NULL` or point to
+/// a writable `TesseraSessionAppearance`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_session_appearance(
+    app: *const App,
+    session_id: u64,
+    out: *mut SessionAppearance,
+) -> Error {
+    ffi_guard!("tessera_session_appearance", {
+        if out.is_null() {
+            return Error::NullPointer;
+        }
+        // SAFETY: non-null and writable per the contract.
+        unsafe { out.write(SessionAppearance::default()) };
+        // SAFETY: the caller passes NULL or a live handle.
+        let Some(app) = (unsafe { App::from_ptr(app) }) else {
+            return Error::NullPointer;
+        };
+        match app.core.session_appearance(SessionId::from_raw(session_id)) {
+            Ok(look) => {
+                // SAFETY: as above.
+                unsafe {
+                    out.write(SessionAppearance {
+                        opaque: look.opaque,
+                        blur: look.blur,
+                    });
+                };
+                Error::Ok
+            }
+            Err(error) => error::report("tessera_session_appearance", &error),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

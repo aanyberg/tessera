@@ -49,13 +49,16 @@ pub struct ProfileAppearance {
     /// font_size`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font_size: Option<f32>,
-    /// Background opacity of this profile's sessions, 0.0..=1.0. The app's
-    /// windows are made translucent while any open session is, and stay
-    /// opaque only while every one is; an opaque session still draws its
-    /// own opaque background.
+    /// Background opacity of this profile's sessions, 0.0..=1.0. A window
+    /// is translucent while any pane of its tab is, and stays opaque only
+    /// while every one is; an opaque session still draws its own opaque
+    /// background. The system's Reduce Transparency setting draws every
+    /// session opaque.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opacity: Option<f32>,
-    /// Background blur when opacity is below 1.0.
+    /// Background blur behind each of this profile's panes whose background
+    /// is translucent (`opacity` below 1.0, or a theme background with
+    /// alpha).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blur: Option<bool>,
     /// The cursor's shape, `"block"`, `"underline"` or `"beam"`, as for

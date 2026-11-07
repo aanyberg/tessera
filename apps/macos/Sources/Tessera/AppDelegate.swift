@@ -58,6 +58,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     /// Set by a termination signal: quit without asking.
     var terminatesWithoutConfirmation = false
+    /// Reads the system's Reduce Transparency setting (Accessibility,
+    /// Display), which ``applyDisplayOptions()`` hands the core. Tests
+    /// replace it.
+    var reducesTransparency: @MainActor () -> Bool = {
+        NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
+    }
+    /// Follows changes of the system's display settings.
+    private var displayOptionsObserver: (any NSObjectProtocol)?
     /// The profile each session was started with, by session id, for the
     /// sessions started with one; the rest have `[general]
     /// default_profile`'s. A split pane starts with its focused pane's
@@ -79,6 +87,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         MainMenu.install(in: NSApp)
         terminateOnSignals()
+        observeDisplayOptions()
         guard !Self.isTestHost else { return }
         let store = WindowStateStore(defaults: .standard)
         windowStateStore = store
@@ -398,7 +407,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         applyKeymap()
         readPaneDimming()
         applyProfiles()
+        applyDisplayOptions()
         return core
+    }
+
+    /// Hands the core the system's display settings (Reduce Transparency,
+    /// ADR 0043): at start and whenever they change. The core re-styles the
+    /// sessions and reports the change through the router, so every pane
+    /// and window follows; a setting that did not change does nothing.
+    func applyDisplayOptions() {
+        guard let core else { return }
+        do {
+            try core.setDisplayOptions(.init(reduceTransparency: reducesTransparency()))
+        } catch {
+            Self.log.error("display options not applied: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    /// AppKit posts this on the workspace's centre, on the main thread, when
+    /// an Accessibility display setting changes.
+    private func observeDisplayOptions() {
+        guard displayOptionsObserver == nil else { return }
+        displayOptionsObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.applyDisplayOptions() }
+        }
     }
 
     /// Gives the profile submenus the core's profiles: at start and after

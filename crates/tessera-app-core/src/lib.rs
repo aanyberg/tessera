@@ -67,6 +67,7 @@ pub use search::{MatchesText, SearchStatus};
 pub use selection::{Granularity, Link, Point};
 pub use session::{SessionEvent, SessionId, SessionObserver};
 pub use tessera_search::{MAX_QUERY_BYTES, QueryError, QueryOptions};
+pub use view::{DisplayOptions, SessionAppearance};
 // Re-exported so frontends (through `tessera-ffi`) depend on this crate
 // alone, as the layering in `docs/architecture.md` requires.
 pub use config_watch::{CONFIG_DIR_POLL_INTERVAL, CONFIG_WATCH_STOP_CAP};
@@ -281,8 +282,13 @@ impl App {
         for warning in &colours.warnings {
             tracing::warn!(target: "tessera_app_core", "{warning}");
         }
-        let default_look =
-            config_watch::Looks::new(&paths.themes_dir(), &config, &colours.theme).default_look();
+        let default_look = config_watch::Looks::new(
+            &paths.themes_dir(),
+            &config,
+            &colours.theme,
+            DisplayOptions::default(),
+        )
+        .default_look();
         let theme = Arc::new(Mutex::new(default_look.theme));
         let bindings = Arc::new(Bindings::new(&config));
         Self {
@@ -294,6 +300,7 @@ impl App {
                     _ => None,
                 },
                 generation: 0,
+                display: DisplayOptions::default(),
             })),
             paths,
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -520,15 +527,16 @@ impl App {
         // sessions started after a change only (lead decision
         // D-SCROLLBACK-LIVE); it is capped like a loaded configuration's,
         // in case this one was built by hand.
-        let (config, colours, generation) = {
+        let (config, colours, generation, display) = {
             let applied = lock(&self.applied);
             (
                 Arc::clone(&applied.config),
                 applied.colours.clone(),
                 applied.generation,
+                applied.display,
             )
         };
-        let look = config_watch::Looks::new(&self.paths.themes_dir(), &config, &colours)
+        let look = config_watch::Looks::new(&self.paths.themes_dir(), &config, &colours, display)
             .of(profile.as_deref(), None);
         let scrollback = config
             .terminal
@@ -2006,6 +2014,48 @@ impl App {
     /// the last [`App::apply_config`].
     pub fn view_theme(&self) -> Theme {
         lock(&self.theme).clone()
+    }
+
+    /// Sets the host's accessibility display options (ADR 0043): every
+    /// session is drawn under them from now on, whatever the configuration
+    /// says. With [`DisplayOptions::reduce_transparency`] every background
+    /// is fully opaque and nothing is blurred.
+    ///
+    /// Options equal to the ones in effect change nothing. Otherwise every
+    /// session's look is derived again from its profile under the
+    /// configuration in effect, as a configuration apply does (no new
+    /// configuration is announced: `on_config_applied` is not called), and
+    /// when anything drawn changed the observer's
+    /// [`SessionObserver::on_appearance_changed`] is called on this thread
+    /// before it returns. Options set before the first session apply to
+    /// it; they last until changed, across configuration applies.
+    ///
+    /// May be called from any thread; it does no GPU work.
+    pub fn set_display_options(&self, options: DisplayOptions) {
+        self.live().set_display(options);
+    }
+
+    /// The display options in effect ([`App::set_display_options`]; all
+    /// off until it is called).
+    pub fn display_options(&self) -> DisplayOptions {
+        lock(&self.applied).display
+    }
+
+    /// How session `id`'s background is drawn now (ADR 0043): whether it
+    /// is fully opaque and whether the host should blur what shows through
+    /// it. Read it after [`SessionObserver::on_appearance_changed`] and
+    /// when the session's view attaches; it follows the session's profile,
+    /// the configuration in effect and [`App::set_display_options`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn session_appearance(&self, id: SessionId) -> Result<SessionAppearance> {
+        let look = self.session(id)?.look();
+        Ok(SessionAppearance {
+            opaque: look.is_opaque(),
+            blur: look.blur,
+        })
     }
 
     /// Detaches and releases session `id`'s view. The session keeps its

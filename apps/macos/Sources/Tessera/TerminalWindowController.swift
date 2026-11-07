@@ -12,9 +12,9 @@ protocol TerminalContentView: NSView {
     /// The session's child exited with `code`, or was killed by `signal`
     /// (non-zero); the pane stays open showing it.
     func sessionDidExit(code: Int32, signal: Int32)
-    /// The core re-themed every view: make the window opaque or translucent
-    /// as `opaque` says and redraw.
-    func applyLayerOpacity(opaque: Bool)
+    /// The core re-styled the views: read the session's appearance again,
+    /// make the window opaque or translucent to match its panes and redraw.
+    func appearanceDidChange()
 }
 
 /// What a ``TerminalWindowController`` asks of the application.

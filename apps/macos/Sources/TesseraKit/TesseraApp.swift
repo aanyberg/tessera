@@ -31,8 +31,10 @@ public protocol TesseraAppDelegate: AnyObject {
     /// it. Not sent for a session the host closed.
     func session(_ session: TesseraSession, didExitWithCode code: Int32, signal: Int32)
     /// The core applied an edit of the configuration or of the theme in use to
-    /// every view (colours, opacity, font size or the default cursor style).
-    /// `opaque` is whether the background is now fully opaque. Make every
+    /// every view (colours, opacity, blur, font size or the default cursor
+    /// style), or new ``TesseraApp/DisplayOptions`` that changed how a view is
+    /// drawn. `opaque` is whether every view's background is now fully opaque.
+    /// Read each session's ``TesseraSession/appearance()`` again, make each
     /// terminal window opaque or translucent to match and redraw every view:
     /// each surface switches its compositing mode at its next frame. Several
     /// changes between two deliveries are reported once, with the latest
@@ -236,6 +238,32 @@ public final class TesseraApp {
         var amount: Float = 0
         try TesseraCoreError.check(tessera_app_dim_inactive_panes(core.pointer, &amount))
         return amount
+    }
+
+    /// The system's display settings that change how every session is drawn
+    /// (ADR 0043). A setting added later defaults to off.
+    public struct DisplayOptions: Sendable, Equatable {
+        /// The system asks for less transparency (Accessibility, Display,
+        /// Reduce transparency): every background is drawn opaque and none is
+        /// blurred, whatever the configuration asks for.
+        public var reduceTransparency: Bool
+
+        public init(reduceTransparency: Bool = false) {
+            self.reduceTransparency = reduceTransparency
+        }
+    }
+
+    /// Applies `options` to every session, open and future, until the next
+    /// call; they survive configuration reloads. Call it at start and when the
+    /// system setting changes. A call that changes nothing does nothing;
+    /// otherwise ``TesseraAppDelegate/appearanceDidChange(opaque:)`` follows
+    /// when a view's opacity or blur changed.
+    ///
+    /// - Throws: ``TesseraCoreError/nullPointer`` after ``shutdown()``.
+    public func setDisplayOptions(_ options: DisplayOptions) throws {
+        var raw = TesseraDisplayOptions()
+        raw.reduce_transparency = options.reduceTransparency ? 1 : 0
+        try TesseraCoreError.check(tessera_app_set_display_options(core.pointer, &raw))
     }
 
     /// Closes every session and frees the core. Idempotent; afterwards every

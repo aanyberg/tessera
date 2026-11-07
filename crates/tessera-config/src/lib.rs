@@ -249,9 +249,13 @@ pub struct Appearance {
     /// Font size in points, clamped on load to
     /// [`Appearance::MIN_FONT_SIZE`]..=[`Appearance::MAX_FONT_SIZE`].
     pub font_size: f32,
-    /// Window opacity, 0.0..=1.0.
+    /// Background opacity, 0.0..=1.0. A window is translucent while any
+    /// pane of its tab is. The system's Reduce Transparency setting draws
+    /// every session opaque.
     pub opacity: f32,
-    /// Background blur when opacity is below 1.0.
+    /// Background blur behind each pane whose background is translucent
+    /// (`opacity` below 1.0, or a theme background with alpha). Off while
+    /// the system's Reduce Transparency setting is on.
     pub blur: bool,
     /// The cursor's shape: `"block"`, `"underline"` or `"beam"` (a
     /// vertical bar), exactly as written here. A program may change it
