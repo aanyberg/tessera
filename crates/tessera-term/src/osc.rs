@@ -8,7 +8,7 @@
 //! | `OSC 52 ; Pc ; base64` | [`Request::SetClipboard`]; `?` (a read) is never answered |
 //! | `OSC 7 ; url` | [`Request::SetCwd`], raw |
 //! | `OSC 8 ; params ; URI` | opens (or, with an empty URI, closes) a hyperlink |
-//! | `OSC 133 ; A/B/C/D[;options]` | a [`Mark`] on the cursor's line |
+//! | `OSC 133 ; A/B/C/D[;options]` | a [`Mark`] on the cursor's line, and [`Request::Mark`] |
 //! | `OSC 1337 ; ShellIntegrationVersion=..` | [`Request::ShellIntegrationHandshake`], raw |
 //! | `OSC 4`, `10`, `11`, `12`, `104`, `110`, `111`, `112` | colours: set, query (`?`), reset; see the `osc_color` module |
 //!
@@ -64,6 +64,12 @@
 //! on the line the cursor is on when the sequence is parsed, a pending wrap
 //! left as it is. Marks received on the alternate screen are dropped, as
 //! the lines they would land on vanish when the program leaves it.
+//! Every mark the grid takes is also reported as [`Request::Mark`] with the
+//! line's absolute id, coalesced to the last mark of each kind per
+//! [`Terminal::advance`](crate::Terminal::advance) call (ADR 0039). The
+//! options after the kind (`aid`, `cl`, `redraw`, `k=` other than the
+//! secondary prompt kinds) are ignored, as are VS Code's `OSC 633` and
+//! iTerm2's `OSC 1337 ; SetMark`.
 //!
 //! # Hyperlinks
 //!
@@ -286,8 +292,30 @@ impl State {
         }
         let row = self.grid.cursor().row;
         if let Some(line) = self.grid.line_mut(row) {
-            line.set_mark(mark);
+            line.set_mark(mark.clone());
+            let id = self.grid.scrollback_pushed() + u64::from(row);
+            self.coalesce_mark(mark, id);
         }
+    }
+
+    /// Queues the [`Request::Mark`] for `mark` on line `id`, replacing the
+    /// one of the same kind this [`Terminal::advance`] call queued before
+    /// (S6: at most [`MAX_MARK_REQUESTS`] per call).
+    fn coalesce_mark(&mut self, mark: Mark, id: u64) {
+        let kind = std::mem::discriminant(&mark);
+        self.marks
+            .retain(|(queued, _)| std::mem::discriminant(queued) != kind);
+        self.marks.push((mark, id));
+    }
+
+    /// Moves the coalesced marks of the call that just ended to the
+    /// requests, oldest first.
+    pub(crate) fn flush_marks(&mut self) {
+        let marks = self
+            .marks
+            .drain(..)
+            .map(|(mark, line)| Request::Mark { mark, line });
+        self.pending.extend(marks);
     }
 }
 
@@ -363,11 +391,34 @@ mod tests {
         ]
     }
 
-    /// The requests and every line's marks after feeding `chunks`.
+    /// The requests but [`Request::Mark`] and every line's marks after
+    /// feeding `chunks`. Mark requests are coalesced per call, so they
+    /// differ between chunkings by design (ADR 0039):
+    /// [`mark_requests`] checks them.
     fn outcome(chunks: &[&[u8]]) -> (Vec<Request>, Vec<Vec<Mark>>) {
+        let (requests, marks, _) = run(chunks);
+        (requests, marks)
+    }
+
+    /// [`outcome`], plus the [`Request::Mark`]s of each call.
+    #[expect(
+        clippy::type_complexity,
+        reason = "a test helper's tuple, unpacked at once"
+    )]
+    fn run(chunks: &[&[u8]]) -> (Vec<Request>, Vec<Vec<Mark>>, Vec<Vec<(Mark, u64)>>) {
         let mut term = Terminal::new(3, 10);
+        let mut requests = Vec::new();
+        let mut calls = Vec::new();
         for chunk in chunks {
             term.advance(chunk);
+            let mut call = Vec::new();
+            for request in term.take_requests() {
+                match request {
+                    Request::Mark { mark, line } => call.push((mark, line)),
+                    other => requests.push(other),
+                }
+            }
+            calls.push(call);
         }
         let grid = term.grid();
         let marks = (0..grid.scrollback_len())
@@ -375,7 +426,36 @@ mod tests {
             .chain(grid.visible_lines())
             .map(|line: &Line| line.marks.clone())
             .collect();
-        (term.take_requests(), marks)
+        (requests, marks, calls)
+    }
+
+    /// The reference coalescing: the last mark of each kind in `marks`, in
+    /// the order those last ones arrived.
+    fn coalesced(marks: &[(Mark, u64)]) -> Vec<(Mark, u64)> {
+        let mut out: Vec<(Mark, u64)> = Vec::new();
+        for (mark, line) in marks {
+            let kind = std::mem::discriminant(mark);
+            out.retain(|(queued, _)| std::mem::discriminant(queued) != kind);
+            out.push((mark.clone(), *line));
+        }
+        out
+    }
+
+    /// Checks one chunking's mark requests against the byte-by-byte run,
+    /// which reports every mark: each call's requests are the reference
+    /// coalescing of the marks its bytes set.
+    fn mark_requests(bytes: &[u8], chunks: &[&[u8]]) -> Result<(), TestCaseError> {
+        let bytewise: Vec<&[u8]> = bytes.chunks(1).collect();
+        let (_, _, every) = run(&bytewise);
+        let (_, _, calls) = run(chunks);
+        let mut byte = 0;
+        for (chunk, call) in chunks.iter().zip(&calls) {
+            let set: Vec<(Mark, u64)> = every[byte..byte + chunk.len()].concat();
+            byte += chunk.len();
+            prop_assert!(call.len() <= crate::MAX_MARK_REQUESTS);
+            prop_assert_eq!(call, &coalesced(&set));
+        }
+        Ok(())
     }
 
     proptest! {
@@ -400,6 +480,8 @@ mod tests {
             }
             chunks.push(&bytes[start..]);
             prop_assert_eq!(&outcome(&chunks), &whole);
+            mark_requests(&bytes, &chunks)?;
+            mark_requests(&bytes, &[&bytes])?;
         }
     }
 
@@ -420,7 +502,17 @@ mod tests {
         let (mut term, small) = flood(b"\x1b]133;A\x07\x1b]133;D;1\x07", 10_000);
         let (_, large) = flood(b"\x1b]133;A\x07\x1b]133;D;1\x07", 100_000);
         eprintln!("OSC 133 x 20 000: {small:?}, x 200 000: {large:?}");
-        assert_eq!(term.take_requests(), []);
+        let marks = vec![
+            Request::Mark {
+                mark: Mark::PromptStart,
+                line: 0,
+            },
+            Request::Mark {
+                mark: Mark::CommandEnd { exit_code: Some(1) },
+                line: 0,
+            },
+        ];
+        assert_eq!(term.take_requests(), marks, "the last of each kind (S6)");
         let marks: usize = term
             .grid()
             .visible_lines()

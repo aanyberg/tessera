@@ -189,8 +189,11 @@ pub struct Config {
     /// tab, or the whole layout again), `equalize_panes` (give every pane
     /// of the tab an equal share), `find`, `find_next` (the match toward
     /// older output), `find_previous` (toward newer output),
-    /// `use_selection_for_find`, `copy_find_matches`, and, for features
-    /// still to come, `prompt_previous`, `prompt_next`, `copy_mode`.
+    /// `use_selection_for_find`, `copy_find_matches`, `prompt_previous` and
+    /// `prompt_next` (the shell's previous or next prompt, by its OSC 133
+    /// marks; Page Up or Down when the history holds none),
+    /// `select_last_output` (select the output of the last finished
+    /// command), and, for features still to come, `copy_mode`.
     ///
     /// Only chords with `cmd` appear in menus; others work in the
     /// terminal only. A malformed entry, an unknown command or a chord

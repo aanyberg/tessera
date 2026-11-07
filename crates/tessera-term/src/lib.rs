@@ -197,7 +197,7 @@ use reports::TitleStack;
 
 use modes::KittyStacks;
 
-use tessera_grid::{Cell, Grid, Point};
+use tessera_grid::{Cell, Grid, Mark, Point};
 use tessera_vt::{Action, Parser, Sink};
 use tracing::trace;
 
@@ -289,7 +289,33 @@ pub enum Request {
     /// the PTY in that order, after any input it already queued. The
     /// terminal never drops one: bounding them is the host's job.
     Reply(Vec<u8>),
+    /// The shell marked a line (OSC 133 `A`, `B`, `C` or `D`, ADR 0022 and
+    /// ADR 0039) on the main screen; the grid already carries the mark.
+    /// Emitted from the branch that set it, so marks the grid refused (the
+    /// alternate screen, `k=s`/`c`/`r` prompts, anything
+    /// [`Mark::from_osc133`] rejects) produce none.
+    ///
+    /// Coalesced per [`Terminal::advance`] call: only the last mark of each
+    /// kind is emitted, in the order those last ones arrived, so one call
+    /// queues at most [`MAX_MARK_REQUESTS`] of them whatever the input
+    /// (S6). The marks on the lines stay complete; only this notification
+    /// is coalesced.
+    Mark {
+        /// The mark, as set on the line.
+        mark: Mark,
+        /// The line's absolute id when the sequence was parsed:
+        /// [`Grid::scrollback_pushed`] plus the cursor row. Stable while
+        /// the line scrolls into the scrollback and until it is evicted,
+        /// as long as [`Terminal::line_epoch`] stays what it was when the
+        /// request was taken (a resize or a [`Terminal::clear_to_cursor`]
+        /// moves rows without counting them).
+        line: u64,
+    },
 }
+
+/// Most [`Request::Mark`] one [`Terminal::advance`] call queues: one per
+/// kind of mark (prompt start, command start, output start, command end).
+pub const MAX_MARK_REQUESTS: usize = 4;
 
 /// The shape of the cursor, as DECSCUSR (`CSI Ps SP q`) and the
 /// configuration name it: what the renderer draws while the cursor is
@@ -330,6 +356,8 @@ pub struct Terminal {
     /// An incomplete UTF-8 sequence (1 to 3 bytes) held back from the end of
     /// the last [`Terminal::advance`] call. See [`incomplete_utf8_suffix`].
     carry: Vec<u8>,
+    /// [`Terminal::line_epoch`].
+    line_epoch: u64,
 }
 
 impl Terminal {
@@ -342,6 +370,7 @@ impl Terminal {
             state: State {
                 grid: Grid::new(rows, cols),
                 pending: Vec::new(),
+                marks: Vec::new(),
                 modes: Modes::default(),
                 keyboard: KeyboardModes::default(),
                 kitty: KittyStacks::default(),
@@ -362,6 +391,7 @@ impl Terminal {
                 unprotected_screens: [true; 2],
             },
             carry: Vec::new(),
+            line_epoch: 0,
         }
     }
 
@@ -396,6 +426,9 @@ impl Terminal {
     /// ([`Terminal::c1_8bit_replies`]; ADR 0024).
     fn feed(&mut self, bytes: &[u8]) {
         self.parser.advance_c1(bytes, &mut self.state);
+        if !self.state.marks.is_empty() {
+            self.state.flush_marks();
+        }
     }
 
     /// Drains side-effect requests accumulated since the last call.
@@ -543,8 +576,25 @@ impl Terminal {
     /// REP has nothing to repeat afterwards, as after any sequence: the
     /// cell the last character took may be gone.
     pub fn clear_to_cursor(&mut self) {
+        let row = self.state.grid.cursor().row;
         self.state.grid.clear_to_cursor();
         self.state.last_printed = None;
+        if self.state.grid.cursor().row != row {
+            // The kept rows moved up without being counted as pushed.
+            self.line_epoch += 1;
+        }
+    }
+
+    /// How many times the absolute line ids of [`Request::Mark`] were
+    /// invalidated since the terminal was created: bumped by every
+    /// [`Terminal::resize`] to another size (a re-wrap moves rows between
+    /// the screen and the history without counting them in
+    /// [`Grid::scrollback_pushed`]) and by a [`Terminal::clear_to_cursor`]
+    /// that moved the kept rows up. A line id is meaningful only with the
+    /// epoch it was read under (ADR 0039). Output never bumps it.
+    #[must_use]
+    pub fn line_epoch(&self) -> u64 {
+        self.line_epoch
     }
 
     /// Resizes the screen to `rows` × `cols` (a zero dimension counts as
@@ -556,9 +606,14 @@ impl Terminal {
     /// before telling the child about the new size, so output written for
     /// the new size lands on a grid that has it.
     pub fn resize(&mut self, rows: u16, cols: u16) {
+        let before = (self.state.grid.rows(), self.state.grid.cols());
         self.state.grid.resize(rows, cols);
         // A re-wrap can pull protected cells back from the scrollback.
         self.state.unprotected_screens = [false; 2];
+        // The same size moves no line (`Grid::resize` returns at once).
+        if (self.state.grid.rows(), self.state.grid.cols()) != before {
+            self.line_epoch += 1;
+        }
     }
 
     /// The terminal-wide protection mode as `"off"`, `"dec"` (DECSCA) or
@@ -606,6 +661,10 @@ fn incomplete_utf8_suffix(bytes: &[u8]) -> usize {
 struct State {
     grid: Grid,
     pending: Vec<Request>,
+    /// The [`Request::Mark`]s of the current [`Terminal::advance`] call, at
+    /// most one per kind ([`MAX_MARK_REQUESTS`]), in the order the last one
+    /// of each kind arrived; moved to `pending` when the call ends.
+    marks: Vec<(Mark, u64)>,
     /// Every mode but the two the grid keeps: `origin` and `alt_screen`
     /// are never written here; [`Terminal::modes`] reads them from the
     /// grid, which saves origin mode with the cursor and owns the screens.

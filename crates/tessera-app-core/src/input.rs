@@ -302,20 +302,21 @@ impl Bindings {
         Arc::clone(&lock(&self.map))
     }
 
-    /// Runs `with` on the binding of `event`, if any; one atomic load when
-    /// no chord has the event's modifiers, a few when no chord has its
-    /// character key with them ([`may_match`]).
+    /// Runs `with` on the binding of `event`, if any, and the keymap it
+    /// is in (locked: `with` must not call [`Bindings::keymap`]); one
+    /// atomic load when no chord has the event's modifiers, a few when no
+    /// chord has its character key with them ([`may_match`]).
     pub(crate) fn with_binding<R>(
         &self,
         event: &KeyEvent,
-        with: impl FnOnce(Binding<'_>) -> R,
+        with: impl FnOnce(&Keymap, Binding<'_>) -> R,
     ) -> Option<R> {
         let mask = self.mask.load(Ordering::Relaxed);
         if !may_match(event, mask, |word| self.ascii[word].load(Ordering::Relaxed)) {
             return None;
         }
         let map = lock(&self.map);
-        map.resolve(event).map(with)
+        map.resolve(event).map(|binding| with(&map, binding))
     }
 
     /// Records that `config` was applied: compiles its `[keys]` again when
@@ -574,11 +575,11 @@ mod tests {
             bindings.mask.load(Ordering::Relaxed),
             plain.modifiers
         ));
-        assert_eq!(bindings.with_binding(&plain, |b| format!("{b:?}")), None);
+        assert_eq!(bindings.with_binding(&plain, |_, b| format!("{b:?}")), None);
         let cmd_t = KeyEvent::new(Key::Char('t'), Modifiers::SUPER);
         let id = CommandId::find("new_tab", None).unwrap();
         assert_eq!(
-            bindings.with_binding(&cmd_t, |b| b == Binding::Command(id)),
+            bindings.with_binding(&cmd_t, |_, b| b == Binding::Command(id)),
             Some(true)
         );
     }
@@ -608,7 +609,7 @@ mod tests {
         assert!(filter(&bindings, &cmd_j));
         let id = CommandId::find("new_tab", None).unwrap();
         assert_eq!(
-            bindings.with_binding(&cmd_j, |b| b == Binding::Command(id)),
+            bindings.with_binding(&cmd_j, |_, b| b == Binding::Command(id)),
             Some(true)
         );
     }

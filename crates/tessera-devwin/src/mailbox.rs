@@ -62,8 +62,11 @@ impl Mailbox {
             SessionEvent::Bell => pending.bells = pending.bells.saturating_add(1),
             SessionEvent::Exit(status) => pending.exit = Some(status),
             // The dev window does not touch the system clipboard on a
-            // program's behalf: nothing to wake the event loop for.
-            SessionEvent::Clipboard(_) => return false,
+            // program's behalf, and shows nothing for command marks (ADR
+            // 0039): nothing to wake the event loop for.
+            SessionEvent::Clipboard(_)
+            | SessionEvent::CommandStarted
+            | SessionEvent::CommandFinished { .. } => return false,
         }
         !std::mem::replace(&mut state.wake_outstanding, true)
     }

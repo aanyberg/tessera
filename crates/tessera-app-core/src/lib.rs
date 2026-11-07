@@ -32,6 +32,7 @@
 #![forbid(unsafe_code)]
 
 pub mod command;
+pub mod commands;
 mod config_watch;
 pub mod input;
 mod mouse;
@@ -57,6 +58,10 @@ use tessera_term::{
     Modifiers, MouseEncoding, MouseTracking, Terminal, encode_key, to_8bit_controls,
 };
 
+pub use commands::{
+    CommandRecord, CommandState, MAX_COMMAND_RECORDS, MAX_PROMPT_SCAN_LINES,
+    PROMPT_SCAN_LINES_PER_LOCK,
+};
 pub use input::{InputEvent, InputOutcome};
 pub use search::{MatchesText, SearchStatus};
 pub use selection::{Granularity, Link, Point};
@@ -198,6 +203,15 @@ pub enum ScrollTarget {
     PageDown,
     /// This many lines above the live screen.
     Offset(usize),
+    /// The prompt above the view's top row, as its new top row (⌘↑, ADR
+    /// 0039): the newest line with an OSC 133 `A` mark above it. Stays at
+    /// the oldest prompt; pages up ([`ScrollTarget::PageUp`]) when the
+    /// history holds no prompt mark at all.
+    PreviousPrompt,
+    /// The prompt below the view's top row in the history, as its new top
+    /// row (⌘↓): the live screen when there is none; pages down
+    /// ([`ScrollTarget::PageDown`]) when the history holds no prompt mark.
+    NextPrompt,
 }
 
 /// A session's scroll position, as [`App::scroll_position`] reads it in one
@@ -363,9 +377,13 @@ impl App {
         key: &KeyEvent,
     ) -> Option<Result<InputOutcome>> {
         let release = key.kind == KeyEventKind::Release;
-        bindings.with_binding(key, |binding| match binding {
+        bindings.with_binding(key, |keymap, binding| match binding {
             _ if release => Ok(InputOutcome::Consumed),
-            command::Binding::Command(command) => Ok(InputOutcome::Command(command)),
+            // ⌘↑ / ⌘↓ by default run the prompt commands, which page
+            // without prompt marks (D4, N1).
+            command::Binding::Command(command) => {
+                Ok(InputOutcome::Command(keymap.prompt_rule(key, command)))
+            }
             command::Binding::SendText(bytes) => {
                 session
                     .queue_input(bytes.to_vec())
@@ -684,6 +702,8 @@ impl App {
         session.scroll_to_bottom();
         // The rows the selection numbered moved up (ADR 0025).
         session.selection().clear();
+        // Their commands went with them; a running one stays (ADR 0039).
+        session.reports().commands().forget_finished();
         Ok(())
     }
 
@@ -1140,6 +1160,68 @@ impl App {
     /// [`Error::SessionNotFound`] if `id` is not a live session.
     pub fn scroll_to(&self, id: SessionId, target: ScrollTarget) -> Result<bool> {
         Ok(self.session(id)?.scroll_to(target))
+    }
+
+    /// Selects the output of session `id`'s last finished command (Select
+    /// Last Output, ADR 0039), as the shell's OSC 133 marks bound it: from
+    /// the line of its `C` mark to the last non-blank cell before the next
+    /// prompt (`A`), a command still running skipped. Scrolls the view so
+    /// the start of the output is visible. Returns whether anything was
+    /// selected: `false` (the selection unchanged) when the last command
+    /// printed nothing, its output left the history or was erased (a
+    /// screen clear, a deleted first line), the shell sent no
+    /// marks, on the alternate screen, or when its start is more than
+    /// [`MAX_PROMPT_SCAN_LINES`] lines up.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn select_command_output(&self, id: SessionId) -> Result<bool> {
+        Ok(commands::select_command_output(&*self.session(id)?))
+    }
+
+    /// Whether session `id`'s last finished command printed output that is
+    /// still there, as its records and the mark on its first line tell (no
+    /// scan): what a frontend enables Select Last Output for. `false` on
+    /// the alternate screen; `true` for
+    /// a command recorded before a resize, whose lines are unknown, so
+    /// [`App::select_command_output`] may still find nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn has_command_output(&self, id: SessionId) -> Result<bool> {
+        Ok(commands::has_command_output(&*self.session(id)?))
+    }
+
+    /// Session `id`'s command records (ADR 0039), oldest first: at most
+    /// [`MAX_COMMAND_RECORDS`], those whose lines all left the history
+    /// skipped. Metadata only (where, when, how it ended; no command
+    /// text): a chunk of output that runs several commands at once records
+    /// the last.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn command_records(&self, id: SessionId) -> Result<Vec<CommandRecord>> {
+        let session = self.session(id)?;
+        let view = session.with_terminal(commands::LineView::of);
+        Ok(session.reports().commands().records(view))
+    }
+
+    /// The command record line `line` of session `id` belongs to (a
+    /// [`tessera_grid::Grid::scrollback_pushed`] plus screen row id): from
+    /// the command's prompt up to the line that ended it. `None` when no
+    /// record covers it, and for every line after a resize until the next
+    /// command (the ids moved, ADR 0039).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn command_at(&self, id: SessionId, line: u64) -> Result<Option<CommandRecord>> {
+        let session = self.session(id)?;
+        let view = session.with_terminal(commands::LineView::of);
+        Ok(session.reports().commands().command_at(line, view))
     }
 
     /// Session `id`'s scroll position: the offset ([`App::scroll_offset`]),
@@ -2107,7 +2189,9 @@ impl App {
     }
 
     /// Applies `bytes` to session `id`'s terminal as if its child wrote
-    /// them, on the calling thread (no output event is sent).
+    /// them in one chunk, on the calling thread: its OSC 133 marks reach
+    /// the command log, but no event is sent and the replies and other
+    /// requests are dropped.
     ///
     /// Exists only so tests can drive a session's terminal byte for byte.
     ///
@@ -2117,8 +2201,7 @@ impl App {
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn feed_for_test(&self, id: SessionId, bytes: &[u8]) -> Result<()> {
-        self.session(id)?
-            .with_terminal_mut(|term| term.advance(bytes));
+        self.session(id)?.feed_for_test(bytes);
         Ok(())
     }
 
@@ -2557,6 +2640,37 @@ mod tests {
             next(&events),
             (id, SessionEvent::Exit(ExitStatus::Exited(4)))
         );
+    }
+
+    /// S6 (#45a, fixture T03 and E02 through the reader): 100 000 OSC 133
+    /// marks in one chunk of output reach the command log as at most four
+    /// marks, so they make at most a handful of command events and one
+    /// record, not one per mark.
+    #[test]
+    fn a_flood_of_command_marks_makes_a_bounded_number_of_events() {
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        let cycle = b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07";
+        let flood = cycle.repeat(25_000);
+        fake.send(PtyEvent::Output(flood));
+        // A bell after the flood: its events come after the flood's.
+        fake.send(PtyEvent::Output(b"\x07".to_vec()));
+        let mut commands = 0;
+        loop {
+            match next(&events) {
+                (_, SessionEvent::Bell) => break,
+                (_, SessionEvent::CommandStarted | SessionEvent::CommandFinished { .. }) => {
+                    commands += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!((1..=4).contains(&commands), "{commands} command events");
+        let records = app.command_records(id).unwrap();
+        assert_eq!(records.len(), 1, "one record for the last command");
+        assert_eq!(records[0].exit_code, Some(0));
+        fake.send(PtyEvent::Exited(ExitStatus::Exited(0)));
     }
 
     #[test]

@@ -296,7 +296,7 @@ impl<'a> Lines<'a> {
 
 /// A cell that holds no text: a space with no marker but padding and a
 /// hyperlink (styles do not count, so an erased coloured cell is blank too).
-fn is_blank(cell: &Cell) -> bool {
+pub(crate) fn is_blank(cell: &Cell) -> bool {
     cell.ch == ' '
         && cell
             .flags
@@ -770,8 +770,42 @@ impl SelectionState {
             line: last_with_text.unwrap_or_else(|| lines.last()),
             col: lines.cols - 1,
         };
+        self.select_whole(&lines, start, end);
+    }
+
+    /// Selects from the start of line `first` of `grid` to column
+    /// `last_col` of line `last`, both included, as a character selection
+    /// (a command's output, ADR 0039); returns whether it did: `false`,
+    /// the selection unchanged, unless both are selectable lines (in the
+    /// history or on the screen, the screen alone on the alternate
+    /// screen), `first` is not below `last` and the column is on the grid.
+    pub(crate) fn select_lines(
+        &mut self,
+        grid: &Grid,
+        first: i64,
+        last: i64,
+        last_col: u16,
+    ) -> bool {
+        let lines = Lines::of(grid);
+        if first > last || first < lines.first || last > lines.last() || last_col >= lines.cols {
+            return false;
+        }
+        let start = Pos {
+            line: first,
+            col: 0,
+        };
+        let end = Pos {
+            line: last,
+            col: last_col,
+        };
+        self.select_whole(&lines, start, end);
+        true
+    }
+
+    /// Makes `start..=end` of `lines` the selection, a character one.
+    fn select_whole(&mut self, lines: &Lines<'_>, start: Pos, end: Pos) {
         let mut guard = self.sel.take().map(|sel| sel.guard).unwrap_or_default();
-        guard.retake(&lines, start.line, end.line);
+        guard.retake(lines, start.line, end.line);
         self.sel = Some(Sel {
             anchor: (start, end),
             start,
