@@ -1,6 +1,6 @@
 # ADR 0037: Profiles and per-session appearance
 
-**Status:** accepted · 2026-11-07
+**Status:** accepted · 2026-11-07 · amended 2026-11-07 (#333)
 
 ## Context
 
@@ -22,16 +22,18 @@ profile. Profile files of their own (`profiles/*.toml`) are #312, not this.
 `dim_inactive_panes` as an `Option`; `ProfileAppearance::over(base)` puts
 the keys that are set over `[appearance]`. A key left out follows
 `[appearance]`, also after it changes. `dim_inactive_panes` is drawn by the
-window, not the session, so in a profile it is ignored with a warning. This
-changes 0.1.0 behaviour (a left-out key was reset to its default); the
-change is in docs/config.md and the release notes.
+window, not the session, so in a profile it is ignored with a warning. The
+inheritance changes 0.1.0 behaviour (a left-out key was reset to its
+default); the change is in docs/config.md and the release notes. A
+`font_size` or `opacity` that is not finite (`nan`, `inf`) is left out with
+a warning, so `[appearance]`'s applies (#333).
 
 **Resolution order.** `Config::resolve_profile(requested)` gives the
 `[[profiles]]` entry named `requested`, else the one `[general]
 default_profile` names, else the built-in profile (`[appearance]` and the
 login shell). A name that matches nothing gives a `Warning::ProfileNotFound`,
 except the default `"Default"` when no profile has it. Of two profiles with
-one name the first wins; there is no warning for the duplicate. The
+one name the first wins, and the second gets a warning. The
 default profile is used for every new tab, window and pane and for
 restored panes; a pane split off another starts with that pane's profile.
 
@@ -43,6 +45,22 @@ wins over the profile's command. `working_directory` is used when the
 caller gave no directory; `~` and `~/...` are the home directory, and a
 directory that does not exist falls back to the home directory with a
 warning that names the directory (escaped) and never the command (S8).
+
+**A profile that cannot start (#333).** When what the profile changed
+fails to start (a `working_directory` that exists but cannot be entered, a
+`command` that cannot be executed: `PtyError::Spawn`), the session is
+started once more as the built-in profile would start it, the caller's own
+options (the login shell in the home directory), and drawn with
+`[appearance]`. Its terminal reads one line before any of the child's
+output: `[Tessera] profile "<name>" could not start (<errno text>); started
+the default shell.` The name passes `display_name` (S3: control and
+bidirectional formatting characters removed, at most 128 bytes); the errno
+text is the C library's, so no path or `PATH` from the spawn error reaches
+the screen. The warning logged names the profile by its index and the
+errno only (S8). A failure of options the caller chose itself is not
+retried, nor is the retry: if the built-in start fails too, the profile's
+error is returned. So a broken `default_profile` never leaves New Tab
+without a shell.
 
 **Per-session looks.** `App` keeps a `Look` (theme, font size, cursor) per
 session, stored at attach from the session's resolved profile and
@@ -80,6 +98,11 @@ listed once, as the core starts the first.
 **Bounds (S5, S7).** At most 256 profiles (`MAX_PROFILES`), later ones
 dropped with one warning; a name longer than 128 bytes
 (`MAX_PROFILE_NAME_LEN`) is cut on a character boundary with a warning.
+A NUL character in a name (which could never be asked for over the C
+ABI) is replaced with U+FFFD, before the cut, with a warning naming the
+entry. The entry keeps its place, so the loaded `profiles[i]` is always
+the file's `i`-th `[[profiles]]` and the key paths of ADR 0040 edit the
+profile the frontend shows (#333).
 The FFI reads `SpawnOptions.profile` at most 129 bytes and refuses a longer
 or non-UTF-8 name with `INVALID_ARGUMENT`.
 

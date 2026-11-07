@@ -253,6 +253,16 @@ pub enum EditError {
     /// The key path does not parse.
     #[error(transparent)]
     KeyPath(#[from] KeyPathError),
+    /// The file is TOML but cannot be edited: the TOML editor cannot read
+    /// it or would not write it back byte for byte (mixed line endings, a
+    /// CRLF inside a multi-line string). Refused at
+    /// [`ConfigEditor::open`], before any key path is involved; the file is
+    /// left for the user to edit by hand.
+    #[error("config.toml cannot be edited here: {reason}")]
+    NotEditable {
+        /// Why, for a message.
+        reason: &'static str,
+    },
     /// The edit is not one the editor makes: the key path runs through a
     /// value that is not a table or array, a value would replace a table,
     /// a value holds a table, or the file would not survive an edit
@@ -403,7 +413,7 @@ impl ConfigEditor {
     /// symlink or a symlink cycle, is not a regular file, is larger than
     /// [`MAX_CONFIG_FILE_LEN`], has more than
     /// one hard link (the rename on save would split them), is read-only,
-    /// is not UTF-8 or not TOML. [`EditError::Unsupported`] when the TOML
+    /// is not UTF-8 or not TOML. [`EditError::NotEditable`] when the TOML
     /// editor would not write the file back byte for byte (the file's own
     /// line endings and missing final newline are kept on save; mixed line
     /// endings are not, nor a CRLF in a multi-line string).
@@ -420,21 +430,18 @@ impl ConfigEditor {
         let (endings, lf) = Endings::of(body);
         let state = State::of(&lf).map_err(|error| match error {
             Parsed::Toml(error) => EditError::File(Error::Parse(error)),
-            Parsed::Editor => EditError::Unsupported {
-                path: KeyPath(vec![Step::Key(String::new())]),
+            Parsed::Editor => EditError::NotEditable {
                 reason: "the TOML editor cannot read this file",
             },
         })?;
         if endings.apply(&state.doc.to_string()) != body {
-            return Err(EditError::Unsupported {
-                path: KeyPath(vec![Step::Key(String::new())]),
+            return Err(EditError::NotEditable {
                 reason: "the TOML editor would not write this file back unchanged",
             });
         }
         // A CRLF inside a multi-line string is part of its value.
         if endings.crlf && !same_as_saved(&state.plain, body) {
-            return Err(EditError::Unsupported {
-                path: KeyPath(vec![Step::Key(String::new())]),
+            return Err(EditError::NotEditable {
                 reason: "a multi-line string in this CRLF file would change",
             });
         }
@@ -509,21 +516,49 @@ impl ConfigEditor {
     /// path ends at a table or runs through a value), [`EditError::KeyPath`]
     /// for a malformed path, [`EditError::TooLarge`]. The document is
     /// unchanged after any error.
+    ///
+    /// An integer set where the loader reads a float (`opacity`) is
+    /// written as a float (`1.0`). Replacing an array keeps the comments
+    /// between its brackets, each on a line of its own above the key.
     pub fn set(&mut self, path: &str, value: toml::Value) -> Result<(), EditError> {
         let path: KeyPath = path.parse()?;
+        let state = self.prepare_set(&path, value.clone())?;
+        // The loader takes an integer for a float key; the file should say
+        // what the setting is (`opacity = 1.0`, #324 item 4).
+        let state = match state
+            .config
+            .as_ref()
+            .and_then(|config| floats_where_config_has_them(value, config, &path.0))
+        {
+            Some(value) => self.prepare_set(&path, value)?,
+            None => state,
+        };
+        self.keep(state);
+        Ok(())
+    }
+
+    /// The document with `value` set at `path`, checked as
+    /// [`ConfigEditor::commit`] checks it, not yet kept.
+    fn prepare_set(&self, path: &KeyPath, value: toml::Value) -> Result<State, EditError> {
         let unsupported = |reason| EditError::Unsupported {
             path: path.clone(),
             reason,
         };
         let edit_value = edit_value(&value, 0).map_err(unsupported)?;
         let mut doc = self.doc.clone();
-        let mut removed = Vec::new();
-        set_table(doc.as_table_mut(), false, &path.0, edit_value, &mut removed)
-            .map_err(unsupported)?;
+        // The comments inside a replaced value are moved, not removed.
+        set_table(
+            doc.as_table_mut(),
+            false,
+            &path.0,
+            edit_value,
+            &mut Vec::new(),
+        )
+        .map_err(unsupported)?;
         let mut expected = toml::Value::Table(self.plain.clone());
         plain_edit(&mut expected, &path.0, Some(value));
         let before = self.warnings.clone().unwrap_or_default();
-        self.commit(&path, &doc.to_string(), &expected, &removed, &before)
+        self.check(path, &doc.to_string(), &expected, &[], &before)
     }
 
     /// Removes the value, table or array element at `path`; `Ok(false)`
@@ -597,6 +632,33 @@ impl ConfigEditor {
         removed: &[String],
         before: &[Warning],
     ) -> Result<(), EditError> {
+        let state = self.check(path, text, expected, removed, before)?;
+        self.keep(state);
+        Ok(())
+    }
+
+    /// Makes the checked document `state` the one being edited.
+    fn keep(&mut self, state: State) {
+        self.doc = state.doc;
+        self.plain = state.plain;
+        self.comments = state.comments;
+        self.warnings = state.warnings;
+        self.themes = state.themes;
+        self.config = state.config;
+    }
+
+    /// Checks the edited document `text`: it parses, it is `expected` as
+    /// plain TOML, it keeps every comment but those of `removed` and adds
+    /// none, and the loader and the theme lookup warn about nothing that
+    /// `before` does not hold.
+    fn check(
+        &self,
+        path: &KeyPath,
+        text: &str,
+        expected: &toml::Value,
+        removed: &[String],
+        before: &[Warning],
+    ) -> Result<State, EditError> {
         let unsupported = |reason| EditError::Unsupported {
             path: path.clone(),
             reason,
@@ -684,13 +746,7 @@ impl ConfigEditor {
                 warnings: new,
             });
         }
-        self.doc = state.doc;
-        self.plain = state.plain;
-        self.comments = state.comments;
-        self.warnings = state.warnings;
-        self.themes = state.themes;
-        self.config = state.config;
-        Ok(())
+        Ok(state)
     }
 
     /// Writes the document back when it changed; `Ok(false)` when there
@@ -1016,6 +1072,73 @@ fn multiset(items: &[String]) -> HashMap<&str, usize> {
     counts
 }
 
+/// `value` with each integer that `config` (the document loaded with
+/// `value` set at `steps`) holds as a float made a float; `None` when
+/// there is none. The loader reads `1` as `1.0` for a float setting, and
+/// the file then says `opacity = 1.0` (#324 item 4); an integer setting
+/// keeps its integer.
+fn floats_where_config_has_them(
+    value: toml::Value,
+    config: &Config,
+    steps: &[Step],
+) -> Option<toml::Value> {
+    /// `value` against `loaded`, the setting as the loader read it, and
+    /// whether anything was turned into a float.
+    fn coerce(value: toml::Value, loaded: &toml::Value) -> (toml::Value, bool) {
+        match (value, loaded) {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "as the loader reads an integer for a float"
+            )]
+            (toml::Value::Integer(i), toml::Value::Float(_)) => {
+                (toml::Value::Float(i as f64), true)
+            }
+            (toml::Value::Array(items), toml::Value::Array(loaded)) => {
+                let mut changed = false;
+                let items = items
+                    .into_iter()
+                    .zip(loaded.iter().map(Some).chain(std::iter::repeat(None)))
+                    .map(|(item, loaded)| match loaded {
+                        Some(loaded) => {
+                            let (item, coerced) = coerce(item, loaded);
+                            changed |= coerced;
+                            item
+                        }
+                        None => item,
+                    })
+                    .collect();
+                (toml::Value::Array(items), changed)
+            }
+            (value, _) => (value, false),
+        }
+    }
+
+    if !holds_integer(&value) {
+        return None;
+    }
+    let mut loaded = toml::Value::try_from(config).ok()?;
+    for step in steps {
+        loaded = match (step, loaded) {
+            (Step::Key(key), toml::Value::Table(mut table)) => table.remove(key)?,
+            (Step::Index(index), toml::Value::Array(mut array)) => {
+                (*index < array.len()).then(|| array.swap_remove(*index))?
+            }
+            _ => return None,
+        };
+    }
+    let (value, changed) = coerce(value, &loaded);
+    changed.then_some(value)
+}
+
+/// Whether `value` is or holds an integer.
+fn holds_integer(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::Integer(_) => true,
+        toml::Value::Array(items) => items.iter().any(holds_integer),
+        _ => false,
+    }
+}
+
 /// `value` as a TOML editor value.
 fn edit_value(value: &toml::Value, depth: usize) -> Result<Value, &'static str> {
     if depth > MAX_VALUE_DEPTH {
@@ -1065,47 +1188,85 @@ fn container(inline: bool, dotted: bool, rest: &[Step]) -> Item {
     }
 }
 
-/// Sets `steps` (starting at a key of `table`) to `value`; the comments of
-/// a replaced value are pushed onto `removed`.
+/// Sets `steps` (starting at a key of `table`) to `value`. A replaced
+/// value keeps the comments around it; those inside it (between an
+/// array's brackets) are pushed onto `moved` and put on lines of their own
+/// above the nearest key of a table that is not inline (#324 item 21):
+/// the key replaced, or the one holding the inline table or array it is
+/// in.
 fn set_table(
     table: &mut dyn TableLike,
     inline: bool,
     steps: &[Step],
     value: Value,
-    removed: &mut Vec<String>,
+    moved: &mut Vec<String>,
 ) -> Result<(), &'static str> {
     let Some((Step::Key(key), rest)) = steps.split_first() else {
         return Err("an index into a table");
     };
     if rest.is_empty() {
-        return match table.get_mut(key) {
+        match table.get_mut(key) {
             Some(Item::Value(old)) if !matches!(old, Value::InlineTable(_)) => {
-                value_comments(old, removed);
+                inner_comments(old, moved);
                 let decor = old.decor().clone();
                 *old = value;
                 *old.decor_mut() = decor;
-                Ok(())
             }
             Some(Item::None) | None => {
                 table.insert(key, Item::Value(value));
-                Ok(())
             }
-            Some(_) => Err("a value cannot replace a table"),
-        };
+            Some(_) => return Err("a value cannot replace a table"),
+        }
+        place_above(table, inline, key, moved);
+        return Ok(());
     }
     if table.get(key).is_none_or(Item::is_none) {
         let dotted = table.is_dotted();
         table.insert(key, container(inline, dotted, rest));
     }
     match table.get_mut(key) {
-        Some(Item::Table(child)) => set_table(child, false, rest, value, removed),
-        Some(Item::Value(Value::InlineTable(child))) => {
-            set_table(child, true, rest, value, removed)
-        }
-        Some(Item::Value(Value::Array(child))) => set_array(child, rest, value, removed),
-        Some(Item::ArrayOfTables(child)) => set_tables(child, rest, value, removed),
+        Some(Item::Table(child)) => set_table(child, false, rest, value, moved),
+        Some(Item::Value(Value::InlineTable(child))) => set_table(child, true, rest, value, moved),
+        Some(Item::Value(Value::Array(child))) => set_array(child, rest, value, moved),
+        Some(Item::ArrayOfTables(child)) => set_tables(child, rest, value, moved),
         _ => Err("the path runs through a value"),
+    }?;
+    place_above(table, inline, key, moved);
+    Ok(())
+}
+
+/// Pushes the comments inside `value` (between an array's brackets), not
+/// those around it.
+fn inner_comments(value: &Value, out: &mut Vec<String>) {
+    if let Value::Array(array) = value {
+        for item in array {
+            value_comments(item, out);
+        }
+        raw_comments(array.trailing(), out);
     }
+}
+
+/// Puts `moved` on lines of their own above `key` of `table`, indented
+/// like the key, unless `table` is inline (they go above the key holding
+/// it). Its line's prefix holds the lines above it, also for a dotted key.
+fn place_above(table: &mut dyn TableLike, inline: bool, key: &str, moved: &mut Vec<String>) {
+    if inline || moved.is_empty() {
+        return;
+    }
+    let Some(mut key) = table.key_mut(key) else {
+        return;
+    };
+    let prefix = raw_text(key.leaf_decor().prefix()).to_owned();
+    let at = prefix.rfind('\n').map_or(0, |nl| nl + 1);
+    let indent = &prefix[at..];
+    let mut lines = prefix[..at].to_owned();
+    for comment in moved.drain(..) {
+        lines.push_str(indent);
+        lines.push_str(&comment);
+        lines.push('\n');
+    }
+    lines.push_str(indent);
+    key.leaf_decor_mut().set_prefix(lines);
 }
 
 /// [`set_table`] for a step into an array of values.
@@ -1113,7 +1274,7 @@ fn set_array(
     array: &mut Array,
     steps: &[Step],
     value: Value,
-    removed: &mut Vec<String>,
+    moved: &mut Vec<String>,
 ) -> Result<(), &'static str> {
     let Some((&Step::Index(index), rest)) = steps.split_first() else {
         return Err("a key into an array");
@@ -1122,7 +1283,7 @@ fn set_array(
         return match array.get(index) {
             Some(Value::InlineTable(_)) => Err("a value cannot replace a table"),
             Some(old) => {
-                value_comments(old, removed);
+                inner_comments(old, moved);
                 array.replace_formatted(index, {
                     let mut value = value;
                     *value.decor_mut() = old.decor().clone();
@@ -1141,8 +1302,8 @@ fn set_array(
         array.push(InlineTable::new());
     }
     match array.get_mut(index) {
-        Some(Value::InlineTable(child)) => set_table(child, true, rest, value, removed),
-        Some(Value::Array(child)) => set_array(child, rest, value, removed),
+        Some(Value::InlineTable(child)) => set_table(child, true, rest, value, moved),
+        Some(Value::Array(child)) => set_array(child, rest, value, moved),
         Some(_) => Err("the path runs through a value"),
         None => Err("no such array element"),
     }
@@ -1184,7 +1345,7 @@ fn set_tables(
     tables: &mut ArrayOfTables,
     steps: &[Step],
     value: Value,
-    removed: &mut Vec<String>,
+    moved: &mut Vec<String>,
 ) -> Result<(), &'static str> {
     let Some((&Step::Index(index), rest)) = steps.split_first() else {
         return Err("a key into an array");
@@ -1196,7 +1357,7 @@ fn set_tables(
         tables.push(Table::new());
     }
     match tables.get_mut(index) {
-        Some(child) => set_table(child, false, rest, value, removed),
+        Some(child) => set_table(child, false, rest, value, moved),
         None => Err("no such array element"),
     }
 }

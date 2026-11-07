@@ -301,6 +301,19 @@ impl Config {
         for (i, profile) in self.profiles.iter_mut().enumerate() {
             if let Some(appearance) = profile.appearance.as_mut() {
                 let prefix = format!("profiles[{i}].appearance");
+                // Not a number, or infinite: unset, so `[appearance]`'s
+                // value applies, as for a key left out (#333).
+                for (key, value) in [
+                    ("font_size", &mut appearance.font_size),
+                    ("opacity", &mut appearance.opacity),
+                ] {
+                    if let Some(bad) = value.take_if(|v| !v.is_finite()) {
+                        warnings.push(Warning::OutOfRange {
+                            path: format!("{prefix}.{key}"),
+                            detail: format!("{bad} ignored; [appearance] {key} applies"),
+                        });
+                    }
+                }
                 if let Some(size) = appearance.font_size.as_mut() {
                     *size = font_size_in_range(&prefix, *size, &mut warnings);
                 }

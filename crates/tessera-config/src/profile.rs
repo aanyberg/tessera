@@ -46,14 +46,16 @@ pub struct ProfileAppearance {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font_family: Option<String>,
     /// Font size in points, clamped on load as for `[appearance]
-    /// font_size`.
+    /// font_size`. A value that is not a finite number (`nan`, `inf`) is
+    /// ignored with a warning, so `[appearance]`'s applies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font_size: Option<f32>,
     /// Background opacity of this profile's sessions, 0.0..=1.0. A window
     /// is translucent while any pane of its tab is, and stays opaque only
     /// while every one is; an opaque session still draws its own opaque
     /// background. The system's Reduce Transparency setting draws every
-    /// session opaque.
+    /// session opaque. A value that is not a finite number is ignored with
+    /// a warning, so `[appearance]`'s applies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opacity: Option<f32>,
     /// Background blur behind each of this profile's panes whose background
@@ -83,7 +85,9 @@ pub struct ProfileAppearance {
 impl ProfileAppearance {
     /// `base` with every key this profile sets replaced:
     /// the appearance a session of this profile is drawn with.
-    /// `dim_inactive_panes` is always `base`'s.
+    /// `dim_inactive_panes` is always `base`'s, and so is a `font_size` or
+    /// `opacity` that is not a finite number (the loader already turns
+    /// those into unset keys; #333).
     #[must_use]
     pub fn over(&self, base: &Appearance) -> Appearance {
         Appearance {
@@ -92,8 +96,14 @@ impl ProfileAppearance {
                 .font_family
                 .clone()
                 .unwrap_or_else(|| base.font_family.clone()),
-            font_size: self.font_size.unwrap_or(base.font_size),
-            opacity: self.opacity.unwrap_or(base.opacity),
+            font_size: self
+                .font_size
+                .filter(|size| size.is_finite())
+                .unwrap_or(base.font_size),
+            opacity: self
+                .opacity
+                .filter(|opacity| opacity.is_finite())
+                .unwrap_or(base.opacity),
             blur: self.blur.unwrap_or(base.blur),
             cursor_shape: self.cursor_shape.unwrap_or(base.cursor_shape),
             cursor_blink: self.cursor_blink.unwrap_or(base.cursor_blink),
@@ -182,7 +192,9 @@ impl Config {
 /// reported. Entries keep their places, so `profiles[i]` in a warning is
 /// the `i`-th `[[profiles]]` of the file. A name an earlier entry has too
 /// (byte for byte, after the cut) is reported: the earlier entry is the
-/// one used.
+/// one used. A NUL character in a name, which the frontends could not
+/// pass as a C string, is replaced with U+FFFD and reported, before the
+/// cut; the entry keeps its place (#333).
 pub(crate) fn cap_profiles(config: &mut Config, warnings: &mut Vec<Warning>) {
     if config.profiles.len() > MAX_PROFILES {
         warnings.push(Warning::TooManyProfiles {
@@ -191,6 +203,13 @@ pub(crate) fn cap_profiles(config: &mut Config, warnings: &mut Vec<Warning>) {
         config.profiles.truncate(MAX_PROFILES);
     }
     for (i, profile) in config.profiles.iter_mut().enumerate() {
+        if profile.name.contains('\0') {
+            warnings.push(Warning::OutOfRange {
+                path: format!("profiles[{i}].name"),
+                detail: "holds a NUL character, replaced with U+FFFD".into(),
+            });
+            profile.name = profile.name.replace('\0', "\u{fffd}");
+        }
         if profile.name.len() > MAX_PROFILE_NAME_LEN {
             let mut end = MAX_PROFILE_NAME_LEN;
             while !profile.name.is_char_boundary(end) {
@@ -472,6 +491,101 @@ mod tests {
         );
         let resolved = loaded.config.resolve_profile(Some("zsh"));
         assert_eq!(resolved.command.as_deref(), Some("zsh"));
+    }
+
+    /// A profile's `font_size = nan` and `opacity = inf` are warned about
+    /// and unset, so the session takes `[appearance]`'s (#333 M-c); a
+    /// finite value out of range is still clamped.
+    #[test]
+    fn a_non_finite_profile_size_or_opacity_inherits_appearance() {
+        let text = "[appearance]\nfont_size = 15.0\nopacity = 0.8\n\
+                    [[profiles]]\nname = \"p\"\nappearance.font_size = nan\nappearance.opacity = inf\n\
+                    [[profiles]]\nname = \"q\"\nappearance.font_size = -inf\nappearance.opacity = 2.0\n";
+        let loaded = Config::from_toml_lenient(text).unwrap();
+        let paths: Vec<&str> = loaded
+            .warnings
+            .iter()
+            .map(|w| match w {
+                Warning::OutOfRange { path, .. } => path.as_str(),
+                _ => "",
+            })
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "profiles[0].appearance.font_size",
+                "profiles[0].appearance.opacity",
+                "profiles[1].appearance.font_size",
+                "profiles[1].appearance.opacity",
+            ]
+        );
+        let p = loaded.config.resolve_profile(Some("p")).appearance;
+        assert!((p.font_size - 15.0).abs() < f32::EPSILON, "{p:?}");
+        assert!((p.opacity - 0.8).abs() < f32::EPSILON, "{p:?}");
+        let q = loaded.config.resolve_profile(Some("q")).appearance;
+        assert!((q.font_size - 15.0).abs() < f32::EPSILON, "{q:?}");
+        assert!((q.opacity - 1.0).abs() < f32::EPSILON, "{q:?}");
+        // A configuration built in code, never loaded: the same.
+        let unchecked = ProfileAppearance {
+            font_size: Some(f32::NAN),
+            opacity: Some(f32::INFINITY),
+            ..ProfileAppearance::default()
+        };
+        let base = Appearance::default();
+        let drawn = unchecked.over(&base);
+        assert_eq!(drawn.font_size.to_bits(), base.font_size.to_bits());
+        assert_eq!(drawn.opacity.to_bits(), base.opacity.to_bits());
+    }
+
+    /// A NUL in a profile name is replaced with U+FFFD, with a load
+    /// warning, and the profile keeps its place (#333): `profiles[i]` is
+    /// still the file's `i`-th entry.
+    #[test]
+    fn a_nul_in_a_profile_name_is_replaced_and_the_profile_kept() {
+        let text = "[[profiles]]\nname = \"a\\u0000b\"\ncommand = \"evil\"\n\
+                    [[profiles]]\nname = \"ok\"\nappearance.opacity = 7.0\n\
+                    [[profiles]]\nname = \"a\\u0000b\"\n";
+        let loaded = Config::from_toml_lenient(text).unwrap();
+        let names: Vec<&str> = loaded
+            .config
+            .profiles
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(names, ["a\u{fffd}b", "ok", "a\u{fffd}b"]);
+        let warned: Vec<(&str, &str)> = loaded
+            .warnings
+            .iter()
+            .map(|w| match w {
+                Warning::OutOfRange { path, detail } => (path.as_str(), detail.as_str()),
+                _ => ("", ""),
+            })
+            .collect();
+        let at = |path: &str| -> Vec<&str> {
+            warned
+                .iter()
+                .filter(|(p, _)| *p == path)
+                .map(|(_, d)| *d)
+                .collect()
+        };
+        assert_eq!(warned.len(), 4, "{warned:?}");
+        assert!(at("profiles[0].name")[0].contains("NUL"), "{warned:?}");
+        assert_eq!(at("profiles[1].appearance.opacity").len(), 1, "{warned:?}");
+        let third = at("profiles[2].name");
+        assert_eq!(third.len(), 2, "NUL and the duplicate: {warned:?}");
+        assert!(third[0].contains("NUL"), "{warned:?}");
+        assert!(third[1].contains("profiles[0]"), "{warned:?}");
+        assert!(warned.iter().all(|(_, d)| !d.contains('\0')));
+        let resolved = loaded.config.resolve_profile(Some("a\u{fffd}b"));
+        assert_eq!(resolved.name.as_deref(), Some("a\u{fffd}b"));
+        assert_eq!(resolved.command.as_deref(), Some("evil"));
+        assert_eq!(loaded.config.resolve_profile(Some("a\0b")).name, None);
+        // Replaced before the cut: the name stays within its bytes.
+        let long = format!("[[profiles]]\nname = \"{}\\u0000\"\n", "n".repeat(127));
+        let loaded = Config::from_toml_lenient(&long).unwrap();
+        let name = &loaded.config.profiles[0].name;
+        assert!(name.len() <= MAX_PROFILE_NAME_LEN, "{}", name.len());
+        assert!(!name.contains('\0'));
     }
 
     /// Profile keys left out stay out when the configuration is written

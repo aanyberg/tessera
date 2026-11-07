@@ -931,7 +931,9 @@ impl Session {
     /// The terminal has `look`'s cursor style as its default and its theme
     /// colours ([`crate::view::theme_colors_for`]) and keeps
     /// at most `scrollback` lines of history (`[terminal]
-    /// scrollback_lines`) before the reader feeds it the first byte. The reader reads
+    /// scrollback_lines`) before the reader feeds it the first byte. The
+    /// terminal reads `notice` (empty, or the line saying a profile could
+    /// not start, #333) before any of the child's output. The reader reads
     /// `applied` for the clipboard setting in effect.
     #[expect(
         clippy::too_many_arguments,
@@ -943,6 +945,7 @@ impl Session {
         events: PtyEvents,
         size: PtySize,
         (profile, look): (Option<String>, (u64, Arc<Look>)),
+        notice: &[u8],
         scrollback: usize,
         observers: ObserverSlot,
         applied: Arc<Mutex<Applied>>,
@@ -953,6 +956,7 @@ impl Session {
         terminal.set_default_cursor_style(look.1.cursor());
         terminal.set_theme_colors(crate::view::theme_colors_for(&look.1.colours));
         terminal.set_max_scrollback(scrollback);
+        terminal.advance(notice);
         let term = Arc::new(SharedTerminal::new(terminal));
         let muted = Arc::new(AtomicBool::new(false));
         let outbox = Arc::new(Outbox::default());

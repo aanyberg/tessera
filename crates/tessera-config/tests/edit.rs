@@ -125,6 +125,100 @@ fn set_replaces_values_in_place() {
     insta::assert_snapshot!("set_in_place", read(&path));
 }
 
+/// Setting a whole array keeps the comments between its old brackets,
+/// each on a line of its own above the key, indented like it (#324 item
+/// 21): in a table, as a dotted key and inside an inline table.
+#[test]
+fn setting_an_array_moves_its_comments_above_the_key() {
+    let (_dir, path, mut editor) = open(HAND_EDITED);
+    editor
+        .set("plugins.enabled", toml::Value::Array(vec![s("a")]))
+        .unwrap();
+    assert!(editor.save().unwrap());
+    insta::assert_snapshot!("array_set_keeps_comments", read(&path));
+    for (text, want) in [
+        (
+            "# above\n  plugins.enabled = [ # first\n    \"x\", # x\n    # end\n  ]\n",
+            "# above\n  # first\n  # x\n  # end\n  plugins.enabled = [\"a\"]\n",
+        ),
+        (
+            "plugins = { enabled = [\"x\", # x\n] } # after\n",
+            "# x\nplugins = { enabled = [\"a\"] } # after\n",
+        ),
+        (
+            "[plugins]\nenabled = [\"x\", [\"nested\" # deep\n], # x\n]\n",
+            "[plugins]\n# deep\n# x\nenabled = [\"a\"]\n",
+        ),
+    ] {
+        let (_dir, _path, mut editor) = open(text);
+        editor
+            .set("plugins.enabled", toml::Value::Array(vec![s("a")]))
+            .unwrap();
+        assert_eq!(editor.to_toml(), want, "{text:?}");
+    }
+}
+
+/// A profile whose name holds a NUL keeps its place (#333): the loaded
+/// `profiles` count is the file's, so `profiles[N].name` (N profiles, as
+/// a frontend reads them) adds a profile and never renames the last one.
+#[test]
+fn a_nul_named_profile_keeps_the_indices_of_the_file() {
+    let text = "[[profiles]]\nname = \"a\\u0000b\"\n\n\
+                [[profiles]]\nname = \"Work\"\ncommand = \"vim\"\n";
+    let loaded = tessera_config::Config::from_toml_lenient(text).unwrap();
+    let n = loaded.config.profiles.len();
+    assert_eq!(n, 2, "every [[profiles]] entry is listed");
+    let (_dir, path, mut editor) = open(text);
+    editor
+        .set(&format!("profiles[{n}].name"), s("New"))
+        .unwrap();
+    assert!(editor.save().unwrap());
+    let saved = tessera_config::Config::from_toml_lenient(&read(&path)).unwrap();
+    let profiles: Vec<(&str, Option<&str>)> = saved
+        .config
+        .profiles
+        .iter()
+        .map(|p| (p.name.as_str(), p.command.as_deref()))
+        .collect();
+    assert_eq!(
+        profiles,
+        [("a\u{fffd}b", None), ("Work", Some("vim")), ("New", None)]
+    );
+}
+
+/// An integer set on a float setting is written as a float (#324 item
+/// 4), in a value and in a profile; an integer setting keeps its integer.
+#[test]
+fn an_integer_on_a_float_key_is_written_as_a_float() {
+    let (_dir, _path, mut editor) =
+        open("[appearance]\nopacity = 0.5\n\n[[profiles]]\nname = \"p\"\n");
+    editor
+        .set("appearance.opacity", toml::Value::Integer(1))
+        .unwrap();
+    editor
+        .set("appearance.font_size", toml::Value::Integer(14))
+        .unwrap();
+    editor
+        .set("profiles[0].appearance.opacity", toml::Value::Integer(0))
+        .unwrap();
+    editor
+        .set("terminal.scrollback_lines", toml::Value::Integer(10))
+        .unwrap();
+    let text = editor.to_toml();
+    assert!(text.contains("\nopacity = 1.0\n"), "{text}");
+    assert!(text.contains("\nfont_size = 14.0\n"), "{text}");
+    assert!(
+        text.contains("[profiles.appearance]\nopacity = 0.0\n"),
+        "{text}"
+    );
+    assert!(text.contains("\nscrollback_lines = 10\n"), "{text}");
+    // Out of range as an integer: refused as before.
+    assert!(matches!(
+        editor.set("appearance.opacity", toml::Value::Integer(5)),
+        Err(EditError::Refused { .. })
+    ));
+}
+
 /// New keys go at the end of their table, new tables after the existing
 /// ones, a new profile after the last; nothing else moves.
 #[test]
@@ -370,10 +464,11 @@ fn crlf_line_endings_are_kept() {
     for mixed in ["[appearance]\r\nopacity = 1.0\n", "a = 1\nb = 2\r\n"] {
         let dir = tempfile::tempdir().unwrap();
         let path = write(dir.path(), mixed);
+        // Refused at open, with no key path (#324 item 1).
         assert!(
             matches!(
                 ConfigEditor::open(&path),
-                Err(EditError::Unsupported { .. })
+                Err(EditError::NotEditable { .. })
             ),
             "{mixed:?}"
         );
@@ -990,8 +1085,10 @@ proptest! {
     }
 
     /// Hostile documents never panic the editor; one that opens either
-    /// takes an edit, keeping every line that is not about the edited key,
-    /// or refuses it and stays as it was.
+    /// takes an edit, keeping every comment line (a profile removed takes
+    /// at most those in it, #324 item 8), or refuses it and stays as it
+    /// was. Setting an array keeps the comments between its brackets
+    /// (#324 item 21).
     #[test]
     fn hostile_documents_never_lose_lines(
         lines in proptest::collection::vec(
@@ -1000,11 +1097,14 @@ proptest! {
                 Just(String::new()),
                 Just("[appearance]".to_owned()),
                 Just("[terminal]".to_owned()),
+                Just("[plugins]".to_owned()),
                 Just("[[profiles]]".to_owned()),
                 Just("name = \"p\"".to_owned()),
                 Just("opacity = 0.5 # trailing".to_owned()),
                 Just("appearance.opacity = 1.0".to_owned()),
                 Just("x = [ # open\n  1, # one\n  # two\n  2,\n]".to_owned()),
+                Just("enabled = [ # first\n  \"a\", # elem\n  # end\n]".to_owned()),
+                Just("plugins.enabled = [\"a\", # dotted\n]".to_owned()),
                 Just("y = { a = 1, b = \"#\" }".to_owned()),
                 Just("s = \"\"\"\n# not a comment\n\"\"\"".to_owned()),
                 Just("font_size = nan".to_owned()),
@@ -1013,9 +1113,18 @@ proptest! {
             ],
             0..24,
         ),
-        op in 0..4u8,
+        // Half the documents start with a commented array that op 4
+        // replaces, so the comments it moves are checked on most runs.
+        lead in proptest::bool::ANY,
+        op in 0..6u8,
     ) {
-        let text = lines.join("\n");
+        /// The comments the generator writes, each counted on its own.
+        const COMMENTS: [&str; 9] = [
+            "# comment", "# trailing", "# open", "# one", "# two", "# first", "# elem",
+            "# end", "# dotted",
+        ];
+        let lead = if lead { "[plugins]\nenabled = [ # first\n  \"a\", # elem\n  # end\n]\n" } else { "" };
+        let text = format!("{lead}{}", lines.join("\n"));
         let dir = tempfile::tempdir().unwrap();
         let path = write(dir.path(), &text);
         let Ok(mut editor) = ConfigEditor::open(&path) else { return Ok(()) };
@@ -1023,7 +1132,8 @@ proptest! {
             0 => editor.set("appearance.opacity", toml::Value::Float(0.25)),
             1 => editor.remove("appearance.opacity").map(|_| ()),
             2 => editor.remove("profiles[0]").map(|_| ()),
-            _ => editor.set("terminal.scrollback_lines", toml::Value::Integer(10)),
+            3 => editor.set("terminal.scrollback_lines", toml::Value::Integer(10)),
+            _ => editor.set("plugins.enabled", toml::Value::Array(vec![s("b")])),
         };
         let after = editor.to_toml();
         if result.is_err() {
@@ -1031,11 +1141,20 @@ proptest! {
         }
         let reparsed: Result<toml::Table, _> = toml::from_str(&after);
         prop_assert!(reparsed.is_ok(), "{}", after);
-        // Every comment line not about the edit stays.
-        for line in text.lines().filter(|l| l.trim_start().starts_with("# comment")) {
-            let before = text.matches(line).count();
-            let now = after.matches(line).count();
-            prop_assert!(now + 2 >= before || op == 2, "{text:?} -> {after:?}");
+        // The lines of the first profile: its header up to the next one.
+        let profile: String = text
+            .lines()
+            .skip_while(|line| *line != "[[profiles]]")
+            .enumerate()
+            .take_while(|(i, line)| *i == 0 || !line.starts_with('['))
+            .flat_map(|(_, line)| [line, "\n"])
+            .collect();
+        for comment in COMMENTS {
+            let before = text.matches(comment).count();
+            let now = after.matches(comment).count();
+            prop_assert!(now <= before, "{comment} added: {text:?} -> {after:?}");
+            let may_go = if op == 2 && result.is_ok() { profile.matches(comment).count() } else { 0 };
+            prop_assert!(now + may_go >= before, "{comment} lost: {text:?} -> {after:?}");
         }
         editor.save().unwrap();
         prop_assert_eq!(read(&path), after);
@@ -1053,7 +1172,7 @@ fn crlf_in_a_multi_line_string_is_refused() {
     let path = write(dir.path(), text);
     assert!(matches!(
         ConfigEditor::open(&path),
-        Err(EditError::Unsupported { .. })
+        Err(EditError::NotEditable { .. })
     ));
     let text = "[[profiles]]\r\nname = \"a\"\r\n";
     let path = write(dir.path(), text);
