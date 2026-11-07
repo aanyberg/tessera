@@ -45,15 +45,16 @@ select_tab:9,cmd+9,,Window > Select Tab > Tab 9,9,cmd,cmd+9,cmd+9,app,S-MM:138 t
 bring_all_to_front,,,Window > Bring All to Front,,,none,none,system,S-MM:119.
 help,cmd+shift+/,,Help > Tessera Help,?,cmd (shift implied by '?'),none,cmd+shift+/ ('Terminal Help' is cmd+? in all Apple apps),app,S-MM:127. Shipped as '?' with default mask. Chord written 'cmd+shift+/' (unshifted key + explicit shift); 'cmd+?' is accepted as an alias that parses to the same chord (grammar G-shifted).
 # --- commands added by later wave-13 tasks (defaults from decisions D1, D4 and the iTerm2 conventions they cite) ---
-split_right,cmd+d,,Shell > Split Right (T1),d,cmd,cmd+d = split vertically (new pane to the right) (S-ITERM),cmd+d = 'Split window into two panes' (S-TERM),later:T1,D1. Terminal.app's close-split is shift+cmd+d; iTerm2's ⇧⌘D splits horizontally. Follow iTerm2 (D1).
-split_down,cmd+shift+d,,Shell > Split Down (T1),d,cmd+shift,cmd+shift+d (S-ITERM),cmd+shift+d = 'Close split pane' (S-TERM) - CONFLICT with Terminal.app meaning; D1 chooses iTerm2,later:T1,D1.
-focus_pane_left,cmd+alt+left,,pane focus (T1),F:LeftArrow,cmd+alt,cmd+alt+left (S-ITERM),none,later:T1,D1.
-focus_pane_right,cmd+alt+right,,pane focus (T1),F:RightArrow,cmd+alt,cmd+alt+right (S-ITERM),none,later:T1,D1.
-focus_pane_up,cmd+alt+up,,pane focus (T1),F:UpArrow,cmd+alt,cmd+alt+up (S-ITERM),none,later:T1,D1. Terminal.app cmd+alt+up = jump to previous bookmark (S-TERM).
-focus_pane_down,cmd+alt+down,,pane focus (T1),F:DownArrow,cmd+alt,cmd+alt+down (S-ITERM),none,later:T1,D1. Terminal.app cmd+alt+down = next bookmark.
-focus_pane_previous,cmd+[,,pane focus order (T10?),[,cmd,cmd+[ (S-ITERM),none,later:T10,Not in D1; recommended for iTerm2 parity, lead to confirm (decision N6).
-focus_pane_next,cmd+],,pane focus order (T10?),],cmd,cmd+] (S-ITERM),none,later:T10,As above.
-zoom_pane,cmd+shift+enter,,pane zoom (T10),F:\r,cmd+shift,cmd+shift+enter = maximize pane (S-ITERM),none,later:T10,Not in D1; confirm (N6). Terminal.app shift+cmd+return = 'send return without marking'.
+split_right,cmd+d,,Shell > Split Right (T1),d,cmd,cmd+d = split vertically (new pane to the right) (S-ITERM),cmd+d = 'Split window into two panes' (S-TERM),app,D1. Terminal.app's close-split is shift+cmd+d; iTerm2's ⇧⌘D splits horizontally. Follow iTerm2 (D1).
+split_down,cmd+shift+d,,Shell > Split Down (T1),d,cmd+shift,cmd+shift+d (S-ITERM),cmd+shift+d = 'Close split pane' (S-TERM) - CONFLICT with Terminal.app meaning; D1 chooses iTerm2,app,D1.
+focus_pane_left,cmd+alt+left,,pane focus (T1),F:LeftArrow,cmd+alt,cmd+alt+left (S-ITERM),none,app,D1.
+focus_pane_right,cmd+alt+right,,pane focus (T1),F:RightArrow,cmd+alt,cmd+alt+right (S-ITERM),none,app,D1.
+focus_pane_up,cmd+alt+up,,pane focus (T1),F:UpArrow,cmd+alt,cmd+alt+up (S-ITERM),none,app,D1. Terminal.app cmd+alt+up = jump to previous bookmark (S-TERM).
+focus_pane_down,cmd+alt+down,,pane focus (T1),F:DownArrow,cmd+alt,cmd+alt+down (S-ITERM),none,app,D1. Terminal.app cmd+alt+down = next bookmark.
+focus_pane_previous,cmd+[,,pane focus order (T10?),[,cmd,cmd+[ (S-ITERM),none,app,Not in D1; recommended for iTerm2 parity, lead to confirm (decision N6).
+focus_pane_next,cmd+],,pane focus order (T10?),],cmd,cmd+] (S-ITERM),none,app,As above.
+zoom_pane,cmd+shift+enter,,pane zoom (T10),F:\r,cmd+shift,cmd+shift+enter = maximize pane (S-ITERM),none,app,Not in D1; confirm (N6). Terminal.app shift+cmd+return = 'send return without marking'.
+equalize_panes,,,Shell > Equalize Panes (#38b),,,none,none,app,No default chord (#38b E3); double-clicking a divider equalises that one split.
 find,cmd+f,,Edit > Find (T8),f,cmd,cmd+f,cmd+f (S-TERM),later:T8,
 find_next,cmd+g,,Edit > Find Next (T8),g,cmd,cmd+g (unverified),cmd+g (S-TERM),later:T8,
 find_previous,cmd+shift+g,,Edit > Find Previous (T8),g,cmd+shift,cmd+shift+g (unverified),cmd+shift+g (S-TERM),later:T8,

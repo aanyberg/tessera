@@ -178,6 +178,17 @@ public final class TesseraApp {
         try TesseraKeymap.read(core.pointer)
     }
 
+    /// `[appearance] dim_inactive_panes` in effect: how much to darken the
+    /// panes of a split tab that do not have the focus, 0 (off) to 0.8,
+    /// clamped by the core. Read again after a configuration is applied.
+    ///
+    /// - Throws: ``TesseraCoreError/nullPointer`` after ``shutdown()``.
+    public func dimInactivePanes() throws -> Float {
+        var amount: Float = 0
+        try TesseraCoreError.check(tessera_app_dim_inactive_panes(core.pointer, &amount))
+        return amount
+    }
+
     /// Closes every session and frees the core. Idempotent; afterwards every
     /// call that needs the core throws ``TesseraCoreError/nullPointer``.
     ///

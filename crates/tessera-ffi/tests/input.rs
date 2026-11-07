@@ -1457,7 +1457,8 @@ fn the_keymap_json_lists_every_command_with_its_menu_chords() {
     );
     assert_eq!(entry("select_tab:3")["parameter"], "3");
     assert_eq!(entry("quit")["owner"], "system");
-    assert_eq!(entry("split_right")["owner"], "planned");
+    assert_eq!(entry("split_right")["owner"], "app");
+    assert_eq!(entry("copy_mode")["owner"], "planned");
     // `cmd+shift+[`: AppKit's key equivalent is the shifted symbol.
     assert_eq!(
         entry("tab_previous")["menu"],

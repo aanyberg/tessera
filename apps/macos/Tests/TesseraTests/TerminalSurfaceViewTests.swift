@@ -405,12 +405,12 @@ final class TerminalSurfaceViewTests: XCTestCase {
         XCTAssertFalse(view.performKeyEquivalent(with: key("t", code: 17, [.command])), "New Tab's item")
         XCTAssertFalse(
             view.performKeyEquivalent(with: key("T", ignoring: "t", code: 17, [.command, .shift])), "unbound")
-        // ⌘D is a command a later version runs (split_right): no item, so the
+        // ⌘F is a command a later version runs (find): no item, so the
         // view swallows it rather than let it reach the shell as `CSI u`.
-        XCTAssertTrue(view.performKeyEquivalent(with: key("d", code: 2, [.command])), "a planned command")
+        XCTAssertTrue(view.performKeyEquivalent(with: key("f", code: 3, [.command])), "a planned command")
         // Not the first responder: nothing is resolved.
         window.makeFirstResponder(nil)
-        XCTAssertFalse(view.performKeyEquivalent(with: key("d", code: 2, [.command])), "another view's key")
+        XCTAssertFalse(view.performKeyEquivalent(with: key("f", code: 3, [.command])), "another view's key")
         // No menu takes the unbound ones here, so AppKit sends them on to
         // `keyDown`: they go up the responder chain, never to the session.
         _ = window.makeFirstResponder(view)

@@ -49,9 +49,11 @@ protocol TerminalWindowControllerDelegate: AnyObject {
 /// controller, and AppKit groups the windows that share
 /// ``tabbingIdentifier`` into one tab bar, ordering, dragging and merging
 /// them itself (ADR 0015). Within a tab, a ``PaneContainerView`` lays out the
-/// panes (ADR 0035): ⌘D and ⌘⇧D split the focused pane, ⌘⌥ and an arrow move
-/// the focus, ⌘W closes the focused pane and the last pane's ⌘W closes the
-/// tab. The window's title is the focused pane's.
+/// panes (ADR 0035): ⌘D and ⌘⇧D split the focused pane, ⌘⌥ and an arrow (or
+/// ⌘[ and ⌘]) move the focus, ⌘⇧↩ maximizes the focused pane and back, ⌘W
+/// closes the focused pane and the last pane's ⌘W closes the tab. A split,
+/// a close, a focus move or a new tab shows every pane again first. The
+/// window's title is the focused pane's.
 @MainActor
 final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMenuItemValidation {
     /// Shared by every terminal window, so AppKit tabs them together.
@@ -60,6 +62,9 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
     static let defaultTitle = "Terminal"
 
     private static let log = Logger(subsystem: "com.aanyberg.tessera", category: "window")
+
+    /// The Shell menu's ⌘W item, which ``PaneContainerView`` retitles.
+    private static let closeTabCommand = "close_tab"
 
     /// The tab's content: its panes, laid out.
     let paneContainer: PaneContainerView
@@ -102,6 +107,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
         window.delegate = self
         watchFocus(of: pane)
         window.initialFirstResponder = pane.view
+        paneContainer.activePane = pane
         updateMinimumSize()
     }
 
@@ -159,6 +165,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
     /// - Throws: The core's error if the session cannot be started.
     @discardableResult
     func splitFocusedPane(_ direction: PaneSplitDirection) throws -> Pane? {
+        unzoom()
         guard let delegate, paneContainer.canSplit(focusedPane, direction) else { return nil }
         let session = try delegate.terminalWindowControllerSpawnSession(self)
         let pane = Pane(session: session)
@@ -170,24 +177,133 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
         watchFocus(of: pane)
         updateMinimumSize()
         focus(pane)
+        paneLayoutDidChange()
         return pane
     }
 
     /// Moves the focus to the pane next to the focused one toward
-    /// `direction`; does nothing at the edge.
+    /// `direction`; does nothing at the edge. Shows every pane first.
     func moveFocus(_ direction: PaneDirection) {
+        unzoom()
         guard let neighbour = paneContainer.neighbour(of: focusedPane, toward: direction) else { return }
         focus(neighbour)
     }
 
-    /// Gives `pane` the keyboard.
+    /// Moves the focus to the next pane in reading order (`offset` 1) or
+    /// the previous one (-1), wrapping around. Shows every pane first.
+    func cycleFocus(by offset: Int) {
+        unzoom()
+        let panes = panes
+        guard panes.count > 1, let index = panes.firstIndex(of: focusedPane) else { return }
+        focus(panes[(index + offset % panes.count + panes.count) % panes.count])
+    }
+
+    /// Gives `pane` the keyboard; another pane than a maximized one shows
+    /// every pane first.
     func focus(_ pane: Pane) {
         guard panes.contains(pane) else { return }
+        if let zoomed = paneContainer.zoomedPane, zoomed !== pane {
+            unzoom()
+        }
         if window?.makeFirstResponder(pane.view) != true {
             // The window keeps its first responder (a sheet's field holds
             // it); the pane still becomes the focused one.
             paneDidBecomeFocused(pane)
         }
+    }
+
+    /// Whether a pane is maximized.
+    var isZoomed: Bool { paneContainer.zoomedPane != nil }
+
+    /// Maximizes the focused pane (`zoom_pane`), or shows every pane again
+    /// while one is maximized. Returns `false` for a lone pane.
+    @discardableResult
+    func toggleZoom() -> Bool {
+        let changed = isZoomed ? paneContainer.unzoom() : paneContainer.zoom(focusedPane)
+        if changed {
+            refocusAfterMovingViews()
+        }
+        return changed
+    }
+
+    /// Shows every pane again if one is maximized.
+    func unzoom() {
+        if paneContainer.unzoom() {
+            refocusAfterMovingViews()
+        }
+    }
+
+    /// Gives every pane an equal share (`equalize_panes`), every pane shown.
+    func equalizePanes() {
+        unzoom()
+        paneContainer.equalize()
+    }
+
+    /// Moving the views between split views can leave the window itself
+    /// first responder; gives the keyboard back to the focused pane.
+    private func refocusAfterMovingViews() {
+        guard let window, window.firstResponder === window || window.firstResponder == nil else { return }
+        window.makeFirstResponder(focusedPane.view)
+    }
+
+    /// The tab's pane layout to save (ADR 0031), or `nil` for one pane.
+    var paneLayout: PaneLayout? {
+        panes.count > 1 ? PaneLayout(paneContainer.tree) : nil
+    }
+
+    /// Lays the tab out as `layout`, a saved one, the first pane being
+    /// this tab's one pane and each other a new session's. Does nothing
+    /// (logged) for a layout that is not ``PaneLayout/isRestorable``, or
+    /// whose panes at their smallest size do not fit the window, or once
+    /// the tab has been split.
+    ///
+    /// - Throws: The core's error if a session cannot be started; the tab
+    ///   then keeps its one pane and every session started for it is closed.
+    func restoreLayout(_ layout: PaneLayout) throws {
+        guard let delegate, panes.count == 1, layout.leafCount > 1 else { return }
+        guard layout.isRestorable, let shape = layout.tree(leaves: Array(0..<layout.leafCount)) else {
+            Self.log.error("a saved pane layout is not usable; the tab opens with one pane")
+            return
+        }
+        let first = focusedPane
+        let paneMinimum = PaneContainerView.minimumSize(of: first.view)
+        let minimum = shape.minimumSize(divider: PaneSplitView.thickness) { _ in paneMinimum }
+        let space = paneContainer.bounds.size
+        guard minimum.width <= space.width, minimum.height <= space.height else {
+            Self.log.info("a saved pane layout does not fit its window; the tab opens with one pane")
+            return
+        }
+        var added: [Pane] = []
+        do {
+            for _ in 1..<layout.leafCount {
+                added.append(Pane(session: try delegate.terminalWindowControllerSpawnSession(self)))
+            }
+        } catch {
+            for pane in added {
+                closeSession(of: pane)
+                delegate.terminalWindowController(self, didClosePaneWith: pane.session)
+            }
+            throw error
+        }
+        guard let tree = layout.tree(leaves: [first] + added), paneContainer.restore(tree) else {
+            // Not reached: the layout was checked above.
+            for pane in added {
+                closeSession(of: pane)
+                delegate.terminalWindowController(self, didClosePaneWith: pane.session)
+            }
+            return
+        }
+        for pane in added {
+            watchFocus(of: pane)
+        }
+        updateMinimumSize()
+        focus(first)
+        paneLayoutDidChange()
+    }
+
+    /// The panes' shape or a divider changed: the window state is saved.
+    func paneLayoutDidChange() {
+        delegate?.terminalWindowControllerDidChangeLayout(self)
     }
 
     /// ⌘W: closes the focused pane, asking first while its session runs a
@@ -234,10 +350,12 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
         // retains its view until it is deactivated.
         pane.view.inputContext?.deactivate()
         let wasFocused = pane === focusedPane
+        unzoom()
         paneContainer.remove(pane)
         closeSession(of: pane)
         delegate?.terminalWindowController(self, didClosePaneWith: pane.session)
         updateMinimumSize()
+        paneLayoutDidChange()
         // Moving the views between split views can leave the window itself
         // first responder; give the keyboard back to the focused pane.
         if wasFocused {
@@ -273,6 +391,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
         guard panes.contains(pane) else { return }
         focusedPane = pane
         window?.initialFirstResponder = pane.view
+        paneContainer.activePane = pane
         updateTitle()
     }
 
@@ -320,6 +439,23 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
     @objc func selectPaneRight(_ sender: Any?) { moveFocus(.right) }
     @objc func selectPaneAbove(_ sender: Any?) { moveFocus(.up) }
     @objc func selectPaneBelow(_ sender: Any?) { moveFocus(.down) }
+
+    /// ⌘[ and ⌘]: the focus moves to the previous or next pane in reading
+    /// order.
+    @objc func selectPreviousPane(_ sender: Any?) { cycleFocus(by: -1) }
+    @objc func selectNextPane(_ sender: Any?) { cycleFocus(by: 1) }
+
+    /// ⌘⇧↩: maximizes the focused pane, or shows every pane again.
+    @objc func toggleZoomPane(_ sender: Any?) {
+        if !toggleZoom() {
+            NSSound.beep()
+        }
+    }
+
+    /// Shell > Equalize Panes.
+    @objc func equalizePanes(_ sender: Any?) {
+        equalizePanes()
+    }
 
     /// The tab bar's "+" button. AppKit shows it only when the responder
     /// chain answers this action.
@@ -378,15 +514,20 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
         }
     }
 
-    /// ⌘1 to ⌘9 are enabled only for tabs that exist, the pane moves only
-    /// with more than one pane.
+    /// ⌘1 to ⌘9 are enabled only for tabs that exist, the pane moves,
+    /// Maximize Pane (checked while a pane is) and Equalize Panes only with
+    /// more than one pane.
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         switch menuItem.action {
         case #selector(selectTabAtIndex(_:)):
             guard let window = window as? TerminalWindow else { return false }
             return window.tabs.indices.contains(menuItem.tag)
+        case #selector(toggleZoomPane(_:)):
+            menuItem.state = isZoomed ? .on : .off
+            return panes.count > 1
         case #selector(selectPaneLeft(_:)), #selector(selectPaneRight(_:)), #selector(selectPaneAbove(_:)),
-            #selector(selectPaneBelow(_:)):
+            #selector(selectPaneBelow(_:)), #selector(selectPreviousPane(_:)), #selector(selectNextPane(_:)),
+            #selector(equalizePanes(_:)):
             return panes.count > 1
         default:
             return true
@@ -427,7 +568,18 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
         delegate?.terminalWindowControllerDidChangeLayout(self)
     }
 
+    /// ⌘W's title is this tab's while its window is key: another window's
+    /// menu (one that is not a terminal's) says Close Tab again.
+    func windowDidResignKey(_ notification: Notification) {
+        Self.resetCloseTitle()
+    }
+
+    private static func resetCloseTitle() {
+        MainMenu.item(forCommand: closeTabCommand, in: NSApp.mainMenu)?.title = PaneContainerView.closeTabTitle
+    }
+
     func windowWillClose(_ notification: Notification) {
+        Self.resetCloseTitle()
         // A tab closing under its close sheet (its shell exited, or ⇧⌘W on
         // another tab closed it): the sheet answers Cancel, or the alert and
         // its modal session would outlive the tab.
@@ -472,6 +624,12 @@ final class TerminalWindow: NSWindow {
         let target = tabs[index]
         tabGroup?.selectedWindow = target
         target.makeKeyAndOrderFront(nil)
+    }
+
+    /// A new tab beside this one: this tab shows every pane again first.
+    override func addTabbedWindow(_ window: NSWindow, ordered: NSWindow.OrderingMode) {
+        (windowController as? TerminalWindowController)?.unzoom()
+        super.addTabbedWindow(window, ordered: ordered)
     }
 
     /// ⇧⌘]: the next tab, the first after the last.

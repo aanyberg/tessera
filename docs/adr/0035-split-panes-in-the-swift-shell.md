@@ -35,8 +35,8 @@ spatial neighbours) are generic over the leaf and tested without AppKit.
   split views are dropped last.
 - **Grid.** A pane's grid is the whole cells its frame holds, the rest
   going to the padding band, as for a window (ADR 0032); dividers do not
-  snap to cells. Dragging a divider resizes the two neighbouring panes'
-  surfaces on every step.
+  snap to cells. Dragging a divider resizes the neighbouring panes'
+  surfaces at most once per frame (below).
 - **Limits.** A tab holds at most 16 panes (`PaneTree.maxLeaves`), and no
   pane is smaller than 10 × 3 cells of its font, padding and a legacy
   scroll bar included. A split that would break either is refused with a
@@ -88,8 +88,51 @@ spatial neighbours) are generic over the leaf and tested without AppKit.
   `performClose(_:)` as before. The tab's close button and AppKit's
   tab-bar closes reach the window directly and close the whole tab.
 
-Window state restore stays one pane per tab: a restored tab opens with a
-single pane (ADR 0031).
+Window state restore keeps each tab's pane tree since #38b (ADR 0031).
+
+### Maximize, dim, equalise and restore (#38b, amended 2026-11-07)
+
+- **Maximize.** `zoom_pane` (⌘⇧↩, Shell ▸ Maximize Pane, checked while
+  on) shows the focused pane alone over the whole tab and toggles back.
+  The tree's split views stay in the container as they are, hidden, not
+  built again and no longer resized with it (an empty autoresizing mask,
+  and no relayout for a changed smallest size), with a stand-in at the
+  maximized pane's frame in its slot, so the hidden panes keep their
+  sessions, take output and keep their frames and grids, a clamped
+  divider included; showing every pane again puts the pane back in its
+  slot, every pane at the frame it had unless the tab was resized
+  meanwhile (then laid out as for a resize). A split, a close, a focus move (⌘⌥ and an arrow,
+  ⌘[ and ⌘], or focusing another pane) and a new tab added to the window
+  show every pane first. A tab with one pane cannot be maximized
+  (a beep). The state is not saved.
+- **Dim.** `[appearance] dim_inactive_panes` (0.0 to 0.8, default 0.0
+  for off; the core clamps a value out of range or not a number, with a
+  load warning, and ignores it in a profile) is drawn as a black
+  `PaneDimView` of that opacity, the topmost subview of each pane
+  without the focus, only while the tab shows more than one pane. It
+  takes no clicks and is not in the accessibility tree. The app reads
+  it from the core (`tessera_app_dim_inactive_panes`) at start and after
+  every applied configuration, so a live reload applies it.
+- **Equalise.** Double-clicking a divider gives that split's two sides
+  equal shares, `equalize_panes` (Shell ▸ Equalize Panes, no default
+  key) every split's. A share is weighted by the panes side by side
+  along the split's direction, so a row of three panes made by two
+  splits gets thirds and L | (R1 / R2) gets halves. Ratios stay the
+  stored fractions (D19), so equalising does not make a divider creep.
+- **Divider drags.** `NSSplitView`'s own drag tracking runs as a live
+  resize of every view under the split view (`viewWillStartLiveResize`
+  until the button is up), so each surface already passed at most one
+  size to the core per display refresh, and its last size at the end, as
+  in a live window resize (the first version of this ADR said a drag
+  resized on every step; it did not). A test drags through AppKit's
+  tracking and pins it (#315).
+- **⌘W's title** reads Close Pane while the focused tab has more than one
+  pane (validated from the `PaneContainerView`), Close Tab otherwise, and
+  goes back to Close Tab when the window stops being key or closes.
+- **Commands.** The pane items (split_right, split_down,
+  focus_pane_left/right/up/down, focus_pane_previous/next, zoom_pane,
+  equalize_panes) are registry commands with their item's identifier, so
+  `[keys]` rebinds them (ADR 0036).
 
 ### Close confirmation (D2)
 
@@ -107,9 +150,7 @@ exits) ends the sheet as Cancel.
 - Panes add no FFI and no core state; the control server cannot see the
   layout yet. Moving the pane tree into `tessera-app-core` later means
   replacing `PaneTree` with the core's model behind the same container.
-- A divider drag resizes the surfaces synchronously on every step, as a
-  window resize outside AppKit's live resize does; a long scrollback can
-  make that step slow (re-wrap under the terminal lock). Coalescing it
-  per frame, as the live window resize does, is left to #38b.
-- Pane commands beyond these (zoom, swap, equalise, resizing from the
-  keyboard, restoring the layout) are #38b.
+- A divider drag resizes each surface at most once per frame, through
+  AppKit's live resize (see Divider drags above).
+- Swapping panes and resizing them from the keyboard are not done yet; a
+  maximized pane and the focus are not restored.
