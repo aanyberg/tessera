@@ -74,6 +74,7 @@ fn install(app: *mut App, sender: &Sender<bool>) {
         on_session_exit: None,
         on_appearance_changed: Some(on_appearance),
         on_session_clipboard: None,
+        on_config_applied: None,
     };
     // SAFETY: live handle and a valid table; `sender` outlives the app.
     assert_eq!(

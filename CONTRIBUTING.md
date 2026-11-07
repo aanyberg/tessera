@@ -37,7 +37,8 @@ Before you push, run `just check` (fmt, clippy, tests, cargo-deny); add `just ap
 - `#![forbid(unsafe_code)]` everywhere except `tessera-pty` and `tessera-ffi`. Every `unsafe` block carries a
   `// SAFETY:` comment. The exceptions outside them are the counting test allocators in
   `crates/tessera-render/tests/alloc.rs` (ADR 0016), `crates/tessera-grid/tests/reset.rs`,
-  `crates/tessera-term/tests/osc8_alloc.rs` and `crates/tessera-term/tests/mouse_alloc.rs`.
+  `crates/tessera-term/tests/osc8_alloc.rs`, `crates/tessera-term/tests/mouse_alloc.rs` and
+  `crates/tessera-app-core/tests/keybindings.rs`.
 - The rules in [`docs/security.md`](docs/security.md) hold for every change: nothing the child sends is echoed into
   the input or read back, and every buffer filled from untrusted input has a named cap.
 - Public items are documented. Crate roots start with a purpose paragraph.

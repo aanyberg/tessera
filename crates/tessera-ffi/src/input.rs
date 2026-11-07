@@ -862,16 +862,33 @@ pub enum InputOutcome {
     Ignored = 0,
     /// The core acted on the event; the frontend must not handle it again.
     Consumed = 1,
+    /// The key is bound to an application command, which the frontend
+    /// runs; nothing was sent. Only `tessera_session_handle_key` stores
+    /// it, with the command's id.
+    Command = 2,
 }
 
 impl From<CoreOutcome> for InputOutcome {
+    /// The C mirror of `outcome`, as `tessera_session_send_key` reports
+    /// it: a bound command is [`InputOutcome::Ignored`] there, so a host
+    /// that does not know commands passes the key on to its menus.
     fn from(outcome: CoreOutcome) -> Self {
         match outcome {
             CoreOutcome::Consumed => Self::Consumed,
-            CoreOutcome::Ignored => Self::Ignored,
+            CoreOutcome::Ignored | CoreOutcome::Command(_) => Self::Ignored,
         }
     }
 }
+
+/// `tessera_session_handle_key` flag: run the key's binding if it has
+/// one, and never encode it for the PTY otherwise (the outcome is then
+/// `TESSERA_INPUT_OUTCOME_IGNORED`). For `AppKit`'s `performKeyEquivalent`,
+/// which sees every Command key before the menus do and before `keyDown`.
+pub const HANDLE_KEY_BINDINGS_ONLY: u32 = 1;
+
+/// `*out_command` of `tessera_session_handle_key` when the outcome is not
+/// `TESSERA_INPUT_OUTCOME_COMMAND`.
+pub const NO_COMMAND: u32 = u32::MAX;
 
 /// A keyboard event for `tessera_session_send_key`.
 ///
@@ -1135,8 +1152,11 @@ unsafe fn send(
 /// Sends a key event to session `session_id` and stores in `*out` whether
 /// the core used it.
 ///
-/// A key bound to an application command runs that command (no key is
-/// bound yet). Any other key is encoded for the child (xterm and kitty
+/// A key bound by the key map (`[keys]` and the default chords) runs its
+/// binding as described at `tessera_session_handle_key`, except that a
+/// key bound to a command stores `TESSERA_INPUT_OUTCOME_IGNORED`, so the
+/// frontend's menus see it; `tessera_session_handle_key` tells which
+/// command. Any other key is encoded for the child (xterm and kitty
 /// keyboard protocol rules, in the session terminal's keyboard modes:
 /// DECCKM, DECKPAM, `modifyOtherKeys` and the kitty flags, see ADR 0020)
 /// and queued
@@ -1183,6 +1203,98 @@ pub unsafe extern "C" fn tessera_session_send_key(
         };
         // SAFETY: forwarded caller contract for `app` and `out`.
         unsafe { send("tessera_session_send_key", app, session_id, out, event) }
+    })
+}
+
+/// Handles a key event in session `session_id` as `tessera_session_send_key`
+/// does, and tells the frontend which command a bound key names.
+///
+/// The key's binding (`[keys]` in `config.toml` over the default chords;
+/// `tessera_app_keymap_json` lists them) runs first:
+///
+/// * a command: `*out` is `TESSERA_INPUT_OUTCOME_COMMAND` and
+///   `*out_command` the command's id (its index in the keymap's
+///   `commands`); nothing is sent, and the frontend runs the command (for
+///   a command with a menu item, by letting the menu handle the key);
+/// * `send_text:…`: its bytes are queued for the child as written,
+///   `TESSERA_INPUT_OUTCOME_CONSUMED`;
+/// * `none`: nothing is sent, `TESSERA_INPUT_OUTCOME_CONSUMED`;
+/// * the release of a bound key: nothing, `TESSERA_INPUT_OUTCOME_CONSUMED`.
+///
+/// A key with no binding is encoded and queued exactly as by
+/// `tessera_session_send_key`, unless `flags` has
+/// `TESSERA_HANDLE_KEY_BINDINGS_ONLY`: then nothing is sent and `*out` is
+/// `TESSERA_INPUT_OUTCOME_IGNORED`. `*out_command` is
+/// `TESSERA_NO_COMMAND` for every outcome but a command, and after any
+/// failure.
+///
+/// Call from the UI (main) thread only.
+///
+/// Returns the errors of `tessera_session_send_key` (a `NULL`
+/// `out_command` is `TESSERA_ERROR_NULL_POINTER`), and
+/// `TESSERA_ERROR_INVALID_ARGUMENT` for a `flags` bit that has no meaning.
+///
+/// # Safety
+///
+/// As `tessera_session_send_key`; `out_command` must be `NULL` or point to
+/// a writable `uint32_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_session_handle_key(
+    app: *mut App,
+    session_id: u64,
+    event: *const KeyEvent,
+    flags: u32,
+    out: *mut InputOutcome,
+    out_command: *mut u32,
+) -> Error {
+    const FUNCTION: &str = "tessera_session_handle_key";
+    ffi_guard!("tessera_session_handle_key", {
+        if out.is_null() || out_command.is_null() {
+            return Error::NullPointer;
+        }
+        // SAFETY: non-null and writable per the contract.
+        unsafe {
+            out.write(InputOutcome::Ignored);
+            out_command.write(NO_COMMAND);
+        }
+        // SAFETY: the caller passes NULL or a live handle.
+        let Some(app) = (unsafe { App::from_ptr(app) }) else {
+            return Error::NullPointer;
+        };
+        if flags & !HANDLE_KEY_BINDINGS_ONLY != 0 {
+            return Error::InvalidArgument;
+        }
+        // SAFETY: `event` is NULL or readable per the contract.
+        let Some(event) = (unsafe { event.as_ref() }) else {
+            return Error::NullPointer;
+        };
+        // SAFETY: `text` satisfies the field contract.
+        let event = match unsafe { event.to_core() } {
+            Ok(event) => event,
+            Err(code) => return code,
+        };
+        let id = SessionId::from_raw(session_id);
+        let outcome = if flags & HANDLE_KEY_BINDINGS_ONLY == 0 {
+            app.core.send_input(id, InputEvent::Key(event))
+        } else {
+            app.core
+                .run_key_binding(id, &event)
+                .map(|outcome| outcome.unwrap_or(CoreOutcome::Ignored))
+        };
+        let (outcome, command) = match outcome {
+            Ok(CoreOutcome::Command(command)) => (
+                InputOutcome::Command,
+                u32::try_from(command.index()).unwrap_or(NO_COMMAND),
+            ),
+            Ok(outcome) => (outcome.into(), NO_COMMAND),
+            Err(error) => return error::report(FUNCTION, &error),
+        };
+        // SAFETY: as above.
+        unsafe {
+            out.write(outcome);
+            out_command.write(command);
+        }
+        Error::Ok
     })
 }
 

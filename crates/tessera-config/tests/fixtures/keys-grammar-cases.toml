@@ -1,0 +1,922 @@
+# Tessera #43 (key bindings): the chord and value grammar of ADR 0036.
+#
+# Ported from the spec-researcher's fixture (chord-grammar.json, wave 13):
+# every case below is one of its cases, with its prose expectation turned
+# into a machine-checked one by tests/keys_spec.rs. `rule` and `cite` are
+# the researcher's; `expect_prose` is the original expectation.
+#
+#   [[chord]]   canonical = printed form of the parsed chord, or
+#               error = the ChordError variant; shadows = rule R10 warning.
+#   [[value]]   action = command | unbound | ignore | text (bytes = hex),
+#               or error = the KeyActionError variant, or registry = the
+#               reason the command registry (tessera-app-core) rejects it.
+#   [[table]]   whole-table behaviour; implemented case by case by `id`.
+
+[[chord]]
+input = "cmd+t"
+canonical = "cmd+t"
+shadows = false
+expect_prose = "ok: super+t"
+rule = "R2 ('cmd' = super)"
+cite = "https://sw.kovidgoyal.net/kitty/conf/#keyboard-shortcuts"
+
+[[chord]]
+input = "super+t"
+canonical = "cmd+t"
+shadows = false
+expect_prose = "ok: super+t"
+rule = "R2"
+cite = "https://sw.kovidgoyal.net/kitty/conf/#keyboard-shortcuts"
+
+[[chord]]
+input = "command+t"
+canonical = "cmd+t"
+shadows = false
+expect_prose = "ok: super+t"
+rule = "R2"
+cite = "https://sw.kovidgoyal.net/kitty/conf/#keyboard-shortcuts"
+
+[[chord]]
+input = "Cmd+T"
+error = "Uppercase"
+expect_prose = "ERR uppercase key 'T' (write shift+t)"
+rule = "R5; R2 folds the modifier but not the key"
+cite = "https://sw.kovidgoyal.net/kitty/conf/#keyboard-shortcuts"
+
+[[chord]]
+input = "CMD+t"
+canonical = "cmd+t"
+shadows = false
+expect_prose = "ok: super+t"
+rule = "R2 case-insensitive modifiers"
+cite = "Tessera decision (no upstream rule)"
+
+[[chord]]
+input = "ctrl+alt+shift+cmd+t"
+canonical = "cmd+ctrl+alt+shift+t"
+shadows = false
+expect_prose = "ok: all four, canonical print 'cmd+ctrl+alt+shift+t'"
+rule = "R1, canonical order"
+cite = "https://ghostty.org/docs/config/keybind"
+
+[[chord]]
+input = "shift+cmd+d"
+canonical = "cmd+shift+d"
+shadows = false
+expect_prose = "ok: same chord as cmd+shift+d (canonical print 'cmd+shift+d')"
+rule = "R4 free input order"
+cite = "https://ghostty.org/docs/config/keybind"
+
+[[chord]]
+input = "cmd+shift+d"
+canonical = "cmd+shift+d"
+shadows = false
+expect_prose = "ok: canonical 'cmd+shift+d'; duplicate detection treats shift+cmd+d and cmd+shift+d as one chord"
+rule = "R9"
+cite = "https://ghostty.org/docs/config/keybind"
+
+[[chord]]
+input = "opt+cmd+left"
+canonical = "cmd+alt+left"
+shadows = false
+expect_prose = "ok: alt+super+left"
+rule = "R2, R8"
+cite = "https://ghostty.org/docs/config/keybind"
+
+[[chord]]
+input = "option+command+left"
+canonical = "cmd+alt+left"
+shadows = false
+expect_prose = "ok: equal to opt+cmd+left"
+rule = "R2"
+cite = "https://ghostty.org/docs/config/keybind"
+
+[[chord]]
+input = "control+tab"
+canonical = "ctrl+tab"
+shadows = false
+expect_prose = "ok: ctrl+tab (menu cannot usefully carry it, see appkit-limits)"
+rule = "R8"
+cite = "https://sw.kovidgoyal.net/kitty/keyboard-protocol/"
+
+[[chord]]
+input = "f5"
+canonical = "f5"
+shadows = false
+expect_prose = "ok: F(5), no modifiers (valid; functional keys never swallow typing)"
+rule = "R8, R10"
+cite = "https://sw.kovidgoyal.net/kitty/keyboard-protocol/"
+
+[[chord]]
+input = "cmd+f35"
+canonical = "cmd+f35"
+shadows = false
+expect_prose = "ok: F(35), highest"
+rule = "R8; Key::F supports 1..=35"
+cite = "https://sw.kovidgoyal.net/kitty/keyboard-protocol/"
+
+[[chord]]
+input = "cmd+f36"
+error = "UnknownKey"
+expect_prose = "ERR unknown key 'f36'"
+rule = "Key::F(36+) encodes to nothing (keyboard.rs)"
+cite = "https://sw.kovidgoyal.net/kitty/keyboard-protocol/"
+
+[[chord]]
+input = "cmd+f0"
+error = "UnknownKey"
+expect_prose = "ERR unknown key 'f0'"
+rule = "R8"
+cite = "https://sw.kovidgoyal.net/kitty/keyboard-protocol/"
+
+[[chord]]
+input = "cmd+page_up"
+canonical = "cmd+page_up"
+shadows = false
+expect_prose = "ok: PageUp"
+rule = "R8"
+cite = "https://sw.kovidgoyal.net/kitty/keyboard-protocol/"
+
+[[chord]]
+input = "cmd+pageup"
+error = "UnknownKey"
+expect_prose = "ERR unknown key 'pageup' (kitty name is page_up)"
+rule = "R8"
+cite = "https://sw.kovidgoyal.net/kitty/keyboard-protocol/"
+
+[[chord]]
+input = "cmd+return"
+canonical = "cmd+enter"
+shadows = false
+expect_prose = "ok: canonical 'cmd+enter'"
+rule = "R8 alias"
+cite = "https://sw.kovidgoyal.net/kitty/keyboard-protocol/"
+
+[[chord]]
+input = "cmd+esc"
+canonical = "cmd+escape"
+shadows = false
+expect_prose = "ok: canonical 'cmd+escape'"
+rule = "R8 alias"
+cite = "https://sw.kovidgoyal.net/kitty/keyboard-protocol/"
+
+[[chord]]
+input = "cmd+space"
+canonical = "cmd+space"
+shadows = false
+expect_prose = "ok: Char(' ')"
+rule = "R8"
+cite = "https://sw.kovidgoyal.net/kitty/keyboard-protocol/"
+
+[[chord]]
+input = "cmd+ "
+error = "Whitespace"
+expect_prose = "ERR whitespace in chord"
+rule = "R1 (no whitespace; a space key is 'space')"
+cite = "Tessera decision (no upstream rule)"
+
+[[chord]]
+input = " cmd+t"
+error = "Whitespace"
+expect_prose = "ERR whitespace in chord (do not trim: TOML key is exact)"
+rule = "R1"
+cite = "Tessera decision (no upstream rule)"
+
+[[chord]]
+input = "cmd + t"
+error = "Whitespace"
+expect_prose = "ERR whitespace in chord"
+rule = "R1"
+cite = "Tessera decision (no upstream rule)"
+
+[[chord]]
+input = "cmd+kp_5"
+canonical = "cmd+kp_5"
+shadows = false
+expect_prose = "ok: Kp5 (core-only chord; AppKit menus cannot tell keypad 5 from 5)"
+rule = "R8"
+cite = "https://sw.kovidgoyal.net/kitty/keyboard-protocol/"
+
+[[chord]]
+input = "cmd+1"
+canonical = "cmd+1"
+shadows = false
+expect_prose = "ok: Char('1')"
+rule = "R8"
+cite = "https://sw.kovidgoyal.net/kitty/conf/#keyboard-shortcuts"
+
+[[chord]]
+input = "cmd+,"
+canonical = "cmd+,"
+shadows = false
+expect_prose = "ok: Char(','); canonical prints the char ('cmd+,'); 'cmd+,' and 'cmd+comma' are the same chord"
+rule = "R6"
+cite = "https://sw.kovidgoyal.net/kitty/conf/#keyboard-shortcuts"
+
+[[chord]]
+input = "cmd+comma"
+canonical = "cmd+,"
+shadows = false
+expect_prose = "ok: same chord as 'cmd+,'"
+rule = "R6"
+cite = "https://sw.kovidgoyal.net/kitty/conf/#keyboard-shortcuts"
+
+[[chord]]
+input = "cmd+."
+canonical = "cmd+."
+shadows = false
+expect_prose = "ok: Char('.')  (Terminal.app binds cmd+. to ^C, a chord the core must be able to bind)"
+rule = "R6; S-TERM 'Break'"
+cite = "https://sw.kovidgoyal.net/kitty/conf/#keyboard-shortcuts"
+
+[[chord]]
+input = "cmd+shift+["
+canonical = "cmd+shift+["
+shadows = false
+expect_prose = "ok: shift+[ ; matches key '[' with shift, or key '{' without shift (R7)"
+rule = "R7"
+cite = "https://developer.apple.com/library/mac/documentation/Cocoa/Conceptual/MenuList/Articles/SettingMenuKeyEquiv.html"
+
+[[chord]]
+input = "cmd+{"
+canonical = "cmd+shift+["
+shadows = false
+expect_prose = "ok: normalises to 'cmd+shift+[' (R7)"
+rule = "R7"
+cite = "https://developer.apple.com/library/mac/documentation/Cocoa/Conceptual/MenuList/Articles/SettingMenuKeyEquiv.html"
+
+[[chord]]
+input = "cmd+}"
+canonical = "cmd+shift+]"
+shadows = false
+expect_prose = "ok: normalises to 'cmd+shift+]'"
+rule = "R7"
+cite = "https://developer.apple.com/library/mac/documentation/Cocoa/Conceptual/MenuList/Articles/SettingMenuKeyEquiv.html"
+
+[[chord]]
+input = "cmd+?"
+canonical = "cmd+shift+/"
+shadows = false
+expect_prose = "ok: normalises to 'cmd+shift+/'"
+rule = "R7; ships as MainMenu '?' item"
+cite = "https://developer.apple.com/library/mac/documentation/Cocoa/Conceptual/MenuList/Articles/SettingMenuKeyEquiv.html"
+
+[[chord]]
+input = "cmd+shift+/"
+canonical = "cmd+shift+/"
+shadows = false
+expect_prose = "ok: same chord as cmd+?"
+rule = "R7"
+cite = "https://developer.apple.com/library/mac/documentation/Cocoa/Conceptual/MenuList/Articles/SettingMenuKeyEquiv.html"
+
+[[chord]]
+input = "cmd+plus"
+canonical = "cmd+shift+="
+shadows = false
+expect_prose = "ok: normalises to 'cmd+shift+='; also matches an event with key '+' and no shift"
+rule = "R6, R7"
+cite = "https://sw.kovidgoyal.net/kitty/conf/#keyboard-shortcuts"
+
+[[chord]]
+input = "cmd++"
+error = "UsePlus"
+expect_prose = "ERR use 'plus' for the + key"
+rule = "R6 (trailing separator is ambiguous)"
+cite = "https://sw.kovidgoyal.net/kitty/conf/#keyboard-shortcuts"
+
+[[chord]]
+input = "cmd+shift++"
+error = "UsePlus"
+expect_prose = "ERR use 'plus'"
+rule = "R6"
+cite = "https://sw.kovidgoyal.net/kitty/conf/#keyboard-shortcuts"
+
+[[chord]]
+input = "+"
+error = "UsePlus"
+expect_prose = "ERR use 'plus' (or a missing key)"
+rule = "R6"
+cite = "https://sw.kovidgoyal.net/kitty/conf/#keyboard-shortcuts"
+
+[[chord]]
+input = "plus"
+canonical = "shift+="
+shadows = true
+expect_prose = "ok: shift+= (valid but shadows typing; R10 warning)"
+rule = "R6, R7, R10"
+cite = "https://sw.kovidgoyal.net/kitty/conf/#keyboard-shortcuts"
+
+[[chord]]
+input = "cmd+="
+canonical = "cmd+="
+shadows = false
+expect_prose = "ok: Char('=') with cmd; NOT the same chord as cmd+plus (no shift): both can coexist, as the two View > Bigger items do today"
+rule = "R7; MainMenu.swift:78-84"
+cite = "https://developer.apple.com/library/mac/documentation/Cocoa/Conceptual/MenuList/Articles/SettingMenuKeyEquiv.html"
+
+[[chord]]
+input = "cmd+minus"
+canonical = "cmd+-"
+shadows = false
+expect_prose = "ok: Char('-')"
+rule = "R6"
+cite = "https://sw.kovidgoyal.net/kitty/conf/#keyboard-shortcuts"
+
+[[chord]]
+input = "cmd+-"
+canonical = "cmd+-"
+shadows = false
+expect_prose = "ok: same chord as cmd+minus"
+rule = "R6"
+cite = "https://sw.kovidgoyal.net/kitty/conf/#keyboard-shortcuts"
+
+[[chord]]
+input = "cmd+shift+_"
+canonical = "cmd+shift+-"
+shadows = false
+expect_prose = "ok: '_' is shift+'-' (R7); the explicit shift merges with the implied one: canonical 'cmd+shift+-', no duplicate-modifier error"
+rule = "R7 vs R4: rule: a shift added by R7 merges with an explicit shift"
+cite = "Tessera decision (no upstream rule)"
+
+[[chord]]
+input = "cmd+ö"
+canonical = "cmd+ö"
+shadows = false
+expect_prose = "ok: Char('ö') (non-ASCII letters allowed, lowercase; ghostty 'ctrl+ö')"
+rule = "R5 char"
+cite = "https://ghostty.org/docs/config/keybind"
+
+[[chord]]
+input = "cmd+Ö"
+error = "Uppercase"
+expect_prose = "ERR uppercase key"
+rule = "R5"
+cite = "https://sw.kovidgoyal.net/kitty/conf/#keyboard-shortcuts"
+
+[[chord]]
+input = "cmd+ǅ"
+error = "Uppercase"
+expect_prose = "ERR uppercase/titlecase key: reject any char whose to_lowercase() differs from itself (tessera-term would treat titlecase Lt as an unshifted key, but a config file gains nothing from it)"
+rule = "R5 vs keyboard.rs unshifted_char doc"
+cite = "Tessera decision (no upstream rule)"
+
+[[chord]]
+input = "cmd+😀"
+canonical = "cmd+😀"
+shadows = false
+expect_prose = "ok: Char('😀') one scalar"
+rule = "R5 one Unicode scalar"
+cite = "https://sw.kovidgoyal.net/kitty/conf/#keyboard-shortcuts"
+
+[[chord]]
+input = "cmd+é"
+canonical = "cmd+é"
+shadows = false
+expect_prose = "ok if input is NFC (one scalar); 'e'+U+0301 (two scalars) is ERR 'more than one character'"
+rule = "R5; do not normalise"
+cite = "Tessera decision (no upstream rule)"
+
+[[chord]]
+input = "cmd+ab"
+error = "UnknownKey"
+expect_prose = "ERR unknown key 'ab'"
+rule = "R8"
+cite = "https://sw.kovidgoyal.net/kitty/conf/#keyboard-shortcuts"
+
+[[chord]]
+input = "cmd+"
+error = "MissingKey"
+expect_prose = "ERR missing key"
+rule = "R1"
+cite = "https://ghostty.org/docs/config/keybind"
+
+[[chord]]
+input = "cmd"
+error = "MissingKey"
+expect_prose = "ERR missing key (cmd is a modifier, not a key)"
+rule = "R1; modifier-only chords cannot be bound"
+cite = "https://ghostty.org/docs/config/keybind"
+
+[[chord]]
+input = "+t"
+error = "EmptySegment"
+expect_prose = "ERR empty modifier"
+rule = "R1"
+cite = "https://ghostty.org/docs/config/keybind"
+
+[[chord]]
+input = "cmd++t"
+error = "EmptySegment"
+expect_prose = "ERR empty segment"
+rule = "R1"
+cite = "https://ghostty.org/docs/config/keybind"
+
+[[chord]]
+input = "cmd+shift"
+error = "MissingKey"
+expect_prose = "ERR missing key"
+rule = "R1"
+cite = "https://ghostty.org/docs/config/keybind"
+
+[[chord]]
+input = ""
+error = "Empty"
+expect_prose = "ERR empty chord"
+rule = "R1"
+cite = "https://ghostty.org/docs/config/keybind"
+
+[[chord]]
+input = "cmd+cmd+t"
+error = "DuplicateModifier"
+expect_prose = "ERR duplicate modifier 'cmd'"
+rule = "R4"
+cite = "Tessera decision (no upstream rule)"
+
+[[chord]]
+input = "cmd+command+t"
+error = "DuplicateModifier"
+expect_prose = "ERR duplicate modifier (aliases count)"
+rule = "R4"
+cite = "Tessera decision (no upstream rule)"
+
+[[chord]]
+input = "hyper+t"
+error = "UnsupportedModifier"
+expect_prose = "ERR unsupported modifier 'hyper'"
+rule = "R3"
+cite = "https://ghostty.org/docs/config/keybind"
+
+[[chord]]
+input = "meta+t"
+error = "UnsupportedModifier"
+expect_prose = "ERR unsupported modifier 'meta'"
+rule = "R3"
+cite = "https://ghostty.org/docs/config/keybind"
+
+[[chord]]
+input = "fn+f1"
+error = "UnsupportedModifier"
+expect_prose = "ERR unsupported modifier 'fn'"
+rule = "R3"
+cite = "https://ghostty.org/docs/config/keybind"
+
+[[chord]]
+input = "globe+f"
+error = "UnsupportedModifier"
+expect_prose = "ERR unsupported modifier 'globe'"
+rule = "R3"
+cite = "https://ghostty.org/docs/config/keybind"
+
+[[chord]]
+input = "caps_lock+a"
+error = "UnsupportedModifier"
+expect_prose = "ERR unsupported modifier"
+rule = "R3"
+cite = "https://ghostty.org/docs/config/keybind"
+
+[[chord]]
+input = "caps_lock"
+error = "UnknownKey"
+expect_prose = "ERR unknown key (lock keys are not bindable)"
+rule = "R8"
+cite = "https://sw.kovidgoyal.net/kitty/keyboard-protocol/"
+
+[[chord]]
+input = "shift"
+error = "MissingKey"
+expect_prose = "ERR missing key (modifier-only)"
+rule = "R1"
+cite = "https://ghostty.org/docs/config/keybind"
+
+[[chord]]
+input = "ctrl+a>n"
+error = "Sequence"
+expect_prose = "ERR sequences are not supported yet"
+rule = "R11"
+cite = "https://ghostty.org/docs/config/keybind/sequence"
+
+[[chord]]
+input = "ctrl+a > n"
+error = "Whitespace"
+expect_prose = "ERR whitespace (and R11)"
+rule = "R1, R11"
+cite = "https://ghostty.org/docs/config/keybind/sequence"
+
+[[chord]]
+input = "global:cmd+t"
+error = "Prefix"
+expect_prose = "ERR prefix 'global:' not supported"
+rule = "R11"
+cite = "https://ghostty.org/docs/config/keybind"
+
+[[chord]]
+input = "unconsumed:cmd+t"
+error = "Prefix"
+expect_prose = "ERR prefix not supported"
+rule = "R11"
+cite = "https://ghostty.org/docs/config/keybind"
+
+[[chord]]
+input = "physical:cmd+t"
+error = "Prefix"
+expect_prose = "ERR prefix not supported"
+rule = "R11"
+cite = "https://ghostty.org/docs/config/keybind"
+
+[[chord]]
+input = "cmd+t\u0000"
+error = "Control"
+expect_prose = "ERR control character"
+rule = "R5"
+cite = "Tessera decision (no upstream rule)"
+
+[[chord]]
+input = "cmd+\t"
+error = "Whitespace"
+expect_prose = "ERR control/whitespace"
+rule = "R5"
+cite = "Tessera decision (no upstream rule)"
+
+[[chord]]
+input = "cmd+\u007f"
+error = "Control"
+expect_prose = "ERR control (DEL); the key is 'backspace' or 'delete'"
+rule = "R5"
+cite = "Tessera decision (no upstream rule)"
+
+[[chord]]
+input = "cmd+"
+error = "FunctionKeyCharacter"
+expect_prose = "ERR function-key private-use char; use 'up'"
+rule = "char excludes U+F700..U+F8FF (TerminalSurfaceView.functionKeyCharacters)"
+cite = "Tessera decision (no upstream rule)"
+
+[[chord]]
+input = "a"
+canonical = "a"
+shadows = true
+expect_prose = "ok: Char('a') no modifiers; R10 warning (shadows typing)"
+rule = "R10"
+cite = "https://sw.kovidgoyal.net/kitty/conf/#keyboard-shortcuts"
+
+[[chord]]
+input = "shift+a"
+canonical = "shift+a"
+shadows = true
+expect_prose = "ok, R10 warning"
+rule = "R10"
+cite = "https://sw.kovidgoyal.net/kitty/conf/#keyboard-shortcuts"
+
+[[chord]]
+input = "alt+a"
+canonical = "alt+a"
+shadows = true
+expect_prose = "ok, R10 warning (shadows Option/Meta typing); honoured"
+rule = "R10"
+cite = "https://sw.kovidgoyal.net/kitty/conf/#keyboard-shortcuts"
+
+[[chord]]
+input = "escape"
+canonical = "escape"
+shadows = true
+expect_prose = "ok, R10 warning (shadows the Escape key); honoured. Lead may prefer ERR (N8)"
+rule = "R10"
+cite = "Tessera decision (no upstream rule)"
+
+[[chord]]
+input = "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+error = "TooLong"
+expect_prose = "ERR chord longer than 64 bytes (65 bytes): one warning, entry dropped"
+rule = "S5 chord <= 64 bytes"
+cite = "Tessera decision (no upstream rule)"
+
+[[chord]]
+input = "cmd+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+error = "UnknownKey"
+expect_prose = "exactly 64 bytes: length check passes, then ERR unknown key (so the cap is observable only on invalid input)"
+rule = "S5; order of checks: length first, then grammar"
+cite = "Tessera decision (no upstream rule)"
+
+[[chord]]
+input = "ctrl+alt+shift+cmd+page_down"
+canonical = "cmd+ctrl+alt+shift+page_down"
+shadows = false
+expect_prose = "ok: 28 bytes"
+rule = "boundary, within 64"
+cite = "Tessera decision (no upstream rule)"
+
+[[value]]
+input = "new_tab"
+action = "command"
+name = "new_tab"
+parameter = ""
+expect_prose = "ok: command new_tab"
+rule = "R12"
+cite = "Tessera decision (no upstream rule)"
+
+[[value]]
+input = "select_tab:3"
+action = "command"
+name = "select_tab"
+parameter = "3"
+expect_prose = "ok: command select_tab param '3' (1..=9)"
+rule = "R12"
+cite = "Tessera decision (no upstream rule)"
+
+[[value]]
+input = "select_tab:0"
+registry = "parameter out of range"
+expect_prose = "ERR parameter out of range 1..=9"
+rule = "R12"
+cite = "Tessera decision (no upstream rule)"
+
+[[value]]
+input = "select_tab:10"
+registry = "parameter out of range"
+expect_prose = "ERR parameter out of range"
+rule = "R12"
+cite = "Tessera decision (no upstream rule)"
+
+[[value]]
+input = "select_tab"
+registry = "missing parameter"
+expect_prose = "ERR missing parameter"
+rule = "R12"
+cite = "Tessera decision (no upstream rule)"
+
+[[value]]
+input = "new_tab:1"
+registry = "takes no parameter"
+expect_prose = "ERR command takes no parameter"
+rule = "R12"
+cite = "Tessera decision (no upstream rule)"
+
+[[value]]
+input = "New_Tab"
+error = "InvalidCommand"
+expect_prose = "ERR unknown command (names are lowercase snake_case, case-sensitive)"
+rule = "R12"
+cite = "Tessera decision (no upstream rule)"
+
+[[value]]
+input = "nope"
+registry = "unknown command"
+expect_prose = "ERR unknown command 'nope' (one warning naming the key)"
+rule = "brief: 'an unknown command ... gives one warning'"
+cite = "Tessera decision (no upstream rule)"
+
+[[value]]
+input = ""
+error = "Empty"
+expect_prose = "ERR empty value"
+rule = "R12"
+cite = "Tessera decision (no upstream rule)"
+
+[[value]]
+input = "unbound"
+action = "unbound"
+expect_prose = "ok: removes the default chord for this key (menu item loses its key equivalent)"
+rule = "R12 (kitty: map with no action; ghostty: unbind)"
+cite = "https://ghostty.org/docs/config/keybind"
+
+[[value]]
+input = "none"
+action = "ignore"
+expect_prose = "ok: swallow the key, send nothing (ghostty 'ignore', kitty 'discard_event')"
+rule = "R12"
+cite = "https://ghostty.org/docs/config/keybind"
+
+[[value]]
+input = "send_text:\\x15"
+action = "text"
+bytes = "15"
+expect_prose = "ok: bytes [0x15] (Ctrl-U)"
+rule = "R13; ghostty doc example 'text:\\x15'"
+cite = "https://ghostty.org/docs/config/keybind"
+
+[[value]]
+input = "send_text:\\e[A"
+action = "text"
+bytes = "1b5b41"
+expect_prose = "ok: ESC '[' 'A'"
+rule = "R13; kitty \\e"
+cite = "https://sw.kovidgoyal.net/kitty/conf/#keyboard-shortcuts"
+
+[[value]]
+input = "send_text:ls -la\\r"
+action = "text"
+bytes = "6c73202d6c610d"
+expect_prose = "ok: 'ls -la' + CR"
+rule = "R13; kitty example 'echo Hello, world!\\r'"
+cite = "https://sw.kovidgoyal.net/kitty/conf/#keyboard-shortcuts"
+
+[[value]]
+input = "send_text:\\u21fb"
+action = "text"
+bytes = "e287bb"
+expect_prose = "ok: UTF-8 E2 87 BB"
+rule = "R13; kitty '\\u21fb'"
+cite = "https://sw.kovidgoyal.net/kitty/conf/#keyboard-shortcuts"
+
+[[value]]
+input = "send_text:\\u{1f600}"
+action = "text"
+bytes = "f09f9880"
+expect_prose = "ok: UTF-8 F0 9F 98 80"
+rule = "R13; Zig literal"
+cite = "https://ghostty.org/docs/config/keybind"
+
+[[value]]
+input = "send_text:\\u{d800}"
+error = "Escape"
+expect_prose = "ERR surrogate"
+rule = "R13"
+cite = "Tessera decision (no upstream rule)"
+
+[[value]]
+input = "send_text:\\u{110000}"
+error = "Escape"
+expect_prose = "ERR out of range"
+rule = "R13"
+cite = "Tessera decision (no upstream rule)"
+
+[[value]]
+input = "send_text:\\u12"
+error = "Escape"
+expect_prose = "ERR truncated \\u"
+rule = "R13"
+cite = "Tessera decision (no upstream rule)"
+
+[[value]]
+input = "send_text:\\x4"
+error = "Escape"
+expect_prose = "ERR truncated \\x"
+rule = "R13"
+cite = "Tessera decision (no upstream rule)"
+
+[[value]]
+input = "send_text:\\xzz"
+error = "Escape"
+expect_prose = "ERR bad hex"
+rule = "R13"
+cite = "Tessera decision (no upstream rule)"
+
+[[value]]
+input = "send_text:\\xff"
+action = "text"
+bytes = "ff"
+expect_prose = "ok: single raw byte 0xFF (not UTF-8; written as is)"
+rule = "R13; Zig \\x is a byte"
+cite = "https://ghostty.org/docs/config/keybind"
+
+[[value]]
+input = "send_text:\\q"
+error = "Escape"
+expect_prose = "ERR unknown escape '\\q'"
+rule = "R13"
+cite = "Tessera decision (no upstream rule)"
+
+[[value]]
+input = "send_text:abc\\"
+error = "Escape"
+expect_prose = "ERR trailing backslash"
+rule = "R13"
+cite = "Tessera decision (no upstream rule)"
+
+[[value]]
+input = "send_text:"
+error = "EmptySendText"
+expect_prose = "ERR empty send_text (use 'none' to swallow a key)"
+rule = "R12/R13"
+cite = "Tessera decision (no upstream rule)"
+
+[[value]]
+input = "send_text:\\\\"
+action = "text"
+bytes = "5c"
+expect_prose = "ok: one backslash"
+rule = "R13"
+cite = "https://sw.kovidgoyal.net/kitty/conf/#keyboard-shortcuts"
+
+[[value]]
+input = "send_text:\\0"
+error = "Escape"
+expect_prose = "ERR octal/NUL escape not supported (a NUL byte is expressible as \\x00)"
+rule = "R13"
+cite = "Tessera decision (no upstream rule)"
+
+[[value]]
+input = "send_text:\\x00"
+action = "text"
+bytes = "00"
+expect_prose = "ok: NUL byte allowed (trusted config)"
+rule = "R13; S4"
+cite = "Tessera decision (no upstream rule)"
+
+[[value]]
+repeat = "a"
+count = 4096
+prefix = "send_text:"
+action = "text"
+bytes_len = 4096
+expect_prose = "ok: exactly 4096 bytes after unescaping"
+rule = "S5 boundary"
+cite = "Tessera decision (no upstream rule)"
+
+[[value]]
+repeat = "a"
+count = 4097
+prefix = "send_text:"
+error = "SendTextTooLong"
+expect_prose = "ERR over 4096 bytes: warn, drop the entry"
+rule = "S5"
+cite = "Tessera decision (no upstream rule)"
+
+[[value]]
+repeat = "\\x41"
+count = 1024
+prefix = "send_text:"
+action = "text"
+bytes_len = 1024
+expect_prose = "ok: 1024 bytes (length counts decoded bytes, not source)"
+rule = "S5 'after unescaping'"
+cite = "Tessera decision (no upstream rule)"
+
+[[value]]
+repeat = "\\x41"
+count = 4097
+prefix = "send_text:"
+error = "SendTextTooLong"
+expect_prose = "ERR 4097 bytes decoded (source is 16388 bytes: the TOML string itself is already capped by the config file limit)"
+rule = "S5"
+cite = "Tessera decision (no upstream rule)"
+
+[[table]]
+id = 1
+input = "entry count 512"
+expect_prose = "ok: 512 entries all kept"
+rule = "S5 MAX_KEY_BINDINGS = 512"
+cite = "Tessera decision (no upstream rule)"
+
+[[table]]
+id = 2
+input = "entry count 513"
+expect_prose = "entry 513 and later dropped with ONE 'too many key bindings' warning (not one per entry: flood test)"
+rule = "S5"
+cite = "Tessera decision (no upstream rule)"
+
+[[table]]
+id = 3
+input = "two keys 'cmd+t' and 'cmd+t' in TOML"
+expect_prose = "TOML itself rejects a duplicate key: config load error already (not our warning). Duplicates reach us as 'shift+cmd+d' vs 'cmd+shift+d' or 'cmd+?' vs 'cmd+shift+/'"
+rule = "R9; TOML 1.0 spec: duplicate keys invalid"
+cite = "Tessera decision (no upstream rule)"
+
+[[table]]
+id = 4
+input = "'cmd+shift+d' = 'split_down' and 'shift+cmd+d' = 'split_down'"
+expect_prose = "1 warning for the second key naming it ('duplicate chord ... same as ...'); first wins"
+rule = "brief: duplicate chord"
+cite = "Tessera decision (no upstream rule)"
+
+[[table]]
+id = 5
+input = "'cmd+t' = 'new_window' (default cmd+t is new_tab)"
+expect_prose = "user entry replaces default: new_tab loses its default chord unless re-bound; NOT a warning (override). new_tab still shows no key equivalent"
+rule = "D3: [keys] overrides re-bind"
+cite = "Tessera decision (no upstream rule)"
+
+[[table]]
+id = 6
+input = "'cmd+n' = 'new_tab' while default cmd+n=new_window"
+expect_prose = "override as above; new_window is now unbound (menu item loses key equivalent). One command with two chords is fine"
+rule = "D3"
+cite = "Tessera decision (no upstream rule)"
+
+[[table]]
+id = 7
+input = "'cmd+w' = 'unbound'"
+expect_prose = "menu Close Tab loses ⌘W; no warning"
+rule = "R12"
+cite = "Tessera decision (no upstream rule)"
+
+[[table]]
+id = 8
+input = "'cmd+q' = 'send_text:x'"
+expect_prose = "chord shadows menu item Quit (system command): warning 'chord shadows menu item quit' per D3 'a chord shadowing a menu item' — first entry (the user's) wins, menu item loses its key equivalent. Lead: should system items quit/hide/minimize be protected? (N10)"
+rule = "D3"
+cite = "Tessera decision (no upstream rule)"
+
+[[table]]
+id = 9
+input = "'cmd+t' = 'new_tab' (same as default)"
+expect_prose = "ok, no warning"
+rule = "D3"
+cite = "Tessera decision (no upstream rule)"
+
+[[table]]
+id = 10
+input = "'cmd+up' = 'scroll_page_up' (D4 dispatcher upgrade)"
+expect_prose = "the user chord for scroll_page_up never becomes prompt_previous: upgrade applies only to the registry default binding of cmd+up (N1)"
+rule = "D4"
+cite = "Tessera decision (no upstream rule)"

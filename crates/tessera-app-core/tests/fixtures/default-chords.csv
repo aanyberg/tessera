@@ -1,0 +1,63 @@
+# T2 #43 default-chord table (spec fixture). Lines starting with '#' are comments; first non-comment line is the header.
+# Columns: command | chord (proposed notation, canonical: mods ctrl+alt+shift+cmd order, lowercase) | alt_chords (';'-separated hidden aliases) | menu_item (current Tessera, MainMenu.swift) | appkit_keyEquivalent | appkit_mask | iterm2_default | terminal_app_default | owner | note
+# appkit_keyEquivalent/appkit_mask reproduce what MainMenu.swift ships today (the "no shortcut changes" test). '{' means the literal character; F:Name is the NSxxxFunctionKey private-use character. Mask omitted = AppKit default (cmd).
+# Sources: S-TERM = https://support.apple.com/guide/terminal/trmlshtcts ; S-ITERM = https://iterm2.com/documentation-one-page.html (+ keyshortcut.pages.dev/macos/iterm cheat sheet, third-party) ; S-ITERM-MENU = https://iterm2.com/documentation-menu-items.html ; S-MM = apps/macos/Sources/Tessera/MainMenu.swift ; S-D = wave-13-plan.md section 3 decisions. "(unverified)" = from memory/third-party only, not an official page: do not make a test depend on it.
+# owner: app = Tessera action; system = AppKit-provided action (chord still rebindable: menu key equivalent is just reassigned); later:Tn = added by task Tn, default chord applies from that task.
+command,chord,alt_chords,menu_item,appkit_keyEquivalent,appkit_mask,iterm2_default,terminal_app_default,owner,note
+about,,,Tessera > About Tessera,,,none,none,system,S-MM:30. No chord.
+settings,cmd+comma,,Tessera > Settings…,",",cmd,cmd+comma (S-ITERM cheat sheet),cmd+comma (S-TERM 'Open Terminal settings'),app,S-MM:35. Key name 'comma' because ',' is fine but names are used for every punctuation in registry output.
+hide,cmd+h,,Tessera > Hide Tessera,h,cmd,cmd+h (system),cmd+h (system),system,S-MM:37.
+hide_others,cmd+alt+h,,Tessera > Hide Others,h,cmd+alt,cmd+alt+h (system),cmd+alt+h (system),system,S-MM:38. iTerm2 binds cmd+alt+h to 'Split Horizontally (New Profile)' only in custom setups (unverified); no conflict in Tessera.
+show_all,,,Tessera > Show All,,,none,none,system,S-MM:40.
+quit,cmd+q,,Tessera > Quit Tessera,q,cmd,cmd+q,cmd+q,system,S-MM:42. Core tests already treat Cmd+Q as Ignored (input.rs doc line 10).
+new_window,cmd+n,,Shell > New Window,n,cmd,cmd+n,cmd+n (S-TERM),app,S-MM:48.
+new_tab,cmd+t,,Shell > New Tab,t,cmd,cmd+t,cmd+t (S-TERM),app,S-MM:49.
+close_tab,cmd+w,,Shell > Close Tab,w,cmd,cmd+w (closes pane/tab),cmd+w (S-TERM 'Close tab'),app,S-MM:53. D1 (T1): with panes it closes the focused pane and the last pane closes the tab. T1 may rename to close_pane; registry keeps 'close_tab' as an alias name until then (decision N3).
+close_window,cmd+shift+w,,Shell > Close Window,w,cmd+shift,cmd+shift+w (unverified),cmd+shift+w (S-TERM),app,S-MM:54.
+clear_scrollback,cmd+k,,Shell > Clear to Start,k,cmd,cmd+k = Clear Buffer (iTerm2 cheat sheet; docs list item without shortcut),cmd+k (S-TERM 'Clear to start'),app,S-MM:57. iTerm2 'Clear Scrollback Buffer' is a separate item (unverified chord cmd+alt+k).
+copy,cmd+c,,Edit > Copy,c,cmd,cmd+c,cmd+c (S-TERM),app,S-MM:66.
+paste,cmd+v,,Edit > Paste,v,cmd,cmd+v,cmd+v (S-TERM),app,S-MM:67.
+paste_plain,cmd+alt+shift+v,,Edit > Paste as Plain Text,v,cmd+alt+shift,cmd+alt+shift+v ('Paste Special' items; unverified),cmd+alt+shift+c is 'Copy plain text' (S-TERM); no paste-plain default,app,S-MM:68. Canonical modifier order puts alt before shift: 'cmd+alt+shift+v' vs written 'alt+cmd+shift+v' must parse to the same chord.
+select_all,cmd+a,,Edit > Select All,a,cmd,cmd+a,cmd+a (S-TERM),app,S-MM:70.
+font_bigger,cmd+shift+=,cmd+=,View > Bigger,+,cmd,cmd+plus (S-ITERM cheat sheet),cmd+plus (S-TERM 'Make fonts bigger'),app,S-MM:78-84. Canonical chord is the US-unshifted form (cmd+shift+=); input 'cmd+plus' and 'cmd++'-less sugar normalise to it (grammar rule R7). Two chords for one command: the visible item carries '+' (shift implied); the hidden item (allowsKeyEquivalentWhenHidden) carries '=' (D3 in MainMenu). Registry must support >1 default chord per command (decision N2).
+font_smaller,cmd+minus,,View > Smaller,-,cmd,cmd+minus,cmd+minus (S-TERM),app,S-MM:85.
+font_reset,cmd+0,,View > Actual Size,0,cmd,cmd+0 (cheat sheet),none in S-TERM,app,S-MM:86.
+scroll_to_top,cmd+home,,View > Scroll to Top,F:Home,cmd,cmd+home? iTerm2: not in S-ITERM; no default (unverified),cmd+home (S-TERM 'Scroll to top'),app,S-MM:91. Function-key item; reachable as cmd+fn+left on laptops.
+scroll_to_bottom,cmd+end,,View > Scroll to Bottom,F:End,cmd,none (unverified),cmd+end (S-TERM),app,S-MM:92.
+scroll_page_up,cmd+up,,View > Page Up,F:UpArrow,cmd,none,cmd+page_up (S-TERM 'Page up'); Terminal.app cmd+up = previous mark,app,S-MM:93 + wave-7 decision. D4 (T2/T6): cmd+up resolves to prompt_previous when the session has a prompt mark, else scroll_page_up. Both commands in registry; the chord maps to ONE command 'scroll_page_up' in the table and the dispatcher upgrades it (decision N1).
+scroll_page_down,cmd+down,,View > Page Down,F:DownArrow,cmd,none,cmd+page_down (S-TERM); Terminal.app cmd+down = next mark,app,S-MM:94. See scroll_page_up.
+show_tab_bar,,,View > Show Tab Bar / Hide Tab Bar,,,none,shift+cmd+t (S-TERM 'Show or hide tab bar'),system,S-MM:103. AppKit retitles it. No chord today; Terminal.app default NOT adopted (no shortcut changes without [keys]).
+minimize,cmd+m,,Window > Minimize,m,cmd,cmd+m,cmd+m,system,S-MM:109.
+zoom,,,Window > Zoom,,,none,none,system,S-MM:110.
+tab_previous,cmd+shift+[,,Window > Show Previous Tab,{,cmd (shift implied by '{'),cmd+left AND cmd+shift+[ (S-ITERM),ctrl+shift+tab (S-TERM 'Previous Tab'); cmd+shift+[ is the AppKit/Safari convention,app,S-MM:113. Shipped as keyEquivalent '{' with the DEFAULT mask; AppKit shows it as ⇧⌘[. Translator must emit '{' for 'cmd+shift+[' on a US layout or XCTest must prove '[' + cmd+shift matches (decision N4).
+tab_next,cmd+shift+],,Window > Show Next Tab,},cmd (shift implied by '}'),cmd+right AND cmd+shift+] (S-ITERM),ctrl+tab (S-TERM 'Next Tab'),app,S-MM:114. Same as tab_previous. ctrl+tab / ctrl+shift+tab are also bound by AppKit window tabbing itself; do not register them as defaults.
+move_tab_to_new_window,,,Window > Move Tab to New Window,,,none,none,system,S-MM:115.
+merge_all_windows,,,Window > Merge All Windows,,,none,none,system,S-MM:116.
+select_tab:1,cmd+1,,Window > Select Tab > Tab 1,1,cmd,cmd+1 (S-ITERM 'go to tab by number'),cmd+1 (S-TERM,unverified: Terminal.app uses cmd+1..9 for windows),app,S-MM:138 tag 0. Parameterised command 'select_tab:N' N=1..9 (decision N5); alternatively nine names select_tab_1..9.
+select_tab:2,cmd+2,,Window > Select Tab > Tab 2,2,cmd,cmd+2,cmd+2,app,S-MM:138 tag 1.
+select_tab:3,cmd+3,,Window > Select Tab > Tab 3,3,cmd,cmd+3,cmd+3,app,S-MM:138 tag 2.
+select_tab:4,cmd+4,,Window > Select Tab > Tab 4,4,cmd,cmd+4,cmd+4,app,S-MM:138 tag 3.
+select_tab:5,cmd+5,,Window > Select Tab > Tab 5,5,cmd,cmd+5,cmd+5,app,S-MM:138 tag 4.
+select_tab:6,cmd+6,,Window > Select Tab > Tab 6,6,cmd,cmd+6,cmd+6,app,S-MM:138 tag 5.
+select_tab:7,cmd+7,,Window > Select Tab > Tab 7,7,cmd,cmd+7,cmd+7,app,S-MM:138 tag 6.
+select_tab:8,cmd+8,,Window > Select Tab > Tab 8,8,cmd,cmd+8,cmd+8,app,S-MM:138 tag 7.
+select_tab:9,cmd+9,,Window > Select Tab > Tab 9,9,cmd,cmd+9,cmd+9,app,S-MM:138 tag 8. Today ⌘9 selects tab 9, not 'last tab' (browser convention) - keep.
+bring_all_to_front,,,Window > Bring All to Front,,,none,none,system,S-MM:119.
+help,cmd+shift+/,,Help > Tessera Help,?,cmd (shift implied by '?'),none,cmd+shift+/ ('Terminal Help' is cmd+? in all Apple apps),app,S-MM:127. Shipped as '?' with default mask. Chord written 'cmd+shift+/' (unshifted key + explicit shift); 'cmd+?' is accepted as an alias that parses to the same chord (grammar G-shifted).
+# --- commands added by later wave-13 tasks (defaults from decisions D1, D4 and the iTerm2 conventions they cite) ---
+split_right,cmd+d,,Shell > Split Right (T1),d,cmd,cmd+d = split vertically (new pane to the right) (S-ITERM),cmd+d = 'Split window into two panes' (S-TERM),later:T1,D1. Terminal.app's close-split is shift+cmd+d; iTerm2's ⇧⌘D splits horizontally. Follow iTerm2 (D1).
+split_down,cmd+shift+d,,Shell > Split Down (T1),d,cmd+shift,cmd+shift+d (S-ITERM),cmd+shift+d = 'Close split pane' (S-TERM) - CONFLICT with Terminal.app meaning; D1 chooses iTerm2,later:T1,D1.
+focus_pane_left,cmd+alt+left,,pane focus (T1),F:LeftArrow,cmd+alt,cmd+alt+left (S-ITERM),none,later:T1,D1.
+focus_pane_right,cmd+alt+right,,pane focus (T1),F:RightArrow,cmd+alt,cmd+alt+right (S-ITERM),none,later:T1,D1.
+focus_pane_up,cmd+alt+up,,pane focus (T1),F:UpArrow,cmd+alt,cmd+alt+up (S-ITERM),none,later:T1,D1. Terminal.app cmd+alt+up = jump to previous bookmark (S-TERM).
+focus_pane_down,cmd+alt+down,,pane focus (T1),F:DownArrow,cmd+alt,cmd+alt+down (S-ITERM),none,later:T1,D1. Terminal.app cmd+alt+down = next bookmark.
+focus_pane_previous,cmd+[,,pane focus order (T10?),[,cmd,cmd+[ (S-ITERM),none,later:T10,Not in D1; recommended for iTerm2 parity, lead to confirm (decision N6).
+focus_pane_next,cmd+],,pane focus order (T10?),],cmd,cmd+] (S-ITERM),none,later:T10,As above.
+zoom_pane,cmd+shift+enter,,pane zoom (T10),F:\r,cmd+shift,cmd+shift+enter = maximize pane (S-ITERM),none,later:T10,Not in D1; confirm (N6). Terminal.app shift+cmd+return = 'send return without marking'.
+find,cmd+f,,Edit > Find (T8),f,cmd,cmd+f,cmd+f (S-TERM),later:T8,
+find_next,cmd+g,,Edit > Find Next (T8),g,cmd,cmd+g (unverified),cmd+g (S-TERM),later:T8,
+find_previous,cmd+shift+g,,Edit > Find Previous (T8),g,cmd+shift,cmd+shift+g (unverified),cmd+shift+g (S-TERM),later:T8,
+prompt_previous,cmd+up,,Edit > Previous Prompt (T6),F:UpArrow,cmd,iTerm2: next/previous mark are cmd+shift+up/down (unverified),cmd+up = 'Jump to previous mark' (S-TERM),later:T6,D4: same chord as scroll_page_up; see decision N1. Registry default for prompt_previous is cmd+up; the dispatcher falls back to scroll_page_up when the session has no prompt mark.
+prompt_next,cmd+down,,Edit > Next Prompt (T6),F:DownArrow,cmd,as above,cmd+down = 'Jump to next mark' (S-TERM),later:T6,As prompt_previous.
+copy_mode,cmd+shift+c,,Edit > Copy Mode (T9),c,cmd+shift,cmd+shift+c = Enter Copy Mode (S-ITERM cheat sheet),cmd+shift+c = Show colors (S-TERM),later:T9,Confirm with T9 owner.
+send_text,,,no menu item,,,Send Text action (S-ITERM prefs-keys page),none,app,Not a registry entry with a default; used as '[keys] "cmd+shift+k" = "send_text:\\x15"'. Never gets a menu item; resolved in App::send_input (D3).

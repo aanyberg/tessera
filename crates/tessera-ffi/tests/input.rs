@@ -26,9 +26,10 @@ use tessera_app_core::input::{
     MouseEventKind as CoreMouseEventKind,
 };
 use tessera_ffi::{
-    App, Callbacks, Error, InputOutcome, Key, KeyEvent, KeyEventKind, Modifiers, MouseButton,
-    MouseEvent, MouseEventKind, ScrollEvent, ScrollPosition, ScrollTarget, SpawnOptions,
-    tessera_app_free, tessera_app_new, tessera_app_set_callbacks, tessera_session_close,
+    App, Callbacks, Error, HANDLE_KEY_BINDINGS_ONLY, InputOutcome, Key, KeyEvent, KeyEventKind,
+    Modifiers, MouseButton, MouseEvent, MouseEventKind, NO_COMMAND, ScrollEvent, ScrollPosition,
+    ScrollTarget, SpawnOptions, tessera_app_free, tessera_app_keymap_json, tessera_app_new,
+    tessera_app_set_callbacks, tessera_session_close, tessera_session_handle_key,
     tessera_session_paste, tessera_session_scroll_position, tessera_session_scroll_to,
     tessera_session_send_key, tessera_session_send_mouse, tessera_session_send_scroll,
     tessera_session_set_focus, tessera_session_spawn, tessera_test_with_core,
@@ -130,6 +131,9 @@ fn every_mouse_event_kind_round_trips() {
 fn outcome_and_modifier_values_are_stable() {
     assert_eq!(InputOutcome::Ignored as u32, 0);
     assert_eq!(InputOutcome::Consumed as u32, 1);
+    assert_eq!(InputOutcome::Command as u32, 2);
+    assert_eq!(HANDLE_KEY_BINDINGS_ONLY, 1);
+    assert_eq!(NO_COMMAND, u32::MAX);
     let bits = [
         Modifiers::None,
         Modifiers::Shift,
@@ -323,6 +327,7 @@ impl Handle {
             on_session_exit: None,
             on_appearance_changed: None,
             on_session_clipboard: None,
+            on_config_applied: None,
         };
         // SAFETY: live handle; valid table; `outputs` outlives the handle.
         assert_eq!(
@@ -359,6 +364,34 @@ impl Handle {
         // SAFETY: live handle; `event` and `out` are valid for the call.
         let code = unsafe { tessera_session_send_key(self.0, id, event, &raw mut out) };
         (code, out)
+    }
+
+    /// `tessera_session_handle_key`: the error, outcome and command id.
+    fn handle_key(&self, id: u64, event: &KeyEvent, flags: u32) -> (Error, InputOutcome, u32) {
+        // Pre-set to values a call must overwrite.
+        let mut out = InputOutcome::Consumed;
+        let mut command = 7;
+        // SAFETY: live handle; `event`, `out` and `command` are valid.
+        let code = unsafe {
+            tessera_session_handle_key(self.0, id, event, flags, &raw mut out, &raw mut command)
+        };
+        (code, out, command)
+    }
+
+    /// The key map JSON, read with the two-call protocol.
+    fn keymap(&self) -> serde_json::Value {
+        let mut len = 0;
+        // SAFETY: live handle; a size query with no buffer.
+        let code = unsafe { tessera_app_keymap_json(self.0, ptr::null_mut(), 0, &raw mut len) };
+        assert_eq!(code, Error::InvalidArgument, "a size query is refused");
+        assert!(len > 0);
+        let mut buf = vec![0_u8; len];
+        let mut written = 0;
+        // SAFETY: `buf` is writable for its length.
+        let code =
+            unsafe { tessera_app_keymap_json(self.0, buf.as_mut_ptr(), len, &raw mut written) };
+        assert_eq!((code, written), (Error::Ok, len));
+        serde_json::from_slice(&buf).expect("the key map is JSON")
     }
 
     fn mouse(&self, id: u64, event: &MouseEvent) -> (Error, InputOutcome) {
@@ -1281,5 +1314,220 @@ fn reject_malformed_mice_and_scrolls(app: &Handle, id: u64) {
                 unsafe { tessera_session_send_scroll(app.0, id, &raw const event, &raw mut out) };
             assert_eq!((code, out), INVALID);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Key bindings (#43)
+// ---------------------------------------------------------------------------
+
+fn cmd(event: KeyEvent) -> KeyEvent {
+    KeyEvent {
+        modifiers: Modifiers::Super as u8,
+        ..event
+    }
+}
+
+/// The id the key map gives `command`.
+fn command_id(map: &serde_json::Value, command: &str) -> u32 {
+    let entry = map["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["command"] == command)
+        .unwrap_or_else(|| panic!("no command {command}"));
+    u32::try_from(entry["id"].as_u64().unwrap()).unwrap()
+}
+
+/// A bound chord reports its command (with or without the bindings-only
+/// flag) and sends nothing; an unbound one is ignored under the flag
+/// (nothing encoded) and typed without it.
+#[test]
+fn handle_key_reports_commands_and_encodes_only_without_the_flag() {
+    let outputs = Outputs::default();
+    let app = Handle::new(&outputs);
+    let id = app.spawn("/bin/cat", &[]);
+    let new_tab = command_id(&app.keymap(), "new_tab");
+    for flags in [0, HANDLE_KEY_BINDINGS_ONLY] {
+        assert_eq!(
+            app.handle_key(id, &cmd(char_event('t')), flags),
+            (Error::Ok, InputOutcome::Command, new_tab)
+        );
+    }
+    let release = KeyEvent {
+        kind: KeyEventKind::Release as u32,
+        ..cmd(char_event('t'))
+    };
+    assert_eq!(
+        app.handle_key(id, &release, HANDLE_KEY_BINDINGS_ONLY),
+        (Error::Ok, InputOutcome::Consumed, NO_COMMAND),
+        "the release of a bound chord is swallowed"
+    );
+    assert_eq!(
+        app.handle_key(id, &char_event('x'), HANDLE_KEY_BINDINGS_ONLY),
+        (Error::Ok, InputOutcome::Ignored, NO_COMMAND),
+        "an unbound key is not typed under the flag"
+    );
+    assert_eq!(
+        app.handle_key(id, &char_event('y'), 0),
+        (Error::Ok, InputOutcome::Consumed, NO_COMMAND)
+    );
+    app.wait_until("the echo", |app| app.row(id, 0) == "y");
+    // The bindings-only `x` never reached cat.
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(app.row(id, 0), "y");
+}
+
+/// `send_text` bytes reach the PTY as written; the map comes from
+/// `config.toml`'s `[keys]` and its warnings are in the JSON.
+#[test]
+fn send_text_bindings_from_config_toml_reach_the_pty() {
+    common::isolate_home();
+    let dir = common::hermetic_config_dir();
+    std::fs::write(
+        dir.join("config.toml"),
+        "[keys]\n'cmd+e' = 'send_text:echo\\n'\n'cmd+q' = 'none'\n'cmd+x' = 'bogus'\n",
+    )
+    .unwrap();
+    let outputs = Outputs::default();
+    let app = Handle::new(&outputs);
+    let id = app.spawn("/bin/cat", &[]);
+    assert_eq!(
+        app.handle_key(id, &cmd(char_event('e')), HANDLE_KEY_BINDINGS_ONLY),
+        (Error::Ok, InputOutcome::Consumed, NO_COMMAND)
+    );
+    app.wait_until("cat to echo the line", |app| {
+        app.row(id, 0) == "echo" && app.row(id, 1) == "echo"
+    });
+    let map = app.keymap();
+    assert_eq!(map["generation"], 0);
+    let warnings: Vec<&str> = map["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|warning| warning.as_str().unwrap())
+        .collect();
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("cmd+q") && w.contains("quit"))
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("unknown command `bogus`"))
+    );
+    let quit = map["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["command"] == "quit")
+        .unwrap();
+    assert_eq!(quit["chords"], serde_json::json!([]), "cmd+q is taken");
+}
+
+/// The JSON names every command once, in id order, with its menu chords.
+#[test]
+fn the_keymap_json_lists_every_command_with_its_menu_chords() {
+    let outputs = Outputs::default();
+    let app = Handle::new(&outputs);
+    let map = app.keymap();
+    let commands = map["commands"].as_array().unwrap();
+    for (index, entry) in commands.iter().enumerate() {
+        assert_eq!(entry["id"].as_u64().unwrap(), index as u64);
+    }
+    let names: HashSet<&str> = commands
+        .iter()
+        .map(|entry| entry["command"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), commands.len(), "a command is listed twice");
+    let entry = |command: &str| {
+        commands
+            .iter()
+            .find(|entry| entry["command"] == command)
+            .unwrap()
+    };
+    let new_tab = entry("new_tab");
+    assert_eq!(new_tab["owner"], "app");
+    assert_eq!(new_tab["chords"], serde_json::json!(["cmd+t"]));
+    assert_eq!(
+        new_tab["menu"],
+        serde_json::json!([{"key_equivalent": "t", "modifiers": 8}])
+    );
+    assert_eq!(entry("select_tab:3")["parameter"], "3");
+    assert_eq!(entry("quit")["owner"], "system");
+    assert_eq!(entry("split_right")["owner"], "planned");
+    // `cmd+shift+[`: AppKit's key equivalent is the shifted symbol.
+    assert_eq!(
+        entry("tab_previous")["menu"],
+        serde_json::json!([{"key_equivalent": "{", "modifiers": 8}])
+    );
+    assert_eq!(map["warnings"], serde_json::json!([]));
+}
+
+#[test]
+fn handle_key_and_keymap_reject_bad_arguments() {
+    let outputs = Outputs::default();
+    let app = Handle::new(&outputs);
+    let id = app.spawn("/bin/cat", &[]);
+    let event = cmd(char_event('t'));
+    assert_eq!(
+        app.handle_key(id, &event, 2),
+        (Error::InvalidArgument, InputOutcome::Ignored, NO_COMMAND)
+    );
+    assert_eq!(
+        app.handle_key(id + 1000, &event, 0).0,
+        app.key(id + 1000, &char_event('a')).0,
+        "an unknown session fails as send_key does"
+    );
+    let mut out = InputOutcome::Consumed;
+    let mut command = 0;
+    // SAFETY: each call passes one NULL where a pointer is required.
+    unsafe {
+        assert_eq!(
+            tessera_session_handle_key(
+                app.0,
+                id,
+                &raw const event,
+                0,
+                &raw mut out,
+                ptr::null_mut()
+            ),
+            Error::NullPointer
+        );
+        assert_eq!(
+            tessera_session_handle_key(app.0, id, ptr::null(), 0, &raw mut out, &raw mut command),
+            Error::NullPointer
+        );
+        assert_eq!((out, command), (InputOutcome::Ignored, NO_COMMAND));
+        assert_eq!(
+            tessera_session_handle_key(
+                ptr::null_mut(),
+                id,
+                &raw const event,
+                0,
+                &raw mut out,
+                &raw mut command
+            ),
+            Error::NullPointer
+        );
+        let mut len = 9;
+        assert_eq!(
+            tessera_app_keymap_json(ptr::null(), ptr::null_mut(), 0, &raw mut len),
+            Error::NullPointer
+        );
+        assert_eq!(len, 0);
+        assert_eq!(
+            tessera_app_keymap_json(app.0, ptr::null_mut(), 0, ptr::null_mut()),
+            Error::NullPointer
+        );
+        let mut small = [0_u8; 4];
+        assert_eq!(
+            tessera_app_keymap_json(app.0, small.as_mut_ptr(), small.len(), &raw mut len),
+            Error::InvalidArgument
+        );
+        assert!(len > small.len());
+        assert_eq!(small, [0; 4], "nothing written when it does not fit");
     }
 }

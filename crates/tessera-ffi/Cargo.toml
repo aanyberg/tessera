@@ -11,6 +11,8 @@ publish.workspace = true
 
 [dependencies]
 tessera-app-core.workspace = true
+# The key map as JSON for the frontend's menus (`tessera_app_keymap_json`).
+serde_json.workspace = true
 tracing.workspace = true
 
 [features]

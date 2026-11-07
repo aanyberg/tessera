@@ -298,7 +298,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let core = try TesseraApp()
         core.delegate = router
         self.core = core
+        router.onConfigurationApplied = { [weak self] in self?.applyKeymap() }
+        applyKeymap()
         return core
+    }
+
+    /// Gives the menu bar the core's key map (ADR 0036): at start and after
+    /// every configuration the core applies. The menus keep their previous
+    /// key equivalents if it cannot be read.
+    func applyKeymap() {
+        guard let core, let bar = NSApp.mainMenu else { return }
+        do {
+            MainMenu.apply(try core.keymap(), to: bar)
+        } catch {
+            Self.log.error("key map not read: \(String(describing: error), privacy: .public)")
+        }
     }
 
     func presentOpenError(_ error: any Error) {

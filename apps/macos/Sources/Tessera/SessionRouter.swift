@@ -18,6 +18,9 @@ final class SessionRouter: TesseraAppDelegate {
     /// delegate's registry owns the controllers.
     private var controllers: [UInt64: WeakController] = [:]
     private var lastBeep: ContinuousClock.Instant?
+    /// Runs when the core applied a configuration: the application delegate
+    /// gives the menus the new key map.
+    var onConfigurationApplied: (() -> Void)?
 
     /// Routes `session`'s events to `controller`, the tab whose pane runs it.
     func register(_ controller: TerminalWindowController, session: TesseraSession) {
@@ -63,5 +66,10 @@ final class SessionRouter: TesseraAppDelegate {
         for (id, entry) in controllers {
             entry.controller?.panes.first { $0.session.id == id }?.view.applyLayerOpacity(opaque: opaque)
         }
+    }
+
+    /// A configuration was applied: its `[keys]` may move menu shortcuts.
+    func configurationDidApply(generation: UInt64) {
+        onConfigurationApplied?()
     }
 }

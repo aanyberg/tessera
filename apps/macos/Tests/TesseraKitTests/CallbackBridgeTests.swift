@@ -493,6 +493,32 @@ final class CallbackBridgeTests: XCTestCase {
         XCTAssertEqual(recorder.appearances, [])
     }
 
+    func testConfigurationAppliesReachTheDelegateCoalesced() async throws {
+        // From the configuration watch thread: a burst is one delivery with
+        // the latest generation, so the menus read the key map once.
+        onReaderThread { callbacks in
+            for generation in 1...10_000 {
+                callbacks.on_config_applied!(callbacks.user_data, UInt64(generation))
+            }
+            callbacks.on_config_applied!(callbacks.user_data, 10_001)
+        }
+        _ = try await drained()
+        XCTAssertEqual(recorder.configurations, [10_001], "10 001 callbacks, one delivery with the latest")
+        XCTAssertEqual(bridge.scheduledConfigurationDeliveries.withLock { $0 }, 1, "and one scheduled")
+        onReaderThread { callbacks in callbacks.on_config_applied!(callbacks.user_data, 10_002) }
+        _ = try await drained()
+        XCTAssertEqual(recorder.configurations, [10_001, 10_002], "a later apply is a new delivery")
+        XCTAssertEqual(recorder.appearances, [], "appearance is a callback of its own")
+        XCTAssertEqual(recorder.events[session.id, default: []], [])
+    }
+
+    func testConfigurationAppliesAfterShutdownAreDropped() async throws {
+        onReaderThread { callbacks in callbacks.on_config_applied!(callbacks.user_data, 1) }
+        bridge.shutDown()
+        _ = try await drained()
+        XCTAssertEqual(recorder.configurations, [])
+    }
+
     func testEveryStatusMapsToItsCase() {
         let cases: [(TesseraError, TesseraCoreError?)] = [
             (TESSERA_ERROR_OK, nil),
