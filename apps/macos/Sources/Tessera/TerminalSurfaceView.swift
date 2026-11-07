@@ -19,7 +19,14 @@ import os
 ///   input methods compose through `NSTextInputClient`. Committed text is
 ///   sent as typed text (never as a paste); keys are mapped from their key
 ///   code. Keys pressed while text is marked belong to the input method and
-///   send nothing of their own.
+///   send nothing of their own. Every key reaches the core's key map first
+///   (ADR 0036): a chord bound to a command runs its menu item, `send_text`
+///   sends its bytes. Command chords arrive through
+///   `performKeyEquivalent(with:)`, before the menus: the core takes the ones
+///   bound to `send_text` or `none`, leaves a menu command to its item when
+///   the menus match the key to it and runs the command itself otherwise
+///   (`validateMenuItem(_:)` gates both); unbound ones go to the menus as
+///   before.
 /// - Mouse: presses, releases, drags and plain motion go to the core in cell
 ///   and pixel coordinates; the core reports them to a program that tracks
 ///   the mouse and says so (`.consumed`), and leaves the rest to the view.
@@ -893,12 +900,15 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     func processKeyDown(_ event: NSEvent, interpret: () -> Void) {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let markedBefore = hasMarkedText()
-        // Command combinations that are not menu key equivalents go up the
-        // responder chain (and end in a beep), not to the session: the core
-        // has no Super bindings yet and would encode them as kitty `CSI u`
-        // sequences the shell would print. Revisit when the core gains Super
-        // bindings (#43).
+        // Command combinations no menu item took: a bound one runs (a menu
+        // command whose item's key equivalent `AppKit` did not match to this
+        // event, on another layout say); the rest go up the responder chain
+        // (and end in a beep), not to the session, which would encode them as
+        // kitty `CSI u` sequences the shell would print.
         if !markedBefore && flags.contains(.command) {
+            if let key = keyEvent(for: event, selector: nil), dispatch(key, bindingsOnly: true) == .consumed {
+                return
+            }
             super.keyDown(with: event)
             return
         }
@@ -907,6 +917,13 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         // shortcuts then).
         if !markedBefore && flags.contains(.control) {
             sendKey(for: event, selector: nil)
+            return
+        }
+        // An Option chord the key map binds runs before the input system
+        // composes the key into its Option character (⌥T would type †).
+        if !markedBefore && flags.contains(.option), let key = keyEvent(for: event, selector: nil),
+            dispatch(key, bindingsOnly: true) == .consumed
+        {
             return
         }
 
@@ -987,40 +1004,98 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         }
     }
 
-    /// Sends a key that produced no text: named from its key code first,
-    /// then from the editing selector AppKit chose, else as its unshifted
-    /// character with the modifiers held (D6).
+    /// Sends a key that produced no text (D6).
     @discardableResult
     private func sendKey(for event: NSEvent, selector: Selector?) -> TesseraSession.InputOutcome {
+        guard let key = keyEvent(for: event, selector: selector) else { return .ignored }
+        return send(key)
+    }
+
+    /// The event for a key that produced no text: named from its key code
+    /// first, then from the editing selector AppKit chose, else as its
+    /// unshifted character with the modifiers held (D6).
+    private func keyEvent(for event: NSEvent, selector: Selector?) -> TesseraSession.KeyEvent? {
         let keys = KeyInfo(event)
         let modifiers = Self.modifiers(of: event)
         if let named = keys.named {
-            return send(TesseraSession.KeyEvent(key: named, modifiers: modifiers, kind: keys.kind))
+            return TesseraSession.KeyEvent(key: named, modifiers: modifiers, kind: keys.kind)
         }
         if let selector, let (key, extra) = Self.key(for: selector) {
-            return send(TesseraSession.KeyEvent(key: key, modifiers: modifiers.union(extra), kind: keys.kind))
+            return TesseraSession.KeyEvent(key: key, modifiers: modifiers.union(extra), kind: keys.kind)
         }
-        guard let own = keys.unshifted else { return .ignored }
-        return send(
-            TesseraSession.KeyEvent(
-                key: .char, codepoint: own, shifted: keys.shifted, baseLayout: keys.baseLayout,
-                modifiers: modifiers, kind: keys.kind))
+        guard let own = keys.unshifted else { return nil }
+        return TesseraSession.KeyEvent(
+            key: .char, codepoint: own, shifted: keys.shifted, baseLayout: keys.baseLayout,
+            modifiers: modifiers, kind: keys.kind)
     }
 
+    /// Sends a key: its binding runs if the key map has one, else the core
+    /// encodes it.
     @discardableResult
     private func send(_ event: TesseraSession.KeyEvent) -> TesseraSession.InputOutcome {
         #if DEBUG
             sentKeys.append(event)
         #endif
+        return dispatch(event, bindingsOnly: false)
+    }
+
+    /// Hands `event` to the core and acts on what it did: a command runs
+    /// its menu item (``MainMenu/run(command:)``); bytes sent return the view to the
+    /// live screen.
+    private func dispatch(_ event: TesseraSession.KeyEvent, bindingsOnly: Bool) -> TesseraSession.InputOutcome {
+        switch handle(event, bindingsOnly: bindingsOnly) {
+        case .ignored:
+            return .ignored
+        case .consumed:
+            movedToLiveScreen()
+            return .consumed
+        case .command(let command):
+            MainMenu.run(command: command)
+            return .consumed
+        }
+    }
+
+    private func handle(_ event: TesseraSession.KeyEvent, bindingsOnly: Bool) -> TesseraSession.KeyOutcome {
         do {
-            let outcome = try session.send(key: event)
-            if outcome == .consumed {
-                movedToLiveScreen()
-            }
-            return outcome
+            return try session.handle(key: event, bindingsOnly: bindingsOnly)
         } catch {
             Self.log.debug("key not sent: \(String(describing: error), privacy: .public)")
             return .ignored
+        }
+    }
+
+    /// Command chords, before the menus see them: the core runs a binding
+    /// to `send_text` or `none` (the key is used). A chord bound to a
+    /// command is left to the command's menu item when the menus match the
+    /// key to that item (N11), which then fires with its title flashing and
+    /// `validateMenuItem(_:)` gating it; otherwise (a keypad chord, which
+    /// the menus read as the main-row key of another item, or a base-layout
+    /// chord) the view runs the command through ``MainMenu/run(command:)``,
+    /// which validates the item too. One with no item (a command a later
+    /// version runs) is swallowed. An
+    /// unbound chord goes on to the menus as before. Only the first
+    /// responder takes part, and not while text is marked (the input method
+    /// owns the key).
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard event.type == .keyDown, flags.contains(.command), window?.firstResponder === self, !hasMarkedText(),
+            let key = keyEvent(for: event, selector: nil)
+        else {
+            return super.performKeyEquivalent(with: event)
+        }
+        switch handle(key, bindingsOnly: true) {
+        case .ignored:
+            return super.performKeyEquivalent(with: event)
+        case .consumed:
+            movedToLiveScreen()
+            return true
+        case .command(let command):
+            // The item fires itself only if the menus match this very key
+            // to it; a chord they would give to another item (⌘ on a
+            // keypad key reads as the main-row key) is run here.
+            if MainMenu.keyEquivalent(of: command, in: NSApp.mainMenu, matches: event) { return false }
+            MainMenu.run(command: command)
+            return true
         }
     }
 

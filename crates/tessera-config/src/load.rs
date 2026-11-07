@@ -145,6 +145,24 @@ pub enum Warning {
         /// Why it could not be loaded (bounded like a [`ParseError`]).
         error: String,
     },
+    /// A `[keys]` entry was left out (a malformed chord or value, a chord
+    /// already bound by an earlier entry, an unknown command) or is
+    /// honoured with a caveat (it shadows plain typing or a menu item).
+    /// The `reason` says which.
+    KeyBinding {
+        /// The table key as written, escaped and truncated to
+        /// [`MAX_WARNING_PATH_LEN`] bytes.
+        key: String,
+        /// What is wrong, ending in `ignored` or `honoured`.
+        reason: String,
+    },
+    /// The `[keys]` table has more than
+    /// [`MAX_KEY_BINDINGS`](crate::MAX_KEY_BINDINGS) entries; the first
+    /// ones are read and `dropped` others are left out.
+    TooManyKeyBindings {
+        /// How many entries were left out.
+        dropped: usize,
+    },
 }
 
 impl fmt::Display for Warning {
@@ -161,6 +179,12 @@ impl fmt::Display for Warning {
                 crate::Theme::DEFAULT_NAME
             ),
             Self::ThemeInvalid { path, error } => write!(f, "theme file {path} ignored: {error}"),
+            Self::KeyBinding { key, reason } => write!(f, "`keys.\"{key}\"`: {reason}"),
+            Self::TooManyKeyBindings { dropped } => write!(
+                f,
+                "{dropped} `[keys]` entries past the first {} ignored",
+                crate::MAX_KEY_BINDINGS
+            ),
         }
     }
 }
@@ -217,6 +241,10 @@ impl Config {
         if omitted > 0 {
             warnings.push((usize::MAX, Warning::UnknownKeysOmitted { count: omitted }));
         }
+        config.keys.put_in_document_order(|key| {
+            lookup(&root, &[Step::Key("keys"), Step::Key(key)]).map(|(at, _)| at)
+        });
+        warnings.extend(config.keys.take_placed_warnings());
         warnings.extend(invalid_lenient_values(text, &root));
         warnings.extend(config.normalize().into_iter().map(|warning| {
             let at = match &warning {
@@ -265,7 +293,14 @@ impl Config {
 
 /// The top-level keys of [`Config`], as written in `config.toml`. A test
 /// checks them against the serialised defaults.
-const CONFIG_KEYS: [&str; 5] = ["general", "appearance", "terminal", "profiles", "plugins"];
+const CONFIG_KEYS: [&str; 6] = [
+    "general",
+    "appearance",
+    "terminal",
+    "profiles",
+    "plugins",
+    "keys",
+];
 
 /// The part of `document` the warnings look up, copied: every top-level
 /// key with its span, and the value only under the keys of [`Config`].
@@ -377,6 +412,19 @@ fn dotted_steps(path: &str) -> Vec<Step<'_>> {
         }
     }
     steps
+}
+
+/// Rebuilds `config`'s `[keys]`, deserialized from `text` in the parser's
+/// order (sorted by key), in document order, as
+/// [`Config::from_toml_lenient`] does: for [`Config::from_toml`].
+pub(crate) fn put_keys_in_document_order(config: &mut Config, text: &str) {
+    // `text` was parsed once already, so this parse fails only if that did.
+    let Ok(document) = toml::de::DeTable::parse(text) else {
+        return;
+    };
+    config.keys.put_in_document_order(|key| {
+        lookup(document.get_ref(), &[Step::Key("keys"), Step::Key(key)]).map(|(at, _)| at)
+    });
 }
 
 /// The value at `steps` in the document and where it is: the start of

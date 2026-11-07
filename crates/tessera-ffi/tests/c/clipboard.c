@@ -15,13 +15,11 @@
 
 #include "TesseraCore.h"
 
-/* Appended after on_appearance_changed (#9): the table's last field. */
+/* Appended after on_appearance_changed (#9); keymap.c checks the table's
+ * last field (on_config_applied, #43). */
 _Static_assert(offsetof(TesseraCallbacks, on_session_clipboard) ==
                    offsetof(TesseraCallbacks, on_appearance_changed) + sizeof(void (*)(void)),
                "on_session_clipboard follows on_appearance_changed");
-_Static_assert(sizeof(TesseraCallbacks) ==
-                   offsetof(TesseraCallbacks, on_session_clipboard) + sizeof(void (*)(void)),
-               "on_session_clipboard is the last field");
 
 static const unsigned char expected[] = {'a', 0, 'b', 0x1b, '[', '3', '1', 'm', 'c', '\n'};
 

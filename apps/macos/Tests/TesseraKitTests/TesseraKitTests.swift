@@ -67,6 +67,14 @@ final class Recorder: TesseraAppDelegate {
         XCTAssertTrue(Thread.isMainThread, "delegate called off the main thread")
         appearances.append(opaque)
     }
+
+    /// Every `configurationDidApply(generation:)`, in order.
+    private(set) var configurations: [UInt64] = []
+
+    func configurationDidApply(generation: UInt64) {
+        XCTAssertTrue(Thread.isMainThread, "delegate called off the main thread")
+        configurations.append(generation)
+    }
 }
 
 @MainActor

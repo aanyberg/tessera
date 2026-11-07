@@ -1,60 +1,79 @@
 import AppKit
+import TesseraKit
+import os
 
 /// The menu bar: Tessera, Shell, Edit, View, Window and Help, laid out after
 /// Terminal.app (D1). Every item sends its action up the responder chain (no
 /// fixed target), so the terminal items (Clear to Start, the Edit and View
 /// items) reach the key window's ``TerminalSurfaceView``, the tab items its
-/// window, and the application items ``AppDelegate``. The key equivalents are
-/// fixed until the configurable key map (#43).
+/// window, and the application items ``AppDelegate``.
+///
+/// Each item's `identifier` is its command's name in the core's registry
+/// (`new_tab`, `select_tab:3`; ADR 0036). The key equivalents built here are
+/// the registry's defaults; ``apply(_:to:)`` replaces them with the key map's
+/// once the core runs and after every configuration it applies. A command
+/// with several menu chords gets hidden alternates after its item
+/// (``aliasPrefix``).
 @MainActor
 enum MainMenu {
     /// Number of tabs reachable with ⌘1 to ⌘9.
     static let numberedTabs = 9
 
+    /// The identifier prefix of a hidden alternate: `alias:` and its
+    /// command's name.
+    static let aliasPrefix = "alias:"
+
+    private static let log = Logger(subsystem: "com.aanyberg.tessera", category: "menu")
+
     /// Builds the menu bar, installs it and registers its Window menu with
     /// AppKit (which appends the window list to it).
     static func install(in app: NSApplication) {
-        let windowMenu = makeWindowMenu()
-        let helpMenu = makeHelpMenu()
-        let mainMenu = NSMenu()
-        for menu in [makeAppMenu(), makeShellMenu(), makeEditMenu(), makeViewMenu(), windowMenu, helpMenu] {
-            mainMenu.addItem(submenuItem(menu))
-        }
+        let (mainMenu, windowMenu, helpMenu) = makeMenuBar()
         app.mainMenu = mainMenu
         app.windowsMenu = windowMenu
         app.helpMenu = helpMenu
     }
 
+    /// The menu bar with the default key equivalents, and its Window and
+    /// Help menus.
+    static func makeMenuBar() -> (bar: NSMenu, window: NSMenu, help: NSMenu) {
+        let windowMenu = makeWindowMenu()
+        let helpMenu = makeHelpMenu()
+        let bar = NSMenu()
+        for menu in [makeAppMenu(), makeShellMenu(), makeEditMenu(), makeViewMenu(), windowMenu, helpMenu] {
+            bar.addItem(submenuItem(menu))
+        }
+        return (bar, windowMenu, helpMenu)
+    }
+
     private static func makeAppMenu() -> NSMenu {
         let menu = NSMenu(title: "Tessera")
-        menu.addItem(withTitle: "About Tessera", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        add(menu, "about", "About Tessera", #selector(NSApplication.orderFrontStandardAboutPanel(_:)))
         menu.addItem(.separator())
         // Opens config.toml in the default editor until the Preferences
         // window (#40) replaces it (D6). Titled "Settings…": AppKit retitles
         // a "Preferences…" item with ⌘, to it anyway (macOS 13 and later).
-        menu.addItem(withTitle: "Settings…", action: #selector(AppDelegate.openConfigFile(_:)), keyEquivalent: ",")
+        add(menu, "settings", "Settings…", #selector(AppDelegate.openConfigFile(_:)), ",")
         menu.addItem(.separator())
-        menu.addItem(withTitle: "Hide Tessera", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
-        menu.addItem(withTitle: "Hide Others", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
-            .keyEquivalentModifierMask = [.command, .option]
-        menu.addItem(withTitle: "Show All", action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: "")
+        add(menu, "hide", "Hide Tessera", #selector(NSApplication.hide(_:)), "h")
+        add(menu, "hide_others", "Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option])
+        add(menu, "show_all", "Show All", #selector(NSApplication.unhideAllApplications(_:)))
         menu.addItem(.separator())
-        menu.addItem(withTitle: "Quit Tessera", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        add(menu, "quit", "Quit Tessera", #selector(NSApplication.terminate(_:)), "q")
         return menu
     }
 
     private static func makeShellMenu() -> NSMenu {
         let menu = NSMenu(title: "Shell")
-        menu.addItem(withTitle: "New Window", action: #selector(AppDelegate.openNewWindow(_:)), keyEquivalent: "n")
-        menu.addItem(withTitle: "New Tab", action: #selector(AppDelegate.openNewTab(_:)), keyEquivalent: "t")
+        add(menu, "new_window", "New Window", #selector(AppDelegate.openNewWindow(_:)), "n")
+        add(menu, "new_tab", "New Tab", #selector(AppDelegate.openNewTab(_:)), "t")
         menu.addItem(.separator())
         // Closes the key window, which is the selected tab; AppKit closes the
         // tab bar's window once its last tab is gone.
-        menu.addItem(withTitle: "Close Tab", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
-        menu.addItem(withTitle: "Close Window", action: #selector(TerminalWindowController.closeTabGroup(_:)), keyEquivalent: "w")
-            .keyEquivalentModifierMask = [.command, .shift]
+        add(menu, "close_tab", "Close Tab", #selector(NSWindow.performClose(_:)), "w")
+        add(menu, "close_window", "Close Window", #selector(TerminalWindowController.closeTabGroup(_:)), "w", [.command, .shift])
         menu.addItem(.separator())
-        menu.addItem(withTitle: "Clear to Start", action: #selector(TerminalSurfaceView.clearScrollback(_:)), keyEquivalent: "k")
+        add(menu, "clear_scrollback", "Clear to Start", #selector(TerminalSurfaceView.clearScrollback(_:)), "k")
         PaneMenu.addItems(to: menu)
         return menu
     }
@@ -64,11 +83,10 @@ enum MainMenu {
     /// terminal asks (D5).
     private static func makeEditMenu() -> NSMenu {
         let menu = NSMenu(title: "Edit")
-        menu.addItem(withTitle: "Copy", action: #selector(TerminalSurfaceView.copy(_:)), keyEquivalent: "c")
-        menu.addItem(withTitle: "Paste", action: #selector(TerminalSurfaceView.paste(_:)), keyEquivalent: "v")
-        menu.addItem(withTitle: "Paste as Plain Text", action: #selector(TerminalSurfaceView.pasteAsPlainText(_:)), keyEquivalent: "v")
-            .keyEquivalentModifierMask = [.command, .option, .shift]
-        menu.addItem(withTitle: "Select All", action: #selector(TerminalSurfaceView.selectAll(_:)), keyEquivalent: "a")
+        add(menu, "copy", "Copy", #selector(TerminalSurfaceView.copy(_:)), "c")
+        add(menu, "paste", "Paste", #selector(TerminalSurfaceView.paste(_:)), "v")
+        add(menu, "paste_plain", "Paste as Plain Text", #selector(TerminalSurfaceView.pasteAsPlainText(_:)), "v", [.command, .option, .shift])
+        add(menu, "select_all", "Select All", #selector(TerminalSurfaceView.selectAll(_:)), "a")
         return menu
     }
 
@@ -76,48 +94,45 @@ enum MainMenu {
     /// through its scrollback, and the tab bar.
     private static func makeViewMenu() -> NSMenu {
         let menu = NSMenu(title: "View")
-        menu.addItem(withTitle: "Bigger", action: #selector(TerminalSurfaceView.increaseFontSize(_:)), keyEquivalent: "+")
+        let bigger = add(menu, "font_bigger", "Bigger", #selector(TerminalSurfaceView.increaseFontSize(_:)), "+")
         // ⌘= as well (D3): "+" is a shifted key on US and many other
-        // layouts, and ⌘= is what users press for it. Hidden items take part
-        // in key equivalents only with `allowsKeyEquivalentWhenHidden`.
-        let equals = menu.addItem(withTitle: "Bigger", action: #selector(TerminalSurfaceView.increaseFontSize(_:)), keyEquivalent: "=")
-        equals.isHidden = true
-        equals.allowsKeyEquivalentWhenHidden = true
-        menu.addItem(withTitle: "Smaller", action: #selector(TerminalSurfaceView.decreaseFontSize(_:)), keyEquivalent: "-")
-        menu.addItem(withTitle: "Actual Size", action: #selector(TerminalSurfaceView.resetFontSize(_:)), keyEquivalent: "0")
+        // layouts, and ⌘= is what users press for it.
+        menu.addItem(alias(of: bigger, .init(keyEquivalent: "=", modifiers: .command)))
+        add(menu, "font_smaller", "Smaller", #selector(TerminalSurfaceView.decreaseFontSize(_:)), "-")
+        add(menu, "font_reset", "Actual Size", #selector(TerminalSurfaceView.resetFontSize(_:)), "0")
         menu.addItem(.separator())
         // The scrollback, as in Terminal.app's View menu; ⌘↑ and ⌘↓ page
         // (wave 7 decision). Home and End are ⌘fn← and ⌘fn→ on a laptop.
-        let scrollItems: [(String, Selector, Int)] = [
-            ("Scroll to Top", #selector(TerminalSurfaceView.scrollToTop(_:)), NSHomeFunctionKey),
-            ("Scroll to Bottom", #selector(TerminalSurfaceView.scrollToBottom(_:)), NSEndFunctionKey),
-            ("Page Up", #selector(TerminalSurfaceView.scrollPageUpInHistory(_:)), NSUpArrowFunctionKey),
-            ("Page Down", #selector(TerminalSurfaceView.scrollPageDownInHistory(_:)), NSDownArrowFunctionKey),
+        let scrollItems: [(String, String, Selector, Int)] = [
+            ("scroll_to_top", "Scroll to Top", #selector(TerminalSurfaceView.scrollToTop(_:)), NSHomeFunctionKey),
+            ("scroll_to_bottom", "Scroll to Bottom", #selector(TerminalSurfaceView.scrollToBottom(_:)), NSEndFunctionKey),
+            ("scroll_page_up", "Page Up", #selector(TerminalSurfaceView.scrollPageUpInHistory(_:)), NSUpArrowFunctionKey),
+            ("scroll_page_down", "Page Down", #selector(TerminalSurfaceView.scrollPageDownInHistory(_:)), NSDownArrowFunctionKey),
         ]
-        for (title, action, key) in scrollItems {
-            menu.addItem(withTitle: title, action: action, keyEquivalent: functionKey(key))
+        for (command, title, action, key) in scrollItems {
+            add(menu, command, title, action, functionKey(key))
         }
         menu.addItem(.separator())
         // In View, as in Terminal.app and Safari, where AppKit adds Show All
         // Tabs and Enter Full Screen. It retitles this "Hide Tab Bar" while
         // the bar is shown.
-        menu.addItem(withTitle: "Show Tab Bar", action: #selector(NSWindow.toggleTabBar(_:)), keyEquivalent: "")
+        add(menu, "show_tab_bar", "Show Tab Bar", #selector(NSWindow.toggleTabBar(_:)))
         return menu
     }
 
     private static func makeWindowMenu() -> NSMenu {
         let menu = NSMenu(title: "Window")
-        menu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
-        menu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        add(menu, "minimize", "Minimize", #selector(NSWindow.performMiniaturize(_:)), "m")
+        add(menu, "zoom", "Zoom", #selector(NSWindow.performZoom(_:)))
         menu.addItem(.separator())
         // "{" and "}" are ⇧[ and ⇧]: the menu shows them as ⇧⌘[ and ⇧⌘].
-        menu.addItem(withTitle: "Show Previous Tab", action: #selector(NSWindow.selectPreviousTab(_:)), keyEquivalent: "{")
-        menu.addItem(withTitle: "Show Next Tab", action: #selector(NSWindow.selectNextTab(_:)), keyEquivalent: "}")
-        menu.addItem(withTitle: "Move Tab to New Window", action: #selector(NSWindow.moveTabToNewWindow(_:)), keyEquivalent: "")
-        menu.addItem(withTitle: "Merge All Windows", action: #selector(NSWindow.mergeAllWindows(_:)), keyEquivalent: "")
+        add(menu, "tab_previous", "Show Previous Tab", #selector(NSWindow.selectPreviousTab(_:)), "{")
+        add(menu, "tab_next", "Show Next Tab", #selector(NSWindow.selectNextTab(_:)), "}")
+        add(menu, "move_tab_to_new_window", "Move Tab to New Window", #selector(NSWindow.moveTabToNewWindow(_:)))
+        add(menu, "merge_all_windows", "Merge All Windows", #selector(NSWindow.mergeAllWindows(_:)))
         menu.addItem(submenuItem(makeSelectTabMenu()))
         menu.addItem(.separator())
-        menu.addItem(withTitle: "Bring All to Front", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: "")
+        add(menu, "bring_all_to_front", "Bring All to Front", #selector(NSApplication.arrangeInFront(_:)))
         return menu
     }
 
@@ -125,7 +140,7 @@ enum MainMenu {
         let menu = NSMenu(title: "Help")
         // `openHelp(_:)`, not AppKit's `showHelp(_:)`: NSApplication answers
         // that one first, and there is no help book.
-        menu.addItem(withTitle: "Tessera Help", action: #selector(AppDelegate.openHelp(_:)), keyEquivalent: "?")
+        add(menu, "help", "Tessera Help", #selector(AppDelegate.openHelp(_:)), "?")
         return menu
     }
 
@@ -133,14 +148,123 @@ enum MainMenu {
     private static func makeSelectTabMenu() -> NSMenu {
         let menu = NSMenu(title: "Select Tab")
         for index in 0..<numberedTabs {
-            let item = menu.addItem(
-                withTitle: "Tab \(index + 1)",
-                action: #selector(TerminalWindowController.selectTabAtIndex(_:)),
-                keyEquivalent: "\(index + 1)"
-            )
+            let item = add(
+                menu, "select_tab:\(index + 1)", "Tab \(index + 1)",
+                #selector(TerminalWindowController.selectTabAtIndex(_:)), "\(index + 1)")
             item.tag = index
         }
         return menu
+    }
+
+    /// Adds an item for `command` (its `identifier`) with the registry's
+    /// default key equivalent.
+    @discardableResult
+    private static func add(
+        _ menu: NSMenu, _ command: String, _ title: String, _ action: Selector, _ key: String = "",
+        _ modifiers: NSEvent.ModifierFlags = .command
+    ) -> NSMenuItem {
+        let item = menu.addItem(withTitle: title, action: action, keyEquivalent: key)
+        item.keyEquivalentModifierMask = modifiers
+        item.identifier = NSUserInterfaceItemIdentifier(command)
+        return item
+    }
+
+    /// A hidden alternate of `item` for another chord of its command: the
+    /// same title, action and tag. Hidden items take part in key
+    /// equivalents only with `allowsKeyEquivalentWhenHidden`.
+    private static func alias(of item: NSMenuItem, _ shortcut: TesseraKeymap.MenuShortcut) -> NSMenuItem {
+        let alias = NSMenuItem(title: item.title, action: item.action, keyEquivalent: shortcut.keyEquivalent)
+        alias.keyEquivalentModifierMask = shortcut.modifiers
+        alias.tag = item.tag
+        alias.identifier = NSUserInterfaceItemIdentifier(aliasPrefix + (item.identifier?.rawValue ?? ""))
+        alias.isHidden = true
+        alias.allowsKeyEquivalentWhenHidden = true
+        return alias
+    }
+
+    // MARK: Key map
+
+    /// Gives every item of `bar` whose `identifier` names a command the key
+    /// map's menu chords: the first as its key equivalent (none if the
+    /// command has none, as when `[keys]` rebinds or unbinds its chord), the
+    /// rest as hidden alternates after it. Idempotent: earlier alternates
+    /// are removed first. Items the key map does not name (the ones `AppKit`
+    /// adds) are left alone.
+    static func apply(_ keymap: TesseraKeymap, to bar: NSMenu) {
+        for menu in menus(of: bar) {
+            for item in menu.items where item.identifier?.rawValue.hasPrefix(aliasPrefix) ?? false {
+                menu.removeItem(item)
+            }
+            for item in menu.items {
+                guard let name = item.identifier?.rawValue, let command = keymap.command(named: name) else { continue }
+                item.keyEquivalent = command.menu.first?.keyEquivalent ?? ""
+                item.keyEquivalentModifierMask = command.menu.first?.modifiers ?? []
+                var index = menu.index(of: item)
+                for shortcut in command.menu.dropFirst() {
+                    index += 1
+                    menu.insertItem(alias(of: item, shortcut), at: index)
+                }
+            }
+        }
+    }
+
+    /// The item of `bar` (searched with its submenus) that runs `command`,
+    /// not one of its hidden alternates.
+    static func item(forCommand command: String, in bar: NSMenu?) -> NSMenuItem? {
+        guard let bar else { return nil }
+        let identifier = NSUserInterfaceItemIdentifier(command)
+        for menu in menus(of: bar) {
+            if let item = menu.items.first(where: { $0.identifier == identifier }) { return item }
+        }
+        return nil
+    }
+
+    /// Whether `AppKit` will match `event` to the item of `bar` that runs
+    /// `command` or to one of its hidden alternates: the item's key
+    /// equivalent (as localised, which is what `AppKit` compares) is the
+    /// event's key, ignoring case for a letter, and the modifiers agree
+    /// (Shift aside for a symbol the key types with Shift, as ⌘? from ⇧⌘/).
+    /// Strict: when in doubt it says no, and the caller runs the command
+    /// itself, so it never runs twice or not at all. A keypad key is
+    /// compared as its character, as `AppKit` does.
+    static func keyEquivalent(of command: String, in bar: NSMenu?, matches event: NSEvent) -> Bool {
+        guard let item = item(forCommand: command, in: bar), let menu = item.menu,
+            let typed = event.charactersIgnoringModifiers, !typed.isEmpty
+        else { return false }
+        let relevant: NSEvent.ModifierFlags = [.command, .control, .option, .shift]
+        let flags = event.modifierFlags.intersection(relevant)
+        let names = [command, aliasPrefix + command]
+        return menu.items.contains { candidate in
+            guard let name = candidate.identifier?.rawValue, names.contains(name) else { return false }
+            let key = candidate.keyEquivalent
+            guard !key.isEmpty else { return false }
+            var mask = candidate.keyEquivalentModifierMask.intersection(relevant)
+            if key != key.lowercased() { mask.insert(.shift) }
+            return (key.lowercased() == typed.lowercased() && flags == mask)
+                || (key == typed && flags.subtracting(.shift) == mask.subtracting(.shift))
+        }
+    }
+
+    /// Runs `command` as choosing its menu item would, if the item is
+    /// enabled (validated first, as `AppKit` does for a key equivalent);
+    /// beeps if it is not. A command with no menu item (one a later version
+    /// runs) does nothing.
+    static func run(command: String) {
+        guard let item = MainMenu.item(forCommand: command, in: NSApp.mainMenu), let menu = item.menu else {
+            log.debug("no menu item runs \(command, privacy: .public)")
+            return
+        }
+        menu.update()
+        guard item.isEnabled else {
+            NSSound.beep()
+            return
+        }
+        menu.performActionForItem(at: menu.index(of: item))
+    }
+
+    /// `bar` and every submenu under it, depth first.
+    private static func menus(of bar: NSMenu) -> [NSMenu] {
+        [bar] + bar.items.compactMap(\.submenu).flatMap(menus(of:))
     }
 
     /// The key equivalent for a function key (`NSUpArrowFunctionKey` and

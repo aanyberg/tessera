@@ -367,7 +367,9 @@ impl DevWin {
         };
         match self.app.send_input(id, event) {
             Ok(InputOutcome::Consumed) => window.request_redraw(),
-            Ok(InputOutcome::Ignored) => {}
+            // The development window has no menus to run a bound command
+            // (`[keys]`, or a default chord such as Cmd-T) with.
+            Ok(InputOutcome::Ignored | InputOutcome::Command(_)) => {}
             Err(error) => eprintln!("tessera-devwin: input dropped: {error}"),
         }
     }

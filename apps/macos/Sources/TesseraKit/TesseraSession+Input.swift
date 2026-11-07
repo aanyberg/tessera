@@ -457,6 +457,19 @@ extension TesseraSession {
         }
     }
 
+    /// What ``TesseraSession/handle(key:bindingsOnly:)`` did with a key.
+    public enum KeyOutcome: Sendable, Equatable {
+        /// The core had no use for the key; the frontend may handle it.
+        case ignored
+        /// The core acted on it (sent bytes, ran a `send_text` or `none`
+        /// binding); the frontend must not handle it again.
+        case consumed
+        /// The key is bound to this command (as `[keys]` names it:
+        /// `new_tab`, `select_tab:3`), which the frontend runs. Nothing was
+        /// sent.
+        case command(String)
+    }
+
     // MARK: Calls
 
     /// Sends a key event. Never blocks: the bytes join the session's pending
@@ -486,6 +499,46 @@ extension TesseraSession {
         }
         try TesseraCoreError.check(status)
         return InputOutcome(outcome)
+    }
+
+    /// Runs the key's binding, if `[keys]` or the defaults bind its chord,
+    /// else (unless `bindingsOnly`) sends it as ``send(key:)`` does.
+    ///
+    /// A chord bound to a command returns ``KeyOutcome/command(_:)``; one
+    /// bound to `send_text` queues its bytes and returns to the live screen;
+    /// `none` swallows the key. The release of a bound chord is swallowed
+    /// too. With `bindingsOnly` an unbound key returns
+    /// ``KeyOutcome/ignored`` and sends nothing: for
+    /// `performKeyEquivalent(with:)`, which must leave Command keys the
+    /// map does not bind to the menus.
+    ///
+    /// - Throws: As ``send(key:)``.
+    @MainActor
+    @discardableResult
+    public func handle(key event: KeyEvent, bindingsOnly: Bool = false) throws -> KeyOutcome {
+        var outcome = TESSERA_INPUT_OUTCOME_IGNORED
+        var command = TESSERA_NO_COMMAND
+        let flags = bindingsOnly ? UInt32(TESSERA_HANDLE_KEY_BINDINGS_ONLY) : 0
+        let status: TesseraError
+        if var text = event.text, !text.isEmpty {
+            status = text.withUTF8 { bytes in
+                bytes.withMemoryRebound(to: CChar.self) { chars in
+                    var cEvent = event.cEvent(text: chars.baseAddress, length: chars.count)
+                    return tessera_session_handle_key(core.pointer, id, &cEvent, flags, &outcome, &command)
+                }
+            }
+        } else {
+            var cEvent = event.cEvent(text: nil, length: 0)
+            status = tessera_session_handle_key(core.pointer, id, &cEvent, flags, &outcome, &command)
+        }
+        try TesseraCoreError.check(status)
+        switch outcome {
+        case TESSERA_INPUT_OUTCOME_COMMAND:
+            let names = bridge.commandNames
+            return Int(command) < names.count ? .command(names[Int(command)]) : .ignored
+        case TESSERA_INPUT_OUTCOME_CONSUMED: return .consumed
+        default: return .ignored
+        }
     }
 
     /// Sends a mouse event: a press, a release, or motion with a button held

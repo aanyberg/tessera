@@ -398,6 +398,29 @@ final class TerminalSurfaceViewTests: XCTestCase {
         try await assertBytes([])
     }
 
+    func testKeyEquivalentsTheMapDoesNotBindGoToTheMenus() async throws {
+        // ⌘J is bound to nothing, ⌘T to New Tab, whose menu item runs it:
+        // both are the menus' (the view answers no).
+        XCTAssertFalse(view.performKeyEquivalent(with: key("j", code: 38, [.command])), "unbound")
+        XCTAssertFalse(view.performKeyEquivalent(with: key("t", code: 17, [.command])), "New Tab's item")
+        XCTAssertFalse(
+            view.performKeyEquivalent(with: key("T", ignoring: "t", code: 17, [.command, .shift])), "unbound")
+        // ⌘D is a command a later version runs (split_right): no item, so the
+        // view swallows it rather than let it reach the shell as `CSI u`.
+        XCTAssertTrue(view.performKeyEquivalent(with: key("d", code: 2, [.command])), "a planned command")
+        // Not the first responder: nothing is resolved.
+        window.makeFirstResponder(nil)
+        XCTAssertFalse(view.performKeyEquivalent(with: key("d", code: 2, [.command])), "another view's key")
+        // No menu takes the unbound ones here, so AppKit sends them on to
+        // `keyDown`: they go up the responder chain, never to the session.
+        _ = window.makeFirstResponder(view)
+        for unbound in [key("j", code: 38, [.command]), key("T", ignoring: "t", code: 17, [.command, .shift])] {
+            press(unbound) { _ in XCTFail("Command skips the input system") }
+        }
+        XCTAssertEqual(view.sentKeys, [], "no Command chord is encoded")
+        try await assertBytes([])
+    }
+
     func testControlLetterSendsItsControlByte() async throws {
         press(key("\u{3}", ignoring: "c", code: 8, [.control])) { _ in XCTFail("Control skips the input system") }
         try await assertBytes([0x03])
