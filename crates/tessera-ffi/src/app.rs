@@ -322,3 +322,35 @@ pub unsafe extern "C" fn tessera_app_config_path(
         Error::Ok
     })
 }
+
+/// Stores `[appearance] dim_inactive_panes` of the configuration in effect
+/// in `*out`: how much the window darkens the panes of a split tab that do
+/// not have the keyboard focus, already clamped to 0.0 (off) ..= 0.8.
+/// Read it at start and again on `on_config_applied`, after which it holds
+/// the new value.
+///
+/// Returns `TESSERA_ERROR_NULL_POINTER` if `app` or `out` is `NULL`; `*out`
+/// is set to 0.0 on failure when `out` is not `NULL`.
+///
+/// # Safety
+///
+/// `app` must be `NULL` or a live handle. `out` must be `NULL` or point to
+/// a writable `float`. Main thread only, like every `tessera_app_*` call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_app_dim_inactive_panes(app: *const App, out: *mut f32) -> Error {
+    ffi_guard!("tessera_app_dim_inactive_panes", {
+        if out.is_null() {
+            return Error::NullPointer;
+        }
+        // SAFETY: non-null and writable per the contract.
+        unsafe { out.write(0.0) };
+        // SAFETY: the caller passes NULL or a live handle.
+        let Some(app) = (unsafe { App::from_ptr(app) }) else {
+            return Error::NullPointer;
+        };
+        let dim = app.core.config().appearance.dim_inactive_panes;
+        // SAFETY: as above.
+        unsafe { out.write(dim) };
+        Error::Ok
+    })
+}

@@ -649,13 +649,21 @@ final class PaneTests: XCTestCase {
             ("Above", #selector(TerminalWindowController.selectPaneAbove(_:)), NSUpArrowFunctionKey),
             ("Below", #selector(TerminalWindowController.selectPaneBelow(_:)), NSDownArrowFunctionKey),
         ]
-        XCTAssertEqual(select.items.map(\.title), expected.map(\.0))
-        for (item, (title, action, key)) in zip(select.items, expected) {
+        let arrows = Array(select.items.prefix(expected.count))
+        XCTAssertEqual(arrows.map(\.title), expected.map(\.0))
+        for (item, (title, action, key)) in zip(arrows, expected) {
             XCTAssertEqual(item.action, action, title)
             XCTAssertEqual(item.keyEquivalent, MainMenu.functionKey(key), title)
             XCTAssertEqual(item.keyEquivalentModifierMask, [.command, .option], title)
             XCTAssertNil(item.target, "\(title) goes up the responder chain")
         }
+        // Then ⌘[ and ⌘] through the panes in reading order (#38b).
+        let cycle = select.items.dropFirst(expected.count + 1).map { ($0.title, authoredKeyEquivalent(of: $0).key, $0.action) }
+        XCTAssertEqual(cycle.map(\.0), ["Previous", "Next"])
+        XCTAssertEqual(cycle.map(\.1), ["[", "]"])
+        XCTAssertEqual(
+            cycle.map(\.2),
+            [#selector(TerminalWindowController.selectPreviousPane(_:)), #selector(TerminalWindowController.selectNextPane(_:))])
         // Enabled only with a pane to move to.
         let controller = try openTab()
         let left = try XCTUnwrap(select.items.first)
@@ -1146,6 +1154,578 @@ final class PaneTests: XCTestCase {
                 throw PollTimedOut(description: "timed out after \(timeout): \(description)")
             }
             try await Task.sleep(for: .milliseconds(20))
+        }
+    }
+}
+
+// MARK: - Pane polish (#38b)
+
+/// Equalising and the state file's layouts, without AppKit.
+extension PaneTreeTests {
+    /// L | (R1 / R2) gets halves; L | M | R thirds; a double-clicked
+    /// divider equalises only its split.
+    func testEqualizingGivesEveryPaneAnEqualShareAlongEachSplit() {
+        var stacked = Tree(0)
+        stacked.split(0, .right, adding: 1)
+        stacked.split(1, .below, adding: 2)
+        stacked.setRatios([0.2, 0.9])
+        stacked.equalize()
+        XCTAssertEqual(stacked.root.splits.map(\.ratio), [0.5, 0.5])
+
+        var row = Tree(0)
+        row.split(0, .right, adding: 1)
+        row.split(1, .right, adding: 2)
+        row.setRatios([0.8, 0.1])
+        row.equalize()
+        let space = CGRect(x: 0, y: 0, width: 902, height: 300)
+        let widths = row.frames(in: space, divider: 1).map(\.frame.width)
+        XCTAssertEqual(widths.count, 3)
+        XCTAssertLessThanOrEqual(widths.max()! - widths.min()!, 1, "thirds: \(widths)")
+
+        var one = Tree(0)
+        one.split(0, .right, adding: 1)
+        one.split(1, .right, adding: 2)
+        one.setRatios([0.8, 0.1])
+        one.equalize(splitAt: 1)
+        XCTAssertEqual(one.root.splits.map(\.ratio), [0.8, 0.5], "only the inner split")
+        one.equalize(splitAt: 7)
+        XCTAssertEqual(one.root.splits.map(\.ratio), [0.8, 0.5], "no such split")
+    }
+
+    func testALayoutKeepsTheTreesShapeAndRatios() throws {
+        var tree = Tree(0)
+        tree.split(0, .right, adding: 1)
+        tree.split(1, .below, adding: 2)
+        tree.setRatios([0.3, 0.6])
+        XCTAssertEqual(tree.depth, 2)
+        let layout = PaneLayout(tree)
+        XCTAssertEqual(layout.leafCount, 3)
+        XCTAssertEqual(layout.depth, 2)
+        XCTAssertTrue(layout.isRestorable)
+        let back = try XCTUnwrap(layout.tree(leaves: ["a", "b", "c"]))
+        XCTAssertEqual(back.leaves, ["a", "b", "c"])
+        XCTAssertEqual(back.root.splits.map(\.direction), [.right, .below])
+        XCTAssertEqual(back.root.splits.map(\.ratio), [0.3, 0.6])
+        XCTAssertNil(layout.tree(leaves: ["a", "b"]), "a pane short")
+        let json = String(decoding: try JSONEncoder().encode(layout), as: UTF8.self)
+        XCTAssertTrue(json.contains(#""direction":"right""#), json)
+        XCTAssertEqual(try JSONDecoder().decode(PaneLayout.self, from: Data(json.utf8)), layout)
+    }
+}
+
+extension PaneTests {
+    // MARK: Maximizing
+
+    /// ⌘⇧↩ on a 2x2 tab: the focused pane fills the tab; the others stay
+    /// open, their sessions still read output, and they are not resized,
+    /// even while the window is; ⌘⇧↩ again puts every pane back at the
+    /// exact frame it had.
+    func testMaximizingAPaneKeepsTheOthersAliveAndUnresizedAndBringsThemBackExactly() async throws {
+        let (controller, panes) = try openTwoByTwo()
+        let window = try XCTUnwrap(controller.window)
+        let container = controller.paneContainer
+        controller.focus(panes[3])
+        let frames = panes.map { frame(of: $0, in: controller) }
+        let resizes = panes.map(\.view.coreResizeCount)
+
+        controller.toggleZoomPane(nil)
+        container.layoutSubtreeIfNeeded()
+        XCTAssertTrue(controller.isZoomed)
+        XCTAssertEqual(frame(of: panes[3], in: controller), container.bounds, "the focused pane fills the tab")
+        XCTAssertFalse(panes[3].view.isHiddenOrHasHiddenAncestor)
+        XCTAssertTrue(window.firstResponder === panes[3].view, "and keeps the keyboard")
+        for index in 0..<3 {
+            XCTAssertTrue(panes[index].view.isHiddenOrHasHiddenAncestor, "pane \(index) is hidden")
+            XCTAssertTrue(panes[index].view.window === window, "pane \(index) stays in the tab")
+        }
+
+        // The window resizes while zoomed: the hidden panes keep their size.
+        window.setContentSize(NSSize(width: 1000, height: 700))
+        container.layoutSubtreeIfNeeded()
+        XCTAssertEqual(frame(of: panes[3], in: controller), container.bounds, "the maximized pane follows the tab")
+        for index in 0..<3 {
+            XCTAssertEqual(panes[index].view.frame.size, frames[index].size, "pane \(index) is not resized")
+            XCTAssertEqual(panes[index].view.coreResizeCount, resizes[index], "pane \(index)'s grid stays")
+        }
+        // A hidden pane's shell still runs and its output is read.
+        try panes[0].session.write(Array(#"printf '\033]0;hidden\007'"#.utf8) + [0x0a])
+        try await waitUntil("the hidden pane's title arrives") { panes[0].title == "hidden" }
+        XCTAssertNoThrow(try panes[1].session.foregroundProcess(), "a hidden pane's session is open")
+
+        window.setContentSize(NSSize(width: 1200, height: 800))
+        container.layoutSubtreeIfNeeded()
+        controller.toggleZoomPane(nil)
+        container.layoutSubtreeIfNeeded()
+        XCTAssertFalse(controller.isZoomed)
+        XCTAssertEqual(panes.map { frame(of: $0, in: controller) }, frames, "every pane is back at its frame")
+        XCTAssertTrue(panes.allSatisfy { !$0.view.isHiddenOrHasHiddenAncestor })
+        XCTAssertTrue(window.firstResponder === panes[3].view)
+        for index in 0..<3 {
+            XCTAssertEqual(panes[index].view.coreResizeCount, resizes[index], "pane \(index) came back at its grid")
+        }
+    }
+
+    /// A layout held by a clamp (the left pane's larger font keeps it above
+    /// its ratio's share): maximizing either pane leaves the other's frame
+    /// and grid alone, a font change of the maximized pane too, and showing
+    /// every pane again brings back the exact frames.
+    func testMaximizingAPaneOfAClampedLayoutLeavesTheOthersAlone() throws {
+        let controller = try openTab(NSSize(width: 400, height: 400))
+        let left = controller.focusedPane
+        let right = try split(controller, .right)
+        try skipUnlessAttached(controller)
+        let container = controller.paneContainer
+        controller.focus(left)
+        for _ in 0..<20 { left.view.increaseFontSize(nil) }
+        container.layoutSubtreeIfNeeded()
+        let frames = [left, right].map { frame(of: $0, in: controller) }
+        XCTAssertGreaterThan(frames[0].width, frames[1].width + 1, "the clamp holds the left pane above half")
+
+        for (shown, hidden) in [(left, right), (right, left)] {
+            let resizes = [left, right].map(\.view.coreResizeCount)
+            let hiddenIndex = hidden === left ? 0 : 1
+            controller.focus(shown)
+            XCTAssertTrue(controller.toggleZoom())
+            container.layoutSubtreeIfNeeded()
+            XCTAssertEqual(hidden.view.frame.size, frames[hiddenIndex].size, "the hidden pane keeps its frame")
+            XCTAssertEqual(hidden.view.coreResizeCount, resizes[hiddenIndex], "and its grid")
+            if shown === left {
+                // The clamp comes from the maximized pane: a font change of
+                // it lays nothing hidden out.
+                left.view.decreaseFontSize(nil)
+                container.layoutSubtreeIfNeeded()
+                XCTAssertEqual(right.view.frame.size, frames[1].size, "a font change of the maximized pane")
+                XCTAssertEqual(right.view.coreResizeCount, resizes[1])
+                left.view.increaseFontSize(nil)
+            }
+            XCTAssertTrue(controller.toggleZoom())
+            container.layoutSubtreeIfNeeded()
+            XCTAssertEqual([left, right].map { frame(of: $0, in: controller) }, frames, "every pane is back at its frame")
+            XCTAssertEqual(hidden.view.coreResizeCount, resizes[hiddenIndex], "the hidden pane was never resized")
+        }
+    }
+
+    /// A split, a close, a focus move, equalising or a new tab show every
+    /// pane first.
+    func testSplitCloseFocusMovesAndNewTabsShowEveryPaneFirst() throws {
+        let (controller, panes) = try openTwoByTwo()
+        let readingOrder = controller.panes
+        let container = controller.paneContainer
+        func zoom(_ pane: Pane) {
+            controller.focus(pane)
+            XCTAssertTrue(controller.toggleZoom())
+            XCTAssertTrue(container.zoomedPane === pane)
+        }
+        zoom(panes[0])
+        controller.selectPaneRight(nil)
+        XCTAssertFalse(controller.isZoomed, "⌘⌥→")
+        XCTAssertTrue(controller.focusedPane === panes[1])
+
+        zoom(panes[0])
+        controller.selectNextPane(nil)
+        XCTAssertFalse(controller.isZoomed, "⌘]")
+        XCTAssertTrue(controller.focusedPane === panes[2], "the next in reading order")
+        controller.selectPreviousPane(nil)
+        XCTAssertTrue(controller.focusedPane === panes[0])
+        controller.selectPreviousPane(nil)
+        XCTAssertTrue(controller.focusedPane === panes[3], "wrapping around")
+
+        zoom(panes[0])
+        controller.focus(panes[0])
+        XCTAssertTrue(controller.isZoomed, "focusing the maximized pane keeps it")
+        controller.focus(panes[2])
+        XCTAssertFalse(controller.isZoomed, "focusing another")
+
+        zoom(panes[3])
+        let added = try split(controller, .right)
+        XCTAssertFalse(controller.isZoomed, "a split")
+        XCTAssertTrue(controller.focusedPane === added)
+        XCTAssertTrue(controller.panes.allSatisfy { !$0.view.isHiddenOrHasHiddenAncestor })
+
+        zoom(added)
+        controller.closeFocusedPane(nil)
+        XCTAssertFalse(controller.isZoomed, "closing the maximized pane")
+        XCTAssertEqual(controller.panes, readingOrder)
+
+        zoom(panes[1])
+        controller.session(panes[2].session, didExitWithCode: 0, signal: 0)
+        XCTAssertFalse(controller.isZoomed, "a hidden pane closing")
+        XCTAssertEqual(controller.panes, [panes[0], panes[1], panes[3]])
+        XCTAssertTrue(controller.panes.allSatisfy { !$0.view.isHiddenOrHasHiddenAncestor })
+
+        zoom(panes[1])
+        controller.equalizePanes(nil)
+        XCTAssertFalse(controller.isZoomed, "equalising")
+
+        zoom(panes[1])
+        let tab = try appDelegate.newTab(in: try XCTUnwrap(controller.window))
+        XCTAssertFalse(controller.isZoomed, "a new tab")
+        XCTAssertFalse(tab.isZoomed)
+    }
+
+    func testMaximizePaneIsAShellMenuItemCheckedWhileAPaneIs() throws {
+        let item = try XCTUnwrap(MainMenu.item(forCommand: "zoom_pane", in: NSApp.mainMenu))
+        XCTAssertEqual(item.title, "Maximize Pane")
+        XCTAssertEqual(item.action, #selector(TerminalWindowController.toggleZoomPane(_:)))
+        XCTAssertEqual(authoredKeyEquivalent(of: item).key, "\r")
+        XCTAssertEqual(item.keyEquivalentModifierMask, [.command, .shift])
+        let equalize = try XCTUnwrap(MainMenu.item(forCommand: "equalize_panes", in: NSApp.mainMenu))
+        XCTAssertEqual(equalize.title, "Equalize Panes")
+        let controller = try openTab()
+        XCTAssertFalse(controller.validateMenuItem(item), "one pane")
+        XCTAssertFalse(controller.validateMenuItem(equalize), "one pane")
+        XCTAssertFalse(controller.toggleZoom(), "a lone pane is not maximized")
+        _ = try split(controller, .right)
+        XCTAssertTrue(controller.validateMenuItem(item))
+        XCTAssertEqual(item.state, .off)
+        XCTAssertTrue(controller.validateMenuItem(equalize))
+        controller.toggleZoomPane(nil)
+        XCTAssertTrue(controller.validateMenuItem(item))
+        XCTAssertEqual(item.state, .on, "checked while a pane is maximized")
+        controller.toggleZoomPane(nil)
+        XCTAssertTrue(controller.validateMenuItem(item))
+        XCTAssertEqual(item.state, .off)
+    }
+
+    // MARK: Dimming
+
+    /// The dim views over a container's panes, by pane.
+    private func shades(_ controller: TerminalWindowController) -> [PaneDimView?] {
+        controller.panes.map { pane in pane.view.subviews.lazy.compactMap { $0 as? PaneDimView }.first }
+    }
+
+    func testOnlyUnfocusedPanesOfASplitTabAreDimmed() throws {
+        defer { appDelegate.paneDimming = 0 }
+        appDelegate.paneDimming = 0.4
+        let controller = try openTab()
+        XCTAssertEqual(controller.paneContainer.inactivePaneDimming, 0.4, "a new tab takes the amount")
+        XCTAssertEqual(shades(controller).compactMap { $0 }.count, 0, "a lone pane is never dimmed")
+        let left = controller.focusedPane
+        let right = try split(controller, .right)
+        var current = shades(controller)
+        XCTAssertNotNil(current[0], "the unfocused pane")
+        XCTAssertNil(current[1], "not the focused one")
+        XCTAssertEqual(current[0]?.alphaValue ?? 0, 0.4, accuracy: 0.001)
+        XCTAssertTrue(left.view.subviews.last is PaneDimView, "above the pane's own views")
+        XCTAssertEqual(current[0]?.frame, left.view.bounds)
+
+        // Clicks go through the shade to the pane.
+        let window = try XCTUnwrap(controller.window)
+        let point = left.view.convert(NSPoint(x: 30, y: 30), to: nil)
+        let hit = window.contentView?.hitTest(window.contentView!.convert(point, from: nil))
+        XCTAssertFalse(hit is PaneDimView, "\(String(describing: hit))")
+        XCTAssertTrue(hit === left.view || hit?.isDescendant(of: left.view) == true, "\(String(describing: hit))")
+
+        controller.focus(left)
+        current = shades(controller)
+        XCTAssertNil(current[0], "the shade follows the focus")
+        XCTAssertNotNil(current[1])
+
+        controller.toggleZoomPane(nil)
+        XCTAssertNil(shades(controller)[0], "the maximized pane is focused")
+
+        controller.toggleZoomPane(nil)
+        appDelegate.paneDimming = 0
+        XCTAssertEqual(shades(controller).compactMap { $0 }.count, 0, "0 draws nothing")
+        appDelegate.paneDimming = 5
+        XCTAssertEqual(shades(controller)[1]?.alphaValue ?? 0, 0.8, accuracy: 0.001, "at most 0.8")
+        appDelegate.paneDimming = .nan
+        XCTAssertEqual(shades(controller).compactMap { $0 }.count, 0, "not a number draws nothing")
+        appDelegate.paneDimming = 0.3
+        XCTAssertNotNil(shades(controller)[1])
+
+        controller.closeFocusedPane(nil)
+        XCTAssertEqual(controller.panes, [right])
+        XCTAssertEqual(shades(controller).compactMap { $0 }.count, 0, "back to one pane: none")
+    }
+
+    /// A configuration the core applies is read again (live reload): the
+    /// app delegate's path, on the app's own core.
+    func testAnAppliedConfigurationReadsTheDimmingAgain() throws {
+        defer { appDelegate.paneDimming = 0 }
+        _ = try openTab()
+        appDelegate.paneDimming = 0.123
+        let reload = try XCTUnwrap(appDelegate.router.onConfigurationApplied)
+        reload()
+        XCTAssertNotEqual(appDelegate.paneDimming, 0.123, "read from the core again")
+        XCTAssertTrue((0...0.8).contains(appDelegate.paneDimming))
+    }
+
+    // MARK: Equalising and dividers
+
+    func testDoubleClickingADividerEqualisesItsSplit() throws {
+        let controller = try openTab()
+        let left = controller.focusedPane
+        let right = try split(controller, .right)
+        let below = try split(controller, .below)
+        let outer = try XCTUnwrap(controller.paneContainer.subviews.first as? PaneSplitView)
+        let inner = try XCTUnwrap(outer.subviews.last as? PaneSplitView)
+        outer.setPosition(300, ofDividerAt: 0)
+        inner.setPosition(200, ofDividerAt: 0)
+        controller.paneContainer.layoutSubtreeIfNeeded()
+        let innerHeights = [frame(of: right, in: controller).height, frame(of: below, in: controller).height]
+
+        let window = try XCTUnwrap(controller.window)
+        let divider = outer.convert(NSPoint(x: 300.5, y: 100), to: nil)
+        let doubleClick = try XCTUnwrap(
+            NSEvent.mouseEvent(
+                with: .leftMouseDown, location: divider, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 2, pressure: 1))
+        // The release, in case the click were tracked as a drag (it should
+        // not be): AppKit's tracking then ends at once instead of hanging.
+        NSApp.postEvent(
+            try XCTUnwrap(
+                NSEvent.mouseEvent(
+                    with: .leftMouseUp, location: divider, modifierFlags: [], timestamp: 0,
+                    windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 2, pressure: 0)),
+            atStart: false)
+        outer.mouseDown(with: doubleClick)
+        controller.paneContainer.layoutSubtreeIfNeeded()
+        let cell = PaneContainerView.fallbackCellSize
+        XCTAssertEqual(
+            frame(of: left, in: controller).width, frame(of: right, in: controller).width, accuracy: max(1, cell.width))
+        XCTAssertEqual(
+            [frame(of: right, in: controller).height, frame(of: below, in: controller).height], innerHeights,
+            "the other split keeps its ratio")
+        XCTAssertEqual(controller.paneContainer.tree.root.splits[0].ratio, 0.5)
+
+        controller.equalizePanes(nil)
+        controller.paneContainer.layoutSubtreeIfNeeded()
+        XCTAssertEqual(controller.paneContainer.tree.root.splits.map(\.ratio), [0.5, 0.5])
+        XCTAssertEqual(
+            frame(of: right, in: controller).height, frame(of: below, in: controller).height, accuracy: 1,
+            "Equalize Panes sets every split")
+    }
+
+    /// #315.3: a 100-step divider drag through AppKit's own tracking
+    /// (`PaneSplitView.mouseDown` follows the posted drags until the posted
+    /// release) passes each pane's size to the core at most once a display
+    /// refresh, and its final size at the end, as a live window resize does.
+    func testADividerDragThroughMouseDownCoalescesTheResizes() throws {
+        let controller = try openTab()
+        let left = controller.focusedPane
+        let right = try split(controller, .right)
+        try skipUnlessAttached(controller)
+        let window = try XCTUnwrap(controller.window)
+        let outer = try XCTUnwrap(controller.paneContainer.subviews.first as? PaneSplitView)
+        let start = frame(of: left, in: controller).maxX + 0.5
+        func event(_ type: NSEvent.EventType, x: CGFloat) throws -> NSEvent {
+            try XCTUnwrap(
+                NSEvent.mouseEvent(
+                    with: type, location: outer.convert(NSPoint(x: x, y: 200), to: nil), modifierFlags: [],
+                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil,
+                    eventNumber: 0, clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1))
+        }
+        for step in 1...100 {
+            NSApp.postEvent(try event(.leftMouseDragged, x: start - CGFloat(2 * step)), atStart: false)
+        }
+        NSApp.postEvent(try event(.leftMouseUp, x: start - 200), atStart: false)
+        let before = [left, right].map(\.view.coreResizeCount)
+        let ticks = [left, right].map(\.view.tickCount)
+        outer.mouseDown(with: try event(.leftMouseDown, x: start))
+        controller.paneContainer.layoutSubtreeIfNeeded()
+        for (index, pane) in [left, right].enumerated() {
+            let resizes = pane.view.coreResizeCount - before[index]
+            let refreshes = pane.view.tickCount - ticks[index]
+            XCTAssertGreaterThan(resizes, 0, "pane \(index) was resized")
+            XCTAssertLessThanOrEqual(resizes, refreshes + 1, "pane \(index): \(resizes) resizes, \(refreshes) refreshes")
+            XCTAssertEqual(pane.view.metrics?.widthPx, pane.view.pixelSize.widthPx, "pane \(index) ends at its size")
+        }
+        XCTAssertLessThan(frame(of: left, in: controller).maxX, start - 50, "the drag moved the divider")
+    }
+
+    // MARK: ⌘W's title (#315.2)
+
+    func testCommandWSaysClosePaneWhileTheTabHasSeveralPanes() throws {
+        let item = try XCTUnwrap(MainMenu.item(forCommand: "close_tab", in: NSApp.mainMenu))
+        defer { item.title = PaneContainerView.closeTabTitle }
+        let controller = try openTab()
+        let window = try XCTUnwrap(controller.window)
+        /// Validates `item` as AppKit does: the first object up the
+        /// responder chain from the pane that answers its action.
+        func validate() -> Bool {
+            var responder: NSResponder? = window.firstResponder
+            while let current = responder, !current.responds(to: item.action) {
+                responder = current.nextResponder
+            }
+            return (responder as? any NSMenuItemValidation)?.validateMenuItem(item) ?? false
+        }
+        XCTAssertTrue(validate())
+        XCTAssertEqual(item.title, "Close Tab", "one pane")
+        _ = try split(controller, .right)
+        XCTAssertTrue(validate())
+        XCTAssertEqual(item.title, "Close Pane")
+        controller.windowDidResignKey(Notification(name: NSWindow.didResignKeyNotification, object: window))
+        XCTAssertEqual(item.title, "Close Tab", "another window's menu says Close Tab")
+        XCTAssertTrue(validate())
+        XCTAssertEqual(item.title, "Close Pane")
+        controller.closeFocusedPane(nil)
+        XCTAssertTrue(validate())
+        XCTAssertEqual(item.title, "Close Tab", "back to one pane")
+        _ = try split(controller, .below)
+        XCTAssertTrue(validate())
+        window.close()
+        XCTAssertEqual(item.title, "Close Tab", "the tab closed")
+    }
+
+    // MARK: Releasing and flooding a maximized, dimmed tab
+
+    func testClosingAMaximizedDimmedTabReleasesEveryPane() async throws {
+        struct WeakRef {
+            weak var object: AnyObject?
+        }
+        defer { appDelegate.paneDimming = 0 }
+        appDelegate.paneDimming = 0.5
+        var weakPanes: [WeakRef] = []
+        weak var weakController: TerminalWindowController?
+        weak var weakContainer: PaneContainerView?
+        weak var weakClosed: Pane?
+        try autoreleasepool {
+            let (controller, panes) = try openTwoByTwo()
+            weakController = controller
+            weakContainer = controller.paneContainer
+            for pane in panes {
+                weakPanes += [WeakRef(object: pane), WeakRef(object: pane.view), WeakRef(object: pane.session)]
+            }
+            // A maximized pane closed: released too, before anything else
+            // (a focus move would clear what still held it).
+            controller.focus(panes[3])
+            controller.toggleZoomPane(nil)
+            weakClosed = panes[3]
+            controller.closeFocusedPane(nil)
+        }
+        try? await waitUntil("the closed maximized pane is freed") { weakClosed == nil }
+        XCTAssertNil(weakClosed, "the maximized pane that closed")
+        try autoreleasepool {
+            let controller = try XCTUnwrap(weakController)
+            controller.focus(controller.panes[0])
+            controller.toggleZoomPane(nil)
+            XCTAssertTrue(controller.isZoomed)
+            controller.focusedPane.view.inputContext?.activate()
+        }
+        autoreleasepool { weakController?.window?.close() }
+        try? await waitUntil("the closed tab's objects are freed") {
+            weakController == nil && weakContainer == nil && weakPanes.allSatisfy { $0.object == nil }
+        }
+        XCTAssertNil(weakController, "controller")
+        XCTAssertNil(weakContainer, "container")
+        XCTAssertEqual(weakPanes.compactMap(\.object).count, 0, "panes, views and sessions")
+    }
+
+    /// The standing flood check on a maximized tab: `yes` in the maximized
+    /// pane and in a hidden one. Without resizing, memory stays bounded;
+    /// while the window resizes, the main actor keeps up, the hidden pane is
+    /// never resized, and closing the tab is quick.
+    func testAFloodInAMaximizedTabStaysBoundedAndClosesQuickly() async throws {
+        defer { appDelegate.paneDimming = 0 }
+        appDelegate.paneDimming = 0.5
+        let controller = try openTab()
+        let shown = controller.focusedPane
+        let hidden = try split(controller, .right)
+        controller.focus(shown)
+        controller.toggleZoomPane(nil)
+        let window = try XCTUnwrap(controller.window)
+        for pane in [shown, hidden] {
+            try await start("yes", in: pane)
+        }
+        let hiddenSize = hidden.view.frame.size
+        let hiddenResizes = hidden.view.coreResizeCount
+
+        // Phase 1, the flood at a fixed size: memory. A fixed 8 s warm-up
+        // first, long enough for both panes' scrollback to fill at CI speed
+        // (where real rendering slows the flood, the footprint still rises
+        // 3-4 MB/s after 15 s, so no plateau check can pass there). The
+        // baseline is the warm-up's highest footprint, and the next 5 s
+        // must not grow past it by the budget.
+        var baseline: UInt64 = 0
+        let warmUpEnd = ContinuousClock.now + .seconds(8)
+        while ContinuousClock.now < warmUpEnd {
+            try await Task.sleep(for: .milliseconds(20))
+            baseline = max(baseline, Self.physFootprint())
+        }
+        var peak = baseline
+        let floodEnd = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < floodEnd {
+            try await Task.sleep(for: .milliseconds(20))
+            peak = max(peak, Self.physFootprint())
+        }
+        let growthMB = Double(peak - baseline) / 1_048_576
+        XCTAssertLessThan(growthMB, 100, "footprint grew \(growthMB) MB during the flood")
+
+        // Phase 2, the flood while the window resizes: what a maximized tab
+        // adds, not memory. Resizing a rendering window saw-tooths the
+        // footprint on CI whether or not a tab is maximized (#326), so no
+        // footprint budget here.
+        let sizes = [NSSize(width: 900, height: 600), NSSize(width: 1200, height: 800), NSSize(width: 1000, height: 700)]
+        var step = 0
+        var worstLag: Duration = .zero
+        let resizeEnd = ContinuousClock.now + .seconds(2)
+        while ContinuousClock.now < resizeEnd {
+            step += 1
+            window.setContentSize(sizes[step % sizes.count])
+            controller.paneContainer.layoutSubtreeIfNeeded()
+            let start = ContinuousClock.now
+            try await Task.sleep(for: .milliseconds(20))
+            worstLag = max(worstLag, ContinuousClock.now - start - .milliseconds(20))
+        }
+        XCTAssertGreaterThan(step, sizes.count, "the window resized")
+        XCTAssertEqual(hidden.view.frame.size, hiddenSize, "the hidden pane is not resized")
+        XCTAssertEqual(hidden.view.coreResizeCount, hiddenResizes)
+        XCTAssertTrue(hidden.view.isHiddenOrHasHiddenAncestor, "the hidden pane stays hidden")
+        XCTAssertTrue(controller.isZoomed)
+
+        let closeStart = ContinuousClock.now
+        window.close()
+        try await waitUntil("the tab closed") { appDelegate.windowControllers.isEmpty }
+        let closeTime = ContinuousClock.now - closeStart
+        print("maximized flood: growth \(Int(growthMB)) MB, \(step) resizes, worst lag \(worstLag), close \(closeTime)")
+        XCTAssertLessThan(worstLag, .milliseconds(500), "main actor lagged \(worstLag)")
+        XCTAssertLessThan(closeTime, .seconds(3), "closing took \(closeTime)")
+    }
+}
+
+/// `[appearance] dim_inactive_panes` through the wrapper, on a core of the
+/// test's own: read at start and again after an edit is applied, clamped.
+@MainActor
+final class PaneDimmingConfigTests: XCTestCase {
+    private var dir: URL!
+    private var previous: String?
+    private var core: TesseraApp?
+
+    override func setUp() async throws {
+        dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-pane-dim-\(UUID().uuidString)")
+        previous = ProcessInfo.processInfo.environment["TESSERA_CONFIG_DIR"]
+    }
+
+    override func tearDown() async throws {
+        core?.shutdown()
+        core = nil
+        if let previous { setenv("TESSERA_CONFIG_DIR", previous, 1) } else { unsetenv("TESSERA_CONFIG_DIR") }
+        try? FileManager.default.removeItem(at: dir)
+    }
+
+    func testTheDimmingFollowsTheConfigurationLive() async throws {
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let file = dir.appendingPathComponent("config.toml")
+        try "[appearance]\ndim_inactive_panes = 0.25\n".write(to: file, atomically: true, encoding: .utf8)
+        setenv("TESSERA_CONFIG_DIR", dir.path, 1)
+        let core = try TesseraApp()
+        self.core = core
+        let router = SessionRouter()
+        core.delegate = router
+        var applied = 0
+        router.onConfigurationApplied = { applied += 1 }
+        XCTAssertEqual(try core.dimInactivePanes(), 0.25)
+        try "[appearance]\ndim_inactive_panes = 3.0\n".write(to: file, atomically: true, encoding: .utf8)
+        let deadline = ContinuousClock.now + .seconds(10)
+        while applied == 0, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertGreaterThan(applied, 0, "on_config_applied reached the router")
+        XCTAssertEqual(try core.dimInactivePanes(), 0.8, "clamped")
+        core.shutdown()
+        XCTAssertThrowsError(try core.dimInactivePanes()) {
+            XCTAssertEqual($0 as? TesseraCoreError, .nullPointer)
         }
     }
 }

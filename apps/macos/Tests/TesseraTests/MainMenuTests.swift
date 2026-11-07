@@ -118,6 +118,10 @@ final class MainMenuTests: XCTestCase {
             title: "Split Below", key: "d", modifiers: [.command, .shift],
             action: #selector(TerminalWindowController.splitPaneBelow(_:))),
         Item(title: "Select Pane", action: #selector(NSMenu.submenuAction(_:))),
+        Item(
+            title: "Maximize Pane", key: "\r", modifiers: [.command, .shift],
+            action: #selector(TerminalWindowController.toggleZoomPane(_:))),
+        Item(title: "Equalize Panes", action: #selector(TerminalWindowController.equalizePanes(_:))),
     ]
 
     private static let editItems: [Item] = [
@@ -312,7 +316,7 @@ final class MainMenuTests: XCTestCase {
         // (a chord without Command, which no menu matches).
         MainMenu.run(command: "settings")
         XCTAssertEqual(events, ["create", "open \(configFile.path)"])
-        MainMenu.run(command: "split_right")
+        MainMenu.run(command: "copy_mode")
         MainMenu.run(command: "no_such_command")
         XCTAssertEqual(events.count, 2, "a command without an item does nothing")
     }

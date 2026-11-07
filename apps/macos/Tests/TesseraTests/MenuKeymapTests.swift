@@ -77,14 +77,9 @@ final class MenuKeymapTests: XCTestCase {
             }
         }
         walk(bar)
-        XCTAssertEqual(names.count, 41, "\(names)")
-        // The pane items (ADR 0035) keep their hardcoded key equivalents until
-        // the key map gains pane commands (#317).
-        XCTAssertEqual(
-            unmapped, [
-                "splitPaneRight:", "splitPaneBelow:", "selectPaneLeft:", "selectPaneRight:", "selectPaneAbove:",
-                "selectPaneBelow:",
-            ], "\(unmapped)")
+        // 41, and the ten pane items (ADR 0035, #38b).
+        XCTAssertEqual(names.count, 51, "\(names)")
+        XCTAssertEqual(unmapped, [], "\(unmapped)")
         for name in names {
             XCTAssertNotNil(keymap.command(named: name), "\(name) is a command")
             XCTAssertNotEqual(keymap.command(named: name)?.owner, .planned, "\(name) runs")

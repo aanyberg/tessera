@@ -47,6 +47,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var cascadePoint = NSPoint.zero
     /// A coalesced save of the window state is queued.
     private var windowStateSavePending = false
+    /// `[appearance] dim_inactive_panes` as last read from the core, given to
+    /// every tab (internal so tests can set it).
+    var paneDimming: CGFloat = 0 {
+        didSet {
+            for controller in windowControllers {
+                controller.paneContainer.inactivePaneDimming = paneDimming
+            }
+        }
+    }
     /// Set by a termination signal: quit without asking.
     var terminatesWithoutConfirmation = false
 
@@ -224,8 +233,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Recreates the windows of `state` (the one saved at the last quit) with
     /// fresh shells: each at its saved frame, moved onto `screens` (the
     /// visible frames of the screens, the main one first), with its saved
-    /// number of tabs (D4c). Returns whether any window opened; `false` for
-    /// no state or no window in it, so the caller opens the usual one.
+    /// number of tabs (D4c) and each tab's panes (ADR 0035). Returns whether
+    /// any window opened; `false` for no state or no window in it, so the
+    /// caller opens the usual one.
     @discardableResult
     func restoreWindows(from state: WindowState?, screens: [NSRect] = NSScreen.screens.map(\.visibleFrame)) -> Bool {
         guard let state else { return false }
@@ -234,9 +244,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             for saved in state.restorePlan(screens: screens) {
                 let first = try newWindow(frame: saved.frame)
                 opened = true
+                if let layout = saved.layout(ofTab: 0) {
+                    try first.restoreLayout(layout)
+                }
                 guard let window = first.window else { continue }
-                for _ in 1..<saved.tabCount {
-                    try newTab(in: window.tabGroup?.windows.last ?? window)
+                for index in 1..<saved.tabCount {
+                    let tab = try newTab(in: window.tabGroup?.windows.last ?? window)
+                    if let layout = saved.layout(ofTab: index) {
+                        try tab.restoreLayout(layout)
+                    }
                 }
             }
         } catch {
@@ -245,21 +261,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return opened
     }
 
-    /// Each window's frame and tab count now, in the order the windows
-    /// opened. Every tab of a window counts once, whichever is selected.
+    /// Each window's frame, tab count and tabs' pane layouts (in tab
+    /// order) now, in the order the windows opened. Every tab of a window
+    /// counts once, whichever is selected.
     func currentWindowState() -> WindowState {
-        var windows: [WindowState.Window] = []
+        var groups: [(frame: CGRect, tabs: [TerminalWindowController])] = []
         var indexByGroup: [ObjectIdentifier: Int] = [:]
         for controller in windowControllers {
             guard let window = controller.window else { continue }
             let group = window.tabGroup.map(ObjectIdentifier.init) ?? ObjectIdentifier(window)
             if let index = indexByGroup[group] {
-                windows[index].tabCount += 1
+                groups[index].tabs.append(controller)
             } else {
-                indexByGroup[group] = windows.count
-                let frame = (window.tabGroup?.selectedWindow ?? window).frame
-                windows.append(WindowState.Window(frame: frame, tabCount: 1))
+                indexByGroup[group] = groups.count
+                groups.append(((window.tabGroup?.selectedWindow ?? window).frame, [controller]))
             }
+        }
+        let windows = groups.map { group in
+            // Tab bar order, which a drag may have changed; a tab not (yet)
+            // in the bar keeps its opening place.
+            let order = group.tabs.first?.window?.tabGroup?.windows ?? []
+            let tabs = group.tabs.enumerated().sorted { lhs, rhs in
+                let left = order.firstIndex { $0 === lhs.element.window } ?? Int.max
+                let right = order.firstIndex { $0 === rhs.element.window } ?? Int.max
+                return (left, lhs.offset) < (right, rhs.offset)
+            }
+            return WindowState.Window(
+                frame: group.frame, tabCount: tabs.count,
+                tabs: tabs.map { WindowState.Tab(tree: $0.element.paneLayout) })
         }
         return WindowState(windows: windows)
     }
@@ -286,6 +315,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let session = try core.spawn(spawnOptions)
         let controller = TerminalWindowController(session: session, title: TerminalWindowController.defaultTitle)
         controller.delegate = self
+        controller.paneContainer.inactivePaneDimming = paneDimming
         // Registered before the main actor can run the session's first
         // delivery, so no event is dropped.
         router.register(controller, session: session)
@@ -298,9 +328,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let core = try TesseraApp()
         core.delegate = router
         self.core = core
-        router.onConfigurationApplied = { [weak self] in self?.applyKeymap() }
+        router.onConfigurationApplied = { [weak self] in
+            self?.applyKeymap()
+            self?.readPaneDimming()
+        }
         applyKeymap()
+        readPaneDimming()
         return core
+    }
+
+    /// Reads `dim_inactive_panes` from the core: at start and after every
+    /// configuration it applies (live reload). Keeps the previous amount if
+    /// it cannot be read.
+    private func readPaneDimming() {
+        guard let core else { return }
+        do {
+            paneDimming = CGFloat(try core.dimInactivePanes())
+        } catch {
+            Self.log.error("dim_inactive_panes not read: \(String(describing: error), privacy: .public)")
+        }
     }
 
     /// Gives the menu bar the core's key map (ADR 0036): at start and after

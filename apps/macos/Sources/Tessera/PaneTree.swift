@@ -1,7 +1,8 @@
 import CoreGraphics
 
-/// Which way a split divides a pane (D1, iTerm2's commands).
-enum PaneSplitDirection: Equatable, Sendable {
+/// Which way a split divides a pane (D1, iTerm2's commands). The raw
+/// values are the state file's (``PaneLayout``).
+enum PaneSplitDirection: String, Equatable, Sendable, Codable {
     /// ⌘D: the new pane goes to the right, behind a vertical divider.
     case right
     /// ⌘⇧D: the new pane goes below, behind a horizontal divider.
@@ -87,6 +88,29 @@ struct PaneTree<Leaf: Equatable> {
         return true
     }
 
+    /// The most splits on a way from the root to a pane: 0 for one pane.
+    var depth: Int {
+        root.depth
+    }
+
+    /// Gives every pane an equal share of its tab along each split's
+    /// direction (`equalize_panes`): each split's ratio becomes its first
+    /// child's share of the panes side by side (or stacked) across it, so
+    /// `L | (R1 | R2)` gets thirds and `L | (R1 / R2)` halves.
+    mutating func equalize() {
+        setRatios(root.splits.map(\.equalRatio))
+    }
+
+    /// Equalises only the split at `index` in ``Node/splits`` (a
+    /// double-clicked divider), as ``equalize()`` would set it; nothing
+    /// for an index out of range.
+    mutating func equalize(splitAt index: Int) {
+        var ratios = root.splits.map(\.ratio)
+        guard ratios.indices.contains(index) else { return }
+        ratios[index] = root.splits[index].equalRatio
+        setRatios(ratios)
+    }
+
     /// Replaces the splits' ratios, in the order ``Node/splits`` lists them
     /// (the shares measured from the views); each is clamped to 0...1, and
     /// splits past the end of `ratios` keep theirs.
@@ -159,7 +183,39 @@ struct PaneTree<Leaf: Equatable> {
     }
 }
 
+extension PaneTree.Split {
+    /// The ratio that gives each pane across this split the same share:
+    /// the first child's ``PaneTree/Node/weight(along:)`` of both's.
+    var equalRatio: CGFloat {
+        let first = first.weight(along: direction)
+        let second = second.weight(along: direction)
+        return CGFloat(first) / CGFloat(first + second)
+    }
+}
+
 extension PaneTree.Node {
+    /// How many panes this subtree puts side by side along `direction`
+    /// (``PaneSplitDirection/right``: in a row; ``PaneSplitDirection/below``:
+    /// in a column): a pane counts 1, a split the same way the sum of its
+    /// children, a split the other way the larger of them.
+    func weight(along direction: PaneSplitDirection) -> Int {
+        switch self {
+        case .leaf:
+            return 1
+        case .split(let split):
+            let first = split.first.weight(along: direction)
+            let second = split.second.weight(along: direction)
+            return split.direction == direction ? first + second : max(first, second)
+        }
+    }
+
+    var depth: Int {
+        switch self {
+        case .leaf: 0
+        case .split(let split): 1 + max(split.first.depth, split.second.depth)
+        }
+    }
+
     var leaves: [Leaf] {
         switch self {
         case .leaf(let leaf): [leaf]

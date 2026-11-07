@@ -189,6 +189,28 @@ one new window, as before. The hosted tests never save to the user's
 defaults: the store is unset in the test host and the tests use a suite of
 their own, kept in memory, so no file is left in `~/Library/Preferences`.
 
+**Pane layouts (amended for #38b, 2026-11-07).** The value keeps its key
+`TesseraWindowState.v1`; its second form adds an optional `tabs` array to
+each window entry, one `{ "tree": … }` per tab in the tab bar's order, the
+tree being `{"leaf":{}}` or `{"split":{"direction":"right"|"below",
+"ratio":…,"first":…,"second":…}}` (ADR 0035). A tab with one pane has no
+tree, and a window with no split tab has no `tabs`, so a first-form entry
+(no `tabs`) restores one pane per tab, as before, and an older build
+reads a newer value's frames and tab counts. A divider drag, split,
+close or equalise also saves the state. On restore the panes count
+against the 64 sessions: a tab costs one session per pane, a tree with
+more panes than are left restores as one pane, and tabs past the budget
+are dropped. A tree with more than 16 panes, deeper than 15 splits (the
+most 16 panes can have, as repeated ⌘D makes them) or with a ratio that
+is not finite or not inside (0, 1) restores its tab as one pane, logged;
+the decoder refuses nesting past that depth itself, an
+unreadable `tabs` or tree reads as absent, and a tree whose panes at
+their smallest size do not fit the restored window restores as one pane.
+Every pane of a restored tree is a fresh login shell in the home
+directory (D4c), as a tab is; which pane was focused or maximized is not
+kept (the first pane is focused), and profiles are not kept per pane
+(#39).
+
 Not covered, accepted for 0.1.0: the order of windows in depth, which
 tab was selected, and whether a window was full screen or minimized are
 not restored (a full-screen window comes back as a normal window of the

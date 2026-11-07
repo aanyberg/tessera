@@ -178,11 +178,13 @@ pub struct Config {
     /// `minimize`, `zoom`, `show_tab_bar`, `tab_previous`, `tab_next`,
     /// `move_tab_to_new_window`, `merge_all_windows`, `select_tab:1` to
     /// `select_tab:9`, `bring_all_to_front`, `help`, `about`, `show_all`,
-    /// and, for features still to come, `split_right`, `split_down`,
-    /// `focus_pane_left`, `focus_pane_right`, `focus_pane_up`,
-    /// `focus_pane_down`, `focus_pane_previous`, `focus_pane_next`,
-    /// `zoom_pane`, `find`, `find_next`, `find_previous`,
-    /// `prompt_previous`, `prompt_next`, `copy_mode`.
+    /// `split_right`, `split_down`, `focus_pane_left`, `focus_pane_right`,
+    /// `focus_pane_up`, `focus_pane_down`, `focus_pane_previous`,
+    /// `focus_pane_next`, `zoom_pane` (show the focused pane alone in its
+    /// tab, or the whole layout again), `equalize_panes` (give every pane
+    /// of the tab an equal share), and, for features still to come,
+    /// `find`, `find_next`, `find_previous`, `prompt_previous`,
+    /// `prompt_next`, `copy_mode`.
     ///
     /// Only chords with `cmd` appear in menus; others work in the
     /// terminal only. A malformed entry, an unknown command or a chord
@@ -257,6 +259,14 @@ pub struct Appearance {
     /// reported with a warning and the default is used.
     #[serde(deserialize_with = "load::lenient_cursor_blink")]
     pub cursor_blink: bool,
+    /// How much to darken the panes of a split tab that do not have the
+    /// keyboard focus, from 0.0 (off) to 0.8, drawn as a black overlay of
+    /// that opacity. A tab with one pane is never dimmed. A value outside
+    /// the range is clamped (not a number means 0.0) with a warning.
+    /// Applies to open windows when the file changes. Set it here only:
+    /// in a profile's `appearance` it is ignored with a warning, since the
+    /// window, not the session, draws it.
+    pub dim_inactive_panes: f32,
 }
 
 /// The cursor's shape (`[appearance] cursor_shape`).
@@ -306,6 +316,9 @@ impl Appearance {
     pub const MIN_FONT_SIZE: f32 = 4.0;
     /// Largest `font_size` accepted; larger values are lowered on load.
     pub const MAX_FONT_SIZE: f32 = 512.0;
+    /// Largest `dim_inactive_panes` accepted, so an unfocused pane stays
+    /// readable; larger values are lowered on load.
+    pub const MAX_DIM_INACTIVE_PANES: f32 = 0.8;
 }
 
 impl Default for Appearance {
@@ -318,6 +331,7 @@ impl Default for Appearance {
             blur: false,
             cursor_shape: CursorShape::Block,
             cursor_blink: false,
+            dim_inactive_panes: 0.0,
         }
     }
 }

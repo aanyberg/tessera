@@ -701,6 +701,34 @@ fn normalize_appearance(prefix: &str, a: &mut crate::Appearance, warnings: &mut 
     if a.opacity == 0.0 {
         a.opacity = 0.0;
     }
+    let max_dim = Appearance::MAX_DIM_INACTIVE_PANES;
+    if prefix != "appearance" {
+        if a.dim_inactive_panes.to_bits() != defaults.dim_inactive_panes.to_bits() {
+            warnings.push(Warning::OutOfRange {
+                path: format!("{prefix}.dim_inactive_panes"),
+                detail: format!(
+                    "{} ignored (set it in [appearance], not in a profile)",
+                    a.dim_inactive_panes
+                ),
+            });
+        }
+        a.dim_inactive_panes = defaults.dim_inactive_panes;
+    } else if !(0.0..=max_dim).contains(&a.dim_inactive_panes) {
+        let clamped = if a.dim_inactive_panes.is_finite() {
+            a.dim_inactive_panes.clamp(0.0, max_dim)
+        } else {
+            0.0
+        };
+        warnings.push(Warning::OutOfRange {
+            path: format!("{prefix}.dim_inactive_panes"),
+            detail: format!("{} clamped to {clamped}", a.dim_inactive_panes),
+        });
+        a.dim_inactive_panes = clamped;
+    }
+    // As for `opacity`: store plain zero for `-0.0`.
+    if a.dim_inactive_panes == 0.0 {
+        a.dim_inactive_panes = 0.0;
+    }
 }
 
 /// Reads and leniently parses the file at `path`.
@@ -1656,6 +1684,55 @@ mod tests {
         assert_eq!(loaded.warnings, Vec::new(), "bounds are inclusive");
         let loaded = Config::from_toml_lenient("[appearance]\nfont_size = 512\n").unwrap();
         assert_eq!(loaded.warnings, Vec::new(), "bounds are inclusive");
+    }
+
+    #[test]
+    fn dim_inactive_panes_is_clamped_to_its_range() {
+        let max = crate::Appearance::MAX_DIM_INACTIVE_PANES;
+        for (text, expected) in [
+            ("[appearance]\ndim_inactive_panes = 0.9\n", max),
+            ("[appearance]\ndim_inactive_panes = 1e30\n", max),
+            ("[appearance]\ndim_inactive_panes = -0.1\n", 0.0),
+            ("[appearance]\ndim_inactive_panes = nan\n", 0.0),
+            ("[appearance]\ndim_inactive_panes = inf\n", 0.0),
+            ("[appearance]\ndim_inactive_panes = -inf\n", 0.0),
+        ] {
+            let loaded = Config::from_toml_lenient(text).unwrap();
+            let dim = loaded.config.appearance.dim_inactive_panes;
+            assert_eq!(dim.to_bits(), f32::to_bits(expected), "{text}: {dim}");
+            assert!(
+                matches!(&loaded.warnings[..], [Warning::OutOfRange { path, .. }] if path == "appearance.dim_inactive_panes"),
+                "{text}: {:?}",
+                loaded.warnings
+            );
+        }
+        for (text, expected) in [
+            ("", 0.0),
+            ("[appearance]\ndim_inactive_panes = 0\n", 0.0),
+            ("[appearance]\ndim_inactive_panes = -0.0\n", 0.0),
+            ("[appearance]\ndim_inactive_panes = 0.3\n", 0.3),
+            ("[appearance]\ndim_inactive_panes = 0.8\n", max),
+        ] {
+            let loaded = Config::from_toml_lenient(text).unwrap();
+            let dim = loaded.config.appearance.dim_inactive_panes;
+            assert_eq!(dim.to_bits(), f32::to_bits(expected), "{text}: {dim}");
+            assert_eq!(loaded.warnings, Vec::new(), "{text}");
+        }
+    }
+
+    /// Dimming belongs to the window, not to a session, so a profile's
+    /// value is dropped with a warning rather than silently ignored.
+    #[test]
+    fn dim_inactive_panes_in_a_profile_is_ignored_with_a_warning() {
+        let text = "[[profiles]]\nname = \"a\"\n[profiles.appearance]\ndim_inactive_panes = 0.5\n";
+        let loaded = Config::from_toml_lenient(text).unwrap();
+        let appearance = loaded.config.profiles[0].appearance.as_ref().unwrap();
+        assert_eq!(appearance.dim_inactive_panes.to_bits(), 0.0f32.to_bits());
+        assert!(
+            matches!(&loaded.warnings[..], [Warning::OutOfRange { path, .. }] if path == "profiles[0].appearance.dim_inactive_panes"),
+            "{:?}",
+            loaded.warnings
+        );
     }
 
     #[test]

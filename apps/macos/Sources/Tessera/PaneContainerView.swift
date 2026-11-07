@@ -33,8 +33,14 @@ final class Pane: Equatable {
 /// at least ``minimumColumns`` × ``minimumRows`` cells; each pane's grid is
 /// the whole cells its frame holds, like a window's, the rest going to the
 /// padding band.
+///
+/// One pane can be maximized (``zoom(_:)``, `zoom_pane`): it alone fills
+/// the view while the split views stay as they were, hidden and not
+/// resized, so its siblings keep their sessions and grids and come back
+/// at their frames. With `dim_inactive_panes` set and more than one pane,
+/// a ``PaneDimView`` shades every pane but the ``activePane``.
 @MainActor
-final class PaneContainerView: NSView, NSSplitViewDelegate {
+final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation {
     /// The smallest pane, in cells of its font (D1).
     static let minimumColumns = 10
     static let minimumRows = 3
@@ -42,7 +48,35 @@ final class PaneContainerView: NSView, NSSplitViewDelegate {
     /// its surface attaches): about Menlo 13 pt, the default font.
     static let fallbackCellSize = CGSize(width: 8, height: TerminalSurfaceView.fallbackLineHeight)
 
+    /// ⌘W's title while the tab has more than one pane (#315), and
+    /// otherwise.
+    static let closePaneTitle = "Close Pane"
+    static let closeTabTitle = "Close Tab"
+
     private(set) var tree: PaneTree<Pane>
+
+    /// The pane shown alone, filling this view, or `nil`.
+    private(set) var zoomedPane: Pane?
+
+    /// The view laid out from the tree: the root split view, or the only
+    /// pane's view.
+    private var rootView: NSView?
+
+    /// The pane with the focus, which is never dimmed.
+    weak var activePane: Pane? {
+        didSet {
+            if activePane !== oldValue { updateDimming() }
+        }
+    }
+
+    /// How dark the panes without the focus are drawn: the opacity of a
+    /// black ``PaneDimView`` over each, 0 (none) to 0.8
+    /// (`[appearance] dim_inactive_panes`, clamped again here).
+    var inactivePaneDimming: CGFloat = 0 {
+        didSet {
+            if inactivePaneDimming != oldValue { updateDimming() }
+        }
+    }
 
     init(pane: Pane, frame: NSRect) {
         tree = PaneTree(pane)
@@ -119,6 +153,7 @@ final class PaneContainerView: NSView, NSSplitViewDelegate {
     func split(_ pane: Pane, _ direction: PaneSplitDirection, adding new: Pane) -> Bool {
         guard canSplit(pane, direction), !tree.contains(new) else { return false }
         tree.split(pane, direction, adding: new)
+        zoomedPane = nil
         rebuild()
         return true
     }
@@ -128,8 +163,137 @@ final class PaneContainerView: NSView, NSSplitViewDelegate {
     @discardableResult
     func remove(_ pane: Pane) -> Bool {
         guard tree.remove(pane) else { return false }
+        zoomedPane = nil
         rebuild()
         return true
+    }
+
+    /// Lays out `restored` (a saved layout, ADR 0031) in place of the tab's
+    /// one pane, which must be one of its panes, the others new. Returns
+    /// `false`, changing nothing, otherwise.
+    @discardableResult
+    func restore(_ restored: PaneTree<Pane>) -> Bool {
+        let leaves = restored.leaves
+        guard panes.count == 1, let pane = panes.first, leaves.contains(pane),
+            Set(leaves.map(ObjectIdentifier.init)).count == leaves.count,
+            leaves.count <= PaneTree<Pane>.maxLeaves
+        else { return false }
+        tree = restored
+        zoomedPane = nil
+        rebuild()
+        return true
+    }
+
+    // MARK: Maximizing
+
+    /// Shows `pane` alone, filling the tab (`zoom_pane`). The other panes
+    /// keep their sessions, which still take output, and their frames: the
+    /// split views are hidden as they are, not built again nor resized,
+    /// until ``unzoom()``, with a stand-in at the pane's frame in its place.
+    /// Returns whether it did: not for a pane not here, a lone pane, or
+    /// while a pane is maximized already.
+    @discardableResult
+    func zoom(_ pane: Pane) -> Bool {
+        guard tree.contains(pane), panes.count > 1, zoomedPane == nil, let root = rootView,
+            let slot = pane.view.superview, slot !== self
+        else { return false }
+        zoomedPane = pane
+        root.autoresizingMask = []
+        root.isHidden = true
+        let standIn = NSView(frame: pane.view.frame)
+        standIn.autoresizingMask = []
+        slot.addSubview(standIn, positioned: .below, relativeTo: pane.view)
+        // Within the window, so its surface stays attached.
+        addSubview(pane.view)
+        pane.view.frame = bounds
+        pane.view.autoresizingMask = [.width, .height]
+        updateDimming()
+        return true
+    }
+
+    /// Shows every pane again: the maximized one back in its place, every
+    /// other at the frame it kept, unless the tab was resized meanwhile
+    /// (then as a resize lays them out). Returns whether a pane was
+    /// maximized.
+    @discardableResult
+    func unzoom() -> Bool {
+        guard let pane = zoomedPane else { return false }
+        zoomedPane = nil
+        guard let root = rootView, root.superview === self,
+            let standIn = Self.splitViews(from: root).flatMap(\.subviews).first(where: {
+                !($0 is TerminalSurfaceView) && !($0 is NSSplitView)
+            }),
+            let slot = standIn.superview
+        else {
+            // Not reached: zoom(_:) left them so.
+            rebuild()
+            return true
+        }
+        pane.view.autoresizingMask = []
+        slot.addSubview(pane.view, positioned: .below, relativeTo: standIn)
+        pane.view.frame = standIn.frame
+        standIn.removeFromSuperview()
+        root.isHidden = false
+        root.autoresizingMask = [.width, .height]
+        if root.frame != bounds {
+            root.frame = bounds
+        }
+        paneMinimumSizeDidChange()
+        updateDimming()
+        return true
+    }
+
+    // MARK: Equalising
+
+    /// Gives every pane an equal share (`equalize_panes`, see
+    /// ``PaneTree/equalize()``) and lays the panes out again.
+    func equalize() {
+        tree.equalize()
+        layoutFromRatios()
+    }
+
+    /// Equalises only the split `splitView` shows (its divider was
+    /// double-clicked).
+    func equalize(_ splitView: NSSplitView) {
+        guard let index = splitIndex(of: splitView) else { return }
+        tree.equalize(splitAt: index)
+        layoutFromRatios()
+    }
+
+    /// Lays every split view out from the tree's ratios, the clamps applied.
+    private func layoutFromRatios() {
+        paneMinimumSizeDidChange()
+        layoutDidChange()
+    }
+
+    // MARK: Dividers
+
+    /// The tree's shape or ratios changed: the window state is saved.
+    private func layoutDidChange() {
+        (window?.windowController as? TerminalWindowController)?.paneLayoutDidChange()
+    }
+
+    // MARK: Dimming
+
+    /// Shades every pane but ``activePane`` while the tab has more than one
+    /// pane and ``inactivePaneDimming`` is above 0; removes the shades
+    /// otherwise.
+    private func updateDimming() {
+        let amount = inactivePaneDimming.isFinite ? min(max(inactivePaneDimming, 0), 0.8) : 0
+        let panes = panes
+        for pane in panes {
+            let shade = pane.view.subviews.lazy.compactMap { $0 as? PaneDimView }.first
+            guard amount > 0, panes.count > 1, pane !== activePane else {
+                shade?.removeFromSuperview()
+                continue
+            }
+            let view = shade ?? PaneDimView(frame: pane.view.bounds)
+            view.alphaValue = amount
+            if view.superview !== pane.view || pane.view.subviews.last !== view {
+                // Above the pane's own subviews (its scroll bar).
+                pane.view.addSubview(view)
+            }
+        }
     }
 
     /// The pane next to `pane` toward `direction`, as laid out now, or `nil`
@@ -146,7 +310,9 @@ final class PaneContainerView: NSView, NSSplitViewDelegate {
     /// smallest size follows, and the split views lay their panes out
     /// again so each keeps its smallest size where there is room.
     func paneMinimumSizeDidChange() {
-        if let root = subviews.last, subviews.count == 1 {
+        // While a pane is maximized the hidden split views keep their
+        // frames; ``unzoom()`` lays them out.
+        if zoomedPane == nil, let root = rootView, root.superview === self {
             for splitView in Self.splitViews(from: root) {
                 splitView.resizeSubviews(withOldSize: splitView.bounds.size)
             }
@@ -192,7 +358,7 @@ final class PaneContainerView: NSView, NSSplitViewDelegate {
     /// the split views mirror the tree's splits in pre-order. `nil` for a
     /// split view not (or no longer) in this view's tree.
     private func splitIndex(of splitView: NSSplitView) -> Int? {
-        guard let root = subviews.last else { return nil }
+        guard let root = rootView, root.superview === self else { return nil }
         let splitViews = Self.splitViews(from: root)
         guard splitViews.count == tree.root.splits.count else { return nil }
         return splitViews.firstIndex { $0 === splitView }
@@ -207,10 +373,11 @@ final class PaneContainerView: NSView, NSSplitViewDelegate {
     /// Builds the split views for the tree, moving each pane's view into
     /// its place while both are in the window (so no surface detaches), and
     /// then drops the old split views, with the view of a pane no longer in
-    /// the tree.
+    /// the tree. Every pane is shown: its callers clear ``zoomedPane``.
     private func rebuild() {
         let old = subviews
         let root = install(tree.root, frame: bounds, into: self)
+        rootView = root
         root.autoresizingMask = [.width, .height]
         for view in old where view !== root && view.superview === self {
             view.removeFromSuperview()
@@ -218,6 +385,7 @@ final class PaneContainerView: NSView, NSSplitViewDelegate {
         // The ratios alone can leave a pane below its smallest size (its
         // font is larger than its sibling's): lay out again with the clamps.
         paneMinimumSizeDidChange()
+        updateDimming()
     }
 
     @discardableResult
@@ -338,6 +506,7 @@ final class PaneContainerView: NSView, NSSplitViewDelegate {
         guard space > 0, abs(first - firstLength(in: splitView, ratio: ratios[index])) >= 0.5 else { return }
         ratios[index] = first / space
         tree.setRatios(ratios)
+        layoutDidChange()
     }
 
     /// The length of a split's first child at `ratio` of the space the
@@ -368,13 +537,64 @@ final class PaneContainerView: NSView, NSSplitViewDelegate {
             window?.performClose(sender)
         }
     }
+
+    /// ⌘W says what it closes: Close Pane while the tab has more than one
+    /// pane, Close Tab otherwise (#315). The title stays until the next
+    /// validation; ``TerminalWindowController`` puts Close Tab back when
+    /// its window stops being key, so another window's menu never shows a
+    /// pane's title.
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(performClose(_:)) {
+            menuItem.title = panes.count > 1 ? Self.closePaneTitle : Self.closeTabTitle
+        }
+        return true
+    }
 }
 
 /// A split of a tab's panes, with a thin divider of a fixed thickness, so
 /// the tree's geometry knows it.
+///
+/// A double-click on the divider equalises the split; a drag passes each
+/// pane's size to the core at most once a display refresh (#315).
 @MainActor
 final class PaneSplitView: NSSplitView {
     static let thickness: CGFloat = 1
 
     override var dividerThickness: CGFloat { Self.thickness }
+
+    /// A click reaches the split view itself only on (or beside) a divider:
+    /// its children cover the rest. A double click equalises the split; a
+    /// drag is AppKit's, which tracks it inside `super` as a live resize of
+    /// every view under this split view, so each pane passes at most one
+    /// size to the core per display refresh (#315).
+    override func mouseDown(with event: NSEvent) {
+        if event.clickCount == 2, let container = delegate as? PaneContainerView {
+            container.equalize(self)
+            return
+        }
+        super.mouseDown(with: event)
+    }
+}
+
+/// The shade over a pane without the focus (`dim_inactive_panes`): black,
+/// at the view's opacity. Clicks, the pointer and accessibility go
+/// through it to the pane.
+@MainActor
+final class PaneDimView: NSView {
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.black.cgColor
+        autoresizingMask = [.width, .height]
+        setAccessibilityElement(false)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
 }
