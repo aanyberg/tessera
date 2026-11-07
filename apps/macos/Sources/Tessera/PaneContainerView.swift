@@ -58,6 +58,11 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
     /// The pane shown alone, filling this view, or `nil`.
     private(set) var zoomedPane: Pane?
 
+    /// The empty view holding the maximized pane's place in its split view
+    /// while ``zoomedPane`` is set (``zoom(_:)`` adds it, ``unzoom()`` and
+    /// a rebuild drop it).
+    private var standIn: NSView?
+
     /// The view laid out from the tree: the root split view, or the only
     /// pane's view.
     private var rootView: NSView?
@@ -203,6 +208,7 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
         let standIn = NSView(frame: pane.view.frame)
         standIn.autoresizingMask = []
         slot.addSubview(standIn, positioned: .below, relativeTo: pane.view)
+        self.standIn = standIn
         // Within the window, so its surface stays attached.
         addSubview(pane.view)
         pane.view.frame = bounds
@@ -219,12 +225,9 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
     func unzoom() -> Bool {
         guard let pane = zoomedPane else { return false }
         zoomedPane = nil
-        guard let root = rootView, root.superview === self,
-            let standIn = Self.splitViews(from: root).flatMap(\.subviews).first(where: {
-                !($0 is TerminalSurfaceView) && !($0 is NSSplitView)
-            }),
-            let slot = standIn.superview
-        else {
+        let standIn = self.standIn
+        self.standIn = nil
+        guard let root = rootView, root.superview === self, let standIn, let slot = standIn.superview else {
             // Not reached: zoom(_:) left them so.
             rebuild()
             return true
@@ -375,6 +378,7 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
     /// then drops the old split views, with the view of a pane no longer in
     /// the tree. Every pane is shown: its callers clear ``zoomedPane``.
     private func rebuild() {
+        standIn = nil
         let old = subviews
         let root = install(tree.root, frame: bounds, into: self)
         rootView = root

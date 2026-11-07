@@ -53,8 +53,12 @@ pub const SEARCH_MAX_MATCHES_TEXT_BYTES: usize = 1_048_576;
 
 const _: () = assert!(SEARCH_MAX_MATCHES_TEXT_BYTES == MAX_MATCHES_TEXT_BYTES);
 
-/// The longest budget, in microseconds, one
-/// `tessera_session_search_step` takes; a larger budget is clamped to it.
+/// The largest budget, in microseconds, `tessera_session_search_step`
+/// accepts; a larger one is clamped to it. The step checks its deadline
+/// between pieces of at most 64 KiB of text, so it returns within the
+/// budget plus one piece's regex run (ADR 0038), whose time depends on
+/// the pattern: seconds for a quadratic one on text of heavy combining
+/// marks, with no fixed ceiling.
 pub const SEARCH_MAX_STEP_MICROS: u32 = 1_000_000;
 
 /// Why `tessera_session_search_start` refused a pattern (its `refusal`
@@ -304,12 +308,16 @@ unsafe fn with_status(
 
 /// Scans session `session_id`'s history for its search for about
 /// `budget_us` microseconds (at most `TESSERA_SEARCH_MAX_STEP_MICROS`):
-/// chunk after chunk until nothing is left or the budget has passed, at
-/// least one chunk, each holding the terminal lock only to copy at most
-/// 256 lines. The screen is searched first, then the history from newest
-/// to oldest; new output is searched as it arrives. Stores the status in
-/// `*out`. Call it once per display refresh while `out->done` is false or
-/// output arrives; without a search it does nothing.
+/// piece after piece (at most 64 KiB of text each) until nothing is left
+/// or the budget has passed, at least one piece, so the call returns
+/// within the budget plus one piece's regex run. Lines are copied in
+/// chunks of at most 256, each under one hold of the terminal lock; a
+/// chunk can be searched over several calls, and its matches count from
+/// the call that searches its last piece. The screen is searched first,
+/// then the history from newest to oldest; new output is searched as it
+/// arrives. Stores the status in `*out`. Call it once per display refresh
+/// while `out->done` is false or output arrives; without a search it does
+/// nothing.
 ///
 /// Returns `TESSERA_ERROR_NULL_POINTER` if `app` or `out` is `NULL`,
 /// `TESSERA_ERROR_SESSION_NOT_FOUND` if the id is not a live session. On

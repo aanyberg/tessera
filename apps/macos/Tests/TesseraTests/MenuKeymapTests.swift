@@ -77,8 +77,8 @@ final class MenuKeymapTests: XCTestCase {
             }
         }
         walk(bar)
-        // 41, and the ten pane items (ADR 0035, #38b).
-        XCTAssertEqual(names.count, 51, "\(names)")
+        // 41, the ten pane items (ADR 0035, #38b) and the five Find items (#46b).
+        XCTAssertEqual(names.count, 56, "\(names)")
         XCTAssertEqual(unmapped, [], "\(unmapped)")
         for name in names {
             XCTAssertNotNil(keymap.command(named: name), "\(name) is a command")
@@ -115,18 +115,18 @@ final class MenuKeymapTests: XCTestCase {
         XCTAssertEqual(newTab.keyEquivalent, "t")
         try """
             [keys]
-            'cmd+e' = 'new_tab'
+            'cmd+u' = 'new_tab'
             'cmd+=' = 'font_smaller'
             'cmd+q' = 'none'
             'cmd+1' = 'select_tab:2'
             'cmd+alt+shift+f2' = 'clear_scrollback'
             """.write(to: configFile, atomically: true, encoding: .utf8)
         let deadline = ContinuousClock.now + .seconds(10)
-        while newTab.keyEquivalent != "e", ContinuousClock.now < deadline {
+        while newTab.keyEquivalent != "u", ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(10))
         }
         XCTAssertGreaterThan(applied, 0, "on_config_applied reached the router")
-        XCTAssertEqual(newTab.keyEquivalent, "e", "the new chord is the item's")
+        XCTAssertEqual(newTab.keyEquivalent, "u", "the new chord is the item's")
         XCTAssertEqual(newTab.keyEquivalentModifierMask, .command)
         // Re-binding a chord takes it from its default command (`[keys]` wins).
         XCTAssertEqual(authoredKeyEquivalent(of: try Self.item("select_tab:2", bar)).key, "1")

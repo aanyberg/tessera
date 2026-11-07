@@ -484,7 +484,7 @@ fn the_base_layout_key_stands_in_only_for_a_non_ascii_key() {
         ("Dvorak", 'y', 'Y', 't', Modifiers::SUPER),
         ("Dvorak", 'b', 'B', 'n', Modifiers::SUPER),
         ("Turkish-F", 's', 'S', 'm', Modifiers::SUPER),
-        ("Colemak", 'e', 'E', 'k', Modifiers::SUPER),
+        ("Colemak", 's', 'S', 'd', Modifiers::SUPER),
         ("Swedish", '-', '_', '/', shift_cmd),
     ];
     for (layout, key, shifted, base, modifiers) in phantoms {

@@ -183,9 +183,10 @@ pub struct Config {
     /// `focus_pane_up`, `focus_pane_down`, `focus_pane_previous`,
     /// `focus_pane_next`, `zoom_pane` (show the focused pane alone in its
     /// tab, or the whole layout again), `equalize_panes` (give every pane
-    /// of the tab an equal share), and, for features still to come,
-    /// `find`, `find_next`, `find_previous`, `prompt_previous`,
-    /// `prompt_next`, `copy_mode`.
+    /// of the tab an equal share), `find`, `find_next` (the match toward
+    /// older output), `find_previous` (toward newer output),
+    /// `use_selection_for_find`, `copy_find_matches`, and, for features
+    /// still to come, `prompt_previous`, `prompt_next`, `copy_mode`.
     ///
     /// Only chords with `cmd` appear in menus; others work in the
     /// terminal only. A malformed entry, an unknown command or a chord

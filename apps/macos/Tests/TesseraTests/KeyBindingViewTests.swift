@@ -25,7 +25,7 @@ final class KeyBindingViewTests: XCTestCase {
     private static let config = """
         [keys]
         'alt+t' = 'send_text:AT'
-        'cmd+e' = 'send_text:CE'
+        'cmd+u' = 'send_text:CU'
         'cmd+j' = 'none'
         'ctrl+shift+c' = 'copy'
         """
@@ -84,11 +84,11 @@ final class KeyBindingViewTests: XCTestCase {
                 self.view.processKeyDown(event) { XCTFail("Command skips the input system") }
             }
         }
-        XCTAssertTrue(view.performKeyEquivalent(with: key("e", code: 14, [.command])), "send_text is used")
-        route(key("e", code: 14, [.command]))
+        XCTAssertTrue(view.performKeyEquivalent(with: key("u", code: 32, [.command])), "send_text is used")
+        route(key("u", code: 32, [.command]))
         XCTAssertTrue(view.performKeyEquivalent(with: key("j", code: 38, [.command])), "`none` is used")
         XCTAssertFalse(view.performKeyEquivalent(with: key("t", code: 17, [.command])), "New Tab's item runs it")
-        try await assertBytes(Array("CECE".utf8), "each ⌘E sends its text once")
+        try await assertBytes(Array("CUCU".utf8), "each ⌘U sends its text once")
     }
 
     func testAChordWithoutCommandNeverGoesOnAMenu() throws {

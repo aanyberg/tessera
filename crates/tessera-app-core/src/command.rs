@@ -30,8 +30,8 @@ pub enum CommandOwner {
     System,
     /// A Tessera command with a menu item today.
     App,
-    /// A command a later feature implements (panes, find, prompt
-    /// navigation, copy mode). It may be bound now; until the feature
+    /// A command a later feature implements (prompt navigation, copy
+    /// mode). It may be bound now; until the feature
     /// lands, nothing runs it.
     Planned,
 }
@@ -122,9 +122,11 @@ commands! {
     "focus_pane_next" => ["cmd+]"] App,
     "zoom_pane" => ["cmd+shift+enter"] App,
     "equalize_panes" => [] App,
-    "find" => ["cmd+f"] Planned,
-    "find_next" => ["cmd+g"] Planned,
-    "find_previous" => ["cmd+shift+g"] Planned,
+    "find" => ["cmd+f"] App,
+    "find_next" => ["cmd+g"] App,
+    "find_previous" => ["cmd+shift+g"] App,
+    "use_selection_for_find" => ["cmd+e"] App,
+    "copy_find_matches" => [] App,
     // Default chords: ⌘↑ / ⌘↓ through scroll_page_up / _down (N1).
     "prompt_previous" => [] Planned,
     "prompt_next" => [] Planned,

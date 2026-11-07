@@ -17,6 +17,7 @@ mod engine;
 
 pub use engine::{
     DFA_SIZE_LIMIT, Haystack, MAX_HAYSTACK_BYTES, MAX_QUERY_BYTES, MAX_SEGMENT_PERIOD,
-    MAX_SEGMENT_ROWS, Match, Query, QueryError, QueryOptions, REGEX_SIZE_LIMIT, Rows, Segment,
-    SegmentMatch, is_segment_start, scan, scan_segment, segment_period, segments,
+    MAX_SEGMENT_ROWS, Match, Piece, Query, QueryError, QueryOptions, REGEX_SIZE_LIMIT, Rows,
+    Segment, SegmentMatch, is_segment_start, scan, scan_piece, scan_segment, segment_period,
+    segments,
 };

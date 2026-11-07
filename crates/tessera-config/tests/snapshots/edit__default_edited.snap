@@ -68,7 +68,7 @@ clipboard_write = true
 # The menus show the chords; docs/config.md lists every chord and command.
 #
 # [keys]
-# "cmd+e" = "new_tab"
+# "cmd+u" = "new_tab"
 # "ctrl+shift+k" = "send_text:clear\n"
 # "cmd+q" = "unbound"
 

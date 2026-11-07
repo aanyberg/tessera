@@ -601,7 +601,7 @@ fn f01_no_match_lost_or_doubled_at_chunk_boundaries() {
     let line = format!("{}abcd{}\r\n", " ".repeat(78), "-".repeat(160));
     app.feed_for_test(id, line.repeat(600).as_bytes()).unwrap();
     app.search_start(id, "abcd", LITERAL).unwrap();
-    // One chunk per step.
+    // At most one piece per step.
     let mut status = app.search_step(id, Duration::ZERO).unwrap();
     let mut steps = 1;
     while !status.done {
@@ -609,7 +609,7 @@ fn f01_no_match_lost_or_doubled_at_chunk_boundaries() {
         steps += 1;
     }
     assert_eq!(status.matches, 600);
-    assert!(steps > 4, "the scan took {steps} chunks");
+    assert!(steps > 4, "the scan took {steps} steps");
     let text = app.search_matches_text(id).unwrap();
     assert!(text.text.lines().all(|l| l == "abcd"));
 }
@@ -641,8 +641,9 @@ fn f02_resize_starts_over() {
     );
 }
 
-/// Step budgets: a zero budget does one chunk; the count grows as the
-/// scan goes on (E18).
+/// Step budgets: a zero budget searches at most one piece, and a chunk's matches
+/// count once its last piece has run; the count grows as the scan goes on
+/// and is never final before `done` (E18).
 #[test]
 fn e18_count_is_live_while_scanning() {
     let app = app();
@@ -653,12 +654,124 @@ fn e18_count_is_live_while_scanning() {
     )
     .unwrap();
     app.search_start(id, "x", LITERAL).unwrap();
-    let first = app.search_step(id, Duration::ZERO).unwrap();
-    assert!(!first.done);
-    assert!(first.matches > 0 && first.matches < 10_000, "{first:?}");
-    let second = app.search_step(id, Duration::ZERO).unwrap();
-    assert!(second.matches > first.matches);
+    let mut counts = Vec::new();
+    let mut status = app.search_step(id, Duration::ZERO).unwrap();
+    while !status.done {
+        counts.push(status.matches);
+        status = app.search_step(id, Duration::ZERO).unwrap();
+    }
+    assert_eq!(status.matches, 10_000);
+    assert!(
+        counts.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the count went down"
+    );
+    let partial = counts.iter().filter(|&&n| n > 0 && n < 10_000).count();
+    assert!(partial > 10, "{partial} steps showed a partial count");
     assert_eq!(finish(&app, id).matches, 10_000);
+}
+
+/// A zero-budget step that makes no progress fails here instead of hanging.
+const MAX_STEPS: usize = 100_000;
+
+/// Steps the search with `budget` until done; returns the count and steps.
+fn count_with(app: &App, id: SessionId, budget: Duration) -> (usize, usize) {
+    let mut status = app.search_step(id, budget).unwrap();
+    let mut steps = 1;
+    while !status.done {
+        assert!(steps < MAX_STEPS, "no end after {steps} steps: {status:?}");
+        status = app.search_step(id, budget).unwrap();
+        steps += 1;
+    }
+    (status.matches, steps)
+}
+
+/// A zalgo cell: `e` and 31 combining acute accents (63 bytes).
+fn zalgo() -> String {
+    format!("e{}", "\u{301}".repeat(31))
+}
+
+/// E1 resume offsets, an independent count oracle: every single-cell `X`
+/// in a logical line of many 64 KiB pieces is found exactly once,
+/// whatever the budget, so a piece resumed a column late (or early) or a
+/// segment restarted from its first piece fails.
+#[test]
+fn every_match_is_found_across_piece_cuts() {
+    let zalgo = zalgo();
+    let heavy = format!("\u{1d400}{}", "\u{1d167}".repeat(31));
+    for (cell, every, cols) in [
+        (&zalgo, 3, 2048u16),
+        (&zalgo, 2, 2048),
+        (&heavy, 3, 2048),
+        (&zalgo, 5, 80),
+        (&heavy, 2, 300),
+    ] {
+        for budget in [Duration::ZERO, Duration::from_secs(60)] {
+            let app = app();
+            let id = session(&app, 10, cols, 1000);
+            let mut input = String::new();
+            let mut xs = 0;
+            for n in 0..usize::from(cols) * 8 {
+                if n % every == 0 {
+                    input.push('X');
+                    xs += 1;
+                } else {
+                    input.push_str(cell);
+                }
+            }
+            app.feed_for_test(id, input.as_bytes()).unwrap();
+            app.search_start(id, "X", LITERAL).unwrap();
+            let (matches, steps) = count_with(&app, id, budget);
+            assert_eq!(
+                matches, xs,
+                "cols {cols}, every {every}, budget {budget:?}, {steps} steps"
+            );
+        }
+    }
+}
+
+/// E1, an independent count oracle: the segments above and below a
+/// segment of many pieces in the same chunk are all searched once.
+#[test]
+fn segments_around_a_multi_piece_one_are_searched() {
+    let zalgo = zalgo();
+    // Each long segment is several pieces: 300 x 8, 80 x 100 and 2048 x 12
+    // zalgo cells of 63 bytes are 151 KB, 504 KB and 1.5 MB.
+    for (cols, heavy_rows) in [(300u16, 8usize), (80, 100), (2048, 12)] {
+        for budget in [
+            Duration::ZERO,
+            Duration::from_millis(1),
+            Duration::from_secs(60),
+        ] {
+            let app = app();
+            let id = session(&app, 10, cols, 2000);
+            let mut input = String::new();
+            let mut xs = 0;
+            for _ in 0..20 {
+                input.push_str("aXa\r\n");
+                xs += 1;
+            }
+            for n in 0..usize::from(cols) * heavy_rows {
+                if n % 7 == 0 {
+                    input.push('X');
+                    xs += 1;
+                } else {
+                    input.push_str(&zalgo);
+                }
+            }
+            input.push_str("\r\n");
+            for _ in 0..20 {
+                input.push_str("bXb\r\n");
+                xs += 1;
+            }
+            app.feed_for_test(id, input.as_bytes()).unwrap();
+            app.search_start(id, "X", LITERAL).unwrap();
+            let (matches, steps) = count_with(&app, id, budget);
+            assert_eq!(
+                matches, xs,
+                "cols {cols}, rows {heavy_rows}, budget {budget:?}, {steps} steps"
+            );
+        }
+    }
 }
 
 /// Unknown sessions are errors.
@@ -683,7 +796,7 @@ fn unknown_session() {
 enum Op {
     /// Output: text, line ends, wide characters and screen controls.
     Feed(String),
-    /// A step of the search with a zero budget (one chunk).
+    /// A step of the search with a zero budget (at most one piece).
     Step,
     /// A resize to these rows and columns.
     Resize(u16, u16),
@@ -734,7 +847,7 @@ fn outcome(app: &App, id: SessionId) -> (usize, String, Vec<(u16, u16, u16)>) {
 proptest::proptest! {
     #![proptest_config(proptest::prelude::ProptestConfig::with_cases(96))]
 
-    /// The live search (stepped one chunk at a time while output, clears,
+    /// The live search (stepped one piece at a time while output, clears,
     /// the alternate screen, RIS and resizes arrive, then finished) finds
     /// what a fresh search of the final state finds: the same count, the
     /// same match texts and the same highlighted cells.

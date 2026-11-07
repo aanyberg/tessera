@@ -1122,11 +1122,15 @@ impl App {
             .map_err(Error::Query)
     }
 
-    /// Scans session `id` for its search for about `budget`: chunk after
-    /// chunk until nothing is left to scan or `budget` has passed, at least
-    /// one chunk (exactly one for a zero `budget`). Each chunk holds the
-    /// terminal lock only to copy at most [`search::SEARCH_LINES_PER_LOCK`]
-    /// lines, so output keeps flowing while a search runs.
+    /// Scans session `id` for its search for about `budget`: piece after
+    /// piece (at most [`tessera_search::MAX_HAYSTACK_BYTES`] of text each)
+    /// until nothing is left to scan or `budget` has passed, at least one
+    /// piece (at most one for a zero `budget`), so a step overruns `budget`
+    /// by at most one piece's regex run, whose time depends on the pattern. Lines are copied in chunks, each
+    /// under one hold of the terminal lock and of at most
+    /// [`search::SEARCH_LINES_PER_LOCK`] lines, so output keeps flowing
+    /// while a search runs; a chunk may be searched over several steps,
+    /// and its matches count from the step that searches its last piece.
     ///
     /// Call it from the display link while [`SearchStatus::done`] is false
     /// or output arrives: the screen is searched first, then the history
