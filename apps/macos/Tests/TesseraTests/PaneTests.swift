@@ -1637,12 +1637,37 @@ extension PaneTests {
             window.setContentSize(sizes[step % sizes.count])
             controller.paneContainer.layoutSubtreeIfNeeded()
         }
-        var baseline = Self.physFootprint()
-        while step < 3 * sizes.count {
-            resize()
-            try await Task.sleep(for: .milliseconds(20))
-            baseline = max(baseline, Self.physFootprint())
+        // Warm up until the footprint levels off, counted in size cycles,
+        // not in time or a fixed number of steps: the flood's one-off step
+        // (the shown pane's history re-wrapped at each width; where the
+        // window renders, as on CI, its drawables and atlases at each size)
+        // must be over before the baseline is taken. A fixed 9 steps ended
+        // mid-step on a slow runner, which then measured 121 MB of it as
+        // growth (#325). Levelled off: the highest footprints of the last
+        // five cycles lie within 4 MB of each other, neither rising nor
+        // falling (a big leak pages out and falls, and must not read as
+        // flat); the baseline is the highest of them. A leak never levels
+        // off and fails here, within 50 cycles, before it can page out.
+        var highs: [UInt64] = []  // each warm-up cycle's highest footprint
+        func spreadMB() -> Double {
+            let last = highs.suffix(5)
+            return Double((last.max() ?? 0) - (last.min() ?? 0)) / 1_048_576
         }
+        while highs.count < 5 || spreadMB() >= 4 {
+            guard highs.count < 50 else {
+                let last = highs.suffix(5).map { $0 >> 20 }
+                XCTFail("the footprint never levelled off in 50 size cycles: the last five peaked at \(last) MB")
+                return
+            }
+            var high: UInt64 = 0
+            for _ in sizes {
+                resize()
+                try await Task.sleep(for: .milliseconds(20))
+                high = max(high, Self.physFootprint())
+            }
+            highs.append(high)
+        }
+        let baseline = highs.suffix(5).max() ?? 0
         var peak = baseline
         var worstLag: Duration = .zero
         let end = ContinuousClock.now + .seconds(2)
@@ -1662,7 +1687,7 @@ extension PaneTests {
         try await waitUntil("the tab closed") { appDelegate.windowControllers.isEmpty }
         let closeTime = ContinuousClock.now - closeStart
         let growthMB = Double(peak - baseline) / 1_048_576
-        print("maximized flood: growth \(Int(growthMB)) MB, worst lag \(worstLag), close \(closeTime)")
+        print("maximized flood: warm-up \(highs.count) size cycles, growth \(Int(growthMB)) MB, worst lag \(worstLag), close \(closeTime)")
         XCTAssertLessThan(growthMB, 100, "footprint grew \(growthMB) MB during the flood")
         XCTAssertLessThan(worstLag, .milliseconds(500), "main actor lagged \(worstLag)")
         XCTAssertLessThan(closeTime, .seconds(3), "closing took \(closeTime)")
