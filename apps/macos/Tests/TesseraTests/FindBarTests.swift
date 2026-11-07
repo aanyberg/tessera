@@ -118,6 +118,18 @@ final class FindBarTests: XCTestCase {
         }
     }
 
+    /// Drives the display link until the child's output fills `rows` rows
+    /// (history and screen, the cursor's row included). A query typed
+    /// before then makes the first match found current, and output after
+    /// it adds newer matches without moving it: a slow runner (CI) types
+    /// before the last lines have arrived.
+    private func waitForOutput(_ view: TerminalSurfaceView, rows: UInt64) async throws {
+        try await tick(view, until: "\(rows) rows of output", timeout: .seconds(60)) {
+            let position = try view.session.scrollPosition
+            return position.history + UInt64(position.rows) >= rows
+        }
+    }
+
     /// Opens the bar and types `query` into its field, as the user would.
     private func type(_ query: String, into view: TerminalSurfaceView) throws {
         if !view.isFindBarOpen { view.showFindBar(nil) }
@@ -154,6 +166,8 @@ final class FindBarTests: XCTestCase {
 
     func testFindNextMovesOlderAndScrollsAndFindPreviousNewerBothWrap() async throws {
         let view = try makeView("echo needle 0; seq 1 60; echo needle 1; seq 61 120; echo needle 2; exec cat > /dev/null")
+        // 123 lines and the cursor's row.
+        try await waitForOutput(view, rows: 124)
         try type("needle", into: view)
         try await tick(view, until: "three matches") { try status(view).matches == 3 && status(view).done }
         XCTAssertEqual(try status(view).current, 2)
@@ -181,6 +195,8 @@ final class FindBarTests: XCTestCase {
 
     func testANewQueryScrollsToItsNewestMatch() async throws {
         let view = try makeView("echo needle 0; echo needle 1; seq 1 60; exec cat > /dev/null")
+        // 62 lines and the cursor's row.
+        try await waitForOutput(view, rows: 63)
         try type("needle", into: view)
         try await tick(view, until: "two matches") { try status(view).matches == 2 && status(view).done }
         XCTAssertEqual(try status(view).current, 1, "the newest")
@@ -202,7 +218,8 @@ final class FindBarTests: XCTestCase {
         // so centring it would move the view.
         let view = try makeView(
             "echo needle 0; seq 1 60; echo needle 1; seq 1 8; exec cat > /dev/null", windowed: false, rows: 12)
-        try await tick(view, until: "the output") { try view.session.scrollPosition.history > 50 }
+        // 70 lines and the cursor's row.
+        try await waitForOutput(view, rows: 71)
         XCTAssertEqual(try view.session.scrollPosition.offset, 0, "at the bottom")
         try type("needle", into: view)
         try await tick(view, until: "two matches") { try status(view).matches == 2 && status(view).done }
