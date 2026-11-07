@@ -64,6 +64,7 @@ pub use tessera_search::{MAX_QUERY_BYTES, QueryError, QueryOptions};
 // Re-exported so frontends (through `tessera-ffi`) depend on this crate
 // alone, as the layering in `docs/architecture.md` requires.
 pub use config_watch::{CONFIG_DIR_POLL_INTERVAL, CONFIG_WATCH_STOP_CAP};
+pub use tessera_config::edit;
 pub use tessera_config::{Config, ConfigPaths, ConfigStore, ShellIntegration, WatchOptions};
 pub use tessera_pty::{
     ExitStatus, ForegroundProcess, MAX_FOREGROUND_NAME_BYTES, Program, PtyError, PtySize,

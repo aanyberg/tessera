@@ -1,0 +1,44 @@
+---
+source: crates/tessera-config/tests/edit.rs
+expression: read(&path)
+---
+# My Tessera setup.
+# Synced from dotfiles.
+
+[general]
+confirm_close   =   true    # I live dangerously
+fancy_unknown = "kept"
+
+[appearance]
+# Colours.
+
+# The theme I like.
+theme = "Dracula"
+font_size = 14.0 # points
+# Fully opaque.
+opacity = 1.0
+# ...and nothing after this.
+
+[terminal]
+scrollback_lines = 50_000
+
+# Plugins come last.
+[plugins]
+enabled = [
+  "hello", # the demo
+  # nothing else yet
+]
+
+[[profiles]]
+name = "Work"
+appearance.theme = "Nord"
+
+[[profiles]]
+# My shell.
+name = "Shell"
+command = "/bin/zsh -l"
+[profiles.appearance]
+font_size = 16.0
+
+[keys]
+"cmd+e" = "new_window"  # muscle memory

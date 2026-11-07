@@ -60,6 +60,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod edit;
 mod import;
 mod keys;
 mod load;

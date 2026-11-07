@@ -32,7 +32,7 @@ a low-risk change.
 | Child-controlled text in the UI: titles, process names, URLs | `tessera-app-core` (`url.rs`), `apps/macos` | S3 |
 | The C ABI | `tessera-ffi`, the TesseraKit wrapper | S7 |
 | Spawning the child: environment, fds, signals, foreground job | `tessera-pty`, `tessera-shell-integration` | S5, S7 |
-| Parsing files: config, themes, imports | `tessera-config`, `tessera-devtool` | S5 |
+| Parsing and writing files: config, themes, imports. Settings write-back (ADR 0040) writes `config.toml` and `themes/` only through a new temporary file in the target's directory, renamed (or hard-linked, for a theme) only while the file is byte for byte what was read, through a symlink to its target, with the mode kept; a hard-linked, read-only or non-regular file is not written; every edit passes the lenient loader without a new warning first | `tessera-config` (`edit.rs`), `tessera-devtool`, the config exports in `tessera-ffi` (`config.rs`) | S3, S5, S7, S8 |
 | Logging anywhere | all crates and the app | S8 |
 | New surfaces: links, control socket, plugins, images, triggers | ADR first | S9 |
 
@@ -94,6 +94,8 @@ a low-risk change.
 | Search matches | 100 000 (`MAX_MATCHES`), the newest kept; "copy all matches" at most 1 MiB (`MAX_MATCHES_TEXT_BYTES`); one search holds about 16 MB measured, plus at most 5.2 MB for the copy of the screen rows it last scanned (`MAX_KEPT_CELLS`) and one window's overlays, and peaks near 40 MB while a pattern near the size limit compiles (ADR 0038) | `crates/tessera-app-core/src/search.rs` |
 | `[keys]` table | 512 entries (`MAX_KEY_BINDINGS`), later ones dropped with one warning; chord 64 bytes (`MAX_CHORD_LEN`), checked before the grammar; command name or parameter 64 bytes (`MAX_COMMAND_NAME_LEN`); `send_text` 4096 bytes after unescaping (`MAX_SEND_TEXT_LEN`), checked while decoding; at most one warning per entry plus one for the overflow, each escaped and its key capped (S3) | `crates/tessera-config/src/keys.rs`, `crates/tessera-app-core/src/command.rs` |
 | Key map JSON (`tessera_app_keymap_json`) and `on_config_applied` | One entry per registry command (fixed), chords from the capped table; deliveries to the app coalesced to one per main-actor turn with the latest generation | `crates/tessera-ffi/src/keymap.rs`, `apps/macos/Sources/TesseraKit/CallbackBridge.swift` |
+| Config edit (`ConfigEditor`, `tessera_config_set` / `_remove`) | key path 1024 bytes, 16 steps, index 65 535 (`MAX_KEY_PATH_LEN`, `MAX_KEY_PATH_STEPS`, `MAX_KEY_PATH_INDEX`); value nesting 32 (`MAX_VALUE_DEPTH`); value JSON 64 KiB (`MAX_CONFIG_VALUE_LEN`); edited file 16 MiB, refused before it is written; user message cut to the caller's buffer; logs carry key paths only, never values (S8) | `crates/tessera-config/src/edit.rs`, `crates/tessera-ffi/src/config.rs` |
+| Theme list / import (`tessera_theme_list`, `tessera_theme_import`) | names 128 bytes (`MAX_DISPLAY_NAME_LEN`) with C0, C1, DEL and bidi formatting characters removed (S3); 256 user files (`MAX_THEME_FILES`) of the first 4096 directory entries (`MAX_THEME_DIR_ENTRIES`); import 1 MiB (`MAX_IMPORT_LEN`) and the importers' caps; id 64 bytes (`TESSERA_THEME_ID_LEN`); path 1024 bytes (`TESSERA_MAX_THEME_PATH_LEN`) | `crates/tessera-config/src/edit.rs`, `crates/tessera-ffi/src/config.rs` |
 
 ## Memory and leaks
 
