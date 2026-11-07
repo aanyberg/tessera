@@ -248,17 +248,22 @@ pub trait SessionObserver: Send + Sync {
     /// Handles one event of session `id`.
     fn on_session_event(&self, id: SessionId, event: SessionEvent);
 
-    /// The appearance every view draws with changed (theme, opacity, font
-    /// size or default cursor style, applied by
-    /// [`App::apply_config`](crate::App::apply_config));
-    /// `opaque` is whether the background is now fully opaque. The host
-    /// makes its windows translucent or opaque to match and redraws its
-    /// views: the core switches each surface's compositing mode at its
-    /// next frame, and a host whose display link idles would otherwise not
-    /// draw the new colours until the next output.
+    /// What the views draw with changed (theme, opacity, blur, font size or
+    /// default cursor style, applied by
+    /// [`App::apply_config`](crate::App::apply_config), or a session's
+    /// opacity or blur changed by
+    /// [`App::set_display_options`](crate::App::set_display_options));
+    /// `opaque` is whether every view's background is now fully opaque.
+    /// The host reads each session's
+    /// [`App::session_appearance`](crate::App::session_appearance), makes
+    /// its windows translucent or opaque and blurred or not to match (ADR
+    /// 0043), and redraws its views: the core switches each surface's
+    /// compositing mode at its next frame, and a host whose display link
+    /// idles would otherwise not draw the new colours until the next output.
     ///
-    /// Called on the thread that applied the change, the configuration
-    /// watch's thread when the change came from a file
+    /// Called on the thread that applied the change (the caller of
+    /// `set_display_options` included), the configuration watch's thread
+    /// when the change came from a file
     /// ([`App::start_config_watch`](crate::App::start_config_watch)). No
     /// lock of the `App` is held but the observer slot's, so unlike a
     /// session event this call may call back into the `App`: its views and

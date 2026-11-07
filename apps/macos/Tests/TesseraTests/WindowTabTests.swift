@@ -72,8 +72,10 @@ final class WindowTabTests: XCTestCase {
     }
 
     /// The core's `appearanceDidChange(opaque:)` reaches every tab through the
-    /// session router, the background tab included: each window follows the
-    /// opacity and each view's display link wakes to draw the new colours.
+    /// session router, the background tab included: each view's display link
+    /// wakes to draw the new colours, and each window follows its own panes'
+    /// sessions (ADR 0043), not the app-wide `opaque` flag; the host's
+    /// configuration is opaque. The translucent side is `TransparencyTests`'.
     func testAnAppearanceChangeReachesEveryTab() throws {
         let first = try appDelegate.newWindow()
         let second = try appDelegate.newTab(in: try XCTUnwrap(first.window))
@@ -97,15 +99,11 @@ final class WindowTabTests: XCTestCase {
         router.appearanceDidChange(opaque: false)
         for (controller, view) in zip(controllers, views) {
             let window = try XCTUnwrap(controller.window)
-            XCTAssertFalse(window.isOpaque, "tab \(controller.focusedPane.session.id) is translucent")
-            XCTAssertEqual(window.backgroundColor, .clear)
-            XCTAssertFalse(view.isDisplayLinkPaused, "tab \(controller.focusedPane.session.id) redraws")
+            let id = controller.focusedPane.session.id
+            XCTAssertEqual(view.backgroundAppearance, .init(opaque: true, blur: false), "tab \(id) read its session")
+            XCTAssertTrue(window.isOpaque, "tab \(id) follows its opaque session, not the flag")
+            XCTAssertFalse(view.isDisplayLinkPaused, "tab \(id) redraws")
             view.displayLinkDidFire()
-        }
-
-        router.appearanceDidChange(opaque: true)
-        for controller in controllers {
-            XCTAssertTrue(try XCTUnwrap(controller.window).isOpaque)
         }
     }
 

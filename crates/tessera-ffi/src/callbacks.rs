@@ -14,8 +14,11 @@ use tessera_app_core::{SessionEvent, SessionId, SessionObserver};
 /// # Threads
 ///
 /// Session callbacks run on an internal reader thread (one per session),
-/// and `on_appearance_changed` on the configuration watch's thread; never
-/// on the thread that calls `tessera_*`. A callback must return quickly, must
+/// and `on_appearance_changed` on the configuration watch's thread, or on
+/// the calling thread before `tessera_app_set_display_options` returns;
+/// no other callback runs on the thread that calls `tessera_*`. A host
+/// lock held around `tessera_app_set_display_options` must therefore not
+/// be taken again in `on_appearance_changed`. A callback must return quickly, must
 /// not call any `tessera_*` function, and must not wait for the thread that
 /// does (for example with a synchronous dispatch to the main queue): closing
 /// a session, replacing the callbacks and freeing the application all wait
@@ -71,16 +74,20 @@ pub struct Callbacks {
     pub on_session_exit: Option<
         unsafe extern "C" fn(user_data: *mut c_void, session_id: u64, code: i32, signal: i32),
     >,
-    /// The appearance every view draws with changed: the configuration
-    /// watch applied an edit of `config.toml` or of the theme file in use
-    /// (colours, opacity, font size or default cursor style). `opaque` is whether the background
-    /// is now fully opaque (`false`: translucent). The host makes its
-    /// windows and layers opaque or translucent to match (`isOpaque`,
-    /// background colour) and redraws every view: each surface switches
-    /// its compositing mode at its next frame, and a view whose display
-    /// link idles would otherwise keep the old colours until its next
-    /// output. Called on the configuration watch's thread; not called for
-    /// a configuration change that alters nothing the views draw. Like
+    /// What the views draw with changed: the configuration watch applied
+    /// an edit of `config.toml` or of the theme file in use (colours,
+    /// opacity, blur, font size or default cursor style), or
+    /// `tessera_app_set_display_options` changed some session's opacity or
+    /// blur. `opaque` is whether every view's background is now fully
+    /// opaque (`false`: some view is translucent). The host reads each
+    /// session's `tessera_session_appearance` and makes each window and
+    /// layer opaque or translucent, blurred or not, to match (ADR 0043),
+    /// and redraws every view: each surface switches its compositing mode
+    /// at its next frame, and a view whose display link idles would
+    /// otherwise keep the old colours until its next output. Called on the
+    /// configuration watch's thread, or on the calling thread before
+    /// `tessera_app_set_display_options` returns; not called for a change
+    /// that alters nothing the views draw (a blur-only change is reported). Like
     /// every callback it must not call `tessera_*`: in particular
     /// `tessera_app_set_callbacks` or `tessera_app_free` from it deadlocks,
     /// since both wait for this call to return.

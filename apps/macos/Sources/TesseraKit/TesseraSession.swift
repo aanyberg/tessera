@@ -121,6 +121,37 @@ public final class TesseraSession: Sendable, Identifiable {
         return ForegroundProcess(pid: job.pid, name: name)
     }
 
+    /// How the session's background is drawn, as ``appearance()`` reports it
+    /// (ADR 0043).
+    public struct Appearance: Sendable, Equatable {
+        /// The background is fully opaque.
+        public let opaque: Bool
+        /// Blur what shows through the translucent background. Never true
+        /// while ``opaque`` is.
+        public let blur: Bool
+
+        public init(opaque: Bool, blur: Bool) {
+            self.opaque = opaque
+            self.blur = blur
+        }
+    }
+
+    /// How the session's background is drawn now: it follows the session's
+    /// profile, the configuration in effect and
+    /// ``TesseraApp/setDisplayOptions(_:)``. Read it when the session's view
+    /// is set up and again on
+    /// ``TesseraAppDelegate/appearanceDidChange(opaque:)``.
+    ///
+    /// - Throws: ``TesseraCoreError/sessionNotFound`` once the session is
+    ///   closed, ``TesseraCoreError/nullPointer`` after the application shut
+    ///   down.
+    @MainActor
+    public func appearance() throws -> Appearance {
+        var look = TesseraSessionAppearance()
+        try TesseraCoreError.check(tessera_session_appearance(core.pointer, id, &look))
+        return Appearance(opaque: look.opaque, blur: look.blur)
+    }
+
     /// Hangs up the child and forgets the session, returning at once. No
     /// delegate call for it follows, not even the exit, however late the child
     /// exits. The core reaps the child in the background, killing it if it

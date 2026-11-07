@@ -39,7 +39,7 @@ use tessera_render::Theme;
 
 use crate::input::Bindings;
 use crate::session::{ObserverSlot, Session, lock, run_thread_start_hook};
-use crate::view::{self, Look, View};
+use crate::view::{self, DisplayOptions, Look, View};
 use crate::{App, SessionId};
 
 /// How long dropping the [`App`] waits for the apply thread to finish the
@@ -74,9 +74,13 @@ pub(crate) struct Applied {
     /// The theme file `colours` came from, `None` for a bundled theme, the
     /// default, or colours handed to [`App::apply_config`] directly.
     pub(crate) source: Option<PathBuf>,
-    /// Counts the configurations applied: a session keeps the look of the
-    /// latest one it was given ([`Session::set_look`]).
+    /// Counts the configurations applied, and the display options set: a
+    /// session keeps the look of the latest one it was given
+    /// ([`Session::set_look`]).
     pub(crate) generation: u64,
+    /// The host's display options ([`App::set_display_options`]), applied
+    /// to every look.
+    pub(crate) display: DisplayOptions,
 }
 
 /// What looking the theme up again gave.
@@ -110,21 +114,25 @@ pub(crate) struct Looks<'a> {
     themes_dir: &'a Path,
     config: &'a Config,
     colours: &'a tessera_config::Theme,
+    display: DisplayOptions,
     resolved: HashMap<String, Option<tessera_config::Theme>>,
 }
 
 impl<'a> Looks<'a> {
     /// Looks for `config`, whose `[appearance]` theme resolved to
-    /// `colours`; other themes are looked up in `themes_dir`.
+    /// `colours`, drawn under `display`; other themes are looked up in
+    /// `themes_dir`.
     pub(crate) fn new(
         themes_dir: &'a Path,
         config: &'a Config,
         colours: &'a tessera_config::Theme,
+        display: DisplayOptions,
     ) -> Self {
         Self {
             themes_dir,
             config,
             colours,
+            display,
             resolved: HashMap::new(),
         }
     }
@@ -153,7 +161,7 @@ impl<'a> Looks<'a> {
 
     fn with(&mut self, appearance: tessera_config::Appearance, previous: Option<&Look>) -> Look {
         if appearance.theme == self.config.appearance.theme {
-            return Look::new(appearance, self.colours.clone());
+            return Look::new(appearance, self.colours.clone(), self.display);
         }
         let themes_dir = self.themes_dir;
         let resolved = self
@@ -179,7 +187,7 @@ impl<'a> Looks<'a> {
             // to (`Theme::resolve` warned).
             (None, _) => tessera_config::Theme::resolve(themes_dir, &appearance.theme).theme,
         };
-        Look::new(appearance, colours)
+        Look::new(appearance, colours, self.display)
     }
 }
 
@@ -224,27 +232,47 @@ impl Live {
         source: Option<PathBuf>,
     ) -> bool {
         let config = Arc::new(config.clone());
-        let generation = {
+        let (generation, display) = {
             let mut applied = lock(&self.applied);
             let generation = applied.generation + 1;
+            let display = applied.display;
             *applied = Applied {
                 config: Arc::clone(&config),
                 colours: colours.clone(),
                 source,
                 generation,
+                display,
             };
-            generation
+            (generation, display)
         };
+        self.restyle_at(&config, colours, generation, display)
+    }
+
+    /// The part of [`Live::restyle`] after the configuration is recorded:
+    /// gives every session its look under `config`, `colours` and
+    /// `display` at `generation`, updates the views and tells the
+    /// observer.
+    fn restyle_at(
+        &self,
+        config: &Config,
+        colours: &tessera_config::Theme,
+        generation: u64,
+        display: DisplayOptions,
+    ) -> bool {
         // Listed after the configuration is recorded: a session that starts
         // meanwhile and is not listed reads it once listed (`App::attach`).
         let sessions: Vec<(SessionId, Arc<Session>)> = lock(&self.sessions)
             .iter()
             .map(|(id, session)| (*id, Arc::clone(session)))
             .collect();
-        let mut looks = Looks::new(&self.themes_dir, &config, colours);
+        let mut looks = Looks::new(&self.themes_dir, config, colours, display);
         let default_look = looks.default_look();
         let mut restyled: HashMap<SessionId, (Arc<Look>, &Arc<Session>)> = HashMap::new();
         let mut cursor_changed = false;
+        // Blur is the host's to draw, not the views': a change of it alone
+        // (`blur` toggled at an unchanged translucent opacity) still tells
+        // the host, which reads it per session (`App::session_appearance`).
+        let mut blur_changed = false;
         for (id, session) in &sessions {
             let previous = session.look();
             let look = Arc::new(looks.of(session.profile(), Some(&previous)));
@@ -253,6 +281,7 @@ impl Live {
             };
             let cursor = old.cursor() != look.cursor();
             cursor_changed |= cursor;
+            blur_changed |= old.blur != look.blur;
             if cursor || old.colours != look.colours {
                 // Each terminal's lock, with no other lock held (ADR 0014).
                 // A session the program gave a shape of its own keeps it
@@ -299,10 +328,11 @@ impl Live {
             }
         }
         *current = default_look.theme.clone();
-        // The host has one opacity switch for all its windows: opaque only
-        // while every view is, so a translucent view is never drawn over
-        // an opaque window's backing. With no view, what a new one would
-        // be.
+        // Opacity is per tab window (ADR 0043): the host keeps a window
+        // opaque only while every view in it is, so a translucent view is
+        // never drawn over an opaque window's backing. This aggregate is
+        // what the host reports across all views; with no view, what a
+        // new one would be.
         let opaque = if views.is_empty() {
             !view::is_translucent(&default_look.theme)
         } else {
@@ -334,7 +364,7 @@ impl Live {
                 tracing::warn!(session = %id, %error, ?size, "resizing a session to its view failed");
             }
         }
-        let changed = theme_changed || font_changed || cursor_changed;
+        let changed = theme_changed || font_changed || cursor_changed || blur_changed;
         if changed {
             self.notify(opaque);
         }
@@ -345,21 +375,48 @@ impl Live {
     /// effect if one was applied after it resolved its own, and its
     /// terminal that look's defaults (`App::attach`).
     pub(crate) fn catch_up(&self, session: &Session) {
-        let (config, colours, generation) = {
+        let (config, colours, generation, display) = {
             let applied = lock(&self.applied);
+            (
+                Arc::clone(&applied.config),
+                applied.colours.clone(),
+                applied.generation,
+                applied.display,
+            )
+        };
+        if session.look_generation() < generation {
+            let previous = session.look();
+            let look = Looks::new(&self.themes_dir, &config, &colours, display)
+                .of(session.profile(), Some(&previous));
+            session.set_look(generation, Arc::new(look));
+        }
+        session.push_look();
+    }
+
+    /// Records the host's display options and, when they changed, gives
+    /// every session its look under them, with the configuration and the
+    /// colours in effect ([`App::set_display_options`]). Returns whether
+    /// anything drawn changed (and so whether the observer was told).
+    ///
+    /// The options, the configuration they apply with and the generation
+    /// are taken under one hold of the `applied` lock, so a configuration
+    /// the watch applies meanwhile is never replaced by the older one, and
+    /// whichever restyle comes second carries both.
+    pub(crate) fn set_display(&self, display: DisplayOptions) -> bool {
+        let (config, colours, generation) = {
+            let mut applied = lock(&self.applied);
+            if applied.display == display {
+                return false;
+            }
+            applied.display = display;
+            applied.generation += 1;
             (
                 Arc::clone(&applied.config),
                 applied.colours.clone(),
                 applied.generation,
             )
         };
-        if session.look_generation() < generation {
-            let previous = session.look();
-            let look = Looks::new(&self.themes_dir, &config, &colours)
-                .of(session.profile(), Some(&previous));
-            session.set_look(generation, Arc::new(look));
-        }
-        session.push_look();
+        self.restyle_at(&config, &colours, generation, display)
     }
 
     /// Compiles `config`'s key map when its `[keys]` changed, counts the
@@ -2263,8 +2320,12 @@ mod tests {
         .unwrap()
         .config;
         let colours = bundled("Dracula");
-        let previous = Look::new(config.profile_appearance(Some("p")), bundled("Nord"));
-        let mut looks = Looks::new(dir.path(), &config, &colours);
+        let previous = Look::new(
+            config.profile_appearance(Some("p")),
+            bundled("Nord"),
+            DisplayOptions::default(),
+        );
+        let mut looks = Looks::new(dir.path(), &config, &colours, DisplayOptions::default());
         assert_eq!(
             looks.of(Some("p"), Some(&previous)).colours,
             previous.colours
@@ -2352,6 +2413,7 @@ mod tests {
         let stale = Arc::new(Look::new(
             tessera_config::Appearance::default(),
             bundled("Dracula"),
+            DisplayOptions::default(),
         ));
         assert!(session.set_look(0, stale).is_none());
         assert_eq!(session.look().appearance.theme, "Nord");
@@ -2379,6 +2441,220 @@ mod tests {
         assert_eq!(
             app.view_theme().background.to_srgb8()[..3],
             srgb(bundled("Nord").background)
+        );
+    }
+
+    /// A configuration whose `[appearance]` is translucent and blurred,
+    /// with an opaque profile `solid`, an unblurred translucent profile
+    /// `clear` and a blurred translucent one `frosted`.
+    fn translucency_config() -> Config {
+        Config::from_toml_lenient(
+            "[appearance]\n\
+             theme = \"Dracula\"\n\
+             opacity = 0.5\n\
+             blur = true\n\
+             [[profiles]]\n\
+             name = \"solid\"\n\
+             [profiles.appearance]\n\
+             opacity = 1.0\n\
+             [[profiles]]\n\
+             name = \"clear\"\n\
+             [profiles.appearance]\n\
+             blur = false\n\
+             [[profiles]]\n\
+             name = \"frosted\"\n\
+             [profiles.appearance]\n\
+             opacity = 0.8\n\
+             blur = true\n",
+        )
+        .unwrap()
+        .config
+    }
+
+    const REDUCE: DisplayOptions = DisplayOptions {
+        reduce_transparency: true,
+    };
+
+    fn appearance(opaque: bool, blur: bool) -> crate::SessionAppearance {
+        crate::SessionAppearance { opaque, blur }
+    }
+
+    /// Each session reports its own profile's translucency and blur
+    /// (ADR 0043): blur only where the profile asks for it and its
+    /// background is translucent.
+    #[test]
+    fn session_appearance_follows_each_profile() {
+        let app = App::new(
+            translucency_config(),
+            ConfigPaths::new("/nonexistent/tessera"),
+        );
+        let plain = attach_fake_profile(&app, None);
+        let solid = attach_fake_profile(&app, Some("solid"));
+        let clear = attach_fake_profile(&app, Some("clear"));
+        let frosted = attach_fake_profile(&app, Some("frosted"));
+        assert_eq!(
+            app.session_appearance(plain).unwrap(),
+            appearance(false, true)
+        );
+        assert_eq!(
+            app.session_appearance(solid).unwrap(),
+            appearance(true, false)
+        );
+        assert_eq!(
+            app.session_appearance(clear).unwrap(),
+            appearance(false, false)
+        );
+        assert_eq!(
+            app.session_appearance(frosted).unwrap(),
+            appearance(false, true)
+        );
+        assert!(matches!(
+            app.session_appearance(SessionId::from_raw(9999)),
+            Err(crate::Error::SessionNotFound(_))
+        ));
+    }
+
+    /// Reduce Transparency (ADR 0043) makes every session opaque and
+    /// unblurred, its views' backgrounds drawn opaque, and tells the
+    /// observer once; the same options again change nothing; turning it
+    /// off brings each profile's translucency and blur back. The options
+    /// last across a configuration apply and reach sessions started later.
+    #[test]
+    fn reduce_transparency_makes_every_session_opaque_until_turned_off() {
+        let config = translucency_config();
+        let app = App::new(config.clone(), ConfigPaths::new("/nonexistent/tessera"));
+        let recorder = Recorder::default();
+        app.set_observer(Some(Box::new(recorder.clone())));
+        let plain = attach_fake_profile(&app, None);
+        let frosted = attach_fake_profile(&app, Some("frosted"));
+        let views = attach_offscreen(&app, plain);
+        if views {
+            assert_eq!(corner(&app, plain)[3], 128, "translucent before");
+        }
+        let generation = app.config_generation();
+
+        app.set_display_options(REDUCE);
+        assert_eq!(app.display_options(), REDUCE);
+        assert_eq!(recorder.take(), [true], "told once, opaque");
+        assert_eq!(app.config_generation(), generation, "no new configuration");
+        for id in [plain, frosted] {
+            assert_eq!(app.session_appearance(id).unwrap(), appearance(true, false));
+        }
+        assert!(!view::is_translucent(&app.view_theme()));
+        if views {
+            assert_eq!(corner(&app, plain)[3], 255, "the view draws opaque");
+        }
+
+        app.set_display_options(REDUCE);
+        assert_eq!(recorder.take(), Vec::<bool>::new(), "unchanged: not told");
+
+        // A configuration applied meanwhile keeps the options.
+        let mut edited = config.clone();
+        edited.appearance.opacity = 0.6;
+        app.apply_config(&edited, &bundled("Dracula"));
+        assert_eq!(
+            app.session_appearance(plain).unwrap(),
+            appearance(true, false)
+        );
+        let late = attach_fake_profile(&app, None);
+        assert_eq!(
+            app.session_appearance(late).unwrap(),
+            appearance(true, false)
+        );
+        recorder.take();
+
+        app.set_display_options(DisplayOptions::default());
+        assert_eq!(recorder.take(), [false], "told once, translucent");
+        for id in [plain, frosted, late] {
+            assert_eq!(app.session_appearance(id).unwrap(), appearance(false, true));
+        }
+        if views {
+            assert_eq!(corner(&app, plain)[3], 153, "0.6 again, the edited opacity");
+        }
+    }
+
+    /// With no session, Reduce Transparency still turns the App's theme
+    /// (what a new view would draw) opaque, and a session started under
+    /// it starts opaque.
+    #[test]
+    fn reduce_transparency_set_before_any_session_applies_to_the_first() {
+        let app = App::new(
+            translucency_config(),
+            ConfigPaths::new("/nonexistent/tessera"),
+        );
+        let recorder = Recorder::default();
+        app.set_observer(Some(Box::new(recorder.clone())));
+        assert!(view::is_translucent(&app.view_theme()));
+        app.set_display_options(REDUCE);
+        assert_eq!(recorder.take(), [true]);
+        assert!(!view::is_translucent(&app.view_theme()));
+        let id = attach_fake_profile(&app, Some("frosted"));
+        assert_eq!(app.session_appearance(id).unwrap(), appearance(true, false));
+    }
+
+    /// Toggling `blur` alone, at an unchanged translucent opacity, changes
+    /// nothing the views draw but still tells the observer, which draws
+    /// the blur (ADR 0043).
+    #[test]
+    fn toggling_blur_alone_tells_the_observer() {
+        let mut config = translucency_config();
+        let app = App::new(config.clone(), ConfigPaths::new("/nonexistent/tessera"));
+        let recorder = Recorder::default();
+        app.set_observer(Some(Box::new(recorder.clone())));
+        let id = attach_fake_profile(&app, None);
+        let dracula = bundled("Dracula");
+        config.appearance.blur = false;
+        app.apply_config(&config, &dracula);
+        assert_eq!(recorder.take(), [false]);
+        assert_eq!(
+            app.session_appearance(id).unwrap(),
+            appearance(false, false)
+        );
+        config.appearance.blur = true;
+        app.apply_config(&config, &dracula);
+        assert_eq!(recorder.take(), [false]);
+        assert_eq!(app.session_appearance(id).unwrap(), appearance(false, true));
+    }
+
+    /// A configuration applied after the display options changed is the
+    /// one in effect, with the options; options set after a configuration
+    /// was applied never bring an older configuration back (they restyle
+    /// with the one in effect).
+    #[test]
+    fn display_options_restyle_with_the_configuration_in_effect() {
+        let config = translucency_config();
+        let app = App::new(config.clone(), ConfigPaths::new("/nonexistent/tessera"));
+        let id = attach_fake_profile(&app, None);
+        let mut nord = config.clone();
+        nord.appearance.theme = "Nord".into();
+        app.apply_config(&nord, &bundled("Nord"));
+        app.set_display_options(REDUCE);
+        assert_eq!(app.config().appearance.theme, "Nord");
+        let session = app.session(id).unwrap();
+        assert_eq!(session.look().appearance.theme, "Nord");
+        assert_eq!(session.look().colours, bundled("Nord"));
+        assert!(session.look().is_opaque());
+    }
+
+    /// A restyle of the configuration thread that recorded its generation
+    /// before the options were set, and runs after them, is older than
+    /// theirs: it cannot undo them.
+    #[test]
+    fn a_restyle_older_than_the_display_options_cannot_undo_them() {
+        let config = translucency_config();
+        let app = App::new(config.clone(), ConfigPaths::new("/nonexistent/tessera"));
+        let id = attach_fake_profile(&app, None);
+        let (before, colours) = {
+            let applied = lock(&app.applied);
+            (applied.generation, applied.colours.clone())
+        };
+        app.set_display_options(REDUCE);
+        app.live()
+            .restyle_at(&config, &colours, before, DisplayOptions::default());
+        assert_eq!(
+            app.session_appearance(id).unwrap(),
+            appearance(true, false),
+            "the late restyle was refused"
         );
     }
 }

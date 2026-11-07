@@ -188,25 +188,70 @@ fn whole_px(v: f32) -> u32 {
 /// alpha `a / 255`. The background's alpha is the theme's multiplied by
 /// `appearance.opacity`, so an opaque theme at opacity 1.0 stays opaque
 /// and a translucent theme background stays as translucent as written.
-/// Line height and padding are the renderer's defaults.
+/// Line height and padding are the renderer's defaults. The host's display
+/// options are the defaults (none on); [`theme_for_appearance`] takes them.
 #[must_use]
 pub fn theme_for(config: &Config, theme: &tessera_config::Theme) -> Theme {
-    theme_for_appearance(&config.appearance, theme)
+    theme_for_appearance(&config.appearance, theme, DisplayOptions::default())
+}
+
+/// The host's accessibility display settings that change how every
+/// session is drawn, whatever its configuration says (ADR 0043). The host
+/// reads them from the system and hands them to
+/// [`App::set_display_options`] at start and whenever they change. New
+/// settings are added as fields, each off by default, so
+/// `DisplayOptions::default()` draws what the configuration says.
+///
+/// [`App::set_display_options`]: crate::App::set_display_options
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DisplayOptions {
+    /// The system's Reduce Transparency setting: every background is drawn
+    /// fully opaque (`appearance.opacity` taken as 1.0, and a translucent
+    /// theme background made opaque too) and nothing is blurred.
+    pub reduce_transparency: bool,
+}
+
+/// How one session's background is drawn ([`App::session_appearance`],
+/// ADR 0043), for the host, which owns the window behind it.
+///
+/// [`App::session_appearance`]: crate::App::session_appearance
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionAppearance {
+    /// The background is fully opaque: nothing behind the view shows
+    /// through it. The host's window is opaque only while every view in it
+    /// is.
+    pub opaque: bool,
+    /// The host blurs what shows through the background: the session's
+    /// resolved `appearance.blur`, while the background is translucent and
+    /// Reduce Transparency is off. Never set while `opaque` is.
+    pub blur: bool,
 }
 
 /// [`theme_for`] with `appearance` in place of `[appearance]`: the theme a
 /// session of a profile draws with, `appearance` being the profile's keys
 /// over `[appearance]` ([`tessera_config::ProfileAppearance::over`]) and
-/// `theme` the colours its `theme` resolved to.
+/// `theme` the colours its `theme` resolved to, under the host's `display`
+/// options. With [`DisplayOptions::reduce_transparency`] the background
+/// is fully opaque, whatever `appearance.opacity` and the theme's alpha
+/// say.
 #[must_use]
-pub fn theme_for_appearance(appearance: &Appearance, theme: &tessera_config::Theme) -> Theme {
+pub fn theme_for_appearance(
+    appearance: &Appearance,
+    theme: &tessera_config::Theme,
+    display: DisplayOptions,
+) -> Theme {
     let background = rgba(theme.background);
+    let alpha = if display.reduce_transparency {
+        1.0
+    } else {
+        background.a * appearance.opacity
+    };
     let defaults = Theme::default();
     Theme {
         font_family: appearance.font_family.clone(),
         font_size: sanitize_font_size(appearance.font_size),
         foreground: rgba(theme.foreground),
-        background: background.with_alpha(background.a * appearance.opacity),
+        background: background.with_alpha(alpha),
         cursor: rgba(theme.cursor),
         selection: rgba(theme.selection),
         search_match: theme.search_match.map_or(defaults.search_match, rgba),
@@ -222,26 +267,42 @@ pub fn theme_for_appearance(appearance: &Appearance, theme: &tessera_config::The
 /// (`[appearance]` with the profile's keys over it), the colours that
 /// appearance's theme resolved to, and the renderer theme of both. Kept
 /// by the session from its start and replaced on every configuration
-/// applied, so a frame never resolves it.
+/// applied and every change of the host's display options, so a frame
+/// never resolves it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Look {
     /// The appearance in effect for the session.
     pub(crate) appearance: Appearance,
     /// `appearance.theme`, resolved.
     pub(crate) colours: tessera_config::Theme,
-    /// [`theme_for_appearance`] of both.
+    /// [`theme_for_appearance`] of both, under the display options.
     pub(crate) theme: Theme,
+    /// Whether the host blurs what shows through the session's background
+    /// (ADR 0043): `appearance.blur` while that background is translucent,
+    /// so never under Reduce Transparency, which makes it opaque.
+    pub(crate) blur: bool,
 }
 
 impl Look {
-    /// The look of `appearance` drawn in `colours`.
-    pub(crate) fn new(appearance: Appearance, colours: tessera_config::Theme) -> Self {
-        let theme = theme_for_appearance(&appearance, &colours);
+    /// The look of `appearance` drawn in `colours` under `display`.
+    pub(crate) fn new(
+        appearance: Appearance,
+        colours: tessera_config::Theme,
+        display: DisplayOptions,
+    ) -> Self {
+        let theme = theme_for_appearance(&appearance, &colours, display);
+        let blur = appearance.blur && is_translucent(&theme);
         Self {
             appearance,
             colours,
             theme,
+            blur,
         }
+    }
+
+    /// Whether the session's background is fully opaque.
+    pub(crate) fn is_opaque(&self) -> bool {
+        !is_translucent(&self.theme)
     }
 
     /// The session's default cursor style ([`cursor_style_for_appearance`]).
@@ -1320,6 +1381,74 @@ mod tests {
         let theme = theme_for(&Config::default(), &tessera_config::Theme::default());
         assert_eq!(theme, Theme::default());
         assert!((theme.selection.a - 0.6).abs() < f32::EPSILON);
+    }
+
+    /// Reduce Transparency (ADR 0043) draws every background fully
+    /// opaque, at any opacity and with a translucent theme background,
+    /// and keeps its colour; off, the alpha is the theme's times the
+    /// opacity, as `theme_for` gives.
+    #[test]
+    fn reduce_transparency_makes_every_background_opaque() {
+        use tessera_config::Color;
+
+        let reduce = DisplayOptions {
+            reduce_transparency: true,
+        };
+        let mut source = tessera_config::Theme::bundled("Dracula").unwrap().clone();
+        for (background_alpha, opacity) in [(0xff, 1.0), (0xff, 0.5), (0x80, 1.0), (0x80, 0.0)] {
+            source.background = Color::rgb(0x28, 0x2a, 0x36).with_alpha(background_alpha);
+            let mut appearance = Appearance {
+                opacity,
+                ..Appearance::default()
+            };
+            let reduced = theme_for_appearance(&appearance, &source, reduce);
+            assert!(
+                (reduced.background.a - 1.0).abs() < f32::EPSILON,
+                "alpha {background_alpha:#x} at opacity {opacity}: {}",
+                reduced.background.a
+            );
+            assert!(!is_translucent(&reduced));
+            assert_eq!(
+                reduced.background.to_srgb8()[..3],
+                [0x28, 0x2a, 0x36],
+                "the theme's colour, only opaque"
+            );
+            appearance.blur = true;
+            let plain = theme_for_appearance(&appearance, &source, DisplayOptions::default());
+            let config = Config {
+                appearance: appearance.clone(),
+                ..Config::default()
+            };
+            assert_eq!(plain, theme_for(&config, &source));
+            let expected = f32::from(background_alpha) / 255.0 * opacity;
+            assert!((plain.background.a - expected).abs() < 1e-6);
+        }
+    }
+
+    /// A look blurs only while its background is translucent: `blur` at
+    /// opacity 1.0 (nothing shows through) or under Reduce Transparency
+    /// gives none.
+    #[test]
+    fn a_look_blurs_only_a_translucent_background() {
+        let colours = tessera_config::Theme::bundled("Dracula").unwrap().clone();
+        let reduce = DisplayOptions {
+            reduce_transparency: true,
+        };
+        let look = |opacity: f32, blur: bool, display: DisplayOptions| {
+            let appearance = Appearance {
+                opacity,
+                blur,
+                ..Appearance::default()
+            };
+            let look = Look::new(appearance, colours.clone(), display);
+            (look.is_opaque(), look.blur)
+        };
+        let off = DisplayOptions::default();
+        assert_eq!(look(0.5, true, off), (false, true));
+        assert_eq!(look(0.5, false, off), (false, false));
+        assert_eq!(look(1.0, true, off), (true, false));
+        assert_eq!(look(0.5, true, reduce), (true, false));
+        assert_eq!(look(1.0, false, reduce), (true, false));
     }
 
     #[test]
