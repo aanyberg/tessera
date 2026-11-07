@@ -719,7 +719,7 @@ fn render_section(out: &mut String, section: &Section) {
 mod tests {
     use std::collections::BTreeMap;
 
-    use tessera_config::Profile;
+    use tessera_config::{Profile, ProfileAppearance};
 
     use super::*;
 
@@ -836,7 +836,7 @@ mod tests {
         // so each leaf has a value unless it is a `None` by default.
         let oracle = Config {
             profiles: vec![Profile {
-                appearance: Some(Appearance::default()),
+                appearance: Some(ProfileAppearance::default()),
                 ..Profile::default()
             }],
             ..Config::default()

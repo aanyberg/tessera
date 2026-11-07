@@ -108,14 +108,14 @@ use std::time::{Duration, Instant};
 use tessera_grid::Grid;
 use tessera_pty::{ExitStatus, ForegroundProcess, Pty, PtyError, PtyEvent, PtyEvents, PtySize};
 use tessera_shell_integration::{Cwd, parse_osc7, parse_osc1337, scripts};
-use tessera_term::{CursorStyle, Request, Terminal};
+use tessera_term::{Request, Terminal};
 
 use crate::config_watch::Applied;
 use crate::input::MouseEvent;
 use crate::mouse;
 use crate::search::{SearchState, TerminalSource};
 use crate::selection::SelectionState;
-use crate::view::{MAX_VIEW_COLS, MAX_VIEW_ROWS};
+use crate::view::{Look, MAX_VIEW_COLS, MAX_VIEW_ROWS};
 use crate::{ScrollPosition, ScrollTarget};
 
 /// How long a closing session's child gets to exit after `SIGHUP` before it
@@ -535,6 +535,15 @@ pub(crate) struct Session {
     /// Resizes so far, counted under the terminal lock: a resize re-wraps
     /// the history, so the search's matches hold only until the next one.
     resizes: AtomicU64,
+    /// The `[[profiles]]` entry the session started with, by name; `None`
+    /// for the built-in profile (`[appearance]`). Its look is resolved
+    /// against each configuration applied by this name (#39).
+    profile: Option<String>,
+    /// The session's look and the generation of the configuration it was
+    /// resolved from ([`crate::config_watch::Applied::generation`]), so of
+    /// two applies racing the newer one's look stays. Taken after the
+    /// terminal lock when both are held, never the other way round.
+    look: Mutex<(u64, Arc<Look>)>,
 }
 
 /// What a session's shell integration scripts reported (ADR 0022): its
@@ -872,8 +881,8 @@ impl ScrollAnchor {
 impl Session {
     /// Wraps a spawned PTY and starts the writer thread for its input and
     /// the reader thread for its events. Both wake `signal` when they end.
-    /// The terminal has `cursor` as its default cursor style, the theme
-    /// colours of `applied` ([`crate::view::theme_colors_for`]) and keeps
+    /// The terminal has `look`'s cursor style as its default and its theme
+    /// colours ([`crate::view::theme_colors_for`]) and keeps
     /// at most `scrollback` lines of history (`[terminal]
     /// scrollback_lines`) before the reader feeds it the first byte. The reader reads
     /// `applied` for the clipboard setting in effect.
@@ -886,7 +895,7 @@ impl Session {
         pty: Box<dyn Pty>,
         events: PtyEvents,
         size: PtySize,
-        cursor: CursorStyle,
+        (profile, look): (Option<String>, (u64, Arc<Look>)),
         scrollback: usize,
         observers: ObserverSlot,
         applied: Arc<Mutex<Applied>>,
@@ -894,8 +903,8 @@ impl Session {
     ) -> io::Result<Self> {
         let pty = Arc::new(Mutex::new(pty));
         let mut terminal = Terminal::new(size.rows, size.cols);
-        terminal.set_default_cursor_style(cursor);
-        terminal.set_theme_colors(crate::view::theme_colors_for(&lock(&applied).colours));
+        terminal.set_default_cursor_style(look.1.cursor());
+        terminal.set_theme_colors(crate::view::theme_colors_for(&look.1.colours));
         terminal.set_max_scrollback(scrollback);
         let term = Arc::new(SharedTerminal::new(terminal));
         let muted = Arc::new(AtomicBool::new(false));
@@ -944,7 +953,47 @@ impl Session {
             selection: Mutex::new(SelectionState::default()),
             search: Mutex::new(SearchState::default()),
             resizes: AtomicU64::new(0),
+            profile,
+            look: Mutex::new(look),
         })
+    }
+
+    /// The profile the session started with, `None` for the built-in one.
+    pub(crate) fn profile(&self) -> Option<&str> {
+        self.profile.as_deref()
+    }
+
+    /// The session's look now.
+    pub(crate) fn look(&self) -> Arc<Look> {
+        Arc::clone(&lock(&self.look).1)
+    }
+
+    /// The generation of the configuration the look was resolved from.
+    pub(crate) fn look_generation(&self) -> u64 {
+        lock(&self.look).0
+    }
+
+    /// Replaces the look with `look`, resolved from the configuration of
+    /// `generation`, unless the one it has is from a later configuration;
+    /// returns the look replaced.
+    pub(crate) fn set_look(&self, generation: u64, look: Arc<Look>) -> Option<Arc<Look>> {
+        let mut slot = lock(&self.look);
+        if slot.0 > generation {
+            return None;
+        }
+        let old = std::mem::replace(&mut slot.1, look);
+        slot.0 = generation;
+        Some(old)
+    }
+
+    /// Gives the terminal the look's cursor style and theme colours as its
+    /// defaults, read under the terminal lock (terminal, then look), so of
+    /// two applies racing the last to get here leaves the newest look.
+    pub(crate) fn push_look(&self) {
+        let mut term = self.term.lock();
+        let look = self.look();
+        term.set_default_cursor_style(look.cursor());
+        term.set_theme_colors(crate::view::theme_colors_for(&look.colours));
     }
 
     /// The working directory the session's shell last reported (OSC 7).
@@ -1040,7 +1089,17 @@ impl Session {
     pub(crate) fn resize(&self, size: PtySize) -> Result<(), PtyError> {
         check_size(size)?;
         {
+            // Selection, then terminal (ADR 0025). A resize to another
+            // number of rows or columns re-wraps the text under the
+            // selection, so it goes, under the same terminal lock as the
+            // re-wrap: also when the configuration's apply thread resizes
+            // (a font size change), not only through `App::resize` (#284).
+            let mut selection = lock(&self.selection);
             let mut term = self.term.lock();
+            if (term.grid().rows(), term.grid().cols()) != (size.rows, size.cols) {
+                selection.clear();
+            }
+            drop(selection);
             let before = History::of(term.grid());
             term.resize(size.rows, size.cols);
             self.resizes.fetch_add(1, Ordering::Relaxed);
@@ -1987,7 +2046,7 @@ fn pause_at(key: usize, at: LockPause) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::mpsc::{RecvTimeoutError, SyncSender};
 
     use tessera_pty::PtyEvent;
@@ -3362,7 +3421,7 @@ mod tests {
     }
 
     /// Runs `f` with a [`Recorder`] on this thread; its warnings.
-    fn warnings(f: impl FnOnce()) -> Vec<String> {
+    pub(crate) fn warnings(f: impl FnOnce()) -> Vec<String> {
         let recorded = Recorded::default();
         tracing::subscriber::with_default(Recorder(Arc::clone(&recorded)), f);
         let events = lock(&recorded).clone();

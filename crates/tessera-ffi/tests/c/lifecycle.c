@@ -114,6 +114,16 @@ int main(void) {
         return 1;
     }
     options.rows = 24;
+    /* So is a profile name one byte past the header's bound (#39). */
+    char long_profile[TESSERA_MAX_PROFILE_NAME_LEN + 2];
+    memset(long_profile, 'p', sizeof long_profile - 1);
+    long_profile[sizeof long_profile - 1] = '\0';
+    options.profile = long_profile;
+    if (tessera_session_spawn(app, &options, &id) != TESSERA_ERROR_INVALID_ARGUMENT || id != 0) {
+        fprintf(stderr, "a profile name past TESSERA_MAX_PROFILE_NAME_LEN should fail\n");
+        return 1;
+    }
+    options.profile = NULL;
     CHECK(tessera_session_spawn(app, &options, &id));
     CHECK(tessera_session_resize(app, id, TESSERA_MAX_ROWS, TESSERA_MAX_COLS, 0, 0));
     CHECK(tessera_session_resize(app, id, 30, 100, 0, 0));

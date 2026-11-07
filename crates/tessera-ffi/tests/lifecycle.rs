@@ -228,6 +228,7 @@ fn default_options() -> SpawnOptions {
         cols: 80,
         width_px: 0,
         height_px: 0,
+        profile: ptr::null(),
     }
 }
 
@@ -471,6 +472,89 @@ fn bad_spawn_requests_fail_cleanly() {
     let app = Handle::observed(&recorder);
     let id = app.spawn("/bin/sh", &["-c", "exit 0"]).unwrap();
     assert_eq!(recorder.wait_exit(id), (0, 0));
+}
+
+/// A profile name is bounded and UTF-8 (docs/security.md S7): one byte
+/// past `TESSERA_MAX_PROFILE_NAME_LEN`, or a name that is not UTF-8, is
+/// refused before anything runs; a name of the longest length that no
+/// profile has falls back to the default profile and spawns.
+#[test]
+fn profile_names_are_bounded_and_utf8() {
+    assert_eq!(
+        tessera_ffi::MAX_PROFILE_NAME_LEN,
+        128,
+        "the header documents it"
+    );
+    let app = Handle::new();
+    let program = c"/bin/sh";
+    let args = [c"-c".as_ptr(), c"exit 0".as_ptr()];
+    let named = |name: &CStr| SpawnOptions {
+        program: program.as_ptr(),
+        args: args.as_ptr(),
+        arg_count: args.len(),
+        profile: name.as_ptr(),
+        ..default_options()
+    };
+    let too_long = CString::new("p".repeat(tessera_ffi::MAX_PROFILE_NAME_LEN + 1)).unwrap();
+    assert_eq!(
+        app.spawn_with(&named(&too_long)),
+        Err(Error::InvalidArgument)
+    );
+    let not_utf8 = CString::new(vec![b'p', 0xff, b'q']).unwrap();
+    assert_eq!(
+        app.spawn_with(&named(&not_utf8)),
+        Err(Error::InvalidArgument)
+    );
+    let longest = CString::new("p".repeat(tessera_ffi::MAX_PROFILE_NAME_LEN)).unwrap();
+    let id = app
+        .spawn_with(&named(&longest))
+        .expect("an unknown name falls back");
+    assert_eq!(app.close(id), Error::Ok);
+    assert_eq!(
+        app.spawn_with(&named(c"")).map(|id| app.close(id)),
+        Ok(Error::Ok)
+    );
+}
+
+/// A session spawned with a profile and no program runs the profile's
+/// command in its working directory (#39).
+#[test]
+fn a_profile_spawn_runs_its_command_in_its_directory() {
+    common::isolate_home();
+    let config_dir = common::hermetic_config_dir();
+    let work = tempfile::tempdir().unwrap();
+    let out = work.path().join("ran");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "[[profiles]]\nname = \"build\"\ncommand = \"pwd -P > ran; exec cat\"\n\
+             working_directory = '{}'\n",
+            work.path().display()
+        ),
+    )
+    .unwrap();
+    let app = Handle::new();
+    let options = SpawnOptions {
+        profile: c"build".as_ptr(),
+        ..default_options()
+    };
+    let id = app.spawn_with(&options).expect("spawn with a profile");
+    // Bounded by polls (30 s idle), not a clock, so load stretches it.
+    let written = (0..3000)
+        .find_map(|_| {
+            let text = std::fs::read_to_string(&out).unwrap_or_default();
+            if text.ends_with('\n') {
+                return Some(text);
+            }
+            thread::sleep(Duration::from_millis(10));
+            None
+        })
+        .expect("the profile's command never ran");
+    assert_eq!(
+        Path::new(written.trim_end()),
+        work.path().canonicalize().unwrap()
+    );
+    assert_eq!(app.close(id), Error::Ok);
 }
 
 #[test]

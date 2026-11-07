@@ -35,11 +35,11 @@ use tessera_config::{
     Config, ConfigEvent, ConfigPaths, ConfigStore, ThemeSource, Warning, WatchGuard, WatchOptions,
 };
 use tessera_pty::PtySize;
-use tessera_render::{Theme, sanitize_font_size};
+use tessera_render::Theme;
 
 use crate::input::Bindings;
 use crate::session::{ObserverSlot, Session, lock, run_thread_start_hook};
-use crate::view::{self, View};
+use crate::view::{self, Look, View};
 use crate::{App, SessionId};
 
 /// How long dropping the [`App`] waits for the apply thread to finish the
@@ -74,6 +74,9 @@ pub(crate) struct Applied {
     /// The theme file `colours` came from, `None` for a bundled theme, the
     /// default, or colours handed to [`App::apply_config`] directly.
     pub(crate) source: Option<PathBuf>,
+    /// Counts the configurations applied: a session keeps the look of the
+    /// latest one it was given ([`Session::set_look`]).
+    pub(crate) generation: u64,
 }
 
 /// What looking the theme up again gave.
@@ -96,6 +99,88 @@ pub(crate) struct Live {
     pub(crate) applied: Arc<Mutex<Applied>>,
     pub(crate) observers: ObserverSlot,
     pub(crate) bindings: Arc<Bindings>,
+    /// Where a profile's theme is looked up (`themes/`).
+    pub(crate) themes_dir: Arc<Path>,
+}
+
+/// Themes a profile names, resolved once per configuration applied:
+/// every session of one profile shares them, and a profile not in use is
+/// never looked up (each lookup reads `themes/`, at most 256 files).
+pub(crate) struct Looks<'a> {
+    themes_dir: &'a Path,
+    config: &'a Config,
+    colours: &'a tessera_config::Theme,
+    resolved: HashMap<String, Option<tessera_config::Theme>>,
+}
+
+impl<'a> Looks<'a> {
+    /// Looks for `config`, whose `[appearance]` theme resolved to
+    /// `colours`; other themes are looked up in `themes_dir`.
+    pub(crate) fn new(
+        themes_dir: &'a Path,
+        config: &'a Config,
+        colours: &'a tessera_config::Theme,
+    ) -> Self {
+        Self {
+            themes_dir,
+            config,
+            colours,
+            resolved: HashMap::new(),
+        }
+    }
+
+    /// The look of a session of `profile` (`None`: the built-in profile,
+    /// `[appearance]` alone). A profile no longer in the configuration
+    /// falls back as [`Config::profile_appearance`] does. A profile theme
+    /// that is the `[appearance]` one uses its colours; another one is
+    /// looked up, and when its file is there but does not load, a session
+    /// already drawn with that theme (`previous`) keeps its colours, as
+    /// `[appearance]`'s do ([`Lookup::KeepBroken`]).
+    pub(crate) fn of(&mut self, profile: Option<&str>, previous: Option<&Look>) -> Look {
+        let appearance = match profile {
+            None => self.config.appearance.clone(),
+            Some(_) => self.config.profile_appearance(profile),
+        };
+        self.with(appearance, previous)
+    }
+
+    /// The look of a new session that names no profile: the one
+    /// `[general] default_profile` names, else the built-in one.
+    pub(crate) fn default_look(&mut self) -> Look {
+        let appearance = self.config.profile_appearance(None);
+        self.with(appearance, None)
+    }
+
+    fn with(&mut self, appearance: tessera_config::Appearance, previous: Option<&Look>) -> Look {
+        if appearance.theme == self.config.appearance.theme {
+            return Look::new(appearance, self.colours.clone());
+        }
+        let themes_dir = self.themes_dir;
+        let resolved = self
+            .resolved
+            .entry(appearance.theme.clone())
+            .or_insert_with(|| {
+                let resolved = tessera_config::Theme::resolve(themes_dir, &appearance.theme);
+                for warning in &resolved.warnings {
+                    tracing::warn!(target: "tessera_app_core", "profile theme: {warning}");
+                }
+                let broken = resolved
+                    .warnings
+                    .iter()
+                    .any(|warning| matches!(warning, Warning::ThemeInvalid { .. }));
+                (!broken).then_some(resolved.theme)
+            });
+        let colours = match (resolved, previous) {
+            (Some(colours), _) => colours.clone(),
+            (None, Some(previous)) if previous.appearance.theme == appearance.theme => {
+                previous.colours.clone()
+            }
+            // A broken file and nothing to keep: what the lookup fell back
+            // to (`Theme::resolve` warned).
+            (None, _) => tessera_config::Theme::resolve(themes_dir, &appearance.theme).theme,
+        };
+        Look::new(appearance, colours)
+    }
 }
 
 impl Live {
@@ -114,39 +199,118 @@ impl Live {
         colours: &tessera_config::Theme,
         source: Option<PathBuf>,
     ) -> bool {
-        let theme = view::theme_for(config, colours);
-        let opaque = !view::is_translucent(&theme);
+        let changed = self.restyle(config, colours, source);
+        self.config_applied(config);
+        changed
+    }
+
+    /// Records `config` and `colours` as in effect and gives every session
+    /// the look of its profile under them (#39): the views their theme and,
+    /// where the session's configured size changed, its font size, the
+    /// terminals their default cursor style and theme colours. Tells the
+    /// observer when anything drawn changed; returns whether it did.
+    ///
+    /// Each session's look is resolved outside every lock (a profile with
+    /// a theme of its own reads `themes/`), set on the session before the
+    /// views are updated under the views lock: a view attached meanwhile
+    /// reads its session's look under that lock, so it either gets the new
+    /// one or is updated here. Under that lock each view takes its
+    /// session's look as it is then, not the one this apply resolved, so
+    /// of two applies racing the older one cannot put its look back.
+    fn restyle(
+        &self,
+        config: &Config,
+        colours: &tessera_config::Theme,
+        source: Option<PathBuf>,
+    ) -> bool {
+        let config = Arc::new(config.clone());
+        let generation = {
+            let mut applied = lock(&self.applied);
+            let generation = applied.generation + 1;
+            *applied = Applied {
+                config: Arc::clone(&config),
+                colours: colours.clone(),
+                source,
+                generation,
+            };
+            generation
+        };
+        // Listed after the configuration is recorded: a session that starts
+        // meanwhile and is not listed reads it once listed (`App::attach`).
+        let sessions: Vec<(SessionId, Arc<Session>)> = lock(&self.sessions)
+            .iter()
+            .map(|(id, session)| (*id, Arc::clone(session)))
+            .collect();
+        let mut looks = Looks::new(&self.themes_dir, &config, colours);
+        let default_look = looks.default_look();
+        let mut restyled: HashMap<SessionId, (Arc<Look>, &Arc<Session>)> = HashMap::new();
+        let mut cursor_changed = false;
+        for (id, session) in &sessions {
+            let previous = session.look();
+            let look = Arc::new(looks.of(session.profile(), Some(&previous)));
+            let Some(old) = session.set_look(generation, Arc::clone(&look)) else {
+                continue; // a later configuration got there first
+            };
+            let cursor = old.cursor() != look.cursor();
+            cursor_changed |= cursor;
+            if cursor || old.colours != look.colours {
+                // Each terminal's lock, with no other lock held (ADR 0014).
+                // A session the program gave a shape of its own keeps it
+                // until it asks for the default (DECSCUSR 0) or resets; a
+                // blink of its own goes when the configured blink changes,
+                // which the terminal decides against the default it holds
+                // (ADR 0020, #169). The theme's colours become what the
+                // program's colours (OSC 4, 10, 11, 12) fall back to; the
+                // program's stay (D-THEME-KEEP). The look is read again
+                // under the terminal lock (`Session::push_look`), so of two
+                // applies racing here the newer one's stays (#168).
+                session.push_look();
+            }
+            restyled.insert(*id, (old, session));
+        }
         let mut views = lock(&self.views);
-        let mut applied = lock(&self.applied);
         let mut current = lock(&self.theme);
-        let theme_changed = *current != theme;
-        // A configured size that changed resets every view's size, zoomed
-        // or not (lead decision D6, as Terminal.app does on a profile
-        // change); any other change keeps each view's own size.
-        let font_size = sanitize_font_size(config.appearance.font_size);
-        let font_changed = sanitize_font_size(applied.config.appearance.font_size).to_bits()
-            != font_size.to_bits();
-        let cursor = view::cursor_style_for(config);
-        let cursor_changed = view::cursor_style_for(&applied.config) != cursor;
-        let colours_changed = applied.colours != *colours;
+        let mut theme_changed = *current != default_look.theme;
+        let mut font_changed = false;
         let mut resizes: Vec<SessionId> = Vec::new();
         for (id, view) in views.iter_mut() {
-            if theme_changed {
-                view.set_appearance(theme.clone());
+            let Some((old, session)) = restyled.get(id) else {
+                continue;
+            };
+            // A later apply may have set a newer look meanwhile (views,
+            // then the session's look: the lock order).
+            let look = session.look();
+            if *view.base_theme() != look.theme {
+                view.set_appearance(look.theme.clone());
+                theme_changed = true;
             }
-            if font_changed && view.font_size().to_bits() != font_size.to_bits() {
-                view.set_font_size(font_size);
-                resizes.push(*id);
+            // A configured size that changed resets the view's size, zoomed
+            // or not (lead decision D6, as Terminal.app does on a profile
+            // change); any other change keeps its own size. Per session, so
+            // editing `[appearance] font_size` leaves the views of a profile
+            // with a size of its own alone.
+            let size = look.font_size();
+            if old.font_size().to_bits() != size.to_bits() {
+                font_changed = true;
+                if view.font_size().to_bits() != size.to_bits() {
+                    view.set_font_size(size);
+                    resizes.push(*id);
+                }
             }
         }
-        *current = theme;
-        *applied = Applied {
-            config: Arc::new(config.clone()),
-            colours: colours.clone(),
-            source,
+        *current = default_look.theme.clone();
+        // The host has one opacity switch for all its windows: opaque only
+        // while every view is, so a translucent view is never drawn over
+        // an opaque window's backing. With no view, what a new one would
+        // be.
+        let opaque = if views.is_empty() {
+            !view::is_translucent(&default_look.theme)
+        } else {
+            views
+                .values()
+                .all(|view| !view::is_translucent(view.base_theme()))
         };
         drop(current);
-        drop(applied);
         // Resizing takes each session's terminal lock and re-wraps its
         // text: never under the views lock (ADR 0014's lock order).
         drop(views);
@@ -170,34 +334,32 @@ impl Live {
                 tracing::warn!(session = %id, %error, ?size, "resizing a session to its view failed");
             }
         }
-        if cursor_changed || colours_changed {
-            // Each terminal's lock, after the views lock is released and
-            // with the sessions lock held only to list them (ADR 0014). A
-            // session the program gave a shape of its own keeps it until it
-            // asks for the default (DECSCUSR 0) or resets; a blink of its
-            // own goes when the configured blink changes, which the terminal
-            // decides against the default it holds (ADR 0020, #169). The
-            // theme's colours become what the program's colours (OSC 4,
-            // 10, 11, 12) fall back to; the program's stay (D-THEME-KEEP).
-            // One that starts meanwhile reads the configuration again once
-            // listed (`App::attach`).
-            //
-            // The style and the colours are read from the configuration in
-            // effect under each terminal's lock (terminal, then `applied`;
-            // #168), not taken from `config`: of two applies racing here,
-            // the one that recorded its configuration first may reach a
-            // terminal last, and must not leave it on the older ones.
-            let sessions: Vec<Arc<Session>> = lock(&self.sessions).values().cloned().collect();
-            for session in sessions {
-                session.with_terminal_mut(|term| self.push_defaults(term));
-            }
-        }
         let changed = theme_changed || font_changed || cursor_changed;
         if changed {
             self.notify(opaque);
         }
-        self.config_applied(config);
         changed
+    }
+
+    /// Gives `session`, just listed, the look of the configuration in
+    /// effect if one was applied after it resolved its own, and its
+    /// terminal that look's defaults (`App::attach`).
+    pub(crate) fn catch_up(&self, session: &Session) {
+        let (config, colours, generation) = {
+            let applied = lock(&self.applied);
+            (
+                Arc::clone(&applied.config),
+                applied.colours.clone(),
+                applied.generation,
+            )
+        };
+        if session.look_generation() < generation {
+            let previous = session.look();
+            let look = Looks::new(&self.themes_dir, &config, &colours)
+                .of(session.profile(), Some(&previous));
+            session.set_look(generation, Arc::new(look));
+        }
+        session.push_look();
     }
 
     /// Compiles `config`'s key map when its `[keys]` changed, counts the
@@ -241,19 +403,6 @@ impl Live {
         Arc::clone(&lock(&self.applied).config)
     }
 
-    /// Sets `term`'s default cursor style and theme colours
-    /// ([`view::theme_colors_for`]) to the configuration in effect, read
-    /// once under the caller's terminal lock (terminal, then `applied`;
-    /// #168).
-    pub(crate) fn push_defaults(&self, term: &mut tessera_term::Terminal) {
-        let applied = lock(&self.applied);
-        let cursor = view::cursor_style_for(&applied.config);
-        let colours = view::theme_colors_for(&applied.colours);
-        drop(applied);
-        term.set_default_cursor_style(cursor);
-        term.set_theme_colors(colours);
-    }
-
     /// Handles one watcher event.
     fn handle(&self, store: &ConfigStore, event: ConfigEvent) {
         match event {
@@ -261,7 +410,11 @@ impl Live {
                 for warning in &changed.warnings {
                     tracing::warn!(target: "tessera_app_core", "{warning}");
                 }
-                self.apply_changed(store, &changed.config);
+                // The store's configuration, not the event's: an older
+                // `Changed` still queued behind a `ThemesChanged` that
+                // applied a newer one must not bring the older back (#283).
+                drop(changed);
+                self.apply_changed(store, &store.config());
             }
             ConfigEvent::ThemesChanged => {
                 self.apply_theme_if_changed(store);
@@ -391,7 +544,10 @@ impl Live {
             applied.colours == colours && *applied.config == *config
         };
         if same {
-            lock(&self.applied).source = source;
+            // The `[appearance]` theme is unchanged, but a profile's may
+            // not be: its sessions are restyled, without announcing a new
+            // configuration.
+            self.restyle(&config, &colours, source);
         } else {
             self.apply_from(&config, &colours, source);
         }
@@ -708,6 +864,7 @@ impl App {
             applied: Arc::clone(&self.applied),
             observers: Arc::clone(&self.observers),
             bindings: Arc::clone(&self.bindings),
+            themes_dir: Arc::from(self.paths.themes_dir()),
         }
     }
 }
@@ -1825,6 +1982,403 @@ mod tests {
             started.elapsed() < Duration::from_millis(500),
             "took {:?}",
             started.elapsed()
+        );
+    }
+
+    /// A session of `profile` (`None`: the built-in one) on a fake PTY.
+    fn attach_fake_profile(app: &App, profile: Option<&str>) -> SessionId {
+        let (tx, rx) = mpsc::sync_channel(4);
+        let pty = FakePty {
+            resizes: Arc::new(Mutex::new(Vec::new())),
+            views: Arc::clone(&app.views),
+            views_locked_during_resize: Arc::new(AtomicBool::new(false)),
+            events: Some(tx),
+        };
+        let id = app.allocate_id();
+        app.attach_with_profile(
+            id,
+            Box::new(pty),
+            rx,
+            PtySize::default(),
+            profile.map(Into::into),
+        )
+        .expect("attach fake session");
+        id
+    }
+
+    /// Attaches a headless 200 x 100 view to session `id` the way
+    /// `App::attach_view` does (the session's look, under the views lock);
+    /// `false` when GPU tests are skipped.
+    fn attach_offscreen(app: &App, id: SessionId) -> bool {
+        if std::env::var_os("TESSERA_SKIP_GPU_TESTS").is_some() {
+            eprintln!("TESSERA_SKIP_GPU_TESTS is set; skipping");
+            return false;
+        }
+        app.attach_with(
+            id,
+            Gpu::new_instance(),
+            (),
+            |()| None,
+            |gpu, (), fonts, theme| {
+                View::offscreen(gpu, fonts, theme, PhysicalSize::new(200, 100), 1.0)
+            },
+        )
+        .expect("attach an offscreen view");
+        true
+    }
+
+    /// The top left pixel of session `id`'s next frame: padding, so the
+    /// theme's background.
+    fn corner(app: &App, id: SessionId) -> [u8; 4] {
+        lock(&app.views).get_mut(&id).unwrap().redraw_now();
+        assert_eq!(
+            app.render_view(id).unwrap(),
+            tessera_render::FrameStatus::Presented
+        );
+        let image = lock(&app.views).get(&id).unwrap().read_back();
+        [image[0], image[1], image[2], image[3]]
+    }
+
+    fn srgb(colour: tessera_config::Color) -> [u8; 3] {
+        [colour.r, colour.g, colour.b]
+    }
+
+    /// `[appearance]` in Dracula at 13 pt, a profile `big` that sets only
+    /// its font size and a profile `nord` with a theme and size of its own.
+    fn profiles_config() -> Config {
+        Config::from_toml_lenient(
+            "[appearance]\n\
+             theme = \"Dracula\"\n\
+             font_size = 13\n\
+             [[profiles]]\n\
+             name = \"big\"\n\
+             [profiles.appearance]\n\
+             font_size = 20\n\
+             [[profiles]]\n\
+             name = \"nord\"\n\
+             [profiles.appearance]\n\
+             theme = \"Nord\"\n\
+             font_size = 18\n",
+        )
+        .unwrap()
+        .config
+    }
+
+    /// Done-when 3 (#39): sessions of two profiles draw with their own
+    /// theme and font size, and editing `[appearance]` restyles only the
+    /// sessions that inherit what changed.
+    #[test]
+    fn sessions_of_two_profiles_draw_with_their_own_theme_and_font_size() {
+        let config = profiles_config();
+        let app = App::new(config.clone(), ConfigPaths::new("/nonexistent/tessera"));
+        let plain = attach_fake_profile(&app, None);
+        let nord = attach_fake_profile(&app, Some("nord"));
+        let big = attach_fake_profile(&app, Some("big"));
+        if !attach_offscreen(&app, plain) {
+            return;
+        }
+        assert!(attach_offscreen(&app, nord));
+        assert!(attach_offscreen(&app, big));
+        let dracula = bundled("Dracula");
+        let nord_colours = bundled("Nord");
+        assert_ne!(dracula.background, nord_colours.background);
+        assert_eq!(corner(&app, plain)[..3], srgb(dracula.background));
+        assert_eq!(corner(&app, nord)[..3], srgb(nord_colours.background));
+        assert_eq!(corner(&app, big)[..3], srgb(dracula.background));
+        assert_eq!(font_size_of(&app, plain), 13.0);
+        assert_eq!(font_size_of(&app, nord), 18.0);
+        assert_eq!(font_size_of(&app, big), 20.0);
+        // The terminals' default colours are their looks' too (OSC 11 ?).
+        let bg = |id| app.with_terminal(id, |t| t.colors().bg).unwrap();
+        assert_eq!(
+            bg(nord),
+            tessera_term::Rgb::new(
+                nord_colours.background.r,
+                nord_colours.background.g,
+                nord_colours.background.b
+            )
+        );
+
+        // Edit `[appearance]`: theme and size.
+        let mut edited = config;
+        edited.appearance.theme = "Gruvbox Dark".into();
+        edited.appearance.font_size = 15.0;
+        let gruvbox = bundled("Gruvbox Dark");
+        app.apply_config(&edited, &gruvbox);
+        assert_eq!(corner(&app, plain)[..3], srgb(gruvbox.background));
+        assert_eq!(font_size_of(&app, plain), 15.0);
+        // `big` inherits the theme, keeps its size.
+        assert_eq!(corner(&app, big)[..3], srgb(gruvbox.background));
+        assert_eq!(font_size_of(&app, big), 20.0);
+        // `nord` sets both: untouched.
+        assert_eq!(corner(&app, nord)[..3], srgb(nord_colours.background));
+        assert_eq!(font_size_of(&app, nord), 18.0);
+        // A zoom on `nord` survives an `[appearance]` size change (D6 is
+        // per session: its configured size did not change).
+        app.set_view_font_size(nord, 24.0).unwrap();
+        edited.appearance.font_size = 11.0;
+        app.apply_config(&edited, &gruvbox);
+        assert_eq!(font_size_of(&app, nord), 24.0);
+        assert_eq!(font_size_of(&app, plain), 11.0);
+        // Editing the profile restyles its session.
+        edited.profiles[1].appearance.as_mut().unwrap().theme = None;
+        app.apply_config(&edited, &gruvbox);
+        assert_eq!(corner(&app, nord)[..3], srgb(gruvbox.background));
+        // Its size did not change, so its zoom stays (D6).
+        assert_eq!(font_size_of(&app, nord), 24.0);
+        // Its size changed: back to the configured one.
+        edited.profiles[1].appearance.as_mut().unwrap().font_size = Some(16.0);
+        app.apply_config(&edited, &gruvbox);
+        assert_eq!(font_size_of(&app, nord), 16.0);
+    }
+
+    /// Two applies racing leave every view drawing its session's look
+    /// (#39 critic B1): the older one never puts its look back over the
+    /// newer one's under the views lock. Staged: the older apply sets the
+    /// first session's look and then waits for that session's terminal
+    /// (held here) while the newer one, which changes only the font size
+    /// and so never needs that terminal, restyles every view; the older
+    /// one then takes the views lock last.
+    #[test]
+    fn racing_applies_leave_every_view_on_its_sessions_look() {
+        let mut dracula = Config::default();
+        dracula.appearance.theme = "Dracula".into();
+        dracula.appearance.font_size = 13.0;
+        let app = App::new(dracula.clone(), ConfigPaths::new("/nonexistent/tessera"));
+        let ids = [
+            attach_fake_profile(&app, None),
+            attach_fake_profile(&app, None),
+        ];
+        if !attach_offscreen(&app, ids[0]) {
+            return;
+        }
+        assert!(attach_offscreen(&app, ids[1]));
+        let mut older = dracula.clone();
+        older.appearance.theme = "Nord".into();
+        let mut newer = older.clone();
+        newer.appearance.font_size = 14.0;
+        let nord = bundled("Nord");
+        app.apply_config(&dracula, &bundled("Dracula"));
+        // The session `restyle` comes to first: the map is not changed.
+        let first = *lock(&app.sessions).keys().next().unwrap();
+        let session = Arc::clone(&lock(&app.sessions)[&first]);
+        let start = lock(&app.applied).generation;
+        let wait = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !done() {
+                assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+                std::thread::yield_now();
+            }
+        };
+        let (held_tx, held) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let app = &app;
+            scope.spawn(move || {
+                app.with_terminal(first, |_| {
+                    held_tx.send(()).unwrap();
+                    let _ = release_rx.recv();
+                })
+                .unwrap();
+            });
+            held.recv().unwrap();
+            scope.spawn(|| app.apply_config(&older, &nord));
+            wait("the older look", &|| session.look_generation() == start + 1);
+            scope.spawn(|| app.apply_config(&newer, &nord));
+            wait("the newer apply's views", &|| {
+                lock(&app.views)[&first].font_size().to_bits() == 14.0_f32.to_bits()
+            });
+            release.send(()).unwrap();
+        });
+        let sessions = lock(&app.sessions).clone();
+        let views = lock(&app.views);
+        for id in ids {
+            let look = sessions[&id].look();
+            assert_eq!(look.font_size(), 14.0, "session {id} has the newer look");
+            let theme = views[&id].base_theme();
+            assert!(
+                *theme == look.theme,
+                "view of {id} draws {} {} pt, its session's look {} {} pt",
+                theme.font_family,
+                theme.font_size,
+                look.theme.font_family,
+                look.theme.font_size
+            );
+            assert_eq!(views[&id].font_size(), 14.0, "view of {id}");
+        }
+    }
+
+    /// The process's font is `[appearance]`'s family, never a profile's
+    /// (#39 critic B2, ADR 0037), even when the first view is of a profile
+    /// with a family of its own (one `default_profile` may name, so every
+    /// new tab's).
+    #[test]
+    fn a_profiles_font_family_never_becomes_the_process_font() {
+        let config = Config::from_toml_lenient(
+            "[general]\n\
+             default_profile = \"work\"\n\
+             [appearance]\n\
+             font_family = \"Menlo\"\n\
+             [[profiles]]\n\
+             name = \"work\"\n\
+             [profiles.appearance]\n\
+             font_family = \"Courier\"\n",
+        )
+        .unwrap()
+        .config;
+        let app = App::new(config, ConfigPaths::new("/nonexistent/tessera"));
+        let id = attach_fake_profile(&app, Some("work"));
+        assert_eq!(
+            lock(&app.sessions)[&id].look().theme.font_family,
+            "Courier",
+            "the session's look keeps the profile's family"
+        );
+        if !attach_offscreen(&app, id) {
+            return;
+        }
+        let fonts = lock(&app.fonts).clone().expect("fonts loaded by the view");
+        assert!(
+            fonts.has_family("Courier"),
+            "the probe needs Courier installed"
+        );
+        assert_eq!(fonts.family(), "Menlo");
+    }
+
+    /// A profile whose theme file stops loading keeps the colours its
+    /// sessions draw with, as `[appearance]`'s theme does
+    /// ([`Lookup::KeepBroken`]); a session with none to keep gets what the
+    /// lookup fell back to.
+    #[test]
+    fn a_profile_whose_theme_file_breaks_keeps_its_colours() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Mine.toml"), "this = = is not a theme").unwrap();
+        let config = Config::from_toml_lenient(
+            "[appearance]\n\
+             theme = \"Dracula\"\n\
+             [[profiles]]\n\
+             name = \"p\"\n\
+             [profiles.appearance]\n\
+             theme = \"Mine\"\n",
+        )
+        .unwrap()
+        .config;
+        let colours = bundled("Dracula");
+        let previous = Look::new(config.profile_appearance(Some("p")), bundled("Nord"));
+        let mut looks = Looks::new(dir.path(), &config, &colours);
+        assert_eq!(
+            looks.of(Some("p"), Some(&previous)).colours,
+            previous.colours
+        );
+        assert_ne!(looks.of(Some("p"), None).colours, previous.colours);
+    }
+
+    /// The observer hears "opaque" only while every view is (#39): one
+    /// translucent profile makes the host draw translucent.
+    #[test]
+    fn appearance_reports_opaque_only_while_every_view_is_opaque() {
+        let mut config = profiles_config();
+        config.profiles[1].appearance.as_mut().unwrap().opacity = Some(1.0);
+        let app = App::new(config.clone(), ConfigPaths::new("/nonexistent/tessera"));
+        let recorder = Recorder::default();
+        app.set_observer(Some(Box::new(recorder.clone())));
+        let plain = attach_fake_profile(&app, None);
+        let nord = attach_fake_profile(&app, Some("nord"));
+        if !attach_offscreen(&app, plain) {
+            return;
+        }
+        assert!(attach_offscreen(&app, nord));
+        let dracula = bundled("Dracula");
+        // `[appearance]` translucent, `nord` opaque: translucent.
+        config.appearance.opacity = 0.5;
+        app.apply_config(&config, &dracula);
+        assert_eq!(recorder.take(), [false]);
+        assert_eq!(corner(&app, plain)[3], 128, "the plain view is translucent");
+        assert_eq!(corner(&app, nord)[3], 255, "the nord view is opaque");
+        // Only `nord` translucent: still translucent.
+        config.appearance.opacity = 1.0;
+        config.profiles[1].appearance.as_mut().unwrap().opacity = Some(0.5);
+        app.apply_config(&config, &dracula);
+        assert_eq!(recorder.take(), [false]);
+        // Both opaque: opaque.
+        config.profiles[1].appearance.as_mut().unwrap().opacity = Some(1.0);
+        app.apply_config(&config, &dracula);
+        assert_eq!(recorder.take(), [true]);
+    }
+
+    /// `[general] default_profile` styles the sessions that name no
+    /// profile, and with no session the App-level theme follows it.
+    #[test]
+    fn the_default_profile_styles_new_sessions_and_the_app_theme() {
+        let mut config = profiles_config();
+        config.general.default_profile = "nord".into();
+        let app = App::new(config, ConfigPaths::new("/nonexistent/tessera"));
+        let nord = bundled("Nord");
+        assert_eq!(
+            app.view_theme().background.to_srgb8()[..3],
+            srgb(nord.background)
+        );
+        assert_eq!(app.view_theme().font_size, 18.0);
+    }
+
+    /// A session that starts while a configuration is applied ends on the
+    /// newer look: the apply lists the sessions after recording it, and a
+    /// session not yet listed catches up (`Live::catch_up`).
+    #[test]
+    fn a_session_started_with_an_older_configuration_catches_up() {
+        let app = App::new(profiles_config(), ConfigPaths::new("/nonexistent/tessera"));
+        let id = attach_fake_profile(&app, Some("big"));
+        let session = app.session(id).unwrap();
+        // As if the look had been resolved before an apply that missed it.
+        let mut newer = profiles_config();
+        newer.appearance.theme = "Nord".into();
+        {
+            let mut applied = lock(&app.applied);
+            applied.config = Arc::new(newer);
+            applied.colours = bundled("Nord");
+            applied.generation += 1;
+        }
+        app.live().catch_up(&session);
+        assert_eq!(session.look().appearance.theme, "Nord");
+        assert_eq!(session.look().appearance.font_size, 20.0);
+        assert_eq!(
+            app.with_terminal(id, |t| t.colors().bg).unwrap(),
+            tessera_term::Rgb::new(
+                bundled("Nord").background.r,
+                bundled("Nord").background.g,
+                bundled("Nord").background.b
+            )
+        );
+        // An older look never replaces a newer one.
+        let stale = Arc::new(Look::new(
+            tessera_config::Appearance::default(),
+            bundled("Dracula"),
+        ));
+        assert!(session.set_look(0, stale).is_none());
+        assert_eq!(session.look().appearance.theme, "Nord");
+    }
+
+    /// #283 item 1: a `Changed` event applies the store's configuration,
+    /// not the one it carries: an older `Changed` still queued behind a
+    /// newer apply must not bring the older configuration back.
+    #[test]
+    fn a_stale_changed_event_applies_the_stores_configuration() {
+        let paths = ConfigPaths::new("/nonexistent/tessera");
+        let current = config("Nord", 13.0, 1.0);
+        let store = ConfigStore::in_memory(paths.clone(), current.clone());
+        let app = App::new(current.clone(), paths);
+        let live = app.live();
+        let stale = config("Dracula", 20.0, 0.5);
+        live.handle(
+            &store,
+            ConfigEvent::Changed(tessera_config::ConfigChanged {
+                config: Arc::new(stale),
+                warnings: Vec::new(),
+            }),
+        );
+        assert_eq!(*app.config(), current);
+        assert_eq!(
+            app.view_theme().background.to_srgb8()[..3],
+            srgb(bundled("Nord").background)
         );
     }
 }

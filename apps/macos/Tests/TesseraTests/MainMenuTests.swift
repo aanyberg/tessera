@@ -100,6 +100,10 @@ final class MainMenuTests: XCTestCase {
     private static let shellItems: [Item] = [
         Item(title: "New Window", key: "n", modifiers: command, action: #selector(AppDelegate.openNewWindow(_:))),
         Item(title: "New Tab", key: "t", modifiers: command, action: #selector(AppDelegate.openNewTab(_:))),
+        // Hidden until the core lists profiles (#39, ``ProfileMenuTests``);
+        // the test host's configuration has none.
+        Item(title: "New Window with Profile (hidden, key equivalent off)", action: #selector(NSMenu.submenuAction(_:))),
+        Item(title: "New Tab with Profile (hidden, key equivalent off)", action: #selector(NSMenu.submenuAction(_:))),
         .separator,
         Item(title: "Close Tab", key: "w", modifiers: command, action: #selector(NSWindow.performClose(_:))),
         Item(

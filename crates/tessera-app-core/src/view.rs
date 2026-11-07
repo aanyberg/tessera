@@ -52,7 +52,7 @@
 
 use std::time::{Duration, Instant};
 
-use tessera_config::Config;
+use tessera_config::{Appearance, Config};
 use tessera_grid::{Cell, DamageRows, GraphemeTable, Grid, Line, Point};
 use tessera_pty::PtySize;
 pub use tessera_render::{CellMetrics, FrameStatus, PhysicalSize, RenderError, wgpu};
@@ -191,7 +191,15 @@ fn whole_px(v: f32) -> u32 {
 /// Line height and padding are the renderer's defaults.
 #[must_use]
 pub fn theme_for(config: &Config, theme: &tessera_config::Theme) -> Theme {
-    let appearance = &config.appearance;
+    theme_for_appearance(&config.appearance, theme)
+}
+
+/// [`theme_for`] with `appearance` in place of `[appearance]`: the theme a
+/// session of a profile draws with, `appearance` being the profile's keys
+/// over `[appearance]` ([`tessera_config::ProfileAppearance::over`]) and
+/// `theme` the colours its `theme` resolved to.
+#[must_use]
+pub fn theme_for_appearance(appearance: &Appearance, theme: &tessera_config::Theme) -> Theme {
     let background = rgba(theme.background);
     let defaults = Theme::default();
     Theme {
@@ -207,6 +215,43 @@ pub fn theme_for(config: &Config, theme: &tessera_config::Theme) -> Theme {
             .map_or(defaults.search_match_current, rgba),
         ansi: theme.ansi.map(rgba),
         ..defaults
+    }
+}
+
+/// What one session is drawn with (#39): its profile's appearance
+/// (`[appearance]` with the profile's keys over it), the colours that
+/// appearance's theme resolved to, and the renderer theme of both. Kept
+/// by the session from its start and replaced on every configuration
+/// applied, so a frame never resolves it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Look {
+    /// The appearance in effect for the session.
+    pub(crate) appearance: Appearance,
+    /// `appearance.theme`, resolved.
+    pub(crate) colours: tessera_config::Theme,
+    /// [`theme_for_appearance`] of both.
+    pub(crate) theme: Theme,
+}
+
+impl Look {
+    /// The look of `appearance` drawn in `colours`.
+    pub(crate) fn new(appearance: Appearance, colours: tessera_config::Theme) -> Self {
+        let theme = theme_for_appearance(&appearance, &colours);
+        Self {
+            appearance,
+            colours,
+            theme,
+        }
+    }
+
+    /// The session's default cursor style ([`cursor_style_for_appearance`]).
+    pub(crate) fn cursor(&self) -> CursorStyle {
+        cursor_style_for_appearance(&self.appearance)
+    }
+
+    /// The configured font size, clamped as the views clamp it.
+    pub(crate) fn font_size(&self) -> f32 {
+        sanitize_font_size(self.appearance.font_size)
     }
 }
 
@@ -255,8 +300,14 @@ pub(crate) fn with_overrides(theme: &Theme, overrides: &ColorOverrides) -> Theme
 /// The cursor style a session starts with and returns to (DECSCUSR 0,
 /// resets): `[appearance] cursor_shape` and `cursor_blink`
 /// ([`Terminal::set_default_cursor_style`]).
+#[cfg(test)]
 pub(crate) fn cursor_style_for(config: &Config) -> CursorStyle {
-    let appearance = &config.appearance;
+    cursor_style_for_appearance(&config.appearance)
+}
+
+/// [`cursor_style_for`] a profile's `appearance` (see
+/// [`theme_for_appearance`]).
+pub(crate) fn cursor_style_for_appearance(appearance: &Appearance) -> CursorStyle {
     let shape = match appearance.cursor_shape {
         tessera_config::CursorShape::Block => tessera_term::CursorShape::Block,
         tessera_config::CursorShape::Underline => tessera_term::CursorShape::Underline,
@@ -628,6 +679,12 @@ impl View {
         }
     }
 
+    /// The theme [`Self::set_appearance`] gave the view last (or
+    /// [`Self::new`]), without the program's colours.
+    pub(crate) fn base_theme(&self) -> &Theme {
+        &self.base
+    }
+
     /// The theme the renderer draws with: the configured one with the
     /// program's colours of the last frame.
     #[cfg(any(test, feature = "test-hooks"))]
@@ -747,6 +804,14 @@ impl View {
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> &Snapshot {
         &self.snapshot
+    }
+
+    /// Makes the next frame draw every row at once: off the frame
+    /// schedule, all of it damaged.
+    #[cfg(test)]
+    pub(crate) fn redraw_now(&mut self) {
+        self.last_presented = None;
+        self.pending = DamageRows::All;
     }
 
     /// The last frame of an offscreen view, as RGBA bytes.

@@ -67,6 +67,9 @@ enum MainMenu {
         let menu = NSMenu(title: "Shell")
         add(menu, "new_window", "New Window", #selector(AppDelegate.openNewWindow(_:)), "n")
         add(menu, "new_tab", "New Tab", #selector(AppDelegate.openNewTab(_:)), "t")
+        // The configured profiles (#39); see `setProfiles(_:in:)`.
+        menu.addItem(profileMenuItem(newWindowWithProfile, "New Window with Profile"))
+        menu.addItem(profileMenuItem(newTabWithProfile, "New Tab with Profile"))
         menu.addItem(.separator())
         // Closes the key window, which is the selected tab; AppKit closes the
         // tab bar's window once its last tab is gone.
@@ -288,6 +291,109 @@ enum MainMenu {
     /// the like): its private-use character.
     static func functionKey(_ key: Int) -> String {
         Unicode.Scalar(UInt32(key)).map { String(Character($0)) } ?? ""
+    }
+
+    // MARK: Profiles
+
+    /// The identifier prefix of the profile submenus. They run no command
+    /// of the registry (whose commands take no profile name, ADR 0037), so
+    /// the key map leaves them alone and they have no key equivalents.
+    static let profileMenuPrefix = "profile_menu:"
+    /// The identifier of New Window with Profile's item.
+    static let newWindowWithProfile = profileMenuPrefix + "new_window"
+    /// The identifier of New Tab with Profile's item.
+    static let newTabWithProfile = profileMenuPrefix + "new_tab"
+    /// Longest title, in characters, a profile's item shows; a longer name
+    /// is cut and ends in "…".
+    static let maxProfileTitleLength = 64
+
+    /// An item for a profile submenu, hidden until there are profiles.
+    private static func profileMenuItem(_ identifier: String, _ title: String) -> NSMenuItem {
+        let item = submenuItem(NSMenu(title: title))
+        item.identifier = NSUserInterfaceItemIdentifier(identifier)
+        item.isHidden = true
+        return item
+    }
+
+    /// Fills New Window with Profile and New Tab with Profile of `bar` with
+    /// one item per name of `profiles` (the core's, in file order), titled
+    /// ``profileTitle(_:)``, carrying the name as written in its
+    /// `representedObject`. A name seen before, byte for byte, is left out
+    /// (the core starts the first profile of a name; canonically equal
+    /// spellings are two profiles to it), and a title seen before gets a
+    /// number.
+    /// Both are hidden while there is no profile. Idempotent; the app calls
+    /// it at start and after every configuration the core applies.
+    static func setProfiles(_ profiles: [String], in bar: NSMenu) {
+        let actions: [(String, Selector)] = [
+            (newWindowWithProfile, #selector(AppDelegate.openNewWindowWithProfile(_:))),
+            (newTabWithProfile, #selector(AppDelegate.openNewTabWithProfile(_:))),
+        ]
+        var names = Set<[UInt8]>()
+        var titles = Set<String>()
+        var entries: [(name: String, title: String)] = []
+        for name in profiles where names.insert(Array(name.utf8)).inserted {
+            let base = profileTitle(name)
+            var title = base
+            var number = 2
+            while !titles.insert(title).inserted {
+                title = "\(base) (\(number))"
+                number += 1
+            }
+            entries.append((name, title))
+        }
+        for (identifier, action) in actions {
+            guard let item = item(forCommand: identifier, in: bar), let submenu = item.submenu else { continue }
+            submenu.removeAllItems()
+            for (index, entry) in entries.enumerated() {
+                let profile = submenu.addItem(withTitle: entry.title, action: action, keyEquivalent: "")
+                profile.representedObject = entry.name
+                // Not AppKit's (the action's name): one the key map knows
+                // is not a command.
+                profile.identifier = NSUserInterfaceItemIdentifier("\(identifier):\(index)")
+            }
+            item.isHidden = entries.isEmpty
+        }
+    }
+
+    /// What a profile's item shows for `name`, which comes from
+    /// `config.toml` and may hold anything (docs/security.md S3): control
+    /// and formatting characters (bidirectional overrides and isolates,
+    /// zero-width characters; a zero-width joiner stays, for emoji) and
+    /// unassigned or private-use code points are dropped, runs of white
+    /// space become one space, and a title past
+    /// ``maxProfileTitleLength`` characters is cut and ends in "…". "Unnamed
+    /// Profile" when nothing visible is left (only default-ignorable
+    /// characters, such as a lone joiner or a Hangul filler, or the blank
+    /// braille pattern).
+    static func profileTitle(_ name: String) -> String {
+        var scalars = String.UnicodeScalarView()
+        var pendingSpace = false
+        for scalar in name.unicodeScalars {
+            let category = scalar.properties.generalCategory
+            if scalar.properties.isWhitespace {
+                pendingSpace = !scalars.isEmpty
+                continue
+            }
+            switch category {
+            case .control, .lineSeparator, .paragraphSeparator, .surrogate, .privateUse, .unassigned:
+                continue
+            case .format where scalar != "\u{200D}":
+                continue
+            default:
+                if pendingSpace { scalars.append(" ") }
+                pendingSpace = false
+                scalars.append(scalar)
+            }
+        }
+        var title = String(scalars)
+        if title.count > maxProfileTitleLength {
+            title = String(title.prefix(maxProfileTitleLength - 1)) + "…"
+        }
+        let visible = title.unicodeScalars.contains {
+            !$0.properties.isDefaultIgnorableCodePoint && $0 != "\u{2800}"
+        }
+        return visible ? title : "Unnamed Profile"
     }
 
     private static func submenuItem(_ menu: NSMenu) -> NSMenuItem {

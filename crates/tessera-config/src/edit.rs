@@ -919,7 +919,7 @@ fn theme_names(config: &Config) -> Vec<String> {
         config
             .profiles
             .iter()
-            .filter_map(|p| p.appearance.as_ref().map(|a| a.theme.clone())),
+            .filter_map(|p| p.appearance.as_ref().and_then(|a| a.theme.clone())),
     );
     names
 }
@@ -991,7 +991,15 @@ fn renumbered(warnings: &[Warning], path: &KeyPath) -> Vec<Warning> {
                     detail: detail.clone(),
                 }),
             },
+            // One profile fewer past the cap.
+            Warning::TooManyProfiles { dropped } if prefix == "profiles" => {
+                (*dropped > 1).then(|| Warning::TooManyProfiles {
+                    dropped: dropped - 1,
+                })
+            }
             Warning::UnknownKeysOmitted { .. }
+            | Warning::TooManyProfiles { .. }
+            | Warning::ProfileNotFound { .. }
             | Warning::ThemeNotFound { .. }
             | Warning::ThemeInvalid { .. }
             | Warning::KeyBinding { .. }

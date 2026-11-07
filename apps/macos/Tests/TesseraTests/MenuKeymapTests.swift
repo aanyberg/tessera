@@ -62,10 +62,17 @@ final class MenuKeymapTests: XCTestCase {
         let bar = MainMenu.makeMenuBar().bar
         var names: [String] = []
         var unmapped: [String] = []
+        var profileMenus: [String] = []
         func walk(_ menu: NSMenu) {
             for item in menu.items where !item.isSeparatorItem {
                 if let submenu = item.submenu, item.identifier == nil {
                     walk(submenu)
+                    continue
+                }
+                // Exempt: the profile submenus run no registry command, as
+                // registry commands take no profile name (ADR 0037).
+                if let name = item.identifier?.rawValue, name.hasPrefix(MainMenu.profileMenuPrefix) {
+                    profileMenus.append(name)
                     continue
                 }
                 guard let name = item.identifier?.rawValue, !name.hasSuffix(":") else {
@@ -80,6 +87,7 @@ final class MenuKeymapTests: XCTestCase {
         // 41, the ten pane items (ADR 0035, #38b) and the five Find items (#46b).
         XCTAssertEqual(names.count, 56, "\(names)")
         XCTAssertEqual(unmapped, [], "\(unmapped)")
+        XCTAssertEqual(profileMenus, [MainMenu.newWindowWithProfile, MainMenu.newTabWithProfile])
         for name in names {
             XCTAssertNotNil(keymap.command(named: name), "\(name) is a command")
             XCTAssertNotEqual(keymap.command(named: name)?.owner, .planned, "\(name) runs")

@@ -58,6 +58,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     /// Set by a termination signal: quit without asking.
     var terminatesWithoutConfirmation = false
+    /// The profile each session was started with, by session id, for the
+    /// sessions started with one; the rest have `[general]
+    /// default_profile`'s. A split pane starts with its focused pane's
+    /// profile. Not saved with the window state (#39).
+    private var profileBySession: [UInt64: String] = [:]
 
     /// True when the app is the host of an XCTest bundle: no window is opened
     /// at launch, the tests open their own.
@@ -123,9 +128,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// - Parameter frame: Where the window goes, as restored at launch;
     ///   `nil` cascades it from the previous standalone window.
     /// - Throws: The core's error if it or the session cannot be started.
+    /// - Parameter profile: The profile the session starts with; `nil` for
+    ///   `[general] default_profile`.
     @discardableResult
-    func newWindow(frame: NSRect? = nil) throws -> TerminalWindowController {
-        let controller = try makeController()
+    func newWindow(frame: NSRect? = nil, profile: String? = nil) throws -> TerminalWindowController {
+        let controller = try makeController(profile: profile)
         guard let window = controller.window else { return controller }
         // `.preferred` would put a window that is ordered front into the
         // key window's tab bar; a new window must stand alone.
@@ -153,13 +160,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// bar (for ⌘T, the selected tab), or a standalone window if `window` is
     /// `nil` or not a terminal window, and returns its controller.
     ///
+    /// - Parameter profile: The profile the session starts with; `nil` for
+    ///   `[general] default_profile`.
     /// - Throws: The core's error if it or the session cannot be started.
     @discardableResult
-    func newTab(in window: NSWindow?) throws -> TerminalWindowController {
+    func newTab(in window: NSWindow?, profile: String? = nil) throws -> TerminalWindowController {
         guard let window, windowControllers.contains(where: { $0.window === window }) else {
-            return try newWindow()
+            return try newWindow(profile: profile)
         }
-        let controller = try makeController()
+        let controller = try makeController(profile: profile)
         guard let tab = controller.window else { return controller }
         window.addTabbedWindow(tab, ordered: .above)
         tab.makeKeyAndOrderFront(nil)
@@ -178,14 +187,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// ⌘T: a tab in the key window's tab bar, or in the main window's while a
     /// panel (About, an alert) is key.
     @objc func openNewTab(_ sender: Any?) {
+        openTab(profile: nil)
+    }
+
+    /// Shell > New Window with Profile > a profile: the item's
+    /// `representedObject` is the profile's name (``MainMenu/setProfiles(_:in:)``).
+    @objc func openNewWindowWithProfile(_ sender: Any?) {
+        do {
+            try newWindow(profile: Self.profileName(of: sender))
+        } catch {
+            presentOpenError(error)
+        }
+    }
+
+    /// Shell > New Tab with Profile > a profile, as ⌘T with that profile.
+    @objc func openNewTabWithProfile(_ sender: Any?) {
+        openTab(profile: Self.profileName(of: sender))
+    }
+
+    private func openTab(profile: String?) {
         let terminal = [NSApp.keyWindow, NSApp.mainWindow].lazy.compactMap { $0 }.first { window in
             self.windowControllers.contains { $0.window === window }
         }
         do {
-            try newTab(in: terminal)
+            try newTab(in: terminal, profile: profile)
         } catch {
             presentOpenError(error)
         }
+    }
+
+    private static func profileName(of sender: Any?) -> String? {
+        (sender as? NSMenuItem)?.representedObject as? String
+    }
+
+    /// The profile `session` was started with, `nil` for `[general]
+    /// default_profile`'s.
+    func profile(of session: TesseraSession) -> String? {
+        profileBySession[session.id]
     }
 
     // MARK: Configuration and help
@@ -310,9 +348,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func makeController() throws -> TerminalWindowController {
-        let core = try self.core ?? startCore()
-        let session = try core.spawn(spawnOptions)
+    private func makeController(profile: String?) throws -> TerminalWindowController {
+        let session = try spawn(profile: profile)
         let controller = TerminalWindowController(session: session, title: TerminalWindowController.defaultTitle)
         controller.delegate = self
         controller.paneContainer.inactivePaneDimming = paneDimming
@@ -324,6 +361,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return controller
     }
 
+    /// Starts a session of ``spawnOptions`` with `profile` and records its
+    /// profile.
+    private func spawn(profile: String?) throws -> TesseraSession {
+        let core = try self.core ?? startCore()
+        var options = spawnOptions
+        options.profile = profile
+        let session = try core.spawn(options)
+        if let profile {
+            profileBySession[session.id] = profile
+        }
+        return session
+    }
+
+    /// Shuts the core down and, with `start`, starts another, which reads
+    /// `TESSERA_CONFIG_DIR` as it is now; without, the next session starts
+    /// one. Internal for tests, which call it with no session open so the
+    /// app's own spawn and reload paths run on a configuration of theirs.
+    func replaceCore(start: Bool) throws {
+        core?.shutdown()
+        core = nil
+        if start {
+            _ = try startCore()
+        }
+    }
+
     private func startCore() throws -> TesseraApp {
         let core = try TesseraApp()
         core.delegate = router
@@ -331,10 +393,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         router.onConfigurationApplied = { [weak self] in
             self?.applyKeymap()
             self?.readPaneDimming()
+            self?.applyProfiles()
         }
         applyKeymap()
         readPaneDimming()
+        applyProfiles()
         return core
+    }
+
+    /// Gives the profile submenus the core's profiles: at start and after
+    /// every configuration the core applies. They keep their previous items
+    /// if the profiles cannot be read.
+    func applyProfiles() {
+        guard let core, let bar = NSApp.mainMenu else { return }
+        do {
+            MainMenu.setProfiles(try core.profileNames(), in: bar)
+        } catch {
+            Self.log.error("profiles not read: \(String(describing: error), privacy: .public)")
+        }
     }
 
     /// Reads `dim_inactive_panes` from the core: at start and after every
@@ -412,9 +488,9 @@ extension AppDelegate: TerminalWindowControllerDelegate {
         }
     }
 
+    /// A split's session, of the focused pane's profile.
     func terminalWindowControllerSpawnSession(_ controller: TerminalWindowController) throws -> TesseraSession {
-        let core = try self.core ?? startCore()
-        let session = try core.spawn(spawnOptions)
+        let session = try spawn(profile: profile(of: controller.focusedPane.session))
         // Registered before the main actor can run the session's first
         // delivery, so no event is dropped.
         router.register(controller, session: session)
@@ -423,11 +499,13 @@ extension AppDelegate: TerminalWindowControllerDelegate {
 
     func terminalWindowController(_ controller: TerminalWindowController, didClosePaneWith session: TesseraSession) {
         router.unregister(session)
+        profileBySession[session.id] = nil
     }
 
     func terminalWindowControllerDidClose(_ controller: TerminalWindowController) {
         for session in controller.sessions {
             router.unregister(session)
+            profileBySession[session.id] = nil
         }
         windowControllers.removeAll { $0 === controller }
         scheduleWindowStateSave()

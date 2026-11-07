@@ -7,8 +7,9 @@ use std::slice;
 
 use tessera_app_core::view::{MAX_VIEW_COLS, MAX_VIEW_ROWS};
 use tessera_app_core::{
-    ForegroundProcess as CoreForegroundProcess, MAX_FOREGROUND_NAME_BYTES, PtySize,
-    ScrollTarget as CoreScrollTarget, SessionId, SpawnOptions as CoreSpawnOptions,
+    ForegroundProcess as CoreForegroundProcess, MAX_FOREGROUND_NAME_BYTES,
+    MAX_PROFILE_NAME_LEN as CORE_MAX_PROFILE_NAME_LEN, PtySize, ScrollTarget as CoreScrollTarget,
+    SessionId, SpawnOptions as CoreSpawnOptions,
 };
 
 use crate::app::App;
@@ -24,9 +25,15 @@ pub const MAX_ROWS: u16 = 1024;
 /// Most columns a session can have; see `TESSERA_MAX_ROWS`.
 pub const MAX_COLS: u16 = 2048;
 
+/// Longest profile name, in bytes before its NUL, that
+/// `tessera_session_spawn` accepts: the longest a loaded configuration
+/// keeps (`[[profiles]] name`s past it are cut to it).
+pub const MAX_PROFILE_NAME_LEN: usize = 128;
+
 // cbindgen needs literals for the header; these keep them equal to the
 // core's bounds.
 const _: () = assert!(MAX_ROWS == MAX_VIEW_ROWS && MAX_COLS == MAX_VIEW_COLS);
+const _: () = assert!(MAX_PROFILE_NAME_LEN == CORE_MAX_PROFILE_NAME_LEN);
 
 /// What `tessera_session_spawn` starts.
 ///
@@ -60,6 +67,23 @@ pub struct SpawnOptions {
     /// Height of the view in pixels, or 0 when unknown. Any value is
     /// accepted; it is only reported to the child.
     pub height_px: u16,
+    /// Name of the profile (a `[[profiles]]` entry's `name`) the session
+    /// is started with, or `NULL` for `[general] default_profile`. Its
+    /// `command` runs when `program` is `NULL`, in its
+    /// `working_directory` when `cwd` is `NULL`, and the session is drawn
+    /// with its appearance. A name no profile has falls back to
+    /// `default_profile`, then to the built-in profile, with a logged
+    /// warning. At most `TESSERA_MAX_PROFILE_NAME_LEN` (128) bytes of
+    /// UTF-8 before its NUL; anything longer, or not UTF-8, is
+    /// `TESSERA_ERROR_INVALID_ARGUMENT`, and no more than that many bytes
+    /// and the NUL are read.
+    pub profile: *const c_char,
+}
+
+/// What `tessera_session_spawn` copied out of its options.
+struct Spawn {
+    options: CoreSpawnOptions,
+    profile: Option<String>,
 }
 
 impl SpawnOptions {
@@ -68,7 +92,7 @@ impl SpawnOptions {
     /// # Safety
     ///
     /// Every pointer must satisfy the contract documented on the fields.
-    unsafe fn to_core(self) -> Result<CoreSpawnOptions, Error> {
+    unsafe fn to_core(self) -> Result<Spawn, Error> {
         // Checked before any string is copied; the core checks again.
         if !(1..=MAX_ROWS).contains(&self.rows) || !(1..=MAX_COLS).contains(&self.cols) {
             return Err(Error::InvalidArgument);
@@ -104,8 +128,42 @@ impl SpawnOptions {
             // SAFETY: non-null, NUL-terminated per the contract.
             options = options.cwd(unsafe { os_str(self.cwd) });
         }
-        Ok(options.size(size))
+        let profile = if self.profile.is_null() {
+            None
+        } else {
+            // SAFETY: non-null, NUL-terminated per the contract.
+            let name = unsafe { bounded_str(self.profile, MAX_PROFILE_NAME_LEN) }
+                .ok_or(Error::InvalidArgument)?;
+            Some(name.to_owned())
+        };
+        Ok(Spawn {
+            options: options.size(size),
+            profile,
+        })
     }
+}
+
+/// Borrows a C string of at most `max` bytes before its NUL as UTF-8;
+/// `None` when it is longer (no more than `max + 1` bytes are read) or not
+/// UTF-8 (docs/security.md S7).
+///
+/// # Safety
+///
+/// `ptr` must be non-null and point to a NUL-terminated string that
+/// outlives `'a`.
+unsafe fn bounded_str<'a>(ptr: *const c_char, max: usize) -> Option<&'a str> {
+    let mut len = 0;
+    // SAFETY: every byte read is at or before the string's NUL, which the
+    // caller guarantees; the scan stops at it or after `max + 1` bytes.
+    while unsafe { *ptr.add(len) } != 0 {
+        if len == max {
+            return None;
+        }
+        len += 1;
+    }
+    // SAFETY: the `len` bytes before the NUL were just read.
+    let bytes = unsafe { slice::from_raw_parts(ptr.cast::<u8>(), len) };
+    std::str::from_utf8(bytes).ok()
 }
 
 /// Borrows a C string as an `OsStr`.
@@ -130,7 +188,8 @@ unsafe fn os_str<'a>(ptr: *const c_char) -> &'a OsStr {
 /// Returns `TESSERA_ERROR_NULL_POINTER` if `app`, `options` or `out_id` is
 /// `NULL` (or an argument string is), `TESSERA_ERROR_INVALID_ARGUMENT` for
 /// zero rows or columns, more than `TESSERA_MAX_ROWS` (1024) rows or
-/// `TESSERA_MAX_COLS` (2048) columns, or an empty program,
+/// `TESSERA_MAX_COLS` (2048) columns, an empty program, or a profile name
+/// past `TESSERA_MAX_PROFILE_NAME_LEN` or not UTF-8,
 /// `TESSERA_ERROR_SPAWN_FAILED` if no PTY is available, the program cannot
 /// be started, a thread could not be created, or the arguments and the
 /// environment together exceed what the system lets a program start with
@@ -165,11 +224,14 @@ pub unsafe extern "C" fn tessera_session_spawn(
             return Error::NullPointer;
         };
         // SAFETY: the option pointers satisfy their documented contract.
-        let options = match unsafe { options.to_core() } {
-            Ok(options) => options,
+        let spawn = match unsafe { options.to_core() } {
+            Ok(spawn) => spawn,
             Err(code) => return code,
         };
-        match app.core.spawn_session(options) {
+        match app
+            .core
+            .spawn_session_with_profile(spawn.options, spawn.profile.as_deref())
+        {
             Ok(id) => {
                 // SAFETY: as above.
                 unsafe { out_id.write(id.get()) };

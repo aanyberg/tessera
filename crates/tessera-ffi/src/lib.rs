@@ -88,6 +88,7 @@ pub use selection::{
     tessera_session_select_clear, tessera_session_select_extend, tessera_session_selection_text,
     tessera_session_set_hover,
 };
+pub use session::MAX_PROFILE_NAME_LEN;
 pub use session::{
     FOREGROUND_NAME_LEN, ForegroundProcess, MAX_COLS, MAX_ROWS, ScrollPosition, ScrollTarget,
     SpawnOptions, tessera_session_clear_scrollback, tessera_session_close,

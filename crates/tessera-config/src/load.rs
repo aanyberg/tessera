@@ -163,6 +163,23 @@ pub enum Warning {
         /// How many entries were left out.
         dropped: usize,
     },
+    /// The file has more than [`MAX_PROFILES`](crate::MAX_PROFILES)
+    /// `[[profiles]]` entries; the first ones are read and `dropped`
+    /// others are left out.
+    TooManyProfiles {
+        /// How many entries were left out.
+        dropped: usize,
+    },
+    /// A session asked for a profile (or `[general] default_profile`
+    /// names one) that no `[[profiles]]` entry has; `instead` is the one
+    /// used, `None` for the built-in profile.
+    ProfileNotFound {
+        /// The name asked for, escaped and truncated to
+        /// [`MAX_WARNING_PATH_LEN`] bytes.
+        name: String,
+        /// The profile used instead, escaped and truncated like `name`.
+        instead: Option<String>,
+    },
 }
 
 impl fmt::Display for Warning {
@@ -185,6 +202,15 @@ impl fmt::Display for Warning {
                 "{dropped} `[keys]` entries past the first {} ignored",
                 crate::MAX_KEY_BINDINGS
             ),
+            Self::TooManyProfiles { dropped } => write!(
+                f,
+                "{dropped} `[[profiles]]` entries past the first {} ignored",
+                crate::MAX_PROFILES
+            ),
+            Self::ProfileNotFound { name, instead } => match instead {
+                Some(instead) => write!(f, "profile `{name}` not found; using `{instead}`"),
+                None => write!(f, "profile `{name}` not found; using the built-in profile"),
+            },
         }
     }
 }
@@ -219,9 +245,13 @@ impl Config {
         let de = toml::de::Deserializer::from(document);
         let mut warnings = Vec::new();
         let mut omitted = 0usize;
+        let mut unknown = 0usize;
         let config = serde_ignored::deserialize(de, |path| {
-            if warnings.len() < MAX_UNKNOWN_KEY_WARNINGS {
-                let steps = path_steps(&path);
+            let steps = path_steps(&path);
+            if let Some(i) = profile_dimming_index(&steps) {
+                warnings.extend(profile_dimming(text, &root, &steps, i));
+            } else if unknown < MAX_UNKNOWN_KEY_WARNINGS {
+                unknown += 1;
                 warnings.push((
                     position(&root, &steps),
                     Warning::UnknownKey {
@@ -266,14 +296,17 @@ impl Config {
     /// warning for each change.
     pub fn normalize(&mut self) -> Vec<Warning> {
         let mut warnings = Vec::new();
-        normalize_appearance("appearance", &mut self.appearance, &mut warnings);
+        normalize_appearance(&mut self.appearance, &mut warnings);
+        crate::profile::cap_profiles(self, &mut warnings);
         for (i, profile) in self.profiles.iter_mut().enumerate() {
             if let Some(appearance) = profile.appearance.as_mut() {
-                normalize_appearance(
-                    &format!("profiles[{i}].appearance"),
-                    appearance,
-                    &mut warnings,
-                );
+                let prefix = format!("profiles[{i}].appearance");
+                if let Some(size) = appearance.font_size.as_mut() {
+                    *size = font_size_in_range(&prefix, *size, &mut warnings);
+                }
+                if let Some(opacity) = appearance.opacity.as_mut() {
+                    *opacity = opacity_in_range(&prefix, *opacity, &mut warnings);
+                }
             }
         }
         if self.terminal.scrollback_lines > crate::Terminal::MAX_SCROLLBACK_LINES {
@@ -547,6 +580,31 @@ where
     Ok(lenient_bool(deserializer)?.unwrap_or(crate::Appearance::default().cursor_blink))
 }
 
+/// Deserializes a profile's `appearance.cursor_shape` without failing: a
+/// value that is not a shape is left unset (so `[appearance]`'s is used),
+/// and [`invalid_lenient_values`] reports it.
+pub(crate) fn lenient_optional_cursor_shape<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::CursorShape>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+
+    let value = toml::Value::deserialize(deserializer)?;
+    Ok(value.as_str().and_then(crate::CursorShape::from_name))
+}
+
+/// Deserializes a profile's `appearance.cursor_blink` without failing:
+/// anything but a boolean is left unset, as for
+/// [`lenient_optional_cursor_shape`].
+pub(crate) fn lenient_optional_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    lenient_bool(deserializer)
+}
+
 /// Deserializes `terminal.clipboard_write` without failing, and fails
 /// closed (D-FAIL-CLOSED, ADR 0022): anything but a boolean is `false`, so
 /// a mistyped switch never leaves clipboard writes on, and
@@ -598,7 +656,7 @@ fn invalid_lenient_values(text: &str, root: &toml::de::DeTable<'_>) -> Vec<(usiz
     };
     let mut warnings = Vec::new();
     let appearances = std::iter::once(("appearance".to_owned(), vec![Step::Key("appearance")]))
-        .chain((0..profiles).map(|i| {
+        .chain((0..profiles.min(crate::MAX_PROFILES)).map(|i| {
             (
                 format!("profiles[{i}].appearance"),
                 vec![
@@ -609,6 +667,14 @@ fn invalid_lenient_values(text: &str, root: &toml::de::DeTable<'_>) -> Vec<(usiz
             )
         }));
     for (prefix, mut steps) in appearances {
+        // A profile's invalid value is left unset, so `[appearance]`'s is used.
+        let instead = |default: &str| {
+            if prefix == "appearance" {
+                format!("replaced by {default}")
+            } else {
+                "ignored, `[appearance]`'s value used".to_owned()
+            }
+        };
         steps.push(Step::Key(SHAPE));
         if let Some((at, value)) = lookup(root, &steps) {
             let valid = match value.get_ref() {
@@ -621,9 +687,9 @@ fn invalid_lenient_values(text: &str, root: &toml::de::DeTable<'_>) -> Vec<(usiz
                     Warning::OutOfRange {
                         path: format!("{prefix}.{SHAPE}"),
                         detail: format!(
-                            "{} replaced by \"{}\" (expected {})",
+                            "{} {} (expected {})",
                             written(text, value),
-                            crate::CursorShape::default().as_str(),
+                            instead(&format!("\"{}\"", crate::CursorShape::default().as_str())),
                             shape_names()
                         ),
                     },
@@ -640,9 +706,9 @@ fn invalid_lenient_values(text: &str, root: &toml::de::DeTable<'_>) -> Vec<(usiz
                 Warning::OutOfRange {
                     path: format!("{prefix}.{BLINK}"),
                     detail: format!(
-                        "{} replaced by {} (expected true or false)",
+                        "{} {} (expected true or false)",
                         written(text, value),
-                        crate::Appearance::default().cursor_blink
+                        instead(&crate::Appearance::default().cursor_blink.to_string())
                     ),
                 },
             ));
@@ -665,62 +731,22 @@ fn invalid_lenient_values(text: &str, root: &toml::de::DeTable<'_>) -> Vec<(usiz
     warnings
 }
 
-fn normalize_appearance(prefix: &str, a: &mut crate::Appearance, warnings: &mut Vec<Warning>) {
+/// `[appearance]`'s ranges: font size, opacity and pane dimming.
+fn normalize_appearance(a: &mut crate::Appearance, warnings: &mut Vec<Warning>) {
     use crate::Appearance;
 
-    let defaults = Appearance::default();
-    if !a.font_size.is_finite() {
-        warnings.push(Warning::OutOfRange {
-            path: format!("{prefix}.font_size"),
-            detail: format!("{} replaced by {}", a.font_size, defaults.font_size),
-        });
-        a.font_size = defaults.font_size;
-    } else if !(Appearance::MIN_FONT_SIZE..=Appearance::MAX_FONT_SIZE).contains(&a.font_size) {
-        let clamped = a
-            .font_size
-            .clamp(Appearance::MIN_FONT_SIZE, Appearance::MAX_FONT_SIZE);
-        warnings.push(Warning::OutOfRange {
-            path: format!("{prefix}.font_size"),
-            detail: format!("{} clamped to {clamped}", a.font_size),
-        });
-        a.font_size = clamped;
-    }
-    if !(0.0..=1.0).contains(&a.opacity) {
-        let clamped = if a.opacity.is_nan() {
-            defaults.opacity
-        } else {
-            a.opacity.clamp(0.0, 1.0)
-        };
-        warnings.push(Warning::OutOfRange {
-            path: format!("{prefix}.opacity"),
-            detail: format!("{} clamped to {clamped}", a.opacity),
-        });
-        a.opacity = clamped;
-    }
-    // `-0.0` is in range but would round-trip as `-0.0`; store plain zero.
-    if a.opacity == 0.0 {
-        a.opacity = 0.0;
-    }
+    const PREFIX: &str = "appearance";
+    a.font_size = font_size_in_range(PREFIX, a.font_size, warnings);
+    a.opacity = opacity_in_range(PREFIX, a.opacity, warnings);
     let max_dim = Appearance::MAX_DIM_INACTIVE_PANES;
-    if prefix != "appearance" {
-        if a.dim_inactive_panes.to_bits() != defaults.dim_inactive_panes.to_bits() {
-            warnings.push(Warning::OutOfRange {
-                path: format!("{prefix}.dim_inactive_panes"),
-                detail: format!(
-                    "{} ignored (set it in [appearance], not in a profile)",
-                    a.dim_inactive_panes
-                ),
-            });
-        }
-        a.dim_inactive_panes = defaults.dim_inactive_panes;
-    } else if !(0.0..=max_dim).contains(&a.dim_inactive_panes) {
+    if !(0.0..=max_dim).contains(&a.dim_inactive_panes) {
         let clamped = if a.dim_inactive_panes.is_finite() {
             a.dim_inactive_panes.clamp(0.0, max_dim)
         } else {
             0.0
         };
         warnings.push(Warning::OutOfRange {
-            path: format!("{prefix}.dim_inactive_panes"),
+            path: format!("{PREFIX}.dim_inactive_panes"),
             detail: format!("{} clamped to {clamped}", a.dim_inactive_panes),
         });
         a.dim_inactive_panes = clamped;
@@ -729,6 +755,96 @@ fn normalize_appearance(prefix: &str, a: &mut crate::Appearance, warnings: &mut 
     if a.dim_inactive_panes == 0.0 {
         a.dim_inactive_panes = 0.0;
     }
+}
+
+/// `{prefix}.font_size` clamped to
+/// [`Appearance::MIN_FONT_SIZE`](crate::Appearance::MIN_FONT_SIZE)..=[`Appearance::MAX_FONT_SIZE`](crate::Appearance::MAX_FONT_SIZE)
+/// (not a number gives the default), with a warning when it changed.
+fn font_size_in_range(prefix: &str, size: f32, warnings: &mut Vec<Warning>) -> f32 {
+    use crate::Appearance;
+
+    if !size.is_finite() {
+        let default = Appearance::default().font_size;
+        warnings.push(Warning::OutOfRange {
+            path: format!("{prefix}.font_size"),
+            detail: format!("{size} replaced by {default}"),
+        });
+        default
+    } else if (Appearance::MIN_FONT_SIZE..=Appearance::MAX_FONT_SIZE).contains(&size) {
+        size
+    } else {
+        let clamped = size.clamp(Appearance::MIN_FONT_SIZE, Appearance::MAX_FONT_SIZE);
+        warnings.push(Warning::OutOfRange {
+            path: format!("{prefix}.font_size"),
+            detail: format!("{size} clamped to {clamped}"),
+        });
+        clamped
+    }
+}
+
+/// `{prefix}.opacity` clamped to 0..=1 (not a number gives the default),
+/// with a warning when it changed.
+fn opacity_in_range(prefix: &str, opacity: f32, warnings: &mut Vec<Warning>) -> f32 {
+    let mut opacity = if (0.0..=1.0).contains(&opacity) {
+        opacity
+    } else {
+        let clamped = if opacity.is_nan() {
+            crate::Appearance::default().opacity
+        } else {
+            opacity.clamp(0.0, 1.0)
+        };
+        warnings.push(Warning::OutOfRange {
+            path: format!("{prefix}.opacity"),
+            detail: format!("{opacity} clamped to {clamped}"),
+        });
+        clamped
+    };
+    // `-0.0` is in range but would round-trip as `-0.0`; store plain zero.
+    if opacity == 0.0 {
+        opacity = 0.0;
+    }
+    opacity
+}
+
+/// The profile index when `steps` is `dim_inactive_panes` in a profile's
+/// `appearance`, which a profile's table does not have: the window draws
+/// the dimming, not the session.
+fn profile_dimming_index(steps: &[Step<'_>]) -> Option<usize> {
+    match steps {
+        [
+            Step::Key("profiles"),
+            Step::Index(i),
+            Step::Key("appearance"),
+            Step::Key("dim_inactive_panes"),
+        ] => Some(*i),
+        _ => None,
+    }
+}
+
+/// The warning for profile `i`'s `dim_inactive_panes` at `steps`: a
+/// [`Warning::OutOfRange`] that says to set it in `[appearance]`, placed
+/// where the key is. None past [`MAX_PROFILES`](crate::MAX_PROFILES): that
+/// profile is left out, with one warning for all of them (S5).
+fn profile_dimming(
+    text: &str,
+    root: &toml::de::DeTable<'_>,
+    steps: &[Step<'_>],
+    i: usize,
+) -> Option<(usize, Warning)> {
+    if i >= crate::MAX_PROFILES {
+        return None;
+    }
+    let (at, value) = lookup(root, steps)?;
+    Some((
+        at,
+        Warning::OutOfRange {
+            path: format!("profiles[{i}].appearance.dim_inactive_panes"),
+            detail: format!(
+                "{} ignored (set it in [appearance], not in a profile)",
+                written(text, value)
+            ),
+        },
+    ))
 }
 
 /// Reads and leniently parses the file at `path`.
@@ -1407,8 +1523,9 @@ mod tests {
         // In a profile too, named by its index.
         let text = "[[profiles]]\nname = \"a\"\n[profiles.appearance]\ncursor_shape = \"bar\"\n";
         let loaded = Config::from_toml_lenient(text).unwrap();
+        // Left unset, so the profile uses `[appearance]`'s shape.
         let appearance = loaded.config.profiles[0].appearance.as_ref().unwrap();
-        assert_eq!(appearance.cursor_shape, CursorShape::Block);
+        assert_eq!(appearance.cursor_shape, None);
         assert!(matches!(
             &loaded.warnings[..],
             [Warning::OutOfRange { path, .. }] if path == "profiles[0].appearance.cursor_shape"
@@ -1725,9 +1842,23 @@ mod tests {
     #[test]
     fn dim_inactive_panes_in_a_profile_is_ignored_with_a_warning() {
         let text = "[[profiles]]\nname = \"a\"\n[profiles.appearance]\ndim_inactive_panes = 0.5\n";
-        let loaded = Config::from_toml_lenient(text).unwrap();
-        let appearance = loaded.config.profiles[0].appearance.as_ref().unwrap();
-        assert_eq!(appearance.dim_inactive_panes.to_bits(), 0.0f32.to_bits());
+        let text = format!("[appearance]\ndim_inactive_panes = 0.25\n{text}");
+        let loaded = Config::from_toml_lenient(&text).unwrap();
+        assert_eq!(
+            loaded.warnings,
+            [Warning::OutOfRange {
+                path: "profiles[0].appearance.dim_inactive_panes".into(),
+                detail: "0.5 ignored (set it in [appearance], not in a profile)".into(),
+            }]
+        );
+        // The window's value, whichever profile.
+        let appearance = loaded.config.resolve_profile(Some("a")).appearance;
+        assert_eq!(appearance.dim_inactive_panes.to_bits(), 0.25f32.to_bits());
+        // Any value, also one that is not a number, warns and nothing more.
+        let loaded = Config::from_toml_lenient(
+            "[[profiles]]\nname = \"a\"\n[profiles.appearance]\ndim_inactive_panes = \"x\"\n",
+        )
+        .unwrap();
         assert!(
             matches!(&loaded.warnings[..], [Warning::OutOfRange { path, .. }] if path == "profiles[0].appearance.dim_inactive_panes"),
             "{:?}",
