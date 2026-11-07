@@ -28,6 +28,37 @@ private struct TimedOut: Error, CustomStringConvertible {
     var description: String
 }
 
+/// Drives `view`'s display link until the child's output shows as `lines`
+/// on the terminal: as many lines in the scrollback and on the screen
+/// (trailing blanks dropped), the last of them complete. Output arrives in
+/// order, so the earlier lines are there too. A query typed before then
+/// searches only what has arrived: the search reports done with too few
+/// matches, or makes an older match current, on a slow runner (CI). Output
+/// that fits on the screen never moves the scroll position, so it is read
+/// as text, through a select-all that is dropped again.
+@MainActor
+private func waitForLines(
+    _ lines: [String], on view: TerminalSurfaceView, timeout: Duration = .seconds(60)
+) async throws {
+    let deadline = ContinuousClock.now + timeout
+    while true {
+        try view.session.selectAll()
+        let text = try view.session.selectionText() ?? ""
+        try view.session.selectClear()
+        var shown = text.split(separator: "\n", omittingEmptySubsequences: false).map {
+            String($0.reversed().drop(while: \.isWhitespace).reversed())
+        }
+        while shown.last?.isEmpty == true { shown.removeLast() }
+        if shown.count == lines.count && shown.last == lines.last { return }
+        guard ContinuousClock.now < deadline else {
+            XCTFail("timed out after \(timeout) waiting for \(lines); shown: \(shown)")
+            throw TimedOut(description: "the printed lines")
+        }
+        view.displayLinkDidFire()
+        try await Task.sleep(for: .milliseconds(5))
+    }
+}
+
 /// The find bar on one view (#46b, ADR 0038): the count, moves, Escape,
 /// refusals, smart case, live output, Copy All Matches, the per-frame
 /// budget and the controller's states. On a core of the test's own (its
@@ -95,10 +126,13 @@ final class FindBarTests: XCTestCase {
         return view
     }
 
-    /// `lines` printed, then the child waits.
-    private func makeView(showing lines: [String], windowed: Bool = true) throws -> TerminalSurfaceView {
+    /// `lines` printed, then the child waits; returned once they are all on
+    /// the terminal.
+    private func makeView(showing lines: [String], windowed: Bool = true) async throws -> TerminalSurfaceView {
         let text = lines.joined(separator: #"\r\n"#)
-        return try makeView("printf '\(text)'; exec cat > /dev/null", windowed: windowed)
+        let view = try makeView("printf '\(text)'; exec cat > /dev/null", windowed: windowed)
+        try await waitForLines(lines, on: view)
+        return view
     }
 
     /// Drives the display link until `condition` holds.
@@ -145,7 +179,7 @@ final class FindBarTests: XCTestCase {
     // MARK: Count and moves
 
     func testTypingAQueryShowsTheCountFromTheCore() async throws {
-        let view = try makeView(showing: ["hit one", "miss", "hit two", "hit three"])
+        let view = try await makeView(showing: ["hit one", "miss", "hit two", "hit three"])
         try type("hit", into: view)
         try await tick(view, until: "three matches") { try status(view).matches == 3 && status(view).done }
         let bar = try XCTUnwrap(view.findBar)
@@ -228,7 +262,7 @@ final class FindBarTests: XCTestCase {
     }
 
     func testReturnAndShiftReturnInTheFieldMoveOlderAndNewer() async throws {
-        let view = try makeView(showing: ["hit one", "hit two", "hit three"])
+        let view = try await makeView(showing: ["hit one", "hit two", "hit three"])
         try type("hit", into: view)
         try await tick(view, until: "three matches") { try status(view).matches == 3 && status(view).done }
         let bar = try XCTUnwrap(view.findBar)
@@ -242,7 +276,7 @@ final class FindBarTests: XCTestCase {
     }
 
     func testAMoveBeforeTheFirstMatchWaitsForIt() async throws {
-        let view = try makeView(showing: ["hit one", "hit two"])
+        let view = try await makeView(showing: ["hit one", "hit two"])
         try type("hit", into: view)
         // Nothing stepped yet: ⌘G waits for the first match.
         view.findNextMatch(nil)
@@ -254,7 +288,7 @@ final class FindBarTests: XCTestCase {
     // MARK: Escape and focus
 
     func testCommandFAndEscapeGoThroughTheMenuAndReturnFocusToTheTerminal() async throws {
-        let view = try makeView(showing: ["hit one", "hit two"])
+        let view = try await makeView(showing: ["hit one", "hit two"])
         let window = try XCTUnwrap(view.window)
         XCTAssertTrue(window.firstResponder === view)
         // ⌘F is the menu's (the key map's `find`), not the terminal's.
@@ -294,7 +328,7 @@ final class FindBarTests: XCTestCase {
     }
 
     func testTheBarFloatsInTheTopTrailingCornerAndNeverResizesTheGrid() async throws {
-        let view = try makeView(showing: ["hit"])
+        let view = try await makeView(showing: ["hit"])
         let resizes = view.coreResizeCount
         let render = view.renderView.frame
         view.showFindBar(nil)
@@ -374,7 +408,7 @@ final class FindBarTests: XCTestCase {
     // MARK: Refusals and case
 
     func testAnInvalidRegexShowsAnInlineErrorAndFixingItSearchesAgain() async throws {
-        let view = try makeView(showing: ["hit one", "hit two"])
+        let view = try await makeView(showing: ["hit one", "hit two"])
         view.showFindBar(nil)
         let bar = try XCTUnwrap(view.findBar)
         bar.regexButton.performClick(nil)
@@ -398,7 +432,7 @@ final class FindBarTests: XCTestCase {
     }
 
     func testSmartCaseAndTheCaseToggles() async throws {
-        let view = try makeView(showing: ["one FOO", "two foo"])
+        let view = try await makeView(showing: ["one FOO", "two foo"])
         try type("foo", into: view)
         try await tick(view, until: "done") { try status(view).done }
         XCTAssertEqual(try status(view).matches, 2, "'foo' finds 'FOO' in smart case")
@@ -461,8 +495,8 @@ final class FindBarTests: XCTestCase {
     // MARK: Panes
 
     func testASecondViewsSearchIsIndependentAndClosingItsSessionFreesIt() async throws {
-        let first = try makeView(showing: ["alpha", "beta"])
-        let second = try makeView(showing: ["alpha", "beta", "beta"])
+        let first = try await makeView(showing: ["alpha", "beta"])
+        let second = try await makeView(showing: ["alpha", "beta", "beta"])
         try type("alpha", into: first)
         try type("beta", into: second)
         try await tick(first, until: "alpha") { try status(first).matches == 1 && status(first).done }
@@ -481,7 +515,7 @@ final class FindBarTests: XCTestCase {
     // MARK: Use Selection and Copy All Matches
 
     func testUseSelectionForFindTakesTheFirstLineSafeAndEscaped() async throws {
-        let view = try makeView(showing: ["a.b*c x\u{202E}y", "a.b*c", "aXbbc"])
+        let view = try await makeView(showing: ["a.b*c x\u{202E}y", "a.b*c", "aXbbc"])
         try await tick(view, until: "the text is shown") {
             try view.session.selectAll()
             return try view.session.selectionText()?.hasSuffix("aXbbc") == true
@@ -561,7 +595,7 @@ final class FindBarTests: XCTestCase {
 
     func testTypingIsDebouncedAndReturnSendsTheQueryAtOnce() async throws {
         FindController.debounce = .milliseconds(200)
-        let view = try makeView(showing: ["hit one", "hit two"])
+        let view = try await makeView(showing: ["hit one", "hit two"])
         view.showFindBar(nil)
         let calls = view.find.searchCallCount
         for prefix in ["h", "hi", "hit"] { try type(prefix, into: view) }
@@ -710,11 +744,14 @@ final class FindBarTests: XCTestCase {
 @MainActor
 final class FindBarPaneTests: XCTestCase {
     private var appDelegate: AppDelegate!
+    /// What every pane's child prints.
+    private static let lines = ["alpha", "beta", "beta"]
 
     override func setUp() async throws {
         FindController.debounce = .zero
         appDelegate = try XCTUnwrap(NSApp.delegate as? AppDelegate)
-        appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-c", #"printf 'alpha\r\nbeta\r\nbeta\r\n'; exec cat > /dev/null"#])
+        let text = Self.lines.joined(separator: #"\r\n"#)
+        appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-c", "printf '\(text)'; exec cat > /dev/null"])
         XCTAssertTrue(appDelegate.windowControllers.isEmpty, "a previous test left windows open")
     }
 
@@ -742,6 +779,7 @@ final class FindBarPaneTests: XCTestCase {
     }
 
     private func search(_ query: String, in pane: Pane) async throws {
+        try await waitForLines(Self.lines, on: pane.view)
         pane.view.showFindBar(nil)
         let bar = try XCTUnwrap(pane.view.findBar)
         bar.field.stringValue = query
