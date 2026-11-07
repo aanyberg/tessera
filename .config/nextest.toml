@@ -94,3 +94,10 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 [[profile.default.overrides]]
 filter = '(package(tessera-app-core) & kind(lib) & test(a_loss_inside_the_frame_detaches_at_once)) | (package(tessera-render) & binary(device_loss))'
 slow-timeout = { period = "60s", terminate-after = 10 }
+
+# The FFI surface tests bring up a GPU device per attach and wait on a shell (each reply up to 60 s, #316). With eight
+# runs at once on a loaded machine a passing run took up to 248 s, close to the default 300 s limit, so they get 600 s
+# (#321). An unloaded run takes under a second.
+[[profile.default.overrides]]
+filter = 'package(tessera-ffi) & binary(surface)'
+slow-timeout = { period = "60s", terminate-after = 10 }

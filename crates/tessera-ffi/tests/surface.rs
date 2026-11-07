@@ -14,8 +14,10 @@
 mod common;
 
 use std::ffi::{CString, c_char};
+use std::panic::AssertUnwindSafe;
 use std::ptr;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tessera_app_core::SessionId;
@@ -271,6 +273,9 @@ impl Handle {
         self.with_core(|core| core.view_ids().into_iter().map(SessionId::get).collect())
     }
 
+    /// The visible screen's text, one line per row, without the blank rows
+    /// below the last written one (so a failure message does not end in a
+    /// screenful of empty lines).
     fn screen(&self, id: u64) -> String {
         self.with_core(|core| {
             core.with_terminal(SessionId::from_raw(id), |term| {
@@ -280,29 +285,44 @@ impl Handle {
                     .map(|line| line.text().trim_end().to_owned())
                     .collect::<Vec<_>>()
                     .join("\n")
+                    .trim_end()
+                    .to_owned()
             })
         })
         .expect("live session")
     }
 
     /// Asks the shell for its window size and waits until the screen shows
-    /// `rows cols`.
+    /// `rows cols`; fails at once when the reply is complete and shows
+    /// another size, and reports the failure at the caller's line.
     ///
     /// Each query tags its reply with a fresh number, so the reply to an
-    /// earlier query still on screen never satisfies a later one, and the
-    /// echoed command line (`echo "<n>:$(stty size)"`) never matches the
-    /// reply.
+    /// earlier query still on screen never satisfies a later one, and ends
+    /// it with a `.`, so a reply is complete only once its last character is
+    /// on screen. The echoed command line (`echo "<n>:$(stty size)."`) never
+    /// matches the reply: it starts with `echo` or the prompt.
+    #[track_caller]
     fn assert_child_sees(&self, id: u64, rows: u16, cols: u16) {
         static QUERY: AtomicU32 = AtomicU32::new(0);
         let tag = QUERY.fetch_add(1, Ordering::Relaxed);
-        self.write(id, format!("echo \"{tag}:$(stty size)\"\n").as_bytes());
-        let expected = format!("{tag}:{rows} {cols}");
+        self.write(id, format!("echo \"{tag}:$(stty size).\"\n").as_bytes());
+        let prefix = format!("{tag}:");
+        let expected = format!("{rows} {cols}");
         wait_for_child(|| {
             let screen = self.screen(id);
-            if screen.lines().any(|line| line.trim_end() == expected) {
-                Ok(())
-            } else {
-                Err(format!("child never reported {expected:?}:\n{screen}"))
+            let reply = screen.lines().find_map(|line| {
+                line.trim_end()
+                    .strip_prefix(&prefix)
+                    .and_then(|rest| rest.strip_suffix('.'))
+            });
+            match reply {
+                Some(size) if size == expected => Ok(()),
+                Some(size) => Err(Miss::Wrong(format!(
+                    "child reported {prefix}{size:?}, not {prefix}{expected:?}:\n{screen}"
+                ))),
+                None => Err(Miss::NotYet(format!(
+                    "child never reported {prefix}{expected:?}:\n{screen}"
+                ))),
             }
         });
     }
@@ -530,38 +550,95 @@ fn metrics_report_the_surface_the_grid_and_the_cursor() {
     assert_eq!(app.close(id), Error::Ok);
 }
 
-/// Waits until the cursor is at `(row, col)` and returns the metrics then.
+/// Waits until the cursor is at `(row, col)` and returns the metrics then;
+/// a timeout is reported at the caller's line.
+#[track_caller]
 fn wait_for_cursor(app: &Handle, id: u64, (row, col): (u16, u16)) -> SurfaceMetrics {
     wait_for_child(|| {
         let now = app.metrics_ok(id);
         if (now.cursor_row, now.cursor_col) == (row, col) {
             Ok(now)
         } else {
-            Err(format!(
+            Err(Miss::NotYet(format!(
                 "the cursor is at {:?}, not {:?}:\n{}",
                 (now.cursor_row, now.cursor_col),
                 (row, col),
                 app.screen(id)
-            ))
+            )))
         }
     })
 }
 
+/// What a probe of [`wait_for_child`] saw instead of what it waits for.
+enum Miss {
+    /// Not there yet: poll again until the deadline.
+    NotYet(String),
+    /// A final answer that differs from the expected one: fail at once.
+    Wrong(String),
+}
+
 /// Polls `probe` every [`POLL`] until it returns `Ok`, for at most
-/// [`CHILD_TIMEOUT`], and panics with the last `Err` (what the probe saw)
-/// past it. The last poll is at the deadline, never a poll interval after
-/// it, so the deadline bounds how long the child may take.
-fn wait_for_child<T>(mut probe: impl FnMut() -> Result<T, String>) -> T {
+/// [`CHILD_TIMEOUT`], and panics with the last [`Miss::NotYet`] (what the
+/// probe saw) past it, or at once with a [`Miss::Wrong`]. The last poll is
+/// at the deadline, never a poll interval after it, so the deadline bounds
+/// how long the child may take. The panic names the caller's line.
+#[track_caller]
+fn wait_for_child<T>(mut probe: impl FnMut() -> Result<T, Miss>) -> T {
     let deadline = Instant::now() + CHILD_TIMEOUT;
     loop {
         let seen = match probe() {
             Ok(value) => return value,
-            Err(seen) => seen,
+            Err(Miss::Wrong(seen)) => panic!("{seen}"),
+            Err(Miss::NotYet(seen)) => seen,
         };
         let left = deadline.saturating_duration_since(Instant::now());
         assert!(!left.is_zero(), "{seen}\n(waited {CHILD_TIMEOUT:?})");
         std::thread::sleep(left.min(POLL));
     }
+}
+
+/// A wrong size on screen fails [`Handle::assert_child_sees`] as soon as
+/// the reply is complete, not when [`CHILD_TIMEOUT`] runs out, at the
+/// caller's line, and the message ends with the last written row (#321).
+/// Needs no GPU: the shell keeps its spawn size, 24 by 80.
+#[test]
+fn a_wrong_size_fails_at_once_at_the_callers_line() {
+    let app = Handle::new();
+    let id = app.spawn_shell();
+    // The panic's location and message, recorded by a hook on this thread;
+    // panics on other threads go to the default hook.
+    let seen: Arc<Mutex<Option<(String, u32, String)>>> = Arc::default();
+    let previous = std::panic::take_hook();
+    let this = std::thread::current().id();
+    let record = Arc::clone(&seen);
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().id() != this {
+            return previous(info);
+        }
+        let location = info.location().expect("a panic location");
+        let message = info
+            .payload()
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        *record.lock().unwrap() = Some((location.file().to_owned(), location.line(), message));
+    }));
+    let call_line = line!() + 1;
+    let caught = std::panic::catch_unwind(AssertUnwindSafe(|| app.assert_child_sees(id, 24, 81)));
+    drop(std::panic::take_hook());
+    assert!(caught.is_err(), "24 81 was accepted for a 24x80 shell");
+    let (file, line, message) = seen.lock().unwrap().take().expect("the panic was recorded");
+    assert_eq!((file.as_str(), line), (file!(), call_line), "{message}");
+    assert!(
+        message.starts_with("child reported ") && !message.contains("(waited "),
+        "not the early failure: {message}"
+    );
+    assert!(message.contains(":\"24 80\""), "{message}");
+    assert_eq!(
+        message,
+        message.trim_end(),
+        "trailing blank rows: {message:?}"
+    );
 }
 
 #[test]
