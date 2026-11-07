@@ -37,6 +37,13 @@ pub enum Error {
     Gpu = 7,
     /// The session has no surface attached (`tessera_surface_attach`).
     NoSurface = 8,
+    /// A configuration edit was refused because the configuration loader
+    /// would warn about the result (`tessera_config_set`): nothing was
+    /// written.
+    Refused = 9,
+    /// `config.toml` (or `themes/`) changed on disk while the call worked
+    /// on it: nothing was written and the other change stays.
+    Conflict = 10,
 }
 
 impl From<&CoreError> for Error {
@@ -99,9 +106,11 @@ mod tests {
             Error::Panic,
             Error::Gpu,
             Error::NoSurface,
+            Error::Refused,
+            Error::Conflict,
         ];
         let values: Vec<i32> = codes.iter().map(|&code| code as i32).collect();
-        assert_eq!(values, [0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(values, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     }
 
     #[test]

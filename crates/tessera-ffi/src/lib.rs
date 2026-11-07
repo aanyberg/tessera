@@ -40,6 +40,7 @@
 
 mod app;
 mod callbacks;
+mod config;
 mod error;
 mod input;
 mod keymap;
@@ -56,6 +57,10 @@ pub use app::{
     tessera_app_free, tessera_app_new, tessera_app_set_callbacks,
 };
 pub use callbacks::Callbacks;
+pub use config::{
+    MAX_CONFIG_VALUE_LEN, MAX_THEME_PATH_LEN, THEME_ID_LEN, tessera_config_json,
+    tessera_config_remove, tessera_config_set, tessera_theme_import, tessera_theme_list,
+};
 pub use error::Error;
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]

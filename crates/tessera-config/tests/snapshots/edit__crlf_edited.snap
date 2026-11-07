@@ -1,0 +1,41 @@
+---
+source: crates/tessera-config/tests/edit.rs
+expression: "saved.replace(\"\\r\\n\", \"\\u{240d}\\n\")"
+---
+# My Tessera setup.␍
+# Synced from dotfiles.␍
+␍
+[general]␍
+confirm_close   =   false    # I live dangerously␍
+fancy_unknown = "kept"␍
+default_profile = "Shell"␍
+␍
+[appearance]␍
+# Colours.␍
+␍
+# The theme I like.␍
+theme = 'Nord'␍
+font_size = 13.5 # points␍
+# Fully opaque.␍
+opacity = 0.5␍
+# ...and nothing after this.␍
+␍
+[terminal]␍
+scrollback_lines = 50_000␍
+␍
+# Plugins come last.␍
+[plugins]␍
+enabled = [␍
+  "hello", # the demo␍
+  # nothing else yet␍
+]␍
+␍
+[[profiles]]␍
+# My shell.␍
+name = "Shell"␍
+command = "/bin/zsh -l"␍
+[profiles.appearance]␍
+font_size = 15.0␍
+␍
+[keys]␍
+"cmd+e" = "new_tab"  # muscle memory␍

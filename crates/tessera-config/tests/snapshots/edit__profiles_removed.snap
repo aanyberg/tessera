@@ -1,0 +1,33 @@
+---
+source: crates/tessera-config/tests/edit.rs
+expression: read(&path)
+---
+# My Tessera setup.
+# Synced from dotfiles.
+
+[general]
+confirm_close   =   false    # I live dangerously
+fancy_unknown = "kept"
+
+[appearance]
+# Colours.
+
+# The theme I like.
+theme = 'Nord'
+font_size = 13.5 # points
+# Fully opaque.
+opacity = 1.0
+# ...and nothing after this.
+
+[terminal]
+scrollback_lines = 50_000
+
+# Plugins come last.
+[plugins]
+enabled = [
+  "hello", # the demo
+  # nothing else yet
+]
+
+[keys]
+"cmd+e" = "new_tab"  # muscle memory

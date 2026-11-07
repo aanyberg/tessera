@@ -1,0 +1,10 @@
+---
+source: crates/tessera-config/tests/edit.rs
+expression: read(&path)
+---
+appearance.theme = "Dracula" # dotted
+appearance.opacity = 0.5
+
+[[profiles]]
+name = "a"
+appearance = { theme = "Dracula", blur = true }
