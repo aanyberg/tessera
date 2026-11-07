@@ -15,6 +15,7 @@ mod common;
 
 use std::ffi::{CString, c_char};
 use std::ptr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use tessera_app_core::SessionId;
@@ -27,7 +28,19 @@ use tessera_ffi::{
     tessera_test_surface_panic, tessera_test_with_core,
 };
 
+/// How long freeing the application may take.
 const TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long to wait for the child to react to input (start, run a
+/// command, copy a line back). On a loaded machine a shell and the `stty`
+/// it forks can stall for long: with the tests at background priority next
+/// to nine busy loops one reply took 26 s and the old 5 s bound failed 8 of
+/// 25 runs (#316). The waits poll and return as soon as the reply is on
+/// screen, so a passing run never waits this long.
+const CHILD_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How often the waits on the child look at the screen.
+const POLL: Duration = Duration::from_millis(10);
 
 /// What `Handle::metrics` pre-fills: no field holds a value a surface
 /// reports.
@@ -273,21 +286,24 @@ impl Handle {
 
     /// Asks the shell for its window size and waits until the screen shows
     /// `rows cols`.
+    ///
+    /// Each query tags its reply with a fresh number, so the reply to an
+    /// earlier query still on screen never satisfies a later one, and the
+    /// echoed command line (`echo "<n>:$(stty size)"`) never matches the
+    /// reply.
     fn assert_child_sees(&self, id: u64, rows: u16, cols: u16) {
-        self.write(id, b"stty size\n");
-        let expected = format!("{rows} {cols}");
-        let deadline = Instant::now() + TIMEOUT;
-        loop {
+        static QUERY: AtomicU32 = AtomicU32::new(0);
+        let tag = QUERY.fetch_add(1, Ordering::Relaxed);
+        self.write(id, format!("echo \"{tag}:$(stty size)\"\n").as_bytes());
+        let expected = format!("{tag}:{rows} {cols}");
+        wait_for_child(|| {
             let screen = self.screen(id);
             if screen.lines().any(|line| line.trim_end() == expected) {
-                return;
+                Ok(())
+            } else {
+                Err(format!("child never reported {expected:?}:\n{screen}"))
             }
-            assert!(
-                Instant::now() < deadline,
-                "child never reported {expected:?}:\n{screen}"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        });
     }
 
     /// Renders one frame after waiting out the pacing interval, so its
@@ -515,20 +531,35 @@ fn metrics_report_the_surface_the_grid_and_the_cursor() {
 
 /// Waits until the cursor is at `(row, col)` and returns the metrics then.
 fn wait_for_cursor(app: &Handle, id: u64, (row, col): (u16, u16)) -> SurfaceMetrics {
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
+    wait_for_child(|| {
         let now = app.metrics_ok(id);
         if (now.cursor_row, now.cursor_col) == (row, col) {
-            return now;
+            Ok(now)
+        } else {
+            Err(format!(
+                "the cursor is at {:?}, not {:?}:\n{}",
+                (now.cursor_row, now.cursor_col),
+                (row, col),
+                app.screen(id)
+            ))
         }
-        assert!(
-            Instant::now() < deadline,
-            "the cursor is at {:?}, not {:?}:\n{}",
-            (now.cursor_row, now.cursor_col),
-            (row, col),
-            app.screen(id)
-        );
-        std::thread::sleep(Duration::from_millis(10));
+    })
+}
+
+/// Polls `probe` every [`POLL`] until it returns `Ok`, for at most
+/// [`CHILD_TIMEOUT`], and panics with the last `Err` (what the probe saw)
+/// past it. The last poll is at the deadline, never a poll interval after
+/// it, so the deadline bounds how long the child may take.
+fn wait_for_child<T>(mut probe: impl FnMut() -> Result<T, String>) -> T {
+    let deadline = Instant::now() + CHILD_TIMEOUT;
+    loop {
+        let seen = match probe() {
+            Ok(value) => return value,
+            Err(seen) => seen,
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(!left.is_zero(), "{seen}\n(waited {CHILD_TIMEOUT:?})");
+        std::thread::sleep(left.min(POLL));
     }
 }
 
