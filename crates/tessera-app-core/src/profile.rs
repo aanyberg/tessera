@@ -26,6 +26,69 @@ pub(crate) fn apply(mut options: SpawnOptions, resolved: &ResolvedProfile) -> Sp
     options
 }
 
+/// The `errno` behind a [`tessera_pty::PtyError::Spawn`] reason, when it
+/// names one: `(os error N)` as `std::io::Error` writes it, or one of the
+/// messages `portable-pty` gives for a program it cannot find or run.
+/// `None` for any other reason; the reason itself (it may hold paths and
+/// `PATH`) is never shown or logged (docs/security.md S8).
+pub(crate) fn spawn_errno(reason: &str) -> Option<i32> {
+    if let Some((_, rest)) = reason.rsplit_once("(os error ")
+        && let Some((digits, _)) = rest.split_once(')')
+        && let Ok(errno) = digits.parse::<i32>()
+    {
+        return Some(errno);
+    }
+    if reason.contains("is a directory") {
+        Some(errno::EISDIR)
+    } else if reason.contains("not executable") {
+        Some(errno::EACCES)
+    } else if [
+        "doesn't exist",
+        "does not exist",
+        "No viable candidates",
+        "Unable to resolve the PATH",
+    ]
+    .iter()
+    .any(|needle| reason.contains(needle))
+    {
+        Some(errno::ENOENT)
+    } else {
+        None
+    }
+}
+
+/// The `errno` values [`spawn_errno`] maps `portable-pty`'s own messages
+/// to (the same on every Unix Tessera builds for).
+mod errno {
+    pub(super) const ENOENT: i32 = 2;
+    pub(super) const EACCES: i32 = 13;
+    pub(super) const EISDIR: i32 = 21;
+}
+
+/// The line written into a session that started on the built-in profile
+/// because profile `name` could not (#333, lead decision F3), ending in
+/// CR LF: the name with control and bidirectional formatting characters
+/// left out and cut to [`tessera_config::edit::MAX_DISPLAY_NAME_LEN`]
+/// bytes (docs/security.md S3), and the `errno`'s text without its
+/// `(os error N)` suffix.
+pub(crate) fn fallback_notice(name: &str, errno: Option<i32>) -> Vec<u8> {
+    let reason = errno.map_or_else(
+        || "the program could not be started".to_owned(),
+        |errno| {
+            let text = std::io::Error::from_raw_os_error(errno).to_string();
+            match text.rsplit_once(" (os error ") {
+                Some((text, _)) => text.to_owned(),
+                None => text,
+            }
+        },
+    );
+    format!(
+        "[Tessera] profile \"{}\" could not start ({reason}); started the default shell.\r\n",
+        tessera_config::edit::display_name(name)
+    )
+    .into_bytes()
+}
+
 /// The program a profile's `command` runs: one word (no white space) as
 /// the program itself, anything else through `/bin/sh -c`; `None` for an
 /// empty command (the login shell then).
@@ -138,6 +201,56 @@ mod tests {
         assert_eq!(at(file.to_str().unwrap()), None);
         // Without a home directory `~` stays as written.
         assert_eq!(directory_for("~", None), None);
+    }
+
+    #[test]
+    fn a_spawn_reason_gives_its_errno_and_nothing_else() {
+        assert_eq!(spawn_errno("Permission denied (os error 13)"), Some(13));
+        assert_eq!(
+            spawn_errno("Unable to spawn /x because it doesn't exist on the filesystem (ENOENT)"),
+            Some(2)
+        );
+        assert_eq!(
+            spawn_errno("Unable to spawn x because it is a directory"),
+            Some(21)
+        );
+        assert_eq!(
+            spawn_errno("Unable to spawn x because it is not executable (mode)"),
+            Some(13)
+        );
+        assert_eq!(
+            spawn_errno("No viable candidates found in PATH \"/bin\""),
+            Some(2)
+        );
+        assert_eq!(spawn_errno("nul byte found in provided data"), None);
+        assert_eq!(spawn_errno("(os error x)"), None);
+    }
+
+    #[test]
+    fn the_notice_names_the_profile_sanitised_and_capped() {
+        let notice = String::from_utf8(fallback_notice("dev", Some(13))).unwrap();
+        assert_eq!(
+            notice,
+            "[Tessera] profile \"dev\" could not start (Permission denied); \
+             started the default shell.\r\n"
+        );
+        let notice = String::from_utf8(fallback_notice("x", None)).unwrap();
+        assert!(
+            notice.contains("(the program could not be started)"),
+            "{notice}"
+        );
+        let hostile = format!("\u{1b}[31m\u{202e}{}\u{7}\n", "é".repeat(200));
+        let notice = String::from_utf8(fallback_notice(&hostile, Some(2))).unwrap();
+        let name = notice
+            .strip_prefix("[Tessera] profile \"")
+            .and_then(|rest| rest.split_once("\" could not start"))
+            .unwrap()
+            .0;
+        assert_eq!(name, format!("[31m{}", "é".repeat(62)));
+        assert!(name.len() <= tessera_config::edit::MAX_DISPLAY_NAME_LEN);
+        let body = notice.strip_suffix("\r\n").unwrap();
+        assert!(!body.contains(char::is_control), "{notice:?}");
+        assert!(!notice.contains('\u{202e}'), "{notice:?}");
     }
 
     /// The missing directory is named in its warning, escaped; the command

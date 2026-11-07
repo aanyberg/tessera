@@ -450,17 +450,22 @@ impl Default for Terminal {
 pub struct Profile {
     /// Display name, shown in the menus. Should be unique: of two
     /// profiles with one name, the first is used and the second is
-    /// reported with a warning.
+    /// reported with a warning. A NUL character in it is replaced with
+    /// U+FFFD, with a warning.
     pub name: String,
     /// Command to run instead of the login shell: one program name or
     /// path runs directly (`"/opt/homebrew/bin/fish"`), anything with a
     /// space runs through `/bin/sh -c` (`"ssh build-box"`). Unset means the
-    /// login shell.
+    /// login shell. A command that cannot be executed (it does not
+    /// exist, or is not executable) starts your login shell in your home
+    /// directory instead, with a line in the new session saying so.
     pub command: Option<String>,
     /// Starting directory; `~` at the start is your home directory. A
     /// directory that does not exist falls back to your home directory
-    /// with a warning. Used only when the session is not given a
-    /// directory of its own; unset means your home directory.
+    /// with a warning; one that exists but cannot be entered starts your
+    /// login shell in your home directory, with a line in the new session
+    /// saying so. Used only when the session is not given a directory of
+    /// its own; unset means your home directory.
     pub working_directory: Option<String>,
     /// Appearance for this profile's sessions: each key set here replaces
     /// the one in `[appearance]`, each key left out follows `[appearance]`

@@ -470,9 +470,21 @@ impl App {
     /// is drawn with the profile's appearance, followed through every
     /// configuration applied later (#39).
     ///
+    /// When what the profile changed cannot start (a `working_directory`
+    /// that exists but cannot be entered, a `command` that cannot be
+    /// executed: a [`PtyError::Spawn`]), the session is started once more
+    /// as the built-in profile would start it (the caller's `options`: the
+    /// login shell in the home directory) and drawn with `[appearance]`. Its
+    /// first line then says so: `[Tessera] profile "<name>" could not start
+    /// (<reason>); started the default shell.`, the name without control or
+    /// bidirectional formatting characters and at most
+    /// [`edit::MAX_DISPLAY_NAME_LEN`] bytes. The warning logged names the
+    /// profile by its index and the `errno` only (#333).
+    ///
     /// # Errors
     ///
-    /// As for [`App::spawn_session`].
+    /// As for [`App::spawn_session`]. When the second start fails too, the
+    /// first start's error.
     pub fn spawn_session_with_profile(
         &self,
         options: SpawnOptions,
@@ -483,19 +495,48 @@ impl App {
         if let Some(warning) = &resolved.warning {
             tracing::warn!(target: "tessera_app_core", "{warning}");
         }
-        let options = profile::apply(options, &resolved);
         let id = self.allocate_id();
-        let options = SpawnOptions {
+        let original = SpawnOptions {
             session_id: id.to_string(),
             ..options
         };
+        let profiled = profile::apply(original.clone(), &resolved);
+        let changed = profiled != original;
+        let error = match self.spawn_pty(profiled) {
+            Ok((pty, events, size)) => {
+                return self.attach_with_profile(id, pty, events, size, resolved.name, &[]);
+            }
+            Err(error) => error,
+        };
+        let (Some(name), true, Error::Pty(PtyError::Spawn { reason, .. })) =
+            (resolved.name.as_deref(), changed, &error)
+        else {
+            return Err(error);
+        };
+        let errno = profile::spawn_errno(reason);
+        let index = self.config().profiles.iter().position(|p| p.name == name);
+        tracing::warn!(
+            target: "tessera_app_core",
+            profile = ?index,
+            errno = ?errno,
+            "a profile's session could not start; starting the built-in profile"
+        );
+        let notice = profile::fallback_notice(name, errno);
+        // One retry, as the built-in profile; its failure reports the
+        // profile's, the one the user asked for.
+        let (pty, events, size) = self.spawn_pty(original).map_err(|_| error)?;
+        self.attach_with_profile(id, pty, events, size, None, &notice)
+    }
+
+    /// Starts `options` on a new PTY, with shell integration applied.
+    fn spawn_pty(&self, options: SpawnOptions) -> Result<(Box<dyn Pty>, PtyEvents, PtySize)> {
         let options = shell_integration::apply(
             options,
             self.config().terminal.shell_integration,
             &self.paths.shell_integration_dir(),
         );
         let (pty, events) = NativePty::spawn(&options)?;
-        self.attach_with_profile(id, Box::new(pty), events, options.size, resolved.name)
+        Ok((Box::new(pty), events, options.size))
     }
 
     /// Registers an already spawned PTY as session `id`, of the built-in
@@ -508,11 +549,12 @@ impl App {
         events: PtyEvents,
         size: PtySize,
     ) -> Result<SessionId> {
-        self.attach_with_profile(id, pty, events, size, None)
+        self.attach_with_profile(id, pty, events, size, None, &[])
     }
 
     /// Registers an already spawned PTY as session `id`, drawn with the
-    /// look of `profile` (`None`: the built-in profile).
+    /// look of `profile` (`None`: the built-in profile), its terminal fed
+    /// `notice` before the child's first byte.
     fn attach_with_profile(
         &self,
         id: SessionId,
@@ -520,6 +562,7 @@ impl App {
         events: PtyEvents,
         size: PtySize,
         profile: Option<String>,
+        notice: &[u8],
     ) -> Result<SessionId> {
         // The configured cursor style (#113), theme colours (#10), both
         // from the profile's look (#39), and history size (#175) are the
@@ -548,6 +591,7 @@ impl App {
             events,
             size,
             (profile, (generation, Arc::new(look))),
+            notice,
             usize::try_from(scrollback).unwrap_or(usize::MAX),
             Arc::clone(&self.observers),
             Arc::clone(&self.applied),

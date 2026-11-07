@@ -4,8 +4,9 @@
  * the two-call protocol, set and remove a setting by key path (the file
  * keeps its comments), see a refused value come back with a message and
  * leave the file alone, check the argument checks, list the themes and
- * import one. Uses a configuration directory of its own under the
- * script's TESSERA_CONFIG_DIR, so later tests start from no config.toml.
+ * import one, and see a file the editor cannot write back refused as IO.
+ * Uses a configuration directory of its own under the script's
+ * TESSERA_CONFIG_DIR, so later tests start from no config.toml.
  */
 
 #include <stddef.h>
@@ -208,6 +209,22 @@ int main(void) {
     /* The imported theme can be selected by its id. */
     EXPECT(tessera_config_set(app, S("appearance.theme"), S("\"ocean\""), NULL, 0, NULL),
            TESSERA_ERROR_OK);
+
+    /* A file the editor would not write back unchanged (mixed line
+       endings) is refused at open as an I/O failure naming no key path,
+       and left alone (#324 item 1). */
+    static const char mixed[] = "[appearance]\r\nopacity = 1.0\n";
+    file = fopen(config_path, "wb");
+    CHECK(file != NULL);
+    CHECK(fwrite(mixed, 1, sizeof mixed - 1, file) == sizeof mixed - 1);
+    fclose(file);
+    msg_len = 0;
+    EXPECT(tessera_config_set(app, S("appearance.opacity"), S("0.5"), msg, sizeof msg, &msg_len),
+           TESSERA_ERROR_IO);
+    CHECK(msg_len > 0 && memchr(msg, '`', msg_len) == NULL);
+    text = slurp(config_path);
+    CHECK(text != NULL && strcmp(text, mixed) == 0);
+    free(text);
 
     tessera_app_free(app);
     printf("ok\n");

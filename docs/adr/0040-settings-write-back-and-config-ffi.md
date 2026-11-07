@@ -1,6 +1,6 @@
 # ADR 0040: Settings write-back and the config FFI (amends 0004 by reference)
 
-**Status:** accepted · 2026-11-07
+**Status:** accepted · 2026-11-07 · amended 2026-11-07 (#324)
 
 ## Context
 
@@ -30,7 +30,10 @@ path at a time in memory, `save` writes it back.
   `profiles[1].appearance.theme`, `keys."cmd+d"`. Capped at 1024 bytes, 16
   steps, index 65 535 (`MAX_KEY_PATH_*`). An index one past the end
   appends, so `profiles[N].name` (N profiles) adds a profile; removing
-  `profiles[i]` moves the later ones down. A set never writes a table (a
+  `profiles[i]` moves the later ones down. The loader keeps every
+  `[[profiles]]` entry at its place (a NUL in a name is replaced, not
+  dropped; ADR 0037), so N and i read from the loaded configuration are
+  the file's (#333). A set never writes a table (a
   value, or an array nested at most 32 deep); tables appear as needed.
 - **Formatting.** What an edit does not touch comes out byte for byte: the
   editor refuses to open a file `toml_edit` would not write back unchanged.
@@ -50,7 +53,14 @@ path at a time in memory, `save` writes it back.
   it (its header line and body) with it, as deleting that section by hand
   would; the comments above its header stay. Restore Defaults (#40c)
   therefore removes the `[keys]` entries it wrote and every unrelated
-  comment survives.
+  comment survives. Replacing a whole array (a multi-line one may hold
+  comments between its brackets) moves those comments to lines of their
+  own above its key, in order, at the key's indentation (#324); inside an
+  inline table, where a comment cannot stand, above the line that holds
+  the table.
+- **Floats stay floats.** The loader reads an integer for a float key, so
+  the window may send `1` for `opacity`; `set` writes it as `1.0` (also
+  inside an array), so the file says what the setting is (#324).
 - **Every edit is checked twice before it is kept.** (1) The edited text,
   read as plain TOML, must equal the old document with exactly this change
   applied, and its comments must be the old ones minus only those the
@@ -79,7 +89,10 @@ path at a time in memory, `save` writes it back.
 - **Files it does not write.** Not a regular file (FIFO, directory), a
   second hard link (the rename would split them silently), read-only
   (the user's choice), not UTF-8, not TOML: `open` refuses, and the file is
-  left for the user to fix by hand.
+  left for the user to fix by hand. A file that is TOML but cannot be
+  written back unchanged (mixed line endings, a CRLF multi-line string,
+  text `toml_edit` would reformat) is `EditError::NotEditable`, which names
+  no key path, and `TESSERA_ERROR_IO` through the FFI (#324).
 - **Themes.** `theme_entries` lists what `appearance.theme` can name:
   bundled themes (minus those a user file shadows, as `Theme::resolve`
   does), then up to 256 `themes/*.toml` files in name order. `import_theme`
@@ -96,8 +109,11 @@ path at a time in memory, `save` writes it back.
 - `tessera_config_json`: `{"generation", "config"}`, the configuration in
   effect (two-call buffer protocol, as `tessera_app_keymap_json`).
 - `tessera_config_set(key, value_json)` and `tessera_config_remove(key)`:
-  one edit, saved at once. They call `App::open_config` first (create the
-  directory and default file, start the watch). The value is JSON (string,
+  one edit, saved at once. They call `App::open_config` first when the
+  file is missing or the watch is not running (create the directory and
+  default file, start the watch), not on every edit. Edits from two threads
+  are serialised by one lock around open, edit and save, so neither saves
+  over the other's change as a `Conflict` (#324). The value is JSON (string,
   number, boolean, array; `null`, objects and integers past `i64` refused;
   at most 64 KiB). Two new status codes: `TESSERA_ERROR_REFUSED` (9) and
   `TESSERA_ERROR_CONFLICT` (10). A message for the user goes to an
@@ -112,6 +128,12 @@ The core does not apply the write itself: the configuration watch (ADR
 
 **Logs** carry the function, the key path (escaped) and the kind of
 failure, never a value or the loader's message, which quotes values (S8).
+A load warning the file already had (an unknown key, a value out of
+range) is logged once, when it appears, not again on every save the watch
+applies: the store logs only load warnings the previous load did not have,
+its reload reads the file silenced, and the watch no longer logs them a
+second time (#324). The warning for an `[appearance] theme` that does not
+resolve is not deduplicated: it is logged on every apply.
 
 **Security.** Not a new attack surface: the editor writes the user's own
 file with input from the user's own Preferences window; it extends

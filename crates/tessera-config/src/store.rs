@@ -321,9 +321,16 @@ impl ConfigStore {
     /// target is missing is an error, like a symlink cycle, since the file
     /// the user keeps their settings in is somewhere and could not be read
     /// (#262 item 1).
+    ///
+    /// The loader's warnings are not logged here: [`ConfigStore::apply`]
+    /// logs those the store did not hold already.
     pub(crate) fn load_from_disk(&self) -> Result<FromDisk, Error> {
         let file = self.paths.config_file();
-        match load_file_noting_empty(&file) {
+        let loaded =
+            tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+                load_file_noting_empty(&file)
+            });
+        match loaded {
             Ok((loaded, empty)) => Ok(FromDisk { loaded, empty }),
             Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                 if std::fs::symlink_metadata(&file).is_ok() {
@@ -351,6 +358,10 @@ impl ConfigStore {
     /// file is applied with them still refused and does not count as a
     /// successful load (see [`ConfigStore`]).
     ///
+    /// Logs each warning of the load that the previous one did not have:
+    /// a warning about a line that stays is logged once, not again on
+    /// every save that reloads the file (#324 item 9).
+    ///
     /// Returns `None` when the configuration is unchanged and no error was
     /// pending; `Some` when it changed or when this load recovers from a
     /// previous failure.
@@ -363,6 +374,15 @@ impl ConfigStore {
             empty,
         } = from;
         let mut state = self.write();
+        // Warnings are few (the loader bounds them); a list will do.
+        let mut known: Vec<&Warning> = state.warnings.iter().collect();
+        for warning in &warnings {
+            if let Some(at) = known.iter().position(|w| *w == warning) {
+                known.swap_remove(at);
+            } else {
+                tracing::warn!(target: "tessera_config", "{warning}");
+            }
+        }
         if empty && state.refusing {
             config.terminal.clipboard_write = false;
         } else {
@@ -900,6 +920,38 @@ mod tests {
             });
             assert_eq!(again, Vec::<String>::new(), "{case}");
         }
+    }
+
+    /// #324 item 9: a load warning is logged when the store first sees
+    /// it, not again on each reload of a file that still has it; a new
+    /// one is logged when it appears, and again if it comes back.
+    #[test]
+    fn a_load_warning_is_logged_once_per_appearance() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(dir.path());
+        let file = paths.config_file();
+        std::fs::write(&file, "[general]\nbogus = 1\n").unwrap();
+        let mut store = None;
+        let lines = logged_warnings(|| store = Some(ConfigStore::open(paths.clone()).unwrap()));
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert!(lines[0].contains("general.bogus"), "{lines:#?}");
+        let store = store.unwrap();
+        let reload = |text: &str| {
+            std::fs::write(&file, text).unwrap();
+            logged_warnings(|| drop(store.reload().unwrap()))
+        };
+        for i in 0..20 {
+            let lines = reload(&format!(
+                "[general]\nbogus = 1\n[terminal]\nscrollback_lines = {i}\n"
+            ));
+            assert_eq!(lines, Vec::<String>::new(), "reload {i}");
+        }
+        let lines = reload("[general]\nbogus = 1\nother = 2\n");
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert!(lines[0].contains("general.other"), "{lines:#?}");
+        assert_eq!(reload("[general]\n"), Vec::<String>::new());
+        let lines = reload("[general]\nbogus = 1\n");
+        assert_eq!(lines.len(), 1, "it came back: {lines:#?}");
     }
 
     /// #262 items 4 and 10 at the log: a parse error quoting a line with a

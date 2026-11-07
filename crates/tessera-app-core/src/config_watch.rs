@@ -464,9 +464,9 @@ impl Live {
     fn handle(&self, store: &ConfigStore, event: ConfigEvent) {
         match event {
             ConfigEvent::Changed(changed) => {
-                for warning in &changed.warnings {
-                    tracing::warn!(target: "tessera_app_core", "{warning}");
-                }
+                // The store logged the warnings it had not logged before
+                // when it applied the file; logging all of them here again
+                // would repeat each on every save (#324 item 9).
                 // The store's configuration, not the event's: an older
                 // `Changed` still queued behind a `ThemesChanged` that
                 // applied a newer one must not bring the older back (#283).
@@ -2058,6 +2058,7 @@ mod tests {
             rx,
             PtySize::default(),
             profile.map(Into::into),
+            &[],
         )
         .expect("attach fake session");
         id

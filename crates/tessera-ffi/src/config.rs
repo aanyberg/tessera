@@ -13,6 +13,7 @@
 
 use std::path::{Path, PathBuf};
 use std::slice;
+use std::sync::Mutex;
 
 use tessera_app_core::WatchOptions;
 use tessera_app_core::command::Keymap;
@@ -108,6 +109,15 @@ impl Failure {
 /// (the message may hold the value; it goes to the caller, not the log).
 fn failure(function: &'static str, key: &str, error: &EditError) -> Failure {
     let (code, kind) = match error {
+        EditError::NotEditable { .. } => {
+            // Refused at open: no key path is involved (#324 item 1).
+            tracing::info!(
+                function,
+                kind = "file not editable",
+                "config edit not saved"
+            );
+            return Failure::new(Error::Io, error.to_string());
+        }
         EditError::KeyPath(_) => (Error::InvalidArgument, "malformed key path"),
         EditError::Unsupported { .. } => (Error::InvalidArgument, "unsupported edit"),
         EditError::TooLarge => (Error::InvalidArgument, "edit past the size cap"),
@@ -133,16 +143,33 @@ enum Change {
     Remove,
 }
 
+/// Held across every edit of `config.toml` from this process: two edits
+/// on two threads (against the UI-thread rule) would both read the file
+/// and one could replace the other's save (#324 item 5). An edit that
+/// panicked left nothing half done in memory, so a poisoned lock is
+/// taken over.
+static EDIT_LOCK: Mutex<()> = Mutex::new(());
+
 /// Opens `config.toml` (creating it and starting the watch when needed),
-/// applies `change` at `key`, checks the key map, and saves.
+/// applies `change` at `key`, checks the key map, and saves, holding
+/// [`EDIT_LOCK`].
 fn edit(function: &'static str, app: &App, key: &str, change: Change) -> Result<(), Failure> {
-    let path = app
-        .core
-        .open_config(WatchOptions::default())
-        .map_err(|error| {
-            tracing::warn!(function, %error, "cannot create the configuration");
-            Failure::new(Error::Io, error.to_string())
-        })?;
+    let _edit = EDIT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Opening the store again reloads and logs the file: only when there
+    // is no file or no watch yet (#324 item 9).
+    let path = app.core.config_path();
+    let path = if path.is_file() && app.core.is_watching_config() {
+        path
+    } else {
+        app.core
+            .open_config(WatchOptions::default())
+            .map_err(|error| {
+                tracing::warn!(function, %error, "cannot create the configuration");
+                Failure::new(Error::Io, error.to_string())
+            })?
+    };
     let mut editor = ConfigEditor::open(&path).map_err(|e| failure(function, key, &e))?;
     // The key map is compiled quietly: its warnings are compared, not
     // logged (the watch logs them when it applies the file).
@@ -345,7 +372,8 @@ pub unsafe extern "C" fn tessera_config_json(
 ///   value in place of a table);
 /// * `TESSERA_ERROR_IO` when the file cannot be read or written, or is not
 ///   one the editor writes (not UTF-8 or TOML, read-only, a second hard
-///   link): it is left for the user to fix by hand;
+///   link, mixed line endings or other TOML the editor would not write
+///   back byte for byte): it is left for the user to fix by hand;
 /// * `TESSERA_ERROR_NULL_POINTER` for a `NULL` `app`, or a `NULL` `key` or
 ///   `value_json` with a non-zero length.
 ///
@@ -355,6 +383,7 @@ pub unsafe extern "C" fn tessera_config_json(
 /// `NULL` to skip the message.
 ///
 /// The UI thread; it reads and writes the file (a few milliseconds).
+/// Edits from two threads are serialised, never interleaved.
 ///
 /// # Safety
 ///
@@ -561,7 +590,8 @@ pub unsafe extern "C" fn tessera_theme_import(
                 tracing::info!(kind = ?code, "theme not imported");
                 Failure::new(code, error.to_string())
             })?;
-            tracing::info!(id = %imported.id, "theme imported");
+            // The id comes from a name the user chose: its length only (S8).
+            tracing::info!(id_len = imported.id.len(), "theme imported");
             // SAFETY: `id_buf` holds `id_cap >= THEME_ID_LEN` bytes, and an
             // id is at most that long.
             Ok(unsafe { copy_out(&imported.id, id_buf, id_cap, id_len) })
