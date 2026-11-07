@@ -206,7 +206,7 @@ Agents use these instead of rebuilding the setup in every run:
   `TESSERA_GATE_SELFTEST=1`, through test hooks the gate honours only under `TESSERA_GATE_SELFTEST=1` (listed in the
   script's header). When the macOS job's test step fails, times out or is cancelled, it uploads
   `apps/macos/build/app-test*.log` as the `app-test-logs` artifact (#121). In CI the Rust job, which also runs the ffi
-  C tests, has `timeout-minutes: 20` and the macOS app job 15 (a normal run is 4-6 minutes), with a 10-minute limit on
+  C tests, has `timeout-minutes: 20` and the macOS app job 20 (a normal run is 8-10 minutes), with a 14-minute limit on
   `just app-test`, whose xcodebuild calls also fail a single hung test after 120 s (300 s at most). A hang below the
   test level, where the test host itself deadlocks and xcodebuild waits for it (the TSan and `fork` deadlock of #121
   and #228, caused by #278), is ended by `scripts/app-test-watchdog.sh`, which wraps both xcodebuild calls: when no
