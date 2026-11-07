@@ -307,6 +307,16 @@ final class MainMenuTests: XCTestCase {
         XCTAssertEqual(opener.revealed, [configFile], "after the failed open")
     }
 
+    func testABoundCommandRunsItsMenuItem() throws {
+        // What a chord bound to a command does once the key map resolved it
+        // (a chord without Command, which no menu matches).
+        MainMenu.run(command: "settings")
+        XCTAssertEqual(events, ["create", "open \(configFile.path)"])
+        MainMenu.run(command: "split_right")
+        MainMenu.run(command: "no_such_command")
+        XCTAssertEqual(events.count, 2, "a command without an item does nothing")
+    }
+
     func testTesseraHelpOpensTheReadme() throws {
         try choose("Tessera Help", in: "Help")
         XCTAssertEqual(opener.urls, [URL(string: "https://github.com/aanyberg/tessera#readme")!])

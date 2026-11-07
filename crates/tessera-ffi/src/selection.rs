@@ -268,7 +268,7 @@ pub unsafe extern "C" fn tessera_session_has_selection(
 ///
 /// `len` must be writable; `buf` must be valid for `cap` bytes of writes
 /// unless `cap` is 0.
-unsafe fn copy_out(text: &str, buf: *mut u8, cap: usize, len: *mut usize) -> Error {
+pub(crate) unsafe fn copy_out(text: &str, buf: *mut u8, cap: usize, len: *mut usize) -> Error {
     // SAFETY: writable per the contract.
     unsafe { len.write(text.len()) };
     if text.len() > cap {

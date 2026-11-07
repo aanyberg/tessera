@@ -37,6 +37,7 @@ use tessera_config::{
 use tessera_pty::PtySize;
 use tessera_render::{Theme, sanitize_font_size};
 
+use crate::input::Bindings;
 use crate::session::{ObserverSlot, Session, lock, run_thread_start_hook};
 use crate::view::{self, View};
 use crate::{App, SessionId};
@@ -94,6 +95,7 @@ pub(crate) struct Live {
     pub(crate) theme: Arc<Mutex<Theme>>,
     pub(crate) applied: Arc<Mutex<Applied>>,
     pub(crate) observers: ObserverSlot,
+    pub(crate) bindings: Arc<Bindings>,
 }
 
 impl Live {
@@ -194,7 +196,27 @@ impl Live {
         if changed {
             self.notify(opaque);
         }
+        self.config_applied(config);
         changed
+    }
+
+    /// Compiles `config`'s key map when its `[keys]` changed, counts the
+    /// configuration applied, and tells the observer
+    /// ([`SessionObserver::on_config_applied`](crate::SessionObserver::on_config_applied)).
+    fn config_applied(&self, config: &Config) {
+        let generation = self.bindings.applied(config);
+        let observers = self
+            .observers
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(observer) = observers.as_ref()
+            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                observer.on_config_applied(generation);
+            }))
+            .is_err()
+        {
+            tracing::error!("session observer panicked in on_config_applied");
+        }
     }
 
     /// Tells the observer the appearance changed; `opaque` is whether the
@@ -685,6 +707,7 @@ impl App {
             theme: Arc::clone(&self.theme),
             applied: Arc::clone(&self.applied),
             observers: Arc::clone(&self.observers),
+            bindings: Arc::clone(&self.bindings),
         }
     }
 }
@@ -1539,6 +1562,51 @@ mod tests {
             cursor_style_of(&app, id)
         );
         assert_eq!(app.config().appearance.font_size, 14.0);
+    }
+
+    /// #43 (R3): an edit that only reorders `[keys]` changes the chord a
+    /// command's menu item shows (the first), so the watch applies it and
+    /// tells the observer.
+    #[test]
+    fn a_reload_that_only_reorders_the_keys_is_applied() {
+        struct Generations(Arc<Mutex<Vec<u64>>>);
+        impl SessionObserver for Generations {
+            fn on_session_event(&self, _: SessionId, _: SessionEvent) {}
+            fn on_config_applied(&self, generation: u64) {
+                lock(&self.0).push(generation);
+            }
+        }
+        let base = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(base.path().join("Tessera"));
+        std::fs::create_dir_all(paths.root()).unwrap();
+        std::fs::write(
+            paths.config_file(),
+            "[keys]\n'cmd+e' = 'new_tab'\n'cmd+y' = 'new_tab'\n",
+        )
+        .unwrap();
+        let app = App::with_config_dir(paths.clone(), WatchOptions::default());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        app.set_observer(Some(Box::new(Generations(Arc::clone(&seen)))));
+        let new_tab = crate::command::CommandId::find("new_tab", None).unwrap();
+        let first = |app: &App| {
+            app.keymap()
+                .chords(new_tab)
+                .first()
+                .map(ToString::to_string)
+        };
+        assert_eq!(first(&app).as_deref(), Some("cmd+e"));
+        std::fs::write(
+            paths.config_file(),
+            "[keys]\n'cmd+y' = 'new_tab'\n'cmd+e' = 'new_tab'\n",
+        )
+        .unwrap();
+        assert!(
+            eventually(Duration::from_secs(5), || first(&app).as_deref()
+                == Some("cmd+y")),
+            "{:?}",
+            first(&app)
+        );
+        assert!(!lock(&seen).is_empty(), "on_config_applied");
     }
 
     /// A configuration directory made by hand after launch is picked up:

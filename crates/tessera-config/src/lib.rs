@@ -61,6 +61,7 @@
 #![forbid(unsafe_code)]
 
 mod import;
+mod keys;
 mod load;
 mod paths;
 mod store;
@@ -76,6 +77,10 @@ pub use theme::{
     ThemeSource, clip_theme_name, slug,
 };
 
+pub use keys::{
+    Chord, ChordError, ChordKey, ChordModifiers, KeyAction, KeyActionError, KeyBinding, Keys,
+    MAX_CHORD_LEN, MAX_COMMAND_NAME_LEN, MAX_KEY_BINDINGS, MAX_SEND_TEXT_LEN,
+};
 pub use load::{
     DEFAULT_CONFIG_TOML, Loaded, MAX_CONFIG_FILE_LEN, MAX_PARSE_ERROR_LEN,
     MAX_UNKNOWN_KEY_WARNINGS, MAX_WARNING_PATH_LEN, ParseError, Warning, escaped, load_file,
@@ -138,6 +143,52 @@ pub struct Config {
     pub profiles: Vec<Profile>,
     /// Plugin enablement, keyed by plugin id.
     pub plugins: Plugins,
+    /// Key bindings: each entry maps a chord to a command, so
+    /// `"cmd+shift+d" = "split_down"` (always quote the chord). An entry
+    /// adds its chord to the command, ahead of its defaults: the menu item
+    /// shows the first, the others stay as hidden shortcuts. An entry on
+    /// another command's default chord takes it from that command; write
+    /// `"cmd+t" = "unbound"` to drop a default.
+    ///
+    /// A chord is zero or more modifiers and one key joined by `+`, with
+    /// no spaces: modifiers `cmd` (`command`, `super`), `ctrl`
+    /// (`control`), `alt` (`opt`, `option`) and `shift`, in any order and
+    /// any case; the key is one lowercase character (`t`, `1`, `,`, `ö`)
+    /// or a name: `escape`, `enter`, `tab`, `space`, `backspace`,
+    /// `delete`, `insert`, `left`, `right`, `up`, `down`, `home`, `end`,
+    /// `page_up`, `page_down`, `f1` to `f35`, `kp_0` to `kp_9`,
+    /// `kp_decimal`, `kp_divide`, `kp_multiply`, `kp_subtract`, `kp_add`,
+    /// `kp_enter`, `kp_equal`, and `plus`, `minus`, `equal`, `comma`,
+    /// `period`, `slash`, `backslash`, `semicolon`, `apostrophe`,
+    /// `grave_accent`, `left_bracket`, `right_bracket`. A shifted symbol is
+    /// shorthand for Shift and its US key: `cmd+?` is `cmd+shift+/`,
+    /// `cmd+plus` is `cmd+shift+=`. Uppercase keys are an error (write
+    /// `shift+t`). At most 64 bytes.
+    ///
+    /// A value is a command name, `send_text:<text>` (bytes written to
+    /// the shell, with the escapes `\e` `\n` `\r` `\t` `\a`
+    /// `\b` `\f` `\v` `\\` `\"` `\'`, `\xHH` for a raw
+    /// byte and `\u{H..}` for a character; at most 4096 bytes, written
+    /// as is), `unbound` (remove the chord's default) or `none` (swallow
+    /// the key). Commands: `settings`, `hide`, `hide_others`, `quit`,
+    /// `new_window`, `new_tab`, `close_tab`, `close_window`,
+    /// `clear_scrollback`, `copy`, `paste`, `paste_plain`, `select_all`,
+    /// `font_bigger`, `font_smaller`, `font_reset`, `scroll_to_top`,
+    /// `scroll_to_bottom`, `scroll_page_up`, `scroll_page_down`,
+    /// `minimize`, `zoom`, `show_tab_bar`, `tab_previous`, `tab_next`,
+    /// `move_tab_to_new_window`, `merge_all_windows`, `select_tab:1` to
+    /// `select_tab:9`, `bring_all_to_front`, `help`, `about`, `show_all`,
+    /// and, for features still to come, `split_right`, `split_down`,
+    /// `focus_pane_left`, `focus_pane_right`, `focus_pane_up`,
+    /// `focus_pane_down`, `focus_pane_previous`, `focus_pane_next`,
+    /// `zoom_pane`, `find`, `find_next`, `find_previous`,
+    /// `prompt_previous`, `prompt_next`, `copy_mode`.
+    ///
+    /// Only chords with `cmd` appear in menus; others work in the
+    /// terminal only. A malformed entry, an unknown command or a chord
+    /// already bound by an earlier entry is ignored with a warning (the
+    /// first entry wins); at most 512 entries are read.
+    pub keys: Keys,
 }
 
 /// Application-wide settings.
@@ -399,7 +450,9 @@ impl Config {
     /// ignored and values are not range-checked. Prefer
     /// [`Config::from_toml_lenient`].
     pub fn from_toml(text: &str) -> Result<Self, Error> {
-        Ok(toml::from_str(text)?)
+        let mut config: Self = toml::from_str(text)?;
+        load::put_keys_in_document_order(&mut config, text);
+        Ok(config)
     }
 
     /// Serializes to TOML.

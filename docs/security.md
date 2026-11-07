@@ -57,7 +57,8 @@ a low-risk change.
   replies) is bounded in rate and memory, and an expensive sequence does not hold the terminal lock long (#117).
 - **S7. Memory safety.** `unsafe` only in `tessera-pty` and `tessera-ffi`, each block with a `// SAFETY:` comment;
   the counting test allocators in `crates/tessera-render/tests/alloc.rs`, `crates/tessera-grid/tests/reset.rs`,
-  `crates/tessera-term/tests/osc8_alloc.rs` and `crates/tessera-term/tests/mouse_alloc.rs` are the exceptions (CONTRIBUTING.md). Every FFI export that can panic runs under `ffi_guard!` (`catch_unwind`);
+  `crates/tessera-term/tests/osc8_alloc.rs`, `crates/tessera-term/tests/mouse_alloc.rs` and
+  `crates/tessera-app-core/tests/keybindings.rs` are the exceptions (CONTRIBUTING.md). Every FFI export that can panic runs under `ffi_guard!` (`catch_unwind`);
   every pointer and length argument is checked; sessions cross the boundary as ids, never pointers.
 - **S8. No terminal content in logs.** Logs carry lengths, ids, parameters and paths, never output, input, titles,
   clipboard text or environment values. Child-controlled bytes that must be logged are capped and escaped.
@@ -87,6 +88,8 @@ a low-risk change.
 | Unloadable theme files followed | 8 extra kqueue descriptors per watcher (`MAX_UNLOADABLE_FOLLOWED`), newest first, only while the configured theme is not found as a loadable user file | `crates/tessera-config/src/theme.rs`, `crates/tessera-config/src/watch.rs` |
 | URL candidate | 2083 characters | `crates/tessera-app-core/src/url.rs` |
 | OSC 8 link table | 65 536 live links (`MAX_LIVE_LINKS`), URI 2 083 bytes, id 250 bytes, 16 MiB of URI + id text (`MAX_LINK_TABLE_BYTES`); the id index loses an entry with its link's last cell; a URI with C0, DEL, C1 or bidi formatting controls is refused | `crates/tessera-grid/src/hyperlink.rs`, `crates/tessera-term/src/osc.rs` |
+| `[keys]` table | 512 entries (`MAX_KEY_BINDINGS`), later ones dropped with one warning; chord 64 bytes (`MAX_CHORD_LEN`), checked before the grammar; command name or parameter 64 bytes (`MAX_COMMAND_NAME_LEN`); `send_text` 4096 bytes after unescaping (`MAX_SEND_TEXT_LEN`), checked while decoding; at most one warning per entry plus one for the overflow, each escaped and its key capped (S3) | `crates/tessera-config/src/keys.rs`, `crates/tessera-app-core/src/command.rs` |
+| Key map JSON (`tessera_app_keymap_json`) and `on_config_applied` | One entry per registry command (fixed), chords from the capped table; deliveries to the app coalesced to one per main-actor turn with the latest generation | `crates/tessera-ffi/src/keymap.rs`, `apps/macos/Sources/TesseraKit/CallbackBridge.swift` |
 
 ## Memory and leaks
 

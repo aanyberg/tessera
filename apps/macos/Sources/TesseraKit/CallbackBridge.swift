@@ -31,7 +31,8 @@ internal import TesseraCore
 ///
 /// `on_appearance_changed` (from the core's configuration watch thread) is
 /// coalesced the same way, app-wide: at most one delivery is queued, and it
-/// reports the latest `opaque`.
+/// reports the latest `opaque`. `on_config_applied` (same thread) likewise
+/// reports the latest generation.
 @MainActor
 final class CallbackBridge {
     weak var delegate: (any TesseraAppDelegate)?
@@ -58,6 +59,14 @@ final class CallbackBridge {
     private nonisolated let pendingAppearance = Mutex<Bool?>(nil)
     /// Appearance deliveries scheduled so far (tests: a burst schedules one).
     nonisolated let scheduledAppearanceDeliveries = Mutex<Int>(0)
+    /// The latest generation `on_config_applied` reported and not yet
+    /// delivered; non-`nil` exactly while a delivery is queued.
+    private nonisolated let pendingConfiguration = Mutex<UInt64?>(nil)
+    /// Configuration deliveries scheduled so far (tests: a burst schedules one).
+    nonisolated let scheduledConfigurationDeliveries = Mutex<Int>(0)
+    /// The registry's command names, by id (``TesseraKeymap/Command/command``),
+    /// read once at start: the registry never changes while the core runs.
+    var commandNames: [String] = []
 
     func register(_ session: TesseraSession) {
         guard !isShutDown else { return }
@@ -114,6 +123,9 @@ final class CallbackBridge {
                 guard let text, len > 0 else { return }
                 let copy = String(decoding: UnsafeBufferPointer(start: text, count: len), as: UTF8.self)
                 CallbackBridge.from(userData)?.receive(for: id) { $0.clipboard = copy }
+            },
+            on_config_applied: { userData, generation in
+                CallbackBridge.from(userData)?.receiveConfiguration(generation: generation)
             }
         )
     }
@@ -162,7 +174,28 @@ final class CallbackBridge {
         }
     }
 
+    private nonisolated func receiveConfiguration(generation: UInt64) {
+        let schedule = pendingConfiguration.withLock { pending in
+            defer { pending = generation }
+            return pending == nil
+        }
+        guard schedule else { return }
+        scheduledConfigurationDeliveries.withLock { $0 += 1 }
+        Task { @MainActor in
+            self.deliverConfiguration()
+        }
+    }
+
     // MARK: Main actor
+
+    private func deliverConfiguration() {
+        guard let generation = pendingConfiguration.withLock({ pending in
+            defer { pending = nil }
+            return pending
+        }) else { return }
+        guard !isShutDown, let delegate else { return }
+        delegate.configurationDidApply(generation: generation)
+    }
 
     private func deliverAppearance() {
         guard let opaque = pendingAppearance.withLock({ pending in

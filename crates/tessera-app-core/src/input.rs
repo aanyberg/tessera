@@ -2,9 +2,11 @@
 //!
 //! The frontend turns its native events into [`InputEvent`]s and hands them
 //! to [`App::send_input`](crate::App::send_input), which decides what each
-//! one means: a key bound to an application command runs that command (no
-//! key is bound until the configurable key map, #43); any other key is
-//! encoded for the session's child and queued for its PTY. The returned
+//! one means: a key the key map binds ([`crate::command::Keymap`], ADR
+//! 0036) to text writes it, to `none` is swallowed, and to a command is
+//! reported to the frontend, which runs it
+//! ([`App::run_key_binding`](crate::App::run_key_binding)); any other key
+//! is encoded for the session's child and queued for its PTY. The returned
 //! [`InputOutcome`] tells the frontend whether the core used the event, so
 //! an event the terminal has no use for (a bare modifier, a key release in
 //! legacy mode, `Cmd`+`Q`) can still go to the frontend's own handling,
@@ -48,7 +50,13 @@
 //!   reports nothing, and setting the mode does not report the current
 //!   state (xterm).
 
-use std::convert::Infallible;
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use tessera_config::Config;
+
+use crate::command::{ASCII_FILTER_WORDS, Binding, CommandId, Keymap, may_match};
+use crate::session::lock;
 
 pub use tessera_term::{Key, KeyEvent, KeyEventKind, Modifiers};
 
@@ -253,29 +261,82 @@ pub enum InputOutcome {
     /// The core had no use for the event; the frontend may handle it
     /// itself (for example as a menu key equivalent).
     Ignored,
+    /// The key is bound to this command (`[keys]`, or a default chord);
+    /// the frontend runs it. Nothing was sent to the PTY.
+    Command(CommandId),
 }
 
-/// An application command a key can be bound to.
-///
-/// Has no variants yet: the command registry and the configurable key map
-/// (#43) do not exist, so no key is ever bound. The type keeps the routing
-/// in [`App::send_input`](crate::App::send_input) in place for them.
-pub(crate) type Binding = Infallible;
-
-/// Resolves key events to application commands before they reach the PTY.
-#[derive(Debug, Default)]
-pub(crate) struct Bindings {}
+/// The compiled key map, shared by the [`App`](crate::App) and the
+/// configuration watch, which replaces it when a configuration with other
+/// `[keys]` is applied.
+#[derive(Debug)]
+pub(crate) struct Bindings {
+    map: Mutex<Arc<Keymap>>,
+    /// [`Keymap::modifier_mask`] of `map`, read without the lock so a key
+    /// with modifiers no chord has (any plain or Ctrl key, by default)
+    /// costs one atomic load.
+    mask: AtomicU16,
+    /// [`Keymap::ascii_filter`] of `map`, read without the lock so an
+    /// unbound Command letter (⌘J) costs a few atomic loads. Stored word
+    /// by word after the map: a key pressed while a configuration applies
+    /// may meet either map's filter, as it may either map.
+    ascii: [AtomicU64; ASCII_FILTER_WORDS],
+    /// Counts the configurations applied ([`App::config_generation`](crate::App::config_generation)).
+    generation: AtomicU64,
+}
 
 impl Bindings {
-    /// The command bound to `event`, if any. Always `None` until #43 adds
-    /// configurable bindings.
-    #[expect(
-        clippy::unused_self,
-        reason = "the key map will live in `self` once #43 adds it"
-    )]
-    pub(crate) fn resolve(&self, event: &KeyEvent) -> Option<Binding> {
-        let _ = event;
-        None
+    /// The key map of `config`, at generation 0.
+    pub(crate) fn new(config: &Config) -> Self {
+        let map = Keymap::compile(&config.keys);
+        Self {
+            mask: AtomicU16::new(map.modifier_mask()),
+            ascii: map.ascii_filter().map(AtomicU64::new),
+            map: Mutex::new(Arc::new(map)),
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    /// The key map in effect.
+    pub(crate) fn keymap(&self) -> Arc<Keymap> {
+        Arc::clone(&lock(&self.map))
+    }
+
+    /// Runs `with` on the binding of `event`, if any; one atomic load when
+    /// no chord has the event's modifiers, a few when no chord has its
+    /// character key with them ([`may_match`]).
+    pub(crate) fn with_binding<R>(
+        &self,
+        event: &KeyEvent,
+        with: impl FnOnce(Binding<'_>) -> R,
+    ) -> Option<R> {
+        let mask = self.mask.load(Ordering::Relaxed);
+        if !may_match(event, mask, |word| self.ascii[word].load(Ordering::Relaxed)) {
+            return None;
+        }
+        let map = lock(&self.map);
+        map.resolve(event).map(with)
+    }
+
+    /// Records that `config` was applied: compiles its `[keys]` again when
+    /// they changed, and returns the new generation.
+    pub(crate) fn applied(&self, config: &Config) -> u64 {
+        let mut map = lock(&self.map);
+        if map.keys() != config.keys.bindings() {
+            let compiled = Keymap::compile(&config.keys);
+            self.mask.store(compiled.modifier_mask(), Ordering::Relaxed);
+            for (word, bits) in self.ascii.iter().zip(compiled.ascii_filter()) {
+                word.store(bits, Ordering::Relaxed);
+            }
+            *map = Arc::new(compiled);
+        }
+        // Under the map lock, so generations and maps go up together.
+        self.generation.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// The number of configurations applied since the app started.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
     }
 }
 
@@ -374,6 +435,7 @@ fn sanitize_into(text: &str, out: &mut Vec<u8>, normalize_breaks: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::admits;
 
     fn bracketed(text: &str) -> Vec<u8> {
         let mut out = Vec::new();
@@ -505,9 +567,49 @@ mod tests {
     }
 
     #[test]
-    fn nothing_is_bound_yet() {
-        let bindings = Bindings::default();
-        let event = KeyEvent::new(Key::Char('q'), Modifiers::SUPER);
-        assert!(bindings.resolve(&event).is_none());
+    fn a_plain_key_skips_the_lock_and_cmd_t_is_new_tab() {
+        let bindings = Bindings::new(&Config::default());
+        let plain = KeyEvent::new(Key::Char('t'), Modifiers::NONE);
+        assert!(!admits(
+            bindings.mask.load(Ordering::Relaxed),
+            plain.modifiers
+        ));
+        assert_eq!(bindings.with_binding(&plain, |b| format!("{b:?}")), None);
+        let cmd_t = KeyEvent::new(Key::Char('t'), Modifiers::SUPER);
+        let id = CommandId::find("new_tab", None).unwrap();
+        assert_eq!(
+            bindings.with_binding(&cmd_t, |b| b == Binding::Command(id)),
+            Some(true)
+        );
+    }
+
+    /// An unbound Command letter stops at the ASCII filter; a configuration
+    /// that binds it updates the filter with the map.
+    #[test]
+    fn an_unbound_command_letter_skips_the_lock_until_a_config_binds_it() {
+        let bindings = Bindings::new(&Config::default());
+        let filter = |bindings: &Bindings, event: &KeyEvent| {
+            may_match(event, bindings.mask.load(Ordering::Relaxed), |word| {
+                bindings.ascii[word].load(Ordering::Relaxed)
+            })
+        };
+        let cmd_j = KeyEvent::new(Key::Char('j'), Modifiers::SUPER);
+        assert!(admits(
+            bindings.mask.load(Ordering::Relaxed),
+            cmd_j.modifiers
+        ));
+        assert!(!filter(&bindings, &cmd_j), "⌘J is no default chord");
+        assert!(filter(
+            &bindings,
+            &KeyEvent::new(Key::Char('T'), Modifiers::SUPER)
+        ));
+        let loaded = Config::from_toml_lenient("[keys]\n'cmd+j' = 'new_tab'\n").unwrap();
+        bindings.applied(&loaded.config);
+        assert!(filter(&bindings, &cmd_j));
+        let id = CommandId::find("new_tab", None).unwrap();
+        assert_eq!(
+            bindings.with_binding(&cmd_j, |b| b == Binding::Command(id)),
+            Some(true)
+        );
     }
 }

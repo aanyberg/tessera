@@ -248,6 +248,19 @@ pub trait SessionObserver: Send + Sync {
     fn on_appearance_changed(&self, opaque: bool) {
         let _ = opaque;
     }
+
+    /// A configuration was applied ([`App::apply_config`](crate::App::apply_config),
+    /// or the configuration watch), whether or not anything in it changed;
+    /// `generation` is the new [`App::config_generation`](crate::App::config_generation).
+    /// The host reads what it shows from the configuration again, such as
+    /// the key equivalents of its menus ([`App::keymap`](crate::App::keymap)).
+    ///
+    /// Called after [`SessionObserver::on_appearance_changed`] when both
+    /// are, on the same thread and under the same rules. Does nothing by
+    /// default.
+    fn on_config_applied(&self, generation: u64) {
+        let _ = generation;
+    }
 }
 
 impl<F> SessionObserver for F

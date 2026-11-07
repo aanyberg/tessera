@@ -6,12 +6,19 @@ Tessera reads its settings from `~/Library/Application Support/Tessera/config.to
 
 Defaults are written as TOML values; *unset* means the key is absent unless you set it.
 
+- [Top-level keys](#top-level-keys)
 - [`[appearance]`](#appearance)
 - [`[general]`](#general)
 - [`[plugins]`](#plugins)
 - [`[[profiles]]`](#profiles)
   - [`[profiles.appearance]`](#profilesappearance)
 - [`[terminal]`](#terminal)
+
+## Top-level keys
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `keys` | table of string | `{}` | Key bindings: each entry maps a chord to a command, so `"cmd+shift+d" = "split_down"` (always quote the chord). An entry adds its chord to the command, ahead of its defaults: the menu item shows the first, the others stay as hidden shortcuts. An entry on another command's default chord takes it from that command; write `"cmd+t" = "unbound"` to drop a default.<br><br>A chord is zero or more modifiers and one key joined by `+`, with no spaces: modifiers `cmd` (`command`, `super`), `ctrl` (`control`), `alt` (`opt`, `option`) and `shift`, in any order and any case; the key is one lowercase character (`t`, `1`, `,`, `ö`) or a name: `escape`, `enter`, `tab`, `space`, `backspace`, `delete`, `insert`, `left`, `right`, `up`, `down`, `home`, `end`, `page_up`, `page_down`, `f1` to `f35`, `kp_0` to `kp_9`, `kp_decimal`, `kp_divide`, `kp_multiply`, `kp_subtract`, `kp_add`, `kp_enter`, `kp_equal`, and `plus`, `minus`, `equal`, `comma`, `period`, `slash`, `backslash`, `semicolon`, `apostrophe`, `grave_accent`, `left_bracket`, `right_bracket`. A shifted symbol is shorthand for Shift and its US key: `cmd+?` is `cmd+shift+/`, `cmd+plus` is `cmd+shift+=`. Uppercase keys are an error (write `shift+t`). At most 64 bytes.<br><br>A value is a command name, `send_text:<text>` (bytes written to the shell, with the escapes `\e` `\n` `\r` `\t` `\a` `\b` `\f` `\v` `\\` `\"` `\'`, `\xHH` for a raw byte and `\u{H..}` for a character; at most 4096 bytes, written as is), `unbound` (remove the chord's default) or `none` (swallow the key). Commands: `settings`, `hide`, `hide_others`, `quit`, `new_window`, `new_tab`, `close_tab`, `close_window`, `clear_scrollback`, `copy`, `paste`, `paste_plain`, `select_all`, `font_bigger`, `font_smaller`, `font_reset`, `scroll_to_top`, `scroll_to_bottom`, `scroll_page_up`, `scroll_page_down`, `minimize`, `zoom`, `show_tab_bar`, `tab_previous`, `tab_next`, `move_tab_to_new_window`, `merge_all_windows`, `select_tab:1` to `select_tab:9`, `bring_all_to_front`, `help`, `about`, `show_all`, and, for features still to come, `split_right`, `split_down`, `focus_pane_left`, `focus_pane_right`, `focus_pane_up`, `focus_pane_down`, `focus_pane_previous`, `focus_pane_next`, `zoom_pane`, `find`, `find_next`, `find_previous`, `prompt_previous`, `prompt_next`, `copy_mode`.<br><br>Only chords with `cmd` appear in menus; others work in the terminal only. A malformed entry, an unknown command or a chord already bound by an earlier entry is ignored with a warning (the first entry wins); at most 512 entries are read. |
 
 ## `[appearance]`
 

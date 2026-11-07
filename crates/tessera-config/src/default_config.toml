@@ -59,6 +59,15 @@ clipboard_write = true
 # [profiles.appearance]
 # font_size = 14.0
 
+# Key bindings: a chord (always quoted) and a command, `send_text:` and the
+# text to type, "unbound" (drop a default chord) or "none" (swallow the key).
+# The menus show the chords; docs/config.md lists every chord and command.
+#
+# [keys]
+# "cmd+e" = "new_tab"
+# "ctrl+shift+k" = "send_text:clear\n"
+# "cmd+q" = "unbound"
+
 [plugins]
 # Plugin ids to enable.
 enabled = []

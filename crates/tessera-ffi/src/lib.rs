@@ -39,6 +39,7 @@ mod app;
 mod callbacks;
 mod error;
 mod input;
+mod keymap;
 mod panic;
 mod selection;
 mod session;
@@ -56,10 +57,12 @@ pub use error::Error;
 #[doc(hidden)]
 pub use input::tessera_test_with_core;
 pub use input::{
-    InputOutcome, Key, KeyEvent, KeyEventKind, Modifiers, MouseButton, MouseEvent, MouseEventKind,
-    ScrollEvent, tessera_session_paste, tessera_session_send_key, tessera_session_send_mouse,
+    HANDLE_KEY_BINDINGS_ONLY, InputOutcome, Key, KeyEvent, KeyEventKind, Modifiers, MouseButton,
+    MouseEvent, MouseEventKind, NO_COMMAND, ScrollEvent, tessera_session_handle_key,
+    tessera_session_paste, tessera_session_send_key, tessera_session_send_mouse,
     tessera_session_send_scroll, tessera_session_set_focus,
 };
+pub use keymap::tessera_app_keymap_json;
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use panic::tessera_test_panic;

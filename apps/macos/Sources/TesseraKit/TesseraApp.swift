@@ -38,6 +38,17 @@ public protocol TesseraAppDelegate: AnyObject {
     /// changes between two deliveries are reported once, with the latest
     /// `opaque`. Not sent after ``TesseraApp/shutdown()``.
     func appearanceDidChange(opaque: Bool)
+    /// The core applied a configuration (the user saved `config.toml`, or a
+    /// theme it names): read ``TesseraApp/keymap()`` again and give the
+    /// menus its key equivalents. `generation` counts the configurations
+    /// applied so far. Several between two deliveries are reported once,
+    /// with the latest. Not sent after ``TesseraApp/shutdown()``. The
+    /// default does nothing.
+    func configurationDidApply(generation: UInt64)
+}
+
+extension TesseraAppDelegate {
+    public func configurationDidApply(generation: UInt64) {}
 }
 
 /// The Rust core's application: its configuration and every session it runs.
@@ -94,6 +105,9 @@ public final class TesseraApp {
             var callbacks = bridge.callbacks()
             try TesseraCoreError.check(tessera_app_set_callbacks(raw, &callbacks))
             configPath = try Self.readConfigPath(raw)
+            // The registry is fixed for the core's lifetime: only the chords
+            // change with the configuration.
+            bridge.commandNames = try TesseraKeymap.read(raw).commands.map(\.command)
         } catch {
             core.free()
             throw error
@@ -153,6 +167,15 @@ public final class TesseraApp {
     ///   be created.
     public func createConfig() throws {
         try TesseraCoreError.check(tessera_app_create_config(core.pointer))
+    }
+
+    /// The key map in effect: the default chords with `config.toml`'s
+    /// `[keys]` laid over them, for the menus' key equivalents.
+    ///
+    /// - Throws: ``TesseraCoreError/nullPointer`` after ``shutdown()``; a
+    ///   decoding error if the core's JSON does not match this wrapper.
+    public func keymap() throws -> TesseraKeymap {
+        try TesseraKeymap.read(core.pointer)
     }
 
     /// Closes every session and frees the core. Idempotent; afterwards every

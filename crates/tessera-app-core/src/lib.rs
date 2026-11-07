@@ -31,6 +31,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod command;
 mod config_watch;
 pub mod input;
 mod mouse;
@@ -67,7 +68,7 @@ pub use tessera_pty::{
 pub use tessera_shell_integration::Cwd;
 
 use config_watch::{Applied, ConfigWatch};
-use input::{Bindings, FocusEvent, MouseEvent};
+use input::{Bindings, FocusEvent, KeyEvent, KeyEventKind, MouseEvent};
 use session::{ObserverSlot, Reaper, Session, lock};
 use view::{CellMetrics, FrameStatus, PhysicalSize, RenderError, View, ViewSize, wgpu};
 
@@ -209,7 +210,8 @@ pub struct App {
     sessions: Arc<Mutex<HashMap<SessionId, Arc<Session>>>>,
     next_id: AtomicU64,
     observers: ObserverSlot,
-    bindings: Bindings,
+    /// The key map; replaced by the configuration watch's thread too.
+    bindings: Arc<Bindings>,
     /// At most one view per session, by session id. Never held while
     /// `sessions` is locked.
     views: Arc<Mutex<HashMap<SessionId, View>>>,
@@ -250,6 +252,7 @@ impl App {
             tracing::warn!(target: "tessera_app_core", "{warning}");
         }
         let theme = Arc::new(Mutex::new(view::theme_for(&config, &colours.theme)));
+        let bindings = Arc::new(Bindings::new(&config));
         Self {
             applied: Arc::new(Mutex::new(Applied {
                 config: Arc::new(config),
@@ -263,7 +266,7 @@ impl App {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
             observers: Arc::new(RwLock::new(None)),
-            bindings: Bindings::default(),
+            bindings,
             views: Arc::new(Mutex::new(HashMap::new())),
             gpu: Mutex::new(None),
             fonts: Mutex::new(None),
@@ -283,6 +286,76 @@ impl App {
     /// Path of the main configuration file, `config.toml`.
     pub fn config_path(&self) -> PathBuf {
         self.paths.config_file()
+    }
+
+    /// The key map in effect: the registry's default chords with the
+    /// configuration's `[keys]` laid over them ([`command::Keymap`]).
+    /// Replaced, not changed, when a configuration with other `[keys]` is
+    /// applied; the frontend reads it again on
+    /// [`SessionObserver::on_config_applied`].
+    pub fn keymap(&self) -> Arc<command::Keymap> {
+        self.bindings.keymap()
+    }
+
+    /// How many configurations were applied since the `App` was created
+    /// ([`App::apply_config`], and the configuration watch): 0 for the one
+    /// it was created with. [`SessionObserver::on_config_applied`] passes
+    /// the new value.
+    pub fn config_generation(&self) -> u64 {
+        self.bindings.generation()
+    }
+
+    /// Runs the binding of `key` in session `id`, if the key has one; the
+    /// first step of [`App::send_input`] for a key, which encodes the key
+    /// for the PTY only when this returns `Ok(None)`. A frontend that
+    /// matches bound keys before its own key equivalents (`AppKit`'s
+    /// `performKeyEquivalent`) calls this alone, so a key with no binding
+    /// is never sent.
+    ///
+    /// What a bound key does ([`command::Keymap::resolve`] finds the
+    /// binding, without allocating):
+    ///
+    /// * a command: [`InputOutcome::Command`], nothing sent; the frontend
+    ///   runs it;
+    /// * `send_text`: its bytes are queued for the PTY as written (never
+    ///   converted to 8-bit controls), the view returns to the live
+    ///   screen, [`InputOutcome::Consumed`]; a repeat sends them again;
+    /// * `none`: [`InputOutcome::Consumed`], nothing sent.
+    ///
+    /// The release of a bound key is [`InputOutcome::Consumed`] and does
+    /// nothing, so a program that asked for releases (kitty flag 2) never
+    /// sees the release of a key whose press it did not see.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session;
+    /// [`Error::Write`] as for [`App::send_input`] if `send_text`'s bytes
+    /// cannot be queued (nothing of them is queued then).
+    pub fn run_key_binding(&self, id: SessionId, key: &KeyEvent) -> Result<Option<InputOutcome>> {
+        let session = self.session(id)?;
+        Self::run_binding(&self.bindings, id, &session, key).transpose()
+    }
+
+    /// [`App::run_key_binding`] on a session already looked up.
+    fn run_binding(
+        bindings: &Bindings,
+        id: SessionId,
+        session: &Session,
+        key: &KeyEvent,
+    ) -> Option<Result<InputOutcome>> {
+        let release = key.kind == KeyEventKind::Release;
+        bindings.with_binding(key, |binding| match binding {
+            _ if release => Ok(InputOutcome::Consumed),
+            command::Binding::Command(command) => Ok(InputOutcome::Command(command)),
+            command::Binding::SendText(bytes) => {
+                session
+                    .queue_input(bytes.to_vec())
+                    .map_err(|source| Error::Write { id, source })?;
+                session.scroll_to_bottom();
+                Ok(InputOutcome::Consumed)
+            }
+            _ => Ok(InputOutcome::Consumed),
+        })
     }
 
     /// Installs the observer that receives every session's events, or
@@ -644,8 +717,8 @@ impl App {
         let write_error = |source| Error::Write { id, source };
         match event {
             InputEvent::Key(key) => {
-                if let Some(binding) = self.bindings.resolve(&key) {
-                    match binding {}
+                if let Some(outcome) = Self::run_binding(&self.bindings, id, &session, &key) {
+                    return outcome;
                 }
                 // One copy under the terminal lock, released before the
                 // write is queued.
@@ -3422,6 +3495,101 @@ mod tests {
         let event = KeyEvent::new(Key::Char('e'), Modifiers::NONE).with_text("é");
         assert_eq!(key(&app, id, event), InputOutcome::Consumed);
         written_eventually(&fake, "é".as_bytes());
+    }
+
+    /// An `App` whose configuration has this `[keys]` table.
+    fn app_with_keys(keys: &str) -> App {
+        let config = Config::from_toml_lenient(&format!("[keys]\n{keys}"))
+            .unwrap()
+            .config;
+        App::new(config, ConfigPaths::new("/nonexistent/tessera"))
+    }
+
+    /// #43: a bound command reaches the frontend as
+    /// [`InputOutcome::Command`] and sends nothing; `send_text` sends its
+    /// bytes as written, 7-bit even in 8-bit mode, and returns the view
+    /// to the live screen; `none` swallows the key; the release of a
+    /// bound key does nothing; an unbound key with the same modifiers is
+    /// encoded as before.
+    #[test]
+    fn bound_keys_run_their_binding_instead_of_reaching_the_pty() {
+        let app = app_with_keys(
+            "'ctrl+shift+k' = 'send_text:\\x1b[A\\x15'\n'ctrl+g' = 'none'\n'cmd+t' = 'new_window'\n",
+        );
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        // S8C1T, then history to scroll back into.
+        feed_child(&events, &fake, id, b"\x1b G");
+        output(&fake, &events, &numbered_lines(0, 100));
+        assert_eq!(scroll(&app, id, 20.0), InputOutcome::Consumed);
+        let new_window = command::CommandId::find("new_window", None).unwrap();
+        let cmd_t = KeyEvent::new(Key::Char('t'), Modifiers::SUPER);
+        assert_eq!(
+            key(&app, id, cmd_t.clone()),
+            InputOutcome::Command(new_window)
+        );
+        assert_eq!(
+            app.run_key_binding(id, &cmd_t).unwrap(),
+            Some(InputOutcome::Command(new_window))
+        );
+        assert_eq!(
+            app.scroll_offset(id).unwrap(),
+            20,
+            "a command moves nothing"
+        );
+        let ctrl_g = KeyEvent::new(Key::Char('g'), Modifiers::CTRL);
+        assert_eq!(key(&app, id, ctrl_g), InputOutcome::Consumed);
+        let release = cmd_t.with_kind(KeyEventKind::Release);
+        assert_eq!(key(&app, id, release), InputOutcome::Consumed);
+        let send = KeyEvent::new(Key::Char('k'), Modifiers::CTRL | Modifiers::SHIFT);
+        let send_release = send.clone().with_kind(KeyEventKind::Release);
+        assert_eq!(key(&app, id, send_release), InputOutcome::Consumed);
+        assert_eq!(
+            app.scroll_offset(id).unwrap(),
+            20,
+            "a release moves nothing"
+        );
+        assert_eq!(key(&app, id, send), InputOutcome::Consumed);
+        assert_eq!(app.scroll_offset(id).unwrap(), 0);
+        // Ctrl+C has a Ctrl chord beside it and is still encoded.
+        let ctrl_c = KeyEvent::new(Key::Char('c'), Modifiers::CTRL);
+        assert_eq!(key(&app, id, ctrl_c.clone()), InputOutcome::Consumed);
+        assert_eq!(app.run_key_binding(id, &ctrl_c).unwrap(), None);
+        written_eventually(&fake, b"\x1b[A\x15\x03");
+    }
+
+    /// The configuration watch's apply replaces the key map, counts the
+    /// generation and tells the observer, whether or not anything the
+    /// views draw changed.
+    #[test]
+    fn applying_a_configuration_replaces_the_key_map_and_says_so() {
+        struct Generations(Arc<Mutex<Vec<u64>>>);
+        impl SessionObserver for Generations {
+            fn on_session_event(&self, _: SessionId, _: SessionEvent) {}
+            fn on_config_applied(&self, generation: u64) {
+                lock(&self.0).push(generation);
+            }
+        }
+        let app = app();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        app.set_observer(Some(Box::new(Generations(Arc::clone(&seen)))));
+        let (id, _fake) = attach_fake(&app, false);
+        let cmd_t = KeyEvent::new(Key::Char('t'), Modifiers::SUPER);
+        let new_tab = command::CommandId::find("new_tab", None).unwrap();
+        assert_eq!(key(&app, id, cmd_t.clone()), InputOutcome::Command(new_tab));
+        assert_eq!(app.config_generation(), 0);
+        let before = app.keymap();
+        let theme = tessera_config::Theme::default();
+        app.apply_config(&Config::default(), &theme);
+        assert!(Arc::ptr_eq(&before, &app.keymap()), "same [keys], same map");
+        let unbound = Config::from_toml_lenient("[keys]\n'cmd+t' = 'unbound'\n")
+            .unwrap()
+            .config;
+        app.apply_config(&unbound, &theme);
+        assert!(!Arc::ptr_eq(&before, &app.keymap()));
+        assert_eq!(app.run_key_binding(id, &cmd_t).unwrap(), None);
+        assert_eq!(app.config_generation(), 2);
+        assert_eq!(*lock(&seen), [1, 2]);
     }
 
     /// A reply goes to the child through the outbox, after the input
