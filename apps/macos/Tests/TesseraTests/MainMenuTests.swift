@@ -131,6 +131,22 @@ final class MainMenuTests: XCTestCase {
             title: "Paste as Plain Text", key: "v", modifiers: [.command, .option, .shift],
             action: #selector(TerminalSurfaceView.pasteAsPlainText(_:))),
         Item(title: "Select All", key: "a", modifiers: command, action: #selector(TerminalSurfaceView.selectAll(_:))),
+        .separator,
+        Item(title: "Find", action: #selector(NSMenu.submenuAction(_:))),
+    ]
+
+    /// Edit > Find (#46b): Find Next moves toward older output (D16a).
+    private static let findItems: [Item] = [
+        Item(title: "Find…", key: "f", modifiers: command, action: #selector(TerminalSurfaceView.showFindBar(_:))),
+        Item(title: "Find Next", key: "g", modifiers: command, action: #selector(TerminalSurfaceView.findNextMatch(_:))),
+        Item(
+            title: "Find Previous", key: "g", modifiers: [.command, .shift],
+            action: #selector(TerminalSurfaceView.findPreviousMatch(_:))),
+        Item(
+            title: "Use Selection for Find", key: "e", modifiers: command,
+            action: #selector(TerminalSurfaceView.useSelectionForFind(_:))),
+        .separator,
+        Item(title: "Copy All Matches", action: #selector(TerminalSurfaceView.copyAllFindMatches(_:))),
     ]
 
     private static let viewItems: [Item] = [
@@ -216,6 +232,15 @@ final class MainMenuTests: XCTestCase {
                 XCTAssertNil(item.target, "\(title) > \(item.title) goes up the responder chain")
             }
         }
+    }
+
+    func testTheFindItemsAreInEditFind() throws {
+        let menu = try XCTUnwrap(try installedMenu("Edit").item(withTitle: "Find")?.submenu)
+        XCTAssertEqual(menu.items.map(Item.init).map(\.description), Self.findItems.map(\.description))
+        for item in menu.items where !item.isSeparatorItem {
+            XCTAssertNil(item.target, "Find > \(item.title) goes up the responder chain")
+        }
+        XCTAssertNil(try installedMenu("Edit").item(withTitle: "Find")?.identifier, "the submenu runs no command")
     }
 
     func testTheTabItemsSelectTheFirstNineTabs() throws {

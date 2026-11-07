@@ -544,15 +544,69 @@ pub fn segments(rows: &[Line], at: Rows, period: usize, out: &mut Vec<Segment>) 
     }
 }
 
+/// Where the scan of a segment stands between two of its pieces
+/// ([`scan_piece`]): the cell the next piece starts at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Piece {
+    /// Row index within the segment and column of the piece's first cell.
+    from: (usize, usize),
+    /// The piece starts behind a cut marker.
+    above: bool,
+}
+
+impl Piece {
+    /// The first piece of `segment`.
+    pub fn first(segment: Segment) -> Self {
+        Self {
+            from: (0, 0),
+            above: segment.above,
+        }
+    }
+}
+
+/// Searches one piece of `segment` of `rows` (the first of which is
+/// absolute row `first`), at most [`MAX_HAYSTACK_BYTES`] of its text from
+/// `piece` on, and calls `found` with each match in it, in document order,
+/// until it returns [`ControlFlow::Break`]. Returns that and the next
+/// piece, `None` when this one reached the segment's end.
+///
+/// A caller that checks a deadline between calls bounds its overrun by one
+/// piece's regex run: a segment of heavy combining marks can hold a hundred
+/// pieces, and a quadratic pattern can take seconds on one (the time
+/// depends on the pattern and has no fixed ceiling).
+pub fn scan_piece(
+    query: &Query,
+    rows: &[Line],
+    first: u64,
+    segment: Segment,
+    piece: Piece,
+    haystack: &mut Haystack,
+    mut found: impl FnMut(Match) -> ControlFlow<()>,
+) -> (ControlFlow<()>, Option<Piece>) {
+    let rows = &rows[segment.start..segment.end];
+    let base = first + segment.start as u64;
+    let stopped = haystack.fill_from(rows, piece.from, piece.above, segment.below);
+    let flow = query.find(haystack, |m| {
+        found(Match {
+            start_line: base + u64::from(m.start_row),
+            start_col: m.start_col,
+            end_line: base + u64::from(m.end_row),
+            end_col: m.end_col,
+        })
+    });
+    let next = stopped.map(|from| Piece { from, above: true });
+    (flow, next)
+}
+
 /// Calls `found` with each match of `segment` of `rows` (the first of
 /// which is absolute row `first`), in document order, until it returns
 /// [`ControlFlow::Break`].
 ///
 /// A segment with more than [`MAX_HAYSTACK_BYTES`] of text is searched in
-/// pieces, top down: each piece starts at the cell the previous one's cap
-/// left out, behind a cut marker as at a segment cut, so every cell is
-/// searched and no piece is longer than the cap. A match that would cross
-/// from one piece to the next is not found.
+/// pieces ([`scan_piece`]), top down: each piece starts at the cell the
+/// previous one's cap left out, behind a cut marker as at a segment cut, so
+/// every cell is searched and no piece is longer than the cap. A match that
+/// would cross from one piece to the next is not found.
 pub fn scan_segment(
     query: &Query,
     rows: &[Line],
@@ -561,25 +615,14 @@ pub fn scan_segment(
     haystack: &mut Haystack,
     mut found: impl FnMut(Match) -> ControlFlow<()>,
 ) -> ControlFlow<()> {
-    let rows = &rows[segment.start..segment.end];
-    let base = first + segment.start as u64;
-    let mut from = (0, 0);
-    let mut above = segment.above;
+    let mut piece = Piece::first(segment);
     loop {
-        let stopped = haystack.fill_from(rows, from, above, segment.below);
-        query.find(haystack, |m| {
-            found(Match {
-                start_line: base + u64::from(m.start_row),
-                start_col: m.start_col,
-                end_line: base + u64::from(m.end_row),
-                end_col: m.end_col,
-            })
-        })?;
-        let Some(next) = stopped else {
+        let (flow, next) = scan_piece(query, rows, first, segment, piece, haystack, &mut found);
+        flow?;
+        let Some(next) = next else {
             return ControlFlow::Continue(());
         };
-        from = next;
-        above = true;
+        piece = next;
     }
 }
 

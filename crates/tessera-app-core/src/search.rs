@@ -4,9 +4,12 @@
 //! [`App::search_step`](crate::App::search_step) copies at most [`SEARCH_LINES_PER_LOCK`] lines
 //! (fewer on wide screens: about [`MAX_HAYSTACK_BYTES`] cells) out of the
 //! terminal under its lock, releases the
-//! lock and runs the regex on the copy. The frontend calls it from its
-//! display link while a search is active; when nothing changed it returns
-//! after one short look at the terminal.
+//! lock and runs the regex on the copy, one piece (at most
+//! [`MAX_HAYSTACK_BYTES`] of text) at a time. The step's deadline is
+//! checked between pieces, so a chunk can be searched over several steps
+//! (`Chunk`) and a step overruns its budget by at most one piece. The
+//! frontend calls it from its display link while a search is active; when
+//! nothing changed it returns after one short look at the terminal.
 //!
 //! # Lines and order
 //!
@@ -47,8 +50,8 @@ use std::time::{Duration, Instant};
 use tessera_grid::{DamageRows, Grid, Line};
 use tessera_render::{Overlay, OverlayKind};
 use tessera_search::{
-    Haystack, MAX_HAYSTACK_BYTES, MAX_SEGMENT_ROWS, Match, Query, QueryError, QueryOptions, Rows,
-    Segment, is_segment_start, scan_segment, segment_period, segments,
+    Haystack, MAX_HAYSTACK_BYTES, MAX_SEGMENT_ROWS, Match, Piece, Query, QueryError, QueryOptions,
+    Rows, Segment, is_segment_start, scan_piece, segment_period, segments,
 };
 use tessera_term::Terminal;
 
@@ -388,6 +391,9 @@ struct Active {
     cuts: Vec<Segment>,
     /// For each pool line, true when it is the last pass's copy, unchanged.
     unchanged: Vec<bool>,
+    /// The chunk copied and not searched to its end yet: a step's deadline
+    /// can pass between its pieces.
+    chunk: Option<Chunk>,
 }
 
 impl Active {
@@ -414,6 +420,7 @@ impl Active {
             spare: Vec::new(),
             cuts: Vec::new(),
             unchanged: Vec::new(),
+            chunk: None,
         }
     }
 
@@ -704,10 +711,9 @@ impl Active {
         }
     }
 
-    /// Searches the copied rows of `work` (the first `count` of the
-    /// pool) and files the matches. A segment the last pass scanned with
-    /// the same rows takes that pass's matches instead ([`Scanned`]).
-    fn search(&mut self, work: Work, count: usize, run_above: usize, period: usize) {
+    /// Takes up the copied rows of `work` (the first `count` of the pool)
+    /// as the chunk to search ([`Active::search_piece`]).
+    fn begin(&mut self, work: Work, count: usize, run_above: usize, period: usize) {
         let (first, more_below) = match work {
             Work::CatchUp { start, .. } | Work::Older { start, .. } | Work::Head { start, .. } => {
                 (start, true)
@@ -721,26 +727,95 @@ impl Active {
             run_above,
             more_below,
         };
-        let mut scan = Scan {
-            query: &self.query,
-            rows: &self.pool[..count],
-            unchanged: &self.unchanged[..count],
-            at,
-            haystack: &mut self.haystack,
-            cuts: &mut self.cuts,
-            scanned: (&self.scanned, &self.screen[..]),
+        segments(&self.pool[..count], at, period, &mut self.cuts);
+        // The screen and older history keep the newest matches that fit;
+        // the room does not change while the chunk is searched.
+        let sink = match work {
+            Work::CatchUp { .. } | Work::Head { .. } => Sink::All(Vec::new()),
+            Work::Screen { .. } => Sink::Newest(Newest::new(
+                MAX_MATCHES.saturating_sub(self.pass.as_ref().map_or(0, |pass| pass.found.len())),
+            )),
+            Work::Older { .. } => Sink::Newest(Newest::new(
+                MAX_MATCHES.saturating_sub(self.history.len() + self.screen.len()),
+            )),
         };
-        match work {
-            Work::CatchUp { end, .. } => {
-                let mut found = Vec::new();
-                let _ = scan.run(
-                    period,
-                    |_| {},
-                    |m| {
-                        found.push(m);
-                        ControlFlow::Continue(())
-                    },
-                );
+        self.chunk = Some(Chunk {
+            work,
+            count,
+            at,
+            left: self.cuts.len(),
+            piece: None,
+            stopped: false,
+            sink,
+        });
+    }
+
+    /// Searches the chunk on, segment by segment from the bottom one up,
+    /// until one piece ([`scan_piece`]) has run or the chunk is done; a
+    /// segment the last pass scanned with the same rows takes that pass's
+    /// matches without a search ([`Scanned`]). A done chunk is filed.
+    /// Returns whether a piece ran.
+    fn search_piece(&mut self) -> bool {
+        let Some(chunk) = &mut self.chunk else {
+            return false;
+        };
+        let rows = &self.pool[..chunk.count];
+        let mut ran = false;
+        while chunk.left > 0 && !chunk.stopped && !ran {
+            let segment = self.cuts[chunk.left - 1];
+            let piece = if let Some(piece) = chunk.piece {
+                piece
+            } else {
+                let key = Cut::of(chunk.at.first, segment);
+                if let (Work::Screen { .. }, Some(pass)) = (chunk.work, &mut self.pass) {
+                    pass.next.cuts.push(key);
+                }
+                let unchanged = self.unchanged[segment.start..segment.end]
+                    .iter()
+                    .all(|&same| same);
+                if unchanged && self.scanned.has(key) {
+                    let screen = &self.screen;
+                    let from = screen.partition_point(|m| m.start_line < key.start);
+                    for m in screen[from..].iter().take_while(|m| m.start_line < key.end) {
+                        if chunk.sink.push(*m).is_break() {
+                            chunk.stopped = true;
+                            break;
+                        }
+                    }
+                    chunk.left -= 1;
+                    continue;
+                }
+                Piece::first(segment)
+            };
+            let sink = &mut chunk.sink;
+            let (flow, next) = scan_piece(
+                &self.query,
+                rows,
+                chunk.at.first,
+                segment,
+                piece,
+                &mut self.haystack,
+                |m| sink.push(m),
+            );
+            ran = true;
+            chunk.piece = next;
+            if next.is_none() {
+                chunk.left -= 1;
+            }
+            chunk.stopped |= flow.is_break();
+        }
+        let done = chunk.left == 0 || chunk.stopped;
+        if done && let Some(chunk) = self.chunk.take() {
+            self.file(chunk);
+        }
+        ran
+    }
+
+    /// Files the matches of a searched chunk.
+    fn file(&mut self, chunk: Chunk) {
+        let count = chunk.count;
+        match (chunk.work, chunk.sink) {
+            (Work::CatchUp { end, .. }, Sink::All(mut found)) => {
                 found.sort_unstable();
                 self.history.extend(found);
                 self.high = end;
@@ -748,12 +823,9 @@ impl Active {
                 self.screen.retain(|m| m.start_line >= high);
                 self.trim();
             }
-            Work::Screen { start, .. } => {
+            (Work::Screen { start, .. }, Sink::Newest(newest)) => {
                 let Some(pass) = &mut self.pass else { return };
-                let room = MAX_MATCHES.saturating_sub(pass.found.len());
-                let mut newest = Newest::new(room);
                 let next = &mut pass.next;
-                let _ = scan.run(period, |cut| next.cuts.push(cut), |m| newest.push(m));
                 pass.truncated |= newest.into(&mut pass.found);
                 if pass.keep && (next.rows.is_empty() || next.first == start + count as u64) {
                     // Keep the copies (the pool takes spare allocations).
@@ -771,10 +843,7 @@ impl Active {
                     self.finish_pass();
                 }
             }
-            Work::Older { start, .. } => {
-                let room = MAX_MATCHES.saturating_sub(self.history.len() + self.screen.len());
-                let mut newest = Newest::new(room);
-                let _ = scan.run(period, |_| {}, |m| newest.push(m));
+            (Work::Older { start, .. }, Sink::Newest(newest)) => {
                 let mut found = Vec::new();
                 if newest.into(&mut found) {
                     self.truncated = true;
@@ -785,16 +854,7 @@ impl Active {
                 }
                 self.low = start;
             }
-            Work::Head { end, .. } => {
-                let mut found = Vec::new();
-                let _ = scan.run(
-                    period,
-                    |_| {},
-                    |m| {
-                        found.push(m);
-                        ControlFlow::Continue(())
-                    },
-                );
+            (Work::Head { end, .. }, Sink::All(mut found)) => {
                 found.sort_unstable();
                 while self.history.front().is_some_and(|m| m.start_line < end) {
                     self.history.pop_front();
@@ -805,59 +865,49 @@ impl Active {
                 self.head = false;
                 self.trim();
             }
+            // `begin` pairs each kind of work with its sink.
+            _ => {}
         }
     }
 }
 
-/// One chunk's scan: the copied rows, where they sit, and what the last
-/// pass scanned when its matches may stand in for a search.
-struct Scan<'a> {
-    query: &'a Query,
-    rows: &'a [Line],
-    /// Which rows [`copy_lines`] found unchanged since the last pass.
-    unchanged: &'a [bool],
+/// A chunk copied out of the terminal and searched over one or more
+/// steps, one piece at a time, so a step's deadline is checked between
+/// pieces (ADR 0038). Nothing it found is filed before its last piece.
+#[derive(Debug)]
+struct Chunk {
+    work: Work,
+    /// Lines of the pool it holds.
+    count: usize,
     at: Rows,
-    haystack: &'a mut Haystack,
-    cuts: &'a mut Vec<Segment>,
-    scanned: (&'a Scanned, &'a [Match]),
+    /// Segments (`Active::cuts`) still to search: the first `left`; the
+    /// bottom one goes next.
+    left: usize,
+    /// Where the next segment stands: `None` before its first piece.
+    piece: Option<Piece>,
+    /// The sink was full: no older segment can add a match.
+    stopped: bool,
+    sink: Sink,
 }
 
-impl Scan<'_> {
-    /// Calls `found` with each match, segment by segment from the bottom
-    /// one up and in document order within a segment, until it returns
-    /// [`ControlFlow::Break`]; `cut` hears of each segment before its
-    /// matches.
-    fn run(
-        &mut self,
-        period: usize,
-        mut cut: impl FnMut(Cut),
-        mut found: impl FnMut(Match) -> ControlFlow<()>,
-    ) -> ControlFlow<()> {
-        segments(self.rows, self.at, period, self.cuts);
-        for &segment in self.cuts.iter().rev() {
-            let key = Cut::of(self.at.first, segment);
-            cut(key);
-            let (scanned, screen) = self.scanned;
-            let unchanged = self.unchanged[segment.start..segment.end]
-                .iter()
-                .all(|&same| same);
-            if unchanged && scanned.has(key) {
-                let from = screen.partition_point(|m| m.start_line < key.start);
-                for m in screen[from..].iter().take_while(|m| m.start_line < key.end) {
-                    found(*m)?;
-                }
-            } else {
-                scan_segment(
-                    self.query,
-                    self.rows,
-                    self.at.first,
-                    segment,
-                    self.haystack,
-                    &mut found,
-                )?;
+/// Where a chunk's matches go until it is filed.
+#[derive(Debug)]
+enum Sink {
+    /// Every match (new history, the history head).
+    All(Vec<Match>),
+    /// The newest that fit (the screen, older history).
+    Newest(Newest),
+}
+
+impl Sink {
+    fn push(&mut self, m: Match) -> ControlFlow<()> {
+        match self {
+            Self::All(found) => {
+                found.push(m);
+                ControlFlow::Continue(())
             }
+            Self::Newest(newest) => newest.push(m),
         }
-        ControlFlow::Continue(())
     }
 }
 
@@ -1112,9 +1162,17 @@ pub(crate) struct SearchState {
     drawn: Drawn,
     /// How long each hold of the terminal lock lasted and how many cells
     /// it copied, for the lock-hold test.
+    holds: Holds,
+    /// How long each piece's regex run took, for the step-deadline test.
     #[cfg(test)]
-    holds: Vec<(Duration, usize)>,
+    pieces: Vec<Duration>,
 }
+
+/// The lock-hold record of [`SearchState`]: kept by test builds only.
+#[cfg(test)]
+type Holds = Vec<(Duration, usize)>;
+#[cfg(not(test))]
+type Holds = ();
 
 impl SearchState {
     /// Starts searching for `pattern`. The same pattern and options as the
@@ -1147,81 +1205,43 @@ impl SearchState {
         self.active.as_ref().map(Active::status).unwrap_or_default()
     }
 
-    /// Scans chunks until nothing is left or `budget` has passed: at least
-    /// one chunk, exactly one when `budget` is zero. Each chunk holds the
-    /// terminal lock only to copy its lines.
+    /// Searches until nothing is left or `budget` has passed, checking the
+    /// deadline between pieces ([`scan_piece`]): at least one piece,
+    /// at most one when `budget` is zero, so a step overruns its budget by
+    /// at most one piece's regex run, whose time depends on the pattern. A chunk of lines is copied under one
+    /// hold of the terminal lock and may be searched over several steps;
+    /// its matches are filed when its last piece has run.
     pub(crate) fn step(&mut self, source: &impl TerminalSource, budget: Duration) -> SearchStatus {
         self.drawn.window = None;
         let started = Instant::now();
-        loop {
-            if !self.chunk(source) {
-                break;
-            }
-            if started.elapsed() >= budget {
-                break;
-            }
-        }
+        while self.unit(source) && started.elapsed() < budget {}
         self.status()
     }
 
-    /// Does one chunk of work; false when there was none.
-    fn chunk(&mut self, source: &impl TerminalSource) -> bool {
+    /// Searches one piece of the chunk under way, copying the next chunk
+    /// out of the terminal first when none is; false when there was no work
+    /// left.
+    fn unit(&mut self, source: &impl TerminalSource) -> bool {
         let Some(active) = &mut self.active else {
             return false;
         };
+        if active.chunk.is_none() && !copy_chunk(active, source, &mut self.holds) {
+            active.done = true;
+            active.fix_current();
+            return false;
+        }
         #[cfg(test)]
-        let holds = &mut self.holds;
-        let copied = source.read_terminal(|term, resizes| {
-            #[cfg(test)]
-            let held = Instant::now();
-            let grid = term.grid();
-            let work = active.plan(grid, resizes);
-            let copied = work.map(|work| {
-                let (start, end) = match work {
-                    Work::CatchUp { start, end }
-                    | Work::Screen { start, end, .. }
-                    | Work::Older { start, end }
-                    | Work::Head { start, end } => (start, end),
-                };
-                let seen = Seen::of(grid);
-                let first = match work {
-                    Work::Screen { .. } => seen.first(),
-                    _ => seen.base,
-                };
-                let lines = Lines::new(grid, &seen, first);
-                let run = lines.run_above(start, lines.period);
-                // Reuse needs every match of the last pass: none gave way.
-                let reuse =
-                    !active.truncated && !matches!(work, Work::Older { .. } | Work::Head { .. });
-                let count = copy_lines(
-                    &mut active.pool,
-                    &mut active.unchanged,
-                    reuse.then_some((&mut active.scanned, &mut active.spare)),
-                    grid,
-                    seen.base,
-                    start,
-                    end,
-                );
-                (work, count, run, lines.period)
-            });
-            #[cfg(test)]
-            holds.push((
-                held.elapsed(),
-                copied
-                    .as_ref()
-                    .map_or(0, |&(_, count, ..)| count * usize::from(grid.cols())),
-            ));
-            copied
-        });
-        let more = if let Some((work, count, run, period)) = copied {
-            active.search(work, count, run, period);
-            true
-        } else {
-            false
-        };
-        active.done = !more;
+        let started = Instant::now();
+        let ran = active.search_piece();
+        #[cfg(test)]
+        if ran {
+            self.pieces.push(started.elapsed());
+        }
+        #[cfg(not(test))]
+        let _ = ran;
+        active.done = false;
         active.fix_current();
-        more
+        true
     }
 
     /// Moves the current match one toward older output (`older`) or newer,
@@ -1380,6 +1400,67 @@ impl SearchState {
     pub(crate) fn take_holds(&mut self) -> Vec<(Duration, usize)> {
         std::mem::take(&mut self.holds)
     }
+
+    /// The pieces' regex run times recorded so far, for the step-deadline
+    /// test.
+    #[cfg(test)]
+    pub(crate) fn take_pieces(&mut self) -> Vec<Duration> {
+        std::mem::take(&mut self.pieces)
+    }
+}
+
+/// Plans the next chunk of `active`'s work and copies its lines under one
+/// hold of the terminal lock; false when there was none.
+fn copy_chunk(active: &mut Active, source: &impl TerminalSource, holds: &mut Holds) -> bool {
+    #[cfg(not(test))]
+    let () = *holds;
+    let copied = source.read_terminal(|term, resizes| {
+        #[cfg(test)]
+        let held = Instant::now();
+        let grid = term.grid();
+        let work = active.plan(grid, resizes);
+        let copied = work.map(|work| {
+            let (start, end) = match work {
+                Work::CatchUp { start, end }
+                | Work::Screen { start, end, .. }
+                | Work::Older { start, end }
+                | Work::Head { start, end } => (start, end),
+            };
+            let seen = Seen::of(grid);
+            let first = match work {
+                Work::Screen { .. } => seen.first(),
+                _ => seen.base,
+            };
+            let lines = Lines::new(grid, &seen, first);
+            let run = lines.run_above(start, lines.period);
+            // Reuse needs every match of the last pass: none gave way.
+            let reuse =
+                !active.truncated && !matches!(work, Work::Older { .. } | Work::Head { .. });
+            let count = copy_lines(
+                &mut active.pool,
+                &mut active.unchanged,
+                reuse.then_some((&mut active.scanned, &mut active.spare)),
+                grid,
+                seen.base,
+                start,
+                end,
+            );
+            (work, count, run, lines.period)
+        });
+        #[cfg(test)]
+        holds.push((
+            held.elapsed(),
+            copied
+                .as_ref()
+                .map_or(0, |&(_, count, ..)| count * usize::from(grid.cols())),
+        ));
+        copied
+    });
+    let Some((work, count, run, period)) = copied else {
+        return false;
+    };
+    active.begin(work, count, run, period);
+    true
 }
 
 /// Appends the text of `m` to `out`: spacers and padding contribute
@@ -1551,7 +1632,15 @@ mod tests {
                 holds.last().unwrap(),
                 search.status().matches,
             );
-            assert_eq!(holds.len(), 1000, "one hold per zero-budget step");
+            // A zero-budget step searches one piece. Here a piece is one
+            // 2048-cell line and a hold copies a haystack of cells (32
+            // lines), so a chunk takes 32 steps; output caught up comes in
+            // smaller chunks, so more holds.
+            assert!(
+                (1000 / 32..=1000).contains(&holds.len()),
+                "{} holds over 1000 zero-budget steps",
+                holds.len()
+            );
             if p99 <= Duration::from_millis(1) {
                 return;
             }
@@ -1685,5 +1774,193 @@ mod tests {
         eprintln!("1 000 000 lines, no match: {took:?}, {status:?}");
         assert_eq!(status.matches, 0);
         assert!(took <= Duration::from_secs(2), "{took:?}");
+    }
+
+    /// A cell of `e` and 31 combining acute accents: 63 bytes of text in
+    /// one column, every scalar a word character.
+    fn zalgo() -> String {
+        format!("e{}", "\u{301}".repeat(31))
+    }
+
+    /// A cell of 128 bytes: a mathematical bold `A` and 31 combining
+    /// stems.
+    fn cluster128() -> String {
+        format!("\u{1d400}{}", "\u{1d167}".repeat(31))
+    }
+
+    /// One logical line of `rows` rows of `cell` at `cols` columns, on a
+    /// screen two rows taller.
+    fn zalgo_terminal(cols: u16, rows: usize, cell: &str) -> Terminal {
+        let mut term = Terminal::new(u16::try_from(rows + 2).unwrap(), cols);
+        term.advance(cell.repeat(usize::from(cols) * rows).as_bytes());
+        term
+    }
+
+    /// The history and screen matches of `search`, as filed.
+    fn filed(search: &SearchState) -> (Vec<Match>, Vec<Match>) {
+        let active = search.active.as_ref().unwrap();
+        (
+            active.history.iter().copied().collect(),
+            active.screen.clone(),
+        )
+    }
+
+    /// E1 (#46b): a zero-budget step runs at most one piece's regex, so a
+    /// segment of heavy combining marks (16 pieces at 2048 columns) is
+    /// searched over many steps; nothing is filed before its last piece,
+    /// and the matches are those of one long step.
+    #[test]
+    fn a_zero_budget_step_runs_at_most_one_piece() {
+        let cell = zalgo();
+        let mut input = String::new();
+        for n in 0..2048_usize * 8 {
+            input.push_str(if n.is_multiple_of(97) { "X" } else { &cell });
+        }
+        let mut term = Terminal::new(10, 2048);
+        term.advance(input.as_bytes());
+        let shared = Shared::new(term);
+        let mut long = SearchState::default();
+        long.start("X", LITERAL).unwrap();
+        while !long.step(&shared, Duration::from_secs(60)).done {}
+        let want = filed(&long);
+        assert!(want.1.len() > 150, "{} matches", want.1.len());
+
+        let mut search = SearchState::default();
+        search.start("X", LITERAL).unwrap();
+        let mut steps = 0;
+        let mut pending = 0;
+        loop {
+            let status = search.step(&shared, Duration::ZERO);
+            steps += 1;
+            assert!(
+                search.take_pieces().len() <= 1,
+                "step {steps} ran two pieces"
+            );
+            if status.done {
+                break;
+            }
+            if search.active.as_ref().unwrap().chunk.is_some() {
+                pending += 1;
+                assert_eq!(status.matches, 0, "matches filed before the last piece");
+            }
+        }
+        eprintln!("{steps} steps, {pending} with a chunk under way");
+        assert!(pending > 12, "{pending} steps left a chunk under way");
+        assert_eq!(filed(&search), want);
+    }
+
+    /// E1 (#46b): output that arrives, scrolls and evicts while a chunk is
+    /// searched over many steps leaves the same matches as a fresh search
+    /// of the final terminal: the new history, the screen, the older
+    /// history and the evicted head are each filed whole.
+    #[test]
+    fn a_chunk_searched_over_steps_files_every_match() {
+        let row = |n: usize| {
+            let mut row = String::new();
+            for col in 0..300 {
+                row.push_str(if (n + col).is_multiple_of(41) {
+                    "X"
+                } else {
+                    "\u{434}\u{301}"
+                });
+            }
+            row
+        };
+        let mut term = Terminal::new(10, 300);
+        term.set_max_scrollback(400);
+        for n in 0..300 {
+            term.advance(row(n).as_bytes());
+            if n.is_multiple_of(3) {
+                term.advance(b"\r\n");
+            }
+        }
+        let shared = Shared::new(term);
+        let mut search = SearchState::default();
+        search.start("X", LITERAL).unwrap();
+        let mut n = 300;
+        let mut pending = 0;
+        for step in 0..4_000_usize {
+            search.step(&shared, Duration::ZERO);
+            if search.active.as_ref().unwrap().chunk.is_some() {
+                pending += 1;
+            }
+            if step.is_multiple_of(7) && step < 3_000 {
+                let mut out = row(n);
+                if n.is_multiple_of(2) {
+                    out.push_str("\r\n");
+                }
+                shared.term.lock().unwrap().advance(out.as_bytes());
+                n += 1;
+            }
+        }
+        while !search.step(&shared, Duration::ZERO).done {}
+        let mut fresh = SearchState::default();
+        fresh.start("X", LITERAL).unwrap();
+        while !fresh.step(&shared, Duration::from_secs(60)).done {}
+        eprintln!(
+            "{pending} steps with a chunk under way, {} lines fed",
+            n - 300
+        );
+        assert!(pending > 100, "{pending} steps left a chunk under way");
+        let (history, screen) = filed(&search);
+        let (want_history, want_screen) = filed(&fresh);
+        assert!(want_history.len() > 1_000, "{} matches", want_history.len());
+        let all = |a: Vec<Match>, b: Vec<Match>| {
+            let mut all: Vec<Match> = a.into_iter().chain(b).collect();
+            all.sort_unstable();
+            all
+        };
+        assert_eq!(all(history, screen), all(want_history, want_screen));
+        // The current match is not compared: the live one was evicted and
+        // moved on, the fresh one is the newest.
+        let counts = |status: SearchStatus| (status.matches, status.done, status.truncated);
+        assert_eq!(counts(search.status()), counts(fresh.status()));
+    }
+
+    /// E1 (#46b): with the quadratic pattern `\w*X|\w` on text of heavy
+    /// combining marks (a regex run of a second or more per 64 KiB piece,
+    /// a hundred pieces per chunk), a step with the C API's largest budget
+    /// (`TESSERA_SEARCH_MAX_STEP_MICROS`, 1 s) returns within that budget
+    /// plus one piece. Checking the deadline between chunks only, as
+    /// before, ran 28 s to 91 s.
+    ///
+    /// Timing-based: release only, with the other timing bars.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "timing bar; run in release")]
+    fn a_step_ends_within_one_piece_of_its_budget() {
+        const BUDGET: Duration = Duration::from_secs(1);
+        /// Time for the copy under the lock and the bookkeeping around the
+        /// pieces.
+        const SLACK: Duration = Duration::from_millis(50);
+        let regex = QueryOptions {
+            regex: true,
+            case_sensitive: true,
+        };
+        for (cols, rows, cell, name) in [
+            (2048, 31, zalgo(), "e + 31 marks, 2048 x 31"),
+            (80, 255, zalgo(), "e + 31 marks, 80 x 255"),
+            (2048, 31, cluster128(), "128-byte clusters, 2048 x 31"),
+        ] {
+            let shared = Shared::new(zalgo_terminal(cols, rows, &cell));
+            let mut search = SearchState::default();
+            search.start(r"\w*X|\w", regex).unwrap();
+            let started = Instant::now();
+            let status = search.step(&shared, BUDGET);
+            let took = started.elapsed();
+            let pieces = search.take_pieces();
+            let longest = pieces.iter().copied().max().unwrap_or_default();
+            eprintln!(
+                "{name}: step {took:?}, {} pieces, longest {longest:?}, {status:?}",
+                pieces.len()
+            );
+            assert!(
+                search.active.as_ref().unwrap().chunk.is_some(),
+                "{name}: the step finished its chunk, so it tested nothing"
+            );
+            assert!(
+                took <= BUDGET + longest + SLACK,
+                "{name}: the step took {took:?}, over {BUDGET:?} + one piece ({longest:?})"
+            );
+        }
     }
 }

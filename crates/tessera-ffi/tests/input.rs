@@ -1386,14 +1386,14 @@ fn send_text_bindings_from_config_toml_reach_the_pty() {
     let dir = common::hermetic_config_dir();
     std::fs::write(
         dir.join("config.toml"),
-        "[keys]\n'cmd+e' = 'send_text:echo\\n'\n'cmd+q' = 'none'\n'cmd+x' = 'bogus'\n",
+        "[keys]\n'cmd+u' = 'send_text:echo\\n'\n'cmd+q' = 'none'\n'cmd+x' = 'bogus'\n",
     )
     .unwrap();
     let outputs = Outputs::default();
     let app = Handle::new(&outputs);
     let id = app.spawn("/bin/cat", &[]);
     assert_eq!(
-        app.handle_key(id, &cmd(char_event('e')), HANDLE_KEY_BINDINGS_ONLY),
+        app.handle_key(id, &cmd(char_event('u')), HANDLE_KEY_BINDINGS_ONLY),
         (Error::Ok, InputOutcome::Consumed, NO_COMMAND)
     );
     app.wait_until("cat to echo the line", |app| {

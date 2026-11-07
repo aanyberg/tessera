@@ -210,6 +210,9 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     /// Where the pointer last was, in view coordinates, or `nil` once it
     /// left: Command pressed or released later re-tests this spot.
     private var lastPointer: NSPoint?
+    /// This pane's search and its find bar (#46b), from the first ⌘F.
+    /// See TerminalSurfaceView+Find.swift.
+    var findController: FindController?
     /// The left-button gesture the view handles itself (the core did not
     /// report the press to a program), from press to release.
     private var gesture: PointerGesture?
@@ -304,6 +307,7 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     /// window resize (one core resize, coalesced during a live resize).
     private func scrollerStyleChanged() {
         layoutRenderViewAndScroller()
+        layoutFindBar()
         window?.invalidateCursorRects(for: self)
         surfaceSizeChanged()
         paneMinimumSizeDidChange()
@@ -443,7 +447,11 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     /// A frame counts only while a surface is attached: without one (the
     /// first attach failed, and is not retried) the link would otherwise
     /// tick forever with nothing to draw.
-    private var hasPendingWork: Bool { (surface.isAttached && needsRender) || pendingResize || wantsReattach }
+    /// An open find bar with matches still to find counts too (its step
+    /// runs on the display link).
+    private var hasPendingWork: Bool {
+        (surface.isAttached && needsRender) || pendingResize || wantsReattach || (findController?.needsStep ?? false)
+    }
 
     /// Pauses the link while the window is hidden or there is nothing to do,
     /// and runs it otherwise. A window that becomes visible again is redrawn:
@@ -559,12 +567,14 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         layoutRenderViewAndScroller()
+        layoutFindBar()
         surfaceSizeChanged()
     }
 
     override func layout() {
         super.layout()
         layoutRenderViewAndScroller()
+        layoutFindBar()
         surfaceSizeChanged()
     }
 
@@ -697,6 +707,9 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         if pendingResize {
             resizeSurface()
         }
+        // At most one search step per refresh, whether or not a frame is
+        // drawn (it changes highlights only when it finds something).
+        stepSearch()
         if !surface.isAttached {
             if wantsReattach, lastAttachAttempt.map({ ContinuousClock.now - $0 >= Self.reattachInterval }) ?? true {
                 attachSurface()
@@ -769,6 +782,18 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
 
     func sessionDidOutput() {
         needsRender = true
+        findController?.outputArrived()
+    }
+
+    /// The search changed what is highlighted or where the view is
+    /// scrolled: the next refresh draws it.
+    func searchDidChange() {
+        needsRender = true
+    }
+
+    /// The search started or stopped having work for the display link.
+    func searchNeedsStepChanged() {
+        updateDisplayLinkPause()
     }
 
     func sessionDidExit(code: Int32, signal: Int32) {

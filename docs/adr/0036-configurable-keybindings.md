@@ -28,7 +28,7 @@ chord, and a string value:
 
 ```toml
 [keys]
-"cmd+e" = "new_tab"
+"cmd+u" = "new_tab"
 "ctrl+shift+t" = "select_tab:3"
 "cmd+k" = "send_text:clear\n"
 "cmd+q" = "none"
@@ -62,7 +62,7 @@ command, a command keeps the defaults no entry took, and within the table
 the first entry for a chord wins. Entries are additive: a command's own
 entries come first, in document order, and its old default stays bound
 as a hidden alternate unless the table also says `"<chord>" = "unbound"`
-(`"cmd+e" = "new_tab"` alone leaves ⌘T opening a tab too). The compiled map is cached against the
+(`"cmd+u" = "new_tab"` alone leaves ⌘T opening a tab too). The compiled map is cached against the
 configuration it came from and swapped as a whole when one applies.
 
 **Warnings, never errors.** An entry that breaks the grammar or the caps,

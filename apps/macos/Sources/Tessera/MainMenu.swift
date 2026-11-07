@@ -87,6 +87,23 @@ enum MainMenu {
         add(menu, "paste", "Paste", #selector(TerminalSurfaceView.paste(_:)), "v")
         add(menu, "paste_plain", "Paste as Plain Text", #selector(TerminalSurfaceView.pasteAsPlainText(_:)), "v", [.command, .option, .shift])
         add(menu, "select_all", "Select All", #selector(TerminalSurfaceView.selectAll(_:)), "a")
+        menu.addItem(.separator())
+        menu.addItem(submenuItem(makeFindMenu()))
+        return menu
+    }
+
+    /// Edit > Find, for the focused pane's search (ADR 0038): Find Next
+    /// (⌘G) moves toward older output, Find Previous (⇧⌘G) toward newer
+    /// (D16a). The actions are the terminal view's, so they reach it from
+    /// the find bar's field too.
+    private static func makeFindMenu() -> NSMenu {
+        let menu = NSMenu(title: "Find")
+        add(menu, "find", "Find…", #selector(TerminalSurfaceView.showFindBar(_:)), "f")
+        add(menu, "find_next", "Find Next", #selector(TerminalSurfaceView.findNextMatch(_:)), "g")
+        add(menu, "find_previous", "Find Previous", #selector(TerminalSurfaceView.findPreviousMatch(_:)), "g", [.command, .shift])
+        add(menu, "use_selection_for_find", "Use Selection for Find", #selector(TerminalSurfaceView.useSelectionForFind(_:)), "e")
+        menu.addItem(.separator())
+        add(menu, "copy_find_matches", "Copy All Matches", #selector(TerminalSurfaceView.copyAllFindMatches(_:)))
         return menu
     }
 

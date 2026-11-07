@@ -88,23 +88,23 @@ final class KeymapTests: XCTestCase {
         let app = try start(config: "[keys]\n")
         let session = try app.spawn(.init(program: "/bin/cat"))
         XCTAssertEqual(try app.keymap().command(named: "new_tab")?.chords, ["cmd+t"])
-        try "[keys]\n'cmd+e' = 'new_tab'\n'cmd+q' = 'none'\n'cmd+x' = 'bogus'\n"
+        try "[keys]\n'cmd+u' = 'new_tab'\n'cmd+q' = 'none'\n'cmd+x' = 'bogus'\n"
             .write(to: dir.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)
         try await until("the edit applies") { !recorder.configurations.isEmpty }
         let generation = try XCTUnwrap(recorder.configurations.last)
         let keymap = try app.keymap()
         XCTAssertEqual(keymap.generation, generation, "the map the delegate heard about")
-        XCTAssertEqual(keymap.command(named: "new_tab")?.chords.first, "cmd+e", "the user's first")
-        XCTAssertEqual(keymap.command(named: "new_tab")?.menu.first, .init(keyEquivalent: "e", modifiers: .command))
+        XCTAssertEqual(keymap.command(named: "new_tab")?.chords.first, "cmd+u", "the user's first")
+        XCTAssertEqual(keymap.command(named: "new_tab")?.menu.first, .init(keyEquivalent: "u", modifiers: .command))
         XCTAssertEqual(keymap.command(named: "quit")?.menu, [], "`none` unbinds the menu item")
         XCTAssertEqual(keymap.warnings.count, 2, "\(keymap.warnings)")
         XCTAssertTrue(keymap.warnings.contains { $0.contains("cmd+x") }, "\(keymap.warnings)")
-        XCTAssertEqual(try session.handle(key: Self.cmd("e"), bindingsOnly: true), .command("new_tab"))
+        XCTAssertEqual(try session.handle(key: Self.cmd("u"), bindingsOnly: true), .command("new_tab"))
         XCTAssertEqual(try session.handle(key: Self.cmd("q"), bindingsOnly: true), .consumed, "`none` swallows")
     }
 
     func testSendTextBindingsWriteToTheSession() async throws {
-        let app = try start(config: "[keys]\n'cmd+e' = 'send_text:hi\\n'\n")
+        let app = try start(config: "[keys]\n'cmd+u' = 'send_text:hi\\n'\n")
         let output = dir.appendingPathComponent("out")
         let ready = dir.appendingPathComponent("ready")
         let session = try app.spawn(
@@ -113,7 +113,7 @@ final class KeymapTests: XCTestCase {
                 arguments: ["-c", "stty raw -echo; : > '\(ready.path)'; head -c 3 > '\(output.path)'"]))
         // Once `stty` ran, the bytes reach `head` unchanged.
         try await until("the shell is ready") { FileManager.default.fileExists(atPath: ready.path) }
-        XCTAssertEqual(try session.handle(key: Self.cmd("e"), bindingsOnly: true), .consumed)
+        XCTAssertEqual(try session.handle(key: Self.cmd("u"), bindingsOnly: true), .consumed)
         try await until("the text arrives") {
             (try? Data(contentsOf: output))?.count == 3
         }

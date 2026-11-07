@@ -1,6 +1,6 @@
 # ADR 0038: Scrollback search: stepped scan, caps, lock budget
 
-**Status:** accepted · 2026-11-06
+**Status:** accepted · 2026-11-06 · amended 2026-11-07 (#46b: per-piece step bound, find bar)
 
 ## Context
 
@@ -68,14 +68,17 @@ generation counters, the cursor row and a copy of the cursor's row), then
 older history newest to oldest. No thread, channel or wake-up is added.
 
 The budget (and the C API's cap, `TESSERA_SEARCH_MAX_STEP_MICROS`) is
-checked between chunks only. A chunk runs one regex pass per 64 KiB piece
-of each segment it holds, up to about 128 pieces on text of heavy combining
-marks, so the step deadline bounds a step only to within one chunk: a step
-can overrun it by many pieces' worth of regex time (28 s to 91 s measured
-with `\w*X|\w` on such text at 2048 and 80 columns). The bound that holds
-is per piece. A resumable scan that checks the deadline between pieces, so
-a step overruns by at most one piece, is a Done-when of #46b; search must not
-be exposed to the UI before it lands.
+checked between pieces (amended in #46b). A chunk runs one regex pass per
+64 KiB piece of each segment it holds, up to about 128 pieces on text of
+heavy combining marks, so the chunk is kept across steps and its scan
+resumes at the next piece: a step runs at least one piece and overruns its
+budget by at most one piece's regex time. That time depends on the
+pattern and has no fixed ceiling: seconds for `\w*X|\w` on such text
+(`a_step_ends_within_one_piece_of_its_budget` checks the bound of one
+piece, not a time; before, a step took 28 s to 91 s). A chunk's matches are filed when its last piece has
+run, so the count grows chunk by chunk and never shows half a chunk; what
+changed in the terminal meanwhile is caught by the next plan, as between a
+copy and its search. A zero budget runs at most one piece.
 
 **Screen passes reuse what did not change.** A segment's text depends only
 on its rows and on whether it continues above and below, so a pass keeps a
@@ -136,6 +139,43 @@ convention). A refused pattern returns `TESSERA_ERROR_INVALID_ARGUMENT`.
 for a refused query carries no source, and the C layer logs only the
 refusal kind.
 
+**Find bar (#46b, amended).** The app's find bar is a small panel floating
+in the top trailing corner of the focused pane, over the terminal (clear of
+the scroll bar): it takes no layout slot and never resizes the grid. It
+holds the query field, the count ("3 of 12", "more than 100 000" when
+`truncated`, "No matches"), or a refused regex's reason (the core's
+message, which quotes the pattern, made safe to show per S3), older and
+newer buttons, a case control and a regex toggle. Each pane has its own
+search (its own query, toggles and current match), kept while the user
+switches pane or tab; closing a pane frees its search with its session.
+
+- Keys (D16a): Return in the field and Find Next (⌘G) move to the older
+  match; Shift-Return and Find Previous (⌘⇧G) to the newer one; both wrap.
+  Escape in the field closes the bar, clears the search (its highlights go)
+  and gives the keyboard back to the terminal. ⌘G or ⌘⇧G with the bar
+  closed opens it with the pane's last query. The commands go through the
+  key map (`find`, `find_next`, `find_previous`, `use_selection_for_find`
+  on ⌘E, `copy_find_matches` with no chord) and Edit > Find.
+- A new query makes its newest match current as soon as a step finds it,
+  and the view scrolls to it; a move asked for before the first match waits
+  for it.
+- Case: smart case by default (case-insensitive unless the query has an
+  uppercase letter; in regex mode an escaped character and a `\p{…}`
+  class name do not count), or match case, or ignore case. Smart case is
+  the app's: the core gets a plain case-sensitive flag.
+- Typing is debounced (120 ms) before the query reaches the core; Return
+  and ⌘G send it at once.
+- Stepping: the pane's display link makes one `step` per refresh with a
+  4 ms budget while the bar is open and the status is not `done` or output
+  arrived since; a step overruns it by at most one piece. With the bar
+  closed the search is cleared and the display link makes no search call.
+- Use Selection for Find takes the selection's first line, drops control,
+  format and separator characters (S3), escapes it in regex mode and cuts
+  it to 1024 bytes; with the bar closed it sets the query ⌘G searches for,
+  as other Mac apps do. Copy All Matches puts `matches_text` on the
+  pasteboard and says in the bar when it was cut at 1 MiB.
+- Neither the query nor match text is logged (S8).
+
 ## Measured
 
 Release, Apple silicon, wave load 13 to 25 (`ab` rows: instruction counts, net of the probe overhead):
@@ -172,9 +212,8 @@ the last overlays (one window's worth). Compilation of a pattern near the size l
   1.15 bar by a few thousand instructions (well under a microsecond). A
   step after output copies and scans the rows the output touched, which
   costs about as much again as the output's own parse: the step's budget
-  (D6) bounds it to within one chunk (see Stepped: per piece once #46b
-  lands), and with no output and nothing left to scan a step is one
-  short look at the terminal.
+  (D6) bounds it to within one piece (see Stepped), and with no output and
+  nothing left to scan a step is one short look at the terminal.
 - A match across a segment cut of a very long logical line (more than the
   segment period's rows) is missed. The cut rows are fixed, so the result
   does not change as output arrives. So is a match across a piece cut of a
@@ -184,5 +223,8 @@ the last overlays (one window's worth). Compilation of a pattern near the size l
   older-history scan (and `done`) can lag until output pauses.
 - `search_status` between a resize and the next step reports the old
   counts; the overlays are already gone.
-- The find bar (#46b) maps ⌘G and ⌘⇧G to older and newer, shows "more than"
-  when `truncated`, and drives `step` from its display link.
+- The find bar (#46b, see Find bar) makes no search call per frame while it
+  is closed, and at most one 4 ms step per frame while it is open.
+- Searches are per pane and the find bar opens on the focused pane only, so
+  two panes searching cost two steps a frame; a closed bar's search is
+  cleared, so only open bars cost anything.

@@ -55,9 +55,11 @@ focus_pane_previous,cmd+[,,pane focus order (T10?),[,cmd,cmd+[ (S-ITERM),none,ap
 focus_pane_next,cmd+],,pane focus order (T10?),],cmd,cmd+] (S-ITERM),none,app,As above.
 zoom_pane,cmd+shift+enter,,pane zoom (T10),F:\r,cmd+shift,cmd+shift+enter = maximize pane (S-ITERM),none,app,Not in D1; confirm (N6). Terminal.app shift+cmd+return = 'send return without marking'.
 equalize_panes,,,Shell > Equalize Panes (#38b),,,none,none,app,No default chord (#38b E3); double-clicking a divider equalises that one split.
-find,cmd+f,,Edit > Find (T8),f,cmd,cmd+f,cmd+f (S-TERM),later:T8,
-find_next,cmd+g,,Edit > Find Next (T8),g,cmd,cmd+g (unverified),cmd+g (S-TERM),later:T8,
-find_previous,cmd+shift+g,,Edit > Find Previous (T8),g,cmd+shift,cmd+shift+g (unverified),cmd+shift+g (S-TERM),later:T8,
+find,cmd+f,,Edit > Find > Find… (#46b),f,cmd,cmd+f,cmd+f (S-TERM),app,
+find_next,cmd+g,,Edit > Find > Find Next (#46b),g,cmd,cmd+g (unverified),cmd+g (S-TERM),app,D16a: toward older output.
+find_previous,cmd+shift+g,,Edit > Find > Find Previous (#46b),g,cmd+shift,cmd+shift+g (unverified),cmd+shift+g (S-TERM),app,D16a: toward newer output.
+use_selection_for_find,cmd+e,,Edit > Find > Use Selection for Find (#46b),e,cmd,cmd+e (unverified),cmd+e (unverified),app,The Mac convention (Safari; Xcode; TextEdit).
+copy_find_matches,,,Edit > Find > Copy All Matches (#46b),,,none,none,app,No default chord.
 prompt_previous,cmd+up,,Edit > Previous Prompt (T6),F:UpArrow,cmd,iTerm2: next/previous mark are cmd+shift+up/down (unverified),cmd+up = 'Jump to previous mark' (S-TERM),later:T6,D4: same chord as scroll_page_up; see decision N1. Registry default for prompt_previous is cmd+up; the dispatcher falls back to scroll_page_up when the session has no prompt mark.
 prompt_next,cmd+down,,Edit > Next Prompt (T6),F:DownArrow,cmd,as above,cmd+down = 'Jump to next mark' (S-TERM),later:T6,As prompt_previous.
 copy_mode,cmd+shift+c,,Edit > Copy Mode (T9),c,cmd+shift,cmd+shift+c = Enter Copy Mode (S-ITERM cheat sheet),cmd+shift+c = Show colors (S-TERM),later:T9,Confirm with T9 owner.
