@@ -24,6 +24,9 @@
 //!   `tessera_session_select_*`, `tessera_session_selection_text`,
 //!   `tessera_session_link_at` and `tessera_session_set_hover` functions
 //!   (see the `selection` module), in view-relative cells.
+//! * Scrollback search goes through the `tessera_session_search_*`
+//!   functions (see the `search` module): set a query, step it from the
+//!   display link, move between matches, copy them all.
 //! * A session is drawn into a host-owned `CAMetalLayer` through the
 //!   `tessera_surface_*` functions (see the `surface` module): attach,
 //!   resize, render each display refresh, set the font size, detach. The
@@ -41,6 +44,7 @@ mod error;
 mod input;
 mod keymap;
 mod panic;
+mod search;
 mod selection;
 mod session;
 mod surface;
@@ -66,6 +70,13 @@ pub use keymap::tessera_app_keymap_json;
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use panic::tessera_test_panic;
+pub use search::{
+    SEARCH_CASE_SENSITIVE, SEARCH_MAX_MATCHES, SEARCH_MAX_MATCHES_TEXT_BYTES,
+    SEARCH_MAX_QUERY_BYTES, SEARCH_MAX_STEP_MICROS, SEARCH_REGEX, SearchRefusal, SearchStatus,
+    tessera_session_search_clear, tessera_session_search_matches_text,
+    tessera_session_search_newer, tessera_session_search_older, tessera_session_search_start,
+    tessera_session_search_status, tessera_session_search_step,
+};
 pub use selection::{
     Granularity, tessera_session_has_selection, tessera_session_link_at,
     tessera_session_select_adjust, tessera_session_select_all, tessera_session_select_begin,

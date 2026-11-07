@@ -11,7 +11,12 @@ publish.workspace = true
 
 [dependencies]
 tessera-grid.workspace = true
-regex = "1"
+regex.workspace = true
+
+[dev-dependencies]
+# Feeds the spec fixture through a real terminal (wrap, wide, clusters).
+tessera-term.workspace = true
+proptest.workspace = true
 
 [lints]
 workspace = true

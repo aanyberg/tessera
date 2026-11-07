@@ -14,7 +14,7 @@ prefix = "Tessera"
 # never hand Rust an invalid discriminant) are not reachable from any
 # signature; list them so their named values reach the header.
 include = [
-    "Key", "KeyEventKind", "Modifiers", "MouseButton", "MouseEventKind", "ScrollTarget", "Granularity",
+    "Key", "KeyEventKind", "Modifiers", "MouseButton", "MouseEventKind", "ScrollTarget", "Granularity", "SearchRefusal",
 ]
 # Constants are `#define`d with C-style names instead of the type prefix.
 renaming_overrides_prefixing = true
@@ -23,6 +23,12 @@ renaming_overrides_prefixing = true
 "MAX_ROWS" = "TESSERA_MAX_ROWS"
 "MAX_COLS" = "TESSERA_MAX_COLS"
 "FOREGROUND_NAME_LEN" = "TESSERA_FOREGROUND_NAME_LEN"
+"SEARCH_REGEX" = "TESSERA_SEARCH_REGEX"
+"SEARCH_CASE_SENSITIVE" = "TESSERA_SEARCH_CASE_SENSITIVE"
+"SEARCH_MAX_QUERY_BYTES" = "TESSERA_SEARCH_MAX_QUERY_BYTES"
+"SEARCH_MAX_MATCHES" = "TESSERA_SEARCH_MAX_MATCHES"
+"SEARCH_MAX_MATCHES_TEXT_BYTES" = "TESSERA_SEARCH_MAX_MATCHES_TEXT_BYTES"
+"SEARCH_MAX_STEP_MICROS" = "TESSERA_SEARCH_MAX_STEP_MICROS"
 "HANDLE_KEY_BINDINGS_ONLY" = "TESSERA_HANDLE_KEY_BINDINGS_ONLY"
 "NO_COMMAND" = "TESSERA_NO_COMMAND"
 

@@ -54,7 +54,7 @@ impl From<&CoreError> for Error {
             CoreError::Write { .. } => Self::Io,
             CoreError::Gpu(_) => Self::Gpu,
             CoreError::NoView(_) => Self::NoSurface,
-            CoreError::ViewAttached(_) => Self::InvalidArgument,
+            CoreError::ViewAttached(_) | CoreError::Query(_) => Self::InvalidArgument,
         }
     }
 }
@@ -152,6 +152,10 @@ mod tests {
             (CoreError::Gpu(RenderError::NoFont("x".into())), Error::Gpu),
             (CoreError::NoView(id), Error::NoSurface),
             (CoreError::ViewAttached(id), Error::InvalidArgument),
+            (
+                CoreError::Query(tessera_app_core::QueryError::TooComplex),
+                Error::InvalidArgument,
+            ),
         ];
         for (error, code) in cases {
             assert_eq!(Error::from(&error), code, "{error:?}");

@@ -65,6 +65,8 @@ bytemuck = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 winit = "0.30"
 base64 = "0.23"
+# Scrollback search (ADR 0038): linear-time regex, size-limited compile.
+regex = "1"
 
 # external, dev
 insta = "1.43"
@@ -114,4 +116,13 @@ opt-level = 3
 # clipboard payloads 33 times each; unoptimised, base64 decoding is a third
 # of that file's run time and keeps it over its 0.5 s budget (#9).
 [profile.dev.package.base64]
+opt-level = 3
+
+# Scrollback search tests (crates/tessera-search, tessera-app-core) run
+# regexes over hundreds of thousands of cells; unoptimised, the regex
+# engine is 30-50x slower and the fixture and cap tests take minutes.
+[profile.dev.package.regex-automata]
+opt-level = 3
+
+[profile.dev.package.regex-syntax]
 opt-level = 3

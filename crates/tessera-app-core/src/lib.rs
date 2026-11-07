@@ -35,6 +35,7 @@ pub mod command;
 mod config_watch;
 pub mod input;
 mod mouse;
+pub mod search;
 pub mod selection;
 pub mod session;
 mod shell_integration;
@@ -47,6 +48,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::time::Duration;
 
 use tessera_pty::{NativePty, Pty, PtyEvents};
 use tessera_render::{FontConfig, Fonts, Gpu, Theme};
@@ -55,8 +57,10 @@ use tessera_term::{
 };
 
 pub use input::{InputEvent, InputOutcome};
+pub use search::{MatchesText, SearchStatus};
 pub use selection::{Granularity, Link, Point};
 pub use session::{SessionEvent, SessionId, SessionObserver};
+pub use tessera_search::{MAX_QUERY_BYTES, QueryError, QueryOptions};
 // Re-exported so frontends (through `tessera-ffi`) depend on this crate
 // alone, as the layering in `docs/architecture.md` requires.
 pub use config_watch::{CONFIG_DIR_POLL_INTERVAL, CONFIG_WATCH_STOP_CAP};
@@ -114,6 +118,13 @@ pub enum Error {
     /// The session already has a view; detach it before attaching another.
     #[error("session {0} already has a view")]
     ViewAttached(SessionId),
+    /// A search query was refused ([`App::search_start`]): too long, not a
+    /// valid regular expression, or too complex to compile within the
+    /// size limit. This message never quotes the query, so it can be
+    /// logged (security rule S8); the [`QueryError`] says why, for the
+    /// user, and is not an error source, so no error chain prints it.
+    #[error("the search query was refused")]
+    Query(QueryError),
 }
 
 /// Result alias for [`Error`].
@@ -1085,6 +1096,124 @@ impl App {
         Ok(self.session(id)?.scroll_position())
     }
 
+    /// Searches session `id` for `pattern` (ADR 0038): a literal string,
+    /// or a regular expression in the `regex` crate's syntax when
+    /// `options.regex` is set; case-insensitive unless
+    /// `options.case_sensitive` is. A match may cross a soft wrap (the
+    /// logical line is the unit `^` and `$` anchor to) but never a hard
+    /// line break.
+    ///
+    /// Nothing is scanned yet: [`App::search_step`] does the work. The
+    /// pattern and options of the current search keep what it found; an
+    /// empty pattern ends the search.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session,
+    /// [`Error::Query`] if the pattern is longer than
+    /// [`tessera_search::MAX_QUERY_BYTES`], is not a valid regular
+    /// expression or is too complex to compile; the earlier search ends
+    /// then too.
+    pub fn search_start(&self, id: SessionId, pattern: &str, options: QueryOptions) -> Result<()> {
+        self.session(id)?
+            .search()
+            .start(pattern, options)
+            .map_err(Error::Query)
+    }
+
+    /// Scans session `id` for its search for about `budget`: chunk after
+    /// chunk until nothing is left to scan or `budget` has passed, at least
+    /// one chunk (exactly one for a zero `budget`). Each chunk holds the
+    /// terminal lock only to copy at most [`search::SEARCH_LINES_PER_LOCK`]
+    /// lines, so output keeps flowing while a search runs.
+    ///
+    /// Call it from the display link while [`SearchStatus::done`] is false
+    /// or output arrives: the screen is searched first, then the history
+    /// from the newest line up; new output keeps the search live (new
+    /// lines scanned, the screen rescanned, matches on evicted or cleared
+    /// lines dropped, everything found again after a resize). The first
+    /// step makes the newest match the current one.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn search_step(&self, id: SessionId, budget: Duration) -> Result<SearchStatus> {
+        let session = self.session(id)?;
+        let status = session.search().step(&*session, budget);
+        Ok(status)
+    }
+
+    /// Makes the match before the current one (toward older output) the
+    /// current one, wrapping from the oldest to the newest, and scrolls
+    /// session `id`'s view to show it when it is not in view (centred).
+    /// Returns the status after the move.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn search_older(&self, id: SessionId) -> Result<SearchStatus> {
+        self.search_move(id, true)
+    }
+
+    /// Makes the match after the current one (toward newer output) the
+    /// current one, wrapping from the newest to the oldest, and scrolls the
+    /// view to it as [`App::search_older`] does.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn search_newer(&self, id: SessionId) -> Result<SearchStatus> {
+        self.search_move(id, false)
+    }
+
+    fn search_move(&self, id: SessionId, older: bool) -> Result<SearchStatus> {
+        let session = self.session(id)?;
+        // The search lock is released before the terminal's is taken
+        // again to scroll.
+        let (found, status) = {
+            let mut search = session.search();
+            let found = search.advance(older);
+            (found, search.status())
+        };
+        if let Some(found) = found {
+            search::reveal(&session, found);
+        }
+        Ok(status)
+    }
+
+    /// Ends session `id`'s search: its matches are no longer drawn.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn search_clear(&self, id: SessionId) -> Result<()> {
+        self.session(id)?.search().clear();
+        Ok(())
+    }
+
+    /// Where session `id`'s search stands, without scanning.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn search_status(&self, id: SessionId) -> Result<SearchStatus> {
+        Ok(self.session(id)?.search().status())
+    }
+
+    /// The text of every match session `id`'s search has found ("copy all
+    /// matches"), in document order, one per line, at most
+    /// [`search::MAX_MATCHES_TEXT_BYTES`]. Reads the terminal a bounded
+    /// number of lines per hold of its lock.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn search_matches_text(&self, id: SessionId) -> Result<MatchesText> {
+        let session = self.session(id)?;
+        let text = session.search().matches_text(&*session);
+        Ok(text)
+    }
+
     /// Starts a selection in session `id` at view-relative cell `at` (row 0
     /// is the top row its view shows at the current scroll offset; a point
     /// outside the grid is clamped to it): a mouse-down with
@@ -1642,11 +1771,19 @@ impl App {
         let result = if view.gpu().is_lost() {
             Err(RenderError::DeviceLost)
         } else {
-            let scrolled = session.with_selection(|selection, term, offset| {
-                let changed = view.capture(term, offset);
-                view.set_decorations(selection.frame_decorations(term.grid(), offset, &changed));
-                offset > 0
-            });
+            let (mut decorations, window, scrolled) =
+                session.with_selection(|selection, term, offset| {
+                    let changed = view.capture(term, offset);
+                    let decorations = selection.frame_decorations(term.grid(), offset, &changed);
+                    let window = search::Window::of(term.grid(), offset, session.resizes());
+                    (decorations, window, offset > 0)
+                });
+            // After the terminal lock (search, then terminal, is the
+            // order): the matches are the search's as of its last step.
+            session
+                .search()
+                .overlays(&window, &mut decorations.overlays);
+            view.set_decorations(decorations);
             // Focus only changes how the cursor is drawn, and a scrolled
             // back frame draws none: drawn as focused, a focus change alone
             // presents nothing there (#175).
@@ -1955,9 +2092,16 @@ impl App {
         Option<tessera_render::Selection>,
         Vec<tessera_render::Overlay>,
     )> {
-        let decorations = self
-            .session(id)?
-            .with_selection(|selection, term, offset| selection.decorations(term.grid(), offset));
+        let session = self.session(id)?;
+        let (mut decorations, window) = session.with_selection(|selection, term, offset| {
+            (
+                selection.decorations(term.grid(), offset),
+                search::Window::of(term.grid(), offset, session.resizes()),
+            )
+        });
+        session
+            .search()
+            .overlays(&window, &mut decorations.overlays);
         Ok((decorations.selection, decorations.overlays))
     }
 
