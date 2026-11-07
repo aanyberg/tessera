@@ -46,7 +46,7 @@ final class TerminalSurfaceViewTests: XCTestCase {
         appDelegate.spawnOptions = .init(
             program: "/bin/sh", arguments: ["-c", #"stty raw -echo; printf R; exec cat > "$0""#, file.path])
         let controller = try appDelegate.newWindow()
-        view = try XCTUnwrap(controller.contentView as? TerminalSurfaceView)
+        view = controller.focusedPane.view
         // Off the app's window, whose key and visible state follow the
         // machine, into one the test controls.
         window = KeyControlledWindow(contentRect: view.frame)
@@ -135,7 +135,7 @@ final class TerminalSurfaceViewTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: marker) }
         appDelegate.spawnOptions = .init(program: "/bin/zsh", arguments: ["-f"])
         let controller = try appDelegate.newWindow()
-        let zsh = try XCTUnwrap(controller.contentView as? TerminalSurfaceView)
+        let zsh = controller.focusedPane.view
         let zshWindow = KeyControlledWindow(contentRect: zsh.frame)
         extraWindows.append(zshWindow)
         zshWindow.contentView = zsh
@@ -1476,7 +1476,7 @@ final class TerminalSurfaceViewTests: XCTestCase {
         appDelegate.spawnOptions = .init(
             program: "/bin/sh", arguments: ["-c", #"seq 1 100; : > "$0"; exec cat"#, marker.path])
         let controller = try appDelegate.newWindow()
-        let printed = try XCTUnwrap(controller.contentView as? TerminalSurfaceView)
+        let printed = controller.focusedPane.view
         let other = KeyControlledWindow(contentRect: printed.frame)
         extraWindows.append(other)
         other.contentView = printed
@@ -1548,7 +1548,7 @@ final class TerminalSurfaceViewTests: XCTestCase {
         try requireSurface()
         appDelegate.spawnOptions = .init(program: "/bin/cat")
         let controller = try appDelegate.newWindow()
-        let second = try XCTUnwrap(controller.contentView as? TerminalSurfaceView)
+        let second = controller.focusedPane.view
         let other = KeyControlledWindow(contentRect: second.frame)
         extraWindows.append(other)
         other.contentView = second

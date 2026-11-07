@@ -75,7 +75,7 @@ final class MouseReportingTests: XCTestCase {
     private func open(modes: String = anyMotionSGR) async throws {
         file = spawnRecorder(modes: modes)
         let controller = try appDelegate.newWindow()
-        view = try XCTUnwrap(controller.contentView as? TerminalSurfaceView)
+        view = controller.focusedPane.view
         window = KeyControlledWindow(contentRect: view.frame)
         window.contentView = view
         _ = window.makeFirstResponder(view)
@@ -503,7 +503,7 @@ final class MouseReportingTests: XCTestCase {
         // The second tab joined the group after its view moved into its
         // window; the first was in it from the start.
         for (tab, other, recording) in [(secondWindow, firstWindow, secondFile), (firstWindow, secondWindow, firstFile)] {
-            view = try XCTUnwrap(tab.contentView as? TerminalSurfaceView)
+            view = try XCTUnwrap((tab.windowController as? TerminalWindowController)?.focusedPane.view)
             file = recording
             view.occlusionOverride = true
             view.metrics = Self.metrics
@@ -556,7 +556,7 @@ final class MouseReportingTests: XCTestCase {
         try autoreleasepool {
             file = spawnRecorder(modes: Self.anyMotionSGR)
             let controller = try appDelegate.newWindow()
-            let surface = try XCTUnwrap(controller.contentView as? TerminalSurfaceView)
+            let surface = controller.focusedPane.view
             weakController = controller
             weakView = surface
             weakSession = surface.session

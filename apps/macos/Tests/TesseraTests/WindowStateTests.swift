@@ -172,7 +172,7 @@ final class WindowStateTests: XCTestCase {
         XCTAssertTrue(appDelegate.restoreWindows(from: state, screens: screens))
 
         XCTAssertEqual(appDelegate.windowControllers.count, 6)
-        XCTAssertEqual(Set(appDelegate.windowControllers.map(\.session.id)).count, 6, "a session per tab")
+        XCTAssertEqual(Set(appDelegate.windowControllers.map(\.focusedPane.session.id)).count, 6, "a session per tab")
         XCTAssertEqual(appDelegate.currentWindowState(), state)
         let groups = Set(appDelegate.windowControllers.compactMap { $0.window?.tabGroup }.map(ObjectIdentifier.init))
         XCTAssertEqual(groups.count, 2)

@@ -1,16 +1,18 @@
 import AppKit
 import TesseraKit
 
-/// What closing a tab or a window, or quitting, would terminate: the
+/// What closing a pane, a tab or a window, or quitting, would terminate: the
 /// sessions among those it closes whose shell runs a job in the foreground,
-/// and the alert that asks first (ADR 0031, D4).
+/// and the alert that asks first (ADR 0031, D4; panes ADR 0035).
 ///
 /// Every job counts, `tmux` and `ssh` included; there is no list of programs
 /// that close without asking. A window or the application asks once for all
-/// its busy sessions, never once per tab.
+/// its busy sessions, never once per tab or pane.
 struct CloseConfirmation: Equatable {
     /// What is being closed.
     enum Scope: Equatable {
+        /// ⌘W on one pane of several.
+        case pane
         case tab
         case window
         case quit
@@ -68,6 +70,7 @@ struct CloseConfirmation: Equatable {
 
     var messageText: String {
         switch scope {
+        case .pane: "Close this pane?"
         case .tab: "Close this tab?"
         case .window: "Close this window?"
         case .quit: "Quit Tessera?"
@@ -79,6 +82,7 @@ struct CloseConfirmation: Equatable {
         let what = processNames.count == 1 ? "the running process" : "the running processes"
         let lead =
             switch scope {
+            case .pane: "Closing this pane will terminate \(what):"
             case .tab: "Closing this tab will terminate \(what):"
             case .window: "Closing this window will terminate \(what):"
             case .quit: "Quitting will terminate \(what):"

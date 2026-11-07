@@ -110,11 +110,15 @@ the first attach.
 Every `tessera_surface_*` call is main thread only. The Swift view that
 makes these calls is not in the tree yet (issue #27).
 
-Windows and tabs are not in the core yet. In 0.1.0 each tab is an `NSWindow`
-with one session, grouped by AppKit's tab bar, and the registry lives in the
-Swift shell; the core keeps only sessions (ADR 0015). The shell also asks
-before closing a tab, a window or the app while a session runs a job, and
-saves each window's frame and tab count for the next launch (ADR 0031).
+Windows, tabs and panes are not in the core yet. Each tab is an `NSWindow`,
+grouped by AppKit's tab bar, and the registry lives in the Swift shell; the
+core keeps only sessions (ADR 0015). Within a tab, a pane tree in the shell
+splits the window into up to 16 panes of at least 10 × 3 cells, one session
+each, laid out by nested split views; the focus moves spatially and the
+window's title is the focused pane's (ADR 0035). The shell also asks before
+closing a pane, a tab, a window or the app while a session runs a job,
+naming every busy pane once, and saves each window's frame and tab count for
+the next launch, one pane per tab (ADR 0031).
 
 ## Threading
 

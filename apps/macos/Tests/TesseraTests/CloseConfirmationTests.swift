@@ -66,7 +66,7 @@ final class CloseConfirmationTests: XCTestCase {
 
     func testClosingAnIdleShellDoesNotAsk() throws {
         let controller = try appDelegate.newWindow()
-        let session = controller.session
+        let session = controller.focusedPane.session
 
         controller.window?.performClose(nil)
 
@@ -96,14 +96,14 @@ final class CloseConfirmationTests: XCTestCase {
 
         sheet.answer(false)
         XCTAssertEqual(appDelegate.windowControllers.count, 2, "Cancel keeps the tab")
-        XCTAssertEqual(try busy.session.foregroundProcess()?.name, "sleep", "and its job")
+        XCTAssertEqual(try busy.focusedPane.session.foregroundProcess()?.name, "sleep", "and its job")
         XCTAssertNil(busy.pendingClose)
 
         windows[0].performClose(nil)
         XCTAssertEqual(presenter.sheets.count, 2, "asks again after Cancel")
         presenter.sheets[1].answer(true)
         XCTAssertFalse(appDelegate.windowControllers.contains { $0 === busy }, "Close closes the tab")
-        XCTAssertThrowsError(try busy.session.foregroundProcess()) {
+        XCTAssertThrowsError(try busy.focusedPane.session.foregroundProcess()) {
             XCTAssertEqual($0 as? TesseraCoreError, .sessionNotFound)
         }
         XCTAssertEqual(appDelegate.windowControllers.count, 1, "the other tab stays")
@@ -112,8 +112,8 @@ final class CloseConfirmationTests: XCTestCase {
     func testAfterTheJobEndsTheTabClosesWithoutAsking() async throws {
         let controller = try appDelegate.newWindow()
         try await start("sleep 100", in: controller)
-        try controller.session.write([0x03])
-        try await waitUntil("Ctrl-C ends sleep") { try controller.session.foregroundProcess() == nil }
+        try controller.focusedPane.session.write([0x03])
+        try await waitUntil("Ctrl-C ends sleep") { try controller.focusedPane.session.foregroundProcess() == nil }
 
         controller.window?.performClose(nil)
 
@@ -136,9 +136,9 @@ final class CloseConfirmationTests: XCTestCase {
         let script = dir.appendingPathComponent("run.sh")
         try "exec \"$(dirname \"$0\")\"/z*q\n".write(to: script, atomically: true, encoding: .utf8)
         let controller = try appDelegate.newWindow()
-        try controller.session.write(Array("sh \(script.path)\n".utf8))
+        try controller.focusedPane.session.write(Array("sh \(script.path)\n".utf8))
         let job = try await poll("the copied sleep runs") {
-            try controller.session.foregroundProcess().flatMap { $0.name.hasPrefix("z") ? $0 : nil }
+            try controller.focusedPane.session.foregroundProcess().flatMap { $0.name.hasPrefix("z") ? $0 : nil }
         }
         XCTAssertTrue(job.name.unicodeScalars.contains { $0.properties.generalCategory == .control }, job.name)
 
@@ -310,7 +310,7 @@ final class CloseConfirmationTests: XCTestCase {
         // As the router delivers a clean exit, in a pool of its own: the
         // test's own pool would keep what AppKit autoreleases until the
         // test ends.
-        autoreleasepool { weakController?.sessionDidExit(code: 0, signal: 0) }
+        autoreleasepool { weakController.map { $0.session($0.focusedPane.session, didExitWithCode: 0, signal: 0) } }
 
         XCTAssertTrue(appDelegate.windowControllers.isEmpty, "the tab closed")
         XCTAssertEqual(window?.sheets.count, 0, "its sheet ended")
@@ -335,12 +335,12 @@ final class CloseConfirmationTests: XCTestCase {
         XCTAssertNotNil(windows[0].attachedSheet, "the window asks on a sheet")
         XCTAssertEqual(asking.pendingClose, .window)
 
-        autoreleasepool { asking.sessionDidExit(code: 0, signal: 0) }
+        autoreleasepool { asking.session(asking.focusedPane.session, didExitWithCode: 0, signal: 0) }
 
         XCTAssertEqual(windows[0].sheets.count, 0, "the sheet ended")
         XCTAssertEqual(appDelegate.windowControllers.map(ObjectIdentifier.init), [ObjectIdentifier(busy)], "the busy tab stays")
         XCTAssertTrue(windows[1].isVisible)
-        XCTAssertEqual(try busy.session.foregroundProcess()?.name, "sleep", "and its job")
+        XCTAssertEqual(try busy.focusedPane.session.foregroundProcess()?.name, "sleep", "and its job")
         XCTAssertNil(busy.pendingClose)
         XCTAssertNil(asking.pendingClose, "the ended sheet asks no more")
     }
@@ -500,9 +500,9 @@ final class CloseConfirmationTests: XCTestCase {
     /// foreground.
     private func start(_ command: String, in controller: TerminalWindowController) async throws {
         let name = String(command.prefix { $0 != " " })
-        try controller.session.write(Array("\(command)\n".utf8))
+        try controller.focusedPane.session.write(Array("\(command)\n".utf8))
         _ = try await poll("\(name) runs in the foreground") {
-            try controller.session.foregroundProcess().flatMap { $0.name == name ? $0 : nil }
+            try controller.focusedPane.session.foregroundProcess().flatMap { $0.name == name ? $0 : nil }
         }
     }
 

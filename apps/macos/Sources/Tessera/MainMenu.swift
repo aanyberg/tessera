@@ -55,6 +55,7 @@ enum MainMenu {
             .keyEquivalentModifierMask = [.command, .shift]
         menu.addItem(.separator())
         menu.addItem(withTitle: "Clear to Start", action: #selector(TerminalSurfaceView.clearScrollback(_:)), keyEquivalent: "k")
+        PaneMenu.addItems(to: menu)
         return menu
     }
 

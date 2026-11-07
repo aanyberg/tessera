@@ -40,7 +40,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let log = Logger(subsystem: "com.aanyberg.tessera", category: "app")
 
     private var core: TesseraApp?
-    private let router = SessionRouter()
+    /// Internal so tests can see which sessions it routes.
+    let router = SessionRouter()
     private var terminationSignals: [any DispatchSourceSignal] = []
     /// Where the next standalone window's top-left corner goes.
     private var cascadePoint = NSPoint.zero
@@ -80,7 +81,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// windows are saved for the next launch.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if !terminatesWithoutConfirmation, let presenter = closeConfirmationPresenter,
-            let confirmation = CloseConfirmation(.quit, sessions: windowControllers.map(\.session)),
+            let confirmation = CloseConfirmation(.quit, sessions: windowControllers.flatMap(\.sessions)),
             !presenter.confirmQuit(confirmation)
         {
             return .terminateCancel
@@ -287,7 +288,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.delegate = self
         // Registered before the main actor can run the session's first
         // delivery, so no event is dropped.
-        router.register(controller)
+        router.register(controller, session: session)
         windowControllers.append(controller)
         scheduleWindowStateSave()
         return controller
@@ -300,7 +301,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return core
     }
 
-    private func presentOpenError(_ error: any Error) {
+    func presentOpenError(_ error: any Error) {
         presentError("Could not open a terminal", error)
     }
 
@@ -351,8 +352,23 @@ extension AppDelegate: TerminalWindowControllerDelegate {
         }
     }
 
+    func terminalWindowControllerSpawnSession(_ controller: TerminalWindowController) throws -> TesseraSession {
+        let core = try self.core ?? startCore()
+        let session = try core.spawn(spawnOptions)
+        // Registered before the main actor can run the session's first
+        // delivery, so no event is dropped.
+        router.register(controller, session: session)
+        return session
+    }
+
+    func terminalWindowController(_ controller: TerminalWindowController, didClosePaneWith session: TesseraSession) {
+        router.unregister(session)
+    }
+
     func terminalWindowControllerDidClose(_ controller: TerminalWindowController) {
-        router.unregister(controller.session)
+        for session in controller.sessions {
+            router.unregister(session)
+        }
         windowControllers.removeAll { $0 === controller }
         scheduleWindowStateSave()
     }
