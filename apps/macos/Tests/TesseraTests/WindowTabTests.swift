@@ -39,10 +39,10 @@ final class WindowTabTests: XCTestCase {
         XCTAssertEqual(window.subtitle, "")
         XCTAssertEqual(window.tabbingMode, .preferred)
         XCTAssertEqual(window.tabbingIdentifier, "com.aanyberg.tessera.terminal")
-        XCTAssertTrue(window.contentView === controller.contentView)
+        XCTAssertTrue(window.contentView === controller.paneContainer)
         // A live session accepts input and a resize.
-        XCTAssertNoThrow(try controller.session.write(Array("hello\n".utf8)))
-        XCTAssertNoThrow(try controller.session.resize(rows: 30, cols: 100))
+        XCTAssertNoThrow(try controller.focusedPane.session.write(Array("hello\n".utf8)))
+        XCTAssertNoThrow(try controller.focusedPane.session.resize(rows: 30, cols: 100))
     }
 
     func testNewWindowStandsAloneInItsOwnTabGroup() throws {
@@ -66,9 +66,9 @@ final class WindowTabTests: XCTestCase {
         let tab = try XCTUnwrap(second.window)
         XCTAssertEqual(tabs(of: window), [window, tab])
         XCTAssertTrue(window.tabGroup === tab.tabGroup)
-        XCTAssertNotEqual(first.session.id, second.session.id)
+        XCTAssertNotEqual(first.focusedPane.session.id, second.focusedPane.session.id)
         XCTAssertEqual(appDelegate.windowControllers.count, 2)
-        XCTAssertNoThrow(try second.session.resize(rows: 24, cols: 80))
+        XCTAssertNoThrow(try second.focusedPane.session.resize(rows: 24, cols: 80))
     }
 
     /// The core's `appearanceDidChange(opaque:)` reaches every tab through the
@@ -78,13 +78,13 @@ final class WindowTabTests: XCTestCase {
         let first = try appDelegate.newWindow()
         let second = try appDelegate.newTab(in: try XCTUnwrap(first.window))
         let controllers = [first, second]
-        let views = try controllers.map { try XCTUnwrap($0.contentView as? TerminalSurfaceView) }
+        let views = controllers.map { $0.focusedPane.view }
         guard views.allSatisfy(\.surface.isAttached) else {
             throw XCTSkip("the core could not attach a renderer to the views (no GPU can present, or no font)")
         }
         let router = SessionRouter()
         for controller in controllers {
-            router.register(controller)
+            router.register(controller, session: controller.focusedPane.session)
         }
         for view in views {
             view.occlusionOverride = false
@@ -97,9 +97,9 @@ final class WindowTabTests: XCTestCase {
         router.appearanceDidChange(opaque: false)
         for (controller, view) in zip(controllers, views) {
             let window = try XCTUnwrap(controller.window)
-            XCTAssertFalse(window.isOpaque, "tab \(controller.session.id) is translucent")
+            XCTAssertFalse(window.isOpaque, "tab \(controller.focusedPane.session.id) is translucent")
             XCTAssertEqual(window.backgroundColor, .clear)
-            XCTAssertFalse(view.isDisplayLinkPaused, "tab \(controller.session.id) redraws")
+            XCTAssertFalse(view.isDisplayLinkPaused, "tab \(controller.focusedPane.session.id) redraws")
             view.displayLinkDidFire()
         }
 
@@ -119,8 +119,8 @@ final class WindowTabTests: XCTestCase {
         let tab = try XCTUnwrap(added.window)
         XCTAssertEqual(appDelegate.windowControllers.count, 3)
         XCTAssertEqual(tabs(of: windows[0]), [windows[0], tab, windows[1]])
-        XCTAssertEqual(Set(appDelegate.windowControllers.map(\.session.id)).count, 3, "each tab has its own session")
-        XCTAssertNoThrow(try added.session.resize(rows: 24, cols: 80))
+        XCTAssertEqual(Set(appDelegate.windowControllers.map(\.focusedPane.session.id)).count, 3, "each tab has its own session")
+        XCTAssertNoThrow(try added.focusedPane.session.resize(rows: 24, cols: 80))
     }
 
     func testNewTabWithoutAWindowOpensAStandaloneWindow() throws {
@@ -182,7 +182,7 @@ final class WindowTabTests: XCTestCase {
     func testClosingATabClosesItsSessionAndForgetsTheController() throws {
         let windows = try openTabs(2)
         let controller = try XCTUnwrap(appDelegate.windowControllers.last)
-        let session = controller.session
+        let session = controller.focusedPane.session
 
         windows[1].performClose(nil)
 
@@ -200,7 +200,7 @@ final class WindowTabTests: XCTestCase {
         let closed = appDelegate.windowControllers.filter { controller in
             windows.contains { $0 === controller.window }
         }
-        let sessions = closed.map(\.session)
+        let sessions = closed.map(\.focusedPane.session)
         XCTAssertEqual(sessions.count, 3)
 
         closed[1].closeTabGroup(nil)
@@ -218,7 +218,7 @@ final class WindowTabTests: XCTestCase {
 
     func testClosingTheLastTabLeavesTheAppRunningWithNoWindows() async throws {
         let controller = try appDelegate.newWindow()
-        let session = controller.session
+        let session = controller.focusedPane.session
 
         controller.window?.performClose(nil)
 
@@ -244,7 +244,7 @@ final class WindowTabTests: XCTestCase {
         let first = try appDelegate.newWindow()
         appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-c", "exit 0"])
         let exiting = try appDelegate.newTab(in: first.window)
-        let session = exiting.session
+        let session = exiting.focusedPane.session
 
         try await waitUntil("the exited tab closes") {
             !self.appDelegate.windowControllers.contains { $0 === exiting }
@@ -260,7 +260,7 @@ final class WindowTabTests: XCTestCase {
         appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-c", "exit 3"])
         let controller = try appDelegate.newWindow()
 
-        let terminal = try XCTUnwrap(controller.contentView as? TerminalSurfaceView)
+        let terminal = controller.focusedPane.view
         try await waitUntil("the exit status shows") {
             terminal.status == "shell exited with code 3"
         }
@@ -272,7 +272,7 @@ final class WindowTabTests: XCTestCase {
         appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-c", "kill -KILL $$"])
         let controller = try appDelegate.newWindow()
 
-        let terminal = try XCTUnwrap(controller.contentView as? TerminalSurfaceView)
+        let terminal = controller.focusedPane.view
         try await waitUntil("the signal shows") {
             terminal.status == "shell killed by signal 9"
         }
@@ -284,9 +284,9 @@ final class WindowTabTests: XCTestCase {
     func testSessionTitleBecomesTheWindowTitle() throws {
         let controller = try appDelegate.newWindow()
 
-        controller.sessionDidSetTitle("vim notes.txt")
+        controller.session(controller.focusedPane.session, didSetTitle: "vim notes.txt")
         XCTAssertEqual(controller.window?.title, "vim notes.txt")
-        controller.sessionDidSetTitle("")
+        controller.session(controller.focusedPane.session, didSetTitle: "")
         XCTAssertEqual(controller.window?.title, "Terminal")
         XCTAssertEqual(controller.window?.subtitle, "")
     }

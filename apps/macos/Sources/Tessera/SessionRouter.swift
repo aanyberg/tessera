@@ -14,14 +14,14 @@ final class SessionRouter: TesseraAppDelegate {
         weak var controller: TerminalWindowController?
     }
 
-    /// Controllers by session id. Weak: the application delegate's registry
-    /// owns the controllers.
+    /// Controllers by session id: one entry per pane. Weak: the application
+    /// delegate's registry owns the controllers.
     private var controllers: [UInt64: WeakController] = [:]
     private var lastBeep: ContinuousClock.Instant?
 
-    /// Routes `controller.session`'s events to `controller`.
-    func register(_ controller: TerminalWindowController) {
-        controllers[controller.session.id] = WeakController(controller: controller)
+    /// Routes `session`'s events to `controller`, the tab whose pane runs it.
+    func register(_ controller: TerminalWindowController, session: TesseraSession) {
+        controllers[session.id] = WeakController(controller: controller)
     }
 
     /// Stops routing `session`'s events.
@@ -29,7 +29,7 @@ final class SessionRouter: TesseraAppDelegate {
         controllers[session.id] = nil
     }
 
-    /// The controller of the tab that runs `session`, if it is open.
+    /// The controller of the tab whose pane runs `session`, if it is open.
     func controller(for session: TesseraSession) -> TerminalWindowController? {
         controllers[session.id]?.controller
     }
@@ -37,11 +37,11 @@ final class SessionRouter: TesseraAppDelegate {
     // MARK: TesseraAppDelegate
 
     func sessionDidOutput(_ session: TesseraSession) {
-        controller(for: session)?.sessionDidOutput()
+        controller(for: session)?.sessionDidOutput(session)
     }
 
     func session(_ session: TesseraSession, didSetTitle title: String) {
-        controller(for: session)?.sessionDidSetTitle(title)
+        controller(for: session)?.session(session, didSetTitle: title)
     }
 
     func sessionDidRingBell(_ session: TesseraSession) {
@@ -54,13 +54,14 @@ final class SessionRouter: TesseraAppDelegate {
     }
 
     func session(_ session: TesseraSession, didExitWithCode code: Int32, signal: Int32) {
-        controller(for: session)?.sessionDidExit(code: code, signal: signal)
+        controller(for: session)?.session(session, didExitWithCode: code, signal: signal)
     }
 
-    /// The configuration or the theme in use changed: every tab follows.
+    /// The configuration or the theme in use changed: every pane of every
+    /// tab follows.
     func appearanceDidChange(opaque: Bool) {
-        for entry in controllers.values {
-            entry.controller?.contentView.applyLayerOpacity(opaque: opaque)
+        for (id, entry) in controllers {
+            entry.controller?.panes.first { $0.session.id == id }?.view.applyLayerOpacity(opaque: opaque)
         }
     }
 }

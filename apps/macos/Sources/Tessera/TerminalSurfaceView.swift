@@ -299,6 +299,13 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         layoutRenderViewAndScroller()
         window?.invalidateCursorRects(for: self)
         surfaceSizeChanged()
+        paneMinimumSizeDidChange()
+    }
+
+    /// This pane's smallest size depends on its cells and its scroll bar's
+    /// style (ADR 0035): the tab's pane container recomputes the window's.
+    private func paneMinimumSizeDidChange() {
+        (window?.contentView as? PaneContainerView)?.paneMinimumSizeDidChange()
     }
 
     // MARK: Window
@@ -766,15 +773,26 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
 
     override var acceptsFirstResponder: Bool { true }
 
+    /// Called after the view became the window's first responder: its tab
+    /// follows which pane has the keyboard (ADR 0035).
+    var didBecomeFirstResponder: (() -> Void)?
+
     override func becomeFirstResponder() -> Bool {
         isFocused = true
         sendFocus(window?.isKeyWindow ?? false)
+        didBecomeFirstResponder?()
         return true
     }
 
+    /// Another pane (or a sheet's field) took the keyboard: a composition
+    /// ends, and so does a gesture begun here, so that a release later
+    /// cannot finish it (a selection, or a Cmd-click on a link taken at the
+    /// press).
     override func resignFirstResponder() -> Bool {
         isFocused = false
         discardComposition()
+        autoscroller.stop()
+        gesture = nil
         sendFocus(false)
         return true
     }
@@ -785,19 +803,25 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     func windowKeyChanged(isKey: Bool) {
         if !isKey {
             discardComposition()
-            // A drag the window lost key status in goes on selecting only
-            // while it is delivered; the timer must not keep scrolling
-            // after it. The selection stays as it is.
+            // A gesture the window lost key status in ends: the timer must
+            // not keep scrolling, and a stray release later must not open
+            // the link taken at the press (#299.2). The selection stays as
+            // it is.
             autoscroller.stop()
+            gesture = nil
         }
         sendFocus(isKey && isFocused)
     }
 
     /// Another tab of the window's group was selected: AppKit sends a
-    /// button held meanwhile no release here, so the core gets it now.
+    /// button held meanwhile no release here, so the core gets it now, and
+    /// a local gesture ends with its autoscroller, so neither runs on in a
+    /// hidden tab (#289.2) nor opens a stale link later (#299.2).
     private func tabSelectionChanged() {
         guard let window, let selected = window.tabGroup?.selectedWindow, selected !== window else { return }
         releaseHeldButtons()
+        autoscroller.stop()
+        gesture = nil
     }
 
     /// Ends a composition without committing it (D5). The input context may
@@ -1611,6 +1635,11 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         } catch {
             metrics = nil
             reattachIfDropped(error, wasAttached: wasAttached)
+        }
+        if metrics?.cellWidthPx != previous?.cellWidthPx || metrics?.cellHeightPx != previous?.cellHeightPx
+            || metrics?.paddingPx != previous?.paddingPx || metrics?.scale != previous?.scale
+        {
+            paneMinimumSizeDidChange()
         }
         guard metrics != previous, hasMarkedText() else { return }
         updateMarkedTextLayer()

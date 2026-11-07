@@ -109,6 +109,15 @@ final class MainMenuTests: XCTestCase {
         Item(
             title: "Clear to Start", key: "k", modifiers: command,
             action: #selector(TerminalSurfaceView.clearScrollback(_:))),
+        // The pane items (ADR 0035; the submenu's in PaneTests).
+        .separator,
+        Item(
+            title: "Split Right", key: "d", modifiers: command,
+            action: #selector(TerminalWindowController.splitPaneRight(_:))),
+        Item(
+            title: "Split Below", key: "d", modifiers: [.command, .shift],
+            action: #selector(TerminalWindowController.splitPaneBelow(_:))),
+        Item(title: "Select Pane", action: #selector(NSMenu.submenuAction(_:))),
     ]
 
     private static let editItems: [Item] = [

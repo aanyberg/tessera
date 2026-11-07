@@ -52,7 +52,7 @@ final class TerminalScrollTests: XCTestCase {
             program: "/bin/sh",
             arguments: ["-c", "printf '\(modes)'; seq 1 \(lines); stty raw -echo; printf '\\n'; exec cat"])
         let controller = try appDelegate.newWindow()
-        view = try XCTUnwrap(controller.contentView as? TerminalSurfaceView)
+        view = controller.focusedPane.view
         window = KeyControlledWindow(contentRect: view.frame)
         window.contentView = view
         _ = window.makeFirstResponder(view)
