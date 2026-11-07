@@ -192,6 +192,7 @@ impl Handle {
             cols: 80,
             width_px: 0,
             height_px: 0,
+            profile: ptr::null(),
         };
         let mut id = 0;
         // SAFETY: live handle, valid options, writable id.

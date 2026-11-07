@@ -35,6 +35,7 @@ pub mod command;
 mod config_watch;
 pub mod input;
 mod mouse;
+mod profile;
 pub mod search;
 pub mod selection;
 pub mod session;
@@ -65,7 +66,9 @@ pub use tessera_search::{MAX_QUERY_BYTES, QueryError, QueryOptions};
 // alone, as the layering in `docs/architecture.md` requires.
 pub use config_watch::{CONFIG_DIR_POLL_INTERVAL, CONFIG_WATCH_STOP_CAP};
 pub use tessera_config::edit;
-pub use tessera_config::{Config, ConfigPaths, ConfigStore, ShellIntegration, WatchOptions};
+pub use tessera_config::{
+    Config, ConfigPaths, ConfigStore, MAX_PROFILE_NAME_LEN, ShellIntegration, WatchOptions,
+};
 pub use tessera_pty::{
     ExitStatus, ForegroundProcess, MAX_FOREGROUND_NAME_BYTES, Program, PtyError, PtySize,
     SpawnOptions,
@@ -216,7 +219,8 @@ pub struct ScrollPosition {
 pub struct App {
     /// The configuration in effect and the colours it resolved to; shared
     /// with the configuration watch's thread ([`App::start_config_watch`]).
-    /// Written only while `views` is held, like `theme`.
+    /// Written before the sessions' looks and then the views are updated,
+    /// with no other lock held; read on its own or while `views` is held.
     applied: Arc<Mutex<Applied>>,
     paths: ConfigPaths,
     sessions: Arc<Mutex<HashMap<SessionId, Arc<Session>>>>,
@@ -263,7 +267,9 @@ impl App {
         for warning in &colours.warnings {
             tracing::warn!(target: "tessera_app_core", "{warning}");
         }
-        let theme = Arc::new(Mutex::new(view::theme_for(&config, &colours.theme)));
+        let default_look =
+            config_watch::Looks::new(&paths.themes_dir(), &config, &colours.theme).default_look();
+        let theme = Arc::new(Mutex::new(default_look.theme));
         let bindings = Arc::new(Bindings::new(&config));
         Self {
             applied: Arc::new(Mutex::new(Applied {
@@ -273,6 +279,7 @@ impl App {
                     tessera_config::ThemeSource::User(path) => Some(path),
                     _ => None,
                 },
+                generation: 0,
             })),
             paths,
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -420,7 +427,38 @@ impl App {
     /// session thread (reader or input writer) cannot be created (the
     /// child is then hung up).
     pub fn spawn_session(&self, options: SpawnOptions) -> Result<SessionId> {
+        self.spawn_session_with_profile(options, None)
+    }
+
+    /// [`App::spawn_session`] with the `[[profiles]]` entry named
+    /// `profile`: `None` (or a name no profile has, with a warning) uses
+    /// `[general] default_profile`, and that failing the built-in profile
+    /// (`[appearance]`, the login shell); see
+    /// [`Config::resolve_profile`](tessera_config::Config::resolve_profile).
+    ///
+    /// When `options.program` is [`Program::LoginShell`] the profile's
+    /// `command` runs instead: a command without white space as a program
+    /// (looked up in `PATH`), any other through `/bin/sh -c`. When
+    /// `options.cwd` is `None` the session starts in the profile's
+    /// `working_directory`, `~` at its start being `$HOME`; one that is not
+    /// a directory gives the home directory, with a warning. The session
+    /// is drawn with the profile's appearance, followed through every
+    /// configuration applied later (#39).
+    ///
+    /// # Errors
+    ///
+    /// As for [`App::spawn_session`].
+    pub fn spawn_session_with_profile(
+        &self,
+        options: SpawnOptions,
+        profile: Option<&str>,
+    ) -> Result<SessionId> {
         session::check_size(options.size)?;
+        let resolved = self.config().resolve_profile(profile);
+        if let Some(warning) = &resolved.warning {
+            tracing::warn!(target: "tessera_app_core", "{warning}");
+        }
+        let options = profile::apply(options, &resolved);
         let id = self.allocate_id();
         let options = SpawnOptions {
             session_id: id.to_string(),
@@ -432,10 +470,12 @@ impl App {
             &self.paths.shell_integration_dir(),
         );
         let (pty, events) = NativePty::spawn(&options)?;
-        self.attach(id, Box::new(pty), events, options.size)
+        self.attach_with_profile(id, Box::new(pty), events, options.size, resolved.name)
     }
 
-    /// Registers an already spawned PTY as session `id`.
+    /// Registers an already spawned PTY as session `id`, of the built-in
+    /// profile.
+    #[cfg(any(test, feature = "test-hooks"))]
     fn attach(
         &self,
         id: SessionId,
@@ -443,14 +483,35 @@ impl App {
         events: PtyEvents,
         size: PtySize,
     ) -> Result<SessionId> {
-        // The configured cursor style (#113), theme colours (#10, read by
-        // `Session::start` from `applied`) and history size (#175) are the
+        self.attach_with_profile(id, pty, events, size, None)
+    }
+
+    /// Registers an already spawned PTY as session `id`, drawn with the
+    /// look of `profile` (`None`: the built-in profile).
+    fn attach_with_profile(
+        &self,
+        id: SessionId,
+        pty: Box<dyn Pty>,
+        events: PtyEvents,
+        size: PtySize,
+        profile: Option<String>,
+    ) -> Result<SessionId> {
+        // The configured cursor style (#113), theme colours (#10), both
+        // from the profile's look (#39), and history size (#175) are the
         // terminal's before its first byte. The history size applies to
         // sessions started after a change only (lead decision
         // D-SCROLLBACK-LIVE); it is capped like a loaded configuration's,
         // in case this one was built by hand.
-        let config = self.config();
-        let cursor = view::cursor_style_for(&config);
+        let (config, colours, generation) = {
+            let applied = lock(&self.applied);
+            (
+                Arc::clone(&applied.config),
+                applied.colours.clone(),
+                applied.generation,
+            )
+        };
+        let look = config_watch::Looks::new(&self.paths.themes_dir(), &config, &colours)
+            .of(profile.as_deref(), None);
         let scrollback = config
             .terminal
             .scrollback_lines
@@ -460,7 +521,7 @@ impl App {
             pty,
             events,
             size,
-            cursor,
+            (profile, (generation, Arc::new(look))),
             usize::try_from(scrollback).unwrap_or(usize::MAX),
             Arc::clone(&self.observers),
             Arc::clone(&self.applied),
@@ -469,14 +530,14 @@ impl App {
         .map_err(|source| Error::ReaderThread { id, source })?;
         let session = Arc::new(session);
         lock(&self.sessions).insert(id, Arc::clone(&session));
-        // A configuration applied while the session started set the new
-        // style and theme colours on the sessions it found, before this one
-        // was listed: read them again now that it is (`Live::apply` lists the sessions after
-        // it records the configuration). Read under the terminal lock, as
-        // `Live::apply` does (terminal, then `applied`; #168), so an apply
-        // racing this one cannot leave the session on an older style.
-        let live = self.live();
-        session.with_terminal_mut(|term| live.push_defaults(term));
+        // A configuration applied while the session started restyled the
+        // sessions it found, before this one was listed: resolve the look
+        // again now that it is (`Live::restyle` lists the sessions after it
+        // records the configuration). The terminal's defaults are read from
+        // the look under its lock, as `Live::restyle` does (terminal, then
+        // look; #168), so an apply racing this one cannot leave the session
+        // on an older style.
+        self.live().catch_up(&session);
         Ok(id)
     }
 
@@ -589,13 +650,9 @@ impl App {
     /// A resize to another number of rows or columns clears the selection
     /// (ADR 0025).
     pub fn resize(&self, id: SessionId, size: PtySize) -> Result<()> {
-        let session = self.session(id)?;
-        let before = session.with_terminal(|term| (term.grid().rows(), term.grid().cols()));
-        session.resize(size)?;
-        // A resize re-wraps the text under the selection (ADR 0025).
-        if before != (size.rows, size.cols) {
-            session.selection().clear();
-        }
+        // The session clears the selection on a size change, under the
+        // terminal lock of the re-wrap (ADR 0025, #284).
+        self.session(id)?.resize(size)?;
         Ok(())
     }
 
@@ -1656,7 +1713,9 @@ impl App {
         }
         let gpu;
         (gpu, retired) = self.gpu_for(instance, surface_of(&target))?;
-        let theme = lock(&self.theme).clone();
+        // The session's look, read under the views lock: an apply sets the
+        // looks before it updates the views under that lock (#39).
+        let theme = self.session(id)?.look().theme.clone();
         let fonts = self.fonts_for(&theme)?;
         let view = build(gpu, target, fonts, theme)?;
         let pty_size = view.pty_size();
@@ -1931,15 +1990,18 @@ impl App {
         Ok((gpu, retired))
     }
 
-    /// The process's font database, loaded for `theme`'s family if this is
-    /// the first view.
+    /// The process's font database, loaded at `theme`'s size if this is the
+    /// first view. Its family is `[appearance] font_family`, whichever
+    /// session's view comes first: the font is process-wide, so a profile's
+    /// family is not honoured (ADR 0037).
     fn fonts_for(&self, theme: &Theme) -> Result<Fonts> {
+        let family = self.config().appearance.font_family.clone();
         let mut slot = lock(&self.fonts);
         if let Some(fonts) = slot.as_ref() {
             return Ok(fonts.clone());
         }
         let fonts = Fonts::new(&FontConfig {
-            family: theme.font_family.clone(),
+            family,
             size_pt: theme.font_size,
             scale: 1.0,
             fallback: Vec::new(),
@@ -4828,6 +4890,42 @@ mod tests {
         // Output after the resize is anchored again.
         output(&fake, &events, b"a\r\nb\r\n");
         assert_eq!(app.scroll_offset(id).unwrap(), top - 28);
+    }
+
+    /// #284: a resize there and back that no frame sees in between, as
+    /// the configuration's apply thread does on a font size change and its
+    /// undo (`Session::resize`, not `App::resize`), clears the selection
+    /// rather than leaving it on other text after the re-wraps.
+    #[test]
+    fn a_session_resize_there_and_back_clears_the_selection() {
+        let app = app();
+        let id = app.spawn_test_session(PtySize::new(3, 8)).unwrap();
+        app.set_max_scrollback_for_test(id, 5).unwrap();
+        app.feed_for_test(
+            id,
+            "hellow0rde\u{301}w0rdw0rdab\r\naaaaaaaaaaaaaaaa e\u{301}\r\nhelloaaaaaaaaaaaaaaaaxyz  "
+                .as_bytes(),
+        )
+        .unwrap();
+        app.scroll_to(id, ScrollTarget::Offset(6)).unwrap();
+        app.select_begin(id, Point::new(0, 3), Granularity::Char, false)
+            .unwrap();
+        app.select_extend(id, Point::new(1, 2)).unwrap();
+        let original = app.selection_text(id).unwrap();
+        assert_eq!(original.as_deref(), Some("b\naaa"));
+        let session = app.session(id).unwrap();
+        session.resize(PtySize::new(5, 12)).unwrap();
+        session.resize(PtySize::new(3, 8)).unwrap();
+        let text = app.selection_text(id).unwrap();
+        assert_eq!(text, None, "the selection moved to {text:?}");
+        // A resize to the same size keeps it.
+        app.select_begin(id, Point::new(0, 0), Granularity::Char, false)
+            .unwrap();
+        app.select_extend(id, Point::new(0, 2)).unwrap();
+        let kept = app.selection_text(id).unwrap();
+        assert!(kept.is_some());
+        session.resize(PtySize::new(3, 8)).unwrap();
+        assert_eq!(app.selection_text(id).unwrap(), kept);
     }
 
     /// #175 item 2: a resize that leaves no history (every line fits on

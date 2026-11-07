@@ -42,7 +42,7 @@ Application-wide settings.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `confirm_close` | boolean | `true` | Confirm before closing a window with running jobs. |
-| `default_profile` | string | `"Default"` | Profile used for new sessions when none is specified. |
+| `default_profile` | string | `"Default"` | The `[[profiles]]` entry new tabs, windows and panes use when none is chosen (a pane split off another uses that pane's). When no profile has this name, the built-in one is used: `[appearance]` and the login shell (with a warning, unless the name is `"Default"`). |
 
 ## `[plugins]`
 
@@ -60,27 +60,26 @@ An array of tables: write one `[[profiles]]` block per entry. Default: `[]`.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `appearance` | table, optional | *unset* | Appearance overrides. See [`[profiles.appearance]`](#profilesappearance). |
-| `command` | string, optional | *unset* | Command to run; `None` means the user's login shell. |
-| `name` | string | `"Default"` | Display name, unique. |
-| `working_directory` | string, optional | *unset* | Starting directory; `None` means inherit. |
+| `appearance` | table, optional | *unset* | Appearance for this profile's sessions: each key set here replaces the one in `[appearance]`, each key left out follows `[appearance]` (also when it changes). In 0.1.0 a key left out here was reset to its built-in default instead (a profile that set only `font_size` also reset `theme`, `opacity` and the cursor). `dim_inactive_panes` cannot be set here (the window draws it): it is ignored with a warning. See [`[profiles.appearance]`](#profilesappearance). |
+| `command` | string, optional | *unset* | Command to run instead of the login shell: one program name or path runs directly (`"/opt/homebrew/bin/fish"`), anything with a space runs through `/bin/sh -c` (`"ssh build-box"`). Unset means the login shell. |
+| `name` | string | `"Default"` | Display name, shown in the menus. Should be unique: of two profiles with one name, the first is used and the second is reported with a warning. |
+| `working_directory` | string, optional | *unset* | Starting directory; `~` at the start is your home directory. A directory that does not exist falls back to your home directory with a warning. Used only when the session is not given a directory of its own; unset means your home directory. |
 
 ### `[profiles.appearance]`
 
-Appearance overrides.
+Appearance for this profile's sessions: each key set here replaces the one in `[appearance]`, each key left out follows `[appearance]` (also when it changes). In 0.1.0 a key left out here was reset to its built-in default instead (a profile that set only `font_size` also reset `theme`, `opacity` and the cursor). `dim_inactive_panes` cannot be set here (the window draws it): it is ignored with a warning.
 
 Optional table; *unset* by default. It belongs to the `[[profiles]]` entry it follows.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `blur` | boolean | `false` | Background blur when opacity is below 1.0. |
-| `cursor_blink` | boolean | `false` | Whether the cursor blinks, unless a program says otherwise (as for `cursor_shape`). tmux and vim turn blinking off on their own (`CSI ? 12 l`), so inside a running tmux a blinking cursor stays off until this is next changed. Changing it applies to open tabs, also where a program turned blinking on or off, but a program still running, such as tmux, may turn it off again. Recorded only for now: the cursor is drawn steady. A value that is not `true` or `false` is reported with a warning and the default is used. |
-| `cursor_shape` | one of `"block"`, `"underline"`, `"beam"` | `"block"` | The cursor's shape: `"block"`, `"underline"` or `"beam"` (a vertical bar), exactly as written here. A program may change it (DECSCUSR, `CSI Ps SP q`, as vim and fish do); it returns to this one when the program asks for the default or resets the terminal. Any other value is reported with a warning and the default is used. |
-| `dim_inactive_panes` | float | `0.0` | How much to darken the panes of a split tab that do not have the keyboard focus, from 0.0 (off) to 0.8, drawn as a black overlay of that opacity. A tab with one pane is never dimmed. A value outside the range is clamped (not a number means 0.0) with a warning. Applies to open windows when the file changes. Set it here only: in a profile's `appearance` it is ignored with a warning, since the window, not the session, draws it. |
-| `font_family` | string | `"Menlo"` | Font family. |
-| `font_size` | float | `13.0` | Font size in points, clamped on load to `4.0`..=`512.0`. |
-| `opacity` | float | `1.0` | Window opacity, 0.0..=1.0. |
-| `theme` | string | `"Tessera Dark"` | Colour theme, by name. Looked up first among the `*.toml` files in `themes/` next to this file (by file stem, then by the `name` key inside each file), then among the bundled themes: Tessera Dark, Tessera Light, Solarized Dark, Solarized Light, Dracula, Nord, Gruvbox Dark, One Dark, Tokyo Night and Catppuccin Mocha. Names match ignoring case, and any run of characters other than letters and digits counts as one separator, with `+` read as the word `plus`: `solarized-dark` and `SOLARIZED DARK` are Solarized Dark, `Dracula+` is `dracula-plus`, not Dracula, but `solarizeddark` is not Solarized Dark. A user file shadows a bundled theme of the same name. Unicode is not normalised, so an accented name matches only when typed in the same form (precomposed or combining) as the theme's. An unknown name falls back to Tessera Dark with a warning. |
+| `blur` | boolean, optional | *unset* | Background blur when opacity is below 1.0. |
+| `cursor_blink` | boolean, optional | *unset* | Whether the cursor blinks, as for `[appearance] cursor_blink`. A value that is not `true` or `false` is reported with a warning and `[appearance]`'s value is used. |
+| `cursor_shape` | one of `"block"`, `"underline"`, `"beam"` | *unset* | The cursor's shape, `"block"`, `"underline"` or `"beam"`, as for `[appearance] cursor_shape`. Any other value is reported with a warning and `[appearance]`'s shape is used. |
+| `font_family` | string, optional | *unset* | Font family. Not honoured per profile yet: the font is shared by every session, so only `[appearance] font_family` changes it. |
+| `font_size` | float, optional | *unset* | Font size in points, clamped on load as for `[appearance] font_size`. |
+| `opacity` | float, optional | *unset* | Background opacity of this profile's sessions, 0.0..=1.0. The app's windows are made translucent while any open session is, and stay opaque only while every one is; an opaque session still draws its own opaque background. |
+| `theme` | string, optional | *unset* | Colour theme, by name, looked up as for `[appearance] theme`. |
 
 ## `[terminal]`
 

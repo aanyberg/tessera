@@ -22,6 +22,15 @@ extension TesseraSession {
         /// Size of the view in pixels, or 0 when unknown.
         public var widthPx: UInt16
         public var heightPx: UInt16
+        /// The profile (a `[[profiles]]` entry's `name` in `config.toml`) the
+        /// session starts with, or `nil` for `[general] default_profile`. Its
+        /// `command` runs when ``program`` is `nil`, in its
+        /// `working_directory` when ``workingDirectory`` is `nil`, and the
+        /// session is drawn with its appearance. A name no profile has falls
+        /// back to the default profile. At most `TESSERA_MAX_PROFILE_NAME_LEN`
+        /// (128) bytes of UTF-8; a longer one fails the spawn with
+        /// ``TesseraCoreError/invalidArgument``.
+        public var profile: String?
 
         public init(
             program: String? = nil,
@@ -30,7 +39,8 @@ extension TesseraSession {
             rows: UInt16 = 24,
             cols: UInt16 = 80,
             widthPx: UInt16 = 0,
-            heightPx: UInt16 = 0
+            heightPx: UInt16 = 0,
+            profile: String? = nil
         ) {
             self.program = program
             self.arguments = arguments
@@ -39,6 +49,7 @@ extension TesseraSession {
             self.cols = cols
             self.widthPx = widthPx
             self.heightPx = heightPx
+            self.profile = profile
         }
 
         /// Calls `body` with the C options. Every pointer in them is valid only
@@ -49,7 +60,7 @@ extension TesseraSession {
         ///   NUL byte, which a C string cannot carry, or if `workingDirectory`
         ///   is not a file URL (its path would name nothing on disk).
         func withCOptions<R>(_ body: (inout TesseraSpawnOptions) -> R) throws -> R {
-            let strings = [program].compactMap { $0 } + arguments
+            let strings = [program, profile].compactMap { $0 } + arguments
             if strings.contains(where: { $0.utf8.contains(0) }) {
                 throw TesseraCoreError.invalidArgument
             }
@@ -57,20 +68,23 @@ extension TesseraSession {
                 throw TesseraCoreError.invalidArgument
             }
             return withOptionalCString(program) { programPointer in
-                withCStringArray(arguments) { argPointers in
-                    withOptionalFileSystemRepresentation(workingDirectory) { cwdPointer in
-                        argPointers.withUnsafeBufferPointer { args in
-                            var options = TesseraSpawnOptions(
-                                program: programPointer,
-                                args: args.baseAddress,
-                                arg_count: args.count,
-                                cwd: cwdPointer,
-                                rows: rows,
-                                cols: cols,
-                                width_px: widthPx,
-                                height_px: heightPx
-                            )
-                            return body(&options)
+                withOptionalCString(profile) { profilePointer in
+                    withCStringArray(arguments) { argPointers in
+                        withOptionalFileSystemRepresentation(workingDirectory) { cwdPointer in
+                            argPointers.withUnsafeBufferPointer { args in
+                                var options = TesseraSpawnOptions(
+                                    program: programPointer,
+                                    args: args.baseAddress,
+                                    arg_count: args.count,
+                                    cwd: cwdPointer,
+                                    rows: rows,
+                                    cols: cols,
+                                    width_px: widthPx,
+                                    height_px: heightPx,
+                                    profile: profilePointer
+                                )
+                                return body(&options)
+                            }
                         }
                     }
                 }

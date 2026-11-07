@@ -77,6 +77,7 @@ fn the_app_and_a_login_shell_stay_out_of_the_real_home() {
         cols: 80,
         width_px: 0,
         height_px: 0,
+        profile: ptr::null(),
     };
     let mut id = 0;
     // SAFETY: live handle; valid options; `id` is writable.

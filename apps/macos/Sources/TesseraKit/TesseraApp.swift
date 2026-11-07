@@ -178,6 +178,55 @@ public final class TesseraApp {
         try TesseraKeymap.read(core.pointer)
     }
 
+    /// The names of the configured profiles (`[[profiles]]` in
+    /// `config.toml`), in file order, as written: what ``TesseraSession/SpawnOptions/profile``
+    /// takes. Not sanitised; a menu shows them only after removing control
+    /// and bidirectional formatting characters. Read again after a
+    /// configuration is applied.
+    ///
+    /// - Throws: ``TesseraCoreError/nullPointer`` after ``shutdown()``, or
+    ///   ``TesseraCoreError/invalidArgument`` if the configuration could not
+    ///   be read or decoded.
+    public func profileNames() throws -> [String] {
+        struct Document: Decodable {
+            struct Config: Decodable {
+                struct Profile: Decodable { var name: String }
+                var profiles: [Profile]
+            }
+            var config: Config
+        }
+        let json = try Self.readJSON { buffer, capacity, length in
+            tessera_config_json(core.pointer, buffer, capacity, length)
+        }
+        do {
+            return try JSONDecoder().decode(Document.self, from: Data(json)).config.profiles.map(\.name)
+        } catch {
+            throw TesseraCoreError.invalidArgument
+        }
+    }
+
+    /// Reads a JSON buffer from a core call that reports its length and
+    /// refuses a short buffer with `TESSERA_ERROR_INVALID_ARGUMENT`: sized
+    /// by a probe, retried if it grew in between.
+    private static func readJSON(
+        _ call: (UnsafeMutablePointer<UInt8>?, Int, UnsafeMutablePointer<Int>) -> TesseraError
+    ) throws -> [UInt8] {
+        var length = 0
+        let probe = call(nil, 0, &length)
+        if probe != TESSERA_ERROR_INVALID_ARGUMENT {
+            try TesseraCoreError.check(probe)
+        }
+        for _ in 0..<3 {
+            var buffer = [UInt8](repeating: 0, count: length + 4096)
+            let capacity = buffer.count
+            let status = buffer.withUnsafeMutableBufferPointer { call($0.baseAddress, capacity, &length) }
+            if status == TESSERA_ERROR_INVALID_ARGUMENT { continue }
+            try TesseraCoreError.check(status)
+            return Array(buffer.prefix(length))
+        }
+        throw TesseraCoreError.invalidArgument
+    }
+
     /// `[appearance] dim_inactive_panes` in effect: how much to darken the
     /// panes of a split tab that do not have the focus, 0 (off) to 0.8,
     /// clamped by the core. Read again after a configuration is applied.

@@ -65,6 +65,7 @@ mod import;
 mod keys;
 mod load;
 mod paths;
+mod profile;
 mod store;
 mod theme;
 mod watch;
@@ -88,6 +89,9 @@ pub use load::{
     write_atomic, write_default_if_missing,
 };
 pub use paths::{APP_SUPPORT_DIR_NAME, CONFIG_FILE_NAME, ConfigPaths, SHELL_INTEGRATION_DIR_NAME};
+pub use profile::{
+    BUILT_IN_PROFILE_NAME, MAX_PROFILE_NAME_LEN, MAX_PROFILES, ProfileAppearance, ResolvedProfile,
+};
 pub use store::ConfigStore;
 pub use watch::{
     ConfigChanged, ConfigEvent, MAX_WATCH_DURATION, MIN_POLL_INTERVAL, WatchBackend, WatchGuard,
@@ -200,7 +204,10 @@ pub struct Config {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct General {
-    /// Profile used for new sessions when none is specified.
+    /// The `[[profiles]]` entry new tabs, windows and panes use when none
+    /// is chosen (a pane split off another uses that pane's). When no
+    /// profile has this name, the built-in one is used: `[appearance]` and
+    /// the login shell (with a warning, unless the name is `"Default"`).
     pub default_profile: String,
     /// Confirm before closing a window with running jobs.
     pub confirm_close: bool,
@@ -426,19 +433,35 @@ impl Default for Terminal {
     }
 }
 
-/// A named session profile.
+/// A named session profile: what a new tab, window or pane runs and
+/// looks like. Chosen from File > New Tab with Profile, or by
+/// `[general] default_profile`. At most 256 profiles are read and a name
+/// is at most 128 bytes (longer ones are cut, with a warning).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct Profile {
-    /// Display name, unique.
+    /// Display name, shown in the menus. Should be unique: of two
+    /// profiles with one name, the first is used and the second is
+    /// reported with a warning.
     pub name: String,
-    /// Command to run; `None` means the user's login shell.
+    /// Command to run instead of the login shell: one program name or
+    /// path runs directly (`"/opt/homebrew/bin/fish"`), anything with a
+    /// space runs through `/bin/sh -c` (`"ssh build-box"`). Unset means the
+    /// login shell.
     pub command: Option<String>,
-    /// Starting directory; `None` means inherit.
+    /// Starting directory; `~` at the start is your home directory. A
+    /// directory that does not exist falls back to your home directory
+    /// with a warning. Used only when the session is not given a
+    /// directory of its own; unset means your home directory.
     pub working_directory: Option<String>,
-    /// Appearance overrides.
-    pub appearance: Option<Appearance>,
+    /// Appearance for this profile's sessions: each key set here replaces
+    /// the one in `[appearance]`, each key left out follows `[appearance]`
+    /// (also when it changes). In 0.1.0 a key left out here was reset to
+    /// its built-in default instead (a profile that set only `font_size`
+    /// also reset `theme`, `opacity` and the cursor). `dim_inactive_panes` cannot be set
+    /// here (the window draws it): it is ignored with a warning.
+    pub appearance: Option<ProfileAppearance>,
 }
 
 impl Default for Profile {
