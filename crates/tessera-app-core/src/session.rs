@@ -82,6 +82,10 @@
 //! - Applying a cursor default reads the `App`'s configuration
 //!   (`Applied`) under the terminal lock (`Live::apply`, `App::attach`;
 //!   #168). Nothing takes a terminal lock while holding `Applied`.
+//! - The command log (`ShellReports::commands`, ADR 0039) is a leaf
+//!   taken alone: the reader thread takes it after a chunk's terminal
+//!   locks were released, a query after reading the line view under the
+//!   terminal lock and releasing it. Nothing is locked while it is held.
 //!
 //! Other input handling reads what it needs from
 //! the terminal (grid size, scrollback length) under the terminal lock,
@@ -105,11 +109,12 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, 
 use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
-use tessera_grid::Grid;
+use tessera_grid::{Grid, Mark};
 use tessera_pty::{ExitStatus, ForegroundProcess, Pty, PtyError, PtyEvent, PtyEvents, PtySize};
 use tessera_shell_integration::{Cwd, parse_osc7, parse_osc1337, scripts};
 use tessera_term::{Request, Terminal};
 
+use crate::commands::{self, CommandLog};
 use crate::config_watch::Applied;
 use crate::input::MouseEvent;
 use crate::mouse;
@@ -210,6 +215,22 @@ pub enum SessionEvent {
     /// The child exited. This is the last event of a session that was not
     /// closed by the application first.
     Exit(ExitStatus),
+    /// The shell reported that a command's output started (OSC 133 `C`,
+    /// ADR 0039). Carries no command text (ADR 0021). Internal to the
+    /// core: the FFI does not forward it. Reported at most once per chunk
+    /// of output (the marks are coalesced, S6).
+    CommandStarted,
+    /// The running command ended: the shell's `D` mark, or the next
+    /// prompt or output when it sent none (`exit_code` is then `None`,
+    /// unknown). `duration` runs from the core processing its `C` to
+    /// processing what ended it. Internal to the core, like
+    /// [`SessionEvent::CommandStarted`].
+    CommandFinished {
+        /// The `D` mark's exit status; `None` when it had none or none came.
+        exit_code: Option<i32>,
+        /// How long the command ran, as the core saw its marks arrive.
+        duration: Duration,
+    },
 }
 
 /// Receives [`SessionEvent`]s.
@@ -556,6 +577,9 @@ pub(crate) struct ShellReports {
     cwd: Mutex<Option<Cwd>>,
     /// Set once a version mismatch was logged: one warning per session.
     warned: AtomicBool,
+    /// The commands its OSC 133 marks reported (ADR 0039). A leaf lock
+    /// (see the module documentation).
+    commands: Mutex<CommandLog>,
 }
 
 impl ShellReports {
@@ -572,6 +596,24 @@ impl ShellReports {
     /// The working directory last reported, if any.
     pub(crate) fn cwd(&self) -> Option<Cwd> {
         lock(&self.cwd).clone()
+    }
+
+    /// The command log, locked: a leaf lock (see the module
+    /// documentation).
+    pub(crate) fn commands(&self) -> MutexGuard<'_, CommandLog> {
+        lock(&self.commands)
+    }
+
+    /// Applies a chunk's coalesced `marks` (`(mark, line, line epoch)`) to
+    /// the command log at one time, `now`, and returns the events they
+    /// made (at most two per mark), to deliver once the log is unlocked.
+    fn apply_marks(&self, marks: Vec<(Mark, u64, u64)>, now: Instant) -> Vec<SessionEvent> {
+        let mut events = Vec::new();
+        let mut log = self.commands();
+        for (mark, line, epoch) in marks {
+            log.apply(&mark, line, epoch, now, |event| events.push(event));
+        }
+        events
     }
 
     /// Checks an OSC 1337 handshake: a script speaking another protocol
@@ -1101,7 +1143,14 @@ impl Session {
             }
             drop(selection);
             let before = History::of(term.grid());
-            term.resize(size.rows, size.cols);
+            // The command log's lock is a leaf, released before the input
+            // state's is taken.
+            crate::commands::resize(
+                &mut self.reports.commands(),
+                &mut term,
+                size.rows,
+                size.cols,
+            );
             self.resizes.fetch_add(1, Ordering::Relaxed);
             let after = History::of(term.grid());
             // Terminal, then input state: the order every path that holds
@@ -1317,6 +1366,11 @@ impl Session {
     /// the offset changed. On the alternate screen there is nothing to
     /// scroll into and the view stays live.
     pub(crate) fn scroll_to(&self, target: ScrollTarget) -> bool {
+        match target {
+            ScrollTarget::PreviousPrompt => return commands::scroll_to_prompt(self, true),
+            ScrollTarget::NextPrompt => return commands::scroll_to_prompt(self, false),
+            _ => {}
+        }
         let (history, current, mut input) = self.scroll_state();
         let max = history.scrollable();
         let page = usize::from(history.rows.saturating_sub(1).max(1));
@@ -1326,10 +1380,54 @@ impl Session {
             ScrollTarget::PageUp => current.saturating_add(page).min(max),
             ScrollTarget::PageDown => current.saturating_sub(page),
             ScrollTarget::Offset(n) => n.min(max),
+            // Handled above.
+            ScrollTarget::PreviousPrompt | ScrollTarget::NextPrompt => current,
         };
         input.scroll = ScrollAnchor::at(offset, &history);
         input.scroll_remainder = 0.0;
         offset != current
+    }
+
+    /// Moves the view so line `line` (a [`Grid::scrollback_pushed`] plus
+    /// screen row id, ADR 0039) is its top row, clamped to the history, and
+    /// drops any banked fraction of a line; a line on the screen returns
+    /// the view to the live screen. Does nothing when the line ids are no
+    /// longer those of [`Terminal::line_epoch`] `epoch` (a resize came
+    /// between) or on the alternate screen. Returns whether the offset
+    /// changed.
+    pub(crate) fn scroll_to_line(&self, line: i64, epoch: u64) -> bool {
+        let term = self.term.lock();
+        if term.line_epoch() != epoch {
+            return false;
+        }
+        let history = History::of(term.grid());
+        // Terminal, then input, as `scroll_state` takes them.
+        let mut input = lock(&self.input);
+        drop(term);
+        let (current, _) = input.scroll.resolve(&history);
+        let pushed = i64::try_from(history.pushed).unwrap_or(i64::MAX);
+        let above = usize::try_from(pushed.saturating_sub(line)).unwrap_or(0);
+        let offset = above.min(history.scrollable());
+        input.scroll = ScrollAnchor::at(offset, &history);
+        input.scroll_remainder = 0.0;
+        offset != current
+    }
+
+    /// The session's shell integration reports, the command log among
+    /// them.
+    pub(crate) fn reports(&self) -> &ShellReports {
+        &self.reports
+    }
+
+    /// Feeds `bytes` to the terminal as the reader thread does a chunk of
+    /// output, applying its OSC 133 marks to the command log, but delivers
+    /// no event and drops the replies and other requests.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn feed_for_test(&self, bytes: &[u8]) {
+        let mut requests = advance_chunk(&self.term, bytes, |_| {});
+        let _ = self
+            .reports
+            .apply_marks(std::mem::take(&mut requests.marks), Instant::now());
     }
 
     /// Returns the view to the live screen, as typing does.
@@ -1739,17 +1837,30 @@ const ADVANCE_SLICE: usize = 4096;
 /// arrived among the other requests.
 #[derive(Debug, Default)]
 struct ChunkRequests {
-    /// Every request but the titles, in order.
+    /// Every request but the titles and marks, in order.
     requests: Vec<Request>,
     /// The chunk's last title and the number of `requests` made before it.
     title: Option<(usize, String)>,
+    /// The chunk's last OSC 133 mark of each kind, in the order those
+    /// arrived (S6: at most [`tessera_term::MAX_MARK_REQUESTS`]), with its
+    /// line and the [`Terminal::line_epoch`] that line id belongs to (the
+    /// lock is released between slices, so a resize may come between).
+    marks: Vec<(Mark, u64, u64)>,
 }
 
 impl ChunkRequests {
-    /// Adds `request`; a title replaces the chunk's previous title.
-    fn push(&mut self, request: Request) {
+    /// Adds `request`, made in line epoch `epoch`; a title replaces the
+    /// chunk's previous title, a mark the chunk's previous mark of its
+    /// kind.
+    fn push(&mut self, request: Request, epoch: u64) {
         match request {
             Request::SetTitle(title) => self.title = Some((self.requests.len(), title)),
+            Request::Mark { mark, line } => {
+                let kind = std::mem::discriminant(&mark);
+                self.marks
+                    .retain(|(other, _, _)| std::mem::discriminant(other) != kind);
+                self.marks.push((mark, line, epoch));
+            }
             other => self.requests.push(other),
         }
     }
@@ -1788,10 +1899,11 @@ fn advance_chunk(
         let mut locked = lock(&term.term);
         locked.advance(slice);
         let mut replies = Vec::new();
+        let epoch = locked.line_epoch();
         for request in locked.take_requests() {
             match request {
                 Request::Reply(bytes) => replies.extend_from_slice(&bytes),
-                other => requests.push(other),
+                other => requests.push(other, epoch),
             }
         }
         drop(locked);
@@ -1876,9 +1988,10 @@ impl Pump {
                     // Requests are collected in order and delivered after
                     // the chunk's one `Output`, so observers see no more
                     // callbacks than before.
-                    let requests = advance_chunk(&self.term, &bytes, |replies| {
+                    let mut requests = advance_chunk(&self.term, &bytes, |replies| {
                         self.outbox.try_queue_reply(self.id, replies);
                     });
+                    let marks = std::mem::take(&mut requests.marks);
                     self.deliver(SessionEvent::Output);
                     // Each clipboard write replaces the previous one: only
                     // the chunk's last reaches the observer, so a flood of
@@ -1907,6 +2020,13 @@ impl Pump {
                         // Replies were queued per slice.
                         _ => {}
                     });
+                    // One clock read per chunk; the log is unlocked before
+                    // the events are delivered.
+                    if !marks.is_empty() {
+                        for event in self.reports.apply_marks(marks, Instant::now()) {
+                            self.deliver(event);
+                        }
+                    }
                 }
                 PtyEvent::Exited(status) => {
                     self.deliver(SessionEvent::Exit(status));
@@ -3311,7 +3431,7 @@ pub(crate) mod tests {
         let order = |requests: Vec<Request>| {
             let mut chunk = ChunkRequests::default();
             for request in requests {
-                chunk.push(request);
+                chunk.push(request, 0);
             }
             let mut delivered = Vec::new();
             chunk.for_each(|request| delivered.push(request));

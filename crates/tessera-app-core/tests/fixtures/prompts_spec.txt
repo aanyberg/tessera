@@ -1,0 +1,627 @@
+# =============================================================================
+# T6 (#45a) prompt navigation, command records, select last command output
+# spec-researcher output 2026-11-06, copied verbatim; only the milestone lead edits it.
+# Rows are data for crates/tessera-app-core/tests/prompts.rs (layers N, R, S, E; R rows also run as unit tests in
+# src/commands.rs) and crates/tessera-term/tests/prompt_marks.rs (layer T, and the T part of T+N). Both test files
+# check that every row of their layers has a test.
+#
+# LEAD DECISIONS APPLIED (wave-13 D14, queue E6): every recommendation of the DECISIONS block at the end is adopted.
+# Records are metadata only; navigation and select read the grid marks. ⌘↑/⌘↓ fall back to Page Up/Down only when the
+# scrollback holds no PromptStart, decided in the core. "Equal across chunkings" applies to grid marks, not requests.
+#
+# SOURCE TAGS (fetched 2026-11-06)
+#   [BO]  Bothner, "semantic prompts" proposal (OSC 133). The gitlab.freedesktop.org page is behind Anubis and could not be
+#         fetched; its content is taken from [BO2], the Ghostty parser commits, the Elvish PR #1917 and ADR 0022/osc_spec.txt
+#         which already transcribe it. Treat [BO] rows marked (secondary) as UNVERIFIED against the primary text.
+#   [BO2] https://terminfo-dev.pages.dev/extensions/osc-133-semantic-prompts (A/B/C/D meaning, terminal support table)
+#   [IT]  iTerm2 escape codes https://iterm2.com/documentation-escape-codes.html : 133;A "just before start of shell
+#         prompt", B "just after the prompt ends, before the user-entered command", C "just before the command's output
+#         begins", D;[Ps] "end of a command; Ps = exit status 0-255; sent after B without a status it indicates an
+#         aborted command". 1337;SetMark = Set Mark (cmd-shift-M). The page says NOTHING about Select Output / Next Mark.
+#   [KT]  kitty/screen.c master (fetched, read in full for the functions below):
+#           shell_prompt_marking L3671  (A -> line_attrs.prompt_kind=PROMPT_START unless k=s/c/r; A calls
+#                                        mark_command_finished; C -> OUTPUT_START, command_state.running=true, started_at;
+#                                        D -> mark_command_finished, finished_at; marks are per cursor row)
+#           screen_history_scroll_to_prompt L3707 (scan from the TOP VISIBLE ROW, strictly beyond it, in the direction;
+#                                        found row becomes the top row: scrolled_by = -y, clamped to 0 for rows on the live
+#                                        screen; nothing found -> false and NO movement; refused on the alternate screen)
+#           find_cmd_output L5417, cmd_output L5565 (which=0 last run command: search upward from the cursor row for the
+#                                        nearest OUTPUT_START, end = the PROMPT_START below it; a command still running has
+#                                        no next prompt so its output runs to the cursor row; which=3 "last NON-EMPTY output")
+#           kitty docs https://sw.kovidgoyal.net/kitty/shell-integration/ : ctrl+shift+z / x = previous / next prompt,
+#           show_last_command_output (pager), mouse_select_command_output; "133;A", "133;A;k=s" for PS2, "133;C", "133;D;"
+#           (exit status optional), `redraw=0` = shell will not redraw the prompt on resize so do not erase it.
+#   [WZ]  WezTerm https://wezterm.org/config/lua/keyassignment/ScrollToPrompt.html : ScrollToPrompt(-1|1) moves one zone,
+#         "current zone" = the one closest to the TOP of the viewport; no default binding. Zones: Prompt, Input, Output.
+#   [VS]  VS Code https://code.visualstudio.com/docs/terminal/shell-integration : OSC 633 ; A (prompt start) B (prompt end)
+#         C (pre-execution) D[;exit] E;<cmdline>[;nonce] P;<Prop>=<Val>. Ctrl/Cmd+Up/Down = previous/next command,
+#         Shift+ = select from here to that command. VS Code also honours 1337;SetMark.
+#   [GH]  Ghostty release notes 1.3.0 / 1.3.1 (releasebot.io/updates/ghostty): 1.3.0 rewrote OSC 133 handling for jump_to_prompt,
+#         copy command output and resize at an active prompt; 1.3.1 fixed jump_to_prompt:next with MULTI-LINE prompts.
+#   [ADR] docs/adr/0022 (D-SECOND D-STRICT133 D-ALT D-DUP D-FRESH D-PENDING D-MARKPOS D-CLEAR-START): the grid already puts
+#         PromptStart / CommandStart / OutputStart / CommandEnd(exit) marks on lines, strict parse, k=s|c|r gives no mark,
+#         marks on the alt screen are dropped, one mark of each kind per line, marks follow text through reflow.
+#   [CODE] tessera-grid Grid::scrollback_pushed doc (grid.rs L492: NOT counted: rows a resize moves between screen and
+#         history), tessera-term osc.rs osc_mark L278, shell-integration/zsh|bash|fish scripts (what Tessera's own
+#         shells emit), tessera-app-core Session::scroll_to L1218 (offset = lines above the live screen).
+#   Not verifiable from docs (no source found, marked UNVERIFIED in rows): iTerm2 and Terminal.app placement of the target mark
+#   in the view, Ghostty placement, what iTerm2 selects for a command with no output.
+#
+# MODEL (what the rows assume; lead may override via the DECISIONS block at the end)
+#   Line id (abs): abs(scrollback index i) = pushed - scrollback_len + i ; abs(screen row r) = pushed + r, where pushed is
+#     Grid::scrollback_pushed(). Valid until the next resize (rows moved between screen and history are not counted).
+#   Request::Mark { mark: Mark, line: u64 } carries the abs id computed WHEN THE SEQUENCE IS PARSED (not at chunk end).
+#   Coalescing (S6): within ONE Terminal::advance call, only the LAST mark of each kind (A, B, C, D) is emitted, in the
+#     order those last occurrences arrived. At most 4 requests per advance, whatever the input.
+#   Records ring (core, per session, MAX_COMMAND_RECORDS = 1000): Record {
+#     prompt_line: Option<u64>, input_line: Option<u64>, output_line: Option<u64>, end_line: Option<u64>,
+#     started: Option<Instant> (time C was processed), finished: Option<Instant> (time D, or the next A, was processed),
+#     exit: Option<i32>, state: Pending|Running|Finished, epoch: u32 (bumped by every resize) }.
+#   Navigation and select read the GRID's marks (they follow text through reflow and leave with their lines);
+#     records are metadata (exit, timing) looked up by line id; they never decide where navigation goes.
+#   Offsets: offset = lines above the live screen (0 = live). top_index = scrollback_len - offset is the logical index of the
+#     top visible row. max_offset = scrollback_len.
+#
+# ROW FORMAT
+#   ### ID
+#   layer: R (record state machine) | T (term bytes -> requests) | N (navigation) | S (select output) | E (eviction, ring, reflow)
+#   cite:  sources (tags above)    note: reasoning    flags: ambiguity|security|perf|decision
+#   in:/buffer:/view:/expect: layer-specific; time is fake-clock milliseconds, lines are abs ids.
+#   Buffer notation:  `idx | text | marks` ; marks: A=PromptStart B=CommandStart C=OutputStart D(n)=CommandEnd(Some n)
+#   D()=CommandEnd(None). Order inside a row = Line::marks order.
+# =============================================================================
+
+# ---------------------------------------------------------------------------- BASE BUFFER B1 (used by N and S rows)
+# zsh-style marks as Tessera's own script emits them (D;status then A then B share the next prompt's row; C is on the first
+# output row because zsh/bash/fish print it after the newline that accepted the line).
+#   screen rows = 4, scrollback_len = 5, total = 9, max_offset = 5, pushed = 5 (so abs id = idx)
+#   idx | text        | marks
+#    0  | $ ls        | A B                 prompt of command #1
+#    1  | a.txt       | C                   output of #1 (2 rows)
+#    2  | b.txt       |
+#    3  | $ pwd       | D(0) A B            command #1 ended 0; prompt of #2
+#    4  | /tmp        | C
+#    5  | $ false     | D(0) A B            screen row 0
+#    6  | $ echo hi   | C D(1) A B          `false` printed nothing: C, its D and the next A share one row
+#    7  | hi          | C
+#    8  | $           | D(0) A B            live prompt, cursor here (screen row 3)
+#   prompt rows (PromptStart): 0 3 5 6 8.  Finished commands: #1 ls (out 1..2, exit 0), #2 pwd (out 4, exit 0),
+#   #3 false (no output, exit 1), #4 echo hi (out 7, exit 0).
+
+### N01_prev_from_live_screen
+layer: N
+buffer: B1
+view: offset 0 (top_index 5)
+action: PreviousPrompt
+expect: moved=true offset=2 (prompt idx 3 becomes the top row)
+cite: [KT] screen_history_scroll_to_prompt (scan strictly above the top visible row; scrolled_by = -y); [WZ] "closest to the top of the viewport"
+note: idx 5 is the top row itself and is NOT the target (strictly above). Placement: prompt row at the TOP of the view (kitty verified; iTerm2, Ghostty, Terminal.app UNVERIFIED).
+
+### N02_prev_again
+layer: N
+buffer: B1
+view: offset 2 (top_index 3)
+action: PreviousPrompt
+expect: moved=true offset=5 (idx 0 at top)
+cite: [KT] same
+
+### N03_prev_at_oldest_stops
+layer: N
+buffer: B1
+view: offset 5 (top_index 0)
+action: PreviousPrompt
+expect: moved=false offset=5; NO fallback to Page Up
+cite: [KT] ensure_y_ok -> return false; brief done-when "stops at the oldest/newest prompt"
+note: the D4 fallback to Page Up is decided by "the session holds no prompt mark", never by the scroll returning false (rows N20-N22).
+flags: decision D-FALLBACK
+
+### N04_next_from_oldest
+layer: N
+buffer: B1
+view: offset 5 (top_index 0)
+action: NextPrompt
+expect: moved=true offset=2
+cite: [KT]
+
+### N05_next_lands_on_live_screen
+layer: N
+buffer: B1
+view: offset 2 (top_index 3)
+action: NextPrompt
+expect: moved=true offset=0 (next prompt idx 5 is a screen row: view returns to the live screen)
+cite: [KT] "self->scrolled_by = y >= 0 ? 0 : -y"
+
+### N06_next_at_live_screen_is_noop
+layer: N
+buffer: B1
+view: offset 0 (top_index 5; prompts 6 and 8 are below the top row but on screen)
+action: NextPrompt
+expect: moved=false offset=0
+cite: [KT] same clamp; D4 (no Page Down fallback because marks exist)
+flags: decision D-FALLBACK
+
+### N07_next_with_no_prompt_below_but_scrolled_up
+layer: N
+buffer: B1 with the live prompt row 8 and 6 stripped of PromptStart (only prompts 0 3 5), view offset 3 (top_index 2)
+action: NextPrompt
+expect: RECOMMENDED moved=true offset=0 (nothing newer than the top row: go to the live screen)
+cite: kitty returns false here (ensure_y_ok), iTerm2/Terminal.app UNVERIFIED
+note: Artificial buffer (a live prompt normally exists). Kept because a running full-screen-less program (`tail -f`) leaves the newest prompt in scrollback: ⌘↓ should end at the live output, not do nothing.
+flags: decision D-NEXT-END
+
+### N08_multi_step_walk_is_symmetric
+layer: N
+buffer: B1
+action: from offset 0 do PreviousPrompt x2 then NextPrompt x2
+expect: offsets 0 -> 2 -> 5 -> 2 -> 0
+cite: [KT]
+
+### N09_wrapped_prompt_counts_once
+layer: N
+buffer: two rows idx 10 and 11 both carrying PromptStart where row 10 has wrapped=true (a prompt longer than the width, or a redraw after resize), top_index 20
+action: PreviousPrompt twice
+expect: RECOMMENDED one stop for the pair, at idx 10; the next PreviousPrompt goes to the prompt above idx 10
+cite: [GH] 1.3.1 "jump_to_prompt:next now handles multiline prompts correctly"; [KT] find_cmd_output "skip fetching wrapped prompt lines"
+note: Tessera's zsh/bash/fish scripts emit A once per prompt (A is not repeated on PS1's second line), so this only matters for redrawn prompts. A stop on each of two adjacent rows is the visible bug Ghostty fixed.
+flags: ambiguity
+
+### N10_ps2_never_stops
+layer: T+N
+in: `\x1b]133;A\x07$ \x1b]133;B\x07for x in 1; do\r\n\x1b]133;A;k=s\x07> \x1b]133;B\x07echo $x; done\r\n\x1b]133;C\x07`
+expect: grid marks: row0=[PromptStart,CommandStart] row1=[CommandStart] row2=[OutputStart]; prompt stops: only row 0
+cite: [ADR] D-SECOND ("A;k=s gives no mark"); kitty zsh script sends 133;A;k=s for PS2 [KT docs]; osc_spec.txt M-rows
+note: the B after a k=s A still lands on row 1 (strict parse keeps B); it is not a prompt stop. fish sends `A;special_key=1` (kitty): the strict parser accepts it as PromptStart. Tessera's own fish script does not send it.
+
+### N11_alt_screen_refuses
+layer: N
+buffer: B1 on the main screen, then ESC[?1049h (vim)
+action: PreviousPrompt / NextPrompt / SelectCommandOutput
+expect: moved=false, no selection, no panic, no change to the stashed main screen's offset
+cite: [KT] "if (self->linebuf != self->main_linebuf) return false"; [ADR] D-ALT
+note: with the alt screen active ⌘↑ must still follow D4 on the ALT screen's own scrollback? The alt screen has no scrollback: Page Up is a no-op. Recommend: both commands are no-ops (return false) on the alt screen, apps get the key via the normal key path when they enable application keys (T2 decides).
+flags: decision D-ALT-NAV
+
+### N12_marks_set_on_alt_screen_are_dropped
+layer: T
+in: `\x1b[?1049h\x1b]133;A\x07\x1b]133;C\x07\x1b]133;D;0\x07\x1b[?1049l`
+expect: requests=[] (no Request::Mark), main-screen marks unchanged
+cite: [ADR] D-ALT, osc.rs osc_mark (`is_alt_screen` -> ignored)
+note: Request::Mark must be emitted from the same branch that sets the mark, never before the alt check.
+
+### N13_scan_cap
+layer: N
+buffer: scrollback_lines = 2_000_000 (config max is 10_000_000), PromptStart only on idx 0, no marks on the other lines, view at offset 0
+action: PreviousPrompt
+expect: moved=false, the scan examined at most MAX_PROMPT_SCAN_LINES = 1_000_000 lines (assert by a counter or a time bound), view unchanged, NO Page Up fallback
+cite: brief S5 "prompt scan per call <= MAX_PROMPT_SCAN_LINES = 1_000_000"; Terminal::MAX_SCROLLBACK_LINES = 10_000_000 (tessera-config lib.rs L348)
+note: the cap bounds the work under the terminal lock per call (S6 spirit); the scan must not hold the lock across the whole range, or must be chunked. Also test the same buffer with the prompt at idx 1_999_990 (inside the cap): found.
+flags: security perf
+
+### N14_no_marks_falls_back_to_page_keys
+layer: N
+buffer: 100 plain lines of scrollback (no PromptStart anywhere in scrollback), view offset 0, rows 24
+action: key ⌘↑ (D4 route)
+expect: behaves as PageUp: offset = 23
+cite: brief D4
+flags: decision D-FALLBACK
+
+### N15_marks_only_on_screen_falls_back
+layer: N
+buffer: 100 plain scrollback lines, the live prompt on screen carries PromptStart
+action: ⌘↑
+expect: RECOMMENDED PageUp (offset 23). Predicate = "a PromptStart exists in the SCROLLBACK" (D4 wording), not "anywhere".
+cite: brief D4 ("the session's scrollback holds a prompt mark")
+note: with the "anywhere" predicate ⌘↑ would do nothing and the user could never page into pre-integration history (motd, output before the shell loaded the script).
+flags: decision D-FALLBACK
+
+### N16_marks_exist_above_but_view_above_all_of_them
+layer: N
+buffer: 50 plain lines (idx 0..49) then B1-style prompts from idx 50; view at offset max (top_index 0)
+action: ⌘↑
+expect: moved=false (stops: the scroll returns false, the D4 rule does NOT turn it into Page Up because scrollback holds marks)
+cite: brief "stops at the oldest/newest prompt"
+note: consequence: history older than the oldest prompt is reachable by Page Up / Home but not by ⌘↑. Same as kitty.
+flags: decision D-FALLBACK
+
+### N17_next_fallback
+layer: N
+buffer: no PromptStart in scrollback, offset 40
+action: ⌘↓
+expect: PageDown: offset 40 - 23 = 17
+cite: brief D4
+
+### N18_clear_history_removes_marks_and_fallback_returns
+layer: N+E
+buffer: B1, then ED 3 (history cleared) so only screen rows 5..8 remain
+action: ⌘↑
+expect: scrollback holds no PromptStart -> PageUp semantics -> moved=false only because history is empty
+cite: [CODE] clear_scrollback bumps history_clear_generation; brief D4
+
+### N19_nav_does_not_hold_lock_longer_than_a_snapshot
+layer: N
+action: PreviousPrompt over a 1_000_000 line scrollback with marks only at idx 0
+expect: terminal lock held <= 1 snapshot-capture time (release-mode test) or scan done in lock-sized chunks (<= 256 lines per hold like search_step)
+cite: brief S6; wave-13 D6 (search_step 256 lines per lock) as precedent
+flags: perf decision D-SCAN-LOCK
+
+# ---------------------------------------------------------------------------- R. record state machine (fake clock)
+# in: list of `t=<ms> <Mark>@<line>`; Marks as Request::Mark carries them. expect: records (oldest first) + events.
+# Event names: CommandStarted{line,t}  CommandFinished{exit,duration_ms,t}
+
+### R01_full_cycle
+layer: R
+in: t=0 A@10; t=0 B@10; t=100 C@11; t=350 D(0)@13; t=350 A@13
+expect: records=[{prompt 10, input 10, output 11, end 13, started 100, finished 350, exit Some(0), Finished}] + a new Pending record {prompt 13}
+events: CommandStarted@100 ; CommandFinished{exit Some(0), duration 250}@350
+cite: [KT] shell_prompt_marking C/D; [IT] A-D; zsh script L100-L135 (D;status then A in one precmd)
+note: duration = finished - started (C to D), not prompt-to-D: matches kitty command_state started_at/finished_at. A new Pending record is NOT counted by records().len() until it has a C (see R05).
+
+### R02_exit_codes
+layer: R
+in (each a separate session): C then D forms
+  D          -> exit None, state Finished           (zsh bare D, [IT] "D without status")
+  D;0        -> Some(0)    D;1 -> Some(1)   D;130 -> Some(130)   D;255 -> Some(255)
+  D;-1       -> Some(-1)   D;+3 -> Some(3)  (Mark::from_osc133 P133-05..07)
+  D;         -> None       D;abc -> None    D;0;aid=1 -> Some(0)    D;;aid=1 -> None
+  D;99999999999 -> None (does not fit i32)
+cite: [IT] "Ps 0-255"; [CODE] Mark::from_osc133 (i32::parse, later options ignored); kitty keeps the status as an unparsed string
+note: Record.exit is Option<i32>; success = Some(0). "unknown" (None) is NOT failure and NOT success: the gutter (T14) must draw it neutral.
+flags: decision D-EXIT-NONE
+
+### R03_missing_D_closed_by_next_A
+layer: R
+in: t=0 A@0; t=10 C@1; t=900 A@5   (no D: the shell died, a script ran `exec`, or a program swallowed the D)
+expect: record finished, exit None, finished 900, end_line 5; event CommandFinished{exit None, duration 890}@900; new Pending record prompt 5
+cite: [KT] shell_prompt_marking case 'A' calls mark_command_finished; [IT] "D after B without status = aborted"
+note: Alternative (rejected): leave Running forever, which would make 'select last output' include later prompts' text and the gutter show a spinner indefinitely.
+flags: decision D-MISSING-D
+
+### R04_C_without_A
+layer: R
+in: t=0 C@4; t=50 D(2)@6   (shell that only sends C/D, e.g. a minimal bash hook)
+expect: record {prompt None, input None, output 4, end 6, started 0, finished 50, exit Some(2)}
+cite: [KT] kitty sets OUTPUT_START independent of PROMPT_START (find_cmd_output "find around" handles output without prompt)
+note: navigation has no stop for this command (no PromptStart); select-output still works from the grid's OutputStart.
+
+### R05_D_without_C_is_ignored_by_records
+layer: R
+in: t=0 A@0; t=1 B@0; t=2 D@1   (zsh: empty Enter or Ctrl-C at the prompt; Tessera's zsh script sends a bare D before the next A)  then t=2 A@1
+expect: NO record created for the abandoned prompt, no CommandStarted/CommandFinished event; the second A replaces the Pending prompt (prompt_line 1)
+cite: shell-integration/zsh/tessera-integration _tessera_si_precmd (state 2 -> bare `D`); fish `fish_cancel` -> D then A; [KT] same code path sets only finished_at
+note: records.len() counts commands that reached C. The grid still holds CommandEnd(None) and PromptStart marks for these rows (nav stops there: an empty prompt is a prompt).
+
+### R06_A_redraw_before_C
+layer: R
+in: t=0 A@10; t=0 B@10; t=500 A@30; t=500 B@30   (prompt redrawn after a resize/reset-prompt, new row)
+expect: ONE Pending record with prompt_line 30, input_line 30
+cite: [KT] redraw semantics (`redraw=0` documented); zsh script redraws marks with PS1 (reset-prompt, SIGWINCH)
+note: the grid may still carry PromptStart on abs 10 (the shell may not erase it): nav stops at both. Acceptable; the record keeps the newest.
+
+### R07_secondary_prompt_changes_nothing
+layer: R
+in: t=0 A@0; t=0 B@0; t=5 (A;k=s parses to no mark: NO Request); t=20 C@2
+expect: record {prompt 0, input 0, output 2}; the k=s A produced no Request and did not reset the Pending record
+cite: [ADR] D-SECOND; [KT] parse_prompt_mark pk != PROMPT_START skips mark_command_finished
+
+### R08_B_edge_cases
+layer: R
+in: (a) B with no Pending record; (b) B after C; (c) two B in one prompt
+expect: (a) ignored (no record created); (b) ignored (input_line only set while Pending and not yet set... first B wins? RECOMMEND last B before C wins: the shell re-prints B after a redraw); (c) last B before C wins
+cite: [KT] ignores B entirely ("kitty doesn't use B prompt marking" in its zsh script); [IT] B = "just after the prompt ends"
+flags: ambiguity
+
+### R09_aid_ignored_nested_shells
+layer: R
+in: outer shell: t=0 A;aid=100@0 ; t=1 C@1 (runs `bash`) ; inner shell: t=50 A;aid=200@2 ; t=60 C@3 ; t=70 D(0);aid=200@4 ; t=70 A;aid=200@4 ; ... inner exits ; t=900 D(0);aid=100@10 ; A;aid=100@10
+expect with aid ignored (RECOMMENDED): at t=50 outer record closed Finished exit None (R03); inner record ok; at t=900 D has no Running record -> ignored (R05) . navigation unaffected (grid marks).
+cite: Elvish PR #1917 / Ghostty parser: "aid ... usually a process ID, useful for nested shell tracking"; [BO2]; Tessera scripts never send aid
+note: Accepting inaccurate exit/duration for the outer `bash`/`ssh` record is the cost of ignoring aid. An aid-aware implementation would keep a stack per aid; recommended out of scope for 0.2 (record in ADR 0039 as future).
+flags: decision D-AID
+
+### R10_clock_and_ordering
+layer: R
+in: marks processed with a fake clock that goes t=100, t=100, t=100 (same chunk)
+expect: duration 0 (finished >= started always, saturating_sub); no panic; CommandFinished still emitted
+cite: S1/S2 (nothing replied); std Instant monotonic
+note: timestamps are the time the CORE processed the request (Instant::now at dispatch), not the time the bytes were produced; a pipelined `true; true; true` pasted at once can land in one chunk and yields 4 coalesced marks (R14): the intermediate commands get NO record. Accepted: navigation reads the grid, so no prompt stop is lost; only exit/duration of those commands.
+flags: decision D-COALESCE
+
+### R11_events_internal_only
+layer: R
+expect: SessionEvent::CommandStarted / CommandFinished are internal (no plugin fan-out, #48 unmet). Event payload carries no command text (no cmdline: the user's data, ADR 0021; do NOT parse kitty `C;cmdline=` / VS Code `E;`).
+cite: brief; shell-integration/zsh L120-L125 ("No `cmdline=`: the command line is the user's data"); [VS] 633;E nonce exists precisely because the command line can be spoofed
+flags: security S3
+
+### R12_record_fields_after_reflow
+layer: R+E
+in: R01 then a resize (any size change)
+expect: record still present with exit Some(0) / started / finished; command_at(row) for any row returns None for records with epoch != current; new commands after the resize resolve normally
+cite: brief T14 body "unknown after a reflow, as ADR 0039 says"; [CODE] scrollback_pushed excludes resize moves
+
+# ---------------------------------------------------------------------------- T. term layer: bytes -> Request::Mark
+# size 5x20 unless stated; `requests:` lists Request::Mark{mark,line}; line = pushed + cursor row at parse time.
+
+### T01_basic_cycle_one_chunk_is_coalesced
+layer: T
+size: 5x20
+step: feed `\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07`   (ONE advance call)
+expect requests (the LAST of each kind, ordered by when that last one arrived): [Mark(OutputStart)@1, Mark(CommandEnd(Some(0)))@2, Mark(PromptStart)@2, Mark(CommandStart)@2]
+expect grid marks: r0=[PromptStart,CommandStart] r1=[OutputStart] r2=[CommandEnd(0),PromptStart,CommandStart]  (osc_spec.txt M04)
+cite: osc_spec.txt M04; brief D8/S6
+note: the first A@0 and B@0 are coalesced away: the core never learns row 0 had a prompt. Navigation is unaffected (grid). The record for this command is therefore built from C@1/D@2 only: prompt_line None. This is why records must not drive navigation, and why 'select output' reads the grid.
+flags: decision D-COALESCE
+
+### T02_basic_cycle_bytewise
+layer: T
+step: same bytes, fed one byte per advance call
+expect requests (6, one per sequence, arrival order): A@0 B@0 C@1 D(Some(0))@2 A@2 B@2, grid marks identical to T01
+cite: brief done-when (split at every byte); osc_spec.txt M04b
+note: requests differ between T01 and T02 BY DESIGN (coalescing is per advance). Harness: compare grid marks across all chunkings; compare requests only for chunkings with ≤1 sequence of each kind per advance. The osc_spec.txt rule "results equal across chunkings" does not apply to `requests`.
+
+### T03_flood_100000_sequences
+layer: T
+size: 24x80
+step: ONE advance of 100000 x `\x1b]133;A\x07` (700 KB)
+expect requests: exactly 1: Mark(PromptStart) with line = the last A's line; grid: set_mark ran 100000 times, one PromptStart per line (D-DUP) ; terminal lock hold <= main ±10%
+cite: brief S6 "100 000 OSC 133 sequences yields at most 4 Request::Mark"
+flags: security perf
+
+### T04_flood_all_kinds
+layer: T
+step: ONE advance of 25000 x (`\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;1\x07`)
+expect requests: exactly 4 (one per kind), D with exit Some(1); take_requests().len() <= 4
+cite: brief S6
+flags: security
+
+### T05_flood_with_scrolling_lines_are_per_mark
+layer: T
+size: 5x20
+step: ONE advance of `\x1b]133;A\x07` + `\n` x 50 + `\x1b]133;A\x07`
+expect requests: 1: Mark(PromptStart) with line = pushed_after + 4 (the LAST A, at the bottom row) ; not the first A's line
+cite: model: line computed at parse time
+note: guards the bug where the line is read from the cursor at chunk end.
+
+### T06_coalesce_keeps_arrival_order_of_last_occurrences
+layer: T
+step: ONE advance of `A B A C` (A@0 B@0 A@1 C@2 via newlines)
+expect requests: [Mark(CommandStart)@0, Mark(PromptStart)@1, Mark(OutputStart)@2]
+note: B arrived before the last A: order is by last occurrence. The core must accept B before A (input_line < prompt_line is possible after coalescing): R-layer must not panic or index by order; it should drop a B/C/D whose line is older than the Pending record's prompt_line.
+flags: ambiguity
+
+### T07_non_marks_emit_nothing
+layer: T
+step: feed `\x1b]133;L\x07\x1b]133;N\x07\x1b]133;P\x07\x1b]133;I\x07\x1b]133;a\x07\x1b]133;\x07\x1b]133;A;k=s\x07\x1b]133;A;k=c\x07\x1b]133;A;k=r\x07\x1b]133;Afoo\x07\x1b]133;D0\x07`
+expect requests: []   grid marks: none
+cite: [ADR] D-STRICT133 D-SECOND; Mark::from_osc133 P133-10..18
+note: Bothner's N (new prompt, fresh-line + A) and P (prompt start with kind) exist in the proposal; Tessera ignores them (strict). If a future shell sends N instead of A, prompt nav silently has no stops; not in 0.2 (VS Code, kitty, iTerm2, fish, zsh scripts all send A).
+flags: ambiguity
+
+### T08_nothing_is_ever_replied
+layer: T
+step: feed every row above
+expect: Request list contains no Reply, no Clipboard, no query response for any OSC 133 payload, including `133;A;cl=line;aid=1;redraw=0;err=1` and a 5000-byte option string (parser cap of the OSC buffer applies)
+cite: S1/S2
+flags: security
+
+### T09_osc_633_not_handled
+layer: T
+step: feed `\x1b]633;A\x07\x1b]633;B\x07\x1b]633;C\x07\x1b]633;D;0\x07\x1b]633;E;ls\x3b\x20-l\x07\x1b]633;P;Cwd=/tmp\x07`
+expect requests: [] ; grid marks: none ; no Reply
+cite: [VS] 633 is VS Code-only ("should be ignored by other terminals"; scripts gate on $TERM_PROGRAM == vscode); Tessera sets TERM_PROGRAM=Tessera (tessera-pty lib.rs L60), so no shell will emit 633
+note: do not implement 633: 633;E carries the command line (user data, spoofable; VS Code needs a nonce). Recommendation recorded in ADR 0039.
+flags: decision D-633
+
+### T10_iterm2_setmark_not_handled
+layer: T
+step: feed `\x1b]1337;SetMark\x07`
+expect requests: []  (D-1337 forwards only ShellIntegrationVersion=); no mark
+cite: [IT] SetMark; [ADR] D-1337; osc_spec.txt H05
+note: iTerm2 SetMark is a manual bookmark that cmd-shift-J jumps to; not part of #45a. The scripts of Tessera never send it. List as possible future "Set Mark" menu item.
+flags: decision D-SETMARK
+
+### T11_mark_on_wrap_pending_and_last_column
+layer: T
+size: 3x4
+step: feed `abcd\x1b]133;A\x07` (cursor at col 3 with pending wrap)
+expect: mark on row 0 (D-PENDING: the cursor's line when parsed, pending wrap left alone), Request::Mark(PromptStart)@pushed+0
+cite: [ADR] D-PENDING
+
+### T12_line_id_values
+layer: T
+size: 3x10, scrollback cap 100
+step: 10 x `x\r\n` (pushed = 8 after 10 LFs from row 0 with 3 rows: LF 1,2 move the cursor, LFs 3..10 scroll => pushed 8, cursor row 2), then `\x1b]133;A\x07`
+expect requests: [Mark(PromptStart)@10]  (pushed 8 + row 2)
+cite: model (abs = pushed + row); [CODE] scrollback_pushed counts every line moved off the top of the primary screen with a full-screen region
+
+### T13_scroll_region_does_not_count
+layer: T
+size: 5x10
+step: DECSTBM 2;4 (ESC[2;4r), cursor into region, feed 20 LFs, then `\x1b]133;A\x07` on row 3
+expect: Mark line = 0 + 3 (partial-region scrolls never enter history; pushed stays 0)
+cite: [CODE] scrollback_pushed doc ("Not counted: lines leaving a partial scroll region")
+note: the mark sits on a row whose abs id never changes: fine.
+
+# ---------------------------------------------------------------------------- S. select last command output
+# Result = Selection over logical lines; text as the copy path produces it. `false` = nothing selected, no error.
+
+### S01_last_command_single_row
+layer: S
+buffer: B1
+action: SelectCommandOutput
+expect: selects idx 7 only: text "hi" (start (7,0), end (7,1)); excludes the prompt `$ echo hi` (idx 6) and the live prompt (idx 8)
+cite: [KT] cmd_output(which=0) / find_cmd_output(direction -1): nearest OUTPUT_START above the next prompt, end = the prompt row; brief done-when "excluding prompt and next prompt"
+note: the live prompt row 8 carries D(0)+A+B; it ends the output. The command is "last FINISHED" because D/A on idx 8 closed it.
+
+### S02_multi_row_output
+layer: S
+buffer: B1 truncated after idx 3 (live prompt = idx 3, commands: #1 ls)
+action: SelectCommandOutput
+expect: selects idx 1..2: text "a.txt\nb.txt" (no trailing newline: RECOMMENDED)
+cite: [KT] find_cmd_output; screen text extraction joins lines with \n
+flags: decision D-SELECT-NEWLINE
+
+### S03_command_with_no_output
+layer: S
+buffer: B1 plus: idx 8 `$ true` [D(0) A B], idx 9 `$ ` [C D(0) A B]  (rows=4, scrollback 6)
+action: SelectCommandOutput
+expect: RECOMMENDED false (the last command, `true`, printed nothing: the OutputStart row 9 also carries PromptStart => empty range). Nothing is selected; a previous selection is NOT replaced by `echo hi`'s output.
+cite: [KT] find_cmd_output: end = prompt row == start => num_lines 0 => returns false; kitty offers which=3 "last NON-EMPTY output" as a separate action
+note: alternative "last non-empty output" is friendlier after `cd`; kitty needed two actions to expose both. Decision for the lead.
+flags: decision D-EMPTY-OUTPUT
+
+### S04_running_command
+layer: S
+buffer: ... idx 8 `$ sleep 100` [D(0) A B], idx 9 `partial` [C]; cursor on idx 10, no D/A after C
+action: SelectCommandOutput
+expect: RECOMMENDED selects the last FINISHED command (`echo hi`, idx 7) per the brief; the running command is skipped. (kitty: selects the running command's output up to the cursor.)
+cite: brief body "selects the last finished command's output"; [KT] find_cmd_output with no next prompt -> end = cursor row + 1
+note: users with `tail -f` / a build running who press Select Last Output get the previous command's output: surprising. Alternative: running command output so far. Needs a lead decision; recommend the brief (finished only) since the row N07 case shows the live prompt is the stop line.
+flags: decision D-RUNNING
+
+### S05_soft_wrapped_output_row
+layer: S
+buffer: width 10; `echo` printed 25 chars `aaaaaaaaaabbbbbbbbbbccccc`: rows idx 7 `aaaaaaaaaa` (wrapped) 8 `bbbbbbbbbb` (wrapped) 9 `ccccc`, C on idx 7, next prompt idx 10
+action: SelectCommandOutput
+expect: text "aaaaaaaaaabbbbbbbbbbccccc" (wrapped rows join with no newline), range (7,0)..(9,5)
+cite: existing copy path joins soft wraps (selection.rs); [KT] as_text_generic honours continuation
+
+### S06_output_with_blank_rows
+layer: S
+buffer: output rows `a`, ``, `b`, ``, `` then the next prompt row
+action: SelectCommandOutput
+expect: RECOMMENDED text "a\n\nb" : interior blank rows kept, trailing blank rows dropped (the range ends at the last row holding a non-blank cell)
+cite: brief "exact text"; kitty extracts all rows incl. trailing blanks (no trim)
+flags: decision D-SELECT-TRAIL
+
+### S07_output_without_trailing_newline_zsh_prompt_sp
+layer: S
+buffer: width 20: `printf foo` then zsh PROMPT_SP: row i `foo%` + 16 spaces(wrapped=true), row i+1 (wrapped continuation) carrying D(0) A B and `$ `; C on row i
+action: SelectCommandOutput
+expect: RECOMMENDED text "foo%" (the PROMPT_SP `%` is included; trailing blanks trimmed), range ends at the end of row i; the prompt row i+1 is excluded although it is a soft-wrap continuation
+cite: [ADR] 2026-11-03 amendment (PROMPT_SP makes the prompt row a soft-wrapped continuation); D-MARKPOS
+note: the range end is the PromptStart mark's POSITION, not 'the previous row start'. After a resize the prompt mark moves with its text (D-MARKPOS), so the same text is selected at any width: add the 80 -> 37 -> 80 variant.
+flags: ambiguity
+
+### S08_output_start_evicted
+layer: S+E
+buffer: scrollback cap 4: output of a long command whose C row has been evicted, its tail and the prompt still present
+action: SelectCommandOutput
+expect: RECOMMENDED false (the output's start is gone, selecting the tail would look like the whole output). Alternative (kitty): select from the oldest retained line.
+cite: [KT] find_cmd_output upward_limit: start = oldest line, reached_upper_limit flag returned to the caller (kitty tells the pager "truncated")
+flags: decision D-EVICTED-OUTPUT
+
+### S09_no_marks_at_all
+layer: S
+buffer: plain text only
+action: SelectCommandOutput
+expect: false; menu item disabled (validateMenuItem uses a cheap core predicate `has_command_output(id)` not a scan of the whole history under the lock)
+cite: [KT] cmd_output returns None
+flags: perf
+
+### S10_select_then_selection_is_normal
+layer: S
+action: SelectCommandOutput then copy, then PreviousPrompt
+expect: the selection is a normal line-range selection (Selection::select_range): extending with shift-click, clearing on click and clearing on output that scrolls it away all behave as today; navigating prompts does not clear it
+cite: brief files list (selection.rs select_range)
+note: select_range lives in selection.rs (T6 owns), T9 later adds word/smart expansion on top; keep the range in logical (scrollback_len-relative) coordinates so it survives scrolling.
+
+### S11_alt_screen_and_scrolled_view
+layer: S
+action: SelectCommandOutput while the view is scrolled (offset 3) and while on the alt screen
+expect: scrolled: selection made on the main grid and the view scrolls to show the START of the output (RECOMMENDED; kitty/iTerm2 UNVERIFIED) so the user sees what was selected; alt screen: false
+flags: decision D-SELECT-SCROLL
+
+# ---------------------------------------------------------------------------- E. ring cap, eviction, clear, reflow
+### E01_ring_cap
+layer: E
+in: 1001 completed commands (A C D cycles, one per advance), exit = index
+expect: records().len() == 1000; records()[0].exit == Some(1) (command #0 dropped), last == Some(1000); memory: Record <= 96 bytes; no allocation per record beyond the Vec
+cite: brief S5 MAX_COMMAND_RECORDS = 1000, D8
+flags: security
+
+### E02_ring_cap_flood_of_commands
+layer: E
+in: 100_000 A C D cycles each in its own advance call (bytewise-ish), same session
+expect: len stays 1000; time linear; CommandStarted/Finished events are queued without growth (events drained or bounded like other session events)
+cite: S5/S6
+flags: security perf
+
+### E03_scrollback_eviction_drops_records
+layer: E
+buffer: scrollback cap 5, 20 commands of 2 rows output each
+expect: command_at(row) returns None for any record whose prompt/output lines are older than the oldest retained abs id (pushed - scrollback_len); records() contains only commands with at least one retained line (RECOMMENDED lazy prune on the next Mark or query)
+cite: [CODE] abs id model; S5
+note: ring cap (1000) and eviction are independent bounds: whichever is smaller wins.
+
+### E04_clear_history_drops_records
+layer: E
+in: B1 history, then ED 3
+expect: records whose lines all were in the cleared history disappear (history_clear_generation changed); records of on-screen commands stay (idx 5..8 here: #3, #4 and the Pending live record)
+cite: [CODE] history_clear_generation; D-CLEAR-START (⌘K keeps from the prompt row)
+note: ⌘K / clear_to_cursor drops the history and keeps rows from the nearest PromptStart: records of the dropped rows go.
+
+### E05_resize_invalidates_line_ids
+layer: E
+in: B1, then resize 4x40 -> 4x30 (or 3 rows, or 6 rows)
+expect: command_at(any row) == None for pre-resize records until they are re-resolved; PreviousPrompt / NextPrompt / SelectCommandOutput still behave as in N/S rows against the REFLOWED grid (marks follow text; D-MARKPOS). New commands after the resize get correct line ids.
+cite: [CODE] scrollback_pushed excludes rows a resize moves between screen and history -> pushed+row is wrong after ANY resize, a height-only resize included; brief T14 "unknown after a reflow"
+note: CRITIC: add a height-grow case (history rows pulled back onto the screen) : a pre-resize record must not map to a different command's row.
+flags: security (wrong data shown) decision D-REFLOW
+
+### E06_resize_during_running_command
+layer: E
+in: A C (running), resize, D(0)
+expect: record Finished with exit Some(0), duration valid, line ids unknown (output_line pre-resize epoch); select-output (grid) still finds the output
+cite: R12
+
+### E07_resize_roundtrip_marks
+layer: E
+in: B1 at width 80 resized 80 -> 37 -> 80
+expect: every row's marks identical to before (exists as a grid test); nav and select produce identical results before and after
+cite: [ADR] 2026-11-03 amendment (80 -> 37 -> 80 tested)
+
+### E08_new_prompt_after_eviction_of_pending
+layer: E
+in: Pending record (A only) whose line is evicted by output, then C D
+expect: no panic; record has prompt_line pointing at an evicted abs id (treated as None for lookup)
+
+### E09_ring_and_grid_disagree_is_harmless
+layer: E
+in: ring dropped record #0 (cap) while its marks remain in scrollback
+expect: PreviousPrompt still stops there; command_at(row) None; no exit/duration shown
+cite: model: nav reads the grid
+
+# ---------------------------------------------------------------------------- DECISIONS NEEDED (lead) with recommendation
+# D-COALESCE   per-chunk "last of each kind" (D8) loses the intermediate commands' records (exit, duration) when several
+#              commands finish inside one read (pasted `a; b; c`, scripts, fast loops). Navigation/select are unaffected
+#              (they read the grid). REC: keep D8 as is; document in ADR 0039; the gutter (T14) reads grid CommandEnd marks
+#              for exit colour (they survive) and the ring only for duration.
+# D-FALLBACK   ⌘↑/⌘↓ fall back to Page Up/Down only when the SCROLLBACK holds no PromptStart (N14-N17); at the oldest/
+#              newest prompt the command stops. The fallback lives in the core (PreviousPrompt itself pages when no marks)
+#              so the Swift key route is one call and validateMenuItem needs no scan. REC as in the rows.
+# D-NEXT-END   NextPrompt with no newer prompt while scrolled up: REC go to the live screen (moved=true); kitty: no-op.
+# D-MISSING-D  A with an open C closes the command with exit None (R03), as kitty does. REC yes.
+# D-EXIT-NONE  Option<i32>; None means unknown, drawn neutral.
+# D-AID        ignore aid/cl/redraw/err options (R09); nested shells give inaccurate metadata only. REC ignore; ADR "future".
+# D-633        do not parse OSC 633 (T09); D-SETMARK ignore 1337;SetMark (T10). REC both ignored; mention in ADR 0039.
+# D-EMPTY-OUTPUT Select Last Output on a command with no output: REC false (S03). Alternative kitty "last non-empty".
+# D-RUNNING    running command: REC skip, select last finished (S04, matches brief). Alternative kitty: output so far.
+# D-SELECT-NEWLINE / D-SELECT-TRAIL  REC no trailing newline, trailing blank rows dropped, interior blanks kept.
+# D-EVICTED-OUTPUT REC false when the OutputStart row is gone (S08).
+# D-SELECT-SCROLL REC scroll so the output START is visible after selecting (S11); UNVERIFIED against iTerm2.
+# D-ALT-NAV    REC no-op on the alt screen (N11).
+# D-REFLOW     any resize (rows or cols) = epoch bump; command_at None for older records (E05).
+# D-SCAN-LOCK  prompt scan under the lock: REC chunk at 256 lines per hold like search_step, or a pre-computed index of
+#              prompt abs ids kept by the core (Request::Mark already feeds it; reflow invalidates it -> rebuild lazily).
+#
+# ISSUE-TEXT CORRECTIONS (brief vs sources)
+#  * Brief lists "k=s/c/r" in the first test: Tessera already gives NO mark for them (D-SECOND), so they produce neither a
+#    Request::Mark nor a stop (N10, R07, T07); only "A" without k, with aid/cl/redraw options, makes a PromptStart.
+#  * "marks during alternate screen": the grid already drops them (D-ALT); the new Request::Mark must be emitted from
+#    that same branch (N12), otherwise records would be created for marks the grid refused.
+#  * Brief "prompt line + output line + start/finish Instant": the term cannot know prompt_line reliably when marks are
+#    coalesced (T01/T06); records must tolerate prompt_line == None.
+#  * Brief D8 says ≤4 Request::Mark per chunk "(S6)": true per advance call; the PTY reader's chunk size (read buffer) is
+#    the effective bound on how many commands can merge: check session.rs read size when writing ADR 0039.
+#  * "select last FINISHED output" (brief body) vs kitty "last command, running included": see D-RUNNING.
+#  * [BO] primary text could not be fetched (Anubis); semantics of N/P/L/I and `err=`/`cl=` are not verified here.

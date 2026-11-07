@@ -17,7 +17,8 @@
 //! - `screen:` (one `>` line per row, the [`render_screen`] layout) or
 //!   `screen: not asserted`, `cursor: (row,col)`, `pending_wrap:` and
 //!   `scrollback: len=N [first=("text", wrapped=false)]` check the grid;
-//! - `requests: [...]` is the whole list of requests, in order: `Bell`,
+//! - `requests: [...]` is the whole list of requests but `Request::Mark`
+//!   (coalesced per call, checked in `tests/prompt_marks.rs`), in order: `Bell`,
 //!   `SetTitle("..")`, `SetClipboard("..")`, `SetCwd(b"..")` and
 //!   `ShellIntegrationHandshake(b"..")`, with `\xNN \\ \" \u{H..} \n \r \t`
 //!   escapes and `@rep(C,N)` inside the quotes;
@@ -552,7 +553,10 @@ fn run(row: &Row, input: &[u8], chunking: Chunking) -> Terminal {
 }
 
 fn outcome(row: &Row, mut term: Terminal) -> Outcome {
-    let requests = term.take_requests();
+    // `Request::Mark` is coalesced per call, so it differs between
+    // chunkings by design (D14); `tests/prompt_marks.rs` checks it.
+    let mut requests = term.take_requests();
+    requests.retain(|request| !matches!(request, Request::Mark { .. }));
     let grid = term.grid();
     let marks = marks_of(grid.visible_lines());
     let marks_scrollback =

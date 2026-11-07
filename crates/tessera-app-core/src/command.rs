@@ -127,9 +127,11 @@ commands! {
     "find_previous" => ["cmd+shift+g"] App,
     "use_selection_for_find" => ["cmd+e"] App,
     "copy_find_matches" => [] App,
-    // Default chords: ⌘↑ / ⌘↓ through scroll_page_up / _down (N1).
-    "prompt_previous" => [] Planned,
-    "prompt_next" => [] Planned,
+    // Default chords: ⌘↑ / ⌘↓ through scroll_page_up / _down (N1, see
+    // `Keymap::prompt_rule`).
+    "prompt_previous" => [] App,
+    "prompt_next" => [] App,
+    "select_last_output" => [] App,
     "copy_mode" => ["cmd+shift+c"] Planned,
 }
 
@@ -492,6 +494,40 @@ impl Keymap {
                     .iter()
                     .any(|text| Chord::parse(text).ok() == Some(chord))
             })
+    }
+
+    /// The command a key event bound to `command` runs: `prompt_previous`
+    /// for `scroll_page_up` and `prompt_next` for `scroll_page_down` when
+    /// the event is that command's registry default chord (⌘↑ / ⌘↓) and no
+    /// `[keys]` entry binds it ([`Keymap::is_default`]), else `command`
+    /// itself (D4, N1). The prompt commands page when the scrollback holds
+    /// no prompt mark, so the default chords page as before in a shell
+    /// without integration; a user's own binding of the chord is never
+    /// upgraded.
+    #[must_use]
+    pub(crate) fn prompt_rule(&self, event: &KeyEvent, command: CommandId) -> CommandId {
+        let upgrade = match command.spec().name {
+            "scroll_page_up" => "prompt_previous",
+            "scroll_page_down" => "prompt_next",
+            _ => return command,
+        };
+        let Some(key) = chord_key(event.key) else {
+            return command;
+        };
+        let probe = (event.modifiers.without_locks().bits(), key);
+        let default = command
+            .spec()
+            .defaults
+            .first()
+            .and_then(|text| Chord::parse(text).ok());
+        match default {
+            Some(chord)
+                if (chord.modifiers.bits(), chord.key) == probe && self.is_default(chord) =>
+            {
+                CommandId::find(upgrade, None).unwrap_or(command)
+            }
+            _ => command,
+        }
     }
 
     /// The warnings of the entries the registry left out or honoured with

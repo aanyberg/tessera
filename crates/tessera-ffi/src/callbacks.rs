@@ -166,6 +166,8 @@ impl SessionObserver for CallbackObserver {
                     unsafe { callback(user_data, id, code, signal) };
                 }
             }
+            // Internal to the core (ADR 0039, #45a): no host callback.
+            SessionEvent::CommandStarted | SessionEvent::CommandFinished { .. } => {}
         }
     }
 

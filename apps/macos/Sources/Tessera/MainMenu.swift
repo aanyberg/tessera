@@ -122,7 +122,8 @@ enum MainMenu {
         add(menu, "font_reset", "Actual Size", #selector(TerminalSurfaceView.resetFontSize(_:)), "0")
         menu.addItem(.separator())
         // The scrollback, as in Terminal.app's View menu; ⌘↑ and ⌘↓ page
-        // (wave 7 decision). Home and End are ⌘fn← and ⌘fn→ on a laptop.
+        // (wave 7 decision) or, with prompt marks, jump between prompts
+        // (D4). Home and End are ⌘fn← and ⌘fn→ on a laptop.
         let scrollItems: [(String, String, Selector, Int)] = [
             ("scroll_to_top", "Scroll to Top", #selector(TerminalSurfaceView.scrollToTop(_:)), NSHomeFunctionKey),
             ("scroll_to_bottom", "Scroll to Bottom", #selector(TerminalSurfaceView.scrollToBottom(_:)), NSEndFunctionKey),
@@ -132,6 +133,13 @@ enum MainMenu {
         for (command, title, action, key) in scrollItems {
             add(menu, command, title, action, functionKey(key))
         }
+        // The shell's prompts, by its OSC 133 marks (ADR 0039). No key
+        // equivalents of their own: ⌘↑ and ⌘↓, the chords of Page Up and
+        // Page Down, run them when the terminal has the key (the core's
+        // prompt rule), and they page without marks.
+        add(menu, "prompt_previous", "Previous Prompt", #selector(TerminalSurfaceView.scrollToPreviousPrompt(_:)))
+        add(menu, "prompt_next", "Next Prompt", #selector(TerminalSurfaceView.scrollToNextPrompt(_:)))
+        add(menu, "select_last_output", "Select Last Output", #selector(TerminalSurfaceView.selectLastOutput(_:)))
         menu.addItem(.separator())
         // In View, as in Terminal.app and Safari, where AppKit adds Show All
         // Tabs and Enter Full Screen. It retitles this "Hide Tab Bar" while

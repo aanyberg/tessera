@@ -41,7 +41,9 @@ import os
 ///   begins while the cell size is unknown. Copy and Select All are the
 ///   Edit menu's; nothing is copied on select.
 /// - Scrollback: the wheel and trackpad move the view through the core;
-///   the View menu's ⌘↑/⌘↓ page and ⌘Home/⌘End jump (``scroll(to:)``);
+///   ⌘↑/⌘↓ jump to the shell's previous or next prompt and page without
+///   prompt marks (``scrollToPreviousPrompt(_:)``, ADR 0039), the View
+///   menu's Page Up/Page Down page and ⌘Home/⌘End jump (``scroll(to:)``);
 ///   ``TerminalScroller`` shows and moves the position. Typing, pasting and
 ///   starting a composition return to the live screen, and drop the rest
 ///   of a trackpad gesture's momentum. Nothing scrolls while text is
@@ -1894,8 +1896,13 @@ extension TerminalSurfaceView: NSMenuItemValidation {
         case #selector(resetFontSize(_:)):
             guard let size = metrics?.fontSizePt, let attached = attachedFontSizePt else { return false }
             return size != attached
+        case #selector(selectLastOutput(_:)):
+            // The command records alone, no search of the history. Disabled
+            // during a composition: it may scroll to the output (ADR 0032).
+            return !hasMarkedText() && ((try? session.hasCommandOutput) ?? false)
         case #selector(scrollToTop(_:)), #selector(scrollToBottom(_:)), #selector(scrollPageUpInHistory(_:)),
-            #selector(scrollPageDownInHistory(_:)):
+            #selector(scrollPageDownInHistory(_:)), #selector(scrollToPreviousPrompt(_:)),
+            #selector(scrollToNextPrompt(_:)):
             // During a composition the items are disabled, so ⌘↑/⌘↓/⌘Home/⌘End
             // do not scroll; AppKit swallows them rather than handing them to
             // the input method (ADR 0032).
@@ -2005,6 +2012,52 @@ extension TerminalSurfaceView: NSMenuItemValidation {
     /// Page Down (⌘↓): one screen less a line towards the live screen.
     @objc func scrollPageDownInHistory(_ sender: Any?) {
         scroll(to: .pageDown)
+    }
+
+    /// Previous Prompt (⌘↑, the default chord of Page Up, when the view has
+    /// the key): the shell's prompt above the view's top row at the top;
+    /// nothing at the oldest one. Pages when the scrollback holds no prompt
+    /// mark (a shell without integration), so ⌘↑ pages as before there
+    /// (ADR 0039, D4).
+    @objc func scrollToPreviousPrompt(_ sender: Any?) {
+        scrollToPrompt(previous: true)
+    }
+
+    /// Next Prompt (⌘↓ when the view has the key): the prompt below the
+    /// view's top row at the top, or the live screen after the newest.
+    /// Pages down without prompt marks.
+    @objc func scrollToNextPrompt(_ sender: Any?) {
+        scrollToPrompt(previous: false)
+    }
+
+    /// Moves the view to a prompt as ``scroll(to:)`` moves it, showing the
+    /// scroll bar only if the view moved.
+    private func scrollToPrompt(previous: Bool) {
+        do {
+            guard try session.scrollToPrompt(previous: previous) else { return }
+        } catch {
+            Self.log.debug("prompt scroll not sent: \(String(describing: error), privacy: .public)")
+            return
+        }
+        ignoresMomentum = true
+        needsRender = true
+        scroller.flash()
+    }
+
+    /// Select Last Output: selects the output of the last finished command
+    /// (by the shell's OSC 133 marks), ready for Copy, and scrolls to its
+    /// start if it is not visible. Beeps when there is nothing to select
+    /// (the command printed nothing, or its output left the scrollback).
+    @objc func selectLastOutput(_ sender: Any?) {
+        do {
+            guard try session.selectLastOutput() else {
+                NSSound.beep()
+                return
+            }
+            needsRender = true
+        } catch {
+            Self.log.debug("select output failed: \(String(describing: error), privacy: .public)")
+        }
     }
 
     /// Bigger (⌘+ and ⌘=): one step up from the surface's current size.

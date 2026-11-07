@@ -673,6 +673,8 @@ final class TerminalScrollTests: XCTestCase {
         #selector(TerminalSurfaceView.scrollToTop(_:)), #selector(TerminalSurfaceView.scrollToBottom(_:)),
         #selector(TerminalSurfaceView.scrollPageUpInHistory(_:)),
         #selector(TerminalSurfaceView.scrollPageDownInHistory(_:)),
+        #selector(TerminalSurfaceView.scrollToPreviousPrompt(_:)),
+        #selector(TerminalSurfaceView.scrollToNextPrompt(_:)),
     ]
 
     private func composeNi() {

@@ -173,6 +173,9 @@ final class MainMenuTests: XCTestCase {
         Item(
             title: "Page Down", key: "\u{F701}", modifiers: command,
             action: #selector(TerminalSurfaceView.scrollPageDownInHistory(_:))),
+        Item(title: "Previous Prompt", action: #selector(TerminalSurfaceView.scrollToPreviousPrompt(_:))),
+        Item(title: "Next Prompt", action: #selector(TerminalSurfaceView.scrollToNextPrompt(_:))),
+        Item(title: "Select Last Output", action: #selector(TerminalSurfaceView.selectLastOutput(_:))),
         .separator,
         Item(title: "Show Tab Bar", action: #selector(NSWindow.toggleTabBar(_:))),
     ]
