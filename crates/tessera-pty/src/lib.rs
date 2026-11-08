@@ -49,6 +49,19 @@ mod native;
 pub use foreground::{ForegroundProcess, MAX_FOREGROUND_NAME_BYTES};
 pub use native::{IoThreads, NativePty, WRITE_QUEUE_BYTES};
 
+/// This machine's host name (`gethostname(3)`), or an empty string when it
+/// cannot be read or is not UTF-8. Read anew on every call: macOS changes
+/// it with the network. Compared with an OSC 7 report's host by
+/// `tessera_shell_integration::Cwd::is_local`, which treats an empty name
+/// as matching only the empty host and `localhost`.
+#[must_use]
+pub fn local_hostname() -> String {
+    nix::unistd::gethostname()
+        .ok()
+        .and_then(|name| name.into_string().ok())
+        .unwrap_or_default()
+}
+
 /// Value injected as `TERM` for every child.
 ///
 /// A dedicated `tessera` terminfo entry is planned; until it ships we claim
@@ -438,11 +451,33 @@ pub trait Pty: Send {
     fn foreground_process(&self) -> Option<ForegroundProcess> {
         None
     }
+
+    /// The name of the child, the session leader: the program spawned, or
+    /// the one it `exec`ed into (`sh -c "ssh host"` runs as `ssh`), read as
+    /// [`ForegroundProcess::name`] is (at most
+    /// [`MAX_FOREGROUND_NAME_BYTES`] bytes). `None` once the child has
+    /// exited or is being reaped, when its name cannot be read, or when the
+    /// implementation cannot tell; the default implementation always
+    /// returns `None`. Cheap (one process lookup) and a snapshot, like
+    /// [`Pty::foreground_process`].
+    fn session_leader_name(&self) -> Option<String> {
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_hostname_matches_the_hostname_command() {
+        let output = std::process::Command::new("/bin/hostname")
+            .output()
+            .expect("run hostname");
+        let expected = String::from_utf8(output.stdout).expect("UTF-8 host name");
+        assert_eq!(local_hostname(), expected.trim_end());
+        assert_ne!(local_hostname(), "");
+    }
 
     #[test]
     fn size_defaults_to_vt100_dimensions() {

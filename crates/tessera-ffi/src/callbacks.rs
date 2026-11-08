@@ -2,7 +2,7 @@
 
 use std::ffi::{CString, c_char, c_void};
 
-use tessera_app_core::{SessionEvent, SessionId, SessionObserver};
+use tessera_app_core::{Remote, SessionEvent, SessionId, SessionObserver};
 
 /// Functions the core calls when something happens in a session, or when
 /// the appearance of every view changes.
@@ -43,7 +43,8 @@ use tessera_app_core::{SessionEvent, SessionId, SessionObserver};
 /// # ABI
 ///
 /// Fields are only ever added at the end (`on_appearance_changed`,
-/// `on_session_clipboard` and `on_config_applied` were). A host compiled against an older header
+/// `on_session_clipboard`, `on_config_applied` and `on_session_remote`
+/// were). A host compiled against an older header
 /// passes a shorter table, which this core would read past: rebuild the
 /// host against the header that ships with the core it links. Initialise the table with designated
 /// initialisers (C) or every field (Swift), so a new field is `NULL`.
@@ -114,6 +115,47 @@ pub struct Callbacks {
     /// both are, on the configuration watch's thread, under the same rules
     /// as every callback: marshal the work to the main thread.
     pub on_config_applied: Option<unsafe extern "C" fn(user_data: *mut c_void, generation: u64)>,
+    /// Where the session's shell runs changed (#205): `kind` is a
+    /// [`RemoteKind`] (`TESSERA_REMOTE_KIND_LOCAL`, `_HOST` or `_UNNAMED`).
+    /// For `_HOST`, `host` points to `len` bytes of UTF-8 naming the other
+    /// machine, valid only during the call and NOT NUL-terminated: already
+    /// sanitised (no control, bidi-control or line-separator characters),
+    /// never empty and at most 253 bytes (`TESSERA_MAX_REMOTE_HOST_LEN`).
+    /// Otherwise `host` is `NULL` and `len` is 0. The host shows a remote
+    /// session in its title (`⇢ host:`, or `⇢ ssh` for `_UNNAMED`) unless
+    /// `general.remote_indicator` is `"off"`. Called only when the state
+    /// changes, at most once per chunk of output; a new session starts
+    /// local. The host is the child's claim, never a security decision.
+    pub on_session_remote: Option<
+        unsafe extern "C" fn(
+            user_data: *mut c_void,
+            session_id: u64,
+            kind: u8,
+            host: *const u8,
+            len: usize,
+        ),
+    >,
+}
+
+/// Most bytes of the host `on_session_remote` passes: the longest DNS name
+/// (the core's `MAX_REMOTE_HOST_BYTES`, spelled out for the header).
+pub const MAX_REMOTE_HOST_LEN: usize = 253;
+
+const _: () = assert!(MAX_REMOTE_HOST_LEN == tessera_app_core::MAX_REMOTE_HOST_BYTES);
+
+/// Where a session's shell runs: the `kind` argument of
+/// `on_session_remote`, carried as `uint8_t`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RemoteKind {
+    /// On this machine, or nothing says otherwise.
+    Local = 0,
+    /// On the machine `host` names (its last OSC 7 report).
+    Host = 1,
+    /// On another machine whose name is not shown: `ssh` runs in the
+    /// foreground with no report naming a host, or the report's host was
+    /// too long or empty once sanitised.
+    Unnamed = 2,
 }
 
 /// Adapts a [`Callbacks`] table to the core's observer trait.
@@ -173,6 +215,19 @@ impl SessionObserver for CallbackObserver {
                     unsafe { callback(user_data, id, code, signal) };
                 }
             }
+            SessionEvent::Remote(remote) => {
+                if let Some(callback) = callbacks.on_session_remote {
+                    let (kind, host) = match &remote {
+                        Remote::Local => (RemoteKind::Local, None),
+                        Remote::Host(host) => (RemoteKind::Host, Some(host.as_bytes())),
+                        Remote::Unnamed => (RemoteKind::Unnamed, None),
+                    };
+                    let (ptr, len) = host.map_or((std::ptr::null(), 0), |h| (h.as_ptr(), h.len()));
+                    // SAFETY: host contract on `Callbacks`; `host` outlives
+                    // the call and `len` is its length in bytes.
+                    unsafe { callback(user_data, id, kind as u8, ptr, len) };
+                }
+            }
             // Internal to the core (ADR 0039, #45a): no host callback.
             SessionEvent::CommandStarted | SessionEvent::CommandFinished { .. } => {}
         }
@@ -206,17 +261,68 @@ fn c_string_lossy(text: String) -> CString {
 mod tests {
     use super::*;
 
-    /// The table's C layout: eight pointers, `on_config_applied` last,
-    /// right after `on_session_clipboard` (fields are only appended).
+    /// The table's C layout: nine pointers, `on_session_remote` last,
+    /// right after `on_config_applied` (fields are only appended, S7).
     #[test]
-    fn the_config_applied_callback_is_appended_last() {
+    fn the_session_remote_callback_is_appended_last() {
         use std::mem::{offset_of, size_of};
 
         let pointer = size_of::<*const c_void>();
-        assert_eq!(size_of::<Callbacks>(), 8 * pointer);
+        assert_eq!(size_of::<Callbacks>(), 9 * pointer);
         assert_eq!(offset_of!(Callbacks, on_appearance_changed), 5 * pointer);
         assert_eq!(offset_of!(Callbacks, on_session_clipboard), 6 * pointer);
         assert_eq!(offset_of!(Callbacks, on_config_applied), 7 * pointer);
+        assert_eq!(offset_of!(Callbacks, on_session_remote), 8 * pointer);
+    }
+
+    /// What one `on_session_remote` call passed: kind, host bytes (`None`
+    /// for a null pointer) and length.
+    type RemoteCall = (u8, Option<Vec<u8>>, usize);
+
+    static REMOTE_CALLS: std::sync::Mutex<Vec<RemoteCall>> = std::sync::Mutex::new(Vec::new());
+
+    unsafe extern "C" fn record_remote(
+        _user_data: *mut c_void,
+        _session_id: u64,
+        kind: u8,
+        host: *const u8,
+        len: usize,
+    ) {
+        let bytes = (!host.is_null())
+            // SAFETY: the core passes `len` readable bytes at `host`.
+            .then(|| unsafe { std::slice::from_raw_parts(host, len) }.to_vec());
+        REMOTE_CALLS.lock().unwrap().push((kind, bytes, len));
+    }
+
+    #[test]
+    fn remote_states_reach_the_callback_with_their_kind_and_host() {
+        let observer = CallbackObserver::new(Callbacks {
+            user_data: std::ptr::null_mut(),
+            on_session_output: None,
+            on_session_title: None,
+            on_session_bell: None,
+            on_session_exit: None,
+            on_appearance_changed: None,
+            on_session_clipboard: None,
+            on_config_applied: None,
+            on_session_remote: Some(record_remote),
+        });
+        let id = SessionId::from_raw(1);
+        observer.on_session_event(id, SessionEvent::Remote(Remote::Host("far.example".into())));
+        observer.on_session_event(id, SessionEvent::Remote(Remote::Unnamed));
+        observer.on_session_event(id, SessionEvent::Remote(Remote::Local));
+        assert_eq!(
+            *REMOTE_CALLS.lock().unwrap(),
+            [
+                (1, Some(b"far.example".to_vec()), 11),
+                (2, None, 0),
+                (0, None, 0),
+            ]
+        );
+        assert_eq!(RemoteKind::Local as u8, 0);
+        assert_eq!(RemoteKind::Host as u8, 1);
+        assert_eq!(RemoteKind::Unnamed as u8, 2);
+        assert_eq!(MAX_REMOTE_HOST_LEN, 253);
     }
 
     #[test]

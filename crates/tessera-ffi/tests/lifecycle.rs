@@ -87,6 +87,7 @@ impl Recorder {
             on_appearance_changed: None,
             on_session_clipboard: None,
             on_config_applied: None,
+            on_session_remote: None,
         }
     }
 }
@@ -861,6 +862,7 @@ fn session_threads_run_at_user_initiated_qos() {
         on_appearance_changed: None,
         on_session_clipboard: None,
         on_config_applied: None,
+        on_session_remote: None,
     };
     // SAFETY: live handle; valid table; `qos` outlives the handle.
     assert_eq!(

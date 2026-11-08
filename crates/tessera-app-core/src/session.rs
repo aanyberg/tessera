@@ -110,7 +110,9 @@ use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
 use tessera_grid::{Grid, Mark};
-use tessera_pty::{ExitStatus, ForegroundProcess, Pty, PtyError, PtyEvent, PtyEvents, PtySize};
+use tessera_pty::{
+    ExitStatus, ForegroundProcess, Pty, PtyError, PtyEvent, PtyEvents, PtySize, local_hostname,
+};
 use tessera_shell_integration::{Cwd, parse_osc7, parse_osc1337, scripts};
 use tessera_term::{Request, Terminal};
 
@@ -118,6 +120,7 @@ use crate::commands::{self, CommandLog};
 use crate::config_watch::Applied;
 use crate::input::MouseEvent;
 use crate::mouse;
+use crate::remote::{Remote, RemoteTracker};
 use crate::search::{SearchState, TerminalSource};
 use crate::selection::SelectionState;
 use crate::view::{Look, MAX_VIEW_COLS, MAX_VIEW_ROWS};
@@ -215,6 +218,12 @@ pub enum SessionEvent {
     /// The child exited. This is the last event of a session that was not
     /// closed by the application first.
     Exit(ExitStatus),
+    /// Where the session's shell runs changed (#205, see the
+    /// [`remote`](crate::remote) module): an OSC 7 report named another
+    /// machine or this one again, or `ssh` came to or left the foreground
+    /// while no report named a host. Reported only on a change (S6), at
+    /// most once per chunk of output.
+    Remote(Remote),
     /// The shell reported that a command's output started (OSC 133 `C`,
     /// ADR 0039). Carries no command text (ADR 0021). Internal to the
     /// core: the FFI does not forward it. Reported at most once per chunk
@@ -589,13 +598,15 @@ pub(crate) struct ShellReports {
 
 impl ShellReports {
     /// Stores the OSC 7 `payload` as the working directory when
-    /// [`parse_osc7`] accepts it; an invalid report keeps the previous one.
-    fn report_cwd(&self, payload: &[u8]) {
-        if let Some(cwd) = parse_osc7(payload) {
-            *lock(&self.cwd) = Some(cwd);
-        } else {
+    /// [`parse_osc7`] accepts it, and returns it; an invalid report keeps
+    /// the previous one and returns `None`.
+    fn report_cwd(&self, payload: &[u8]) -> Option<Cwd> {
+        let Some(cwd) = parse_osc7(payload) else {
             tracing::trace!("invalid OSC 7 working directory ignored");
-        }
+            return None;
+        };
+        *lock(&self.cwd) = Some(cwd.clone());
+        Some(cwd)
     }
 
     /// The working directory last reported, if any.
@@ -968,8 +979,10 @@ impl Session {
         let writer = Worker::spawn(format!("tessera-input-{id}"), signal, move || writer.run())?;
         let delivering = Arc::new(Mutex::new(()));
         let reports = Arc::new(ShellReports::default());
-        let pump = Pump {
+        let mut pump = Pump {
             id,
+            pty: Arc::clone(&pty),
+            remote: RemoteTracker::new(local_hostname()),
             term: Arc::clone(&term),
             outbox: Arc::clone(&outbox),
             muted: Arc::clone(&muted),
@@ -1974,6 +1987,16 @@ fn give_way(term: &SharedTerminal, mut yield_now: impl FnMut()) -> usize {
 /// State moved onto a session's reader thread.
 struct Pump {
     id: SessionId,
+    /// The session's PTY, for the foreground job and session leader
+    /// [`RemoteTracker`] probes for `ssh` (at most once per
+    /// [`SSH_PROBE_INTERVAL`](crate::SSH_PROBE_INTERVAL)). This handle
+    /// keeps the PTY (its master) alive for as long as the reader runs,
+    /// also after the session is closed while a detached reader drains a
+    /// terminal a grandchild still holds open; hanging up and killing stay
+    /// explicit, so nothing waits on it.
+    pty: Arc<Mutex<Box<dyn Pty>>>,
+    /// Where the session's shell runs (#205); owned by this thread.
+    remote: RemoteTracker,
     term: Arc<SharedTerminal>,
     /// The session's outbox, for the terminal's replies (see "Replies" in
     /// the module documentation).
@@ -1990,7 +2013,7 @@ struct Pump {
 }
 
 impl Pump {
-    fn run(&self, events: &PtyEvents) {
+    fn run(&mut self, events: &PtyEvents) {
         for event in events {
             match event {
                 PtyEvent::Output(bytes) => {
@@ -2006,6 +2029,9 @@ impl Pump {
                     // the chunk's last reaches the observer, so a flood of
                     // OSC 52 costs one pasteboard write per chunk. Titles
                     // are replaced as they arrive (see `ChunkRequests`).
+                    // The chunk's last valid OSC 7 report decides the
+                    // remote state (one decision per chunk, S6).
+                    let mut cwd = None;
                     let mut clipboard_writes = requests
                         .requests
                         .iter()
@@ -2020,7 +2046,11 @@ impl Pump {
                                 self.clipboard(text);
                             }
                         }
-                        Request::SetCwd(payload) => self.reports.report_cwd(&payload),
+                        Request::SetCwd(payload) => {
+                            if let Some(reported) = self.reports.report_cwd(&payload) {
+                                cwd = Some(reported);
+                            }
+                        }
                         Request::ShellIntegrationHandshake(payload) => {
                             self.reports.handshake(self.id, &payload);
                         }
@@ -2036,12 +2066,41 @@ impl Pump {
                             self.deliver(event);
                         }
                     }
+                    self.update_remote(cwd.as_ref());
                 }
                 PtyEvent::Exited(status) => {
                     self.deliver(SessionEvent::Exit(status));
                     break;
                 }
             }
+        }
+    }
+
+    /// Decides the remote state after a chunk of output: from its last
+    /// valid OSC 7 report `cwd`, if any, then from the program in front when
+    /// a probe is due (see [`RemoteTracker::output`]): the foreground job,
+    /// or with no job the session leader (a profile's `command = "ssh
+    /// host"`, which `sh -c` `exec`s). Delivers
+    /// [`SessionEvent::Remote`] when the state changed; the log names only
+    /// the host's length (S8).
+    fn update_remote(&mut self, cwd: Option<&Cwd>) {
+        if let Some(cwd) = cwd {
+            self.remote.report(cwd, local_hostname());
+        }
+        let pty = &self.pty;
+        self.remote.output(Instant::now, || {
+            let pty = lock(pty);
+            pty.foreground_process()
+                .map(|job| job.name)
+                .or_else(|| pty.session_leader_name())
+        });
+        if let Some(remote) = self.remote.changed() {
+            let host_len = match &remote {
+                Remote::Host(host) => host.len(),
+                Remote::Local | Remote::Unnamed => 0,
+            };
+            tracing::debug!(session = %self.id, ?host_len, local = remote == Remote::Local, "remote state changed");
+            self.deliver(SessionEvent::Remote(remote));
         }
     }
 
@@ -3295,6 +3354,21 @@ pub(crate) mod tests {
         }
     }
 
+    /// Sends `bytes` and a bell as one chunk, then a lone bell as a
+    /// second, and returns every event up to the second bell, bells left
+    /// out: so the first chunk's remote event, delivered after its
+    /// requests (#205), is among them, followed by the second chunk's
+    /// `Output`.
+    fn pump_chunk(
+        tx: &SyncSender<PtyEvent>,
+        events: &Receiver<SessionEvent>,
+        bytes: &[u8],
+    ) -> Vec<SessionEvent> {
+        let mut seen = pump_until_bell(tx, events, bytes);
+        seen.extend(pump_until_bell(tx, events, b""));
+        seen
+    }
+
     fn with_clipboard_write(on: bool) -> Config {
         let mut config = Config::default();
         config.terminal.clipboard_write = on;
@@ -3484,9 +3558,13 @@ pub(crate) mod tests {
             path: "/a b".into(),
         };
         assert_eq!(
-            pump_until_bell(&tx, &events, b"\x1b]7;file://h/a%20b\x07"),
-            [SessionEvent::Output],
-            "a report is no event"
+            pump_chunk(&tx, &events, b"\x1b]7;file://h/a%20b\x07"),
+            [
+                SessionEvent::Output,
+                SessionEvent::Remote(Remote::Host("h".into())),
+                SessionEvent::Output
+            ],
+            "a report from another host makes the session remote (#205)"
         );
         assert_eq!(
             app.session_cwd(id).expect("live"),
@@ -3516,6 +3594,265 @@ pub(crate) mod tests {
         assert!(!remote.is_local("Mac"), "D-HOST: kept, but not local");
         app.close_session(id).expect("close");
         assert!(app.session_cwd(id).is_err(), "closed");
+    }
+
+    /// A PTY whose foreground job is whatever the test sets and whose
+    /// session leader is `leader`, counting how often the job is asked: the
+    /// remote tracker's `ssh` probe (#205).
+    struct ProbePty {
+        events: Option<SyncSender<PtyEvent>>,
+        foreground: Arc<Mutex<Option<String>>>,
+        leader: Option<String>,
+        probes: Arc<AtomicUsize>,
+    }
+
+    impl Pty for ProbePty {
+        fn write(&mut self, _bytes: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn try_write(&mut self, _bytes: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn resize(&mut self, _size: PtySize) -> Result<(), PtyError> {
+            Ok(())
+        }
+
+        fn size(&self) -> PtySize {
+            PtySize::default()
+        }
+
+        fn child_pid(&self) -> Option<u32> {
+            None
+        }
+
+        fn exit_status(&self) -> Option<ExitStatus> {
+            None
+        }
+
+        fn hangup(&mut self) -> io::Result<()> {
+            if let Some(events) = self.events.take() {
+                let _ = events.send(PtyEvent::Exited(ExitStatus::Signaled(1)));
+            }
+            Ok(())
+        }
+
+        fn kill(&mut self) -> io::Result<()> {
+            self.hangup()
+        }
+
+        fn foreground_process(&self) -> Option<ForegroundProcess> {
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            lock(&self.foreground)
+                .clone()
+                .map(|name| ForegroundProcess { pid: 42, name })
+        }
+
+        fn session_leader_name(&self) -> Option<String> {
+            self.leader.clone()
+        }
+    }
+
+    /// What [`probe_session`] returns.
+    type ProbeSession = (
+        SessionId,
+        SyncSender<PtyEvent>,
+        Receiver<SessionEvent>,
+        Arc<Mutex<Option<String>>>,
+        Arc<AtomicUsize>,
+    );
+
+    /// A session on a [`ProbePty`] whose foreground job starts as
+    /// `foreground` and whose leader is `leader`: its id, event sender,
+    /// observed events, the job's name and the probe count.
+    fn probe_session(app: &App, foreground: Option<&str>, leader: Option<&str>) -> ProbeSession {
+        let (events_tx, events) = mpsc::channel();
+        app.set_observer(Some(Box::new(move |_, event| {
+            let _ = events_tx.send(event);
+        })));
+        let (tx, rx) = mpsc::sync_channel(16);
+        let foreground = Arc::new(Mutex::new(foreground.map(str::to_owned)));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let pty = ProbePty {
+            events: Some(tx.clone()),
+            foreground: Arc::clone(&foreground),
+            leader: leader.map(str::to_owned),
+            probes: Arc::clone(&probes),
+        };
+        let id = app.allocate_id();
+        app.attach(id, Box::new(pty), rx, PtySize::new(4, 20))
+            .expect("attach");
+        (id, tx, events, foreground, probes)
+    }
+
+    /// The remote events among `events`.
+    fn remotes(events: Vec<SessionEvent>) -> Vec<Remote> {
+        events
+            .into_iter()
+            .filter_map(|event| match event {
+                SessionEvent::Remote(remote) => Some(remote),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// #205: a report from another machine makes the session remote with
+    /// that host, the next local one (empty host, `localhost` or this
+    /// machine's name) makes it local again, and a repeated report is no
+    /// event (S6).
+    #[test]
+    fn osc_7_reports_decide_the_remote_state_on_change_only() {
+        let app = App::new(Config::default(), ConfigPaths::new("/nonexistent/tessera"));
+        let (id, tx, events) = fake_session(&app, PtySize::new(4, 20));
+        assert_eq!(
+            remotes(pump_chunk(&tx, &events, b"\x1b]7;file:///tmp\x07")),
+            [],
+            "a new session is local"
+        );
+        let far = b"\x1b]7;file://far.example/srv\x07";
+        assert_eq!(
+            remotes(pump_chunk(&tx, &events, far)),
+            [Remote::Host("far.example".into())]
+        );
+        assert_eq!(remotes(pump_chunk(&tx, &events, far)), [], "unchanged");
+        assert_eq!(
+            remotes(pump_chunk(
+                &tx,
+                &events,
+                b"\x1b]7;file://far.example/a\x07\x1b]7;file://near.example/b\x07"
+            )),
+            [Remote::Host("near.example".into())],
+            "one decision per chunk, from its last report"
+        );
+        assert_eq!(
+            remotes(pump_chunk(&tx, &events, b"\x1b]7;http://x/tmp\x07")),
+            [],
+            "an invalid report changes nothing"
+        );
+        assert_eq!(
+            remotes(pump_chunk(&tx, &events, b"\x1b]7;file://localhost/tmp\x07")),
+            [Remote::Local]
+        );
+        pump_chunk(&tx, &events, far);
+        let here = format!("\x1b]7;file://{}/tmp\x07", tessera_pty::local_hostname());
+        assert_eq!(
+            remotes(pump_chunk(&tx, &events, here.as_bytes())),
+            [Remote::Local],
+            "this machine's own name"
+        );
+        app.close_session(id).expect("close");
+    }
+
+    /// #205, S3: a hostile host is shown without its control, bidi and
+    /// line-separator characters, and one longer than 253 bytes is dropped
+    /// whole; a flood of them costs one event.
+    #[test]
+    fn hostile_hosts_are_sanitised_or_dropped() {
+        let app = App::new(Config::default(), ConfigPaths::new("/nonexistent/tessera"));
+        let (id, tx, events) = fake_session(&app, PtySize::new(4, 20));
+        // `parse_osc7` refuses a host with a control character (C0, C1,
+        // DEL): such a report changes nothing. Bidi controls and line
+        // separators are not control characters, so they reach the
+        // tracker, which removes them.
+        assert_eq!(
+            remotes(pump_chunk(
+                &tx,
+                &events,
+                "\x1b]7;file://ev\u{9b}il.com/srv\x07".as_bytes()
+            )),
+            [],
+            "refused"
+        );
+        assert_eq!(
+            remotes(pump_chunk(
+                &tx,
+                &events,
+                "\x1b]7;file://ev\u{202E}il\u{2066}.\u{2028}c\u{200F}om/srv\x07".as_bytes()
+            )),
+            [Remote::Host("evil.com".into())]
+        );
+        let long = format!("\x1b]7;file://{}/srv\x07", "a".repeat(254));
+        assert_eq!(
+            remotes(pump_chunk(&tx, &events, long.as_bytes())),
+            [Remote::Unnamed],
+            "too long: remote, without a name"
+        );
+        let flood = long.repeat(64 * 1024 / long.len());
+        for _ in 0..16 {
+            assert_eq!(remotes(pump_chunk(&tx, &events, flood.as_bytes())), []);
+        }
+        app.close_session(id).expect("close");
+    }
+
+    /// #205, D11: with no report naming a host, `ssh` in the foreground
+    /// makes the session remote without a host, and leaving it makes it
+    /// local; the job is asked at most once per second of output however
+    /// much arrives, and never while a host report is in effect.
+    #[test]
+    fn the_ssh_probe_runs_at_most_once_per_second_under_a_flood() {
+        let app = App::new(Config::default(), ConfigPaths::new("/nonexistent/tessera"));
+        let (id, tx, events, foreground, probes) = probe_session(&app, Some("ssh"), Some("zsh"));
+        // Before the first probe, so every probe falls inside the window.
+        let start = Instant::now();
+        assert_eq!(
+            remotes(pump_chunk(&tx, &events, b"login")),
+            [Remote::Unnamed]
+        );
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+        let mut chunks = 0_u32;
+        while start.elapsed() < Duration::from_millis(2500) {
+            pump_until_bell(&tx, &events, &[b'x'; 1024]);
+            chunks += 1;
+        }
+        let elapsed = start.elapsed();
+        let count = probes.load(Ordering::SeqCst);
+        // The first probe at `start`, then at most one per whole second.
+        let allowed = 1 + usize::try_from(elapsed.as_secs()).expect("small");
+        eprintln!("{chunks} chunks in {elapsed:?}: {count} probes");
+        assert!(chunks > 100, "a flood: {chunks} chunks");
+        assert!(count <= allowed, "{count} probes in {elapsed:?}");
+        assert!(count >= 2, "count again after a second: {count}");
+        // Back at the shell: local by the first probe a second later.
+        *lock(&foreground) = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen = Vec::new();
+        while seen.is_empty() && Instant::now() < deadline {
+            seen = remotes(pump_chunk(&tx, &events, b"$ "));
+        }
+        assert_eq!(seen, [Remote::Local]);
+        // A host report stops the probe.
+        *lock(&foreground) = Some("ssh".into());
+        pump_chunk(&tx, &events, b"\x1b]7;file://far.example/srv\x07");
+        let before = probes.load(Ordering::SeqCst);
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(1500) {
+            assert_eq!(remotes(pump_chunk(&tx, &events, b"remote output")), []);
+        }
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            before,
+            "no probe while a host is reported"
+        );
+        app.close_session(id).expect("close");
+    }
+
+    /// #205 B2: a session whose own program is `ssh` (a profile's
+    /// `command = "ssh build-box"`, which `sh -c` `exec`s, so it is the
+    /// session leader and never a job) is remote without a host; with no
+    /// job and another leader it stays local.
+    #[test]
+    fn a_session_whose_program_is_ssh_is_remote() {
+        let app = App::new(Config::default(), ConfigPaths::new("/nonexistent/tessera"));
+        let (id, tx, events, _, _) = probe_session(&app, None, Some("ssh"));
+        assert_eq!(
+            remotes(pump_chunk(&tx, &events, b"login")),
+            [Remote::Unnamed]
+        );
+        app.close_session(id).expect("close");
+        let (id, tx, events, _, _) = probe_session(&app, None, Some("zsh"));
+        assert_eq!(remotes(pump_chunk(&tx, &events, b"$ ")), [], "local");
+        app.close_session(id).expect("close");
     }
 
     /// The level and text of every event a [`Recorder`] saw.

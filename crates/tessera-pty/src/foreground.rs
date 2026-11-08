@@ -52,7 +52,7 @@ pub(crate) fn foreground_process(master: &dyn MasterPty, shell: u32) -> Option<F
 }
 
 /// The name of process `pid`, or `None` if it cannot be read.
-fn process_name(pid: u32) -> Option<String> {
+pub(crate) fn process_name(pid: u32) -> Option<String> {
     let pid = i32::try_from(pid).ok().filter(|&pid| pid > 0)?;
     platform::process_name(pid).map(|bytes| truncated_name(&bytes))
 }

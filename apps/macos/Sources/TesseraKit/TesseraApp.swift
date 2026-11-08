@@ -8,6 +8,7 @@ internal import TesseraCore
 /// queued at a time, and it reports everything since the previous one, in this
 /// order: ``sessionDidOutput(_:)`` once if there was any output (all of it is
 /// applied by then), ``session(_:didSetTitle:)`` once with the latest title,
+/// ``session(_:didChangeRemote:)`` once with the latest remote state,
 /// ``sessionDidRingBell(_:)`` once however many bells rang, and finally
 /// ``session(_:didExitWithCode:signal:)``, which always comes last. Deliveries
 /// keep their order; the interleaving of events within one delivery is not
@@ -47,10 +48,33 @@ public protocol TesseraAppDelegate: AnyObject {
     /// with the latest. Not sent after ``TesseraApp/shutdown()``. The
     /// default does nothing.
     func configurationDidApply(generation: UInt64)
+    /// Where the session's shell runs changed (#205): the core decided it from
+    /// the shell's working-directory reports (OSC 7) and, with none naming a
+    /// host, from `ssh` in the foreground. Reported only on a change; a new
+    /// session starts ``TesseraRemote/local``. Several changes between two
+    /// deliveries are reported once, with the latest. The default does nothing.
+    func session(_ session: TesseraSession, didChangeRemote remote: TesseraRemote)
 }
 
 extension TesseraAppDelegate {
     public func configurationDidApply(generation: UInt64) {}
+    public func session(_ session: TesseraSession, didChangeRemote remote: TesseraRemote) {}
+}
+
+/// Where a session's shell runs, as the core reports it
+/// (``TesseraAppDelegate/session(_:didChangeRemote:)``). A display hint: the
+/// child can claim any host.
+public enum TesseraRemote: Sendable, Hashable {
+    /// On this Mac, or nothing says otherwise.
+    case local
+    /// On the machine its last working-directory report named. The core
+    /// removed control, bidirectional-formatting and line-separator
+    /// characters; never empty, at most 253 bytes.
+    case host(String)
+    /// On another machine whose name is not known: `ssh` runs in the
+    /// foreground and no report named a host (or the one that did could not
+    /// be shown).
+    case unnamed
 }
 
 /// The Rust core's application: its configuration and every session it runs.

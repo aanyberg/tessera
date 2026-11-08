@@ -10,6 +10,8 @@ final class Pane: Equatable {
     /// The session's title as the core last reported it (already sanitised
     /// there, docs/security.md S3); empty until the session sets one.
     var title = ""
+    /// Where the session's shell runs, as the core last reported it (#205).
+    var remote = TesseraRemote.local
 
     init(session: TesseraSession) {
         self.session = session

@@ -125,6 +125,45 @@ fn an_exited_child_has_no_foreground_job() {
     assert_eq!(pty.foreground_process(), None, "asking again is harmless");
 }
 
+/// #205: a program that `sh -c` runs as the session's own command (a
+/// profile's `command = "ssh build-box"`) is the session leader, never a
+/// job: [`Pty::session_leader_name`] names it once `sh` has `exec`ed it.
+#[test]
+fn the_session_leader_is_named_after_the_program_sh_c_runs() {
+    let (mut shell, events) = interactive_sh();
+    let mut seen = String::new();
+    shell.write(b"echo ready-$((6 * 7))\n").unwrap();
+    wait_for_output(&events, &mut seen, "ready-42\r\nprompt> ");
+    // `/bin/sh` is `bash` on macOS and `dash` on Debian.
+    let name = shell.session_leader_name();
+    assert!(
+        name.as_ref().is_some_and(|name| name.ends_with("sh")),
+        "{name:?}"
+    );
+    shell.kill().unwrap();
+    wait_for_exit(&events);
+    assert_eq!(shell.session_leader_name(), None, "exited");
+
+    for script in ["/bin/sleep 100", "exec /bin/sleep 100"] {
+        let options = SpawnOptions::command("/bin/sh", "fg-leader")
+            .arg("-c")
+            .arg(script);
+        let (mut pty, events) = NativePty::spawn(&options).expect("spawn sh -c");
+        let mut name = pty.session_leader_name();
+        for _ in 0..ATTEMPTS {
+            if name.as_deref() == Some("sleep") {
+                break;
+            }
+            thread::sleep(POLL);
+            name = pty.session_leader_name();
+        }
+        assert_eq!(name.as_deref(), Some("sleep"), "{script}");
+        assert_eq!(pty.foreground_process(), None, "{script}: not a job");
+        pty.kill().unwrap();
+        wait_for_exit(&events);
+    }
+}
+
 #[test]
 fn a_program_spawned_without_a_shell_is_not_a_job() {
     // `sleep` is the session leader here: its group owns the terminal.

@@ -999,6 +999,72 @@ fn empty_lines_and_ctrl_c_close_with_a_bare_d() {
     }
 }
 
+/// #205: a program run from the shell (`ssh` to an integrated host, say)
+/// may report another machine's directory; the shell reports its own again
+/// at every following prompt, even though `$PWD` did not change, so the
+/// remote-host prefix clears at the next local prompt.
+#[test]
+fn every_prompt_reports_the_directory_after_a_program_reported_another() {
+    let steps = [
+        (
+            Wait::Prompts(1),
+            "printf '\\033]7;file://far.example/srv\\007'\r",
+        ),
+        (Wait::Prompts(2), "\r"),
+        (Wait::Prompts(3), "exit\r"),
+    ];
+    let host = host_name();
+    let mut cases = vec![(Shell::Zsh, PathBuf::from(ZSH), ".zshrc")];
+    cases.extend(
+        bashes()
+            .into_iter()
+            .map(|bash| (Shell::Bash, bash, ".bashrc")),
+    );
+    for (shell, program, rc) in cases {
+        let observed = run_steps(
+            &Case {
+                shell,
+                program: program.clone(),
+                args: Some(&["-i"]),
+                files: &[(rc, "")],
+                env: &[],
+            },
+            &steps,
+        );
+        let describe = || {
+            observed
+                .payloads
+                .iter()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        };
+        let far = observed
+            .payloads
+            .iter()
+            .position(|p| p.as_slice() == b"7;file://far.example/srv")
+            .unwrap_or_else(|| panic!("{shell:?}: no far report: {}", describe()));
+        // After it, each prompt (A) is preceded by a report from this host.
+        let mut local = false;
+        let mut prompts = 0;
+        for payload in &observed.payloads[far + 1..] {
+            if let Some(report) = payload.strip_prefix(b"7;") {
+                local = parse_osc7(report).is_some_and(|cwd| cwd.host == host);
+            } else if payload.starts_with(b"133;A") {
+                assert!(
+                    local,
+                    "{shell:?} {program:?}: prompt {} without a report: {}",
+                    prompts + 2,
+                    describe()
+                );
+                local = false;
+                prompts += 1;
+            }
+        }
+        assert_eq!(prompts, 2, "{shell:?} {program:?}: {}", describe());
+    }
+}
+
 /// OSC 7 paths outside `[/._~A-Za-z0-9-]` take the scripts' slow path (a
 /// byte loop in zsh and bash, `string escape --style=url` in fish); the
 /// payload must be Terminal.app's encoding exactly (fixture P1, E1-E6), and

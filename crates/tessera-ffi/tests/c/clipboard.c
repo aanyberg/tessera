@@ -15,8 +15,8 @@
 
 #include "TesseraCore.h"
 
-/* Appended after on_appearance_changed (#9); keymap.c checks the table's
- * last field (on_config_applied, #43). */
+/* Appended after on_appearance_changed (#9); remote.c checks the table's
+ * last field (on_session_remote, #205). */
 _Static_assert(offsetof(TesseraCallbacks, on_session_clipboard) ==
                    offsetof(TesseraCallbacks, on_appearance_changed) + sizeof(void (*)(void)),
                "on_session_clipboard follows on_appearance_changed");

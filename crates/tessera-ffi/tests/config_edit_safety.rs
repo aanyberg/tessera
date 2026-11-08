@@ -109,6 +109,7 @@ fn install(app: *mut App, applied: &AtomicU64) {
         on_appearance_changed: None,
         on_session_clipboard: None,
         on_config_applied: Some(on_config_applied),
+        on_session_remote: None,
     };
     // SAFETY: live handle and a valid table; `applied` outlives the app.
     assert_eq!(

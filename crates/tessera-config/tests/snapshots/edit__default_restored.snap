@@ -15,6 +15,10 @@ expression: restored
 default_profile = "Default"
 # Confirm before closing a window that still has running jobs.
 confirm_close = true
+# Mark a tab whose shell runs on another machine: "title" puts "⇢ host: "
+# before its title (or "⇢ ssh" when ssh runs and the host is unknown), "off"
+# leaves titles unchanged.
+remote_indicator = "title"
 
 [appearance]
 # Theme name: a themes/*.toml file next to this file (by file stem or by the

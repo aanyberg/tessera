@@ -45,6 +45,7 @@ Application-wide settings.
 |---|---|---|---|
 | `confirm_close` | boolean | `true` | Confirm before closing a window with running jobs. |
 | `default_profile` | string | `"Default"` | The `[[profiles]]` entry new tabs, windows and panes use when none is chosen (a pane split off another uses that pane's). When no profile has this name, the built-in one is used: `[appearance]` and the login shell (with a warning, unless the name is `"Default"`). |
+| `remote_indicator` | one of `"title"`, `"off"` | `"title"` | How a tab whose shell runs on another machine is marked: `"title"` puts `⇢ <host>: ` before its title, the host taken from the shell's working-directory report (OSC 7), or `⇢ ssh` when `ssh` runs with no such report; `"off"` shows titles unchanged. Applies to open tabs when the file changes. Any other value is reported with a warning and `"title"` is used. |
 
 ## `[plugins]`
 

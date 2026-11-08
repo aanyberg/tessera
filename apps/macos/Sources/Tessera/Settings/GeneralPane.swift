@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// General: the profile new tabs start with, and whether closing a busy
-/// window asks first.
+/// General: the profile new tabs start with, whether closing a busy window
+/// asks first, and whether a tab marks a remote shell in its title.
 struct GeneralPane: View {
     let model: SettingsModel
 
@@ -12,6 +12,13 @@ struct GeneralPane: View {
         SettingsField(
             key: "general.confirm_close", title: "Confirm before closing a window with running jobs",
             control: .toggle),
+        SettingsField(
+            key: "general.remote_indicator", title: "Remote host",
+            control: .choice([
+                SettingsField.Choice(value: "title", title: "Show in tab title"),
+                SettingsField.Choice(value: "off", title: "Don’t show"),
+            ]),
+            note: "Tabs connected to another machine with ssh start their title with ⇢ and the host name."),
     ]
 
     var body: some View {

@@ -11,6 +11,7 @@ final class Recorder: TesseraAppDelegate {
     enum Event: Equatable {
         case output
         case title(String)
+        case remote(TesseraRemote)
         case bell
         case exit(code: Int32, signal: Int32)
     }
@@ -55,6 +56,9 @@ final class Recorder: TesseraAppDelegate {
         onOutput?(session)
     }
     func session(_ session: TesseraSession, didSetTitle title: String) { record(.title(title), session) }
+    func session(_ session: TesseraSession, didChangeRemote remote: TesseraRemote) {
+        record(.remote(remote), session)
+    }
     func sessionDidRingBell(_ session: TesseraSession) { record(.bell, session) }
     func session(_ session: TesseraSession, didExitWithCode code: Int32, signal: Int32) {
         record(.exit(code: code, signal: signal), session)

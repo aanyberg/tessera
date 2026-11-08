@@ -649,6 +649,16 @@ impl Pty for NativePty {
         }
         foreground::foreground_process(self.master.as_ref(), self.pid)
     }
+
+    /// Looks the child's pid up under the phase lock, as
+    /// [`Pty::foreground_process`] does, so a recycled pid is never named.
+    fn session_leader_name(&self) -> Option<String> {
+        let phase = self.phase();
+        if *phase != Phase::Running {
+            return None;
+        }
+        foreground::process_name(self.pid)
+    }
 }
 
 impl Drop for NativePty {

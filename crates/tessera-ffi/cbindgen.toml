@@ -14,7 +14,7 @@ prefix = "Tessera"
 # never hand Rust an invalid discriminant) are not reachable from any
 # signature; list them so their named values reach the header.
 include = [
-    "Key", "KeyEventKind", "Modifiers", "MouseButton", "MouseEventKind", "ScrollTarget", "Granularity", "SearchRefusal",
+    "Key", "KeyEventKind", "Modifiers", "MouseButton", "MouseEventKind", "ScrollTarget", "Granularity", "SearchRefusal", "RemoteKind",
 ]
 # Constants are `#define`d with C-style names instead of the type prefix.
 renaming_overrides_prefixing = true
@@ -35,6 +35,7 @@ renaming_overrides_prefixing = true
 "MAX_CONFIG_VALUE_LEN" = "TESSERA_MAX_CONFIG_VALUE_LEN"
 "MAX_THEME_PATH_LEN" = "TESSERA_MAX_THEME_PATH_LEN"
 "THEME_ID_LEN" = "TESSERA_THEME_ID_LEN"
+"MAX_REMOTE_HOST_LEN" = "TESSERA_MAX_REMOTE_HOST_LEN"
 
 [enum]
 # `TESSERA_ERROR_OK`, `TESSERA_ERROR_NULL_POINTER`, …: C enumerators share

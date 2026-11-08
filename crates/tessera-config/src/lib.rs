@@ -223,6 +223,15 @@ pub struct General {
     pub default_profile: String,
     /// Confirm before closing a window with running jobs.
     pub confirm_close: bool,
+    /// How a tab whose shell runs on another machine is marked: `"title"`
+    /// puts `⇢ <host>: ` before its title, the host taken from the shell's
+    /// working-directory report (OSC 7), or `⇢ ssh` when `ssh` runs with
+    /// no such report; `"off"` shows titles unchanged. Applies to open
+    /// tabs when the file changes. Any other value is reported with a
+    /// warning and `"title"` is used.
+    #[serde(deserialize_with = "load::lenient_remote_indicator")]
+    #[cfg_attr(feature = "schema", schemars(schema_with = "RemoteIndicator::schema"))]
+    pub remote_indicator: RemoteIndicator,
 }
 
 impl Default for General {
@@ -230,7 +239,47 @@ impl Default for General {
         Self {
             default_profile: "Default".into(),
             confirm_close: true,
+            remote_indicator: RemoteIndicator::Title,
         }
+    }
+}
+
+/// How a remote session is marked (`[general] remote_indicator`, #205).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RemoteIndicator {
+    /// `⇢ <host>: ` before the tab's title.
+    #[default]
+    Title,
+    /// No mark.
+    Off,
+}
+
+impl RemoteIndicator {
+    /// Every value, in the order the documentation lists them.
+    pub const ALL: [Self; 2] = [Self::Title, Self::Off];
+
+    /// The value as written in `config.toml`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Title => "title",
+            Self::Off => "off",
+        }
+    }
+
+    /// The value `name` is written as: exactly
+    /// [`RemoteIndicator::as_str`], no other spelling or case.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|value| value.as_str() == name)
+    }
+
+    /// A plain string `enum` schema, as for [`CursorShape`].
+    #[cfg(feature = "schema")]
+    fn schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let values: Vec<&str> = Self::ALL.iter().map(|value| value.as_str()).collect();
+        schemars::json_schema!({ "type": "string", "enum": values })
     }
 }
 
