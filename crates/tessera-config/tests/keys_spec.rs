@@ -11,7 +11,8 @@ use std::path::Path;
 
 use proptest::prelude::*;
 use tessera_config::{
-    Chord, Config, KeyAction, Keys, MAX_CHORD_LEN, MAX_KEY_BINDINGS, MAX_SEND_TEXT_LEN, Warning,
+    Chord, ChordError, Config, KeyAction, Keys, MAX_CHORD_LEN, MAX_KEY_BINDINGS, MAX_SEND_TEXT_LEN,
+    Warning,
 };
 
 fn spec() -> toml::Table {
@@ -275,6 +276,110 @@ fn floods_past_each_cap_are_dropped_with_bounded_warnings() {
     ));
 }
 
+/// Characters that show as nothing: bidi formatting, zero-width,
+/// variation selectors, tags and the other default-ignorables.
+const INVISIBLE: [char; 16] = [
+    '\u{AD}',
+    '\u{34F}',
+    '\u{61C}',
+    '\u{115F}',
+    '\u{180E}',
+    '\u{200B}',
+    '\u{200C}',
+    '\u{200D}',
+    '\u{200E}',
+    '\u{202E}',
+    '\u{2060}',
+    '\u{2066}',
+    '\u{3164}',
+    '\u{FE0F}',
+    '\u{FEFF}',
+    '\u{E0041}',
+];
+
+/// M2 (#317): a chord whose key is invisible is refused with one warning,
+/// which shows the key as its escape; visible keys beyond ASCII still
+/// bind.
+#[test]
+fn invisible_keys_are_refused_with_a_warning() {
+    for c in INVISIBLE {
+        for chord in [format!("cmd+{c}"), format!("ctrl+alt+{c}"), c.to_string()] {
+            let parsed = Chord::parse(&chord);
+            assert_eq!(
+                parsed,
+                Err(ChordError::InvisibleKey(c)),
+                "U+{:04X} in {chord:?}",
+                u32::from(c)
+            );
+            let mut keys = Keys::from_entries([(chord.as_str(), "new_tab")]);
+            assert!(keys.is_empty(), "U+{:04X} bound", u32::from(c));
+            let warnings = keys.take_warnings();
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            let text = warnings[0].to_string();
+            assert!(!text.contains(c), "raw U+{:04X} in {text:?}", u32::from(c));
+            let escape: String = c.escape_unicode().collect();
+            assert!(text.contains(&escape), "{text}");
+            assert!(text.contains("invisible key"), "{text}");
+        }
+    }
+    for chord in [
+        "cmd+é",
+        "cmd+ö",
+        "cmd+ß",
+        "cmd+€",
+        "cmd+\u{2010}",
+        "cmd+т",
+        "cmd+\u{301}",
+    ] {
+        let keys = Keys::from_entries([(chord, "new_tab")]);
+        assert_eq!(keys.bindings().len(), 1, "{chord:?} is visible");
+    }
+}
+
+/// M1 (#317): an `UnknownKey` segment carrying a bidi override, a
+/// zero-width character or (through the control check) a C0 control
+/// reaches the warning escaped, in the reason as well as the key.
+#[test]
+fn unknown_key_warnings_are_escaped() {
+    for (chord, raw, escape) in [
+        ("cmd+a\u{202E}b", '\u{202E}', "\\u{202e}"),
+        ("cmd+a\u{200B}b", '\u{200B}', "\\u{200b}"),
+        ("cmd\u{202E}+t", '\u{202E}', "\\u{202e}"),
+        ("cmd\u{200B}+t", '\u{200B}', "\\u{200b}"),
+        ("cmd+a\u{FEFF}\u{2066}b", '\u{FEFF}', "\\u{feff}"),
+    ] {
+        let error = Chord::parse(chord).unwrap_err();
+        assert!(
+            matches!(error, ChordError::UnknownKey(_)),
+            "{chord:?}: {error:?}"
+        );
+        assert!(!error.to_string().contains(raw), "{error}");
+        assert!(error.to_string().contains(escape), "{error}");
+        let mut keys = Keys::from_entries([(chord, "new_tab")]);
+        let text = keys.take_warnings()[0].to_string();
+        assert!(
+            !text.contains(raw),
+            "raw U+{:04X} in {text:?}",
+            u32::from(raw)
+        );
+        // The key and the reason both carry the escape.
+        assert_eq!(text.matches(escape).count(), 2, "{text}");
+    }
+    let mut keys = Keys::from_entries([("cmd+a\u{1}b", "new_tab")]);
+    let text = keys.take_warnings()[0].to_string();
+    assert!(
+        !text.contains('\u{1}') && text.contains("\\u{1}"),
+        "{text:?}"
+    );
+    // A value too: the command name's warning escapes its invisibles.
+    let mut keys = Keys::from_entries([("cmd+y", "new\u{200B}tab")]);
+    let text = keys.take_warnings()[0].to_string();
+    assert!(
+        !text.contains('\u{200B}') && text.contains("\\u{200b}"),
+        "{text:?}"
+    );
+}
+
 /// A table far past the cap costs work for the first entries only: the
 /// rest are not parsed (they are one warning), so loading stays linear.
 #[test]
@@ -327,6 +432,7 @@ fn segment() -> impl Strategy<Value = String> {
         ])
         .prop_map(str::to_owned),
         any::<char>().prop_map(|c| c.to_string()),
+        prop::sample::select(INVISIBLE.to_vec()).prop_map(|c| c.to_string()),
         "[a-z+]{0,3}",
     ]
 }
@@ -345,6 +451,18 @@ proptest! {
             prop_assert_eq!(Chord::parse(&canonical), Ok(chord), "{:?} -> {:?}", text, canonical);
             prop_assert!(canonical.len() <= MAX_CHORD_LEN + 16);
             prop_assert_eq!(chord.to_string(), canonical);
+        }
+        // Accepted or not, nothing invisible is shown: not in the chord a
+        // menu prints, not in the warning.
+        let mut keys = Keys::from_entries([(text.as_str(), "new_tab")]);
+        let mut shown: Vec<String> = keys
+            .bindings()
+            .iter()
+            .map(|binding| binding.chord.to_string())
+            .collect();
+        shown.extend(keys.take_warnings().iter().map(ToString::to_string));
+        for shown in shown {
+            prop_assert!(!shown.contains(INVISIBLE), "{:?} shows {:?}", text, shown);
         }
     }
 

@@ -8,9 +8,11 @@ use crate::panic::ffi_guard;
 use crate::selection::copy_out;
 
 /// The key map in effect, as JSON (`App::keymap`): what the menus show.
+/// The map and its generation are read under one lock
+/// (`App::keymap_and_generation`), so `generation` always names the
+/// configuration the chords came from (#317).
 fn keymap_json(app: &App) -> String {
-    let map = app.core.keymap();
-    let generation = app.core.config_generation();
+    let (map, generation) = app.core.keymap_and_generation();
     let commands: Vec<serde_json::Value> = CommandId::all()
         .map(|id| {
             let spec = id.spec();
@@ -63,7 +65,8 @@ fn keymap_json(app: &App) -> String {
 /// ```
 ///
 /// * `generation`: the configurations applied before this map
-///   (`on_config_applied`'s count; 0 for the one the app started with).
+///   (`on_config_applied`'s count; 0 for the one the app started with),
+///   read with the map: the chords are always those of this generation.
 /// * `commands`: every command, in id order (the id
 ///   `tessera_session_handle_key` reports); `command` is the name as
 ///   written in `[keys]` (`select_tab:3`); `owner` is `system` (an `AppKit`
@@ -87,8 +90,8 @@ fn keymap_json(app: &App) -> String {
 /// `NULL` with `cap` 0 to ask for it). Returns `TESSERA_ERROR_NULL_POINTER`
 /// if `app` or `len` is `NULL`, or `buf` is `NULL` with `cap` too small;
 /// `*len` is then 0 (when `len` is not `NULL`). The map can change between
-/// the two calls (a configuration applied); compare `generation`, or ask
-/// with room to spare.
+/// the two calls (a configuration applied), so the second may need more
+/// room: ask with room to spare. Each JSON is consistent in itself.
 ///
 /// Any thread.
 ///
@@ -117,4 +120,74 @@ pub unsafe extern "C" fn tessera_app_keymap_json(
         // SAFETY: `len` and `buf` per the contract.
         unsafe { copy_out(&keymap_json(app), buf, cap, len) }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use tessera_app_core::{App as CoreApp, Config, ConfigPaths};
+
+    use super::*;
+
+    /// M4 (#317): under a storm of applies alternating between two
+    /// `[keys]` tables, every JSON's chords are those of its generation
+    /// (odd: `cmd+u` opens a tab too; even: the defaults). Reading the map
+    /// and the generation one after the other tore 2 reads in 357,861.
+    #[test]
+    fn the_generation_and_the_chords_never_disagree() {
+        const APPLIES: u64 = 20_000;
+        let app = Arc::new(App {
+            core: CoreApp::new(Config::default(), ConfigPaths::new("/nonexistent/tessera")),
+        });
+        let bound = Config::from_toml_lenient("[keys]\n'cmd+u' = 'new_tab'\n")
+            .unwrap()
+            .config;
+        let defaults = Config::default();
+        let theme = tessera_config::Theme::default();
+        let done = Arc::new(AtomicBool::new(false));
+        let applier = {
+            let app = Arc::clone(&app);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                for generation in 1..=APPLIES {
+                    let config = if generation % 2 == 1 {
+                        &bound
+                    } else {
+                        &defaults
+                    };
+                    app.core.apply_config(config, &theme);
+                }
+                done.store(true, Ordering::Release);
+            })
+        };
+        let (mut reads, mut torn, mut seen_odd, mut seen_even) = (0_u64, 0_u64, false, false);
+        while !done.load(Ordering::Acquire) {
+            let json: serde_json::Value = serde_json::from_str(&keymap_json(&app)).unwrap();
+            let generation = json["generation"].as_u64().unwrap();
+            let new_tab = json["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["command"] == "new_tab")
+                .unwrap();
+            let expected = if generation % 2 == 1 {
+                seen_odd = true;
+                serde_json::json!(["cmd+u", "cmd+t"])
+            } else {
+                seen_even = true;
+                serde_json::json!(["cmd+t"])
+            };
+            torn += u64::from(new_tab["chords"] != expected);
+            reads += 1;
+        }
+        applier.join().unwrap();
+        assert_eq!(app.core.config_generation(), APPLIES);
+        assert_eq!(torn, 0, "{torn} torn reads in {reads}");
+        assert!(
+            reads > 1 && seen_odd && seen_even,
+            "{reads} reads overlapped the applies"
+        );
+    }
 }

@@ -154,3 +154,46 @@ sanitised (S3 covers what the core displays, not what the user types).
   so a later version can give it meaning without breaking a config.
 * Mode-dependent bindings (only on the alternate screen, only in copy
   mode) wait for copy mode (#47).
+
+## Amendment: #317 (2026-11-08)
+
+The Rust half of the follow-ups #317 lists; the Keys pane's own items stay
+with #40c.
+
+* **Invisible keys are refused.** A chord whose key is a bidi control, a
+  zero-width character or any other `Default_Ignorable_Code_Point` (U+00AD,
+  U+200B to U+200F, U+202A to U+202E, U+2060 to U+206F, U+FEFF, the
+  variation selectors and tags, and the rest of the Unicode property) is
+  left out with an `invisible key` warning naming the code point: a
+  binding the user cannot see in the file or in the Keys pane is a binding
+  nobody can audit. Combining marks and visible non-ASCII keys (`cmd+é`,
+  `cmd+т`) still bind.
+* **Warnings escape what they echo** (S3). The unknown-key segment, the
+  unknown command or parameter and the entry key a warning names are
+  escaped as the loader escapes paths (C0 and C1 controls, U+2028/9, bidi
+  controls) and, stricter than the loader, every default-ignorable
+  character as `\u{…}`, then cut to `MAX_WARNING_PATH_LEN` bytes. Text a
+  warning shows can no longer reorder or hide the rest of the line. The
+  key path `tessera_config_set` echoes in front of a refusal is the
+  caller's own text and is not the key map's to escape.
+* **The source table is dropped after load** (S5). `Keys` kept every raw
+  `[keys]` entry it read (up to the 1 MiB file cap) to put the bindings in
+  document order; it now builds from the entries once and keeps only the
+  at most 512 bindings and their warnings.
+* **The map and its generation are read together.** `App::keymap_and_generation`
+  takes both under the map lock (applies bump the generation under it), and
+  `tessera_app_keymap_json` builds its JSON from that pair: the chords in
+  one JSON are always those of its `generation`. Reading them one after the
+  other tore about one read in 180 000 under a storm of applies.
+* **`Keymap::default()` is the defaults** (the map of an empty `[keys]`
+  table), with chords for every command; it used to be empty and
+  `chords` panicked on it. `chords` no longer indexes.
+* **No re-parsing per key.** The registry's default chords are parsed once
+  (a `LazyLock`); `is_default` is a binary search over the defaults no
+  entry names, compiled with the map, and the ⌘↑ / ⌘↓ prompt rule reads the
+  parsed default. Neither allocates.
+* **A binding runs after the map lock is released.** Dispatch takes the
+  map's `Arc` under the lock and resolves and runs the binding on it
+  unlocked, so a `send_text` write (or anything else a binding does) that
+  reaches the key map again cannot deadlock, and an apply never waits on
+  a write to the PTY.

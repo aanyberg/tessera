@@ -15,6 +15,7 @@
 //! macOS chord, are this module's ([`Keymap::warnings`]).
 
 use std::fmt;
+use std::sync::LazyLock;
 
 use tessera_config::{
     Chord, ChordKey, ChordModifiers, KeyAction, Keys, MAX_WARNING_PATH_LEN, Warning, escaped,
@@ -273,8 +274,29 @@ type Probe = (u8, ChordKey);
 /// modifier sets.
 pub(crate) const ASCII_FILTER_WORDS: usize = 32;
 
+/// The registry's default chords, parsed once: entry `i` holds the
+/// [`CommandSpec::defaults`] of command `i`, in order. Every registry chord
+/// parses (a unit test checks); one that did not would be left out.
+fn registry_defaults() -> &'static [Vec<Chord>] {
+    static DEFAULTS: LazyLock<Vec<Vec<Chord>>> = LazyLock::new(|| {
+        COMMANDS
+            .iter()
+            .map(|spec| {
+                spec.defaults
+                    .iter()
+                    .filter_map(|text| Chord::parse(text).ok())
+                    .collect()
+            })
+            .collect()
+    });
+    &DEFAULTS
+}
+
 /// The defaults and a `[keys]` table, compiled for lookup.
-#[derive(Debug, Clone, Default)]
+///
+/// [`Keymap::default`] is the map of an empty table: the registry's
+/// default chords alone.
+#[derive(Debug, Clone)]
 pub struct Keymap {
     /// The entries compiled, to tell whether a new configuration changes
     /// them.
@@ -293,6 +315,16 @@ pub struct Keymap {
     table: Vec<(Probe, Slot)>,
     texts: Vec<Box<[u8]>>,
     warnings: Vec<Warning>,
+    /// The registry default chords no `[keys]` entry names, sorted: what
+    /// [`Keymap::is_default`] looks up.
+    defaults: Vec<Chord>,
+}
+
+/// The registry defaults alone, as compiled from an empty `[keys]` table.
+impl Default for Keymap {
+    fn default() -> Self {
+        Self::compile(&Keys::default())
+    }
 }
 
 impl Keymap {
@@ -307,17 +339,20 @@ impl Keymap {
     pub fn compile(keys: &Keys) -> Self {
         let defaults: Vec<(Chord, CommandId)> = CommandId::all()
             .flat_map(|id| {
-                // Every registry chord parses (a unit test checks).
-                id.spec()
-                    .defaults
+                registry_defaults()[id.index()]
                     .iter()
-                    .filter_map(move |text| Some((Chord::parse(text).ok()?, id)))
+                    .map(move |&chord| (chord, id))
             })
             .collect();
         let mut map = Self {
             keys: keys.bindings().to_vec(),
+            mask: 0,
+            ascii: [0; ASCII_FILTER_WORDS],
             chords: vec![Vec::new(); COMMANDS.len()],
-            ..Self::default()
+            table: Vec::new(),
+            texts: Vec::new(),
+            warnings: Vec::new(),
+            defaults: Vec::new(),
         };
         let mut taken: Vec<Chord> = Vec::new();
         for binding in keys.bindings() {
@@ -372,7 +407,11 @@ impl Keymap {
                 map.chords[id.index()].push(chord);
                 map.insert(chord, Slot::Command(id));
             }
+            if !map.keys.iter().any(|binding| binding.chord == chord) {
+                map.defaults.push(chord);
+            }
         }
+        map.defaults.sort_unstable();
         map.table.sort_by_key(|&(probe, _)| probe);
         for warning in &map.warnings {
             tracing::warn!(target: "tessera_config", "{warning}");
@@ -476,24 +515,21 @@ impl Keymap {
 
     /// The chords bound to `id`: the `[keys]` entries naming it, in
     /// document order, then its defaults that no entry took. A menu item
-    /// shows the first one [`menu_shortcut`] accepts.
+    /// shows the first one [`menu_shortcut`] accepts. Every map, the
+    /// [`Keymap::default`] one included, has an entry for every command.
     #[must_use]
     pub fn chords(&self, id: CommandId) -> &[Chord] {
-        &self.chords[id.index()]
+        self.chords.get(id.index()).map_or(&[], Vec::as_slice)
     }
 
     /// Whether `chord` is bound by its registry default, not by a `[keys]`
     /// entry (which may name the same command): the ⌘↑ / ⌘↓ prompt rule
     /// (Previous / Next Prompt when the scrollback has a prompt mark)
-    /// applies only to a default binding, never to a user's (N1).
+    /// applies only to a default binding, never to a user's (N1). A binary
+    /// search over the defaults compiled with the map; allocates nothing.
     #[must_use]
     pub fn is_default(&self, chord: Chord) -> bool {
-        !self.keys.iter().any(|binding| binding.chord == chord)
-            && COMMANDS.iter().any(|spec| {
-                spec.defaults
-                    .iter()
-                    .any(|text| Chord::parse(text).ok() == Some(chord))
-            })
+        self.defaults.binary_search(&chord).is_ok()
     }
 
     /// The command a key event bound to `command` runs: `prompt_previous`
@@ -515,13 +551,8 @@ impl Keymap {
             return command;
         };
         let probe = (event.modifiers.without_locks().bits(), key);
-        let default = command
-            .spec()
-            .defaults
-            .first()
-            .and_then(|text| Chord::parse(text).ok());
-        match default {
-            Some(chord)
+        match registry_defaults()[command.index()].first() {
+            Some(&chord)
                 if (chord.modifiers.bits(), chord.key) == probe && self.is_default(chord) =>
             {
                 CommandId::find(upgrade, None).unwrap_or(command)
@@ -841,10 +872,58 @@ mod tests {
         }
     }
 
+    /// #317: the default map is the registry's defaults, for every command
+    /// (it used to have no chords at all, and `chords` panicked).
     #[test]
-    fn an_empty_table_resolves_nothing_cheaply() {
+    fn the_default_map_is_the_registry_defaults() {
         let map = Keymap::default();
+        let compiled = Keymap::compile(&Keys::default());
+        for id in CommandId::all() {
+            let expected: Vec<Chord> = id
+                .spec()
+                .defaults
+                .iter()
+                .map(|text| Chord::parse(text).unwrap())
+                .collect();
+            assert_eq!(map.chords(id), expected, "{id}");
+            assert_eq!(map.chords(id), compiled.chords(id), "{id}");
+            for &chord in &expected {
+                assert!(map.is_default(chord), "{chord}");
+            }
+        }
+        let new_tab = CommandId::find("new_tab", None).unwrap();
         let event = KeyEvent::new(Key::Char('t'), Modifiers::SUPER);
-        assert_eq!(map.resolve(&event), None);
+        assert_eq!(map.resolve(&event), Some(Binding::Command(new_tab)));
+        // Plain typing has no binding, and the mask says so first.
+        let plain = KeyEvent::new(Key::Char('t'), Modifiers::NONE);
+        assert!(!admits(map.mask, plain.modifiers));
+        assert_eq!(map.resolve(&plain), None);
+    }
+
+    /// `is_default` against the rule it caches: no `[keys]` entry names
+    /// the chord, and some command has it as a registry default.
+    #[test]
+    fn is_default_agrees_with_the_registry() {
+        let loaded = tessera_config::Config::from_toml_lenient(
+            "[keys]\n'cmd+up' = 'scroll_page_up'\n'cmd+t' = 'bogus'\n'cmd+n' = 'unbound'\n'cmd+j' = 'new_tab'\n",
+        )
+        .unwrap();
+        let map = Keymap::compile(&loaded.config.keys);
+        let mut chords: Vec<Chord> = COMMANDS
+            .iter()
+            .flat_map(|spec| spec.defaults.iter().map(|text| Chord::parse(text).unwrap()))
+            .collect();
+        chords.extend(["cmd+j", "cmd+shift+j", "ctrl+t", "f5"].map(|t| Chord::parse(t).unwrap()));
+        for chord in chords {
+            let slow = !map.keys().iter().any(|binding| binding.chord == chord)
+                && COMMANDS.iter().any(|spec| {
+                    spec.defaults
+                        .iter()
+                        .any(|text| Chord::parse(text).ok() == Some(chord))
+                });
+            assert_eq!(map.is_default(chord), slow, "{chord}");
+        }
+        assert!(!map.is_default(Chord::parse("cmd+up").unwrap()));
+        assert!(map.is_default(Chord::parse("cmd+down").unwrap()));
     }
 }

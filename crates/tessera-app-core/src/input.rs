@@ -302,10 +302,27 @@ impl Bindings {
         Arc::clone(&lock(&self.map))
     }
 
+    /// The key map in effect and the generation of the configuration it
+    /// came from, read under one lock: [`Bindings::applied`] replaces the
+    /// map and counts the generation under the same lock, so the two
+    /// always belong together (#317).
+    pub(crate) fn keymap_and_generation(&self) -> (Arc<Keymap>, u64) {
+        let guard = lock(&self.map);
+        let map = Arc::clone(&guard);
+        #[cfg(test)]
+        tests::between_reads();
+        (map, self.generation.load(Ordering::Relaxed))
+    }
+
     /// Runs `with` on the binding of `event`, if any, and the keymap it
-    /// is in (locked: `with` must not call [`Bindings::keymap`]); one
-    /// atomic load when no chord has the event's modifiers, a few when no
-    /// chord has its character key with them ([`may_match`]).
+    /// is in; one atomic load when no chord has the event's modifiers, a
+    /// few when no chord has its character key with them ([`may_match`]).
+    /// The lock is held only to take the map: `with` runs on that map
+    /// after it is released (#317), so it may queue `send_text` bytes
+    /// (the PTY and outbox locks), read the map again or apply a
+    /// configuration without waiting on a key press, or a key press on
+    /// it. A configuration applied meanwhile replaces the map for the
+    /// next key; this one finishes with the map it resolved in.
     pub(crate) fn with_binding<R>(
         &self,
         event: &KeyEvent,
@@ -315,7 +332,8 @@ impl Bindings {
         if !may_match(event, mask, |word| self.ascii[word].load(Ordering::Relaxed)) {
             return None;
         }
-        let map = lock(&self.map);
+        // The guard is a temporary: dropped at the end of this statement.
+        let map = Arc::clone(&lock(&self.map));
         map.resolve(event).map(|binding| with(&map, binding))
     }
 
@@ -582,6 +600,162 @@ mod tests {
             bindings.with_binding(&cmd_t, |_, b| b == Binding::Command(id)),
             Some(true)
         );
+    }
+
+    /// #317: `with` runs after the map lock is released, so a binding
+    /// whose work reads the map again or applies a configuration (as
+    /// `send_text` takes the PTY and outbox locks) does not deadlock. On
+    /// another thread with a deadline: a held lock would hang it for good.
+    #[test]
+    fn a_binding_that_reenters_the_map_does_not_deadlock() {
+        let bindings = Arc::new(Bindings::new(&Config::default()));
+        let loaded = Config::from_toml_lenient("[keys]\n'cmd+u' = 'send_text:x'\n").unwrap();
+        bindings.applied(&loaded.config);
+        let (done, finished) = std::sync::mpsc::channel();
+        let worker = Arc::clone(&bindings);
+        std::thread::spawn(move || {
+            let cmd_u = KeyEvent::new(Key::Char('u'), Modifiers::SUPER);
+            let outcome = worker.with_binding(&cmd_u, |map, binding| {
+                let Binding::SendText(bytes) = binding else {
+                    return None;
+                };
+                // Re-entered: the map, the map with its generation, and a
+                // new configuration, each of which takes the map's lock.
+                let again = worker.keymap();
+                let (_, generation) = worker.keymap_and_generation();
+                let applied = worker.applied(&Config::default());
+                Some((
+                    bytes.to_vec(),
+                    std::ptr::eq(map, Arc::as_ptr(&again)),
+                    generation,
+                    applied,
+                ))
+            });
+            let _ = done.send(outcome);
+        });
+        let outcome = finished
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the binding re-entered the map's lock and hung");
+        assert_eq!(outcome, Some(Some((b"x".to_vec(), true, 1, 2))));
+        // The map in effect is the one applied from inside the binding.
+        let cmd_u = KeyEvent::new(Key::Char('u'), Modifiers::SUPER);
+        assert_eq!(bindings.with_binding(&cmd_u, |_, _| ()), None);
+    }
+
+    /// The map and its generation come from the same apply.
+    #[test]
+    fn the_map_and_its_generation_are_read_together() {
+        let bindings = Bindings::new(&Config::default());
+        let (map, generation) = bindings.keymap_and_generation();
+        assert_eq!(generation, 0);
+        assert!(Arc::ptr_eq(&map, &bindings.keymap()));
+        let loaded = Config::from_toml_lenient("[keys]\n'cmd+u' = 'new_tab'\n").unwrap();
+        assert_eq!(bindings.applied(&loaded.config), 1);
+        let (map, generation) = bindings.keymap_and_generation();
+        assert_eq!(generation, 1);
+        let new_tab = CommandId::find("new_tab", None).unwrap();
+        assert_eq!(map.chords(new_tab).len(), 2, "cmd+u and cmd+t");
+    }
+
+    thread_local! {
+        /// Run once by [`Bindings::keymap_and_generation`] on this thread,
+        /// after it took the map and before it reads the generation.
+        static BETWEEN_READS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// The pause point of [`Bindings::keymap_and_generation`].
+    pub(super) fn between_reads() {
+        if let Some(hook) = BETWEEN_READS.with(|cell| cell.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    /// M4 (#317), staged: an apply started between taking the map and
+    /// reading the generation cannot finish there (it waits for the lock),
+    /// so the pair is the old map with the old generation. Read with the
+    /// lock released, it was the old map with the new generation.
+    #[test]
+    fn an_apply_cannot_land_between_the_map_and_its_generation() {
+        let bindings = Arc::new(Bindings::new(&Config::default()));
+        let (start, started) = std::sync::mpsc::channel::<()>();
+        let (finish, finished) = std::sync::mpsc::channel::<u64>();
+        let applier = {
+            let bindings = Arc::clone(&bindings);
+            std::thread::spawn(move || {
+                let bound = Config::from_toml_lenient("[keys]\n'cmd+u' = 'new_tab'\n")
+                    .unwrap()
+                    .config;
+                started.recv().unwrap();
+                let generation = bindings.applied(&bound);
+                // The reader has stopped listening when the apply waited
+                // for the lock, as it should; nothing to report then.
+                let _ = finish.send(generation);
+            })
+        };
+        let landed = Arc::new(Mutex::new(None));
+        let hook_landed = Arc::clone(&landed);
+        BETWEEN_READS.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(move || {
+                start.send(()).unwrap();
+                // Long enough for an unblocked apply even under load; a
+                // blocked one never finishes here.
+                let outcome = finished.recv_timeout(std::time::Duration::from_millis(500));
+                *hook_landed.lock().unwrap() = outcome.ok();
+            }));
+        });
+        let (map, generation) = bindings.keymap_and_generation();
+        let new_tab = CommandId::find("new_tab", None).unwrap();
+        assert_eq!(
+            (generation, map.chords(new_tab).len()),
+            (0, 1),
+            "an apply landed between the reads: {:?}",
+            landed.lock().unwrap()
+        );
+        applier.join().unwrap();
+        assert_eq!(bindings.keymap_and_generation().0.chords(new_tab).len(), 2);
+    }
+
+    /// M4 (#317) at the source: 20,000 applies alternating between two
+    /// `[keys]` tables against a tight loop of reads; every map is the
+    /// one of its generation. (Unstaged, this rarely reaches the few
+    /// nanoseconds between the reads that a torn version left open; the
+    /// staged test above is the one that catches it.)
+    #[test]
+    fn the_map_and_its_generation_never_tear_under_applies() {
+        const APPLIES: u64 = 20_000;
+        let bindings = Arc::new(Bindings::new(&Config::default()));
+        let bound = Config::from_toml_lenient("[keys]\n'cmd+u' = 'new_tab'\n")
+            .unwrap()
+            .config;
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let applier = {
+            let bindings = Arc::clone(&bindings);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                let defaults = Config::default();
+                for generation in 1..=APPLIES {
+                    let config = if generation % 2 == 1 {
+                        &bound
+                    } else {
+                        &defaults
+                    };
+                    assert_eq!(bindings.applied(config), generation);
+                }
+                done.store(true, Ordering::Release);
+            })
+        };
+        let new_tab = CommandId::find("new_tab", None).unwrap();
+        let (mut reads, mut torn) = (0_u64, 0_u64);
+        while !done.load(Ordering::Acquire) {
+            let (map, generation) = bindings.keymap_and_generation();
+            let expected = if generation % 2 == 1 { 2 } else { 1 };
+            torn += u64::from(map.chords(new_tab).len() != expected);
+            reads += 1;
+        }
+        applier.join().unwrap();
+        assert_eq!(torn, 0, "{torn} torn reads in {reads}");
+        assert!(reads > 1, "the reads overlapped the applies");
     }
 
     /// An unbound Command letter stops at the ASCII filter; a configuration

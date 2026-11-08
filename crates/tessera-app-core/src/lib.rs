@@ -337,6 +337,15 @@ impl App {
         self.bindings.keymap()
     }
 
+    /// [`App::keymap`] with the [`App::config_generation`] of the
+    /// configuration it was compiled from, read together under the key
+    /// map's lock: never a map and a generation of two different
+    /// applies, which reading the two one after the other can give while
+    /// configurations apply (#317).
+    pub fn keymap_and_generation(&self) -> (Arc<command::Keymap>, u64) {
+        self.bindings.keymap_and_generation()
+    }
+
     /// How many configurations were applied since the `App` was created
     /// ([`App::apply_config`], and the configuration watch): 0 for the one
     /// it was created with. [`SessionObserver::on_config_applied`] passes
