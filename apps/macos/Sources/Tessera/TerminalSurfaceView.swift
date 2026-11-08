@@ -70,6 +70,10 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     private(set) var coreResizeCount = 0
     /// `render` calls made.
     private(set) var renderCount = 0
+    /// Frames the core drew into a drawable and presented (`.presented` or
+    /// `.suboptimal`, whatever ``frameStatusOverride`` says): the hosted
+    /// test app's windows vend drawables only when the screen is unlocked.
+    private(set) var presentedFrameCount = 0
     /// Display link callbacks, real or driven by a test.
     private(set) var tickCount = 0
     /// Attach attempts made, first attach and re-attaches.
@@ -721,6 +725,7 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         updateScroller()
         do {
             let status = try surface.render()
+            if status == .presented || status == .suboptimal { presentedFrameCount += 1 }
             switch frameStatusOverride ?? status {
             case .presented, .skipped:
                 // Drawn, or nothing changed: nothing is pending, and the link

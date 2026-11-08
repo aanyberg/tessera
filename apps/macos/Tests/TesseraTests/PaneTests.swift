@@ -1654,7 +1654,9 @@ extension PaneTests {
 
         // Phase 2, the flood while the window resizes: what a maximized tab
         // adds, not memory. Resizing a rendering window saw-tooths the
-        // footprint on CI whether or not a tab is maximized (#326), so no
+        // footprint on CI whether or not a tab is maximized: macOS keeps the
+        // old-size drawables for a while (#326, "Live resize footprint" in
+        // docs/debugging.md; ResizeFootprintTests bounds it), so no
         // footprint budget here.
         let sizes = [NSSize(width: 900, height: 600), NSSize(width: 1200, height: 800), NSSize(width: 1000, height: 700)]
         var step = 0
