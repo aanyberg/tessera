@@ -63,6 +63,7 @@ final class MenuKeymapTests: XCTestCase {
         var names: [String] = []
         var unmapped: [String] = []
         var profileMenus: [String] = []
+        var exempt: [String] = []
         func walk(_ menu: NSMenu) {
             for item in menu.items where !item.isSeparatorItem {
                 if let submenu = item.submenu, item.identifier == nil {
@@ -73,6 +74,12 @@ final class MenuKeymapTests: XCTestCase {
                 // registry commands take no profile name (ADR 0037).
                 if let name = item.identifier?.rawValue, name.hasPrefix(MainMenu.profileMenuPrefix) {
                     profileMenus.append(name)
+                    continue
+                }
+                // Exempt: Open config.toml is the Settings window's way
+                // out to the file, not a command of the registry (ADR 0044).
+                if item.identifier?.rawValue == MainMenu.openConfigFileIdentifier {
+                    exempt.append(MainMenu.openConfigFileIdentifier)
                     continue
                 }
                 guard let name = item.identifier?.rawValue, !name.hasSuffix(":") else {
@@ -89,6 +96,7 @@ final class MenuKeymapTests: XCTestCase {
         XCTAssertEqual(names.count, 59, "\(names)")
         XCTAssertEqual(unmapped, [], "\(unmapped)")
         XCTAssertEqual(profileMenus, [MainMenu.newWindowWithProfile, MainMenu.newTabWithProfile])
+        XCTAssertEqual(exempt, [MainMenu.openConfigFileIdentifier])
         for name in names {
             XCTAssertNotNil(keymap.command(named: name), "\(name) is a command")
             XCTAssertNotEqual(keymap.command(named: name)?.owner, .planned, "\(name) runs")

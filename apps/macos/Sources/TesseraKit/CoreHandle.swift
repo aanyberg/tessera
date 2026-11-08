@@ -12,15 +12,23 @@ internal import TesseraCore
 /// sessions that have a write in flight (which wakes a blocked write), waits
 /// for those writes to return, and only then frees the application.
 ///
+/// The Settings window's edits of `config.toml` (`tessera_config_set`,
+/// `_remove`, `tessera_theme_import`; ADR 0044) run on a background queue
+/// through ``call(_:)``, which ``free()`` waits for in the same way. They
+/// never block for long: each reads and writes one small file.
+///
 /// Every other `tessera_*` call is made on the main thread, which is also
 /// where ``free()`` runs, so those calls never race with it; they read
 /// ``pointer`` and pass `NULL` after the free, which the core rejects.
 final class CoreHandle: @unchecked Sendable {
-    // Guards `raw` and `writers`; `free()` waits on it for `writers` to drain.
+    // Guards `raw`, `writers` and `calls`; `free()` waits on it for both to
+    // drain.
     private let condition = NSCondition()
     private var raw: OpaquePointer?
     // Session id -> number of `tessera_session_write` calls in progress.
     private var writers: [UInt64: Int] = [:]
+    // Number of ``call(_:)``s in progress.
+    private var calls = 0
 
     init(_ raw: OpaquePointer) {
         self.raw = raw
@@ -63,6 +71,29 @@ final class CoreHandle: @unchecked Sendable {
         return status
     }
 
+    /// Runs `body` with the live handle, or `NULL` once ``free()`` has
+    /// started, from any thread; ``free()`` waits until it has returned.
+    /// For calls the core allows off the main thread that return on their
+    /// own (no blocking on a session), so ``free()`` need not wake them.
+    func call<Result>(_ body: (OpaquePointer?) -> Result) -> Result {
+        condition.lock()
+        let app = raw
+        if app != nil {
+            calls += 1
+        }
+        condition.unlock()
+        guard app != nil else { return body(nil) }
+        defer {
+            condition.lock()
+            calls -= 1
+            if calls == 0 {
+                condition.broadcast()
+            }
+            condition.unlock()
+        }
+        return body(app)
+    }
+
     /// Frees the application. Main thread only; idempotent. Returns once no
     /// callback runs or can run again (see `tessera_app_free`).
     func free() {
@@ -81,7 +112,7 @@ final class CoreHandle: @unchecked Sendable {
             _ = tessera_session_close(app, id)
         }
         condition.lock()
-        while !writers.isEmpty {
+        while !writers.isEmpty || calls > 0 {
             condition.wait()
         }
         condition.unlock()

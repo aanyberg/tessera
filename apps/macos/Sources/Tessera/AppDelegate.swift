@@ -21,7 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// so no editor or browser starts.
     var opener: any ExternalOpener = WorkspaceOpener()
     /// Creates `config.toml` where it is missing and returns its path, for
-    /// Settings…: the core's ``TesseraApp/createConfig()`` and
+    /// Open config.toml: the core's ``TesseraApp/createConfig()`` and
     /// ``TesseraApp/configPath`` unless a test replaces it, so hosted tests
     /// never create a configuration directory or start the core's watch of
     /// it.
@@ -40,6 +40,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let log = Logger(subsystem: "com.aanyberg.tessera", category: "app")
 
     private var core: TesseraApp?
+    /// The Settings window while it is open (ADR 0044); dropped when it
+    /// closes. Internal for tests.
+    private(set) var settingsWindowController: SettingsWindowController?
+    /// Where the Settings window's frame is saved: its autosave name, or
+    /// `nil` when hosting tests, so tests never write the user's defaults.
+    var settingsAutosaveName: String? = AppDelegate.isTestHost ? nil : SettingsWindowController.autosaveName
     /// Internal so tests can see which sessions it routes.
     let router = SessionRouter()
     private var terminationSignals: [any DispatchSourceSignal] = []
@@ -237,10 +243,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: Configuration and help
 
-    /// Settings… (⌘,): opens `config.toml` in the default editor, after the
-    /// core has written its commented defaults if the file is missing (and
-    /// started applying edits of it live). Replaced by the Preferences window
-    /// in #40 (D6). When no application opens it, or opening fails, Finder
+    /// Settings… (⌘,): opens the Settings window (ADR 0044), or brings the
+    /// open one to the front. It edits the configuration through the core,
+    /// which it starts if no session has yet.
+    @objc func openSettings(_ sender: Any?) {
+        if let controller = settingsWindowController {
+            controller.showWindow(sender)
+            controller.window?.makeKeyAndOrderFront(sender)
+            return
+        }
+        if Self.isTestHost, !(ProcessInfo.processInfo.environment["TESSERA_CONFIG_DIR"]?.hasPrefix("/") ?? false) {
+            // Never edit the user's own configuration from a test.
+            Self.log.error("Settings not opened: a test host needs an absolute TESSERA_CONFIG_DIR")
+            return
+        }
+        let core: TesseraApp
+        do {
+            core = try self.core ?? startCore()
+        } catch {
+            presentError("Could not open Settings", error)
+            return
+        }
+        let actions = SettingsActions { [weak self] in self?.openConfigFile(nil) }
+        let controller = SettingsWindowController(
+            model: SettingsModel(source: core), actions: actions, autosaveName: settingsAutosaveName)
+        controller.onClose = { [weak self] in self?.settingsWindowController = nil }
+        settingsWindowController = controller
+        controller.showWindow(sender)
+    }
+
+    /// Open config.toml (the Tessera menu, and Advanced in Settings): opens
+    /// `config.toml` in the default editor, after the core has written its
+    /// commented defaults if the file is missing (and started applying edits
+    /// of it live). When no application opens it, or opening fails, Finder
     /// shows the file instead, so the user can still find it.
     @objc func openConfigFile(_ sender: Any?) {
         let file: URL
@@ -388,6 +423,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// one. Internal for tests, which call it with no session open so the
     /// app's own spawn and reload paths run on a configuration of theirs.
     func replaceCore(start: Bool) throws {
+        // The Settings window edits through this core.
+        settingsWindowController?.close()
         core?.shutdown()
         core = nil
         if start {
@@ -403,6 +440,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.applyKeymap()
             self?.readPaneDimming()
             self?.applyProfiles()
+            self?.settingsWindowController?.model.reload()
         }
         applyKeymap()
         readPaneDimming()

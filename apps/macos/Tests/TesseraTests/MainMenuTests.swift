@@ -5,8 +5,9 @@ import XCTest
 
 /// The menu bar the app installs at launch: every item's title, key
 /// equivalent, modifiers and action, ⌘= reaching Bigger through its hidden
-/// item, and the application items (Settings…, Tessera Help) without
-/// starting an editor or a browser. The terminal items' effects are tested
+/// item, and the application items (Open config.toml, Tessera Help)
+/// without starting an editor or a browser; the Settings window's are in
+/// ``SettingsTests``. The terminal items' effects are tested
 /// on the view in ``TerminalSurfaceViewTests``, the scrollback items' (and
 /// their key equivalents) in ``TerminalScrollTests``.
 @MainActor
@@ -86,7 +87,8 @@ final class MainMenuTests: XCTestCase {
     private static let tesseraItems: [Item] = [
         Item(title: "About Tessera", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:))),
         .separator,
-        Item(title: "Settings…", key: ",", modifiers: command, action: #selector(AppDelegate.openConfigFile(_:))),
+        Item(title: "Settings…", key: ",", modifiers: command, action: #selector(AppDelegate.openSettings(_:))),
+        Item(title: "Open config.toml", action: #selector(AppDelegate.openConfigFile(_:))),
         .separator,
         Item(title: "Hide Tessera", key: "h", modifiers: command, action: #selector(NSApplication.hide(_:))),
         Item(
@@ -318,27 +320,27 @@ final class MainMenuTests: XCTestCase {
         XCTAssertTrue(NSApp.sendAction(action, to: nil, from: item), "\(title) reached a responder")
     }
 
-    func testSettingsCreatesTheConfigFileThenOpensIt() throws {
-        try choose("Settings…", in: "Tessera")
+    func testOpenConfigFileCreatesTheConfigFileThenOpensIt() throws {
+        try choose("Open config.toml", in: "Tessera")
         XCTAssertEqual(events, ["create", "open \(configFile.path)"], "created (if missing) before it is opened")
         XCTAssertEqual(opener.opened, [configFile])
         XCTAssertEqual(opener.revealed, [])
         XCTAssertEqual(opener.urls, [])
-        try choose("Settings…", in: "Tessera")
+        try choose("Open config.toml", in: "Tessera")
         XCTAssertEqual(events.filter { $0 == "create" }.count, 2, "the core's createConfig() is idempotent")
     }
 
-    func testSettingsShowsTheFileInFinderWhenNothingOpensIt() throws {
+    func testOpenConfigFileShowsTheFileInFinderWhenNothingOpensIt() throws {
         opener.editor = nil
-        try choose("Settings…", in: "Tessera")
+        try choose("Open config.toml", in: "Tessera")
         XCTAssertEqual(events, ["create"])
         XCTAssertEqual(opener.opened, [])
         XCTAssertEqual(opener.revealed, [configFile])
     }
 
-    func testSettingsShowsTheFileInFinderWhenOpeningItFails() throws {
+    func testOpenConfigFileShowsTheFileInFinderWhenOpeningItFails() throws {
         opener.openError = CocoaError(.fileReadNoPermission)
-        try choose("Settings…", in: "Tessera")
+        try choose("Open config.toml", in: "Tessera")
         XCTAssertEqual(opener.opened, [configFile])
         XCTAssertEqual(opener.revealed, [configFile], "after the failed open")
     }
@@ -346,11 +348,12 @@ final class MainMenuTests: XCTestCase {
     func testABoundCommandRunsItsMenuItem() throws {
         // What a chord bound to a command does once the key map resolved it
         // (a chord without Command, which no menu matches).
-        MainMenu.run(command: "settings")
-        XCTAssertEqual(events, ["create", "open \(configFile.path)"])
+        MainMenu.run(command: "help")
+        XCTAssertEqual(opener.urls, [AppDelegate.helpURL])
         MainMenu.run(command: "copy_mode")
         MainMenu.run(command: "no_such_command")
-        XCTAssertEqual(events.count, 2, "a command without an item does nothing")
+        XCTAssertEqual(opener.urls.count, 1, "a command without an item does nothing")
+        XCTAssertEqual(events, [])
     }
 
     func testTesseraHelpOpensTheReadme() throws {
