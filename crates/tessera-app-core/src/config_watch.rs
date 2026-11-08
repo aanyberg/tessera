@@ -2474,7 +2474,56 @@ mod tests {
 
     const REDUCE: DisplayOptions = DisplayOptions {
         reduce_transparency: true,
+        increase_contrast: false,
     };
+
+    const CONTRAST: DisplayOptions = DisplayOptions {
+        reduce_transparency: false,
+        increase_contrast: true,
+    };
+
+    /// Increase Contrast (ADR 0041, fixture E13/E14) draws the cursor and
+    /// the selection opaque in every view theme, tells the observer once,
+    /// turns `dim_inactive_panes` off while it is on (the configured amount
+    /// comes back after), and keeps the background as translucent as the
+    /// configuration says.
+    #[test]
+    fn increase_contrast_draws_opaque_cursor_and_selection_and_stops_dimming() {
+        let mut config = translucency_config();
+        config.appearance.dim_inactive_panes = 0.4;
+        let app = App::new(config.clone(), ConfigPaths::new("/nonexistent/tessera"));
+        let mut colours = bundled("Dracula");
+        colours.selection = colours.selection.with_alpha(0x99);
+        colours.cursor = colours.cursor.with_alpha(0x40);
+        app.apply_config(&config, &colours);
+        let recorder = Recorder::default();
+        app.set_observer(Some(Box::new(recorder.clone())));
+        let plain = attach_fake_profile(&app, None);
+        assert!((app.dim_inactive_panes() - 0.4).abs() < f32::EPSILON);
+        let before = app.view_theme();
+        assert!(
+            before.selection.a < 1.0,
+            "the theme's selection is translucent"
+        );
+
+        app.set_display_options(CONTRAST);
+        assert_eq!(app.display_options(), CONTRAST);
+        assert_eq!(recorder.take(), [false], "told once, still translucent");
+        let theme = app.view_theme();
+        assert!((theme.selection.a - 1.0).abs() < f32::EPSILON);
+        assert!((theme.cursor.a - 1.0).abs() < f32::EPSILON);
+        assert_eq!(theme.background, before.background);
+        assert_eq!(
+            app.session_appearance(plain).unwrap(),
+            appearance(false, true)
+        );
+        assert!(app.dim_inactive_panes().abs() < f32::EPSILON, "no dimming");
+
+        app.set_display_options(DisplayOptions::default());
+        assert_eq!(recorder.take(), [false]);
+        assert_eq!(app.view_theme(), before);
+        assert!((app.dim_inactive_panes() - 0.4).abs() < f32::EPSILON);
+    }
 
     fn appearance(opaque: bool, blur: bool) -> crate::SessionAppearance {
         crate::SessionAppearance { opaque, blur }

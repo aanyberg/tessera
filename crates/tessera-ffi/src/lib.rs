@@ -39,6 +39,7 @@
 //! The thread-safety contract is documented on [`App`] and [`Callbacks`],
 //! and is reproduced in the generated header.
 
+mod accessibility;
 mod app;
 mod callbacks;
 mod config;
@@ -54,6 +55,14 @@ mod surface;
 
 use std::ffi::{CStr, c_char};
 
+pub use accessibility::{
+    AccessibleText, AccessibleTextContents, CellRect, MAX_ACCESSIBLE_TEXT_UNITS,
+    MAX_ANNOUNCEMENT_CHARS, TextRange, tessera_accessible_text_announcement,
+    tessera_accessible_text_cells_for_range, tessera_accessible_text_char_range,
+    tessera_accessible_text_contents, tessera_accessible_text_free,
+    tessera_accessible_text_line_for_index, tessera_accessible_text_line_range,
+    tessera_accessible_text_range_at_cell, tessera_session_accessible_text,
+};
 pub use app::{
     App, DisplayOptions, tessera_app_config_path, tessera_app_create_config,
     tessera_app_dim_inactive_panes, tessera_app_free, tessera_app_new, tessera_app_set_callbacks,

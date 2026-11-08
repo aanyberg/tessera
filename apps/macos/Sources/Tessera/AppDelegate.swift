@@ -79,6 +79,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var reducesTransparency: @MainActor () -> Bool = {
         NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
     }
+    /// Reads the system's Increase Contrast setting, which
+    /// ``applyDisplayOptions()`` hands the core with Reduce Transparency
+    /// (ADR 0041). Tests replace it.
+    var increasesContrast: @MainActor () -> Bool = {
+        NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
+    }
+    /// Reads the system's Reduce Motion setting, which
+    /// ``applyDisplayOptions()`` gives every scroll bar (it stays on the
+    /// Swift side, ADR 0041). Tests replace it.
+    var reducesMotion: @MainActor () -> Bool = {
+        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+    /// The options last handed to the current core, or `nil` before the
+    /// first: a notification that changes neither setting makes no call.
+    private var appliedDisplayOptions: TesseraApp.DisplayOptions?
+    /// How many times the core was handed display options (tests).
+    private(set) var displayOptionsCallCount = 0
     /// Follows changes of the system's display settings.
     private var displayOptionsObserver: (any NSObjectProtocol)?
     /// The profile each session was started with, by session id, for the
@@ -103,6 +120,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MainMenu.install(in: NSApp)
         terminateOnSignals()
         observeDisplayOptions()
+        applyDisplayOptions()
         guard !Self.isTestHost else { return }
         let store = WindowStateStore(defaults: .standard)
         windowStateStore = store
@@ -457,21 +475,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         readPaneDimming()
         readRemoteIndicator()
         applyProfiles()
+        appliedDisplayOptions = nil
         applyDisplayOptions()
         return core
     }
 
-    /// Hands the core the system's display settings (Reduce Transparency,
-    /// ADR 0043): at start and whenever they change. The core re-styles the
+    /// Applies the system's display settings: at start and whenever they
+    /// change, each read once. Reduce Motion goes to every scroll bar.
+    /// Reduce Transparency (ADR 0043) and Increase Contrast (ADR 0041) go
+    /// to the core, only when one of them changed: it re-styles the
     /// sessions and reports the change through the router, so every pane
-    /// and window follows; a setting that did not change does nothing.
+    /// and window follows, and the pane dimming is read again (Increase
+    /// Contrast turns it off).
     func applyDisplayOptions() {
+        let motion = reducesMotion()
+        if TerminalScroller.systemReducesMotion != motion {
+            TerminalScroller.systemReducesMotion = motion
+            for controller in windowControllers {
+                for pane in controller.paneContainer.panes {
+                    pane.view.scroller.reducesMotion = motion
+                }
+            }
+        }
         guard let core else { return }
+        let options = TesseraApp.DisplayOptions(
+            reduceTransparency: reducesTransparency(), increaseContrast: increasesContrast())
+        guard options != appliedDisplayOptions else { return }
         do {
-            try core.setDisplayOptions(.init(reduceTransparency: reducesTransparency()))
+            try core.setDisplayOptions(options)
+            appliedDisplayOptions = options
+            displayOptionsCallCount += 1
         } catch {
             Self.log.error("display options not applied: \(String(describing: error), privacy: .public)")
         }
+        readPaneDimming()
     }
 
     /// AppKit posts this on the workspace's centre, on the main thread, when
@@ -497,9 +534,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Reads `dim_inactive_panes` from the core: at start and after every
-    /// configuration it applies (live reload). Keeps the previous amount if
-    /// it cannot be read.
+    /// Reads `dim_inactive_panes` from the core: at start, after every
+    /// configuration it applies (live reload) and after the display options
+    /// change (0 under Increase Contrast). Keeps the previous amount if it
+    /// cannot be read.
     private func readPaneDimming() {
         guard let core else { return }
         do {

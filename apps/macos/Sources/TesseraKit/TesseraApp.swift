@@ -256,7 +256,9 @@ public final class TesseraApp {
 
     /// `[appearance] dim_inactive_panes` in effect: how much to darken the
     /// panes of a split tab that do not have the focus, 0 (off) to 0.8,
-    /// clamped by the core. Read again after a configuration is applied.
+    /// clamped by the core, and 0 while
+    /// ``DisplayOptions/increaseContrast`` is on (ADR 0041). Read again after
+    /// a configuration is applied and after ``setDisplayOptions(_:)``.
     ///
     /// - Throws: ``TesseraCoreError/nullPointer`` after ``shutdown()``.
     public func dimInactivePanes() throws -> Float {
@@ -272,9 +274,15 @@ public final class TesseraApp {
         /// Reduce transparency): every background is drawn opaque and none is
         /// blurred, whatever the configuration asks for.
         public var reduceTransparency: Bool
+        /// The system asks for more contrast (Accessibility, Display,
+        /// Increase contrast): the cursor and the selection are drawn opaque
+        /// and ``TesseraApp/dimInactivePanes()`` reports 0, whatever the theme
+        /// and configuration ask for (ADR 0041).
+        public var increaseContrast: Bool
 
-        public init(reduceTransparency: Bool = false) {
+        public init(reduceTransparency: Bool = false, increaseContrast: Bool = false) {
             self.reduceTransparency = reduceTransparency
+            self.increaseContrast = increaseContrast
         }
     }
 
@@ -282,12 +290,14 @@ public final class TesseraApp {
     /// call; they survive configuration reloads. Call it at start and when the
     /// system setting changes. A call that changes nothing does nothing;
     /// otherwise ``TesseraAppDelegate/appearanceDidChange(opaque:)`` follows
-    /// when a view's opacity or blur changed.
+    /// when a view's opacity or blur changed, and ``dimInactivePanes()`` holds
+    /// the new amount.
     ///
     /// - Throws: ``TesseraCoreError/nullPointer`` after ``shutdown()``.
     public func setDisplayOptions(_ options: DisplayOptions) throws {
         var raw = TesseraDisplayOptions()
         raw.reduce_transparency = options.reduceTransparency ? 1 : 0
+        raw.increase_contrast = options.increaseContrast ? 1 : 0
         try TesseraCoreError.check(tessera_app_set_display_options(core.pointer, &raw))
     }
 

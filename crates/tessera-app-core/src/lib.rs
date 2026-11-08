@@ -31,6 +31,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod accessibility;
 pub mod command;
 pub mod commands;
 mod config_watch;
@@ -60,6 +61,7 @@ use tessera_term::{
     Modifiers, MouseEncoding, MouseTracking, Terminal, encode_key, to_8bit_controls,
 };
 
+pub use accessibility::{AccessibleText, CellRect};
 pub use commands::{
     CommandRecord, CommandState, MAX_COMMAND_RECORDS, MAX_PROMPT_SCAN_LINES,
     PROMPT_SCAN_LINES_PER_LOCK,
@@ -1591,6 +1593,26 @@ impl App {
             }))
     }
 
+    /// The text session `id`'s view shows now, for assistive clients
+    /// (ADR 0041; see the [`accessibility`] module for its rules): the rows
+    /// at the view's scroll offset, the cursor (none while scrolled back)
+    /// and the selection.
+    ///
+    /// Holds the terminal lock only to copy the rows, as a frame's capture
+    /// does; the text is built after it is released. Call it when an
+    /// assistive client asks, at most a few times a second, never per
+    /// output callback without one.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn accessible_text(&self, id: SessionId) -> Result<AccessibleText> {
+        let capture = self.session(id)?.with_selection(|selection, term, offset| {
+            accessibility::Capture::of_view(selection, term, offset)
+        });
+        Ok(capture.build())
+    }
+
     /// The link at view-relative cell `at` of session `id` (the view's
     /// scroll offset honoured), with the cells it covers on each row the
     /// view shows, or `None` when there is none there or `at` is outside
@@ -2134,6 +2156,21 @@ impl App {
     /// off until it is called).
     pub fn display_options(&self) -> DisplayOptions {
         lock(&self.applied).display
+    }
+
+    /// How much the host darkens the panes of a split tab that do not have
+    /// the keyboard focus: `[appearance] dim_inactive_panes` of the
+    /// configuration in effect, or 0.0 (off) while
+    /// [`DisplayOptions::increase_contrast`] is on (ADR 0041). Read it again
+    /// after a configuration is applied and after the display options
+    /// change.
+    pub fn dim_inactive_panes(&self) -> f32 {
+        let applied = lock(&self.applied);
+        if applied.display.increase_contrast {
+            0.0
+        } else {
+            applied.config.appearance.dim_inactive_panes
+        }
     }
 
     /// How session `id`'s background is drawn now (ADR 0043): whether it
@@ -5149,6 +5186,35 @@ mod tests {
         // Output after the resize is anchored again.
         output(&fake, &events, b"a\r\nb\r\n");
         assert_eq!(app.scroll_offset(id).unwrap(), top - 28);
+    }
+
+    /// ADR 0041: `accessible_text` reads the rows the view shows, at its
+    /// scroll offset, with the cursor and the selection; an unknown
+    /// session is an error.
+    #[test]
+    fn accessible_text_reads_the_view_with_its_cursor_and_selection() {
+        let app = app();
+        let id = app.spawn_test_session(PtySize::new(3, 12)).unwrap();
+        app.feed_for_test(id, b"ls\r\na.txt  b.txt\r\n$ ").unwrap();
+        let text = app.accessible_text(id).unwrap();
+        let utf16 = |s: &str| s.encode_utf16().collect::<Vec<_>>();
+        assert_eq!(text.text(), utf16("ls\na.txt  b.txt\n$ "));
+        assert_eq!(text.cursor(), Some(18));
+        assert_eq!(text.selection(), None);
+        app.select_begin(id, Point::new(1, 0), Granularity::Char, false)
+            .unwrap();
+        app.select_extend(id, Point::new(1, 4)).unwrap();
+        assert_eq!(app.accessible_text(id).unwrap().selection(), Some(3..8));
+
+        app.feed_for_test(id, b"\r\nmore\r\n$ ").unwrap();
+        app.scroll_to(id, ScrollTarget::Offset(1)).unwrap();
+        let scrolled = app.accessible_text(id).unwrap();
+        assert_eq!(scrolled.text(), utf16("a.txt  b.txt\n$\nmore"));
+        assert_eq!(scrolled.cursor(), None);
+        assert!(matches!(
+            app.accessible_text(SessionId::from_raw(9999)),
+            Err(Error::SessionNotFound(_))
+        ));
     }
 
     /// #284: a resize there and back that no frame sees in between, as

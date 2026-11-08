@@ -209,6 +209,12 @@ pub struct DisplayOptions {
     /// fully opaque (`appearance.opacity` taken as 1.0, and a translucent
     /// theme background made opaque too) and nothing is blurred.
     pub reduce_transparency: bool,
+    /// The system's Increase Contrast setting (ADR 0041): the selection
+    /// and the cursor are drawn fully opaque, in their theme colours, and
+    /// inactive panes are not dimmed ([`App::dim_inactive_panes`]).
+    ///
+    /// [`App::dim_inactive_panes`]: crate::App::dim_inactive_panes
+    pub increase_contrast: bool,
 }
 
 /// How one session's background is drawn ([`App::session_appearance`],
@@ -233,7 +239,8 @@ pub struct SessionAppearance {
 /// `theme` the colours its `theme` resolved to, under the host's `display`
 /// options. With [`DisplayOptions::reduce_transparency`] the background
 /// is fully opaque, whatever `appearance.opacity` and the theme's alpha
-/// say.
+/// say; with [`DisplayOptions::increase_contrast`] so are the cursor and
+/// the selection, their colours unchanged.
 #[must_use]
 pub fn theme_for_appearance(
     appearance: &Appearance,
@@ -247,13 +254,20 @@ pub fn theme_for_appearance(
         background.a * appearance.opacity
     };
     let defaults = Theme::default();
+    let contrast = |color: Rgba| {
+        if display.increase_contrast {
+            color.with_alpha(1.0)
+        } else {
+            color
+        }
+    };
     Theme {
         font_family: appearance.font_family.clone(),
         font_size: sanitize_font_size(appearance.font_size),
         foreground: rgba(theme.foreground),
         background: background.with_alpha(alpha),
-        cursor: rgba(theme.cursor),
-        selection: rgba(theme.selection),
+        cursor: contrast(rgba(theme.cursor)),
+        selection: contrast(rgba(theme.selection)),
         search_match: theme.search_match.map_or(defaults.search_match, rgba),
         search_match_current: theme
             .search_match_current
@@ -1393,6 +1407,7 @@ mod tests {
 
         let reduce = DisplayOptions {
             reduce_transparency: true,
+            ..DisplayOptions::default()
         };
         let mut source = tessera_config::Theme::bundled("Dracula").unwrap().clone();
         for (background_alpha, opacity) in [(0xff, 1.0), (0xff, 0.5), (0x80, 1.0), (0x80, 0.0)] {
@@ -1425,6 +1440,70 @@ mod tests {
         }
     }
 
+    /// Increase Contrast (ADR 0041, fixture E13): the cursor and the
+    /// selection are drawn fully opaque with their colour unchanged, the
+    /// background keeps its alpha, and with Reduce Transparency on too
+    /// both apply. Off, the theme is the one `theme_for` gives.
+    #[test]
+    fn increase_contrast_makes_the_cursor_and_selection_opaque() {
+        use tessera_config::Color;
+
+        let mut source = tessera_config::Theme::bundled("Dracula").unwrap().clone();
+        source.background = Color::rgb(0x28, 0x2a, 0x36).with_alpha(0x80);
+        source.cursor = Color::rgb(0xf8, 0xf8, 0xf2).with_alpha(0x40);
+        source.selection = Color::rgb(0x44, 0x47, 0x5a).with_alpha(0x99);
+        let appearance = Appearance {
+            opacity: 0.5,
+            ..Appearance::default()
+        };
+        let plain = theme_for_appearance(&appearance, &source, DisplayOptions::default());
+        let config = Config {
+            appearance: appearance.clone(),
+            ..Config::default()
+        };
+        assert_eq!(plain, theme_for(&config, &source), "off: unchanged");
+        assert!(plain.cursor.a < 0.5 && plain.selection.a < 0.7);
+        let contrast = DisplayOptions {
+            increase_contrast: true,
+            ..DisplayOptions::default()
+        };
+        let high = theme_for_appearance(&appearance, &source, contrast);
+        for (name, color, was) in [
+            ("cursor", high.cursor, plain.cursor),
+            ("selection", high.selection, plain.selection),
+        ] {
+            assert!(
+                (color.a - 1.0).abs() < f32::EPSILON,
+                "{name} alpha {}",
+                color.a
+            );
+            assert_eq!(color.with_alpha(was.a), was, "{name} keeps its colour");
+        }
+        assert_eq!(
+            high.background, plain.background,
+            "the background keeps its alpha"
+        );
+        assert_eq!(
+            Theme {
+                cursor: plain.cursor,
+                selection: plain.selection,
+                ..high.clone()
+            },
+            plain,
+            "nothing else changes"
+        );
+        let both = theme_for_appearance(
+            &appearance,
+            &source,
+            DisplayOptions {
+                increase_contrast: true,
+                reduce_transparency: true,
+            },
+        );
+        assert!((both.background.a - 1.0).abs() < f32::EPSILON);
+        assert_eq!((both.cursor, both.selection), (high.cursor, high.selection));
+    }
+
     /// A look blurs only while its background is translucent: `blur` at
     /// opacity 1.0 (nothing shows through) or under Reduce Transparency
     /// gives none.
@@ -1433,6 +1512,7 @@ mod tests {
         let colours = tessera_config::Theme::bundled("Dracula").unwrap().clone();
         let reduce = DisplayOptions {
             reduce_transparency: true,
+            ..DisplayOptions::default()
         };
         let look = |opacity: f32, blur: bool, display: DisplayOptions| {
             let appearance = Appearance {

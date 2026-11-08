@@ -80,6 +80,11 @@ test-group = 'timing'
 filter = 'package(tessera-app-core) & kind(lib) & (test(scrolling_through_a_long_history_is_smooth) | test(a_flood_under_a_scrolled_view_keeps_captures_short))'
 test-group = 'timing'
 
+# Release-only accessibility bar (#52): the S6 lock hold of `App::accessible_text` against a frame's capture.
+[[profile.default.overrides]]
+filter = 'package(tessera-app-core) & kind(lib) & test(accessible_text_lock_hold_is_no_longer_than_a_capture)'
+test-group = 'timing'
+
 # Release-only smart-selection latency bar (#47, SS-C6), also run by the gate's release timing step.
 [[profile.default.overrides]]
 filter = 'package(tessera-app-core) & binary(smart_selection) & test(=a_double_click_with_64_rules_on_2048_columns_takes_under_5_ms)'
