@@ -1002,6 +1002,9 @@ final class TerminalScrollTests: XCTestCase {
         host.wantsLayer = true
         window.contentView = host
         let scroller = TerminalScroller()
+        // These tests time the fade: off whatever the machine's setting
+        // (a CI runner may report Reduce Motion on).
+        scroller.reducesMotion = false
         scroller.preferredStyleOverride = .overlay
         scroller.frame = NSRect(x: 480 - TerminalScroller.width, y: 0, width: TerminalScroller.width, height: 200)
         host.addSubview(scroller)

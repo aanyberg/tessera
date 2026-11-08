@@ -396,7 +396,7 @@ final class ReduceTransparencySettingTests: XCTestCase {
         // The next test's first session starts a core on its own configuration.
         try appDelegate.replaceCore(start: false)
         appDelegate.spawnOptions = .init()
-        appDelegate.reducesTransparency = { NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency }
+        HostDisplaySettings.pin(appDelegate)
         appDelegate = nil
         if let previous { setenv("TESSERA_CONFIG_DIR", previous, 1) } else { unsetenv("TESSERA_CONFIG_DIR") }
         try? FileManager.default.removeItem(at: dir)

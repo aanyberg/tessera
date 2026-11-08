@@ -33,6 +33,13 @@ Tests never read or write the real home directory. Tests that create an
 sound with one test per process, so run them with `cargo nextest` (as `just
 test` and the gate do), not plain `cargo test`.
 
+The app's tests do not read the machine's Accessibility settings either:
+the test bundle's principal class (`HostDisplaySettings`) pins Reduce
+Motion, Reduce Transparency and Increase Contrast off before the first
+test, and a test that turns one on puts the pin back in its tearDown. A
+view's VoiceOver monitor is the machine's until a test replaces it, so a
+test that needs a client attached sets a detached fake first.
+
 ## Adding an escape-sequence test
 
 Emulator tests in `crates/tessera-term/tests/` feed bytes into a fresh

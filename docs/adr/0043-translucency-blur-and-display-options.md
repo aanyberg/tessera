@@ -75,3 +75,15 @@ Preferences window's (#40b).
   it stays for ABI stability and for hosts with one window.
 - Increase Contrast (#52) adds a field to `DisplayOptions` and one more
   check in `theme_for_appearance`; no new export.
+
+## Amendment (#52, ADR 0041, 2026-11-08)
+
+`DisplayOptions` is now `{ reduce_transparency, increase_contrast }`, both
+`uint8_t` flags read as above, two bytes with no size field (decision F7):
+the header and the core ship together, and both sides assert the size (the
+Rust `display_options` FFI test and TesseraKit's `MemoryLayout` test). While
+`increase_contrast` is set, `theme_for_appearance` draws the cursor and the
+selection fully opaque and `App::dim_inactive_panes` is 0. The app reads
+Increase Contrast with Reduce Transparency on this ADR's observer and calls
+`tessera_app_set_display_options` only when one of them changed, then reads
+the pane dimming again.

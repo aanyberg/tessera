@@ -21,7 +21,8 @@ import TesseraKit
 ///   overlay scroller is hidden then; otherwise it shows when the user
 ///   scrolls or points at it and fades out after a moment, like AppKit's
 ///   own overlay scrollers. A faded-out scroller lets clicks through to
-///   the terminal.
+///   the terminal. Under the system's Reduce Motion (``reducesMotion``) it
+///   appears and disappears at once, with no fade (ADR 0041).
 /// - Input: dragging the knob or clicking the track reports where to go
 ///   through ``onScroll``; the terminal view moves the session's view.
 @MainActor
@@ -61,6 +62,28 @@ final class TerminalScroller: NSScroller {
 
     /// The clock the flash is timed by (tests advance their own).
     var now: () -> CFTimeInterval = { CACurrentMediaTime() }
+    /// Runs the closure on the main actor after the delay: hides a flash
+    /// shown without an animation (tests run it themselves).
+    var scheduleHide: (CFTimeInterval, @escaping @MainActor () -> Void) -> Void = { delay, hide in
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { MainActor.assumeIsolated { hide() } }
+    }
+    /// A hide is scheduled (at most one at a time).
+    private var hidePending = false
+    /// The system's Reduce Motion (Accessibility, Display) as the app last
+    /// read it, which new scrollers start with.
+    static var systemReducesMotion = false
+    /// No fade: a flash shows at full opacity at once and hides after
+    /// ``holdDuration`` without an animation. Turning it on or off during a
+    /// flash settles it: shown until the flash would have ended, then
+    /// hidden.
+    var reducesMotion = TerminalScroller.systemReducesMotion {
+        didSet {
+            guard reducesMotion != oldValue, flashEnd != nil else { return }
+            layer?.removeAnimation(forKey: Self.flashKey)
+            alphaValue = 1
+            hideAfterFlash()
+        }
+    }
     /// AppKit's preferred scroller style, read when the system says it
     /// changed (tests stand in for the user's setting).
     static var systemStyle: @MainActor () -> NSScroller.Style = { NSScroller.preferredScrollerStyle }
@@ -184,6 +207,13 @@ final class TerminalScroller: NSScroller {
     /// while it stays shown or is in use.
     func flash() {
         guard !isHidden, !staysShown, !isTracking, !isPointerInside, let layer else { return }
+        guard !reducesMotion else {
+            layer.removeAnimation(forKey: Self.flashKey)
+            alphaValue = 1
+            flashEnd = now() + Self.holdDuration
+            hideAfterFlash()
+            return
+        }
         let total = Self.holdDuration + Self.fadeDuration
         let appear = 0.1
         let animation = CAKeyframeAnimation(keyPath: "opacity")
@@ -195,6 +225,26 @@ final class TerminalScroller: NSScroller {
         // commit, which an idle terminal never makes: the end time, not
         // the animation's presence, says whether it is still shown.
         flashEnd = now() + total
+    }
+
+    /// Hides a flash shown without an animation once it has ended: at once
+    /// when it has, otherwise through one hide scheduled for its end, which
+    /// looks again (a later flash moves the end).
+    private func hideAfterFlash() {
+        guard let flashEnd else { return }
+        let remaining = flashEnd - now()
+        guard remaining > 0 else {
+            self.flashEnd = nil
+            applyVisibility()
+            return
+        }
+        guard !hidePending else { return }
+        hidePending = true
+        scheduleHide(remaining) { [weak self] in
+            guard let self else { return }
+            hidePending = false
+            hideAfterFlash()
+        }
     }
 
     /// Hidden only in overlay style without history. Hiding forgets the

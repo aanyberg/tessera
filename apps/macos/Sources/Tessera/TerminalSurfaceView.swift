@@ -103,9 +103,12 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     /// The window the link and observers are set up for.
     private weak var observedWindow: NSWindow?
     /// Something changed since the last frame. Setting it wakes the display
-    /// link.
+    /// link and tells ``accessibility`` the text may have changed.
     private var needsRender = true {
-        didSet { if needsRender != oldValue { updateDisplayLinkPause() } }
+        didSet {
+            if needsRender { accessibility.contentChanged() }
+            if needsRender != oldValue { updateDisplayLinkPause() }
+        }
     }
     private var isLiveResizing = false
     private var pendingResize = false {
@@ -239,12 +242,16 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     /// starts a re-attached surface (a lost swapchain, a tab moved to another
     /// window) at the configured size, so the zoom is applied again then.
     private(set) var zoomedFontSizePt: Float?
+    /// What VoiceOver reads and is told about output (ADR 0041).
+    let accessibility: TerminalAccessibility
 
     init(session: TesseraSession, frame: NSRect = NSRect(x: 0, y: 0, width: 480, height: 200)) {
         self.session = session
         surface = TesseraSurface(session: session)
         renderView = TerminalRenderView(frame: NSRect(origin: .zero, size: frame.size))
+        accessibility = TerminalAccessibility(textProvider: { [session] in try session.accessibleText() })
         super.init(frame: frame)
+        accessibility.element = self
         wantsLayer = true
         addSubview(renderView)
 

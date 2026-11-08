@@ -327,9 +327,10 @@ pub unsafe extern "C" fn tessera_app_config_path(
 
 /// Stores `[appearance] dim_inactive_panes` of the configuration in effect
 /// in `*out`: how much the window darkens the panes of a split tab that do
-/// not have the keyboard focus, already clamped to 0.0 (off) ..= 0.8.
-/// Read it at start and again on `on_config_applied`, after which it holds
-/// the new value.
+/// not have the keyboard focus, already clamped to 0.0 (off) ..= 0.8, and
+/// 0.0 while `TesseraDisplayOptions::increase_contrast` is on (ADR 0041).
+/// Read it at start, again on `on_config_applied` and again after
+/// `tessera_app_set_display_options`, after which it holds the new value.
 ///
 /// Returns `TESSERA_ERROR_NULL_POINTER` if `app` or `out` is `NULL`; `*out`
 /// is set to 0.0 on failure when `out` is not `NULL`.
@@ -350,7 +351,7 @@ pub unsafe extern "C" fn tessera_app_dim_inactive_panes(app: *const App, out: *m
         let Some(app) = (unsafe { App::from_ptr(app) }) else {
             return Error::NullPointer;
         };
-        let dim = app.core.config().appearance.dim_inactive_panes;
+        let dim = app.core.dim_inactive_panes();
         // SAFETY: as above.
         unsafe { out.write(dim) };
         Error::Ok
@@ -374,6 +375,12 @@ pub struct DisplayOptions {
     /// background is drawn opaque and none is blurred, whatever the
     /// configuration asks for.
     pub reduce_transparency: u8,
+    /// Non-zero when the system asks for more contrast (macOS:
+    /// Accessibility, Display, Increase contrast): the cursor and the
+    /// selection are drawn opaque and `tessera_app_dim_inactive_panes`
+    /// reports 0.0, whatever the theme and configuration ask for
+    /// (ADR 0041).
+    pub increase_contrast: u8,
 }
 
 /// Applies the system's display settings in `*options` to every session,
@@ -381,8 +388,11 @@ pub struct DisplayOptions {
 /// survive configuration reloads. Call it at start and whenever the system
 /// setting changes. A call that changes nothing does nothing; otherwise
 /// sessions whose look changed are redrawn and `on_appearance_changed` is
-/// called (on the calling thread) when the opacity or blur of any session
-/// changed. `on_config_applied` is not called.
+/// called (on the calling thread) when anything a session draws changed:
+/// its opacity or blur, or its colours (an `increase_contrast` change alone
+/// changes the cursor and selection colours, so it calls it too).
+/// `on_config_applied` is not called; read
+/// `tessera_app_dim_inactive_panes` again after the call.
 ///
 /// Returns `TESSERA_ERROR_NULL_POINTER` if `app` or `options` is `NULL`.
 ///
@@ -409,6 +419,7 @@ pub unsafe extern "C" fn tessera_app_set_display_options(
         app.core
             .set_display_options(tessera_app_core::DisplayOptions {
                 reduce_transparency: options.reduce_transparency != 0,
+                increase_contrast: options.increase_contrast != 0,
             });
         Error::Ok
     })

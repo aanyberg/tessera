@@ -2,7 +2,8 @@
 //! from its profile, and `tessera_app_set_display_options` with
 //! `reduce_transparency` makes every session opaque and unblurred, tells
 //! the host through `on_appearance_changed`, and is undone by turning it
-//! off (ADR 0043).
+//! off (ADR 0043); `increase_contrast` turns pane dimming off until it is
+//! turned off (ADR 0041).
 //!
 //! A binary of its own: it points `TESSERA_CONFIG_DIR` at a configuration
 //! of its own, which no other test may see.
@@ -17,9 +18,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use tessera_ffi::{
-    App, Callbacks, DisplayOptions, Error, SessionAppearance, SpawnOptions, tessera_app_free,
-    tessera_app_new, tessera_app_set_callbacks, tessera_app_set_display_options,
-    tessera_session_appearance, tessera_session_close, tessera_session_spawn,
+    App, Callbacks, DisplayOptions, Error, SessionAppearance, SpawnOptions,
+    tessera_app_dim_inactive_panes, tessera_app_free, tessera_app_new, tessera_app_set_callbacks,
+    tessera_app_set_display_options, tessera_session_appearance, tessera_session_close,
+    tessera_session_spawn,
 };
 
 /// `on_appearance_changed` runs on the calling thread before
@@ -31,6 +33,7 @@ const CONFIG: &str = "[appearance]\n\
                       theme = \"Dracula\"\n\
                       opacity = 0.5\n\
                       blur = true\n\
+                      dim_inactive_panes = 0.4\n\
                       [[profiles]]\n\
                       name = \"solid\"\n\
                       [profiles.appearance]\n\
@@ -106,6 +109,7 @@ fn set_reduce(app: *mut App, reduce_transparency: bool) {
         app,
         &DisplayOptions {
             reduce_transparency: u8::from(reduce_transparency),
+            increase_contrast: 0,
         },
     );
 }
@@ -182,8 +186,11 @@ fn reduce_transparency_makes_every_session_opaque_until_turned_off() {
 
 #[test]
 fn the_display_options_are_one_byte_per_flag() {
-    // The C layout #52 appends to: one `uint8_t` per flag, no padding.
-    assert_eq!(std::mem::size_of::<DisplayOptions>(), 1);
+    // The C layout ADR 0043 appends to: one `uint8_t` per flag, no padding
+    // (`reduce_transparency`, then `increase_contrast` from #52).
+    assert_eq!(std::mem::size_of::<DisplayOptions>(), 2);
+    assert_eq!(std::mem::offset_of!(DisplayOptions, reduce_transparency), 0);
+    assert_eq!(std::mem::offset_of!(DisplayOptions, increase_contrast), 1);
     assert_eq!(std::mem::align_of::<DisplayOptions>(), 1);
 }
 
@@ -201,6 +208,7 @@ fn any_non_zero_byte_turns_reduce_transparency_on() {
     for options in [
         DisplayOptions {
             reduce_transparency: 2,
+            increase_contrast: 0,
         },
         memset_options(0x80),
         memset_options(0xff),
@@ -210,6 +218,64 @@ fn any_non_zero_byte_turns_reduce_transparency_on() {
         set_options(app, &memset_options(0));
         assert_eq!(appearance(app, id), (false, true), "a zeroed struct is off");
     }
+
+    // SAFETY: live handle and session; freed once.
+    unsafe {
+        assert_eq!(tessera_session_close(app, id), Error::Ok);
+        tessera_app_free(app);
+    }
+}
+
+fn dim(app: *mut App) -> f32 {
+    let mut out = -1.0;
+    // SAFETY: live handle; `out` is writable.
+    assert_eq!(
+        unsafe { tessera_app_dim_inactive_panes(app, &raw mut out) },
+        Error::Ok
+    );
+    out
+}
+
+#[test]
+fn increase_contrast_turns_pane_dimming_off_and_leaves_opacity_alone() {
+    common::isolate_home();
+    let dir = common::hermetic_config_dir();
+    std::fs::write(dir.join("config.toml"), CONFIG).unwrap();
+    let mut app = ptr::null_mut();
+    // SAFETY: `app` is writable storage for one pointer.
+    assert_eq!(unsafe { tessera_app_new(&raw mut app) }, Error::Ok);
+    let id = spawn(app, c"no-such-profile");
+    assert!(
+        (dim(app) - 0.4).abs() < 1e-6,
+        "the configured dimming to start"
+    );
+
+    for options in [
+        DisplayOptions {
+            reduce_transparency: 0,
+            increase_contrast: 1,
+        },
+        DisplayOptions {
+            reduce_transparency: 0,
+            increase_contrast: 0x80,
+        },
+    ] {
+        set_options(app, &options);
+        assert_eq!(dim(app), 0.0, "{options:?} turns dimming off");
+        assert_eq!(
+            appearance(app, id),
+            (false, true),
+            "{options:?} keeps the translucency"
+        );
+        set_options(app, &memset_options(0));
+        assert!(
+            (dim(app) - 0.4).abs() < 1e-6,
+            "turning it off restores the dimming"
+        );
+    }
+    set_options(app, &memset_options(0xff));
+    assert_eq!(dim(app), 0.0, "both on: no dimming");
+    assert_eq!(appearance(app, id), (true, false), "both on: opaque");
 
     // SAFETY: live handle and session; freed once.
     unsafe {

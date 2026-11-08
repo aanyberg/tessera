@@ -1160,6 +1160,18 @@ impl SelectionState {
         self.draw(grid, offset)
     }
 
+    /// The selection clipped to the rows of the view at scroll `offset`,
+    /// unchecked as [`Self::draw`] does (checking it compares every line it
+    /// guards, too slow under the terminal lock for the accessible text);
+    /// `None` without one in view (ADR 0041).
+    pub(crate) fn view_highlight(&self, grid: &Grid, offset: usize) -> Option<Highlight> {
+        let lines = Lines::of(grid);
+        self.sel
+            .as_ref()
+            .filter(|sel| sel.active)
+            .and_then(|sel| clip(&lines, offset, sel))
+    }
+
     /// The decorations of the selection as it is, unchecked.
     fn draw(&self, grid: &Grid, offset: usize) -> Decorations {
         let lines = Lines::of(grid);
