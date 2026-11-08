@@ -81,7 +81,8 @@ public final class TesseraApp {
         set { bridge.pasteboard = newValue }
     }
 
-    private let core: CoreHandle
+    // Internal for the configuration wrapper (TesseraConfig.swift).
+    let core: CoreHandle
     // `user_data` of the installed callbacks (passed unretained): must stay
     // alive until `tessera_app_free` has returned.
     private let bridge: CallbackBridge
@@ -210,7 +211,7 @@ public final class TesseraApp {
     /// Reads a JSON buffer from a core call that reports its length and
     /// refuses a short buffer with `TESSERA_ERROR_INVALID_ARGUMENT`: sized
     /// by a probe, retried if it grew in between.
-    private static func readJSON(
+    static func readJSON(
         _ call: (UnsafeMutablePointer<UInt8>?, Int, UnsafeMutablePointer<Int>) -> TesseraError
     ) throws -> [UInt8] {
         var length = 0

@@ -38,7 +38,7 @@ The menu bar follows the standard macOS layout, and the shortcuts are fixed unti
 
 | Shortcut | Menu item | What it does |
 |---|---|---|
-| ⌘, | Tessera > Settings… | Opens `config.toml` in your text editor, creating it if missing (until the Preferences window) |
+| ⌘, | Tessera > Settings… | Opens the Settings window, or brings it to the front (Tessera > Open config.toml opens the file itself) |
 | ⌘N | Shell > New Window | A new window with a new shell |
 | ⌘T | Shell > New Tab | A new tab in the current window |
 | ⌘W | Shell > Close Tab | Closes the current tab |
@@ -70,8 +70,8 @@ Closing a window or tab that is running a job asks first (`confirm_close`).
 
 ### Configuration
 
-Tessera reads `~/Library/Application Support/Tessera/config.toml`. Press ⌘, to create it with every default
-commented and open it. Every key is optional, saved edits apply to all open windows within a few seconds, and a file
+Tessera reads `~/Library/Application Support/Tessera/config.toml`. Settings (⌘,) edits the common keys in place,
+keeping your comments; Tessera > Open config.toml creates the file with every default commented and opens it. Every key is optional, saved edits apply to all open windows within a few seconds, and a file
 that does not parse never stops Tessera: the error is reported and the last good configuration stays in effect.
 
 ```toml
