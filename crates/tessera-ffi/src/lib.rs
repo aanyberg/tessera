@@ -22,6 +22,7 @@
 //!   `input` module); the core decides between key bindings and PTY input.
 //! * Text selection, Copy and command-click links go through the
 //!   `tessera_session_select_*`, `tessera_session_selection_text`,
+//!   `tessera_session_selection_rich_text` (Copy with Formatting),
 //!   `tessera_session_link_at` and `tessera_session_set_hover` functions
 //!   (see the `selection` module), in view-relative cells.
 //! * Scrollback search goes through the `tessera_session_search_*`
@@ -89,10 +90,10 @@ pub use search::{
     tessera_session_search_status, tessera_session_search_step,
 };
 pub use selection::{
-    Granularity, tessera_session_has_selection, tessera_session_link_at,
+    Granularity, TextBuffer, tessera_session_has_selection, tessera_session_link_at,
     tessera_session_select_adjust, tessera_session_select_all, tessera_session_select_begin,
-    tessera_session_select_clear, tessera_session_select_extend, tessera_session_selection_text,
-    tessera_session_set_hover,
+    tessera_session_select_clear, tessera_session_select_extend,
+    tessera_session_selection_rich_text, tessera_session_selection_text, tessera_session_set_hover,
 };
 pub use session::MAX_PROFILE_NAME_LEN;
 pub use session::{

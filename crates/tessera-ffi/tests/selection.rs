@@ -1,6 +1,6 @@
 //! Tests of the selection API (`tessera_session_select_begin`, `_extend`,
 //! `_adjust`, `_all`, `_clear`, `_has_selection`, `_selection_text`,
-//! `_link_at`, `_set_hover`), calling the `extern "C"` functions as a
+//! `_selection_rich_text`, `_link_at`, `_set_hover`), calling the `extern "C"` functions as a
 //! frontend would (ADR 0025): a `NULL` handle, an unknown or closed session
 //! id, a bad enum value, `NULL` and short out-buffers, and a valid round
 //! trip for each.
@@ -18,11 +18,11 @@ use std::ptr;
 
 use tessera_app_core::{PtySize, SessionId};
 use tessera_ffi::{
-    App, Error, Granularity, tessera_app_free, tessera_app_new, tessera_session_close,
+    App, Error, Granularity, TextBuffer, tessera_app_free, tessera_app_new, tessera_session_close,
     tessera_session_has_selection, tessera_session_link_at, tessera_session_select_adjust,
     tessera_session_select_all, tessera_session_select_begin, tessera_session_select_clear,
-    tessera_session_select_extend, tessera_session_selection_text, tessera_session_set_hover,
-    tessera_test_with_core,
+    tessera_session_select_extend, tessera_session_selection_rich_text,
+    tessera_session_selection_text, tessera_session_set_hover, tessera_test_with_core,
 };
 
 /// An id no session has.
@@ -102,6 +102,47 @@ impl Handle {
                 .1
                 .len()
         })
+    }
+}
+
+/// Three output buffers for `tessera_session_selection_rich_text`, each
+/// of 4096 bytes pre-filled with `#`, with the capacities given.
+struct RichBuffers {
+    bytes: [Vec<u8>; 3],
+    outs: [TextBuffer; 3],
+}
+
+impl RichBuffers {
+    fn new(caps: [usize; 3]) -> Self {
+        let mut bytes = [vec![b'#'; 4096], vec![b'#'; 4096], vec![b'#'; 4096]];
+        let outs = [0, 1, 2].map(|i| TextBuffer {
+            buf: bytes[i].as_mut_ptr(),
+            cap: caps[i],
+            len: usize::MAX,
+        });
+        Self { bytes, outs }
+    }
+
+    /// Calls the copy on session `id` of `app` (`html`, `rtf`, `plain`).
+    fn copy(&mut self, app: *mut App, id: u64) -> Error {
+        let [html, rtf, plain] = &mut self.outs;
+        // SAFETY: every buffer points into a live 4096-byte vector and its
+        // `cap` is at most 4096.
+        unsafe { tessera_session_selection_rich_text(app, id, html, rtf, plain) }
+    }
+
+    fn lens(&self) -> [usize; 3] {
+        self.outs.each_ref().map(|out| out.len)
+    }
+
+    fn text(&self, i: usize) -> &str {
+        std::str::from_utf8(&self.bytes[i][..self.outs[i].len]).expect("UTF-8")
+    }
+
+    fn untouched(&self) -> bool {
+        self.bytes
+            .iter()
+            .all(|bytes| bytes.iter().all(|&b| b == b'#'))
     }
 }
 
@@ -346,4 +387,159 @@ fn hover_sets_and_clears_the_frame_underline() {
         Error::Ok
     );
     assert_eq!(app.underlines(id), 0);
+}
+
+#[test]
+fn rich_text_round_trips_the_colours_and_the_plain_text() {
+    let app = Handle::new();
+    let id = app.session(3, 30, b"\x1b[1;31mred\x1b[0m <b>&{x}\\");
+    // Nothing selected: Ok and empty.
+    let mut out = RichBuffers::new([4096; 3]);
+    assert_eq!(out.copy(app.0, id), Error::Ok);
+    assert_eq!(out.lens(), [0; 3]);
+    assert!(out.untouched());
+    assert_eq!(app.begin(id, 0, 0, Granularity::Line as u32), Error::Ok);
+    assert_eq!(out.copy(app.0, id), Error::Ok);
+    assert_eq!(out.text(2), "red <b>&{x}\\");
+    let html = out.text(0);
+    assert!(html.contains("font-weight:bold\">red</span>"), "{html}");
+    assert!(html.contains("&lt;b&gt;&amp;&#123;x&#125;&#92;"), "{html}");
+    assert!(!html.contains("<b>"), "{html}");
+    let rtf = out.text(1);
+    assert!(rtf.starts_with("{\\rtf1"), "{rtf}");
+    assert!(rtf.contains("\\{x\\}\\\\"), "{rtf}");
+    // The plain text equals what Copy copies.
+    let (_, len, buf) = app.text(id, 64);
+    assert_eq!(&buf[..len], out.text(2).as_bytes());
+}
+
+#[test]
+fn rich_text_honours_its_buffer_rules() {
+    let app = Handle::new();
+    let id = app.session(3, 30, b"\x1b[31mred\x1b[0m text");
+    assert_eq!(app.begin(id, 0, 0, Granularity::Line as u32), Error::Ok);
+    let mut full = RichBuffers::new([4096; 3]);
+    assert_eq!(full.copy(app.0, id), Error::Ok);
+    let need = full.lens();
+    assert_eq!(need[2], 8);
+    // Any one buffer short: every size reported, nothing written anywhere.
+    for short in 0..3 {
+        let mut caps = need;
+        caps[short] -= 1;
+        let mut out = RichBuffers::new(caps);
+        assert_eq!(out.copy(app.0, id), Error::InvalidArgument, "{short}");
+        assert_eq!(out.lens(), need, "{short}");
+        assert!(out.untouched(), "{short}");
+    }
+    // Exact fits, the byte after each untouched.
+    let mut out = RichBuffers::new(need);
+    assert_eq!(out.copy(app.0, id), Error::Ok);
+    for (i, n) in need.into_iter().enumerate() {
+        assert_eq!(out.text(i), full.text(i));
+        assert_eq!(out.bytes[i][n], b'#');
+    }
+    // Asking for the sizes with NULL buffers and no capacity.
+    let mut out = RichBuffers::new([0; 3]);
+    for o in &mut out.outs {
+        o.buf = ptr::null_mut();
+    }
+    assert_eq!(out.copy(app.0, id), Error::InvalidArgument);
+    assert_eq!(out.lens(), need);
+    // A NULL buffer that claims room: refused before anything is written.
+    let mut out = RichBuffers::new([4096; 3]);
+    out.outs[1].buf = ptr::null_mut();
+    assert_eq!(out.copy(app.0, id), Error::NullPointer);
+    assert_eq!(out.lens(), [0; 3]);
+    assert!(out.untouched());
+    // ... also when a later buffer is short: the NULL one decides.
+    let mut out = RichBuffers::new([4096, 4096, 1]);
+    out.outs[0].buf = ptr::null_mut();
+    assert_eq!(out.copy(app.0, id), Error::NullPointer);
+    assert_eq!(out.lens(), [0; 3]);
+    assert!(out.untouched());
+    // A NULL buffer struct, a NULL handle, an unknown session.
+    for missing in 0..3 {
+        let mut out = RichBuffers::new([4096; 3]);
+        let [html, rtf, plain] = &mut out.outs;
+        let mut ptrs: [*mut TextBuffer; 3] = [html, rtf, plain];
+        ptrs[missing] = ptr::null_mut();
+        // SAFETY: the other buffers are live; NULL is refused.
+        let code =
+            unsafe { tessera_session_selection_rich_text(app.0, id, ptrs[0], ptrs[1], ptrs[2]) };
+        assert_eq!(code, Error::NullPointer, "{missing}");
+        for (i, o) in out.outs.iter().enumerate() {
+            if i != missing {
+                assert_eq!(o.len, 0, "{missing}/{i}");
+            }
+        }
+        assert!(out.untouched());
+    }
+    let mut out = RichBuffers::new([4096; 3]);
+    assert_eq!(out.copy(ptr::null_mut(), id), Error::NullPointer);
+    assert_eq!(out.lens(), [0; 3]);
+    let mut out = RichBuffers::new([4096; 3]);
+    assert_eq!(out.copy(app.0, UNKNOWN), Error::SessionNotFound);
+    assert_eq!(out.lens(), [0; 3]);
+    assert!(out.untouched());
+}
+
+#[test]
+fn rich_text_past_the_cap_is_refused_and_the_plain_text_written() {
+    let app = Handle::new();
+    let id = app.core(|core| {
+        let id = core
+            .spawn_test_session(PtySize::new(50, 200))
+            .expect("a test session");
+        core.set_max_scrollback_for_test(id, 2_000)
+            .expect("scrollback");
+        // Every attribute on, the colour alternating so no run merges.
+        let mut feed = String::from("\x1b[1;3;4;9;48;5;4m");
+        for cell in 0..700 * 200 {
+            feed.push_str(if cell % 2 == 0 {
+                "\x1b[31mé"
+            } else {
+                "\x1b[32mé"
+            });
+        }
+        core.feed_for_test(id, feed.as_bytes()).expect("feed");
+        id.get()
+    });
+    // SAFETY: a live handle.
+    assert_eq!(unsafe { tessera_session_select_all(app.0, id) }, Error::Ok);
+    // One soft-wrapped line: no newlines.
+    let plain_len = 700 * 200 * "é".len();
+    let mut bytes = vec![b'#'; plain_len];
+    let mut html = TextBuffer {
+        buf: ptr::null_mut(),
+        cap: 0,
+        len: usize::MAX,
+    };
+    let mut rtf = TextBuffer {
+        buf: ptr::null_mut(),
+        cap: 0,
+        len: usize::MAX,
+    };
+    let mut plain = TextBuffer {
+        buf: bytes.as_mut_ptr(),
+        cap: plain_len,
+        len: usize::MAX,
+    };
+    // SAFETY: a live handle; `plain` holds `plain_len` bytes.
+    let code = unsafe {
+        tessera_session_selection_rich_text(app.0, id, &raw mut html, &raw mut rtf, &raw mut plain)
+    };
+    assert_eq!(
+        (code, html.len, rtf.len, plain.len),
+        (Error::Refused, 0, 0, plain_len)
+    );
+    let (_, len, _) = app.text(id, 0);
+    assert_eq!(len, plain_len);
+    assert!(bytes.starts_with("éé".as_bytes()) && bytes.ends_with("é".as_bytes()));
+    // A short plain buffer: the size, as for the other calls.
+    plain.cap = 10;
+    // SAFETY: as above.
+    let code = unsafe {
+        tessera_session_selection_rich_text(app.0, id, &raw mut html, &raw mut rtf, &raw mut plain)
+    };
+    assert_eq!((code, plain.len), (Error::InvalidArgument, plain_len));
 }

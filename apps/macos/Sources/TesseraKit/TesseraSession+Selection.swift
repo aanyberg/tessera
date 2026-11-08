@@ -78,6 +78,65 @@ extension TesseraSession {
         }
     }
 
+    /// The selection for Copy with Formatting (ADR 0042): the plain text
+    /// ``selectionText()`` gives, and the same text as an HTML fragment and
+    /// an RTF document with the cells' colours, bold, italic, underline and
+    /// strikethrough, made and escaped by the core (the host never parses
+    /// them). `nil` without a selection.
+    public struct FormattedSelection: Sendable, Equatable {
+        /// The plain text, as Copy copies it.
+        public let plain: String
+        /// The HTML fragment (UTF-8), or `nil` when the formatted copy
+        /// would pass the core's 16 MiB cap: copy the plain text alone.
+        public let html: Data?
+        /// The RTF document (ASCII), or `nil` with ``html``.
+        public let rtf: Data?
+    }
+
+    /// The selection with its formatting for Copy with Formatting, or `nil`
+    /// without a selection. A selection of blanks only gives an empty
+    /// ``FormattedSelection/plain`` and no formatting.
+    @MainActor
+    public func selectionWithFormatting() throws -> FormattedSelection? {
+        guard try hasSelection else { return nil }
+        // Ask for the sizes with no buffers, then read into buffers of those
+        // sizes; output arriving between the calls may grow the text, so a
+        // text that outgrew its buffer is asked for again (as `readText`).
+        var capacities = [0, 0, 0]
+        for _ in 0..<8 {
+            var html = [UInt8](repeating: 0, count: capacities[0])
+            var rtf = [UInt8](repeating: 0, count: capacities[1])
+            var plain = [UInt8](repeating: 0, count: capacities[2])
+            var lengths = [0, 0, 0]
+            let status = html.withUnsafeMutableBufferPointer { html in
+                rtf.withUnsafeMutableBufferPointer { rtf in
+                    plain.withUnsafeMutableBufferPointer { plain in
+                        var htmlOut = TesseraTextBuffer(buf: html.baseAddress, cap: capacities[0], len: 0)
+                        var rtfOut = TesseraTextBuffer(buf: rtf.baseAddress, cap: capacities[1], len: 0)
+                        var plainOut = TesseraTextBuffer(buf: plain.baseAddress, cap: capacities[2], len: 0)
+                        let status = tessera_session_selection_rich_text(
+                            core.pointer, id, &htmlOut, &rtfOut, &plainOut)
+                        lengths = [htmlOut.len, rtfOut.len, plainOut.len]
+                        return status
+                    }
+                }
+            }
+            if status == TESSERA_ERROR_INVALID_ARGUMENT, zip(lengths, capacities).contains(where: { $0 > $1 }) {
+                capacities = zip(lengths, capacities).map { Swift.max($0, $1) }
+                continue
+            }
+            let text = String(decoding: plain.prefix(lengths[2]), as: UTF8.self)
+            if status == TESSERA_ERROR_REFUSED {
+                return FormattedSelection(plain: text, html: nil, rtf: nil)
+            }
+            try TesseraCoreError.check(status)
+            guard lengths[2] > 0 else { return FormattedSelection(plain: "", html: nil, rtf: nil) }
+            return FormattedSelection(
+                plain: text, html: Data(html.prefix(lengths[0])), rtf: Data(rtf.prefix(lengths[1])))
+        }
+        throw TesseraCoreError.invalidArgument
+    }
+
     /// The URL under the cell, as the core detects it (and, once OSC 8 is
     /// stored, as a program wrote it), or `nil`. Whether it may be opened is
     /// the caller's decision.

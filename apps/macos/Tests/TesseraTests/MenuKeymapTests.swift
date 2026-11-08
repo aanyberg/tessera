@@ -91,9 +91,10 @@ final class MenuKeymapTests: XCTestCase {
             }
         }
         walk(bar)
-        // 41, the ten pane items (ADR 0035, #38b), the five Find items (#46b)
-        // and the three prompt items (ADR 0039, #45a).
-        XCTAssertEqual(names.count, 59, "\(names)")
+        // 41, the ten pane items (ADR 0035, #38b), the five Find items (#46b),
+        // the three prompt items (ADR 0039, #45a) and Copy with Formatting
+        // (ADR 0042, #47).
+        XCTAssertEqual(names.count, 60, "\(names)")
         XCTAssertEqual(unmapped, [], "\(unmapped)")
         XCTAssertEqual(profileMenus, [MainMenu.newWindowWithProfile, MainMenu.newTabWithProfile])
         XCTAssertEqual(exempt, [MainMenu.openConfigFileIdentifier])

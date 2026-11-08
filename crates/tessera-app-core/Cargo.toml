@@ -23,6 +23,8 @@ tessera-render.workspace = true
 tessera-grid.workspace = true
 # Scrollback search (ADR 0038).
 tessera-search.workspace = true
+# Smart selection matching (ADR 0042).
+regex.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

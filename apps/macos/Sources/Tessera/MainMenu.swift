@@ -84,12 +84,14 @@ enum MainMenu {
         return menu
     }
 
-    /// Copy is enabled while something is selected, Select All always;
+    /// Copy and Copy with Formatting are enabled while something is
+    /// selected, Select All always;
     /// paste goes to the session, which sanitises it and brackets it when the
     /// terminal asks (D5).
     private static func makeEditMenu() -> NSMenu {
         let menu = NSMenu(title: "Edit")
         add(menu, "copy", "Copy", #selector(TerminalSurfaceView.copy(_:)), "c")
+        add(menu, "copy_with_formatting", "Copy with Formatting", #selector(TerminalSurfaceView.copyWithFormatting(_:)))
         add(menu, "paste", "Paste", #selector(TerminalSurfaceView.paste(_:)), "v")
         add(menu, "paste_plain", "Paste as Plain Text", #selector(TerminalSurfaceView.pasteAsPlainText(_:)), "v", [.command, .option, .shift])
         add(menu, "select_all", "Select All", #selector(TerminalSurfaceView.selectAll(_:)), "a")

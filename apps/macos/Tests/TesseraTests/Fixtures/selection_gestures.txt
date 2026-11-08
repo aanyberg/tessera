@@ -459,16 +459,16 @@ opened: []
 sel: none
 cite: [IT-mouse] L532 requires cmd; [OSC8] security: "opening links only on Ctrl+click or a context menu, not a plain click"
 
-### L13_double_click_on_url_slash_selects_path_run
+### L13_double_click_on_url_selects_the_whole_url
 setup: size 3x40
 setup: feed see https://a.bc/x now
 event: down 0,10 clicks=2
 event: up
-sel: linear (0,10)-(0,17)
-text: "//a.bc/x"
+sel: linear (0,4)-(0,17)
+text: "https://a.bc/x"
 opened: []
-cite: selection_spec.txt C03 (word chars `/ . - _ ~ + \`); cols: `:`=9 stops the run, `//a.bc/x` = cols 10-17
-note: `:` (col 9) is not a word character, `/` is, so the run is `//a.bc/x` (cols 10-17), not the whole URL.
+cite: ADR 0042 (smart selection, #47): the URL rule (very high) covers the click; `https://a.bc/x` = cols 4-17
+note: before #47 a double-click took the word run `//a.bc/x` (cols 10-17, `:` is not a word character); the smart URL rule now selects the whole URL, and a double-click still opens nothing.
 
 # ---------------------------------------------------------------------------
 # M. MISC

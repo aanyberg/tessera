@@ -132,6 +132,7 @@ final class MainMenuTests: XCTestCase {
 
     private static let editItems: [Item] = [
         Item(title: "Copy", key: "c", modifiers: command, action: #selector(TerminalSurfaceView.copy(_:))),
+        Item(title: "Copy with Formatting", action: #selector(TerminalSurfaceView.copyWithFormatting(_:))),
         Item(title: "Paste", key: "v", modifiers: command, action: #selector(TerminalSurfaceView.paste(_:))),
         Item(
             title: "Paste as Plain Text", key: "v", modifiers: [.command, .option, .shift],

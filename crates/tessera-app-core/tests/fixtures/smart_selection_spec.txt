@@ -1,0 +1,806 @@
+# =============================================================================
+# T9 / issue #47: smart selection and copy modes (spec fixture)
+# spec-researcher output, 2026-11-06. Location: $CLAUDE_JOB_DIR/tmp/spec-t9/smart_selection_spec.txt (NOT in the repo yet;
+# the lead copies it to crates/tessera-app-core/tests/fixtures/smart_selection_spec.txt). Nothing here was run in iTerm2;
+# every expected span for section 3 was COMPUTED by tools/sim.py (Python `re`, iTerm2 scoring) from the rule table in
+# section 2 and then eyeballed. Rows marked DECISION depend on a choice recorded in section 9.
+#
+# SECTIONS
+#   1  how iTerm2 picks a match (scoring, precision weights, gestures)
+#   2  default rule table (iTerm2 originals + Tessera additions), as RUST-regex-compatible patterns
+#   3  double-click expansion table (strings; span = half-open [start,end) in CHARACTERS of the logical line)
+#   4  cell-coordinate rows (wide characters, soft wraps, bounds)
+#   5  trim_trailing_whitespace rows
+#   6  copy semantics (plain vs with formatting, pasteboard types)
+#   7  HTML and RTF grammar, escaping, caps, rows
+#   8  S5 bounds table
+#   9  decisions for the milestone lead, and issue-text corrections
+#  10  sources
+# =============================================================================
+
+## 1. HOW iTerm2 PICKS A MATCH
+# - Source: iTermTextExtractor.m `smartSelectionAt:withRules:...` and SmartSelectionController.m (gnachman/iTerm2 master).
+# - For every rule, every regex match that COVERS the clicked character is a candidate. score = weight(precision) * length
+#   in characters. The candidate with the highest score wins. No match at all => fall back to ordinary word selection.
+# - Precision weights (SmartSelectionController.m L40-44): very_low 0.00001, low 0.001, normal 1.0, high 1000, very_high 1000000.
+#   So one level is a factor of 1000 in score: a very_high match beats a normal one unless the normal one is >1000x longer.
+#   Within one level the LONGER match wins. Tie on score: iTerm2 keys candidates by matched string in an NSDictionary and
+#   sorts by score, so the winner of an exact tie is unspecified. TESSERA TIE-BREAK (DECISION D-TIE): higher precision,
+#   then longer, then earlier start, then earlier rule in the list.
+# - iTerm2 runs each regex on a text window of +-smartSelectionRadius lines around the click (default 10 lines, advanced
+#   setting), restarting the search after each match START, so overlapping matches are found. Tessera: leftmost-first,
+#   non-overlapping scan of a window of at most 8192 characters (S5); overlapping alternatives are not enumerated.
+# - Quirk: iTerm2 matches against a substring that starts at the search offset, so `\b` and lookbehind see the substring start
+#   as a boundary. Tessera matches against the whole window; word boundaries are real. Not a fixture row.
+# - Gestures: iTerm2 double-click = word, triple-click = line, QUAD-click = smart selection; "Double-click performs smart
+#   selection" (Settings > Pointer) moves smart selection to double-click. https://iterm2.com/documentation-smart-selection.html,
+#   https://iterm2.com/3.3/documentation-preferences-pointer.html. Issue #47 wants double-click: see D-GESTURE.
+# - iTerm2 ships a catch-all LOW rule `\S+` ("Word bounded by whitespace"). It makes smart selection never fall back to the
+#   word. TESSERA DOES NOT SHIP IT (D-NOWORDRULE): otherwise `foo=bar&baz` would select whole and the existing word
+#   tests (WORD_CHARS = alnum + `/-+\~_.`) would change, contradicting the issue's "word selection is unchanged".
+
+## 2. DEFAULT RULES (Tessera). `pattern` is for the Rust `regex` crate: no lookaround, no backreferences; `\p{L}\p{N}` replace
+#    ICU `[:letter:][:number:]`; `\w` below is NOT used for the path class. Precision names as in iTerm2.
+#    Source column: iTerm2 = plists/SmartSelectionRules.plist (verbatim, modulo class translation); TESSERA = this fixture.
+# id            precision  source   pattern
+# cpp_namespace normal     iTerm2   (?:[A-Za-z0-9_]+::)+[A-Za-z0-9_]+
+# path          normal     iTerm2   ~?/?(?:[\p{L}\p{N}._-]+/+)+[\p{L}\p{N}._-]+/?
+# quoted        normal     iTerm2   @?"(?:[^"\\]|\\.)*"
+# include_path  normal     iTerm2   (?:[\p{L}\p{N}._]+\.)+[\p{L}\p{N}._]+
+# mailto        normal     iTerm2   \bmailto:(?:[a-z0-9A-Z_]+@)?(?:[a-zA-Z0-9\-]+\.)*[a-zA-Z0-9\-]+\b
+# objc_selector high       iTerm2   @selector\([^)]+\)
+# email         high       iTerm2   \b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,4}\b
+# http_url      very_high  iTerm2*  https?://(?:[a-z0-9A-Z]+(?::[a-zA-Z0-9]+)?@)?(?:[a-z0-9A-Z][-a-z0-9A-Z]*\.)*[A-Za-z][-A-Za-z]*(?::[0-9]+)?(?:/[a-zA-Z0-9;/.\-_+%?&@=#~()]*)?
+#     * iTerm2's real rule is two alternatives, the first guarded by the lookbehind (?<!\() so that `(url)` does not swallow
+#       the closing paren; Rust regex has no lookbehind. RECOMMENDED: match the single alternative above, then apply
+#       url.rs U4 (strip trailing . , ; : ! ? ' ") and U5 (balanced closers) to the span (DECISION D-URLRULE: or call url::url_at
+#       directly, which also gives file:/ftp: and IRIs; the config rule then only matters for user rules).
+#       Note iTerm2's own class INCLUDES `.` and `;` so it selects a trailing full stop; Tessera strips it (matches cmd-click).
+# ssh_url       very_high  iTerm2   \bssh:(?:[a-z0-9A-Z_]+@)?(?:[a-zA-Z0-9\-]+\.)*[a-zA-Z0-9\-]+\b
+# telnet_url    very_high  iTerm2   \btelnet:(?:[a-z0-9A-Z_]+@)?(?:[a-zA-Z0-9\-]+\.)*[a-zA-Z0-9\-]+\b
+# --- Tessera additions: iTerm2 has NO default rule for hashes or IP addresses (issue text wrong, see section 9) ---
+# git_sha       normal     TESSERA  \b(?:[0-9a-f]{40}|[0-9a-f]{64}|[0-9a-f]{7,12})\b
+#                                   normal, not high: a high sha would beat `deadbeef.txt` (include_path) and truncate a file name.
+# ipv4          high       TESSERA  \b(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\b
+# ipv6          high       TESSERA  three alternatives, H = [0-9A-Fa-f]{1,4}:
+#                                   \b(?:H:){7}H\b
+#                                   | \bH(?::H){0,6}::(?:H(?::H){0,6})?   (and the next char is not hex or ':'; Rust regex has no
+#                                     lookahead: the implementer drops a match whose following char is hex or ':')
+#                                   | ::(?:H(?::H){0,6})?                 (and the previous char is not alnum or ':'; same post-check)
+#                                   Zone ids (`fe80::1%en0`), embedded IPv4 tails (`::ffff:1.2.3.4`) are NOT covered (D-IPV6).
+# Order in the list matters only for the last tie-break. Not in the defaults: `\S+` word rule, single-quoted strings,
+# Windows paths, line:column suffixes (`file.rs:12:3`), ports on IPs.
+
+## 3. DOUBLE-CLICK EXPANSION TABLE (single logical line, no wraps; the click is on the char shown in `click`)
+# Row layout:  ### <id> / text: "<line>" / click: <char index, 0-based> / expect: [start,end) "<span>" / by: <rule or word-fallback>
+#              / note: / cite:
+# "by: word" means the existing word_at behaviour (alnum + WORD_CHARS run, blank run, or one other char); those rows must
+# equal the OLD result byte for byte (the issue's "existing selection tests unchanged").
+
+### SS-P1
+text:   "ls -l /usr/local/bin/foo.sh now"
+click:  6   # char "/"
+expect: [6,27) "/usr/local/bin/foo.sh"
+by:     path
+note:   absolute path; click on its first char
+cite:   SmartSelectionRules.plist 'Paths'; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-P2
+text:   "ls -l /usr/local/bin/foo.sh now"
+click:  13   # char "c"
+expect: [6,27) "/usr/local/bin/foo.sh"
+by:     path
+note:   click mid path
+cite:   Paths; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-P3
+text:   "cd ~/projects/tessera/crates"
+click:  18   # char "e"
+expect: [3,28) "~/projects/tessera/crates"
+by:     path
+note:   ~ prefix
+cite:   Paths; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-P4
+text:   "cat ./src/main.rs: error"
+click:  12   # char "i"
+expect: [4,17) "./src/main.rs"
+by:     path
+note:   './' prefix: '.' is in the class, so './src/main.rs' (':' ends)
+cite:   Paths class [letter number . _ -]; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-P5
+text:   "x/y"
+click:  2   # char "y"
+expect: [0,3) "x/y"
+by:     path
+note:   minimal relative path (one slash)
+cite:   Paths: ([class]+/+)+[class]+/?; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-P6
+text:   "/tmp/日本語/x.txt"
+click:  7   # char "語"
+expect: [0,14) "/tmp/日本語/x.txt"
+by:     path
+note:   non-ASCII letters belong to the class ([:letter:])
+cite:   Paths [[:letter:][:number:]._-]; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-P7
+text:   "/a/b/ trailing"
+click:  5   # char " "
+expect: [5,6) " "
+by:     word(space)
+note:   click on the char after the last slash is a SPACE: space is not part of the path (a/b/ ends at the slash)
+cite:   Paths optional trailing /; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-P8
+text:   "open file.txt now"
+click:  5   # char "f"
+expect: [5,13) "file.txt"
+by:     include_path
+note:   bare file name matches the Java/Python include rule (normal); word fallback would be identical
+cite:   Java/Python include paths; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-P9
+text:   "foo.txt, a.b"
+click:  4   # char "t"
+expect: [0,7) "foo.txt"
+by:     include_path
+note:   trailing comma is not in the class
+cite:   Java/Python include paths; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-U1
+text:   "see https://example.com/a/b.html?x=1&y=2#frag, ok"
+click:  4   # char "h"
+expect: [4,45) "https://example.com/a/b.html?x=1&y=2#frag"
+by:     http_url
+note:   trailing comma excluded by the class
+cite:   HTTP URL regex; url.rs U4; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-U2
+text:   "see https://example.com/a/b.html"
+click:  15   # char "m"
+expect: [4,32) "https://example.com/a/b.html"
+by:     http_url
+note:   click in host; URL beats the path rule 'example.com/a/b.html' (normal vs very_high)
+cite:   HTTP URL very_high; Paths normal; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-U3
+text:   "go to (https://en.wikipedia.org/wiki/Foo_(bar)) now"
+click:  45   # char ")"
+expect: [7,46) "https://en.wikipedia.org/wiki/Foo_(bar)"
+by:     http_url
+note:   parenthesis balance: keeps '(bar)', loses outer ')'. iTerm2 does this with a lookbehind alternative (?<!\() that Rust regex lacks; Tessera uses url.rs U5
+cite:   HTTP URL regex alt 1; url.rs U5; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-U4
+text:   "visit https://example.com/path. Then"
+click:  28   # char "t"
+expect: [6,30) "https://example.com/path"
+by:     http_url
+note:   trailing '.' stripped (DIVERGES from iTerm2, whose class includes '.'; matches url.rs U4 / cmd-click)
+cite:   url.rs U4; iTerm2 regex class contains '.'; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-U4b [DECISION]
+text:   "visit https://example.com/path. Then"
+click:  30   # char "."
+expect: [6,30) "https://example.com/path"
+by:     http_url
+note:   DECISION D-URLTRAIL: click ON the stripped '.': coverage is tested on the UNtrimmed match, the selected span is the trimmed one (recommended; the alternative lets the Paths rule select the junk '//example.com/path.')
+cite:   url.rs U4; Paths class contains '.'; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-U9
+text:   "a https://example.com/x(y)z ok"
+click:  13   # char "m"
+expect: [2,27) "https://example.com/x(y)z"
+by:     http_url
+note:   balanced parens inside the path stay
+cite:   url.rs U5; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-U10
+text:   "a (https://example.com/x) ok"
+click:  14   # char "m"
+expect: [3,24) "https://example.com/x"
+by:     http_url
+note:   outer ')' stripped
+cite:   url.rs U5; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-U5
+text:   "ssh:user@host.example and"
+click:  11   # char "s"
+expect: [0,21) "ssh:user@host.example"
+by:     ssh_url
+note:   ssh: URL (very_high)
+cite:   SSH URL rule; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-U6
+text:   "telnet:host"
+click:  9   # char "s"
+expect: [0,11) "telnet:host"
+by:     telnet_url
+note:   telnet: URL
+cite:   Telnet URL rule; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-U7
+text:   "mailto:bob@example.com"
+click:  0   # char "m"
+expect: [0,22) "mailto:bob@example.com"
+by:     mailto
+note:   click on 'm': only the mailto rule covers it (normal)
+cite:   mailto rule; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-U8
+text:   "mailto:bob@example.com"
+click:  14   # char "m"
+expect: [7,22) "bob@example.com"
+by:     email
+note:   click in the address: email (high) beats mailto (normal): selects the address only
+cite:   Email high > mailto normal; score = precision*len; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-E1
+text:   "mail bob.smith+tag@example.co.uk please"
+click:  12   # char "t"
+expect: [5,32) "bob.smith+tag@example.co.uk"
+by:     email
+note:   local part with . + ; long TLD allowed up to 4 letters; 'uk'
+cite:   Email regex {2,4}; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-E2
+text:   "user@host.museum is"
+click:  9   # char "."
+expect: [5,16) "host.museum"
+by:     include_path
+note:   TLD of 6 letters: the email rule needs {2,4}, but \b after 'user@host.muse' fails, so no email match; '@' is not a path/include char, so the span is 'host.museum' only (iTerm2 quirk kept; see decision D-EMAILTLD)
+cite:   Email regex {2,4}; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-E3
+text:   "to: a@b.io;"
+click:  8   # char "i"
+expect: [4,10) "a@b.io"
+by:     email
+note:   short: 'a@b.io' (';' excluded)
+cite:   Email regex; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-H1
+text:   "commit 3f2a9c1d8e7b6a5f4e3d2c1b0a9f8e7d6c5b4a39 Author"
+click:  18   # char "b"
+expect: [7,47) "3f2a9c1d8e7b6a5f4e3d2c1b0a9f8e7d6c5b4a39"
+by:     git_sha
+note:   40-hex SHA (TESSERA EXTENSION, not an iTerm2 default)
+cite:   tessera extension; git object names 40/64 hex, abbreviations 7-12; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-H2
+text:   "fix abc1234 in main"
+click:  6   # char "c"
+expect: [4,11) "abc1234"
+by:     git_sha
+note:   7-hex abbreviation
+cite:   tessera extension; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-H3
+text:   "id 123456 x"
+click:  7   # char "5"
+expect: [3,9) "123456"
+by:     word(word)
+note:   6 hex digits is below the 7 minimum: word fallback
+cite:   tessera extension; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-H4
+text:   "file deadbeef.txt x"
+click:  7   # char "a"
+expect: [5,17) "deadbeef.txt"
+by:     include_path
+note:   sha (normal, len 8) loses to the longer include_path 'deadbeef.txt' (len 12): equal precision, longer wins
+cite:   score = precision*len; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-H5
+text:   "at cafebabe now"
+click:  7   # char "b"
+expect: [3,11) "cafebabe"
+by:     git_sha
+note:   8 hex chars all letters: matches (documented false positive: dictionary-hex words like 'deadbeef', 'facade1' select identically to the word fallback, so harmless)
+cite:   tessera extension; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-I1
+text:   "ip 192.168.0.1 and"
+click:  9   # char "8"
+expect: [3,14) "192.168.0.1"
+by:     ipv4
+note:   dotted quad (TESSERA EXTENSION)
+cite:   tessera extension; RFC 791 dotted decimal; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-I2
+text:   "ip 10.0.0.256 end"
+click:  11   # char "5"
+expect: [3,13) "10.0.0.256"
+by:     include_path
+note:   256 is no octet; falls to include_path 10.0.0.256 (same span as the word)
+cite:   ipv4 octet range; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-I3
+text:   "to 192.168.0.1:8080 x"
+click:  17   # char "8"
+expect: [15,19) "8080"
+by:     word(word)
+note:   click on the port: port belongs to neither ipv4 nor include_path: word fallback '8080'
+cite:   tessera extension: port not part of ipv4; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-I4
+text:   "to 192.168.0.1:8080 x"
+click:  10   # char "."
+expect: [3,14) "192.168.0.1"
+by:     ipv4
+note:   click on the address: '192.168.0.1' only, port excluded
+cite:   tessera extension; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-I5
+text:   "addr [2001:db8::1]:443"
+click:  12   # char "b"
+expect: [6,17) "2001:db8::1"
+by:     ipv6
+note:   compressed IPv6 inside brackets: brackets and port excluded
+cite:   tessera extension; RFC 4291 s2.2; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-I6
+text:   "a fe80::1 b"
+click:  4   # char "8"
+expect: [2,9) "fe80::1"
+by:     ipv6
+note:   link-local
+cite:   RFC 4291 s2.2; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-I7
+text:   "a ::1 b"
+click:  2   # char ":"
+expect: [2,5) "::1"
+by:     ipv6
+note:   loopback written ::1
+cite:   RFC 4291 s2.2; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-I8
+text:   "a 2001:0db8:85a3:0000:0000:8a2e:0370:7334 b"
+click:  34   # char "7"
+expect: [2,41) "2001:0db8:85a3:0000:0000:8a2e:0370:7334"
+by:     ipv6
+note:   full eight-group form
+cite:   RFC 4291 s2.2 form 1; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-I9
+text:   "time 12:34:56 done"
+click:  9   # char "4"
+expect: [8,10) "34"
+by:     word(word)
+note:   h:m:s is not IPv6 (needs 8 groups or '::'): word fallback '34'
+cite:   tessera extension; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-Q1
+text:   "say \"hello world\" and"
+click:  4   # char "\""
+expect: [4,17) "\"hello world\""
+by:     quoted
+note:   click on the opening quote
+cite:   Quoted string rule; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-Q2
+text:   "say \"hello world\" and"
+click:  13   # char "r"
+expect: [4,17) "\"hello world\""
+by:     quoted
+note:   click inside
+cite:   Quoted string; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-Q3
+text:   "say \"he said \\\"hi\\\"\" ok"
+click:  16   # char "i"
+expect: [4,20) "\"he said \\\"hi\\\"\""
+by:     quoted
+note:   escaped quotes stay inside (\\.)
+cite:   Quoted string (?:[^"\\]|\\.)*; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-Q4
+text:   "say 'single' q"
+click:  9   # char "l"
+expect: [5,11) "single"
+by:     word(word)
+note:   single quotes are NOT a default rule: word fallback 'single'
+cite:   iTerm2 defaults: double quotes only; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-Q5
+text:   "say \"unterminated here"
+click:  11   # char "i"
+expect: [5,17) "unterminated"
+by:     word(word)
+note:   no closing quote: word fallback
+cite:   Quoted string; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-Q6
+text:   "x = @\"nsstr\";"
+click:  8   # char "s"
+expect: [4,12) "@\"nsstr\""
+by:     quoted
+note:   Objective-C @"..." prefix included
+cite:   Quoted string @?; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-Q7
+text:   "a \"one\" b \"two\" c"
+click:  13   # char "o"
+expect: [10,15) "\"two\""
+by:     quoted
+note:   two quoted strings: pairs left to right, click selects its own pair
+cite:   Quoted string; non-overlapping scan; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-N1
+text:   "use std::vector<int> x"
+click:  4   # char "s"
+expect: [4,15) "std::vector"
+by:     cpp_namespace
+note:   C++ scope (normal)
+cite:   C++ namespace::identifier; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-N2
+text:   "boost::asio::io_context x"
+click:  16   # char "c"
+expect: [0,23) "boost::asio::io_context"
+by:     cpp_namespace
+note:   chain of ::
+cite:   C++ namespace; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-N3
+text:   "import os.path.join;"
+click:  12   # char "t"
+expect: [7,19) "os.path.join"
+by:     include_path
+note:   dotted module path
+cite:   Java/Python include paths; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-N4
+text:   "java.util.List;"
+click:  12   # char "s"
+expect: [0,14) "java.util.List"
+by:     include_path
+note:   ;' excluded
+cite:   Java/Python include paths; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-N5
+text:   "[self perform:@selector(foo:bar:)];"
+click:  14   # char "@"
+expect: [14,33) "@selector(foo:bar:)"
+by:     objc_selector
+note:   @selector(...) (high)
+cite:   Obj-C selector; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-N6
+text:   "[self perform:@selector(foo:bar:)];"
+click:  10   # char "o"
+expect: [6,13) "perform"
+by:     word(word)
+note:   click outside the selector: word fallback 'perform'
+cite:   Obj-C selector; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-W1
+text:   "foo=bar&baz"
+click:  6   # char "r"
+expect: [4,7) "bar"
+by:     word(word)
+note:   ':' '=' '&' end a word: existing word behaviour unchanged
+cite:   WORD_CHARS in selection.rs; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-W2
+text:   "a   b"
+click:  3   # char " "
+expect: [1,4) "   "
+by:     word(space)
+note:   blank run: existing whitespace-run behaviour, smart rules never match blanks
+cite:   selection.rs class_of; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-W3
+text:   "x ! y"
+click:  2   # char "!"
+expect: [2,3) "!"
+by:     word(other)
+note:   single other char
+cite:   selection.rs class_of; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-W4
+text:   "aaa bbb"
+click:  3   # char " "
+expect: [3,4) " "
+by:     word(space)
+note:   click on blank after word
+cite:   selection.rs; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+### SS-W5
+text:   "mid/dle-name_x.y"
+click:  10   # char "m"
+expect: [0,16) "mid/dle-name_x.y"
+by:     path
+note:   'mid/dle-name_x.y' by path (one slash)
+cite:   Paths; scoring: SmartSelectionController.m L40-44 + iTermTextExtractor.m smartSelectionAt
+
+## 4. CELL-COORDINATE ROWS (grid size RxC, 0-based (row,col), inclusive ends, as in selection_spec.txt `sel:` layout)
+# Wide characters occupy two cells (WIDE + SPACER); a click on the spacer counts as a click on the wide char. Expected `sel:`
+# is reported as clicked/ends, not widened (selection_spec.txt convention); extraction widens.
+
+### SS-C1  (soft-wrapped URL)
+size:   3x20
+feed:   "see https://example.com/abcdef/ghijkl now"   # wraps after col 19: row0 "see https://example.", row1 "com/abcdef/ghijkl no", row2 "w"
+click:  (1,3)
+sel:    linear (0,4)-(1,16)
+text:   "https://example.com/abcdef/ghijkl"
+by:     http_url
+note:   the rule scans the LOGICAL line (soft wraps join without a separator); a click on row 0 col 4 gives the same selection
+cite:   issue #47 "scanned logical line"; selection_spec.notes.md U8 (soft wraps continue a URL); ADR 0009
+
+### SS-C2  (wide chars before a path)
+size:   2x20
+feed:   "日本 /tmp/x ok"      # 日 c0-1, 本 c2-3, ' ' c4, '/' c5 t6 m7 p8 '/' c9 x c10
+click:  (0,7)
+sel:    linear (0,5)-(0,10)
+text:   "/tmp/x"
+by:     path
+note:   columns, not characters, are what `sel:` counts; the wide chars shift col != char index
+cite:   path rule; selection_spec.txt "reported as clicked"
+
+### SS-C3  (click on the spacer half of a wide char: unchanged word behaviour)
+size:   2x20
+feed:   "日本 /tmp/x ok"
+click:  (0,1)
+sel:    linear (0,0)-(0,3)
+text:   "日本"
+by:     word
+note:   non-ASCII alphanumerics are word chars today; no smart rule matches '日' (path needs a slash)
+cite:   selection.rs class_of/word_at (existing tests)
+
+### SS-C4  (wide chars INSIDE a path)
+size:   2x20
+feed:   "/tmp/日本/x ok"      # '/' c0 t1 m2 p3 '/' c4 日 c5-6 本 c7-8 '/' c9 x c10
+click:  (0,6)                 # spacer of 日
+sel:    linear (0,0)-(0,10)
+text:   "/tmp/日本/x"
+by:     path
+cite:   path class \p{L}
+
+### SS-C5  (match straddling the 8192-character scan window)  [DECISION D-WINDOW]
+size:   2x200, one 100000-character logical line (soft wraps)
+feed:   "a/" x 50000  (no spaces; the path rule would match all 100000 characters)
+click:  a 'a' in the middle
+sel:    the WORD at the click, not a truncated 8192-char path
+note:   window = at most 4096 characters either side of the click. A candidate touching a window edge that is not the logical line's
+        own start or end may be truncated, so it is dropped and the word fallback applies. A path wholly inside the window is found
+        (second feed: 1000 x "a" then " /usr/lib/x " then 1000 x "a" separated by spaces; click on "lib" selects "/usr/lib/x").
+        Alternative: accept the truncated match.
+cite:   S5 in the issue; iTerm2 uses a +-10 line radius (smartSelectionRadius) instead, no character bound.
+
+### SS-C5b/c/d  (the window edge inside a long C++ name, on a `:`)  [D-WINDOW, review of #47]
+size:   70x200, one logical line
+feed:   b: "a::" x 4000 (12000 chars), click char 6000; c: "a::" x 2000 + "a" + " x" x 100, click char 5895 (the window starts on
+        the second `:` of a "a::", 5895 - 4096 = 1799); d: "a::" x 4000, click char 3001 (the window ends on a first `:`, 3001 + 4095)
+sel:    what a word double-click selects there (the `a` or the `::`), not the 8188-character C++ name the regex finds inside the window
+note:   a match the rule finds may start (end) a character or two inside the window when the edge falls on a character the rule cannot
+        start (end) with, so "touching the edge" is not enough: a match starting (ending) in the run of non-blank characters at an edge
+        where the line goes on is dropped. Wholly inside the window ("x " + "a::" x 1000 + "a y") the 3001-character name is selected.
+        A rule matching across blanks (quoted strings) can still pair up differently in the window than on the whole line.
+cite:   rust-critic #47 round 1 B2 (the "a::" x 4000 repro)
+
+### SS-C6  (latency, release test)
+size:   1x2048 full of "/a" repeated, 64 rules (the 12 defaults + 52 copies with distinct patterns)
+click:  middle
+bound:  double-click handling <= 5 ms wall time on the release build (issue done-list). Regex crate guarantees linear time; the
+        cost is 64 scans of <= 8192 chars. Recompile of 64 patterns must NOT happen per click (compile at config load).
+cite:   issue #47 done-list; regex crate docs (no backtracking)
+
+## 5. trim_trailing_whitespace  (default true).  Mechanism: App::selection_text / rich copy.
+# Existing behaviour (extract() in selection.rs): on every logical line the cells AFTER its last non-blank cell are never
+# emitted, and trailing '\n' of the whole text is trimmed. That is today's `trim = true` and must stay byte-identical.
+# `blank` = a cell with ch == ' ' and no flags other than PAD/LINK (is_blank): styles (erased coloured cells) do NOT make it
+# non-blank; U+00A0 and U+3000 are NOT blank (they are content). Wide-char SPACER and PAD cells are never emitted in either mode.
+# trim = false  : on every row up to the row holding the LAST non-blank cell of the selection, emit the blanks up to the
+#                 selection's last column on that row (full width for non-final rows). Rows after that last non-blank row
+#                 are still dropped (so a select-all does not append a screen of blank lines). Soft-wrapped rows never trimmed
+#                 or padded differently: the wrap hides the newline and the blanks are mid-line content in both modes.
+# iTerm2: advanced setting TrimWhitespaceOnCopy (default true), https://iterm2.com/documentation/2.1/documentation-hidden-settings.html
+#         (old docs: `defaults write com.googlecode.iterm2 TrimWhitespaceOnCopy -bool false`). Exact current key not confirmed.
+
+### TR-1  size 3x10   feed "ab\r\ncd"   begin (0,0) char, extend (1,9)
+trim=true : "ab\ncd"
+trim=false: "ab        \ncd        "         # row0 padded to col 9, row1 padded to the selection end col 9
+cite: extract() text_end rule; this fixture's trim=false definition
+
+### TR-2  size 3x10   feed "ab"   begin (0,0), extend (0,4)
+trim=true : "ab"
+trim=false: "ab   "                           # cols 0-4
+
+### TR-3  (soft wrap: blanks before a wrap are content)    size 4x5   feed "abc  def"    # row0 "abc  " wrapped, row1 "def"
+select all
+trim=true : "abc  def"
+trim=false: "abc  def  "        # CORRECTED in #47: was "abc  def"; select all ends at (1,4), and row 1 is padded to
+                               # the selection end column like TR-9 (D-TRIMALL)
+cite: extract(): `n < end && !line.wrapped` => newline only on hard line ends
+
+### TR-4  (blanks at the end of a wrapped line's last row)   size 4x5   feed "abcdefg"+"   "   # row0 "abcde" wrapped, row1 "fg   "
+begin (0,0), extend (1,4)
+trim=true : "abcdefg"
+trim=false: "abcdefg   "
+
+### TR-5  (wide char that did not fit: PAD cell)   size 4x5   feed "abcd日"   # c4 of row0 = PAD, 日 on row1 c0-1
+begin (0,0), extend (1,4)
+trim=true : "abcd日"                          # PAD is not a space and not emitted
+trim=false: "abcd日   "                       # row1: 日 + 3 blanks (c2-c4); SPACER c1 not emitted
+cite: extract() `cell.is_spacer() || cell.is_pad()`
+
+### TR-6  (non-blank space-like scalars are content)   size 2x10   feed "a\u{a0}"  / "b\u{3000}"
+trim=true : "a\u{a0}"    and  "b\u{3000}"     # kept: not ' '
+cite: is_blank only ' '
+
+### TR-7  (erased coloured cells are blank)   size 2x10   feed "ab\e[41m   \e[0m"   # 3 red-background blanks after ab
+begin (0,0), extend (0,4)
+trim=true : "ab"
+trim=false: "ab   "
+rich(trim=true):  no run for the blanks (the red background is trimmed with them);  rich(trim=false): the 3 blanks carry background-color
+cite: is_blank ignores styles; D-TRIMSTYLE
+
+### TR-8  (block selection trims/pads each row to the block's right edge)   size 3x10  feed "ab\r\ncdef"  block (0,0)-(1,3)
+trim=true : "ab\ncdef"
+trim=false: "ab  \ncdef"
+
+### TR-9  (blank tail rows are never padded)   size 5x10  feed "ab"  select all
+trim=true : "ab"
+trim=false: "ab        "        # DECISION D-TRIMALL: output ends at the last non-blank row; that row is padded to the selection end col (9).
+                               # Rows 1-4 (all blank) are dropped in both modes.
+
+## 6. COPY SEMANTICS
+# - Copy (plain): public.utf8-plain-text only (NSPasteboardTypeString). Today's behaviour, subject to trim_trailing_whitespace.
+# - Copy with Formatting: ONE pasteboard write (single clearContents + declare) of three types: public.rtf, public.html and
+#   public.utf8-plain-text, the plain string byte-identical to what Copy would write. Consumers pick: TextEdit/Pages prefer RTF,
+#   Mail and browsers HTML, terminals/editors plain text.
+# - iTerm2: Edit > Copy with Styles, docs (menu items) https://iterm2.com/3.5/documentation-menu-items.html ; it writes RTF
+#   (public.rtf) per the third-party note https://also.github.io/notes/2016/03/19/copy-terminal-html.html. Terminal.app copies
+#   RTF + plain by default; NOT verified (closed source, no binary used): treat as unverified; lead's manual check (ls --color
+#   -> TextEdit and Mail) is the arbiter. HTML is Tessera-specific.
+# - Disabled (validateMenuItem) when there is no selection. No selection => returns None, pasteboard untouched.
+# - Rich output above the 16 MiB cap => None for the rich types; the plain copy proceeds (section 8).
+# - Styles come from the cell's resolved style: indexed colours through the live theme palette to #RRGGBB, truecolor as is,
+#   Default fg/bg => NO colour property (inherit from the paste target: DECISION D-DEFCOLOUR). Inverse swaps resolved fg/bg
+#   (default colours resolve to the theme's foreground/background and are then written, since a swap is not inheritable).
+#   bold -> bold, italic -> italic, any underline style -> single underline, strikethrough -> line-through. Faint, blink,
+#   conceal, overline: no output (conceal text still copied: the plain copy contains it too, D-CONCEAL).
+# - OSC 8 / detected links: text only, never <a> or \field (D10).
+
+## 7. OUTPUT GRAMMAR
+### 7a HTML  (the ONLY elements: html head meta body pre span; the ONLY attribute: style; no <a>, <img>, <link>, <script>, url(), @import)
+document := "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body><pre style=\"font-family:Menlo,monospace\">" body "</pre></body></html>"
+body     := (run | "\n")*                 # lines joined by a literal LF, no trailing LF; <pre> keeps spaces
+run      := text | "<span style=\"" decl (";" decl)* "\">" text "</span>"
+decl     := "color:#rrggbb" | "background-color:#rrggbb" | "font-weight:bold" | "font-style:italic"
+          | "text-decoration:underline" | "text-decoration:line-through" | "text-decoration:underline line-through"
+# declaration ORDER is fixed: color, background-color, font-weight, font-style, text-decoration. Hex is lowercase, 6 digits.
+# Adjacent cells with an identical resolved style merge into one run; a run with no declaration is bare text (no span).
+# The font family is the constant `Menlo,monospace`: the configured font name is not interpolated (nothing config- or
+# child-derived reaches an attribute value; D-FONT).
+escape(c) for every scalar c of the cell text (cluster scalars included):
+    '&' -> "&amp;"   '<' -> "&lt;"   '>' -> "&gt;"   '"' -> "&quot;"   "'" -> "&#39;"
+    '\' -> "&#92;"   '{' -> "&#123;"  '}' -> "&#125;"      (not required in HTML; escaped anyway so one rule serves both formats)
+    any scalar > U+007E (incl. U+007F..U+009F, NBSP, ZWJ, bidi controls, astral) -> "&#x" lowercase-hex "no leading zeros" ";"
+    C0 controls except LF (0x00-0x09, 0x0B-0x1F) and DEL -> DROPPED (nothing emitted)
+    everything else (printable ASCII 0x20-0x7E, minus the list above) -> itself
+cite: HTML Living Standard 13.3 serialising text/attribute values https://html.spec.whatwg.org/multipage/parsing.html#serialising-html-fragments ;
+      OWASP XSS prevention rule 1/2 (escape & < > " ').
+
+### 7b RTF  (RTF Specification 1.9.1, Microsoft: https://www.loc.gov/preservation/digital/formats/fdd/fdd000473.shtml and
+###          https://www.microsoft.com/en-us/download/details.aspx?id=10725 ; no \pict, \field, \object, \*\ extensions, \info)
+document := "{\rtf1\ansi\ansicpg1252\deff0{\fonttbl{\f0\fmodern Menlo;}}" colortbl "\f0\fs24 " body "}"
+colortbl := "{\colortbl;" ("\red" N "\green" N "\blue" N ";")* "}"     # entry 0 = auto (the leading ';'); entries 1.. in first-use order,
+                                                                        # deduplicated, fg and bg share the table
+body     := (run | "\par ")*      # LF => "\par " (control word + ONE delimiter space)
+run      := text | "{" ("\cf" k " ")? ("\cb" k " ")? ("\b ")? ("\i ")? ("\ul ")? ("\strike ")? text "}"
+# EVERY control word is followed by exactly one space (the delimiter); a literal space that starts the text after it is a second
+# space, so it is preserved. Groups scope the attributes, so no \b0 / \ulnone resets are needed.
+# Table cap: at most 4096 distinct colours (more => rich copy refused, same as the size cap; D-COLCAP).
+escape(c):
+    '\' -> "\\"   '{' -> "\{"   '}' -> "\}"
+    scalar > U+007E, BMP  -> "\u" signed16(code) "?"           e.g. U+00E9 -> \u233?   U+65E5 -> ☈5?   U+301 -> \u769?
+        signed16: code <= 32767 ? code : code - 65536          e.g. U+F8FF -> \u-1793?
+    astral -> two \u items, one per UTF-16 surrogate, each followed by "?"      U+1F600 -> \u-10179?\u-8704?
+    C0 controls except LF, DEL -> DROPPED
+    '?' after \uN is the ANSI fallback and is consumed by \uc1 (the default); so `\u233?` followed by text "x" is "éx".
+    all other ASCII (0x20-0x7E) -> itself
+# Why signed: RTF 1.9.1 "Unicode" section: \uN with N a signed 16-bit decimal.
+
+### 7c ROWS  (input cells -> expected strings; colours given as resolved #rrggbb)
+### RT-1 plain                    cells: "hi"
+html: <!DOCTYPE html><html><head><meta charset="utf-8"></head><body><pre style="font-family:Menlo,monospace">hi</pre></body></html>
+rtf:  {\rtf1\ansi\ansicpg1252\deff0{\fonttbl{\f0\fmodern Menlo;}}{\colortbl;}\f0\fs24 hi}
+### RT-2 red bold then newline     cells: line1 "a" fg #ff0000 bold ; line2 "b" default
+html body: <span style="color:#ff0000;font-weight:bold">a</span>\nb          (\n = one LF byte)
+rtf:  {\rtf1\ansi\ansicpg1252\deff0{\fonttbl{\f0\fmodern Menlo;}}{\colortbl;\red255\green0\blue0;}\f0\fs24 {\cf1 \b a}\par b}
+### RT-3 hostile text              cells: <script>&"'\{}é😀   (plain style)
+html body: &lt;script&gt;&amp;&quot;&#39;&#92;&#123;&#125;&#xe9;&#x1f600;
+rtf body:  <script>&"'\\\{\}\u233?\u-10179?\u-8704?
+    # must hold: the HTML body contains no '<' except the fixed wrapper tags, no unescaped & " ', and no scalar > 0x7E; the RTF body has
+    # no unescaped \ { } and no byte > 0x7E. The test feeds every scalar 0x00-0xFF and a sample of astral/bidi/ZWJ scalars.
+### RT-4 colours and decorations   cells: "x" fg #00ff00 bg #0000ff italic underline
+html body: <span style="color:#00ff00;background-color:#0000ff;font-style:italic;text-decoration:underline">x</span>
+rtf body:  {\cf1 \cb2 \i \ul x}     colortbl: {\colortbl;\red0\green255\blue0;\red0\green0\blue255;}
+### RT-5 merge and split          cells: "ab" fg #ff0000 ; "c" fg #ff0000 bold
+html body: <span style="color:#ff0000">ab</span><span style="color:#ff0000;font-weight:bold">c</span>
+rtf body:  {\cf1 ab}{\cf1 \b c}    (colour 1 reused)
+### RT-6 strike + underline        cells: "z" underline strikethrough
+html body: <span style="text-decoration:underline line-through">z</span>        rtf body: {\ul \strike z}
+### RT-7 leading space after a control word   cells: "a" then " b" in bold ("a" plain)
+rtf body:  a{\b  b}                  # first space = delimiter, second = the literal blank
+### RT-8 controls dropped         cells: "a" ESC "b" BEL "c" U+0085 "d"     (the grid never holds LF in a cell, but may hold these)
+html body: abc&#x85;d             # ESC (0x1b) and BEL (0x07) dropped; U+0085 > 0x7E is escaped, not dropped
+rtf body:  abc\u133?d
+### RT-9 clusters and wide        cells: "e" + U+0301 ; 日 (wide, spacer skipped)
+html body: e&#x301;&#x65e5;           rtf body: e\u769?☈5?
+### RT-10 OSC 8 link text         cells: "link" with a hyperlink id            html/rtf: plain run "link" (no <a>, no \field)
+### RT-11 trimmed styled blanks   see TR-7
+### RT-12 inverse                 cells: "i" fg Default bg Default, inverse; theme fg #c0c0c0 bg #101010
+html body: <span style="color:#101010;background-color:#c0c0c0">i</span>   # swap of the resolved theme colours
+### RT-13 empty selection         no cells => None (no pasteboard write), also when trim removes everything (all blanks)
+
+## 8. S5 BOUNDS
+# MAX_SMART_RULES = 64: the 65th rule is dropped with a warning (config load), defaults count towards it? DECISION D-RULECOUNT: user rules only; with
+#   include-defaults the sum is capped at 64. Test: 65 rules => 64 kept and one warning.
+# pattern <= 1024 bytes (1025 refused with a warning); compile with regex::RegexBuilder size_limit(1 MiB) and dfa_size_limit(1 MiB);
+#   nest_limit(50). A pattern that fails to compile is skipped with a warning, other rules still work.
+# empty-match patterns (`a*`, `^`) are refused at load: a rule must not match the empty string (test on the string "").
+# scanned logical line <= 8192 characters around the click (section 4 SS-C5).
+# rich output <= 16 MiB = 16_777_216 bytes per string (html and rtf each): exactly the cap passes, one byte more => rich refused, plain copy
+#   still written. Generation aborts as soon as a string exceeds the cap (no unbounded String growth); the test uses a lowered cap constant.
+#   The styled runs collected under the terminal lock are bounded by the same cap: each run with a look of its own is charged the least
+#   HTML markup it needs (an empty span and `color:#rrggbb`, 35 bytes) on top of its text, so the collection stops once that lower bound
+#   of the HTML passes 16 MiB (a cell-by-cell colour flood stops after about 466 k runs, not 16 M).
+#   Worst-case growth per cell: html `<span style="color:#rrggbb;background-color:#rrggbb;font-weight:bold;font-style:italic;text-decoration:underline line-through">` (~150 B)
+#   + `&#x10ffff;` (10 B) vs 1 B of text, so a 100 k-cell selection can reach the cap with hostile styling.
+# colours table <= 4096 entries.
+# Patterns are user config (trusted-ish) but MATCHED TEXT is child-controlled: never shown in UI (S3), never evaluated; only used as a span.
+
+## 9. DECISIONS FOR THE MILESTONE LEAD (recommended option first)
+# D-GESTURE   Issue says double-click selects the smart match. iTerm2 default is QUAD-click; double-click only with the pref
+#             "Double-click performs smart selection". Recommend: follow the issue (double-click), plus a `[selection] smart_double_click = true`
+#             switch if cheap; triple-click stays the logical line (no change).
+# D-NOWORDRULE Do NOT ship iTerm2's `\S+` low rule (changes every existing word test). Without it no default rule is a catch-all.
+# D-URLRULE   http_url: single-alternative regex + url.rs U4/U5 post-trim, or call url::url_at (U1-U9: also ftp/file/IRIs). Recommend the
+#             regex rule with the post-trim so the config keeps one mechanism; keep url.rs behaviour for cmd-click untouched.
+# D-URLTRAIL  Click ON a stripped trailing '.' still selects the (trimmed) URL: coverage on the untrimmed match (SS-U4b).
+# D-TIE       Tie-break order: precision, length, start, rule index (iTerm2: undefined).
+# D-EMAILTLD  iTerm2's email rule caps the TLD at 4 letters ({2,4}); `x@y.museum` then falls to the include_path rule and selects `y.museum`
+#             (SS-E2). Recommend {2,24}? That diverges from iTerm2 but selects what users expect. Fixture row SS-E2 follows iTerm2 {2,4}; flip it with the decision.
+# D-IPV6      Zone ids / v4-mapped tails unsupported; ports excluded from ipv4/ipv6 (SS-I3/I4/I5).
+# D-WINDOW    Truncated candidates at a window edge are dropped (SS-C5).
+# D-DEFCOLOUR Default fg/bg emit no colour so Mail/TextEdit keep their own; alternative is to write the theme colours (matches iTerm2 look,
+#             breaks dark themes pasted onto white pages).
+# D-FONT      Constant `Menlo,monospace` / `\fs24`; configured font and size are not interpolated.
+# D-TRIMSTYLE trim also removes coloured blank cells in rich copy (consistent with plain).
+# D-TRIMALL   trim=false pads only rows up to the last non-blank row (TR-9).
+# D-CONCEAL   Concealed text is copied like the plain copy does.
+# D-COLCAP    More than 4096 distinct colours => rich refused.
+# D-RULECOUNT 64 caps the user's list; defaults are separate unless `smart_rules` replaces them (recommend: unset = defaults, set = replaces; an
+#             `include_defaults = true` key is optional).
+# D-PRIORITY  The issue says "regex + priority". Recommend priority = iTerm2's five named levels (very_low .. very_high), score = weight x length
+#             (not a plain integer priority: a plain integer would let a short very-high rule hide the longer correct match). Config row:
+#             smart_rules = [{ name = "...", pattern = "...", precision = "normal" }].
+#
+# ISSUE TEXT CORRECTIONS
+# 1. "iTerm2-like defaults: ... hashes, IPv4/IPv6": iTerm2's default set (11 rules, plist) has NO hash, IPv4 or IPv6 rule, no single-quote rule,
+#    and no Rust-compatible lookbehind; those three are Tessera additions (section 2).
+# 2. "highest-priority rule match": iTerm2 does not take the highest precision class outright: score = weight x length, one level = 1000x.
+#    A longer lower-level match outranks a shorter higher-level one only when it is >1000x longer, which cannot happen inside a 8192-char
+#    window between adjacent levels (normal vs high needs 1000+ chars, so it can; very_high vs normal needs 1,000,000). Recommend
+#    implementing weight x length exactly (cheap) rather than "class first".
+# 3. "double-click": see D-GESTURE.
+# 4. Today's selection text already drops blanks after the last non-blank cell of every logical line (extract()), so trim_trailing_whitespace=true
+#    is a no-op; the new work is trim=false (padding), not trim=true.
+# 5. `regex.workspace` must have `unicode-perl`/`unicode-gencat` features for \b and \p{L}; default features suffice. No lookaround anywhere.
+
+## 10. SOURCES
+# iTerm2 Smart Selection docs: https://iterm2.com/documentation-smart-selection.html
+# iTerm2 default rules: https://raw.githubusercontent.com/gnachman/iTerm2/master/plists/SmartSelectionRules.plist
+# iTerm2 scoring: https://raw.githubusercontent.com/gnachman/iTerm2/master/sources/ContentAnalysis/iTermTextExtractor.m (smartSelectionAt) and
+#                 https://raw.githubusercontent.com/gnachman/iTerm2/master/sources/Settings/SmartSelectionController.m (precision weights)
+# iTerm2 pointer prefs: https://iterm2.com/3.3/documentation-preferences-pointer.html ; menu items https://iterm2.com/3.5/documentation-menu-items.html
+# iTerm2 hidden settings (TrimWhitespaceOnCopy): https://iterm2.com/documentation/2.1/documentation-hidden-settings.html
+# RTF 1.9.1: https://www.microsoft.com/en-us/download/details.aspx?id=10725 ; HTML serialisation: https://html.spec.whatwg.org/multipage/parsing.html#serialising-html-fragments
+# Local: crates/tessera-app-core/src/selection.rs (WORD_CHARS, extract, is_blank), src/url.rs (U1-U9), tests/fixtures/selection_spec.txt|notes.md
+# Simulator used for section 3: tools/sim.py + tools/gen.py (Python re; ipv6 uses lookaround that Rust lacks, see section 2)

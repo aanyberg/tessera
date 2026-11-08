@@ -1487,8 +1487,10 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         return GridCell(col: cell.col, row: cell.row)
     }
 
-    /// What a click of `count` selects: a cell, a word, a whole line (the
-    /// fourth click and later too: no smart selection).
+    /// What a click of `count` selects: a cell, a word (the core's smart
+    /// selection first: a path, URL, email address, hash or IP address
+    /// under the click; ADR 0042), a whole line (the fourth click and later
+    /// too).
     private static func granularity(forClicks count: Int) -> TesseraSession.SelectionGranularity {
         switch count {
         case ...1: .character
@@ -1869,7 +1871,7 @@ extension TerminalSurfaceView: NSMenuItemValidation {
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         switch menuItem.action {
-        case #selector(copy(_:)):
+        case #selector(copy(_:)), #selector(copyWithFormatting(_:)):
             return hasSelection
         case #selector(selectAll(_:)):
             return true
@@ -1914,6 +1916,36 @@ extension TerminalSurfaceView: NSMenuItemValidation {
         } catch {
             Self.log.debug("copy failed: \(String(describing: error), privacy: .public)")
         }
+    }
+
+    /// Copy with Formatting (Edit menu, no default chord; ADR 0042): the
+    /// selection goes to the pasteboard as RTF and HTML with its colours,
+    /// bold, italic, underline and strikethrough, and as plain text, in one
+    /// write, so an
+    /// editor that takes styled text pastes it styled and any other pastes
+    /// the text. The core makes and escapes both formats; they are put on
+    /// the pasteboard as the bytes it gave. A selection too large to format
+    /// (past 16 MiB) is copied as plain text alone, like Copy.
+    @objc func copyWithFormatting(_ sender: Any?) {
+        do {
+            guard let copy = try session.selectionWithFormatting(), !copy.plain.isEmpty else { return }
+            Self.write(copy, to: pasteboard)
+        } catch {
+            Self.log.debug("copy with formatting failed: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    /// Puts `copy` on `pasteboard` in one write: RTF and HTML when the core
+    /// gave them, and the plain string always.
+    static func write(_ copy: TesseraSession.FormattedSelection, to pasteboard: NSPasteboard) {
+        pasteboard.clearContents()
+        let item = NSPasteboardItem()
+        if let rtf = copy.rtf, let html = copy.html {
+            item.setData(rtf, forType: .rtf)
+            item.setData(html, forType: .html)
+        }
+        item.setString(copy.plain, forType: .string)
+        pasteboard.writeObjects([item])
     }
 
     /// Select All (⌘A): the scrollback and the screen (the screen only on

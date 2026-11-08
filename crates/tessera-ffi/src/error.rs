@@ -39,7 +39,9 @@ pub enum Error {
     NoSurface = 8,
     /// A configuration edit was refused because the configuration loader
     /// would warn about the result (`tessera_config_set`): nothing was
-    /// written.
+    /// written. Also: the formatted copy of a selection would pass its
+    /// size cap (`tessera_session_selection_rich_text`): only the plain
+    /// text was written.
     Refused = 9,
     /// `config.toml` (or `themes/`) changed on disk while the call worked
     /// on it: nothing was written and the other change stays.

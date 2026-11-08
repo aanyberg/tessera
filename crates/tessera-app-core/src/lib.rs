@@ -37,6 +37,7 @@ mod config_watch;
 pub mod input;
 mod mouse;
 mod profile;
+pub mod rich_text;
 pub mod search;
 pub mod selection;
 pub mod session;
@@ -63,8 +64,9 @@ pub use commands::{
     PROMPT_SCAN_LINES_PER_LOCK,
 };
 pub use input::{InputEvent, InputOutcome};
+pub use rich_text::{FormattedText, MAX_RICH_COPY_LEN, MAX_RTF_COLORS, RichCopy};
 pub use search::{MatchesText, SearchStatus};
-pub use selection::{Granularity, Link, Point};
+pub use selection::{Granularity, Link, Point, SMART_SCAN_LEN};
 pub use session::{SessionEvent, SessionId, SessionObserver};
 pub use tessera_search::{MAX_QUERY_BYTES, QueryError, QueryOptions};
 pub use view::{DisplayOptions, SessionAppearance};
@@ -1448,8 +1450,10 @@ impl App {
         granularity: Granularity,
         block: bool,
     ) -> Result<()> {
+        // Compiled when the configuration was loaded, not per click.
+        let rules = self.config().selection.compiled_rules();
         self.session(id)?.with_selection(|selection, term, offset| {
-            selection.begin(term.grid(), offset, at, granularity, block);
+            selection.begin(term.grid(), offset, at, granularity, block, &rules);
         });
         Ok(())
     }
@@ -1537,6 +1541,11 @@ impl App {
     ///   spacer and padding cells give nothing, a grapheme cluster gives
     ///   its whole text, and a tab gives the spaces it moved over.
     ///
+    /// With `[selection] trim_trailing_whitespace = false` the blanks are
+    /// kept instead: every selected cell is copied on the rows up to the
+    /// last one with text in the selection, and the rows after it are
+    /// still dropped.
+    ///
     /// A selection of blanks only gives `Some("")`, or `None` on the
     /// alternate screen.
     ///
@@ -1544,9 +1553,40 @@ impl App {
     ///
     /// [`Error::SessionNotFound`] if `id` is not a live session.
     pub fn selection_text(&self, id: SessionId) -> Result<Option<String>> {
+        let trim = self.config().selection.trim_trailing_whitespace;
         Ok(self
             .session(id)?
-            .with_selection(|selection, term, _| selection.text(term.grid())))
+            .with_selection(|selection, term, _| selection.text(term.grid(), trim)))
+    }
+
+    /// Copy with Formatting: the text of session `id`'s selection as
+    /// [`App::selection_text`] gives it, and the same text as HTML and RTF
+    /// with its colours, bold, italic, underline and strikethrough
+    /// ([`rich_text`], ADR 0042), all from one look at the terminal.
+    /// `None` without a selection and when its text is empty. The
+    /// formatted forms are [`RichCopy::TooLarge`] past
+    /// [`MAX_RICH_COPY_LEN`] bytes or [`MAX_RTF_COLORS`] colours; the
+    /// plain text is there either way.
+    ///
+    /// Colours are resolved under the terminal's current theme and palette
+    /// (indexed colours to RGB); the default foreground and background are
+    /// left out. The formats are built after the terminal lock is
+    /// released.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn selection_copy_with_formatting(&self, id: SessionId) -> Result<Option<FormattedText>> {
+        let trim = self.config().selection.trim_trailing_whitespace;
+        let styled = self.session(id)?.with_selection(|selection, term, _| {
+            selection.styled_text(term.grid(), trim, &term.colors(), MAX_RICH_COPY_LEN)
+        });
+        Ok(styled
+            .filter(|(plain, _)| !plain.is_empty())
+            .map(|(plain, styled)| FormattedText {
+                plain,
+                rich: styled.render(MAX_RICH_COPY_LEN),
+            }))
     }
 
     /// The link at view-relative cell `at` of session `id` (the view's
