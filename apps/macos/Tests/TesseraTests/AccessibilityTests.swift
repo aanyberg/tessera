@@ -572,11 +572,17 @@ final class TerminalAccessibilityAppTests: XCTestCase {
         let recorder = PostRecorder { scheduler.now }
         view.accessibility.scheduler = scheduler
         view.accessibility.poster = recorder
-        // Already attached when set, as VoiceOver is when a tab opens: the
-        // first settle takes the snapshot later output is announced against.
+        // The view started with the machine's VoiceOver, which may be on
+        // and may have a settle pending on the main queue: detached first,
+        // so attaching is a change whatever the machine says. The first
+        // settle takes the snapshot later output is announced against.
+        view.accessibility.monitor = FakeClientMonitor(attached: false)
         view.accessibility.monitor = FakeClientMonitor(attached: true)
         view.accessibility.contentChanged()
-        scheduler.advance(by: 0.2)
+        try await waitUntil("the first settle") {
+            scheduler.advance(by: 0.2)
+            return !recorder.notifications.isEmpty
+        }
         XCTAssertEqual(recorder.notifications, [.valueChanged], "the first settle only tells the client to read")
         recorder.clear()
         try controller.focusedPane.session.write(Data("hello\n".utf8))
@@ -664,6 +670,8 @@ final class ReduceMotionScrollerTests: XCTestCase {
 
     override func setUp() async throws {
         scroller = TerminalScroller()
+        // Off unless a test turns it on, whatever the machine's setting.
+        scroller.reducesMotion = false
         scroller.preferredStyleOverride = .overlay
         scroller.now = { [unowned self] in now }
         scroller.scheduleHide = { [unowned self] delay, hide in hides.append((now + delay, hide)) }
@@ -775,10 +783,7 @@ final class DisplayOptionsSettingTests: XCTestCase {
         }
         try appDelegate.replaceCore(start: false)
         appDelegate.spawnOptions = .init()
-        appDelegate.reducesTransparency = { NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency }
-        appDelegate.increasesContrast = { NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast }
-        appDelegate.reducesMotion = { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
-        appDelegate.applyDisplayOptions()
+        HostDisplaySettings.pin(appDelegate)
         appDelegate = nil
         if let previous { setenv("TESSERA_CONFIG_DIR", previous, 1) } else { unsetenv("TESSERA_CONFIG_DIR") }
         try? FileManager.default.removeItem(at: dir)

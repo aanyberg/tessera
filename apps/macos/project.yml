@@ -118,6 +118,9 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.aanyberg.TesseraTests
         GENERATE_INFOPLIST_FILE: YES
+        # Pins the machine's Accessibility display settings off for every
+        # test (Tests/TesseraTests/HostDisplaySettings.swift).
+        INFOPLIST_KEY_NSPrincipalClass: TesseraTestsHostDisplaySettings
         TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Tessera.app/Contents/MacOS/Tessera"
         BUNDLE_LOADER: "$(TEST_HOST)"
 
