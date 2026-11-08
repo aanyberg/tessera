@@ -17,6 +17,8 @@ schema = ["dep:schemars"]
 [dependencies]
 # Reads iTerm2 `.itermcolors` property lists (XML and binary).
 plist.workspace = true
+# Smart selection rules (`[selection] smart_rules`, ADR 0042).
+regex.workspace = true
 schemars = { workspace = true, optional = true }
 serde.workspace = true
 serde_ignored = "0.1"

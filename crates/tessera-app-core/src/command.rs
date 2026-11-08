@@ -82,6 +82,7 @@ commands! {
     "close_window" => ["cmd+shift+w"] App,
     "clear_scrollback" => ["cmd+k"] App,
     "copy" => ["cmd+c"] App,
+    "copy_with_formatting" => [] App,
     "paste" => ["cmd+v"] App,
     "paste_plain" => ["cmd+alt+shift+v"] App,
     "select_all" => ["cmd+a"] App,

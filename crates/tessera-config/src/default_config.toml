@@ -68,6 +68,18 @@ clipboard_write = true
 # "ctrl+shift+k" = "send_text:clear\n"
 # "cmd+q" = "unbound"
 
+[selection]
+# Whether Copy drops the blanks after the last text of each line.
+trim_trailing_whitespace = true
+# A double-click selects the best match of the smart selection rules that
+# covers the click (paths, URLs, email and IP addresses, git hashes, quoted
+# strings by default), else the word. A list replaces the built-in rules;
+# precision is "very_low", "low", "normal", "high" or "very_high".
+#
+# [[selection.smart_rules]]
+# regex = '[A-Z]+-[0-9]+'
+# precision = "high"
+
 [plugins]
 # Plugin ids to enable.
 enabled = []

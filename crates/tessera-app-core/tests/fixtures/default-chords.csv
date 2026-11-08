@@ -16,6 +16,7 @@ close_tab,cmd+w,,Shell > Close Tab,w,cmd,cmd+w (closes pane/tab),cmd+w (S-TERM '
 close_window,cmd+shift+w,,Shell > Close Window,w,cmd+shift,cmd+shift+w (unverified),cmd+shift+w (S-TERM),app,S-MM:54.
 clear_scrollback,cmd+k,,Shell > Clear to Start,k,cmd,cmd+k = Clear Buffer (iTerm2 cheat sheet; docs list item without shortcut),cmd+k (S-TERM 'Clear to start'),app,S-MM:57. iTerm2 'Clear Scrollback Buffer' is a separate item (unverified chord cmd+alt+k).
 copy,cmd+c,,Edit > Copy,c,cmd,cmd+c,cmd+c (S-TERM),app,S-MM:66.
+copy_with_formatting,,,Edit > Copy with Formatting (#47),,,none,none,app,No default chord (ADR 0042).
 paste,cmd+v,,Edit > Paste,v,cmd,cmd+v,cmd+v (S-TERM),app,S-MM:67.
 paste_plain,cmd+alt+shift+v,,Edit > Paste as Plain Text,v,cmd+alt+shift,cmd+alt+shift+v ('Paste Special' items; unverified),cmd+alt+shift+c is 'Copy plain text' (S-TERM); no paste-plain default,app,S-MM:68. Canonical modifier order puts alt before shift: 'cmd+alt+shift+v' vs written 'alt+cmd+shift+v' must parse to the same chord.
 select_all,cmd+a,,Edit > Select All,a,cmd,cmd+a,cmd+a (S-TERM),app,S-MM:70.

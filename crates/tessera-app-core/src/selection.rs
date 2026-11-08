@@ -18,15 +18,34 @@
 //! - [`Granularity::Char`]: whole cells. A click alone selects nothing; the
 //!   first extend selects from the clicked cell to the pointer's, both
 //!   included.
-//! - [`Granularity::Word`]: the run of word characters (Unicode
-//!   alphanumerics and [`WORD_CHARS`]) or of whitespace under the click; any
-//!   other character is selected alone; past the end of the line's text
-//!   nothing is selected. Words continue across soft wraps.
+//! - [`Granularity::Word`]: the best smart-selection match under the
+//!   click (see below), else the run of word characters (Unicode
+//!   alphanumerics and [`WORD_CHARS`]) or of whitespace under the click;
+//!   any other character is selected alone; past the end of the line's
+//!   text nothing is selected. Words continue across soft wraps.
 //! - [`Granularity::Line`]: the whole logical line, every soft-wrapped row
 //!   of it at full width.
 //!
 //! Dragging extends by the same unit and keeps the unit first clicked
 //! whole. A block selection is the rectangle between the two points.
+//!
+//! # Smart selection
+//!
+//! A double-click first tries the rules of `[selection] smart_rules` (or
+//! the defaults, [`tessera_config::DEFAULT_SMART_RULES`]: paths, URLs,
+//! e-mail addresses, quoted strings, Git hashes, IPv4 and IPv6 addresses
+//! and more; ADR 0042) on the clicked character's logical line, soft wraps
+//! joined: at most [`SMART_SCAN_LEN`] characters around the click. Every
+//! match of a rule that covers the clicked character is a candidate,
+//! scored as its precision's weight times its length in characters; the
+//! highest score wins, then the higher precision, the longer match, the
+//! earlier start and the earlier rule. Where the logical line goes on past
+//! an edge of that window, a match starting (or ending) in the run of
+//! non-blank characters at that edge may be part of a longer one, so it
+//! is no candidate. Without a candidate the word is selected. Each rule scans
+//! from left to right, matches not overlapping (the regex crate's
+//! `find_iter`). Only the unit first clicked is smart: a drag and a
+//! shift-click extend by words.
 //!
 //! # When it is cleared
 //!
@@ -58,12 +77,16 @@
 //! [`crate::App::select_all`] stops at the last row with text, so output
 //! written below it does not clear the selection.
 
+use std::cmp::Reverse;
 use std::ops::Range;
 
+use tessera_config::{RuleCheck, SmartRules};
 pub use tessera_grid::Point;
 use tessera_grid::{Cell, Color, DamageRows, Grid, Line};
 use tessera_render::{Overlay, OverlayKind, Selection as Highlight};
+use tessera_term::ThemeColors;
 
+use crate::rich_text::{RunStyle, Styled};
 use crate::url::{self, MAX_URL_LEN};
 
 /// The characters besides Unicode alphanumerics that a double-click
@@ -397,6 +420,239 @@ fn unit_at(lines: &Lines<'_>, pos: Pos, granularity: Granularity) -> Option<(Pos
     }
 }
 
+/// The most characters smart selection scans around the click (S5): the
+/// clicked one, up to 4096 before it and up to 4095 after it on its
+/// logical line.
+pub const SMART_SCAN_LEN: usize = 8192;
+
+/// The characters before the click a smart scan takes at most.
+const SMART_SCAN_BEFORE: usize = SMART_SCAN_LEN / 2;
+
+/// The text smart-selection rules scan: part of one logical line around
+/// the clicked character, one entry per character (a cell's cluster or
+/// character; spacers and padding give none).
+#[derive(Debug, Default)]
+struct ScanWindow {
+    text: String,
+    /// Each character's cell.
+    cells: Vec<Pos>,
+    /// The byte each character's text starts at.
+    starts: Vec<usize>,
+    /// The clicked character's index.
+    click: usize,
+    /// Whether the window starts where its logical line starts.
+    line_start: bool,
+    /// Whether the window ends where its logical line's text ends.
+    line_end: bool,
+    /// The end of the run of characters at the window's start that may
+    /// continue before it: a match starting before this byte may be the
+    /// tail of a longer one and is not taken. 0 when the window starts with
+    /// its line; else the first character and the non-blank characters
+    /// after it.
+    cut_before: usize,
+    /// Likewise at the end: a match ending after this byte may be cut.
+    /// The text's length when the window ends with its line's text.
+    cut_after: usize,
+}
+
+impl ScanWindow {
+    /// The window around `at`, a character on or before `last` (the last
+    /// cell with text on `at`'s logical line).
+    fn around(lines: &Lines<'_>, at: Pos, last: Pos) -> Self {
+        let mut before = Vec::new();
+        let mut line_start = true;
+        let mut pos = at;
+        while let Some(prev) = lines.prev_char(pos) {
+            if before.len() == SMART_SCAN_BEFORE {
+                line_start = false;
+                break;
+            }
+            before.push(prev);
+            pos = prev;
+        }
+        let after_cap = SMART_SCAN_LEN - SMART_SCAN_BEFORE - 1;
+        let mut window = Self {
+            cells: Vec::with_capacity(before.len() + 1),
+            line_start,
+            line_end: true,
+            click: before.len(),
+            ..Self::default()
+        };
+        for &pos in before.iter().rev() {
+            window.push(lines, pos);
+        }
+        window.push(lines, at);
+        let mut pos = at;
+        while pos < last {
+            let Some(next) = lines.next_char(pos) else {
+                break;
+            };
+            if window.cells.len() - window.click - 1 == after_cap {
+                window.line_end = false;
+                break;
+            }
+            window.push(lines, next);
+            pos = next;
+        }
+        window.cut_before = if window.line_start {
+            0
+        } else {
+            match window.text.find(char::is_whitespace) {
+                Some(0) => window.bytes(0).end,
+                Some(blank) => blank,
+                None => window.text.len(),
+            }
+        };
+        window.cut_after = if window.line_end {
+            window.text.len()
+        } else {
+            let last = window.cells.len().saturating_sub(1);
+            match window.text.rfind(char::is_whitespace) {
+                Some(blank) if blank == window.starts.get(last).copied().unwrap_or(0) => blank,
+                Some(blank) => {
+                    blank
+                        + window.text[blank..]
+                            .chars()
+                            .next()
+                            .map_or(1, char::len_utf8)
+                }
+                None => 0,
+            }
+        };
+        window
+    }
+
+    fn push(&mut self, lines: &Lines<'_>, pos: Pos) {
+        let Some(line) = lines.line(pos.line) else {
+            return;
+        };
+        let col = usize::from(pos.col);
+        let Some(cell) = line.cells.get(col) else {
+            return;
+        };
+        self.cells.push(pos);
+        self.starts.push(self.text.len());
+        match line.cluster(col) {
+            Some(text) if cell.is_cluster() => self.text.push_str(text),
+            _ => self.text.push(cell.ch),
+        }
+    }
+
+    /// The bytes of character `i`.
+    fn bytes(&self, i: usize) -> Range<usize> {
+        let end = self.starts.get(i + 1).copied().unwrap_or(self.text.len());
+        self.starts[i]..end
+    }
+
+    /// The characters `bytes` touches.
+    fn chars(&self, bytes: Range<usize>) -> Range<usize> {
+        let first = self.starts.partition_point(|&s| s <= bytes.start) - 1;
+        let end = self.starts.partition_point(|&s| s < bytes.end);
+        first..end
+    }
+}
+
+/// The span `check` keeps of match `span` of `text`, or `None` when the
+/// check drops the match.
+fn checked(check: RuleCheck, text: &str, span: Range<usize>) -> Option<Range<usize>> {
+    match check {
+        RuleCheck::UrlTrail => Some(trim_url(text, span)),
+        RuleCheck::NotBeforeHexOrColon => text[span.end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_ascii_hexdigit() && c != ':')
+            .then_some(span),
+        RuleCheck::NotAfterAlnumOrColon => text[..span.start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric() && c != ':')
+            .then_some(span),
+        _ => Some(span),
+    }
+}
+
+/// URL detection's U4 and U5 on a matched URL: trailing punctuation
+/// stripped, and a trailing `)` or `]` while the URL holds more of it than
+/// of its opener, repeated until neither applies. Counts once, so a run of
+/// closers costs one pass.
+fn trim_url(text: &str, span: Range<usize>) -> Range<usize> {
+    let url = &text[span.clone()];
+    let count = |c: char| url.bytes().filter(|&b| b == c as u8).count();
+    let (open_paren, mut close_paren) = (count('('), count(')'));
+    let (open_bracket, mut close_bracket) = (count('['), count(']'));
+    let mut end = url.len();
+    while let Some(last) = url[..end].chars().next_back() {
+        let strip = match last {
+            c if url::is_trailing_punctuation(c) => true,
+            ')' if close_paren > open_paren => {
+                close_paren -= 1;
+                true
+            }
+            ']' if close_bracket > open_bracket => {
+                close_bracket -= 1;
+                true
+            }
+            _ => false,
+        };
+        if !strip {
+            break;
+        }
+        end -= last.len_utf8();
+    }
+    span.start..span.start + end
+}
+
+/// The cells of the best smart-selection match of `rules` covering the
+/// character at `pos` (see the module docs), or `None`: no rule matches
+/// there, or `pos` is past the end of its line's text or on padding.
+fn smart_at(lines: &Lines<'_>, pos: Pos, rules: &SmartRules) -> Option<(Pos, Pos)> {
+    // (score, weight, length, start, rule) and the characters.
+    type Key = (u64, u64, usize, Reverse<usize>, Reverse<usize>);
+    if rules.is_empty() {
+        return None;
+    }
+    let at = lines.char_at(pos)?;
+    let (_, last) = lines.text_end(at.line);
+    let last = last.filter(|last| at <= *last)?;
+    let window = ScanWindow::around(lines, at, last);
+    let click = window.bytes(window.click);
+    let mut best: Option<(Key, Range<usize>)> = None;
+    for (index, rule) in rules.rules().iter().enumerate() {
+        for found in rule.regex().find_iter(&window.text) {
+            if found.start() >= click.end {
+                break;
+            }
+            if found.end() <= click.start || found.is_empty() {
+                continue;
+            }
+            // A match in a run that reaches a window edge where the line
+            // goes on may be cut: dropped, never taken shortened.
+            let cut = found.start() < window.cut_before || found.end() > window.cut_after;
+            if cut {
+                continue;
+            }
+            let Some(span) = checked(rule.check(), &window.text, found.range()) else {
+                continue;
+            };
+            if span.is_empty() {
+                continue;
+            }
+            let chars = window.chars(span);
+            let weight = rule.precision().weight();
+            let len = chars.len();
+            let score = weight.saturating_mul(u64::try_from(len).unwrap_or(u64::MAX));
+            let key = (score, weight, len, Reverse(chars.start), Reverse(index));
+            if best.as_ref().is_none_or(|(best, _)| key > *best) {
+                best = Some((key, chars));
+            }
+        }
+    }
+    let (_, chars) = best?;
+    let first = *window.cells.get(chars.start)?;
+    let last = *window.cells.get(chars.end.checked_sub(1)?)?;
+    Some((first, lines.char_end(last)))
+}
+
 /// What a selection was taken against, to tell when it must be cleared.
 #[derive(Debug, Clone, Default)]
 struct Guard {
@@ -659,7 +915,9 @@ impl SelectionState {
     /// A click at `at` (view-relative at scroll `offset`): starts a new
     /// selection of `granularity`, a block one if `block`. A character
     /// click selects nothing until [`Self::extend`]; a word click past the
-    /// end of the text selects nothing either.
+    /// end of the text selects nothing either. A word click selects the
+    /// best match of `rules` there, if any, instead of the word (smart
+    /// selection, see the module docs).
     pub(crate) fn begin(
         &mut self,
         grid: &Grid,
@@ -667,12 +925,14 @@ impl SelectionState {
         at: Point,
         granularity: Granularity,
         block: bool,
+        rules: &SmartRules,
     ) {
         let lines = Lines::of(grid);
         let pos = lines.clamped(offset, at);
         let unit = match granularity {
             Granularity::Char => None,
-            _ => unit_at(&lines, pos, granularity),
+            Granularity::Word => smart_at(&lines, pos, rules).or_else(|| word_at(&lines, pos)),
+            Granularity::Line => unit_at(&lines, pos, granularity),
         };
         let mut guard = self.sel.take().map(|sel| sel.guard).unwrap_or_default();
         let (start, end) = unit.unwrap_or((pos, pos));
@@ -831,12 +1091,44 @@ impl SelectionState {
 
     /// The selected text, or `None` without a selection and for a
     /// selection on the alternate screen that holds no text; see
-    /// [`crate::App::selection_text`] for the rules.
-    pub(crate) fn text(&mut self, grid: &Grid) -> Option<String> {
+    /// [`crate::App::selection_text`] for the rules. `trim` drops the
+    /// blanks after each logical line's text (`trim_trailing_whitespace`).
+    pub(crate) fn text(&mut self, grid: &Grid, trim: bool) -> Option<String> {
         self.validate(grid, None);
         let sel = self.sel.as_ref().filter(|sel| sel.active)?;
-        let text = extract(&Lines::of(grid), sel);
+        let text = plain(&Lines::of(grid), sel, trim);
         (!text.is_empty() || !grid.is_alt_screen()).then_some(text)
+    }
+
+    /// The selected text as [`Self::text`] gives it, and the same text in
+    /// runs of one look under `colors`, collected up to `cap` bytes of
+    /// text (past it the runs are [`Styled::is_over`]); `None` as for
+    /// [`Self::text`]. One look at the grid gives both.
+    pub(crate) fn styled_text(
+        &mut self,
+        grid: &Grid,
+        trim: bool,
+        colors: &ThemeColors,
+        cap: usize,
+    ) -> Option<(String, Styled)> {
+        self.validate(grid, None);
+        let sel = self.sel.as_ref().filter(|sel| sel.active)?;
+        let lines = Lines::of(grid);
+        let text = plain(&lines, sel, trim);
+        if text.is_empty() && grid.is_alt_screen() {
+            return None;
+        }
+        let mut styled = Styled::default();
+        walk(&lines, sel, trim, |piece| {
+            match piece {
+                Piece::Cell(cell, cluster) => {
+                    styled.push_cell(cell, cluster, RunStyle::of(&cell.style, colors), cap);
+                }
+                Piece::Newline => styled.push_newline(cap),
+            }
+            !styled.is_over()
+        });
+        Some((text, styled))
     }
 
     /// Stores the hovered cell (view-relative), or none.
@@ -920,10 +1212,147 @@ fn clip(lines: &Lines<'_>, offset: usize, sel: &Sel) -> Option<Highlight> {
     Some(Highlight::linear(start, end))
 }
 
+/// One piece of a selection's text, in reading order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Piece<'a> {
+    /// A cell and, for a cluster, its whole text.
+    Cell(&'a Cell, Option<&'a str>),
+    /// A hard line end, or the end of a block's row.
+    Newline,
+}
+
+/// The pieces of `sel`'s text in order, to `emit` until it returns
+/// `false`: soft-wrapped rows joined, a newline at every hard line end
+/// (every row of a block), spacers and padding skipped, and no newline
+/// after the last cell given (the newlines of trailing blank rows are
+/// dropped). With `trim`, the blanks after the last text of each logical
+/// line are left out; without it every cell of the selection is given on
+/// the rows up to the last one the trimmed text has a cell on (text
+/// follows the row's first selected cell on its logical line), and none
+/// after it (`trim_trailing_whitespace = false`, ADR 0042).
+fn walk<'a>(lines: &Lines<'a>, sel: &Sel, trim: bool, mut emit: impl FnMut(Piece<'a>) -> bool) {
+    let columns = |n: i64| {
+        if sel.block {
+            (sel.start.col, sel.end.col)
+        } else {
+            (
+                if n == sel.start.line {
+                    sel.start.col
+                } else {
+                    0
+                },
+                if n == sel.end.line {
+                    sel.end.col
+                } else {
+                    lines.cols - 1
+                },
+            )
+        }
+    };
+    // Without trimming, the rows after the last one the trimmed text has
+    // a cell on give nothing: a row counts when text follows its first
+    // selected cell on its logical line (`tail`, the last text at or
+    // after the row, found walking up from the last row in one pass).
+    let last_row = if trim {
+        sel.end.line
+    } else {
+        let mut tail = lines.text_end(sel.end.line).1;
+        let mut row = sel.end.line;
+        loop {
+            let Some(line) = lines.line(row) else { return };
+            if row < sel.end.line {
+                let own = line
+                    .cells
+                    .iter()
+                    .rposition(|c| !is_blank(c))
+                    .map(|col| Pos {
+                        line: row,
+                        col: u16::try_from(col).unwrap_or(u16::MAX),
+                    });
+                tail = if line.wrapped { tail.or(own) } else { own };
+            }
+            let first = Pos {
+                line: row,
+                col: columns(row).0,
+            };
+            if tail.is_some_and(|tail| tail >= first) {
+                break row;
+            }
+            if row == sel.start.line {
+                return;
+            }
+            row -= 1;
+        }
+    };
+    // Newlines wait for the next cell, so trailing ones are never given.
+    let mut newlines = 0usize;
+    // The current logical line's last row and last cell with text.
+    let mut logical: Option<(i64, Option<Pos>)> = None;
+    for n in sel.start.line..=last_row {
+        let Some(line) = lines.line(n) else { break };
+        let (first, last) = columns(n);
+        let text_end = if trim {
+            if logical.is_none_or(|(bottom, _)| n > bottom) {
+                logical = Some(lines.text_end(n));
+            }
+            logical.and_then(|(_, end)| end)
+        } else {
+            None
+        };
+        let mut first = usize::from(first);
+        if first > 0 && line.cells.get(first).is_some_and(Cell::is_spacer) {
+            first -= 1;
+        }
+        let last = usize::from(last).min(line.cells.len().saturating_sub(1));
+        for col in first..=last {
+            let pos = Pos {
+                line: n,
+                col: u16::try_from(col).unwrap_or(u16::MAX),
+            };
+            if trim && text_end.is_none_or(|end| pos > end) {
+                break;
+            }
+            let cell = &line.cells[col];
+            if cell.is_spacer() || cell.is_pad() {
+                continue;
+            }
+            for _ in 0..newlines {
+                if !emit(Piece::Newline) {
+                    return;
+                }
+            }
+            newlines = 0;
+            let cluster = line.cluster(col).filter(|_| cell.is_cluster());
+            if !emit(Piece::Cell(cell, cluster)) {
+                return;
+            }
+        }
+        if n < sel.end.line && (sel.block || !line.wrapped) {
+            newlines += 1;
+        }
+    }
+}
+
+/// The text of `sel` ([`walk`]).
+fn plain(lines: &Lines<'_>, sel: &Sel, trim: bool) -> String {
+    let mut out = String::new();
+    walk(lines, sel, trim, |piece| {
+        match piece {
+            Piece::Cell(_, Some(text)) => out.push_str(text),
+            Piece::Cell(cell, None) => out.push(cell.ch),
+            Piece::Newline => out.push('\n'),
+        }
+        true
+    });
+    out
+}
+
 /// The text of `sel`: soft-wrapped rows joined, a newline at every hard
 /// line end (every row of a block), the blanks after the last text of a
 /// logical line dropped, spacers and padding skipped, clusters whole, and
-/// the newlines of trailing blank rows dropped.
+/// the newlines of trailing blank rows dropped. The reference
+/// [`plain`] with trimming must equal (a proptest checks it).
+#[cfg(test)]
 fn extract(lines: &Lines<'_>, sel: &Sel) -> String {
     let mut out = String::new();
     // The current logical line's last row and last cell with text.
@@ -1291,7 +1720,14 @@ mod tests {
     fn a_selection_survives_identical_repaints_and_clears_on_change() {
         let mut term = term(3, 10, b"hello\r\nworld");
         let mut state = SelectionState::default();
-        state.begin(term.grid(), 0, point(0, 0), Granularity::Char, false);
+        state.begin(
+            term.grid(),
+            0,
+            point(0, 0),
+            Granularity::Char,
+            false,
+            &SmartRules::default(),
+        );
         state.extend(term.grid(), 0, point(0, 4));
         // A full repaint of the same text (ED 2 + rewrite) keeps it.
         term.advance(b"\x1b[H\x1b[2Jhello\r\nworld");
@@ -1314,7 +1750,14 @@ mod tests {
         let mut state = SelectionState::default();
         // The oldest history line, selected while scrolled to the top.
         let offset = term.grid().scrollback_len();
-        state.begin(term.grid(), offset, point(0, 0), Granularity::Line, false);
+        state.begin(
+            term.grid(),
+            offset,
+            point(0, 0),
+            Granularity::Line,
+            false,
+            &SmartRules::default(),
+        );
         assert!(state.has_selection(term.grid()));
         term.advance(b"x\r\n");
         assert!(!state.has_selection(term.grid()));
@@ -1332,14 +1775,21 @@ mod tests {
         // compared by its line number, and none changed.
         term.advance(b"\r\n");
         assert!(state.has_selection(term.grid()));
-        assert_eq!(state.text(term.grid()).as_deref(), Some("a\nb\nc\nd"));
+        assert_eq!(state.text(term.grid(), true).as_deref(), Some("a\nb\nc\nd"));
     }
 
     #[test]
     fn switching_to_the_alternate_screen_clears() {
         let mut term = term(3, 10, b"hello");
         let mut state = SelectionState::default();
-        state.begin(term.grid(), 0, point(0, 0), Granularity::Word, false);
+        state.begin(
+            term.grid(),
+            0,
+            point(0, 0),
+            Granularity::Word,
+            false,
+            &SmartRules::default(),
+        );
         term.advance(b"\x1b[?1049h");
         assert!(!state.has_selection(term.grid()));
     }
@@ -1442,7 +1892,7 @@ mod tests {
         let term = term(2, 10, b"\x1b]8;;https://a.example/\x1b\\ab  \x1b]8;;\x1b\\");
         let mut state = SelectionState::default();
         state.select_all(term.grid());
-        assert_eq!(state.text(term.grid()).as_deref(), Some("ab"));
+        assert_eq!(state.text(term.grid(), true).as_deref(), Some("ab"));
     }
 
     /// The reference link lookup: every character of the whole logical
@@ -1616,14 +2066,14 @@ mod tests {
         let mut state = SelectionState::default();
         state.select_all(term.grid());
         assert!(state.has_selection(term.grid()));
-        assert_eq!(state.text(term.grid()), None);
+        assert_eq!(state.text(term.grid(), true), None);
         // With text it copies it; on the primary screen blanks copy as "".
         term.advance(b"ab");
         state.select_all(term.grid());
-        assert_eq!(state.text(term.grid()).as_deref(), Some("ab"));
+        assert_eq!(state.text(term.grid(), true).as_deref(), Some("ab"));
         let term = self::term(3, 10, b"");
         state.select_all(term.grid());
-        assert_eq!(state.text(term.grid()).as_deref(), Some(""));
+        assert_eq!(state.text(term.grid(), true).as_deref(), Some(""));
     }
 
     #[test]
@@ -1637,9 +2087,16 @@ mod tests {
             let mut term = term(2, 5, b"l1\r\nl2\r\nl3\r\ns1\r\ns2");
             term.set_max_scrollback(3);
             let mut state = SelectionState::default();
-            state.begin(term.grid(), 1, point(0, 0), Granularity::Char, block);
+            state.begin(
+                term.grid(),
+                1,
+                point(0, 0),
+                Granularity::Char,
+                block,
+                &SmartRules::default(),
+            );
             state.extend(term.grid(), 0, point(1, 1));
-            assert_eq!(state.text(term.grid()).as_deref(), Some("l3\ns1\ns2"));
+            assert_eq!(state.text(term.grid(), true).as_deref(), Some("l3\ns1\ns2"));
             term.advance(b"\x1b[3J\r\nx\r\ny\r\nz");
             assert_eq!(term.grid().scrollback_len(), term.grid().max_scrollback());
             assert!(!state.has_selection(term.grid()), "block {block}");
@@ -1648,10 +2105,17 @@ mod tests {
         let mut term = term(2, 5, b"l1\r\nl2\r\nl3\r\ns1\r\ns2");
         term.set_max_scrollback(3);
         let mut state = SelectionState::default();
-        state.begin(term.grid(), 1, point(0, 0), Granularity::Char, true);
+        state.begin(
+            term.grid(),
+            1,
+            point(0, 0),
+            Granularity::Char,
+            true,
+            &SmartRules::default(),
+        );
         state.extend(term.grid(), 0, point(1, 1));
         term.advance(b"\r\nx\r\ny\r\nz");
-        assert_eq!(state.text(term.grid()).as_deref(), Some("s1\ns2"));
+        assert_eq!(state.text(term.grid(), true).as_deref(), Some("s1\ns2"));
     }
 
     #[test]
@@ -1664,12 +2128,12 @@ mod tests {
         term.advance(b"l1\r\nl2\r\nl3");
         let mut state = SelectionState::default();
         state.select_all(term.grid());
-        assert_eq!(state.text(term.grid()).as_deref(), Some("l1\nl2\nl3"));
+        assert_eq!(state.text(term.grid(), true).as_deref(), Some("l1\nl2\nl3"));
         term.advance(b"\r\nm1");
-        assert_eq!(state.text(term.grid()).as_deref(), Some("l2\nl3"));
+        assert_eq!(state.text(term.grid(), true).as_deref(), Some("l2\nl3"));
         term.advance(b"\r\nm2\r\nm3\r\nm4");
         assert!(!state.has_selection(term.grid()));
-        assert_eq!(state.text(term.grid()), None);
+        assert_eq!(state.text(term.grid(), true), None);
     }
 
     /// Feeds `steps` one by one, and after each requires Copy to give
@@ -1974,7 +2438,7 @@ mod tests {
             term.advance(setup.concat().as_bytes());
             let mut state = SelectionState::default();
             let grid = term.grid();
-            state.begin(grid, offset, point(from.0, from.1), Granularity::Char, block);
+            state.begin(grid, offset, point(from.0, from.1), Granularity::Char, block, &SmartRules::default());
             state.extend(grid, offset, point(to.0, to.1));
             let sel = state.sel.clone().expect("selected");
             let original = extract(&Lines::of(grid), &sel);
@@ -2103,6 +2567,172 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// SS-C5: a match running past the scan window where its logical line
+    /// goes on is no candidate (the word is selected); a match inside the
+    /// window is found; the window holds at most [`SMART_SCAN_LEN`]
+    /// characters.
+    #[test]
+    fn the_scan_window_is_bounded_and_cut_matches_are_dropped() {
+        let rules = tessera_config::Selection::default().compiled_rules();
+        let mut term = Terminal::new(2, 200);
+        term.set_max_scrollback(1_000);
+        let line = "a/".repeat(50_000);
+        term.advance(line.as_bytes());
+        let lines = Lines::of(term.grid());
+        let mid = Pos {
+            line: lines.base + 250,
+            col: 100,
+        };
+        let (_, last) = lines.text_end(mid.line);
+        let window = ScanWindow::around(&lines, mid, last.unwrap());
+        assert_eq!(window.cells.len(), SMART_SCAN_LEN);
+        assert_eq!(window.text.len(), SMART_SCAN_LEN);
+        assert_eq!(window.click, 4096, "4096 characters before the click");
+        assert!(!window.line_start && !window.line_end);
+        assert_eq!(smart_at(&lines, mid, &rules), None);
+        // Near the line's start the window starts with it, but the match
+        // still runs past its end.
+        let near = Pos {
+            line: lines.base,
+            col: 10,
+        };
+        let window = ScanWindow::around(&lines, near, last.unwrap());
+        assert!(window.line_start && !window.line_end);
+        assert_eq!(window.cells.len(), 10 + SMART_SCAN_LEN - SMART_SCAN_BEFORE);
+        assert_eq!(smart_at(&lines, near, &rules), None);
+        // A double-click there selects the word: the whole line.
+        let mut state = SelectionState::default();
+        state.begin(
+            term.grid(),
+            249,
+            point(0, 100),
+            Granularity::Word,
+            false,
+            &rules,
+        );
+        assert_eq!(
+            state.text(term.grid(), true).as_deref(),
+            Some(line.as_str())
+        );
+
+        // A path inside the window of a long line is found.
+        let mut term = Terminal::new(2, 200);
+        term.set_max_scrollback(1_000);
+        let text = format!("{}/usr/lib/x {}", "a ".repeat(3_000), "a ".repeat(3_000));
+        term.advance(text.as_bytes());
+        let lines = Lines::of(term.grid());
+        let lib = Pos {
+            line: lines.base + 30,
+            col: 5,
+        };
+        assert_eq!(
+            smart_at(&lines, lib, &rules),
+            Some((
+                Pos {
+                    line: lines.base + 30,
+                    col: 0
+                },
+                Pos {
+                    line: lines.base + 30,
+                    col: 9
+                }
+            ))
+        );
+    }
+
+    /// U5 on a URL of closers only strips them in one pass: a hostile run
+    /// costs the run's length, not its square.
+    #[test]
+    fn url_trimming_is_linear() {
+        let url = format!("https://a.test/x(y){}.,", ")".repeat(8_000));
+        assert_eq!(trim_url(&url, 0..url.len()), 0.."https://a.test/x(y)".len());
+        let url = "https://a.test/[x]]";
+        assert_eq!(trim_url(url, 0..url.len()), 0..url.len() - 1);
+        let url = "https://a.test/x?";
+        assert_eq!(trim_url(url, 0..url.len()), 0..url.len() - 1);
+    }
+
+    /// The IPv6 post-checks drop matches that a look-around would have.
+    #[test]
+    fn ipv6_checks_drop_partial_matches() {
+        let text = "fe80::1g";
+        assert_eq!(
+            checked(RuleCheck::NotBeforeHexOrColon, text, 0..7),
+            Some(0..7)
+        );
+        assert_eq!(
+            checked(RuleCheck::NotBeforeHexOrColon, "fe80::1a", 0..7),
+            None
+        );
+        assert_eq!(
+            checked(RuleCheck::NotBeforeHexOrColon, "fe80::1:", 0..7),
+            None
+        );
+        assert_eq!(checked(RuleCheck::NotAfterAlnumOrColon, "x::1", 1..4), None);
+        assert_eq!(checked(RuleCheck::NotAfterAlnumOrColon, ":::1", 1..4), None);
+        assert_eq!(
+            checked(RuleCheck::NotAfterAlnumOrColon, " ::1", 1..4),
+            Some(1..4)
+        );
+        assert_eq!(checked(RuleCheck::None, "x", 0..1), Some(0..1));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1_000))]
+
+        /// The walker with trimming gives exactly the text the reference
+        /// `extract` does (Copy with `trim_trailing_whitespace = true` is
+        /// unchanged), and without trimming it gives that text plus blanks:
+        /// removing the blanks after each line's text gives it back.
+        #[test]
+        fn the_walker_agrees_with_the_reference(
+            parts in proptest::collection::vec(
+                prop_oneof![
+                    4 => "[ab ]{1,9}",
+                    1 => Just("\u{65e5}".to_owned()),
+                    1 => Just("e\u{301}".to_owned()),
+                    1 => Just("\x1b[41m  \x1b[0m".to_owned()),
+                    2 => Just("\r\n".to_owned()),
+                ],
+                0..14,
+            ),
+            from in (0u16..5, 0u16..7),
+            to in (0u16..5, 0u16..7),
+            offset in 0usize..3,
+            block in proptest::bool::weighted(0.25),
+            all in proptest::bool::weighted(0.1),
+        ) {
+            let mut term = Terminal::new(5, 7);
+            term.advance(parts.concat().as_bytes());
+            let grid = term.grid();
+            let mut state = SelectionState::default();
+            if all {
+                state.select_all(grid);
+            } else {
+                state.begin(grid, offset, point(from.0, from.1), Granularity::Char, block, &SmartRules::default());
+                state.extend(grid, offset, point(to.0, to.1));
+            }
+            let sel = state.sel.clone().expect("selected");
+            let lines = Lines::of(grid);
+            let reference = extract(&lines, &sel);
+            prop_assert_eq!(&plain(&lines, &sel, true), &reference);
+            let padded = plain(&lines, &sel, false);
+            prop_assert!(padded.len() >= reference.len());
+            if !sel.block {
+                let strip = |text: &str| {
+                    text.split('\n').map(|l| l.trim_end_matches(' ')).collect::<Vec<_>>().join("\n")
+                };
+                prop_assert_eq!(strip(&padded), strip(&reference));
+            }
+            // The styled text holds the same characters as the plain one.
+            let colors = ThemeColors::default();
+            let (text, _) = state
+                .styled_text(grid, false, &colors, crate::MAX_RICH_COPY_LEN)
+                .expect("selected");
+            prop_assert_eq!(text, padded);
         }
     }
 }

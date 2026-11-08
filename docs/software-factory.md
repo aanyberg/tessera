@@ -199,7 +199,8 @@ Agents use these instead of rebuilding the setup in every run:
   (`scripts/ffi-c-test.sh`, under the same watchdog; `surface.c` skips itself under `TESSERA_SKIP_GPU_TESTS`) and the
   release-only timing bars `reader_lock_hold_is_bounded`,
   `view_metrics_are_fast_while_output_floods_the_terminal`, `scrolling_through_a_long_history_is_smooth` and
-  `a_flood_under_a_scrolled_view_keeps_captures_short` (#114, #175; `timing` group). A failure with the 1-minute
+  `a_flood_under_a_scrolled_view_keeps_captures_short` (#114, #175) and
+  `a_double_click_with_64_rules_on_2048_columns_takes_under_5_ms` (#47) (`timing` group). A failure with the 1-minute
   load at or above `hw.ncpu` is retried once ("failed under load, retried"), any other failure fails the gate,
   and so does a failed build of the timing tests (load does not explain it). `just quality-gate-test` checks, with a
   fake `cargo`, the watchdog (nextest and the ffi C step), that retry and that the hooks are inert without

@@ -66,6 +66,7 @@ mod keys;
 mod load;
 mod paths;
 mod profile;
+mod selection;
 mod store;
 mod theme;
 mod watch;
@@ -91,6 +92,11 @@ pub use load::{
 pub use paths::{APP_SUPPORT_DIR_NAME, CONFIG_FILE_NAME, ConfigPaths, SHELL_INTEGRATION_DIR_NAME};
 pub use profile::{
     BUILT_IN_PROFILE_NAME, MAX_PROFILE_NAME_LEN, MAX_PROFILES, ProfileAppearance, ResolvedProfile,
+};
+pub use selection::{
+    CompiledRule, DEFAULT_SMART_RULES, MAX_SMART_RULE_PATTERN_LEN, MAX_SMART_RULES, Precision,
+    RuleCheck, SMART_RULE_NEST_LIMIT, SMART_RULE_SIZE_LIMIT, Selection, SmartRule, SmartRules,
+    default_rules,
 };
 pub use store::ConfigStore;
 pub use watch::{
@@ -148,6 +154,8 @@ pub struct Config {
     pub profiles: Vec<Profile>,
     /// Plugin enablement, keyed by plugin id.
     pub plugins: Plugins,
+    /// Smart selection on a double-click, and Copy's trailing blanks.
+    pub selection: Selection,
     /// Key bindings: each entry maps a chord to a command, so
     /// `"cmd+shift+d" = "split_down"` (always quote the chord). An entry
     /// adds its chord to the command, ahead of its defaults: the menu item
@@ -177,7 +185,8 @@ pub struct Config {
     /// as is), `unbound` (remove the chord's default) or `none` (swallow
     /// the key). Commands: `settings`, `hide`, `hide_others`, `quit`,
     /// `new_window`, `new_tab`, `close_tab`, `close_window`,
-    /// `clear_scrollback`, `copy`, `paste`, `paste_plain`, `select_all`,
+    /// `clear_scrollback`, `copy`, `copy_with_formatting` (Copy as RTF and
+    /// HTML too), `paste`, `paste_plain`, `select_all`,
     /// `font_bigger`, `font_smaller`, `font_reset`, `scroll_to_top`,
     /// `scroll_to_bottom`, `scroll_page_up`, `scroll_page_down`,
     /// `minimize`, `zoom`, `show_tab_bar`, `tab_previous`, `tab_next`,

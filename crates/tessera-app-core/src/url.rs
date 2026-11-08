@@ -230,7 +230,7 @@ fn url_around(line: &[char], at: usize) -> Option<Range<usize>> {
 }
 
 /// A trailing character U4 strips.
-fn is_trailing_punctuation(c: char) -> bool {
+pub(crate) fn is_trailing_punctuation(c: char) -> bool {
     matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"')
 }
 

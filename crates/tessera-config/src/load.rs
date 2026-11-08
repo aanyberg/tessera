@@ -297,6 +297,7 @@ impl Config {
     pub fn normalize(&mut self) -> Vec<Warning> {
         let mut warnings = Vec::new();
         normalize_appearance(&mut self.appearance, &mut warnings);
+        self.selection.normalize(&mut warnings);
         crate::profile::cap_profiles(self, &mut warnings);
         for (i, profile) in self.profiles.iter_mut().enumerate() {
             if let Some(appearance) = profile.appearance.as_mut() {
@@ -339,13 +340,14 @@ impl Config {
 
 /// The top-level keys of [`Config`], as written in `config.toml`. A test
 /// checks them against the serialised defaults.
-const CONFIG_KEYS: [&str; 6] = [
+const CONFIG_KEYS: [&str; 7] = [
     "general",
     "appearance",
     "terminal",
     "profiles",
     "plugins",
     "keys",
+    "selection",
 ];
 
 /// The part of `document` the warnings look up, copied: every top-level

@@ -28,7 +28,7 @@ a low-risk change.
 | Surface | Code | Rules |
 |---|---|---|
 | Escape sequences from the child: parser, OSC, DCS, replies, titles, clipboard, marks, cwd | `tessera-vt`, `tessera-term`, the session event path in `tessera-app-core` | S1, S2, S3, S5, S6 |
-| Paste and clipboard | `tessera-app-core` input and paste, the app's pasteboard bridge | S4 |
+| Paste and clipboard, Copy with Formatting (child text turned into HTML and RTF, ADR 0042) | `tessera-app-core` input and paste, `rich_text.rs`, the app's pasteboard bridge | S4, S5 |
 | Child-controlled text in the UI: titles, process names, URLs | `tessera-app-core` (`url.rs`), `apps/macos` | S3 |
 | The C ABI | `tessera-ffi`, the TesseraKit wrapper | S7 |
 | Spawning the child: environment, fds, signals, foreground job | `tessera-pty`, `tessera-shell-integration` | S5, S7 |
@@ -87,6 +87,9 @@ a low-risk change.
 | Imported plist | 4096 values, 256 KiB of text | `crates/tessera-config/src/import.rs` |
 | Unloadable theme files followed | 8 extra kqueue descriptors per watcher (`MAX_UNLOADABLE_FOLLOWED`), newest first, only while the configured theme is not found as a loadable user file | `crates/tessera-config/src/theme.rs`, `crates/tessera-config/src/watch.rs` |
 | URL candidate | 2083 characters | `crates/tessera-app-core/src/url.rs` |
+| Smart selection rules (`[selection] smart_rules`) | 64 rules (`MAX_SMART_RULES`), later ones dropped with one warning; pattern 1024 bytes (`MAX_SMART_RULE_PATTERN_LEN`); compiled program and lazy DFA cache 1 MiB each (`SMART_RULE_SIZE_LIMIT`), nesting 50 (`SMART_RULE_NEST_LIMIT`); a rule past a bound, that does not compile or that matches the empty string is left out with a warning; compiled once per configuration load (ADR 0042) | `crates/tessera-config/src/selection.rs` |
+| Smart selection scan (double-click) | 8192 characters of the logical line around the click (`SMART_SCAN_LEN`, 4096 before it); a match in the non-blank run at a window edge where the line goes on is dropped, never cut (ADR 0042) | `crates/tessera-app-core/src/selection.rs` |
+| Copy with Formatting | 16 MiB of HTML and of RTF each (`MAX_RICH_COPY_LEN`), counted while the runs are collected; RTF colour table 4096 entries (`MAX_RTF_COLORS`); past either the formatted copy is refused and only the plain text is copied; every markup character and every scalar above U+007E escaped, C0 and DEL dropped, no links or external resources (ADR 0042) | `crates/tessera-app-core/src/rich_text.rs`, `crates/tessera-ffi/src/selection.rs` |
 | OSC 8 link table | 65 536 live links (`MAX_LIVE_LINKS`), URI 2 083 bytes, id 250 bytes, 16 MiB of URI + id text (`MAX_LINK_TABLE_BYTES`); the id index loses an entry with its link's last cell; a URI with C0, DEL, C1 or bidi formatting controls is refused | `crates/tessera-grid/src/hyperlink.rs`, `crates/tessera-term/src/osc.rs` |
 | Search query | 1024 bytes (`MAX_QUERY_BYTES`); a regex program of 10 MiB (`REGEX_SIZE_LIMIT`) and a lazy DFA cache of 4 MiB (`DFA_SIZE_LIMIT`); longer or larger is refused, never cut | `crates/tessera-search/src/engine.rs` |
 | Search haystack | 64 KiB of text per scan (`MAX_HAYSTACK_BYTES`); a logical line is cut into segments of at most 128 rows (`MAX_SEGMENT_PERIOD`, fewer on wide screens) | `crates/tessera-search/src/engine.rs`, `crates/tessera-app-core/src/search.rs` |

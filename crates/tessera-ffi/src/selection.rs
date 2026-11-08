@@ -10,7 +10,7 @@
 
 use std::slice;
 
-use tessera_app_core::{Granularity as CoreGranularity, Point, SessionId};
+use tessera_app_core::{FormattedText, Granularity as CoreGranularity, Point, RichCopy, SessionId};
 
 use crate::app::App;
 use crate::error::{self, Error};
@@ -77,9 +77,12 @@ unsafe fn with_app(
 /// selection is replaced.
 ///
 /// A click selects nothing until `tessera_session_select_extend`; a
-/// double-click selects the word (letters, digits and `/-+\~_.`), the run
-/// of spaces or the single other character under it, and nothing past the
-/// end of the line's text; a triple-click selects the whole line, its
+/// double-click selects the longest smart-selection match under it (a
+/// path, URL, email address, hash or IP address, by the
+/// `[selection] smart_rules` patterns; ADR 0042), else the word (letters,
+/// digits and `/-+\~_.`), the run of spaces or the single other character
+/// under it, and nothing past the end of the line's text; dragging after a
+/// double-click extends by words; a triple-click selects the whole line, its
 /// soft-wrapped rows included.
 ///
 /// Returns `TESSERA_ERROR_NULL_POINTER` if `app` is `NULL`,
@@ -331,6 +334,145 @@ pub unsafe extern "C" fn tessera_session_selection_text(
             // SAFETY: `len` and `buf` per the contract.
             Ok(text) => unsafe { copy_out(text.as_deref().unwrap_or(""), buf, cap, len) },
             Err(error) => error::report("tessera_session_selection_text", &error),
+        }
+    })
+}
+
+/// One caller-owned output buffer of `tessera_session_selection_rich_text`:
+/// `buf` holds `cap` bytes of writes (it may be `NULL` with `cap` 0 to ask
+/// for the size), and the call stores the size the text needs in `len`.
+#[repr(C)]
+#[derive(Debug)]
+pub struct TextBuffer {
+    /// Where the UTF-8 bytes go (no NUL terminator), or `NULL`.
+    pub buf: *mut u8,
+    /// How many bytes `buf` holds.
+    pub cap: usize,
+    /// Set by the call: the text's length in bytes.
+    pub len: usize,
+}
+
+/// Copies `texts` into the caller's buffers all or none: stores every
+/// length, and writes them only when every buffer holds its text. A NULL
+/// `buf` whose `cap` claims room for its text is `NullPointer` (every
+/// length then 0), whatever the other buffers hold; else a buffer too
+/// short is `InvalidArgument`.
+///
+/// # Safety
+///
+/// Every buffer pointer must be writable, and each `buf` valid for its
+/// `cap` bytes of writes unless `cap` is 0.
+unsafe fn copy_all(texts: &[(&str, *mut TextBuffer)]) -> Error {
+    let (mut short, mut null) = (false, false);
+    for &(text, out) in texts {
+        // SAFETY: writable per the contract.
+        let out = unsafe { &mut *out };
+        out.len = text.len();
+        if text.len() > out.cap {
+            short = true;
+        } else if !text.is_empty() && out.buf.is_null() {
+            null = true;
+        }
+    }
+    if null {
+        for &(_, out) in texts {
+            // SAFETY: as above.
+            unsafe { (*out).len = 0 };
+        }
+        return Error::NullPointer;
+    }
+    if short {
+        return Error::InvalidArgument;
+    }
+    for &(text, out) in texts {
+        // SAFETY: as above.
+        let out = unsafe { &*out };
+        if !text.is_empty() {
+            // SAFETY: `buf` is non-null and holds `cap >= text.len()` bytes
+            // per the contract.
+            unsafe { slice::from_raw_parts_mut(out.buf, text.len()) }
+                .copy_from_slice(text.as_bytes());
+        }
+    }
+    Error::Ok
+}
+
+/// Copies session `session_id`'s selection for Copy with Formatting (ADR
+/// 0042): `plain` receives the text `tessera_session_selection_text` would
+/// copy (honouring `[selection] trim_trailing_whitespace`), `html` a
+/// self-contained HTML fragment and `rtf` an RTF document of the same text,
+/// with the cells' colours (the theme's, default colours left out), bold,
+/// italic, underline and strikethrough. Every character of the cell text is
+/// escaped; there are no links and no external resources. Put the three on
+/// the pasteboard as they are.
+///
+/// Each buffer gets its text's length in bytes in `len`. Without a
+/// selection, and for a selection of blanks only, every `len` is 0.
+///
+/// Returns `TESSERA_ERROR_INVALID_ARGUMENT` when a buffer is shorter than
+/// its text: nothing is written to any buffer and every `len` holds the
+/// size to call again with. Returns `TESSERA_ERROR_REFUSED` when the
+/// formatted text would pass 16 MiB: `html` and `rtf` get `len` 0 and
+/// `plain` is written as usual (copy it as plain text). Returns
+/// `TESSERA_ERROR_NULL_POINTER` if `app`, `html`, `rtf` or `plain` is
+/// `NULL`, or a `buf` is `NULL` with text to write and a `cap` that holds
+/// it (this comes before a short buffer);
+/// `TESSERA_ERROR_SESSION_NOT_FOUND` if the id is not a live session. On
+/// those failures every `len` is 0 (where its buffer is not `NULL`).
+///
+/// # Safety
+///
+/// `app` must be `NULL` or a live handle. `html`, `rtf` and `plain` must
+/// each be `NULL` or point to a writable `TesseraTextBuffer` whose `buf` is
+/// `NULL` or valid for `cap` bytes of writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_session_selection_rich_text(
+    app: *mut App,
+    session_id: u64,
+    html: *mut TextBuffer,
+    rtf: *mut TextBuffer,
+    plain: *mut TextBuffer,
+) -> Error {
+    ffi_guard!("tessera_session_selection_rich_text", {
+        let mut any_null = false;
+        for out in [html, rtf, plain] {
+            if out.is_null() {
+                any_null = true;
+            } else {
+                // SAFETY: non-null and writable per the contract.
+                unsafe { (*out).len = 0 };
+            }
+        }
+        if any_null {
+            return Error::NullPointer;
+        }
+        // SAFETY: the caller passes NULL or a live handle.
+        let Some(app) = (unsafe { App::from_ptr(app) }) else {
+            return Error::NullPointer;
+        };
+        match app
+            .core
+            .selection_copy_with_formatting(SessionId::from_raw(session_id))
+        {
+            Ok(None) => Error::Ok,
+            Ok(Some(FormattedText {
+                plain: text,
+                rich: RichCopy::Text { html: h, rtf: r },
+            })) => {
+                // SAFETY: the buffers per the contract.
+                unsafe { copy_all(&[(&h, html), (&r, rtf), (&text, plain)]) }
+            }
+            Ok(Some(FormattedText {
+                plain: text,
+                rich: RichCopy::TooLarge,
+            })) => {
+                // SAFETY: as above.
+                match unsafe { copy_all(&[(&text, plain)]) } {
+                    Error::Ok => Error::Refused,
+                    status => status,
+                }
+            }
+            Err(error) => error::report("tessera_session_selection_rich_text", &error),
         }
     })
 }
