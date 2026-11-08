@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 /// The Settings window (⌘,, ADR 0044): one per app, a toolbar of panes
-/// (General, Appearance, Profiles, Advanced), each a SwiftUI view in an
+/// (General, Appearance, Profiles, Keys, Advanced), each a SwiftUI view in an
 /// `NSHostingController` over the one ``SettingsModel``. AppKit hosts it
 /// (D12) rather than a SwiftUI `Settings` scene, since the app has no
 /// SwiftUI `App`; its frame is saved under ``autosaveName``.
@@ -15,8 +15,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     /// The name the window's frame is saved under in the user's defaults.
     static let autosaveName = "TesseraSettings"
 
-    /// One pane: its toolbar item and its view. A new pane (Keys, #40c) is
-    /// one more entry in ``panes``.
+    /// One pane: its toolbar item and its view. A new pane (Plugins, #48)
+    /// is one more entry in ``panes``.
     struct Pane {
         var identifier: String
         var label: String
@@ -34,6 +34,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         },
         Pane(identifier: "profiles", label: "Profiles", symbol: "person.crop.rectangle.stack") { model, _ in
             AnyView(ProfilesPane(model: model))
+        },
+        Pane(identifier: "keys", label: "Keys", symbol: "keyboard") { model, _ in
+            AnyView(KeysPane(model: model))
         },
         Pane(identifier: "advanced", label: "Advanced", symbol: "gearshape.2") { model, actions in
             AnyView(AdvancedPane(model: model, actions: actions))
@@ -69,6 +72,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         window.identifier = NSUserInterfaceItemIdentifier("settings")
         super.init(window: window)
         window.delegate = self
+        // The Keys pane records only this window's keys.
+        model.keys.window = window
         window.center()
         if let autosaveName {
             // Restores the saved frame, if there is one, and saves it from

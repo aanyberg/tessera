@@ -208,6 +208,16 @@ pub struct Config {
     /// terminal only. A malformed entry, an unknown command or a chord
     /// already bound by an earlier entry is ignored with a warning (the
     /// first entry wins); at most 512 entries are read.
+    ///
+    /// The Settings window's Keys pane writes chords in the canonical form
+    /// (`cmd+ctrl+alt+shift+key`). An entry you write by hand in another
+    /// form (modifiers in another order, an alias such as `opt`, a shifted
+    /// symbol such as `cmd+?`) still binds, but the pane does not recognise
+    /// the entry as its chord: such an entry that sends text or is `none`
+    /// is not shown as a conflict, and replacing or recording again a chord
+    /// such an entry holds shows the refusal ("same chord as …") and writes
+    /// nothing. Write such entries canonically, or edit them in `config.toml`
+    /// (#355).
     pub keys: Keys,
 }
 
