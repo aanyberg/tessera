@@ -37,6 +37,7 @@ mod config_watch;
 pub mod input;
 mod mouse;
 mod profile;
+pub mod remote;
 pub mod rich_text;
 pub mod search;
 pub mod selection;
@@ -64,6 +65,7 @@ pub use commands::{
     PROMPT_SCAN_LINES_PER_LOCK,
 };
 pub use input::{InputEvent, InputOutcome};
+pub use remote::{MAX_REMOTE_HOST_BYTES, Remote, SSH_PROBE_INTERVAL};
 pub use rich_text::{FormattedText, MAX_RICH_COPY_LEN, MAX_RTF_COLORS, RichCopy};
 pub use search::{MatchesText, SearchStatus};
 pub use selection::{Granularity, Link, Point, SMART_SCAN_LEN};

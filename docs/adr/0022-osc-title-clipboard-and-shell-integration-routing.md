@@ -274,6 +274,68 @@ prompt mark it never carried.
   `Loaded::warnings` is sorted into document order by the position of
   each warning's key.
 
+### Amendment 2026-11-08: remote-host indicator (#205)
+
+D-HOST gains its first consumer: the tab title shows when a session's
+shell runs on another machine, as `⇢ <host>: <title>`.
+
+- **D-REMOTE-CORE** (lead decision): the core decides, on the session's
+  reader thread (`tessera-app-core` `remote.rs`), and sends
+  `SessionEvent::Remote(Local | Host(host) | Unnamed)` only when the state
+  changes (S6); the C table gains `on_session_remote(user_data, session_id,
+  kind, host, len)` after `on_config_applied` (append-only, S7). One
+  decision per chunk of output, after its marks, from the chunk's last
+  valid OSC 7 report: one that `Cwd::is_local` accepts makes the session
+  local, any other remote with its host. "This machine" is any name
+  `tessera_pty::local_hostname()` (`gethostname`) returned at the session's
+  start or at one of its reports, at most 4 (`MAX_LOCAL_HOST_NAMES`, the
+  oldest forgotten first): a shell sends the name it read when it started
+  (zsh `$HOST`, bash `$HOSTNAME`), and macOS changes the name with the
+  network, so comparing with the current name alone would mark every open
+  local tab remote after a network change.
+- **D-REMOTE-SSH** (lead decision): while no non-local report is in effect,
+  the program in front is asked for its name at most once per second per
+  session (`SSH_PROBE_INTERVAL`, on output only, never on a timer): the
+  foreground job, or with no job the session leader
+  (`Pty::session_leader_name`, under the same guard against a recycled
+  pid), so a profile's `command = "ssh build-box"`, which `sh -c` `exec`s,
+  counts. A program named `ssh` makes the session `Unnamed`, shown
+  `⇢ ssh`: a host we have not confirmed is never shown. A non-local report stops the probe
+  (and its clock read) until a local report; a local report also clears a
+  probe's `ssh` finding.
+- **D-REMOTE-HOST** (S3): the host is dropped whole when it is longer than
+  253 bytes (`MAX_REMOTE_HOST_BYTES`, the longest DNS name; measured before
+  sanitising), and otherwise loses control (C0, C1, DEL), bidi-control and
+  line-separator characters and surrounding white space, the set a title
+  loses. Dropped, or empty once sanitised, it is `Unnamed`. `parse_osc7`
+  already refuses a host with a control character, so the sanitising is a
+  second line. Logs carry the host's length only (S8). The Swift bridge
+  copies the bytes before the callback returns, reads a host kind with a
+  null pointer, no bytes or more than 253 bytes as `Unnamed`, and keeps one
+  pending state per session (the latest), so a flood is one delivery.
+- **D-REMOTE-TITLE**: the window shows the focused pane's state in front of
+  the pane's title (an OSC 0/2 title keeps its text; an empty title shows
+  the prefix alone). `[general] remote_indicator = "title" | "off"`
+  (lenient: an unknown value warns and is `"title"`) is read at start and
+  after every applied reload and applies to every window at once; each pane
+  keeps its state while the prefix is off.
+- **Limits** (accepted):
+  - Leaving an integrated remote shell for a local shell without
+    integration keeps the prefix until a local report (the session cannot
+    tell the remote shell exited).
+  - A remote shell that sends OSC 7 with an empty host counts as local, so
+    inside `ssh` the title flips between `⇢ ssh` (the probe) and no prefix
+    (the report) at each prompt.
+  - The `ssh` fallback clears on the first output at least a second after
+    the last probe.
+  - `ssh` run by a command line that `sh -c` does not `exec` (`command =
+    "ssh host; true"`) shares the leader's group and is neither the leader
+    nor a job, so it is not seen.
+  - A local program can set an OSC 0/2 title such as `⇢ prod-db: ~` that
+    looks like the indicator. That cannot be prevented: the host is the
+    child's own claim either way. The indicator is a display hint, never a
+    security decision.
+
 ## Consequences
 
 - The C callback table grows by `on_session_clipboard(user_data,

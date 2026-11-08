@@ -4,10 +4,11 @@
  * check that Command-T reports a command without being typed (with and
  * without TESSERA_HANDLE_KEY_BINDINGS_ONLY), that an unbound key under the
  * flag is ignored, and that unknown flag bits are refused. The callback
- * table carries on_config_applied, appended last. #317: a chord with an
- * invisible key is refused with an escaped message, and once a binding
- * applies the JSON carries the new generation with the new chords. Uses a
- * configuration directory of its own under the script's
+ * table carries on_config_applied, appended after on_session_clipboard
+ * (remote.c checks the table's last field, on_session_remote, #205). #317:
+ * a chord with an invisible key is refused with an escaped message, and
+ * once a binding applies the JSON carries the new generation with the new
+ * chords. Uses a configuration directory of its own under the script's
  * TESSERA_CONFIG_DIR, so later tests start from no config.toml.
  */
 
@@ -20,13 +21,10 @@
 
 #include "TesseraCore.h"
 
-/* Appended after on_session_clipboard (#43): the table's last field. */
+/* Appended after on_session_clipboard (#43). */
 _Static_assert(offsetof(TesseraCallbacks, on_config_applied) ==
                    offsetof(TesseraCallbacks, on_session_clipboard) + sizeof(void (*)(void)),
                "on_config_applied follows on_session_clipboard");
-_Static_assert(sizeof(TesseraCallbacks) ==
-                   offsetof(TesseraCallbacks, on_config_applied) + sizeof(void (*)(void)),
-               "on_config_applied is the last field");
 
 #define EXPECT(expr, status)                                                         \
     do {                                                                             \

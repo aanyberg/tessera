@@ -585,6 +585,26 @@ where
         .unwrap_or_default())
 }
 
+/// Deserializes `general.remote_indicator` without failing: a value that
+/// is not exactly one of
+/// [`RemoteIndicator::as_str`](crate::RemoteIndicator::as_str) gives
+/// `"title"`, and [`invalid_lenient_values`] reports it, as for
+/// [`lenient_cursor_shape`].
+pub(crate) fn lenient_remote_indicator<'de, D>(
+    deserializer: D,
+) -> Result<crate::RemoteIndicator, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+
+    let value = toml::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_str()
+        .and_then(crate::RemoteIndicator::from_name)
+        .unwrap_or_default())
+}
+
 /// Deserializes `appearance.cursor_blink` without failing: anything but a
 /// boolean gives the default (`false`), and [`invalid_lenient_values`]
 /// reports it, as for [`lenient_cursor_shape`].
@@ -641,10 +661,43 @@ where
     Ok(toml::Value::deserialize(deserializer)?.as_bool())
 }
 
+/// The [`Warning::OutOfRange`] for `[general] remote_indicator` when its
+/// value is not one of [`RemoteIndicator::ALL`](crate::RemoteIndicator::ALL),
+/// with where the key is (see [`invalid_lenient_values`]).
+fn invalid_remote_indicator(text: &str, root: &toml::de::DeTable<'_>) -> Option<(usize, Warning)> {
+    use toml::de::DeValue;
+
+    const REMOTE: &str = "remote_indicator";
+
+    let (at, value) = lookup(root, &[Step::Key("general"), Step::Key(REMOTE)])?;
+    if let DeValue::String(name) = value.get_ref()
+        && crate::RemoteIndicator::from_name(name).is_some()
+    {
+        return None;
+    }
+    let names: Vec<String> = crate::RemoteIndicator::ALL
+        .iter()
+        .map(|value| format!("\"{}\"", value.as_str()))
+        .collect();
+    Some((
+        at,
+        Warning::OutOfRange {
+            path: format!("general.{REMOTE}"),
+            detail: format!(
+                "{} replaced by \"{}\" (expected {})",
+                written(text, value),
+                crate::RemoteIndicator::default().as_str(),
+                names.join(" or ")
+            ),
+        },
+    ))
+}
+
 /// One [`Warning::OutOfRange`], with where its key is, for every lenient
 /// key whose value the lenient deserializers replaced:
 /// `cursor_shape` and `cursor_blink` under `[appearance]` and under each
-/// profile's `appearance`, and `[terminal] clipboard_write`. Found in the
+/// profile's `appearance`, `[general] remote_indicator` and `[terminal]
+/// clipboard_write`. Found in the
 /// parsed document `root`, so a key written quoted or with escapes
 /// (`"cursor\u005fshape"`) is found too, and a value that merely mentions
 /// a key's name is not.
@@ -729,6 +782,7 @@ fn invalid_lenient_values(text: &str, root: &toml::de::DeTable<'_>) -> Vec<(usiz
             ));
         }
     }
+    warnings.extend(invalid_remote_indicator(text, root));
     if let Some((at, value)) = lookup(root, &[Step::Key("terminal"), Step::Key(CLIPBOARD)])
         && !matches!(value.get_ref(), DeValue::Boolean(_))
     {
@@ -1490,6 +1544,68 @@ mod tests {
             assert!(written.contains(&text[13..]), "{written}");
             assert_eq!(Config::from_toml(&written).unwrap(), loaded.config);
         }
+    }
+
+    #[test]
+    fn remote_indicator_parses_its_two_values_and_defaults_to_title() {
+        use crate::RemoteIndicator;
+
+        assert_eq!(
+            Config::default().general.remote_indicator,
+            RemoteIndicator::Title
+        );
+        for value in RemoteIndicator::ALL {
+            let text = format!("[general]\nremote_indicator = \"{}\"\n", value.as_str());
+            let loaded = Config::from_toml_lenient(&text).unwrap();
+            assert_eq!(loaded.config.general.remote_indicator, value);
+            assert_eq!(loaded.warnings, []);
+            let written = loaded.config.to_toml().unwrap();
+            assert!(written.contains(&text[10..]), "{written}");
+            assert_eq!(Config::from_toml(&written).unwrap(), loaded.config);
+        }
+    }
+
+    /// #205: an unknown value falls back to `"title"` with a warning that
+    /// names the key, in document order, and every other key applies.
+    #[test]
+    fn an_invalid_remote_indicator_warns_and_shows_the_prefix() {
+        use crate::RemoteIndicator;
+
+        for bad in ["\"Off\"", "\"none\"", "\"\"", "false", "0", "[\"off\"]"] {
+            let text = format!(
+                "[general]\nconfirm_close = false\nremote_indicator = {bad}\n\
+                 [appearance]\ncursor_shape = \"bar\"\n"
+            );
+            let loaded = Config::from_toml_lenient(&text).unwrap();
+            let general = &loaded.config.general;
+            assert_eq!(general.remote_indicator, RemoteIndicator::Title, "{bad}");
+            assert!(!general.confirm_close, "{bad}");
+            let paths: Vec<&str> = loaded
+                .warnings
+                .iter()
+                .map(|w| match w {
+                    Warning::OutOfRange { path, .. } => path.as_str(),
+                    other => panic!("{bad}: {other:?}"),
+                })
+                .collect();
+            assert_eq!(
+                paths,
+                ["general.remote_indicator", "appearance.cursor_shape"],
+                "{bad}"
+            );
+            let Warning::OutOfRange { detail, .. } = &loaded.warnings[0] else {
+                unreachable!();
+            };
+            assert!(detail.contains("replaced by \"title\""), "{bad}: {detail}");
+            assert!(detail.contains("\"off\""), "{bad}: {detail}");
+        }
+        // A hostile value is escaped in the warning (S8).
+        let loaded =
+            Config::from_toml_lenient("[general]\nremote_indicator = \"a\\u001b[2Jb\"\n").unwrap();
+        let Warning::OutOfRange { detail, .. } = &loaded.warnings[0] else {
+            panic!("{:?}", loaded.warnings);
+        };
+        assert!(!detail.contains('\u{1b}'), "{detail}");
     }
 
     #[test]

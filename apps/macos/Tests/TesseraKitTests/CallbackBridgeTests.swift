@@ -111,6 +111,45 @@ final class CallbackBridgeTests: XCTestCase {
             events, (0..<5).flatMap { [Recorder.Event.title("t\($0)"), .bell] } + [.exit(code: 3, signal: 0)])
     }
 
+    /// #205: the host is copied before the callback returns, a burst of
+    /// changes is one delivery with the latest, after the title.
+    func testRemoteStatesAreCopiedAndCoalescedAfterTheTitle() async throws {
+        onReaderThread { callbacks in
+            var host = Array("far.example".utf8)
+            host.withUnsafeBufferPointer {
+                callbacks.on_session_remote!(
+                    callbacks.user_data, 7, UInt8(TESSERA_REMOTE_KIND_HOST.rawValue), $0.baseAddress, $0.count)
+            }
+            for index in host.indices { host[index] = 0x58 }
+            Array("t".utf8CString).withUnsafeBufferPointer {
+                callbacks.on_session_title!(callbacks.user_data, 7, $0.baseAddress)
+            }
+        }
+        let first = try await drained()
+        XCTAssertEqual(first, [.title("t"), .remote(.host("far.example"))])
+        onReaderThread { callbacks in
+            for index in 0..<100_000 {
+                let kind = index.isMultiple(of: 2) ? TESSERA_REMOTE_KIND_UNNAMED : TESSERA_REMOTE_KIND_LOCAL
+                callbacks.on_session_remote!(callbacks.user_data, 7, UInt8(kind.rawValue), nil, 0)
+            }
+        }
+        let flooded = try await drained()
+        XCTAssertEqual(
+            flooded, [.title("t"), .remote(.host("far.example")), .remote(.local)],
+            "a flood is one delivery, the latest state")
+    }
+
+    func testMalformedRemoteCallsReadSafely() {
+        XCTAssertEqual(CallbackBridge.remote(kind: UInt8(TESSERA_REMOTE_KIND_HOST.rawValue), host: nil, len: 3), .unnamed)
+        let long = Array(repeating: UInt8(ascii: "a"), count: Int(TESSERA_MAX_REMOTE_HOST_LEN) + 1)
+        long.withUnsafeBufferPointer {
+            XCTAssertEqual(
+                CallbackBridge.remote(kind: UInt8(TESSERA_REMOTE_KIND_HOST.rawValue), host: $0.baseAddress, len: $0.count),
+                .unnamed)
+        }
+        XCTAssertEqual(CallbackBridge.remote(kind: 9, host: nil, len: 0), .local)
+    }
+
     func testBellBurstIsCoalescedIntoOneDelivery() async throws {
         onReaderThread { callbacks in
             for _ in 0..<100_000 {

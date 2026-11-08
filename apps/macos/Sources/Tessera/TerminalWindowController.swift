@@ -61,6 +61,15 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
     /// The window title while the focused pane's session has not set one.
     static let defaultTitle = "Terminal"
 
+    /// Whether a remote focused pane marks the title (`[general]
+    /// remote_indicator`, #205); the application delegate sets it from the
+    /// configuration in effect.
+    var showsRemoteHost = true {
+        didSet {
+            if showsRemoteHost != oldValue { updateTitle() }
+        }
+    }
+
     private static let log = Logger(subsystem: "com.aanyberg.tessera", category: "window")
 
     /// The Shell menu's ⌘W item, which ``PaneContainerView`` retitles.
@@ -137,6 +146,15 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
     func session(_ session: TesseraSession, didSetTitle title: String) {
         guard let pane = pane(for: session) else { return }
         pane.title = title
+        if pane === focusedPane {
+            updateTitle()
+        }
+    }
+
+    /// The focused pane's remote state marks the window's title.
+    func session(_ session: TesseraSession, didChangeRemote remote: TesseraRemote) {
+        guard let pane = pane(for: session) else { return }
+        pane.remote = remote
         if pane === focusedPane {
             updateTitle()
         }
@@ -396,8 +414,22 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
     }
 
     private func updateTitle() {
-        let title = focusedPane.title
-        window?.title = title.isEmpty ? Self.defaultTitle : title
+        window?.title = Self.title(focusedPane.title, remote: showsRemoteHost ? focusedPane.remote : .local)
+    }
+
+    /// The window title for a pane titled `title` (empty: none set) whose
+    /// shell runs at `remote`: `⇢ host: title`, or `⇢ ssh: title` when the
+    /// host is not known; a pane with no title shows `⇢ host` or `⇢ ssh`
+    /// alone. The host and the title both come sanitised from the core
+    /// (docs/security.md S3).
+    static func title(_ title: String, remote: TesseraRemote) -> String {
+        let prefix: String
+        switch remote {
+        case .local: return title.isEmpty ? defaultTitle : title
+        case .host(let host): prefix = "⇢ \(host)"
+        case .unnamed: prefix = "⇢ ssh"
+        }
+        return title.isEmpty ? prefix : "\(prefix): \(title)"
     }
 
     /// The window cannot be made smaller than its panes' smallest sizes.

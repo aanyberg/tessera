@@ -661,6 +661,7 @@ final class SettingsTests: XCTestCase {
         let edits = [
             Edit(key: "general.default_profile", value: .string("two"), line: #"default_profile = "two""#),
             Edit(key: "general.confirm_close", value: .bool(false), line: "confirm_close = false"),
+            Edit(key: "general.remote_indicator", value: .string("off"), line: #"remote_indicator = "off""#),
             Edit(key: "appearance.theme", value: .string(theme), line: "theme = \"\(theme)\""),
             Edit(key: "appearance.font_family", value: .string(font), line: "font_family = \"\(font)\""),
             Edit(key: "appearance.font_size", value: .float(15), line: "font_size = 15.0"),

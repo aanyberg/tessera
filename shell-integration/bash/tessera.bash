@@ -134,17 +134,15 @@ if [[ $- == *i* && -n "${TESSERA_SHELL_INTEGRATION-}" && "${TESSERA_SHELL_INTEGR
     # $? and $_ as the DEBUG trap found them.
     _tessera_si_saved=(0 "")
     _tessera_si_elements=1
-    _tessera_si_last_pwd=
     _tessera_si_mark_a='\[\033]133;A\007\]'
     _tessera_si_mark_b='\[\033]133;B\007\]'
 
     # OSC 7: `file://<host><path>`, the path percent-encoded byte by byte
     # with Terminal.app's rule (every byte outside [/._~A-Za-z0-9-] becomes
-    # %XX), the host from $HOSTNAME reduced to [A-Za-z0-9._-]. Sent only
-    # when $PWD changed.
+    # %XX), the host from $HOSTNAME reduced to [A-Za-z0-9._-]. Sent at
+    # every prompt (as zsh and fish do): a program run from the shell, ssh
+    # say, may have reported another directory, or another host, meanwhile.
     _tessera_si_report_pwd() {
-        [[ "$PWD" == "$_tessera_si_last_pwd" ]] && builtin return 0
-        _tessera_si_last_pwd=$PWD
         builtin local LC_ALL=C LC_CTYPE=C LC_COLLATE=C
         # bash 3.2 word-splits unquoted expansions in `local` arguments.
         builtin local host="${HOSTNAME//[!A-Za-z0-9._-]/}" url="$PWD" ch hex i

@@ -18,10 +18,11 @@ internal import TesseraCore
 /// read and once per BEL byte, which a program can emit far faster than any
 /// delegate runs (`yes $'\a'`): one `Task` per event would grow the main
 /// queue without bound. Each callback records its event in the session's
-/// pending set (output: a flag; title and clipboard text: the latest value;
-/// bell: a flag; exit: the code and signal) and schedules a delivery only if
-/// none is queued for that session. The delivery takes the whole set and
-/// reports it in a fixed order: output, title, clipboard, bell, exit. The
+/// pending set (output: a flag; title, remote state and clipboard text: the
+/// latest value; bell: a flag; exit: the code and signal) and schedules a
+/// delivery only if none is queued for that session. The delivery takes the
+/// whole set and reports it in a fixed order: output, title, remote state,
+/// clipboard, bell, exit. The
 /// clipboard text (OSC 52) goes to ``pasteboard``, not to the delegate,
 /// through one app-wide ``ClipboardThrottle`` (at most 10 writes a second,
 /// the latest held; ADR 0022 D-RATE52). So at most one delivery per session
@@ -126,8 +127,29 @@ final class CallbackBridge {
             },
             on_config_applied: { userData, generation in
                 CallbackBridge.from(userData)?.receiveConfiguration(generation: generation)
+            },
+            on_session_remote: { userData, id, kind, host, len in
+                // `host` (UTF-8, already sanitised by the core) is valid only
+                // during this call.
+                let remote = CallbackBridge.remote(kind: kind, host: host, len: len)
+                CallbackBridge.from(userData)?.receive(for: id) { $0.remote = remote }
             }
         )
+    }
+
+    /// The remote state an `on_session_remote` call describes. A host kind
+    /// without a host, or longer than the core's cap, reads as unnamed; an
+    /// unknown kind as local.
+    nonisolated static func remote(kind: UInt8, host: UnsafePointer<UInt8>?, len: Int) -> TesseraRemote {
+        switch TesseraRemoteKind(rawValue: UInt32(kind)) {
+        case TESSERA_REMOTE_KIND_HOST:
+            guard let host, len > 0, len <= Int(TESSERA_MAX_REMOTE_HOST_LEN) else { return .unnamed }
+            return .host(String(decoding: UnsafeBufferPointer(start: host, count: len), as: UTF8.self))
+        case TESSERA_REMOTE_KIND_UNNAMED:
+            return .unnamed
+        default:
+            return .local
+        }
     }
 
     private nonisolated static func from(_ userData: UnsafeMutableRawPointer?) -> CallbackBridge? {
@@ -141,6 +163,7 @@ final class CallbackBridge {
     private struct Pending: Sendable {
         var output = false
         var title: String?
+        var remote: TesseraRemote?
         var clipboard: String?
         var bell = false
         var exit: (code: Int32, signal: Int32)?
@@ -221,6 +244,9 @@ final class CallbackBridge {
         }
         if let title = events.title, let (delegate, session) = target() {
             delegate.session(session, didSetTitle: title)
+        }
+        if let remote = events.remote, let (delegate, session) = target() {
+            delegate.session(session, didChangeRemote: remote)
         }
         if let text = events.clipboard, !isShutDown, sessions[id] != nil {
             offerClipboard(.init(session: id, text: text))

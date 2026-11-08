@@ -62,6 +62,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
     }
+    /// `[general] remote_indicator` as last read from the core: whether every
+    /// tab marks a remote shell in its title (#205).
+    var showsRemoteHost = true {
+        didSet {
+            for controller in windowControllers {
+                controller.showsRemoteHost = showsRemoteHost
+            }
+        }
+    }
     /// Set by a termination signal: quit without asking.
     var terminatesWithoutConfirmation = false
     /// Reads the system's Reduce Transparency setting (Accessibility,
@@ -397,6 +406,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let controller = TerminalWindowController(session: session, title: TerminalWindowController.defaultTitle)
         controller.delegate = self
         controller.paneContainer.inactivePaneDimming = paneDimming
+        controller.showsRemoteHost = showsRemoteHost
         // Registered before the main actor can run the session's first
         // delivery, so no event is dropped.
         router.register(controller, session: session)
@@ -439,11 +449,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         router.onConfigurationApplied = { [weak self] in
             self?.applyKeymap()
             self?.readPaneDimming()
+            self?.readRemoteIndicator()
             self?.applyProfiles()
             self?.settingsWindowController?.model.reload()
         }
         applyKeymap()
         readPaneDimming()
+        readRemoteIndicator()
         applyProfiles()
         applyDisplayOptions()
         return core
@@ -494,6 +506,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             paneDimming = CGFloat(try core.dimInactivePanes())
         } catch {
             Self.log.error("dim_inactive_panes not read: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    /// Reads `[general] remote_indicator` from the configuration in effect: at
+    /// start and after every configuration the core applies (live reload).
+    /// The core has already replaced an unknown value with `"title"`, with a
+    /// warning. Keeps the previous setting if it cannot be read.
+    private func readRemoteIndicator() {
+        guard let core else { return }
+        do {
+            showsRemoteHost = try core.configSnapshot()["general.remote_indicator"]?.string != "off"
+        } catch {
+            Self.log.error("remote_indicator not read: \(String(describing: error), privacy: .public)")
         }
     }
 
