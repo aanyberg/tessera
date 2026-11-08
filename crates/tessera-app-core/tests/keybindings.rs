@@ -556,6 +556,25 @@ fn resolve_allocates_nothing() {
     assert_eq!(found, 5);
 }
 
+/// #317: `is_default` (asked on every ⌘↑ / ⌘↓ by the prompt rule)
+/// allocates nothing: it no longer parses the registry's chords per call.
+#[test]
+fn is_default_allocates_nothing() {
+    let map = keymap("'cmd+up' = 'scroll_page_up'\n'cmd+j' = 'new_tab'\n");
+    let chords = [
+        chord("cmd+up"),
+        chord("cmd+down"),
+        chord("cmd+t"),
+        chord("cmd+j"),
+        chord("cmd+shift+k"),
+        chord("f5"),
+    ];
+    let before = ALLOCATIONS.with(Cell::get);
+    let defaults = chords.iter().filter(|&&c| map.is_default(c)).count();
+    assert_eq!(ALLOCATIONS.with(Cell::get), before);
+    assert_eq!(defaults, 2, "cmd+down and cmd+t");
+}
+
 /// S5: a table past every cap compiles to at most `MAX_KEY_BINDINGS`
 /// entries and as many registry warnings, each bounded, however many
 /// entries and however long their names.

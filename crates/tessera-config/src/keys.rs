@@ -239,7 +239,16 @@ pub enum ChordError {
     /// A function-key character from U+F700..U+F8FF.
     #[error("private-use function-key character; use the key's name")]
     FunctionKeyCharacter,
-    /// Neither one character nor a key name.
+    /// A key that shows nothing: a bidirectional formatting, zero-width or
+    /// other default-ignorable character (U+200B, U+202E, U+FEFF, a
+    /// variation selector), which a menu or the Keys pane would show as a
+    /// blank or let reorder the text around it. Printed as its `\u{..}`
+    /// escape.
+    #[error("invisible key `{}` (a bidi, zero-width or other default-ignorable character)", .0.escape_unicode())]
+    InvisibleKey(char),
+    /// Neither one character nor a key name. The segment is escaped as
+    /// warnings are (control, bidi and other default-ignorable characters
+    /// as their `\u{..}` escapes) and capped, so it can be shown as is.
     #[error("unknown key `{0}`")]
     UnknownKey(String),
 }
@@ -306,7 +315,7 @@ impl Chord {
                 if is_unsupported_modifier(segment) {
                     return Err(ChordError::UnsupportedModifier((*segment).to_owned()));
                 }
-                return Err(ChordError::UnknownKey((*segment).to_owned()));
+                return Err(ChordError::UnknownKey(escaped_text(segment)));
             };
             if held.contains(modifier) {
                 return Err(ChordError::DuplicateModifier((*segment).to_owned()));
@@ -437,6 +446,9 @@ fn parse_key(segment: &str) -> Result<(ChordKey, ChordModifiers), ChordError> {
         if ('\u{F700}'..='\u{F8FF}').contains(&c) {
             return Err(ChordError::FunctionKeyCharacter);
         }
+        if is_invisible(c) {
+            return Err(ChordError::InvisibleKey(c));
+        }
         let mut lower = c.to_lowercase();
         if lower.next() != Some(c) || lower.next().is_some() {
             return Err(ChordError::Uppercase(c));
@@ -495,9 +507,72 @@ fn parse_key(segment: &str) -> Result<(ChordKey, ChordModifiers), ChordError> {
             {
                 return named(ChordKey::KpDigit(n));
             }
-            Err(ChordError::UnknownKey(segment.to_owned()))
+            Err(ChordError::UnknownKey(escaped_text(segment)))
         }
     }
+}
+
+/// The Unicode `Default_Ignorable_Code_Point` ranges (`DerivedCoreProperties`,
+/// Unicode 16), inclusive and sorted: the characters a renderer shows as
+/// nothing, the bidirectional formatting characters among them (U+061C,
+/// U+200E, U+200F, U+202A..=U+202E, U+2066..=U+2069).
+const DEFAULT_IGNORABLE: [(u32, u32); 17] = [
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1_BCA0, 0x1_BCA3),
+    (0x1_D173, 0x1_D17A),
+    (0xE_0000, 0xE_0FFF),
+];
+
+/// Whether `c` shows nothing: a default-ignorable character
+/// ([`DEFAULT_IGNORABLE`]), the bidi, zero-width and variation-selector
+/// characters included. Control and white space characters are refused
+/// before a chord gets this far.
+fn is_invisible(c: char) -> bool {
+    let c = u32::from(c);
+    let i = DEFAULT_IGNORABLE.partition_point(|&(_, last)| last < c);
+    DEFAULT_IGNORABLE
+        .get(i)
+        .is_some_and(|&(first, _)| first <= c)
+}
+
+/// `text` for a `[keys]` warning: as [`escaped`] writes it (control, line
+/// separator and bidi characters as escapes, cut to
+/// [`MAX_WARNING_PATH_LEN`] bytes with a marker), with every other
+/// invisible character ([`is_invisible`]: zero-width, variation selectors,
+/// the other default-ignorables) written as its `\u{..}` escape too, so a
+/// warning never carries a character that shows as nothing. Only the
+/// first [`MAX_WARNING_PATH_LEN`] bytes or so are looked at, so a huge key
+/// costs no more than a short one.
+pub(crate) fn escaped_text(text: &str) -> String {
+    // One byte past the cap, rounded up to a character boundary: a longer
+    // `text` still ends up longer than the cap, so `escaped` cuts it and
+    // adds its marker.
+    let mut end = text.len().min(MAX_WARNING_PATH_LEN + 1);
+    while !text.is_char_boundary(end) {
+        end += 1;
+    }
+    let mut head = String::with_capacity(end);
+    for c in text[..end].chars() {
+        if is_invisible(c) {
+            head.extend(c.escape_unicode());
+        } else {
+            head.push(c);
+        }
+    }
+    escaped(&head, MAX_WARNING_PATH_LEN)
 }
 
 /// `n` when `text` is `prefix` followed by `n` in decimal without a
@@ -580,10 +655,7 @@ impl KeyAction {
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
         if !valid_name {
-            return Err(KeyActionError::InvalidCommand(escaped(
-                name,
-                MAX_WARNING_PATH_LEN,
-            )));
+            return Err(KeyActionError::InvalidCommand(escaped_text(name)));
         }
         if let Some(parameter) = parameter {
             let valid = !parameter.is_empty()
@@ -592,10 +664,7 @@ impl KeyAction {
                     .bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
             if !valid {
-                return Err(KeyActionError::InvalidParameter(escaped(
-                    parameter,
-                    MAX_WARNING_PATH_LEN,
-                )));
+                return Err(KeyActionError::InvalidParameter(escaped_text(parameter)));
             }
         }
         Ok(Self::Command {
@@ -722,9 +791,12 @@ pub struct Keys {
     /// to sort; not part of the value.
     warnings: Vec<(usize, Warning)>,
     /// The entries as deserialized (a value that is not a string is
-    /// `None`), kept until [`Keys::put_in_document_order`] rebuilds the
-    /// table from them: the TOML parser hands a table over sorted by key,
-    /// and only the loader knows where each key was. Not part of the value.
+    /// `None`), kept only until [`Keys::put_in_document_order`] rebuilds
+    /// the table from them and drops them: the TOML parser hands a table
+    /// over sorted by key, and only the loader knows where each key was.
+    /// Empty after a load, so a table at the file cap keeps no more than
+    /// its [`MAX_KEY_BINDINGS`] entries (docs/security.md S5). Not part of
+    /// the value.
     source: Vec<(String, Option<String>)>,
 }
 
@@ -742,51 +814,50 @@ impl Keys {
     /// been written in a `[keys]` table: the same checks, caps and
     /// warnings as a loaded file.
     pub fn from_entries<'a>(entries: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
-        let source = entries
+        let source: Vec<(String, Option<String>)> = entries
             .into_iter()
             .map(|(key, value)| (key.to_owned(), Some(value.to_owned())))
             .collect();
         let mut keys = Self::default();
-        keys.build(source, |_| None);
+        keys.build(&source, |_| None);
         keys
     }
 
     /// Rebuilds the table from the entries it was deserialized from, in
     /// the order of `at`: the byte offset of each key in the document
     /// (`None` sorts last). Duplicates and the cap are decided in that
-    /// order, so the first entry *written* wins. Does nothing the second
-    /// time.
+    /// order, so the first entry *written* wins. The entries are dropped
+    /// then, so a second call (or a table not deserialized) does nothing.
     pub(crate) fn put_in_document_order(&mut self, at: impl Fn(&str) -> Option<usize>) {
         let source = std::mem::take(&mut self.source);
         if !source.is_empty() {
-            self.build(source, at);
+            self.build(&source, at);
         }
     }
 
     /// Checks `source` in the order of `at` (stable), keeping at most
-    /// [`MAX_KEY_BINDINGS`] entries.
-    fn build(&mut self, source: Vec<(String, Option<String>)>, at: impl Fn(&str) -> Option<usize>) {
-        let mut entries: Vec<(usize, String, Option<String>)> = source
-            .into_iter()
-            .map(|(key, value)| (at(&key).unwrap_or(usize::MAX), key, value))
+    /// [`MAX_KEY_BINDINGS`] entries. Keeps nothing of `source` but the
+    /// entries it accepts.
+    fn build(&mut self, source: &[(String, Option<String>)], at: impl Fn(&str) -> Option<usize>) {
+        let mut order: Vec<(usize, usize)> = source
+            .iter()
+            .enumerate()
+            .map(|(index, (key, _))| (at(key).unwrap_or(usize::MAX), index))
             .collect();
-        entries.sort_by_key(|&(at, _, _)| at);
+        order.sort_by_key(|&(at, _)| at);
         self.bindings.clear();
         self.warnings.clear();
-        let dropped = entries.len().saturating_sub(MAX_KEY_BINDINGS);
-        for (at, key, value) in entries.iter().take(MAX_KEY_BINDINGS) {
-            self.add(*at, key, value.as_deref().ok_or(()));
+        let dropped = order.len().saturating_sub(MAX_KEY_BINDINGS);
+        for &(at, index) in order.iter().take(MAX_KEY_BINDINGS) {
+            let (key, value) = &source[index];
+            self.add(at, key, value.as_deref().ok_or(()));
         }
         if dropped > 0 {
-            let at = entries[MAX_KEY_BINDINGS].0;
+            let at = order[MAX_KEY_BINDINGS].0;
             self.warnings
                 .push((at, Warning::TooManyKeyBindings { dropped }));
         }
         self.warnings.sort_by_key(|&(at, _)| at);
-        self.source = entries
-            .into_iter()
-            .map(|(_, key, value)| (key, value))
-            .collect();
     }
 
     /// The accepted entries, in document order. No two have the same
@@ -824,7 +895,7 @@ impl Keys {
             (
                 at,
                 Warning::KeyBinding {
-                    key: escaped(key, MAX_WARNING_PATH_LEN),
+                    key: escaped_text(key),
                     reason,
                 },
             )
@@ -849,7 +920,7 @@ impl Keys {
             }
         };
         if let Some(first) = self.bindings.iter().find(|b| b.chord == chord) {
-            let first = escaped(&first.key, MAX_WARNING_PATH_LEN);
+            let first = escaped_text(&first.key);
             self.warnings.push(warn(format!(
                 "same chord as `{first}` (the first entry wins); ignored"
             )));
@@ -900,7 +971,8 @@ impl<'de> Deserialize<'de> for Keys {
                     source.push((key, value.as_str().map(str::to_owned)));
                 }
                 let mut keys = Keys::default();
-                keys.build(source, |_| None);
+                keys.build(&source, |_| None);
+                keys.source = source;
                 Ok(keys)
             }
         }
@@ -983,6 +1055,106 @@ mod tests {
         assert!(loaded.config.keys.is_empty());
         assert_eq!(loaded.warnings.len(), 1);
         assert!(loaded.warnings[0].to_string().contains("cmd+t"));
+    }
+
+    #[test]
+    fn the_invisible_table_is_sorted_and_matches_known_characters() {
+        for pair in DEFAULT_IGNORABLE.windows(2) {
+            assert!(pair[0].0 <= pair[0].1 && pair[0].1 < pair[1].0, "{pair:X?}");
+        }
+        for c in [
+            '\u{AD}',
+            '\u{34F}',
+            '\u{61C}',
+            '\u{115F}',
+            '\u{180E}',
+            '\u{200B}',
+            '\u{200D}',
+            '\u{200E}',
+            '\u{202E}',
+            '\u{2060}',
+            '\u{2066}',
+            '\u{2069}',
+            '\u{3164}',
+            '\u{FE0F}',
+            '\u{FEFF}',
+            '\u{1D173}',
+            '\u{E0001}',
+            '\u{E0FFF}',
+        ] {
+            assert!(is_invisible(c), "U+{:04X}", u32::from(c));
+        }
+        for c in [
+            'a',
+            '-',
+            '\u{A0}',
+            '\u{301}',
+            '\u{2010}',
+            '\u{2028}',
+            '\u{2070}',
+            '\u{FE10}',
+            '\u{FFF9}',
+            '\u{E1000}',
+            'é',
+            'т',
+        ] {
+            assert!(!is_invisible(c), "U+{:04X}", u32::from(c));
+        }
+    }
+
+    /// Warning text escapes what `escaped` does and every invisible
+    /// character too, and stays bounded however long the key.
+    #[test]
+    fn warning_text_escapes_invisible_characters_and_is_bounded() {
+        assert_eq!(
+            escaped_text("a\u{200B}b\u{202E}c\u{1}d\u{FEFF}"),
+            "a\\u{200b}b\\u{202e}c\\u{1}d\\u{feff}"
+        );
+        assert_eq!(escaped_text("cmd+t"), "cmd+t");
+        for long in [
+            "\u{200B}".repeat(1 << 20),
+            "x".repeat(1 << 20),
+            "é".repeat(1 << 20),
+        ] {
+            let out = escaped_text(&long);
+            assert!(out.len() <= MAX_WARNING_PATH_LEN + 8, "{}", out.len());
+            assert!(!out.contains('\u{200B}'));
+        }
+    }
+
+    /// M3: a `[keys]` table filling the config file cap keeps only the
+    /// accepted entries once loaded: the deserialized entries are dropped
+    /// (none left in the table or in a clone), whatever the count.
+    #[test]
+    fn a_table_at_the_file_cap_keeps_no_source_entries() {
+        /// A `[keys]` table of `'k<n>' = 'none'` lines, `len` bytes at most.
+        fn table(len: usize) -> String {
+            let mut text = String::with_capacity(len);
+            text.push_str("[keys]\n");
+            for i in 0.. {
+                let line = format!("'k{i}' = 'none'\n");
+                if text.len() + line.len() > len {
+                    break;
+                }
+                text.push_str(&line);
+            }
+            text
+        }
+        let full = table(usize::try_from(crate::MAX_CONFIG_FILE_LEN).unwrap());
+        assert!(full.lines().count() > 500_000);
+        // The strict loader at a smaller size: the file cap costs seconds
+        // in a debug build.
+        let small = table(1 << 20);
+        for keys in [
+            crate::Config::from_toml_lenient(&full).unwrap().config.keys,
+            crate::Config::from_toml(&small).unwrap().keys,
+        ] {
+            assert_eq!(keys.source.len(), 0);
+            assert_eq!(keys.source.capacity(), 0, "the entries are freed");
+            assert_eq!(keys.clone().source.capacity(), 0);
+            assert!(keys.bindings.is_empty(), "every `k<n>` is an unknown key");
+            assert!(keys.warnings.len() <= MAX_KEY_BINDINGS + 1);
+        }
     }
 
     #[test]

@@ -4,13 +4,19 @@
  * check that Command-T reports a command without being typed (with and
  * without TESSERA_HANDLE_KEY_BINDINGS_ONLY), that an unbound key under the
  * flag is ignored, and that unknown flag bits are refused. The callback
- * table carries on_config_applied, appended last.
+ * table carries on_config_applied, appended last. #317: a chord with an
+ * invisible key is refused with an escaped message, and once a binding
+ * applies the JSON carries the new generation with the new chords. Uses a
+ * configuration directory of its own under the script's
+ * TESSERA_CONFIG_DIR, so later tests start from no config.toml.
  */
 
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
 
 #include "TesseraCore.h"
 
@@ -45,6 +51,28 @@ static void on_config_applied_cb(void *user_data, uint64_t generation) {
     (void)generation;
 }
 
+#define S(text) (const uint8_t *)(text), strlen(text)
+
+/* The key map JSON, NUL-terminated, read with the two-call protocol (with
+ * room to spare: the map may grow between the calls); NULL on failure. */
+static char *keymap_json(const TesseraApp *app) {
+    size_t len = 0;
+    if (tessera_app_keymap_json(app, NULL, 0, &len) != TESSERA_ERROR_INVALID_ARGUMENT ||
+        len == 0) {
+        return NULL;
+    }
+    size_t cap = len + 4096;
+    char *json = malloc(cap + 1);
+    size_t written = 0;
+    if (json == NULL ||
+        tessera_app_keymap_json(app, (uint8_t *)json, cap, &written) != TESSERA_ERROR_OK) {
+        free(json);
+        return NULL;
+    }
+    json[written] = 0;
+    return json;
+}
+
 static TesseraKeyEvent key(uint32_t key, uint32_t codepoint, uint8_t modifiers) {
     TesseraKeyEvent event;
     memset(&event, 0, sizeof event);
@@ -58,6 +86,13 @@ static TesseraKeyEvent key(uint32_t key, uint32_t codepoint, uint8_t modifiers) 
 }
 
 int main(void) {
+    const char *base = getenv("TESSERA_CONFIG_DIR");
+    CHECK(base != NULL && base[0] == '/');
+    char dir[1024];
+    snprintf(dir, sizeof dir, "%s/keymap-c-test", base);
+    CHECK(mkdir(dir, 0700) == 0);
+    CHECK(setenv("TESSERA_CONFIG_DIR", dir, 1) == 0);
+
     TesseraApp *app = NULL;
     EXPECT(tessera_app_new(&app), TESSERA_ERROR_OK);
     TesseraCallbacks callbacks = {
@@ -125,6 +160,50 @@ int main(void) {
     CHECK(outcome == TESSERA_INPUT_OUTCOME_IGNORED && command == TESSERA_NO_COMMAND);
 
     EXPECT(tessera_session_close(app, id), TESSERA_ERROR_OK);
+
+    /* #317: a chord whose key is a zero-width space (U+200B) is refused,
+     * and the message shows the key escaped, never the raw character. */
+    uint8_t msg[512];
+    size_t msg_len = 0;
+    EXPECT(tessera_config_set(app, S("keys.\"cmd+\xe2\x80\x8b\""), S("\"new_tab\""), msg,
+                              sizeof msg - 1, &msg_len),
+           TESSERA_ERROR_REFUSED);
+    CHECK(msg_len > 0 && msg_len < sizeof msg);
+    msg[msg_len] = 0;
+    /* The path before "refused:" is the caller's own key, echoed back; the
+     * reason after it is the key map's warning, escaped. */
+    const char *reason = strstr((const char *)msg, "refused:");
+    CHECK(reason != NULL);
+    CHECK(strstr(reason, "\xe2\x80\x8b") == NULL);
+    CHECK(strstr(reason, "invisible key `\\u{200b}`") != NULL);
+
+    /* A binding applies: the JSON that shows the new chords carries a
+     * later generation, read with them. */
+    EXPECT(tessera_config_set(app, S("keys.\"cmd+u\""), S("\"new_tab\""), NULL, 0, NULL),
+           TESSERA_ERROR_OK);
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (;;) {
+        char *text = keymap_json(app);
+        CHECK(text != NULL);
+        int initial = strstr(text, "\"generation\":0") != NULL;
+        int rebound = strstr(text, "\"chords\":[\"cmd+u\",\"cmd+t\"]") != NULL;
+        free(text);
+        /* The watch may apply the created default file first; the chords
+         * of the edit never come with the generation the app started at. */
+        CHECK(!(initial && rebound));
+        if (rebound) {
+            break;
+        }
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec - start.tv_sec > 30) {
+            fprintf(stderr, "timed out waiting for the configuration to apply\n");
+            return 1;
+        }
+        struct timespec pause = {.tv_sec = 0, .tv_nsec = 10 * 1000 * 1000};
+        nanosleep(&pause, NULL);
+    }
     tessera_app_free(app);
     printf("ok\n");
     return 0;
