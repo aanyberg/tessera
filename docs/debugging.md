@@ -1,7 +1,8 @@
 # Debugging
 
 Two dev-only tools show what the emulator and renderer do without Xcode or the Swift app. Neither is shipped or
-linked by the app. The contributor workflow is in [`CONTRIBUTING.md`](../CONTRIBUTING.md).
+linked by the app. The contributor workflow is in [`CONTRIBUTING.md`](../CONTRIBUTING.md). The last section records
+what a live resize does to the process's memory footprint, so a footprint budget in a test is not mistaken for a leak.
 
 ## Screen dumps with `tessera-devtool`
 
@@ -101,3 +102,50 @@ needs its own `UCKeyTranslate`-based dead-key state (as Zed and kitty keep) or
 an IME. Known limit: with the left Option as Meta, a US key whose Option layer
 is a dead key (`M-u`, `M-e`, `M-n`, `M-i`, `` M-` ``) may leave a composition
 pending, so the next key can come out accented.
+
+## Live resize footprint
+
+Resizing a window that renders makes the process's physical footprint (`phys_footprint`, what Activity Monitor and
+the footprint budgets in the app tests read) climb by about one drawable per resize step and fall back in batches.
+On CI it reached about 1.2 GB in the flood tests (#326). The controls below show that the growth is neither
+Tessera's allocations nor `wgpu` freeing late, and the likely cause is macOS. Every resize gives the pane's
+`CAMetalLayer` a new drawable size, and each frame presented at that size hands an IOSurface of it to the window
+server. The best reading of the measurements is that macOS keeps those surfaces after the layer has dropped them and
+charges them to the process. No control isolates the window server itself, such as a windowed layer presenting
+through plain Metal without `wgpu`. `footprint <pid>` lists the growth as "Owned physical footprint (unmapped)",
+memory the process owns but does not map. It is released in batches every 40 to 100 steps, and all of it within
+0.5 to 3 s of the last resize. By then the pane has nothing new to draw and the app submits no GPU work.
+
+The measurements come from a throwaway CI branch (run 42443391618, `macos-15`, scale 1, Debug app tests). The
+window cycled through 900 × 600, 1200 × 800, 1000 × 700 and 1100 × 650 points, with 200 steps 20 ms apart and
+about 200 frames presented. Growth is the peak minus the start. Settled is the footprint 3 s after the last step.
+
+| Variant | Growth with TSan | Growth without TSan | Settled vs start |
+| --- | --- | --- | --- |
+| As shipped (two runs) | +115, +195 MB | +212, +197 MB | -6 to +9 MB |
+| No rendering (resizes only) | +0 MB | +0 MB | -1 to 0 MB |
+| Fixed size, output only | +3 MB | +0 MB | -3 to +3 MB |
+| An autorelease pool around every display-link tick | +172 MB | +196 MB | -3 MB |
+| `device.poll(wait)` after every resize | +104 MB | +210 MB | -3 to -2 MB |
+| Frame latency 1 instead of 2 | +153 MB | +209 MB | -2 to -1 MB |
+| Autorelease pool and poll | +186 MB | +212 MB | -50 to 0 MB |
+
+The growth is linear at about 2.6 MB per presented resize step, the size of one BGRA drawable at about
+1000 × 700 pixels. The "Owned physical footprint (unmapped)" category went from 3 MB in 2 regions to 91-185 MB in
+35-74 regions and back. The IOSurface and IOAccelerator categories stayed flat, and so did everything Tessera
+allocates (the renderer has no per-size texture other than the swapchain). Nothing the app or the renderer controls
+moved the growth. An autorelease pool would drain autoreleased drawables and `device.poll(wait)` would run `wgpu`'s
+deferred frees, but both left it unchanged, and so did a shorter swapchain. A bare `CAMetalLayer` that is not in a
+window shows no growth (a flat 143-146 MB at scale 2, with 99 MB of it in the same category), which suggests that
+window-server compositing is what holds the surfaces. A hosted app test's window that is not visible presents
+nothing: a locked screen, a sleeping display, a covered window or one on another Space. So the effect can only be
+seen on CI or with the test window on screen.
+
+`ResizeFootprintTests` (in `apps/macos/Tests/TesseraTests`) bounds what remains. Over 200 steps 20 ms apart with a
+rendering pane, the peak must stay below 0.9 of the bytes that keeping every step's drawable would cost. The
+measured peaks reached 0.2 to 0.4 of that, and the bar leaves room for a late batch. The footprint must also be back
+within 150 MB of its start no more than 10 s after the last step. The test prints the frames presented meanwhile. A
+texture kept per resize (1.17 to 1.2 of the sum, never released) fails both bounds. The test skips when the window
+is not visible, because nothing is drawn then. The other footprint budgets in the app tests either leave live
+resizing out or, like the pane flood test, measure growth past the highest footprint of a warm-up resize cycle.
+
