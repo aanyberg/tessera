@@ -11,13 +11,17 @@
 //! selection = "#44475a"       # optional; defaults to the foreground at alpha 0x40
 //! search_match = "#ffd86699"  # optional; defaults to the renderer's (#ffd866 at alpha 0.6)
 //! search_match_current = "#ff9f43cc"  # optional; defaults to #ff9f43 at alpha 0.8
+//! mark_success = "#50fa7b"    # optional; defaults to ansi[2] (green)
+//! mark_failure = "#ff5555"    # optional; defaults to ansi[1] (red)
 //! ansi = ["#21222c", "#ff5555", "#50fa7b", "#f1fa8c", "#bd93f9", "#ff79c6", "#8be9fd", "#f8f8f2",
 //!         "#6272a4", "#ff6e6e", "#69ff94", "#ffffa5", "#d6acff", "#ff92df", "#a4ffff", "#ffffff"]
 //! ```
 //!
 //! Colours are `#rrggbb` or `#rrggbbaa` sRGB strings (hex digits in either
 //! case). Unknown keys are ignored, so a theme written by a newer version
-//! still loads.
+//! still loads. `mark_success` and `mark_failure` colour the exit-status
+//! marks beside finished commands' prompts (#45b); they are drawn opaque,
+//! and a command whose exit status is unknown is marked in `ansi[8]`.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -245,6 +249,12 @@ pub struct Theme {
     /// ANSI colours 0-15: black, red, green, yellow, blue, magenta, cyan,
     /// white, then their bright variants.
     pub ansi: [Color; 16],
+    /// The exit-status mark of a command that succeeded, or `None` for
+    /// `ansi[2]` (green). Drawn opaque: the alpha digits are ignored.
+    pub mark_success: Option<Color>,
+    /// The exit-status mark of a command that failed, or `None` for
+    /// `ansi[1]` (red). Drawn opaque.
+    pub mark_failure: Option<Color>,
 }
 
 /// The bundled themes' names in their documented order, with their files.
@@ -335,6 +345,8 @@ impl Theme {
             color("selection")?.unwrap_or_else(|| foreground.with_alpha(DERIVED_SELECTION_ALPHA));
         let search_match = color("search_match")?;
         let search_match_current = color("search_match_current")?;
+        let mark_success = color("mark_success")?;
+        let mark_failure = color("mark_failure")?;
         let ansi = match table.get("ansi") {
             None => return Err(ThemeError::MissingKey("ansi")),
             Some(toml::Value::Array(items)) => {
@@ -380,6 +392,8 @@ impl Theme {
             search_match,
             search_match_current,
             ansi,
+            mark_success,
+            mark_failure,
         })
     }
 
@@ -402,6 +416,12 @@ impl Theme {
         }
         if let Some(color) = self.search_match_current {
             let _ = writeln!(out, "search_match_current = \"{color}\"");
+        }
+        if let Some(color) = self.mark_success {
+            let _ = writeln!(out, "mark_success = \"{color}\"");
+        }
+        if let Some(color) = self.mark_failure {
+            let _ = writeln!(out, "mark_failure = \"{color}\"");
         }
         out.push_str("ansi = [\n");
         for row in self.ansi.chunks(8) {
@@ -784,6 +804,30 @@ mod tests {
         let bad = format!("{base}search_match = \"red\"\n");
         let error = Theme::parse(&bad).unwrap_err().to_string();
         assert!(error.contains("search_match"), "{error}");
+    }
+
+    /// The exit-status mark keys (#45b) are optional like the search
+    /// keys: absent they are `None` and not written; set, they parse, survive
+    /// `to_toml`, and a bad value is an error naming the key.
+    #[test]
+    fn mark_keys_are_optional() {
+        let base = Theme::bundled("Dracula").unwrap().to_toml();
+        let plain = Theme::parse(&base).unwrap();
+        assert_eq!((plain.mark_success, plain.mark_failure), (None, None));
+        assert!(!base.contains("mark_"), "absent keys are not written");
+        let text = format!("{base}mark_success = \"#00ff00\"\nmark_failure = \"#Ff000080\"\n");
+        let theme = Theme::parse(&text).unwrap();
+        assert_eq!(theme.mark_success, Some(Color::rgb(0, 0xff, 0)));
+        assert_eq!(
+            theme.mark_failure,
+            Some(Color::rgb(0xff, 0, 0).with_alpha(0x80))
+        );
+        assert_eq!(Theme::parse(&theme.to_toml()).unwrap(), theme, "round trip");
+        for key in ["mark_success", "mark_failure"] {
+            let bad = format!("{base}{key} = \"green\"\n");
+            let error = Theme::parse(&bad).unwrap_err().to_string();
+            assert!(error.contains(key), "{error}");
+        }
     }
 
     /// #262 items 4 and 5: a theme warning never carries a raw line

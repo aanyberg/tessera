@@ -49,6 +49,16 @@
 //! from the configured one and the overrides (`with_overrides`), at most
 //! once per frame and outside the terminal lock, so a flood of colour sets
 //! costs one rebuild per drawn frame. A re-theme keeps the overrides.
+//!
+//! # Exit-status gutter
+//!
+//! `View::capture` also finds the rows in view that start the prompt of a
+//! finished command (`commands::gutter`, #45b) and their exit status, which
+//! frames draw as marks in the left padding. It looks again only when the
+//! lines may have changed (the grid's damage generation, the history's
+//! length or count of pushed lines, the offset or the line epoch moved),
+//! and a frame whose marks differ from the last presented one's is drawn
+//! even without damage. The alternate screen has no marks.
 
 use std::time::{Duration, Instant};
 
@@ -57,11 +67,12 @@ use tessera_grid::{Cell, DamageRows, GraphemeTable, Grid, Line, Point};
 use tessera_pty::PtySize;
 pub use tessera_render::{CellMetrics, FrameStatus, PhysicalSize, RenderError, wgpu};
 use tessera_render::{
-    CursorShape, CursorState, Fonts, FrameInput, Gpu, RenderSurface, Renderer, Rgba, Shaper,
-    SurfaceOptions, Theme, sanitize_font_size, sanitize_scale,
+    CommandStatus, CursorShape, CursorState, Fonts, FrameInput, Gpu, GutterMark, RenderSurface,
+    Renderer, Rgba, Shaper, SurfaceOptions, Theme, sanitize_font_size, sanitize_scale,
 };
 use tessera_term::{ColorOverrides, CursorStyle, Rgb, Terminal, ThemeColors};
 
+use crate::commands;
 use crate::selection::Decorations;
 
 /// The shortest time between two presented frames of one view: one
@@ -273,6 +284,8 @@ pub fn theme_for_appearance(
             .search_match_current
             .map_or(defaults.search_match_current, rgba),
         ansi: theme.ansi.map(rgba),
+        mark_success: theme.mark_success.map(rgba),
+        mark_failure: theme.mark_failure.map(rgba),
         ..defaults
     }
 }
@@ -545,6 +558,9 @@ pub(crate) struct View {
     /// The selection and link underlines of the last presented frame;
     /// `None` before the first one.
     shown_decorations: Option<Decorations>,
+    /// [`Snapshot::gutter_generation`] of the last presented frame; `None`
+    /// before the first one.
+    shown_gutter: Option<u64>,
     /// When the last presented frame was due on the [`MIN_FRAME_INTERVAL`]
     /// schedule (at most [`FRAME_SLACK`] before it was actually
     /// presented); `None` before the first one.
@@ -612,6 +628,7 @@ impl View {
             pending: DamageRows::All,
             shown: None,
             shown_decorations: None,
+            shown_gutter: None,
             last_presented: None,
         })
     }
@@ -830,6 +847,7 @@ impl View {
         let changed = !self.pending.is_none()
             || self.shown != Some(shown)
             || self.shown_decorations.as_ref() != Some(self.snapshot.decorations())
+            || self.shown_gutter != Some(self.snapshot.gutter_generation)
             || self.renderer.needs_redraw();
         if !changed {
             return Ok(FrameStatus::Skipped);
@@ -849,6 +867,7 @@ impl View {
                 self.pending = DamageRows::None;
                 self.shown = Some(shown);
                 self.shown_decorations = Some(self.snapshot.decorations().clone());
+                self.shown_gutter = Some(self.snapshot.gutter_generation);
                 self.last_presented = Some(due_time(self.last_presented, now));
             }
             // Not drawn: the damage stays pending for the next frame.
@@ -913,6 +932,32 @@ struct ScrolledAt {
     len: usize,
 }
 
+/// What the exit-status gutter of a snapshot was found for: while it is
+/// the same, the lines' marks are too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GutterKey {
+    /// [`Grid::damage_generation`]: setting a mark damages its row, and
+    /// the cursor leaving its row moves it. It does not cover every line
+    /// change: EL clears the cursor row's wrap flag without moving it,
+    /// hence `cursor_wrapped`.
+    generation: u64,
+    /// The cursor row's [`Line::wrapped`], which decides whether an `A` on
+    /// the row below continues a prompt.
+    ///
+    /// [`Line::wrapped`]: tessera_grid::Line::wrapped
+    cursor_wrapped: bool,
+    /// [`Grid::scrollback_pushed`].
+    pushed: u64,
+    /// [`Grid::scrollback_len`].
+    len: usize,
+    /// The offset captured (0 on the alternate screen).
+    offset: usize,
+    /// [`Terminal::line_epoch`].
+    epoch: u64,
+    /// [`Grid::is_alt_screen`].
+    alt: bool,
+}
+
 /// The rows in view, their grapheme clusters and the cursor of a grid,
 /// copied so the terminal lock is held only for the copy. The buffers are
 /// reused from frame to frame, and only rows that can have changed are
@@ -948,9 +993,22 @@ pub(crate) struct Snapshot {
     /// The selection and link underlines frames draw, set after each
     /// capture ([`Self::set_decorations`]).
     decorations: Decorations,
+    /// The exit-status marks of the rows (`commands::gutter`), top to
+    /// bottom: at most one per row.
+    gutter: Vec<GutterMark>,
+    /// What [`Self::gutter`] was found for; `None` before the first
+    /// capture.
+    gutter_key: Option<GutterKey>,
+    /// Moves whenever [`Self::gutter`] changes, so a frame can tell it
+    /// apart from the one presented last.
+    gutter_generation: u64,
     /// Rows compared by partial captures, for tests.
     #[cfg(test)]
     compared: usize,
+    /// Gutter scans ([`Self::capture_gutter`] that looked at the lines),
+    /// for tests.
+    #[cfg(test)]
+    gutter_scans: usize,
 }
 
 impl Snapshot {
@@ -986,6 +1044,7 @@ impl Snapshot {
         } else {
             offset.min(grid.scrollback_len())
         };
+        self.capture_gutter(term, offset);
         if offset > 0 {
             self.cursor_hidden = hidden;
             self.cursor_shape = shape;
@@ -1002,6 +1061,58 @@ impl Snapshot {
         self.cursor_hidden = hidden;
         self.cursor_shape = shape;
         changed.with_row(self.cursor.row)
+    }
+
+    /// Finds the exit-status marks of the rows `term` shows `offset` lines
+    /// above its live screen, unless nothing they depend on moved since the
+    /// last capture ([`GutterKey`]). Out of line, so the row copies of
+    /// [`Self::capture`] keep their code.
+    #[inline(never)]
+    fn capture_gutter(&mut self, term: &Terminal, offset: usize) {
+        let grid = term.grid();
+        let key = GutterKey {
+            generation: grid.damage_generation(),
+            cursor_wrapped: grid
+                .line(grid.cursor().row)
+                .is_some_and(|line| line.wrapped),
+            pushed: grid.scrollback_pushed(),
+            len: grid.scrollback_len(),
+            offset,
+            epoch: term.line_epoch(),
+            alt: grid.is_alt_screen(),
+        };
+        if self.gutter_key.replace(key) == Some(key) {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.gutter_scans += 1;
+        }
+        let had = self.gutter.len();
+        let mut at = 0;
+        let mut same = true;
+        commands::gutter(grid, offset, |row, exit_code| {
+            let mark = GutterMark::new(row, CommandStatus::of(exit_code));
+            // Overwrite in place, noting whether anything differs.
+            if let Some(old) = self.gutter.get_mut(at) {
+                same &= *old == mark;
+                *old = mark;
+            } else {
+                same = false;
+                self.gutter.push(mark);
+            }
+            at += 1;
+        });
+        self.gutter.truncate(at);
+        if !same || at != had {
+            self.gutter_generation = self.gutter_generation.wrapping_add(1);
+        }
+    }
+
+    /// The exit-status marks of the rows, top to bottom.
+    #[cfg(test)]
+    pub(crate) fn gutter(&self) -> &[GutterMark] {
+        &self.gutter
     }
 
     /// Copies `term`'s colour overrides, at colour generation
@@ -1224,7 +1335,8 @@ impl Snapshot {
     /// (DECTCEM) or the view is scrolled back, `focused` (an unfocused
     /// frame draws every shape hollow), the selection and link underlines
     /// last set ([`Self::set_decorations`]), and the default damage
-    /// ([`DamageRows::All`]). Cursor blink (a host clock) is still to come.
+    /// ([`DamageRows::All`]), and the exit-status marks of the last
+    /// capture. Cursor blink (a host clock) is still to come.
     pub(crate) fn frame<'a>(&'a self, rows: &'a [&'a [Cell]], focused: bool) -> FrameInput<'a> {
         let Point { row, col } = self.cursor;
         let visible = !self.cursor_hidden && self.scrolled.is_none();
@@ -1236,6 +1348,7 @@ impl Snapshot {
             .with_focus(focused)
             .with_selection(self.decorations.selection)
             .with_overlays(&self.decorations.overlays)
+            .with_gutter(&self.gutter)
     }
 }
 
@@ -1244,6 +1357,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use tessera_grid::Mark;
 
     /// Menlo 13 pt at 1x (what `tessera-render`'s shaping tests pin).
     const MENLO_1X: CellMetrics = CellMetrics {
@@ -1582,6 +1696,22 @@ mod tests {
         assert_eq!(
             theme.search_match_current,
             Rgba::from_srgb8(0x44, 0x55, 0x66)
+        );
+        // Exit-status marks (#45b): the theme's own green and red unless
+        // it sets them.
+        assert_eq!((theme.mark_success, theme.mark_failure), (None, None));
+        assert_eq!(
+            theme.mark_color(CommandStatus::Success),
+            rgba(source.ansi[2]).with_alpha(1.0)
+        );
+        source.mark_success = Some(Color::rgb(0x01, 0x02, 0x03));
+        source.mark_failure = Some(Color::rgb(0x04, 0x05, 0x06).with_alpha(0x80));
+        let theme = theme_for(&config, &source);
+        assert_eq!(theme.mark_success, Some(Rgba::from_srgb8(1, 2, 3)));
+        assert_eq!(
+            theme.mark_color(CommandStatus::Failure),
+            Rgba::from_srgb8(4, 5, 6),
+            "drawn opaque"
         );
     }
 
@@ -2456,6 +2586,311 @@ mod tests {
             view.read_back() == fresh.read_back(),
             "every row in the new theme"
         );
+    }
+
+    // ------------------------------------------- exit-status gutter (#45b)
+
+    /// A prompt as zsh's integration draws it: `A`, `$ `, `B`.
+    const PROMPT: &str = "\x1b]133;A\x07$ \x1b]133;B\x07";
+
+    /// One command at a prompt, as the integration sends it: the prompt,
+    /// `line` and Enter, `C`, `output` (with its line breaks), then `D`
+    /// with `end` after it (`";0"`, `";1"`, `""` for no status). The `D`
+    /// lands on the next prompt's row, as zsh's precmd prints it.
+    fn command(line: &str, output: &str, end: &str) -> String {
+        format!("{PROMPT}{line}\r\n\x1b]133;C\x07{output}\x1b]133;D{end}\x07")
+    }
+
+    /// The snapshot's rows as text, trailing blanks trimmed, each after
+    /// its gutter mark: `+` success, `x` failure, `?` unknown, ` ` none.
+    fn gutter_text(snapshot: &Snapshot) -> String {
+        let rows = snapshot.rows();
+        let mut marks = vec![' '; rows.len()];
+        for mark in snapshot.gutter() {
+            let row = usize::from(mark.row);
+            assert_eq!(marks[row], ' ', "one mark per row");
+            marks[row] = match mark.status {
+                CommandStatus::Success => '+',
+                CommandStatus::Failure => 'x',
+                _ => '?',
+            };
+        }
+        let rows: Vec<String> = rows
+            .iter()
+            .zip(marks)
+            .map(|(row, mark)| {
+                let text: String = row.iter().map(|cell| cell.ch).collect();
+                format!("{mark}|{}", text.trim_end())
+            })
+            .collect();
+        rows.join("\n")
+    }
+
+    /// A snapshot of `term` at `offset` and its gutter text.
+    fn gutter_of(term: &Terminal, offset: usize) -> String {
+        let mut snapshot = Snapshot::default();
+        snapshot.capture(term, offset);
+        gutter_text(&snapshot)
+    }
+
+    /// Each finished command's prompt row gets its exit status: `D;0`
+    /// success, any other code failure, a `D` without one or a next prompt
+    /// with no `D` at all unknown. The prompt being typed at gets none.
+    #[test]
+    fn finished_commands_mark_their_prompt_rows() {
+        let mut term = Terminal::new(8, 20);
+        term.advance(command("true", "", ";0").as_bytes());
+        term.advance(command("false", "", ";1").as_bytes());
+        term.advance(command("echo hi", "hi\r\n", ";0").as_bytes());
+        term.advance(command("kill -9 $$", "", "").as_bytes());
+        // A command whose shell never sent `D`: the next prompt ends it.
+        term.advance(format!("{PROMPT}exec sh\r\n\x1b]133;C\x07sh$ exit\r\n").as_bytes());
+        term.advance(PROMPT.as_bytes());
+        assert_eq!(
+            gutter_of(&term, 0),
+            "+|$ true\n\
+             x|$ false\n\
+             +|$ echo hi\n \
+             |hi\n\
+             ?|$ kill -9 $$\n\
+             ?|$ exec sh\n \
+             |sh$ exit\n \
+             |$"
+        );
+    }
+
+    /// No mark for a prompt that ran nothing (an empty Enter, Ctrl-C at
+    /// the prompt: a `D` with no `C` before it), nor for a command still
+    /// running; its mark comes with its `D`.
+    #[test]
+    fn empty_enter_and_running_commands_have_no_mark() {
+        let mut term = Terminal::new(5, 20);
+        term.advance(format!("{PROMPT}\r\n\x1b]133;D\x07").as_bytes());
+        term.advance(format!("{PROMPT}^C\r\n\x1b]133;D;130\x07").as_bytes());
+        term.advance(format!("{PROMPT}sleep 9\r\n\x1b]133;C\x07").as_bytes());
+        let mut snapshot = Snapshot::default();
+        snapshot.capture(&term, 0);
+        assert_eq!(gutter_text(&snapshot), " |$\n |$ ^C\n |$ sleep 9\n |\n |");
+        term.advance(format!("\x1b]133;D;0\x07{PROMPT}").as_bytes());
+        snapshot.capture(&term, 0);
+        assert_eq!(gutter_text(&snapshot), " |$\n |$ ^C\n+|$ sleep 9\n |$\n |");
+    }
+
+    /// A shell without integration sends no marks: no gutter.
+    #[test]
+    fn no_marks_without_shell_integration() {
+        let mut term = Terminal::new(4, 20);
+        term.advance(b"$ true\r\n$ false\r\n$ ");
+        let mut snapshot = Snapshot::default();
+        snapshot.capture(&term, 0);
+        assert_eq!(snapshot.gutter(), []);
+    }
+
+    /// The alternate screen shows no marks (and refuses new ones); back on
+    /// the primary screen they are there again.
+    #[test]
+    fn the_alternate_screen_has_no_marks() {
+        let mut term = Terminal::new(4, 20);
+        term.advance(command("true", "", ";0").as_bytes());
+        term.advance(PROMPT.as_bytes());
+        let mut snapshot = Snapshot::default();
+        snapshot.capture(&term, 0);
+        assert_eq!(snapshot.gutter().len(), 1);
+        term.advance(b"\x1b[?1049h");
+        term.advance(command("true", "", ";0").as_bytes());
+        snapshot.capture(&term, 0);
+        assert_eq!(snapshot.gutter(), [], "none on the alternate screen");
+        snapshot.capture(&term, 2);
+        assert_eq!(snapshot.gutter(), [], "whatever the offset");
+        term.advance(b"\x1b[?1049l");
+        snapshot.capture(&term, 0);
+        assert_eq!(
+            snapshot.gutter(),
+            [GutterMark::new(0, CommandStatus::Success)]
+        );
+    }
+
+    /// Scrolled back, the marks follow their rows and are clipped to the
+    /// view: a prompt above the view has no mark (its `D` in view is not
+    /// one), and the last prompt in view learns its status from lines
+    /// below the view.
+    #[test]
+    fn scrolled_back_marks_are_clipped_to_the_view() {
+        let mut term = Terminal::new(3, 20);
+        term.advance(command("a", "1\r\n2\r\n", ";0").as_bytes());
+        term.advance(command("b", "3\r\n4\r\n", ";1").as_bytes());
+        term.advance(command("c", "5\r\n", ";0").as_bytes());
+        term.advance(PROMPT.as_bytes());
+        // Lines: $ a, 1, 2, $ b, 3, 4, $ c, 5, $ (the last three live).
+        assert_eq!(term.grid().scrollback_len(), 6);
+        assert_eq!(gutter_of(&term, 0), "+|$ c\n |5\n |$");
+        assert_eq!(gutter_of(&term, 1), " |4\n+|$ c\n |5");
+        assert_eq!(gutter_of(&term, 4), " |2\nx|$ b\n |3");
+        assert_eq!(gutter_of(&term, 5), " |1\n |2\nx|$ b");
+        assert_eq!(gutter_of(&term, 6), "+|$ a\n |1\n |2");
+    }
+
+    /// The look below the view for the end of its last prompt's command
+    /// stops after [`commands::MAX_GUTTER_SCAN_LINES`] lines: a command
+    /// whose `D` is further down has no mark while the view is up there.
+    #[test]
+    fn the_scan_below_the_view_is_capped() {
+        let cap = commands::MAX_GUTTER_SCAN_LINES;
+        for (lines, marked) in [(cap, true), (cap + 1, false)] {
+            let mut term = Terminal::new(2, 20);
+            let output = "x\r\n".repeat(lines);
+            term.advance(command("seq", &output, ";0").as_bytes());
+            term.advance(PROMPT.as_bytes());
+            // The view's two rows: the prompt and the first output line;
+            // `lines - 1` output lines and the `D`'s row below them, so the
+            // `D` is `lines` lines below the view.
+            let offset = term.grid().scrollback_len();
+            let expected = if marked {
+                "+|$ seq\n |x"
+            } else {
+                " |$ seq\n |x"
+            };
+            assert_eq!(gutter_of(&term, offset), expected, "{lines} lines");
+        }
+    }
+
+    /// A long prompt that soft-wraps and is redrawn marks both its rows
+    /// with `A`: one prompt, one mark, on its first row.
+    #[test]
+    fn a_wrapped_prompt_is_one_mark() {
+        let mut term = Terminal::new(4, 6);
+        // `~/abc $ ` wraps after six cells; the redraw's `A` lands on the
+        // second row.
+        term.advance(b"\x1b]133;A\x07~/abc $ \x1b]133;A\x07\x1b]133;B\x07ls\r\n");
+        term.advance(b"\x1b]133;C\x07\x1b]133;D;2\x07");
+        term.advance(PROMPT.as_bytes());
+        let grid = term.grid();
+        let a = |row: usize| {
+            grid.logical_line(row)
+                .unwrap()
+                .marks
+                .contains(&Mark::PromptStart)
+        };
+        assert!(a(0) && a(1) && grid.logical_line(0).unwrap().wrapped);
+        assert_eq!(gutter_of(&term, 0), "x|~/abc\n |$ ls\n |$\n |");
+    }
+
+    /// EL on the cursor's row clears its wrap flag without moving the
+    /// damage generation, and the flag decides whether the `A` on the row
+    /// below continues a prompt: the cached gutter follows it (#45b B1).
+    #[test]
+    fn an_erased_wrap_on_the_cursor_row_moves_the_gutter() {
+        let mut term = Terminal::new(6, 10);
+        // `$ ` and nine cells wrap onto row 1, which gets an `A`; the `D`
+        // ends the command row 0 started.
+        term.advance(b"\x1b]133;A\x07$ \x1b]133;C\x07xxxxxxxxy\x1b]133;A\x07\r\n");
+        term.advance(b"\x1b]133;D;1\x07\x1b[1;1H");
+        let mut snapshot = Snapshot::default();
+        snapshot.capture(&term, 0);
+        assert!(term.grid().line(0).unwrap().wrapped);
+        assert_eq!(gutter_text(&snapshot), gutter_of(&term, 0));
+        assert!(gutter_text(&snapshot).starts_with('x'), "row 0 failed");
+        term.advance(b"\x1b[2K");
+        assert!(!term.grid().line(0).unwrap().wrapped);
+        snapshot.capture(&term, 0);
+        assert_eq!(gutter_text(&snapshot), gutter_of(&term, 0));
+        assert!(
+            gutter_text(&snapshot).starts_with('?'),
+            "row 1's `A` ends it"
+        );
+        term.advance(b"typing at the prompt");
+        snapshot.capture(&term, 0);
+        assert_eq!(gutter_text(&snapshot), gutter_of(&term, 0));
+        // The cursor comes from an unwrapped row and erases the wrap
+        // before the next capture: leaving its row moved the generation.
+        let mut term = Terminal::new(6, 10);
+        term.advance(b"\x1b]133;A\x07$ \x1b]133;C\x07xxxxxxxxy\x1b]133;A\x07\r\n");
+        term.advance(b"\x1b]133;D;1\x07");
+        let mut snapshot = Snapshot::default();
+        snapshot.capture(&term, 0);
+        assert!(!term.grid().line(term.grid().cursor().row).unwrap().wrapped);
+        assert!(gutter_text(&snapshot).starts_with('x'));
+        term.advance(b"\x1b[1;1H\x1b[2K");
+        snapshot.capture(&term, 0);
+        assert_eq!(gutter_text(&snapshot), gutter_of(&term, 0));
+    }
+
+    /// However many marks the output holds, at most one mark per row in
+    /// view (S6), and an idle capture looks at nothing again.
+    #[test]
+    fn a_flood_of_prompts_marks_at_most_every_row() {
+        let mut term = Terminal::new(6, 10);
+        let flood = command("x", "", ";1").repeat(100_000);
+        term.advance(flood.as_bytes());
+        let mut snapshot = Snapshot::default();
+        snapshot.capture(&term, 0);
+        assert_eq!(snapshot.gutter().len(), 5, "every row but the prompt's");
+        assert!(
+            snapshot
+                .gutter()
+                .iter()
+                .all(|m| m.status == CommandStatus::Failure)
+        );
+        // The marks of one row piled up: still one mark.
+        term.advance(
+            "\x1b]133;A\x07\x1b]133;C\x07\x1b]133;D;0\x07"
+                .repeat(10_000)
+                .as_bytes(),
+        );
+        snapshot.capture(&term, 0);
+        assert!(snapshot.gutter().len() <= 6);
+        let scans = snapshot.gutter_scans;
+        let generation = snapshot.gutter_generation;
+        snapshot.capture(&term, 0);
+        assert_eq!(snapshot.gutter_scans, scans, "nothing moved: no scan");
+        assert_eq!(snapshot.gutter_generation, generation);
+    }
+
+    /// The colour of pixel `(x, y)` of `view`'s last frame.
+    fn pixel(view: &View, x: usize, y: usize) -> [u8; 3] {
+        let width = view.size().pixels.width as usize;
+        let image = view.read_back();
+        let at = (y * width + x) * 4;
+        [image[at], image[at + 1], image[at + 2]]
+    }
+
+    /// The marks are drawn in the left padding of their rows, and a mark
+    /// that came without damage to the rows in view (the `D` of the last
+    /// prompt in view landed below it) is drawn, not skipped.
+    #[test]
+    fn a_new_mark_is_drawn_even_without_damage_in_view() {
+        let Some(mut view) = offscreen_view(3, 20) else {
+            return;
+        };
+        let mut term = Terminal::new(3, 20);
+        term.advance(format!("{PROMPT}seq\r\n\x1b]133;C\x071\r\n2\r\n3\r\n4\r\n").as_bytes());
+        // History: `$ seq`, 1, 2; the screen 3, 4 and the cursor's row.
+        let offset = term.grid().scrollback_len();
+        assert_eq!(offset, 3);
+        view.capture(&term, offset);
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+        // Padding 4 px at 1x: the bar is x = 1..3; row r is at y = 4 + 15 r.
+        let (bar, row) = (2, |r: usize| 4 + 15 * r + 7);
+        let background = pixel(&view, 0, 0);
+        assert_eq!(pixel(&view, bar, row(0)), background, "running: no mark");
+        term.advance(b"\x1b]133;D;0\x07");
+        assert_eq!(term.grid().scrollback_len(), 3, "nothing scrolled");
+        next_frame();
+        assert_eq!(view.capture(&term, offset), DamageRows::None);
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+        let green = view.theme().mark_color(CommandStatus::Success).to_srgb8();
+        assert_eq!(pixel(&view, bar, row(0)), green, "the mark");
+        assert_eq!(pixel(&view, bar, row(1)), background, "row 1 has none");
+        assert_eq!(pixel(&view, 0, row(0)), background, "the bar is inset");
+        assert_eq!(pixel(&view, 4, row(0)), background, "and leaves the cells");
+        next_frame();
+        view.capture(&term, offset);
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Skipped);
+        // Back at the live screen, the prompt is in the history: no mark.
+        next_frame();
+        view.capture(&term, 0);
+        assert_eq!(view.render(true).expect("frame"), FrameStatus::Presented);
+        assert_eq!(pixel(&view, bar, row(0)), background);
     }
 
     // ------------------------------------------------- program colours (#10)

@@ -445,28 +445,78 @@ fn n18_clear_history_removes_marks_and_fallback_returns() {
 /// N19: the scan reads the lines a chunk of
 /// [`tessera_app_core::PROMPT_SCAN_LINES_PER_LOCK`] per lock hold (counted
 /// in the unit test `n19_scans_hold_the_lock_a_chunk_at_a_time`). Here:
-/// a reader feeding output while a walk over 200 000 lines runs is never
-/// blocked for the whole walk.
+/// a reader feeding output all through a walk over 200 000 lines gets the
+/// lock between the walk's holds, so its chunks land *during* the walk.
+/// Held for the whole walk instead, every chunk would wait for its end:
+/// at most the one blocked chunk could land inside it (#334). Measured:
+/// about 2000 chunks land during the walk, 1 or 2 without the yield
+/// between holds. Only chunks landing in the middle half of the walk count:
+/// the walk's own short holds before and after the scan leave gaps a held
+/// scan would not. The walk takes about 0.8 ms in release, and a loaded
+/// machine can deschedule the feeder for all of it, so the walk is tried up
+/// to `TRIES` times and one that sees the chunks land is enough; a scan
+/// holding the lock throughout fails every try.
 #[test]
 fn n19_nav_does_not_hold_lock_longer_than_a_snapshot() {
-    let app = std::sync::Arc::new(app());
+    /// Walks tried before the test fails.
+    const TRIES: usize = 5;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    let app = Arc::new(app());
     let id = session(&app, 2, 2, 300_000);
     feed(&app, id, format!("{}\r\n", m("A")).as_bytes());
     feed(&app, id, &b"\n".repeat(200_000));
+    let stop = Arc::new(AtomicBool::new(false));
+    let fed = Arc::new(AtomicUsize::new(0));
+    let landed = Arc::new(Mutex::new(Vec::new()));
     let feeder = {
-        let app = std::sync::Arc::clone(&app);
+        let (app, stop, fed, landed) = (
+            Arc::clone(&app),
+            Arc::clone(&stop),
+            Arc::clone(&fed),
+            Arc::clone(&landed),
+        );
         std::thread::spawn(move || {
-            let mut fed = 0;
-            for _ in 0..50 {
-                app.feed_for_test(id, b"x").unwrap();
-                fed += 1;
+            while !stop.load(Ordering::Acquire) {
+                // Each chunk wraps the 2-column screen: the scrollback
+                // grows, which moves no line id.
+                app.feed_for_test(id, b"xyz").unwrap();
+                landed.lock().unwrap().push(Instant::now());
+                fed.fetch_add(1, Ordering::Release);
             }
-            fed
         })
     };
-    let moved = app.scroll_to(id, ScrollTarget::PreviousPrompt).unwrap();
-    assert_eq!(feeder.join().unwrap(), 50);
-    assert!(moved);
+    while fed.load(Ordering::Acquire) == 0 {
+        std::thread::yield_now();
+    }
+    let mut walks = Vec::new();
+    for _ in 0..TRIES {
+        app.scroll_to(id, ScrollTarget::Bottom).unwrap();
+        let started = Instant::now();
+        let moved = app.scroll_to(id, ScrollTarget::PreviousPrompt).unwrap();
+        let ended = Instant::now();
+        assert!(moved);
+        let quarter = (ended - started) / 4;
+        let (from, to) = (started + quarter, ended.checked_sub(quarter).unwrap());
+        let during = landed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|&&at| from < at && at < to)
+            .count();
+        walks.push((during, ended - started));
+        if during >= 10 {
+            break;
+        }
+    }
+    stop.store(true, Ordering::Release);
+    feeder.join().unwrap();
+    assert!(
+        walks.iter().any(|&(during, _)| during >= 10),
+        "chunks landed in the middle of each walk: {walks:?}"
+    );
 }
 
 // ---------------------------------------------------------- S: select output
@@ -1133,4 +1183,77 @@ fn the_prompt_rule_applies_to_the_default_chord_only() {
         app.run_key_binding(id, &down).unwrap(),
         Some(InputOutcome::Command(command("prompt_next")))
     );
+}
+
+// ------------------------------------------- G: the exit-status gutter (#45b)
+
+/// The gutter's hover (`App::command_mark_at`): the exit status a prompt's
+/// mark is drawn for, from the grid, and the command's duration from its
+/// record. A row with no mark has none; commands that one chunk ran at
+/// once keep their marks (D-COALESCE) but the coalesced ones have no
+/// duration; after a resize no duration is known (ADR 0039).
+#[test]
+fn g01_the_gutter_hover_reports_exit_status_and_duration() {
+    use std::time::Duration;
+
+    let app = app();
+    let id = session(&app, 6, 20, 100);
+    feed(
+        &app,
+        id,
+        format!("{}\r\n", prompt(None, "sleep")).as_bytes(),
+    );
+    feed(&app, id, m("C").as_bytes());
+    std::thread::sleep(Duration::from_millis(30));
+    feed(
+        &app,
+        id,
+        format!("{}\r\n", prompt(Some(1), "a; b")).as_bytes(),
+    );
+    // `a; b` in one chunk: `a` exits 0, `b` 2, and the next prompt.
+    let chunk = format!(
+        "{}{}\r\n{}{}",
+        m("C"),
+        prompt(Some(0), "b"),
+        m("C"),
+        prompt(Some(2), "")
+    );
+    feed(&app, id, chunk.as_bytes());
+    let at = |row| app.command_mark_at(id, row).unwrap();
+    let sleep = at(0).expect("row 0 is a finished command's prompt");
+    assert_eq!(sleep.exit_code, Some(1));
+    let ran = sleep.duration.expect("its record knows how long it ran");
+    assert!(ran >= Duration::from_millis(30), "{ran:?}");
+    assert_eq!(at(1).map(|mark| mark.exit_code), Some(Some(0)));
+    let b = at(2).expect("a coalesced command keeps its mark");
+    assert_eq!((b.exit_code, b.duration), (Some(2), None));
+    assert_eq!(at(3), None, "the prompt being typed at");
+    assert_eq!(at(5), None, "a blank row");
+    assert_eq!(at(u16::MAX), None);
+    app.resize(id, PtySize::new(6, 30)).unwrap();
+    let after = at(0).expect("the grid keeps the mark");
+    assert_eq!((after.exit_code, after.duration), (Some(1), None));
+    assert!(app.command_mark_at(SessionId::from_raw(9999), 0).is_err());
+}
+
+/// The hover pairs a mark with a record only when they agree: the record
+/// of a command that ended with `D;1` does not lend its duration to a mark
+/// that, once the `D`'s row was erased, the grid draws as unknown.
+#[test]
+fn g02_a_record_that_disagrees_with_the_mark_gives_no_duration() {
+    let app = app();
+    let id = session(&app, 6, 20, 100);
+    feed(&app, id, format!("{}\r\n", prompt(None, "x")).as_bytes());
+    feed(&app, id, format!("{}out\r\n", m("C")).as_bytes());
+    feed(&app, id, m("D;1").as_bytes());
+    let ended = app.command_mark_at(id, 0).unwrap().expect("finished");
+    assert_eq!(ended.exit_code, Some(1));
+    assert!(ended.duration.is_some(), "the record agrees with the mark");
+    // Delete the `D`'s row (DL) and draw the next prompt in its place.
+    feed(&app, id, format!("\r\x1b[M{}", prompt(None, "")).as_bytes());
+    let mark = app
+        .command_mark_at(id, 0)
+        .unwrap()
+        .expect("ended by the prompt");
+    assert_eq!((mark.exit_code, mark.duration), (None, None));
 }

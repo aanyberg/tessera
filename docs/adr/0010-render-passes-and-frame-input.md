@@ -4,7 +4,9 @@
 pass, selection and overlays, underline styles, overline, superscript and
 subscript, cursor redraw rules; see "Amendment: #22" at the end) ·
 amended 2026-11-03 (#124: highlights stop at the grid's last column, a
-cursor on a cut wide character's spacer; see "Amendment: #124")
+cursor on a cut wide character's spacer; see "Amendment: #124") ·
+amended 2026-11-08 (#45b: the exit-status gutter, a sixth draw; see
+"Amendment: #45b")
 
 ## Context
 
@@ -627,3 +629,67 @@ checksums include the last frame's pixels, equal on both sides.
 
 Every line is within noise of 1.00. Full selection on `punctuation` first
 read 1.023 from one inflated base run; 15 pairs gave 1.001.
+
+## Amendment: #45b (2026-11-08)
+
+### The exit-status gutter
+
+`FrameInput::gutter` (`with_gutter`) is a slice of `GutterMark { row,
+status }`, `status` a `CommandStatus`: `Success`, `Failure` or `Unknown`
+(`CommandStatus::of` maps exit status 0, any other status, and none). The
+producer (the app core's snapshot, ADR 0039) finds the rows; the renderer
+only draws them, so a frame without marks costs one empty check.
+
+**Geometry.** One solid bar per mark in the left padding: as tall as its
+row, half the padding wide (at least one pixel), centred in it, clipped
+to the padding column and the target, so a mark never covers a cell. No
+padding, no marks. At most one bar per row that starts inside the target,
+whatever the slice holds: marks are read in row order and a repeated,
+out-of-order or off-screen row draws nothing, so a producer bug or a
+flood costs at most a screenful of quads.
+
+**Colours.** `Theme::mark_color(status)`: `mark_success` and
+`mark_failure` (from the theme file, ADR 0019) or the palette's `ansi[2]`
+and `ansi[1]`; `ansi[8]` for an unknown status. Always opaque, and from
+the theme's own palette, not a program's palette overrides: output does
+not recolour the marks.
+
+**Draw and damage.** The bars are pushed into the cursor's slot after the
+cursor's instances and drawn as a sixth range (`PassRanges::gutter`),
+after the cursor, with the same pipeline; an empty range is skipped like
+any other (#247), so a frame without marks issues the same draws as
+before. The slot is rebuilt every frame, so the marks take no part in the
+per-row damage; when a mark on every row outgrows the slot, the next
+frame lays the buffer out again once (`Slots::fits`). The producer tells
+the view when the marks changed without any row in view changing (a `D`
+below the view's last row), so a frame is presented for it.
+
+**Tests.** `passes/gutter.rs` pins the geometry, the clip, the
+one-per-row rule and the zero padding; `renderer.rs` the sixth range and
+its draw counts; `tests/overlay.rs` the pixels of a success and a failure
+bar beside text that keeps its own.
+
+### Measurements (#45b)
+
+`cargo xtask ab` against the merge base (ae6a701), 15 interleaved pairs at
+load 5-13, head / base. A case renders 40 full frames of a 60x200 screen of
+one wave-13 corpus line (box drawing 120, braille 80, to clear the probe's
+size floor), Menlo 13 pt at 2x, and waits for the GPU after each frame.
+`none`: no gutter on either side, pixels compared. `every row`: head draws a
+mark on each of the 60 rows, base none. Bars 1.02 (none) and 1.05 (every
+row); all pass.
+
+| line | none: instructions | none: cycles | every row: instructions | every row: cycles |
+|---|---|---|---|---|
+| ascii | 1.001 | 1.006 | 1.002 | 1.002 |
+| latin_diacritics | 1.000 | 0.996 | 1.001 | 1.000 |
+| cjk | 0.999 | 0.998 | 1.000 | 1.000 |
+| box_drawing | 1.000 | 0.996 | 1.000 | 1.002 |
+| hebrew | 1.001 | 1.001 | 1.001 | 1.007 |
+| arabic | 1.000 | 0.998 | 1.000 | 1.003 |
+| punctuation | 1.001 | 0.995 | 1.000 | 0.997 |
+| braille | 1.000 | 1.001 | 0.999 | 0.997 |
+| emoji | 1.000 | 1.010 | 1.000 | 1.005 |
+| sgr_heavy | 1.003 | 1.012 | 1.000 | 1.005 |
+| combining_heavy | 1.001 | 1.013 | 1.001 | 0.996 |
+

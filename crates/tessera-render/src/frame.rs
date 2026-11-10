@@ -1,4 +1,5 @@
-//! What one frame draws: rows of cells plus cursor, selection and overlays.
+//! What one frame draws: rows of cells plus cursor, selection, overlays
+//! and the exit-status gutter.
 //!
 //! [`FrameInput`] is deliberately decoupled from [`tessera_grid::Grid`]:
 //! the caller (app-core) decides which rows are visible, including
@@ -205,6 +206,56 @@ impl Overlay {
     }
 }
 
+/// How a shell command ended, as its gutter mark shows it (ADR 0039).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum CommandStatus {
+    /// Exit status 0: [`crate::Theme::mark_success`].
+    Success,
+    /// Any other exit status: [`crate::Theme::mark_failure`].
+    Failure,
+    /// The shell reported no exit status (unknown, neither success nor
+    /// failure): drawn neutral, in ANSI colour 8 (bright black).
+    Unknown,
+}
+
+impl CommandStatus {
+    /// The status of a command that exited with `exit_code`, `None` when
+    /// the shell did not say.
+    #[must_use]
+    pub const fn of(exit_code: Option<i32>) -> Self {
+        match exit_code {
+            Some(0) => Self::Success,
+            Some(_) => Self::Failure,
+            None => Self::Unknown,
+        }
+    }
+}
+
+/// An exit-status mark in the left padding, next to the prompt row of a
+/// finished command (#45b).
+///
+/// Drawn as a bar in the left padding, as tall as the row and half the
+/// padding wide, centred in it, in the colour of its
+/// [`CommandStatus`]. A mark on a row past the frame's rows or the
+/// target's bottom is not drawn, and nothing is drawn with no padding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct GutterMark {
+    /// The row, in [`FrameInput::rows`] indices.
+    pub row: u16,
+    /// How the command ended.
+    pub status: CommandStatus,
+}
+
+impl GutterMark {
+    /// A mark of `status` on `row`.
+    #[must_use]
+    pub const fn new(row: u16, status: CommandStatus) -> Self {
+        Self { row, status }
+    }
+}
+
 /// Everything the renderer needs to draw one frame.
 ///
 /// Build one with [`FrameInput::new`] and the `with_*` methods (or set the
@@ -243,6 +294,12 @@ pub struct FrameInput<'a> {
     /// selection and the overlays, row by row (a changed selection
     /// rebuilds only the rows whose coverage changed).
     pub damage: DamageRows,
+    /// Exit-status marks in the left padding (see [`GutterMark`]), top to
+    /// bottom, at most one per row: a mark at or above the row of the one
+    /// before it is not drawn, so a frame draws at most one per visible
+    /// row whatever the slice holds. Drawn after the cursor, and compared
+    /// by the renderer itself, so they need no damage.
+    pub gutter: &'a [GutterMark],
 }
 
 impl<'a> FrameInput<'a> {
@@ -257,6 +314,7 @@ impl<'a> FrameInput<'a> {
             focused: true,
             clusters: &[],
             damage: DamageRows::All,
+            gutter: &[],
         }
     }
 
@@ -295,6 +353,13 @@ impl<'a> FrameInput<'a> {
         self
     }
 
+    /// The same frame with the exit-status marks `gutter`.
+    #[must_use]
+    pub const fn with_gutter(mut self, gutter: &'a [GutterMark]) -> Self {
+        self.gutter = gutter;
+        self
+    }
+
     /// The same frame with `damage`.
     #[must_use]
     pub fn with_damage(mut self, damage: DamageRows) -> Self {
@@ -330,6 +395,20 @@ mod tests {
         assert_eq!(frame.drawn_cursor(), None);
         assert_eq!(frame.damage, DamageRows::All, "full redraw by default");
         assert_eq!(frame.clusters, &[] as &[GraphemeTable]);
+        assert_eq!(frame.gutter, &[] as &[GutterMark]);
+    }
+
+    #[test]
+    fn exit_codes_map_to_statuses() {
+        assert_eq!(CommandStatus::of(Some(0)), CommandStatus::Success);
+        for code in [1, 2, 127, 130, -1, i32::MIN, i32::MAX] {
+            assert_eq!(
+                CommandStatus::of(Some(code)),
+                CommandStatus::Failure,
+                "{code}"
+            );
+        }
+        assert_eq!(CommandStatus::of(None), CommandStatus::Unknown);
     }
 
     #[test]

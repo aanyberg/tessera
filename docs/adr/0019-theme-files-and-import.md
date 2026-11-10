@@ -1,6 +1,7 @@
 # ADR 0019: Theme files, bundled themes and scheme import
 
-**Status:** accepted · 2026-10-28
+**Status:** accepted · 2026-10-28 · amended 2026-11-08 (#45b: optional
+`mark_success` and `mark_failure` keys; see "Amendment: #45b" at the end)
 
 ## Context
 
@@ -286,3 +287,16 @@ still queued for it, so an older change never lands after a newer one.
 0004). A font *family* change is still not applied live; it stays on #29's
 font reload path. The configuration has no line-height or padding keys, so
 those stay at the renderer's defaults.
+
+## Amendment: #45b (2026-11-08)
+
+A theme file may set `mark_success` and `mark_failure`, the colours of the
+exit-status marks in the left padding (ADR 0039). Both are optional
+colours of the same syntax, with no effect on a file that leaves them
+out: the marks then take the palette's `ansi[2]` (green) and `ansi[1]`
+(red), and a mark whose command reported no status always takes
+`ansi[8]`. The renderer draws them opaque, whatever alpha the file gives.
+They are written back only when set, so a theme saved by the Settings
+window or the importer stays as it was, and `.itermcolors` import sets
+neither. The file size cap and every other bound are unchanged.
+

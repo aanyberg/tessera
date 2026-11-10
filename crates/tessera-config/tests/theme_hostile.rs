@@ -148,18 +148,35 @@ fn arb_theme() -> impl Strategy<Value = Theme> {
         proptest::array::uniform16(arb_color()),
         proptest::option::of(arb_color()),
         proptest::option::of(arb_color()),
+        proptest::option::of(arb_color()),
+        proptest::option::of(arb_color()),
     )
         .prop_filter("names are not blank", |(n, ..)| !n.trim().is_empty())
         .prop_map(
-            |(name, foreground, background, cursor, selection, ansi, search, current)| Theme {
+            |(
                 name,
                 foreground,
                 background,
                 cursor,
                 selection,
-                search_match: search,
-                search_match_current: current,
                 ansi,
+                search,
+                current,
+                ok,
+                failed,
+            )| {
+                Theme {
+                    name,
+                    foreground,
+                    background,
+                    cursor,
+                    selection,
+                    search_match: search,
+                    search_match_current: current,
+                    ansi,
+                    mark_success: ok,
+                    mark_failure: failed,
+                }
             },
         )
 }

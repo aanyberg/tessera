@@ -36,6 +36,15 @@
 //! (S5, S6). A scan that sees the line epoch change or the alternate screen
 //! come up gives up.
 //!
+//! # The exit-status gutter
+//!
+//! Each prompt of a finished command in view gets a mark in the left
+//! padding (#45b): `gutter` reads the lines' marks, never the records, so
+//! a pasted `a; b; c` marks all three (D-COALESCE). The records give the
+//! hover its duration (`command_mark_at`). The scan reads the rows in
+//! view and, while the last prompt in view has not finished, at most
+//! [`MAX_GUTTER_SCAN_LINES`] lines below it (S5, S6).
+//!
 //! # Locks
 //!
 //! The command log's lock is a leaf: taken alone by the reader thread, and
@@ -65,6 +74,14 @@ pub const MAX_PROMPT_SCAN_LINES: usize = 1_000_000;
 /// so the reader thread and the frame never wait long behind it: 256,
 /// like a search step (fixture D-SCAN-LOCK).
 pub const PROMPT_SCAN_LINES_PER_LOCK: usize = 256;
+
+/// Most lines below the view `gutter` reads to learn how the command of
+/// the last prompt in view ended (S5, S6): a command whose end lies further
+/// down gets no mark while the view is scrolled back that far. The rows in
+/// view are read as well, so one scan reads at most the screen's rows plus
+/// this many lines, under the terminal lock, at each capture that saw the
+/// lines change.
+pub const MAX_GUTTER_SCAN_LINES: usize = 1024;
 
 /// A line id no line has: a record's line it never learnt.
 const NO_LINE: u64 = u64::MAX;
@@ -117,6 +134,22 @@ impl CommandRecord {
         self.finished
             .map(|finished| finished.saturating_duration_since(self.started))
     }
+}
+
+/// The exit-status mark on a row of the view, as
+/// [`crate::App::command_mark_at`] returns it for the hover (#45b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CommandMark {
+    /// The exit status the mark is drawn for: the `D` mark's on the grid,
+    /// `None` when it had none or the next prompt came without one
+    /// (unknown, drawn neutral).
+    pub exit_code: Option<i32>,
+    /// How long the command ran, from its record: `None` when no record of
+    /// the current line epoch starts at this prompt and agrees on the exit
+    /// status (after a resize, ADR 0039; for a command coalesced away,
+    /// D-COALESCE; or one whose record the ring dropped).
+    pub duration: Option<Duration>,
 }
 
 /// A command as the log keeps it: about 80 bytes, lines [`NO_LINE`] when
@@ -620,6 +653,10 @@ fn scan(
         if let Some(scan) = step {
             return scan;
         }
+        // The reader thread locks the terminal without being counted as
+        // waiting, and an unfair mutex hands it straight back to this
+        // thread: let a woken waiter take it before the next hold (#334).
+        std::thread::yield_now();
     }
 }
 
@@ -637,6 +674,116 @@ fn prompt_stop(grid: &Grid, index: usize) -> bool {
             grid.logical_line(above)
                 .is_some_and(|line| line.wrapped && line.marks.contains(&Mark::PromptStart))
         })
+}
+
+/// Calls `mark(row, exit_code)` for each row of the view `offset` lines
+/// above `grid`'s live screen that starts the prompt of a finished command,
+/// top to bottom: the exit-status gutter (#45b). `offset` is at most
+/// [`Grid::scrollback_len`]; the alternate screen has no marks.
+///
+/// A prompt is a [`prompt_stop`]. Its command finished when a `C` follows
+/// it and then a `D` (whose exit status it reports) or the next prompt (no
+/// status: unknown) comes before the next prompt. A prompt with no `C`
+/// before what ends it ran nothing (an empty Enter, Ctrl-C at the prompt)
+/// and gets no mark; nor does a command still running, nor one whose end
+/// lies more than [`MAX_GUTTER_SCAN_LINES`] lines below the view. A row's
+/// marks are read in the order they were set, so zsh's `D` before `A` on
+/// the next prompt's row ends the command above.
+///
+/// At most one call per row in view, whatever the lines hold (S6).
+pub(crate) fn gutter(grid: &Grid, offset: usize, mut mark: impl FnMut(u16, Option<i32>)) {
+    if grid.is_alt_screen() {
+        return;
+    }
+    let first = grid.scrollback_len().saturating_sub(offset);
+    let view_end = first + usize::from(grid.rows());
+    let end = view_end
+        .saturating_add(MAX_GUTTER_SCAN_LINES)
+        .min(grid.total_lines());
+    // The prompt in view whose command has not ended yet: its row, and
+    // whether its output started (`C`).
+    let mut pending: Option<(u16, bool)> = None;
+    // The line above wrapped into this one with a prompt on it: this
+    // line's `A` continues that prompt (a redrawn long prompt).
+    let mut continues = first.checked_sub(1).is_some_and(|above| {
+        grid.logical_line(above)
+            .is_some_and(|line| line.wrapped && line.marks.contains(&Mark::PromptStart))
+    });
+    for index in first..end {
+        if index >= view_end && pending.is_none() {
+            break;
+        }
+        let Some(line) = grid.logical_line(index) else {
+            break;
+        };
+        if line.marks.is_empty() {
+            continues = false;
+            continue;
+        }
+        for kind in &line.marks {
+            match kind {
+                Mark::PromptStart if !continues => {
+                    if let Some((row, true)) = pending {
+                        mark(row, None);
+                    }
+                    pending = (index < view_end)
+                        .then(|| (u16::try_from(index - first).unwrap_or(u16::MAX), false));
+                }
+                Mark::OutputStart => {
+                    if let Some((_, ran)) = &mut pending {
+                        *ran = true;
+                    }
+                }
+                Mark::CommandEnd { exit_code } => {
+                    if let Some((row, true)) = pending.take() {
+                        mark(row, *exit_code);
+                    }
+                }
+                _ => {}
+            }
+        }
+        continues = line.wrapped && line.marks.contains(&Mark::PromptStart);
+    }
+}
+
+/// The exit-status mark on row `row` of `session`'s view, and the duration
+/// of its command when a record knows it: what the gutter's hover shows
+/// (#45b). `None` for a row with no mark ([`gutter`]).
+///
+/// Reads the rows in view (and at most [`MAX_GUTTER_SCAN_LINES`] below)
+/// under one hold of the terminal lock, and the records (at most
+/// [`MAX_COMMAND_RECORDS`]) under the log's leaf lock inside it.
+pub(crate) fn command_mark_at(session: &Session, row: u16) -> Option<CommandMark> {
+    session.with_viewport(|term, offset| {
+        let grid = term.grid();
+        let offset = offset.min(grid.scrollback_len());
+        let mut exit = None;
+        gutter(grid, offset, |at, exit_code| {
+            if at == row {
+                exit = Some(exit_code);
+            }
+        });
+        let exit_code = exit?;
+        let line = grid
+            .scrollback_pushed()
+            .wrapping_sub(offset as u64)
+            .wrapping_add(u64::from(row));
+        // The log's lock is a leaf: taking it under the terminal's is fine.
+        let duration = session
+            .reports()
+            .commands()
+            .command_at(line, LineView::of(term))
+            .filter(|record| {
+                record.prompt_line == Some(line)
+                    && record.state == CommandState::Finished
+                    && record.exit_code == exit_code
+            })
+            .and_then(|record| record.duration());
+        Some(CommandMark {
+            exit_code,
+            duration,
+        })
+    })
 }
 
 fn has_prompt(grid: &Grid, index: usize) -> bool {
@@ -927,6 +1074,24 @@ mod tests {
             exit_code: Some(0),
             duration: Duration::from_millis(ms),
         }
+    }
+
+    /// Only a prompt mark (`A`) tells the log the shell reports prompts
+    /// (#334): `B`, `C` and `D` alone, from a script that prints them or a
+    /// shell sending only some, leave the prompt keys paging at once.
+    #[test]
+    fn only_a_prompt_mark_sets_prompt_seen() {
+        use Mark::*;
+        let (log, ..) = log_of(&[
+            (CommandStart, 1, 0),
+            (OutputStart, 2, 0),
+            (d(Some(0)), 3, 0),
+            (d(None), 4, 0),
+            (OutputStart, 5, 0),
+        ]);
+        assert!(!log.prompt_seen(), "no A, no prompt");
+        let (log, ..) = log_of(&[(OutputStart, 1, 0), (PromptStart, 2, 0)]);
+        assert!(log.prompt_seen());
     }
 
     #[test]

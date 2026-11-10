@@ -579,6 +579,7 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         layoutRenderViewAndScroller()
         layoutFindBar()
         surfaceSizeChanged()
+        updateGutterToolTips()
     }
 
     override func viewDidChangeEffectiveAppearance() {
@@ -1729,11 +1730,15 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     /// it to known metrics.
     var metrics: TesseraSurface.Metrics?
 
+    /// The exit-status gutter's tool-tip rects (`TerminalSurfaceView+Gutter`).
+    var gutterToolTips = GutterToolTips()
+
     /// Reads ``metrics`` from the core (`nil` once the surface is gone).
     /// While text is marked, a change moves the composition overlay and
     /// tells the input method the character rects moved, so its candidate
-    /// window follows the cursor.
+    /// window follows the cursor; the gutter's tool tips follow the rows.
     private func refreshMetrics() {
+        defer { updateGutterToolTips() }
         let previous = metrics
         let wasAttached = surface.isAttached
         do {
