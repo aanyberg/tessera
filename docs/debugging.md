@@ -146,6 +146,5 @@ rendering pane, the peak must stay below 0.9 of the bytes that keeping every ste
 measured peaks reached 0.2 to 0.4 of that, and the bar leaves room for a late batch. The footprint must also be back
 within 150 MB of its start no more than 10 s after the last step. The test prints the frames presented meanwhile. A
 texture kept per resize (1.17 to 1.2 of the sum, never released) fails both bounds. The test skips when the window
-is not visible, because nothing is drawn then. The other footprint budgets in the app tests either leave live
-resizing out or, like the pane flood test, measure growth past the highest footprint of a warm-up resize cycle.
+is not visible, because nothing is drawn then. The other footprint budgets in the app tests leave live resizing out.
 

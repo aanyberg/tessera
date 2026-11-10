@@ -618,10 +618,41 @@ final class TerminalAccessibilityAppTests: XCTestCase {
             // As AppKit does for the key window's first responder.
             view.inputContext?.activate()
         }
-        try await Task.sleep(for: .milliseconds(500))
-        let footprintBefore = Self.footprint()
-        try await Task.sleep(for: .seconds(3))
-        let footprintAfter = Self.footprint()
+        // The first seconds after the window opens add one-off steps: a
+        // runner that renders the key window builds drawables and glyph
+        // atlases (40 to 45 MB seen on CI), and the host frees what opening
+        // the window used (about 165 MB, locally about 1 s in). So the
+        // baseline waits, sampling every 100 ms, until the footprint levels
+        // off: at most 8 MiB between the highest and lowest sample of the
+        // last 2 s, after 2 s and before 8 s. Growth is then the median of
+        // the last second, 3 s later, less the median of the baseline's last
+        // second, which a passing spike or drop does not move and a steady
+        // leak does. The bound is a rate, growth faster than about
+        // 11 MiB/s: with about one settle (two posts) a second, 16 MiB
+        // leaked per snapshot or 8 MiB per post fails it, and 8 MiB per
+        // snapshot or 4 MiB per post can pass (Debug, TSan, key windows).
+        let second = 10
+        var samples: [Int] = []
+        func sample() async throws {
+            try await Task.sleep(for: .milliseconds(100))
+            samples.append(Self.footprint())
+        }
+        func spread(_ last: ArraySlice<Int>) -> Int { (last.max() ?? 0) - (last.min() ?? 0) }
+        func median(_ last: ArraySlice<Int>) -> Int { last.sorted()[last.count / 2] }
+        repeat {
+            try await sample()
+        } while samples.count < 8 * second
+            && (samples.count < 2 * second || spread(samples.suffix(2 * second)) > 8 << 20)
+        let warmUp = samples.count
+        let footprintBefore = median(samples.suffix(second))
+        for _ in 0..<(3 * second) {
+            try await sample()
+        }
+        let footprintAfter = median(samples.suffix(second))
+        // On a pass too, for the steps a runner shows.
+        print(
+            "A11Y-FLOOD-FOOTPRINT: warm-up \(warmUp) samples; MiB "
+                + samples.map { String(format: "%.1f", Double($0) / 1_048_576) }.joined(separator: " "))
         XCTAssertGreaterThan(recorder.posts.count, 2, "the flood was told")
         XCTAssertLessThanOrEqual(recorder.mostPostsInASecond, TerminalAccessibility.postsPerSecond, "S6")
         // Two snapshots of a 24 x 80 view are a few kB; the bound is loose

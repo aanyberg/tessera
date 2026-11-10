@@ -1011,10 +1011,10 @@ final class PaneTests: XCTestCase {
 
     // MARK: Flood
 
-    /// The standing flood check: `yes` in two panes while the window and the
-    /// divider between them keep resizing. Memory stays bounded, the main
-    /// actor keeps up, every pane's grid follows its frame, and closing the
-    /// tab is quick.
+    /// The standing flood check: `yes` in two panes. At a fixed size, memory
+    /// stays bounded; while the window and the divider between them keep
+    /// resizing, the main actor keeps up, every pane's grid follows its
+    /// frame, and closing the tab is quick.
     func testAFloodWhileResizingPanesStaysBoundedAndClosesQuickly() async throws {
         let controller = try openTab()
         let left = controller.focusedPane
@@ -1024,6 +1024,32 @@ final class PaneTests: XCTestCase {
         for pane in [left, right] {
             try await start("yes", in: pane)
         }
+        // Phase 1, the flood at a fixed size: memory. As in the maximized
+        // flood test, a fixed 8 s warm-up first, for both panes' scrollback
+        // to fill at CI speed; the baseline is its highest footprint, and the
+        // next 5 s must not grow past it by the budget.
+        var baseline: UInt64 = 0
+        let warmUpEnd = ContinuousClock.now + .seconds(8)
+        while ContinuousClock.now < warmUpEnd {
+            try await Task.sleep(for: .milliseconds(20))
+            baseline = max(baseline, Self.physFootprint())
+        }
+        var peak = baseline
+        let floodEnd = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < floodEnd {
+            try await Task.sleep(for: .milliseconds(20))
+            peak = max(peak, Self.physFootprint())
+        }
+        let growthMB = Double(peak - baseline) / 1_048_576
+        XCTAssertLessThan(growthMB, 100, "footprint grew \(growthMB) MB during the flood")
+
+        // Phase 2, the flood while the window and the divider resize: lag,
+        // grids and close, not memory. Resizing a rendering window
+        // saw-tooths the footprint on CI: macOS keeps the old-size
+        // drawables and frees them in batches every 40 to 100 steps (#326,
+        // "Live resize footprint" in docs/debugging.md;
+        // ResizeFootprintTests bounds it), so a budget here measured where
+        // a batch fell (0 to 108 MB of "growth" on CI).
         // The sizes the resizing visits: every (window width, window
         // height, divider) combination once per cycle, the periods being
         // coprime.
@@ -1039,20 +1065,12 @@ final class PaneTests: XCTestCase {
             splitView.setPosition(dividers[step % dividers.count], ofDividerAt: 0)
             controller.paneContainer.layoutSubtreeIfNeeded()
         }
-        // A full cycle first: the panes' drawables, glyph atlases and
-        // re-wrapped scrollback reach every size, a one-off step of up to
-        // about 450 MB under TSan that then swings up and down with the
-        // sizes, so the budget below measures growth past the warm-up's
-        // highest footprint. Counted in steps, not time: a slow runner that
-        // got through a few sizes in a time-based warm-up measured the rest
-        // of that step as growth (#319).
-        var baseline = Self.physFootprint()
+        // A full cycle first, not timed: the panes' drawables, glyph atlases
+        // and re-wrapped scrollback reach every size once.
         while step < cycle {
             resize()
             try await Task.sleep(for: .milliseconds(20))
-            baseline = max(baseline, Self.physFootprint())
         }
-        var peak = baseline
         var worstLag: Duration = .zero
         let floodStart = step
         let end = ContinuousClock.now + .seconds(3)
@@ -1061,7 +1079,6 @@ final class PaneTests: XCTestCase {
             let start = ContinuousClock.now
             try await Task.sleep(for: .milliseconds(20))
             worstLag = max(worstLag, ContinuousClock.now - start - .milliseconds(20))
-            peak = max(peak, Self.physFootprint())
         }
         // Each grid is the whole cells its pane's frame holds once the
         // resizing stops.
@@ -1082,13 +1099,11 @@ final class PaneTests: XCTestCase {
         try await waitUntil("the tab closed") { appDelegate.windowControllers.isEmpty }
         let closeTime = ContinuousClock.now - closeStart
 
-        let growthMB = Double(peak - baseline) / 1_048_576
         let floodSteps = step - floodStart
-        print("pane flood: \(floodSteps) resize steps, growth \(Int(growthMB)) MB, worst lag \(worstLag), close \(closeTime)")
+        print("pane flood: growth \(Int(growthMB)) MB at a fixed size, \(floodSteps) resize steps, worst lag \(worstLag), close \(closeTime)")
         // 65 steps under TSan locally, 32 with the test host in the
         // background policy beside CPU burners, 27 with it starved.
         XCTAssertGreaterThanOrEqual(floodSteps, 10, "the resizing kept up")
-        XCTAssertLessThan(growthMB, 100, "footprint grew \(growthMB) MB during the flood")
         XCTAssertLessThan(worstLag, .milliseconds(500), "main actor lagged \(worstLag)")
         XCTAssertLessThan(closeTime, .seconds(3), "closing took \(closeTime)")
     }
