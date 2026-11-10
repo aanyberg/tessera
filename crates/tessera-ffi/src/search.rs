@@ -56,8 +56,8 @@ const _: () = assert!(SEARCH_MAX_MATCHES_TEXT_BYTES == MAX_MATCHES_TEXT_BYTES);
 
 /// The largest budget, in microseconds, `tessera_session_search_step`
 /// accepts; a larger one is clamped to it. The step reads the clock after
-/// every regex run inside a piece too, so it returns within four budgets
-/// plus 250 ms plus one regex call (ADR 0038). That call is not
+/// every regex run inside a piece too, so it returns within
+/// `max(4 x budget, 250 ms)` plus one regex call (ADR 0038). That call is not
 /// interruptible: it runs on at most a piece's text, 64 KiB, or 1 KiB once
 /// a slow pattern has halved the pieces to the floor, and is bounded by
 /// bytes, not time: a pathological pattern costs about 0.65-0.9 s per KiB,
@@ -324,8 +324,8 @@ unsafe fn with_status(
 /// `budget_us` microseconds (at most `TESSERA_SEARCH_MAX_STEP_MICROS`):
 /// piece after piece (at most 64 KiB of text each) until nothing is left
 /// or the budget has passed, at least one piece. The clock is read after
-/// every regex run inside a piece too, so the call returns within four
-/// budgets plus 250 ms plus one regex call, which is not interruptible
+/// every regex run inside a piece too, so the call returns within
+/// `max(4 x budget, 250 ms)` plus one regex call, which is not interruptible
 /// (`TESSERA_SEARCH_MAX_STEP_MICROS` says how long one can take). Pieces
 /// too slow are searched again in halves; a row slower than 250 ms is
 /// skipped, and `out->lines_skipped` set, as when the halves cut a line.

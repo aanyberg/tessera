@@ -25,12 +25,15 @@
 //! read after the last call of a piece too, the one that finds nothing, so
 //! such a piece is late, not on time (F9c). The first piece of a
 //! step may run for four times the budget (at least [`MIN_PIECE_TIME`]); a
-//! piece that takes longer is searched again at half its own size, and
-//! every later piece of the search is cut at that [`PieceLimit`], down to
-//! one row and [`MIN_PIECE_BYTES`] ([`PieceLimit::halved_from`]). A piece at that floor
-//! may run for [`LINE_TIME_LIMIT`] (or four budgets, when longer); one
-//! slower still, even in one run, is skipped, keeping the matches found
-//! before the stop. A segment a halved limit cuts inside its line can lose
+//! piece that takes longer is searched again at half its own size
+//! ([`PieceLimit::halved_from`]), and every later piece of the search is
+//! cut at half the [`PieceLimit`] it had (#368: a short piece, late from a
+//! stall, no longer cuts every later line to the floor), down to one row
+//! and [`MIN_PIECE_BYTES`]. A piece at that floor may run for
+//! [`LINE_TIME_LIMIT`] (or four budgets, when longer); one slower still,
+//! even in one run, is skipped, keeping the matches found before the stop,
+//! and so is a piece no larger than the floor that already had that
+//! deadline (searched again, it would be the same run). A segment a halved limit cuts inside its line can lose
 //! a match across the cut, so it counts as skipped too: either way the
 //! status says lines were skipped ([`SearchStatus::lines_skipped`]). A
 //! later piece of a step stops at the budget and is searched first in the
@@ -76,11 +79,10 @@ use std::time::{Duration, Instant};
 
 use tessera_grid::{DamageRows, Grid, Line};
 use tessera_render::{Overlay, OverlayKind};
-#[cfg(doc)]
-use tessera_search::MIN_PIECE_BYTES;
 use tessera_search::{
-    Haystack, MAX_HAYSTACK_BYTES, MAX_SEGMENT_ROWS, Match, Piece, PieceLimit, Query, QueryError,
-    QueryOptions, Rows, Segment, is_segment_start, scan_piece, segment_period, segments,
+    Haystack, MAX_HAYSTACK_BYTES, MAX_SEGMENT_ROWS, MIN_PIECE_BYTES, Match, Piece, PieceLimit,
+    Query, QueryError, QueryOptions, Rows, Segment, is_segment_start, scan_piece, segment_period,
+    segments,
 };
 use tessera_term::Terminal;
 
@@ -607,7 +609,11 @@ impl Active {
             matches: self.shown_len(),
             current,
             done: self.done,
-            truncated: self.truncated() || self.pass.as_ref().is_some_and(|pass| pass.truncated),
+            // On the alternate screen the history is not shown: its lost
+            // matches do not make the count short (#368).
+            truncated: (!alt && self.lost != 0)
+                || (self.screen_shown(alt) && self.screen_truncated)
+                || self.pass.as_ref().is_some_and(|pass| pass.truncated),
             lines_skipped: (!alt && self.skipped != 0)
                 || (self.screen_shown(alt) && self.screen_skipped)
                 || self.pass.as_ref().is_some_and(|pass| pass.skipped),
@@ -672,6 +678,8 @@ impl Active {
         if self.alt() != seen.alt {
             self.screen.clear();
             self.screen_seen = None;
+            self.screen_truncated = false;
+            self.screen_skipped = false;
             self.drop_pass();
             self.scanned.clear(&mut self.spare);
             self.current = None;
@@ -863,6 +871,7 @@ impl Active {
             at,
             left: self.cuts.len(),
             piece: None,
+            retry: None,
             stopped: false,
             sink,
         });
@@ -909,7 +918,10 @@ impl Active {
                 }
                 Piece::first(chunk.at.first, segment)
             };
-            let floor = self.limit.halved(cols).is_none();
+            // A piece searched again after it was slow has a limit of its
+            // own: half its size, below the search's.
+            let limit = chunk.retry.unwrap_or(self.limit);
+            let floor = limit.halved(cols).is_none();
             self.found.clear();
             let found = &mut self.found;
             #[cfg(test)]
@@ -922,7 +934,7 @@ impl Active {
                 &self.query,
                 rows,
                 piece,
-                self.limit,
+                limit,
                 Some(clock.deadline(floor)),
                 &mut self.haystack,
                 |m| {
@@ -948,10 +960,16 @@ impl Active {
                     // this piece, at its own deadline.
                     break;
                 }
-                if let Some(half) = self.limit.halved_from(scan.size, cols) {
-                    // Too slow at this size: in halves of this piece, from
-                    // here on.
-                    self.limit = half;
+                if let Some(half) = retry_limit(limit, scan.size, cols, clock) {
+                    // Too slow at this size: searched again at half its own
+                    // size, and every later piece one halving smaller than
+                    // before, not cut as fine as this piece's half: a short
+                    // piece late from a stall does not cut every later line
+                    // to the floor (#368).
+                    chunk.retry = Some(half);
+                    if let Some(step) = self.limit.halved(cols) {
+                        self.limit = step;
+                    }
                     break;
                 }
                 // Too slow at the smallest size: skipped, with what it
@@ -961,7 +979,7 @@ impl Active {
                     self.skips += 1;
                 }
                 incomplete(chunk, segment, &mut self.pass, &mut self.skipped);
-            } else if scan.next.is_some() && self.limit != PieceLimit::FULL {
+            } else if scan.next.is_some() && limit != PieceLimit::FULL {
                 // Cut inside its line finer than the full limit cuts: a
                 // match across the cut is lost, so it counts as skipped
                 // (#331, F9a).
@@ -974,6 +992,7 @@ impl Active {
                 }
             }
             chunk.piece = scan.next;
+            chunk.retry = None;
             if scan.next.is_none() {
                 chunk.left -= 1;
             }
@@ -1050,6 +1069,18 @@ impl Active {
     }
 }
 
+/// The limit a first piece too slow at `limit` (its own size `size`) is
+/// searched again at: half its size ([`PieceLimit::halved_from`]); `None`
+/// when it is to be skipped. Searched again at the floor, a piece no larger
+/// than the floor that already had the floor's deadline would be this same
+/// run, so it is skipped at once (#368).
+fn retry_limit(limit: PieceLimit, size: PieceLimit, cols: u16, clock: Clock) -> Option<PieceLimit> {
+    let floor = limit.halved(cols).is_none();
+    let fits = size.bytes() <= MIN_PIECE_BYTES && size.cells() <= usize::from(cols.max(1));
+    let same = fits && clock.deadline(true) <= clock.deadline(floor);
+    limit.halved_from(size, cols).filter(|_| !same)
+}
+
 /// Notes that `segment` of `chunk` was not searched whole (a piece too
 /// slow was skipped, or a halved limit cut it): the status says lines were
 /// skipped until those lines are gone.
@@ -1122,6 +1153,9 @@ struct Chunk {
     left: usize,
     /// Where the next segment stands: `None` before its first piece.
     piece: Option<Piece>,
+    /// The limit `piece` is searched again at after it was too slow (half
+    /// its own size); `None` for the search's limit.
+    retry: Option<PieceLimit>,
     /// The sink was full: no older segment can add a match.
     stopped: bool,
     sink: Sink,
@@ -2201,8 +2235,9 @@ mod tests {
     const NO_MATCH_PER_KIB: &str = r"(?:e{1,400}){1,250}\b\d";
 
     /// #331, F9, F9a: over 64 KiB of combining marks, Cyrillic and CJK, no
-    /// step takes longer than four budgets plus 250 ms plus one regex run
-    /// (its longest gap between two matches: both patterns match every
+    /// step takes longer than four budgets plus 250 ms plus one regex run:
+    /// a looser bar than the deadline, `max(4 x budget, 250 ms)`, which
+    /// leaves room for a loaded machine (its longest gap between two matches: both patterns match every
     /// cell they do not take into a longer match), and no piece longer
     /// than its share of that; the search finishes, with every cell found
     /// (each is one match of `\w*X\b|\w`) or a piece skipped.
@@ -2475,18 +2510,102 @@ mod tests {
             budget: Duration::ZERO,
             first: true,
         };
-        for _ in 0..10 {
-            if search.active.as_ref().unwrap().limit != PieceLimit::FULL {
-                break;
-            }
-            search.unit(&shared, late);
-        }
-        let limit = search.active.as_ref().unwrap().limit;
+        let retry = (0..10)
+            .find_map(|_| {
+                search.unit(&shared, late);
+                search.active.as_ref().unwrap().chunk.as_ref()?.retry
+            })
+            .expect("never retried");
         assert!(
-            limit.bytes() <= 4000 && limit.cells() <= 4000,
-            "the retry of an 8000-byte line runs at {limit:?}, not cutting it"
+            retry.bytes() <= 4000 && retry.cells() <= 4000,
+            "the retry of an 8000-byte line runs at {retry:?}, not cutting it"
         );
-        assert!(limit.cells() >= 300, "below one row: {limit:?}");
+        assert!(retry.cells() >= 300, "below one row: {retry:?}");
+        // The scan runs at the retry's limit: late again, the piece is
+        // retried smaller still or, at the floor, skipped; never retried
+        // at the same limit, as a scan at the search's limit would be.
+        search.unit(&shared, late);
+        let active = search.active.as_ref().unwrap();
+        let again = active.chunk.as_ref().and_then(|chunk| chunk.retry);
+        assert!(
+            again.map_or(active.skips == 1, |again| again.bytes() < retry.bytes()
+                || again.cells() < retry.cells()),
+            "the scan ignored the retry at {retry:?}: retried at {again:?}"
+        );
+        // Later pieces are one halving smaller, not cut as fine as this
+        // one's half (#368).
+        assert_eq!(
+            search.active.as_ref().unwrap().limit,
+            PieceLimit::FULL.halved(300).unwrap()
+        );
+    }
+
+    /// #368: a piece no larger than the floor that already had the floor's
+    /// deadline (four budgets of 100 ms are past 250 ms) is skipped at once:
+    /// searched again at the floor, it would be the same run. The search's
+    /// limit is left alone.
+    #[test]
+    fn a_floor_sized_piece_late_at_the_floor_deadline_is_skipped_at_once() {
+        let mut term = Terminal::new(6, 40);
+        term.advance(b"aXa");
+        let shared = Shared::new(term);
+        let mut search = SearchState::default();
+        search.start("X", LITERAL).unwrap();
+        let late = Clock {
+            started: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+            budget: Duration::from_millis(100),
+            first: true,
+        };
+        assert_eq!(search.unit(&shared, late), Some(Ran::Stop));
+        let active = search.active.as_ref().unwrap();
+        assert_eq!(active.skips, 1, "retried instead of skipped");
+        assert_eq!(active.limit, PieceLimit::FULL);
+        assert!(
+            active
+                .chunk
+                .as_ref()
+                .is_none_or(|chunk| chunk.retry.is_none())
+        );
+        // With a 16 ms deadline it is tried once more at the floor.
+        let mut search = SearchState::default();
+        search.start("X", LITERAL).unwrap();
+        let late = Clock {
+            budget: Duration::ZERO,
+            ..late
+        };
+        assert_eq!(search.unit(&shared, late), Some(Ran::Stop));
+        let active = search.active.as_ref().unwrap();
+        assert_eq!(active.skips, 0);
+        let mut floor = PieceLimit::FULL;
+        while let Some(half) = floor.halved(40) {
+            floor = half;
+        }
+        assert_eq!(active.chunk.as_ref().unwrap().retry, Some(floor));
+        // The rest of the search goes one halving down, not to the floor.
+        assert_eq!(active.limit, PieceLimit::FULL.halved(40).unwrap());
+    }
+
+    /// The deadline of a step's pieces (module docs, Time): the first gets
+    /// four budgets, at least [`MIN_PIECE_TIME`] or, at the floor,
+    /// [`LINE_TIME_LIMIT`]; a later one gets the budget (#368).
+    #[test]
+    fn a_step_first_piece_gets_four_budgets_or_its_least() {
+        let started = Instant::now();
+        let after = |budget: u64, first: bool, floor: bool| {
+            let clock = Clock {
+                started,
+                budget: Duration::from_millis(budget),
+                first,
+            };
+            clock.deadline(floor) - started
+        };
+        let ms = Duration::from_millis;
+        assert_eq!(after(10, true, false), ms(40));
+        assert_eq!(after(1, true, false), MIN_PIECE_TIME);
+        assert_eq!(after(1, true, true), LINE_TIME_LIMIT);
+        assert_eq!(after(100, true, true), ms(400));
+        assert_eq!(after(10, false, false), ms(10));
+        assert_eq!(after(10, false, true), ms(10));
     }
 
     /// #331 round 1 (rust B1, F9a): a halved limit cuts a logical line
@@ -2660,5 +2779,238 @@ mod tests {
         let live = counts(run(&mut search, &shared));
         assert_eq!(live, fresh_x(&shared));
         assert_eq!(live, (2, false, false));
+    }
+
+    /// The floor limit for `cols` columns.
+    fn floor(cols: u16) -> PieceLimit {
+        let mut limit = PieceLimit::FULL;
+        while let Some(half) = limit.halved(cols) {
+            limit = half;
+        }
+        limit
+    }
+
+    /// Searches `shared` for `X` with every piece late at the floor (all
+    /// skipped), then on time at the full limit.
+    fn skip_all(shared: &Shared) -> SearchState {
+        let mut search = SearchState::default();
+        search.start("X", LITERAL).unwrap();
+        search.active.as_mut().unwrap().limit = floor(40);
+        let late = Clock {
+            started: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+            budget: Duration::ZERO,
+            first: true,
+        };
+        while search.unit(shared, late).is_some() {}
+        assert!(search.active.as_ref().unwrap().skipped != 0);
+        search.active.as_mut().unwrap().limit = PieceLimit::FULL;
+        run(&mut search, shared);
+        search
+    }
+
+    /// #368 (M10): the skipped mark is the skipped segment's end, so
+    /// evicting the first row of a skipped three-row line leaves the status
+    /// saying lines were skipped; evicting all of it clears that.
+    #[test]
+    fn a_skipped_line_counts_until_its_last_row_is_evicted() {
+        let mut term = Terminal::new(6, 40);
+        term.set_max_scrollback(3);
+        term.advance(format!("{}\r\n{}", "aX".repeat(60), "b\r\n".repeat(5)).as_bytes());
+        assert_eq!(term.grid().scrollback_len(), 3);
+        let shared = Shared::new(term);
+        let mut search = skip_all(&shared);
+        assert!(search.status().lines_skipped);
+        let mut evict = |lines: usize| {
+            shared
+                .term
+                .lock()
+                .unwrap()
+                .advance("b\r\n".repeat(lines).as_bytes());
+            run(&mut search, &shared).lines_skipped
+        };
+        assert!(evict(1), "a row of the skipped line left, unreported");
+        assert!(evict(1), "a row of the skipped line left, unreported");
+        assert!(!evict(1), "the skipped line is gone");
+    }
+
+    /// #368 (M4, and the screen flags' reset): history lines skipped do not
+    /// count on the alternate screen, which does not show them, and count
+    /// again back on the primary. The screen's flags are of the other
+    /// screen from the switch on.
+    #[test]
+    fn skipped_history_does_not_count_on_the_alternate_screen() {
+        let mut term = Terminal::new(6, 40);
+        term.advance("aXa\r\n".repeat(20).as_bytes());
+        let shared = Shared::new(term);
+        let mut search = skip_all(&shared);
+        assert!(search.status().lines_skipped);
+        // The primary screen skipped too: its flag must not survive.
+        search.active.as_mut().unwrap().screen_skipped = true;
+        search.active.as_mut().unwrap().screen_truncated = true;
+        shared.term.lock().unwrap().advance(b"\x1b[?1049hX");
+        search.step(&shared, Duration::ZERO);
+        let active = search.active.as_ref().unwrap();
+        assert!(!active.screen_skipped && !active.screen_truncated);
+        let status = run(&mut search, &shared);
+        assert_eq!(
+            (status.matches, status.truncated, status.lines_skipped),
+            (1, false, false)
+        );
+        shared.term.lock().unwrap().advance(b"\x1b[?1049l");
+        assert!(run(&mut search, &shared).lines_skipped);
+    }
+
+    /// #368: matches lost from the history at the cap do not make the
+    /// alternate screen's count short; back on the primary they do again.
+    #[test]
+    fn lost_history_matches_do_not_truncate_the_alternate_screen() {
+        let (shared, mut search) = truncated_x(10_000);
+        shared.term.lock().unwrap().advance(b"\x1b[?1049hxx");
+        let live = counts(run(&mut search, &shared));
+        assert_eq!(live, (2, false, false));
+        assert_eq!(live, fresh_x(&shared));
+        shared.term.lock().unwrap().advance(b"\x1b[?1049l");
+        let live = counts(run(&mut search, &shared));
+        assert_eq!(live, (MAX_MATCHES, true, false));
+    }
+
+    /// #368 (M2): the search stays truncated while one line whose matches
+    /// gave way is left, and is whole once eviction takes exactly the last.
+    #[test]
+    fn truncation_clears_exactly_when_the_last_lost_line_is_evicted() {
+        let (shared, mut search) = truncated_x(500);
+        let lost = search.active.as_ref().unwrap().lost;
+        let base = || Seen::of(shared.term.lock().unwrap().grid()).base;
+        assert!(base() < lost, "nothing lost is left");
+        let plain = "plain\r\n";
+        while base() + 1 < lost {
+            shared.term.lock().unwrap().advance(plain.as_bytes());
+        }
+        assert!(run(&mut search, &shared).truncated, "a lost line is left");
+        shared.term.lock().unwrap().advance(plain.as_bytes());
+        assert_eq!(base(), lost);
+        let live = counts(run(&mut search, &shared));
+        assert!(!live.1, "{live:?}");
+        assert_eq!(live, fresh_x(&shared));
+    }
+
+    /// #368 (M1): a screen pass that skipped a piece is not kept as the
+    /// copy the next pass reuses, so that pass searches the segment again
+    /// (and skips it again, at the floor) instead of taking its short count.
+    #[test]
+    fn a_screen_pass_that_skipped_is_not_reused() {
+        let mut term = Terminal::new(6, 40);
+        term.set_max_scrollback(0);
+        term.advance(b"aXa\r\nbXb");
+        let shared = Shared::new(term);
+        let mut search = SearchState::default();
+        search.start("X", LITERAL).unwrap();
+        search.active.as_mut().unwrap().limit = floor(40);
+        let late = Clock {
+            started: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+            budget: Duration::ZERO,
+            first: true,
+        };
+        while search.unit(&shared, late).is_some() {}
+        // Both rows skipped; a step plans the pass's end.
+        search.step(&shared, Duration::ZERO);
+        assert!(search.status().lines_skipped);
+        assert_eq!(search.active.as_ref().unwrap().scanned.seen, None);
+        // On time now, after output on the last row only: the first row is
+        // searched again, not taken from a copy of the skipped pass.
+        shared.term.lock().unwrap().advance(b"c");
+        let status = run(&mut search, &shared);
+        assert_eq!((status.matches, status.lines_skipped), (2, false));
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(32))]
+
+        /// #368: the live-versus-fresh check of `tests/search.rs` at a
+        /// halved limit, where pieces cut lines: the live search, stepped
+        /// a piece at a time through output, resizes and screen switches,
+        /// agrees with a fresh one at the same limit. Runs a stall moved
+        /// the limit on are not compared.
+        #[test]
+        fn a_live_search_at_a_halved_limit_agrees_with_a_fresh_one(
+            ops in proptest::collection::vec(halved_op(), 1..24),
+            halvings in 1usize..8,
+            scrollback in 0usize..300,
+        ) {
+            let mut term = Terminal::new(12, 40);
+            term.set_max_scrollback(scrollback);
+            let shared = Shared::new(term);
+            let mut limit = PieceLimit::FULL;
+            for _ in 0..halvings {
+                limit = limit.halved(40).unwrap_or(limit);
+            }
+            let start = |search: &mut SearchState| {
+                search.start("X[ab]*|\u{4e00}", REGEX).unwrap();
+                search.active.as_mut().unwrap().limit = limit;
+            };
+            let mut live = SearchState::default();
+            start(&mut live);
+            for op in &ops {
+                match op {
+                    HalvedOp::Feed(text) => shared.term.lock().unwrap().advance(text.as_bytes()),
+                    HalvedOp::Step => {
+                        live.step(&shared, Duration::ZERO);
+                    }
+                    HalvedOp::Resize(rows, cols) => {
+                        shared.term.lock().unwrap().resize(*rows, *cols);
+                        shared.resizes.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            let live_status = run(&mut live, &shared);
+            let mut fresh = SearchState::default();
+            start(&mut fresh);
+            let fresh_status = run(&mut fresh, &shared);
+            let stalled = |search: &SearchState| {
+                let active = search.active.as_ref().unwrap();
+                active.limit != limit || active.skips != 0
+            };
+            proptest::prop_assume!(!stalled(&live) && !stalled(&fresh));
+            proptest::prop_assert_eq!(counts(live_status), counts(fresh_status));
+            let shown = |search: &SearchState| {
+                let (a, b, c) = search.active.as_ref().unwrap().shown();
+                [a, b, c].concat()
+            };
+            proptest::prop_assert_eq!(shown(&live), shown(&fresh));
+        }
+    }
+
+    /// An operation of [`a_live_search_at_a_halved_limit_agrees_with_a_fresh_one`].
+    #[derive(Debug, Clone)]
+    enum HalvedOp {
+        Feed(String),
+        Step,
+        Resize(u16, u16),
+    }
+
+    /// Heavy output (zalgo runs of several kilobytes, so one line is many
+    /// pieces at a halved limit), `X` marks and the screen controls of the
+    /// integration tests' `heavy_op`.
+    fn halved_op() -> impl proptest::strategy::Strategy<Value = HalvedOp> {
+        use proptest::prelude::*;
+        let piece = prop_oneof![
+            4 => (1usize..200).prop_map(|n| zalgo().repeat(n)),
+            4 => Just("X".to_owned()),
+            2 => "[ab ]{1,12}",
+            2 => Just("\r\n".to_owned()),
+            1 => Just("\u{4e00}".to_owned()),
+            1 => Just("\x1b[2J".to_owned()),
+            1 => Just("\x1b[3J".to_owned()),
+            1 => Just("\x1b[H".to_owned()),
+            1 => Just("\x1b[5;7H".to_owned()),
+            1 => Just("\x1b[?1049h".to_owned()),
+            1 => Just("\x1b[?1049l".to_owned()),
+            1 => Just("\x1bc".to_owned()),
+        ];
+        prop_oneof![
+            5 => proptest::collection::vec(piece, 1..6).prop_map(|p| HalvedOp::Feed(p.concat())),
+            5 => Just(HalvedOp::Step),
+            1 => (6u16..14, 20u16..48).prop_map(|(rows, cols)| HalvedOp::Resize(rows, cols)),
+        ]
     }
 }

@@ -1346,8 +1346,8 @@ impl App {
     /// piece (at most [`tessera_search::MAX_HAYSTACK_BYTES`] of text each)
     /// until nothing is left to scan or `budget` has passed, at least one
     /// piece (at most one for a zero `budget`). The clock is read after
-    /// every regex run inside a piece too, so a step returns within four
-    /// budgets plus [`search::LINE_TIME_LIMIT`] plus one regex call, which
+    /// every regex run inside a piece too, so a step returns within
+    /// `max(4 x budget, `[`search::LINE_TIME_LIMIT`]`)` plus one regex call, which
     /// is not interruptible (on at most a piece's text: 64 KiB, or 1 KiB
     /// once halved to the floor; bounded by bytes, not time: with a
     /// pathological pattern many seconds, ADR 0038 has the measured worst
