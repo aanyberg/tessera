@@ -185,7 +185,7 @@ final class KeysPaneTests: XCTestCase {
         }
     }
 
-    func testTheSystemMonitorSwallowsTheRecordedKeyAndNoOther() throws {
+    func testTheSystemMonitorSwallowsTheRecordedKeyAndNoOther() async throws {
         let window = testWindow()
         let key = try Self.key(14, "e", [.control, .shift], in: window)
         let other = OtherMonitor()
@@ -208,6 +208,8 @@ final class KeysPaneTests: XCTestCase {
             NSApp.sendEvent(key)
             XCTAssertEqual(other.keyDowns, seen + 2, "round \(round): the keys after it go on")
             XCTAssertEqual(keys.registrationCount, 0)
+            // The chord is written on SettingsModel.writeQueue (#373).
+            try await waitUntil("round \(round): written") { !writer.calls.isEmpty }
             XCTAssertEqual(writer.calls.first?.value, .string("find"))
         }
         XCTAssertEqual(other.leaks, 0, "the recorded key reaches no monitor after the pane's")
