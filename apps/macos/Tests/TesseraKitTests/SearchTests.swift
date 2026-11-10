@@ -115,6 +115,52 @@ final class SearchTests: XCTestCase {
         XCTAssertThrowsError(try session.searchStep(budgetMicros: 4_000))
     }
 
+    /// Every field of the C status reaches ``TesseraSession/SearchStatus``,
+    /// `lines_skipped` included (#318).
+    func testTheCStatusMapsFieldByField() {
+        var c = TesseraSearchStatus()
+        XCTAssertEqual(TesseraSession.SearchStatus(c), .init())
+        c.matches = 7
+        c.has_current = true
+        c.current = 3
+        c.active = true
+        c.done = true
+        XCTAssertEqual(TesseraSession.SearchStatus(c), .init(matches: 7, current: 3, active: true, done: true))
+        c.has_current = false
+        XCTAssertNil(TesseraSession.SearchStatus(c).current, "no current without has_current")
+        c.truncated = true
+        XCTAssertEqual(
+            TesseraSession.SearchStatus(c), .init(matches: 7, active: true, done: true, truncated: true))
+        c.truncated = false
+        c.lines_skipped = true
+        XCTAssertEqual(
+            TesseraSession.SearchStatus(c), .init(matches: 7, active: true, done: true, linesSkipped: true))
+    }
+
+    /// `searchReveal()` scrolls the view to the current match (the newest
+    /// once found) without moving it, and does nothing without a search.
+    func testRevealScrollsToTheCurrentMatchOnly() async throws {
+        let filler = (1...30).map { "line \($0)" }
+        let session = try await session(["hit"] + filler)
+        XCTAssertEqual(try session.searchReveal(), .init(), "no search: nothing")
+        XCTAssertEqual(try session.scrollPosition.offset, 0, "no search: the view stays")
+        try session.searchStart("hit", regex: false, caseSensitive: false)
+        let found = try finish(session)
+        XCTAssertEqual(found.matches, 1)
+        XCTAssertEqual(found.current, 0)
+        XCTAssertEqual(try session.scrollPosition.offset, 0, "a step does not scroll")
+        let revealed = try session.searchReveal()
+        XCTAssertEqual(revealed, found, "the match stays current")
+        let position = try session.scrollPosition
+        XCTAssertEqual(position.offset, position.history, "scrolled to the top, where the match is")
+        XCTAssertEqual(try session.searchReveal(), found)
+        XCTAssertEqual(try session.scrollPosition, position, "in view: no move")
+        try session.searchClear()
+        try session.scroll(to: .bottom)
+        XCTAssertEqual(try session.searchReveal(), .init(), "cleared: nothing")
+        XCTAssertEqual(try session.scrollPosition.offset, 0, "cleared: the view stays")
+    }
+
     // MARK: Smart case
 
     func testSmartCaseMatchesCaseOnlyForAnUppercaseLetter() {

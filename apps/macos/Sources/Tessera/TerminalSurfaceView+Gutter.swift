@@ -28,6 +28,8 @@ extension TerminalSurfaceView: NSViewToolTipOwner {
         var layout: Layout?
         /// One tag per visible row, top row first.
         var tags: [NSView.ToolTipTag] = []
+        /// The rect each tag was added with, in view coordinates.
+        var rects: [NSRect] = []
     }
 
     /// Lays out one tool-tip rect per visible row over the left padding,
@@ -54,6 +56,7 @@ extension TerminalSurfaceView: NSViewToolTipOwner {
             let y = isFlipped ? fromTop : bounds.height - fromTop - cellHeight
             let rect = NSRect(x: 0, y: y, width: padding, height: cellHeight)
             gutterToolTips.tags.append(addToolTip(rect, owner: self, userData: nil))
+            gutterToolTips.rects.append(rect)
         }
     }
 
@@ -94,7 +97,9 @@ extension TerminalSurfaceView: NSViewToolTipOwner {
         guard seconds >= 0, attoseconds >= 0 else { return "0 ms" }
         let millis = seconds.multipliedReportingOverflow(by: 1000)
         guard !millis.overflow else { return "\(seconds / 3600) h" }
-        let total = millis.partialValue + attoseconds / 1_000_000_000_000_000
+        let sum = millis.partialValue.addingReportingOverflow(attoseconds / 1_000_000_000_000_000)
+        guard !sum.overflow else { return "\(seconds / 3600) h" }
+        let total = sum.partialValue
         switch total {
         case ..<1000: return "\(total) ms"
         case ..<60_000:

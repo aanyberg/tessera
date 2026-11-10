@@ -40,11 +40,6 @@ extension TesseraSession {
         return selected
     }
 
-    /// Whether the last finished command printed output still in the
-    /// scrollback, from the session's command records alone (no search of
-    /// the history): cheap enough to enable Select Last Output in
-    /// `validateMenuItem(_:)`. ``selectLastOutput()`` can still find nothing
-    /// (after a resize moved the lines, say).
     /// The finished command whose prompt is on the view's `row` (0 is the
     /// top), as the exit-status mark in the left padding draws it (#45b,
     /// ADR 0039), or `nil` when that row has no mark: no prompt there, the
@@ -80,6 +75,11 @@ extension TesseraSession {
         }
     }
 
+    /// Whether the last finished command printed output still in the
+    /// scrollback, from the session's command records alone (no search of
+    /// the history): cheap enough to enable Select Last Output in
+    /// `validateMenuItem(_:)`. ``selectLastOutput()`` can still find nothing
+    /// (after a resize moved the lines, say).
     @MainActor
     public var hasCommandOutput: Bool {
         get throws {
