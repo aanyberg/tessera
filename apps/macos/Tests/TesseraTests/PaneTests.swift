@@ -170,6 +170,14 @@ final class PaneTests: XCTestCase {
         return controller
     }
 
+    /// Starts the core, as the first window does: its configuration sets
+    /// `paneDimming`, which would otherwise reset a test's amount when the
+    /// test, run alone, opens its first window.
+    private func startCore() throws {
+        try appDelegate.newWindow().window?.close()
+        XCTAssertTrue(appDelegate.windowControllers.isEmpty)
+    }
+
     private func split(_ controller: TerminalWindowController, _ direction: PaneSplitDirection) throws -> Pane {
         let pane = try XCTUnwrap(controller.splitFocusedPane(direction), "the split is refused")
         controller.paneContainer.layoutSubtreeIfNeeded()
@@ -1410,6 +1418,7 @@ extension PaneTests {
     }
 
     func testOnlyUnfocusedPanesOfASplitTabAreDimmed() throws {
+        try startCore()
         defer { appDelegate.paneDimming = 0 }
         appDelegate.paneDimming = 0.4
         let controller = try openTab()
@@ -1744,5 +1753,284 @@ final class PaneDimmingConfigTests: XCTestCase {
         XCTAssertThrowsError(try core.dimInactivePanes()) {
             XCTAssertEqual($0 as? TesseraCoreError, .nullPointer)
         }
+    }
+}
+
+// MARK: - Pane follow-ups (#323)
+
+/// Stands between a tab and the app delegate: counts the layout changes
+/// (each asks for a window-state save) and the panes closed, and can make
+/// the spawns past a number fail; everything else goes to the app.
+@MainActor
+private final class PaneHostProxy: TerminalWindowControllerDelegate {
+    struct SpawnRefused: Error {}
+
+    let app: AppDelegate
+    private(set) var layoutChanges = 0
+    private(set) var spawned: [TesseraSession] = []
+    private(set) var closed: [TesseraSession] = []
+    /// How many more spawns succeed; `nil` for no limit.
+    var spawnsLeft: Int?
+
+    init(app: AppDelegate) {
+        self.app = app
+    }
+
+    func terminalWindowControllerWantsNewTab(_ controller: TerminalWindowController) {
+        app.terminalWindowControllerWantsNewTab(controller)
+    }
+
+    func terminalWindowControllerSpawnSession(_ controller: TerminalWindowController) throws -> TesseraSession {
+        if let left = spawnsLeft {
+            guard left > 0 else { throw SpawnRefused() }
+            spawnsLeft = left - 1
+        }
+        let session = try app.terminalWindowControllerSpawnSession(controller)
+        spawned.append(session)
+        return session
+    }
+
+    func terminalWindowController(_ controller: TerminalWindowController, didClosePaneWith session: TesseraSession) {
+        closed.append(session)
+        app.terminalWindowController(controller, didClosePaneWith: session)
+    }
+
+    func terminalWindowControllerDidClose(_ controller: TerminalWindowController) {
+        app.terminalWindowControllerDidClose(controller)
+    }
+
+    func terminalWindowControllerDidChangeLayout(_ controller: TerminalWindowController) {
+        layoutChanges += 1
+        app.terminalWindowControllerDidChangeLayout(controller)
+    }
+
+    func presentOpenError(_ error: any Error) {
+        app.presentOpenError(error)
+    }
+
+    var closeConfirmationPresenter: (any CloseConfirmationPresenter)? { app.closeConfirmationPresenter }
+}
+
+extension PaneTests {
+    // MARK: Maximizing keeps the keyboard where it is
+
+    /// #323 M1 (the #38b adversarial run's T9): maximizing and showing every
+    /// pane again move the focused pane's view without taking the keyboard
+    /// from it, so a child with focus reports on (DECSET 1004) receives no
+    /// `ESC[O ESC[I`, and a marked-text composition stays open.
+    func testT9MaximizeSendsNoFocusReports() async throws {
+        let controller = try openTab()
+        let pane = controller.focusedPane
+        _ = try split(controller, .right)
+        controller.focus(pane)
+        let window = try XCTUnwrap(controller.window)
+        XCTAssertTrue(window.firstResponder === pane.view)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-focus-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: url) }
+        // Every byte the child reads goes to the file.
+        try pane.session.write(Array("stty raw -echo; printf '\\033[?1004h'; cat > '\(url.path)'\n".utf8))
+        try await waitUntil("cat runs") { try pane.session.foregroundProcess()?.name == "cat" }
+        func received() -> [UInt8] { (try? [UInt8](Data(contentsOf: url))) ?? [] }
+        func contains(_ bytes: [UInt8], _ part: [UInt8]) -> Bool {
+            bytes.count >= part.count && (0...(bytes.count - part.count)).contains { Array(bytes[$0..<$0 + part.count]) == part }
+        }
+        let focusIn: [UInt8] = [0x1b, 0x5b, 0x49]
+        let focusOut: [UInt8] = [0x1b, 0x5b, 0x4f]
+        // The session focused as in a key window (a locked session has
+        // none), and the reports reach the child.
+        try await waitUntil("the child gets focus reports") {
+            pane.view.windowKeyChanged(isKey: false)
+            pane.view.windowKeyChanged(isKey: true)
+            return contains(received(), focusIn)
+        }
+        // A marker, so every report sent so far has arrived: pasted, so it
+        // queues behind the reports (a write goes straight to the pty and
+        // could overtake one).
+        try pane.session.paste("a")
+        try await waitUntil("the first marker arrives") { received().last == 0x61 }
+        let before = received().count
+
+        pane.view.setMarkedText(
+            "に", selectedRange: NSRange(location: 1, length: 0),
+            replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertTrue(pane.view.hasMarkedText())
+        for cycle in 0..<3 {
+            for zoomed in [true, false] {
+                XCTAssertTrue(controller.toggleZoom())
+                XCTAssertEqual(controller.isZoomed, zoomed)
+                let state = "\(zoomed ? "maximized" : "every pane shown"), cycle \(cycle)"
+                XCTAssertTrue(window.firstResponder === pane.view, "the pane keeps the keyboard, \(state)")
+                XCTAssertTrue(pane.view.hasMarkedText(), "the composition stays, \(state)")
+            }
+        }
+        try pane.session.paste("x")
+        try await waitUntil("the last marker arrives") { received().last == 0x78 }
+        let after = Array(received()[before...])
+        XCTAssertFalse(contains(after, focusOut), "a focus-out report: \(after)")
+        XCTAssertFalse(contains(after, focusIn), "a focus-in report: \(after)")
+        XCTAssertEqual(after, [0x78])
+    }
+
+    /// #331 M3: ⌘⇧↩ with the find field focused leaves the keyboard in the
+    /// field, maximized and back.
+    func testMaximizingWithTheFindFieldFocusedKeepsTheKeyboardInIt() throws {
+        let controller = try openTab()
+        let pane = controller.focusedPane
+        _ = try split(controller, .right)
+        controller.focus(pane)
+        pane.view.showFindBar(nil)
+        let bar = try XCTUnwrap(pane.view.findBar)
+        XCTAssertTrue(bar.fieldHasFocus, "the keyboard is in the field")
+        for zoomed in [true, false] {
+            controller.toggleZoomPane(nil)
+            XCTAssertEqual(controller.isZoomed, zoomed)
+            XCTAssertTrue(bar.fieldHasFocus, zoomed ? "maximized" : "every pane shown")
+            XCTAssertTrue(controller.focusedPane === pane)
+        }
+    }
+
+    /// While the window itself holds the keyboard (nothing in the tab has
+    /// it), maximizing and showing every pane again give it to the focused
+    /// pane.
+    func testMaximizingGivesTheKeyboardToTheFocusedPaneWhenTheWindowHoldsIt() throws {
+        let controller = try openTab()
+        let pane = controller.focusedPane
+        _ = try split(controller, .right)
+        controller.focus(pane)
+        let window = try XCTUnwrap(controller.window)
+        for zoomed in [true, false] {
+            XCTAssertTrue(window.makeFirstResponder(nil))
+            XCTAssertTrue(window.firstResponder === window)
+            XCTAssertTrue(controller.toggleZoom())
+            XCTAssertEqual(controller.isZoomed, zoomed)
+            XCTAssertTrue(window.firstResponder === pane.view, zoomed ? "maximized" : "every pane shown")
+        }
+    }
+
+    // MARK: The shade
+
+    /// A dimmed pane's shade covers it after the window resizes, and goes
+    /// back above a view the pane adds later when the dimming changes.
+    func testTheShadeCoversItsPaneAfterAResizeAndStaysAboveLaterViews() throws {
+        try startCore()
+        defer { appDelegate.paneDimming = 0 }
+        appDelegate.paneDimming = 0.4
+        let controller = try openTab()
+        let left = controller.focusedPane
+        _ = try split(controller, .right)
+        let shade = try XCTUnwrap(shades(controller)[0], "the unfocused pane is dimmed")
+        let window = try XCTUnwrap(controller.window)
+        let start = left.view.bounds
+        for size in [NSSize(width: 1000, height: 700), NSSize(width: 700, height: 500), NSSize(width: 1300, height: 900)] {
+            window.setContentSize(size)
+            controller.paneContainer.layoutSubtreeIfNeeded()
+            XCTAssertEqual(shade.frame, left.view.bounds, "\(size)")
+        }
+        XCTAssertNotEqual(left.view.bounds, start, "the pane was resized")
+
+        let later = NSView(frame: NSRect(x: 0, y: 0, width: 40, height: 40))
+        left.view.addSubview(later)
+        appDelegate.paneDimming = 0.5
+        XCTAssertTrue(shades(controller)[0] === shade, "the same shade")
+        XCTAssertTrue(left.view.subviews.last === shade, "above the later view")
+        XCTAssertEqual(shade.alphaValue, 0.5, accuracy: 0.001)
+        later.removeFromSuperview()
+    }
+
+    // MARK: Saving
+
+    /// A 100-step divider drag through AppKit's tracking asks for one
+    /// window-state save, at its end, and the saved ratio is the drag's.
+    func testADividerDragSavesTheWindowStateOnceAtItsEnd() async throws {
+        let controller = try openTab()
+        let left = controller.focusedPane
+        _ = try split(controller, .right)
+        let proxy = PaneHostProxy(app: appDelegate)
+        controller.delegate = proxy
+        let defaults = try XCTUnwrap(CountingDefaults(suiteName: "com.aanyberg.tessera.tests.\(UUID().uuidString)"))
+        let store = WindowStateStore(defaults: defaults)
+        appDelegate.windowStateStore = store
+        defer {
+            appDelegate.windowStateStore = nil
+            controller.delegate = appDelegate
+        }
+        let window = try XCTUnwrap(controller.window)
+        let outer = try XCTUnwrap(controller.paneContainer.subviews.first as? PaneSplitView)
+        let start = frame(of: left, in: controller).maxX + 0.5
+        func event(_ type: NSEvent.EventType, x: CGFloat) throws -> NSEvent {
+            try XCTUnwrap(
+                NSEvent.mouseEvent(
+                    with: type, location: outer.convert(NSPoint(x: x, y: 200), to: nil), modifierFlags: [],
+                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil,
+                    eventNumber: 0, clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1))
+        }
+        for step in 1...100 {
+            NSApp.postEvent(try event(.leftMouseDragged, x: start - CGFloat(2 * step)), atStart: false)
+        }
+        NSApp.postEvent(try event(.leftMouseUp, x: start - 200), atStart: false)
+        outer.mouseDown(with: try event(.leftMouseDown, x: start))
+        XCTAssertLessThan(frame(of: left, in: controller).maxX, start - 50, "the drag moved the divider")
+        XCTAssertEqual(proxy.layoutChanges, 1, "one save asked for, at the end of the drag")
+
+        let ratio = Double(controller.paneContainer.tree.root.splits[0].ratio)
+        try await waitUntil("the drag's ratio is saved") {
+            guard case .split(_, let saved, _, _) = store.load()?.windows.first?.layout(ofTab: 0) else { return false }
+            return abs(saved - ratio) < 1e-9
+        }
+        // A click on the divider that moves nothing asks for none.
+        NSApp.postEvent(try event(.leftMouseUp, x: frame(of: left, in: controller).maxX + 0.5), atStart: false)
+        outer.mouseDown(with: try event(.leftMouseDown, x: frame(of: left, in: controller).maxX + 0.5))
+        XCTAssertEqual(proxy.layoutChanges, 1, "a click without a move")
+    }
+
+    /// A spawn failing partway through a restored layout: the tab keeps its
+    /// one pane, and the session started before the failure is closed and
+    /// handed back to the app.
+    func testASpawnFailingPartwayThroughARestoreClosesTheSessionsItStarted() throws {
+        let controller = try openTab()
+        let proxy = PaneHostProxy(app: appDelegate)
+        controller.delegate = proxy
+        defer { controller.delegate = appDelegate }
+        proxy.spawnsLeft = 1
+        let layout = PaneLayout.split(
+            .right, ratio: 0.5, first: .leaf, second: .split(.below, ratio: 0.5, first: .leaf, second: .leaf))
+        XCTAssertThrowsError(try controller.restoreLayout(layout)) { error in
+            XCTAssertTrue(error is PaneHostProxy.SpawnRefused, "\(error)")
+        }
+        XCTAssertEqual(controller.panes.count, 1)
+        XCTAssertEqual(proxy.spawned.count, 1, "one session started before the failure")
+        XCTAssertEqual(proxy.closed.map(\.id), proxy.spawned.map(\.id), "and it is closed")
+        XCTAssertThrowsError(try proxy.spawned[0].close(), "already closed") { error in
+            XCTAssertEqual(error as? TesseraCoreError, .sessionNotFound)
+        }
+        XCTAssertEqual(proxy.layoutChanges, 0, "nothing changed to save")
+    }
+
+    // MARK: ⌘W's title outside the panes
+
+    /// With the keyboard outside the panes (the window holds it), ⌘W
+    /// closes the tab and its title says so, however many panes it has.
+    func testCommandWSaysCloseTabWhileTheKeyboardIsOutsideThePanes() throws {
+        let item = try XCTUnwrap(MainMenu.item(forCommand: "close_tab", in: NSApp.mainMenu))
+        defer { item.title = PaneContainerView.closeTabTitle }
+        let controller = try openTab()
+        let window = try XCTUnwrap(controller.window)
+        _ = try split(controller, .right)
+        func validate() -> Bool {
+            var responder: NSResponder? = window.firstResponder
+            while let current = responder, !current.responds(to: item.action) {
+                responder = current.nextResponder
+            }
+            return (responder as? any NSMenuItemValidation)?.validateMenuItem(item) ?? false
+        }
+        XCTAssertTrue(validate())
+        XCTAssertEqual(item.title, "Close Pane", "the focused pane holds the keyboard")
+        XCTAssertTrue(window.makeFirstResponder(nil))
+        XCTAssertTrue(window.firstResponder === window)
+        XCTAssertTrue(validate())
+        XCTAssertEqual(item.title, "Close Tab", "the window holds the keyboard")
+        controller.focus(controller.focusedPane)
+        XCTAssertTrue(validate())
+        XCTAssertEqual(item.title, "Close Pane", "back in the pane")
     }
 }

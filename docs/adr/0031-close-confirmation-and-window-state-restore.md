@@ -206,6 +206,15 @@ is not finite or not inside (0, 1) restores its tab as one pane, logged;
 the decoder refuses nesting past that depth itself, an
 unreadable `tabs` or tree reads as absent, and a tree whose panes at
 their smallest size do not fit the restored window restores as one pane.
+A session that cannot be started partway through a tree closes the ones
+started for it, and the tab keeps one pane. Hostile values (S5, #323): a
+saved value over 1 MiB (`WindowStateStore.maxBytes`) is not decoded, and a
+window entry of more than 64 tabs (`WindowState.maxTabs`), by its
+`tabCount` or its `tabs` list, which is counted before a tab is decoded,
+makes the value unreadable; either way the default window opens. A
+window of more than 64 tabs is saved with its first 64, and a state that
+would encode to more than 1 MiB is not saved, the old one removed, so the
+app never writes what it would not read.
 Every pane of a restored tree is a fresh login shell in the home
 directory (D4c), as a tab is; which pane was focused or maximized is not
 kept (the first pane is focused), and profiles are not kept per pane

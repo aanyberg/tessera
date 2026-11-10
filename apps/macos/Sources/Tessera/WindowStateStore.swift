@@ -12,28 +12,41 @@ struct WindowState: Codable, Equatable {
     struct Window: Codable, Equatable {
         /// The window's frame in screen coordinates.
         var frame: CGRect
-        /// How many tabs it has, at least 1. Kept beside ``tabs``, which an
-        /// older Tessera does not read, so it still restores the tabs.
+        /// How many tabs it has, at least 1, at most ``maxTabs``. Kept
+        /// beside ``tabs``, which an older Tessera does not read, so it
+        /// still restores the tabs.
         var tabCount: Int
         /// Each tab's panes, in tab order; `nil` (as in the first format,
         /// and as saved while every tab has a single pane) or a missing
-        /// entry is one pane. Saved only when some tab is split.
+        /// entry is one pane. Saved only when some tab is split; at most
+        /// ``maxTabs``.
         var tabs: [Tab]?
 
+        /// The tabs past the first ``maxTabs`` are left out: a window
+        /// with more could not be read back.
         init(frame: CGRect, tabCount: Int, tabs: [Tab]? = nil) {
             self.frame = frame
-            self.tabCount = tabCount
+            self.tabCount = min(tabCount, WindowState.maxTabs)
+            let kept = tabs.map { Array($0.prefix(WindowState.maxTabs)) }
             // One pane everywhere is the first format's window.
-            self.tabs = tabs?.contains { $0.tree != nil } == true ? tabs : nil
+            self.tabs = kept?.contains { $0.tree != nil } == true ? kept : nil
         }
 
         /// As the first format: a `tabs` that cannot be read (not a list,
         /// a tree too deep to decode) leaves every tab one pane rather
-        /// than losing the window.
+        /// than losing the window. A window of more than ``maxTabs`` tabs,
+        /// by its count or its list, which is counted before a tab is
+        /// decoded, makes the whole state unreadable (S5).
         init(from decoder: any Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             let frame = try container.decode(CGRect.self, forKey: .frame)
             let tabCount = try container.decode(Int.self, forKey: .tabCount)
+            let listed = (try? container.nestedUnkeyedContainer(forKey: .tabs))?.count ?? 0
+            guard tabCount <= WindowState.maxTabs, listed <= WindowState.maxTabs else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .tabCount, in: container,
+                    debugDescription: "a window of more than \(WindowState.maxTabs) tabs")
+            }
             var tabs: [Tab]?
             do {
                 tabs = try container.decodeIfPresent([Tab].self, forKey: .tabs)
@@ -83,6 +96,9 @@ struct WindowState: Codable, Equatable {
     /// saved: a damaged or hand-edited value must not start thousands of
     /// shells.
     static let maxRestoredSessions = 64
+    /// A window has at most this many tabs in the state (S5): more than a
+    /// restore could start (``maxRestoredSessions``).
+    static let maxTabs = 64
     /// A restored window is at least this big, whatever was saved.
     static let minimumWindowSize = CGSize(width: 160, height: 80)
 
@@ -290,6 +306,12 @@ final class WindowStateStore {
     /// stayed; a format an older Tessera would misread gets a new key.
     nonisolated static let key = "TesseraWindowState.v1"
 
+    /// A saved value larger than this is not decoded at all (S5): decoding
+    /// is linear in the size (about 10 MB/s). A window's entry is a few
+    /// kilobytes at most (64 tabs, 16 panes each), so only hundreds of
+    /// windows reach it, and a restore starts 64 sessions in any case.
+    nonisolated static let maxBytes = 1 << 20
+
     private static let log = Logger(subsystem: "com.aanyberg.tessera", category: "window-state")
 
     let defaults: UserDefaults
@@ -298,17 +320,31 @@ final class WindowStateStore {
         self.defaults = defaults
     }
 
+    /// Saves `state`; one larger than ``maxBytes``, which ``load()``
+    /// would refuse, removes the saved state instead.
     func save(_ state: WindowState) {
         do {
-            defaults.set(try JSONEncoder().encode(state), forKey: Self.key)
+            let data = try JSONEncoder().encode(state)
+            guard data.count <= Self.maxBytes else {
+                Self.log.error("the window state is \(data.count) bytes, over \(Self.maxBytes); not saved")
+                defaults.removeObject(forKey: Self.key)
+                return
+            }
+            defaults.set(data, forKey: Self.key)
         } catch {
             Self.log.error("could not save the window state: \(String(describing: error), privacy: .public)")
         }
     }
 
-    /// The saved state, or `nil` if there is none or it cannot be read.
+    /// The saved state, or `nil` if there is none or it cannot be read,
+    /// is larger than ``maxBytes`` (not decoded) or has a window of more
+    /// than ``WindowState/maxTabs`` tabs.
     func load() -> WindowState? {
         guard let data = defaults.data(forKey: Self.key) else { return nil }
+        guard data.count <= Self.maxBytes else {
+            Self.log.error("ignoring a window state of \(data.count) bytes, over \(Self.maxBytes)")
+            return nil
+        }
         do {
             return try JSONDecoder().decode(WindowState.self, from: data)
         } catch {
