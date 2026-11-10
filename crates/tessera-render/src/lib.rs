@@ -21,7 +21,8 @@
 //! [`Renderer`] draws a [`FrameInput`] (rows of cells, cursor, selection,
 //! overlays; decoupled from the grid, so the caller picks the visible
 //! rows) in five passes: backgrounds, the selection and search overlays,
-//! glyphs, decorations and the cursor (ADR 0010). [`Palette`] resolves cell colors against the [`Theme`].
+//! glyphs, decorations and the cursor, then the exit-status marks in the
+//! left padding (ADR 0010). [`Palette`] resolves cell colors against the [`Theme`].
 //! [`RenderSurface::render`] presents a frame; [`OffscreenTarget::render`]
 //! draws one headless for the golden tests.
 //!
@@ -66,7 +67,8 @@ pub use font::{
     sanitize_font_size,
 };
 pub use frame::{
-    CursorShape, CursorState, FrameInput, Overlay, OverlayKind, Selection, SelectionKind,
+    CommandStatus, CursorShape, CursorState, FrameInput, GutterMark, Overlay, OverlayKind,
+    Selection, SelectionKind,
 };
 pub use gpu::Gpu;
 pub use offscreen::{

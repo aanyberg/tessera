@@ -5,10 +5,11 @@
 //! coverage, and the instances of its background, overlay, glyph and
 //! decoration quads. On the GPU the instance buffer is laid out as four
 //! sections (one per pass, in draw order) of one slot per row, then a slot
-//! for the cursor:
+//! for the cursor, whose instances are followed by the exit-status gutter
+//! marks' (each drawn as its own range of the slot):
 //!
 //! ```text
-//! [ bg row 0 | ... ][ overlay row 0 | ... ][ glyph row 0 | ... ][ deco row 0 | ... ][ cursor ]
+//! [ bg row 0 | ... ][ overlay row 0 | ... ][ glyph row 0 | ... ][ deco row 0 | ... ][ cursor, gutter ]
 //! ```
 //!
 //! A slot holds its row's instances followed by empty ones (zero-sized
@@ -65,7 +66,8 @@ pub(crate) struct Row {
 pub(crate) struct Slots {
     /// `rows[pass][row]`: the slot of `row` in `pass`'s section.
     rows: [Vec<Range<u32>>; ROW_PASSES],
-    /// The cursor's slot, after the sections.
+    /// The cursor's slot, after the sections; it also holds the gutter
+    /// marks, after the cursor's instances.
     cursor: Range<u32>,
 }
 

@@ -15,8 +15,9 @@ extension TesseraSession {
     /// prompt mark in the scrollback (a shell without integration) it pages
     /// instead, like ``ScrollTarget/pageUp`` and ``ScrollTarget/pageDown``,
     /// however long the history. The core reads at most 1 000 000 lines of
-    /// history per call: a prompt further away is not found and nothing
-    /// moves. Nothing moves on the alternate screen.
+    /// history per call, a chunk at a time: a prompt further away is not
+    /// found and nothing moves, but when that look finds no prompt at all
+    /// the call pages. Nothing moves on the alternate screen.
     @MainActor
     @discardableResult
     public func scrollToPrompt(previous: Bool) throws -> Bool {
@@ -44,6 +45,41 @@ extension TesseraSession {
     /// the history): cheap enough to enable Select Last Output in
     /// `validateMenuItem(_:)`. ``selectLastOutput()`` can still find nothing
     /// (after a resize moved the lines, say).
+    /// The finished command whose prompt is on the view's `row` (0 is the
+    /// top), as the exit-status mark in the left padding draws it (#45b,
+    /// ADR 0039), or `nil` when that row has no mark: no prompt there, the
+    /// command is running or ran nothing, the shell sends no marks, or the
+    /// row is outside the view. The exit status comes from the screen's
+    /// marks; the duration from the session's command records, which keep
+    /// the last 1000 commands and forget a command's lines when a resize
+    /// re-wraps the history, so ``CommandMark/duration`` is `nil` then.
+    @MainActor
+    public func commandMark(atRow row: UInt16) throws -> CommandMark? {
+        var mark = TesseraCommandMark()
+        try TesseraCoreError.check(tessera_session_command_at(core.pointer, id, row, &mark))
+        guard mark.found else { return nil }
+        return CommandMark(
+            exitCode: mark.exit_known ? mark.exit_code : nil,
+            duration: mark.duration_known ? .milliseconds(mark.duration_ms) : nil)
+    }
+
+    /// A finished command's exit-status mark: see ``commandMark(atRow:)``.
+    public struct CommandMark: Equatable, Sendable {
+        /// The status the shell reported (`D;<code>`), `nil` when it sent
+        /// none.
+        public var exitCode: Int32?
+        /// How long the command ran, `nil` when the session's records no
+        /// longer know it (too old, after a resize, or a command the shell
+        /// reported without its start).
+        public var duration: Duration?
+
+        /// A mark with these fields.
+        public init(exitCode: Int32?, duration: Duration?) {
+            self.exitCode = exitCode
+            self.duration = duration
+        }
+    }
+
     @MainActor
     public var hasCommandOutput: Bool {
         get throws {

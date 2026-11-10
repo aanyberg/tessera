@@ -1,7 +1,8 @@
 //! The overlay pass (selection, search matches, link underlines), the
 //! decorations added with it (underline styles and colour, overline,
-//! superscript and subscript) and the block cursor's redraw rules, drawn
-//! headless and checked pixel by pixel (ADR 0010).
+//! superscript and subscript), the block cursor's redraw rules and the
+//! exit-status gutter (#45b), drawn headless and checked pixel by pixel
+//! (ADR 0010).
 //!
 //! `TESSERA_SKIP_GPU_TESTS=1` skips the suite like the other GPU tests.
 
@@ -14,8 +15,8 @@
 
 use tessera_grid::{Cell, Color, DamageRows, GraphemeTable, Grid, Point, Style};
 use tessera_render::{
-    CursorShape, CursorState, FontConfig, FrameInput, Gpu, OffscreenTarget, Overlay, OverlayKind,
-    PhysicalSize, Renderer, Rgba, Selection, Shaper, Theme,
+    CommandStatus, CursorShape, CursorState, FontConfig, FrameInput, Gpu, GutterMark,
+    OffscreenTarget, Overlay, OverlayKind, PhysicalSize, Renderer, Rgba, Selection, Shaper, Theme,
 };
 
 const SKIP_VAR: &str = "TESSERA_SKIP_GPU_TESTS";
@@ -1499,4 +1500,85 @@ fn the_block_cursor_redraws_a_link_underline() {
         rgb(theme.cursor),
         1
     ));
+}
+
+// ------------------------------------------------------------ gutter
+
+/// #45b: a success mark, a failure mark and an unknown one land in the
+/// left padding of their rows, in the theme's colours (a configured
+/// success colour, the palette's red and bright black), as bars half the
+/// padding wide; the rows without a mark, every cell and the right padding
+/// are the pixels of the same frame without marks.
+#[test]
+fn gutter_marks_fill_the_left_padding_of_their_rows() {
+    let Some(gpu) = gpu() else { return };
+    let ok = Rgba::from_srgb8(0x12, 0xc0, 0x34);
+    let theme = Theme {
+        mark_success: Some(ok),
+        ..Theme::default()
+    };
+    let Some(mut renderer) = renderer_with(&gpu, theme.clone(), "Menlo", 2.0) else {
+        panic!("Menlo ships with macOS");
+    };
+    let rows: Vec<(&str, Style)> = ["$ true", "", "$ false", "$ x", "$ "]
+        .iter()
+        .map(|t| (*t, Style::DEFAULT))
+        .collect();
+    let screen = Screen::with(&rows, 12);
+    let target = Target::new(&gpu, &renderer, 5, 12);
+    let cells = screen.rows();
+    let marks = [
+        GutterMark::new(0, CommandStatus::Success),
+        GutterMark::new(2, CommandStatus::Failure),
+        GutterMark::new(3, CommandStatus::Unknown),
+    ];
+    let plain = target.draw(&gpu, &mut renderer, &FrameInput::new(&cells));
+    let marked = target.draw(
+        &gpu,
+        &mut renderer,
+        &FrameInput::new(&cells).with_gutter(&marks),
+    );
+    let pad = target.pad;
+    assert_eq!(pad, 8, "4 pt of padding at 2x");
+    let background = rgb(theme.background);
+    let expected = [
+        Some(rgb(ok)),
+        None,
+        Some(rgb(theme.ansi[1])),
+        Some(rgb(theme.ansi[8])),
+        None,
+    ];
+    for (row, want) in expected.iter().enumerate() {
+        let (_, y0) = target.origin(row as u32, 0);
+        for y in y0..y0 + target.cell[1] {
+            for x in 0..pad {
+                let bar = (2..6).contains(&x);
+                let want = match want {
+                    Some(color) if bar => *color,
+                    _ => background,
+                };
+                assert!(
+                    near(target.pixel(&marked, x, y), want, 1),
+                    "row {row} pixel ({x}, {y}): {:?}, want {want:?}",
+                    target.pixel(&marked, x, y)
+                );
+            }
+        }
+    }
+    for y in 0..target.size.height {
+        for x in pad..target.size.width {
+            assert_eq!(
+                target.pixel(&marked, x, y),
+                target.pixel(&plain, x, y),
+                "({x}, {y}) is not in the gutter"
+            );
+        }
+    }
+    // Dropping the marks again restores the frame without them.
+    let again = target.draw(
+        &gpu,
+        &mut renderer,
+        &FrameInput::new(&cells).with_damage(DamageRows::None),
+    );
+    assert!(again == plain, "the marks are gone");
 }

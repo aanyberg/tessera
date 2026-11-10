@@ -41,7 +41,8 @@ const INSTANCE_SIZE: u64 = std::mem::size_of::<Instance>() as u64;
 ///
 /// Each frame clears the target to [`Theme::background`] and draws the
 /// background, overlay (selection and search highlights), glyph,
-/// decoration and cursor passes in that order, from one instance buffer
+/// decoration and cursor passes in that order, then the exit-status marks
+/// in the left padding ([`FrameInput::gutter`]), from one instance buffer
 /// (ADR 0010). Rows keep their shaped glyphs and instances between
 /// frames: only the rows in [`FrameInput::damage`] are shaped and
 /// uploaded again, plus every row when the layout, theme, font size or
@@ -80,8 +81,12 @@ pub struct Renderer {
     slots: Slots,
     /// A CPU copy of the instance buffer, laid out by `slots`.
     mirror: Vec<Instance>,
-    /// The cursor's instances this frame.
+    /// The cursor's instances this frame, then the gutter marks': one
+    /// slot after the row sections holds both (see [`Slots`]).
     cursor: Vec<Instance>,
+    /// How many of [`Self::cursor`] are the cursor's; the rest are the
+    /// gutter's.
+    cursor_len: usize,
     /// A row copy with `HIDDEN` cells blanked, for shaping.
     shaping_row: Vec<Cell>,
     /// The frame's overlays grouped by row (indices into
@@ -231,6 +236,7 @@ impl Renderer {
                 slots: Slots::default(),
                 mirror: Vec::new(),
                 cursor: Vec::new(),
+                cursor_len: 0,
                 shaping_row: Vec::new(),
                 overlay_rows: Vec::new(),
                 spans: Vec::new(),
@@ -635,7 +641,10 @@ impl Renderer {
                     .map(|row| (row.shaped.as_slice(), row.spans.as_slice()))
             },
             &mut source,
-        )
+        )?;
+        self.cursor_len = self.cursor.len();
+        passes::gutter::push(&mut self.cursor, layout, &self.theme, frame);
+        Ok(())
     }
 
     /// Writes the rebuilt rows and the cursor into the instance buffer, or
@@ -728,12 +737,21 @@ impl Renderer {
             // EMPTY, and a pass that draws even those stores a
             // translucent clear one step off a pass that only clears
             // (Metal, #247), so a frame with nothing to draw draws nothing.
-            cursor: {
-                let slot = self.slots.cursor();
-                let used = u32::try_from(self.cursor.len()).unwrap_or(u32::MAX);
-                slot.start..slot.start.saturating_add(used).min(slot.end)
-            },
+            cursor: self.tail_range(0, self.cursor_len),
+            gutter: self.tail_range(self.cursor_len, self.cursor.len()),
         })
+    }
+
+    /// Instances `from..to` of [`Self::cursor`] in the buffer: within the
+    /// cursor's slot, never past it.
+    fn tail_range(&self, from: usize, to: usize) -> std::ops::Range<u32> {
+        let slot = self.slots.cursor();
+        let at = |n: usize| {
+            slot.start
+                .saturating_add(u32::try_from(n).unwrap_or(u32::MAX))
+                .min(slot.end)
+        };
+        at(from)..at(to)
     }
 
     /// Grows the instance buffer to hold `needed` instances; the new
@@ -1265,6 +1283,65 @@ mod tests {
         assert_eq!(draws(&tiny, at), 0, "nothing to draw: only the clear");
         assert_eq!(draws(&tiny, None), 0, "nor without a cursor");
         assert_eq!(draws(&target, at), 5, "and back");
+    }
+
+    /// #45b: the gutter marks are one more draw, after the cursor and over
+    /// exactly their instances, which follow the cursor's in its slot; a
+    /// frame without marks draws what it drew before, and marks on rows
+    /// the target does not show draw nothing.
+    #[test]
+    fn the_gutter_draw_follows_the_cursor_and_covers_only_its_marks() {
+        let Some((gpu, mut renderer, target)) = small_frame_renderer() else {
+            return;
+        };
+        let rows = [text_row("hello"), text_row("world")];
+        let rows = frame(&rows);
+        let at = Some(crate::CursorState::new(1, 2, crate::CursorShape::Block));
+        let marks = [
+            crate::GutterMark::new(0, crate::CommandStatus::Success),
+            crate::GutterMark::new(1, crate::CommandStatus::Failure),
+        ];
+        let prepare = |renderer: &mut Renderer, size, cursor, gutter| {
+            let layout = Layout::new(
+                renderer.shaper.cell_metrics(),
+                renderer.shaper.scale(),
+                renderer.theme.padding,
+                size,
+            );
+            let frame = FrameInput::new(&rows)
+                .with_cursor(cursor)
+                .with_gutter(gutter);
+            renderer.prepare(&gpu, &layout, &frame).expect("prepare")
+        };
+        let ranges = prepare(&mut renderer, target.size(), at, &marks);
+        assert_eq!(ranges.gutter.len(), 2, "one instance per mark");
+        assert_eq!(
+            ranges.gutter.start, ranges.cursor.end,
+            "right after the cursor"
+        );
+        assert!(ranges.gutter.end <= renderer.slots.cursor().end);
+        let hidden = prepare(&mut renderer, target.size(), None, &marks);
+        assert_eq!(
+            hidden.gutter,
+            renderer.slots.cursor().start..renderer.slots.cursor().start + 2
+        );
+        assert!(hidden.cursor.is_empty());
+        let bare = prepare(&mut renderer, target.size(), at, &[]);
+        assert!(bare.gutter.is_empty(), "no marks, no gutter instances");
+        let tiny = prepare(&mut renderer, PhysicalSize::new(40, 4), at, &marks);
+        assert!(tiny.gutter.is_empty(), "no visible row, no mark");
+
+        let mut draws = |cursor, gutter| {
+            let frame = FrameInput::new(&rows)
+                .with_cursor(cursor)
+                .with_gutter(gutter);
+            target.render(&gpu, &mut renderer, &frame).expect("render");
+            renderer.last_frame_draws
+        };
+        assert_eq!(draws(at, &marks), 6, "every pass and the gutter");
+        assert_eq!(draws(None, &marks), 5, "the gutter without a cursor");
+        assert_eq!(draws(at, &[]), 5, "no marks: the frame of before");
+        assert_eq!(draws(None, &[]), 4);
     }
 
     /// M1 (#22 review): 800 full-width overlays per row (link underlines

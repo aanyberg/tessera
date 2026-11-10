@@ -3,6 +3,7 @@
 use tessera_grid::Color;
 
 use crate::font::{DEFAULT_FAMILY, DEFAULT_FONT_SIZE_PT};
+use crate::frame::CommandStatus;
 use crate::palette::{ColorSlot, indexed_srgb};
 
 /// Linear-space RGBA color.
@@ -201,6 +202,14 @@ pub struct Theme {
     pub search_match_current: Rgba,
     /// The 16 ANSI colors.
     pub ansi: [Rgba; 16],
+    /// The gutter mark of a command that exited 0
+    /// ([`crate::CommandStatus::Success`]), or `None` for ANSI green
+    /// (`ansi[2]`). Drawn opaque.
+    pub mark_success: Option<Rgba>,
+    /// The gutter mark of a command that failed
+    /// ([`crate::CommandStatus::Failure`]), or `None` for ANSI red
+    /// (`ansi[1]`). Drawn opaque.
+    pub mark_failure: Option<Rgba>,
     /// Colors a program set for palette entries (OSC 4), by index: `Some`
     /// replaces entry `i` (an ANSI color, a cube color or a grey), drawn
     /// opaque. All `None` by default. A fixed table, so a program's
@@ -235,6 +244,21 @@ impl Theme {
             Color::Rgb(r, g, b) => Rgba::from_srgb8(r, g, b),
         }
     }
+
+    /// The colour of a gutter mark of `status`: [`Self::mark_success`] or
+    /// [`Self::mark_failure`], else the theme's ANSI green or red, and
+    /// ANSI 8 (bright black) for an unknown status; always opaque. The
+    /// theme's own palette, not a program's overrides of it
+    /// ([`Self::indexed_overrides`]): output does not recolour the marks.
+    #[must_use]
+    pub fn mark_color(&self, status: CommandStatus) -> Rgba {
+        let color = match status {
+            CommandStatus::Success => self.mark_success.unwrap_or(self.ansi[2]),
+            CommandStatus::Failure => self.mark_failure.unwrap_or(self.ansi[1]),
+            CommandStatus::Unknown => self.ansi[8],
+        };
+        color.with_alpha(1.0)
+    }
 }
 
 impl Default for Theme {
@@ -267,6 +291,8 @@ impl Default for Theme {
             search_match: srgb(0xff_d866).with_alpha(0.6),
             search_match_current: srgb(0xff_9f43).with_alpha(0.8),
             ansi,
+            mark_success: None,
+            mark_failure: None,
             indexed_overrides: [None; 256],
             padding: 4.0,
         }
@@ -381,6 +407,30 @@ mod tests {
                 [0xff, 0, 0xaf]
             );
         }
+    }
+
+    /// The marks default to the theme's ANSI green, red and bright black,
+    /// follow a theme's own palette, and the keys replace the first two,
+    /// opaque; a program's palette overrides do not reach them.
+    #[test]
+    fn mark_colors_default_to_the_palette() {
+        let mut theme = Theme::default();
+        assert_eq!(theme.mark_color(CommandStatus::Success), theme.ansi[2]);
+        assert_eq!(theme.mark_color(CommandStatus::Failure), theme.ansi[1]);
+        assert_eq!(theme.mark_color(CommandStatus::Unknown), theme.ansi[8]);
+        let teal = Rgba::from_srgb8(0, 0x80, 0x80);
+        theme.ansi[2] = teal;
+        theme.indexed_overrides[1] = Some(Rgba::WHITE);
+        assert_eq!(theme.mark_color(CommandStatus::Success), teal);
+        assert_eq!(theme.mark_color(CommandStatus::Failure), theme.ansi[1]);
+        let (ok, bad) = (Rgba::from_srgb8(1, 2, 3), Rgba::new(0.5, 0.0, 0.0, 0.25));
+        theme.mark_success = Some(ok);
+        theme.mark_failure = Some(bad);
+        assert_eq!(theme.mark_color(CommandStatus::Success), ok);
+        assert_eq!(
+            theme.mark_color(CommandStatus::Failure),
+            bad.with_alpha(1.0)
+        );
     }
 
     #[test]

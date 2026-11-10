@@ -4,8 +4,9 @@
  * with their OSC 133 marks around 30 plain lines on a 24-row screen, wait
  * (at most 5 s) until Select Last Output selects the last command's
  * output, then walk the prompts with tessera_session_scroll_to_prompt and
- * ask tessera_session_has_command_output, including NULL pointers and an
- * unknown session id.
+ * ask tessera_session_has_command_output and the exit-status marks'
+ * tessera_session_command_at, including NULL pointers and an unknown
+ * session id.
  */
 
 #include <stdio.h>
@@ -118,6 +119,34 @@ int main(void) {
     /* Next: the second prompt is on the live screen. */
     EXPECT_STEP(app, id, false, true, 0);
     EXPECT_STEP(app, id, false, false, 0);
+
+    /* The exit-status marks' hover (#45b): on the live screen row 21 is
+     * the second prompt (line 33), whose command exited 0; row 22 ("hi")
+     * and row 23 (the live prompt) have no mark. Scrolled to the top, row
+     * 0 is the first prompt. Whether a duration is known depends on how
+     * the output was chunked; when not, it is 0. */
+    TesseraCommandMark mark = {.found = false, .exit_code = -1, .duration_ms = 7};
+    EXPECT(tessera_session_command_at(app, id, 21, &mark), TESSERA_ERROR_OK);
+    EXPECT_TRUE(mark.found && mark.exit_known && mark.exit_code == 0);
+    EXPECT_TRUE(mark.duration_known || mark.duration_ms == 0);
+    for (uint16_t row = 22; row <= 24; row++) {
+        mark = (TesseraCommandMark){.found = true, .exit_known = true, .exit_code = 5};
+        EXPECT(tessera_session_command_at(app, id, row, &mark), TESSERA_ERROR_OK);
+        EXPECT_TRUE(!mark.found && !mark.exit_known && mark.exit_code == 0);
+        EXPECT_TRUE(!mark.duration_known && mark.duration_ms == 0);
+    }
+    EXPECT_STEP(app, id, true, true, 12);
+    mark = (TesseraCommandMark){.found = false};
+    EXPECT(tessera_session_command_at(app, id, 0, &mark), TESSERA_ERROR_OK);
+    EXPECT_TRUE(mark.found && mark.exit_known && mark.exit_code == 0);
+    mark = (TesseraCommandMark){.found = true};
+    EXPECT(tessera_session_command_at(NULL, id, 0, &mark), TESSERA_ERROR_NULL_POINTER);
+    EXPECT_TRUE(!mark.found);
+    EXPECT(tessera_session_command_at(app, id, 0, NULL), TESSERA_ERROR_NULL_POINTER);
+    mark = (TesseraCommandMark){.found = true};
+    EXPECT(tessera_session_command_at(app, id + 100, 0, &mark),
+           TESSERA_ERROR_SESSION_NOT_FOUND);
+    EXPECT_TRUE(!mark.found);
 
     /* NULL pointers and an unknown session id; the out value is false. */
     bool out = true;

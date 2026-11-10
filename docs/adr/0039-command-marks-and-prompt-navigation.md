@@ -1,6 +1,8 @@
 # ADR 0039: Command marks and prompt navigation
 
-**Status:** accepted · 2026-11-07
+**Status:** accepted · 2026-11-07 · amended 2026-11-08 (#45b: the
+exit-status gutter, its hover and a yield between scan holds; see
+"Amendment: #45b" at the end)
 
 ## Context
 
@@ -169,3 +171,134 @@ with no scan, so `validateMenuItem` can call it on every validation.
   Rejected: a `[keys]` table written for 0.1.0 that rebinds Page Up would
   then lose ⌘↑ paging, and the menu would show ⌘↑ on an item that pages
   only without marks.
+
+## Amendment: #45b (2026-11-08)
+
+### The exit-status gutter
+
+Each prompt row of a finished command gets a mark in the left padding: a
+bar in the theme's success or failure colour, or the palette's bright
+black when the shell reported no status. The renderer side (the
+`FrameInput::gutter` slice, the bar's geometry and colours) is in ADR
+0010's amendment; the theme keys in ADR 0019's.
+
+**Which rows (D-GUTTER-ROWS).** `commands::gutter` reads the grid, like
+navigation, never the record ring: per D-COALESCE the grid's `D` marks are
+complete and the ring is not. A row is marked when it is a prompt stop (a
+soft-wrapped prompt is one mark, on its first row) and its command
+finished: a `C` follows the prompt, then a `D` (its status) or the next
+prompt (status unknown, as D-MISSING-D) comes first. A prompt with no `C`
+before its end ran nothing (an empty Enter, Ctrl-C at the prompt) and gets
+no mark, and neither does a running command. A row's marks are read in the
+order they were set, so zsh's `D` before `A` on the next prompt's row
+ends the command above. The alternate screen has none.
+
+**Bounds (S5, S6).** The scan reads the rows in view and, only while a
+prompt in view is still open, at most `MAX_GUTTER_SCAN_LINES` (1024)
+lines below the view to find its end; a command that ends further down
+has no mark (the view is scrolled back over a very long output). It
+emits at most one mark per row in view, whatever the lines hold, so a
+`cat` of 100 000 marks draws at most a screenful. The snapshot runs it
+under the terminal lock it already holds for the capture, and only when
+something it depends on moved: the grid's damage generation (a mark
+damages its row), `scrollback_pushed`, `scrollback_len`, the offset, the
+line epoch and the alternate screen (`GutterKey`). An idle frame does not
+scan. The marks are overwritten in place in the snapshot's buffer, and a
+gutter generation that changes only when they differ tells the view to
+present a frame although no row in view was damaged (a `D` below the
+view's last row marks a prompt in view).
+
+**After a reflow (D-REFLOW).** The marks themselves follow the lines
+through a re-wrap, so the colours stay. The durations do not: a record of
+an older epoch has no lines, so the hover reports the status and an
+unknown duration.
+
+### The hover
+
+`App::command_mark_at(id, row)` returns the mark on row `row` of the view
+as it is scrolled now: `CommandMark { exit_code, duration }`, or `None`
+when the gutter draws nothing there. It runs the same scan, under the
+same bounds, and takes the status from it, so the hover always agrees
+with the colour. The duration comes from `command_at` on that line (S6:
+at most `MAX_COMMAND_RECORDS` records read, under the log's leaf lock),
+and only from a finished record whose prompt is that line and whose exit
+status is the mark's; otherwise it is `None` (a coalesced command, an
+older epoch, a record the ring dropped).
+
+**C API (S7).** `tessera_session_command_at(app, id, row, out)` fills a
+`TesseraCommandMark` (`found`, `exit_known`, `exit_code`,
+`duration_known`, `duration_ms`). It zeroes `*out` first, so every
+failure and every row without a mark reads `found = false`, and runs
+under `ffi_guard!`; `tests/c/prompts.c` covers a mark, rows without one,
+a scrolled view, `NULL` arguments and an unknown session. It logs nothing
+(S8).
+
+**The app.** `TerminalSurfaceView+Gutter.swift` lays out one AppKit
+tool-tip rect per visible row over the left padding, again when the
+padding, cell height, row count, scale or the view's height change. AppKit
+asks for the text when the pointer rests in one; it is built then from
+`TesseraSession.commandMark(atRow:)`: "Exit status 1" (or "unknown") and
+"Ran for 4.2 s" (or "Duration unknown"), in units that read the same in
+every locale. A row without a mark returns an empty string: no tip.
+Nothing is logged, and a failed call shows no tip.
+
+### A yield between scan holds (D-SCAN-LOCK, #334)
+
+The prompt scan now yields the thread after each hold of the terminal lock
+it continues past. The PTY reader locks the terminal directly and is not
+counted as a waiter, and `std::sync::Mutex` is not fair: without the yield
+the scanning thread took the lock straight back, and a long scan let the
+reader in only once or twice in its whole walk. With it, about 2000 small
+feeds land during a walk over 200 000 lines to the prompt (n19 asserts at
+least ten; the code before the yield gave one or two and fails it).
+
+### Measurements (#45b)
+
+See ADR 0010's amendment for the render passes. Below, `cargo xtask ab`
+against the merge base (ae6a701), 15 interleaved pairs at load 10-40,
+head / base, instructions then cycles. A case fills a 60x200 terminal
+with one wave-13 corpus line per row and then, per frame, feeds the next
+line (the screen scrolls by one). `none`: plain lines. `every row`: each
+line is `D;n`, `A`, `$ `, `B`, the text and `C`, so every row has a mark
+and every frame moves them all. Bars 1.02 (none) and 1.05 (every row).
+
+**`render_view`** (an offscreen view at 2x: capture under the lock, then
+a frame drawn and waited for; 80 frames, box drawing 240). All pass.
+
+| line | none | every row |
+|---|---|---|
+| ascii | 1.001 / 0.994 | 1.003 / 0.999 |
+| latin_diacritics | 1.000 / 0.971 | 1.004 / 1.013 |
+| cjk | 1.000 / 1.003 | 1.001 / 0.772 |
+| box_drawing | 1.001 / 0.990 | 1.008 / 1.008 |
+| hebrew | 0.998 / 0.995 | 1.002 / 0.996 |
+| arabic | 1.001 / 1.010 | 1.003 / 1.001 |
+| punctuation | 1.001 / 1.003 | 1.005 / 1.009 |
+| braille | 1.000 / 0.995 | 1.006 / 1.019 |
+| emoji | 0.999 / 1.003 | 1.003 / 1.005 |
+| sgr_heavy | 0.998 / 0.993 | 1.006 / 1.011 |
+| combining_heavy | 0.997 / 1.003 | 1.006 / 1.010 |
+
+**The capture alone** (`Snapshot::capture`, `rows` and `frame`, the part
+that holds the terminal lock; 40 000 frames). Without marks it is within
+1.02 but for emoji (1.022). With a mark on every row and every frame the
+gutter scan adds about 5 300 instructions a frame (60 rows of four marks
+each, about 90 instructions a row), 6-7 %, over the 1.05 bar on the
+cheap lines. The figures move by up to 6 % with no scan at all: with the
+scan stubbed out, emoji is 1.013 / 1.022 and combining_heavy 0.943, which
+is codegen moving in the row copies, not gutter work.
+
+| line | none | every row |
+|---|---|---|
+| ascii | 1.010 / 1.011 | 1.061 / 1.027 |
+| latin_diacritics | 1.010 / 1.009 | 1.061 / 1.046 |
+| cjk | 1.010 / 1.016 | 1.061 / 1.033 |
+| box_drawing | 1.010 / 0.987 | 1.062 / 1.040 |
+| hebrew | 1.011 / 1.015 | 1.066 / 1.039 |
+| arabic | 1.011 / 1.011 | 1.064 / 1.048 |
+| punctuation | 1.012 / 1.003 | 1.068 / 1.037 |
+| braille | 1.012 / 1.016 | 1.069 / 1.079 |
+| emoji | 1.022 / 1.024 | 1.020 / 1.029 |
+| sgr_heavy | 1.012 / 1.002 | 1.069 / 1.059 |
+| combining_heavy | 0.946 / 0.987 | 0.958 / 0.985 |
+

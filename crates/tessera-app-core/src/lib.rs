@@ -63,8 +63,8 @@ use tessera_term::{
 
 pub use accessibility::{AccessibleText, CellRect};
 pub use commands::{
-    CommandRecord, CommandState, MAX_COMMAND_RECORDS, MAX_PROMPT_SCAN_LINES,
-    PROMPT_SCAN_LINES_PER_LOCK,
+    CommandMark, CommandRecord, CommandState, MAX_COMMAND_RECORDS, MAX_GUTTER_SCAN_LINES,
+    MAX_PROMPT_SCAN_LINES, PROMPT_SCAN_LINES_PER_LOCK,
 };
 pub use input::{InputEvent, InputOutcome};
 pub use remote::{MAX_REMOTE_HOST_BYTES, Remote, SSH_PROBE_INTERVAL};
@@ -1289,6 +1289,20 @@ impl App {
         let session = self.session(id)?;
         let view = session.with_terminal(commands::LineView::of);
         Ok(session.reports().commands().command_at(line, view))
+    }
+
+    /// The exit-status mark on row `row` of session `id`'s view (the
+    /// gutter drawn in the left padding, #45b) and its command's duration,
+    /// for the mark's hover: `None` for a row with no mark. The exit
+    /// status is the one the mark is drawn for (from the grid); the
+    /// duration comes from the command records and is unknown after a
+    /// resize (ADR 0039).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn command_mark_at(&self, id: SessionId, row: u16) -> Result<Option<CommandMark>> {
+        Ok(commands::command_mark_at(&*self.session(id)?, row))
     }
 
     /// Session `id`'s scroll position: the offset ([`App::scroll_offset`]),

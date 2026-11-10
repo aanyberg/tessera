@@ -1,4 +1,4 @@
-//! The five grid passes and the instance data they share.
+//! The grid passes and the instance data they share.
 //!
 //! Every pass emits instanced quads into one [`Instance`] buffer; the
 //! passes are consecutive ranges of it, drawn in order with one pipeline
@@ -14,7 +14,9 @@
 //!    strikethrough;
 //! 5. [`cursor`]: the cursor shape, plus, under a block cursor, the glyphs
 //!    and decorations of its cell or cells redrawn in the cursor's text
-//!    color.
+//!    color;
+//! 6. [`gutter`]: the exit-status marks in the left padding, beside the
+//!    cells (so their order does not matter).
 //!
 //! Coordinates are physical pixels from the target's top-left corner.
 //! See ADR 0010 for the layout and the color pipeline.
@@ -23,6 +25,7 @@ pub(crate) mod background;
 pub(crate) mod cursor;
 pub(crate) mod decoration;
 pub(crate) mod glyph;
+pub(crate) mod gutter;
 pub(crate) mod overlay;
 
 use std::ops::Range;
@@ -202,17 +205,19 @@ pub(crate) struct PassRanges {
     pub glyph: Range<u32>,
     pub decoration: Range<u32>,
     pub cursor: Range<u32>,
+    pub gutter: Range<u32>,
 }
 
 impl PassRanges {
-    /// The five passes with their debug labels, in draw order.
-    pub fn labelled(&self) -> [(&'static str, Range<u32>); 5] {
+    /// The six passes with their debug labels, in draw order.
+    pub fn labelled(&self) -> [(&'static str, Range<u32>); 6] {
         [
             ("tessera.background", self.background.clone()),
             ("tessera.overlay", self.overlay.clone()),
             ("tessera.glyph", self.glyph.clone()),
             ("tessera.decoration", self.decoration.clone()),
             ("tessera.cursor", self.cursor.clone()),
+            ("tessera.gutter", self.gutter.clone()),
         ]
     }
 }
