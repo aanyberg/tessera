@@ -257,8 +257,10 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
         paneContainer.equalize()
     }
 
-    /// Moving the views between split views can leave the window itself
-    /// first responder; gives the keyboard back to the focused pane.
+    /// After maximizing or showing every pane again: while the window
+    /// itself holds the keyboard (nothing in the tab had it), the focused
+    /// pane gets it. A first responder in the tab keeps it, a find field's
+    /// included: the views move without taking it (``PaneContainerView``).
     private func refocusAfterMovingViews() {
         guard let window, window.firstResponder === window || window.firstResponder == nil else { return }
         window.makeFirstResponder(focusedPane.view)
@@ -662,6 +664,16 @@ final class TerminalWindow: NSWindow {
     override func addTabbedWindow(_ window: NSWindow, ordered: NSWindow.OrderingMode) {
         (windowController as? TerminalWindowController)?.unzoom()
         super.addTabbedWindow(window, ordered: ordered)
+    }
+
+    /// ⌘W while the keyboard is outside the panes (the window itself is the
+    /// first responder, so the validation does not pass a
+    /// ``PaneContainerView``): it closes the tab, and says so.
+    override func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(performClose(_:)) {
+            menuItem.title = PaneContainerView.closeTabTitle
+        }
+        return super.validateMenuItem(menuItem)
     }
 
     /// ⇧⌘]: the next tab, the first after the last.

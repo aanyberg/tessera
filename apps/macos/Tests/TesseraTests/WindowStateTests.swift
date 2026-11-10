@@ -517,6 +517,166 @@ final class WindowStateTests: XCTestCase {
         }
     }
 
+    // MARK: Follow-ups (#323)
+
+    private static let twoPanes = #"{"split":{"direction":"right","ratio":0.5,"first":{"leaf":{}},"second":{"leaf":{}}}}"#
+
+    /// A `tabs` that cannot be read leaves the window with one pane per
+    /// tab (the state is kept), and a tree that cannot be read leaves its
+    /// tab one pane while the window's other tabs keep theirs.
+    func testAnUnreadableTabsListOrTreeKeepsTheWindowAndItsOtherTabs() throws {
+        let store = WindowStateStore(defaults: defaults)
+        func load(_ tabs: String) -> WindowState? {
+            let json = #"{"windows":[{"frame":[[40,60],[700,450]],"tabCount":2,"tabs":"# + tabs + "}]}"
+            defaults.set(Data(json.utf8), forKey: WindowStateStore.key)
+            return store.load()
+        }
+        let unreadableLists = [
+            ("tabs not a list", #""tabs""#),
+            ("tabs an object", "{}"),
+            ("a tab not an object", "[5,{\"tree\":\(Self.twoPanes)}]"),
+        ]
+        for (name, tabs) in unreadableLists {
+            let window = try XCTUnwrap(load(tabs)?.windows.first, "\(name): the window is kept")
+            XCTAssertEqual(window.tabCount, 2, name)
+            XCTAssertNil(window.tabs, "\(name): one pane per tab")
+        }
+        let unreadableTrees = [
+            ("a leaf not an object", #"{"leaf":5}"#),
+            ("a ratio as a string", #"{"split":{"direction":"right","ratio":"nan","first":{"leaf":{}},"second":{"leaf":{}}}}"#),
+            ("an unknown direction", #"{"split":{"direction":"up","ratio":0.5,"first":{"leaf":{}},"second":{"leaf":{}}}}"#),
+            ("a split without a child", #"{"split":{"direction":"right","ratio":0.5,"first":{"leaf":{}}}}"#),
+            ("neither leaf nor split", #"{"pane":{}}"#),
+        ]
+        for (name, tree) in unreadableTrees {
+            let window = try XCTUnwrap(
+                load("[{\"tree\":\(tree)},{\"tree\":\(Self.twoPanes)}]")?.windows.first, "\(name): the window is kept")
+            XCTAssertNil(window.layout(ofTab: 0), "\(name): its tab is one pane")
+            XCTAssertEqual(window.layout(ofTab: 1)?.leafCount, 2, "\(name): the other tab keeps its panes")
+        }
+    }
+
+    /// S5: a saved value over 1 MiB is not decoded: one of 59 MB (a full
+    /// tree 12 splits deep per window, which decoded took about 7 s and
+    /// 540 MB) loads as nothing in under 50 ms, so the default window opens.
+    /// One of exactly 1 MiB is read.
+    func testAStateOverOneMebibyteIsNotDecoded() throws {
+        let store = WindowStateStore(defaults: defaults)
+        var tree = #"{"leaf":{}}"#
+        for _ in 0..<12 {
+            tree = #"{"split":{"direction":"right","ratio":0.5,"first":"# + tree + #","second":"# + tree + "}}"
+        }
+        let window = #"{"frame":[[40,60],[700,450]],"tabCount":1,"tabs":[{"tree":"# + tree + "}]}"
+        let count = 59_000_000 / window.utf8.count + 1
+        let blob = Data(("{\"windows\":[" + Array(repeating: window, count: count).joined(separator: ",") + "]}").utf8)
+        XCTAssertGreaterThanOrEqual(blob.count, 59_000_000)
+        defaults.set(blob, forKey: WindowStateStore.key)
+        let start = ContinuousClock.now
+        let loaded = store.load()
+        let elapsed = ContinuousClock.now - start
+        XCTAssertNil(loaded)
+        XCTAssertLessThan(elapsed, .milliseconds(50), "\(blob.count) bytes took \(elapsed)")
+        XCTAssertFalse(appDelegate.restoreWindows(from: loaded, screens: [Self.screen]), "the default window opens")
+        XCTAssertTrue(appDelegate.windowControllers.isEmpty)
+
+        // At the cap, padded with white space: read; a byte more: not.
+        let small = #"{"windows":[{"frame":[[40,60],[700,450]],"tabCount":3}]}"#
+        let padded = small + String(repeating: " ", count: WindowStateStore.maxBytes - small.utf8.count)
+        defaults.set(Data(padded.utf8), forKey: WindowStateStore.key)
+        XCTAssertEqual(store.load()?.windows.first?.tabCount, 3, "exactly 1 MiB")
+        defaults.set(Data((padded + " ").utf8), forKey: WindowStateStore.key)
+        XCTAssertNil(store.load(), "a byte over 1 MiB")
+    }
+
+    /// S5: a window of more than 64 tabs, by its count or its list, makes
+    /// the state unreadable; one of 64 is read. A window of more is saved
+    /// with its first 64, so the app never saves what it cannot read.
+    func testAWindowOfMoreThanSixtyFourTabsIsRefusedAndNeverSaved() throws {
+        let store = WindowStateStore(defaults: defaults)
+        func load(tabCount: Int, listed: Int?) -> WindowState? {
+            let tabs = listed.map {
+                #","tabs":["# + Array(repeating: "{\"tree\":\(Self.twoPanes)}", count: $0).joined(separator: ",") + "]"
+            }
+            let json = #"{"windows":[{"frame":[[40,60],[700,450]],"tabCount":"# + "\(tabCount)" + (tabs ?? "") + "}]}"
+            defaults.set(Data(json.utf8), forKey: WindowStateStore.key)
+            return store.load()
+        }
+        XCTAssertEqual(load(tabCount: 64, listed: 64)?.windows.first?.tabs?.count, 64, "64 tabs")
+        XCTAssertEqual(load(tabCount: 64, listed: nil)?.windows.first?.tabCount, 64, "64 tabs, no list")
+        XCTAssertNil(load(tabCount: 65, listed: nil), "a count of 65")
+        XCTAssertNil(load(tabCount: 1_000_000, listed: nil), "a count of a million")
+        XCTAssertNil(load(tabCount: 64, listed: 65), "a list of 65")
+        XCTAssertNil(load(tabCount: 1, listed: 10_000), "a list of 10,000")
+
+        let frame = CGRect(x: 40, y: 60, width: 700, height: 450)
+        let many = WindowState(windows: [
+            .init(frame: frame, tabCount: 100, tabs: Array(repeating: .init(tree: Self.threePanes), count: 100))
+        ])
+        XCTAssertEqual(many.windows[0].tabCount, 64)
+        XCTAssertEqual(many.windows[0].tabs?.count, 64)
+        store.save(many)
+        XCTAssertEqual(store.load(), many, "saved and read back")
+    }
+
+    /// A state the store would refuse to read is not saved: the old one
+    /// goes, so the next launch opens the default window, not stale ones.
+    func testAStateOverOneMebibyteIsNotSaved() throws {
+        let store = WindowStateStore(defaults: defaults)
+        let frame = CGRect(x: 40, y: 60, width: 700, height: 450)
+        let small = WindowState(windows: [.init(frame: frame, tabCount: 2)])
+        store.save(small)
+        XCTAssertEqual(store.load(), small)
+        let tab = WindowState.Tab(tree: Self.balanced(16))
+        let big = WindowState(
+            windows: Array(repeating: .init(frame: frame, tabCount: 64, tabs: Array(repeating: tab, count: 64)), count: 20))
+        XCTAssertGreaterThan(try JSONEncoder().encode(big).count, WindowStateStore.maxBytes)
+        let saves = defaults.stateSaves
+        store.save(big)
+        XCTAssertEqual(defaults.stateSaves, saves, "not written")
+        XCTAssertNil(defaults.object(forKey: WindowStateStore.key), "the old state is gone")
+        XCTAssertNil(store.load())
+    }
+
+    /// The saved layouts follow the tab bar's order after a tab moves.
+    func testALayoutFollowsItsTabWhenTheTabsAreReordered() throws {
+        let first = try appDelegate.newWindow()
+        let window = try XCTUnwrap(first.window)
+        let second = try appDelegate.newTab(in: window)
+        let secondWindow = try XCTUnwrap(second.window)
+        secondWindow.setContentSize(NSSize(width: 900, height: 600))
+        XCTAssertNotNil(try second.splitFocusedPane(.below))
+        let group = try XCTUnwrap(window.tabGroup)
+        XCTAssertTrue(group.windows.last === secondWindow, "the split tab is second")
+        var state = appDelegate.currentWindowState()
+        XCTAssertNil(state.windows.first?.layout(ofTab: 0))
+        XCTAssertEqual(state.windows.first?.layout(ofTab: 1)?.leafCount, 2)
+
+        group.removeWindow(secondWindow)
+        group.insertWindow(secondWindow, at: 0)
+        XCTAssertTrue(group.windows.first === secondWindow, "the split tab is first now: \(group.windows)")
+        state = appDelegate.currentWindowState()
+        XCTAssertEqual(state.windows.count, 1)
+        XCTAssertEqual(state.windows.first?.layout(ofTab: 0)?.leafCount, 2, "the split tab's layout comes first")
+        XCTAssertNil(state.windows.first?.layout(ofTab: 1))
+    }
+
+    /// A restored layout and Equalize Panes each save the state.
+    func testARestoredLayoutAndEqualizingSaveTheState() async throws {
+        let store = WindowStateStore(defaults: defaults)
+        let controller = try appDelegate.newWindow()
+        controller.window?.setContentSize(NSSize(width: 900, height: 600))
+        appDelegate.windowStateStore = store
+        func savedRatio() -> Double? {
+            guard case .split(_, let ratio, _, _) = store.load()?.windows.first?.layout(ofTab: 0) else { return nil }
+            return ratio
+        }
+        try controller.restoreLayout(.split(.right, ratio: 0.3, first: .leaf, second: .leaf))
+        XCTAssertEqual(controller.panes.count, 2)
+        try await waitUntil("the restored layout is saved") { savedRatio().map { abs($0 - 0.3) < 1e-9 } ?? false }
+        controller.equalizePanes(nil)
+        try await waitUntil("the equalised ratio is saved") { savedRatio() == 0.5 }
+    }
+
     /// Polls `condition`, letting the main actor run, until it holds or
     /// `timeout` passes.
     private func waitUntil(

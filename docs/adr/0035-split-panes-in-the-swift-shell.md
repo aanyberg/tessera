@@ -90,7 +90,7 @@ spatial neighbours) are generic over the leaf and tested without AppKit.
 
 Window state restore keeps each tab's pane tree since #38b (ADR 0031).
 
-### Maximize, dim, equalise and restore (#38b, amended 2026-11-07)
+### Maximize, dim, equalise and restore (#38b, amended 2026-11-07 and for #323, 2026-11-10)
 
 - **Maximize.** `zoom_pane` (⌘⇧↩, Shell ▸ Maximize Pane, checked while
   on) shows the focused pane alone over the whole tab and toggles back.
@@ -104,7 +104,13 @@ Window state restore keeps each tab's pane tree since #38b (ADR 0031).
   meanwhile (then laid out as for a resize). A split, a close, a focus move (⌘⌥ and an arrow,
   ⌘[ and ⌘], or focusing another pane) and a new tab added to the window
   show every pane first. A tab with one pane cannot be maximized
-  (a beep). The state is not saved.
+  (a beep). The state is not saved. The pane's view moves out of the
+  split views before they are hidden, as hiding a view takes the
+  keyboard from a first responder inside it: the pane keeps the keyboard
+  and a marked-text composition, a DECSET 1004 child gets no focus-out
+  and focus-in reports, and a find field with the keyboard keeps it.
+  Only while the window itself holds the keyboard does the focused pane
+  get it (#323).
 - **Dim.** `[appearance] dim_inactive_panes` (0.0 to 0.8, default 0.0
   for off; the core clamps a value out of range or not a number, with a
   load warning, and ignores it in a profile) is drawn as a black
@@ -125,10 +131,14 @@ Window state restore keeps each tab's pane tree since #38b (ADR 0031).
   size to the core per display refresh, and its last size at the end, as
   in a live window resize (the first version of this ADR said a drag
   resized on every step; it did not). A test drags through AppKit's
-  tracking and pins it (#315).
+  tracking and pins it (#315). The drag saves the window state once,
+  when the button is up and a divider moved, not per step (#323).
 - **⌘W's title** reads Close Pane while the focused tab has more than one
   pane (validated from the `PaneContainerView`), Close Tab otherwise, and
-  goes back to Close Tab when the window stops being key or closes.
+  goes back to Close Tab when the window stops being key or closes. While
+  the keyboard is outside the panes (the window itself is first
+  responder), the `TerminalWindow` validates it as Close Tab, which is
+  what ⌘W then does (#323).
 - **Commands.** The pane items (split_right, split_down,
   focus_pane_left/right/up/down, focus_pane_previous/next, zoom_pane,
   equalize_panes) are registry commands with their item's identifier, so

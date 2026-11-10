@@ -205,16 +205,20 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
             let slot = pane.view.superview, slot !== self
         else { return false }
         zoomedPane = pane
-        root.autoresizingMask = []
-        root.isHidden = true
         let standIn = NSView(frame: pane.view.frame)
         standIn.autoresizingMask = []
         slot.addSubview(standIn, positioned: .below, relativeTo: pane.view)
         self.standIn = standIn
-        // Within the window, so its surface stays attached.
+        // Within the window, so its surface stays attached; and out of the
+        // split views before they are hidden, since hiding a view takes
+        // the keyboard from a first responder inside it: the child would
+        // get a focus-out and focus-in report (DECSET 1004), a composition
+        // would be dropped and a find field would lose the keyboard.
         addSubview(pane.view)
         pane.view.frame = bounds
         pane.view.autoresizingMask = [.width, .height]
+        root.autoresizingMask = []
+        root.isHidden = true
         updateDimming()
         return true
     }
@@ -276,6 +280,25 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
     /// The tree's shape or ratios changed: the window state is saved.
     private func layoutDidChange() {
         (window?.windowController as? TerminalWindowController)?.paneLayoutDidChange()
+    }
+
+    /// While a divider drag tracks: whether it has moved a divider yet.
+    /// The drag saves the window state once, at its end, not per step.
+    private var dividerDragMoved: Bool?
+
+    /// A ``PaneSplitView`` starts tracking a divider drag.
+    fileprivate func dividerDragWillBegin() {
+        dividerDragMoved = false
+    }
+
+    /// The drag ended (the button is up): the window state is saved if a
+    /// divider moved.
+    fileprivate func dividerDragDidEnd() {
+        let moved = dividerDragMoved == true
+        dividerDragMoved = nil
+        if moved {
+            layoutDidChange()
+        }
     }
 
     // MARK: Dimming
@@ -511,7 +534,8 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
     }
 
     /// A divider drag sets its split's ratio in the tree to the share the
-    /// drag left, so later resizes and rebuilds keep it. AppKit names a
+    /// drag left, so later resizes and rebuilds keep it, and the window
+    /// state is saved (at the end of a drag tracked by AppKit). AppKit names a
     /// divider on a resize too, so a drag is told apart by the first
     /// child's length: a resize leaves the one ``firstLength(in:ratio:)``
     /// gives for the stored ratio, and keeps that ratio.
@@ -526,7 +550,11 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
         guard space > 0, abs(first - firstLength(in: splitView, ratio: ratios[index])) >= 0.5 else { return }
         ratios[index] = first / space
         tree.setRatios(ratios)
-        layoutDidChange()
+        if dividerDragMoved != nil {
+            dividerDragMoved = true
+        } else {
+            layoutDidChange()
+        }
     }
 
     /// The length of a split's first child at `ratio` of the space the
@@ -562,7 +590,8 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
     /// pane, Close Tab otherwise (#315). The title stays until the next
     /// validation; ``TerminalWindowController`` puts Close Tab back when
     /// its window stops being key, so another window's menu never shows a
-    /// pane's title.
+    /// pane's title, and ``TerminalWindow`` while the keyboard is outside
+    /// the panes (the window itself holds it), where ⌘W closes the tab.
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if menuItem.action == #selector(performClose(_:)) {
             menuItem.title = panes.count > 1 ? Self.closePaneTitle : Self.closeTabTitle
@@ -575,7 +604,8 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
 /// the tree's geometry knows it.
 ///
 /// A double-click on the divider equalises the split; a drag passes each
-/// pane's size to the core at most once a display refresh (#315).
+/// pane's size to the core at most once a display refresh (#315) and saves
+/// the window state once, when it ends.
 @MainActor
 final class PaneSplitView: NSSplitView {
     static let thickness: CGFloat = 1
@@ -586,13 +616,17 @@ final class PaneSplitView: NSSplitView {
     /// its children cover the rest. A double click equalises the split; a
     /// drag is AppKit's, which tracks it inside `super` as a live resize of
     /// every view under this split view, so each pane passes at most one
-    /// size to the core per display refresh (#315).
+    /// size to the core per display refresh (#315). `super` returns once the
+    /// button is up: the drag's new ratio is saved then.
     override func mouseDown(with event: NSEvent) {
-        if event.clickCount == 2, let container = delegate as? PaneContainerView {
+        let container = delegate as? PaneContainerView
+        if event.clickCount == 2, let container {
             container.equalize(self)
             return
         }
+        container?.dividerDragWillBegin()
         super.mouseDown(with: event)
+        container?.dividerDragDidEnd()
     }
 }
 
