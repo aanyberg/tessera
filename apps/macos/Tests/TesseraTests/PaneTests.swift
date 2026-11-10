@@ -1758,6 +1758,24 @@ final class PaneDimmingConfigTests: XCTestCase {
 
 // MARK: - Pane follow-ups (#323)
 
+/// Runs a test's steps from a Timer, which can fire inside AppKit's
+/// tracking loops (in the event-tracking mode), until a step sets
+/// ``step`` to 3.
+@MainActor
+private final class DragDriver: NSObject {
+    var step = 0
+    var failure: String?
+    var onTick: (() -> Void)?
+
+    @objc func fire(_ timer: Timer) {
+        onTick?()
+        if step == 3 {
+            timer.invalidate()
+            onTick = nil
+        }
+    }
+}
+
 /// Stands between a tab and the app delegate: counts the layout changes
 /// (each asks for a window-state save) and the panes closed, and can make
 /// the spawns past a number fail; everything else goes to the app.
@@ -1981,6 +1999,303 @@ extension PaneTests {
         NSApp.postEvent(try event(.leftMouseUp, x: frame(of: left, in: controller).maxX + 0.5), atStart: false)
         outer.mouseDown(with: try event(.leftMouseDown, x: frame(of: left, in: controller).maxX + 0.5))
         XCTAssertEqual(proxy.layoutChanges, 1, "a click without a move")
+    }
+
+    /// A pane's shell exiting during a divider drag (#371), with the events
+    /// posted to NSApp's queue and the press dispatched from the run loop,
+    /// so that AppKit's tracking loop takes the drag's events from the queue
+    /// as for a real drag, and the shell's exit arrives inside it; a Timer
+    /// in the event-tracking mode drives the drag. The tree changes at once, the split views only when
+    /// the drag ends: AppKit raised (`objectAtIndex:` beyond bounds) on the
+    /// next step after a rebuild, which ended the drag without
+    /// ``PaneContainerView/dividerDragDidEnd(_:)``. The outer split survives
+    /// the close, so the drag's last position is its ratio, and saved.
+    func testAPaneClosingDuringADividerDragLetsTheDragEndAndKeepsItsRatio() async throws {
+        // Weak, assigned (not initialised) so that Swift 6.1 does not ask
+        // for a `weak let`, which it does not have. The test's own pool
+        // would keep the split views, autoreleased by the layouts, and with
+        // them the closed pane's view.
+        weak var closing: Pane?
+        weak var closingView: TerminalSurfaceView?
+        let (controller, left, topRight) = try autoreleasepool {
+            let controller = try openTab()
+            let left = controller.focusedPane
+            let topRight = try split(controller, .right)
+            let bottomRight = try split(controller, .below)
+            closing = bottomRight
+            closingView = bottomRight.view
+            XCTAssertTrue(controller.paneContainer.subviews.first is PaneSplitView)
+            return (controller, left, topRight)
+        }
+        try skipUnlessAttached(controller)
+        let proxy = PaneHostProxy(app: appDelegate)
+        controller.delegate = proxy
+        let defaults = try XCTUnwrap(CountingDefaults(suiteName: "com.aanyberg.tessera.tests.\(UUID().uuidString)"))
+        let store = WindowStateStore(defaults: defaults)
+        appDelegate.windowStateStore = store
+        defer {
+            appDelegate.windowStateStore = nil
+            controller.delegate = appDelegate
+        }
+        let container = controller.paneContainer
+        let window = try XCTUnwrap(controller.window)
+        let start = autoreleasepool { frame(of: left, in: controller).maxX + 0.5 }
+        let windowNumber = window.windowNumber
+        // Not through the split view, which the drag's end drops.
+        let toWindow = { (x: CGFloat) in container.convert(NSPoint(x: x, y: 200), to: nil) }
+        @MainActor func post(_ type: NSEvent.EventType, x: CGFloat) {
+            guard
+                let event = NSEvent.mouseEvent(
+                    with: type, location: toWindow(x), modifierFlags: [],
+                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: windowNumber, context: nil,
+                    eventNumber: 0, clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1)
+            else { return XCTFail("no \(type) event") }
+            NSApp.postEvent(event, atStart: false)
+        }
+
+        /// 0: wait for the drag to track, then drag 100 points; 1: once the
+        /// divider moved, exit the bottom right shell; 2: once its pane is
+        /// gone from the tree, drag 100 more and let go; 3: done.
+        let driver = DragDriver()
+        let deadline = ContinuousClock.now + .seconds(10)
+        driver.onTick = { [unowned driver] in
+            guard ContinuousClock.now < deadline else {
+                driver.failure = "timed out at step \(driver.step)"
+                post(.leftMouseUp, x: start - 200)
+                return driver.step = 3
+            }
+            switch driver.step {
+            case 0 where container.isTrackingDividerDrag:
+                for step in 1...10 { post(.leftMouseDragged, x: start - CGFloat(10 * step)) }
+                driver.step = 1
+            case 1 where self.frame(of: left, in: controller).maxX < start - 50:
+                do {
+                    try closing?.session.write(Array("exit\n".utf8))
+                } catch {
+                    driver.failure = "write: \(error)"
+                }
+                driver.step = 2
+            case 2 where controller.panes.count == 2:
+                XCTAssertTrue(container.isTrackingDividerDrag, "the pane closed while the drag tracked")
+                for step in 11...20 { post(.leftMouseDragged, x: start - CGFloat(10 * step)) }
+                post(.leftMouseUp, x: start - 200)
+                driver.step = 3
+            default:
+                break
+            }
+        }
+        let timer = Timer(
+            timeInterval: 0.01, target: driver, selector: #selector(DragDriver.fire(_:)), userInfo: nil, repeats: true)
+        RunLoop.main.add(timer, forMode: .eventTracking)
+        defer { timer.invalidate() }
+        // The press is posted and dispatched as NSApp's loop does, from a
+        // Timer (not the main queue, whose blocks would wait for it, nor
+        // the test's task), in a pool of its own: the test's would keep
+        // what the drag autoreleases, the closed pane's view with it.
+        let downDriver = DragDriver()
+        downDriver.onTick = { [unowned downDriver] in
+            autoreleasepool {
+                post(.leftMouseDown, x: start)
+                if let event = NSApp.nextEvent(
+                    matching: .leftMouseDown, until: .distantPast, inMode: .default, dequeue: true)
+                {
+                    NSApp.sendEvent(event)
+                } else {
+                    downDriver.failure = "the press was not queued"
+                }
+            }
+            downDriver.step = 3
+        }
+        RunLoop.main.add(
+            Timer(
+                timeInterval: 0, target: downDriver, selector: #selector(DragDriver.fire(_:)), userInfo: nil,
+                repeats: true),
+            forMode: .default)
+
+        try await waitUntil("the drag ends") {
+            driver.failure != nil || (driver.step == 3 && !container.isTrackingDividerDrag)
+        }
+        XCTAssertNil(downDriver.failure)
+        XCTAssertNil(driver.failure)
+        XCTAssertEqual(controller.panes, [left, topRight])
+        XCTAssertNil(closingView?.window, "the closed pane's view left the tab")
+        let width = frame(of: left, in: controller).maxX
+        XCTAssertEqual(width, start - 200.5, accuracy: 1, "the divider is where the drag let go")
+        let ratio = container.tree.root.splits[0].ratio
+        let space = container.bounds.width - PaneSplitView.thickness
+        XCTAssertEqual(ratio * space, width, accuracy: 1, "the tree keeps the drag's ratio")
+        try await waitUntil("the drag's ratio is saved") {
+            guard case .split(_, let saved, _, _) = store.load()?.windows.first?.layout(ofTab: 0) else { return false }
+            return abs(saved - Double(ratio)) < 1e-9
+        }
+        try? await waitUntil("the closed pane is freed", timeout: .seconds(5)) { closing == nil && closingView == nil }
+        XCTAssertNil(closing, "pane")
+        XCTAssertNil(closingView, "view")
+    }
+
+    /// Presses on the divider at `x` (in `container`'s coordinates), as
+    /// ``testAPaneClosingDuringADividerDragLetsTheDragEndAndKeepsItsRatio()``
+    /// does, and runs `steps` in turn from an event-tracking Timer: each is
+    /// retried every 10 ms until it returns `true`, and gets a function that
+    /// posts a mouse event at an x. Returns once every step ran and the
+    /// drag stopped tracking (or the container is gone).
+    private func trackDividerDrag(
+        at x: CGFloat, in container: PaneContainerView, window: NSWindow,
+        steps: [(_ post: (NSEvent.EventType, CGFloat) -> Void) -> Bool]
+    ) async throws {
+        weak var weakContainer: PaneContainerView?
+        weakContainer = container
+        let windowNumber = window.windowNumber
+        let toWindow = { (x: CGFloat) in weakContainer?.convert(NSPoint(x: x, y: 200), to: nil) ?? .zero }
+        let post = { (type: NSEvent.EventType, x: CGFloat) in
+            guard
+                let event = NSEvent.mouseEvent(
+                    with: type, location: toWindow(x), modifierFlags: [],
+                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: windowNumber, context: nil,
+                    eventNumber: 0, clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1)
+            else { return XCTFail("no \(type) event") }
+            NSApp.postEvent(event, atStart: false)
+        }
+        let driver = DragDriver()
+        let deadline = ContinuousClock.now + .seconds(10)
+        var next = 0
+        driver.onTick = { [unowned driver] in
+            guard ContinuousClock.now < deadline else {
+                driver.failure = "timed out at step \(next)"
+                post(.leftMouseUp, x)
+                return driver.step = 3
+            }
+            guard weakContainer?.isTrackingDividerDrag == true, steps[next](post) else { return }
+            next += 1
+            if next == steps.count { driver.step = 3 }
+        }
+        let timer = Timer(
+            timeInterval: 0.01, target: driver, selector: #selector(DragDriver.fire(_:)), userInfo: nil, repeats: true)
+        RunLoop.main.add(timer, forMode: .eventTracking)
+        defer { timer.invalidate() }
+        let downDriver = DragDriver()
+        downDriver.onTick = { [unowned downDriver] in
+            autoreleasepool {
+                post(.leftMouseDown, x)
+                if let event = NSApp.nextEvent(
+                    matching: .leftMouseDown, until: .distantPast, inMode: .default, dequeue: true)
+                {
+                    NSApp.sendEvent(event)
+                } else {
+                    downDriver.failure = "the press was not queued"
+                }
+            }
+            downDriver.step = 3
+        }
+        RunLoop.main.add(
+            Timer(
+                timeInterval: 0, target: downDriver, selector: #selector(DragDriver.fire(_:)), userInfo: nil,
+                repeats: true),
+            forMode: .default)
+        try await waitUntil("the drag ends") {
+            driver.failure != nil || (driver.step == 3 && weakContainer?.isTrackingDividerDrag != true)
+        }
+        XCTAssertNil(downDriver.failure)
+        XCTAssertNil(driver.failure)
+    }
+
+    /// Every pane's shell exiting during a divider drag (#371): the last
+    /// one closes the window, whose views leave it only once the drag has
+    /// ended. Taking them out inside AppKit's tracking loop raised as a
+    /// rebuild did, and skipped ``PaneContainerView/dividerDragDidEnd(_:)``.
+    func testEveryPaneClosingDuringADividerDragLetsTheDragEndAndFreesTheTab() async throws {
+        struct WeakRef {
+            weak var object: AnyObject?
+        }
+        weak var weakController: TerminalWindowController?
+        weak var weakContainer: PaneContainerView?
+        var weakViews: [WeakRef] = []
+        let (initialSessions, start) = try autoreleasepool {
+            let controller = try openTab()
+            _ = try split(controller, .right)
+            try skipUnlessAttached(controller)
+            weakController = controller
+            weakContainer = controller.paneContainer
+            weakViews = controller.panes.map { WeakRef(object: $0.view) }
+            return (controller.panes.map(\.session), frame(of: controller.panes[0], in: controller).maxX + 0.5)
+        }
+        var sessions = initialSessions
+        try await trackDividerDrag(
+            at: start, in: try XCTUnwrap(weakContainer), window: try XCTUnwrap(weakController?.window),
+            steps: [
+                { post in
+                    for step in 1...5 { post(.leftMouseDragged, start - CGFloat(10 * step)) }
+                    return true
+                },
+                { _ in
+                    for session in sessions { try? session.write(Array("exit\n".utf8)) }
+                    sessions = []
+                    return true
+                },
+                { post in
+                    guard !self.appDelegate.windowControllers.contains(where: { $0 === weakController }) else {
+                        return false
+                    }
+                    post(.leftMouseDragged, start - 100)
+                    post(.leftMouseUp, start - 100)
+                    return true
+                },
+            ])
+        try? await waitUntil("the closed tab is freed") {
+            weakController == nil && weakContainer == nil && weakViews.allSatisfy { $0.object == nil }
+        }
+        XCTAssertNil(weakController, "controller")
+        XCTAssertNil(weakContainer, "container")
+        XCTAssertEqual(weakViews.compactMap(\.object).count, 0, "views")
+    }
+
+    /// A pane's shell exiting before the drag moves the divider (#371): the
+    /// drag's moves after it reach the tree only at its end, which saves
+    /// them.
+    func testAPaneClosingBeforeADividerDragMovesKeepsAndSavesTheDragsRatio() async throws {
+        weak var closing: Pane?
+        let (controller, left, topRight) = try autoreleasepool {
+            let controller = try openTab()
+            let left = controller.focusedPane
+            let topRight = try split(controller, .right)
+            closing = try split(controller, .below)
+            return (controller, left, topRight)
+        }
+        try skipUnlessAttached(controller)
+        let proxy = PaneHostProxy(app: appDelegate)
+        controller.delegate = proxy
+        let defaults = try XCTUnwrap(CountingDefaults(suiteName: "com.aanyberg.tessera.tests.\(UUID().uuidString)"))
+        let store = WindowStateStore(defaults: defaults)
+        appDelegate.windowStateStore = store
+        defer {
+            appDelegate.windowStateStore = nil
+            controller.delegate = appDelegate
+        }
+        let container = controller.paneContainer
+        let start = autoreleasepool { frame(of: left, in: controller).maxX + 0.5 }
+        try await trackDividerDrag(
+            at: start, in: container, window: try XCTUnwrap(controller.window),
+            steps: [
+                { _ in
+                    try? closing?.session.write(Array("exit\n".utf8))
+                    return true
+                },
+                { post in
+                    guard controller.panes.count == 2 else { return false }
+                    for step in 1...20 { post(.leftMouseDragged, start - CGFloat(10 * step)) }
+                    post(.leftMouseUp, start - 200)
+                    return true
+                },
+            ])
+        XCTAssertEqual(controller.panes, [left, topRight])
+        let width = frame(of: left, in: controller).maxX
+        XCTAssertEqual(width, start - 200.5, accuracy: 1, "the divider is where the drag let go")
+        let ratio = container.tree.root.splits[0].ratio
+        XCTAssertEqual(ratio * (container.bounds.width - PaneSplitView.thickness), width, accuracy: 1)
+        try await waitUntil("the drag's ratio is saved") {
+            guard case .split(_, let saved, _, _) = store.load()?.windows.first?.layout(ofTab: 0) else { return false }
+            return abs(saved - Double(ratio)) < 1e-9
+        }
     }
 
     /// A spawn failing partway through a restored layout: the tab keeps its
