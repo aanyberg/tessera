@@ -20,6 +20,8 @@ extension TesseraConfigWriter: SettingsConfigWriting {}
 protocol SettingsConfigSource: AnyObject {
     func configSnapshot() throws -> TesseraConfigSnapshot
     func themes() throws -> [TesseraTheme]
+    /// The key map in effect, which the Keys pane shows (ADR 0036).
+    func keymap() throws -> TesseraKeymap
     var settingsWriter: any SettingsConfigWriting { get }
 }
 
@@ -103,6 +105,12 @@ final class SettingsModel {
     private(set) var themes: [TesseraTheme] = []
     /// Why the configuration could not be read, if it could not.
     private(set) var loadError: String?
+    /// The key map in effect, as last read, of ``snapshot``'s generation
+    /// when both could be read alike; `nil` if it could not be read.
+    private(set) var keymap: TesseraKeymap?
+    /// The Keys pane's state: recording, conflicts and its edits of
+    /// `[keys]`.
+    @ObservationIgnored let keys: KeysModel
 
     /// Values set but not yet seen in ``snapshot``, by key path; `.null`
     /// for a removed key.
@@ -143,6 +151,8 @@ final class SettingsModel {
         self.source = source
         self.clock = clock
         snapshot = TesseraConfigSnapshot(generation: 0, config: .table([:]))
+        keys = KeysModel()
+        keys.settings = self
         reload()
     }
 
@@ -160,6 +170,7 @@ final class SettingsModel {
         do {
             let entries = profileEntries
             snapshot = try source.configSnapshot()
+            readKeymap(source)
             loadError = nil
             if profileEntries != entries { profileListGeneration += 1 }
         } catch {
@@ -176,6 +187,29 @@ final class SettingsModel {
             pending[key] = nil
             queuedAtGeneration[key] = nil
         }
+    }
+
+    /// Reads the key map. The configuration and the key map are read one
+    /// after the other, so an apply in between can give them different
+    /// generations (#348): both are read again, a few times at most, until
+    /// they agree. The Keys pane edits nothing while they do not.
+    private func readKeymap(_ source: any SettingsConfigSource) {
+        do {
+            var map = try source.keymap()
+            for _ in 0..<3 where map.generation != snapshot.generation {
+                snapshot = try source.configSnapshot()
+                map = try source.keymap()
+            }
+            keymap = map
+        } catch {
+            keymap = nil
+            Self.log.error("key map not read: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    /// The writer edits go through, while the core runs.
+    var writer: (any SettingsConfigWriting)? {
+        source?.settingsWriter
     }
 
     /// The value at `key`: the one last set while it is not yet applied,

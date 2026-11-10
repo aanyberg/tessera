@@ -2272,9 +2272,11 @@ extension TerminalSurfaceView: @preconcurrency NSTextInputClient {
 
 // MARK: Key codes
 
-/// What a key event says about its key, independent of the text it produced.
+/// What a key event says about its key, independent of the text it produced:
+/// what the core's key map resolves (and the Keys pane names a recorded
+/// chord by).
 @MainActor
-private struct KeyInfo {
+struct KeyInfo {
     /// The non-character key its key code names, if any.
     let named: TesseraSession.Key?
     /// The key's character with no modifiers, and with Shift, in the active
