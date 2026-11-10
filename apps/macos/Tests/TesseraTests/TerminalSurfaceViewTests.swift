@@ -43,8 +43,11 @@ final class TerminalSurfaceViewTests: XCTestCase {
         appDelegate = try XCTUnwrap(NSApp.delegate as? AppDelegate)
         XCTAssertTrue(appDelegate.windowControllers.isEmpty, "a previous test left windows open")
         file = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-view-\(UUID().uuidString).bin")
+        // The recorder appends: a session a test opens through the menus
+        // (New Tab) runs this same script, and `>` would empty the file,
+        // sentinel included, whenever its shell got there after the input.
         appDelegate.spawnOptions = .init(
-            program: "/bin/sh", arguments: ["-c", #"stty raw -echo; printf R; exec cat > "$0""#, file.path])
+            program: "/bin/sh", arguments: ["-c", #"stty raw -echo; printf R; exec cat >> "$0""#, file.path])
         let controller = try appDelegate.newWindow()
         view = controller.focusedPane.view
         // Off the app's window, whose key and visible state follow the
@@ -413,8 +416,10 @@ final class TerminalSurfaceViewTests: XCTestCase {
         // Not the first responder: nothing is resolved.
         window.makeFirstResponder(nil)
         XCTAssertFalse(view.performKeyEquivalent(with: copyMode), "another view's key")
-        // No menu takes the unbound ones here, so AppKit sends them on to
-        // `keyDown`: they go up the responder chain, never to the session.
+        // No menu took the unbound ones before `keyDown`, so they go up the
+        // responder chain, never to the session. There the menus get them
+        // again: ⇧⌘T, whose unshifted character is ⌘T's, may open a new
+        // tab, which the recorder's `>>` in setUp makes harmless here.
         _ = window.makeFirstResponder(view)
         for unbound in [key("j", code: 38, [.command]), key("T", ignoring: "t", code: 17, [.command, .shift])] {
             press(unbound) { _ in XCTFail("Command skips the input system") }
