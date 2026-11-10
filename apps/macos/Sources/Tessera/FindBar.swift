@@ -317,7 +317,8 @@ final class FindController {
         if status.truncated {
             // Only the matches the search kept (the newest
             // ``TesseraSession/searchMaxMatches``) were copied.
-            return "Copied \(format(status.matches)) of more than \(format(TesseraSession.searchMaxMatches))"
+            let copied = "Copied \(format(status.matches)) of more than \(format(TesseraSession.searchMaxMatches))"
+            return status.linesSkipped ? "\(copied); some lines were skipped" : copied
         }
         if status.linesSkipped {
             // The skipped lines' matches are not in the copy.
@@ -335,21 +336,26 @@ final class FindController {
     /// (their matches may be missing).
     var countText: String {
         guard isOpen, !query.isEmpty, refusal == nil, status.active else { return "" }
-        let count = baseCountText
+        return Self.countText(for: status)
+    }
+
+    /// ``countText`` for an open bar with an accepted query and `status`.
+    static func countText(for status: TesseraSession.SearchStatus) -> String {
+        let count = baseCountText(for: status)
         return status.linesSkipped ? "\(count), some lines skipped" : count
     }
 
-    private var baseCountText: String {
+    private static func baseCountText(for status: TesseraSession.SearchStatus) -> String {
         if status.truncated {
-            return "more than \(Self.format(TesseraSession.searchMaxMatches))"
+            return "more than \(format(TesseraSession.searchMaxMatches))"
         }
         if status.matches == 0 {
             return status.done ? "No matches" : "Searching…"
         }
         if let current = status.current, current < status.matches {
-            return "\(Self.format(current + 1)) of \(Self.format(status.matches))"
+            return "\(format(current + 1)) of \(format(status.matches))"
         }
-        return status.matches == 1 ? "1 match" : "\(Self.format(status.matches)) matches"
+        return status.matches == 1 ? "1 match" : "\(format(status.matches)) matches"
     }
 
     /// Why the query was refused, short enough for the bar, or `nil`.

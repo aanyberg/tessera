@@ -670,13 +670,43 @@ final class FindBarTests: XCTestCase {
                 Status(
                     matches: TesseraSession.searchMaxMatches, active: true, done: true, truncated: true,
                     linesSkipped: true),
-                "Copied \(max) of more than \(max)"
+                "Copied \(max) of more than \(max); some lines were skipped"
             ),
         ]
         for (copyTruncated, status, notice) in cases {
             XCTAssertEqual(
                 FindController.copyNotice(copyTruncated: copyTruncated, status: status), notice,
                 "copy cut \(copyTruncated), \(status)")
+        }
+    }
+
+    /// The count as a function of the status alone: pins the ", some
+    /// lines skipped" suffix on every form of the count (#318).
+    func testTheCountTextFollowsTheStatus() {
+        typealias Status = TesseraSession.SearchStatus
+        let max = FindController.format(TesseraSession.searchMaxMatches)
+        let cases: [(status: Status, text: String)] = [
+            (Status(active: true), "Searching…"),
+            (Status(active: true, done: true), "No matches"),
+            (Status(active: true, done: true, linesSkipped: true), "No matches, some lines skipped"),
+            (Status(matches: 1, active: true, done: true), "1 match"),
+            (Status(matches: 1_200, active: true, done: true), "\(FindController.format(1_200)) matches"),
+            (Status(matches: 12, current: 2, active: true, done: true), "3 of 12"),
+            (Status(matches: 12, current: 2, active: true, done: true, linesSkipped: true), "3 of 12, some lines skipped"),
+            (Status(matches: 12, current: 12, active: true, done: true), "12 matches"),
+            (
+                Status(matches: TesseraSession.searchMaxMatches, current: 3, active: true, done: true, truncated: true),
+                "more than \(max)"
+            ),
+            (
+                Status(
+                    matches: TesseraSession.searchMaxMatches, active: true, done: true, truncated: true,
+                    linesSkipped: true),
+                "more than \(max), some lines skipped"
+            ),
+        ]
+        for (status, text) in cases {
+            XCTAssertEqual(FindController.countText(for: status), text, "\(status)")
         }
     }
 
