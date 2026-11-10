@@ -64,21 +64,32 @@ extension TesseraSession {
         /// false again.
         public var done: Bool
         /// More than ``TesseraSession/searchMaxMatches`` matched: the
-        /// count reads "more than".
+        /// count reads "more than". Clears once the lines whose matches
+        /// gave way are gone.
         public var truncated: Bool
+        /// Some lines were too slow for the pattern to search whole (a row
+        /// over 250 ms was skipped, or a line was cut into smaller pieces):
+        /// matches there may be missing from the count. Clears once those
+        /// lines are gone.
+        public var linesSkipped: Bool
 
-        public init(matches: Int = 0, current: Int? = nil, active: Bool = false, done: Bool = false, truncated: Bool = false) {
+        public init(
+            matches: Int = 0, current: Int? = nil, active: Bool = false, done: Bool = false, truncated: Bool = false,
+            linesSkipped: Bool = false
+        ) {
             self.matches = matches
             self.current = current
             self.active = active
             self.done = done
             self.truncated = truncated
+            self.linesSkipped = linesSkipped
         }
 
         init(_ status: TesseraSearchStatus) {
             self.init(
                 matches: Int(status.matches), current: status.has_current ? Int(status.current) : nil,
-                active: status.active, done: status.done, truncated: status.truncated)
+                active: status.active, done: status.done, truncated: status.truncated,
+                linesSkipped: status.lines_skipped)
         }
     }
 
@@ -150,7 +161,13 @@ extension TesseraSession {
 
     /// Scans for about `budgetMicros` microseconds (clamped to
     /// ``TesseraSession/searchMaxStepMicros``), at least one piece of at
-    /// most 64 KiB of text, and returns the status. Call it once per
+    /// most 64 KiB of text, and returns the status. It returns within four
+    /// budgets plus 250 ms plus one regex call, which is not interruptible
+    /// and bounded by bytes, not time: with a pathological pattern the
+    /// first call of a query can block for many seconds (7.3 s measured on
+    /// an 8 KB line, ADR 0038), and at the 1 KiB floor up to about 0.7 s;
+    /// a row slower than 250 ms is skipped (``SearchStatus/linesSkipped``).
+    /// Call it once per
     /// display refresh while the status is not ``SearchStatus/done`` or
     /// output arrived; without a search it does nothing.
     @MainActor
@@ -171,6 +188,15 @@ extension TesseraSession {
     @MainActor
     public func searchNewer() throws -> SearchStatus {
         try searchCall { tessera_session_search_newer(core.pointer, id, $0) }
+    }
+
+    /// Scrolls the view to the current match when it is out of view,
+    /// without moving it (one call when a new query's first match is
+    /// found: the newest match is current by itself, but only a move or
+    /// this scrolls to it).
+    @MainActor
+    public func searchReveal() throws -> SearchStatus {
+        try searchCall { tessera_session_search_reveal(core.pointer, id, $0) }
     }
 
     /// The search's status, without scanning.

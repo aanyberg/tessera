@@ -491,6 +491,64 @@ fn d13_refused_query_clears_the_search() {
     ));
 }
 
+/// #318 (S8): neither form of a refused query's error, nor its source's
+/// `Debug`, carries the pattern into a log line.
+#[test]
+fn a_refused_query_error_never_prints_the_pattern() {
+    let app = app();
+    let id = session(&app, 3, 10, 100);
+    // A syntax error (its message quotes the pattern) and a regex too
+    // complex to compile.
+    for pattern in ["(hunter2secret", r"hunter2\w{5000}"] {
+        let error = app.search_start(id, pattern, REGEX).unwrap_err();
+        let Error::Query(query) = &error else {
+            panic!("not a query error");
+        };
+        for shown in [
+            format!("{error}"),
+            format!("{error:?}"),
+            format!("{error:#?}"),
+            format!("{query:?}"),
+        ] {
+            assert!(!shown.contains("hunter2"), "S8: {shown}");
+        }
+    }
+}
+
+/// #331: `search_reveal` scrolls to the current match when it is out of
+/// view, without moving it, and leaves a view that shows it alone.
+#[test]
+fn reveal_scrolls_to_the_current_match_without_moving_it() {
+    let app = app();
+    let id = session(&app, 5, 10, 20_000);
+    let mut text = String::from("hit\r\n");
+    text.push_str(&numbered(5_000, &[]));
+    text.push_str("hit\r\n");
+    text.push_str(&numbered(5_000, &[]));
+    app.feed_for_test(id, text.as_bytes()).unwrap();
+    // Nothing to reveal yet.
+    app.search_start(id, "hit", LITERAL).unwrap();
+    assert_eq!(app.search_reveal(id).unwrap().current, None);
+    assert_eq!(offset(&app, id), 0);
+    let status = finish(&app, id);
+    assert_eq!((status.matches, status.current), (2, Some(1)));
+    assert!(current_rows(&app, id).is_empty(), "the newest is far above");
+    let status = app.search_reveal(id).unwrap();
+    assert_eq!(status.current, Some(1), "not moved");
+    assert_eq!(current_rows(&app, id).len(), 1, "scrolled to it");
+    let scrolled = offset(&app, id);
+    assert!((4_990..5_010).contains(&scrolled), "{scrolled}");
+    app.search_reveal(id).unwrap();
+    assert_eq!(offset(&app, id), scrolled, "in view: no scroll");
+    // The older one is scrolled to by a move, and revealed in place.
+    app.search_older(id).unwrap();
+    let older = offset(&app, id);
+    assert!(older > 9_990, "{older}");
+    app.search_reveal(id).unwrap();
+    assert_eq!(offset(&app, id), older);
+    assert!(app.search_reveal(SessionId::from_raw(999)).is_err());
+}
+
 /// An empty query is no search.
 #[test]
 fn empty_query_is_idle() {
@@ -786,6 +844,7 @@ fn unknown_session() {
     assert!(app.search_step(id, Duration::ZERO).is_err());
     assert!(app.search_older(id).is_err());
     assert!(app.search_newer(id).is_err());
+    assert!(app.search_reveal(id).is_err());
     assert!(app.search_clear(id).is_err());
     assert!(app.search_status(id).is_err());
     assert!(app.search_matches_text(id).is_err());
@@ -863,6 +922,83 @@ proptest::proptest! {
             ("a[ab]*b|\u{4e00}", REGEX)
         } else {
             ("ab", LITERAL)
+        };
+        app.search_start(id, pattern, options).unwrap();
+        for op in &ops {
+            match op {
+                Op::Feed(text) => app.feed_for_test(id, text.as_bytes()).unwrap(),
+                Op::Step => {
+                    app.search_step(id, Duration::ZERO).unwrap();
+                }
+                Op::Resize(rows, cols) => app.resize(id, PtySize::new(*rows, *cols)).unwrap(),
+                Op::Look => {
+                    matches(&app, id);
+                }
+                Op::Move(older) => {
+                    if *older {
+                        app.search_older(id).unwrap();
+                    } else {
+                        app.search_newer(id).unwrap();
+                    }
+                }
+            }
+        }
+        let live = outcome(&app, id);
+        app.search_clear(id).unwrap();
+        app.search_start(id, pattern, options).unwrap();
+        let fresh = outcome(&app, id);
+        proptest::prop_assert_eq!(live, fresh);
+    }
+}
+
+/// Heavy output for [`a_live_search_over_many_pieces_agrees_with_a_fresh_one`]:
+/// runs of zalgo cells (63 bytes each) long enough that one logical line
+/// is several 64 KiB pieces, `X` marks between them, and the same screen
+/// controls as [`op`].
+fn heavy_op() -> impl proptest::strategy::Strategy<Value = Op> {
+    use proptest::prelude::*;
+    let piece = prop_oneof![
+        4 => (1usize..1_400).prop_map(|n| zalgo().repeat(n)),
+        4 => Just("X".to_owned()),
+        2 => "[ab ]{1,12}",
+        2 => Just("\r\n".to_owned()),
+        1 => Just("\u{4e00}".to_owned()),
+        1 => Just("\x1b[2J".to_owned()),
+        1 => Just("\x1b[3J".to_owned()),
+        1 => Just("\x1b[H".to_owned()),
+        1 => Just("\x1b[5;7H".to_owned()),
+        1 => Just("\x1b[?1049h".to_owned()),
+        1 => Just("\x1b[?1049l".to_owned()),
+        1 => Just("\x1bc".to_owned()),
+    ];
+    prop_oneof![
+        5 => proptest::collection::vec(piece, 1..6).prop_map(|p| Op::Feed(p.concat())),
+        5 => Just(Op::Step),
+        1 => (6u16..14, 20u16..48).prop_map(|(rows, cols)| Op::Resize(rows, cols)),
+        1 => Just(Op::Look),
+        1 => proptest::bool::ANY.prop_map(Op::Move),
+    ]
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(24))]
+
+    /// #331: the live-versus-fresh check on output whose logical lines are
+    /// several pieces long, so zero-budget steps stop inside a segment and
+    /// resume it after output, resizes, clears, RIS and the alternate
+    /// screen have moved it.
+    #[test]
+    fn a_live_search_over_many_pieces_agrees_with_a_fresh_one(
+        ops in proptest::collection::vec(heavy_op(), 1..24),
+        regex in proptest::bool::ANY,
+        scrollback in 0usize..300,
+    ) {
+        let app = app();
+        let id = session(&app, 12, 40, scrollback);
+        let (pattern, options) = if regex {
+            ("X[ab]*|\u{4e00}", REGEX)
+        } else {
+            ("X", LITERAL)
         };
         app.search_start(id, pattern, options).unwrap();
         for op in &ops {

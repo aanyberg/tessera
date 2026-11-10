@@ -1,6 +1,7 @@
 # ADR 0038: Scrollback search: stepped scan, caps, lock budget
 
-**Status:** accepted · 2026-11-06 · amended 2026-11-07 (#46b: per-piece step bound, find bar)
+**Status:** accepted · 2026-11-06 · amended 2026-11-07 (#46b: per-piece step bound, find bar) · amended
+2026-11-08 (#331, #318: a ceiling per piece, lines skipped, stale truncation, reveal)
 
 ## Context
 
@@ -71,14 +72,72 @@ The budget (and the C API's cap, `TESSERA_SEARCH_MAX_STEP_MICROS`) is
 checked between pieces (amended in #46b). A chunk runs one regex pass per
 64 KiB piece of each segment it holds, up to about 128 pieces on text of
 heavy combining marks, so the chunk is kept across steps and its scan
-resumes at the next piece: a step runs at least one piece and overruns its
-budget by at most one piece's regex time. That time depends on the
-pattern and has no fixed ceiling: seconds for `\w*X|\w` on such text
-(`a_step_ends_within_one_piece_of_its_budget` checks the bound of one
-piece, not a time; before, a step took 28 s to 91 s). A chunk's matches are filed when its last piece has
-run, so the count grows chunk by chunk and never shows half a chunk; what
-changed in the terminal meanwhile is caught by the next plan, as between a
-copy and its search. A zero budget runs at most one piece.
+resumes at the next piece. A zero budget runs at most one piece.
+
+**A ceiling per piece (amended in #331).** A piece's regex time depends on
+the pattern: `\w*X\b|\w` takes 19 s to 32 s on a 64 KiB piece of
+combining marks, Cyrillic or CJK, and before this amendment one step took
+all of it. The engine now reads the clock after every regex run inside a
+piece, and once before the first, and stops at the piece's deadline
+(reading it every 16 runs, as first amended, let one step run 16 slow
+calls: about 12 s in the app; #331 round 1):
+
+- The step's first piece may take `max(4 × budget, MIN_PIECE_TIME)`
+  (16 ms; a zero budget still searches). One that runs out is searched
+  again from its start in halves: the piece limit (`PieceLimit`, bytes and
+  cells) becomes half of that piece's own size (`PieceLimit::halved_from`,
+  so the first retry already cuts a piece far below the limit), and stays
+  there for the rest of the search, down to one row of cells and
+  `MIN_PIECE_BYTES` (1 KiB).
+- At that floor the first piece may take `max(4 × budget,
+  LINE_TIME_LIMIT)` (250 ms). One that still runs out is skipped with the
+  matches it found before the stop, and the status's `lines_skipped` says
+  so (the count reads "some lines skipped" in the find bar) until those
+  lines are gone. "Line" here is one row, or 1 KiB of it. A row whose
+  single regex run outlasts that deadline is skipped the same way.
+- Halved pieces cut a logical line inside where the full limit would not,
+  and a match across such a cut is not found. A segment cut at a halved
+  limit therefore counts as skipped too (`lines_skipped`), so the count is
+  never short without saying so.
+- A later piece of the step gets the step's own deadline; one that runs
+  out is not halved but runs first in the next step, at a first piece's
+  deadline.
+
+So a step returns within four budgets plus 250 ms plus one regex call
+(`no_step_outlasts_four_budgets_and_a_quarter_second`, release only). The
+deadline is checked after the last call of a piece too, the one that finds
+nothing more: before that (#331 adversarial run, F9c), a piece whose last
+call ran past the deadline counted as on time and was never halved or
+skipped. That call is the residual cost, accepted: it is not interruptible
+and is bounded by bytes, not time. It runs on at most one piece's text, 64
+KiB until a slow piece halves the limit, at most `MIN_PIECE_BYTES` once at
+the floor, and costs up to that length times the program's size. No time
+bound holds for it; measured (release, 4 ms budget):
+
+| Case | Worst step |
+|---|---|
+| `(?:e{1,400}){1,250}\b\d`, one 8000-byte line of `e` (load 6-15) | 7.3 s for the first call, then 3.5 s, 1.6 s and 0.63 s as the retries halve the line itself (14.4 s in all); before halving from the piece's own size, four 7.3 s steps in a row (halving 64 KiB to 8 KiB did not cut the line), 36.5 s in all; 20.5 s in one step before the F9c fix |
+| same pattern, rows of 1100 `e` at the floor | 0.65-0.70 s a step, one 1 KiB call each, every such row skipped and reported |
+| same pattern, 3000 `e` edited one key at a time | 2.7 s for the first search, 43 ms a step on later edits (the limit stays halved); before the fix 2.5 s on every edit |
+| `(?:.{1,200}){1,40}\b\d`, 8000 bytes of prose, edited | 0.70 s first, 22 ms later; before the fix 0.7 s on every edit |
+| `(?:[\x{434}\x{4e2d}e\x{301}]{1,200}){1,40}\b\|\w`, 64 KiB of combining marks, Cyrillic and CJK | 0.5-0.6 s at load 13, 1.22 s at load 35, 2.1-2.9 s in probes at load 35-50 |
+| `(?:\w{1,40}){1,5}\b\d` (no match), same texts | 0.11-0.13 s, halved to 8 KiB |
+
+So a pathological pattern costs about 0.65-0.9 s per KiB in one call: the
+first call of a query can block the main thread for many seconds, and
+each retry at half the slow piece's size about half as long; after that the search
+runs at the floor, and a row whose one call outlasts the 250 ms is skipped
+and reported. `\w*X\b|\w` stays within 17 ms a step at budgets 0 and 4 ms
+(205 ms at 50 ms), its longest call 30 ms. Moving the step off the main
+thread would remove the residual from the frame; it is the follow-up. A piece's matches are kept apart until it
+finishes or is skipped, so a piece searched again is never counted twice.
+Under heavy load the wall clock can halve a piece that was not slow; the
+search is then slower, and long lines it cuts are reported as skipped.
+
+A chunk's matches are filed when its last piece has run, so the count
+grows chunk by chunk and never shows half a chunk; what changed in the
+terminal meanwhile is caught by the next plan, as between a copy and its
+search.
 
 **Screen passes reuse what did not change.** A segment's text depends only
 on its rows and on whether it continues above and below, so a pass keeps a
@@ -112,7 +171,10 @@ output keeps the current match where it is.
 
 **Caps (S5).** `MAX_MATCHES` = 100 000: the newest are kept and the
 status's `truncated` makes the count read "more than"; once full the
-older-history scan stops. "Copy all matches" returns the matches' text in
+older-history scan stops. `truncated` (amended in #318) clears once the
+lines whose matches gave way are gone (ED 3, eviction, a fresh pass of the
+screen or the alternate screen), as a fresh search would report it.
+"Copy all matches" returns the matches' text in
 document order joined by newlines, at most `MAX_MATCHES_TEXT_BYTES` (1 MiB),
 stopping before the match that would pass it; it re-reads the terminal 256
 lines per lock hold.
@@ -124,20 +186,27 @@ redraws and an unchanged one does not. They draw over the selection, as on
 main. The last overlays are kept with the window they were computed for and
 handed out again while the window is the same and the search did not
 change (any start, clear, step or move drops them), so an idle frame costs
-a copy, not a walk of the matches. Lock order: the search lock before the terminal lock, never inside
-it; the reader thread never takes it.
+a copy, not a walk of the matches. Lock order: the search lock, then the
+view table, then the selection and the terminal (amended in #318:
+`render_view` takes the session's search lock before the view table, so a
+step running on another pane's search never stalls every frame on that
+table); the terminal lock is never held while the search lock is waited
+for, and the reader thread never takes it.
 
 **C API.** `tessera_session_search_start` (pattern as pointer and length,
 UTF-8 checked, the length checked before the bytes are read; `options` bits
 `TESSERA_SEARCH_REGEX`, `TESSERA_SEARCH_CASE_SENSITIVE`; a
 `TesseraSearchRefusal` and an optional message buffer), `_step` (budget in
 microseconds, clamped to `TESSERA_SEARCH_MAX_STEP_MICROS`), `_older`,
-`_newer`, `_status`, `_clear` and `_matches_text` (the selection's copy-out
-convention). A refused pattern returns `TESSERA_ERROR_INVALID_ARGUMENT`.
+`_newer`, `_reveal` (amended in #331: scrolls to the current match without
+moving it), `_status`, `_clear` and `_matches_text` (the selection's
+copy-out convention). The status carries `matches`, `current`, `active`,
+`done`, `truncated` and `lines_skipped`. A refused pattern returns
+`TESSERA_ERROR_INVALID_ARGUMENT`.
 
 **Logs (S8).** Neither the query nor match text is logged: the core error
-for a refused query carries no source, and the C layer logs only the
-refusal kind.
+for a refused query carries no source (its `Debug` form neither, #318),
+and the C layer logs only the refusal kind.
 
 **Find bar (#46b, amended).** The app's find bar is a small panel floating
 in the top trailing corner of the focused pane, over the terminal (clear of
@@ -157,8 +226,8 @@ switches pane or tab; closing a pane frees its search with its session.
   key map (`find`, `find_next`, `find_previous`, `use_selection_for_find`
   on ⌘E, `copy_find_matches` with no chord) and Edit > Find.
 - A new query makes its newest match current as soon as a step finds it,
-  and the view scrolls to it; a move asked for before the first match waits
-  for it.
+  and the view scrolls to it with one `reveal` call (amended in #331); a
+  move asked for before the first match waits for it.
 - Case: smart case by default (case-insensitive unless the query has an
   uppercase letter; in regex mode an escaped character and a `\p{…}`
   class name do not count), or match case, or ignore case. Smart case is
@@ -167,13 +236,17 @@ switches pane or tab; closing a pane frees its search with its session.
   and ⌘G send it at once.
 - Stepping: the pane's display link makes one `step` per refresh with a
   4 ms budget while the bar is open and the status is not `done` or output
-  arrived since; a step overruns it by at most one piece. With the bar
+  arrived since; a step returns within 16 ms, or 266 ms at the halving
+  floor (four budgets plus 250 ms, see A ceiling per piece). With the bar
   closed the search is cleared and the display link makes no search call.
 - Use Selection for Find takes the selection's first line, drops control,
   format and separator characters (S3), escapes it in regex mode and cuts
-  it to 1024 bytes; with the bar closed it sets the query ⌘G searches for,
-  as other Mac apps do. Copy All Matches puts `matches_text` on the
-  pasteboard and says in the bar when it was cut at 1 MiB.
+  it to 1024 bytes; regex escaping is per unicode scalar (a `.` with a
+  combining mark is still escaped, #331); with the bar closed it sets the
+  query ⌘G searches for, as other Mac apps do. Copy All Matches puts
+  `matches_text` on the pasteboard and says in the bar when it was cut at
+  1 MiB, or, past the match cap, how many of "more than 100 000" it
+  copied.
 - Neither the query nor match text is logged (S8).
 
 ## Measured
@@ -189,10 +262,19 @@ Release, Apple silicon, wave load 13 to 25 (`ab` rows: instruction counts, net o
 | Memory held by one search, literal, at the 100 000-match cap | 3.6 MB |
 | Memory held by one search, `\w{209}` on 2048 columns | 16.3 MB |
 | `render_view`, no search active, 11 corpus lines (`cargo xtask ab`, three fresh probes) | 0.989 to 1.015 of main (bar 1.02) |
-| `render_view` scrolling one line a frame, a search showing 36 matches (`v_`) | 1.07 to 1.43 of the same without a search (bar 1.15); ascii +3.4 k instructions a frame |
-| `render_view` idle, the same search (`i_`) | 1.27 to 1.70; ascii +1.6 k instructions on a 5.9 k frame |
-| Output of one line a frame with a step a frame (`s_`) | 1.76 to 2.43; ascii +87 k instructions a frame |
-| A line redrawn in place a frame with a step a frame (`r_`) | 1.68 to 1.94; ascii +57 k instructions a frame |
+| The same after the ceiling per piece (#331, one probe, load 11 to 6) | 0.992 to 1.013 of main (bar 1.02) |
+| A step a frame after one line of output, #331 vs main, both searching (`bs_`) | 0.990 to 1.004 |
+
+Active-search cost (#318), re-measured in #331 (2026-11-08, load 4 to 17):
+each row is head with a search against head without one, so it is what a
+search costs, not a regression, and has no bar.
+
+| What | Result |
+|---|---|
+| `render_view` scrolling one line a frame, a search showing its matches (`v_`, 240 000 frames) | 0.99 to 1.46; ascii +3.2 k instructions a frame |
+| `render_view` idle, the same search (`i_`, below the instruction floor even at 240 000 frames) | 1.32 to 1.78; ascii +1.5 k instructions a frame |
+| Output of one line a frame with a step a frame (`s_`) | 1.42 to 2.70; ascii +106 k instructions a frame |
+| A line redrawn in place a frame with a step a frame (`r_`) | 1.40 to 2.53; ascii +59 k instructions a frame |
 
 The per-search total is bounded by: the compiled program (≤ 10 MiB plus the
 regex crate's overhead), two lazy DFA caches (≤ 4 MiB each), the match
@@ -208,17 +290,26 @@ the last overlays (one window's worth). Compilation of a pattern near the size l
 - A search costs nothing per frame while none is active; with one active,
   each frame adds a step and the overlays of the rows shown. The overlays
   cost about 25 instructions per visible match in the search plus the
-  renderer's compare and draw, so a frame showing many matches misses the
-  1.15 bar by a few thousand instructions (well under a microsecond). A
-  step after output copies and scans the rows the output touched, which
-  costs about as much again as the output's own parse: the step's budget
-  (D6) bounds it to within one piece (see Stepped), and with no output and
+  renderer's compare and draw, a few thousand instructions a frame (well
+  under a microsecond). There is no ratio bar on an active search (amended
+  in #331, replacing the 1.15 bar it could not meet): Measured gives its
+  cost. A step after output copies and scans the rows the output touched,
+  which costs about as much again as the output's own parse: the step's
+  budget (D6) and the ceiling per piece bound it, and with no output and
   nothing left to scan a step is one short look at the terminal.
+- A pattern too slow for one row within 250 ms leaves that row's matches
+  out, and says so (`lines_skipped`), rather than stalling the frame; the
+  count is then a lower bound. The pieces halved for one slow line stay
+  small for the rest of the search, which costs speed on later text and
+  can lose matches across the cuts in its long lines; those lines are
+  reported as skipped too. A halving depends on the wall clock, so under
+  load a live search and a fresh one can differ there; both say so.
 - A match across a segment cut of a very long logical line (more than the
   segment period's rows) is missed. The cut rows are fixed, so the result
   does not change as output arrives. So is a match across a piece cut of a
-  segment with more than 64 KiB of text; a piece cut depends only on the
-  segment's cells, so it does not move as output arrives either.
+  segment with more than 64 KiB of text; at the full limit a piece cut
+  depends only on the segment's cells, so it does not move as output
+  arrives either (cuts at a halved limit are reported, above).
 - Under a continuous flood, catch-up of new history has priority, so the
   older-history scan (and `done`) can lag until output pauses.
 - `search_status` between a resize and the next step reports the old

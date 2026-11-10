@@ -1345,12 +1345,21 @@ impl App {
     /// Scans session `id` for its search for about `budget`: piece after
     /// piece (at most [`tessera_search::MAX_HAYSTACK_BYTES`] of text each)
     /// until nothing is left to scan or `budget` has passed, at least one
-    /// piece (at most one for a zero `budget`), so a step overruns `budget`
-    /// by at most one piece's regex run, whose time depends on the pattern. Lines are copied in chunks, each
-    /// under one hold of the terminal lock and of at most
-    /// [`search::SEARCH_LINES_PER_LOCK`] lines, so output keeps flowing
-    /// while a search runs; a chunk may be searched over several steps,
-    /// and its matches count from the step that searches its last piece.
+    /// piece (at most one for a zero `budget`). The clock is read after
+    /// every regex run inside a piece too, so a step returns within four
+    /// budgets plus [`search::LINE_TIME_LIMIT`] plus one regex call, which
+    /// is not interruptible (on at most a piece's text: 64 KiB, or 1 KiB
+    /// once halved to the floor; bounded by bytes, not time: with a
+    /// pathological pattern many seconds, ADR 0038 has the measured worst
+    /// case). A
+    /// piece too slow is searched again in halves, down to one row, and a
+    /// row still slower is skipped ([`SearchStatus::lines_skipped`], also
+    /// set when the halves cut a line). Lines are
+    /// copied in chunks, each under one hold of the terminal lock and of
+    /// at most [`search::SEARCH_LINES_PER_LOCK`] lines, so output keeps
+    /// flowing while a search runs; a chunk may be searched over several
+    /// steps, and its matches count from the step that searches its last
+    /// piece.
     ///
     /// Call it from the display link while [`SearchStatus::done`] is false
     /// or output arrives: the screen is searched first, then the history
@@ -1389,6 +1398,27 @@ impl App {
     /// [`Error::SessionNotFound`] if `id` is not a live session.
     pub fn search_newer(&self, id: SessionId) -> Result<SearchStatus> {
         self.search_move(id, false)
+    }
+
+    /// Scrolls session `id`'s view to show the current match when it is
+    /// not in view (centred), as a move does, without moving it; returns
+    /// the status. Without a current match nothing scrolls. The host calls
+    /// it once when a new query's first match is found: the newest match
+    /// is current by itself but only a move or this scrolls to it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    pub fn search_reveal(&self, id: SessionId) -> Result<SearchStatus> {
+        let session = self.session(id)?;
+        let (found, status) = {
+            let search = session.search();
+            (search.current_match(), search.status())
+        };
+        if let Some(found) = found {
+            search::reveal(&session, found);
+        }
+        Ok(status)
     }
 
     fn search_move(&self, id: SessionId, older: bool) -> Result<SearchStatus> {
@@ -2049,6 +2079,10 @@ impl App {
     pub fn render_view(&self, id: SessionId) -> Result<FrameStatus> {
         let session = self.session(id)?;
         let focused = session.is_focused();
+        // The search lock before the views lock (#318): a step holds it
+        // for up to its budget's ceiling, and a render waiting on it must
+        // not hold every view's lock meanwhile. Released before drawing.
+        let mut search = session.search();
         let mut views = lock(&self.views);
         let view = views.get_mut(&id).ok_or(Error::NoView(id))?;
         // Every view on a lost device is detached by its next render, even
@@ -2063,11 +2097,9 @@ impl App {
                     let window = search::Window::of(term.grid(), offset, session.resizes());
                     (decorations, window, offset > 0)
                 });
-            // After the terminal lock (search, then terminal, is the
-            // order): the matches are the search's as of its last step.
-            session
-                .search()
-                .overlays(&window, &mut decorations.overlays);
+            // The matches are the search's as of its last step.
+            search.overlays(&window, &mut decorations.overlays);
+            drop(search);
             view.set_decorations(decorations);
             // Focus only changes how the cursor is drawn, and a scrolled
             // back frame draws none: drawn as focused, a focus change alone
@@ -5929,6 +5961,54 @@ mod tests {
         release.send(()).unwrap();
         holder.join().unwrap();
         assert_eq!(reader.join().unwrap(), app.view_metrics(id).unwrap());
+    }
+
+    /// #318: a render waiting for the search lock (a step holds it for up
+    /// to its time ceiling) does not hold the view table meanwhile, so the
+    /// other panes' renders, resizes and attaches go on.
+    #[test]
+    fn render_never_holds_the_view_table_while_waiting_for_the_search() {
+        let app = Arc::new(app());
+        let (id, _fake) = attach_fake(&app, false);
+        if !attach_offscreen(&app, id, PhysicalSize::new(800, 600), 1.0) {
+            return;
+        }
+        app.search_start(id, "x", QueryOptions::default()).unwrap();
+        let (entered, wait) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let holder = {
+            let app = Arc::clone(&app);
+            thread::spawn(move || {
+                let session = app.session(id).unwrap();
+                let _search = session.search();
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+            })
+        };
+        wait.recv().unwrap();
+        let renderer = {
+            let app = Arc::clone(&app);
+            thread::spawn(move || app.render_view(id).map(|_| ()))
+        };
+        // As in the view-metrics test: a render preempted on its way to
+        // the search lock may hold nothing for a moment; one that holds
+        // the table across the wait fails every probe.
+        thread::sleep(Duration::from_millis(50));
+        let mut held = 0;
+        for _ in 0..40 {
+            if app.views.try_lock().is_err() {
+                held += 1;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(held < 20, "view table held in {held} of 40 probes");
+        assert!(
+            !renderer.is_finished(),
+            "render_view did not wait for the search"
+        );
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        renderer.join().unwrap().unwrap();
     }
 
     /// The terminal is held only for a few field reads, so under a flood of

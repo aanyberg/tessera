@@ -95,8 +95,8 @@ pub use search::{
     SEARCH_CASE_SENSITIVE, SEARCH_MAX_MATCHES, SEARCH_MAX_MATCHES_TEXT_BYTES,
     SEARCH_MAX_QUERY_BYTES, SEARCH_MAX_STEP_MICROS, SEARCH_REGEX, SearchRefusal, SearchStatus,
     tessera_session_search_clear, tessera_session_search_matches_text,
-    tessera_session_search_newer, tessera_session_search_older, tessera_session_search_start,
-    tessera_session_search_status, tessera_session_search_step,
+    tessera_session_search_newer, tessera_session_search_older, tessera_session_search_reveal,
+    tessera_session_search_start, tessera_session_search_status, tessera_session_search_step,
 };
 pub use selection::{
     Granularity, TextBuffer, tessera_session_has_selection, tessera_session_link_at,

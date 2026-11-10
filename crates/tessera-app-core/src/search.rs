@@ -5,11 +5,38 @@
 //! (fewer on wide screens: about [`MAX_HAYSTACK_BYTES`] cells) out of the
 //! terminal under its lock, releases the
 //! lock and runs the regex on the copy, one piece (at most
-//! [`MAX_HAYSTACK_BYTES`] of text) at a time. The step's deadline is
-//! checked between pieces, so a chunk can be searched over several steps
-//! (`Chunk`) and a step overruns its budget by at most one piece. The
-//! frontend calls it from its display link while a search is active; when
-//! nothing changed it returns after one short look at the terminal.
+//! [`MAX_HAYSTACK_BYTES`] of text) at a time, so a chunk can be searched
+//! over several steps (`Chunk`). The frontend calls it from its display
+//! link while a search is active; when nothing changed it returns after
+//! one short look at the terminal.
+//!
+//! # Time
+//!
+//! The clock is read after every regex run inside a piece ([`scan_piece`]),
+//! so no step outlives `max(4 x budget, 250 ms)` by more than one regex
+//! call, the one under way at the deadline (#331). That call is not
+//! interruptible: it runs on at most the current piece's text, 64 KiB until
+//! a slow piece halves the limit and at most [`MIN_PIECE_BYTES`] at the
+//! floor. It is bounded by bytes, not time: a pathological pattern costs
+//! about 0.65-0.9 s per KiB in one call, so the first call of a query can
+//! take many seconds, and each retry at half the slow piece about half as
+//! long (7.3 s, then 3.5 s, measured on an 8 KB line; ADR 0038 has the
+//! figures). The clock is
+//! read after the last call of a piece too, the one that finds nothing, so
+//! such a piece is late, not on time (F9c). The first piece of a
+//! step may run for four times the budget (at least [`MIN_PIECE_TIME`]); a
+//! piece that takes longer is searched again at half its own size, and
+//! every later piece of the search is cut at that [`PieceLimit`], down to
+//! one row and [`MIN_PIECE_BYTES`] ([`PieceLimit::halved_from`]). A piece at that floor
+//! may run for [`LINE_TIME_LIMIT`] (or four budgets, when longer); one
+//! slower still, even in one run, is skipped, keeping the matches found
+//! before the stop. A segment a halved limit cuts inside its line can lose
+//! a match across the cut, so it counts as skipped too: either way the
+//! status says lines were skipped ([`SearchStatus::lines_skipped`]). A
+//! later piece of a step stops at the budget and is searched first in the
+//! next step. A piece's matches reach the chunk's sink only once it has
+//! run to its end (or been skipped), so a piece searched again is never
+//! counted twice.
 //!
 //! # Lines and order
 //!
@@ -49,9 +76,11 @@ use std::time::{Duration, Instant};
 
 use tessera_grid::{DamageRows, Grid, Line};
 use tessera_render::{Overlay, OverlayKind};
+#[cfg(doc)]
+use tessera_search::MIN_PIECE_BYTES;
 use tessera_search::{
-    Haystack, MAX_HAYSTACK_BYTES, MAX_SEGMENT_ROWS, Match, Piece, Query, QueryError, QueryOptions,
-    Rows, Segment, is_segment_start, scan_piece, segment_period, segments,
+    Haystack, MAX_HAYSTACK_BYTES, MAX_SEGMENT_ROWS, Match, Piece, PieceLimit, Query, QueryError,
+    QueryOptions, Rows, Segment, is_segment_start, scan_piece, segment_period, segments,
 };
 use tessera_term::Terminal;
 
@@ -75,6 +104,15 @@ pub const MAX_MATCHES_TEXT_BYTES: usize = 1 << 20;
 // A chunk always holds at least one whole segment.
 const _: () = assert!(SEARCH_LINES_PER_LOCK >= MAX_SEGMENT_ROWS);
 
+/// The time the first piece of a step may take before it counts as slow
+/// when four budgets are shorter (a zero budget still searches): a slower
+/// piece is searched again in halves.
+pub const MIN_PIECE_TIME: Duration = Duration::from_millis(16);
+
+/// The time a piece at the smallest [`PieceLimit`] may take, when four
+/// budgets are shorter, before it is skipped (#331).
+pub const LINE_TIME_LIMIT: Duration = Duration::from_millis(250);
+
 /// Most cells of the screen region a search keeps a copy of between
 /// passes ([`Scanned`]), 2.5 MB of cells: a larger region is searched
 /// whole on every pass.
@@ -82,6 +120,10 @@ const MAX_KEPT_CELLS: usize = 128 << 10;
 
 /// Where a search stands.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent flags the find bar shows"
+)]
 pub struct SearchStatus {
     /// A query is set. False after [`App::search_clear`](crate::App::search_clear), an empty query
     /// and a refused one.
@@ -96,8 +138,15 @@ pub struct SearchStatus {
     /// work, so this turns false again; until it is true the count may
     /// still grow.
     pub done: bool,
-    /// More than [`MAX_MATCHES`] matched: the oldest are not kept.
+    /// More than [`MAX_MATCHES`] matched: the oldest are not kept. Clears
+    /// once the lines whose matches gave way are gone (cleared, evicted).
     pub truncated: bool,
+    /// Some lines were too slow to search whole with this query: one row
+    /// of at most [`MIN_PIECE_BYTES`] of text took over [`LINE_TIME_LIMIT`]
+    /// and was skipped, or a line was cut into pieces finer than the full
+    /// limit cuts (a match across such a cut is not found). Matches there
+    /// may be missing from the count. Clears once those lines are gone.
+    pub lines_skipped: bool,
 }
 
 /// The text of every match, as [`App::search_matches_text`](crate::App::search_matches_text) returns it.
@@ -234,6 +283,8 @@ struct Pass {
     /// Matches so far, newest segment first (sorted on completion).
     found: Vec<Match>,
     truncated: bool,
+    /// A piece of the region was skipped (too slow).
+    skipped: bool,
     /// The rows scanned so far and their cuts, for the next pass to
     /// reuse; `keep` is false once that is off (too many cells, or rows
     /// that did not join up).
@@ -353,6 +404,10 @@ enum Work {
 
 /// A query being searched for.
 #[derive(Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent facts about the search's progress"
+)]
 struct Active {
     pattern: String,
     query: Query,
@@ -370,8 +425,32 @@ struct Active {
     /// The cursor's row on the screen `screen_seen` describes.
     screen_row: Line,
     pass: Option<Pass>,
-    /// The history scan stopped at [`MAX_MATCHES`], or matches gave way.
-    truncated: bool,
+    /// History matches gave way at [`MAX_MATCHES`] (or the older-history
+    /// scan stopped there) on the lines below this one: their counts may
+    /// be short. 0 when none did; cleared once the oldest line left is at
+    /// or past it (#318).
+    lost: u64,
+    /// The last finished screen pass stopped at [`MAX_MATCHES`].
+    screen_truncated: bool,
+    /// A history piece below this line was skipped (too slow); 0 when none
+    /// was. Cleared as `lost` is.
+    skipped: u64,
+    /// The last finished screen pass skipped a piece.
+    screen_skipped: bool,
+    /// The size of the pieces the regex runs on: halved for the rest of the
+    /// search when one is slow (module docs, Time).
+    limit: PieceLimit,
+    /// The matches of the piece being searched, handed to the chunk's sink
+    /// once the piece has run (at most one per byte of a piece:
+    /// [`MAX_HAYSTACK_BYTES`]).
+    found: Vec<Match>,
+    /// How long each piece's regex run took, and its longest single regex
+    /// run (a gap between two matches), for the step-deadline tests.
+    #[cfg(test)]
+    pieces: Vec<(Duration, Duration)>,
+    /// Pieces skipped as too slow at the smallest limit, for the tests.
+    #[cfg(test)]
+    skips: usize,
     /// Eviction reached into the scanned history: its oldest segment is
     /// to be searched again ([`Work::Head`]).
     head: bool,
@@ -409,7 +488,16 @@ impl Active {
             screen_seen: None,
             screen_row: Line::default(),
             pass: None,
-            truncated: false,
+            lost: 0,
+            screen_truncated: false,
+            skipped: 0,
+            screen_skipped: false,
+            limit: PieceLimit::FULL,
+            found: Vec::new(),
+            #[cfg(test)]
+            pieces: Vec::new(),
+            #[cfg(test)]
+            skips: 0,
             head: false,
             wrapping: None,
             current: None,
@@ -502,17 +590,27 @@ impl Active {
         self.current = self.shown_at(index).map(|m| key(&m));
     }
 
+    /// Matches gave way at [`MAX_MATCHES`] on lines still there: no room
+    /// for older ones.
+    fn truncated(&self) -> bool {
+        self.lost != 0 || self.screen_truncated
+    }
+
     fn status(&self) -> SearchStatus {
         let current = self.current.and_then(|key| {
             let (index, exact) = self.shown_index(key);
             exact.then_some(index)
         });
+        let alt = self.alt();
         SearchStatus {
             active: true,
             matches: self.shown_len(),
             current,
             done: self.done,
-            truncated: self.truncated || self.pass.as_ref().is_some_and(|pass| pass.truncated),
+            truncated: self.truncated() || self.pass.as_ref().is_some_and(|pass| pass.truncated),
+            lines_skipped: (!alt && self.skipped != 0)
+                || (self.screen_shown(alt) && self.screen_skipped)
+                || self.pass.as_ref().is_some_and(|pass| pass.skipped),
         }
     }
 
@@ -524,7 +622,10 @@ impl Active {
         self.screen_seen = None;
         self.drop_pass();
         self.scanned.clear(&mut self.spare);
-        self.truncated = false;
+        self.lost = 0;
+        self.screen_truncated = false;
+        self.skipped = 0;
+        self.screen_skipped = false;
         self.head = false;
         self.current = None;
         // On the alternate screen too: the primary's history is scanned
@@ -532,6 +633,30 @@ impl Active {
         let start = Lines::new(grid, seen, seen.base).segment_start(seen.pushed);
         self.low = start;
         self.high = start;
+    }
+
+    /// Lines below `base`, evicted at the cap or cleared, take their
+    /// matches along. When that cuts into the scanned history, the rest of
+    /// its oldest line is a line of its own now (as a fresh search reads
+    /// it).
+    fn forget_below(&mut self, base: u64) {
+        if base > self.low {
+            self.head = base < self.high;
+        }
+        while self.history.front().is_some_and(|m| m.start_line < base) {
+            self.history.pop_front();
+        }
+        self.screen.retain(|m| m.start_line >= base);
+        self.low = self.low.max(base);
+        self.high = self.high.max(base);
+        // Lines whose matches gave way, or that were skipped, are gone
+        // (ED 3, eviction): the count is whole again (#318).
+        if self.lost <= base {
+            self.lost = 0;
+        }
+        if self.skipped <= base {
+            self.skipped = 0;
+        }
     }
 
     /// Brings the bookkeeping up to date with the terminal, then picks the
@@ -551,19 +676,8 @@ impl Active {
             self.scanned.clear(&mut self.spare);
             self.current = None;
         }
-        // Lines evicted at the cap or cleared take their matches along.
-        // When that cuts into the scanned history, the rest of its oldest
-        // line is a line of its own now (as a fresh search reads it).
         let base = seen.base;
-        if base > self.low {
-            self.head = base < self.high;
-        }
-        while self.history.front().is_some_and(|m| m.start_line < base) {
-            self.history.pop_front();
-        }
-        self.screen.retain(|m| m.start_line >= base);
-        self.low = self.low.max(base);
-        self.high = self.high.max(base);
+        self.forget_below(base);
         let rows = chunk_rows(layout.cols);
         let history = Lines::new(grid, &seen, base);
         self.see_ended_line(&history, seen.pushed, base);
@@ -607,6 +721,7 @@ impl Active {
                 row,
                 found: Vec::new(),
                 truncated: false,
+                skipped: false,
                 next: Scanned::default(),
                 keep: cells <= MAX_KEPT_CELLS,
             });
@@ -626,13 +741,13 @@ impl Active {
             self.finish_pass();
         }
 
-        if self.head && !self.truncated {
+        if self.head && !self.truncated() {
             return Some(Work::Head {
                 start: base,
                 end: history.segment_end(base, self.high),
             });
         }
-        if !self.truncated && self.low > base {
+        if !self.truncated() && self.low > base {
             return Some(Work::Older {
                 start: history.chunk_above(base, self.low, rows),
                 end: self.low,
@@ -655,8 +770,9 @@ impl Active {
         self.screen_seen = Some(pass.seen);
         self.screen_row = pass.row;
         self.scanned.clear(&mut self.spare);
+        self.screen_truncated = pass.truncated;
+        self.screen_skipped = pass.skipped;
         if pass.truncated {
-            self.truncated = true;
             pass.next.clear(&mut self.spare);
         } else if pass.keep {
             self.scanned = pass.next;
@@ -704,10 +820,12 @@ impl Active {
     /// Lets the oldest history matches give way past [`MAX_MATCHES`].
     fn trim(&mut self) {
         while self.history.len() + self.screen.len() > MAX_MATCHES {
-            if self.history.pop_front().is_none() {
+            if let Some(m) = self.history.pop_front() {
+                self.lost = self.lost.max(m.start_line + 1);
+            } else {
                 self.screen.truncate(MAX_MATCHES);
+                self.screen_truncated = true;
             }
-            self.truncated = true;
         }
     }
 
@@ -754,14 +872,18 @@ impl Active {
     /// until one piece ([`scan_piece`]) has run or the chunk is done; a
     /// segment the last pass scanned with the same rows takes that pass's
     /// matches without a search ([`Scanned`]). A done chunk is filed.
-    /// Returns whether a piece ran.
-    fn search_piece(&mut self) -> bool {
+    ///
+    /// The piece runs until `clock`'s deadline for it (module docs, Time):
+    /// one that times out is searched again later (in halves when it was
+    /// the step's first piece) or, at the smallest limit, skipped.
+    fn search_piece(&mut self, clock: Clock) -> Ran {
         let Some(chunk) = &mut self.chunk else {
-            return false;
+            return Ran::Nothing;
         };
         let rows = &self.pool[..chunk.count];
-        let mut ran = false;
-        while chunk.left > 0 && !chunk.stopped && !ran {
+        let cols = self.layout.map_or(1, |layout| layout.cols);
+        let mut ran = Ran::Nothing;
+        while chunk.left > 0 && !chunk.stopped && ran == Ran::Nothing {
             let segment = self.cuts[chunk.left - 1];
             let piece = if let Some(piece) = chunk.piece {
                 piece
@@ -785,24 +907,77 @@ impl Active {
                     chunk.left -= 1;
                     continue;
                 }
-                Piece::first(segment)
+                Piece::first(chunk.at.first, segment)
             };
-            let sink = &mut chunk.sink;
-            let (flow, next) = scan_piece(
+            let floor = self.limit.halved(cols).is_none();
+            self.found.clear();
+            let found = &mut self.found;
+            #[cfg(test)]
+            let started = Instant::now();
+            // The last match's time and the longest gap between two: with a
+            // pattern that matches every cell, its longest regex run.
+            #[cfg(test)]
+            let mut run = (started, Duration::ZERO);
+            let scan = scan_piece(
                 &self.query,
                 rows,
-                chunk.at.first,
-                segment,
                 piece,
+                self.limit,
+                Some(clock.deadline(floor)),
                 &mut self.haystack,
-                |m| sink.push(m),
+                |m| {
+                    #[cfg(test)]
+                    {
+                        let now = Instant::now();
+                        run = (now, run.1.max(now - run.0));
+                    }
+                    found.push(m);
+                    ControlFlow::Continue(())
+                },
             );
-            ran = true;
-            chunk.piece = next;
-            if next.is_none() {
+            #[cfg(test)]
+            self.pieces
+                .push((started.elapsed(), run.1.max(run.0.elapsed())));
+            ran = Ran::Piece;
+            if scan.timed_out {
+                ran = Ran::Stop;
+                // Searched again from where it started, its cut noted.
+                chunk.piece = Some(piece);
+                if !clock.first {
+                    // The step's budget ran out: the next step starts with
+                    // this piece, at its own deadline.
+                    break;
+                }
+                if let Some(half) = self.limit.halved_from(scan.size, cols) {
+                    // Too slow at this size: in halves of this piece, from
+                    // here on.
+                    self.limit = half;
+                    break;
+                }
+                // Too slow at the smallest size: skipped, with what it
+                // found before the stop.
+                #[cfg(test)]
+                {
+                    self.skips += 1;
+                }
+                incomplete(chunk, segment, &mut self.pass, &mut self.skipped);
+            } else if scan.next.is_some() && self.limit != PieceLimit::FULL {
+                // Cut inside its line finer than the full limit cuts: a
+                // match across the cut is lost, so it counts as skipped
+                // (#331, F9a).
+                incomplete(chunk, segment, &mut self.pass, &mut self.skipped);
+            }
+            for m in self.found.drain(..) {
+                if chunk.sink.push(m).is_break() {
+                    chunk.stopped = true;
+                    break;
+                }
+            }
+            chunk.piece = scan.next;
+            if scan.next.is_none() {
                 chunk.left -= 1;
             }
-            chunk.stopped |= flow.is_break();
+            chunk.stopped |= scan.flow.is_break();
         }
         let done = chunk.left == 0 || chunk.stopped;
         if done && let Some(chunk) = self.chunk.take() {
@@ -843,12 +1018,15 @@ impl Active {
                     self.finish_pass();
                 }
             }
-            (Work::Older { start, .. }, Sink::Newest(newest)) => {
+            (Work::Older { start, end }, Sink::Newest(newest)) => {
                 let mut found = Vec::new();
-                if newest.into(&mut found) {
-                    self.truncated = true;
-                }
+                let full = newest.into(&mut found);
                 found.sort_unstable();
+                if full {
+                    // Matches above the oldest one kept gave way.
+                    let line = found.first().map_or(end, |m| m.start_line + 1);
+                    self.lost = self.lost.max(line);
+                }
                 for m in found.into_iter().rev() {
                     self.history.push_front(m);
                 }
@@ -865,9 +1043,68 @@ impl Active {
                 self.head = false;
                 self.trim();
             }
-            // `begin` pairs each kind of work with its sink.
-            _ => {}
+            (work, _) => {
+                debug_assert!(false, "{work:?} filed with the wrong sink");
+            }
         }
+    }
+}
+
+/// Notes that `segment` of `chunk` was not searched whole (a piece too
+/// slow was skipped, or a halved limit cut it): the status says lines were
+/// skipped until those lines are gone.
+fn incomplete(chunk: &Chunk, segment: Segment, pass: &mut Option<Pass>, skipped: &mut u64) {
+    match (chunk.work, pass) {
+        (Work::Screen { .. }, Some(pass)) => {
+            pass.skipped = true;
+            // Its matches cannot stand in for a search.
+            pass.keep = false;
+        }
+        (Work::Screen { .. }, None) => {}
+        _ => {
+            let end = chunk.at.first + segment.end as u64;
+            *skipped = (*skipped).max(end);
+        }
+    }
+}
+
+/// What [`Active::search_piece`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ran {
+    /// No regex ran: segments took the last pass's matches, or the chunk
+    /// was done.
+    Nothing,
+    /// A piece ran to its end.
+    Piece,
+    /// A piece timed out (or was skipped): the step ends.
+    Stop,
+}
+
+/// When the pieces of one step must stop (module docs, Time).
+#[derive(Debug, Clone, Copy)]
+struct Clock {
+    started: Instant,
+    budget: Duration,
+    /// No piece has run in this step yet.
+    first: bool,
+}
+
+impl Clock {
+    /// The deadline of the next piece: for the step's first, four budgets
+    /// (at least [`MIN_PIECE_TIME`], or [`LINE_TIME_LIMIT`] at the
+    /// smallest piece, `floor`); for a later one, the budget.
+    fn deadline(&self, floor: bool) -> Instant {
+        let allowed = if self.first {
+            let least = if floor {
+                LINE_TIME_LIMIT
+            } else {
+                MIN_PIECE_TIME
+            };
+            self.budget.saturating_mul(4).max(least)
+        } else {
+            self.budget
+        };
+        self.started + allowed
     }
 }
 
@@ -1163,9 +1400,6 @@ pub(crate) struct SearchState {
     /// How long each hold of the terminal lock lasted and how many cells
     /// it copied, for the lock-hold test.
     holds: Holds,
-    /// How long each piece's regex run took, for the step-deadline test.
-    #[cfg(test)]
-    pieces: Vec<Duration>,
 }
 
 /// The lock-hold record of [`SearchState`]: kept by test builds only.
@@ -1205,43 +1439,53 @@ impl SearchState {
         self.active.as_ref().map(Active::status).unwrap_or_default()
     }
 
-    /// Searches until nothing is left or `budget` has passed, checking the
-    /// deadline between pieces ([`scan_piece`]): at least one piece,
-    /// at most one when `budget` is zero, so a step overruns its budget by
-    /// at most one piece's regex run, whose time depends on the pattern. A chunk of lines is copied under one
-    /// hold of the terminal lock and may be searched over several steps;
-    /// its matches are filed when its last piece has run.
+    /// Searches until nothing is left or `budget` has passed: at most one
+    /// piece when `budget` is zero. The step ends within
+    /// `max(4 x budget, LINE_TIME_LIMIT)` plus one regex call, which is not
+    /// interruptible (module docs, Time). A chunk of lines is copied under
+    /// one hold of the terminal lock and may be searched over several
+    /// steps; its matches are filed when its last piece has run.
     pub(crate) fn step(&mut self, source: &impl TerminalSource, budget: Duration) -> SearchStatus {
         self.drawn.window = None;
-        let started = Instant::now();
-        while self.unit(source) && started.elapsed() < budget {}
+        let mut clock = Clock {
+            started: Instant::now(),
+            budget,
+            first: true,
+        };
+        loop {
+            match self.unit(source, clock) {
+                None | Some(Ran::Stop) => break,
+                Some(Ran::Piece) => clock.first = false,
+                Some(Ran::Nothing) => {}
+            }
+            if clock.started.elapsed() >= budget {
+                break;
+            }
+        }
         self.status()
     }
 
     /// Searches one piece of the chunk under way, copying the next chunk
-    /// out of the terminal first when none is; false when there was no work
-    /// left.
-    fn unit(&mut self, source: &impl TerminalSource) -> bool {
-        let Some(active) = &mut self.active else {
-            return false;
-        };
+    /// out of the terminal first when none is; `None` when there was no
+    /// work left.
+    fn unit(&mut self, source: &impl TerminalSource, clock: Clock) -> Option<Ran> {
+        let active = self.active.as_mut()?;
         if active.chunk.is_none() && !copy_chunk(active, source, &mut self.holds) {
             active.done = true;
             active.fix_current();
-            return false;
+            return None;
         }
-        #[cfg(test)]
-        let started = Instant::now();
-        let ran = active.search_piece();
-        #[cfg(test)]
-        if ran {
-            self.pieces.push(started.elapsed());
-        }
-        #[cfg(not(test))]
-        let _ = ran;
+        let ran = active.search_piece(clock);
         active.done = false;
         active.fix_current();
-        true
+        Some(ran)
+    }
+
+    /// The current match, if it is shown.
+    pub(crate) fn current_match(&self) -> Option<Match> {
+        let active = self.active.as_ref()?;
+        let (index, exact) = active.shown_index(active.current?);
+        exact.then(|| active.shown_at(index)).flatten()
     }
 
     /// Moves the current match one toward older output (`older`) or newer,
@@ -1401,11 +1645,14 @@ impl SearchState {
         std::mem::take(&mut self.holds)
     }
 
-    /// The pieces' regex run times recorded so far, for the step-deadline
-    /// test.
+    /// The pieces' regex run times recorded so far, each with its longest
+    /// single regex run, for the step-deadline test.
     #[cfg(test)]
-    pub(crate) fn take_pieces(&mut self) -> Vec<Duration> {
-        std::mem::take(&mut self.pieces)
+    pub(crate) fn take_pieces(&mut self) -> Vec<(Duration, Duration)> {
+        self.active
+            .as_mut()
+            .map(|active| std::mem::take(&mut active.pieces))
+            .unwrap_or_default()
     }
 }
 
@@ -1435,7 +1682,7 @@ fn copy_chunk(active: &mut Active, source: &impl TerminalSource, holds: &mut Hol
             let run = lines.run_above(start, lines.period);
             // Reuse needs every match of the last pass: none gave way.
             let reuse =
-                !active.truncated && !matches!(work, Work::Older { .. } | Work::Head { .. });
+                !active.truncated() && !matches!(work, Work::Older { .. } | Work::Head { .. });
             let count = copy_lines(
                 &mut active.pool,
                 &mut active.unchanged,
@@ -1782,12 +2029,6 @@ mod tests {
         format!("e{}", "\u{301}".repeat(31))
     }
 
-    /// A cell of 128 bytes: a mathematical bold `A` and 31 combining
-    /// stems.
-    fn cluster128() -> String {
-        format!("\u{1d400}{}", "\u{1d167}".repeat(31))
-    }
-
     /// One logical line of `rows` rows of `cell` at `cols` columns, on a
     /// screen two rows taller.
     fn zalgo_terminal(cols: u16, rows: usize, cell: &str) -> Terminal {
@@ -1805,16 +2046,21 @@ mod tests {
         )
     }
 
-    /// E1 (#46b): a zero-budget step runs at most one piece's regex, so a
-    /// segment of heavy combining marks (16 pieces at 2048 columns) is
-    /// searched over many steps; nothing is filed before its last piece,
-    /// and the matches are those of one long step.
+    /// E1 (#46b): a zero-budget step runs at most one piece's regex, so
+    /// segments of heavy combining marks (four lines of two rows, four
+    /// pieces each at 2048 columns) are searched over many steps; nothing
+    /// is filed before the chunk's last piece, and the matches are those of
+    /// one long step. Several segments (#331): a unit that ends only at the
+    /// end of a segment, or at the last one, still runs two pieces.
     #[test]
     fn a_zero_budget_step_runs_at_most_one_piece() {
         let cell = zalgo();
         let mut input = String::new();
         for n in 0..2048_usize * 8 {
             input.push_str(if n.is_multiple_of(97) { "X" } else { &cell });
+            if n % 4096 == 4095 {
+                input.push_str("\r\n");
+            }
         }
         let mut term = Terminal::new(10, 2048);
         term.advance(input.as_bytes());
@@ -1917,50 +2163,502 @@ mod tests {
         assert_eq!(counts(search.status()), counts(fresh.status()));
     }
 
-    /// E1 (#46b): with the quadratic pattern `\w*X|\w` on text of heavy
-    /// combining marks (a regex run of a second or more per 64 KiB piece,
-    /// a hundred pieces per chunk), a step with the C API's largest budget
-    /// (`TESSERA_SEARCH_MAX_STEP_MICROS`, 1 s) returns within that budget
-    /// plus one piece. Checking the deadline between chunks only, as
-    /// before, ran 28 s to 91 s.
+    const REGEX: QueryOptions = QueryOptions {
+        regex: true,
+        case_sensitive: true,
+    };
+
+    /// About 64 KiB of text with no `X`, as `(name, terminal, cells)`: e
+    /// with 31 combining marks (63 bytes a cell), Cyrillic (2 bytes) and
+    /// CJK (3 bytes for two columns), each one logical line.
+    fn slow_texts() -> Vec<(&'static str, Terminal, usize)> {
+        let text = |rows: u16, cols: u16, cell: &str, cells: usize| {
+            let mut term = Terminal::new(rows, cols);
+            term.advance(cell.repeat(cells).as_bytes());
+            term
+        };
+        vec![
+            ("zalgo", zalgo_terminal(80, 13, &zalgo()), 1040),
+            ("cyrillic", text(120, 300, "\u{434}", 32_768), 32_768),
+            ("cjk", text(24, 2048, "\u{4e2d}", 21_845), 21_845),
+        ]
+    }
+
+    /// The pattern of the #331 round-1 review (swift B1): its program is
+    /// near the size limit, so one regex run on a 64 KiB piece takes
+    /// 0.5-3 s depending on load and one on a 1 KiB piece 0.05-0.2 s.
+    const COSTLY_RUN: &str = r"(?:[\x{434}\x{4e2d}e\x{301}]{1,200}){1,40}\b|\w";
+
+    /// A pattern of the #331 adversarial run (F9c) that finds nothing in
+    /// [`slow_texts`], so each piece is one regex run that reaches its end
+    /// (about 0.1 s on 64 KiB). When the clock was read only before each
+    /// run, such a piece was never late, never halved and never skipped.
+    const NO_MATCH: &str = r"(?:\w{1,40}){1,5}\b\d";
+
+    /// The adversarial run's pathological pattern (F9c): one run takes
+    /// about 0.65 s per KiB of `e`, so a 1 KiB piece at the floor outlasts
+    /// [`LINE_TIME_LIMIT`].
+    const NO_MATCH_PER_KIB: &str = r"(?:e{1,400}){1,250}\b\d";
+
+    /// #331, F9, F9a: over 64 KiB of combining marks, Cyrillic and CJK, no
+    /// step takes longer than four budgets plus 250 ms plus one regex run
+    /// (its longest gap between two matches: both patterns match every
+    /// cell they do not take into a longer match), and no piece longer
+    /// than its share of that; the search finishes, with every cell found
+    /// (each is one match of `\w*X\b|\w`) or a piece skipped.
+    /// `\w*X\b|\w` is quadratic (a 64 KiB piece takes 19 s to 32 s);
+    /// with [`COSTLY_RUN`] a single run is the cost. Before the clock was
+    /// read inside a piece, one step took the whole piece; before it was
+    /// read after every run, one step took 16 runs. [`NO_MATCH`] finds
+    /// nothing, so its one run per piece is the cost, and it must halve;
+    /// at the floor, [`NO_MATCH_PER_KIB`] must skip rows and say so (F9c:
+    /// before the clock was read after a last run without a match, both
+    /// searched every piece to its end).
     ///
     /// Timing-based: release only, with the other timing bars.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "timing bar; run in release")]
-    fn a_step_ends_within_one_piece_of_its_budget() {
-        const BUDGET: Duration = Duration::from_secs(1);
-        /// Time for the copy under the lock and the bookkeeping around the
-        /// pieces.
-        const SLACK: Duration = Duration::from_millis(50);
-        let regex = QueryOptions {
-            regex: true,
-            case_sensitive: true,
-        };
-        for (cols, rows, cell, name) in [
-            (2048, 31, zalgo(), "e + 31 marks, 2048 x 31"),
-            (80, 255, zalgo(), "e + 31 marks, 80 x 255"),
-            (2048, 31, cluster128(), "128-byte clusters, 2048 x 31"),
-        ] {
-            let shared = Shared::new(zalgo_terminal(cols, rows, &cell));
-            let mut search = SearchState::default();
-            search.start(r"\w*X|\w", regex).unwrap();
-            let started = Instant::now();
-            let status = search.step(&shared, BUDGET);
-            let took = started.elapsed();
-            let pieces = search.take_pieces();
-            let longest = pieces.iter().copied().max().unwrap_or_default();
-            eprintln!(
-                "{name}: step {took:?}, {} pieces, longest {longest:?}, {status:?}",
-                pieces.len()
-            );
-            assert!(
-                search.active.as_ref().unwrap().chunk.is_some(),
-                "{name}: the step finished its chunk, so it tested nothing"
-            );
-            assert!(
-                took <= BUDGET + longest + SLACK,
-                "{name}: the step took {took:?}, over {BUDGET:?} + one piece ({longest:?})"
-            );
+    fn no_step_outlasts_four_budgets_and_a_quarter_second() {
+        let quadratic = [
+            Duration::ZERO,
+            Duration::from_millis(4),
+            Duration::from_millis(50),
+        ]
+        .map(|budget| (r"\w*X\b|\w", budget));
+        // The find bar's budget.
+        let costly = [COSTLY_RUN, NO_MATCH].map(|pattern| (pattern, Duration::from_millis(4)));
+        for (pattern, budget) in quadratic.into_iter().chain(costly) {
+            let bound = budget * 4 + LINE_TIME_LIMIT;
+            for (name, term, cells) in slow_texts() {
+                let shared = Shared::new(term);
+                let mut search = SearchState::default();
+                search.start(pattern, REGEX).unwrap();
+                let mut longest = Duration::ZERO;
+                let mut longest_piece = Duration::ZERO;
+                let mut longest_run = Duration::ZERO;
+                let mut steps = 0;
+                let started = Instant::now();
+                let status = loop {
+                    let step = Instant::now();
+                    let status = search.step(&shared, budget);
+                    let took = step.elapsed();
+                    steps += 1;
+                    let pieces = search.take_pieces();
+                    if budget.is_zero() {
+                        assert!(
+                            pieces.len() <= 1,
+                            "{name}: a zero budget ran {} pieces",
+                            pieces.len()
+                        );
+                    }
+                    longest = longest.max(took);
+                    let mut run = Duration::ZERO;
+                    for (piece, piece_run) in pieces {
+                        // A single piece's regex run, timed alone: two
+                        // pieces in one unit could not hide behind the
+                        // step's bound.
+                        assert!(
+                            piece <= bound + piece_run,
+                            "{name}, {pattern}: a piece took {piece:?}, its longest run \
+                             {piece_run:?}"
+                        );
+                        longest_piece = longest_piece.max(piece);
+                        run = run.max(piece_run);
+                    }
+                    longest_run = longest_run.max(run);
+                    assert!(
+                        took <= bound + run,
+                        "{name}, {pattern}, budget {budget:?}: step {steps} took {took:?}, over \
+                         {bound:?} and its longest run {run:?}"
+                    );
+                    if status.done {
+                        break status;
+                    }
+                };
+                let active = search.active.as_ref().unwrap();
+                let (limit, skips) = (active.limit, active.skips);
+                eprintln!(
+                    "{name}, {pattern}, budget {budget:?}: {steps} steps in {:?}, longest \
+                     {longest:?}, longest piece {longest_piece:?}, longest run \
+                     {longest_run:?}, limit {limit:?}, {skips} skipped, {status:?}",
+                    started.elapsed()
+                );
+                assert!(
+                    limit != PieceLimit::FULL,
+                    "{name}: never halved, so tested nothing"
+                );
+                // A halved limit cuts these lines: the status says so.
+                assert!(status.lines_skipped, "{name}: {status:?}");
+                if pattern == NO_MATCH {
+                    assert_eq!(status.matches, 0, "{name}: {status:?}");
+                } else if pattern != COSTLY_RUN {
+                    assert!(
+                        skips > 0 || status.matches == cells,
+                        "{name}, budget {budget:?}: {status:?}, {cells} cells"
+                    );
+                }
+                assert!(status.matches <= cells, "{name}: {status:?}, counted twice");
+            }
         }
+        // At the floor, a row whose single run outlasts the line limit is
+        // skipped and reported (F9c).
+        floor_skips_a_row_whose_one_run_outlasts_the_line_limit();
+    }
+
+    /// At the floor, a row whose single run outlasts the line limit is
+    /// skipped and reported, not searched to its end (F9c): three rows of
+    /// 1100 `e`, one logical line, each row cut to 1 KiB pieces.
+    fn floor_skips_a_row_whose_one_run_outlasts_the_line_limit() {
+        let budget = Duration::from_millis(4);
+        let bound = budget * 4 + LINE_TIME_LIMIT;
+        let mut term = Terminal::new(30, 1100);
+        term.advance("e".repeat(1100 * 3).as_bytes());
+        let shared = Shared::new(term);
+        let mut search = SearchState::default();
+        search.start(NO_MATCH_PER_KIB, REGEX).unwrap();
+        let mut limit = PieceLimit::FULL;
+        while let Some(half) = limit.halved(1100) {
+            limit = half;
+        }
+        search.active.as_mut().unwrap().limit = limit;
+        let mut longest = Duration::ZERO;
+        let status = loop {
+            let step = Instant::now();
+            let status = search.step(&shared, budget);
+            let took = step.elapsed();
+            let run = search
+                .take_pieces()
+                .into_iter()
+                .map(|(_, run)| run)
+                .max()
+                .unwrap_or_default();
+            assert!(
+                took <= bound + run,
+                "floor: a step took {took:?}, its longest run {run:?}"
+            );
+            longest = longest.max(took);
+            if status.done {
+                break status;
+            }
+        };
+        let skips = search.active.as_ref().unwrap().skips;
+        eprintln!(
+            "floor, {NO_MATCH_PER_KIB}: longest step {longest:?}, {skips} skipped, {status:?}"
+        );
+        assert!(skips > 0, "floor: no row skipped, {status:?}");
+        assert!(status.lines_skipped, "floor: {status:?}");
+    }
+
+    /// F9: a piece too slow for the step's first-piece deadline is searched
+    /// again in halves (the limit shrinks and stays shrunk), each match is
+    /// counted once, and a zero-budget step still runs at most one piece.
+    /// The 64 KiB piece of combining marks takes seconds; the halves get
+    /// under 16 ms at about a kilobyte, far from the 250 ms skip.
+    #[test]
+    fn a_slow_piece_is_searched_again_in_halves() {
+        let (_, term, cells) = slow_texts().swap_remove(0);
+        let shared = Shared::new(term);
+        let mut search = SearchState::default();
+        search.start(r"\w*X\b|\w", REGEX).unwrap();
+        let mut steps = 0;
+        let mut limits = vec![PieceLimit::FULL];
+        let status = loop {
+            let status = search.step(&shared, Duration::ZERO);
+            steps += 1;
+            assert!(steps < 1_000, "no end: {status:?}");
+            assert!(
+                search.take_pieces().len() <= 1,
+                "step {steps} ran two pieces"
+            );
+            let limit = search.active.as_ref().unwrap().limit;
+            if limits.last() != Some(&limit) {
+                limits.push(limit);
+            }
+            if status.done {
+                break status;
+            }
+        };
+        eprintln!("{steps} steps, limits {limits:?}, {status:?}");
+        assert!(limits.len() > 2, "{limits:?}");
+        // Each change shrinks the limit, in bytes or (at the byte floor,
+        // when the halves are slow too under load) in cells, never grows
+        // it (#331 round 1, rust B2).
+        assert!(
+            limits.windows(2).all(|w| w[1] != w[0]
+                && w[1].bytes() <= w[0].bytes()
+                && w[1].cells() <= w[0].cells()),
+            "{limits:?}"
+        );
+        assert!(status.matches <= cells, "{status:?}: counted twice");
+        let skips = search.active.as_ref().unwrap().skips;
+        assert!(skips > 0 || status.matches == cells, "{status:?}");
+        // The halved limit cut the line: the status says so.
+        assert!(status.lines_skipped, "{status:?}");
+        // A new query starts at the full size again.
+        search.start("x", LITERAL).unwrap();
+        assert_eq!(search.active.as_ref().unwrap().limit, PieceLimit::FULL);
+    }
+
+    /// F9: a piece still too slow at the smallest size is skipped, with
+    /// the matches found before its stop, and the search goes on to the
+    /// end and says lines were skipped. The clock is faked: the step's
+    /// start is put a second in the past, so every piece is late.
+    #[test]
+    fn a_piece_too_slow_at_the_floor_is_skipped() {
+        let mut term = Terminal::new(6, 40);
+        // 15 lines in the history, five on the screen.
+        term.advance("aXa\r\n".repeat(20).as_bytes());
+        let shared = Shared::new(term);
+        let mut search = SearchState::default();
+        search.start("X", LITERAL).unwrap();
+        // At the floor for 40 columns.
+        let mut limit = PieceLimit::FULL;
+        while let Some(half) = limit.halved(40) {
+            limit = half;
+        }
+        search.active.as_mut().unwrap().limit = limit;
+        let late = Clock {
+            started: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+            budget: Duration::ZERO,
+            first: true,
+        };
+        let mut units = 0;
+        while search.unit(&shared, late).is_some() {
+            units += 1;
+            assert!(units < 100, "never done");
+        }
+        let status = search.status();
+        eprintln!("{units} units, {status:?}");
+        assert!(status.lines_skipped, "{status:?}");
+        assert!(status.done, "{status:?}");
+        // The pieces stopped before their first regex run: nothing found.
+        assert_eq!(status.matches, 0, "{status:?}");
+        let active = search.active.as_ref().unwrap();
+        assert!(active.skipped != 0, "no history line skipped");
+        assert!(active.screen_skipped, "no screen line skipped");
+        // A fresh search on time finds all 20 and skips nothing.
+        let mut fresh = SearchState::default();
+        fresh.start("X", LITERAL).unwrap();
+        while !fresh.step(&shared, Duration::from_secs(60)).done {}
+        let status = fresh.status();
+        assert_eq!((status.matches, status.lines_skipped), (20, false));
+        // Once the skipped lines are gone, the live search says so.
+        shared
+            .term
+            .lock()
+            .unwrap()
+            .advance(b"\x1b[3J\x1b[H\x1b[2JcXc");
+        while !search.step(&shared, Duration::from_secs(60)).done {}
+        let status = search.status();
+        assert_eq!(
+            (status.matches, status.lines_skipped),
+            (1, false),
+            "{status:?}"
+        );
+    }
+
+    /// #331 adversarial case A (F9c): a piece too slow is searched again
+    /// at half its own size, so the first retry already cuts it. One line
+    /// of 8000 `e` is one piece far below the full limit; halving the
+    /// limit from 64 KiB re-ran the whole line at 32, 16 and 8 KiB, a
+    /// costly call each time. A deadline already past makes the first
+    /// piece late without any slow pattern.
+    #[test]
+    fn a_slow_piece_is_retried_at_half_its_own_size() {
+        let mut term = Terminal::new(30, 300);
+        term.advance("e".repeat(8000).as_bytes());
+        let shared = Shared::new(term);
+        let mut search = SearchState::default();
+        search.start(r"e\d", REGEX).unwrap();
+        let late = Clock {
+            started: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+            budget: Duration::ZERO,
+            first: true,
+        };
+        for _ in 0..10 {
+            if search.active.as_ref().unwrap().limit != PieceLimit::FULL {
+                break;
+            }
+            search.unit(&shared, late);
+        }
+        let limit = search.active.as_ref().unwrap().limit;
+        assert!(
+            limit.bytes() <= 4000 && limit.cells() <= 4000,
+            "the retry of an 8000-byte line runs at {limit:?}, not cutting it"
+        );
+        assert!(limit.cells() >= 300, "below one row: {limit:?}");
+    }
+
+    /// #331 round 1 (rust B1, F9a): a halved limit cuts a logical line
+    /// inside, and a match across the cut is not found; the status then
+    /// says lines were skipped, so the count is never short without saying
+    /// so. At the floor for 40 columns every row is a piece, and each
+    /// `hello` crosses a row's end. History and screen both say so, and a
+    /// second screen pass does not reuse the cut segment's matches.
+    #[test]
+    fn a_match_lost_at_a_halved_cut_is_reported() {
+        let mut term = Terminal::new(6, 40);
+        let hellos = format!("hello{}", "a".repeat(35)).repeat(30);
+        // Two such lines: the screen region takes the second whole (it
+        // reaches the screen), the history holds the first.
+        let line = format!("{}{hellos}\r\n", "a".repeat(37));
+        term.advance(line.repeat(2).as_bytes());
+        let shared = Shared::new(term);
+        // At the full limit: all 60 found, nothing skipped.
+        let mut fresh = SearchState::default();
+        fresh.start("hello", LITERAL).unwrap();
+        while !fresh.step(&shared, Duration::from_secs(60)).done {}
+        let status = fresh.status();
+        assert_eq!((status.matches, status.lines_skipped), (60, false));
+        let mut search = SearchState::default();
+        search.start("hello", LITERAL).unwrap();
+        let mut limit = PieceLimit::FULL;
+        while let Some(half) = limit.halved(40) {
+            limit = half;
+        }
+        search.active.as_mut().unwrap().limit = limit;
+        while !search.step(&shared, Duration::from_secs(60)).done {}
+        let status = search.status();
+        assert!(
+            status.matches < 30,
+            "{status:?}: nothing lost, tested nothing"
+        );
+        assert!(status.lines_skipped, "{status:?}: lost at cuts, unreported");
+        let active = search.active.as_ref().unwrap();
+        assert_eq!(active.skips, 0, "no piece was slow");
+        assert!(active.skipped != 0, "the history's cut not noted");
+        assert!(active.screen_skipped, "the screen's cut not noted");
+        // New output on the last row: the next screen pass searches the cut
+        // segment again rather than keep its short count.
+        shared.term.lock().unwrap().advance(b"x");
+        while !search.step(&shared, Duration::from_secs(60)).done {}
+        assert!(search.active.as_ref().unwrap().screen_skipped);
+        assert!(search.status().lines_skipped);
+    }
+
+    /// F9: a later piece of a step that passes the budget is not halved or
+    /// skipped: it runs first in the next step.
+    #[test]
+    fn a_later_piece_past_the_budget_runs_first_next_step() {
+        let mut term = Terminal::new(6, 40);
+        term.advance(b"aXa\r\nbXb\r\n");
+        let shared = Shared::new(term);
+        let mut search = SearchState::default();
+        search.start("X", LITERAL).unwrap();
+        let late = Clock {
+            started: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+            budget: Duration::ZERO,
+            first: false,
+        };
+        for _ in 0..10 {
+            assert_eq!(search.unit(&shared, late), Some(Ran::Stop));
+        }
+        let active = search.active.as_ref().unwrap();
+        assert_eq!(active.limit, PieceLimit::FULL);
+        assert_eq!(search.status().matches, 0);
+        assert!(!search.status().lines_skipped);
+        while !search.step(&shared, Duration::ZERO).done {}
+        let status = search.status();
+        assert_eq!(
+            (status.matches, status.lines_skipped),
+            (2, false),
+            "{status:?}"
+        );
+    }
+
+    /// Steps `search` over `shared` to the end with a long budget.
+    fn run(search: &mut SearchState, shared: &Shared) -> SearchStatus {
+        while !search.step(shared, Duration::from_secs(60)).done {}
+        search.status()
+    }
+
+    /// What a fresh search for `x` finds on `shared`: count, truncation.
+    fn fresh_x(shared: &Shared) -> (usize, bool, bool) {
+        let mut fresh = SearchState::default();
+        fresh.start("x", LITERAL).unwrap();
+        let status = run(&mut fresh, shared);
+        (status.matches, status.truncated, status.lines_skipped)
+    }
+
+    fn counts(status: SearchStatus) -> (usize, bool, bool) {
+        (status.matches, status.truncated, status.lines_skipped)
+    }
+
+    /// 600 lines of 200 `x` on a 24 x 200 screen: 120 000 matches, so the
+    /// search for `x` is truncated.
+    fn truncated_x(scrollback: usize) -> (Shared, SearchState) {
+        let mut term = Terminal::new(24, 200);
+        term.set_max_scrollback(scrollback);
+        term.advance(format!("{}\r\n", "x".repeat(200)).repeat(600).as_bytes());
+        let shared = Shared::new(term);
+        let mut search = SearchState::default();
+        search.start("x", LITERAL).unwrap();
+        let status = run(&mut search, &shared);
+        assert_eq!((status.matches, status.truncated), (MAX_MATCHES, true));
+        (shared, search)
+    }
+
+    /// #318 (adversarial t1): ED 3 clears the history whose matches gave
+    /// way; the live search is no longer truncated, as a fresh one is not.
+    #[test]
+    fn truncation_clears_when_ed3_clears_its_lines() {
+        let (shared, mut search) = truncated_x(10_000);
+        shared.term.lock().unwrap().advance(b"\x1b[3J");
+        let live = counts(run(&mut search, &shared));
+        let fresh = fresh_x(&shared);
+        assert_eq!(live, fresh);
+        assert!(!fresh.1, "{fresh:?}");
+    }
+
+    /// #318 (adversarial t1b): eviction takes every line whose matches gave
+    /// way; the live search is no longer truncated.
+    #[test]
+    fn truncation_clears_when_its_lines_are_evicted() {
+        let (shared, mut search) = truncated_x(1_000);
+        shared
+            .term
+            .lock()
+            .unwrap()
+            .advance("plain\r\n".repeat(1_100).as_bytes());
+        let live = counts(run(&mut search, &shared));
+        assert_eq!(live, fresh_x(&shared));
+        assert_eq!(live, (0, false, false));
+    }
+
+    /// #318 (adversarial t1d): the same on the alternate screen, and after
+    /// leaving it.
+    #[test]
+    fn truncation_clears_on_the_alternate_screen() {
+        let (shared, mut search) = truncated_x(10_000);
+        shared
+            .term
+            .lock()
+            .unwrap()
+            .advance(b"\x1b[?1049h\x1b[3Jxx\r\nx");
+        let live = counts(run(&mut search, &shared));
+        assert_eq!(live, fresh_x(&shared));
+        assert!(!live.1, "{live:?}");
+        shared.term.lock().unwrap().advance(b"\x1b[?1049l");
+        let live = counts(run(&mut search, &shared));
+        assert_eq!(live, fresh_x(&shared));
+        assert!(!live.1, "{live:?}");
+    }
+
+    /// #318: a screen pass cut at the cap (102 400 matches on a 50 x 2048
+    /// screen) makes the search truncated only until a pass that fits.
+    #[test]
+    fn a_truncated_screen_pass_clears_with_the_next_one() {
+        let mut term = Terminal::new(50, 2048);
+        term.set_max_scrollback(0);
+        term.advance("x".repeat(50 * 2048 - 1).as_bytes());
+        let shared = Shared::new(term);
+        let mut search = SearchState::default();
+        search.start("x", LITERAL).unwrap();
+        let status = run(&mut search, &shared);
+        assert_eq!((status.matches, status.truncated), (MAX_MATCHES, true));
+        shared.term.lock().unwrap().advance(b"\x1b[H\x1b[2Jxx");
+        let live = counts(run(&mut search, &shared));
+        assert_eq!(live, fresh_x(&shared));
+        assert_eq!(live, (2, false, false));
     }
 }

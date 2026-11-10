@@ -19,7 +19,10 @@ final class FindController {
 
     /// The step budget per display refresh, in microseconds: a quarter of
     /// a 60 Hz frame, so typing stays smooth while a long history is
-    /// scanned (docs/security.md: a step overruns it by at most one piece).
+    /// scanned (docs/security.md: a step returns within four budgets plus
+    /// 250 ms plus one regex call, which a pathological pattern can make
+    /// last many seconds on a query's first call, 7.3 s measured on an 8 KB
+    /// line; ADR 0038).
     static let stepBudgetMicros: UInt32 = 4_000
 
     /// How long typing must pause before the query reaches the core
@@ -250,20 +253,20 @@ final class FindController {
 
     /// The first match found: made current by `direction` and scrolled to.
     /// The core makes its newest match current by itself (ADR 0038, D16)
-    /// but scrolls only on a move, and the C API has no other way to
-    /// scroll to a match: one move away, the view put back where it was,
-    /// and one move back leave the newest current, the view moved only if
-    /// that match was out of it (a single match is its own neighbour).
+    /// but scrolls only on a move or a reveal: one reveal call scrolls to
+    /// it, the view moved only if that match was out of it.
     private func revealFirstMatch(_ direction: Direction) {
         guard status.current != nil else {
             _ = move(direction)
             return
         }
-        if status.matches > 1, let saved = try? session.scrollPosition.offset {
-            _ = move(.older)
-            call("scroll back") { try session.scroll(to: .offset(saved)) }
+        searchCallCount += 1
+        do {
+            status = try session.searchReveal()
+        } catch {
+            Self.log.debug("search reveal failed: \(String(describing: error), privacy: .public)")
         }
-        _ = move(.newer)
+        onChange?()
     }
 
     private func move(_ direction: Direction) -> Bool {
@@ -298,18 +301,45 @@ final class FindController {
         guard !copied.text.isEmpty else { return false }
         pasteboard.clearContents()
         pasteboard.setString(copied.text, forType: .string)
-        notice = copied.truncated ? "Copied the matches that fit in 1 MB" : "Copied all matches"
+        notice = Self.copyNotice(copyTruncated: copied.truncated, status: status)
         onChange?()
         return true
+    }
+
+    /// What Copy All Matches says, from whether the copy stopped at 1 MiB
+    /// (`copyTruncated`) and the search's `status`: it says "all" only when
+    /// the copy is whole, no match gave way at the cap and no line was
+    /// skipped (#331).
+    static func copyNotice(copyTruncated: Bool, status: TesseraSession.SearchStatus) -> String {
+        if copyTruncated {
+            return "Copied the matches that fit in 1 MB"
+        }
+        if status.truncated {
+            // Only the matches the search kept (the newest
+            // ``TesseraSession/searchMaxMatches``) were copied.
+            return "Copied \(format(status.matches)) of more than \(format(TesseraSession.searchMaxMatches))"
+        }
+        if status.linesSkipped {
+            // The skipped lines' matches are not in the copy.
+            return "Copied the matches found; some lines were skipped"
+        }
+        return "Copied all matches"
     }
 
     // MARK: Shown text
 
     /// The count: "3 of 12", "12 matches" without a current one, "more
     /// than 100 000" at the cap, "No matches", or empty without a query
-    /// (or with a refused one: ``errorText`` says why).
+    /// (or with a refused one: ``errorText`` says why); with ", some lines
+    /// skipped" when lines too slow for the pattern were left out or cut
+    /// (their matches may be missing).
     var countText: String {
         guard isOpen, !query.isEmpty, refusal == nil, status.active else { return "" }
+        let count = baseCountText
+        return status.linesSkipped ? "\(count), some lines skipped" : count
+    }
+
+    private var baseCountText: String {
         if status.truncated {
             return "more than \(Self.format(TesseraSession.searchMaxMatches))"
         }
@@ -424,14 +454,16 @@ final class FindController {
 
     /// `text` with every regex metacharacter escaped (the `regex` crate's
     /// syntax: escaping ASCII punctuation is always allowed; `<` and `>`
-    /// are left, since `\<` and `\>` are word boundaries).
+    /// are left, since `\<` and `\>` are word boundaries). Escaped per
+    /// unicode scalar, as the regex reads it: a `.` with a combining mark
+    /// is one Swift character but still a metacharacter.
     static func escapedForRegex(_ text: String) -> String {
-        var escaped = ""
-        for character in text {
-            if "\\.+*?()|[]{}^$#&-~".contains(character) { escaped.append("\\") }
-            escaped.append(character)
+        var escaped = String.UnicodeScalarView()
+        for scalar in text.unicodeScalars {
+            if "\\.+*?()|[]{}^$#&-~".unicodeScalars.contains(scalar) { escaped.append("\\") }
+            escaped.append(scalar)
         }
-        return escaped
+        return String(escaped)
     }
 
     private static func isOddRunOfBackslashes(_ text: String) -> Bool {
