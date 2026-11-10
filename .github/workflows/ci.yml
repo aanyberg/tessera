@@ -43,10 +43,10 @@ jobs:
     name: macOS app
     runs-on: macos-15
     needs: rust
-    # A normal run is 8-10 minutes (the suite has grown; it ran 8-9.5 minutes against a 10 minute step limit and timed out
-    # on a slow runner). just app-test hung three times (#121); the job limit is the backstop for a hang
+    # A normal run of just app-test is 12-14 minutes (the suite has grown; a run that passed every test took 14:02 against
+    # a 14 minute step limit and timed out). just app-test hung three times (#121); the job limit is the backstop for a hang
     # below the test level, the step limit and xcodebuild's per-test timeouts (in the justfile) report it earlier.
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -57,9 +57,9 @@ jobs:
       - run: sudo xcode-select -s /Applications/Xcode_16.4.app || true
       - run: just app
       - run: just app-test
-        timeout-minutes: 14
+        timeout-minutes: 18
       # After a failed, timed-out or cancelled test step the full xcodebuild logs name the hanging test (#121). The
-      # step limit (14 min) is below the job limit (20 min), so this step still runs after a step timeout.
+      # step limit (18 min) is below the job limit (25 min), so this step still runs after a step timeout.
       - name: Upload app test logs
         if: failure() || cancelled()
         uses: actions/upload-artifact@v4
