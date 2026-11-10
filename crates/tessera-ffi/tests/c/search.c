@@ -2,7 +2,8 @@
  * Search smoke test of TesseraCore.h from C, built and run by
  * scripts/ffi-c-test.sh: spawn /bin/sh printing three lines, step a literal
  * search (waiting at most 5 s for the output), move between the matches
- * both ways, copy them all into a short and a long buffer, then a
+ * both ways, reveal the current one without moving it, copy them all into
+ * a short and a long buffer, then a
  * case-sensitive regex, refused patterns (invalid and too complex regex,
  * too long, not UTF-8, an unknown option), clearing, NULL pointers and an
  * unknown session id.
@@ -88,7 +89,8 @@ int main(void) {
         struct timespec pause = {.tv_sec = 0, .tv_nsec = 10 * 1000 * 1000};
         nanosleep(&pause, NULL);
     }
-    CHECK(status.active && status.done && !status.truncated, "status flags");
+    CHECK(status.active && status.done && !status.truncated && !status.lines_skipped,
+          "status flags");
     CHECK(status.has_current && status.current == 2, "current %zu", status.current);
 
     /* Older steps back, newer forward; both wrap. */
@@ -101,6 +103,12 @@ int main(void) {
     CHECK(status.current == 2, "older past the oldest gave %zu", status.current);
     EXPECT(tessera_session_search_status(app, id, &status), TESSERA_ERROR_OK);
     CHECK(status.matches == 3 && status.current == 2, "status after the moves");
+
+    /* Reveal scrolls to the current match (on screen here) and keeps it. */
+    status.current = 99;
+    EXPECT(tessera_session_search_reveal(app, id, &status), TESSERA_ERROR_OK);
+    CHECK(status.matches == 3 && status.has_current && status.current == 2,
+          "reveal moved the current match to %zu", status.current);
 
     /* Copy all matches: a short buffer gets nothing but the size. */
     const char *all = "needle\nNEEDLE\nneedle";
@@ -196,6 +204,8 @@ int main(void) {
     EXPECT(tessera_session_search_step(NULL, id, 0, &status), TESSERA_ERROR_NULL_POINTER);
     EXPECT(tessera_session_search_older(app, id, NULL), TESSERA_ERROR_NULL_POINTER);
     EXPECT(tessera_session_search_newer(NULL, id, &status), TESSERA_ERROR_NULL_POINTER);
+    EXPECT(tessera_session_search_reveal(app, id, NULL), TESSERA_ERROR_NULL_POINTER);
+    EXPECT(tessera_session_search_reveal(NULL, id, &status), TESSERA_ERROR_NULL_POINTER);
     EXPECT(tessera_session_search_status(app, id, NULL), TESSERA_ERROR_NULL_POINTER);
     EXPECT(tessera_session_search_clear(NULL, id), TESSERA_ERROR_NULL_POINTER);
     EXPECT(tessera_session_search_matches_text(app, id, (uint8_t *)buf, sizeof buf, NULL, NULL),
@@ -210,6 +220,9 @@ int main(void) {
     CHECK(status.matches == 0, "status not zeroed after an unknown session");
     EXPECT(tessera_session_search_older(app, unknown, &status), TESSERA_ERROR_SESSION_NOT_FOUND);
     EXPECT(tessera_session_search_newer(app, unknown, &status), TESSERA_ERROR_SESSION_NOT_FOUND);
+    status.matches = 7;
+    EXPECT(tessera_session_search_reveal(app, unknown, &status), TESSERA_ERROR_SESSION_NOT_FOUND);
+    CHECK(status.matches == 0, "reveal left the status after an unknown session");
     EXPECT(tessera_session_search_status(app, unknown, &status), TESSERA_ERROR_SESSION_NOT_FOUND);
     EXPECT(tessera_session_search_clear(app, unknown), TESSERA_ERROR_SESSION_NOT_FOUND);
     len = 5;

@@ -12,10 +12,13 @@
 //! A segment whose text is longer than [`MAX_HAYSTACK_BYTES`] (multi-byte
 //! characters, combining marks) is searched in pieces of at most that many
 //! bytes, cut between cells where the cap falls; a match that would cross
-//! such a cut is not found either.
+//! such a cut is not found either. A caller can search in smaller pieces
+//! ([`PieceLimit`]) and stop a piece's regex run at a deadline
+//! ([`scan_piece`]).
 
 use std::fmt;
 use std::ops::ControlFlow;
+use std::time::Instant;
 
 use regex::{Regex, RegexBuilder};
 use tessera_grid::{Cell, CellFlags, Line};
@@ -42,6 +45,16 @@ pub const DFA_SIZE_LIMIT: usize = 4 << 20;
 /// bounds the text buffer and the regex crate's quadratic worst case for
 /// iterating matches (`O(m * n^2)` for a haystack of `n` bytes).
 pub const MAX_HAYSTACK_BYTES: usize = 64 << 10;
+
+/// Most cells of one piece of text at the full [`PieceLimit`]: a segment
+/// never holds more (it has fewer than two periods of rows, each period at
+/// most half of [`MAX_HAYSTACK_BYTES`] cells), so at the full limit only
+/// the byte cap cuts a segment into pieces.
+pub const MAX_PIECE_CELLS: usize = MAX_HAYSTACK_BYTES;
+
+/// The fewest bytes a halved [`PieceLimit`] allows: halving stops once a
+/// piece is at most one row and at most this many bytes.
+pub const MIN_PIECE_BYTES: usize = 1 << 10;
 
 /// The longest [`segment_period`], in rows.
 pub const MAX_SEGMENT_PERIOD: usize = 128;
@@ -78,8 +91,10 @@ pub struct QueryOptions {
 ///
 /// The message of [`QueryError::Syntax`] quotes the pattern, which may be
 /// anything the user typed: show it to the user, never log it (security
-/// rule S8).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// rule S8). Its [`Debug`](fmt::Debug) form gives the message's length
+/// only, so a `{:?}` of the error (or of an error that wraps it) does not
+/// carry the pattern into a log.
+#[derive(Clone, PartialEq, Eq)]
 pub enum QueryError {
     /// The pattern is longer than [`MAX_QUERY_BYTES`] bytes.
     TooLong {
@@ -106,6 +121,20 @@ impl fmt::Display for QueryError {
                 "the pattern is too complex to search; a smaller repetition count \
                  or ASCII classes such as (?-u:\\w) compile smaller",
             ),
+        }
+    }
+}
+
+impl fmt::Debug for QueryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLong { bytes } => f.debug_struct("TooLong").field("bytes", bytes).finish(),
+            // The message quotes the pattern (S8): its length only.
+            Self::Syntax(message) => f
+                .debug_struct("Syntax")
+                .field("message_bytes", &message.len())
+                .finish(),
+            Self::TooComplex => f.write_str("TooComplex"),
         }
     }
 }
@@ -173,12 +202,34 @@ impl Query {
     pub fn find(
         &self,
         haystack: &Haystack,
-        mut found: impl FnMut(SegmentMatch) -> ControlFlow<()>,
+        found: impl FnMut(SegmentMatch) -> ControlFlow<()>,
     ) -> ControlFlow<()> {
+        self.find_until(haystack, None, found)
+            .unwrap_or(ControlFlow::Continue(()))
+    }
+
+    /// [`Query::find`] that stops once `deadline` has passed: `None` when
+    /// it stopped there, the matches before it having been handed to
+    /// `found`. The clock is read before the first of the regex crate's
+    /// runs and after every run, the last one too, whether or not it found
+    /// a match, so the stop comes at most one run late (#331): a deadline
+    /// already past stops before any regex runs, and a search whose last
+    /// run ended past the deadline returns `None` even though it reached
+    /// the haystack's end. One run is not interruptible; it costs up to
+    /// the haystack's length times the program's size.
+    pub fn find_until(
+        &self,
+        haystack: &Haystack,
+        deadline: Option<Instant>,
+        mut found: impl FnMut(SegmentMatch) -> ControlFlow<()>,
+    ) -> Option<ControlFlow<()>> {
         let text = haystack.text.as_str();
         let mut at = haystack.start;
         let mut previous_end: Option<(u32, u16)> = None;
         while at <= haystack.end {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return None;
+            }
             let Some(m) = self.regex.find_at(text, at) else {
                 break;
             };
@@ -200,14 +251,22 @@ impl Query {
             }
             let end = (last.row, last.col + last.width);
             previous_end = Some(end);
-            found(SegmentMatch {
+            let flow = found(SegmentMatch {
                 start_row: first.row,
                 start_col: first.col,
                 end_row: last.row,
                 end_col: end.1,
-            })?;
+            });
+            if flow.is_break() {
+                return Some(flow);
+            }
         }
-        ControlFlow::Continue(())
+        // The last run, which found nothing past the matches already
+        // handed over, may itself have passed the deadline (#331, F9c).
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return None;
+        }
+        Some(ControlFlow::Continue(()))
     }
 }
 
@@ -280,6 +339,8 @@ pub struct Haystack {
     end: usize,
     /// True when text past [`MAX_HAYSTACK_BYTES`] was left out.
     capped: bool,
+    /// Cells the last fill took in, spacers and padding included.
+    cells: usize,
     /// Segments, kept for [`scan`] to reuse.
     segments: Vec<Segment>,
 }
@@ -297,13 +358,19 @@ impl Haystack {
     /// [`MAX_HAYSTACK_BYTES`] is left out.
     pub fn fill(&mut self, rows: &[Line], continues_above: bool, continues_below: bool) {
         // The rest of a capped segment is left out, as documented.
-        let _ = self.fill_from(rows, (0, 0), continues_above, continues_below);
+        let _ = self.fill_from(
+            rows,
+            (0, 0),
+            PieceLimit::FULL,
+            continues_above,
+            continues_below,
+        );
     }
 
     /// [`Haystack::fill`] from the cell at `from` (row index in `rows`,
-    /// column) on: the cells before it are left out. Returns the position
-    /// of the first cell left out at the cap, or `None` when the text
-    /// reaches the end of `rows`.
+    /// column) on, at most `limit`'s bytes and cells: the cells before
+    /// `from` are left out. Returns the position of the first cell left
+    /// out at the cap, or `None` when the text reaches the end of `rows`.
     ///
     /// The first cell always goes in, so a refill from the returned
     /// position makes progress; a cell holds at most
@@ -312,6 +379,7 @@ impl Haystack {
         &mut self,
         rows: &[Line],
         from: (usize, usize),
+        limit: PieceLimit,
         continues_above: bool,
         continues_below: bool,
     ) -> Option<(usize, usize)> {
@@ -322,7 +390,9 @@ impl Haystack {
             self.text.push(CUT);
         }
         self.start = self.text.len();
-        let limit = self.start + MAX_HAYSTACK_BYTES;
+        let cell_limit = limit.cells.max(1);
+        let mut cells_left = cell_limit;
+        let limit = self.start + limit.bytes.max(1);
         let last_row = rows.len().saturating_sub(1);
         let mut stopped = None;
         'rows: for (row, line) in rows.iter().enumerate().skip(from.0) {
@@ -333,14 +403,24 @@ impl Haystack {
                 cells.len()
             };
             let first_col = if row == from.0 { from.1.min(end) } else { 0 };
+            if first_col < end && cells_left == 0 {
+                // The cell cap: the piece ends before this row.
+                self.capped = true;
+                stopped = Some((row, first_col));
+                break;
+            }
+            // The cells this row gives, at most what the cell cap leaves.
+            let row_end = end.min(first_col.saturating_add(cells_left));
+            cells_left -= row_end - first_col;
             // True while the last span is a run this row can extend.
             let mut open = false;
-            for (col, cell) in cells[..end].iter().enumerate().skip(first_col) {
+            for (col, cell) in cells[..row_end].iter().enumerate().skip(first_col) {
                 if is_plain(cell) {
                     let before = self.text.len();
                     if before >= limit {
                         self.capped = true;
                         stopped = Some((row, col));
+                        cells_left += row_end - col;
                         break 'rows;
                     }
                     if !open {
@@ -372,6 +452,7 @@ impl Haystack {
                 if before + bytes > limit && before > self.start {
                     self.capped = true;
                     stopped = Some((row, col));
+                    cells_left += row_end - col;
                     break 'rows;
                 }
                 match cluster {
@@ -389,8 +470,15 @@ impl Haystack {
                     run: false,
                 });
             }
+            if row_end < end {
+                // The cell cap fell inside this row.
+                self.capped = true;
+                stopped = Some((row, row_end));
+                break;
+            }
         }
         self.end = self.text.len();
+        self.cells = cell_limit - cells_left;
         if continues_below || self.capped {
             self.text.push(CUT);
         }
@@ -544,10 +632,69 @@ pub fn segments(rows: &[Line], at: Rows, period: usize, out: &mut Vec<Segment>) 
     }
 }
 
+/// How much text one piece holds: at most this many bytes and this many
+/// cells (columns, spacers included). [`PieceLimit::FULL`] cuts a segment
+/// only at [`MAX_HAYSTACK_BYTES`]; a caller whose regex is slow on a piece
+/// halves the limit ([`PieceLimit::halved`]) so a piece's run takes about a
+/// quarter of the time (the regex crate's match iteration is quadratic in
+/// the worst case).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PieceLimit {
+    bytes: usize,
+    cells: usize,
+}
+
+impl PieceLimit {
+    /// [`MAX_HAYSTACK_BYTES`] and [`MAX_PIECE_CELLS`].
+    pub const FULL: Self = Self {
+        bytes: MAX_HAYSTACK_BYTES,
+        cells: MAX_PIECE_CELLS,
+    };
+
+    /// Most bytes of text of one piece.
+    pub fn bytes(self) -> usize {
+        self.bytes
+    }
+
+    /// Most cells of one piece.
+    pub fn cells(self) -> usize {
+        self.cells
+    }
+
+    /// Half the limit, but not below one row of `cols` cells and
+    /// [`MIN_PIECE_BYTES`] bytes; `None` when it is at that floor already.
+    pub fn halved(self, cols: u16) -> Option<Self> {
+        self.halved_from(self, cols)
+    }
+
+    /// Half of `piece`, a piece's own size ([`PieceScan::size`]), but not
+    /// below the floor of [`PieceLimit::halved`] and not above this limit:
+    /// the limit for searching a piece too slow at `piece` again, so the
+    /// first retry already cuts it, however far below this limit it was
+    /// (#331, F9c). `None` when this limit is at the floor already.
+    pub fn halved_from(self, piece: Self, cols: u16) -> Option<Self> {
+        let row = usize::from(cols.max(1));
+        let half = Self {
+            bytes: (piece.bytes / 2).max(MIN_PIECE_BYTES).min(self.bytes),
+            cells: (piece.cells / 2).max(row).min(self.cells),
+        };
+        (half != self).then_some(half)
+    }
+}
+
+impl Default for PieceLimit {
+    fn default() -> Self {
+        Self::FULL
+    }
+}
+
 /// Where the scan of a segment stands between two of its pieces
-/// ([`scan_piece`]): the cell the next piece starts at.
+/// ([`scan_piece`]): the segment and the cell the next piece starts at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Piece {
+    /// Absolute row number of the first row of the run the segment is in.
+    first: u64,
+    segment: Segment,
     /// Row index within the segment and column of the piece's first cell.
     from: (usize, usize),
     /// The piece starts behind a cut marker.
@@ -555,38 +702,69 @@ pub struct Piece {
 }
 
 impl Piece {
-    /// The first piece of `segment`.
-    pub fn first(segment: Segment) -> Self {
+    /// The first piece of `segment` of a run of rows whose first row is
+    /// absolute row `first`.
+    pub fn first(first: u64, segment: Segment) -> Self {
         Self {
+            first,
+            segment,
             from: (0, 0),
             above: segment.above,
         }
     }
+
+    /// The segment the piece is in.
+    pub fn segment(&self) -> Segment {
+        self.segment
+    }
+
+    /// Absolute row number of the piece's first row.
+    pub fn line(&self) -> u64 {
+        self.first + (self.segment.start + self.from.0) as u64
+    }
 }
 
-/// Searches one piece of `segment` of `rows` (the first of which is
-/// absolute row `first`), at most [`MAX_HAYSTACK_BYTES`] of its text from
-/// `piece` on, and calls `found` with each match in it, in document order,
-/// until it returns [`ControlFlow::Break`]. Returns that and the next
-/// piece, `None` when this one reached the segment's end.
+/// How the search of one piece ended ([`scan_piece`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PieceScan {
+    /// [`ControlFlow::Break`] when `found` returned it.
+    pub flow: ControlFlow<()>,
+    /// The piece after this one, `None` when this one reached the
+    /// segment's end. Known before the regex runs, so it is set when the
+    /// run timed out too.
+    pub next: Option<Piece>,
+    /// The deadline passed before the regex reached the piece's end: the
+    /// matches handed to `found` are those before the stop.
+    pub timed_out: bool,
+    /// The piece's own bytes of text (cut markers left out) and cells, at
+    /// most the limit it was searched at.
+    pub size: PieceLimit,
+}
+
+/// Searches one piece of a segment of `rows`, at most `limit`'s bytes and
+/// cells of its text from `piece` on, and calls `found` with each match in
+/// it, in document order, until it returns [`ControlFlow::Break`] or
+/// `deadline` passes ([`Query::find_until`]).
 ///
-/// A caller that checks a deadline between calls bounds its overrun by one
-/// piece's regex run: a segment of heavy combining marks can hold a hundred
-/// pieces, and a quadratic pattern can take seconds on one (the time
-/// depends on the pattern and has no fixed ceiling).
+/// Without a deadline a run can take seconds: a quadratic pattern such as
+/// `\w*X\b|\w` costs about a millisecond per match on 64 KiB of combining
+/// marks. A caller bounds it with the deadline and, when a piece times
+/// out, retries it at a [halved](PieceLimit::halved) limit or skips it.
 pub fn scan_piece(
     query: &Query,
     rows: &[Line],
-    first: u64,
-    segment: Segment,
     piece: Piece,
+    limit: PieceLimit,
+    deadline: Option<Instant>,
     haystack: &mut Haystack,
     mut found: impl FnMut(Match) -> ControlFlow<()>,
-) -> (ControlFlow<()>, Option<Piece>) {
+) -> PieceScan {
+    let segment = piece.segment;
     let rows = &rows[segment.start..segment.end];
-    let base = first + segment.start as u64;
-    let stopped = haystack.fill_from(rows, piece.from, piece.above, segment.below);
-    let flow = query.find(haystack, |m| {
+    let base = piece.first + segment.start as u64;
+    let stopped = haystack.fill_from(rows, piece.from, limit, piece.above, segment.below);
+    let flow = query.find_until(haystack, deadline, |m| {
         found(Match {
             start_line: base + u64::from(m.start_row),
             start_col: m.start_col,
@@ -594,8 +772,19 @@ pub fn scan_piece(
             end_col: m.end_col,
         })
     });
-    let next = stopped.map(|from| Piece { from, above: true });
-    (flow, next)
+    PieceScan {
+        flow: flow.unwrap_or(ControlFlow::Continue(())),
+        next: stopped.map(|from| Piece {
+            from,
+            above: true,
+            ..piece
+        }),
+        timed_out: flow.is_none(),
+        size: PieceLimit {
+            bytes: haystack.end - haystack.start,
+            cells: haystack.cells,
+        },
+    }
 }
 
 /// Calls `found` with each match of `segment` of `rows` (the first of
@@ -615,11 +804,19 @@ pub fn scan_segment(
     haystack: &mut Haystack,
     mut found: impl FnMut(Match) -> ControlFlow<()>,
 ) -> ControlFlow<()> {
-    let mut piece = Piece::first(segment);
+    let mut piece = Piece::first(first, segment);
     loop {
-        let (flow, next) = scan_piece(query, rows, first, segment, piece, haystack, &mut found);
-        flow?;
-        let Some(next) = next else {
+        let scan = scan_piece(
+            query,
+            rows,
+            piece,
+            PieceLimit::FULL,
+            None,
+            haystack,
+            &mut found,
+        );
+        scan.flow?;
+        let Some(next) = scan.next else {
             return ControlFlow::Continue(());
         };
         piece = next;
@@ -762,8 +959,103 @@ mod tests {
         ])
     }
 
+    /// Fills `rows` piece by piece at `limit`, as [`scan_piece`] does, and
+    /// checks that the pieces' texts, joined, are the whole text, that
+    /// each byte maps to the cell the per-cell map gives it, that every
+    /// piece after the first starts behind a cut marker and that no piece
+    /// holds more than the limit's bytes or cells (beyond its first cell,
+    /// which always goes in). Returns the number of pieces.
+    fn check_pieces(rows: &[Line], above: bool, below: bool, limit: PieceLimit) -> usize {
+        let (text, cells, _) = reference(rows, above, below, usize::MAX);
+        let skip = usize::from(above);
+        let mut haystack = Haystack::new();
+        let mut joined = String::new();
+        let mut from = (0, 0);
+        let mut pieces = 0;
+        loop {
+            let marker = above || pieces > 0;
+            let stopped = haystack.fill_from(rows, from, limit, marker, below);
+            pieces += 1;
+            assert_eq!(haystack.start, usize::from(marker));
+            assert_eq!(haystack.is_capped(), stopped.is_some());
+            let spans = &haystack.spans;
+            if let (Some(first), Some(last)) = (spans.first(), spans.last()) {
+                // Columns from the first cell to past the last one.
+                let columns =
+                    |span: &Span| span.cell.row as usize * 100_000 + usize::from(span.cell.col);
+                let last_width = if last.run {
+                    haystack.end - last.cell.byte as usize
+                } else {
+                    usize::from(last.cell.width)
+                };
+                let one_row = first.cell.row == last.cell.row;
+                if one_row {
+                    // A wide character the cap falls on brings its spacer.
+                    let width = columns(last) + last_width - columns(first);
+                    let spill = if last.run {
+                        0
+                    } else {
+                        usize::from(last.cell.width) - 1
+                    };
+                    assert!(
+                        width <= limit.cells().max(usize::from(first.cell.width)) + spill,
+                        "a piece of {width} cells at {limit:?}"
+                    );
+                }
+                let bytes = haystack.end - haystack.start;
+                let first_bytes = spans
+                    .get(1)
+                    .map_or(bytes, |next| next.cell.byte as usize - haystack.start);
+                assert!(
+                    bytes <= limit.bytes().max(first_bytes),
+                    "a piece of {bytes} bytes at {limit:?}"
+                );
+            }
+            for byte in haystack.start..haystack.end {
+                let at = skip + joined.len() + byte - haystack.start;
+                let index = cells
+                    .partition_point(|cell| cell.byte as usize <= at)
+                    .saturating_sub(1);
+                let want = cells[index];
+                let got = haystack.cell_at(byte);
+                assert_eq!(
+                    (got.row, got.col, got.width),
+                    (want.row, want.col, want.width),
+                    "piece {pieces}, byte {byte} at {limit:?}"
+                );
+            }
+            joined.push_str(haystack.text());
+            let Some(next) = stopped else { break };
+            assert!(next > from, "no progress from {from:?}");
+            from = next;
+        }
+        assert_eq!(joined, text[skip..], "at {limit:?}");
+        pieces
+    }
+
+    /// A limit of `bytes` bytes and `cells` cells.
+    fn limit(bytes: usize, cells: usize) -> PieceLimit {
+        PieceLimit { bytes, cells }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// #331: pieces cut at any byte and cell limit cover the text of a
+        /// run of rows exactly, each within the limit, every byte mapped to
+        /// its cell; resuming a column late or early loses or repeats text.
+        #[test]
+        fn pieces_at_any_limit_cover_the_text(
+            cols in 2u16..12,
+            pieces in prop::collection::vec(piece(), 0..40),
+            above in any::<bool>(),
+            below in any::<bool>(),
+            bytes in 1usize..24,
+            cells in 1usize..16,
+        ) {
+            let rows = rows(cols, &pieces.concat());
+            check_pieces(&rows, above, below, limit(bytes, cells));
+        }
 
         /// The run-length cell map gives every byte the cell the per-cell
         /// map gives it.
@@ -798,6 +1090,186 @@ mod tests {
                 check(&rows, true, false);
             }
         }
+    }
+
+    /// Halving goes down to one row and [`MIN_PIECE_BYTES`], each step at
+    /// least halving one of the two, and stops there.
+    #[test]
+    fn halving_stops_at_one_row_and_the_byte_floor() {
+        for cols in [1, 80, 300, 2048, u16::MAX] {
+            let mut at = PieceLimit::FULL;
+            let mut steps = 0;
+            while let Some(half) = at.halved(cols) {
+                assert!(half.bytes <= at.bytes && half.cells <= at.cells);
+                assert!(
+                    half.bytes * 2 <= at.bytes.max(MIN_PIECE_BYTES * 2)
+                        || half.cells * 2 <= at.cells.max(usize::from(cols) * 2)
+                );
+                at = half;
+                steps += 1;
+                assert!(steps < 64, "{cols} columns never reach the floor");
+            }
+            assert_eq!(at.bytes, MIN_PIECE_BYTES, "{cols} columns");
+            assert_eq!(
+                at.cells,
+                usize::from(cols).min(MAX_PIECE_CELLS),
+                "{cols} columns"
+            );
+            eprintln!("{cols} columns: {steps} halvings to {at:?}");
+        }
+    }
+
+    /// #331: a full segment of heavy combining marks, CJK and plain text
+    /// cut at every halving down to the floor: the pieces cover it exactly
+    /// and grow in number as the limit shrinks.
+    #[test]
+    fn pieces_at_every_halving_cover_a_long_segment() {
+        let marks = format!("e{}", "\u{301}".repeat(30));
+        let cases: [(u16, usize, &str, usize); 4] = [
+            (300, 12, &marks, 1),
+            (2048, 31, "\u{4e2d}", 2),
+            (80, 250, "a", 1),
+            (200, 160, "\u{434}", 1),
+        ];
+        for (cols, height, cell, width) in cases {
+            let rows = long_line(cols, height, cell, width);
+            let mut at = PieceLimit::FULL;
+            let mut last = check_pieces(&rows, false, true, at);
+            while let Some(half) = at.halved(cols) {
+                at = half;
+                let pieces = check_pieces(&rows, true, false, at);
+                assert!(
+                    pieces >= last,
+                    "{cell:?}: {pieces} pieces at {at:?}, {last} before"
+                );
+                last = pieces;
+            }
+            assert!(
+                last >= height,
+                "{cell:?}: {last} pieces at the floor for {height} rows"
+            );
+        }
+    }
+
+    /// S8 (#318): the Debug form of a syntax error, which quotes the
+    /// pattern in its message, gives the message's length only.
+    #[test]
+    fn the_debug_form_of_a_refusal_omits_the_pattern() {
+        let regex = QueryOptions {
+            regex: true,
+            case_sensitive: false,
+        };
+        let error = Query::new("secret-pattern(", regex).unwrap_err();
+        assert!(error.to_string().contains("secret-pattern"), "{error}");
+        let debug = format!("{error:?} {error:#?}");
+        assert!(!debug.contains("secret"), "{debug}");
+        assert!(debug.contains("Syntax"), "{debug}");
+        assert_eq!(
+            format!("{:?}", QueryError::TooLong { bytes: 2000 }),
+            "TooLong { bytes: 2000 }"
+        );
+        assert_eq!(format!("{:?}", QueryError::TooComplex), "TooComplex");
+    }
+
+    /// A deadline already past stops a piece before any regex run; a far
+    /// one finds what [`Query::find`] finds.
+    #[test]
+    fn a_passed_deadline_stops_the_run_and_a_far_one_finds_everything() {
+        let query = Query::new("a", QueryOptions::default()).unwrap().unwrap();
+        let rows = rows(40, &"ab".repeat(100));
+        let mut haystack = Haystack::new();
+        haystack.fill(&rows, false, false);
+        let mut all = Vec::new();
+        let _ = query.find(&haystack, |m| {
+            all.push(m);
+            ControlFlow::Continue(())
+        });
+        assert_eq!(all.len(), 100);
+        let mut early = Vec::new();
+        let past = Instant::now();
+        let ended = query.find_until(&haystack, Some(past), |m| {
+            early.push(m);
+            ControlFlow::Continue(())
+        });
+        assert_eq!(ended, None);
+        assert!(
+            early.is_empty(),
+            "{} matches past the deadline",
+            early.len()
+        );
+        let mut late = Vec::new();
+        let far = Instant::now() + std::time::Duration::from_secs(3600);
+        let ended = query.find_until(&haystack, Some(far), |m| {
+            late.push(m);
+            ControlFlow::Continue(())
+        });
+        assert_eq!(ended, Some(ControlFlow::Continue(())));
+        assert_eq!(late, all);
+    }
+
+    /// #331 round 1 (swift B1): the clock is read after every regex run,
+    /// so at most one run ends after the deadline: the one under way when
+    /// it passed. Each run of `\w*X\b|\w` over 64 KiB of Cyrillic scans
+    /// to the text's end, takes milliseconds and finds one cell; the
+    /// deadline passes during the first. Reading the clock every 16 runs
+    /// ran 15 more.
+    #[test]
+    fn at_most_one_run_ends_after_the_deadline() {
+        let rows = long_line(300, 109, "\u{434}", 1);
+        let query = Query::new(
+            r"\w*X\b|\w",
+            QueryOptions {
+                regex: true,
+                case_sensitive: true,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let mut haystack = Haystack::new();
+        haystack.fill(&rows, false, false);
+        let deadline = Instant::now() + std::time::Duration::from_micros(200);
+        let mut late = 0_usize;
+        let mut found = 0_usize;
+        let ended = query.find_until(&haystack, Some(deadline), |_| {
+            found += 1;
+            if Instant::now() >= deadline {
+                late += 1;
+            }
+            ControlFlow::Continue(())
+        });
+        assert_eq!(ended, None, "{found} matches, none stopped");
+        assert!(late <= 1, "{late} runs ended after the deadline");
+    }
+
+    /// #331 adversarial cycle 1 (F9c): a run that finds nothing and ends
+    /// past the deadline is a stop too, not a piece searched to its end.
+    /// `(?:\w{1,40}){1,5}\b\d` has no match in 64 KiB of Cyrillic, and its
+    /// single run takes about 0.1 s, so the deadline passes inside it;
+    /// reading the clock only before each run returned `Continue`.
+    #[test]
+    fn a_last_run_without_a_match_past_the_deadline_is_a_stop() {
+        let rows = long_line(300, 109, "\u{434}", 1);
+        let query = Query::new(
+            r"(?:\w{1,40}){1,5}\b\d",
+            QueryOptions {
+                regex: true,
+                case_sensitive: true,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let mut haystack = Haystack::new();
+        haystack.fill(&rows, false, false);
+        let started = Instant::now();
+        let deadline = started + std::time::Duration::from_millis(1);
+        let mut found = 0_usize;
+        let ended = query.find_until(&haystack, Some(deadline), |_| {
+            found += 1;
+            ControlFlow::Continue(())
+        });
+        let took = started.elapsed();
+        assert_eq!(found, 0, "the pattern matched");
+        assert_eq!(ended, None, "a run of {took:?} ended past the deadline");
     }
 
     /// One logical line of `rows` rows at `cols` columns: `cell` repeated,
@@ -843,7 +1315,7 @@ mod tests {
                 let mut pieces = 0;
                 loop {
                     let marker = above || pieces > 0;
-                    let stopped = haystack.fill_from(&rows, from, marker, below);
+                    let stopped = haystack.fill_from(&rows, from, PieceLimit::FULL, marker, below);
                     pieces += 1;
                     assert_eq!(haystack.start, usize::from(marker));
                     assert!(haystack.text().len() <= MAX_HAYSTACK_BYTES);

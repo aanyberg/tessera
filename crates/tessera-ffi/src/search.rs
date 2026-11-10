@@ -6,7 +6,8 @@
 //! not `done` (and again after output), so a search of a long history
 //! never blocks a frame. Matches show on the session's surface from the
 //! next `tessera_surface_render`; `tessera_session_search_older` and
-//! `_newer` move the current match and scroll the view to it. Call these
+//! `_newer` move the current match and scroll the view to it, and
+//! `tessera_session_search_reveal` scrolls to it without moving. Call these
 //! from the UI (main) thread, like the selection calls.
 //!
 //! The query and the text of matches are user data: the core never logs
@@ -54,11 +55,16 @@ pub const SEARCH_MAX_MATCHES_TEXT_BYTES: usize = 1_048_576;
 const _: () = assert!(SEARCH_MAX_MATCHES_TEXT_BYTES == MAX_MATCHES_TEXT_BYTES);
 
 /// The largest budget, in microseconds, `tessera_session_search_step`
-/// accepts; a larger one is clamped to it. The step checks its deadline
-/// between pieces of at most 64 KiB of text, so it returns within the
-/// budget plus one piece's regex run (ADR 0038), whose time depends on
-/// the pattern: seconds for a quadratic one on text of heavy combining
-/// marks, with no fixed ceiling.
+/// accepts; a larger one is clamped to it. The step reads the clock after
+/// every regex run inside a piece too, so it returns within four budgets
+/// plus 250 ms plus one regex call (ADR 0038). That call is not
+/// interruptible: it runs on at most a piece's text, 64 KiB, or 1 KiB once
+/// a slow pattern has halved the pieces to the floor, and is bounded by
+/// bytes, not time: a pathological pattern costs about 0.65-0.9 s per KiB,
+/// so the first call of a query can block for many seconds (7.3 s measured
+/// on an 8 KB line; ADR 0038). A piece too slow is searched again
+/// in halves, and a row still slower than 250 ms is skipped (the status's
+/// `lines_skipped`).
 pub const SEARCH_MAX_STEP_MICROS: u32 = 1_000_000;
 
 /// Why `tessera_session_search_start` refused a pattern (its `refusal`
@@ -100,9 +106,16 @@ pub struct SearchStatus {
     /// The last step found nothing left to scan; until then the count may
     /// still grow. New output turns it false again.
     pub done: bool,
-    /// More than `TESSERA_SEARCH_MAX_MATCHES` matched; the oldest are not
-    /// kept.
+    /// More than `TESSERA_SEARCH_MAX_MATCHES` matched on lines still
+    /// there; the oldest are not kept. Clears once those lines are gone
+    /// (cleared or evicted).
     pub truncated: bool,
+    /// Some lines were too slow for the pattern to search whole: a row
+    /// that took more than 250 ms was skipped, or a line was cut into
+    /// pieces smaller than 64 KiB (a match across such a cut is not
+    /// found). Matches there may be missing from the count. Clears once
+    /// those lines are gone or a new query starts.
+    pub lines_skipped: bool,
 }
 
 impl SearchStatus {
@@ -118,6 +131,7 @@ impl SearchStatus {
             has_current,
             done: status.done,
             truncated: status.truncated,
+            lines_skipped: status.lines_skipped,
         }
     }
 }
@@ -309,15 +323,20 @@ unsafe fn with_status(
 /// Scans session `session_id`'s history for its search for about
 /// `budget_us` microseconds (at most `TESSERA_SEARCH_MAX_STEP_MICROS`):
 /// piece after piece (at most 64 KiB of text each) until nothing is left
-/// or the budget has passed, at least one piece, so the call returns
-/// within the budget plus one piece's regex run. Lines are copied in
-/// chunks of at most 256, each under one hold of the terminal lock; a
-/// chunk can be searched over several calls, and its matches count from
-/// the call that searches its last piece. The screen is searched first,
-/// then the history from newest to oldest; new output is searched as it
-/// arrives. Stores the status in `*out`. Call it once per display refresh
-/// while `out->done` is false or output arrives; without a search it does
-/// nothing.
+/// or the budget has passed, at least one piece. The clock is read after
+/// every regex run inside a piece too, so the call returns within four
+/// budgets plus 250 ms plus one regex call, which is not interruptible
+/// (`TESSERA_SEARCH_MAX_STEP_MICROS` says how long one can take). Pieces
+/// too slow are searched again in halves; a row slower than 250 ms is
+/// skipped, and `out->lines_skipped` set, as when the halves cut a line.
+/// Lines
+/// are copied in chunks of at most 256, each under one hold of the
+/// terminal lock; a chunk can be searched over several calls, and its
+/// matches count from the call that searches its last piece. The screen is
+/// searched first, then the history from newest to oldest; new output is
+/// searched as it arrives. Stores the status in `*out`. Call it once per
+/// display refresh while `out->done` is false or output arrives; without a
+/// search it does nothing.
 ///
 /// Returns `TESSERA_ERROR_NULL_POINTER` if `app` or `out` is `NULL`,
 /// `TESSERA_ERROR_SESSION_NOT_FOUND` if the id is not a live session. On
@@ -398,6 +417,37 @@ pub unsafe extern "C" fn tessera_session_search_newer(
         unsafe {
             with_status("tessera_session_search_newer", app, out, |app| {
                 app.core.search_newer(SessionId::from_raw(session_id))
+            })
+        }
+    })
+}
+
+/// Scrolls session `session_id`'s view to show the current match when it
+/// is out of view (centred), as `tessera_session_search_older` does, but
+/// without moving it, and stores the status in `*out`. Without a current
+/// match nothing scrolls. Call it once when a new query's first match is
+/// found: the newest match becomes current by itself, but only a move or
+/// this call scrolls to it.
+///
+/// Returns `TESSERA_ERROR_NULL_POINTER` if `app` or `out` is `NULL`,
+/// `TESSERA_ERROR_SESSION_NOT_FOUND` if the id is not a live session. On
+/// failure `*out` is zeroed (when `out` is not `NULL`).
+///
+/// # Safety
+///
+/// `app` must be `NULL` or a live handle. `out` must be `NULL` or point to
+/// a writable `TesseraSearchStatus`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_session_search_reveal(
+    app: *mut App,
+    session_id: u64,
+    out: *mut SearchStatus,
+) -> Error {
+    ffi_guard!("tessera_session_search_reveal", {
+        // SAFETY: per the contract.
+        unsafe {
+            with_status("tessera_session_search_reveal", app, out, |app| {
+                app.core.search_reveal(SessionId::from_raw(session_id))
             })
         }
     })
@@ -561,6 +611,7 @@ mod tests {
             current: None,
             done: true,
             truncated: false,
+            lines_skipped: false,
         });
         assert!(!status.has_current);
         let status = SearchStatus::from_core(CoreStatus {

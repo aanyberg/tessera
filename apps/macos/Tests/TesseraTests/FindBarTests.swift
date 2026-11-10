@@ -232,6 +232,21 @@ final class FindBarTests: XCTestCase {
         // 62 lines and the cursor's row.
         try await waitForOutput(view, rows: 63)
         try type("needle", into: view)
+        // The tick that finds the first match scrolls to it with one call
+        // after its step (#331: not a move away, a scroll back and a move
+        // back).
+        let deadline = ContinuousClock.now + .seconds(20)
+        var revealCalls: Int?
+        while revealCalls == nil {
+            guard ContinuousClock.now < deadline else { return XCTFail("nothing found") }
+            let before = view.find.searchCallCount
+            view.displayLinkDidFire()
+            if view.find.pendingMove == nil, try status(view).matches > 0 {
+                revealCalls = view.find.searchCallCount - before
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(revealCalls, 2, "one step and one reveal")
         try await tick(view, until: "two matches") { try status(view).matches == 2 && status(view).done }
         XCTAssertEqual(try status(view).current, 1, "the newest")
         let position = try view.session.scrollPosition
@@ -539,6 +554,21 @@ final class FindBarTests: XCTestCase {
         XCTAssertEqual(view.findBar?.field.stringValue, "aXbbc")
     }
 
+    func testRegexEscapingIsPerUnicodeScalar() async throws {
+        // `.` with a combining acute is one Swift character, but the regex
+        // reads the `.` alone (#331).
+        let text = "a.\u{301}b"
+        XCTAssertEqual(FindController.escapedForRegex(text).unicodeScalars.map(\.value), [0x61, 0x5C, 0x2E, 0x301, 0x62])
+        XCTAssertEqual(
+            FindController.query(fromSelection: text, regex: true)?.unicodeScalars.map(\.value),
+            [0x61, 0x5C, 0x2E, 0x301, 0x62])
+        let view = try await makeView(showing: ["a.\u{301}b ax\u{301}b"])
+        view.find.regex = true
+        try type(try XCTUnwrap(FindController.query(fromSelection: text, regex: true)), into: view)
+        try await tick(view, until: "done") { try status(view).done }
+        XCTAssertEqual(try status(view).matches, 1, "the escaped dot finds itself, not the x")
+    }
+
     func testTheSelectionQueryIsCutAtTheQueryLimit() {
         let long = String(repeating: "é", count: 1_000)
         let query = FindController.query(fromSelection: long, regex: false)
@@ -589,6 +619,65 @@ final class FindBarTests: XCTestCase {
         XCTAssertEqual(view.findBar?.countLabel.stringValue, "Copied the matches that fit in 1 MB")
         try type("[0-9]+ ", into: view)
         XCTAssertNotEqual(view.findBar?.countLabel.stringValue, "Copied the matches that fit in 1 MB", "a new query drops it")
+    }
+
+    func testCopyAllMatchesPastTheCapSaysHowManyItCopied() async throws {
+        let pasteboard = NSPasteboard(name: .init("tessera-find-\(UUID().uuidString)"))
+        defer { pasteboard.releaseGlobally() }
+        try startCore("[terminal]\nscrollback_lines = 120000\n")
+        // 110 000 lines of digits: more matches than the cap, under 1 MB
+        // of text for the newest 100 000.
+        let view = try makeView("seq 1 110000; exec cat > /dev/null", windowed: false, rows: 4, cols: 8)
+        view.pasteboard = pasteboard
+        try await tick(view, until: "110 000 lines of history", timeout: .seconds(120)) {
+            try view.session.scrollPosition.history >= 109_990
+        }
+        view.find.regex = true
+        try type("[0-9]+", into: view)
+        try await tick(view, until: "done", timeout: .seconds(120)) { try status(view).done }
+        XCTAssertTrue(try status(view).truncated)
+        view.copyAllFindMatches(nil)
+        let copied = try XCTUnwrap(pasteboard.string(forType: .string))
+        XCTAssertEqual(copied.split(separator: "\n").count, TesseraSession.searchMaxMatches)
+        XCTAssertTrue(copied.hasSuffix("110000"), "the newest kept")
+        let max = FindController.format(TesseraSession.searchMaxMatches)
+        XCTAssertEqual(view.find.notice, "Copied \(max) of more than \(max)", "not 'all matches'")
+    }
+
+    /// #331 round 1 (swift B2): the copy notice says "all" only when the
+    /// copy is whole, nothing gave way at the cap and no line was skipped;
+    /// each cut names itself, the 1 MB one first.
+    func testTheCopyNoticeSaysAllOnlyWhenNothingIsMissing() {
+        typealias Status = TesseraSession.SearchStatus
+        let max = FindController.format(TesseraSession.searchMaxMatches)
+        let cases: [(copyTruncated: Bool, status: Status, notice: String)] = [
+            (false, Status(matches: 12, active: true, done: true), "Copied all matches"),
+            (true, Status(matches: 12, active: true, done: true), "Copied the matches that fit in 1 MB"),
+            (
+                false, Status(matches: TesseraSession.searchMaxMatches, active: true, done: true, truncated: true),
+                "Copied \(max) of more than \(max)"
+            ),
+            (
+                false, Status(matches: 12, active: true, done: true, linesSkipped: true),
+                "Copied the matches found; some lines were skipped"
+            ),
+            (
+                true, Status(matches: 12, active: true, done: true, truncated: true, linesSkipped: true),
+                "Copied the matches that fit in 1 MB"
+            ),
+            (
+                false,
+                Status(
+                    matches: TesseraSession.searchMaxMatches, active: true, done: true, truncated: true,
+                    linesSkipped: true),
+                "Copied \(max) of more than \(max)"
+            ),
+        ]
+        for (copyTruncated, status, notice) in cases {
+            XCTAssertEqual(
+                FindController.copyNotice(copyTruncated: copyTruncated, status: status), notice,
+                "copy cut \(copyTruncated), \(status)")
+        }
     }
 
     // MARK: Controller states
