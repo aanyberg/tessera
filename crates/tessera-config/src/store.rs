@@ -266,7 +266,9 @@ impl ConfigStore {
     /// window. Several watchers on the same store each receive every event
     /// too, but each costs a thread, a kernel queue and about seven file
     /// descriptors (up to eight more while the configured theme's file does
-    /// not load), and gains nothing over a single one.
+    /// not load, and up to eight for the directories holding symbolic links
+    /// on the way to the configuration directory), and gains nothing over a
+    /// single one.
     pub fn watch(&self, options: WatchOptions) -> Result<Watcher, Error> {
         Watcher::spawn(self.clone(), options)
     }

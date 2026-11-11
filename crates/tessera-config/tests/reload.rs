@@ -814,3 +814,152 @@ fn in_place_saves_from_a_broken_launch_never_turn_clipboard_writes_on() {
 fn unsafe_root() -> bool {
     std::env::var_os("USER").is_some_and(|u| u == "root")
 }
+
+/// A configuration in `dir/config.toml` with `font_size` and
+/// `clipboard_write`.
+#[cfg(unix)]
+fn write_config(dir: &std::path::Path, font_size: u32, clipboard_write: bool) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("config.toml"),
+        format!(
+            "[appearance]\nfont_size = {font_size}\n[terminal]\nclipboard_write = {clipboard_write}\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// Points the symlink `link` at `target` atomically (a new link renamed
+/// over it, as `ln -sfn` does on GNU and home-manager does on a switch).
+#[cfg(unix)]
+fn retarget(link: &std::path::Path, target: &std::path::Path) {
+    let staged = link.with_extension("newlink");
+    std::os::unix::fs::symlink(target, &staged).unwrap();
+    std::fs::rename(&staged, link).unwrap();
+}
+
+/// Waits for a `Changed` event whose configuration has `font_size`;
+/// panics after [`EVENTUALLY`]. Other events on the way are skipped.
+#[cfg(unix)]
+fn expect_font_size(watcher: &Watcher, font_size: f32, what: &str) -> Config {
+    let deadline = Instant::now() + EVENTUALLY;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match watcher.recv_timeout(remaining) {
+            Ok(ConfigEvent::Changed(changed))
+                if (changed.config.appearance.font_size - font_size).abs() < f32::EPSILON =>
+            {
+                return (*changed.config).clone();
+            }
+            Ok(_) => {}
+            Err(e) => panic!("{what}: font_size {font_size} not applied: {e}"),
+        }
+    }
+}
+
+/// #384: the configuration directory is a symlink (GNU stow, a dotfiles
+/// generation) retargeted while watched. The new target's `config.toml`
+/// applies, including `clipboard_write = false`, and so does a later
+/// in-place edit of it, on both backends. Kernel watches follow inodes, so
+/// the native backend sees the retarget only through the directory holding
+/// the link.
+#[cfg(unix)]
+#[test]
+fn retargeting_a_symlinked_configuration_directory_is_followed() {
+    for backend in BACKENDS {
+        let dir = tempfile::tempdir().unwrap();
+        let (gen1, gen2) = (dir.path().join("gen1"), dir.path().join("gen2"));
+        write_config(&gen1.join("tessera"), 10, true);
+        write_config(&gen2.join("tessera"), 20, false);
+        let root = dir.path().join("Tessera");
+        std::os::unix::fs::symlink(gen1.join("tessera"), &root).unwrap();
+        let store = ConfigStore::open(ConfigPaths::new(&root)).unwrap();
+        assert!(store.config().terminal.clipboard_write, "{backend:?}");
+        let watcher = store.watch(options(backend)).unwrap();
+
+        retarget(&root, &gen2.join("tessera"));
+        let config = expect_font_size(&watcher, 20.0, &format!("{backend:?} retarget"));
+        assert!(!config.terminal.clipboard_write, "{backend:?}: writes off");
+        assert!(!store.config().terminal.clipboard_write, "{backend:?}");
+
+        write_config(&gen2.join("tessera"), 21, false);
+        expect_font_size(
+            &watcher,
+            21.0,
+            &format!("{backend:?} edit of the new target"),
+        );
+
+        // Back, the way BSD `ln -sfn` does it: removed and made again.
+        std::fs::remove_file(&root).unwrap();
+        std::os::unix::fs::symlink(gen1.join("tessera"), &root).unwrap();
+        let config = expect_font_size(&watcher, 10.0, &format!("{backend:?} back"));
+        assert!(config.terminal.clipboard_write, "{backend:?}");
+    }
+}
+
+/// #384: a link above the configuration directory (a dotfiles checkout
+/// switched with `ln -sfn`) retargeted while watched is followed too.
+#[cfg(unix)]
+#[test]
+fn retargeting_a_link_above_the_configuration_directory_is_followed() {
+    for backend in BACKENDS {
+        let dir = tempfile::tempdir().unwrap();
+        let (gen1, gen2) = (dir.path().join("gen1"), dir.path().join("gen2"));
+        write_config(&gen1.join("tessera"), 10, true);
+        write_config(&gen2.join("tessera"), 20, false);
+        let dotfiles = dir.path().join("dotfiles");
+        std::os::unix::fs::symlink(&gen1, &dotfiles).unwrap();
+        let store = ConfigStore::open(ConfigPaths::new(dotfiles.join("tessera"))).unwrap();
+        let watcher = store.watch(options(backend)).unwrap();
+
+        std::fs::remove_file(&dotfiles).unwrap();
+        std::os::unix::fs::symlink(&gen2, &dotfiles).unwrap();
+        let config = expect_font_size(&watcher, 20.0, &format!("{backend:?} retarget"));
+        assert!(!config.terminal.clipboard_write, "{backend:?}: writes off");
+
+        write_config(&gen2.join("tessera"), 21, false);
+        expect_font_size(
+            &watcher,
+            21.0,
+            &format!("{backend:?} edit of the new target"),
+        );
+    }
+}
+
+/// #384, S5: past the cap on links followed (here nine in a chain), the
+/// native backend watches none of them and polls `config.toml` instead, so
+/// a retarget of the last link still applies, and so does a later edit.
+#[cfg(unix)]
+#[test]
+fn a_retarget_past_the_link_cap_is_applied_by_polling() {
+    for backend in BACKENDS {
+        let dir = tempfile::tempdir().unwrap();
+        let (gen1, gen2) = (dir.path().join("gen1"), dir.path().join("gen2"));
+        write_config(&gen1.join("tessera"), 10, true);
+        write_config(&gen2.join("tessera"), 20, false);
+        // l0 -> l1 -> ... -> l8 -> gen1/tessera: nine links.
+        let last = dir.path().join("l8");
+        std::os::unix::fs::symlink(gen1.join("tessera"), &last).unwrap();
+        for i in (0..8).rev() {
+            std::os::unix::fs::symlink(
+                dir.path().join(format!("l{}", i + 1)),
+                dir.path().join(format!("l{i}")),
+            )
+            .unwrap();
+        }
+        let store = ConfigStore::open(ConfigPaths::new(dir.path().join("l0"))).unwrap();
+        assert_eq!(store.config().appearance.font_size, 10.0, "{backend:?}");
+        let watcher = store.watch(options(backend)).unwrap();
+
+        retarget(&last, &gen2.join("tessera"));
+        let config = expect_font_size(&watcher, 20.0, &format!("{backend:?} retarget"));
+        assert!(!config.terminal.clipboard_write, "{backend:?}: writes off");
+
+        write_config(&gen2.join("tessera"), 21, false);
+        expect_font_size(
+            &watcher,
+            21.0,
+            &format!("{backend:?} edit of the new target"),
+        );
+    }
+}
