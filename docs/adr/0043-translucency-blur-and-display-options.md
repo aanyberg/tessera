@@ -34,8 +34,9 @@ opaque. Native tabs are windows, so one translucent tab no longer makes
 the app's other windows translucent. A translucent window has a
 transparent title bar over full-size content (#363), so the title bar and
 tab bar draw no material band of their own; the panes stay below them
-(`contentLayoutRect`), a blur fills the strip above them while a pane of
-the tab is blurred, and the switch keeps the window's frame. The theme's
+(`contentLayoutRect`), a blur always fills the strip above them, whatever
+the panes' own blur setting, so the title and tab titles stay legible over a
+busy desktop, and the switch keeps the window's frame. The theme's
 background tint is not drawn under the title bar.
 
 **Blur only when translucent.** A session's look carries `blur =

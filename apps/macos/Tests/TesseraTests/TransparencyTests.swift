@@ -176,10 +176,11 @@ final class TransparencyTests: XCTestCase {
     /// Asserts the window's title bar of `controller`'s tab (#363): standard
     /// over panes filling the content of an opaque window; transparent over
     /// full-size content for a translucent one, the panes below the title bar
-    /// and tab bar and, while `blurred`, a backdrop filling the rest above
-    /// them. The window's smallest size keeps the panes at theirs either way.
+    /// and tab bar and a backdrop filling the rest above them, whether or not
+    /// a pane is blurred. The window's smallest size keeps the panes at
+    /// theirs either way.
     private func assertTitlebar(
-        _ controller: TerminalWindowController, translucent: Bool, blurred: Bool, _ what: String,
+        _ controller: TerminalWindowController, translucent: Bool, _ what: String,
         file: StaticString = #filePath, line: UInt = #line
     ) {
         guard let window = controller.window, let content = window.contentView as? TerminalWindowContentView else {
@@ -206,7 +207,7 @@ final class TransparencyTests: XCTestCase {
             controller.paneContainer.minimumSize.height + content.bounds.height - area.height,
             "\(what): the smallest size keeps the panes at theirs", file: file, line: line)
         let effects = content.subviews.filter { $0 is NSVisualEffectView }
-        guard blurred else {
+        guard translucent else {
             XCTAssertNil(content.titlebarBackdrop, "\(what): no blur under the title bar", file: file, line: line)
             XCTAssertTrue(effects.isEmpty, "\(what): no effect view left", file: file, line: line)
             return
@@ -252,7 +253,7 @@ final class TransparencyTests: XCTestCase {
         XCTAssertEqual(solid.view.backgroundAppearance, .init(opaque: true, blur: false))
         assertBackdrop(solid, false, "solid")
         XCTAssertTrue(try isOpaque(controller), "one opaque pane")
-        assertTitlebar(controller, translucent: false, blurred: false, "one opaque pane")
+        assertTitlebar(controller, translucent: false, "one opaque pane")
         let frame = try XCTUnwrap(controller.window).frame
 
         let frosted = try split(controller, profile: nil)
@@ -261,7 +262,7 @@ final class TransparencyTests: XCTestCase {
         assertBackdrop(frosted, true, "the default profile")
         assertBackdrop(solid, false, "solid, after the split")
         XCTAssertFalse(try isOpaque(controller), "a translucent pane makes the window transparent")
-        assertTitlebar(controller, translucent: true, blurred: true, "a blurred pane")
+        assertTitlebar(controller, translucent: true, "a blurred pane")
         XCTAssertEqual(try XCTUnwrap(controller.window).frame, frame, "the window keeps its frame")
 
         let clear = try split(controller, .below, profile: "clear")
@@ -287,12 +288,12 @@ final class TransparencyTests: XCTestCase {
         controller.focus(clear)
         controller.closeFocusedPane(nil)
         XCTAssertFalse(try isOpaque(controller), "the frosted pane is left")
-        assertTitlebar(controller, translucent: true, blurred: true, "the frosted pane is left")
+        assertTitlebar(controller, translucent: true, "the frosted pane is left")
         controller.focus(frosted)
         controller.closeFocusedPane(nil)
         XCTAssertEqual(controller.panes, [solid])
         XCTAssertTrue(try isOpaque(controller), "only the opaque pane is left")
-        assertTitlebar(controller, translucent: false, blurred: false, "only the opaque pane is left")
+        assertTitlebar(controller, translucent: false, "only the opaque pane is left")
         XCTAssertEqual(try XCTUnwrap(controller.window).frame, frame, "the window has its frame back")
     }
 
@@ -300,16 +301,16 @@ final class TransparencyTests: XCTestCase {
 
     /// The title bar and tab bar of a translucent window draw no band of
     /// their own: it gets a transparent title bar over full-size content,
-    /// blurred under it while a pane is, the panes below it at the size they
-    /// had, the window at its frame; a tab bar coming moves the panes below
-    /// it; opaque again, the window is standard again. Driven directly, so
-    /// it runs without a renderer too.
+    /// always blurred under it (here no pane is), the panes below it at the
+    /// size they had, the window at its frame; a tab bar coming moves the
+    /// panes below it; opaque again, the window is standard again. Driven
+    /// directly, so it runs without a renderer too.
     func testATranslucentWindowsTitleBarShowsWhatThePanesShowThrough() throws {
         let host = try startHost()
         let controller = try host.open(profile: "solid")
         let window = try XCTUnwrap(controller.window)
         let content = try XCTUnwrap(window.contentView as? TerminalWindowContentView)
-        assertTitlebar(controller, translucent: false, blurred: false, "opaque")
+        assertTitlebar(controller, translucent: false, "opaque")
         let frame = window.frame
         let size = controller.paneContainer.frame.size
         // Not even for a moment: a pane resized mid-flip and back changes the
@@ -318,40 +319,44 @@ final class TransparencyTests: XCTestCase {
         let pane = controller.focusedPane
         let resizes = pane.view.coreResizeCount
 
-        content.updateTitlebar(translucent: true, blur: false)
-        assertTitlebar(controller, translucent: true, blurred: false, "translucent")
+        content.updateTitlebar(translucent: true)
+        assertTitlebar(controller, translucent: true, "translucent")
+        XCTAssertNil(pane.view.backdrop, "translucent: the pane keeps its own setting, no blur")
         XCTAssertEqual(window.frame, frame, "translucent: the window keeps its frame")
         XCTAssertEqual(controller.paneContainer.frame.size, size, "translucent: the panes keep their size")
         XCTAssertEqual(pane.view.coreResizeCount, resizes, "translucent: the pane never resized")
 
-        content.updateTitlebar(translucent: true, blur: true)
-        assertTitlebar(controller, translucent: true, blurred: true, "blurred")
-        XCTAssertEqual(window.frame, frame, "blurred: the window keeps its frame")
+        let backdrop = content.titlebarBackdrop
+        content.updateTitlebar(translucent: true)
+        assertTitlebar(controller, translucent: true, "translucent again")
+        XCTAssertTrue(content.titlebarBackdrop === backdrop, "translucent again: the same blur is kept")
+        XCTAssertEqual(window.frame, frame, "translucent again: the window keeps its frame")
 
         for _ in 0..<10 {
-            content.updateTitlebar(translucent: false, blur: false)
-            content.updateTitlebar(translucent: true, blur: true)
+            content.updateTitlebar(translucent: false)
+            content.updateTitlebar(translucent: true)
         }
-        assertTitlebar(controller, translucent: true, blurred: true, "after 20 flips")
+        assertTitlebar(controller, translucent: true, "after 20 flips")
         XCTAssertEqual(window.frame, frame, "after 20 flips: the window keeps its frame")
         XCTAssertEqual(pane.view.coreResizeCount, resizes, "20 flips: the pane never resized")
 
         let other = try XCTUnwrap(host.open(profile: "solid").window)
         window.addTabbedWindow(other, ordered: .above)
         XCTAssertLessThan(controller.paneContainer.frame.height, size.height, "a tab bar takes the panes' top")
-        assertTitlebar(controller, translucent: true, blurred: true, "blurred, with a tab bar")
+        assertTitlebar(controller, translucent: true, "blurred, with a tab bar")
 
         let tabbed = window.frame
         let tabbedResizes = pane.view.coreResizeCount
-        content.updateTitlebar(translucent: false, blur: false)
-        assertTitlebar(controller, translucent: false, blurred: false, "opaque again, with a tab bar")
+        content.updateTitlebar(translucent: false)
+        assertTitlebar(controller, translucent: false, "opaque again, with a tab bar")
         XCTAssertEqual(window.frame, tabbed, "opaque again: the window keeps its frame")
         XCTAssertEqual(pane.view.coreResizeCount, tabbedResizes, "opaque again: the pane never resized")
     }
 
     /// The core's appearance change (here a reload of `config.toml` that
     /// turns the default profile's blur off) reaches each pane through the
-    /// router: the backdrop goes, the window stays transparent.
+    /// router: the pane's backdrop goes, the window stays transparent and its
+    /// title bar stays blurred.
     func testAConfigurationReloadReachesEveryPane() async throws {
         let host = try startHost()
         let controller = try host.open(profile: nil)
@@ -359,12 +364,15 @@ final class TransparencyTests: XCTestCase {
         let solid = try split(controller, profile: "solid")
         try requireSurfaces([frosted, solid])
         assertBackdrop(frosted, true, "before")
+        assertTitlebar(controller, translucent: true, "before")
         try Self.config.replacingOccurrences(of: "blur = true", with: "blur = false")
             .write(to: dir.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)
         try await waitUntil("the reload turns the blur off") { frosted.view.backdrop == nil }
         assertBackdrop(frosted, false, "after")
         XCTAssertEqual(frosted.view.backgroundAppearance, .init(opaque: false, blur: false))
         XCTAssertFalse(try isOpaque(controller), "still translucent")
+        assertBackdrop(solid, false, "after, solid")
+        assertTitlebar(controller, translucent: true, "after: no pane is blurred")
     }
 
     // MARK: Reduce Transparency
@@ -386,7 +394,7 @@ final class TransparencyTests: XCTestCase {
             XCTAssertEqual(pane.view.backgroundAppearance, .init(opaque: true, blur: false))
             assertBackdrop(pane, false, "reduced")
         }
-        assertTitlebar(controller, translucent: false, blurred: false, "reduced")
+        assertTitlebar(controller, translucent: false, "reduced")
         XCTAssertEqual(
             panes.map(\.view.coreResizeCount), resizes,
             "the title bar's change resizes no pane (no pty window-size change)")
@@ -402,7 +410,7 @@ final class TransparencyTests: XCTestCase {
         try host.core.setDisplayOptions(.init(reduceTransparency: false))
         try await waitUntil("the panes are translucent again") { try !self.isOpaque(controller) }
         try await waitUntil("the blur is back") { frosted.view.backdrop != nil && late.view.backdrop != nil }
-        assertTitlebar(controller, translucent: true, blurred: true, "turned off")
+        assertTitlebar(controller, translucent: true, "turned off")
         XCTAssertEqual(
             all.map(\.view.coreResizeCount), lateResizes, "turned off: the title bar's change resizes no pane")
         assertBackdrop(frosted, true, "turned off")

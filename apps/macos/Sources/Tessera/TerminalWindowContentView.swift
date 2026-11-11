@@ -8,23 +8,24 @@ import AppKit
 /// system's material and the panes fill this view. A translucent window
 /// (ADR 0043, E7) has a transparent title bar over full-size content, so the
 /// title bar and tab bar draw no band of their own: the desktop shows
-/// through them as through the panes, blurred by a ``PaneBackdropView`` while
-/// any pane of the tab is. The panes stay below the title bar and tab bar,
-/// and a switch keeps the window's frame, so they keep their size and the
-/// sessions are not resized.
+/// through them, always blurred by a ``PaneBackdropView`` so the title, the
+/// tab titles and the traffic lights stay legible over a busy desktop; each
+/// pane still follows its own blur setting. The panes stay below the title
+/// bar and tab bar, and a switch keeps the window's frame, so they keep their
+/// size and the sessions are not resized.
 @MainActor
 final class TerminalWindowContentView: NSView {
     let paneContainer: PaneContainerView
 
-    /// The blur under the title bar and tab bar of a translucent window
-    /// whose tab has a blurred pane; `nil` otherwise.
+    /// The blur under the title bar and tab bar of a translucent window,
+    /// whether or not a pane of the tab is blurred; `nil` while opaque.
     private(set) var titlebarBackdrop: PaneBackdropView?
 
     /// The window's `contentLayoutRect`, which a tab bar coming or going
     /// changes without resizing a full-size content view.
     private var layoutRectObservation: NSKeyValueObservation?
 
-    /// While ``updateTitlebar(translucent:blur:)`` changes the style mask:
+    /// While ``updateTitlebar(translucent:)`` changes the style mask:
     /// the window passes through another frame, which the panes must not
     /// take.
     private var holdsPanes = false
@@ -56,8 +57,8 @@ final class TerminalWindowContentView: NSView {
 
     /// Makes the window's title bar transparent over full-size content while
     /// `translucent`, standard otherwise, keeping the window's frame, and
-    /// blurs under it while `translucent` and `blur`.
-    func updateTitlebar(translucent: Bool, blur: Bool) {
+    /// blurs under it while `translucent`, whatever the panes' blur.
+    func updateTitlebar(translucent: Bool) {
         guard let window else { return }
         if window.styleMask.contains(.fullSizeContentView) != translucent {
             // AppKit keeps the content size across the change, so the frame
@@ -75,13 +76,12 @@ final class TerminalWindowContentView: NSView {
             }
             holdsPanes = false
         }
-        let blurred = translucent && blur
-        if blurred, titlebarBackdrop == nil {
+        if translucent, titlebarBackdrop == nil {
             let view = PaneBackdropView(frame: .zero)
             view.autoresizingMask = []
             addSubview(view, positioned: .below, relativeTo: paneContainer)
             titlebarBackdrop = view
-        } else if !blurred, let titlebarBackdrop {
+        } else if !translucent, let titlebarBackdrop {
             titlebarBackdrop.removeFromSuperview()
             self.titlebarBackdrop = nil
         }

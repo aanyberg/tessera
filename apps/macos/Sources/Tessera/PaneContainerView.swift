@@ -381,8 +381,7 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
         guard let window else { return }
         let opaque = panes.allSatisfy(\.view.isBackgroundOpaque)
         TerminalSurfaceView.setWindow(window, opaque: opaque)
-        (superview as? TerminalWindowContentView)?.updateTitlebar(
-            translucent: !opaque, blur: panes.contains { $0.view.backdrop != nil })
+        (superview as? TerminalWindowContentView)?.updateTitlebar(translucent: !opaque)
     }
 
     /// The pane next to `pane` toward `direction`, as laid out now, or `nil`
