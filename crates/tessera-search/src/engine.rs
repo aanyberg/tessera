@@ -56,6 +56,12 @@ pub const MAX_PIECE_CELLS: usize = MAX_HAYSTACK_BYTES;
 /// piece is at most one row and at most this many bytes.
 pub const MIN_PIECE_BYTES: usize = 1 << 10;
 
+/// Most regex runs of a literal (not regex) query between two reads of the
+/// clock in [`Query::find_until`]. A regex's clock is read after every run;
+/// a literal's run ends at its match, so reading the clock after each
+/// match of a dense literal cost about a quarter of the search (#368).
+pub const LITERAL_RUNS_PER_CLOCK_READ: u32 = 16;
+
 /// The longest [`segment_period`], in rows.
 pub const MAX_SEGMENT_PERIOD: usize = 128;
 
@@ -211,12 +217,19 @@ impl Query {
     /// [`Query::find`] that stops once `deadline` has passed: `None` when
     /// it stopped there, the matches before it having been handed to
     /// `found`. The clock is read before the first of the regex crate's
-    /// runs and after every run, the last one too, whether or not it found
-    /// a match, so the stop comes at most one run late (#331): a deadline
-    /// already past stops before any regex runs, and a search whose last
-    /// run ended past the deadline returns `None` even though it reached
-    /// the haystack's end. One run is not interruptible; it costs up to
-    /// the haystack's length times the program's size.
+    /// runs and after every run of a regex, the last one too, whether or
+    /// not it found a match, so the stop comes at most one run late (#331):
+    /// a deadline already past stops before any regex runs, and a search
+    /// whose last run ended past the deadline returns `None` even though it
+    /// reached the haystack's end. One run is not interruptible; it costs
+    /// up to the haystack's length times the program's size.
+    ///
+    /// A literal query's clock is read after every
+    /// [`LITERAL_RUNS_PER_CLOCK_READ`]-th run instead (and after the last):
+    /// each of its runs scans the text only up to its match's end, so the
+    /// runs between two reads scan disjoint stretches of the text and cost
+    /// no more than one run over them would. The stop then comes at most
+    /// that many short runs late, never more text than one run could take.
     pub fn find_until(
         &self,
         haystack: &Haystack,
@@ -226,10 +239,22 @@ impl Query {
         let text = haystack.text.as_str();
         let mut at = haystack.start;
         let mut previous_end: Option<(u32, u16)> = None;
+        // Runs before the clock is read next: one for a regex, whose run
+        // may scan far past its match (#331), more for a literal.
+        let runs_per_read = if self.options.regex {
+            1
+        } else {
+            LITERAL_RUNS_PER_CLOCK_READ
+        };
+        let mut unread = 0;
         while at <= haystack.end {
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                return None;
+            if unread == 0 {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return None;
+                }
+                unread = runs_per_read;
             }
+            unread -= 1;
             let Some(m) = self.regex.find_at(text, at) else {
                 break;
             };
@@ -1239,6 +1264,40 @@ mod tests {
         });
         assert_eq!(ended, None, "{found} matches, none stopped");
         assert!(late <= 1, "{late} runs ended after the deadline");
+    }
+
+    /// #378: a literal query reads the clock every
+    /// [`LITERAL_RUNS_PER_CLOCK_READ`] runs, so at most that many runs end
+    /// after the deadline. Every cell of 64 KiB is an `X`, so each run
+    /// finds one; the deadline passes after a few thousand. Never reading
+    /// the clock handed out every match after it.
+    #[test]
+    fn a_literal_stops_within_its_runs_per_clock_read() {
+        let rows = long_line(300, 218, "X", 1);
+        let query = Query::new(
+            "X",
+            QueryOptions {
+                regex: false,
+                case_sensitive: true,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let mut haystack = Haystack::new();
+        haystack.fill(&rows, false, false);
+        let deadline = Instant::now() + std::time::Duration::from_micros(200);
+        let mut late = 0_usize;
+        let mut found = 0_usize;
+        let ended = query.find_until(&haystack, Some(deadline), |_| {
+            found += 1;
+            if Instant::now() >= deadline {
+                late += 1;
+            }
+            ControlFlow::Continue(())
+        });
+        assert_eq!(ended, None, "{found} matches, none stopped");
+        let most = usize::try_from(LITERAL_RUNS_PER_CLOCK_READ).unwrap();
+        assert!(late <= most, "{late} runs ended after the deadline");
     }
 
     /// #331 adversarial cycle 1 (F9c): a run that finds nothing and ends
