@@ -58,7 +58,11 @@
 //! the native backend, a kernel queue and about seven file descriptors (the
 //! queue, the stop pipe's two ends, the directory, the file, `themes/` and
 //! the theme file in use), plus at most eight
-//! (`MAX_UNLOADABLE_FOLLOWED`) while the configured theme's file does not load. The
+//! (`MAX_UNLOADABLE_FOLLOWED`) while the configured theme's file does not load,
+//! plus one per directory holding a symbolic link on the way to the
+//! configuration directory (at most eight, `MAX_DIR_LINKS_FOLLOWED`; past
+//! that, or in a cycle, it polls `config.toml` instead), so a retargeted
+//! link is followed (#384). The
 //! application should hold a single [`Watcher`] and fan its events out to
 //! every window rather than watching once per window.
 
@@ -231,8 +235,10 @@ pub enum ConfigEvent {
 ///
 /// Hold **one per process** and fan its events out to every window: each
 /// watcher costs a thread and, natively, a kernel queue and about seven
-/// file descriptors. Several watchers on one store do work (each sees every
-/// event once) but gain nothing over a single one.
+/// file descriptors (more for a configuration directory reached through
+/// symbolic links; see the module documentation). Several watchers on one
+/// store do work (each sees every event once) but gain nothing over a
+/// single one.
 ///
 /// Dropping the watcher stops the thread. Events are delivered on a channel
 /// so any frontend loop can consume them: block with [`Watcher::recv_timeout`],
@@ -851,6 +857,17 @@ mod native {
         /// would wake it.
         root: PathBuf,
         root_handle: Option<File>,
+        /// The directories holding the symbolic links on the way to the
+        /// configuration directory ([`link_dirs`], at most
+        /// [`MAX_DIR_LINKS_FOLLOWED`]), each with its registered handle
+        /// (`None` while it could not be registered). Opening the root
+        /// follows its links, so its watch is on the current target's
+        /// inode; a retargeted link (`ln -sfn`, a home-manager switch) is
+        /// seen only here, and the re-registration it starts follows the
+        /// new target (#384). Empty when no link leads to the root, and
+        /// while the links cannot be followed (more than the cap, a
+        /// cycle), in which case the thread polls.
+        root_links: Vec<(PathBuf, Option<File>)>,
         /// `config.toml` and its handle, `None` while the file is missing.
         /// Opening follows symlinks, so the handle is the link's target.
         file: PathBuf,
@@ -895,6 +912,12 @@ mod native {
         /// change is logged, so a file that stays unreadable produces one
         /// warning rather than one per poll.
         register_error: Option<String>,
+        /// `config.toml`'s metadata when the last settle began. While the
+        /// backend is not armed it compares this with the file on every
+        /// poll and settles on a change, as the polling backend does, so a
+        /// change that no registered watch can see (a link retargeted
+        /// past [`MAX_DIR_LINKS_FOLLOWED`]) is still applied.
+        config_seen: super::Fingerprint,
     }
 
     /// What a registration slot expects to find at its path.
@@ -977,7 +1000,7 @@ mod native {
         }
         #[cfg(test)]
         tests::before_open(path);
-        let handle = match open_nonblocking(path) {
+        let handle = match crate::load::open_nonblocking(path) {
             Ok(handle) => handle,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e),
@@ -1001,17 +1024,6 @@ mod native {
                 named.map(|_| ())
             }
         }
-    }
-
-    /// Opens `path` read-only without blocking on a FIFO (`O_NONBLOCK`,
-    /// which a regular file or directory ignores). Symlinks are followed:
-    /// a symlinked `config.toml` is watched through its target.
-    fn open_nonblocking(path: &Path) -> std::io::Result<File> {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path)
     }
 
     /// Whether `path` still names the inode `handle` has open. `false` when
@@ -1043,6 +1055,86 @@ mod native {
         target.parent().map(Path::to_path_buf)
     }
 
+    /// How many symbolic links [`link_dirs`] follows on the way to the
+    /// configuration directory (S5: each costs at most one more watched
+    /// descriptor). A path that needs more, or runs in a cycle, is not
+    /// watched through its links: the backend polls `config.toml` instead
+    /// (see [`Native::armed`]).
+    pub(crate) const MAX_DIR_LINKS_FOLLOWED: usize = 8;
+
+    /// The directories holding the symbolic links met while resolving
+    /// `root` component by component, as the kernel does (the configuration
+    /// directory itself a link, GNU stow's layout, or a directory above it,
+    /// such as a dotfiles checkout switched with `ln -sfn`), each once, in
+    /// the order met. Retargeting one of those links changes the directory
+    /// that holds it and nothing the root's own watch sees, since that
+    /// follows the old target's inode (#384).
+    ///
+    /// Each directory is a resolved path, with no link left in it. A link
+    /// whose target is missing ends the walk (nothing past it can be a
+    /// link yet). An error for more than [`MAX_DIR_LINKS_FOLLOWED`] links,
+    /// which includes every cycle, and for an I/O error other than "not
+    /// found".
+    pub(crate) fn link_dirs(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+        use std::collections::VecDeque;
+        use std::path::Component;
+
+        let root = std::path::absolute(root)?;
+        let mut pending: VecDeque<PathBuf> = root
+            .components()
+            .map(|component| PathBuf::from(component.as_os_str()))
+            .collect();
+        let mut resolved = PathBuf::from("/");
+        let mut links = 0_usize;
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        while let Some(part) = pending.pop_front() {
+            let Some(component) = part.components().next() else {
+                continue;
+            };
+            let name = match component {
+                Component::RootDir | Component::Prefix(_) => {
+                    resolved = PathBuf::from("/");
+                    continue;
+                }
+                Component::CurDir => continue,
+                Component::ParentDir => {
+                    resolved.pop();
+                    continue;
+                }
+                Component::Normal(name) => name,
+            };
+            let candidate = resolved.join(name);
+            match std::fs::symlink_metadata(&candidate) {
+                Ok(meta) if meta.is_symlink() => {
+                    links += 1;
+                    if links > MAX_DIR_LINKS_FOLLOWED {
+                        return Err(std::io::Error::other(format!(
+                            "more than {MAX_DIR_LINKS_FOLLOWED} symbolic links (or a cycle) on the way to the configuration directory"
+                        )));
+                    }
+                    if !dirs.contains(&resolved) {
+                        dirs.push(resolved.clone());
+                    }
+                    let target = std::fs::read_link(&candidate)?;
+                    for part in target.components().rev() {
+                        pending.push_front(PathBuf::from(part.as_os_str()));
+                    }
+                }
+                Ok(_) => resolved = candidate,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(dirs)
+    }
+
     impl Native {
         /// Registers the directory, the file (if present), the themes
         /// directory, the theme files `config` follows (see
@@ -1071,6 +1163,7 @@ mod native {
                 _wake: wake,
                 root: paths.root().to_path_buf(),
                 root_handle: None,
+                root_links: Vec::new(),
                 file: paths.config_file(),
                 file_handle: None,
                 link_dir: None,
@@ -1082,12 +1175,14 @@ mod native {
                 unloadable,
                 unloadable_handles: Vec::new(),
                 register_error: None,
+                config_seen: super::Fingerprint::Missing,
             };
             native.rearm();
             Ok((native, stop))
         }
 
-        /// Re-registers the directory, (for a symlinked file) the target's
+        /// Re-registers the directories holding the links to the
+        /// directory, the directory, (for a symlinked file) the target's
         /// directory, the themes directory, the theme file in use and then
         /// the file, so all follow their current inodes.
         /// Every slot is attempted even when an earlier one fails, so the
@@ -1100,6 +1195,11 @@ mod native {
                     failed.get_or_insert(error);
                 }
             };
+            // The links first: a retarget landing while the root is
+            // re-registered below then either precedes the root's open
+            // (which follows the new target) or raises an event on an
+            // armed link directory.
+            note(self.register_root_links());
             note(register(
                 &mut self.queue,
                 &mut self.root_handle,
@@ -1149,6 +1249,74 @@ mod native {
             failed.map_or(Ok(()), Err)
         }
 
+        /// Registers the directories holding the links on the way to the
+        /// root ([`link_dirs`]), replacing the previous registrations.
+        ///
+        /// The chain is resolved again once they are registered, and
+        /// registered again (keeping the handles of directories still in
+        /// it, so their pending events survive) until two resolutions agree.
+        /// A retarget that lands after a directory's registration raises an
+        /// event on it; one that lands before (an atomic `ln -sfn`, whose
+        /// temporary link woke the thread just before its rename) changes the next resolution,
+        /// so a directory the new chain brings in is not left unwatched.
+        /// More than [`MAX_DIR_LINKS_FOLLOWED`] + 1 resolutions that keep
+        /// changing, a cap or cycle error, or an I/O error leave the
+        /// backend unarmed, polling (an error, see [`Native::armed`]).
+        fn register_root_links(&mut self) -> std::io::Result<()> {
+            // After an event every holder is registered anew: one may have
+            // been replaced, and its handle would be stale.
+            let stale = std::mem::take(&mut self.root_links);
+            self.drop_root_links(stale);
+            let mut registered = Vec::new();
+            let mut failed = None;
+            let mut resolved = link_dirs(&self.root);
+            for _ in 0..=MAX_DIR_LINKS_FOLLOWED {
+                let dirs = match resolved {
+                    Ok(dirs) => dirs,
+                    Err(error) => {
+                        self.drop_root_links(registered);
+                        return Err(error);
+                    }
+                };
+                for dir in dirs {
+                    let slot = if let Some(at) =
+                        registered.iter().position(|(held, _)| *held == dir)
+                    {
+                        registered.swap_remove(at).1
+                    } else {
+                        let mut slot = None;
+                        if let Err(error) = register(&mut self.queue, &mut slot, &dir, Kind::Dir) {
+                            failed.get_or_insert(error);
+                        }
+                        slot
+                    };
+                    self.root_links.push((dir, slot));
+                }
+                self.drop_root_links(std::mem::take(&mut registered));
+                resolved = link_dirs(&self.root);
+                if resolved
+                    .as_ref()
+                    .is_ok_and(|now| now.iter().eq(self.root_links.iter().map(|(dir, _)| dir)))
+                {
+                    return failed.map_or(Ok(()), Err);
+                }
+                registered = std::mem::take(&mut self.root_links);
+            }
+            self.drop_root_links(registered);
+            Err(std::io::Error::other(
+                "the symbolic links on the way to the configuration directory kept changing",
+            ))
+        }
+
+        /// Removes the registrations of `links`, closing their handles.
+        fn drop_root_links(&mut self, links: Vec<(PathBuf, Option<File>)>) {
+            for (_, handle) in links {
+                if let Some(handle) = handle {
+                    let _ = self.queue.remove_file(&handle, EventFilter::EVFILT_VNODE);
+                }
+            }
+        }
+
         /// Registers the theme file in use and the unloadable ones followed
         /// with it, or drops the registrations of the previous ones. Touches
         /// no other slot, so pending directory events survive it.
@@ -1187,12 +1355,16 @@ mod native {
 
         /// Whether everything that could produce the next change is
         /// registered, so sleeping on the queue cannot miss anything. While
-        /// the root or a symlink target's directory is missing, or a path
-        /// exists but could not be registered (an unreadable `config.toml`
-        /// is rewritten in place without any directory event), the thread
-        /// polls instead and re-reads the file once it is armed again.
+        /// the root, a directory holding a link to it or a symlink target's
+        /// directory is missing, or a path exists but could not be
+        /// registered (an unreadable `config.toml` is rewritten in place
+        /// without any directory event; the root's links are more than
+        /// [`MAX_DIR_LINKS_FOLLOWED`] or a cycle), the thread polls
+        /// instead: it re-reads the file once it is armed again, or as soon
+        /// as the file's metadata (followed through every link) changes.
         fn armed(&self) -> bool {
             self.root_handle.is_some()
+                && self.root_links.iter().all(|(_, handle)| handle.is_some())
                 && (self.link_dir.is_none() || self.link_dir_handle.is_some())
                 && self.register_error.is_none()
         }
@@ -1245,10 +1417,11 @@ mod native {
                     return Some(event);
                 }
                 self.rearm();
-                if self.armed() {
+                if self.armed() || super::Fingerprint::of(&self.file) != self.config_seen {
                     // The directory is back (it may already hold a file),
                     // or the file became readable; either way it may have
-                    // changed unseen.
+                    // changed unseen. Or it changed while nothing could
+                    // see it (a link past the cap retargeted).
                     self.settle(store);
                 }
             }
@@ -1268,6 +1441,9 @@ mod native {
         /// `Watcher::spawn` runs it once before the thread starts, to catch
         /// up on what changed since `ConfigStore::open` (#253 item 1).
         pub(super) fn settle(&mut self, store: &ConfigStore) {
+            // Before the load: a change after this sample is either read
+            // by the load or seen as a difference on the next poll.
+            self.config_seen = super::Fingerprint::of(&self.file);
             super::settle(store, |name| self.follow(name));
         }
 
@@ -1597,6 +1773,181 @@ mod native {
                 !logged.contains('\u{202e}'),
                 "raw U+202E logged: {logged:?}"
             );
+        }
+
+        /// A temporary directory by its resolved path (`/var` is a link on
+        /// macOS, which would add `/` to every [`link_dirs`] result).
+        fn resolved_tempdir() -> (tempfile::TempDir, PathBuf) {
+            let dir = tempfile::tempdir().unwrap();
+            let base = std::fs::canonicalize(dir.path()).unwrap();
+            (dir, base)
+        }
+
+        /// A chain of `links` symbolic links, each in a directory of its
+        /// own (`d0/l -> d1/l -> ... -> gen/tessera`); returns the first.
+        fn link_chain(base: &Path, links: usize) -> PathBuf {
+            std::fs::create_dir_all(base.join("gen").join("tessera")).unwrap();
+            let mut target = base.join("gen").join("tessera");
+            for i in (0..links).rev() {
+                let dir = base.join(format!("d{i}"));
+                std::fs::create_dir(&dir).unwrap();
+                std::os::unix::fs::symlink(&target, dir.join("l")).unwrap();
+                target = dir.join("l");
+            }
+            target
+        }
+
+        /// #384: every directory holding a link met while resolving the
+        /// root, the root's own and those above it, relative targets
+        /// resolved against the link's directory, each once.
+        #[test]
+        fn link_dirs_lists_each_directory_holding_a_link() {
+            let (_dir, base) = resolved_tempdir();
+            std::fs::create_dir_all(base.join("gen1").join("tessera")).unwrap();
+            std::fs::create_dir_all(base.join("plain")).unwrap();
+            assert_eq!(
+                link_dirs(&base.join("plain")).unwrap(),
+                Vec::<PathBuf>::new()
+            );
+
+            std::os::unix::fs::symlink(base.join("gen1").join("tessera"), base.join("Tessera"))
+                .unwrap();
+            assert_eq!(
+                link_dirs(&base.join("Tessera")).unwrap(),
+                vec![base.clone()]
+            );
+
+            // An ancestor that is a relative link into a directory holding
+            // another (absolute) link.
+            std::fs::create_dir_all(base.join("home")).unwrap();
+            std::fs::create_dir_all(base.join("store").join("dot")).unwrap();
+            std::os::unix::fs::symlink("../store/dot", base.join("home").join("dotfiles")).unwrap();
+            std::os::unix::fs::symlink(
+                base.join("gen1").join("tessera"),
+                base.join("store").join("dot").join("tessera"),
+            )
+            .unwrap();
+            let root = base.join("home").join("dotfiles").join("tessera");
+            assert_eq!(
+                link_dirs(&root).unwrap(),
+                vec![base.join("home"), base.join("store").join("dot")]
+            );
+
+            // Two links in one directory are one entry.
+            std::os::unix::fs::symlink(base.join("Tessera"), base.join("again")).unwrap();
+            assert_eq!(link_dirs(&base.join("again")).unwrap(), vec![base.clone()]);
+
+            // A dangling link ends the walk; its directory is still listed.
+            std::os::unix::fs::symlink(base.join("missing"), base.join("dangling")).unwrap();
+            assert_eq!(
+                link_dirs(&base.join("dangling").join("tessera")).unwrap(),
+                vec![base.clone()]
+            );
+        }
+
+        /// S5: at most [`MAX_DIR_LINKS_FOLLOWED`] links are followed; one
+        /// more, or a cycle, is an error rather than an endless walk.
+        #[test]
+        fn link_dirs_refuses_more_than_the_cap_and_cycles() {
+            let (_dir, base) = resolved_tempdir();
+            let at_cap = link_chain(&base.join("at"), MAX_DIR_LINKS_FOLLOWED);
+            assert_eq!(link_dirs(&at_cap).unwrap().len(), MAX_DIR_LINKS_FOLLOWED);
+            let past = link_chain(&base.join("past"), MAX_DIR_LINKS_FOLLOWED + 1);
+            let error = link_dirs(&past).unwrap_err().to_string();
+            assert!(error.contains("symbolic links"), "{error}");
+
+            std::os::unix::fs::symlink(base.join("c2"), base.join("c1")).unwrap();
+            std::os::unix::fs::symlink(base.join("c1"), base.join("c2")).unwrap();
+            assert!(link_dirs(&base.join("c1").join("tessera")).is_err());
+            assert!(link_dirs(&base.join("c1")).is_err());
+        }
+
+        thread_local! {
+            /// For [`retarget_current_once`]: the `dots` directory whose
+            /// `current` link it switches to `gen2`, once.
+            static SWITCH_IN: std::cell::RefCell<Option<PathBuf>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        /// A [`BEFORE_OPEN`] hook: the first time any path is about to be
+        /// registered, switches `dots/current` to `gen2` atomically (a new
+        /// link renamed over it, as GNU `ln -sfn` does).
+        fn retarget_current_once(_: &Path) {
+            if let Some(dots) = SWITCH_IN.with(|dots| dots.borrow_mut().take()) {
+                std::os::unix::fs::symlink("gen2", dots.join("current.tmp")).unwrap();
+                std::fs::rename(dots.join("current.tmp"), dots.join("current")).unwrap();
+            }
+        }
+
+        /// A switch landing after the chain was resolved and before its
+        /// first directory is registered (GNU `ln -sfn`: the temporary
+        /// link wakes the thread, the rename follows at once) brings in a
+        /// directory holding a link that the first resolution did not
+        /// list. It is registered too: the chain is resolved again until
+        /// the registered directories are the current ones. Deterministic:
+        /// the switch runs in the window, on the registering thread.
+        #[test]
+        fn a_switch_during_the_registration_watches_the_new_chain() {
+            let (_dir, base) = resolved_tempdir();
+            let (home, dots, store) = (base.join("home"), base.join("dots"), base.join("store"));
+            for generation in ["gen1", "gen2"] {
+                std::fs::create_dir_all(dots.join(generation).join("config")).unwrap();
+                std::fs::create_dir_all(store.join(generation)).unwrap();
+                std::os::unix::fs::symlink(
+                    format!("../../../store/{generation}"),
+                    dots.join(generation).join("config").join("tessera"),
+                )
+                .unwrap();
+            }
+            std::fs::create_dir_all(&home).unwrap();
+            std::os::unix::fs::symlink("gen1", dots.join("current")).unwrap();
+            std::os::unix::fs::symlink("../dots/current/config", home.join("cfg")).unwrap();
+            let root = home.join("cfg").join("tessera");
+            assert_eq!(
+                link_dirs(&root).unwrap(),
+                vec![home.clone(), dots.clone(), dots.join("gen1").join("config")]
+            );
+
+            SWITCH_IN.with(|switch| *switch.borrow_mut() = Some(dots.clone()));
+            BEFORE_OPEN.with(|hook| hook.set(Some(retarget_current_once)));
+            let opened = Native::open(&ConfigPaths::new(&root), &crate::Config::default());
+            BEFORE_OPEN.with(|hook| hook.set(None));
+            let (native, _stop) = opened.unwrap();
+            assert!(
+                SWITCH_IN.with(|switch| switch.borrow().is_none()),
+                "the hook switched"
+            );
+            let watched: Vec<PathBuf> = native
+                .root_links
+                .iter()
+                .map(|(dir, _)| dir.clone())
+                .collect();
+            assert_eq!(
+                watched,
+                vec![home, dots.clone(), dots.join("gen2").join("config")],
+                "the new generation's link directory is watched"
+            );
+            assert!(native.armed());
+        }
+
+        /// S5: the watcher holds one descriptor per directory of the chain
+        /// up to the cap, and none past it (the backend polls instead).
+        #[test]
+        fn the_link_watch_is_capped() {
+            let (_dir, base) = resolved_tempdir();
+            let at_cap = link_chain(&base.join("at"), MAX_DIR_LINKS_FOLLOWED);
+            let (native, _stop) =
+                Native::open(&ConfigPaths::new(&at_cap), &crate::Config::default()).unwrap();
+            assert_eq!(native.root_links.len(), MAX_DIR_LINKS_FOLLOWED);
+            assert!(native.root_links.iter().all(|(_, handle)| handle.is_some()));
+            assert!(native.armed());
+
+            let past = link_chain(&base.join("past"), MAX_DIR_LINKS_FOLLOWED + 1);
+            let (native, _stop) =
+                Native::open(&ConfigPaths::new(&past), &crate::Config::default()).unwrap();
+            assert!(native.root_links.is_empty());
+            assert!(native.root_handle.is_some(), "the root itself is watched");
+            assert!(!native.armed(), "polls past the cap");
         }
     }
 }

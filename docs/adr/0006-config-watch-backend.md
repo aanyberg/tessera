@@ -211,6 +211,20 @@ its full scan every twentieth tick sees the save. A native watcher costs
 about seven descriptors, plus at most eight while the configured theme
 does not load.
 
+**Symlinked configuration directory (#384).** `kqueue` watches inodes:
+opening a configuration directory that is a symlink (GNU stow, a
+home-manager generation) or lies below one (a dotfiles checkout switched
+with `ln -sfn`) registers the current target, and retargeting the link
+changes only the directory that holds it. The native backend therefore
+resolves the root component by component, as the kernel does, and also
+watches each directory holding a link on the way, at most
+`MAX_DIR_LINKS_FOLLOWED` (8; S5), re-resolving on every re-registration
+so it follows the new target. More links than that, or a cycle, register
+none of them; the backend then counts as not armed and polls, settling
+whenever `config.toml`'s metadata (followed through the links) changes,
+so a retarget is still applied, a poll interval later. The polling
+backend already follows names and needs none of this.
+
 **Opacity on `ThemesChanged`.** The apply thread applies a re-resolved theme
 with the store's configuration, the one whose `appearance.theme` it
 resolved, not with the configuration it applied last. A `ThemesChanged`
@@ -226,10 +240,13 @@ is a failed load, like a symlink loop, not a missing file (#262 item 1),
 so at launch it refuses writes and while running it keeps the last good
 configuration; so is a `config.toml` missing because the configuration
 directory, or one above it, is a symlink whose target is missing (GNU
-stow's layout, a dotfiles volume that is not mounted; #287): when the
-directory itself is the link, until its target appears; when the link is
-further up, until ⌘, (`App::open_config`) or a restart after the target
-is back, since the application then does not wait for the directory; and
+stow's layout, a dotfiles volume that is not mounted; #287): until the
+directory appears, whether the directory itself is the link or one above
+it (the application waits for the directory in both cases, #382 item 1,
+and the store it then watches is the one that refused, so the refusal
+carries over, #382 m2, except when ⌘, (`App::open_config`) runs in the
+up to 2 s before the wait's next poll sees the directory: that starts a
+watch on a fresh store, and an empty file there turns writes on); and
 while writes are refused this way, an empty (or
 whitespace-only, after an optional byte order mark, which TOML skips;
 #287) file applies the defaults with writes still off, since a save that

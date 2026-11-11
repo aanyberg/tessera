@@ -957,7 +957,7 @@ pub(crate) fn read_capped(path: &Path, limit: u64, what: &str) -> Result<Vec<u8>
     use std::io::Read as _;
 
     check_regular_file(path, &std::fs::metadata(path)?, limit, what)?;
-    let file = open_regular_file(path)?;
+    let file = open_nonblocking(path)?;
     let len = check_regular_file(path, &file.metadata()?, limit, what)?;
     let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
     (&file).take(limit + 1).read_to_end(&mut bytes)?;
@@ -967,11 +967,17 @@ pub(crate) fn read_capped(path: &Path, limit: u64, what: &str) -> Result<Vec<u8>
     Ok(bytes)
 }
 
-/// Opens `path` for reading without blocking on a FIFO. On Unix the open
-/// itself is non-blocking (`O_NONBLOCK`), which a regular file ignores and
-/// which lets a FIFO open immediately so [`check_regular_file`] can reject
-/// it from its handle.
-fn open_regular_file(path: &Path) -> std::io::Result<std::fs::File> {
+/// Opens `path` read-only without blocking on a FIFO: the one open for
+/// every file the loader reads and every path the watcher registers
+/// (#382 item 2; the directory `edit` syncs after a write is opened
+/// apart).
+/// On Unix the open itself is non-blocking (`O_NONBLOCK`), which a regular
+/// file or a directory ignores and which lets a FIFO open at once, so the
+/// caller can reject it from its handle ([`check_regular_file`] here, the
+/// type check on the handle in the watcher's registration). Symlinks are
+/// followed: a symlinked `config.toml` is read, and watched, through its
+/// target.
+pub(crate) fn open_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -2233,7 +2239,7 @@ mod tests {
             .status()
             .expect("mkfifo");
         assert!(status.success());
-        let file = open_regular_file(&path).expect("non-blocking open of a FIFO");
+        let file = open_nonblocking(&path).expect("non-blocking open of a FIFO");
         let err = check_regular_file(
             &path,
             &file.metadata().unwrap(),

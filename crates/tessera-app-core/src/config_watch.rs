@@ -648,10 +648,21 @@ impl ConfigWatch {
         Self::spawn(slot, wake, move |_| Some((store, events)), live)
     }
 
-    /// Waits for the configuration directory at `paths` (one `stat` every
+    /// Waits for the configuration directory of `store` (one `stat` every
     /// [`CONFIG_DIR_POLL_INTERVAL`]), then watches it and applies what it
     /// holds, on one thread.
-    fn wait_for(live: Live, paths: ConfigPaths, options: WatchOptions) -> std::io::Result<Self> {
+    ///
+    /// A `store` whose load failed (a dangling symlink at or above the
+    /// directory) is watched itself, so its refusal of clipboard writes
+    /// carries over: an empty `config.toml` in the appeared directory keeps
+    /// them off (#382 m2), unless `App::open_config` runs before the
+    /// next poll sees the directory: it starts a watch on a fresh store,
+    /// which does not refuse. Otherwise a fresh store is, as if the
+    /// application started now: a missing directory is a successful load
+    /// that a later broken file must not inherit.
+    fn wait_for(live: Live, store: ConfigStore, options: WatchOptions) -> std::io::Result<Self> {
+        let paths = store.paths().clone();
+        let refusing = store.last_error().is_some();
         let slot = Arc::new(Mutex::new(Slot::default()));
         let (wake, woken) = mpsc::channel::<()>();
         Self::spawn(
@@ -665,7 +676,11 @@ impl ConfigWatch {
                     if !paths.root().is_dir() {
                         continue;
                     }
-                    let store = ConfigStore::in_memory(paths, Config::default());
+                    let store = if refusing {
+                        store
+                    } else {
+                        ConfigStore::in_memory(paths, Config::default())
+                    };
                     // A file that does not load is logged by the store, once
                     // (#262 item 6); the defaults stay, writes refused.
                     let _ = store.reload();
@@ -796,11 +811,12 @@ impl App {
     /// [`CONFIG_DIR_POLL_INTERVAL`] (one `stat`) and watched, its
     /// configuration applied, once it appears: created by hand, by
     /// [`App::open_config`] (which also starts the watch at once) or by the
-    /// first session's shell integration; so is one that is a dangling
-    /// symlink, once its target appears. When its parent directory does
-    /// not exist either (or is itself a dangling symlink), nothing is
-    /// waited for (only `open_config` would create it, and starts the
-    /// watch).
+    /// first session's shell integration; so is one behind a dangling
+    /// symlink (the directory itself or one above it), until the
+    /// directory appears, with clipboard writes refused meanwhile. When
+    /// its parent directory does not exist either and the load did not
+    /// fail, nothing is waited for (only `open_config` would create
+    /// it, and starts the watch).
     pub fn with_config_dir(paths: ConfigPaths, options: WatchOptions) -> Self {
         let store = ConfigStore::in_memory(paths, Config::default());
         let paths = store.paths().clone();
@@ -809,9 +825,12 @@ impl App {
         let _ = store.reload();
         let app = Self::new((*store.config()).clone(), paths.clone());
         let parent_exists = paths.root().parent().is_none_or(Path::is_dir);
+        // A missing directory whose load failed is behind a dangling
+        // symlink, at it or above it (#382 item 1): its target may appear.
+        let behind_link = store.last_error().is_some();
         let started = if paths.root().is_dir() {
             app.start_config_watch(store, options)
-        } else if !parent_exists {
+        } else if !parent_exists && !behind_link {
             // `~/Library/Application Support` always exists; a missing
             // parent is a `TESSERA_CONFIG_DIR` that names nothing (the
             // app's test runs do so on purpose). Nothing will create the
@@ -829,7 +848,7 @@ impl App {
                 path = %paths.root().display(),
                 "no configuration directory; using the defaults until it appears"
             );
-            ConfigWatch::wait_for(app.live(), paths, options)
+            ConfigWatch::wait_for(app.live(), store, options)
                 .map(|watch| *lock(&app.config_watch) = Some(watch))
         };
         if let Err(error) = started {
@@ -938,6 +957,7 @@ mod tests {
     use tessera_pty::{ExitStatus, Pty, PtyError, PtyEvent};
     use tessera_render::{Fonts, Gpu, PhysicalSize, Rgba};
 
+    use tessera_config::WatchBackend;
     use tessera_grid::DamageRows;
 
     use super::*;
@@ -1849,6 +1869,128 @@ mod tests {
         assert!(app.is_watching_config());
     }
 
+    /// Moves `dir.staged` (made beforehand) to `dir`, so `dir` appears at
+    /// once with what it holds.
+    #[cfg(unix)]
+    fn appear(dir: &Path) {
+        std::fs::rename(dir.with_extension("staged"), dir).unwrap();
+    }
+
+    /// #382 item 1: the configuration directory sits below a dangling
+    /// symlink (`dotfiles -> volume`, not mounted; the directory is
+    /// `dotfiles/tessera`), so its parent does not exist either. It is
+    /// still waited for, with writes refused, and its `config.toml`
+    /// applies once it appears, without ⌘, or a restart.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_below_a_dangling_link_is_waited_for() {
+        let base = tempfile::tempdir().unwrap();
+        let volume = base.path().join("volume");
+        let dotfiles = base.path().join("dotfiles");
+        std::os::unix::fs::symlink(&volume, &dotfiles).unwrap();
+        let paths = ConfigPaths::new(dotfiles.join("tessera"));
+        let app = App::with_config_dir(paths.clone(), WatchOptions::default());
+        assert!(!app.config().terminal.clipboard_write, "writes refused");
+        assert!(lock(&app.config_watch).is_some(), "waiting");
+
+        let staged = volume.with_extension("staged").join("tessera");
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(
+            staged.join("config.toml"),
+            "[appearance]\nfont_size = 20.0\n[terminal]\nclipboard_write = true\n",
+        )
+        .unwrap();
+        appear(&volume);
+        assert!(
+            eventually(CONFIG_DIR_POLL_INTERVAL + Duration::from_secs(3), || {
+                (app.config().appearance.font_size - 20.0).abs() < f32::EPSILON
+            }),
+            "the appeared directory applies: {:?}",
+            app.config().appearance
+        );
+        assert!(app.config().terminal.clipboard_write);
+        assert!(app.is_watching_config());
+        std::fs::write(paths.config_file(), "[appearance]\nfont_size = 21.0\n").unwrap();
+        assert!(
+            eventually(Duration::from_secs(3), || {
+                (app.config().appearance.font_size - 21.0).abs() < f32::EPSILON
+            }),
+            "and is watched"
+        );
+    }
+
+    /// #382 m2: started behind a dangling symlink (writes refused), the
+    /// directory appears holding an empty or byte-order-mark-only
+    /// `config.toml`. Writes stay off on both backends, whether the link
+    /// is the directory itself or one above it: the refusal is carried
+    /// into the watch. A version of the file with something in it that
+    /// loads turns them on.
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_file_appearing_behind_a_dangling_link_keeps_writes_off() {
+        let mut cases = Vec::new();
+        for above in [false, true] {
+            for backend in [WatchBackend::Native, WatchBackend::Poll] {
+                for content in ["", "\u{feff}"] {
+                    cases.push(std::thread::spawn(move || {
+                        empty_file_behind_a_dangling_link(above, backend, content);
+                    }));
+                }
+            }
+        }
+        for case in cases {
+            case.join().unwrap();
+        }
+    }
+
+    /// One case of
+    /// [`an_empty_file_appearing_behind_a_dangling_link_keeps_writes_off`].
+    #[cfg(unix)]
+    fn empty_file_behind_a_dangling_link(above: bool, backend: WatchBackend, content: &str) {
+        let what = format!("above: {above}, {backend:?}, {content:?}");
+        let base = tempfile::tempdir().unwrap();
+        let volume = base.path().join("volume");
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&volume, &link).unwrap();
+        let (root, staged_root) = if above {
+            (
+                link.join("tessera"),
+                volume.with_extension("staged").join("tessera"),
+            )
+        } else {
+            (link, volume.with_extension("staged"))
+        };
+        std::fs::create_dir_all(&staged_root).unwrap();
+        std::fs::write(staged_root.join("config.toml"), content).unwrap();
+        let paths = ConfigPaths::new(&root);
+        let options = WatchOptions {
+            backend,
+            ..WatchOptions::default()
+        };
+        let app = App::with_config_dir(paths.clone(), options);
+        assert!(!app.config().terminal.clipboard_write, "{what}");
+        appear(&volume);
+        assert!(
+            eventually(CONFIG_DIR_POLL_INTERVAL + Duration::from_secs(3), || {
+                app.is_watching_config()
+            }),
+            "{what}: watched"
+        );
+        assert!(
+            !eventually(Duration::from_millis(600), || {
+                app.config().terminal.clipboard_write
+            }),
+            "{what}: the empty file turned writes on"
+        );
+        std::fs::write(paths.config_file(), "[terminal]\nclipboard_write = true\n").unwrap();
+        assert!(
+            eventually(Duration::from_secs(3), || {
+                app.config().terminal.clipboard_write
+            }),
+            "{what}: a file that loads turns them on"
+        );
+    }
+
     /// A configuration directory made by hand after launch is picked up:
     /// by `open_config` at once (its `config.toml` applied, not just
     /// watched), and without it within the directory poll.
@@ -2026,11 +2168,23 @@ mod tests {
         assert!(paths.config_file().is_file());
     }
 
+    /// Also when the directory is waited for below a dangling link
+    /// (#382 item 1).
     #[test]
     fn an_app_waiting_for_its_directory_stops_promptly() {
         let base = tempfile::tempdir().unwrap();
-        for drop_it in [false, true] {
-            let paths = ConfigPaths::new(base.path().join("Missing"));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(base.path().join("volume"), base.path().join("dotfiles"))
+            .unwrap();
+        for (drop_it, root) in [
+            (false, "Missing"),
+            (true, "Missing"),
+            #[cfg(unix)]
+            (false, "dotfiles/tessera"),
+            #[cfg(unix)]
+            (true, "dotfiles/tessera"),
+        ] {
+            let paths = ConfigPaths::new(base.path().join(root));
             let app = App::with_config_dir(paths, WatchOptions::default());
             assert!(lock(&app.config_watch).is_some(), "waiting");
             let started = std::time::Instant::now();
@@ -2043,7 +2197,7 @@ mod tests {
             let took = started.elapsed();
             assert!(
                 took < Duration::from_millis(100),
-                "drop: {drop_it}: took {took:?}"
+                "{root}: drop: {drop_it}: took {took:?}"
             );
         }
     }

@@ -23,8 +23,9 @@
 //! the application fanning each event out to its windows. Several watchers
 //! on the same store also work (every one receives every event), but each
 //! costs a thread, a kernel queue and about seven file descriptors (up to
-//! eight more while the configured theme's file does not load), so do not
-//! create one per window.
+//! eight more while the configured theme's file does not load, and one per
+//! directory holding a symlink on the way to the configuration directory,
+//! at most eight), so do not create one per window.
 //!
 //! A `config.toml` that is a symlink (into a dotfiles checkout, say) is
 //! respected: defaults are never written over it, saves go through to its
@@ -452,12 +453,12 @@ pub struct Terminal {
     /// is not UTF-8, a `config.toml` symlink whose target is missing, or a
     /// configuration directory that is such a symlink, as when a dotfiles
     /// volume is not mounted), writes are refused as well until the file is
-    /// fixed (or the directory appears; when the link is above the
-    /// configuration directory, until you open the file with ⌘, or
-    /// restart once the target is back), while the other defaults apply;
+    /// fixed (or the directory appears, also when the link is above the
+    /// configuration directory), while the other defaults apply;
     /// emptying the file (or leaving only a byte order mark) does not turn
-    /// them back on (a save
-    /// that truncates first leaves it empty for a moment), only a version
+    /// them back on (a save that truncates first leaves it empty for a
+    /// moment; one gap: an appeared directory opened with ⌘, within two
+    /// seconds, before Tessera has noticed it, does), only a version
     /// of it with something in it that loads. Applies to every session at
     /// once when changed.
     #[serde(deserialize_with = "load::lenient_clipboard_write")]

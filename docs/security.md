@@ -87,6 +87,7 @@ a low-risk change.
 | OSC colour name | 22 bytes (the longest X11 name), rejected before the lookup; static table, no allocation | `crates/tessera-term/src/color_names.rs` (`MAX_NAME_LEN`) |
 | Config / theme / import file | 16 MiB / 64 KiB (256 files) / 1 MiB | `crates/tessera-config/src/` |
 | Imported plist | 4096 values, 256 KiB of text | `crates/tessera-config/src/import.rs` |
+| Symbolic links followed to the configuration directory | 8 links per watcher (`MAX_DIR_LINKS_FOLLOWED`), one extra kqueue descriptor per directory holding one; more, or a cycle, watches none and polls `config.toml`'s metadata instead | `crates/tessera-config/src/watch.rs` |
 | Unloadable theme files followed | 8 extra kqueue descriptors per watcher (`MAX_UNLOADABLE_FOLLOWED`), newest first, only while the configured theme is not found as a loadable user file | `crates/tessera-config/src/theme.rs`, `crates/tessera-config/src/watch.rs` |
 | URL candidate | 2083 characters | `crates/tessera-app-core/src/url.rs` |
 | Smart selection rules (`[selection] smart_rules`) | 64 rules (`MAX_SMART_RULES`), later ones dropped with one warning; pattern 1024 bytes (`MAX_SMART_RULE_PATTERN_LEN`); compiled program and lazy DFA cache 1 MiB each (`SMART_RULE_SIZE_LIMIT`), nesting 50 (`SMART_RULE_NEST_LIMIT`); a rule past a bound, that does not compile or that matches the empty string is left out with a warning; compiled once per configuration load (ADR 0042) | `crates/tessera-config/src/selection.rs` |
