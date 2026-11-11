@@ -453,16 +453,27 @@ fn n18_clear_history_removes_marks_and_fallback_returns() {
 /// between holds. Only chunks landing in the middle half of the walk count:
 /// the walk's own short holds before and after the scan leave gaps a held
 /// scan would not. The walk takes about 0.8 ms in release, and a loaded
-/// machine can deschedule the feeder for all of it, so the walk is tried up
-/// to `TRIES` times and one that sees the chunks land is enough; a scan
-/// holding the lock throughout fails every try.
+/// machine can deschedule the feeder for all of it (4 of 2400 runs at 24
+/// in parallel did so for five walks in a row, #368), so walks are tried
+/// for up to `TRYING` and the test passes once half of the last
+/// `WINDOW` walks see the chunks land (at least `LEAST` walks), or when
+/// time runs out and every walk did: a loaded machine slows a walk to
+/// seconds (one took 10 s at load 100 and 24 runs in parallel, #368). The
+/// feeder yields between chunks so it does not starve the walk. A held scan sees them in about 2% of
+/// walks (51 of 2645 measured, #368), never most of a window. The
+/// feeder's chunks grow no history, so trying that long never evicts the
+/// prompt.
 #[test]
 fn n19_nav_does_not_hold_lock_longer_than_a_snapshot() {
-    /// Walks tried before the test fails.
-    const TRIES: usize = 5;
+    /// How long walks are tried before the test fails.
+    const TRYING: Duration = Duration::from_secs(10);
+    /// How many consecutive walks the criterion looks at.
+    const WINDOW: usize = 20;
+    /// The fewest walks the criterion looks at.
+    const LEAST: usize = 3;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     let app = Arc::new(app());
     let id = session(&app, 2, 2, 300_000);
@@ -480,20 +491,31 @@ fn n19_nav_does_not_hold_lock_longer_than_a_snapshot() {
         );
         std::thread::spawn(move || {
             while !stop.load(Ordering::Acquire) {
-                // Each chunk wraps the 2-column screen: the scrollback
-                // grows, which moves no line id.
-                app.feed_for_test(id, b"xyz").unwrap();
+                // Each chunk rewrites the 2-column screen's top row: no
+                // line id moves and the history does not grow.
+                app.feed_for_test(id, b"\x1b[Hxy").unwrap();
                 landed.lock().unwrap().push(Instant::now());
                 fed.fetch_add(1, Ordering::Release);
+                std::thread::yield_now();
             }
         })
     };
     while fed.load(Ordering::Acquire) == 0 {
         std::thread::yield_now();
     }
+    // Half of the last walks (at least `LEAST`, unless time ran
+    // out and all of them did) saw chunks land.
+    let good = |walks: &[(usize, Duration)], out: bool| {
+        let window = &walks[walks.len().saturating_sub(WINDOW)..];
+        let landed = window.iter().filter(|&&(during, _)| during >= 10).count();
+        let all = out && landed == window.len() && landed > 0;
+        all || (window.len() >= LEAST && landed * 2 >= window.len())
+    };
     let mut walks = Vec::new();
-    for _ in 0..TRIES {
+    let trying = Instant::now();
+    while trying.elapsed() < TRYING {
         app.scroll_to(id, ScrollTarget::Bottom).unwrap();
+        landed.lock().unwrap().clear();
         let started = Instant::now();
         let moved = app.scroll_to(id, ScrollTarget::PreviousPrompt).unwrap();
         let ended = Instant::now();
@@ -507,15 +529,17 @@ fn n19_nav_does_not_hold_lock_longer_than_a_snapshot() {
             .filter(|&&at| from < at && at < to)
             .count();
         walks.push((during, ended - started));
-        if during >= 10 {
+        if walks.len() >= WINDOW && good(&walks, false) {
             break;
         }
     }
     stop.store(true, Ordering::Release);
     feeder.join().unwrap();
+    let window = &walks[walks.len().saturating_sub(WINDOW)..];
     assert!(
-        walks.iter().any(|&(during, _)| during >= 10),
-        "chunks landed in the middle of each walk: {walks:?}"
+        good(&walks, true),
+        "chunks landed in the middle of the last {WINDOW} of {} walks: {window:?}",
+        walks.len()
     );
 }
 
@@ -1256,4 +1280,39 @@ fn g02_a_record_that_disagrees_with_the_mark_gives_no_duration() {
         .unwrap()
         .expect("ended by the prompt");
     assert_eq!((mark.exit_code, mark.duration), (None, None));
+}
+
+/// #368 (adversarial h1): after Ctrl-L the shell clears the screen in
+/// place (ED 2, no row goes to the history) and draws its prompt on the
+/// line the cleared command's prompt had. When the next command runs and
+/// ends inside one chunk, coalescing leaves the log no record of it, and
+/// the hover must not lend it the cleared command's duration.
+#[test]
+fn g03_a_command_run_after_an_in_place_clear_has_no_borrowed_duration() {
+    use std::time::Duration;
+
+    let app = app();
+    let id = session(&app, 6, 20, 100);
+    feed(&app, id, format!("{}\r\n", prompt(None, "x")).as_bytes());
+    feed(&app, id, format!("{}out\r\n", m("C")).as_bytes());
+    std::thread::sleep(Duration::from_millis(30));
+    feed(&app, id, prompt(Some(0), "").as_bytes());
+    let cleared = app.command_mark_at(id, 0).unwrap().expect("finished");
+    assert_eq!(cleared.exit_code, Some(0));
+    assert!(
+        cleared
+            .duration
+            .is_some_and(|d| d >= Duration::from_millis(30))
+    );
+    // Ctrl-L, the prompt redrawn on row 0, and `y` run to its end, in one
+    // chunk: the same rows and exit status as `x`.
+    let chunk = format!(
+        "\x1b[H\x1b[2J{}\r\n{}out\r\n{}",
+        prompt(None, "y"),
+        m("C"),
+        prompt(Some(0), "")
+    );
+    feed(&app, id, chunk.as_bytes());
+    let mark = app.command_mark_at(id, 0).unwrap().expect("y finished");
+    assert_eq!((mark.exit_code, mark.duration), (Some(0), None));
 }

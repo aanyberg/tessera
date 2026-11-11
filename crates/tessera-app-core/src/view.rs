@@ -934,6 +934,10 @@ struct ScrolledAt {
 
 /// What the exit-status gutter of a snapshot was found for: while it is
 /// the same, the lines' marks are too.
+///
+/// `pushed`, `epoch` and `alt` are defence only: scrolling, a resize and
+/// a screen switch each damage rows too, so they also move `generation`
+/// and no test can tell a key without them apart (#368).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct GutterKey {
     /// [`Grid::damage_generation`]: setting a mark damages its row, and

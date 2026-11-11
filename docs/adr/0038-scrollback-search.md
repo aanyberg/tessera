@@ -84,11 +84,15 @@ calls: about 12 s in the app; #331 round 1):
 
 - The step's first piece may take `max(4 × budget, MIN_PIECE_TIME)`
   (16 ms; a zero budget still searches). One that runs out is searched
-  again from its start in halves: the piece limit (`PieceLimit`, bytes and
-  cells) becomes half of that piece's own size (`PieceLimit::halved_from`,
-  so the first retry already cuts a piece far below the limit), and stays
-  there for the rest of the search, down to one row of cells and
-  `MIN_PIECE_BYTES` (1 KiB).
+  again from its start in halves: that piece is retried at half its own
+  size (`PieceLimit::halved_from`, so the first retry already cuts a piece
+  far below the limit), and the piece limit (`PieceLimit`, bytes and
+  cells) for the rest of the search drops one halving from what it was,
+  so a short piece late from a stall does not cut every later line to the
+  floor (#368). Both go down to one row of cells and `MIN_PIECE_BYTES`
+  (1 KiB). A piece no larger than that floor that already had the floor's
+  deadline (below) is skipped at once: searched again, it would be the
+  same run.
 - At that floor the first piece may take `max(4 × budget,
   LINE_TIME_LIMIT)` (250 ms). One that still runs out is skipped with the
   matches it found before the stop, and the status's `lines_skipped` says
@@ -103,7 +107,7 @@ calls: about 12 s in the app; #331 round 1):
   out is not halved but runs first in the next step, at a first piece's
   deadline.
 
-So a step returns within four budgets plus 250 ms plus one regex call
+So a step returns within `max(4 × budget, 250 ms)` plus one regex call
 (`no_step_outlasts_four_budgets_and_a_quarter_second`, release only). The
 deadline is checked after the last call of a piece too, the one that finds
 nothing more: before that (#331 adversarial run, F9c), a piece whose last
@@ -236,8 +240,9 @@ switches pane or tab; closing a pane frees its search with its session.
   and ⌘G send it at once.
 - Stepping: the pane's display link makes one `step` per refresh with a
   4 ms budget while the bar is open and the status is not `done` or output
-  arrived since; a step returns within 16 ms, or 266 ms at the halving
-  floor (four budgets plus 250 ms, see A ceiling per piece). With the bar
+  arrived since; a step returns within 16 ms, or 250 ms at the halving
+  floor (`max(4 × budget, 250 ms)`, see A ceiling per piece), plus one
+  regex call. With the bar
   closed the search is cleared and the display link makes no search call.
 - Use Selection for Find takes the selection's first line, drops control,
   format and separator characters (S3), escapes it in regex mode and cuts

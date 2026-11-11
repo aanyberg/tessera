@@ -148,7 +148,8 @@ pub struct CommandMark {
     /// How long the command ran, from its record: `None` when no record of
     /// the current line epoch starts at this prompt and agrees on the exit
     /// status (after a resize, ADR 0039; for a command coalesced away,
-    /// D-COALESCE; or one whose record the ring dropped).
+    /// D-COALESCE, and the older ones whose lines it drew over in place,
+    /// #368; or one whose record the ring dropped).
     pub duration: Option<Duration>,
 }
 
@@ -172,6 +173,11 @@ struct Record {
     anchor: i64,
     anchor_epoch: u64,
 }
+
+/// [`Record::epoch`] of a record whose lines were drawn over in place
+/// ([`CommandLog::drawn_over`]): no line epoch reaches it, so the record
+/// reports no lines and no hover pairs with it.
+const REDRAWN: u64 = u64::MAX;
 
 /// [`Record::anchor`] of a `C` that a screen clear or a deleted line
 /// erased before a resize: newer than every line.
@@ -272,7 +278,12 @@ impl CommandLog {
                     .pending
                     .take_if(|p| p.epoch == epoch && line < p.prompt);
                 if pending.is_some() {
-                    // A `C` older than the prompt: the prompt stays.
+                    // A `C` older than the prompt: the prompt stays. It was
+                    // set after that prompt's `A`, so the lines from its
+                    // own down were drawn again, by a command whose `A`
+                    // coalescing hid (an in-place clear, #368): the
+                    // records there no longer describe them.
+                    self.drawn_over(line, epoch);
                     self.pending = pending;
                     return;
                 }
@@ -309,6 +320,18 @@ impl CommandLog {
             // is non-exhaustive: a kind this layer does not know is not a
             // command boundary.
             _ => {}
+        }
+    }
+
+    /// Takes the lines from the records of epoch `epoch` that reach line
+    /// `line` or below: those lines were drawn over in place. Such a
+    /// record keeps its times and exit status, like one of an older epoch
+    /// ([`REDRAWN`]).
+    fn drawn_over(&mut self, line: u64, epoch: u64) {
+        for record in &mut self.records {
+            if record.epoch == epoch && last_line(record) >= line {
+                record.epoch = REDRAWN;
+            }
         }
     }
 
@@ -692,6 +715,8 @@ fn prompt_stop(grid: &Grid, index: usize) -> bool {
 ///
 /// At most one call per row in view, whatever the lines hold (S6).
 pub(crate) fn gutter(grid: &Grid, offset: usize, mut mark: impl FnMut(u16, Option<i32>)) {
+    // Defence only: the alternate screen refuses marks (`osc_mark`), so
+    // its rows have none to read and no test can tell this guard is gone.
     if grid.is_alt_screen() {
         return;
     }
@@ -1396,6 +1421,34 @@ mod tests {
         assert_eq!(log.records(VIEW)[0].state, CommandState::Running);
     }
 
+    /// #368: a `C` above the prompt was drawn after it, over the lines of
+    /// the records that reach its line, which then report no lines (their
+    /// times and status stay); a record above that line keeps its lines.
+    #[test]
+    fn a_c_above_the_prompt_takes_the_lines_of_records_it_drew_over() {
+        use Mark::*;
+        let (log, _, _) = log_of(&[
+            (PromptStart, 0, 0),
+            (OutputStart, 1, 0),
+            (d(Some(0)), 3, 5),
+            (PromptStart, 3, 5),
+            (OutputStart, 4, 5),
+            (d(Some(2)), 6, 9),
+            (PromptStart, 6, 9),
+            // Drawn over from line 4 down.
+            (OutputStart, 4, 20),
+        ]);
+        let lines = |r: &CommandRecord| (r.prompt_line, r.output_line, r.end_line);
+        let records = log.records(VIEW);
+        assert_eq!(records.len(), 2);
+        assert_eq!(lines(&records[0]), (Some(0), Some(1), Some(3)));
+        assert_eq!(lines(&records[1]), (None, None, None));
+        assert_eq!(records[1].exit_code, Some(2));
+        assert!(log.command_at(4, VIEW).is_none());
+        assert!(log.command_at(1, VIEW).is_some());
+        assert_eq!(log.pending.map(|p| p.prompt), Some(6));
+    }
+
     #[test]
     fn e01_ring_cap() {
         use Mark::*;
@@ -1535,6 +1588,22 @@ mod tests {
             }),
             Scan::Invalid
         );
+    }
+
+    /// #368 (M10): a row that wraps into the next with a `C` but no `A`
+    /// on it does not make the next row's `A` a continuation: that `A`
+    /// starts a prompt of its own and gets its mark.
+    #[test]
+    fn an_a_below_a_wrapped_row_without_one_starts_a_prompt() {
+        let mut term = Terminal::new(8, 10);
+        term.advance(b"\x1b]133;A\x07$ \r\n\x1b]133;C\x070123456789ab");
+        term.advance(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \r\n\x1b]133;C\x07out\r\n");
+        term.advance(b"\x1b]133;D;1\x07\x1b]133;A\x07$ ");
+        let grid = term.grid();
+        assert!(grid.line(1).is_some_and(|line| line.wrapped));
+        let mut marks = Vec::new();
+        gutter(grid, 0, |row, exit| marks.push((row, exit)));
+        assert_eq!(marks, [(0, Some(0)), (2, Some(1))]);
     }
 
     /// N09: a prompt redrawn over two rows (the first soft-wrapped into
