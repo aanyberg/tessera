@@ -2153,9 +2153,13 @@ impl App {
     /// every session (each session reads the configuration in effect).
     ///
     /// When anything the views draw changed, the cursor default included,
-    /// the observer's
+    /// or anything the host draws ([`App::session_appearance`] of a
+    /// session: its blur or its background colour, also of a session with
+    /// no view; or [`App::blur_radius`]), the observer's
     /// [`SessionObserver::on_appearance_changed`] is then called on this
-    /// thread with whether the background is opaque.
+    /// thread, once for the whole apply, with whether the background is
+    /// opaque. A configuration equal to the one in effect calls it not at
+    /// all.
     ///
     /// May be called from any thread (the configuration watch calls it
     /// from its own, [`App::start_config_watch`]); it does no GPU work.
@@ -2219,21 +2223,34 @@ impl App {
         }
     }
 
+    /// The window's blur radius: `[appearance] blur_radius` of the
+    /// configuration in effect, already clamped to
+    /// 0..=[`tessera_config::Appearance::MAX_BLUR_RADIUS`] (ADR 0045). 0
+    /// keeps each pane's own material blur; above 0 the host blurs the
+    /// whole window at that radius while every translucent pane of its
+    /// tab asks for blur. It is the configured value whatever the display
+    /// options say: under Reduce Transparency no session is translucent or
+    /// blurred, and the host sets no radius then. A window-level key, so
+    /// no profile changes it. When a configuration applied changes it the
+    /// observer's [`SessionObserver::on_appearance_changed`] is called, as
+    /// for any change of the sessions' appearance; read it again then.
+    pub fn blur_radius(&self) -> u32 {
+        lock(&self.applied).config.appearance.blur_radius
+    }
+
     /// How session `id`'s background is drawn now (ADR 0043): whether it
-    /// is fully opaque and whether the host should blur what shows through
-    /// it. Read it after [`SessionObserver::on_appearance_changed`] and
-    /// when the session's view attaches; it follows the session's profile,
-    /// the configuration in effect and [`App::set_display_options`].
+    /// is fully opaque, whether the host should blur what shows through
+    /// it, and its configured colour (OSC 11 not followed), for the host
+    /// to tint the title bar and tab bar above it. Read it after
+    /// [`SessionObserver::on_appearance_changed`] and when the session's
+    /// view attaches; it follows the session's profile, the configuration
+    /// in effect and [`App::set_display_options`].
     ///
     /// # Errors
     ///
     /// [`Error::SessionNotFound`] if `id` is not a live session.
     pub fn session_appearance(&self, id: SessionId) -> Result<SessionAppearance> {
-        let look = self.session(id)?.look();
-        Ok(SessionAppearance {
-            opaque: look.is_opaque(),
-            blur: look.blur,
-        })
+        Ok(self.session(id)?.look().session_appearance())
     }
 
     /// Detaches and releases session `id`'s view. The session keeps its

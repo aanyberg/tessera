@@ -88,8 +88,12 @@ pub struct Callbacks {
     /// otherwise keep the old colours until its next output. Called on the
     /// configuration watch's thread, or on the calling thread before
     /// `tessera_app_set_display_options` returns; not called for a change
-    /// that alters nothing the views draw (a blur-only change is reported). Like
-    /// every callback it must not call `tessera_*`: in particular
+    /// that alters nothing the views draw, but a change of what the
+    /// frontend draws is reported: a session's blur or background colour
+    /// (`tessera_session_appearance`) or the window's blur radius
+    /// (`tessera_app_blur_radius`), once per configuration applied however
+    /// many sessions it changed. Like every callback it must not call
+    /// `tessera_*`: in particular
     /// `tessera_app_set_callbacks` or `tessera_app_free` from it deadlocks,
     /// since both wait for this call to return.
     pub on_appearance_changed: Option<unsafe extern "C" fn(user_data: *mut c_void, opaque: bool)>,

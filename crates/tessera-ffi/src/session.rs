@@ -691,10 +691,37 @@ pub unsafe extern "C" fn tessera_session_foreground_process(
     })
 }
 
-/// How a session's background is drawn, as `tessera_session_appearance`
-/// reports it (ADR 0043).
+/// A colour as four `float`s, each in 0.0..=1.0: red, green and blue
+/// sRGB-encoded (a theme file's `#rrggbb` bytes over 255, not linear, so
+/// `NSColor(srgbRed:green:blue:alpha:)` takes them as they are) and alpha
+/// straight, not premultiplied.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rgba {
+    /// Red, 0.0..=1.0, sRGB-encoded.
+    pub r: f32,
+    /// Green, 0.0..=1.0, sRGB-encoded.
+    pub g: f32,
+    /// Blue, 0.0..=1.0, sRGB-encoded.
+    pub b: f32,
+    /// Alpha, 0.0 (transparent) ..= 1.0 (opaque), straight.
+    pub a: f32,
+}
+
+impl Rgba {
+    /// Opaque black.
+    const OPAQUE_BLACK: Self = Self {
+        r: 0.0,
+        g: 0.0,
+        b: 0.0,
+        a: 1.0,
+    };
+}
+
+/// How a session's background is drawn, as `tessera_session_appearance`
+/// reports it (ADR 0043). Fields are only ever appended.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SessionAppearance {
     /// `true` when the background is fully opaque: the frontend can draw
     /// the session's view, and a window whose every view is opaque, as
@@ -704,14 +731,36 @@ pub struct SessionAppearance {
     /// translucent background (`blur` of the session's profile or
     /// `[appearance]`). Never true while `opaque` is.
     pub blur: bool,
+    /// The session's configured background (#388, ADR 0043 amendment):
+    /// the theme of the session's profile, with that profile's `opacity`
+    /// times the theme's own alpha as `a`, or `a` 1.0 under
+    /// `TesseraDisplayOptions::reduce_transparency`. The frontend tints the
+    /// title bar and tab bar above the session's pane with it. Only the
+    /// configured theme counts: a background the program sets (OSC 11) is
+    /// not followed. `a` is below 1.0 exactly when `opaque` is false.
+    pub background: Rgba,
 }
 
 impl Default for SessionAppearance {
-    /// What a failed call reports: an opaque background, nothing blurred.
+    /// What a failed call reports: an opaque background, nothing blurred,
+    /// the background opaque black.
     fn default() -> Self {
         Self {
             opaque: true,
             blur: false,
+            background: Rgba::OPAQUE_BLACK,
+        }
+    }
+}
+
+impl SessionAppearance {
+    /// The core's appearance as the C struct.
+    fn from_core(look: &tessera_app_core::SessionAppearance) -> Self {
+        let [r, g, b, a] = look.background;
+        Self {
+            opaque: look.opaque,
+            blur: look.blur,
+            background: Rgba { r, g, b, a },
         }
     }
 }
@@ -725,7 +774,8 @@ impl Default for SessionAppearance {
 ///
 /// Returns `TESSERA_ERROR_NULL_POINTER` if `app` or `out` is `NULL`,
 /// `TESSERA_ERROR_SESSION_NOT_FOUND` if the id is not a live session. On
-/// failure `*out` is set to opaque with no blur (when `out` is not `NULL`).
+/// failure `*out` is set to opaque with no blur and an opaque black
+/// background, (0, 0, 0, 1) (when `out` is not `NULL`).
 ///
 /// # Safety
 ///
@@ -750,12 +800,7 @@ pub unsafe extern "C" fn tessera_session_appearance(
         match app.core.session_appearance(SessionId::from_raw(session_id)) {
             Ok(look) => {
                 // SAFETY: as above.
-                unsafe {
-                    out.write(SessionAppearance {
-                        opaque: look.opaque,
-                        blur: look.blur,
-                    });
-                };
+                unsafe { out.write(SessionAppearance::from_core(&look)) };
                 Error::Ok
             }
             Err(error) => error::report("tessera_session_appearance", &error),
