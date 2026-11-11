@@ -334,7 +334,7 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     /// This pane's smallest size depends on its cells and its scroll bar's
     /// style (ADR 0035): the tab's pane container recomputes the window's.
     private func paneMinimumSizeDidChange() {
-        (window?.contentView as? PaneContainerView)?.paneMinimumSizeDidChange()
+        enclosingPaneContainer?.paneMinimumSizeDidChange()
     }
 
     // MARK: Window

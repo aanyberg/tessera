@@ -23,9 +23,9 @@ final class Pane: Equatable {
     }
 }
 
-/// A tab's content view: lays out the tab's ``PaneTree`` with nested split
-/// views, one per split, whose leaves are the panes' terminal surfaces
-/// (ADR 0035).
+/// A tab's panes, in its window's ``TerminalWindowContentView``: lays out
+/// the tab's ``PaneTree`` with nested split views, one per split, whose
+/// leaves are the panes' terminal surfaces (ADR 0035).
 ///
 /// After every change to the tree the split views are built again from it:
 /// each pane's view moves to its new split view within the same window, so
@@ -375,10 +375,14 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
     /// behind a maximized pane included (ADR 0043, E7): a translucent pane
     /// in an opaque window would show the window's background, not the
     /// desktop. An opaque pane in a transparent window covers its frame, so
-    /// a mixed tab draws right.
+    /// a mixed tab draws right. The title bar and tab bar follow the window
+    /// (``TerminalWindowContentView``, #363).
     func paneOpacityDidChange() {
         guard let window else { return }
-        TerminalSurfaceView.setWindow(window, opaque: panes.allSatisfy(\.view.isBackgroundOpaque))
+        let opaque = panes.allSatisfy(\.view.isBackgroundOpaque)
+        TerminalSurfaceView.setWindow(window, opaque: opaque)
+        (superview as? TerminalWindowContentView)?.updateTitlebar(
+            translucent: !opaque, blur: panes.contains { $0.view.backdrop != nil })
     }
 
     /// The pane next to `pane` toward `direction`, as laid out now, or `nil`
@@ -402,7 +406,16 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
                 splitView.resizeSubviews(withOldSize: splitView.bounds.size)
             }
         }
-        window?.contentMinSize = minimumSize
+        updateWindowMinimumSize()
+    }
+
+    /// Sets the window's smallest content size: ``minimumSize``, and the
+    /// title bar's height over the panes of a translucent window, whose
+    /// content runs under it (``TerminalWindowContentView``).
+    func updateWindowMinimumSize() {
+        let inset = (superview as? TerminalWindowContentView)?.titlebarInset ?? 0
+        let minimum = minimumSize
+        window?.contentMinSize = CGSize(width: minimum.width, height: minimum.height + inset)
     }
 
     /// The smallest content size that keeps every pane at its smallest size.

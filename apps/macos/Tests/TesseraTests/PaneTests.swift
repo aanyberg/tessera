@@ -913,6 +913,8 @@ final class PaneTests: XCTestCase {
             for pane in controller.panes {
                 weakPanes += [WeakRef(object: pane), WeakRef(object: pane.view), WeakRef(object: pane.session)]
             }
+            // The window's content, which observes the window (#363).
+            weakPanes.append(WeakRef(object: controller.window?.contentView))
             controller.focusedPane.view.inputContext?.activate()
         }
         // AppKit may keep the closed window (the macOS 15 runner does).
@@ -922,7 +924,7 @@ final class PaneTests: XCTestCase {
             weakController == nil && weakPanes.allSatisfy { $0.object == nil }
         }
         XCTAssertNil(weakController, "controller")
-        XCTAssertEqual(weakPanes.compactMap(\.object).count, 0, "panes, views and sessions")
+        XCTAssertEqual(weakPanes.compactMap(\.object).count, 0, "panes, views, sessions and the window's content")
         XCTAssertNil(heldWindow?.contentView, "the panes left the closed window")
     }
 
@@ -1633,7 +1635,7 @@ extension PaneTests {
         }
         XCTAssertNil(weakController, "controller")
         XCTAssertNil(weakContainer, "container")
-        XCTAssertEqual(weakPanes.compactMap(\.object).count, 0, "panes, views and sessions")
+        XCTAssertEqual(weakPanes.compactMap(\.object).count, 0, "panes, views, sessions and the window's content")
     }
 
     /// The standing flood check on a maximized tab: `yes` in the maximized

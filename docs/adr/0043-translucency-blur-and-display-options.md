@@ -31,7 +31,12 @@ not flip the window. The window recomputes on every appearance change and
 on every rebuild of its panes (split, close, restore). A pane without a
 surface (not attached yet, or failed to start) draws nothing and counts as
 opaque. Native tabs are windows, so one translucent tab no longer makes
-the app's other windows translucent.
+the app's other windows translucent. A translucent window has a
+transparent title bar over full-size content (#363), so the title bar and
+tab bar draw no material band of their own; the panes stay below them
+(`contentLayoutRect`), a blur fills the strip above them while a pane of
+the tab is blurred, and the switch keeps the window's frame. The theme's
+background tint is not drawn under the title bar.
 
 **Blur only when translucent.** A session's look carries `blur =
 appearance.blur` only while its background is translucent after display

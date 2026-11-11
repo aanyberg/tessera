@@ -53,11 +53,16 @@ extension TerminalSurfaceView {
     /// ``PaneContainerView``, and this one pane otherwise.
     func paneOpacityDidChange() {
         guard let window else { return }
-        if let container = window.contentView as? PaneContainerView {
+        if let container = enclosingPaneContainer {
             container.paneOpacityDidChange()
         } else {
             Self.setWindow(window, opaque: isBackgroundOpaque)
         }
+    }
+
+    /// The tab's pane container this view is laid out in, if any.
+    var enclosingPaneContainer: PaneContainerView? {
+        sequence(first: superview, next: { $0?.superview }).lazy.compactMap { $0 as? PaneContainerView }.first
     }
 
     /// Makes `window` opaque, or transparent with a clear background, and
