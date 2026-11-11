@@ -788,16 +788,19 @@ impl App {
     /// Starting creates nothing on disk: `config.toml` is read if it is
     /// there. A missing file gives the defaults. A file that does not load
     /// (invalid TOML or values, unreadable, a symlink loop or a dangling
-    /// symlink) gives the defaults with clipboard writes (OSC 52) refused,
+    /// symlink, or missing because the configuration directory or one
+    /// above it is a dangling symlink) gives the defaults with clipboard writes (OSC 52) refused,
     /// logged once, until a version of it loads; an empty file does not
     /// turn them back on (ADR 0006). A configuration directory
     /// that does not exist yet is looked for every
     /// [`CONFIG_DIR_POLL_INTERVAL`] (one `stat`) and watched, its
     /// configuration applied, once it appears: created by hand, by
     /// [`App::open_config`] (which also starts the watch at once) or by the
-    /// first session's shell integration. When its parent directory does
-    /// not exist either, nothing is waited for (only `open_config` would
-    /// create it, and starts the watch).
+    /// first session's shell integration; so is one that is a dangling
+    /// symlink, once its target appears. When its parent directory does
+    /// not exist either (or is itself a dangling symlink), nothing is
+    /// waited for (only `open_config` would create it, and starts the
+    /// watch).
     pub fn with_config_dir(paths: ConfigPaths, options: WatchOptions) -> Self {
         let store = ConfigStore::in_memory(paths, Config::default());
         let paths = store.paths().clone();
@@ -1821,6 +1824,29 @@ mod tests {
             first(&app)
         );
         assert!(!lock(&seen).is_empty(), "on_config_applied");
+    }
+
+    /// #287 (M1): a configuration directory that is a symlink whose target
+    /// is missing (a dotfiles volume not mounted) starts with clipboard
+    /// writes refused; once the target appears it is watched and the usual
+    /// rules apply (no `config.toml`: the defaults, writes on).
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_configuration_directory_refuses_writes_until_it_appears() {
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("volume").join("tessera");
+        let paths = ConfigPaths::new(base.path().join("Tessera"));
+        std::os::unix::fs::symlink(&target, paths.root()).unwrap();
+        let app = App::with_config_dir(paths.clone(), WatchOptions::default());
+        assert!(!app.config().terminal.clipboard_write, "writes refused");
+        std::fs::create_dir_all(&target).unwrap();
+        assert!(
+            eventually(CONFIG_DIR_POLL_INTERVAL + Duration::from_secs(3), || {
+                app.config().terminal.clipboard_write
+            }),
+            "the appeared directory applies"
+        );
+        assert!(app.is_watching_config());
     }
 
     /// A configuration directory made by hand after launch is picked up:

@@ -131,8 +131,9 @@ Tracked: churn and leak checks for Rust, FFI and the app (#214); FFI fuzzing, AS
 ## Known gaps and open decisions
 
 - The OSC buffer in the parser is unbounded (#213).
-- OSC 52 writes are on by default with no notice (only a `config.toml` that exists but does not load at launch turns
-  them off until it loads: the store fails closed, `crates/tessera-config/src/store.rs`), multi-line paste without
+- OSC 52 writes are on by default with no notice (only a `config.toml` that exists but does not load at launch, or
+  sits behind a configuration directory symlink whose target is missing, turns them off until it loads: the store
+  fails closed, `crates/tessera-config/src/store.rs`), multi-line paste without
   bracketed paste runs every line, the link-opening scheme policy is undecided, and the child inherits the app's
   whole environment (#217).
 - An unknown OSC command's bytes are traced uncapped (`crates/tessera-term/src/osc.rs`; S8). No subscriber is

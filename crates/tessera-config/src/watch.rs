@@ -938,10 +938,14 @@ mod native {
     /// handle, so after arming the path must still name the handle's inode
     /// (see [`still_names`]); otherwise it counts as missing.
     ///
-    /// The type is checked with `stat` before opening: a FIFO where
-    /// `config.toml` should be would otherwise block the open until a
-    /// writer appeared. Anything but the expected kind counts as missing;
-    /// the directory watch still reports when it is replaced.
+    /// The type is checked with `stat` before opening, and again on the
+    /// open handle: the open is non-blocking (`O_NONBLOCK`), so a FIFO
+    /// renamed over the path between the two (a hostile local process
+    /// racing a broken `themes/*.toml`, #287) opens at once instead of
+    /// blocking the watcher thread, and the drop that joins it, until a
+    /// writer appears; the check on the handle then rejects it. Anything
+    /// but the expected kind counts as missing; the directory watch still
+    /// reports when it is replaced.
     fn register(
         queue: &mut kqueue::Watcher,
         slot: &mut Option<File>,
@@ -971,11 +975,18 @@ mod native {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e),
         }
-        let handle = match File::open(path) {
+        #[cfg(test)]
+        tests::before_open(path);
+        let handle = match open_nonblocking(path) {
             Ok(handle) => handle,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e),
         };
+        if !kind.matches(handle.metadata()?.file_type()) {
+            // Replaced since the `stat`; the directory watch reports the
+            // next change.
+            return Ok(());
+        }
         queue.add_file(&handle, EventFilter::EVFILT_VNODE, kind.flags())?;
         match queue.watch().and_then(|()| still_names(path, &handle)) {
             Ok(true) => {
@@ -990,6 +1001,17 @@ mod native {
                 named.map(|_| ())
             }
         }
+    }
+
+    /// Opens `path` read-only without blocking on a FIFO (`O_NONBLOCK`,
+    /// which a regular file or directory ignores). Symlinks are followed:
+    /// a symlinked `config.toml` is watched through its target.
+    fn open_nonblocking(path: &Path) -> std::io::Result<File> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
     }
 
     /// Whether `path` still names the inode `handle` has open. `false` when
@@ -1312,6 +1334,83 @@ mod native {
         use super::*;
         use crate::theme::Theme;
         use crate::watch::ConfigEvent;
+
+        thread_local! {
+            /// Run by [`register`] on this thread between its `stat` and
+            /// its open: a test that swaps the path in that window.
+            static BEFORE_OPEN: std::cell::Cell<Option<fn(&Path)>> =
+                const { std::cell::Cell::new(None) };
+        }
+
+        /// The hook point in [`register`]; see [`BEFORE_OPEN`].
+        pub(super) fn before_open(path: &Path) {
+            if let Some(hook) = BEFORE_OPEN.with(std::cell::Cell::get) {
+                hook(path);
+            }
+        }
+
+        /// Creates a FIFO at `path`.
+        fn mkfifo(path: &Path) {
+            let status = std::process::Command::new("mkfifo")
+                .arg(path)
+                .status()
+                .unwrap();
+            assert!(status.success(), "mkfifo {}", path.display());
+        }
+
+        /// Renames the FIFO made beforehand at `path.fifo` over `path`
+        /// (no process is started in the window), keeping that name so a
+        /// test that fails can still release a reader blocked on it.
+        fn swap_in_fifo(path: &Path) {
+            let fifo = path.with_extension("fifo");
+            let staged = path.with_extension("staged");
+            std::fs::hard_link(&fifo, &staged).unwrap();
+            std::fs::rename(&staged, path).unwrap();
+        }
+
+        /// #287 (M4): a FIFO renamed over a broken theme file between
+        /// [`register`]'s `stat` and its open must not block the watcher
+        /// thread; it counts as missing. Deterministic: the swap runs in
+        /// the window, on the registering thread.
+        #[test]
+        fn a_fifo_raced_in_after_the_stat_does_not_block_the_registration() {
+            let base = tempfile::tempdir().unwrap();
+            let paths = ConfigPaths::new(base.path());
+            std::fs::create_dir_all(paths.themes_dir()).unwrap();
+            let broken = paths.themes_dir().join("broken.toml");
+            std::fs::write(&broken, "name = \"Broken\"\nforeground = ").unwrap();
+            mkfifo(&broken.with_extension("fifo"));
+            let (done, finished) = std::sync::mpsc::channel();
+            let path = broken.clone();
+            let registering = std::thread::spawn(move || {
+                BEFORE_OPEN.with(|hook| hook.set(Some(swap_in_fifo)));
+                let mut queue = kqueue::Watcher::new().unwrap();
+                let mut slot = None;
+                let result = register(&mut queue, &mut slot, &path, Kind::File);
+                done.send(()).unwrap();
+                (result.map_err(|e| e.to_string()), slot.is_some())
+            });
+            if finished
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_err()
+            {
+                // Release the blocked open so the process can exit.
+                let _writer = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(broken.with_extension("fifo"));
+                let _ = registering.join();
+                panic!("register blocked opening a FIFO raced over the path");
+            }
+            let (result, armed) = registering.join().unwrap();
+            assert_eq!(result, Ok(()), "a FIFO counts as missing, not as an error");
+            assert!(!armed, "a FIFO is not watched as the file");
+            assert!(
+                std::os::unix::fs::FileTypeExt::is_fifo(
+                    &std::fs::metadata(&broken).unwrap().file_type()
+                ),
+                "the hook swapped the FIFO in"
+            );
+        }
 
         /// A theme document named `name`.
         fn theme_named(name: &str) -> String {

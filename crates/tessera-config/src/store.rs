@@ -30,7 +30,8 @@ use crate::{Config, Error};
 /// defaults), a failed load keeps the last good configuration unchanged.
 /// A `config.toml` symlink whose target is missing is a failed load, not a
 /// missing file (#262 item 1). While writes are refused this way, a file
-/// that is empty (or only whitespace) applies the defaults but keeps them
+/// that is empty (or only whitespace, after an optional byte order mark)
+/// applies the defaults but keeps them
 /// refused: it is what a save that truncates before it writes leaves for a
 /// moment, so only a load of a non-empty file turns them on (#262 item 9).
 #[derive(Debug, Clone)]
@@ -85,7 +86,8 @@ pub(crate) struct State {
 #[derive(Debug)]
 pub(crate) struct FromDisk {
     pub(crate) loaded: Loaded,
-    /// Whether the file held nothing but whitespace (a missing file is not
+    /// Whether the file held nothing but whitespace, after an optional
+    /// byte order mark (a missing file is not
     /// empty: it is a successful load of the defaults).
     pub(crate) empty: bool,
 }
@@ -320,7 +322,9 @@ impl ConfigStore {
     /// Reads `config.toml`. A missing file is the defaults; a symlink whose
     /// target is missing is an error, like a symlink cycle, since the file
     /// the user keeps their settings in is somewhere and could not be read
-    /// (#262 item 1).
+    /// (#262 item 1). So is a file missing because the configuration
+    /// directory, or a directory above it, is such a symlink (GNU stow's
+    /// layout, a dotfiles volume that is not mounted; #287).
     ///
     /// The loader's warnings are not logged here: [`ConfigStore::apply`]
     /// logs those the store did not hold already.
@@ -337,6 +341,13 @@ impl ConfigStore {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
                         "config.toml is a symlink whose target is missing",
+                    )
+                    .into());
+                }
+                if behind_dangling_link(&file) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "the configuration directory (or one above it) is a symlink whose target is missing",
                     )
                     .into());
                 }
@@ -486,6 +497,24 @@ impl ConfigStore {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+/// Whether `file` is missing because a directory above it is a symlink
+/// whose target is missing (or cannot be followed): the deepest ancestor
+/// that exists is such a symlink. `false` when it is a directory, so the
+/// file is simply missing. A few `lstat`s, only for a missing file.
+fn behind_dangling_link(file: &std::path::Path) -> bool {
+    for dir in file.ancestors().skip(1) {
+        if dir.as_os_str().is_empty() {
+            return false;
+        }
+        match std::fs::symlink_metadata(dir) {
+            Ok(meta) => return meta.is_symlink() && std::fs::metadata(dir).is_err(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1011,8 +1040,56 @@ mod tests {
         assert!(applied.terminal.clipboard_write);
     }
 
+    /// #287 (M1): a configuration directory that is a symlink whose target
+    /// is missing (GNU stow's layout with the checkout gone, a dotfiles
+    /// volume that is not mounted), or that sits below one, fails closed
+    /// like a dangling `config.toml` (#262 item 1), for an absolute and a
+    /// relative link; once the target directory appears the usual rules
+    /// apply (no file: the defaults, writes on).
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_config_directory_refuses_clipboard_writes() {
+        for (what, link, target, root) in [
+            ("absolute", "Tessera", "volume/tessera", "Tessera"),
+            ("relative", "Tessera", "./volume/tessera", "Tessera"),
+            ("above the root", "dotfiles", "volume", "dotfiles/tessera"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let target_dir = if target.starts_with("./") {
+                std::os::unix::fs::symlink(target, dir.path().join(link)).unwrap();
+                dir.path().join(target)
+            } else {
+                let target_dir = dir.path().join(target);
+                std::os::unix::fs::symlink(&target_dir, dir.path().join(link)).unwrap();
+                target_dir
+            };
+            let paths = ConfigPaths::new(dir.path().join(root));
+            // How the application starts (`App::with_config_dir`).
+            let store = ConfigStore::in_memory(paths.clone(), Config::default());
+            assert!(store.reload().is_err(), "{what}");
+            assert_eq!(*store.config(), refusing_defaults(), "{what}");
+            assert!(store.last_error().is_some(), "{what}");
+
+            std::fs::create_dir_all(&target_dir).unwrap();
+            std::fs::create_dir_all(paths.root()).unwrap();
+            let applied = store.reload().unwrap().expect("recovered");
+            assert_eq!(*applied, Config::default(), "{what}: no file, writes on");
+            assert!(store.last_error().is_none(), "{what}");
+        }
+
+        // A real directory with no `config.toml` is still the defaults.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConfigStore::in_memory(
+            ConfigPaths::new(dir.path().join("Tessera")),
+            Config::default(),
+        );
+        assert_eq!(store.reload().unwrap(), None);
+        assert!(store.config().terminal.clipboard_write);
+    }
+
     /// #262 item 9: while writes are refused after a failed load, an empty
-    /// or whitespace-only file keeps them refused, however often it loads;
+    /// or whitespace-only file (after an optional byte order mark, #287)
+    /// keeps them refused, however often it loads;
     /// only a non-empty file turns them on. Without a failure first, an
     /// empty file is the defaults with writes on.
     #[test]
@@ -1027,7 +1104,8 @@ mod tests {
         let paths = ConfigPaths::new(dir.path());
         std::fs::write(paths.config_file(), "[terminal\n").unwrap();
         let store = ConfigStore::open(paths.clone()).unwrap();
-        for empty in ["", " \n\t\r\n", ""] {
+        // A byte order mark alone loads as an empty document too (#287).
+        for empty in ["", " \n\t\r\n", "\u{feff}", "\u{feff} \r\n", ""] {
             std::fs::write(paths.config_file(), empty).unwrap();
             let _ = store.reload().unwrap();
             assert_eq!(*store.config(), refusing_defaults(), "{empty:?}");

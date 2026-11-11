@@ -935,11 +935,17 @@ pub fn load_file(path: &Path) -> Result<Loaded, Error> {
     load_file_noting_empty(path).map(|(loaded, _)| loaded)
 }
 
-/// [`load_file`], and whether the file held nothing but whitespace.
+/// [`load_file`], and whether the file held nothing but whitespace after
+/// an optional byte order mark: TOML loads a BOM-only file as empty, so it
+/// counts as empty too (#287).
 pub(crate) fn load_file_noting_empty(path: &Path) -> Result<(Loaded, bool), Error> {
     let bytes = read_capped(path, MAX_CONFIG_FILE_LEN, "config file")?;
     let text = std::str::from_utf8(&bytes)?;
-    let empty = text.trim().is_empty();
+    let empty = text
+        .strip_prefix('\u{feff}')
+        .unwrap_or(text)
+        .trim()
+        .is_empty();
     Config::from_toml_lenient(text).map(|loaded| (loaded, empty))
 }
 

@@ -202,7 +202,11 @@ modification first, at most `MAX_UNLOADABLE_FOLLOWED` (8; S5: a directory
 of thousands of broken files costs at most eight descriptors), so the save
 that completes the configured theme raises an event. These are kept to the
 same best-effort rule as the theme file: one that cannot be registered is
-logged at debug level and skipped. The polling backend needs none of this;
+logged at debug level and skipped. Every registration opens its path
+non-blocking and checks the type on the open handle as well as with the
+`stat` before it, so a FIFO renamed over a broken theme file between the
+two opens at once and is skipped instead of blocking the watcher thread
+and the drop that joins it (#287). The polling backend needs none of this;
 its full scan every twentieth tick sees the save. A native watcher costs
 about seven descriptors, plus at most eight while the configured theme
 does not load.
@@ -220,10 +224,17 @@ not load before any load has succeeded keeps clipboard writes (OSC 52)
 off. Two cases are added: a `config.toml` symlink whose target is missing
 is a failed load, like a symlink loop, not a missing file (#262 item 1),
 so at launch it refuses writes and while running it keeps the last good
-configuration; and while writes are refused this way, an empty (or
-whitespace-only) file applies the defaults with writes still off, since a
-save that truncates first leaves the file empty for a moment (#262 item
-9). Only a non-empty file that loads turns them on. Under the settled
+configuration; so is a `config.toml` missing because the configuration
+directory, or one above it, is a symlink whose target is missing (GNU
+stow's layout, a dotfiles volume that is not mounted; #287): when the
+directory itself is the link, until its target appears; when the link is
+further up, until ⌘, (`App::open_config`) or a restart after the target
+is back, since the application then does not wait for the directory; and
+while writes are refused this way, an empty (or
+whitespace-only, after an optional byte order mark, which TOML skips;
+#287) file applies the defaults with writes still off, since a save that
+truncates first leaves the file empty for a moment (#262 item 9). Only a
+non-empty file that loads turns them on. Under the settled
 rule that a missing file is a successful load, a broken file made or
 edited while running (after a successful load) keeps writes as they were
 until it is fixed or Tessera restarts (#262 N1). A failed load is logged
