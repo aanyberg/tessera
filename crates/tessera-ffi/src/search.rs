@@ -63,7 +63,8 @@ const _: () = assert!(SEARCH_MAX_MATCHES_TEXT_BYTES == MAX_MATCHES_TEXT_BYTES);
 /// bytes, not time: a pathological pattern costs about 0.65-0.9 s per KiB,
 /// so the first call of a query can block for many seconds (7.3 s measured
 /// on an 8 KB line; ADR 0038). A piece too slow is searched again
-/// in halves, and a row still slower than 250 ms is skipped (the status's
+/// in halves, and a row still slower than `max(4 x budget, 250 ms)` at the
+/// smallest piece (one row, 1 KiB) is skipped (the status's
 /// `lines_skipped`).
 pub const SEARCH_MAX_STEP_MICROS: u32 = 1_000_000;
 
@@ -111,7 +112,8 @@ pub struct SearchStatus {
     /// (cleared or evicted).
     pub truncated: bool,
     /// Some lines were too slow for the pattern to search whole: a row
-    /// that took more than 250 ms was skipped, or a line was cut into
+    /// that took more than `max(4 x budget, 250 ms)` (budget: the step's
+    /// `budget_us`) was skipped, or a line was cut into
     /// pieces smaller than 64 KiB (a match across such a cut is not
     /// found). Matches there may be missing from the count. Clears once
     /// those lines are gone or a new query starts.
@@ -327,8 +329,9 @@ unsafe fn with_status(
 /// every regex run inside a piece too, so the call returns within
 /// `max(4 x budget, 250 ms)` plus one regex call, which is not interruptible
 /// (`TESSERA_SEARCH_MAX_STEP_MICROS` says how long one can take). Pieces
-/// too slow are searched again in halves; a row slower than 250 ms is
-/// skipped, and `out->lines_skipped` set, as when the halves cut a line.
+/// too slow are searched again in halves; a row slower than
+/// `max(4 x budget, 250 ms)` at the smallest piece is skipped, and
+/// `out->lines_skipped` set, as when the halves cut a line.
 /// Lines
 /// are copied in chunks of at most 256, each under one hold of the
 /// terminal lock; a chunk can be searched over several calls, and its

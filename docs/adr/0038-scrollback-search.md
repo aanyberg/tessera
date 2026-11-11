@@ -80,7 +80,11 @@ combining marks, Cyrillic or CJK, and before this amendment one step took
 all of it. The engine now reads the clock after every regex run inside a
 piece, and once before the first, and stops at the piece's deadline
 (reading it every 16 runs, as first amended, let one step run 16 slow
-calls: about 12 s in the app; #331 round 1):
+calls: about 12 s in the app; #331 round 1). A literal query (not a
+regex) reads it every 16 runs (`LITERAL_RUNS_PER_CLOCK_READ`, #378): a
+literal's run ends at its match, so 16 of them scan disjoint text, no more
+than one run over the piece; reading the clock after each match cost about
+a quarter of a dense literal search:
 
 - The step's first piece may take `max(4 × budget, MIN_PIECE_TIME)`
   (16 ms; a zero budget still searches). One that runs out is searched
@@ -90,9 +94,14 @@ calls: about 12 s in the app; #331 round 1):
   cells) for the rest of the search drops one halving from what it was,
   so a short piece late from a stall does not cut every later line to the
   floor (#368). Both go down to one row of cells and `MIN_PIECE_BYTES`
-  (1 KiB). A piece no larger than that floor that already had the floor's
-  deadline (below) is skipped at once: searched again, it would be the
-  same run.
+  (1 KiB). A piece searched again that runs out again is slow at its size,
+  not stalled, so later pieces follow it: the search's limit becomes its
+  next half, or its own limit when it is skipped (#378). Such a piece no
+  larger than that floor that already had the floor's deadline (below) is
+  skipped at once: searched again, it would be the same run. Above the
+  floor, a piece late the first time is always searched again, even when
+  four budgets (62.5 ms or more) are the floor's deadline: one stall does
+  not skip a row (#378).
 - At that floor the first piece may take `max(4 × budget,
   LINE_TIME_LIMIT)` (250 ms). One that still runs out is skipped with the
   matches it found before the stop, and the status's `lines_skipped` says
@@ -108,7 +117,9 @@ calls: about 12 s in the app; #331 round 1):
   deadline.
 
 So a step returns within `max(4 × budget, 250 ms)` plus one regex call
-(`no_step_outlasts_four_budgets_and_a_quarter_second`, release only). The
+(`no_step_outlasts_four_budgets_and_a_quarter_second`, release only, checks
+each step against its own first piece's deadline plus its longest call and
+25 ms of slack). The
 deadline is checked after the last call of a piece too, the one that finds
 nothing more: before that (#331 adversarial run, F9c), a piece whose last
 call ran past the deadline counted as on time and was never halved or
