@@ -201,7 +201,7 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
     /// while a pane is maximized already.
     @discardableResult
     func zoom(_ pane: Pane) -> Bool {
-        guard tree.contains(pane), panes.count > 1, zoomedPane == nil, let root = rootView,
+        guard tree.contains(pane), panes.count > 1, zoomedPane == nil, !rebuildAfterDrag, let root = rootView,
             let slot = pane.view.superview, slot !== self
         else { return false }
         zoomedPane = pane
@@ -286,19 +286,64 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
     /// The drag saves the window state once, at its end, not per step.
     private var dividerDragMoved: Bool?
 
+    /// Whether the tree changed while a divider drag tracked (a pane's shell
+    /// exited): the split views are built again from it once the drag ends
+    /// (#371). AppKit's tracking loop reads the dragged split view's two
+    /// children at every step, and raises (`objectAtIndex:` beyond bounds)
+    /// once a rebuild has moved one out; the drag would end there, with
+    /// ``dividerDragDidEnd(_:)`` skipped and its children left in a live
+    /// resize. Only a rebuild inside the tracking loop (the run loop in its
+    /// event-tracking mode) waits: should a drag end without
+    /// ``dividerDragDidEnd(_:)`` all the same (an exception in AppKit), the
+    /// next change outside it rebuilds as before.
+    private var rebuildAfterDrag = false
+
+    /// Whether a ``PaneSplitView`` is tracking a divider drag.
+    var isTrackingDividerDrag: Bool { dividerDragMoved != nil }
+
     /// A ``PaneSplitView`` starts tracking a divider drag.
     fileprivate func dividerDragWillBegin() {
         dividerDragMoved = false
     }
 
-    /// The drag ended (the button is up): the window state is saved if a
+    /// The drag of `splitView`'s divider ended (the button is up): a rebuild
+    /// put off meanwhile happens now, and the window state is saved if a
     /// divider moved.
-    fileprivate func dividerDragDidEnd() {
-        let moved = dividerDragMoved == true
+    fileprivate func dividerDragDidEnd(_ splitView: PaneSplitView) {
+        var moved = dividerDragMoved == true
         dividerDragMoved = nil
+        if rebuildAfterDrag {
+            rebuildAfterDrag = false
+            moved = keepRatio(of: splitView) || moved
+            rebuild()
+        }
         if moved {
             layoutDidChange()
         }
+    }
+
+    /// After a drag during which the tree changed: the share `splitView`
+    /// shows goes to its split if the split is still in the tree (a pane
+    /// on each side of it is), which the split views, built from the tree
+    /// before the change, could not map it to while the drag tracked.
+    /// Returns whether it changed the split's ratio.
+    private func keepRatio(of splitView: PaneSplitView) -> Bool {
+        let views = splitView.subviews
+        guard views.count == 2 else { return false }
+        let panes = panes
+        let first = panes.filter { $0.view.isDescendant(of: views[0]) }
+        let second = panes.filter { $0.view.isDescendant(of: views[1]) }
+        var ratios = tree.root.splits.map(\.ratio)
+        guard !first.isEmpty, !second.isEmpty,
+            let index = tree.root.splits.firstIndex(where: { $0.first.leaves == first && $0.second.leaves == second })
+        else { return false }
+        let vertical = splitView.isVertical
+        let length = vertical ? views[0].frame.width : views[0].frame.height
+        let space = (vertical ? splitView.bounds.width : splitView.bounds.height) - splitView.dividerThickness
+        guard space > 0, abs(length - (space * ratios[index]).rounded()) >= 0.5 else { return false }
+        ratios[index] = length / space
+        tree.setRatios(ratios)
+        return true
     }
 
     // MARK: Dimming
@@ -414,7 +459,14 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
     /// its place while both are in the window (so no surface detaches), and
     /// then drops the old split views, with the view of a pane no longer in
     /// the tree. Every pane is shown: its callers clear ``zoomedPane``.
+    /// Inside a divider drag's tracking loop it waits for the drag's end
+    /// (``rebuildAfterDrag``).
     private func rebuild() {
+        if isTrackingDividerDrag, RunLoop.current.currentMode == .eventTracking {
+            rebuildAfterDrag = true
+            return
+        }
+        rebuildAfterDrag = false
         standIn = nil
         let old = subviews
         let root = install(tree.root, frame: bounds, into: self)
@@ -626,7 +678,7 @@ final class PaneSplitView: NSSplitView {
         }
         container?.dividerDragWillBegin()
         super.mouseDown(with: event)
-        container?.dividerDragDidEnd()
+        container?.dividerDragDidEnd(self)
     }
 }
 

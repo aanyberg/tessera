@@ -406,14 +406,18 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     /// macOS 15 CI runner), the window holding its content view; either
     /// would keep a closed tab's view and session alive. The view leaves
     /// once the main actor is next free, so the closing window never draws
-    /// without it. A closed window is never shown again.
+    /// without it, and in the run loop's default mode only: not inside
+    /// AppKit's tracking of a divider drag, which raises once a split view
+    /// it tracks loses a child (#371). A closed window is never shown again.
     private func windowWillClose() {
         tearDown()
         inputContext?.deactivate()
         let closedWindow = window
-        Task { @MainActor [weak self, weak closedWindow] in
-            guard let self, let closedWindow, window === closedWindow else { return }
-            removeFromSuperview()
+        RunLoop.main.perform(inModes: [.default]) { [weak self, weak closedWindow] in
+            MainActor.assumeIsolated {
+                guard let self, let closedWindow, self.window === closedWindow else { return }
+                self.removeFromSuperview()
+            }
         }
     }
 
