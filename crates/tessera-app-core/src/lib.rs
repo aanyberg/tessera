@@ -2624,6 +2624,7 @@ mod tests {
     use tessera_pty::{ExitStatus, PtyEvent};
 
     use super::*;
+    use proptest::strategy::Strategy as _;
 
     /// Mouse and wheel routing (#12), in `src/tests/mouse_routing.rs`.
     mod mouse_routing;
@@ -5269,34 +5270,206 @@ mod tests {
     /// rather than leaving it on other text after the re-wraps.
     #[test]
     fn a_session_resize_there_and_back_clears_the_selection() {
+        // Taller and wider, wider alone and taller alone: each changes
+        // the history the selection is on.
+        for there in [PtySize::new(5, 12), PtySize::new(3, 12), PtySize::new(5, 8)] {
+            let app = app();
+            let id = app.spawn_test_session(PtySize::new(3, 8)).unwrap();
+            app.set_max_scrollback_for_test(id, 5).unwrap();
+            app.feed_for_test(id, REWRAP_284.as_bytes()).unwrap();
+            app.scroll_to(id, ScrollTarget::Offset(6)).unwrap();
+            app.select_begin(id, Point::new(0, 3), Granularity::Char, false)
+                .unwrap();
+            app.select_extend(id, Point::new(1, 2)).unwrap();
+            let original = app.selection_text(id).unwrap();
+            assert_eq!(original.as_deref(), Some("b\naaa"));
+            let session = app.session(id).unwrap();
+            session.resize(there).unwrap();
+            session.resize(PtySize::new(3, 8)).unwrap();
+            let text = app.selection_text(id).unwrap();
+            assert_eq!(
+                text, None,
+                "via {there:?} the selection is {text:?}, not cleared"
+            );
+            // A resize to the same size keeps it.
+            app.select_begin(id, Point::new(0, 0), Granularity::Char, false)
+                .unwrap();
+            app.select_extend(id, Point::new(0, 2)).unwrap();
+            let kept = app.selection_text(id).unwrap();
+            assert!(kept.is_some());
+            session.resize(PtySize::new(3, 8)).unwrap();
+            assert_eq!(app.selection_text(id).unwrap(), kept);
+        }
+    }
+
+    /// #284: text whose re-wraps at 3 x 8 and 5 x 12 change the history's
+    /// length at a cap of 5 lines while no line is evicted.
+    const REWRAP_284: &str =
+        "hellow0rde\u{301}w0rdw0rdab\r\naaaaaaaaaaaaaaaa e\u{301}\r\nhelloaaaaaaaaaaaaaaaaxyz  ";
+
+    /// #284 in the application: `font_size` 13 -> {10, 17, 20, 26} -> 13
+    /// through [`App::apply_config`] (the configuration watch's path, with
+    /// no frame in between), on an offscreen 3 x 14 view with re-wrapping
+    /// text and a short scrollback. Every selection that Copy would read
+    /// afterwards is the text that was selected, or there is none: never
+    /// other text (the issue counted 130 changed copies on the pre-fix
+    /// head). A no-op apply keeps the selection. Needs a GPU: skipped (it
+    /// passes without checking) under `TESSERA_SKIP_GPU_TESTS`.
+    #[test]
+    fn a_font_size_round_trip_through_apply_config_never_moves_the_selection() {
+        // The text, fed afresh (after a RIS, which clears the history)
+        // before each selection: a round trip re-wraps it once, after
+        // which it re-wraps to the same lines.
+        const TEXT: &str = "hellow0rde\u{301}w0rdw0rdabcdefgh\r\naaaaaaaaaaaaaaaaaaaaaaaaa e\u{301}\r\n\
+             helloaaaaaaaaaaaaaaaaaaaaaaaaaaxyz  \r\nw0rd w0rd\r\nlast  ";
         let app = app();
-        let id = app.spawn_test_session(PtySize::new(3, 8)).unwrap();
-        app.set_max_scrollback_for_test(id, 5).unwrap();
-        app.feed_for_test(
-            id,
-            "hellow0rde\u{301}w0rdw0rdab\r\naaaaaaaaaaaaaaaa e\u{301}\r\nhelloaaaaaaaaaaaaaaaaxyz  "
-                .as_bytes(),
-        )
-        .unwrap();
-        app.scroll_to(id, ScrollTarget::Offset(6)).unwrap();
-        app.select_begin(id, Point::new(0, 3), Granularity::Char, false)
-            .unwrap();
-        app.select_extend(id, Point::new(1, 2)).unwrap();
-        let original = app.selection_text(id).unwrap();
-        assert_eq!(original.as_deref(), Some("b\naaa"));
-        let session = app.session(id).unwrap();
-        session.resize(PtySize::new(5, 12)).unwrap();
-        session.resize(PtySize::new(3, 8)).unwrap();
-        let text = app.selection_text(id).unwrap();
-        assert_eq!(text, None, "the selection moved to {text:?}");
-        // A resize to the same size keeps it.
+        let id = app.spawn_test_session(PtySize::new(3, 14)).unwrap();
+        let refeed = || {
+            app.feed_for_test(id, b"\x1bc").unwrap();
+            app.set_max_scrollback_for_test(id, 5).unwrap();
+            app.feed_for_test(id, TEXT.as_bytes()).unwrap();
+        };
+        refeed();
+        if !attach_offscreen(&app, id, PhysicalSize::new(120, 60), 1.0) {
+            return;
+        }
+        let grid = |app: &App| {
+            app.with_terminal(id, |t| (t.grid().rows(), t.grid().cols()))
+                .unwrap()
+        };
+        assert_eq!(grid(&app), (3, 14));
+        let theme = tessera_config::Theme::default();
+        let at = |font_size: f32| {
+            let mut config = Config::default();
+            config.appearance.font_size = font_size;
+            config
+        };
+        assert_eq!(app.config().appearance.font_size, 13.0);
+
+        // A no-op apply (the configuration in effect) keeps the selection.
         app.select_begin(id, Point::new(0, 0), Granularity::Char, false)
             .unwrap();
-        app.select_extend(id, Point::new(0, 2)).unwrap();
+        app.select_extend(id, Point::new(2, 5)).unwrap();
         let kept = app.selection_text(id).unwrap();
         assert!(kept.is_some());
-        session.resize(PtySize::new(3, 8)).unwrap();
+        app.apply_config(&at(13.0), &theme);
         assert_eq!(app.selection_text(id).unwrap(), kept);
+
+        let (rows, cols) = (3u16, 14u16);
+        let cells: Vec<Point> = (0..rows)
+            .flat_map(|row| (0..cols).map(move |col| Point::new(row, col)))
+            .collect();
+        let (mut checked, mut changed) = (0usize, Vec::new());
+        for font_size in [10.0, 17.0, 20.0, 26.0] {
+            for offset in 0..=6 {
+                for (i, &from) in cells.iter().enumerate() {
+                    for delta in [0, 1, 5, 13, 14, 15, 27, 41] {
+                        let to = cells[(i + delta).min(cells.len() - 1)];
+                        refeed();
+                        app.scroll_to(id, ScrollTarget::Offset(offset)).unwrap();
+                        app.select_begin(id, from, Granularity::Char, false)
+                            .unwrap();
+                        app.select_extend(id, to).unwrap();
+                        let Some(original) = app.selection_text(id).unwrap() else {
+                            continue;
+                        };
+                        app.apply_config(&at(font_size), &theme);
+                        assert_ne!(grid(&app), (rows, cols), "{font_size} pt re-wraps");
+                        app.apply_config(&at(13.0), &theme);
+                        assert_eq!(grid(&app), (rows, cols));
+                        checked += 1;
+                        let copied = app.selection_text(id).unwrap();
+                        if copied.as_ref().is_some_and(|text| *text != original) {
+                            changed.push((font_size, offset, from, to, original, copied));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 2000, "only {checked} selections checked");
+        assert!(
+            changed.is_empty(),
+            "{} of {checked} copies changed, first: {:?}",
+            changed.len(),
+            changed.first()
+        );
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+        /// #284 over random text, sizes and selections: after a run of
+        /// `Session::resize`s (the configuration's apply path) with or
+        /// without a look in between, the selection reads the text it read
+        /// before, or is gone; it never ends on other text, also after a
+        /// round trip back to the starting size.
+        #[test]
+        fn a_selection_survives_a_resize_only_on_the_same_text(
+            text in proptest::prop_oneof![
+                // The issue's text, whose re-wraps change the history's
+                // length at its cap without an eviction.
+                1 => proptest::strategy::Just(REWRAP_284.to_owned()),
+                3 => proptest::collection::vec(
+                    proptest::sample::select(vec![
+                        "ab", "w0rd", "hello", "e\u{301}", "\u{3042}", " ", "  ",
+                        "\r\n", "\r\n", "aaaaaaaaaaaa", "xyz", "\x1b[2J",
+                    ]),
+                    1..40,
+                )
+                .prop_map(|pieces| pieces.concat()),
+            ],
+            start in proptest::prop_oneof![
+                1 => proptest::strategy::Just((3u16, 8u16)),
+                2 => (1u16..6, 2u16..16),
+            ],
+            cap in proptest::prop_oneof![1 => proptest::strategy::Just(5usize), 2 => 0usize..8],
+            // Scrolled to the top of the history and selecting from the
+            // view's first row: where a shorter history after the round
+            // trip shifts the selected lines.
+            offset in proptest::prop_oneof![1 => proptest::strategy::Just(usize::MAX), 1 => 0usize..12],
+            from in proptest::prop_oneof![
+                1 => (proptest::strategy::Just(0u16), 0u16..16),
+                1 => (0u16..6, 0u16..16),
+            ],
+            to in (0u16..6, 0u16..16),
+            granularity in proptest::sample::select(vec![
+                Granularity::Char, Granularity::Word, Granularity::Line,
+            ]),
+            block in proptest::bool::weighted(0.2),
+            // Whether Copy (or a frame) looks after each resize: the
+            // configuration's apply thread resizes with no look in between.
+            sizes in proptest::collection::vec(
+                (1u16..7, 1u16..18, proptest::bool::weighted(0.25)),
+                1..5,
+            ),
+        ) {
+            let app = app();
+            let (rows, cols) = start;
+            let id = app.spawn_test_session(PtySize::new(rows, cols)).unwrap();
+            app.set_max_scrollback_for_test(id, cap).unwrap();
+            app.feed_for_test(id, text.as_bytes()).unwrap();
+            let target = match offset {
+                usize::MAX => ScrollTarget::Top,
+                offset => ScrollTarget::Offset(offset),
+            };
+            app.scroll_to(id, target).unwrap();
+            let point = |(row, col): (u16, u16)| Point::new(row % rows, col % cols);
+            app.select_begin(id, point(from), granularity, block).unwrap();
+            app.select_extend(id, point(to)).unwrap();
+            let original = app.selection_text(id).unwrap();
+            let session = app.session(id).unwrap();
+            for (r, c, look) in sizes.into_iter().chain([(start.0, start.1, true)]) {
+                session.resize(PtySize::new(r, c)).unwrap();
+                if !look {
+                    continue;
+                }
+                let text = app.selection_text(id).unwrap();
+                proptest::prop_assert!(
+                    text.is_none() || text == original,
+                    "{original:?} became {text:?} at {r}x{c}"
+                );
+            }
+        }
     }
 
     /// #175 item 2: a resize that leaves no history (every line fits on
