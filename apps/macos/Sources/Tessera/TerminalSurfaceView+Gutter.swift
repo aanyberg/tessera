@@ -36,7 +36,13 @@ extension TerminalSurfaceView: NSViewToolTipOwner {
     /// again only when the padding, cell height, row count, scale or the
     /// view's height changed. Without a surface, a cell size or a padding
     /// there are none.
+    ///
+    /// Not during a live resize (a window or divider drag, which holds the
+    /// mouse button, so no tip shows): the rects are placed from the view's
+    /// bottom, so every height step would move all of them (3.5 ms a step
+    /// at 798 rows, #375). They are laid out once when it ends.
     func updateGutterToolTips() {
+        guard !isLiveResizing else { return }
         let layout = metrics.map {
             GutterToolTips.Layout(
                 paddingPx: $0.paddingPx, cellHeightPx: $0.cellHeightPx, rows: $0.rows, scale: $0.scale,
@@ -96,9 +102,10 @@ extension TerminalSurfaceView: NSViewToolTipOwner {
         let (seconds, attoseconds) = duration.components
         guard seconds >= 0, attoseconds >= 0 else { return "0 ms" }
         let millis = seconds.multipliedReportingOverflow(by: 1000)
-        guard !millis.overflow else { return "\(seconds / 3600) h" }
+        // Past what milliseconds hold (about 2.5e12 hours): from the seconds.
+        guard !millis.overflow else { return "\(seconds / 3600) h \(seconds / 60 % 60) min" }
         let sum = millis.partialValue.addingReportingOverflow(attoseconds / 1_000_000_000_000_000)
-        guard !sum.overflow else { return "\(seconds / 3600) h" }
+        guard !sum.overflow else { return "\(seconds / 3600) h \(seconds / 60 % 60) min" }
         let total = sum.partialValue
         switch total {
         case ..<1000: return "\(total) ms"

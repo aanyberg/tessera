@@ -110,7 +110,10 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
             if needsRender != oldValue { updateDisplayLinkPause() }
         }
     }
-    private var isLiveResizing = false
+    /// A live resize (a window or divider drag) is under way: the core and
+    /// the gutter's tool tips get the size once it ends or, for the core,
+    /// once a display refresh.
+    private(set) var isLiveResizing = false
     private var pendingResize = false {
         didSet { if pendingResize != oldValue { updateDisplayLinkPause() } }
     }
@@ -610,6 +613,7 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         super.viewDidEndLiveResize()
         isLiveResizing = false
         resizeSurface()
+        updateGutterToolTips()
     }
 
     /// During a live resize every size change re-wraps the scrollback under
@@ -638,6 +642,10 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
             suboptimalFrames = 0
             needsRender = true
             updateMarkedTextLayer()
+        } catch TesseraCoreError.sessionNotFound {
+            // The pane closed: its view stays only until the split views
+            // are rebuilt, at the end of a divider drag that ends the live
+            // resize which got here (#379).
         } catch {
             guard !reattachIfDropped(error, wasAttached: true) else {
                 Self.log.info("core dropped the surface; re-attaching")

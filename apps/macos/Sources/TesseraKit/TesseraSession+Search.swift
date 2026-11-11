@@ -68,9 +68,10 @@ extension TesseraSession {
         /// gave way are gone.
         public var truncated: Bool
         /// Some lines were too slow for the pattern to search whole (a row
-        /// over 250 ms was skipped, or a line was cut into smaller pieces):
-        /// matches there may be missing from the count. Clears once those
-        /// lines are gone.
+        /// slower than `max(4 x budget, 250 ms)` at the smallest piece was
+        /// skipped, the budget being the step's, or a line was cut into
+        /// smaller pieces): matches there may be missing from the count.
+        /// Clears once those lines are gone.
         public var linesSkipped: Bool
 
         public init(
@@ -161,12 +162,13 @@ extension TesseraSession {
 
     /// Scans for about `budgetMicros` microseconds (clamped to
     /// ``TesseraSession/searchMaxStepMicros``), at least one piece of at
-    /// most 64 KiB of text, and returns the status. It returns within four
-    /// budgets plus 250 ms plus one regex call, which is not interruptible
-    /// and bounded by bytes, not time: with a pathological pattern the
-    /// first call of a query can block for many seconds (7.3 s measured on
-    /// an 8 KB line, ADR 0038), and at the 1 KiB floor up to about 0.7 s;
-    /// a row slower than 250 ms is skipped (``SearchStatus/linesSkipped``).
+    /// most 64 KiB of text, and returns the status. It returns within
+    /// `max(4 x budget, 250 ms)` plus one regex call, which is not
+    /// interruptible and bounded by bytes, not time: with a pathological
+    /// pattern the first call of a query can block for many seconds (7.3 s
+    /// measured on an 8 KB line, ADR 0038), and at the 1 KiB floor up to
+    /// about 0.7 s; a row slower than `max(4 x budget, 250 ms)` at the
+    /// smallest piece is skipped (``SearchStatus/linesSkipped``).
     /// Call it once per
     /// display refresh while the status is not ``SearchStatus/done`` or
     /// output arrived; without a search it does nothing.

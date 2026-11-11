@@ -621,13 +621,19 @@ final class FindBarTests: XCTestCase {
         XCTAssertNotEqual(view.findBar?.countLabel.stringValue, "Copied the matches that fit in 1 MB", "a new query drops it")
     }
 
+    /// At the cap the notice counts the matches copied: lines evicted from
+    /// the history since the last step take their matches out of the copy
+    /// but not out of the status the bar holds (#375).
     func testCopyAllMatchesPastTheCapSaysHowManyItCopied() async throws {
         let pasteboard = NSPasteboard(name: .init("tessera-find-\(UUID().uuidString)"))
         defer { pasteboard.releaseGlobally() }
-        try startCore("[terminal]\nscrollback_lines = 120000\n")
+        try startCore("[terminal]\nscrollback_lines = 110000\n")
         // 110 000 lines of digits: more matches than the cap, under 1 MB
-        // of text for the newest 100 000.
-        let view = try makeView("seq 1 110000; exec cat > /dev/null", windowed: false, rows: 4, cols: 8)
+        // of text for the newest 100 000. Then, on a line from the test,
+        // 20 000 more, which evict the oldest.
+        let view = try makeView(
+            "stty -echo; seq 1 110000; read x; seq 200001 220000; exec cat > /dev/null", windowed: false, rows: 4,
+            cols: 8)
         view.pasteboard = pasteboard
         try await tick(view, until: "110 000 lines of history", timeout: .seconds(120)) {
             try view.session.scrollPosition.history >= 109_990
@@ -642,41 +648,65 @@ final class FindBarTests: XCTestCase {
         XCTAssertTrue(copied.hasSuffix("110000"), "the newest kept")
         let max = FindController.format(TesseraSession.searchMaxMatches)
         XCTAssertEqual(view.find.notice, "Copied \(max) of more than \(max)", "not 'all matches'")
+
+        // No step meanwhile (the display link is not driven): the bar's
+        // status still counts the evicted lines' matches.
+        try view.session.write(Array("go\n".utf8))
+        let deadline = ContinuousClock.now + .seconds(120)
+        while try !view.session.accessibleText().string.contains("220000") {
+            guard ContinuousClock.now < deadline else { return XCTFail("the second batch did not arrive") }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(view.find.status.matches, TesseraSession.searchMaxMatches)
+        view.copyAllFindMatches(nil)
+        let evicted = try XCTUnwrap(pasteboard.string(forType: .string))
+        let count = evicted.split(separator: "\n").count
+        XCTAssertLessThan(count, TesseraSession.searchMaxMatches, "the evicted lines' matches are not copied")
+        XCTAssertTrue(evicted.hasSuffix("110000"), "the output after the step is not searched yet")
+        XCTAssertEqual(view.find.notice, "Copied \(FindController.format(count)) of more than \(max)")
     }
 
     /// #331 round 1 (swift B2): the copy notice says "all" only when the
     /// copy is whole, nothing gave way at the cap and no line was skipped;
-    /// each cut names itself, the 1 MB one first.
+    /// each cut names itself, the 1 MB one first, and skipped lines are
+    /// named whatever else it says (#375). At the cap it counts the matches
+    /// copied, not the status's.
     func testTheCopyNoticeSaysAllOnlyWhenNothingIsMissing() {
         typealias Status = TesseraSession.SearchStatus
-        let max = FindController.format(TesseraSession.searchMaxMatches)
-        let cases: [(copyTruncated: Bool, status: Status, notice: String)] = [
-            (false, Status(matches: 12, active: true, done: true), "Copied all matches"),
-            (true, Status(matches: 12, active: true, done: true), "Copied the matches that fit in 1 MB"),
+        let cap = TesseraSession.searchMaxMatches
+        let max = FindController.format(cap)
+        let cases: [(copyTruncated: Bool, copied: Int, status: Status, notice: String)] = [
+            (false, 12, Status(matches: 12, active: true, done: true), "Copied all matches"),
+            (true, 9, Status(matches: 12, active: true, done: true), "Copied the matches that fit in 1 MB"),
             (
-                false, Status(matches: TesseraSession.searchMaxMatches, active: true, done: true, truncated: true),
+                false, cap, Status(matches: cap, active: true, done: true, truncated: true),
                 "Copied \(max) of more than \(max)"
             ),
             (
-                false, Status(matches: 12, active: true, done: true, linesSkipped: true),
+                false, 12, Status(matches: 12, active: true, done: true, linesSkipped: true),
                 "Copied the matches found; some lines were skipped"
             ),
             (
-                true, Status(matches: 12, active: true, done: true, truncated: true, linesSkipped: true),
-                "Copied the matches that fit in 1 MB"
+                true, 9, Status(matches: 12, active: true, done: true, linesSkipped: true),
+                "Copied the matches that fit in 1 MB; some lines were skipped"
             ),
             (
-                false,
-                Status(
-                    matches: TesseraSession.searchMaxMatches, active: true, done: true, truncated: true,
-                    linesSkipped: true),
+                true, 9, Status(matches: 12, active: true, done: true, truncated: true, linesSkipped: true),
+                "Copied the matches that fit in 1 MB; some lines were skipped"
+            ),
+            (
+                false, cap, Status(matches: cap, active: true, done: true, truncated: true, linesSkipped: true),
                 "Copied \(max) of more than \(max); some lines were skipped"
             ),
+            (
+                false, 90_000, Status(matches: cap, active: true, done: true, truncated: true),
+                "Copied \(FindController.format(90_000)) of more than \(max)"
+            ),
         ]
-        for (copyTruncated, status, notice) in cases {
+        for (copyTruncated, copied, status, notice) in cases {
             XCTAssertEqual(
-                FindController.copyNotice(copyTruncated: copyTruncated, status: status), notice,
-                "copy cut \(copyTruncated), \(status)")
+                FindController.copyNotice(copyTruncated: copyTruncated, copied: copied, status: status), notice,
+                "copy cut \(copyTruncated), \(copied) copied, \(status)")
         }
     }
 

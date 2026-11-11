@@ -292,14 +292,24 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
     /// children at every step, and raises (`objectAtIndex:` beyond bounds)
     /// once a rebuild has moved one out; the drag would end there, with
     /// ``dividerDragDidEnd(_:)`` skipped and its children left in a live
-    /// resize. Only a rebuild inside the tracking loop (the run loop in its
-    /// event-tracking mode) waits: should a drag end without
-    /// ``dividerDragDidEnd(_:)`` all the same (an exception in AppKit), the
-    /// next change outside it rebuilds as before.
+    /// resize. Only a rebuild inside the tracking loop waits
+    /// (``isTrackingDividerDrag``), and the run loop's default mode, which
+    /// runs once no tracking loop does, rebuilds what is still put off and
+    /// ends the drag: one that ended without ``dividerDragDidEnd(_:)`` all
+    /// the same (an exception in AppKit, #379) leaves no stale split view
+    /// and no refused zoom behind, only the ratio of its last steps.
     private var rebuildAfterDrag = false
 
-    /// Whether a ``PaneSplitView`` is tracking a divider drag.
-    var isTrackingDividerDrag: Bool { dividerDragMoved != nil }
+    /// Whether a ``PaneSplitView`` is tracking a divider drag: one began
+    /// and the run loop is in its event-tracking mode, in which AppKit's
+    /// tracking loop runs. A drag that ended without
+    /// ``dividerDragDidEnd(_:)`` (an exception in AppKit) reads as none
+    /// outside that mode, though ``dividerDragMoved`` stays set until the
+    /// next drag begins; inside it (a menu, a window's live resize) a
+    /// rebuild waits for the default mode as a drag's would.
+    var isTrackingDividerDrag: Bool {
+        dividerDragMoved != nil && RunLoop.current.currentMode == .eventTracking
+    }
 
     /// A ``PaneSplitView`` starts tracking a divider drag.
     fileprivate func dividerDragWillBegin() {
@@ -472,9 +482,24 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
     /// then drops the old split views, with the view of a pane no longer in
     /// the tree. Every pane is shown: its callers clear ``zoomedPane``.
     /// Inside a divider drag's tracking loop it waits for the drag's end
-    /// (``rebuildAfterDrag``).
+    /// or, should the drag end without ``dividerDragDidEnd(_:)``, for the
+    /// run loop's default mode (``rebuildAfterDrag``).
     private func rebuild() {
-        if isTrackingDividerDrag, RunLoop.current.currentMode == .eventTracking {
+        if isTrackingDividerDrag {
+            if !rebuildAfterDrag {
+                // Not before the tracking loop is gone, however it ended:
+                // no default-mode pass runs inside it. Still put off then,
+                // the drag ended without dividerDragDidEnd(_:).
+                RunLoop.main.perform(inModes: [.default]) { [weak self] in
+                    MainActor.assumeIsolated {
+                        guard let self, self.rebuildAfterDrag else { return }
+                        let moved = self.dividerDragMoved == true
+                        self.dividerDragMoved = nil
+                        self.rebuild()
+                        if moved { self.layoutDidChange() }
+                    }
+                }
+            }
             rebuildAfterDrag = true
             return
         }
@@ -561,6 +586,19 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
             ? after.frame.maxX - minimum.width - splitView.dividerThickness
             : after.frame.maxY - minimum.height - splitView.dividerThickness
         return min(proposedMaximumPosition, limit)
+    }
+
+    /// At every step of a drag, the limits above again: AppKit reads them
+    /// once, as the drag begins, and a pane zoomed in during it would end
+    /// below its new smallest size (#379).
+    func splitView(
+        _ splitView: NSSplitView, constrainSplitPosition proposedPosition: CGFloat, ofSubviewAt dividerIndex: Int
+    ) -> CGFloat {
+        let lower = self.splitView(splitView, constrainMinCoordinate: -.infinity, ofSubviewAt: dividerIndex)
+        let upper = self.splitView(splitView, constrainMaxCoordinate: .infinity, ofSubviewAt: dividerIndex)
+        // No room for both (the window at its smallest size): AppKit's own.
+        guard lower <= upper else { return proposedPosition }
+        return min(max(proposedPosition, lower), upper)
     }
 
     /// A split view's new size (the window resized, or an outer divider

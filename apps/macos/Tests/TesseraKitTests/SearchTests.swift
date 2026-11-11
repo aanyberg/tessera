@@ -139,20 +139,26 @@ final class SearchTests: XCTestCase {
 
     /// `searchReveal()` scrolls the view to the current match (the newest
     /// once found) without moving it, and does nothing without a search.
+    /// Three matches, so that a reveal wired to the older or the newer move
+    /// makes another one current (#375).
     func testRevealScrollsToTheCurrentMatchOnly() async throws {
         let filler = (1...30).map { "line \($0)" }
-        let session = try await session(["hit"] + filler)
+        let session = try await session(["hit", "hit", "hit"] + filler)
         XCTAssertEqual(try session.searchReveal(), .init(), "no search: nothing")
         XCTAssertEqual(try session.scrollPosition.offset, 0, "no search: the view stays")
         try session.searchStart("hit", regex: false, caseSensitive: false)
         let found = try finish(session)
-        XCTAssertEqual(found.matches, 1)
-        XCTAssertEqual(found.current, 0)
+        XCTAssertEqual(found.matches, 3)
+        XCTAssertEqual(found.current, 2, "the newest is current once found")
         XCTAssertEqual(try session.scrollPosition.offset, 0, "a step does not scroll")
         let revealed = try session.searchReveal()
-        XCTAssertEqual(revealed, found, "the match stays current")
+        XCTAssertEqual(revealed, found, "the newest stays current")
+        XCTAssertEqual(try session.searchStatus.current, 2)
         let position = try session.scrollPosition
-        XCTAssertEqual(position.offset, position.history, "scrolled to the top, where the match is")
+        // The newest match is the third line of the history; the top row
+        // shows line `history - offset`.
+        XCTAssertGreaterThanOrEqual(position.offset, position.history - 2, "scrolled up to the newest match")
+        XCTAssertLessThanOrEqual(position.offset, position.history)
         XCTAssertEqual(try session.searchReveal(), found)
         XCTAssertEqual(try session.scrollPosition, position, "in view: no move")
         try session.searchClear()

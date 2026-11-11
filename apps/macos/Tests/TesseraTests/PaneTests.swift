@@ -1,4 +1,5 @@
 import AppKit
+import OSLog
 import TesseraKit
 import XCTest
 
@@ -2042,6 +2043,8 @@ extension PaneTests {
         let container = controller.paneContainer
         let window = try XCTUnwrap(controller.window)
         let start = autoreleasepool { frame(of: left, in: controller).maxX + 0.5 }
+        let logged = try OSLogStore(scope: .currentProcessIdentifier)
+        let since = logged.position(date: Date())
         let windowNumber = window.windowNumber
         // Not through the split view, which the drag's end drops.
         let toWindow = { (x: CGFloat) in container.convert(NSPoint(x: x, y: 200), to: nil) }
@@ -2121,6 +2124,14 @@ extension PaneTests {
         XCTAssertNil(driver.failure)
         XCTAssertEqual(controller.panes, [left, topRight])
         XCTAssertNil(closingView?.window, "the closed pane's view left the tab")
+        // The drag's end resized the closed pane's view too, before it left
+        // (#379): its session is gone, which is no failure.
+        let failures = try logged.getEntries(
+            at: since,
+            matching: NSPredicate(
+                format: "subsystem == %@ AND category == %@", "com.aanyberg.tessera", "surface")
+        ).compactMap { ($0 as? OSLogEntryLog)?.composedMessage }.filter { $0.hasPrefix("resizing the surface failed") }
+        XCTAssertEqual(failures, [])
         let width = frame(of: left, in: controller).maxX
         XCTAssertEqual(width, start - 200.5, accuracy: 1, "the divider is where the drag let go")
         let ratio = container.tree.root.splits[0].ratio
@@ -2298,6 +2309,242 @@ extension PaneTests {
             guard case .split(_, let saved, _, _) = store.load()?.windows.first?.layout(ofTab: 0) else { return false }
             return abs(saved - Double(ratio)) < 1e-9
         }
+    }
+
+    /// A pane zoomed in during a divider drag (#379): the drag stops at
+    /// the pane's new smallest size, not at the one it had when the drag
+    /// began.
+    func testADividerDragStopsAtASmallestSizeThatGrewDuringIt() async throws {
+        let controller = try openTab(NSSize(width: 1200, height: 600))
+        let left = controller.focusedPane
+        let right = try split(controller, .right)
+        try skipUnlessAttached(controller)
+        let container = controller.paneContainer
+        let start = frame(of: left, in: controller).maxX + 0.5
+        let before = PaneContainerView.minimumSize(of: right.view).width
+        let end = container.bounds.width - 5
+        try await trackDividerDrag(
+            at: start, in: container, window: try XCTUnwrap(controller.window),
+            steps: [
+                { post in
+                    for step in 1...5 { post(.leftMouseDragged, start + CGFloat(10 * step)) }
+                    return true
+                },
+                { _ in
+                    guard self.frame(of: left, in: controller).maxX > start + 25 else { return false }
+                    for _ in 0..<7 { right.view.increaseFontSize(nil) }
+                    return true
+                },
+                { post in
+                    for step in 1...10 { post(.leftMouseDragged, start + (end - start) * CGFloat(step) / 10) }
+                    post(.leftMouseUp, end)
+                    return true
+                },
+            ])
+        let minimum = PaneContainerView.minimumSize(of: right.view).width
+        XCTAssertGreaterThan(minimum, before + 20, "the zoom raised the smallest width")
+        XCTAssertGreaterThanOrEqual(right.view.frame.width, minimum - 0.5, "the drag stopped at it")
+        XCTAssertLessThanOrEqual(right.view.frame.width, minimum + 1, "and went that far")
+    }
+
+    /// An exception in AppKit ending a divider drag after a pane's shell
+    /// exited during it (#379): ``PaneContainerView/dividerDragDidEnd(_:)``
+    /// is skipped, and the run loop's default mode builds the split views
+    /// that waited: the closed pane's view leaves the tab, zoom works again
+    /// and no drag tracks.
+    func testADividerDragEndedByAnExceptionStillDropsTheClosedPane() async throws {
+        weak var closingView: TerminalSurfaceView?
+        let (controller, left, topRight, closing) = try autoreleasepool {
+            let controller = try openTab()
+            let left = controller.focusedPane
+            let topRight = try split(controller, .right)
+            let bottomRight = try split(controller, .below)
+            closingView = bottomRight.view
+            return (controller, left, topRight, bottomRight)
+        }
+        try skipUnlessAttached(controller)
+        let container = controller.paneContainer
+        let start = autoreleasepool { frame(of: left, in: controller).maxX + 0.5 }
+        try await trackDividerDragUntilAnException(
+            at: start, in: container, window: try XCTUnwrap(controller.window),
+            steps: [
+                { post in
+                    for step in 1...5 { post(.leftMouseDragged, start - CGFloat(10 * step)) }
+                    return true
+                },
+                { _ in
+                    guard self.frame(of: left, in: controller).maxX < start - 25 else { return false }
+                    try? closing.session.write(Array("exit\n".utf8))
+                    return true
+                },
+                { _ in
+                    guard controller.panes.count == 2 else { return false }
+                    XCTAssertNotNil(closingView?.window, "the rebuild waits for the drag")
+                    return true
+                },
+            ])
+        try await waitUntil("the closed pane's view leaves the tab") { closingView?.window == nil }
+        XCTAssertEqual(controller.panes, [left, topRight])
+        XCTAssertEqual(splitViews(in: container), container.tree.root.splits.count, "no stale split view")
+        XCTAssertFalse(isTrackingDividerDragInEventTrackingMode(container), "the drag ended")
+        XCTAssertTrue(controller.toggleZoom(), "zoom works again")
+        XCTAssertTrue(controller.toggleZoom())
+    }
+
+    /// The run loop's event-tracking mode with no drag tracking (#379),
+    /// after an exception in AppKit ended one with nothing put off: a split
+    /// outside that mode builds its split views at once, and a pane's shell
+    /// exiting inside it (a menu open, a window's live resize) waits for
+    /// the default mode, which drops the pane's view.
+    func testOnlyTheTrackingLoopPutsARebuildOff() async throws {
+        weak var closingView: TerminalSurfaceView?
+        let (controller, left, right) = try autoreleasepool {
+            let controller = try openTab()
+            let left = controller.focusedPane
+            return (controller, left, try split(controller, .right))
+        }
+        try skipUnlessAttached(controller)
+        let container = controller.paneContainer
+        let start = autoreleasepool { frame(of: left, in: controller).maxX + 0.5 }
+        try await trackDividerDragUntilAnException(
+            at: start, in: container, window: try XCTUnwrap(controller.window),
+            steps: [
+                { post in
+                    for step in 1...5 { post(.leftMouseDragged, start - CGFloat(10 * step)) }
+                    return true
+                },
+                { _ in self.frame(of: left, in: controller).maxX < start - 25 },
+            ])
+        let below = try autoreleasepool { try split(controller, .below) }
+        closingView = below.view
+        XCTAssertTrue(below.view.window === controller.window, "the split is built at once")
+        XCTAssertEqual(splitViews(in: container), 2)
+        XCTAssertTrue(controller.toggleZoom(), "zoom is not refused")
+        XCTAssertTrue(controller.toggleZoom())
+
+        // From a Timer, as AppKit's loops run: the test's task would wait
+        // for the mode to end.
+        var gone = false
+        let spinner = DragDriver()
+        let deadline = ContinuousClock.now + .seconds(10)
+        spinner.onTick = { [unowned spinner] in
+            spinner.step = 3
+            try? below.session.write(Array("exit\n".utf8))
+            while controller.panes.contains(below), ContinuousClock.now < deadline {
+                _ = CFRunLoopRunInMode(CFRunLoopMode(RunLoop.Mode.eventTracking.rawValue as CFString), 0.02, false)
+            }
+            gone = !controller.panes.contains(below)
+        }
+        RunLoop.main.add(
+            Timer(
+                timeInterval: 0, target: spinner, selector: #selector(DragDriver.fire(_:)), userInfo: nil,
+                repeats: true),
+            forMode: .default)
+        try await waitUntil("the shell exits in the event-tracking mode") { gone || ContinuousClock.now > deadline }
+        XCTAssertTrue(gone, "the pane left the tree")
+        try await waitUntil("its view leaves the tab") { closingView?.window == nil }
+        XCTAssertEqual(controller.panes, [left, right])
+        XCTAssertEqual(splitViews(in: container), 1, "no stale split view")
+        XCTAssertTrue(controller.toggleZoom(), "zoom works again")
+        XCTAssertTrue(controller.toggleZoom())
+    }
+
+    /// Presses on the divider at `x` as ``trackDividerDrag(at:in:window:steps:)``
+    /// does, runs `steps` in turn while the drag tracks, then raises an
+    /// NSException inside AppKit's tracking loop, which unwinds it past
+    /// ``PaneContainerView/dividerDragDidEnd(_:)``. Returns once it was
+    /// raised.
+    private func trackDividerDragUntilAnException(
+        at x: CGFloat, in container: PaneContainerView, window: NSWindow,
+        steps: [(_ post: (NSEvent.EventType, CGFloat) -> Void) -> Bool]
+    ) async throws {
+        let windowNumber = window.windowNumber
+        let post = { (type: NSEvent.EventType, x: CGFloat) in
+            guard
+                let event = NSEvent.mouseEvent(
+                    with: type, location: container.convert(NSPoint(x: x, y: 200), to: nil), modifierFlags: [],
+                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: windowNumber, context: nil,
+                    eventNumber: 0, clickCount: 1, pressure: 1)
+            else { return XCTFail("no \(type) event") }
+            NSApp.postEvent(event, atStart: false)
+        }
+        let reason = "injected mid-drag (#379)"
+        // The exception skips the end of the drag Timer's fire: its steps
+        // stop it themselves.
+        var raised = false
+        let driver = DragDriver()
+        let deadline = ContinuousClock.now + .seconds(10)
+        var next = 0
+        driver.onTick = { [unowned driver] in
+            guard !raised else { return driver.step = 3 }
+            guard ContinuousClock.now < deadline else {
+                driver.failure = "timed out at step \(next)"
+                post(.leftMouseUp, x)
+                return driver.step = 3
+            }
+            guard container.isTrackingDividerDrag else { return }
+            guard next == steps.count else {
+                if steps[next](post) { next += 1 }
+                return
+            }
+            raised = true
+            NSException(name: NSExceptionName("PaneTestsInjected"), reason: reason).raise()
+        }
+        let timer = Timer(
+            timeInterval: 0.01, target: driver, selector: #selector(DragDriver.fire(_:)), userInfo: nil, repeats: true)
+        RunLoop.main.add(timer, forMode: .eventTracking)
+        defer { timer.invalidate() }
+        // Caught where the press is dispatched, as NSApp's loop would: left
+        // to XCTest, it would end the test.
+        var caught: NSException?
+        let downDriver = DragDriver()
+        downDriver.onTick = { [unowned downDriver] in
+            post(.leftMouseDown, x)
+            if let event = NSApp.nextEvent(
+                matching: .leftMouseDown, until: .distantPast, inMode: .default, dequeue: true)
+            {
+                caught = TesseraTestsCatchingException { NSApp.sendEvent(event) }
+            } else {
+                downDriver.failure = "the press was not queued"
+            }
+            downDriver.step = 3
+        }
+        RunLoop.main.add(
+            Timer(
+                timeInterval: 0, target: downDriver, selector: #selector(DragDriver.fire(_:)), userInfo: nil,
+                repeats: true),
+            forMode: .default)
+        try await waitUntil("the drag ends") { downDriver.step == 3 }
+        XCTAssertNil(downDriver.failure)
+        XCTAssertNil(driver.failure)
+        XCTAssertTrue(raised, "the exception was raised")
+        XCTAssertEqual(caught?.reason, reason, "and ended the drag")
+    }
+
+    /// Whether `container` reads a divider drag as tracking from inside the
+    /// run loop's event-tracking mode, where one would.
+    private func isTrackingDividerDragInEventTrackingMode(_ container: PaneContainerView) -> Bool {
+        var tracking: Bool?
+        let probe = DragDriver()
+        probe.onTick = { [unowned probe] in
+            tracking = container.isTrackingDividerDrag
+            probe.step = 3
+        }
+        let timer = Timer(
+            timeInterval: 0, target: probe, selector: #selector(DragDriver.fire(_:)), userInfo: nil, repeats: true)
+        RunLoop.main.add(timer, forMode: .eventTracking)
+        defer { timer.invalidate() }
+        let deadline = Date(timeIntervalSinceNow: 2)
+        while tracking == nil, Date() < deadline {
+            _ = CFRunLoopRunInMode(CFRunLoopMode(RunLoop.Mode.eventTracking.rawValue as CFString), 0.02, false)
+        }
+        XCTAssertNotNil(tracking, "the event-tracking Timer fired")
+        return tracking ?? true
+    }
+
+    /// The split views shown in `view`, itself included.
+    private func splitViews(in view: NSView) -> Int {
+        (view is PaneSplitView && !view.isHidden ? 1 : 0) + view.subviews.reduce(0) { $0 + splitViews(in: $1) }
     }
 
     /// A spawn failing partway through a restored layout: the tab keeps its
