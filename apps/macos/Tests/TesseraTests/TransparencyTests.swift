@@ -169,6 +169,7 @@ final class TransparencyTests: XCTestCase {
         XCTAssertTrue(view.subviews.first === backdrop, "\(what): under the render view and the rest", file: file, line: line)
         XCTAssertEqual(backdrop.frame, view.bounds, "\(what): filling the pane", file: file, line: line)
         XCTAssertEqual(backdrop.blendingMode, .behindWindow, "\(what)", file: file, line: line)
+        XCTAssertEqual(backdrop.material, .fullScreenUI, "\(what): no grey cast (#363)", file: file, line: line)
         XCTAssertEqual(backdrop.state, .active, "\(what): blurred in a window that is not key", file: file, line: line)
         XCTAssertNil(backdrop.hitTest(NSPoint(x: 5, y: 5)), "\(what): takes no clicks", file: file, line: line)
     }
@@ -222,6 +223,7 @@ final class TransparencyTests: XCTestCase {
             NSRect(x: 0, y: area.maxY, width: content.bounds.width, height: content.bounds.maxY - area.maxY),
             "\(what): filling the title bar and tab bar", file: file, line: line)
         XCTAssertEqual(backdrop.blendingMode, .behindWindow, "\(what)", file: file, line: line)
+        XCTAssertEqual(backdrop.material, .fullScreenUI, "\(what): the panes' material", file: file, line: line)
         XCTAssertEqual(backdrop.state, .active, "\(what): blurred in a window that is not key", file: file, line: line)
         XCTAssertNil(
             backdrop.hitTest(NSPoint(x: backdrop.frame.midX, y: backdrop.frame.midY)), "\(what): takes no clicks",

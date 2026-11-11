@@ -17,13 +17,17 @@ setting was ignored. Issue #42 finishes it.
 
 **Blur per pane (E7).** A pane whose session is translucent and asks for
 blur gets an `NSVisualEffectView` (`PaneBackdropView`: `.behindWindow`,
-material `.underWindowBackground`, state `.active` so it does not change
-when another window takes the focus) under its render view, inside the
-pane's `TerminalSurfaceView` (`TerminalSurfaceView+Backdrop.swift`). It
-fills the pane, sits below everything the pane draws (text, scroll bar,
-find bar, the inactive-pane shade) and takes no clicks, cursor or
-accessibility. A pane that stops asking for blur loses it; closing the pane
-releases it with the view.
+material `.fullScreenUI`, state `.active` so it does not change when
+another window takes the focus) under its render view, inside the pane's
+`TerminalSurfaceView` (`TerminalSurfaceView+Backdrop.swift`). It fills the
+pane, sits below everything the pane draws (text, scroll bar, find bar, the
+inactive-pane shade) and takes no clicks, cursor or accessibility. A pane
+that stops asking for blur loses it; closing the pane releases it with the
+view. The material was `.underWindowBackground` until #363: in a manual
+check its grey system tint washed the theme's colours out below 0.9
+opacity. Compared side by side with the other materials, `.fullScreenUI` was
+picked; `.popover` came second and is the alternative, a one-word swap, if
+the colours still look grey somewhere.
 
 **Opacity per tab window (E7).** A window is opaque only while every pane of
 its tab is, panes hidden behind a maximized pane included, so zooming does
@@ -34,9 +38,10 @@ opaque. Native tabs are windows, so one translucent tab no longer makes
 the app's other windows translucent. A translucent window has a
 transparent title bar over full-size content (#363), so the title bar and
 tab bar draw no material band of their own; the panes stay below them
-(`contentLayoutRect`), a blur always fills the strip above them, whatever
-the panes' own blur setting, so the title and tab titles stay legible over a
-busy desktop, and the switch keeps the window's frame. The theme's
+(`contentLayoutRect`), a blur (the same `PaneBackdropView`, so the same
+material) always fills the strip above them, whatever the panes' own blur
+setting, so the title and tab titles stay legible over a busy desktop, and
+the switch keeps the window's frame. The theme's
 background tint is not drawn under the title bar.
 
 **Blur only when translucent.** A session's look carries `blur =

@@ -77,16 +77,19 @@ extension TerminalSurfaceView {
     }
 }
 
-/// The blur under a translucent pane (ADR 0043): what is behind the window,
-/// blurred, active whether or not the window is key, so the pane does not
-/// change when the focus moves to another window. It fills the pane and
-/// takes no clicks, the pointer or accessibility.
+/// The blur under a translucent pane and under a translucent window's title
+/// bar and tab bar (ADR 0043): what is behind the window, blurred through the
+/// `.fullScreenUI` material (`.underWindowBackground` gave the theme's
+/// colours a grey cast; `.popover` is the alternative); active whether or
+/// not the window is key, so the pane does not change when the focus moves
+/// to another window. It fills the pane and takes no clicks, the pointer or
+/// accessibility.
 @MainActor
 final class PaneBackdropView: NSVisualEffectView {
     override init(frame: NSRect) {
         super.init(frame: frame)
         blendingMode = .behindWindow
-        material = .underWindowBackground
+        material = .fullScreenUI
         state = .active
         autoresizingMask = [.width, .height]
         setAccessibilityElement(false)
