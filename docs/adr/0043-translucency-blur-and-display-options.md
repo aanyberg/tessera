@@ -42,7 +42,7 @@ tab bar draw no material band of their own; the panes stay below them
 material) always fills the strip above them, whatever the panes' own blur
 setting, so the title and tab titles stay legible over a busy desktop, and
 the switch keeps the window's frame. The theme's
-background tint is not drawn under the title bar.
+background tint under the strip is added by the amendment below.
 
 **Blur only when translucent.** A session's look carries `blur =
 appearance.blur` only while its background is translucent after display
@@ -98,3 +98,26 @@ selection fully opaque and `App::dim_inactive_panes` is 0. The app reads
 Increase Contrast with Reduce Transparency on this ADR's observer and calls
 `tessera_app_set_display_options` only when one of them changed, then reads
 the pane dimming again.
+
+## Amendment (#388, ADR 0045, 2026-11-11)
+
+**Strip tint (E7).** The strip is no longer left without the theme's colour.
+The core reports the session's resolved theme background in
+`SessionAppearance` as four `f32` (red, green, blue, alpha, each 0..=1,
+straight not premultiplied alpha), after the profile's theme, its opacity and
+the display options (Reduce Transparency: alpha 1) are applied. The host
+draws that colour under the strip's `PaneBackdropView`; it never reads the
+theme itself. Each pane that touches the top edge of the content tints its own
+segment of the strip with its own colour, so a split with two themes shows
+both; if the eye check shows that as noisy, the top-left pane's colour is used
+for the tab-bar area only, each top-edge pane still tinting its own segment.
+Only the configured theme counts (profile theme, opacity, display options): an
+OSC 11 background set by the program is not followed, a documented gap. The strip keeps its material and has no blur key
+of its own (ADR 0045).
+
+**Hidden panes (E7).** The window's opacity counts every pane of the tab,
+including one hidden behind a maximized pane, as stated above. So a hidden
+translucent pane keeps the window translucent, and a hidden pane that asks
+for blur is not drawn but still counts toward the window's blur: this is
+intended, it keeps zooming from changing the window, and the wording above
+and the code comments say "every pane of the tab", not "every visible pane".
