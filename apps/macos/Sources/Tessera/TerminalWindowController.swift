@@ -111,7 +111,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
         window.tabbingMode = .preferred
         window.tabbingIdentifier = Self.tabbingIdentifier
         window.title = title.isEmpty ? Self.defaultTitle : title
-        window.contentView = paneContainer
+        window.contentView = TerminalWindowContentView(paneContainer: paneContainer, frame: paneContainer.frame)
         super.init(window: window)
         window.delegate = self
         watchFocus(of: pane)
@@ -436,7 +436,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
 
     /// The window cannot be made smaller than its panes' smallest sizes.
     private func updateMinimumSize() {
-        window?.contentMinSize = paneContainer.minimumSize
+        paneContainer.updateWindowMinimumSize()
     }
 
     /// Whether the window asks for all its tabs (⇧⌘W).
@@ -630,7 +630,9 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
         // view leaving it, once AppKit is done with the close.
         let closedWindow = window
         Task { @MainActor [weak paneContainer, weak closedWindow] in
-            guard let paneContainer, let closedWindow, closedWindow.contentView === paneContainer else { return }
+            guard let paneContainer, let closedWindow,
+                (closedWindow.contentView as? TerminalWindowContentView)?.paneContainer === paneContainer
+            else { return }
             closedWindow.contentView = nil
         }
         delegate?.terminalWindowControllerDidClose(self)

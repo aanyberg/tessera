@@ -17,7 +17,9 @@ Swift shell, and left the "windows → tabs → pane tree → sessions" model of
 
 The pane tree is Swift, like the tab registry; the core is unchanged and
 keeps one session per pane. A tab's controller owns a
-`PaneContainerView`, the window's content view, which owns a
+`PaneContainerView` (inside the window's content view, a
+`TerminalWindowContentView` that keeps it below a transparent title bar,
+#363), which owns a
 `PaneTree<Pane>`: a value-type binary tree whose leaves are `Pane`s (a
 session and its `TerminalSurfaceView`) and whose inner nodes are splits with
 a direction (`.right`: side by side, `.below`: stacked) and the share of the

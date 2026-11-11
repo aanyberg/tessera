@@ -39,7 +39,7 @@ final class WindowTabTests: XCTestCase {
         XCTAssertEqual(window.subtitle, "")
         XCTAssertEqual(window.tabbingMode, .preferred)
         XCTAssertEqual(window.tabbingIdentifier, "com.aanyberg.tessera.terminal")
-        XCTAssertTrue(window.contentView === controller.paneContainer)
+        XCTAssertTrue((window.contentView as? TerminalWindowContentView)?.paneContainer === controller.paneContainer)
         // A live session accepts input and a resize.
         XCTAssertNoThrow(try controller.focusedPane.session.write(Array("hello\n".utf8)))
         XCTAssertNoThrow(try controller.focusedPane.session.resize(rows: 30, cols: 100))

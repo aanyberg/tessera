@@ -25,7 +25,7 @@ extension TerminalSurfaceView {
     /// The pane's title, which the core sanitised (docs/security.md S3),
     /// never empty.
     override func accessibilityLabel() -> String? {
-        let pane = (window?.contentView as? PaneContainerView)?.panes.first { $0.view === self }
+        let pane = enclosingPaneContainer?.panes.first { $0.view === self }
         guard let title = pane?.title, !title.isEmpty else { return Self.accessibilityFallbackLabel }
         return title
     }
