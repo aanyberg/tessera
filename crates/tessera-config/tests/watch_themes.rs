@@ -609,3 +609,87 @@ fn the_thread_start_hook_runs_on_the_watcher_thread() {
         drop(watcher);
     }
 }
+
+/// #287 (M4): a hostile local process that keeps renaming a FIFO over a
+/// broken theme file (followed while it does not load) and a regular file
+/// back must not hang the watcher thread in an `open` of the FIFO: after
+/// 20 rounds the watcher still reports the fix, and dropping it (which
+/// joins the thread) returns within 5 s. The FIFO and the regular file
+/// are one inode each, hard-linked into place, so a failing run can
+/// release a reader blocked on the FIFO before it panics. Only the native
+/// backend opens the files it watches. The race is real, so without the
+/// fix a run catches it about three times in five; the deterministic test
+/// is `a_fifo_raced_in_after_the_stat_does_not_block_the_registration`
+/// in `watch.rs`.
+#[cfg(unix)]
+#[test]
+fn a_fifo_renamed_over_a_broken_theme_file_does_not_hang_the_watcher() {
+    const ROUNDS: usize = 20;
+    /// Swaps per round: each one gives the watcher a directory event,
+    /// so it registers the file again while the next swap lands.
+    const SWAPS: usize = 200;
+    const DROP_BOUND: Duration = Duration::from_secs(5);
+    let backend = WatchBackend::Native;
+    let dir = tempfile::tempdir().unwrap();
+    let side = tempfile::tempdir_in(dir.path()).unwrap();
+    let paths = ConfigPaths::new(dir.path().join("config"));
+    std::fs::create_dir_all(paths.themes_dir()).unwrap();
+    let broken = paths.themes_dir().join("broken.toml");
+    let staged = paths.themes_dir().join(".staged");
+    let regular = side.path().join("regular");
+    let fifo = side.path().join("fifo");
+    write(&regular, "name = \"Broken\"\nforeground = ");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    std::fs::hard_link(&regular, &broken).unwrap();
+    std::fs::write(paths.config_file(), config_doc("broken")).unwrap();
+    let store = ConfigStore::open(paths).unwrap();
+    let watcher = store
+        .watch(WatchOptions {
+            backend,
+            debounce: Duration::from_millis(20),
+            max_wait: Duration::from_millis(50),
+            ..Default::default()
+        })
+        .unwrap();
+    // Releases a reader blocked opening the FIFO, from a thread of its
+    // own since the open blocks when no reader is.
+    let release = |what: &str| -> ! {
+        let fifo = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = std::fs::OpenOptions::new().write(true).open(fifo);
+        });
+        panic!("{backend:?}: {what}");
+    };
+    for _ in 0..ROUNDS {
+        for _ in 0..SWAPS {
+            for source in [&fifo, &regular] {
+                std::fs::hard_link(source, &staged).unwrap();
+                std::fs::rename(&staged, &broken).unwrap();
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drain(&watcher, QUIET);
+    write(&broken, &theme_doc("Broken", "#1d1d1d"));
+    let deadline = Instant::now() + EVENTUALLY;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match watcher.recv_timeout(left) {
+            Ok(ConfigEvent::ThemesChanged) if background(&store) == "#1d1d1d" => break,
+            Ok(_) => {}
+            Err(_) => release("the watcher no longer reports the fix"),
+        }
+    }
+    let (dropped, done) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        drop(watcher);
+        let _ = dropped.send(());
+    });
+    if done.recv_timeout(DROP_BOUND).is_err() {
+        release("dropping the watcher did not return within 5 s");
+    }
+}

@@ -12,7 +12,9 @@
 //! loads, and [`ConfigStore::last_error`] reports why), and an invalid edit
 //! while running keeps the last good configuration until the file is
 //! repaired. A `config.toml` symlink whose target is missing counts as a
-//! file that does not load, not as a missing one. Each failure is logged
+//! file that does not load, not as a missing one, and so does a
+//! `config.toml` missing because the configuration directory is such a
+//! symlink. Each failure is logged
 //! once, with the text it quotes from the file escaped.
 //! Watching uses kernel file events where available and polling elsewhere;
 //! see ADR 0006.
@@ -447,9 +449,14 @@ pub struct Terminal {
     /// until it is fixed. When Tessera starts with a `config.toml` that does
     /// not load at all (a syntax error anywhere in it, such as
     /// `clipboard_write = off` without quotes, a duplicate key, a file that
-    /// is not UTF-8, or a `config.toml` symlink whose target is missing),
-    /// writes are refused as well until the file is fixed, while the other
-    /// defaults apply; emptying the file does not turn them back on (a save
+    /// is not UTF-8, a `config.toml` symlink whose target is missing, or a
+    /// configuration directory that is such a symlink, as when a dotfiles
+    /// volume is not mounted), writes are refused as well until the file is
+    /// fixed (or the directory appears; when the link is above the
+    /// configuration directory, until you open the file with ⌘, or
+    /// restart once the target is back), while the other defaults apply;
+    /// emptying the file (or leaving only a byte order mark) does not turn
+    /// them back on (a save
     /// that truncates first leaves it empty for a moment), only a version
     /// of it with something in it that loads. Applies to every session at
     /// once when changed.
