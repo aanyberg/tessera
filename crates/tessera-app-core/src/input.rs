@@ -720,18 +720,25 @@ mod tests {
     /// `[keys]` tables against a tight loop of reads; every map is the
     /// one of its generation. (Unstaged, this rarely reaches the few
     /// nanoseconds between the reads that a torn version left open; the
-    /// staged test above is the one that catches it.)
+    /// staged test above is the one that catches it.) Halfway, the applier
+    /// waits until a read has started after that apply, so the reads
+    /// overlap the applies however the threads are scheduled (#386: a
+    /// stalled reader used to wake after the last apply).
     #[test]
     fn the_map_and_its_generation_never_tear_under_applies() {
         const APPLIES: u64 = 20_000;
+        const HALFWAY: u64 = APPLIES / 2;
         let bindings = Arc::new(Bindings::new(&Config::default()));
         let bound = Config::from_toml_lenient("[keys]\n'cmd+u' = 'new_tab'\n")
             .unwrap()
             .config;
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The reads finished so far.
+        let reads = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let applier = {
             let bindings = Arc::clone(&bindings);
             let done = Arc::clone(&done);
+            let reads = Arc::clone(&reads);
             std::thread::spawn(move || {
                 let defaults = Config::default();
                 for generation in 1..=APPLIES {
@@ -741,21 +748,33 @@ mod tests {
                         &defaults
                     };
                     assert_eq!(bindings.applied(config), generation);
+                    // No apply until a read that started after this one
+                    // finishes: two more finished reads, as one may have
+                    // been under way. It counts reads, not the generation
+                    // they report, so a torn read fails the test rather
+                    // than hanging it; the reader loops until `done`.
+                    if generation == HALFWAY {
+                        let before = reads.load(Ordering::Acquire);
+                        while reads.load(Ordering::Acquire) < before + 2 {
+                            std::thread::yield_now();
+                        }
+                    }
                 }
                 done.store(true, Ordering::Release);
             })
         };
         let new_tab = CommandId::find("new_tab", None).unwrap();
-        let (mut reads, mut torn) = (0_u64, 0_u64);
-        while !done.load(Ordering::Acquire) {
+        let mut torn = 0_u64;
+        // An applier that panics never sets `done`: `join` reports it.
+        while !done.load(Ordering::Acquire) && !applier.is_finished() {
             let (map, generation) = bindings.keymap_and_generation();
             let expected = if generation % 2 == 1 { 2 } else { 1 };
             torn += u64::from(map.chords(new_tab).len() != expected);
-            reads += 1;
+            reads.fetch_add(1, Ordering::Release);
         }
         applier.join().unwrap();
+        let reads = reads.load(Ordering::Relaxed);
         assert_eq!(torn, 0, "{torn} torn reads in {reads}");
-        assert!(reads > 1, "the reads overlapped the applies");
     }
 
     /// An unbound Command letter stops at the ASCII filter; a configuration
