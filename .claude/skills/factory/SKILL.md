@@ -13,7 +13,7 @@ The full runbook is `docs/software-factory.md`. Read it before you delegate work
    `adversarial-tester` pass for product code (`crates/`, `apps/macos/`; docs, infra, tooling and test-only changes
    are exempt), and a green `scripts/quality-gate.sh` on the integrated commit. CI only confirms. Never push
    mid-review.
-2. **Waves run as an agent team.** The lead owns the shared task list and keeps up to five tasks in flight from
+2. **Waves run as an agent team.** The lead owns the shared task list and keeps up to three tasks in flight from
    the wave's queue; each task ships as its own PR as soon as it is verified. One teammate per issue implements in
    its own worktree and fixes its own branch on `revise`. Do not use the Workflow tool for waves.
 3. **Fresh reviewers.** Every critique round and every adversarial run is a new one-shot subagent
@@ -22,8 +22,9 @@ The full runbook is `docs/software-factory.md`. Read it before you delegate work
 4. **Review rules** (runbook "Review rules"). Round 1 is one strict full review; every finding is a BLOCKER (wrong
    behaviour, spec or "Done when" miss, data loss or safety, flaky or hanging test, unmet perf bar, breaks a
    sibling) or a MINOR (docs, wording, non-critical test gaps, polish). The implementer fixes blockers only, in one
-   fix commit with no new behaviour, and reports a mutation check per blocker. Minors go into one follow-up issue
-   in the milestone, labelled for the lowest wave that has not started, filed by the lead; they do not hold the
+   fix commit with no new behaviour, and reports a mutation check per blocker. Minors go into one checklist issue
+   per wave (`chore: wave <n> review minors`, in the milestone, labelled for the lowest wave that has not started),
+   kept by the lead; a real defect gets its own issue; they do not hold the
    merge (the lead may order a cheap docs or test minor fixed now). A refuted or deferred blocker is a disagreement:
    the lead (or `milestone-lead`) decides and records it. The lead re-runs each named mutation check against the
    fix's parent. A second critic round runs only if the fix added new behaviour or code paths, or a blocker

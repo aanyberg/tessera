@@ -16,7 +16,7 @@ by editing the agent file; the lead refers to agents by name only.
 | `rust-critic` | One strict blocker/minor review of crates/ branches, then ship/revise/escalate; owns the "Done when" judgement | opus | high (scoped round 2: medium) | no | no |
 | `swift-critic` | One strict blocker/minor review of apps/macos branches, then ship/revise/escalate; Swift 6 concurrency, AppKit, FFI ownership | opus | high (scoped round 2: medium) | no | no |
 | `code-critic` | One strict blocker/minor review of infra and docs branches (workflows, justfile, scripts, ADRs) | sonnet | medium (scoped round 2: low) | no | no |
-| `adversarial-tester` | Breaks ship-ready branches with hostile input and real flows; reproduced bugs only | opus | high (risky changes: xhigh; repro re-run: medium) | scratch only | no |
+| `adversarial-tester` | Breaks ship-ready branches with hostile input and real flows; reproduced bugs only | opus | high (xhigh only for concurrency or FS watching, emulator state machines and unsafe/FFI; repro re-run: medium) | scratch only | no |
 | `integrator` | Serialized: one conventional commit on `origin/main` per verified task, lockfile conflicts, PR body (wave mode: squash into local main) | sonnet | medium | conflicts only | task branch / main |
 | `docs-writer` | ADRs, CONTRIBUTING, README, generated references after merges | sonnet | medium | docs | branch |
 | `release-engineer` | CI/release workflows, justfile, packaging, tag/version guards | sonnet | medium | infra | branch |
@@ -36,13 +36,19 @@ a later gate catches goes into the next retro; that is the signal to revert. `co
 at medium by the user's decision of 2026-10-28 (no retro data yet: neither ran in wave 3), and on Sonnet from
 2026-10-29 to cut token cost; revisit in the next retro that has runs of either.
 
-**Adversarial cost levers (2026-10-29).** The frontmatter is `high` with `maxTurns: 80`. The lead raises a cycle-1
-run with the Agent tool's `effort: "higher"` (xhigh) when the change is risky: concurrency, FFI or render path, a
-hot or fast path, parser or pty input handling, an attack surface in `docs/security.md`, or user-visible emulation
-behaviour (any one of these is risky; a change is low-risk only when it meets all of the low-risk list under "Review
-rules"). It spawns the run with `model: "sonnet"` for low-risk changes. Cycle 2 is `effort: "lower"` (medium) on the
-cycle-1 model. If a later gate or a release finds a bug an `adversarial-tester` run at the lower setting should have
-caught, record it in the next retro and revert that setting.
+**Adversarial cost levers (2026-10-29, narrowed 2026-11-12, wave 18 retro P1, P2).** The frontmatter is `high` with
+`maxTurns: 80`, and `high` is the default for every risky change. A change is risky when it fails any item of the
+low-risk list under "Review rules" (concurrency, FFI or render path, a hot or fast path, parser or pty input handling,
+an attack surface in `docs/security.md`, or user-visible emulation behaviour); that classification is unchanged and
+still decides whether the critic and the adversarial run may start in parallel. The lead raises a cycle-1 run with the
+Agent tool's `effort: "higher"` (xhigh) only for concurrency or FS-watching, emulator state machines, and unsafe or
+FFI changes: the classes where wave 18's xhigh runs found what `high` did not. For UI tasks the run stays at `high`
+and its prompt asks for a real-launch probe (a scratch Debug build, driven the way the app is used) started early and
+findings written by turn 40. Every run writes a pass/fail report at turn 60 even if incomplete, then continues; a run
+that reaches `maxTurns` without a report loses the verification. The lead spawns the run with `model: "sonnet"` for
+low-risk changes. Cycle 2 is `effort: "lower"` (medium) on the cycle-1 model. If a later gate or a release finds a bug
+an `adversarial-tester` run at the lower setting should have caught, record it in the next retro and revert that
+setting.
 
 **Mechanical checks are scripts, not agents.** `scripts/verify-branch.sh` replaced the haiku `quality-gate` agent
 (0 failures in 7 wave-3 runs, one false-positive flag); `revision-implementer` was removed after 0 uses in wave 3,
@@ -75,7 +81,7 @@ milestone-lead ── draft brief ──► spec-researcher (spec-heavy issues, 
                                                         │
                                                         ▼
                          lead pushes task branch, one PR per task, squash-merge, resync
-                         (the round's minors are already filed as one follow-up issue, linked in the PR body)
+                         (the round's minors are already on the wave's minors checklist issue, linked in the PR body)
                                                         │ merged
                                                         ▼
                                   next queued issue starts; after the wave, flow-analyst retro
@@ -83,8 +89,8 @@ milestone-lead ── draft brief ──► spec-researcher (spec-heavy issues, 
 
 - The critic is chosen by area: `rust-critic` for crates/, `swift-critic` for apps/macos, `code-critic` for infra and docs.
 - Verification is two lenses plus a gate: `scripts/verify-branch.sh` (mechanical), `adversarial-tester` (judgement)
-  and the quality gate. The critic owns "Done when"; the adversarial tester runs at xhigh for risky changes in cycle 1
-  (see "Adversarial cost levers") because it found 7 of the 9 post-ship majors in wave 1, both verify failures in
+  and the quality gate. The critic owns "Done when"; the adversarial tester runs at `high`, and at xhigh only for the
+  classes named in "Adversarial cost levers", in cycle 1 because it found 7 of the 9 post-ship majors in wave 1, both verify failures in
   wave 3, and the bugs the critics missed in waves 5 and 6.
 - Every critic and the adversarial tester check the security and resource rules in `docs/security.md` (S1-S9); a
   broken rule is a BLOCKER ("a safety problem"). The planner names the rules a task touches in its "Done when".
@@ -106,7 +112,7 @@ adversarial run, and replace the extra rounds with mechanical checks.
 | Critic rounds | up to 5, each re-reviewing the new commits | round 1 full and strict; round 2 only if a fix added new behaviour or code paths, or a blocker was a design problem; round 2 is the last |
 | Finding severity | blocker / major / minor; any major blocked `ship` | BLOCKER or MINOR only; only blockers block |
 | Fix commits | fix or refute every finding, may widen as needed | blockers only, one commit, no new behaviour |
-| Minors | fixed in later rounds, or ad hoc | one follow-up issue labelled for the lowest wave that has not started, does not hold the merge |
+| Minors | fixed in later rounds, or ad hoc | one checklist issue per wave, labelled for the lowest wave that has not started; does not hold the merge |
 | Round 3+ | spawned at `effort: "lower"` | none: remaining blockers go to the lead (`escalate`) |
 | Re-checking fixes | another critic round | `scripts/verify-branch.sh` with its load targets, the quality gate, and the mutation check the implementer reports for each fixed blocker |
 | Adversarial tester | cycle 1, up to 2 cycles; early start with critique round 2 | once after `ship` for product code; a second cycle only if the first fails, scoped to the repro; docs, infra, tooling and test-only changes exempt |
@@ -130,13 +136,16 @@ a lead decision, and round 2 then reviews it. A blocker the implementer refutes 
 critic: the lead (or `milestone-lead`) reads both arguments and the spec, decides, and records the decision under
 `## Lead decisions (<date>)`; or the lead spawns round 2 for it. The report also lists the minors it saw.
 
-**Minors.** The lead files one GitHub issue per task with every minor of the round (file, line, what, suggested fix),
-in the task's milestone and labelled for the lowest wave that has not started (`wave:<m>`; labels may already exist
-well ahead of the running wave, and the next wave number is never the highest label plus one for this), and links it
-in the PR body, so the issue is filed before the integrator writes the body. `milestone-lead` pulls open issues
-already labelled for the wave it plans into that wave and writes their briefs. The issue does not hold the merge.
-The lead may order one specific minor fixed now when it is a cheap docs or test fix; it goes into the same fix
-commit, or, when there is no fix commit because the critic shipped, it follows "Changes after `ship`".
+**Minors (wave 18 retro P10, from wave 19).** The wave's minors go into one checklist issue per wave, not one
+follow-up issue per task: `chore: wave <n> review minors`, in the milestone, labelled for the lowest wave that has not
+started (`wave:<m>`; labels may already exist well ahead of the running wave, and the next wave number is never the
+highest label plus one for this). The lead creates it at the first round that has minors and appends each task's
+minors as a group of checkboxes (task, file, line, what, suggested fix); every PR body links it, so it exists before
+the integrator writes the body. A real defect still gets its own issue, and so does an out-of-scope item a critic
+raises. `milestone-lead` pulls open issues already labelled for the wave it plans into that wave and writes their
+briefs. The checklist does not hold the merge. The lead may order one specific minor fixed now when it is a cheap docs
+or test fix; it goes into the same fix commit, or, when there is no fix commit because the critic shipped, it follows
+"Changes after `ship`".
 
 **Round 2 (rare, scoped, last).** A second critic round runs only if the fix commit added new behaviour or new code
 paths (a safety net: the fix commit is not allowed to), or a blocker was a design problem. It is a fresh one-shot
@@ -148,6 +157,11 @@ there is no round 3. The lead decides and records it in the brief under `## Lead
 applies the decision, the lead reads the diff, and the mechanical checks and, for product code, the adversarial run
 cover the result. That clears the PR gate.
 
+**Mutants run in scratch copies.** A critic or adversarial tester that mutates code to check a test (the mutation
+checks above) does it in a scratch copy of the files, never in the task's worktree: in wave 18 critics mutated the
+shared worktree in place (#368), where an interrupted run leaves a mutant behind for the next reader. The agent
+definitions say so.
+
 **Mechanical checks, not rounds.** Everything else about a fix is checked by scripts and by the lead's reading:
 `scripts/verify-branch.sh` with its load targets (timing-sensitive tests under load) and `scripts/quality-gate.sh`
 are scripts; the mutation check per fixed blocker is the implementer's report, and the lead re-runs each named test
@@ -157,7 +171,9 @@ against the fix's parent (`git checkout <fix>^ -- <source files>`, run, then `gi
 `apps/macos/`). A second cycle runs only if the first failed (a reproduced blocker), at `effort: "lower"`, scoped to
 the original repro, the fix commits and their callers. If cycle 2 fails, the lead decides (fix, descope or drop the
 task) and records it in the brief; there is no cycle 3. Docs, infra, tooling (`scripts/`, `justfile`, `xtask`,
-workflows) and test-only changes are exempt.
+workflows) and test-only changes are exempt. So are Swift minors and chore tasks whose critic ships and whose scope
+is covered by tests, and narrow core tasks whose critic ran mutants and probes (its `coverage` says so; wave 18
+retro P3); the lead may opt any task out with one line in its brief.
 
 **Low-risk product changes: critic and adversarial in parallel.** The lead may start the adversarial run at the same
 time as round 1 when the change is low-risk, meaning all of:
@@ -235,10 +251,19 @@ Agents use these instead of rebuilding the setup in every run:
   probes). A bar tighter than 1.02 therefore counts as met only when three independent probe builds (a fresh
   `ab init` each) all measure under it.
 - **Branch verification.** `scripts/verify-branch.sh <wt> [--base <ref>] [--allow <path>]... [--session <url>]
-  [--coauthor <line>] [--load <crate>:<target>]... [--no-load] [--parallel <1-8>] [--list-targets]` runs the gate
+  [--coauthor <line>] [--load <crate>:<target>]... [--no-load] [--parallel <1-8>] [--list-targets]
+  [--closes <n[,n...]>] [--body <file>]` runs the gate
   and checks the clean tree, ancestry, the tip commit's Conventional Commit subject and trailers (the integrator
   squashes the branch, so a problem in a commit below the tip is a warning), scope against the brief's paths
-  (a warning, for the lead), ADR number collisions, and timing-sensitive tests under load (10 runs each).
+  (a warning, for the lead), ADR number collisions, closing references (`bodies`), `unsafe` outside the places
+  `docs/security.md` S7 allows (`unsafe`), and timing-sensitive tests under load (10 runs each). `bodies` scans the
+  commit messages of `<base>..HEAD` and the `--body` file for GitHub closing references (close, fix and resolve in
+  every tense, any case, an optional colon, then `#N`, `owner/repo#N` or an issue URL): with `--closes` it fails on a
+  number outside the list and, with `--body`, on a listed number the body does not close; without `--closes` it only
+  warns. `unsafe` fails on an added line of a Rust file, outside a `//` comment, with the word `unsafe` or
+  `#[global_allocator]` in a crate other than `tessera-pty` and `tessera-ffi`, unless the file is listed in
+  `scripts/unsafe-exceptions.txt` (the same six files S7 names; `just verify-branch-test` fails when the two differ);
+  `unsafe_code` in a lint attribute does not match.
   `--parallel N` caps the load check at N test runs in flight, per target and in total (targets run one
   after another); the default is 3 so a busy machine is not exhausted, and the lead may raise it up to 8 on a quiet
   one. Do not improvise extra load runs beside it. `--list-targets` prints the effective cap and the load targets
@@ -266,7 +291,11 @@ Agents use these instead of rebuilding the setup in every run:
   `(MIT OR Apache-2.0) AND NCSA`, a license outside `deny.toml`'s allow list: accepted by the lead (2026-10-29)
   because the fuzzers are a development tool that is never distributed.
 - **Wave stats.** `scripts/factory-stats.sh --since <t> --until <t> <session dir>` prints the per-role and
-  per-agent cost tables (output tokens, cache reads, tool calls, span and active minutes) for the retro.
+  per-agent cost tables (output tokens, cache reads, tool calls, span and active minutes) for the retro. When the
+  session is the lead of an agent team (`~/.claude/teams/<session>/config.json`, `--teams-dir` to look elsewhere),
+  it also lists the members (name, role, model, agent id) and counts each teammate's transcript, a sibling of the
+  lead's, as an agent of its role; it reads no prompt from the config. `scripts/test-factory-stats.sh` checks it on a
+  synthetic team.
 - **Scratch directories.** Every subagent works in its own `<scratchpad>/<agent type>-<issue>`; the scratchpad
   is shared, and a probe file left in a worktree under review becomes a false finding.
 
@@ -328,7 +357,7 @@ moves. Per-task PRs are merged one at a time, so this only happens when a change
 Waves run as an agent team (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, set in `.claude/settings.local.json`).
 Scripted workflows are not used for waves: they cannot apply judgement when a step fails or a critic and an
 implementer disagree, and they hide progress from the user. A wave is a planning batch and an ordered queue, not a
-shipping unit: up to five tasks are in flight, and each ships as soon as it is verified.
+shipping unit: up to three tasks are in flight (the user's cap since wave 9), and each ships as soon as it is verified.
 
 **Session hygiene.** The lead's context grows with every teammate report. Teammates and subagents return a verdict, the
 blockers and a path or issue link, not the full analysis; detail goes into a file or the GitHub issue. Between waves,
@@ -342,7 +371,12 @@ while tasks are in flight. Stop idle teammates, and `/clear` between unrelated t
    (`git fetch origin && git rev-list --count origin/main..main` prints `0`) and that `sccache` is on `PATH`
    (otherwise every worktree builds its dependencies from scratch; ask the user to `brew install sccache`).
    Commands the user types with `!` may not run in the session; when a step needs the user, give them the exact
-   command to run in a separate terminal, or run it from the lead with their go-ahead.
+   command to run in a separate terminal, or run it from the lead with their go-ahead. The lead also checks the
+   console lock once (`ioreg -n Root -d1 -a | grep -A1 IOConsoleLocked`; `<true/>` means locked) and tells the user
+   before any Swift task starts, and lists the wave's user eye checks up front. With a locked console the task ships
+   what the hosted tests can prove; the eye check goes into the task's PR body and the milestone's closeout
+   manual-check issue, and the issue that needs it is referenced (`Refs`), not closed, until the user has done it
+   (wave 18 retro P11; whether and when the user unlocks stays the user's decision).
 1. **Plan.** `milestone-lead` turns open issues into a wave: an ordered queue of parallel-safe issues, each labelled
    `wave:<n>`. Wave numbers are global and never reset across milestones: the next wave is the highest existing
    `wave:<n>` plus one, or 3 when no `wave:<n>` label exists (0.1.0 used waves 1 and 2 before labels existed). It
@@ -357,18 +391,20 @@ while tasks are in flight. Stop idle teammates, and `/clear` between unrelated t
    one upstream and one downstream and queues the downstream one to start after the upstream merges. Hot-path
    issues carry a performance bar with a named corpus measured against main with `cargo xtask ab`.
 2. **Task list.** The lead session creates one shared task per issue in the wave, carrying the final brief, and
-   keeps up to five in progress. When no task-list tool exists, the lead keeps a status table in its messages.
+   keeps up to three in progress. When no task-list tool exists, the lead keeps a status table in its messages.
 3. **Implement.** One teammate per issue claims its task and implements it in its own worktree
    (`../tessera-worktrees/wave-<n>/task-<issue>`, branch `task/<issue>-<slug>`) as `rust-implementer`,
    `swift-implementer` or `release-engineer` by area, with the spec fixture as its first test. Before reporting it
    runs the critics' standing checks on its own branch (mutation of tolerance tests, flood of per-byte events,
-   fast paths against their reference) and ticks off every lead decision.
+   fast paths against their reference) and ticks off every lead decision. A teammate never spends turns "waiting on
+   background work": it runs the gate in the foreground with a timeout, or reports "gate running, log <path>" once and
+   goes idle (wave 18 retro P13).
 4. **Critique.** The lead spawns a fresh one-shot critic (`rust-critic`, `swift-critic` or `code-critic` by area)
    at the frontmatter effort for round 1, with the brief and the branch. It reviews once, strictly, and sorts every
    finding into BLOCKER or MINOR (see "Review rules"). On `revise` the owning teammate fixes the blockers only, in
-   one fix commit with no new behaviour, and reports the mutation check for each. The lead files the round's minors
-   as one issue, in the milestone and labelled for the lowest wave that has not started; it does not hold the merge,
-   and the lead may order a cheap docs or test minor fixed in the same fix commit. The lead reads the fix commit and
+   one fix commit with no new behaviour, and reports the mutation check for each. The lead adds the round's minors
+   to the wave's minors checklist issue (see "Minors"); it does not hold the merge, and the lead may order a cheap
+   docs or test minor fixed in the same fix commit. The lead reads the fix commit and
    re-runs each named mutation check against the fix's parent. A blocker the implementer refutes or defers is
    decided by the lead (or `milestone-lead`) and recorded like an escalation. A second critic round runs only if the fix added new
    behaviour or new code paths, or a blocker was a design problem: a fresh critic at `effort: "lower"`, scoped to the
@@ -378,24 +414,34 @@ while tasks are in flight. Stop idle teammates, and `/clear` between unrelated t
    `## Lead decisions (<date>)` heading; the teammate applies it in the fix commit, and the round-2 rule above
    decides whether another critic looks.
 5. **Verify.** After `ship` (or after the fix commit that clears round 1), the lead runs
-   `scripts/verify-branch.sh <wt> --allow <brief paths>... --session <url> --coauthor <line>`
-   (in the background, with its load targets) and, for product code, the `adversarial-tester` as a one-shot
+   `scripts/verify-branch.sh <wt> --allow <brief paths>... --session <url> --coauthor <line> --closes <n>[,<n>...]`
+   (in the background, with its load targets; `--closes` is the issue numbers of the brief's `Closes` PR lines, and
+   the `bodies` check fails a commit that closes anything else) and, for product code, the `adversarial-tester` as a one-shot
    subagent, in parallel. The adversarial brief carries the critic's `coverage` section so it does not repeat the
    critic's benchmarks and fuzzing. The adversarial tester runs once; docs, infra, tooling and test-only changes skip
-   it. For a low-risk product change (see "Review rules") the lead may start it at the same time as critique round 1;
+   it, and so do the tasks the brief opts out (see "Adversarial tester, once"). For a low-risk product change (see "Review rules") the lead may start it at the same time as critique round 1;
    if the critic then asks for a change, the run is repeated only on the new range. A blocker from either lens
    fails the gate. Only then does a second adversarial cycle run: `effort: "lower"`, the cycle-1 repros and the fix
    commits, scoped to the fixes and their callers; if it fails too, the lead decides and there is no cycle 3. A structural rewrite during a verify cycle gets a fresh critic
    (the lead's judgement; it is not round 2 and does not permit a round 3) before verification resumes.
 6. **Integrate.** Verified branches go to `integrator` one at a time, first verified first integrated (a downstream
    task after its upstream). It squashes the branch into one conventional commit, rebases it onto `origin/main`,
-   re-runs the gate and writes the PR body. Conflicts it resolved outside Cargo.lock go to the lead, who applies
-   the "Changes after `ship`" rules.
+   re-runs the gate and writes the PR body. Its final message carries the commit hash, the exit codes of verify and
+   the gate, and the path or URL of the PR body; a message that says "placeholder" or lacks one of them is a failure,
+   and the lead re-prompts it once (wave 18 retro P8). Conflicts it resolved outside Cargo.lock go to the lead, who
+   applies the "Changes after `ship`" rules. Integrator rebases of queued branches start only when the next PR is
+   ready to push, never ahead of it.
 7. **Ship.** The lead pushes the task branch (`git push -u origin task/<issue>-<slug>`), opens its PR
    (`gh pr create --base main --head task/<issue>-<slug> --title "<conventional title>" --body-file <file>`),
-   and when CI is green merges it with `gh pr merge <pr> --squash --subject "<conventional title> (#<pr>)"`. Then
-   it resyncs local main, removes the worktree, and starts the next queued issue. The next integration waits for
-   this merge, so `origin/main` is always the base.
+   and when CI is green merges it with `gh pr merge <pr> --squash --subject "<conventional title> (#<pr>)"`. Before
+   `gh pr create` the lead re-runs `scripts/verify-branch.sh <wt> --base origin/main --no-load --body <file> --closes
+   <n>[,<n>...]` on the integrator's body: the gate is a recorded-pass hit by then, so only its `bodies` line is
+   new, and it fails a body without a `Closes #<n>` line for every listed number or with one for any other. After a
+   merge the lead runs `gh pr update-branch` on the next queued PR, only once the previous one has merged. Then it
+   resyncs local main, removes the worktree, and starts the next queued issue. The next integration waits for this
+   merge, so `origin/main` is always the base. When a queued task depends on another only through a file overlap (not
+   a decision), open it stacked: branch from the upstream task branch and rebase onto `main` after the upstream
+   merges (wave 18 retro P9).
 8. **Close out.** When the wave's queue is empty, the lead comments deferred findings on their owning issues and
    hands the wave's transcripts and `scripts/factory-stats.sh` output to `flow-analyst`, whose retro lands in
    `docs/retros/`.
@@ -424,7 +470,8 @@ Hotfixes, CI fixes and factory changes take the same loop at a smaller size, sti
 2. Implement with the agent for the area (`rust-implementer`, `swift-implementer`, `release-engineer`,
    `docs-writer`), or directly by the lead for agent definitions and docs.
 3. A fresh critic for the area, one strict round under "Review rules": the implementer fixes the blockers in one
-   commit, and a second scoped round runs only on the conditions listed there. Minors go to one follow-up issue.
+   commit, and a second scoped round runs only on the conditions listed there. Minors go to the wave's minors
+   checklist issue, or to a new issue when no wave is running.
 4. `scripts/verify-branch.sh`. Add `adversarial-tester`, once, when the change touches product code (`crates/`,
    `apps/macos/`) other than tests; skip it for docs, infra, tooling, agent definitions and test-only changes.
 5. `git push -u origin <branch>`, then

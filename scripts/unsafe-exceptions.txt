@@ -1,0 +1,9 @@
+# Files outside tessera-pty and tessera-ffi that may contain `unsafe` or `#[global_allocator]` (docs/security.md S7):
+# the counting test allocators. One repo-relative path per line; blank lines and `#` lines are ignored.
+# scripts/test-verify-branch.sh fails when this list and the paths named in S7 differ.
+crates/tessera-render/tests/alloc.rs
+crates/tessera-grid/tests/reset.rs
+crates/tessera-term/tests/osc8_alloc.rs
+crates/tessera-term/tests/mouse_alloc.rs
+crates/tessera-term/tests/screen_clears_alloc.rs
+crates/tessera-app-core/tests/keybindings.rs
