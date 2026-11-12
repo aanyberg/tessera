@@ -23,6 +23,9 @@ struct SettingsField: Identifiable {
         case slider(ClosedRange<Double>, step: Double, percent: Bool)
         /// A float, stepped; written coalesced.
         case stepper(ClosedRange<Double>, step: Double, unit: String)
+        /// An integer, dragged in steps of 1; written coalesced. 0 shows
+        /// `zeroTitle` instead of the number.
+        case integerSlider(ClosedRange<Int64>, zeroTitle: String)
         /// An integer, typed.
         case integer
         /// A string, typed; committed on Return or when the field loses
@@ -105,6 +108,15 @@ extension SettingsField {
         context.model.endChange(context.path)
     }
 
+    /// An integer slider's: as a slider's, writing the whole number nearest
+    /// the knob, within the range.
+    @MainActor
+    func integerSliderBinding(_ context: SettingsFieldContext) -> Binding<Double> {
+        Binding(
+            get: { Double(context.current?.integer ?? 0) },
+            set: { context.model.change(context.path, .integer(Self.rounded(integer: $0, control))) })
+    }
+
     @MainActor
     func integerBinding(_ context: SettingsFieldContext) -> Binding<Int64> {
         Binding(
@@ -145,6 +157,13 @@ extension SettingsField {
         case .profile: model.profiles.map { .init(value: $0.name, title: $0.title) }
         default: nil
         }
+    }
+
+    /// An integer slider's value: the nearest whole number in its range.
+    static func rounded(integer value: Double, _ control: Control) -> Int64 {
+        guard case .integerSlider(let range, _) = control else { return Int64(value.rounded()) }
+        let clamped = min(max(value.rounded(), Double(range.lowerBound)), Double(range.upperBound))
+        return Int64(clamped)
     }
 
     /// A slider's value on its step, so a drag writes `0.85`, not
@@ -204,6 +223,18 @@ struct SettingsFieldRow: View {
                         if !editing { field.endEditing(context) }
                     }
                     Text(percent ? "\(Int((value.wrappedValue * 100).rounded())) %" : String(format: "%.2f", value.wrappedValue))
+                        .monospacedDigit()
+                        .frame(minWidth: 44, alignment: .trailing)
+                }
+            }
+        case .integerSlider(let range, let zeroTitle):
+            let value = field.integerSliderBinding(context)
+            LabeledContent(field.title) {
+                HStack {
+                    Slider(value: value, in: Double(range.lowerBound)...Double(range.upperBound), step: 1) { editing in
+                        if !editing { field.endEditing(context) }
+                    }
+                    Text(value.wrappedValue == 0 ? zeroTitle : "\(Int64(value.wrappedValue))")
                         .monospacedDigit()
                         .frame(minWidth: 44, alignment: .trailing)
                 }

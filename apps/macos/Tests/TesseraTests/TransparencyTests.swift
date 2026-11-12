@@ -10,7 +10,7 @@ import XCTest
 /// one tab can hold panes of different profiles (the app's splits take the
 /// focused pane's), and closes reach the test's ``SessionRouter``.
 @MainActor
-private final class TransparencyHost: TerminalWindowControllerDelegate {
+final class TransparencyHost: TerminalWindowControllerDelegate {
     let core: TesseraApp
     let router = SessionRouter()
     /// The profile of the next split's session; `nil` for the default one.

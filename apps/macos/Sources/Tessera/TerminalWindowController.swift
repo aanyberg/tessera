@@ -70,6 +70,14 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
         }
     }
 
+    /// The window's blur radius (`[appearance] blur_radius`, ADR 0045), 0
+    /// while Reduce Transparency is on; the application delegate sets it
+    /// from the configuration in effect, and a change applies at once.
+    var windowBlurRadius: UInt32 {
+        get { (window?.contentView as? TerminalWindowContentView)?.blurRadius ?? 0 }
+        set { (window?.contentView as? TerminalWindowContentView)?.blurRadius = newValue }
+    }
+
     private static let log = Logger(subsystem: "com.aanyberg.tessera", category: "window")
 
     /// The Shell menu's ⌘W item, which ``PaneContainerView`` retitles.
@@ -600,6 +608,8 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
 
     func windowDidBecomeMain(_ notification: Notification) {
         delegate?.terminalWindowControllerDidChangeLayout(self)
+        // A tab selected by a path that does not order the window in.
+        (window?.contentView as? TerminalWindowContentView)?.updateWindowBlur()
     }
 
     /// ⌘W's title is this tab's while its window is key: another window's
@@ -660,6 +670,17 @@ final class TerminalWindow: NSWindow {
         let target = tabs[index]
         tabGroup?.selectedWindow = target
         target.makeKeyAndOrderFront(nil)
+    }
+
+    /// Ordered in (``NSWindowController/showWindow(_:)``,
+    /// `makeKeyAndOrderFront`, a tab's selection): the window now has a
+    /// number on screen, so a blur radius waiting for one is set (ADR 0045).
+    /// AppKit posts no occlusion change for a first show, whose state can
+    /// already be visible.
+    override func order(_ place: NSWindow.OrderingMode, relativeTo otherWin: Int) {
+        super.order(place, relativeTo: otherWin)
+        guard place != .out else { return }
+        (contentView as? TerminalWindowContentView)?.updateWindowBlur()
     }
 
     /// A new tab beside this one: this tab shows every pane again first.

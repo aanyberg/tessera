@@ -17,6 +17,13 @@ import TesseraKit
 /// across its own width, as the pane draws it over its own blur. The panes
 /// stay below the title bar and tab bar, and a switch keeps the window's
 /// frame, so they keep their size and the sessions are not resized.
+///
+/// With `[appearance] blur_radius` above 0 (ADR 0045), a translucent window
+/// whose translucent panes all ask for blur is blurred whole at that radius
+/// (``WindowBlurRadius``) and the panes' own blur is hidden; otherwise, or
+/// if the call is not available, each pane keeps its material blur. The
+/// strip keeps its material either way (D4): over a window blurred at a
+/// radius it shows its own blur, not the radius.
 @MainActor
 final class TerminalWindowContentView: NSView {
     let paneContainer: PaneContainerView
@@ -44,6 +51,24 @@ final class TerminalWindowContentView: NSView {
     /// is no taller than that and so all of it is under the title bar (#388
     /// m1).
     private(set) var titlebarInset: CGFloat = 0
+
+    /// `[appearance] blur_radius` for this window, 0 while Reduce
+    /// Transparency is on (``AppDelegate`` sets it on every window);
+    /// a change applies at once (``updateWindowBlur()``).
+    var blurRadius: UInt32 = 0 {
+        didSet {
+            if blurRadius != oldValue { updateWindowBlur() }
+        }
+    }
+
+    /// The radius last set on the window and the window number it was set
+    /// on, and whether the call reported no failure; `nil` before the
+    /// first. The call is made again only when one of them changes.
+    private(set) var appliedBlur: (windowNumber: Int, radius: UInt32, succeeded: Bool)?
+
+    /// Whether the window is blurred at ``blurRadius`` now, with the panes'
+    /// own blur hidden.
+    private(set) var usesBlurRadius = false
 
     init(paneContainer: PaneContainerView, frame: NSRect) {
         self.paneContainer = paneContainer
@@ -102,6 +127,54 @@ final class TerminalWindowContentView: NSView {
             titlebarTint = nil
         }
         placeSubviews()
+        updateWindowBlur()
+    }
+
+    /// The radius the window asks for now: ``blurRadius`` while the window
+    /// is translucent and every translucent pane of the tab, hidden ones
+    /// included, asks for blur (ADR 0045, option ii); 0 otherwise, an opaque
+    /// window included.
+    var wantedBlurRadius: UInt32 {
+        let panes = paneContainer.panes.map(\.view)
+        let translucent = panes.filter { !$0.isBackgroundOpaque }
+        guard !translucent.isEmpty, translucent.allSatisfy({ $0.backgroundAppearance?.blur == true }) else {
+            return 0
+        }
+        return min(blurRadius, WindowBlurRadius.maximum)
+    }
+
+    /// Sets the window's blur radius to ``wantedBlurRadius`` once the window
+    /// is on screen (before, the call has no effect), when the radius or the
+    /// window number changed; then hides each pane's own blur while the
+    /// radius blurs the window, and shows it otherwise. Radius 0 is set only
+    /// on a window that had another, so a window that never asks for one
+    /// makes no call.
+    func updateWindowBlur() {
+        guard let window else { return }
+        let radius = wantedBlurRadius
+        var active = false
+        if let number = WindowBlurRadius.windowNumber(window) {
+            if let appliedBlur, appliedBlur.windowNumber == number, appliedBlur.radius == radius {
+                active = appliedBlur.succeeded && radius > 0
+            } else if radius == 0, appliedBlur?.windowNumber != number || appliedBlur?.radius == 0 {
+                appliedBlur = (number, 0, true)
+            } else {
+                let succeeded = WindowBlurRadius.set(radius, windowNumber: number)
+                appliedBlur = (number, radius, succeeded)
+                active = succeeded && radius > 0
+            }
+        }
+        usesBlurRadius = active
+        for pane in paneContainer.panes {
+            pane.view.backdrop?.isHidden = active
+        }
+    }
+
+    /// The window came back on screen (unhidden, deminiaturized), or went
+    /// off or under another: a radius waiting for a window number is set
+    /// now. A first show is ``TerminalWindow``'s ordering in.
+    @objc private func windowOcclusionDidChange(_ notification: Notification) {
+        updateWindowBlur()
     }
 
     /// Tints the strip again from the panes now at the top (their frames or
@@ -143,6 +216,10 @@ final class TerminalWindowContentView: NSView {
     override func viewWillMove(toWindow newWindow: NSWindow?) {
         super.viewWillMove(toWindow: newWindow)
         layoutRectObservation = nil
+        if let window {
+            NotificationCenter.default.removeObserver(
+                self, name: NSWindow.didChangeOcclusionStateNotification, object: window)
+        }
     }
 
     override func viewDidMoveToWindow() {
@@ -152,7 +229,13 @@ final class TerminalWindowContentView: NSView {
         layoutRectObservation = window.observe(\.contentLayoutRect) { [weak self] _, _ in
             MainActor.assumeIsolated { self?.placeSubviews() }
         }
+        // Posted on the main thread; the centre keeps no reference to this
+        // view.
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(windowOcclusionDidChange(_:)),
+            name: NSWindow.didChangeOcclusionStateNotification, object: window)
         placeSubviews()
+        updateWindowBlur()
     }
 
     /// Lays the panes out in ``paneArea`` and the blur above them; the

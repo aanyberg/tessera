@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// Appearance: the theme (and importing one), the font, the window's
-/// opacity and blur, the cursor and the dimming of inactive panes; the
+/// opacity, blur and blur radius, the cursor and the dimming of inactive panes; the
 /// `[appearance]` table every profile follows where it sets nothing of its
 /// own.
 struct AppearancePane: View {
@@ -19,6 +19,9 @@ struct AppearancePane: View {
         SettingsField(
             key: "appearance.blur", title: "Blur the background", control: .toggle,
             note: "While the opacity is below 100 %. Reduce Transparency in System Settings turns both off."),
+        SettingsField(
+            key: "appearance.blur_radius", title: "Blur radius", control: .integerSlider(0...64, zeroTitle: "Off"),
+            note: "Blurs the whole window evenly while every translucent pane of the tab blurs; Off keeps each pane's own blur."),
     ]
     static let cursor = [
         SettingsField(key: "appearance.cursor_shape", title: "Cursor", control: .choice(SettingsField.cursorShapes)),

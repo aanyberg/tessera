@@ -172,6 +172,27 @@ final class SettingsTests: XCTestCase {
         XCTAssertEqual(writer.calls.filter { $0.key == field.key }.count, writes.count, "nothing after the release")
     }
 
+    /// The blur radius slider (#390, ADR 0044 mirror of `blur_radius`)
+    /// writes whole numbers within 0...64, coalesced like any slider, never
+    /// a float (which the core refuses for an integer key).
+    func testTheBlurRadiusSliderWritesWholeNumbersInItsRange() async throws {
+        let (model, _, writer) = try fakeModel(Self.fakeConfig, clock: ManualClock())
+        let field = try XCTUnwrap(AppearancePane.fields.first { $0.key == "appearance.blur_radius" })
+        let context = SettingsFieldContext(model: model, path: field.key)
+        let binding = field.integerSliderBinding(context)
+        for (dragged, written) in [(20.4, 20), (20.6, 21), (90.0, 64), (-3.0, 0)] {
+            binding.wrappedValue = dragged
+            XCTAssertEqual(model.value(field.key), .integer(Int64(written)), "\(dragged)")
+            XCTAssertEqual(binding.wrappedValue, Double(written))
+        }
+        binding.wrappedValue = 30
+        field.endEditing(context)
+        try await waitUntil("the writes ran") { !model.isWriting }
+        let writes = writer.calls.filter { $0.key == field.key }
+        XCTAssertEqual(writes.last?.value, .integer(30), "the final value is written")
+        XCTAssertTrue(writes.allSatisfy { if case .integer = $0.value { true } else { false } }, "\(writes)")
+    }
+
     func testARefusedEditShowsTheSanitisedWarningAndTheFilesValue() async throws {
         let writer = FakeWriter()
         writer.respond = { call, _ in
@@ -637,6 +658,9 @@ final class SettingsTests: XCTestCase {
         case (.slider, .float(let float)), (.stepper, .float(let float)):
             field.doubleBinding(context).wrappedValue = float
             field.endEditing(context)
+        case (.integerSlider, .integer(let integer)):
+            field.integerSliderBinding(context).wrappedValue = Double(integer)
+            field.endEditing(context)
         case (.integer, .integer(let integer)):
             field.integerBinding(context).wrappedValue = integer
         case (_, .string(let string)):
@@ -667,6 +691,7 @@ final class SettingsTests: XCTestCase {
             Edit(key: "appearance.font_size", value: .float(15), line: "font_size = 15.0"),
             Edit(key: "appearance.opacity", value: .float(0.5), line: "opacity = 0.5"),
             Edit(key: "appearance.blur", value: .bool(true), line: "blur = true"),
+            Edit(key: "appearance.blur_radius", value: .integer(20), line: "blur_radius = 20"),
             Edit(key: "appearance.cursor_shape", value: .string("beam"), line: #"cursor_shape = "beam""#),
             Edit(key: "appearance.cursor_blink", value: .bool(true), line: "cursor_blink = true"),
             Edit(key: "appearance.dim_inactive_panes", value: .float(0.3), line: "dim_inactive_panes = 0.3"),
