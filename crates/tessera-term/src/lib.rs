@@ -597,6 +597,39 @@ impl Terminal {
         self.line_epoch
     }
 
+    /// How many times the primary screen was erased whole since the
+    /// terminal was created ([`Grid::screen_clears`]): ED 2 and DECSED 2,
+    /// ED 0 from the home position (the `clear` of screen, tmux, vt100 and
+    /// linux terminfo; not on a top row that continues the history),
+    /// DECCOLM and RIS. Never ED 0 elsewhere (a shell redrawing its
+    /// prompt), ED 1, ED 3, EL or anything on the alternate screen.
+    ///
+    /// Unlike [`Terminal::line_epoch`], which no erase bumps (an in-place
+    /// erase moves no line), it tells a reader that the screen's rows lost
+    /// their marks in place, so a record of a command whose prompt was on
+    /// them no longer describes what the rows show (ADR 0039, #377).
+    /// Wrapping; nothing is reported to the child.
+    #[must_use]
+    pub fn screen_clears(&self) -> u64 {
+        self.state.grid.screen_clears()
+    }
+
+    /// The screen-top line id ([`Grid::scrollback_pushed`] at the time) of
+    /// the first whole-screen erase ([`Terminal::screen_clears`]) since the
+    /// last call, and clears it: the erase blanked that line and the screen
+    /// rows below it. `None` when none came. See
+    /// [`Grid::take_first_clear_top`]; a reader takes it after each
+    /// [`Terminal::advance`], with the requests, in the line epoch the
+    /// marks were reported in.
+    ///
+    /// Taking it consumes it, so it has one consumer: app-core's PTY
+    /// reader, which takes it per slice under the terminal lock. Anything
+    /// else that took it would hide the clear from that reader's command
+    /// log; other readers use [`Terminal::screen_clears`].
+    pub fn take_first_clear_top(&mut self) -> Option<u64> {
+        self.state.grid.take_first_clear_top()
+    }
+
     /// Resizes the screen to `rows` × `cols` (a zero dimension counts as
     /// one), re-wrapping soft-wrapped lines on the primary screen and its
     /// scrollback and cutting or padding the alternate screen; see

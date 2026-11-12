@@ -2,7 +2,8 @@
 
 **Status:** accepted · 2026-11-07 · amended 2026-11-08 (#45b: the
 exit-status gutter, its hover and a yield between scan holds; see
-"Amendment: #45b" at the end)
+"Amendment: #45b") · amended 2026-11-12 (#377, #378 M3: a whole-screen
+clear retires the records it erased; see "Amendment: #377" at the end)
 
 ## Context
 
@@ -302,3 +303,139 @@ is codegen moving in the row copies, not gutter work.
 | sgr_heavy | 1.012 / 1.002 | 1.069 / 1.059 |
 | combining_heavy | 0.946 / 0.987 | 0.958 / 0.985 |
 
+## Amendment: #377 (2026-11-12)
+
+### The problem
+
+Ctrl-L (zsh, bash and fish all send `CSI H CSI 2 J` and redraw the prompt)
+blanks the screen in place: no line scrolls, `scrollback_pushed` does not
+move, so the next prompt gets the same line id as an older one that was
+on the screen. When the clear, the new prompt and a command arrive in one
+chunk, the older record still owned that id, and the hover lent its
+duration to the new mark (#377). Neither the line ids nor the epochs
+(D-REFLOW) tell the log that the lines were blanked.
+
+### The signal (D-CLEAR)
+
+**A separate count.** `Grid::screen_clears` counts the whole-screen erases
+of the primary screen; `Terminal::line_epoch` is left alone by every ED,
+ED 0 at home, DECSED, RIS and DECCOLM (asserted in
+`tessera-term/tests/screen_clears.rs`), because the ids are still valid:
+the lines they name were erased, not renumbered.
+
+**What counts.** Exactly the erases that clear `scrolled_since_clear`
+(the grid's `whole_screen` predicate), on the primary screen only:
+
+- ED 2 and DECSED 2, protected cells kept or not;
+- ED 0 from the home position, unless the top row continues the newest
+  history line (then it erased a continuation, not a screen);
+- DECCOLM (when allowed), which erases through the same path;
+- RIS, through `Grid::reset`, also while the alternate screen is up (it
+  drops the stashed primary rows).
+
+Never counted: ED 0 elsewhere, ED 1, ED 3 and `clear_scrollback`, EL,
+resizes, anything on the alternate screen, and the 1047/1049 switches
+(their erase is of the alternate screen). **DECALN** (`ESC # 8`) fills
+the primary screen with `E` without counting: a known gap, since no shell
+sends it at a prompt and its marks are erased with the cells anyway.
+
+**Ctrl-L typed ahead** is a second known gap. When the user presses
+Ctrl-L while a command runs, the shell writes the command's `D` and the
+clear in one read, so they land in one slice and the clear is applied
+before that `D` (the same-slice corner below). The record is then not
+cut at the floor: its prompt, in the history, shows no duration on hover
+(the gutter has no status for it and `end_erased` is not set), and
+`command_at` on lines of the new screen still returns it, ending at its
+`D`'s line (probe P1 of the #377 review: `seq 1 60`, then Ctrl-L, in zsh,
+bash and fish). Both err away from lending a duration. Cutting a record
+when a clear of the same slice has a floor at or above its `D` is left
+for a follow-up.
+
+**The floor.** Each counted erase also records the screen-top line id
+(`scrollback_pushed` then) if it is the first since the last take:
+`Grid::take_first_clear_top` (forwarded by `Terminal`) returns it and
+clears it. Ids never decrease within an epoch, so the first is the lowest
+line any of them blanked. Recording it is O(1) per erase and allocates
+nothing.
+
+### Applying it (D-CLEAR-APPLY)
+
+app-core already advances the terminal in slices of 4096 bytes under the
+lock. After each slice it takes the floor, with `line_epoch` read in the
+same hold, and pushes `ChunkMark::Cleared { top, epoch }` into the chunk's
+requests **before** that slice's marks. Adjacent clears merge: of two with
+the same epoch the earlier (lower) floor is kept, of two with different
+epochs the newer replaces the older (the older's ids mean nothing in the
+new epoch). With the per-kind mark coalescing that bounds the list at
+`MAX_CHUNK_MARKS = 2 * MAX_MARK_REQUESTS + 1` entries per chunk (S5).
+
+`CommandLog::screen_cleared(top, epoch)` then, for that epoch:
+
+- drops the pending prompt if it is at or below the floor (`prompt >=
+  top`);
+- retires a record whose first line (prompt, input or output) is at or
+  below the floor: its epoch becomes `REDRAWN`, so `command_at` never
+  finds it and its duration is never lent (D-REFLOW's rule for an older
+  epoch);
+- truncates a finished record that started above the floor and ended at
+  or below it: `end = top`, and `end_erased` is set, since its `D` was on
+  a blanked line.
+
+A record is therefore stale only if a clear came after its `A` and its
+prompt is at or below that clear's floor; the first clear after the `A`
+decides, and floors never decrease. A record whose prompt is in the
+history above the floor keeps its duration across the clear.
+
+**The same-slice corner.** The floor is per slice, not per byte: a mark
+set in the same 4096-byte slice as a clear is applied after it, even when
+its bytes came before it. Such a record is not retired by that clear. It
+errs safe: its line was blanked, so the grid no longer has its mark there,
+the gutter draws nothing on it and the hover, which starts from the
+gutter's mark, asks for no duration; when a later prompt is drawn on that
+line, its own `A` starts a newer record, and the newest record covering
+a line is the one `command_at` returns.
+
+**ED 0 at home** erases from the cursor down, the cursor row's cells
+included, but the grid keeps that row's marks (it always did; only
+`erase_line` of whole rows drops them). The record is retired by the
+floor all the same.
+
+### The relaxed hover filter (#378 M3)
+
+The hover still lends a duration only to a finished record that starts at
+that prompt and agrees with the gutter's exit status, with one
+relaxation: when the gutter reports no status and `end_erased` is set
+(a clear erased the record's `D` below its prompt), they agree. No other
+loss of the `D` (a deleted line, #368) relaxes it.
+
+### Measurements (#377)
+
+`cargo xtask ab` against the merge base (bbd2a2c; the table is the run
+against 0283266, before main gained the config-only #396, and the
+review's run against bbd2a2c, 10 pairs, read 0.995 to 1.000), `tessera-term`, 7
+interleaved pairs at load 3-4, gating on instructions (net of process
+overhead), bar 1.02. Each corpus case feeds its line plus CRLF to 24 MiB
+in 4 KiB slices into a 24x80 terminal; `flood` is B13, 1 MiB of
+`CSI H CSI 2 J` then `x`, eight times. Head / base, best of 7; reads above
+1.000 were repeated on three independent probe builds.
+
+| case | instructions | cycles |
+|---|---|---|
+| ascii | 1.000 | 1.000 |
+| latin | 1.000 (-0.001 to +0.002 %) | 1.000 |
+| cjk | 1.000 | 1.000 |
+| box | 1.000 | 1.000 |
+| hebrew | 1.000 | 1.000 |
+| arabic | 1.000 | 1.000 |
+| punct | 1.000 | 1.000 |
+| braille | 1.000 | 1.000 |
+| emoji | 1.000 | 1.000 |
+| sgr | 1.000 | 1.000 |
+| combining | 1.000 (+0.002 to +0.008 %) | 1.000 |
+| flood | 1.0003 (three builds) | 1.001 |
+
+The flood costs about 5 instructions more per clear (the count and the
+floor). A differential case (`clears`, 20 000 seeds of random clears,
+erases, alternate-screen switches, DECCOLM, RIS, DECALN, marks and
+splits) found the grid, cursor, history, epoch and requests identical to
+the base.

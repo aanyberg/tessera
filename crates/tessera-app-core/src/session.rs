@@ -620,14 +620,19 @@ impl ShellReports {
         lock(&self.commands)
     }
 
-    /// Applies a chunk's coalesced `marks` (`(mark, line, line epoch)`) to
+    /// Applies a chunk's coalesced `marks` and screen clears, in order, to
     /// the command log at one time, `now`, and returns the events they
     /// made (at most two per mark), to deliver once the log is unlocked.
-    fn apply_marks(&self, marks: Vec<(Mark, u64, u64)>, now: Instant) -> Vec<SessionEvent> {
+    fn apply_marks(&self, marks: Vec<ChunkMark>, now: Instant) -> Vec<SessionEvent> {
         let mut events = Vec::new();
         let mut log = self.commands();
-        for (mark, line, epoch) in marks {
-            log.apply(&mark, line, epoch, now, |event| events.push(event));
+        for entry in marks {
+            match entry {
+                ChunkMark::Mark { mark, line, epoch } => {
+                    log.apply(&mark, line, epoch, now, |event| events.push(event));
+                }
+                ChunkMark::Cleared { top, epoch } => log.screen_cleared(top, epoch),
+            }
         }
         events
     }
@@ -1446,10 +1451,17 @@ impl Session {
     /// no event and drops the replies and other requests.
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn feed_for_test(&self, bytes: &[u8]) {
+        self.feed_for_test_at(bytes, Instant::now());
+    }
+
+    /// [`Session::feed_for_test`] with the chunk's marks processed at
+    /// `now`, the one clock read the reader thread makes per chunk.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn feed_for_test_at(&self, bytes: &[u8], now: Instant) {
         let mut requests = advance_chunk(&self.term, bytes, |_| {});
         let _ = self
             .reports
-            .apply_marks(std::mem::take(&mut requests.marks), Instant::now());
+            .apply_marks(std::mem::take(&mut requests.marks), now);
     }
 
     /// Returns the view to the live screen, as typing does.
@@ -1866,8 +1878,25 @@ struct ChunkRequests {
     /// The chunk's last OSC 133 mark of each kind, in the order those
     /// arrived (S6: at most [`tessera_term::MAX_MARK_REQUESTS`]), with its
     /// line and the [`Terminal::line_epoch`] that line id belongs to (the
-    /// lock is released between slices, so a resize may come between).
-    marks: Vec<(Mark, u64, u64)>,
+    /// lock is released between slices, so a resize may come between), and
+    /// the screen clears among them (#377): at most one between two marks
+    /// and one at each end, so at most [`MAX_CHUNK_MARKS`] entries.
+    marks: Vec<ChunkMark>,
+}
+
+/// Most entries [`ChunkRequests::marks`] holds (S5): the last mark of each
+/// kind and a screen clear before, between and after them.
+const MAX_CHUNK_MARKS: usize = 2 * tessera_term::MAX_MARK_REQUESTS + 1;
+
+/// An entry of [`ChunkRequests::marks`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChunkMark {
+    /// An OSC 133 mark on line `line` of line epoch `epoch`.
+    Mark { mark: Mark, line: u64, epoch: u64 },
+    /// The whole primary screen was cleared at least once, the first time
+    /// with line `top` of line epoch `epoch` at its top
+    /// ([`Terminal::take_first_clear_top`]).
+    Cleared { top: u64, epoch: u64 },
 }
 
 impl ChunkRequests {
@@ -1879,12 +1908,44 @@ impl ChunkRequests {
             Request::SetTitle(title) => self.title = Some((self.requests.len(), title)),
             Request::Mark { mark, line } => {
                 let kind = std::mem::discriminant(&mark);
-                self.marks
-                    .retain(|(other, _, _)| std::mem::discriminant(other) != kind);
-                self.marks.push((mark, line, epoch));
+                self.marks.retain(|entry| {
+                    !matches!(entry, ChunkMark::Mark { mark: other, .. }
+                        if std::mem::discriminant(other) == kind)
+                });
+                self.merge_clears();
+                self.marks.push(ChunkMark::Mark { mark, line, epoch });
             }
             other => self.requests.push(other),
         }
+        debug_assert!(self.marks.len() <= MAX_CHUNK_MARKS);
+    }
+
+    /// Adds a screen clear whose top was line `top` of epoch `epoch`, made
+    /// before the marks of the same slice: the terminal reports neither
+    /// where among them it came, and a shell redraws its prompt after
+    /// clearing (ADR 0039).
+    fn push_clear(&mut self, top: u64, epoch: u64) {
+        self.marks.push(ChunkMark::Cleared { top, epoch });
+        self.merge_clears();
+        debug_assert!(self.marks.len() <= MAX_CHUNK_MARKS);
+    }
+
+    /// Makes two clears with no mark between them one: the earlier of the
+    /// same line epoch, whose top is the lower (tops never decrease within
+    /// an epoch, so the later one blanks no line the earlier did not and
+    /// applying it too would change nothing); the later of a newer epoch,
+    /// since the records of an older one already report no lines.
+    fn merge_clears(&mut self) {
+        self.marks
+            .dedup_by(|later, earlier| match (&*later, &*earlier) {
+                (ChunkMark::Cleared { epoch: new, .. }, ChunkMark::Cleared { epoch: old, .. }) => {
+                    if new != old {
+                        *earlier = later.clone();
+                    }
+                    true
+                }
+                _ => false,
+            });
     }
 
     /// Hands every request to `f` in order, the kept title at its place.
@@ -1921,7 +1982,12 @@ fn advance_chunk(
         let mut locked = lock(&term.term);
         locked.advance(slice);
         let mut replies = Vec::new();
+        // Only `Terminal::resize` changes the epoch, never `advance`: the
+        // slice's clears and marks are in this one.
         let epoch = locked.line_epoch();
+        if let Some(top) = locked.take_first_clear_top() {
+            requests.push_clear(top, epoch);
+        }
         for request in locked.take_requests() {
             match request {
                 Request::Reply(bytes) => replies.extend_from_slice(&bytes),
@@ -3478,6 +3544,116 @@ pub(crate) mod tests {
             [SessionEvent::Output]
         );
         app.close_session(id).expect("close");
+    }
+
+    /// #377: the reader takes the screen's clears per slice, ahead of the
+    /// slice's marks, and two clears with no mark between them are one,
+    /// the first (lowest top); a flood of clears and marks across many
+    /// slices holds at most `MAX_CHUNK_MARKS` entries (S5).
+    #[test]
+    fn a_chunk_s_clears_come_before_its_slices_marks_and_merge() {
+        let mark = |mark, line| ChunkMark::Mark {
+            mark,
+            line,
+            epoch: 0,
+        };
+        let cleared = |top| ChunkMark::Cleared { top, epoch: 0 };
+        let term = SharedTerminal::new(Terminal::new(4, 20));
+        // A prompt, a line scrolled off (the screen's top is line 1), a
+        // clear, a prompt on the cursor's row (line 4) and a clear, in one
+        // slice: the first clear goes first.
+        let requests = advance_chunk(
+            &term,
+            b"\x1b]133;A\x07\r\n\r\n\r\n\r\n\x1b[2J\x1b]133;A\x07\x1b[2J",
+            |_| {},
+        );
+        assert_eq!(
+            requests.marks,
+            [cleared(1), mark(Mark::PromptStart, 4)],
+            "one clear, the first, before the slice's marks"
+        );
+        // Slices: a mark of one slice stays before the next slice's clear.
+        let slice = |fill: u8, tail: &[u8]| {
+            let mut bytes = vec![fill; ADVANCE_SLICE];
+            bytes.splice(ADVANCE_SLICE - tail.len().., tail.iter().copied());
+            bytes
+        };
+        let chunk = [
+            slice(b'x', b"\x1b]133;C\x07"),
+            slice(b'y', b"\x1b[2J\x1b]133;D\x07"),
+            slice(b'z', b"\x1b]133;C\x07"),
+        ]
+        .concat();
+        let pushed = |term: &SharedTerminal| lock(&term.term).grid().scrollback_pushed();
+        let before = pushed(&term);
+        let requests = advance_chunk(&term, &chunk, |_| {});
+        let tops: Vec<_> = requests
+            .marks
+            .iter()
+            .map(|entry| match entry {
+                ChunkMark::Mark { mark, .. } => format!("{mark:?}"),
+                ChunkMark::Cleared { top, .. } => format!("clear@{}", top - before),
+            })
+            .collect();
+        // x's `C` was replaced by z's; the clear stays between.
+        assert!(tops[0].starts_with("clear@"), "{tops:?}");
+        assert_eq!(tops.len(), 3, "{tops:?}");
+        assert!(tops[1].starts_with("CommandEnd"), "{tops:?}");
+        assert_eq!(tops[2], "OutputStart", "{tops:?}");
+        // A flood: every slice a clear and every kind of mark.
+        let every =
+            b"\x1b[2J\x1b]133;A\x07\x1b[2J\x1b]133;B\x07\x1b]133;C\x07\x1b[2J\x1b]133;D\x07";
+        let flood = every.repeat(64 * 1024 / every.len());
+        let requests = advance_chunk(&term, &flood, |_| {});
+        assert!(
+            requests.marks.len() <= MAX_CHUNK_MARKS,
+            "{:?}",
+            requests.marks
+        );
+        // Cleared, then each kind's last; a clear between marks stays.
+        let mut chunk = ChunkRequests::default();
+        for _ in 0..1000 {
+            chunk.push_clear(5, 0);
+            for kind in [Mark::PromptStart, Mark::CommandStart, Mark::OutputStart] {
+                chunk.push(
+                    Request::Mark {
+                        mark: kind,
+                        line: 6,
+                    },
+                    0,
+                );
+                chunk.push_clear(9, 0);
+            }
+        }
+        assert!(chunk.marks.len() <= MAX_CHUNK_MARKS, "{:?}", chunk.marks);
+        assert_eq!(chunk.marks.first(), Some(&cleared(5)));
+        // Two clears of different epochs: the newer one stays.
+        let mut chunk = ChunkRequests::default();
+        chunk.push_clear(5, 0);
+        chunk.push_clear(2, 1);
+        assert_eq!(chunk.marks, [ChunkMark::Cleared { top: 2, epoch: 1 }]);
+        // Two slices, each a screenful of output scrolled off, a clear and
+        // a prompt: the second prompt replaces the first, which leaves the
+        // two clears side by side, and the first (the lower top) stays.
+        let twice = [
+            slice(b'p', b"\x1b[2J\x1b]133;A\x07"),
+            slice(b'q', b"\x1b[2J\x1b]133;A\x07"),
+        ];
+        let first_top = {
+            let twin = SharedTerminal::new(Terminal::new(4, 20));
+            let _ = advance_chunk(&twin, &twice[0], |_| {});
+            pushed(&twin)
+        };
+        let term = SharedTerminal::new(Terminal::new(4, 20));
+        let requests = advance_chunk(&term, &twice.concat(), |_| {});
+        assert!(pushed(&term) > first_top, "the second clear's top is lower");
+        assert_eq!(
+            requests.marks,
+            [
+                cleared(first_top),
+                mark(Mark::PromptStart, pushed(&term) + 3)
+            ]
+        );
     }
 
     /// #263 M3: 64 KiB of title-stack pushes and pops in one chunk (10

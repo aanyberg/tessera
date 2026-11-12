@@ -250,6 +250,12 @@ pub struct Grid {
     /// Times the history was cleared: see
     /// [`Grid::history_clear_generation`].
     history_clears: ClearCount,
+    /// Whole-screen erases of the primary screen: see
+    /// [`Grid::screen_clears`].
+    screen_clears: ClearCount,
+    /// The screen-top line id of the first of them since the last take:
+    /// see [`Grid::take_first_clear_top`].
+    first_clear_top: ClearTop,
     /// The OSC 8 hyperlink cells are written with, if one is open: see
     /// [`Grid::begin_hyperlink`].
     active_link: Option<Hyperlink>,
@@ -298,6 +304,8 @@ impl Grid {
             blanked_at: BlankedAt::default(),
             scrollback_pushed: PushedCount::default(),
             history_clears: ClearCount::default(),
+            screen_clears: ClearCount::default(),
+            first_clear_top: ClearTop::default(),
             active_link: None,
             links: LinkPool::new(),
         }
@@ -515,6 +523,45 @@ impl Grid {
     #[must_use]
     pub fn history_clear_generation(&self) -> u64 {
         self.history_clears.0
+    }
+
+    /// How many times the primary screen has been erased whole since the
+    /// grid was created: a wrapping count that tells a reader whether the
+    /// rows on the screen were blanked in place (their marks with them)
+    /// between two looks, which neither the line ids nor
+    /// [`Grid::scrollback_pushed`] show (ADR 0039, #377).
+    ///
+    /// Bumped once per erase of the whole primary screen: ED 2
+    /// ([`EraseDisplay::All`], protected cells kept or not) and ED 0
+    /// ([`EraseDisplay::Below`]) from the home position unless the top row
+    /// continues the newest history line, exactly the erases that clear
+    /// [`Grid::scrolled_since_clear`], and [`Grid::reset`] (RIS), also
+    /// while the alternate screen is active (it drops the stashed primary
+    /// rows). Never bumped by ED 0 elsewhere, ED 1, ED 3,
+    /// [`Grid::clear_scrollback`], erasing a line, a resize or anything on
+    /// the alternate screen.
+    #[must_use]
+    pub fn screen_clears(&self) -> u64 {
+        self.screen_clears.0
+    }
+
+    /// The screen-top line id of the first whole-screen erase
+    /// ([`Grid::screen_clears`]) since the last call: what
+    /// [`Grid::scrollback_pushed`] was at that erase, so the lines it
+    /// blanked were that id and the `rows` below it. `None` when no erase
+    /// came since the last call (or since the grid was created). Ids are
+    /// non-decreasing, so the first is the lowest. Taking it clears it.
+    ///
+    /// The id belongs to the line numbering in effect at the erase: a
+    /// reader takes it after each batch of output, before anything that
+    /// renumbers lines (a resize) can come between.
+    ///
+    /// Taking it consumes it, so it has one consumer: app-core's PTY
+    /// reader (through `Terminal::take_first_clear_top`). Anything else
+    /// that took it would hide the clear from that reader's command log;
+    /// other readers compare [`Grid::screen_clears`].
+    pub fn take_first_clear_top(&mut self) -> Option<u64> {
+        self.first_clear_top.0.take()
     }
 
     /// A scrollback line; index `0` is the oldest, `scrollback_len() - 1`
@@ -2201,9 +2248,10 @@ impl Grid {
     /// erase of the whole screen ([`EraseDisplay::All`], or
     /// [`EraseDisplay::Below`] from the home position when the top row
     /// does not continue the newest scrollback line) also clears
-    /// [`Grid::scrolled_since_clear`] and ends the newest scrollback line
-    /// (clears its wrap flag), whose continuation on the top row it erased;
-    /// [`EraseDisplay::Scrollback`] is [`Grid::clear_scrollback`].
+    /// [`Grid::scrolled_since_clear`], counts in [`Grid::screen_clears`]
+    /// and ends the newest scrollback line (clears its wrap flag), whose
+    /// continuation on the top row it erased; [`EraseDisplay::Scrollback`]
+    /// is [`Grid::clear_scrollback`].
     pub fn erase_in_display(&mut self, mode: EraseDisplay) {
         self.erase_display(mode, false);
     }
@@ -2284,9 +2332,20 @@ impl Grid {
         };
         if whole_screen && !self.is_alt_screen() {
             self.scrolled_since_clear = false;
+            self.note_screen_clear();
             self.end_newest_history_line();
         }
         kept
+    }
+
+    /// Counts a whole-screen erase of the primary screen
+    /// ([`Grid::screen_clears`]) and keeps its screen-top line id if it is
+    /// the first since the last [`Grid::take_first_clear_top`]. O(1).
+    fn note_screen_clear(&mut self) {
+        self.screen_clears.bump();
+        self.first_clear_top
+            .0
+            .get_or_insert(self.scrollback_pushed.0);
     }
 
     /// True when the newest scrollback line is wrapped: the top row of the
@@ -2312,7 +2371,8 @@ impl Grid {
     /// home cursor, default pen, full scroll region and margins, origin
     /// mode off, default
     /// tab stops, both saved-cursor slots at their initial state and
-    /// [`Grid::scrolled_since_clear`] cleared. The alternate screen is left
+    /// [`Grid::scrolled_since_clear`] cleared; it counts as a whole-screen
+    /// erase in [`Grid::screen_clears`]. The alternate screen is left
     /// and the stashed primary contents are discarded. Scrollback and its
     /// cap are kept; the newest history line is ended, as ED 2 does. The
     /// whole screen counts as damaged, and the damage generations carry on
@@ -2365,6 +2425,9 @@ impl Grid {
         self.alt_saved = SavedCursor::INITIAL;
         reset_tabs(&mut self.tabs, self.cols);
         self.scrolled_since_clear = false;
+        // The primary screen's rows were blanked (or, behind the alternate
+        // screen, dropped): a whole-screen erase, as ED 2 is.
+        self.note_screen_clear();
         // The blank screen ends the newest history line, as ED 2 does.
         self.end_newest_history_line();
         // The tracker is kept, so a reader of the old screen sees it all
@@ -2732,6 +2795,19 @@ impl ClearCount {
 impl std::fmt::Debug for ClearCount {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ClearCount")
+    }
+}
+
+/// The screen-top line id of the first whole-screen erase since the last
+/// take ([`Grid::take_first_clear_top`]). A clone keeps it. Opaque in
+/// `Debug`, like [`ClearCount`]: RIS sets it, and the grid it leaves must
+/// print as a fresh one does.
+#[derive(Clone, Copy, Default)]
+struct ClearTop(Option<u64>);
+
+impl std::fmt::Debug for ClearTop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClearTop")
     }
 }
 
@@ -3820,6 +3896,68 @@ mod tests {
             format!("{:?}", {
                 let mut other = grid.clone();
                 other.history_clears = ClearCount::default();
+                other
+            })
+        );
+    }
+
+    /// #377: `screen_clears` counts the whole-screen erases of the primary
+    /// screen and RIS, and `take_first_clear_top` gives the screen-top line
+    /// id of the first one since the last take, once.
+    #[test]
+    fn the_screen_clear_count_counts_whole_screen_erases_of_the_primary() {
+        let mut grid = Grid::with_scrollback(2, 4, 8);
+        for _ in 0..3 {
+            grid.line_feed();
+        }
+        assert_eq!(grid.scrollback_pushed(), 2);
+        // Partial erases, ED 0 below home, ED 3 and scrolling do not count.
+        grid.erase_in_display(EraseDisplay::Above);
+        grid.erase_in_display(EraseDisplay::Below);
+        grid.erase_in_display(EraseDisplay::Scrollback);
+        grid.clear_to_cursor();
+        grid.erase_in_line(EraseLine::All);
+        assert_eq!(
+            (grid.screen_clears(), grid.take_first_clear_top()),
+            (0, None)
+        );
+        // ED 2 counts, its top is the line id of row 0 then.
+        grid.erase_in_display(EraseDisplay::All);
+        assert_eq!(grid.screen_clears(), 1);
+        // ED 0 from home counts; the first clear's top stays.
+        grid.goto(0, 0);
+        grid.line_feed();
+        grid.line_feed();
+        grid.goto(0, 0);
+        grid.erase_in_display_unprotected(EraseDisplay::Below);
+        assert_eq!(grid.screen_clears(), 2);
+        assert_eq!(grid.take_first_clear_top(), Some(2));
+        assert_eq!(grid.take_first_clear_top(), None);
+        grid.erase_in_display(EraseDisplay::All);
+        assert_eq!(grid.take_first_clear_top(), Some(3));
+        // The alternate screen's erases do not count; RIS does, there too.
+        grid.enter_alt_screen();
+        grid.erase_in_display(EraseDisplay::All);
+        assert_eq!(
+            (grid.screen_clears(), grid.take_first_clear_top()),
+            (3, None)
+        );
+        grid.reset();
+        assert_eq!(
+            (grid.screen_clears(), grid.take_first_clear_top()),
+            (4, Some(3))
+        );
+        // A clone keeps both; `Debug` shows neither.
+        grid.erase_in_display(EraseDisplay::All);
+        let clone = grid.clone();
+        assert_eq!(clone.screen_clears(), 5);
+        assert_eq!(clone.clone().take_first_clear_top(), Some(3));
+        assert_eq!(
+            format!("{grid:?}"),
+            format!("{:?}", {
+                let mut other = grid.clone();
+                other.screen_clears = ClearCount::default();
+                other.first_clear_top = ClearTop::default();
                 other
             })
         );

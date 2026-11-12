@@ -58,7 +58,8 @@ a low-risk change.
   replies) is bounded in rate and memory, and an expensive sequence does not hold the terminal lock long (#117).
 - **S7. Memory safety.** `unsafe` only in `tessera-pty` and `tessera-ffi`, each block with a `// SAFETY:` comment;
   the counting test allocators in `crates/tessera-render/tests/alloc.rs`, `crates/tessera-grid/tests/reset.rs`,
-  `crates/tessera-term/tests/osc8_alloc.rs`, `crates/tessera-term/tests/mouse_alloc.rs` and
+  `crates/tessera-term/tests/osc8_alloc.rs`, `crates/tessera-term/tests/mouse_alloc.rs`,
+  `crates/tessera-term/tests/screen_clears_alloc.rs` and
   `crates/tessera-app-core/tests/keybindings.rs` are the exceptions (CONTRIBUTING.md). Every FFI export that can panic runs under `ffi_guard!` (`catch_unwind`);
   every pointer and length argument is checked; sessions cross the boundary as ids, never pointers.
 - **S8. No terminal content in logs.** Logs carry lengths, ids, parameters and paths, never output, input, titles,
