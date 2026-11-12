@@ -24,7 +24,7 @@ Verdict `escalate` instead of `revise` when a blocker cannot be fixed inside the
 
 Capture real exit codes: redirect output to a file and read `$?` (`scripts/quality-gate.sh <wt> > <log> 2>&1; echo $?`); never pipe the gate through `tail` or `grep` before reading its status.
 
-Work in your own scratch directory (`<scratchpad>/<agent type>-<issue>`); other agents share the scratchpad, so never write probe files into the worktree or into another agent's directory.
+Work in your own scratch directory (`<scratchpad>/<agent type>-<issue>`); other agents share the scratchpad, so never write probe files into the worktree or into another agent's directory. Mutants run in a scratch copy of the files (under your scratch directory), never in the task's worktree: an interrupted run must not leave a mutant behind.
 
 Never modify the branch. Do not anchor on the implementer's self-report; form your own view first.
 

@@ -3,7 +3,9 @@
 **Status:** accepted · 2026-11-07 · amended 2026-11-08 (#45b: the
 exit-status gutter, its hover and a yield between scan holds; see
 "Amendment: #45b") · amended 2026-11-12 (#377, #378 M3: a whole-screen
-clear retires the records it erased; see "Amendment: #377" at the end)
+clear retires the records it erased; see "Amendment: #377" at the end) ·
+amended 2026-11-12 (#392: the capture-only cost is accepted; see "Amendment:
+capture-only cost")
 
 ## Context
 
@@ -439,3 +441,21 @@ floor). A differential case (`clears`, 20 000 seeds of random clears,
 erases, alternate-screen switches, DECCOLM, RIS, DECALN, marks and
 splits) found the grid, cursor, history, epoch and requests identical to
 the base.
+
+## Amendment: capture-only cost under the terminal lock (#368, #392, 2026-11-12)
+
+The "capture alone" measurement above (`Snapshot::capture`, the part that
+holds the terminal lock) is over its 1.05 bar when every row carries a mark
+and every frame moves them all: 1.061-1.069 in instructions on nine of the
+eleven corpus lines (the review of #368 reads 1.061-1.073), the
+other two inside the bar. The gutter scan costs about 5 300 instructions
+more per frame, held under the terminal lock the PTY reader shares: 60 rows
+of four marks each, about 90 instructions a row. The review of #368 asked to
+track that cost and to decide whether to reduce it.
+
+**Decision (2026-11-12): accepted for 0.2.0.** The extra work is small next
+to a frame: the `render_view` table above, which includes the capture, stays
+within 1.01 on every line. Reducing the scan's cost under the lock is not
+planned for 0.2.0, and the capture-alone figures above stay as measured: nine
+of the eleven "every row" lines are over the 1.05 bar, recorded here as an
+accepted exception, not as a pass.

@@ -10,9 +10,9 @@ color: purple
 ---
 You analyse how a wave actually ran and recommend changes to the factory.
 
-Inputs: the wave's teammate and subagent transcripts, the wave's issues (`gh issue list --state all --label wave:<n>`) with their comments, and the merged commits.
+Inputs: the wave's teammate and subagent transcripts (pass the lead's session dir to the script; the teammates' transcripts are its siblings), the wave's issues (`gh issue list --state all --label wave:<n>`) with their comments, and the merged commits.
 
-Start with `scripts/factory-stats.sh --since <first brief> --until <last merge> <session dir>`: it prints the per-role and per-agent cost tables (agents, output tokens, cache reads, tool calls, span and active minutes) from the transcripts. Paste them; spend your turns on value, not on counting.
+Start with `scripts/factory-stats.sh --since <first brief> --until <last merge> <session dir>`: it prints the per-role and per-agent cost tables (agents, output tokens, cache reads, tool calls, span and active minutes) from the transcripts. Paste them; spend your turns on value, not on counting. When the lead session leads an agent team, the script also lists the members from `~/.claude/teams/<session>/config.json` (`name`, `agentType`, `model`, `agentId`) and counts each teammate's transcript; read those transcripts for the teammates' stories. Never quote a prompt or a path from the team config or a transcript that belongs to another project.
 
 Produce docs/retros/<wave>.md with:
 1. Cost table per role, from the script.

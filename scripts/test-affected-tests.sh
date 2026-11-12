@@ -22,8 +22,8 @@ chmod +x "$work/bin/cargo"
 export PATH="$work/bin:$PATH"
 
 git init -q -b main .
-print '[workspace]\nresolver = "3"\nmembers = ["crates/a", "crates/b", "crates/c", "crates/d", "crates/term", "crates/shell"]' > Cargo.toml
-typeset -A pkgname=(a a b b c c d d term tessera-term shell tessera-shell-integration)
+print '[workspace]\nresolver = "3"\nmembers = ["crates/a", "crates/b", "crates/c", "crates/d", "crates/term", "crates/shell", "crates/tessera-config"]' > Cargo.toml
+typeset -A pkgname=(a a b b c c d d term tessera-term shell tessera-shell-integration tessera-config tessera-config)
 for n in ${(k)pkgname}; do
     mkdir -p crates/$n/src && : > crates/$n/src/lib.rs
     print "[package]\nname = \"${pkgname[$n]}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n" > crates/$n/Cargo.toml
@@ -59,7 +59,14 @@ echo '//' >> crates/d/src/lib.rs
 expect "an unrelated crate stays out" "d"
 reset
 echo '# x' >> Cargo.toml
-expect "a root manifest affects every crate" "a b c d tessera-shell-integration tessera-term" "workspace-wide"
+expect "a root manifest affects every crate" "a b c d tessera-config tessera-shell-integration tessera-term" "workspace-wide"
+reset
+echo '//' >> crates/tessera-config/src/lib.rs
+expect "a change under crates/tessera-config names config-docs-check" "tessera-config" "just config-docs-check"
+reset
+echo '//' >> crates/a/src/lib.rs
+expect "a change elsewhere does not name config-docs-check" "a b c" ""
+[[ "$("$script" --list 2>&1 >/dev/null)" != *config-docs-check* ]] && ok "no config-docs-check note without a tessera-config change" || not_ok "unexpected config-docs-check note"
 reset
 echo y >> apps/macos/x.swift
 expect "an app change affects no crate and points at app-test" "" "just app-test"
