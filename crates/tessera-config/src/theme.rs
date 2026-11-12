@@ -477,6 +477,8 @@ impl Theme {
         name: &str,
         unloadable: &mut Vec<PathBuf>,
     ) -> ResolvedTheme {
+        #[cfg(test)]
+        LOOKUPS.with(|lookups| lookups.set(lookups.get() + 1));
         let mut warnings = Vec::new();
         // A name longer than any imported theme's (the importers clip names
         // to this length) is not compared at all: doing so against every
@@ -653,6 +655,18 @@ fn find_user_theme(
         }
     }
     None
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many theme lookups ([`Theme::resolve`]) ran on this thread.
+    static LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many theme lookups ran on this thread so far (#283 item 2).
+#[cfg(test)]
+pub(crate) fn lookups_on_this_thread() -> usize {
+    LOOKUPS.with(std::cell::Cell::get)
 }
 
 /// The `*.toml` files in `dir` whose file stem matches `name` (the files

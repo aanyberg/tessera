@@ -694,7 +694,8 @@ pub unsafe extern "C" fn tessera_session_foreground_process(
 /// A colour as four `float`s, each in 0.0..=1.0: red, green and blue
 /// sRGB-encoded (a theme file's `#rrggbb` bytes over 255, not linear, so
 /// `NSColor(srgbRed:green:blue:alpha:)` takes them as they are) and alpha
-/// straight, not premultiplied.
+/// straight, not premultiplied. Not `tessera_render::Rgba`, whose values
+/// are linear (#397 m4).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rgba {

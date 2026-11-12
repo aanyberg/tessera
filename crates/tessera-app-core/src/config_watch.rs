@@ -632,6 +632,11 @@ pub(crate) struct ConfigWatch {
     thread: Option<JoinHandle<()>>,
     /// Never receives; disconnects when the apply thread's body returns.
     done: Receiver<()>,
+    /// While waiting for the directory, the store the wait watches once it
+    /// appears when that store's load failed (it refuses clipboard writes):
+    /// [`App::open_config`] watches it too rather than a fresh store, so
+    /// the refusal carries over (#393 F1).
+    refusing: Option<ConfigStore>,
 }
 
 #[derive(Debug, Default)]
@@ -653,7 +658,7 @@ impl ConfigWatch {
             stopped: false,
         }));
         let (wake, _) = mpsc::channel();
-        Self::spawn(slot, wake, move |_| Some((store, events)), live)
+        Self::spawn(slot, wake, move |_| Some((store, events)), live, None)
     }
 
     /// Waits for the configuration directory of `store` (one `stat` every
@@ -661,16 +666,17 @@ impl ConfigWatch {
     /// holds, on one thread.
     ///
     /// A `store` whose load failed (a dangling symlink at or above the
-    /// directory) is watched itself, so its refusal of clipboard writes
-    /// carries over: an empty `config.toml` in the appeared directory keeps
-    /// them off (#382 m2), unless `App::open_config` runs before the
-    /// next poll sees the directory: it starts a watch on a fresh store,
-    /// which does not refuse. Otherwise a fresh store is, as if the
-    /// application started now: a missing directory is a successful load
-    /// that a later broken file must not inherit.
+    /// directory, one that cannot be searched) is watched itself, so its
+    /// refusal of clipboard writes carries over: an empty `config.toml` in
+    /// the appeared directory keeps them off (#382 m2), and so it does when
+    /// `App::open_config` runs before the next poll sees the directory,
+    /// since that watches the same store (#393 F1). Otherwise a fresh store
+    /// is, as if the application started now: a missing directory is a
+    /// successful load that a later broken file must not inherit.
     fn wait_for(live: Live, store: ConfigStore, options: WatchOptions) -> std::io::Result<Self> {
         let paths = store.paths().clone();
-        let refusing = store.last_error().is_some();
+        let refusing = store.last_error().is_some().then(|| store.clone());
+        let failed = refusing.is_some();
         let slot = Arc::new(Mutex::new(Slot::default()));
         let (wake, woken) = mpsc::channel::<()>();
         Self::spawn(
@@ -684,7 +690,7 @@ impl ConfigWatch {
                     if !paths.root().is_dir() {
                         continue;
                     }
-                    let store = if refusing {
+                    let store = if failed {
                         store
                     } else {
                         ConfigStore::in_memory(paths, Config::default())
@@ -711,6 +717,7 @@ impl ConfigWatch {
                 None
             },
             live,
+            refusing,
         )
     }
 
@@ -723,6 +730,7 @@ impl ConfigWatch {
         + Send
         + 'static,
         live: Live,
+        refusing: Option<ConfigStore>,
     ) -> std::io::Result<Self> {
         let (done_tx, done) = mpsc::channel::<()>();
         let thread_slot = Arc::clone(&slot);
@@ -753,6 +761,7 @@ impl ConfigWatch {
             wake: Some(wake),
             thread: Some(thread),
             done,
+            refusing,
         })
     }
 
@@ -819,12 +828,12 @@ impl App {
     /// [`CONFIG_DIR_POLL_INTERVAL`] (one `stat`) and watched, its
     /// configuration applied, once it appears: created by hand, by
     /// [`App::open_config`] (which also starts the watch at once) or by the
-    /// first session's shell integration; so is one behind a dangling
-    /// symlink (the directory itself or one above it), until the
-    /// directory appears, with clipboard writes refused meanwhile. When
-    /// its parent directory does not exist either and the load did not
-    /// fail, nothing is waited for (only `open_config` would create
-    /// it, and starts the watch).
+    /// first session's shell integration; so is one whose load failed
+    /// (behind a dangling symlink, at the directory or above it, or below
+    /// a directory that cannot be searched), until the directory appears,
+    /// with clipboard writes refused meanwhile. When its parent directory
+    /// does not exist either and the load did not fail, nothing is waited
+    /// for (only `open_config` would create it, and starts the watch).
     pub fn with_config_dir(paths: ConfigPaths, options: WatchOptions) -> Self {
         let store = ConfigStore::in_memory(paths, Config::default());
         let paths = store.paths().clone();
@@ -834,7 +843,8 @@ impl App {
         let app = Self::new((*store.config()).clone(), paths.clone());
         let parent_exists = paths.root().parent().is_none_or(Path::is_dir);
         // A missing directory whose load failed is behind a dangling
-        // symlink, at it or above it (#382 item 1): its target may appear.
+        // symlink, at it or above it (#382 item 1), whose target may
+        // appear, or below one that cannot be searched, which may change.
         let behind_link = store.last_error().is_some();
         let started = if paths.root().is_dir() {
             app.start_config_watch(store, options)
@@ -886,7 +896,12 @@ impl App {
     ) -> Result<std::path::PathBuf, tessera_config::Error> {
         let store = ConfigStore::open(self.paths.clone())?;
         if !self.is_watching_config() {
-            self.start_config_watch(store, options)?;
+            // A wait whose store refuses clipboard writes hands that store
+            // over, so an empty `config.toml` keeps them off (#393 F1).
+            let refusing = lock(&self.config_watch)
+                .as_ref()
+                .and_then(|watch| watch.refusing.clone());
+            self.start_config_watch(refusing.unwrap_or(store), options)?;
         }
         Ok(self.paths.config_file())
     }
@@ -1931,8 +1946,9 @@ mod tests {
     /// directory appears holding an empty or byte-order-mark-only
     /// `config.toml`. Writes stay off on both backends, whether the link
     /// is the directory itself or one above it: the refusal is carried
-    /// into the watch. A version of the file with something in it that
-    /// loads turns them on.
+    /// into the watch, also when `open_config` (⌘,) starts it before the
+    /// directory poll sees the directory (#393 F1). A version of the file
+    /// with something in it that loads turns them on.
     #[cfg(unix)]
     #[test]
     fn an_empty_file_appearing_behind_a_dangling_link_keeps_writes_off() {
@@ -1940,9 +1956,11 @@ mod tests {
         for above in [false, true] {
             for backend in [WatchBackend::Native, WatchBackend::Poll] {
                 for content in ["", "\u{feff}"] {
-                    cases.push(std::thread::spawn(move || {
-                        empty_file_behind_a_dangling_link(above, backend, content);
-                    }));
+                    for opened in [false, true] {
+                        cases.push(std::thread::spawn(move || {
+                            empty_file_behind_a_dangling_link(above, backend, content, opened);
+                        }));
+                    }
                 }
             }
         }
@@ -1952,10 +1970,16 @@ mod tests {
     }
 
     /// One case of
-    /// [`an_empty_file_appearing_behind_a_dangling_link_keeps_writes_off`].
+    /// [`an_empty_file_appearing_behind_a_dangling_link_keeps_writes_off`];
+    /// `opened`: `open_config` runs as soon as the directory appears.
     #[cfg(unix)]
-    fn empty_file_behind_a_dangling_link(above: bool, backend: WatchBackend, content: &str) {
-        let what = format!("above: {above}, {backend:?}, {content:?}");
+    fn empty_file_behind_a_dangling_link(
+        above: bool,
+        backend: WatchBackend,
+        content: &str,
+        opened: bool,
+    ) {
+        let what = format!("above: {above}, {backend:?}, {content:?}, opened: {opened}");
         let base = tempfile::tempdir().unwrap();
         let volume = base.path().join("volume");
         let link = base.path().join("link");
@@ -1978,6 +2002,14 @@ mod tests {
         let app = App::with_config_dir(paths.clone(), options);
         assert!(!app.config().terminal.clipboard_write, "{what}");
         appear(&volume);
+        if opened {
+            app.open_config(WatchOptions {
+                backend,
+                ..WatchOptions::default()
+            })
+            .unwrap();
+            assert!(app.is_watching_config(), "{what}: open_config watches");
+        }
         assert!(
             eventually(CONFIG_DIR_POLL_INTERVAL + Duration::from_secs(3), || {
                 app.is_watching_config()
@@ -3119,6 +3151,86 @@ mod tests {
             app.session_appearance(sea).unwrap().background,
             colour("#405060")
         );
+    }
+
+    /// #397 m2: a configuration that did not come through the loader (so
+    /// nothing clamped it) still reports a blur radius of at most
+    /// `Appearance::MAX_BLUR_RADIUS`.
+    #[test]
+    fn the_blur_radius_is_clamped_whatever_built_the_configuration() {
+        let mut config = Config::default();
+        config.appearance.blur_radius = tessera_config::Appearance::MAX_BLUR_RADIUS + 1;
+        let app = App::new(config.clone(), ConfigPaths::new("/nonexistent/tessera"));
+        assert_eq!(
+            app.blur_radius(),
+            tessera_config::Appearance::MAX_BLUR_RADIUS
+        );
+        config.appearance.blur_radius = u32::MAX;
+        app.apply_config(&config, &bundled("Dracula"));
+        assert_eq!(
+            app.blur_radius(),
+            tessera_config::Appearance::MAX_BLUR_RADIUS
+        );
+        config.appearance.blur_radius = 7;
+        app.apply_config(&config, &bundled("Dracula"));
+        assert_eq!(app.blur_radius(), 7);
+    }
+
+    /// #397: the same through a running watch, on each backend: a
+    /// profile's theme file saved in place (not renamed, so `themes/`
+    /// itself does not change) restyles the profile's session, whose view
+    /// draws the new colours, and tells the observer. The native backend
+    /// watches the profiles' theme files for it; the poll backend sees it
+    /// in its full scan of `themes/`.
+    #[test]
+    fn a_profile_theme_saved_in_place_restyles_through_the_watch() {
+        for backend in [WatchBackend::Native, WatchBackend::Poll] {
+            let root = tempfile::tempdir().unwrap();
+            let paths = ConfigPaths::new(root.path());
+            std::fs::create_dir_all(paths.themes_dir()).unwrap();
+            let file = paths.themes_dir().join("ocean.toml");
+            std::fs::write(&file, theme_doc("Ocean", "#102030")).unwrap();
+            std::fs::write(
+                paths.config_file(),
+                "[[profiles]]\nname = \"sea\"\n[profiles.appearance]\ntheme = \"ocean\"\n",
+            )
+            .unwrap();
+            let app = App::with_config_dir(
+                paths.clone(),
+                WatchOptions {
+                    backend,
+                    ..WatchOptions::default()
+                },
+            );
+            assert!(app.is_watching_config(), "{backend:?}");
+            let sea = attach_fake_profile(&app, Some("sea"));
+            if !attach_offscreen(&app, sea) {
+                return;
+            }
+            let recorder = Recorder::default();
+            app.set_observer(Some(Box::new(recorder.clone())));
+            let before = view_theme_of(&app, sea).background;
+            let saved = background_of("#405060".parse().unwrap(), 1.0);
+
+            std::fs::write(&file, theme_doc("Ocean", "#405060")).unwrap();
+            // Generous: the poll backend sees an in-place save at its full
+            // theme scan, seconds late under background QoS (#393 B2).
+            assert!(
+                eventually(Duration::from_secs(30), || {
+                    view_theme_of(&app, sea).background != before
+                }),
+                "{backend:?}: the view draws the saved theme"
+            );
+            assert_eq!(
+                app.session_appearance(sea).unwrap().background,
+                saved,
+                "{backend:?}"
+            );
+            assert!(
+                eventually(Duration::from_secs(1), || !lock(&recorder.0).is_empty()),
+                "{backend:?}: the observer was told"
+            );
+        }
     }
 
     /// #390 (ADR 0045): `App::blur_radius` is `[appearance] blur_radius`

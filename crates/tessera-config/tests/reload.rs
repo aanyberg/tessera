@@ -79,31 +79,54 @@ fn font_size_edit_is_observed_within_500ms() {
     }
 }
 
+/// Writes closer together than the debounce are applied as one change,
+/// the last. Independent of scheduling (#283 item 4): a stall of the
+/// writing thread is a quiet period the watcher may rightly settle in, so
+/// each gap between two writes of at least half the debounce allows one
+/// more event; `max_wait` is out of reach. A watcher that does not
+/// coalesce reports a change per write whatever the gaps.
 #[test]
 fn rapid_writes_are_debounced_into_one_event() {
+    // Longer than a write takes under background QoS (about 200 ms, its
+    // I/O throttled), so the writes coalesce there too.
+    const DEBOUNCE: Duration = Duration::from_millis(600);
     for backend in BACKENDS {
         let (_dir, store, watcher) = open_watched(WatchOptions {
             backend,
             poll_interval: Duration::from_millis(10),
-            debounce: Duration::from_millis(150),
+            debounce: DEBOUNCE,
+            max_wait: Duration::from_secs(60),
             ..Default::default()
         });
         let path = store.paths().config_file();
 
+        let mut written = Vec::new();
         for size in 14..=20 {
             std::fs::write(&path, font_size_doc(size)).unwrap();
+            written.push(Instant::now());
             std::thread::sleep(Duration::from_millis(5));
         }
+        let stalls = written
+            .windows(2)
+            .filter(|pair| pair[1].duration_since(pair[0]) >= DEBOUNCE / 2)
+            .count();
 
-        let event = watcher.recv_timeout(EVENTUALLY).expect("one event");
-        let changed = expect_changed(event, backend);
+        let mut changes = vec![expect_changed(
+            watcher.recv_timeout(EVENTUALLY).expect("one event"),
+            backend,
+        )];
+        while let Ok(event) = watcher.recv_timeout(DEBOUNCE * 2 + Duration::from_millis(300)) {
+            changes.push(expect_changed(event, backend));
+        }
         assert_eq!(
-            changed.config.appearance.font_size, 20.0,
-            "{backend:?}: only the final value is applied"
+            changes.last().unwrap().config.appearance.font_size,
+            20.0,
+            "{backend:?}: the final value is applied"
         );
         assert!(
-            watcher.recv_timeout(Duration::from_millis(300)).is_err(),
-            "{backend:?}: intermediate writes must not produce extra events"
+            changes.len() <= 1 + stalls,
+            "{backend:?}: {} events for writes with {stalls} stalls between them",
+            changes.len()
         );
     }
 }

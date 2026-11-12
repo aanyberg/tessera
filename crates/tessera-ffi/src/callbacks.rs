@@ -92,7 +92,9 @@ pub struct Callbacks {
     /// frontend draws is reported: a session's blur or background colour
     /// (`tessera_session_appearance`) or the window's blur radius
     /// (`tessera_app_blur_radius`), once per configuration applied however
-    /// many sessions it changed. Like every callback it must not call
+    /// many sessions it changed. It names no session: one call per apply,
+    /// not one per session affected, so the host reads every session's
+    /// `tessera_session_appearance` again. Like every callback it must not call
     /// `tessera_*`: in particular
     /// `tessera_app_set_callbacks` or `tessera_app_free` from it deadlocks,
     /// since both wait for this call to return.
