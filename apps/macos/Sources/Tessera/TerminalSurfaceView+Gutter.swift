@@ -40,7 +40,10 @@ extension TerminalSurfaceView: NSViewToolTipOwner {
     /// Not during a live resize (a window or divider drag, which holds the
     /// mouse button, so no tip shows): the rects are placed from the view's
     /// bottom, so every height step would move all of them (3.5 ms a step
-    /// at 798 rows, #375). They are laid out once when it ends.
+    /// at 798 rows, #375). They are laid out once when it ends; a divider
+    /// drag that AppKit's exception ended without its end is ended by the
+    /// pane container (#399). Not `inLiveResize`: AppKit leaves that set
+    /// then too.
     func updateGutterToolTips() {
         guard !isLiveResizing else { return }
         let layout = metrics.map {

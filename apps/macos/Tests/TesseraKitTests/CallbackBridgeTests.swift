@@ -4,6 +4,12 @@ import TesseraCore
 @testable import TesseraKit
 import XCTest
 
+/// Thrown by a failed `until()` after it has recorded the failure, so the test
+/// ends there instead of going on into more waits (#275).
+private struct UntilTimedOut: Error, CustomStringConvertible {
+    var description: String { "until() timed out (reported above)" }
+}
+
 /// Drives the bridge's C callbacks directly, from a background thread, the way
 /// the core's reader threads do, to cover paths the core cannot trigger yet
 /// (titles) or cannot trigger deterministically (coalescing, ordering).
@@ -260,10 +266,12 @@ final class CallbackBridgeTests: XCTestCase {
 
     // MARK: Clipboard write cap (ADR 0022 D-RATE52)
 
-    /// Lets the main actor run until `condition` holds; fails the test if it
-    /// does not within `limit`. The limit is a failure bound, not a timing
-    /// claim: a passing run returns as soon as the condition holds, and a
-    /// starved main actor (load average 70 and more) must not fail it.
+    /// Lets the main actor run until `condition` holds; fails the test and
+    /// throws ``UntilTimedOut`` if it does not within `limit`, so the caller
+    /// stops there instead of going on into more waits (#275). The limit is a
+    /// failure bound, not a timing claim: a passing run returns as soon as the
+    /// condition holds, and a starved main actor (load average 70 and more)
+    /// must not fail it.
     private func until(
         _ limit: Duration = .seconds(10), _ condition: () -> Bool,
         file: StaticString = #filePath, line: UInt = #line
@@ -272,22 +280,32 @@ final class CallbackBridgeTests: XCTestCase {
         while !condition() {
             guard ContinuousClock.now < deadline else {
                 XCTFail("condition not met within \(limit)", file: file, line: line)
-                return
+                throw UntilTimedOut()
             }
             try await Task.sleep(for: .milliseconds(1))
         }
     }
 
     func testUntilFailsAtItsDeadline() async throws {
-        let start = ContinuousClock.now
         try await until { true }
         // Strict: the test fails unless `until` records its failure; any
         // other failure is not expected.
         let options = XCTExpectedFailure.Options()
         options.issueMatcher = { $0.compactDescription.contains("condition not met within") }
         XCTExpectFailure("a condition that never holds fails at the deadline", options: options)
-        try await until(.milliseconds(20)) { false }
-        XCTAssertGreaterThanOrEqual(ContinuousClock.now - start, .milliseconds(20), "not before it")
+        // When the condition last ran, not when `until` returned: XCTest's
+        // first failure record alone can take longer than the limit (#275).
+        let start = ContinuousClock.now
+        var lastCheck: ContinuousClock.Instant?
+        do {
+            try await until(.milliseconds(20)) {
+                lastCheck = .now
+                return false
+            }
+            XCTFail("returned instead of throwing")
+        } catch is UntilTimedOut {}
+        let checked = try XCTUnwrap(lastCheck, "the condition never ran")
+        XCTAssertGreaterThanOrEqual(checked - start, .milliseconds(20), "not before it")
     }
 
     /// ``writeClipboard(_:_:session:)`` on a background thread; returns once

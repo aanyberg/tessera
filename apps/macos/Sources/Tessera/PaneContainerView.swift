@@ -293,27 +293,49 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
     /// once a rebuild has moved one out; the drag would end there, with
     /// ``dividerDragDidEnd(_:)`` skipped and its children left in a live
     /// resize. Only a rebuild inside the tracking loop waits
-    /// (``isTrackingDividerDrag``), and the run loop's default mode, which
-    /// runs once no tracking loop does, rebuilds what is still put off and
-    /// ends the drag: one that ended without ``dividerDragDidEnd(_:)`` all
-    /// the same (an exception in AppKit, #379) leaves no stale split view
-    /// and no refused zoom behind, only the ratio of its last steps.
+    /// (``isTrackingDividerDrag``). A drag that ended without
+    /// ``dividerDragDidEnd(_:)`` all the same (an exception in AppKit, #379)
+    /// is ended in the run loop's default mode, which runs once no tracking
+    /// loop does (``dividerDragWillBegin(_:)``): no stale split view, no
+    /// refused zoom and no lost ratio stay behind.
     private var rebuildAfterDrag = false
 
     /// Whether a ``PaneSplitView`` is tracking a divider drag: one began
     /// and the run loop is in its event-tracking mode, in which AppKit's
     /// tracking loop runs. A drag that ended without
     /// ``dividerDragDidEnd(_:)`` (an exception in AppKit) reads as none
-    /// outside that mode, though ``dividerDragMoved`` stays set until the
-    /// next drag begins; inside it (a menu, a window's live resize) a
-    /// rebuild waits for the default mode as a drag's would.
+    /// outside that mode, and inside it (a menu, a window's live resize)
+    /// once the default mode has ended it.
     var isTrackingDividerDrag: Bool {
         dividerDragMoved != nil && RunLoop.current.currentMode == .eventTracking
     }
 
-    /// A ``PaneSplitView`` starts tracking a divider drag.
-    fileprivate func dividerDragWillBegin() {
+    /// `splitView` starts tracking a divider drag. The run loop's default
+    /// mode, which runs once the tracking loop is gone however it ended,
+    /// ends a drag that ended without ``dividerDragDidEnd(_:)`` (an
+    /// exception in AppKit, #379): as that would (#399), and with the live
+    /// resize AppKit began on the panes' views, which AppKit does not end
+    /// then, so their tool tips and core size follow later changes again.
+    fileprivate func dividerDragWillBegin(_ splitView: PaneSplitView) {
         dividerDragMoved = false
+        // Weak: a rebuild at the drag's end drops `splitView`, and with it
+        // the view of a pane closed during the drag, before this runs.
+        RunLoop.main.perform(inModes: [.default]) { [weak self, weak splitView] in
+            MainActor.assumeIsolated {
+                guard let self, self.dividerDragMoved != nil else { return }
+                if let splitView {
+                    self.dividerDragDidEnd(splitView)
+                } else {
+                    // Dropped by a rebuild since: nothing is put off.
+                    let moved = self.dividerDragMoved == true
+                    self.dividerDragMoved = nil
+                    if moved { self.layoutDidChange() }
+                }
+                for pane in self.panes where pane.view.isLiveResizing {
+                    pane.view.viewDidEndLiveResize()
+                }
+            }
+        }
     }
 
     /// The drag of `splitView`'s divider ended (the button is up): a rebuild
@@ -500,24 +522,10 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
     /// then drops the old split views, with the view of a pane no longer in
     /// the tree. Every pane is shown: its callers clear ``zoomedPane``.
     /// Inside a divider drag's tracking loop it waits for the drag's end
-    /// or, should the drag end without ``dividerDragDidEnd(_:)``, for the
-    /// run loop's default mode (``rebuildAfterDrag``).
+    /// (``rebuildAfterDrag``), which the run loop's default mode makes
+    /// should AppKit skip ``dividerDragDidEnd(_:)``.
     private func rebuild() {
         if isTrackingDividerDrag {
-            if !rebuildAfterDrag {
-                // Not before the tracking loop is gone, however it ended:
-                // no default-mode pass runs inside it. Still put off then,
-                // the drag ended without dividerDragDidEnd(_:).
-                RunLoop.main.perform(inModes: [.default]) { [weak self] in
-                    MainActor.assumeIsolated {
-                        guard let self, self.rebuildAfterDrag else { return }
-                        let moved = self.dividerDragMoved == true
-                        self.dividerDragMoved = nil
-                        self.rebuild()
-                        if moved { self.layoutDidChange() }
-                    }
-                }
-            }
             rebuildAfterDrag = true
             return
         }
@@ -744,7 +752,7 @@ final class PaneSplitView: NSSplitView {
             container.equalize(self)
             return
         }
-        container?.dividerDragWillBegin()
+        container?.dividerDragWillBegin(self)
         super.mouseDown(with: event)
         container?.dividerDragDidEnd(self)
     }

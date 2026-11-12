@@ -5,11 +5,11 @@ import XCTest
 
 /// The menu bar the app installs at launch: every item's title, key
 /// equivalent, modifiers and action, ⌘= reaching Bigger through its hidden
-/// item, and the application items (Open config.toml, Tessera Help)
-/// without starting an editor or a browser; the Settings window's are in
-/// ``SettingsTests``. The terminal items' effects are tested
-/// on the view in ``TerminalSurfaceViewTests``, the scrollback items' (and
-/// their key equivalents) in ``TerminalScrollTests``.
+/// item, and Tessera Help without starting a browser; Open config.toml
+/// (the Settings window's Advanced pane) is in ``SettingsTests``. The
+/// terminal items' effects are tested on the view in
+/// ``TerminalSurfaceViewTests``, the scrollback items' (and their key
+/// equivalents) in ``TerminalScrollTests``.
 @MainActor
 final class MainMenuTests: XCTestCase {
     private var appDelegate: AppDelegate!
@@ -87,8 +87,8 @@ final class MainMenuTests: XCTestCase {
     private static let tesseraItems: [Item] = [
         Item(title: "About Tessera", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:))),
         .separator,
-        Item(title: "Settings…", key: ",", modifiers: command, action: #selector(AppDelegate.openSettings(_:))),
-        Item(title: "Open config.toml", action: #selector(AppDelegate.openConfigFile(_:))),
+        // "Settings", as installed at launch: AppKit adds no ellipsis (#410).
+        Item(title: "Settings", key: ",", modifiers: command, action: #selector(AppDelegate.openSettings(_:))),
         .separator,
         Item(title: "Hide Tessera", key: "h", modifiers: command, action: #selector(NSApplication.hide(_:))),
         Item(
@@ -319,31 +319,6 @@ final class MainMenuTests: XCTestCase {
         let item = try XCTUnwrap(try installedMenu(menuTitle).item(withTitle: title))
         let action = try XCTUnwrap(item.action)
         XCTAssertTrue(NSApp.sendAction(action, to: nil, from: item), "\(title) reached a responder")
-    }
-
-    func testOpenConfigFileCreatesTheConfigFileThenOpensIt() throws {
-        try choose("Open config.toml", in: "Tessera")
-        XCTAssertEqual(events, ["create", "open \(configFile.path)"], "created (if missing) before it is opened")
-        XCTAssertEqual(opener.opened, [configFile])
-        XCTAssertEqual(opener.revealed, [])
-        XCTAssertEqual(opener.urls, [])
-        try choose("Open config.toml", in: "Tessera")
-        XCTAssertEqual(events.filter { $0 == "create" }.count, 2, "the core's createConfig() is idempotent")
-    }
-
-    func testOpenConfigFileShowsTheFileInFinderWhenNothingOpensIt() throws {
-        opener.editor = nil
-        try choose("Open config.toml", in: "Tessera")
-        XCTAssertEqual(events, ["create"])
-        XCTAssertEqual(opener.opened, [])
-        XCTAssertEqual(opener.revealed, [configFile])
-    }
-
-    func testOpenConfigFileShowsTheFileInFinderWhenOpeningItFails() throws {
-        opener.openError = CocoaError(.fileReadNoPermission)
-        try choose("Open config.toml", in: "Tessera")
-        XCTAssertEqual(opener.opened, [configFile])
-        XCTAssertEqual(opener.revealed, [configFile], "after the failed open")
     }
 
     func testABoundCommandRunsItsMenuItem() throws {
