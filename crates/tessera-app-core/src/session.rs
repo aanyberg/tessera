@@ -325,14 +325,21 @@ pub(crate) fn lock<T: ?Sized>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 static THREAD_START_HOOK: OnceLock<fn()> = OnceLock::new();
 
 /// Installs `hook`, which every thread this crate starts (each session's
-/// reader and input writer, and the application's reaper) runs first.
+/// reader and input writer, and the application's reaper) runs first, and
+/// which every thread `tessera-pty` starts (each PTY's reader and writer)
+/// runs first too.
 ///
 /// For thread attributes this crate cannot set itself: it forbids
 /// `unsafe`, so `tessera-ffi` installs a hook that gives these threads a
 /// quality-of-service class on macOS (ADR 0018). Process-wide; only the
 /// first hook is kept, and threads already running are not affected.
-/// Returns whether `hook` was installed.
+/// Returns whether `hook` was installed here; the install into
+/// [`tessera_pty::set_thread_start_hook`] is best-effort, and a hook
+/// already set there is kept (logged at debug) whatever this returns.
 pub fn set_thread_start_hook(hook: fn()) -> bool {
+    if !tessera_pty::set_thread_start_hook(hook) {
+        tracing::debug!("tessera-pty already has a thread start hook; keeping it");
+    }
     THREAD_START_HOOK.set(hook).is_ok()
 }
 

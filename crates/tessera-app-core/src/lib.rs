@@ -3372,13 +3372,31 @@ mod tests {
         let (id, _fake) = attach_fake(&app, false);
         app.close_session(id).unwrap();
         wait_reaped(&app, Instant::now());
-        let hooked = lock(&HOOKED).clone();
-        for name in [
+        // A real PTY: app-core's setter installed the hook into
+        // `tessera-pty` too, so its reader and writer run it (#398).
+        let pty_id = app.spawn_session(sh("exit 0")).unwrap();
+        let pid = app.session(pty_id).unwrap().child_pid().expect("child pid");
+        app.close_session(pty_id).unwrap();
+        wait_reaped(&app, Instant::now());
+        let expected = [
             format!("tessera-session-{id}"),
             format!("tessera-input-{id}"),
             "tessera-reaper".to_owned(),
-        ] {
-            assert!(hooked.contains(&name), "{name} missing from {hooked:?}");
+            format!("pty-reader-{pid}"),
+            format!("pty-writer-{pid}"),
+        ];
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let hooked = lock(&HOOKED).clone();
+            let missing: Vec<_> = expected.iter().filter(|n| !hooked.contains(n)).collect();
+            if missing.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{missing:?} missing from {hooked:?}"
+            );
+            thread::sleep(Duration::from_millis(2));
         }
     }
 

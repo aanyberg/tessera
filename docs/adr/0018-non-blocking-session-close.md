@@ -249,3 +249,33 @@ finished 1.21–1.25 s after the 1 s grace. The tests run in nextest's
   the reaper joins it; the close returns at once either way.
 - #34 (close confirmation, window state restore) can close many sessions
   from the main thread without a progress UI.
+
+## Amendment: pty threads run the start hook (#398, 2026-11-12)
+
+The paragraph under "Quality of service" that kept `tessera-pty`'s reader
+and writer at the default class is superseded. Xcode's Thread Performance
+Checker reported the inversion it dismissed: a session reader
+(`session::Pump::run`, at `USER_INITIATED`) blocks in `recv_timeout` on the
+`PtyEvent` channel, which only `pty-reader-<pid>` fills, so for as long as
+the child is quiet or the output arrives the higher-class thread waits on a
+default-class one.
+
+Every core and pty thread now runs the start hook. `tessera-pty` has its
+own `set_thread_start_hook(fn()) -> bool`, the same contract as app-core's
+(a process-wide `OnceLock<fn()>`, first hook wins, returns whether it was
+installed). `spawn_thread` runs it first inside `pty-reader-<pid>` and
+`pty-writer-<pid>`, under `catch_unwind`: a panicking hook is logged
+(`"pty thread start hook panicked"`, no payload) and the thread carries
+on, since a reader that died there would strand the child.
+`tessera_app_core::session::set_thread_start_hook` installs the same hook
+into `tessera-pty` too (dependencies still point downward), so
+`tessera_app_new`'s single call covers both crates and `tessera-ffi` is
+unchanged. It returns app-core's own result; the pty install is
+best-effort, and a pty hook already set is kept and logged at debug. The
+hook runs once per thread start; no per-read or per-write path changed.
+
+Verified headlessly: `tessera-pty`'s `start_hook` test binary records both
+thread names for a spawn and shows that a panicking hook is logged once
+per thread while the session still takes input, delivers output and
+exits; `every_core_thread_runs_the_start_hook` now also requires
+`pty-reader-<pid>` and `pty-writer-<pid>` after app-core's setter alone.
