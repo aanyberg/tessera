@@ -232,7 +232,7 @@ pub struct DisplayOptions {
 /// ADR 0043), for the host, which owns the window behind it.
 ///
 /// [`App::session_appearance`]: crate::App::session_appearance
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SessionAppearance {
     /// The background is fully opaque: nothing behind the view shows
     /// through it. The host's window is opaque only while every view in it
@@ -242,6 +242,17 @@ pub struct SessionAppearance {
     /// resolved `appearance.blur`, while the background is translucent and
     /// Reduce Transparency is off. Never set while `opaque` is.
     pub blur: bool,
+    /// The session's configured background colour as red, green, blue and
+    /// alpha, each in 0.0..=1.0: the theme of the session's profile, its
+    /// red, green and blue sRGB-encoded as the theme file writes them
+    /// (`#rrggbb` over 255, not linear), and its alpha the theme's times
+    /// the profile's `opacity`, straight (not premultiplied), or 1.0 under
+    /// Reduce Transparency. What the host tints the title bar and tab bar
+    /// with above the session's view (ADR 0043 amendment, #388). A
+    /// background the program sets (OSC 11) is not followed: this is the
+    /// configured colour only, a documented gap. Alpha is below 1.0
+    /// exactly when `opaque` is not set.
+    pub background: [f32; 4],
 }
 
 /// [`theme_for`] with `appearance` in place of `[appearance]`: the theme a
@@ -330,6 +341,31 @@ impl Look {
     /// Whether the session's background is fully opaque.
     pub(crate) fn is_opaque(&self) -> bool {
         !is_translucent(&self.theme)
+    }
+
+    /// The configured background as [`SessionAppearance::background`]
+    /// reports it: the resolved theme's sRGB bytes over 255 and the
+    /// renderer theme's straight alpha, which already holds the opacity
+    /// and the display options.
+    pub(crate) fn background(&self) -> [f32; 4] {
+        let unit = |byte: u8| f32::from(byte) / 255.0;
+        let colour = self.colours.background;
+        [
+            unit(colour.r),
+            unit(colour.g),
+            unit(colour.b),
+            self.theme.background.clamped().a,
+        ]
+    }
+
+    /// The session's appearance as the host reads it
+    /// ([`crate::App::session_appearance`]).
+    pub(crate) fn session_appearance(&self) -> SessionAppearance {
+        SessionAppearance {
+            opaque: self.is_opaque(),
+            blur: self.blur,
+            background: self.background(),
+        }
     }
 
     /// The session's default cursor style ([`cursor_style_for_appearance`]).

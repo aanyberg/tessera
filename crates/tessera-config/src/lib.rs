@@ -321,13 +321,29 @@ pub struct Appearance {
     /// [`Appearance::MIN_FONT_SIZE`]..=[`Appearance::MAX_FONT_SIZE`].
     pub font_size: f32,
     /// Background opacity, 0.0..=1.0. A window is translucent while any
-    /// pane of its tab is. The system's Reduce Transparency setting draws
-    /// every session opaque.
+    /// pane of its tab is. While the window is translucent its title bar
+    /// and tab bar are always blurred, whatever `blur` says, and tinted
+    /// with the theme's background at this opacity. The system's Reduce
+    /// Transparency setting draws every session opaque.
     pub opacity: f32,
     /// Background blur behind each pane whose background is translucent
-    /// (`opacity` below 1.0, or a theme background with alpha). Off while
-    /// the system's Reduce Transparency setting is on.
+    /// (`opacity` below 1.0, or a theme background with alpha). The title
+    /// bar and tab bar of a translucent window are always blurred, whatever
+    /// this says. Off while the system's Reduce Transparency setting is on.
     pub blur: bool,
+    /// How strongly a window blurs what is behind it, from 0 to 64
+    /// ([`Appearance::MAX_BLUR_RADIUS`]). 0 keeps the system's standard
+    /// blur behind each pane that asks for `blur`; 1 to 64 blurs the whole
+    /// window at that radius instead, but only while every translucent
+    /// pane of the tab asks for `blur` (otherwise each pane keeps the
+    /// standard blur). The title bar and tab bar keep the standard blur
+    /// either way. A value above 64 is lowered to 64 with a warning; a
+    /// negative or fractional one (`-1`, `20.0`) makes the file invalid,
+    /// as for `scrollback_lines`. Applies to open windows when the file
+    /// changes. Set it here only: in a profile's `appearance` it is
+    /// ignored with a warning, since the window, not the session, is
+    /// blurred.
+    pub blur_radius: u32,
     /// The cursor's shape: `"block"`, `"underline"` or `"beam"` (a
     /// vertical bar), exactly as written here. A program may change it
     /// (DECSCUSR, `CSI Ps SP q`, as vim and fish do); it returns to this
@@ -406,6 +422,9 @@ impl Appearance {
     /// Largest `dim_inactive_panes` accepted, so an unfocused pane stays
     /// readable; larger values are lowered on load.
     pub const MAX_DIM_INACTIVE_PANES: f32 = 0.8;
+    /// Largest `blur_radius` accepted, where the window server's blur stops
+    /// growing (ADR 0045); larger values are lowered on load.
+    pub const MAX_BLUR_RADIUS: u32 = 64;
 }
 
 impl Default for Appearance {
@@ -416,6 +435,7 @@ impl Default for Appearance {
             font_size: 13.0,
             opacity: 1.0,
             blur: false,
+            blur_radius: 0,
             cursor_shape: CursorShape::Block,
             cursor_blink: false,
             dim_inactive_panes: 0.0,
@@ -547,8 +567,9 @@ pub struct Profile {
     /// the one in `[appearance]`, each key left out follows `[appearance]`
     /// (also when it changes). In 0.1.0 a key left out here was reset to
     /// its built-in default instead (a profile that set only `font_size`
-    /// also reset `theme`, `opacity` and the cursor). `dim_inactive_panes` cannot be set
-    /// here (the window draws it): it is ignored with a warning.
+    /// also reset `theme`, `opacity` and the cursor). `dim_inactive_panes` and
+    /// `blur_radius` cannot be set here (the window draws them): they are
+    /// ignored with a warning.
     pub appearance: Option<ProfileAppearance>,
 }
 

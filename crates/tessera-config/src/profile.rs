@@ -32,8 +32,9 @@ pub const BUILT_IN_PROFILE_NAME: &str = "Default";
 /// `[appearance]`, each key left out is taken from it, also after
 /// `[appearance]` changes.
 ///
-/// `dim_inactive_panes` is not here: the window draws it, not the session,
-/// so a profile that sets it gets a warning and `[appearance]`'s value.
+/// `dim_inactive_panes` and `blur_radius` are not here: the window draws
+/// them, not the session, so a profile that sets one gets a warning and
+/// `[appearance]`'s value.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(default)]
@@ -53,14 +54,16 @@ pub struct ProfileAppearance {
     /// Background opacity of this profile's sessions, 0.0..=1.0. A window
     /// is translucent while any pane of its tab is, and stays opaque only
     /// while every one is; an opaque session still draws its own opaque
-    /// background. The system's Reduce Transparency setting draws every
-    /// session opaque. A value that is not a finite number is ignored with
+    /// background. While the window is translucent its title bar and tab
+    /// bar are always blurred, whatever `blur` says. The system's Reduce
+    /// Transparency setting draws every session opaque. A value that is not a finite number is ignored with
     /// a warning, so `[appearance]`'s applies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opacity: Option<f32>,
     /// Background blur behind each of this profile's panes whose background
     /// is translucent (`opacity` below 1.0, or a theme background with
-    /// alpha).
+    /// alpha). The title bar and tab bar of a translucent window are always
+    /// blurred, whatever this says.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blur: Option<bool>,
     /// The cursor's shape, `"block"`, `"underline"` or `"beam"`, as for
@@ -85,9 +88,9 @@ pub struct ProfileAppearance {
 impl ProfileAppearance {
     /// `base` with every key this profile sets replaced:
     /// the appearance a session of this profile is drawn with.
-    /// `dim_inactive_panes` is always `base`'s, and so is a `font_size` or
-    /// `opacity` that is not a finite number (the loader already turns
-    /// those into unset keys; #333).
+    /// `dim_inactive_panes` and `blur_radius` are always `base`'s, and so
+    /// is a `font_size` or `opacity` that is not a finite number (the
+    /// loader already turns those into unset keys; #333).
     #[must_use]
     pub fn over(&self, base: &Appearance) -> Appearance {
         Appearance {
@@ -105,6 +108,7 @@ impl ProfileAppearance {
                 .filter(|opacity| opacity.is_finite())
                 .unwrap_or(base.opacity),
             blur: self.blur.unwrap_or(base.blur),
+            blur_radius: base.blur_radius,
             cursor_shape: self.cursor_shape.unwrap_or(base.cursor_shape),
             cursor_blink: self.cursor_blink.unwrap_or(base.cursor_blink),
             dim_inactive_panes: base.dim_inactive_panes,
@@ -299,6 +303,7 @@ mod tests {
     fn every_set_key_overrides_and_dimming_stays_the_windows() {
         let base = Appearance {
             dim_inactive_panes: 0.4,
+            blur_radius: 20,
             ..Appearance::default()
         };
         let overrides = ProfileAppearance {
@@ -319,6 +324,7 @@ mod tests {
                 font_size: 18.0,
                 opacity: 0.5,
                 blur: true,
+                blur_radius: 20,
                 cursor_shape: CursorShape::Underline,
                 cursor_blink: true,
                 dim_inactive_panes: 0.4,

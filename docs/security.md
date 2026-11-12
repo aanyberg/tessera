@@ -80,6 +80,7 @@ a low-risk change.
 | Grapheme cluster | 32 scalars | `crates/tessera-grid/src/grapheme.rs` |
 | Grid | 2048 columns × 1024 rows | `crates/tessera-app-core/src/view.rs`, `crates/tessera-ffi/src/session.rs` |
 | Scrollback | `[terminal] scrollback_lines` (default 10 000), applied when a session starts; capped at `Terminal::MAX_SCROLLBACK_LINES` (10 000 000); a width change re-wraps the whole history under the terminal lock (~0.2 ms per 1 000 lines, 2-4 s and ~18 GB at the cap; user-chosen, documented in docs/config.md) | `crates/tessera-config/src/lib.rs`, `crates/tessera-app-core/src/lib.rs` (`App::attach`), `crates/tessera-grid/src/grid.rs` |
+| Window blur radius (#390, ADR 0045) | `[appearance] blur_radius` 0..=64 (`Appearance::MAX_BLUR_RADIUS`): above 64 clamped with one warning that names only the number; a negative, fractional or non-integer value is a parse error, as for `scrollback_lines`; ignored with a warning in a profile; reported by `tessera_app_blur_radius` already clamped, and the host clamps again before it reaches the window server | `crates/tessera-config/src/lib.rs`, `crates/tessera-config/src/load.rs`, `crates/tessera-ffi/src/app.rs` |
 | PTY read queue / write queue / pending input | 64 × 64 KiB / 1 MiB / 16 MiB | `crates/tessera-pty/src/native.rs`, `crates/tessera-app-core/src/session.rs` |
 | Foreground process name | 64 bytes | `crates/tessera-pty/src/foreground.rs` |
 | Kitty keyboard stack | 8 | `crates/tessera-term/src/modes.rs` |

@@ -358,6 +358,43 @@ pub unsafe extern "C" fn tessera_app_dim_inactive_panes(app: *const App, out: *m
     })
 }
 
+/// Stores `[appearance] blur_radius` of the configuration in effect in
+/// `*out` (ADR 0045): the window's blur radius, already clamped to
+/// 0..=64. 0 keeps each pane's own material blur; above 0 the frontend
+/// blurs the whole window at that radius while every translucent pane of
+/// the tab asks for blur (`TesseraSessionAppearance::blur`), and sets no
+/// radius while the window is opaque or Reduce Transparency is on (the
+/// value reported does not change with the display options). A
+/// configuration applied that changes it calls `on_appearance_changed`
+/// (and `on_config_applied`, as every configuration applied does): read it
+/// at start and again then.
+///
+/// Returns `TESSERA_ERROR_NULL_POINTER` if `app` or `out` is `NULL`; `*out`
+/// is set to 0 on failure when `out` is not `NULL`.
+///
+/// # Safety
+///
+/// `app` must be `NULL` or a live handle. `out` must be `NULL` or point to
+/// a writable `uint32_t`. Main thread only, like every `tessera_app_*` call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_app_blur_radius(app: *const App, out: *mut u32) -> Error {
+    ffi_guard!("tessera_app_blur_radius", {
+        if out.is_null() {
+            return Error::NullPointer;
+        }
+        // SAFETY: non-null and writable per the contract.
+        unsafe { out.write(0) };
+        // SAFETY: the caller passes NULL or a live handle.
+        let Some(app) = (unsafe { App::from_ptr(app) }) else {
+            return Error::NullPointer;
+        };
+        let radius = app.core.blur_radius();
+        // SAFETY: as above.
+        unsafe { out.write(radius) };
+        Error::Ok
+    })
+}
+
 /// The system's display settings that change how the core styles every
 /// session (ADR 0043), as the frontend reads them from the operating
 /// system. Each flag is a `uint8_t`, 0 for off and any other value for on

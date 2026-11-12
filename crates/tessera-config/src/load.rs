@@ -248,8 +248,8 @@ impl Config {
         let mut unknown = 0usize;
         let config = serde_ignored::deserialize(de, |path| {
             let steps = path_steps(&path);
-            if let Some(i) = profile_dimming_index(&steps) {
-                warnings.extend(profile_dimming(text, &root, &steps, i));
+            if let Some((i, key)) = profile_window_key(&steps) {
+                warnings.extend(profile_window_warning(text, &root, &steps, i, key));
             } else if unknown < MAX_UNKNOWN_KEY_WARNINGS {
                 unknown += 1;
                 warnings.push((
@@ -800,13 +800,27 @@ fn invalid_lenient_values(text: &str, root: &toml::de::DeTable<'_>) -> Vec<(usiz
     warnings
 }
 
-/// `[appearance]`'s ranges: font size, opacity and pane dimming.
+/// `[appearance]`'s ranges: font size, opacity, blur radius and pane
+/// dimming.
 fn normalize_appearance(a: &mut crate::Appearance, warnings: &mut Vec<Warning>) {
     use crate::Appearance;
 
     const PREFIX: &str = "appearance";
     a.font_size = font_size_in_range(PREFIX, a.font_size, warnings);
     a.opacity = opacity_in_range(PREFIX, a.opacity, warnings);
+    // A negative or fractional radius never gets here: it does not fit
+    // the `u32` and fails the load (ADR 0045).
+    if a.blur_radius > Appearance::MAX_BLUR_RADIUS {
+        warnings.push(Warning::OutOfRange {
+            path: format!("{PREFIX}.blur_radius"),
+            detail: format!(
+                "{} clamped to {}",
+                a.blur_radius,
+                Appearance::MAX_BLUR_RADIUS
+            ),
+        });
+        a.blur_radius = Appearance::MAX_BLUR_RADIUS;
+    }
     let max_dim = Appearance::MAX_DIM_INACTIVE_PANES;
     if !(0.0..=max_dim).contains(&a.dim_inactive_panes) {
         let clamped = if a.dim_inactive_panes.is_finite() {
@@ -875,30 +889,38 @@ fn opacity_in_range(prefix: &str, opacity: f32, warnings: &mut Vec<Warning>) -> 
     opacity
 }
 
-/// The profile index when `steps` is `dim_inactive_panes` in a profile's
-/// `appearance`, which a profile's table does not have: the window draws
-/// the dimming, not the session.
-fn profile_dimming_index(steps: &[Step<'_>]) -> Option<usize> {
+/// The `[appearance]` keys the window draws, not the session, so a
+/// profile's `appearance` table does not have them: pane dimming and the
+/// window's blur radius.
+const WINDOW_APPEARANCE_KEYS: [&str; 2] = ["dim_inactive_panes", "blur_radius"];
+
+/// The profile index and the key when `steps` is one of
+/// [`WINDOW_APPEARANCE_KEYS`] in a profile's `appearance`.
+fn profile_window_key(steps: &[Step<'_>]) -> Option<(usize, &'static str)> {
     match steps {
         [
             Step::Key("profiles"),
             Step::Index(i),
             Step::Key("appearance"),
-            Step::Key("dim_inactive_panes"),
-        ] => Some(*i),
+            Step::Key(key),
+        ] => WINDOW_APPEARANCE_KEYS
+            .into_iter()
+            .find(|window_key| window_key == key)
+            .map(|key| (*i, key)),
         _ => None,
     }
 }
 
-/// The warning for profile `i`'s `dim_inactive_panes` at `steps`: a
+/// The warning for profile `i`'s window-level `key` at `steps`: a
 /// [`Warning::OutOfRange`] that says to set it in `[appearance]`, placed
 /// where the key is. None past [`MAX_PROFILES`](crate::MAX_PROFILES): that
 /// profile is left out, with one warning for all of them (S5).
-fn profile_dimming(
+fn profile_window_warning(
     text: &str,
     root: &toml::de::DeTable<'_>,
     steps: &[Step<'_>],
     i: usize,
+    key: &str,
 ) -> Option<(usize, Warning)> {
     if i >= crate::MAX_PROFILES {
         return None;
@@ -907,7 +929,7 @@ fn profile_dimming(
     Some((
         at,
         Warning::OutOfRange {
-            path: format!("profiles[{i}].appearance.dim_inactive_panes"),
+            path: format!("profiles[{i}].appearance.{key}"),
             detail: format!(
                 "{} ignored (set it in [appearance], not in a profile)",
                 written(text, value)
@@ -2006,6 +2028,130 @@ mod tests {
             matches!(&loaded.warnings[..], [Warning::OutOfRange { path, .. }] if path == "profiles[0].appearance.dim_inactive_panes"),
             "{:?}",
             loaded.warnings
+        );
+    }
+
+    /// ADR 0045: an integer 0..=64, default 0; above 64 lowered with one
+    /// warning; a negative or fractional value fails the load, as for
+    /// `scrollback_lines`.
+    #[test]
+    fn blur_radius_is_an_integer_up_to_64() {
+        let max = crate::Appearance::MAX_BLUR_RADIUS;
+        assert_eq!(max, 64);
+        assert_eq!(Config::default().appearance.blur_radius, 0);
+        for (text, expected) in [
+            ("", 0),
+            ("[appearance]\nblur_radius = 0\n", 0),
+            ("[appearance]\nblur_radius = 1\n", 1),
+            ("[appearance]\nblur_radius = 20\n", 20),
+            ("[appearance]\nblur_radius = 64\n", max),
+        ] {
+            let loaded = Config::from_toml_lenient(text).unwrap();
+            assert_eq!(loaded.config.appearance.blur_radius, expected, "{text}");
+            assert_eq!(loaded.warnings, Vec::new(), "{text}");
+        }
+        for (text, written) in [
+            ("[appearance]\nblur_radius = 65\n", 65u64),
+            ("[appearance]\nblur_radius = 1000\n", 1000),
+            (
+                "[appearance]\nblur_radius = 4294967295\n",
+                u64::from(u32::MAX),
+            ),
+        ] {
+            let loaded = Config::from_toml_lenient(text).unwrap();
+            assert_eq!(loaded.config.appearance.blur_radius, max, "{text}");
+            assert_eq!(
+                loaded.warnings,
+                [Warning::OutOfRange {
+                    path: "appearance.blur_radius".into(),
+                    detail: format!("{written} clamped to 64"),
+                }],
+                "{text}"
+            );
+        }
+        for text in [
+            "[appearance]\nblur_radius = -1\n",
+            "[appearance]\nblur_radius = 20.0\n",
+            "[appearance]\nblur_radius = 0.5\n",
+            "[appearance]\nblur_radius = 4294967296\n",
+            "[appearance]\nblur_radius = true\n",
+            "[appearance]\nblur_radius = \"20\"\n",
+        ] {
+            let err = Config::from_toml_lenient(text).unwrap_err();
+            assert!(matches!(err, Error::Parse(_)), "{text}: {err}");
+        }
+        // The clamped value is what is written back, and it reads back
+        // without a warning.
+        let loaded = Config::from_toml_lenient("[appearance]\nblur_radius = 99\n").unwrap();
+        let written = loaded.config.to_toml().unwrap();
+        assert!(written.contains("blur_radius = 64"), "{written}");
+        assert_eq!(Config::from_toml_lenient(&written).unwrap().warnings, []);
+    }
+
+    /// The window is blurred, not a session, so a profile's radius is
+    /// dropped with a warning and `[appearance]`'s applies to every
+    /// profile, as for `dim_inactive_panes`.
+    #[test]
+    fn blur_radius_in_a_profile_is_ignored_with_a_warning() {
+        let text = "[appearance]\nblur_radius = 12\n[[profiles]]\nname = \"a\"\n\
+                    [profiles.appearance]\nblur_radius = 30\n";
+        let loaded = Config::from_toml_lenient(text).unwrap();
+        assert_eq!(
+            loaded.warnings,
+            [Warning::OutOfRange {
+                path: "profiles[0].appearance.blur_radius".into(),
+                detail: "30 ignored (set it in [appearance], not in a profile)".into(),
+            }]
+        );
+        assert_eq!(
+            loaded
+                .config
+                .resolve_profile(Some("a"))
+                .appearance
+                .blur_radius,
+            12
+        );
+        // Any value, also one that would fail `[appearance]`'s load, warns
+        // and nothing more: the profile has no such key.
+        for value in ["-1", "20.0", "\"x\"", "1000"] {
+            let loaded = Config::from_toml_lenient(&format!(
+                "[[profiles]]\nname = \"a\"\n[profiles.appearance]\nblur_radius = {value}\n"
+            ))
+            .unwrap();
+            assert!(
+                matches!(&loaded.warnings[..], [Warning::OutOfRange { path, .. }] if path == "profiles[0].appearance.blur_radius"),
+                "{value}: {:?}",
+                loaded.warnings
+            );
+            assert_eq!(
+                loaded
+                    .config
+                    .resolve_profile(Some("a"))
+                    .appearance
+                    .blur_radius,
+                0
+            );
+        }
+        // Both window keys in one profile: one warning each, in order.
+        let loaded = Config::from_toml_lenient(
+            "[[profiles]]\nname = \"a\"\n[profiles.appearance]\nblur_radius = 5\n\
+             dim_inactive_panes = 0.5\n",
+        )
+        .unwrap();
+        let paths: Vec<_> = loaded
+            .warnings
+            .iter()
+            .map(|w| match w {
+                Warning::OutOfRange { path, .. } => path.as_str(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "profiles[0].appearance.blur_radius",
+                "profiles[0].appearance.dim_inactive_panes"
+            ]
         );
     }
 

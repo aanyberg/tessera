@@ -232,10 +232,12 @@ impl Live {
         source: Option<PathBuf>,
     ) -> bool {
         let config = Arc::new(config.clone());
-        let (generation, display) = {
+        let (generation, display, radius_changed) = {
             let mut applied = lock(&self.applied);
             let generation = applied.generation + 1;
             let display = applied.display;
+            let radius_changed =
+                applied.config.appearance.blur_radius != config.appearance.blur_radius;
             *applied = Applied {
                 config: Arc::clone(&config),
                 colours: colours.clone(),
@@ -243,21 +245,23 @@ impl Live {
                 generation,
                 display,
             };
-            (generation, display)
+            (generation, display, radius_changed)
         };
-        self.restyle_at(&config, colours, generation, display)
+        self.restyle_at(&config, colours, generation, display, radius_changed)
     }
 
     /// The part of [`Live::restyle`] after the configuration is recorded:
     /// gives every session its look under `config`, `colours` and
     /// `display` at `generation`, updates the views and tells the
-    /// observer.
+    /// observer, also when nothing a session draws changed but
+    /// `window_changed` (the window's blur radius, [`App::blur_radius`]).
     fn restyle_at(
         &self,
         config: &Config,
         colours: &tessera_config::Theme,
         generation: u64,
         display: DisplayOptions,
+        window_changed: bool,
     ) -> bool {
         // Listed after the configuration is recorded: a session that starts
         // meanwhile and is not listed reads it once listed (`App::attach`).
@@ -272,7 +276,10 @@ impl Live {
         // Blur is the host's to draw, not the views': a change of it alone
         // (`blur` toggled at an unchanged translucent opacity) still tells
         // the host, which reads it per session (`App::session_appearance`).
-        let mut blur_changed = false;
+        // So is the background colour under the title bar and tab bar
+        // (#388), also of a session with no view, whose look changes
+        // nothing a view draws.
+        let mut host_changed = false;
         for (id, session) in &sessions {
             let previous = session.look();
             let look = Arc::new(looks.of(session.profile(), Some(&previous)));
@@ -281,7 +288,7 @@ impl Live {
             };
             let cursor = old.cursor() != look.cursor();
             cursor_changed |= cursor;
-            blur_changed |= old.blur != look.blur;
+            host_changed |= old.blur != look.blur || old.theme.background != look.theme.background;
             if cursor || old.colours != look.colours {
                 // Each terminal's lock, with no other lock held (ADR 0014).
                 // A session the program gave a shape of its own keeps it
@@ -364,7 +371,8 @@ impl Live {
                 tracing::warn!(session = %id, %error, ?size, "resizing a session to its view failed");
             }
         }
-        let changed = theme_changed || font_changed || cursor_changed || blur_changed;
+        let changed =
+            theme_changed || font_changed || cursor_changed || host_changed || window_changed;
         if changed {
             self.notify(opaque);
         }
@@ -416,7 +424,7 @@ impl Live {
                 applied.generation,
             )
         };
-        self.restyle_at(&config, &colours, generation, display)
+        self.restyle_at(&config, &colours, generation, display, false)
     }
 
     /// Compiles `config`'s key map when its `[keys]` changed, counts the
@@ -2694,7 +2702,7 @@ mod tests {
         assert!((theme.cursor.a - 1.0).abs() < f32::EPSILON);
         assert_eq!(theme.background, before.background);
         assert_eq!(
-            app.session_appearance(plain).unwrap(),
+            flags(app.session_appearance(plain).unwrap()),
             appearance(false, true)
         );
         assert!(app.dim_inactive_panes().abs() < f32::EPSILON, "no dimming");
@@ -2705,8 +2713,14 @@ mod tests {
         assert!((app.dim_inactive_panes() - 0.4).abs() < f32::EPSILON);
     }
 
-    fn appearance(opaque: bool, blur: bool) -> crate::SessionAppearance {
-        crate::SessionAppearance { opaque, blur }
+    /// The flags `flags` compares a [`crate::SessionAppearance`] by.
+    fn appearance(opaque: bool, blur: bool) -> (bool, bool) {
+        (opaque, blur)
+    }
+
+    /// Whether `look` is opaque and blurred (its colour aside).
+    fn flags(look: crate::SessionAppearance) -> (bool, bool) {
+        (look.opaque, look.blur)
     }
 
     /// Each session reports its own profile's translucency and blur
@@ -2723,19 +2737,19 @@ mod tests {
         let clear = attach_fake_profile(&app, Some("clear"));
         let frosted = attach_fake_profile(&app, Some("frosted"));
         assert_eq!(
-            app.session_appearance(plain).unwrap(),
+            flags(app.session_appearance(plain).unwrap()),
             appearance(false, true)
         );
         assert_eq!(
-            app.session_appearance(solid).unwrap(),
+            flags(app.session_appearance(solid).unwrap()),
             appearance(true, false)
         );
         assert_eq!(
-            app.session_appearance(clear).unwrap(),
+            flags(app.session_appearance(clear).unwrap()),
             appearance(false, false)
         );
         assert_eq!(
-            app.session_appearance(frosted).unwrap(),
+            flags(app.session_appearance(frosted).unwrap()),
             appearance(false, true)
         );
         assert!(matches!(
@@ -2768,7 +2782,10 @@ mod tests {
         assert_eq!(recorder.take(), [true], "told once, opaque");
         assert_eq!(app.config_generation(), generation, "no new configuration");
         for id in [plain, frosted] {
-            assert_eq!(app.session_appearance(id).unwrap(), appearance(true, false));
+            assert_eq!(
+                flags(app.session_appearance(id).unwrap()),
+                appearance(true, false)
+            );
         }
         assert!(!view::is_translucent(&app.view_theme()));
         if views {
@@ -2783,12 +2800,12 @@ mod tests {
         edited.appearance.opacity = 0.6;
         app.apply_config(&edited, &bundled("Dracula"));
         assert_eq!(
-            app.session_appearance(plain).unwrap(),
+            flags(app.session_appearance(plain).unwrap()),
             appearance(true, false)
         );
         let late = attach_fake_profile(&app, None);
         assert_eq!(
-            app.session_appearance(late).unwrap(),
+            flags(app.session_appearance(late).unwrap()),
             appearance(true, false)
         );
         recorder.take();
@@ -2796,7 +2813,10 @@ mod tests {
         app.set_display_options(DisplayOptions::default());
         assert_eq!(recorder.take(), [false], "told once, translucent");
         for id in [plain, frosted, late] {
-            assert_eq!(app.session_appearance(id).unwrap(), appearance(false, true));
+            assert_eq!(
+                flags(app.session_appearance(id).unwrap()),
+                appearance(false, true)
+            );
         }
         if views {
             assert_eq!(corner(&app, plain)[3], 153, "0.6 again, the edited opacity");
@@ -2819,7 +2839,10 @@ mod tests {
         assert_eq!(recorder.take(), [true]);
         assert!(!view::is_translucent(&app.view_theme()));
         let id = attach_fake_profile(&app, Some("frosted"));
-        assert_eq!(app.session_appearance(id).unwrap(), appearance(true, false));
+        assert_eq!(
+            flags(app.session_appearance(id).unwrap()),
+            appearance(true, false)
+        );
     }
 
     /// Toggling `blur` alone, at an unchanged translucent opacity, changes
@@ -2837,13 +2860,16 @@ mod tests {
         app.apply_config(&config, &dracula);
         assert_eq!(recorder.take(), [false]);
         assert_eq!(
-            app.session_appearance(id).unwrap(),
+            flags(app.session_appearance(id).unwrap()),
             appearance(false, false)
         );
         config.appearance.blur = true;
         app.apply_config(&config, &dracula);
         assert_eq!(recorder.take(), [false]);
-        assert_eq!(app.session_appearance(id).unwrap(), appearance(false, true));
+        assert_eq!(
+            flags(app.session_appearance(id).unwrap()),
+            appearance(false, true)
+        );
     }
 
     /// A configuration applied after the display options changed is the
@@ -2880,11 +2906,276 @@ mod tests {
         };
         app.set_display_options(REDUCE);
         app.live()
-            .restyle_at(&config, &colours, before, DisplayOptions::default());
+            .restyle_at(&config, &colours, before, DisplayOptions::default(), false);
         assert_eq!(
-            app.session_appearance(id).unwrap(),
+            flags(app.session_appearance(id).unwrap()),
             appearance(true, false),
             "the late restyle was refused"
         );
+    }
+
+    /// The configured background as `SessionAppearance::background` should
+    /// report it: `colour`'s sRGB bytes over 255, and `alpha`.
+    fn background_of(colour: tessera_config::Color, alpha: f32) -> [f32; 4] {
+        let unit = |byte: u8| f32::from(byte) / 255.0;
+        [unit(colour.r), unit(colour.g), unit(colour.b), alpha]
+    }
+
+    /// Three profiles for the background tests: `[appearance]` Dracula at
+    /// 0.5, `nord` Nord at 0.8, `solid` Dracula at 1.0.
+    fn background_config() -> Config {
+        Config::from_toml_lenient(
+            "[appearance]\n\
+             theme = \"Dracula\"\n\
+             opacity = 0.5\n\
+             [[profiles]]\n\
+             name = \"nord\"\n\
+             [profiles.appearance]\n\
+             theme = \"Nord\"\n\
+             opacity = 0.8\n\
+             [[profiles]]\n\
+             name = \"solid\"\n\
+             [profiles.appearance]\n\
+             opacity = 1.0\n",
+        )
+        .unwrap()
+        .config
+    }
+
+    /// #388 (ADR 0043 amendment): each session reports its profile's
+    /// theme background, sRGB bytes over 255, with the profile's opacity
+    /// as straight alpha; Reduce Transparency makes every alpha 1.0 and
+    /// keeps the colours; Increase Contrast changes nothing here.
+    #[test]
+    fn session_appearance_reports_each_profiles_configured_background() {
+        let app = App::new(
+            background_config(),
+            ConfigPaths::new("/nonexistent/tessera"),
+        );
+        let plain = attach_fake_profile(&app, None);
+        let nord = attach_fake_profile(&app, Some("nord"));
+        let solid = attach_fake_profile(&app, Some("solid"));
+        let dracula = bundled("Dracula").background;
+        let nord_bg = bundled("Nord").background;
+        let expected = [
+            (plain, background_of(dracula, 0.5)),
+            (nord, background_of(nord_bg, 0.8)),
+            (solid, background_of(dracula, 1.0)),
+        ];
+        for (id, background) in expected {
+            assert_eq!(app.session_appearance(id).unwrap().background, background);
+        }
+        assert!(app.session_appearance(solid).unwrap().opaque);
+        assert_ne!(dracula, nord_bg, "the two themes differ");
+
+        app.set_display_options(REDUCE);
+        for (id, [r, g, b, _]) in expected {
+            let look = app.session_appearance(id).unwrap();
+            assert_eq!(look.background, [r, g, b, 1.0], "opaque, same colour");
+            assert!(look.opaque);
+        }
+        app.set_display_options(CONTRAST);
+        for (id, background) in expected {
+            assert_eq!(app.session_appearance(id).unwrap().background, background);
+        }
+    }
+
+    /// A theme whose background has an alpha of its own: the reported
+    /// alpha is the theme's times the opacity, as the view draws it.
+    #[test]
+    fn session_background_alpha_includes_the_themes_alpha() {
+        let config = background_config();
+        let app = App::new(config.clone(), ConfigPaths::new("/nonexistent/tessera"));
+        let plain = attach_fake_profile(&app, None);
+        let mut colours = bundled("Dracula");
+        colours.background = colours.background.with_alpha(0x80);
+        app.apply_config(&config, &colours);
+        let look = app.session_appearance(plain).unwrap();
+        let alpha = 128.0 / 255.0 * 0.5;
+        assert!((look.background[3] - alpha).abs() < 1e-6, "{look:?}");
+        assert_eq!(
+            look.background[..3],
+            background_of(colours.background, 0.0)[..3]
+        );
+    }
+
+    /// D3 (ADR 0043 amendment): a background the program sets (OSC 11)
+    /// changes what the view draws but not the reported background, which
+    /// is the configured one; the program's reset leaves it as it was.
+    #[test]
+    fn an_osc_11_background_is_not_followed() {
+        let app = App::new(
+            background_config(),
+            ConfigPaths::new("/nonexistent/tessera"),
+        );
+        let plain = attach_fake_profile(&app, None);
+        let before = app.session_appearance(plain).unwrap();
+        app.feed_for_test(plain, b"\x1b]11;#ff0000\x07").unwrap();
+        assert_eq!(
+            app.with_terminal(plain, |term| term.color_overrides().bg)
+                .unwrap(),
+            Some(tessera_term::Rgb::new(0xff, 0, 0)),
+            "the program's colour took"
+        );
+        assert_eq!(app.session_appearance(plain).unwrap(), before);
+        app.feed_for_test(plain, b"\x1b]111\x07").unwrap();
+        assert_eq!(app.session_appearance(plain).unwrap(), before);
+    }
+
+    /// #388 done-when 2: an apply that changes a session's background (its
+    /// profile's theme or opacity, or `[appearance]`'s) tells the observer
+    /// exactly once, however many sessions it changes, also for sessions
+    /// with no view; an apply that changes nothing tells it nothing.
+    #[test]
+    fn a_background_change_tells_the_observer_once_and_no_change_never() {
+        let mut config = background_config();
+        let app = App::new(config.clone(), ConfigPaths::new("/nonexistent/tessera"));
+        let dracula = bundled("Dracula");
+        app.apply_config(&config, &dracula);
+        let recorder = Recorder::default();
+        app.set_observer(Some(Box::new(recorder.clone())));
+        let plain = attach_fake_profile(&app, None);
+        let other = attach_fake_profile(&app, None);
+        let nord = attach_fake_profile(&app, Some("nord"));
+
+        app.apply_config(&config, &dracula);
+        assert_eq!(recorder.take(), Vec::<bool>::new(), "unchanged");
+
+        // The `nord` profile's theme: only a session with no view changes.
+        config.profiles[0].appearance.as_mut().unwrap().theme = Some("Gruvbox Dark".into());
+        app.apply_config(&config, &dracula);
+        assert_eq!(recorder.take(), [false], "told once");
+        assert_eq!(
+            app.session_appearance(nord).unwrap().background,
+            background_of(bundled("Gruvbox Dark").background, 0.8)
+        );
+        app.apply_config(&config, &dracula);
+        assert_eq!(recorder.take(), Vec::<bool>::new(), "unchanged again");
+
+        // The profile's opacity alone.
+        config.profiles[0].appearance.as_mut().unwrap().opacity = Some(0.6);
+        app.apply_config(&config, &dracula);
+        assert_eq!(recorder.take(), [false], "told once");
+        assert!((app.session_appearance(nord).unwrap().background[3] - 0.6).abs() < 1e-6);
+
+        // `[appearance]`'s opacity: two sessions change, one call.
+        config.appearance.opacity = 0.7;
+        app.apply_config(&config, &dracula);
+        assert_eq!(recorder.take(), [false], "one call for both sessions");
+        for id in [plain, other] {
+            assert!((app.session_appearance(id).unwrap().background[3] - 0.7).abs() < 1e-6);
+        }
+
+        // `[appearance]`'s theme.
+        let nord_colours = bundled("Nord");
+        config.appearance.theme = "Nord".into();
+        app.apply_config(&config, &nord_colours);
+        assert_eq!(recorder.take(), [false], "told once");
+        assert_eq!(
+            app.session_appearance(plain).unwrap().background,
+            background_of(nord_colours.background, 0.7)
+        );
+        app.apply_config(&config, &nord_colours);
+        assert_eq!(recorder.take(), Vec::<bool>::new(), "unchanged");
+    }
+
+    /// The same through the watch: a profile's theme file edited on disk
+    /// (`ThemesChanged`, the `[appearance]` theme unchanged) tells the
+    /// observer once and reports the new colour, for a session with no
+    /// view; looking again with nothing changed tells it nothing.
+    #[test]
+    fn a_profile_theme_file_edit_tells_the_observer_once() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(root.path());
+        std::fs::create_dir_all(paths.themes_dir()).unwrap();
+        let file = paths.themes_dir().join("ocean.toml");
+        std::fs::write(&file, theme_doc("Ocean", "#102030")).unwrap();
+        std::fs::write(
+            paths.config_file(),
+            "[[profiles]]\nname = \"sea\"\n[profiles.appearance]\ntheme = \"ocean\"\n",
+        )
+        .unwrap();
+        let store = ConfigStore::open(paths.clone()).unwrap();
+        let app = App::new((*store.config()).clone(), paths.clone());
+        let recorder = Recorder::default();
+        app.set_observer(Some(Box::new(recorder.clone())));
+        let sea = attach_fake_profile(&app, Some("sea"));
+        let colour = |hex: &str| background_of(hex.parse().unwrap(), 1.0);
+        assert_eq!(
+            app.session_appearance(sea).unwrap().background,
+            colour("#102030")
+        );
+        let live = app.live();
+        live.handle(&store, ConfigEvent::ThemesChanged);
+        assert_eq!(recorder.take(), Vec::<bool>::new(), "nothing changed");
+
+        std::fs::write(&file, theme_doc("Ocean", "#405060")).unwrap();
+        live.handle(&store, ConfigEvent::ThemesChanged);
+        assert_eq!(recorder.take(), [true], "told once");
+        assert_eq!(
+            app.session_appearance(sea).unwrap().background,
+            colour("#405060")
+        );
+    }
+
+    /// #390 (ADR 0045): `App::blur_radius` is `[appearance] blur_radius`
+    /// in effect; a reload that changes it alone tells the observer once
+    /// (`on_appearance_changed`, the host's cue to blur its windows
+    /// again), one that keeps it tells it nothing, and display options
+    /// leave it alone.
+    #[test]
+    fn a_blur_radius_change_tells_the_observer_once() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(root.path());
+        std::fs::write(
+            paths.config_file(),
+            "[appearance]\nopacity = 0.5\nblur = true\n",
+        )
+        .unwrap();
+        let store = ConfigStore::open(paths.clone()).unwrap();
+        let app = App::new((*store.config()).clone(), paths.clone());
+        assert_eq!(app.blur_radius(), 0);
+        let recorder = Recorder::default();
+        app.set_observer(Some(Box::new(recorder.clone())));
+        let id = attach_fake_profile(&app, None);
+        let before = app.session_appearance(id).unwrap();
+        let live = app.live();
+
+        let reload = |text: &str| {
+            std::fs::write(paths.config_file(), text).unwrap();
+            store.reload().unwrap();
+            live.handle(
+                &store,
+                ConfigEvent::Changed(tessera_config::ConfigChanged {
+                    config: store.config(),
+                    warnings: Vec::new(),
+                }),
+            );
+        };
+        reload("[appearance]\nopacity = 0.5\nblur = true\nblur_radius = 20\n");
+        assert_eq!(app.blur_radius(), 20);
+        assert_eq!(recorder.take(), [false], "told once");
+        assert_eq!(
+            app.session_appearance(id).unwrap(),
+            before,
+            "no session changed"
+        );
+        reload("[appearance]\nopacity = 0.5\nblur = true\nblur_radius = 20\n# edited\n");
+        assert_eq!(recorder.take(), Vec::<bool>::new(), "unchanged");
+        reload("[appearance]\nopacity = 0.5\nblur = true\nblur_radius = 900\n");
+        assert_eq!(app.blur_radius(), 64, "clamped");
+        assert_eq!(recorder.take(), [false]);
+        app.set_display_options(REDUCE);
+        assert_eq!(app.blur_radius(), 64, "the configured radius");
+        recorder.take();
+        reload("[appearance]\nopacity = 0.5\nblur = true\n");
+        assert_eq!(app.blur_radius(), 0);
+        assert_eq!(recorder.take(), [true], "told once, opaque under REDUCE");
+        // A profile cannot change it.
+        reload(
+            "[appearance]\nblur_radius = 8\n[[profiles]]\nname = \"p\"\n\
+             [profiles.appearance]\nblur_radius = 30\n",
+        );
+        assert_eq!(app.blur_radius(), 8);
     }
 }

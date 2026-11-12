@@ -3,7 +3,9 @@
 //! `reduce_transparency` makes every session opaque and unblurred, tells
 //! the host through `on_appearance_changed`, and is undone by turning it
 //! off (ADR 0043); `increase_contrast` turns pane dimming off until it is
-//! turned off (ADR 0041).
+//! turned off (ADR 0041). The reported background is the profile's
+//! configured theme at its opacity (#388), and `tessera_app_blur_radius`
+//! the clamped `[appearance] blur_radius` (ADR 0045).
 //!
 //! A binary of its own: it points `TESSERA_CONFIG_DIR` at a configuration
 //! of its own, which no other test may see.
@@ -18,10 +20,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use tessera_ffi::{
-    App, Callbacks, DisplayOptions, Error, SessionAppearance, SpawnOptions,
-    tessera_app_dim_inactive_panes, tessera_app_free, tessera_app_new, tessera_app_set_callbacks,
-    tessera_app_set_display_options, tessera_session_appearance, tessera_session_close,
-    tessera_session_spawn,
+    App, Callbacks, DisplayOptions, Error, Rgba, SessionAppearance, SpawnOptions,
+    tessera_app_blur_radius, tessera_app_dim_inactive_panes, tessera_app_free, tessera_app_new,
+    tessera_app_set_callbacks, tessera_app_set_display_options, tessera_session_appearance,
+    tessera_session_close, tessera_session_spawn,
 };
 
 /// `on_appearance_changed` runs on the calling thread before
@@ -34,6 +36,7 @@ const CONFIG: &str = "[appearance]\n\
                       opacity = 0.5\n\
                       blur = true\n\
                       dim_inactive_panes = 0.4\n\
+                      blur_radius = 99\n\
                       [[profiles]]\n\
                       name = \"solid\"\n\
                       [profiles.appearance]\n\
@@ -41,7 +44,12 @@ const CONFIG: &str = "[appearance]\n\
                       [[profiles]]\n\
                       name = \"clear\"\n\
                       [profiles.appearance]\n\
-                      blur = false\n";
+                      blur = false\n\
+                      [[profiles]]\n\
+                      name = \"nord\"\n\
+                      [profiles.appearance]\n\
+                      theme = \"Nord\"\n\
+                      opacity = 0.8\n";
 
 unsafe extern "C" fn on_appearance(user_data: *mut c_void, opaque: bool) {
     // SAFETY: `user_data` is the `Sender` installed below, alive until the
@@ -91,17 +99,51 @@ fn spawn(app: *mut App, profile: &CStr) -> u64 {
     id
 }
 
-fn appearance(app: *mut App, id: u64) -> (bool, bool) {
-    let mut out = SessionAppearance {
-        opaque: false,
-        blur: true,
-    };
+/// Not what any call reports: a failed call must overwrite it.
+const GARBAGE: SessionAppearance = SessionAppearance {
+    opaque: false,
+    blur: true,
+    background: Rgba {
+        r: 0.25,
+        g: 0.5,
+        b: 0.75,
+        a: 0.125,
+    },
+};
+
+/// The opaque black a failed call reports.
+const OPAQUE_BLACK: Rgba = Rgba {
+    r: 0.0,
+    g: 0.0,
+    b: 0.0,
+    a: 1.0,
+};
+
+fn look(app: *mut App, id: u64) -> SessionAppearance {
+    let mut out = GARBAGE;
     // SAFETY: live handle; `out` is writable.
     assert_eq!(
         unsafe { tessera_session_appearance(app, id, &raw mut out) },
         Error::Ok
     );
+    out
+}
+
+fn appearance(app: *mut App, id: u64) -> (bool, bool) {
+    let out = look(app, id);
     (out.opaque, out.blur)
+}
+
+/// A bundled theme's background as `TesseraRgba` reports it, at `alpha`.
+fn theme_background(theme: &str, alpha: f32) -> Rgba {
+    let colour = tessera_config::Theme::bundled(theme).unwrap().background;
+    let unit = |byte: u8| f32::from(byte) / 255.0;
+    Rgba {
+        r: unit(colour.r),
+        g: unit(colour.g),
+        b: unit(colour.b),
+        a: alpha,
+    }
 }
 
 fn set_reduce(app: *mut App, reduce_transparency: bool) {
@@ -178,6 +220,78 @@ fn reduce_transparency_makes_every_session_opaque_until_turned_off() {
     // SAFETY: live handle and sessions; freed once.
     unsafe {
         for id in [base, solid, clear] {
+            assert_eq!(tessera_session_close(app, id), Error::Ok);
+        }
+        tessera_app_free(app);
+    }
+}
+
+#[test]
+fn the_appearance_struct_appends_the_background_as_four_floats() {
+    // The C layout: the two flags, padding to the floats' alignment, then
+    // red, green, blue and alpha.
+    assert_eq!(std::mem::size_of::<Rgba>(), 16);
+    assert_eq!(std::mem::align_of::<Rgba>(), 4);
+    assert_eq!(std::mem::offset_of!(Rgba, r), 0);
+    assert_eq!(std::mem::offset_of!(Rgba, g), 4);
+    assert_eq!(std::mem::offset_of!(Rgba, b), 8);
+    assert_eq!(std::mem::offset_of!(Rgba, a), 12);
+    assert_eq!(std::mem::offset_of!(SessionAppearance, opaque), 0);
+    assert_eq!(std::mem::offset_of!(SessionAppearance, blur), 1);
+    assert_eq!(std::mem::offset_of!(SessionAppearance, background), 4);
+    assert_eq!(std::mem::size_of::<SessionAppearance>(), 20);
+}
+
+/// #388: each session's background is its profile's configured theme at
+/// its opacity, alpha 1.0 under Reduce Transparency (a program's OSC 11
+/// is not followed: `an_osc_11_background_is_not_followed` in
+/// tessera-app-core). ADR 0045: the radius is the configured one,
+/// clamped, whatever the display options.
+#[test]
+fn the_background_is_the_configured_theme_and_the_radius_is_clamped() {
+    common::isolate_home();
+    let dir = common::hermetic_config_dir();
+    std::fs::write(dir.join("config.toml"), CONFIG).unwrap();
+    let mut app = ptr::null_mut();
+    // SAFETY: `app` is writable storage for one pointer.
+    assert_eq!(unsafe { tessera_app_new(&raw mut app) }, Error::Ok);
+    let base = spawn(app, c"no-such-profile");
+    let solid = spawn(app, c"solid");
+    let nord = spawn(app, c"nord");
+    let expected = [
+        (base, theme_background("Dracula", 0.5)),
+        (solid, theme_background("Dracula", 1.0)),
+        (nord, theme_background("Nord", 0.8)),
+    ];
+    for (id, background) in expected {
+        assert_eq!(look(app, id).background, background, "session {id}");
+    }
+    let radius = || {
+        let mut out = 7u32;
+        // SAFETY: live handle; `out` is writable.
+        assert_eq!(
+            unsafe { tessera_app_blur_radius(app, &raw mut out) },
+            Error::Ok
+        );
+        out
+    };
+    assert_eq!(radius(), 64, "99 clamped");
+
+    set_reduce(app, true);
+    for (id, background) in expected {
+        let Rgba { r, g, b, .. } = background;
+        assert_eq!(look(app, id).background, Rgba { r, g, b, a: 1.0 });
+    }
+    assert_eq!(
+        radius(),
+        64,
+        "the configured radius under Reduce Transparency"
+    );
+    set_reduce(app, false);
+
+    // SAFETY: live handle and sessions; freed once.
+    unsafe {
+        for id in [base, solid, nord] {
             assert_eq!(tessera_session_close(app, id), Error::Ok);
         }
         tessera_app_free(app);
@@ -292,10 +406,8 @@ fn null_pointers_and_unknown_sessions_fail_opaque() {
     // SAFETY: `app` is writable storage for one pointer.
     assert_eq!(unsafe { tessera_app_new(&raw mut app) }, Error::Ok);
     let options = DisplayOptions::default();
-    let mut out = SessionAppearance {
-        opaque: false,
-        blur: true,
-    };
+    let mut out = GARBAGE;
+    let mut radius = 7u32;
     // SAFETY: NULL pointers are part of the contract; `app` is live.
     unsafe {
         assert_eq!(
@@ -311,14 +423,26 @@ fn null_pointers_and_unknown_sessions_fail_opaque() {
             Error::NullPointer
         );
         assert_eq!((out.opaque, out.blur), (true, false), "reset on failure");
-        out.opaque = false;
+        assert_eq!(out.background, OPAQUE_BLACK, "reset on failure");
+        out = GARBAGE;
         assert_eq!(
             tessera_session_appearance(app, 9999, &raw mut out),
             Error::SessionNotFound
         );
         assert_eq!((out.opaque, out.blur), (true, false), "reset on failure");
+        assert_eq!(out.background, OPAQUE_BLACK, "reset on failure");
+        assert_eq!(out, SessionAppearance::default());
         assert_eq!(
             tessera_session_appearance(app, 1, ptr::null_mut()),
+            Error::NullPointer
+        );
+        assert_eq!(
+            tessera_app_blur_radius(ptr::null(), &raw mut radius),
+            Error::NullPointer
+        );
+        assert_eq!(radius, 0, "reset on failure");
+        assert_eq!(
+            tessera_app_blur_radius(app, ptr::null_mut()),
             Error::NullPointer
         );
         tessera_app_free(app);
