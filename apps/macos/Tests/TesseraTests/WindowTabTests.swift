@@ -100,7 +100,8 @@ final class WindowTabTests: XCTestCase {
         for (controller, view) in zip(controllers, views) {
             let window = try XCTUnwrap(controller.window)
             let id = controller.focusedPane.session.id
-            XCTAssertEqual(view.backgroundAppearance, .init(opaque: true, blur: false), "tab \(id) read its session")
+            XCTAssertEqual(
+                view.backgroundAppearance.map { [$0.opaque, $0.blur] }, [true, false], "tab \(id) read its session")
             XCTAssertTrue(window.isOpaque, "tab \(id) follows its opaque session, not the flag")
             XCTAssertFalse(view.isDisplayLinkPaused, "tab \(id) redraws")
             view.displayLinkDidFire()

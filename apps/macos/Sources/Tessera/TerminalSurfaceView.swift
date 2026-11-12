@@ -579,6 +579,15 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         layoutRenderViewAndScroller()
         layoutFindBar()
         surfaceSizeChanged()
+        enclosingPaneContainer?.paneFrameDidChange()
+    }
+
+    // Both hooks: `setFrame` calls both, so either would do for a split
+    // view's layout, but AppKit may move a view without resizing it (or the
+    // reverse) through the other alone; the strip's tint is cheap to redo.
+    override func setFrameOrigin(_ newOrigin: NSPoint) {
+        super.setFrameOrigin(newOrigin)
+        enclosingPaneContainer?.paneFrameDidChange()
     }
 
     override func layout() {

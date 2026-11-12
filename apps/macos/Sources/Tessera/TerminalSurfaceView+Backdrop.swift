@@ -5,7 +5,10 @@ import TesseraKit
 /// draws each session's background at its profile's opacity, and a pane
 /// whose session asks for blur gets a ``PaneBackdropView`` under its render
 /// view, which blurs what is behind the window there. A window is opaque
-/// only while every pane of its tab is (E7); the core forces every pane
+/// only while every pane of its tab is, a pane hidden behind a maximized
+/// one included (E7): so a hidden translucent pane keeps the window, and
+/// with it the blurred strip under the title bar, translucent, which keeps
+/// a maximize from changing the window. The core forces every pane
 /// opaque and unblurred while the system's Reduce Transparency is on (E8,
 /// ``AppDelegate/applyDisplayOptions()``).
 ///
@@ -20,6 +23,16 @@ extension TerminalSurfaceView {
     var isBackgroundOpaque: Bool {
         guard surface.isAttached, let backgroundAppearance else { return true }
         return backgroundAppearance.opaque
+    }
+
+    /// The tint of the strip above this pane in a translucent window
+    /// (#388): its session's configured background at its alpha, as last
+    /// read; `nil` without a surface (the pane draws nothing either).
+    var stripTint: CGColor? {
+        guard surface.isAttached, let color = backgroundAppearance?.background else { return nil }
+        return CGColor(
+            srgbRed: CGFloat(color.red), green: CGFloat(color.green), blue: CGFloat(color.blue),
+            alpha: CGFloat(color.alpha))
     }
 
     /// Reads the session's appearance, shows or removes the blur under the
@@ -82,8 +95,10 @@ extension TerminalSurfaceView {
 /// `.fullScreenUI` material (`.underWindowBackground` gave the theme's
 /// colours a grey cast; `.popover` is the alternative); active whether or
 /// not the window is key, so the pane does not change when the focus moves
-/// to another window. It fills the pane and takes no clicks, the pointer or
-/// accessibility.
+/// to another window. It fills the pane it blurs, or the strip above the
+/// panes, and takes no clicks, the pointer or accessibility. Its material is
+/// a constant the tests pin; whether it looks right (dark and light system
+/// appearance, a dark theme at 0.7 and 0.5 opacity) is an eye check.
 @MainActor
 final class PaneBackdropView: NSVisualEffectView {
     override init(frame: NSRect) {

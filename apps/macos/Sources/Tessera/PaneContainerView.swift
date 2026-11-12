@@ -394,6 +394,24 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
         (superview as? TerminalWindowContentView)?.updateTitlebar(translucent: !opaque)
     }
 
+    /// The panes shown at the top of this view, with their frames: those
+    /// whose top edge is this view's (all but the maximized one are hidden
+    /// while one is). Their sessions' backgrounds tint the strip above them
+    /// in a translucent window (``TerminalWindowContentView``, #388). A pane
+    /// with no visible width is passed over.
+    var topEdgePanes: [(leaf: Pane, frame: CGRect)] {
+        if let zoomedPane {
+            return [(zoomedPane, convert(zoomedPane.view.bounds, from: zoomedPane.view))]
+        }
+        return paneFrames.filter { $0.frame.minY <= bounds.minY + 0.5 && $0.frame.width >= 1 }
+    }
+
+    /// A pane moved or was resized (a split, a divider, a window resize, a
+    /// maximize): the strip's tint follows the panes at the top.
+    func paneFrameDidChange() {
+        (superview as? TerminalWindowContentView)?.updateTitlebarTint()
+    }
+
     /// The pane next to `pane` toward `direction`, as laid out now, or `nil`
     /// at the edge of the tab. A pane with no visible size is passed over.
     func neighbour(of pane: Pane, toward direction: PaneDirection) -> Pane? {
