@@ -2097,6 +2097,7 @@ extension PaneTests {
         // Timer (not the main queue, whose blocks would wait for it, nor
         // the test's task), in a pool of its own: the test's would keep
         // what the drag autoreleases, the closed pane's view with it.
+        var freedAtTheDragsEnd = false
         let downDriver = DragDriver()
         downDriver.onTick = { [unowned downDriver] in
             autoreleasepool {
@@ -2109,6 +2110,9 @@ extension PaneTests {
                     downDriver.failure = "the press was not queued"
                 }
             }
+            // Before any block the run loop runs later: what #399's end of
+            // a drag cut short schedules keeps nothing alive.
+            freedAtTheDragsEnd = closingView == nil
             downDriver.step = 3
         }
         RunLoop.main.add(
@@ -2144,6 +2148,7 @@ extension PaneTests {
         try? await waitUntil("the closed pane is freed", timeout: .seconds(5)) { closing == nil && closingView == nil }
         XCTAssertNil(closing, "pane")
         XCTAssertNil(closingView, "view")
+        XCTAssertTrue(freedAtTheDragsEnd, "the view was freed as the drag ended")
     }
 
     /// Presses on the divider at `x` (in `container`'s coordinates), as
@@ -2347,6 +2352,24 @@ extension PaneTests {
         XCTAssertLessThanOrEqual(right.view.frame.width, minimum + 1, "and went that far")
     }
 
+    /// The per-step clamp of a divider drag when the split view is too
+    /// small for both sides' smallest sizes (#399): AppKit's proposed
+    /// position stands, not either limit.
+    func testADividerDragStepWithoutRoomForBothSidesKeepsAppKitsPosition() throws {
+        let controller = try openTab()
+        let left = controller.focusedPane
+        _ = try split(controller, .right)
+        let container = controller.paneContainer
+        let outer = try XCTUnwrap(container.subviews.first as? PaneSplitView)
+        outer.frame.size.width = PaneContainerView.minimumSize(of: left.view).width
+        outer.adjustSubviews()
+        let lower = container.splitView(outer, constrainMinCoordinate: -.infinity, ofSubviewAt: 0)
+        let upper = container.splitView(outer, constrainMaxCoordinate: .infinity, ofSubviewAt: 0)
+        XCTAssertGreaterThan(lower, upper, "no room for both")
+        let proposed = (lower + upper) / 2 + 3
+        XCTAssertEqual(container.splitView(outer, constrainSplitPosition: proposed, ofSubviewAt: 0), proposed)
+    }
+
     /// An exception in AppKit ending a divider drag after a pane's shell
     /// exited during it (#379): ``PaneContainerView/dividerDragDidEnd(_:)``
     /// is skipped, and the run loop's default mode builds the split views
@@ -2394,8 +2417,8 @@ extension PaneTests {
     /// The run loop's event-tracking mode with no drag tracking (#379),
     /// after an exception in AppKit ended one with nothing put off: a split
     /// outside that mode builds its split views at once, and a pane's shell
-    /// exiting inside it (a menu open, a window's live resize) waits for
-    /// the default mode, which drops the pane's view.
+    /// exiting inside it (a menu open, a window's live resize) drops the
+    /// pane's view, since the default mode ended the drag (#399).
     func testOnlyTheTrackingLoopPutsARebuildOff() async throws {
         weak var closingView: TerminalSurfaceView?
         let (controller, left, right) = try autoreleasepool {
@@ -2447,6 +2470,120 @@ extension PaneTests {
         XCTAssertEqual(splitViews(in: container), 1, "no stale split view")
         XCTAssertTrue(controller.toggleZoom(), "zoom works again")
         XCTAssertTrue(controller.toggleZoom())
+    }
+
+    /// A divider drag that an exception in AppKit ends after a pane's
+    /// shell exited during it, and that moved on after the close (#399):
+    /// the run loop's default mode ends it as
+    /// ``PaneContainerView/dividerDragDidEnd(_:)`` would, so the share its
+    /// last steps left, which the split views built before the close could
+    /// not map to the tree, is the split's ratio.
+    func testADividerDragEndedByAnExceptionKeepsTheRatioOfItsLastSteps() async throws {
+        weak var closingView: TerminalSurfaceView?
+        let (controller, left, topRight, closing) = try autoreleasepool {
+            let controller = try openTab()
+            let left = controller.focusedPane
+            let topRight = try split(controller, .right)
+            let bottomRight = try split(controller, .below)
+            closingView = bottomRight.view
+            return (controller, left, topRight, bottomRight)
+        }
+        try skipUnlessAttached(controller)
+        let container = controller.paneContainer
+        let start = autoreleasepool { frame(of: left, in: controller).maxX + 0.5 }
+        try await trackDividerDragUntilAnException(
+            at: start, in: container, window: try XCTUnwrap(controller.window),
+            steps: [
+                { post in
+                    for step in 1...5 { post(.leftMouseDragged, start - CGFloat(10 * step)) }
+                    return true
+                },
+                { _ in
+                    guard self.frame(of: left, in: controller).maxX < start - 25 else { return false }
+                    try? closing.session.write(Array("exit\n".utf8))
+                    return true
+                },
+                { post in
+                    guard controller.panes.count == 2 else { return false }
+                    for step in 6...15 { post(.leftMouseDragged, start - CGFloat(10 * step)) }
+                    return true
+                },
+                { _ in abs(self.frame(of: left, in: controller).maxX - (start - 150.5)) < 1 },
+            ])
+        try await waitUntil("the closed pane's view leaves the tab") { closingView?.window == nil }
+        XCTAssertEqual(controller.panes, [left, topRight])
+        let width = frame(of: left, in: controller).maxX
+        XCTAssertEqual(width, start - 150.5, accuracy: 1, "the divider is where the drag's last step left it")
+        let space = container.bounds.width - PaneSplitView.thickness
+        XCTAssertEqual(container.tree.root.splits[0].ratio * space, width, accuracy: 1, "the tree keeps it")
+    }
+
+    /// A divider drag that an exception in AppKit ends with nothing put
+    /// off (#399): the run loop's default mode still ends it, so no drag
+    /// reads as tracking in the event-tracking mode afterwards (a menu, a
+    /// window's live resize), and the drag's ratio is saved.
+    func testADividerDragEndedByAnExceptionWithNothingPutOffStillEnds() async throws {
+        let (controller, left) = try autoreleasepool {
+            let controller = try openTab()
+            let left = controller.focusedPane
+            _ = try split(controller, .right)
+            return (controller, left)
+        }
+        try skipUnlessAttached(controller)
+        let proxy = PaneHostProxy(app: appDelegate)
+        controller.delegate = proxy
+        defer { controller.delegate = appDelegate }
+        let container = controller.paneContainer
+        let start = autoreleasepool { frame(of: left, in: controller).maxX + 0.5 }
+        try await trackDividerDragUntilAnException(
+            at: start, in: container, window: try XCTUnwrap(controller.window),
+            steps: [
+                { post in
+                    for step in 1...5 { post(.leftMouseDragged, start - CGFloat(10 * step)) }
+                    return true
+                },
+                { _ in self.frame(of: left, in: controller).maxX < start - 25 },
+            ])
+        XCTAssertFalse(isTrackingDividerDragInEventTrackingMode(container), "the drag ended")
+        XCTAssertEqual(proxy.layoutChanges, 1, "its ratio is saved")
+    }
+
+    /// A divider drag that an exception in AppKit ends leaves the panes'
+    /// views in AppKit's live resize, which AppKit does not end (#399): the
+    /// run loop's default mode ends it for them, so a later window resize
+    /// reaches the core at once and moves the gutter's tool-tip rects.
+    func testADividerDragEndedByAnExceptionEndsThePanesLiveResize() async throws {
+        let (controller, left, right) = try autoreleasepool {
+            let controller = try openTab()
+            let left = controller.focusedPane
+            return (controller, left, try split(controller, .right))
+        }
+        try skipUnlessAttached(controller)
+        let container = controller.paneContainer
+        let window = try XCTUnwrap(controller.window)
+        let start = autoreleasepool { frame(of: left, in: controller).maxX + 0.5 }
+        try await trackDividerDragUntilAnException(
+            at: start, in: container, window: window,
+            steps: [
+                { post in
+                    for step in 1...5 { post(.leftMouseDragged, start - CGFloat(10 * step)) }
+                    XCTAssertTrue(left.view.isLiveResizing, "the drag is a live resize")
+                    return true
+                },
+                { _ in self.frame(of: left, in: controller).maxX < start - 25 },
+            ])
+        try? await waitUntil("the live resize ends", timeout: .seconds(2)) {
+            !left.view.isLiveResizing && !right.view.isLiveResizing
+        }
+        XCTAssertFalse(left.view.isLiveResizing)
+        XCTAssertFalse(right.view.isLiveResizing)
+        let height = window.contentLayoutRect.height
+        window.setContentSize(NSSize(width: window.contentLayoutRect.width, height: height - 120))
+        for view in [left.view, right.view] {
+            XCTAssertLessThan(view.bounds.height, height - 100, "the window shrank the pane")
+            XCTAssertEqual(view.surface.size, view.pixelSize, "the core has the new size at once")
+            XCTAssertEqual(view.gutterToolTips.layout?.height, view.bounds.height, "the tool tips follow it")
+        }
     }
 
     /// Presses on the divider at `x` as ``trackDividerDrag(at:in:window:steps:)``

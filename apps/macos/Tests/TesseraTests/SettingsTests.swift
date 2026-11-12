@@ -38,6 +38,8 @@ final class SettingsTests: XCTestCase {
         if let previous { setenv("TESSERA_CONFIG_DIR", previous, 1) } else { unsetenv("TESSERA_CONFIG_DIR") }
         if let dir { try? FileManager.default.removeItem(at: dir) }
         sources = []
+        appDelegate.opener = WorkspaceOpener()
+        appDelegate.configFileCreator = nil
         appDelegate = nil
     }
 
@@ -1008,6 +1010,89 @@ final class SettingsTests: XCTestCase {
         print("SETTINGS-OPEN-TIMINGS: warm-up \(warmUp); \(timings); best 1 MiB \(bestLarge), best minimal \(bestMinimal)")
         XCTAssertLessThanOrEqual(ratio, 2.75, timings)
         XCTAssertLessThan(bestLarge, .seconds(1), timings)
+    }
+
+    // MARK: Open config.toml (Advanced)
+
+    /// What the stand-in for the core's `createConfig()` returns; nothing
+    /// is written there.
+    private let createdConfigFile = URL(fileURLWithPath: "/nonexistent/tessera-tests/config.toml")
+
+    /// Gives the app a recording opener and a stand-in `createConfig()` (it
+    /// would create the configuration directory and watch it); `events`
+    /// gets "create" and "open <path>", in order.
+    private func record(_ opener: RecordingOpener, events: @escaping (String) -> Void) {
+        appDelegate.opener = opener
+        appDelegate.configFileCreator = { [createdConfigFile] in
+            events("create")
+            return createdConfigFile
+        }
+        opener.onOpen = { file in events("open \(file.path)") }
+    }
+
+    /// The actions the Settings window's Advanced pane was built with, read
+    /// out of its hosted view: what its Open config.toml button calls.
+    /// `nil` when SwiftUI's view storage hides them from `Mirror`.
+    private func advancedPaneActions(in controller: SettingsWindowController) throws -> SettingsActions? {
+        let tabs = try XCTUnwrap(controller.tabs)
+        let item = try XCTUnwrap(tabs.tabViewItems.first { ($0.identifier as? String) == "advanced" })
+        let hosting = try XCTUnwrap(item.viewController as? NSHostingController<AnyView>)
+        // Depth-bounded: no cycle in a value's reflection can loop.
+        func find(_ value: Any, depth: Int) -> SettingsActions? {
+            if let actions = value as? SettingsActions { return actions }
+            guard depth < 8 else { return nil }
+            for child in Mirror(reflecting: value).children {
+                if let found = find(child.value, depth: depth + 1) { return found }
+            }
+            return nil
+        }
+        return find(hosting.rootView, depth: 0)
+    }
+
+    func testTheAdvancedPanesOpenConfigFileIsTheAppsOpenConfigFile() throws {
+        try openSettings(config: "")
+        let controller = try XCTUnwrap(appDelegate.settingsWindowController)
+        guard let actions = try advancedPaneActions(in: controller) else {
+            throw XCTSkip("SwiftUI's AnyView storage is not reflectable here")
+        }
+        let opener = RecordingOpener()
+        var events: [String] = []
+        record(opener) { events.append($0) }
+        actions.openConfigFile()
+        XCTAssertEqual(events, ["create", "open \(createdConfigFile.path)"], "the app delegate's Open config.toml")
+    }
+
+    func testOpenConfigFileCreatesTheConfigFileThenOpensIt() throws {
+        let opener = RecordingOpener()
+        var events: [String] = []
+        record(opener) { events.append($0) }
+        appDelegate.openConfigFile(nil)
+        XCTAssertEqual(events, ["create", "open \(createdConfigFile.path)"], "created (if missing) before it is opened")
+        XCTAssertEqual(opener.opened, [createdConfigFile])
+        XCTAssertEqual(opener.revealed, [])
+        XCTAssertEqual(opener.urls, [])
+        appDelegate.openConfigFile(nil)
+        XCTAssertEqual(events.filter { $0 == "create" }.count, 2, "the core's createConfig() is idempotent")
+    }
+
+    func testOpenConfigFileShowsTheFileInFinderWhenNothingOpensIt() throws {
+        let opener = RecordingOpener()
+        opener.editor = nil
+        var events: [String] = []
+        record(opener) { events.append($0) }
+        appDelegate.openConfigFile(nil)
+        XCTAssertEqual(events, ["create"])
+        XCTAssertEqual(opener.opened, [])
+        XCTAssertEqual(opener.revealed, [createdConfigFile])
+    }
+
+    func testOpenConfigFileShowsTheFileInFinderWhenOpeningItFails() throws {
+        let opener = RecordingOpener()
+        opener.openError = CocoaError(.fileReadNoPermission)
+        record(opener) { _ in }
+        appDelegate.openConfigFile(nil)
+        XCTAssertEqual(opener.opened, [createdConfigFile])
+        XCTAssertEqual(opener.revealed, [createdConfigFile], "after the failed open")
     }
 }
 

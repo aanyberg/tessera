@@ -49,14 +49,19 @@ struct PTYRecorder {
         return received
     }
 
-    /// Sends a sentinel key and returns everything received up to and
-    /// including it: what a test sent before is then known to be complete,
-    /// because the core writes a session's input in order.
-    func bytesThroughSentinel() async throws -> [UInt8] {
+    /// Sends a sentinel key and returns everything received before it: what
+    /// a test sent before is then known to be complete, because the core
+    /// writes a session's input in order.
+    ///
+    /// `expected` is the number of bytes the test sent before the sentinel.
+    /// The wait needs that count as well as the sentinel byte, because input
+    /// can itself end in `~` (Delete is `ESC [ 3 ~`): a wait for the last byte
+    /// alone stops at that `~` and drops the rest (#346).
+    func bytesThroughSentinel(expecting expected: Int) async throws -> [UInt8] {
         try session.send(key: .init(key: .char, codepoint: "~", text: "~"))
         let deadline = ContinuousClock.now + .seconds(5)
         var received = bytes()
-        while received.last != UInt8(ascii: "~"), ContinuousClock.now < deadline {
+        while received.count <= expected || received.last != UInt8(ascii: "~"), ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(10))
             received = bytes()
         }
@@ -125,7 +130,7 @@ final class SurfaceAndInputTests: XCTestCase {
             XCTAssertEqual(try session.send(key: event), .consumed, "\(event)")
             expected += bytes
         }
-        let received = try await pty.bytesThroughSentinel()
+        let received = try await pty.bytesThroughSentinel(expecting: expected.count)
         XCTAssertEqual(hex(received), hex(expected))
     }
 
@@ -136,7 +141,7 @@ final class SurfaceAndInputTests: XCTestCase {
         XCTAssertEqual(try session.send(key: .init(key: .char, codepoint: "a", kind: .release)), .ignored)
         // A text-only event whose text is a control character sends nothing.
         XCTAssertEqual(try session.send(key: .text("\u{1b}[31m")), .ignored)
-        let received = try await pty.bytesThroughSentinel()
+        let received = try await pty.bytesThroughSentinel(expecting: 0)
         XCTAssertEqual(received, [])
     }
 
@@ -218,15 +223,16 @@ final class SurfaceAndInputTests: XCTestCase {
         let pty = try await startRecorder()
         try pty.session.paste("a\nb\u{1b}[31mc\r\nd")
         try pty.session.paste("")
-        let received = try await pty.bytesThroughSentinel()
-        XCTAssertEqual(hex(received), hex(Array("a\rb[31mc\rd".utf8)))
+        let pasted = Array("a\rb[31mc\rd".utf8)
+        let received = try await pty.bytesThroughSentinel(expecting: pasted.count)
+        XCTAssertEqual(hex(received), hex(pasted))
     }
 
     func testFocusIsAcceptedAndSendsNothing() async throws {
         let pty = try await startRecorder()
         try pty.session.setFocused(true)
         try pty.session.setFocused(false)
-        let received = try await pty.bytesThroughSentinel()
+        let received = try await pty.bytesThroughSentinel(expecting: 0)
         XCTAssertEqual(received, [])
     }
 
@@ -241,7 +247,7 @@ final class SurfaceAndInputTests: XCTestCase {
         XCTAssertThrowsError(
             try session.send(mouse: .init(kind: .press, button: .left, col: 0, row: 0, xPx: .nan, yPx: 0))
         ) { XCTAssertEqual($0 as? TesseraCoreError, .invalidArgument) }
-        let received = try await pty.bytesThroughSentinel()
+        let received = try await pty.bytesThroughSentinel(expecting: 0)
         XCTAssertEqual(received, [], "mouse reporting is not on yet")
     }
 
