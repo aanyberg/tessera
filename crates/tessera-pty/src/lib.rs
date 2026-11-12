@@ -47,7 +47,7 @@ mod foreground;
 mod native;
 
 pub use foreground::{ForegroundProcess, MAX_FOREGROUND_NAME_BYTES};
-pub use native::{IoThreads, NativePty, WRITE_QUEUE_BYTES};
+pub use native::{IoThreads, NativePty, WRITE_QUEUE_BYTES, set_thread_start_hook};
 
 /// This machine's host name (`gethostname(3)`), or an empty string when it
 /// cannot be read or is not UTF-8. Read anew on every call: macOS changes

@@ -6,10 +6,11 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::BorrowedFd;
 use std::os::unix::process::ExitStatusExt;
+use std::panic;
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
 
 use nix::sys::signal::{self, Signal};
@@ -333,8 +334,36 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Starts a named thread running `body`. On failure `body` is dropped
-/// without running, as [`thread::Builder::spawn`] does.
+/// The hook [`set_thread_start_hook`] installed, if any.
+static THREAD_START_HOOK: OnceLock<fn()> = OnceLock::new();
+
+/// Installs `hook`, which every thread this crate starts (each PTY's
+/// `pty-reader-<pid>` and `pty-writer-<pid>`) runs first.
+///
+/// For thread attributes the caller sets per thread, such as the macOS
+/// quality-of-service class `tessera-ffi` gives session threads (ADR
+/// 0018). Process-wide; only the first hook is kept, and threads already
+/// running are not affected. `tessera_app_core::session::set_thread_start_hook`
+/// installs its hook here too. The hook runs once per thread start, never
+/// per read or write. A hook that panics is logged and the thread carries
+/// on. Returns whether `hook` was installed.
+pub fn set_thread_start_hook(hook: fn()) -> bool {
+    THREAD_START_HOOK.set(hook).is_ok()
+}
+
+/// Runs the hook [`set_thread_start_hook`] installed, if any. A panicking
+/// hook is logged (without its payload) and the thread carries on: a
+/// reader that died here would strand the child.
+fn run_thread_start_hook() {
+    if let Some(hook) = THREAD_START_HOOK.get()
+        && panic::catch_unwind(*hook).is_err()
+    {
+        tracing::error!("pty thread start hook panicked");
+    }
+}
+
+/// Starts a named thread that runs the start hook, then `body`. On failure
+/// `body` is dropped without running, as [`thread::Builder::spawn`] does.
 fn spawn_thread(
     name: String,
     step: fault::Step,
@@ -344,7 +373,10 @@ fn spawn_thread(
         drop(body);
         return Err(err);
     }
-    thread::Builder::new().name(name).spawn(body)
+    thread::Builder::new().name(name).spawn(move || {
+        run_thread_start_hook();
+        body();
+    })
 }
 
 /// Fraction of `ARG_MAX` withheld for what the kernel adds to the
