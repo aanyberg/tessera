@@ -121,8 +121,7 @@ pub fn import(options: &ImportOptions) -> Result<PathBuf, ThemeImportError> {
     })?;
     let stem = input
         .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .map_or_default(|s| s.to_string_lossy().into_owned());
     let imported = match format {
         Format::ITermColors => import_itermcolors(&bytes, &stem),
         Format::Base16 => {
@@ -151,8 +150,7 @@ pub fn import(options: &ImportOptions) -> Result<PathBuf, ThemeImportError> {
     let path = out.join(format!("{slug}.toml"));
     let file_name = input
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .map_or_default(|n| n.to_string_lossy().into_owned());
     let contents = theme_file(&theme, &file_name);
     let written = if options.force {
         tessera_config::write_atomic(&path, &contents)
