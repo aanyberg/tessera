@@ -34,6 +34,7 @@ a low-risk change.
 | Spawning the child: environment, fds, signals, foreground job | `tessera-pty`, `tessera-shell-integration` | S5, S7 |
 | Parsing and writing files: config, themes, imports. Settings write-back (ADR 0040) writes `config.toml` and `themes/` only through a new temporary file in the target's directory, renamed (or hard-linked, for a theme) only while the file is byte for byte what was read, through a symlink to its target, with the mode kept; a hard-linked, read-only or non-regular file is not written; every edit passes the lenient loader without a new warning first | `tessera-config` (`edit.rs`), `tessera-devtool`, the config exports in `tessera-ffi` (`config.rs`) | S3, S5, S7, S8 |
 | Terminal text for assistive clients (ADR 0041): the view's text, cursor and selection as an `AXTextArea`, announcements of new output | `tessera-app-core` (`accessibility.rs`), `tessera-ffi` (`accessibility.rs`), `apps/macos/Sources/Tessera/TerminalSurfaceView+Accessibility.swift` | S3, S5, S6, S8 |
+| The private WindowServer call `CGSSetWindowBackgroundBlurRadius`, resolved with `dlsym` (ADR 0045): its input is the clamped `blur_radius` (an integer, 0..=64, see "Current bounds") and a window number; no child-controlled data reaches it, and the log carries the radius only | `apps/macos` (`WindowBlurRadius.swift`) | S7, S8 |
 | Logging anywhere | all crates and the app | S8 |
 | New surfaces: links, control socket, plugins, images, triggers | ADR first | S9 |
 
@@ -60,7 +61,8 @@ a low-risk change.
   the counting test allocators in `crates/tessera-render/tests/alloc.rs`, `crates/tessera-grid/tests/reset.rs`,
   `crates/tessera-term/tests/osc8_alloc.rs`, `crates/tessera-term/tests/mouse_alloc.rs`,
   `crates/tessera-term/tests/screen_clears_alloc.rs` and
-  `crates/tessera-app-core/tests/keybindings.rs` are the exceptions (CONTRIBUTING.md). Every FFI export that can panic runs under `ffi_guard!` (`catch_unwind`);
+  `crates/tessera-app-core/tests/keybindings.rs` are the exceptions (CONTRIBUTING.md); `scripts/verify-branch.sh`
+  checks the rule mechanically from `scripts/unsafe-exceptions.txt`, which must list exactly these files. Every FFI export that can panic runs under `ffi_guard!` (`catch_unwind`);
   every pointer and length argument is checked; sessions cross the boundary as ids, never pointers.
 - **S8. No terminal content in logs.** Logs carry lengths, ids, parameters and paths, never output, input, titles,
   clipboard text or environment values. Child-controlled bytes that must be logged are capped and escaped.

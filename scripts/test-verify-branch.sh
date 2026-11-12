@@ -91,6 +91,11 @@ package tessera-render lib.rs
 package tessera-devwin main.rs
 package tessera-config lib.rs
 package tessera-term lib.rs
+package tessera-grid lib.rs
+package tessera-pty lib.rs
+package tessera-ffi lib.rs
+mkdir -p scripts
+cp "$here/unsafe-exceptions.txt" scripts/unsafe-exceptions.txt
 git add -A
 git commit -qm 'chore: fixture'
 
@@ -143,6 +148,18 @@ change crates/tessera-config/README.md 'notes'
 change crates/tessera-term/src/lib.rs '// untimed change'
 commit
 
+# The real nextest line of #273: a package with two binaries in one alternative. Read from the repository's own config
+# so that a change to that line is exercised too.
+real_line="$(grep -F 'binary(watch_themes)' "$here/../.config/nextest.toml" | head -1)"
+case "$real_line" in
+    *'binary(reload)'*) ;;
+    *) printf 'FAIL .config/nextest.toml has no filter naming binary(watch_themes) and binary(reload)\n'; exit 1 ;;
+esac
+branch real-line
+printf '[[profile.default.overrides]]\n%s\ntest-group = "timing"\n' "$real_line" > .config/nextest.toml
+change crates/tessera-config/src/lib.rs '// untimed change'
+commit
+
 branch everything
 for b in app-core-lib render-golden render-helper devwin-bin term-devwin overrides; do
     git merge -q --no-edit "$b"
@@ -184,6 +201,7 @@ list test-only-untimed; expect 'untimed test-only change' "$header" --list-targe
 list term-devwin;       expect 'one alternative per package, each with its own suite (#192)' "$header${nl}tessera-devwin:bins${nl}tessera-term:decscusr${nl}tessera-term:lib" --list-targets
 list devwin-only;       expect 'a bin-only package named by an alternative is a bins target' "$header${nl}tessera-devwin:bins" --list-targets
 list overrides;         expect 'nextest overrides' "$header${nl}tessera-config:reload${nl}tessera-term:decscusr${nl}tessera-term:lib" --list-targets
+list real-line;         expect 'one target per binary of an alternative (#273)' "$header${nl}tessera-config:reload${nl}tessera-config:watch_themes" --list-targets
 list everything
 all="tessera-app-core:lib${nl}tessera-config:reload${nl}tessera-devwin:bins${nl}tessera-render:golden${nl}tessera-render:tests${nl}tessera-term:decscusr${nl}tessera-term:lib"
 expect 'every trigger' "$header${nl}$all" --list-targets
@@ -253,6 +271,124 @@ trailer_check 'a tip without trailers fails' bad-tip fail
 trailer_check 'an exact --session that the tip lacks fails' squashed-wip fail --session https://example.com/s/2
 trailer_check 'an exact --session the tip has passes (the lower wip commit warns)' squashed-wip pass+warn --session https://example.com/s/1 --coauthor 'Co-Authored-By: A <a@example.com>'
 trailer_check 'a single commit without trailers fails' app-core-lib fail
+
+# bodies and unsafe: the PASS/WARN/FAIL line of one check, through bash and zsh. --no-load skips the load check; the
+# fixture's gate fails (fake cargo) and is not looked at.
+trailers='Co-Authored-By: A <a@example.com>
+Claude-Session: https://example.com/s/1'
+line_check() { # <case> <branch> <check> <PASS|WARN|FAIL> <verify-branch args>...
+    name="$1" br="$2" check="$3" want="$4"
+    shift 4
+    git -C "$repo" switch -q "$br"
+    for runner in bash zsh; do
+        "$runner" "$script" "$repo" --no-load "$@" > "$work/line.log" 2>&1 || true
+        got="$(grep -E "^.{0,10}(PASS|WARN|FAIL).{0,10} $check( |:|\$)" "$work/line.log" | sed -E 's/^.*(PASS|WARN|FAIL).*/\1/' | tr '\n' ' ' || true)"
+        if [ "$got" = "$want " ]; then ok "$name ($runner)"; else not_ok "$name ($runner): got [$got], want [$want]: $(cat "$work/line.log")"; fi
+    done
+}
+message_branch() { # <name> <message>: a branch with one commit carrying <message> and the trailers
+    branch "$1"
+    change crates/tessera-config/README.md "$1"
+    git_commit "fix(config): subject
+
+$2
+
+$trailers"
+}
+message_branch closes-999 'fixes #999'
+message_branch closes-1 'Closes #1'
+message_branch closes-upper 'CLOSED: #1'
+message_branch no-number 'prefix #3, and a commit that closes everything and fixes nothing'
+message_branch closes-url 'Resolves https://github.com/owner/repo/issues/12'
+message_branch closes-cross 'Fixed owner/repo#13'
+line_check 'a commit that fixes a number outside --closes fails' closes-999 bodies FAIL --closes 1
+line_check 'a commit that closes the listed number passes' closes-1 bodies PASS --closes 1
+line_check 'a closing reference is found in any case, with a colon' closes-upper bodies PASS --closes 1
+line_check 'an issue URL outside --closes fails' closes-url bodies FAIL --closes 1
+line_check 'owner/repo#N outside --closes fails' closes-cross bodies FAIL --closes 1
+line_check 'an issue URL in the list passes' closes-url bodies PASS --closes 12
+line_check 'without --closes a closing reference warns' closes-999 bodies WARN
+line_check 'prefix #3 and a closes without a number are no reference' no-number bodies PASS --closes 1
+line_check 'prefix #3 and a closes without a number are no reference (no --closes)' no-number bodies PASS
+printf 'Closes #1\n\nCloses #2\n' > "$work/body-both"
+printf 'Summary\n\nCloses #1\nRefs #2\n' > "$work/body-one"
+printf 'Closes #1\nfixes #5\n' > "$work/body-extra"
+line_check 'a body with every listed number passes' closes-1 bodies PASS --closes 1,2 --body "$work/body-both"
+line_check 'a listed number missing from --body fails' closes-1 bodies FAIL --closes 1,2 --body "$work/body-one"
+line_check 'a body closing a number outside --closes fails' closes-1 bodies FAIL --closes 1 --body "$work/body-extra"
+line_check 'a body without --closes warns' closes-1 bodies WARN --body "$work/body-both"
+rc=0
+"$script" "$repo" --closes 1,x > /dev/null 2>&1 || rc=$?
+if [ "$rc" -eq 2 ]; then ok "--closes with a non-number rejected"; else not_ok "--closes 1,x: exit $rc, want 2"; fi
+rc=0
+"$script" "$repo" --body "$work/no-such-body" > /dev/null 2>&1 || rc=$?
+if [ "$rc" -eq 2 ]; then ok "--body with a missing file rejected"; else not_ok "--body missing file: exit $rc, want 2"; fi
+
+unsafe_branch() { # <name> <path> <line>
+    branch "$1"
+    change "$2" "$3"
+    commit
+}
+unsafe_branch unsafe-grid crates/tessera-grid/src/lib.rs 'fn f() { unsafe { g() } }'
+unsafe_branch unsafe-pty crates/tessera-pty/src/lib.rs 'fn f() { unsafe { g() } }'
+unsafe_branch unsafe-ffi crates/tessera-ffi/src/lib.rs 'pub unsafe extern "C" fn f() {}'
+unsafe_branch unsafe-listed crates/tessera-grid/tests/reset.rs 'unsafe impl GlobalAlloc for Counting {}'
+unsafe_branch alloc-listed crates/tessera-grid/tests/reset.rs '#[global_allocator]'
+unsafe_branch alloc-unlisted crates/tessera-grid/tests/other.rs '#[global_allocator]'
+unsafe_branch alloc-src crates/tessera-term/src/lib.rs '#[global_allocator] static A: Counting = Counting;'
+unsafe_branch unsafe-attr crates/tessera-grid/src/lib.rs 'unsafe(no_mangle)'
+branch unsafe-quiet
+change crates/tessera-grid/src/lib.rs '#![forbid(unsafe_code)]'
+change crates/tessera-grid/src/lib.rs '#![allow(unsafe_code)]'
+change crates/tessera-grid/src/lib.rs '// unsafe is not used here'
+change crates/tessera-grid/src/lib.rs '/// Never `unsafe`.'
+change crates/tessera-grid/src/lib.rs 'fn g() {} // unsafe in a trailing comment'
+change crates/tessera-grid/src/lib.rs '/* an unsafe block comment */ fn h() {}'
+change crates/tessera-grid/src/lib.rs ' * unsafe in a block comment continuation'
+change crates/tessera-grid/src/lib.rs 'fn unsafely() {}'
+commit
+line_check 'an added unsafe block outside pty and ffi fails' unsafe-grid unsafe FAIL
+line_check 'an added unsafe block in tessera-pty passes' unsafe-pty unsafe PASS
+line_check 'an added unsafe item in tessera-ffi passes' unsafe-ffi unsafe PASS
+line_check 'an added unsafe in a listed exception file passes' unsafe-listed unsafe PASS
+line_check 'a global_allocator in a listed exception file passes' alloc-listed unsafe PASS
+line_check 'a global_allocator in an unlisted file fails' alloc-unlisted unsafe FAIL
+line_check 'a global_allocator in a src file fails' alloc-src unsafe FAIL
+line_check 'unsafe(no_mangle) outside pty and ffi fails' unsafe-attr unsafe FAIL
+line_check 'unsafe_code lint names and unsafe in comments do not match' unsafe-quiet unsafe PASS
+git -C "$repo" switch -q unsafe-grid
+"$script" "$repo" --no-load > "$work/line.log" 2>&1 || true
+if grep -q 'crates/tessera-grid/src/lib.rs: fn f() { unsafe { g() } }' "$work/line.log"; then
+    ok "the unsafe failure names the file and the line"
+else
+    not_ok "the unsafe failure does not name the file and the line: $(cat "$work/line.log")"
+fi
+
+# docs/security.md S7 and scripts/unsafe-exceptions.txt name the same files (the check is mechanical, so the text must
+# not drift from the list).
+security="$here/../docs/security.md"
+s7_paths() { sed -n '/^- \*\*S7\./,/^- \*\*S8\./p' "$1" | grep -oE '(crates|apps)/[A-Za-z0-9_./-]+\.rs' | sort -u; }
+listed_paths() { grep -vE '^[[:space:]]*(#|$)' "$1" | sort -u; }
+sync_check() { # <security.md> <exceptions file>
+    [ -n "$(s7_paths "$1")" ] && [ "$(s7_paths "$1")" = "$(listed_paths "$2")" ]
+}
+if sync_check "$security" "$here/unsafe-exceptions.txt"; then
+    ok "docs/security.md S7 and scripts/unsafe-exceptions.txt name the same files"
+else
+    not_ok "docs/security.md S7 and scripts/unsafe-exceptions.txt differ: $(diff <(s7_paths "$security") <(listed_paths "$here/unsafe-exceptions.txt") || true)"
+fi
+grep -v 'crates/tessera-grid/tests/reset.rs' "$security" > "$work/security-fewer.md"
+if sync_check "$work/security-fewer.md" "$here/unsafe-exceptions.txt"; then
+    not_ok "the sync check passes with a path missing from S7"
+else
+    ok "the sync check fails when S7 lacks a listed path"
+fi
+{ cat "$here/unsafe-exceptions.txt"; echo crates/tessera-vt/tests/extra.rs; } > "$work/exceptions-more.txt"
+if sync_check "$security" "$work/exceptions-more.txt"; then
+    not_ok "the sync check passes with a path missing from S7"
+else
+    ok "the sync check fails when the list has a path S7 lacks"
+fi
 
 # The load check runs 2 tests x 10 runs and never has more than --parallel of them in flight. The fixture's gate
 # and commit trailers may pass or fail (exit 0 or 1); only the load line and the samples matter here.

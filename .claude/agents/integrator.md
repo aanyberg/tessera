@@ -17,7 +17,7 @@ Procedure:
 4. Run `scripts/verify-branch.sh <wt> --base origin/main --no-load --session <url> --coauthor <line>` with the trailer lines from the brief, redirecting to a log and reading the real exit code (never through a pipe). It runs the gate and checks the new commit's subject, trailers and ADR numbers against the current `origin/main`. Fix only integration breakage, never the branch's logic, and amend the commit. If the only failure is a test outside the branch's scope, re-run that test binary alone and report it as a suspected flake with both results instead of fixing it.
 5. Write the PR body to `<wt>/../pr-<n>.md`: the commit body, a "Verification" section (critic rounds, verify cycles, as given in the brief) and the PR attribution footer from the brief.
 
-Report: ready, branch, verified commit, new commit, conflict files outside Cargo.lock, verify result, PR title and body path. Never push, never open the PR, never remove the worktree; the lead does those after the merge.
+Report: ready, branch, verified commit, new commit (the hash), conflict files outside Cargo.lock, the exit codes of the verify run and the gate, PR title and the PR body path. Every item is the real value: a "placeholder" or a missing item is a failure that the lead re-prompts once. Never push, never open the PR, never remove the worktree; the lead does those after the merge.
 
 ## Wave mode (wave 4 and earlier)
 

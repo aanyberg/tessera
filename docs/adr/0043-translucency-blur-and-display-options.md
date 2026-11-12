@@ -87,7 +87,7 @@ Preferences window's (#40b).
 - Increase Contrast (#52) adds a field to `DisplayOptions` and one more
   check in `theme_for_appearance`; no new export.
 
-## Amendment (#52, ADR 0041, 2026-11-08)
+## Amendment: Increase Contrast, from ADR 0041 (#52, 2026-11-08)
 
 `DisplayOptions` is now `{ reduce_transparency, increase_contrast }`, both
 `uint8_t` flags read as above, two bytes with no size field (decision F7):
@@ -99,7 +99,7 @@ Increase Contrast with Reduce Transparency on this ADR's observer and calls
 `tessera_app_set_display_options` only when one of them changed, then reads
 the pane dimming again.
 
-## Amendment (#388, ADR 0045, 2026-11-11)
+## Amendment: strip tint, from ADR 0045 (#388, 2026-11-11)
 
 **Strip tint (E7).** The strip is no longer left without the theme's colour.
 The core reports the session's resolved theme background in
