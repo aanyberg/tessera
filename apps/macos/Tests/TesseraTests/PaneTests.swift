@@ -2097,6 +2097,7 @@ extension PaneTests {
         // Timer (not the main queue, whose blocks would wait for it, nor
         // the test's task), in a pool of its own: the test's would keep
         // what the drag autoreleases, the closed pane's view with it.
+        var freedAtTheDragsEnd = false
         let downDriver = DragDriver()
         downDriver.onTick = { [unowned downDriver] in
             autoreleasepool {
@@ -2109,6 +2110,9 @@ extension PaneTests {
                     downDriver.failure = "the press was not queued"
                 }
             }
+            // Before any block the run loop runs later: what #399's end of
+            // a drag cut short schedules keeps nothing alive.
+            freedAtTheDragsEnd = closingView == nil
             downDriver.step = 3
         }
         RunLoop.main.add(
@@ -2144,6 +2148,7 @@ extension PaneTests {
         try? await waitUntil("the closed pane is freed", timeout: .seconds(5)) { closing == nil && closingView == nil }
         XCTAssertNil(closing, "pane")
         XCTAssertNil(closingView, "view")
+        XCTAssertTrue(freedAtTheDragsEnd, "the view was freed as the drag ended")
     }
 
     /// Presses on the divider at `x` (in `container`'s coordinates), as

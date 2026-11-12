@@ -318,10 +318,19 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
     /// then, so their tool tips and core size follow later changes again.
     fileprivate func dividerDragWillBegin(_ splitView: PaneSplitView) {
         dividerDragMoved = false
-        RunLoop.main.perform(inModes: [.default]) { [weak self] in
+        // Weak: a rebuild at the drag's end drops `splitView`, and with it
+        // the view of a pane closed during the drag, before this runs.
+        RunLoop.main.perform(inModes: [.default]) { [weak self, weak splitView] in
             MainActor.assumeIsolated {
                 guard let self, self.dividerDragMoved != nil else { return }
-                self.dividerDragDidEnd(splitView)
+                if let splitView {
+                    self.dividerDragDidEnd(splitView)
+                } else {
+                    // Dropped by a rebuild since: nothing is put off.
+                    let moved = self.dividerDragMoved == true
+                    self.dividerDragMoved = nil
+                    if moved { self.layoutDidChange() }
+                }
                 for pane in self.panes where pane.view.isLiveResizing {
                     pane.view.viewDidEndLiveResize()
                 }
