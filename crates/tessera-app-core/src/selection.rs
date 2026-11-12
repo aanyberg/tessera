@@ -934,7 +934,7 @@ impl SelectionState {
             Granularity::Word => smart_at(&lines, pos, rules).or_else(|| word_at(&lines, pos)),
             Granularity::Line => unit_at(&lines, pos, granularity),
         };
-        let mut guard = self.sel.take().map(|sel| sel.guard).unwrap_or_default();
+        let mut guard = self.sel.take().map_or_default(|sel| sel.guard);
         let (start, end) = unit.unwrap_or((pos, pos));
         guard.retake(&lines, start.line, end.line);
         self.sel = Some(Sel {
@@ -1064,7 +1064,7 @@ impl SelectionState {
 
     /// Makes `start..=end` of `lines` the selection, a character one.
     fn select_whole(&mut self, lines: &Lines<'_>, start: Pos, end: Pos) {
-        let mut guard = self.sel.take().map(|sel| sel.guard).unwrap_or_default();
+        let mut guard = self.sel.take().map_or_default(|sel| sel.guard);
         guard.retake(lines, start.line, end.line);
         self.sel = Some(Sel {
             anchor: (start, end),
@@ -1183,13 +1183,12 @@ impl SelectionState {
         let overlays = self
             .hover
             .and_then(|at| link_at(grid, offset, at))
-            .map(|link| {
+            .map_or_default(|link| {
                 link.span
                     .into_iter()
                     .map(|(row, cols)| Overlay::new(OverlayKind::Underline, row, cols))
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         Decorations {
             selection,
             overlays,

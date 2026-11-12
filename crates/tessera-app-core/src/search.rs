@@ -1524,7 +1524,7 @@ impl SearchState {
 
     /// Where the search stands.
     pub(crate) fn status(&self) -> SearchStatus {
-        self.active.as_ref().map(Active::status).unwrap_or_default()
+        self.active.as_ref().map_or_default(Active::status)
     }
 
     /// Searches until nothing is left or `budget` has passed: at most one
@@ -1740,8 +1740,7 @@ impl SearchState {
     pub(crate) fn take_pieces(&mut self) -> Vec<(Duration, Duration, Duration)> {
         self.active
             .as_mut()
-            .map(|active| std::mem::take(&mut active.pieces))
-            .unwrap_or_default()
+            .map_or_default(|active| std::mem::take(&mut active.pieces))
     }
 }
 
