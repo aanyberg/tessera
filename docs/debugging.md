@@ -148,3 +148,11 @@ within 150 MB of its start no more than 10 s after the last step. The test print
 texture kept per resize (1.17 to 1.2 of the sum, never released) fails both bounds. The test skips when the window
 is not visible, because nothing is drawn then. The other footprint budgets in the app tests leave live resizing out.
 
+## Window blur radius fallback
+
+`[appearance] blur_radius` above 0 blurs a window through the private call `CGSSetWindowBackgroundBlurRadius`
+(ADR 0045), looked up once at the first window that asks for it. If the lookup fails, every window keeps the
+material blur of ADR 0043 and the app logs one error, category `window`
+(`log stream --predicate 'subsystem == "com.aanyberg.tessera" AND category == "window"'`). To see that fallback on a
+macOS that has the call, start the app with `TESSERA_WINDOW_BLUR_RADIUS=off` in its environment, for example
+`TESSERA_WINDOW_BLUR_RADIUS=off apps/macos/DerivedData/Build/Products/Debug/Tessera.app/Contents/MacOS/Tessera`.

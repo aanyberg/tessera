@@ -10,7 +10,10 @@ import TesseraKit
 /// with it the blurred strip under the title bar, translucent, which keeps
 /// a maximize from changing the window. The core forces every pane
 /// opaque and unblurred while the system's Reduce Transparency is on (E8,
-/// ``AppDelegate/applyDisplayOptions()``).
+/// ``AppDelegate/applyDisplayOptions()``). While the window is blurred
+/// whole at `blur_radius` (ADR 0045), ``TerminalWindowContentView`` hides
+/// each pane's backdrop, which would otherwise show its material, not the
+/// radius.
 ///
 /// The appearance is the session's (``TesseraSession/appearance()``), read
 /// when the surface attaches and again on every

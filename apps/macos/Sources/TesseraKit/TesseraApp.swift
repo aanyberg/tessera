@@ -267,6 +267,20 @@ public final class TesseraApp {
         return amount
     }
 
+    /// `[appearance] blur_radius` in effect (ADR 0045): the window's blur
+    /// radius, 0 to 64, clamped by the core. 0 keeps each pane's own
+    /// material blur; above 0 a window whose translucent panes all ask for
+    /// blur is blurred whole at that radius. It does not change with
+    /// ``DisplayOptions/reduceTransparency``: the caller sets no radius then.
+    /// Read again after a configuration is applied.
+    ///
+    /// - Throws: ``TesseraCoreError/nullPointer`` after ``shutdown()``.
+    public func blurRadius() throws -> UInt32 {
+        var radius: UInt32 = 0
+        try TesseraCoreError.check(tessera_app_blur_radius(core.pointer, &radius))
+        return radius
+    }
+
     /// The system's display settings that change how every session is drawn
     /// (ADR 0043). A setting added later defaults to off.
     public struct DisplayOptions: Sendable, Equatable {

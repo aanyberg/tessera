@@ -19,7 +19,7 @@ struct ProfilesPane: View {
     ]
 
     /// The appearance fields a profile may set: Appearance's, but for
-    /// `dim_inactive_panes` (the window draws that).
+    /// `dim_inactive_panes` and `blur_radius` (the window draws those).
     static var appearanceFields: [SettingsField] {
         AppearancePane.fields.filter { SettingsField.profileAppearanceKeys.contains($0.key) }
     }
