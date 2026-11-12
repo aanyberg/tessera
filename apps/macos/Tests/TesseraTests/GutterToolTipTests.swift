@@ -251,6 +251,51 @@ final class GutterToolTipTests: XCTestCase {
         }
     }
 
+    /// A live resize (a window or divider drag) moves no tool-tip rect per
+    /// height step, and lays them out for the final size once it ends,
+    /// although the display link passed that size to the core meanwhile
+    /// (#375). Re-adding every rect cost 3.5 ms a step at 798 rows; the
+    /// bar is 1 ms, taken as the median of 21 steps at 700 rows or more.
+    func testALiveResizeLaysTheTipRectsOutOnceItEnds() async throws {
+        try await open("stty -echo; printf ready; exec cat")
+        window.setContentSize(NSSize(width: 800, height: 4_000))
+        for _ in 0..<40 { view.decreaseFontSize(nil) }
+        try await waitUntil("at least 700 rows") {
+            guard let metrics = self.view.metrics, metrics.rows >= 700 else { return false }
+            return self.view.gutterToolTips.layout?.height == self.view.bounds.height
+                && self.view.gutterToolTips.rects.count == Int(metrics.rows)
+        }
+        let before = view.gutterToolTips
+        let rows = try XCTUnwrap(view.metrics).rows
+        let clock = ContinuousClock()
+        var steps: [Duration] = []
+        var size = view.frame.size
+        view.viewWillStartLiveResize()
+        for _ in 0..<21 {
+            size.height -= 1
+            view.setFrameSize(size)
+            let start = clock.now
+            view.updateGutterToolTips()
+            steps.append(clock.now - start)
+        }
+        let median = steps.sorted()[steps.count / 2]
+        XCTAssertLessThan(median, .milliseconds(1), "tool-tip work per live resize step at \(rows) rows")
+        // The display link passes the size on during the resize, which
+        // re-reads the metrics: the rects still wait.
+        let resizes = view.coreResizeCount
+        view.displayLinkDidFire()
+        XCTAssertEqual(view.coreResizeCount, resizes + 1, "the display link passed the size on")
+        XCTAssertEqual(view.surface.size, view.pixelSize, "the core has the final size")
+        XCTAssertEqual(view.gutterToolTips.tags, before.tags, "no rect re-added during the resize")
+        view.viewDidEndLiveResize()
+        let metrics = try XCTUnwrap(view.metrics)
+        XCTAssertEqual(view.gutterToolTips.layout?.height, view.bounds.height, "laid out for the final height")
+        XCTAssertEqual(view.gutterToolTips.rects.count, Int(metrics.rows))
+        for (row, rect) in view.gutterToolTips.rects.enumerated() {
+            XCTAssertEqual(rect, try expectedRect(row: row), "row \(row)")
+        }
+    }
+
     func testTheTipFormatsDurationsTheSameInEveryLocale() {
         let tip = { (code: Int32?, duration: Duration?) in
             TerminalSurfaceView.gutterToolTip(for: .init(exitCode: code, duration: duration))
@@ -261,13 +306,13 @@ final class GutterToolTipTests: XCTestCase {
         XCTAssertEqual(tip(0, .seconds(7_500)), "Exit status 0\nRan for 2 h 5 min")
         XCTAssertEqual(tip(nil, .zero), "Exit status unknown\nRan for 0 ms")
         XCTAssertEqual(tip(2, nil), "Exit status 2\nDuration unknown")
-        XCTAssertEqual(tip(0, .seconds(Int64.max)), "Exit status 0\nRan for \(Int64.max / 3600) h")
-        // The seconds fit in milliseconds but adding the fraction does
-        // not: the hours, not a trap.
-        let seconds = Int64.max / 1000
+        // Past what milliseconds hold: the hours and minutes, not a trap
+        // (#375: the minutes were dropped).
+        XCTAssertEqual(tip(0, .seconds(Int64.max)), "Exit status 0\nRan for 2562047788015215 h 30 min")
+        // The seconds fit in milliseconds but adding the fraction does not.
         XCTAssertEqual(
-            tip(0, Duration(secondsComponent: seconds, attosecondsComponent: 999_000_000_000_000_000)),
-            "Exit status 0\nRan for \(seconds / 3600) h")
+            tip(0, Duration(secondsComponent: Int64.max / 1000, attosecondsComponent: 999_000_000_000_000_000)),
+            "Exit status 0\nRan for 2562047788015 h 12 min")
     }
 
     /// Polls `condition` on the main actor until it holds or ten seconds

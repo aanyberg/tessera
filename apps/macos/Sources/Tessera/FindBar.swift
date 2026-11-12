@@ -19,10 +19,10 @@ final class FindController {
 
     /// The step budget per display refresh, in microseconds: a quarter of
     /// a 60 Hz frame, so typing stays smooth while a long history is
-    /// scanned (docs/security.md: a step returns within four budgets plus
-    /// 250 ms plus one regex call, which a pathological pattern can make
-    /// last many seconds on a query's first call, 7.3 s measured on an 8 KB
-    /// line; ADR 0038).
+    /// scanned (docs/security.md: a step returns within
+    /// `max(4 x budget, 250 ms)` plus one regex call, which a pathological
+    /// pattern can make last many seconds on a query's first call, 7.3 s
+    /// measured on an 8 KB line; ADR 0038).
     static let stepBudgetMicros: UInt32 = 4_000
 
     /// How long typing must pause before the query reaches the core
@@ -301,28 +301,33 @@ final class FindController {
         guard !copied.text.isEmpty else { return false }
         pasteboard.clearContents()
         pasteboard.setString(copied.text, forType: .string)
-        notice = Self.copyNotice(copyTruncated: copied.truncated, status: status)
+        // One match per line: the copy leaves out matches whose lines left
+        // the history since the last step, which `status` still counts.
+        let count = copied.text.utf8.reduce(1) { $1 == UInt8(ascii: "\n") ? $0 + 1 : $0 }
+        notice = Self.copyNotice(copyTruncated: copied.truncated, copied: count, status: status)
         onChange?()
         return true
     }
 
     /// What Copy All Matches says, from whether the copy stopped at 1 MiB
-    /// (`copyTruncated`) and the search's `status`: it says "all" only when
-    /// the copy is whole, no match gave way at the cap and no line was
-    /// skipped (#331).
-    static func copyNotice(copyTruncated: Bool, status: TesseraSession.SearchStatus) -> String {
+    /// (`copyTruncated`), how many matches it holds (`copied`) and the
+    /// search's `status`: it says "all" only when the copy is whole, no
+    /// match gave way at the cap and no line was skipped (#331), and names
+    /// skipped lines whatever else it says (#375).
+    static func copyNotice(copyTruncated: Bool, copied: Int, status: TesseraSession.SearchStatus) -> String {
+        let skipped = status.linesSkipped ? "; some lines were skipped" : ""
         if copyTruncated {
-            return "Copied the matches that fit in 1 MB"
+            return "Copied the matches that fit in 1 MB\(skipped)"
         }
         if status.truncated {
             // Only the matches the search kept (the newest
-            // ``TesseraSession/searchMaxMatches``) were copied.
-            let copied = "Copied \(format(status.matches)) of more than \(format(TesseraSession.searchMaxMatches))"
-            return status.linesSkipped ? "\(copied); some lines were skipped" : copied
+            // ``TesseraSession/searchMaxMatches``) whose lines are still
+            // there were copied.
+            return "Copied \(format(copied)) of more than \(format(TesseraSession.searchMaxMatches))\(skipped)"
         }
         if status.linesSkipped {
             // The skipped lines' matches are not in the copy.
-            return "Copied the matches found; some lines were skipped"
+            return "Copied the matches found\(skipped)"
         }
         return "Copied all matches"
     }
