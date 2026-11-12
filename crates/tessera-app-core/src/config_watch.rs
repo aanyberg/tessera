@@ -2023,20 +2023,23 @@ mod tests {
             } else {
                 CONFIG_DIR_POLL_INTERVAL + Duration::from_secs(3)
             };
+            // Waits on the view theme too: `restyle` records the config
+            // before `restyle_at` updates the view theme, so a read of the
+            // theme right after the config shows the new font size can
+            // still see the old one under load (#343).
+            let applied = || {
+                let background = app.view_theme().background;
+                (app.config().appearance.font_size - 20.0).abs() < f32::EPSILON
+                    && background.with_alpha(1.0) == Rgba::from_srgb8(0x2e, 0x34, 0x40)
+                    && (background.a - 0.5).abs() < 1e-6
+            };
             assert!(
-                eventually(bound, || {
-                    (app.config().appearance.font_size - 20.0).abs() < f32::EPSILON
-                }),
-                "open_config: {via_open_config}: {:?}",
-                app.config().appearance
+                eventually(bound, applied),
+                "open_config: {via_open_config}: {:?}, background {:?}",
+                app.config().appearance,
+                app.view_theme().background
             );
             assert!(app.is_watching_config());
-            let theme = app.view_theme();
-            assert_eq!(
-                theme.background.with_alpha(1.0),
-                Rgba::from_srgb8(0x2e, 0x34, 0x40)
-            );
-            assert!((theme.background.a - 0.5).abs() < 1e-6);
             assert_eq!(
                 std::fs::read_to_string(paths.config_file()).unwrap(),
                 "[appearance]\ntheme = \"Nord\"\nfont_size = 20.0\nopacity = 0.5\n",
