@@ -251,8 +251,7 @@ fn tmux(program: &Path, home: &Path, term: &Term) -> Result<String, String> {
             .env("HOME", home)
             .env_remove("TMUX")
             .output()
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
-            .unwrap_or_default()
+            .map_or_default(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
     };
     let result = (|| {
         if !tmux.wait(|tmux| {
@@ -312,8 +311,7 @@ fn htop(program: &Path, home: &Path, term: &Term) -> Result<String, String> {
                 let text = term
                     .grid()
                     .line(row16)
-                    .map(tessera_grid::Line::text)
-                    .unwrap_or_default();
+                    .map_or_default(tessera_grid::Line::text);
                 // Labels are separated by spaces, or by the sort direction
                 // mark htop draws after the sort column's label.
                 let separator = |ch: char| ch == ' ' || !ch.is_ascii();
@@ -335,8 +333,7 @@ fn htop(program: &Path, home: &Path, term: &Term) -> Result<String, String> {
                     let style = term
                         .grid()
                         .cell(Point::new(row16, at))
-                        .map(|cell| cell.style)
-                        .unwrap_or_default();
+                        .map_or_default(|cell| cell.style);
                     out.push((ch.to_string(), at, style));
                 }
                 out

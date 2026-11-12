@@ -111,8 +111,7 @@ fn rows() -> Vec<Row> {
                 reply: field("reply: ").map(|r| decode(&r)),
                 pstate,
                 flags: field("flags: ")
-                    .map(|f| f.split_whitespace().map(str::to_owned).collect())
-                    .unwrap_or_default(),
+                    .map_or_default(|f| f.split_whitespace().map(str::to_owned).collect()),
                 has_screen: block.lines().any(|l| l == "screen:"),
                 script: Script { rows, cols, steps },
                 block,

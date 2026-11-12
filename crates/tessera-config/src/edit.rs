@@ -1795,8 +1795,8 @@ pub struct ThemeEntry {
 /// ([`display_name`] would change it), since its id would not select it.
 #[must_use]
 pub fn theme_entries(themes_dir: &Path) -> Vec<ThemeEntry> {
-    let mut stems: Vec<(String, PathBuf)> = std::fs::read_dir(themes_dir)
-        .map(|entries| {
+    let mut stems: Vec<(String, PathBuf)> =
+        std::fs::read_dir(themes_dir).map_or_default(|entries| {
             entries
                 .take(MAX_THEME_DIR_ENTRIES)
                 .filter_map(Result::ok)
@@ -1807,8 +1807,7 @@ pub fn theme_entries(themes_dir: &Path) -> Vec<ThemeEntry> {
                         .then(|| (stem.to_owned(), entry.path()))
                 })
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     stems.sort();
     let mut user = Vec::new();
     let mut shadowing = Vec::new();
@@ -1894,8 +1893,7 @@ pub fn import_theme(themes_dir: &Path, source: &Path) -> Result<ImportedTheme, E
     let bytes = crate::read_scheme_file(source)?;
     let stem = source
         .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .map_or_default(|s| s.to_string_lossy().into_owned());
     let imported = match extension.as_deref() {
         Some("itermcolors") => crate::import_itermcolors(&bytes, clip_theme_name(&stem)),
         Some("yaml" | "yml") => {
@@ -1913,8 +1911,7 @@ pub fn import_theme(themes_dir: &Path, source: &Path) -> Result<ImportedTheme, E
     let path = themes_dir.join(&file_name);
     let source_name = source
         .file_name()
-        .map(|n| display_name(&n.to_string_lossy()))
-        .unwrap_or_default();
+        .map_or_default(|n| display_name(&n.to_string_lossy()));
     // One line: a crafted file name cannot start a TOML line of its own.
     let contents = format!(
         "# Imported by Tessera from {source_name}.\n{}",

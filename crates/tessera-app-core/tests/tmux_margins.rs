@@ -46,8 +46,7 @@ impl Tmux<'_> {
             .env("HOME", self.home)
             .env_remove("TMUX")
             .output()
-            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-            .unwrap_or_default()
+            .map_or_default(|out| String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
     /// `(left, top, width, height)` of pane `target`.

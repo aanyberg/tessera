@@ -175,9 +175,7 @@ impl Seq {
             return format!(
                 "]{}{} {end}",
                 String::from_utf8_lossy(command),
-                index
-                    .map(|i| format!(";{}", String::from_utf8_lossy(i)))
-                    .unwrap_or_default()
+                index.map_or_default(|i| format!(";{}", String::from_utf8_lossy(i)))
             );
         }
         let marker = self
@@ -188,7 +186,7 @@ impl Seq {
         let mut kind = format!(
             "{}{}{}{}",
             char::from(self.intro),
-            marker.map(String::from).unwrap_or_default(),
+            marker.map_or_default(String::from),
             String::from_utf8_lossy(&self.inters),
             char::from(self.fin)
         );
@@ -199,7 +197,7 @@ impl Seq {
                 String::from_utf8_lossy(&self.params),
                 String::from_utf8_lossy(&self.inters),
                 char::from(self.fin),
-                setting.map(String::from).unwrap_or_default()
+                setting.map_or_default(String::from)
             );
         }
         kind

@@ -826,7 +826,7 @@ fn any_csi() -> impl Strategy<Value = Vec<u8>> {
             out.extend(private);
             let params: Vec<String> = params
                 .iter()
-                .map(|p| p.map(|n| n.to_string()).unwrap_or_default())
+                .map(|p| p.map_or_default(|n| n.to_string()))
                 .collect();
             out.extend_from_slice(params.join(";").as_bytes());
             out.extend(intermediate);

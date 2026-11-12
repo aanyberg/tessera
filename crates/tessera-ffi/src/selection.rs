@@ -517,7 +517,7 @@ pub unsafe extern "C" fn tessera_session_link_at(
             .link_at(SessionId::from_raw(session_id), Point::new(row, col))
         {
             Ok(link) => {
-                let url = link.map(|link| link.url).unwrap_or_default();
+                let url = link.map_or_default(|link| link.url);
                 // SAFETY: `len` and `buf` per the contract.
                 unsafe { copy_out(&url, buf, cap, len) }
             }
