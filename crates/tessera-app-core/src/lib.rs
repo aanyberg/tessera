@@ -2450,6 +2450,25 @@ impl App {
         Ok(())
     }
 
+    /// [`App::feed_for_test`] with the chunk's OSC 133 marks processed at
+    /// `now` rather than when the call reads the clock, so a test gives its
+    /// commands durations of its choosing.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SessionNotFound`] if `id` is not a live session.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn feed_for_test_at(
+        &self,
+        id: SessionId,
+        bytes: &[u8],
+        now: std::time::Instant,
+    ) -> Result<()> {
+        self.session(id)?.feed_for_test_at(bytes, now);
+        Ok(())
+    }
+
     /// Keeps at most `lines` lines of session `id`'s scrollback
     /// ([`Terminal::set_max_scrollback`]).
     ///

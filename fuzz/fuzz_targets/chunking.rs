@@ -11,7 +11,8 @@
 //!
 //! Compared: every visible and scrollback line (cells, styles, clusters,
 //! wrap flags), the cursor, pending wrap, pen, scroll region, tab stops,
-//! the modes, the keyboard modes, the conformance level and the requests,
+//! the modes, the keyboard modes, the conformance level, the screen clear
+//! count and the first clear's top (#377) and the requests,
 //! replies to the child's queries ([`Request::Reply`], #10) included.
 //! Hidden state is compared by probing: after the first comparison both
 //! terminals get the same probes, each followed by another comparison: REP
@@ -98,6 +99,16 @@ fn assert_same(whole: &mut Terminal, chunked: &mut Terminal, stage: &str) {
         whole.c1_8bit_replies(),
         chunked.c1_8bit_replies(),
         "{stage}"
+    );
+    assert_eq!(
+        whole.screen_clears(),
+        chunked.screen_clears(),
+        "{stage}: screen clear counts differ"
+    );
+    assert_eq!(
+        whole.take_first_clear_top(),
+        chunked.take_first_clear_top(),
+        "{stage}: first screen clear tops differ"
     );
     assert_eq!(
         whole.take_requests(),

@@ -165,13 +165,30 @@ struct Record {
     epoch: u64,
     started: Instant,
     finished: Option<Instant>,
-    exit_code: Option<i32>,
+    /// The `D` mark's exit status when `exit_known` ([`Record::exit_code`]);
+    /// apart from an `Option` so that the flags share its word and the
+    /// record stays within 96 bytes.
+    exit_status: i32,
+    exit_known: bool,
     /// The line id of its `C` now, in epoch `anchor_epoch`: `output` at
     /// first, carried across each resize by the `C`'s rank from the bottom
     /// ([`resize`]); [`ERASED`] once the `C` was gone at a resize, below
     /// the oldest line once it left the history.
     anchor: i64,
     anchor_epoch: u64,
+    /// Whether a screen clear ([`CommandLog::screen_cleared`]) blanked
+    /// the line of what ended it while its prompt, above the clear, stayed:
+    /// its `D` (and the exit status on it) is gone from the grid, so the
+    /// gutter reports the status unknown, yet the record still describes
+    /// the prompt and keeps its duration (#378 M3).
+    end_erased: bool,
+}
+
+impl Record {
+    /// The `D` mark's exit status: `None` when it had none, or none came.
+    fn exit_code(&self) -> Option<i32> {
+        self.exit_known.then_some(self.exit_status)
+    }
 }
 
 /// [`Record::epoch`] of a record whose lines were drawn over in place
@@ -303,9 +320,11 @@ impl CommandLog {
                     epoch,
                     started: now,
                     finished: None,
-                    exit_code: None,
+                    exit_status: 0,
+                    exit_known: false,
                     anchor: id(line),
                     anchor_epoch: epoch,
+                    end_erased: false,
                 });
                 emit(SessionEvent::CommandStarted);
             }
@@ -331,6 +350,38 @@ impl CommandLog {
         for record in &mut self.records {
             if record.epoch == epoch && last_line(record) >= line {
                 record.epoch = REDRAWN;
+            }
+        }
+    }
+
+    /// Applies a clear of the whole primary screen in epoch `epoch` whose
+    /// top row was line `top` ([`Terminal::take_first_clear_top`]; #377,
+    /// ADR 0039): the lines from `top` down were blanked in place, so the
+    /// records whose first line is there no longer describe any line
+    /// ([`REDRAWN`], like [`CommandLog::drawn_over`]), a prompt there that
+    /// ran no command is forgotten, and a finished record whose first line
+    /// is above the clear (in the history) but whose end was not keeps the
+    /// lines above `top`, ends at `top` and notes that the line that ended
+    /// it was erased ([`Record::end_erased`]).
+    ///
+    /// Clears come in order and their tops never decrease within an epoch,
+    /// so the first clear after a record's `A` decides: a later one cannot
+    /// reach above it. Visits each record once (S6: at most
+    /// [`MAX_COMMAND_RECORDS`]), allocates nothing.
+    pub(crate) fn screen_cleared(&mut self, top: u64, epoch: u64) {
+        self.pending
+            .take_if(|p| p.epoch == epoch && p.prompt >= top);
+        for record in &mut self.records {
+            if record.epoch != epoch {
+                continue;
+            }
+            if first_line(record) >= top {
+                record.epoch = REDRAWN;
+            } else if record.finished.is_some() && record.end != NO_LINE && record.end >= top {
+                // Its lines from `top` down are new ones now: it ends where
+                // they start (the line the next prompt is drawn on).
+                record.end = top;
+                record.end_erased = true;
             }
         }
     }
@@ -361,7 +412,8 @@ impl CommandLog {
             return;
         };
         record.finished = Some(now);
-        record.exit_code = exit_code;
+        record.exit_status = exit_code.unwrap_or_default();
+        record.exit_known = exit_code.is_some();
         if record.epoch == epoch {
             record.end = line;
         }
@@ -394,6 +446,11 @@ impl CommandLog {
     /// running command to the end. The newest such command; `None` for a
     /// line no record of this epoch covers.
     pub(crate) fn command_at(&self, line: u64, view: LineView) -> Option<CommandRecord> {
+        self.record_at(line, view).map(|r| public(r, view))
+    }
+
+    /// The record [`CommandLog::command_at`] returns, as the log keeps it.
+    fn record_at(&self, line: u64, view: LineView) -> Option<&Record> {
         if id(line) < view.base {
             return None;
         }
@@ -402,15 +459,34 @@ impl CommandLog {
             .rev()
             .filter(|r| r.epoch == view.epoch)
             .find(|r| {
-                let start = r.prompt.min(r.input).min(r.output);
                 let end = if r.finished.is_some() {
                     r.end
                 } else {
                     u64::MAX
                 };
-                start <= line && line < end
+                first_line(r) <= line && line < end
             })
-            .map(|r| public(r, view))
+    }
+
+    /// How long the command whose prompt is line `line` ran, for the
+    /// gutter's hover of a mark drawn with `exit_code`: the record of
+    /// [`CommandLog::command_at`] if it is finished, starts at this prompt
+    /// and agrees on the exit status. It agrees when the statuses are
+    /// equal, or when the gutter reports none because a screen clear
+    /// erased the record's `D` below its prompt ([`Record::end_erased`],
+    /// #378 M3); no other loss of the `D` (a deleted line, #368) lends a
+    /// record's duration to a mark it may not be.
+    pub(crate) fn hover_duration(
+        &self,
+        line: u64,
+        exit_code: Option<i32>,
+        view: LineView,
+    ) -> Option<Duration> {
+        let record = self.record_at(line, view)?;
+        let agrees = record.exit_code() == exit_code || (exit_code.is_none() && record.end_erased);
+        let finished = record.finished?;
+        (view.line(record, record.prompt) == Some(line) && agrees)
+            .then(|| finished.saturating_duration_since(record.started))
     }
 
     /// Whether the newest finished command printed something that is still
@@ -440,6 +516,12 @@ impl CommandLog {
     }
 }
 
+/// The first line of `record`: its prompt, command line or output,
+/// whichever is known and highest up ([`NO_LINE`] when none is).
+fn first_line(record: &Record) -> u64 {
+    record.prompt.min(record.input).min(record.output)
+}
+
 /// The newest line of `record` it knows: its prompt, command line or
 /// output, or the line before what ended it (that line is the next
 /// prompt's).
@@ -461,7 +543,7 @@ fn public(record: &Record, view: LineView) -> CommandRecord {
         end_line: view.line(record, record.end),
         started: record.started,
         finished: record.finished,
-        exit_code: record.exit_code,
+        exit_code: record.exit_code(),
         state: if record.finished.is_some() {
             CommandState::Finished
         } else {
@@ -794,16 +876,11 @@ pub(crate) fn command_mark_at(session: &Session, row: u16) -> Option<CommandMark
             .wrapping_sub(offset as u64)
             .wrapping_add(u64::from(row));
         // The log's lock is a leaf: taking it under the terminal's is fine.
-        let duration = session
-            .reports()
-            .commands()
-            .command_at(line, LineView::of(term))
-            .filter(|record| {
-                record.prompt_line == Some(line)
-                    && record.state == CommandState::Finished
-                    && record.exit_code == exit_code
-            })
-            .and_then(|record| record.duration());
+        let duration =
+            session
+                .reports()
+                .commands()
+                .hover_duration(line, exit_code, LineView::of(term));
         Some(CommandMark {
             exit_code,
             duration,
@@ -1619,5 +1696,110 @@ mod tests {
         assert!(prompt_stop(grid, 0));
         assert!(prompt_stop(grid, 1));
         assert!(!prompt_stop(grid, 2), "the continuation of row 1");
+    }
+
+    /// #377: a screen clear whose top is line 20 takes the lines of the
+    /// records from line 20 down and forgets a prompt there; a record
+    /// above it whose end was erased ends at 20 and keeps its duration for
+    /// a mark drawn unknown (#378 M3); a record wholly above it, or of
+    /// another epoch, is left alone.
+    #[test]
+    fn a_screen_clear_takes_the_lines_it_erased() {
+        use Mark::*;
+        let (mut log, _, t0) = log_of(&[
+            // Above the clear: ended above it.
+            (PromptStart, 2, 0),
+            (OutputStart, 3, 10),
+            (d(Some(1)), 5, 30),
+            // Above the clear, its `D` below its top (erased).
+            (PromptStart, 5, 30),
+            (OutputStart, 6, 40),
+            (d(Some(0)), 24, 100),
+            // Below the clear's top.
+            (PromptStart, 24, 100),
+            (OutputStart, 25, 110),
+            (d(Some(0)), 26, 150),
+            (PromptStart, 26, 150),
+        ]);
+        log.records.push_front(Record {
+            epoch: 7,
+            ..log.records[0]
+        });
+        log.screen_cleared(20, 0);
+        assert!(log.pending.is_none(), "the prompt on line 26 was erased");
+        let epochs: Vec<_> = log.records.iter().map(|r| r.epoch).collect();
+        assert_eq!(epochs, [7, 0, 0, REDRAWN]);
+        let r = &log.records[2];
+        assert_eq!((r.end, r.end_erased), (20, true));
+        assert_eq!(log.command_at(20, VIEW), None, "line 20 is a new one");
+        assert!(!log.records[1].end_erased);
+        // The hover pairs the erased `D`'s record with an unknown mark.
+        let at = |line, exit| log.hover_duration(line, exit, VIEW);
+        assert_eq!(at(5, None), Some(Duration::from_millis(60)));
+        assert_eq!(at(5, Some(0)), Some(Duration::from_millis(60)));
+        assert_eq!(at(5, Some(1)), None);
+        // Not the one whose `D` is still there.
+        assert_eq!(at(2, Some(1)), Some(Duration::from_millis(20)));
+        assert_eq!(at(2, None), None);
+        assert_eq!(at(24, Some(0)), None, "its record was erased");
+        // A prompt above the top stays; the next `C` starts from it.
+        log.apply(&PromptStart, 21, 0, t0, |_| {});
+        log.screen_cleared(30, 0);
+        log.apply(&OutputStart, 22, 0, t0, |_| {});
+        assert_eq!(log.records.back().map(|r| r.prompt), Some(21));
+        // A clear of another epoch changes nothing of this one.
+        log.screen_cleared(0, 1);
+        assert_eq!(log.records.back().map(|r| r.epoch), Some(0));
+        // A record with its first line known only from its `C`.
+        let (mut log, ..) = log_of(&[(OutputStart, 25, 0)]);
+        log.screen_cleared(20, 0);
+        assert_eq!(log.records[0].epoch, REDRAWN);
+    }
+
+    /// #377: the clear's top line is one it erased. A record that starts
+    /// on it is taken, one whose `D` is on it ends there with its `D`
+    /// erased, and a prompt on it is forgotten (of the clear's epoch
+    /// only); a record known only from a `C` above the top is cut, not
+    /// taken, though its prompt line is unknown.
+    #[test]
+    fn a_screen_clear_takes_the_records_on_its_top_line() {
+        use Mark::*;
+        let (mut log, _, t0) = log_of(&[
+            // Its `D` on the top line.
+            (PromptStart, 10, 0),
+            (OutputStart, 11, 10),
+            (d(Some(0)), 20, 30),
+            // Its prompt on the top line.
+            (PromptStart, 20, 30),
+            (OutputStart, 21, 40),
+            (d(Some(0)), 22, 50),
+        ]);
+        log.screen_cleared(20, 0);
+        let kept: Vec<_> = log
+            .records
+            .iter()
+            .map(|r| (r.epoch, r.end, r.end_erased))
+            .collect();
+        assert_eq!(kept, [(0, 20, true), (REDRAWN, 22, false)]);
+        assert_eq!(
+            log.hover_duration(10, None, VIEW),
+            Some(Duration::from_millis(20)),
+            "its `D` was erased: an unknown mark gets its duration"
+        );
+        // A prompt on the top line, of another epoch and then of this one.
+        log.apply(&PromptStart, 20, 0, t0, |_| {});
+        log.screen_cleared(20, 1);
+        assert_eq!(log.pending.map(|p| p.prompt), Some(20), "another epoch");
+        log.screen_cleared(20, 0);
+        assert!(log.pending.is_none(), "the prompt on the top line");
+        // No prompt: the first line is the `C`'s, above the top.
+        let (mut log, ..) = log_of(&[(OutputStart, 12, 0), (d(Some(0)), 25, 10)]);
+        log.screen_cleared(20, 0);
+        let r = &log.records[0];
+        assert_eq!((r.epoch, r.end, r.end_erased), (0, 20, true));
+        assert_eq!(
+            log.command_at(12, VIEW).map(|c| c.output_line),
+            Some(Some(12))
+        );
     }
 }
