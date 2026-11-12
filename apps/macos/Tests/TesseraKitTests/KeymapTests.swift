@@ -2,6 +2,12 @@ import AppKit
 @testable import TesseraKit
 import XCTest
 
+/// Thrown by a failed `until()` after it has recorded the failure, so the test
+/// ends there instead of going on into more waits (#275).
+private struct UntilTimedOut: Error, CustomStringConvertible {
+    var description: String { "until() timed out (reported above)" }
+}
+
 /// The key map (#43, ADR 0036) through the wrapper: reading it, resolving
 /// keys with ``TesseraSession/handle(key:bindingsOnly:)``, and a
 /// `config.toml` edit reaching ``TesseraAppDelegate/configurationDidApply(generation:)``.
@@ -46,7 +52,10 @@ final class KeymapTests: XCTestCase {
     ) async throws {
         let deadline = ContinuousClock.now + timeout
         while !condition() {
-            guard ContinuousClock.now < deadline else { return XCTFail("timed out: \(description)") }
+            guard ContinuousClock.now < deadline else {
+                XCTFail("timed out: \(description)")
+                throw UntilTimedOut()
+            }
             try await Task.sleep(for: .milliseconds(10))
         }
     }

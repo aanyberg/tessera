@@ -340,11 +340,17 @@ final class TesseraKitTests: XCTestCase {
         let returned = XCTestExpectation(description: "blocked write returned")
         let large = Data(repeating: UInt8(ascii: "x"), count: 8 << 20)
         let outcome = Mutex<Result<Void, any Error>?>(nil)
-        Thread.detachNewThread {
+        // Above the default quality of service, as in CallbackBridgeTests:
+        // the Thread Performance Checker reported the main thread waiting on
+        // a lower-QoS thread at the `shutdown()` below, which wakes this
+        // write (#275).
+        let writer = Thread {
             let result = Result { try session.write(large) }
             outcome.withLock { $0 = result }
             returned.fulfill()
         }
+        writer.qualityOfService = .userInteractive
+        writer.start()
         try await Task.sleep(for: .milliseconds(500))
         XCTAssertNil(outcome.withLock { $0 }, "the write did not block; the test proves nothing")
         let start = ContinuousClock.now

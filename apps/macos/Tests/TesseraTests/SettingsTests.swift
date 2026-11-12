@@ -38,6 +38,8 @@ final class SettingsTests: XCTestCase {
         if let previous { setenv("TESSERA_CONFIG_DIR", previous, 1) } else { unsetenv("TESSERA_CONFIG_DIR") }
         if let dir { try? FileManager.default.removeItem(at: dir) }
         sources = []
+        appDelegate.opener = WorkspaceOpener()
+        appDelegate.configFileCreator = nil
         appDelegate = nil
     }
 
@@ -1008,6 +1010,104 @@ final class SettingsTests: XCTestCase {
         print("SETTINGS-OPEN-TIMINGS: warm-up \(warmUp); \(timings); best 1 MiB \(bestLarge), best minimal \(bestMinimal)")
         XCTAssertLessThanOrEqual(ratio, 2.75, timings)
         XCTAssertLessThan(bestLarge, .seconds(1), timings)
+    }
+
+    // MARK: Open config.toml (Advanced)
+
+    /// What the stand-in for the core's `createConfig()` returns; nothing
+    /// is written there.
+    private let createdConfigFile = URL(fileURLWithPath: "/nonexistent/tessera-tests/config.toml")
+
+    /// Opens Settings on the Advanced pane with a recording opener and a
+    /// stand-in `createConfig()` (it would create the configuration
+    /// directory and watch it); `events` gets "create" and "open <path>",
+    /// in order.
+    private func openAdvanced(_ opener: RecordingOpener, events: @escaping (String) -> Void) throws -> SettingsWindowController {
+        try openSettings(config: "")
+        appDelegate.opener = opener
+        appDelegate.configFileCreator = { [createdConfigFile] in
+            events("create")
+            return createdConfigFile
+        }
+        opener.onOpen = { file in events("open \(file.path)") }
+        let controller = try XCTUnwrap(appDelegate.settingsWindowController)
+        controller.select(pane: "advanced")
+        controller.window?.contentView?.layoutSubtreeIfNeeded()
+        return controller
+    }
+
+    /// Clicks the Advanced pane's Open config.toml button with mouse events
+    /// sent to the window, as a click does, and returns once its action ran
+    /// (`pressed()`). SwiftUI draws the Form's sections into views of its
+    /// own with no button or accessibility element to find in-process, so
+    /// this clicks across the last section (config.toml: the button and a
+    /// caption, nothing else that acts on a click) until the action runs.
+    private func clickOpenConfigFile(in controller: SettingsWindowController, pressed: () -> Bool) async throws {
+        let window = try XCTUnwrap(controller.window)
+        let content = try XCTUnwrap(window.contentView)
+        func views(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(views) }
+        var section: NSView?
+        try await waitUntil("the Advanced pane is drawn") {
+            content.layoutSubtreeIfNeeded()
+            // The sections, in order down the pane.
+            let sections = views(content).filter { "\(type(of: $0))" == "_NSGraphicsView" && $0.superview?.window != nil }
+            section = sections.max { $0.convert($0.bounds, to: nil).minY > $1.convert($1.bounds, to: nil).minY }
+            return section != nil
+        }
+        let last = try XCTUnwrap(section)
+        let frame = last.convert(last.bounds, to: nil)
+        func click(_ point: NSPoint) {
+            for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                if let event = NSEvent.mouseEvent(
+                    with: type, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                    windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)
+                {
+                    window.sendEvent(event)
+                }
+            }
+        }
+        // The button sits at the trailing edge of the section's first row.
+        for y in stride(from: frame.maxY - 4, to: frame.minY, by: -6) {
+            for x in stride(from: frame.maxX - 4, to: frame.midX, by: -8) {
+                click(NSPoint(x: x, y: y))
+                await Task.yield()
+                if pressed() { return }
+            }
+        }
+        XCTFail("no click in the config.toml section reached Open config.toml")
+    }
+
+    func testOpenConfigFileCreatesTheConfigFileThenOpensIt() async throws {
+        let opener = RecordingOpener()
+        var events: [String] = []
+        let controller = try openAdvanced(opener) { events.append($0) }
+        try await clickOpenConfigFile(in: controller) { !opener.opened.isEmpty }
+        XCTAssertEqual(events, ["create", "open \(createdConfigFile.path)"], "created (if missing) before it is opened")
+        XCTAssertEqual(opener.opened, [createdConfigFile])
+        XCTAssertEqual(opener.revealed, [])
+        XCTAssertEqual(opener.urls, [])
+        try await clickOpenConfigFile(in: controller) { opener.opened.count == 2 }
+        XCTAssertEqual(events.filter { $0 == "create" }.count, 2, "the core's createConfig() is idempotent")
+    }
+
+    func testOpenConfigFileShowsTheFileInFinderWhenNothingOpensIt() async throws {
+        let opener = RecordingOpener()
+        opener.editor = nil
+        var events: [String] = []
+        let controller = try openAdvanced(opener) { events.append($0) }
+        try await clickOpenConfigFile(in: controller) { !opener.revealed.isEmpty }
+        XCTAssertEqual(events, ["create"])
+        XCTAssertEqual(opener.opened, [])
+        XCTAssertEqual(opener.revealed, [createdConfigFile])
+    }
+
+    func testOpenConfigFileShowsTheFileInFinderWhenOpeningItFails() async throws {
+        let opener = RecordingOpener()
+        opener.openError = CocoaError(.fileReadNoPermission)
+        let controller = try openAdvanced(opener) { _ in }
+        try await clickOpenConfigFile(in: controller) { !opener.revealed.isEmpty }
+        XCTAssertEqual(opener.opened, [createdConfigFile])
+        XCTAssertEqual(opener.revealed, [createdConfigFile], "after the failed open")
     }
 }
 

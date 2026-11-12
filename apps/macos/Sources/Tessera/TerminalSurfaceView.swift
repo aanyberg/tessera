@@ -201,8 +201,10 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     /// from the core each time, since output that changes a selected line
     /// drops the selection there.
     var hasSelection: Bool { (try? session.hasSelection) ?? false }
-    /// Where Paste reads from. Tests use a private pasteboard, so the user's
-    /// clipboard is neither read nor changed.
+    /// Where Copy and Copy with Formatting write and Paste reads. A program's
+    /// OSC 52 write goes elsewhere: through `CallbackBridge.pasteboard`, behind
+    /// its throttle (ADR 0022 D-RATE52). Tests use a private pasteboard, so
+    /// the user's clipboard is neither read nor changed.
     var pasteboard: NSPasteboard = .general
     /// Pastes handed to the session (tests).
     private(set) var pasteCount = 0
@@ -654,7 +656,8 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         } catch TesseraCoreError.sessionNotFound {
             // The pane closed: its view stays only until the split views
             // are rebuilt, at the end of a divider drag that ends the live
-            // resize which got here (#379).
+            // resize which got here (#379). The id only (S8).
+            Self.log.debug("resize after session \(self.session.id, privacy: .public) closed")
         } catch {
             guard !reattachIfDropped(error, wasAttached: true) else {
                 Self.log.info("core dropped the surface; re-attaching")

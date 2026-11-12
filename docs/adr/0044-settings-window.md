@@ -232,3 +232,16 @@ Known limits:
   after recording it stays bound as a hidden shortcut.
 * **The lock** can release one apply early when an edit is queued just
   before a hand edit applies, as the Profiles pane's can.
+
+## Amendment: Settings menu item, Open config.toml in Advanced only (#410, 2026-11-12)
+
+The Tessera menu's item reads **Settings**, with no ellipsis, and keeps ⌘,.
+AppKit does not add the "…" back: the menu bar installed at launch has the
+title as authored (`MainMenuTests` pins it). Open config.toml leaves the
+Tessera menu and is on the Advanced pane only; it still creates the file
+with the core's commented defaults if it is missing, and Finder shows the
+file when no application opens it. Every remaining menu item runs a
+registry command, so the key map exempts none. This replaces "Tessera >
+Settings…" and "Open config.toml stays in the Tessera menu" under Hosting;
+the keys no pane shows are reachable through the Advanced pane's Open
+config.toml.

@@ -50,13 +50,9 @@ enum MainMenu {
         let menu = NSMenu(title: "Tessera")
         add(menu, "about", "About Tessera", #selector(NSApplication.orderFrontStandardAboutPanel(_:)))
         menu.addItem(.separator())
-        // The Settings window (ADR 0044). Titled "Settings…": AppKit
-        // retitles a "Preferences…" item with ⌘, to it anyway (macOS 13 and
-        // later).
-        add(menu, "settings", "Settings…", #selector(AppDelegate.openSettings(_:)), ",")
-        // config.toml in the default editor, for the keys the window does
-        // not show; no registry command, so no key map entry.
-        add(menu, openConfigFileIdentifier, "Open config.toml", #selector(AppDelegate.openConfigFile(_:)))
+        // The Settings window (ADR 0044, #410): "Settings", no ellipsis.
+        // config.toml opens from the window's Advanced pane.
+        add(menu, "settings", "Settings", #selector(AppDelegate.openSettings(_:)), ",")
         menu.addItem(.separator())
         add(menu, "hide", "Hide Tessera", #selector(NSApplication.hide(_:)), "h")
         add(menu, "hide_others", "Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option])
@@ -305,10 +301,6 @@ enum MainMenu {
     static func functionKey(_ key: Int) -> String {
         Unicode.Scalar(UInt32(key)).map { String(Character($0)) } ?? ""
     }
-
-    /// The identifier of Open config.toml, which runs no registry command:
-    /// the key map leaves it alone and it has no key equivalent.
-    static let openConfigFileIdentifier = "app_menu:open_config_file"
 
     // MARK: Profiles
 
