@@ -1271,6 +1271,10 @@ mod tests {
     /// after the deadline. Every cell of 64 KiB is an `X`, so each run
     /// finds one; the deadline passes after a few thousand. Never reading
     /// the clock handed out every match after it.
+    ///
+    /// How many runs end late depends on where the deadline falls between
+    /// two clock reads, so one measurement let a stride of 64 pass about
+    /// half the time (#394): the test repeats it and bounds the largest.
     #[test]
     fn a_literal_stops_within_its_runs_per_clock_read() {
         let rows = long_line(300, 218, "X", 1);
@@ -1285,19 +1289,27 @@ mod tests {
         .unwrap();
         let mut haystack = Haystack::new();
         haystack.fill(&rows, false, false);
-        let deadline = Instant::now() + std::time::Duration::from_micros(200);
-        let mut late = 0_usize;
-        let mut found = 0_usize;
-        let ended = query.find_until(&haystack, Some(deadline), |_| {
-            found += 1;
-            if Instant::now() >= deadline {
-                late += 1;
-            }
-            ControlFlow::Continue(())
-        });
-        assert_eq!(ended, None, "{found} matches, none stopped");
+        let mut lates = Vec::new();
+        for _ in 0..20 {
+            let deadline = Instant::now() + std::time::Duration::from_micros(200);
+            let mut late = 0_usize;
+            let mut found = 0_usize;
+            let ended = query.find_until(&haystack, Some(deadline), |_| {
+                found += 1;
+                if Instant::now() >= deadline {
+                    late += 1;
+                }
+                ControlFlow::Continue(())
+            });
+            assert_eq!(ended, None, "{found} matches, none stopped");
+            lates.push(late);
+        }
         let most = usize::try_from(LITERAL_RUNS_PER_CLOCK_READ).unwrap();
-        assert!(late <= most, "{late} runs ended after the deadline");
+        let largest = lates.iter().copied().max().unwrap_or(0);
+        assert!(
+            largest <= most,
+            "{largest} runs ended after the deadline (per repeat: {lates:?})"
+        );
     }
 
     /// #331 adversarial cycle 1 (F9c): a run that finds nothing and ends

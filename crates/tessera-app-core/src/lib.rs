@@ -3828,6 +3828,24 @@ mod tests {
         (id, pid)
     }
 
+    /// [`spawn_ready`], then waits until `stamps` holds at least one
+    /// observer call: the observer runs after the screen shows `ready`,
+    /// so a close right after [`spawn_ready`] can land before that call
+    /// and leave `stamps` empty (#354).
+    fn spawn_ready_observed(
+        app: &App,
+        script: &str,
+        stamps: &Mutex<Vec<Instant>>,
+    ) -> (SessionId, u32) {
+        let spawned = spawn_ready(app, script);
+        let deadline = Instant::now() + TIMEOUT;
+        while lock(stamps).is_empty() {
+            assert!(Instant::now() < deadline, "{script:?} was never observed");
+            thread::sleep(Duration::from_millis(2));
+        }
+        spawned
+    }
+
     /// A shell that ignores `SIGHUP` and lives exactly as long as the test
     /// process: it never exits on its own while its parent is alive, so
     /// only the close's `SIGKILL` ends it, and it never reads its terminal
@@ -3891,9 +3909,10 @@ mod tests {
                 lock(&stamps).push(Instant::now());
             })));
         }
-        let (id, pid) = spawn_ready(
+        let (id, pid) = spawn_ready_observed(
             &app,
             "trap '' HUP; echo ready; sleep 0.3; printf '\\a'; exit 0",
+            &stamps,
         );
         app.close_session(id).unwrap();
         let closed = Instant::now();
