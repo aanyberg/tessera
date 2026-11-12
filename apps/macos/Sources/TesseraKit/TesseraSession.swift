@@ -129,10 +129,33 @@ public final class TesseraSession: Sendable, Identifiable {
         /// Blur what shows through the translucent background. Never true
         /// while ``opaque`` is.
         public let blur: Bool
+        /// The session's configured background (ADR 0043, strip tint): the
+        /// theme of its profile at that profile's opacity, alpha 1 under
+        /// Reduce Transparency. A background the program sets (OSC 11) is
+        /// not followed. Its alpha is below 1 exactly when ``opaque`` is
+        /// false.
+        public let background: Color
 
-        public init(opaque: Bool, blur: Bool) {
+        public init(opaque: Bool, blur: Bool, background: Color) {
             self.opaque = opaque
             self.blur = blur
+            self.background = background
+        }
+
+        /// An sRGB colour with straight (not premultiplied) alpha, each
+        /// component 0...1.
+        public struct Color: Sendable, Equatable {
+            public let red: Float
+            public let green: Float
+            public let blue: Float
+            public let alpha: Float
+
+            public init(red: Float, green: Float, blue: Float, alpha: Float) {
+                self.red = red
+                self.green = green
+                self.blue = blue
+                self.alpha = alpha
+            }
         }
     }
 
@@ -149,7 +172,10 @@ public final class TesseraSession: Sendable, Identifiable {
     public func appearance() throws -> Appearance {
         var look = TesseraSessionAppearance()
         try TesseraCoreError.check(tessera_session_appearance(core.pointer, id, &look))
-        return Appearance(opaque: look.opaque, blur: look.blur)
+        let background = look.background
+        return Appearance(
+            opaque: look.opaque, blur: look.blur,
+            background: .init(red: background.r, green: background.g, blue: background.b, alpha: background.a))
     }
 
     /// Hangs up the child and forgets the session, returning at once. No

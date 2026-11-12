@@ -106,8 +106,9 @@ The core reports the session's resolved theme background in
 `SessionAppearance` as four `f32` (red, green, blue, alpha, each 0..=1,
 straight not premultiplied alpha), after the profile's theme, its opacity and
 the display options (Reduce Transparency: alpha 1) are applied. The host
-draws that colour under the strip's `PaneBackdropView`; it never reads the
-theme itself. Each pane that touches the top edge of the content tints its own
+draws that colour at its alpha over the strip's `PaneBackdropView`, below the
+title and tab titles, as a pane draws its background over its own blur; it
+never reads the theme itself. Each pane that touches the top edge of the content tints its own
 segment of the strip with its own colour, so a split with two themes shows
 both; if the eye check shows that as noisy, the top-left pane's colour is used
 for the tab-bar area only, each top-edge pane still tinting its own segment.

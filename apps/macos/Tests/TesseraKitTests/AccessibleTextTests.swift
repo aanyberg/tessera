@@ -200,26 +200,59 @@ final class AccessibleTextTests: XCTestCase {
         dim_inactive_panes = 0.4
         """
 
+    /// A session's appearance with its background reduced to its alpha.
+    private struct Look: Equatable {
+        var opaque: Bool
+        var blur: Bool
+        var alpha: Float
+    }
+
+    private func look(_ session: TesseraSession) throws -> Look {
+        let appearance = try session.appearance()
+        return Look(opaque: appearance.opaque, blur: appearance.blur, alpha: appearance.background.alpha)
+    }
+
+    /// The background is the profile's theme at its opacity (#388), sRGB
+    /// with straight alpha, and only that: Reduce Transparency makes it
+    /// opaque, the theme's colour kept.
+    func testTheAppearanceCarriesTheConfiguredThemeBackground() throws {
+        try start(config: """
+            [appearance]
+            theme = "Dracula"
+            opacity = 0.7
+            """)
+        let session = try app.spawn(.init(program: "/bin/cat"))
+        let dracula = TesseraSession.Appearance.Color(
+            red: 0x28 / 255.0, green: 0x2a / 255.0, blue: 0x36 / 255.0, alpha: 0.7)
+        XCTAssertEqual(try session.appearance().background, dracula, "Dracula's #282a36 at 0.7")
+        try app.setDisplayOptions(.init(reduceTransparency: true))
+        XCTAssertEqual(
+            try session.appearance().background,
+            .init(red: dracula.red, green: dracula.green, blue: dracula.blue, alpha: 1), "reduced: opaque")
+        try session.close()
+    }
+
     func testAppearanceFollowsReduceTransparencyAndIncreaseContrastStopsDimming() throws {
         try start(config: Self.translucent)
         let session = try app.spawn(.init(program: "/bin/cat"))
-        XCTAssertEqual(try session.appearance(), .init(opaque: false, blur: true), "the configuration's look")
+        XCTAssertEqual(try look(session), .init(opaque: false, blur: true, alpha: 0.5), "the configuration's look")
         XCTAssertEqual(try app.dimInactivePanes(), 0.4, accuracy: 1e-6)
 
         try app.setDisplayOptions(.init(reduceTransparency: true))
-        XCTAssertEqual(try session.appearance(), .init(opaque: true, blur: false), "reduced")
+        XCTAssertEqual(try look(session), .init(opaque: true, blur: false, alpha: 1), "reduced: an opaque background")
         XCTAssertEqual(try app.dimInactivePanes(), 0.4, accuracy: 1e-6, "Reduce Transparency keeps the dimming")
 
         try app.setDisplayOptions(.init(increaseContrast: true))
-        XCTAssertEqual(try session.appearance(), .init(opaque: false, blur: true), "contrast keeps the translucency")
+        XCTAssertEqual(
+            try look(session), .init(opaque: false, blur: true, alpha: 0.5), "contrast keeps the translucency")
         XCTAssertEqual(try app.dimInactivePanes(), 0, "Increase Contrast turns the dimming off")
 
         try app.setDisplayOptions(.init(reduceTransparency: true, increaseContrast: true))
-        XCTAssertEqual(try session.appearance(), .init(opaque: true, blur: false))
+        XCTAssertEqual(try look(session), .init(opaque: true, blur: false, alpha: 1))
         XCTAssertEqual(try app.dimInactivePanes(), 0)
 
         try app.setDisplayOptions(.init())
-        XCTAssertEqual(try session.appearance(), .init(opaque: false, blur: true), "both off again")
+        XCTAssertEqual(try look(session), .init(opaque: false, blur: true, alpha: 0.5), "both off again")
         XCTAssertEqual(try app.dimInactivePanes(), 0.4, accuracy: 1e-6)
         try session.close()
         XCTAssertThrowsError(try session.appearance()) { error in

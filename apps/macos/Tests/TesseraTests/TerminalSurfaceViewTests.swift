@@ -748,7 +748,9 @@ final class TerminalSurfaceViewTests: XCTestCase {
         view.appearanceDidChange()
         XCTAssertTrue(view.metalLayer.isOpaque, "the layer is the core's")
         XCTAssertTrue(window.isOpaque, "the session is opaque")
-        XCTAssertEqual(view.backgroundAppearance, TesseraSession.Appearance(opaque: true, blur: false))
+        XCTAssertEqual(view.backgroundAppearance?.opaque, true)
+        XCTAssertEqual(view.backgroundAppearance?.blur, false)
+        XCTAssertEqual(view.backgroundAppearance?.background.alpha, 1, "an opaque background")
         XCTAssertNil(view.backdrop)
         XCTAssertFalse(view.isDisplayLinkPaused, "a re-theme wakes the link")
         let before = view.renderCount
