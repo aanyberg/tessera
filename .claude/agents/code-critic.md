@@ -22,6 +22,6 @@ Verdict `escalate` instead of `revise` when a blocker cannot be fixed inside the
 
 Capture real exit codes: redirect output to a file and read `$?` (`scripts/quality-gate.sh <wt> > <log> 2>&1; echo $?`); never pipe the gate through `tail` or `grep` before reading its status.
 
-Never modify the branch. Do not anchor on the implementer's self-report; form your own view first.
+Never modify the branch. Mutants run in a scratch copy of the files (under your scratch directory), never in the task's worktree: an interrupted run must not leave a mutant behind. Do not anchor on the implementer's self-report; form your own view first.
 
 End every report with `coverage`: the checks you ran (gate, validators, local executions of the flows), with counts (cases, corpora, seed or input counts), and the files, paths and behaviours you only read. The lead hands it to the adversarial tester so it attacks what you did not reach.

@@ -2,7 +2,7 @@
 # Mechanical verification of a task branch before integration: the facts a reviewer should not spend reasoning on.
 # Usage: scripts/verify-branch.sh <worktree> [--base <ref>] [--allow <path>]... [--session <url>] [--coauthor <line>]
 #                                            [--load <crate>:<lib|bins|bin/<name>|tests|test-binary>]... [--no-load]
-#                                            [--parallel <1-8>] [--list-targets]
+#                                            [--parallel <1-8>] [--list-targets] [--closes <n[,n...]>] [--body <file>]
 #        scripts/verify-branch.sh --help
 #
 # Checks, each printed as PASS, WARN or FAIL:
@@ -15,6 +15,14 @@
 #   scope     with --allow: changed paths outside every allowed file or directory (WARN: the lead decides)
 #   adr       no ADR added or renamed on the branch shares its number with another ADR on the branch or on <base>
 #             (paths the branch deletes or renames away do not count)
+#   bodies    GitHub closing references (close/closes/closed, fix/fixes/fixed, resolve/resolves/resolved, any case, an
+#             optional colon, then `#N`, `owner/repo#N` or an issue URL) in the commit messages of <base>..HEAD and,
+#             with --body, in that PR body file. With --closes: FAIL on a reference to a number outside the list, and
+#             (with --body) FAIL when a listed number has no closing reference in the body. Without --closes: WARN on
+#             any closing reference, because a task branch should close nothing the lead did not name.
+#   unsafe    FAIL when a line the branch adds to a Rust file (outside a `//` comment) contains the word `unsafe` or
+#             `#[global_allocator]`, in a crate other than tessera-pty and tessera-ffi, unless the file is listed in
+#             scripts/unsafe-exceptions.txt (docs/security.md S7). `unsafe_code` in a lint attribute does not match.
 #   load      timing-sensitive tests pass 10 runs each, at most --parallel at a time. Triggers: a nextest `timing`
 #             override in a changed package; a changed test file (tests/*.rs; a src file with #[cfg(test)], or
 #             src/**/tests.rs and src/**/tests/*.rs) that mentions wall-clock time anywhere in it (that test binary;
@@ -24,6 +32,10 @@
 # --parallel <N>   load check: at most N test runs in flight, per target and in total (targets run one
 #                  after another). Default 3 so a busy machine is not exhausted; 1-8 accepted. A run that records
 #                  no exit status FAILs. Ctrl-C (or TERM/HUP) stops the runs in flight and exits 130 (143/129).
+# --closes <list>  bodies check: the issue numbers the task may close (from the brief's PR lines), comma separated.
+# --body <file>    bodies check: also scan this PR body file. Together with --closes, every listed number must have a
+#                  closing reference in it. Re-run with `--body <file> --closes <list> --no-load` on the integrator's
+#                  body before `gh pr create`: the gate is a recorded-pass hit then, so only the `bodies` line is new.
 # --list-targets   print the effective parallelism as a `# parallel: N` line, then the derived load targets
 #                  (`crate:kind`, one per line, sorted), and exit 0. Runs no check and builds nothing.
 # Exit 0 when nothing FAILs, 1 otherwise, 2 on a usage error. Logs go to the directory printed on the first line.
@@ -34,17 +46,18 @@ set -uo pipefail
 self="${0:A}"  # inside a function $0 is the function's name
 help() { sed -n '2,/^[^#]/s/^# \{0,1\}//p' "$self"; }
 usage() {
-    print -ru2 -- "usage: scripts/verify-branch.sh <worktree> [--base <ref>] [--allow <path>]... [--session <url>] [--coauthor <line>] [--load <crate>:<target>]... [--no-load] [--parallel <1-8>] [--list-targets]  (--help for details)"
+    print -ru2 -- "usage: scripts/verify-branch.sh <worktree> [--base <ref>] [--allow <path>]... [--session <url>] [--coauthor <line>] [--load <crate>:<target>]... [--no-load] [--parallel <1-8>] [--list-targets] [--closes <n[,n...]>] [--body <file>]  (--help for details)"
     exit 2
 }
 [[ "${1:-}" == (-h|--help) ]] && { help; exit 0; }
 (( $# >= 1 )) || usage
 wt="$1"; shift
 base=main session="" coauthor="" no_load="" list_targets="" parallel=3 runs_per_test=10 max_parallel=8
-typeset -a allow loads
+body_file="" closes_given=""
+typeset -a allow loads closes
 while (( $# )); do
     case "$1" in
-        --base|--allow|--session|--coauthor|--load|--parallel) (( $# >= 2 )) || usage ;;
+        --base|--allow|--session|--coauthor|--load|--parallel|--closes|--body) (( $# >= 2 )) || usage ;;
     esac
     case "$1" in
         --base) base="$2"; shift 2 ;;
@@ -52,6 +65,12 @@ while (( $# )); do
         --session) session="$2"; shift 2 ;;
         --coauthor) coauthor="$2"; shift 2 ;;
         --load) loads+=("$2"); shift 2 ;;
+        --closes)
+            [[ "$2" =~ '^[0-9]+(,[0-9]+)*$' ]] || { print -ru2 -- "--closes takes issue numbers separated by commas, got '$2'"; usage; }
+            closes=( ${(s:,:)2} ); closes_given=1; shift 2 ;;
+        --body)
+            [[ -f "$2" ]] || { print -ru2 -- "--body: no such file '$2'"; exit 2; }
+            body_file="${2:A}"; shift 2 ;;
         --no-load) no_load=1; shift ;;
         --parallel)
             [[ "$2" == [1-${max_parallel}] ]] || { print -ru2 -- "--parallel takes 1-${max_parallel}, got '$2'"; usage; }
@@ -108,9 +127,10 @@ for f in $changed; do
 done
 # A nextest override filter is an expression such as `(package(a) & binary(b) & test(x)) | (package(c) & test(y))`.
 # Each top-level `|` alternative names its own package and suite, so a target pairs a package with the binary of the
-# same alternative, never the last binary of the line with another alternative's package (#192). An alternative with
-# no binary(...) selects its package's lib, or its bins when the package has no src/lib.rs. Prints
-# "<package> <binary or empty>" per alternative of a filter line.
+# same alternative, never the last binary of the line with another alternative's package (#192). An alternative that
+# names several binaries, `package(x) & (binary(a) | binary(b))`, is one alternative: each binary is a target (#273).
+# An alternative with no binary(...) selects its package's lib, or its bins when the package has no src/lib.rs.
+# Prints "<package> <binary or empty>" per binary, or one line with an empty binary, per alternative of a filter line.
 filter_targets() {
     perl -e '
         my $e = $ARGV[0]; my ($d, $cur, @alt) = (0, "");
@@ -123,8 +143,8 @@ filter_targets() {
         for my $a (@alt) {
             $a =~ s/^\s+|\s+$//g;
             my ($p) = $a =~ /package\(([^)]*)\)/ or next;
-            my ($b) = $a =~ /binary\(([^)]*)\)/;
-            print "$p ", $b // "", "\n";
+            my @b = $a =~ /binary\(([^)]*)\)/g;
+            if (@b) { print "$p $_\n" for @b } else { print "$p \n" }
         }
     ' -- "$1"
 }
@@ -223,6 +243,58 @@ for f in $(git diff --name-only --diff-filter=AR "$base...HEAD" -- 'docs/adr/*.m
     (( ${#same} )) && collisions+=("$f shares $num with ${(j:, :)same}")
 done
 if (( ${#collisions} )); then fail "adr:"; print -l -- "  "${^collisions}; else pass "adr"; fi
+
+# bodies: closing references in the commit messages (and the PR body) against what the brief lets the task close.
+# Prints the issue number of every closing reference read from stdin, one per line.
+closing_refs() {
+    perl -ne '
+        while (/(?<![A-Za-z0-9_])(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)(?![A-Za-z0-9_]):?[ \t]+(?:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#|#|https?:\/\/github\.com\/[^\/\s]+\/[^\/\s]+\/issues\/)(\d+)/gi) { print "$1\n" }'
+}
+commit_refs=( ${(u)${(f)"$(git log --format=%B "$base..HEAD" | closing_refs)"}} )
+commit_refs=(${commit_refs:#})
+body_refs=()
+if [[ -n "$body_file" ]]; then
+    body_refs=( ${(u)${(f)"$(closing_refs < "$body_file")"}} )
+    body_refs=(${body_refs:#})
+fi
+problems=()
+if [[ -n "$closes_given" ]]; then
+    for n in $commit_refs; do (( ${closes[(Ie)$n]} )) || problems+=("a commit message closes #$n, which is not in --closes ${(j:,:)closes}"); done
+    for n in $body_refs; do (( ${closes[(Ie)$n]} )) || problems+=("the PR body closes #$n, which is not in --closes ${(j:,:)closes}"); done
+    if [[ -n "$body_file" ]]; then
+        for n in $closes; do (( ${body_refs[(Ie)$n]} )) || problems+=("the PR body has no 'Closes #$n' line"); done
+    fi
+    if (( ${#problems} )); then fail "bodies:"; print -l -- "  "${^problems}; else pass "bodies"; fi
+elif (( ${#commit_refs} + ${#body_refs} )); then
+    warn "bodies: closing references to ${(j:, :)${(u)commit_refs}} ${(j:, :)${(u)body_refs}} found; pass --closes with the brief's PR lines to check them"
+else
+    pass "bodies"
+fi
+
+# unsafe: S7 made mechanical. Only a line the branch adds counts; comments and `unsafe_code` lint names do not.
+exceptions=()
+[[ -f scripts/unsafe-exceptions.txt ]] && exceptions=( ${(f)"$(grep -vE '^[[:space:]]*(#|$)' scripts/unsafe-exceptions.txt)"} )
+exceptions=(${exceptions:#})
+unsafe_hits=()
+while IFS=$'\t' read -r file text; do
+    [[ -n "$file" ]] || continue
+    (( ${exceptions[(Ie)$file]} )) && continue
+    pkg="$(package_of "$file")"
+    [[ "${pkg#* }" == (tessera-pty|tessera-ffi) ]] && continue
+    unsafe_hits+=("$file: ${text## #}")
+done < <(git -c core.quotePath=false diff -U0 --no-color "$base...HEAD" -- '*.rs' | awk '
+    /^\+\+\+ / { f = ($0 == "+++ /dev/null") ? "" : substr($0, 7); next }
+    /^\+/ && f != "" {
+        s = substr($0, 2)
+        gsub(/\/\*[^*]*\*\//, "", s); sub(/\/\*.*/, "", s); sub(/\/\/.*/, "", s)
+        if (s ~ /^[ \t]*\*/) next
+        if (s ~ /(^|[^A-Za-z0-9_])unsafe([^A-Za-z0-9_]|$)/ || s ~ /#\[global_allocator\]/) print f "\t" s
+    }')
+if (( ${#unsafe_hits} )); then
+    fail "unsafe: outside tessera-pty, tessera-ffi and scripts/unsafe-exceptions.txt (S7):"; print -l -- "  "${^unsafe_hits}
+else
+    pass "unsafe"
+fi
 
 # load
 if [[ -z "$no_load" ]]; then

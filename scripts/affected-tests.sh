@@ -19,6 +19,8 @@
 #   fuzz/               not a workspace member: `scripts/quality-gate.sh` runs its fmt and clippy
 #   everything else     docs, scripts, CI: no Rust test is affected; run the check that matches the file
 #                       (actionlint, `just terminfo-check`, `just config-docs-check`)
+# crates/tessera-config/   a change there may alter the generated docs/config.md, which no Rust test checks: the output
+#                       names `just config-docs-check` (only for a changed file there, not a crate that merely depends on it).
 # shell-integration/ is read by Rust tests (the scripts by tessera-shell-integration, the terminfo entry by
 # tessera-term), so a change there selects both crates and their dependents.
 # Exit status: the clippy or nextest status, 2 on a usage error or when git/jq/cargo fail.
@@ -77,7 +79,7 @@ owner_of() {
 
 typeset -A hit
 whole=""
-app="" fuzz="" other=()
+app="" fuzz="" cfg="" other=()
 for f in $files; do
     case "$f" in
         Cargo.toml|Cargo.lock|rust-toolchain|rust-toolchain.toml|clippy.toml|.clippy.toml|rustfmt.toml|.rustfmt.toml|deny.toml|.config/nextest.toml|.cargo/*)
@@ -88,6 +90,7 @@ for f in $files; do
         apps/macos/*) app=1 ;;
         fuzz/*) fuzz=1 ;;
         *)
+            [[ "$f" == crates/tessera-config/* ]] && cfg=1
             o="$(owner_of "$f")"
             if [[ -n "$o" ]]; then hit[$o]=1; else other+=("$f"); fi ;;
     esac
@@ -110,6 +113,7 @@ crates=(${(ko)affected})
 notes=()
 [[ -n "$whole" ]] && notes+=("a workspace-wide file changed: every crate is affected")
 [[ -n "$app" ]] && notes+=("apps/macos changed: also run 'just app-test' (needs Xcode)")
+[[ -n "$cfg" ]] && notes+=("crates/tessera-config/ changed: also run 'just config-docs-check' (the generated docs/config.md)")
 [[ -n "$fuzz" ]] && notes+=("fuzz/ changed: scripts/quality-gate.sh runs its fmt and clippy")
 if (( ${#other} )); then
     more=""
