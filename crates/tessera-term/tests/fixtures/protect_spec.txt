@@ -13,9 +13,9 @@
 # Protection is invisible in render_screen, so every row proves it BEHAVIOURALLY: print protected text, run an erase, read
 # what survived. `control` rows run the same erase without protection and prove the setup is not vacuous.
 #
-# EDITS (#95 brief, 2026-11-04): DECSERA is not implemented (descoped to #251, rectangular area operations), so section G
-# (D01-D10) and the DECSERA rows K02/K03 are `#>` pending blocks below; K03 is now the SCORC variant of K01 (DECSEL), and
-# Q09 no longer cites DECSERA. Rows are run by tests/protect.rs.
+# EDITS (#95 brief, 2026-11-04): DECSERA was descoped to #251 (rectangular area operations), so section G (D01-D10) and
+# the DECSERA rows K02/K03b waited as `#>` pending blocks; K03 is now the SCORC variant of K01 (DECSEL), and Q09 no longer
+# cites DECSERA. #251 (2026-11-13) lifted them as cases, at the end. Rows are run by tests/protect.rs.
 #
 # DECISIONS (D-P*) are in spec-95-protect.md and ADR 0034; each row that depends on one names it. Summary: Tessera follows xterm exactly
 # (one terminal-wide mode off|dec|iso, one per-cell bit), because xterm is the only oracle that passes esctest2.
@@ -1049,205 +1049,200 @@ reply: \e[?64;6;9;21;22c
 cite: reports_spec D-DECID
 flags: flips
 
+# ============================================================================ G. DECSERA
+
+# Lifted from the #251 pending block (ADR 0046); D06 and D09 screens and D10's attr corrected there.
+# prepare (4x5): odd rows protected: aaaaa / bbbbb unprotected / ccccc protected / ddddd unprotected; cursor then moved to 2;3
+
+### D01_decsera_default_rect_is_the_whole_page
+size: 4x5
+step: feed \e[1"qaaaaa\r\n\e[0"qbbbbb\r\n\e[1"qccccc\r\n\e[0"qddddd\e[0"q\e[2;3H\e[${
+source: esctest2 decsera.py (prepare: protect odd rows; test_DECSERA_defaultArgs, test_DECSERA_basic)
+cite: [E2] decsera.py; [DEC] DECSERA.html defaults Pt=1 Pl=1 Pb=last line Pr=last column; [XT] CASE_DECSERA -> ScrnWipeRectangle, mode dec => protected cells skipped
+note: the unprotected rows are blanked; cursor and pending wrap untouched ([DEC] "does not change the active cursor position").
+screen:
+>aaaaa
+>   |
+>ccccc
+>
+cursor: (1,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: dec/0
+
+### D02_decsera_explicit_rectangle
+size: 4x5
+step: feed \e[1"qaaaaa\r\n\e[0"qbbbbb\r\n\e[1"qccccc\r\n\e[0"qddddd\e[0"q\e[2;3H\e[2;2;4;4${
+source: esctest2 decsera.py test_DECSERA_basic
+cite: [E2] decsera.py; [DEC] DECSERA Pt;Pl;Pb;Pr = rows 2-4, columns 2-4; protected row 3 keeps its cells
+screen:
+>aaaaa
+>b  | b
+>ccccc
+>d   d
+cursor: (1,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### D03_decsera_invalid_rect_does_nothing
+size: 4x5
+step: feed \e[1"qaaaaa\r\n\e[0"qbbbbb\r\n\e[1"qccccc\r\n\e[0"qddddd\e[0"q\e[2;3H\e[3;3;2;2${
+source: esctest2 decsera.py test_DECSERA_invalidRectDoesNothing
+cite: [E2] decsera.py; [DEC] "Pt must be less than or equal to Pb" / "Pl <= Pr"; [XT] validRect() fails
+screen:
+>aaaaa
+>bbb|bb
+>ccccc
+>ddddd
+cursor: (1,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### D04_decsera_respects_origin_mode
+size: 4x5
+step: feed \e[1"qaaaaa\r\n\e[0"qbbbbb\r\n\e[1"qccccc\r\n\e[0"qddddd\e[0"q\e[2;4r\e[?6h\e[1;1;1;5${
+source: esctest2 decsera.py test_DECSERA_respectsOriginMode
+cite: [E2] decsera.py; [DEC] "coordinates ... are affected by the setting of origin mode"; [XT] xtermParseRect adds the top margin when ORIGIN is set
+note: row 1 of the region is absolute row 2; DECOM and DECSTBM home the cursor to (1,0).
+screen:
+>aaaaa
+> |
+>ccccc
+>ddddd
+cursor: (1,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### D05_decsera_clips_overlarge_rect
+size: 4x5
+step: feed \e[1"qaaaaa\r\n\e[0"qbbbbb\r\n\e[1"qccccc\r\n\e[0"qddddd\e[0"q\e[2;3H\e[2;2;99;99${
+source: esctest2 decsera.py test_DECSERA_overlyLargeSourceClippedToScreenSize
+cite: [E2] decsera.py; [XT] xtermParseRect clamp: rows 2-4, columns 2-5
+screen:
+>aaaaa
+>b  |
+>ccccc
+>d
+cursor: (1,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### D06_decsera_ignores_left_right_margins
+size: 4x5
+step: feed \e[1"qaaaaa\r\n\e[0"qbbbbb\r\n\e[1"qccccc\r\n\e[0"qddddd\e[0"q\e[?69h\e[2;3s\e[2;3H\e[2;1;2;5${\e[?69l
+source: esctest2 decsera.py test_DECSERA_ignoresMargins
+cite: [E2] decsera.py; [DEC] "DECSERA is not affected by the page margins"
+screen:
+>aaaaa
+>   |
+>ccccc
+>ddddd
+cursor: (1,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### D07_decsera_does_not_honour_iso_protection
+size: 3x10
+step: feed a\eVb\eW\e[1;1;1;2${
+source: esctest2 decsera.py test_DECSERA_doesNotRespectISOProtect
+cite: [E2] decsera.py; [XT] ScrnWipeRectangle IsProtected requires protected_mode == DEC_PROTECT; in iso mode both cells are blanked (esctest2 passes on xterm: no knownBug entry)
+note: the one place where xterm's DECSERA differs from its DECSED/DECSEL (M05/M06). DECISION D-P2.
+screen:
+>   |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+flags: xterm-quirk decision
+
+### D08_decsera_with_no_protection_in_use_blanks_the_rect
+size: 3x10
+step: feed abc\e[1;1;1;3${
+cite: [XT] mode off => IsProtected false
+screen:
+>    |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+flags: control
+
+### D09_decsera_is_ignored_below_level_4
+size: 3x10
+step: feed abc\e[62"p\e[1;1;1;3${
+cite: [XT] CASE_DECSERA `if (screen->vtXX_level >= 4)`; Tessera's level gate for DECLRMM/DECSLRM uses the same pattern (ADR 0028)
+note: DECSCL 62 is a soft reset and leaves the screen and cursor alone. DECSED/DECSEL/DECSCA are NOT level-gated in xterm.
+screen:
+>abc |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+flags: decision
+
+### D10_decsera_keeps_sgr_attributes_and_the_protection_bit_of_what_stays
+size: 3x10
+step: feed \e[41mabc\e[0m\e[1;1;1;3${
+cite: [DEC] DECSERA "does not change SGR visual attributes, DECSCA protection attributes, or line attributes"; [XT] ScrnWipeRectangle `Clear1Cell` leaves attribs (colour) untouched, unlike ED/EL which use the current background (BCE)
+note: the erased cells keep bg=red from the printed text, and its fg and flags (default) too; the run is checked in tests/protect.rs pen notation.
+screen:
+>    |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+attr: (0,0)-(0,2) fg=- bg=i1 ul=- us=none flags=-
+flags: decision
+
+### K02_decrc_protection_with_decsera
+size: 3x10
+step: feed \e[1"q\e7\e[0"q\e8a\e[1;1;1;1${
+source: esctest2 save_restore_cursor.py test_SaveRestoreCursor_Protection (the original, DECSERA form)
+cite: [E2] save_restore_cursor.py; [XT] CASE_DECSERA (level >= 4), mode dec so the protected 'a' survives
+screen:
+>a |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: dec/1
+
+### K03b_scorc_protection_with_decsera
+size: 3x10
+step: feed \e[1"q\e[s\e[0"q\e[ua\e[1;1;1;1${
+source: esctest2 scorc.py via save_restore_cursor.py test_SaveRestoreCursor_Protection (E_SCORC_saveRestoreCursor_protection; DECSERA form like the original)
+cite: [E2] scorc.py inherits SaveRestoreCursorTests; [XT] SCOSC/SCORC share CursorSave/CursorRestore with DECSC/DECRC
+screen:
+>a |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
 # -- end of cases
 
-#> ============================================================================ Pending: DECSERA (#251)
-#> DECSERA (`CSI Pt;Pl;Pb;Pr $ {`) needs rectangle infrastructure Tessera does not have yet (DECERA/DECFRA/DECCRA, `$`
-#> rectangle parsing with defaults, clamping, DECOM and validation, the level-4 gate). These rows move to #251 ("term:
-#> rectangular area operations DECERA, DECFRA, DECCRA, DECSERA") unchanged; lift them into the cases there. D-P7 (DECSERA
-#> keeps colours, D10) moves with them. Today DECSERA is an ignored CSI with an intermediate.
-#>
-#> # ============================================================================ G. DECSERA
-#>
-#> # prepare (4x5): odd rows protected: aaaaa / bbbbb unprotected / ccccc protected / ddddd unprotected; cursor then moved to 2;3
-#>
-#> ### D01_decsera_default_rect_is_the_whole_page
-#> size: 4x5
-#> step: feed \e[1"qaaaaa\r\n\e[0"qbbbbb\r\n\e[1"qccccc\r\n\e[0"qddddd\e[0"q\e[2;3H\e[${
-#> source: esctest2 decsera.py (prepare: protect odd rows; test_DECSERA_defaultArgs, test_DECSERA_basic)
-#> cite: [E2] decsera.py; [DEC] DECSERA.html defaults Pt=1 Pl=1 Pb=last line Pr=last column; [XT] CASE_DECSERA -> ScrnWipeRectangle, mode dec => protected cells skipped
-#> note: the unprotected rows are blanked; cursor and pending wrap untouched ([DEC] "does not change the active cursor position").
-#> screen:
-#> >aaaaa
-#> >   |
-#> >ccccc
-#> >
-#> cursor: (1,2)
-#> pending_wrap: false
-#> requests: []
-#> scrollback: len=0
-#> pstate: dec/0
-#>
-#> ### D02_decsera_explicit_rectangle
-#> size: 4x5
-#> step: feed \e[1"qaaaaa\r\n\e[0"qbbbbb\r\n\e[1"qccccc\r\n\e[0"qddddd\e[0"q\e[2;3H\e[2;2;4;4${
-#> source: esctest2 decsera.py test_DECSERA_basic
-#> cite: [E2] decsera.py; [DEC] DECSERA Pt;Pl;Pb;Pr = rows 2-4, columns 2-4; protected row 3 keeps its cells
-#> screen:
-#> >aaaaa
-#> >b  | b
-#> >ccccc
-#> >d   d
-#> cursor: (1,2)
-#> pending_wrap: false
-#> requests: []
-#> scrollback: len=0
-#>
-#> ### D03_decsera_invalid_rect_does_nothing
-#> size: 4x5
-#> step: feed \e[1"qaaaaa\r\n\e[0"qbbbbb\r\n\e[1"qccccc\r\n\e[0"qddddd\e[0"q\e[2;3H\e[3;3;2;2${
-#> source: esctest2 decsera.py test_DECSERA_invalidRectDoesNothing
-#> cite: [E2] decsera.py; [DEC] "Pt must be less than or equal to Pb" / "Pl <= Pr"; [XT] validRect() fails
-#> screen:
-#> >aaaaa
-#> >bbb|bb
-#> >ccccc
-#> >ddddd
-#> cursor: (1,2)
-#> pending_wrap: false
-#> requests: []
-#> scrollback: len=0
-#>
-#> ### D04_decsera_respects_origin_mode
-#> size: 4x5
-#> step: feed \e[1"qaaaaa\r\n\e[0"qbbbbb\r\n\e[1"qccccc\r\n\e[0"qddddd\e[0"q\e[2;4r\e[?6h\e[1;1;1;5${
-#> source: esctest2 decsera.py test_DECSERA_respectsOriginMode
-#> cite: [E2] decsera.py; [DEC] "coordinates ... are affected by the setting of origin mode"; [XT] xtermParseRect adds the top margin when ORIGIN is set
-#> note: row 1 of the region is absolute row 2; DECOM and DECSTBM home the cursor to (1,0).
-#> screen:
-#> >aaaaa
-#> > |
-#> >ccccc
-#> >ddddd
-#> cursor: (1,0)
-#> pending_wrap: false
-#> requests: []
-#> scrollback: len=0
-#>
-#> ### D05_decsera_clips_overlarge_rect
-#> size: 4x5
-#> step: feed \e[1"qaaaaa\r\n\e[0"qbbbbb\r\n\e[1"qccccc\r\n\e[0"qddddd\e[0"q\e[2;3H\e[2;2;99;99${
-#> source: esctest2 decsera.py test_DECSERA_overlyLargeSourceClippedToScreenSize
-#> cite: [E2] decsera.py; [XT] xtermParseRect clamp: rows 2-4, columns 2-5
-#> screen:
-#> >aaaaa
-#> >b  |
-#> >ccccc
-#> >d
-#> cursor: (1,2)
-#> pending_wrap: false
-#> requests: []
-#> scrollback: len=0
-#>
-#> ### D06_decsera_ignores_left_right_margins
-#> size: 4x5
-#> step: feed \e[1"qaaaaa\r\n\e[0"qbbbbb\r\n\e[1"qccccc\r\n\e[0"qddddd\e[0"q\e[?69h\e[2;3s\e[2;3H\e[2;1;2;5${\e[?69l
-#> source: esctest2 decsera.py test_DECSERA_ignoresMargins
-#> cite: [E2] decsera.py; [DEC] "DECSERA is not affected by the page margins"
-#> screen:
-#> >aaaaa
-#> >  |
-#> >ccccc
-#> >ddddd
-#> cursor: (1,2)
-#> pending_wrap: false
-#> requests: []
-#> scrollback: len=0
-#>
-#> ### D07_decsera_does_not_honour_iso_protection
-#> size: 3x10
-#> step: feed a\eVb\eW\e[1;1;1;2${
-#> source: esctest2 decsera.py test_DECSERA_doesNotRespectISOProtect
-#> cite: [E2] decsera.py; [XT] ScrnWipeRectangle IsProtected requires protected_mode == DEC_PROTECT; in iso mode both cells are blanked (esctest2 passes on xterm: no knownBug entry)
-#> note: the one place where xterm's DECSERA differs from its DECSED/DECSEL (M05/M06). DECISION D-P2.
-#> screen:
-#> >   |
-#> >
-#> >
-#> cursor: (0,2)
-#> pending_wrap: false
-#> requests: []
-#> scrollback: len=0
-#> flags: xterm-quirk decision
-#>
-#> ### D08_decsera_with_no_protection_in_use_blanks_the_rect
-#> size: 3x10
-#> step: feed abc\e[1;1;1;3${
-#> cite: [XT] mode off => IsProtected false
-#> screen:
-#> >    |
-#> >
-#> >
-#> cursor: (0,3)
-#> pending_wrap: false
-#> requests: []
-#> scrollback: len=0
-#> flags: control
-#>
-#> ### D09_decsera_is_ignored_below_level_4
-#> size: 3x10
-#> step: feed abc\e[62"p\e[1;1;1;3${
-#> cite: [XT] CASE_DECSERA `if (screen->vtXX_level >= 4)`; Tessera's level gate for DECLRMM/DECSLRM uses the same pattern (ADR 0028)
-#> note: DECSCL 62 is a soft reset and leaves the screen and cursor alone. DECSED/DECSEL/DECSCA are NOT level-gated in xterm.
-#> screen:
-#> >abc|
-#> >
-#> >
-#> cursor: (0,3)
-#> pending_wrap: false
-#> requests: []
-#> scrollback: len=0
-#> flags: decision
-#>
-#> ### D10_decsera_keeps_sgr_attributes_and_the_protection_bit_of_what_stays
-#> size: 3x10
-#> step: feed \e[41mabc\e[0m\e[1;1;1;3${
-#> cite: [DEC] DECSERA "does not change SGR visual attributes, DECSCA protection attributes, or line attributes"; [XT] ScrnWipeRectangle `Clear1Cell` leaves attribs (colour) untouched, unlike ED/EL which use the current background (BCE)
-#> note: the erased cells keep bg=red from the printed text. pen text is sgr_spec.txt canonical form.
-#> screen:
-#> >    |
-#> >
-#> >
-#> cursor: (0,3)
-#> pending_wrap: false
-#> requests: []
-#> scrollback: len=0
-#> attr: (0,0)-(0,2) fg=- bg=1 ul=- us=none flags=-
-#> flags: decision
-#>
-#> ### K02_decrc_protection_with_decsera
-#> size: 3x10
-#> step: feed \e[1"q\e7\e[0"q\e8a\e[1;1;1;1${
-#> source: esctest2 save_restore_cursor.py test_SaveRestoreCursor_Protection (the original, DECSERA form)
-#> cite: [E2] save_restore_cursor.py; [XT] CASE_DECSERA (level >= 4), mode dec so the protected 'a' survives
-#> screen:
-#> >a |
-#> >
-#> >
-#> cursor: (0,1)
-#> pending_wrap: false
-#> requests: []
-#> scrollback: len=0
-#> pstate: dec/1
-#>
-#> ### K03b_scorc_protection_with_decsera
-#> size: 3x10
-#> step: feed \e[1"q\e[s\e[0"q\e[ua\e[1;1;1;1${
-#> source: esctest2 scorc.py via save_restore_cursor.py test_SaveRestoreCursor_Protection (E_SCORC_saveRestoreCursor_protection; DECSERA form like the original)
-#> cite: [E2] scorc.py inherits SaveRestoreCursorTests; [XT] SCOSC/SCORC share CursorSave/CursorRestore with DECSC/DECRC
-#> screen:
-#> >a |
-#> >
-#> >
-#> cursor: (0,1)
-#> pending_wrap: false
-#> requests: []
-#> scrollback: len=0
-
-#> Not covered by rows here (xterm behaviour noted in spec-95-protect.md and ADR 0034):
-#>   - DECERA/DECFRA/DECCRA are not implemented in Tessera at all. xterm's DECERA ignores protection and DECFRA/DECERA stamp the
-#>     pen's PROTECTED bit onto the new blanks (ScrnFillRectangle uses xw->flags). If those ever land, the rows go with them.
-#>   - resize/reflow of a protected soft-wrapped line must keep the bit on each cell: tests/protect.rs protection_survives_reflow.
-#>   - pending-wrap on a fully protected ECH/EL range: xterm does not call ResetWrap (ClearInLine2 returns before it). Tessera
-#>     always disarms; not asserted.
-#>   - xterm's do_erase_display(2) resets the mode to OFF when the erase found no protected cell left (D-P5): NOT replicated.
+# Not covered by rows here (xterm behaviour noted in spec-95-protect.md and ADR 0034):
+#   - DECERA, DECFRA and DECCRA rows live in rect_spec.txt (#251, ADR 0046). DECERA never stamps the pen's PROTECTED bit
+#     (xterm does); DECFRA stamps it, as printing does (xterm too).
+#   - resize/reflow of a protected soft-wrapped line must keep the bit on each cell: tests/protect.rs protection_survives_reflow.
+#   - pending-wrap on a fully protected ECH/EL range: xterm does not call ResetWrap (ClearInLine2 returns before it). Tessera
+#     always disarms; not asserted.
+#   - xterm's do_erase_display(2) resets the mode to OFF when the erase found no protected cell left (D-P5): NOT replicated.

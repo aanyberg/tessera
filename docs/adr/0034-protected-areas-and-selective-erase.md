@@ -156,3 +156,21 @@ with DECSEL.
   most 1.02, `erase_heavy_after_epa` at most 1.05).
 - `cargo xtask ab diff` against the base agrees on input without SPA, EPA,
   DECSCA, DECSED, DECSEL and DA1/DECRQSS queries.
+
+## Amendment: rectangular area operations (#251, 2026-11-13)
+
+**DECSERA implemented.** The "DECSERA descoped" paragraph above no longer
+holds: #251 adds DECSERA with DECERA, DECFRA and DECCRA (ADR 0046). DECSERA
+erases to spaces that keep the cells' fg, bg, SGR flags and PROTECTED bit
+(D-P7, widened from the background alone: protect_spec.txt D10 checks all
+of them); it keeps the protected cells in DEC mode only, and erases every
+cell in ISO mode and with protection off, as xterm does. The fixture rows
+D01-D10, K02 and K03b and the esctest2 `saveRestoreCursor_protection` rows
+are live.
+
+**Filled cells carry the bit.** "Erase, insertion and scroll blanks never
+carry the bit" stays true of every erase, DECERA and DECSERA included.
+DECFRA is not an erase: its cells are written characters, like printed
+ones, and take the pen's full style, PROTECTED included, so DECFRA with
+DECSCA 1 in force writes protected cells that DECSED keeps (RF22). DECCRA
+copies the bit with the cell, as the other moving operations do.

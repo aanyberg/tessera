@@ -310,7 +310,13 @@ fn fixture_is_well_formed() {
     }
 
     let statements = pending_statements(FIXTURE);
-    assert!(!statements.is_empty(), "no pending `#>` lines");
+    // #251 lifted the last pending tests; a `#>` line added later must
+    // still parse as a statement.
+    assert_eq!(
+        statements.is_empty(),
+        !FIXTURE.lines().any(|line| line.starts_with("#>")),
+        "`#>` lines that are no pending statement"
+    );
     for text in &statements {
         // The ids come before the first `->`, the issue right after it;
         // prose further on may mention live cases or other arrows.

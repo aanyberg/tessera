@@ -76,6 +76,13 @@
 //! into the scrollback. Both pairs are shared by the primary and the
 //! alternate screen.
 //!
+//! # Rectangles
+//!
+//! [`Grid::erase_rect`], [`Grid::fill_rect`], [`Grid::copy_rect`] and
+//! [`Grid::selective_erase_rect`] edit a [`Rect`] of the screen in one call
+//! (DECERA, DECFRA, DECCRA, DECSERA; ADR 0046), without moving the cursor or
+//! touching the lines' wrap flags and marks.
+//!
 //! Assumptions this crate documents rather than enforces:
 //!
 //! - Origin mode (DECOM) is a terminal mode. The grid exposes
@@ -90,6 +97,7 @@ mod grapheme;
 mod grid;
 mod hyperlink;
 mod line;
+mod rect;
 mod reflow;
 mod scrollback;
 mod tabs;
@@ -104,5 +112,6 @@ pub use hyperlink::{
     Hyperlink, LinkRefused, MAX_ID_BYTES, MAX_LINK_TABLE_BYTES, MAX_LIVE_LINKS, MAX_URI_BYTES,
 };
 pub use line::{Line, Mark};
+pub use rect::Rect;
 pub use scrollback::Scrollback;
 pub use tabs::TabStops;
