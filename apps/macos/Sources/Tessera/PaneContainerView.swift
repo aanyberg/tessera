@@ -420,12 +420,12 @@ final class PaneContainerView: NSView, NSSplitViewDelegate, NSMenuItemValidation
     /// whose top edge is this view's (all but the maximized one are hidden
     /// while one is). Their sessions' backgrounds tint the strip above them
     /// in a translucent window (``TerminalWindowContentView``, #388). A pane
-    /// with no visible width is passed over.
+    /// with no visible width or height is passed over.
     var topEdgePanes: [(leaf: Pane, frame: CGRect)] {
         if let zoomedPane {
             return [(zoomedPane, convert(zoomedPane.view.bounds, from: zoomedPane.view))]
         }
-        return paneFrames.filter { $0.frame.minY <= bounds.minY + 0.5 && $0.frame.width >= 1 }
+        return paneFrames.filter { $0.frame.minY <= bounds.minY + 0.5 && $0.frame.width >= 1 && $0.frame.height >= 1 }
     }
 
     /// A pane moved or was resized (a split, a divider, a window resize, a

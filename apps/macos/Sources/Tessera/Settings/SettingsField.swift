@@ -108,6 +108,15 @@ extension SettingsField {
         context.model.endChange(context.path)
     }
 
+    /// A slider's or stepper's `onEditingChanged`: ``endEditing(_:)`` once
+    /// the control is let go, nothing as it is taken.
+    @MainActor
+    func editingChanged(_ context: SettingsFieldContext) -> (Bool) -> Void {
+        { editing in
+            if !editing { endEditing(context) }
+        }
+    }
+
     /// An integer slider's: as a slider's, writing the whole number nearest
     /// the knob, within the range.
     @MainActor
@@ -219,9 +228,8 @@ struct SettingsFieldRow: View {
             let value = field.doubleBinding(context)
             LabeledContent(field.title) {
                 HStack {
-                    Slider(value: value, in: range, step: step) { editing in
-                        if !editing { field.endEditing(context) }
-                    }
+                    Slider(
+                        value: value, in: range, step: step, onEditingChanged: field.editingChanged(context))
                     Text(percent ? "\(Int((value.wrappedValue * 100).rounded())) %" : String(format: "%.2f", value.wrappedValue))
                         .monospacedDigit()
                         .frame(minWidth: 44, alignment: .trailing)
@@ -231,9 +239,9 @@ struct SettingsFieldRow: View {
             let value = field.integerSliderBinding(context)
             LabeledContent(field.title) {
                 HStack {
-                    Slider(value: value, in: Double(range.lowerBound)...Double(range.upperBound), step: 1) { editing in
-                        if !editing { field.endEditing(context) }
-                    }
+                    Slider(
+                        value: value, in: Double(range.lowerBound)...Double(range.upperBound), step: 1,
+                        onEditingChanged: field.editingChanged(context))
                     Text(value.wrappedValue == 0 ? zeroTitle : "\(Int64(value.wrappedValue))")
                         .monospacedDigit()
                         .frame(minWidth: 44, alignment: .trailing)
@@ -242,9 +250,7 @@ struct SettingsFieldRow: View {
         case .stepper(let range, let step, let unit):
             let value = field.doubleBinding(context)
             LabeledContent(field.title) {
-                Stepper(value: value, in: range, step: step) { editing in
-                    if !editing { field.endEditing(context) }
-                } label: {
+                Stepper(value: value, in: range, step: step, onEditingChanged: field.editingChanged(context)) {
                     Text("\(value.wrappedValue.formatted(.number.precision(.fractionLength(0...1)))) \(unit)")
                         .monospacedDigit()
                 }

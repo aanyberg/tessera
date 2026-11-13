@@ -46,6 +46,11 @@ private final class BlurRecorder {
         return nextNumber
     }
 
+    /// Takes `window` "off screen": it has no number, and nothing is posted.
+    func hide(_ window: NSWindow) {
+        numbers[ObjectIdentifier(window)] = nil
+    }
+
     func calls(for window: NSWindow) -> [UInt32] {
         guard let number = number(of: window) else { return [] }
         return calls.filter { $0.windowNumber == number }.map(\.radius)
@@ -223,6 +228,36 @@ final class BlurRadiusTests: XCTestCase {
             recorder.calls.suffix(2), [.init(windowNumber: number, radius: 10), .init(windowNumber: renumbered, radius: 10)],
             "a new window number gets the radius again")
         try assertRadius(controller, true, "renumbered")
+    }
+
+    /// #405 m1, n3: while the window is off screen (an unselected tab,
+    /// minimized) it keeps the radius set on it, so an update meanwhile (a
+    /// theme reload, a new pane) keeps the panes' own material hidden, and
+    /// reselecting the tab does not flash it.
+    func testAnUpdateWhileOffScreenKeepsTheBlurState() throws {
+        let host = try startHost()
+        let controller = try host.open(profile: nil)
+        try requireSurfaces(controller.panes)
+        let window = try XCTUnwrap(controller.window)
+        recorder.show(window)
+        controller.windowBlurRadius = 20
+        try assertRadius(controller, true, "on screen")
+
+        recorder.hide(window)
+        for pane in controller.panes {
+            pane.view.appearanceDidChange()
+        }
+        try assertRadius(controller, true, "off screen, the theme reloaded")
+        let pane = try split(controller, profile: nil)
+        try requireSurfaces([pane])
+        XCTAssertNotNil(pane.view.backdrop, "a blurred pane")
+        try assertRadius(controller, true, "off screen, a new pane")
+        XCTAssertEqual(recorder.calls(for: window), [], "no call without a number")
+        XCTAssertEqual(recorder.calls.map(\.radius), [20])
+
+        recorder.show(window)
+        try assertRadius(controller, true, "back on screen")
+        XCTAssertEqual(recorder.calls(for: window), [20], "set on the new number")
     }
 
     /// D5 (ii): a tab with a translucent pane that asks for no blur is not
@@ -509,6 +544,301 @@ final class BlurRadiusReloadTests: XCTestCase {
             name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: NSWorkspace.shared)
         try await waitUntil("turned off: the radius is back") {
             windows.allSatisfy { self.recorder.calls(for: $0).last == 64 }
+        }
+    }
+}
+
+/// A tab window shows the state its panes ask for whenever it comes on
+/// screen (#409, #405 n1): opaque or transparent, its title bar, the strip
+/// under the title bar and tab bar, and its blur radius, by every route that
+/// selects a tab or brings a window back, as a fresh attach of the tab gives.
+/// Through the app's own windows and tabs and `config.toml`, posting nothing:
+/// a radius changed while a tab is off screen reaches it as it is shown. The
+/// window-number seam is the real guard, and treats an unselected tab as off
+/// screen (as WindowServer does; this host reports such a tab visible).
+@MainActor
+final class TabVisibilityTests: XCTestCase {
+    private var appDelegate: AppDelegate!
+    private var dir: URL!
+    private var previous: String?
+    private var recorder: BlurRecorder!
+    private var savedBackend: WindowBlurRadius.Backend?
+    private var savedWindowNumber: (@MainActor (NSWindow) -> Int?)!
+
+    override func setUp() async throws {
+        appDelegate = try XCTUnwrap(NSApp.delegate as? AppDelegate)
+        XCTAssertTrue(appDelegate.windowControllers.isEmpty, "a previous test left windows open")
+        appDelegate.spawnOptions = .init(program: "/bin/cat")
+        appDelegate.reducesTransparency = { false }
+        dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-tab-blur-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try write(radius: 20)
+        previous = ProcessInfo.processInfo.environment["TESSERA_CONFIG_DIR"]
+        setenv("TESSERA_CONFIG_DIR", dir.path, 1)
+        recorder = BlurRecorder()
+        savedBackend = WindowBlurRadius.backend
+        savedWindowNumber = WindowBlurRadius.windowNumber
+        WindowBlurRadius.backend = recorder.backend
+        let real = savedWindowNumber!
+        WindowBlurRadius.windowNumber = { window in
+            (window.tabGroup?.selectedWindow ?? window) === window ? real(window) : nil
+        }
+        try appDelegate.replaceCore(start: true)
+    }
+
+    override func tearDown() async throws {
+        if NSApp.isHidden { NSApp.unhide(nil) }
+        for controller in appDelegate.windowControllers {
+            controller.window?.close()
+        }
+        XCTAssertTrue(appDelegate.windowControllers.isEmpty)
+        try appDelegate.replaceCore(start: false)
+        appDelegate.spawnOptions = .init()
+        HostDisplaySettings.pin(appDelegate)
+        appDelegate.windowBlurRadius = 0
+        appDelegate = nil
+        WindowBlurRadius.backend = savedBackend
+        WindowBlurRadius.windowNumber = savedWindowNumber
+        recorder = nil
+        if let previous { setenv("TESSERA_CONFIG_DIR", previous, 1) } else { unsetenv("TESSERA_CONFIG_DIR") }
+        try? FileManager.default.removeItem(at: dir)
+    }
+
+    private func write(radius: Int) throws {
+        let config = TransparencyTests.config.replacingOccurrences(
+            of: "blur = true", with: "blur = true\nblur_radius = \(radius)")
+        try config.write(to: dir.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)
+    }
+
+    private func waitUntil(_ description: String, _ condition: () -> Bool) async throws {
+        let deadline = ContinuousClock.now + .seconds(10)
+        while !condition() {
+            guard ContinuousClock.now < deadline else {
+                XCTFail("timed out: \(description)")
+                throw BlurTimedOut(description: description)
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    /// Two tabs of one window, the first (default profile: translucent,
+    /// blurred) selected, the second of `profile`; the radius then changed
+    /// to 40 in the file, which the unselected second tab cannot take yet.
+    private func openTabs(
+        second profile: String?
+    ) async throws -> (TerminalWindowController, TerminalWindowController) {
+        let first = try appDelegate.newWindow()
+        let window = try XCTUnwrap(first.window)
+        let second = try appDelegate.newTab(in: window, profile: profile)
+        let tab = try XCTUnwrap(second.window)
+        guard MTLCreateSystemDefaultDevice() != nil, (first.panes + second.panes).allSatisfy(\.view.surface.isAttached)
+        else {
+            throw XCTSkip("the core could not attach a renderer to the views (no GPU can present, or no font)")
+        }
+        guard window.windowNumber > 0, tab.windowNumber > 0, savedWindowNumber(tab) != nil else {
+            throw XCTSkip("the host puts no window on screen")
+        }
+        XCTAssertTrue(window.tabGroup === tab.tabGroup, "one tab group")
+        window.tabGroup?.selectedWindow = window
+        XCTAssertNil(WindowBlurRadius.windowNumber(tab), "the second tab is off screen")
+        try write(radius: 40)
+        try await waitUntil("the reload reaches both tabs") {
+            appDelegate.windowBlurRadius == 40 && [first, second].allSatisfy { $0.windowBlurRadius == 40 }
+        }
+        XCTAssertEqual(recorder.calls.filter { $0.windowNumber == window.windowNumber }.last?.radius, 40)
+        if profile == nil {
+            XCTAssertEqual(
+                try XCTUnwrap(tab.contentView as? TerminalWindowContentView).appliedBlur?.radius, 20,
+                "the unselected tab keeps the radius it had")
+        }
+        return (first, second)
+    }
+
+    /// The state a fresh attach of `controller`'s tab gives its window, on
+    /// screen: transparent with a transparent title bar over a tinted strip
+    /// while `translucent`, which fills exactly what is above the panes, under
+    /// the panes and the title bar's views; blurred at `radius` (the panes'
+    /// own material hidden) while above 0; a standard opaque window otherwise.
+    private func assertShown(
+        _ controller: TerminalWindowController, translucent: Bool, radius: UInt32, _ what: String,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        guard let window = controller.window, let content = window.contentView as? TerminalWindowContentView else {
+            return XCTFail("\(what): a tab window's content", file: file, line: line)
+        }
+        XCTAssertTrue(window.tabGroup?.selectedWindow ?? window === window, "\(what): selected", file: file, line: line)
+        XCTAssertEqual(window.isOpaque, !translucent, "\(what): opaque", file: file, line: line)
+        XCTAssertEqual(
+            window.backgroundColor, translucent ? .clear : .windowBackgroundColor, "\(what): background", file: file,
+            line: line)
+        XCTAssertEqual(
+            window.styleMask.contains(.fullSizeContentView), translucent, "\(what): full-size content", file: file,
+            line: line)
+        XCTAssertEqual(window.titlebarAppearsTransparent, translucent, "\(what): title bar", file: file, line: line)
+        let area = content.convert(window.contentLayoutRect, from: nil)
+        XCTAssertEqual(controller.paneContainer.frame, area, "\(what): the panes' frame", file: file, line: line)
+        if translucent {
+            let strip = NSRect(
+                x: content.bounds.minX, y: area.maxY, width: content.bounds.width,
+                height: content.bounds.maxY - area.maxY)
+            XCTAssertGreaterThan(strip.height, 0, "\(what): a strip", file: file, line: line)
+            XCTAssertEqual(content.titlebarBackdrop?.frame, strip, "\(what): the strip's blur", file: file, line: line)
+            XCTAssertEqual(content.titlebarTint?.frame, strip, "\(what): the strip's tint", file: file, line: line)
+            XCTAssertEqual(
+                content.subviews.map { ObjectIdentifier($0) },
+                [content.titlebarBackdrop, content.titlebarTint, controller.paneContainer].compactMap {
+                    $0.map { ObjectIdentifier($0) }
+                }, "\(what): blur, tint, panes, bottom up", file: file, line: line)
+            XCTAssertEqual(
+                content.titlebarTint?.segments.first?.minX, 0, "\(what): the tint spans the strip", file: file,
+                line: line)
+            XCTAssertEqual(
+                content.titlebarTint?.segments.last?.maxX, strip.width, "\(what): to its end", file: file, line: line)
+        } else {
+            XCTAssertNil(content.titlebarBackdrop, "\(what): no strip", file: file, line: line)
+            XCTAssertNil(content.titlebarTint, "\(what): no tint", file: file, line: line)
+        }
+        // The title bar's views (its buttons, title and the tab bar) stay
+        // over the content, which would cover them with the strip (#409).
+        if let close = window.standardWindowButton(.closeButton), let frame = content.superview {
+            let above = frame.subviews.drop { $0 !== content }.dropFirst()
+            XCTAssertTrue(
+                above.contains { close.isDescendant(of: $0) }, "\(what): the title bar over the content", file: file,
+                line: line)
+            XCTAssertFalse(close.isHiddenOrHasHiddenAncestor, "\(what): the title bar shown", file: file, line: line)
+        } else {
+            XCTFail("\(what): a title bar", file: file, line: line)
+        }
+        XCTAssertEqual(content.usesBlurRadius, radius > 0, "\(what): blurred at the radius", file: file, line: line)
+        if radius > 0 {
+            XCTAssertEqual(
+                content.appliedBlur?.windowNumber, window.windowNumber, "\(what): set on this window", file: file,
+                line: line)
+            XCTAssertEqual(content.appliedBlur?.radius, radius, "\(what): the radius", file: file, line: line)
+        } else {
+            XCTAssertEqual(content.appliedBlur?.radius ?? 0, 0, "\(what): no radius", file: file, line: line)
+        }
+        for pane in controller.panes {
+            if let backdrop = pane.view.backdrop {
+                XCTAssertEqual(backdrop.isHidden, radius > 0, "\(what): the pane's material", file: file, line: line)
+            }
+        }
+    }
+
+    /// Each route that selects the second tab, with that tab translucent
+    /// and blurred like the first, then opaque.
+    private func checkRoute(_ name: String, _ select: (NSWindow, NSWindow) -> Void) async throws {
+        for profile in [nil, "solid"] {
+            let (first, second) = try await openTabs(second: profile)
+            let window = try XCTUnwrap(first.window)
+            let tab = try XCTUnwrap(second.window)
+            select(window, tab)
+            assertShown(
+                second, translucent: profile == nil, radius: profile == nil ? 40 : 0,
+                "\(name), second tab \(profile ?? "translucent")")
+            for controller in appDelegate.windowControllers {
+                controller.window?.close()
+            }
+        }
+    }
+
+    func testSelectNextTabShowsTheTabsState() async throws {
+        try await checkRoute("⇧⌘]") { window, _ in window.selectNextTab(nil) }
+    }
+
+    func testSelectingATabByNumberShowsItsState() async throws {
+        try await checkRoute("⌘2") { window, _ in (window as? TerminalWindow)?.selectTab(at: 1) }
+    }
+
+    func testSettingTheSelectedWindowShowsItsState() async throws {
+        try await checkRoute("selectedWindow") { window, tab in window.tabGroup?.selectedWindow = tab }
+    }
+
+    func testClosingTheSelectedTabShowsTheNextTabsState() async throws {
+        try await checkRoute("closing the selected tab") { window, _ in window.close() }
+    }
+
+    func testMakeKeyAndOrderFrontShowsTheTabsState() async throws {
+        try await checkRoute("makeKeyAndOrderFront") { _, tab in tab.makeKeyAndOrderFront(nil) }
+    }
+
+    /// #405 n1: the radius changed in the file while the window's tabs are
+    /// minimized, then while the app is hidden, reaches every tab window as
+    /// it comes back, through the real window-number guard (a minimized or
+    /// hidden window has none), with no notification posted by the test.
+    func testARadiusChangedWhileMinimizedOrHiddenReachesEveryTab() async throws {
+        WindowBlurRadius.windowNumber = savedWindowNumber
+        let first = try appDelegate.newWindow()
+        let window = try XCTUnwrap(first.window)
+        let second = try appDelegate.newTab(in: window)
+        let tab = try XCTUnwrap(second.window)
+        let controllers = [first, second]
+        guard MTLCreateSystemDefaultDevice() != nil, controllers.flatMap(\.panes).allSatisfy(\.view.surface.isAttached)
+        else {
+            throw XCTSkip("the core could not attach a renderer to the views (no GPU can present, or no font)")
+        }
+        guard savedWindowNumber(window) != nil || savedWindowNumber(tab) != nil else {
+            throw XCTSkip("the host puts no window on screen")
+        }
+        let contents = try controllers.map { try XCTUnwrap($0.window?.contentView as? TerminalWindowContentView) }
+        func radii() -> [UInt32?] { contents.map { $0.appliedBlur?.radius } }
+
+        tab.miniaturize(nil)
+        let deadline = ContinuousClock.now + .seconds(10)
+        while !tab.isMiniaturized, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        guard tab.isMiniaturized else { throw XCTSkip("the host cannot minimize a window (no Dock)") }
+        try await waitUntil("minimized") { [window, tab].allSatisfy { !$0.isVisible } }
+        try write(radius: 40)
+        try await waitUntil("the reload reaches both tabs") { controllers.allSatisfy { $0.windowBlurRadius == 40 } }
+        XCTAssertFalse(radii().contains(40), "minimized: no window number to set it on")
+        tab.deminiaturize(nil)
+        try await waitUntil("restored, every tab at the new radius") { radii() == [40, 40] }
+        XCTAssertEqual(contents.map(\.usesBlurRadius), [true, true])
+
+        NSApp.hide(nil)
+        try await waitUntil("hidden") { NSApp.isHidden }
+        try write(radius: 30)
+        try await waitUntil("the reload reaches both tabs") { controllers.allSatisfy { $0.windowBlurRadius == 30 } }
+        NSApp.unhide(nil)
+        try await waitUntil("shown again, every tab at the new radius") { radii() == [30, 30] }
+        XCTAssertEqual(contents.map(\.usesBlurRadius), [true, true])
+    }
+
+    /// #403 m2: the smallest frame of a translucent tabbed window, set by a
+    /// program, leaves every pane its smallest size under the title bar and
+    /// the tab bar, also after a frame too small to show any pane.
+    func testTheSmallestTabbedWindowKeepsThePanesSmallestSize() throws {
+        let first = try appDelegate.newWindow()
+        let window = try XCTUnwrap(first.window)
+        let second = try appDelegate.newTab(in: window)
+        guard MTLCreateSystemDefaultDevice() != nil, (first.panes + second.panes).allSatisfy(\.view.surface.isAttached)
+        else {
+            throw XCTSkip("the core could not attach a renderer to the views (no GPU can present, or no font)")
+        }
+        _ = try first.splitFocusedPane(.below)
+        let tab = try XCTUnwrap(second.window)
+        let content = try XCTUnwrap(tab.contentView as? TerminalWindowContentView)
+        let titlebar = TerminalWindowContentView.standardTitlebarHeight(of: tab)
+        let strip = content.bounds.maxY - content.paneArea.maxY
+        guard strip > titlebar + 1 else { throw XCTSkip("the host shows no tab bar") }
+
+        for controller in [second, first] {
+            let window = try XCTUnwrap(controller.window)
+            window.tabGroup?.selectedWindow = window
+            controller.paneContainer.layoutSubtreeIfNeeded()
+            var tiny = window.frame
+            tiny.size.height = 20
+            window.setFrame(tiny, display: false)
+            var smallest = window.frame
+            smallest.size.height =
+                window.frameRect(forContentRect: NSRect(origin: .zero, size: window.contentMinSize)).height
+            window.setFrame(smallest, display: false)
+            controller.paneContainer.layoutSubtreeIfNeeded()
+            for pane in controller.panes {
+                XCTAssertGreaterThanOrEqual(
+                    pane.view.frame.height, PaneContainerView.minimumSize(of: pane.view).height - 0.5,
+                    "\(controller.panes.count) panes: each keeps its smallest height")
+            }
         }
     }
 }
