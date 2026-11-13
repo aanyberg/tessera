@@ -174,14 +174,12 @@ fn edit(function: &'static str, app: &App, key: &str, change: Change) -> Result<
     // The key map is compiled quietly: its warnings are compared, not
     // logged (the watch logs them when it applies the file).
     let quiet = |config: Option<&tessera_app_core::Config>| -> Vec<String> {
-        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
-            config.map_or_else(Vec::new, |config| {
-                Keymap::compile(&config.keys)
-                    .warnings()
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect()
-            })
+        config.map_or_else(Vec::new, |config| {
+            Keymap::compile_quietly(&config.keys)
+                .warnings()
+                .iter()
+                .map(ToString::to_string)
+                .collect()
         })
     };
     let mut before = quiet(editor.config());
@@ -201,13 +199,16 @@ fn edit(function: &'static str, app: &App, key: &str, change: Change) -> Result<
         })
         .collect();
     if !new.is_empty() {
-        let path = key.parse::<tessera_app_core::edit::KeyPath>();
-        if let Ok(path) = path {
-            tracing::info!(function, %path, kind = "refused by the key map", "config edit not saved");
-        }
+        // The edit took the key path, so it parses; it displays escaped as
+        // the loader escapes the file's text (S3, S8): the message reaches
+        // a settings window, and the caller's text must not reorder it.
+        let path = key
+            .parse::<tessera_app_core::edit::KeyPath>()
+            .map_or_else(|_| "?".to_owned(), |path| path.to_string());
+        tracing::info!(function, %path, kind = "refused by the key map", "config edit not saved");
         return Err(Failure::new(
             Error::Refused,
-            format!("`{key}` refused: {}", new.join("; ")),
+            format!("`{path}` refused: {}", new.join("; ")),
         ));
     }
     editor.save().map_err(|e| failure(function, key, &e))?;
@@ -329,8 +330,9 @@ pub unsafe extern "C" fn tessera_config_json(
         let Some(app) = (unsafe { App::from_ptr(app) }) else {
             return Error::NullPointer;
         };
-        let generation = app.core.config_generation();
-        let config = app.core.config();
+        // Read together (#348): read one after the other, an apply in
+        // between gave a configuration with another apply's generation.
+        let (config, generation) = app.core.config_and_generation();
         let json = serde_json::json!({
             "generation": generation,
             "config": &*config,
@@ -610,6 +612,97 @@ pub unsafe extern "C" fn tessera_theme_import(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #348: a refusal names the caller's key path escaped, so an
+    /// invisible character in it (U+200B) reaches the settings window as
+    /// `\u{200b}`, never as itself (S3, S8).
+    #[test]
+    fn a_refusal_escapes_the_callers_key_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App {
+            core: tessera_app_core::App::new(
+                tessera_app_core::Config::default(),
+                tessera_app_core::ConfigPaths::new(dir.path()),
+            ),
+        };
+        let value = || Change::Set(TomlValue::String("new_tab".into()));
+        let failure = edit("test", &app, "keys.\"cmd+\u{200B}\"", value()).unwrap_err();
+        assert_eq!(failure.code, Error::Refused, "{}", failure.message);
+        assert!(
+            failure
+                .message
+                .starts_with("`keys.\"cmd+\\u{200b}\"` refused")
+                && !failure.message.contains('\u{200B}'),
+            "{}",
+            failure.message
+        );
+        // Refused by the key map (an unknown command), the same way.
+        let bogus = Change::Set(TomlValue::String("bogus".into()));
+        let failure = edit("test", &app, "keys.\"cmd+j\"", bogus).unwrap_err();
+        assert_eq!(failure.code, Error::Refused, "{}", failure.message);
+        assert!(
+            failure.message.starts_with("`keys.\"cmd+j\"` refused: ")
+                && failure.message.contains("unknown command `bogus`"),
+            "{}",
+            failure.message
+        );
+    }
+
+    /// #348, staged: an apply started between the configuration and its
+    /// generation cannot finish there (the combined read holds the lock
+    /// the configuration is recorded under), so the JSON is the old
+    /// configuration with the old generation. Read one after the other
+    /// (in either order), the apply lands in between and they disagree.
+    #[test]
+    fn an_apply_cannot_land_between_the_configuration_and_its_generation() {
+        use std::sync::Arc;
+        let app = Arc::new(App {
+            core: tessera_app_core::App::new(
+                tessera_app_core::Config::default(),
+                tessera_app_core::ConfigPaths::new("/nonexistent/tessera"),
+            ),
+        });
+        let (start, started) = std::sync::mpsc::channel::<()>();
+        let (finish, finished) = std::sync::mpsc::channel::<()>();
+        let applier = {
+            let app = Arc::clone(&app);
+            std::thread::spawn(move || {
+                let bound =
+                    tessera_app_core::Config::from_toml_lenient("[keys]\n'cmd+u' = 'new_tab'\n")
+                        .unwrap()
+                        .config;
+                started.recv().unwrap();
+                app.core
+                    .apply_config(&bound, &tessera_config::Theme::default());
+                // The reader stopped listening if the apply had to wait.
+                let _ = finish.send(());
+            })
+        };
+        tessera_app_core::App::pause_between_reads_for_test(move || {
+            start.send(()).unwrap();
+            // Long enough for an unblocked apply even under load; a
+            // blocked one never finishes here.
+            let _ = finished.recv_timeout(std::time::Duration::from_millis(500));
+        });
+        let mut buf = vec![0u8; 1 << 20];
+        let mut len = 0usize;
+        // SAFETY: a live handle, a writable length and a buffer of its size.
+        let code = unsafe {
+            tessera_config_json(Arc::as_ptr(&app), buf.as_mut_ptr(), buf.len(), &raw mut len)
+        };
+        applier.join().unwrap();
+        assert_eq!(code, Error::Ok);
+        let json: serde_json::Value = serde_json::from_slice(&buf[..len]).unwrap();
+        assert_eq!(
+            (
+                json["generation"].as_u64().unwrap(),
+                &json["config"]["keys"]
+            ),
+            (0, &serde_json::json!({})),
+            "an apply landed between the reads"
+        );
+        assert_eq!(app.core.config_generation(), 1);
+    }
 
     #[test]
     fn messages_are_cut_on_a_character_boundary() {

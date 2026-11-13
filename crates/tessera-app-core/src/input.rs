@@ -299,7 +299,10 @@ impl Bindings {
 
     /// The key map in effect.
     pub(crate) fn keymap(&self) -> Arc<Keymap> {
-        Arc::clone(&lock(&self.map))
+        let map = Arc::clone(&lock(&self.map));
+        #[cfg(any(test, feature = "test-hooks"))]
+        read_pause::between_reads();
+        map
     }
 
     /// The key map in effect and the generation of the configuration it
@@ -309,8 +312,8 @@ impl Bindings {
     pub(crate) fn keymap_and_generation(&self) -> (Arc<Keymap>, u64) {
         let guard = lock(&self.map);
         let map = Arc::clone(&guard);
-        #[cfg(test)]
-        tests::between_reads();
+        #[cfg(any(test, feature = "test-hooks"))]
+        read_pause::between_reads();
         (map, self.generation.load(Ordering::Relaxed))
     }
 
@@ -355,7 +358,37 @@ impl Bindings {
 
     /// The number of configurations applied since the app started.
     pub(crate) fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Relaxed)
+        let generation = self.generation.load(Ordering::Relaxed);
+        #[cfg(any(test, feature = "test-hooks"))]
+        read_pause::between_reads();
+        generation
+    }
+}
+
+/// The pause point of the reads that must come from one apply: run once
+/// on its thread by [`Bindings::keymap`] and [`Bindings::generation`]
+/// after their read, by [`Bindings::keymap_and_generation`] between the
+/// map and the generation, and by `Live::config` and
+/// `Live::config_and_generation` likewise, so a test can land an apply right there
+/// ([`App::pause_between_reads_for_test`](crate::App::pause_between_reads_for_test); #348).
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) mod read_pause {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `hook` at this thread's next pause point.
+    pub(crate) fn set(hook: Box<dyn FnOnce()>) {
+        HOOK.with(|cell| *cell.borrow_mut() = Some(hook));
+    }
+
+    /// The pause point.
+    pub(crate) fn between_reads() {
+        if let Some(hook) = HOOK.with(|cell| cell.borrow_mut().take()) {
+            hook();
+        }
     }
 }
 
@@ -657,20 +690,6 @@ mod tests {
         assert_eq!(map.chords(new_tab).len(), 2, "cmd+u and cmd+t");
     }
 
-    thread_local! {
-        /// Run once by [`Bindings::keymap_and_generation`] on this thread,
-        /// after it took the map and before it reads the generation.
-        static BETWEEN_READS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-            const { std::cell::RefCell::new(None) };
-    }
-
-    /// The pause point of [`Bindings::keymap_and_generation`].
-    pub(super) fn between_reads() {
-        if let Some(hook) = BETWEEN_READS.with(|cell| cell.borrow_mut().take()) {
-            hook();
-        }
-    }
-
     /// M4 (#317), staged: an apply started between taking the map and
     /// reading the generation cannot finish there (it waits for the lock),
     /// so the pair is the old map with the old generation. Read with the
@@ -695,15 +714,13 @@ mod tests {
         };
         let landed = Arc::new(Mutex::new(None));
         let hook_landed = Arc::clone(&landed);
-        BETWEEN_READS.with(|cell| {
-            *cell.borrow_mut() = Some(Box::new(move || {
-                start.send(()).unwrap();
-                // Long enough for an unblocked apply even under load; a
-                // blocked one never finishes here.
-                let outcome = finished.recv_timeout(std::time::Duration::from_millis(500));
-                *hook_landed.lock().unwrap() = outcome.ok();
-            }));
-        });
+        read_pause::set(Box::new(move || {
+            start.send(()).unwrap();
+            // Long enough for an unblocked apply even under load; a
+            // blocked one never finishes here.
+            let outcome = finished.recv_timeout(std::time::Duration::from_millis(500));
+            *hook_landed.lock().unwrap() = outcome.ok();
+        }));
         let (map, generation) = bindings.keymap_and_generation();
         let new_tab = CommandId::find("new_tab", None).unwrap();
         assert_eq!(
@@ -714,6 +731,115 @@ mod tests {
         );
         applier.join().unwrap();
         assert_eq!(bindings.keymap_and_generation().0.chords(new_tab).len(), 2);
+    }
+
+    /// #317 K3: non-ASCII chords through the lock-free filter: a bound
+    /// `cmd+ö` and a Cyrillic key standing in for its base-layout `t`
+    /// (⌘T) both reach the map.
+    #[test]
+    fn non_ascii_chords_pass_the_filter() {
+        let config = Config::from_toml_lenient("[keys]\n'cmd+ö' = 'new_window'\n")
+            .unwrap()
+            .config;
+        let bindings = Bindings::new(&config);
+        let command = |event: &KeyEvent| {
+            bindings
+                .with_binding(event, |_, binding| match binding {
+                    Binding::Command(id) => Some(id),
+                    _ => None,
+                })
+                .flatten()
+        };
+        let new_window = CommandId::find("new_window", None).unwrap();
+        let new_tab = CommandId::find("new_tab", None).unwrap();
+        assert_eq!(
+            command(&KeyEvent::new(Key::Char('ö'), Modifiers::SUPER)),
+            Some(new_window)
+        );
+        let mut cyrillic = KeyEvent::new(Key::Char('е'), Modifiers::SUPER);
+        cyrillic.base_layout_key = Some('t');
+        assert_eq!(command(&cyrillic), Some(new_tab));
+        // And one with no binding is still refused.
+        assert_eq!(
+            command(&KeyEvent::new(Key::Char('ä'), Modifiers::SUPER)),
+            None
+        );
+    }
+
+    /// #317 K3: a configuration applied live that binds a chord with a
+    /// modifier set no chord had (⌃⌥) publishes the new mask and filter,
+    /// so the key reaches the new map; and dropping it again refuses it.
+    #[test]
+    fn a_live_config_with_a_new_modifier_set_is_seen() {
+        let bindings = Bindings::new(&Config::default());
+        let event = KeyEvent::new(Key::Char('x'), Modifiers::CTRL | Modifiers::ALT);
+        let found = |bindings: &Bindings| bindings.with_binding(&event, |_, _| ()).is_some();
+        assert!(!admits(
+            bindings.mask.load(Ordering::Relaxed),
+            event.modifiers
+        ));
+        assert!(!found(&bindings));
+        let config = Config::from_toml_lenient("[keys]\n'ctrl+alt+x' = 'new_tab'\n")
+            .unwrap()
+            .config;
+        bindings.applied(&config);
+        assert!(found(&bindings), "the new mask and filter are published");
+        bindings.applied(&Config::default());
+        assert!(!found(&bindings));
+        assert!(!admits(
+            bindings.mask.load(Ordering::Relaxed),
+            event.modifiers
+        ));
+    }
+
+    /// #348 M1 (lead decision D2-4): two applies of different `[keys]`
+    /// racing, 20,000 times: once both returned, the configuration in
+    /// effect and the key map in effect are those of the same apply. The
+    /// key map used to be compiled from each apply's own configuration
+    /// under its own lock, after the configuration was recorded, so the
+    /// apply that recorded first could publish its key map last (8,466
+    /// of 20,000 trials).
+    #[test]
+    fn racing_applies_leave_the_configuration_and_its_key_map_together() {
+        const TRIALS: usize = 20_000;
+        let app = Arc::new(crate::App::new(
+            Config::default(),
+            tessera_config::ConfigPaths::new("/nonexistent/tessera"),
+        ));
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let appliers: Vec<_> = ["cmd+u", "cmd+j"]
+            .into_iter()
+            .map(|chord| {
+                let app = Arc::clone(&app);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let config =
+                        Config::from_toml_lenient(&format!("[keys]\n'{chord}' = 'new_tab'\n"))
+                            .unwrap()
+                            .config;
+                    let theme = tessera_config::Theme::default();
+                    for _ in 0..TRIALS {
+                        barrier.wait();
+                        app.apply_config(&config, &theme);
+                        barrier.wait();
+                    }
+                })
+            })
+            .collect();
+        let new_tab = CommandId::find("new_tab", None).unwrap();
+        let mut apart = 0_usize;
+        for _ in 0..TRIALS {
+            barrier.wait();
+            barrier.wait();
+            let config = app.config();
+            let chord = config.keys.bindings()[0].chord;
+            apart += usize::from(app.keymap().chords(new_tab).first() != Some(&chord));
+        }
+        for applier in appliers {
+            applier.join().unwrap();
+        }
+        assert_eq!(apart, 0, "{apart} of {TRIALS} trials ended apart");
+        assert_eq!(app.config_generation(), 2 * TRIALS as u64);
     }
 
     /// M4 (#317) at the source: 20,000 applies alternating between two

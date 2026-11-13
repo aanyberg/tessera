@@ -210,7 +210,8 @@ pub struct Config {
     /// Only chords with `cmd` appear in menus; others work in the
     /// terminal only. A malformed entry, an unknown command or a chord
     /// already bound by an earlier entry is ignored with a warning (the
-    /// first entry wins); at most 512 entries are read.
+    /// first entry not ignored for another reason wins); at most 512
+    /// entries are read.
     ///
     /// The Settings window's Keys pane writes chords in the canonical form
     /// (`cmd+ctrl+alt+shift+key`). An entry you write by hand in another
@@ -552,9 +553,13 @@ pub struct Profile {
     /// Command to run instead of the login shell: one program name or
     /// path runs directly (`"/opt/homebrew/bin/fish"`), anything with a
     /// space runs through `/bin/sh -c` (`"ssh build-box"`). Unset means the
-    /// login shell. A command that cannot be executed (it does not
-    /// exist, or is not executable) starts your login shell in your home
-    /// directory instead, with a line in the new session saying so.
+    /// login shell. A command that cannot be started (the program does
+    /// not exist or is not executable, or the command is longer than the
+    /// system lets a program's arguments be) starts your login shell in
+    /// your home directory instead, with a line in the new session saying
+    /// so. A command with a space is started by `/bin/sh`, which always
+    /// exists: when the program it names is missing, the shell reports it
+    /// in the session and exits, with no fallback.
     pub command: Option<String>,
     /// Starting directory; `~` at the start is your home directory. A
     /// directory that does not exist falls back to your home directory

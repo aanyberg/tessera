@@ -1447,6 +1447,13 @@ fn handle_key_reports_commands_and_encodes_only_without_the_flag() {
             (Error::Ok, InputOutcome::Command, new_tab)
         );
     }
+    // #317 K3: `send_key` reports a bound command as IGNORED, so the
+    // frontend's menus see the key, and types nothing (the row below is
+    // only the later `y`).
+    assert_eq!(
+        app.key(id, &cmd(char_event('t'))),
+        (Error::Ok, InputOutcome::Ignored)
+    );
     let release = KeyEvent {
         kind: KeyEventKind::Release as u32,
         ..cmd(char_event('t'))

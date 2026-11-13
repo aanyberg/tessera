@@ -5,7 +5,7 @@
 # owner: app = Tessera action; system = AppKit-provided action (chord still rebindable: menu key equivalent is just reassigned); later:Tn = added by task Tn, default chord applies from that task.
 command,chord,alt_chords,menu_item,appkit_keyEquivalent,appkit_mask,iterm2_default,terminal_app_default,owner,note
 about,,,Tessera > About Tessera,,,none,none,system,S-MM:30. No chord.
-settings,cmd+comma,,Tessera > Settings…,",",cmd,cmd+comma (S-ITERM cheat sheet),cmd+comma (S-TERM 'Open Terminal settings'),app,S-MM:35. Key name 'comma' because ',' is fine but names are used for every punctuation in registry output.
+settings,cmd+comma,,Tessera > Settings,",",cmd,cmd+comma (S-ITERM cheat sheet),cmd+comma (S-TERM 'Open Terminal settings'),app,S-MM:35. Key name 'comma' because ',' is fine but names are used for every punctuation in registry output.
 hide,cmd+h,,Tessera > Hide Tessera,h,cmd,cmd+h (system),cmd+h (system),system,S-MM:37.
 hide_others,cmd+alt+h,,Tessera > Hide Others,h,cmd+alt,cmd+alt+h (system),cmd+alt+h (system),system,S-MM:38. iTerm2 binds cmd+alt+h to 'Split Horizontally (New Profile)' only in custom setups (unverified); no conflict in Tessera.
 show_all,,,Tessera > Show All,,,none,none,system,S-MM:40.

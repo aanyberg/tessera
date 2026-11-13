@@ -58,8 +58,11 @@ pub(crate) fn spawn_errno(reason: &str) -> Option<i32> {
 }
 
 /// The `errno` values [`spawn_errno`] maps `portable-pty`'s own messages
-/// to (the same on every Unix Tessera builds for).
-mod errno {
+/// to (the same on every Unix Tessera builds for), and the one a refused
+/// [`tessera_pty::PtyError::ArgumentsTooLong`] stands for.
+pub(crate) mod errno {
+    /// `Argument list too long`.
+    pub(crate) const E2BIG: i32 = 7;
     pub(super) const ENOENT: i32 = 2;
     pub(super) const EACCES: i32 = 13;
     pub(super) const EISDIR: i32 = 21;

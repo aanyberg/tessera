@@ -88,19 +88,27 @@ impl From<toml::de::Error> for ParseError {
 /// `text` cut to at most `max` bytes on a character boundary, with a marker
 /// when anything was dropped.
 pub(crate) fn truncated(text: &str, max: usize) -> String {
-    const MARKER: &str = "… (truncated)";
     if text.len() <= max {
         return text.to_owned();
     }
-    let keep = max.saturating_sub(MARKER.len());
+    let keep = max.saturating_sub(TRUNCATION_MARKER.len());
     let mut cut = keep;
     while !text.is_char_boundary(cut) {
         cut -= 1;
     }
-    let mut out = String::with_capacity(cut + MARKER.len());
+    let mut out = String::with_capacity(cut + TRUNCATION_MARKER.len());
     out.push_str(&text[..cut]);
-    out.push_str(MARKER);
+    out.push_str(TRUNCATION_MARKER);
     out
+}
+
+/// What [`truncated`] (and so [`escaped`]) puts at the end of a cut text.
+pub(crate) const TRUNCATION_MARKER: &str = "… (truncated)";
+
+/// The uncut start of `text` when [`truncated`] cut it (it ends with
+/// [`TRUNCATION_MARKER`]), `None` when it is whole.
+pub(crate) fn cut_prefix(text: &str) -> Option<&str> {
+    text.strip_suffix(TRUNCATION_MARKER)
 }
 
 /// A non-fatal problem found while loading configuration.
@@ -215,6 +223,15 @@ impl fmt::Display for Warning {
     }
 }
 
+/// Whether a load logs its warnings ([`Config::from_toml_lenient_logging`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Logging {
+    /// Each warning is logged (`tracing::warn!`), as a load does.
+    Log,
+    /// Nothing is logged; the caller gets the warnings and decides.
+    Quiet,
+}
+
 /// A successfully loaded configuration together with its warnings.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Loaded {
@@ -235,6 +252,15 @@ impl Config {
     /// (for example [`Terminal::MAX_SCROLLBACK_LINES`](crate::Terminal::MAX_SCROLLBACK_LINES))
     /// are clamped with a warning.
     pub fn from_toml_lenient(text: &str) -> Result<Loaded, Error> {
+        Self::from_toml_lenient_logging(text, Logging::Log)
+    }
+
+    /// [`Config::from_toml_lenient`] that logs no warning when `logging`
+    /// is [`Logging::Quiet`]: for a check that is not a load (an edit's
+    /// check, a reload that logs only the warnings it had not logged
+    /// before), without a scoped subscriber, which would churn tracing's
+    /// callsite cache on every call (#342 M6).
+    pub(crate) fn from_toml_lenient_logging(text: &str, logging: Logging) -> Result<Loaded, Error> {
         // Parsed once (#233 item 6). The deserializer consumes its tree,
         // and the warnings need the document with spans afterwards (where
         // each warning's key is, for document order, and the values the
@@ -286,8 +312,10 @@ impl Config {
         // Stable: warnings without a place keep the order they came in.
         warnings.sort_by_key(|&(at, _)| at);
         let warnings: Vec<Warning> = warnings.into_iter().map(|(_, warning)| warning).collect();
-        for w in &warnings {
-            tracing::warn!(target: "tessera_config", "{w}");
+        if logging == Logging::Log {
+            for w in &warnings {
+                tracing::warn!(target: "tessera_config", "{w}");
+            }
         }
         Ok(Loaded { config, warnings })
     }
@@ -521,9 +549,12 @@ fn written(text: &str, value: &toml::Spanned<toml::de::DeValue<'_>>) -> String {
 
 /// `text` with every control character (C0, DEL and C1: `\n`, `\t`,
 /// `\u{1b}`, ...), the line and paragraph separators (U+2028, U+2029) and
-/// the bidirectional formatting characters (U+061C, U+200E, U+200F,
-/// U+202A..=U+202E, U+2066..=U+2069) written as their Rust escapes, so a
-/// warning stays on one line and cannot reorder the text around it, then
+/// every character that shows as nothing (`is_invisible`: the
+/// bidirectional formatting characters U+061C, U+200E, U+200F,
+/// U+202A..=U+202E and U+2066..=U+2069, the zero-width characters, the
+/// variation selectors and the other default-ignorables) written as their
+/// Rust escapes, so a warning stays on one line, cannot reorder the text
+/// around it and never carries a character a reader cannot see, then
 /// cut to at most `max` bytes on a character boundary (with a marker when
 /// cut). Only as much of `text` is escaped as can survive the cut, so a
 /// huge value costs at most `max` characters of work.
@@ -552,19 +583,45 @@ pub fn escaped(text: &str, max: usize) -> String {
 
 /// Whether [`escaped`] writes `c` (not a control character) as `\u{..}`:
 /// a line or paragraph separator, which some log viewers break lines at,
-/// or a bidirectional formatting character.
-fn needs_unicode_escape(c: char) -> bool {
-    matches!(c, '\u{2028}' | '\u{2029}') || is_bidi_control(c)
+/// or a character that shows as nothing ([`is_invisible`]), the
+/// bidirectional formatting characters among them.
+pub(crate) fn needs_unicode_escape(c: char) -> bool {
+    matches!(c, '\u{2028}' | '\u{2029}') || is_invisible(c)
 }
 
-/// The bidirectional formatting characters (Unicode category Cf): the
-/// marks (U+061C, U+200E, U+200F), embeddings and overrides
-/// (U+202A..=U+202E) and isolates (U+2066..=U+2069).
-fn is_bidi_control(c: char) -> bool {
-    matches!(
-        c,
-        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
-    )
+/// The Unicode `Default_Ignorable_Code_Point` ranges (`DerivedCoreProperties`,
+/// Unicode 16), inclusive and sorted: the characters a renderer shows as
+/// nothing, the bidirectional formatting characters among them (U+061C,
+/// U+200E, U+200F, U+202A..=U+202E, U+2066..=U+2069).
+pub(crate) const DEFAULT_IGNORABLE: [(u32, u32); 17] = [
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1_BCA0, 0x1_BCA3),
+    (0x1_D173, 0x1_D17A),
+    (0xE_0000, 0xE_0FFF),
+];
+
+/// Whether `c` shows nothing: a default-ignorable character
+/// ([`DEFAULT_IGNORABLE`]), the bidi, zero-width and variation-selector
+/// characters included.
+pub(crate) fn is_invisible(c: char) -> bool {
+    let c = u32::from(c);
+    let i = DEFAULT_IGNORABLE.partition_point(|&(_, last)| last < c);
+    DEFAULT_IGNORABLE
+        .get(i)
+        .is_some_and(|&(first, _)| first <= c)
 }
 
 /// Deserializes `appearance.cursor_shape` without failing: a value that is
@@ -954,13 +1011,16 @@ fn profile_window_warning(
 /// on the open handle and at most that many bytes are ever read, so a
 /// file that grows during the read is rejected rather than read whole.
 pub fn load_file(path: &Path) -> Result<Loaded, Error> {
-    load_file_noting_empty(path).map(|(loaded, _)| loaded)
+    load_file_noting_empty(path, Logging::Log).map(|(loaded, _)| loaded)
 }
 
 /// [`load_file`], and whether the file held nothing but whitespace after
 /// an optional byte order mark: TOML loads a BOM-only file as empty, so it
 /// counts as empty too (#287).
-pub(crate) fn load_file_noting_empty(path: &Path) -> Result<(Loaded, bool), Error> {
+pub(crate) fn load_file_noting_empty(
+    path: &Path,
+    logging: Logging,
+) -> Result<(Loaded, bool), Error> {
     let bytes = read_capped(path, MAX_CONFIG_FILE_LEN, "config file")?;
     let text = std::str::from_utf8(&bytes)?;
     let empty = text
@@ -968,7 +1028,7 @@ pub(crate) fn load_file_noting_empty(path: &Path) -> Result<(Loaded, bool), Erro
         .unwrap_or(text)
         .trim()
         .is_empty();
-    Config::from_toml_lenient(text).map(|loaded| (loaded, empty))
+    Config::from_toml_lenient_logging(text, logging).map(|loaded| (loaded, empty))
 }
 
 /// Reads the regular file at `path` whole, refusing one larger than `limit`
@@ -1241,6 +1301,21 @@ mod tests {
     /// A file that appears between the existence check and the write (the
     /// user saving their own, another process) is never replaced, and no
     /// temporary file is left behind.
+    /// #348 adversarial M2 (lead decision D2-3): a TOML parse error
+    /// quotes the offending line with its zero-width character escaped,
+    /// as every other warning does now.
+    #[test]
+    fn a_parse_error_escapes_zero_width_characters() {
+        let Err(Error::Parse(error)) = Config::from_toml_lenient("a\u{200B} = 1\n") else {
+            panic!("U+200B is not a bare key character");
+        };
+        assert!(
+            error.message.contains("\\u{200b}") && !error.message.contains('\u{200B}'),
+            "{}",
+            error.message
+        );
+    }
+
     #[test]
     fn writing_the_default_never_replaces_a_file_created_meanwhile() {
         let dir = tempfile::tempdir().unwrap();
@@ -1459,18 +1534,19 @@ mod tests {
 
     proptest::proptest! {
         /// [`escaped`] never leaves a control character, a line separator
-        /// or a bidirectional formatting character, never exceeds its cap,
-        /// and equals escaping the whole text before the cut.
+        /// or a character that shows as nothing (bidi, zero-width, other
+        /// default-ignorables), never exceeds its cap, and equals escaping
+        /// the whole text before the cut.
         #[test]
         fn escaping_is_one_line_and_capped(
-            text in "\\PC{0,40}|[\\x00-\\x7f\\u{80}-\\u{a0}é\\u{61c}\\u{200b}-\\u{200f}\\u{2028}-\\u{202f}\\u{2066}-\\u{2069}]{0,600}",
+            text in "\\PC{0,40}|[\\x00-\\x7f\\u{80}-\\u{ad}é\\u{34f}\\u{61c}\\u{180b}-\\u{180f}\\u{200b}-\\u{200f}\\u{2028}-\\u{202f}\\u{2060}-\\u{2069}\\u{fe00}-\\u{fe0f}\\u{feff}\\u{e0001}\\u{e0100}]{0,600}",
             max in 16usize..300,
         ) {
             let out = escaped(&text, max);
             proptest::prop_assert!(out.len() <= max, "{} > {max}", out.len());
             proptest::prop_assert!(!out.chars().any(char::is_control), "{:?}", out);
             proptest::prop_assert!(
-                !out.chars().any(|c| matches!(c, '\u{2028}' | '\u{2029}') || is_bidi_control(c)),
+                !out.chars().any(|c| matches!(c, '\u{2028}' | '\u{2029}') || is_invisible(c)),
                 "{:?}", out
             );
             // The reference: escape the whole text, then cut (for text
@@ -1484,7 +1560,13 @@ mod tests {
                         c.escape_debug().collect()
                     } else if matches!(
                         c,
-                        '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+                        '\u{ad}' | '\u{34f}' | '\u{61c}' | '\u{115f}' | '\u{1160}'
+                            | '\u{17b4}' | '\u{17b5}' | '\u{180b}'..='\u{180f}'
+                            | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}'
+                            | '\u{2060}'..='\u{206f}' | '\u{3164}' | '\u{fe00}'..='\u{fe0f}'
+                            | '\u{feff}' | '\u{ffa0}' | '\u{fff0}'..='\u{fff8}'
+                            | '\u{1bca0}'..='\u{1bca3}' | '\u{1d173}'..='\u{1d17a}'
+                            | '\u{e0000}'..='\u{e0fff}'
                     ) {
                         c.escape_unicode().collect()
                     } else {
@@ -1504,9 +1586,8 @@ mod tests {
     fn separators_bidi_controls_and_esc_are_escaped_in_warnings_and_parse_errors() {
         let hostile = "x\u{2028}y\u{202e}z\u{1b}[31m";
         let raw = |text: &str| {
-            text.chars().any(|c| {
-                c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') || is_bidi_control(c)
-            })
+            text.chars()
+                .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') || is_invisible(c))
         };
         // A warning naming a key: an unknown quoted key, whose escapes
         // TOML decodes (raw controls are not valid inside a TOML string).

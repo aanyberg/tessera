@@ -3,7 +3,7 @@
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, RwLock};
 
-use crate::load::{Loaded, Warning, load_file_noting_empty, write_default_if_missing};
+use crate::load::{Loaded, Logging, Warning, load_file_noting_empty, write_default_if_missing};
 use crate::paths::ConfigPaths;
 use crate::theme::{ResolvedTheme, Theme};
 use crate::watch::{ConfigEvent, ThemesFingerprint, WatchOptions, Watcher};
@@ -198,8 +198,10 @@ impl ConfigStore {
     /// The colour theme `appearance.theme` names, resolved now from the
     /// themes directory and the bundled themes (see [`Theme::resolve`]
     /// for the order). Never fails: a name that matches nothing gives
-    /// [`Theme::DEFAULT_NAME`]. The lookup's warnings are logged and
-    /// replace the previous lookup's in [`ConfigStore::last_warnings`].
+    /// [`Theme::DEFAULT_NAME`]. The lookup's warnings replace the previous
+    /// lookup's in [`ConfigStore::last_warnings`]; those the previous
+    /// lookup did not report are logged (a lookup on every save of a file
+    /// naming a missing theme logs it once, #342 M1).
     ///
     /// Reads the disk on every call, so call it when the configuration
     /// or the themes change (on [`ConfigEvent::Changed`] and
@@ -216,10 +218,20 @@ impl ConfigStore {
     pub fn resolve_theme(&self) -> ResolvedTheme {
         let name = self.config().appearance.theme.clone();
         let resolved = Theme::resolve(&self.paths.themes_dir(), &name);
-        for warning in &resolved.warnings {
+        let new: Vec<Warning> = {
+            let mut state = self.write();
+            let new = resolved
+                .warnings
+                .iter()
+                .filter(|w| !state.theme_warnings.contains(w))
+                .cloned()
+                .collect();
+            state.theme_warnings.clone_from(&resolved.warnings);
+            new
+        };
+        for warning in &new {
             tracing::warn!(target: "tessera_config", "{warning}");
         }
-        self.write().theme_warnings.clone_from(&resolved.warnings);
         resolved
     }
 
@@ -332,10 +344,7 @@ impl ConfigStore {
     /// logs those the store did not hold already.
     pub(crate) fn load_from_disk(&self) -> Result<FromDisk, Error> {
         let file = self.paths.config_file();
-        let loaded =
-            tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
-                load_file_noting_empty(&file)
-            });
+        let loaded = load_file_noting_empty(&file, Logging::Quiet);
         match loaded {
             Ok((loaded, empty)) => Ok(FromDisk { loaded, empty }),
             Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -951,6 +960,45 @@ mod tests {
             });
             assert_eq!(again, Vec::<String>::new(), "{case}");
         }
+    }
+
+    /// #342 M1: a theme lookup logs a missing theme when the previous
+    /// lookup did not report it, not on every lookup (the watch looks the
+    /// theme up on every save it applies); it is logged again once a
+    /// lookup has found the theme in between.
+    #[test]
+    fn a_theme_warning_is_logged_once_per_appearance() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(dir.path());
+        std::fs::write(paths.config_file(), "[appearance]\ntheme = \"Gone\"\n").unwrap();
+        let store = ConfigStore::open(paths.clone()).unwrap();
+        let lookups = || {
+            logged_warnings(|| {
+                for _ in 0..3 {
+                    let resolved = store.resolve_theme();
+                    assert_eq!(resolved.warnings.len(), 1, "{:?}", resolved.warnings);
+                }
+            })
+        };
+        let lines = lookups();
+        let [line] = &lines[..] else {
+            panic!("{lines:#?}");
+        };
+        assert!(line.contains("Gone"), "{line}");
+        assert_eq!(store.last_warnings().len(), 1);
+        std::fs::create_dir_all(paths.themes_dir()).unwrap();
+        std::fs::write(
+            paths.themes_dir().join("Gone.toml"),
+            include_str!("../themes/dracula.toml").replace("\"Dracula\"", "\"Gone\""),
+        )
+        .unwrap();
+        let found = logged_warnings(|| {
+            let warnings = store.resolve_theme().warnings;
+            assert!(warnings.is_empty(), "{warnings:?}");
+        });
+        assert_eq!(found, Vec::<String>::new());
+        std::fs::remove_file(paths.themes_dir().join("Gone.toml")).unwrap();
+        assert_eq!(lookups().len(), 1);
     }
 
     /// #324 item 9: a load warning is logged when the store first sees

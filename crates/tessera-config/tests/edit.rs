@@ -1184,3 +1184,229 @@ fn crlf_in_a_multi_line_string_is_refused() {
     assert_eq!(editor.to_toml(), text);
     editor.set("profiles[0].command", s("x y")).unwrap();
 }
+
+/// #324 item 2: another copy of a warning the file has already is
+/// refused. A new key in an unknown table adds no warning (the loader
+/// names the table once), and a second use of a missing theme the root
+/// uses added none either; what the file has already may stay and change.
+#[test]
+fn another_copy_of_an_existing_warning_is_refused() {
+    let text = "[bogus]\na = 1\n\n[general.extra]\nx = 1\n\n[appearance]\ntheme = \"Missing\"\n\n\
+                [[profiles]]\nname = \"p\"\n";
+    let (_dir, path, mut editor) = open(text);
+    for (key, unknown) in [("bogus.b", "bogus"), ("general.extra.y", "general.extra")] {
+        let warnings = refused(editor.set(key, toml::Value::Integer(2)));
+        assert!(
+            matches!(&warnings[..], [Warning::UnknownKey { path }] if path == unknown),
+            "{key}: {warnings:?}"
+        );
+    }
+    let warnings = refused(editor.set("profiles[0].appearance.theme", s("Missing")));
+    assert!(
+        matches!(&warnings[..], [Warning::ThemeNotFound { .. }]),
+        "{warnings:?}"
+    );
+    assert_eq!(editor.to_toml(), text);
+    editor.set("bogus.a", toml::Value::Integer(3)).unwrap();
+    editor
+        .set("appearance.font_size", toml::Value::Float(14.0))
+        .unwrap();
+    editor.save().unwrap();
+    assert!(read(&path).contains("a = 3\n"));
+}
+
+/// #324 items 14 and 18: past `MAX_UNKNOWN_KEY_WARNINGS` the loader only
+/// counts the unknown keys. Removing a listed one (a hidden one becomes
+/// listed) or a profile with one (the count drops) adds nothing; one more
+/// unknown key past the cap is still new.
+#[test]
+fn hidden_unknown_keys_count_as_present() {
+    use std::fmt::Write as _;
+
+    let mut text = String::from("[general]\n");
+    for i in 0..tessera_config::MAX_UNKNOWN_KEY_WARNINGS + 6 {
+        writeln!(text, "bogus{i} = 1").unwrap();
+    }
+    text.push_str("\n[[profiles]]\nname = \"a\"\nbogus = 1\n\n[[profiles]]\nname = \"b\"\n");
+    let (_dir, _path, mut editor) = open(&text);
+    assert!(editor.remove("general.bogus0").unwrap());
+    assert!(editor.remove("general.bogus69").unwrap());
+    assert!(editor.remove("profiles[0]").unwrap());
+    for key in ["general.bogus_new", "profiles[0].bogus_new"] {
+        let warnings = refused(editor.set(key, toml::Value::Integer(1)));
+        assert!(
+            matches!(&warnings[..], [Warning::UnknownKeysOmitted { .. }]),
+            "{key}: {warnings:?}"
+        );
+    }
+}
+
+/// #324 items 15 and 17: the loader cuts a warning path at
+/// `MAX_WARNING_PATH_LEN`; renumbered from `profiles[10]` to
+/// `profiles[9]`, a 300-byte key's path is cut one character later and a
+/// 244-byte key's path is not cut at all. Removing an earlier profile adds
+/// no warning, but a new long key in that profile is still new.
+#[test]
+fn renumbered_cut_paths_are_not_new() {
+    use std::fmt::Write as _;
+
+    for len in [300, 244] {
+        let mut text = String::new();
+        for i in 0..11 {
+            writeln!(text, "[[profiles]]\nname = \"p{i}\"").unwrap();
+        }
+        writeln!(text, "{} = 1", "k".repeat(len)).unwrap();
+        let (_dir, _path, mut editor) = open(&text);
+        assert!(editor.remove("profiles[0]").unwrap(), "{len}");
+        let warnings = refused(editor.set(
+            &format!("profiles[9].{}", "j".repeat(len)),
+            toml::Value::Integer(1),
+        ));
+        assert!(
+            matches!(&warnings[..], [Warning::UnknownKey { path }] if path.starts_with("profiles[9].jjj")),
+            "{len}: {warnings:?}"
+        );
+    }
+}
+
+/// #324 item 19: the size cap applies to the file as saved, CRLF line
+/// endings and all. Here the edit fits with LF endings and does not with
+/// CRLF.
+#[test]
+fn the_size_cap_counts_crlf_line_endings() {
+    let cap = usize::try_from(tessera_config::MAX_CONFIG_FILE_LEN).unwrap();
+    let filler = format!("# {}\r\n", "x".repeat(1020));
+    let text = filler.repeat(cap / filler.len() - 1);
+    let lines = text.matches('\n').count();
+    let (_dir, _path, mut editor) = open(&text);
+    let fits = 500;
+    let crlf_too_large = 2000;
+    assert!(crlf_too_large < lines, "the LF text would fit");
+    let mut small = editor.clone();
+    small
+        .set("general.default_profile", s(&"y".repeat(fits)))
+        .unwrap();
+    assert!(small.to_toml().len() <= cap);
+    assert!(matches!(
+        editor.set("general.default_profile", s(&"y".repeat(crlf_too_large))),
+        Err(EditError::TooLarge)
+    ));
+}
+
+/// #324 item 22: a file without a final newline keeps none when its last
+/// profile goes and the comment above it stays (with the blank line
+/// between them, which became last).
+#[test]
+fn removing_the_last_profile_keeps_no_final_newline() {
+    for (text, edited) in [
+        (
+            "a = 1\n# about x\n\n[[profiles]]\nname = \"x\"",
+            "a = 1\n# about x",
+        ),
+        (
+            "a = 1\r\n# about x\r\n\r\n[[profiles]]\r\nname = \"x\"",
+            "a = 1\r\n# about x",
+        ),
+        (
+            "a = 1\n# about x\n\n[[profiles]]\nname = \"x\"\n",
+            "a = 1\n# about x\n\n",
+        ),
+    ] {
+        let (_dir, path, mut editor) = open(text);
+        assert!(editor.remove("profiles[0]").unwrap());
+        assert_eq!(editor.to_toml(), edited, "{text:?}");
+        editor.save().unwrap();
+        assert_eq!(read(&path), edited);
+    }
+}
+
+/// #342 M7: the loader reads the first `MAX_PROFILES` profiles only, so an
+/// edit of a later one would go unseen by every check (the Settings
+/// window, adding at the loaded count, would rename the 257th entry).
+/// Such a set and an add at the cap are refused; removing one works.
+#[test]
+fn no_profile_past_the_cap_is_edited() {
+    use std::fmt::Write as _;
+
+    use tessera_config::MAX_PROFILES;
+
+    let mut text = String::new();
+    for i in 0..=MAX_PROFILES {
+        writeln!(text, "[[profiles]]\nname = \"p{i}\"").unwrap();
+    }
+    let (_dir, _path, mut editor) = open(&text);
+    let unsupported = |result: Result<(), EditError>| {
+        assert!(
+            matches!(result, Err(EditError::Unsupported { .. })),
+            "{result:?}"
+        );
+    };
+    unsupported(editor.set(&format!("profiles[{MAX_PROFILES}].name"), s("New")));
+    unsupported(editor.set(
+        &format!("profiles[{MAX_PROFILES}].appearance.opacity"),
+        toml::Value::Float(0.5),
+    ));
+    unsupported(editor.add_profile("New").map(drop));
+    assert_eq!(editor.to_toml(), text);
+    assert!(editor.remove(&format!("profiles[{MAX_PROFILES}]")).unwrap());
+    unsupported(editor.add_profile("New").map(drop));
+    assert!(editor.remove("profiles[0]").unwrap());
+    assert_eq!(editor.add_profile("New").unwrap(), MAX_PROFILES - 1);
+}
+
+/// #324 item 7 (ADR 0040 amendment): the saved file keeps the old file's
+/// group when the owner is in it, not the directory's, which a new file
+/// gets. Skipped when the user is in no second group.
+#[cfg(unix)]
+#[test]
+fn saving_keeps_the_files_group() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let (dir, path, _) = open("[appearance]\nopacity = 1.0\n");
+    let dir_gid = std::fs::metadata(dir.path()).unwrap().gid();
+    let Some(gid) = [12, 20, 80, 61, 33, 98, 100, 701, 702]
+        .into_iter()
+        .filter(|&gid| gid != dir_gid)
+        .find(|&gid| std::os::unix::fs::chown(&path, None, Some(gid)).is_ok())
+    else {
+        eprintln!("skipped: the user is in no group but the directory's");
+        return;
+    };
+    let mut editor = ConfigEditor::open(&path).unwrap();
+    editor
+        .set("appearance.opacity", toml::Value::Float(0.5))
+        .unwrap();
+    assert!(editor.save().unwrap());
+    assert_eq!(std::fs::metadata(&path).unwrap().gid(), gid);
+}
+
+/// #324 item 3: a file with 20 000 lines that look like the editor's
+/// marks (`#tessera-edit-<n>`) is edited in well under 100 ms: the mark
+/// search is one pass, not one search per candidate (8 s before).
+#[test]
+#[cfg_attr(debug_assertions, ignore = "timing bar; run in release")]
+fn an_edit_among_many_mark_like_lines_is_fast() {
+    use std::fmt::Write as _;
+
+    let mut text = String::new();
+    for n in 0..20_000u32 {
+        writeln!(text, "#tessera-edit-{n:x}").unwrap();
+    }
+    text.push_str("[appearance]\n# kept\nopacity = 1.0\n");
+    let (_dir, _path, editor) = open(&text);
+    let best = (0..5)
+        .map(|_| {
+            let mut editor = editor.clone();
+            let start = std::time::Instant::now();
+            assert!(editor.remove("appearance.opacity").unwrap());
+            let took = start.elapsed();
+            assert!(editor.to_toml().ends_with("[appearance]\n# kept\n"));
+            took
+        })
+        .min()
+        .unwrap();
+    assert!(
+        best < std::time::Duration::from_millis(100),
+        "best of 5: {best:?}"
+    );
+}

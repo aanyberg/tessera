@@ -208,7 +208,7 @@ impl Live {
         source: Option<PathBuf>,
     ) -> bool {
         let changed = self.restyle(config, colours, source);
-        self.config_applied(config);
+        self.config_applied();
         changed
     }
 
@@ -427,11 +427,23 @@ impl Live {
         self.restyle_at(&config, &colours, generation, display, false)
     }
 
-    /// Compiles `config`'s key map when its `[keys]` changed, counts the
-    /// configuration applied, and tells the observer
+    /// Compiles the key map of the configuration in effect when its
+    /// `[keys]` changed, counts the configuration applied, and tells the
+    /// observer
     /// ([`SessionObserver::on_config_applied`](crate::SessionObserver::on_config_applied)).
-    fn config_applied(&self, config: &Config) {
-        let generation = self.bindings.applied(config);
+    ///
+    /// The key map is compiled from the configuration recorded now, under
+    /// the lock that records it, not from the one this apply recorded: of
+    /// two racing applies the one that records its configuration last
+    /// also has its key map published last, so [`App::config`] and
+    /// [`App::keymap`] never stay from different applies (#348 M1). The
+    /// generation counts under that lock too, so
+    /// [`Live::config_and_generation`] reads a matching pair.
+    fn config_applied(&self) {
+        let generation = {
+            let applied = lock(&self.applied);
+            self.bindings.applied(&applied.config)
+        };
         let observers = self
             .observers
             .read()
@@ -465,7 +477,22 @@ impl Live {
 
     /// The configuration in effect.
     pub(crate) fn config(&self) -> Arc<Config> {
-        Arc::clone(&lock(&self.applied).config)
+        let config = Arc::clone(&lock(&self.applied).config);
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::input::read_pause::between_reads();
+        config
+    }
+
+    /// [`Live::config`] and the configuration generation, read under the
+    /// lock [`Live::config_applied`] counts the generation under: the
+    /// generation is that of the last apply whose key map was published,
+    /// never one newer than the configuration (#348).
+    pub(crate) fn config_and_generation(&self) -> (Arc<Config>, u64) {
+        let applied = lock(&self.applied);
+        let config = Arc::clone(&applied.config);
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::input::read_pause::between_reads();
+        (config, self.bindings.generation())
     }
 
     /// Handles one watcher event.
