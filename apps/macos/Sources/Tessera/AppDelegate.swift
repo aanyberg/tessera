@@ -125,6 +125,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         app.run()
     }
 
+    /// Runs before any window exists, so every window, sheet and panel the
+    /// app shows starts out with the app's appearance.
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        Self.applyAppAppearance()
+    }
+
+    /// The app is always dark, whatever the system's Light or Dark setting
+    /// (ADR 0043, #364): terminal windows, their title and tab bars, the find
+    /// bar, Settings, alerts and sheets. The one place that sets the app's
+    /// appearance, for the dark, light and system choice (#365) to replace.
+    static func applyAppAppearance() {
+        NSApp.appearance = NSAppearance(named: .darkAqua)
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         MainMenu.install(in: NSApp)
         terminateOnSignals()
@@ -279,7 +293,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: Configuration and help
 
-    /// Settings… (⌘,): opens the Settings window (ADR 0044), or brings the
+    /// Settings (⌘,): opens the Settings window (ADR 0044), or brings the
     /// open one to the front. It edits the configuration through the core,
     /// which it starts if no session has yet.
     @objc func openSettings(_ sender: Any?) {
@@ -308,7 +322,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.showWindow(sender)
     }
 
-    /// Open config.toml (the Tessera menu, and Advanced in Settings): opens
+    /// Open config.toml (Advanced in Settings): opens
     /// `config.toml` in the default editor, after the core has written its
     /// commented defaults if the file is missing (and started applying edits
     /// of it live). When no application opens it, or opening fails, Finder
