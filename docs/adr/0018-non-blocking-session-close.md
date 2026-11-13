@@ -260,15 +260,16 @@ Checker reported the inversion it dismissed: a session reader
 the child is quiet or the output arrives the higher-class thread waits on a
 default-class one.
 
-Every core and pty thread now runs the start hook. `tessera-pty` has its
-own `set_thread_start_hook(fn()) -> bool`, the same contract as app-core's
-(a process-wide `OnceLock<fn()>`, first hook wins, returns whether it was
-installed). `spawn_thread` runs it first inside `pty-reader-<pid>` and
-`pty-writer-<pid>`, under `catch_unwind`: a panicking hook is logged
-(`"pty thread start hook panicked"`, no payload) and the thread carries
-on, since a reader that died there would strand the child.
-`tessera_app_core::session::set_thread_start_hook` installs the same hook
-into `tessera-pty` too (dependencies still point downward), so
+`tessera-pty`'s reader and writer now run the start hook too, as do the
+threads app-core starts (the amendment below lists them). `tessera-pty` has
+its own `set_thread_start_hook(fn()) -> bool`, the same contract as
+app-core's (a process-wide `OnceLock<fn()>`, first hook wins, returns
+whether it was installed). `spawn_thread` runs it first inside
+`pty-reader-<pid>` and `pty-writer-<pid>`, under `catch_unwind`: a
+panicking hook is logged (`"pty thread start hook panicked"`, no payload)
+and the thread carries on, since a reader that died there would strand the
+child. `tessera_app_core::session::set_thread_start_hook` installs the same
+hook into `tessera-pty` too (dependencies still point downward), so
 `tessera_app_new`'s single call covers both crates and `tessera-ffi` is
 unchanged. It returns app-core's own result; the pty install is
 best-effort, and a pty hook already set is kept and logged at debug. The
@@ -279,3 +280,38 @@ thread names for a spawn and shows that a panicking hook is logged once
 per thread while the session still takes input, delivers output and
 exits; `every_core_thread_runs_the_start_hook` now also requires
 `pty-reader-<pid>` and `pty-writer-<pid>` after app-core's setter alone.
+
+## Amendment: start hook scope and install (#417, 2026-11-13)
+
+Which threads run the hook. The threads `tessera-app-core` starts:
+`tessera-session-<id>` (a session's reader), `tessera-input-<id>` (its
+input writer), `tessera-reaper` and `tessera-config-apply`; and the threads
+`tessera-pty` starts: `pty-reader-<pid>` and `pty-writer-<pid>`; and
+`tessera-config`'s `tessera-config-watch`, which app-core's configuration
+watch starts with the hook in `WatchOptions::on_thread_start`. The
+amendment above said "every core and pty thread", which overstated it and
+is corrected in place. The one exception among the core's threads is
+`tessera-render`'s `tessera-font-index`, which stays at the default class.
+That is deliberate: no higher-class thread waits on it (readers only `get`
+its `OnceLock`, and a lookup made before the index exists takes the slow
+path instead of waiting), so it cannot cause the inversion the hook exists
+for. `tessera-pty`'s `start_hook` test now also checks the order: the
+reader has run the hook before it forwards any output, and the writer
+before the child has read what it wrote.
+
+Install is best-effort, not atomic.
+`tessera_app_core::session::set_thread_start_hook` sets app-core's
+`OnceLock` and `tessera-pty`'s in two steps. Two threads that install
+different hooks at the same time can leave the crates on different hooks
+(the adversarial probe for #398 saw it in 6 of 300 runs). No lock or atomic
+pair is added: production installs one hook, once, from `tessera_app_new`,
+before any session exists, and the setter's doc states that contract.
+
+A panicking hook. All three crates (`tessera-app-core`, `tessera-pty`,
+`tessera-config`) run the hook under `catch_unwind` and log a fixed message
+without the payload. The panic itself still goes through Rust's default
+panic handler first, which prints the payload to stderr; no panic hook is
+installed to suppress that. This does not break S8 (`docs/security.md`): S8
+covers terminal content in logs, and the hook is host code (`tessera-ffi`'s
+QoS call in production) whose payload carries no terminal content and
+reaches stderr only, never the log.

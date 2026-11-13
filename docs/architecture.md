@@ -138,10 +138,12 @@ hangs up the session and hands it to the `App`'s one reaper thread, which
 kills a child that lingers past the hangup grace and joins the session's
 threads in the background. Dropping the `App` (`tessera_app_free`) waits
 for every close, about two seconds at most (ADR 0018). The threads
-`tessera-app-core` starts (each session's reader and input writer, and the
-reaper) run at `QOS_CLASS_USER_INITIATED` on macOS through a start hook
-that `tessera-ffi` installs; `tessera-pty`'s own reader and writer threads
-stay at the default class (ADR 0018 explains why).
+`tessera-app-core` starts (each session's reader and input writer, the
+reaper and the configuration apply thread), `tessera-pty`'s reader and
+writer threads (`pty-reader-<pid>`, `pty-writer-<pid>`) and
+`tessera-config`'s watcher thread (`tessera-config-watch`) run at
+`QOS_CLASS_USER_INITIATED` on macOS through a start hook that `tessera-ffi`
+installs once (ADR 0018 and its amendments).
 
 ## Data flow for one keystroke
 
