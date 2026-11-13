@@ -403,6 +403,12 @@ final class TerminalSelectionCallTests: XCTestCase {
         XCTAssertEqual(rig.opener.revealed.map(\.lastPathComponent), ["run.command", "Foo.app"])
     }
 
+    /// The hover's "no file system" rule, as far as a test can see it: only
+    /// the calls that go through the view's file manager seam are counted.
+    /// A lookup that bypasses `FileManager` (`URL.resourceValues`, `stat`,
+    /// LaunchServices) would not show here; what keeps those out is that the
+    /// hover path judges the URL alone (``LinkPolicy/allows(_:localHostName:)``
+    /// takes no file manager) (#299).
     func testCommandHoverOverFileLinksNeverLooksThemUpAndAClickDoes() async throws {
         let directory = try makeFiles()
         defer { try? FileManager.default.removeItem(at: directory) }

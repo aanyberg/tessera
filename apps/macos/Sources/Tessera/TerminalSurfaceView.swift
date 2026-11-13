@@ -215,6 +215,9 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     var linkOpener: any LinkOpening = WorkspaceLinkOpener()
     /// What a Command-click looks `file:` links up with. Tests count.
     var linkFileManager: FileManager = .default
+    /// Sounds the beep for a Command-click on a link that opens nothing.
+    /// Tests count.
+    var linkRefusedBeep: () -> Void = { NSSound.beep() }
     /// Scrolls the view while a selection drag has the pointer outside it.
     let autoscroller = SelectionAutoscroller()
     /// The link under the pointer while Command is held (the string the core
@@ -1104,10 +1107,14 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
             movedToLiveScreen()
             return .consumed
         case .command(let command):
-            MainMenu.run(command: command)
+            runCommand(command)
             return .consumed
         }
     }
+
+    /// Runs a command a key is bound to, as its menu item would
+    /// (``MainMenu/run(command:in:beep:)``). Tests record instead.
+    var runCommand: (String) -> Void = { MainMenu.run(command: $0) }
 
     private func handle(_ event: TesseraSession.KeyEvent, bindingsOnly: Bool) -> TesseraSession.KeyOutcome {
         do {
@@ -1148,7 +1155,7 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
             // to it; a chord they would give to another item (⌘ on a
             // keypad key reads as the main-row key) is run here.
             if MainMenu.keyEquivalent(of: command, in: NSApp.mainMenu, matches: event) { return false }
-            MainMenu.run(command: command)
+            runCommand(command)
             return true
         }
     }
@@ -1269,10 +1276,11 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
             inputContext?.discardMarkedText()
             isDiscardingMarkedText = false
         }
-        let outcome = press(event, button: .left)
+        let point = location(of: event)
+        let outcome = press(event, at: point, button: .left)
         gesture = nil
         autoscroller.stop()
-        lastPointer = convert(event.locationInWindow, from: nil)
+        lastPointer = point
         // With no cell size every point is cell 0,0: no selection or link
         // click starts there.
         if outcome == .ignored, metrics != nil {
@@ -1281,39 +1289,48 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     }
 
     override func mouseUp(with event: NSEvent) {
-        release(event, button: .left)
-        endGesture(event)
+        let point = location(of: event)
+        release(event, at: point, button: .left)
+        endGesture(at: point)
     }
 
     override func mouseDragged(with event: NSEvent) {
-        drag(event, button: .left)
-        continueGesture(event)
+        let point = location(of: event)
+        drag(event, at: point, button: .left)
+        continueGesture(at: point)
     }
-    override func rightMouseDown(with event: NSEvent) { press(event, button: .right) }
-    override func rightMouseUp(with event: NSEvent) { release(event, button: .right) }
-    override func rightMouseDragged(with event: NSEvent) { drag(event, button: .right) }
+    override func rightMouseDown(with event: NSEvent) { press(event, at: location(of: event), button: .right) }
+    override func rightMouseUp(with event: NSEvent) { release(event, at: location(of: event), button: .right) }
+    override func rightMouseDragged(with event: NSEvent) { drag(event, at: location(of: event), button: .right) }
 
     override func otherMouseDown(with event: NSEvent) {
         guard let button = Self.otherButton(event) else { return }
-        press(event, button: button)
+        press(event, at: location(of: event), button: button)
     }
 
     override func otherMouseUp(with event: NSEvent) {
         guard let button = Self.otherButton(event) else { return }
-        release(event, button: button)
+        release(event, at: location(of: event), button: button)
     }
 
     override func otherMouseDragged(with event: NSEvent) {
         guard let button = Self.otherButton(event) else { return }
-        drag(event, button: button)
+        drag(event, at: location(of: event), button: button)
     }
 
     override func mouseMoved(with event: NSEvent) {
-        if reportsPointer(at: event) {
-            sendMouse(event, kind: .motion, button: .none)
+        let point = location(of: event)
+        if reportsPointer(at: point) {
+            sendMouse(event, at: point, kind: .motion, button: .none)
         }
-        lastPointer = convert(event.locationInWindow, from: nil)
+        lastPointer = point
         updateHover(modifiers: event.modifierFlags)
+    }
+
+    /// Where `event` happened, in view coordinates: converted once per
+    /// event and handed to everything that handles it.
+    private func location(of event: NSEvent) -> NSPoint {
+        convert(event.locationInWindow, from: nil)
     }
 
     override func mouseExited(with event: NSEvent) {
@@ -1355,25 +1372,27 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     /// its release are sent. A press the core refuses is recorded as
     /// `.ignored` (see ``pressOutcomes``).
     @discardableResult
-    private func press(_ event: NSEvent, button: TesseraSession.MouseButton) -> TesseraSession.InputOutcome {
+    private func press(
+        _ event: NSEvent, at point: NSPoint, button: TesseraSession.MouseButton
+    ) -> TesseraSession.InputOutcome {
         if button != .left, window?.isKeyWindow != true { return .ignored }
-        guard reportsPointer(at: event) else { return .ignored }
-        let outcome = sendMouse(event, kind: .press, button: button) ?? .ignored
+        guard reportsPointer(at: point) else { return .ignored }
+        let outcome = sendMouse(event, at: point, kind: .press, button: button) ?? .ignored
         pressOutcomes[button] = outcome
         return outcome
     }
 
-    private func drag(_ event: NSEvent, button: TesseraSession.MouseButton) {
+    private func drag(_ event: NSEvent, at point: NSPoint, button: TesseraSession.MouseButton) {
         guard pressOutcomes[button] != nil else { return }
-        sendMouse(event, kind: .motion, button: button)
+        sendMouse(event, at: point, kind: .motion, button: button)
     }
 
     /// Sends the release of a press that was sent; its record goes only
     /// once the core takes it, so a release the core refuses (a position
     /// that is not a number) does not leave the program's button held.
-    private func release(_ event: NSEvent, button: TesseraSession.MouseButton) {
+    private func release(_ event: NSEvent, at point: NSPoint, button: TesseraSession.MouseButton) {
         guard pressOutcomes[button] != nil else { return }
-        guard sendMouse(event, kind: .release, button: button) != nil else { return }
+        guard sendMouse(event, at: point, kind: .release, button: button) != nil else { return }
         pressOutcomes[button] = nil
     }
 
@@ -1393,28 +1412,29 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         }
     }
 
-    /// Whether a press or a motion with no button held at `event` is sent:
+    /// Whether a press or a motion with no button held at `point` is sent:
     /// only over the render view while its cell size is known. The drags
     /// and the release of a press that was sent always are. The test is
     /// AppKit's hit test (`isMousePoint(_:in:)`): in this unflipped view
     /// a point on the top edge (y == maxY, the top pixel row) is inside and
     /// one on the bottom edge is not.
-    private func reportsPointer(at event: NSEvent) -> Bool {
-        metrics != nil && isMousePoint(convert(event.locationInWindow, from: nil), in: renderView.frame)
+    private func reportsPointer(at point: NSPoint) -> Bool {
+        metrics != nil && isMousePoint(point, in: renderView.frame)
     }
 
-    /// Sends a pointer event to the session and returns whether the core
+    /// Sends a pointer event at `point` (view coordinates) to the session
+    /// and returns whether the core
     /// reported it to the program, or `nil` when it was not sent or the
     /// core refused it. While ``metrics`` is `nil` it goes to the last
     /// position the core took (``lastMousePosition``), and is not sent
     /// when there is none.
     @discardableResult
     private func sendMouse(
-        _ event: NSEvent, kind: TesseraSession.MouseEventKind, button: TesseraSession.MouseButton
+        _ event: NSEvent, at point: NSPoint, kind: TesseraSession.MouseEventKind, button: TesseraSession.MouseButton
     ) -> TesseraSession.InputOutcome? {
         let position: (col: UInt16, row: UInt16, xPx: Float, yPx: Float)
         if metrics != nil {
-            let (cell, pixels) = cell(at: convert(event.locationInWindow, from: nil))
+            let (cell, pixels) = cell(at: point)
             position = (cell.col, cell.row, Float(pixels.x), Float(pixels.y))
         } else if let lastMousePosition {
             position = lastMousePosition
@@ -1459,7 +1479,9 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     ///
     /// While text is marked the event is dropped whole after that
     /// bookkeeping: the input method owns input during a composition, and
-    /// the core cannot be asked to report the wheel without scrolling.
+    /// the core cannot be asked to report the wheel without scrolling. So
+    /// is an event while ``metrics`` is `nil`: no cell can be named for it,
+    /// and a program tracking the mouse would get it at cell 0,0 (#289).
     override func scrollWheel(with event: NSEvent) {
         let gesture = event.phase
         let momentum = event.momentumPhase
@@ -1475,15 +1497,13 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         if ignoresMomentum, !momentum.isEmpty {
             return
         }
-        guard !hasMarkedText() else { return }
-        let point = convert(event.locationInWindow, from: nil)
-        let (cell, _) = cell(at: point)
-        let scale: CGFloat = metrics.map { CGFloat($0.scale) } ?? window?.backingScaleFactor ?? 1
+        guard !hasMarkedText(), let metrics else { return }
+        let (cell, _) = cell(at: location(of: event))
+        let scale = CGFloat(metrics.scale)
         // A notched wheel reports lines; a trackpad reports points.
         let lines: CGFloat
         if event.hasPreciseScrollingDeltas {
-            let lineHeight: CGFloat = metrics.map { CGFloat($0.cellHeightPx) / scale } ?? Self.fallbackLineHeight
-            lines = event.scrollingDeltaY / lineHeight
+            lines = event.scrollingDeltaY / (CGFloat(metrics.cellHeightPx) / scale)
         } else {
             lines = event.scrollingDeltaY
         }
@@ -1563,9 +1583,8 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         gesture = .selecting(last: cell)
     }
 
-    /// A drag with the left button down.
-    private func continueGesture(_ event: NSEvent) {
-        let point = convert(event.locationInWindow, from: nil)
+    /// A drag with the left button down, to `point`.
+    private func continueGesture(at point: NSPoint) {
         lastPointer = point
         let cell = gridCell(at: point)
         switch gesture {
@@ -1586,11 +1605,10 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
 
     /// The left button went up: autoscroll stops, a Command-click that
     /// stayed in its cell opens the link that was there at the press.
-    private func endGesture(_ event: NSEvent) {
+    private func endGesture(at point: NSPoint) {
         autoscroller.stop()
         defer { gesture = nil }
         guard case .link(let press, let link, let moved)? = gesture, !moved else { return }
-        let point = convert(event.locationInWindow, from: nil)
         lastPointer = point
         guard gridCell(at: point) == press, let link else { return }
         openLink(link)
@@ -1598,9 +1616,14 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
 
     /// Opens `link` if the policy allows (Finder shows a file that would
     /// launch something). A `file:` link is looked up on disk here, on the
-    /// click, never on hover.
+    /// click, never on hover. A link the hover underlined that opens
+    /// nothing (a `file:` path that does not exist) beeps, so the click
+    /// is not silently lost (#299).
     private func openLink(_ link: String) {
-        guard let action = LinkPolicy.action(for: link, fileManager: linkFileManager) else { return }
+        guard let action = LinkPolicy.action(for: link, fileManager: linkFileManager) else {
+            if LinkPolicy.allows(link) { linkRefusedBeep() }
+            return
+        }
         switch action {
         case .open(let url): linkOpener.open(url)
         case .reveal(let url): linkOpener.reveal(url)
@@ -1662,11 +1685,14 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     /// the pointer leaves the link or a button is down. The policy is asked
     /// about the URL alone (``LinkPolicy/allows(_:localHostName:)``): a hover
     /// never touches the file system, where a hung mount would stall the
-    /// pointer. Only the text hovers, while its cell size is known: a click
-    /// opens nothing elsewhere.
+    /// pointer. Only the text hovers, while its cell size is known, and not
+    /// under a scroll bar that is not hidden (an overlay one floats over the
+    /// text and takes the click there, even while transparent between
+    /// flashes): a click opens nothing elsewhere.
     private func updateHover(modifiers: NSEvent.ModifierFlags) {
         guard Self.isLinkModifier(modifiers.intersection(.deviceIndependentFlagsMask)), gesture == nil,
-            let point = lastPointer, metrics != nil, isMousePoint(point, in: renderView.frame)
+            let point = lastPointer, metrics != nil, isMousePoint(point, in: renderView.frame),
+            scroller.isHidden || !isMousePoint(point, in: scroller.frame)
         else {
             setHover(link: nil, cell: nil)
             return
@@ -1781,8 +1807,8 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         inputContext?.invalidateCharacterCoordinates()
     }
 
-    /// Line height in points for trackpad scrolling, and the composition
-    /// cell's height, while the cell size is unknown (Menlo 13 pt, the
+    /// The composition cell's height and a pane's smallest size, in points,
+    /// while the cell size is unknown (Menlo 13 pt, the
     /// default font).
     static let fallbackLineHeight: CGFloat = 16
 

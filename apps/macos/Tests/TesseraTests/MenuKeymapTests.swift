@@ -163,4 +163,32 @@ final class MenuKeymapTests: XCTestCase {
         }
         XCTAssertEqual(Self.shortcuts(bar), Self.shortcuts(MainMenu.makeMenuBar().bar), "back to the defaults")
     }
+
+    /// A bound command runs as choosing its item would: only while the
+    /// item validates as enabled, with a beep otherwise (#317).
+    func testRunningACommandValidatesItsItemFirst() throws {
+        let bar = MainMenu.makeMenuBar().bar
+        let copy = try Self.item("copy", bar)
+        let target = CopyTarget()
+        copy.target = target
+        var beeps = 0
+        MainMenu.run(command: "copy", in: bar) { beeps += 1 }
+        XCTAssertEqual(target.copies, 0, "a disabled item does not run")
+        XCTAssertEqual(beeps, 1, "it beeps instead")
+        target.enabled = true
+        MainMenu.run(command: "copy", in: bar) { beeps += 1 }
+        XCTAssertEqual(target.copies, 1, "an enabled one runs")
+        XCTAssertEqual(beeps, 1)
+    }
+}
+
+/// A Copy target whose item is enabled only when told.
+@MainActor
+private final class CopyTarget: NSObject, NSMenuItemValidation {
+    var enabled = false
+    private(set) var copies = 0
+
+    @objc func copy(_ sender: Any?) { copies += 1 }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool { enabled }
 }

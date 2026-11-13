@@ -324,6 +324,25 @@ final class MouseReportingTests: XCTestCase {
         XCTAssertNil(view.pressOutcomes[.left], "released")
     }
 
+    /// While no cell can be named, a wheel event is not sent: a program
+    /// tracking the mouse would get it at cell 1;1 (#289).
+    func testWithoutMetricsAWheelEventIsNotReported() async throws {
+        try await open()
+        let event = try XCTUnwrap(
+            CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 1, wheel1: 3, wheel2: 0, wheel3: 0))
+        event.setIntegerValueField(.scrollWheelEventIsContinuous, value: 0)
+        let wheel = try XCTUnwrap(NSEvent(cgEvent: event))
+        XCTAssertNotEqual(wheel.scrollingDeltaY, 0, "the event system kept the delta")
+        view.metrics = nil
+        let sent = view.sentScrollCount
+        view.scrollWheel(with: wheel)
+        XCTAssertEqual(view.sentScrollCount, sent, "not sent")
+        try await assertBytes([], "nothing at 1;1")
+        view.metrics = Self.metrics
+        view.scrollWheel(with: wheel)
+        XCTAssertEqual(view.sentScrollCount, sent + 1, "with a cell size it is")
+    }
+
     func testAReleaseTheCoreRefusesKeepsThePressRecord() async throws {
         try await open()
         try down(1, 1)

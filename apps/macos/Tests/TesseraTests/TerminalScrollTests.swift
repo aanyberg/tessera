@@ -927,14 +927,10 @@ final class TerminalScrollTests: XCTestCase {
             XCTAssertTrue(NSCursor.current === NSCursor.pointingHand, "\(style): the hand over the link")
             NSCursor.crosshair.set()
             try move(to: NSPoint(x: scroller.frame.midX, y: y))
-            if style == .legacy {
-                XCTAssertNil(view.hoveredLink, "legacy: the scroll bar beside the text hovers nothing")
-                XCTAssertTrue(NSCursor.current === NSCursor.arrow, "legacy: the arrow over the scroll bar")
-            } else {
-                // An overlay bar floats over the text: the link stays, and
-                // the cursor rects give the arrow there.
-                XCTAssertEqual(view.hoveredLink, url, "overlay")
-            }
+            // Beside the text (legacy) or floating over it (overlay, #299):
+            // the bar takes the click, so it hovers nothing.
+            XCTAssertNil(view.hoveredLink, "\(style): the scroll bar hovers nothing")
+            XCTAssertTrue(NSCursor.current === NSCursor.arrow, "\(style): the arrow over the scroll bar")
             view.mouseExited(with: NSEvent())
         }
     }

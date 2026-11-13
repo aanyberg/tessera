@@ -35,15 +35,20 @@ final class WorkspaceLinkOpener: LinkOpening {
 /// launch something (an application or other bundle, an executable or
 /// script, an installer package or disk image, a Java archive, a `.command`,
 /// `.webloc`, `.url` or other stored URL, a Finder alias) is shown in Finder
-/// instead of opened; any other local file or folder opens normally. A
-/// stored URL is handed to its scheme's handler, whatever the scheme, so
-/// opening one would get around the scheme rule above.
+/// instead of opened, and so is one that would install something or start
+/// a system flow that does (a configuration or provisioning profile, a
+/// certificate, a Shortcuts shortcut, a Java Web Start file, an Automator
+/// workflow; ADR 0027 amendment, #299). Any other local file or
+/// folder opens normally: an archive too, which Archive Utility extracts
+/// without running anything. A stored URL is handed to its scheme's
+/// handler, whatever the scheme, so opening one would get around the
+/// scheme rule above.
 ///
 /// The file system is consulted only for a click (``action(for:localHostName:fileManager:)``):
 /// the Command-hover asks ``allows(_:localHostName:)``, which reads the URL
 /// alone, so a hung network mount cannot stall the pointer. A hovered
-/// `file:` link to a path that does not exist is underlined and does
-/// nothing when clicked.
+/// `file:` link to a path that does not exist is underlined, and a click
+/// on it opens nothing and beeps.
 enum LinkPolicy {
     enum Action: Equatable {
         case open(URL)
@@ -57,17 +62,36 @@ enum LinkPolicy {
     }
 
     private static let remoteSchemes: Set<String> = ["http", "https", "mailto", "ftp"]
-    /// Files the system would launch or run, or that redirect to something
-    /// that does.
-    private static let launchableExtensions: Set<String> = [
-        "command", "tool", "terminal", "webloc", "inetloc", "fileloc", "pkg", "mpkg", "dmg", "jar",
+    /// Files the system would launch, run or install, or that redirect to
+    /// something that does. A flat `.workflow` file has no declared type
+    /// (Automator's is a bundle's), nor do Keychain Access's `.cert`, `.p7c`
+    /// and `.p7b` certificates, so only their extensions name them.
+    static let launchableExtensions: Set<String> = [
+        "command", "tool", "terminal", "term", "webloc", "inetloc", "fileloc", "pkg", "mpkg", "dmg", "jar",
+        "mobileconfig", "configprofile", "provisionprofile", "cer", "crt", "der", "pem", "cert", "p7c", "p7b",
+        "shortcut", "wflow", "jnlp", "workflow",
     ]
     /// By type, so a renamed file is caught too: every stored URL
     /// (`public.stored-url`: `.url`, `.webloc`, `.vncloc`, `.afploc` and the
-    /// rest) and every disk image (`.img` and `.iso` as well as `.dmg`).
+    /// rest), every disk image (`.img` and `.iso` as well as `.dmg`), and
+    /// what installs or starts a flow that does: configuration and
+    /// provisioning profiles (ProfileHelper opens them), X.509 certificates
+    /// (whatever extension the system maps to them), shortcuts in either
+    /// format, Java Web Start files, Automator workflows and Terminal
+    /// session files (`.term`, whose commands Terminal runs).
     private static let launchableTypes: [UTType] =
         [.executable, .script, .shellScript, .applicationBundle, .unixExecutable, .diskImage]
-        + [UTType("public.stored-url")].compactMap { $0 }
+        + [
+            "public.stored-url", "com.apple.mobileconfig", "com.apple.configprofile", "com.apple.provisionprofile",
+            "public.x509-certificate", "com.apple.shortcut", "com.apple.shortcuts.workflow-file",
+            "com.sun.java-web-start", "com.apple.automator-workflow", "com.apple.terminal.session",
+        ].compactMap { UTType($0) }
+
+    /// Whether a file of `type` is shown rather than opened (tests: every
+    /// rule of ``launchableTypes`` on its own).
+    static func isLaunchable(_ type: UTType) -> Bool {
+        launchableTypes.contains { type.conforms(to: $0) }
+    }
 
     /// This Mac's host name, as `gethostname` gives it.
     static var localHostName: String {
@@ -120,9 +144,7 @@ enum LinkPolicy {
             // it in its name or mode: every one is shown, not opened.
             if values?.isAliasFile == true { return true }
             if values?.isApplication == true || values?.isPackage == true { return true }
-            if let type = values?.contentType, launchableTypes.contains(where: { type.conforms(to: $0) }) {
-                return true
-            }
+            if let type = values?.contentType, isLaunchable(type) { return true }
             // Directories are "executable" for the search permission only.
             return values?.isDirectory != true && fileManager.isExecutableFile(atPath: target.path)
         }
