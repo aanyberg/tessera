@@ -291,7 +291,7 @@ fn word_click(app: &App, id: SessionId, row: u16, col: u16) -> (String, Option<S
     )
 }
 
-/// SS-C1 to SS-C4: soft wraps and wide characters, in cells.
+/// SS-C1 to SS-C4b: soft wraps, wide characters and NFD accents, in cells.
 #[test]
 fn cell_rows_select_their_cells() {
     let app = app_with(None, true);
@@ -323,6 +323,13 @@ fn cell_rows_select_their_cells() {
             Some("/tmp/日本/x".to_owned())
         ),
         "SS-C4"
+    );
+    let nfd = "/Users/Jose\u{301}/cafe\u{301}.txt";
+    let id = session(&app, 2, 40, format!("ls a+{nfd} ok").as_bytes());
+    assert_eq!(
+        word_click(&app, id, 0, 19),
+        ("linear (0,5)-(0,24)".to_owned(), Some(nfd.to_owned())),
+        "SS-C4b"
     );
 }
 
@@ -363,7 +370,7 @@ fn a_user_rule_replaces_the_defaults() {
     assert_eq!(word_click(&app, id, 0, 3).1.as_deref(), Some("a/b"));
 }
 
-/// SS-C5b to SS-C5d: where the window edge falls inside a long C++ name
+/// SS-C5b to SS-C5e: where the window edge falls inside a long C++ name
 /// on a character the rule cannot start or end with (`:`), the match the
 /// regex finds starts or ends just inside the window; it is still dropped,
 /// and the double-click selects what a word double-click selects.
@@ -404,6 +411,11 @@ fn a_match_cut_inside_the_edge_run_is_dropped() {
     let short = format!("x {}a y", "a::".repeat(1000));
     let (got, _) = click(&short, 1500);
     assert_eq!(got.map(|t| t.len()), Some(3001));
+    // SS-C5e: the window ends with the line and holds no blank.
+    let path = "a/".repeat(3000);
+    let (got, word) = click(&path, 5000);
+    assert_eq!(word.as_deref(), Some(path.as_str()), "SS-C5e word");
+    assert_eq!(got, word, "SS-C5e");
 }
 
 /// Equal scores go to the earlier start, then (same start) to the earlier
@@ -605,7 +617,7 @@ fn html_body(formatted: &FormattedText) -> &str {
     let RichCopy::Text { html, .. } = &formatted.rich else {
         panic!("no rich text: {formatted:?}");
     };
-    let start = html.find("monospace\">").expect("the pre") + "monospace\">".len();
+    let start = html.find("monospace\">\n").expect("the pre") + "monospace\">\n".len();
     &html[start..html.len() - "</pre></body></html>".len()]
 }
 

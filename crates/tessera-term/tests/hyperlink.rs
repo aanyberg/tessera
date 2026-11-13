@@ -603,8 +603,8 @@ fn a_repeated_alternate_screen_set_closes_the_open_link() {
 #[test]
 fn controls_and_bidi_formatting_in_a_uri_refuse_the_link_and_the_text_prints() {
     for ch in [
-        '\u{7f}', '\u{80}', '\u{85}', '\u{9b}', '\u{9f}', '\u{200e}', '\u{200f}', '\u{202a}',
-        '\u{202e}', '\u{2066}', '\u{2069}',
+        '\u{7f}', '\u{80}', '\u{85}', '\u{9b}', '\u{9f}', '\u{61c}', '\u{200e}', '\u{200f}',
+        '\u{2028}', '\u{2029}', '\u{202a}', '\u{202e}', '\u{2066}', '\u{2069}',
     ] {
         let mut term = Terminal::new(2, 10);
         term.advance(&open("https://a.bc/"));

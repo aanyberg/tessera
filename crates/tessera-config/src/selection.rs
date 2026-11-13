@@ -219,9 +219,10 @@ macro_rules! ipv6_group {
 pub const DEFAULT_SMART_RULES: [(&str, Precision); 15] = [
     // C++ names: std::vector.
     (r"(?:[A-Za-z0-9_]+::)+[A-Za-z0-9_]+", Precision::Normal),
-    // Paths: /usr/local/bin, ~/src, ./a/b.
+    // Paths: /usr/local/bin, ~/src, ./a/b; `\p{M}` keeps a decomposed
+    // (NFD) accent, as macOS file names often hold, inside the path (#351).
     (
-        r"~?/?(?:[\p{L}\p{N}._-]+/+)+[\p{L}\p{N}._-]+/?",
+        r"~?/?(?:[\p{L}\p{M}\p{N}._-]+/+)+[\p{L}\p{M}\p{N}._-]+/?",
         Precision::Normal,
     ),
     // Double-quoted strings, with an Objective-C `@`.
@@ -330,6 +331,10 @@ fn compile(rule: &SmartRule) -> Result<CompiledRule, RuleError> {
     }
     let regex = RegexBuilder::new(&rule.regex)
         .size_limit(SMART_RULE_SIZE_LIMIT)
+        // Bounds the lazy DFA's cache. No test can tell it from the
+        // default (#351 m3): past its limit the regex crate falls back to a
+        // slower engine with the same matches, so the mutant that drops it
+        // survives; it bounds memory, not the result.
         .dfa_size_limit(SMART_RULE_SIZE_LIMIT)
         .nest_limit(SMART_RULE_NEST_LIMIT)
         .build()

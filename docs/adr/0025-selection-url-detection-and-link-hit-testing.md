@@ -1,7 +1,8 @@
 # ADR 0025: Selection, URL detection and link hit-testing
 
 **Status:** accepted · 2026-10-31 · amended 2026-11-04 (#191: the guarded
-rows, CJK around URLs, the lookup's fast path)
+rows, CJK around URLs, the lookup's fast path); amended 2026-11-13 (#279, #281:
+invisible characters in a detected link, the narrowed hidden-end check)
 
 ## Context
 
@@ -555,3 +556,55 @@ of the base against the head (`url_at` on 220 000 lines, the hover on
 - `WORD_CHARS` and copy-on-select become configuration in #47.
 - `Terminal::set_max_scrollback` exists (for a test hook today); applying
   the configured `scrollback_lines` to sessions is still to do.
+
+## Amendment: invisible characters in a detected link (#279, 2026-11-13)
+
+**Strip, do not end** (lead decision D3-2). A default-ignorable code point
+that is not a hidden URL end (ZWNJ, CGJ, variation selectors including
+VS16, tag characters, Mongolian free variation selectors, U+17B4/17B5,
+the Hangul fillers U+115F/1160/3164/FFA0, the rest of U+2060-206F and
+every other `Default_Ignorable_Code_Point`) no longer survives in
+`Link.url`: `link_of` leaves it out when it builds the text, so the URL
+that opens equals the cell text the user sees. U3 is restated: such a
+code point does not end a URL and is not part of the opened URL. The
+hidden-end set of `url::is_hidden_url_end` (the bidi controls and ZWJ) is
+unchanged, so the check below does not widen. The table is a static
+sorted range list in `url.rs` (`DEFAULT_IGNORABLE`, Unicode 17.0's
+DerivedCoreProperties.txt, merged ranges, no dependency); a test checks
+it against the listed UCD ranges and one code point of each class. The
+hover span still covers the cells, stripped ones included. The 2083 cap
+(U9) counts cells, a cell whose only scalar is stripped included, so it is
+at least as strict as stripping first and the URL stays at most 2083
+characters.
+
+**The hidden-end check after a miss (#281)**, lead decision D3-1, option
+(b). When `url_at` finds no URL on the base scalars of a window that holds
+a `:`, the lookup used to read every window cell's cluster for a hidden
+end, which cost up to 2x on combining text with a time or path in it. A
+hidden end only ends the run of URL characters; it starts no scheme. So
+it can give the point a URL only (U1) in the cell before a scheme start
+whose base scalar blocks the scheme, or (U9, and the U4 `-` at a CJK cut)
+in a cell after the point, which shortens every candidate. Any other cell
+before the point cuts the run so that the starts after it see the base's
+own text, which found nothing. `hidden_end_can_link` checks only those
+cells, and none when the window has no scheme start up to the point; the
+proof is in its doc comment. No grid write path changed (option (c), a
+per-line bit, was not taken). The dead `0xD8` lead-byte test for U+061C
+(ALM) went: the terminal drops ALM at print, so it never reaches a
+cluster, and a test (`alm_never_reaches_a_cluster`) keeps that true.
+
+**Measurements** (`cargo xtask ab bench` against f057a0b, 15 interleaved
+pairs, best instructions retired, cycles in brackets, load 3-4):
+`y_comb_colon` 0.671 (0.561), `y_bigcl_colon` 0.539 (0.466),
+`y_ls_nospace` 0.914 (0.863); `h_ascii_url` 1.007 (1.017),
+`h_ascii_plain` 0.999, `h_latin_diacritics` 1.000, `h_cjk` 1.000,
+`h_box_drawing` 1.000, `h_hebrew` 1.000, `h_arabic` 1.000,
+`h_punctuation` 0.997, `h_braille` 1.000, `h_combining_heavy` 0.996,
+and `h_emoji_vs16_url` (a link holding a stripped VS16) 1.003 (1.015).
+The OSC 8 drop path (#277, `get` then `remove`, so a drop never
+allocates) on `Terminal::advance`: every print line 1.000, `osc8_dense`
+(every word a link, each row overwritten twice) 1.016 (1.019), the cost
+of the second hash on each link's last-cell drop. A differential run of
+the hover against the per-cell reference (200 000 seeds) and of the base,
+its URL stripped the same way, against the head (200 000 seeds) found no
+difference.

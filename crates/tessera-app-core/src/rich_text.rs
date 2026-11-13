@@ -42,8 +42,10 @@ pub const MAX_RICH_COPY_LEN: usize = 16 << 20;
 /// distinct colours is refused like one over [`MAX_RICH_COPY_LEN`].
 pub const MAX_RTF_COLORS: usize = 4096;
 
-/// The HTML before the body.
-const HTML_HEAD: &str = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body><pre style=\"font-family:Menlo,monospace\">";
+/// The HTML before the body. It ends with a line feed: a parser drops the
+/// one right after a `<pre>` open tag, so a selection starting with a blank
+/// line keeps it (#351).
+const HTML_HEAD: &str = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body><pre style=\"font-family:Menlo,monospace\">\n";
 /// The HTML after the body.
 const HTML_TAIL: &str = "</pre></body></html>";
 /// The RTF before the colour table.
@@ -237,28 +239,51 @@ fn is_dropped(c: char) -> bool {
     c.is_ascii_control()
 }
 
-/// A string that refuses to grow past a cap.
+/// A string that refuses to grow past a cap, or only its length: each
+/// format is written twice, first counted (nothing stored), then into a
+/// string of exactly that length, so a copy of many megabytes allocates
+/// its output once instead of doubling into it (#351).
 struct Capped {
     text: String,
+    len: usize,
     cap: usize,
+    /// Whether the text is kept, not only counted.
+    write: bool,
 }
 
 /// The cap was reached.
 struct Over;
 
 impl Capped {
-    fn new(cap: usize) -> Self {
+    /// A counter of at most `cap` bytes.
+    fn counting(cap: usize) -> Self {
         Self {
             text: String::new(),
+            len: 0,
             cap,
+            write: false,
+        }
+    }
+
+    /// A string of at most `cap` bytes, `len` of them reserved (at most
+    /// `cap`).
+    fn writing(len: usize, cap: usize) -> Self {
+        Self {
+            text: String::with_capacity(len.min(cap)),
+            len: 0,
+            cap,
+            write: true,
         }
     }
 
     fn push_str(&mut self, s: &str) -> Result<(), Over> {
-        if self.text.len() + s.len() > self.cap {
+        if self.len + s.len() > self.cap {
             return Err(Over);
         }
-        self.text.push_str(s);
+        self.len += s.len();
+        if self.write {
+            self.text.push_str(s);
+        }
         Ok(())
     }
 
@@ -267,9 +292,48 @@ impl Capped {
     }
 }
 
+/// A short piece of text built on the stack: one character reference or
+/// RTF control word or colour entry, so escaping allocates nothing.
+struct Small {
+    bytes: [u8; 48],
+    len: usize,
+}
+
+impl Small {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; 48],
+            len: 0,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        // Only `write_str` fills it, with whole `str`s.
+        std::str::from_utf8(&self.bytes[..self.len]).unwrap_or_default()
+    }
+}
+
+impl std::fmt::Write for Small {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let end = self.len + s.len();
+        let into = self.bytes.get_mut(self.len..end).ok_or(std::fmt::Error)?;
+        into.copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
 /// The HTML document of `styled`, or `None` past `cap` bytes.
 pub(crate) fn html(styled: &Styled, cap: usize) -> Option<String> {
-    let mut out = Capped::new(cap);
+    let mut count = Capped::counting(cap);
+    html_into(styled, &mut count)?;
+    let mut out = Capped::writing(count.len, cap);
+    html_into(styled, &mut out)?;
+    Some(out.text)
+}
+
+/// The HTML document of `styled` into `out`.
+fn html_into(styled: &Styled, out: &mut Capped) -> Option<()> {
     out.push_str(HTML_HEAD).ok()?;
     let mut style = String::new();
     for segment in &styled.segments {
@@ -283,7 +347,7 @@ pub(crate) fn html(styled: &Styled, cap: usize) -> Option<String> {
                     out.push_str("\">").ok()?;
                 }
                 for c in text.chars() {
-                    html_escape(c, &mut out).ok()?;
+                    html_escape(c, out).ok()?;
                 }
                 if !style.is_empty() {
                     out.push_str("</span>").ok()?;
@@ -291,8 +355,7 @@ pub(crate) fn html(styled: &Styled, cap: usize) -> Option<String> {
             }
         }
     }
-    out.push_str(HTML_TAIL).ok()?;
-    Some(out.text)
+    out.push_str(HTML_TAIL).ok()
 }
 
 /// The declarations of `look`, in the fixed order, into `out` (emptied
@@ -339,9 +402,9 @@ fn html_escape(c: char, out: &mut Capped) -> Result<(), Over> {
         '}' => out.push_str("&#125;"),
         c if is_dropped(c) => Ok(()),
         c if u32::from(c) > 0x7e => {
-            let mut reference = String::with_capacity(10);
+            let mut reference = Small::new();
             let _ = write!(reference, "&#x{:x};", u32::from(c));
-            out.push_str(&reference)
+            out.push_str(reference.as_str())
         }
         c => out.push(c),
     }
@@ -350,10 +413,38 @@ fn html_escape(c: char, out: &mut Capped) -> Result<(), Over> {
 /// The RTF document of `styled`, or `None` past `cap` bytes or
 /// [`MAX_RTF_COLORS`] colours.
 pub(crate) fn rtf(styled: &Styled, cap: usize) -> Option<String> {
-    // The body first: the colour table it fills comes before it.
-    let mut body = Capped::new(cap);
-    let mut colors: HashMap<Rgb, usize> = HashMap::new();
+    let mut count = Capped::counting(cap);
+    rtf_into(styled, &mut count)?;
+    let mut out = Capped::writing(count.len, cap);
+    rtf_into(styled, &mut out)?;
+    Some(out.text)
+}
+
+/// The RTF document of `styled` into `out`. The colour table comes before
+/// the body that fills it, so the body is walked twice: once counted, for
+/// the table (bounded by [`MAX_RTF_COLORS`]), then written after it.
+fn rtf_into(styled: &Styled, out: &mut Capped) -> Option<()> {
     let mut table: Vec<Rgb> = Vec::new();
+    rtf_body(styled, &mut Capped::counting(out.cap), &mut table)?;
+    out.push_str(RTF_HEAD).ok()?;
+    out.push_str("{\\colortbl;").ok()?;
+    let mut entry = Small::new();
+    for &Rgb { r, g, b } in &table {
+        entry.len = 0;
+        let _ = write!(entry, "\\red{r}\\green{g}\\blue{b};");
+        out.push_str(entry.as_str()).ok()?;
+    }
+    out.push('}').ok()?;
+    out.push_str(RTF_BODY).ok()?;
+    // The same walk numbers the colours the same way.
+    table.clear();
+    rtf_body(styled, out, &mut table)?;
+    out.push('}').ok()
+}
+
+/// The RTF body of `styled` into `out`, its colours numbered into `table`.
+fn rtf_body(styled: &Styled, body: &mut Capped, table: &mut Vec<Rgb>) -> Option<()> {
+    let mut colors: HashMap<Rgb, usize> = HashMap::new();
     let mut index = |rgb: Rgb| -> Option<usize> {
         if let Some(&i) = colors.get(&rgb) {
             return Some(i);
@@ -365,12 +456,12 @@ pub(crate) fn rtf(styled: &Styled, cap: usize) -> Option<String> {
         colors.insert(rgb, table.len());
         Some(table.len())
     };
-    let mut word = String::new();
+    let mut word = Small::new();
     for segment in &styled.segments {
         match segment {
             Segment::Newline => body.push_str("\\par ").ok()?,
             Segment::Run(look, text) => {
-                word.clear();
+                word.len = 0;
                 if let Some(fg) = look.fg {
                     let _ = write!(word, "\\cf{} ", index(fg)?);
                 }
@@ -384,16 +475,16 @@ pub(crate) fn rtf(styled: &Styled, cap: usize) -> Option<String> {
                     (look.strike, "\\strike "),
                 ] {
                     if on {
-                        word.push_str(control);
+                        let _ = word.write_str(control);
                     }
                 }
-                let grouped = !word.is_empty();
+                let grouped = word.len > 0;
                 if grouped {
                     body.push('{').ok()?;
-                    body.push_str(&word).ok()?;
+                    body.push_str(word.as_str()).ok()?;
                 }
                 for c in text.chars() {
-                    rtf_escape(c, &mut body).ok()?;
+                    rtf_escape(c, body).ok()?;
                 }
                 if grouped {
                     body.push('}').ok()?;
@@ -401,20 +492,7 @@ pub(crate) fn rtf(styled: &Styled, cap: usize) -> Option<String> {
             }
         }
     }
-    let mut out = Capped::new(cap);
-    out.push_str(RTF_HEAD).ok()?;
-    out.push_str("{\\colortbl;").ok()?;
-    let mut entry = String::new();
-    for Rgb { r, g, b } in table {
-        entry.clear();
-        let _ = write!(entry, "\\red{r}\\green{g}\\blue{b};");
-        out.push_str(&entry).ok()?;
-    }
-    out.push('}').ok()?;
-    out.push_str(RTF_BODY).ok()?;
-    out.push_str(&body.text).ok()?;
-    out.push('}').ok()?;
-    Some(out.text)
+    Some(())
 }
 
 /// One scalar of text as RTF.
@@ -426,13 +504,13 @@ fn rtf_escape(c: char, out: &mut Capped) -> Result<(), Over> {
         c if is_dropped(c) => Ok(()),
         c if u32::from(c) > 0x7e => {
             let mut units = [0u16; 2];
-            let mut item = String::with_capacity(16);
+            let mut item = Small::new();
             for unit in c.encode_utf16(&mut units) {
                 // RTF's \uN takes a signed 16-bit number.
                 let signed = i16::from_ne_bytes(unit.to_ne_bytes());
                 let _ = write!(item, "\\u{signed}?");
             }
-            out.push_str(&item)
+            out.push_str(item.as_str())
         }
         c => out.push(c),
     }
@@ -479,12 +557,68 @@ mod tests {
         let s = styled(&[("hi", RunStyle::default())]);
         assert_eq!(
             html(&s, MAX_RICH_COPY_LEN).unwrap(),
-            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body><pre style=\"font-family:Menlo,monospace\">hi</pre></body></html>"
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body><pre style=\"font-family:Menlo,monospace\">\nhi</pre></body></html>"
         );
         assert_eq!(
             rtf(&s, MAX_RICH_COPY_LEN).unwrap(),
             "{\\rtf1\\ansi\\ansicpg1252\\deff0{\\fonttbl{\\f0\\fmodern Menlo;}}{\\colortbl;}\\f0\\fs24 hi}"
         );
+    }
+
+    /// #351: a parser drops the line feed right after `<pre>`, so one is
+    /// always written there and a selection starting with a blank line
+    /// keeps it.
+    #[test]
+    fn a_leading_blank_line_survives_the_pre_tag() {
+        let mut s = Styled::default();
+        s.push_newline(MAX_RICH_COPY_LEN);
+        s.push_cell(
+            &Cell::default(),
+            Some("a"),
+            RunStyle::default(),
+            MAX_RICH_COPY_LEN,
+        );
+        let html = html(&s, MAX_RICH_COPY_LEN).unwrap();
+        assert!(html.contains("monospace\">\n\na</pre>"), "{html}");
+        assert!(HTML_HEAD.ends_with("\">\n"));
+    }
+
+    /// #351: each format is counted first and written into a string of
+    /// exactly its length, one allocation however long the copy: the
+    /// capacity equals the length (a string grown by doubling would end
+    /// with spare capacity). 2 MiB of mixed text and looks.
+    #[test]
+    fn each_format_is_written_into_one_exact_allocation() {
+        let mut s = Styled::default();
+        let cell = Cell::default();
+        for i in 0..40_000u32 {
+            let look = RunStyle {
+                fg: Some(Rgb::new(byte(i), 0, 0)),
+                bold: i % 3 == 0,
+                ..RunStyle::default()
+            };
+            s.push_cell(&cell, Some("ab<\u{e9}\u{65e5}{"), look, MAX_RICH_COPY_LEN);
+            s.push_cell(
+                &cell,
+                Some(" x\u{1f600}"),
+                RunStyle::default(),
+                MAX_RICH_COPY_LEN,
+            );
+            if i % 50 == 0 {
+                s.push_newline(MAX_RICH_COPY_LEN);
+            }
+        }
+        let RichCopy::Text { html, rtf } = s.render(MAX_RICH_COPY_LEN) else {
+            panic!("refused");
+        };
+        assert!(html.len() > 1 << 20 && rtf.len() > 1 << 20);
+        assert_eq!(html.capacity(), html.len());
+        assert_eq!(rtf.capacity(), rtf.len());
+        // At the exact cap too, and refused one byte under it.
+        let (h, r) = (html.len(), rtf.len());
+        assert_eq!(super::html(&s, h).map(|t| t.capacity()), Some(h));
+        assert_eq!(super::rtf(&s, r).map(|t| t.capacity()), Some(r));
+        assert!(super::html(&s, h - 1).is_none() && super::rtf(&s, r - 1).is_none());
     }
 
     #[test]

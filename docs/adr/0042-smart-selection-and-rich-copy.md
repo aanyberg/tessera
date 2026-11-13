@@ -1,6 +1,7 @@
 # ADR 0042: Smart selection rules and Copy with Formatting
 
-**Status:** accepted · 2026-11-08
+**Status:** accepted · 2026-11-08 · amended 2026-11-13 (#351: click budget, path marks,
+rich-copy output)
 
 ## Context
 
@@ -167,3 +168,40 @@ builds (a test asserts it).
   the tests can attack.
 - **Cutting a too-large copy.** A formatted copy silently missing its end
   is worse than a plain one; the plain copy is still whole.
+
+## Amendment: click budget, path marks and rich-copy output (#351, 2026-11-13)
+
+- **Click budget.** The rules of one double-click share 50 ms of wall time
+  (`SMART_RULE_BUDGET`), checked before each rule after the first: a rule
+  not started by then is skipped, and the best match of the rules that ran
+  wins (with none, the word). One debug log carries the counts only (rules
+  run, skipped, total; S8). The 64-rule cap bounds count, not time: 64
+  rules like `[a-z]+X|[a-z]` took ~425 ms a click on 8192 characters
+  before; now a click stops after the rule running at 50 ms. The first rule
+  always runs, so a click costs at most 50 ms plus one rule.
+- **Paths keep combining marks.** The built-in path rule is
+  `~?/?(?:[\p{L}\p{M}\p{N}._-]+/+)+[\p{L}\p{M}\p{N}._-]+/?`: a decomposed
+  (NFD) accent, as macOS file names often hold, no longer cuts a path
+  (fixture SS-C4b). The other built-in rules are unchanged.
+- **`<pre>` and a leading blank line.** The HTML always has a line feed
+  right after the `<pre ...>` open tag. An HTML parser drops one line feed
+  there, so a selection starting with a blank line keeps it.
+- **Output sized up front.** Each format is written twice: first counted
+  (nothing stored, the cap checked), then into a string of exactly that
+  length, at most `MAX_RICH_COPY_LEN`. A 14 MB copy allocates its output
+  once instead of doubling into it, and an over-cap copy is refused before
+  any output is allocated.
+- **Fixture TR-3** is `abc  def  `, consistent with TR-9 and D-TRIMALL
+  (#47 round 2 m6).
+- **Pairing at a window edge.** A rule that matches across blanks (the
+  quoted-string rule) can pair its delimiters differently inside the scan
+  window than on the whole line. The edge-run drop does not catch that,
+  because the run at the edge is not the match's own.
+- **Cocoa's RTF reader** turns U+FFFD into `?`, drops U+202A-U+202E, and
+  shifts some colours slightly (229 becomes `#eaeaea`; a white `\cb` is
+  dropped). These are platform limits: the RTF is as written, and the HTML
+  form keeps the exact colours and characters.
+- **Mutants left alive, by design.** The rule compiler's `dfa_size_limit`
+  bounds the lazy DFA's cache. Past the limit the regex crate falls back to
+  a slower engine with the same matches, so no test can kill the mutant
+  that drops it. It bounds memory, not results.

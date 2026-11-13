@@ -83,3 +83,23 @@ fn an_over_long_uri_is_refused_from_its_piece_lengths_without_a_copy() {
         "OSC 8 allocated {for_link} bytes, an ignored OSC {for_ignored}"
     );
 }
+
+#[test]
+fn overwriting_a_links_last_cell_allocates_nothing() {
+    // The last cell of an entity drops it, and an entity with an `id`
+    // leaves the pool's index (#277: `get` and `remove`, never `entry`,
+    // which can reserve).
+    for id in ["", "id=k"] {
+        let mut term = Terminal::new(2, 10);
+        // Warm up: the line's side table and the index exist already.
+        term.advance(format!("\x1b]8;{id};https://a.bc/w\x1b\\w\x1b]8;;\x1b\\").as_bytes());
+        term.advance(format!("\x1b]8;{id};https://a.bc/x\x1b\\x\x1b]8;;\x1b\\").as_bytes());
+        assert_eq!(term.grid().live_hyperlinks(), 2, "{id:?}");
+        // Only the print is counted: the cursor move before it can allocate
+        // in the parser.
+        term.advance(b"\x1b[1;2H");
+        let cost = allocated_by(|| term.advance(b"y"));
+        assert_eq!(term.grid().live_hyperlinks(), 1, "{id:?}: the x link died");
+        assert_eq!(cost, 0, "{id:?}: the drop allocated {cost} bytes");
+    }
+}
