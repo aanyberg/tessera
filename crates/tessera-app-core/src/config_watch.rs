@@ -3260,6 +3260,75 @@ mod tests {
         }
     }
 
+    /// #365: `App::app_appearance` follows an edit of `config.toml` that
+    /// the watch applies, and is already the new value when the host
+    /// hears `on_config_applied` (its cue to read it again, lead decision
+    /// D5-1): the observer reads the value in effect at each call. A
+    /// profile's value and the display options never change it.
+    #[test]
+    fn app_appearance_follows_a_live_reload() {
+        use tessera_config::AppAppearance;
+
+        struct Seen(Live, Arc<Mutex<Vec<AppAppearance>>>);
+        impl SessionObserver for Seen {
+            fn on_session_event(&self, _: SessionId, _: SessionEvent) {}
+            fn on_config_applied(&self, _generation: u64) {
+                let now = lock(&self.0.applied).config.appearance.app_appearance;
+                lock(&self.1).push(now);
+            }
+        }
+        let base = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(base.path().join("Tessera"));
+        std::fs::create_dir_all(paths.root()).unwrap();
+        std::fs::write(
+            paths.config_file(),
+            "[appearance]
+font_size = 14.0
+",
+        )
+        .unwrap();
+        let app = App::with_config_dir(paths.clone(), WatchOptions::default());
+        assert_eq!(app.app_appearance(), AppAppearance::Dark, "missing key");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        app.set_observer(Some(Box::new(Seen(app.live(), Arc::clone(&seen)))));
+
+        // Each step's own font size marks when its file is in effect.
+        for (size, text, want) in [
+            (15u8, "app_appearance = \"light\"\n", AppAppearance::Light),
+            (16, "app_appearance = \"system\"\n", AppAppearance::System),
+            (
+                17,
+                "app_appearance = \"system\"\n[[profiles]]\nname = \"p\"\n\
+                 [profiles.appearance]\napp_appearance = \"light\"\n",
+                AppAppearance::System,
+            ),
+            (18, "app_appearance = \"nope\"\n", AppAppearance::Dark),
+        ] {
+            let text = format!("[appearance]\nfont_size = {size}.0\n{text}");
+            std::fs::write(paths.config_file(), &text).unwrap();
+            assert!(
+                eventually(Duration::from_secs(10), || {
+                    #[allow(clippy::float_cmp)]
+                    let applied = app.config().appearance.font_size == f32::from(size);
+                    applied && lock(&seen).last() == Some(&want)
+                }),
+                "{text}: {:?}",
+                lock(&seen)
+            );
+            assert_eq!(app.app_appearance(), want, "{text}");
+            assert_eq!(
+                app.config()
+                    .resolve_profile(Some("p"))
+                    .appearance
+                    .app_appearance,
+                want,
+                "{text}"
+            );
+        }
+        app.set_display_options(REDUCE);
+        assert_eq!(app.app_appearance(), AppAppearance::Dark);
+    }
+
     /// #390 (ADR 0045): `App::blur_radius` is `[appearance] blur_radius`
     /// in effect; a reload that changes it alone tells the observer once
     /// (`on_appearance_changed`, the host's cue to blur its windows

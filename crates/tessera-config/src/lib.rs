@@ -371,6 +371,61 @@ pub struct Appearance {
     /// in a profile's `appearance` it is ignored with a warning, since the
     /// window, not the session, draws it.
     pub dim_inactive_panes: f32,
+    /// Whether Tessera's own windows, menus and settings are drawn dark,
+    /// light or as the system's appearance (System Settings > Appearance)
+    /// says: `"dark"`, `"light"` or `"system"`, exactly as written here.
+    /// Only the window's chrome follows it: the terminal's colours stay
+    /// the theme's. Applies to open windows when the file changes. Any
+    /// other value is reported with a warning and `"dark"` is used. Set it
+    /// here only: in a profile's `appearance` it is ignored with a
+    /// warning, since it applies to the whole app.
+    #[serde(deserialize_with = "load::lenient_app_appearance")]
+    #[cfg_attr(feature = "schema", schemars(schema_with = "AppAppearance::schema"))]
+    pub app_appearance: AppAppearance,
+}
+
+/// The app's own appearance (`[appearance] app_appearance`, #365): the
+/// light or dark look of the windows, menus and settings, not the
+/// terminal's colours.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AppAppearance {
+    /// Always dark.
+    #[default]
+    Dark,
+    /// Always light.
+    Light,
+    /// Whatever the system's appearance is, following it when it changes.
+    System,
+}
+
+impl AppAppearance {
+    /// Every value, in the order the documentation lists them.
+    pub const ALL: [Self; 3] = [Self::Dark, Self::Light, Self::System];
+
+    /// The value as written in `config.toml`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+            Self::System => "system",
+        }
+    }
+
+    /// The value `name` is written as: exactly [`AppAppearance::as_str`],
+    /// no other spelling or case.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|value| value.as_str() == name)
+    }
+
+    /// A plain string `enum` schema, as for [`CursorShape`].
+    #[cfg(feature = "schema")]
+    fn schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let values: Vec<&str> = Self::ALL.iter().map(|value| value.as_str()).collect();
+        schemars::json_schema!({ "type": "string", "enum": values })
+    }
 }
 
 /// The cursor's shape (`[appearance] cursor_shape`).
@@ -440,6 +495,7 @@ impl Default for Appearance {
             cursor_shape: CursorShape::Block,
             cursor_blink: false,
             dim_inactive_panes: 0.0,
+            app_appearance: AppAppearance::Dark,
         }
     }
 }
@@ -572,9 +628,9 @@ pub struct Profile {
     /// the one in `[appearance]`, each key left out follows `[appearance]`
     /// (also when it changes). In 0.1.0 a key left out here was reset to
     /// its built-in default instead (a profile that set only `font_size`
-    /// also reset `theme`, `opacity` and the cursor). `dim_inactive_panes` and
-    /// `blur_radius` cannot be set here (the window draws them): they are
-    /// ignored with a warning.
+    /// also reset `theme`, `opacity` and the cursor). `dim_inactive_panes`,
+    /// `blur_radius` and `app_appearance` cannot be set here (the window or
+    /// the app draws them): they are ignored with a warning.
     pub appearance: Option<ProfileAppearance>,
 }
 

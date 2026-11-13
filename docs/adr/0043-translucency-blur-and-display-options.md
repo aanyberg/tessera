@@ -143,3 +143,31 @@ Dark while the app runs changes nothing in it.
 **The choice comes later.** There is no setting: a dark, light and system
 choice is #365, which replaces the one call that sets the appearance
 (`AppDelegate.applyAppAppearance()`).
+
+## Amendment: app appearance setting (#365, 2026-11-13)
+
+**Decision.** `[appearance] app_appearance` chooses the app's own appearance:
+`"dark"` (the default, so the #364 behaviour stays what a configuration without
+the key gets), `"light"` or `"system"` (follow System Settings > Appearance,
+also when it changes while the app runs). It is read exactly as written; any
+other value, another case or another type gives `"dark"` with one warning that
+names the key and the escaped value (docs/security.md S8), as for the other
+string settings.
+
+**App-wide only.** The app has one appearance, so the key is not a profile
+key: in a profile's `appearance` it is ignored with the same window-level
+warning as `dim_inactive_panes` and `blur_radius`, and every resolved profile
+carries `[appearance]`'s value.
+
+**Only the chrome.** The setting decides the windows, title and tab bars,
+find bar, Settings, sheets, alerts and panels, and the backdrop material's
+tint, as the #364 amendment lists them. The terminal's colours stay the
+theme's: a light app appearance around a dark theme draws the theme unchanged.
+
+**How the host reads it.** The core reports it with
+`tessera_app_app_appearance` (`TESSERA_APP_APPEARANCE_DARK` = 0, `_LIGHT` = 1,
+`_SYSTEM` = 2). No new callback: the host reads it at start and again on every
+`on_config_applied`, which the watch calls for each configuration applied
+whether or not anything changed. Settings writes it through
+`tessera_config_set("appearance.app_appearance", "\"light\"")` like any other
+key. The host side (`AppDelegate.applyAppAppearance()`) is #365's app half.

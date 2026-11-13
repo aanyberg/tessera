@@ -46,6 +46,10 @@ cursor_blink = false
 # How much to darken the unfocused panes of a split tab, from 0.0 (off) to
 # 0.8.
 dim_inactive_panes = 0.0
+# Tessera's own windows, menus and settings: "dark", "light" or "system"
+# (follow System Settings > Appearance). The terminal's colours stay the
+# theme's.
+app_appearance = "dark"
 
 [terminal]
 # Maximum number of lines kept in scrollback per pane.

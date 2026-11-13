@@ -4,6 +4,8 @@
 //! (`on_config_applied`), so the configuration in effect and
 //! `tessera_config_json` show the new value. A refused edit and an edit
 //! that changes nothing write nothing, so nothing is applied.
+//! `appearance.app_appearance` (#365) is set as a string, and the next
+//! configuration applied reports it through `tessera_app_app_appearance`.
 //!
 //! One test, in a binary of its own: it sets `TESSERA_CONFIG_DIR`, which no
 //! other test may see.
@@ -17,8 +19,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tessera_ffi::{
-    App, Callbacks, Error, tessera_app_free, tessera_app_new, tessera_app_set_callbacks,
-    tessera_config_json, tessera_config_remove, tessera_config_set, tessera_test_with_core,
+    App, AppAppearance, Callbacks, Error, tessera_app_app_appearance, tessera_app_free,
+    tessera_app_new, tessera_app_set_callbacks, tessera_config_json, tessera_config_remove,
+    tessera_config_set, tessera_test_with_core,
 };
 
 /// A `config.toml` write is applied within the watch's debounce plus
@@ -122,6 +125,92 @@ fn opacity(app: *mut App) -> f32 {
     unsafe { tessera_test_with_core(app, |core| core.config().appearance.opacity) }.unwrap()
 }
 
+fn app_appearance(app: *const App) -> u32 {
+    let mut out = u32::MAX;
+    // SAFETY: a live handle and writable storage for one `uint32_t`.
+    assert_eq!(
+        unsafe { tessera_app_app_appearance(app, &raw mut out) },
+        Error::Ok
+    );
+    out
+}
+
+/// #365: `appearance.app_appearance` is written as a string, the watch
+/// applies the write once, and `tessera_app_app_appearance` reports the
+/// new value once `on_config_applied` has been called; a value that is
+/// not one of the three is refused and writes nothing.
+fn app_appearance_round_trips(root: &Path) {
+    let dir = root.join("app-appearance");
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("config.toml");
+    std::fs::write(&config, "[appearance]\nfont_size = 13.0\n").unwrap();
+    let applied = AtomicU64::new(0);
+    let app = new_app(&dir);
+    install(app, &applied);
+    assert_eq!(
+        app_appearance(app),
+        AppAppearance::Dark as u32,
+        "missing key"
+    );
+    assert_eq!(
+        (
+            AppAppearance::Dark as u32,
+            AppAppearance::Light as u32,
+            AppAppearance::System as u32
+        ),
+        (0, 1, 2),
+        "the values the header names"
+    );
+
+    let mut n = 0;
+    for (name, want) in [
+        ("light", AppAppearance::Light),
+        ("system", AppAppearance::System),
+        ("dark", AppAppearance::Dark),
+    ] {
+        let (code, msg) = set(app, "appearance.app_appearance", &format!("\"{name}\""));
+        assert_eq!((code, msg.as_str()), (Error::Ok, ""), "{name}");
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            format!("[appearance]\nfont_size = 13.0\napp_appearance = \"{name}\"\n"),
+            "{name}"
+        );
+        n += 1;
+        assert_eq!(settled(&applied, n), n, "{name}: applied once");
+        assert_eq!(app_appearance(app), want as u32, "{name}");
+        assert_eq!(
+            config_json(app)["config"]["appearance"]["app_appearance"],
+            name
+        );
+    }
+
+    let before = std::fs::read_to_string(&config).unwrap();
+    for bad in ["\"Light\"", "\"auto\"", "1", "true"] {
+        let (code, msg) = set(app, "appearance.app_appearance", bad);
+        assert_eq!(code, Error::Refused, "{bad}: {msg}");
+        assert!(msg.contains("appearance.app_appearance"), "{bad}: {msg}");
+    }
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
+    assert_eq!(settled(&applied, n), n, "nothing more applied");
+
+    let mut out = 7;
+    // SAFETY: NULL handle with writable `out`; a live handle with NULL
+    // `out`.
+    unsafe {
+        assert_eq!(
+            tessera_app_app_appearance(ptr::null(), &raw mut out),
+            Error::NullPointer
+        );
+        assert_eq!(out, AppAppearance::Dark as u32, "reset on failure");
+        assert_eq!(
+            tessera_app_app_appearance(app, ptr::null_mut()),
+            Error::NullPointer
+        );
+    }
+    // SAFETY: live handle, freed once; no other call races.
+    unsafe { tessera_app_free(app) };
+}
+
 #[test]
 fn the_watch_applies_a_write_once() {
     let dir = tempfile::tempdir().unwrap();
@@ -180,4 +269,6 @@ fn the_watch_applies_a_write_once() {
 
     // SAFETY: live handle, freed once; no other call races.
     unsafe { tessera_app_free(app) };
+
+    app_appearance_round_trips(dir.path());
 }

@@ -79,7 +79,8 @@ pub use view::{DisplayOptions, SessionAppearance};
 pub use config_watch::{CONFIG_DIR_POLL_INTERVAL, CONFIG_WATCH_STOP_CAP};
 pub use tessera_config::edit;
 pub use tessera_config::{
-    Config, ConfigPaths, ConfigStore, MAX_PROFILE_NAME_LEN, ShellIntegration, WatchOptions,
+    AppAppearance, Config, ConfigPaths, ConfigStore, MAX_PROFILE_NAME_LEN, ShellIntegration,
+    WatchOptions,
 };
 pub use tessera_pty::{
     ExitStatus, ForegroundProcess, MAX_FOREGROUND_NAME_BYTES, Program, PtyError, PtySize,
@@ -2255,6 +2256,19 @@ impl App {
             .appearance
             .blur_radius
             .min(tessera_config::Appearance::MAX_BLUR_RADIUS)
+    }
+
+    /// The app's own appearance: `[appearance] app_appearance` of the
+    /// configuration in effect (#365), whether the host draws its windows,
+    /// menus and settings dark, light or as the system's appearance says.
+    /// The terminal's colours stay the theme's. An app-wide key, so no
+    /// profile changes it, and the display options leave it alone. No
+    /// callback reports a change of it: the host reads it at start and
+    /// again on every [`SessionObserver::on_config_applied`], which is
+    /// called for each configuration applied whether or not anything in
+    /// it changed.
+    pub fn app_appearance(&self) -> AppAppearance {
+        lock(&self.applied).config.appearance.app_appearance
     }
 
     /// How session `id`'s background is drawn now (ADR 0043): whether it

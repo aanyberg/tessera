@@ -662,6 +662,26 @@ where
         .unwrap_or_default())
 }
 
+/// Deserializes `appearance.app_appearance` without failing: a value that
+/// is not exactly one of
+/// [`AppAppearance::as_str`](crate::AppAppearance::as_str) gives `"dark"`,
+/// and [`invalid_lenient_values`] reports it, as for
+/// [`lenient_cursor_shape`].
+pub(crate) fn lenient_app_appearance<'de, D>(
+    deserializer: D,
+) -> Result<crate::AppAppearance, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+
+    let value = toml::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_str()
+        .and_then(crate::AppAppearance::from_name)
+        .unwrap_or_default())
+}
+
 /// Deserializes `appearance.cursor_blink` without failing: anything but a
 /// boolean gives the default (`false`), and [`invalid_lenient_values`]
 /// reports it, as for [`lenient_cursor_shape`].
@@ -750,11 +770,45 @@ fn invalid_remote_indicator(text: &str, root: &toml::de::DeTable<'_>) -> Option<
     ))
 }
 
+/// The [`Warning::OutOfRange`] for `[appearance] app_appearance` when its
+/// value is not one of [`AppAppearance::ALL`](crate::AppAppearance::ALL),
+/// with where the key is (see [`invalid_lenient_values`]). A profile's
+/// `app_appearance` is not looked at here: it gets the window-level
+/// warning instead ([`WINDOW_APPEARANCE_KEYS`]).
+fn invalid_app_appearance(text: &str, root: &toml::de::DeTable<'_>) -> Option<(usize, Warning)> {
+    use toml::de::DeValue;
+
+    const APP: &str = "app_appearance";
+
+    let (at, value) = lookup(root, &[Step::Key("appearance"), Step::Key(APP)])?;
+    if let DeValue::String(name) = value.get_ref()
+        && crate::AppAppearance::from_name(name).is_some()
+    {
+        return None;
+    }
+    let names: Vec<String> = crate::AppAppearance::ALL
+        .iter()
+        .map(|value| format!("\"{}\"", value.as_str()))
+        .collect();
+    Some((
+        at,
+        Warning::OutOfRange {
+            path: format!("appearance.{APP}"),
+            detail: format!(
+                "{} replaced by \"{}\" (expected {})",
+                written(text, value),
+                crate::AppAppearance::default().as_str(),
+                names.join(", ")
+            ),
+        },
+    ))
+}
+
 /// One [`Warning::OutOfRange`], with where its key is, for every lenient
 /// key whose value the lenient deserializers replaced:
 /// `cursor_shape` and `cursor_blink` under `[appearance]` and under each
-/// profile's `appearance`, `[general] remote_indicator` and `[terminal]
-/// clipboard_write`. Found in the
+/// profile's `appearance`, `[appearance] app_appearance`, `[general]
+/// remote_indicator` and `[terminal] clipboard_write`. Found in the
 /// parsed document `root`, so a key written quoted or with escapes
 /// (`"cursor\u005fshape"`) is found too, and a value that merely mentions
 /// a key's name is not.
@@ -839,6 +893,7 @@ fn invalid_lenient_values(text: &str, root: &toml::de::DeTable<'_>) -> Vec<(usiz
             ));
         }
     }
+    warnings.extend(invalid_app_appearance(text, root));
     warnings.extend(invalid_remote_indicator(text, root));
     if let Some((at, value)) = lookup(root, &[Step::Key("terminal"), Step::Key(CLIPBOARD)])
         && !matches!(value.get_ref(), DeValue::Boolean(_))
@@ -948,8 +1003,9 @@ fn opacity_in_range(prefix: &str, opacity: f32, warnings: &mut Vec<Warning>) -> 
 
 /// The `[appearance]` keys the window draws, not the session, so a
 /// profile's `appearance` table does not have them: pane dimming and the
-/// window's blur radius.
-const WINDOW_APPEARANCE_KEYS: [&str; 2] = ["dim_inactive_panes", "blur_radius"];
+/// window's blur radius, and the app's own appearance, which the whole app
+/// draws.
+const WINDOW_APPEARANCE_KEYS: [&str; 3] = ["dim_inactive_panes", "blur_radius", "app_appearance"];
 
 /// The profile index and the key when `steps` is one of
 /// [`WINDOW_APPEARANCE_KEYS`] in a profile's `appearance`.
@@ -2234,6 +2290,145 @@ mod tests {
                 "profiles[0].appearance.dim_inactive_panes"
             ]
         );
+    }
+
+    /// #365: the three values read and write back, and a missing key is
+    /// `"dark"`.
+    #[test]
+    fn app_appearance_parses_its_three_values_and_defaults_to_dark() {
+        use crate::AppAppearance;
+
+        assert_eq!(
+            Config::default().appearance.app_appearance,
+            AppAppearance::Dark
+        );
+        let loaded = Config::from_toml_lenient("[appearance]\nfont_size = 14.0\n").unwrap();
+        assert_eq!(loaded.config.appearance.app_appearance, AppAppearance::Dark);
+        assert_eq!(loaded.warnings, []);
+        for (name, value) in [
+            ("dark", AppAppearance::Dark),
+            ("light", AppAppearance::Light),
+            ("system", AppAppearance::System),
+        ] {
+            let text = format!("[appearance]\napp_appearance = \"{name}\"\n");
+            let loaded = Config::from_toml_lenient(&text).unwrap();
+            assert_eq!(loaded.config.appearance.app_appearance, value, "{name}");
+            assert_eq!(loaded.warnings, [], "{name}");
+            let written = loaded.config.to_toml().unwrap();
+            assert!(written.contains(&text[13..]), "{written}");
+            assert_eq!(Config::from_toml(&written).unwrap(), loaded.config);
+        }
+    }
+
+    /// #365: an unknown value, another case or another type falls back to
+    /// `"dark"` with one warning that names the key and the value as
+    /// written, escaped (S8), and every other key applies.
+    #[test]
+    fn an_invalid_app_appearance_warns_once_and_is_dark() {
+        use crate::AppAppearance;
+
+        for bad in [
+            "\"Light\"",
+            "\"auto\"",
+            "\"\"",
+            "true",
+            "1",
+            "[\"light\"]",
+            "{ a = 1 }",
+        ] {
+            let text = format!("[appearance]\nfont_size = 14.0\napp_appearance = {bad}\n");
+            let loaded = Config::from_toml_lenient(&text).unwrap();
+            let appearance = &loaded.config.appearance;
+            assert_eq!(appearance.app_appearance, AppAppearance::Dark, "{bad}");
+            assert!((appearance.font_size - 14.0).abs() < f32::EPSILON, "{bad}");
+            assert_eq!(
+                loaded.warnings,
+                [Warning::OutOfRange {
+                    path: "appearance.app_appearance".into(),
+                    detail: format!(
+                        "{bad} replaced by \"dark\" (expected \"dark\", \"light\", \"system\")"
+                    ),
+                }],
+                "{bad}"
+            );
+        }
+        // A bidi override and a newline in the value are escaped in the
+        // warning, so it cannot reorder or break the log line.
+        let text = "[appearance]\napp_appearance = \"li\u{202e}ght\\n\"\n";
+        let loaded = Config::from_toml_lenient(text).unwrap();
+        assert_eq!(loaded.config.appearance.app_appearance, AppAppearance::Dark);
+        let [Warning::OutOfRange { path, detail }] = &loaded.warnings[..] else {
+            panic!("{:?}", loaded.warnings);
+        };
+        assert_eq!(path, "appearance.app_appearance");
+        assert!(!detail.contains('\u{202e}'), "{detail:?}");
+        assert!(
+            detail.starts_with("\"li\\u{202e}ght\\n\" replaced by"),
+            "{detail:?}"
+        );
+        // A huge value is capped as every warning value is.
+        let text = format!(
+            "[appearance]\napp_appearance = \"{}\"\n",
+            "x".repeat(100_000)
+        );
+        let loaded = Config::from_toml_lenient(&text).unwrap();
+        let [Warning::OutOfRange { detail, .. }] = &loaded.warnings[..] else {
+            panic!("{:?}", loaded.warnings);
+        };
+        assert!(
+            detail.len() < MAX_WARNING_PATH_LEN + 200,
+            "{}",
+            detail.len()
+        );
+    }
+
+    /// #365: the app has one appearance, so a profile's is dropped with
+    /// the window-level warning and `[appearance]`'s applies to every
+    /// profile, as for `blur_radius`.
+    #[test]
+    fn app_appearance_in_a_profile_is_ignored_with_a_warning() {
+        use crate::AppAppearance;
+
+        let text = "[appearance]\napp_appearance = \"system\"\n[[profiles]]\nname = \"a\"\n\
+                    [profiles.appearance]\napp_appearance = \"light\"\n";
+        let loaded = Config::from_toml_lenient(text).unwrap();
+        assert_eq!(
+            loaded.warnings,
+            [Warning::OutOfRange {
+                path: "profiles[0].appearance.app_appearance".into(),
+                detail: "\"light\" ignored (set it in [appearance], not in a profile)".into(),
+            }]
+        );
+        assert_eq!(
+            loaded
+                .config
+                .resolve_profile(Some("a"))
+                .appearance
+                .app_appearance,
+            AppAppearance::System
+        );
+        // Any value warns once, with the window-level warning only.
+        for value in ["\"bogus\"", "3", "\"dark\""] {
+            let loaded = Config::from_toml_lenient(&format!(
+                "[[profiles]]\nname = \"a\"\n[profiles.appearance]\napp_appearance = {value}\n"
+            ))
+            .unwrap();
+            assert!(
+                matches!(&loaded.warnings[..], [Warning::OutOfRange { path, detail }]
+                    if path == "profiles[0].appearance.app_appearance"
+                        && detail.ends_with("ignored (set it in [appearance], not in a profile)")),
+                "{value}: {:?}",
+                loaded.warnings
+            );
+            assert_eq!(
+                loaded
+                    .config
+                    .resolve_profile(Some("a"))
+                    .appearance
+                    .app_appearance,
+                AppAppearance::Dark
+            );
+        }
     }
 
     #[test]
