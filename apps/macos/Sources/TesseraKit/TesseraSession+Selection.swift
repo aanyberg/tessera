@@ -96,13 +96,64 @@ extension TesseraSession {
     /// The selection with its formatting for Copy with Formatting, or `nil`
     /// without a selection. A selection of blanks only gives an empty
     /// ``FormattedSelection/plain`` and no formatting.
+    ///
+    /// The core formats the selection on every call, so the first call
+    /// already passes buffers sized from an estimate
+    /// (``formattedCapacities()``): one formatting pass in the common case.
     @MainActor
     public func selectionWithFormatting() throws -> FormattedSelection? {
         guard try hasSelection else { return nil }
-        // Ask for the sizes with no buffers, then read into buffers of those
-        // sizes; output arriving between the calls may grow the text, so a
-        // text that outgrew its buffer is asked for again (as `readText`).
-        var capacities = [0, 0, 0]
+        return try readFormatted { html, rtf, plain in
+            tessera_session_selection_rich_text(core.pointer, id, &html, &rtf, &plain)
+        }
+    }
+
+    /// ``selectionWithFormatting()``'s reading, through `call` (the core's
+    /// rich-text call, or a test's counting wrapper of it), starting from
+    /// the estimate.
+    @MainActor
+    func readFormatted(
+        _ call: (inout TesseraTextBuffer, inout TesseraTextBuffer, inout TesseraTextBuffer) -> TesseraError
+    ) throws -> FormattedSelection {
+        try Self.readFormatted(capacities: try formattedCapacities(), call)
+    }
+
+    /// The most bytes the core's HTML or RTF may have (its 16 MiB cap, past
+    /// which it copies the plain text alone): no estimate asks for more.
+    static let maxFormattedBytes = 16 << 20
+    /// What the HTML and RTF take beyond their text: the RTF colour table
+    /// and header, the HTML's outer element.
+    static let formattedOverhead = 16 << 10
+
+    /// The buffer sizes (HTML, RTF, plain) the first formatting call
+    /// passes: the plain text's size, which the core reports without
+    /// formatting anything, and for HTML and RTF eight times that plus
+    /// ``formattedOverhead``, at most ``maxFormattedBytes``. A selection
+    /// whose styles or escapes need more is asked for again.
+    @MainActor
+    func formattedCapacities() throws -> [Int] {
+        var plain = 0
+        let status = tessera_session_selection_text(core.pointer, id, nil, 0, &plain)
+        if status != TESSERA_ERROR_INVALID_ARGUMENT { try TesseraCoreError.check(status) }
+        return Self.formattedCapacities(plainLength: plain)
+    }
+
+    static func formattedCapacities(plainLength: Int) -> [Int] {
+        let room = (maxFormattedBytes - formattedOverhead) / 8
+        let rich = plainLength >= room ? maxFormattedBytes : plainLength * 8 + formattedOverhead
+        return [rich, rich, plainLength]
+    }
+
+    /// Runs `call` (the core's rich-text call, or a test's stub) into
+    /// buffers of `capacities` (HTML, RTF, plain). Output arriving between
+    /// two calls may grow the text, so a text that outgrew its buffer is
+    /// asked for again at the sizes the core reported, which for HTML and
+    /// RTF never pass ``maxFormattedBytes`` (it refuses past that).
+    static func readFormatted(
+        capacities initial: [Int],
+        _ call: (inout TesseraTextBuffer, inout TesseraTextBuffer, inout TesseraTextBuffer) -> TesseraError
+    ) throws -> FormattedSelection {
+        var capacities = initial
         for _ in 0..<8 {
             var html = [UInt8](repeating: 0, count: capacities[0])
             var rtf = [UInt8](repeating: 0, count: capacities[1])
@@ -114,14 +165,16 @@ extension TesseraSession {
                         var htmlOut = TesseraTextBuffer(buf: html.baseAddress, cap: capacities[0], len: 0)
                         var rtfOut = TesseraTextBuffer(buf: rtf.baseAddress, cap: capacities[1], len: 0)
                         var plainOut = TesseraTextBuffer(buf: plain.baseAddress, cap: capacities[2], len: 0)
-                        let status = tessera_session_selection_rich_text(
-                            core.pointer, id, &htmlOut, &rtfOut, &plainOut)
+                        let status = call(&htmlOut, &rtfOut, &plainOut)
                         lengths = [htmlOut.len, rtfOut.len, plainOut.len]
                         return status
                     }
                 }
             }
             if status == TESSERA_ERROR_INVALID_ARGUMENT, zip(lengths, capacities).contains(where: { $0 > $1 }) {
+                // The core reports no formatted size past its cap; one
+                // that does breaks the contract and is not allocated.
+                guard lengths[0] <= maxFormattedBytes, lengths[1] <= maxFormattedBytes else { break }
                 capacities = zip(lengths, capacities).map { Swift.max($0, $1) }
                 continue
             }

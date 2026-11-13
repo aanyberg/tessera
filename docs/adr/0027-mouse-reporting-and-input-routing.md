@@ -199,3 +199,48 @@ no reporting decision of its own.
   against 3.2 MB for an idle test) and queues only the cell changes; each report is queued
   like a key, so a child that stops reading fills the pending input to its
   bound (ADR 0011) and further reports fail with `WouldBlock`.
+
+## Amendment: link opening (#299, 2026-11-13)
+
+- **The reveal policy.** A `file:` link the policy allows is opened with its
+  default application unless opening it would launch, run or install
+  something; then it is shown in Finder (selected, nothing opened).
+  `LinkPolicy` judges the path by its extension (lower-cased) and by its
+  type (`UTType` conformance read from the file), so a renamed file and a
+  folder named like one are both caught: applications and other packages,
+  Finder aliases, executables and scripts, stored URLs (`.webloc`, `.url`,
+  `.inetloc`, `.fileloc`), installer packages and disk images, `.command`,
+  `.tool`, `.terminal`, `.term` (`com.apple.terminal.session`: Terminal runs
+  its command) and `.jar`.
+- **D4-2, what installs or starts a system flow** is revealed too:
+  configuration profiles (`.mobileconfig`, `com.apple.mobileconfig`;
+  `.configprofile`, `com.apple.configprofile`), provisioning profiles
+  (`.provisionprofile`, `com.apple.provisionprofile`), X.509
+  certificates (`.cer`, `.crt`, `.der`, `.pem`, `public.x509-certificate`,
+  whatever extension the system maps to it; Keychain Access's `.cert`,
+  `.p7c` and `.p7b`, which have only dynamic types, by extension), shortcuts
+  (`.shortcut`, `com.apple.shortcut`; `.wflow`,
+  `com.apple.shortcuts.workflow-file`), Java Web Start files (`.jnlp`,
+  `com.sun.java-web-start`) and Automator workflows (`.workflow`,
+  `com.apple.automator-workflow`; a flat `.workflow` file has only a dynamic
+  type on the systems tested, so the extension rule is the one that catches it).
+  Archives keep opening: Archive Utility extracts, it runs nothing. The
+  supertypes of a profile (XML, property list, text) are not swept up.
+- **D4-3, a click that opens nothing beeps.** A Command-click on an
+  underlined `file:` link whose path no longer exists (deleted between the
+  hover and the click) beeps through the view's `linkRefusedBeep`, so
+  tests count it. A link the policy refuses whatever the disk holds
+  (another host, a scheme outside the list) is never underlined and its
+  click stays silent, like a Command-click on plain text.
+- **A stale link does not open.** A tab switch (`tabGroup.selectedWindow`
+  changing) or the window losing key status ends the gesture taken at the
+  press, so a release later in the same cell opens nothing (#299.2,
+  #289.2).
+- **The Command-hover skips a shown overlay scroll bar.** An overlay bar
+  floats over the last columns and takes the click there, so the hover
+  does not underline the text under it; a hidden bar (no history) covers
+  nothing. The hover reads the URL alone (no file system call), so a path
+  is judged for existence and type only at the click.
+- **The wheel without metrics.** Before the view knows its cell size no
+  cell can be named, so a wheel event is dropped, not reported at 1;1
+  (#289.4), as a press already was.

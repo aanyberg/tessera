@@ -143,15 +143,94 @@ final class SelectionTests: XCTestCase {
         XCTAssertEqual(try session.selectionWithFormatting(), .init(plain: "", html: nil, rtf: nil))
     }
 
-    func testFormattedTextLongerThanTheFirstBuffersIsReadWhole() async throws {
-        // 30 runs of two cells, each its own colour: more than the first
-        // (empty) buffers, read on the second try.
+    /// The production path's calls, counted: the estimate from the
+    /// plain text's size, then the core's rich-text call through
+    /// ``TesseraSession/readFormatted(capacities:_:)``.
+    private func countedCopy(_ session: TesseraSession) throws -> (TesseraSession.FormattedSelection, calls: Int) {
+        var calls = 0
+        let copy = try session.readFormatted { html, rtf, plain in
+            calls += 1
+            return tessera_session_selection_rich_text(session.core.pointer, session.id, &html, &rtf, &plain)
+        }
+        return (copy, calls)
+    }
+
+    /// A normal Copy with Formatting formats the selection once: the first
+    /// call's buffers, sized from the plain text, hold it (#351 M3).
+    func testANormalCopyWithFormattingMakesOneFormattingCall() async throws {
+        // 30 runs of two cells, each its own colour.
         let colours = (0..<30).map { #"\033[3\#($0 % 8)mab"# }.joined()
         let session = try await session(printing: "\(colours)\\r\\nlast")
         try session.selectAll()
-        let copy = try XCTUnwrap(try session.selectionWithFormatting())
+        let (copy, calls) = try countedCopy(session)
+        XCTAssertEqual(calls, 1, "one formatting pass")
+        XCTAssertEqual(copy, try session.selectionWithFormatting(), "the same copy as the public call")
         XCTAssertEqual(copy.plain, String(repeating: "ab", count: 30) + "\nlast")
         XCTAssertGreaterThan(try XCTUnwrap(copy.html).count, 30 * 20)
+    }
+
+    /// Every cell styled unlike its neighbour: the HTML outgrows the
+    /// estimate, so the core's sizes are asked for again, once.
+    func testFormattedTextLongerThanTheEstimateIsReadWhole() async throws {
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tessera-styled-\(UUID().uuidString).txt")
+        try Self.tooLargeToFormat(lines: 20, cols: 250).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let session = try await session(running: "cat '\(file.path)'", rows: 30, cols: 250, endsWith: "last")
+        try session.selectAll()
+        let estimate = try session.formattedCapacities()
+        let (copy, calls) = try countedCopy(session)
+        XCTAssertGreaterThan(try XCTUnwrap(copy.html).count, estimate[0], "the HTML outgrew the estimate")
+        XCTAssertEqual(calls, 2, "read on the second call")
+        XCTAssertTrue(try copy.plain == session.selectionText())
+        XCTAssertEqual(copy, try session.selectionWithFormatting())
+    }
+
+    /// Output that grows the selection between the call that sized the
+    /// buffers and the one that fills them: the core answers
+    /// `INVALID_ARGUMENT` with the larger sizes, and the wrapper calls
+    /// again with those (#351 M2). A stub stands in for the core.
+    func testAFormattedTextThatGrewBetweenTheCallsIsAskedForAgain() throws {
+        let (html, rtf, plain) = (Array("<b>grown</b>".utf8), Array(#"{\rtf1 grown}"#.utf8), Array("grown".utf8))
+        var calls: [[Int]] = []
+        let copy = try TesseraSession.readFormatted(capacities: [4, 4, 2]) { htmlOut, rtfOut, plainOut in
+            calls.append([htmlOut.cap, rtfOut.cap, plainOut.cap])
+            (htmlOut.len, rtfOut.len, plainOut.len) = (html.count, rtf.count, plain.count)
+            guard htmlOut.cap >= html.count, rtfOut.cap >= rtf.count, plainOut.cap >= plain.count else {
+                return TESSERA_ERROR_INVALID_ARGUMENT
+            }
+            for (bytes, out) in [(html, htmlOut), (rtf, rtfOut), (plain, plainOut)] {
+                bytes.withUnsafeBufferPointer { out.buf!.update(from: $0.baseAddress!, count: bytes.count) }
+            }
+            return TESSERA_ERROR_OK
+        }
+        XCTAssertEqual(calls, [[4, 4, 2], [html.count, rtf.count, plain.count]], "once more, at the sizes it needs")
+        XCTAssertEqual(copy, .init(plain: "grown", html: Data(html), rtf: Data(rtf)))
+    }
+
+    /// The estimate: eight times the plain text plus the overhead, never
+    /// past the core's 16 MiB cap however large the selection; and a
+    /// core that asks for more than the cap is not allocated for.
+    func testTheEstimateNeverPassesTheCap() throws {
+        let cap = TesseraSession.maxFormattedBytes
+        XCTAssertEqual(cap, 16 << 20)
+        let overhead = TesseraSession.formattedOverhead
+        XCTAssertEqual(TesseraSession.formattedCapacities(plainLength: 0), [overhead, overhead, 0])
+        XCTAssertEqual(TesseraSession.formattedCapacities(plainLength: 100), [800 + overhead, 800 + overhead, 100])
+        for plain in [(cap - overhead) / 8 - 1, (cap - overhead) / 8, 2 << 20, cap, Int.max / 2, Int.max] {
+            let sizes = TesseraSession.formattedCapacities(plainLength: plain)
+            XCTAssertLessThanOrEqual(sizes[0], cap, "\(plain)")
+            XCTAssertLessThanOrEqual(sizes[1], cap, "\(plain)")
+            XCTAssertEqual(sizes[2], plain, "the plain text's own size")
+        }
+        var asked: [Int] = []
+        XCTAssertThrowsError(
+            try TesseraSession.readFormatted(capacities: [1, 1, 1]) { html, rtf, plain in
+                asked.append(html.cap)
+                (html.len, rtf.len, plain.len) = (cap + 1, 1, 1)
+                return TESSERA_ERROR_INVALID_ARGUMENT
+            })
+        XCTAssertEqual(asked, [1], "past the cap: no second call, no buffer of that size")
     }
 
     func testASelectionTooLargeToFormatIsThePlainTextAlone() async throws {

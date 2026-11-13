@@ -277,15 +277,18 @@ enum MainMenu {
     /// Runs `command` as choosing its menu item would, if the item is
     /// enabled (validated first, as `AppKit` does for a key equivalent);
     /// beeps if it is not. A command with no menu item (one a later version
-    /// runs) does nothing.
-    static func run(command: String) {
-        guard let item = MainMenu.item(forCommand: command, in: NSApp.mainMenu), let menu = item.menu else {
+    /// runs) does nothing. `bar` and `beep` are the installed menus and the
+    /// system beep; tests pass their own.
+    static func run(
+        command: String, in bar: NSMenu? = NSApp.mainMenu, beep: () -> Void = { NSSound.beep() }
+    ) {
+        guard let item = MainMenu.item(forCommand: command, in: bar), let menu = item.menu else {
             log.debug("no menu item runs \(command, privacy: .public)")
             return
         }
         menu.update()
         guard item.isEnabled else {
-            NSSound.beep()
+            beep()
             return
         }
         menu.performActionForItem(at: menu.index(of: item))
