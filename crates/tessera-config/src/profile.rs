@@ -198,8 +198,16 @@ impl Config {
 /// (byte for byte, after the cut) is reported: the earlier entry is the
 /// one used. A NUL character in a name, which the frontends could not
 /// pass as a C string, is replaced with U+FFFD and reported, before the
-/// cut; the entry keeps its place (#333).
+/// cut; the entry keeps its place (#333). `[general] default_profile` gets
+/// the same replacement, so it still names that profile (#342).
 pub(crate) fn cap_profiles(config: &mut Config, warnings: &mut Vec<Warning>) {
+    if config.general.default_profile.contains('\0') {
+        warnings.push(Warning::OutOfRange {
+            path: "general.default_profile".into(),
+            detail: "holds a NUL character, replaced with U+FFFD".into(),
+        });
+        config.general.default_profile = config.general.default_profile.replace('\0', "\u{fffd}");
+    }
     if config.profiles.len() > MAX_PROFILES {
         warnings.push(Warning::TooManyProfiles {
             dropped: config.profiles.len() - MAX_PROFILES,
@@ -592,6 +600,26 @@ mod tests {
         let name = &loaded.config.profiles[0].name;
         assert!(name.len() <= MAX_PROFILE_NAME_LEN, "{}", name.len());
         assert!(!name.contains('\0'));
+    }
+
+    /// #342: `[general] default_profile` gets the U+FFFD replacement profile
+    /// names get, with a warning, so it still names the profile.
+    #[test]
+    fn a_nul_in_default_profile_still_names_the_profile() {
+        let text = "[general]\ndefault_profile = \"a\\u0000b\"\n\
+                    [[profiles]]\nname = \"a\\u0000b\"\ncommand = \"mine\"\n";
+        let loaded = Config::from_toml_lenient(text).unwrap();
+        assert_eq!(loaded.config.general.default_profile, "a\u{fffd}b");
+        let default_warnings: Vec<&Warning> = loaded
+            .warnings
+            .iter()
+            .filter(|w| matches!(w, Warning::OutOfRange { path, .. } if path == "general.default_profile"))
+            .collect();
+        assert_eq!(default_warnings.len(), 1, "{:?}", loaded.warnings);
+        let resolved = loaded.config.resolve_profile(None);
+        assert_eq!(resolved.name.as_deref(), Some("a\u{fffd}b"));
+        assert_eq!(resolved.command.as_deref(), Some("mine"));
+        assert!(resolved.warning.is_none(), "{:?}", resolved.warning);
     }
 
     /// Profile keys left out stay out when the configuration is written

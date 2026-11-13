@@ -352,6 +352,15 @@ impl App {
         self.bindings.keymap_and_generation()
     }
 
+    /// [`App::config`] with the [`App::config_generation`] of the
+    /// configuration it is, read together under the lock the
+    /// configuration is recorded under: never a configuration and a
+    /// generation of two different applies, which reading the two one
+    /// after the other can give while configurations apply (#348).
+    pub fn config_and_generation(&self) -> (Arc<Config>, u64) {
+        self.live().config_and_generation()
+    }
+
     /// How many configurations were applied since the `App` was created
     /// ([`App::apply_config`], and the configuration watch): 0 for the one
     /// it was created with. [`SessionObserver::on_config_applied`] passes
@@ -487,7 +496,9 @@ impl App {
     ///
     /// When what the profile changed cannot start (a `working_directory`
     /// that exists but cannot be entered, a `command` that cannot be
-    /// executed: a [`PtyError::Spawn`]), the session is started once more
+    /// executed: a [`PtyError::Spawn`]; a `command` longer than the system
+    /// lets a program's arguments be: a [`PtyError::ArgumentsTooLong`],
+    /// #342), the session is started once more
     /// as the built-in profile would start it (the caller's `options`: the
     /// login shell in the home directory) and drawn with `[appearance]`. Its
     /// first line then says so: `[Tessera] profile "<name>" could not start
@@ -523,12 +534,14 @@ impl App {
             }
             Err(error) => error,
         };
-        let (Some(name), true, Error::Pty(PtyError::Spawn { reason, .. })) =
-            (resolved.name.as_deref(), changed, &error)
-        else {
+        let (Some(name), true) = (resolved.name.as_deref(), changed) else {
             return Err(error);
         };
-        let errno = profile::spawn_errno(reason);
+        let errno = match &error {
+            Error::Pty(PtyError::Spawn { reason, .. }) => profile::spawn_errno(reason),
+            Error::Pty(PtyError::ArgumentsTooLong { .. }) => Some(profile::errno::E2BIG),
+            _ => return Err(error),
+        };
         let index = self.config().profiles.iter().position(|p| p.name == name);
         tracing::warn!(
             target: "tessera_app_core",
@@ -2359,6 +2372,19 @@ impl App {
         {
             tracing::warn!(session = %id, %error, ?size, "resizing a session to its view failed");
         }
+    }
+
+    /// Runs `hook` once, on the calling thread, at the next point between
+    /// two reads that must come from one apply: in [`App::keymap`],
+    /// [`App::config`] and [`App::config_generation`] after the read, in [`App::keymap_and_generation`]
+    /// and [`App::config_and_generation`] between their two reads.
+    ///
+    /// Exists only so tests can land an apply between two reads and prove
+    /// that a combined read keeps it out (#348).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn pause_between_reads_for_test(hook: impl FnOnce() + 'static) {
+        input::read_pause::set(Box::new(hook));
     }
 
     /// Panics while holding the session table lock, poisoning it.

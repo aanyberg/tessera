@@ -14,7 +14,7 @@ use serde::de::{MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::load::{MAX_WARNING_PATH_LEN, Warning, escaped};
+use crate::load::{MAX_WARNING_PATH_LEN, Warning, escaped, is_invisible};
 
 /// Most `[keys]` entries read; later entries are dropped with one
 /// [`Warning::TooManyKeyBindings`] (docs/security.md S5).
@@ -512,67 +512,13 @@ fn parse_key(segment: &str) -> Result<(ChordKey, ChordModifiers), ChordError> {
     }
 }
 
-/// The Unicode `Default_Ignorable_Code_Point` ranges (`DerivedCoreProperties`,
-/// Unicode 16), inclusive and sorted: the characters a renderer shows as
-/// nothing, the bidirectional formatting characters among them (U+061C,
-/// U+200E, U+200F, U+202A..=U+202E, U+2066..=U+2069).
-const DEFAULT_IGNORABLE: [(u32, u32); 17] = [
-    (0x00AD, 0x00AD),
-    (0x034F, 0x034F),
-    (0x061C, 0x061C),
-    (0x115F, 0x1160),
-    (0x17B4, 0x17B5),
-    (0x180B, 0x180F),
-    (0x200B, 0x200F),
-    (0x202A, 0x202E),
-    (0x2060, 0x206F),
-    (0x3164, 0x3164),
-    (0xFE00, 0xFE0F),
-    (0xFEFF, 0xFEFF),
-    (0xFFA0, 0xFFA0),
-    (0xFFF0, 0xFFF8),
-    (0x1_BCA0, 0x1_BCA3),
-    (0x1_D173, 0x1_D17A),
-    (0xE_0000, 0xE_0FFF),
-];
-
-/// Whether `c` shows nothing: a default-ignorable character
-/// ([`DEFAULT_IGNORABLE`]), the bidi, zero-width and variation-selector
-/// characters included. Control and white space characters are refused
-/// before a chord gets this far.
-fn is_invisible(c: char) -> bool {
-    let c = u32::from(c);
-    let i = DEFAULT_IGNORABLE.partition_point(|&(_, last)| last < c);
-    DEFAULT_IGNORABLE
-        .get(i)
-        .is_some_and(|&(first, _)| first <= c)
-}
-
-/// `text` for a `[keys]` warning: as [`escaped`] writes it (control, line
-/// separator and bidi characters as escapes, cut to
-/// [`MAX_WARNING_PATH_LEN`] bytes with a marker), with every other
-/// invisible character ([`is_invisible`]: zero-width, variation selectors,
-/// the other default-ignorables) written as its `\u{..}` escape too, so a
-/// warning never carries a character that shows as nothing. Only the
-/// first [`MAX_WARNING_PATH_LEN`] bytes or so are looked at, so a huge key
-/// costs no more than a short one.
+/// `text` for a `[keys]` warning, as [`escaped`] writes it with
+/// [`MAX_WARNING_PATH_LEN`] as the cap: control characters, line separators
+/// and every character that shows as nothing ([`is_invisible`]) as
+/// escapes, cut with a marker. Only the first [`MAX_WARNING_PATH_LEN`]
+/// bytes or so are looked at, so a huge key costs no more than a short one.
 pub(crate) fn escaped_text(text: &str) -> String {
-    // One byte past the cap, rounded up to a character boundary: a longer
-    // `text` still ends up longer than the cap, so `escaped` cuts it and
-    // adds its marker.
-    let mut end = text.len().min(MAX_WARNING_PATH_LEN + 1);
-    while !text.is_char_boundary(end) {
-        end += 1;
-    }
-    let mut head = String::with_capacity(end);
-    for c in text[..end].chars() {
-        if is_invisible(c) {
-            head.extend(c.escape_unicode());
-        } else {
-            head.push(c);
-        }
-    }
-    escaped(&head, MAX_WARNING_PATH_LEN)
+    escaped(text, MAX_WARNING_PATH_LEN)
 }
 
 /// `n` when `text` is `prefix` followed by `n` in decimal without a
@@ -860,8 +806,11 @@ impl Keys {
         self.warnings.sort_by_key(|&(at, _)| at);
     }
 
-    /// The accepted entries, in document order. No two have the same
-    /// chord, and there are at most [`MAX_KEY_BINDINGS`].
+    /// The accepted entries, in document order, at most
+    /// [`MAX_KEY_BINDINGS`]. Two may have the same chord (`cmd+d` and
+    /// `d+cmd`): which one wins depends on whether its command exists,
+    /// which the command registry decides when it compiles the table (the
+    /// first entry it does not leave out wins; #317).
     #[must_use]
     pub fn bindings(&self) -> &[KeyBinding] {
         &self.bindings
@@ -919,13 +868,6 @@ impl Keys {
                 return;
             }
         };
-        if let Some(first) = self.bindings.iter().find(|b| b.chord == chord) {
-            let first = escaped_text(&first.key);
-            self.warnings.push(warn(format!(
-                "same chord as `{first}` (the first entry wins); ignored"
-            )));
-            return;
-        }
         if chord.shadows_typing() && action != KeyAction::Unbound {
             self.warnings.push(warn(
                 "shadows plain typing of this key; honoured".to_owned(),
@@ -1002,6 +944,7 @@ impl schemars::JsonSchema for Keys {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::load::DEFAULT_IGNORABLE;
 
     #[test]
     fn modifier_bits_match_the_terminal() {
@@ -1040,13 +983,10 @@ mod tests {
             .iter()
             .map(|b| b.key.as_str())
             .collect();
-        assert_eq!(keys, ["cmd+z", "cmd+a", "shift+cmd+z"]);
-        assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
-        assert!(
-            loaded.warnings[0].to_string().contains("cmd+shift+z"),
-            "{}",
-            loaded.warnings[0]
-        );
+        // Both spellings of one chord stay, in document order: the key map
+        // keeps the first whose command it knows (#317 K1).
+        assert_eq!(keys, ["cmd+z", "cmd+a", "shift+cmd+z", "cmd+shift+z"]);
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
     }
 
     #[test]
@@ -1120,6 +1060,39 @@ mod tests {
             assert!(out.len() <= MAX_WARNING_PATH_LEN + 8, "{}", out.len());
             assert!(!out.contains('\u{200B}'));
         }
+    }
+
+    /// #348 m3: the cap is on the escaped text: text under the cap whose
+    /// escapes take it over is cut to the cap, marker included, never
+    /// left longer.
+    #[test]
+    fn the_cap_applies_to_the_escaped_text() {
+        let text = format!("{}{}", "a".repeat(180), "\u{200B}".repeat(20));
+        assert!(text.len() < MAX_WARNING_PATH_LEN);
+        let out = escaped_text(&text);
+        assert!(out.len() <= MAX_WARNING_PATH_LEN, "{}", out.len());
+        assert!(out.ends_with(crate::load::TRUNCATION_MARKER), "{out}");
+        assert!(
+            out.starts_with(&format!("{}\\u{{200b}}", "a".repeat(180))),
+            "{out}"
+        );
+    }
+
+    /// #348 m2: a parameter with an invisible character is refused with
+    /// the character escaped.
+    #[test]
+    fn an_invisible_parameter_is_refused_escaped() {
+        let error = KeyAction::parse("select_tab:1\u{200B}").unwrap_err();
+        assert_eq!(error, KeyActionError::InvalidParameter("1\\u{200b}".into()));
+        let keys = Keys::from_entries([("cmd+1", "select_tab:1\u{200B}")]);
+        assert!(keys.is_empty());
+        let mut keys = keys;
+        let warnings = keys.take_warnings();
+        let text = warnings[0].to_string();
+        assert!(
+            text.contains("1\\u{200b}") && !text.contains('\u{200B}'),
+            "{text}"
+        );
     }
 
     /// M3: a `[keys]` table filling the config file cap keeps only the

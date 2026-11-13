@@ -187,14 +187,19 @@ fn table_cases() {
                     "[keys]\n'cmd+shift+d' = 'split_down'\n'shift+cmd+d' = 'split_down'\n",
                 )
                 .unwrap();
-                assert_eq!(loaded.config.keys.bindings().len(), 1);
-                assert_eq!(loaded.config.keys.bindings()[0].key, "cmd+shift+d");
-                assert_eq!(loaded.warnings.len(), 1);
-                let text = loaded.warnings[0].to_string();
-                assert!(
-                    text.contains("shift+cmd+d") && text.contains("same chord as `cmd+shift+d`"),
-                    "{text}"
-                );
+                // Both are kept here: whether the first one's command
+                // exists is the registry's to decide, and the key map
+                // (tessera-app-core) leaves the later one out with the
+                // "same chord" warning (#317 K1).
+                let keys: Vec<&str> = loaded
+                    .config
+                    .keys
+                    .bindings()
+                    .iter()
+                    .map(|binding| binding.key.as_str())
+                    .collect();
+                assert_eq!(keys, ["cmd+shift+d", "shift+cmd+d"]);
+                assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
             }
             // Default chords: the registry's (tessera-app-core).
             5..=10 => {}

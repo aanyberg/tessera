@@ -121,3 +121,17 @@ restored windows start with the default profile.
 - #42 (transparency and blur) builds on `theme_for` and
   `ProfileAppearance`, with a session appearance getter in the FFI
   (ADR 0043).
+
+## Amendment: profile fallback and default_profile (#342, 2026-11-13)
+
+- A profile `command` too long to run (`PtyError::ArgumentsTooLong`, the
+  system's limit on a program's arguments) falls back like a spawn error:
+  the built-in start runs once more and the notice reads `could not start
+  (Argument list too long)`, with `E2BIG` as the logged errno.
+- A `command` with a space runs through `/bin/sh -c`, which always starts:
+  a program it names that does not exist is the shell's error, shown in the
+  session (`sh: …: command not found`, exit 127), not a spawn failure, so it
+  gets no fallback. `docs/config.md` says so.
+- `[general] default_profile` gets the same NUL replacement (U+FFFD) as
+  profile names, with an out-of-range warning, so a name with a NUL still
+  selects the profile it named.

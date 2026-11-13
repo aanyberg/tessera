@@ -36,7 +36,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
-use crate::load::{MAX_CONFIG_FILE_LEN, follow_links, read_capped};
+use crate::load::{
+    Logging, MAX_CONFIG_FILE_LEN, MAX_WARNING_PATH_LEN, cut_prefix, escaped, follow_links,
+    needs_unicode_escape, read_capped,
+};
 use crate::theme::{MAX_THEME_DIR_ENTRIES, MAX_THEME_FILES, ThemeSource, clip_theme_name, slug};
 use crate::{Config, Error, ParseError, Theme, Warning};
 
@@ -75,14 +78,17 @@ pub enum Step {
 }
 
 /// The place of a value in `config.toml`, written as keys joined by `.`,
-/// each bare (`A-Za-z0-9_-`) or in double quotes (with `\"` and `\\` the
-/// only escapes), each optionally followed by `[N]` indices:
+/// each bare (`A-Za-z0-9_-`) or in double quotes (with `\"`, `\\` and
+/// `\u{XXXX}`, one to six hexadecimal digits, the only escapes), each
+/// optionally followed by `[N]` indices:
 /// `appearance.opacity`, `profiles[1].appearance.theme`, `keys."cmd+d"`.
 ///
 /// At most [`MAX_KEY_PATH_LEN`] bytes, [`MAX_KEY_PATH_STEPS`] steps and
 /// indices up to [`MAX_KEY_PATH_INDEX`]; a quoted key may not hold control
 /// characters. Displays in the same syntax, so a path can be logged (S8: a
-/// key path, never a value).
+/// key path, never a value), with each character that shows as nothing
+/// (bidi controls, zero-width and other default-ignorable characters) as
+/// its `\u{XXXX}` escape, which parses back to it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct KeyPath(Vec<Step>);
 
@@ -154,6 +160,29 @@ impl FromStr for KeyPath {
                         }
                         '\\' => match chars.next() {
                             Some((_, escaped @ ('"' | '\\'))) => key.push(escaped),
+                            Some((_, 'u')) => {
+                                let malformed = KeyPathError::Malformed { at: at + 1 + i };
+                                let rest = &text[at + 1 + i + 2..];
+                                let digits = rest
+                                    .strip_prefix('{')
+                                    .and_then(|r| r.split_once('}'))
+                                    .map(|(digits, _)| digits)
+                                    .filter(|d| {
+                                        (1..=6).contains(&d.len())
+                                            && d.bytes().all(|b| b.is_ascii_hexdigit())
+                                    })
+                                    .ok_or(malformed.clone())?;
+                                let c = u32::from_str_radix(digits, 16)
+                                    .ok()
+                                    .and_then(char::from_u32)
+                                    .filter(|c| !c.is_control())
+                                    .ok_or(malformed)?;
+                                key.push(c);
+                                // `{`, the digits and `}`, all ASCII.
+                                for _ in 0..digits.len() + 2 {
+                                    chars.next();
+                                }
+                            }
                             _ => return Err(KeyPathError::Malformed { at: at + 1 + i }),
                         },
                         c if c.is_control() => {
@@ -226,8 +255,13 @@ impl fmt::Display for KeyPath {
                             match c {
                                 '"' | '\\' => write!(f, "\\{c}")?,
                                 // Never parsed, but a path built in code is
-                                // still displayed on one line (S8).
-                                c if c.is_control() => write!(f, "\\u{{{:x}}}", u32::from(c))?,
+                                // still displayed on one line (S8); and a
+                                // caller's character that shows as nothing
+                                // (bidi, zero-width) as its escape, as the
+                                // loader writes the file's (#348).
+                                c if c.is_control() || needs_unicode_escape(c) => {
+                                    write!(f, "\\u{{{:x}}}", u32::from(c))?;
+                                }
                                 c => write!(f, "{c}")?,
                             }
                         }
@@ -387,12 +421,15 @@ impl Endings {
         )
     }
 
-    /// `text`, as the editor renders it, with these endings.
+    /// `text`, as the editor renders it, with these endings. Without a
+    /// final newline every line break at the end goes, not only the one
+    /// the editor adds: removing the last item of such a file can leave
+    /// the blank line that was above it last (#324 item 22).
     fn apply(self, text: &str) -> String {
         let text = if self.final_newline {
             text
         } else {
-            text.strip_suffix('\n').unwrap_or(text)
+            text.trim_end_matches('\n')
         };
         if self.crlf {
             text.replace('\n', "\r\n")
@@ -544,6 +581,18 @@ impl ConfigEditor {
             path: path.clone(),
             reason,
         };
+        // The loader drops the profiles past the cap, so the checks cannot
+        // see an edit of one: `profiles[256].name` on a file with 300
+        // would rename its 257th entry unseen (#342 M7).
+        const { assert!(crate::MAX_PROFILES == 256, "the reason below names the cap") };
+        if let [Step::Key(key), Step::Index(index), ..] = &path.0[..]
+            && key == "profiles"
+            && *index >= crate::MAX_PROFILES
+        {
+            return Err(unsupported(
+                "only the first 256 profiles are read; this one would be ignored",
+            ));
+        }
         let edit_value = edit_value(&value, 0).map_err(unsupported)?;
         let mut doc = self.doc.clone();
         // The comments inside a replaced value are moved, not removed.
@@ -558,6 +607,16 @@ impl ConfigEditor {
         let mut expected = toml::Value::Table(self.plain.clone());
         plain_edit(&mut expected, &path.0, Some(value));
         let before = self.warnings.clone().unwrap_or_default();
+        // A new key in an unknown table adds no warning (the loader names
+        // the table once), but it is one more unknown key (#324 item 2).
+        if plain_at(&self.plain, &path.0).is_none()
+            && let Some(unknown) = unknown_above(&before, &path.0)
+        {
+            return Err(EditError::Refused {
+                path: path.clone(),
+                warnings: vec![unknown.clone()],
+            });
+        }
         self.check(path, &doc.to_string(), &expected, &[], &before)
     }
 
@@ -611,7 +670,9 @@ impl ConfigEditor {
     ///
     /// # Errors
     ///
-    /// As for [`ConfigEditor::set`].
+    /// As for [`ConfigEditor::set`]; [`EditError::Unsupported`] when the
+    /// file has [`MAX_PROFILES`](crate::MAX_PROFILES) profiles already (a
+    /// set anywhere in a profile past the cap is refused the same way).
     pub fn add_profile(&mut self, name: &str) -> Result<usize, EditError> {
         let index = self.profile_count();
         self.set(
@@ -710,23 +771,19 @@ impl ConfigEditor {
                 None => unsupported("internal: the loader failed"),
             });
         };
-        // Warnings are few (the loader bounds them); a list will do.
-        let mut before: Vec<&Warning> = before.iter().collect();
-        let mut new = Vec::new();
-        for warning in after {
-            match before.iter().position(|w| *w == warning) {
-                Some(at) => {
-                    before.swap_remove(at);
-                }
-                None => new.push(warning.clone()),
-            }
-        }
+        let mut new = new_warnings(before, after);
         // A theme the edit names must exist (`ConfigStore::theme` would
-        // fall back to the default with a warning).
+        // fall back to the default with a warning). Each use of a missing
+        // theme the document already has may stay, but not a further one
+        // (#324 item 2).
         if let Some(dir) = self.path.parent() {
             let themes_dir = dir.join("themes");
+            let mut known = multiset(&self.themes);
             for name in &state.themes {
-                if self.themes.contains(name) {
+                if let Some(n) = known.get_mut(name.as_str())
+                    && *n > 0
+                {
+                    *n -= 1;
                     continue;
                 }
                 let resolved = Theme::resolve(&themes_dir, name);
@@ -754,7 +811,8 @@ impl ConfigEditor {
     ///
     /// The document goes to a new temporary file in the directory of the
     /// file (the symlink's target when `config.toml` is a symlink), with
-    /// the file's permission bits, which is flushed to disk and then
+    /// the file's permission bits and, when the owner may set it, its
+    /// group (not its extended attributes or ACLs), which is flushed to disk and then
     /// renamed over the file; the directory is flushed after. A crash
     /// leaves the old file or the new one, never a mix (a temporary file
     /// may stay behind). Just before the rename the file is read again: if
@@ -787,6 +845,7 @@ impl ConfigEditor {
         }
         check_writable(&self.target, &meta)?;
         let (tmp, mut file) = temporary_file(&self.target)?;
+        carry_group(&file, &meta);
         let written = file
             .set_permissions(meta.permissions())
             .and_then(|()| file.write_all(text.as_bytes()))
@@ -868,6 +927,33 @@ fn check_writable(target: &Path, meta: &std::fs::Metadata) -> Result<(), EditErr
     Ok(())
 }
 
+/// Gives `file` the group of the file it replaces (`meta`), best effort:
+/// the owner may not be in that group, and then the new file keeps the
+/// directory's (ADR 0040 amendment, #324 item 7). Extended attributes and
+/// ACLs are not carried.
+fn carry_group(file: &std::fs::File, meta: &std::fs::Metadata) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let gid = meta.gid();
+        let current = file.metadata().map(|m| m.gid());
+        if current.is_ok_and(|g| g == gid) {
+            return;
+        }
+        if let Err(error) = std::os::unix::fs::fchown(file, None, Some(gid)) {
+            tracing::debug!(
+                target: "tessera_config",
+                gid,
+                %error,
+                "configuration file group not kept"
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (file, meta);
+}
+
 /// Numbers the temporary files within this process.
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -944,10 +1030,7 @@ impl State {
         let comments = doc_comments(&doc);
         // The loader logs what it warns about; a check is not a load, and
         // a refused value must not reach the log (S8).
-        let loaded =
-            tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
-                Config::from_toml_lenient(text)
-            });
+        let loaded = Config::from_toml_lenient_logging(text, Logging::Quiet);
         let (warnings, error, themes, config) = match loaded {
             Ok(loaded) => {
                 let themes = theme_names(&loaded.config);
@@ -980,7 +1063,6 @@ fn theme_names(config: &Config) -> Vec<String> {
     names
 }
 
-/// How many times each string occurs.
 /// Whether `saved` (the document with its line endings) reads as `plain`.
 fn same_as_saved(plain: &toml::Table, saved: &str) -> bool {
     toml::from_str::<toml::Table>(saved).is_ok_and(|disk| {
@@ -997,26 +1079,11 @@ fn same_as_saved(plain: &toml::Table, saved: &str) -> bool {
 /// `profiles[1].bogus` when `profiles[0]` goes). Unchanged when `path`
 /// does not end at an array element.
 fn renumbered(warnings: &[Warning], path: &KeyPath) -> Vec<Warning> {
-    use std::fmt::Write as _;
-
     let Some((Step::Index(removed), array)) = path.0.split_last() else {
         return warnings.to_vec();
     };
     // The array's path as the loader writes it (`profiles`).
-    let mut prefix = String::new();
-    for step in array {
-        match step {
-            Step::Key(key) => {
-                if !prefix.is_empty() {
-                    prefix.push('.');
-                }
-                prefix.push_str(key);
-            }
-            Step::Index(index) => {
-                let _ = write!(prefix, "[{index}]");
-            }
-        }
-    }
+    let prefix = loader_path(array);
     // `Some(None)` for a warning of the removed element.
     let shift = |path: &str| -> Option<Option<String>> {
         let rest = path.strip_prefix(prefix.as_str())?.strip_prefix('[')?;
@@ -1064,6 +1131,133 @@ fn renumbered(warnings: &[Warning], path: &KeyPath) -> Vec<Warning> {
         .collect()
 }
 
+/// `steps` as the loader writes a path (`profiles[0].appearance`), before
+/// escaping and cutting.
+fn loader_path(steps: &[Step]) -> String {
+    use std::fmt::Write as _;
+
+    let mut path = String::new();
+    for step in steps {
+        match step {
+            Step::Key(key) => {
+                if !path.is_empty() {
+                    path.push('.');
+                }
+                path.push_str(key);
+            }
+            Step::Index(index) => {
+                let _ = write!(path, "[{index}]");
+            }
+        }
+    }
+    path
+}
+
+/// The value at `steps` in `table`, `None` when there is none.
+fn plain_at<'a>(table: &'a toml::Table, steps: &[Step]) -> Option<&'a toml::Value> {
+    let (Step::Key(first), rest) = steps.split_first()? else {
+        return None;
+    };
+    let mut node = table.get(first)?;
+    for step in rest {
+        node = match (step, node) {
+            (Step::Key(key), toml::Value::Table(t)) => t.get(key)?,
+            (Step::Index(i), toml::Value::Array(a)) => a.get(*i)?,
+            _ => return None,
+        };
+    }
+    Some(node)
+}
+
+/// The [`Warning::UnknownKey`] of `warnings` that names a table (or array)
+/// `steps` lies in, if any.
+fn unknown_above<'a>(warnings: &'a [Warning], steps: &[Step]) -> Option<&'a Warning> {
+    (1..steps.len()).find_map(|len| {
+        let above = escaped(&loader_path(&steps[..len]), MAX_WARNING_PATH_LEN);
+        warnings
+            .iter()
+            .find(|w| matches!(w, Warning::UnknownKey { path } if same_path(path, &above)))
+    })
+}
+
+/// The warnings of `after` that `before` does not hold, compared as
+/// multisets (a second copy of a warning is new).
+///
+/// - A path the loader cut (at [`MAX_WARNING_PATH_LEN`]) matches a path
+///   that starts with its uncut part, so a renumbered path, which the
+///   loader cuts one character later or not at all, is not new (#324
+///   items 15 and 17).
+/// - The unknown keys past [`crate::MAX_UNKNOWN_KEY_WARNINGS`], which `before`
+///   only counts ([`Warning::UnknownKeysOmitted`]), are present too: an
+///   edit that makes one of them listed adds nothing (item 18), and
+///   `after`'s count is new only when it exceeds what is left of
+///   `before`'s (item 14: a removal that lowers it is not new, an edit
+///   that adds an unknown key past the cap is).
+fn new_warnings(before: &[Warning], after: &[Warning]) -> Vec<Warning> {
+    let mut hidden = omitted(before);
+    // Warnings are few (the loader bounds them); a list will do.
+    let mut before: Vec<&Warning> = before
+        .iter()
+        .filter(|w| !matches!(w, Warning::UnknownKeysOmitted { .. }))
+        .collect();
+    let mut new = Vec::new();
+    for warning in after {
+        if let Warning::UnknownKeysOmitted { .. } = warning {
+            continue;
+        }
+        match before.iter().position(|w| same_warning(w, warning)) {
+            Some(at) => {
+                before.swap_remove(at);
+            }
+            None if hidden > 0 && matches!(warning, Warning::UnknownKey { .. }) => hidden -= 1,
+            None => new.push(warning.clone()),
+        }
+    }
+    if let count @ 1.. = omitted(after)
+        && count > hidden
+    {
+        new.push(Warning::UnknownKeysOmitted { count });
+    }
+    new
+}
+
+/// The count of [`Warning::UnknownKeysOmitted`] in `warnings` (0 without
+/// one).
+fn omitted(warnings: &[Warning]) -> usize {
+    warnings
+        .iter()
+        .map(|w| match w {
+            Warning::UnknownKeysOmitted { count } => *count,
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Whether `a` and `b` are the same warning, a cut path matching any path
+/// that starts with its uncut part (see [`new_warnings`]).
+fn same_warning(a: &Warning, b: &Warning) -> bool {
+    match (a, b) {
+        (Warning::UnknownKey { path: a }, Warning::UnknownKey { path: b }) => same_path(a, b),
+        (
+            Warning::OutOfRange { path: a, detail: x },
+            Warning::OutOfRange { path: b, detail: y },
+        ) => x == y && same_path(a, b),
+        _ => a == b,
+    }
+}
+
+/// Whether two warning paths name the same key: equal, or one was cut and
+/// the other starts with its uncut part.
+fn same_path(a: &str, b: &str) -> bool {
+    match (cut_prefix(a), cut_prefix(b)) {
+        (None, None) => a == b,
+        (Some(cut), None) => b.starts_with(cut),
+        (None, Some(cut)) => a.starts_with(cut),
+        (Some(x), Some(y)) => x.starts_with(y) || y.starts_with(x),
+    }
+}
+
+/// How many times each string occurs.
 fn multiset(items: &[String]) -> HashMap<&str, usize> {
     let mut counts = HashMap::new();
     for item in items {
@@ -1452,15 +1646,7 @@ struct Carried {
 /// they were. The indentation of the item's own line goes with the item.
 /// `None` when no comment is kept (or there is no such item).
 fn cut_leading_decor(doc: &mut DocumentMut, steps: &[Step]) -> Option<Carried> {
-    let text = doc.to_string();
-    let mut n = 0u64;
-    let mark = loop {
-        let mark = format!("#tessera-edit-{n:x}\n");
-        if !text.contains(&mark) {
-            break mark;
-        }
-        n += 1;
-    };
+    let mark = unused_mark(&doc.to_string());
     let mut kept = None;
     with_leading_decor(doc.as_table_mut(), steps, &mut |decor, trailing| {
         let prefix = decor
@@ -1481,6 +1667,38 @@ fn cut_leading_decor(doc: &mut DocumentMut, steps: &[Step]) -> Option<Carried> {
         }
     });
     kept.map(|kept| Carried { kept, mark })
+}
+
+/// What every edit mark starts with; a hexadecimal number and a line
+/// break follow.
+const MARK_START: &str = "#tessera-edit-";
+
+/// The first mark (`#tessera-edit-<n>` and a line break, `n` in lowercase
+/// hexadecimal from 0) found nowhere in `text`. One pass over `text`: the
+/// marks it holds are collected, then the first number missing is taken
+/// (a text with 20 000 of them took seconds when each candidate was
+/// searched for in turn, #324 item 3).
+fn unused_mark(text: &str) -> String {
+    let mut taken = std::collections::HashSet::new();
+    for (at, _) in text.match_indices(MARK_START) {
+        let rest = &text[at + MARK_START.len()..];
+        let digits = rest
+            .bytes()
+            .take_while(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            .count();
+        if rest[digits..].starts_with('\n')
+            && let Ok(n) = u64::from_str_radix(&rest[..digits], 16)
+            // `#tessera-edit-01` is not the mark of 1.
+            && format!("{n:x}").len() == digits
+        {
+            taken.insert(n);
+        }
+    }
+    // Of the numbers 0..=taken.len(), at least one is free.
+    let n = (0..=taken.len() as u64)
+        .find(|n| !taken.contains(n))
+        .unwrap_or_default();
+    format!("{MARK_START}{n:x}\n")
 }
 
 /// Calls `f` with the decoration that holds the lines above the item at
@@ -1997,6 +2215,26 @@ mod tests {
         if let Some(hook) = BEFORE_RENAME.with(Cell::get) {
             hook();
         }
+    }
+
+    /// #324 item 3: the mark is the first number whose mark the text does
+    /// not hold; text that only looks like a mark (a leading zero, no line
+    /// break after it, upper case) does not take its number.
+    #[test]
+    fn the_mark_is_the_first_unused_one() {
+        assert_eq!(unused_mark(""), "#tessera-edit-0\n");
+        let mut taken = String::new();
+        for n in 0..300u32 {
+            std::fmt::Write::write_fmt(&mut taken, format_args!("#tessera-edit-{n:x}\n"))
+                .expect("writing to a String");
+        }
+        assert_eq!(unused_mark(&taken), "#tessera-edit-12c\n");
+        let gap = "x = \"#tessera-edit-0\n\"\n#tessera-edit-2\n#tessera-edit-1";
+        assert_eq!(unused_mark(gap), "#tessera-edit-1\n");
+        let lookalikes = "#tessera-edit-00\n#tessera-edit-A\n#tessera-edit-\n#tessera-edit-0x\n";
+        assert_eq!(unused_mark(lookalikes), "#tessera-edit-0\n");
+        let huge = "#tessera-edit-fffffffffffffffffffff\n#tessera-edit-0\n";
+        assert_eq!(unused_mark(huge), "#tessera-edit-1\n");
     }
 
     fn editor_for(text: &str) -> (tempfile::TempDir, PathBuf, ConfigEditor) {

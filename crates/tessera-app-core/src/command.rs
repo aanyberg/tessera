@@ -330,14 +330,32 @@ impl Default for Keymap {
 
 impl Keymap {
     /// Lays `keys` over the registry defaults. An entry naming an unknown
-    /// command (or a wrong parameter) is left out with a warning; an
+    /// command (or a wrong parameter) is left out with a warning and
+    /// claims no chord; of the other entries with the same chord the first
+    /// wins and each later one is left out with a warning. An
     /// entry is honoured with a warning when it takes a chord macOS uses
     /// (⌃⌘F, ⌃Tab and the like), or takes the default chord of a system command, or
     /// replaces a menu command's default chord with text or `none`. An
     /// entry whose chord is a default of another command takes it from
     /// that command; `unbound` takes it from every command.
+    ///
+    /// Each warning is logged (`tracing::warn!`); [`Keymap::compile_quietly`]
+    /// logs none.
     #[must_use]
     pub fn compile(keys: &Keys) -> Self {
+        let map = Self::compile_quietly(keys);
+        for warning in &map.warnings {
+            tracing::warn!(target: "tessera_config", "{warning}");
+        }
+        map
+    }
+
+    /// [`Keymap::compile`] without logging its warnings: for a check that
+    /// compares them ([`Keymap::warnings`]) rather than applies the map,
+    /// such as a settings edit's, without a scoped tracing subscriber,
+    /// which churns tracing's callsite cache on every call (#342 M6).
+    #[must_use]
+    pub fn compile_quietly(keys: &Keys) -> Self {
         let defaults: Vec<(Chord, CommandId)> = CommandId::all()
             .flat_map(|id| {
                 registry_defaults()[id.index()]
@@ -355,7 +373,9 @@ impl Keymap {
             warnings: Vec::new(),
             defaults: Vec::new(),
         };
-        let mut taken: Vec<Chord> = Vec::new();
+        // The chord of each entry kept so far, with its key as written:
+        // the first kept entry of a chord wins it.
+        let mut taken: Vec<(Chord, &str)> = Vec::new();
         for binding in keys.bindings() {
             let warn = |reason: String| Warning::KeyBinding {
                 key: escaped(&binding.key, MAX_WARNING_PATH_LEN),
@@ -379,7 +399,16 @@ impl Keymap {
                 _ => None,
             };
             let chord = binding.chord;
-            taken.push(chord);
+            // After the command check: an entry left out claims no chord,
+            // so a later valid entry of the same chord is honoured (#317).
+            if let Some(&(_, first)) = taken.iter().find(|&&(taken, _)| taken == chord) {
+                let first = escaped(first, MAX_WARNING_PATH_LEN);
+                map.warnings.push(warn(format!(
+                    "same chord as `{first}` (the first entry wins); ignored"
+                )));
+                continue;
+            }
+            taken.push((chord, &binding.key));
             let Some(slot) = slot else {
                 continue;
             };
@@ -404,7 +433,7 @@ impl Keymap {
             map.insert(chord, slot);
         }
         for (chord, id) in defaults {
-            if !taken.contains(&chord) {
+            if !taken.iter().any(|&(taken, _)| taken == chord) {
                 map.chords[id.index()].push(chord);
                 map.insert(chord, Slot::Command(id));
             }
@@ -414,9 +443,6 @@ impl Keymap {
         }
         map.defaults.sort_unstable();
         map.table.sort_by_key(|&(probe, _)| probe);
-        for warning in &map.warnings {
-            tracing::warn!(target: "tessera_config", "{warning}");
-        }
         map
     }
 
@@ -899,6 +925,66 @@ mod tests {
         let plain = KeyEvent::new(Key::Char('t'), Modifiers::NONE);
         assert!(!admits(map.mask, plain.modifiers));
         assert_eq!(map.resolve(&plain), None);
+    }
+
+    /// #317 K2: ⌘⇧E is unbound while ⌘E is bound (Use Selection for
+    /// Find), so the filter must refuse it: the shifted `E` is looked up
+    /// as typed under ⌘ (not lowercased to the bound `e`), and the shifted
+    /// lookup is not a pass by itself.
+    #[test]
+    fn the_filter_refuses_command_shift_and_an_unbound_letter() {
+        let map = Keymap::default();
+        let mut event = KeyEvent::new(Key::Char('e'), Modifiers::SUPER | Modifiers::SHIFT);
+        event.shifted_key = Some('E');
+        assert!(admits(map.mask, event.modifiers), "some ⌘⇧ chord is bound");
+        assert!(
+            map.resolve(&KeyEvent::new(Key::Char('e'), Modifiers::SUPER))
+                .is_some()
+        );
+        assert_eq!(map.resolve(&event), None);
+        assert!(!may_match(&event, map.mask, |word| map.ascii[word]));
+    }
+
+    /// #317 K1: an entry left out for its command claims no chord, so a
+    /// later entry of the same chord binds it; of two valid entries the
+    /// first wins and the later one is left out with a warning naming
+    /// the first.
+    #[test]
+    fn only_kept_entries_claim_their_chord() {
+        let split_down = CommandId::find("split_down", None).unwrap();
+        let split_right = CommandId::find("split_right", None).unwrap();
+        let event = KeyEvent::new(Key::Char('d'), Modifiers::SUPER | Modifiers::SHIFT);
+        let loaded = tessera_config::Config::from_toml_lenient(
+            "[keys]\n'cmd+shift+d' = 'bogus'\n'shift+cmd+d' = 'split_right'\n",
+        )
+        .unwrap();
+        let map = Keymap::compile(&loaded.config.keys);
+        assert_eq!(map.resolve(&event), Some(Binding::Command(split_right)));
+        let warnings: Vec<String> = map.warnings().iter().map(ToString::to_string).collect();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("\"cmd+shift+d\"") && warnings[0].contains("bogus"),
+            "{warnings:?}"
+        );
+        assert!(
+            map.chords(split_down).is_empty(),
+            "the entry took ⌘⇧D from split_down"
+        );
+
+        let loaded = tessera_config::Config::from_toml_lenient(
+            "[keys]\n'cmd+shift+d' = 'split_right'\n'shift+cmd+d' = 'split_down'\n",
+        )
+        .unwrap();
+        let map = Keymap::compile(&loaded.config.keys);
+        assert_eq!(map.resolve(&event), Some(Binding::Command(split_right)));
+        let warnings: Vec<String> = map.warnings().iter().map(ToString::to_string).collect();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("\"shift+cmd+d\"")
+                && warnings[0]
+                    .contains("same chord as `cmd+shift+d` (the first entry wins); ignored"),
+            "{warnings:?}"
+        );
     }
 
     /// `is_default` against the rule it caches: no `[keys]` entry names

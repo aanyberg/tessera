@@ -177,7 +177,7 @@ with #40c.
   key path `tessera_config_set` echoes in front of a refusal is the
   caller's own text and is not the key map's to escape.
 * **The source table is dropped after load** (S5). `Keys` kept every raw
-  `[keys]` entry it read (up to the 1 MiB file cap) to put the bindings in
+  `[keys]` entry it read (up to the 16 MiB file cap) to put the bindings in
   document order; it now builds from the entries once and keeps only the
   at most 512 bindings and their warnings.
 * **The map and its generation are read together.** `App::keymap_and_generation`
@@ -197,3 +197,42 @@ with #40c.
   unlocked, so a `send_text` write (or anything else a binding does) that
   reaches the key map again cannot deadlock, and an apply never waits on
   a write to the PTY.
+
+## Amendment: key map and config edit follow-ups (#348, 2026-11-13)
+
+The rest of #348 and the Rust half of what #317 still listed.
+
+* **Only a kept entry claims its chord** (#317 K1). An entry the key map
+  drops (an unknown command, a malformed value, an invisible key) no
+  longer blocks a later entry for the same chord: `Keys` keeps every
+  well-formed entry in document order, both spellings of a chord
+  included, and `Keymap::compile` takes the first entry whose command it
+  knows. The "same chord as" warning is the key map's now, not the
+  loader's, so it reaches the Keys pane through the key map's warnings
+  and the FFI still refuses an edit that adds one.
+* **One escape helper** (lead decision D2-3). The loader's `escaped`,
+  which every warning path, TOML parse error and logged file name goes
+  through, now escapes every default-ignorable character as `\u{…}` as
+  the key map's did, and `escaped_text` is that helper at
+  `MAX_WARNING_PATH_LEN`. The "stricter than the loader" note above no
+  longer holds: a TOML parse error that quotes a U+200B shows `\u{200b}`.
+  The cap counts the escaped text (#348 m3).
+* **The caller's key path is escaped too.** A `KeyPath` displays a
+  character that shows as nothing as `\u{XXXX}`, and parses that escape
+  back, so a refusal `tessera_config_set` returns, and every log line that
+  names a key path, carry no invisible character from the caller. This
+  replaces "is not the key map's to escape" above.
+* **Configuration and key map are published together** (D2-4). An apply
+  sets the configuration and compiles its key map under one lock (the
+  configuration's, then the map's), so `App::config()` and
+  `App::keymap()` never come from different applies, and
+  `tessera_config_json` reads the configuration and its generation
+  together (`App::config_and_generation`). A 20 000-trial stress of
+  racing applies, and test hooks that pause between the two reads (so a
+  revert to separate reads fails a test, #348 m1), check it.
+* **Known limitation: ⌥⌘W shows no shortcut** (lead decision D2-1). A
+  command bound to `cmd+alt+w` works, but its menu item shows no key
+  equivalent: AppKit clears it because Close All, the alternate of Close
+  Window, holds ⌥⌘W. "Menus show the map" has this one exception; no code
+  change.
+* The 1 MiB above was the file cap of an earlier version; it is 16 MiB.

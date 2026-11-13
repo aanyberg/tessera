@@ -154,3 +154,52 @@ ABI rules (S7) cover the exports.
   nothing; deleting them is the user's call.
 - `profiles/*.toml` (separate profile files) are not edited yet; the
   editor works on `config.toml`'s `[[profiles]]`.
+
+## Amendment: write-back follow-ups (#324, 2026-11-13)
+
+- **Warnings are counted, not just named.** The "adds a warning" check
+  compares warning multisets: an edit that adds a second copy of a warning
+  the file already has (another unknown key of the same name in a new
+  table, another profile naming the same missing theme) is `Refused`. A
+  new value under a key the file already warns about as unknown (setting
+  `bogus.b` while `bogus` is unknown) is refused with that warning.
+- **Hidden and cut warnings.** The loader lists at most 64 unknown keys and
+  reports the rest as one `UnknownKeysOmitted` count. Keys hidden behind
+  that count count as present: a removal that brings one into the list is
+  not new, and the count is new only when it grows beyond the hidden keys
+  left. A warning path cut at `MAX_WARNING_PATH_LEN` matches by its uncut
+  prefix, so renumbering profiles (removing one before a profile with a
+  long unknown key) is not refused.
+- **Linear mark search.** Finding a comment mark the file does not already
+  use is one pass over the text (it was quadratic: about 8 s for 20 000
+  mark-like lines; now under 100 ms in release).
+- **Final newline.** Removing the last `[[profiles]]` entry from a file
+  without a final newline keeps it without one.
+- **Profile cap.** The loader reads the first 256 profiles. Setting a key
+  on `profiles[i]` with `i >= 256`, including an add, is `Unsupported`
+  (it would rename or edit a profile the app ignores); removing one stays
+  possible.
+- **Group.** The saved file keeps the original's group when it differs from
+  the temporary file's (`fchown` on the open temporary file, best effort; a
+  failure is logged at debug). Extended attributes and ACLs are not carried
+  over by the rename.
+- **Stale temporary files.** A crash between creating
+  `.config.toml.<pid>.<n>.edit` and the rename leaves that file in the
+  configuration directory. It is not swept: deleting files by pattern there
+  would add a delete path (D2-5).
+- **Quiet loading.** The check reads the edited copy with a loader flag
+  that skips logging warnings, instead of a scoped tracing subscriber
+  (which churned tracing's callsite cache on every save).
+- **Theme warning once.** The `[appearance] theme` lookup warning is now
+  logged once per change, like other load warnings: the store logs only
+  theme warnings the previous apply did not have. This replaces the
+  sentence above saying it is logged on every apply.
+- **Known cosmetic placements** (the file stays correct; only its layout
+  differs from a hand edit): a new key in an indented table is written
+  without the table's indentation; a new inline profile gets `toml_edit`'s
+  spacing (`{ name = "B" , ... }`); a comment after an array's opening `[`
+  moves when the first element is removed; a new table goes after the last
+  table, before any trailing comments.
+- **Caller key path.** Refusals that echo the caller's key path escape it
+  (controls, line separators and default-ignorable characters as
+  `\u{…}`), like file-derived paths (S3, S8).

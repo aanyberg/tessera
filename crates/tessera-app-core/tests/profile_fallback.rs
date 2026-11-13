@@ -46,6 +46,23 @@ impl Locked {
     fn path(&self) -> &str {
         self.0.to_str().unwrap()
     }
+
+    /// Whether the lock holds for this user: not for root, who enters any
+    /// directory (#342 M8). `USER` is checked, then a file is created in
+    /// the directory as a probe, for a root whose `USER` says otherwise.
+    fn holds(&self) -> bool {
+        if std::env::var("USER").is_ok_and(|user| user == "root") {
+            eprintln!("skipped: run as root, who enters a mode-000 directory");
+            return false;
+        }
+        let probe = self.0.join("probe");
+        if std::fs::File::create(&probe).is_ok() {
+            let _ = std::fs::remove_file(&probe);
+            eprintln!("skipped: a mode-000 directory does not stop this user");
+            return false;
+        }
+        true
+    }
 }
 
 impl Drop for Locked {
@@ -199,6 +216,9 @@ fn a_directory_that_cannot_be_entered_starts_the_default_shell_at_home() {
     let root = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let locked = Locked::new(root.path());
+    if !locked.holds() {
+        return;
+    }
     let app = app(
         &root,
         config(
@@ -256,6 +276,35 @@ fn a_command_that_cannot_be_executed_starts_the_default_shell_at_home() {
     }
 }
 
+/// #342 (lead decision D2-7): a command longer than a program's arguments
+/// may be (`PtyError::ArgumentsTooLong`, refused before the fork) starts
+/// the default shell too; as `default_profile` it would otherwise fail
+/// every new tab.
+#[test]
+fn a_command_too_long_to_run_starts_the_default_shell_at_home() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let long = format!("/bin/echo {}", "x".repeat(1_100_000));
+    let app = app(&root, config(&[("long", Some(&long), None)], "long"));
+    let (id, logged) = warnings(|| {
+        app.spawn_session(options(home.path()))
+            .expect("the fallback starts")
+    });
+    let rows = wait_for_row(&app, id, &notice("long", "Argument list too long"));
+    assert_eq!(rows[0], notice("long", "Argument list too long"));
+    assert_a_shell_in(&app, id, home.path());
+    app.close_session(id).unwrap();
+    let fallback: Vec<_> = logged
+        .iter()
+        .filter(|line| line.contains("could not start"))
+        .collect();
+    assert_eq!(fallback.len(), 1, "{logged:?}");
+    assert!(fallback[0].contains("errno=Some(7)"), "{logged:?}");
+    for line in &logged {
+        assert!(!line.contains("xxxx"), "the command is never logged");
+    }
+}
+
 /// `[general] default_profile` naming such a profile: New Tab (no profile
 /// asked for) still opens a usable shell.
 #[test]
@@ -263,6 +312,9 @@ fn a_broken_default_profile_still_opens_a_usable_shell() {
     let root = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let locked = Locked::new(root.path());
+    if !locked.holds() {
+        return;
+    }
     let app = app(
         &root,
         config(&[("broken", None, Some(locked.path()))], "broken"),
@@ -308,6 +360,9 @@ fn a_hostile_name_is_sanitised_and_capped_in_the_notice() {
 fn the_default_shell_is_tried_once_and_the_profiles_error_returned() {
     let root = tempfile::tempdir().unwrap();
     let locked = Locked::new(root.path());
+    if !locked.holds() {
+        return;
+    }
     let app = app(
         &root,
         config(&[("tool", Some(MISSING_COMMAND), None)], "Default"),

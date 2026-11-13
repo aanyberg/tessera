@@ -131,10 +131,58 @@ mod tests {
 
     use super::*;
 
+    /// #348 m1, staged: an apply started between the chords and the
+    /// generation cannot finish there (the combined read holds the key
+    /// map's lock), so the JSON is the old chords with the old generation.
+    /// Read as `keymap()` and then `config_generation()`, the apply lands
+    /// in between: the old chords with the new generation.
+    #[test]
+    fn an_apply_cannot_land_between_the_chords_and_the_generation() {
+        let app = Arc::new(App {
+            core: CoreApp::new(Config::default(), ConfigPaths::new("/nonexistent/tessera")),
+        });
+        let (start, started) = std::sync::mpsc::channel::<()>();
+        let (finish, finished) = std::sync::mpsc::channel::<()>();
+        let applier = {
+            let app = Arc::clone(&app);
+            std::thread::spawn(move || {
+                let bound = Config::from_toml_lenient("[keys]\n'cmd+u' = 'new_tab'\n")
+                    .unwrap()
+                    .config;
+                started.recv().unwrap();
+                app.core
+                    .apply_config(&bound, &tessera_config::Theme::default());
+                // The reader stopped listening if the apply had to wait.
+                let _ = finish.send(());
+            })
+        };
+        CoreApp::pause_between_reads_for_test(move || {
+            start.send(()).unwrap();
+            // Long enough for an unblocked apply even under load; a
+            // blocked one never finishes here.
+            let _ = finished.recv_timeout(std::time::Duration::from_millis(500));
+        });
+        let json: serde_json::Value = serde_json::from_str(&keymap_json(&app)).unwrap();
+        applier.join().unwrap();
+        let new_tab = json["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["command"] == "new_tab")
+            .unwrap();
+        assert_eq!(
+            (json["generation"].as_u64().unwrap(), &new_tab["chords"]),
+            (0, &serde_json::json!(["cmd+t"])),
+            "an apply landed between the reads"
+        );
+        assert_eq!(app.core.config_generation(), 1);
+    }
+
     /// M4 (#317): under a storm of applies alternating between two
     /// `[keys]` tables, every JSON's chords are those of its generation
     /// (odd: `cmd+u` opens a tab too; even: the defaults). Reading the map
-    /// and the generation one after the other tore 2 reads in 357,861.
+    /// and the generation one after the other tore 2 reads in 357,861, too
+    /// rarely to catch that revert: the staged test above does (#348 m1).
     #[test]
     fn the_generation_and_the_chords_never_disagree() {
         const APPLIES: u64 = 20_000;
