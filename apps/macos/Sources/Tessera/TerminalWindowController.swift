@@ -119,7 +119,7 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
         window.tabbingMode = .preferred
         window.tabbingIdentifier = Self.tabbingIdentifier
         window.title = title.isEmpty ? Self.defaultTitle : title
-        window.contentView = TerminalWindowContentView(paneContainer: paneContainer, frame: paneContainer.frame)
+        TerminalWindowContentView(paneContainer: paneContainer, frame: paneContainer.frame).install(in: window)
         super.init(window: window)
         window.delegate = self
         watchFocus(of: pane)
@@ -608,8 +608,11 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
 
     func windowDidBecomeMain(_ notification: Notification) {
         delegate?.terminalWindowControllerDidChangeLayout(self)
-        // A tab selected by a path that does not order the window in.
-        (window?.contentView as? TerminalWindowContentView)?.updateWindowBlur()
+        // The backstop for a path to the screen that neither selects the
+        // tab nor orders the window in, nor posts what the content view
+        // observes (#405 n2); a no-op when the state is already right. The
+        // tests' host never becomes main, so no test reaches it.
+        (window?.contentView as? TerminalWindowContentView)?.windowDidBecomeVisible()
     }
 
     /// ⌘W's title is this tab's while its window is key: another window's
@@ -676,11 +679,12 @@ final class TerminalWindow: NSWindow {
     /// `makeKeyAndOrderFront`, a tab's selection): the window now has a
     /// number on screen, so a blur radius waiting for one is set (ADR 0045).
     /// AppKit posts no occlusion change for a first show, whose state can
-    /// already be visible.
+    /// already be visible. The same path as a tab's selection
+    /// (``TerminalWindowContentView/windowDidBecomeVisible()``).
     override func order(_ place: NSWindow.OrderingMode, relativeTo otherWin: Int) {
         super.order(place, relativeTo: otherWin)
         guard place != .out else { return }
-        (contentView as? TerminalWindowContentView)?.updateWindowBlur()
+        (contentView as? TerminalWindowContentView)?.windowDidBecomeVisible()
     }
 
     /// A new tab beside this one: this tab shows every pane again first.

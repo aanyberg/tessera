@@ -108,3 +108,51 @@ which the symbol lookup and the material fallback absorb.
   to about a second); manual checks must not judge pixels inside that time.
 - NSGlassEffectView (macOS 26 glass, as Ghostty's `macos-glass-*`) is out of
   scope; a later ADR can add it.
+
+## Amendment: tab switches, off-screen windows, full screen (#405, #409, 2026-11-13)
+
+**The title bar under the content (#409).** Found headlessly, not yet confirmed
+by eye: a translucent window had AppKit's `NSTitlebarContainerView` (the title,
+the tab bar, the buttons) below the window's content view, where the strip's
+blur and tint cover it. A pane attaches as it moves into the window, which
+made the window transparent while AppKit was still inside
+`window.contentView =`; a window whose background changes then keeps its title
+bar's views under the new content view for good (reproduced in a plain AppKit
+program as well). The content view is now installed before the panes go into
+it (`TerminalWindowContentView.install(in:)`), and the tests check that the
+window's close button is in a view above the content after every tab route.
+Why the user saw it only on a tab switch is not known; a stacking that the
+compositor ignored until the tab bar moved between windows fits.
+
+**One path to the screen.** A tab window makes its opacity, title bar, strip
+and radius what its panes ask for, as on a pane's attach, whenever it may come
+on screen: ordered in (`order(_:relativeTo:)`, which every tab route and an app
+unhide reach on macOS 27), its tab group's `selectedWindow` changing (KVO, for
+a route that does not order in), a window of its tab group deminiaturized, the
+app unhidden, and `windowDidBecomeMain` as the backstop (no test reaches it:
+the test host never becomes main). What is already right is left alone, so
+each is cheap.
+
+**Off screen.** While the window has no number (a tab not yet shown, minimized,
+the app hidden) an update keeps the blur state it has, since the radius set on
+the window stays: a theme reload or a new pane meanwhile does not show the
+panes' material, which would flash as the window comes back. The radius wanted
+meanwhile is set when the window is back on screen. On macOS 27 an unselected
+tab that has been shown keeps `isVisible` and its window number, so this guard
+covers minimized windows and a hidden app, not unselected tabs: those are
+brought up to date when they become visible again, as above.
+
+**Recorded, not changed.**
+
+- Native full screen is not special-cased: the radius applies to a full-screen
+  window as to any other, over the desktop space behind it. Eye check (#363).
+- A failed radius-0 call leaves whatever blur WindowServer had on the window,
+  under the panes' material (shown again), and is not retried until the radius
+  or the window number changes.
+- `WindowBlurRadius.systemBackend()` stays internal so a test can call it.
+- The strip over an inactive pane is not dimmed by `dim_inactive_panes`
+  while the pane is: the strip is window chrome. Accepted for 0.2.0.
+- The smallest content size of a translucent window adds the height of the
+  title bar and tab bar as last measured over panes with height (#403 m2), so
+  a programmatic frame at the smallest size leaves each pane its smallest
+  size in a tabbed window too.

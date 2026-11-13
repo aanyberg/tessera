@@ -40,6 +40,10 @@ final class TerminalWindowContentView: NSView {
     /// changes without resizing a full-size content view.
     private var layoutRectObservation: NSKeyValueObservation?
 
+    /// The selected tab of the window's tab group, which AppKit changes
+    /// with no window notification (``windowDidBecomeVisible()``).
+    private var tabSelectionObservation: NSKeyValueObservation?
+
     /// While ``updateTitlebar(translucent:)`` changes the style mask:
     /// the window passes through another frame, which the panes must not
     /// take.
@@ -51,6 +55,12 @@ final class TerminalWindowContentView: NSView {
     /// is no taller than that and so all of it is under the title bar (#388
     /// m1).
     private(set) var titlebarInset: CGFloat = 0
+
+    /// The height of the title bar and tab bar over the panes the last time
+    /// the content was taller than both: the floor of ``titlebarInset``
+    /// while it is not, so the smallest frame of a tabbed window leaves the
+    /// panes their smallest size (#403 m2).
+    private var unclippedStripHeight: CGFloat = 0
 
     /// `[appearance] blur_radius` for this window, 0 while Reduce
     /// Transparency is on (``AppDelegate`` sets it on every window);
@@ -70,12 +80,24 @@ final class TerminalWindowContentView: NSView {
     /// own blur hidden.
     private(set) var usesBlurRadius = false
 
+    /// A view for `paneContainer`, which ``install(in:)`` puts in it.
     init(paneContainer: PaneContainerView, frame: NSRect) {
         self.paneContainer = paneContainer
         super.init(frame: frame)
         paneContainer.frame = bounds
         paneContainer.autoresizingMask = []
+    }
+
+    /// Makes this view `window`'s content view, then puts the panes in it.
+    /// In that order: a pane makes the window transparent as it attaches,
+    /// when it moves into the window, and a window whose background changes
+    /// while AppKit still sets its content view keeps its title bar's views
+    /// (the title, the tab bar, the buttons) under the content view, where
+    /// the strip covers them (#409).
+    func install(in window: NSWindow) {
+        window.contentView = self
         addSubview(paneContainer)
+        placeSubviews()
     }
 
     @available(*, unavailable)
@@ -148,12 +170,16 @@ final class TerminalWindowContentView: NSView {
     /// window number changed; then hides each pane's own blur while the
     /// radius blurs the window, and shows it otherwise. Radius 0 is set only
     /// on a window that had another, so a window that never asks for one
-    /// makes no call.
+    /// makes no call. While the window is off screen (an unselected tab,
+    /// minimized, the app hidden) it keeps the state it has, as the radius
+    /// set on it stays (#405 m1): an update meanwhile (a theme reload) does
+    /// not show the panes' material, which would flash as it comes back.
     func updateWindowBlur() {
         guard let window else { return }
         let radius = wantedBlurRadius
-        var active = false
+        var active = usesBlurRadius
         if let number = WindowBlurRadius.windowNumber(window) {
+            active = false
             if let appliedBlur, appliedBlur.windowNumber == number, appliedBlur.radius == radius {
                 active = appliedBlur.succeeded && radius > 0
             } else if radius == 0, appliedBlur?.windowNumber != number || appliedBlur?.radius == 0 {
@@ -175,6 +201,30 @@ final class TerminalWindowContentView: NSView {
     /// now. A first show is ``TerminalWindow``'s ordering in.
     @objc private func windowOcclusionDidChange(_ notification: Notification) {
         updateWindowBlur()
+    }
+
+    /// The window's tab may be shown now (#409, #405 n1): its tab was
+    /// selected (by any route: ⇧⌘], ⌘1 to ⌘9, a click, `selectedWindow`, the
+    /// selected tab closing), it was ordered in, or it, a window of its tab
+    /// group, or the app came back from the Dock or from hiding. Makes the
+    /// window's opacity, title bar, strip and blur radius what its panes ask
+    /// for now, as on a pane's attach; what is already right is left alone.
+    func windowDidBecomeVisible() {
+        guard window != nil else { return }
+        paneContainer.paneOpacityDidChange()
+    }
+
+    /// A window was deminiaturized: if it is a tab of this window's group
+    /// (only the selected one is posted), this tab shows again.
+    @objc private func anyWindowDidDeminiaturize(_ notification: Notification) {
+        guard let window, let restored = notification.object as? NSWindow,
+            (window.tabGroup?.windows ?? [window]).contains(where: { $0 === restored })
+        else { return }
+        windowDidBecomeVisible()
+    }
+
+    @objc private func applicationDidUnhide(_ notification: Notification) {
+        windowDidBecomeVisible()
     }
 
     /// Tints the strip again from the panes now at the top (their frames or
@@ -216,10 +266,13 @@ final class TerminalWindowContentView: NSView {
     override func viewWillMove(toWindow newWindow: NSWindow?) {
         super.viewWillMove(toWindow: newWindow)
         layoutRectObservation = nil
+        tabSelectionObservation = nil
         if let window {
             NotificationCenter.default.removeObserver(
                 self, name: NSWindow.didChangeOcclusionStateNotification, object: window)
         }
+        NotificationCenter.default.removeObserver(self, name: NSWindow.didDeminiaturizeNotification, object: nil)
+        NotificationCenter.default.removeObserver(self, name: NSApplication.didUnhideNotification, object: nil)
     }
 
     override func viewDidMoveToWindow() {
@@ -229,11 +282,23 @@ final class TerminalWindowContentView: NSView {
         layoutRectObservation = window.observe(\.contentLayoutRect) { [weak self] _, _ in
             MainActor.assumeIsolated { self?.placeSubviews() }
         }
+        // On the main thread, also for a window that joins a tab group after
+        // this view moved into it.
+        tabSelectionObservation = window.observe(\.tabGroup?.selectedWindow) { [weak self] _, _ in
+            MainActor.assumeIsolated { self?.windowDidBecomeVisible() }
+        }
         // Posted on the main thread; the centre keeps no reference to this
         // view.
         NotificationCenter.default.addObserver(
             self, selector: #selector(windowOcclusionDidChange(_:)),
             name: NSWindow.didChangeOcclusionStateNotification, object: window)
+        // Any window's: the one restored may be another tab of this group.
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(anyWindowDidDeminiaturize(_:)), name: NSWindow.didDeminiaturizeNotification,
+            object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(applicationDidUnhide(_:)), name: NSApplication.didUnhideNotification,
+            object: nil)
         placeSubviews()
         updateWindowBlur()
     }
@@ -253,7 +318,11 @@ final class TerminalWindowContentView: NSView {
         updateTitlebarTint()
         var inset = bounds.height - area.height
         if inset > 0, let window {
-            inset = max(inset, Self.standardTitlebarHeight(of: window))
+            if area.height > 0 {
+                // The panes have height, so all of the strip is above them.
+                unclippedStripHeight = inset
+            }
+            inset = max(inset, unclippedStripHeight, Self.standardTitlebarHeight(of: window))
         }
         if inset != titlebarInset {
             titlebarInset = inset

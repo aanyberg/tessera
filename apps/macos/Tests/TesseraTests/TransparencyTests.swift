@@ -467,6 +467,10 @@ final class TransparencyTests: XCTestCase {
         let other = try XCTUnwrap(host.open(profile: "solid").window)
         window.addTabbedWindow(other, ordered: .above)
         XCTAssertLessThan(controller.paneContainer.frame.height, size.height, "a tab bar takes the panes' top")
+        // The tab group's change shows the window as its opaque panes ask
+        // (#409); flipped here by hand again, as above.
+        assertTitlebar(controller, translucent: false, "the tab joined: as the panes ask")
+        content.updateTitlebar(translucent: true)
         assertTitlebar(controller, translucent: true, "blurred, with a tab bar")
 
         let tabbed = window.frame

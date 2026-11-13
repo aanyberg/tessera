@@ -195,6 +195,43 @@ final class SettingsTests: XCTestCase {
         XCTAssertTrue(writes.allSatisfy { if case .integer = $0.value { true } else { false } }, "\(writes)")
     }
 
+    /// #405 m3: a slider's and an integer slider's `onEditingChanged`
+    /// (``SettingsField/editingChanged(_:)``, what the row hands SwiftUI)
+    /// writes the value held back by the coalescing once the knob is let
+    /// go, and nothing as it is taken.
+    func testLettingGoOfASliderWritesItsLastValue() async throws {
+        let clock = ManualClock()
+        let (model, _, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        for (key, values) in [
+            ("appearance.opacity", [TesseraConfigValue.float(0.4), .float(0.5), .float(0.6)]),
+            ("appearance.blur_radius", [.integer(10), .integer(11), .integer(12)]),
+        ] {
+            let field = try XCTUnwrap(AppearancePane.fields.first { $0.key == key })
+            let context = SettingsFieldContext(model: model, path: field.key)
+            let editingChanged = field.editingChanged(context)
+            editingChanged(true)
+            for value in values {
+                switch value {
+                case .float(let float): field.doubleBinding(context).wrappedValue = float
+                case .integer(let integer): field.integerSliderBinding(context).wrappedValue = Double(integer)
+                default: XCTFail("\(value)")
+                }
+            }
+            try await waitUntil("the first write ran") { !model.isWriting }
+            try await Task.sleep(for: .milliseconds(50))
+            XCTAssertNotEqual(
+                writer.calls.last { $0.key == key }?.value, values.last, "\(key): held back while dragged")
+            editingChanged(true)
+            try await Task.sleep(for: .milliseconds(50))
+            XCTAssertNotEqual(
+                writer.calls.last { $0.key == key }?.value, values.last, "\(key): taking it writes nothing")
+            editingChanged(false)
+            try await waitUntil("\(key): the last value written") {
+                !model.isWriting && writer.calls.last { $0.key == key }?.value == values.last
+            }
+        }
+    }
+
     func testARefusedEditShowsTheSanitisedWarningAndTheFilesValue() async throws {
         let writer = FakeWriter()
         writer.respond = { call, _ in
