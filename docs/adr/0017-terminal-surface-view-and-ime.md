@@ -294,7 +294,7 @@ screenshots. Rows from the fixture marked (unverified) are among them.
 | Cmd-V, Cmd-K, Cmd-A at a zsh prompt | Cmd-V pastes the clipboard's text, Cmd-K clears to the prompt line (#29), Cmd-A does nothing until the selection model (#30); no escape sequence typed into zsh | pending |
 | Cmd-Shift variants without a menu item (Cmd-Shift-V, Cmd-Shift-K, Cmd-Shift-A) at a zsh prompt | nothing typed into zsh; a beep at most | pending |
 | Idle visible window (prompt, no output) | near-zero CPU (link idles) | pending |
-| Switch light/dark mode while composing | overlay colours follow | pending |
+| Switch light/dark mode while composing (after #365, with the app following the system; until then the app is always dark, #364, and a system switch changes nothing) | overlay colours follow | pending |
 | Focus loss mid Japanese composition: click another window, Cmd-Tab away, switch tab | composition disappears, nothing sent | pending |
 | Output in a background tab (`sleep 2; seq 1 50`), then select that tab | the tab shows the output (relies on AppKit's occlusion notification on tab switch) | pending |
 | Cmd-. and Cmd-Backspace at a zsh prompt | nothing typed into zsh | pending |

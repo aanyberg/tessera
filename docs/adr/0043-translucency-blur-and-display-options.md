@@ -122,3 +122,24 @@ translucent pane keeps the window translucent, and a hidden pane that asks
 for blur is not drawn but still counts toward the window's blur: this is
 intended, it keeps zooming from changing the window, and the wording above
 and the code comments say "every pane of the tab", not "every visible pane".
+
+## Amendment: the app is always dark (#364, 2026-11-13)
+
+**Decision.** The app sets `NSApp.appearance` to `.darkAqua` in
+`applicationWillFinishLaunching`, before any window exists, so every window,
+sheet and panel it shows is dark whatever the system's Light or Dark setting:
+terminal windows, their title and tab bars, the find bar, Settings, alerts,
+sheets and the About panel. No window or view sets an appearance of its own;
+they inherit the app's. Context menus are dark too; the menu bar and its
+menus are drawn by the system and follow the system's setting. This is the maintainer's decision: terminal themes are
+dark, and light window chrome around a dark theme looked out of place.
+
+**The backdrop no longer follows the system mode.** The blur backdrop's
+material (`.fullScreenUI`, `.underWindowBackground` before #363) draws its
+system tint from the effective appearance. With the app always dark, the tint
+is the dark one in Light mode too, and switching the system between Light and
+Dark while the app runs changes nothing in it.
+
+**The choice comes later.** There is no setting: a dark, light and system
+choice is #365, which replaces the one call that sets the appearance
+(`AppDelegate.applyAppAppearance()`).
