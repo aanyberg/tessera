@@ -776,7 +776,7 @@ mod model {
     pub fn encode(params: &[Option<u16>]) -> String {
         params
             .iter()
-            .map(|p| p.map(|n| n.to_string()).unwrap_or_default())
+            .map(|p| p.map_or_default(|n| n.to_string()))
             .collect::<Vec<_>>()
             .join(";")
     }
