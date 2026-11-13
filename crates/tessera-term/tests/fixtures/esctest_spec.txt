@@ -40,6 +40,8 @@
 #     #95 (protected areas) lifted E_ED_respectsISOProtection, E_EL_respectsISOProtection, E_ECH_respectsISOProtection
 #     and E_S8C1T_SPA_EPA (protect_spec.txt P01..P04); the two saveRestoreCursor_protection tests use DECSERA and wait
 #     for #251. 210 cases.
+#     #251 (rectangular area operations) lifted E_DECRC_saveRestoreCursor_protection and
+#     E_SCORC_saveRestoreCursor_protection (DECSERA). 212 cases.
 #
 # HOW esctest ASSERTIONS MAP TO THE FIXTURE
 #   esctest reads the cursor with DSR 6 (needs #10) and the screen with DECRQCRA checksums; tessera tests read the grid. So:
@@ -6514,8 +6516,42 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_DECRC_saveRestoreCursor_protection -> #251 (DECSERA: the esctest original erases with DECSERA, which needs the rectangle
-#>    operations; #95 proves the DECRC half with DECSEL, protect_spec.txt K01)
+### E_DECRC_saveRestoreCursor_protection
+size: 25x80
+step: feed \x1b[1"q\x1b7\x1b[0"q\x1b8a\x1b[1;1;1;1${
+source: esctest2 esctest/tests/save_restore_cursor.py (DECRCTests) test_SaveRestoreCursor_Protection
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/save_restore_cursor.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #251 (rectangular area operations): DECSCA 1, save, DECSCA 0, restore, print `a`, then DECSERA over that cell; the restored pen protects, so in DEC protection mode the `a` survives the selective erase. Same bytes as protect_spec.txt K02 and rect_spec.txt RS16.
+screen:
+>a |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
 
 ### E_DECRC_saveRestoreCursor_reverseWrapNotAffected
 size: 25x80
@@ -6932,7 +6968,42 @@ pending_wrap: false
 requests: []
 scrollback: len=0
 
-#> E_SCORC_saveRestoreCursor_protection -> #251 (as E_DECRC_saveRestoreCursor_protection; protect_spec.txt K03 for SCORC)
+### E_SCORC_saveRestoreCursor_protection
+size: 25x80
+step: feed \x1b[1"q\x1b[s\x1b[0"q\x1b[ua\x1b[1;1;1;1${
+source: esctest2 esctest/tests/scorc.py via save_restore_cursor.py (SCORCTests) test_SaveRestoreCursor_Protection
+cite: https://github.com/ThomasDickey/esctest2/blob/master/esctest/tests/save_restore_cursor.py ; https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+note: lifted by #251 (rectangular area operations): DECSCA 1, save, DECSCA 0, restore, print `a`, then DECSERA over that cell; the restored pen protects, so in DEC protection mode the `a` survives the selective erase. Same bytes as protect_spec.txt K03b and rect_spec.txt RS17.
+screen:
+>a |
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
 
 # ---------------------------------------------------------------------------- DECSTBM (decstbm.py)  ESC[Pt;Pb r  — moves the cursor home on success
 

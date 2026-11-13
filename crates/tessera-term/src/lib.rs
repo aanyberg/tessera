@@ -110,7 +110,16 @@
 //! DECRQSS `" q` reports it in DEC mode. ICH, DCH, IL, DL and scrolling
 //! move protected cells like any other, printing over one replaces its
 //! protection with the pen's, and a protected wide character is erased
-//! whole or not at all. DECSERA is not implemented (#251).
+//! whole or not at all. DECSERA (`CSI Pt;Pl;Pb;Pr $ {`) keeps protected
+//! cells in DEC mode only.
+//!
+//! ## Rectangular area operations
+//!
+//! From conformance level 4, DECERA (`CSI Pt;Pl;Pb;Pr $ z`), DECFRA
+//! (`CSI Pch;Pt;Pl;Pb;Pr $ x`), DECCRA (`CSI ... $ v`) and DECSERA erase,
+//! fill, copy and selectively erase a rectangle of the active screen,
+//! relative to the origin region in origin mode, without moving the cursor
+//! or answering (ADR 0046).
 //!
 //! ## Character sets
 //!
@@ -177,6 +186,7 @@ mod modes;
 mod mouse;
 mod osc;
 mod osc_color;
+mod rect;
 mod reports;
 mod sgr;
 

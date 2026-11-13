@@ -40,7 +40,7 @@ Before you push, run `just check` (fmt, clippy, tests, cargo-deny); add `just ap
   `// SAFETY:` comment. The exceptions outside them are the counting test allocators in
   `crates/tessera-render/tests/alloc.rs` (ADR 0016), `crates/tessera-grid/tests/reset.rs`,
   `crates/tessera-term/tests/osc8_alloc.rs`, `crates/tessera-term/tests/mouse_alloc.rs`,
-  `crates/tessera-term/tests/screen_clears_alloc.rs` and
+  `crates/tessera-term/tests/screen_clears_alloc.rs`, `crates/tessera-term/tests/rect_alloc.rs` and
   `crates/tessera-app-core/tests/keybindings.rs`. `scripts/verify-branch.sh` checks this mechanically: its `unsafe`
   check fails an added `unsafe` or `#[global_allocator]` line outside those two crates unless the file is listed in
   `scripts/unsafe-exceptions.txt`, and `just verify-branch-test` fails when that list and `docs/security.md` S7 differ.

@@ -44,6 +44,10 @@
 //! | `CSI Pl ; Pc " p` | DECSCL | select conformance level: for `Pl` 61..=65, the DECSTR soft reset, then level `Pl - 60` and the C1 reply mode from `Pc`; any other `Pl` does nothing |
 //! | `CSI Ps " q` | DECSCA | DEC protection mode; `Ps` 1 makes the pen protect, absent, 0 and 2 stop it, others leave it (ADR 0034) |
 //! | `CSI ? Ps J` `CSI ? Ps K` | DECSED DECSEL | ED and EL that keep protected cells while protection is on (ADR 0034) |
+//! | `CSI Pt ; Pl ; Pb ; Pr $ z` | DECERA | erase the rectangle to blanks of the pen's background, protected cells too (level 4 and up; see the `rect` module) |
+//! | `CSI Pch ; Pt ; Pl ; Pb ; Pr $ x` | DECFRA | fill the rectangle with character `Pch` in the pen's style (level 4 and up) |
+//! | `CSI Pts ; Pls ; Pbs ; Prs ; Pps ; Ptd ; Pld ; Ppd $ v` | DECCRA | copy the rectangle to the one at (`Ptd`, `Pld`); pages ignored (level 4 and up) |
+//! | `CSI Pt ; Pl ; Pb ; Pr $ {` | DECSERA | erase the rectangle to spaces that keep their style, keeping protected cells in DEC protection mode (level 4 and up) |
 //!
 //! Parameters follow xterm: an absent parameter and an explicit `0` both
 //! mean the default, positions are 1-based and clamp to the screen, and
@@ -90,14 +94,14 @@
 //! its default `decTerminalID` 420, accepts only up to 64). Nothing is
 //! answered; `State::select_conformance_level` has the details.
 //!
-//! DECSET/DECRST, SM/RM, DECSCL, DECSCUSR, DECSCA, the kitty keyboard sequences
-//! and every report query are ignored as a whole when a parameter carries
+//! DECSET/DECRST, SM/RM, DECSCL, DECSCUSR, DECSCA, the kitty keyboard sequences,
+//! the rectangle operations and every report query are ignored as a whole when a parameter carries
 //! a colon sub-parameter (`CSI ? 25:1049 h`), as in xterm, which accepts
 //! them only in SGR and XTMODKEYS.
 //!
 //! Everything else (an unassigned final, any other private marker and
 //! final pair such as `CSI > 25 h` or `CSI ? 5 m`, any other intermediate
-//! such as `$` with a final other than `p`, `SP` with a final other than
+//! such as `$` with a final other than `p`, `z`, `x`, `v` and `{`, `SP` with a final other than
 //! `q`, `'` with one other than `}` and `~`, and `"` with one other than `p` and `q`, a private marker before `SP q`,
 //! and the xterm extension SL/SR that is not in scope) is ignored and
 //! logged at trace level. The parser hands over private markers as
@@ -109,7 +113,8 @@
 //! `tests/fixtures/modes_spec.txt`, for DECSCUSR by
 //! `tests/fixtures/decscusr_spec.txt`, for the margins by
 //! `tests/fixtures/margins_spec.txt` and for protection and selective
-//! erase by `tests/fixtures/protect_spec.txt`.
+//! erase by `tests/fixtures/protect_spec.txt` and for the rectangle
+//! operations by `tests/fixtures/rect_spec.txt`.
 //!
 //! [`Action::Csi`]: tessera_vt::Action::Csi
 
@@ -182,6 +187,7 @@ fn voided_by_subparams(intermediates: &[u8], action: char) -> bool {
             | (b" " | b">" | b"\"", 'q')
             | (b">" | b"=", 'c')
             | (b"$" | b"?$", 'p')
+            | (b"$", 'z' | 'x' | 'v' | '{')
     )
 }
 
@@ -347,6 +353,11 @@ impl State {
                 } else {
                     self.grid.delete_columns(count(params, 0));
                 }
+            }
+            // DECERA, DECFRA, DECCRA and DECSERA, VT420 and up (xterm
+            // `CASE_DECERA` and siblings; ADR 0046).
+            (b"$", 'z' | 'x' | 'v' | '{') if self.conformance_level >= 4 => {
+                self.rect_op(params, action);
             }
             (b">", 'm') => self.set_key_modifiers(params),
             ([marker @ (b'>' | b'<' | b'=')], 'u') => self.kitty_keyboard(*marker, params),

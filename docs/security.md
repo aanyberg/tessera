@@ -60,7 +60,7 @@ a low-risk change.
 - **S7. Memory safety.** `unsafe` only in `tessera-pty` and `tessera-ffi`, each block with a `// SAFETY:` comment;
   the counting test allocators in `crates/tessera-render/tests/alloc.rs`, `crates/tessera-grid/tests/reset.rs`,
   `crates/tessera-term/tests/osc8_alloc.rs`, `crates/tessera-term/tests/mouse_alloc.rs`,
-  `crates/tessera-term/tests/screen_clears_alloc.rs` and
+  `crates/tessera-term/tests/screen_clears_alloc.rs`, `crates/tessera-term/tests/rect_alloc.rs` and
   `crates/tessera-app-core/tests/keybindings.rs` are the exceptions (CONTRIBUTING.md); `scripts/verify-branch.sh`
   checks the rule mechanically from `scripts/unsafe-exceptions.txt`, which must list exactly these files. Every FFI export that can panic runs under `ffi_guard!` (`catch_unwind`);
   every pointer and length argument is checked; sessions cross the boundary as ids, never pointers.
@@ -78,6 +78,7 @@ a low-risk change.
 | Title | 1024 bytes, dropped whole when longer; stack depth 10; last title per chunk | `crates/tessera-term/src/osc.rs`, `crates/tessera-term/src/reports.rs`, `crates/tessera-app-core/src/session.rs` |
 | OSC 52 write | 1 MiB decoded, strict base64, UTF-8; last write per chunk; 10 pasteboard writes per second app-wide, latest held | `crates/tessera-term/src/osc.rs`, `crates/tessera-app-core/src/session.rs`, `apps/macos/Sources/TesseraKit/CallbackBridge.swift` |
 | OSC 7 / OSC 1337 | 4096 bytes | `crates/tessera-term/src/lib.rs` |
+| Rectangle operations (DECERA, DECFRA, DECCRA, DECSERA; ADR 0046) | work per sequence at most the clamped rectangle (the screen); DECCRA's only buffers scratch of at most one row (its cells; for a copy that carries clusters or links, also their entries and the destination row's own while merged in column order, so each row costs linear work), at most the screen's width (2048 cells), none sized from a parameter; plain text costs one allocation per copy, a copied cluster one more for its text; no reply, no per-cell event; DECFRA never writes a C0, C1 or DEL cell | `crates/tessera-term/src/rect.rs`, `crates/tessera-grid/src/rect.rs` |
 | Remote host in the title (#205, ADR 0022) | host 253 bytes (`MAX_REMOTE_HOST_BYTES`, `TESSERA_MAX_REMOTE_HOST_LEN`), dropped whole when longer (shown `⇢ ssh`); control, bidi-control and line-separator characters removed (S3); one decision per chunk, `SessionEvent::Remote` only on change (S6), one pending state per session in the bridge; the `ssh` probe (foreground job, else session leader; names at most 64 bytes, compared, never shown) at most once per second per session, on output only; at most 4 local host names remembered per session (`MAX_LOCAL_HOST_NAMES`); logs carry the host's length only (S8) | `crates/tessera-app-core/src/remote.rs`, `crates/tessera-app-core/src/session.rs`, `crates/tessera-ffi/src/callbacks.rs`, `apps/macos/Sources/TesseraKit/CallbackBridge.swift` |
 | DCS | streamed in 4 KiB chunks; DECRQSS request 64 bytes | `crates/tessera-vt/src/lib.rs`, `crates/tessera-term/src/dcs.rs` |
 | Grapheme cluster | 32 scalars | `crates/tessera-grid/src/grapheme.rs` |

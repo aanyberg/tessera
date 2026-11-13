@@ -12,19 +12,23 @@
 //! - `reply:` the [`Request::Reply`] bytes of the whole script,
 //!   concatenated (`\e` is ESC; the escapes of [`common::decode`]);
 //! - `pstate: <mode>/<pen>`: [`Terminal::protection_mode`] and whether the
-//!   pen carries [`Style::PROTECTED`] after the script.
+//!   pen carries [`Style::PROTECTED`] after the script;
+//! - `attr: (row,c0)-(row,c1) <pen>`: the style of every cell of the run in
+//!   [`common::pen_text`] notation (colours, underline and flags),
+//!   [`Style::PROTECTED`] left out.
 //!
 //! Protection is invisible on the screen, so every row proves it by what
 //! an erase leaves behind; the `flags: control` rows run the same erase
-//! without protection and prove the setups are not vacuous. Rows after the
-//! fixture's `#>` marker wait for DECSERA (#251) and are not cases.
+//! without protection and prove the setups are not vacuous. The DECSERA
+//! rows (section G, K02, K03b) came with #251; the other rectangle
+//! operations have their own table, `tests/rect.rs`.
 
 #[allow(dead_code)] // Shared harness: not every helper is used here.
 mod common;
 #[allow(dead_code)] // Shared with tests/csi.rs and tests/vttest.rs.
 mod spec;
 
-use common::{Chunking, Script, Step, decode, render_screen, split_replies};
+use common::{Chunking, Script, Step, decode, pen_text, render_screen, split_replies};
 use tessera_grid::{Cell, CellFlags, Point, Style};
 use tessera_term::Terminal;
 
@@ -32,7 +36,7 @@ const FIXTURE: &str = include_str!("fixtures/protect_spec.txt");
 const FIXTURE_NAME: &str = "fixtures/protect_spec.txt";
 
 /// Cases in the fixture: a row lost from it fails the table.
-const CASES: usize = 73;
+const CASES: usize = 85;
 
 /// Replaces `\e` with `\x1b` in a fixture payload, leaving `\\` alone, so
 /// [`common::decode`] reads it.
@@ -65,11 +69,36 @@ struct Row {
     script: Script,
     reply: Option<Vec<u8>>,
     pstate: Option<(String, bool)>,
+    /// `attr:` runs: row, first and last column, pen text.
+    attrs: Vec<(u16, u16, u16, String)>,
     flags: Vec<String>,
     has_screen: bool,
 }
 
-/// Every row of the fixture, in order, up to the `#>` pending blocks.
+/// `(row,col)` of an `attr:` run.
+fn parse_point(raw: &str) -> (u16, u16) {
+    let inner = raw
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("`{raw}` is not `(row,col)`"));
+    let (row, col) = inner.split_once(',').expect("`(row,col)`");
+    (
+        row.trim().parse().expect("attr row"),
+        col.trim().parse().expect("attr col"),
+    )
+}
+
+/// One `attr: (r,c0)-(r,c1) <pen>` run of row `id`.
+fn attr_run(id: &str, rest: &str) -> (u16, u16, u16, String) {
+    let (range, pen) = rest.split_once(' ').expect("`attr: <range> <pen>`");
+    let (from, to) = range.split_once('-').expect("`(r,c0)-(r,c1)`");
+    let ((row, col0), (row1, col1)) = (parse_point(from), parse_point(to));
+    assert_eq!(row, row1, "{id}: an attr run stays on one row");
+    assert!(col0 <= col1, "{id}: attr run {range} is reversed");
+    (row, col0, col1, pen.trim().to_owned())
+}
+
+/// Every row of the fixture, in order.
 fn rows() -> Vec<Row> {
     let mut blocks: Vec<Vec<&str>> = Vec::new();
     for line in FIXTURE.lines() {
@@ -107,9 +136,15 @@ fn rows() -> Vec<Row> {
                 let (mode, pen) = p.split_once('/').expect("pstate is mode/pen");
                 (mode.to_owned(), pen == "1")
             });
+            let attrs = block
+                .lines()
+                .filter_map(|l| l.strip_prefix("attr: "))
+                .map(|rest| attr_run(&id, rest))
+                .collect();
             Row {
                 reply: field("reply: ").map(|r| decode(&r)),
                 pstate,
+                attrs,
                 flags: field("flags: ")
                     .map_or_default(|f| f.split_whitespace().map(str::to_owned).collect()),
                 has_screen: block.lines().any(|l| l == "screen:"),
@@ -154,6 +189,20 @@ fn check_row(row: &Row, chunking: Chunking) -> Vec<String> {
                 got.0,
                 u8::from(got.1)
             ));
+        }
+    }
+    for (r, c0, c1, want) in &row.attrs {
+        for col in *c0..=*c1 {
+            let cell = term.grid().cell(Point::new(*r, col)).expect("attr cell");
+            let mut style = cell.style;
+            style.flags &= !Style::PROTECTED;
+            let got = pen_text(style);
+            if got != *want {
+                errors.push(format!(
+                    "{} ({chunking:?}) cell ({r},{col}): {got}, expected {want}",
+                    row.id
+                ));
+            }
         }
     }
     term.grid().check_invariants();

@@ -6,4 +6,5 @@ crates/tessera-grid/tests/reset.rs
 crates/tessera-term/tests/osc8_alloc.rs
 crates/tessera-term/tests/mouse_alloc.rs
 crates/tessera-term/tests/screen_clears_alloc.rs
+crates/tessera-term/tests/rect_alloc.rs
 crates/tessera-app-core/tests/keybindings.rs

@@ -1,0 +1,2182 @@
+# =============================================================================
+# tessera-term: rectangular area operations DECERA / DECFRA / DECCRA / DECSERA   (issue #251, wave 20)
+# spec-researcher output, 2026-11-13, lifted from the wave-20 staging file; run by tests/rect.rs (132 cases, whole and byte by byte; ADR 0046).
+#
+# FORMAT  Same layout as protect_spec.txt / csi_spec.txt (### ID / size / step / screen / cursor / pending_wrap / requests / scrollback), read by
+#   tests/spec/mod.rs parse_fixture; `|` is placed AFTER the cursor's cell (render_screen); a wide glyph is one character (spacer not drawn); `\` after a
+#   row marks a soft-wrapped line. `\e` ESC, `\r\n`; wide characters appear as raw scalars (the harness decode must keep them, else write \u{6F22}).
+#   Extra keys: `pstate: mode/pen` (as protect_spec.txt, asserted by tests/protect.rs only), `attr: (row,c0)-(row,c1) fg=.. bg=.. ul=- us=.. flags=..`
+#   (esctest.rs notation: colours `i<n>`, flags `bold,...`), `xterm_screen:` / `xterm_attr:` = what a stock xterm (snapshot master, 2026-11-13) produces when it differs
+#   from the recommended row (the row's own `screen:` is the RECOMMENDATION), `xterm: identical`, `flags:` = decision | xterm-differs | xterm-quirk | xterm-extension | control.
+#   Row ids: RE DECERA, RF DECFRA, RC DECCRA, RS DECSERA, RO origin mode/margins, RG level gate, RW wide cells, RH other.
+#
+# HOW THE ROWS WERE PRODUCED  A Python model of xterm (screen.c xtermParseRect/validRect/ScrnFillRectangle/ScrnCopyRectangle/ScrnWipeRectangle, charproc.c CASE_DEC*)
+#   with the #251 planning decisions applied, byte streams run through it and rendered in render_screen notation. The model reproduces protect_spec.txt D02/D04-D07/K02/K03b
+#   exactly (RS02 etc. are byte-identical to the existing `#>` rows). NOTHING WAS RUN ON A REAL xterm; the xterm column is read from source, not observed.
+#
+# SOURCES
+#   [XT-ctl] https://invisible-island.net/xterm/ctlseqs/ctlseqs.html  DECERA `CSI Pt;Pl;Pb;Pr $ z` "VT400 and up"; DECFRA `CSI Pc;Pt;Pl;Pb;Pr $ x` "VT420 and up";
+#            DECCRA `CSI Pt;Pl;Pb;Pr;Pp;Pt;Pl;Pp $ v` "VT400 and up"; DECSERA `CSI Pt;Pl;Pb;Pr $ {`; DECSACE `CSI Ps * x` Note 1: "In both stream and rectangle modes
+#            the row- and column- positions are affected by Origin Mode". ctlseqs lists NO defaults for any of them.
+#   [XT-cp]  xterm charproc.c (ThomasDickey/xterm-snapshots master) CASE_DECCRA L5648, CASE_DECERA L5657, CASE_DECFRA L5666, CASE_DECSERA L5686: all four are gated on
+#            `screen->vtXX_level >= 4`; DECFRA additionally on `IsLatin1(value) || (value >= 256 && CharWidth(value) > 0)`; value = use_default_value(0, ' ').
+#   [XT-scr] xterm screen.c L2587-2700 minRect/maxRect, limitedParseRow/Col, xtermParseRect, validRect; ScrnFillRectangle L2681 (DECERA+DECFRA); ScrnCopyRectangle L2800;
+#            ScrnWipeRectangle L3095 (DECSERA).  ptyx.h ATTRIBUTES = SGR_MASK|SGR_MASK2|BG_COLOR|FG_COLOR|INVISIBLE|PROTECTED.
+#   [DEC-ERA] https://vt100.net/docs/vt510-rm/DECERA.html  [DEC-FRA] .../DECFRA.html  [DEC-CRA] .../DECCRA.html  [DEC-SERA] .../DECSERA.html  [DEC-SACE] .../DECSACE.html
+#   [E2]     esctest2 esctest/tests/{deccra,decera,decfra,decsera,decrectops,save_restore_cursor,scorc}.py
+#   [ADR34]  docs/adr/0034-protected-areas-and-selective-erase.md;  [LEAD] the planning decisions in the #251 issue comment (2026-11-12).
+#   DEC STD 070 (VSRM EL-00070-05, pages 5-170 DECFRA, 5-173 DECCARA, 5-175 DECRARA, 5-177 DECSACE) is not online; xterm's source comments quote it.
+#
+# WHAT THE ISSUE TEXT / EXISTING FILES GET WRONG OR LEAVE OPEN
+#   1. "gate at conformance level 4" is right: all four xterm handlers test `vtXX_level >= 4` and the VT510 pages say "VT Level 4 mode only". DECSED/DECSEL/DECSCA are NOT gated (D09 note).
+#   2. The VT510 DECCRA page's own wording is "If Pbs is greater than Pts, or Pls is greater than Prs, the terminal ignores DECCRA" (letters swapped in the manual); read it as
+#      Pts > Pbs / Pls > Prs. xterm/esctest2 agree (validRect).
+#   3. protect_spec.txt D01-D10 are correct against this model except: D10 only checks bg; D-P7 should also keep fg and SGR flags (RS10). D06 is `>   |`, D09 `>abc |` per the lead.
+#   4. protect_spec.txt trailer says "xterm's DECERA ignores protection and DECFRA/DECERA stamp the pen's PROTECTED bit": true of xterm for BOTH (xw->flags & ATTRIBUTES),
+#      but the lead decided DECERA never stamps it (RE17-RE19); only DECFRA does (RF22) -- see open question Q1.
+#   5. DECSERA row K03b is right; the issue says D01-D10 + K02/K03 DECSERA forms (K03b).
+#   6. ctlseqs gives no parameter defaults; the defaults (1,1,last,last; dest 1,1; page 1) come ONLY from the VT510 pages and are what xterm implements.
+#
+# XTERM vs DEC DIFFERENCES THAT THESE ROWS FIX A SIDE ON (all marked `xterm-differs`)
+#   X1 DECERA with a default pen: DEC "erases ... visual attributes" (blank); xterm keeps the cell's old colours (keepColors=True) and stamps the pen's bold/underline/PROTECTED. RE17-RE19.
+#   X2 DECOM + omitted rectangle parameter: xterm passes the already-absolute default through limitedParseRow/Col which adds the margin again (default top becomes top_marg*2+1).
+#      Real xterm bug (affects DECERA/DECFRA/DECSERA/DECCRA source+dest). RO03, RO09. [LEAD]: no double count.
+#   X3 DECFRA with a wide Pch: xterm writes the wide codepoint into single cells without spacers (corrupt line). RF14.
+#   X4 DECCRA/DECFRA/DECERA at a wide-char edge: xterm's source copy carries a raw HIDDEN_CHAR spacer to the destination (orphan); erase/fill blank both halves. RW07.
+#   X5 DECCRA in DECOM: xterm clips the DESTINATION to the origin region (margin box); the DEC text says it clips "off-page data" (the page). RO10, RO11.
+#   X6 DECFRA Pch 128-159: xterm accepts them when c1_printable is set; Tessera has no such option. RF09.
+#   X7 DECSERA with ISO (SPA/EPA) protection: xterm erases (mode != DEC_PROTECT); ED/EL/ECH/DECSED/DECSEL honour it. Not a DEC/xterm difference but the one DECSERA oddity. RS07.
+#
+# OTHER EMULATORS (not row-tested)  iTerm2: none of DECERA/DECFRA/DECCRA/DECSERA implemented except as no-ops (esctest2 knownBug "Not implemented", some "Erase fills rather than clears").
+#   kitty: not implemented. Alacritty: not implemented. WezTerm: parses, no rectangle ops. VTE: DECERA/DECFRA/DECCRA/DECSERA implemented partially (no DECSERA protection), not authoritative.
+#   (from esctest2 knownBug annotations and prior #95 research; kitty/Alacritty/WezTerm not re-fetched for this issue.)
+#
+# OPEN QUESTIONS (details at the end of the file; each has the recommended row already in place)
+#   Q1 DECFRA stamps the pen's PROTECTED bit (RF22; xterm does; DEC silent) -- changes the ADR 0034 "blank cells never carry the bit" sentence.
+#   Q2 DECCRA in DECOM: clip the destination to the origin region (xterm, RO10/RO11) or only to the page (DEC text)?
+#   Q3 DECCRA/DECERA/DECSERA and OSC 8 hyperlinks on cells (no xterm precedent): see Q3 in the closing section.
+#   Q4 DECFRA Pch U+FFFF (parameter saturation) and charset mapping of Pch via GL/GR (RF17, RF25).
+#   Q5 The `CSI * x` DECSACE sequence: not needed for #251 (RH01); DECCARA/DECRARA are out of scope.
+# =============================================================================
+
+# ============================================================================================================
+# A. DECERA  CSI Pt;Pl;Pb;Pr $ z   (level >= 4; esctest2 decera.py -> decrectops.py FillRectangleTests)
+# ============================================================================================================
+### RE01_decera_explicit_rect
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[2;2;3;4$z
+cite: [XT-ctl] DECERA CSI Pt;Pl;Pb;Pr $ z; [DEC-ERA] rows 2-3, columns 2-4 replaced by spaces; [E2] decrectops.py fillRectangle_basic
+screen:
+>a|bcde
+>f   j
+>k   o
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RE02_decera_default_is_whole_page
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[$z
+cite: [DEC-ERA] defaults Pt=1 Pl=1 Pb=last line Pr=last column; [XT-scr] xtermParseRect LimitedParse -> minRect/maxRect; [E2] fillRectangle_defaultArgs
+note: `CSI $ z` with no digits is the all-default form.
+screen:
+> |
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RE03_decera_zero_params_are_defaults
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[0;0;0;0$z
+cite: [XT-scr] LimitedParse uses a parameter only when `params[n] > 0`: 0 is the default, same as omitted; [DEC] 'Pt = 1' defaults
+note: Contrast DECSTBM-like clamping: a 0 is not clamped to 1, it is 'default' (matters for Pb/Pr where the default is the LAST line/column).
+screen:
+> |
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RE04_decera_partial_defaults
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[3;;;4$z
+cite: [XT-scr] each of the four defaults independently: Pl=1, Pb=last line; [DEC-ERA] defaults per parameter
+note: top 3, left default 1, bottom default 4, right 4: rows 3-4, columns 1-4.
+screen:
+>a|bcde
+>fghij
+>    o
+>    t
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RE05_decera_single_cell
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[2;3;2;3$z
+cite: [XT-scr] validRect top<=bottom, left<=right; equal is valid
+screen:
+>a|bcde
+>fg ij
+>klmno
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RE06_decera_invalid_rect_does_nothing
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[3;3;2;2$z
+cite: [DEC-ERA] 'Pt must be less than or equal to Pb ... Pl <= Pr' (the terminal ignores); [XT-scr] validRect fails -> no-op; [E2] fillRectangle_invalidRectDoesNothing
+note: Only top>bottom or left>right AFTER clamping is invalid. Cursor, pen and screen untouched.
+screen:
+>a|bcde
+>fghij
+>klmno
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RE07_decera_top_gt_bottom_only
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[3;1;2;5$z
+cite: [XT-scr] validRect top<=bottom
+note: columns fine, rows reversed: no-op.
+screen:
+>a|bcde
+>fghij
+>klmno
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RE08_decera_left_gt_right_only
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[1;4;4;2$z
+cite: [XT-scr] validRect left<=right
+note: no-op.
+screen:
+>a|bcde
+>fghij
+>klmno
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RE09_decera_clamps_overlarge_rect
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[2;2;99;99$z
+cite: [DEC-ERA] 'If the value of Pt, Pl, Pb, or Pr exceeds the width or height of the active page, the value is treated as the width or height'; [XT-scr] limitedParseRow/Col clamp; [E2] fillRectangle_overlyLargeSourceClippedToScreenSize
+screen:
+>a|bcde
+>f
+>k
+>p
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RE10_decera_start_beyond_screen_is_clamped_not_invalid
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[9;9;9;9$z
+cite: [XT-scr] the clamp runs BEFORE validRect, so Pt=Pb=Pl=Pr=9 become the bottom-right cell and that cell IS erased; [DEC-ERA] 'treated as the width or height'
+note: Surprising but follows both texts: out-of-range is clamped, not rejected. esctest2 overlyLargeSource depends on it (starting row = height, ending height+1).
+screen:
+>a|bcde
+>fghij
+>klmno
+>pqrs
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RE11_decera_param_saturation
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[1;1;99999999999;99999999999$z
+cite: [XT-scr] parameters saturate (xterm MAX_I_PARAM 65535) then clamp; csi_spec.txt PARSER FACTS: 99999999999 -> 65535; docs/security.md bounds
+note: no u16 overflow, no allocation proportional to the value.
+screen:
+> |
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RE12_decera_extra_params_ignored
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[1;1;2;2;9;9$z
+cite: [XT-cp] CASE_DECERA ParamPair(0) -> xtermParseRect reads params 0-3 only; [DEC-ERA] four parameters
+note: Recommendation: params 5+ are ignored (xterm), not a reason to void the sequence.
+screen:
+> | cde
+>  hij
+>klmno
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RE13_decera_colon_subparam_voids
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[1:2;1;1;3$z
+cite: [LEAD #251 comment] 'a colon sub-parameter voids the sequence'; csi.rs voided_by_subparams (xterm ParseSGR-only colon support)
+note: the sequence is dropped whole; no partial erase.
+screen:
+>a|bcde
+>fghij
+>klmno
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RE14_decera_private_marker_is_not_decera
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[?1;1;1;3$z
+cite: [XT-cp] sparse table: `CSI ? ... $ z` is not DECERA; csi.rs: every intermediate-bearing CSI is a different function
+note: `?` arrives as an intermediate byte, so the dispatch key is (`?$`, z), not (`$`, z).
+screen:
+>a|bcde
+>fghij
+>klmno
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: control
+### RE15_decera_ignores_protection_dec
+size: 4x5
+step: feed \e[1"qabcde\e[0"q\e[H\e[1;1;1;5$z
+cite: [XT-scr] ScrnFillRectangle never tests PROTECTED (only ScrnWipeRectangle does); [DEC-ERA] page does not mention protection; DECERA 'erases character values and visual attributes'
+note: DECERA erases protected cells; protection mode stays dec (pstate dec/0).
+screen:
+> |
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: dec/0
+flags: decision
+### RE16_decera_ignores_iso_protection
+size: 4x5
+step: feed \eVabc\eWde\e[H\e[1;1;1;5$z
+cite: [XT-scr] ScrnFillRectangle ignores PROTECTED; ISO guarded areas likewise
+screen:
+> |
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: iso/0
+flags: decision
+### RE17_decera_blank_takes_pen_background
+size: 3x6
+step: feed \e[41mabc\e[0m\e[44m\e[H\e[1;1;1;3$z\e[0m
+cite: [LEAD #251 comment] 'DECERA blank = pen background only, never PROTECTED'; [DEC-ERA] 'erases character values and visual attributes' (blank is attribute-free); [XT-scr] ScrnFillRectangle keepColors=True: pen colour pair applied only when the pen has a colour
+note: BCE-style erase with the pen background (as ED/EL/ECH). Row also sets bg red first so a 'keep old colour' implementation is caught.
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+attr: (0,0)-(0,2) fg=- bg=i4 ul=- us=none flags=-
+xterm: identical
+### RE18_decera_default_pen_clears_old_colour
+size: 3x6
+step: feed \e[41;1mabc\e[0m\e[H\e[1;1;1;3$z
+cite: [DEC-ERA] 'erases ... visual attributes'; [LEAD] pen background only; [XT-scr] ScrnFillRectangle: with a default pen xterm KEEPS the cell's old colour (keepColors=True) and stamps the pen's SGR flags
+note: THE xterm/DEC difference for DECERA: DEC says attributes are erased -> default blank; xterm leaves the old bg red. Recommendation: DEC (bg=-, flags=-).
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+attr: (0,0)-(0,2) fg=- bg=- ul=- us=none flags=-
+xterm_screen:
+> |
+>
+>
+xterm_attr: (0,0)-(0,2) fg=- bg=i1 ul=- us=none flags=-
+flags: decision xterm-differs
+### RE19_decera_pen_sgr_not_stamped
+size: 3x6
+step: feed \e[1;4mabc\e[H\e[1;1;1;3$z\e[0m
+cite: [LEAD] 'pen background only'; [XT-scr] xterm stamps pen BOLD/UNDERLINE onto the blank (ld->attribs = flags & ATTRIBUTES): an underlined blank would draw
+note: Pen is still bold+underline when the erase runs: the blanks must be plain.
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+attr: (0,0)-(0,2) fg=- bg=- ul=- us=none flags=-
+xterm_screen:
+> |
+>
+>
+xterm_attr: (0,0)-(0,2) fg=- bg=- ul=- us=single flags=bold
+flags: decision xterm-differs
+### RE20_decera_cursor_and_pen_untouched
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[3;3H\e[1m\e[1;1;2;2$z
+cite: [DEC-ERA] 'does not change the active cursor position'; [E2] fillRectangle_cursorDoesNotMove
+note: cursor (2,2); pen bold stays (a following print is bold).
+screen:
+>  cde
+>  hij
+>klm|no
+>pqrst
+cursor: (2,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RE21_decera_leaves_pending_wrap
+size: 2x5
+step: feed abcde\e[1;1;1;1$zX
+cite: [XT-scr] ScrnFillRectangle neither calls ResetWrap nor moves the cursor; [DEC-ERA] cursor unchanged
+note: pending wrap survives: X lands on row 2, row 1 stays marked wrapped (`\`). Wrapped flag/marks are not touched ([LEAD]).
+screen:
+> bcde\
+>X |
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RE22_decera_keeps_wrapped_flag
+size: 2x5
+step: feed abcdefg\e[H\e[1;1;2;5$z
+cite: [LEAD] 'wrapped flag, marks and pending wrap untouched'; [XT-scr] no LINEWRAPPED change
+note: row 1 shows the soft-wrap marker `\` although it is blank.
+screen:
+> |\
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+
+# ============================================================================================================
+# B. DECFRA  CSI Pch;Pt;Pl;Pb;Pr $ x   (level >= 4; esctest2 decfra.py)
+# ============================================================================================================
+### RF01_decfra_basic
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[37;2;2;3;4$x
+cite: [XT-ctl] DECFRA CSI Pc;Pt;Pl;Pb;Pr $ x; [DEC-FRA] Pch decimal; [E2] decfra.py (CHARACTER '%' = 37) fillRectangle_basic
+screen:
+>a|bcde
+>f%%%j
+>k%%%o
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RF02_decfra_defaults_fill_whole_page
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[37$x
+cite: [DEC-FRA] rect defaults; [XT-cp] CASE_DECFRA ParamPair(1); [E2] fillRectangle_defaultArgs
+screen:
+>%|%%%%
+>%%%%%
+>%%%%%
+>%%%%%
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RF03_decfra_pch_absent_is_space
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[;2;2;3;4$x
+cite: [XT-cp] CASE_DECFRA `use_default_value(0, ' ')`: absent/0 -> space; [DEC-FRA] range 32..126 includes 32
+note: Pch omitted fills spaces (with the pen's attributes: contrast DECERA).
+screen:
+>a|bcde
+>f   j
+>k   o
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RF04_decfra_pch_zero_is_space
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[0;2;2;3;4$x
+cite: [XT-cp] use_default_value: <= 0 -> default 32
+screen:
+>a|bcde
+>f   j
+>k   o
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RF05_decfra_pch_31_ignored
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[31;2;2;3;4$x
+cite: [DEC-FRA] 'If Pch is not in [32-126, 160-255], the terminal ignores DECFRA'; [XT-cp] IsLatin1 false -> whole op skipped
+screen:
+>a|bcde
+>fghij
+>klmno
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RF06_decfra_pch_32_ok
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[32;1;1;1;2$x
+cite: [DEC-FRA] 32 is the first valid value (space)
+screen:
+> | cde
+>fghij
+>klmno
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RF07_decfra_pch_126_ok
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[126;1;1;1;2$x
+cite: [DEC-FRA] 126 '~' last GL value
+screen:
+>~|~cde
+>fghij
+>klmno
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RF08_decfra_pch_127_ignored
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[127;1;1;1;2$x
+cite: [DEC-FRA] range ends at 126; [XT-cp] IsAscii1 is 32..126, Upper8Bits 160
+note: DEL: no-op.
+screen:
+>a|bcde
+>fghij
+>klmno
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RF09_decfra_pch_159_ignored
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[159;1;1;1;2$x
+cite: [XT-cp] Upper8Bits = c1_printable ? 128 : 160 (c1_printable off by default); [DEC-FRA] 160..255
+note: Tessera has no c1_printable: 128..159 always ignored.
+screen:
+>a|bcde
+>fghij
+>klmno
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RF10_decfra_pch_160_latin1
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[160;1;1;1;2$x
+cite: [DEC-FRA] 160-255 'from the current GR table'; [XT-cp] IsLatin1 -> filled as Latin-1 codepoint (default GR = ISO Latin-1)
+note: U+00A0 (NBSP). Recommendation: default GR is Latin-1 so Pch maps to U+0080+Pch-128; a row with a different GR designation is out of scope.
+screen:
+> | cde
+>fghij
+>klmno
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RF11_decfra_pch_233_e_acute
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[233;1;1;1;2$x
+cite: [DEC-FRA] 160..255; [XT-cp] IsLatin1
+note: U+00E9.
+screen:
+>é|écde
+>fghij
+>klmno
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RF12_decfra_pch_255
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[255;1;1;1;2$x
+cite: [DEC-FRA] 255 is the last valid GR value; U+00FF
+screen:
+>ÿ|ÿcde
+>fghij
+>klmno
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RF13_decfra_pch_256_width1
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[8364;1;1;1;2$x
+cite: [XT-cp] `(value >= 256 && CharWidth(value) > 0)`: xterm accepts printable Unicode (DEC STD 070 p.5-170 says ASCII or Latin-1 only); [LEAD] '>= 256 only if width 1'
+note: U+20AC.
+screen:
+>€|€cde
+>fghij
+>klmno
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision xterm-extension
+### RF14_decfra_pch_wide_ignored
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[20013;1;1;1;2$x
+cite: [LEAD] '>= 256 only if width 1'; [XT-cp] would fill wide U+4E2D into single cells (corrupts the line: no HIDDEN_CHAR spacers)
+note: width-2 fill character is ignored whole: nothing changes.
+screen:
+>a|bcde
+>fghij
+>klmno
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision xterm-differs
+### RF15_decfra_pch_combining_ignored
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[768;1;1;1;2$x
+cite: [XT-cp] CharWidth(0x300) == 0 -> skipped; [LEAD] width 1 only
+screen:
+>a|bcde
+>fghij
+>klmno
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RF16_decfra_pch_surrogate_ignored
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[55296;1;1;1;2$x
+cite: [LEAD] only valid width-1 scalars; U+D800 is not a scalar value
+screen:
+>a|bcde
+>fghij
+>klmno
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RF17_decfra_pch_saturated_65535
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[99999999;1;1;1;2$x
+cite: csi_spec.txt PARSER FACTS: parameters saturate at 65535 -> U+FFFF (noncharacter)
+note: U+FFFF is a Unicode noncharacter. Decided (lead Q4): ignored, the screen is unchanged; the xterm model fills because it only checks the width.
+xterm_screen:
+>￿|￿cde
+>fghij
+>klmno
+>pqrst
+screen:
+>a|bcde
+>fghij
+>klmno
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RF18_decfra_invalid_rect_does_nothing
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[37;3;3;2;2$x
+cite: [DEC-FRA] Pt<=Pb, Pl<=Pr; [E2] fillRectangle_invalidRectDoesNothing
+screen:
+>a|bcde
+>fghij
+>klmno
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RF19_decfra_clamps
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[37;2;2;99;99$x
+cite: [DEC-FRA] 'treated as the width or height'; [E2] fillRectangle_overlyLargeSourceClippedToScreenSize
+screen:
+>a|bcde
+>f%%%%
+>k%%%%
+>p%%%%
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RF20_decfra_takes_pen_style
+size: 3x6
+step: feed abc\e[1;31;44m\e[H\e[88;1;1;1;3$x\e[0m
+cite: [DEC-FRA] 'The fill character assumes the visual character attributes set by the last SGR'; [XT-scr] ScrnFillRectangle(flags = xw->flags, keepColors=True) applies pen flags and colours; [LEAD] 'DECFRA takes the full pen style'
+note: fg red, bg blue, bold.
+screen:
+>X|XX
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+attr: (0,0)-(0,2) fg=i1 bg=i4 ul=- us=none flags=bold
+xterm: identical
+### RF21_decfra_default_pen_keeps_old_colour_in_xterm
+size: 3x6
+step: feed \e[41mabc\e[0m\e[H\e[88;1;1;1;3$x
+cite: [LEAD] 'full pen style' = the pen as it is, so a default pen gives default colours; [XT-scr] xterm keeps the old bg when the pen has no colour (keepColors)
+note: Same xterm quirk as RE18; recommendation: the cell gets exactly the pen (bg=-).
+screen:
+>X|XX
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+attr: (0,0)-(0,2) fg=- bg=- ul=- us=none flags=-
+xterm_screen:
+>X|XX
+>
+>
+xterm_attr: (0,0)-(0,2) fg=- bg=i1 ul=- us=none flags=-
+flags: decision xterm-differs
+### RF22_decfra_stamps_protected_bit_then_decsera_keeps_it
+size: 3x6
+step: feed abc\e[1"q\e[H\e[88;1;1;1;3$x\e[0"q\e[1;1;1;6${
+cite: [XT-scr] ScrnFillRectangle attrs = xw->flags & ATTRIBUTES, and ATTRIBUTES includes PROTECTED -> the filled cells are protected (xterm); DEC-FRA 'assumes the visual attributes' says nothing about protection; ADR 0034 'printing copies the pen bit'
+note: DECFRA is a print-like write, so it copies the pen's PROTECTED bit: DECSERA (dec mode) leaves XXX. OPEN QUESTION for the lead (DECERA never stamps it, DECFRA does).
+screen:
+>X|XX
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: dec/0
+flags: decision
+### RF23_decfra_ignores_protection
+size: 3x6
+step: feed \e[1"qabc\e[0"q\e[H\e[88;1;1;1;3$x
+cite: [XT-scr] ScrnFillRectangle has no IsProtected test; [DEC-FRA] page silent
+note: protected cells are overwritten.
+screen:
+>X|XX
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: dec/0
+flags: decision
+### RF24_decfra_cursor_untouched
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[3;3H\e[37;1;1;2;2$x
+cite: [DEC-FRA] 'does not change the active cursor position'; [E2] fillRectangle_cursorDoesNotMove
+screen:
+>%%cde
+>%%hij
+>klm|no
+>pqrst
+cursor: (2,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RF25_decfra_uses_gl_charset
+size: 3x6
+step: feed \e(0\e[H\e[113;1;1;1;3$x\e(B
+cite: [DEC-FRA] 'The decimal value refers to the character in the current GL or GR in-use table'; [XT-cp] ScrnFillRectangle `charset != nrc_ASCII` -> xtermCharSetOut
+note: With DEC Special Graphics in G0, Pch 113 fills U+2500 as printing 'q' would. Open: implement (recommended, cheap with the existing charset module) or fill raw 'q'.
+screen:
+>─|──
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RF26_decfra_missing_params_after_pch_default_rect
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[37;2$x
+cite: [XT-cp] ParamPair(1): missing Pl/Pb/Pr default; Pt=2 given
+note: rows 2-4, all columns.
+screen:
+>a|bcde
+>%%%%%
+>%%%%%
+>%%%%%
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+
+# ============================================================================================================
+# C. DECCRA  CSI Pts;Pls;Pbs;Prs;Pps;Ptd;Pld;Ppd $ v   (level >= 4; esctest2 deccra.py; 8x8 screen A8)
+# ============================================================================================================
+### RC01_deccra_nonoverlapping
+size: 8x8
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyz012345\r\nABCDEFGH\r\nIJKLMNOP\r\nQRSTUVWX\r\nYZ6789!@\e[H\e[2;2;4;4;1;5;5;1$v
+cite: [XT-ctl] DECCRA; [E2] deccra.py test_DECCRA_nonOverlappingSourceAndDest; [DEC-CRA] copied text retains values and attributes
+screen:
+>a|bcdefgh
+>ijklmnop
+>qrstuvwx
+>yz012345
+>ABCDjklH
+>IJKLrstP
+>QRSTz01X
+>YZ6789!@
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RC02_deccra_overlap_down_right
+size: 8x8
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyz012345\r\nABCDEFGH\r\nIJKLMNOP\r\nQRSTUVWX\r\nYZ6789!@\e[H\e[2;2;4;4;1;3;3;1$v
+cite: [E2] test_DECCRA_overlappingSourceAndDest; [XT-scr] ScrnCopyRectangle 'make a local copy of the source rectangle first' = memmove semantics; [DEC-CRA] page silent on overlap
+note: Result must equal copying from a snapshot, NOT a naive forward copy (that would smear j,k).
+screen:
+>a|bcdefgh
+>ijklmnop
+>qrjklvwx
+>yzrst345
+>ABz01FGH
+>IJKLMNOP
+>QRSTUVWX
+>YZ6789!@
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RC03_deccra_overlap_up_left
+size: 8x8
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyz012345\r\nABCDEFGH\r\nIJKLMNOP\r\nQRSTUVWX\r\nYZ6789!@\e[H\e[3;3;5;5;1;2;2;1$v
+cite: [XT-scr] same snapshot rule, opposite direction (the esctest2 case only covers down-right)
+note: A naive backward-only copy would also fail the down-right case, so both directions are rows.
+screen:
+>a|bcdefgh
+>istumnop
+>q012uvwx
+>yCDE2345
+>ABCDEFGH
+>IJKLMNOP
+>QRSTUVWX
+>YZ6789!@
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RC04_deccra_overlap_same_row_shift_right_by_1
+size: 8x8
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyz012345\r\nABCDEFGH\r\nIJKLMNOP\r\nQRSTUVWX\r\nYZ6789!@\e[H\e[1;1;1;4;1;1;2;1$v
+cite: [XT-scr] snapshot rule in one row: abcd -> aabcd
+screen:
+>a|abcdfgh
+>ijklmnop
+>qrstuvwx
+>yz012345
+>ABCDEFGH
+>IJKLMNOP
+>QRSTUVWX
+>YZ6789!@
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RC05_deccra_identity_copy
+size: 8x8
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyz012345\r\nABCDEFGH\r\nIJKLMNOP\r\nQRSTUVWX\r\nYZ6789!@\e[H\e[2;2;4;4;1;2;2;1$v
+cite: [XT-scr] source == destination: no change
+screen:
+>a|bcdefgh
+>ijklmnop
+>qrstuvwx
+>yz012345
+>ABCDEFGH
+>IJKLMNOP
+>QRSTUVWX
+>YZ6789!@
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: control
+### RC06_deccra_dest_partially_offscreen_clipped
+size: 8x8
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyz012345\r\nABCDEFGH\r\nIJKLMNOP\r\nQRSTUVWX\r\nYZ6789!@\e[H\e[2;2;4;4;1;7;7;1$v
+cite: [DEC-CRA] 'If the destination area is partially off the page, then DECCRA clips the off-page data'; [E2] test_DECCRA_destinationPartiallyOffscreen (expects jk/rs at the last 2x2)
+screen:
+>a|bcdefgh
+>ijklmnop
+>qrstuvwx
+>yz012345
+>ABCDEFGH
+>IJKLMNOP
+>QRSTUVjk
+>YZ6789rs
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RC07_deccra_dest_beyond_screen_clamped_to_last_cell
+size: 8x8
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyz012345\r\nABCDEFGH\r\nIJKLMNOP\r\nQRSTUVWX\r\nYZ6789!@\e[H\e[2;2;4;4;1;99;99;1$v
+cite: [XT-scr] the destination row/column goes through limitedParseRow/Col, so 99 clamps to the last cell and one cell ('j') is copied; [DEC-CRA] size limits 'treated as the width or height'
+note: Consequence of clamping rather than rejecting: Ptd/Pld beyond the page behave as the last row/column.
+screen:
+>a|bcdefgh
+>ijklmnop
+>qrstuvwx
+>yz012345
+>ABCDEFGH
+>IJKLMNOP
+>QRSTUVWX
+>YZ6789!j
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RC08_deccra_default_source_values
+size: 8x8
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyz012345\r\nABCDEFGH\r\nIJKLMNOP\r\nQRSTUVWX\r\nYZ6789!@\e[H\e[;;2;2;;5;5$v
+cite: [E2] test_DECCRA_defaultValuesInSource (source_top/left default 1); [DEC-CRA] 'Default: Pts = 1 Pls = 1'
+screen:
+>a|bcdefgh
+>ijklmnop
+>qrstuvwx
+>yz012345
+>ABCDabGH
+>IJKLijOP
+>QRSTUVWX
+>YZ6789!@
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RC09_deccra_default_dest_is_top_left
+size: 8x8
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyz012345\r\nABCDEFGH\r\nIJKLMNOP\r\nQRSTUVWX\r\nYZ6789!@\e[H\e[2;2;4;4$v
+cite: [E2] test_DECCRA_defaultValuesInDest (dest defaults 1,1); [DEC-CRA] 'Default: Ptd = 1 / Pld = 1 / Ppd = 1'
+screen:
+>j|kldefgh
+>rstlmnop
+>z01tuvwx
+>yz012345
+>ABCDEFGH
+>IJKLMNOP
+>QRSTUVWX
+>YZ6789!@
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RC10_deccra_default_source_bottom_right_is_last
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[2;2;;;;1;1$v
+cite: [DEC-CRA] 'Default: Pbs = the last line of the page; Prs = the last column'
+note: source rows 2-4 x columns 2-5 copied to (1,1); clipped at the page edge is not needed (3x4 fits).
+screen:
+>g|hije
+>lmnoj
+>qrsto
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RC11_deccra_invalid_source_does_nothing
+size: 8x8
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyz012345\r\nABCDEFGH\r\nIJKLMNOP\r\nQRSTUVWX\r\nYZ6789!@\e[H\e[2;2;1;1;1;5;5;1$v
+cite: [DEC-CRA] 'If Pbs is greater than Pts, or Pls is greater than Prs, the terminal ignores DECCRA' (sic: reversed); [E2] test_DECCRA_invalidSourceRectDoesNothing; [XT-scr] validRect(source)
+screen:
+>a|bcdefgh
+>ijklmnop
+>qrstuvwx
+>yz012345
+>ABCDEFGH
+>IJKLMNOP
+>QRSTUVWX
+>YZ6789!@
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RC12_deccra_overlarge_source_clipped
+size: 4x5
+step: feed \e[3;4Hab\e[4;4HcX\e[H\e[4;5;5;6;1;3;4;1$v
+cite: [E2] test_DECCRA_overlyLargeSourceClippedToScreenSize: the source clamps to the 1x1 cell at the corner, and the destination is the CLAMPED source's size; [XT-scr] high/wide from the clamped rectangle
+note: X (bottom-right) is copied onto 'a'; b and c unchanged -> `Xb` / `cX`.
+screen:
+> |
+>
+>   Xb
+>   cX
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RC13_deccra_page_params_ignored
+size: 8x8
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyz012345\r\nABCDEFGH\r\nIJKLMNOP\r\nQRSTUVWX\r\nYZ6789!@\e[H\e[2;2;4;4;2;5;5;3$v
+cite: [XT-scr] ScrnCopyRectangle 'This implementation ignores page numbers'; [DEC-CRA] 'If a page value exceeds the number of pages available ... treated as the last available page' (one page => page 1); [LEAD] page parameters accepted and ignored
+note: Pps=2, Ppd=3 behave as page 1. Same result as RC01.
+screen:
+>a|bcdefgh
+>ijklmnop
+>qrstuvwx
+>yz012345
+>ABCDjklH
+>IJKLrstP
+>QRSTz01X
+>YZ6789!@
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RC14_deccra_page_params_zero_and_absent
+size: 8x8
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyz012345\r\nABCDEFGH\r\nIJKLMNOP\r\nQRSTUVWX\r\nYZ6789!@\e[H\e[2;2;4;4;0;5;5;0$v
+cite: [XT-cp] zero == default == page 1; [DEC-CRA] 'Default: Pps = 1'
+note: Same result as RC01.
+screen:
+>a|bcdefgh
+>ijklmnop
+>qrstuvwx
+>yz012345
+>ABCDjklH
+>IJKLrstP
+>QRSTz01X
+>YZ6789!@
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RC15_deccra_short_form_without_page_params
+size: 8x8
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyz012345\r\nABCDEFGH\r\nIJKLMNOP\r\nQRSTUVWX\r\nYZ6789!@\e[H\e[2;2;4;4;;5;5$v
+cite: [XT-scr] ParamPair(5) reads the destination at indices 5,6; the page slots may be empty/absent
+note: Same result as RC01.
+screen:
+>a|bcdefgh
+>ijklmnop
+>qrstuvwx
+>yz012345
+>ABCDjklH
+>IJKLrstP
+>QRSTz01X
+>YZ6789!@
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RC16_deccra_extra_params_ignored
+size: 8x8
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyz012345\r\nABCDEFGH\r\nIJKLMNOP\r\nQRSTUVWX\r\nYZ6789!@\e[H\e[2;2;4;4;1;5;5;1;9;9$v
+cite: [XT-cp] CASE_DECCRA ParamPair(0)/(5): params beyond index 7 ignored
+note: Same result as RC01.
+screen:
+>a|bcdefgh
+>ijklmnop
+>qrstuvwx
+>yz012345
+>ABCDjklH
+>IJKLrstP
+>QRSTz01X
+>YZ6789!@
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RC17_deccra_copies_attributes
+size: 3x8
+step: feed \e[1;4;31;44mab\e[0mc\e[H\e[1;1;1;2;1;2;5;1$v
+cite: [DEC-CRA] 'The copied text retains its character values and attributes'; [XT-scr] saveCellData/restoreCellData copy attribs + colours
+note: dest cells 2;5-6 carry bold, underline, fg red, bg blue.
+screen:
+>a|bc
+>    ab
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+attr: (1,4)-(1,5) fg=i1 bg=i4 ul=- us=single flags=bold
+### RC18_deccra_copies_protected_bit
+size: 3x8
+step: feed \e[1"qab\e[0"qcd\e[H\e[1;1;1;2;1;2;1;1$v\e[2;1;2;8${
+cite: [XT-scr] saveCellData copies attribs including PROTECTED; ADR 0034 'the bit travels with the cell through DCH/ICH/IL/DL/scroll/reflow'
+note: the copy at row 2 is protected: DECSERA over the whole row leaves 'ab'.
+screen:
+>a|bcd
+>ab
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: dec/0
+flags: decision
+### RC19_deccra_copies_blank_cells
+size: 3x8
+step: feed abcdef\e[H\e[2;2;2;5;1;1;1;1$v
+cite: [DEC-CRA] copies cells, including blanks (no 'unoccupied cell' rule); [XT-scr] restoreCellData copies the cell as is
+note: row 2 is empty: copying it onto row 1 erases the start of row 1.
+screen:
+> |   ef
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RC20_deccra_cursor_untouched
+size: 8x8
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyz012345\r\nABCDEFGH\r\nIJKLMNOP\r\nQRSTUVWX\r\nYZ6789!@\e[H\e[3;4H\e[2;2;4;4;1;5;5;1$v
+cite: [DEC-CRA] 'does not change the active cursor position'; [E2] test_DECCRA_cursorDoesNotMove
+screen:
+>abcdefgh
+>ijklmnop
+>qrst|uvwx
+>yz012345
+>ABCDjklH
+>IJKLrstP
+>QRSTz01X
+>YZ6789!@
+cursor: (2,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RC21_deccra_leaves_pending_wrap
+size: 2x5
+step: feed abcde\e[1;1;1;2;1;2;3;1$vX
+cite: [XT-scr] no ResetWrap; cursor unmoved
+note: X wraps to row 2.
+screen:
+>abcde\
+>X |ab
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RC22_deccra_ignores_margins_when_decom_off
+size: 8x8
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyz012345\r\nABCDEFGH\r\nIJKLMNOP\r\nQRSTUVWX\r\nYZ6789!@\e[H\e[?69h\e[3;6s\e[3;6r\e[2;2;4;4;1;5;5;1$v\e[?69l\e[r
+cite: [DEC-CRA] 'DECCRA is not affected by the page margins'; [E2] test_DECCRA_ignoresMargins (same expectation as RC01)
+note: Same cells as RC01; margins reset afterwards.
+screen:
+>a|bcdefgh
+>ijklmnop
+>qrstuvwx
+>yz012345
+>ABCDjklH
+>IJKLrstP
+>QRSTz01X
+>YZ6789!@
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+
+# ============================================================================================================
+# D. DECSERA  CSI Pt;Pl;Pb;Pr $ {   (D01-D10, K02, K03b from protect_spec.txt; see that file's #> block)
+# ============================================================================================================
+### RS01_decsera_default_rect_whole_page
+size: 4x5
+step: feed \e[1"qaaaaa\r\n\e[0"qbbbbb\r\n\e[1"qccccc\r\n\e[0"qddddd\e[0"q\e[2;3H\e[${
+cite: [ex D01] [E2] decsera.py; [DEC-SERA] defaults; [XT-scr] ScrnWipeRectangle skips PROTECTED iff protected_mode == DEC_PROTECT
+note: odd rows protected: rows 1 and 3 stay.
+screen:
+>aaaaa
+>   |
+>ccccc
+>
+cursor: (1,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: dec/0
+### RS02_decsera_explicit_rect
+size: 4x5
+step: feed \e[1"qaaaaa\r\n\e[0"qbbbbb\r\n\e[1"qccccc\r\n\e[0"qddddd\e[0"q\e[2;3H\e[2;2;4;4${
+cite: [ex D02] [E2] decsera.py basic
+screen:
+>aaaaa
+>b  | b
+>ccccc
+>d   d
+cursor: (1,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: dec/0
+### RS03_decsera_invalid_rect
+size: 4x5
+step: feed \e[1"qaaaaa\r\n\e[0"qbbbbb\r\n\e[1"qccccc\r\n\e[0"qddddd\e[0"q\e[2;3H\e[3;3;2;2${
+cite: [ex D03] [XT-scr] validRect
+screen:
+>aaaaa
+>bbb|bb
+>ccccc
+>ddddd
+cursor: (1,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: dec/0
+### RS04_decsera_origin_mode
+size: 4x5
+step: feed \e[1"qaaaaa\r\n\e[0"qbbbbb\r\n\e[1"qccccc\r\n\e[0"qddddd\e[0"q\e[2;3H\e[2;4r\e[?6h\e[1;1;1;5${
+cite: [ex D04] [XT-scr] limitedParseRow adds top_marg
+note: the pre-existing D04 expects cursor (1,0) because DECOM/DECSTBM home it.
+screen:
+>aaaaa
+> |
+>ccccc
+>ddddd
+cursor: (1,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: dec/0
+### RS05_decsera_clips_overlarge
+size: 4x5
+step: feed \e[1"qaaaaa\r\n\e[0"qbbbbb\r\n\e[1"qccccc\r\n\e[0"qddddd\e[0"q\e[2;3H\e[2;2;99;99${
+cite: [ex D05]
+screen:
+>aaaaa
+>b  |
+>ccccc
+>d
+cursor: (1,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: dec/0
+### RS06_decsera_ignores_lr_margins
+size: 4x5
+step: feed \e[1"qaaaaa\r\n\e[0"qbbbbb\r\n\e[1"qccccc\r\n\e[0"qddddd\e[0"q\e[2;3H\e[?69h\e[2;3s\e[2;3H\e[2;1;2;5${\e[?69l
+cite: [ex D06] note: the cursor ends at (1,2)
+screen:
+>aaaaa
+>   |
+>ccccc
+>ddddd
+cursor: (1,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: dec/0
+### RS07_decsera_ignores_iso_protection
+size: 3x10
+step: feed a\eVb\eW\e[1;1;1;2${
+cite: [ex D07] [XT-scr] IsProtected requires DEC_PROTECT; [ADR34 + #251 comment correction 1] ISO (SPA/EPA) does NOT protect against DECSERA
+screen:
+>   |
+>
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: iso/0
+flags: xterm-quirk decision
+### RS08_decsera_no_protection_blanks
+size: 3x10
+step: feed abc\e[1;1;1;3${
+cite: [ex D08] [XT-scr] mode off -> IsProtected false
+screen:
+>    |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: control
+### RS09_decsera_below_level_4_ignored
+size: 3x10
+step: feed abc\e[62"p\e[1;1;1;3${
+cite: [ex D09] [XT-cp] CASE_DECSERA `vtXX_level >= 4`
+screen:
+>abc |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RS10_decsera_keeps_colour_and_sgr
+size: 3x10
+step: feed \e[1;4;31;41mabc\e[0m\e[1;1;1;3${
+cite: [ex D10] [DEC-SERA] 'does not change SGR visual attributes, DECSCA protection attributes, or line attributes'; [XT-scr] Clear1Cell leaves attribs
+note: D-P7 / ADR 0046: blank keeps fg red, bg red, bold, underline. Pre-existing D10 used bg only; this widens to fg+SGR (the same statement in the DEC text).
+screen:
+>    |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+attr: (0,0)-(0,2) fg=i1 bg=i1 ul=- us=single flags=bold
+flags: decision
+### RS11_decsera_keeps_protected_bit_of_erased_iso_cell
+size: 2x6
+step: feed \e[41m\eVa\eW\e[0m\e[H\e[1;1;1;1${\e[44m\e[H\e[X
+cite: [DEC-SERA] 'does not change ... DECSCA protection attributes'; [XT-scr] ISO-protected cell is erased by DECSERA (mode iso != dec) but keeps its PROTECTED bit; ECH honours iso protection and so leaves its bg red
+note: Observes the kept PROTECTED bit through ECH: bg stays red (i1). If the bit were cleared, ECH would blank with the pen bg (i4). ADR 0046.
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: iso/0
+attr: (0,0)-(0,0) fg=- bg=i1 ul=- us=none flags=-
+flags: decision
+### RS12_decsera_dec_protected_survives
+size: 3x6
+step: feed \e[1"qab\e[0"qcd\e[H\e[1;1;1;4${
+cite: [XT-scr] IsProtected(DEC mode) per cell
+note: ab protected, cd erased.
+screen:
+>a|b
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: dec/0
+### RS13_decsera_decsca_2_is_erasable
+size: 3x6
+step: feed \e[2"qab\e[0"q\e[H\e[1;1;1;2${
+cite: [XT-ctl] DECSCA Ps=2 same as 0 (erasable); csi.rs sets the mode dec for any DECSCA
+note: mode is dec but the cells are not protected.
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: dec/0
+### RS14_decsera_wide_protected_survives
+size: 2x6
+step: feed \e[1"q漢\e[0"qbc\e[H\e[1;2;1;2${
+cite: [XT-scr] ScrnWipeRectangle `left > 0 && !IsProtected(ld,left)`: the protected wide char is left whole
+screen:
+>漢|bc
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: dec/0
+flags: decision
+### RS15_decsera_cursor_untouched
+size: 4x5
+step: feed \e[1"qaaaaa\r\n\e[0"qbbbbb\r\n\e[1"qccccc\r\n\e[0"qddddd\e[0"q\e[2;3H\e[3;5H\e[1;1;4;5${
+cite: [DEC-SERA] 'does not change the active cursor position'
+screen:
+>aaaaa
+>
+>ccccc|
+>
+cursor: (2,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: dec/0
+### RS16_decsera_k02_decrc_protection
+size: 3x10
+step: feed \e[1"q\e7\e[0"q\e8a\e[1;1;1;1${
+cite: [ex K02] [E2] save_restore_cursor.py test_SaveRestoreCursor_Protection
+screen:
+>a |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: dec/1
+### RS17_decsera_k03b_scorc_protection
+size: 3x10
+step: feed \e[1"q\e[s\e[0"q\e[ua\e[1;1;1;1${
+cite: [ex K03b] [E2] scorc.py
+screen:
+>a |
+>
+>
+cursor: (0,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: dec/1
+
+# ============================================================================================================
+# E. Origin mode and margins   (DECOM relative addressing; xterm limitedParseRow/Col; DEC 'DECOM affects coordinates, margins do not limit')
+# ============================================================================================================
+### RO01_decera_decom_relative
+size: 5x6
+step: feed abcdef\r\nghijkl\r\nmnopqr\r\nstuvwx\r\nyzABCD\e[H\e[2;4r\e[?6h\e[1;1;1;6$z
+cite: [DEC-ERA] coordinates affected by DECOM; [XT-scr] limitedParseRow adds top_marg; [E2] fillRectangle_respectsOriginMode
+note: row 1 of the region is screen row 2.
+screen:
+>abcdef
+> |
+>mnopqr
+>stuvwx
+>yzABCD
+cursor: (1,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RO02_decera_decom_clamps_to_region_bottom
+size: 5x6
+step: feed abcdef\r\nghijkl\r\nmnopqr\r\nstuvwx\r\nyzABCD\e[H\e[2;4r\e[?6h\e[1;1;99;99$z
+cite: [XT-scr] limitedParseRow clamps to bot_marg+1 in origin mode, not the page
+note: rows 2-4 only: row 5 survives.
+screen:
+>abcdef
+> |
+>
+>
+>yzABCD
+cursor: (1,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RO03_decera_decom_default_rect_is_the_region
+size: 5x6
+step: feed abcdef\r\nghijkl\r\nmnopqr\r\nstuvwx\r\nyzABCD\e[H\e[2;4r\e[?6h\e[$z
+cite: [DEC-ERA] defaults Pt=1..Pb=last line [of the DECOM region]; [XT-scr] LimitedParse passes the already-absolute default through limitedParseRow, which adds top_marg AGAIN (xterm bug: top=3, region top row is skipped)
+note: [LEAD] 'no default double-count'. Region 2-4 fully erased.
+screen:
+>abcdef
+> |
+>
+>
+>yzABCD
+cursor: (1,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+xterm_screen:
+>abcdef
+>g|hijkl
+>
+>
+>yzABCD
+flags: decision xterm-differs
+### RO04_decera_decom_off_ignores_tb_margins
+size: 5x6
+step: feed abcdef\r\nghijkl\r\nmnopqr\r\nstuvwx\r\nyzABCD\e[H\e[2;4r\e[1;1;5;6$z
+cite: [DEC-ERA] 'not affected by the page margins'; [E2] fillRectangle_ignoresMargins
+note: DECOM off: the scroll region is irrelevant, whole page erased.
+screen:
+> |
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RO05_decera_decom_with_lr_margins
+size: 5x6
+step: feed abcdef\r\nghijkl\r\nmnopqr\r\nstuvwx\r\nyzABCD\e[H\e[?69h\e[2;5s\e[2;4r\e[?6h\e[1;1;99;99$z
+cite: [XT-scr] getMinCol/getMaxCol use lft_marg/rgt_marg when ORIGIN is set; [DEC] DECOM + DECSLRM relative addressing
+note: rows 2-4 x columns 2-5.
+screen:
+>abcdef
+>g |   l
+>m    r
+>s    x
+>yzABCD
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RO06_decera_decom_off_with_lr_margins_ignores_them
+size: 5x6
+step: feed abcdef\r\nghijkl\r\nmnopqr\r\nstuvwx\r\nyzABCD\e[H\e[?69h\e[2;5s\e[2;4r\e[1;1;5;6$z
+cite: [DEC-ERA] 'not affected by the page margins'
+note: whole page.
+screen:
+> |
+>
+>
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: control
+### RO07_decfra_decom_relative
+size: 5x6
+step: feed abcdef\r\nghijkl\r\nmnopqr\r\nstuvwx\r\nyzABCD\e[H\e[?69h\e[2;5s\e[2;4r\e[?6h\e[37;1;1;2;2$x
+cite: [DEC-FRA] DECOM relative; [XT-scr] same parse
+note: screen (2,2)-(3,3) 1-based -> cells at row 2-3, col 2-3.
+screen:
+>abcdef
+>g%|%jkl
+>m%%pqr
+>stuvwx
+>yzABCD
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RO08_deccra_decom_source_and_dest_relative
+size: 8x8
+step: feed abcdefgh\r\nijklmnop\r\nqrstuvwx\r\nyz012345\r\nABCDEFGH\r\nIJKLMNOP\r\nQRSTUVWX\r\nYZ6789!@\e[H\e[2;9r\e[?69h\e[2;9s\e[?6h\e[1;1;3;3;1;4;4;1$v\e[?6l
+cite: [E2] test_DECCRA_respectsOriginMode (source 1,1-3,3 -> absolute 2,2-4,4; dest 4,4 -> 5,5); [XT-scr] ScrnCopyRectangle parses the destination with xtermParseRect too
+note: Same cells as RC01. Margins 2-9 on an 8x8 screen: the bottom margin clamps to 8.
+screen:
+>a|bcdefgh
+>ijklmnop
+>qrstuvwx
+>yz012345
+>ABCDjklH
+>IJKLrstP
+>QRSTz01X
+>YZ6789!@
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RO09_deccra_decom_default_dest_is_region_top_left
+size: 5x6
+step: feed abcdef\r\nghijkl\r\nmnopqr\r\nstuvwx\r\nyzABCD\e[H\e[?69h\e[2;5s\e[2;4r\e[?6h\e[2;2;3;3;1$v
+cite: [DEC-CRA] 'Ptd Default: 1' (relative to the DECOM origin); [XT-scr] default goes through limitedParseRow/Col (adds the margin again: xterm double-count) -> xterm_variant
+note: source rel (2,2)-(3,3) = screen (3,3)-(4,4); dest default = region top-left = screen (2,2). xterm lands 1 row/col too far (double count). Same decision as RO03.
+screen:
+>abcdef
+>go|pjkl
+>muvpqr
+>stuvwx
+>yzABCD
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+xterm_screen:
+>abcdef
+>gh|ijkl
+>mnopqr
+>stuvwx
+>yzABCD
+flags: decision xterm-differs
+### RO10_deccra_decom_dest_clipped_to_region
+size: 5x6
+step: feed abcdef\r\nghijkl\r\nmnopqr\r\nstuvwx\r\nyzABCD\e[H\e[?69h\e[2;5s\e[2;4r\e[?6h\e[1;1;2;2;1;3;4;1$v
+cite: [XT-scr] ScrnCopyRectangle only writes cells with `row >= getMinRow && row <= getMaxRow && col >= getMinCol && col <= getMaxCol`: in origin mode the destination is clipped to the margin box, not the page
+note: 2x2 source (screen rows 2-3, cols 2-3) copied to relative (3,4) = screen (4,5): only the cell inside the origin region (row<=4, col<=5) is written. A page-only clip (DEC text) would also write (4,6),(5,5),(5,6). Same decision as RO11.
+screen:
+>abcdef
+>gh|ijkl
+>mnopqr
+>stuvhx
+>yzABCD
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision xterm-extension
+### RO11_deccra_decom_dest_clipped_at_right_margin
+size: 5x6
+step: feed abcdef\r\nghijkl\r\nmnopqr\r\nstuvwx\r\nyzABCD\e[H\e[?69h\e[2;5s\e[2;4r\e[?6h\e[1;1;2;3;1;1;4;1$v
+cite: [XT-scr] same clip: 2x3 source to region column 4 -> column 6 is outside the right margin (5) and is NOT written; DEC-CRA would clip at the page edge (col 6)
+note: Recommendation: follow xterm (consistent with the source clamp). Lead decides.
+screen:
+>abcdef
+>gh|ijhl
+>mnopnr
+>stuvwx
+>yzABCD
+cursor: (1,1)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision xterm-differs
+### RO12_decsera_decom_relative
+size: 5x6
+step: feed abcdef\r\nghijkl\r\nmnopqr\r\nstuvwx\r\nyzABCD\e[H\e[2;4r\e[?6h\e[1;1;1;6${
+cite: [ex D04] relative addressing for DECSERA
+note: no protection, so equals DECERA of region row 1.
+screen:
+>abcdef
+> |
+>mnopqr
+>stuvwx
+>yzABCD
+cursor: (1,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+
+# ============================================================================================================
+# F. Conformance level gate (DECSCL; xterm CASE_DEC* 'vtXX_level >= 4'; DEC 'VT Level 4 mode only'; ADR 0028 pattern)
+# ============================================================================================================
+### RG_decera_level_61_ignored
+size: 3x6
+step: feed abc\e[61"p\e[1;1;1;3$z
+cite: [XT-cp] CASE_DECERA `if (screen->vtXX_level >= 4)`; [DEC] 'VT Level 4 mode only'
+note: the sequence is parsed and dropped; no cell, cursor or pen change. DECSCL itself is a soft reset that leaves the screen alone.
+screen:
+>abc |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RG_decera_level_62_ignored
+size: 3x6
+step: feed abc\e[62"p\e[1;1;1;3$z
+cite: [XT-cp] CASE_DECERA `if (screen->vtXX_level >= 4)`; [DEC] 'VT Level 4 mode only'
+note: the sequence is parsed and dropped; no cell, cursor or pen change. DECSCL itself is a soft reset that leaves the screen alone.
+screen:
+>abc |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RG_decera_level_63_ignored
+size: 3x6
+step: feed abc\e[63"p\e[1;1;1;3$z
+cite: [XT-cp] CASE_DECERA `if (screen->vtXX_level >= 4)`; [DEC] 'VT Level 4 mode only'
+note: the sequence is parsed and dropped; no cell, cursor or pen change. DECSCL itself is a soft reset that leaves the screen alone.
+screen:
+>abc |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RG_decera_level_64_works
+size: 3x6
+step: feed abc\e[64"p\e[1;1;1;3$z
+cite: [XT-cp] CASE_DECERA vtXX_level 4
+screen:
+>    |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: control
+### RG_decfra_level_61_ignored
+size: 3x6
+step: feed abc\e[61"p\e[88;1;1;1;3$x
+cite: [XT-cp] CASE_DECFRA `if (screen->vtXX_level >= 4)`; [DEC] 'VT Level 4 mode only'
+note: the sequence is parsed and dropped; no cell, cursor or pen change. DECSCL itself is a soft reset that leaves the screen alone.
+screen:
+>abc |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RG_decfra_level_62_ignored
+size: 3x6
+step: feed abc\e[62"p\e[88;1;1;1;3$x
+cite: [XT-cp] CASE_DECFRA `if (screen->vtXX_level >= 4)`; [DEC] 'VT Level 4 mode only'
+note: the sequence is parsed and dropped; no cell, cursor or pen change. DECSCL itself is a soft reset that leaves the screen alone.
+screen:
+>abc |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RG_decfra_level_63_ignored
+size: 3x6
+step: feed abc\e[63"p\e[88;1;1;1;3$x
+cite: [XT-cp] CASE_DECFRA `if (screen->vtXX_level >= 4)`; [DEC] 'VT Level 4 mode only'
+note: the sequence is parsed and dropped; no cell, cursor or pen change. DECSCL itself is a soft reset that leaves the screen alone.
+screen:
+>abc |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RG_decfra_level_64_works
+size: 3x6
+step: feed abc\e[64"p\e[88;1;1;1;3$x
+cite: [XT-cp] CASE_DECFRA vtXX_level 4
+screen:
+>XXX |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: control
+### RG_deccra_level_61_ignored
+size: 3x6
+step: feed abc\e[61"p\e[1;1;1;2;1;2;1;1$v
+cite: [XT-cp] CASE_DECCRA `if (screen->vtXX_level >= 4)`; [DEC] 'VT Level 4 mode only'
+note: the sequence is parsed and dropped; no cell, cursor or pen change. DECSCL itself is a soft reset that leaves the screen alone.
+screen:
+>abc |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RG_deccra_level_62_ignored
+size: 3x6
+step: feed abc\e[62"p\e[1;1;1;2;1;2;1;1$v
+cite: [XT-cp] CASE_DECCRA `if (screen->vtXX_level >= 4)`; [DEC] 'VT Level 4 mode only'
+note: the sequence is parsed and dropped; no cell, cursor or pen change. DECSCL itself is a soft reset that leaves the screen alone.
+screen:
+>abc |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RG_deccra_level_63_ignored
+size: 3x6
+step: feed abc\e[63"p\e[1;1;1;2;1;2;1;1$v
+cite: [XT-cp] CASE_DECCRA `if (screen->vtXX_level >= 4)`; [DEC] 'VT Level 4 mode only'
+note: the sequence is parsed and dropped; no cell, cursor or pen change. DECSCL itself is a soft reset that leaves the screen alone.
+screen:
+>abc |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RG_deccra_level_64_works
+size: 3x6
+step: feed abc\e[64"p\e[1;1;1;2;1;2;1;1$v
+cite: [XT-cp] CASE_DECCRA vtXX_level 4
+screen:
+>abc |
+>ab
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: control
+### RG_decsera_level_61_ignored
+size: 3x6
+step: feed abc\e[61"p\e[1;1;1;3${
+cite: [XT-cp] CASE_DECSERA `if (screen->vtXX_level >= 4)`; [DEC] 'VT Level 4 mode only'
+note: the sequence is parsed and dropped; no cell, cursor or pen change. DECSCL itself is a soft reset that leaves the screen alone.
+screen:
+>abc |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RG_decsera_level_62_ignored
+size: 3x6
+step: feed abc\e[62"p\e[1;1;1;3${
+cite: [XT-cp] CASE_DECSERA `if (screen->vtXX_level >= 4)`; [DEC] 'VT Level 4 mode only'
+note: the sequence is parsed and dropped; no cell, cursor or pen change. DECSCL itself is a soft reset that leaves the screen alone.
+screen:
+>abc |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RG_decsera_level_63_ignored
+size: 3x6
+step: feed abc\e[63"p\e[1;1;1;3${
+cite: [XT-cp] CASE_DECSERA `if (screen->vtXX_level >= 4)`; [DEC] 'VT Level 4 mode only'
+note: the sequence is parsed and dropped; no cell, cursor or pen change. DECSCL itself is a soft reset that leaves the screen alone.
+screen:
+>abc |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RG_decsera_level_64_works
+size: 3x6
+step: feed abc\e[64"p\e[1;1;1;3${
+cite: [XT-cp] CASE_DECSERA vtXX_level 4
+screen:
+>    |
+>
+>
+cursor: (0,3)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: control
+### RG_decera_level_4_default_works
+size: 3x6
+step: feed abc\e[H\e[1;1;1;3$z
+cite: [LEAD] Tessera default conformance level is 4 (margins_spec.txt header; csi.rs `conformance_level >= 4`)
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: control
+
+# ============================================================================================================
+# G. Wide characters at the rectangle edges   (xterm: HIDDEN_CHAR + Clear1Cell; LEAD: 'a wide character cut by an edge is blanked whole')
+# ============================================================================================================
+### RW01_decera_left_half_only
+size: 2x6
+step: feed a漢bcd\e[H\e[1;1;1;2$z
+cite: [XT-scr] ScrnFillRectangle: right edge `charData[right+1] == HIDDEN_CHAR` -> Clear1Cell(right) and (right+1); [LEAD] blanked whole
+note: erasing a..lead half also blanks the spacer half.
+screen:
+> |  bcd
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RW02_decera_right_half_only
+size: 2x6
+step: feed a漢bcd\e[H\e[1;3;1;3$z
+cite: [XT-scr] left edge on HIDDEN_CHAR -> Clear1Cell(left-1) and (left)
+note: the lead half at column 2 goes too.
+screen:
+>a|  bcd
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RW03_decera_whole_wide
+size: 2x6
+step: feed a漢bcd\e[H\e[1;2;1;3$z
+cite: [XT-scr] both halves in the rectangle: plain erase
+screen:
+>a|  bcd
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: control
+### RW04_decfra_over_right_half
+size: 2x6
+step: feed a漢bcd\e[H\e[120;1;3;1;3$x
+cite: [XT-scr] ScrnFillRectangle blanks the orphaned lead half then fills column 3
+note: `a x...`: column 2 blank, column 3 'x'.
+screen:
+>a| xbcd
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RW05_decfra_over_left_half
+size: 2x6
+step: feed a漢bcd\e[H\e[120;1;2;1;2$x
+cite: [XT-scr] right-edge case
+note: column 2 'x', column 3 blank (orphaned spacer cleared).
+screen:
+>a|x bcd
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RW06_decsera_wide_cut_unprotected
+size: 2x6
+step: feed a漢bcd\e[H\e[1;3;1;3${
+cite: [XT-scr] ScrnWipeRectangle left edge: `left > 0 && !IsProtected(ld,left)` then Clear1Cell(left-1), Clear1Cell(left)
+note: same as RW02.
+screen:
+>a|  bcd
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RW07_deccra_source_right_half_cut_copied_as_blank
+size: 2x6
+step: feed a漢bcd\e[H\e[1;3;1;4;1;2;1;1$v
+cite: [XT-scr] saveCellData copies the raw HIDDEN_CHAR spacer, leaving an orphan spacer at the destination (xterm artefact); [LEAD] cut wide chars are blanked, never orphaned
+note: source columns 3-4 = spacer + 'b' -> destination 'b' preceded by a blank.
+screen:
+>a|漢bcd
+> b
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision xterm-differs
+### RW08_deccra_whole_wide_copied
+size: 2x6
+step: feed a漢bcd\e[H\e[1;2;1;3;1;2;4;1$v
+cite: [DEC-CRA] copies cells incl. both halves; [XT-scr] saveCellData/restoreCellData
+screen:
+>a|漢bcd
+>   漢
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: control
+### RW09_deccra_dest_cuts_existing_wide
+size: 2x6
+step: feed a漢bcd\r\nxyzxyz\e[H\e[2;1;2;1;1;1;3;1$v
+cite: [XT-scr] ScrnCopyRectangle b_left/b_right: Clear1Cell of the neighbour of a cut wide char
+note: copying 'x' onto the right half of 漢... see row output; the orphaned lead half is blanked.
+screen:
+>a| xbcd
+>xyzxyz
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+### RW10_decera_wide_char_on_the_last_column_edge
+size: 2x6
+step: feed abcd漢\e[H\e[1;5;1;5$z
+cite: [XT-scr] right edge handled as left; cell 6 is the spacer
+note: whole wide char (cols 5-6) blanked.
+screen:
+>a|bcd
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+
+# ============================================================================================================
+# H. Other interactions
+# ============================================================================================================
+### RH01_decsace_does_not_affect_rect_ops
+size: 4x5
+step: feed abcde\r\nfghij\r\nklmno\r\npqrst\e[H\e[1*x\e[2;2;3;4$z
+cite: [XT-ctl] DECSACE only changes DECCARA/DECRARA extents (not implemented here); [XT-cp] CASE_DECSACE just stores cur_decsace; ctlseqs Note 1
+note: stream mode must not turn DECERA into a stream erase. `CSI * x` need not be implemented (ignored sequence) for this to pass.
+screen:
+>a|bcde
+>f   j
+>k   o
+>pqrst
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: control
+### RH02_rect_ops_on_alt_screen_only_touch_alt
+size: 3x5
+step: feed abcd\e[?1049h\e[1;1;1;5$z\e[?1049l
+cite: [XT-scr] getLineData(screen,row) is the active screen
+note: primary is intact after the round trip; the erase ran on the alternate.
+screen:
+>abcd |
+>
+>
+cursor: (0,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+### RH03_decaln_then_decera
+size: 3x5
+step: feed \e#8\e[2;2;2;4$z
+cite: [XT-cp] CASE_DECALN fills 'E'; [DEC-ERA]
+screen:
+>E|EEEE
+>E   E
+>EEEEE
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: control
+### RH04_decera_after_sgr_conceal_does_not_leak
+size: 3x5
+step: feed abcde\e[8m\e[H\e[1;1;1;2$z\e[0m
+cite: [LEAD] pen background only: conceal is not stamped on the blank
+screen:
+> | cde
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+attr: (0,0)-(0,1) fg=- bg=- ul=- us=none flags=-
+flags: decision
+### RH05_decstbm_scroll_region_ignored_decom_off
+size: 5x6
+step: feed abcdef\r\nghijkl\r\nmnopqr\r\nstuvwx\r\nyzABCD\e[H\e[2;4r\e[2;2;2;2$z
+cite: [DEC-ERA] page margins do not apply when DECOM is off
+screen:
+>a|bcdef
+>g ijkl
+>mnopqr
+>stuvwx
+>yzABCD
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: control
+### RH06_rect_ops_leave_line_marks_and_selection_alone
+size: 3x5
+step: feed abcde\e[H\e[1;1;3;5$z
+cite: [LEAD] 'marks untouched' (OSC 133 prompt marks are per-line metadata)
+note: structural check in the test: marks/seqno unchanged. Screen is blank.
+screen:
+> |
+>
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+pstate: off/0
+flags: decision
+
+# =============================================================================
+# PROPERTY ROWS (no screen; one test each, not fixture cases)
+#   B01 allocation bound   [docs/security.md]  DECCRA with a 65535x65535 request on a RxC screen allocates at most R*C cells (the source is clamped first); no Vec sized from a
+#       parameter. xterm allocates `high*wide` after validRect (screen-sized too). Same for DECFRA/DECERA/DECSERA: zero allocation.
+#   B02 work bound         one rectangle op touches at most R*C cells; 100_000 full-screen DECCRA on 24x80 must finish inside the existing perf budget of tests/*_alloc.rs style tests.
+#   B03 chunking           every row above runs whole and byte by byte (the shared harness does this) -- including a split inside `$` and inside a multi-digit parameter.
+#   B04 no side effects    after any of the four ops: cursor, pending wrap, pen, DECSCA mode, saved cursor, scrollback, selection, hyperlink table, OSC 133 marks, tab stops,
+#       margins, modes unchanged. Rows RE20/RE21/RE22/RF24/RC20/RC21/RS15 prove the visible ones; B04 asserts the rest structurally ([LEAD]: marks untouched).
+#   B05 damage             only rows intersecting the (clamped) rectangle are damaged (render golden); a no-op (invalid rect, level < 4) damages nothing.
+#   B06 DA1                attribute 28 (rectangular editing) NOT added ([LEAD]). xterm CASE_DA1 reports 28 at `terminal_id >= 400`; Tessera must not claim it until DECCARA/DECRARA/
+#       DECRQCRA exist, else vim/tmux would use them. A test pins the current DA1 string.
+#   B07 reset              RIS and DECSTR do not need new state (no new mode), except that DECSTR does not clear the screen: unchanged.
+#
+# DECISIONS ALREADY MADE BY THE LEAD (rows follow them)  DECERA blank = pen background only, never PROTECTED (RE17-19); DECFRA takes the full pen style (RF20-22);
+#   DECSERA keeps colours/SGR/PROTECTED (RS10, RS11); DECOM relative+clamped, no default double count (RO*); page parameters accepted and ignored (RC13-RC15); DECFRA Pch 0/absent = space,
+#   1-31 and 127-159 ignored, >= 256 only if width 1 (RF03-RF17); a wide char cut by an edge is blanked whole (RW*); wrapped flag, marks, pending wrap untouched (RE21, RE22, RC21, B04);
+#   colon sub-parameter voids the sequence (RE13); level >= 4 (RG*).
+#
+# DECISIONS NEEDED FROM THE LEAD (each one changes a row; recommendation first)
+#   Q1  DECFRA copies the pen's PROTECTED bit (xterm; RF22) vs never (consistent with DECERA). Recommend: copy (DECFRA is a write like printing, ADR 0034 "printing copies the pen bit").
+#   Q2  DECCRA in DECOM clips the destination to the origin region (xterm; RO10/RO11) vs the page. Recommend: xterm (source and destination both live in the origin region).
+#   Q3  Hyperlink ids on cells: DECCRA copies the id with the cell; DECERA/DECSERA/DECFRA(blank) clear it. Recommend that. No fixture row (needs OSC 8 in the harness); add one to the PR tests.
+#   Q4  DECFRA Pch >= 256 that is a noncharacter (U+FFFF from a saturated parameter): ignore (recommend) or fill. And map Pch 32-126 through the active GL charset (RF25, recommend yes: DEC says
+#       "the character in the current GL or GR in-use table") or fill raw ASCII.
+#   Q5  Default state: `conformance_level >= 4` is true by default in Tessera (margins_spec.txt header). Confirm DECSCL 61-63 must make all four ops no-ops and that DECSCL 64/65 restore them (RG*).
+#
+# DONE-WHEN impact: (a) the issue lists D01-D10, K02, K03b only; the new rows RE*, RF*, RC*, RO*, RW* are the DECERA/DECFRA/DECCRA coverage the issue title promises but its "Done when"
+#   does not enumerate; (b) D10 and RS10 differ: D-P7 must keep fg+SGR too, not only bg; (c) Q1-Q4 above each need a one-line ADR 0046 sentence; (d) the issue says "gate at level 4"
+#   but does not say DECSCL <4 must keep screen content (RG*): rows assume it does.
+# =============================================================================
