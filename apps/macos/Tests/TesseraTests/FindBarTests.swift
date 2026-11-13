@@ -847,12 +847,17 @@ final class FindBarTests: XCTestCase {
         var worst: Duration = .zero
         let deliveries = router.deliveries
         let steps = view.find.stepCount
+        // The most matches any frame reported: each new generation of
+        // output restarts the search, so the count read at one moment can
+        // be 0 (#427).
+        var mostMatches = 0
         let end = ContinuousClock.now + .seconds(3)
         while ContinuousClock.now < end {
             let start = ContinuousClock.now
             view.displayLinkDidFire()
             worst = max(worst, ContinuousClock.now - start)
             ticks += 1
+            mostMatches = max(mostMatches, try status(view).matches)
             try await Task.sleep(for: .milliseconds(16))
             peak = max(peak, footprint())
         }
@@ -860,7 +865,7 @@ final class FindBarTests: XCTestCase {
         let delivered = router.deliveries - deliveries
         XCTAssertLessThanOrEqual(stepped, ticks, "at most one step a frame, however much output")
         XCTAssertGreaterThan(stepped, ticks / 2, "the search kept up")
-        XCTAssertGreaterThan(try status(view).matches, 0)
+        XCTAssertGreaterThan(mostMatches, 0, "the search found the flood's lines")
         let closeStart = ContinuousClock.now
         view.closeFindBar()
         try view.session.close()

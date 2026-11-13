@@ -47,10 +47,23 @@ final class TerminalScrollTests: XCTestCase {
     ///
     /// `modes` (printf escapes) is printed before the lines, so the core
     /// has parsed it once the lines are in the session.
+    ///
+    /// The wait is long (30 s) because a loaded host can stall the child's
+    /// start (#417): it ends as soon as the lines are in. The child writes
+    /// its pid (the shell's, which `exec cat` keeps) to a file first, so a
+    /// timeout reports whether it ever ran and is still alive, beside what
+    /// arrived.
     private func open(lines: Int = 1000, modes: String = "") async throws {
+        let pidFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tessera-scroll-\(UUID().uuidString).pid")
+        addTeardownBlock { try? FileManager.default.removeItem(at: pidFile) }
         appDelegate.spawnOptions = .init(
             program: "/bin/sh",
-            arguments: ["-c", "printf '\(modes)'; seq 1 \(lines); stty raw -echo; printf '\\n'; exec cat"])
+            arguments: [
+                "-c",
+                "echo $$ > '\(pidFile.path)'; printf '\(modes)'; seq 1 \(lines); stty raw -echo; printf '\\n';"
+                    + " exec cat",
+            ])
         let controller = try appDelegate.newWindow()
         view = controller.focusedPane.view
         window = KeyControlledWindow(contentRect: view.frame)
@@ -60,10 +73,44 @@ final class TerminalScrollTests: XCTestCase {
         view.occlusionOverride = false
         // The scroll bar's visibility follows the user's setting otherwise.
         view.scroller.preferredStyleOverride = .overlay
-        try await waitUntil("the child's \(lines) lines and its raw-mode line are in the session") {
-            guard let position = try? self.view.session.scrollPosition else { return false }
-            return position.history + UInt64(position.rows) == UInt64(lines + 2)
+        let expected = UInt64(lines + 2)
+        let timeout = Duration.seconds(30)
+        let deadline = ContinuousClock.now + timeout
+        while true {
+            if let position = try? view.session.scrollPosition, position.history + UInt64(position.rows) == expected {
+                return
+            }
+            guard ContinuousClock.now < deadline else {
+                throw ChildStalled(
+                    description: "timed out after \(timeout) waiting for the child's \(lines) lines and its"
+                        + " raw-mode line: " + childState(pidFile: pidFile))
+            }
+            try await Task.sleep(for: .milliseconds(10))
         }
+    }
+
+    /// The child's state for a failed ``open(lines:modes:)``: its
+    /// pid, whether it is alive, and how much of its output is in the
+    /// session (the lines of history and screen, the length of their text).
+    private func childState(pidFile: URL) -> String {
+        let pidText = (try? String(contentsOf: pidFile, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let process: String
+        if let pidText, let pid = Int32(pidText) {
+            let exists = kill(pid, 0) == 0 || errno == EPERM
+            process = "pid \(pid), " + (exists ? "exists (alive or unreaped)" : "gone (errno \(errno))")
+        } else {
+            process = "no pid written (the child never ran its first command)"
+        }
+        let position = (try? view.session.scrollPosition).map {
+            "history \($0.history) + rows \($0.rows)"
+        } ?? "no scroll position"
+        var text = 0
+        if (try? view.session.selectAll()) != nil {
+            text = (try? view.session.selectionText())?.utf8.count ?? 0
+            try? view.session.selectClear()
+        }
+        return "\(process); session: \(position), \(text) bytes of text"
     }
 
     private var position: TesseraSession.ScrollPosition {
@@ -1226,6 +1273,12 @@ final class TerminalScrollTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(10))
         }
     }
+}
+
+/// The child of ``TerminalScrollTests/open(lines:modes:)`` did not
+/// print what it should in time.
+private struct ChildStalled: Error, CustomStringConvertible {
+    let description: String
 }
 
 /// Counts the sets of a scroller's `alphaValue`, `isEnabled` and `isHidden`
