@@ -88,7 +88,8 @@ pub struct ProfileAppearance {
 impl ProfileAppearance {
     /// `base` with every key this profile sets replaced:
     /// the appearance a session of this profile is drawn with.
-    /// `dim_inactive_panes` and `blur_radius` are always `base`'s, and so
+    /// `dim_inactive_panes`, `blur_radius` and `app_appearance` are always
+    /// `base`'s, and so
     /// is a `font_size` or `opacity` that is not a finite number (the
     /// loader already turns those into unset keys; #333).
     #[must_use]
@@ -112,6 +113,7 @@ impl ProfileAppearance {
             cursor_shape: self.cursor_shape.unwrap_or(base.cursor_shape),
             cursor_blink: self.cursor_blink.unwrap_or(base.cursor_blink),
             dim_inactive_panes: base.dim_inactive_panes,
+            app_appearance: base.app_appearance,
         }
     }
 }
@@ -312,6 +314,7 @@ mod tests {
         let base = Appearance {
             dim_inactive_panes: 0.4,
             blur_radius: 20,
+            app_appearance: crate::AppAppearance::Light,
             ..Appearance::default()
         };
         let overrides = ProfileAppearance {
@@ -336,6 +339,7 @@ mod tests {
                 cursor_shape: CursorShape::Underline,
                 cursor_blink: true,
                 dim_inactive_panes: 0.4,
+                app_appearance: crate::AppAppearance::Light,
             }
         );
         assert_eq!(ProfileAppearance::default().over(&base), base);

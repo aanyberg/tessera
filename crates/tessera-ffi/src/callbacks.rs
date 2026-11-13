@@ -117,7 +117,9 @@ pub struct Callbacks {
     /// the application was created (the first one applied is 1). The host
     /// reads what it shows from the configuration again: the menus' key
     /// equivalents with `tessera_app_keymap_json`, which reports the
-    /// generation it describes. Called after `on_appearance_changed` when
+    /// generation it describes, and the app's own appearance with
+    /// `tessera_app_app_appearance` (no other callback reports a change
+    /// of it). Called after `on_appearance_changed` when
     /// both are, on the configuration watch's thread, under the same rules
     /// as every callback: marshal the work to the main thread.
     pub on_config_applied: Option<unsafe extern "C" fn(user_data: *mut c_void, generation: u64)>,

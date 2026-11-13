@@ -64,9 +64,9 @@ pub use accessibility::{
     tessera_accessible_text_range_at_cell, tessera_session_accessible_text,
 };
 pub use app::{
-    App, DisplayOptions, tessera_app_blur_radius, tessera_app_config_path,
-    tessera_app_create_config, tessera_app_dim_inactive_panes, tessera_app_free, tessera_app_new,
-    tessera_app_set_callbacks, tessera_app_set_display_options,
+    App, AppAppearance, DisplayOptions, tessera_app_app_appearance, tessera_app_blur_radius,
+    tessera_app_config_path, tessera_app_create_config, tessera_app_dim_inactive_panes,
+    tessera_app_free, tessera_app_new, tessera_app_set_callbacks, tessera_app_set_display_options,
 };
 pub use callbacks::{Callbacks, MAX_REMOTE_HOST_LEN, RemoteKind};
 pub use config::{

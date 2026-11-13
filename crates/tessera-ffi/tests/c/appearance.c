@@ -3,7 +3,8 @@
  * ADR 0045), built and run by scripts/ffi-c-test.sh: the layout of
  * TesseraSessionAppearance with its TesseraRgba background, a session's
  * configured background colour and alpha, the opaque-black failure default,
- * and tessera_app_blur_radius with its clamp and argument checks. Uses a
+ * tessera_app_blur_radius with its clamp and argument checks, and
+ * tessera_app_app_appearance with its named values (#365). Uses a
  * configuration directory of its own under the script's TESSERA_CONFIG_DIR,
  * so later tests start from no config.toml.
  */
@@ -39,7 +40,8 @@ static const char CONFIG[] = "[appearance]\n"
                              "theme = \"Dracula\"\n"
                              "opacity = 0.5\n"
                              "blur = true\n"
-                             "blur_radius = 100\n";
+                             "blur_radius = 100\n"
+                             "app_appearance = \"system\"\n";
 
 /* What a failed call must overwrite. */
 static const TesseraSessionAppearance GARBAGE = {
@@ -86,6 +88,17 @@ int main(void) {
     EXPECT(tessera_app_new(&app), TESSERA_ERROR_OK);
     EXPECT(tessera_app_blur_radius(app, NULL), TESSERA_ERROR_NULL_POINTER);
     EXPECT(tessera_session_appearance(app, 1, NULL), TESSERA_ERROR_NULL_POINTER);
+
+    /* The header's names for the app's appearance, and their values. */
+    CHECK(TESSERA_APP_APPEARANCE_DARK == 0);
+    CHECK(TESSERA_APP_APPEARANCE_LIGHT == 1);
+    CHECK(TESSERA_APP_APPEARANCE_SYSTEM == 2);
+    uint32_t app_appearance = 7;
+    EXPECT(tessera_app_app_appearance(NULL, &app_appearance), TESSERA_ERROR_NULL_POINTER);
+    CHECK(app_appearance == TESSERA_APP_APPEARANCE_DARK);
+    EXPECT(tessera_app_app_appearance(app, NULL), TESSERA_ERROR_NULL_POINTER);
+    EXPECT(tessera_app_app_appearance(app, &app_appearance), TESSERA_ERROR_OK);
+    CHECK(app_appearance == TESSERA_APP_APPEARANCE_SYSTEM);
 
     /* 100 is past the bound: the file loads with it lowered to 64. */
     radius = 7;

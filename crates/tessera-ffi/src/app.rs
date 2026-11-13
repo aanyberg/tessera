@@ -397,6 +397,66 @@ pub unsafe extern "C" fn tessera_app_blur_radius(app: *const App, out: *mut u32)
     })
 }
 
+/// The app's own appearance (`[appearance] app_appearance`, #365), the
+/// value `tessera_app_app_appearance` stores, carried as `uint32_t`
+/// (`TESSERA_APP_APPEARANCE_DARK`, `_LIGHT` or `_SYSTEM`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AppAppearance {
+    /// The host draws its windows, menus and settings dark.
+    Dark = 0,
+    /// The host draws them light.
+    Light = 1,
+    /// The host draws them as the system's appearance says, following it
+    /// when it changes.
+    System = 2,
+}
+
+impl From<tessera_app_core::AppAppearance> for AppAppearance {
+    fn from(value: tessera_app_core::AppAppearance) -> Self {
+        match value {
+            tessera_app_core::AppAppearance::Dark => Self::Dark,
+            tessera_app_core::AppAppearance::Light => Self::Light,
+            tessera_app_core::AppAppearance::System => Self::System,
+        }
+    }
+}
+
+/// Stores `[appearance] app_appearance` of the configuration in effect in
+/// `*out` (#365): `TESSERA_APP_APPEARANCE_DARK` (0, the default and what
+/// an unknown value in the file gives), `_LIGHT` (1) or `_SYSTEM` (2). The
+/// host draws its own windows, menus and settings with it; the terminal's
+/// colours stay the theme's. App-wide: no profile changes it, and the
+/// display options leave it alone. No callback reports a change of it:
+/// read it at start and again on every `on_config_applied`.
+///
+/// Returns `TESSERA_ERROR_NULL_POINTER` if `app` or `out` is `NULL`; `*out`
+/// is set to `TESSERA_APP_APPEARANCE_DARK` on failure when `out` is not
+/// `NULL`.
+///
+/// # Safety
+///
+/// `app` must be `NULL` or a live handle. `out` must be `NULL` or point to
+/// a writable `uint32_t`. Main thread only, like every `tessera_app_*` call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_app_app_appearance(app: *const App, out: *mut u32) -> Error {
+    ffi_guard!("tessera_app_app_appearance", {
+        if out.is_null() {
+            return Error::NullPointer;
+        }
+        // SAFETY: non-null and writable per the contract.
+        unsafe { out.write(AppAppearance::Dark as u32) };
+        // SAFETY: the caller passes NULL or a live handle.
+        let Some(app) = (unsafe { App::from_ptr(app) }) else {
+            return Error::NullPointer;
+        };
+        let value = AppAppearance::from(app.core.app_appearance());
+        // SAFETY: as above.
+        unsafe { out.write(value as u32) };
+        Error::Ok
+    })
+}
+
 /// The system's display settings that change how the core styles every
 /// session (ADR 0043), as the frontend reads them from the operating
 /// system. Each flag is a `uint8_t`, 0 for off and any other value for on
