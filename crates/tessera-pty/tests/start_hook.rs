@@ -114,6 +114,15 @@ fn sh(script: &str) -> SpawnOptions {
 /// Output (with `\r\n` normalised) and exit status, read until the child
 /// exits and the stream ends.
 fn collect_all(events: &PtyEvents) -> (String, Option<ExitStatus>) {
+    collect_watching(events, |_| {})
+}
+
+/// As [`collect_all`], calling `on_output` with the text so far each time
+/// an output event arrives, before the next one is read.
+fn collect_watching(
+    events: &PtyEvents,
+    mut on_output: impl FnMut(&str),
+) -> (String, Option<ExitStatus>) {
     let deadline = Instant::now() + TIMEOUT;
     let mut text = String::new();
     let mut exit = None;
@@ -122,6 +131,7 @@ fn collect_all(events: &PtyEvents) -> (String, Option<ExitStatus>) {
         match events.recv_timeout(remaining) {
             Ok(PtyEvent::Output(bytes)) => {
                 text.push_str(&String::from_utf8_lossy(&bytes).replace("\r\n", "\n"));
+                on_output(&text);
             }
             Ok(PtyEvent::Exited(status)) => exit = Some(status),
             Err(RecvTimeoutError::Timeout) => panic!("timed out; output so far: {text:?}"),
@@ -157,8 +167,31 @@ fn reader_and_writer_threads_run_the_hook() {
     let (mut pty, events) = NativePty::spawn(&sh("read line; echo \"got $line\"")).unwrap();
     let pid = pty.child_pid().expect("child pid");
     pty.write(b"x\n").unwrap();
-    let (text, exit) = collect_all(&events);
-    assert!(text.contains("got x"), "{text:?}");
+    let [reader, writer] = thread_names(pid);
+    // The hook runs before each thread's work: the reader has run it by
+    // the time it forwards any output, the writer by the time the child
+    // has read what it wrote. Both threads are still working then, so a
+    // hook run after the thread's body is not yet recorded.
+    let mut first = true;
+    let mut answered = false;
+    let (text, exit) = collect_watching(&events, |text| {
+        if std::mem::take(&mut first) {
+            let hooked = lock(&HOOKED).clone();
+            assert!(
+                hooked.contains(&reader),
+                "output arrived before {reader} ran the hook: {hooked:?}"
+            );
+        }
+        if !answered && text.contains("got x") {
+            answered = true;
+            let hooked = lock(&HOOKED).clone();
+            assert!(
+                hooked.contains(&writer),
+                "the child read input before {writer} ran the hook: {hooked:?}"
+            );
+        }
+    });
+    assert!(answered, "{text:?}");
     assert_eq!(exit, Some(ExitStatus::Exited(0)));
     let hooked = wait_listed(&HOOKED, pid);
     for name in thread_names(pid) {

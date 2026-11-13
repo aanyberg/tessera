@@ -589,40 +589,131 @@ fn a_zeroed_key_event_is_ignored() {
     assert_untouched(&app, id);
 }
 
-#[test]
-fn a_paste_into_a_stopped_child_never_blocks_and_close_drops_it() {
-    let outputs = Outputs::default();
-    let app = Handle::new(&outputs);
-    // `sleep` never reads its terminal, so the paste can only be queued;
-    // raw mode, or the line discipline would discard what passes
-    // `MAX_CANON` and let the queue drain.
-    let id = app.spawn(
-        "/bin/sh",
-        &["-c", "stty raw -echo; echo ready; exec sleep 1000"],
-    );
-    app.wait_until("the child to enter raw mode", |app| {
-        app.row(id, 0) == "ready"
+/// How many [`AWAKE_TICK`] waits a call that must not wait on a child may
+/// take before the test calls it blocked: at least 10 s of wall time.
+///
+/// Counted in waits, not read off the clock: under `taskpolicy -b` at load
+/// 10 and above the whole machine stalls for up to 26 s at a time (#419),
+/// and a stall delays this thread's waits as well as the call, so it adds
+/// only a few counts. A call that waits on a stopped child never returns,
+/// so it is caught whatever the load, after 10 s or more.
+///
+/// The count has no wall-clock ceiling of its own: if waits stretch so far
+/// that it never runs out, nextest's `terminate-after` (300 s,
+/// `.config/nextest.toml`) ends the test as the backstop.
+const BLOCKED_AFTER_TICKS: u32 = 1000;
+
+/// One wait of the [`BLOCKED_AFTER_TICKS`] count.
+const AWAKE_TICK: Duration = Duration::from_millis(10);
+
+/// Runs `call` with the application on a helper thread and returns its
+/// result, or fails the test if it has not returned after
+/// [`BLOCKED_AFTER_TICKS`] waits. On that failure the handle is leaked,
+/// not freed, as the blocked call still uses it.
+fn returns_without_blocking<R: Send + 'static>(
+    app: Handle,
+    what: &str,
+    call: impl FnOnce(&Handle) -> R + Send + 'static,
+) -> (Handle, R) {
+    let (done, result) = std::sync::mpsc::channel();
+    // The raw pointer crosses as an address: only one thread uses the
+    // handle at a time, as the API requires, since this one waits.
+    let raw = app.0 as usize;
+    std::mem::forget(app);
+    thread::spawn(move || {
+        let app = Handle(raw as *mut App);
+        let value = call(&app);
+        let _ = done.send((app.0 as usize, value));
+        std::mem::forget(app);
     });
-    let big = vec![b'p'; 3 * 1024 * 1024];
     let started = Instant::now();
-    assert_eq!(app.paste(id, &big), Error::Ok);
-    assert_eq!(
-        app.key(id, &char_event('k')),
-        (Error::Ok, InputOutcome::Consumed)
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "queueing took {:?}",
+    for _ in 0..BLOCKED_AFTER_TICKS {
+        match result.recv_timeout(AWAKE_TICK) {
+            Ok((raw, value)) => return (Handle(raw as *mut App), value),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(err) => panic!("{what}: the helper thread died ({err})"),
+        }
+    }
+    panic!(
+        "{what} blocked: no return after {BLOCKED_AFTER_TICKS} waits of {AWAKE_TICK:?} ({:?})",
         started.elapsed()
     );
-    let closing = Instant::now();
-    // SAFETY: live handle.
-    assert_eq!(unsafe { tessera_session_close(app.0, id) }, Error::Ok);
-    assert!(
-        closing.elapsed() < Duration::from_millis(1500),
-        "close took {:?}",
-        closing.elapsed()
+}
+
+/// Waits until `done` holds, checking every [`AWAKE_TICK`], for at most
+/// [`BLOCKED_AFTER_TICKS`] checks: a stall-proof [`Handle::wait_until`].
+fn wait_ticks(what: &str, mut done: impl FnMut() -> bool) {
+    for _ in 0..BLOCKED_AFTER_TICKS {
+        if done() {
+            return;
+        }
+        thread::sleep(AWAKE_TICK);
+    }
+    assert!(done(), "timed out waiting for {what}");
+}
+
+/// The `ps` state of process `pid`, such as `T` for stopped.
+fn process_state(pid: u32) -> String {
+    let out = std::process::Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps runs");
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// Sends `signal` (a `kill(1)` name) to process `pid`.
+fn signal(pid: u32, signal: &str) -> bool {
+    std::process::Command::new("/bin/kill")
+        .args([&format!("-{signal}"), &pid.to_string()])
+        .status()
+        .expect("kill runs")
+        .success()
+}
+
+#[test]
+fn a_paste_into_a_stopped_child_never_blocks_and_close_drops_it() {
+    let outputs = Box::leak(Box::new(Outputs::default()));
+    let app = Handle::new(outputs);
+    // Raw mode, or the line discipline would discard what passes
+    // `MAX_CANON` and let the queue drain; the shell's pid is `sleep`'s.
+    let id = app.spawn(
+        "/bin/sh",
+        &["-c", "stty raw -echo; echo ready $$; exec sleep 1000"],
     );
+    wait_ticks("the child to enter raw mode", || {
+        app.row(id, 0).starts_with("ready ")
+    });
+    let pid: u32 = app.row(id, 0)["ready ".len()..]
+        .trim()
+        .parse()
+        .expect("the child prints its pid");
+    // Stopped, the child can read nothing: a paste that waited on it,
+    // even for the first PTY buffer's worth, would never return.
+    assert!(signal(pid, "STOP"), "stopping {pid}");
+    wait_ticks("the child to stop", || process_state(pid).starts_with('T'));
+    let (app, (pasted, keyed)) =
+        returns_without_blocking(app, "queueing a 3 MiB paste", move |app| {
+            let big = vec![b'p'; 3 * 1024 * 1024];
+            (app.paste(id, &big), app.key(id, &char_event('k')))
+        });
+    assert_eq!(pasted, Error::Ok);
+    assert_eq!(keyed, (Error::Ok, InputOutcome::Consumed));
+    // The calls returned while the child was still stopped, so neither
+    // waited for it to read.
+    assert!(
+        process_state(pid).starts_with('T'),
+        "{pid} is no longer stopped: {:?}",
+        process_state(pid)
+    );
+    let (app, closed) = returns_without_blocking(app, "closing the session", move |app| {
+        // SAFETY: live handle.
+        unsafe { tessera_session_close(app.0, id) }
+    });
+    assert_eq!(closed, Error::Ok);
+    // The reaper kills the child after its grace; let a pending `SIGHUP`
+    // land sooner. Harmless if it already went.
+    signal(pid, "CONT");
+    drop(app);
 }
 
 const MIB: usize = 1024 * 1024;

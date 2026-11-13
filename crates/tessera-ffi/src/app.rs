@@ -133,8 +133,10 @@ fn config_paths() -> Option<ConfigPaths> {
     }
 }
 
-/// Gives the calling thread (a session reader or input writer, or the
-/// reaper) the `QOS_CLASS_USER_INITIATED` quality-of-service class.
+/// Gives the calling thread (a session reader or input writer, the reaper,
+/// the configuration apply or watch thread, or a PTY's `pty-reader-<pid>`
+/// or `pty-writer-<pid>`) the `QOS_CLASS_USER_INITIATED` quality-of-service
+/// class.
 ///
 /// Threads the core starts would otherwise run at the default class, below
 /// the main thread's `USER_INTERACTIVE`, and the main thread waits on locks

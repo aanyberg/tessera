@@ -325,9 +325,11 @@ pub(crate) fn lock<T: ?Sized>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 static THREAD_START_HOOK: OnceLock<fn()> = OnceLock::new();
 
 /// Installs `hook`, which every thread this crate starts (each session's
-/// reader and input writer, and the application's reaper) runs first, and
-/// which every thread `tessera-pty` starts (each PTY's reader and writer)
-/// runs first too.
+/// reader and input writer, the application's reaper and the
+/// configuration apply thread) runs first, and which every thread
+/// `tessera-pty` starts (each PTY's reader and writer) and the
+/// `tessera-config` watcher thread of the configuration watch run first
+/// too.
 ///
 /// For thread attributes this crate cannot set itself: it forbids
 /// `unsafe`, so `tessera-ffi` installs a hook that gives these threads a
@@ -336,6 +338,11 @@ static THREAD_START_HOOK: OnceLock<fn()> = OnceLock::new();
 /// Returns whether `hook` was installed here; the install into
 /// [`tessera_pty::set_thread_start_hook`] is best-effort, and a hook
 /// already set there is kept (logged at debug) whatever this returns.
+///
+/// Install one hook, once, before the first session, as `tessera_app_new`
+/// does. The two installs are separate, not one atomic step: two threads
+/// installing different hooks at the same time can leave this crate with
+/// one hook and `tessera-pty` with the other (ADR 0018, #417).
 pub fn set_thread_start_hook(hook: fn()) -> bool {
     if !tessera_pty::set_thread_start_hook(hook) {
         tracing::debug!("tessera-pty already has a thread start hook; keeping it");
