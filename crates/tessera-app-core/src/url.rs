@@ -24,8 +24,11 @@
 //!   `https://www.例え.テスト`). A path written in raw CJK (`/wiki/日本`) is
 //!   cut where the CJK starts; a percent-encoded one is not. The zero-width
 //!   joiner and the bidirectional controls are no URL characters, so they
-//!   end it too (see [`is_hidden_url_end`] for the cells that hide them;
-//!   other zero-width scalars can stay in a link's text);
+//!   end it too (see [`is_hidden_url_end`] for the cells that hide them).
+//!   The other default-ignorable code points ([`is_default_ignorable`]:
+//!   ZWNJ, variation selectors, CGJ, tags, Hangul fillers and the rest)
+//!   do not end it; the caller leaves them out of the URL it opens, so
+//!   the URL is the text the cells show (#279, ADR 0025);
 //! - **U4** a trailing `.` `,` `;` `:` `!` `?` `'` `"` is stripped, again and
 //!   again, and so is a trailing `-` of a URL that a CJK character ended
 //!   (`https://a.jp-日本` is `https://a.jp`);
@@ -151,9 +154,10 @@ pub fn is_cjk(c: char) -> bool {
 /// cell holding one of these as a character that is not a URL character:
 /// `https://go` + ZWJ + `od.com` must not open a host its text hides.
 /// Other zero-width scalars that join a cluster (ZWNJ, variation
-/// selectors, CGJ, tag characters) are no hidden ends: they stay in a
-/// link's text, unseen, but make no host its text does not show (UTS 46
-/// ignores VS and CGJ, CONTEXTJ rejects ZWNJ after Latin, tags are invalid).
+/// selectors, CGJ, tag characters) are no hidden ends: they do not end
+/// the URL, and the caller leaves them out of the URL it opens
+/// ([`is_default_ignorable`], #279), so they make no host its text does
+/// not show.
 #[must_use]
 pub fn is_hidden_url_end(c: char) -> bool {
     matches!(
@@ -227,6 +231,104 @@ fn url_around(line: &[char], at: usize) -> Option<Range<usize>> {
         }
         window.advance();
     }
+}
+
+/// Unicode 17.0's `Default_Ignorable_Code_Point` (DerivedCoreProperties.txt,
+/// unchanged since 16.0), as sorted, disjoint, inclusive ranges with the
+/// adjacent entries merged: SHY, CGJ, ALM, the Hangul fillers (U+115F,
+/// U+1160, U+3164, U+FFA0), the Khmer inherent vowels, the Mongolian free
+/// variation selectors and vowel separator, ZWSP to RLM, the bidi
+/// embeddings and isolates, WJ and the invisible operators, the variation
+/// selectors, BOM, U+FFF0-U+FFF8, the shorthand format controls, the
+/// musical beam and slur controls, and the tags and supplementary
+/// variation selectors (U+E0000-U+E0FFF, reserved code points included).
+const DEFAULT_IGNORABLE: [(u32, u32); 17] = [
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1_BCA0, 0x1_BCA3),
+    (0x1_D173, 0x1_D17A),
+    (0xE_0000, 0xE_0FFF),
+];
+
+/// Whether `c` is a default-ignorable code point (Unicode 17.0's
+/// `Default_Ignorable_Code_Point`):
+/// one a renderer shows as nothing when it has no glyph for it. A detected
+/// link's URL leaves these out (U3, #279), so the URL that opens is the
+/// text the cells show.
+#[must_use]
+pub fn is_default_ignorable(c: char) -> bool {
+    let c = u32::from(c);
+    // Below SHY (ASCII, most Latin-1) one compare.
+    if c < 0x00AD {
+        return false;
+    }
+    let i = DEFAULT_IGNORABLE.partition_point(|&(_, last)| last < c);
+    DEFAULT_IGNORABLE
+        .get(i)
+        .is_some_and(|&(first, _)| first <= c)
+}
+
+/// Whether byte `b` leads the UTF-8 form of some default-ignorable code
+/// point ([`DEFAULT_IGNORABLE`]).
+fn leads_default_ignorable(b: u8) -> bool {
+    // U+00AD, U+034F, U+061C, U+1xxx, U+2xxx, U+3164, U+Fxxx, U+1xxxx and
+    // U+Exxxx. Not `0xCC` (U+0300-U+033F) nor most CJK leads.
+    matches!(
+        b,
+        0xC2 | 0xCD | 0xD8 | 0xE1 | 0xE2 | 0xE3 | 0xEF | 0xF0 | 0xF3
+    )
+}
+
+/// Removes every default-ignorable code point ([`is_default_ignorable`])
+/// from `text`. A text without one costs one byte scan, with no lead byte
+/// of one (ASCII, combining marks U+0300-U+033F, most CJK) a scan without
+/// decoding.
+pub(crate) fn strip_default_ignorables(text: &mut String) {
+    // No early exit, so the scan vectorises.
+    let leads = text
+        .bytes()
+        .fold(false, |seen, b| seen | leads_default_ignorable(b));
+    if leads && text.chars().any(is_default_ignorable) {
+        text.retain(|c| !is_default_ignorable(c));
+    }
+}
+
+/// Whether `text` starts with a scheme's prefix (U1: `http://`, `https://`,
+/// `ftp://`, `file://` or `mailto:`, ASCII case-insensitive), whatever
+/// comes before it and after it.
+pub(crate) fn starts_scheme(text: &[char]) -> bool {
+    // Most characters start no scheme: one compare against the first
+    // letters before any prefix.
+    if !text
+        .first()
+        .is_some_and(|c| matches!(c.to_ascii_lowercase(), 'h' | 'f' | 'm'))
+    {
+        return false;
+    }
+    SCHEMES.iter().any(|(prefix, _)| {
+        text.len() >= prefix.len()
+            && text
+                .iter()
+                .zip(prefix.chars())
+                .all(|(&c, p)| c.eq_ignore_ascii_case(&p))
+    })
+}
+
+/// Whether `c`, right before a scheme, stops it starting a URL (U1).
+pub(crate) fn blocks_scheme(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')
 }
 
 /// A trailing character U4 strips.
@@ -496,7 +598,7 @@ impl<'a> Window<'a> {
     /// and U9, if it contains the point.
     fn candidate(&mut self, before: Option<char>) -> Option<Range<usize>> {
         steps(8);
-        if before.is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) {
+        if before.is_some_and(blocks_scheme) {
             return None;
         }
         let start = self.start;
@@ -774,6 +876,98 @@ mod tests {
             let c = char::from(b);
             let want = c.is_ascii_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=%".contains(c);
             assert_eq!(is_url_char(c), want, "{c:?}");
+        }
+    }
+
+    /// `Default_Ignorable_Code_Point` as Unicode 17.0's
+    /// DerivedCoreProperties.txt lists it, line by line.
+    const UCD_DEFAULT_IGNORABLE: &[(u32, u32)] = &[
+        (0x00AD, 0x00AD),
+        (0x034F, 0x034F),
+        (0x061C, 0x061C),
+        (0x115F, 0x1160),
+        (0x17B4, 0x17B5),
+        (0x180B, 0x180D),
+        (0x180E, 0x180E),
+        (0x180F, 0x180F),
+        (0x200B, 0x200F),
+        (0x202A, 0x202E),
+        (0x2060, 0x2064),
+        (0x2065, 0x2065),
+        (0x2066, 0x206F),
+        (0x3164, 0x3164),
+        (0xFE00, 0xFE0F),
+        (0xFEFF, 0xFEFF),
+        (0xFFA0, 0xFFA0),
+        (0xFFF0, 0xFFF8),
+        (0x1BCA0, 0x1BCA3),
+        (0x1D173, 0x1D17A),
+        (0xE0000, 0xE0000),
+        (0xE0001, 0xE0001),
+        (0xE0002, 0xE001F),
+        (0xE0020, 0xE007F),
+        (0xE0080, 0xE00FF),
+        (0xE0100, 0xE01EF),
+        (0xE01F0, 0xE0FFF),
+    ];
+
+    #[test]
+    fn default_ignorables_are_the_unicode_set() {
+        // Every scalar value: the merged table names exactly the listed
+        // code points, and each listed one has a lead byte the strip's
+        // pre-scan looks for.
+        for c in (0..=0x10_FFFF).filter_map(char::from_u32) {
+            let listed = UCD_DEFAULT_IGNORABLE
+                .iter()
+                .any(|&(first, last)| (first..=last).contains(&u32::from(c)));
+            assert_eq!(is_default_ignorable(c), listed, "{:04X}", u32::from(c));
+            if listed {
+                let mut utf8 = [0; 4];
+                let lead = c.encode_utf8(&mut utf8).as_bytes()[0];
+                assert!(leads_default_ignorable(lead), "{:04X}", u32::from(c));
+            }
+        }
+    }
+
+    #[test]
+    fn stripping_leaves_out_each_class_and_keeps_the_rest() {
+        // The classes #279 probed (ZWNJ, VS16, CGJ, a tag), then the first
+        // and last of every range, between visible text.
+        let mut probes = vec!['\u{200C}', '\u{FE0F}', '\u{034F}', '\u{E0041}'];
+        for &(first, last) in &DEFAULT_IGNORABLE {
+            probes.extend([first, last].into_iter().filter_map(char::from_u32));
+        }
+        for c in probes {
+            let mut text = format!("https://a\u{e9}.b/x{c}y\u{301}{c}");
+            strip_default_ignorables(&mut text);
+            assert_eq!(text, "https://a\u{e9}.b/xy\u{301}", "{:04X}", u32::from(c));
+        }
+        // Neighbours that are no default ignorables stay, ASCII untouched.
+        for keep in [
+            "https://a.b/~x",
+            "\u{AC}\u{AE}\u{34E}\u{350}\u{2028}\u{3165}\u{FFF9}\u{E1000}",
+        ] {
+            let mut text = keep.to_owned();
+            strip_default_ignorables(&mut text);
+            assert_eq!(text, keep);
+        }
+    }
+
+    #[test]
+    fn scheme_starts_are_the_detected_prefixes() {
+        for text in [
+            "https://", "HTTP://x", "ftp://", "File://", "mailto:", "mAiLtO:a",
+        ] {
+            assert!(starts_scheme(&chars(text)), "{text}");
+        }
+        for text in ["http:/", "https:", "mailto", "ssh://", "xhttp://", "", "h"] {
+            assert!(!starts_scheme(&chars(text)), "{text}");
+        }
+        for c in ['a', 'Z', '0', '+', '-', '.'] {
+            assert!(blocks_scheme(c), "{c:?}");
+        }
+        for c in [' ', '/', ':', '_', '\u{e9}', '\u{4e16}'] {
+            assert!(!blocks_scheme(c), "{c:?}");
         }
     }
 

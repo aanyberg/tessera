@@ -79,6 +79,7 @@
 
 use std::cmp::Reverse;
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
 use tessera_config::{RuleCheck, SmartRules};
 pub use tessera_grid::Point;
@@ -602,9 +603,44 @@ fn trim_url(text: &str, span: Range<usize>) -> Range<usize> {
     span.start..span.start + end
 }
 
+/// The wall time one double-click gives its smart-selection rules (#351
+/// m1): checked before each rule after the first, a rule not started
+/// within it is skipped. Rules are bounded in count and size (S5), not in
+/// time, and 64 slow user rules take ~425 ms on 8192 characters.
+pub const SMART_RULE_BUDGET: Duration = Duration::from_millis(50);
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: wall time charged to the budget per rule run, so a test
+    /// can spend the budget without slow rules.
+    static RULE_COST: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+    /// Test hook: how many rules the last [`smart_at`] on this thread ran.
+    static RULES_RUN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The time the rules of a click have taken: since `started`, plus in tests
+/// the charged cost of the `ran` rules.
+fn rules_time(started: Instant, ran: usize) -> Duration {
+    #[cfg(test)]
+    let charged = RULE_COST
+        .with(std::cell::Cell::get)
+        .saturating_mul(u32::try_from(ran).unwrap_or(u32::MAX));
+    #[cfg(not(test))]
+    let charged = {
+        let _ = ran;
+        Duration::ZERO
+    };
+    started.elapsed().saturating_add(charged)
+}
+
 /// The cells of the best smart-selection match of `rules` covering the
 /// character at `pos` (see the module docs), or `None`: no rule matches
 /// there, or `pos` is past the end of its line's text or on padding.
+///
+/// The rules share [`SMART_RULE_BUDGET`]: once it is spent, the rules not
+/// yet started are skipped (one debug log with the counts, S8) and the
+/// best match of those that ran wins; with none the word is selected. The
+/// first rule always runs.
 fn smart_at(lines: &Lines<'_>, pos: Pos, rules: &SmartRules) -> Option<(Pos, Pos)> {
     // (score, weight, length, start, rule) and the characters.
     type Key = (u64, u64, usize, Reverse<usize>, Reverse<usize>);
@@ -617,7 +653,23 @@ fn smart_at(lines: &Lines<'_>, pos: Pos, rules: &SmartRules) -> Option<(Pos, Pos
     let window = ScanWindow::around(lines, at, last);
     let click = window.bytes(window.click);
     let mut best: Option<(Key, Range<usize>)> = None;
+    let started = Instant::now();
+    #[cfg(test)]
+    RULES_RUN.with(|run| run.set(rules.len()));
     for (index, rule) in rules.rules().iter().enumerate() {
+        // `index` rules have run.
+        if index > 0 && rules_time(started, index) >= SMART_RULE_BUDGET {
+            let ran = index;
+            #[cfg(test)]
+            RULES_RUN.with(|run| run.set(ran));
+            tracing::debug!(
+                ran,
+                skipped = rules.len() - ran,
+                rules = rules.len(),
+                "smart selection budget spent; rules skipped"
+            );
+            break;
+        }
         for found in rule.regex().find_iter(&window.text) {
             if found.start() >= click.end {
                 break;
@@ -1434,16 +1486,18 @@ fn url_char(line: &Line, col: u16, cell: &Cell) -> char {
     cell.ch
 }
 
-/// The first hidden URL end ([`url::is_hidden_url_end`]) in `text`.
-/// Each starts with byte `0xD8` or `0xE2` in UTF-8, which a combining mark
-/// (`0xCC` to `0xCF` for U+0300-U+036F) and an ASCII character never hold,
-/// so most texts cost one byte scan.
+/// The first hidden URL end ([`url::is_hidden_url_end`]) in `text`, a
+/// cell's cluster or a link's text.
+///
+/// Of the hidden ends only the ZWJ and the bidi controls from U+200E on can
+/// be in a cluster, and each starts with byte `0xE2` in UTF-8, which a
+/// combining mark (`0xCC` to `0xCF` for U+0300-U+036F) and an ASCII
+/// character never hold, so most texts cost one byte scan. U+061C (ALM,
+/// lead byte `0xD8`) is GCB=Control: the terminal drops it at print and no
+/// cluster holds it (#281, tested), so the scan does not look for it.
 fn hidden_url_end(text: &str) -> Option<char> {
     // No early exit, so the scan vectorises.
-    let leads = text
-        .bytes()
-        .fold(0u8, |n, b| n | u8::from(b == 0xD8) | u8::from(b == 0xE2));
-    if leads == 0 {
+    if text.bytes().fold(0u8, |n, b| n | u8::from(b == 0xE2)) == 0 {
         return None;
     }
     text.chars().find(|&c| url::is_hidden_url_end(c))
@@ -1472,6 +1526,51 @@ fn hides_url_end(lines: &Lines<'_>, cells: &[Pos]) -> bool {
                     .is_some()
         })
     })
+}
+
+/// Whether a hidden URL end in a cell of the window `cells` (with `chars`,
+/// their base scalars) could give the point (`index`) a URL when
+/// [`url::url_at`] finds none on the base scalars: whether one of the cells
+/// that can change the answer hides one ([`hides_url_end`]).
+///
+/// A hidden end makes its cell a character that is no URL character, which
+/// ends the run of URL characters there. It cannot start a scheme, and so
+/// it cannot add a candidate. Proof that only these cells can change "no
+/// URL", given the starts `s <= index` where a scheme's prefix starts
+/// ([`url::starts_scheme`]; with none there is no candidate on either
+/// side, so no cell matters):
+///
+/// - **the cell before a start** (`s - 1`), when its base scalar blocks the
+///   scheme (U1, [`url::blocks_scheme`]): the hidden end does not, so the
+///   start can become a URL. When the base scalar does not block, both
+///   leave U1 passing and only the run's start moves, which changes no
+///   candidate of a later start;
+/// - **every cell after the point**: cutting the run there shortens each
+///   candidate, which can bring an over-cap one under U9 or turn a CJK cut
+///   (where U4 strips a trailing `-`) into the run's end (where it keeps
+///   it);
+/// - no other cell. One before the point that is not before a start cuts
+///   the run: the candidates of starts before it lose the point, and those
+///   after it are the base's own (same scheme, same character before it,
+///   same text from it on, as the CJK cut's label scan stops at the
+///   scheme), which found nothing. The point's own cell is checked by
+///   [`window`].
+///
+/// The cells inside a scheme only break it, which also adds no URL. So
+/// over text that has a `:` but no scheme (a time, a path) this reads no
+/// cluster (#281).
+fn hidden_end_can_link(lines: &Lines<'_>, chars: &[char], cells: &[Pos], index: usize) -> bool {
+    let mut started = false;
+    for s in 0..=index {
+        if !url::starts_scheme(&chars[s..]) {
+            continue;
+        }
+        started = true;
+        if s > 0 && url::blocks_scheme(chars[s - 1]) && hides_url_end(lines, &cells[s - 1..s]) {
+            return true;
+        }
+    }
+    started && hides_url_end(lines, &cells[index + 1..])
 }
 
 /// The character before `pos` on its logical line, as
@@ -1639,12 +1738,13 @@ fn osc8_link(grid: &Grid, offset: usize, at: Point) -> Option<Link> {
 ///
 /// The window holds base scalars, and a cell that hides a URL end
 /// ([`url_char`]) ends the run of URL characters there, which can change
-/// the answer. The lookup checks the cells outside the span it found here
-/// (all of them when it found none), and [`link_of`] those inside as it
-/// reads their clusters anyway: a cluster cell costs one more lookup only
-/// outside the link. When a cell hides an end, the lookup runs again on
-/// every cell's [`url_char`], which gives the answer the whole logical
-/// line of [`url_char`]s would.
+/// the answer. The lookup checks the cells outside the span it found here,
+/// and [`link_of`] those inside as it reads their clusters anyway: a
+/// cluster cell costs one more lookup only outside the link. When it found
+/// none, it checks only the cells that could give the point a URL
+/// ([`hidden_end_can_link`]). When a cell hides an end, the lookup runs
+/// again on every cell's [`url_char`], which gives the answer the whole
+/// logical line of [`url_char`]s would.
 fn link_with_reach(grid: &Grid, offset: usize, at: Point, reach: usize) -> Option<Link> {
     let lines = Lines::of(grid);
     let pos = lines.exact(offset, at)?;
@@ -1659,7 +1759,7 @@ fn link_with_reach(grid: &Grid, offset: usize, at: Point, reach: usize) -> Optio
                 return Some(link);
             }
         }
-        None if !hides_url_end(&lines, &cells) => return None,
+        None if !hidden_end_can_link(&lines, &chars, &cells, index) => return None,
         _ => {}
     }
     for (c, &p) in chars.iter_mut().zip(&cells) {
@@ -1674,8 +1774,16 @@ fn link_with_reach(grid: &Grid, offset: usize, at: Point, reach: usize) -> Optio
 }
 
 /// The link whose characters start at `cells`: their text (clusters
-/// whole) and their cells in the view at scroll `offset`, row by row, and
-/// whether one of the clusters hides a URL end ([`url_char`]).
+/// whole, default-ignorable code points left out) and their cells in the
+/// view at scroll `offset`, row by row, and whether one of the clusters
+/// hides a URL end ([`url_char`]).
+///
+/// The text leaves out what [`url::is_default_ignorable`] names (ZWNJ,
+/// variation selectors, CGJ, tags, fillers; #279): the cells show nothing
+/// for them, so the URL that opens is the text the cells show. The cap
+/// (U9) has already counted the cells, one character each, a cell whose
+/// only scalar is left out included; leaving them out only shortens the
+/// text, so the URL stays within [`MAX_URL_LEN`] characters after it.
 fn link_of(lines: &Lines<'_>, offset: usize, cells: &[Pos]) -> Option<(Link, bool)> {
     let mut text = String::new();
     let top = lines.view_top(offset);
@@ -1700,7 +1808,9 @@ fn link_of(lines: &Lines<'_>, offset: usize, cells: &[Pos]) -> Option<(Link, boo
         }
     }
     // A hidden end is in a cluster: no base scalar of a URL cell is one.
+    // Looked for before the invisible characters go (ZWJ is one of them).
     let hidden = hidden_url_end(&text).is_some();
+    url::strip_default_ignorables(&mut text);
     Some((
         Link {
             url: text,
@@ -1713,6 +1823,8 @@ fn link_of(lines: &Lines<'_>, offset: usize, cells: &[Pos]) -> Option<(Link, boo
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
+    use std::sync::Arc;
+    use tessera_config::{MAX_SMART_RULES, Precision};
     use tessera_term::Terminal;
 
     use super::*;
@@ -2055,6 +2167,17 @@ mod tests {
                 Some("https://a.jp-"),
             ),
             ("see https://a.jp-\u{65e5} ok", 6, Some("https://a.jp")),
+            // No URL on the base scalars, a hidden end after the point
+            // (#281): on the `-` that U4 strips before a CJK cut, the cell
+            // after it ends the run, and the `-` stays.
+            (
+                "see https://a.jp--\u{200d}-\u{65e5} ok",
+                16,
+                Some("https://a.jp-"),
+            ),
+            ("see https://a.jp---\u{65e5} ok", 16, None),
+            // A `:` and a hidden end but no scheme: nothing to find.
+            ("see 12:30\u{200d}x ok", 5, None),
         ] {
             let term = term(2, 40, bytes.as_bytes());
             let link = link_at(term.grid(), 0, point(0, col));
@@ -2068,6 +2191,142 @@ mod tests {
                 reference_link(term.grid(), point(0, col)),
                 "{bytes:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_hidden_end_after_the_point_can_bring_a_run_under_the_cap() {
+        // One logical line: a scheme and more URL characters than the cap
+        // (U9: no URL), cut by a cell that hides a URL end 100 cells after
+        // the point. The cut run is under the cap, so the point is in a
+        // URL; without the joiner it is not.
+        for (joiner, want) in [(true, true), (false, false)] {
+            let mut text = "https://a.b/".to_owned();
+            text.push_str(&"x".repeat(1_000));
+            text.push('y');
+            if joiner {
+                text.push('\u{200d}');
+            }
+            text.push_str(&"z".repeat(MAX_URL_LEN));
+            let term = term(40, 100, text.as_bytes());
+            let at = point(9, 12);
+            let link = link_at(term.grid(), 0, at);
+            assert_eq!(link.is_some(), want, "joiner {joiner}");
+            assert_eq!(link, reference_link(term.grid(), at), "joiner {joiner}");
+            if let Some(link) = link {
+                assert_eq!(link.url.chars().count(), 12 + 1_000);
+            }
+        }
+    }
+
+    #[test]
+    fn invisible_characters_are_left_out_of_a_detected_link() {
+        // #279: each class probed in the review (ZWNJ, VS16, CGJ, a tag)
+        // and the first and last code point of every default-ignorable
+        // range, inside a URL. The terminal drops some at print and joins
+        // others to the cell before them or gives them a cell: either way
+        // the URL that opens is the cells' text without them, and the
+        // hover span covers the cells the link shows.
+        let mut probes = vec!['\u{200C}', '\u{FE0F}', '\u{034F}', '\u{E0041}', '\u{E0020}'];
+        for &(first, last) in &[
+            (0x00AD, 0x00AD),
+            (0x034F, 0x034F),
+            (0x115F, 0x1160),
+            (0x17B4, 0x17B5),
+            (0x180B, 0x180F),
+            (0x200B, 0x200F),
+            (0x2060, 0x206F),
+            (0x3164, 0x3164),
+            (0xFE00, 0xFE0F),
+            (0xFEFF, 0xFEFF),
+            (0xFFA0, 0xFFA0),
+            (0xFFF0, 0xFFF8),
+            (0x1_BCA0, 0x1_BCA3),
+            (0x1_D173, 0x1_D17A),
+            (0xE_0000, 0xE_0FFF),
+            (0xE_0100, 0xE_01EF),
+        ] {
+            probes.extend([first, last].into_iter().filter_map(char::from_u32));
+        }
+        for c in probes {
+            if url::is_hidden_url_end(c) {
+                continue; // they end the URL (a_zwj_or_bidi_control...)
+            }
+            let bytes = format!("see https://a.com/x{c}y ok");
+            let term = term(2, 40, bytes.as_bytes());
+            let name = format!("U+{:04X}", u32::from(c));
+            let link = link_at(term.grid(), 0, point(0, 6)).expect(&name);
+            // The Hangul fillers are CJK letters: one with a cell of its own
+            // ends a path as any CJK character does (U3); U+1160 joins the
+            // `x` cell's cluster.
+            let own_cell = term
+                .grid()
+                .line(0)
+                .expect("a row")
+                .cells
+                .iter()
+                .any(|cell| cell.ch == c);
+            let want = if own_cell && url::is_cjk(c) {
+                "https://a.com/x"
+            } else {
+                "https://a.com/xy"
+            };
+            assert_eq!(link.url, want, "{name}");
+            assert_eq!(
+                Some(&link),
+                reference_link(term.grid(), point(0, 6)).as_ref()
+            );
+            // The span is the cells from the scheme to `y`, and their text
+            // without the invisible characters is the URL.
+            let row = term.grid().line(0).expect("a row");
+            let [(0, cols)] = link.span.as_slice() else {
+                panic!("{name}: one row, {:?}", link.span);
+            };
+            let shown: String = (cols.start..cols.end)
+                .filter_map(|col| {
+                    let cell = row.cells.get(usize::from(col))?;
+                    if cell.is_spacer() || cell.is_pad() {
+                        return None;
+                    }
+                    Some(match row.cluster(usize::from(col)) {
+                        Some(cluster) if cell.is_cluster() => cluster.to_owned(),
+                        _ => cell.ch.to_string(),
+                    })
+                })
+                .collect::<String>()
+                .chars()
+                .filter(|&c| !url::is_default_ignorable(c))
+                .collect();
+            assert_eq!(shown, link.url, "{name}");
+            assert_eq!(cols.start, 4, "{name}");
+            // The cell that holds it, if one does, hovers the same link.
+            for col in cols.clone() {
+                if let Some(other) = link_at(term.grid(), 0, point(0, col)) {
+                    assert_eq!(other.url, link.url, "{name} at {col}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn alm_never_reaches_a_cluster() {
+        // The hidden-end scan skips U+061C's lead byte (#281): the terminal
+        // drops ALM at print, alone, after a letter, a mark or a joiner,
+        // and in a URL.
+        for text in [
+            "a\u{061C}b",
+            "\u{061C}ab",
+            "e\u{301}\u{061C}b",
+            "a\u{200d}\u{061C}b",
+            "https://a.b/\u{061C}c",
+        ] {
+            let term = term(2, 30, text.as_bytes());
+            let row = term.grid().line(0).expect("a row");
+            for col in 0..row.cells.len() {
+                let cluster = row.cluster(col).unwrap_or_default();
+                assert!(!cluster.contains('\u{061C}'), "{text:?} at {col}");
+                assert_ne!(row.cells[col].ch, '\u{061C}', "{text:?} at {col}");
+            }
         }
     }
 
@@ -2556,7 +2815,7 @@ mod tests {
                 prop_oneof![
                     Just("https://".to_owned()),
                     Just("mailto:".to_owned()),
-                    "[a-c@./()\\[\\] \u{4e16}\u{301}\u{200d}]{0,5}",
+                    "[a-c@./()\\[\\] \u{4e16}\u{301}\u{200d}\u{200c}\u{fe0f}\u{3164}:-]{0,5}",
                     Just("\r\n".to_owned()),
                 ],
                 0..10,
@@ -2570,6 +2829,7 @@ mod tests {
                     let full = link_at(term.grid(), 0, at);
                     prop_assert_eq!(&full, &reference_link(term.grid(), at));
                     if let Some(link) = full {
+                        prop_assert!(!link.url.chars().any(url::is_default_ignorable));
                         prop_assert!(link.url.to_ascii_lowercase().starts_with("https://")
                             || link.url.to_ascii_lowercase().starts_with("mailto:"));
                         for (r, c) in &link.span {
@@ -2579,6 +2839,157 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #351 r2 n2: a window edge on a blank where the line goes on. A rule
+    /// that matches blanks (no default rule starts or ends with one) may
+    /// continue past that blank, so a match taking it is dropped, at the
+    /// start edge and at the end edge alike.
+    #[test]
+    fn a_match_taking_a_blank_at_a_window_edge_is_dropped() {
+        let rules = smart_rules(&[("[ x]+", Precision::Normal)]);
+        let check = |text: &str, click: usize, inside: &str| {
+            let mut term = Terminal::new(2, 100);
+            term.set_max_scrollback(1_000);
+            term.advance(text.as_bytes());
+            let lines = Lines::of(term.grid());
+            let at = Pos {
+                line: lines.base + i64::try_from(click / 100).unwrap(),
+                col: u16::try_from(click % 100).unwrap(),
+            };
+            let (_, last) = lines.text_end(at.line);
+            let window = ScanWindow::around(&lines, at, last.unwrap());
+            assert!(!(window.line_start && window.line_end), "{inside}: an edge");
+            assert_eq!(smart_at(&lines, at, &rules), None, "{inside}");
+        };
+        // Start edge: the window's first character is a blank of the run
+        // before "xx" (5100 - 4096 = 1004).
+        check(
+            &format!("{}{}xx", "b".repeat(100), " ".repeat(5_000)),
+            5_100,
+            "start",
+        );
+        // End edge: the window's last character (1 + 4095) is a blank.
+        check(&format!("xx{}b", " ".repeat(9_000)), 1, "end");
+        // Wholly inside the window the same match is found.
+        let mut term = Terminal::new(2, 100);
+        term.advance(b"b   xx b");
+        let lines = Lines::of(term.grid());
+        let at = Pos {
+            line: lines.base,
+            col: 4,
+        };
+        assert!(smart_at(&lines, at, &rules).is_some());
+    }
+
+    /// Rules made from `(pattern, precision)` pairs.
+    fn smart_rules(rules: &[(&str, Precision)]) -> Arc<SmartRules> {
+        let mut selection = tessera_config::Selection::default();
+        selection.smart_rules = Some(
+            rules
+                .iter()
+                .map(|&(regex, precision)| tessera_config::SmartRule::new(regex, precision))
+                .collect(),
+        );
+        selection.compiled_rules()
+    }
+
+    /// #351 m1: once the rules of a click have spent [`SMART_RULE_BUDGET`],
+    /// the rules not started are skipped and the best match of those that
+    /// ran wins; the first rule always runs. The cost is charged through
+    /// the test hook, so the test does not depend on the machine's speed.
+    #[test]
+    fn rules_past_the_click_budget_are_skipped() {
+        let rules = smart_rules(&[
+            ("[0-9]+", Precision::Normal),
+            ("q+", Precision::Normal),
+            ("/tmp/[a-z]+", Precision::VeryHigh),
+        ]);
+        let mut term = Terminal::new(2, 40);
+        term.advance(b"see /tmp/xyz ok");
+        let lines = Lines::of(term.grid());
+        let at = Pos {
+            line: lines.base,
+            col: 6,
+        };
+        let path = Some((
+            Pos {
+                line: lines.base,
+                col: 4,
+            },
+            Pos {
+                line: lines.base,
+                col: 11,
+            },
+        ));
+        let run = |cost: Duration| {
+            RULE_COST.with(|c| c.set(cost));
+            let found = smart_at(&lines, at, &rules);
+            RULE_COST.with(|c| c.set(Duration::ZERO));
+            (found, RULES_RUN.with(std::cell::Cell::get))
+        };
+        assert_eq!(run(Duration::ZERO), (path, 3), "within the budget");
+        assert_eq!(
+            run(SMART_RULE_BUDGET / 3),
+            (path, 3),
+            "spent after the third"
+        );
+        assert_eq!(
+            run(SMART_RULE_BUDGET / 2),
+            (None, 2),
+            "spent after the second"
+        );
+        assert_eq!(
+            run(SMART_RULE_BUDGET * 10),
+            (None, 1),
+            "the first always runs"
+        );
+        // The best of the rules that ran still wins.
+        let rules = smart_rules(&[
+            ("/tmp/[a-z]+", Precision::Normal),
+            ("[a-z]+", Precision::Normal),
+        ]);
+        RULE_COST.with(|c| c.set(SMART_RULE_BUDGET));
+        assert_eq!(smart_at(&lines, at, &rules), path);
+        RULE_COST.with(|c| c.set(Duration::ZERO));
+        assert_eq!(RULES_RUN.with(std::cell::Cell::get), 1);
+    }
+
+    /// #351 m1 in real time: 64 slow user rules (`[a-z]+X|[a-z]`, ~425 ms
+    /// a click on 8192 letters in a release build before the budget) stop
+    /// near [`SMART_RULE_BUDGET`]. The budget is wall time, so load makes
+    /// fewer rules run, not more; the bound is loose (500 ms, which one
+    /// rule run late under load still meets) and the fastest of five
+    /// clicks counts, so one descheduled click does not fail it.
+    #[test]
+    fn sixty_four_slow_rules_stay_near_the_click_budget() {
+        let slow = vec![("[a-z]+X|[a-z]", Precision::Normal); MAX_SMART_RULES];
+        let rules = smart_rules(&slow);
+        assert_eq!(rules.len(), MAX_SMART_RULES);
+        let mut term = Terminal::new(2, 200);
+        term.set_max_scrollback(1_000);
+        term.advance("a".repeat(20_000).as_bytes());
+        let lines = Lines::of(term.grid());
+        let mid = Pos {
+            line: lines.base + 50,
+            col: 100,
+        };
+        let mut fastest = Duration::MAX;
+        let mut ran = MAX_SMART_RULES;
+        for _ in 0..5 {
+            let started = Instant::now();
+            let _ = smart_at(&lines, mid, &rules);
+            let took = started.elapsed();
+            if took < fastest {
+                fastest = took;
+                ran = RULES_RUN.with(std::cell::Cell::get);
+            }
+        }
+        assert!(
+            fastest < Duration::from_millis(500),
+            "fastest click took {fastest:?} ({ran} rules ran)"
+        );
+        assert!(ran < MAX_SMART_RULES, "{ran} rules ran in {fastest:?}");
     }
 
     /// SS-C5: a match running past the scan window where its logical line

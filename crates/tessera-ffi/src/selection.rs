@@ -358,6 +358,11 @@ pub struct TextBuffer {
 /// length then 0), whatever the other buffers hold; else a buffer too
 /// short is `InvalidArgument`.
 ///
+/// So a NULL buffer next to a short one returns `NullPointer` with every
+/// length 0, not `InvalidArgument` with the sizes: a caller that passed a
+/// NULL `buf` with a `cap` claiming room has a bug to fix, not a size to
+/// retry with (#351; before #47's second round it was `InvalidArgument`).
+///
 /// # Safety
 ///
 /// Every buffer pointer must be writable, and each `buf` valid for its

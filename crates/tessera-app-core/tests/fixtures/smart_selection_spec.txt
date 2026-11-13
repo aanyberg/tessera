@@ -44,7 +44,7 @@
 #    Source column: iTerm2 = plists/SmartSelectionRules.plist (verbatim, modulo class translation); TESSERA = this fixture.
 # id            precision  source   pattern
 # cpp_namespace normal     iTerm2   (?:[A-Za-z0-9_]+::)+[A-Za-z0-9_]+
-# path          normal     iTerm2   ~?/?(?:[\p{L}\p{N}._-]+/+)+[\p{L}\p{N}._-]+/?
+# path          normal     iTerm2   ~?/?(?:[\p{L}\p{M}\p{N}._-]+/+)+[\p{L}\p{M}\p{N}._-]+/?   (\p{M} added, #351: NFD accents)
 # quoted        normal     iTerm2   @?"(?:[^"\\]|\\.)*"
 # include_path  normal     iTerm2   (?:[\p{L}\p{N}._]+\.)+[\p{L}\p{N}._]+
 # mailto        normal     iTerm2   \bmailto:(?:[a-z0-9A-Z_]+@)?(?:[a-zA-Z0-9\-]+\.)*[a-zA-Z0-9\-]+\b
@@ -560,6 +560,17 @@ text:   "/tmp/日本/x"
 by:     path
 cite:   path class \p{L}
 
+### SS-C4b  (a decomposed (NFD) accent inside a path)  [#351 adversarial (5)]
+size:   2x40
+feed:   "ls a+/Users/Jose\u0301/cafe\u0301.txt ok"   # '/' c5; "e\u0301" one cell each (c15, c20); '.' c21, t22 x23 t24
+click:  (0,19)                # 'f'
+sel:    linear (0,5)-(0,24)
+text:   "/Users/Jose\u0301/cafe\u0301.txt"
+by:     path
+note:   macOS file names are often NFD; without \p{M} in the path class the combining acute cuts the path after "Jose",
+        and the click on "cafe" falls back to the word, "a+/Users/..." ('+' is a word character, not a path one)
+cite:   path rule; UAX #44 General_Category M
+
 ### SS-C5  (match straddling the 8192-character scan window)  [DECISION D-WINDOW]
 size:   2x200, one 100000-character logical line (soft wraps)
 feed:   "a/" x 50000  (no spaces; the path rule would match all 100000 characters)
@@ -581,6 +592,15 @@ note:   a match the rule finds may start (end) a character or two inside the win
         where the line goes on is dropped. Wholly inside the window ("x " + "a::" x 1000 + "a y") the 3001-character name is selected.
         A rule matching across blanks (quoted strings) can still pair up differently in the window than on the whole line.
 cite:   rust-critic #47 round 1 B2 (the "a::" x 4000 repro)
+
+### SS-C5e  (a window start edge with no blank in it, the window ending with the line)  [#351 r2 n1]
+size:   70x200, one logical line
+feed:   "a/" x 3000 (6000 chars, no blank), click char 5000 (the window is chars 904..6000: it ends with the line, starts
+        mid-path, and holds no blank)
+sel:    the word: the whole line, as a word double-click selects it; not the 5096-character path the rule finds in the window
+note:   with no blank in the window, the run at its start edge is the whole window, so every match in it may be the tail
+        of a longer one and none is taken
+cite:   SS-C5b..d; rust-critic #47 round 2 n1
 
 ### SS-C6  (latency, release test)
 size:   1x2048 full of "/a" repeated, 64 rules (the 12 defaults + 52 copies with distinct patterns)
@@ -668,7 +688,9 @@ trim=false: "ab        "        # DECISION D-TRIMALL: output ends at the last no
 
 ## 7. OUTPUT GRAMMAR
 ### 7a HTML  (the ONLY elements: html head meta body pre span; the ONLY attribute: style; no <a>, <img>, <link>, <script>, url(), @import)
-document := "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body><pre style=\"font-family:Menlo,monospace\">" body "</pre></body></html>"
+document := "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body><pre style=\"font-family:Menlo,monospace\">" "\n" body "</pre></body></html>"
+# the LF after the <pre> open tag is always written (#351): a parser drops one LF right after it, so a body starting
+# with a blank line keeps that line
 body     := (run | "\n")*                 # lines joined by a literal LF, no trailing LF; <pre> keeps spaces
 run      := text | "<span style=\"" decl (";" decl)* "\">" text "</span>"
 decl     := "color:#rrggbb" | "background-color:#rrggbb" | "font-weight:bold" | "font-style:italic"
@@ -708,7 +730,7 @@ escape(c):
 
 ### 7c ROWS  (input cells -> expected strings; colours given as resolved #rrggbb)
 ### RT-1 plain                    cells: "hi"
-html: <!DOCTYPE html><html><head><meta charset="utf-8"></head><body><pre style="font-family:Menlo,monospace">hi</pre></body></html>
+html: <!DOCTYPE html><html><head><meta charset="utf-8"></head><body><pre style="font-family:Menlo,monospace">\nhi</pre>        (\n = one LF byte)</body></html>
 rtf:  {\rtf1\ansi\ansicpg1252\deff0{\fonttbl{\f0\fmodern Menlo;}}{\colortbl;}\f0\fs24 hi}
 ### RT-2 red bold then newline     cells: line1 "a" fg #ff0000 bold ; line2 "b" default
 html body: <span style="color:#ff0000;font-weight:bold">a</span>\nb          (\n = one LF byte)

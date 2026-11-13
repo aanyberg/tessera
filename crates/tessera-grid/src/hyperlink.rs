@@ -35,6 +35,12 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 /// Most hyperlink entities alive at once: held by a cell, in scrollback or
 /// as the active link. Past it [`Grid::begin_hyperlink`] refuses new ones.
 ///
+/// The cap holds per grid and for clones written on one thread. Clones of
+/// a grid share the count but check it before they add to it, so clones
+/// written on several threads at once can each add one past the cap
+/// before either sees the other's (#277: no compare-and-swap, since
+/// nothing in the product writes to a clone).
+///
 /// [`Grid::begin_hyperlink`]: crate::Grid::begin_hyperlink
 pub const MAX_LIVE_LINKS: usize = 65_536;
 
@@ -49,7 +55,8 @@ pub const MAX_ID_BYTES: usize = 250;
 /// Most bytes of URI and `id` text the live hyperlink entities of a grid
 /// hold together (16 MiB). Past it [`Grid::begin_hyperlink`] refuses new
 /// ones, as at [`MAX_LIVE_LINKS`]. With maximal URIs and ids this is the
-/// cap that binds: about 7 190 links of 2 083 + 250 bytes.
+/// cap that binds: about 7 190 links of 2 083 + 250 bytes. Clones written
+/// on several threads can pass it as they can [`MAX_LIVE_LINKS`].
 ///
 /// [`Grid::begin_hyperlink`]: crate::Grid::begin_hyperlink
 pub const MAX_LINK_TABLE_BYTES: usize = 16 * 1024 * 1024;
@@ -74,10 +81,13 @@ pub enum LinkRefused {
     EmptyUri,
     /// The URI is longer than [`MAX_URI_BYTES`].
     UriTooLong,
-    /// The URI holds a control character (C0, DEL or C1) or a bidirectional
-    /// formatting character (U+200E, U+200F, U+202A to U+202E, U+2066 to
-    /// U+2069). Such a link is refused rather than cleaned: a URI that
-    /// reorders or hides part of itself when shown is not one to open.
+    /// The URI holds a control character (C0, DEL or C1), a bidirectional
+    /// formatting character (U+061C, U+200E, U+200F, U+202A to U+202E,
+    /// U+2066 to U+2069) or a line or paragraph separator (U+2028, U+2029),
+    /// the set the OSC title filter drops. Such a link is refused rather
+    /// than cleaned: a URI that reorders, hides or breaks part of itself
+    /// when shown is not one to open. The text written under it still
+    /// prints.
     ControlInUri,
     /// [`MAX_LIVE_LINKS`] entities are alive, or the new one's URI and `id`
     /// would take the table past [`MAX_LINK_TABLE_BYTES`]. `first` is true
@@ -164,11 +174,12 @@ extern "C" fn unindex(link: &LinkData) {
     let key = (Arc::clone(id), Arc::clone(&link.uri));
     // The entry is this entity's unless the grid already reopened the `id`
     // (this one died on another thread meanwhile, and its successor took
-    // the entry over): leave a live successor alone.
-    if let Slot::Occupied(slot) = link.shared.index().entry(key)
-        && slot.get().strong_count() == 0
-    {
-        slot.remove();
+    // the entry over): leave a live successor alone. `get` then `remove`,
+    // not `entry`: an entry for a missing key reserves room for it, and a
+    // drop must not allocate (#277).
+    let mut index = link.shared.index();
+    if index.get(&key).is_some_and(|slot| slot.strong_count() == 0) {
+        index.remove(&key);
     }
 }
 
@@ -220,7 +231,9 @@ impl fmt::Debug for Hyperlink {
 /// A clone shares the counts and the index with the original (the links of
 /// a cloned grid are the original's entities, so they count once): a clone
 /// of a grid at a cap is at the cap too, and an `id` opened in one finds the
-/// live entity of the other.
+/// live entity of the other. [`LinkPool::create`] checks the caps and then
+/// adds to the counts, so clones creating links on several threads at once
+/// can each pass a cap by one (see [`MAX_LIVE_LINKS`]).
 #[derive(Clone)]
 pub(crate) struct LinkPool {
     shared: Arc<Shared>,
@@ -255,7 +268,8 @@ impl LinkPool {
     }
 
     /// Bytes of URI and `id` text the live entities hold, at most
-    /// [`MAX_LINK_TABLE_BYTES`].
+    /// [`MAX_LINK_TABLE_BYTES`] (see [`MAX_LIVE_LINKS`] for clones on
+    /// several threads).
     pub(crate) fn bytes(&self) -> usize {
         self.shared.bytes.load(Ordering::Relaxed)
     }
@@ -340,7 +354,13 @@ fn has_control(uri: &str) -> bool {
             ch.is_control()
                 || matches!(
                     ch,
-                    '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+                    '\u{061C}'
+                        | '\u{200E}'
+                        | '\u{200F}'
+                        | '\u{2028}'
+                        | '\u{2029}'
+                        | '\u{202A}'..='\u{202E}'
+                        | '\u{2066}'..='\u{2069}'
                 )
         })
 }
@@ -809,8 +829,9 @@ mod tests {
     fn controls_and_bidi_formatting_in_a_uri_refuse_the_link() {
         let mut pool = LinkPool::new();
         for ch in [
-            '\0', '\u{1b}', '\u{7f}', '\u{80}', '\u{85}', '\u{9b}', '\u{9f}', '\u{200e}',
-            '\u{200f}', '\u{202a}', '\u{202e}', '\u{2066}', '\u{2069}',
+            '\0', '\u{1b}', '\u{7f}', '\u{80}', '\u{85}', '\u{9b}', '\u{9f}', '\u{61c}',
+            '\u{200e}', '\u{200f}', '\u{2028}', '\u{2029}', '\u{202a}', '\u{202e}', '\u{2066}',
+            '\u{2069}',
         ] {
             assert_eq!(
                 pool.open(&format!("https://a.bc/{ch}x"), None).unwrap_err(),
@@ -826,6 +847,26 @@ mod tests {
             assert!(pool.open(uri, None).is_ok(), "{uri:?}");
         }
         assert_eq!(pool.live(), 0);
+    }
+
+    #[test]
+    fn a_dying_link_whose_entry_is_gone_does_not_grow_the_index() {
+        // The entry of a dying entity can be missing: its successor took it
+        // over and died first (two threads). `entry` would reserve a slot
+        // for the missing key, which allocates when the map is full (#277).
+        let mut pool = LinkPool::new();
+        let dying = pool.open("https://a.bc/", Some("dying")).unwrap();
+        pool.shared.index().clear();
+        let mut held = Vec::new();
+        let mut i = 0;
+        while held.is_empty() || pool.indexed() < pool.shared.index().capacity() {
+            held.push(pool.open("https://a.bc/", Some(&format!("k{i}"))).unwrap());
+            i += 1;
+        }
+        let capacity = pool.shared.index().capacity();
+        drop(dying);
+        assert_eq!(pool.shared.index().capacity(), capacity);
+        assert_eq!(pool.indexed(), held.len());
     }
 
     #[test]
