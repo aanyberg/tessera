@@ -8,7 +8,8 @@ use crate::palette::{ColorSlot, indexed_srgb};
 
 /// Linear-space RGBA color.
 ///
-/// Values are linear (not sRGB-encoded). When the render target has an sRGB
+/// Values are linear (not sRGB-encoded; the FFI's `TesseraRgba`, by
+/// contrast, holds sRGB-encoded ones). When the render target has an sRGB
 /// format the GPU encodes on write, so a clear to `Rgba { r: 0.25, .. }`
 /// lands as byte `137` in an `*Srgb` texture and as `64` in a plain `Unorm`
 /// one. See [`crate::OffscreenTarget`] for the test that pins this down.

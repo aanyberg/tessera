@@ -34,6 +34,10 @@ font_size = 13.0
 # Window opacity from 0.0 (invisible) to 1.0 (opaque), and whether to blur
 # what is behind the window when it is translucent.
 blur = false
+# Blur radius for the whole window (0 to 64): 0 keeps the standard blur
+# behind each pane that asks for it; above 0 blurs the window at that
+# radius while every translucent pane of the tab asks for blur.
+blur_radius = 0
 # Cursor shape: "block", "underline" or "beam" (a vertical bar), and whether
 # it blinks. Programs may change both (vim, fish); they come back to these
 # when a program asks for the default or the terminal is reset. An edit of
@@ -42,6 +46,9 @@ blur = false
 # drawn yet.
 cursor_shape = "block"
 cursor_blink = false
+# How much to darken the unfocused panes of a split tab, from 0.0 (off) to
+# 0.8.
+dim_inactive_panes = 0.0
 
 [terminal]
 # Maximum number of lines kept in scrollback per pane.

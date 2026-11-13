@@ -19,8 +19,9 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use tessera_ffi::{
-    App, Callbacks, Error, tessera_app_create_config, tessera_app_dim_inactive_panes,
-    tessera_app_free, tessera_app_new, tessera_app_set_callbacks, tessera_test_with_core,
+    App, Callbacks, Error, tessera_app_blur_radius, tessera_app_create_config,
+    tessera_app_dim_inactive_panes, tessera_app_free, tessera_app_new, tessera_app_set_callbacks,
+    tessera_test_with_core,
 };
 
 /// A theme-file edit is applied within a debounce plus 500 ms; the bound
@@ -354,6 +355,52 @@ fn dim_inactive_panes_follows_the_file(root: &Path) {
     unsafe { tessera_app_free(app) };
 }
 
+fn blur_radius(app: *const App) -> u32 {
+    let mut radius = u32::MAX;
+    // SAFETY: a live handle and writable storage for one `uint32_t`.
+    assert_eq!(
+        unsafe { tessera_app_blur_radius(app, &raw mut radius) },
+        Error::Ok
+    );
+    radius
+}
+
+/// #397 m5: `[appearance] blur_radius` is read at start and follows an
+/// edit of the file through the real watch, which calls
+/// `on_appearance_changed` (the host's cue to read it again); a value
+/// above the cap reads as the cap.
+fn blur_radius_follows_the_file(root: &Path) {
+    let dir = root.join("blur");
+    std::fs::create_dir_all(&dir).unwrap();
+    let config =
+        |radius: u32| format!("[appearance]\nopacity = 0.5\nblur = true\nblur_radius = {radius}\n");
+    std::fs::write(dir.join("config.toml"), config(20)).unwrap();
+    let app = new_app(&dir);
+    let (sender, told) = std::sync::mpsc::channel();
+    install(app, &sender);
+    assert_eq!(blur_radius(app), 20);
+
+    for (written, read) in [(40, 40), (900, tessera_config::Appearance::MAX_BLUR_RADIUS)] {
+        std::fs::write(dir.join("config.toml"), config(written)).unwrap();
+        let deadline = Instant::now() + BOUND;
+        while blur_radius(app) != read {
+            assert!(
+                Instant::now() < deadline,
+                "{written}: edit not applied in {BOUND:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            told.recv_timeout(BOUND).is_ok(),
+            "{written}: on_appearance_changed was not called"
+        );
+        while told.try_recv().is_ok() {}
+    }
+    // SAFETY: live handle, freed once; `sender` outlives it.
+    unsafe { tessera_app_free(app) };
+    drop(sender);
+}
+
 #[test]
 fn the_configured_theme_applies_at_start_and_edits_apply_live() {
     let root = tempfile::tempdir().unwrap();
@@ -364,4 +411,5 @@ fn the_configured_theme_applies_at_start_and_edits_apply_live() {
     directory_appearing_with_a_broken_file(root.path());
     uncreatable_directory(root.path());
     dim_inactive_panes_follows_the_file(root.path());
+    blur_radius_follows_the_file(root.path());
 }

@@ -359,8 +359,8 @@ pub unsafe extern "C" fn tessera_app_dim_inactive_panes(app: *const App, out: *m
 }
 
 /// Stores `[appearance] blur_radius` of the configuration in effect in
-/// `*out` (ADR 0045): the window's blur radius, already clamped to
-/// 0..=64. 0 keeps each pane's own material blur; above 0 the frontend
+/// `*out` (ADR 0045): the window's blur radius, 0..=64 (a larger value is
+/// lowered to 64, whatever set it). 0 keeps each pane's own material blur; above 0 the frontend
 /// blurs the whole window at that radius while every translucent pane of
 /// the tab asks for blur (`TesseraSessionAppearance::blur`), and sets no
 /// radius while the window is opaque or Reduce Transparency is on (the

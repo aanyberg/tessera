@@ -245,8 +245,9 @@ directory appears, whether the directory itself is the link or one above
 it (the application waits for the directory in both cases, #382 item 1,
 and the store it then watches is the one that refused, so the refusal
 carries over, #382 m2, except when ⌘, (`App::open_config`) runs in the
-up to 2 s before the wait's next poll sees the directory: that starts a
-watch on a fresh store, and an empty file there turns writes on); and
+up to 2 s before the wait's next poll sees the directory: that started a
+watch on a fresh store, and an empty file there turned writes on, until
+#393 F1 closed it, see the amendment of 2026-11-12); and
 while writes are refused this way, an empty (or
 whitespace-only, after an optional byte order mark, which TOML skips;
 #287) file applies the defaults with writes still off, since a save that
@@ -259,3 +260,76 @@ once, by the store, when it differs from the previous failure (#262 item
 6); the text it quotes from the file is escaped (controls, U+2028 and
 U+2029, and the bidirectional formatting controls) before it is logged or
 reported, as are theme lookup warnings (#262 items 4, 5 and 10; S8).
+
+## Amendment: link chains, flood rearm, waiting store, profile themes (#393, #397, 2026-11-12)
+
+**Every directory on the way.** The native backend no longer registers only
+the directories that hold a link. It walks `config.toml`'s path the way
+the kernel does (`chain_dirs`), and registers every directory it passes
+through on the way to the file, except the one that holds the file's last
+component (the root, or a linked file's target directory, registered
+already). That includes the real directories above the root, so a
+directory above it swapped by rename (`dirswap`), and a `config.toml`
+symlink through a retargeted directory link (`filelink`), are applied
+from an event, as fast as the poll backend applies them (#393 F3). The
+walk is capped at 8 links (`MAX_DIR_LINKS_FOLLOWED`) and 32 directories
+(`MAX_CHAIN_DIRS`); past either, or in a cycle, nothing on the way is
+registered (S5). A directory on the way that cannot be read (`EACCES`)
+and that the walk only passes through is left unwatched, with a debug
+log, and does not unarm the backend: a change there is seen only from the
+directories below it. One that holds a link the walk follows fails the
+registration instead, since a retarget there changes nothing below it, so
+the backend polls, as before this amendment (#393 B1).
+
+**Resolve, register, resolve again.** A link retargeted between the walk
+and the registrations could move the chain through a directory nobody
+registered (#393 m1). After registering, the backend walks the path again
+and registers anew until two walks agree, at most 9 times; a chain still
+changing after that is a failed registration, and the backend polls.
+
+**Past the cap, slowly.** A chain past a cap stays so until someone
+changes the links, so the backend polls it every 2 s
+(`CAPPED_CHAIN_POLL_INTERVAL`, the interval at which the application looks
+for a missing configuration directory) instead of every `poll_interval`
+(#393 m3): an idle watcher wakes at most once per 2 s. An edit in the
+configuration directory still applies at once, from the directory's own
+watch; a retarget on the way, within about 2 s. Each poll reloads only
+when `config.toml`'s metadata (followed through the links) changed since
+the last load.
+
+**An unrelated change on the way changes nothing.** A directory on the
+way is often busy (`~`, a dotfiles checkout). An event there re-registers
+and reloads only if the walk now lists other directories or a registered
+handle (the chain's, the root's, a linked file's target directory's, the
+file's) no longer names what its path names (#393 m2). Such events are
+debounced like the others, but they never extend the wait, and the walk
+is made once at its end: a stream of them costs one walk per `debounce`,
+and neither an edit of `config.toml` nor a change on the way during the
+stream waits longer than the usual debounce. Under 70 changes a second the
+watcher spends a few percent of the CPU time it did.
+
+**`open_config` keeps the waiting store.** While the application waits for
+a configuration directory behind a dangling link with a store that refused
+`config.toml`, ⌘, (`App::open_config`) starts the watch on that store, not
+a fresh one, so the refusal carries over and an empty or byte-order-mark
+only `config.toml` keeps clipboard writes off (#393 F1). The fail-closed
+rules of 2026-11-05 now hold without the exception noted there.
+
+**Profile themes.** The theme files named by profiles (`[profiles.*]
+appearance.theme`) are followed like the `[appearance]` theme: looked up
+before an outcome is applied, and registered on the native backend so a
+save in place (truncate and write, no rename) of one raises an event, the
+sessions using that profile restyle and `on_appearance_changed` is called
+(#397). The first 8 distinct ones (`MAX_PROFILE_THEMES_FOLLOWED`, in
+profile order) are registered; past that, a profile theme is still read at
+each reload but saved in place it is applied only with the next change in
+`themes/` or `config.toml`. The poll backend needs no change: it already
+fingerprints every theme file every few ticks (`POLL_FULL_THEMES_EVERY`).
+Starting a native watch no longer looks the theme up itself: the settle
+that `Watcher::spawn` runs first does, so start-up looks it up once on the
+caller's thread, not twice (#283 item 2).
+
+**Descriptors.** A native watcher holds at most one descriptor for the
+stop pipe, the root, a linked file's target directory, `themes/`, the
+theme file and `config.toml`, plus 8 unloadable theme files, 8 profile
+theme files and 32 directories on the way.

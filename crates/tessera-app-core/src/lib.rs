@@ -2224,8 +2224,10 @@ impl App {
     }
 
     /// The window's blur radius: `[appearance] blur_radius` of the
-    /// configuration in effect, already clamped to
-    /// 0..=[`tessera_config::Appearance::MAX_BLUR_RADIUS`] (ADR 0045). 0
+    /// configuration in effect, at most
+    /// [`tessera_config::Appearance::MAX_BLUR_RADIUS`] (ADR 0045): a loaded
+    /// configuration is clamped already, and a larger value in one built
+    /// another way ([`App::apply_config`]) is lowered here. 0
     /// keeps each pane's own material blur; above 0 the host blurs the
     /// whole window at that radius while every translucent pane of its
     /// tab asks for blur. It is the configured value whatever the display
@@ -2235,7 +2237,11 @@ impl App {
     /// observer's [`SessionObserver::on_appearance_changed`] is called, as
     /// for any change of the sessions' appearance; read it again then.
     pub fn blur_radius(&self) -> u32 {
-        lock(&self.applied).config.appearance.blur_radius
+        lock(&self.applied)
+            .config
+            .appearance
+            .blur_radius
+            .min(tessera_config::Appearance::MAX_BLUR_RADIUS)
     }
 
     /// How session `id`'s background is drawn now (ADR 0043): whether it
