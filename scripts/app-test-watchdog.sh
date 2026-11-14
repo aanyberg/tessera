@@ -14,7 +14,8 @@
 #     each later hang is handled the same way; when no test starts within the limit after a kill, the command's
 #     process group and any host left are killed;
 #   - if every hang's own sample has a thread stuck inside the Thread Sanitizer runtime (`__tsan::`/`__sanitizer::`
-#     frames at its hot leaf; see tsan_hang: the fork deadlock of #228, whose cause is #278) and the hung tests are the
+#     frames at its hot leaf; see tsan_hang: the fork deadlock of #228, whose cause is #278; the report also names the
+#     thread waiting inside `wrap_fork`, the other side of that deadlock, #443) and the hung tests are the
 #     run's only failures, reruns only them once, after the run ends (same arguments, `-only-testing:<Target>/<Class>/<test>`
 #     instead of any -only-testing/-skip-testing), and prints "TSan hang in <test> (#278), retried"; the run then
 #     passes if the rerun does. A hang outside the TSan runtime, a run with other failures or that did not finish
@@ -304,6 +305,12 @@ tsan_hang() {
         sub leaf {
             my @path = @stack;
             return if !@path || $path[-1]{count} * 2 < $total;
+            # The thread inside fork (TSan holds its locks there) waits outside the runtime, in an atfork handler:
+            # named so the report shows both sides of the #278 deadlock, not only the threads parked in the runtime.
+            if (grep { $_->{text} =~ /^wrap_fork / } @path) {
+                print "$thread is forking (the #278 deadlock: it waits in an atfork handler while TSan holds its locks):\n";
+                print "    $_->{text}\n" for reverse @stack[($#stack > 7 ? $#stack - 7 : 0) .. $#stack];
+            }
             pop @path while @path && ($path[-1]{text} =~ /\(in libsystem_(kernel|platform)\.dylib\)/
                 || $path[-1]{text} =~ /^(cthread_yield|DYLD-STUB\$\$\w+) .*\(in libsystem_pthread\.dylib\)/);
             return unless @path && $path[-1]{text} =~ /^(__tsan::|__sanitizer::|_ZN6__tsan|_ZN11__sanitizer)/;
@@ -360,7 +367,9 @@ for t in $hung; do
         fail "$what, and $t names no test target to rerun; not retried"
     fi
 done
-failed=(${(f)"$(cat "$state/failed" 2>/dev/null)"})
+# No file when xcodebuild listed no failure (with -test-iterations the restarted host repeats the hung test and it
+# can pass); `|| true` keeps errexit from ending the script here without a word (#443).
+failed=(${(f)"$(cat "$state/failed" 2>/dev/null || true)"})
 others=(${(u)failed:|hung_names})
 (( ${#others} == 0 )) || fail "$what, and other tests failed: ${(j:, :)others}; not retried"
 args=()

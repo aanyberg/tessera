@@ -769,6 +769,17 @@ final class TabVisibilityTests: XCTestCase {
         try await checkRoute("makeKeyAndOrderFront") { _, tab in tab.makeKeyAndOrderFront(nil) }
     }
 
+    /// #443: a window or tab the app opens leaves restoration to the window
+    /// state store. AppKit's own restoration work takes a lock that a
+    /// session spawn's fork waits for under TSan (#278).
+    func testTheAppsWindowsAndTabsAreNotRestorableByAppKit() throws {
+        let first = try appDelegate.newWindow()
+        let window = try XCTUnwrap(first.window)
+        let second = try appDelegate.newTab(in: window)
+        XCTAssertFalse(window.isRestorable, "a new window")
+        XCTAssertFalse(try XCTUnwrap(second.window).isRestorable, "a new tab")
+    }
+
     /// #405 n1: the radius changed in the file while the window's tabs are
     /// minimized, then while the app is hidden, reaches every tab window as
     /// it comes back, through the real window-number guard (a minimized or

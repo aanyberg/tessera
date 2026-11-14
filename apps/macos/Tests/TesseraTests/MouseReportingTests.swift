@@ -91,7 +91,8 @@ final class MouseReportingTests: XCTestCase {
     /// started recording to ``file``, and checks that nothing reached it.
     private func waitForRecorder() async throws {
         checkedLength = 0
-        try await waitUntil("the modes and lines are parsed and the recorder runs") {
+        // 30 s: the child's first output can stall that long on a loaded host.
+        try await waitUntil("the modes and lines are parsed and the recorder runs", timeout: .seconds(30)) {
             guard let position = try? self.view.session.scrollPosition else { return false }
             return position.history + UInt64(position.rows) > UInt64(Self.lines)
                 && FileManager.default.fileExists(atPath: self.file.path)

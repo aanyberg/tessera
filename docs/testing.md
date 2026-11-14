@@ -31,6 +31,21 @@ from the branch you have checked out now. Before an eye check, rebuild (`just ap
 DerivedData app was built from (`git -C <worktree> branch --show-current` and the build time of
 `apps/macos/DerivedData/Build/Products/Debug/Tessera.app`); a check against a stale app proves nothing about the branch.
 
+**A hang under Thread Sanitizer is usually the fork deadlock of #278.** The session spawn forks on the main thread, and
+TSan's `fork` interceptor holds the runtime's slot locks while libSystem's atfork handlers take their own locks
+(corecrypto's `ccrng`, the Objective-C runtime). Another thread that holds one of those locks and then enters the
+runtime (`__tsan::SlotLock`) deadlocks the host. Every other thread that touches the runtime then parks in `SlotLock`
+too, the font index's `close` in `Coverage::build` among them (#443): those threads are bystanders. In the watchdog's
+sample (`apps/macos/build/app-test-hang-sample.log`), look for the thread it reports as "forking" and for the thread
+that holds the atfork lock. In #443 that was AppKit's `NSPersistentUI` queue (`arc4random_buf` from
+`-[NSPersistentUIWindowInfo initWithWindowID:]`); other samples show a CoreSpotlight queue. Terminal windows are not
+restorable by AppKit (the window state store restores them), which removes the `NSPersistentUI` partner but not the
+others. `scripts/app-test-watchdog.sh` kills such a host and reruns the hung test once; the run fails anyway when
+another test failed in it. A test that waits for a child's output should therefore wait for all of it and allow 30 s, so
+that it does not fail on its own on a loaded host. To reproduce locally, run the affected classes under TSan with
+`-test-iterations 20` through the watchdog (`taskpolicy -b` and a concurrent `cargo build`). On main that gave 1 hang in
+60 iterations of `TabVisibilityTests` and `PromptNavigationTests`, and none in 40 with terminal windows not restorable.
+
 ## Tests and the home directory
 
 Tests never read or write the real home directory. Tests that create an
