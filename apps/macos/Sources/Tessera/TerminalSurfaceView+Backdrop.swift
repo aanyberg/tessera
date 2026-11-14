@@ -100,8 +100,10 @@ extension TerminalSurfaceView {
 /// not the window is key, so the pane does not change when the focus moves
 /// to another window. It fills the pane it blurs, or the strip above the
 /// panes, and takes no clicks, the pointer or accessibility. Its material is
-/// a constant the tests pin; whether it looks right (dark and light system
-/// appearance, a dark theme at 0.7 and 0.5 opacity) is an eye check.
+/// a constant the tests pin. It sets no appearance of its own, so it draws
+/// in the app's (`app_appearance`, #365: dark, light or the system's) as the
+/// window's effective appearance resolves it; whether it looks right under
+/// each (with a dark theme at 0.7 and 0.5 opacity) is an eye check.
 @MainActor
 final class PaneBackdropView: NSVisualEffectView {
     override init(frame: NSRect) {

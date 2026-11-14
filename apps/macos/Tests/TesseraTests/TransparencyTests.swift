@@ -470,6 +470,13 @@ final class TransparencyTests: XCTestCase {
         // The tab group's change shows the window as its opaque panes ask
         // (#409); flipped here by hand again, as above.
         assertTitlebar(controller, translucent: false, "the tab joined: as the panes ask")
+        // #417 M2: the tab bar takes the panes' top inside the same frame,
+        // and the flip to opaque that comes with it resizes nothing more: the
+        // pane is resized once, for the tab bar (with a renderer; without one
+        // nothing reaches the core).
+        XCTAssertEqual(window.frame, frame, "the tab joined: the window keeps its frame")
+        let joinResizes = pane.view.surface.isAttached ? resizes + 1 : resizes
+        XCTAssertEqual(pane.view.coreResizeCount, joinResizes, "the tab joined: one resize, for the tab bar")
         content.updateTitlebar(translucent: true)
         assertTitlebar(controller, translucent: true, "blurred, with a tab bar")
 

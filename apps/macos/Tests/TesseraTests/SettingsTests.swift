@@ -34,6 +34,9 @@ final class SettingsTests: XCTestCase {
         if replacedCore {
             try appDelegate.replaceCore(start: false)
         }
+        // An edit of `app_appearance` made the app light; the next test
+        // expects the app's default.
+        AppDelegate.applyAppAppearance(.dark)
         if let bar = NSApp.mainMenu { MainMenu.setProfiles([], in: bar) }
         if let previous { setenv("TESSERA_CONFIG_DIR", previous, 1) } else { unsetenv("TESSERA_CONFIG_DIR") }
         if let dir { try? FileManager.default.removeItem(at: dir) }
@@ -725,6 +728,7 @@ final class SettingsTests: XCTestCase {
             Edit(key: "general.default_profile", value: .string("two"), line: #"default_profile = "two""#),
             Edit(key: "general.confirm_close", value: .bool(false), line: "confirm_close = false"),
             Edit(key: "general.remote_indicator", value: .string("off"), line: #"remote_indicator = "off""#),
+            Edit(key: "appearance.app_appearance", value: .string("light"), line: #"app_appearance = "light""#),
             Edit(key: "appearance.theme", value: .string(theme), line: "theme = \"\(theme)\""),
             Edit(key: "appearance.font_family", value: .string(font), line: "font_family = \"\(font)\""),
             Edit(key: "appearance.font_size", value: .float(15), line: "font_size = 15.0"),

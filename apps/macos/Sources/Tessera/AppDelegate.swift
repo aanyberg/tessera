@@ -126,17 +126,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Runs before any window exists, so every window, sheet and panel the
-    /// app shows starts out with the app's appearance.
+    /// app shows starts out dark, the default, until the core is started and
+    /// its `app_appearance` read (``readAppAppearance()``).
     func applicationWillFinishLaunching(_ notification: Notification) {
-        Self.applyAppAppearance()
+        Self.applyAppAppearance(.dark)
     }
 
-    /// The app is always dark, whatever the system's Light or Dark setting
-    /// (ADR 0043, #364): terminal windows, their title and tab bars, the find
-    /// bar, Settings, alerts and sheets. The one place that sets the app's
-    /// appearance, for the dark, light and system choice (#365) to replace.
-    static func applyAppAppearance() {
-        NSApp.appearance = NSAppearance(named: .darkAqua)
+    /// The one place that sets the app's appearance (#365, ADR 0043):
+    /// `NSApp.appearance` dark (`.darkAqua`), light (`.aqua`) or `nil` for
+    /// the system's, which AppKit then follows live with no code here. Every
+    /// terminal window, its title and tab bars and blur, the find bar,
+    /// Settings, alerts and sheets inherit it; nothing sets a window's own.
+    /// A value equal to the current one changes nothing, so a reload that
+    /// keeps it redraws no window.
+    static func applyAppAppearance(_ value: TesseraApp.AppAppearance) {
+        let appearance: NSAppearance? =
+            switch value {
+            case .dark: NSAppearance(named: .darkAqua)
+            case .light: NSAppearance(named: .aqua)
+            case .system: nil
+            }
+        guard NSApp.appearance?.name != appearance?.name else { return }
+        NSApp.appearance = appearance
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -489,6 +500,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         core.delegate = router
         self.core = core
         router.onConfigurationApplied = { [weak self] in
+            self?.readAppAppearance()
             self?.applyKeymap()
             self?.readPaneDimming()
             self?.readBlurRadius()
@@ -496,6 +508,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.applyProfiles()
             self?.settingsWindowController?.model.reload()
         }
+        // Before the caller opens the window the core was started for.
+        readAppAppearance()
         applyKeymap()
         readPaneDimming()
         readRemoteIndicator()
@@ -557,6 +571,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             MainMenu.setProfiles(try core.profileNames(), in: bar)
         } catch {
             Self.log.error("profiles not read: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    /// Reads `app_appearance` from the core and applies it to the app: at
+    /// start and after every configuration it applies (live reload, a
+    /// Settings edit). Keeps the previous appearance if it cannot be read.
+    private func readAppAppearance() {
+        guard let core else { return }
+        do {
+            Self.applyAppAppearance(try core.appAppearance())
+        } catch {
+            Self.log.error("app_appearance not read: \(String(describing: error), privacy: .public)")
         }
     }
 
