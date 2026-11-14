@@ -14,7 +14,8 @@ import os
 ///   is sent when the live resize ends.
 /// - Drawing: a display link (`NSView.displayLink(target:selector:)`) renders
 ///   once per refresh while something changed (output, focus, size), and is
-///   paused while the window is occluded or minimised.
+///   paused while the view is hidden (a pane behind a maximized one) or
+///   the window is occluded or minimised.
 /// - Keyboard: `keyDown` goes through `interpretKeyEvents`, so dead keys and
 ///   input methods compose through `NSTextInputClient`. Committed text is
 ///   sent as typed text (never as a paste); keys are mapped from their key
@@ -460,12 +461,26 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         metrics = nil
     }
 
-    /// Whether the window is hidden from the user: minimised, occluded or
-    /// gone. The display link is paused meanwhile.
+    /// Whether the view is hidden from the user: hidden itself or by an
+    /// ancestor (a pane behind a maximized one, #323), or its window
+    /// minimised, occluded or gone. The display link is paused meanwhile.
     var isOccluded: Bool {
+        if isHiddenOrHasHiddenAncestor { return true }
         if let occlusionOverride { return occlusionOverride }
         guard let window else { return true }
         return window.isMiniaturized || !window.occlusionState.contains(.visible)
+    }
+
+    /// Hidden, or shown again, with an ancestor (a pane behind a maximized
+    /// one, #323): the link follows, and a pane shown again is redrawn.
+    override func viewDidHide() {
+        super.viewDidHide()
+        updateDisplayLinkPause()
+    }
+
+    override func viewDidUnhide() {
+        super.viewDidUnhide()
+        updateDisplayLinkPause()
     }
 
     /// Whether the display link is paused.

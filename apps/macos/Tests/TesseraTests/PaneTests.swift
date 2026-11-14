@@ -1291,6 +1291,55 @@ extension PaneTests {
         }
     }
 
+    /// #323: a pane hidden behind a maximized one (through Maximize Pane's
+    /// action, as the menu sends it) draws nothing while its shell floods
+    /// it for 2 s, with the refreshes a running link would deliver (the
+    /// hosted app's windows are never on screen, so a real link does not
+    /// fire, and each view is told its window is visible): its link stays
+    /// paused and no frame renders; the core keeps reading the output and
+    /// its grid stays. Shown again, the next refresh draws its latest
+    /// output.
+    func testAPaneHiddenBehindAMaximizedOneDrawsNothingUntilShownAgain() async throws {
+        let controller = try openTab()
+        let shown = controller.focusedPane
+        let hidden = try split(controller, .right)
+        try skipUnlessAttached(controller)
+        for pane in [shown, hidden] { pane.view.occlusionOverride = false }
+        controller.focus(shown)
+        let resizes = hidden.view.coreResizeCount
+        try await start("seq 1 1000000000", in: hidden)
+
+        controller.toggleZoomPane(nil)
+        XCTAssertTrue(controller.isZoomed)
+        XCTAssertTrue(hidden.view.isHiddenOrHasHiddenAncestor, "hidden")
+        XCTAssertTrue(hidden.view.isOccluded)
+        XCTAssertTrue(hidden.view.isDisplayLinkPaused, "its link is paused")
+        let before = hidden.view.renderCount
+        let shownBefore = shown.view.renderCount
+        let output = try hidden.session.foregroundProcess()?.name
+        XCTAssertEqual(output, "seq", "the flood runs")
+        let deadline = ContinuousClock.now + .seconds(2)
+        while ContinuousClock.now < deadline {
+            hidden.view.displayLinkDidFire()
+            shown.view.sessionDidOutput()
+            shown.view.displayLinkDidFire()
+            try await Task.sleep(for: .milliseconds(16))
+            XCTAssertTrue(hidden.view.isDisplayLinkPaused, "the output does not wake its link")
+        }
+        XCTAssertEqual(hidden.view.renderCount, before, "no frame while hidden")
+        XCTAssertGreaterThan(shown.view.renderCount, shownBefore, "the maximized pane draws")
+        XCTAssertEqual(hidden.view.coreResizeCount, resizes, "its grid stays")
+
+        controller.toggleZoomPane(nil)
+        XCTAssertFalse(controller.isZoomed)
+        XCTAssertFalse(hidden.view.isOccluded)
+        XCTAssertFalse(hidden.view.isDisplayLinkPaused, "shown again, its link runs")
+        hidden.view.displayLinkDidFire()
+        XCTAssertEqual(hidden.view.renderCount, before + 1, "the next refresh draws it")
+        XCTAssertEqual(hidden.view.coreResizeCount, resizes, "at the grid it kept")
+        try hidden.session.write([0x03])
+    }
+
     /// A layout held by a clamp (the left pane's larger font keeps it above
     /// its ratio's share): maximizing either pane leaves the other's frame
     /// and grid alone, a font change of the maximized pane too, and showing
@@ -1458,12 +1507,61 @@ extension PaneTests {
         XCTAssertEqual(shades(controller)[1]?.alphaValue ?? 0, 0.8, accuracy: 0.001, "at most 0.8")
         appDelegate.paneDimming = .nan
         XCTAssertEqual(shades(controller).compactMap { $0 }.count, 0, "not a number draws nothing")
+        // NaN fails `amount > 0` with or without the clamp's `isFinite`
+        // guard; infinity is what the guard is for (#323).
+        appDelegate.paneDimming = 0.3
+        appDelegate.paneDimming = .infinity
+        XCTAssertEqual(shades(controller).compactMap { $0 }.count, 0, "infinity draws nothing")
         appDelegate.paneDimming = 0.3
         XCTAssertNotNil(shades(controller)[1])
 
         controller.closeFocusedPane(nil)
         XCTAssertEqual(controller.panes, [right])
         XCTAssertEqual(shades(controller).compactMap { $0 }.count, 0, "back to one pane: none")
+    }
+
+    /// #417 T5 m2 and M5: a translucent window given a frame of no height
+    /// at all (by a program) still keeps the whole title bar in its
+    /// smallest content size, and its panes, with no height, are not taken
+    /// for panes at the top (whose sessions tint the strip); at the
+    /// smallest frame every pane keeps its smallest size and is at the top
+    /// again. Driven directly, so it runs without a renderer too.
+    func testAFrameOfNoHeightKeepsTheTitleBarInTheSmallestSize() throws {
+        let controller = try openTab()
+        _ = try split(controller, .right)
+        let window = try XCTUnwrap(controller.window)
+        let content = try XCTUnwrap(window.contentView as? TerminalWindowContentView)
+        let container = controller.paneContainer
+        content.updateTitlebar(translucent: true)
+        let titlebar = TerminalWindowContentView.standardTitlebarHeight(of: window)
+        XCTAssertGreaterThan(titlebar, 20, "a title bar")
+        let minimum = container.minimumSize.height
+
+        var zero = window.frame
+        zero.size.height = 0
+        window.setFrame(zero, display: false)
+        container.layoutSubtreeIfNeeded()
+        XCTAssertEqual(content.bounds.height, 0, "content of no height")
+        XCTAssertEqual(content.titlebarInset, titlebar, "the title bar still counts")
+        XCTAssertEqual(window.contentMinSize.height, minimum + titlebar, "the panes' smallest size plus the title bar")
+        XCTAssertEqual(container.paneFrames.count, 2)
+        for (_, frame) in container.paneFrames {
+            XCTAssertLessThan(frame.height, 1, "no pane has height")
+            XCTAssertGreaterThanOrEqual(frame.width, 1, "but each has width")
+        }
+        XCTAssertTrue(container.topEdgePanes.isEmpty, "a pane with no height is not at the top")
+
+        var smallest = window.frame
+        smallest.size.height =
+            window.frameRect(forContentRect: NSRect(origin: .zero, size: window.contentMinSize)).height
+        window.setFrame(smallest, display: false)
+        container.layoutSubtreeIfNeeded()
+        for pane in controller.panes {
+            XCTAssertGreaterThanOrEqual(
+                pane.view.frame.height, PaneContainerView.minimumSize(of: pane.view).height - 0.5,
+                "each pane keeps its smallest height")
+        }
+        XCTAssertEqual(container.topEdgePanes.map(\.leaf), controller.panes, "both are at the top again")
     }
 
     /// A configuration the core applies is read again (live reload): the
@@ -2548,6 +2646,85 @@ extension PaneTests {
         XCTAssertEqual(proxy.layoutChanges, 1, "its ratio is saved")
     }
 
+    /// Two divider drags on different splits, each ended by an exception
+    /// in AppKit within one pass of the run loop's default mode, a pane
+    /// closing during the second (#417 T3): the default mode ends only the
+    /// second, as ``PaneContainerView/dividerDragDidEnd(_:)`` would, so each
+    /// split keeps the share its own drag left (the second's last steps
+    /// came after the close, which the split views built before it could
+    /// not map to the tree), the closed pane's view leaves, and zoom works.
+    func testTwoDividerDragsEndedByExceptionsEachKeepTheirOwnSplitsRatio() async throws {
+        weak var closingView: TerminalSurfaceView?
+        let (controller, left, topRight, bottomRight, closing) = try autoreleasepool {
+            let controller = try openTab()
+            let left = controller.focusedPane
+            let topRight = try split(controller, .right)
+            let bottomRight = try split(controller, .below)
+            let extra = try split(controller, .right)
+            closingView = extra.view
+            return (controller, left, topRight, bottomRight, extra)
+        }
+        try skipUnlessAttached(controller)
+        let proxy = PaneHostProxy(app: appDelegate)
+        controller.delegate = proxy
+        defer { controller.delegate = appDelegate }
+        let container = controller.paneContainer
+        let (outerStart, innerStart, innerX) = autoreleasepool {
+            let topRightFrame = frame(of: topRight, in: controller)
+            return (frame(of: left, in: controller).maxX + 0.5, topRightFrame.maxY + 0.5, topRightFrame.midX)
+        }
+        let outer = ExceptionDrag(
+            start: outerStart,
+            steps: [
+                { post in
+                    for step in 1...5 { post(.leftMouseDragged, outerStart - CGFloat(10 * step)) }
+                    return true
+                },
+                { _ in abs(self.frame(of: left, in: controller).maxX - (outerStart - 50.5)) < 1 },
+            ])
+        let inner = ExceptionDrag(
+            start: innerStart, point: { NSPoint(x: innerX - 50, y: $0) },
+            steps: [
+                { post in
+                    for step in 1...5 { post(.leftMouseDragged, innerStart - CGFloat(10 * step)) }
+                    return true
+                },
+                { _ in
+                    guard self.frame(of: topRight, in: controller).maxY < innerStart - 25 else { return false }
+                    try? closing.session.write(Array("exit\n".utf8))
+                    return true
+                },
+                { post in
+                    guard controller.panes.count == 3 else { return false }
+                    for step in 6...15 { post(.leftMouseDragged, innerStart - CGFloat(10 * step)) }
+                    return true
+                },
+                { _ in abs(self.frame(of: topRight, in: controller).maxY - (innerStart - 150.5)) < 1 },
+            ])
+        try await trackDividerDragsUntilExceptions(
+            [outer, inner], in: container, window: try XCTUnwrap(controller.window))
+        try await waitUntil("the closed pane's view leaves the tab") { closingView?.window == nil }
+        XCTAssertEqual(controller.panes, [left, topRight, bottomRight])
+        XCTAssertEqual(splitViews(in: container), 2, "no stale split view")
+        let splits = container.tree.root.splits
+        let width = frame(of: left, in: controller).maxX
+        XCTAssertEqual(width, outerStart - 50.5, accuracy: 1, "the first drag's divider stays")
+        XCTAssertEqual(
+            splits[0].ratio * (container.bounds.width - PaneSplitView.thickness), width, accuracy: 1,
+            "the tree keeps the first drag's ratio")
+        let height = frame(of: topRight, in: controller).height
+        XCTAssertEqual(
+            frame(of: topRight, in: controller).maxY, innerStart - 150.5, accuracy: 1,
+            "the second drag's divider is where its last step left it")
+        XCTAssertEqual(
+            splits[1].ratio * (container.bounds.height - PaneSplitView.thickness), height, accuracy: 1,
+            "the tree keeps the second drag's ratio")
+        XCTAssertFalse(isTrackingDividerDragInEventTrackingMode(container), "the drags ended")
+        XCTAssertEqual(proxy.layoutChanges, 2, "saved for the close and once at the drags' end")
+        XCTAssertTrue(controller.toggleZoom(), "zoom is not refused")
+        XCTAssertTrue(controller.toggleZoom())
+    }
+
     /// A divider drag that an exception in AppKit ends leaves the panes'
     /// views in AppKit's live resize, which AppKit does not end (#399): the
     /// run loop's default mode ends it for them, so a later window resize
@@ -2595,54 +2772,87 @@ extension PaneTests {
         at x: CGFloat, in container: PaneContainerView, window: NSWindow,
         steps: [(_ post: (NSEvent.EventType, CGFloat) -> Void) -> Bool]
     ) async throws {
+        try await trackDividerDragsUntilExceptions(
+            [ExceptionDrag(start: x, steps: steps)], in: container, window: window)
+    }
+
+    /// One drag for ``trackDividerDragsUntilExceptions(_:in:window:)``:
+    /// pressed at `start`, each event at `point(position)` in the container.
+    private struct ExceptionDrag {
+        var start: CGFloat
+        var point: (CGFloat) -> NSPoint = { NSPoint(x: $0, y: 200) }
+        var steps: [(_ post: (NSEvent.EventType, CGFloat) -> Void) -> Bool]
+    }
+
+    /// Divider drags that an injected exception ends inside AppKit's
+    /// tracking loop (#379), one after the other within one pass of the run
+    /// loop's default mode, so none of them is ended by that mode before
+    /// the next begins (#417 T3).
+    private func trackDividerDragsUntilExceptions(
+        _ drags: [ExceptionDrag], in container: PaneContainerView, window: NSWindow
+    ) async throws {
         let windowNumber = window.windowNumber
-        let post = { (type: NSEvent.EventType, x: CGFloat) in
+        var current = 0
+        let post = { (type: NSEvent.EventType, position: CGFloat) in
             guard
                 let event = NSEvent.mouseEvent(
-                    with: type, location: container.convert(NSPoint(x: x, y: 200), to: nil), modifierFlags: [],
-                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: windowNumber, context: nil,
-                    eventNumber: 0, clickCount: 1, pressure: 1)
+                    with: type, location: container.convert(drags[current].point(position), to: nil),
+                    modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: windowNumber,
+                    context: nil, eventNumber: 0, clickCount: 1, pressure: 1)
             else { return XCTFail("no \(type) event") }
             NSApp.postEvent(event, atStart: false)
         }
         let reason = "injected mid-drag (#379)"
         // The exception skips the end of the drag Timer's fire: its steps
         // stop it themselves.
-        var raised = false
+        var raised = Array(repeating: false, count: drags.count)
         let driver = DragDriver()
         let deadline = ContinuousClock.now + .seconds(10)
         var next = 0
         driver.onTick = { [unowned driver] in
-            guard !raised else { return driver.step = 3 }
+            guard !raised[current] else { return }
             guard ContinuousClock.now < deadline else {
-                driver.failure = "timed out at step \(next)"
-                post(.leftMouseUp, x)
-                return driver.step = 3
+                driver.failure = "timed out at drag \(current) step \(next)"
+                post(.leftMouseUp, drags[current].start)
+                raised[current] = true
+                return
             }
             guard container.isTrackingDividerDrag else { return }
+            let steps = drags[current].steps
             guard next == steps.count else {
                 if steps[next](post) { next += 1 }
                 return
             }
-            raised = true
+            raised[current] = true
             NSException(name: NSExceptionName("PaneTestsInjected"), reason: reason).raise()
         }
-        let timer = Timer(
-            timeInterval: 0.01, target: driver, selector: #selector(DragDriver.fire(_:)), userInfo: nil, repeats: true)
-        RunLoop.main.add(timer, forMode: .eventTracking)
-        defer { timer.invalidate() }
+        // One Timer per drag: the exception skips the run loop's end of the
+        // fire that raised it, and that Timer never fires again.
+        var timers: [Timer] = []
+        defer { timers.forEach { $0.invalidate() } }
         // Caught where the press is dispatched, as NSApp's loop would: left
         // to XCTest, it would end the test.
-        var caught: NSException?
+        var caught: [NSException?] = []
         let downDriver = DragDriver()
         downDriver.onTick = { [unowned downDriver] in
-            post(.leftMouseDown, x)
-            if let event = NSApp.nextEvent(
-                matching: .leftMouseDown, until: .distantPast, inMode: .default, dequeue: true)
-            {
-                caught = TesseraTestsCatchingException { NSApp.sendEvent(event) }
-            } else {
-                downDriver.failure = "the press was not queued"
+            for index in drags.indices {
+                current = index
+                next = 0
+                let timer = Timer(
+                    timeInterval: 0.01, target: driver, selector: #selector(DragDriver.fire(_:)), userInfo: nil,
+                    repeats: true)
+                RunLoop.main.add(timer, forMode: .eventTracking)
+                timers.append(timer)
+                post(.leftMouseDown, drags[index].start)
+                if let event = NSApp.nextEvent(
+                    matching: .leftMouseDown, until: .distantPast, inMode: .default, dequeue: true)
+                {
+                    caught.append(TesseraTestsCatchingException { NSApp.sendEvent(event) })
+                    timer.invalidate()
+                } else {
+                    downDriver.failure = "the press of drag \(index) was not queued"
+                    break
+                }
             }
             downDriver.step = 3
         }
@@ -2651,11 +2861,11 @@ extension PaneTests {
                 timeInterval: 0, target: downDriver, selector: #selector(DragDriver.fire(_:)), userInfo: nil,
                 repeats: true),
             forMode: .default)
-        try await waitUntil("the drag ends") { downDriver.step == 3 }
+        try await waitUntil("the drags end") { downDriver.step == 3 }
         XCTAssertNil(downDriver.failure)
         XCTAssertNil(driver.failure)
-        XCTAssertTrue(raised, "the exception was raised")
-        XCTAssertEqual(caught?.reason, reason, "and ended the drag")
+        XCTAssertEqual(raised, Array(repeating: true, count: drags.count), "each drag's exception was raised")
+        XCTAssertEqual(caught.map { $0?.reason }, Array(repeating: reason, count: drags.count), "and ended it")
     }
 
     /// Whether `container` reads a divider drag as tracking from inside the
