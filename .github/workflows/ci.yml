@@ -14,6 +14,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Decides whether the macOS app job can affect the result (#417). The rules live in scripts/ci-app-affected.sh, which is
+  # conservative: the app links the xcframework built from tessera-ffi, so any change to a crate it depends on runs the
+  # job. Pushes to main always run it. A skipped required job counts as passing for branch protection (a workflow-level
+  # `paths:` filter would leave the check pending forever), and the check name `macOS app` does not change.
+  changes:
+    name: Changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      app: ${{ steps.decide.outputs.app }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$EVENT" != pull_request ]; then
+            app=true
+          else
+            app="$(scripts/ci-app-affected.sh --base "$BASE_SHA" --head HEAD)"
+          fi
+          case "$app" in true|false) ;; *) echo "unexpected decision: $app" >&2; app=true ;; esac
+          echo "app=$app" >> "$GITHUB_OUTPUT"
+          echo "macOS app job: $app" >> "$GITHUB_STEP_SUMMARY"
+
   rust:
     name: Rust (stable)
     runs-on: macos-15
@@ -42,7 +70,11 @@ jobs:
   app:
     name: macOS app
     runs-on: macos-15
-    needs: rust
+    # Runs in parallel with `rust` (no `needs: rust`, ~7 minutes saved per PR); when `rust` fails this job still runs and
+    # both required checks must pass anyway. Skipped only when `changes` succeeded and said false: a failed `changes`
+    # job runs the app job (a skipped required job would otherwise count as a pass).
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.app == 'true') }}
     # A normal run of just app-test is 12-14 minutes (the suite has grown; a run that passed every test took 14:02 against
     # a 14 minute step limit and timed out). just app-test hung three times (#121); the job limit is the backstop for a hang
     # below the test level, the step limit and xcodebuild's per-test timeouts (in the justfile) report it earlier.
