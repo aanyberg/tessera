@@ -3,7 +3,8 @@
 //!
 //! [`ConfigEditor`] opens the file, changes one key at a time
 //! ([`ConfigEditor::set`], [`ConfigEditor::remove`],
-//! [`ConfigEditor::add_profile`]) and [`ConfigEditor::save`]s it. Every
+//! [`ConfigEditor::add_profile`], or a whole new profile at once with
+//! [`ConfigEditor::add_profile_with`]) and [`ConfigEditor::save`]s it. Every
 //! comment, blank line, key order and spelling (quotes, dotted keys,
 //! inline tables, number formats) that an edit does not touch comes out
 //! byte for byte as it went in. An edit is checked before it is kept:
@@ -66,6 +67,23 @@ pub const MAX_THEME_ID_LEN: usize = crate::theme::MAX_SLUG_LEN;
 
 /// Longest name [`display_name`] returns, in bytes.
 pub const MAX_DISPLAY_NAME_LEN: usize = 128;
+
+/// Most keys besides the name [`ConfigEditor::add_profile_with`] sets in
+/// the profile it adds: a profile has about twenty (S5).
+pub const MAX_ADDED_PROFILE_KEYS: usize = 64;
+
+/// A profile [`ConfigEditor::add_profile_with`] added.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AddedProfile {
+    /// Its place in the configuration the app reads (the `[[profiles]]`
+    /// entries, then the profile files' profiles), which is also its key
+    /// path index (`profiles[index].command`).
+    pub index: usize,
+    /// The name it was given: the base name, or the base name with the
+    /// number that makes it unused.
+    pub name: String,
+}
 
 /// One step of a [`KeyPath`]: a key of a table or an index into an array
 /// (of values, or of tables such as `[[profiles]]`).
@@ -685,13 +703,18 @@ impl ConfigEditor {
     /// has, with the profiles of the files in `profiles/` (which come after
     /// the entries and move up one), that many already.
     pub fn add_profile(&mut self, name: &str) -> Result<usize, EditError> {
+        let files = self.file_profiles();
+        self.add_entry(name, files)
+    }
+
+    /// [`ConfigEditor::add_profile`] with `files` profile files' profiles
+    /// (read by the caller).
+    fn add_entry(&mut self, name: &str, files: usize) -> Result<usize, EditError> {
         let index = self.profile_count();
         let path: KeyPath = format!("profiles[{index}].name").parse()?;
         // The new entry goes before the profile files' profiles, which
         // move up one; with the cap reached, the last of them would drop.
-        if index < crate::MAX_PROFILES
-            && index.saturating_add(self.file_profiles()) >= crate::MAX_PROFILES
-        {
+        if index < crate::MAX_PROFILES && index.saturating_add(files) >= crate::MAX_PROFILES {
             return Err(EditError::Unsupported {
                 path,
                 reason: "the first 256 profiles, with those in profiles/, are read; one more would push one out",
@@ -699,6 +722,134 @@ impl ConfigEditor {
         }
         self.set_path(&path, toml::Value::String(name.to_owned()))?;
         Ok(index)
+    }
+
+    /// The first of `base`, `base 2`, `base 3`, … that no profile of the
+    /// configuration the app would read now is named: the `[[profiles]]`
+    /// entries of the document (with the edits so far) and the profiles of
+    /// the files in `profiles/` (#312). Names compare byte for byte, as
+    /// the loader's duplicate-name check does. At most one more try than
+    /// there are profiles.
+    #[must_use]
+    pub fn unused_profile_name(&self, base: &str) -> String {
+        self.unused_name(base, &self.load_profile_files())
+    }
+
+    /// The profile files next to the opened path, loaded now.
+    fn load_profile_files(&self) -> crate::profile_files::ProfileFiles {
+        crate::profile_files::load(&self.path.with_file_name("profiles"))
+    }
+
+    /// [`ConfigEditor::unused_profile_name`] with `files` read by the
+    /// caller.
+    fn unused_name(&self, base: &str, files: &crate::profile_files::ProfileFiles) -> String {
+        let entries: Vec<String> = match &self.config {
+            Some(config) => config.profiles.iter().map(|p| p.name.clone()).collect(),
+            None => match self.plain.get("profiles") {
+                Some(toml::Value::Array(profiles)) => profiles
+                    .iter()
+                    .filter_map(|p| p.get("name").and_then(toml::Value::as_str))
+                    .map(str::to_owned)
+                    .collect(),
+                _ => Vec::new(),
+            },
+        };
+        let taken: std::collections::HashSet<&str> = entries
+            .iter()
+            .map(String::as_str)
+            .chain(files.names())
+            .collect();
+        let mut name = base.to_owned();
+        let mut number = 2usize;
+        while taken.contains(name.as_str()) {
+            name = format!("{base} {number}");
+            number += 1;
+        }
+        name
+    }
+
+    /// Adds a `[[profiles]]` entry named after `base` and sets `keys` in
+    /// it, all or nothing (#312): the profile Settings adds or duplicates,
+    /// whatever profile files exist. The name is
+    /// [`ConfigEditor::unused_profile_name`] of `base`, so it never
+    /// shadows a profile of either source; each key is a key path within
+    /// the profile (`command`, `appearance.theme`), set as
+    /// [`ConfigEditor::set`] sets it. The entry goes after the last entry,
+    /// before the profile files' profiles, which move up one; its index in
+    /// the configuration the app reads, also its key path index, is the
+    /// number of entries before the add.
+    ///
+    /// # Errors
+    ///
+    /// As for [`ConfigEditor::add_profile`] (the cap of
+    /// [`MAX_PROFILES`](crate::MAX_PROFILES) counting both sources) and
+    /// [`ConfigEditor::set`] for each key, naming that key's full path
+    /// (`profiles[3].appearance.theme`); [`EditError::Unsupported`] for more
+    /// than [`MAX_ADDED_PROFILE_KEYS`] keys, a key `name` (the name is
+    /// `base`'s), or a name longer than
+    /// [`MAX_PROFILE_NAME_LEN`](crate::MAX_PROFILE_NAME_LEN) bytes (`base`,
+    /// or `base` with the number that makes it unused);
+    /// [`EditError::KeyPath`] for a key that does not parse or makes a path
+    /// of more than [`MAX_KEY_PATH_STEPS`] steps. The document is unchanged
+    /// after any error.
+    pub fn add_profile_with(
+        &mut self,
+        base: &str,
+        keys: &[(String, toml::Value)],
+    ) -> Result<AddedProfile, EditError> {
+        let index = self.profile_count();
+        let unsupported = |suffix: &str, reason| -> Result<AddedProfile, EditError> {
+            Err(EditError::Unsupported {
+                path: format!("profiles[{index}]{suffix}").parse()?,
+                reason,
+            })
+        };
+        if keys.len() > MAX_ADDED_PROFILE_KEYS {
+            return unsupported("", "a new profile takes at most 64 keys besides its name");
+        }
+        const {
+            assert!(
+                crate::MAX_PROFILE_NAME_LEN == 128 && MAX_ADDED_PROFILE_KEYS == 64,
+                "the reasons name the caps"
+            );
+        };
+        if base.len() > crate::MAX_PROFILE_NAME_LEN {
+            return unsupported(".name", "a profile name is at most 128 bytes");
+        }
+        // One read of `profiles/` for the name and the cap.
+        let files = self.load_profile_files();
+        let name = self.unused_name(base, &files);
+        if name.len() > crate::MAX_PROFILE_NAME_LEN {
+            return unsupported(
+                ".name",
+                "the name is taken, and with a number that makes it unused it is longer than 128 bytes",
+            );
+        }
+        let mut paths = Vec::with_capacity(keys.len());
+        for (key, _) in keys {
+            let relative: KeyPath = key.parse()?;
+            if relative.0.first() == Some(&Step::Key("name".to_owned())) {
+                return unsupported(".name", "the name is given as the base name, not as a key");
+            }
+            if relative.0.len() + 2 > MAX_KEY_PATH_STEPS {
+                return Err(KeyPathError::TooManySteps.into());
+            }
+            let mut steps = vec![Step::Key("profiles".to_owned()), Step::Index(index)];
+            steps.extend(relative.0);
+            paths.push(KeyPath(steps));
+        }
+        let before = self.clone();
+        let added = self.add_entry(&name, files.count()).and_then(|at| {
+            debug_assert_eq!(at, index);
+            for (path, (_, value)) in paths.iter().zip(keys) {
+                self.set_path(path, value.clone())?;
+            }
+            Ok(AddedProfile { index, name })
+        });
+        if added.is_err() {
+            *self = before;
+        }
+        added
     }
 
     /// [`EditError::Unsupported`] when `path` is in a profile that a file
@@ -726,7 +877,7 @@ impl ConfigEditor {
     /// define (those that load), read now; see
     /// [`ConfigEditor::not_in_a_profile_file`].
     fn file_profiles(&self) -> usize {
-        crate::profile_files::load(&self.path.with_file_name("profiles")).count()
+        self.load_profile_files().count()
     }
 
     /// Checks the edited document `text` and keeps it, or returns why not.

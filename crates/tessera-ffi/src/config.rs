@@ -1,6 +1,6 @@
 //! Settings write-back for the Preferences window (#40, ADR 0040): the
 //! configuration in effect as JSON, edits of `config.toml` by key path,
-//! and the theme list and import.
+//! a new profile with its keys in one edit, and the theme list and import.
 //!
 //! An edit goes through [`ConfigEditor`]: comments and layout survive, a
 //! value the loader would warn about is refused, the write is atomic and
@@ -18,14 +18,15 @@ use std::sync::Mutex;
 use tessera_app_core::WatchOptions;
 use tessera_app_core::command::Keymap;
 use tessera_app_core::edit::{
-    ConfigEditor, EditError, FILE_PROFILE_REFUSED, KeyPath, MAX_KEY_PATH_LEN, Step, ThemeOrigin,
-    TomlValue, import_theme, theme_entries,
+    AddedProfile, ConfigEditor, EditError, FILE_PROFILE_REFUSED, KeyPath, MAX_KEY_PATH_LEN, Step,
+    ThemeOrigin, TomlValue, import_theme, theme_entries,
 };
 
 use crate::app::App;
 use crate::error::Error;
 use crate::panic::ffi_guard;
 use crate::selection::copy_out;
+use crate::session::MAX_PROFILE_NAME_LEN;
 
 /// Longest value JSON `tessera_config_set` takes, in bytes (64 KiB): far
 /// more than any setting needs, small enough to parse on the UI thread.
@@ -39,6 +40,12 @@ pub const MAX_THEME_PATH_LEN: usize = 1024;
 pub const THEME_ID_LEN: usize = 64;
 
 const _: () = assert!(THEME_ID_LEN == tessera_app_core::edit::MAX_THEME_ID_LEN);
+
+/// Most keys besides `name` `tessera_config_add_profile` takes for the new
+/// profile (a profile has about twenty).
+pub const MAX_ADDED_PROFILE_KEYS: usize = 64;
+
+const _: () = assert!(MAX_ADDED_PROFILE_KEYS == tessera_app_core::edit::MAX_ADDED_PROFILE_KEYS);
 
 /// Borrows `len` bytes at `ptr` (`NULL` allowed when `len` is 0).
 ///
@@ -129,8 +136,15 @@ fn failure(function: &'static str, key: &str, error: &EditError) -> Failure {
         EditError::File(_) => (Error::Io, "file error"),
         _ => (Error::Io, "edit failed"),
     };
-    // The key path only when it parses (then it displays escaped).
-    if let Ok(path) = key.parse::<tessera_app_core::edit::KeyPath>() {
+    // The error's own key path (for a new profile, the key that failed),
+    // else the caller's when it parses; either displays escaped.
+    let own = match error {
+        EditError::Unsupported { path, .. }
+        | EditError::Refused { path, .. }
+        | EditError::Invalid { path, .. } => Some(path.clone()),
+        _ => None,
+    };
+    if let Some(path) = own.or_else(|| key.parse::<KeyPath>().ok()) {
         tracing::info!(function, %path, kind, "config edit not saved");
     } else {
         tracing::info!(function, kind, "config edit not saved");
@@ -219,6 +233,21 @@ fn edit(function: &'static str, app: &App, key: &str, change: Change) -> Result<
         };
         return Err(failure(function, key, &error));
     }
+    edit_locked(function, app, key, |editor| match change {
+        Change::Set(value) => editor.set(key, value),
+        Change::Remove => editor.remove(key).map(|_| ()),
+    })
+}
+
+/// Opens `config.toml` (creating it and starting the watch when needed),
+/// makes `change` to it, checks the key map, and saves; the caller holds
+/// [`EDIT_LOCK`]. `key` is the key path a refusal by the key map names.
+fn edit_locked<T>(
+    function: &'static str,
+    app: &App,
+    key: &str,
+    change: impl FnOnce(&mut ConfigEditor) -> Result<T, EditError>,
+) -> Result<T, Failure> {
     let path = open_config(app).map_err(|error| {
         tracing::warn!(function, %error, "cannot create the configuration");
         Failure::new(Error::Io, error)
@@ -236,11 +265,7 @@ fn edit(function: &'static str, app: &App, key: &str, change: Change) -> Result<
         })
     };
     let mut before = quiet(editor.config());
-    let result = match change {
-        Change::Set(value) => editor.set(key, value),
-        Change::Remove => editor.remove(key).map(|_| ()),
-    };
-    result.map_err(|e| failure(function, key, &e))?;
+    let done = change(&mut editor).map_err(|e| failure(function, key, &e))?;
     let new: Vec<String> = quiet(editor.config())
         .into_iter()
         .filter(|warning| match before.iter().position(|w| w == warning) {
@@ -265,7 +290,7 @@ fn edit(function: &'static str, app: &App, key: &str, change: Change) -> Result<
         ));
     }
     editor.save().map_err(|e| failure(function, key, &e))?;
-    Ok(())
+    Ok(done)
 }
 
 /// Runs `edit` for an export, with its arguments checked, and reports the
@@ -425,8 +450,11 @@ fn config_value(config: &tessera_app_core::Config) -> serde_json::Value {
 ///
 /// The key path is keys joined by `.`, bare (`A-Za-z0-9_-`) or in double
 /// quotes, each optionally followed by `[N]`: `appearance.opacity`,
-/// `profiles[1].appearance.theme`, `keys."cmd+d"`. An index one past the
-/// last profile adds a profile (`profiles[2].name` with two profiles).
+/// `profiles[1].appearance.theme`, `keys."cmd+d"`. With no profile read
+/// from `profiles/`, an index one past the last profile adds a profile
+/// (`profiles[2].name` with two profiles); with one, that index is a
+/// file's profile and refused, so a new profile goes through
+/// `tessera_config_add_profile`, which takes its keys in the same edit.
 /// The value is a JSON string, number, boolean or array (`"Nord"`, `0.9`,
 /// `true`); `null` and objects are refused.
 ///
@@ -537,6 +565,183 @@ pub unsafe extern "C" fn tessera_config_remove(
                 msg_cap,
                 msg_len,
             )
+        }
+    })
+}
+
+/// The new profile `tessera_config_add_profile` reads: its base name and
+/// its other keys (key paths within the profile) with their values.
+struct NewProfile {
+    name: String,
+    keys: Vec<(String, TomlValue)>,
+}
+
+/// Parses `json`, a JSON object of key paths within a profile to values
+/// with a string `"name"` (S5: the caller checked its length; the keys
+/// are counted here).
+fn new_profile(json: &[u8]) -> Result<NewProfile, Failure> {
+    let invalid = |message: String| Failure::new(Error::InvalidArgument, message);
+    let object: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(json)
+        .map_err(|error| invalid(format!("the profile is not a JSON object: {error}")))?;
+    let mut name = None;
+    let mut keys = Vec::new();
+    for (key, value) in object {
+        if key == "name" {
+            let serde_json::Value::String(text) = value else {
+                return Err(invalid("the profile's \"name\" is not a string".to_owned()));
+            };
+            name = Some(text);
+            continue;
+        }
+        if keys.len() == MAX_ADDED_PROFILE_KEYS {
+            return Err(invalid(format!(
+                "a new profile takes at most {MAX_ADDED_PROFILE_KEYS} keys besides its name"
+            )));
+        }
+        // JSON `null` and numbers past `i64` have no TOML form. The key
+        // is not echoed: it is the caller's text, and may not parse.
+        let value = serde_json::from_value::<TomlValue>(value).map_err(|error| {
+            invalid(format!(
+                "a value of the profile is not a TOML value as JSON: {error}"
+            ))
+        })?;
+        keys.push((key, value));
+    }
+    let name = name.ok_or_else(|| invalid("the profile has no \"name\"".to_owned()))?;
+    Ok(NewProfile { name, keys })
+}
+
+/// Adds a profile to `config.toml` as a new `[[profiles]]` entry and sets
+/// its keys, in one edit saved at once: Settings' Add and Duplicate,
+/// whatever profiles the files in `profiles/` define (#312).
+///
+/// `profile_json` (UTF-8, `profile_len` bytes, at most
+/// `TESSERA_MAX_CONFIG_VALUE_LEN`) is a JSON object: `"name"`, a string,
+/// is the base name, and every other member is a key path within the
+/// profile (`"command"`, `"appearance.theme"`, as after
+/// `profiles[N].` in `tessera_config_set`) with its value as JSON, at most
+/// `TESSERA_MAX_ADDED_PROFILE_KEYS` of them:
+///
+/// ```json
+/// {"name": "Work Copy", "command": "/bin/zsh",
+///  "appearance.theme": "Nord", "appearance.opacity": 0.9}
+/// ```
+///
+/// The profile is named the first of `name`, `name 2`, `name 3`, … that no
+/// profile is named, in `config.toml` or in `profiles/` (byte for byte),
+/// so a duplicate never shadows another profile. The entry goes after the
+/// last `[[profiles]]` entry, so in `tessera_config_json` it comes before
+/// the profiles of `profiles/`, which move up one. Its index there (also
+/// its key path index, `profiles[N].command`) goes to `*index`, and its
+/// name (at most `TESSERA_MAX_PROFILE_NAME_LEN` bytes, no NUL terminator)
+/// to `name_buf` and its length to `*name_len`. Either all of it is
+/// written or nothing is: one refused key refuses the profile.
+///
+/// Returns, writing nothing to `config.toml` for any failure:
+///
+/// * `TESSERA_ERROR_REFUSED` when the loader would warn about the result
+///   (a value out of range or of the wrong type, an unknown key, a theme
+///   that does not exist), as for `tessera_config_set`;
+/// * `TESSERA_ERROR_INVALID_ARGUMENT` when `name_cap` is below
+///   `TESSERA_MAX_PROFILE_NAME_LEN` (checked first), `profile_json` is too
+///   long, not a JSON object, has no string `"name"`, more keys than
+///   `TESSERA_MAX_ADDED_PROFILE_KEYS`, a `null` value or a key path that
+///   does not parse; when the app reads `MAX_PROFILES` (256) profiles
+///   already, counting `config.toml`'s and `profiles/`'s together; when the
+///   name (with the number that makes it unused) would be longer than
+///   `TESSERA_MAX_PROFILE_NAME_LEN` bytes; or an edit the editor does not
+///   make (a key that holds a table);
+/// * `TESSERA_ERROR_CONFLICT` and `TESSERA_ERROR_IO` as for
+///   `tessera_config_set`;
+/// * `TESSERA_ERROR_NULL_POINTER` for a `NULL` `app`, `index`, `name_buf`
+///   or `name_len`, or a `NULL` `profile_json` with a non-zero length.
+///
+/// On every failure a message for the user goes to `msg` as for
+/// `tessera_config_set`: the core's reason, naming the key that was
+/// refused (`profiles[3].appearance.theme`) where one was. `*index` and
+/// `*name_len` are 0 then.
+///
+/// Any thread (the app's background write queue), as for
+/// `tessera_config_set`; serialised with it.
+///
+/// # Safety
+///
+/// `app` must be `NULL` or a live handle. `profile_json` must be `NULL` or
+/// valid for `profile_len` bytes of reads. `index`, `name_len` and
+/// `msg_len` must be `NULL` or point to a writable `size_t`; `name_buf`
+/// must be `NULL` or valid for `name_cap` bytes of writes, `msg` for
+/// `msg_cap`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tessera_config_add_profile(
+    app: *mut App,
+    profile_json: *const u8,
+    profile_len: usize,
+    index: *mut usize,
+    name_buf: *mut u8,
+    name_cap: usize,
+    name_len: *mut usize,
+    msg: *mut u8,
+    msg_cap: usize,
+    msg_len: *mut usize,
+) -> Error {
+    const FUNCTION: &str = "tessera_config_add_profile";
+    ffi_guard!("tessera_config_add_profile", {
+        // SAFETY: `msg_len` and `msg` per the contract.
+        unsafe { message_out("", msg, msg_cap, msg_len) };
+        let outcome = (|| {
+            if index.is_null() || name_buf.is_null() || name_len.is_null() {
+                return Err(Failure::new(
+                    Error::NullPointer,
+                    "index, name_buf or name_len is NULL",
+                ));
+            }
+            // SAFETY: non-null and writable per the contract.
+            unsafe {
+                index.write(0);
+                name_len.write(0);
+            }
+            if name_cap < MAX_PROFILE_NAME_LEN {
+                return Err(Failure::new(Error::InvalidArgument, "name_cap too small"));
+            }
+            // SAFETY: the caller passes NULL or a live handle.
+            let Some(app) = (unsafe { App::from_ptr(app) }) else {
+                return Err(Failure::new(Error::NullPointer, "app is NULL"));
+            };
+            if profile_len > MAX_CONFIG_VALUE_LEN {
+                return Err(Failure::new(Error::InvalidArgument, "profile too long"));
+            }
+            // SAFETY: `profile_json` is NULL or valid for `profile_len` bytes.
+            let Some(json) = (unsafe { input(profile_json, profile_len) }) else {
+                return Err(Failure::new(Error::NullPointer, "profile_json is NULL"));
+            };
+            let profile = new_profile(json).inspect_err(|_| {
+                tracing::info!(
+                    function = FUNCTION,
+                    kind = "malformed profile",
+                    "config edit not saved"
+                );
+            })?;
+            let _edit = EDIT_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let added: AddedProfile = edit_locked(FUNCTION, app, "profiles", |editor| {
+                editor.add_profile_with(&profile.name, &profile.keys)
+            })?;
+            // SAFETY: writable per the contract; `name_buf` holds
+            // `name_cap >= MAX_PROFILE_NAME_LEN` bytes, and the name is at
+            // most that long (`add_profile_with` refuses a longer one).
+            Ok(unsafe {
+                index.write(added.index);
+                copy_out(&added.name, name_buf, name_cap, name_len)
+            })
+        })();
+        match outcome {
+            Ok(code) => code,
+            Err(failure) => {
+                // SAFETY: as above.
+                unsafe { message_out(&failure.message, msg, msg_cap, msg_len) };
+                failure.code
+            }
         }
     })
 }
@@ -692,6 +897,7 @@ pub unsafe extern "C" fn tessera_theme_import(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     /// #344: `open_config` from two threads at once (the Open Config menu
     /// item and a Settings edit) starts one watch, never two: the check
@@ -940,6 +1146,325 @@ mod tests {
         if let Err(failure) = edit("test", &app, "profiles[0].command", set()) {
             panic!("{}", failure.message);
         }
+    }
+
+    /// What `tessera_config_add_profile` returned: its code, index, name
+    /// and message.
+    #[derive(Debug)]
+    struct Added {
+        code: Error,
+        index: usize,
+        name: String,
+        message: String,
+    }
+
+    /// Calls `tessera_config_add_profile` with `json` and buffers of the
+    /// sizes the header names.
+    fn add_profile(app: &App, json: &str) -> Added {
+        let mut name = vec![0u8; MAX_PROFILE_NAME_LEN];
+        let mut message = vec![0u8; 8 * 1024];
+        let (mut index, mut name_len, mut message_len) = (usize::MAX, usize::MAX, usize::MAX);
+        // SAFETY: a live handle, input of its length, writable lengths and
+        // buffers of their sizes.
+        let code = unsafe {
+            tessera_config_add_profile(
+                std::ptr::from_ref(app).cast_mut(),
+                json.as_ptr(),
+                json.len(),
+                &raw mut index,
+                name.as_mut_ptr(),
+                name.len(),
+                &raw mut name_len,
+                message.as_mut_ptr(),
+                message.len(),
+                &raw mut message_len,
+            )
+        };
+        Added {
+            code,
+            index,
+            name: String::from_utf8(name[..name_len].to_vec()).unwrap(),
+            message: String::from_utf8(message[..message_len].to_vec()).unwrap(),
+        }
+    }
+
+    /// An app over `config` and the profile files `files` (name, text),
+    /// with the configuration they load applied.
+    fn app_with(
+        dir: &Path,
+        config: &str,
+        files: &[(String, String)],
+    ) -> (App, tessera_app_core::ConfigPaths) {
+        let paths = tessera_app_core::ConfigPaths::new(dir);
+        std::fs::create_dir_all(paths.profiles_dir()).unwrap();
+        std::fs::write(paths.config_file(), config).unwrap();
+        for (name, text) in files {
+            std::fs::write(paths.profiles_dir().join(name), text).unwrap();
+        }
+        let store = tessera_config::ConfigStore::open(paths.clone()).unwrap();
+        let app = App {
+            core: tessera_app_core::App::new((*store.config()).clone(), paths.clone()),
+        };
+        (app, paths)
+    }
+
+    /// The names and sources of the profiles `tessera_config_json` reports.
+    fn listed(app: &App) -> Vec<(String, String)> {
+        let mut buf = vec![0u8; 1 << 20];
+        let mut len = 0usize;
+        // SAFETY: a live handle, a writable length and a buffer of its size.
+        let code = unsafe {
+            tessera_config_json(
+                std::ptr::from_ref(app),
+                buf.as_mut_ptr(),
+                buf.len(),
+                &raw mut len,
+            )
+        };
+        assert_eq!(code, Error::Ok);
+        let json: serde_json::Value = serde_json::from_slice(&buf[..len]).unwrap();
+        json["config"]["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                (
+                    p["name"].as_str().unwrap().to_owned(),
+                    p["source"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    /// #312 app half: with profile files present, Add and Duplicate go
+    /// through `tessera_config_add_profile`: one save, a new
+    /// `[[profiles]]` entry named the first unused of the base name, `name
+    /// 2`, ... across both sources, with its keys, at the index returned,
+    /// which is where the applied configuration lists it (before the
+    /// files' profiles); `profiles/` is not written.
+    #[test]
+    fn a_profile_added_with_profile_files_present_lands_at_its_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = [
+            ("work.toml".to_owned(), "name = \"Work Copy\"\n".to_owned()),
+            ("z.toml".to_owned(), "name = \"Work Copy\"\n".to_owned()),
+        ];
+        let (app, paths) = app_with(dir.path(), "[[profiles]]\nname = \"entry\"\n", &files);
+        let before = std::fs::read(paths.profiles_dir().join("work.toml")).unwrap();
+        // Through the key path this is refused: `profiles[1]` is a file's.
+        let refused = edit(
+            "test",
+            &app,
+            "profiles[1].name",
+            Change::Set(TomlValue::String("Work Copy".into())),
+        )
+        .unwrap_err();
+        assert!(
+            refused.message.contains(FILE_PROFILE_REFUSED),
+            "{}",
+            refused.message
+        );
+
+        let added = add_profile(
+            &app,
+            r#"{"name": "Work Copy", "command": "/bin/copy", "appearance.opacity": 0.5}"#,
+        );
+        assert_eq!(
+            (
+                added.code,
+                added.index,
+                added.name.as_str(),
+                added.message.as_str()
+            ),
+            (Error::Ok, 1, "Work Copy 2", ""),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while app.core.config().profiles.len() < 4 {
+            assert!(std::time::Instant::now() < deadline, "never applied");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let config = app.core.config();
+        let profile = &config.profiles[added.index];
+        assert_eq!(profile.name, "Work Copy 2");
+        assert_eq!(profile.command.as_deref(), Some("/bin/copy"));
+        assert_eq!(
+            profile.appearance.as_ref().and_then(|a| a.opacity),
+            Some(0.5)
+        );
+        let config_source = || "config".to_owned();
+        assert_eq!(
+            listed(&app),
+            [
+                ("entry".to_owned(), config_source()),
+                ("Work Copy 2".to_owned(), config_source()),
+                ("Work Copy".to_owned(), "profiles/work.toml".to_owned()),
+                ("Work Copy".to_owned(), "profiles/z.toml".to_owned()),
+            ]
+        );
+        assert_eq!(
+            std::fs::read(paths.profiles_dir().join("work.toml")).unwrap(),
+            before
+        );
+    }
+
+    /// #312: what the core refuses comes back with its code and message,
+    /// and writes nothing: a refused key (named in full), the 256-profile
+    /// cap counting both sources (255 take one more, 256 none), the key
+    /// cap at the C boundary (64 pass to the core, 65 do not), and a
+    /// malformed object.
+    #[test]
+    fn a_refused_profile_comes_back_with_the_cores_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let files: Vec<(String, String)> = (0..155)
+            .map(|i| (format!("p{i:03}.toml"), String::new()))
+            .collect();
+        let entries = (0..100).fold(String::new(), |mut text, i| {
+            let _ = writeln!(text, "[[profiles]]\nname = \"c{i}\"");
+            text
+        });
+        let (app, paths) = app_with(dir.path(), &entries, &files);
+        let unchanged = |what: &str| {
+            assert_eq!(
+                std::fs::read_to_string(paths.config_file()).unwrap(),
+                entries,
+                "{what}"
+            );
+        };
+
+        let refused = add_profile(
+            &app,
+            r#"{"name": "n", "appearance.theme": "No Such Theme"}"#,
+        );
+        assert_eq!(refused.code, Error::Refused, "{refused:?}");
+        assert!(
+            refused
+                .message
+                .starts_with("`profiles[100].appearance.theme` refused")
+                && refused.message.contains("No Such Theme"),
+            "{refused:?}"
+        );
+        assert_eq!((refused.index, refused.name.as_str()), (0, ""));
+        unchanged("refused theme");
+
+        let keys = |n: usize| {
+            let members = (0..n).fold(String::new(), |mut text, i| {
+                let _ = write!(text, r#", "k{i:02}": 1"#);
+                text
+            });
+            format!(r#"{{"name": "n"{members}}}"#)
+        };
+        let at_cap = add_profile(&app, &keys(MAX_ADDED_PROFILE_KEYS));
+        assert_eq!(at_cap.code, Error::Refused, "{at_cap:?}");
+        assert!(at_cap.message.contains("`profiles[100].k00`"), "{at_cap:?}");
+        let past = add_profile(&app, &keys(MAX_ADDED_PROFILE_KEYS + 1));
+        assert_eq!(past.code, Error::InvalidArgument, "{past:?}");
+        assert!(past.message.contains("at most 64 keys"), "{past:?}");
+        // Counted here, before the values are converted, not left to the
+        // core.
+        let failure = new_profile(keys(MAX_ADDED_PROFILE_KEYS + 1).as_bytes())
+            .err()
+            .expect("65 keys refused at the boundary");
+        assert!(
+            failure.message.contains("at most 64 keys"),
+            "{}",
+            failure.message
+        );
+        unchanged("key cap");
+
+        for (json, expected) in [
+            ("[]", "not a JSON object"),
+            ("{\"name\": \"n\"", "not a JSON object"),
+            (r#"{"command": "/bin/sh"}"#, "no \"name\""),
+            (r#"{"name": 1}"#, "\"name\" is not a string"),
+            (r#"{"name": "n", "command": null}"#, "not a TOML value"),
+            (r#"{"name": "n", "a..b": 1}"#, "malformed key path"),
+            (r#"{"name": "n", "name.x": 1}"#, "`profiles[100].name`"),
+        ] {
+            let refused = add_profile(&app, json);
+            assert_eq!(refused.code, Error::InvalidArgument, "{json}: {refused:?}");
+            assert!(refused.message.contains(expected), "{json}: {refused:?}");
+        }
+        let long = format!(r#"{{"name": "{}"}}"#, "x".repeat(MAX_CONFIG_VALUE_LEN));
+        assert_eq!(add_profile(&app, &long).code, Error::InvalidArgument);
+        unchanged("malformed");
+
+        // 255 in all: one more, at the index past the entries, named
+        // past the file profile `p000`.
+        let added = add_profile(&app, r#"{"name": "p000"}"#);
+        assert_eq!(
+            (added.code, added.index, added.name.as_str()),
+            (Error::Ok, 100, "p000 2"),
+            "{added:?}"
+        );
+        // 256: refused, with why.
+        let full = add_profile(&app, r#"{"name": "one more"}"#);
+        assert_eq!(full.code, Error::InvalidArgument, "{full:?}");
+        assert!(full.message.contains("256"), "{full:?}");
+        let after = std::fs::read_to_string(paths.config_file()).unwrap();
+        assert_eq!(after.matches("[[profiles]]").count(), 101);
+        assert!(!after.contains("one more"));
+    }
+
+    /// #312: `tessera_config_add_profile`'s pointers and `name_cap` are
+    /// checked before anything is read or written.
+    #[test]
+    fn the_add_profile_arguments_are_checked_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, paths) = app_with(dir.path(), "", &[]);
+        let app = std::ptr::from_ref(&app).cast_mut();
+        let json = br#"{"name": "x"}"#;
+        let mut buf = [0u8; MAX_PROFILE_NAME_LEN];
+        let (mut index, mut len) = (0usize, 0usize);
+        let (index, name, len) = (&raw mut index, buf.as_mut_ptr(), &raw mut len);
+        let cap = MAX_PROFILE_NAME_LEN;
+        let call = |app: *mut App,
+                    json: *const u8,
+                    index: *mut usize,
+                    name: *mut u8,
+                    cap: usize,
+                    len: *mut usize| {
+            // SAFETY: each pointer is NULL or valid storage of its size,
+            // and `json` is NULL or valid for its length.
+            unsafe {
+                tessera_config_add_profile(
+                    app,
+                    json,
+                    br#"{"name": "x"}"#.len(),
+                    index,
+                    name,
+                    cap,
+                    len,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                )
+            }
+        };
+        let null = std::ptr::null_mut();
+        let json = json.as_ptr();
+        assert_eq!(call(null, json, index, name, cap, len), Error::NullPointer);
+        assert_eq!(
+            call(app, json, null.cast(), name, cap, len),
+            Error::NullPointer
+        );
+        assert_eq!(
+            call(app, json, index, null.cast(), cap, len),
+            Error::NullPointer
+        );
+        assert_eq!(
+            call(app, json, index, name, cap, null.cast()),
+            Error::NullPointer
+        );
+        assert_eq!(
+            call(app, json, index, name, cap - 1, len),
+            Error::InvalidArgument
+        );
+        assert_eq!(
+            call(app, std::ptr::null(), index, name, cap, len),
+            Error::NullPointer
+        );
+        assert_eq!(std::fs::read_to_string(paths.config_file()).unwrap(), "");
+        assert_eq!(call(app, json, index, name, cap, len), Error::Ok);
     }
 
     #[test]

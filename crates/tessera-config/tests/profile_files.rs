@@ -454,6 +454,269 @@ fn without_profile_files_the_editor_is_unchanged() {
     assert_eq!(names(&store), ["entry", "second"]);
 }
 
+/// `(key, value)` pairs for [`ConfigEditor::add_profile_with`].
+fn keys(pairs: &[(&str, toml::Value)]) -> Vec<(String, toml::Value)> {
+    pairs
+        .iter()
+        .map(|(key, value)| ((*key).to_owned(), value.clone()))
+        .collect()
+}
+
+/// `n` profile files `p000.toml`, ... named `p000`, ... (by their stem).
+fn files(n: usize) -> Vec<(String, String)> {
+    (0..n)
+        .map(|i| (format!("p{i:03}.toml"), String::new()))
+        .collect()
+}
+
+fn as_refs(files: &[(String, String)]) -> Vec<(&str, &str)> {
+    files
+        .iter()
+        .map(|(name, text)| (name.as_str(), text.as_str()))
+        .collect()
+}
+
+/// #312 app half: a profile added with its keys while profile files exist
+/// is a new `[[profiles]]` entry, before the files' profiles (which move
+/// up one), at the index the add returns; its name is the first of
+/// `base`, `base 2`, ... that no profile of either source has (two files
+/// with the same name, one named like the next number), so it shadows
+/// none; `profiles/` is not written.
+#[test]
+fn add_profile_with_names_it_unused_across_both_sources() {
+    let (_dir, paths) = setup(
+        "[[profiles]]\nname = \"entry\"\n",
+        &[
+            ("a.toml", "name = \"Work\"\n"),
+            ("b.toml", "name = \"Work\"\n"),
+            ("c.toml", "name = \"Work 2\"\n"),
+        ],
+    );
+    let before = snapshot(&paths.profiles_dir());
+    let mut editor = ConfigEditor::open(&paths.config_file()).unwrap();
+    assert_eq!(editor.unused_profile_name("Work"), "Work 3");
+    assert_eq!(editor.unused_profile_name("entry"), "entry 2");
+    assert_eq!(editor.unused_profile_name("free"), "free");
+    let added = editor
+        .add_profile_with(
+            "Work",
+            &keys(&[
+                ("command", toml::Value::String("/bin/copy".into())),
+                ("appearance.opacity", toml::Value::Float(0.5)),
+            ]),
+        )
+        .unwrap();
+    assert_eq!((added.index, added.name.as_str()), (1, "Work 3"));
+    assert!(editor.save().unwrap());
+    let store = ConfigStore::open(paths.clone()).unwrap();
+    assert_eq!(names(&store), ["entry", "Work 3", "Work", "Work", "Work 2"]);
+    let profile = &store.config().profiles[added.index];
+    assert_eq!(profile.source, ProfileSource::Config);
+    assert_eq!(profile.command.as_deref(), Some("/bin/copy"));
+    assert_eq!(
+        profile.appearance.as_ref().and_then(|a| a.opacity),
+        Some(0.5)
+    );
+    assert_eq!(
+        snapshot(&paths.profiles_dir()),
+        before,
+        "profiles/ untouched"
+    );
+
+    // The next add sees the entry just added, too.
+    let mut editor = ConfigEditor::open(&paths.config_file()).unwrap();
+    assert_eq!(editor.unused_profile_name("Work"), "Work 4");
+    assert_eq!(editor.add_profile_with("Work", &[]).unwrap().index, 2);
+}
+
+/// #312, S5: [`MAX_PROFILES`] counts both sources for an add: 255
+/// profiles in all (split three ways between `config.toml` and
+/// `profiles/`) take one more, at the index past the entries; 256 take
+/// none, and nothing changes. Kills the mutant that drops the file count
+/// from the cap (#430 21.7 M5, `Xaddcap`).
+#[test]
+fn add_profile_with_counts_both_sources_toward_the_cap() {
+    for entry_count in [0, 100, MAX_PROFILES - 1] {
+        let file_count = MAX_PROFILES - 1 - entry_count;
+        let files = files(file_count);
+        let (_dir, paths) = setup(&entries(entry_count), &as_refs(&files));
+        let mut editor = ConfigEditor::open(&paths.config_file()).unwrap();
+        let added = editor.add_profile_with("new", &[]).unwrap();
+        assert_eq!(added.index, entry_count, "{entry_count} entries");
+        assert!(editor.save().unwrap());
+        let store = ConfigStore::open(paths.clone()).unwrap();
+        assert_eq!(store.config().profiles.len(), MAX_PROFILES);
+        assert_eq!(names(&store)[entry_count], "new");
+        assert!(
+            !store
+                .warnings()
+                .iter()
+                .any(|w| matches!(w, Warning::TooManyProfiles { .. })),
+            "{:?}",
+            store.warnings()
+        );
+
+        // Now at the cap: refused, through both adds, nothing changed.
+        let mut editor = ConfigEditor::open(&paths.config_file()).unwrap();
+        let refused = editor
+            .add_profile_with("one more", &[])
+            .expect_err("at the cap");
+        assert!(
+            matches!(refused, EditError::Unsupported { .. }) && refused.to_string().contains("256"),
+            "{entry_count} entries: {refused}"
+        );
+        assert!(editor.add_profile("one more").is_err());
+        assert!(!editor.is_modified());
+    }
+    // All 256 in profiles/: none.
+    let files = files(MAX_PROFILES);
+    let (_dir, paths) = setup("", &as_refs(&files));
+    let mut editor = ConfigEditor::open(&paths.config_file()).unwrap();
+    assert!(editor.add_profile_with("new", &[]).is_err());
+    assert!(!editor.is_modified());
+}
+
+/// #312, S5: a name at the byte cap is added; one byte more is refused
+/// before anything is set, and so is a name the unused-name number would
+/// push past the cap (126 bytes taken: `… 2` is 128, added; 127 taken:
+/// 129, refused).
+#[test]
+fn add_profile_with_keeps_the_name_within_the_byte_cap() {
+    let cap = tessera_config::MAX_PROFILE_NAME_LEN;
+    let name = |len: usize| "n".repeat(len);
+    let (_dir, paths) = setup(
+        &format!(
+            "[[profiles]]\nname = \"{}\"\n[[profiles]]\nname = \"{}\"\n",
+            name(126),
+            name(127)
+        ),
+        &[("f.toml", &format!("name = \"{}\"\n", name(cap)))],
+    );
+    let mut editor = ConfigEditor::open(&paths.config_file()).unwrap();
+    for (base, why) in [
+        (name(cap + 1), "a profile name is at most 128 bytes"),
+        (name(127), "the name is taken"),
+        (name(cap), "the name is taken"),
+    ] {
+        let refused = editor
+            .add_profile_with(&base, &[])
+            .expect_err("past the cap");
+        assert!(
+            matches!(&refused, EditError::Unsupported { reason, .. }
+                if reason.contains("128 bytes") && reason.starts_with(why)),
+            "{} bytes: {refused}",
+            base.len()
+        );
+        assert!(!editor.is_modified());
+    }
+    let added = editor.add_profile_with(&name(126), &[]).unwrap();
+    assert_eq!(added.name, format!("{} 2", name(126)));
+    assert_eq!(added.name.len(), cap);
+    // A multi-byte name exactly at the cap (64 two-byte characters).
+    let wide = "é".repeat(cap / 2);
+    let added = editor.add_profile_with(&wide, &[]).unwrap();
+    assert_eq!(added.name, wide);
+    assert!(editor.save().unwrap());
+    let store = ConfigStore::open(paths).unwrap();
+    assert!(store.warnings().is_empty(), "{:?}", store.warnings());
+    assert_eq!(names(&store)[2..4], [format!("{} 2", name(126)), wide]);
+}
+
+/// #312: one refused key refuses the whole profile, naming the key's full
+/// path, and the document is as before: a theme that does not exist, a
+/// key the loader does not know, a value of the wrong type, a table, a
+/// `name` key, a malformed key, a path too deep, and more than
+/// [`MAX_ADDED_PROFILE_KEYS`] keys.
+#[test]
+fn add_profile_with_is_all_or_nothing() {
+    use tessera_config::edit::MAX_ADDED_PROFILE_KEYS;
+    let (_dir, paths) = setup("[[profiles]]\nname = \"entry\"\n", &[("f.toml", "")]);
+    let mut editor = ConfigEditor::open(&paths.config_file()).unwrap();
+    let good = ("command", toml::Value::String("/bin/sh".into()));
+    let cases: Vec<(Vec<(&str, toml::Value)>, &str)> = vec![
+        (
+            vec![
+                good.clone(),
+                (
+                    "appearance.theme",
+                    toml::Value::String("No Such Theme".into()),
+                ),
+            ],
+            "`profiles[1].appearance.theme` refused",
+        ),
+        (
+            vec![good.clone(), ("bogus", toml::Value::Integer(1))],
+            "`profiles[1].bogus` refused",
+        ),
+        (
+            vec![
+                good.clone(),
+                ("appearance.opacity", toml::Value::String("x".into())),
+            ],
+            "`profiles[1].appearance.opacity` refused",
+        ),
+        (
+            vec![("appearance", toml::Value::Table(toml::Table::new()))],
+            "`profiles[1].appearance`",
+        ),
+        (
+            vec![good.clone(), ("name", toml::Value::String("other".into()))],
+            "`profiles[1].name`",
+        ),
+        (
+            vec![good.clone(), ("a..b", toml::Value::Integer(1))],
+            "malformed",
+        ),
+        (
+            vec![("a.b.c.d.e.f.g.h.i.j.k.l.m.n.o", toml::Value::Integer(1))],
+            "steps",
+        ),
+    ];
+    for (pairs, expected) in cases {
+        let refused = editor
+            .add_profile_with("new", &keys(&pairs))
+            .expect_err(expected);
+        assert!(
+            refused.to_string().contains(expected),
+            "{expected}: {refused}"
+        );
+        assert!(!editor.is_modified(), "{expected}");
+        assert_eq!(editor.profile_count(), 1, "{expected}");
+    }
+    let many: Vec<(String, toml::Value)> = (0..=MAX_ADDED_PROFILE_KEYS)
+        .map(|i| (format!("k{i}"), toml::Value::Integer(1)))
+        .collect();
+    let refused = editor.add_profile_with("new", &many).expect_err("too many");
+    assert!(refused.to_string().contains("at most 64 keys"), "{refused}");
+    assert!(!editor.is_modified());
+    // The cap itself is taken (the keys are checked, not counted, past it).
+    let at_cap = &many[..MAX_ADDED_PROFILE_KEYS];
+    let refused = editor.add_profile_with("new", at_cap).expect_err("unknown");
+    assert!(
+        refused.to_string().contains("`profiles[1].k0` refused"),
+        "{refused}"
+    );
+    // A path of exactly 16 steps is taken.
+    let deep = keys(&[(
+        "appearance.a.b.c.d.e.f.g.h.i.j.k.l.m",
+        toml::Value::Integer(1),
+    )]);
+    let refused = editor.add_profile_with("new", &deep).expect_err("unknown");
+    assert!(
+        !refused.to_string().contains("steps"),
+        "16 steps are a key path: {refused}"
+    );
+    assert!(!editor.is_modified());
+    // And the good keys alone go in.
+    assert_eq!(
+        editor
+            .add_profile_with("new", &keys(&[good]))
+            .unwrap()
+            .index,
+        1
+    );
+}
+
 const BACKENDS: [WatchBackend; 2] = [WatchBackend::Native, WatchBackend::Poll];
 
 /// The issue's bound: 500 ms from the write to the store, on the native
