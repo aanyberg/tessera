@@ -43,6 +43,8 @@ final class SettingsTests: XCTestCase {
         sources = []
         appDelegate.opener = WorkspaceOpener()
         appDelegate.configFileCreator = nil
+        appDelegate.settingsWaitLimit = .seconds(2)
+        appDelegate.settingsClock = SystemSettingsClock()
         appDelegate = nil
     }
 
@@ -83,15 +85,21 @@ final class SettingsTests: XCTestCase {
         (try? file()) ?? "(unreadable)"
     }
 
-    /// Gives the app a core of its own on `config` in a fresh temporary
-    /// directory and opens Settings on it; returns the window's model.
+    /// Gives the app a core of its own on `config` (and `files`, by path
+    /// in the configuration directory) in a fresh temporary directory and
+    /// opens Settings on it; returns the window's model.
     @discardableResult
-    private func openSettings(config: String) throws -> SettingsModel {
+    private func openSettings(config: String, files: [String: String] = [:]) throws -> SettingsModel {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-settings-\(UUID().uuidString)")
         XCTAssertTrue(dir.path.hasPrefix("/"), "an absolute TESSERA_CONFIG_DIR")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         self.dir = dir
         try config.write(to: dir.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)
+        for (path, text) in files {
+            let url = dir.appendingPathComponent(path)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try text.write(to: url, atomically: true, encoding: .utf8)
+        }
         setenv("TESSERA_CONFIG_DIR", dir.path, 1)
         replacedCore = true
         try appDelegate.replaceCore(start: true)
@@ -928,6 +936,8 @@ final class SettingsTests: XCTestCase {
     }
 
     func testClosingTheWindowFreesItsControllerAndModel() async throws {
+        // Only a model that waits for an add or delete is kept (#455).
+        appDelegate.settingsWaitLimit = .seconds(60)
         try autoreleasepool { _ = try openSettings(config: "[[profiles]]\nname = \"one\"\n") }
         let closed = try await opened { controller in
             // Every pane's view, so each holds the model.
@@ -1524,6 +1534,7 @@ extension SettingsTests {
     /// (with the field's binding, which holds the model), is written when
     /// the window closes, and the model is freed all the same.
     func testClosingTheWindowWithTypedTextWritesItAndFreesTheModel() async throws {
+        appDelegate.settingsWaitLimit = .seconds(60)
         try autoreleasepool { _ = try openSettings(config: "[[profiles]]\nname = \"one\"\n") }
         let field = NSObject()
         let closed = try await opened { controller in
@@ -1533,6 +1544,268 @@ extension SettingsTests {
         }
         try await waitUntil("the controller and model are freed") { closed.controller == nil && closed.model == nil }
         try await waitUntil("the typed text written") { (try? self.lines())?.contains(#"command = "typed""#) ?? false }
+    }
+
+    // MARK: #455
+
+    private static let threeProfilesTOML = """
+        [general]
+        default_profile = "one"
+
+        [[profiles]]
+        name = "one"
+
+        [[profiles]]
+        name = "two"
+        command = "/bin/cat"
+
+        [[profiles]]
+        name = "three"
+
+        """
+
+    /// A copy whose name is refused writes none of its keys: its command
+    /// alone would be a profile without a name, which the core loads as
+    /// "Default". The list says why and is not left locked.
+    func testADuplicateWhoseNameIsRefusedWritesNoneOfItsKeys() async throws {
+        let writer = FakeWriter()
+        writer.respond = { call, _ in
+            call.key == "profiles[3].name" ? TesseraConfigEditError(.refused, message: "profiles[3].name: too long") : nil
+        }
+        let (model, _, _) = try fakeModel(Self.threeProfiles, writer: writer)
+        XCTAssertEqual(model.duplicateProfile(1), 3)
+        XCTAssertTrue(model.profilesChanging)
+        try await waitUntil("refused") { !model.isWriting }
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(writer.calls, [.init(key: "profiles[3].name", value: .string("two Copy"))])
+        XCTAssertFalse(model.profilesChanging, "a refused copy unlocks the list")
+        XCTAssertEqual(model.message(SettingsModel.profilesKey), "profiles[3].name: too long")
+        XCTAssertNil(model.value("profiles[3].command"))
+    }
+
+    /// On the core: a profile whose name is 125 bytes has no copy, since
+    /// " Copy" makes the name longer than the core's 128 bytes. Nothing of
+    /// the copy is written, so no nameless profile appears.
+    func testDuplicatingAProfileWithALongNameWritesNoProfileWithoutAName() async throws {
+        let long = String(repeating: "p", count: 125)
+        let model = try openSettings(
+            config: "[[profiles]]\nname = \"\(long)\"\ncommand = \"/bin/cat\"\nworking_directory = \"/tmp\"\n")
+        XCTAssertEqual(model.profiles.map(\.name), [long])
+        let before = try file()
+        XCTAssertEqual(model.duplicateProfile(0), 1)
+        try await waitUntil("refused") { !model.isWriting }
+        XCTAssertFalse(model.profilesChanging)
+        XCTAssertNotNil(model.message(SettingsModel.profilesKey), "the list says why")
+        XCTAssertEqual(try file(), before, "nothing of the copy written")
+        // Nothing for the watch to apply either.
+        try await Task.sleep(for: .milliseconds(300))
+        model.reload()
+        XCTAssertEqual(model.profiles.map(\.name), [long], contents)
+    }
+
+    /// Settings closed and opened again before a delete is applied (the
+    /// watch waits 100 ms to 1 s) edits on with the model that made it,
+    /// still locked: an edit of the stale list's last profile would land
+    /// past the end of the file's and make a nameless profile. Opened the
+    /// way the app opens it.
+    func testSettingsOpenedAgainBeforeADeleteAppliesStaysLocked() async throws {
+        let model = try openSettings(config: Self.threeProfilesTOML)
+        XCTAssertEqual(model.profiles.map(\.name), ["one", "two", "three"])
+        XCTAssertTrue(model.deleteProfile(1))
+        try XCTUnwrap(appDelegate.settingsWindowController).close()
+        XCTAssertNil(appDelegate.settingsWindowController)
+        // Written, and the watch (100 ms at least) not yet applied it.
+        try await waitUntil("the delete written") { !model.isWriting }
+        MainMenu.run(command: "settings")
+        let reopened = try XCTUnwrap(appDelegate.settingsWindowController?.model)
+        XCTAssertTrue(reopened === model, "the model that made the delete")
+        XCTAssertTrue(reopened.profilesChanging, "still locked")
+        XCTAssertNotNil(reopened.profilesStatus)
+        // What the stale list's "three" fields would write.
+        let command = try XCTUnwrap(ProfilesPane.fields.first { $0.key == "command" })
+        command.stringBinding(.init(model: reopened, path: "profiles[2].command", profile: 2)).wrappedValue = "stray"
+        reopened.renameProfile(2, to: "renamed")
+        try await waitUntil("the delete applied") { !reopened.profilesChanging && reopened.profiles.count == 2 }
+        // A stray write would have landed and applied by now.
+        try await Task.sleep(for: .milliseconds(1500))
+        XCTAssertEqual(try lines().filter { $0 == "[[profiles]]" }.count, 2, contents)
+        XCTAssertFalse(try file().contains("stray"), contents)
+        XCTAssertFalse(try file().contains("renamed"), contents)
+        XCTAssertEqual(reopened.profiles.map(\.name), ["one", "three"])
+    }
+
+    /// A closed window's model that waits for its delete is freed once the
+    /// delete applies, or with the core; its controller at once.
+    func testAClosedWindowsWaitingModelIsFreedOnceItsDeleteAppliesOrWithTheCore() async throws {
+        // Not by the wait limit.
+        appDelegate.settingsWaitLimit = .seconds(60)
+        try autoreleasepool { _ = try openSettings(config: Self.threeProfilesTOML) }
+        let closed = try await opened { controller in
+            XCTAssertTrue(controller.model.deleteProfile(1))
+            controller.close()
+        }
+        XCTAssertNil(appDelegate.settingsWindowController)
+        try await waitUntil("the controller is freed") { closed.controller == nil }
+        try await waitUntil("the model is freed once the delete applies") { closed.model == nil }
+        XCTAssertFalse(try file().contains("\"two\""), contents)
+
+        let replaced = try await opened { controller in
+            XCTAssertTrue(controller.model.deleteProfile(1))
+            controller.close()
+            // Before the watch applies the delete.
+            try appDelegate.replaceCore(start: true)
+        }
+        try await waitUntil("freed with the core") { replaced.controller == nil && replaced.model == nil }
+        // Settings on the new core reads it afresh, unlocked.
+        MainMenu.run(command: "settings")
+        XCTAssertEqual(appDelegate.settingsWindowController?.model.profilesChanging, false)
+    }
+
+    /// One wait limit at a time, the last close's: Settings closed, opened
+    /// again and closed again just before the first close's limit keeps
+    /// the model, its delete still waiting, until the second close's limit
+    /// has passed; then it goes, still locked. On a manual clock; nothing
+    /// awaited between the delete and the last check, so the watch's apply
+    /// (on the main actor) cannot come in between.
+    func testSettingsClosedAgainKeepsTheModelForTheLastClosesWaitLimit() async throws {
+        let clock = ManualClock()
+        appDelegate.settingsClock = clock
+        let model = try openSettings(config: Self.threeProfilesTOML)
+        XCTAssertTrue(model.deleteProfile(2))
+        try XCTUnwrap(appDelegate.settingsWindowController).close()
+        XCTAssertTrue(appDelegate.waitingSettingsModel === model)
+        clock.advance(by: .milliseconds(1900))
+        MainMenu.run(command: "settings")
+        XCTAssertTrue(appDelegate.settingsWindowController?.model === model)
+        try XCTUnwrap(appDelegate.settingsWindowController).close()
+        XCTAssertTrue(appDelegate.waitingSettingsModel === model)
+        clock.advance(by: .milliseconds(200))
+        XCTAssertTrue(appDelegate.waitingSettingsModel === model, "kept past the first close's limit")
+        clock.advance(by: .milliseconds(1750))
+        XCTAssertTrue(appDelegate.waitingSettingsModel === model, "kept 1.95 s after the second close")
+        clock.advance(by: .milliseconds(100))
+        XCTAssertTrue(model.profilesChanging, "the delete still waits")
+        XCTAssertNil(appDelegate.waitingSettingsModel, "a model still locked goes after the limit")
+        MainMenu.run(command: "settings")
+        XCTAssertFalse(appDelegate.settingsWindowController?.model === model, "Settings starts afresh")
+        // Leaves no write running into the next test.
+        try await waitUntil("the delete written") { !model.isWriting }
+    }
+
+    /// A closed window's model goes ``AppDelegate/settingsWaitLimit`` after
+    /// the close, applied or not (a watch that never applies must not keep
+    /// Settings locked): here the core refuses the delete (a profile of
+    /// `profiles/*.toml`), so no configuration is applied after it.
+    /// Settings opened then starts afresh.
+    func testAClosedWindowsWaitingModelGoesAfterTheWaitLimit() async throws {
+        appDelegate.settingsWaitLimit = .milliseconds(300)
+        try autoreleasepool {
+            _ = try openSettings(
+                config: "[general]\ndefault_profile = \"one\"\n\n[[profiles]]\nname = \"one\"\n",
+                files: ["profiles/extra.toml": "command = \"/bin/cat\"\n"])
+        }
+        let closed = try await opened { controller in
+            XCTAssertEqual(controller.model.profiles.map(\.name), ["one", "extra"])
+            XCTAssertTrue(controller.model.deleteProfile(1))
+            controller.close()
+        }
+        try await waitUntil("the controller is freed") { closed.controller == nil }
+        try await waitUntil("the model goes after the wait limit") { closed.model == nil }
+        MainMenu.run(command: "settings")
+        let model = try XCTUnwrap(appDelegate.settingsWindowController?.model)
+        XCTAssertFalse(model.profilesChanging)
+        XCTAssertEqual(model.profiles.map(\.name), ["one", "extra"])
+    }
+
+    /// The toolbar item labelled `label`, pressed as a click on it does.
+    private static func pressToolbarItem(_ label: String, in window: NSWindow) throws {
+        let item = try XCTUnwrap(window.toolbar?.items.first { $0.label == label }, "\(label) in the toolbar")
+        XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(item.action), to: item.target, from: item))
+    }
+
+    /// Selects `row` of the Profiles pane's list in `window` and types
+    /// `text` into its Command field.
+    private func typeCommand(_ text: String, row: Int, in window: NSWindow, showing shown: String) async throws {
+        window.layoutIfNeeded()
+        try await waitUntil("the list shows the profiles") {
+            Self.views(NSTableView.self, in: window.contentView).first?.numberOfRows == 3
+        }
+        let table = try XCTUnwrap(Self.views(NSTableView.self, in: window.contentView).first)
+        Self.click(table, row: row)
+        try await waitUntil("the profile's fields are shown") { Self.commandField(in: window)?.stringValue == shown }
+        let field = try XCTUnwrap(Self.commandField(in: window))
+        XCTAssertTrue(window.makeFirstResponder(field))
+        field.currentEditor()?.selectAll(nil)
+        (field.currentEditor() as? NSTextView)?.insertText(text, replacementRange: NSRange(location: NSNotFound, length: 0))
+        try await Task.sleep(for: .milliseconds(50))
+    }
+
+    /// The panes of the Settings window the app opened, in a key window:
+    /// a list row is selected only by a click, which a window that is not
+    /// key (a locked console) does not take. The toolbar comes along.
+    private func appSettingsInAKeyWindow() throws -> (NSTabViewController, KeyControlledWindow) {
+        let controller = try XCTUnwrap(appDelegate.settingsWindowController)
+        let tabs = try XCTUnwrap(controller.tabs)
+        XCTAssertTrue(tabs is SettingsTabViewController)
+        controller.window?.contentViewController = nil
+        let window = KeyControlledWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 600))
+        window.isKeyForTest = true
+        window.contentViewController = tabs
+        return (tabs, window)
+    }
+
+    /// Text typed into a profile's Command field is written when another
+    /// pane is shown with the toolbar (the field goes with its pane before
+    /// it sees the focus go), on the core, in the window the app opens.
+    func testTypedCommandTextIsWrittenWhenAnotherPaneShows() async throws {
+        _ = try openSettings(config: Self.threeProfilesTOML)
+        let (tabs, window) = try appSettingsInAKeyWindow()
+        defer {
+            window.contentViewController = nil
+            window.close()
+        }
+        try Self.pressToolbarItem("Profiles", in: window)
+        XCTAssertEqual(tabs.selectedTabViewItemIndex, 2)
+        try await typeCommand("echo typed", row: 1, in: window, showing: "/bin/cat")
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertFalse(try file().contains("echo typed"), "not written while typed")
+        try Self.pressToolbarItem("General", in: window)
+        XCTAssertEqual(tabs.selectedTabViewItemIndex, 0)
+        try await waitUntil("the typed text written") { (try? self.lines())?.contains(#"command = "echo typed""#) ?? false }
+        // Back on Profiles, two shows it.
+        try Self.pressToolbarItem("Profiles", in: window)
+        try await waitUntil("shown") {
+            Self.views(NSTextField.self, in: window.contentView).contains { $0.stringValue == "echo typed" }
+        }
+    }
+
+    /// A pane switch made without the toolbar (the tab view controller's
+    /// selection, as ``SettingsWindowController/select(pane:)`` sets it)
+    /// writes the typed text too, once, and the field's later focus loss
+    /// writes nothing more.
+    func testTypedCommandTextIsWrittenOnceWhenAnotherPaneIsSelected() async throws {
+        let (model, _, writer) = try fakeModel(Self.threeProfiles)
+        let controller = SettingsWindowController(
+            model: model, actions: SettingsActions(openConfigFile: {}), autosaveName: nil)
+        let tabs = try XCTUnwrap(controller.tabs)
+        controller.window?.contentViewController = nil
+        let window = KeyControlledWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 600))
+        window.isKeyForTest = true
+        window.contentViewController = tabs
+        defer {
+            window.contentViewController = nil
+            window.close()
+            controller.close()
+        }
+        tabs.selectedTabViewItemIndex = 2
+        try await typeCommand("echo typed", row: 1, in: window, showing: "/bin/cat")
+        XCTAssertEqual(writer.calls, [], "not written while typed")
+        tabs.selectedTabViewItemIndex = 3
+        let typed = FakeWriter.Call(key: "profiles[1].command", value: .string("echo typed"))
+        try await waitUntil("the typed text written") { writer.calls == [typed] }
+        window.makeFirstResponder(nil)
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(writer.calls, [typed], "once")
     }
 
     /// The profile appearance fields leave out exactly the keys the window

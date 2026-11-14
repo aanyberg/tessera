@@ -144,7 +144,9 @@ final class SettingsModel {
     private(set) var profileListGeneration = 0
 
     @ObservationIgnored private weak var source: (any SettingsConfigSource)?
-    @ObservationIgnored private let clock: any SettingsClock
+    /// The clock edits are coalesced by (and the app delegate times a closed
+    /// window's waiting model by).
+    @ObservationIgnored let clock: any SettingsClock
     /// The Settings window, which the panes' open panels are sheets on.
     @ObservationIgnored weak var window: NSWindow?
     /// The text typed into a field and not yet committed (one field has
@@ -716,7 +718,10 @@ final class SettingsModel {
     /// Adds a copy of the profile at `index` at the end, named after it
     /// with " Copy"; returns the copy's index (`nil` while
     /// ``profilesChanging``, and with a message at ``maxProfiles``). Text
-    /// typed into a field is committed first, so the copy has it.
+    /// typed into a field is committed first, so the copy has it. The
+    /// name and the copied keys are one run, name first: a name the core
+    /// refuses (" Copy" makes it too long) writes none of the keys, which
+    /// would make a profile without a name (#455).
     @discardableResult
     func duplicateProfile(_ index: Int) -> Int? {
         commitDraft()
@@ -724,12 +729,13 @@ final class SettingsModel {
         guard !profilesChanging, all.indices.contains(index), roomForProfile() else { return nil }
         let copy = all.count
         let name = value(all[index].key("name"))?.string ?? all[index].name
-        set("profiles[\(copy)].name", .string(unusedProfileName(name + " Copy")))
+        var edits = [Edit(key: "profiles[\(copy)].name", value: .string(unusedProfileName(name + " Copy")))]
         for key in Self.profileKeys {
             if let value = value(all[index].key(key)) {
-                set("profiles[\(copy)].\(key)", value)
+                edits.append(Edit(key: "profiles[\(copy)].\(key)", value: value))
             }
         }
+        enqueue(edits)
         return copy
     }
 
