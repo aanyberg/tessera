@@ -2,12 +2,12 @@ import AppKit
 import os
 
 /// The windows to bring back at the next launch: each window's frame, its
-/// number of tabs and the layout of each tab's panes, in the order the
-/// windows opened (ADR 0031, D4c; ADR 0035). Restored panes start fresh
-/// shells in the default directory; their working directories are #61,
-/// their profiles #39. Which pane had the focus, and a maximized pane, are
-/// not kept: a restored tab has every pane showing and its first one
-/// focused.
+/// number of tabs, which tab was selected and the layout of each tab's
+/// panes, front to back (ADR 0031, D4c; ADR 0035; #414). Restored panes
+/// start fresh shells in the default directory; their working directories
+/// are #61, their profiles #39. Which pane had the focus, and a maximized
+/// pane, are not kept: a restored tab has every pane showing and its first
+/// one focused.
 struct WindowState: Codable, Equatable {
     struct Window: Codable, Equatable {
         /// The window's frame in screen coordinates.
@@ -21,22 +21,34 @@ struct WindowState: Codable, Equatable {
         /// entry is one pane. Saved only when some tab is split; at most
         /// ``maxTabs``.
         var tabs: [Tab]?
+        /// The selected tab's place in tab order; `nil` for the last tab,
+        /// which a restore without it selects (as an older Tessera does),
+        /// so it is saved only for another tab.
+        var selectedTab: Int?
 
         /// The tabs past the first ``maxTabs`` are left out: a window
-        /// with more could not be read back.
-        init(frame: CGRect, tabCount: Int, tabs: [Tab]? = nil) {
+        /// with more could not be read back. A `selectedTab` that is not
+        /// one of the tabs kept but the last is `nil`.
+        init(frame: CGRect, tabCount: Int, tabs: [Tab]? = nil, selectedTab: Int? = nil) {
             self.frame = frame
             self.tabCount = min(tabCount, WindowState.maxTabs)
             let kept = tabs.map { Array($0.prefix(WindowState.maxTabs)) }
             // One pane everywhere is the first format's window.
             self.tabs = kept?.contains { $0.tree != nil } == true ? kept : nil
+            // No range and no arithmetic on the count: a hostile one may
+            // be 0, negative or `Int.min`.
+            self.selectedTab = selectedTab.flatMap { index in
+                (0..<WindowState.maxTabs).contains(index) && index + 1 < self.tabCount ? index : nil
+            }
         }
 
         /// As the first format: a `tabs` that cannot be read (not a list,
         /// a tree too deep to decode) leaves every tab one pane rather
         /// than losing the window. A window of more than ``maxTabs`` tabs,
         /// by its count or its list, which is counted before a tab is
-        /// decoded, makes the whole state unreadable (S5).
+        /// decoded, makes the whole state unreadable (S5). A `selectedTab`
+        /// that is not a whole number of a tab is ignored: the last tab is
+        /// selected.
         init(from decoder: any Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             let frame = try container.decode(CGRect.self, forKey: .frame)
@@ -54,7 +66,8 @@ struct WindowState: Codable, Equatable {
                 WindowState.log.error(
                     "a window's pane layouts are unreadable; one pane per tab: \(String(describing: error), privacy: .public)")
             }
-            self.init(frame: frame, tabCount: tabCount, tabs: tabs)
+            let selectedTab = (try? container.decodeIfPresent(Int.self, forKey: .selectedTab)) ?? nil
+            self.init(frame: frame, tabCount: tabCount, tabs: tabs, selectedTab: selectedTab)
         }
 
         /// The layout tab `index` restores: its tree, or `nil` for one pane.
@@ -88,6 +101,12 @@ struct WindowState: Codable, Equatable {
         }
     }
 
+    /// Front to back: the frontmost window first, then those behind it,
+    /// then the minimized ones; windows not on the window list (ordered
+    /// out) follow in the order they opened. While the app is hidden, the
+    /// order is the one it had when it hid. (A value saved before #414
+    /// lists every window in the order they opened, so its first comes back
+    /// in front.)
     var windows: [Window]
 
     fileprivate static let log = Logger(subsystem: "com.aanyberg.tessera", category: "window-state")
@@ -107,7 +126,9 @@ struct WindowState: Codable, Equatable {
     /// moved onto `screens` (see ``clamp(_:to:)``). Every pane counts
     /// against ``maxRestoredSessions``: a tab whose tree is not
     /// ``PaneLayout/isRestorable`` or does not fit what is left restores as
-    /// one pane (logged), and tabs past the cap are dropped.
+    /// one pane (logged), and tabs past the cap are dropped (a selected tab
+    /// among them leaves the last tab kept selected). The windows are
+    /// front to back, so the cap keeps the front ones.
     func restorePlan(screens: [CGRect]) -> [Window] {
         var plan: [Window] = []
         var sessions = 0
@@ -133,7 +154,10 @@ struct WindowState: Codable, Equatable {
                 sessions += tree?.leafCount ?? 1
                 tabs.append(Tab(tree: tree))
             }
-            plan.append(Window(frame: Self.clamp(frame, to: screens), tabCount: tabs.count, tabs: tabs))
+            plan.append(
+                Window(
+                    frame: Self.clamp(frame, to: screens), tabCount: tabs.count, tabs: tabs,
+                    selectedTab: window.selectedTab))
         }
         return plan
     }

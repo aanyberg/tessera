@@ -221,7 +221,8 @@ kept (the first pane is focused), and profiles are not kept per pane
 (#39).
 
 Not covered, accepted for 0.1.0: the order of windows in depth, which
-tab was selected, and whether a window was full screen or minimized are
+tab was selected (both restored since #414, see the amendment below),
+and whether a window was full screen or minimized are
 not restored (a full-screen window comes back as a normal window of the
 screen's size); ⌥⌘Q (Quit and Keep Windows) is not offered; and restore
 follows only `NSQuitAlwaysKeepsWindows`, not the logout panel's "Reopen
@@ -296,3 +297,31 @@ replaces that handler in `applicationWillFinishLaunching`
   answer Quit and the app then quits; harmless, since a sender reads the
   answer only as "not quit yet", and the system's own quit takes the
   first path instead.
+
+## Amendment: stacking order and the selected tab (#414, 2026-11-14)
+
+The saved windows are now listed front to back, by
+`NSApp.orderedWindows` at the time of the save (each window by its
+selected tab), which lists minimized windows after those on screen; a
+window whose selected tab is not on that list (ordered out) comes after
+those that are, in the order the windows opened. While the app is hidden
+(Hide, Hide Others) that list is in the order the windows opened, so the
+order at `NSApplication.willHideNotification` is kept until
+`didUnhideNotification` and used instead; a window opened while hidden
+comes after it. The restore opens them back to front, so the front
+window opens last and is in front and key, as it was. The 64-session
+budget is spent in list order, so it now keeps the front windows rather
+than the first opened. A value saved before #414 lists the windows in the
+order they opened and restores with the first of them in front; an older
+Tessera reads a list saved front to back in its own open order, so its
+front window comes back at the back.
+
+Each window entry gains an optional `selectedTab`: the selected tab's
+place in tab-bar order, saved only when it is not the last tab (a restore
+without it selects the last tab, as every earlier value and an older
+Tessera do), so a value whose windows all have their last tab selected is
+the earlier form. The restore selects it once the window's tabs are open.
+Hostile values (S5): a `selectedTab` that is not a whole number, is
+negative, or is not a tab other than the last of the tabs kept (by the
+saved count, the 64-tab cap or the session budget) is ignored and the
+last tab is selected; it never makes the value unreadable.

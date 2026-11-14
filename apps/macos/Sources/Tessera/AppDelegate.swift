@@ -108,6 +108,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) var displayOptionsCallCount = 0
     /// Follows changes of the system's display settings.
     private var displayOptionsObserver: (any NSObjectProtocol)?
+    /// The application's windows front to back as they were when it last
+    /// hid, from its hiding to its unhiding: a hidden application's
+    /// `NSApp.orderedWindows` lists its windows in the order they opened
+    /// (#414). Weak, so a window closed meanwhile is not kept.
+    private var windowsStackedAtHide: [WeakWindow]?
+    /// Takes and clears ``windowsStackedAtHide``.
+    private var hideObservers: [any NSObjectProtocol] = []
     /// The profile each session was started with, by session id, for the
     /// sessions started with one; the rest have `[general]
     /// default_profile`'s. A split pane starts with its focused pane's
@@ -160,6 +167,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MainMenu.install(in: NSApp)
         terminateOnSignals()
         observeDisplayOptions()
+        observeHiding()
         applyDisplayOptions()
         guard !Self.isTestHost else { return }
         let store = WindowStateStore(defaults: .standard)
@@ -395,26 +403,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Recreates the windows of `state` (the one saved at the last quit) with
     /// fresh shells: each at its saved frame, moved onto `screens` (the
     /// visible frames of the screens, the main one first), with its saved
-    /// number of tabs (D4c) and each tab's panes (ADR 0035). Returns whether
-    /// any window opened; `false` for no state or no window in it, so the
-    /// caller opens the usual one.
+    /// number of tabs (D4c), each tab's panes (ADR 0035) and its selected
+    /// tab, stacked as they were: the state lists them front to back, so the
+    /// back one opens first and the front one last, which leaves it in front
+    /// and key (#414). Returns whether any window opened; `false` for no
+    /// state or no window in it, so the caller opens the usual one.
     @discardableResult
     func restoreWindows(from state: WindowState?, screens: [NSRect] = NSScreen.screens.map(\.visibleFrame)) -> Bool {
         guard let state else { return false }
         var opened = false
         do {
-            for saved in state.restorePlan(screens: screens) {
+            for saved in state.restorePlan(screens: screens).reversed() {
                 let first = try newWindow(frame: saved.frame)
                 opened = true
                 if let layout = saved.layout(ofTab: 0) {
                     try first.restoreLayout(layout)
                 }
-                guard let window = first.window else { continue }
+                guard let window = first.window as? TerminalWindow else { continue }
                 for index in 1..<saved.tabCount {
                     let tab = try newTab(in: window.tabGroup?.windows.last ?? window)
                     if let layout = saved.layout(ofTab: index) {
                         try tab.restoreLayout(layout)
                     }
+                }
+                // Each new tab was selected as it opened, so the last one is.
+                if let selected = saved.selectedTab {
+                    window.selectTab(at: selected)
                 }
             }
         } catch {
@@ -423,11 +437,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return opened
     }
 
-    /// Each window's frame, tab count and tabs' pane layouts (in tab
-    /// order) now, in the order the windows opened. Every tab of a window
-    /// counts once, whichever is selected.
-    func currentWindowState() -> WindowState {
-        var groups: [(frame: CGRect, tabs: [TerminalWindowController])] = []
+    /// Each window's frame, tab count, tabs' pane layouts (in tab order)
+    /// and selected tab now, front to back by `orderedWindows`, by default
+    /// the application's windows front to back (``windowsFrontToBack()``,
+    /// which lists minimized ones after those on screen): a window whose
+    /// selected tab is not among them (ordered out, or opened while the
+    /// application was hidden) comes after those that are, in the order the
+    /// windows opened. Every tab of a window counts once, whichever is
+    /// selected.
+    func currentWindowState(orderedWindows: [NSWindow]? = nil) -> WindowState {
+        let orderedWindows = orderedWindows ?? windowsFrontToBack()
+        var groups: [(front: NSWindow, tabs: [TerminalWindowController])] = []
         var indexByGroup: [ObjectIdentifier: Int] = [:]
         for controller in windowControllers {
             guard let window = controller.window else { continue }
@@ -436,10 +456,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 groups[index].tabs.append(controller)
             } else {
                 indexByGroup[group] = groups.count
-                groups.append(((window.tabGroup?.selectedWindow ?? window).frame, [controller]))
+                groups.append((window.tabGroup?.selectedWindow ?? window, [controller]))
             }
         }
-        let windows = groups.map { group in
+        var depth: [ObjectIdentifier: Int] = [:]
+        for (index, window) in orderedWindows.enumerated() where depth[ObjectIdentifier(window)] == nil {
+            depth[ObjectIdentifier(window)] = index
+        }
+        let stacked = groups.enumerated().sorted { lhs, rhs in
+            let left = depth[ObjectIdentifier(lhs.element.front)] ?? Int.max
+            let right = depth[ObjectIdentifier(rhs.element.front)] ?? Int.max
+            return (left, lhs.offset) < (right, rhs.offset)
+        }
+        let windows = stacked.map(\.element).map { group in
             // Tab bar order, which a drag may have changed; a tab not (yet)
             // in the bar keeps its opening place.
             let order = group.tabs.first?.window?.tabGroup?.windows ?? []
@@ -449,10 +478,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return (left, lhs.offset) < (right, rhs.offset)
             }
             return WindowState.Window(
-                frame: group.frame, tabCount: tabs.count,
-                tabs: tabs.map { WindowState.Tab(tree: $0.element.paneLayout) })
+                frame: group.front.frame, tabCount: tabs.count,
+                tabs: tabs.map { WindowState.Tab(tree: $0.element.paneLayout) },
+                selectedTab: tabs.firstIndex { $0.element.window === group.front })
         }
         return WindowState(windows: windows)
+    }
+
+    /// The application's windows front to back: `NSApp.orderedWindows`,
+    /// or while the application is hidden, the order they had when it hid.
+    private func windowsFrontToBack() -> [NSWindow] {
+        windowsStackedAtHide?.compactMap(\.window) ?? NSApp.orderedWindows
+    }
+
+    /// At `willHide` the window list still has the windows' stacking; from
+    /// `didUnhide` on it has it again.
+    private func observeHiding() {
+        guard hideObservers.isEmpty else { return }
+        let center = NotificationCenter.default
+        hideObservers = [
+            center.addObserver(forName: NSApplication.willHideNotification, object: NSApp, queue: .main) {
+                [weak self] _ in
+                MainActor.assumeIsolated { self?.windowsStackedAtHide = NSApp.orderedWindows.map { WeakWindow(window: $0) } }
+            },
+            center.addObserver(forName: NSApplication.didUnhideNotification, object: NSApp, queue: .main) {
+                [weak self] _ in
+                MainActor.assumeIsolated { self?.windowsStackedAtHide = nil }
+            },
+        ]
     }
 
     /// Saves ``currentWindowState()`` to ``windowStateStore``, if there is one.
@@ -882,3 +935,7 @@ struct WorkspaceOpener: ExternalOpener {
     }
 }
 
+/// A window not kept alive by being listed.
+private struct WeakWindow {
+    weak var window: NSWindow?
+}
