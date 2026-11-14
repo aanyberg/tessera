@@ -698,20 +698,24 @@ fn timed_on(runs: usize, setup: &[u8], ops: &[u8]) -> std::time::Duration {
 /// and as a flood of 256 (the screen stays full, so each costs the same):
 /// within 10 times ED 2 (measured: 3 times over clusters, 6 over links,
 /// whose copies count references; inserting each entry on its own was 19
-/// and 40 times).
+/// and 40 times). The one-at-a-time bar for links is 20 times, not 10: the
+/// tightest run was 52 ms against a 58 ms limit at a load of 31 (#430), so a
+/// loaded machine failed a correct build; a per-entry insert is 40 times.
 #[test]
 #[cfg_attr(debug_assertions, ignore = "timing: release only")]
 fn b02_partial_copies_over_clusters_and_links_cost_a_constant_per_cell() {
     use std::time::Duration;
     let copy = b"\x1b[1;1;1024;1024;1;1;2;1$v";
     for kind in ["clusters", "links"] {
+        // Links are the slower kind and flaked at 10 times under load (see above).
+        let one_factor = if kind == "links" { 20 } else { 10 };
         let setup = filled_largest(kind);
         let erase = timed_on(3, &setup, b"\x1b[2J");
         let one = timed_on(3, &setup, copy);
         let flood = timed_on(1, &setup, &copy.repeat(256));
         eprintln!("{kind}: DECCRA of the left half {one:?}, x256 {flood:?}; ED 2 {erase:?}");
         assert!(
-            one < erase * 10 + Duration::from_millis(5),
+            one < erase * one_factor + Duration::from_millis(5),
             "{kind}: {one:?} vs ED 2 {erase:?}"
         );
         assert!(

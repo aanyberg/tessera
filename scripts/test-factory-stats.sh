@@ -71,6 +71,35 @@ if [[ "$(print -r -- "$both" | grep -c 'teammate t-alpha')" == 1 && "$(print -r 
     && "$(print -r -- "$both" | grep -c 'rust-critic')" == 2 && "$both" == *"| **total** | | 3 | 2k |"* ]]; then
     ok "a session dir and its bare transcript list each teammate once"
 else not_ok "duplicate arguments: $both"; fi
+# A teammate missing from config.json (shut down before the stats run, #446) is counted from its transcript's teamName:
+# the team is `session-<first 8 characters of the lead session id>`, with or without a config; its role comes from the
+# transcript's agent-setting line, and a config member with no transcript is still listed.
+p2="$work/project2" lead2="abcdef12-0000-4000-8000-000000000000"
+mkdir -p "$p2/$lead2" "$work/teams2/session-abcdef12"
+{ print -r -- '{"type":"agent-setting","agentSetting":"adversarial-tester","sessionId":"x"}'; line 500 g1 2026-11-12T10:00:00.000Z session-abcdef12 adv-gone; line 250 g2 2026-11-12T10:01:00.000Z session-abcdef12 adv-gone; } > "$p2/gone.jsonl"
+line 700 k1 2026-11-12T10:00:00.000Z session-abcdef12 t-kept > "$p2/kept.jsonl"
+cat > "$work/teams2/session-abcdef12/config.json" <<JSON
+{"name":"session-abcdef12","leadSessionId":"$lead2","members":[
+ {"agentId":"team-lead@session-abcdef12","name":"team-lead","agentType":"team-lead"},
+ {"agentId":"t-kept@session-abcdef12","name":"t-kept","agentType":"rust-implementer","model":"opus"},
+ {"agentId":"t-idle@session-abcdef12","name":"t-idle","agentType":"rust-critic","model":"opus"}]}
+JSON
+gone="$("$script" --teams-dir "$work/teams2" "$p2/$lead2")"
+noconf="$("$script" --teams-dir "$work/no-teams" "$p2/$lead2")"
+for variant in gone noconf; do
+    out="${(P)variant}"
+    if [[ "$out" == *"| adversarial-tester | claude-sonnet-5-5 | 1 | 750 |"* && "$out" == *"| adversarial-tester | teammate adv-gone | 750 |"* \
+        && "$out" == *"| adv-gone | adversarial-tester |"* ]]; then
+        ok "a teammate absent from the config is counted from its transcript ($variant)"
+    else not_ok "absent teammate ($variant): $out"; fi
+done
+if [[ "$gone" == *"| t-kept | rust-implementer | opus | t-kept@session-abcdef12 | kept |"* && "$gone" == *"| t-idle | rust-critic | opus | t-idle@session-abcdef12 | not found |"* \
+    && "$gone" == *"| **total** | | 2 | 1.4k |"* ]]; then
+    ok "config members keep their role and model; one with no transcript is listed as not found"
+else not_ok "config fallback: $gone"; fi
+if [[ "$noconf" == *"| **total** | | 2 | 1.4k |"* && "$noconf" != *"not found"* ]]; then
+    ok "without any config the same transcripts give the same totals"
+else not_ok "no config totals: $noconf"; fi
 rc=0; "$script" --teams-dir > /dev/null 2>&1 || rc=$?
 if [[ "$rc" == 2 ]]; then ok "--teams-dir without a value rejected"; else not_ok "--teams-dir without a value: exit $rc"; fi
 
