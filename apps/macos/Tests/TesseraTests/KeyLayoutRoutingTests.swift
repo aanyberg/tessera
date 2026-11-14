@@ -36,7 +36,10 @@ final class KeyLayoutRoutingTests: XCTestCase {
 
     private static let notFound = NSRange(location: NSNotFound, length: 0)
 
-    private func setUpCore(config: String?) async throws {
+    /// `typingCaveats`: the chords of `config` that shadow plain typing;
+    /// each gets the "honoured" caveat in the key map's warnings (#355 K4
+    /// m4) and nothing else may warn.
+    private func setUpCore(config: String?, typingCaveats: [String] = []) async throws {
         dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-key-layout-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         if let config {
@@ -46,7 +49,10 @@ final class KeyLayoutRoutingTests: XCTestCase {
         setenv("TESSERA_CONFIG_DIR", dir.path, 1)
         let core = try TesseraApp()
         self.core = core
-        XCTAssertEqual(try core.keymap().warnings, [], "the table applies as written")
+        XCTAssertEqual(
+            try core.keymap().warnings,
+            typingCaveats.map { "`keys.\"\($0)\"`: shadows plain typing of this key; honoured" },
+            "the table applies as written")
         file = dir.appendingPathComponent("input.bin")
         let session = try core.spawn(
             .init(program: "/bin/sh", arguments: ["-c", #"stty raw -echo; printf R; exec cat > "$0""#, file.path]))
@@ -116,7 +122,8 @@ final class KeyLayoutRoutingTests: XCTestCase {
     /// German: Z is where US has Y. With `ctrl+y` and `alt+y` bound,
     /// Control-Z still sends ^Z and Option-Z still types Ω.
     func testQwertzControlZWithCtrlYBinding() async throws {
-        try await setUpCore(config: "[keys]\n'ctrl+y' = 'send_text:CY'\n'alt+y' = 'send_text:AY'\n")
+        try await setUpCore(
+            config: "[keys]\n'ctrl+y' = 'send_text:CY'\n'alt+y' = 'send_text:AY'\n", typingCaveats: ["alt+y"])
         view.processKeyDown(key("\u{1a}", ignoring: "z", code: 16, [.control])) { XCTFail("Control skips the input system") }
         try await assertBytes([0x1a], "Control-Z is ^Z")
         view.processKeyDown(key("Ω", ignoring: "z", code: 16, [.option])) {
