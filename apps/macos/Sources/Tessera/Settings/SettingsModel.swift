@@ -398,7 +398,7 @@ final class SettingsModel {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 for (edit, outcome) in zip(edits, done) {
-                    finish(edit.key, outcome, written: edit.value ?? .null)
+                    self.finish(edit.key, outcome, written: edit.value ?? .null)
                 }
             }
         }
