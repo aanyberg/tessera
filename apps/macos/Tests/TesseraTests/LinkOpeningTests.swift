@@ -5,16 +5,19 @@ import XCTest
 
 @testable import Tessera
 
-/// The link-opening follow-ups of #299 (ADR 0027 amendment): the files a
-/// Command-click shows in Finder because opening them would install
-/// something or start a system flow that does (D4-2), the beep for a click
-/// that opens nothing (D4-3), and the Command-hover under an overlay scroll
-/// bar.
+/// The link-opening follow-ups of #299 and #437 (ADR 0027 amendments): the
+/// files a Command-click shows in Finder because opening them would run,
+/// install or import something (D4-2, the risk list, the handler and the
+/// `OpenWith` rules), the beep for a click that opens nothing (D4-3), and
+/// the Command-hover under an overlay scroll bar.
 ///
-/// The policy is judged by extension or by type, so each rule has a row
-/// only it catches: a folder named like the file isolates the extension
-/// rule (its type is a folder's), and ``LinkPolicy/isLaunchable(_:)`` the
-/// type rule.
+/// The policy has several rules, so each one has a row only it catches: a
+/// folder named like a file isolates the extension rule (its type is a
+/// folder's and Finder opens it), a fake app bundle passed as the handler
+/// isolates the handler rule (the file itself is plain text), and
+/// ``LinkPolicy/isLaunchable(_:)`` the type rule. The system's own risk list
+/// is read at test time, so the assertions on it hold whatever it lists on
+/// the macOS the test runs on.
 @MainActor
 final class LinkOpeningTests: XCTestCase {
     private var app: TesseraApp!
@@ -45,14 +48,62 @@ final class LinkOpeningTests: XCTestCase {
         return directory
     }
 
-    /// The extensions D4-2 adds: configuration and provisioning profiles,
-    /// certificates (Keychain Access's dynamic-typed ones too), shortcuts
-    /// (both formats), a Java Web Start file, a flat Automator workflow and
-    /// a Terminal session file.
+    /// The extensions the hand-kept list of #299 named: every one is still
+    /// shown, now through the type, risk-list and handler rules.
     private static let installing = [
+        "command", "tool", "terminal", "term", "webloc", "inetloc", "fileloc", "pkg", "mpkg", "dmg", "jar",
         "mobileconfig", "configprofile", "provisionprofile", "cer", "crt", "der", "pem", "cert", "p7c", "p7b",
-        "shortcut", "wflow", "jnlp", "workflow", "term",
+        "shortcut", "wflow", "jnlp", "workflow",
     ]
+
+    /// Kinds the reviews of #437 found opening (and M5 of #430): Keychain
+    /// Access imports, Safari's web archives, flat help books and menu
+    /// extras, Xcode's provisioning profiles.
+    private static let found437 = [
+        "p12", "pfx", "keychain", "keychain-db", "webarchive", "help", "menu", "mobileprovision",
+    ]
+
+    /// Kinds whose handler depends on the Mac (what is installed, what the
+    /// user bound): each is shown whenever its default handler is a risky
+    /// one, whatever that is here.
+    private static let dependsOnHandler = [
+        "pkcs12", "p7m", "p7s", "p7r", "ics", "vcf", "scptd", "scpt", "networkconnect", "internetconnect",
+        "safariextz", "prefPane", "saver", "action", "caction", "definition", "lplug4", "skill", "torrent",
+    ]
+
+    /// Kinds Keychain Access imports. `.p12` and `.pfx` are caught by the
+    /// type rule where `com.rsa.pkcs-12` is declared (CoreTypes), the
+    /// keychains where `com.apple.keychain` is (Security's QuickLook
+    /// generator, not CoreTypes), and `.cert`, `.p7c` and `.p7b`, which no
+    /// declared type names, only by the handler rule. A Mac that binds them
+    /// to another app and lacks the declaration opens them, so their rows
+    /// are skipped there (``importsIntoKeychain(_:)``).
+    private static let keychainKinds: Set<String> = ["p12", "pfx", "cert", "p7c", "p7b", "keychain", "keychain-db"]
+
+    /// Whether Keychain Access is `file`'s default handler on this Mac.
+    private static func opensInKeychainAccess(_ file: URL) -> Bool {
+        guard let handler = LinkPolicy.defaultHandler(for: file) else { return false }
+        return Bundle(url: handler)?.bundleIdentifier?.lowercased() == "com.apple.keychainaccess"
+    }
+
+    /// Whether a rule on this Mac names `file` as something Keychain Access
+    /// imports: its type is a declared PKCS #12 or keychain type, or
+    /// Keychain Access is its handler.
+    private static func importsIntoKeychain(_ file: URL) -> Bool {
+        if let type = UTType(filenameExtension: file.pathExtension), type.isDeclared,
+            ["com.rsa.pkcs-12", "com.apple.keychain"].contains(type.identifier)
+        {
+            return true
+        }
+        return opensInKeychainAccess(file)
+    }
+
+    private func action(_ url: URL, handler: ((URL) -> URL?)? = nil) -> LinkPolicy.Action? {
+        if let handler {
+            return LinkPolicy.action(for: url.absoluteString, localHostName: "mymac", handler: handler)
+        }
+        return LinkPolicy.action(for: url.absoluteString, localHostName: "mymac")
+    }
 
     // MARK: Policy (D4-2)
 
@@ -60,33 +111,208 @@ final class LinkOpeningTests: XCTestCase {
         let directory = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let manager = FileManager.default
-        func action(_ name: String) -> LinkPolicy.Action? {
-            LinkPolicy.action(for: directory.appendingPathComponent(name).absoluteString, localHostName: "mymac")
-        }
         func url(_ name: String) -> URL { directory.appendingPathComponent(name) }
-        var files = Self.installing.map { "file.\($0)" } + ["UPPER.CER"]
-        files += ["a.zip", "b.tar.gz", "c.tgz", "d.tar", "e.xml", "f.plist", "g.txt"]
+        var files = (Self.installing + Self.found437).map { "file.\($0)" } + ["UPPER.CER", "UPPER.P12"]
+        files += ["a.zip", "b.tar.gz", "c.tgz", "d.tar", "e.xml", "f.plist", "g.txt", "h.md", "i.json", "j.png"]
         for name in files {
             XCTAssertTrue(manager.createFile(atPath: url(name).path, contents: Data("x".utf8)), name)
         }
-        for ext in Self.installing {
-            try manager.createDirectory(at: url("folder.\(ext)"), withIntermediateDirectories: false)
+        for ext in Self.installing + Self.found437 {
+            let file = url("file.\(ext)")
+            if Self.keychainKinds.contains(ext), !Self.importsIntoKeychain(file) { continue }
+            XCTAssertEqual(action(file), .reveal(file), "a .\(ext) file is shown, not opened")
         }
-        for ext in Self.installing {
-            XCTAssertEqual(action("file.\(ext)"), .reveal(url("file.\(ext)")), "a .\(ext) file is shown, not opened")
-            // A folder's type is a folder's: only the extension rule shows it
-            // (unless an app declares the name a package, as one does for
-            // .pem here, so the set is checked as well).
-            XCTAssertEqual(action("folder.\(ext)"), .reveal(url("folder.\(ext)")), "the .\(ext) extension rule")
-            XCTAssertTrue(LinkPolicy.launchableExtensions.contains(ext), ext)
+        XCTAssertEqual(action(url("UPPER.CER")), .reveal(url("UPPER.CER")), "in any case")
+        if Self.importsIntoKeychain(url("UPPER.P12")) {
+            XCTAssertEqual(action(url("UPPER.P12")), .reveal(url("UPPER.P12")), "in any case")
         }
-        XCTAssertEqual(action("UPPER.CER"), .reveal(url("UPPER.CER")), "in any case")
         for opens in ["a.zip", "b.tar.gz", "c.tgz", "d.tar"] {
-            XCTAssertEqual(action(opens), .open(url(opens)), "\(opens): Archive Utility extracts, runs nothing")
+            XCTAssertEqual(action(url(opens)), .open(url(opens)), "\(opens): Archive Utility extracts, runs nothing")
         }
-        for opens in ["e.xml", "f.plist", "g.txt"] {
-            XCTAssertEqual(action(opens), .open(url(opens)), "\(opens): a profile's supertypes are not swept up")
+        for opens in ["e.xml", "f.plist", "g.txt", "h.md", "i.json", "j.png"] {
+            XCTAssertEqual(action(url(opens)), .open(url(opens)), "\(opens): a profile's supertypes and documents open")
         }
+    }
+
+    /// Whatever the Mac binds these to, a file whose default handler is
+    /// risky is shown; the rest open.
+    func testAFileIsShownWheneverItsDefaultHandlerIsRisky() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var risky: [String] = []
+        for ext in Self.dependsOnHandler + Self.installing + Self.found437 {
+            let file = directory.appendingPathComponent("f.\(ext)")
+            XCTAssertTrue(FileManager.default.createFile(atPath: file.path, contents: Data("x".utf8)), ext)
+            guard let handler = LinkPolicy.defaultHandler(for: file), LinkPolicy.isRiskyHandler(handler) else { continue }
+            risky.append(ext)
+            XCTAssertEqual(action(file), .reveal(file), ".\(ext) opens in \(handler.lastPathComponent)")
+        }
+        // Where Keychain Access is the handler of a certificate or identity,
+        // the handler rule names it (a Mac that binds them elsewhere has no
+        // row here).
+        for ext in ["p12", "pfx", "cert", "p7c", "p7b"]
+        where Self.opensInKeychainAccess(directory.appendingPathComponent("f.\(ext)")) {
+            XCTAssertTrue(risky.contains(ext), ".\(ext) opens in Keychain Access")
+        }
+    }
+
+    /// The handler rule on its own: a plain text file opens unless the app
+    /// that would open it is one of the risky system apps (by bundle
+    /// identifier, in any case) or an agent app.
+    func testTheHandlerRuleShowsWhatARiskyOrAgentAppWouldOpen() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let notes = directory.appendingPathComponent("notes.txt")
+        XCTAssertTrue(FileManager.default.createFile(atPath: notes.path, contents: Data("x".utf8)))
+        func fakeApp(_ name: String, _ info: [String: Any]) throws -> URL {
+            let app = directory.appendingPathComponent("\(name).app", isDirectory: true)
+            let contents = app.appendingPathComponent("Contents", isDirectory: true)
+            try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+            let plist = try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+            try plist.write(to: contents.appendingPathComponent("Info.plist"))
+            return app
+        }
+        XCTAssertEqual(action(notes), .open(notes), "plain text opens with its own app")
+        let viewer = try fakeApp("Viewer", ["CFBundleIdentifier": "com.example.viewer", "LSUIElement": false])
+        XCTAssertEqual(action(notes) { _ in viewer }, .open(notes), "a document app opens it")
+        XCTAssertEqual(action(notes) { _ in nil }, .open(notes), "no app known: opening launches nothing")
+        XCTAssertEqual(
+            action(notes) { _ in directory.appendingPathComponent("Missing.app") }, .open(notes), "no bundle to judge")
+        for (index, identifier) in LinkPolicy.riskyHandlers.sorted().enumerated() {
+            // Bundle identifiers are compared in any case: Launch Services
+            // does.
+            let mixed = index.isMultiple(of: 2) ? identifier.uppercased() : identifier
+            let app = try fakeApp("Risky\(index)", ["CFBundleIdentifier": mixed])
+            XCTAssertEqual(action(notes) { _ in app }, .reveal(notes), mixed)
+        }
+        let agents: [[String: Any]] = [
+            ["LSUIElement": true], ["LSUIElement": "1"], ["LSUIElement": 1], ["LSUIElement": "YES"],
+            ["LSBackgroundOnly": true], ["LSBackgroundOnly": "true"],
+        ]
+        for (index, info) in agents.enumerated() {
+            var plist: [String: Any] = ["CFBundleIdentifier": "com.example.agent\(index)"]
+            plist.merge(info) { $1 }
+            let agent = try fakeApp("Agent\(index)", plist)
+            XCTAssertEqual(action(notes) { _ in agent }, .reveal(notes), "an agent app: \(info)")
+        }
+        let windowed: [[String: Any]] = [["LSUIElement": false], ["LSUIElement": "0"], ["LSBackgroundOnly": 0]]
+        for (index, info) in windowed.enumerated() {
+            var plist: [String: Any] = ["CFBundleIdentifier": "com.example.window\(index)"]
+            plist.merge(info) { $1 }
+            let app = try fakeApp("Window\(index)", plist)
+            XCTAssertEqual(action(notes) { _ in app }, .open(notes), "not an agent: \(info)")
+        }
+    }
+
+    /// Launch Services' own list, read from this Mac: every kind on it is
+    /// shown (by extension, also for a folder, whose type is a folder's; by
+    /// type for every declared type), and the built-in copy covers it, so a
+    /// macOS that adds a kind fails here until the copy has it too.
+    func testEveryKindOnTheSystemRiskListIsShownAndTheCopyCoversIt() throws {
+        let system = try XCTUnwrap(LinkPolicy.systemRiskList(), "the system's risk list is readable")
+        XCTAssertFalse(system.types.isEmpty)
+        XCTAssertFalse(system.extensions.isEmpty)
+        XCTAssertFalse(system.types.contains("public.archive"), "archives keep opening")
+        XCTAssertTrue(system.types.isSubset(of: LinkPolicy.riskList.types))
+        XCTAssertTrue(system.extensions.isSubset(of: LinkPolicy.riskList.extensions))
+        XCTAssertEqual(
+            system.types.subtracting(LinkPolicy.builtInRiskList.types), [], "types the built-in copy lacks")
+        XCTAssertEqual(
+            system.extensions.subtracting(LinkPolicy.builtInRiskList.extensions), [],
+            "extensions the built-in copy lacks")
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let finder = URL(fileURLWithPath: "/System/Library/CoreServices/Finder.app")
+        for ext in system.extensions.sorted() {
+            let file = directory.appendingPathComponent("f.\(ext)")
+            XCTAssertTrue(FileManager.default.createFile(atPath: file.path, contents: Data("x".utf8)), ext)
+            XCTAssertEqual(action(file), .reveal(file), "a .\(ext) file")
+            let folder = directory.appendingPathComponent("d.\(ext)", isDirectory: true)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+            XCTAssertEqual(action(folder) { _ in finder }, .reveal(folder), "a folder named .\(ext)")
+        }
+        for identifier in system.types.sorted() {
+            guard let type = UTType(identifier) else { continue }  // not declared on this Mac: no file has it
+            XCTAssertTrue(LinkPolicy.isLaunchable(type), identifier)
+        }
+        // A web archive opens in Safari, a document app: only the risk
+        // list's type shows it.
+        let archive = directory.appendingPathComponent("page.webarchive")
+        XCTAssertTrue(FileManager.default.createFile(atPath: archive.path, contents: Data("x".utf8)))
+        XCTAssertEqual(action(archive) { _ in finder }, .reveal(archive))
+    }
+
+    /// The reading of a risk-list property list: both categories, the
+    /// archive type left out, extensions lower-cased, other entries ignored,
+    /// and anything else, or too much of it, read as no list.
+    func testTheRiskListIsReadFromBothCategoriesButTheArchiveType() throws {
+        func data(_ plist: Any) throws -> Data {
+            try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+        }
+        let plist: [String: Any] = [
+            "LSRiskCategoryUnsafeExecutable": [
+                "LSRiskCategoryContentTypes": ["com.example.run", 7], "LSRiskCategoryExtensions": ["RUN", "x"],
+                "LSRiskCategoryOSTypes": ["abcd"],
+            ],
+            "LSRiskCategoryMayContainUnsafeExecutable": [
+                "LSRiskCategoryContentTypes": ["public.archive", "com.example.installer"],
+                "LSRiskCategoryExtensions": ["inst"],
+            ],
+            "LSRiskCategorySafe": ["LSRiskCategoryContentTypes": ["public.plain-text"], "LSRiskCategoryExtensions": ["txt"]],
+        ]
+        XCTAssertEqual(
+            LinkPolicy.riskList(fromPropertyList: try data(plist)),
+            LinkPolicy.RiskList(types: ["com.example.run", "com.example.installer"], extensions: ["run", "x", "inst"]))
+        XCTAssertEqual(
+            LinkPolicy.riskList(fromPropertyList: try data(["LSRiskCategoryUnsafeExecutable": [String: Any]()])),
+            LinkPolicy.RiskList(types: [], extensions: []), "a category with nothing in it")
+        XCTAssertNil(LinkPolicy.riskList(fromPropertyList: try data(["LSRiskCategorySafe": [String: Any]()])))
+        XCTAssertNil(LinkPolicy.riskList(fromPropertyList: try data(["a", "b"])), "not a dictionary")
+        XCTAssertNil(LinkPolicy.riskList(fromPropertyList: Data("not a plist".utf8)))
+        var big = plist
+        big["padding"] = String(repeating: "x", count: LinkPolicy.maxRiskListBytes)
+        XCTAssertNil(LinkPolicy.riskList(fromPropertyList: try data(big)), "more than the cap is not read")
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("System")
+        try data(plist).write(to: file)
+        XCTAssertEqual(LinkPolicy.systemRiskList(at: file)?.extensions, ["run", "x", "inst"])
+        XCTAssertNil(LinkPolicy.systemRiskList(at: directory.appendingPathComponent("missing")))
+        try data(big).write(to: file)
+        XCTAssertNil(LinkPolicy.systemRiskList(at: file), "a file over the cap is not read")
+    }
+
+    /// A file that carries Launch Services' per-file `OpenWith` attribute
+    /// (it hands the file to whatever app it names) is shown; the same file
+    /// without it opens. The attribute names Preview here, which is no risky
+    /// handler, so only the attribute rule shows it (Launch Services honours
+    /// it when naming the handler, so one naming Terminal would be caught by
+    /// the handler rule too). A symbolic link is shown whatever it leads to:
+    /// Foundation counts it as an alias.
+    func testAFileBoundToAnAppByItsOpenWithAttributeIsShown() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let plain = directory.appendingPathComponent("plain.txt")
+        let bound = directory.appendingPathComponent("bound.txt")
+        for file in [plain, bound] {
+            XCTAssertTrue(FileManager.default.createFile(atPath: file.path, contents: Data("x".utf8)))
+        }
+        let value = try PropertyListSerialization.data(
+            fromPropertyList: [
+                "version": 0, "bundleidentifier": "com.apple.Preview", "path": "/System/Applications/Preview.app",
+            ], format: .binary, options: 0)
+        let result = value.withUnsafeBytes {
+            setxattr(bound.path, LinkPolicy.openWithAttribute, $0.baseAddress, value.count, 0, 0)
+        }
+        XCTAssertEqual(result, 0, "setxattr: errno \(errno)")
+        if let handler = LinkPolicy.defaultHandler(for: bound) {
+            XCTAssertFalse(LinkPolicy.isRiskyHandler(handler), handler.path)
+        }
+        XCTAssertEqual(action(plain), .open(plain))
+        XCTAssertEqual(action(bound), .reveal(bound), "the attribute names the app, so the file is shown")
+        let link = directory.appendingPathComponent("link.txt")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: plain)
+        XCTAssertEqual(action(link), .reveal(link), "a symbolic link, as before")
     }
 
     func testTheTypeRulesCatchEachKindWhateverItsName() throws {
@@ -94,8 +320,19 @@ final class LinkOpeningTests: XCTestCase {
             "com.apple.mobileconfig", "com.apple.configprofile", "com.apple.provisionprofile",
             "public.x509-certificate", "com.apple.shortcut", "com.apple.shortcuts.workflow-file",
             "com.sun.java-web-start", "com.apple.automator-workflow", "com.apple.terminal.session",
+            "com.apple.webarchive", "com.apple.installer-package-archive",
         ] {
             let type = try XCTUnwrap(UTType(identifier), "\(identifier) is declared on this system")
+            XCTAssertTrue(LinkPolicy.isLaunchable(type), identifier)
+        }
+        // Declared only where Xcode, Safari's extension support or Security's
+        // QuickLook generator is (and the PKCS #12 type by CoreTypes, kept
+        // here so a macOS that drops it skips the row): judged by type where
+        // they are.
+        for identifier in [
+            "com.apple.mobileprovision", "com.apple.safari.extension", "com.rsa.pkcs-12", "com.apple.keychain",
+        ] {
+            guard let type = UTType(identifier) else { continue }
             XCTAssertTrue(LinkPolicy.isLaunchable(type), identifier)
         }
         // Every extension the system maps to a certificate, by its type.
@@ -105,12 +342,13 @@ final class LinkOpeningTests: XCTestCase {
             XCTAssertTrue(LinkPolicy.isLaunchable(type), ext)
         }
         // Keychain Access's other certificate extensions have no declared
-        // type: only the extension rule shows them.
+        // type: the handler rule shows them (Keychain Access opens them).
         for ext in ["cert", "p7c", "p7b"] {
-            XCTAssertTrue(try XCTUnwrap(UTType(filenameExtension: ext)).isDynamic, ext)
-            XCTAssertTrue(LinkPolicy.launchableExtensions.contains(ext), ext)
+            let type = try XCTUnwrap(UTType(filenameExtension: ext))
+            XCTAssertTrue(type.isDynamic, ext)
+            XCTAssertFalse(LinkPolicy.isLaunchable(type), ext)
         }
-        for opens: UTType in [.zip, .gzip, .archive, .xml, .propertyList, .plainText, .folder, .pdf] {
+        for opens: UTType in [.zip, .gzip, .archive, .xml, .propertyList, .plainText, .folder, .pdf, .png, .json] {
             XCTAssertFalse(LinkPolicy.isLaunchable(opens), opens.identifier)
         }
     }
@@ -145,6 +383,42 @@ final class LinkOpeningTests: XCTestCase {
         try rig.perform("up mods=cmd")
         XCTAssertEqual(beeps, 1, "neither an opened file nor a refused host beeps")
         XCTAssertEqual(rig.opener.opened, [present])
+    }
+
+    /// The click goes through the same policy with Launch Services' real
+    /// handler: a PKCS #7 certificate bundle (Keychain Access imports it; no
+    /// declared type, risk-list or extension rule names it, so only the
+    /// handler rule shows it) and a text file bound to Terminal by its
+    /// `OpenWith` attribute are shown, a plain text file opens. Skipped on a
+    /// Mac that binds `.p7b` to another app.
+    func testACommandClickShowsWhatTheHandlerOrOpenWithRuleCatches() async throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let certificates = directory.appendingPathComponent("certificates.p7b")
+        let bound = directory.appendingPathComponent("bound.txt")
+        let plain = directory.appendingPathComponent("plain.txt")
+        for file in [certificates, bound, plain] {
+            XCTAssertTrue(FileManager.default.createFile(atPath: file.path, contents: Data("x".utf8)))
+        }
+        guard Self.opensInKeychainAccess(certificates) else {
+            throw XCTSkip(".p7b does not open in Keychain Access on this Mac")
+        }
+        XCTAssertFalse(UTType(filenameExtension: "p7b")?.isDeclared ?? false, "no declared type names .p7b")
+        let value = try PropertyListSerialization.data(
+            fromPropertyList: ["version": 0, "bundleidentifier": "com.apple.Terminal"], format: .binary, options: 0)
+        let result = value.withUnsafeBytes {
+            setxattr(bound.path, LinkPolicy.openWithAttribute, $0.baseAddress, value.count, 0, 0)
+        }
+        XCTAssertEqual(result, 0)
+        let links = [certificates, bound, plain]
+        let rig = try await rig(rows: 4, cols: 200, feed: links.map(\.absoluteString).joined(separator: "\r\n"))
+        defer { rig.close() }
+        for row in 0..<links.count {
+            try rig.perform("down \(row),10 mods=cmd")
+            try rig.perform("up mods=cmd")
+        }
+        XCTAssertEqual(rig.opener.revealed, [certificates, bound])
+        XCTAssertEqual(rig.opener.opened, [plain])
     }
 
     // MARK: Hover under an overlay scroll bar

@@ -346,8 +346,8 @@ final class TerminalSelectionCallTests: XCTestCase {
         try folder("Foo.app")
         try folder("Doc.rtfd")
         try folder("Plug.bundle")
-        // A folder's type says nothing of its name: only the extension
-        // rule shows it (a `.jar` file's type is executable already).
+        // A folder named like a Java archive is a folder: Finder opens it
+        // (#437; the hand-kept extension list that showed it is gone).
         try folder("i.jar")
         for (alias, target) in [("alias-to-app", "Foo.app"), ("alias-to-txt", "notes.txt")] {
             let data = try directory.appendingPathComponent(target).bookmarkData(options: .suitableForBookmarkFile)
@@ -370,12 +370,12 @@ final class TerminalSelectionCallTests: XCTestCase {
             LinkPolicy.action(for: directory.appendingPathComponent(name).absoluteString, localHostName: "mymac")
         }
         let url = { directory.appendingPathComponent($0) }
-        for opens in ["notes.txt", "picture.png", "folder"] {
+        for opens in ["notes.txt", "picture.png", "folder", "i.jar"] {
             XCTAssertEqual(action(opens), .open(url(opens)), "\(opens) is an ordinary file or folder")
         }
         for revealed in [
             "run.command", "script.sh", "tool", "link.webloc", "a.inetloc", "b.fileloc", "c.terminal", "d.tool",
-            "e.pkg", "f.mpkg", "g.dmg", "h.jar", "i.jar", "j.url", "k.vncloc", "l.afploc", "m.img", "n.iso",
+            "e.pkg", "f.mpkg", "g.dmg", "h.jar", "j.url", "k.vncloc", "l.afploc", "m.img", "n.iso",
             "Foo.app", "Doc.rtfd", "Plug.bundle", "link-to-app", "link-to-tool.txt", "link-to-webloc.txt", "readme.txt",
             "alias-to-app", "alias-to-txt",
         ] {
