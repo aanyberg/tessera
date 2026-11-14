@@ -732,6 +732,13 @@ final class TabVisibilityTests: XCTestCase {
             let (first, second) = try await openTabs(second: profile)
             let window = try XCTUnwrap(first.window)
             let tab = try XCTUnwrap(second.window)
+            // #417 M1: the unselected tab's window is put in the other
+            // opacity first, so the route has to re-derive all of its state
+            // (opacity, background, style mask, title bar, strip), not only
+            // the blur radius.
+            TerminalSurfaceView.setWindow(tab, opaque: profile == nil)
+            (tab.contentView as? TerminalWindowContentView)?.updateTitlebar(translucent: profile != nil)
+            XCTAssertEqual(tab.isOpaque, profile == nil, "\(name): the unselected tab is in the other state")
             select(window, tab)
             assertShown(
                 second, translucent: profile == nil, radius: profile == nil ? 40 : 0,
@@ -802,6 +809,69 @@ final class TabVisibilityTests: XCTestCase {
         NSApp.unhide(nil)
         try await waitUntil("shown again, every tab at the new radius") { radii() == [30, 30] }
         XCTAssertEqual(contents.map(\.usesBlurRadius), [true, true])
+    }
+
+    /// #417 m1: minimizing a window of three tabs and bringing it back
+    /// gives each tab at most one update of its state from the restore,
+    /// the selected tab exactly one, whichever tabs macOS posts the restore
+    /// for (macOS 27.2 posts it for each), not one per tab for each of them.
+    /// The app's own windows, minimized and restored for real, posting
+    /// nothing.
+    func testADeminiaturizeUpdatesEachTabOnce() async throws {
+        let first = try appDelegate.newWindow()
+        let window = try XCTUnwrap(first.window)
+        let second = try appDelegate.newTab(in: window)
+        let third = try appDelegate.newTab(in: try XCTUnwrap(second.window))
+        let windows = try [first, second, third].map { try XCTUnwrap($0.window) }
+        XCTAssertEqual(window.tabGroup?.windows.count, 3)
+        let contents = try windows.map { try XCTUnwrap($0.contentView as? TerminalWindowContentView) }
+        let selected = try XCTUnwrap(window.tabGroup?.selectedWindow)
+
+        selected.miniaturize(nil)
+        let deadline = ContinuousClock.now + .seconds(10)
+        while !selected.isMiniaturized, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        guard selected.isMiniaturized else { throw XCTSkip("the host cannot minimize a window (no Dock)") }
+        let before = contents.map(\.deminiaturizeCount)
+        selected.deminiaturize(nil)
+        try await waitUntil("restored") { !selected.isMiniaturized && selected.isVisible }
+        // Every restore notification is posted by now; let any late one land.
+        try await Task.sleep(for: .milliseconds(300))
+        let counts = zip(contents, before).map { $0.deminiaturizeCount - $1 }
+        let index = try XCTUnwrap(windows.firstIndex { $0 === selected })
+        XCTAssertEqual(counts[index], 1, "the selected tab is updated once: \(counts)")
+        XCTAssertTrue(counts.allSatisfy { $0 <= 1 }, "no tab is updated more than once: \(counts)")
+    }
+
+    /// #417 M6: a window that turns opaque forgets the height of the title
+    /// bar and tab bar it had, so after its tab bar goes and it turns
+    /// translucent again at a frame too small to show a pane, its smallest
+    /// size takes the title bar alone, not the tab bar that is gone.
+    func testAnOpaqueWindowForgetsTheTabBarItHad() throws {
+        let first = try appDelegate.newWindow(profile: "solid")
+        let window = try XCTUnwrap(first.window)
+        let second = try appDelegate.newTab(in: window, profile: "solid")
+        let tab = try XCTUnwrap(second.window)
+        window.tabGroup?.selectedWindow = tab
+        let content = try XCTUnwrap(tab.contentView as? TerminalWindowContentView)
+        let titlebar = TerminalWindowContentView.standardTitlebarHeight(of: tab)
+        content.updateTitlebar(translucent: true)
+        let strip = content.bounds.maxY - content.paneArea.maxY
+        guard strip > titlebar + 1 else { throw XCTSkip("the host shows no tab bar") }
+        XCTAssertEqual(content.titlebarInset, strip, "translucent with a tab bar: the strip")
+
+        content.updateTitlebar(translucent: false)
+        XCTAssertEqual(content.titlebarInset, 0, "opaque: no strip")
+        window.close()
+        XCTAssertNil(tab.tabGroup.flatMap { $0.windows.count > 1 ? $0 : nil }, "the tab bar went")
+
+        var tiny = tab.frame
+        tiny.size.height = 20
+        tab.setFrame(tiny, display: false)
+        content.updateTitlebar(translucent: true)
+        XCTAssertEqual(content.paneArea.height, 0, "no pane shows")
+        XCTAssertEqual(content.titlebarInset, titlebar, "the title bar alone, the tab bar it had forgotten")
     }
 
     /// #403 m2: the smallest frame of a translucent tabbed window, set by a

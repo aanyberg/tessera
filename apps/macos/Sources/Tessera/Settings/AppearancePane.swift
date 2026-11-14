@@ -1,12 +1,16 @@
 import SwiftUI
 
-/// Appearance: the theme (and importing one), the font, the window's
-/// opacity, blur and blur radius, the cursor and the dimming of inactive panes; the
-/// `[appearance]` table every profile follows where it sets nothing of its
-/// own.
+/// Appearance: the app's own appearance (app-wide, #365), the theme (and
+/// importing one), the font, the window's opacity, blur and blur radius, the
+/// cursor and the dimming of inactive panes; but for the app's appearance,
+/// the `[appearance]` table every profile follows where it sets nothing of
+/// its own.
 struct AppearancePane: View {
     let model: SettingsModel
 
+    static let app = SettingsField(
+        key: "appearance.app_appearance", title: "Appearance", control: .choice(SettingsField.appAppearances),
+        note: "The windows, tab bars, find bar, sheets and Settings. The terminal keeps its theme's colours.")
     static let theme = SettingsField(key: "appearance.theme", title: "Theme", control: .theme)
     static let font = [
         SettingsField(key: "appearance.font_family", title: "Font", control: .font),
@@ -35,10 +39,13 @@ struct AppearancePane: View {
     ]
 
     /// Every field of the pane, in order.
-    static var fields: [SettingsField] { [theme] + font + window + cursor + panes }
+    static var fields: [SettingsField] { [app, theme] + font + window + cursor + panes }
 
     var body: some View {
         SettingsForm(model: model) {
+            Section("App") {
+                SettingsFieldRow(field: Self.app, context: .init(model: model, path: Self.app.key))
+            }
             Section("Theme") {
                 SettingsFieldRow(field: Self.theme, context: .init(model: model, path: Self.theme.key))
                 LabeledContent("") {
