@@ -169,6 +169,24 @@ enum KeyChord {
         return glyphs.filter { names.contains($0.name) }.map(\.glyph).joined()
     }
 
+    /// The modifiers `chord` (canonical) names.
+    static func flags(of chord: String) -> NSEvent.ModifierFlags {
+        let names = Set(chord.split(separator: "+", omittingEmptySubsequences: false).dropLast().map(String.init))
+        return modifiers.reduce(into: []) { flags, modifier in
+            if names.contains(modifier.name) { flags.insert(modifier.flag) }
+        }
+    }
+
+    /// Whether the key map's `menu` lists `chord` (canonical): the core
+    /// puts a chord on a menu item when it has Command and its key is not
+    /// on the keypad (`menu_shortcut`), in the order of the chords. This
+    /// only pairs the two lists the core gave; the pane checks each pair's
+    /// modifiers before it uses one.
+    static func goesOnMenu(_ chord: String) -> Bool {
+        let key = chord.split(separator: "+", omittingEmptySubsequences: false).last ?? ""
+        return chord.hasPrefix("cmd+") && !key.hasPrefix("kp_")
+    }
+
     /// `chord` (canonical, as the key map lists it) as macOS writes a
     /// shortcut: modifier glyphs, then the key (`⇧⌘E`, `⌥F5`, `⌘Space`,
     /// `⇧⌘[`), sanitised (S3) since it comes from `config.toml`.
@@ -275,13 +293,21 @@ struct SystemKeyEventMonitoring: KeyEventMonitoring {
 /// map with its chords, the shortcut being recorded, a conflict waiting for
 /// the user, and the pane's edits of `[keys]`.
 ///
-/// The key map and `[keys]` as written come from the ``SettingsModel``
-/// (both of one generation); an edit is a run of single-key sets and
-/// removes of `keys."<chord>"` on ``SettingsModel/writeQueue``, in order,
-/// stopping at the first that fails. From the moment one is queued until a
-/// later key map applies (or it fails, with its message by the row) the
-/// pane shows the chord it set and edits nothing else, as the Profiles
-/// pane does while its indices move.
+/// The key map, its `[keys]` entries and `[keys]` as written come from the
+/// ``SettingsModel`` (all of one generation). The pane finds an entry by
+/// the canonical chord and the effect the core reports for it (#355), never
+/// by the table key as written, and writes only command names and
+/// `unbound`, never an entry's value: the entry is changed under its own
+/// table key (`shift+cmd+u` stays `shift+cmd+u`), and only when that key is
+/// one of `[keys]` as written.
+///
+/// An edit is a run of single-key sets and removes of `keys."<key>"` on
+/// ``SettingsModel/writeQueue``, in order, stopping at the first that
+/// fails. From the moment one is queued until the key map shows every key
+/// it wrote (or it fails, with its message by the row, or
+/// ``settleTimeout`` passes and the pane reads the applied configuration
+/// again) the pane
+/// shows the chord it set and edits nothing else.
 @MainActor
 @Observable
 final class KeysModel {
@@ -295,12 +321,15 @@ final class KeysModel {
         var group: String
         /// Its chords, canonical, the one its menu item shows first.
         var chords: [String]
+        /// Its chords as the menus show them (`⌘?` for `cmd+shift+/`), or as
+        /// macOS writes a shortcut (``KeyChord/display(_:)``), sanitised.
+        var labels: [String]
         /// A command a later version runs: bindable, does nothing yet.
         var planned: Bool
 
         var id: String { command }
-        /// Its chords as macOS writes shortcuts, joined.
-        @MainActor var display: String { chords.map { KeyChord.display($0) }.joined(separator: ", ") }
+        /// Its chords' labels, joined.
+        var display: String { labels.joined(separator: ", ") }
     }
 
     /// Rows under the title of their menu.
@@ -320,24 +349,71 @@ final class KeysModel {
         var text: String
     }
 
-    /// One write of `[keys]`: a chord (the table key as written) set to a
-    /// value, or removed.
+    /// One write of `[keys]`: a table key set to a value, or removed.
     enum Edit: Equatable, Sendable {
         case set(String, String)
         case remove(String)
 
-        /// The key path of `chord`: `keys."<chord>"`, quotes and backslashes
+        /// The key path of `key`: `keys."<key>"`, quotes and backslashes
         /// escaped.
-        static func path(_ chord: String) -> String {
-            let escaped = chord.replacingOccurrences(of: "\\", with: "\\\\")
+        static func path(_ key: String) -> String {
+            let escaped = key.replacingOccurrences(of: "\\", with: "\\\\")
                 .replacingOccurrences(of: "\"", with: "\\\"")
             return "keys.\"\(escaped)\""
+        }
+
+        var key: String {
+            switch self {
+            case .set(let key, _), .remove(let key): key
+            }
+        }
+    }
+
+    /// The key map, its entries and `[keys]` as written, of one generation.
+    private struct State {
+        let map: TesseraKeymap
+        /// The table keys of `[keys]` as written: an entry whose (escaped,
+        /// capped) key is one of them is one the pane can change.
+        let keys: Set<String>
+
+        /// The entry that took `chord`: the first kept one, binding it or
+        /// `unbound`.
+        func effective(_ chord: String) -> TesseraKeymap.Entry? {
+            map.entries.first { $0.chord == chord && ($0.effect == .bound || $0.effect == .unbound) }
+        }
+
+        /// The entries binding one of `command`'s chords: its own.
+        func bound(_ command: TesseraKeymap.Command) -> [TesseraKeymap.Entry] {
+            map.entries.filter { entry in
+                entry.effect == .bound && entry.chord.map(command.chords.contains) == true
+            }
+        }
+
+        /// The entries naming `command` that a first entry for their chord
+        /// left out: they would bind it again once that one goes.
+        func shadowed(_ command: TesseraKeymap.Command) -> [TesseraKeymap.Entry] {
+            map.entries.filter { $0.effect == .shadowed && $0.value == .text(command.command) }
+        }
+
+        /// `command`'s chords no entry of its own binds: its defaults.
+        func defaults(_ command: TesseraKeymap.Command) -> [String] {
+            let own = Set(bound(command).compactMap(\.chord))
+            return command.chords.filter { !own.contains($0) }
+        }
+
+        /// Whether Restore Defaults removes `entry`: one binding a command
+        /// or `unbound`, what the pane writes, that the pane can change.
+        /// Entries that send text or turn a key off (`none`) stay.
+        func isRestorable(_ entry: TesseraKeymap.Entry) -> Bool {
+            guard keys.contains(entry.key), case .text(let value) = entry.value else { return false }
+            return value == "unbound" || map.command(named: value) != nil
         }
     }
 
     /// The key of the message Restore Defaults shows.
     static let restoreKey = "action:restore_keys"
-    /// At most this many of the key map's warnings are listed.
+    /// At most this many of the key map's problems, and of its caveats, are
+    /// listed.
     static let maxWarnings = 20
 
     private static let log = Logger(subsystem: "com.aanyberg.tessera", category: "settings")
@@ -349,6 +425,16 @@ final class KeysModel {
     @ObservationIgnored weak var window: NSWindow?
     /// Where key events come from while recording.
     @ObservationIgnored var monitoring: any KeyEventMonitoring = SystemKeyEventMonitoring()
+    /// Where conflicts and refusals are announced to VoiceOver.
+    @ObservationIgnored var poster: any AccessibilityPosting = SystemAccessibilityPoster()
+    /// How long a written edit waits for the key map to show it before the
+    /// pane reads the configuration again (``SettingsModel/reload()``: the
+    /// core's applied configuration and key map, not the file) and edits
+    /// on: an apply the pane missed, an entry past the first 512, or an edit
+    /// the core reads as no change. Released before a slow apply lands, the
+    /// pane edits from that stale snapshot until the apply comes (the wave
+    /// 22 generation token fixes it).
+    @ObservationIgnored var settleTimeout: Duration = .seconds(2)
 
     /// The command whose shortcut is being recorded.
     private(set) var recording: String?
@@ -361,8 +447,14 @@ final class KeysModel {
     /// applies.
     private var editing: (command: String, chords: [String])?
     private var inFlight = false
-    /// The configuration's generation when the latest edit was queued.
-    private var queuedAt: UInt64?
+    /// Counts runs released by ``settleTimeout``: it changes what
+    /// ``isChanging`` reads.
+    private var timedOut = 0
+    /// What the latest run leaves in `[keys]`, by table key: the value set,
+    /// or `nil` for a key removed. `nil` once the key map shows it.
+    @ObservationIgnored private var settling: [String: String?]?
+    /// The latest run.
+    @ObservationIgnored private var runs = 0
 
     /// The monitor and window observers of a recording.
     @ObservationIgnored private var registrations: [KeysRegistration] = []
@@ -371,40 +463,94 @@ final class KeysModel {
 
     // MARK: Reading
 
-    /// The key map and `[keys]` as written (chord → value), when both are
-    /// of one generation: a key map torn from its configuration edits
-    /// nothing.
-    private var state: (map: TesseraKeymap, entries: [String: String])? {
+    /// The key map and `[keys]` as written, when both are of one
+    /// generation: a key map torn from its configuration edits nothing.
+    private var state: State? {
         guard let settings, let map = settings.keymap, map.generation == settings.snapshot.generation else {
             return nil
         }
-        var entries: [String: String] = [:]
+        var keys: Set<String> = []
         if case .table(let table)? = settings.snapshot["keys"] {
-            for (key, value) in table {
-                if let value = value.string { entries[key] = value }
-            }
+            keys = Set(table.keys)
         }
-        return (map, entries)
+        return State(map: map, keys: keys)
     }
 
-    /// Whether an edit is queued, running, or written and not yet applied:
-    /// the pane edits nothing until it is.
+    /// Whether an edit is queued, running, or written and not yet shown by
+    /// the key map: the pane edits nothing until it is.
     var isChanging: Bool {
+        _ = timedOut
         if inFlight { return true }
-        guard let queuedAt, let generation = settings?.keymap?.generation else { return false }
-        return generation <= queuedAt
+        guard let settling else { return false }
+        guard let map = settings?.keymap, Self.shows(map, settling) else { return true }
+        // Shown: later changes of the file (a hand edit) lock nothing.
+        self.settling = nil
+        return false
+    }
+
+    /// Whether `map`'s entries hold `outcome`: each key set has its value,
+    /// each key removed is gone.
+    private static func shows(_ map: TesseraKeymap, _ outcome: [String: String?]) -> Bool {
+        var values: [String: TesseraKeymap.Entry.Value] = [:]
+        for entry in map.entries where values[entry.key] == nil {
+            values[entry.key] = entry.value
+        }
+        return outcome.allSatisfy { key, value in
+            guard let value else { return values[key] == nil }
+            return values[key] == .text(value)
+        }
     }
 
     /// Whether the key map could be read.
     var isAvailable: Bool { settings?.keymap != nil }
 
-    /// The key map's warnings about `[keys]` (escaped and bounded by the
-    /// core), sanitised again for the window, at most ``maxWarnings``.
-    var warnings: [String] {
-        let all = settings?.keymap?.warnings ?? []
-        var shown = all.prefix(Self.maxWarnings).map(SettingsModel.sanitisedMessage)
-        if all.count > Self.maxWarnings {
-            shown.append("And \(all.count - Self.maxWarnings) more; see config.toml.")
+    /// The key map's warnings about `[keys]` entries it left out (and, last,
+    /// the one for the entries past the first 512), sanitised again for the
+    /// window, at most ``maxWarnings`` and the last.
+    var problems: [String] { Self.bounded(split.problems, keepingLast: true) }
+
+    /// The caveats entries that took effect are honoured with (`macOS uses
+    /// this chord for …; honoured`), sanitised, at most ``maxWarnings``.
+    var caveats: [String] { Self.bounded(split.caveats, keepingLast: false) }
+
+    /// The bound entries' warnings (caveats) apart from the others: the
+    /// warnings of the entries left out, in file order (a notation the
+    /// loader refused is in `entries` only), then the key map's warnings no
+    /// entry carries, so the overflow line stays last.
+    private var split: (problems: [String], caveats: [String]) {
+        guard let map = settings?.keymap else { return ([], []) }
+        var carried: [String: Int] = [:]
+        var split: (problems: [String], caveats: [String]) = ([], [])
+        for entry in map.entries {
+            guard let warning = entry.warning else { continue }
+            carried[warning, default: 0] += 1
+            if entry.effect == .bound {
+                split.caveats.append(warning)
+            } else {
+                split.problems.append(warning)
+            }
+        }
+        for warning in map.warnings {
+            if let count = carried[warning], count > 0 {
+                carried[warning] = count - 1
+            } else {
+                split.problems.append(warning)
+            }
+        }
+        return split
+    }
+
+    /// `all`, sanitised, at most ``maxWarnings`` of them and a line for the
+    /// rest; with `keepingLast`, the last of `all` (the overflow warning)
+    /// is among them.
+    private static func bounded(_ all: [String], keepingLast: Bool) -> [String] {
+        guard all.count > maxWarnings else { return all.map(SettingsModel.sanitisedMessage) }
+        var shown = all.prefix(maxWarnings - (keepingLast ? 1 : 0)).map(SettingsModel.sanitisedMessage)
+        let more = "And \(all.count - maxWarnings) more; see config.toml."
+        if keepingLast, let last = all.last {
+            shown += [more, SettingsModel.sanitisedMessage(last)]
+        } else {
+            shown.append(more)
         }
         return shown
     }
@@ -416,8 +562,8 @@ final class KeysModel {
     /// Whether `[keys]` binds a command or unbinds a default: what Restore
     /// Defaults removes.
     var hasCustomShortcuts: Bool {
-        guard case let (map, entries)? = state else { return false }
-        return entries.values.contains { Self.isRestorable($0, map) }
+        guard let state else { return false }
+        return state.map.entries.contains(where: state.isRestorable)
     }
 
     /// The commands, grouped by the menu their item is in, matching `query`
@@ -425,6 +571,7 @@ final class KeysModel {
     func groups(matching query: String) -> [Group] {
         guard let map = settings?.keymap else { return [] }
         let changing = isChanging
+        let labels = Self.labels(map)
         let query = query.trimmingCharacters(in: .whitespaces).lowercased()
         var groups: [Group] = []
         for command in map.commands {
@@ -435,9 +582,10 @@ final class KeysModel {
             }
             let row = Row(
                 command: command.command, title: Self.title(of: command, item: item),
-                group: Self.group(of: item), chords: chords, planned: command.owner == .planned)
+                group: Self.group(of: item), chords: chords,
+                labels: chords.map { labels[$0] ?? KeyChord.display($0) }, planned: command.owner == .planned)
             if !query.isEmpty {
-                let haystack = [row.title, row.command, row.display] + row.chords
+                let haystack = [row.title, row.command] + row.labels + row.chords
                 guard haystack.contains(where: { $0.lowercased().contains(query) }) else { continue }
             }
             if let index = groups.firstIndex(where: { $0.title == row.group }) {
@@ -447,6 +595,39 @@ final class KeysModel {
             }
         }
         return groups
+    }
+
+    /// The chords the menus show other than as written, by chord: a chord
+    /// with Shift on a US shifted symbol, which the core puts on its menu
+    /// item as the symbol without Shift (`cmd+shift+/` as `⌘?`). The labels
+    /// are the core's key equivalents (its `menu`), paired with the chords
+    /// that go on a menu in order, and used only where a pair's modifiers
+    /// are the chord's without Shift.
+    private static func labels(_ map: TesseraKeymap) -> [String: String] {
+        var labels: [String: String] = [:]
+        for command in map.commands {
+            let chords = command.chords.filter(KeyChord.goesOnMenu)
+            guard chords.count == command.menu.count else { continue }
+            for (chord, shortcut) in zip(chords, command.menu) {
+                let flags = KeyChord.flags(of: chord)
+                guard flags.contains(.shift), shortcut.modifiers == flags.subtracting(.shift) else { continue }
+                labels[chord] = SettingsModel.sanitisedMessage(
+                    KeyChord.display(flags: shortcut.modifiers) + shortcut.keyEquivalent)
+            }
+        }
+        return labels
+    }
+
+    /// `chord` as the pane shows it: as its menu item does, else as macOS
+    /// writes a shortcut.
+    private static func label(_ chord: String, in map: TesseraKeymap) -> String {
+        labels(map)[chord] ?? KeyChord.display(chord)
+    }
+
+    /// `chord` as the pane shows it.
+    func label(of chord: String) -> String {
+        guard let map = settings?.keymap else { return KeyChord.display(chord) }
+        return Self.label(chord, in: map)
     }
 
     /// The menu item's title, or the command's name in words
@@ -475,18 +656,48 @@ final class KeysModel {
         return Self.title(of: spec, item: MainMenu.item(forCommand: command, in: NSApp.mainMenu))
     }
 
+    // MARK: Telling VoiceOver
+
+    /// Shows `text` by the row of `key` and announces it, unless it is
+    /// shown there already.
+    private func show(_ text: String, for key: String) {
+        guard messages[key] != text else { return }
+        messages[key] = text
+        announce(text)
+    }
+
+    /// Shows `conflict` and announces what the chord does.
+    private func show(_ conflict: Conflict) {
+        self.conflict = conflict
+        announce(conflict.text)
+    }
+
+    /// Asks VoiceOver to speak `text`: once per message shown, so a flood
+    /// of keys is spoken once (see ``show(_:for:)``).
+    private func announce(_ text: String) {
+        poster.post(
+            element: NSApp as Any, notification: .announcementRequested,
+            userInfo: [.announcement: text, .priority: NSAccessibilityPriorityLevel.high.rawValue])
+    }
+
     // MARK: Recording
 
     /// Records a shortcut for `command`: the next key pressed in the
     /// Settings window with or without modifiers (modifiers alone wait for
     /// a key). Escape cancels, Delete clears the command's shortcut. Only
     /// the Settings window's keys are taken, and only until one is
-    /// recorded, the window resigns key or closes, or the pane goes.
+    /// recorded, the window resigns key or closes, a text field (the
+    /// search field) takes the focus, or the pane goes.
     func startRecording(_ command: String) {
         guard !isChanging, let window else { return }
         stopRecording()
         conflict = nil
         messages[command] = nil
+        // A field being typed in gives up the focus, so only clicking into
+        // one again ends the recording.
+        if window.firstResponder is NSText {
+            window.makeFirstResponder(nil)
+        }
         recording = command
         let monitor = monitoring.monitorKeys { [weak self] event in
             self?.handle(event) ?? false
@@ -497,9 +708,15 @@ final class KeysModel {
                 MainActor.assumeIsolated { self?.stopRecording() }
             }
         }
+        let focus = window.observe(\.firstResponder) { [weak self] window, _ in
+            MainActor.assumeIsolated {
+                if window.firstResponder is NSText { self?.stopRecording() }
+            }
+        }
         registrations = [
             monitor,
             KeysRegistration { observers.forEach(center.removeObserver) },
+            KeysRegistration { focus.invalidate() },
         ]
     }
 
@@ -535,7 +752,7 @@ final class KeysModel {
                 stopRecording()
                 record(chord, for: command)
             } else {
-                messages[command] = "This key cannot be part of a shortcut."
+                show("This key cannot be part of a shortcut.", for: command)
             }
             return true
         default:
@@ -545,38 +762,60 @@ final class KeysModel {
 
     // MARK: Editing
 
+    private static let applying = "config.toml is being applied; try again."
+
     /// Gives `command` the shortcut `chord`, its only one: unless something
     /// else has the chord, then the conflict waits for ``replace()``.
     func record(_ chord: String, for command: String) {
-        guard case let (map, entries)? = state else {
-            messages[command] = "config.toml is being applied; try again."
+        guard let state else {
+            show(Self.applying, for: command)
             return
         }
         conflict = nil
         messages[command] = nil
-        if let owner = map.commands.first(where: { $0.command != command && $0.chords.contains(chord) }) {
-            conflict = Conflict(
-                command: command, chord: chord,
-                text: "\(KeyChord.display(chord)) is the shortcut of “\(title(of: owner.command))”.")
+        if let text = conflictText(chord, for: command, in: state) {
+            show(Conflict(command: command, chord: chord, text: text))
             return
         }
-        // An entry that sends text or is `none`; any other value the core
-        // does not run (an unknown command) binds nothing.
-        if let value = entries[chord], value == "none" || (value.hasPrefix("send_text:") && value != "send_text:") {
-            let does = value == "none" ? "turned off in config.toml" : "set to send text in config.toml"
-            conflict = Conflict(command: command, chord: chord, text: "\(KeyChord.display(chord)) is \(does).")
-            return
+        assign(chord, to: command, in: state)
+    }
+
+    /// What `chord` does for something other than `command`, as the pane
+    /// says it; `nil` when it is free or `command`'s already.
+    private func conflictText(_ chord: String, for command: String, in state: State) -> String? {
+        let label = Self.label(chord, in: state.map)
+        if let owner = state.map.commands.first(where: { $0.command != command && $0.chords.contains(chord) }) {
+            return "\(label) is the shortcut of “\(title(of: owner.command))”."
         }
-        assign(chord, to: command)
+        // An entry binding the chord to no command: a text, or `none`.
+        guard let entry = state.effective(chord), entry.effect == .bound else { return nil }
+        switch entry.value {
+        case .sendText:
+            return "\(label) is set to send text in config.toml."
+        case .text(let value) where state.map.command(named: value) != nil:
+            return nil
+        default:
+            return "\(label) is turned off in config.toml."
+        }
     }
 
     /// Gives the conflicting chord to the command it was recorded for; what
     /// had it loses it (an entry of `[keys]` is replaced, a default goes to
-    /// the entry).
+    /// the entry). When the file changed since the conflict was shown and
+    /// the chord now does something else, the conflict says what instead,
+    /// and a second Replace gives it.
     func replace() {
-        guard let conflict else { return }
+        guard let conflict, !isChanging else { return }
+        guard let state else {
+            show(Self.applying, for: conflict.command)
+            return
+        }
+        if let text = conflictText(conflict.chord, for: conflict.command, in: state), text != conflict.text {
+            show(Conflict(command: conflict.command, chord: conflict.chord, text: text))
+            return
+        }
         self.conflict = nil
-        assign(conflict.chord, to: conflict.command)
+        assign(conflict.chord, to: conflict.command, in: state)
     }
 
     /// Keeps what the conflicting chord does.
@@ -584,76 +823,93 @@ final class KeysModel {
         conflict = nil
     }
 
-    /// Makes `chord` the one shortcut of `command`: `keys."<chord>"` set to
-    /// it, the command's other entries removed and the defaults no entry
-    /// took set to `unbound`. Writes nothing it need not.
-    private func assign(_ chord: String, to command: String) {
-        guard case let (map, entries)? = state, let spec = map.command(named: command) else {
-            messages[command] = "config.toml is being applied; try again."
+    /// Makes `chord` the one shortcut of `command`: the entry that took the
+    /// chord set to it under its own table key (or `keys."<chord>"` when no
+    /// entry did and it is not `command`'s default), the command's other
+    /// entries removed and the defaults no entry of its own took set to
+    /// `unbound`. Writes nothing it need not.
+    private func assign(_ chord: String, to command: String, in state: State) {
+        guard let spec = state.map.command(named: command) else {
+            show(Self.applying, for: command)
             return
         }
-        let own = entries.filter { $0.value == command }.map(\.key).sorted()
-        let defaults = Self.defaults(of: spec, own: own)
         var edits: [Edit] = []
-        if entries[chord] != command, !defaults.contains(chord) {
+        var kept: String?
+        if let entry = state.effective(chord) {
+            kept = entry.key
+            if entry.effect != .bound || entry.value != .text(command) {
+                edits.append(.set(entry.key, command))
+            }
+        } else if !spec.chords.contains(chord) {
+            kept = chord
             edits.append(.set(chord, command))
         }
-        edits += own.filter { $0 != chord }.map { .remove($0) }
-        edits += defaults.filter { $0 != chord }.map { .set($0, "unbound") }
-        run(edits, key: command, showing: (command, [chord]))
+        let others = (state.bound(spec) + state.shadowed(spec)).filter { $0.key != kept }
+        edits += Self.removals(others)
+        edits += state.defaults(spec).filter { $0 != chord }.map { .set($0, "unbound") }
+        run(edits, key: command, showing: (command, [chord]), in: state)
     }
 
     /// Takes every shortcut from `command`: its entries removed, its
     /// defaults set to `unbound`.
     func clear(_ command: String) {
         guard !isChanging else { return }
-        guard case let (map, entries)? = state, let spec = map.command(named: command) else {
-            messages[command] = "config.toml is being applied; try again."
+        guard let state, let spec = state.map.command(named: command) else {
+            show(Self.applying, for: command)
             return
         }
         conflict = nil
-        let own = entries.filter { $0.value == command }.map(\.key).sorted()
-        let edits = own.map { Edit.remove($0) } + Self.defaults(of: spec, own: own).map { .set($0, "unbound") }
-        run(edits, key: command, showing: (command, []))
+        let edits = Self.removals(state.bound(spec) + state.shadowed(spec))
+            + state.defaults(spec).map { .set($0, "unbound") }
+        run(edits, key: command, showing: (command, []), in: state)
     }
 
-    /// The default chords `command` still has: the key map lists the
-    /// entries' chords first (one per entry, in document order), then the
-    /// defaults no entry took.
-    private static func defaults(of command: TesseraKeymap.Command, own: [String]) -> [String] {
-        command.chords.dropFirst(own.count).filter { !own.contains($0) }
-    }
-
-    /// Whether Restore Defaults removes an entry with `value`: one binding
-    /// a command or unbinding a default, what the pane writes. Entries that
-    /// send text or turn a key off (`none`) stay.
-    private static func isRestorable(_ value: String, _ map: TesseraKeymap) -> Bool {
-        value == "unbound" || map.command(named: value) != nil
+    /// Removes `entries`, the last in the file first, so none removed first
+    /// makes a later one take effect for a moment.
+    private static func removals(_ entries: [TesseraKeymap.Entry]) -> [Edit] {
+        entries.sorted { $0.index > $1.index }.map { .remove($0.key) }
     }
 
     /// Restore Defaults: removes each `[keys]` entry that binds a command
-    /// or unbinds a default, one key at a time; comments, other tables and
-    /// the entries that send text or turn a key off stay.
+    /// or unbinds a default, one key at a time, the last first; comments,
+    /// other tables and the entries that send text or turn a key off stay.
     func restoreDefaults() {
-        guard !isChanging, case let (map, entries)? = state else { return }
+        guard !isChanging, let state else { return }
         stopRecording()
         conflict = nil
-        let edits = entries.filter { Self.isRestorable($0.value, map) }.map(\.key).sorted().map { Edit.remove($0) }
-        run(edits, key: Self.restoreKey, showing: nil)
+        run(Self.removals(state.map.entries.filter(state.isRestorable)), key: Self.restoreKey, showing: nil, in: state)
     }
 
     /// Runs `edits` in order on the write queue, stopping at the first that
     /// fails; a conflict (the file changed since the core read it) is run
-    /// once more. Nothing is queued for no edits.
-    private func run(_ edits: [Edit], key: String, showing: (command: String, chords: [String])?) {
+    /// once more. Nothing is queued for no edits, nor when an entry to
+    /// change is one the pane cannot name (its key is not one of `[keys]`
+    /// as written).
+    private func run(
+        _ edits: [Edit], key: String, showing: (command: String, chords: [String])?, in state: State
+    ) {
         guard !edits.isEmpty else { return }
+        let written = Set(state.map.entries.map(\.key))
+        guard edits.allSatisfy({ !written.contains($0.key) || state.keys.contains($0.key) }) else {
+            show("An entry this changes is written in config.toml in a way Settings cannot edit.", for: key)
+            return
+        }
         guard let settings, let writer = settings.writer else {
-            messages[key] = "Tessera’s core is not running."
+            show("Tessera’s core is not running.", for: key)
             return
         }
         messages[key] = nil
         inFlight = true
-        queuedAt = settings.snapshot.generation
+        runs += 1
+        let run = runs
+        var outcome: [String: String?] = [:]
+        for edit in edits {
+            switch edit {
+            case .set(let table, let value): outcome.updateValue(value, forKey: table)
+            case .remove(let table): outcome.updateValue(nil, forKey: table)
+            }
+        }
+        settling = outcome
         editing = showing
         SettingsModel.writeQueue.async { [weak self] in
             var retried = false
@@ -671,7 +927,7 @@ final class KeysModel {
             }
             let outcome = failure
             Task { @MainActor [weak self] in
-                self?.finish(key, failure: outcome, retried: retried)
+                self?.finish(run, key: key, failure: outcome, retried: retried)
             }
         }
     }
@@ -681,8 +937,8 @@ final class KeysModel {
     ) -> Result<Void, TesseraConfigEditError> {
         do throws(TesseraConfigEditError) {
             switch edit {
-            case .set(let chord, let value): try writer.set(Edit.path(chord), to: .string(value))
-            case .remove(let chord): try writer.remove(Edit.path(chord))
+            case .set(let key, let value): try writer.set(Edit.path(key), to: .string(value))
+            case .remove(let key): try writer.remove(Edit.path(key))
             }
             return .success(())
         } catch {
@@ -690,23 +946,40 @@ final class KeysModel {
         }
     }
 
-    private func finish(_ key: String, failure: TesseraConfigEditError?, retried: Bool) {
+    private func finish(_ run: Int, key: String, failure: TesseraConfigEditError?, retried: Bool) {
         inFlight = false
         if let failure {
             // S8: the message may quote the file; only its kind is logged.
             Self.log.info("shortcut not saved: \(String(describing: failure.kind), privacy: .public)")
-            messages[key] = SettingsModel.displayMessage(failure)
-            queuedAt = nil
+            settling = nil
             editing = nil
-        }
-        if retried || failure != nil {
+            show(SettingsModel.displayMessage(failure), for: key)
             settings?.reload()
-            if failure == nil, let settings {
-                // The other edit was applied first: wait for one after
-                // this.
-                queuedAt = settings.snapshot.generation
-            }
+            return
         }
+        if retried {
+            // The other edit's apply may have come before this one's: read
+            // the applied configuration again, and the key map may show the
+            // run already.
+            settings?.reload()
+        }
+        let timeout = settleTimeout
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: timeout)
+            self?.settle(run)
+        }
+    }
+
+    /// ``settleTimeout`` after `run` was written: if the key map does not
+    /// show it yet, the applied configuration is read again (not the file)
+    /// and the pane edits on.
+    private func settle(_ run: Int) {
+        guard run == runs, !inFlight, settling != nil else { return }
+        settings?.reload()
+        guard isChanging else { return }
+        Self.log.info("shortcut edit not shown by the key map in time; reading config.toml again")
+        settling = nil
+        timedOut += 1
     }
 }
 
@@ -747,18 +1020,8 @@ struct KeysPane: View {
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, minHeight: 380)
             }
-            let warnings = keys.warnings
-            if !warnings.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Problems in config.toml’s [keys]").font(.headline)
-                    ForEach(Array(warnings.enumerated()), id: \.offset) { _, warning in
-                        Text(warning)
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-            }
+            KeysWarnings(title: "Entries of config.toml’s [keys] that are ignored", lines: keys.problems)
+            KeysWarnings(title: "Entries of config.toml’s [keys] honoured with a caveat", lines: keys.caveats)
             HStack(alignment: .firstTextBaseline) {
                 SettingsMessage(text: keys.message(KeysModel.restoreKey))
                 Spacer()
@@ -777,6 +1040,26 @@ struct KeysPane: View {
             Text(
                 "The shortcuts set in config.toml are removed, including ones written there by hand. Entries that send text or turn a key off stay, and so do comments."
             )
+        }
+    }
+}
+
+/// A heading and the key map's warnings under it, when there are any.
+private struct KeysWarnings: View {
+    let title: String
+    let lines: [String]
+
+    var body: some View {
+        if !lines.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title).font(.headline)
+                ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                    Text(line)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
         }
     }
 }
@@ -823,7 +1106,7 @@ private struct KeysRow: View {
                     Button("Cancel") { keys.cancelConflict() }
                         .keyboardShortcut(.cancelAction)
                     Button("Replace") { keys.replace() }
-                        .accessibilityLabel("Replace, giving \(KeyChord.display(conflict.chord)) to \(row.title)")
+                        .accessibilityLabel("Replace, giving \(keys.label(of: conflict.chord)) to \(row.title)")
                 }
             }
             SettingsMessage(text: keys.message(row.command))

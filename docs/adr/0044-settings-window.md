@@ -293,3 +293,80 @@ config.toml.
   line break too.
 - **Open panels** (Choose… of a working directory, Import Theme…) are
   sheets on the Settings window, not app-modal.
+
+## Amendment: Keys pane on exported entries (#355, 2026-11-14)
+
+The key map JSON now lists every `[keys]` entry in file order (`entries`:
+its key as written, escaped and capped; its canonical chord, or none when the
+notation was refused; its value; whether it was bound, unbound, shadowed or
+refused; its first warning). The Keys pane works on those entries instead of
+matching the raw table keys against canonical chords, which lifts the
+three known limits of the #40c amendment (the lock's through the new lock
+rule below: a hand edit that applies first does not show the run's keys):
+
+* **Matching.** An entry belongs to a command when it is bound and its
+  chord is one of the command's chords; the entry that holds a chord is the
+  first bound or `unbound` one with that chord, so when the file spells a
+  chord twice (`cmd+d` refused for an unknown command, `super+d` bound), the
+  pane shows and changes the one that took effect. A hand-written
+  `shift+cmd+u` or `opt+cmd+j` is found by its chord: a conflict with a
+  `send_text` or `none` entry in another spelling shows inline, and Replace
+  or recording again changes that entry under its own key, so the file keeps
+  one entry per chord. Recording also removes the command's shadowed
+  entries (they would bind it again once the first goes), the last in the
+  file first. A command's defaults are its chords no entry of its own binds;
+  nothing is inferred from order. The pane parses no chord: it compares the
+  core's canonical strings, and takes an edit's value from the action, never
+  from `entries[].value` (which is escaped for display).
+* **Only keys as written are edited.** An edit that would set or remove an
+  entry whose reported key is not one of `[keys]` as written (a key the core
+  escaped or cut) is refused with a message by the row; Restore Defaults
+  leaves such an entry.
+* **Replace checks again.** When the file changed since a conflict was
+  shown and the chord now does something else, Replace shows and announces
+  what it does instead and writes nothing; a second Replace gives it.
+* **The lock** (replacing "until a key map of a later generation applies")
+  holds from the moment an edit is queued until the key map's entries show
+  every key it wrote (each set with its value, each removed gone), so a
+  long run (Restore Defaults over 200 entries, applied as the watch sees the
+  writes) stays locked to its last apply. A failed edit releases at once and
+  reads the configuration again; a retried one (the file changed under it)
+  reads it again, since the other edit's apply may have come first. When the
+  key map has not shown the run 2 seconds after its last write (an edit the
+  watch saw as no change, or a hand edit that undid it), the pane reads the
+  configuration again and edits on. Reading again (`SettingsModel.reload()`)
+  reads the core's applied configuration and key map
+  (`tessera_config_json`), not the file: released before a slow apply lands,
+  the pane edits from that stale snapshot until the apply comes (the wave 22
+  generation token fixes it).
+* **Problems and caveats.** The warnings are listed in two parts: problems
+  (each entry left out, with its own warning, in file order, including a
+  notation the loader refused, whose warning is in `entries` only; then the
+  key map's warnings no entry carries, the 512-entry overflow last) and
+  caveats (the bound entries' warnings, honoured: a reserved chord, typing
+  shadowed, a menu item that loses its chord). Each list shows at most
+  twenty, then a count; the problems keep the overflow line.
+* **Shown as the menus show them.** A chord with Shift on a US shifted
+  symbol shows as its menu item's key equivalent from the core's `menu`
+  (`⌘?` for `cmd+shift+/`, `⌘+` for `cmd+shift+=`), paired with the
+  command's chords that go on a menu (with Command, off the keypad, the
+  core's rule) in order, and only where the pair's modifiers are the chord's
+  without Shift; every other chord is written as macOS writes a shortcut.
+* **Focus and VoiceOver.** A text field taking the focus (a click into the
+  search field) ends a recording; starting one takes the focus from a field
+  being typed in. Conflicts and refusals are announced
+  (`NSAccessibility.Notification.announcementRequested`, high priority),
+  once per message shown, so a flood of refused keys is spoken once.
+
+Known limits:
+
+* An entry of a command on one of its own default chords (`"cmd+f" =
+  "find"`) is removed, not set to `unbound`, when another chord is recorded,
+  so the default binds again; the JSON does not say which of a command's
+  chords are defaults.
+* Removing an entry can let a later entry of another command for the same
+  chord, shadowed until then, take effect.
+* A second warning of one bound entry (the JSON reports the first) lists
+  under the problems.
+* A chord the key map does not list (a conflict on an unknown chord) shows
+  in the written form, not as a menu would.

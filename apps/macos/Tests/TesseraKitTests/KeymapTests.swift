@@ -80,6 +80,40 @@ final class KeymapTests: XCTestCase {
         XCTAssertEqual(keymap.command(named: "tab_previous")?.menu, [.init(keyEquivalent: "{", modifiers: .command)])
         XCTAssertEqual(keymap.command(named: "quit")?.owner, .system)
         XCTAssertEqual(keymap.command(named: "select_tab:3")?.parameter, "3")
+        XCTAssertEqual(keymap.entries, [])
+    }
+
+    /// Every `[keys]` entry in file order, with its canonical chord, value
+    /// and effect (#355): what the Keys pane matches on.
+    func testTheEntriesCarryTheirChordValueAndEffect() throws {
+        let config = """
+            [keys]
+            "shift+cmd+u" = "copy"
+            "d+cmd" = "paste"
+            "super+u" = "paste"
+            "cmd+e" = "send_text:hi"
+            "opt+cmd+j" = "none"
+            "cmd+k" = "unbound"
+            "cmd+shift+y" = 7
+            """
+        let keymap = try start(config: config).keymap()
+        let entries = keymap.entries
+        XCTAssertEqual(entries.map(\.index), Array(0..<7))
+        XCTAssertEqual(entries.map(\.key), ["shift+cmd+u", "d+cmd", "super+u", "cmd+e", "opt+cmd+j", "cmd+k", "cmd+shift+y"])
+        XCTAssertEqual(entries.map(\.chord), ["cmd+shift+u", nil, "cmd+u", "cmd+e", "cmd+alt+j", "cmd+k", "cmd+shift+y"])
+        XCTAssertEqual(
+            entries.map(\.value),
+            [.text("copy"), .text("paste"), .text("paste"), .sendText("hi"), .text("none"), .text("unbound"), .notAString])
+        XCTAssertEqual(entries.map(\.effect), [.bound, .refused, .bound, .bound, .bound, .unbound, .refused])
+        XCTAssertNil(entries[0].warning)
+        XCTAssertTrue(entries[1].warning?.contains("d+cmd") ?? false, "\(entries[1])")
+        XCTAssertTrue(entries[6].warning != nil)
+        XCTAssertEqual(keymap.command(named: "copy")?.chords.first, "cmd+shift+u")
+        // The registry's warnings: `cmd+e` takes Use Selection for Find's
+        // chord. An entry the notation refuses has its warning from the
+        // loader, in `entries` only.
+        XCTAssertEqual(keymap.warnings, [try XCTUnwrap(entries[3].warning)])
+        XCTAssertTrue(entries[3].warning?.contains("use_selection_for_find") ?? false, "\(entries[3])")
     }
 
     func testHandleKeyReportsCommandsAndSendsOnlyWithoutBindingsOnly() throws {
