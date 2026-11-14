@@ -3,9 +3,11 @@ import XCTest
 
 @testable import Tessera
 
-/// The app is always dark, whatever the system's Light or Dark setting
-/// (ADR 0043, #364). Nothing here sets an appearance: the app's own launch
-/// does, and every window opened the way the app opens one inherits it.
+/// The app is dark by default, whatever the system's Light or Dark setting
+/// (ADR 0043, #364; `app_appearance` with no key, #365, whose other values
+/// ``AppAppearanceTests`` covers). Nothing here sets an appearance: the
+/// app's own launch does, and every window opened the way the app opens one
+/// inherits it.
 @MainActor
 final class AppearanceTests: XCTestCase {
     private var appDelegate: AppDelegate!

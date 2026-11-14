@@ -134,6 +134,12 @@ final class TerminalWindowContentView: NSView {
             }
             holdsPanes = false
         }
+        if !translucent {
+            // No strip while opaque: a floor kept from before would outlive a
+            // tab bar that goes meanwhile and keep the next translucent
+            // window's smallest size too tall (#417 M6).
+            unclippedStripHeight = 0
+        }
         if translucent, titlebarBackdrop == nil {
             let view = PaneBackdropView(frame: .zero)
             view.autoresizingMask = []
@@ -205,23 +211,28 @@ final class TerminalWindowContentView: NSView {
 
     /// The window's tab may be shown now (#409, #405 n1): its tab was
     /// selected (by any route: ⇧⌘], ⌘1 to ⌘9, a click, `selectedWindow`, the
-    /// selected tab closing), it was ordered in, or it, a window of its tab
-    /// group, or the app came back from the Dock or from hiding. Makes the
-    /// window's opacity, title bar, strip and blur radius what its panes ask
-    /// for now, as on a pane's attach; what is already right is left alone.
+    /// selected tab closing), it was ordered in, or it or the app came back
+    /// from the Dock or from hiding. Makes the window's opacity, title bar,
+    /// strip and blur radius what its panes ask for now, as on a pane's
+    /// attach; what is already right is left alone.
     func windowDidBecomeVisible() {
         guard window != nil else { return }
         paneContainer.paneOpacityDidChange()
     }
 
-    /// A window was deminiaturized: if it is a tab of this window's group
-    /// (only the selected one is posted), this tab shows again.
-    @objc private func anyWindowDidDeminiaturize(_ notification: Notification) {
-        guard let window, let restored = notification.object as? NSWindow,
-            (window.tabGroup?.windows ?? [window]).contains(where: { $0 === restored })
-        else { return }
+    /// This window was deminiaturized. macOS posts it for every window of
+    /// a tab group that comes back (macOS 27.2), so each tab answers only
+    /// its own: one ``windowDidBecomeVisible()`` per window, not one per
+    /// window for each of them (#417). Where only the selected tab is
+    /// posted, the others are brought up to date as they are selected.
+    @objc private func windowDidDeminiaturize(_ notification: Notification) {
+        guard let window, notification.object as? NSWindow === window else { return }
+        deminiaturizeCount += 1
         windowDidBecomeVisible()
     }
+
+    /// How many deminiaturizes this tab answered (tests).
+    private(set) var deminiaturizeCount = 0
 
     @objc private func applicationDidUnhide(_ notification: Notification) {
         windowDidBecomeVisible()
@@ -270,8 +281,8 @@ final class TerminalWindowContentView: NSView {
         if let window {
             NotificationCenter.default.removeObserver(
                 self, name: NSWindow.didChangeOcclusionStateNotification, object: window)
+            NotificationCenter.default.removeObserver(self, name: NSWindow.didDeminiaturizeNotification, object: window)
         }
-        NotificationCenter.default.removeObserver(self, name: NSWindow.didDeminiaturizeNotification, object: nil)
         NotificationCenter.default.removeObserver(self, name: NSApplication.didUnhideNotification, object: nil)
     }
 
@@ -292,10 +303,9 @@ final class TerminalWindowContentView: NSView {
         NotificationCenter.default.addObserver(
             self, selector: #selector(windowOcclusionDidChange(_:)),
             name: NSWindow.didChangeOcclusionStateNotification, object: window)
-        // Any window's: the one restored may be another tab of this group.
         NotificationCenter.default.addObserver(
-            self, selector: #selector(anyWindowDidDeminiaturize(_:)), name: NSWindow.didDeminiaturizeNotification,
-            object: nil)
+            self, selector: #selector(windowDidDeminiaturize(_:)), name: NSWindow.didDeminiaturizeNotification,
+            object: window)
         NotificationCenter.default.addObserver(
             self, selector: #selector(applicationDidUnhide(_:)), name: NSApplication.didUnhideNotification,
             object: nil)
@@ -316,8 +326,12 @@ final class TerminalWindowContentView: NSView {
         titlebarBackdrop?.frame = strip
         titlebarTint?.frame = strip
         updateTitlebarTint()
-        var inset = bounds.height - area.height
-        if inset > 0, let window {
+        // Only a full-size (translucent) window has a strip: an opaque one
+        // passes through a frame with its content over a tab bar that is
+        // going, which is no strip and must not become the floor (#417 M6).
+        var inset: CGFloat = 0
+        if let window, window.styleMask.contains(.fullSizeContentView), bounds.height > area.height {
+            inset = bounds.height - area.height
             if area.height > 0 {
                 // The panes have height, so all of the strip is above them.
                 unclippedStripHeight = inset

@@ -281,6 +281,34 @@ public final class TesseraApp {
         return radius
     }
 
+    /// `[appearance] app_appearance` (#365): how the app draws its own
+    /// windows, menus, sheets and Settings. The terminal's colours stay the
+    /// theme's.
+    public enum AppAppearance: Sendable, Equatable {
+        /// Dark whatever the system's setting; the default.
+        case dark
+        /// Light whatever the system's setting.
+        case light
+        /// As the system's Light or Dark setting, following it live.
+        case system
+    }
+
+    /// `[appearance] app_appearance` in effect: ``AppAppearance/dark`` with
+    /// no key and for an unknown value (the core warns). App-wide, so no
+    /// profile and no display option changes it. No callback reports a
+    /// change: read it at start and after every configuration is applied.
+    ///
+    /// - Throws: ``TesseraCoreError/nullPointer`` after ``shutdown()``.
+    public func appAppearance() throws -> AppAppearance {
+        var raw: UInt32 = 0
+        try TesseraCoreError.check(tessera_app_app_appearance(core.pointer, &raw))
+        switch TesseraAppAppearance(rawValue: raw) {
+        case TESSERA_APP_APPEARANCE_LIGHT: return .light
+        case TESSERA_APP_APPEARANCE_SYSTEM: return .system
+        default: return .dark
+        }
+    }
+
     /// The system's display settings that change how every session is drawn
     /// (ADR 0043). A setting added later defaults to off.
     public struct DisplayOptions: Sendable, Equatable {

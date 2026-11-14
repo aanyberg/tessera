@@ -63,6 +63,11 @@ struct SettingsField: Identifiable {
         Choice(value: "block", title: "Block"), Choice(value: "underline", title: "Underline"),
         Choice(value: "beam", title: "Bar"),
     ]
+    /// `[appearance] app_appearance`'s values (#365).
+    static let appAppearances = [
+        Choice(value: "dark", title: "Dark"), Choice(value: "light", title: "Light"),
+        Choice(value: "system", title: "System"),
+    ]
 }
 
 /// Where a field's control reads and writes: the key path, and for a
