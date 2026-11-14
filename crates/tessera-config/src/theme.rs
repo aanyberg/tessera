@@ -322,6 +322,8 @@ impl Theme {
     /// Only a regular file of at most [`MAX_THEME_FILE_LEN`] bytes is read
     /// (a FIFO cannot block the call; see [`crate::load_file`]).
     pub fn load(path: &Path) -> Result<Self, ThemeError> {
+        #[cfg(test)]
+        LOADS.with(|loads| loads.set(loads.get() + 1));
         let bytes = read_capped(path, MAX_THEME_FILE_LEN, "theme file")?;
         let text = std::str::from_utf8(&bytes).map_err(crate::Error::from)?;
         let stem = path.file_stem().map(|s| s.to_string_lossy());
@@ -663,6 +665,18 @@ thread_local! {
     static LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many theme files [`Theme::load`] read on this thread.
+    static LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many theme files were loaded on this thread so far (#417).
+#[cfg(test)]
+pub(crate) fn loads_on_this_thread() -> usize {
+    LOADS.with(std::cell::Cell::get)
+}
+
 /// How many theme lookups ran on this thread so far (#283 item 2).
 #[cfg(test)]
 pub(crate) fn lookups_on_this_thread() -> usize {
@@ -682,6 +696,85 @@ pub(crate) fn files_named(dir: &Path, name: &str) -> Vec<PathBuf> {
         .filter(|(stem, _)| names_match(stem, name))
         .map(|(_, path)| path)
         .collect()
+}
+
+/// For the watcher: the user theme file each of `names` resolves to, as
+/// [`Theme::resolve`] would find it (else its first stem match, which may
+/// be a file that does not load yet), in the order of `names`, without
+/// duplicates and at most `cap`.
+///
+/// Unlike a [`Theme::resolve`] per name, `dir` is listed once for all
+/// names, a name with no stem match that names a bundled theme is skipped
+/// before any file is read (it takes no slot of `cap`), and the files are
+/// read at most once for the `name` keys of all the other names, within
+/// [`MAX_THEME_FILES`] reads (#417). A user file that shadows a bundled
+/// theme only by its `name` key, under another stem, is thus not found.
+pub(crate) fn files_for_names(dir: &Path, names: &[&str], cap: usize) -> Vec<PathBuf> {
+    let names: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|name| is_lookup_name(name) && name.len() <= MAX_THEME_NAME_LEN)
+        .collect();
+    if names.is_empty() || cap == 0 {
+        return Vec::new();
+    }
+    let files = theme_files(dir);
+    let mut budget = MAX_THEME_FILES;
+    // Per name: the file found, and whether its `name` key is still to be
+    // searched for (no stem match loaded).
+    let mut found: Vec<Option<PathBuf>> = Vec::with_capacity(names.len());
+    let mut by_key: Vec<bool> = Vec::with_capacity(names.len());
+    for name in &names {
+        let stems: Vec<&PathBuf> = files
+            .iter()
+            .filter(|(stem, _)| names_match(stem, name))
+            .map(|(_, path)| path)
+            .collect();
+        if stems.is_empty() {
+            found.push(None);
+            by_key.push(Theme::bundled(name).is_none());
+            continue;
+        }
+        let mut loaded = None;
+        for path in stems.iter().copied() {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            if Theme::load(path).is_ok() {
+                loaded = Some(path.clone());
+                break;
+            }
+        }
+        by_key.push(loaded.is_none());
+        found.push(loaded.or_else(|| stems.first().map(|path| (*path).clone())));
+    }
+    if by_key.iter().any(|pending| *pending) {
+        for (_, path) in files.iter().take(budget) {
+            let Ok(theme) = Theme::load(path) else {
+                continue;
+            };
+            for (i, name) in names.iter().enumerate() {
+                if by_key[i] && names_match(&theme.name, name) {
+                    by_key[i] = false;
+                    found[i] = Some(path.clone());
+                }
+            }
+            if !by_key.iter().any(|pending| *pending) {
+                break;
+            }
+        }
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for file in found.into_iter().flatten() {
+        if out.len() == cap {
+            break;
+        }
+        if !out.contains(&file) {
+            out.push(file);
+        }
+    }
+    out
 }
 
 /// Most theme files that do not load which the native watcher keeps

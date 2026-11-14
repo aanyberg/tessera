@@ -156,3 +156,18 @@ material blur of ADR 0043 and the app logs one error, category `window`
 (`log stream --predicate 'subsystem == "com.aanyberg.tessera" AND category == "window"'`). To see that fallback on a
 macOS that has the call, start the app with `TESSERA_WINDOW_BLUR_RADIUS=off` in its environment, for example
 `TESSERA_WINDOW_BLUR_RADIUS=off apps/macos/DerivedData/Build/Products/Debug/Tessera.app/Contents/MacOS/Tessera`.
+
+## Thread Performance Checker notes
+
+Xcode's Thread Performance Checker (scheme, Run, Diagnostics) reports a priority inversion when a thread of a higher
+QoS class waits on one of a lower class. ADR 0018 covers the reports it made at session close, and the thread start
+hook (`raise_thread_qos` in `crates/tessera-ffi/src/app.rs`) raises the core's threads to avoid most of them.
+
+One report remains, and it is accepted (lead decision D7-1, #417). It reads "User-initiated thread waits on a Default
+thread" via `dispatch_semaphore_wait`, under `park_timeout` and `Receiver<()>::recv_timeout`, on the
+`tessera-config-apply` thread. That thread runs `ConfigWatch::wait_for` in `crates/tessera-app-core/src/config_watch.rs`
+while the configuration directory does not exist yet: it sleeps for `CONFIG_DIR_POLL_INTERVAL` between two checks of
+the directory, and only stopping the watch wakes it early. Nothing waits on that thread, so the report costs no
+latency. Avoiding the park would need tick polling (idle wake-ups) or a stop latency above `CONFIG_WATCH_STOP_CAP`.
+With identical-code folding, the symbol in the report can show as a `PtyEvent` channel's `recv_timeout`, so a search
+of the log for `PtyEvent` still matches this report.

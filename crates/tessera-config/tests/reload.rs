@@ -84,7 +84,11 @@ fn font_size_edit_is_observed_within_500ms() {
 /// writing thread is a quiet period the watcher may rightly settle in, so
 /// each gap between two writes of at least half the debounce allows one
 /// more event; `max_wait` is out of reach. A watcher that does not
-/// coalesce reports a change per write whatever the gaps.
+/// coalesce reports a change per write whatever the gaps. Whatever the
+/// stalls, no event can arrive sooner than the debounce after the first
+/// write, as the first change is seen no earlier than that write (#417
+/// item 5: the count alone let a watcher that never waits pass when the
+/// writes stalled under `taskpolicy -b`).
 #[test]
 fn rapid_writes_are_debounced_into_one_event() {
     // Longer than a write takes under background QoS (about 200 ms, its
@@ -101,6 +105,7 @@ fn rapid_writes_are_debounced_into_one_event() {
         let path = store.paths().config_file();
 
         let mut written = Vec::new();
+        let first_write = Instant::now();
         for size in 14..=20 {
             std::fs::write(&path, font_size_doc(size)).unwrap();
             written.push(Instant::now());
@@ -115,6 +120,12 @@ fn rapid_writes_are_debounced_into_one_event() {
             watcher.recv_timeout(EVENTUALLY).expect("one event"),
             backend,
         )];
+        let first_event = first_write.elapsed();
+        assert!(
+            first_event >= DEBOUNCE,
+            "{backend:?}: the first event came {first_event:?} after the first write, \
+             sooner than the debounce"
+        );
         while let Ok(event) = watcher.recv_timeout(DEBOUNCE * 2 + Duration::from_millis(300)) {
             changes.push(expect_changed(event, backend));
         }
