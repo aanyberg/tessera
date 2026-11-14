@@ -144,11 +144,49 @@ enum Change {
 }
 
 /// Held across every edit of `config.toml` from this process: two edits
-/// on two threads (against the UI-thread rule) would both read the file
+/// on two threads (the write queue and any other caller) would both read the file
 /// and one could replace the other's save (#324 item 5). An edit that
 /// panicked left nothing half done in memory, so a poisoned lock is
 /// taken over.
 static EDIT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Held across [`open_config`]'s check and its start of the watch.
+static OPEN_LOCK: Mutex<()> = Mutex::new(());
+
+/// The apps (by address) [`open_config`] started a watch for, in order:
+/// what the test of two callers at once counts.
+#[cfg(test)]
+static WATCH_STARTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Makes `config.toml` editable: creates the configuration directory and a
+/// commented default `config.toml` where they are missing and starts the
+/// watch unless it runs already (`App::open_config`); returns the file's
+/// path. Nothing is opened again when the file exists and is watched: that
+/// would reload and log it (#324 item 9). The check and the start happen
+/// under one lock, so two callers at once (the Open Config menu item's
+/// `tessera_app_create_config` and a Settings edit on the write queue)
+/// start one watch, never two (#344). A Settings edit
+/// (`tessera_config_set`, `tessera_config_remove`) creates the file too.
+pub(crate) fn open_config(app: &App) -> Result<PathBuf, String> {
+    let _open = OPEN_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let path = app.core.config_path();
+    let watching = app.core.is_watching_config();
+    if path.is_file() && watching {
+        return Ok(path);
+    }
+    #[cfg(test)]
+    if !watching {
+        WATCH_STARTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(std::ptr::from_ref(app) as usize);
+    }
+    app.core
+        .open_config(WatchOptions::default())
+        .map_err(|error| error.to_string())
+}
 
 /// Opens `config.toml` (creating it and starting the watch when needed),
 /// applies `change` at `key`, checks the key map, and saves, holding
@@ -157,19 +195,10 @@ fn edit(function: &'static str, app: &App, key: &str, change: Change) -> Result<
     let _edit = EDIT_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // Opening the store again reloads and logs the file: only when there
-    // is no file or no watch yet (#324 item 9).
-    let path = app.core.config_path();
-    let path = if path.is_file() && app.core.is_watching_config() {
-        path
-    } else {
-        app.core
-            .open_config(WatchOptions::default())
-            .map_err(|error| {
-                tracing::warn!(function, %error, "cannot create the configuration");
-                Failure::new(Error::Io, error.to_string())
-            })?
-    };
+    let path = open_config(app).map_err(|error| {
+        tracing::warn!(function, %error, "cannot create the configuration");
+        Failure::new(Error::Io, error)
+    })?;
     let mut editor = ConfigEditor::open(&path).map_err(|e| failure(function, key, &e))?;
     // The key map is compiled quietly: its warnings are compared, not
     // logged (the watch logs them when it applies the file).
@@ -384,8 +413,9 @@ pub unsafe extern "C" fn tessera_config_json(
 /// length to `*msg_len`; on success `*msg_len` is 0. `msg_len` may be
 /// `NULL` to skip the message.
 ///
-/// The UI thread; it reads and writes the file (a few milliseconds).
-/// Edits from two threads are serialised, never interleaved.
+/// Any thread: the app calls it on its background write queue, off the
+/// main thread; it reads and writes the file (a few milliseconds). Edits
+/// from two threads are serialised, never interleaved.
 ///
 /// # Safety
 ///
@@ -431,7 +461,8 @@ pub unsafe extern "C" fn tessera_config_set(
 /// comments inside it. Everything else as for `tessera_config_set`,
 /// including the codes and the message.
 ///
-/// The UI thread.
+/// Any thread (the app's background write queue), as for
+/// `tessera_config_set`.
 ///
 /// # Safety
 ///
@@ -536,7 +567,8 @@ pub unsafe extern "C" fn tessera_theme_list(
 /// `id_len`, or a `NULL` `path` with a non-zero length. A message goes to
 /// `msg` as for `tessera_config_set`.
 ///
-/// The UI thread.
+/// Any thread (the app's background write queue); it reads the scheme
+/// and writes `themes/`.
 ///
 /// # Safety
 ///
@@ -612,6 +644,52 @@ pub unsafe extern "C" fn tessera_theme_import(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #344: `open_config` from two threads at once (the Open Config menu
+    /// item and a Settings edit) starts one watch, never two: the check
+    /// and the start are under one lock. 100 rounds, each a fresh
+    /// directory the two threads race to create.
+    #[test]
+    fn two_callers_at_once_start_one_watch() {
+        for round in 0..100 {
+            let dir = tempfile::tempdir().unwrap();
+            let app = std::sync::Arc::new(App {
+                core: tessera_app_core::App::new(
+                    tessera_app_core::Config::default(),
+                    tessera_app_core::ConfigPaths::new(dir.path().join("tessera")),
+                ),
+            });
+            let address = std::ptr::from_ref::<App>(&app) as usize;
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let callers: Vec<_> = (0..2)
+                .map(|_| {
+                    let app = std::sync::Arc::clone(&app);
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        open_config(&app).unwrap()
+                    })
+                })
+                .collect();
+            for caller in callers {
+                assert!(caller.join().unwrap().is_file());
+            }
+            assert!(app.core.is_watching_config());
+            let starts = WATCH_STARTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|&&started| started == address)
+                .count();
+            assert_eq!(starts, 1, "round {round}");
+            // The next app may reuse the address.
+            drop(app);
+            WATCH_STARTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|&started| started != address);
+        }
+    }
 
     /// #348: a refusal names the caller's key path escaped, so an
     /// invisible character in it (U+200B) reaches the settings window as

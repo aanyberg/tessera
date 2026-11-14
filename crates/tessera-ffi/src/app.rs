@@ -243,7 +243,9 @@ pub unsafe extern "C" fn tessera_app_set_callbacks(
 /// not watching yet, so the edits the user is about to make apply live.
 /// Call it before opening `config.toml` for editing: the app's Open Config
 /// menu item (#29) and Preferences (#40) are its callers.
-/// Idempotent; an existing file is never changed.
+/// Idempotent; an existing file is never changed. A Settings edit
+/// (`tessera_config_set`) creates the file and starts the watch the same
+/// way, and the two never start two watches at once.
 ///
 /// Returns `TESSERA_ERROR_NULL_POINTER` if `app` is `NULL`, and
 /// `TESSERA_ERROR_IO` if the directory or the file cannot be created or the
@@ -260,7 +262,9 @@ pub unsafe extern "C" fn tessera_app_create_config(app: *mut App) -> Error {
         let Some(app) = (unsafe { App::from_ptr(app) }) else {
             return Error::NullPointer;
         };
-        match app.core.open_config(WatchOptions::default()) {
+        // One lock across the check and the start, shared with the
+        // Settings edits that create the file too (#344).
+        match crate::config::open_config(app) {
             Ok(_) => Error::Ok,
             Err(error) => {
                 tracing::warn!(%error, "cannot create the configuration");

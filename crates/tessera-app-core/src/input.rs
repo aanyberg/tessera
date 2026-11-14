@@ -341,10 +341,11 @@ impl Bindings {
     }
 
     /// Records that `config` was applied: compiles its `[keys]` again when
-    /// they changed, and returns the new generation.
+    /// they changed (a refused entry included: the map lists it), and
+    /// returns the new generation.
     pub(crate) fn applied(&self, config: &Config) -> u64 {
         let mut map = lock(&self.map);
-        if map.keys() != config.keys.bindings() {
+        if !map.compiled_from(&config.keys) {
             let compiled = Keymap::compile(&config.keys);
             self.mask.store(compiled.modifier_mask(), Ordering::Relaxed);
             for (word, bits) in self.ascii.iter().zip(compiled.ascii_filter()) {
