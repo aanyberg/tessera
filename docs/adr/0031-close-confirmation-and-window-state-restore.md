@@ -240,3 +240,25 @@ windows when logging back in".
 - Very rarely the leader's pid could be recycled between `tcgetpgrp` and
   the name lookup, giving the wrong name for a job that has just ended;
   `running` is still right at the time of the call.
+
+## Amendment: termination signals with a sheet up (#441, 2026-11-14)
+
+A termination signal (`SIGTERM`, `SIGINT`, `SIGHUP`) quits without
+asking (nobody may be there to answer), but `NSApp.terminate` does
+nothing while a window has a sheet: with a close confirmation up,
+`applicationShouldTerminate` was never asked and the app ran on until
+killed, leaving a session's child that ignores `SIGHUP` behind. The
+signal's handler (`AppDelegate.terminateForSignal()`) now:
+
+- ends every attached sheet as Cancel, then calls `terminate`;
+- with an application-modal alert up (the quit confirmation, an error),
+  aborts it instead of calling `terminate`: the quit confirmation's
+  `terminate` then goes on and quits (`applicationShouldTerminate`
+  checks the signal again after the alert), where a second, nested
+  `terminate` would have ended the app without saving the windows;
+- if the app still runs one second later (something else refused),
+  saves the window state, shuts the core down (which ends the sessions'
+  children) and exits with status 0.
+
+Either way the window state is saved, as a quit saves it, and the core's
+shutdown runs before the process ends.

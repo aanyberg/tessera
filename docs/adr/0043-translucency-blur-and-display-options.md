@@ -142,7 +142,7 @@ Dark while the app runs changes nothing in it.
 
 **The choice comes later.** There is no setting: a dark, light and system
 choice is #365, which replaces the one call that sets the appearance
-(`AppDelegate.applyAppAppearance()`).
+(`AppDelegate.applyAppAppearance(_:)`).
 
 ## Amendment: app appearance setting (#365, 2026-11-13)
 
@@ -170,4 +170,4 @@ theme's: a light app appearance around a dark theme draws the theme unchanged.
 `on_config_applied`, which the watch calls for each configuration applied
 whether or not anything changed. Settings writes it through
 `tessera_config_set("appearance.app_appearance", "\"light\"")` like any other
-key. The host side (`AppDelegate.applyAppAppearance()`) is #365's app half.
+key. The host side (`AppDelegate.applyAppAppearance(_:)`) is #365's app half.
