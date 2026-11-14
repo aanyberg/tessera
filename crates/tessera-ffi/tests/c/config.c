@@ -210,6 +210,42 @@ int main(void) {
     EXPECT(tessera_config_set(app, S("appearance.theme"), S("\"ocean\""), NULL, 0, NULL),
            TESSERA_ERROR_OK);
 
+    /* A new profile with its keys in one edit (#312): the core names it
+       (the base, else "base 2", ...) and says where it landed; a refusal
+       comes back with the core's message and writes nothing. */
+    uint8_t name[TESSERA_MAX_PROFILE_NAME_LEN];
+    size_t name_len = 99;
+    size_t index = 99;
+    static const char work[] = "{\"name\": \"Work\", \"command\": \"/bin/sh\"}";
+    EXPECT(tessera_config_add_profile(app, S(work), &index, name, sizeof name, &name_len, msg,
+                                      sizeof msg, &msg_len),
+           TESSERA_ERROR_OK);
+    CHECK(index == 0 && name_len == 4 && memcmp(name, "Work", 4) == 0 && msg_len == 0);
+    EXPECT(tessera_config_add_profile(app, S(work), &index, name, sizeof name, &name_len, msg,
+                                      sizeof msg, &msg_len),
+           TESSERA_ERROR_OK);
+    CHECK(index == 1 && name_len == 6 && memcmp(name, "Work 2", 6) == 0);
+    static const char missing[] = "{\"name\": \"x\", \"appearance.theme\": \"No Such Theme\"}";
+    EXPECT(tessera_config_add_profile(app, S(missing), &index, name, sizeof name, &name_len, msg,
+                                      sizeof msg, &msg_len),
+           TESSERA_ERROR_REFUSED);
+    CHECK(index == 0 && name_len == 0);
+    CHECK(msg_len > 0 && memmem(msg, msg_len, "profiles[2].appearance.theme", 28) != NULL);
+    EXPECT(tessera_config_add_profile(app, S("{\"command\": \"/bin/sh\"}"), &index, name,
+                                      sizeof name, &name_len, msg, sizeof msg, &msg_len),
+           TESSERA_ERROR_INVALID_ARGUMENT);
+    CHECK(msg_len > 0);
+    EXPECT(tessera_config_add_profile(app, S(work), &index, name, sizeof name - 1, &name_len,
+                                      NULL, 0, NULL),
+           TESSERA_ERROR_INVALID_ARGUMENT);
+    EXPECT(tessera_config_add_profile(NULL, S(work), &index, name, sizeof name, &name_len, NULL,
+                                      0, NULL),
+           TESSERA_ERROR_NULL_POINTER);
+    text = slurp(config_path);
+    CHECK(text != NULL && strstr(text, "name = \"Work 2\"") != NULL);
+    CHECK(strstr(text, "No Such Theme") == NULL && strstr(text, "\"x\"") == NULL);
+    free(text);
+
     /* A file the editor would not write back unchanged (mixed line
        endings) is refused at open as an I/O failure naming no key path,
        and left alone (#324 item 1). */

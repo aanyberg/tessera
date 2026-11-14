@@ -38,8 +38,8 @@ pub enum Error {
     /// The session has no surface attached (`tessera_surface_attach`).
     NoSurface = 8,
     /// A configuration edit was refused because the configuration loader
-    /// would warn about the result (`tessera_config_set`): nothing was
-    /// written. Also: the formatted copy of a selection would pass its
+    /// would warn about the result (`tessera_config_set`,
+    /// `tessera_config_add_profile`): nothing was written. Also: the formatted copy of a selection would pass its
     /// size cap (`tessera_session_selection_rich_text`): only the plain
     /// text was written.
     Refused = 9,

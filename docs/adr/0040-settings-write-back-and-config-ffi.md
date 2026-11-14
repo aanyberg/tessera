@@ -243,3 +243,53 @@ ABI rules (S7) cover the exports.
   adds or duplicates a profile by key path needs the entry count (the
   profiles whose `"source"` is `"config"`) and an index that stays put
   while it sets several keys; that is left to the app's follow-up.
+
+## Amendment: adding a profile with profile files (#312 app half, 2026-11-14)
+
+This settles "left to the app's follow-up" in the previous amendment. Add
+and Duplicate do not go through the key path, whose index the files'
+profiles shift and whose per-key sets the stale-index check refuses until
+the watch has applied each one.
+
+- **One export, one edit.** `tessera_config_add_profile(app, profile_json,
+  profile_len, index, name_buf, name_cap, name_len, msg, msg_cap,
+  msg_len)` takes the whole profile as a JSON object: `"name"` (a string,
+  the base name) and up to `TESSERA_MAX_ADDED_PROFILE_KEYS` (64) other
+  members, each a key path within the profile (`"command"`,
+  `"appearance.theme"`) with its value as JSON, as `tessera_config_set`
+  takes them. It appends a `[[profiles]]` entry to `config.toml` with
+  those keys (`ConfigEditor::add_profile_with`) and saves once. The entry
+  comes after the other entries and before the profiles of `profiles/`,
+  which move up one; `*index` is where `tessera_config_json` lists it and
+  the index its key paths use from then on. `profiles/` is never written.
+- **The core names it.** The profile is named the first of `name`,
+  `name 2`, `name 3`, … that no profile has, entries and profile files
+  together, compared byte for byte (the rule the Settings window used),
+  so a new entry never shadows a profile file of the same name (the
+  loader keeps the first of a duplicate name, and entries come first).
+  The name goes back in `name_buf`, which must hold
+  `TESSERA_MAX_PROFILE_NAME_LEN` (128) bytes; a base name past 128 bytes,
+  or a numbered one that would be, is refused rather than cut.
+- **Caps.** 256 profiles in all (`MAX_PROFILES`), entries and profile
+  files together, as `ConfigEditor::add_profile` already counted them (it
+  is now tested): with 255 read one more is added, with 256 the add is
+  refused. The JSON object is within `TESSERA_MAX_CONFIG_VALUE_LEN`; a key
+  path within the profile has at most 14 steps, so the full one stays
+  within `MAX_KEY_PATH_STEPS`; `name` is not among the keys.
+- **All or nothing.** Every key is checked by the loader as a set is
+  (ADR 0040's rules: no new warning, the plain TOML equals the old one
+  with the change); the first refused one refuses the profile, and
+  nothing is written. A duplicate of a profile with a value the loader
+  warns about is refused with that warning rather than copied in part.
+- **Messages.** Every failure writes the core's reason to `msg` (cut on a
+  character boundary to `msg_cap`), naming the full key path that was
+  refused (`` `profiles[3].appearance.theme` refused: … ``), as for
+  `tessera_config_set`; `*index` and `*name_len` are 0 then. The return
+  codes are `tessera_config_set`'s: `REFUSED` for a loader warning,
+  `INVALID_ARGUMENT` for a malformed object, the caps and a short
+  `name_cap`, `CONFLICT` and `IO` as before, `NULL_POINTER` for a `NULL`
+  handle or out-parameter.
+- **The key path keeps its rule.** `tessera_config_set` on `profiles[N]`
+  with `N` the entry count still adds an entry when there are no profile
+  files, so a caller without them is unchanged; with files the app uses
+  the export.

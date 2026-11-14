@@ -172,6 +172,13 @@ impl ProfileFiles {
     pub(crate) fn count(&self) -> usize {
         self.files.iter().filter(|f| f.profile.is_some()).count()
     }
+
+    /// The names of the files' profiles, by stem (duplicates included).
+    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
+        self.files
+            .iter()
+            .filter_map(|f| f.profile.as_ref().map(|p| p.name.as_str()))
+    }
 }
 
 /// Loads the profile files of `dir` (`profiles/`), logging nothing: the
