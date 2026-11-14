@@ -1,6 +1,6 @@
 #!/usr/bin/env zsh
 # Builds tessera-ffi, compiles each C test in crates/tessera-ffi/tests/c
-# (lifecycle.c, input.c, keymap.c, scroll.c, clipboard.c, remote.c, selection.c, selection_rich.c, search.c, prompts.c, foreground.c, config.c, appearance.c, accessibility.c, then surface.c) against the generated TesseraCore.h
+# (lifecycle.c, input.c, keymap.c, scroll.c, clipboard.c, remote.c, selection.c, selection_rich.c, search.c, prompts.c, foreground.c, config.c, appearance.c, plugins.c, accessibility.c, then surface.c) against the generated TesseraCore.h
 # and the static library, and runs it. surface.c draws into a bare
 # CAMetalLayer and skips itself when TESSERA_SKIP_GPU_TESTS is set.
 # Usage: scripts/ffi-c-test.sh [worktree-dir]   (defaults to the repo root)
@@ -13,8 +13,9 @@ cargo build -p tessera-ffi
 # library follows CARGO_TARGET_DIR when it is set.
 target_dir="${CARGO_TARGET_DIR:-$dir/target}"
 include_dir="$dir/target/include"
-out_dir="$target_dir/ffi-c-test"
-mkdir -p "$out_dir"
+# One directory per run, so two runs on one target never link over each other.
+mkdir -p "$target_dir"
+out_dir="$(mktemp -d "$target_dir/ffi-c-test.XXXXXX")"
 
 # Native libraries the static library needs beyond what cc links by
 # default, from `cargo rustc -p tessera-ffi --lib --crate-type staticlib --
@@ -32,10 +33,10 @@ esac
 # tessera_app_new reads and watches its configuration directory (#100): the
 # tests use a scratch one, never the user's.
 config_dir="$(mktemp -d)"
-trap 'rm -rf "$config_dir"' EXIT
+trap 'rm -rf "$config_dir" "$out_dir"' EXIT
 export TESSERA_CONFIG_DIR="$config_dir"
 
-for test in lifecycle input keymap scroll clipboard remote selection selection_rich search prompts foreground config appearance accessibility surface; do
+for test in lifecycle input keymap scroll clipboard remote selection selection_rich search prompts foreground config appearance plugins accessibility surface; do
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -pedantic \
         -I "$include_dir" \
         "crates/tessera-ffi/tests/c/$test.c" \

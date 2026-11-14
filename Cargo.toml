@@ -29,7 +29,6 @@ edition = "2024"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/aanyberg/tessera"
-homepage = "https://github.com/aanyberg/tessera"
 authors = ["Alexander Nyberg <alexandernyberg@me.com>"]
 publish = false
 
@@ -46,7 +45,6 @@ tessera-config = { path = "crates/tessera-config" }
 tessera-plugin-api = { path = "crates/tessera-plugin-api" }
 tessera-plugin-hello = { path = "crates/tessera-plugins/tessera-plugin-hello" }
 tessera-protocol = { path = "crates/tessera-protocol" }
-tessera-control = { path = "crates/tessera-control" }
 tessera-app-core = { path = "crates/tessera-app-core" }
 
 # external

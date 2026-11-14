@@ -1,6 +1,6 @@
 # ADR 0002: One plugin API, built-in loader now, WASM loader later
 
-**Status:** accepted · 2026-10-27
+**Status:** accepted · 2026-10-27 · the built-in host is specified by ADR 0047
 
 ## Context
 
