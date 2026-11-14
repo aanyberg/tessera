@@ -63,6 +63,14 @@ struct SettingsField: Identifiable {
         Choice(value: "block", title: "Block"), Choice(value: "underline", title: "Underline"),
         Choice(value: "beam", title: "Bar"),
     ]
+    /// The profile new tabs start with while `[general] default_profile`
+    /// is not set or names no profile: the core's `BUILT_IN_PROFILE_NAME`.
+    /// A `[[profiles]]` entry of this name is the one used.
+    static let builtInProfileName = "Default"
+    /// The default profile picker's item for ``builtInProfileName``, which
+    /// leaves `default_profile` out.
+    static let builtInProfileChoice = Choice(value: builtInProfileName, title: "Default (built-in)")
+
     /// `[appearance] app_appearance`'s values (#365).
     static let appAppearances = [
         Choice(value: "dark", title: "Dark"), Choice(value: "light", title: "Light"),
@@ -138,13 +146,20 @@ extension SettingsField {
             set: { context.model.set(context.path, .integer($0)) })
     }
 
-    /// A choice's, a text field's (set on commit) and a profile name's.
+    /// A choice's, a text field's (set on commit) and a profile name's. The
+    /// default profile's shows ``builtInProfileName`` while it is not set,
+    /// and choosing that removes it.
     @MainActor
     func stringBinding(_ context: SettingsFieldContext) -> Binding<String> {
         Binding(
-            get: { context.current?.string ?? "" },
+            get: {
+                if case .profile = control { return context.current?.string ?? Self.builtInProfileName }
+                return context.current?.string ?? ""
+            },
             set: { text in
                 switch control {
+                case .profile where text == Self.builtInProfileName:
+                    context.model.remove(context.path)
                 case .profileName:
                     guard let profile = context.profile else { return }
                     context.model.renameProfile(profile, to: text)
@@ -168,7 +183,11 @@ extension SettingsField {
         case .choice(let choices): choices
         case .theme: model.themes.map { .init(value: $0.id, title: MainMenu.profileTitle($0.name)) }
         case .font: FontFamilies.fixedPitch.map { .init(value: $0, title: MainMenu.profileTitle($0)) }
-        case .profile: model.profiles.map { .init(value: $0.name, title: $0.title) }
+        case .profile:
+            // A profile of the built-in's name is the one used: it shows
+            // instead.
+            (model.profiles.contains { $0.name == Self.builtInProfileName } ? [] : [Self.builtInProfileChoice])
+                + model.profiles.map { .init(value: $0.name, title: $0.title) }
         default: nil
         }
     }
@@ -264,15 +283,24 @@ struct SettingsFieldRow: View {
             TextField(field.title, value: field.integerBinding(context), format: .number)
                 .multilineTextAlignment(.trailing)
         case .text(let placeholder, _):
-            CommitTextField(title: field.title, placeholder: placeholder, value: field.stringBinding(context))
+            CommitTextField(
+                title: field.title, placeholder: placeholder, value: field.stringBinding(context),
+                drafts: context.model)
         case .profileName:
-            CommitTextField(title: field.title, placeholder: "", value: field.stringBinding(context))
+            CommitTextField(title: field.title, placeholder: "", value: field.stringBinding(context), drafts: context.model)
         case .directory:
             LabeledContent(field.title) {
                 HStack {
-                    CommitTextField(title: "", placeholder: "Home folder", value: field.stringBinding(context))
+                    CommitTextField(
+                        title: "", placeholder: "Home folder", value: field.stringBinding(context),
+                        drafts: context.model)
                     Button("Choose…") {
-                        if let directory = SettingsPanels.chooseDirectory() {
+                        let model = context.model
+                        let generation = model.profileListGeneration
+                        SettingsPanels.present(SettingsPanels.directoryPanel(), on: model.window) { directory in
+                            // A hand edit may have put another profile at
+                            // this one's index while the sheet was open.
+                            guard model.profileListGeneration == generation else { return }
                             field.stringBinding(context).wrappedValue = directory.path(percentEncoded: false)
                         }
                     }
@@ -291,32 +319,55 @@ struct SettingsPicker: View {
 
     var body: some View {
         Picker(title, selection: selection) {
-            ForEach(choices, id: \.value) { choice in
+            ForEach(Self.items(choices, selection: selection.wrappedValue), id: \.value) { choice in
                 Text(choice.title).tag(choice.value)
             }
-            if !choices.contains(where: { $0.value == selection.wrappedValue }) {
-                Text(MainMenu.profileTitle(selection.wrappedValue)).tag(selection.wrappedValue)
-            }
         }
+    }
+
+    /// The menu's items: `choices`, and `selection` after them when it is
+    /// none of them.
+    static func items(_ choices: [SettingsField.Choice], selection: String) -> [SettingsField.Choice] {
+        if choices.contains(where: { $0.value == selection }) { return choices }
+        return choices + [.init(value: selection, title: MainMenu.profileTitle(selection))]
     }
 }
 
 /// A text field that writes when Return is pressed or it loses the focus,
-/// not on every keystroke; it follows the value when that changes.
+/// not on every keystroke; it follows the value when that changes. Text
+/// typed and not yet written is held with `drafts`
+/// (``SettingsModel/holdDraft(_:commit:)``), which writes it before a click
+/// elsewhere takes the field away.
 struct CommitTextField: View {
     let title: String
     let placeholder: String
     let value: Binding<String>
+    var drafts: SettingsModel?
     @State private var draft = ""
+    @State private var token = DraftToken()
     @FocusState private var focused: Bool
+
+    /// Who holds this field's draft with the model.
+    final class DraftToken {}
 
     var body: some View {
         TextField(title, text: $draft, prompt: placeholder.isEmpty ? nil : Text(placeholder))
             .focused($focused)
             .onSubmit(commit)
             .onAppear { draft = value.wrappedValue }
+            .onDisappear { drafts?.releaseDraft(token) }
             .onChange(of: value.wrappedValue) { _, new in
                 if !focused { draft = new }
+            }
+            .onChange(of: draft) { _, text in
+                guard let drafts else { return }
+                if text == value.wrappedValue {
+                    drafts.releaseDraft(token)
+                } else {
+                    drafts.holdDraft(token) { [value] in
+                        if text != value.wrappedValue { value.wrappedValue = text }
+                    }
+                }
             }
             .onChange(of: focused) { _, isFocused in
                 if !isFocused { commit() }
@@ -324,9 +375,13 @@ struct CommitTextField: View {
     }
 
     private func commit() {
+        drafts?.releaseDraft(token)
         if draft != value.wrappedValue {
             value.wrappedValue = draft
         }
+        // A value refused before it was written (a profile name) shows the
+        // one in effect again once the field is left.
+        if !focused { draft = value.wrappedValue }
     }
 }
 
@@ -361,22 +416,22 @@ enum FontFamilies {
     }()
 }
 
-/// The open panels the panes show.
+/// The open panels the panes show, as sheets on the Settings window.
 @MainActor
 enum SettingsPanels {
-    /// A directory the user chooses, or `nil`.
-    static func chooseDirectory() -> URL? {
+    /// The panel that chooses a directory.
+    static func directoryPanel() -> NSOpenPanel {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
         panel.prompt = "Choose"
-        return panel.runModal() == .OK ? panel.url : nil
+        return panel
     }
 
-    /// A colour scheme file the user chooses (`.itermcolors`, `.yaml`,
-    /// `.yml`), or `nil`.
-    static func chooseThemeFile() -> URL? {
+    /// The panel that chooses a colour scheme file (`.itermcolors`,
+    /// `.yaml`, `.yml`).
+    static func themeFilePanel() -> NSOpenPanel {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
@@ -384,6 +439,20 @@ enum SettingsPanels {
         panel.allowedContentTypes = ["itermcolors", "yaml", "yml"].compactMap { UTType(filenameExtension: $0) }
         panel.message = "Choose an iTerm2 colour scheme (.itermcolors) or a base16 scheme (.yaml)."
         panel.prompt = "Import"
-        return panel.runModal() == .OK ? panel.url : nil
+        return panel
+    }
+
+    /// Shows `panel` as a sheet on `window` (on its own without one, not
+    /// app-modal) and calls `chosen` with what was chosen, if anything was.
+    static func present(_ panel: NSOpenPanel, on window: NSWindow?, chosen: @escaping @MainActor (URL) -> Void) {
+        let done: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .OK, let url = panel.url else { return }
+            MainActor.assumeIsolated { chosen(url) }
+        }
+        if let window {
+            panel.beginSheetModal(for: window, completionHandler: done)
+        } else {
+            panel.begin(completionHandler: done)
+        }
     }
 }

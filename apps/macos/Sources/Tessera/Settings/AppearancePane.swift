@@ -50,7 +50,7 @@ struct AppearancePane: View {
                 SettingsFieldRow(field: Self.theme, context: .init(model: model, path: Self.theme.key))
                 LabeledContent("") {
                     Button("Import Theme…") {
-                        if let file = SettingsPanels.chooseThemeFile() {
+                        SettingsPanels.present(SettingsPanels.themeFilePanel(), on: model.window) { file in
                             model.importTheme(at: file)
                         }
                     }

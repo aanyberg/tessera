@@ -19,7 +19,8 @@ struct ProfilesPane: View {
     ]
 
     /// The appearance fields a profile may set: Appearance's, but for
-    /// `dim_inactive_panes` and `blur_radius` (the window draws those).
+    /// `dim_inactive_panes` and `blur_radius` (the window draws those) and
+    /// `app_appearance` (app-wide).
     static var appearanceFields: [SettingsField] {
         AppearancePane.fields.filter { SettingsField.profileAppearanceKeys.contains($0.key) }
     }
@@ -30,7 +31,10 @@ struct ProfilesPane: View {
         let changing = model.profilesChanging
         HStack(alignment: .top, spacing: 0) {
             VStack(alignment: .leading, spacing: 0) {
-                List(selection: $selection) {
+                // A click on another profile first writes the text typed
+                // into this one's field, which goes before it sees the
+                // focus go (#344).
+                List(selection: Binding(get: { selection }, set: { model.commitDraft(); selection = $0 })) {
                     ForEach(profiles) { profile in
                         Text(profile.title)
                             .lineLimit(1)
@@ -49,6 +53,7 @@ struct ProfilesPane: View {
                     } label: {
                         Image(systemName: "plus").accessibilityLabel("Add Profile")
                     }
+                    .disabled(!model.canAddProfile)
                     Button {
                         if let selection, let copy = model.duplicateProfile(selection) {
                             self.selection = copy
@@ -56,7 +61,7 @@ struct ProfilesPane: View {
                     } label: {
                         Image(systemName: "plus.square.on.square").accessibilityLabel("Duplicate Profile")
                     }
-                    .disabled(selected(in: profiles) == nil)
+                    .disabled(selected(in: profiles) == nil || !model.canAddProfile)
                     Button {
                         confirmingDelete = selected(in: profiles)
                     } label: {
@@ -67,6 +72,14 @@ struct ProfilesPane: View {
                 .buttonStyle(.borderless)
                 .disabled(changing)
                 .padding(.top, 6)
+                if let status = model.profilesStatus {
+                    // Why the list and the profile are disabled (#344 m-f).
+                    Text(status)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, 6)
+                }
                 SettingsMessage(text: model.message(SettingsModel.profilesKey))
                     .padding(.top, 6)
             }

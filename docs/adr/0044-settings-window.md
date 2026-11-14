@@ -107,7 +107,8 @@ the importer refuses writes nothing and shows the importer's message.
 - A hand edit and a window edit can meet: the hand edit wins the conflict
   and the window's edit goes on top of it, once.
 - Profiles are addressed by index. If the file's profiles are reordered by
-  hand and an edit is made before the watch has applied that (0.1 to 4 s),
+  hand and an edit is made before the watch has applied that (0.1 to about
+  1 s: it debounces 100 ms and waits at most 1 s),
   the edit lands on the profile now at that index. Accepted for now: the
   window reloads within seconds, and naming profiles by name in the key
   path would need an FFI change (#40c or later). Once the watch applies a
@@ -127,7 +128,7 @@ the importer refuses writes nothing and shows the importer's message.
 - After Add, Duplicate or Delete the Profiles pane waits for the watch (0.1
   to about 1 s) before the next profile edit. A watch that never applies
   keeps the pane disabled until the window is closed and opened again,
-  which starts from the file.
+  which starts from the configuration the core has applied.
 - `on_config_applied` reloads the model once per applied configuration, not
   per edit; nothing in the window runs per byte of terminal output.
 - Keys the panes do not show are untouched by the window and reachable
@@ -245,3 +246,50 @@ registry command, so the key map exempts none. This replaces "Tessera >
 Settings…" and "Open config.toml stays in the Tessera menu" under Hosting;
 the keys no pane shows are reachable through the Advanced pane's Open
 config.toml.
+
+## Amendment: Settings minors (#344, 2026-11-14)
+
+- **The built-in profile.** General's Default profile picker lists
+  "Default (built-in)" first: the profile new tabs start with while
+  `default_profile` is not set (the core's `BUILT_IN_PROFILE_NAME`,
+  `"Default"`, which the configuration reads for an unset key). Choosing it
+  removes the key. A `[[profiles]]` entry of that name is the one the core
+  uses, so it shows instead of the built-in item.
+- **Renaming the default profile** writes the name, then `default_profile`,
+  as one run on the write queue that stops at the first refusal: a refused
+  rename writes neither. The core has no edit of several keys at once, and
+  no order of two single-key edits avoids a file in between whose
+  `default_profile` names no profile (the name first: the old name is gone;
+  the default first: the new name is not there yet). That file is not a
+  loader warning (only a new tab would warn), and the watch's 100 ms
+  debounce normally applies both edits together. The name is written first
+  so the in-between file never names a profile that a refusal then leaves
+  missing.
+- **Profile names** are checked before anything is written: a control
+  character or line break, nothing visible (empty, spaces, a lone BOM) and
+  another profile's name (as shown, renames not yet applied included) are
+  refused with why by the Name field.
+- **The profile list's lock.** Add and Duplicate are refused at the core's
+  256 profiles (`MAX_PROFILES`, which the FFI does not export: the app's
+  constant mirrors it), with a message by the list, and never lock it. An
+  add or delete unlocks when the listed profiles differ from the ones it was
+  queued against (this window's pending keys left out of both), not with
+  the first configuration applied after it, which may be an earlier edit's.
+  While locked, the model refuses every edit of a profile's key (but for
+  the add or delete itself and a Duplicate's keys of the copy), and a line
+  under the buttons says why the pane is disabled. A hand edit that puts
+  back the very profiles the add or delete was queued against before the
+  watch applies it keeps the pane locked until the next change of the list
+  or until the window is opened again (accepted).
+- **Uncommitted text.** A field with text typed and not yet committed holds
+  it with the model; a click on another profile, Add and Duplicate commit
+  it first (the field goes before it would see the focus go), so the copy
+  of a profile has the command just typed; closing the window commits it
+  too. A hand edit that moves the profiles drops it, as before.
+- **Messages as lines.** The core writes a line break of the text it quotes
+  (a TOML syntax error's excerpt of the file) as the two characters `\n`
+  (S8); the window shows those as lines, each sanitised (S3), at most 12
+  lines and 400 characters. A literal `\n` in a quoted value shows as a
+  line break too.
+- **Open panels** (Choose… of a working directory, Import Theme…) are
+  sheets on the Settings window, not app-modal.

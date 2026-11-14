@@ -72,8 +72,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         window.identifier = NSUserInterfaceItemIdentifier("settings")
         super.init(window: window)
         window.delegate = self
-        // The Keys pane records only this window's keys.
+        // The Keys pane records only this window's keys; the open panels
+        // are sheets on it.
         model.keys.window = window
+        model.window = window
         window.center()
         if let autosaveName {
             // Restores the saved frame, if there is one, and saves it from
@@ -102,6 +104,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     func windowWillClose(_ notification: Notification) {
         window?.delegate = nil
+        // Text typed into a field and not committed is written, as a click
+        // elsewhere would; the model then holds nothing of the field (whose
+        // binding holds the model).
+        model.commitDraft()
         // The panes hold the model. AppKit keeps a closed key window (as
         // the previous key window) until another one becomes key, so the
         // window lets go of the panes now; a closed controller is never
