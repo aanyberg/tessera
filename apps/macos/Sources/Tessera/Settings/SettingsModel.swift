@@ -22,6 +22,9 @@ protocol SettingsConfigSource: AnyObject {
     func themes() throws -> [TesseraTheme]
     /// The key map in effect, which the Keys pane shows (ADR 0036).
     func keymap() throws -> TesseraKeymap
+    /// The built-in plugins and their states, which the Plugins pane shows
+    /// (ADR 0047).
+    func plugins() throws -> [TesseraPlugin]
     var settingsWriter: any SettingsConfigWriting { get }
 }
 
@@ -117,6 +120,14 @@ final class SettingsModel {
     /// The Keys pane's state: recording, conflicts and its edits of
     /// `[keys]`.
     @ObservationIgnored let keys: KeysModel
+    /// The built-in plugins, as last read (ADR 0047), in the core's order.
+    private(set) var plugins: [TesseraPlugin] = []
+    /// Whether the plugins could not be read when last asked.
+    private(set) var pluginsUnreadable = false
+    /// The plugins read again while one of them settles
+    /// (``TesseraPlugin/isSettling``): the host starts and stops them on its
+    /// own thread after the apply, and tells the app nothing more.
+    @ObservationIgnored private var pluginRead: SettingsTimer?
 
     /// Values set but not yet seen in ``snapshot``, by key path; `.null`
     /// for a removed key.
@@ -159,6 +170,10 @@ final class SettingsModel {
     static let importThemeKey = "action:import_theme"
     /// The key of the message the profile list shows.
     static let profilesKey = "action:profiles"
+    /// While a plugin settles, the plugins are read again this often…
+    static let pluginSettleInterval: Duration = .milliseconds(50)
+    /// …at most this many times after each configuration applied (2 s).
+    static let pluginSettleReads = 40
 
     /// One slider's or stepper's coalescing state.
     private struct Throttle {
@@ -208,6 +223,8 @@ final class SettingsModel {
         } catch {
             Self.log.error("themes not read: \(String(describing: error), privacy: .public)")
         }
+        // After the configuration, so an apply in between reloads again.
+        readPluginsAgain()
         let masks = pending
         let listed = snapshot["profiles"]?.array ?? []
         for key in Array(pending.keys) where (inFlight[key] ?? 0) == 0 && throttles[key]?.timer == nil {
@@ -240,6 +257,48 @@ final class SettingsModel {
             keymap = nil
             Self.log.error("key map not read: \(String(describing: error), privacy: .public)")
         }
+    }
+
+    /// Reads the plugins again, and again while one settles: after every
+    /// configuration applied (``reload()``) and when the Plugins pane shows
+    /// (ADR 0047).
+    func readPluginsAgain() {
+        pluginRead?.cancel()
+        pluginRead = nil
+        guard let source else { return }
+        readPlugins(source)
+        settlePlugins(reads: Self.pluginSettleReads)
+    }
+
+    /// Reads the plugins (ADR 0047).
+    private func readPlugins(_ source: any SettingsConfigSource) {
+        do {
+            plugins = try source.plugins()
+            pluginsUnreadable = false
+        } catch {
+            pluginsUnreadable = true
+            Self.log.error("plugins not read: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    /// Reads the plugins again after ``pluginSettleInterval`` while one of
+    /// them settles, `reads` times at most; each configuration applied
+    /// starts it again from ``reload()``.
+    private func settlePlugins(reads: Int) {
+        guard reads > 0, plugins.contains(where: \.isSettling) else { return }
+        let timer = clock.schedule(after: Self.pluginSettleInterval) { [weak self] in
+            guard let self, let source = self.source else { return }
+            self.pluginRead = nil
+            self.readPlugins(source)
+            self.settlePlugins(reads: reads - 1)
+        }
+        pluginRead = timer
+    }
+
+    /// Whether an edit of `key` is queued, running, or written and not yet
+    /// applied.
+    func isPending(_ key: String) -> Bool {
+        pending[key] != nil
     }
 
     /// The writer edits go through, while the core runs.

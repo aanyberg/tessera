@@ -1,8 +1,7 @@
 import SwiftUI
 
 /// Advanced: scrollback, shell integration, clipboard writes by programs,
-/// the enabled plugins (shown only, until the Plugins pane, #48), and
-/// `config.toml` itself for the keys no pane shows.
+/// and `config.toml` itself for the keys no pane shows.
 struct AdvancedPane: View {
     let model: SettingsModel
     let actions: SettingsActions
@@ -24,17 +23,6 @@ struct AdvancedPane: View {
             Section("Terminal") {
                 ForEach(Self.fields) { field in
                     SettingsFieldRow(field: field, context: .init(model: model, path: field.key))
-                }
-            }
-            Section("Plugins") {
-                let enabled = model.value("plugins.enabled")?.array?.compactMap(\.string) ?? []
-                if enabled.isEmpty {
-                    Text("No plugins are enabled.")
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(Array(enabled.enumerated()), id: \.offset) { _, plugin in
-                        Text(MainMenu.profileTitle(plugin))
-                    }
                 }
             }
             Section {
