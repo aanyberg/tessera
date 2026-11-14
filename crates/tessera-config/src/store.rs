@@ -528,6 +528,56 @@ fn behind_dangling_link(file: &std::path::Path) -> bool {
     false
 }
 
+/// Makes the scoped subscribers of this crate's tests see every event,
+/// whichever test registers a callsite first (#430). A process-wide
+/// subscriber that is interested in every callsite but enabled for no
+/// event: without it, while only one test's scoped subscriber exists,
+/// `tracing-core` computes a new callsite's interest from the default of
+/// the thread that hits it first, and a test thread with no subscriber
+/// caches "never" for every thread, so a capture on another thread sees
+/// nothing (`a_broken_file_at_open_is_one_warning` failed about half the
+/// time under plain `cargo test`).
+#[cfg(test)]
+pub(crate) fn captures_see_every_event() {
+    struct Interested;
+
+    impl tracing::Subscriber for Interested {
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            false
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, _: &tracing::Event<'_>) {}
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // Fails only when a global subscriber is set already, which then
+        // decides; nothing in this crate sets one.
+        let _ = tracing::subscriber::set_global_default(Interested);
+    });
+    // A callsite whose interest was cached before the line above.
+    tracing::callsite::rebuild_interest_cache();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -930,6 +980,7 @@ mod tests {
 
     /// The warnings and errors `f` logs on this thread.
     fn logged_warnings(f: impl FnOnce()) -> Vec<String> {
+        crate::store::captures_see_every_event();
         let capture = std::sync::Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
         tracing::subscriber::with_default(std::sync::Arc::clone(&capture), f);
         capture.0.lock().unwrap().clone()
@@ -960,6 +1011,61 @@ mod tests {
             });
             assert_eq!(again, Vec::<String>::new(), "{case}");
         }
+    }
+
+    /// #430 (20.2 adv m1): a theme file that does not load is logged once
+    /// per broken content, not on every lookup (`Theme::resolve` itself
+    /// logs nothing; the watch looks the theme up on every save it
+    /// applies), and again once a lookup has loaded it in between.
+    #[test]
+    fn a_broken_theme_file_is_logged_once_per_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(dir.path());
+        std::fs::create_dir_all(paths.themes_dir()).unwrap();
+        let file = paths.themes_dir().join("Broken.toml");
+        std::fs::write(&file, "not = [valid").unwrap();
+        std::fs::write(paths.config_file(), "[appearance]\ntheme = \"Broken\"\n").unwrap();
+        let mut store = None;
+        let opened = logged_warnings(|| store = Some(ConfigStore::open(paths.clone()).unwrap()));
+        assert_eq!(opened, Vec::<String>::new());
+        let store = store.unwrap();
+        let lookups = || {
+            logged_warnings(|| {
+                for _ in 0..3 {
+                    let resolved = store.resolve_theme();
+                    assert!(
+                        matches!(&resolved.warnings[..], [Warning::ThemeInvalid { .. }, ..]),
+                        "{:?}",
+                        resolved.warnings
+                    );
+                }
+            })
+        };
+        let only_broken = |lines: &[String]| {
+            lines
+                .iter()
+                .filter(|line| line.contains("Broken.toml"))
+                .count()
+        };
+        let lines = lookups();
+        assert_eq!(only_broken(&lines), 1, "{lines:#?}");
+        assert_eq!(
+            logged_warnings(|| drop(Theme::resolve(&paths.themes_dir(), "Broken"))),
+            Vec::<String>::new(),
+            "the lookup itself logs"
+        );
+        std::fs::write(&file, "also = [broken").unwrap();
+        let lines = lookups();
+        assert_eq!(only_broken(&lines), 1, "new content: {lines:#?}");
+        std::fs::write(
+            &file,
+            include_str!("../themes/dracula.toml").replace("\"Dracula\"", "\"Broken\""),
+        )
+        .unwrap();
+        assert_eq!(store.resolve_theme().warnings, Vec::<Warning>::new());
+        std::fs::write(&file, "also = [broken").unwrap();
+        let lines = lookups();
+        assert_eq!(only_broken(&lines), 1, "broken again: {lines:#?}");
     }
 
     /// #342 M1: a theme lookup logs a missing theme when the previous

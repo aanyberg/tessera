@@ -1323,7 +1323,9 @@ fn removing_the_last_profile_keeps_no_final_newline() {
 /// #342 M7: the loader reads the first `MAX_PROFILES` profiles only, so an
 /// edit of a later one would go unseen by every check (the Settings
 /// window, adding at the loaded count, would rename the 257th entry).
-/// Such a set and an add at the cap are refused; removing one works.
+/// Such a set and an add at the cap are refused, and so is a removal of
+/// one or of a key in it (#430: it would change a profile the app never
+/// reads); a removal below the cap works.
 #[test]
 fn no_profile_past_the_cap_is_edited() {
     use std::fmt::Write as _;
@@ -1347,11 +1349,85 @@ fn no_profile_past_the_cap_is_edited() {
         toml::Value::Float(0.5),
     ));
     unsupported(editor.add_profile("New").map(drop));
+    for path in [
+        format!("profiles[{MAX_PROFILES}]"),
+        format!("profiles[{MAX_PROFILES}].name"),
+        format!("profiles[{}]", MAX_PROFILES + 1),
+    ] {
+        unsupported(editor.remove(&path).map(drop));
+    }
     assert_eq!(editor.to_toml(), text);
-    assert!(editor.remove(&format!("profiles[{MAX_PROFILES}]")).unwrap());
+    assert!(
+        editor
+            .remove(&format!("profiles[{}]", MAX_PROFILES - 1))
+            .unwrap()
+    );
     unsupported(editor.add_profile("New").map(drop));
     assert!(editor.remove("profiles[0]").unwrap());
     assert_eq!(editor.add_profile("New").unwrap(), MAX_PROFILES - 1);
+}
+
+/// `count` unknown top-level keys, more than the loader lists.
+fn hidden_unknown_keys(count: usize) -> String {
+    use std::fmt::Write as _;
+
+    let mut text = String::new();
+    for i in 0..count {
+        writeln!(text, "unknown{i} = {i}").unwrap();
+    }
+    text
+}
+
+/// #430 (20.2 adv m2): a new key in an unknown table is refused whether or
+/// not the loader lists the table's warning: with 70 unknown keys before
+/// it, `[zzz]` is hidden behind the omitted count. A key it has already
+/// may still change, and a known table takes new keys.
+#[test]
+fn a_new_key_in_an_unknown_table_hidden_past_the_cap_is_refused() {
+    for count in [10, 70] {
+        let text = format!(
+            "{}[zzz]\na = 1\n\n[[profiles]]\nname = \"p\"\n[profiles.yyy]\nb = 1\n",
+            hidden_unknown_keys(count)
+        );
+        let (_dir, _path, mut editor) = open(&text);
+        for (key, unknown) in [
+            ("zzz.newkey", "zzz"),
+            ("zzz.sub.newkey", "zzz"),
+            ("profiles[0].yyy.c", "profiles[0].yyy"),
+        ] {
+            let warnings = refused(editor.set(key, toml::Value::Integer(2)));
+            assert!(
+                matches!(&warnings[..], [Warning::UnknownKey { path }] if path == unknown),
+                "{count} unknown keys, {key}: {warnings:?}"
+            );
+        }
+        assert_eq!(editor.to_toml(), text, "{count}");
+        editor.set("zzz.a", toml::Value::Integer(3)).unwrap();
+        editor
+            .set("appearance.font_size", toml::Value::Float(14.0))
+            .unwrap();
+        editor.set("profiles[0].command", s("fish")).unwrap();
+    }
+}
+
+/// #430 (20.2 m3): with more than 64 unknown keys hidden behind the
+/// omitted count, a value out of range and a missing theme are still
+/// refused (only unknown keys hide there).
+#[test]
+fn other_warnings_are_refused_past_the_hidden_unknown_keys() {
+    let text = hidden_unknown_keys(70);
+    let (_dir, _path, mut editor) = open(&text);
+    let warnings = refused(editor.set("appearance.opacity", toml::Value::Float(5.0)));
+    assert!(
+        matches!(&warnings[..], [Warning::OutOfRange { path, .. }] if path == "appearance.opacity"),
+        "{warnings:?}"
+    );
+    let warnings = refused(editor.set("appearance.theme", s("No Such Theme")));
+    assert!(
+        matches!(&warnings[..], [Warning::ThemeNotFound { .. }]),
+        "{warnings:?}"
+    );
+    assert_eq!(editor.to_toml(), text);
 }
 
 /// #324 item 7 (ADR 0040 amendment): the saved file keeps the old file's

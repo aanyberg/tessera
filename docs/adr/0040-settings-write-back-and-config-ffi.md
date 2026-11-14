@@ -203,3 +203,22 @@ ABI rules (S7) cover the exports.
 - **Caller key path.** Refusals that echo the caller's key path escape it
   (controls, line separators and default-ignorable characters as
   `\u{…}`), like file-derived paths (S3, S8).
+
+## Amendment: refusals past the caps (#430, 2026-11-14)
+
+- **Profile cap on remove.** Removing `profiles[i]`, or a key in it, with
+  `i >= 256` is now `Unsupported` too, like a set: it would edit a profile
+  the loader never reads. This replaces "removing one stays possible" in
+  the #324 amendment. Removing an earlier profile of a file with more than
+  256 still moves the later ones down, so the 257th becomes read.
+- **Unknown tables past the warning cap.** A new key in an unknown table
+  is refused whatever the warning list holds. The check loads a document
+  that holds only the new value at its path, so it no longer depends on
+  the table's warning being among the first 64 unknown keys listed. Other
+  new warnings (a value out of range, a missing theme) are refused as
+  before, also when more than 64 unknown keys are left unlisted.
+- **Broken theme files.** `tessera-config` warns about a theme file that
+  does not load once per content, like a missing theme: the lookup
+  (`Theme::resolve`) no longer logs it itself, and the store logs only
+  warnings the previous apply did not have. The app's own messages about
+  keeping the colours in use are its callers' and unchanged here.

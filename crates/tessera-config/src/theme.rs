@@ -438,7 +438,10 @@ impl Theme {
     /// [`slug`] (so `solarized-dark` finds `Solarized Dark`).
     #[must_use]
     pub fn bundled(name: &str) -> Option<&'static Self> {
-        BUNDLED.iter().find(|theme| names_match(name, &theme.name))
+        let key = NameKey::of(name);
+        BUNDLED
+            .iter()
+            .find(|theme| NameKey::of(&theme.name).matches(&key))
     }
 
     /// The bundled themes' names, in a fixed order with
@@ -599,10 +602,29 @@ pub fn slug(name: &str) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-/// Whether two theme names denote the same theme: equal ignoring case, or
-/// with equal [`slug`]s.
-fn names_match(a: &str, b: &str) -> bool {
-    a.to_lowercase() == b.to_lowercase() || slug(a).is_some_and(|s| slug(b) == Some(s))
+/// A theme name as lookups compare it, worked out once (#430: comparing
+/// thousands of names, each pair recomputing both sides, cost seconds).
+/// Two names denote the same theme when they are equal ignoring case or
+/// have equal [`slug`]s.
+struct NameKey {
+    /// The name lowercased.
+    lower: String,
+    /// Its [`slug`].
+    slug: Option<String>,
+}
+
+impl NameKey {
+    fn of(name: &str) -> Self {
+        Self {
+            lower: name.to_lowercase(),
+            slug: slug(name),
+        }
+    }
+
+    /// Whether the two names denote the same theme.
+    fn matches(&self, other: &Self) -> bool {
+        self.lower == other.lower || (self.slug.is_some() && self.slug == other.slug)
+    }
 }
 
 /// Whether `name` is worth looking up: not empty or blank.
@@ -619,8 +641,10 @@ fn find_user_theme(
     unloadable: &mut Vec<PathBuf>,
 ) -> Option<(Theme, PathBuf)> {
     let files = theme_files(dir);
-    let (by_stem, others): (Vec<_>, Vec<_>) =
-        files.iter().partition(|(stem, _)| names_match(stem, name));
+    let key = NameKey::of(name);
+    let (by_stem, others): (Vec<_>, Vec<_>) = files
+        .iter()
+        .partition(|(stem, _)| NameKey::of(stem).matches(&key));
     let mut budget = MAX_THEME_FILES;
     for (_, path) in by_stem.into_iter().take(budget) {
         budget -= 1;
@@ -628,20 +652,23 @@ fn find_user_theme(
             Ok(theme) => return Some((theme, path.clone())),
             Err(error) => {
                 // Escaped (S8): the error may quote the file, and a file
-                // name may hold any character but `/`.
-                let warning = Warning::ThemeInvalid {
+                // name may hold any character but `/`. Not logged here: a
+                // lookup runs on every save the watch applies, and the
+                // callers log what is new (#430: one line per broken
+                // content, not one per lookup).
+                warnings.push(Warning::ThemeInvalid {
                     path: escaped(&path.display().to_string(), MAX_WARNING_PATH_LEN),
                     error: escaped(&error.to_string(), MAX_PARSE_ERROR_LEN),
-                };
-                tracing::warn!(target: "tessera_config", "{warning}");
-                warnings.push(warning);
+                });
                 unloadable.push(path.clone());
             }
         }
     }
     for (_, path) in others.into_iter().take(budget) {
         match Theme::load(path) {
-            Ok(theme) if names_match(&theme.name, name) => return Some((theme, path.clone())),
+            Ok(theme) if NameKey::of(&theme.name).matches(&key) => {
+                return Some((theme, path.clone()));
+            }
             Ok(_) => {}
             // A broken file that does not match by stem may not be the one
             // asked for; it is not reported.
@@ -691,9 +718,10 @@ pub(crate) fn files_named(dir: &Path, name: &str) -> Vec<PathBuf> {
     if !is_lookup_name(name) || name.len() > MAX_THEME_NAME_LEN {
         return Vec::new();
     }
+    let key = NameKey::of(name);
     theme_files(dir)
         .into_iter()
-        .filter(|(stem, _)| names_match(stem, name))
+        .filter(|(stem, _)| NameKey::of(stem).matches(&key))
         .map(|(_, path)| path)
         .collect()
 }
@@ -703,13 +731,27 @@ pub(crate) fn files_named(dir: &Path, name: &str) -> Vec<PathBuf> {
 /// be a file that does not load yet), in the order of `names`, without
 /// duplicates and at most `cap`.
 ///
-/// Unlike a [`Theme::resolve`] per name, `dir` is listed once for all
-/// names, a name with no stem match that names a bundled theme is skipped
-/// before any file is read (it takes no slot of `cap`), and the files are
-/// read at most once for the `name` keys of all the other names, within
-/// [`MAX_THEME_FILES`] reads (#417). A user file that shadows a bundled
-/// theme only by its `name` key, under another stem, is thus not found.
+/// Each name gets the budget of [`Theme::resolve`]: [`MAX_THEME_FILES`]
+/// reads by stem and then by `name` key (#430). Unlike a lookup per name,
+/// `dir` is listed once, each file is read at most once for all names,
+/// each name and stem is lowercased and slugged once, and the names past
+/// the one that settles the `cap`th file are not looked at. A name with
+/// no stem match that names a bundled theme reads no file of its own: it
+/// is searched by `name` key (a user file that shadows the bundled theme
+/// under another stem) only when another name's search reads the files
+/// anyway (#417 item 4, #430). All this reads at most
+/// [`MAX_THEME_FILES`] times `cap + 1` files.
 pub(crate) fn files_for_names(dir: &Path, names: &[&str], cap: usize) -> Vec<PathBuf> {
+    /// Where a name's search ended.
+    enum Outcome {
+        /// The index of its file.
+        File(usize),
+        /// Nothing found.
+        Nothing,
+        /// A bundled theme's name with no stem match, searched by key last.
+        Bundled(NameKey),
+    }
+
     let names: Vec<&str> = names
         .iter()
         .copied()
@@ -719,62 +761,118 @@ pub(crate) fn files_for_names(dir: &Path, names: &[&str], cap: usize) -> Vec<Pat
         return Vec::new();
     }
     let files = theme_files(dir);
-    let mut budget = MAX_THEME_FILES;
-    // Per name: the file found, and whether its `name` key is still to be
-    // searched for (no stem match loaded).
-    let mut found: Vec<Option<PathBuf>> = Vec::with_capacity(names.len());
-    let mut by_key: Vec<bool> = Vec::with_capacity(names.len());
+    let stems: Vec<NameKey> = files.iter().map(|(stem, _)| NameKey::of(stem)).collect();
+    let mut reads = Reads {
+        files: &files,
+        read: (0..files.len()).map(|_| Read::Not).collect(),
+        left: MAX_THEME_FILES.saturating_mul(cap.saturating_add(1)),
+    };
+    let mut outcomes: Vec<Outcome> = Vec::with_capacity(names.len());
+    // Distinct files found so far; once `cap` are, no later name can
+    // enter the result (a bundled name searched last may only push one
+    // of them out).
+    let mut settled: Vec<usize> = Vec::new();
+    let mut key_pass = false;
     for name in &names {
-        let stems: Vec<&PathBuf> = files
-            .iter()
-            .filter(|(stem, _)| names_match(stem, name))
-            .map(|(_, path)| path)
+        if settled.len() >= cap {
+            break;
+        }
+        let key = NameKey::of(name);
+        let matching: Vec<usize> = (0..files.len())
+            .filter(|&i| stems[i].matches(&key))
             .collect();
-        if stems.is_empty() {
-            found.push(None);
-            by_key.push(Theme::bundled(name).is_none());
+        if matching.is_empty() && Theme::bundled(name).is_some() {
+            outcomes.push(Outcome::Bundled(key));
             continue;
         }
-        let mut loaded = None;
-        for path in stems.iter().copied() {
+        let mut budget = MAX_THEME_FILES;
+        let mut file = None;
+        for &i in &matching {
             if budget == 0 {
                 break;
             }
             budget -= 1;
-            if Theme::load(path).is_ok() {
-                loaded = Some(path.clone());
+            if reads.name_of(i).is_some() {
+                file = Some(i);
                 break;
             }
         }
-        by_key.push(loaded.is_none());
-        found.push(loaded.or_else(|| stems.first().map(|path| (*path).clone())));
-    }
-    if by_key.iter().any(|pending| *pending) {
-        for (_, path) in files.iter().take(budget) {
-            let Ok(theme) = Theme::load(path) else {
-                continue;
-            };
-            for (i, name) in names.iter().enumerate() {
-                if by_key[i] && names_match(&theme.name, name) {
-                    by_key[i] = false;
-                    found[i] = Some(path.clone());
+        if file.is_none() {
+            key_pass = true;
+            file = (0..files.len())
+                .filter(|&i| !stems[i].matches(&key))
+                .take(budget)
+                .find(|&i| reads.name_of(i).is_some_and(|theme| theme.matches(&key)))
+                .or_else(|| matching.first().copied());
+        }
+        match file {
+            Some(i) => {
+                if !settled.contains(&i) {
+                    settled.push(i);
                 }
+                outcomes.push(Outcome::File(i));
             }
-            if !by_key.iter().any(|pending| *pending) {
-                break;
-            }
+            None => outcomes.push(Outcome::Nothing),
         }
     }
     let mut out: Vec<PathBuf> = Vec::new();
-    for file in found.into_iter().flatten() {
+    for outcome in outcomes {
+        let file = match outcome {
+            Outcome::File(i) => Some(i),
+            Outcome::Bundled(key) if key_pass => (0..files.len())
+                .take(MAX_THEME_FILES)
+                .find(|&i| reads.name_of(i).is_some_and(|theme| theme.matches(&key))),
+            Outcome::Nothing | Outcome::Bundled(_) => None,
+        };
+        let Some(i) = file else { continue };
         if out.len() == cap {
             break;
         }
-        if !out.contains(&file) {
-            out.push(file);
+        if !out.contains(&files[i].1) {
+            out.push(files[i].1.clone());
         }
     }
     out
+}
+
+/// The theme files of one [`files_for_names`] call, each read at most
+/// once, within a total number of reads.
+struct Reads<'a> {
+    files: &'a [(String, PathBuf)],
+    /// What reading each file gave.
+    read: Vec<Read>,
+    /// Reads left; past them a file not read yet counts as not loading.
+    left: usize,
+}
+
+impl Reads<'_> {
+    /// The key of the `name` of file `i`, `None` when it does not load.
+    fn name_of(&mut self, i: usize) -> Option<&NameKey> {
+        if matches!(self.read[i], Read::Not) {
+            if self.left == 0 {
+                return None;
+            }
+            self.left -= 1;
+            self.read[i] = match Theme::load(&self.files[i].1) {
+                Ok(theme) => Read::Named(NameKey::of(&theme.name)),
+                Err(_) => Read::Broken,
+            };
+        }
+        match &self.read[i] {
+            Read::Named(key) => Some(key),
+            Read::Not | Read::Broken => None,
+        }
+    }
+}
+
+/// What [`Reads`] knows of one file.
+enum Read {
+    /// Not read yet.
+    Not,
+    /// Read; it did not load.
+    Broken,
+    /// Read; the key of its `name`.
+    Named(NameKey),
 }
 
 /// Most theme files that do not load which the native watcher keeps
@@ -973,5 +1071,176 @@ mod tests {
         let text = resolved.warnings[0].to_string();
         assert!(text.contains(r"bad\u{2028}\u{202e}\u{1b}.toml"), "{text}");
         assert!(text.contains(r"nope\u{202e}\u{2028}\u{1b}"), "{text}");
+    }
+
+    /// A theme document named `name`.
+    fn named(name: &str) -> String {
+        Theme {
+            name: name.to_owned(),
+            ..Theme::default()
+        }
+        .to_toml()
+    }
+
+    /// `dir` holding `files` as `(file name, contents)`.
+    fn themes_dir(files: &[(String, String)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, contents) in files {
+            std::fs::write(dir.path().join(name), contents).unwrap();
+        }
+        dir
+    }
+
+    /// The file names `files_for_names` gives for `names`.
+    fn followed(dir: &Path, names: &[&str], cap: usize) -> Vec<String> {
+        files_for_names(dir, names, cap)
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// #430 (20.7 adv F2): each name gets [`Theme::resolve`]'s budget, so
+    /// a file found only by its `name` key at sorted index 255 is found
+    /// while another name took a stem load, and one at index 256 is not
+    /// (as `resolve` finds it, or not).
+    #[test]
+    fn each_name_gets_the_lookup_budget_of_resolve() {
+        let mut files: Vec<(String, String)> = (0..255)
+            .map(|i| (format!("f{i:03}.toml"), named(&format!("F{i}"))))
+            .collect();
+        files.push(("g-keyed.toml".into(), named("Keyed")));
+        let dir = themes_dir(&files);
+        assert!(matches!(
+            Theme::resolve(dir.path(), "Keyed").source,
+            ThemeSource::User(path) if path.ends_with("g-keyed.toml")
+        ));
+        assert_eq!(
+            followed(dir.path(), &["f001", "Keyed"], 8),
+            ["f001.toml", "g-keyed.toml"]
+        );
+        assert_eq!(
+            followed(dir.path(), &["f001", "f002", "f003", "Keyed"], 8),
+            ["f001.toml", "f002.toml", "f003.toml", "g-keyed.toml"]
+        );
+
+        // One file more before it: index 256, past the budget, for
+        // `resolve` and here alike.
+        std::fs::write(dir.path().join("f255.toml"), named("F255")).unwrap();
+        assert_eq!(
+            Theme::resolve(dir.path(), "Keyed").source,
+            ThemeSource::Default
+        );
+        assert_eq!(followed(dir.path(), &["f001", "Keyed"], 8), ["f001.toml"]);
+    }
+
+    /// #430 (20.7 m7): names that resolve to one file (they differ by
+    /// case, or one is found by stem and the other by key) follow it once
+    /// and take one slot.
+    #[test]
+    fn names_resolving_to_one_file_follow_it_once() {
+        let dir = themes_dir(&[
+            ("mine.toml".into(), named("Mine Keyed")),
+            ("other.toml".into(), named("Other")),
+        ]);
+        assert_eq!(
+            followed(dir.path(), &["mine", "MINE", "Mine Keyed", "other"], 2),
+            ["mine.toml", "other.toml"]
+        );
+    }
+
+    /// S5 at the key pass: a file is read for its `name` key only up to
+    /// [`MAX_THEME_FILE_LEN`]; one byte more and it is not followed by
+    /// its key.
+    #[test]
+    fn the_key_pass_reads_a_theme_up_to_its_size_cap() {
+        let padded = |len: u64| {
+            let mut text = named("Keyed");
+            text.push('#');
+            let len = usize::try_from(len).unwrap();
+            text.extend(std::iter::repeat_n('x', len - text.len() - 1));
+            text.push('\n');
+            assert_eq!(text.len(), len);
+            text
+        };
+        let at = themes_dir(&[("other.toml".into(), padded(MAX_THEME_FILE_LEN))]);
+        assert_eq!(followed(at.path(), &["Keyed"], 8), ["other.toml"]);
+        let past = themes_dir(&[("other.toml".into(), padded(MAX_THEME_FILE_LEN + 1))]);
+        assert_eq!(followed(past.path(), &["Keyed"], 8), Vec::<String>::new());
+    }
+
+    /// #430 (20.7 m2): a user file that shadows a bundled theme only by
+    /// its `name` key (another stem) is found once another name's search
+    /// reads the files anyway; alone, a bundled name still reads nothing
+    /// (#417 item 4).
+    #[test]
+    fn a_bundled_name_shadowed_by_key_is_found_when_the_files_are_read() {
+        let dir = themes_dir(&[
+            ("my-north.toml".into(), named("Nord")),
+            ("other.toml".into(), named("Keyed")),
+        ]);
+        let loads = loads_on_this_thread();
+        assert_eq!(followed(dir.path(), &["Nord"], 8), Vec::<String>::new());
+        assert_eq!(loads_on_this_thread(), loads, "a bundled name alone");
+        assert_eq!(
+            followed(dir.path(), &["Nord", "Keyed"], 8),
+            ["my-north.toml", "other.toml"]
+        );
+        // In profile order, and within the cap.
+        assert_eq!(
+            followed(dir.path(), &["Nord", "Keyed"], 1),
+            ["my-north.toml"]
+        );
+    }
+
+    /// #430 (20.7 m4, adv F1): once `cap` files are settled the later
+    /// names read nothing, and each file is read at most once for all
+    /// names: 16 names with 20 broken stem matches each and 256 files
+    /// with other stems (sorted first, so each key window ends in them)
+    /// read the 8 first names' 160 broken files and at most
+    /// [`MAX_THEME_FILES`] others, not the later names' 160 too.
+    #[test]
+    fn the_search_stops_once_the_slots_are_settled() {
+        let mut files: Vec<(String, String)> = Vec::new();
+        let names: Vec<String> = (0..16).map(|n| format!("n{n:02}")).collect();
+        for name in &names {
+            for bang in 0..20 {
+                files.push((format!("{name}{}.toml", "!".repeat(bang)), "x = ".into()));
+            }
+        }
+        for i in 0..256 {
+            files.push((format!("a{i:03}.toml"), named(&format!("A{i}"))));
+        }
+        let dir = themes_dir(&files);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let loads = loads_on_this_thread();
+        let found = followed(dir.path(), &refs, 8);
+        let read = loads_on_this_thread() - loads;
+        let want: Vec<String> = names[..8].iter().map(|n| format!("{n}.toml")).collect();
+        assert_eq!(found, want);
+        assert!(read <= 8 * 20 + MAX_THEME_FILES, "{read} files read");
+        assert!(read >= 8 * 20, "{read} files read");
+    }
+
+    /// #430 (20.7 adv F1): 256 long names that match nothing against 4096
+    /// files with long stems: each stem and name is lowercased and
+    /// slugged once, so this takes far less than the seconds it took.
+    /// Release-only bar; debug just checks the outcome.
+    #[test]
+    fn many_long_names_against_many_long_stems_are_compared_once_each() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..MAX_THEME_DIR_ENTRIES {
+            let stem = format!("{i:04}{}", "s".repeat(246));
+            std::fs::write(dir.path().join(format!("{stem}.toml")), named("S")).unwrap();
+        }
+        let names: Vec<String> = (0..crate::MAX_PROFILES)
+            .map(|i| format!("{i:03}{}", "N".repeat(MAX_THEME_NAME_LEN - 3)))
+            .collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let started = std::time::Instant::now();
+        assert_eq!(files_for_names(dir.path(), &refs, 8), Vec::<PathBuf>::new());
+        let took = started.elapsed();
+        if !cfg!(debug_assertions) {
+            assert!(took < std::time::Duration::from_millis(500), "{took:?}");
+        }
     }
 }
