@@ -227,7 +227,8 @@ Agents use these instead of rebuilding the setup in every run:
   `TESSERA_GATE_SELFTEST=1`, through test hooks the gate honours only under `TESSERA_GATE_SELFTEST=1` (listed in the
   script's header). When the macOS job's test step fails, times out or is cancelled, it uploads
   `apps/macos/build/app-test*.log` as the `app-test-logs` artifact (#121). In CI the Rust job, which also runs the ffi C
-  tests, has `timeout-minutes: 20` and the macOS app job 37 (a normal `just app-test` is 12-14 minutes), with a
+  tests, has `timeout-minutes: 20` (it runs in parallel with the macOS app job, which no longer waits for it, and is
+  skipped for changes that cannot affect the app: see **CI skips the macOS app job**) and the macOS app job 37 (a normal `just app-test` is 12-14 minutes), with a
   30-minute limit on `just app-test` (macos-15 hit the #278 deadlock 6 times in 3 runs, and #443 adds `Coverage::build`
   close stacks, so a run needs room for several 150 s hangs and their restarts), whose xcodebuild calls also fail a
   single hung test after 120 s (300 s at most). A hang below the test level, where the test host itself deadlocks and
@@ -244,6 +245,19 @@ Agents use these instead of rebuilding the setup in every run:
   and on SIGINT, SIGTERM, SIGHUP or SIGALRM it kills the hosts and removes its state directory. `just
   app-test-watchdog-test` checks it with a fake `xcodebuild`, `sample` and `ps`, with timing bounds that grow with the
   machine's load. A new test that legitimately needs more than 300 s gets its own `slow-timeout` override there.
+- **CI skips the macOS app job (#417).** The `changes` job in `.github/workflows/ci.yml` runs
+  `scripts/ci-app-affected.sh --base <PR base sha> --head HEAD` and the `macOS app` job runs only when it prints `true`
+  (pushes to main always run it). A skipped required job satisfies branch protection (the check shows as skipped); the
+  check names `Rust (stable)` and `macOS app` are unchanged, and a failed `changes` job runs the app job. The rule is
+  conservative because the app links the xcframework built from `tessera-ffi`: the job is skipped only when every
+  changed path is docs (`docs/**`, `*.md`, `LICENSE*`), `xtask/**`, `fuzz/**`, `.github/ISSUE_TEMPLATE/**`, a crate's
+  `tests/**` or `benches/**`, `scripts/**` other than `app-test-watchdog.sh` and `rustc-wrapper.sh`, or any file of a
+  workspace crate outside the dependency closure of `tessera-ffi` (computed from `Cargo.lock`; `scripts/ci-app-affected.sh
+  --list-crates` prints it). `apps/**`, the `justfile`, `Cargo.toml`, `Cargo.lock`, `.cargo/**`, toolchain files,
+  workflows and everything unlisted run the job. `just factory-test` checks the script
+  (`scripts/test-ci-app-affected.sh`). The two jobs run in parallel, so a failing `rust` job does not stop the app job;
+  both checks must pass anyway. When you change a path the rule treats as skippable but that the app does use, add it
+  to the always-run list and to the test script.
 - **A/B probes.** `cargo xtask ab init --base <rev> --crate <name> --out <scratch dir>` builds a probe crate that
   depends on each crate at the base revision (`base_<name>`) and in the worktree (`head_<name>`). Write cases in
   the probe's `src/cases.rs`, then `cargo xtask ab bench <dir> --case <c> [--max-ratio <bar>]` (alternating
