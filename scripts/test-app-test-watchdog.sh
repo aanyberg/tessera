@@ -23,7 +23,8 @@
 #   - a TSan hang, also in macOS 15's shape (the runtime yielding through libsystem_pthread), reruns only the hung
 #     test, once, with the other arguments kept and the run's -only-testing replaced
 #     ("TSan hang in ..., retried"), and passes when that rerun passes; a TSan hang plus another failure fails without
-#     a rerun; a second hang in the rerun fails, keeping both samples.
+#     a rerun; a second hang in the rerun fails, keeping both samples; a TSan hang that xcodebuild lists under no
+#     failure (`hang-unlisted`, as with -test-iterations) is rerun too (#443).
 #   - a host that outlives the run's last suite line is sampled and killed after the limit, and the run fails
 #     (`hang-after`); a `sample` that never returns is killed after TESSERA_APP_TEST_SAMPLE_SECONDS (3 in that case, 60 otherwise);
 #   - a host that keeps forking is stopped before it is killed, so none of its children outlives it (`fork`);
@@ -111,6 +112,13 @@ case "$mode" in
         wait
         echo "** TEST SUCCEEDED **"
         exit 0 ;;
+    hang-unlisted)
+        # As with -test-iterations (#443): the restarted host repeats the test and passes, so no test is listed failed.
+        echo "Test Case '-[FakeTests.HangTests testHangs]' started (Iteration 1 of 1)."
+        echo "Test Case '-[FakeTests.HangTests testHangs]' passed (0.001 seconds)."
+        echo "Test Suite 'Selected tests' passed at 2026-11-03 12:00:01.000."
+        echo "** TEST SUCCEEDED **"
+        exit 0 ;;
     hang-fail)
         echo "Test Case '-[FakeTests.OtherTests testOther]' started."
         echo "Test Case '-[FakeTests.OtherTests testOther]' failed (0.001 seconds)."
@@ -165,7 +173,7 @@ EOF
 # background thread and a thread blocked in an interceptor (`__tsan::` frames, as in every TSan process); the main
 # thread hangs inside the runtime (`__tsan::SlotLock`) when FAKE_SAMPLE_TSAN gives this call 1, in a condition wait
 # otherwise; with 15 the main thread waits and another thread is stuck in the runtime as on macOS 15 (CI, PR #294),
-# yielding through libsystem_pthread's `cthread_yield`.
+# yielding through libsystem_pthread's `cthread_yield`, while a third thread waits in fork's atfork handler (#443).
 cat > "$work/bin/sample" <<'EOF'
 #!/bin/sh
 echo "$1" >> "$FAKE_WORK/sampled"
@@ -198,7 +206,16 @@ if [ "$tsan" = 15 ]; then
     +                         ! : 5970 swtch_pri  (in libsystem_kernel.dylib) + 8  [0x0]
     +                         ! : 1 DYLD-STUB\$\$swtch_pri  (in libsystem_pthread.dylib) + 0  [0x0]
     +                         ! 2 cthread_yield  (in libsystem_pthread.dylib) + 28  [0x0]
-    +                         1 __sanitizer::Semaphore::Wait()  (in libclang_rt.tsan_osx_dynamic.dylib) + 40  [0x0]"
+    +                         1 __sanitizer::Semaphore::Wait()  (in libclang_rt.tsan_osx_dynamic.dylib) + 40  [0x0]
+    5974 Thread_5: tessera-spawn
+    + 5974 thread_start  (in libsystem_pthread.dylib) + 8  [0x0]
+    +   5974 wrap_fork  (in libclang_rt.tsan_osx_dynamic.dylib) + 128  [0x0]
+    +     5974 fork  (in libsystem_c.dylib) + 36  [0x0]
+    +       5974 libSystem_atfork_prepare  (in libSystem.B.dylib) + 56  [0x0]
+    +         5974 ccrng_process_atfork_prepare  (in libcorecrypto.dylib) + 28  [0x0]
+    +           5974 wrap_os_unfair_lock_lock  (in libclang_rt.tsan_osx_dynamic.dylib) + 188  [0x0]
+    +             5974 _os_unfair_lock_lock_slow  (in libsystem_platform.dylib) + 176  [0x0]
+    +               5974 __ulock_wait2  (in libsystem_kernel.dylib) + 8  [0x0]"
 fi
 if [ "$tsan" = 1 ]; then
     hang="    +             900 __tsan::SlotLock(__tsan::ThreadState*)  (in libclang_rt.tsan_osx_dynamic.dylib) + 96  [0x1]
@@ -409,6 +426,7 @@ start_case stuck hang-stuck 0
 start_case tsan-pass hang,pass 1
 start_case tsan-macos15 hang,pass 15
 start_case tsan-other hang-fail,pass 1
+start_case tsan-unlisted hang-unlisted,pass 1
 start_case tsan-stuck hang-stuck,pass 1
 start_case tsan-twice hang,hang 1
 start_case mixed hang-hang,pass 1,0
@@ -562,12 +580,21 @@ check_no_strays "a TSan hang then a pass"
 
 load_case tsan-macos15
 if (( st == 0 )) && [[ "$(runs)" == 2 && "$tail" == *"TSan hang in -[FakeTests.HangTests testHangs] (#278), retried"* \
-    && "$out" == *"Thread_4"*"NSPersistentUI Work"*"stuck in the TSan runtime"*"cthread_yield"* ]]; then
-    ok "a macOS 15 TSan hang (the runtime semaphore yielding through cthread_yield) is classified TSan and rerun"
+    && "$out" == *"Thread_4"*"NSPersistentUI Work"*"stuck in the TSan runtime"*"cthread_yield"* \
+    && "$out" == *"Thread_5: tessera-spawn is forking"*"ccrng_process_atfork_prepare"* ]]; then
+    ok "a macOS 15 TSan hang (the runtime semaphore yielding through cthread_yield) is classified TSan and rerun, naming the forking thread"
 else
     not_ok "a macOS 15 TSan hang: exit $st, $(runs) runs: $out"
 fi
 check_no_strays "a macOS 15 TSan hang"
+
+load_case tsan-unlisted
+if (( st == 0 )) && [[ "$(runs)" == 2 && "$tail" == *"TSan hang in -[FakeTests.HangTests testHangs] (#278), retried"* ]]; then
+    ok "a TSan hang that xcodebuild does not list as failed (-test-iterations) is still rerun"
+else
+    not_ok "a TSan hang with no failed test listed: exit $st, $(runs) runs: $out"
+fi
+check_no_strays "a TSan hang with no failed test listed"
 
 load_case tsan-other
 if (( st != 0 )) && [[ "$(runs)" == 1 \

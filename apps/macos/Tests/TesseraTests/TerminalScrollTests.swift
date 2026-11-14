@@ -91,14 +91,17 @@ final class TerminalScrollTests: XCTestCase {
 
     /// The child's state for a failed ``open(lines:modes:)``: its
     /// pid, whether it is alive, and how much of its output is in the
-    /// session (the lines of history and screen, the length of their text).
+    /// session (the lines of history and screen, the length of their text,
+    /// which is not the number of bytes read from the pty).
     private func childState(pidFile: URL) -> String {
         let pidText = (try? String(contentsOf: pidFile, encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let process: String
         if let pidText, let pid = Int32(pidText) {
-            let exists = kill(pid, 0) == 0 || errno == EPERM
-            process = "pid \(pid), " + (exists ? "exists (alive or unreaped)" : "gone (errno \(errno))")
+            let result = kill(pid, 0)
+            let error = errno
+            let exists = result == 0 || error == EPERM
+            process = "pid \(pid), " + (exists ? "exists (alive or unreaped)" : "gone (errno \(error))")
         } else {
             process = "no pid written (the child never ran its first command)"
         }
@@ -110,7 +113,8 @@ final class TerminalScrollTests: XCTestCase {
             text = (try? view.session.selectionText())?.utf8.count ?? 0
             try? view.session.selectClear()
         }
-        return "\(process); session: \(position), \(text) bytes of text"
+        return "\(process); session: \(position), \(text) UTF-8 bytes of history and screen text"
+            + " (the text as the core holds it, not the bytes read from the pty)"
     }
 
     private var position: TesseraSession.ScrollPosition {
@@ -1256,9 +1260,10 @@ final class TerminalScrollTests: XCTestCase {
     }
 
     /// Polls `condition` on the main actor until it holds or a timeout
-    /// passes.
+    /// passes. 30 s like ``open(lines:modes:)``: the waits for a child's
+    /// echo share its stall risk on a loaded host.
     private func waitUntil(
-        _ description: String, timeout: Duration = .seconds(10), _ condition: () -> Bool
+        _ description: String, timeout: Duration = .seconds(30), _ condition: () -> Bool
     ) async throws {
         let deadline = ContinuousClock.now + timeout
         while !condition() {

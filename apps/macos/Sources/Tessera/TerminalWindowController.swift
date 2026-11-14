@@ -118,6 +118,9 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
         window.isReleasedWhenClosed = false
         window.tabbingMode = .preferred
         window.tabbingIdentifier = Self.tabbingIdentifier
+        // The window state store restores windows, not AppKit: AppKit's restoration work takes a lock that a session
+        // spawn's fork waits for under TSan (#278, #443).
+        window.isRestorable = false
         window.title = title.isEmpty ? Self.defaultTitle : title
         TerminalWindowContentView(paneContainer: paneContainer, frame: paneContainer.frame).install(in: window)
         super.init(window: window)

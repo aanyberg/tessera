@@ -104,8 +104,11 @@ final class PromptNavigationTests: XCTestCase {
     }
 
     func testCommandArrowsPageWithoutMarks() async throws {
+        // All 1000 lines and the empty line under them: output still arriving
+        // between the keys would move the anchored offset (#443).
         try await open("seq 1 1000; exec cat", until: "the history") {
-            ((try? self.view.session.scrollPosition)?.history ?? 0) > 900
+            guard let position = try? self.view.session.scrollPosition else { return false }
+            return position.history + UInt64(position.rows) == 1001
         }
         let page = UInt64(try position.rows - 1)
         XCTAssertTrue(view.performKeyEquivalent(with: try commandUp()))
@@ -196,10 +199,11 @@ final class PromptNavigationTests: XCTestCase {
         XCTAssertEqual(try position.offset, 0)
     }
 
-    /// Polls `condition` on the main actor until it holds or ten seconds
+    /// Polls `condition` on the main actor until it holds or thirty seconds
     /// pass.
     private func waitUntil(_ description: String, _ condition: () -> Bool) async throws {
-        let deadline = ContinuousClock.now + .seconds(10)
+        // 30 s: a child's first output can take that long on a loaded host.
+        let deadline = ContinuousClock.now + .seconds(30)
         while !condition() {
             guard ContinuousClock.now < deadline else {
                 XCTFail("timed out: \(description)")
