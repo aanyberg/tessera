@@ -513,6 +513,9 @@ final class FindBarView: NSView, NSTextFieldDelegate {
     let closeButton = NSButton()
     private let background = NSVisualEffectView()
 
+    /// The bar's hairline border as drawn (tests).
+    var borderColor: CGColor? { background.layer?.borderColor }
+
     init(controller: FindController) {
         self.controller = controller
         super.init(frame: NSRect(x: 0, y: 0, width: Self.preferredWidth, height: 32))
@@ -538,6 +541,21 @@ final class FindBarView: NSView, NSTextFieldDelegate {
     override func otherMouseDragged(with event: NSEvent) {}
     override func otherMouseUp(with event: NSEvent) {}
 
+    /// A layer's colour is fixed when it is set, so the dynamic
+    /// `separatorColor` is resolved for the bar's own appearance, at
+    /// creation and again whenever that appearance changes (#442): without
+    /// it a bar opened or kept across a switch to Light drew Dark's border.
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyBorderColor()
+    }
+
+    private func applyBorderColor() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            background.layer?.borderColor = NSColor.separatorColor.cgColor
+        }
+    }
+
     private func setUp() {
         wantsLayer = true
         setAccessibilityElement(true)
@@ -558,7 +576,7 @@ final class FindBarView: NSView, NSTextFieldDelegate {
         background.layer?.cornerRadius = 8
         background.layer?.masksToBounds = true
         background.layer?.borderWidth = 0.5
-        background.layer?.borderColor = NSColor.separatorColor.cgColor
+        applyBorderColor()
         background.translatesAutoresizingMaskIntoConstraints = false
         addSubview(background)
 

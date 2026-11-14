@@ -128,9 +128,57 @@ final class AppAppearanceTests: XCTestCase {
             file: file, line: line)
     }
 
+    /// The blur materials that follow the appearance. The fixed ones
+    /// (`.dark`, `.ultraDark`, `.light`, `.mediumLight`, all deprecated)
+    /// would draw one appearance whatever the app's, so any blur outside
+    /// this list fails (#430); so does the deprecated adaptive
+    /// `.appearanceBased`, which the app does not use either.
+    private static let adaptiveMaterials: Set<NSVisualEffectView.Material> = [
+        .titlebar, .selection, .menu, .popover, .sidebar, .headerView, .sheet, .windowBackground, .fullScreenUI,
+        .toolTip, .contentBackground, .underWindowBackground, .underPageBackground,
+    ]
+
+    /// Every blur in `view`'s tree, `view` included.
+    private static func effectViews(in view: NSView) -> [NSVisualEffectView] {
+        ([view as? NSVisualEffectView].compactMap(\.self)) + view.subviews.flatMap(effectViews(in:))
+    }
+
+    private func assertAdaptiveMaterials(
+        in view: NSView?, _ what: String, file: StaticString = #filePath, line: UInt = #line
+    ) {
+        guard let view else { return XCTFail("\(what): missing", file: file, line: line) }
+        for effect in Self.effectViews(in: view) {
+            XCTAssertTrue(
+                Self.adaptiveMaterials.contains(effect.material),
+                "\(what): \(type(of: effect)) has the fixed material \(effect.material.rawValue)", file: file,
+                line: line)
+        }
+    }
+
+    /// The find bar's hairline is `separatorColor` as `dark` or light
+    /// resolve it.
+    private func assertFindBarBorder(
+        dark: Bool, _ bar: FindBarView?, _ what: String, file: StaticString = #filePath, line: UInt = #line
+    ) {
+        guard let bar else { return XCTFail("\(what): no find bar", file: file, line: line) }
+        var expected: CGColor?
+        NSAppearance(named: dark ? .darkAqua : .aqua)?.performAsCurrentDrawingAppearance {
+            expected = NSColor.separatorColor.cgColor
+        }
+        var other: CGColor?
+        NSAppearance(named: dark ? .aqua : .darkAqua)?.performAsCurrentDrawingAppearance {
+            other = NSColor.separatorColor.cgColor
+        }
+        XCTAssertNotEqual(expected, other, "the two appearances' separators differ", file: file, line: line)
+        XCTAssertEqual(
+            bar.borderColor, expected, "\(what): the border is \(dark ? "Dark" : "Light")'s separator",
+            file: file, line: line)
+    }
+
     /// Every terminal window open now and, in each, the pane's blur and the
     /// strip's blur and tint, which a translucent window has once its panes
-    /// have a renderer (without one a pane counts as opaque).
+    /// have a renderer (without one a pane counts as opaque). No blur in
+    /// the window has a fixed material.
     private func assertEveryWindowDraws(
         dark: Bool, translucent: Bool = true, _ what: String, file: StaticString = #filePath, line: UInt = #line
     ) {
@@ -139,6 +187,7 @@ final class AppAppearanceTests: XCTestCase {
             let name = "\(what), window \(index)"
             assertDraws(dark: dark, controller.window, name, file: file, line: line)
             let content = controller.window?.contentView as? TerminalWindowContentView
+            assertAdaptiveMaterials(in: content, name, file: file, line: line)
             guard translucent, controller.panes.allSatisfy(\.view.surface.isAttached) else { continue }
             assertDraws(dark: dark, content?.titlebarBackdrop, "\(name): the title bar's blur", file: file, line: line)
             assertDraws(dark: dark, content?.titlebarTint, "\(name): the title bar's tint", file: file, line: line)
@@ -175,6 +224,8 @@ final class AppAppearanceTests: XCTestCase {
             let view = first.focusedPane.view
             view.showFindBar(nil)
             assertDraws(dark: dark, view.findBar, "\(what): the find bar")
+            assertFindBarBorder(dark: dark, view.findBar, "\(what): the find bar")
+            assertAdaptiveMaterials(in: view.findBar, "\(what): the find bar")
 
             AlertCloseConfirmationPresenter().confirm(
                 CloseConfirmation(scope: .tab, processNames: ["sleep"]), sheetFor: window
@@ -227,6 +278,33 @@ final class AppAppearanceTests: XCTestCase {
         try await waitUntil("the key gone, the app is dark again") { NSApp.appearance?.name == .darkAqua }
         assertEveryWindowDraws(dark: true, "no key")
         XCTAssertEqual(content.titlebarTint?.segments, tint, "the strip keeps the theme's tint")
+    }
+
+    /// The find bar's border follows a reload of the file (#442): with
+    /// `dark` read at the core's start and a bar open, `light` makes that
+    /// bar's border Light's separator and a bar opened afterwards, in a new
+    /// window, has it too; `dark` again turns both back. Nothing is posted
+    /// or set by the test.
+    func testTheFindBarsBorderFollowsAReload() async throws {
+        try write(Self.config("dark"))
+        try appDelegate.replaceCore(start: true)
+        let first = try appDelegate.newWindow()
+        let open = first.focusedPane.view
+        open.showFindBar(nil)
+        assertFindBarBorder(dark: true, open.findBar, "dark, the open bar")
+
+        try write(Self.config("light"))
+        try await waitUntil("the reload makes the app light") { NSApp.appearance?.name == .aqua }
+        assertFindBarBorder(dark: false, open.findBar, "light, the bar open since dark")
+        let second = try appDelegate.newWindow()
+        let opened = second.focusedPane.view
+        opened.showFindBar(nil)
+        assertFindBarBorder(dark: false, opened.findBar, "light, a bar opened in a new window")
+
+        try write(Self.config("dark"))
+        try await waitUntil("the reload makes the app dark") { NSApp.appearance?.name == .darkAqua }
+        assertFindBarBorder(dark: true, open.findBar, "dark again, the first bar")
+        assertFindBarBorder(dark: true, opened.findBar, "dark again, the second bar")
     }
 
     // MARK: Settings

@@ -529,3 +529,369 @@ final class CloseConfirmationTests: XCTestCase {
 struct PollTimedOut: Error, CustomStringConvertible {
     let description: String
 }
+
+// MARK: - Termination signals with a confirmation up (#441)
+
+/// `kill -TERM`, `-INT` and `-HUP` end the app while a close sheet or the
+/// quit alert is up (#441, ADR 0031). A signal ends the process it is sent
+/// to, so each case runs in a child: a second copy of this test host
+/// (``TerminationSignalChild``) that opens a terminal the way the app does,
+/// starts a job in its `/bin/sh -i`, asks to close it (the real
+/// ``AlertCloseConfirmationPresenter`` shows the sheet) or to quit (the
+/// real quit alert), and waits. This test is the watcher: it sends the
+/// signal and times the child's exit. Nothing is posted or called in the
+/// child but what a user's ⌘W or ⌘Q would.
+@MainActor
+final class TerminationSignalTests: XCTestCase {
+    /// How long the child may take to exit after the signal (the issue
+    /// measured more than 20 s).
+    private static let exitDeadline: Duration = .seconds(3)
+
+    func testASignalEndsTheAppWithACloseSheetUp() async throws {
+        for (signal, name) in [(SIGTERM, "SIGTERM"), (SIGINT, "SIGINT"), (SIGHUP, "SIGHUP")] {
+            let result = try await run(.sheet, command: "sleep 100", signal: signal)
+            assertQuit(result, within: Self.exitDeadline, "\(name), close sheet")
+        }
+    }
+
+    func testASignalEndsTheAppWithTheQuitAlertUp() async throws {
+        for (signal, name) in [(SIGTERM, "SIGTERM"), (SIGINT, "SIGINT"), (SIGHUP, "SIGHUP")] {
+            let result = try await run(.alert, command: "sleep 100", signal: signal)
+            assertQuit(result, within: Self.exitDeadline, "\(name), quit alert")
+        }
+    }
+
+    /// The core's shutdown runs on that path: a shell that ignores `SIGHUP`
+    /// is killed and reaped (after the core's grace, about 2 s) before the
+    /// app exits.
+    func testASignalWithASheetUpReapsAShellThatIgnoresHangup() async throws {
+        let result = try await run(.sheet, command: "trap '' HUP; echo $$ > shell.pid; sleep 100", signal: SIGTERM)
+        assertQuit(result, within: Self.exitDeadline + .seconds(3), "a shell that ignores SIGHUP")
+        XCTAssertNotNil(result.shellPid, "the shell wrote its pid")
+        XCTAssertEqual(result.shellRemains, false, "the shell is gone once the app has exited")
+    }
+
+    /// When `terminate` cannot end the app (here a modal session that
+    /// ignores the abort), the app ends itself after
+    /// ``AppDelegate/signalTerminationGrace``, with the window state saved
+    /// and the shell that ignores `SIGHUP` reaped.
+    func testASignalEndsTheAppWhenSomethingRefusesToQuit() async throws {
+        let result = try await run(
+            .stubbornModal, command: "trap '' HUP; echo $$ > shell.pid; sleep 100", signal: SIGTERM)
+        assertQuit(
+            result, within: Self.exitDeadline + .seconds(3), "a modal session that ignores the abort",
+            throughTerminate: false)
+        XCTAssertNotNil(result.shellPid, "the shell wrote its pid")
+        XCTAssertEqual(result.shellRemains, false, "the shell is gone once the app has exited")
+    }
+
+    // MARK: Helpers
+
+    struct Result {
+        /// From the signal to the child's exit; `nil` if it was still
+        /// running 10 s later (it was then killed).
+        let exitTime: Duration?
+        let reason: Process.TerminationReason
+        let status: Int32
+        let savedState: WindowState?
+        let shellPid: pid_t?
+        /// Whether the shell that wrote `shell.pid` still existed (even as
+        /// a zombie) when the app had exited; `nil` without that file.
+        let shellRemains: Bool?
+        /// Whether `NSApplication.willTerminateNotification` was posted:
+        /// the app quit through `terminate` rather than its own `exit`.
+        let quitThroughTerminate: Bool
+        let output: String
+    }
+
+    private func assertQuit(
+        _ result: Result, within deadline: Duration, _ what: String, throughTerminate: Bool = true,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        let tail = result.output.split(separator: "\n").suffix(15).joined(separator: "\n")
+        guard let time = result.exitTime else {
+            return XCTFail("\(what): still running 10 s after the signal; output:\n\(tail)", file: file, line: line)
+        }
+        XCTAssertLessThan(time, deadline, "\(what): exits in time", file: file, line: line)
+        XCTAssertEqual(result.reason, .exit, "\(what): exits rather than dying of the signal", file: file, line: line)
+        XCTAssertEqual(result.status, 0, "\(what): exit status; output:\n\(tail)", file: file, line: line)
+        XCTAssertEqual(
+            result.savedState?.windows.count, 1, "\(what): the window state is saved; output:\n\(tail)", file: file,
+            line: line)
+        XCTAssertEqual(result.savedState?.windows.first?.tabCount, 1, "\(what): with its tab", file: file, line: line)
+        XCTAssertEqual(
+            result.quitThroughTerminate, throughTerminate, "\(what): quits through terminate; output:\n\(tail)",
+            file: file, line: line)
+    }
+
+    /// Starts a child for `mode` running `command`, waits until its sheet
+    /// or alert is up, sends `signal` and waits for the exit.
+    private func run(_ mode: TerminationSignalChild.Mode, command: String, signal: Int32) async throws -> Result {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-441-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let suite = "com.aanyberg.tessera.tests.\(UUID().uuidString)"
+        let request = TerminationSignalChild.Request(mode: mode, command: command, suite: suite)
+        try JSONEncoder().encode(request).write(to: dir.appendingPathComponent(TerminationSignalChild.requestFile))
+        var jobPid: pid_t?
+        var shellPid: pid_t?
+        defer {
+            // The job may outlive the app (it ignores SIGHUP, or its shell
+            // was killed first).
+            for pid in [jobPid, shellPid].compactMap(\.self) { kill(pid, SIGKILL) }
+            UserDefaults.standard.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let child = try TerminationSignalChild.launch(in: dir)
+        let ready = dir.appendingPathComponent(TerminationSignalChild.readyFile)
+        let failure = dir.appendingPathComponent(TerminationSignalChild.errorFile)
+        let deadline = ContinuousClock.now + .seconds(60)
+        while !FileManager.default.fileExists(atPath: ready.path) {
+            let output = (try? String(contentsOf: dir.appendingPathComponent("output.log"), encoding: .utf8)) ?? ""
+            if let error = try? String(contentsOf: failure, encoding: .utf8) {
+                child.terminate()
+                throw PollTimedOut(description: "the child failed: \(error)\n\(output.suffix(2000))")
+            }
+            guard child.isRunning, ContinuousClock.now < deadline else {
+                if child.isRunning { kill(child.processIdentifier, SIGKILL) }
+                throw PollTimedOut(description: "the child never got ready\n\(output.suffix(2000))")
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        jobPid = try JSONDecoder().decode(TerminationSignalChild.Ready.self, from: Data(contentsOf: ready)).jobPid
+        shellPid = (try? String(contentsOf: dir.appendingPathComponent("shell.pid"), encoding: .utf8))
+            .flatMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+
+        XCTAssertEqual(kill(child.processIdentifier, signal), 0)
+        let start = ContinuousClock.now
+        var exitTime: Duration?
+        while ContinuousClock.now - start < .seconds(10) {
+            if !child.isRunning {
+                exitTime = ContinuousClock.now - start
+                break
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        if exitTime == nil {
+            kill(child.processIdentifier, SIGKILL)
+        }
+        child.waitUntilExit()
+        // Before the cleanup above kills it.
+        let shellRemains = shellPid.map { kill($0, 0) == 0 }
+        let saved = UserDefaults(suiteName: suite).flatMap { WindowStateStore(defaults: $0).load() }
+        let output = (try? String(contentsOf: dir.appendingPathComponent("output.log"), encoding: .utf8)) ?? ""
+        let quitThroughTerminate = FileManager.default.fileExists(
+            atPath: dir.appendingPathComponent(TerminationSignalChild.willTerminateFile).path)
+        return Result(
+            exitTime: exitTime, reason: child.terminationReason, status: child.terminationStatus, savedState: saved,
+            shellPid: shellPid, shellRemains: shellRemains, quitThroughTerminate: quitThroughTerminate, output: output)
+    }
+}
+
+/// The child side of ``TerminationSignalTests``: a copy of the test host
+/// started with ``directoryVariable`` set runs this from the test bundle's
+/// start (``HostDisplaySettings``) instead of any test, and never returns.
+/// It reports through files in that directory: ``readyFile`` once the
+/// sheet or alert is up, ``errorFile`` if it could not get there.
+@MainActor
+enum TerminationSignalChild {
+    static let directoryVariable = "TESSERA_TESTS_SIGNAL_CHILD"
+    static let requestFile = "request.json"
+    static let readyFile = "ready.json"
+    static let errorFile = "error.txt"
+    /// Written when `NSApplication.willTerminateNotification` is posted.
+    static let willTerminateFile = "will-terminate"
+
+    enum Mode: String, Codable {
+        /// ⌘W: the close sheet.
+        case sheet
+        /// ⌘Q: the application-modal quit alert.
+        case alert
+        /// A modal session whose runner ignores `abortModal`: something
+        /// that keeps `terminate` from ending the app.
+        case stubbornModal
+    }
+
+    struct Request: Codable {
+        let mode: Mode
+        /// Typed into the shell; runs in the child's directory.
+        let command: String
+        /// The defaults suite the window state is saved to.
+        let suite: String
+    }
+
+    struct Ready: Codable {
+        let jobPid: pid_t
+    }
+
+    struct Failure: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    /// Starts a copy of this test host that runs the child in `dir`
+    /// (``requestFile`` there says what), its output in `output.log`.
+    /// XCTest in the copy reads a copy of this run's configuration that
+    /// reports to no IDE, from a file.
+    static func launch(in dir: URL) throws -> Process {
+        guard let configurationClass = NSClassFromString("XCTestConfiguration") as? NSObject.Type,
+            let active = configurationClass.perform(NSSelectorFromString("activeTestConfiguration"))?
+                .takeUnretainedValue() as? NSObject
+        else {
+            // Not a skip: a skip would hide every proof of #441 on CI.
+            throw Failure(description: "this XCTest has no XCTestConfiguration to start a child test host with")
+        }
+        let unarchiver = try NSKeyedUnarchiver(
+            forReadingFrom: try NSKeyedArchiver.archivedData(withRootObject: active, requiringSecureCoding: false))
+        unarchiver.requiresSecureCoding = false
+        guard let configuration = unarchiver.decodeObject(forKey: NSKeyedArchiveRootObjectKey) as? NSObject else {
+            throw Failure(description: "the test configuration did not copy")
+        }
+        configuration.setValue(false, forKey: "reportResultsToIDE")
+        configuration.setValue(UUID(), forKey: "sessionIdentifier")
+        let configurationFile = dir.appendingPathComponent("child.xctestconfiguration")
+        try NSKeyedArchiver.archivedData(withRootObject: configuration, requiringSecureCoding: false)
+            .write(to: configurationFile)
+
+        var environment = ProcessInfo.processInfo.environment
+        environment["XCTestConfigurationFilePath"] = configurationFile.path
+        environment["XCTestSessionIdentifier"] = nil
+        // Newer Xcodes inject XCTest through this variable rather than
+        // DYLD_INSERT_LIBRARIES, which a child does not inherit then.
+        if environment["DYLD_INSERT_LIBRARIES"] == nil, let inject = environment["XCTestBundleInjectPath"] {
+            environment["DYLD_INSERT_LIBRARIES"] = inject
+        }
+        environment[directoryVariable] = dir.path
+        // Thread Sanitizer sleeps 1 s at exit by default (2 s measured); the
+        // exit deadline measures the app, not that.
+        environment["TSAN_OPTIONS"] = [environment["TSAN_OPTIONS"], "atexit_sleep_ms=0"]
+            .compactMap(\.self).filter { !$0.isEmpty }.joined(separator: ":")
+
+        let output = dir.appendingPathComponent("output.log")
+        FileManager.default.createFile(atPath: output.path, contents: Data())
+        let child = Process()
+        child.executableURL = Bundle.main.executableURL
+        child.arguments = Array(ProcessInfo.processInfo.arguments.dropFirst())
+        child.environment = environment
+        child.currentDirectoryURL = dir
+        child.standardOutput = try FileHandle(forWritingTo: output)
+        child.standardError = child.standardOutput
+        try child.run()
+        return child
+    }
+
+    /// Runs the child if this process is one; then never returns.
+    static func runIfRequested() {
+        guard let path = ProcessInfo.processInfo.environment[directoryVariable] else { return }
+        let dir = URL(fileURLWithPath: path)
+        // A cap of the child's own, whatever its mode: the quit alert's
+        // `runModal` would wait forever if the parent died before
+        // signalling (Xcode's Stop, a crash).
+        let failure = dir.appendingPathComponent(errorFile)
+        DispatchQueue.global().asyncAfter(deadline: .now() + .seconds(90)) {
+            try? "no signal came within 90 s".write(to: failure, atomically: true, encoding: .utf8)
+            _exit(3)
+        }
+        do {
+            try run(in: dir)
+            report("no signal ended the app within 30 s", in: dir)
+            exit(3)
+        } catch {
+            report("\(error)", in: dir)
+            exit(2)
+        }
+    }
+
+    private static func reportReady(_ jobPid: pid_t, in dir: URL) throws {
+        try JSONEncoder().encode(Ready(jobPid: jobPid)).write(to: dir.appendingPathComponent(readyFile))
+    }
+
+    /// Reports ready once an application-modal window is up.
+    private static func reportReadyOnceModal(_ jobPid: pid_t, in dir: URL) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(20)) {
+            MainActor.assumeIsolated {
+                guard NSApp.modalWindow != nil else { return reportReadyOnceModal(jobPid, in: dir) }
+                do { try reportReady(jobPid, in: dir) } catch { report("\(error)", in: dir) }
+            }
+        }
+    }
+
+    private static func report(_ error: String, in dir: URL) {
+        try? error.write(to: dir.appendingPathComponent(errorFile), atomically: true, encoding: .utf8)
+    }
+
+    private static func run(in dir: URL) throws {
+        let request = try JSONDecoder().decode(
+            Request.self, from: Data(contentsOf: dir.appendingPathComponent(requestFile)))
+        guard let appDelegate = NSApp.delegate as? AppDelegate, let defaults = UserDefaults(suiteName: request.suite)
+        else { throw Failure(description: "no app delegate or defaults suite") }
+        appDelegate.windowStateStore = WindowStateStore(defaults: defaults)
+        appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-i"], workingDirectory: dir)
+        let controller = try appDelegate.newWindow()
+        let session = controller.focusedPane.session
+        try session.write(Array("\(request.command)\n".utf8))
+        var job: TesseraSession.ForegroundProcess?
+        let started = try spin(timeout: .seconds(10)) {
+            job = try session.foregroundProcess().flatMap { $0.name == "sleep" ? $0 : nil }
+            return job != nil
+        }
+        guard started, let job, let window = controller.window else {
+            throw Failure(description: "sleep did not start in the foreground")
+        }
+        // Only the signal's quit may save it from here on.
+        defaults.removeObject(forKey: WindowStateStore.key)
+        let willTerminate = dir.appendingPathComponent(willTerminateFile)
+        _ = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: nil
+        ) { _ in
+            FileManager.default.createFile(atPath: willTerminate.path, contents: Data())
+        }
+        switch request.mode {
+        case .sheet:
+            window.performClose(nil)
+            guard try spin(timeout: .seconds(10), until: { window.attachedSheet != nil }) else {
+                throw Failure(description: "no close sheet")
+            }
+            try reportReady(job.pid, in: dir)
+        case .alert:
+            // ⌘Q's path: the alert runs modally inside `terminate`, so the
+            // ready file is written from within its modal session (the
+            // main queue runs there).
+            reportReadyOnceModal(job.pid, in: dir)
+            NSApp.terminate(nil)
+            throw Failure(description: "the quit alert's terminate returned: the app was not quit")
+        case .stubbornModal:
+            let panel = NSPanel(
+                contentRect: NSRect(x: 0, y: 0, width: 200, height: 100), styleMask: [.titled], backing: .buffered,
+                defer: false)
+            let modal = NSApp.beginModalSession(for: panel)
+            try reportReady(job.pid, in: dir)
+            let deadline = ContinuousClock.now + .seconds(30)
+            while ContinuousClock.now < deadline {
+                // The signal's abort makes this return `.abort`, ignored;
+                // the run loop still runs (the main queue with it).
+                _ = NSApp.runModalSession(modal)
+                RunLoop.current.run(mode: .modalPanel, before: Date(timeIntervalSinceNow: 0.02))
+            }
+            NSApp.endModalSession(modal)
+            return
+        }
+        try spin(timeout: .seconds(30)) { false }
+    }
+
+    /// Runs the app's event loop, as the app's own loop would (the
+    /// signal's handler runs on the main queue), until `condition` holds or
+    /// `timeout` has passed; whether it held.
+    @discardableResult
+    private static func spin(timeout: Duration, until condition: () throws -> Bool) throws -> Bool {
+        let deadline = ContinuousClock.now + timeout
+        while try !condition() {
+            guard ContinuousClock.now < deadline else { return false }
+            if let event = NSApp.nextEvent(
+                matching: .any, until: Date(timeIntervalSinceNow: 0.02), inMode: .default, dequeue: true)
+            {
+                NSApp.sendEvent(event)
+            }
+        }
+        return true
+    }
+}

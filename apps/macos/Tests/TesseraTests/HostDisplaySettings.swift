@@ -19,6 +19,8 @@ final class HostDisplaySettings: NSObject, XCTestObservation {
 
     func testBundleWillStart(_ testBundle: Bundle) {
         MainActor.assumeIsolated {
+            // A child of TerminationSignalTests runs no test.
+            TerminationSignalChild.runIfRequested()
             if let appDelegate = NSApp.delegate as? AppDelegate {
                 Self.pin(appDelegate)
             }

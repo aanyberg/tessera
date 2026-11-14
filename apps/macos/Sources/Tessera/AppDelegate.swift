@@ -167,12 +167,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Cmd-Q, the Dock's Quit, logging out: when any session runs a job, one
     /// alert lists them all (D4b) and Cancel keeps everything open. A
-    /// termination signal quits without asking. Once the app quits, the
-    /// windows are saved for the next launch.
+    /// termination signal quits without asking, also when it arrives while
+    /// that alert is up: it ends the alert (``terminateForSignal()``), and
+    /// the quit goes on rather than being cancelled. Once the app quits,
+    /// the windows are saved for the next launch.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if !terminatesWithoutConfirmation, let presenter = closeConfirmationPresenter,
             let confirmation = CloseConfirmation(.quit, sessions: windowControllers.flatMap(\.sessions)),
-            !presenter.confirmQuit(confirmation)
+            !presenter.confirmQuit(confirmation), !terminatesWithoutConfirmation
         {
             return .terminateCancel
         }
@@ -655,10 +657,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: Signals
 
+    /// How long a termination signal waits for `NSApp.terminate` to end the
+    /// app before ``exitAfterSignal()`` ends it itself.
+    static let signalTerminationGrace: DispatchTimeInterval = .seconds(1)
+
     /// `kill`, Ctrl-C and closing the launching terminal (`SIGTERM`, `SIGINT`,
     /// `SIGHUP`) end the process without `applicationWillTerminate`, which
     /// would orphan a child that ignores `SIGHUP`. Route them through
-    /// `NSApp.terminate` so `shutdown()` runs.
+    /// ``terminateForSignal()`` so `shutdown()` runs.
     ///
     /// The default action would kill the process before the source's handler
     /// runs, so the process ignores the signal once the source is armed (the
@@ -671,15 +677,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let source = DispatchSource.makeSignalSource(signal: signalNumber, queue: .main)
             source.setEventHandler { [weak self] in
                 MainActor.assumeIsolated {
-                    // Nobody may be there to answer an alert.
-                    self?.terminatesWithoutConfirmation = true
-                    NSApp.terminate(nil)
+                    self?.terminateForSignal()
                 }
             }
             source.resume()
             terminationSignals.append(source)
             signal(signalNumber, SIG_IGN)
         }
+    }
+
+    /// Quits for a termination signal; nobody may be there to answer an
+    /// alert (#441). `NSApp.terminate` does nothing while a window has a
+    /// sheet (a close confirmation: `applicationShouldTerminate` is never
+    /// asked), so every sheet is ended first as Cancel. An app-modal alert
+    /// (the quit confirmation, an error) is aborted instead: when it is the
+    /// quit confirmation, the `terminate` that showed it goes on and quits,
+    /// so this call does not start a second, nested one (that one would end
+    /// the app without saving the windows). Should the app still run after
+    /// ``signalTerminationGrace`` (another alert was aborted, or something
+    /// else refused), it saves the windows, shuts the core down and exits
+    /// on its own.
+    func terminateForSignal() {
+        terminatesWithoutConfirmation = true
+        for window in NSApp.windows {
+            for sheet in window.sheets {
+                window.endSheet(sheet, returnCode: .cancel)
+            }
+        }
+        if NSApp.modalWindow != nil {
+            NSApp.abortModal()
+        } else {
+            NSApp.terminate(nil)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.signalTerminationGrace) { [weak self] in
+            MainActor.assumeIsolated {
+                self?.exitAfterSignal()
+            }
+        }
+    }
+
+    /// The fallback of ``terminateForSignal()``: what quitting would have
+    /// done (the window state, `shutdown()`, which ends the sessions'
+    /// children), then the process ends.
+    private func exitAfterSignal() {
+        Self.log.error("a termination signal did not end the app in time; exiting")
+        saveWindowState()
+        core?.shutdown()
+        exit(0)
     }
 }
 
