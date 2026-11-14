@@ -92,13 +92,86 @@ public struct TesseraKeymap: Sendable, Equatable, Decodable {
         }
     }
 
+    /// One `[keys]` entry as the core read it (#355): what a settings view
+    /// lists. Every text is escaped by the core (S3) and capped, so it is
+    /// for display and matching only: ``value`` is never written back.
+    public struct Entry: Sendable, Equatable, Decodable {
+        /// Whether the entry took effect.
+        public enum Effect: String, Sendable, Equatable {
+            /// It binds its chord: a command, a text or `none`.
+            case bound
+            /// `unbound`: it took its chord from every command.
+            case unbound
+            /// An earlier entry for the same chord took effect.
+            case shadowed
+            /// Left out for itself (a chord or value that does not parse,
+            /// an unknown command, an invisible character).
+            case refused
+        }
+
+        /// The entry's value as written, escaped and capped.
+        public enum Value: Sendable, Equatable {
+            /// A command (`select_tab:3`), `unbound`, `none`, or a value
+            /// that does not parse.
+            case text(String)
+            /// The text after `send_text:`, its escapes as written.
+            case sendText(String)
+            /// The value is not a string.
+            case notAString
+        }
+
+        /// The entry's place in `[keys]`, from 0.
+        public let index: Int
+        /// The table key as written (`shift+cmd+u`), escaped and capped at
+        /// 256 bytes.
+        public let key: String
+        /// Its canonical chord (`cmd+shift+u`, as ``Command/chords`` lists
+        /// it), or `nil` when the key does not parse.
+        public let chord: String?
+        public let value: Value
+        public let effect: Effect
+        /// Why it was left out, or the caveat it is honoured with.
+        public let warning: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case index, key, chord, value, effect, warning
+        }
+
+        private enum ValueKeys: String, CodingKey {
+            case sendText = "send_text"
+        }
+
+        public init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            index = try container.decode(Int.self, forKey: .index)
+            key = try container.decode(String.self, forKey: .key)
+            chord = try container.decodeIfPresent(String.self, forKey: .chord)
+            if try container.decodeNil(forKey: .value) {
+                value = .notAString
+            } else if let text = try? container.decode(String.self, forKey: .value) {
+                value = .text(text)
+            } else {
+                let object = try container.nestedContainer(keyedBy: ValueKeys.self, forKey: .value)
+                value = .sendText(try object.decode(String.self, forKey: .sendText))
+            }
+            // An effect a newer core adds reads as refused: it binds nothing
+            // the pane knows of.
+            effect = Effect(rawValue: try container.decode(String.self, forKey: .effect)) ?? .refused
+            warning = try container.decodeIfPresent(String.self, forKey: .warning)
+        }
+    }
+
     /// The configurations the core applied before this map (0 for the one
     /// it started with).
     public let generation: UInt64
     /// Every command, in id order.
     public let commands: [Command]
+    /// The first 512 `[keys]` entries in file order, refused ones included,
+    /// read with the chords (one generation).
+    public let entries: [Entry]
     /// Why `[keys]` entries were left out or honoured with a caveat (escaped
-    /// and bounded by the core); it has logged them already.
+    /// and bounded by the core), and last the one for the entries past the
+    /// first 512, if any; it has logged them already.
     public let warnings: [String]
 
     /// The command `[keys]` calls `command` (`new_tab`, `select_tab:3`).

@@ -270,8 +270,9 @@ final class KeysPaneTests: XCTestCase {
         // as the key map writes it.
         keys.startRecording("find")
         XCTAssertTrue(monitor.send(try Self.key(33, "[", [.command, .shift], in: window)))
+        // It is shown as its menu item shows it (#356 M3).
         XCTAssertEqual(keys.conflict?.chord, "cmd+shift+[")
-        XCTAssertEqual(keys.conflict?.text, "⇧⌘[ is the shortcut of “Show Previous Tab”.")
+        XCTAssertEqual(keys.conflict?.text, "⌘{ is the shortcut of “Show Previous Tab”.")
         keys.cancelConflict()
 
         // ⌘U is New Tab's by an entry: Replace writes over that entry.
@@ -378,24 +379,392 @@ final class KeysPaneTests: XCTestCase {
         XCTAssertFalse(keys.hasCustomShortcuts)
     }
 
+    /// Restore Defaults over 200 entries is 200 writes, which the watch
+    /// applies as they land: the pane stays locked until the key map shows
+    /// the last (#356 m3), read on every apply and polled in between.
+    func testRestoreDefaultsOverManyEntriesStaysLockedUntilTheLastIsApplied() async throws {
+        var lines = ["[keys]"]
+        let modifiers = ["cmd+ctrl", "cmd+ctrl+alt", "cmd+ctrl+shift", "cmd+ctrl+alt+shift"]
+        let letters = "abcdefghijklmnopqrstuvwxyz".map(String.init)
+        let keys = modifiers.flatMap { mods in letters.map { "\(mods)+\($0)" } }
+            + modifiers.flatMap { mods in (1...24).map { "\(mods)+f\($0)" } }
+        XCTAssertEqual(keys.count, 200)
+        for (index, key) in keys.enumerated() {
+            lines.append("\"\(key)\" = \"\(index.isMultiple(of: 2) ? "find" : "unbound")\"")
+        }
+        let controller = try openKeys(config: lines.joined(separator: "\n") + "\n", monitor: FakeKeyMonitor())
+        let model = controller.model
+        let pane = model.keys
+        // Only the key map showing the run may unlock it.
+        pane.settleTimeout = .seconds(300)
+        XCTAssertEqual(model.keymap?.entries.count, 200)
+        XCTAssertTrue(pane.hasCustomShortcuts)
+
+        @MainActor final class Counts {
+            var applies = 0
+            var midRun = 0
+            var unlockedEarly = 0
+        }
+        let counts = Counts()
+        let router = appDelegate.router
+        let reload = router.onConfigurationApplied
+        defer { router.onConfigurationApplied = reload }
+        router.onConfigurationApplied = { [weak model, weak pane] in
+            reload?()
+            MainActor.assumeIsolated {
+                counts.applies += 1
+                guard let model, let pane, model.keymap?.entries.isEmpty == false else { return }
+                counts.midRun += 1
+                if !pane.isChanging { counts.unlockedEarly += 1 }
+            }
+        }
+        pane.restoreDefaults()
+        XCTAssertTrue(pane.isChanging)
+        var polledEarly = 0
+        let deadline = ContinuousClock.now + .seconds(120)
+        while model.keymap?.entries.isEmpty != true || pane.isChanging {
+            if model.keymap?.entries.isEmpty == false, !pane.isChanging { polledEarly += 1 }
+            guard ContinuousClock.now < deadline else { return XCTFail("not restored: \(counts.applies) applies") }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        XCTAssertEqual(counts.unlockedEarly, 0, "unlocked on an apply before the last")
+        XCTAssertEqual(polledEarly, 0, "unlocked between applies")
+        XCTAssertFalse(pane.hasCustomShortcuts)
+        XCTAssertEqual(Self.chords("find", controller), ["cmd+f"])
+        // An apply mid-run needs the writes to outlast the watch's 1 s
+        // max_wait, which a fast host may not: then this run proves nothing
+        // about one, and the stand-in test of a key map showing part of a
+        // run (`testAnEditWaitsForAKeyMapShowingIt…`) covers it.
+        if counts.midRun == 0 {
+            throw XCTSkip("the 200 writes were applied at once; no apply came before the last")
+        }
+    }
+
+    // MARK: Entries as written (core, #355)
+
+    /// Entries written in another spelling of their chord are found by the
+    /// chord the core reads them as: each shows on its command's row, a
+    /// conflict with one says what it does, and Replace or a new shortcut
+    /// changes the entry under its own key, never adding a second one.
+    func testHandWrittenEntriesAreFoundByTheirCanonicalChord() async throws {
+        let config = """
+            [keys]
+            "shift+cmd+u" = "copy"
+            "opt+cmd+j" = "none"
+            "d+cmd" = "find"
+            "cmd+d" = "no_such_command"
+            "super+d" = "select_all"
+            "command+d" = "paste"
+            "shift+cmd+k" = "send_text:hi"
+
+            """
+        let controller = try openKeys(config: config, monitor: FakeKeyMonitor())
+        let keys = controller.model.keys
+        func row(_ command: String) -> KeysModel.Row? {
+            keys.groups(matching: "").flatMap(\.rows).first { $0.command == command }
+        }
+        XCTAssertEqual(row("copy")?.chords, ["cmd+shift+u", "cmd+c"])
+        XCTAssertEqual(row("copy")?.display, "⇧⌘U, ⌘C")
+        XCTAssertEqual(row("select_all")?.chords, ["cmd+d", "cmd+a"], "the spelling that took effect")
+        XCTAssertEqual(controller.model.keymap?.entries[3].effect, .refused, "an unknown command claims no chord")
+        XCTAssertEqual(row("split_right")?.chords, [])
+        XCTAssertEqual(row("paste")?.chords, ["cmd+v"], "a shadowed entry binds nothing")
+        XCTAssertEqual(row("find")?.chords, ["cmd+f"], "nor does a refused one")
+
+        // `none` and a text, each in another spelling, are conflicts.
+        keys.record("cmd+alt+j", for: "find")
+        XCTAssertEqual(keys.conflict?.text, "⌥⌘J is turned off in config.toml.")
+        keys.cancelConflict()
+        keys.record("cmd+shift+k", for: "find")
+        XCTAssertEqual(keys.conflict?.text, "⇧⌘K is set to send text in config.toml.")
+        keys.cancelConflict()
+        keys.record("cmd+d", for: "find")
+        XCTAssertEqual(keys.conflict?.text, "⌘D is the shortcut of “Select All”.")
+        keys.cancelConflict()
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(try file(), config, "a cancelled conflict writes nothing")
+
+        // Replace on ⌘D changes the spelling that took it, not the first.
+        keys.record("cmd+d", for: "find")
+        keys.replace()
+        try await waitUntil("replaced") { Self.chords("find", controller) == ["cmd+d"] && !keys.isChanging }
+        var text = try file()
+        XCTAssertTrue(text.contains("\"super+d\" = \"find\""), text)
+        XCTAssertTrue(text.contains("\"cmd+d\" = \"no_such_command\""), text)
+        XCTAssertTrue(text.contains("\"cmd+f\" = \"unbound\""), text)
+        XCTAssertEqual(Self.chords("select_all", controller), ["cmd+a"])
+
+        // Replace on `shift+cmd+u` changes that entry: one for the chord.
+        keys.record("cmd+shift+u", for: "paste")
+        XCTAssertEqual(keys.conflict?.text, "⇧⌘U is the shortcut of “Copy”.")
+        keys.replace()
+        try await waitUntil("replaced") {
+            Self.chords("paste", controller) == ["cmd+shift+u"] && !keys.isChanging
+        }
+        text = try file()
+        XCTAssertTrue(text.contains("\"shift+cmd+u\" = \"paste\""), text)
+        XCTAssertFalse(text.contains("\"cmd+shift+u\""), "a second entry for the chord: \(text)")
+        XCTAssertFalse(text.contains("\"command+d\""), "Paste's shadowed entry goes: \(text)")
+        XCTAssertTrue(text.contains("\"cmd+v\" = \"unbound\""), text)
+        XCTAssertEqual(Self.chords("copy", controller), ["cmd+c"])
+
+        // Recording again takes Paste off `shift+cmd+u`, and clearing Find
+        // takes it off `super+d`, which Split Right gets back.
+        keys.record("cmd+shift+o", for: "paste")
+        try await waitUntil("recorded") { Self.chords("paste", controller) == ["cmd+shift+o"] && !keys.isChanging }
+        keys.clear("find")
+        try await waitUntil("cleared") { Self.chords("find", controller) == [] && !keys.isChanging }
+        XCTAssertEqual(Self.chords("split_right", controller), ["cmd+d"])
+        text = try file()
+        XCTAssertFalse(text.contains("shift+cmd+u"), text)
+        XCTAssertFalse(text.contains("super+d"), text)
+        for kept in [
+            "\"opt+cmd+j\" = \"none\"", "\"shift+cmd+k\" = \"send_text:hi\"", "\"d+cmd\" = \"find\"",
+            "\"cmd+d\" = \"no_such_command\"",
+        ] {
+            XCTAssertTrue(text.contains(kept), "\(kept) kept: \(text)")
+        }
+    }
+
+    /// A hand-written `unbound` entry in another spelling holds its chord:
+    /// recording the chord changes that entry, never adds one the core
+    /// would refuse as a second for the chord.
+    func testAnUnboundEntryInAnotherSpellingIsTheOneRecordingChanges() async throws {
+        let config = "[keys]\n\"command+t\" = \"unbound\"\n"
+        let controller = try openKeys(config: config, monitor: FakeKeyMonitor())
+        let keys = controller.model.keys
+        XCTAssertEqual(Self.chords("new_tab", controller), [])
+        keys.record("cmd+t", for: "find")
+        XCTAssertNil(keys.conflict, "an unbound chord is free")
+        try await waitUntil("recorded") { Self.chords("find", controller) == ["cmd+t"] && !keys.isChanging }
+        let text = try file()
+        XCTAssertTrue(text.contains("\"command+t\" = \"find\""), text)
+        XCTAssertFalse(text.contains("\"cmd+t\""), "a second entry for the chord: \(text)")
+        XCTAssertNil(keys.message("find"))
+    }
+
+    /// Clearing a command removes every entry of its own, the shadowed
+    /// spelling of a chord too, which would bind it again once the first
+    /// goes.
+    func testClearRemovesTheShadowedSpellingToo() async throws {
+        let config = "[keys]\n\"super+u\" = \"new_tab\"\n\"cmd+u\" = \"new_tab\"\n"
+        let controller = try openKeys(config: config, monitor: FakeKeyMonitor())
+        let keys = controller.model.keys
+        XCTAssertEqual(controller.model.keymap?.entries.map(\.effect), [.bound, .shadowed])
+        XCTAssertEqual(Self.chords("new_tab", controller), ["cmd+u", "cmd+t"])
+        keys.clear("new_tab")
+        try await waitUntil("cleared") { Self.chords("new_tab", controller) == [] && !keys.isChanging }
+        // Past one more apply, should one come.
+        try await Task.sleep(for: .milliseconds(1500))
+        XCTAssertEqual(Self.chords("new_tab", controller), [])
+        let text = try file()
+        XCTAssertFalse(text.contains("+u\""), text)
+        XCTAssertTrue(text.contains("\"cmd+t\" = \"unbound\""), text)
+    }
+
+    /// A conflict shown before a hand edit says what the chord does now
+    /// when Replace is pressed, and writes nothing until it is pressed
+    /// again (#356 M2).
+    func testReplaceAfterAHandEditSaysWhatTheChordDoesNowAndWritesOnTheSecond() async throws {
+        let controller = try openKeys(config: "", monitor: FakeKeyMonitor())
+        let keys = controller.model.keys
+        keys.record("cmd+e", for: "find")
+        let first = try XCTUnwrap(keys.conflict?.text)
+        XCTAssertTrue(first.hasPrefix("⌘E is the shortcut of “"), first)
+
+        let edited = "[keys]\n\"super+e\" = \"send_text:hi\"\n"
+        try edited.write(to: try XCTUnwrap(dir).appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)
+        try await waitUntil("the hand edit applied") {
+            controller.model.keymap?.entries.first?.value == .sendText("hi")
+                && controller.model.keymap?.generation == controller.model.snapshot.generation
+        }
+        keys.replace()
+        XCTAssertEqual(keys.conflict?.text, "⌘E is set to send text in config.toml.")
+        XCTAssertFalse(keys.isChanging, "nothing queued")
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(try file(), edited)
+
+        keys.replace()
+        XCTAssertNil(keys.conflict)
+        try await waitUntil("replaced") { Self.chords("find", controller) == ["cmd+e"] && !keys.isChanging }
+        let text = try file()
+        XCTAssertTrue(text.contains("\"super+e\" = \"find\""), text)
+    }
+
+    /// The key map's problems (entries left out, and the overflow) and the
+    /// caveats bound entries are honoured with, as the core reports them.
+    func testProblemsAndCaveatsAreListedApart() async throws {
+        var lines = ["[keys]", "\"cmd+h\" = \"find\"", "\"d+cmd\" = \"copy\""]
+        let modifiers = ["", "cmd+", "ctrl+", "alt+", "shift+", "cmd+ctrl+", "cmd+alt+", "cmd+shift+", "ctrl+alt+",
+            "ctrl+shift+", "alt+shift+", "cmd+ctrl+alt+", "cmd+ctrl+shift+", "cmd+alt+shift+", "ctrl+alt+shift+"]
+        let fkeys = modifiers.flatMap { mods in (1...35).map { "\(mods)f\($0)" } }.prefix(515)
+        XCTAssertEqual(fkeys.count, 515)
+        lines += fkeys.map { "\"\($0)\" = \"unbound\"" }
+        let controller = try openKeys(config: lines.joined(separator: "\n") + "\n", monitor: FakeKeyMonitor())
+        let keys = controller.model.keys
+        XCTAssertEqual(controller.model.keymap?.entries.count, 512)
+        XCTAssertEqual(keys.caveats.count, 1, "\(keys.caveats)")
+        XCTAssertTrue(keys.caveats.first?.contains("hide") ?? false, "\(keys.caveats)")
+        XCTAssertEqual(keys.problems.count, 2, "\(keys.problems)")
+        XCTAssertTrue(keys.problems.first?.contains("d+cmd") ?? false, "\(keys.problems)")
+        XCTAssertTrue(keys.problems.last?.contains("512") ?? false, "the overflow last: \(keys.problems)")
+    }
+
+    // MARK: Menus (core, #356 M3)
+
+    /// Every shortcut shows as its menu item shows it: a US shifted symbol
+    /// as the symbol without Shift (⌘? for `cmd+shift+/`), from the core's
+    /// key equivalents.
+    func testShortcutsShowAsTheirMenuItemsShowThem() throws {
+        let controller = try openKeys(config: "", monitor: FakeKeyMonitor())
+        let keys = controller.model.keys
+        let rows = keys.groups(matching: "").flatMap(\.rows)
+        var compared = 0
+        for row in rows {
+            guard let item = MainMenu.item(forCommand: row.command, in: NSApp.mainMenu) else { continue }
+            let (key, modifiers) = authoredKeyEquivalent(of: item)
+            guard key.unicodeScalars.count == 1, let scalar = key.unicodeScalars.first,
+                (0x21..<0x7F).contains(scalar.value)
+            else { continue }
+            let label = zip(row.chords, row.labels).first { KeyChord.goesOnMenu($0.0) }?.1
+            XCTAssertEqual(label, KeyChord.display(flags: modifiers) + key.uppercased(), row.command)
+            compared += 1
+        }
+        XCTAssertGreaterThan(compared, 30)
+        for (command, label) in [("help", "⌘?"), ("font_bigger", "⌘+"), ("tab_previous", "⌘{"), ("tab_next", "⌘}")] {
+            XCTAssertEqual(rows.first { $0.command == command }?.labels.first, label, command)
+        }
+        XCTAssertEqual(rows.first { $0.command == "font_bigger" }?.display, "⌘+, ⌘=")
+        XCTAssertEqual(keys.groups(matching: "⌘?").flatMap(\.rows).map(\.command), ["help"])
+        keys.record("cmd+shift+/", for: "find")
+        XCTAssertTrue(keys.conflict?.text.hasPrefix("⌘? is the shortcut of “") ?? false, "\(String(describing: keys.conflict))")
+        XCTAssertEqual(keys.label(of: "cmd+shift+["), "⌘{")
+    }
+
+    // MARK: Focus (core, #356 m5)
+
+    /// The first editable text field in `view`'s tree.
+    private static func textField(in view: NSView) -> NSTextField? {
+        if let field = view as? NSTextField, field.isEditable { return field }
+        return view.subviews.lazy.compactMap { textField(in: $0) }.first
+    }
+
+    func testTheSearchFieldTakingTheFocusEndsARecording() async throws {
+        let monitor = FakeKeyMonitor()
+        let controller = try openKeys(config: "", monitor: monitor)
+        let keys = controller.model.keys
+        let window = try XCTUnwrap(controller.window)
+        var field: NSTextField?
+        try await waitUntil("the search field") {
+            window.contentView?.layoutSubtreeIfNeeded()
+            field = window.contentView.flatMap(Self.textField)
+            return field != nil
+        }
+        let search = try XCTUnwrap(field)
+
+        keys.startRecording("find")
+        XCTAssertEqual(keys.recording, "find")
+        XCTAssertTrue(window.makeFirstResponder(search))
+        XCTAssertTrue(window.firstResponder is NSText, "the field editor has the focus")
+        XCTAssertNil(keys.recording, "the field took the focus")
+        XCTAssertEqual(monitor.live, 0)
+        XCTAssertEqual(keys.registrationCount, 0)
+        XCTAssertFalse(monitor.send(try Self.key(14, "e", [.command, .shift], in: window)), "keys go to the field")
+
+        // Started while the field has the focus, a recording takes it, so
+        // clicking into the field again ends it.
+        keys.startRecording("find")
+        XCTAssertEqual(keys.recording, "find")
+        XCTAssertFalse(window.firstResponder is NSText)
+        XCTAssertTrue(window.makeFirstResponder(search))
+        XCTAssertNil(keys.recording)
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(try file(), "")
+    }
+
+    // MARK: VoiceOver (#356 m6)
+
+    func testConflictsAndRefusalsAreAnnouncedOnceEach() async throws {
+        let monitor = FakeKeyMonitor()
+        let controller = try openKeys(config: "", monitor: monitor)
+        let keys = controller.model.keys
+        let poster = PostRecorder(clock: { 0 })
+        keys.poster = poster
+        let window = try XCTUnwrap(controller.window)
+        func announcements() -> [String] {
+            poster.posts.filter { $0.notification == .announcementRequested }
+                .compactMap { $0.userInfo?[.announcement] as? String }
+        }
+
+        // ⌘Q is Quit's: the conflict is said.
+        keys.startRecording("find")
+        XCTAssertTrue(monitor.send(try Self.key(12, "q", [.command], in: window)))
+        let conflict = try XCTUnwrap(keys.conflict?.text)
+        XCTAssertEqual(announcements(), [conflict])
+        let post = try XCTUnwrap(poster.posts.first)
+        XCTAssertTrue(post.element === NSApp)
+        XCTAssertEqual(post.userInfo?[.priority] as? Int, NSAccessibilityPriorityLevel.high.rawValue)
+
+        // Replace: the core refuses to shadow Quit, and the refusal is said.
+        keys.replace()
+        try await waitUntil("refused") { keys.message("find") != nil && !keys.isChanging }
+        XCTAssertEqual(announcements(), [conflict, try XCTUnwrap(keys.message("find"))])
+
+        // A flood of keys no shortcut can hold: said once.
+        keys.startRecording("find")
+        for _ in 0..<1_000 {
+            XCTAssertTrue(monitor.send(try Self.key(200, "", [.command], in: window)))
+        }
+        XCTAssertEqual(keys.message("find"), "This key cannot be part of a shortcut.")
+        XCTAssertEqual(announcements().count, 3, "\(announcements())")
+        XCTAssertEqual(announcements().last, "This key cannot be part of a shortcut.")
+        keys.stopRecording()
+    }
+
     // MARK: Edits (stand-ins)
 
-    /// A key map of four commands, and `[keys]` as `entries`.
+    /// A key map of four commands, and `[keys]` as `entries` (in order,
+    /// each key its own chord, bound or `unbound`).
     private func fakeKeys(
-        entries: [String: String] = [:], warnings: [String] = [], newTabChords: [String] = ["cmd+t"],
+        entries: KeyValuePairs<String, String> = [:], warnings: [String] = [], newTabChords: [String] = ["cmd+t"],
         generation: UInt64 = 0, writer: FakeWriter = FakeWriter()
     ) throws -> (SettingsModel, FakeSource, FakeWriter) {
         let source = FakeSource(writer: writer)
-        source.snapshot = TesseraConfigSnapshot(
-            generation: generation, config: .table(["keys": .table(entries.mapValues { .string($0) })]))
-        source.keymapResult = try Self.keymap(generation: generation, newTabChords: newTabChords, warnings: warnings)
+        source.snapshot = Self.snapshot(generation: generation, entries)
+        source.keymapResult = try Self.keymap(
+            generation: generation, newTabChords: newTabChords, warnings: warnings, entries: Self.entries(entries))
         sources.append(source)
         return (SettingsModel(source: source), source, writer)
     }
 
+    /// The configuration with `[keys]` as `entries`.
+    private static func snapshot(generation: UInt64, _ entries: KeyValuePairs<String, String>) -> TesseraConfigSnapshot {
+        var table: [String: TesseraConfigValue] = [:]
+        for (key, value) in entries { table[key] = .string(value) }
+        return TesseraConfigSnapshot(generation: generation, config: .table(["keys": .table(table)]))
+    }
+
+    /// The key map's entries for `entries`: each key its own chord, bound
+    /// or `unbound`.
+    private static func entries(_ entries: KeyValuePairs<String, String>) -> [[String: Any]] {
+        entries.enumerated().map { index, entry in
+            Self.entry(index, entry.key, chord: entry.key, value: entry.value, effect: entry.value == "unbound" ? "unbound" : "bound")
+        }
+    }
+
+    /// One `[keys]` entry as the core's key map reports it.
+    private static func entry(
+        _ index: Int, _ key: String, chord: String?, value: Any, effect: String, warning: String? = nil
+    ) -> [String: Any] {
+        [
+            "index": index, "key": key, "chord": chord ?? NSNull(), "value": value, "effect": effect,
+            "warning": warning ?? NSNull(),
+        ]
+    }
+
     private static func keymap(
         generation: UInt64, newTabChords: [String] = ["cmd+t"], fontChords: [String] = ["cmd+shift+=", "cmd+="],
-        warnings: [String] = []
+        warnings: [String] = [], entries: [[String: Any]] = []
     ) throws -> TesseraKeymap {
         func command(_ id: Int, _ name: String, _ owner: String, _ chords: [String]) -> [String: Any] {
             ["id": id, "command": name, "name": name, "owner": owner, "chords": chords, "menu": [[String: Any]]()]
@@ -406,6 +775,7 @@ final class KeysPaneTests: XCTestCase {
                 command(0, "new_tab", "app", newTabChords), command(1, "find", "app", ["cmd+f"]),
                 command(2, "font_bigger", "app", fontChords), command(3, "copy_mode", "planned", ["cmd+shift+c"]),
             ],
+            "entries": entries,
             "warnings": warnings,
         ]
         return try JSONDecoder().decode(TesseraKeymap.self, from: JSONSerialization.data(withJSONObject: object))
@@ -424,19 +794,25 @@ final class KeysPaneTests: XCTestCase {
         let writer = FakeWriter()
         let (model, _, _) = try fakeKeys(
             entries: ["cmd+u": "font_bigger", "shift+cmd+o": "font_bigger"], writer: writer)
-        // Two entries, then the defaults no entry took.
+        // Two entries, then the defaults no entry took; the second written
+        // as no canonical chord is.
         try sources[0].keymapResult = Self.keymap(
-            generation: 0, fontChords: ["cmd+u", "cmd+shift+o", "cmd+shift+=", "cmd+="])
+            generation: 0, fontChords: ["cmd+u", "cmd+shift+o", "cmd+shift+=", "cmd+="],
+            entries: [
+                Self.entry(0, "cmd+u", chord: "cmd+u", value: "font_bigger", effect: "bound"),
+                Self.entry(1, "shift+cmd+o", chord: "cmd+shift+o", value: "font_bigger", effect: "bound"),
+            ])
         model.reload()
         let keys = model.keys
         keys.record("cmd+shift+e", for: "font_bigger")
         try await waitUntil("written") { writer.calls.count == 5 }
+        // The entries go under their own keys, the last first.
         XCTAssertEqual(
             writer.calls,
             [
                 .init(key: "keys.\"cmd+shift+e\"", value: .string("font_bigger")),
-                .init(key: "keys.\"cmd+u\"", value: nil),
                 .init(key: "keys.\"shift+cmd+o\"", value: nil),
+                .init(key: "keys.\"cmd+u\"", value: nil),
                 .init(key: "keys.\"cmd+shift+=\"", value: .string("unbound")),
                 .init(key: "keys.\"cmd+=\"", value: .string("unbound")),
             ])
@@ -454,16 +830,17 @@ final class KeysPaneTests: XCTestCase {
         XCTAssertFalse(other.keys.isChanging, "a failure ends the edit at once")
     }
 
-    func testAnEditWaitsForAKeyMapAppliedAfterItAndNothingIsEditedFromATornRead() async throws {
+    func testAnEditWaitsForAKeyMapShowingItAndNothingIsEditedFromATornRead() async throws {
         let writer = FakeWriter()
         let (model, source, _) = try fakeKeys(writer: writer)
         let keys = model.keys
+        keys.settleTimeout = .seconds(60)
         let monitor = FakeKeyMonitor()
         keys.monitoring = monitor
         keys.window = testWindow()
         keys.record("cmd+shift+e", for: "find")
         try await waitUntil("written") { writer.calls.count == 2 }
-        XCTAssertTrue(keys.isChanging, "until a later key map applies")
+        XCTAssertTrue(keys.isChanging, "until a key map shows it")
         XCTAssertEqual(keys.groups(matching: "").flatMap(\.rows).first { $0.command == "find" }?.chords, ["cmd+shift+e"])
         keys.startRecording("new_tab")
         XCTAssertNil(keys.recording, "nothing is recorded meanwhile")
@@ -472,24 +849,154 @@ final class KeysPaneTests: XCTestCase {
         keys.clear("new_tab")
         model.reload()
         XCTAssertTrue(keys.isChanging, "the same generation again")
+        // A later key map that shows only part of the run (the set, not the
+        // unbinding) is an apply in between (#356 m3).
+        let set = Self.entry(0, "cmd+shift+e", chord: "cmd+shift+e", value: "find", effect: "bound")
+        source.snapshot = Self.snapshot(generation: 1, ["cmd+shift+e": "find"])
+        source.keymapResult = try Self.keymap(generation: 1, entries: [set])
+        model.reload()
+        XCTAssertTrue(keys.isChanging, "an apply in between")
         XCTAssertEqual(writer.calls.count, 2)
 
         // The configuration was read at a generation the key map is not
         // (#348), every time: nothing is edited.
-        source.snapshot = TesseraConfigSnapshot(
-            generation: 2, config: .table(["keys": .table(["cmd+shift+e": .string("find")])]))
-        source.keymapResult = try Self.keymap(generation: 1)
+        source.snapshot = Self.snapshot(generation: 3, ["cmd+shift+e": "find", "cmd+f": "unbound"])
+        source.keymapResult = try Self.keymap(
+            generation: 2,
+            entries: [set, Self.entry(1, "cmd+f", chord: "cmd+f", value: "unbound", effect: "unbound")])
         model.reload()
-        XCTAssertFalse(keys.isChanging)
+        XCTAssertFalse(keys.isChanging, "the key map shows every key written")
         keys.record("cmd+shift+y", for: "new_tab")
         XCTAssertEqual(keys.message("new_tab"), "config.toml is being applied; try again.")
         XCTAssertEqual(writer.calls.count, 2)
     }
 
+    /// A write that met another edit of the file and was run again: that
+    /// edit's apply may have come first, and the pane reads the file again
+    /// instead of waiting for an apply that is over (#356 m4).
+    func testARetriedEditWhoseApplyCameFirstEndsUnlocked() async throws {
+        let writer = FakeWriter()
+        let (model, source, _) = try fakeKeys(writer: writer)
+        let keys = model.keys
+        keys.settleTimeout = .seconds(60)
+        writer.respond = { _, attempt in
+            attempt == 1 ? TesseraConfigEditError(.conflict, message: "config.toml changed") : nil
+        }
+        // What the run leaves, already applied when the retry lands.
+        let shown: KeyValuePairs<String, String> = ["cmd+shift+e": "find", "cmd+f": "unbound"]
+        source.snapshot = Self.snapshot(generation: 1, shown)
+        source.keymapResult = try Self.keymap(generation: 1, entries: Self.entries(shown))
+        keys.record("cmd+shift+e", for: "find")
+        XCTAssertTrue(keys.isChanging)
+        try await waitUntil("unlocked") { !keys.isChanging }
+        XCTAssertEqual(writer.calls.count, 4, "each edit run twice")
+        XCTAssertEqual(model.snapshot.generation, 1)
+        XCTAssertNil(keys.message("find"))
+    }
+
+    /// A write the key map never shows (the watch saw no change, or
+    /// another edit undid it) ends after ``KeysModel/settleTimeout`` with
+    /// the file read again (#356 m4).
+    func testAnEditTheKeyMapNeverShowsEndsAfterTheTimeoutWithTheFileReadAgain() async throws {
+        let writer = FakeWriter()
+        let (model, source, _) = try fakeKeys(writer: writer)
+        let keys = model.keys
+        keys.settleTimeout = .seconds(1)
+        let start = ContinuousClock.now
+        keys.record("cmd+shift+e", for: "find")
+        try await waitUntil("written") { writer.calls.count == 2 }
+        XCTAssertTrue(keys.isChanging)
+        // A hand edit, applied, that is not the run.
+        source.snapshot = Self.snapshot(generation: 1, ["cmd+shift+y": "find"])
+        source.keymapResult = try Self.keymap(generation: 1, entries: Self.entries(["cmd+shift+y": "find"]))
+        try await waitUntil("released") { !keys.isChanging }
+        let elapsed = ContinuousClock.now - start
+        XCTAssertGreaterThanOrEqual(elapsed, .seconds(1), "released before the timeout")
+        XCTAssertLessThan(elapsed, .seconds(6))
+        XCTAssertEqual(model.snapshot.generation, 1, "the file read again")
+        // And the pane edits on.
+        keys.record("cmd+shift+u", for: "new_tab")
+        try await waitUntil("written again") { writer.calls.count == 4 }
+    }
+
+    /// The timeout of a run the key map showed does not end a later run.
+    func testAnEarlierRunsTimeoutLeavesTheNextLocked() async throws {
+        let writer = FakeWriter()
+        let (model, source, _) = try fakeKeys(writer: writer)
+        let keys = model.keys
+        keys.settleTimeout = .seconds(1)
+        keys.record("cmd+shift+e", for: "find")
+        try await waitUntil("written") { writer.calls.count == 2 }
+        let first = ContinuousClock.now
+        let shown: KeyValuePairs<String, String> = ["cmd+shift+e": "find", "cmd+f": "unbound"]
+        source.snapshot = Self.snapshot(generation: 1, shown)
+        source.keymapResult = try Self.keymap(generation: 1, entries: Self.entries(shown))
+        model.reload()
+        try await waitUntil("shown") { !keys.isChanging }
+        // The next run waits for its key map alone.
+        keys.settleTimeout = .seconds(60)
+        keys.record("cmd+shift+u", for: "new_tab")
+        try await waitUntil("written again") { writer.calls.count == 4 }
+        // Past the first run's timeout, by a margin.
+        try await Task.sleep(until: first + .seconds(2.5))
+        XCTAssertTrue(keys.isChanging, "the first run's timeout ended the second")
+    }
+
+    /// An entry whose key, as the key map reports it (escaped, capped), is
+    /// not one of `[keys]` as written is never edited: nothing is written
+    /// under a key the file does not have.
+    func testAnEntryNotNamedAsWrittenIsNotEdited() throws {
+        let writer = FakeWriter()
+        let (model, source, _) = try fakeKeys(
+            entries: ["cmd+u": "new_tab"], newTabChords: ["cmd+u", "cmd+t"], writer: writer)
+        source.snapshot = Self.snapshot(generation: 0, ["cmd+u\u{202E}": "new_tab"])
+        model.reload()
+        let keys = model.keys
+        keys.record("cmd+shift+e", for: "new_tab")
+        XCTAssertEqual(
+            keys.message("new_tab"), "An entry this changes is written in config.toml in a way Settings cannot edit.")
+        XCTAssertFalse(keys.isChanging)
+        XCTAssertFalse(keys.hasCustomShortcuts, "nor does Restore Defaults remove it")
+        XCTAssertEqual(writer.calls, [])
+    }
+
+    /// Past ``KeysModel/maxWarnings`` a list says how many more; the
+    /// problems keep their last (the overflow line), and a notation the
+    /// loader refused, which only its entry carries, is a problem.
+    func testTheWarningListsAreBounded() throws {
+        let letters = "abcdefghijklmnopqrstuvwxy".map(String.init)
+        XCTAssertEqual(letters.count, 25)
+        var entries = letters.enumerated().map { index, letter in
+            Self.entry(
+                index, "cmd+ctrl+\(letter)", chord: "cmd+ctrl+\(letter)", value: "find", effect: "bound",
+                warning: "caveat \(index); honoured")
+        }
+        entries.append(Self.entry(25, "d+cmd", chord: nil, value: "find", effect: "refused", warning: "refused d+cmd"))
+        let problems = (0..<40).map { "problem \($0)" }
+        let (model, _, _) = try fakeKeys()
+        try sources[0].keymapResult = Self.keymap(
+            generation: 0, warnings: zip(letters.indices, problems).flatMap { ["caveat \($0); honoured", $1] }
+                + problems.dropFirst(25),
+            entries: entries)
+        model.reload()
+        let keys = model.keys
+        XCTAssertEqual(keys.problems.count, KeysModel.maxWarnings + 1)
+        XCTAssertEqual(keys.problems.first, "refused d+cmd")
+        XCTAssertEqual(keys.problems[1], "problem 0")
+        XCTAssertEqual(keys.problems[KeysModel.maxWarnings - 1], "And 21 more; see config.toml.")
+        XCTAssertEqual(keys.problems.last, "problem 39")
+        XCTAssertEqual(keys.caveats.count, KeysModel.maxWarnings + 1)
+        XCTAssertEqual(keys.caveats.first, "caveat 0; honoured")
+        XCTAssertEqual(keys.caveats.last, "And 5 more; see config.toml.")
+        XCTAssertFalse(keys.problems.contains { $0.contains("caveat") }, "\(keys.problems)")
+    }
+
     func testEscapeCancelsDeleteClearsAndOtherWindowsKeysPass() async throws {
         let writer = FakeWriter()
         let (model, _, _) = try fakeKeys(entries: ["cmd+u": "font_bigger"], writer: writer)
-        try sources[0].keymapResult = Self.keymap(generation: 0, fontChords: ["cmd+u", "cmd+shift+=", "cmd+="])
+        try sources[0].keymapResult = Self.keymap(
+            generation: 0, fontChords: ["cmd+u", "cmd+shift+=", "cmd+="],
+            entries: Self.entries(["cmd+u": "font_bigger"]))
         model.reload()
         let keys = model.keys
         let monitor = FakeKeyMonitor()
@@ -540,7 +1047,7 @@ final class KeysPaneTests: XCTestCase {
         for index in 0..<10_000 {
             _ = monitor.send(try Self.flags(index.isMultiple(of: 2) ? [.command] : [.command, .shift], in: window))
         }
-        XCTAssertEqual(keys.registrationCount, 2, "one monitor and one observer set")
+        XCTAssertEqual(keys.registrationCount, 3, "one monitor, one observer set and the focus observation")
         XCTAssertEqual(keys.recording, "find")
         for _ in 0..<10_000 {
             _ = monitor.send(try Self.key(14, "e", [.command, .shift], in: window))
@@ -759,9 +1266,9 @@ final class KeysPaneTests: XCTestCase {
         clean(row.display, "a chord")
         clean(row.title, "a title")
         XCTAssertEqual(row.display, "⌘A")
-        XCTAssertEqual(keys.warnings.count, KeysModel.maxWarnings + 1)
-        XCTAssertEqual(keys.warnings.first, "eviltxt.exe line")
-        keys.warnings.forEach { clean($0, "a warning") }
+        XCTAssertEqual(keys.problems.count, KeysModel.maxWarnings + 1)
+        XCTAssertEqual(keys.problems.first, "eviltxt.exe line")
+        keys.problems.forEach { clean($0, "a warning") }
 
         // A conflict names the chord and the command sanitised.
         keys.record("cmd+\u{202E}a\u{200F}", for: "find")

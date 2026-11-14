@@ -241,15 +241,15 @@ pub struct Config {
     /// ignored with a warning (the first entry not ignored for another
     /// reason wins); at most 512 entries are read.
     ///
-    /// The Settings window's Keys pane writes chords in the canonical form
-    /// (`cmd+ctrl+alt+shift+key`). An entry you write by hand in another
-    /// form (modifiers in another order, an alias such as `opt`, a shifted
-    /// symbol such as `cmd+?`) still binds, but the pane does not recognise
-    /// the entry as its chord: such an entry that sends text or is `none`
-    /// is not shown as a conflict, and replacing or recording again a chord
-    /// such an entry holds shows the refusal ("same chord as …") and writes
-    /// nothing. Write such entries canonically, or edit them in `config.toml`
-    /// (#355).
+    /// The Settings window's Keys pane writes a new chord in the canonical
+    /// form (`cmd+ctrl+alt+shift+key`). An entry you write by hand in
+    /// another form (modifiers in another order, an alias such as `opt`, a
+    /// shifted symbol such as `cmd+?`) is found by the chord it binds:
+    /// replacing or recording again changes that entry under its own key,
+    /// so the file keeps one entry per chord, and one that sends text or is
+    /// `none` shows as a conflict. When the file holds the chord in two
+    /// spellings, the pane changes the one that took effect. Restore
+    /// Defaults keeps entries that send text or are `none` (#355).
     pub keys: Keys,
 }
 
