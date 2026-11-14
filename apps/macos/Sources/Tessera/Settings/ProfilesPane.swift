@@ -1,10 +1,10 @@
 import SwiftUI
 
-/// Profiles: the `[[profiles]]` list in file order, with Add, Duplicate and
-/// Delete under it, and the selected profile's name, command, working
-/// directory and appearance. Each appearance key either follows
-/// `[appearance]` (Inherit, the key left out of the profile) or is the
-/// profile's own.
+/// Profiles: the `[[profiles]]` entries, then the profiles of
+/// `profiles/*.toml`, with Add, Duplicate and Delete under it, and the
+/// selected profile's name, command, working directory and appearance. Each
+/// appearance key either follows `[appearance]` (Inherit, the key left out
+/// of the profile) or is the profile's own.
 struct ProfilesPane: View {
     let model: SettingsModel
     @State private var selection: Int?
@@ -47,16 +47,15 @@ struct ProfilesPane: View {
                 .disabled(changing)
                 HStack(spacing: 4) {
                     Button {
-                        if let index = model.addProfile() {
-                            selection = index
-                        }
+                        // Selected once written, where the core put it.
+                        model.addProfile { selection = $0 }
                     } label: {
                         Image(systemName: "plus").accessibilityLabel("Add Profile")
                     }
                     .disabled(!model.canAddProfile)
                     Button {
-                        if let selection, let copy = model.duplicateProfile(selection) {
-                            self.selection = copy
+                        if let selection {
+                            model.duplicateProfile(selection) { self.selection = $0 }
                         }
                     } label: {
                         Image(systemName: "plus.square.on.square").accessibilityLabel("Duplicate Profile")

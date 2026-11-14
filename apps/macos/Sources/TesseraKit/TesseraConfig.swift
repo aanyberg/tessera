@@ -104,7 +104,7 @@ public enum TesseraConfigValue: Sendable, Hashable {
 
     /// `string` as a JSON string: quotes, backslashes and C0 controls
     /// escaped, everything else as is.
-    private static func quoted(_ string: String) -> String {
+    static func quoted(_ string: String) -> String {
         var text = "\""
         for scalar in string.unicodeScalars {
             switch scalar {
@@ -210,6 +210,24 @@ public struct TesseraTheme: Sendable, Hashable, Decodable {
     }
 }
 
+/// The profile ``TesseraConfigWriter/addProfile(named:keys:)`` added: where
+/// the configuration lists it and the name the core gave it.
+public struct TesseraAddedProfile: Sendable, Equatable {
+    /// Its index in `profiles`, also its key path index
+    /// (`profiles[N].command`), once the watch has applied the file: after
+    /// the `[[profiles]]` entries, before the profiles of `profiles/`, which
+    /// move up one.
+    public var index: Int
+    /// The base name, or the base name numbered (`New Profile 2`) when a
+    /// profile has it. Not sanitised (S3): show it as a profile name is.
+    public var name: String
+
+    public init(index: Int, name: String) {
+        self.index = index
+        self.name = name
+    }
+}
+
 /// An edit of `config.toml` or an import the core did not make.
 public struct TesseraConfigEditError: Error, Sendable, Equatable {
     public enum Kind: Sendable, Equatable {
@@ -279,8 +297,10 @@ public final class TesseraConfigWriter: Sendable {
     }
 
     /// Sets the setting at the key path `key` (`appearance.opacity`,
-    /// `profiles[1].appearance.theme`, `profiles[2].name` to add a third
-    /// profile) to `value` and saves the file. Creates the configuration
+    /// `profiles[1].appearance.theme`) to `value` and saves the file; a new
+    /// profile goes through ``addProfile(named:keys:)``, since the profiles
+    /// of `profiles/` come after the entries and refuse edits by key path.
+    /// Creates the configuration
     /// directory and a default `config.toml` first when they are missing.
     ///
     /// - Throws: ``TesseraConfigEditError`` with the core's message; a
@@ -301,6 +321,55 @@ public final class TesseraConfigWriter: Sendable {
     /// - Throws: ``TesseraConfigEditError`` with the core's message.
     public func remove(_ key: String) throws(TesseraConfigEditError) {
         try edit(key: key, json: nil)
+    }
+
+    /// Adds a profile to `config.toml` with `keys` set in it, in one edit
+    /// saved at once (`tessera_config_add_profile`), whatever profiles the
+    /// files in `profiles/` define: a new `[[profiles]]` entry after the
+    /// last one, named the first of `base`, `base 2`, `base 3`… no profile
+    /// has. `keys` are key paths within the profile (`command`,
+    /// `appearance.theme`) with their values, at most
+    /// `TESSERA_MAX_ADDED_PROFILE_KEYS`; one the core refuses refuses the
+    /// profile, and nothing is written.
+    ///
+    /// - Returns: the index and name the core gave the profile.
+    /// - Throws: ``TesseraConfigEditError`` with the core's message, which
+    ///   names the refused key path (`profiles[3].appearance.theme`); a
+    ///   value that has no JSON form as `.invalidArgument` without calling
+    ///   the core.
+    public func addProfile(
+        named base: String, keys: [(key: String, value: TesseraConfigValue)] = []
+    ) throws(TesseraConfigEditError) -> TesseraAddedProfile {
+        var object = "{\"name\":" + TesseraConfigValue.quoted(base)
+        for (key, value) in keys {
+            guard let json = value.json else {
+                throw TesseraConfigEditError(
+                    .invalidArgument, message: "The profile’s \(key) has a value that cannot be written.")
+            }
+            object += "," + TesseraConfigValue.quoted(key) + ":" + json
+        }
+        let profile = Array((object + "}").utf8)
+        var index = 0
+        var name = [UInt8](repeating: 0, count: Int(TESSERA_MAX_PROFILE_NAME_LEN))
+        var nameLength = 0
+        var message = [UInt8](repeating: 0, count: Self.messageCapacity)
+        var messageLength = 0
+        let status = core.call { app in
+            profile.withUnsafeBufferPointer { profile in
+                name.withUnsafeMutableBufferPointer { nameBuffer in
+                    message.withUnsafeMutableBufferPointer { messageBuffer in
+                        tessera_config_add_profile(
+                            app, profile.baseAddress, profile.count, &index, nameBuffer.baseAddress,
+                            nameBuffer.count, &nameLength, messageBuffer.baseAddress, messageBuffer.count,
+                            &messageLength)
+                    }
+                }
+            }
+        }
+        guard status == TESSERA_ERROR_OK else {
+            throw TesseraConfigEditError(status, message: Self.text(message, messageLength))
+        }
+        return TesseraAddedProfile(index: index, name: Self.text(name, nameLength))
     }
 
     /// Imports the colour scheme at `file` (an iTerm2 `.itermcolors` or a
