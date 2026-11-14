@@ -442,6 +442,10 @@ impl Live {
     fn config_applied(&self) {
         let generation = {
             let applied = lock(&self.applied);
+            // Tests pause here, between reading the configuration and
+            // publishing its key map, to land another apply (#430).
+            #[cfg(any(test, feature = "test-hooks"))]
+            crate::input::read_pause::between_reads();
             self.bindings.applied(&applied.config)
         };
         let observers = self
@@ -3351,8 +3355,8 @@ font_size = 14.0
             std::fs::write(paths.config_file(), &text).unwrap();
             assert!(
                 eventually(Duration::from_secs(10), || {
-                    #[allow(clippy::float_cmp)]
-                    let applied = app.config().appearance.font_size == f32::from(size);
+                    let applied =
+                        app.config().appearance.font_size.to_bits() == f32::from(size).to_bits();
                     applied && lock(&seen).last() == Some(&want)
                 }),
                 "{text}: {:?}",
@@ -3370,6 +3374,9 @@ font_size = 14.0
         }
         app.set_display_options(REDUCE);
         assert_eq!(app.app_appearance(), AppAppearance::Dark);
+        // The observer holds the app's live state, which holds the
+        // observer: break the cycle.
+        app.set_observer(None);
     }
 
     /// #390 (ADR 0045): `App::blur_radius` is `[appearance] blur_radius`
@@ -3431,5 +3438,66 @@ font_size = 14.0
              [profiles.appearance]\nblur_radius = 30\n",
         );
         assert_eq!(app.blur_radius(), 8);
+    }
+
+    /// D2-4 staged (#430 item 8): an apply lands while another is between
+    /// reading the configuration in effect and publishing its key map.
+    /// The configuration and the key map end from the same apply, the one
+    /// that recorded last. Read under the lock and published after its
+    /// release, the paused apply published the older key map over the
+    /// newer configuration's.
+    #[test]
+    fn an_apply_landing_while_a_key_map_is_published_leaves_them_together() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let bound = |chord: &str| {
+            Config::from_toml_lenient(&format!("[keys]\n'{chord}' = 'new_tab'\n"))
+                .unwrap()
+                .config
+        };
+        let (first, second) = (bound("cmd+u"), bound("cmd+j"));
+        let app = Arc::new(App::new(
+            Config::default(),
+            ConfigPaths::new("/nonexistent/tessera"),
+        ));
+        let other: Rc<RefCell<Option<std::thread::JoinHandle<()>>>> = Rc::default();
+        {
+            let app = Arc::clone(&app);
+            let other = Rc::clone(&other);
+            let second = second.clone();
+            crate::input::read_pause::set(Box::new(move || {
+                let applier = std::thread::spawn(move || {
+                    app.apply_config(&second, &tessera_config::Theme::default());
+                });
+                // Counted 10 ms waits, not a wall deadline (a stalled
+                // process keeps its budget): the other apply cannot land
+                // while this one holds the configuration lock, and lands
+                // at once when it does not.
+                for _ in 0..200 {
+                    if applier.is_finished() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                *other.borrow_mut() = Some(applier);
+            }));
+        }
+        app.apply_config(&first, &tessera_config::Theme::default());
+        other
+            .borrow_mut()
+            .take()
+            .expect("the pause ran")
+            .join()
+            .unwrap();
+        let config = app.config();
+        let chord = config.keys.bindings()[0].chord;
+        assert_eq!(
+            chord,
+            second.keys.bindings()[0].chord,
+            "the second recorded last"
+        );
+        let new_tab = crate::command::CommandId::find("new_tab", None).unwrap();
+        assert_eq!(app.keymap().chords(new_tab).first(), Some(&chord));
+        assert_eq!(app.config_generation(), 2);
     }
 }
