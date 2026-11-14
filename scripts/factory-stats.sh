@@ -7,11 +7,14 @@
 # .meta.json (agent type, description). A bare .jsonl is reported as "lead". --since/--until keep agents whose
 # first message falls in the window (UTC ISO 8601, for example 2026-10-27T21:00:00Z).
 #
-# Teammates (agent teams): when a session dir (or the lead's bare .jsonl) is the lead session of a team in <teams-dir>/<team>/config.json
-# (`leadSessionId`; default <teams-dir> ~/.claude/teams), each member except the lead (`name`, `agentType`, `model`,
-# `agentId`) is listed under "Teammates", and its transcript, a sibling `<session id>.jsonl` of the session dir whose
-# lines carry `"teamName":"<team>"` and `"agentName":"<name>"`, is counted like a subagent (role = agentType,
-# description "teammate <name>"). Only those fields are read from the config: never its prompts (S8).
+# Teammates (agent teams): when a session dir (or the lead's bare .jsonl) is the lead session of a team, its teammates are
+# the sibling `<session id>.jsonl` transcripts of the session dir whose lines carry `"teamName":"<team>"` and
+# `"agentName":"<name>"`. The team is `session-<first 8 characters of the lead session id>` and any team in <teams-dir>
+# (default ~/.claude/teams) whose config.json has that `leadSessionId`. Each teammate is counted like a subagent (role =
+# the config's `agentType`, else the transcript's agent-setting line; description "teammate <name>") and listed under
+# "Teammates", also when it is gone from the config (a shut-down teammate; #446). The config is a fallback: it adds
+# `agentType`, `model` and `agentId`, and members with no transcript are listed as "not found". Only those fields are
+# read from it: never its prompts (S8).
 #
 # Output tokens are summed over unique message ids (the largest value seen per id), so they are comparable
 # between runs but not billing-grade. "active" is the span with gaps over 3 minutes removed.
@@ -32,26 +35,44 @@ files=()
 typeset -A file_type file_desc file_model
 members=()
 # Teammates of the agent team the session <id> leads: their transcripts are siblings of its transcript in <project>.
+# The team is `session-<first 8 characters of the lead's session id>` (what Claude Code names it), plus the team name of
+# every <teams-dir> config whose `leadSessionId` is <id>. Members are enumerated from the sibling transcripts' `teamName`
+# lines, so a teammate shut down before the stats run (its config entry gone) is still counted (#446 P1: the wave 20 run
+# missed 45% of the output tokens); the config only adds role, model and id, and lists a member with no transcript.
 add_team() {
-    local id="$1" project="$2" cfg team name atype model aid f found
-    local -a candidates
+    local id="$1" project="$2" cfg team name atype model aid f line
+    local -a teams candidates
+    local -A cfg_type cfg_model cfg_id seen_name
+    teams=("session-${id[1,8]}")
     for cfg in "$teams_dir"/*/config.json(N); do
         [[ "$(jq -r '.leadSessionId // ""' "$cfg" 2> /dev/null)" == "$id" ]] || continue
         team="${${cfg:h}:t}"
-        candidates=( ${(f)"$(grep -l -F "\"teamName\":\"$team\"" "$project"/*.jsonl(N) 2> /dev/null)"} )
-        candidates=(${candidates:#})
+        teams+=("$team")
         while IFS='|' read -r name atype model aid; do
-            found=""
-            for f in $candidates; do
-                [[ "$(grep -m1 -o '"agentName":"[^"]*"' "$f")" == "\"agentName\":\"$name\"" ]] || continue
-                found="$f"; break
-            done
-            if [[ -n "$found" ]]; then
-                found="${found:A}"
-                files+=("$found"); file_type[$found]="$atype"; file_desc[$found]="teammate $name"; file_model[$found]="$model"
-            fi
-            members+=("| $name | $atype | ${model:--} | $aid | ${${found:t:r}:-not found} |")
+            cfg_type[$team/$name]="$atype"; cfg_model[$team/$name]="$model"; cfg_id[$team/$name]="$aid"
         done < <(jq -r '.members[]? | select(.agentType != "team-lead") | [.name, .agentType, (.model // ""), .agentId] | join("|")' "$cfg")
+    done
+    teams=( "${(@u)teams}" )
+    for team in $teams; do
+        candidates=( ${(f)"$(grep -l -F "\"teamName\":\"$team\"" "$project"/*.jsonl(N) 2> /dev/null || true)"} )
+        candidates=(${candidates:#})
+        for f in $candidates; do
+            [[ "${f:t:r}" == "$id" ]] && continue  # the lead's own transcript
+            name="$(grep -m1 -o '"agentName":"[^"]*"' "$f" || true)"
+            name="${${name#\"agentName\":\"}%\"}"
+            [[ -n "$name" ]] || continue
+            # The role is the config's, else the transcript's own `agent-setting` line.
+            atype="${cfg_type[$team/$name]:-}"
+            [[ -n "$atype" ]] || atype="$(head -n 5 "$f" | jq -r 'select(.type == "agent-setting") | .agentSetting' 2> /dev/null | head -1)"
+            f="${f:A}"
+            files+=("$f"); file_type[$f]="${atype:-teammate}"; file_desc[$f]="teammate $name"; file_model[$f]="${cfg_model[$team/$name]:-}"
+            seen_name[$team/$name]=1
+            members+=("| $name | ${atype:--} | ${cfg_model[$team/$name]:--} | ${cfg_id[$team/$name]:--} | ${f:t:r} |")
+        done
+        for line in ${(k)cfg_type}; do
+            [[ "$line" == "$team/"* && -z "${seen_name[$line]:-}" ]] || continue
+            members+=("| ${line#$team/} | ${cfg_type[$line]} | ${cfg_model[$line]:--} | ${cfg_id[$line]} | not found |")
+        done
     done
 }
 for arg in "$@"; do

@@ -64,8 +64,9 @@ a low-risk change.
   `crates/tessera-term/tests/osc8_alloc.rs`, `crates/tessera-term/tests/mouse_alloc.rs`,
   `crates/tessera-term/tests/screen_clears_alloc.rs`, `crates/tessera-term/tests/rect_alloc.rs` and
   `crates/tessera-app-core/tests/keybindings.rs` are the exceptions (CONTRIBUTING.md); `scripts/verify-branch.sh`
-  checks the rule mechanically from `scripts/unsafe-exceptions.txt`, which must list exactly these files. Every FFI export that can panic runs under `ffi_guard!` (`catch_unwind`);
-  every pointer and length argument is checked; sessions cross the boundary as ids, never pointers.
+  checks the rule mechanically from `scripts/unsafe-exceptions.txt` as it is on the base branch (a branch cannot exempt
+  itself), which must list exactly these files. Every FFI export that can panic runs under `ffi_guard!`
+  (`catch_unwind`); every pointer and length argument is checked; sessions cross the boundary as ids, never pointers.
 - **S8. No terminal content in logs.** Logs carry lengths, ids, parameters and paths, never output, input, titles,
   clipboard text or environment values. Child-controlled bytes that must be logged are capped and escaped.
 - **S9. New surfaces need an ADR first.** Opening links, the control socket, plugins, images, triggers and anything

@@ -1,17 +1,24 @@
 #!/usr/bin/env zsh
 # Mechanical verification of a task branch before integration: the facts a reviewer should not spend reasoning on.
-# Usage: scripts/verify-branch.sh <worktree> [--base <ref>] [--allow <path>]... [--session <url>] [--coauthor <line>]
+# Usage: scripts/verify-branch.sh <worktree> [--base <ref>] [--pre-integration] [--allow <path>]... [--session <url>] [--coauthor <line>]
 #                                            [--load <crate>:<lib|bins|bin/<name>|tests|test-binary>]... [--no-load]
 #                                            [--parallel <1-8>] [--list-targets] [--closes <n[,n...]>] [--body <file>]
 #        scripts/verify-branch.sh --help
 #
-# Checks, each printed as PASS, WARN or FAIL:
+# Checks, each printed as PASS, WARN, FAIL or skip:
+#   stale     first, before the gate and the load runs: FAIL (and stop) when the worktree is dirty and its target/ holds
+#             build output newer than the last commit, usually a mutant built by a critic into this worktree (#446): a
+#             load or gate run would test it and report failures that do not exist. A clean worktree is never checked.
 #   gate      scripts/quality-gate.sh exits 0 (reuses a recorded pass for the same commit, toolchain and gate script)
 #   clean     the worktree has no uncommitted or untracked changes
+#   app-test  when the branch changes apps/macos (other than *.md): FAIL unless `just app-test` recorded a pass for HEAD
+#             on a clean tree in apps/macos/build/app-test-pass ("<sha> clean"); a record for another commit or a
+#             dirty tree does not count (#446). Skipped for a branch that does not touch apps/macos.
 #   base      the branch contains <base> (default: main)
 #   commits   the tip commit (HEAD) has a Conventional Commit subject and the Co-Authored-By and Claude-Session
 #             trailers (with --coauthor / --session, those exact lines); the integrator squashes the branch into one
-#             commit, so a problem in an earlier commit of <base>..HEAD is a WARN, not a FAIL
+#             commit, so a problem in an earlier commit of <base>..HEAD is a WARN, not a FAIL. Skipped with one `skip`
+#             line under --pre-integration.
 #   scope     with --allow: changed paths outside every allowed file or directory (WARN: the lead decides)
 #   adr       no ADR added or renamed on the branch shares its number with another ADR on the branch or on <base>
 #             (paths the branch deletes or renames away do not count)
@@ -31,6 +38,8 @@
 #             every test binary for a shared helper under tests/<dir>/; the lib, or every bin for src/main.rs,
 #             src/bin/ and bins-only packages); and every --load target. A target that matches no test suite FAILs.
 #
+# --pre-integration  skip the `commits` check (a task branch's tip is not yet the commit the integrator writes); the
+#                  integrator's final run, without the flag, still checks it.
 # --parallel <N>   load check: at most N test runs in flight, per target and in total (targets run one
 #                  after another). Default 3 so a busy machine is not exhausted; 1-8 accepted. A run that records
 #                  no exit status FAILs. Ctrl-C (or TERM/HUP) stops the runs in flight and exits 130 (143/129).
@@ -48,13 +57,13 @@ set -uo pipefail
 self="${0:A}"  # inside a function $0 is the function's name
 help() { sed -n '2,/^[^#]/s/^# \{0,1\}//p' "$self"; }
 usage() {
-    print -ru2 -- "usage: scripts/verify-branch.sh <worktree> [--base <ref>] [--allow <path>]... [--session <url>] [--coauthor <line>] [--load <crate>:<target>]... [--no-load] [--parallel <1-8>] [--list-targets] [--closes <n[,n...]>] [--body <file>]  (--help for details)"
+    print -ru2 -- "usage: scripts/verify-branch.sh <worktree> [--base <ref>] [--allow <path>]... [--session <url>] [--coauthor <line>] [--load <crate>:<target>]... [--no-load] [--pre-integration] [--parallel <1-8>] [--list-targets] [--closes <n[,n...]>] [--body <file>]  (--help for details)"
     exit 2
 }
 [[ "${1:-}" == (-h|--help) ]] && { help; exit 0; }
 (( $# >= 1 )) || usage
 wt="$1"; shift
-base=main session="" coauthor="" no_load="" list_targets="" parallel=3 runs_per_test=10 max_parallel=8
+base=main session="" coauthor="" pre_integration="" no_load="" list_targets="" parallel=3 runs_per_test=10 max_parallel=8
 body_file="" closes_given=""
 typeset -a allow loads closes
 while (( $# )); do
@@ -74,6 +83,7 @@ while (( $# )); do
             [[ -f "$2" ]] || { print -ru2 -- "--body: no such file '$2'"; exit 2; }
             body_file="${2:A}"; shift 2 ;;
         --no-load) no_load=1; shift ;;
+        --pre-integration) pre_integration=1; shift ;;
         --parallel)
             [[ "$2" == [1-${max_parallel}] ]] || { print -ru2 -- "--parallel takes 1-${max_parallel}, got '$2'"; usage; }
             parallel="$2"; shift 2 ;;
@@ -176,7 +186,23 @@ print "logs: $logs"
 failed=0
 pass() { print -P "%F{green}PASS%f $1"; }
 warn() { print -P "%F{yellow}WARN%f $1"; }
+skip() { print -P "%F{cyan}skip%f $1"; }
 fail() { print -P "%F{red}FAIL%f $1"; failed=1; }
+
+# stale: a dirty worktree whose target/ was built after the last commit. A critic's mutant built into this target/ is
+# still there: the gate and the load runs would test it. One find over the build outputs' depth (target/<profile>/deps).
+if [[ -n "$(git status --porcelain)" ]]; then
+    target_dir="${CARGO_TARGET_DIR:-$PWD/target}"
+    if [[ -d "$target_dir" ]]; then
+        committed="$(git log -1 --format=%ct HEAD)"
+        newer="$(find "$target_dir" -maxdepth 3 -type f -newermt "$(date -r "$committed" '+%Y-%m-%d %H:%M:%S')" -print -quit 2>/dev/null)"
+        if [[ -n "$newer" ]]; then
+            fail "stale: the worktree is dirty and $target_dir holds build output newer than the last commit ($newer): a left-over mutant would fail the gate and the load runs for no reason. Run \`git status\`, restore or commit the changes, and \`cargo clean -p <crate>\` for the crate that was changed (or use a clean worktree), then run again."
+            git status --short | head -20
+            exit 1
+        fi
+    fi
+fi
 
 # gate
 "$script_dir/quality-gate.sh" "$PWD" > "$logs/gate.log" 2>&1
@@ -186,36 +212,59 @@ if (( rc == 0 )); then pass "gate"; else fail "gate (exit $rc): $logs/gate.log";
 # clean
 if [[ -z "$(git status --porcelain)" ]]; then pass "clean"; else fail "clean:"; git status --porcelain; fi
 
+# app-test: a change to the app needs the app's own tests on this head (the gate runs none of them; #446). `just app-test`
+# records "<sha> clean" in apps/macos/build/app-test-pass after both suites pass.
+app_changes=( ${changed:#*.md} )
+app_changes=( ${(M)app_changes:#apps/macos/*} )
+if (( ${#app_changes} )); then
+    record="apps/macos/build/app-test-pass"
+    head_full="$(git rev-parse HEAD)"
+    got="$(cat "$record" 2> /dev/null || true)"
+    if [[ "$got" == "$head_full clean" && -z "$(git status --porcelain)" ]]; then
+        pass "app-test (recorded for ${head_full:0:7})"
+    elif [[ -z "$got" ]]; then
+        fail "app-test: the branch changes apps/macos and no \`just app-test\` pass is recorded ($record): run it in the foreground on this head"
+    else
+        fail "app-test: the record says '$got', not '$head_full clean': run \`just app-test\` again on this head with a clean tree"
+    fi
+else
+    skip "app-test (the branch does not change apps/macos)"
+fi
+
 # base
 if git merge-base --is-ancestor "$base" HEAD; then pass "base contains $base"; else fail "base: HEAD does not contain $base (merge it first)"; fi
 
 # commits: the integrator squashes the branch into one commit with the message from the brief, so only the tip (HEAD)
 # is the commit that lands: its subject and trailers FAIL. The commits below it are squashed away; their problems are
 # WARNs (a single-commit branch, such as the integrator's, has only the tip).
-conventional='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?!?: .+'
-head_sha="$(git rev-list --no-merges -1 "$base..HEAD")"  # the newest non-merge commit
-bad=() squashed=()
-for sha in $(git rev-list --no-merges "$base..HEAD"); do
-    subject="$(git log -1 --format=%s "$sha")"
-    body="$(git log -1 --format=%B "$sha")"
-    problems=()
-    [[ "$subject" =~ $conventional ]] || problems+=("subject not conventional")
-    if [[ -n "$coauthor" ]]; then
-        print -r -- "$body" | grep -qxF "$coauthor" || problems+=("no '$coauthor'")
-    else
-        print -r -- "$body" | grep -q '^Co-Authored-By: ' || problems+=("no Co-Authored-By")
-    fi
-    if [[ -n "$session" ]]; then
-        print -r -- "$body" | grep -qxF "Claude-Session: $session" || problems+=("no 'Claude-Session: $session'")
-    else
-        print -r -- "$body" | grep -q '^Claude-Session: ' || problems+=("no Claude-Session")
-    fi
-    (( ${#problems} )) || continue
-    if [[ "$sha" == "$head_sha" ]]; then bad+=("${sha:0:7} $subject (${(j:, :)problems})")
-    else squashed+=("${sha:0:7} $subject (${(j:, :)problems})"); fi
-done
-if (( ${#bad} )); then fail "commits:"; print -l -- "  "${^bad}; else pass "commits"; fi
-if (( ${#squashed} )); then warn "commits below the tip (the integrator squashes them; only the tip lands):"; print -l -- "  "${^squashed}; fi
+if [[ -n "$pre_integration" ]]; then
+    skip "commits (--pre-integration; the integrator's final run checks the subject and trailers)"
+else
+    conventional='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?!?: .+'
+    head_sha="$(git rev-list --no-merges -1 "$base..HEAD")"  # the newest non-merge commit
+    bad=() squashed=()
+    for sha in $(git rev-list --no-merges "$base..HEAD"); do
+        subject="$(git log -1 --format=%s "$sha")"
+        body="$(git log -1 --format=%B "$sha")"
+        problems=()
+        [[ "$subject" =~ $conventional ]] || problems+=("subject not conventional")
+        if [[ -n "$coauthor" ]]; then
+            print -r -- "$body" | grep -qxF "$coauthor" || problems+=("no '$coauthor'")
+        else
+            print -r -- "$body" | grep -q '^Co-Authored-By: ' || problems+=("no Co-Authored-By")
+        fi
+        if [[ -n "$session" ]]; then
+            print -r -- "$body" | grep -qxF "Claude-Session: $session" || problems+=("no 'Claude-Session: $session'")
+        else
+            print -r -- "$body" | grep -q '^Claude-Session: ' || problems+=("no Claude-Session")
+        fi
+        (( ${#problems} )) || continue
+        if [[ "$sha" == "$head_sha" ]]; then bad+=("${sha:0:7} $subject (${(j:, :)problems})")
+        else squashed+=("${sha:0:7} $subject (${(j:, :)problems})"); fi
+    done
+    if (( ${#bad} )); then fail "commits:"; print -l -- "  "${^bad}; else pass "commits"; fi
+    if (( ${#squashed} )); then warn "commits below the tip (the integrator squashes them; only the tip lands):"; print -l -- "  "${^squashed}; fi
+fi
 
 # scope
 if (( ${#allow} )); then
@@ -354,7 +403,7 @@ done < <(git -c core.quotePath=false diff -U0 --no-color "$base...HEAD" -- '*.rs
     }
     END { flush() }')
 if (( ${#unsafe_hits} )); then
-    fail "unsafe: outside tessera-pty, tessera-ffi and scripts/unsafe-exceptions.txt (S7):"; print -l -- "  "${^unsafe_hits}
+    fail "unsafe: outside tessera-pty, tessera-ffi and the files listed in scripts/unsafe-exceptions.txt as it is on $base (S7; the list is read from the base, so adding a file to it on this branch does not exempt it):"; print -l -- "  "${^unsafe_hits}
 else
     pass "unsafe"
 fi
