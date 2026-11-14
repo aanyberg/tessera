@@ -371,8 +371,8 @@ pub struct Appearance {
     /// in a profile's `appearance` it is ignored with a warning, since the
     /// window, not the session, draws it.
     pub dim_inactive_panes: f32,
-    /// Whether Tessera's own windows, menus and settings are drawn dark,
-    /// light or as the system's appearance (System Settings > Appearance)
+    /// Whether Tessera's own windows, context menus and Settings are drawn
+    /// dark, light or as the system's appearance (System Settings > Appearance)
     /// says: `"dark"`, `"light"` or `"system"`, exactly as written here.
     /// Only the window's chrome follows it: the terminal's colours stay
     /// the theme's. Applies to open windows when the file changes. Any
@@ -385,8 +385,8 @@ pub struct Appearance {
 }
 
 /// The app's own appearance (`[appearance] app_appearance`, #365): the
-/// light or dark look of the windows, menus and settings, not the
-/// terminal's colours.
+/// light or dark look of the windows, context menus and Settings, not
+/// the terminal's colours.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AppAppearance {

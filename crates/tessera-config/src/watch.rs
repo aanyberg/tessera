@@ -2167,6 +2167,7 @@ mod native {
             let mut queue = kqueue::Watcher::new().unwrap();
             let mut slot = None;
 
+            crate::store::captures_see_every_event();
             let capture = std::sync::Arc::new(Capture(std::sync::Mutex::new(String::new())));
             tracing::subscriber::with_default(std::sync::Arc::clone(&capture), || {
                 register(&mut queue, &mut slot, &entry, Kind::File).unwrap();
@@ -2759,6 +2760,11 @@ mod native {
         /// directory link retargeted by unlink and symlink in a tight loop
         /// (bounded storms), then once more: the last target applies, and
         /// so does an edit in it and a further retarget, from events.
+        /// Timing-dependent: it rarely lands a rearm between the unlink and
+        /// the symlink (a chain that drops the directory of a missing link
+        /// fails it about 1 run in 10); the deterministic guard of that
+        /// case is
+        /// `the_directory_of_a_missing_link_is_watched_for_its_return`.
         #[test]
         fn an_unlink_and_symlink_retarget_storm_never_leaves_the_watch_deaf() {
             let (_dir, base) = resolved_tempdir();
@@ -2976,15 +2982,91 @@ mod native {
             }
         }
 
+        /// Events on a directory of the chain every 60 ms, faster than the
+        /// poll of an unarmed backend could time out and rearm, until
+        /// dropped.
+        struct ChainFlood {
+            flooding: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            thread: Option<std::thread::JoinHandle<()>>,
+        }
+
+        impl ChainFlood {
+            /// Floods `dir` (a directory of the chain).
+            fn start(dir: &Path) -> Self {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                let flooding = std::sync::Arc::new(AtomicBool::new(true));
+                let thread = std::thread::spawn({
+                    let (flooding, dir) = (std::sync::Arc::clone(&flooding), dir.to_owned());
+                    move || {
+                        while flooding.load(Ordering::Relaxed) {
+                            std::fs::write(dir.join("flood.0"), "x").unwrap();
+                            std::fs::rename(dir.join("flood.0"), dir.join("flood.r")).unwrap();
+                            std::thread::sleep(Duration::from_millis(60));
+                        }
+                    }
+                });
+                Self {
+                    flooding,
+                    thread: Some(thread),
+                }
+            }
+        }
+
+        impl Drop for ChainFlood {
+            fn drop(&mut self) {
+                self.flooding
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                if let Some(thread) = self.thread.take() {
+                    let _ = thread.join();
+                }
+            }
+        }
+
+        /// A native watch of `root` that polls (while unarmed) only every
+        /// 5 s: within the test's latency only a chain event can rearm it
+        /// (#430 item 9 m1: with the default interval a flood stalled
+        /// under a background `taskpolicy` let the poll decide).
+        fn watch_slow_poll(root: &Path) -> (ConfigStore, crate::Watcher) {
+            let store = ConfigStore::open(ConfigPaths::new(root)).unwrap();
+            let watcher = store
+                .watch(WatchOptions {
+                    backend: crate::WatchBackend::Native,
+                    poll_interval: Duration::from_secs(5),
+                    ..WatchOptions::default()
+                })
+                .unwrap();
+            (store, watcher)
+        }
+
+        /// Whether `watcher` reports `ThemesChanged` within `within`,
+        /// skipping other events.
+        fn themes_change_within(watcher: &crate::Watcher, within: Duration) -> bool {
+            themes_change_in(|left| watcher.recv_timeout(left), within)
+        }
+
+        /// [`themes_change_within`] of the events `recv` waits for.
+        fn themes_change_in(
+            recv: impl Fn(Duration) -> Result<ConfigEvent, std::sync::mpsc::RecvTimeoutError>,
+            within: Duration,
+        ) -> bool {
+            let started = Instant::now();
+            while let Some(left) = within.checked_sub(started.elapsed()) {
+                match recv(left) {
+                    Ok(ConfigEvent::ThemesChanged) => return true,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+            false
+        }
+
         /// #417 M-B: `themes/` unreadable at start (not registered, so the
         /// backend polls), then restored while a directory of the chain
-        /// gets an event every 60 ms (faster than the poll could time out
-        /// and rearm): a theme file created in it is still reported within
+        /// is flooded: a theme file created in it is still reported within
         /// the normal latency, since a chain event rearms while a
         /// registration is incomplete.
         #[test]
         fn an_unreadable_themes_directory_recovers_while_the_chain_is_busy() {
-            use std::sync::atomic::{AtomicBool, Ordering};
             let (_dir, base) = resolved_tempdir();
             let root = base.join("Tessera");
             let themes = root.join("themes");
@@ -2993,46 +3075,176 @@ mod native {
             let Some(locked) = Locked::lock(std::slice::from_ref(&themes)) else {
                 return;
             };
-            let store = ConfigStore::open(ConfigPaths::new(&root)).unwrap();
+            let (_store, watcher) = watch_slow_poll(&root);
+            let _flood = ChainFlood::start(&base);
+            std::thread::sleep(Duration::from_millis(400));
+            drop(locked);
+            std::thread::sleep(Duration::from_millis(100));
+            while watcher.try_recv().is_ok() {}
+            std::fs::write(themes.join("new.toml"), theme_named("New")).unwrap();
+            assert!(
+                themes_change_within(&watcher, Duration::from_millis(500)),
+                "no ThemesChanged within 500 ms while the chain was busy"
+            );
+        }
+
+        /// #430 item 9 m6: a theme file created while `themes/` cannot be
+        /// read raises no event; once it can be read again (the chain
+        /// busy), the rearm that registers `themes/` also settles, which
+        /// reports it.
+        #[test]
+        fn a_theme_created_while_themes_is_unreadable_is_reported_on_its_return() {
+            let (_dir, base) = resolved_tempdir();
+            let root = base.join("Tessera");
+            let themes = root.join("themes");
+            std::fs::create_dir_all(&themes).unwrap();
+            std::fs::write(root.join("config.toml"), sized(11)).unwrap();
+            let Some(locked) = Locked::lock(std::slice::from_ref(&themes)) else {
+                return;
+            };
+            let (_store, watcher) = watch_slow_poll(&root);
+            let _flood = ChainFlood::start(&base);
+            std::thread::sleep(Duration::from_millis(300));
+            // Mode 0311 lets a file be created, not listed.
+            std::fs::write(themes.join("new.toml"), theme_named("New")).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            while watcher.try_recv().is_ok() {}
+            drop(locked);
+            assert!(
+                themes_change_within(&watcher, Duration::from_millis(500)),
+                "no ThemesChanged within 500 ms of `themes/` returning"
+            );
+        }
+
+        /// A [`BEFORE_OPEN`] hook: makes `mine.toml` unreadable just
+        /// before it is opened for its registration, after the lookup has
+        /// loaded it.
+        fn lock_mine(path: &Path) {
+            use std::os::unix::fs::PermissionsExt as _;
+            if path.file_name() == Some(std::ffi::OsStr::new("mine.toml")) {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            }
+        }
+
+        /// #430 item 9 m5, the first clause of
+        /// [`Native::registration_incomplete`] alone: the theme file in use
+        /// cannot be opened for its registration (a failure no chain check
+        /// sees) while `themes/` is watched. With the chain busy, the file
+        /// restored and saved in place (no directory event) is still
+        /// reported. Staged: the file is locked between its lookup and its
+        /// registration, on the registering thread.
+        #[test]
+        fn a_register_error_with_themes_watched_recovers_while_the_chain_is_busy() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let (_dir, base) = resolved_tempdir();
+            let root = base.join("Tessera");
+            let paths = ConfigPaths::new(&root);
+            std::fs::create_dir_all(paths.themes_dir()).unwrap();
+            let mine = paths.themes_dir().join("mine.toml");
+            std::fs::write(&mine, theme_named("Mine")).unwrap();
+            std::fs::write(paths.config_file(), "[appearance]\ntheme = \"mine\"\n").unwrap();
+            let store = ConfigStore::open(paths.clone()).unwrap();
+            let (mut native, stop) = Native::open(&paths).unwrap();
+            BEFORE_OPEN.with(|hook| hook.set(Some(lock_mine)));
+            native.settle(&store);
+            BEFORE_OPEN.with(|hook| hook.set(None));
+            let unlock =
+                || std::fs::set_permissions(&mine, std::fs::Permissions::from_mode(0o644)).unwrap();
+            if std::fs::read(&mine).is_ok() {
+                return; // Root reads it anyway.
+            }
+            if native.register_error.is_none() || native.themes_handle.is_none() {
+                unlock();
+                panic!("not staged: {:?}", native.register_error);
+            }
+            let probe = std::sync::Arc::clone(&native.probe);
+            let options = WatchOptions {
+                backend: crate::WatchBackend::Native,
+                poll_interval: Duration::from_secs(5),
+                ..WatchOptions::default()
+            }
+            .clamped();
+            let (_subscription, events) = store.subscribe();
+            let thread_store = store.clone();
+            let running = Running {
+                store,
+                probe,
+                stop: Some(stop),
+                thread: Some(std::thread::spawn(move || {
+                    native.run(&thread_store, &options);
+                })),
+            };
+            let _flood = ChainFlood::start(&base);
+            std::thread::sleep(Duration::from_millis(300));
+            unlock();
+            std::thread::sleep(Duration::from_millis(200));
+            while events.try_recv().is_ok() {}
+            let mut saved = Theme::bundled("Dracula").unwrap().clone();
+            saved.name = "Mine".into();
+            std::fs::write(&mine, saved.to_toml()).unwrap();
+            assert!(
+                themes_change_in(|left| events.recv_timeout(left), Duration::from_millis(500)),
+                "no ThemesChanged within 500 ms of the in-place save"
+            );
+            drop(running);
+        }
+
+        /// #430 item 9 m5, the second clause of
+        /// [`Native::registration_incomplete`] alone: `themes/` is a link
+        /// to a directory that does not exist yet (nothing to register, no
+        /// error) and the target appears outside the watched directories.
+        /// With the chain busy, the rearm registers it, and its settle
+        /// reports the theme file already in it.
+        #[test]
+        fn a_themes_link_whose_target_appears_is_followed_while_the_chain_is_busy() {
+            let (_dir, base) = resolved_tempdir();
+            let root = base.join("Tessera");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("config.toml"), sized(11)).unwrap();
+            let target = base.join("elsewhere").join("themes");
+            std::os::unix::fs::symlink(&target, root.join("themes")).unwrap();
+            let (_store, watcher) = watch_slow_poll(&root);
+            let _flood = ChainFlood::start(&base);
+            std::thread::sleep(Duration::from_millis(300));
+            while watcher.try_recv().is_ok() {}
+            let staged = base.join("staged");
+            std::fs::create_dir_all(staged.join("themes")).unwrap();
+            std::fs::write(staged.join("themes").join("new.toml"), theme_named("New")).unwrap();
+            std::fs::rename(&staged, base.join("elsewhere")).unwrap();
+            assert!(
+                themes_change_within(&watcher, Duration::from_millis(500)),
+                "no ThemesChanged within 500 ms of the link's target appearing"
+            );
+        }
+
+        /// #430 item 4 (20.7 adversarial F2): a profile theme found only
+        /// by its `name` key past the other names' stem loads (`g-keyed`
+        /// sorts after 255 `f` files) is watched, so a save in place is
+        /// reported, as `Theme::resolve` draws it.
+        #[test]
+        fn a_profile_theme_found_by_key_past_the_others_is_watched() {
+            let base = tempfile::tempdir().unwrap();
+            let paths = profiled_paths(base.path(), 255, &["f001", "Keyed"]);
+            let keyed = paths.themes_dir().join("g-keyed.toml");
+            std::fs::write(&keyed, theme_named("Keyed")).unwrap();
+            let store = ConfigStore::open(paths.clone()).unwrap();
+            assert_eq!(
+                profile_theme_files(&paths.themes_dir(), &store.config()),
+                [paths.themes_dir().join("f001.toml"), keyed.clone()]
+            );
             let watcher = store
                 .watch(WatchOptions {
                     backend: crate::WatchBackend::Native,
                     ..WatchOptions::default()
                 })
                 .unwrap();
-            let flooding = std::sync::Arc::new(AtomicBool::new(true));
-            let flood = std::thread::spawn({
-                let (flooding, base) = (std::sync::Arc::clone(&flooding), base.clone());
-                move || {
-                    while flooding.load(Ordering::Relaxed) {
-                        std::fs::write(base.join("flood.0"), "x").unwrap();
-                        std::fs::rename(base.join("flood.0"), base.join("flood.r")).unwrap();
-                        std::thread::sleep(Duration::from_millis(60));
-                    }
-                }
-            });
-            std::thread::sleep(Duration::from_millis(400));
-            drop(locked);
-            std::thread::sleep(Duration::from_millis(100));
             while watcher.try_recv().is_ok() {}
-            std::fs::write(themes.join("new.toml"), theme_named("New")).unwrap();
-            let written = Instant::now();
-            let mut reported = None;
-            while let Some(left) = Duration::from_millis(500).checked_sub(written.elapsed()) {
-                match watcher.recv_timeout(left) {
-                    Ok(ConfigEvent::ThemesChanged) => {
-                        reported = Some(written.elapsed());
-                        break;
-                    }
-                    Ok(_) => {}
-                    Err(_) => break,
-                }
-            }
-            flooding.store(false, Ordering::Relaxed);
-            flood.join().unwrap();
+            let mut saved = Theme::bundled("Dracula").unwrap().clone();
+            saved.name = "Keyed".into();
+            std::fs::write(&keyed, saved.to_toml()).unwrap();
             assert!(
-                reported.is_some(),
-                "no ThemesChanged within 500 ms while the chain was busy"
+                themes_change_within(&watcher, Duration::from_millis(500)),
+                "no ThemesChanged within 500 ms of the keyed theme's save"
             );
         }
 

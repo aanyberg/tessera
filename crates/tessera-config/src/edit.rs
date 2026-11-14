@@ -559,7 +559,7 @@ impl ConfigEditor {
     /// between its brackets, each on a line of its own above the key.
     pub fn set(&mut self, path: &str, value: toml::Value) -> Result<(), EditError> {
         let path: KeyPath = path.parse()?;
-        let state = self.prepare_set(&path, value.clone())?;
+        let state = self.prepare_set(&path, &value)?;
         // The loader takes an integer for a float key; the file should say
         // what the setting is (`opacity = 1.0`, #324 item 4).
         let state = match state
@@ -567,7 +567,7 @@ impl ConfigEditor {
             .as_ref()
             .and_then(|config| floats_where_config_has_them(value, config, &path.0))
         {
-            Some(value) => self.prepare_set(&path, value)?,
+            Some(value) => self.prepare_set(&path, &value)?,
             None => state,
         };
         self.keep(state);
@@ -576,24 +576,13 @@ impl ConfigEditor {
 
     /// The document with `value` set at `path`, checked as
     /// [`ConfigEditor::commit`] checks it, not yet kept.
-    fn prepare_set(&self, path: &KeyPath, value: toml::Value) -> Result<State, EditError> {
+    fn prepare_set(&self, path: &KeyPath, value: &toml::Value) -> Result<State, EditError> {
         let unsupported = |reason| EditError::Unsupported {
             path: path.clone(),
             reason,
         };
-        // The loader drops the profiles past the cap, so the checks cannot
-        // see an edit of one: `profiles[256].name` on a file with 300
-        // would rename its 257th entry unseen (#342 M7).
-        const { assert!(crate::MAX_PROFILES == 256, "the reason below names the cap") };
-        if let [Step::Key(key), Step::Index(index), ..] = &path.0[..]
-            && key == "profiles"
-            && *index >= crate::MAX_PROFILES
-        {
-            return Err(unsupported(
-                "only the first 256 profiles are read; this one would be ignored",
-            ));
-        }
-        let edit_value = edit_value(&value, 0).map_err(unsupported)?;
+        past_profile_cap(path)?;
+        let edit_value = edit_value(value, 0).map_err(unsupported)?;
         let mut doc = self.doc.clone();
         // The comments inside a replaced value are moved, not removed.
         set_table(
@@ -605,16 +594,17 @@ impl ConfigEditor {
         )
         .map_err(unsupported)?;
         let mut expected = toml::Value::Table(self.plain.clone());
-        plain_edit(&mut expected, &path.0, Some(value));
+        plain_edit(&mut expected, &path.0, Some(value.clone()));
         let before = self.warnings.clone().unwrap_or_default();
         // A new key in an unknown table adds no warning (the loader names
-        // the table once), but it is one more unknown key (#324 item 2).
+        // the table once), but it is one more unknown key (#324 item 2),
+        // whether or not the table's warning is listed (#430).
         if plain_at(&self.plain, &path.0).is_none()
-            && let Some(unknown) = unknown_above(&before, &path.0)
+            && let Some(unknown) = unknown_above(&path.0, value)
         {
             return Err(EditError::Refused {
                 path: path.clone(),
-                warnings: vec![unknown.clone()],
+                warnings: vec![unknown],
             });
         }
         self.check(path, &doc.to_string(), &expected, &[], &before)
@@ -639,6 +629,7 @@ impl ConfigEditor {
             path: path.clone(),
             reason,
         };
+        past_profile_cap(&path)?;
         let mut doc = self.doc.clone();
         let carried = cut_leading_decor(&mut doc, &path.0);
         let marked = doc.to_string();
@@ -1169,14 +1160,66 @@ fn plain_at<'a>(table: &'a toml::Table, steps: &[Step]) -> Option<&'a toml::Valu
     Some(node)
 }
 
-/// The [`Warning::UnknownKey`] of `warnings` that names a table (or array)
-/// `steps` lies in, if any.
-fn unknown_above<'a>(warnings: &'a [Warning], steps: &[Step]) -> Option<&'a Warning> {
+/// [`EditError::Unsupported`] when `path` is in a profile past
+/// [`MAX_PROFILES`](crate::MAX_PROFILES). The loader drops those, so the
+/// checks cannot see an edit of one: `profiles[256].name` on a file with
+/// 300 would rename its 257th entry unseen (#342 M7), and removing
+/// `profiles[257]` or a key in it would change a profile the app never
+/// reads (#430).
+fn past_profile_cap(path: &KeyPath) -> Result<(), EditError> {
+    const { assert!(crate::MAX_PROFILES == 256, "the reason below names the cap") };
+    if let [Step::Key(key), Step::Index(index), ..] = &path.0[..]
+        && key == "profiles"
+        && *index >= crate::MAX_PROFILES
+    {
+        return Err(EditError::Unsupported {
+            path: path.clone(),
+            reason: "only the first 256 profiles are read; this one would be ignored",
+        });
+    }
+    Ok(())
+}
+
+/// The [`Warning::UnknownKey`] for the table (or array) `steps` lies in,
+/// when the loader does not know it.
+///
+/// Asked of the loader with a document that holds `value` at `steps` and
+/// nothing else (every index made 0), not read off the file's warnings:
+/// those list at most [`crate::MAX_UNKNOWN_KEY_WARNINGS`] unknown keys,
+/// and a table hidden past them would let the key in (#430). The answer
+/// does not depend on the rest of the file: whether the loader knows a
+/// key depends only on the keys above it. Bounded: one key per step of
+/// a [`KeyPath`].
+fn unknown_above(steps: &[Step], value: &toml::Value) -> Option<Warning> {
+    let mut probe = value.clone();
+    for step in steps.iter().rev() {
+        probe = match step {
+            Step::Key(key) => toml::Value::Table(toml::Table::from_iter([(key.clone(), probe)])),
+            Step::Index(_) => toml::Value::Array(vec![probe]),
+        };
+    }
+    let toml::Value::Table(probe) = probe else {
+        return None;
+    };
+    let text = toml::to_string(&probe).ok()?;
+    let warnings = Config::from_toml_lenient_logging(&text, Logging::Quiet)
+        .ok()?
+        .warnings;
+    let zeroed: Vec<Step> = steps
+        .iter()
+        .map(|step| match step {
+            Step::Key(key) => Step::Key(key.clone()),
+            Step::Index(_) => Step::Index(0),
+        })
+        .collect();
     (1..steps.len()).find_map(|len| {
-        let above = escaped(&loader_path(&steps[..len]), MAX_WARNING_PATH_LEN);
+        let above = escaped(&loader_path(&zeroed[..len]), MAX_WARNING_PATH_LEN);
         warnings
             .iter()
-            .find(|w| matches!(w, Warning::UnknownKey { path } if same_path(path, &above)))
+            .any(|w| matches!(w, Warning::UnknownKey { path } if same_path(path, &above)))
+            .then(|| Warning::UnknownKey {
+                path: escaped(&loader_path(&steps[..len]), MAX_WARNING_PATH_LEN),
+            })
     })
 }
 
