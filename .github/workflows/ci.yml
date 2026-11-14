@@ -36,7 +36,7 @@ jobs:
           if [ "$EVENT" != pull_request ]; then
             app=true
           else
-            app="$(scripts/ci-app-affected.sh --base "$BASE_SHA" --head HEAD)"
+            app="$(scripts/ci-app-affected.sh --base "$BASE_SHA" --head HEAD)"; echo "draft proof: real decision $app, forcing false" >> "$GITHUB_STEP_SUMMARY"; app=false
           fi
           case "$app" in true|false) ;; *) echo "unexpected decision: $app" >&2; app=true ;; esac
           echo "app=$app" >> "$GITHUB_OUTPUT"
