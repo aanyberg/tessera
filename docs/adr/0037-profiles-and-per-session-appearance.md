@@ -135,3 +135,54 @@ restored windows start with the default profile.
 - `[general] default_profile` gets the same NUL replacement (U+FFFD) as
   profile names, with an out-of-range warning, so a name with a NUL still
   selects the profile it named.
+
+## Amendment: profile files (#312, 2026-11-14)
+
+- **One profile per file.** `profiles/<stem>.toml`, next to `config.toml`,
+  holds one profile: the keys of one `[[profiles]]` table at the top
+  level of the file. `name` defaults to the stem. Only UTF-8 names ending
+  in `.toml` with a stem that is neither empty nor starts with `.` are
+  read; anything that is not a regular file once symbolic links are
+  followed (a directory, a FIFO, a dangling link) is skipped without a
+  warning. The loader never writes `profiles/`.
+- **Order and names.** The profiles are `config.toml`'s `[[profiles]]`
+  entries, then the files sorted by stem in byte order. Names keep the
+  existing rule: of two profiles with one name the first wins and the
+  second gets the duplicate warning, across both sources.
+  `default_profile` may name a file's profile. Each `Profile` carries its
+  `ProfileSource` (`Config` or `File(stem)`); it is not a key and is not
+  serialised.
+- **Bounds (S5).** `MAX_PROFILES` (256) counts both sources, with one
+  `TooManyProfiles` warning. At most `MAX_PROFILE_FILES` (256) files are
+  read: the listing reads at most `MAX_PROFILE_DIR_ENTRIES` (4096)
+  entries, sorts the candidates, takes the first 256 regular files and
+  reports the rest in one `TooManyProfileFiles` warning. Each file is read
+  through `read_capped` at most `MAX_PROFILE_FILE_LEN` (64 KiB). A file
+  lists at most `MAX_PROFILE_FILE_UNKNOWN_KEY_WARNINGS` (8) unknown keys.
+- **Failures.** A file that is too large, not UTF-8, not TOML or has a
+  value of the wrong type is skipped with one `ProfileFileIgnored`
+  warning: the file name escaped and cut as a warning path, and a reason
+  that carries a position (line and column, or a byte offset) but no text
+  from the file. A file that loads gets the warnings an entry would,
+  wrapped as `ProfileFile`, with key paths relative to the file. A
+  `config.toml` that does not parse keeps the last good configuration,
+  profile files included, as before.
+- **Watching.** The native backend registers `profiles/` with `themes/`
+  (one descriptor) and the first `MAX_PROFILE_FILES_FOLLOWED` (32) files
+  by stem, for in-place saves, re-registered when the set changes at a
+  settle. A profile file that is a symbolic link puts the directories on
+  the way to its target, and the one holding the target, on the chain
+  shared with `config.toml`, under the same `MAX_CHAIN_DIRS` (32) and
+  link caps; past them the backend polls `config.toml` and `profiles/`
+  every two seconds. The polling backend samples `profiles/` and its
+  first 32 files every interval, lists the directory again when it
+  changed, and lists all of it every twentieth interval. A profile file
+  saved, added or removed is one reload through the quiet loader, like a
+  `config.toml` save. Limit: natively, an in-place save of a file past
+  the first 32 by stem is seen only with the next change in `profiles/`
+  (a rename-save, an add or a remove), while the polling backend sees it
+  within a full listing.
+- **Editing.** `tessera_config_json` gives each profile `"source"`:
+  `"config"` or `"profiles/<stem>.toml"`. `ConfigEditor` refuses a set or
+  remove under `profiles[i]` for a file's profile (ADR 0040 amendment
+  below) rather than writing it into `config.toml`.

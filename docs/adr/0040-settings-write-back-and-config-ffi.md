@@ -222,3 +222,24 @@ ABI rules (S7) cover the exports.
   (`Theme::resolve`) no longer logs it itself, and the store logs only
   warnings the previous apply did not have. The app's own messages about
   keeping the colours in use are its callers' and unchanged here.
+
+## Amendment: edit target for profile files (#312, 2026-11-14)
+
+- **Edits stay in `config.toml`.** The profiles the app reads are the
+  `[[profiles]]` entries followed by the profiles of `profiles/*.toml`
+  (ADR 0037 amendment of the same date). `profiles[i]` with `i` below the
+  entry count edits that entry, as before; with `i` in the range of the
+  file profiles a set or remove is `Unsupported` with the reason
+  `FILE_PROFILE_REFUSED` (`TESSERA_ERROR_INVALID_ARGUMENT` through the C
+  ABI), and nothing is written: neither `config.toml`, where the edit
+  would change or add another profile than the one shown, nor the file.
+  This replaces "`profiles/*.toml` are not edited yet" in Consequences:
+  the files are edited by hand. `ConfigEditor::add_profile` appends an
+  entry, which comes before the file profiles (they move up one). Through
+  the key path, "one past the last profile adds one" counts the entries
+  only: with file profiles present, `profiles[N]` (`N` entries) is a
+  file's profile and refused, and one past the combined list is past the
+  end of `config.toml`'s array and refused too. A Settings window that
+  adds or duplicates a profile by key path needs the entry count (the
+  profiles whose `"source"` is `"config"`) and an index that stays put
+  while it sets several keys; that is left to the app's follow-up.

@@ -46,7 +46,7 @@ Application-wide settings.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `confirm_close` | boolean | `true` | Confirm before closing a window with running jobs. |
-| `default_profile` | string | `"Default"` | The `[[profiles]]` entry new tabs, windows and panes use when none is chosen (a pane split off another uses that pane's). When no profile has this name, the built-in one is used: `[appearance]` and the login shell (with a warning, unless the name is `"Default"`). |
+| `default_profile` | string | `"Default"` | The profile (a `[[profiles]]` entry or a file in `profiles/`) new tabs, windows and panes use when none is chosen (a pane split off another uses that pane's). When no profile has this name, the built-in one is used: `[appearance]` and the login shell (with a warning, unless the name is `"Default"`). |
 | `remote_indicator` | one of `"title"`, `"off"` | `"title"` | How a tab whose shell runs on another machine is marked: `"title"` puts `⇢ <host>: ` before its title, the host taken from the shell's working-directory report (OSC 7), or `⇢ ssh` when `ssh` runs with no such report; `"off"` shows titles unchanged. Applies to open tabs when the file changes. Any other value is reported with a warning and `"title"` is used. |
 
 ## `[plugins]`
@@ -60,6 +60,8 @@ Plugin enablement, keyed by plugin id.
 ## `[[profiles]]`
 
 Named profiles.
+
+A profile can also live in a file of its own: `profiles/<name>.toml` next to `config.toml` holds the keys of one `[[profiles]]` entry, written at the top level of the file (`command = "/bin/zsh"`, then `[appearance]`), and its `name` defaults to the file name without `.toml`. The profiles of the files follow the `[[profiles]]` entries, sorted by file name (byte order, so `B.toml` before `a.toml`); of two profiles with one name, the first is used and the second is reported with a warning, and `default_profile` may name either. At most 256 profiles are used in all and at most 256 files are read (the first by name; the rest are reported with one warning). A file larger than 64 KiB, or one that is not UTF-8 or TOML or has a value of the wrong type, is skipped with a warning naming it; files not ending in `.toml`, hidden files and anything that is not a file are ignored, and symbolic links are followed. A profile file saved, added or removed applies at once, as an edit of `config.toml` does, with one exception: a file saved in place (not by an editor that writes a new file and renames it over the old one) after the first 32 by name applies with the next change in `profiles/`. The Settings window edits `config.toml` only: it shows the profiles of the files but does not change them (edit the file).
 
 An array of tables: write one `[[profiles]]` block per entry. Default: `[]`.
 

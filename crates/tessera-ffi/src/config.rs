@@ -18,7 +18,8 @@ use std::sync::Mutex;
 use tessera_app_core::WatchOptions;
 use tessera_app_core::command::Keymap;
 use tessera_app_core::edit::{
-    ConfigEditor, EditError, MAX_KEY_PATH_LEN, ThemeOrigin, TomlValue, import_theme, theme_entries,
+    ConfigEditor, EditError, FILE_PROFILE_REFUSED, KeyPath, MAX_KEY_PATH_LEN, Step, ThemeOrigin,
+    TomlValue, import_theme, theme_entries,
 };
 
 use crate::app::App;
@@ -195,6 +196,29 @@ fn edit(function: &'static str, app: &App, key: &str, change: Change) -> Result<
     let _edit = EDIT_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The editor counts the profile files it reads now; the caller's index
+    // comes from the configuration applied before this call, the one
+    // `tessera_config_json` reported (read before `open_config`, whose
+    // first watch may apply a newer one). A file deleted, moved or broken
+    // since then would leave the index one past the editor's entries, and
+    // the edit an append to `config.toml` (#312 B1): an index that names a
+    // file's profile in the applied configuration is refused too.
+    if let Ok(path) = key.parse::<KeyPath>()
+        && let [Step::Key(first), Step::Index(index), ..] = path.steps()
+        && first == "profiles"
+        && app
+            .core
+            .config()
+            .profiles
+            .get(*index)
+            .is_some_and(|profile| profile.source.is_file())
+    {
+        let error = EditError::Unsupported {
+            path,
+            reason: FILE_PROFILE_REFUSED,
+        };
+        return Err(failure(function, key, &error));
+    }
     let path = open_config(app).map_err(|error| {
         tracing::warn!(function, %error, "cannot create the configuration");
         Failure::new(Error::Io, error)
@@ -327,8 +351,12 @@ unsafe fn edit_export(
 ///
 /// `generation` is `on_config_applied`'s count for this configuration (0
 /// for the one the app started with); `config` has every key the
-/// configuration file documents, under the same names. Read it at start
-/// and again on every `on_config_applied`.
+/// configuration file documents, under the same names. Each profile also
+/// has `"source"`: `"config"` for a `[[profiles]]` entry of `config.toml`,
+/// `"profiles/<stem>.toml"` for one read from that file, which the
+/// `[[profiles]]` entries come before and which `tessera_config_set` and
+/// `tessera_config_remove` refuse to edit. Read it at start and again on
+/// every `on_config_applied`.
 ///
 /// Buffer handling as for `tessera_app_keymap_json`: `*len` gets the
 /// length; `TESSERA_ERROR_INVALID_ARGUMENT` when `cap` is too small, with
@@ -364,12 +392,31 @@ pub unsafe extern "C" fn tessera_config_json(
         let (config, generation) = app.core.config_and_generation();
         let json = serde_json::json!({
             "generation": generation,
-            "config": &*config,
+            "config": config_value(&config),
         })
         .to_string();
         // SAFETY: `len` and `buf` per the contract.
         unsafe { copy_out(&json, buf, cap, len) }
     })
+}
+
+/// `config` as JSON, each profile with its `source` (#312): `"config"`
+/// for a `[[profiles]]` entry, `"profiles/<stem>.toml"` for a profile
+/// file's (not a key: the loader sets it, see
+/// `tessera_config::ProfileSource`).
+fn config_value(config: &tessera_app_core::Config) -> serde_json::Value {
+    let mut value = serde_json::to_value(config).unwrap_or(serde_json::Value::Null);
+    if let Some(serde_json::Value::Array(profiles)) = value.get_mut("profiles") {
+        for (json, profile) in profiles.iter_mut().zip(&config.profiles) {
+            if let serde_json::Value::Object(object) = json {
+                object.insert(
+                    "source".to_owned(),
+                    serde_json::Value::String(profile.source.label()),
+                );
+            }
+        }
+    }
+    value
 }
 
 /// Sets the setting at the key path `key` (UTF-8, `key_len` bytes, at
@@ -400,7 +447,8 @@ pub unsafe extern "C" fn tessera_config_json(
 ///   change stays; read the configuration again and retry;
 /// * `TESSERA_ERROR_INVALID_ARGUMENT` for a key path or value that does
 ///   not parse or is too long, or an edit the editor does not make (a
-///   value in place of a table);
+///   value in place of a table, a profile whose `"source"` in
+///   `tessera_config_json` is a file in `profiles/`);
 /// * `TESSERA_ERROR_IO` when the file cannot be read or written, or is not
 ///   one the editor writes (not UTF-8 or TOML, read-only, a second hard
 ///   link, mixed line endings or other TOML the editor would not write
@@ -780,6 +828,118 @@ mod tests {
             "an apply landed between the reads"
         );
         assert_eq!(app.core.config_generation(), 1);
+    }
+
+    /// #312, F5: each profile in `tessera_config_json` names its source,
+    /// `[[profiles]]` entries first; an edit of a file profile through
+    /// the C ABI is refused (`TESSERA_ERROR_INVALID_ARGUMENT`, as any edit
+    /// the editor does not make) with its message and writes nothing,
+    /// and an edit of a `config.toml` profile is saved.
+    #[test]
+    fn profiles_carry_their_source_and_file_profiles_are_not_edited() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = tessera_app_core::ConfigPaths::new(dir.path());
+        std::fs::create_dir_all(paths.profiles_dir()).unwrap();
+        std::fs::write(paths.config_file(), "[[profiles]]\nname = \"entry\"\n").unwrap();
+        let file = paths.profiles_dir().join("work.toml");
+        std::fs::write(&file, "command = \"/bin/zsh\"\n").unwrap();
+        let store = tessera_config::ConfigStore::open(paths.clone()).unwrap();
+        let app = App {
+            core: tessera_app_core::App::new((*store.config()).clone(), paths.clone()),
+        };
+        let mut buf = vec![0u8; 1 << 20];
+        let mut len = 0usize;
+        // SAFETY: a live handle, a writable length and a buffer of its size.
+        let code = unsafe {
+            tessera_config_json(
+                std::ptr::from_ref(&app),
+                buf.as_mut_ptr(),
+                buf.len(),
+                &raw mut len,
+            )
+        };
+        assert_eq!(code, Error::Ok);
+        let json: serde_json::Value = serde_json::from_slice(&buf[..len]).unwrap();
+        let profiles: Vec<_> = json["config"]["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|profile| (profile["name"].clone(), profile["source"].clone()))
+            .collect();
+        assert_eq!(
+            profiles,
+            [
+                (serde_json::json!("entry"), serde_json::json!("config")),
+                (
+                    serde_json::json!("work"),
+                    serde_json::json!("profiles/work.toml")
+                ),
+            ]
+        );
+
+        let config_before = std::fs::read(paths.config_file()).unwrap();
+        let file_before = std::fs::read(&file).unwrap();
+        let set = || Change::Set(TomlValue::String("/bin/sh".into()));
+        let failure = edit("test", &app, "profiles[1].command", set()).unwrap_err();
+        // An edit the editor does not make, as for any unsupported one.
+        assert_eq!(failure.code, Error::InvalidArgument, "{}", failure.message);
+        assert!(
+            failure
+                .message
+                .contains(tessera_config::edit::FILE_PROFILE_REFUSED),
+            "{}",
+            failure.message
+        );
+        assert_eq!(std::fs::read(paths.config_file()).unwrap(), config_before);
+        assert_eq!(std::fs::read(&file).unwrap(), file_before);
+
+        if let Err(failure) = edit("test", &app, "profiles[0].command", set()) {
+            panic!("{}", failure.message);
+        }
+        let saved = std::fs::read_to_string(paths.config_file()).unwrap();
+        assert!(saved.contains("command = \"/bin/sh\""), "{saved}");
+        assert_eq!(std::fs::read(&file).unwrap(), file_before);
+    }
+
+    /// #312 B1: a profile file deleted after the configuration was
+    /// applied leaves the editor no file profiles, so `profiles[1]` (the
+    /// caller's index of that file's profile) would be one past the
+    /// entries and append to `config.toml`. The applied configuration
+    /// still names it a file's profile, so the edit is refused and nothing
+    /// is written.
+    #[test]
+    fn a_file_profile_deleted_since_the_last_apply_is_not_edited() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = tessera_app_core::ConfigPaths::new(dir.path());
+        std::fs::create_dir_all(paths.profiles_dir()).unwrap();
+        std::fs::write(paths.config_file(), "[[profiles]]\nname = \"entry\"\n").unwrap();
+        let file = paths.profiles_dir().join("p00.toml");
+        std::fs::write(&file, "command = \"/bin/p00\"\n").unwrap();
+        let store = tessera_config::ConfigStore::open(paths.clone()).unwrap();
+        let app = App {
+            core: tessera_app_core::App::new((*store.config()).clone(), paths.clone()),
+        };
+        std::fs::remove_file(&file).unwrap();
+        let before = std::fs::read(paths.config_file()).unwrap();
+        let set = || Change::Set(TomlValue::String("/bin/meant-for-file".into()));
+        for change in [set(), Change::Remove] {
+            let failure = edit("test", &app, "profiles[1].command", change).unwrap_err();
+            assert_eq!(failure.code, Error::InvalidArgument, "{}", failure.message);
+            assert!(
+                failure
+                    .message
+                    .contains(tessera_config::edit::FILE_PROFILE_REFUSED),
+                "{}",
+                failure.message
+            );
+        }
+        let failure = edit("test", &app, "profiles[1]", Change::Remove).unwrap_err();
+        assert_eq!(failure.code, Error::InvalidArgument, "{}", failure.message);
+        assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
+        // The entry itself is still edited.
+        if let Err(failure) = edit("test", &app, "profiles[0].command", set()) {
+            panic!("{}", failure.message);
+        }
     }
 
     #[test]

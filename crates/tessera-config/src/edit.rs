@@ -557,8 +557,25 @@ impl ConfigEditor {
     /// An integer set where the loader reads a float (`opacity`) is
     /// written as a float (`1.0`). Replacing an array keeps the comments
     /// between its brackets, each on a line of its own above the key.
+    ///
+    /// A profile that a file in `profiles/` defines is not edited here
+    /// (#312): in the configuration the app reads, the files' profiles
+    /// follow the `[[profiles]]` entries, and a path into one of them
+    /// (`profiles[N]` and on, `N` the number of entries, as many as the
+    /// files define) is refused with [`EditError::Unsupported`] and
+    /// [`FILE_PROFILE_REFUSED`], also by [`ConfigEditor::remove`].
+    /// [`ConfigEditor::add_profile`] still adds an entry, before them.
     pub fn set(&mut self, path: &str, value: toml::Value) -> Result<(), EditError> {
         let path: KeyPath = path.parse()?;
+        self.not_in_a_profile_file(&path)?;
+        self.set_path(&path, value)
+    }
+
+    /// [`ConfigEditor::set`] of a parsed `path`, which may be one past the
+    /// last `[[profiles]]` entry with profile files after it
+    /// ([`ConfigEditor::add_profile`]).
+    fn set_path(&mut self, path: &KeyPath, value: toml::Value) -> Result<(), EditError> {
+        let path = path.clone();
         let state = self.prepare_set(&path, &value)?;
         // The loader takes an integer for a float key; the file should say
         // what the setting is (`opacity = 1.0`, #324 item 4).
@@ -630,6 +647,7 @@ impl ConfigEditor {
             reason,
         };
         past_profile_cap(&path)?;
+        self.not_in_a_profile_file(&path)?;
         let mut doc = self.doc.clone();
         let carried = cut_leading_decor(&mut doc, &path.0);
         let marked = doc.to_string();
@@ -663,14 +681,52 @@ impl ConfigEditor {
     ///
     /// As for [`ConfigEditor::set`]; [`EditError::Unsupported`] when the
     /// file has [`MAX_PROFILES`](crate::MAX_PROFILES) profiles already (a
-    /// set anywhere in a profile past the cap is refused the same way).
+    /// set anywhere in a profile past the cap is refused the same way), or
+    /// has, with the profiles of the files in `profiles/` (which come after
+    /// the entries and move up one), that many already.
     pub fn add_profile(&mut self, name: &str) -> Result<usize, EditError> {
         let index = self.profile_count();
-        self.set(
-            &format!("profiles[{index}].name"),
-            toml::Value::String(name.to_owned()),
-        )?;
+        let path: KeyPath = format!("profiles[{index}].name").parse()?;
+        // The new entry goes before the profile files' profiles, which
+        // move up one; with the cap reached, the last of them would drop.
+        if index < crate::MAX_PROFILES
+            && index.saturating_add(self.file_profiles()) >= crate::MAX_PROFILES
+        {
+            return Err(EditError::Unsupported {
+                path,
+                reason: "the first 256 profiles, with those in profiles/, are read; one more would push one out",
+            });
+        }
+        self.set_path(&path, toml::Value::String(name.to_owned()))?;
         Ok(index)
+    }
+
+    /// [`EditError::Unsupported`] when `path` is in a profile that a file
+    /// in `profiles/` defines (#312): in the configuration the app reads,
+    /// the profiles of the files follow the `[[profiles]]` entries, so
+    /// `profiles[i]` with `i` from the number of entries on is a file's.
+    /// The editor writes `config.toml` only, and an edit there would
+    /// change (or add) another profile than the one asked for, so it is
+    /// refused; the file is edited by hand (ADR 0040).
+    fn not_in_a_profile_file(&self, path: &KeyPath) -> Result<(), EditError> {
+        if let [Step::Key(key), Step::Index(index), ..] = &path.0[..]
+            && key == "profiles"
+            && *index >= self.profile_count()
+            && *index - self.profile_count() < self.file_profiles()
+        {
+            return Err(EditError::Unsupported {
+                path: path.clone(),
+                reason: FILE_PROFILE_REFUSED,
+            });
+        }
+        Ok(())
+    }
+
+    /// How many profiles the files in `profiles/` next to the opened path
+    /// define (those that load), read now; see
+    /// [`ConfigEditor::not_in_a_profile_file`].
+    fn file_profiles(&self) -> usize {
+        crate::profile_files::load(&self.path.with_file_name("profiles")).count()
     }
 
     /// Checks the edited document `text` and keeps it, or returns why not.
@@ -1117,7 +1173,10 @@ fn renumbered(warnings: &[Warning], path: &KeyPath) -> Vec<Warning> {
             | Warning::ThemeNotFound { .. }
             | Warning::ThemeInvalid { .. }
             | Warning::KeyBinding { .. }
-            | Warning::TooManyKeyBindings { .. } => Some(warning.clone()),
+            | Warning::TooManyKeyBindings { .. }
+            | Warning::ProfileFile { .. }
+            | Warning::ProfileFileIgnored { .. }
+            | Warning::TooManyProfileFiles { .. } => Some(warning.clone()),
         })
         .collect()
 }
@@ -1159,6 +1218,11 @@ fn plain_at<'a>(table: &'a toml::Table, steps: &[Step]) -> Option<&'a toml::Valu
     }
     Some(node)
 }
+
+/// The reason of the [`EditError::Unsupported`] for an edit of a profile
+/// that a file in `profiles/` defines.
+pub const FILE_PROFILE_REFUSED: &str =
+    "this profile is defined in a file in profiles/, not in config.toml; edit that file instead";
 
 /// [`EditError::Unsupported`] when `path` is in a profile past
 /// [`MAX_PROFILES`](crate::MAX_PROFILES). The loader drops those, so the
