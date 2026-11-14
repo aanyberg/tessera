@@ -638,7 +638,7 @@ fn render_document(sections: &[Section]) -> String {
          variable names (unset by default; for tests and side-by-side installs). Starting Tessera \
          writes no configuration there: without the file the defaults apply, and the file is \
          written, with every default commented, only when the app is asked to open it for \
-         editing (a file you create yourself is picked up within a few seconds and never \
+         editing or a change is saved in the Settings window (a file you create yourself is picked up within a few seconds and never \
          replaced). \
          Saved edits of the file, and of the theme file in use under `themes/`, apply to every \
          open window at once. Every key is optional: a missing key \
