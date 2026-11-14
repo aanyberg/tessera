@@ -199,10 +199,13 @@ the pasteboard on the main actor (`CallbackBridge`, through an injectable
   line. `D`'s first option is the exit code (an `i32`, `None` otherwise).
   D-PENDING: the mark goes on the cursor's line when parsed, a pending wrap
   left alone (kitty's `cursor->y`). D-ALT: marks on the alternate screen
-  are dropped; its lines vanish on leave. D-DUP: `Line::set_mark` keeps one
-  mark of each kind per line, the new one last, so a redrawn prompt does
-  not pile marks up; a re-wrap keeps the rule too (D-MARKPOS, amended
-  2026-11-03 below). D-FRESH: `133;A` does not move the cursor.
+  are dropped; its lines vanish on leave. A `D` also turns modes off and
+  leaves the alternate screen, carrying its text onto the primary one
+  (ADR 0020, "Amendment: modes a dead program left on", #461). D-DUP:
+  `Line::set_mark` keeps one mark of each kind per line, the new one last,
+  so a redrawn prompt does not pile marks up; a re-wrap keeps the rule too
+  (D-MARKPOS, amended 2026-11-03 below). D-FRESH: `133;A` does not move the
+  cursor.
 
 ### Amendment 2026-11-03: marks in reflow, Clear to Start, clipboard switch (#181, #132)
 

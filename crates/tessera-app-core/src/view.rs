@@ -2727,7 +2727,9 @@ mod tests {
     }
 
     /// The alternate screen shows no marks (and refuses new ones); back on
-    /// the primary screen they are there again.
+    /// the primary screen they are there again. The marks sent there stop
+    /// before a command end, which would leave the alternate screen
+    /// (#461).
     #[test]
     fn the_alternate_screen_has_no_marks() {
         let mut term = Terminal::new(4, 20);
@@ -2737,7 +2739,7 @@ mod tests {
         snapshot.capture(&term, 0);
         assert_eq!(snapshot.gutter().len(), 1);
         term.advance(b"\x1b[?1049h");
-        term.advance(command("true", "", ";0").as_bytes());
+        term.advance(format!("{PROMPT}true\r\n\x1b]133;C\x07").as_bytes());
         snapshot.capture(&term, 0);
         assert_eq!(snapshot.gutter(), [], "none on the alternate screen");
         snapshot.capture(&term, 2);

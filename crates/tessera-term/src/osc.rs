@@ -63,7 +63,11 @@
 //! mark of each kind per line, [`Line::set_mark`](tessera_grid::Line::set_mark)):
 //! on the line the cursor is on when the sequence is parsed, a pending wrap
 //! left as it is. Marks received on the alternate screen are dropped, as
-//! the lines they would land on vanish when the program leaves it.
+//! the lines they would land on vanish when the program leaves it. A
+//! command end (`D`) received on either screen first turns off the input
+//! modes a dead command may have left on, the alternate screen included
+//! (see the `modes` module, #461); one received on the alternate screen is
+//! still dropped.
 //! Every mark the grid takes is also reported as [`Request::Mark`] with the
 //! line's absolute id, coalesced to the last mark of each kind per
 //! [`Terminal::advance`](crate::Terminal::advance) call (ADR 0039). The
@@ -282,13 +286,21 @@ impl State {
         }
     }
 
-    /// `OSC 133`: marks the cursor's line on the main screen.
+    /// `OSC 133`: marks the cursor's line on the main screen. A command
+    /// end, on either screen, first turns off the modes a dead command
+    /// may have left on (#461).
     fn osc_mark(&mut self, args: &[Vec<u8>]) {
         let Some(mark) = Mark::from_osc133(&args.join(&b';')) else {
             trace!("OSC 133 that is no mark ignored");
             return;
         };
-        if self.grid.is_alt_screen() {
+        // Decided before the reset leaves the alternate screen: a mark
+        // received there is dropped all the same.
+        let alt = self.grid.is_alt_screen();
+        if matches!(mark, Mark::CommandEnd { .. }) {
+            self.command_end_reset_modes();
+        }
+        if alt {
             trace!(?mark, "OSC 133 on the alternate screen ignored");
             return;
         }
