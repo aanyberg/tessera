@@ -11,6 +11,7 @@
 //! | `CSI 5 n` | DSR | `CSI 0 n` |
 //! | `CSI 6 n` | CPR | `CSI row ; col R` |
 //! | `CSI ? Ps n` | DEC DSR | `?6` DECXCPR, `?15`, `?25`, `?26`, `?55`, `?56`, `?75`, `?85` with xterm's level gates |
+//! | `CSI ? 996 n` | colour scheme | `CSI ? 997 ; 1 n` dark, `CSI ? 997 ; 2 n` light, at every level and whether or not 2031 is on (see the `osc_color` module) |
 //! | `CSI Ps $ p`, `CSI ? Ps $ p` | DECRQM | `CSI Ps ; Pm $ y`, `CSI ? Ps ; Pm $ y`, one for every query |
 //! | `CSI ? u` | kitty keyboard flags | `CSI ? flags u` from the active screen's stack |
 //! | `DCS $ q Pt ST` | DECRQSS | `DCS 1 $ r ... ST` for `m`, `r`, `s` (level 4 and up), ` q`, `" p` and `" q`, `DCS 0 $ r ST` otherwise |
@@ -45,7 +46,8 @@
 //! A query whose answer would be a lie or a security hole gets none:
 //! DA1/DA2/DA3/XTVERSION with a non-zero parameter, DSR other than 5 and
 //! 6, DEC DSRs other than the ones above (`?53`, `?62` and `?63` among
-//! them), the window reports `CSI 11 t`, `13 t`, `14 ; 2 t`, `15 t`, `20 t`
+//! them, and the colour scheme report form `?997` a program may echo
+//! back), `CSI 996 n` without the `?`, the window reports `CSI 11 t`, `13 t`, `14 ; 2 t`, `15 t`, `20 t`
 //! and `21 t` (a title is never echoed back), `CSI 14 t` and `16 t` while
 //! the cell size is unknown, `CSI ? N u` with a non-zero parameter (the
 //! terminal's own reply form; the parser reports `CSI ? 0 u` like the query
@@ -63,7 +65,9 @@
 //! SRM 12, DECANM `?2`) or 4 (permanently reset: KAM 2, CRM 3, DECSCLM
 //! `?4`, DECARM `?8` and the ANSI modes DEC lists as permanently reset).
 //! Synchronized output (`?2026`) answers its real state, as the
-//! synchronized-output specification asks; xterm does not know it.
+//! synchronized-output specification asks; xterm does not know it. So
+//! does colour scheme updates (`?2031`): 1 set, 2 reset, as tmux, kitty
+//! and foot answer (neovim turns the mode on only after a 1 or a 2).
 //!
 //! # Title stack
 //!
@@ -283,6 +287,8 @@ impl State {
             (56, true) if level >= 3 => self.reply_csi(format_args!("?57;0n")),
             (75, true) if level >= 4 => self.reply_csi(format_args!("?70n")),
             (85, true) if level >= 4 => self.reply_csi(format_args!("?83n")),
+            // Not a DEC DSR: no level gate (Contour's colour scheme query).
+            (996, true) => self.report_color_scheme(self.colors.scheme_now()),
             (ps, dec) => trace!(ps, dec, "DSR not answered"),
         }
     }
@@ -357,6 +363,7 @@ impl State {
             1016 => of(modes.mouse_encoding == MouseEncoding::SgrPixels),
             2004 => of(modes.bracketed_paste),
             2026 => of(modes.synchronized_output),
+            2031 => of(modes.color_scheme_updates),
             _ => ModeReport::Unknown,
         }
     }

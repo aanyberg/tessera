@@ -690,8 +690,10 @@ fn timed_on(runs: usize, setup: &[u8], ops: &[u8]) -> std::time::Duration {
 }
 
 /// B02 with clusters and links (#251 round 1, B1): a DECCRA that copies
-/// the left half of every row onto itself, on a screen of clusters or of
-/// linked cells, so each destination row keeps entries right of the copy,
+/// the left half of every row one column to the right (onto itself would
+/// be the exact self copy, a no-op since #269), on a screen of clusters or
+/// of linked cells, so each destination row keeps entries left and right
+/// of the copy,
 /// costs a constant per cell, like ED 2 on the same screen, one at a time
 /// and as a flood of 256 (the screen stays full, so each costs the same):
 /// within 10 times ED 2 (measured: 3 times over clusters, 6 over links,
@@ -701,7 +703,7 @@ fn timed_on(runs: usize, setup: &[u8], ops: &[u8]) -> std::time::Duration {
 #[cfg_attr(debug_assertions, ignore = "timing: release only")]
 fn b02_partial_copies_over_clusters_and_links_cost_a_constant_per_cell() {
     use std::time::Duration;
-    let copy = b"\x1b[1;1;1024;1024;1;1;1;1$v";
+    let copy = b"\x1b[1;1;1024;1024;1;1;2;1$v";
     for kind in ["clusters", "links"] {
         let setup = filled_largest(kind);
         let erase = timed_on(3, &setup, b"\x1b[2J");

@@ -1,0 +1,611 @@
+# =============================================================================
+# tessera-term: the colour-scheme query CSI ? 996 n and mode 2031 (unsolicited reports)   (issue #269, wave 21 task 21.2)
+# crates/tessera-term/tests/fixtures/color_scheme_spec.txt   (from the spec-researcher fixture spec/269-color-scheme.md, 2026-11-14)
+# Companion: reports_spec.txt (the reply path, DECRQM), osc_color_spec.txt (OSC 10/11/111, the theme and its overrides).
+#
+# FORMAT (one table-driven test, tests/color_scheme.rs, through common::check_table; every failing id is reported;
+# each row also runs byte by byte and with every feed step split in two at every offset)
+#   ### ID / size: RxC / step: feed <bytes> / reply: <bytes>|none / cite: / note: / flags:   as reports_spec.txt.
+#         \e is ESC, \x07 BEL, \x9b C1 CSI. `reply:` is the concatenation of every Request::Reply queued since the previous
+#         `reply:` (or the row start), the unsolicited 2031 reports included.
+#   step: set theme <spec> [(N times)]   Terminal::set_theme_colors(..), N times in a row; <spec> is one of
+#         default             ThemeColors::default() (fg #e5e5e5 bg #000000)                      DARK
+#         D                   osc_color_spec TEST THEME T  (fg #d0d0d0 bg #101010 cursor #ffcc00)   DARK
+#         D2                  osc_color_spec TEST THEME T2 (fg #aabbcc bg #223344 cursor #00ff00)   DARK, every colour differs from D
+#         L                   fg #202020 bg #f0f0f0 cursor #000000, palette as D                   LIGHT
+#         bg #rrggbb          D with only bg replaced
+#         fg #rrggbb bg #rrggbb   D with fg and bg replaced
+#         Rows start on Terminal::new (the default theme) and set their theme explicitly.
+#   step: set size RxC   Terminal::resize.
+#   screen:   the `>` lines that follow are the first screen rows (common::render_screen, `|` after the cursor cell); every
+#             row of the screen below them must be blank.
+#
+# The reply is `ESC [ ? 997 ; <scheme> n`, scheme 1 = dark, 2 = light, 9 bytes in 7-bit mode (C1 CSI once 8-bit controls are on).
+#
+# SOURCES: see spec/269-color-scheme.md (Contour "dark and light mode detection" page and Screen.cpp, tmux input.c / window.c /
+# colour.c, Ghostty Termio, kitty screen.c, foot csi.c, neovim _defaults.lua and tui.c; all read from source by the researcher).
+#
+# DECISIONS (milestone lead, brief 21.2, 2026-11-14)
+#   D-LUMA  / D21-1  The scheme is a function of the EFFECTIVE default background (theme + program override): light iff
+#                    299*r + 587*g + 114*b > 127500 (Rec.601, Y > 127.5), else dark. OSC 10 (foreground) and OSC 4 never decide.
+#   D-OSC   / D21-2  The scheme is recomputed on every change of the effective background: set_theme_colors, OSC 11, OSC 111, RIS.
+#                    A program's own OSC 11/111 that flips the scheme reports under 2031 (as tmux does).
+#   D-DEDUP          A report only when the scheme VALUE changes. The stored scheme follows every recompute, 2031 set or not.
+#   D-ENABLE         CSI ? 2031 h sends nothing; programs ask CSI ? 996 n for the first value.
+#   D-RQM            DECRQM ?2031 answers 1 set, 2 reset (never 0: the pinned rows RM36/RM37 of reports_spec.txt moved to ;2).
+#                    996 is answered whether 2031 is set or not.
+#   D-DSR-SHAPE      Only the first parameter counts; not gated by conformance level; CSI 996 n (no `?`) and the reply form
+#                    CSI ? 997 ... n are never answered.
+#   D-RESET / D21-3  RIS, DECSTR and DECSCL clear 2031; no reset sends a report (the mode is off before the colours a reset drops
+#                    are looked at). 2031 survives alternate-screen switches (D-ALT).
+#   D-FLOOD / D21-4  Reports go through the one reply outbox and its cap (ADR 0024). A report that does not fit is dropped like
+#                    any other reply (no coalescing); the stored scheme still advances and the program re-queries with 996.
+#
+# DEVIATIONS FROM THE RESEARCH FIXTURE (layout only, the expected bytes are unchanged)
+#   - Section B's one-line rows are written out as full rows (set theme, feed 996, reply).
+#   - CS07's `screen: >abcd|` is written in the render format of the other fixtures: `>abcd |` (the cursor cell is the blank
+#     after `d`), and only the first screen row is listed.
+#   - CS59's "10 000 times" is the step `set theme L (10000 times)`.
+#   - CS56 gains `reply: \e[?997;1n` after its `set theme D`: 2031 is set at that step, so the change reports exactly as in CS51;
+#     the research row's single `reply: none` after the re-enable would have swallowed it. The re-enable itself still sends nothing.
+# =============================================================================
+
+### CS01_query_default_theme_is_dark
+size: 24x80
+step: feed \e[?996n
+reply: \e[?997;1n
+cite: [CS] Contour dark/light spec: "Send CSI ? 996 n ... reply CSI ? 997 ; 1 n for dark mode"; default bg #000000 -> D-LUMA dark (osc_color.rs:172)
+flags: control
+
+### CS02_query_dark_theme
+size: 24x80
+step: set theme D
+step: feed \e[?996n
+reply: \e[?997;1n
+cite: [CS] reply 1 = dark; D bg #101010, Y=16
+
+### CS03_query_light_theme
+size: 24x80
+step: set theme L
+step: feed \e[?996n
+reply: \e[?997;2n
+cite: [CS] reply 2 = light; L bg #f0f0f0, Y=240
+
+### CS04_query_two_in_a_row
+size: 24x80
+step: set theme L
+step: feed \e[?996n\e[?996n
+reply: \e[?997;2n\e[?997;2n
+cite: [CS] one reply per query (the DSR arm answers each); D-FLOOD
+
+### CS05_query_answers_with_2031_reset
+size: 24x80
+step: set theme L
+step: feed \e[?2031l\e[?996n
+reply: \e[?997;2n
+cite: D-RQM: 996 is independent of 2031 (tmux input_csi_dispatch INPUT_CSI_DSR_PRIVATE case 996 unconditional; Ghostty .color_scheme force=true)
+
+### CS06_query_answers_with_2031_set_and_adds_nothing
+size: 24x80
+step: set theme L
+step: feed \e[?2031h\e[?996n
+reply: \e[?997;2n
+cite: D-ENABLE: the enable sends nothing, the query exactly one reply
+
+### CS07_query_does_not_print_or_move_cursor
+size: 24x80
+step: feed ab\e[?996ncd
+reply: \e[?997;1n
+screen:
+>abcd |
+cite: [XT] DSR consumes no text; same shape as the other DSR rows in reports_spec.txt
+
+### CS08_query_first_param_counts
+size: 24x80
+step: feed \e[?996;5n
+reply: \e[?997;1n
+cite: D-DSR-SHAPE: device_status uses the first parameter only (xterm CASE_DSR)
+flags: decision
+
+### CS09_ansi_996_is_silent
+size: 24x80
+step: feed \e[996n
+reply: none
+cite: D-DSR-SHAPE: only the private DSR; ANSI DSR 996 is unknown (xterm answers nothing for unknown DSR)
+flags: negative
+
+### CS10_reply_form_is_never_answered
+size: 24x80
+step: feed \e[?997n\e[?997;1n\e[?997;2n\e[?997;0n
+reply: none
+cite: D-DSR-SHAPE; Contour discussion #1236 (j4james): the reply uses different final digits "to avoid feedback loops"; a terminal that echoes a reply back (loopback pty) must stay silent
+flags: negative security
+
+### CS11_query_not_gated_by_conformance_level
+size: 24x80
+step: feed \e[61"p\e[?996n
+reply: \e[?997;1n
+cite: D-DSR-SHAPE: 996 is not a DEC DSR; device_status gates ?15/?25/?26/?55.. by level, this one must not be
+flags: decision
+
+### CS12_query_reply_is_8bit_in_8bit_mode
+size: 24x80
+step: feed \e[62;0"p\e[?996n
+reply: \x9b?997;1n
+cite: ADR 0024 / c1_spec.txt: replies use C1 CSI (0x9B) once 8-bit controls are on (DECSCL Pc 0/2); consistent with every other CSI reply
+flags: decision
+
+### CS13_query_bad_shapes_are_silent
+size: 24x80
+step: feed \e[>996n\e[?996$n\e[?996 n\e[?;996n
+reply: none
+cite: [XT] CSI > Ps n (modifyOtherKeys reset), an intermediate byte or an empty first parameter is not DSR ?996; first parameter 0 for the empty case
+flags: negative
+
+### CS20_bg_black
+size: 24x80
+step: set theme bg #000000
+step: feed \e[?996n
+reply: \e[?997;1n
+note: (Y=0)
+cite: D-LUMA (header)
+flags: control
+
+### CS21_bg_white
+size: 24x80
+step: set theme bg #ffffff
+step: feed \e[?996n
+reply: \e[?997;2n
+note: (Y=255)
+cite: D-LUMA (header)
+flags: control
+
+### CS22_bg_grey_7f
+size: 24x80
+step: set theme bg #7f7f7f
+step: feed \e[?996n
+reply: \e[?997;1n
+note: (Y=127.0 <= 127.5) boundary, tmux sum 381 <= 382 agrees
+cite: D-LUMA (header)
+flags: control
+
+### CS23_bg_grey_80
+size: 24x80
+step: set theme bg #808080
+step: feed \e[?996n
+reply: \e[?997;2n
+note: (Y=128.0 > 127.5) boundary, tmux sum 384 > 382 agrees
+cite: D-LUMA (header)
+flags: control
+
+### CS24_bg_blue
+size: 24x80
+step: set theme bg #0000ff
+step: feed \e[?996n
+reply: \e[?997;1n
+note: (Y=29.1) tmux: 255 dark, agrees
+cite: D-LUMA (header)
+flags: control
+
+### CS25_bg_green
+size: 24x80
+step: set theme bg #00ff00
+step: feed \e[?996n
+reply: \e[?997;2n
+note: (Y=149.7) tmux: 255 <= 382 = DARK, DISAGREES (flag decision)
+cite: D-LUMA (header)
+flags: decision
+
+### CS26_bg_magenta
+size: 24x80
+step: set theme bg #ff00ff
+step: feed \e[?996n
+reply: \e[?997;1n
+note: (Y=104.9) tmux: 510 > 382 = LIGHT, DISAGREES (flag decision)
+cite: D-LUMA (header)
+flags: decision
+
+### CS27_bg_yellow
+size: 24x80
+step: set theme bg #ffff00
+step: feed \e[?996n
+reply: \e[?997;2n
+note: (Y=225.9) tmux agrees
+cite: D-LUMA (header)
+flags: control
+
+### CS28_bg_solarized_dark_base03
+size: 24x80
+step: set theme bg #002b36
+step: feed \e[?996n
+reply: \e[?997;1n
+note: (Y=33.6) real dark theme
+cite: D-LUMA (header)
+flags: control
+
+### CS29_bg_solarized_light_base3
+size: 24x80
+step: set theme bg #fdf6e3
+step: feed \e[?996n
+reply: \e[?997;2n
+note: (Y=245.6) real light theme
+cite: D-LUMA (header)
+flags: control
+
+### CS30_bg_mid_dark_theme_grey_66
+size: 24x80
+step: set theme bg #666666
+step: feed \e[?996n
+reply: \e[?997;1n
+note: (Y=102) e.g. Dracula-ish dark greys stay dark
+cite: D-LUMA (header)
+flags: control
+
+### CS31_bg_mid_light_grey_99
+size: 24x80
+step: set theme bg #999999
+step: feed \e[?996n
+reply: \e[?997;2n
+note: (Y=153)
+cite: D-LUMA (header)
+flags: control
+
+### CS32_fg_does_not_decide_light_fg_light_bg
+size: 24x80
+step: set theme fg #ffffff bg #ffffff
+step: feed \e[?996n
+reply: \e[?997;2n
+note: (a foreground-based rule answers dark)
+cite: D-LUMA (header)
+flags: control
+
+### CS33_fg_does_not_decide_dark_fg_dark_bg
+size: 24x80
+step: set theme fg #000000 bg #000000
+step: feed \e[?996n
+reply: \e[?997;1n
+note: (a foreground-based rule answers light)
+cite: D-LUMA (header)
+flags: control
+
+### CS34_program_osc11_bg_decides
+size: 24x80
+step: set theme D
+step: feed \e]11;#ffffff\x07
+step: feed \e[?996n
+reply: \e[?997;2n
+note: (effective bg = override; D-OSC)
+cite: D-LUMA (header)
+flags: control
+
+### CS35_osc111_returns_to_theme
+size: 24x80
+step: set theme D
+step: feed \e]11;#ffffff\x07\e]111\x07
+step: feed \e[?996n
+reply: \e[?997;1n
+note: 
+cite: D-LUMA (header)
+flags: control
+
+### CS36_osc10_osc4_do_not_decide
+size: 24x80
+step: set theme D
+step: feed \e]10;#ffffff\x07\e]4;0;#ffffff\x07
+step: feed \e[?996n
+reply: \e[?997;1n
+note: (Contour's fg rule: a fg of #ffffff stays dark; use OSC 10 #000000 to see its difference: bg rule 1, fg rule 2)
+cite: D-LUMA (header)
+flags: control
+
+### CS37_bg_luma_exactly_half
+size: 24x80
+step: set theme bg #00cc44
+step: feed \e[?996n
+reply: \e[?997;1n
+note: (299*0 + 587*204 + 114*68 = 127500, Y = 127.5 exactly: not above half, dark) added in the #269 fix round: 114 integer colours land on 127500 (#01ade1 too)
+cite: D-LUMA (header)
+flags: control
+
+### CS38_bg_luma_just_above_half
+size: 24x80
+step: set theme bg #00cc45
+step: feed \e[?996n
+reply: \e[?997;2n
+note: (587*204 + 114*69 = 127614 > 127500: light) added in the #269 fix round, the near colour of CS37
+cite: D-LUMA (header)
+flags: control
+
+
+### CS40_rqm_initial_is_reset
+size: 24x80
+step: feed \e[?2031$p
+reply: \e[?2031;2$y
+cite: [VT] tmux input.c `n = (s->mode & MODE_THEME_UPDATES) ? 1 : 2` -> "\033[?%d;%d$y"; [CTL] DECRPM 1 set 2 reset; neovim tui_handle_term_mode enables only on 1/2/4
+flags: decision
+
+### CS41_rqm_set
+size: 24x80
+step: feed \e[?2031h\e[?2031$p
+reply: \e[?2031;1$y
+cite: as CS40
+
+### CS42_rqm_set_then_reset
+size: 24x80
+step: feed \e[?2031h\e[?2031l\e[?2031$p
+reply: \e[?2031;2$y
+cite: as CS40
+
+### CS43_rqm_set_twice_then_reset_once
+size: 24x80
+step: feed \e[?2031h\e[?2031h\e[?2031l\e[?2031$p
+reply: \e[?2031;2$y
+cite: [CTL] modes are booleans, no nesting count
+
+### CS44_rqm_multi_param_decset
+size: 24x80
+step: feed \e[?2031;2004h\e[?2031$p\e[?2004$p
+reply: \e[?2031;1$y\e[?2004;1$y
+cite: [CTL] DECSET takes a parameter list; every parameter applies (modes.rs set loop)
+
+### CS45_rqm_ansi_2031_is_unknown
+size: 24x80
+step: feed \e[2031h\e[?2031$p\e[2031$p
+reply: \e[?2031;2$y\e[2031;0$y
+cite: [CTL] ANSI mode space differs from DEC private: SM 2031 without `?` is not mode 2031; DECRQM ANSI 2031 -> 0 (unknown)
+flags: negative
+
+### CS46_rqm_996_997_are_not_modes
+size: 24x80
+step: feed \e[?996$p\e[?997$p
+reply: \e[?996;0$y\e[?997;0$y
+cite: [CTL] 996/997 are DSR numbers, not private modes; D-RQM0 (unknown private mode -> 0, reports_spec.txt RM36)
+flags: negative
+
+# (No XTSAVE/XTRESTORE row: Tessera does not implement `CSI ? Pm s|r` (no hit in src/); foot saves and restores 2031 and a restore sends
+# no report. If XTSAVE is ever added, 2031 joins it with "restore sends nothing".)
+
+### CS50_theme_change_dark_to_light
+size: 24x80
+step: set theme D
+step: feed \e[?2031h
+reply: none
+step: set theme L
+reply: \e[?997;2n
+cite: [CS] "send ... when the palette changes" (page "When notifications are sent"); the notification "uses the same format as the query reply"
+
+### CS51_theme_change_light_to_dark
+size: 24x80
+step: set theme L
+step: feed \e[?2031h
+reply: none
+step: set theme D
+reply: \e[?997;1n
+cite: as CS50
+
+### CS52_same_scheme_other_colours_is_silent
+size: 24x80
+step: set theme D
+step: feed \e[?2031h
+step: set theme D2
+reply: none
+cite: D-DEDUP [VT] tmux window.c `if (theme == wp->last_theme) return;`. Contour's literal "palette changes" would report; decision
+flags: decision
+
+### CS53_same_theme_again_is_silent
+size: 24x80
+step: set theme D
+step: feed \e[?2031h
+step: set theme D
+reply: none
+cite: D-DEDUP; also tessera set_theme change detection (osc_color.rs set_theme bumps only on a changed colour)
+
+### CS54_mode_reset_is_silent
+size: 24x80
+step: set theme D
+step: set theme L
+reply: none
+cite: [CS] "Send CSI ? 2031 l to disable them"; unsolicited only while set. Ghostty Termio.colorSchemeReport: `!force and !modes.get(.report_color_scheme)` returns
+
+### CS55_set_then_reset_then_change_is_silent
+size: 24x80
+step: set theme D
+step: feed \e[?2031h\e[?2031l
+step: set theme L
+reply: none
+cite: as CS54
+
+### CS56_enable_sends_nothing
+size: 24x80
+step: set theme L
+step: feed \e[?2031h
+reply: none
+step: set theme D
+reply: \e[?997;1n
+step: feed \e[?2031l\e[?2031h
+reply: none
+note: the research row had no reply line after `set theme D`; the mode is set there, so the change reports (as CS51)
+cite: D-ENABLE (Q5). [VT] tmux sets MODE_THEME_UPDATES and records last_theme, no reply; [GH] Ghostty setMode has no 2031 arm
+
+### CS57_baseline_is_the_scheme_at_enable_not_the_last_report
+size: 24x80
+step: set theme D
+step: set theme L
+step: feed \e[?2031h
+step: set theme L
+reply: none
+step: set theme D
+reply: \e[?997;1n
+cite: D-DEDUP: the stored scheme tracks every recompute while the mode is reset, so enabling while light and re-applying light is silent (tmux records last_theme at `h` for the same reason)
+
+### CS58_toggle_storm_one_report_per_change
+size: 24x80
+step: set theme D
+step: feed \e[?2031h
+step: set theme L
+step: set theme D
+step: set theme L
+step: set theme D
+reply: \e[?997;2n\e[?997;1n\e[?997;2n\e[?997;1n
+cite: D-DEDUP, D-FLOOD: 4 changes, 4 reports, in order, each exactly the new scheme
+
+### CS59_no_report_without_change_storm
+size: 24x80
+step: set theme L
+step: feed \e[?2031h
+step: set theme L (10000 times)
+reply: none
+cite: D-FLOOD
+
+### CS60_program_osc11_flip_reports
+size: 24x80
+step: set theme D
+step: feed \e[?2031h\e]11;#ffffff\x07
+reply: \e[?997;2n
+cite: D-OSC (Q2); [VT] tmux input.c OSC 11 sets PANE_THEMECHANGED -> window_pane_send_theme_update sends when the theme differs
+flags: decision
+
+### CS61_program_osc11_same_scheme_is_silent
+size: 24x80
+step: set theme D
+step: feed \e[?2031h\e]11;#202020\x07\e]11;#000000\x07
+reply: none
+cite: D-DEDUP
+
+### CS62_osc111_reset_reports_back
+size: 24x80
+step: set theme D
+step: feed \e[?2031h\e]11;#ffffff\x07
+reply: \e[?997;2n
+step: feed \e]111\x07
+reply: \e[?997;1n
+cite: D-OSC; [VT] tmux OSC 111 also sets PANE_THEMECHANGED
+
+### CS63_osc11_query_and_other_colours_are_silent
+size: 24x80
+step: set theme D
+step: feed \e[?2031h\e]11;?\x07
+reply: \e]11;rgb:1010/1010/1010\x07
+step: feed \e]10;#ffffff\x07\e]12;#ffffff\x07\e]4;0;#ffffff\x07\e]104\x07\e]110\x07\e]112\x07
+reply: none
+cite: D-LUMA: only the background decides (the OSC 11 reply bytes follow osc_color_spec.txt, 4-digit channels; copy the terminator style from there)
+flags: control
+
+### CS64_theme_change_under_program_bg_override_is_silent
+size: 24x80
+step: set theme D
+step: feed \e[?2031h\e]11;#ffffff\x07
+reply: \e[?997;2n
+step: set theme L
+reply: none
+step: feed \e]111\x07
+reply: none
+step: set theme D
+reply: \e[?997;1n
+cite: D-THEME-KEEP (osc_color_spec.txt): the override holds the effective bg across a theme change, so the scheme does not change (CS64.2); OSC 111 falls back to the NEW theme L (light = 2, already 2: silent, CS64.3); D then differs (CS64.4)
+
+### CS65_resize_and_other_modes_are_silent
+size: 24x80
+step: set theme L
+step: feed \e[?2031h
+step: set size 30x100
+step: feed \e[?1004h\e[?2004h\e[?1049h\e[?1049l\e[?5h\e[?5l
+reply: none
+cite: D-LUMA: nothing but the effective background moves the scheme (DECSCNM ?5 swaps fg/bg on screen only; it does not change the default background the reports describe: Tessera's D-REVERSE reports the colour itself)
+
+### CS66_report_order_among_other_replies
+size: 24x80
+step: set theme D
+step: feed \e[?2031h\e[5n
+reply: \e[0n
+step: set theme L
+step: feed \e[6n
+reply: \e[?997;2n\e[1;1R
+cite: ADR 0024 ordering (D-ORDER): replies leave in the order queued, the unsolicited one at the moment of the theme change
+
+### CS70_ris_clears_2031
+size: 24x80
+step: set theme D
+step: feed \e[?2031h\ec\e[?2031$p
+reply: \e[?2031;2$y
+step: set theme L
+reply: none
+cite: [XT] RIS = ReallyReset(full): modes to defaults; Tessera reset_modes (`Modes::default()` + the 2031 field); kitty do_screen_reset `modes = empty_modes`
+
+### CS71_ris_sends_no_report_even_when_the_override_dropped_flips_the_scheme
+size: 24x80
+step: set theme D
+step: feed \e[?2031h\e]11;#ffffff\x07
+reply: \e[?997;2n
+step: feed \ec
+reply: none
+step: feed \e[?996n
+reply: \e[?997;1n
+cite: D-RESET: the mode is cleared first, so dropping the override (osc_color D-THEME-KEEP: RIS returns colours to the theme) reports nothing; the query shows the new truth. Ghostty fullReset sends a NON-forced report, which the cleared mode suppresses (Termio.colorSchemeReport) -> same observable result
+flags: decision
+
+### CS72_ris_stored_scheme_follows_the_dropped_override
+size: 24x80
+step: set theme D
+step: feed \e]11;#ffffff\x07\ec\e[?2031h
+step: set theme L
+reply: \e[?997;2n
+cite: the stored scheme must be recomputed by RIS (override gone: dark), else the enable above starts from a stale "light" baseline and the change to L is swallowed: this row fails on an implementation that forgets to recompute on RIS
+flags: control
+
+### CS73_decstr_clears_2031
+size: 24x80
+step: set theme D
+step: feed \e[?2031h\e[!p\e[?2031$p
+reply: \e[?2031;2$y
+step: set theme L
+reply: none
+cite: D-RESET (LEAD): not in DEC Table 5-9 / xterm ReallyReset; kitty screen_soft_reset -> do_screen_reset clears every mode (per a summary of screen.c; likely); Tessera soft_reset_modes already clears 2026 for the same dead-program reason. ALTERNATIVE (xterm-faithful): `;1` and the change reports `\e[?997;2n`
+flags: decision
+
+### CS74_decstr_keeps_the_theme_and_the_scheme
+size: 24x80
+step: set theme L
+step: feed \e[!p\e[?996n
+reply: \e[?997;2n
+cite: the theme is configuration, no reset touches it (osc_color.rs set_theme_colors docs)
+
+### CS75_2031_survives_the_alt_screen_both_ways
+size: 24x80
+step: set theme D
+step: feed \e[?2031h\e[?1049h\e[?2031$p
+reply: \e[?2031;1$y
+step: set theme L
+reply: \e[?997;2n
+step: feed \e[?1049l\e[?2031$p
+reply: \e[?2031;1$y
+step: set theme D
+reply: \e[?997;1n
+cite: D-ALT: configuration, not screen state; [GH] Ghostty keeps modes in one table, no per-screen copy
+
+### CS76_2031_set_on_alt_screen_stays_after_leaving
+size: 24x80
+step: set theme D
+step: feed \e[?1049h\e[?2031h\e[?1049l\e[?2031$p
+reply: \e[?2031;1$y
+cite: D-ALT: ?1049 save/restore touches the cursor and screen only
+flags: decision
+
+### CS77_1047_47_switches_are_silent_and_keep_the_mode
+size: 24x80
+step: set theme D
+step: feed \e[?2031h\e[?47h\e[?47l\e[?1047h\e[?1047l
+reply: none
+step: feed \e[?2031$p
+reply: \e[?2031;1$y
+cite: D-ALT
+
+### CS78_decscl_follows_decstr
+size: 24x80
+step: set theme D
+step: feed \e[?2031h\e[63;1"p\e[?2031$p
+reply: \e[?2031;2$y
+step: set theme L
+reply: none
+cite: [XT] DECSCL calls ReallyReset(soft) (decstr_spec.txt), so it follows D-RESET exactly: if the lead keeps 2031 across DECSTR this row flips to `;1` and reports `\e[?997;2n`
+flags: decision

@@ -125,3 +125,42 @@ fn deccra_allocates_one_row_of_at_most_the_screen_width() {
         assert!(largest <= usize::from(COLS) * 20, "{largest} bytes");
     }
 }
+
+/// #430 20.1 M2: an exact DECCRA self copy (destination at the source's
+/// top-left corner) allocates nothing of its own, on a screen of clusters
+/// and links where any other copy allocates per row and per cluster.
+#[test]
+fn an_exact_self_copy_allocates_nothing() {
+    let screen = |level: u8| {
+        let mut term = Terminal::new(ROWS, COLS);
+        term.advance(format!("\x1b[{level};1\"p").as_bytes());
+        term.advance(b"\x1b]8;;https://a.example/\x1b\\");
+        term.advance(
+            "e\u{301}"
+                .repeat(usize::from(ROWS) * usize::from(COLS))
+                .as_bytes(),
+        );
+        term.advance(b"\x1b]8;;\x1b\\\x1b[H");
+        term
+    };
+    for op in [
+        &b"\x1b[$v"[..],
+        b"\x1b[1;1;50;200;1;1;1;1$v",
+        b"\x1b[3;4;20;150;1;3;4;1$v",
+        b"\x1b[7;9;65535;65535;9;7;9;9$v",
+    ] {
+        let flood = op.repeat(200);
+        let mut on = screen(64);
+        let before = format!("{:?}", on.grid().visible_lines());
+        let ran = allocations_by(|| on.advance(&flood)).0;
+        assert_eq!(
+            format!("{:?}", on.grid().visible_lines()),
+            before,
+            "{:?} changed a cell",
+            String::from_utf8_lossy(op)
+        );
+        let mut off = screen(63);
+        let ignored = allocations_by(|| off.advance(&flood)).0;
+        assert_eq!(ran, ignored, "{:?}", String::from_utf8_lossy(op));
+    }
+}

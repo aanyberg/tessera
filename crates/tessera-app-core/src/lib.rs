@@ -4436,6 +4436,88 @@ mod tests {
         written_eventually(&fake, after.as_bytes());
     }
 
+    /// #269: under mode 2031 a theme apply that changes the colour scheme
+    /// reaches a child that writes nothing more: `Session::push_look`
+    /// queues the report itself rather than leaving it in the terminal for
+    /// the reader's next slice. Each report arrives once, in order, and
+    /// none for an apply that keeps the scheme.
+    ///
+    /// Nothing is lost or sent twice: the reader drains the terminal's
+    /// requests under the same lock hold as the `advance` that queued them,
+    /// so when `push_look` takes the lock no reply of the child's own is
+    /// pending, and `push_look` takes only the replies
+    /// (`Terminal::take_replies`). The `CSI 5 n` after the applies shows
+    /// the reader's next slice sends its own reply and no report again.
+    #[test]
+    fn a_colour_scheme_change_reaches_a_child_that_writes_nothing_more() {
+        let config = Config::default();
+        let dark = tessera_config::Theme::bundled("tessera-dark").expect("bundled");
+        let light = tessera_config::Theme::bundled("tessera-light").expect("bundled");
+        let app = app();
+        let events = observe(&app);
+        let (_id, fake) = attach_fake(&app, false);
+        app.apply_config(&config, dark);
+        output(&fake, &events, b"\x1b[?2031h\x1b[?996n");
+        written_eventually(&fake, b"\x1b[?997;1n");
+        lock(&fake.written).clear();
+        app.apply_config(&config, light);
+        written_eventually(&fake, b"\x1b[?997;2n");
+        app.apply_config(&config, light);
+        app.apply_config(&config, dark);
+        written_eventually(&fake, b"\x1b[?997;2n\x1b[?997;1n");
+        output(&fake, &events, b"\x1b[5n");
+        written_eventually(&fake, b"\x1b[?997;2n\x1b[?997;1n\x1b[0n");
+    }
+
+    /// S6 for the colour scheme report (#269, D21-4): a report that does
+    /// not fit in the outbox is dropped and counted like every other reply,
+    /// never queued past [`session::PENDING_INPUT_BYTES`]; a 1 MiB flood of
+    /// `CSI ? 996 n` onto the full outbox drops every answer the same way.
+    #[test]
+    fn a_colour_scheme_report_into_a_full_outbox_is_dropped_and_counted() {
+        let config = Config::default();
+        let dark = tessera_config::Theme::bundled("tessera-dark").expect("bundled");
+        let light = tessera_config::Theme::bundled("tessera-light").expect("bundled");
+        let app = app();
+        let events = observe(&app);
+        let (id, fake) = attach_fake(&app, false);
+        app.apply_config(&config, dark);
+        output(&fake, &events, b"\x1b[?2031h");
+        fake.would_block.store(true, Ordering::SeqCst);
+        let session = app.session(id).unwrap();
+        // Room for 8 bytes: one report (9) does not fit.
+        session
+            .queue_input(vec![b'x'; session::PENDING_INPUT_BYTES - 8])
+            .expect("fits");
+        let (full, _, dropped) = session.outbox_stats();
+        assert_eq!((full, dropped), (session::PENDING_INPUT_BYTES - 8, 0));
+        app.apply_config(&config, light);
+        assert_eq!(
+            session.outbox_stats().2,
+            1,
+            "the report is dropped and counted"
+        );
+        app.apply_config(&config, dark);
+        app.apply_config(&config, light);
+        let (bytes, _, dropped) = session.outbox_stats();
+        assert_eq!(
+            (bytes, dropped),
+            (full, 3),
+            "one drop per change, nothing queued"
+        );
+        let flood = b"\x1b[?996n".repeat((1 << 20) / 7);
+        for chunk in flood.chunks(64 * 1024) {
+            output(&fake, &events, chunk);
+        }
+        let (bytes, _, dropped) = session.outbox_stats();
+        assert_eq!(bytes, full, "never past the cap");
+        assert!(
+            dropped > 3,
+            "the flood's answers are dropped and counted: {dropped}"
+        );
+        app.close_session(id).unwrap();
+    }
+
     /// #10's flood bar: 1,000,000 `CSI 6 n` from a child that never reads
     /// queue each reply once, in a handful of outbox entries (never one per
     /// reply), and 2,000,000 more overflow

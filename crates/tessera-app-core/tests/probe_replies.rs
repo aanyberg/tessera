@@ -26,8 +26,8 @@
 //! The deliberate silences: `CSI 13 t` (vim's `getwinpos()`, which then
 //! waits its own timeout), `CSI 11/15/20/21 t` and `14 ; 2 t`, `CSI 14 t`
 //! and `16 t` while the session has no view (the cell size is unknown),
-//! XTGETTCAP (`DCS + q`), tmux's colour scheme query `CSI ? 996 n` (a
-//! DEC DSR outside D-DSRSET, D-996) and the clipboard read `OSC 52 ; ?`.
+//! XTGETTCAP (`DCS + q`) and the clipboard read `OSC 52 ; ?`. tmux's
+//! colour scheme query `CSI ? 996 n` is answered (#269).
 //! The OSC 4/10/11/12 colour queries are answered (#10) and their replies
 //! matched by command, index and terminator: a query that ended with BEL
 //! must read a reply that ends with BEL, one that ended with ST a reply
@@ -289,9 +289,6 @@ fn deliberate_silence(seq: &Seq) -> Option<&'static str> {
         (b'[', b't') if seq.params == b"14;2" => Some("CSI 14 ; 2 t (D-WIN2)"),
         (b'[', b't') if matches!(first, b"14" | b"16") => {
             Some("pixel size without a view (D-CELLPX)")
-        }
-        (b'[', b'n') if seq.params == b"?996" => {
-            Some("colour scheme query (theme updates, ?2031, are not implemented; D-DSRSET)")
         }
         (b'P', b'q') if seq.inters == b"+" => Some("XTGETTCAP (out of scope)"),
         (b']', _) if seq.params.starts_with(b"52;") => {

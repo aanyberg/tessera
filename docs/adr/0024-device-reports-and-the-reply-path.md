@@ -134,8 +134,10 @@ A query whose answer would be a lie or a security hole gets none, and a
 program then waits its own timeout:
 
 - DA1, DA2, DA3 and XTVERSION with a non-zero parameter; DSR other than 5
-  and 6; DEC DSRs other than the ones above (`?53`, `?62`, `?63`, and
-  tmux's colour scheme query `?996`); DA3 below level 4; DECRQSS `" p` at
+  and 6; DEC DSRs other than the ones above (`?53`, `?62`, `?63`; tmux's
+  colour scheme query `?996` is answered since #269, see the "colour
+  scheme" amendment below, and its ANSI form `CSI 996 n` and an echoed
+  `?997` report stay silent); DA3 below level 4; DECRQSS `" p` at
   level 1.
 - **D-WIN2 / D-SECURITY**: `CSI 11 t`, `13 t` (vim's `getwinpos()` waits
   its timeout), `14 ; 2 t`, `15 t`, `20 t` and `21 t`: a title is never
@@ -349,7 +351,8 @@ byte and at every two-way split. The rules live in
   only.
 - **D-REVERSE.** Under DECSCNM a query reports the colour itself; xterm
   reports the opposite one.
-- **D-996.** tmux's `CSI ? 996 n` (colour scheme) stays silent in 0.1.0.
+- **D-996.** tmux's `CSI ? 996 n` (colour scheme) stayed silent in 0.1.0;
+  #269 answers it (the "colour scheme" amendment below replaces this item).
 
 ### Theme, overrides and resets
 
@@ -511,3 +514,54 @@ two thousand 64 KiB ones.
   xterm's: xterm keeps 30 parameters (`NPARAM`), drops the rest without
   ignoring the sequence and answers from the first. Tessera follows vte
   (S1); checked against both sources (#260).
+
+## Amendment: colour scheme query and mode 2031 (#269, 2026-11-14)
+
+Replaces D-996 and the `?996` entry of the deliberate silences. Fixture:
+`crates/tessera-term/tests/fixtures/color_scheme_spec.txt` (63 rows from the specification, two luma boundary rows added in review),
+driven by `tests/color_scheme.rs`; sources: Contour's dark/light mode
+specification, tmux, Ghostty, foot, kitty and neovim, read from source.
+
+- **D-LUMA (D21-1).** The scheme is a function of the effective default
+  background (the theme's, or the program's OSC 11 override): light
+  (`2`) when `299 r + 587 g + 114 b > 127 500` on its 8-bit sRGB values
+  (Rec. 601 luma above half), dark (`1`) otherwise. The foreground (OSC
+  10) and the system appearance never decide.
+- **The query.** `CSI ? 996 n` answers `CSI ? 997 ; Ps n` with the scheme
+  now, 7-bit or 8-bit like every reply, one reply per query. Only the
+  first parameter counts, and it is not gated by the conformance level
+  (996 is not a DEC DSR). `CSI 996 n` without `?` and a `CSI ? 997 ; Ps
+  n` sent back by an echoing program get nothing, so a loopback cannot
+  feed itself.
+- **Mode 2031** (`CSI ? 2031 h` / `l`) asks for a report of the same
+  form whenever the scheme changes. Setting it sends nothing (programs
+  ask `?996` for the first value). The scheme is recomputed on every
+  change of the effective background, whoever made it: a theme pushed
+  by the application (`Terminal::set_theme_colors`), a program's OSC 11
+  or OSC 111 (D21-2), RIS. A report is queued only when the value
+  changes (D-DEDUP): a theme that moves the background within one
+  scheme, or a storm of themes, costs at most one report per change.
+- **Resets (D21-3).** RIS, DECSTR and DECSCL clear 2031; no reset sends a
+  report (the mode is off before the colours a reset drops are looked
+  at). 2031 survives alternate-screen switches. DECRQM `?2031` answers
+  `1` when set and `2` when reset (it answered `0`, not recognised).
+- **Delivery and bounds (D21-4, S6).** A report is a `Request::Reply`
+  like any answer and goes through the session's one reply outbox and
+  its cap (16 MiB, `PENDING_INPUT_BYTES`); one that does not fit is
+  dropped and counted, not coalesced. A theme change arrives from the
+  application, not from the program's output, so no reader slice would
+  carry its report to the child: `Session::push_look` drains the replies
+  the theme queued (`Terminal::take_replies`, which leaves every other
+  request queued for the reader) under the terminal lock and queues
+  them through the same outbox after dropping it. A reply the reader
+  had already drained is queued by the reader, one still in the
+  terminal by whichever drains first, so none is lost or doubled. The
+  order is not kept across the two paths: in the short window between
+  the reader dropping the terminal lock and queueing the replies it
+  drained, a theme's report can reach the outbox first. If one of those
+  replies is a `?996` answer given before the theme changed, the child
+  then reads the new scheme's report followed by the old scheme's
+  answer and believes the old scheme until the next change. The window
+  is one lock release to one outbox call on the reader thread; a fix
+  (queueing the reader's replies before it releases the lock, or
+  ordering both paths through one sequence) is tracked in #430.

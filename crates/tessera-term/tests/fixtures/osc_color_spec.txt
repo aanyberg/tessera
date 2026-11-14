@@ -50,7 +50,7 @@
 #   [VT]   neovim tui.c L350..353: `ESC ] 11 ; ? BEL` immediately followed by `ESC [ 5 n` (the DSR 5 reply is the "no answer to the
 #          colour query" sentinel; the colour answer, when there is one, arrives first); neovim parses the reply
 #          `OSC 11 ; rgb:rrrr/gggg/bbbb` terminated by BEL or ST. fish terminal.rs L323: `ESC ] 11 ; ? ESC \` (ST!) after `ESC [ 0 c`
-#          (DA1), `ESC [ > 0 q` (XTVERSION), `ESC [ ? u`, `ESC [ 6 n`; fish also enables `CSI ? 2031 h` (colour theme reporting).
+#          (DA1), `ESC [ > 0 q` (XTVERSION), `ESC [ ? u`, `ESC [ 6 n`; fish also enables `CSI ? 2031 h` (colour theme reporting, honoured since #269).
 #          tmux queries OSC 10 / OSC 11 (tty.c, `\033]10;?\033\\` and `\033]11;?\033\\`) and parses `rgb:` replies (tty-keys.c).
 #   [KT]   kitty https://sw.kovidgoyal.net/kitty/ (escape code docs "Colors" and the dynamic colours: OSC 4/10/11/12 query replies in
 #          `rgb:rrrr/gggg/bbbb`, terminator echoed; RIS resets dynamic colours; DECSTR does not). From memory of kitty/colors.c and
