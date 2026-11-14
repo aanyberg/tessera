@@ -16,7 +16,9 @@ tessera-config.workspace = true
 # Shell integration scripts and their injection on spawn (ADR 0021).
 tessera-shell-integration.workspace = true
 tessera-plugin-api.workspace = true
-tessera-plugin-hello.workspace = true
+# The first-party plugins the built-in host links in (ADR 0047), one
+# feature each.
+tessera-plugin-hello = { workspace = true, optional = true }
 # Views: one GPU surface and renderer per session (ADR 0014).
 tessera-render.workspace = true
 # Names the `Cell`s a view snapshots from the grid for the renderer.
@@ -38,6 +40,10 @@ proptest.workspace = true
 tessera-render = { workspace = true, features = ["test-hooks"] }
 
 [features]
+default = ["plugin-hello"]
+# Links in the Hello plugin (`dev.tessera.hello`), the plugin host's
+# acceptance test (ADR 0047).
+plugin-hello = ["dep:tessera-plugin-hello"]
 # Exposes `App::panic_holding_session_lock` and `App::lose_gpu_for_test`
 # for tests of the FFI layer.
 test-hooks = ["tessera-render/test-hooks"]

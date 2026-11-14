@@ -81,7 +81,7 @@ pub fn shown_host(host: &str) -> Option<String> {
 
 /// Whether `c` may appear in a title: the set `tessera-term` keeps in an
 /// OSC 0 or 2 title (ADR 0022 S3), here for a host the title is built from.
-fn shown_in_title(c: char) -> bool {
+pub(crate) fn shown_in_title(c: char) -> bool {
     !c.is_control()
         && !matches!(
             c,

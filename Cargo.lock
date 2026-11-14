@@ -2416,10 +2416,6 @@ dependencies = [
 [[package]]
 name = "tessera-control"
 version = "0.1.0"
-dependencies = [
- "tessera-protocol",
- "thiserror 2.0.21",
-]
 
 [[package]]
 name = "tessera-devtool"

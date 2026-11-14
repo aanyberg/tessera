@@ -47,6 +47,7 @@ mod error;
 mod input;
 mod keymap;
 mod panic;
+mod plugins;
 mod prompts;
 mod search;
 mod selection;
@@ -87,6 +88,7 @@ pub use keymap::tessera_app_keymap_json;
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use panic::tessera_test_panic;
+pub use plugins::tessera_app_plugins_json;
 pub use prompts::{
     tessera_session_has_command_output, tessera_session_scroll_to_prompt,
     tessera_session_select_last_output,

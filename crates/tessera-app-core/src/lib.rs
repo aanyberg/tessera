@@ -37,6 +37,7 @@ pub mod commands;
 mod config_watch;
 pub mod input;
 mod mouse;
+pub mod plugins;
 mod profile;
 pub mod remote;
 pub mod rich_text;
@@ -67,6 +68,7 @@ pub use commands::{
     MAX_PROMPT_SCAN_LINES, PROMPT_SCAN_LINES_PER_LOCK,
 };
 pub use input::{InputEvent, InputOutcome};
+pub use plugins::{PluginInfo, PluginState};
 pub use remote::{MAX_REMOTE_HOST_BYTES, Remote, SSH_PROBE_INTERVAL};
 pub use rich_text::{FormattedText, MAX_RICH_COPY_LEN, MAX_RTF_COLORS, RichCopy};
 pub use search::{MatchesText, SearchStatus};
@@ -271,6 +273,9 @@ pub struct App {
     reaper: Reaper,
     /// The configuration watch, if [`App::start_config_watch`] started one.
     config_watch: Mutex<Option<ConfigWatch>>,
+    /// The built-in plugin host (ADR 0047); looks on through the observer
+    /// slot, which always holds a [`plugins::Tee`] while the `App` lives.
+    plugins: Arc<plugins::PluginHost>,
 }
 
 impl App {
@@ -285,6 +290,26 @@ impl App {
     /// [`ConfigStore`] passes `(*store.config()).clone()` here and then
     /// hands the store to [`App::start_config_watch`].
     pub fn new(config: Config, paths: ConfigPaths) -> Self {
+        Self::with_plugin_factories(config, paths, plugins::builtin())
+    }
+
+    /// [`App::new`] with the plugins `factories` make in place of the
+    /// built-in ones, for tests of the plugin host.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn with_plugins(
+        config: Config,
+        paths: ConfigPaths,
+        factories: Vec<plugins::PluginFactory>,
+    ) -> Self {
+        Self::with_plugin_factories(config, paths, factories)
+    }
+
+    fn with_plugin_factories(
+        config: Config,
+        paths: ConfigPaths,
+        factories: Vec<plugins::PluginFactory>,
+    ) -> Self {
         let colours = tessera_config::Theme::resolve(&paths.themes_dir(), &config.appearance.theme);
         for warning in &colours.warnings {
             tracing::warn!(target: "tessera_app_core", "{warning}");
@@ -298,21 +323,30 @@ impl App {
         .default_look();
         let theme = Arc::new(Mutex::new(default_look.theme));
         let bindings = Arc::new(Bindings::new(&config));
+        let applied = Arc::new(Mutex::new(Applied {
+            config: Arc::new(config),
+            colours: colours.theme,
+            source: match colours.source {
+                tessera_config::ThemeSource::User(path) => Some(path),
+                _ => None,
+            },
+            generation: 0,
+            display: DisplayOptions::default(),
+        }));
+        let plugins = Arc::new(plugins::PluginHost::new(factories, Arc::clone(&applied)));
+        // The configuration the `App` starts with enables its plugins; no
+        // `ConfigChanged` for it.
+        plugins.apply(false);
+        let tee: Box<dyn SessionObserver> = Box::new(plugins::Tee {
+            inner: None,
+            plugins: Arc::clone(&plugins),
+        });
         Self {
-            applied: Arc::new(Mutex::new(Applied {
-                config: Arc::new(config),
-                colours: colours.theme,
-                source: match colours.source {
-                    tessera_config::ThemeSource::User(path) => Some(path),
-                    _ => None,
-                },
-                generation: 0,
-                display: DisplayOptions::default(),
-            })),
+            applied,
             paths,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
-            observers: Arc::new(RwLock::new(None)),
+            observers: Arc::new(RwLock::new(Some(tee))),
             bindings,
             views: Arc::new(Mutex::new(HashMap::new())),
             gpu: Mutex::new(None),
@@ -320,7 +354,24 @@ impl App {
             theme,
             reaper: Reaper::new(),
             config_watch: Mutex::new(None),
+            plugins,
         }
+    }
+
+    /// The plugins linked into this build, in a fixed order, with whether
+    /// `[plugins] enabled` lists each, where each stands and its status
+    /// items (ADR 0047). Activation and deactivation run on the plugin
+    /// thread, so a configuration just applied may not show yet. Never
+    /// waits for a plugin.
+    pub fn plugins(&self) -> Vec<PluginInfo> {
+        self.plugins.report()
+    }
+
+    /// The plugin event queue's counters, for tests of its cap.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn plugin_queue_stats(&self) -> plugins::QueueStats {
+        self.plugins.stats()
     }
 
     /// The configuration in effect: the one the `App` was created with,
@@ -434,6 +485,16 @@ impl App {
     /// returns the previous observer is never called again. Must therefore
     /// not be called from inside an observer.
     pub fn set_observer(&self, observer: Option<Box<dyn SessionObserver>>) {
+        // The plugin host keeps looking on (ADR 0047).
+        let tee: Box<dyn SessionObserver> = Box::new(plugins::Tee {
+            inner: observer,
+            plugins: Arc::clone(&self.plugins),
+        });
+        self.replace_observer(Some(tee));
+    }
+
+    /// Puts `observer` in the observer slot, as it is.
+    fn replace_observer(&self, observer: Option<Box<dyn SessionObserver>>) {
         let previous = std::mem::replace(
             &mut *self
                 .observers
@@ -614,6 +675,9 @@ impl App {
             .terminal
             .scrollback_lines
             .min(tessera_config::Terminal::MAX_SCROLLBACK_LINES);
+        // Before the reader starts, so plugins see the session created
+        // before any of its events.
+        self.plugins.session_created(id);
         let session = Session::start(
             id,
             pty,
@@ -626,7 +690,10 @@ impl App {
             Arc::clone(&self.applied),
             self.reaper.signal(),
         )
-        .map_err(|source| Error::ReaderThread { id, source })?;
+        .map_err(|source| {
+            self.plugins.session_closed(id);
+            Error::ReaderThread { id, source }
+        })?;
         let session = Arc::new(session);
         lock(&self.sessions).insert(id, Arc::clone(&session));
         // A configuration applied while the session started restyled the
@@ -682,6 +749,8 @@ impl App {
         drop(removed);
         let session = vec![session];
         Self::begin_closing(&session);
+        // After its last event was delivered.
+        self.plugins.session_closed(id);
         self.reaper.reap(session);
         Ok(())
     }
@@ -2682,7 +2751,10 @@ impl Drop for App {
         self.reaper.shut_down();
         // A detached reader still holds the observer slot; empty it so the
         // observer is dropped here rather than later on that thread.
-        self.set_observer(None);
+        self.replace_observer(None);
+        // Not waited for: the plugin thread deactivates every plugin and
+        // ends on its own (ADR 0047).
+        self.plugins.shut_down();
     }
 }
 
@@ -3424,13 +3496,22 @@ mod tests {
         let pid = app.session(pty_id).unwrap().child_pid().expect("child pid");
         app.close_session(pty_id).unwrap();
         wait_reaped(&app, Instant::now());
-        let expected = [
+        #[allow(unused_mut)]
+        let mut expected = vec![
             format!("tessera-session-{id}"),
             format!("tessera-input-{id}"),
             "tessera-reaper".to_owned(),
             format!("pty-reader-{pid}"),
             format!("pty-writer-{pid}"),
         ];
+        // Enabling Hello starts the plugin thread (ADR 0047).
+        #[cfg(feature = "plugin-hello")]
+        {
+            let mut config = Config::default();
+            config.plugins.enabled = vec!["dev.tessera.hello".to_owned()];
+            app.apply_config(&config, &tessera_config::Theme::default());
+            expected.push("tessera-plugins".to_owned());
+        }
         let deadline = Instant::now() + TIMEOUT;
         loop {
             let hooked = lock(&HOOKED).clone();

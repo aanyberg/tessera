@@ -139,11 +139,30 @@ kills a child that lingers past the hangup grace and joins the session's
 threads in the background. Dropping the `App` (`tessera_app_free`) waits
 for every close, about two seconds at most (ADR 0018). The threads
 `tessera-app-core` starts (each session's reader and input writer, the
-reaper and the configuration apply thread), `tessera-pty`'s reader and
+reaper, the configuration apply thread and the plugin thread
+`tessera-plugins`), `tessera-pty`'s reader and
 writer threads (`pty-reader-<pid>`, `pty-writer-<pid>`) and
 `tessera-config`'s watcher thread (`tessera-config-watch`) run at
 `QOS_CLASS_USER_INITIATED` on macOS through a start hook that `tessera-ffi`
 installs once (ADR 0018 and its amendments).
+
+## Plugin host
+
+`tessera-app-core` hosts the built-in plugins (`plugins.rs`, ADR 0047):
+first-party crates linked in by feature (`plugin-hello`, on by default),
+each enabled by listing its id in `[plugins] enabled`. A plugin gets
+exactly the capabilities its manifest declares; only `sessions`,
+`status_bar` and `storage` exist yet, and a manifest declaring any other
+is refused. The host sits in the session observer slot as a tee in front
+of the frontend's observer: `Output` passes straight through, while
+titles and command marks, and the session lifecycle from `App`, are
+queued (1024 events, the newest dropped when full) for one thread,
+`tessera-plugins`, started at the first activation. That thread
+activates and deactivates plugins as the enabled list changes, fans the
+events out and runs every plugin call under `catch_unwind`, so a slow or
+panicking plugin never holds up a session. Status items and storage are
+capped and sanitised by the host; the frontend reads them with
+`tessera_app_plugins_json`.
 
 ## Data flow for one keystroke
 
@@ -165,8 +184,8 @@ installs once (ADR 0018 and its amendments).
    scrollback lines at the scroll offset, ADR 0023) and the selection and
    hovered link clipped to them (ADR 0025) under the terminal lock, releases
    it, and draws the copy with `tessera-render` (ADR 0014).
-6. Events worth observing (`CommandFinished`, `TitleChanged`) are fanned out
-   to plugins and socket subscribers.
+6. Events worth observing (`CommandFinished`, `TitleChanged`) are queued
+   for the enabled plugins (ADR 0047) and, later, socket subscribers.
 
 ```mermaid
 sequenceDiagram

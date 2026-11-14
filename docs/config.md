@@ -55,7 +55,7 @@ Plugin enablement, keyed by plugin id.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | array of string | `[]` | Plugin ids that are enabled. |
+| `enabled` | array of string | `[]` | Plugin ids that are enabled, from the plugins built into this version (`dev.tessera.hello`). Applies when the file changes: a newly listed plugin is activated, a removed one deactivated. A plugin that declares a capability this version does not grant is refused, one that panics or fails to start is marked failed until it is removed and listed again. At most 64 ids of at most 128 bytes are read; a longer, unknown or extra id is ignored with a warning. |
 
 ## `[[profiles]]`
 
