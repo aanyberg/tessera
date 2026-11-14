@@ -700,6 +700,16 @@ impl ConfigWatch {
     /// since that watches the same store (#393 F1). Otherwise a fresh store
     /// is, as if the application started now: a missing directory is a
     /// successful load that a later broken file must not inherit.
+    ///
+    /// Xcode's Thread Performance Checker reports a priority inversion
+    /// here: the `tessera-config-apply` thread, raised by the thread start
+    /// hook, parks in `woken.recv_timeout` (a `dispatch_semaphore_wait`),
+    /// which the Checker charges to the default-QoS thread that will drop
+    /// the `ConfigWatch`, the only one that ends the wait early. Accepted
+    /// (lead decision D7-1, #417): the wait is a timed sleep between two
+    /// `stat`s, nothing waits on its result, and avoiding the park needs
+    /// tick polling (idle wake-ups) or a stop latency above
+    /// [`CONFIG_WATCH_STOP_CAP`]. See `docs/debugging.md`.
     fn wait_for(live: Live, store: ConfigStore, options: WatchOptions) -> std::io::Result<Self> {
         let paths = store.paths().clone();
         let refusing = store.last_error().is_some().then(|| store.clone());
@@ -1985,7 +1995,16 @@ mod tests {
                 for content in ["", "\u{feff}"] {
                     for opened in [false, true] {
                         cases.push(std::thread::spawn(move || {
-                            empty_file_behind_a_dangling_link(above, backend, content, opened);
+                            // A case the directory poll won proves nothing
+                            // about `open_config`: run it again.
+                            assert!(
+                                (0..5).any(|_| {
+                                    empty_file_behind_a_dangling_link(
+                                        above, backend, content, opened,
+                                    )
+                                }),
+                                "the directory poll beat open_config five times"
+                            );
                         }));
                     }
                 }
@@ -1999,13 +2018,17 @@ mod tests {
     /// One case of
     /// [`an_empty_file_appearing_behind_a_dangling_link_keeps_writes_off`];
     /// `opened`: `open_config` runs as soon as the directory appears.
+    /// `false` when `opened` but the directory poll started the watch
+    /// before `open_config` did, so the case did not test `open_config`
+    /// (#417 item 7).
     #[cfg(unix)]
+    #[must_use]
     fn empty_file_behind_a_dangling_link(
         above: bool,
         backend: WatchBackend,
         content: &str,
         opened: bool,
-    ) {
+    ) -> bool {
         let what = format!("above: {above}, {backend:?}, {content:?}, opened: {opened}");
         let base = tempfile::tempdir().unwrap();
         let volume = base.path().join("volume");
@@ -2036,6 +2059,14 @@ mod tests {
             })
             .unwrap();
             assert!(app.is_watching_config(), "{what}: open_config watches");
+            // `open_config` starts a watch of its own, which hands nothing
+            // on; the wait's watch keeps the store it refuses with.
+            let by_open_config = lock(&app.config_watch)
+                .as_ref()
+                .is_some_and(|watch| watch.refusing.is_none());
+            if !by_open_config {
+                return false;
+            }
         }
         assert!(
             eventually(CONFIG_DIR_POLL_INTERVAL + Duration::from_secs(3), || {
@@ -2056,6 +2087,7 @@ mod tests {
             }),
             "{what}: a file that loads turns them on"
         );
+        true
     }
 
     /// A configuration directory made by hand after launch is picked up:
@@ -3231,22 +3263,33 @@ mod tests {
             );
             assert!(app.is_watching_config(), "{backend:?}");
             let sea = attach_fake_profile(&app, Some("sea"));
-            if !attach_offscreen(&app, sea) {
-                return;
-            }
+            // The watch needs no GPU: without one (`TESSERA_SKIP_GPU_TESTS`)
+            // only the view's part is left out (#417 item 6).
+            let viewed = attach_offscreen(&app, sea);
             let recorder = Recorder::default();
             app.set_observer(Some(Box::new(recorder.clone())));
-            let before = view_theme_of(&app, sea).background;
+            let before = viewed.then(|| view_theme_of(&app, sea).background);
             let saved = background_of("#405060".parse().unwrap(), 1.0);
+            assert_ne!(
+                app.session_appearance(sea).unwrap().background,
+                saved,
+                "{backend:?}"
+            );
 
             std::fs::write(&file, theme_doc("Ocean", "#405060")).unwrap();
             // Generous: the poll backend sees an in-place save at its full
             // theme scan, seconds late under background QoS (#393 B2).
             assert!(
                 eventually(Duration::from_secs(30), || {
-                    view_theme_of(&app, sea).background != before
+                    app.session_appearance(sea)
+                        .unwrap()
+                        .background
+                        .iter()
+                        .zip(saved)
+                        .all(|(now, saved)| (now - saved).abs() < 1e-6)
+                        && before.is_none_or(|before| view_theme_of(&app, sea).background != before)
                 }),
-                "{backend:?}: the view draws the saved theme"
+                "{backend:?}: the session (and its view) take the saved theme"
             );
             assert_eq!(
                 app.session_appearance(sea).unwrap().background,
