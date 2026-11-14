@@ -22,6 +22,39 @@ pub const MAX_PROFILES: usize = 256;
 /// length on a character boundary with a warning (docs/security.md S5).
 pub const MAX_PROFILE_NAME_LEN: usize = 128;
 
+/// Where a [`Profile`](crate::Profile) was read from (#312).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ProfileSource {
+    /// A `[[profiles]]` entry of `config.toml`.
+    #[default]
+    Config,
+    /// The file `profiles/<stem>.toml` next to `config.toml`; holds the
+    /// stem (the file name without `.toml`).
+    File(String),
+}
+
+impl ProfileSource {
+    /// `"config"` for a `[[profiles]]` entry, else the file's path relative
+    /// to the configuration directory, `profiles/<stem>.toml`, as the
+    /// configuration JSON's `source` says it. Not escaped: a warning that
+    /// names the file escapes it ([`escaped`]).
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::Config => "config".to_owned(),
+            Self::File(stem) => format!("profiles/{stem}.toml"),
+        }
+    }
+
+    /// Whether the profile is a file's, which the configuration editor
+    /// does not edit ([`crate::edit::ConfigEditor`]).
+    #[must_use]
+    pub fn is_file(&self) -> bool {
+        matches!(self, Self::File(_))
+    }
+}
+
 /// The name of the profile used when `[general] default_profile` names no
 /// `[[profiles]]` entry and nothing else was asked for: the built-in one,
 /// `[appearance]` and the login shell. Not finding it is not worth a
@@ -267,6 +300,7 @@ mod tests {
             command: Some(format!("{name}-cmd")),
             working_directory: None,
             appearance,
+            source: ProfileSource::Config,
         }
     }
 

@@ -333,7 +333,12 @@ impl ConfigStore {
         self.write().on_apply = hook;
     }
 
-    /// Reads `config.toml`. A missing file is the defaults; a symlink whose
+    /// Reads `config.toml` and the profile files in `profiles/`, which join
+    /// its `[[profiles]]` entries (#312, [`crate::MAX_PROFILE_FILES`]; a
+    /// file that does not load is skipped with a warning). A
+    /// `config.toml` that fails to load fails the whole load, so the
+    /// configuration in use (profile files included) stays as it was. A
+    /// missing file is the defaults; a symlink whose
     /// target is missing is an error, like a symlink cycle, since the file
     /// the user keeps their settings in is somewhere and could not be read
     /// (#262 item 1). So is a file missing because the configuration
@@ -343,6 +348,14 @@ impl ConfigStore {
     /// The loader's warnings are not logged here: [`ConfigStore::apply`]
     /// logs those the store did not hold already.
     pub(crate) fn load_from_disk(&self) -> Result<FromDisk, Error> {
+        let mut from = self.load_config_file()?;
+        crate::profile_files::load_and_merge(&mut from.loaded, &self.paths.profiles_dir());
+        Ok(from)
+    }
+
+    /// `config.toml` alone, for [`ConfigStore::load_from_disk`], which adds
+    /// the profile files (#312).
+    fn load_config_file(&self) -> Result<FromDisk, Error> {
         let file = self.paths.config_file();
         let loaded = load_file_noting_empty(&file, Logging::Quiet);
         match loaded {

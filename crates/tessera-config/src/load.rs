@@ -171,11 +171,40 @@ pub enum Warning {
         /// How many entries were left out.
         dropped: usize,
     },
-    /// The file has more than [`MAX_PROFILES`](crate::MAX_PROFILES)
-    /// `[[profiles]]` entries; the first ones are read and `dropped`
-    /// others are left out.
+    /// There are more than [`MAX_PROFILES`](crate::MAX_PROFILES)
+    /// profiles, `[[profiles]]` entries and profile files together (the
+    /// entries count first, then the files in name order, #312); the first
+    /// ones are read and `dropped` others are left out.
     TooManyProfiles {
-        /// How many entries were left out.
+        /// How many profiles were left out.
+        dropped: usize,
+    },
+    /// A warning about the profile file `file` (`profiles/<stem>.toml`,
+    /// #312): what the same key in a `[[profiles]]` entry gets, its path
+    /// relative to the file (`appearance.font_size`, `name`).
+    ProfileFile {
+        /// The file's path in the configuration directory, escaped and
+        /// truncated to [`MAX_WARNING_PATH_LEN`] bytes.
+        file: String,
+        /// The warning, never itself a `ProfileFile`.
+        warning: Box<Warning>,
+    },
+    /// The profile file `file` (or, for `profiles/`, the directory) was
+    /// not loaded: too large, unreadable, not UTF-8 or not a profile. The
+    /// other profiles load. The `reason` names the kind of problem and,
+    /// for a TOML error, its line and column, never the file's text.
+    ProfileFileIgnored {
+        /// The file's path in the configuration directory, escaped and
+        /// truncated to [`MAX_WARNING_PATH_LEN`] bytes.
+        file: String,
+        /// Why, for a message.
+        reason: String,
+    },
+    /// `profiles/` holds more than
+    /// [`MAX_PROFILE_FILES`](crate::MAX_PROFILE_FILES) profile files; the
+    /// first ones by name are read and `dropped` others are not.
+    TooManyProfileFiles {
+        /// How many files were not read.
         dropped: usize,
     },
     /// A session asked for a profile (or `[general] default_profile`
@@ -212,8 +241,17 @@ impl fmt::Display for Warning {
             ),
             Self::TooManyProfiles { dropped } => write!(
                 f,
-                "{dropped} `[[profiles]]` entries past the first {} ignored",
+                "{dropped} profiles past the first {} ignored (`[[profiles]]` entries count first, then `profiles/*.toml` by name)",
                 crate::MAX_PROFILES
+            ),
+            Self::ProfileFile { file, warning } => write!(f, "{file}: {warning}"),
+            Self::ProfileFileIgnored { file, reason } => {
+                write!(f, "profile file {file} ignored: {reason}")
+            }
+            Self::TooManyProfileFiles { dropped } => write!(
+                f,
+                "{dropped} files in `profiles/` past the first {} by name not read",
+                crate::MAX_PROFILE_FILES
             ),
             Self::ProfileNotFound { name, instead } => match instead {
                 Some(instead) => write!(f, "profile `{name}` not found; using `{instead}`"),
@@ -261,12 +299,25 @@ impl Config {
     /// before), without a scoped subscriber, which would churn tracing's
     /// callsite cache on every call (#342 M6).
     pub(crate) fn from_toml_lenient_logging(text: &str, logging: Logging) -> Result<Loaded, Error> {
+        let document = toml::de::DeTable::parse(text)?;
+        Self::from_document_lenient(text, document, logging, MAX_UNKNOWN_KEY_WARNINGS)
+    }
+
+    /// [`Config::from_toml_lenient_logging`] of a document parsed already
+    /// from `text` (its spans point into `text`), reporting at most
+    /// `max_unknown` unknown keys one by one: a profile file is loaded
+    /// as the document `profiles = [<the file's table>]` (#312).
+    pub(crate) fn from_document_lenient<'i>(
+        text: &'i str,
+        document: toml::Spanned<toml::de::DeTable<'i>>,
+        logging: Logging,
+        max_unknown: usize,
+    ) -> Result<Loaded, Error> {
         // Parsed once (#233 item 6). The deserializer consumes its tree,
         // and the warnings need the document with spans afterwards (where
         // each warning's key is, for document order, and the values the
         // lenient keys replaced), so they get a copy of the part they can
         // look at: see `position_tree`.
-        let document = toml::de::DeTable::parse(text)?;
         let root = position_tree(document.get_ref());
         let de = toml::de::Deserializer::from(document);
         let mut warnings = Vec::new();
@@ -276,7 +327,7 @@ impl Config {
             let steps = path_steps(&path);
             if let Some((i, key)) = profile_window_key(&steps) {
                 warnings.extend(profile_window_warning(text, &root, &steps, i, key));
-            } else if unknown < MAX_UNKNOWN_KEY_WARNINGS {
+            } else if unknown < max_unknown {
                 unknown += 1;
                 warnings.push((
                     position(&root, &steps),

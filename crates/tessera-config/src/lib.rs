@@ -69,6 +69,7 @@ mod keys;
 mod load;
 mod paths;
 mod profile;
+mod profile_files;
 mod selection;
 mod store;
 mod theme;
@@ -95,7 +96,12 @@ pub use load::{
 };
 pub use paths::{APP_SUPPORT_DIR_NAME, CONFIG_FILE_NAME, ConfigPaths, SHELL_INTEGRATION_DIR_NAME};
 pub use profile::{
-    BUILT_IN_PROFILE_NAME, MAX_PROFILE_NAME_LEN, MAX_PROFILES, ProfileAppearance, ResolvedProfile,
+    BUILT_IN_PROFILE_NAME, MAX_PROFILE_NAME_LEN, MAX_PROFILES, ProfileAppearance, ProfileSource,
+    ResolvedProfile,
+};
+pub use profile_files::{
+    MAX_PROFILE_DIR_ENTRIES, MAX_PROFILE_FILE_LEN, MAX_PROFILE_FILE_UNKNOWN_KEY_WARNINGS,
+    MAX_PROFILE_FILES,
 };
 pub use selection::{
     CompiledRule, DEFAULT_SMART_RULES, MAX_SMART_RULE_PATTERN_LEN, MAX_SMART_RULES, Precision,
@@ -155,6 +161,27 @@ pub struct Config {
     /// Terminal emulation limits and shell integration.
     pub terminal: Terminal,
     /// Named profiles.
+    ///
+    /// A profile can also live in a file of its own: `profiles/<name>.toml`
+    /// next to `config.toml` holds the keys of one `[[profiles]]` entry,
+    /// written at the top level of the file (`command = "/bin/zsh"`, then
+    /// `[appearance]`), and its `name` defaults to the file name without
+    /// `.toml`. The profiles of the files follow the `[[profiles]]`
+    /// entries, sorted by file name (byte order, so `B.toml` before
+    /// `a.toml`); of two profiles with one name, the first is used and the
+    /// second is reported with a warning, and `default_profile` may name
+    /// either. At most 256 profiles are used in all and at most 256 files
+    /// are read (the first by name; the rest are reported with one
+    /// warning). A file larger than 64 KiB, or one that is not UTF-8 or
+    /// TOML or has a value of the wrong type, is skipped with a warning
+    /// naming it; files not ending in `.toml`, hidden files and anything
+    /// that is not a file are ignored, and symbolic links are followed. A
+    /// profile file saved, added or removed applies at once, as an edit of
+    /// `config.toml` does, with one exception: a file saved in place (not
+    /// by an editor that writes a new file and renames it over the old
+    /// one) after the first 32 by name applies with the next change in
+    /// `profiles/`. The Settings window edits `config.toml` only: it shows the
+    /// profiles of the files but does not change them (edit the file).
     pub profiles: Vec<Profile>,
     /// Plugin enablement, keyed by plugin id.
     pub plugins: Plugins,
@@ -231,8 +258,8 @@ pub struct Config {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct General {
-    /// The `[[profiles]]` entry new tabs, windows and panes use when none
-    /// is chosen (a pane split off another uses that pane's). When no
+    /// The profile (a `[[profiles]]` entry or a file in `profiles/`) new
+    /// tabs, windows and panes use when none is chosen (a pane split off another uses that pane's). When no
     /// profile has this name, the built-in one is used: `[appearance]` and
     /// the login shell (with a warning, unless the name is `"Default"`).
     pub default_profile: String,
@@ -633,6 +660,11 @@ pub struct Profile {
     /// `blur_radius` and `app_appearance` cannot be set here (the window or
     /// the app draws them): they are ignored with a warning.
     pub appearance: Option<ProfileAppearance>,
+    /// Where the profile was read from: a `[[profiles]]` entry of
+    /// `config.toml` or a file in `profiles/` (#312). Not a key: set by the
+    /// loader, never read from or written to a file.
+    #[serde(skip)]
+    pub source: ProfileSource,
 }
 
 impl Default for Profile {
@@ -642,6 +674,7 @@ impl Default for Profile {
             command: None,
             working_directory: None,
             appearance: None,
+            source: ProfileSource::Config,
         }
     }
 }

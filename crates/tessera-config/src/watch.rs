@@ -1,5 +1,5 @@
-//! Live reload: watches `config.toml` and the `themes/` directory and applies
-//! external edits.
+//! Live reload: watches `config.toml`, the `profiles/` directory and the
+//! `themes/` directory and applies external edits.
 //!
 //! Two backends share one debounce-and-apply path (ADR 0006):
 //!
@@ -33,7 +33,15 @@
 //!   and takes no slot), so a profile's theme saved in place restyles that
 //!   profile's sessions (#397). An in-place write to
 //!   any *other* theme file is not seen: it cannot change a theme in use.
-//!   Every directory met on the way to `config.toml` (those above the
+//!   The `profiles/` directory is registered like `themes/` (a profile
+//!   file added, removed or rename-saved), and so are its first 32 profile
+//!   files by stem (`MAX_PROFILE_FILES_FOLLOWED`), for an in-place save
+//!   (#312); one saved in place past them is seen with the next change in
+//!   the directory or by the poll. A profile file that is a symbolic link
+//!   puts the directories on the way to its target (and the one holding
+//!   it) on the chain below, as for `config.toml`.
+//!   Every directory met on the way to `config.toml` and to the profile
+//!   files (those above the
 //!   configuration directory, those holding a symbolic link on the way,
 //!   including a link to the file itself, and the one where a link is
 //!   missing) is registered too, so a retargeted link, one deleted and
@@ -41,16 +49,19 @@
 //!   #393 F3, #417); an event on one that changes
 //!   nothing on the way (a file written in `~`) costs a few `stat`s and
 //!   no reload.
-//! - [`WatchBackend::Poll`] samples the metadata of the file, of `themes/`
-//!   and of the theme file in use every [`WatchOptions::poll_interval`],
-//!   and of every `*.toml` file in `themes/` every twentieth interval (about
-//!   once a second by default). It is the fallback on platforms without
+//! - [`WatchBackend::Poll`] samples the metadata of the file, of `themes/`,
+//!   of the theme file in use, of `profiles/` and of its first 32 profile
+//!   files every [`WatchOptions::poll_interval`] (all of `profiles/`, up to
+//!   `MAX_PROFILE_FILES`, when the directory itself changed), and of every
+//!   `*.toml` file in `themes/` and `profiles/` every twentieth interval
+//!   (about once a second by default). It is the fallback on platforms without
 //!   `kqueue` and stays available everywhere for tests.
 //!
 //! Either way the files must be quiet for [`WatchOptions::debounce`] before
 //! they are re-read, so rapid successive writes coalesce into one event; a
 //! writer that never goes quiet is read anyway after
-//! [`WatchOptions::max_wait`]. A change to `config.toml` is reported as
+//! [`WatchOptions::max_wait`]. A change to `config.toml` or to a profile
+//! file is reported as
 //! [`ConfigEvent::Changed`] (or [`ConfigEvent::Invalid`]); a change in
 //! `themes/` as [`ConfigEvent::ThemesChanged`], after which the application
 //! resolves the theme again ([`ConfigStore::theme`]).
@@ -71,10 +82,13 @@
 //! queue, the stop pipe's two ends, the directory, the file, `themes/` and
 //! the theme file in use), plus at most eight
 //! (`MAX_UNLOADABLE_FOLLOWED`) while the configured theme's file does not
-//! load, at most eight for the profiles' themes, and one per directory on
-//! the way to `config.toml` (at most 32, `MAX_CHAIN_DIRS`, through at most
-//! eight symbolic links, `MAX_DIR_LINKS_FOLLOWED`; past either, or in a
-//! cycle, it polls `config.toml` instead, every two seconds). The
+//! load, at most eight for the profiles' themes, `profiles/` and at most
+//! 32 of its files (`MAX_PROFILE_FILES_FOLLOWED`), and one per directory
+//! on the way to `config.toml` and to the linked profile files (at most 32
+//! in all, `MAX_CHAIN_DIRS`, through at most eight symbolic links each,
+//! `MAX_DIR_LINKS_FOLLOWED`; past either, or in a cycle, it polls
+//! `config.toml` and `profiles/` instead, every two seconds): at most
+//! about 88. The
 //! application should hold a single [`Watcher`] and fan its events out to
 //! every window rather than watching once per window.
 
@@ -601,7 +615,7 @@ fn apply(store: &ConfigStore, outcome: Result<FromDisk, Error>) -> Option<Config
 enum Backend {
     Poll {
         stop: Receiver<()>,
-        baseline: PollSample,
+        baseline: Box<PollSample>,
     },
     #[cfg(any(
         target_os = "macos",
@@ -657,7 +671,10 @@ impl Backend {
         // where the second load finds nothing new.
         let themes = store.paths().themes_dir();
         let name = store.config().appearance.theme.clone();
-        let baseline = PollSample::of(store, active_theme_file(&themes, &name, None));
+        let baseline = Box::new(PollSample::of(
+            store,
+            active_theme_file(&themes, &name, None),
+        ));
         (
             Self::Poll { stop, baseline },
             Stop::Channel { _tx: stop_tx },
@@ -688,7 +705,7 @@ impl Backend {
 
     fn run(self, store: &ConfigStore, options: &WatchOptions) {
         match self {
-            Self::Poll { stop, baseline } => run_polling(store, options, baseline, &stop),
+            Self::Poll { stop, baseline } => run_polling(store, options, *baseline, &stop),
             #[cfg(any(
                 target_os = "macos",
                 target_os = "ios",
@@ -704,8 +721,9 @@ impl Backend {
 
 /// A cheap identity of the file's on-disk state, from metadata alone; see
 /// [`WatchBackend::Poll`] for what it cannot tell apart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Fingerprint {
+    #[default]
     Missing,
     Present {
         modified: Option<SystemTime>,
@@ -761,6 +779,76 @@ impl ThemesFingerprint {
     }
 }
 
+/// Most profile files the watcher samples or follows between two full
+/// listings of `profiles/`: the first by stem. The native backend holds one
+/// kqueue descriptor for each (S5), so an in-place save of one of these is
+/// seen at once; an in-place save of a file past them is seen with the
+/// next change of `profiles/` or `config.toml` there, and by the polling
+/// backend within [`POLL_FULL_THEMES_EVERY`] ticks. A file created,
+/// deleted or renamed in `profiles/` is seen at once whatever its place.
+pub(crate) const MAX_PROFILE_FILES_FOLLOWED: usize = 32;
+
+/// A cheap identity of the state of `profiles/`: the directory's own
+/// [`Fingerprint`] and that of each profile file
+/// [`crate::profile_files::list_first`] finds, in stem order, followed by
+/// the dangling links it reports (a target that appears changes them).
+/// Following symbolic links, so a linked file's target saved by rename
+/// changes it too.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ProfilesFingerprint {
+    dir: Fingerprint,
+    files: Vec<(std::path::PathBuf, Fingerprint)>,
+}
+
+impl ProfilesFingerprint {
+    /// Lists `dir` (whose own fingerprint is `dir_now`, sampled first so a
+    /// change during the listing shows on the next sample) and samples the
+    /// first `limit` profile files.
+    fn listed(dir: &Path, dir_now: Fingerprint, limit: usize) -> Self {
+        let listing = crate::profile_files::list_first(dir, limit);
+        let files = listing
+            .files
+            .into_iter()
+            .map(|(_, path)| path)
+            .chain(listing.dangling)
+            .map(|path| {
+                let fingerprint = Fingerprint::of(&path);
+                (path, fingerprint)
+            })
+            .collect();
+        Self {
+            dir: dir_now,
+            files,
+        }
+    }
+
+    /// [`ProfilesFingerprint::listed`] with the directory sampled now.
+    fn of(dir: &Path, limit: usize) -> Self {
+        Self::listed(dir, Fingerprint::of(dir), limit)
+    }
+
+    /// The same files sampled again, the first `limit` of them; the others
+    /// keep their fingerprints. `dir_now` is the directory's.
+    fn resampled(&self, dir_now: Fingerprint, limit: usize) -> Self {
+        Self {
+            dir: dir_now,
+            files: self
+                .files
+                .iter()
+                .enumerate()
+                .map(|(i, (path, seen))| {
+                    let fingerprint = if i < limit {
+                        Fingerprint::of(path)
+                    } else {
+                        *seen
+                    };
+                    (path.clone(), fingerprint)
+                })
+                .collect(),
+        }
+    }
+}
+
 #[cfg(unix)]
 fn identity_of(meta: &std::fs::Metadata) -> (u64, i64, i64) {
     use std::os::unix::fs::MetadataExt as _;
@@ -789,11 +877,21 @@ struct PollSample {
     theme_file: Option<(std::path::PathBuf, Fingerprint)>,
     /// Every theme file, refreshed every [`POLL_FULL_THEMES_EVERY`] ticks.
     themes: ThemesFingerprint,
+    /// `profiles/` and its profile files: listed in full (at most
+    /// [`crate::MAX_PROFILE_FILES`]) every [`POLL_FULL_THEMES_EVERY`] ticks
+    /// and whenever the directory's own metadata changed (a file created,
+    /// deleted or renamed), the first [`MAX_PROFILE_FILES_FOLLOWED`] files
+    /// sampled again on every tick.
+    profiles: ProfilesFingerprint,
 }
 
 impl PollSample {
     fn of(store: &ConfigStore, theme_file: Option<std::path::PathBuf>) -> Self {
         Self {
+            profiles: ProfilesFingerprint::of(
+                &store.paths().profiles_dir(),
+                crate::MAX_PROFILE_FILES,
+            ),
             config: Fingerprint::of(&store.paths().config_file()),
             themes_dir: Fingerprint::of(&store.paths().themes_dir()),
             theme_file: theme_file.map(|path| {
@@ -813,6 +911,7 @@ fn run_polling(
 ) {
     let path = store.paths().config_file();
     let themes_dir = store.paths().themes_dir();
+    let profiles_dir = store.paths().profiles_dir();
     let mut last_seen = baseline;
     let mut tick: u32 = 0;
     // When the files last changed, and when the current burst of changes
@@ -828,7 +927,17 @@ fn run_polling(
 
         let now = Instant::now();
         tick = tick.wrapping_add(1);
+        let full = tick.is_multiple_of(POLL_FULL_THEMES_EVERY);
+        let profiles_dir_now = Fingerprint::of(&profiles_dir);
+        let profiles = if full || profiles_dir_now != last_seen.profiles.dir {
+            ProfilesFingerprint::listed(&profiles_dir, profiles_dir_now, crate::MAX_PROFILE_FILES)
+        } else {
+            last_seen
+                .profiles
+                .resampled(profiles_dir_now, MAX_PROFILE_FILES_FOLLOWED)
+        };
         let mut current = PollSample {
+            profiles,
             config: Fingerprint::of(&path),
             themes_dir: Fingerprint::of(&themes_dir),
             theme_file: last_seen
@@ -837,7 +946,7 @@ fn run_polling(
                 .map(|(file, _)| (file.clone(), Fingerprint::of(file))),
             themes: last_seen.themes.clone(),
         };
-        if tick.is_multiple_of(POLL_FULL_THEMES_EVERY) {
+        if full {
             current.themes = ThemesFingerprint::of(&themes_dir);
         }
         if current != last_seen {
@@ -978,6 +1087,28 @@ mod native {
         /// of those registered. Best effort, as `unloadable`.
         profile_themes: Vec<PathBuf>,
         profile_theme_handles: Vec<File>,
+        /// The profiles directory and its handle, `None` while it is
+        /// missing (#312). As with `themes/`, its creation is seen through
+        /// the root directory's watch, and opening it follows a link, so
+        /// its watch is on the linked directory.
+        profiles: PathBuf,
+        profiles_handle: Option<File>,
+        /// The profile files followed for in-place saves: the first
+        /// [`super::MAX_PROFILE_FILES_FOLLOWED`] by stem and the dangling
+        /// links the listing reports, as of the last settle (or the open),
+        /// and the handles of those registered (best effort, as
+        /// `unloadable`; a dangling link has none). The ones that are
+        /// symbolic links are followed through the chain too
+        /// ([`Native::walk_all`]).
+        profile_files: Vec<PathBuf>,
+        profile_file_handles: Vec<File>,
+        /// The state of `profiles/` and of `profile_files` when the last
+        /// settle began. A chain event, or a poll while the backend is not
+        /// armed, that finds it changed reloads, as `config_seen` does for
+        /// `config.toml`: a linked profile file's target saved by rename,
+        /// or one that appears, is seen through a directory of the chain
+        /// only.
+        profiles_seen: super::ProfilesFingerprint,
         /// The error from the most recent [`Native::register_all`] that
         /// could not register every slot, or `None` when it registered
         /// them all. While `Some` the backend is not armed and polls, since
@@ -1253,6 +1384,10 @@ mod native {
     /// [`MAX_DIR_LINKS_FOLLOWED`] links, which includes every cycle, or
     /// more than [`MAX_CHAIN_DIRS`] directories, and the error of any
     /// other I/O failure but "not found".
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the tests' view of `walk_chain`")
+    )]
     pub(crate) fn chain_dirs(file: &Path) -> std::io::Result<Vec<PathBuf>> {
         Ok(walk_chain(file)?.into_iter().map(|(dir, _)| dir).collect())
     }
@@ -1400,11 +1535,20 @@ mod native {
                 unloadable_handles: Vec::new(),
                 profile_themes: Vec::new(),
                 profile_theme_handles: Vec::new(),
+                profiles: paths.profiles_dir(),
+                profiles_handle: None,
+                profile_files: Vec::new(),
+                profile_file_handles: Vec::new(),
+                profiles_seen: super::ProfilesFingerprint::default(),
                 register_error: None,
                 config_seen: super::Fingerprint::Missing,
                 #[cfg(test)]
                 probe: std::sync::Arc::default(),
             };
+            // Listed before the first registration, so the chain covers the
+            // linked profile files and the catch-up settle that follows,
+            // finding the same files, registers nothing twice.
+            native.profile_files = native.sample_profiles().0;
             native.rearm();
             Ok((native, stop))
         }
@@ -1462,7 +1606,14 @@ mod native {
                 &self.themes,
                 Kind::Dir,
             ));
+            note(register(
+                &mut self.queue,
+                &mut self.profiles_handle,
+                &self.profiles,
+                Kind::Dir,
+            ));
             note(self.register_theme_file());
+            self.register_profile_files();
             // The file goes last: re-registering a directory drops its
             // pending events, so a rename-save landing between opening the
             // file and re-arming the directory it was replaced in would go
@@ -1507,7 +1658,7 @@ mod native {
             self.chain_capped = false;
             let mut registered = Vec::new();
             let mut failed = None;
-            let mut resolved = walk_chain(&self.file);
+            let mut resolved = self.walk_all();
             for _ in 0..=MAX_DIR_LINKS_FOLLOWED {
                 let dirs = match resolved {
                     Ok(dirs) => dirs,
@@ -1554,7 +1705,7 @@ mod native {
                     self.chain.push((dir, slot));
                 }
                 self.drop_chain(std::mem::take(&mut registered));
-                resolved = walk_chain(&self.file);
+                resolved = self.walk_all();
                 if resolved.as_ref().is_ok_and(|now| {
                     now.iter()
                         .map(|(dir, _)| dir)
@@ -1568,6 +1719,70 @@ mod native {
             Err(std::io::Error::other(
                 "the symbolic links on the way to config.toml kept changing",
             ))
+        }
+
+        /// The directories of the chain ([`walk_chain`]): those on the way
+        /// to `config.toml`, then those on the way to `profiles/` and to
+        /// each followed profile file that is a symbolic link, with the
+        /// directory holding such a link's existing target (#312), each
+        /// once and at most [`MAX_CHAIN_DIRS`] in all (a [`ChainCapped`]
+        /// error past it). Not the root nor `profiles/` themselves, which
+        /// have watches of their own. A dangling link's walk lists the
+        /// directory where its target would appear.
+        fn walk_all(&self) -> std::io::Result<Vec<(PathBuf, bool)>> {
+            let mut dirs = walk_chain(&self.file)?;
+            let own: Vec<PathBuf> = [&self.root, &self.profiles]
+                .into_iter()
+                .filter_map(|dir| std::fs::canonicalize(dir).ok())
+                .collect();
+            let linked = self
+                .profile_files
+                .iter()
+                .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink()));
+            for path in std::iter::once(&self.profiles).chain(linked) {
+                let mut more = walk_chain(path)?;
+                if std::fs::metadata(path).is_ok()
+                    && let Some(dir) = link_dir_of(path)
+                {
+                    more.push((std::fs::canonicalize(&dir).unwrap_or(dir), false));
+                }
+                for (dir, holds_link) in more {
+                    if own.contains(&dir) {
+                        continue;
+                    }
+                    if let Some((_, held)) = dirs.iter_mut().find(|(seen, _)| *seen == dir) {
+                        *held |= holds_link;
+                        continue;
+                    }
+                    if dirs.len() == MAX_CHAIN_DIRS {
+                        return Err(ChainCapped::error(format!(
+                            "more than {MAX_CHAIN_DIRS} directories on the way to config.toml and profiles/"
+                        )));
+                    }
+                    dirs.push((dir, holds_link));
+                }
+            }
+            Ok(dirs)
+        }
+
+        /// The profile files to follow now, and the state of `profiles/`
+        /// they give ([`super::ProfilesFingerprint`]).
+        fn sample_profiles(&self) -> (Vec<PathBuf>, super::ProfilesFingerprint) {
+            let seen =
+                super::ProfilesFingerprint::of(&self.profiles, super::MAX_PROFILE_FILES_FOLLOWED);
+            let files = seen.files.iter().map(|(path, _)| path.clone()).collect();
+            (files, seen)
+        }
+
+        /// Registers the followed profile files (`profile_files`), best
+        /// effort, replacing the previous registrations. Touches no other
+        /// slot.
+        fn register_profile_files(&mut self) {
+            for old in self.profile_file_handles.drain(..) {
+                let _ = self.queue.remove_file(&old, EventFilter::EVFILT_VNODE);
+            }
+            self.profile_file_handles =
+                best_effort(&mut self.queue, &self.profile_files, "profile file");
         }
 
         /// Removes the registrations of `chain`, closing their handles.
@@ -1605,10 +1820,12 @@ mod native {
         /// Whether nothing that leads to `config.toml` changed (the test
         /// `changes_nothing` makes after its event): walks the chain once.
         fn chain_unchanged(&self) -> bool {
-            let Ok(now) = chain_dirs(&self.file) else {
+            let Ok(now) = self.walk_all() else {
                 return false;
             };
-            now.iter().eq(self.chain.iter().map(|(dir, _)| dir))
+            now.iter()
+                .map(|(dir, _)| dir)
+                .eq(self.chain.iter().map(|(dir, _)| dir))
                 && self.chain.iter().all(|(dir, slot)| match slot {
                     ChainSlot::Armed(handle) => still_names(dir, handle).unwrap_or(false),
                     ChainSlot::Missing => false,
@@ -1621,6 +1838,7 @@ mod native {
                     .as_deref()
                     .is_none_or(|dir| names_now(dir, self.link_dir_handle.as_ref()))
                 && names_now(&self.file, self.file_handle.as_ref())
+                && self.sample_profiles().1 == self.profiles_seen
         }
 
         /// Whether a registration is incomplete: one failed
@@ -1628,9 +1846,12 @@ mod native {
         /// backend holds no watch on. A chain event cannot repair either
         /// without a rearm, though the chain itself is unchanged (#417 M-B).
         fn registration_incomplete(&self) -> bool {
+            let unwatched = |handle: &Option<File>, dir: &Path| {
+                handle.is_none() && std::fs::metadata(dir).is_ok_and(|meta| meta.is_dir())
+            };
             self.register_error.is_some()
-                || (self.themes_handle.is_none()
-                    && std::fs::metadata(&self.themes).is_ok_and(|meta| meta.is_dir()))
+                || unwatched(&self.themes_handle, &self.themes)
+                || unwatched(&self.profiles_handle, &self.profiles)
         }
 
         /// Registers the theme file in use, the unloadable ones followed
@@ -1744,7 +1965,7 @@ mod native {
                     return Some(event);
                 }
                 self.rearm();
-                if self.armed() || super::Fingerprint::of(&self.file) != self.config_seen {
+                if self.armed() || self.changed_unseen() {
                     // The directory is back (it may already hold a file),
                     // or the file became readable; either way it may have
                     // changed unseen. Or it changed while nothing could
@@ -1771,9 +1992,27 @@ mod native {
             // Before the load: a change after this sample is either read
             // by the load or seen as a difference on the next poll.
             self.config_seen = super::Fingerprint::of(&self.file);
+            // The profile files are read by the load, so they are followed
+            // before it: a write after the registration raises an event, one
+            // before is read. A changed set rearms everything, the chain
+            // included, so a new linked file's way is watched too (#312).
+            let (files, seen) = self.sample_profiles();
+            if files != self.profile_files {
+                self.profile_files = files;
+                self.rearm();
+            }
+            self.profiles_seen = seen;
             #[cfg(test)]
             self.probe.note_settle();
             super::settle(store, |config| self.follow(config));
+        }
+
+        /// Whether `config.toml` or `profiles/` changed since the last
+        /// settle began, as far as metadata tell: what a poll while the
+        /// backend is not armed looks at.
+        fn changed_unseen(&self) -> bool {
+            super::Fingerprint::of(&self.file) != self.config_seen
+                || self.sample_profiles().1 != self.profiles_seen
         }
 
         /// Follows the theme files `config`'s `appearance.theme` and its
@@ -1874,8 +2113,7 @@ mod native {
                     self.rearm();
                     #[cfg(test)]
                     self.probe.note_rearm();
-                    changed =
-                        self.armed() || super::Fingerprint::of(&self.file) != self.config_seen;
+                    changed = self.armed() || self.changed_unseen();
                 }
                 if changed {
                     self.settle(store);
@@ -2569,6 +2807,204 @@ mod native {
             assert!(native.chain.is_empty());
             assert!(native.chain_capped);
             assert!(!native.armed(), "polls past the cap");
+        }
+
+        /// S5: with more profile files than
+        /// [`super::super::MAX_PROFILE_FILES_FOLLOWED`], the first by stem
+        /// are registered and no more, also after a settle.
+        #[test]
+        fn profile_files_are_watched_up_to_their_cap() {
+            let base = tempfile::tempdir().unwrap();
+            let paths = ConfigPaths::new(base.path());
+            std::fs::create_dir_all(paths.profiles_dir()).unwrap();
+            let cap = super::super::MAX_PROFILE_FILES_FOLLOWED;
+            for i in 0..cap + 20 {
+                std::fs::write(paths.profiles_dir().join(format!("p{i:03}.toml")), "").unwrap();
+            }
+            let store = ConfigStore::open(paths.clone()).unwrap();
+            let (mut native, _stop) = Native::open(&paths).unwrap();
+            let want: Vec<PathBuf> = (0..cap)
+                .map(|i| paths.profiles_dir().join(format!("p{i:03}.toml")))
+                .collect();
+            assert_eq!(native.profile_files, want);
+            assert_eq!(native.profile_file_handles.len(), cap);
+            native.settle(&store);
+            assert_eq!(native.profile_files, want);
+            assert_eq!(native.profile_file_handles.len(), cap);
+            assert_eq!(native.profiles_seen.files.len(), cap);
+        }
+
+        /// #312, F4: a profile file added (or removed) changes the set the
+        /// next settle registers, so an in-place save of the new file
+        /// raises an event on its own handle.
+        #[test]
+        fn a_profile_file_added_is_registered_at_the_next_settle() {
+            let base = tempfile::tempdir().unwrap();
+            let paths = ConfigPaths::new(base.path());
+            std::fs::create_dir_all(paths.profiles_dir()).unwrap();
+            let a = paths.profiles_dir().join("a.toml");
+            let b = paths.profiles_dir().join("b.toml");
+            std::fs::write(&a, "").unwrap();
+            let store = ConfigStore::open(paths.clone()).unwrap();
+            let (mut native, _stop) = Native::open(&paths).unwrap();
+            native.settle(&store);
+            assert_eq!(native.profile_file_handles.len(), 1);
+            std::fs::write(&b, "").unwrap();
+            native.settle(&store);
+            assert_eq!(native.profile_files, [a.clone(), b.clone()]);
+            assert_eq!(native.profile_file_handles.len(), 2);
+            while native.queue.poll(Some(Duration::ZERO)).is_some() {}
+            std::fs::write(&b, "command = \"/bin/b\"\n").unwrap();
+            let fd = native.profile_file_handles[1].as_raw_fd();
+            assert!(event_on(&mut native, fd).is_some(), "no event on b.toml");
+            std::fs::remove_file(&a).unwrap();
+            native.settle(&store);
+            assert_eq!(native.profile_files, [b]);
+            assert_eq!(native.profile_file_handles.len(), 1);
+        }
+
+        /// A root `base/root` (with `config.toml`) whose `profiles/` holds
+        /// `links` profile files, each a symbolic link into a directory of
+        /// its own (`profiles/p07.toml -> base/t07/p.toml`).
+        fn linked_profiles(base: &Path, links: usize) -> PathBuf {
+            let root = base.join("root");
+            std::fs::create_dir_all(root.join("profiles")).unwrap();
+            std::fs::write(root.join("config.toml"), "").unwrap();
+            for i in 0..links {
+                let dir = base.join(format!("t{i:02}"));
+                std::fs::create_dir(&dir).unwrap();
+                std::fs::write(dir.join("p.toml"), "").unwrap();
+                std::os::unix::fs::symlink(
+                    dir.join("p.toml"),
+                    root.join("profiles").join(format!("p{i:02}.toml")),
+                )
+                .unwrap();
+            }
+            root
+        }
+
+        /// #312, S5: the directories holding the targets of linked profile
+        /// files join the chain, and the chain with them holds at most
+        /// [`MAX_CHAIN_DIRS`] directories: at the cap it is armed, one
+        /// more and it polls (slowly), the root, `profiles/` and the
+        /// followed files still watched.
+        #[test]
+        fn linked_profile_files_join_the_chain_up_to_its_cap() {
+            let (_dir, base) = resolved_tempdir();
+            // The directories above `root` (its own walk), `base` included.
+            let above = chain_dirs(&base.join("root").join("config.toml"))
+                .unwrap()
+                .len();
+            let room = MAX_CHAIN_DIRS - above;
+            assert!(room < super::super::MAX_PROFILE_FILES_FOLLOWED, "{above}");
+
+            let at = linked_profiles(&base.join("at"), room - 1);
+            let (native, _stop) = Native::open(&ConfigPaths::new(&at)).unwrap();
+            assert_eq!(native.chain.len(), MAX_CHAIN_DIRS, "{:?}", native.chain);
+            for i in 0..room - 1 {
+                let dir = base.join("at").join(format!("t{i:02}"));
+                assert!(
+                    native.chain.iter().any(|(held, _)| *held == dir),
+                    "{dir:?} is on the chain"
+                );
+            }
+            assert!(!native.chain_capped);
+            assert!(native.armed());
+            assert_eq!(native.profile_file_handles.len(), room - 1);
+
+            let past = linked_profiles(&base.join("past"), room);
+            let (native, _stop) = Native::open(&ConfigPaths::new(&past)).unwrap();
+            assert!(native.chain.is_empty());
+            assert!(native.chain_capped);
+            assert!(!native.armed(), "polls past the cap");
+            assert!(native.root_handle.is_some());
+            assert!(native.profiles_handle.is_some());
+            assert_eq!(native.profile_file_handles.len(), room);
+        }
+
+        /// #312, F4: past the chain cap, a change that only a directory of
+        /// the chain would have seen (the target of a dangling profile
+        /// link created) is applied by the slow poll, which samples
+        /// `profiles/` with `config.toml`.
+        #[test]
+        fn past_the_cap_the_poll_samples_profiles() {
+            let (_dir, base) = resolved_tempdir();
+            let above = chain_dirs(&base.join("root").join("config.toml"))
+                .unwrap()
+                .len();
+            let root = linked_profiles(&base, MAX_CHAIN_DIRS - above);
+            std::fs::create_dir(base.join("late")).unwrap();
+            std::os::unix::fs::symlink(
+                base.join("late").join("zz.toml"),
+                root.join("profiles").join("zz.toml"),
+            )
+            .unwrap();
+            let running = run_native(&root, |native| assert!(native.chain_capped));
+            std::fs::write(base.join("late").join("zz.toml"), "").unwrap();
+            let started = Instant::now();
+            while !running
+                .store
+                .config()
+                .profiles
+                .iter()
+                .any(|profile| profile.name == "zz")
+            {
+                assert!(
+                    started.elapsed() < CAPPED_CHAIN_POLL_INTERVAL * 3,
+                    "the new target was not applied"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(running.probe.polls() > 0);
+        }
+
+        /// #312: an event on the directory holding a linked profile file's
+        /// target changes nothing when the target stays, and is a change
+        /// when the target is saved by rename, deleted or created again
+        /// (a dangling link's walk lists the directory too).
+        /// Deterministic: the events are read off the queue here.
+        #[test]
+        fn a_linked_profile_target_changed_in_its_directory_is_a_change() {
+            let (_dir, base) = resolved_tempdir();
+            let dots = base.join("dots");
+            std::fs::create_dir(&dots).unwrap();
+            let target = dots.join("w.toml");
+            std::fs::write(&target, "").unwrap();
+            let root = base.join("root");
+            std::fs::create_dir_all(root.join("profiles")).unwrap();
+            std::os::unix::fs::symlink(&target, root.join("profiles").join("w.toml")).unwrap();
+            let paths = ConfigPaths::new(&root);
+            let store = ConfigStore::open(paths.clone()).unwrap();
+            let (mut native, _stop) = Native::open(&paths).unwrap();
+            native.settle(&store);
+            assert!(native.armed());
+            let next = |native: &mut Native| {
+                let fd = chain_fd(native, &dots);
+                event_on(native, fd).expect("no event on dots")
+            };
+
+            std::fs::write(dots.join("noise"), "x").unwrap();
+            let event = next(&mut native);
+            assert!(native.changes_nothing(&event), "noise: {event:?}");
+
+            crate::write_atomic(&target, "command = \"/bin/x\"\n").unwrap();
+            let event = next(&mut native);
+            assert!(!native.changes_nothing(&event), "a rename-save: {event:?}");
+            native.settle(&store);
+
+            std::fs::remove_file(&target).unwrap();
+            let event = next(&mut native);
+            assert!(!native.changes_nothing(&event), "deleted: {event:?}");
+            native.rearm();
+            native.settle(&store);
+            assert!(
+                watched_under(&native, &base).contains(&dots),
+                "a dangling link's directory stays on the chain"
+            );
+
+            std::fs::write(&target, "").unwrap();
+            let event = next(&mut native);
+            assert!(!native.changes_nothing(&event), "created again: {event:?}");
         }
 
         /// What a running [`Native`] did, counted on its own thread.
@@ -3568,12 +4004,17 @@ mod tests {
         }
     }
 
+    /// Where [`arm_break`] leaves its marker: a directory no watcher
+    /// watches (an event in the root, or in `profiles/` since #312, would
+    /// start a settle that finds the fix anyway).
+    fn marker_dir(paths: &ConfigPaths) -> std::path::PathBuf {
+        paths.root().join("markers")
+    }
+
     /// Saves `keyed.toml` as [`arm_break`] said, once: the first call after
-    /// it consumes its marker file, which lives in `profiles/` since no
-    /// watcher watches that (an event in the root would start a settle that
-    /// finds the fix anyway).
+    /// it consumes its marker file (in [`marker_dir`]).
     fn break_keyed_once(paths: &ConfigPaths) {
-        let marker = paths.profiles_dir().join("break-keyed-once");
+        let marker = marker_dir(paths).join("break-keyed-once");
         if let Ok(half_written) = std::fs::read_to_string(&marker)
             && std::fs::remove_file(&marker).is_ok()
         {
@@ -3587,7 +4028,7 @@ mod tests {
 
     fn arm_break(paths: &ConfigPaths, half_written: bool) {
         let mode = if half_written { "half" } else { "renamed" };
-        std::fs::write(paths.profiles_dir().join("break-keyed-once"), mode).unwrap();
+        std::fs::write(marker_dir(paths).join("break-keyed-once"), mode).unwrap();
     }
 
     /// Where the configuration's change is seen first: by a subscriber of
@@ -3607,6 +4048,7 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let paths = ConfigPaths::new(base.path());
         std::fs::create_dir_all(paths.themes_dir()).unwrap();
+        std::fs::create_dir_all(marker_dir(&paths)).unwrap();
         std::fs::write(
             paths.themes_dir().join("mine.toml"),
             theme_doc("Mine", "#101010"),
