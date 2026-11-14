@@ -43,6 +43,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// The Settings window while it is open (ADR 0044); dropped when it
     /// closes. Internal for tests.
     private(set) var settingsWindowController: SettingsWindowController?
+    /// The closed Settings window's model while an add or delete of a
+    /// profile it made waits for the watch to apply it (#455): Settings
+    /// opened again before then edits on with it, still locked, instead of
+    /// a model of the configuration from before the add or delete (whose
+    /// indices are the old ones). Dropped with the next configuration
+    /// applied once the add or delete no longer waits (applied, or failed),
+    /// ``settingsWaitLimit`` after the window closed, or with the core.
+    /// Internal for tests.
+    private(set) var waitingSettingsModel: SettingsModel?
+    /// The one timer of ``settingsWaitLimit``, the last close's: it goes
+    /// with the waiting model, so a reopened and again closed model waits
+    /// its whole limit (#455).
+    private var waitingSettingsTimer: SettingsTimer?
+    /// How long a closed Settings window's model waits for its add or
+    /// delete at most. The watch applies an edit within about a second
+    /// (ADR 0044); a model that waits longer waits for a watch that will
+    /// not apply it, and Settings opened after it starts afresh from the
+    /// configuration applied. Internal for tests.
+    var settingsWaitLimit: Duration = .seconds(2)
+    /// The clock of the Settings window's model, which also times
+    /// ``settingsWaitLimit``. Internal for tests, which move a manual one.
+    var settingsClock: any SettingsClock = SystemSettingsClock()
     /// Where the Settings window's frame is saved: its autosave name, or
     /// `nil` when hosting tests, so tests never write the user's defaults.
     var settingsAutosaveName: String? = AppDelegate.isTestHost ? nil : SettingsWindowController.autosaveName
@@ -353,11 +375,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         let actions = SettingsActions { [weak self] in self?.openConfigFile(nil) }
+        let waiting = takeWaitingSettingsModel()
         let controller = SettingsWindowController(
-            model: SettingsModel(source: core), actions: actions, autosaveName: settingsAutosaveName)
-        controller.onClose = { [weak self] in self?.settingsWindowController = nil }
+            model: waiting ?? SettingsModel(source: core, clock: settingsClock), actions: actions,
+            autosaveName: settingsAutosaveName)
+        controller.onClose = { [weak self, weak controller] in
+            guard let self else { return }
+            self.settingsWindowController = nil
+            guard let model = controller?.model, model.profilesChanging else { return }
+            self.waitingSettingsModel = model
+            // No other timer runs: this window's model was taken, with
+            // its timer, when the window opened.
+            self.waitingSettingsTimer = model.clock.schedule(after: self.settingsWaitLimit) { [weak self] in
+                _ = self?.takeWaitingSettingsModel()
+            }
+        }
         settingsWindowController = controller
         controller.showWindow(sender)
+    }
+
+    /// A configuration was applied: the closed Settings window's waiting
+    /// model reads it, and goes once its add or delete no longer waits.
+    private func reloadWaitingSettingsModel() {
+        guard let model = waitingSettingsModel else { return }
+        model.reload()
+        if !model.profilesChanging { _ = takeWaitingSettingsModel() }
+    }
+
+    /// The closed Settings window's waiting model, which the app delegate
+    /// lets go of, with its timer.
+    private func takeWaitingSettingsModel() -> SettingsModel? {
+        waitingSettingsTimer?.cancel()
+        waitingSettingsTimer = nil
+        defer { waitingSettingsModel = nil }
+        return waitingSettingsModel
     }
 
     /// Open config.toml (Advanced in Settings): opens
@@ -560,6 +611,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func replaceCore(start: Bool) throws {
         // The Settings window edits through this core.
         settingsWindowController?.close()
+        _ = takeWaitingSettingsModel()
         core?.shutdown()
         core = nil
         if start {
@@ -579,6 +631,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.readRemoteIndicator()
             self?.applyProfiles()
             self?.settingsWindowController?.model.reload()
+            self?.reloadWaitingSettingsModel()
         }
         // Before the caller opens the window the core was started for.
         readAppAppearance()

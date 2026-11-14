@@ -9,7 +9,9 @@ import SwiftUI
 ///
 /// The window owns the model, the model holds the core only weakly, and
 /// the app delegate drops the controller when the window closes, so
-/// closing it frees all three of the window's objects.
+/// closing it frees all three of the window's objects; but for a model
+/// whose add or delete of a profile still waits for the watch, which the
+/// app delegate keeps until then and opens Settings with again (#455).
 @MainActor
 final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     /// The name the window's frame is saved under in the user's defaults.
@@ -52,7 +54,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     /// tests).
     init(model: SettingsModel, actions: SettingsActions, autosaveName: String? = SettingsWindowController.autosaveName) {
         self.model = model
-        let tabs = NSTabViewController()
+        let tabs = SettingsTabViewController()
+        tabs.model = model
         tabs.tabStyle = .toolbar
         tabs.canPropagateSelectedChildViewControllerTitle = true
         for pane in Self.panes {
@@ -116,6 +119,21 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let onClose = onClose
         self.onClose = nil
         onClose?()
+    }
+}
+
+/// The panes' tab view controller. Text typed into a field and not yet
+/// committed is written before another pane shows: the pane switch takes
+/// the field away before it sees the focus go, and the field's text would
+/// be lost (#455).
+@MainActor
+final class SettingsTabViewController: NSTabViewController {
+    /// The model whose typed text is committed.
+    weak var model: SettingsModel?
+
+    override func tabView(_ tabView: NSTabView, willSelect tabViewItem: NSTabViewItem?) {
+        model?.commitDraft()
+        super.tabView(tabView, willSelect: tabViewItem)
     }
 }
 

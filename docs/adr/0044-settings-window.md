@@ -280,7 +280,8 @@ config.toml.
   under the buttons says why the pane is disabled. A hand edit that puts
   back the very profiles the add or delete was queued against before the
   watch applies it keeps the pane locked until the next change of the list
-  or until the window is opened again (accepted).
+  or until the window is opened again, since #455 at least 2 s after it
+  closed (accepted).
 - **Uncommitted text.** A field with text typed and not yet committed holds
   it with the model; a click on another profile, Add and Duplicate commit
   it first (the field goes before it would see the focus go), so the copy
@@ -370,3 +371,35 @@ Known limits:
   under the problems.
 * A chord the key map does not list (a conflict on an unknown chord) shows
   in the written form, not as a menu would.
+
+## Amendment: profile edits that wrote a nameless profile or lost text (#455, 2026-11-14)
+
+- **Duplicate is one run.** The copy's name and the keys copied to it are
+  one run on the write queue, the name first, stopping at the first
+  refusal (as the rename of the default profile). A name the core refuses
+  (" Copy" pushes a 125-byte name past its 128 bytes) writes none of the
+  copy's keys: written alone, they made a `[[profiles]]` table without a
+  name, which the core loads as "Default". The message shows by the list.
+- **Settings opened again before an add or delete applies.** A closed
+  window's model whose add or delete still waits for the watch is kept by
+  the app delegate, and Settings opened again edits on with it, still
+  locked. A new model would read the configuration from before the add or
+  delete, unlocked, and an edit of its last profile landed past the end of
+  the file's list as a nameless profile. The model goes with the next
+  configuration applied once nothing waits (applied, or failed), with the
+  core, and at the latest 2 s after the last close: the watch applies
+  within about 1 s, so a model that waits longer waits for a watch that
+  will not apply it, and Settings opened after that starts from the
+  configuration the core has applied (the escape from a stuck list in
+  "Consequences", and from the hand edit's locked pane in the #344
+  amendment's "The profile list's lock", now needs those 2 s after the
+  close). One timer runs at a time: Settings
+  opened again takes the model with its timer, so a model closed again
+  waits the whole 2 s of that close. The wave 22 generation token, which tells a
+  snapshot that has the window's edits from one that does not, can
+  replace this.
+- **A pane switch commits typed text.** The panes' tab view controller
+  commits the text typed into a field and not yet committed before another
+  pane shows (`tabView(_:willSelect:)`): the switch takes the field away
+  before it sees the focus go, and a typed Command, Name or Working
+  directory was lost.
