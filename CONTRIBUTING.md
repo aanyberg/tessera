@@ -43,7 +43,7 @@ Before you push, run `just check` (fmt, clippy, tests, cargo-deny); add `just ap
   `crates/tessera-term/tests/screen_clears_alloc.rs`, `crates/tessera-term/tests/rect_alloc.rs` and
   `crates/tessera-app-core/tests/keybindings.rs`. `scripts/verify-branch.sh` checks this mechanically: its `unsafe`
   check fails an added `unsafe` or `#[global_allocator]` line outside those two crates unless the file is listed in
-  `scripts/unsafe-exceptions.txt`, and `just verify-branch-test` fails when that list and `docs/security.md` S7 differ.
+  `scripts/unsafe-exceptions.txt`, and `just factory-test` fails when that list and `docs/security.md` S7 differ.
 - The rules in [`docs/security.md`](docs/security.md) hold for every change: nothing the child sends is echoed into
   the input or read back, and every buffer filled from untrusted input has a named cap.
 - Public items are documented. Crate roots start with a purpose paragraph.

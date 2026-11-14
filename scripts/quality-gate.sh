@@ -146,7 +146,8 @@ ffi_c_tests_step() {
 }
 
 # Timing bars that only run in release builds (#114, #175): the reader lock hold, the view metrics under an output
-# flood, scrolling through a long history and captures under a flood while scrolled back. They are in the `timing`
+# flood, scrolling through a long history, captures under a flood while scrolled back, and the `b02_*` cost bars of
+# the rectangular area operations (tessera-term, tests/rect.rs; the `#[ignore]`d one-MiB run stays out). They are in the `timing`
 # test group (one at a time). A failure under load (1-min load average >= the core count) is retried once; a second
 # failure, any failure below that load and any failure of the build (`--no-run`) fail the gate.
 timing_stub=(${(s:,:)${TESSERA_GATE_TEST_TIMING_RESULTS:-}})
@@ -160,7 +161,7 @@ release_timing() {
         print -r -- "-- release timing run (self-test): exit $st"
         return "$st"
     fi
-    run_nextest --release -p tessera-app-core -E 'kind(lib) & (test(reader_lock_hold_is_bounded) | test(view_metrics_are_fast_while_output_floods_the_terminal) | test(scrolling_through_a_long_history_is_smooth) | test(a_flood_under_a_scrolled_view_keeps_captures_short) | test(search_lock_hold_is_bounded) | test(a_million_lines_) | test(no_step_outlasts_four_budgets_and_a_quarter_second) | test(accessible_text_lock_hold_is_no_longer_than_a_capture)) | (binary(smart_selection) & test(=a_double_click_with_64_rules_on_2048_columns_takes_under_5_ms))'
+    run_nextest --release -p tessera-app-core -p tessera-term -E 'kind(lib) & (test(reader_lock_hold_is_bounded) | test(view_metrics_are_fast_while_output_floods_the_terminal) | test(scrolling_through_a_long_history_is_smooth) | test(a_flood_under_a_scrolled_view_keeps_captures_short) | test(search_lock_hold_is_bounded) | test(a_million_lines_) | test(no_step_outlasts_four_budgets_and_a_quarter_second) | test(accessible_text_lock_hold_is_no_longer_than_a_capture)) | (binary(smart_selection) & test(=a_double_click_with_64_rules_on_2048_columns_takes_under_5_ms)) | (package(tessera-term) & binary(=rect) & test(b02_))'
 }
 load_1min() {
     if [[ -n "$selftest" && -n "${TESSERA_GATE_TEST_LOAD:-}" ]]; then

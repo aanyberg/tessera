@@ -12,7 +12,7 @@ Pick the cheapest check that covers the change while you work; the full gate run
 | Iterating | `cargo nextest run -p <crate>` | one crate |
 | After a change | `just test-affected` (`--clippy` to lint too; `--base <ref>`; `-- <nextest args>`) | every crate your change touches since the merge base with `main` (committed, staged, unstaged and untracked), plus every crate that depends on them |
 | Swift or `tessera-ffi` surface | `just app-test` | the XCTest suites (Xcode, Thread Sanitizer); the gate does not run them, CI does |
-| Docs, scripts, CI | the matching check: `actionlint`, `just config-docs-check` | no Rust test is affected |
+| Docs, scripts, CI | the matching check: `actionlint`, `just config-docs-check`; for the factory scripts `just factory-test`, `just verify-branch-test`, `just quality-gate-test` | no Rust test is affected |
 | `shell-integration/` | `just test-affected` (selects those two crates and their dependents: `tessera-shell-integration` and `tessera-term` read it), plus `just terminfo-check` for the terminfo entry | the shell scripts and the terminfo entry |
 | Before any push or PR | `scripts/quality-gate.sh <worktree>` | everything: fmt, clippy, workspace tests, rustdoc, deny, FFI build and C tests, release timing tests, fuzz fmt and clippy |
 
@@ -24,6 +24,12 @@ under `crates/tessera-config/` also prints a note to run `just config-docs-check
 downward only, so a change in `tessera-vt` or `tessera-grid` reaches most of the workspace and a change in
 `tessera-cli` only itself. The targeted run is a feedback loop, not a gate: it can miss what only the whole workspace
 shows (build scripts, the FFI header, the Swift consumers).
+
+**A worktree's built app is from its last run.** `just app` and `just app-test` build into the worktree's own
+`apps/macos/DerivedData`, and `just run` opens whatever is there: the app from the last build in that worktree, not
+from the branch you have checked out now. Before an eye check, rebuild (`just app`) or look at the branch the
+DerivedData app was built from (`git -C <worktree> branch --show-current` and the build time of
+`apps/macos/DerivedData/Build/Products/Debug/Tessera.app`); a check against a stale app proves nothing about the branch.
 
 ## Tests and the home directory
 

@@ -32,7 +32,7 @@ list=""
 extra=()
 while (( $# )); do
     case "$1" in
-        --base) (( $# >= 2 )) || { print -u2 "--base needs a ref"; exit 2; }; base="$2"; shift 2 ;;
+        --base) (( $# >= 2 )) || { print -u2 -- "--base needs a ref"; exit 2; }; base="$2"; shift 2 ;;
         --clippy) clippy=1; shift ;;
         --list) list=1; shift ;;
         --) shift; extra=("$@"); break ;;

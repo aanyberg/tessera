@@ -158,6 +158,19 @@ verify-branch-test:
     bash scripts/test-verify-branch.sh
     zsh scripts/test-verify-branch.sh
 
+# #417
+# Check the factory tooling that has no recipe of its own: scripts/factory-stats.sh, scripts/affected-tests.sh, scripts/toolchain-check.sh and the S7 list against scripts/unsafe-exceptions.txt (the gate does not run it)
+factory-test:
+    zsh scripts/test-factory-stats.sh
+    zsh scripts/test-affected-tests.sh
+    zsh scripts/test-toolchain-check.sh
+    bash scripts/test-unsafe-exceptions.sh
+
+# #417
+# Warn (exit 0) when the local stable rustc is behind the current stable that CI installs; run in the factory pre-flight. Never updates anything
+toolchain-check:
+    scripts/toolchain-check.sh
+
 # #166
 # Check scripts/quality-gate.sh's nextest watchdog (build outside it, orphan exit) and release timing retry, with a fake cargo
 quality-gate-test:

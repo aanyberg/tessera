@@ -46,7 +46,7 @@ jobs:
     # A normal run of just app-test is 12-14 minutes (the suite has grown; a run that passed every test took 14:02 against
     # a 14 minute step limit and timed out). just app-test hung three times (#121); the job limit is the backstop for a hang
     # below the test level, the step limit and xcodebuild's per-test timeouts (in the justfile) report it earlier.
-    timeout-minutes: 25
+    timeout-minutes: 37
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -56,10 +56,13 @@ jobs:
       - run: brew install just cbindgen xcodegen
       - run: sudo xcode-select -s /Applications/Xcode_16.4.app || true
       - run: just app
+      # 30 minutes: macos-15 hits the fork deadlock of #278 (and the `Coverage::build` close stacks of #443) in this step;
+      # each hang costs the watchdog's 150 s plus a restart, and 6 hangs in 3 runs passed 18 minutes. Fixing the hangs
+      # is #278 and #443; this only keeps a run that recovers from being cut off.
       - run: just app-test
-        timeout-minutes: 18
+        timeout-minutes: 30
       # After a failed, timed-out or cancelled test step the full xcodebuild logs name the hanging test (#121). The
-      # step limit (18 min) is below the job limit (25 min), so this step still runs after a step timeout.
+      # step limit (30 min) is below the job limit (37 min), so this step still runs after a step timeout.
       - name: Upload app test logs
         if: failure() || cancelled()
         uses: actions/upload-artifact@v4

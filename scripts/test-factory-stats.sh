@@ -64,6 +64,13 @@ if [[ "$with_team" != *SECRET-PROMPT-CANARY* && "$with_team" != */Users/someone*
 # The window applies to teammates too.
 windowed="$("$script" --teams-dir "$work/teams" --since 2026-11-12T11:00:00Z "$project/$lead")"
 if [[ "$windowed" != *"teammate t-alpha"* && "$windowed" == *"| t-alpha |"* ]]; then ok "--since drops a teammate outside the window but still lists it"; else not_ok "window: $windowed"; fi
+# A session dir and its bare transcript both passed (and the dir passed twice): each teammate once, in both tables.
+line 150 l1 2026-11-12T09:59:00.000Z > "$project/$lead.jsonl"
+both="$("$script" --teams-dir "$work/teams" "$project/$lead" "$project/$lead.jsonl" "$project/$lead/")"
+if [[ "$(print -r -- "$both" | grep -c 'teammate t-alpha')" == 1 && "$(print -r -- "$both" | grep -c '^| t-alpha |')" == 1 \
+    && "$(print -r -- "$both" | grep -c 'rust-critic')" == 2 && "$both" == *"| **total** | | 3 | 2k |"* ]]; then
+    ok "a session dir and its bare transcript list each teammate once"
+else not_ok "duplicate arguments: $both"; fi
 rc=0; "$script" --teams-dir > /dev/null 2>&1 || rc=$?
 if [[ "$rc" == 2 ]]; then ok "--teams-dir without a value rejected"; else not_ok "--teams-dir without a value: exit $rc"; fi
 
