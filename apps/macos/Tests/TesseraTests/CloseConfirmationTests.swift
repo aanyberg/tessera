@@ -645,16 +645,25 @@ final class TerminationSignalTests: XCTestCase {
         let child = try TerminationSignalChild.launch(in: dir)
         let ready = dir.appendingPathComponent(TerminationSignalChild.readyFile)
         let failure = dir.appendingPathComponent(TerminationSignalChild.errorFile)
-        let deadline = ContinuousClock.now + .seconds(60)
+        let stages = dir.appendingPathComponent(TerminationSignalChild.stagesFile)
+        let launched = ContinuousClock.now
         while !FileManager.default.fileExists(atPath: ready.path) {
-            let output = (try? String(contentsOf: dir.appendingPathComponent("output.log"), encoding: .utf8)) ?? ""
             if let error = try? String(contentsOf: failure, encoding: .utf8) {
-                child.terminate()
-                throw PollTimedOut(description: "the child failed: \(error)\n\(output.suffix(2000))")
-            }
-            guard child.isRunning, ContinuousClock.now < deadline else {
+                let diagnosis = TerminationSignalChild.diagnose(child, in: dir)
                 if child.isRunning { kill(child.processIdentifier, SIGKILL) }
-                throw PollTimedOut(description: "the child never got ready\n\(output.suffix(2000))")
+                child.waitUntilExit()
+                throw PollTimedOut(description: "the child failed: \(error)\n\(diagnosis)")
+            }
+            // A child whose test bundle never loaded (XCTest not injected)
+            // runs as the plain app and would never get ready.
+            let loaded = FileManager.default.fileExists(atPath: stages.path)
+            let waited = ContinuousClock.now - launched
+            guard child.isRunning, waited < .seconds(60), loaded || waited < .seconds(20) else {
+                let what = !child.isRunning ? "exited" : loaded ? "never got ready" : "never loaded the test bundle"
+                let diagnosis = TerminationSignalChild.diagnose(child, in: dir)
+                if child.isRunning { kill(child.processIdentifier, SIGKILL) }
+                child.waitUntilExit()
+                throw PollTimedOut(description: "the child \(what) after \(waited)\n\(diagnosis)")
             }
             try await Task.sleep(for: .milliseconds(20))
         }
@@ -695,10 +704,14 @@ final class TerminationSignalTests: XCTestCase {
 /// sheet or alert is up, ``errorFile`` if it could not get there.
 @MainActor
 enum TerminationSignalChild {
-    static let directoryVariable = "TESSERA_TESTS_SIGNAL_CHILD"
+    nonisolated static let directoryVariable = "TESSERA_TESTS_SIGNAL_CHILD"
     static let requestFile = "request.json"
     static let readyFile = "ready.json"
     static let errorFile = "error.txt"
+    /// One line per stage the child reached (``mark(_:)``).
+    nonisolated static let stagesFile = "stages.log"
+    /// How the parent launched the child, for a failure's diagnosis.
+    static let launchFile = "launch.txt"
     /// Written when `NSApplication.willTerminateNotification` is posted.
     static let willTerminateFile = "will-terminate"
 
@@ -753,12 +766,19 @@ enum TerminationSignalChild {
             .write(to: configurationFile)
 
         var environment = ProcessInfo.processInfo.environment
+        let inherited = environment.filter { $0.key.hasPrefix("DYLD_") || $0.key.hasPrefix("XC") }
         environment["XCTestConfigurationFilePath"] = configurationFile.path
         environment["XCTestSessionIdentifier"] = nil
-        // Newer Xcodes inject XCTest through this variable rather than
-        // DYLD_INSERT_LIBRARIES, which a child does not inherit then.
-        if environment["DYLD_INSERT_LIBRARIES"] == nil, let inject = environment["XCTestBundleInjectPath"] {
-            environment["DYLD_INSERT_LIBRARIES"] = inject
+        // XCTest's injector removes itself from DYLD_INSERT_LIBRARIES once
+        // loaded, so a child would start as the plain app. Xcode 26 and
+        // later name it in XCTestBundleInjectPath; Xcode 16 embeds it in the
+        // host's Frameworks and names it nowhere, but it stays loaded here.
+        guard let inject = injectorPath() ?? environment["XCTestBundleInjectPath"] else {
+            throw Failure(description: "no XCTest injector to start a child test host with; environment: \(inherited)")
+        }
+        let inserted = (environment["DYLD_INSERT_LIBRARIES"] ?? "").split(separator: ":").map(String.init)
+        if !inserted.contains(inject) {
+            environment["DYLD_INSERT_LIBRARIES"] = (inserted + [inject]).joined(separator: ":")
         }
         environment[directoryVariable] = dir.path
         // Thread Sanitizer sleeps 1 s at exit by default (2 s measured); the
@@ -775,14 +795,74 @@ enum TerminationSignalChild {
         child.currentDirectoryURL = dir
         child.standardOutput = try FileHandle(forWritingTo: output)
         child.standardError = child.standardOutput
+        let launchSummary = [
+            "inherited: \(inherited.sorted { $0.key < $1.key })",
+            "child DYLD_INSERT_LIBRARIES: \(environment["DYLD_INSERT_LIBRARIES"] ?? "")",
+        ].joined(separator: "\n")
+        try launchSummary.write(to: dir.appendingPathComponent(launchFile), atomically: true, encoding: .utf8)
         try child.run()
         return child
+    }
+
+    /// The path of XCTest's injector library loaded in this process.
+    private static func injectorPath() -> String? {
+        (0..<_dyld_image_count()).lazy.compactMap { _dyld_get_image_name($0).map { String(cString: $0) } }
+            .first { URL(fileURLWithPath: $0).lastPathComponent == "libXCTestBundleInject.dylib" }
+    }
+
+    /// Records that the child reached `stage` (``stagesFile``); a no-op in
+    /// a process that is no child.
+    nonisolated static func mark(_ stage: String) {
+        guard let path = ProcessInfo.processInfo.environment[directoryVariable] else { return }
+        let file = URL(fileURLWithPath: path).appendingPathComponent(stagesFile)
+        if !FileManager.default.fileExists(atPath: file.path) {
+            FileManager.default.createFile(atPath: file.path, contents: Data())
+        }
+        guard let handle = try? FileHandle(forWritingTo: file) else { return }
+        defer { try? handle.close() }
+        _ = try? handle.seekToEnd()
+        try? handle.write(contentsOf: Data("\(stage)\n".utf8))
+    }
+
+    /// What the parent knows of a child that did not get ready: whether it
+    /// runs or how it ended, the stages it reached, how it was launched,
+    /// its output and, while it runs, where its main thread is.
+    static func diagnose(_ child: Process, in dir: URL) -> String {
+        func read(_ name: String) -> String {
+            (try? String(contentsOf: dir.appendingPathComponent(name), encoding: .utf8)) ?? "(none)"
+        }
+        var lines = [
+            child.isRunning
+                ? "state: running (pid \(child.processIdentifier))"
+                : "state: \(child.terminationReason == .exit ? "exited with status" : "died of signal") "
+                    + "\(child.terminationStatus)",
+            "stages:\n\(read(stagesFile))",
+            read(launchFile),
+            "output (tail):\n\(read("output.log").suffix(2000))",
+        ]
+        if child.isRunning {
+            let sample = Process()
+            sample.executableURL = URL(fileURLWithPath: "/usr/bin/sample")
+            let file = dir.appendingPathComponent("sample.txt")
+            sample.arguments = ["\(child.processIdentifier)", "1", "-mayDie", "-file", file.path]
+            sample.standardOutput = FileHandle.nullDevice
+            sample.standardError = FileHandle.nullDevice
+            if (try? sample.run()) != nil { sample.waitUntilExit() }
+            let text = read("sample.txt").split(separator: "\n", omittingEmptySubsequences: false)
+            let graph = text.drop { !$0.contains("Call graph:") }.prefix(40)
+            let images = text.drop { !$0.contains("Binary Images:") }
+                .filter { $0.contains("XCTest") || $0.contains("Inject") || $0.contains("tsan") }
+            lines.append("main thread:\n\(graph.joined(separator: "\n"))")
+            lines.append("XCTest images:\n\(images.joined(separator: "\n"))")
+        }
+        return lines.joined(separator: "\n")
     }
 
     /// Runs the child if this process is one; then never returns.
     static func runIfRequested() {
         guard let path = ProcessInfo.processInfo.environment[directoryVariable] else { return }
         let dir = URL(fileURLWithPath: path)
+        mark("the test bundle started")
         // A cap of the child's own, whatever its mode: the quit alert's
         // `runModal` would wait forever if the parent died before
         // signalling (Xcode's Stop, a crash).
@@ -827,6 +907,7 @@ enum TerminationSignalChild {
         appDelegate.windowStateStore = WindowStateStore(defaults: defaults)
         appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-i"], workingDirectory: dir)
         let controller = try appDelegate.newWindow()
+        mark("a window opened")
         let session = controller.focusedPane.session
         try session.write(Array("\(request.command)\n".utf8))
         var job: TesseraSession.ForegroundProcess?
@@ -837,6 +918,7 @@ enum TerminationSignalChild {
         guard started, let job, let window = controller.window else {
             throw Failure(description: "sleep did not start in the foreground")
         }
+        mark("the job runs in the foreground")
         // Only the signal's quit may save it from here on.
         defaults.removeObject(forKey: WindowStateStore.key)
         let willTerminate = dir.appendingPathComponent(willTerminateFile)

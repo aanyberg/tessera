@@ -14,6 +14,7 @@ import XCTest
 final class HostDisplaySettings: NSObject, XCTestObservation {
     override init() {
         super.init()
+        TerminationSignalChild.mark("the test bundle loaded")
         XCTestObservationCenter.shared.addTestObserver(self)
     }
 
