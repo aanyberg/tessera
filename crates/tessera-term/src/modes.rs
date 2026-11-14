@@ -89,8 +89,25 @@
 //! reverse video, LNM, the alternate screen, bracketed paste, focus events
 //! and the mouse modes. No reset sends a colour scheme report: 2031 is
 //! off before the colours a reset drops are looked at.
+//!
+//! The shell integration's command end (`OSC 133 ; D`, on either screen)
+//! turns off the input modes the command that just ended may have left on
+//! because it died before it could (a remote tmux behind a dropped ssh
+//! connection, #461): it leaves the alternate screen as DECRST 1049 does,
+//! shows the cursor, and turns off mouse tracking and its encoding, focus
+//! events, colour-scheme updates (2031), DECLRMM (margins back to the full
+//! width), DECCKM, DECKPAM, `modifyOtherKeys` and both kitty stacks, and
+//! resets the scroll region to the full screen without moving the cursor.
+//! The alternate screen's text (the dead program's last screen and what
+//! followed it: ssh's disconnect reason, a panic, the shell's job status)
+//! is then printed on the primary screen from the restored cursor's line,
+//! as the reference terminals keep it visible. Bracketed paste is left on
+//! (shells turn it on and off around each command themselves), and so is
+//! every other mode. Shells write the command end before their line editor
+//! turns its own modes back on, so those stay (ADR 0020, "Amendment: modes
+//! a dead program left on").
 
-use tessera_grid::EraseDisplay;
+use tessera_grid::{EraseDisplay, Line};
 use tracing::trace;
 
 use crate::keyboard::{KeyboardModes, KittyFlags, KittyFlagsMode, ModifyOtherKeys};
@@ -569,6 +586,105 @@ impl State {
         self.modes.reverse_wrap_extended = false;
         self.keyboard = KeyboardModes::default();
         self.kitty = KittyStacks::default();
+    }
+
+    /// The shell integration's command end (`OSC 133 ; D`): turns off the
+    /// modes the command that just ended may have left on because it died
+    /// before it could (a remote tmux behind a dropped ssh connection,
+    /// #461). Leaves the alternate screen as DECRST 1049 does, shows the
+    /// cursor, and turns off mouse tracking and its encoding, focus
+    /// events, colour-scheme updates, DECLRMM (margins back to the full
+    /// width), DECCKM, DECKPAM, `modifyOtherKeys` and both kitty stacks,
+    /// and resets the scroll region to the full screen without moving the
+    /// cursor. Bracketed paste and every other mode are left as they are.
+    /// What the alternate screen showed is then carried onto the primary
+    /// screen ([`State::carry_alt_screen_text`]). See the module
+    /// documentation.
+    pub(crate) fn command_end_reset_modes(&mut self) {
+        let carried = self.alt_screen_text();
+        self.set_dec_mode(1049, false);
+        self.modes.cursor_visible = true;
+        self.modes.mouse = MouseTracking::None;
+        self.modes.mouse_encoding = MouseEncoding::Default;
+        self.modes.focus_events = false;
+        self.modes.color_scheme_updates = false;
+        self.modes.left_right_margins = false;
+        self.grid.reset_margins();
+        // Before the carry: rows printed under a stale region would
+        // overwrite one line below it or be discarded inside it. The
+        // cursor stays where the leave put it.
+        self.grid.reset_scroll_region();
+        self.keyboard = KeyboardModes::default();
+        self.kitty = KittyStacks::default();
+        self.carry_alt_screen_text(&carried);
+    }
+
+    /// The alternate screen's rows from its first to its last row showing
+    /// anything but blanks, at most the screen's height; none on the
+    /// primary screen.
+    fn alt_screen_text(&self) -> Vec<Line> {
+        if !self.grid.is_alt_screen() {
+            return Vec::new();
+        }
+        let lines = self.grid.visible_lines();
+        let shows = |line: &Line| line.cells.iter().any(|cell| !cell.is_blank());
+        let Some(first) = lines.iter().position(shows) else {
+            return Vec::new();
+        };
+        let last = lines.iter().rposition(shows).unwrap_or(first);
+        lines[first..=last].to_vec()
+    }
+
+    /// Prints `lines` (the alternate screen a command end left,
+    /// [`State::alt_screen_text`]) on the primary screen from the start of
+    /// the cursor's line, or of the next one when the cursor is not at its
+    /// start, each row's trailing blanks trimmed and followed by a new
+    /// line, so the dead program's last screen and the messages after it
+    /// (ssh's disconnect reason, a panic, the shell's job status) stay
+    /// above the next prompt and scroll into the scrollback like printed
+    /// text. Each cell keeps its character, cluster and style, and a full
+    /// soft-wrapped row stays wrapped; hyperlinks are not carried. The
+    /// shell's pen is restored before each line break, so a row the carry
+    /// scrolls in is blank in the shell's colours, not the carried text's.
+    fn carry_alt_screen_text(&mut self, lines: &[Line]) {
+        if lines.is_empty() {
+            return;
+        }
+        let pen = self.grid.pen();
+        if self.grid.cursor().col != 0 || self.grid.pending_wrap() {
+            self.grid.carriage_return();
+            self.grid.line_feed();
+        }
+        for (index, line) in lines.iter().enumerate() {
+            let end = line
+                .cells
+                .iter()
+                .rposition(|cell| !cell.is_blank())
+                .map_or(0, |col| col + 1);
+            for (col, cell) in line.cells[..end].iter().enumerate() {
+                if cell.is_spacer() {
+                    continue;
+                }
+                self.grid.set_pen(cell.style);
+                match line.cluster(col) {
+                    Some(text) if cell.is_cluster() => self.grid.put_str(text),
+                    _ => self.grid.put_char(cell.ch),
+                }
+            }
+            // The shell's pen before each line break: a scroll fills the
+            // new row with the pen's background (BCE), which must not be
+            // the dead program's.
+            self.grid.set_pen(pen);
+            // A soft-wrapped row that filled the line continues on the
+            // next one, as it was printed.
+            let continues = line.wrapped && self.grid.pending_wrap() && index + 1 < lines.len();
+            if continues {
+                self.grid.wrap_line();
+            } else {
+                self.grid.carriage_return();
+                self.grid.line_feed();
+            }
+        }
     }
 
     /// The mode part of RIS: every mode and both kitty stacks to their

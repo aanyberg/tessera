@@ -266,3 +266,76 @@ whatever its shape.
   DECLRMM and reverse wrap arrived with #97 (ADR 0028). DECRQM (ADR 0024) reads `Modes` and
   answers 0 for a mode Tessera does not know, so each new mode also gets
   its DECRQM answer.
+
+## Amendment: modes a dead program left on (#461, 2026-11-14)
+
+A program that dies without turning its modes off leaves them on for the shell that comes back. The case that
+prompted this is `ssh host` running tmux with `mouse on`: when the connection drops, neither the remote tmux server
+nor its client can write the sequences that turn the modes off, so mouse motion, clicks and focus changes reach the
+local prompt as text such as `ESC [ < 0 ; 6 ; 4 M` and `ESC [ I`. A tmux 3.8 attach, captured on a pty and run in a
+Tessera session, leaves the alternate screen, DECCKM and DECKPAM, bracketed paste, focus events (1004),
+colour-scheme updates (2031), DECLRMM and button-event mouse tracking in SGR encoding on. Before this amendment only
+RIS and DECSTR cleared them.
+
+**Decision.** The shell integration's command end (`OSC 133 ; D`, with or without a status, on either screen) turns
+those modes off before the mark is handled. It leaves the alternate screen as DECRST 1049 does (the cursor saved on
+entry comes back), shows the cursor, and turns off mouse tracking and its encoding, focus events, 2031, DECLRMM (the
+margins go back to the full width), DECCKM, DECKPAM, `modifyOtherKeys` and both kitty keyboard stacks. It also resets
+the scroll region (DECSTBM, shared by both screens) to the full screen without moving the cursor, before the carry
+below: a dead program's region (tmux sets `1;rows-1` for each scroll burst, irssi and mutt keep one) would make the
+carried rows overwrite one line below the region or be discarded inside it, and would keep the shell's output out of
+the scrollback. A command end received on the alternate screen is still dropped as a mark (ADR 0039), and the reset
+queues nothing for the host.
+
+What the alternate screen showed is kept: its rows from the first to the last that shows anything but blanks (at most
+the screen's height) are printed on the primary screen from the start of the restored cursor's line (the next line when
+the cursor is not at a line's start), each with its trailing blanks trimmed and followed by a new line, so they scroll
+into the scrollback like printed text and the next prompt starts below them. That is the dead program's last screen and
+what followed it on the alternate screen: ssh's `Connection to host closed by remote host.`, a TUI's panic or traceback,
+zsh's `segmentation fault` job status (printed before `precmd` writes `D`). xterm, kitty, WezTerm, Ghostty and iTerm2
+keep that text visible (they stay on the alternate screen); so did Tessera 0.1.0. Each cell keeps its character,
+grapheme cluster and style, and a full soft-wrapped row stays wrapped; hyperlinks are not carried. The pen the leave
+restored is set again before each line break, so a row the carry scrolls in (filled with the pen's background) and the
+next prompt take the shell's colours, not those of the dead program's last cell (tmux's status bar). A program that
+leaves the alternate screen itself before the shell's `D` (vim, htop, a local tmux detaching) is unaffected: the `D`
+finds the primary screen.
+
+- **Why the command end and not the prompt start (`A`).** Shells write `D` before their line editor turns its own
+  modes back on and `A` after: fish 4 enables bracketed paste, the kitty flags (`CSI = 5 u`), `modifyOtherKeys`,
+  `ESC =` and on master 2031 every time it waits for input, after `D` and before it paints the prompt with `A`; zsh
+  runs `zle-line-init` (where `echoti smkx` turns DECCKM and DECKPAM on) after the `precmd` that writes `D`; bash
+  writes `D` from `PROMPT_COMMAND` and has `A` inside `PS1`, which readline prints after it turned bracketed paste on.
+  A reset at `A` would undo all of that at every prompt.
+- **Why not bracketed paste.** zsh, bash and fish turn it off before running a command and on again when they read
+  the next line, so a leftover one is harmless, and a shell that turns it on once at start-up would lose it.
+- **Why not other modes.** Insert, origin, auto-wrap, LNM, reverse video, synchronized output (stored only) and the
+  cursor style do not send anything to the shell; RIS (`reset`) still clears them.
+- **False positives.** A command end that arrives while a program is still running on the same pty turns its modes
+  off. tmux 3.8 does not forward a pane's `OSC 133` to the outer terminal (checked on a pty), except wrapped in its
+  `DCS tmux;` passthrough with `allow-passthrough on`, which Tessera's scripts do not write; programs such as vim,
+  less and mc leave the alternate screen and their modes before they run a shell. A setup that forwards marks from
+  inside tmux will see tmux's mouse mode drop after each command in a pane, until tmux sets it again. Also:
+  - A program stopped with Ctrl-Z that keeps its alternate screen or modes over SIGTSTP: the shell's `D` turns them
+    off and carries its screen onto the primary one; after `fg` it runs without them until it redraws or sets them
+    again (most full-screen programs restore the terminal on SIGTSTP and set it up again on SIGCONT).
+  - zsh `precmd` hooks the user installs that turn on modes: Tessera's own `precmd` runs last, so its `D` comes after
+    them and turns those modes off. A line editor's modes (`zle-line-init`) are unaffected.
+  - fish 4 and later write `D` natively, whatever `TESSERA_SHELL_INTEGRATION` says, so a fish started from another
+    program on the same pty (a nested shell inside a running TUI) always resets that program's modes after each of
+    its commands.
+  - A pane that forwards a `D` through its multiplexer: with tmux's `allow-passthrough on`, or GNU screen, which
+    forwards DCS-wrapped OSC 133 by default, a pane printing `ESC P tmux; ESC ESC ] 133 ; D ; 0 BEL ESC \` makes
+    Tessera leave the alternate screen and turn tmux's modes off while tmux keeps running, and tmux then draws over
+    the primary screen until it redraws in full (reproduced on tmux 3.8).
+- **Without shell integration** (or with `no-prompt-mark`) nothing changes: there is no command end to act on. A
+  trigger that needs none, such as the pty's foreground process group returning to the shell, was not taken: it is
+  polled by the host, so it cannot fire at the right byte of the stream.
+
+**Other terminals** (their source at the time of writing): kitty, WezTerm and Ghostty change no mode on `OSC 133`.
+iTerm2 turns mouse reporting off (or offers to), and offers to turn focus reporting and bracketed paste off, when the
+shell integration reports a different host (`OSC 1337 ; RemoteHost`), which needs its integration on both sides.
+
+Tests: `crates/tessera-term/tests/stuck_modes.rs` (the tmux attach sequence, each mode, the carried text, the marks that
+do not reset, the modes a shell turns on after the command end, a flood), `crates/tessera-app-core/tests/stuck_modes.rs`
+(a killed program on a real pty, the real zsh with the integration, and the real tmux with its server and client killed,
+ignored).

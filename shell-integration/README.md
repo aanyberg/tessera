@@ -91,7 +91,10 @@ Loading a script twice installs its hooks once.
 - `A` before each prompt and `B` after it, `C` when a command starts (never
   with the command line), `D;<status>` at the next prompt, and a bare `D`
   when a prompt was shown and no command ran (an empty line, Ctrl-C). No
-  `D` before the first prompt.
+  `D` before the first prompt. Tessera treats every `D` as the end of the
+  command: it turns off the input modes (mouse, focus, cursor keys, kitty
+  flags) and the alternate screen the command may have left on (ADR 0020,
+  "Amendment: modes a dead program left on").
 - OSC 7 at startup, at every prompt and whenever the directory changes
   (not for a subshell's `cd`). The host is the
   shell's host name reduced to `[A-Za-z0-9._-]`; the path is encoded like

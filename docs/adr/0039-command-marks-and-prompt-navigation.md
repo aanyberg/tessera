@@ -194,7 +194,10 @@ prompt (status unknown, as D-MISSING-D) comes first. A prompt with no `C`
 before its end ran nothing (an empty Enter, Ctrl-C at the prompt) and gets
 no mark, and neither does a running command. A row's marks are read in the
 order they were set, so zsh's `D` before `A` on the next prompt's row
-ends the command above. The alternate screen has none.
+ends the command above. The alternate screen has none. A `D` also changes
+modes: it turns off the input modes a dead command left on and leaves the
+alternate screen, carrying its text onto the primary one (ADR 0020,
+"Amendment: modes a dead program left on", #461).
 
 **Bounds (S5, S6).** The scan reads the rows in view and, only while a
 prompt in view is still open, at most `MAX_GUTTER_SCAN_LINES` (1024)
