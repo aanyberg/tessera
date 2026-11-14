@@ -18,7 +18,8 @@ use std::fmt;
 use std::sync::LazyLock;
 
 use tessera_config::{
-    Chord, ChordKey, ChordModifiers, KeyAction, Keys, MAX_WARNING_PATH_LEN, Warning, escaped,
+    Chord, ChordKey, ChordModifiers, KeyAction, KeyEntry, Keys, MAX_WARNING_PATH_LEN, Warning,
+    escaped, escaped_value,
 };
 use tessera_term::{Key, KeyEvent, Modifiers};
 
@@ -259,6 +260,82 @@ pub enum Binding<'a> {
     Ignore,
 }
 
+/// Whether a `[keys]` entry took effect ([`KeymapEntry::effect`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KeyEffect {
+    /// It binds its chord: a command, `send_text` or `none`.
+    Bound,
+    /// `unbound`: it took its chord from every command, and the key types.
+    Unbound,
+    /// Left out because an earlier entry for the same chord took effect
+    /// (the first entry wins; an `unbound` entry is left out the same way).
+    Shadowed,
+    /// Left out for itself: a chord or value that does not parse, an
+    /// unknown command or parameter, an invisible character.
+    Refused,
+}
+
+impl KeyEffect {
+    /// The name the key map JSON uses: `bound`, `unbound`, `shadowed` or
+    /// `refused`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bound => "bound",
+            Self::Unbound => "unbound",
+            Self::Shadowed => "shadowed",
+            Self::Refused => "refused",
+        }
+    }
+}
+
+/// The value of a [`KeymapEntry`] as written, escaped and capped at
+/// [`tessera_config::MAX_ENTRY_VALUE_TEXT_LEN`] bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EntryValue {
+    /// A command (`select_tab:3`), `unbound`, `none`, or a value that does
+    /// not parse, as written.
+    Text(String),
+    /// The text after `send_text:`, as written (its escapes not decoded).
+    SendText(String),
+    /// The value is not a string.
+    NotAString,
+}
+
+impl EntryValue {
+    /// `text`, already escaped and capped, split at a `send_text:` prefix.
+    fn of(text: String) -> Self {
+        match text.strip_prefix("send_text:") {
+            Some(rest) => Self::SendText(rest.to_owned()),
+            None => Self::Text(text),
+        }
+    }
+}
+
+/// One of the first [`tessera_config::MAX_KEY_BINDINGS`] `[keys]` entries,
+/// in document order, and what became of it ([`Keymap::entries`]): what a
+/// settings view lists. Every text is escaped as warnings are (S3) and
+/// capped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeymapEntry<'a> {
+    /// Its place in the table, from 0, refused entries counted.
+    pub index: usize,
+    /// The table key as written.
+    pub key: String,
+    /// The chord, canonical when printed; `None` when the key does not
+    /// parse.
+    pub chord: Option<Chord>,
+    /// The value as written.
+    pub value: EntryValue,
+    /// Whether it took effect.
+    pub effect: KeyEffect,
+    /// The entry's warning: why it was left out, or the caveat it is
+    /// honoured with.
+    pub warning: Option<&'a Warning>,
+}
+
 /// A chord's binding in the compiled table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Slot {
@@ -302,6 +379,14 @@ pub struct Keymap {
     /// The entries compiled, to tell whether a new configuration changes
     /// them.
     keys: Vec<tessera_config::KeyBinding>,
+    /// The table's [`Keys::entries`], for [`Keymap::entries`] and to tell
+    /// whether a new configuration changes them.
+    sources: Vec<KeyEntry>,
+    /// The table's [`Keys::overflow`].
+    overflow: Option<Warning>,
+    /// For each of `keys`: whether it took effect, and the index in
+    /// `warnings` of its warning.
+    outcomes: Vec<(KeyEffect, Option<usize>)>,
     /// Bit `m` is set when some chord in `table` has modifier bits `m`.
     mask: u16,
     /// Bit `c % 64` of word `2 * m + c / 64` is set when some chord in
@@ -331,9 +416,11 @@ impl Default for Keymap {
 impl Keymap {
     /// Lays `keys` over the registry defaults. An entry naming an unknown
     /// command (or a wrong parameter) is left out with a warning and
-    /// claims no chord; of the other entries with the same chord the first
-    /// wins and each later one is left out with a warning. An
-    /// entry is honoured with a warning when it takes a chord macOS uses
+    /// claims no chord; of the other entries with the same chord (an
+    /// `unbound` one included) the first wins and each later one is left
+    /// out with a warning. An entry is honoured with a warning when it
+    /// shadows plain typing ([`Chord::shadows_typing`]; never an entry left
+    /// out, #430 m4), takes a chord macOS uses
     /// (⌃⌘F, ⌃Tab and the like), or takes the default chord of a system command, or
     /// replaces a menu command's default chord with text or `none`. An
     /// entry whose chord is a default of another command takes it from
@@ -365,6 +452,9 @@ impl Keymap {
             .collect();
         let mut map = Self {
             keys: keys.bindings().to_vec(),
+            sources: keys.entries().to_vec(),
+            overflow: keys.overflow().cloned(),
+            outcomes: Vec::with_capacity(keys.bindings().len()),
             mask: 0,
             ascii: [0; ASCII_FILTER_WORDS],
             chords: vec![Vec::new(); COMMANDS.len()],
@@ -377,60 +467,10 @@ impl Keymap {
         // the first kept entry of a chord wins it.
         let mut taken: Vec<(Chord, &str)> = Vec::new();
         for binding in keys.bindings() {
-            let warn = |reason: String| Warning::KeyBinding {
-                key: escaped(&binding.key, MAX_WARNING_PATH_LEN),
-                reason,
-            };
-            let slot = match &binding.action {
-                KeyAction::Command { name, parameter } => {
-                    match CommandId::find(name, parameter.as_deref()) {
-                        Ok(id) => Some(Slot::Command(id)),
-                        Err(error) => {
-                            map.warnings.push(warn(format!("{error}; ignored")));
-                            continue;
-                        }
-                    }
-                }
-                KeyAction::SendText(bytes) => {
-                    map.texts.push(bytes.clone().into_boxed_slice());
-                    Some(Slot::Text(map.texts.len() - 1))
-                }
-                KeyAction::Ignore => Some(Slot::Ignore),
-                _ => None,
-            };
-            let chord = binding.chord;
-            // After the command check: an entry left out claims no chord,
-            // so a later valid entry of the same chord is honoured (#317).
-            if let Some(&(_, first)) = taken.iter().find(|&&(taken, _)| taken == chord) {
-                let first = escaped(first, MAX_WARNING_PATH_LEN);
-                map.warnings.push(warn(format!(
-                    "same chord as `{first}` (the first entry wins); ignored"
-                )));
-                continue;
-            }
-            taken.push((chord, &binding.key));
-            let Some(slot) = slot else {
-                continue;
-            };
-            if let Some((_, what)) = RESERVED
-                .iter()
-                .find(|(text, _)| Chord::parse(text).ok() == Some(chord))
-            {
-                map.warnings
-                    .push(warn(format!("macOS uses this chord for {what}; honoured")));
-            }
-            if let Some(&(_, owner)) = defaults.iter().find(|(default, _)| *default == chord)
-                && slot != Slot::Command(owner)
-                && (!matches!(slot, Slot::Command(_)) || owner.spec().owner == CommandOwner::System)
-            {
-                map.warnings.push(warn(format!(
-                    "shadows the menu item of `{owner}`, which loses this chord; honoured"
-                )));
-            }
-            if let Slot::Command(id) = slot {
-                map.chords[id.index()].push(chord);
-            }
-            map.insert(chord, slot);
+            let first_warning = map.warnings.len();
+            let effect = map.lay(binding, &defaults, &mut taken);
+            let warning = (map.warnings.len() > first_warning).then_some(first_warning);
+            map.outcomes.push((effect, warning));
         }
         for (chord, id) in defaults {
             if !taken.iter().any(|&(taken, _)| taken == chord) {
@@ -444,6 +484,80 @@ impl Keymap {
         map.defaults.sort_unstable();
         map.table.sort_by_key(|&(probe, _)| probe);
         map
+    }
+
+    /// Lays one entry over the map: claims its chord when it is the first
+    /// kept entry for it, and pushes its warnings (the first is the one
+    /// [`Keymap::entries`] reports).
+    fn lay<'k>(
+        &mut self,
+        binding: &'k tessera_config::KeyBinding,
+        defaults: &[(Chord, CommandId)],
+        taken: &mut Vec<(Chord, &'k str)>,
+    ) -> KeyEffect {
+        let warn = |reason: String| Warning::KeyBinding {
+            key: escaped(&binding.key, MAX_WARNING_PATH_LEN),
+            reason,
+        };
+        let command = match &binding.action {
+            KeyAction::Command { name, parameter } => {
+                match CommandId::find(name, parameter.as_deref()) {
+                    Ok(id) => Some(id),
+                    Err(error) => {
+                        self.warnings.push(warn(format!("{error}; ignored")));
+                        return KeyEffect::Refused;
+                    }
+                }
+            }
+            _ => None,
+        };
+        let chord = binding.chord;
+        // After the command check: an entry left out claims no chord, so a
+        // later valid entry of the same chord is honoured (#317). Before
+        // the `unbound` return: an `unbound` entry after a kept one is left
+        // out with this warning too, never silently (#430 m6).
+        if let Some(&(_, first)) = taken.iter().find(|&&(taken, _)| taken == chord) {
+            let first = escaped(first, MAX_WARNING_PATH_LEN);
+            self.warnings.push(warn(format!(
+                "same chord as `{first}` (the first entry wins); ignored"
+            )));
+            return KeyEffect::Shadowed;
+        }
+        taken.push((chord, &binding.key));
+        let slot = match (&binding.action, command) {
+            (_, Some(id)) => Slot::Command(id),
+            (KeyAction::SendText(bytes), None) => {
+                self.texts.push(bytes.clone().into_boxed_slice());
+                Slot::Text(self.texts.len() - 1)
+            }
+            (KeyAction::Ignore, None) => Slot::Ignore,
+            _ => return KeyEffect::Unbound,
+        };
+        if chord.shadows_typing() {
+            self.warnings.push(warn(
+                "shadows plain typing of this key; honoured".to_owned(),
+            ));
+        }
+        if let Some((_, what)) = RESERVED
+            .iter()
+            .find(|(text, _)| Chord::parse(text).ok() == Some(chord))
+        {
+            self.warnings
+                .push(warn(format!("macOS uses this chord for {what}; honoured")));
+        }
+        if let Some(&(_, owner)) = defaults.iter().find(|(default, _)| *default == chord)
+            && slot != Slot::Command(owner)
+            && (!matches!(slot, Slot::Command(_)) || owner.spec().owner == CommandOwner::System)
+        {
+            self.warnings.push(warn(format!(
+                "shadows the menu item of `{owner}`, which loses this chord; honoured"
+            )));
+        }
+        if let Slot::Command(id) = slot {
+            self.chords[id.index()].push(chord);
+        }
+        self.insert(chord, slot);
+        KeyEffect::Bound
     }
 
     /// Adds `chord` (and its shifted-symbol form) to the table.
@@ -466,8 +580,72 @@ impl Keymap {
     }
 
     /// The `[keys]` entries this map was compiled from.
+    #[cfg(test)]
     pub(crate) fn keys(&self) -> &[tessera_config::KeyBinding] {
         &self.keys
+    }
+
+    /// Whether this map was compiled from a table equal to `keys`: the
+    /// same bindings, the same refused entries and the same overflow, so
+    /// [`Keymap::entries`] would not change.
+    pub(crate) fn compiled_from(&self, keys: &Keys) -> bool {
+        self.keys == keys.bindings()
+            && self.sources == keys.entries()
+            && self.overflow.as_ref() == keys.overflow()
+    }
+
+    /// The first [`tessera_config::MAX_KEY_BINDINGS`] `[keys]` entries the
+    /// map was compiled from, in document order, refused ones included,
+    /// with whether each took effect and its warning; the canonical chord
+    /// of a [`KeyEffect::Bound`] command entry is among that command's
+    /// [`Keymap::chords`]. The texts are escaped and capped here; nothing
+    /// of a refused entry but its escaped form was kept.
+    pub fn entries(&self) -> impl Iterator<Item = KeymapEntry<'_>> + '_ {
+        self.sources
+            .iter()
+            .enumerate()
+            .map(move |(index, source)| match source {
+                KeyEntry::Refused(refused) => KeymapEntry {
+                    index,
+                    key: refused.key.clone(),
+                    chord: refused.chord,
+                    value: refused
+                        .value
+                        .clone()
+                        .map_or(EntryValue::NotAString, EntryValue::of),
+                    effect: KeyEffect::Refused,
+                    warning: Some(&refused.warning),
+                },
+                &KeyEntry::Binding(at) => {
+                    let binding = &self.keys[at];
+                    let (effect, warning) = self.outcomes[at];
+                    KeymapEntry {
+                        index,
+                        key: escaped(&binding.key, MAX_WARNING_PATH_LEN),
+                        chord: Some(binding.chord),
+                        value: EntryValue::of(escaped_value(&binding.value)),
+                        effect,
+                        warning: warning.map(|at| &self.warnings[at]),
+                    }
+                }
+                // `KeyEntry` is non-exhaustive; a later kind lists as
+                // refused, without text.
+                _ => KeymapEntry {
+                    index,
+                    key: String::new(),
+                    chord: None,
+                    value: EntryValue::NotAString,
+                    effect: KeyEffect::Refused,
+                    warning: None,
+                },
+            })
+    }
+
+    /// The warning for the `[keys]` entries past
+    /// [`tessera_config::MAX_KEY_BINDINGS`], when the table had more.
+    #[must_use]
+    pub fn overflow(&self) -> Option<&Warning> {
+        self.overflow.as_ref()
     }
 
     /// Bit `m` is set when some chord has modifier bits `m` (Shift 1, Alt
@@ -985,6 +1163,138 @@ mod tests {
                     .contains("same chord as `cmd+shift+d` (the first entry wins); ignored"),
             "{warnings:?}"
         );
+    }
+
+    /// The effect and warning of each entry of `toml`'s `[keys]`, by key.
+    fn effects(toml: &str) -> Vec<(String, KeyEffect, Option<String>)> {
+        let loaded = tessera_config::Config::from_toml_lenient(toml).unwrap();
+        let map = Keymap::compile_quietly(&loaded.config.keys);
+        map.entries()
+            .map(|entry| {
+                (
+                    entry.key,
+                    entry.effect,
+                    entry.warning.map(ToString::to_string),
+                )
+            })
+            .collect()
+    }
+
+    /// #430 m4: "shadows plain typing; honoured" is reported for an entry
+    /// that binds its chord, and only for one: an entry left out (an
+    /// unknown command, an earlier entry for the chord) or `unbound` gets
+    /// its own warning or none, and the loader reports none of it.
+    #[test]
+    fn only_a_bound_entry_shadows_plain_typing() {
+        let toml = "[keys]\na = 'none'\n'shift+a' = 'bogus'\nA = 'copy'\nb = 'copy'\n\
+                    'opt+a' = 'paste'\nc = 'unbound'\n'shift+b' = 'send_text:x'\n";
+        let typing = |key: &str| {
+            Some(format!(
+                "`keys.\"{key}\"`: shadows plain typing of this key; honoured"
+            ))
+        };
+        assert_eq!(
+            effects(toml),
+            [
+                ("a".to_owned(), KeyEffect::Bound, typing("a")),
+                (
+                    "shift+a".to_owned(),
+                    KeyEffect::Refused,
+                    Some("`keys.\"shift+a\"`: unknown command `bogus`; ignored".to_owned())
+                ),
+                (
+                    "A".to_owned(),
+                    KeyEffect::Refused,
+                    Some(
+                        "`keys.\"A\"`: uppercase key `A` (write shift+ and the lowercase key); ignored"
+                            .to_owned()
+                    )
+                ),
+                ("b".to_owned(), KeyEffect::Bound, typing("b")),
+                ("opt+a".to_owned(), KeyEffect::Bound, typing("opt+a")),
+                ("c".to_owned(), KeyEffect::Unbound, None),
+                ("shift+b".to_owned(), KeyEffect::Bound, typing("shift+b")),
+            ]
+        );
+        let loaded = tessera_config::Config::from_toml_lenient(
+            "[keys]\na = 'copy'\n'shift+a' = 'bogus'\nb = 'unbound'\n",
+        )
+        .unwrap();
+        let load: Vec<String> = loaded.warnings.iter().map(ToString::to_string).collect();
+        assert!(
+            load.is_empty(),
+            "the loader reports no typing caveat: {load:?}"
+        );
+        let map: Vec<String> = Keymap::compile_quietly(&loaded.config.keys)
+            .warnings()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            map,
+            [
+                "`keys.\"a\"`: shadows plain typing of this key; honoured",
+                "`keys.\"shift+a\"`: unknown command `bogus`; ignored",
+            ]
+        );
+        // Shadowed by an earlier entry: the "same chord" warning only.
+        assert_eq!(
+            effects("[keys]\n'shift+a' = 'copy'\n'SHIFT+a' = 'paste'\n"),
+            [
+                ("shift+a".to_owned(), KeyEffect::Bound, typing("shift+a")),
+                (
+                    "SHIFT+a".to_owned(),
+                    KeyEffect::Shadowed,
+                    Some(
+                        "`keys.\"SHIFT+a\"`: same chord as `shift+a` (the first entry wins); ignored"
+                            .to_owned()
+                    )
+                ),
+            ]
+        );
+    }
+
+    /// #430 m6: an `unbound` entry after a kept entry for the same chord
+    /// is left out with the "same chord" warning, as any later entry is
+    /// (the first wins), never silently; and a kept `unbound` wins over a
+    /// later binding of its chord.
+    #[test]
+    fn an_unbound_entry_after_a_binding_is_shadowed_with_a_warning() {
+        let new_tab = CommandId::find("new_tab", None).unwrap();
+        let event = KeyEvent::new(Key::Char('t'), Modifiers::SUPER);
+        let loaded = tessera_config::Config::from_toml_lenient(
+            "[keys]\n'cmd+t' = 'new_tab'\n'command+t' = 'unbound'\n",
+        )
+        .unwrap();
+        let map = Keymap::compile_quietly(&loaded.config.keys);
+        let entries: Vec<_> = map
+            .entries()
+            .map(|e| (e.effect, e.warning.cloned()))
+            .collect();
+        let same = Warning::KeyBinding {
+            key: "command+t".into(),
+            reason: "same chord as `cmd+t` (the first entry wins); ignored".into(),
+        };
+        assert_eq!(
+            entries,
+            [
+                (KeyEffect::Bound, None),
+                (KeyEffect::Shadowed, Some(same.clone()))
+            ]
+        );
+        assert_eq!(map.warnings(), [same]);
+        assert_eq!(map.resolve(&event), Some(Binding::Command(new_tab)));
+        assert_eq!(map.chords(new_tab), [Chord::parse("cmd+t").unwrap()]);
+
+        let loaded = tessera_config::Config::from_toml_lenient(
+            "[keys]\n'cmd+t' = 'unbound'\n'command+t' = 'new_tab'\n",
+        )
+        .unwrap();
+        let map = Keymap::compile_quietly(&loaded.config.keys);
+        let entries: Vec<_> = map.entries().map(|e| e.effect).collect();
+        assert_eq!(entries, [KeyEffect::Unbound, KeyEffect::Shadowed]);
+        assert_eq!(map.resolve(&event), None, "the unbound entry came first");
+        assert_eq!(map.chords(new_tab), []);
     }
 
     /// `is_default` against the rule it caches: no `[keys]` entry names

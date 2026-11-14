@@ -30,6 +30,12 @@ pub const MAX_SEND_TEXT_LEN: usize = 4096;
 /// close; the cap only bounds what an entry may keep.
 pub const MAX_COMMAND_NAME_LEN: usize = 64;
 
+/// Longest value text a [`RefusedKey`] keeps (and the key map exports for
+/// any entry), in bytes, after escaping: room for `send_text:` and
+/// [`MAX_SEND_TEXT_LEN`] bytes written plainly. Longer text is cut with a
+/// marker (docs/security.md S5).
+pub const MAX_ENTRY_VALUE_TEXT_LEN: usize = MAX_SEND_TEXT_LEN + "send_text:".len();
+
 /// The modifiers of a [`Chord`]. The bit values are those of
 /// `tessera_term::Modifiers` (Shift 1, Alt 2, Ctrl 4, Super 8).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -726,6 +732,43 @@ pub struct KeyBinding {
     pub action: KeyAction,
 }
 
+/// What became of one of the first [`MAX_KEY_BINDINGS`] `[keys]` entries
+/// of a table, in document order ([`Keys::entries`]): for a settings view
+/// that lists every entry as written, the refused ones included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KeyEntry {
+    /// Accepted by the notation: [`Keys::bindings`] at this index. The key
+    /// map decides whether it takes effect.
+    Binding(usize),
+    /// Refused by the notation (a chord or value that does not parse, an
+    /// invisible character, a value that is not a string).
+    Refused(RefusedKey),
+}
+
+/// A `[keys]` entry the notation refused, as much of it as a settings view
+/// shows: never the raw text, which may be as long as the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedKey {
+    /// The table key as written, escaped and capped as warnings are.
+    pub key: String,
+    /// The chord, when the key parses (the value did not).
+    pub chord: Option<Chord>,
+    /// The value as written, escaped as warnings are and capped at
+    /// [`MAX_ENTRY_VALUE_TEXT_LEN`] bytes; `None` when it is not a string.
+    pub value: Option<String>,
+    /// Why it was refused: the entry's one warning, also reported by
+    /// [`Keys::take_warnings`].
+    pub warning: Warning,
+}
+
+/// `value` as a [`RefusedKey`] keeps it and the key map exports it:
+/// escaped, at most [`MAX_ENTRY_VALUE_TEXT_LEN`] bytes.
+#[must_use]
+pub fn escaped_value(value: &str) -> String {
+    escaped(value, MAX_ENTRY_VALUE_TEXT_LEN)
+}
+
 /// The `[keys]` table: chords bound to commands or text, in document
 /// order. Built by deserializing; entries that break the grammar or the
 /// caps are left out and reported by [`Keys::take_warnings`].
@@ -736,6 +779,12 @@ pub struct Keys {
     /// [`Config::from_toml_lenient`](crate::Config::from_toml_lenient)
     /// to sort; not part of the value.
     warnings: Vec<(usize, Warning)>,
+    /// The first [`MAX_KEY_BINDINGS`] entries in document order and what
+    /// became of each ([`Keys::entries`]).
+    entries: Vec<KeyEntry>,
+    /// The overflow warning, when entries past [`MAX_KEY_BINDINGS`] were
+    /// dropped; kept after [`Keys::take_warnings`] for the key map.
+    overflow: Option<Warning>,
     /// The entries as deserialized (a value that is not a string is
     /// `None`), kept only until [`Keys::put_in_document_order`] rebuilds
     /// the table from them and drops them: the TOML parser hands a table
@@ -746,12 +795,16 @@ pub struct Keys {
     source: Vec<(String, Option<String>)>,
 }
 
-/// Equal when both bind the same entries in the same order: the order
-/// decides which chord a command's menu item shows (its first), so a
-/// configuration that only reorders the table is a change.
+/// Equal when both bind the same entries in the same order, refuse the
+/// same entries at the same places and drop as many past the cap: the
+/// order decides which chord a command's menu item shows (its first), so
+/// a configuration that only reorders the table is a change, and so is
+/// one whose refused entries changed (the key map exports them).
 impl PartialEq for Keys {
     fn eq(&self, other: &Self) -> bool {
         self.bindings == other.bindings
+            && self.entries == other.entries
+            && self.overflow == other.overflow
     }
 }
 
@@ -793,6 +846,8 @@ impl Keys {
         order.sort_by_key(|&(at, _)| at);
         self.bindings.clear();
         self.warnings.clear();
+        self.entries.clear();
+        self.overflow = None;
         let dropped = order.len().saturating_sub(MAX_KEY_BINDINGS);
         for &(at, index) in order.iter().take(MAX_KEY_BINDINGS) {
             let (key, value) = &source[index];
@@ -800,8 +855,9 @@ impl Keys {
         }
         if dropped > 0 {
             let at = order[MAX_KEY_BINDINGS].0;
-            self.warnings
-                .push((at, Warning::TooManyKeyBindings { dropped }));
+            let warning = Warning::TooManyKeyBindings { dropped };
+            self.overflow = Some(warning.clone());
+            self.warnings.push((at, warning));
         }
         self.warnings.sort_by_key(|&(at, _)| at);
     }
@@ -814,6 +870,23 @@ impl Keys {
     #[must_use]
     pub fn bindings(&self) -> &[KeyBinding] {
         &self.bindings
+    }
+
+    /// The first [`MAX_KEY_BINDINGS`] entries read, in document order,
+    /// with what became of each: accepted (an index into
+    /// [`Keys::bindings`]) or refused with its warning. At most
+    /// [`MAX_KEY_BINDINGS`]; the raw text of a refused entry is not kept,
+    /// only its escaped and capped form.
+    #[must_use]
+    pub fn entries(&self) -> &[KeyEntry] {
+        &self.entries
+    }
+
+    /// The warning for the entries past [`MAX_KEY_BINDINGS`], when there
+    /// were any (also reported once by [`Keys::take_warnings`]).
+    #[must_use]
+    pub fn overflow(&self) -> Option<&Warning> {
+        self.overflow.as_ref()
     }
 
     /// Whether the table has no accepted entry.
@@ -839,40 +912,37 @@ impl Keys {
 
     /// Checks one entry found at byte offset `at` (or index, for
     /// [`Keys::from_entries`]); `value` is `Err` when it is not a string.
+    ///
+    /// The "shadows plain typing" caveat is the key map's: only an entry
+    /// that takes effect is honoured (#430 m4).
     fn add(&mut self, at: usize, key: &str, value: Result<&str, ()>) {
-        let warn = |reason: String| {
-            (
-                at,
-                Warning::KeyBinding {
-                    key: escaped_text(key),
-                    reason,
-                },
-            )
+        let mut refuse = |chord: Option<Chord>, reason: String| {
+            let escaped_key = escaped_text(key);
+            let warning = Warning::KeyBinding {
+                key: escaped_key.clone(),
+                reason,
+            };
+            self.warnings.push((at, warning.clone()));
+            self.entries.push(KeyEntry::Refused(RefusedKey {
+                key: escaped_key,
+                chord,
+                value: value.ok().map(escaped_value),
+                warning,
+            }));
         };
         let chord = match Chord::parse(key) {
             Ok(chord) => chord,
-            Err(error) => {
-                self.warnings.push(warn(format!("{error}; ignored")));
-                return;
-            }
+            Err(error) => return refuse(None, format!("{error}; ignored")),
         };
-        let Ok(value) = value else {
-            self.warnings
-                .push(warn("value must be a string; ignored".into()));
-            return;
+        let Ok(text) = value else {
+            return refuse(Some(chord), "value must be a string; ignored".into());
         };
-        let action = match KeyAction::parse(value) {
+        let action = match KeyAction::parse(text) {
             Ok(action) => action,
-            Err(error) => {
-                self.warnings.push(warn(format!("{error}; ignored")));
-                return;
-            }
+            Err(error) => return refuse(Some(chord), format!("{error}; ignored")),
         };
-        if chord.shadows_typing() && action != KeyAction::Unbound {
-            self.warnings.push(warn(
-                "shadows plain typing of this key; honoured".to_owned(),
-            ));
-        }
+        self.entries.push(KeyEntry::Binding(self.bindings.len()));
+        let value = text;
         self.bindings.push(KeyBinding {
             key: key.to_owned(),
             chord,

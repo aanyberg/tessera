@@ -84,8 +84,9 @@ pub use theme::{
 };
 
 pub use keys::{
-    Chord, ChordError, ChordKey, ChordModifiers, KeyAction, KeyActionError, KeyBinding, Keys,
-    MAX_CHORD_LEN, MAX_COMMAND_NAME_LEN, MAX_KEY_BINDINGS, MAX_SEND_TEXT_LEN,
+    Chord, ChordError, ChordKey, ChordModifiers, KeyAction, KeyActionError, KeyBinding, KeyEntry,
+    Keys, MAX_CHORD_LEN, MAX_COMMAND_NAME_LEN, MAX_ENTRY_VALUE_TEXT_LEN, MAX_KEY_BINDINGS,
+    MAX_SEND_TEXT_LEN, RefusedKey, escaped_value,
 };
 pub use load::{
     DEFAULT_CONFIG_TOML, Loaded, MAX_CONFIG_FILE_LEN, MAX_PARSE_ERROR_LEN,
@@ -209,9 +210,9 @@ pub struct Config {
     ///
     /// Only chords with `cmd` appear in menus; others work in the
     /// terminal only. A malformed entry, an unknown command or a chord
-    /// already bound by an earlier entry is ignored with a warning (the
-    /// first entry not ignored for another reason wins); at most 512
-    /// entries are read.
+    /// already bound by an earlier entry (an `unbound` entry too) is
+    /// ignored with a warning (the first entry not ignored for another
+    /// reason wins); at most 512 entries are read.
     ///
     /// The Settings window's Keys pane writes chords in the canonical form
     /// (`cmd+ctrl+alt+shift+key`). An entry you write by hand in another

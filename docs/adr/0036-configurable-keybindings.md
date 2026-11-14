@@ -225,7 +225,9 @@ The rest of #348 and the Rust half of what #317 still listed.
 * **Configuration and key map are published together** (D2-4). An apply
   sets the configuration and compiles its key map under one lock (the
   configuration's, then the map's), so `App::config()` and
-  `App::keymap()` never come from different applies, and
+  `App::keymap()` never come from different applies once an apply has
+  returned (#355 m5; while one runs, a reader may still see the new
+  configuration with the old map), and
   `tessera_config_json` reads the configuration and its generation
   together (`App::config_and_generation`). A 20 000-trial stress of
   racing applies, and test hooks that pause between the two reads (so a
@@ -236,3 +238,34 @@ The rest of #348 and the Rust half of what #317 still listed.
   Window, holds ⌥⌘W. "Menus show the map" has this one exception; no code
   change.
 * The 1 MiB above was the file cap of an earlier version; it is 16 MiB.
+
+## Amendment: `[keys]` entries in the key map JSON (#355, 2026-11-14)
+
+* **Every entry is listed.** `tessera_app_keymap_json` gains a top-level
+  `entries` array, in file order, beside `commands` and `warnings` (which
+  are unchanged): `{index, key, chord, value, effect, warning}`. `key` is
+  the file's key, escaped (S3) and capped at 256 bytes; `chord` is the
+  canonical spelling Rust parsed (`null` when it did not parse:
+  canonicalisation stays in Rust); `value` is the file's string,
+  `{"send_text": "…"}` for a text, or `null` when it was not a string,
+  escaped and capped at 4106 bytes (`MAX_ENTRY_VALUE_TEXT_LEN`, the
+  `send_text:` prefix plus 4096); `warning` is the entry's warning or
+  `null`.
+* **Effects.** `bound` (it took effect: a command, a text or `ignore`),
+  `unbound` (an `unbound` entry that removed a default), `shadowed` (an
+  earlier entry for the same chord took effect, the first entry wins as
+  in #317; an `unbound` entry after a binding included, with the "same
+  chord" warning rather than silently, #430 m6) and `refused` (an entry
+  the loader or the registry refused). The "shadows plain typing"
+  caveat is given only for `bound` entries (#430 m4); it moved from the
+  loader to the key map, so the config editor still refuses an edit that
+  adds it.
+* **One snapshot, no raw entries.** The entries come from the same
+  `keymap_and_generation` read as the chords, so a JSON's entries are
+  those of its `generation` (a 1000-round staged test). The table keeps
+  only each entry's outcome (at most 512, `MAX_KEY_BINDINGS`; the raw TOML
+  is still dropped once it is built); the overflow warning comes last in
+  `warnings`. A change of refused entries alone recompiles the map.
+* **Size.** 512 entries at their caps, every byte a character the JSON
+  escapes, measured 4.78 MB (8.8 KB without `[keys]`); the buffer
+  contract has no fixed maximum, the app retries with the reported length.

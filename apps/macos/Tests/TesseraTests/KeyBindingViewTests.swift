@@ -44,7 +44,11 @@ final class KeyBindingViewTests: XCTestCase {
         setenv("TESSERA_CONFIG_DIR", dir.path, 1)
         let core = try TesseraApp()
         self.core = core
-        XCTAssertEqual(try core.keymap().warnings, [], "the table applies as written")
+        // The table applies as written: the only warning is the caveat a
+        // bound Option chord gets (#355 K4 m4; honoured, not refused).
+        XCTAssertEqual(
+            try core.keymap().warnings, ["`keys.\"alt+t\"`: shadows plain typing of this key; honoured"],
+            "the table applies as written")
         // The recorder: `cat` in raw mode, writing its input to a file,
         // after lines enough for a scrollback.
         file = dir.appendingPathComponent("input.bin")
