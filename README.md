@@ -65,7 +65,8 @@ Closing a window or tab that is running a job asks first (`confirm_close`).
 - Drag to select, double-click for a word, triple-click for a line, ⇧-click to move the nearer end of the selection,
   ⌥-drag (or ⌥⌘-drag) for a block. Dragging above or below the window scrolls.
 - ⌘-hover underlines a link, ⌘-click opens `http`, `https`, `mailto`, `ftp` and local `file` links (a local app,
-  script or similar file is shown in Finder instead of launched).
+  script, installer, profile, certificate or other file that would run, install or import something is shown in
+  Finder instead).
 - A program that tracks the mouse (vim, tmux, htop) gets the clicks instead; hold ⇧ to select anyway.
 
 ### Configuration
