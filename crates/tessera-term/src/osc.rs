@@ -92,10 +92,12 @@
 //!   opens none (the length is summed from the pieces, so an over-long URI
 //!   is never copied); an id over [`tessera_grid::MAX_ID_BYTES`] is dropped
 //!   and the link kept without it.
-//! - A URI with a control character (DEL or C1; C0 never reaches an OSC)
-//!   or a bidirectional formatting character closes the open link and opens
-//!   none ([`LinkRefused::ControlInUri`]). The text after it prints as
-//!   usual, unlinked.
+//! - A URI with a control character (DEL or C1; C0 never reaches an OSC),
+//!   a bidirectional formatting character (U+061C, U+200E, U+200F,
+//!   U+202A..U+202E, U+2066..U+2069) or a line or paragraph separator
+//!   (U+2028, U+2029) closes the open link and opens none
+//!   ([`LinkRefused::ControlInUri`]). The text after it prints as usual,
+//!   unlinked.
 //! - Past [`tessera_grid::MAX_LIVE_LINKS`] links alive, or
 //!   [`tessera_grid::MAX_LINK_TABLE_BYTES`] of URI and id text, no new one
 //!   is opened, and the open link is closed. The first refusal is logged at

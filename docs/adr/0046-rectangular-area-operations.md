@@ -131,3 +131,44 @@ two damages.
 - The protect_spec.txt `#>` block (D01-D10, K02, K03b) and the esctest2
   `saveRestoreCursor_protection` rows are live tests now.
 - DECCARA, DECRARA, DECRQCRA, DECSACE and DA1 attribute 28 remain open.
+
+## Amendment: DECFRA mapping order and the exact self copy (#269, 2026-11-14)
+
+Two fixes from the wave 20 review (#430, 20.1 adversarial M1 and M2);
+tests in `crates/tessera-term/tests/rect_fixes.rs` and
+`tests/rect_alloc.rs`, and an application-level damage check in
+`crates/tessera-app-core/tests/rect_damage.rs` (D1-4 through a session's
+own advance and the selection guard, not the grid alone).
+
+- **DECFRA maps, then checks.** A Latin-1 `Pch` is mapped through the
+  character sets first and the result checked for being fillable, as
+  printing it would show it. Before, the check ran on `Pch` itself, so
+  173 (U+00AD, a zero-width soft hyphen) was refused under DEC
+  Supplemental or DEC Technical in GR, where printing it shows a
+  one-column glyph. DECFRA now fills with what printing the same
+  character shows, for every `Pch` 32-126 and 160-255 under every set of
+  the designation table, in GL and in GR, with DECNRCM off and on
+  (compared exhaustively). A `Pch` from 256 up is unchanged: it is not
+  mapped, and must itself be fillable.
+- **An exact self copy is a no-op.** A DECCRA whose destination is its
+  clipped source's top-left corner (whatever the source, the page
+  parameters and the origin mode) changes no cell, damages no row and
+  allocates nothing. Before, it copied every cell onto itself: 127 ms
+  on a 1024x2048 screen of clusters, each cluster's text copied, and a
+  wide character cut by an edge of the source was blanked although its
+  other half was where it was. Now the copy returns before any work, so
+  such a character stays whole and the cells' flags (a wrapped row's pad
+  included) stay as they were. A copy one cell off still copies. The
+  release bar: the full-screen self copy on that screen costs at most
+  twice a DECALN there and at most ten one-cell DECERAs plus a
+  millisecond.
+- **Allocation wording.** Merging a copy into a destination row that
+  holds clusters or links takes the row's entries out, which moves the
+  row's entry list out with them: each touched row regrows it as the
+  entries are set back, about log n allocations for a row of n entries
+  (docs/security.md "Current bounds").
+- `tests/rect.rs`'s B02 partial copy over clusters and links copied the
+  left half onto itself, which is now the no-op; it copies one column to
+  the right instead (`CSI 1;1;1024;1024;1;1;2;1 $ v`), so it still times
+  the merge path (a merge that sets each copied entry on its own fails
+  it, over clusters and over links).

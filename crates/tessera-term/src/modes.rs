@@ -37,6 +37,7 @@
 //! | 1049 | alternate screen | set saves the cursor, enters and clears; reset leaves and restores the cursor |
 //! | 2004 | bracketed paste | [`Modes::bracketed_paste`] |
 //! | 2026 | synchronized output | [`Modes::synchronized_output`], stored only |
+//! | 2031 | colour scheme updates | [`Modes::color_scheme_updates`]: while set, a change of the colour scheme (dark or light, from the default background) queues an unsolicited `CSI ? 997 ; 1\|2 n`; setting it sends nothing (ADR 0024) |
 //!
 //! Every other mode, `0` and an empty parameter included, is ignored and
 //! logged at trace level; one sequence may set several modes, and an
@@ -82,11 +83,12 @@
 //! a resource there); in 132-column mode it also asks the host for 80
 //! columns with a [`Request::Resize`] (the grid keeps its width). DECSTR (`CSI ! p`) resets origin
 //! mode, cursor visibility (on), cursor blink, synchronized output,
-//! insert mode, auto-wrap (on), DECLRMM (off, with the margins back to
+//! colour scheme updates (2031), insert mode, auto-wrap (on), DECLRMM (off, with the margins back to
 //! the full width), reverse wraparound (45 and 1045, off), DECCKM,
 //! DECKPAM, `modifyOtherKeys` and both kitty stacks, and keeps the rest:
 //! reverse video, LNM, the alternate screen, bracketed paste, focus events
-//! and the mouse modes.
+//! and the mouse modes. No reset sends a colour scheme report: 2031 is
+//! off before the colours a reset drops are looked at.
 
 use tessera_grid::EraseDisplay;
 use tracing::trace;
@@ -173,6 +175,15 @@ pub struct Modes {
     /// DECRST 42 keeps the sets that were designated; DECSTR keeps the mode
     /// (xterm), RIS turns it off (ADR 0033).
     pub nrcs: bool,
+    /// DECSET 2031 (Contour's colour palette update notifications): while
+    /// it is on, every change of the colour scheme, dark or light as the
+    /// colour-scheme query `CSI ? 996 n` answers it, queues one
+    /// unsolicited `CSI ? 997 ; 1 n` (dark) or `CSI ? 997 ; 2 n` (light)
+    /// [`Request::Reply`]. Setting it sends nothing; a change that leaves
+    /// the scheme as it was sends nothing either. Cleared by DECSTR,
+    /// DECSCL and RIS, kept across the alternate screen (ADR 0024,
+    /// "Amendment: colour scheme").
+    pub color_scheme_updates: bool,
 }
 
 impl Default for Modes {
@@ -197,6 +208,7 @@ impl Default for Modes {
             reverse_wrap: false,
             reverse_wrap_extended: false,
             nrcs: false,
+            color_scheme_updates: false,
         }
     }
 }
@@ -386,6 +398,7 @@ impl State {
             }
             2004 => self.modes.bracketed_paste = on,
             2026 => self.modes.synchronized_output = on,
+            2031 => self.modes.color_scheme_updates = on,
             45 => self.modes.reverse_wrap = on,
             69 => self.set_left_right_margin_mode(on),
             1045 => self.modes.reverse_wrap_extended = on,
@@ -543,6 +556,10 @@ impl State {
         // The spec is silent; a program that died between the begin and
         // the end of an update must not freeze the screen after `reset`.
         self.modes.synchronized_output = false;
+        // Not in DEC's table or xterm's `ReallyReset`, but a program that
+        // died with it on must not leave the shell receiving reports after
+        // `reset` (kitty clears every mode on a soft reset; ADR 0024).
+        self.modes.color_scheme_updates = false;
         // xterm `ReallyReset`: `resetMarginMode` (DECLRMM off, margins to
         // the full width) and the reverse wraparound modes to their
         // defaults (DEC STD 070, esctest's DECSTR tests).

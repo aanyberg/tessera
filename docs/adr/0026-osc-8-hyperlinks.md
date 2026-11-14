@@ -148,8 +148,9 @@ Ghostty; WezTerm drops the whole OSC). The URI is everything after the
 second `;`, further semicolons included, and must be UTF-8. Its length is
 summed from the parser's pieces before they are joined, so an over-long
 URI is refused without a copy. A URI that contains a C0 control, DEL, a
-C1 control (U+0080 to U+009F) or a bidirectional formatting character
-(U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069) is refused: such a
+C1 control (U+0080 to U+009F), a bidirectional formatting character
+(U+061C, U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069) or a line
+or paragraph separator (U+2028, U+2029) is refused: such a
 URI shows the user one target and opens another (the Trojan Source
 spoofing of a hover tooltip or a copied link), and no real URI needs them
 unencoded. The OSC layer already drops C0 bytes, and NUL handling is
@@ -161,7 +162,7 @@ unchanged; the grid checks C0 too, for callers other than the parser.
 | URI not UTF-8 | ignored, the open link stays (if it is also over 2 083 bytes, the length check comes first: the link closes) |
 | empty URI, whatever the params | closes (D-L2: VTE, kitty) |
 | URI over 2 083 bytes | closes the open link, opens none (D-L3: VTE; a long URI cannot make text look as if it belonged to the previous link) |
-| URI with C1, DEL or bidi formatting characters | closes the open link, opens none; the text after it prints unlinked |
+| URI with C1, DEL, bidi formatting characters or U+2028/U+2029 | closes the open link, opens none; the text after it prints unlinked |
 | `id` over 250 bytes (or empty) | dropped, the link opens without it |
 | payload fills the parser's 16 pieces (`MAX_OSC_PARAMS`): a URI with 13 or more `;` (`8`, the params and 14 URI pieces); 12 still opens | closes the open link: a cut URI is another URI |
 
@@ -256,3 +257,14 @@ until it is hovered with Command held.
 - Not done: drawing links by default, a tooltip, `file:` host checks (the
   Swift side, 30-app), links across the alternate-screen switch, and
   OSC 8 inside tmux passthrough (tmux strips it unless configured).
+
+## Amendment: the refusal set as built (#269, 2026-11-14)
+
+The list of characters that make a URI refused (Decision, above) now
+names the full set the grid refuses since the window-title filter was
+shared with it: U+061C (ARABIC LETTER MARK) with the other bidirectional
+formatting characters, and the line and paragraph separators U+2028 and
+U+2029, which a tooltip or a pasted link would break a line at. The code
+already refused them (`tessera-grid`'s `hyperlink.rs`, tested there);
+only this record and `tessera-term`'s `osc.rs` documentation lagged
+(#430 20.3 m3). No behaviour changes.

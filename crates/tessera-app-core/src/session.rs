@@ -1072,11 +1072,24 @@ impl Session {
     /// Gives the terminal the look's cursor style and theme colours as its
     /// defaults, read under the terminal lock (terminal, then look), so of
     /// two applies racing the last to get here leaves the newest look.
+    ///
+    /// A colour scheme report the new colours queue (mode 2031, #269) goes
+    /// to the outbox at once, after the terminal lock is released, as the
+    /// reader queues its replies: an idle child gets it without writing
+    /// first. Only replies are taken ([`Terminal::take_replies`]); the
+    /// reader drains every request under the lock hold of the slice that
+    /// queued it, so no reply of the child's own queries is pending here to
+    /// be sent twice or lost.
     pub(crate) fn push_look(&self) {
         let mut term = self.term.lock();
         let look = self.look();
         term.set_default_cursor_style(look.cursor());
         term.set_theme_colors(crate::view::theme_colors_for(&look.colours));
+        let replies = term.take_replies();
+        drop(term);
+        if !replies.is_empty() {
+            self.outbox.try_queue_reply(self.id, replies);
+        }
     }
 
     /// The working directory the session's shell last reported (OSC 7).

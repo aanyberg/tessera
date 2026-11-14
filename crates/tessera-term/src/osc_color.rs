@@ -79,12 +79,32 @@
 //! `105`), the pointer and Tektronix colours (`OSC 13` to `16`, `18`) and
 //! their resets stay ignored.
 //!
+//! # Colour scheme
+//!
+//! The colour scheme is dark or light, decided by the background in effect
+//! (the theme's or the program's `OSC 11`) alone: light when its Rec. 601
+//! luma `299 r + 587 g + 114 b` is above `127 500` (Y > 127.5 on 8-bit
+//! channels), dark otherwise (D-LUMA). The foreground, the palette and
+//! the cursor never decide it. `CSI ? 996 n` answers it (`CSI ? 997 ; 1 n`
+//! dark, `CSI ? 997 ; 2 n` light), and while DECSET 2031 is on, every
+//! change of it queues the same bytes unsolicited, at the moment of the
+//! change: a theme change ([`Terminal::set_theme_colors`]), the program's
+//! own `OSC 11` or `OSC 111` (D-OSC, as tmux does). A change of colours
+//! that leaves the scheme as it was sends nothing (D-DEDUP); the scheme is
+//! recomputed whether or not 2031 is on, so turning it on starts from the
+//! scheme in effect. RIS turns 2031 off before it drops the overrides, so
+//! it never reports.
+//!
 //! # Bounds
 //!
 //! The overrides are a fixed table of [`MAX_COLOR_OVERRIDES`] slots (256
 //! palette entries and the three dynamic colours): no sequence makes it
 //! grow. Each query queues one [`Request::Reply`], bounded by the host's
-//! reply outbox like every other reply (ADR 0024).
+//! reply outbox like every other reply (ADR 0024). So does each colour
+//! scheme report: at most one per change of the scheme, never one for a
+//! colour change that keeps it, and none while 2031 is off; a report the
+//! host's full outbox drops is gone (the program asks again with `CSI ?
+//! 996 n`, D-FLOOD).
 //!
 //! [`Request::Reply`]: crate::Request::Reply
 
@@ -230,6 +250,31 @@ impl Default for ColorOverrides {
     }
 }
 
+/// Dark or light: what `CSI ? 996 n` answers and DECSET 2031 reports, as
+/// the `Ps` of `CSI ? 997 ; Ps n`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ColorScheme {
+    /// 1: a dark background.
+    Dark = 1,
+    /// 2: a light background.
+    Light = 2,
+}
+
+impl ColorScheme {
+    /// The scheme of background `bg`: light when its Rec. 601 luma is above
+    /// 127.5 (`299 r + 587 g + 114 b > 127 500`), dark otherwise (D-LUMA).
+    /// A luma of exactly 127.5 is dark: 114 colours land on it, `#00cc44`
+    /// and `#01ade1` among them.
+    pub(crate) fn of(bg: Rgb) -> Self {
+        let luma = 299 * u32::from(bg.r) + 587 * u32::from(bg.g) + 114 * u32::from(bg.b);
+        if luma > 127_500 {
+            Self::Light
+        } else {
+            Self::Dark
+        }
+    }
+}
+
 /// One colour a program can set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Slot {
@@ -260,12 +305,18 @@ pub(crate) struct Colors {
     /// Increased by every change of an override or of an effective
     /// colour.
     generation: u64,
+    /// The scheme of the background in effect when it last changed: what
+    /// a change of the scheme is detected against (see "Colour scheme" in
+    /// the module documentation).
+    scheme: ColorScheme,
 }
 
 impl Default for Colors {
     fn default() -> Self {
+        let theme = ThemeColors::default();
         Self {
-            theme: ThemeColors::default(),
+            scheme: ColorScheme::of(theme.bg),
+            theme,
             overrides: ColorOverrides::NONE,
             generation: 0,
         }
@@ -273,6 +324,21 @@ impl Default for Colors {
 }
 
 impl Colors {
+    /// The scheme of the background in effect now.
+    pub(crate) fn scheme_now(&self) -> ColorScheme {
+        ColorScheme::of(self.effective(Slot::Bg))
+    }
+
+    /// Records the scheme of the background in effect; returns it when it
+    /// differs from the one recorded before.
+    fn rescheme(&mut self) -> Option<ColorScheme> {
+        let now = self.scheme_now();
+        (now != self.scheme).then(|| {
+            self.scheme = now;
+            now
+        })
+    }
+
     fn theme_of(&self, slot: Slot) -> Rgb {
         match slot {
             Slot::Fg => self.theme.fg,
@@ -505,6 +571,9 @@ impl State {
                 self.reply_osc(format_args!("{ps};{color}"), bell);
             } else if let Some(color) = parse_color_spec(spec) {
                 self.colors.set(slot, color);
+                if slot == Slot::Bg {
+                    self.color_scheme_changed();
+                }
             } else {
                 trace!(
                     len = spec.len(),
@@ -539,7 +608,30 @@ impl State {
         }
         if let Some(slot) = Slot::dynamic(n) {
             self.colors.reset(slot);
+            if slot == Slot::Bg {
+                self.color_scheme_changed();
+            }
         }
+    }
+
+    /// Records the colour scheme after a change of the background in
+    /// effect and, when it changed while DECSET 2031 is on, queues the
+    /// unsolicited report `CSI ? 997 ; Ps n` (see "Colour scheme" in the
+    /// module documentation). Called after every change that can move the
+    /// background: `OSC 11`, `OSC 111`, a theme and RIS.
+    pub(crate) fn color_scheme_changed(&mut self) {
+        if let Some(scheme) = self.colors.rescheme()
+            && self.modes.color_scheme_updates
+        {
+            self.report_color_scheme(scheme);
+        }
+    }
+
+    /// Queues `CSI ? 997 ; Ps n` for `scheme`: the answer to `CSI ? 996 n`
+    /// and the unsolicited report of DECSET 2031 alike.
+    pub(crate) fn report_color_scheme(&mut self, scheme: ColorScheme) {
+        let ps = scheme as u8;
+        self.reply_csi(format_args!("?997;{ps}n"));
     }
 }
 
@@ -550,8 +642,18 @@ impl Terminal {
     /// program's overrides stay (D-THEME-KEEP). The host sets it before
     /// the session's first byte and whenever the configured theme changes.
     /// Starts as [`ThemeColors::default`].
+    ///
+    /// A theme whose background changes the colour scheme (dark or light,
+    /// see `CSI ? 996 n` in ADR 0024) while the program has DECSET 2031 on
+    /// queues one [`Request::Reply`], `CSI ? 997 ; 1 n` or `CSI ? 997 ; 2
+    /// n`, for the host to take with [`Terminal::take_requests`] and write
+    /// to the child; a theme that keeps the scheme, or one whose background
+    /// the program overrides (`OSC 11`), queues nothing.
+    ///
+    /// [`Request::Reply`]: crate::Request::Reply
     pub fn set_theme_colors(&mut self, theme: ThemeColors) {
         self.state.colors.set_theme(theme);
+        self.state.color_scheme_changed();
     }
 
     /// The colours the program set (`OSC 4`, `10`, `11`, `12`) and has not
