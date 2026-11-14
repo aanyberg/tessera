@@ -43,6 +43,7 @@ check "the warning names both versions" 1.99.1 update "local rustc 1.99.1 is beh
 check "1.99.1 is older than 1.100.0 as numbers" 1.99.1 update "behind"
 check "an equal version passes" 1.100.0 current "PASS"
 check "a newer local version passes" 1.101.0 current "PASS"
+check "a newer local version is called newer, not current" 1.101.0 current "is newer than the current stable (1.100.0)"
 check "an offline rustup check is skipped" 1.99.1 offline "check skipped"
 check "no rustup is skipped" 1.99.1 update "rustup not found" "$work/nobin"
 out="$(FAKE_RUSTC=1.99.1 FAKE_RUSTUP=update PATH="$work/bin:$PATH" zsh "$script" extra 2>&1)"; rc=$?

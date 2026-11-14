@@ -35,6 +35,8 @@ fi
 newest="$(printf '%s\n%s\n' "$local_version" "$latest" | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)"
 if [[ "$local_version" != "$latest" && "$newest" == "$latest" ]]; then
     print -P "%F{yellow}WARN%f local rustc $local_version is behind the current stable $latest that CI uses: run \`rustup update stable\` before the gate"
+elif [[ "$local_version" != "$latest" ]]; then
+    print -P "%F{green}PASS%f local rustc $local_version is newer than the current stable ($latest)"
 else
     print -P "%F{green}PASS%f local rustc $local_version is the current stable ($latest)"
 fi

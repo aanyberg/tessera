@@ -36,6 +36,12 @@ if sync_check "$security" "$work/exceptions-more.txt"; then
 else
     ok "the sync check fails when the list has a path S7 lacks"
 fi
+# The exceptions list is read from the base branch, and S7 says so (#430, 20.0c).
+if sed -n '/^- \*\*S7\./,/^- \*\*S8\./p' "$security" | tr '\n' ' ' | tr -s ' ' | grep -q 'as it is on the base branch'; then
+    ok "docs/security.md S7 says the exceptions list is read as it is on the base branch"
+else
+    not_ok "docs/security.md S7 does not say the list is read as it is on the base branch"
+fi
 
 if [ "$failures" -ne 0 ]; then
     printf '%s check(s) failed\n' "$failures"

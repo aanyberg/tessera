@@ -419,6 +419,80 @@ if grep -q 'crates/tessera-grid/src/lib.rs: fn f() { unsafe { g() } }' "$work/li
 else
     not_ok "the unsafe failure does not name the file and the line: $(cat "$work/line.log")"
 fi
+if grep -q 'FAIL.* unsafe: outside tessera-pty, tessera-ffi and the files listed in scripts/unsafe-exceptions.txt as it is on main' "$work/line.log"; then
+    ok "the unsafe failure says the exceptions list is read from the base"
+else
+    not_ok "the unsafe failure does not say where the list is read from: $(cat "$work/line.log")"
+fi
+
+# --pre-integration skips the commits check with one `skip` line (bad-tip's tip has no trailers); without it the same
+# branch fails.
+git -C "$repo" switch -q bad-tip
+for runner in bash zsh; do
+    "$runner" "$script" "$repo" --no-load --pre-integration > "$work/pre.log" 2>&1 || true
+    "$runner" "$script" "$repo" --no-load > "$work/nopre.log" 2>&1 || true
+    if [ "$(grep -c 'skip.* commits (--pre-integration' "$work/pre.log")" = 1 ] && ! grep -q 'FAIL.* commits' "$work/pre.log" \
+        && grep -q 'FAIL.* commits:' "$work/nopre.log" && ! grep -q 'skip.* commits' "$work/nopre.log"; then
+        ok "--pre-integration skips the commits check on a tip without trailers; without it the check fails ($runner)"
+    else not_ok "--pre-integration ($runner): $(cat "$work/pre.log") / $(cat "$work/nopre.log")"; fi
+done
+
+# app-test: a branch that changes apps/macos needs a `just app-test` record "<sha> clean" for its head. The record and
+# target/ are untracked build output: keep them out of `git status` as the real .gitignore does.
+printf 'apps/macos/build\ntarget\n' >> "$repo/.git/info/exclude"
+branch app-change
+change apps/macos/Sources/App.swift 'let x = 1'
+commit
+app_head="$(git -C "$repo" rev-parse HEAD)"
+record="$repo/apps/macos/build/app-test-pass"
+mkdir -p "$repo/apps/macos/build"
+app_case() { # <case> <PASS|FAIL> <record content or ->
+    rm -f "$record"
+    [ "$3" = - ] || printf '%s\n' "$3" > "$record"
+    line_check "$1" app-change app-test "$2"
+    rm -f "$record"
+}
+app_case 'an apps/macos change with no app-test record fails' FAIL -
+app_case 'an app-test record for another commit fails' FAIL "$(git -C "$repo" rev-parse main) clean"
+app_case 'an app-test record for HEAD from a dirty tree fails' FAIL "$app_head dirty"
+app_case 'an app-test record for HEAD on a clean tree passes' PASS "$app_head clean"
+git -C "$repo" switch -q app-core-lib
+"$script" "$repo" --no-load > "$work/line.log" 2>&1 || true
+if grep -q 'skip.* app-test (the branch does not change apps/macos)' "$work/line.log" && ! grep -qE '(PASS|FAIL|WARN).* app-test' "$work/line.log"; then
+    ok "a Rust-only branch skips the app-test check"
+else not_ok "Rust-only branch: $(cat "$work/line.log")"; fi
+
+# stale: a dirty worktree whose target/ holds output newer than the last commit fails before the gate, within a second;
+# a clean worktree with the same target/ is not checked, and neither is a dirty one whose target/ is older.
+mkdir -p "$repo/target/debug/deps"
+newer="$repo/target/debug/deps/libmutant.rlib"
+: > "$newer"
+touch -t "$(date -v+1d +%Y%m%d%H%M)" "$newer"
+git -C "$repo" switch -q app-core-lib
+for runner in bash zsh; do
+    git -C "$repo" checkout -q -- . ; rm -f "$repo/dirty.txt"
+    rc=0; "$runner" "$script" "$repo" --no-load > "$work/stale.log" 2>&1 || rc=$?
+    if [ "$rc" = 0 ] || [ "$rc" = 1 ]; then clean_gate="$(grep -cE '(PASS|FAIL)[^ ]* gate( \(|$)' "$work/stale.log")"; else clean_gate=0; fi
+    if [ "$clean_gate" = 1 ] && ! grep -q 'stale' "$work/stale.log"; then
+        ok "a clean worktree with a newer target/ is not checked ($runner)"
+    else not_ok "clean worktree with a newer target/ ($runner): exit $rc: $(cat "$work/stale.log")"; fi
+    printf 'x\n' > "$repo/dirty.txt"
+    start="$(perl -MTime::HiRes=time -e 'print time')"
+    rc=0; "$runner" "$script" "$repo" --no-load > "$work/stale.log" 2>&1 || rc=$?
+    took="$(perl -MTime::HiRes=time -e "printf '%.2f', time - $start")"
+    if [ "$rc" = 1 ] && grep -q 'FAIL.* stale: the worktree is dirty and .*target holds build output newer than the last commit' "$work/stale.log" \
+        && grep -q 'git status' "$work/stale.log" && grep -q 'cargo clean -p' "$work/stale.log" && ! grep -qE '(PASS|FAIL)[^ ]* gate( \(|$)' "$work/stale.log" \
+        && perl -e "exit($took < 1 ? 0 : 1)"; then
+        ok "a dirty worktree with a newer target/ fails fast, before the gate, in ${took}s ($runner)"
+    else not_ok "dirty worktree with a newer target/ ($runner, ${took}s): exit $rc: $(cat "$work/stale.log")"; fi
+    touch -t 200001010000 "$newer"
+    "$runner" "$script" "$repo" --no-load > "$work/stale.log" 2>&1 || true
+    if ! grep -q 'stale' "$work/stale.log" && grep -q 'FAIL.* clean' "$work/stale.log"; then
+        ok "a dirty worktree whose target/ is older than the last commit goes on to the other checks ($runner)"
+    else not_ok "dirty worktree with an older target/ ($runner): $(cat "$work/stale.log")"; fi
+    touch -t "$(date -v+1d +%Y%m%d%H%M)" "$newer"
+done
+rm -rf "$repo/target" "$repo/dirty.txt"
 
 # The load check runs 2 tests x 10 runs and never has more than --parallel of them in flight. The fixture's gate
 # and commit trailers may pass or fail (exit 0 or 1); only the load line and the samples matter here.

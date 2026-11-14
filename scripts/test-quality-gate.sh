@@ -154,6 +154,17 @@ if timing 1,0 "$high" > "$work/out" 2>&1 && grep -q "failed under load $high, re
 else
     not_ok "failure then pass under load: $(< "$work/out")"
 fi
+# Each run's first and last line name it (pid, head) with its exit status, so two runs that write one log file can be
+# told apart (#446): a passing and a failing run each end with their own status.
+timing 0 "$high" > "$work/run1" 2>&1 || true
+timing 1,1 "$high" > "$work/run2" 2>&1 || true
+if [[ "$(head -1 "$work/run1")" == "quality gate run (pid "*" head "*") started "* && "$(tail -1 "$work/run1")" == "quality gate run (pid "*") exit 0" \
+    && "$(tail -1 "$work/run2")" == "quality gate run (pid "*") exit 1" \
+    && "$(head -1 "$work/run1" | sed 's/ started.*//')" == "$(tail -1 "$work/run1" | sed 's/ exit.*//')" ]]; then
+    ok "a gate run starts and ends with its own id and exit status"
+else
+    not_ok "run id lines: $(head -1 "$work/run1") / $(tail -1 "$work/run1") / $(tail -1 "$work/run2")"
+fi
 if ! timing 1,1 "$high" > "$work/out" 2>&1 && grep -q "retried" "$work/out" \
     && [[ "$(grep -c -- '-- release timing run' "$work/out")" == 2 ]]; then
     ok "two failures under load: the step fails after one retry"
@@ -183,11 +194,17 @@ fi
 
 # The release timing run selects the b02_* cost bars of tessera-term's rect tests next to tessera-app-core's bars, in a
 # release build.
-if grep -q -- '--release -p tessera-app-core -p tessera-term -E' "$work/cargo.calls" \
+if grep -q -- '--release -p tessera-app-core -p tessera-term -p tessera-config -E' "$work/cargo.calls" \
     && grep -q 'package(tessera-term) & binary(=rect) & test(b02_)' "$work/cargo.calls"; then
     ok "the release timing run includes the tessera-term b02_ tests"
 else
     not_ok "the release timing run lacks the b02_ tests: $(< "$work/cargo.calls")"
+fi
+# ... and the config edit bar among many mark-like lines (tessera-config, tests/edit.rs).
+if grep -q 'package(tessera-config) & binary(=edit) & test(=an_edit_among_many_mark_like_lines_is_fast)' "$work/cargo.calls"; then
+    ok "the release timing run includes the tessera-config edit bar"
+else
+    not_ok "the release timing run lacks the edit bar: $(< "$work/cargo.calls")"
 fi
 
 # --- the ffi C tests run under the watchdog
