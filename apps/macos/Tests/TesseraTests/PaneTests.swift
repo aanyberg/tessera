@@ -2859,6 +2859,7 @@ extension PaneTests {
         // Caught where the press is dispatched, as NSApp's loop would: left
         // to XCTest, it would end the test.
         var caught: [NSException?] = []
+        let pressMode = RunLoop.Mode.eventTracking
         let downDriver = DragDriver()
         downDriver.onTick = { [unowned downDriver] in
             for index in drags.indices {
@@ -2870,8 +2871,13 @@ extension PaneTests {
                 RunLoop.main.add(timer, forMode: .eventTracking)
                 timers.append(timer)
                 post(.leftMouseDown, drags[index].start)
+                // Fetched outside the default mode: on CI's active host the
+                // fetch runs a pass of its mode, and one of the default mode
+                // would end the drag before this one (#453). The pass is run
+                // here too, so the test takes that path locally.
+                _ = RunLoop.main.run(mode: pressMode, before: .distantPast)
                 if let event = NSApp.nextEvent(
-                    matching: .leftMouseDown, until: .distantPast, inMode: .default, dequeue: true)
+                    matching: .leftMouseDown, until: .distantPast, inMode: pressMode, dequeue: true)
                 {
                     caught.append(TesseraTestsCatchingException { NSApp.sendEvent(event) })
                     timer.invalidate()
