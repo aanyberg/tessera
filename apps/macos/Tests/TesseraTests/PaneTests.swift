@@ -1918,6 +1918,26 @@ private final class PaneHostProxy: TerminalWindowControllerDelegate {
         app.terminalWindowControllerDidClose(controller)
     }
 
+    /// The saves the tab's window asked for itself: it moved, resized or
+    /// became main. On CI the host is active, so the window can become main
+    /// in the middle of a test (#453); locally it never does.
+    private(set) var windowChanges = 0
+
+    /// The saves the panes asked for: the layout changes less the window's
+    /// own (``countWindowChanges(of:)``).
+    var paneLayoutChanges: Int { layoutChanges - windowChanges }
+
+    /// Counts `window`'s own saves until the returned observers are removed:
+    /// the window delegate's `windowDidMove`, `windowDidResize` and
+    /// `windowDidBecomeMain` come from these notifications.
+    func countWindowChanges(of window: NSWindow) -> [any NSObjectProtocol] {
+        [NSWindow.didMoveNotification, NSWindow.didResizeNotification, NSWindow.didBecomeMainNotification].map {
+            NotificationCenter.default.addObserver(forName: $0, object: window, queue: nil) { [weak self] _ in
+                MainActor.assumeIsolated { self?.windowChanges += 1 }
+            }
+        }
+    }
+
     func terminalWindowControllerDidChangeLayout(_ controller: TerminalWindowController) {
         layoutChanges += 1
         app.terminalWindowControllerDidChangeLayout(controller)
@@ -2701,8 +2721,13 @@ extension PaneTests {
                 },
                 { _ in abs(self.frame(of: topRight, in: controller).maxY - (innerStart - 150.5)) < 1 },
             ])
-        try await trackDividerDragsUntilExceptions(
-            [outer, inner], in: container, window: try XCTUnwrap(controller.window))
+        let window = try XCTUnwrap(controller.window)
+        let observers = proxy.countWindowChanges(of: window)
+        defer { observers.forEach { NotificationCenter.default.removeObserver($0) } }
+        // The window becomes main, as it can on CI (#453): a save, but not
+        // the panes'.
+        NotificationCenter.default.post(name: NSWindow.didBecomeMainNotification, object: window)
+        try await trackDividerDragsUntilExceptions([outer, inner], in: container, window: window)
         try await waitUntil("the closed pane's view leaves the tab") { closingView?.window == nil }
         XCTAssertEqual(controller.panes, [left, topRight, bottomRight])
         XCTAssertEqual(splitViews(in: container), 2, "no stale split view")
@@ -2720,7 +2745,8 @@ extension PaneTests {
             splits[1].ratio * (container.bounds.height - PaneSplitView.thickness), height, accuracy: 1,
             "the tree keeps the second drag's ratio")
         XCTAssertFalse(isTrackingDividerDragInEventTrackingMode(container), "the drags ended")
-        XCTAssertEqual(proxy.layoutChanges, 2, "saved for the close and once at the drags' end")
+        XCTAssertEqual(proxy.windowChanges, 1, "the window's own save is counted apart")
+        XCTAssertEqual(proxy.paneLayoutChanges, 2, "saved for the close and once at the drags' end")
         XCTAssertTrue(controller.toggleZoom(), "zoom is not refused")
         XCTAssertTrue(controller.toggleZoom())
     }
