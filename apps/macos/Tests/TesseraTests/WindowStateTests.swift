@@ -49,6 +49,10 @@ final class WindowStateTests: XCTestCase {
     }
 
     override func tearDown() async throws {
+        if NSApp.isHidden {
+            NSApp.unhideWithoutActivation()
+            try await waitUntil("the app is shown again") { !NSApp.isHidden }
+        }
         appDelegate.windowStateStore = nil
         for controller in appDelegate.windowControllers {
             controller.window?.close()
@@ -191,7 +195,8 @@ final class WindowStateTests: XCTestCase {
         let background = try appDelegate.newTab(in: window)
         _ = try appDelegate.newTab(in: window)
         await Task.yield()
-        XCTAssertEqual(store.load(), WindowState(windows: [.init(frame: window.frame, tabCount: 3)]))
+        // Each new tab opens after `window`, the first, and is selected.
+        XCTAssertEqual(store.load(), WindowState(windows: [.init(frame: window.frame, tabCount: 3, selectedTab: 1)]))
 
         // The selected tab is the window on screen; the others follow it.
         let selected = try XCTUnwrap(window.tabGroup?.selectedWindow)
@@ -207,8 +212,8 @@ final class WindowStateTests: XCTestCase {
 
         let other = try XCTUnwrap(appDelegate.newWindow().window)
         await Task.yield()
-        XCTAssertEqual(store.load()?.windows.map(\.tabCount), [2, 1])
-        XCTAssertEqual(store.load()?.windows.last?.frame, other.frame)
+        XCTAssertEqual(store.load()?.windows.map(\.tabCount), [1, 2], "the new window is in front")
+        XCTAssertEqual(store.load()?.windows.first?.frame, other.frame)
     }
 
     /// Quitting saves the windows as they are, whatever is still queued.
@@ -675,6 +680,249 @@ final class WindowStateTests: XCTestCase {
         try await waitUntil("the restored layout is saved") { savedRatio().map { abs($0 - 0.3) < 1e-9 } ?? false }
         controller.equalizePanes(nil)
         try await waitUntil("the equalised ratio is saved") { savedRatio() == 0.5 }
+    }
+
+    // MARK: Stacking and the selected tab (#414)
+
+    /// The selected tab is saved by its place in tab order, the last tab
+    /// as none (what a restore selects without it), and a restore selects
+    /// it again, also after the tabs were reordered.
+    func testTheSelectedTabIsSavedAndRestored() throws {
+        let window = try XCTUnwrap(appDelegate.newWindow().window)
+        _ = try appDelegate.newTab(in: window)
+        _ = try appDelegate.newTab(in: window.tabGroup?.windows.last ?? window)
+        let group = try XCTUnwrap(window.tabGroup)
+        let tabs = group.windows
+        XCTAssertEqual(tabs.count, 3)
+        XCTAssertTrue(group.selectedWindow === tabs[2], "a new tab is selected")
+        XCTAssertNil(appDelegate.currentWindowState().windows.first?.selectedTab, "the last tab: none saved")
+
+        group.selectedWindow = tabs[1]
+        XCTAssertEqual(appDelegate.currentWindowState().windows.first?.selectedTab, 1)
+        // The bar's order counts, not the order the tabs opened.
+        group.removeWindow(tabs[1])
+        group.insertWindow(tabs[1], at: 0)
+        group.selectedWindow = tabs[1]
+        let state = appDelegate.currentWindowState()
+        XCTAssertEqual(state.windows.first?.selectedTab, 0, "the selected tab moved first")
+        XCTAssertEqual(state.windows.first?.frame, tabs[1].frame, "the selected tab's frame")
+        let store = WindowStateStore(defaults: defaults)
+        store.save(state)
+        let loaded = try XCTUnwrap(store.load())
+        XCTAssertEqual(loaded, state)
+        for controller in appDelegate.windowControllers {
+            controller.window?.close()
+        }
+
+        XCTAssertTrue(appDelegate.restoreWindows(from: loaded, screens: NSScreen.screens.map(\.visibleFrame)))
+
+        let restored = try XCTUnwrap(appDelegate.windowControllers.first?.window?.tabGroup)
+        XCTAssertEqual(restored.windows.count, 3)
+        XCTAssertTrue(restored.selectedWindow === restored.windows[0], "the first tab is selected again")
+        XCTAssertEqual(appDelegate.currentWindowState(), loaded, "and saved as it came back")
+    }
+
+    /// A value without a selected tab (every value before #414) restores
+    /// with the last tab selected, as before.
+    func testAValueWithoutASelectedTabRestoresWithTheLastTabSelected() throws {
+        let json = #"{"windows":[{"frame":[[40,60],[700,450]],"tabCount":3}]}"#
+        defaults.set(Data(json.utf8), forKey: WindowStateStore.key)
+        let state = try XCTUnwrap(WindowStateStore(defaults: defaults).load())
+        XCTAssertNil(state.windows.first?.selectedTab)
+
+        XCTAssertTrue(appDelegate.restoreWindows(from: state, screens: NSScreen.screens.map(\.visibleFrame)))
+
+        let group = try XCTUnwrap(appDelegate.windowControllers.first?.window?.tabGroup)
+        XCTAssertEqual(group.windows.count, 3)
+        XCTAssertTrue(group.selectedWindow === group.windows.last)
+    }
+
+    /// S5: a selected tab that is no tab, or not a whole number, is
+    /// ignored (the last tab is selected) and never refuses the window or
+    /// traps, whatever the tab count.
+    func testAHostileSelectedTabIsIgnored() throws {
+        let store = WindowStateStore(defaults: defaults)
+        func load(tabCount: String, selected: String) -> WindowState? {
+            let json = #"{"windows":[{"frame":[[40,60],[700,450]],"tabCount":"# + tabCount + #","selectedTab":"#
+                + selected + "}]}"
+            defaults.set(Data(json.utf8), forKey: WindowStateStore.key)
+            return store.load()
+        }
+        XCTAssertEqual(load(tabCount: "3", selected: "0")?.windows.first?.selectedTab, 0)
+        XCTAssertEqual(load(tabCount: "3", selected: "1")?.windows.first?.selectedTab, 1)
+        XCTAssertEqual(load(tabCount: "3", selected: "1.0")?.windows.first?.selectedTab, 1, "a whole number in JSON")
+        XCTAssertEqual(load(tabCount: "64", selected: "62")?.windows.first?.selectedTab, 62)
+        let ignored: [(tabCount: String, selected: String)] = [
+            ("3", "2"), ("3", "3"), ("3", "-1"), ("3", "64"), ("3", "1.5"), ("3", #""1""#), ("3", "null"),
+            ("3", "true"), ("3", "[1]"), ("3", "1e300"), ("3", "\(Int.max)"), ("3", "\(Int.min)"),
+            ("3", "99999999999999999999"), ("1", "0"), ("0", "0"), ("-5", "0"), ("\(Int.min)", "0"),
+            ("\(Int.min)", "\(Int.max)"), ("64", "63"),
+        ]
+        for (tabCount, selected) in ignored {
+            let window = load(tabCount: tabCount, selected: selected)?.windows.first
+            XCTAssertNotNil(window, "tabCount \(tabCount), selectedTab \(selected): the window is kept")
+            XCTAssertNil(window?.selectedTab, "tabCount \(tabCount), selectedTab \(selected)")
+        }
+        // In the model too, and through the restore plan.
+        let frame = CGRect(x: 40, y: 60, width: 700, height: 450)
+        for (count, selected) in [(Int.min, Int.max), (0, 0), (-1, -2), (2, Int.max), (2, Int.min)] {
+            XCTAssertNil(WindowState.Window(frame: frame, tabCount: count, selectedTab: selected).selectedTab)
+            let plan = WindowState(windows: [.init(frame: frame, tabCount: count, selectedTab: selected)])
+                .restorePlan(screens: [Self.screen])
+            XCTAssertEqual(plan.map(\.selectedTab), [nil], "\(count), \(selected)")
+        }
+    }
+
+    /// The session cap drops tabs from the back of the list; a selected
+    /// tab among the dropped ones leaves the last tab kept selected, and
+    /// the cap keeps the front windows (the list is front to back).
+    func testTheRestorePlanKeepsTheSelectedTabWithinTheTabsItKeeps() {
+        let frame = CGRect(x: 100, y: 100, width: 700, height: 500)
+        let state = WindowState(windows: [
+            .init(frame: frame, tabCount: 60, selectedTab: 10),
+            .init(frame: frame, tabCount: 10, selectedTab: 2),
+            .init(frame: frame, tabCount: 10, selectedTab: 8),
+            .init(frame: frame, tabCount: 5, selectedTab: 1),
+        ])
+
+        let plan = state.restorePlan(screens: [Self.screen])
+
+        XCTAssertEqual(plan.map(\.tabCount), [60, 4], "64 sessions, the front windows first")
+        XCTAssertEqual(plan.map(\.selectedTab), [10, 2])
+        let cut = WindowState(windows: [.init(frame: frame, tabCount: 64), .init(frame: frame, tabCount: 3, selectedTab: 1)])
+        XCTAssertEqual(cut.restorePlan(screens: [Self.screen]).count, 1)
+        let partly = WindowState(windows: [
+            .init(frame: frame, tabCount: 62), .init(frame: frame, tabCount: 5, selectedTab: 3),
+        ])
+        XCTAssertEqual(partly.restorePlan(screens: [Self.screen]).map(\.selectedTab), [nil, nil], "tab 3 is dropped")
+    }
+
+    /// The windows are saved front to back as they are stacked on screen,
+    /// whatever order they opened in, and a restore stacks them the same
+    /// way, the front one key. The ordering is the window server's, through
+    /// the app's own calls: nothing is injected.
+    func testTheWindowsAreSavedFrontToBackAndRestoredStackedTheSame() throws {
+        let screens = NSScreen.screens.map(\.visibleFrame)
+        guard let main = screens.first, main.width >= 800, main.height >= 500 else {
+            throw XCTSkip("no screen big enough to place the windows")
+        }
+        let frames = (0..<3).map { CGRect(x: main.minX + 20 + CGFloat($0) * 40, y: main.minY + 20, width: 500, height: 300) }
+        let windows = try frames.map { try XCTUnwrap(appDelegate.newWindow(frame: $0).window) }
+        _ = try appDelegate.newTab(in: windows[1])
+        try requireStacking(of: windows)
+        // Front to back: 1 (its selected tab), 0, 2.
+        windows[0].orderFront(nil)
+        try XCTUnwrap(windows[1].tabGroup?.selectedWindow).orderFront(nil)
+        windows[2].orderBack(nil)
+        let store = WindowStateStore(defaults: defaults)
+        appDelegate.windowStateStore = store
+
+        XCTAssertEqual(appDelegate.applicationShouldTerminate(NSApp), .terminateNow)
+
+        let saved = try XCTUnwrap(store.load())
+        XCTAssertEqual(saved.windows.map(\.frame), [frames[1], frames[0], frames[2]], "front to back")
+        XCTAssertEqual(saved.windows.map(\.tabCount), [2, 1, 1])
+        appDelegate.windowStateStore = nil
+        for controller in appDelegate.windowControllers {
+            controller.window?.close()
+        }
+
+        XCTAssertTrue(appDelegate.restoreWindows(from: saved, screens: screens))
+
+        // An unselected tab is on the list too, behind; each window counts
+        // by its selected tab.
+        let stacked = NSApp.orderedWindows.filter { window in
+            window.tabGroup?.selectedWindow === window && self.appDelegate.windowControllers.contains { $0.window === window }
+        }
+        XCTAssertEqual(stacked.map(\.frame), [frames[1], frames[0], frames[2]], "restored front to back")
+        XCTAssertEqual(appDelegate.currentWindowState(), saved, "and saved as it came back")
+    }
+
+    /// A window that is not on screen (here ordered out, as a minimized
+    /// one is) is saved after those that are, which keep their stacking.
+    func testAWindowOffScreenIsSavedBehindTheOthers() throws {
+        let windows = try (0..<3).map { _ in try XCTUnwrap(appDelegate.newWindow().window) }
+        try requireStacking(of: windows)
+        windows[0].orderOut(nil)
+        windows[1].orderFront(nil)
+        windows[2].orderFront(nil)
+
+        let state = appDelegate.currentWindowState()
+
+        XCTAssertEqual(state.windows.map(\.frame), [windows[2].frame, windows[1].frame, windows[0].frame])
+        XCTAssertEqual(
+            appDelegate.currentWindowState(orderedWindows: []).windows.map(\.frame), windows.map(\.frame),
+            "nothing on screen: the order they opened")
+    }
+
+    /// A minimized window stays on the window list, after those on screen,
+    /// and is saved there.
+    func testAMinimizedWindowIsSavedBehindThoseOnScreen() async throws {
+        let windows = try (0..<3).map { _ in try XCTUnwrap(appDelegate.newWindow().window) }
+        try requireStacking(of: windows)
+        // Front to back: 2, 1, 0, each opened in front.
+        windows[2].miniaturize(nil)
+        try await waitUntil("the window is minimized") { windows[2].isMiniaturized }
+
+        XCTAssertEqual(
+            appDelegate.currentWindowState().windows.map(\.frame), [1, 0, 2].map { windows[$0].frame },
+            "on screen front to back, then the minimized one")
+    }
+
+    /// While the app is hidden (Hide, Hide Others) its window list is in the
+    /// order the windows opened; the windows are saved as they were stacked
+    /// when it hid, one opened since after them, and once it is shown again
+    /// the stacking on screen counts again. Hidden through AppKit, as Hide
+    /// does: nothing is posted.
+    func testTheWindowsOfAHiddenAppAreSavedAsTheyWereStackedWhenItHid() async throws {
+        let screens = NSScreen.screens.map(\.visibleFrame)
+        guard let main = screens.first, main.width >= 800, main.height >= 500 else {
+            throw XCTSkip("no screen big enough to place the windows")
+        }
+        let frames = (0..<5).map { CGRect(x: main.minX + 20 + CGFloat($0) * 40, y: main.minY + 20, width: 500, height: 300) }
+        let windows = try frames.prefix(4).map { try XCTUnwrap(appDelegate.newWindow(frame: $0).window) }
+        try requireStacking(of: windows)
+        for index in [1, 3, 0, 2] {
+            windows[index].orderFront(nil)
+        }
+        let stacked = [2, 0, 3, 1].map { frames[$0] }
+        XCTAssertEqual(appDelegate.currentWindowState().windows.map(\.frame), stacked, "shown: front to back")
+
+        NSApp.hide(nil)
+        try await waitUntil("the app is hidden") { NSApp.isHidden }
+        let listed = NSApp.orderedWindows.filter { window in windows.contains { $0 === window } }.map(\.frame)
+        // macOS 27 lists a hidden app's windows in open order; an OS that
+        // keeps the stacking makes this test pass without the fix, which is
+        // recorded, not failed.
+        if listed == stacked {
+            XCTContext.runActivity(named: "this OS keeps a hidden app's stacking: the snapshot is not exercised") { _ in }
+        }
+        let opened = try XCTUnwrap(appDelegate.newWindow(frame: frames[4]).window)
+        XCTAssertTrue(NSApp.isHidden, "opening a window left the app hidden")
+        let store = WindowStateStore(defaults: defaults)
+        appDelegate.windowStateStore = store
+
+        XCTAssertEqual(appDelegate.applicationShouldTerminate(NSApp), .terminateNow)
+
+        XCTAssertEqual(try XCTUnwrap(store.load()).windows.map(\.frame), stacked + [frames[4]], "as stacked when it hid")
+        appDelegate.windowStateStore = nil
+        NSApp.unhideWithoutActivation()
+        try await waitUntil("the app is shown again") { !NSApp.isHidden }
+        windows[1].orderFront(nil)
+        XCTAssertEqual(
+            appDelegate.currentWindowState().windows.first?.frame, frames[1], "shown again: the stacking on screen")
+        _ = opened
+    }
+
+    /// Fails unless this host stacks `windows` (they are on the window
+    /// server's list, as they are in a locked session and on CI), which
+    /// the stacking tests rely on; not a skip, which would hide them.
+    private func requireStacking(of windows: [NSWindow]) throws {
+        let ordered = NSApp.orderedWindows
+        let missing = windows.filter { window in !ordered.contains { $0 === (window.tabGroup?.selectedWindow ?? window) } }
+        if !missing.isEmpty {
+            throw PollTimedOut(description: "\(missing.count) of \(windows.count) windows are not on the window list")
+        }
     }
 
     /// Polls `condition`, letting the main actor run, until it holds or
