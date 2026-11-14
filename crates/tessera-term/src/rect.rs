@@ -52,7 +52,11 @@
 //! Each costs a constant per cell of the clipped rectangle, with no per-cell
 //! event; DECCRA's only buffers are scratch of at most one row (cells,
 //! and the clusters and links of a row), at most the screen's width
-//! (docs/security.md).
+//! (docs/security.md). Merging a copy into a destination row that holds
+//! clusters or links moves that row's entry list out, so each touched row
+//! regrows it (about log n allocations for n entries). An exact self copy
+//! (the destination is the source's top-left corner) is a no-op: no cell,
+//! no damage, no allocation.
 
 use tessera_grid::{Cell, Rect, char_width};
 use tracing::trace;
@@ -193,16 +197,19 @@ impl State {
     }
 
     /// The character DECFRA fills with for `pch`, or `None` when it is not
-    /// one it takes.
+    /// one it takes. A Latin-1 `Pch` is mapped through the character sets
+    /// first and the result checked, as printing it would show it (#430):
+    /// U+00AD (173, a zero-width soft hyphen) under DEC Supplemental or DEC
+    /// Technical in GR is a one-column glyph and fills.
     fn fill_char(&self, pch: u16) -> Option<char> {
         let code = match pch {
             0 => 0x20,
             32..=126 | 160.. => u32::from(pch),
             _ => return None,
         };
-        let ch = char::from_u32(code).filter(|&ch| fillable(ch))?;
+        let ch = char::from_u32(code)?;
         if !self.charsets.active || code > 0xFF {
-            return Some(ch);
+            return Some(ch).filter(|&ch| fillable(ch));
         }
         // Printing would map it through GL or GR; a copy of the sets
         // without the single shift, so a pending SS2 or SS3 stays pending.

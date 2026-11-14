@@ -136,7 +136,9 @@ impl State {
     /// their defaults, both kitty keyboard stacks emptied, 132-column mode
     /// left with a request for 80 columns) and replies back to 7-bit C1
     /// controls (xterm's `show_8bit_control(False)`), and every colour a
-    /// program set (OSC 4, 10, 11, 12; xterm would keep 10 to 12). The
+    /// program set (OSC 4, 10, 11, 12; xterm would keep 10 to 12), with
+    /// no colour scheme report for the background that goes (2031 is off
+    /// by then). The
     /// DECSCL conformance level and the theme's colours are kept: xterm sets
     /// the level only at start-up. DECSTR (`CSI ! p`) is the soft variant
     /// that keeps the screen, see the crate documentation.
@@ -157,6 +159,9 @@ impl State {
         // Every colour a program set (OSC 4, 10, 11, 12) goes; the theme
         // stays (ADR 0024: xterm keeps the dynamic colours here).
         self.colors.reset_all();
+        // The scheme follows the dropped background override; 2031 is
+        // already off (`reset_modes` above), so nothing is reported.
+        self.color_scheme_changed();
         // Protection off, and no protected cell is left anywhere: the
         // screens and the scrollback are gone (ADR 0034).
         self.protection = Protection::Off;

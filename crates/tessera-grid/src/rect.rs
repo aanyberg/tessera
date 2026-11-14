@@ -22,7 +22,12 @@
 //! most the screen's width per call; a copy that carries clusters or links
 //! also uses scratch lists of them (each at most one row's entries: the
 //! copied ones and the destination row's own while they are merged back in
-//! column order) and one allocation per copied cluster's text.
+//! column order) and one allocation per copied cluster's text. Taking the
+//! destination row's entries out moves the row's entry list out with them,
+//! so each touched row regrows its list as they are set back (about log n
+//! allocations for a row of n entries). An exact self copy (the
+//! destination is the source's top-left corner) returns before any of
+//! this: it costs nothing and allocates nothing.
 
 use crate::{Cell, CellFlags, Grid, Hyperlink, Style};
 
@@ -165,6 +170,11 @@ impl Grid {
     /// its own background, and one in the destination that loses a half
     /// to the copy is blanked whole with the background of `pen`. A
     /// destination at or past an edge of `clip` copies nothing.
+    ///
+    /// An exact self copy (`dst_top` and `dst_left` are `src`'s top-left
+    /// corner) changes nothing at all, damages no row and allocates
+    /// nothing (#430): a wide character cut by an edge of `src` stays
+    /// whole there, since its other half is where it was.
     pub fn copy_rect(&mut self, src: Rect, dst_top: u16, dst_left: u16, clip: Rect, pen: Style) {
         let (rows, cols) = (self.rows(), self.cols());
         let (Some(src), Some(clip)) = (src.clip(rows, cols), clip.clip(rows, cols)) else {
@@ -174,6 +184,9 @@ impl Grid {
             return;
         }
         if dst_left > clip.right {
+            return;
+        }
+        if dst_top == src.top && dst_left == src.left {
             return;
         }
         let height = (src.bottom - src.top).min(clip.bottom - dst_top) + 1;

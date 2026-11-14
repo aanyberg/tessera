@@ -35,7 +35,11 @@
 //! query, 0 for an unknown mode), DECRQSS (`DCS $ q`, for SGR, DECSTBM,
 //! DECSCUSR and DECSCL), the kitty keyboard flags query `CSI ? u` and the
 //! XTWINOPS size reports (`CSI 14/16/18/19 t`; the pixel sizes once
-//! [`Terminal::set_cell_pixels`] knows the cell). Replies are 7-bit unless
+//! [`Terminal::set_cell_pixels`] knows the cell) and the colour scheme
+//! query `CSI ? 996 n` (dark or light, from the background in effect).
+//! The one reply nobody asked for is the colour scheme report of DECSET
+//! 2031 ([`Modes::color_scheme_updates`]): `CSI ? 997 ; 1|2 n` whenever
+//! the scheme changes, from a theme change or the program's own OSC 11. Replies are 7-bit unless
 //! 8-bit mode is on (see "8-bit C1 controls" below). Tessera identifies as itself, not as xterm ([`DA2_PV`]). Reports that
 //! would echo text a program supplied (the title reports `CSI 20/21 t`,
 //! XTGETTCAP) are never answered. `CSI 22 t` and `CSI 23 t` push and pop
@@ -74,7 +78,8 @@
 //! - the modes on DECSTR's reset list (ADR 0020): origin mode (DECOM)
 //!   off before the saved cursor is reset, so a DECRC homes to the screen's
 //!   corner; the cursor visible (DECTCEM) and not blinking (DECSET 12);
-//!   synchronized output (2026) off; cursor keys (DECCKM) and keypad
+//!   synchronized output (2026) and colour scheme updates (2031) off;
+//!   cursor keys (DECCKM) and keypad
 //!   (DECKPAM) to normal, `modifyOtherKeys` to 0 and both kitty keyboard
 //!   flag stacks emptied;
 //! - the cursor style the program set (DECSCUSR, `CSI Ps SP q`, and DECSET
@@ -292,7 +297,10 @@ pub enum Request {
         cols: u16,
     },
     /// Bytes to write to the child: the answer to a query it sent (DA,
-    /// DSR, DECRQM, DECRQSS, XTVERSION, window size, ...; ADR 0024).
+    /// DSR, DECRQM, DECRQSS, XTVERSION, window size, ...; ADR 0024), or
+    /// the colour scheme report DECSET 2031 asked for, which a theme
+    /// change ([`Terminal::set_theme_colors`]) can queue outside
+    /// [`Terminal::advance`].
     /// 7-bit controls, or 8-bit ones in 8-bit mode (S8C1T, see "8-bit C1
     /// controls" in the crate documentation). One request per answered
     /// query, in the order the queries completed; the host writes them to
@@ -444,6 +452,25 @@ impl Terminal {
     /// Drains side-effect requests accumulated since the last call.
     pub fn take_requests(&mut self) -> Vec<Request> {
         std::mem::take(&mut self.state.pending)
+    }
+
+    /// Drains only the [`Request::Reply`] requests, their bytes joined in
+    /// the order they were queued, and leaves every other request queued for
+    /// [`Terminal::take_requests`]. For a caller that changed the terminal
+    /// outside [`Terminal::advance`] (the colour scheme report
+    /// [`Terminal::set_theme_colors`] queues under mode 2031) and can
+    /// deliver replies but not the other requests. Empty when no reply is
+    /// queued.
+    pub fn take_replies(&mut self) -> Vec<u8> {
+        let mut replies = Vec::new();
+        self.state.pending.retain_mut(|request| match request {
+            Request::Reply(bytes) => {
+                replies.append(bytes);
+                false
+            }
+            _ => true,
+        });
+        replies
     }
 
     /// Read access to the grid.
