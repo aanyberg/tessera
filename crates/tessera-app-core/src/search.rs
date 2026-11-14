@@ -2037,7 +2037,17 @@ mod tests {
             search.start("dolor", LITERAL).unwrap();
             let mut most = (0, 0);
             for round in 0..40 {
-                while !search.step(&shared, Duration::ZERO).done {}
+                // A budget no stall outlasts: a late piece would halve the
+                // limit for the rest of the search, and a pass whose lines
+                // are cut finer than the full limit keeps no copy (so the
+                // 50-row screen would keep nothing under machine load).
+                while !search.step(&shared, Duration::from_secs(3600)).done {}
+                let active = search.active.as_ref().unwrap();
+                assert_eq!(
+                    (active.limit, active.skips),
+                    (PieceLimit::FULL, 0),
+                    "{rows} rows, round {round}: a piece was late"
+                );
                 let (copies, spares) = kept(&search);
                 most = (most.0.max(copies), most.1.max(spares));
                 // Rewrite a row in place, scroll a few in, or switch
