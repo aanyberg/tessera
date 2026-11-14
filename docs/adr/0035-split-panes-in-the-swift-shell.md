@@ -166,3 +166,20 @@ exits) ends the sheet as Cancel.
   AppKit's live resize (see Divider drags above).
 - Swapping panes and resizing them from the keyboard are not done yet; a
   maximized pane and the focus are not restored.
+
+## Amendment: hidden panes while maximized (#323, 2026-11-14)
+
+The panes hidden behind a maximized one no longer draw. Their sessions
+still run and the core keeps parsing their output; each pane's display
+link pauses while the view or an ancestor is hidden, as for an occluded
+window, so a flood in a hidden pane renders no frame. Showing every pane
+again redraws each pane once, at the next display refresh, with its
+latest output. The hidden panes keep their last grid size: the hidden
+split views are neither built again nor resized (no core resize reaches
+a hidden pane, `testAPaneHiddenBehindAMaximizedOneDrawsNothingUntilShownAgain`
+and `testMaximizingAPaneKeepsTheOthersAliveAndUnresizedAndBringsThemBackExactly`),
+so the rule holds now that the #38b review's B1 is fixed.
+A divider drag that AppKit ended with an exception is ended in the run
+loop's default mode only for the latest drag, with its own split's ratio
+(#417 T3), through the same `dividerDragDidEnd` path as a drag that ends
+normally.

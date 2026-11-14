@@ -329,8 +329,12 @@ final class TerminalWindowContentView: NSView {
         // Only a full-size (translucent) window has a strip: an opaque one
         // passes through a frame with its content over a tab bar that is
         // going, which is no strip and must not become the floor (#417 M6).
+        // Content of no height (a program's frame) is all under the title
+        // bar too (#417 T5 m2).
         var inset: CGFloat = 0
-        if let window, window.styleMask.contains(.fullSizeContentView), bounds.height > area.height {
+        if let window, window.styleMask.contains(.fullSizeContentView),
+            bounds.height > area.height || bounds.height == 0
+        {
             inset = bounds.height - area.height
             if area.height > 0 {
                 // The panes have height, so all of the strip is above them.

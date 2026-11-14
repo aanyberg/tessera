@@ -4,7 +4,9 @@
  * TesseraSessionAppearance with its TesseraRgba background, a session's
  * configured background colour and alpha, the opaque-black failure default,
  * tessera_app_blur_radius with its clamp and argument checks, and
- * tessera_app_app_appearance with its named values (#365). Uses a
+ * tessera_app_app_appearance with its named values (#365), and
+ * tessera_app_dim_inactive_panes with its clamp, argument checks and the
+ * Increase Contrast override (#323, ADR 0041). Uses a
  * configuration directory of its own under the script's TESSERA_CONFIG_DIR,
  * so later tests start from no config.toml.
  */
@@ -41,7 +43,8 @@ static const char CONFIG[] = "[appearance]\n"
                              "opacity = 0.5\n"
                              "blur = true\n"
                              "blur_radius = 100\n"
-                             "app_appearance = \"system\"\n";
+                             "app_appearance = \"system\"\n"
+                             "dim_inactive_panes = 1.5\n";
 
 /* What a failed call must overwrite. */
 static const TesseraSessionAppearance GARBAGE = {
@@ -99,6 +102,25 @@ int main(void) {
     EXPECT(tessera_app_app_appearance(app, NULL), TESSERA_ERROR_NULL_POINTER);
     EXPECT(tessera_app_app_appearance(app, &app_appearance), TESSERA_ERROR_OK);
     CHECK(app_appearance == TESSERA_APP_APPEARANCE_SYSTEM);
+
+    /* 1.5 is past the bound: it reads as 0.8; Increase Contrast turns the
+     * dimming off until it is turned off again. */
+    float dim = 7.0f;
+    EXPECT(tessera_app_dim_inactive_panes(NULL, &dim), TESSERA_ERROR_NULL_POINTER);
+    CHECK(dim == 0.0f);
+    EXPECT(tessera_app_dim_inactive_panes(app, NULL), TESSERA_ERROR_NULL_POINTER);
+    dim = 7.0f;
+    EXPECT(tessera_app_dim_inactive_panes(app, &dim), TESSERA_ERROR_OK);
+    CHECK(dim == 0.8f);
+    TesseraDisplayOptions contrast = {.reduce_transparency = 0, .increase_contrast = 1};
+    EXPECT(tessera_app_set_display_options(app, &contrast), TESSERA_ERROR_OK);
+    dim = 7.0f;
+    EXPECT(tessera_app_dim_inactive_panes(app, &dim), TESSERA_ERROR_OK);
+    CHECK(dim == 0.0f);
+    contrast.increase_contrast = 0;
+    EXPECT(tessera_app_set_display_options(app, &contrast), TESSERA_ERROR_OK);
+    EXPECT(tessera_app_dim_inactive_panes(app, &dim), TESSERA_ERROR_OK);
+    CHECK(dim == 0.8f);
 
     /* 100 is past the bound: the file loads with it lowered to 64. */
     radius = 7;
