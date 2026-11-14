@@ -134,7 +134,7 @@ closes exactly as before:
 | ⌘W, the tab's or window's close button (AppKit closes only the selected tab) | the tab's session runs a job | sheet on the tab, which is selected first: "Close this tab?" |
 | ⇧⌘W (`closeTabGroup`) | any tab of the window runs a job | one sheet on the current tab listing every busy tab's job (D4b) |
 | AppKit's own multi-tab closes (Close Other Tabs, Close Tabs to the Right, Close All), which close each tab through `windowShouldClose` | that tab's session runs a job | idle tabs close at once; each busy tab asks on its own sheet, as for ⌘W |
-| ⌘Q, the Dock's Quit, logging out (`applicationShouldTerminate`) | any session runs a job | one application-modal alert listing them all (D4b) |
+| ⌘Q, the Dock's Quit, logging out (`applicationShouldTerminate`) | any session runs a job | one application-modal alert listing them all (D4b); a quit Apple event that arrives with a confirmation up: see the #458 amendment |
 
 Close (Quit) is the default button and marked destructive, as Terminal.app
 makes Terminate the default; Cancel (Escape) keeps every tab and its job.
@@ -248,7 +248,8 @@ asking (nobody may be there to answer), but `NSApp.terminate` does
 nothing while a window has a sheet: with a close confirmation up,
 `applicationShouldTerminate` was never asked and the app ran on until
 killed, leaving a session's child that ignores `SIGHUP` behind. The
-signal's handler (`AppDelegate.terminateForSignal()`) now:
+signal's handler (`AppDelegate.terminateForSignal()`, now
+`terminateWithoutAsking()`, #458) now:
 
 - ends every attached sheet as Cancel, then calls `terminate`;
 - with an application-modal alert up (the quit confirmation, an error),
@@ -262,3 +263,36 @@ signal's handler (`AppDelegate.terminateForSignal()`) now:
 
 Either way the window state is saved, as a quit saves it, and the core's
 shutdown runs before the process ends.
+
+## Amendment: quit Apple events with a confirmation up (#458, 2026-11-14)
+
+The quit Apple event (`kAEQuitApplication`: a logout, restart or
+shutdown, the Dock's Quit, `NSRunningApplication.terminate()`,
+AppleScript's `quit`) went to AppKit's own handler, which calls
+`terminate`; with a close sheet up that does nothing (as for a signal,
+above), so the event was ignored and a logout waited on the app. The app
+replaces that handler in `applicationWillFinishLaunching`
+(`AppDelegate.handleQuitEvent(_:withReplyEvent:)`):
+
+- The system's quit, which names its reason (`kAEQuitReason`, read as a
+  parameter and as an attribute: a logout, restart or shutdown the user
+  has already confirmed), with a sheet or an application-modal alert up
+  (the quit alert itself, an error): the question is left unanswered and
+  the system wins. It quits as a signal does, without asking again, with
+  the window state saved and the core shut down. The signal's handler is
+  renamed `terminateWithoutAsking()` for it, and its grace
+  `AppDelegate.terminationGrace`.
+- Any other quit event, or the system's with nothing up: every sheet
+  ends as Cancel and `terminate` asks as ⌘Q does, one alert listing every
+  busy session (D4b), because quitting ends more than the sheet asked
+  about; with idle sessions it quits. Another application-modal alert up
+  (an error) changes nothing, as with AppKit's handler: the quit alert
+  shows over it. Only while the quit alert itself asks (a flag set around
+  `confirmQuit`) is nothing more done.
+- When the app still runs afterwards, the event is answered with
+  `userCanceledErr`, as AppKit's handler answers a cancelled quit, so a
+  logout stops rather than waiting on the app. With the quit alert
+  already up, that answer goes out at once, though the user may still
+  answer Quit and the app then quits; harmless, since a sender reads the
+  answer only as "not quit yet", and the system's own quit takes the
+  first path instead.

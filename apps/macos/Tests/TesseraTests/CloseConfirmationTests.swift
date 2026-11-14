@@ -418,6 +418,72 @@ final class CloseConfirmationTests: XCTestCase {
         XCTAssertTrue(presenter.quits.isEmpty)
     }
 
+    /// A quit Apple event that names no reason (the Dock's Quit,
+    /// `NSRunningApplication.terminate()`) with no confirmation up asks as
+    /// ⌘Q does (D4b), and its Cancel answers the event with
+    /// `userCanceledErr` (#458). The event goes through the Apple Event
+    /// Manager to the handler the app installed at launch.
+    func testAQuitEventWithNothingUpAsksAndCancelAnswersTheEvent() async throws {
+        try await assertAQuitEventWithNothingUpAsks(reason: nil)
+    }
+
+    /// The system's quit (a logout names its reason) with no confirmation
+    /// up asks too, as ⌘Q does: only a confirmation already up makes it
+    /// quit without asking. Its Cancel answers the event with
+    /// `userCanceledErr`, so the logout stops rather than waiting on the
+    /// app.
+    func testALogoutQuitEventWithNothingUpAsksAndCancelAnswersTheEvent() async throws {
+        try await assertAQuitEventWithNothingUpAsks(reason: OSType(kAEReallyLogOut))
+    }
+
+    /// Another application-modal alert up (an error) does not keep a quit
+    /// event from asking, as with AppKit's own handler: only the quit
+    /// alert already asking does.
+    func testAQuitEventWithAnotherModalAlertUpAsks() async throws {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 200, height: 100), styleMask: [.titled], backing: .buffered,
+            defer: false)
+        let modal = NSApp.beginModalSession(for: panel)
+        defer {
+            NSApp.endModalSession(modal)
+            panel.close()
+        }
+        XCTAssertNotNil(NSApp.modalWindow, "a modal alert is up")
+        try await assertAQuitEventWithNothingUpAsks(reason: nil)
+    }
+
+    /// Sends this process a quit Apple event naming `reason` (none if
+    /// `nil`) with a busy session and the quit answered Cancel.
+    private func assertAQuitEventWithNothingUpAsks(
+        reason: OSType?, file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        let controller = try appDelegate.newWindow()
+        try await start("sleep 100", in: controller)
+        presenter.quitAnswer = false
+
+        let event = NSAppleEventDescriptor(
+            eventClass: AEEventClass(kCoreEventClass), eventID: AEEventID(kAEQuitApplication),
+            targetDescriptor: .currentProcess(), returnID: AEReturnID(kAutoGenerateReturnID),
+            transactionID: AETransactionID(kAnyTransactionID))
+        if let reason {
+            event.setParam(NSAppleEventDescriptor(enumCode: reason), forKeyword: AEKeyword(kAEQuitReason))
+        }
+        var error: Int32?
+        do {
+            let reply = try event.sendEvent(options: [.waitForReply], timeout: 5)
+            error = reply.paramDescriptor(forKeyword: keyErrorNumber)?.int32Value
+        } catch let failure as NSError {
+            error = Int32(failure.code)
+        }
+
+        XCTAssertEqual(
+            presenter.quits, [CloseConfirmation(scope: .quit, processNames: ["sleep"])], "it asks once", file: file,
+            line: line)
+        XCTAssertEqual(error, Int32(userCanceledErr), "Cancel answers the event as cancelled", file: file, line: line)
+        XCTAssertEqual(appDelegate.windowControllers.count, 1, "Cancel keeps everything open", file: file, line: line)
+        XCTAssertFalse(appDelegate.terminatesWithoutConfirmation, "the next quit asks again", file: file, line: line)
+    }
+
     func testQuitWithIdleSessionsDoesNotAsk() throws {
         _ = try openTabs(2)
 
@@ -573,7 +639,7 @@ final class TerminationSignalTests: XCTestCase {
 
     /// When `terminate` cannot end the app (here a modal session that
     /// ignores the abort), the app ends itself after
-    /// ``AppDelegate/signalTerminationGrace``, with the window state saved
+    /// ``AppDelegate/terminationGrace``, with the window state saved
     /// and the shell that ignores `SIGHUP` reaped.
     func testASignalEndsTheAppWhenSomethingRefusesToQuit() async throws {
         let result = try await run(
@@ -585,12 +651,114 @@ final class TerminationSignalTests: XCTestCase {
         XCTAssertEqual(result.shellRemains, false, "the shell is gone once the app has exited")
     }
 
+    // MARK: Quit Apple events (#458)
+
+    /// The quit event a logout, restart or shutdown sends (it names its
+    /// reason) ends the app with a close sheet up, without asking again.
+    /// The reason is sent as a parameter, and for a logout also as an
+    /// attribute.
+    func testASystemQuitEventEndsTheAppWithACloseSheetUp() async throws {
+        let reasons: [(OSType, Bool, String)] = [
+            (OSType(kAEReallyLogOut), false, "log out"), (OSType(kAEReallyLogOut), true, "log out (attribute)"),
+            (OSType(kAERestart), false, "restart"), (OSType(kAEShutDown), false, "shut down"),
+        ]
+        for (reason, asAttribute, name) in reasons {
+            let result = try await run(
+                .sheet, command: "sleep 100", trigger: .systemQuitEvent(reason: reason, asAttribute: asAttribute))
+            assertQuit(result, within: Self.exitDeadline, "a \(name) quit event, close sheet")
+        }
+    }
+
+    /// With the quit alert up (⌘Q with a busy session), the system's quit
+    /// ends it and the quit goes on: the windows are saved, through
+    /// `terminate`.
+    func testASystemQuitEventEndsTheAppWithTheQuitAlertUp() async throws {
+        let result = try await run(
+            .alert, command: "sleep 100", trigger: .systemQuitEvent(reason: OSType(kAEReallyLogOut)))
+        assertQuit(result, within: Self.exitDeadline, "a log out quit event, quit alert")
+    }
+
+    /// The core's shutdown runs on that path too: a shell that ignores
+    /// `SIGHUP` is reaped before the app exits.
+    func testASystemQuitEventWithASheetUpReapsAShellThatIgnoresHangup() async throws {
+        let result = try await run(
+            .sheet, command: "trap '' HUP; echo $$ > shell.pid; sleep 100",
+            trigger: .systemQuitEvent(reason: OSType(kAEShutDown)))
+        assertQuit(
+            result, within: Self.exitDeadline + .seconds(3), "a shut down quit event, a shell that ignores SIGHUP")
+        XCTAssertNotNil(result.shellPid, "the shell wrote its pid")
+        XCTAssertEqual(result.shellRemains, false, "the shell is gone once the app has exited")
+    }
+
+    /// Any other quit event (`NSRunningApplication.terminate()`, the
+    /// Dock's Quit) with a close sheet up ends the sheet as Cancel and asks
+    /// to quit, as ⌘Q would: quitting ends more than the sheet asked
+    /// about. The app runs on, asking; a signal then ends it.
+    func testAQuitEventWithACloseSheetUpEndsItAndAsksToQuit() async throws {
+        let result = try await run(
+            .sheet, command: "sleep 100", trigger: .quitEvent, thenExpect: "sheets=0 modal=Cancel,Quit",
+            followedBy: SIGTERM)
+        XCTAssertEqual(result.stateAfterTrigger, "sheets=0 modal=Cancel,Quit", "the sheet ended, the quit alert asks")
+        XCTAssertEqual(result.ranOnAfterTrigger, true, "the app runs on while it asks")
+        assertQuit(result, within: Self.exitDeadline, "the signal after the quit event")
+    }
+
+    /// The same quit event with the quit alert already up changes nothing:
+    /// it already asks.
+    func testAQuitEventWithTheQuitAlertUpLeavesItAsking() async throws {
+        let result = try await run(
+            .alert, command: "sleep 100", trigger: .quitEvent, thenExpect: "sheets=0 modal=Cancel,Quit",
+            followedBy: SIGTERM)
+        XCTAssertEqual(result.stateAfterTrigger, "sheets=0 modal=Cancel,Quit", "the quit alert still asks")
+        XCTAssertEqual(result.ranOnAfterTrigger, true, "the app runs on while it asks")
+        assertQuit(result, within: Self.exitDeadline, "the signal after the quit event")
+    }
+
+    /// With another application-modal alert up (an error), the quit event
+    /// asks as ⌘Q does, as AppKit's own handler did: the quit alert shows
+    /// over the error's (whose button is OK).
+    func testAQuitEventWithAnErrorAlertUpAsksToQuit() async throws {
+        let result = try await run(
+            .errorAlert, command: "sleep 100", trigger: .quitEvent, thenExpect: "sheets=0 modal=Cancel,Quit",
+            followedBy: SIGTERM)
+        XCTAssertEqual(result.stateAfterTrigger, "sheets=0 modal=Cancel,Quit", "the quit alert asks")
+        XCTAssertEqual(result.ranOnAfterTrigger, true, "the app runs on while it asks")
+        assertQuit(result, within: Self.exitDeadline, "the signal after the quit event")
+    }
+
+    /// With idle sessions there is nothing to ask about: the quit event
+    /// quits through `terminate` with the error alert still up.
+    func testAQuitEventWithAnErrorAlertUpAndIdleSessionsQuits() async throws {
+        let result = try await run(.idleErrorAlert, command: "sleep 100", trigger: .quitEvent)
+        assertQuit(result, within: Self.exitDeadline, "a quit event, error alert, idle sessions")
+    }
+
     // MARK: Helpers
 
+    /// What ends the child.
+    enum Trigger {
+        case signal(Int32)
+        /// `NSRunningApplication.terminate()`: a quit Apple event that
+        /// names no reason.
+        case quitEvent
+        /// A quit Apple event naming its reason (`kAEQuitReason`), as the
+        /// system sends for a logout, restart or shutdown: as a parameter,
+        /// or as an attribute.
+        case systemQuitEvent(reason: OSType, asAttribute: Bool = false)
+    }
+
     struct Result {
-        /// From the signal to the child's exit; `nil` if it was still
-        /// running 10 s later (it was then killed).
+        /// From the (last) trigger to the child's exit; `nil` if it was
+        /// still running 10 s later (it was then killed).
         let exitTime: Duration?
+        /// With a follow-up trigger: the child's sheets and modal alert
+        /// (``TerminationSignalChild/stateFile``) once the first trigger's
+        /// expected state showed, or the last one seen if it never did.
+        var stateAfterTrigger: String?
+        /// With a follow-up trigger: whether the child still ran longer
+        /// than ``AppDelegate/terminationGrace`` after the first trigger,
+        /// in the expected state.
+        var ranOnAfterTrigger: Bool?
         let reason: Process.TerminationReason
         let status: Int32
         let savedState: WindowState?
@@ -602,6 +770,35 @@ final class TerminationSignalTests: XCTestCase {
         /// the app quit through `terminate` rather than its own `exit`.
         let quitThroughTerminate: Bool
         let output: String
+    }
+
+    /// Sends `pid` a quit Apple event naming `reason` (as a parameter or
+    /// an attribute), without waiting for a reply.
+    private static func sendQuitEvent(to pid: pid_t, reason: OSType, asAttribute: Bool) throws {
+        let event = NSAppleEventDescriptor(
+            eventClass: AEEventClass(kCoreEventClass), eventID: AEEventID(kAEQuitApplication),
+            targetDescriptor: NSAppleEventDescriptor(processIdentifier: pid),
+            returnID: AEReturnID(kAutoGenerateReturnID), transactionID: AETransactionID(kAnyTransactionID))
+        let value = NSAppleEventDescriptor(enumCode: reason)
+        if asAttribute {
+            event.setAttribute(value, forKeyword: AEKeyword(kAEQuitReason))
+        } else {
+            event.setParam(value, forKeyword: AEKeyword(kAEQuitReason))
+        }
+        _ = try event.sendEvent(options: [.noReply], timeout: 5)
+    }
+
+    private func send(_ trigger: Trigger, to child: Process) throws {
+        switch trigger {
+        case .signal(let signal):
+            XCTAssertEqual(kill(child.processIdentifier, signal), 0)
+        case .quitEvent:
+            let application = try XCTUnwrap(
+                NSRunningApplication(processIdentifier: child.processIdentifier), "the child is a running application")
+            XCTAssertTrue(application.terminate(), "the quit event is sent")
+        case .systemQuitEvent(let reason, let asAttribute):
+            try Self.sendQuitEvent(to: child.processIdentifier, reason: reason, asAttribute: asAttribute)
+        }
     }
 
     private func assertQuit(
@@ -627,6 +824,18 @@ final class TerminationSignalTests: XCTestCase {
     /// Starts a child for `mode` running `command`, waits until its sheet
     /// or alert is up, sends `signal` and waits for the exit.
     private func run(_ mode: TerminationSignalChild.Mode, command: String, signal: Int32) async throws -> Result {
+        try await run(mode, command: command, trigger: .signal(signal))
+    }
+
+    /// Starts a child for `mode` running `command`, waits until its sheet
+    /// or alert is up, sends `trigger` and waits for the exit. With
+    /// `expected` and `followUp`, it first waits for the child to show the
+    /// `expected` state and run on in it, then sends the `followUp` signal
+    /// and times the exit from there.
+    private func run(
+        _ mode: TerminationSignalChild.Mode, command: String, trigger: Trigger, thenExpect expected: String? = nil,
+        followedBy followUp: Int32? = nil
+    ) async throws -> Result {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-441-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let suite = "com.aanyberg.tessera.tests.\(UUID().uuidString)"
@@ -671,7 +880,27 @@ final class TerminationSignalTests: XCTestCase {
         shellPid = (try? String(contentsOf: dir.appendingPathComponent("shell.pid"), encoding: .utf8))
             .flatMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
 
-        XCTAssertEqual(kill(child.processIdentifier, signal), 0)
+        try send(trigger, to: child)
+        var stateAfterTrigger: String?
+        var ranOnAfterTrigger: Bool?
+        if let expected, let followUp {
+            // The expected state must show and hold past the grace after
+            // which ``AppDelegate/terminateWithoutAsking()`` would exit.
+            let stateFile = dir.appendingPathComponent(TerminationSignalChild.stateFile)
+            func state() -> String? { try? String(contentsOf: stateFile, encoding: .utf8) }
+            let sent = ContinuousClock.now
+            while state() != expected, child.isRunning, ContinuousClock.now - sent < .seconds(5) {
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            if state() == expected {
+                try await Task.sleep(for: .milliseconds(1500))
+            }
+            stateAfterTrigger = state()
+            ranOnAfterTrigger = child.isRunning && stateAfterTrigger == expected
+            if child.isRunning {
+                try send(.signal(followUp), to: child)
+            }
+        }
         let start = ContinuousClock.now
         var exitTime: Duration?
         while ContinuousClock.now - start < .seconds(10) {
@@ -692,8 +921,9 @@ final class TerminationSignalTests: XCTestCase {
         let quitThroughTerminate = FileManager.default.fileExists(
             atPath: dir.appendingPathComponent(TerminationSignalChild.willTerminateFile).path)
         return Result(
-            exitTime: exitTime, reason: child.terminationReason, status: child.terminationStatus, savedState: saved,
-            shellPid: shellPid, shellRemains: shellRemains, quitThroughTerminate: quitThroughTerminate, output: output)
+            exitTime: exitTime, stateAfterTrigger: stateAfterTrigger, ranOnAfterTrigger: ranOnAfterTrigger,
+            reason: child.terminationReason, status: child.terminationStatus, savedState: saved, shellPid: shellPid,
+            shellRemains: shellRemains, quitThroughTerminate: quitThroughTerminate, output: output)
     }
 }
 
@@ -714,6 +944,10 @@ enum TerminationSignalChild {
     static let launchFile = "launch.txt"
     /// Written when `NSApplication.willTerminateNotification` is posted.
     static let willTerminateFile = "will-terminate"
+    /// The child's sheets and modal alert once its sheet or alert is up,
+    /// rewritten as they change: `sheets=<count> modal=<button titles, sorted>`
+    /// (``reportState(in:)``).
+    static let stateFile = "state.txt"
 
     enum Mode: String, Codable {
         /// ⌘W: the close sheet.
@@ -723,6 +957,11 @@ enum TerminationSignalChild {
         /// A modal session whose runner ignores `abortModal`: something
         /// that keeps `terminate` from ending the app.
         case stubbornModal
+        /// An application-modal error alert (``AppDelegate/presentOpenError(_:)``),
+        /// the job still running.
+        case errorAlert
+        /// The same with the job ended first: nothing to ask about.
+        case idleErrorAlert
     }
 
     struct Request: Codable {
@@ -895,6 +1134,24 @@ enum TerminationSignalChild {
         }
     }
 
+    /// Writes ``stateFile`` whenever the sheets or the modal alert change,
+    /// from the main queue (which runs in a modal session too).
+    private static func reportState(in dir: URL, last: String? = nil) {
+        func buttons(in view: NSView?) -> [String] {
+            guard let view else { return [] }
+            return ((view as? NSButton).map { [$0.title] } ?? []) + view.subviews.flatMap { buttons(in: $0) }
+        }
+        let sheets = NSApp.windows.reduce(0) { $0 + $1.sheets.count }
+        let modal = buttons(in: NSApp.modalWindow?.contentView).filter { !$0.isEmpty }.sorted().joined(separator: ",")
+        let state = "sheets=\(sheets) modal=\(modal)"
+        if state != last {
+            try? state.write(to: dir.appendingPathComponent(stateFile), atomically: true, encoding: .utf8)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(20)) {
+            MainActor.assumeIsolated { reportState(in: dir, last: state) }
+        }
+    }
+
     private static func report(_ error: String, in dir: URL) {
         try? error.write(to: dir.appendingPathComponent(errorFile), atomically: true, encoding: .utf8)
     }
@@ -927,6 +1184,7 @@ enum TerminationSignalChild {
         ) { _ in
             FileManager.default.createFile(atPath: willTerminate.path, contents: Data())
         }
+        reportState(in: dir)
         switch request.mode {
         case .sheet:
             window.performClose(nil)
@@ -956,6 +1214,17 @@ enum TerminationSignalChild {
             }
             NSApp.endModalSession(modal)
             return
+        case .errorAlert, .idleErrorAlert:
+            if request.mode == .idleErrorAlert {
+                kill(job.pid, SIGKILL)
+                let idle = try spin(timeout: .seconds(10)) {
+                    CloseConfirmation(.quit, sessions: appDelegate.windowControllers.flatMap(\.sessions)) == nil
+                }
+                guard idle else { throw Failure(description: "the session stayed busy") }
+            }
+            reportReadyOnceModal(job.pid, in: dir)
+            appDelegate.presentOpenError(Failure(description: "an error"))
+            throw Failure(description: "the error alert returned: the app was not quit")
         }
         try spin(timeout: .seconds(30)) { false }
     }
