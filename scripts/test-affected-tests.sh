@@ -47,6 +47,9 @@ expect() {
 }
 reset() { git checkout -q -- . && git clean -fdq && git reset -q --hard main 2>/dev/null || true; }
 
+rc=0; out="$("$script" --base 2>&1)" || rc=$?
+[[ "$rc" == 2 && "$out" == "--base needs a ref" ]] && ok "--base without a ref exits 2 with the message" || not_ok "--base without a ref: exit $rc, '$out'"
+
 out="$("$script" 2>&1)" && [[ "$out" == *"no changes since main"* ]] && ok "no changes" || not_ok "no changes: $out"
 
 echo '//' >> crates/a/src/lib.rs

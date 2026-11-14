@@ -47,6 +47,7 @@ add_team() {
                 found="$f"; break
             done
             if [[ -n "$found" ]]; then
+                found="${found:A}"
                 files+=("$found"); file_type[$found]="$atype"; file_desc[$found]="teammate $name"; file_model[$found]="$model"
             fi
             members+=("| $name | $atype | ${model:--} | $aid | ${${found:t:r}:-not found} |")
@@ -62,6 +63,19 @@ for arg in "$@"; do
         add_team "${${arg:t}%.jsonl}" "${arg:h}"
     fi
 done
+
+# A session dir and its bare .jsonl (or a path given twice) name the same transcripts and teammates: count each once,
+# by resolved path.
+typeset -A seen_file
+unique=()
+for f in $files; do
+    f="${f:A}"
+    [[ -z "${seen_file[$f]:-}" ]] || continue
+    seen_file[$f]=1
+    unique+=("$f")
+done
+files=("${unique[@]}")
+members=( "${(@u)members}" )
 
 rows="$(mktemp)"
 trap 'rm -f "$rows"' EXIT

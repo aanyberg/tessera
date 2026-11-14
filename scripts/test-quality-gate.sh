@@ -181,6 +181,15 @@ else
     not_ok "the real release timing run with a failed build: $(< "$work/out") / $(< "$work/cargo.calls")"
 fi
 
+# The release timing run selects the b02_* cost bars of tessera-term's rect tests next to tessera-app-core's bars, in a
+# release build.
+if grep -q -- '--release -p tessera-app-core -p tessera-term -E' "$work/cargo.calls" \
+    && grep -q 'package(tessera-term) & binary(=rect) & test(b02_)' "$work/cargo.calls"; then
+    ok "the release timing run includes the tessera-term b02_ tests"
+else
+    not_ok "the release timing run lacks the b02_ tests: $(< "$work/cargo.calls")"
+fi
+
 # --- the ffi C tests run under the watchdog
 ffi="$work/ffi"
 mkdir -p "$ffi/scripts"

@@ -20,9 +20,11 @@
 #             with --body, in that PR body file. With --closes: FAIL on a reference to a number outside the list, and
 #             (with --body) FAIL when a listed number has no closing reference in the body. Without --closes: WARN on
 #             any closing reference, because a task branch should close nothing the lead did not name.
-#   unsafe    FAIL when a line the branch adds to a Rust file (outside a `//` comment) contains the word `unsafe` or
-#             `#[global_allocator]`, in a crate other than tessera-pty and tessera-ffi, unless the file is listed in
-#             scripts/unsafe-exceptions.txt (docs/security.md S7). `unsafe_code` in a lint attribute does not match.
+#   unsafe    FAIL when a line the branch adds to a Rust file contains, in code (not in a comment, a string or character
+#             literal, or a raw string; block comments nest), the word `unsafe` or `#[global_allocator]`, in a crate
+#             other than tessera-pty and tessera-ffi, unless the file is listed in scripts/unsafe-exceptions.txt as it
+#             is on <base> (docs/security.md S7): a branch cannot exempt itself. A branch that changes the list gets a
+#             WARN. `unsafe_code` in a lint attribute does not match.
 #   load      timing-sensitive tests pass 10 runs each, at most --parallel at a time. Triggers: a nextest `timing`
 #             override in a changed package; a changed test file (tests/*.rs; a src file with #[cfg(test)], or
 #             src/**/tests.rs and src/**/tests/*.rs) that mentions wall-clock time anywhere in it (that test binary;
@@ -266,30 +268,91 @@ if [[ -n "$closes_given" ]]; then
     fi
     if (( ${#problems} )); then fail "bodies:"; print -l -- "  "${^problems}; else pass "bodies"; fi
 elif (( ${#commit_refs} + ${#body_refs} )); then
-    warn "bodies: closing references to ${(j:, :)${(u)commit_refs}} ${(j:, :)${(u)body_refs}} found; pass --closes with the brief's PR lines to check them"
+    all_refs=( ${(u)commit_refs} ${(u)body_refs} )
+    warn "bodies: closing references to ${(j:, :)${(u)all_refs}} found; pass --closes with the brief's PR lines to check them"
 else
     pass "bodies"
 fi
 
-# unsafe: S7 made mechanical. Only a line the branch adds counts; comments and `unsafe_code` lint names do not.
+# unsafe: S7 made mechanical. Only a line the branch adds counts; comments, string and character literals and
+# `unsafe_code` lint names do not. The exceptions list is read from <base>, not from the branch: a branch cannot
+# exempt itself by editing it (a change to the file is a WARN for the lead instead).
+# Prints, for the Rust source on stdin, every line of $2 (a comma separated list of line numbers) whose code, with
+# comments and literals blanked, holds `unsafe` or `#[global_allocator]`. The scan runs over the whole file, so a line
+# added inside an old block comment or raw string is read in its context. It follows Rust's lexical rules: line and
+# nested block comments, "..." strings with escapes (they may span lines), raw strings r#"..."# (b, c prefixes), char
+# literals ('"', '\'', '\u{..}') against lifetimes ('a).
+unsafe_lines() {
+    perl -e '
+        my %want = map { $_ => 1 } split /,/, $ARGV[0];
+        my $s = do { local $/; <STDIN> };
+        $s = "" unless defined $s;
+        my @orig = split /\n/, $s, -1;
+        my ($i, $n, $cur, $depth, $str, $raw, @code) = (0, length $s, "", 0, 0, -1);
+        while ($i < $n) {
+            my $c = substr($s, $i, 1);
+            if ($c eq "\n") { push @code, $cur; $cur = ""; $i++; next }
+            if ($depth) {
+                if (substr($s, $i, 2) eq "/*") { $depth++; $i += 2 }
+                elsif (substr($s, $i, 2) eq "*/") { $depth--; $i += 2 }
+                else { $i++ }
+            } elsif ($raw >= 0) {
+                if ($c eq "\"" && substr($s, $i + 1, $raw) eq "#" x $raw) { $i += 1 + $raw; $raw = -1 }
+                else { $i++ }
+            } elsif ($str) {
+                if ($c eq "\\") { $i++; $i++ unless substr($s, $i, 1) eq "\n" }
+                elsif ($c eq "\"") { $str = 0; $cur .= "\""; $i++ }
+                else { $i++ }
+            } elsif ($c eq "/" && substr($s, $i + 1, 1) eq "/") {
+                pos($s) = $i; $s =~ /\G[^\n]*/gc; $i = pos($s); $cur .= " ";
+            } elsif ($c eq "/" && substr($s, $i + 1, 1) eq "*") {
+                $depth = 1; $i += 2; $cur .= " ";
+            } elsif ($c eq "r" && ($i == 0 || substr($s, $i - 1, 1) !~ /[A-Za-z0-9_]/ || substr($s, $i - 1, 1) =~ /[bc]/)
+                     && do { pos($s) = $i; $s =~ /\Gr(#*)"/gc }) {
+                $raw = pos($s) - $i - 2; $i = pos($s); $cur .= "\"\"";
+            } elsif ($c eq "\"") {
+                $str = 1; $cur .= "\""; $i++;
+            } elsif ($c eq "\x27") {
+                pos($s) = $i;
+                if ($s =~ /\G\x27(?:\\(?:x[0-9a-fA-F]{2}|u\{[^}\n]*\}|[^\n])|[^\\\x27\n][\x80-\xBF]*)\x27/gc) { $i = pos($s); $cur .= "\x27\x27" }
+                else { $cur .= $c; $i++ }
+            } else { $cur .= $c; $i++ }
+        }
+        push @code, $cur;
+        for my $ln (sort { $a <=> $b } keys %want) {
+            my $t = $code[$ln - 1]; next unless defined $t;
+            print "$orig[$ln - 1]\n" if $t =~ /(?<![A-Za-z0-9_])unsafe(?![A-Za-z0-9_])/ || $t =~ /#\s*\[\s*global_allocator\s*\]/;
+        }
+    ' -- "$1"
+}
 exceptions=()
-[[ -f scripts/unsafe-exceptions.txt ]] && exceptions=( ${(f)"$(grep -vE '^[[:space:]]*(#|$)' scripts/unsafe-exceptions.txt)"} )
+exceptions_text="$(git show "${base}:scripts/unsafe-exceptions.txt" 2>/dev/null)" \
+    && exceptions=( ${(f)"$(print -r -- "$exceptions_text" | grep -vE '^[[:space:]]*(#|$)')"} )
 exceptions=(${exceptions:#})
+if (( ${changed[(Ie)scripts/unsafe-exceptions.txt]} )); then
+    warn "unsafe: the branch changes scripts/unsafe-exceptions.txt; the check reads the list from $base, so review the change (docs/security.md S7 must name the same files)"
+fi
 unsafe_hits=()
-while IFS=$'\t' read -r file text; do
-    [[ -n "$file" ]] || continue
+# The added line numbers of every changed Rust file: "<file>\t<n,n,...>".
+while IFS=$'\t' read -r file nums; do
+    [[ -n "$file" && -n "$nums" ]] || continue
     (( ${exceptions[(Ie)$file]} )) && continue
     pkg="$(package_of "$file")"
     [[ "${pkg#* }" == (tessera-pty|tessera-ffi) ]] && continue
-    unsafe_hits+=("$file: ${text## #}")
+    for text in "${(@f)$(git show "HEAD:${file}" 2>/dev/null | unsafe_lines "$nums")}"; do
+        [[ -n "$text" ]] && unsafe_hits+=("$file: ${text## #}")
+    done
 done < <(git -c core.quotePath=false diff -U0 --no-color "$base...HEAD" -- '*.rs' | awk '
-    /^\+\+\+ / { f = ($0 == "+++ /dev/null") ? "" : substr($0, 7); next }
-    /^\+/ && f != "" {
-        s = substr($0, 2)
-        gsub(/\/\*[^*]*\*\//, "", s); sub(/\/\*.*/, "", s); sub(/\/\/.*/, "", s)
-        if (s ~ /^[ \t]*\*/) next
-        if (s ~ /(^|[^A-Za-z0-9_])unsafe([^A-Za-z0-9_]|$)/ || s ~ /#\[global_allocator\]/) print f "\t" s
-    }')
+    function flush() { if (f != "" && nums != "") print f "\t" nums; nums = "" }
+    /^\+\+\+ / { flush(); f = ($0 == "+++ /dev/null") ? "" : substr($0, 7); next }
+    /^@@ / && f != "" {
+        if (match($0, /\+[0-9]+(,[0-9]+)?/)) {
+            split(substr($0, RSTART + 1, RLENGTH - 1), a, ",")
+            c = (a[2] == "") ? 1 : a[2]
+            for (k = 0; k < c; k++) nums = nums (nums == "" ? "" : ",") (a[1] + k)
+        }
+    }
+    END { flush() }')
 if (( ${#unsafe_hits} )); then
     fail "unsafe: outside tessera-pty, tessera-ffi and scripts/unsafe-exceptions.txt (S7):"; print -l -- "  "${^unsafe_hits}
 else

@@ -454,8 +454,9 @@ of four marks each, about 90 instructions a row. The review of #368 asked to
 track that cost and to decide whether to reduce it.
 
 **Decision (2026-11-12): accepted for 0.2.0.** The extra work is small next
-to a frame: the `render_view` table above, which includes the capture, stays
-within 1.01 on every line. Reducing the scan's cost under the lock is not
+to a frame: the `render_view` table above, which includes the capture, keeps
+its instruction counts within 1.01 on every line; its cycles reach 1.019
+(braille, a mark on every row). Reducing the scan's cost under the lock is not
 planned for 0.2.0, and the capture-alone figures above stay as measured: nine
 of the eleven "every row" lines are over the 1.05 bar, recorded here as an
 accepted exception, not as a pass.

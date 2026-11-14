@@ -22,19 +22,20 @@ by editing the agent file; the lead refers to agents by name only.
 | `release-engineer` | CI/release workflows, justfile, packaging, tag/version guards | sonnet | medium | infra | branch |
 | `flow-analyst` | Post-wave retro from journals and `scripts/factory-stats.sh`: cost/value per role, proposed changes | sonnet | high | retro only | no |
 
-Model aliases map to the current Claude 5 family (`fable` = claude-fable-5-1, `opus` = claude-opus-5-5,
-`sonnet` = claude-sonnet-5-5, `haiku` = claude-haiku-5-5). Fable is not used (token cost); planning, implementation
-and critique of product code, and adversarial testing run on Opus (Sonnet per spawn for low-risk changes); infra and
-docs review and release engineering run on Sonnet. Pin a full id in the frontmatter if a role must not follow alias updates.
+Model aliases map to the current Claude 5 family (`fable` = claude-fable-5-1, `opus` = claude-opus-5-5, `sonnet` =
+claude-sonnet-5-5, `haiku` = claude-haiku-5-5). Fable is not used (token cost); planning, implementation and critique of
+product code, and adversarial testing run on Opus (Sonnet per spawn for low-risk changes); infra and docs review and
+release engineering run on Sonnet. Pin a full id in the frontmatter if a role must not follow alias updates.
 
-**Effort by round.** Round 1 and adversarial cycle 1 run at the frontmatter effort: they find the defects (wave 3:
-6 majors in round 1, 2 in round 2 from benchmarks and differential fuzzing, none in round 3; both verify failures in cycle 1; waves 5 and 6: critics found
-most serious defects in round 1, which is why round 1 must run those benchmarks and diff-fuzzes itself). The only other critic round, the scoped round 2 (below), is spawned with the Agent
-tool's `effort: "lower"`, one step below the frontmatter, because it checks a fix range rather than a branch.
-Adversarial cycle 2 (only after a cycle-1 failure) is spawned the same way. Any defect a lower-effort run misses that
-a later gate catches goes into the next retro; that is the signal to revert. `code-critic` and `release-engineer` run
-at medium by the user's decision of 2026-10-28 (no retro data yet: neither ran in wave 3), and on Sonnet from
-2026-10-29 to cut token cost; revisit in the next retro that has runs of either.
+**Effort by round.** Round 1 and adversarial cycle 1 run at the frontmatter effort: they find the defects (wave 3: 6
+majors in round 1, 2 in round 2 from benchmarks and differential fuzzing, none in round 3; both verify failures in cycle
+1; waves 5 and 6: critics found most serious defects in round 1, which is why round 1 must run those benchmarks and
+diff-fuzzes itself). The only other critic round, the scoped round 2 (below), is spawned with the Agent tool's `effort:
+"lower"`, one step below the frontmatter, because it checks a fix range rather than a branch. Adversarial cycle 2 (only
+after a cycle-1 failure) is spawned the same way. Any defect a lower-effort run misses that a later gate catches goes
+into the next retro; that is the signal to revert. `code-critic` and `release-engineer` run at medium by the user's
+decision of 2026-10-28 (no retro data yet: neither ran in wave 3), and on Sonnet from 2026-10-29 to cut token cost;
+revisit in the next retro that has runs of either.
 
 **Adversarial cost levers (2026-10-29, narrowed 2026-11-12, wave 18 retro P1, P2).** The frontmatter is `high` with
 `maxTurns: 80`, and `high` is the default for every risky change. A change is risky when it fails any item of the
@@ -63,7 +64,7 @@ milestone-lead ── draft brief ──► spec-researcher (spec-heavy issues, 
                                       implementer (rust-/swift-implementer, release-engineer)
                                                         │
                                                         ▼
-                      {rust|swift|code}-critic, round 1: one strict full review, BLOCKER / MINOR ── escalate ──► lead decides
+                      {rust|swift|code}-critic, round 1: strict full review, BLOCKER/MINOR ── escalate ──► lead decides
                                       │ revise                                          │ ship
                                       ▼                                                 │
                   same implementer: one fix commit, blockers only, no new behaviour     │
@@ -87,11 +88,12 @@ milestone-lead ── draft brief ──► spec-researcher (spec-heavy issues, 
                                   next queued issue starts; after the wave, flow-analyst retro
 ```
 
-- The critic is chosen by area: `rust-critic` for crates/, `swift-critic` for apps/macos, `code-critic` for infra and docs.
-- Verification is two lenses plus a gate: `scripts/verify-branch.sh` (mechanical), `adversarial-tester` (judgement)
-  and the quality gate. The critic owns "Done when"; the adversarial tester runs at `high`, and at xhigh only for the
-  classes named in "Adversarial cost levers", in cycle 1 because it found 7 of the 9 post-ship majors in wave 1, both verify failures in
-  wave 3, and the bugs the critics missed in waves 5 and 6.
+- The critic is chosen by area: `rust-critic` for crates/, `swift-critic` for apps/macos, `code-critic` for infra and
+  docs.
+- Verification is two lenses plus a gate: `scripts/verify-branch.sh` (mechanical), `adversarial-tester` (judgement) and
+  the quality gate. The critic owns "Done when"; the adversarial tester runs at `high`, and at xhigh only for the
+  classes named in "Adversarial cost levers", in cycle 1 because it found 7 of the 9 post-ship majors in wave 1, both
+  verify failures in wave 3, and the bugs the critics missed in waves 5 and 6.
 - Every critic and the adversarial tester check the security and resource rules in `docs/security.md` (S1-S9); a
   broken rule is a BLOCKER ("a safety problem"). The planner names the rules a task touches in its "Done when".
 - Any blocker from any gate fails that gate. Minors never fail a gate.
@@ -163,9 +165,11 @@ shared worktree in place (#368), where an interrupted run leaves a mutant behind
 definitions say so.
 
 **Mechanical checks, not rounds.** Everything else about a fix is checked by scripts and by the lead's reading:
-`scripts/verify-branch.sh` with its load targets (timing-sensitive tests under load) and `scripts/quality-gate.sh`
-are scripts; the mutation check per fixed blocker is the implementer's report, and the lead re-runs each named test
-against the fix's parent (`git checkout <fix>^ -- <source files>`, run, then `git checkout HEAD -- <source files>`; only once the teammate has stopped working) before accepting it. A fix commit that adds only a test or a doc line gets no critic: the lead reads the diff.
+`scripts/verify-branch.sh` with its load targets (timing-sensitive tests under load) and `scripts/quality-gate.sh` are
+scripts; the mutation check per fixed blocker is the implementer's report, and the lead re-runs each named test against
+the fix's parent (`git checkout <fix>^ -- <source files>`, run, then `git checkout HEAD -- <source files>`; only once
+the teammate has stopped working) before accepting it. A fix commit that adds only a test or a doc line gets no critic:
+the lead reads the diff.
 
 **Adversarial tester, once.** After `ship` the `adversarial-tester` runs once for product code (`crates/`,
 `apps/macos/`). A second cycle runs only if the first failed (a reproduced blocker), at `effort: "lower"`, scoped to
@@ -204,41 +208,41 @@ Agents use these instead of rebuilding the setup in every run:
   script, so the implementer, critic and verifiers pay for the gate once per commit. `--force` re-runs it.
 - **Hang protection (#137, #121, #166, #228).** A hung test fails fast instead of stalling a run for hours.
   `.config/nextest.toml` reports a test SLOW after 60 s and terminates it after 5 periods (300 s; 600 s for the
-  file-watcher, shaping, term `wide`, GPU and hdiutil tests); the slowest test in the workspace takes 12 s, so there
-  is room for a machine under load 30+. `scripts/quality-gate.sh` then fails with the terminated test names
-  (`TIMEOUT` lines) instead of a bare exit code. `TESSERA_GATE_NEXTEST_MINUTES` (default 30) is a gate-level
-  watchdog: nextest, the ffi C tests and their descendants are killed after that long and the gate fails naming the
-  limit in seconds and the variable that set it (nextest runs with `--color never`, so the `TIMEOUT` report also
-  works under `CARGO_TERM_COLOR=always`). The gate builds the test binaries first (`cargo nextest run --no-run`, same
-  arguments), so the watchdog's window covers the run and not the compilation, and a watchdog whose gate was killed
-  (SIGKILL included) exits without acting. After the ffi release build the gate runs the ffi C tests
-  (`scripts/ffi-c-test.sh`, under the same watchdog; `surface.c` skips itself under `TESSERA_SKIP_GPU_TESTS`) and the
-  release-only timing bars `reader_lock_hold_is_bounded`,
-  `view_metrics_are_fast_while_output_floods_the_terminal`, `scrolling_through_a_long_history_is_smooth` and
-  `a_flood_under_a_scrolled_view_keeps_captures_short` (#114, #175) and
+  file-watcher, shaping, term `wide`, GPU and hdiutil tests); the slowest test in the workspace takes 12 s, so there is
+  room for a machine under load 30+. `scripts/quality-gate.sh` then fails with the terminated test names (`TIMEOUT`
+  lines) instead of a bare exit code. `TESSERA_GATE_NEXTEST_MINUTES` (default 30) is a gate-level watchdog: nextest, the
+  ffi C tests and their descendants are killed after that long and the gate fails naming the limit in seconds and the
+  variable that set it (nextest runs with `--color never`, so the `TIMEOUT` report also works under
+  `CARGO_TERM_COLOR=always`). The gate builds the test binaries first (`cargo nextest run --no-run`, same arguments), so
+  the watchdog's window covers the run and not the compilation, and a watchdog whose gate was killed (SIGKILL included)
+  exits without acting. After the ffi release build the gate runs the ffi C tests (`scripts/ffi-c-test.sh`, under the
+  same watchdog; `surface.c` skips itself under `TESSERA_SKIP_GPU_TESTS`) and the release-only timing bars
+  `reader_lock_hold_is_bounded`, `view_metrics_are_fast_while_output_floods_the_terminal`,
+  `scrolling_through_a_long_history_is_smooth` and `a_flood_under_a_scrolled_view_keeps_captures_short` (#114, #175) and
   `a_double_click_with_64_rules_on_2048_columns_takes_under_5_ms` (#47) (`timing` group). A failure with the 1-minute
-  load at or above `hw.ncpu` is retried once ("failed under load, retried"), any other failure fails the gate,
-  and so does a failed build of the timing tests (load does not explain it). `just quality-gate-test` checks, with a
-  fake `cargo`, the watchdog (nextest and the ffi C step), that retry and that the hooks are inert without
+  load at or above `hw.ncpu` is retried once ("failed under load, retried"), any other failure fails the gate, and so
+  does a failed build of the timing tests (load does not explain it). `just quality-gate-test` checks, with a fake
+  `cargo`, the watchdog (nextest and the ffi C step), that retry and that the hooks are inert without
   `TESSERA_GATE_SELFTEST=1`, through test hooks the gate honours only under `TESSERA_GATE_SELFTEST=1` (listed in the
   script's header). When the macOS job's test step fails, times out or is cancelled, it uploads
-  `apps/macos/build/app-test*.log` as the `app-test-logs` artifact (#121). In CI the Rust job, which also runs the ffi
-  C tests, has `timeout-minutes: 20` and the macOS app job 25 (a normal `just app-test` is 12-14 minutes), with an
-  18-minute limit on `just app-test`, whose xcodebuild calls also fail a single hung test after 120 s (300 s at
-  most). A hang below the test level, where the test host itself deadlocks and xcodebuild waits for it (the TSan and
-  `fork` deadlock of #121 and #228, caused by #278), is ended by `scripts/app-test-watchdog.sh`, which wraps both
-  xcodebuild calls: when no test line follows a started test for `TESSERA_APP_TEST_HANG_SECONDS` (default 150), it
-  samples the host into `apps/macos/build/app-test-hang-sample.log` (uploaded with the `app-test-logs` artifact when
-  the step fails), kills it and names the test and the limit. If each hang's sample has a thread stuck inside the
-  TSan runtime and the hung tests are the run's only failures, it reruns only them once (`-only-testing`); a retried
-  run that passes leaves only the "TSan hang in <test> (#278), retried" line in the CI log. Any other hang fails the
-  run, including a test host still alive `TESSERA_APP_TEST_HANG_SECONDS` after the run's last suite result (never
-  retried). A `sample` that has not returned after `TESSERA_APP_TEST_SAMPLE_SECONDS` (default 60) is killed ("sample
-  timed out" in the log). The watchdog never kills a process that was already running from the products path when the
-  run started (for example `just run`'s Tessera; it is matched by PID and start time), and on SIGINT, SIGTERM, SIGHUP
-  or SIGALRM it kills the hosts and removes its state directory. `just app-test-watchdog-test` checks it with a fake
-  `xcodebuild`, `sample` and `ps`, with timing bounds that grow with the machine's load. A new test that legitimately
-  needs more than 300 s gets its own `slow-timeout` override there.
+  `apps/macos/build/app-test*.log` as the `app-test-logs` artifact (#121). In CI the Rust job, which also runs the ffi C
+  tests, has `timeout-minutes: 20` and the macOS app job 37 (a normal `just app-test` is 12-14 minutes), with a
+  30-minute limit on `just app-test` (macos-15 hit the #278 deadlock 6 times in 3 runs, and #443 adds `Coverage::build`
+  close stacks, so a run needs room for several 150 s hangs and their restarts), whose xcodebuild calls also fail a
+  single hung test after 120 s (300 s at most). A hang below the test level, where the test host itself deadlocks and
+  xcodebuild waits for it (the TSan and `fork` deadlock of #121 and #228, caused by #278), is ended by
+  `scripts/app-test-watchdog.sh`, which wraps both xcodebuild calls: when no test line follows a started test for
+  `TESSERA_APP_TEST_HANG_SECONDS` (default 150), it samples the host into `apps/macos/build/app-test-hang-sample.log`
+  (uploaded with the `app-test-logs` artifact when the step fails), kills it and names the test and the limit. If each
+  hang's sample has a thread stuck inside the TSan runtime and the hung tests are the run's only failures, it reruns
+  only them once (`-only-testing`); a retried run that passes leaves only the "TSan hang in <test> (#278), retried" line
+  in the CI log. Any other hang fails the run, including a test host still alive `TESSERA_APP_TEST_HANG_SECONDS` after
+  the run's last suite result (never retried). A `sample` that has not returned after `TESSERA_APP_TEST_SAMPLE_SECONDS`
+  (default 60) is killed ("sample timed out" in the log). The watchdog never kills a process that was already running
+  from the products path when the run started (for example `just run`'s Tessera; it is matched by PID and start time),
+  and on SIGINT, SIGTERM, SIGHUP or SIGALRM it kills the hosts and removes its state directory. `just
+  app-test-watchdog-test` checks it with a fake `xcodebuild`, `sample` and `ps`, with timing bounds that grow with the
+  machine's load. A new test that legitimately needs more than 300 s gets its own `slow-timeout` override there.
 - **A/B probes.** `cargo xtask ab init --base <rev> --crate <name> --out <scratch dir>` builds a probe crate that
   depends on each crate at the base revision (`base_<name>`) and in the worktree (`head_<name>`). Write cases in
   the probe's `src/cases.rs`, then `cargo xtask ab bench <dir> --case <c> [--max-ratio <bar>]` (alternating
@@ -260,16 +264,27 @@ Agents use these instead of rebuilding the setup in every run:
   commit messages of `<base>..HEAD` and the `--body` file for GitHub closing references (close, fix and resolve in
   every tense, any case, an optional colon, then `#N`, `owner/repo#N` or an issue URL): with `--closes` it fails on a
   number outside the list and, with `--body`, on a listed number the body does not close; without `--closes` it only
-  warns. `unsafe` fails on an added line of a Rust file, outside a `//` comment, with the word `unsafe` or
+  warns. `unsafe` fails on an added line of a Rust file whose code (outside comments, string and character literals, raw
+  strings and block comments, nested ones included, read in the context of the whole file) has the word `unsafe` or
   `#[global_allocator]` in a crate other than `tessera-pty` and `tessera-ffi`, unless the file is listed in
-  `scripts/unsafe-exceptions.txt` (the same six files S7 names; `just verify-branch-test` fails when the two differ);
-  `unsafe_code` in a lint attribute does not match.
+  `scripts/unsafe-exceptions.txt` as it is on `<base>`, not on the branch, so a branch cannot exempt itself (the same
+  files S7 names; `just factory-test` fails when the two differ). A branch that changes the list gets a `WARN unsafe`
+  line for the lead to review. `unsafe_code` in a lint attribute does not match.
   `--parallel N` caps the load check at N test runs in flight, per target and in total (targets run one
   after another); the default is 3 so a busy machine is not exhausted, and the lead may raise it up to 8 on a quiet
   one. Do not improvise extra load runs beside it. `--list-targets` prints the effective cap and the load targets
   derived from the branch (`crate:kind`, one per line) and exits without building; `just verify-branch-test`
   checks that derivation and the cap under bash and zsh. The script is zsh: always brace a name before a colon
   (`${name}:lib`), because zsh reads `$name:lib` as the `:l` modifier and `$name:tests` as `:t`.
+- **Factory tooling tests (#417).** `just factory-test` checks the scripts the other test recipes do not cover:
+  `scripts/factory-stats.sh` (including a session dir passed together with its bare transcript),
+  `scripts/affected-tests.sh`, `scripts/toolchain-check.sh` and that `docs/security.md` S7 and
+  `scripts/unsafe-exceptions.txt` name the same files. The gate does not run it: run it after a change to one of those
+  scripts, next to `just verify-branch-test` and `just quality-gate-test`.
+- **Toolchain check (#417).** `just toolchain-check` compares the local `rustc` with the current stable that CI installs
+  (`rustup check`) and prints a WARN, exit 0, when the local one is behind: a lint that is new in the current stable
+  passes the local gate and fails CI (wave 19: local 1.99.1, CI 1.100). It never updates anything; the user (or the
+  lead, with the user's go-ahead) runs `rustup update stable`.
 - **Fuzzing.** `fuzz/` holds four cargo-fuzz (libFuzzer) targets outside the workspace: `parser` (raw bytes into
   `tessera_vt::Parser`; no panic, CSI sub-parameter masks and DCS framing consistent), `terminal` (raw bytes into
   `Terminal::advance` at a size taken from the first two bytes; cheap invariants after every chunk,
@@ -369,7 +384,9 @@ while tasks are in flight. Stop idle teammates, and `/clear` between unrelated t
 
 0. **Pre-flight.** Before planning, the lead checks that local main equals `origin/main`
    (`git fetch origin && git rev-list --count origin/main..main` prints `0`) and that `sccache` is on `PATH`
-   (otherwise every worktree builds its dependencies from scratch; ask the user to `brew install sccache`).
+   (otherwise every worktree builds its dependencies from scratch; ask the user to `brew install sccache`) and that
+   `just toolchain-check` prints no WARN (a local stable behind CI's lets a new lint through the gate; ask the user to
+   run `rustup update stable`; no script does it).
    Commands the user types with `!` may not run in the session; when a step needs the user, give them the exact
    command to run in a separate terminal, or run it from the lead with their go-ahead. The lead also checks the
    console lock once (`ioreg -n Root -d1 -a | grep -A1 IOConsoleLocked`; `<true/>` means locked) and tells the user
@@ -399,31 +416,30 @@ while tasks are in flight. Stop idle teammates, and `/clear` between unrelated t
    fast paths against their reference) and ticks off every lead decision. A teammate never spends turns "waiting on
    background work": it runs the gate in the foreground with a timeout, or reports "gate running, log <path>" once and
    goes idle (wave 18 retro P13).
-4. **Critique.** The lead spawns a fresh one-shot critic (`rust-critic`, `swift-critic` or `code-critic` by area)
-   at the frontmatter effort for round 1, with the brief and the branch. It reviews once, strictly, and sorts every
-   finding into BLOCKER or MINOR (see "Review rules"). On `revise` the owning teammate fixes the blockers only, in
-   one fix commit with no new behaviour, and reports the mutation check for each. The lead adds the round's minors
-   to the wave's minors checklist issue (see "Minors"); it does not hold the merge, and the lead may order a cheap
-   docs or test minor fixed in the same fix commit. The lead reads the fix commit and
-   re-runs each named mutation check against the fix's parent. A blocker the implementer refutes or defers is
-   decided by the lead (or `milestone-lead`) and recorded like an escalation. A second critic round runs only if the fix added new
-   behaviour or new code paths, or a blocker was a design problem: a fresh critic at `effort: "lower"`, scoped to the
-   fix range, and the last round. It never returns `revise`: every blocker it reports comes back as `escalate`, and
-   there is no round 3. On `escalate` the lead
-   (or `milestone-lead`) decides and records the decision in the brief, under a dated
-   `## Lead decisions (<date>)` heading; the teammate applies it in the fix commit, and the round-2 rule above
-   decides whether another critic looks.
-5. **Verify.** After `ship` (or after the fix commit that clears round 1), the lead runs
-   `scripts/verify-branch.sh <wt> --allow <brief paths>... --session <url> --coauthor <line> --closes <n>[,<n>...]`
-   (in the background, with its load targets; `--closes` is the issue numbers of the brief's `Closes` PR lines, and
-   the `bodies` check fails a commit that closes anything else) and, for product code, the `adversarial-tester` as a one-shot
-   subagent, in parallel. The adversarial brief carries the critic's `coverage` section so it does not repeat the
-   critic's benchmarks and fuzzing. The adversarial tester runs once; docs, infra, tooling and test-only changes skip
-   it, and so do the tasks the brief opts out (see "Adversarial tester, once"). For a low-risk product change (see "Review rules") the lead may start it at the same time as critique round 1;
-   if the critic then asks for a change, the run is repeated only on the new range. A blocker from either lens
-   fails the gate. Only then does a second adversarial cycle run: `effort: "lower"`, the cycle-1 repros and the fix
-   commits, scoped to the fixes and their callers; if it fails too, the lead decides and there is no cycle 3. A structural rewrite during a verify cycle gets a fresh critic
-   (the lead's judgement; it is not round 2 and does not permit a round 3) before verification resumes.
+4. **Critique.** The lead spawns a fresh one-shot critic (`rust-critic`, `swift-critic` or `code-critic` by area) at the
+   frontmatter effort for round 1, with the brief and the branch. It reviews once, strictly, and sorts every finding
+   into BLOCKER or MINOR (see "Review rules"). On `revise` the owning teammate fixes the blockers only, in one fix
+   commit with no new behaviour, and reports the mutation check for each. The lead adds the round's minors to the wave's
+   minors checklist issue (see "Minors"); it does not hold the merge, and the lead may order a cheap docs or test minor
+   fixed in the same fix commit. The lead reads the fix commit and re-runs each named mutation check against the fix's
+   parent. A blocker the implementer refutes or defers is decided by the lead (or `milestone-lead`) and recorded like an
+   escalation. A second critic round runs only if the fix added new behaviour or new code paths, or a blocker was a
+   design problem: a fresh critic at `effort: "lower"`, scoped to the fix range, and the last round. It never returns
+   `revise`: every blocker it reports comes back as `escalate`, and there is no round 3. On `escalate` the lead (or
+   `milestone-lead`) decides and records the decision in the brief, under a dated `## Lead decisions (<date>)` heading;
+   the teammate applies it in the fix commit, and the round-2 rule above decides whether another critic looks.
+5. **Verify.** After `ship` (or after the fix commit that clears round 1), the lead runs `scripts/verify-branch.sh <wt>
+   --allow <brief paths>... --session <url> --coauthor <line> --closes <n>[,<n>...]` (in the background, with its load
+   targets; `--closes` is the issue numbers of the brief's `Closes` PR lines, and the `bodies` check fails a commit that
+   closes anything else) and, for product code, the `adversarial-tester` as a one-shot subagent, in parallel. The
+   adversarial brief carries the critic's `coverage` section so it does not repeat the critic's benchmarks and fuzzing.
+   The adversarial tester runs once; docs, infra, tooling and test-only changes skip it, and so do the tasks the brief
+   opts out (see "Adversarial tester, once"). For a low-risk product change (see "Review rules") the lead may start it
+   at the same time as critique round 1; if the critic then asks for a change, the run is repeated only on the new
+   range. A blocker from either lens fails the gate. Only then does a second adversarial cycle run: `effort: "lower"`,
+   the cycle-1 repros and the fix commits, scoped to the fixes and their callers; if it fails too, the lead decides and
+   there is no cycle 3. A structural rewrite during a verify cycle gets a fresh critic (the lead's judgement; it is not
+   round 2 and does not permit a round 3) before verification resumes.
 6. **Integrate.** Verified branches go to `integrator` one at a time, first verified first integrated (a downstream
    task after its upstream). It squashes the branch into one conventional commit, rebases it onto `origin/main`,
    re-runs the gate and writes the PR body. Its final message carries the commit hash, the exit codes of verify and

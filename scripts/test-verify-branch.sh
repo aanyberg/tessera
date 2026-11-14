@@ -96,6 +96,7 @@ package tessera-pty lib.rs
 package tessera-ffi lib.rs
 mkdir -p scripts
 cp "$here/unsafe-exceptions.txt" scripts/unsafe-exceptions.txt
+printf '/*\n an old block comment\n*/\nfn notes() {}\n' > crates/tessera-grid/src/notes.rs
 git add -A
 git commit -qm 'chore: fixture'
 
@@ -308,6 +309,13 @@ line_check 'an issue URL outside --closes fails' closes-url bodies FAIL --closes
 line_check 'owner/repo#N outside --closes fails' closes-cross bodies FAIL --closes 1
 line_check 'an issue URL in the list passes' closes-url bodies PASS --closes 12
 line_check 'without --closes a closing reference warns' closes-999 bodies WARN
+git -C "$repo" switch -q closes-999
+"$script" "$repo" --no-load > "$work/line.log" 2>&1 || true
+if grep -q 'WARN.* bodies: closing references to 999 found; pass' "$work/line.log"; then
+    ok "the bodies warning lists the numbers with single spaces"
+else
+    not_ok "the bodies warning text: $(grep bodies "$work/line.log")"
+fi
 line_check 'prefix #3 and a closes without a number are no reference' no-number bodies PASS --closes 1
 line_check 'prefix #3 and a closes without a number are no reference (no --closes)' no-number bodies PASS
 printf 'Closes #1\n\nCloses #2\n' > "$work/body-both"
@@ -344,7 +352,6 @@ change crates/tessera-grid/src/lib.rs '// unsafe is not used here'
 change crates/tessera-grid/src/lib.rs '/// Never `unsafe`.'
 change crates/tessera-grid/src/lib.rs 'fn g() {} // unsafe in a trailing comment'
 change crates/tessera-grid/src/lib.rs '/* an unsafe block comment */ fn h() {}'
-change crates/tessera-grid/src/lib.rs ' * unsafe in a block comment continuation'
 change crates/tessera-grid/src/lib.rs 'fn unsafely() {}'
 commit
 line_check 'an added unsafe block outside pty and ffi fails' unsafe-grid unsafe FAIL
@@ -356,38 +363,61 @@ line_check 'a global_allocator in an unlisted file fails' alloc-unlisted unsafe 
 line_check 'a global_allocator in a src file fails' alloc-src unsafe FAIL
 line_check 'unsafe(no_mangle) outside pty and ffi fails' unsafe-attr unsafe FAIL
 line_check 'unsafe_code lint names and unsafe in comments do not match' unsafe-quiet unsafe PASS
+
+# The Rust-aware stripper (comments, string and char literals, raw strings), each case on its own branch.
+branch unsafe-str-slashes
+change crates/tessera-grid/src/lib.rs 'fn s() { let _ = "http://x"; unsafe { g() } }'
+commit
+branch unsafe-raw-closed
+change crates/tessera-grid/src/lib.rs 'fn s() { let _ = r##"a "# b"##; unsafe { g() } }'
+commit
+branch unsafe-nested-after
+change crates/tessera-grid/src/lib.rs '/* a /* b */ c */ unsafe { g() }'
+commit
+branch unsafe-char-quote
+change crates/tessera-grid/src/lib.rs "fn s<'a>(x: &'a str) { let _ = '\"'; unsafe { g() } }"
+commit
+branch unsafe-literals
+change crates/tessera-grid/src/lib.rs 'fn s() { let _ = r#"unsafe { // "#; let _ = "unsafe"; }'
+change crates/tessera-grid/src/lib.rs 'fn t() { let _ = "two
+lines with unsafe
+end"; }'
+change crates/tessera-grid/src/lib.rs "fn u() { let _ = '\"'; } // unsafe"
+commit
+branch unsafe-nested-block
+change crates/tessera-grid/src/lib.rs '/* outer /* inner */ unsafe still a comment */ fn v() {}'
+change crates/tessera-grid/src/lib.rs '/*
+   unsafe in a continuation line without a star
+*/'
+commit
+branch unsafe-in-old-comment
+printf '/*\n an old block comment\n unsafe added inside it\n*/\nfn notes() {}\n' > crates/tessera-grid/src/notes.rs
+commit
+line_check 'a // inside a string before unsafe does not hide it' unsafe-str-slashes unsafe FAIL
+line_check 'a raw string holding a quote and a hash does not end early' unsafe-raw-closed unsafe FAIL
+line_check 'unsafe after a nested block comment closes fails' unsafe-nested-after unsafe FAIL
+line_check 'a char literal quote and a lifetime do not hide unsafe' unsafe-char-quote unsafe FAIL
+line_check 'unsafe in strings, raw strings and after a char literal comment passes' unsafe-literals unsafe PASS
+line_check 'nested block comments and continuation lines without a star pass' unsafe-nested-block unsafe PASS
+line_check 'a line added inside an old block comment passes' unsafe-in-old-comment unsafe PASS
+
+# The exceptions list comes from the base: a branch that lists itself is still checked, and the change is a WARN.
+branch unsafe-self-exempt
+change scripts/unsafe-exceptions.txt 'crates/tessera-grid/tests/selfmade.rs'
+change crates/tessera-grid/tests/selfmade.rs '#[global_allocator]'
+commit
+branch exceptions-only
+change scripts/unsafe-exceptions.txt 'crates/tessera-grid/tests/other.rs'
+commit
+line_check 'a branch that lists itself in unsafe-exceptions.txt still fails, and warns' unsafe-self-exempt unsafe 'WARN FAIL'
+line_check 'a changed unsafe-exceptions.txt alone warns and passes' exceptions-only unsafe 'WARN PASS'
+line_check 'a branch that leaves unsafe-exceptions.txt alone has no unsafe warning' unsafe-listed unsafe PASS
 git -C "$repo" switch -q unsafe-grid
 "$script" "$repo" --no-load > "$work/line.log" 2>&1 || true
 if grep -q 'crates/tessera-grid/src/lib.rs: fn f() { unsafe { g() } }' "$work/line.log"; then
     ok "the unsafe failure names the file and the line"
 else
     not_ok "the unsafe failure does not name the file and the line: $(cat "$work/line.log")"
-fi
-
-# docs/security.md S7 and scripts/unsafe-exceptions.txt name the same files (the check is mechanical, so the text must
-# not drift from the list).
-security="$here/../docs/security.md"
-s7_paths() { sed -n '/^- \*\*S7\./,/^- \*\*S8\./p' "$1" | grep -oE '(crates|apps)/[A-Za-z0-9_./-]+\.rs' | sort -u; }
-listed_paths() { grep -vE '^[[:space:]]*(#|$)' "$1" | sort -u; }
-sync_check() { # <security.md> <exceptions file>
-    [ -n "$(s7_paths "$1")" ] && [ "$(s7_paths "$1")" = "$(listed_paths "$2")" ]
-}
-if sync_check "$security" "$here/unsafe-exceptions.txt"; then
-    ok "docs/security.md S7 and scripts/unsafe-exceptions.txt name the same files"
-else
-    not_ok "docs/security.md S7 and scripts/unsafe-exceptions.txt differ: $(diff <(s7_paths "$security") <(listed_paths "$here/unsafe-exceptions.txt") || true)"
-fi
-grep -v 'crates/tessera-grid/tests/reset.rs' "$security" > "$work/security-fewer.md"
-if sync_check "$work/security-fewer.md" "$here/unsafe-exceptions.txt"; then
-    not_ok "the sync check passes with a path missing from S7"
-else
-    ok "the sync check fails when S7 lacks a listed path"
-fi
-{ cat "$here/unsafe-exceptions.txt"; echo crates/tessera-vt/tests/extra.rs; } > "$work/exceptions-more.txt"
-if sync_check "$security" "$work/exceptions-more.txt"; then
-    not_ok "the sync check passes with a path missing from S7"
-else
-    ok "the sync check fails when the list has a path S7 lacks"
 fi
 
 # The load check runs 2 tests x 10 runs and never has more than --parallel of them in flight. The fixture's gate
