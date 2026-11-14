@@ -1701,9 +1701,10 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
     /// about the URL alone (``LinkPolicy/allows(_:localHostName:)``): a hover
     /// never touches the file system, where a hung mount would stall the
     /// pointer. Only the text hovers, while its cell size is known, and not
-    /// under a scroll bar that is not hidden (an overlay one floats over the
-    /// text and takes the click there, even while transparent between
-    /// flashes): a click opens nothing elsewhere.
+    /// under a scroll bar that is not hidden: an overlay one floats over the
+    /// text, the pointer over it reveals it (``TerminalScroller/isRevealed``)
+    /// and a revealed bar takes the click there. A click opens nothing
+    /// elsewhere.
     private func updateHover(modifiers: NSEvent.ModifierFlags) {
         guard Self.isLinkModifier(modifiers.intersection(.deviceIndependentFlagsMask)), gesture == nil,
             let point = lastPointer, metrics != nil, isMousePoint(point, in: renderView.frame),

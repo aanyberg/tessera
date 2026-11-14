@@ -202,7 +202,8 @@ no reporting decision of its own.
 
 ## Amendment: link opening (#299, 2026-11-13)
 
-- **The reveal policy.** A `file:` link the policy allows is opened with its
+- **The reveal policy** (the extension list below is replaced by the #437
+  amendment). A `file:` link the policy allows is opened with its
   default application unless opening it would launch, run or install
   something; then it is shown in Finder (selected, nothing opened).
   `LinkPolicy` judges the path by its extension (lower-cased) and by its
@@ -244,3 +245,59 @@ no reporting decision of its own.
 - **The wheel without metrics.** Before the view knows its cell size no
   cell can be named, so a wheel event is dropped, not reported at 1;1
   (#289.4), as a press already was.
+
+## Amendment: judged by what would open the file (#437, 2026-11-14)
+
+Every review round of #299 found more file kinds that start an install,
+import or execute flow when opened (`.webarchive`, flat `.help` and `.menu`,
+`.mobileprovision`, `.keychain`, `.p12`, `.ics`, a plug-in installer's
+files, an `OpenWith` attribute on a `.txt`), so the hand-kept extension list
+is gone. A local `file:` link is shown in Finder, not opened, when any of
+these holds for the path or for the path with its links resolved:
+
+- **Launch Services' risk list.** The types and extensions of
+  `LSRiskCategoryUnsafeExecutable` in CoreTypes
+  (`/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/System`,
+  the list Safari uses not to open a download), and those of
+  `LSRiskCategoryMayContainUnsafeExecutable` but `public.archive` (installer
+  packages, `.ipa`; archives keep opening). The file is read once, at the
+  first click, at most 1 MiB (`LinkPolicy.maxRiskListBytes`), and joined to
+  a built-in copy of the macOS 27.2 list, so a missing or moved file still
+  covers it. A test reads the system's list on the machine it runs on and
+  fails when the copy lacks a kind the system lists. The list's HFS type
+  codes are not used. Its `LSRiskCategorySafe` category is not used either:
+  it holds profiles, `.ics` and `.vcf`, which Safari opens and this policy
+  shows.
+- **The default handler.** `NSWorkspace.urlForApplication(toOpen:)` names
+  the app `NSWorkspace.open` would use. The file is shown when that app is
+  Terminal, Installer, ProfileHelper, Shortcuts, Automator, Automator
+  Installer, Keychain Access, Script Editor, JavaLauncher, System Settings
+  (preference panes, screen savers, network configurations), Tips (help
+  books), SystemUIServer (menu extras), DiskImageMounter, Calendar or its
+  file handler, or Contacts (by bundle identifier, in any case:
+  `LinkPolicy.riskyHandlers`), or any agent app (`LSUIElement` or
+  `LSBackgroundOnly`): an app without a Dock icon has no window to show a
+  document in and handles the file instead (ProfileHelper,
+  CalendarFileHandler, a third-party plug-in installer such as Logitech's
+  `.lplug4` tool). Safari and Xcode are document apps: a `.webarchive` is
+  caught by the risk list, a `.mobileprovision` (Xcode installs it) and a
+  `.safariextz` by type.
+- **A per-file `com.apple.LaunchServices.OpenWith` attribute**, which binds
+  one file to any app, survives a tar round trip and is honoured by Launch
+  Services. Finder's "Open With" for a single file sets it too, so such a
+  file is shown rather than opened.
+- **What the file is**, as before: an application or other package, a
+  Finder alias or symbolic link (Foundation counts both as aliases), an
+  executable or script, a stored URL, a disk image, and by type
+  configuration and provisioning profiles, X.509 certificates, PKCS #12
+  bundles, keychains, shortcuts, Java Web Start files, Automator workflows
+  and Safari extensions.
+
+A plain folder is judged like a file: named `x.cer` or `x.jar`, it is a
+folder and opens in Finder (the extension list showed it), unless an app
+declares the name a package or the risk list names the extension. A file
+whose only known handler is a regular third-party app opens with it, as any
+document does: a `.torrent` in a torrent client, a `.skill` in the app that
+imports it. Such an app is one the user installed and bound to that kind, and
+telling an importer from an editor would need a list of apps again. The
+handler is looked up at the click, like the file's type, never on hover.
