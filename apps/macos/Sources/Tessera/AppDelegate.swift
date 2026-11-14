@@ -80,7 +80,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
     }
-    /// Set by a termination signal: quit without asking.
+    /// Set by a termination signal, or by the system's quit Apple event (a
+    /// logout) with a confirmation up: quit without asking.
     var terminatesWithoutConfirmation = false
     /// Reads the system's Reduce Transparency setting (Accessibility,
     /// Display), which ``applyDisplayOptions()`` hands the core. Tests
@@ -127,9 +128,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Runs before any window exists, so every window, sheet and panel the
     /// app shows starts out dark, the default, until the core is started and
-    /// its `app_appearance` read (``readAppAppearance()``).
+    /// its `app_appearance` read (``readAppAppearance()``). The quit Apple
+    /// event's handler replaces AppKit's here, before the first event is
+    /// dispatched (``handleQuitEvent(_:withReplyEvent:)``).
     func applicationWillFinishLaunching(_ notification: Notification) {
         Self.applyAppAppearance(.dark)
+        NSAppleEventManager.shared().setEventHandler(
+            self, andSelector: #selector(handleQuitEvent(_:withReplyEvent:)),
+            forEventClass: AEEventClass(kCoreEventClass), andEventID: AEEventID(kAEQuitApplication))
     }
 
     /// The one place that sets the app's appearance (#365, ADR 0043):
@@ -168,18 +174,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Cmd-Q, the Dock's Quit, logging out: when any session runs a job, one
     /// alert lists them all (D4b) and Cancel keeps everything open. A
     /// termination signal quits without asking, also when it arrives while
-    /// that alert is up: it ends the alert (``terminateForSignal()``), and
-    /// the quit goes on rather than being cancelled. Once the app quits,
-    /// the windows are saved for the next launch.
+    /// that alert is up: it ends the alert (``terminateWithoutAsking()``),
+    /// and the quit goes on rather than being cancelled; so does the
+    /// system's quit Apple event (a logout) that arrives while it is up.
+    /// Once the app quits, the windows are saved for the next launch.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if !terminatesWithoutConfirmation, let presenter = closeConfirmationPresenter,
             let confirmation = CloseConfirmation(.quit, sessions: windowControllers.flatMap(\.sessions)),
-            !presenter.confirmQuit(confirmation), !terminatesWithoutConfirmation
+            !confirmQuit(confirmation, with: presenter), !terminatesWithoutConfirmation
         {
             return .terminateCancel
         }
         saveWindowState()
         return .terminateNow
+    }
+
+    /// The quit alert asks (``confirmQuit(_:with:)``): a quit Apple event
+    /// that arrives meanwhile leaves it asking.
+    private var asksToQuit = false
+
+    private func confirmQuit(_ confirmation: CloseConfirmation, with presenter: any CloseConfirmationPresenter) -> Bool {
+        asksToQuit = true
+        defer { asksToQuit = false }
+        return presenter.confirmQuit(confirmation)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -657,14 +674,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: Signals
 
-    /// How long a termination signal waits for `NSApp.terminate` to end the
-    /// app before ``exitAfterSignal()`` ends it itself.
-    static let signalTerminationGrace: DispatchTimeInterval = .seconds(1)
+    /// How long ``terminateWithoutAsking()`` waits for `NSApp.terminate` to
+    /// end the app before ``exitAfterTerminationGrace()`` ends it itself.
+    static let terminationGrace: DispatchTimeInterval = .seconds(1)
 
     /// `kill`, Ctrl-C and closing the launching terminal (`SIGTERM`, `SIGINT`,
     /// `SIGHUP`) end the process without `applicationWillTerminate`, which
     /// would orphan a child that ignores `SIGHUP`. Route them through
-    /// ``terminateForSignal()`` so `shutdown()` runs.
+    /// ``terminateWithoutAsking()`` so `shutdown()` runs.
     ///
     /// The default action would kill the process before the source's handler
     /// runs, so the process ignores the signal once the source is armed (the
@@ -677,7 +694,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let source = DispatchSource.makeSignalSource(signal: signalNumber, queue: .main)
             source.setEventHandler { [weak self] in
                 MainActor.assumeIsolated {
-                    self?.terminateForSignal()
+                    self?.terminateWithoutAsking()
                 }
             }
             source.resume()
@@ -686,18 +703,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Quits for a termination signal; nobody may be there to answer an
-    /// alert (#441). `NSApp.terminate` does nothing while a window has a
+    /// Quits for a termination signal (nobody may be there to answer an
+    /// alert, #441) or the system's quit Apple event that arrives with a
+    /// confirmation up (#458). `NSApp.terminate` does nothing while a window has a
     /// sheet (a close confirmation: `applicationShouldTerminate` is never
     /// asked), so every sheet is ended first as Cancel. An app-modal alert
     /// (the quit confirmation, an error) is aborted instead: when it is the
     /// quit confirmation, the `terminate` that showed it goes on and quits,
     /// so this call does not start a second, nested one (that one would end
     /// the app without saving the windows). Should the app still run after
-    /// ``signalTerminationGrace`` (another alert was aborted, or something
-    /// else refused), it saves the windows, shuts the core down and exits
-    /// on its own.
-    func terminateForSignal() {
+    /// ``terminationGrace`` (another alert was aborted, or something else
+    /// refused), it saves the windows, shuts the core down and exits on its
+    /// own.
+    func terminateWithoutAsking() {
         terminatesWithoutConfirmation = true
         for window in NSApp.windows {
             for sheet in window.sheets {
@@ -709,21 +727,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             NSApp.terminate(nil)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.signalTerminationGrace) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.terminationGrace) { [weak self] in
             MainActor.assumeIsolated {
-                self?.exitAfterSignal()
+                self?.exitAfterTerminationGrace()
             }
         }
     }
 
-    /// The fallback of ``terminateForSignal()``: what quitting would have
-    /// done (the window state, `shutdown()`, which ends the sessions'
+    /// The fallback of ``terminateWithoutAsking()``: what quitting would
+    /// have done (the window state, `shutdown()`, which ends the sessions'
     /// children), then the process ends.
-    private func exitAfterSignal() {
-        Self.log.error("a termination signal did not end the app in time; exiting")
+    private func exitAfterTerminationGrace() {
+        Self.log.error("terminate did not end the app in time; exiting")
         saveWindowState()
         core?.shutdown()
         exit(0)
+    }
+}
+
+// MARK: Quit Apple event
+
+extension AppDelegate {
+    /// The quit Apple event (#458). AppKit's own handler calls `terminate`,
+    /// which does nothing while a window has a sheet: with a close
+    /// confirmation up the event was ignored, and a logout waited on the
+    /// app. This one replaces it:
+    ///
+    /// - The system's quit (a logout, restart or shutdown, which the user
+    ///   has already confirmed; ``isSystemQuit(_:)``) with a confirmation
+    ///   up, a sheet or an application-modal alert such as the quit alert
+    ///   itself: the question is left unanswered and the system wins. It is
+    ///   ended and the app quits without asking again, the windows saved,
+    ///   as a signal quits (``terminateWithoutAsking()``).
+    /// - Any other quit (the Dock's Quit, `NSRunningApplication.terminate()`,
+    ///   AppleScript's `quit`), or the system's with nothing up: every sheet
+    ///   is ended as Cancel and `terminate` asks as ⌘Q does, one alert for
+    ///   every busy session (D4b), since quitting ends more than the sheet
+    ///   asked about; with idle sessions it quits. That holds with another
+    ///   application-modal alert up too (an error), as with AppKit's
+    ///   handler. Only while the quit alert itself asks is nothing more
+    ///   done.
+    ///
+    /// When the app is still running afterwards, the event is answered with
+    /// `userCanceledErr`, as AppKit's handler answers a cancelled quit, so a
+    /// logout stops rather than waiting on the app.
+    @objc func handleQuitEvent(_ event: NSAppleEventDescriptor, withReplyEvent reply: NSAppleEventDescriptor) {
+        let modal = NSApp.modalWindow != nil
+        let sheets = NSApp.windows.flatMap { window in window.sheets.map { (window, $0) } }
+        if Self.isSystemQuit(event), modal || !sheets.isEmpty {
+            return terminateWithoutAsking()
+        }
+        if !asksToQuit {
+            for (window, sheet) in sheets {
+                window.endSheet(sheet, returnCode: .cancel)
+            }
+            NSApp.terminate(nil)
+        }
+        if reply.descriptorType != typeNull {
+            reply.setParam(NSAppleEventDescriptor(int32: Int32(userCanceledErr)), forKeyword: keyErrorNumber)
+        }
+    }
+
+    /// Whether a quit Apple event is the system's: a logout, restart or
+    /// shutdown names its reason (`kAEQuitReason`, a parameter, though
+    /// commonly read as an attribute; both are read), which the Dock's
+    /// Quit, `NSRunningApplication.terminate()` and AppleScript's `quit`
+    /// do not.
+    static func isSystemQuit(_ event: NSAppleEventDescriptor) -> Bool {
+        let reason = AEKeyword(kAEQuitReason)
+        return event.paramDescriptor(forKeyword: reason) != nil || event.attributeDescriptor(forKeyword: reason) != nil
     }
 }
 
