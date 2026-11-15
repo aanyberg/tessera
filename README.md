@@ -2,9 +2,9 @@
 
 A native macOS terminal emulator with a polished, approachable interface, built on a fast, modular Rust core.
 
-> **Status:** approaching 0.1.0, the first daily-drivable release. Windows, tabs, scrollback, selection, links,
-> themes and `config.toml` work today. Splits, a Preferences window, search and profiles in the UI are planned for
-> 0.2.0 (see [Roadmap](#roadmap)).
+> **Status:** 0.2.0. Windows, tabs, split panes, scrollback, selection, links, find, themes, profiles, a Settings
+> window and `config.toml` work today, along with a first plugin host. A status bar and an update mechanism
+> are planned for 0.3.0 (see [Roadmap](#roadmap)).
 
 ## Why Tessera
 
