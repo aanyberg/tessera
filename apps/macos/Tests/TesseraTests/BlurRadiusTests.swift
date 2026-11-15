@@ -406,8 +406,10 @@ final class BlurRadiusTests: XCTestCase {
     }
 }
 
-/// The app's own delegate reads `blur_radius` and gives it to every window:
-/// at start, on every reload, and 0 while Reduce Transparency is on.
+/// #490: the app ignores `[appearance] blur_radius` in 0.2.0, until the
+/// rework in 0.3.0 (#491). A file that sets it loads (its windows are
+/// translucent, as it asks), and every window keeps the panes' material
+/// blur: at start, on every reload and across a Reduce Transparency change.
 @MainActor
 final class BlurRadiusReloadTests: XCTestCase {
     private var appDelegate: AppDelegate!
@@ -418,8 +420,9 @@ final class BlurRadiusReloadTests: XCTestCase {
     private var savedBackend: WindowBlurRadius.Backend?
     private var savedWindowNumber: (@MainActor (NSWindow) -> Int?)!
 
-    private static func config(radius: Int) -> String {
-        TransparencyTests.config.replacingOccurrences(of: "blur = true", with: "blur = true\nblur_radius = \(radius)")
+    private static func config(radius: Int, dimming: Double = 0) -> String {
+        TransparencyTests.config.replacingOccurrences(
+            of: "blur = true", with: "blur = true\nblur_radius = \(radius)\ndim_inactive_panes = \(dimming)")
     }
 
     override func setUp() async throws {
@@ -467,18 +470,37 @@ final class BlurRadiusReloadTests: XCTestCase {
         }
     }
 
-    private func write(radius: Int) throws {
-        try Self.config(radius: radius)
+    private func write(radius: Int, dimming: Double = 0) throws {
+        try Self.config(radius: radius, dimming: dimming)
             .write(to: dir.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)
     }
 
-    /// B1: a window and a tab opened with a radius already in the file get
-    /// it as they come on screen, through the real window-number guard and
-    /// with no notification posted by the test.
-    func testAWindowOpenedWithARadiusGetsItWhenShown() async throws {
+    /// `controller`'s window as the file asks, translucent and blurred, on
+    /// the panes' own material: no radius taken, none set on the window.
+    private func assertMaterial(
+        _ controller: TerminalWindowController, _ what: String, file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        let window = try XCTUnwrap(controller.window, what, file: file, line: line)
+        let content = try XCTUnwrap(window.contentView as? TerminalWindowContentView, what, file: file, line: line)
+        XCTAssertFalse(window.isOpaque, "\(what): translucent, so the file loaded", file: file, line: line)
+        XCTAssertEqual(controller.windowBlurRadius, 0, "\(what): no radius", file: file, line: line)
+        XCTAssertFalse(content.usesBlurRadius, "\(what): not blurred at a radius", file: file, line: line)
+        XCTAssertEqual(content.appliedBlur?.radius ?? 0, 0, "\(what): none set", file: file, line: line)
+        for pane in controller.panes {
+            let backdrop = try XCTUnwrap(pane.view.backdrop, "\(what): the pane's material", file: file, line: line)
+            XCTAssertFalse(backdrop.isHidden, "\(what): the pane's material shown", file: file, line: line)
+        }
+        XCTAssertTrue(recorder.calls.isEmpty, "\(what): \(recorder.calls)", file: file, line: line)
+    }
+
+    /// A window and a tab opened the way the app opens them, with a radius
+    /// in the file, through the real window-number guard and with no
+    /// notification posted by the test, keep the material.
+    func testAWindowOpenedWithARadiusInTheFileKeepsTheMaterial() async throws {
         WindowBlurRadius.windowNumber = savedWindowNumber
         try write(radius: 20)
         try appDelegate.replaceCore(start: true)
+        XCTAssertEqual(appDelegate.windowBlurRadius, 0, "not read at start")
         let controller = try appDelegate.newWindow()
         let window = try XCTUnwrap(controller.window)
         guard MTLCreateSystemDefaultDevice() != nil, controller.focusedPane.view.surface.isAttached else {
@@ -487,25 +509,19 @@ final class BlurRadiusReloadTests: XCTestCase {
         guard window.isVisible, window.windowNumber > 0 else {
             throw XCTSkip("the host puts no window on screen")
         }
-        let calls = { (window: NSWindow) in
-            self.recorder.calls.filter { $0.windowNumber == window.windowNumber }.map(\.radius)
-        }
-        XCTAssertEqual(calls(window), [20], "set once, as the window is shown")
-        XCTAssertTrue(try XCTUnwrap(window.contentView as? TerminalWindowContentView).usesBlurRadius)
+        try assertMaterial(controller, "a new window")
 
         let tab = try appDelegate.newTab(in: window)
-        let tabWindow = try XCTUnwrap(tab.window)
-        guard tab.focusedPane.view.surface.isAttached, tabWindow.windowNumber > 0 else {
+        guard tab.focusedPane.view.surface.isAttached, try XCTUnwrap(tab.window).windowNumber > 0 else {
             throw XCTSkip("the tab has no surface or number")
         }
-        XCTAssertEqual(calls(tabWindow), [20], "a new tab too")
-        XCTAssertEqual(calls(window), [20], "the first window is not set again")
+        try assertMaterial(tab, "a new tab")
+        try assertMaterial(controller, "the first window")
     }
 
-    func testAReloadReachesEveryWindowAndReduceTransparencyTurnsItOff() async throws {
+    func testAReloadOrReduceTransparencyKeepsEveryWindowOnTheMaterial() async throws {
         try write(radius: 15)
         try appDelegate.replaceCore(start: true)
-        XCTAssertEqual(appDelegate.windowBlurRadius, 15, "read at start")
         let first = try appDelegate.newWindow()
         let second = try appDelegate.newWindow()
         let windows = try [first, second].map { try XCTUnwrap($0.window) }
@@ -515,36 +531,29 @@ final class BlurRadiusReloadTests: XCTestCase {
         }
         for window in windows {
             recorder.show(window)
-            XCTAssertEqual(recorder.calls(for: window), [15], "each window at the radius read at start")
         }
+        try assertMaterial(first, "at start")
+        try assertMaterial(second, "at start")
 
-        try write(radius: 40)
-        try await waitUntil("the reload reaches every window") {
-            windows.allSatisfy { self.recorder.calls(for: $0).last == 40 }
-        }
-        XCTAssertEqual([first, second].map(\.windowBlurRadius), [40, 40])
-
-        try write(radius: 99)
-        try await waitUntil("clamped by the core") { windows.allSatisfy { self.recorder.calls(for: $0).last == 64 } }
+        // The dimming shows the reload was applied: it is read in the same
+        // pass as the radius was.
+        try write(radius: 40, dimming: 0.3)
+        try await waitUntil("the reload is applied") { abs(appDelegate.paneDimming - 0.3) < 0.001 }
+        XCTAssertEqual(appDelegate.windowBlurRadius, 0, "not read on a reload")
+        try assertMaterial(first, "after a reload")
+        try assertMaterial(second, "after a reload")
 
         reduces = true
         NSWorkspace.shared.notificationCenter.post(
             name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: NSWorkspace.shared)
-        try await waitUntil("Reduce Transparency: radius 0") {
-            windows.allSatisfy { self.recorder.calls(for: $0).last == 0 && $0.isOpaque }
-        }
-        XCTAssertEqual(appDelegate.windowBlurRadius, 0, "the host sets no radius under Reduce Transparency")
-        XCTAssertEqual([first, second].map(\.windowBlurRadius), [0, 0])
-        let third = try appDelegate.newWindow()
-        XCTAssertEqual(third.windowBlurRadius, 0, "a window opened meanwhile")
-        third.window?.close()
-
+        try await waitUntil("Reduce Transparency: opaque") { windows.allSatisfy(\.isOpaque) }
         reduces = false
         NSWorkspace.shared.notificationCenter.post(
             name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: NSWorkspace.shared)
-        try await waitUntil("turned off: the radius is back") {
-            windows.allSatisfy { self.recorder.calls(for: $0).last == 64 }
-        }
+        try await waitUntil("turned off: translucent again") { windows.allSatisfy { !$0.isOpaque } }
+        XCTAssertEqual(appDelegate.windowBlurRadius, 0, "not read after the display options change")
+        try assertMaterial(first, "after Reduce Transparency")
+        try assertMaterial(second, "after Reduce Transparency")
     }
 }
 
@@ -552,8 +561,10 @@ final class BlurRadiusReloadTests: XCTestCase {
 /// screen (#409, #405 n1): opaque or transparent, its title bar, the strip
 /// under the title bar and tab bar, and its blur radius, by every route that
 /// selects a tab or brings a window back, as a fresh attach of the tab gives.
-/// Through the app's own windows and tabs and `config.toml`, posting nothing:
-/// a radius changed while a tab is off screen reaches it as it is shown. The
+/// Through the app's own windows and tabs, posting nothing: a radius changed
+/// while a tab is off screen reaches it as it is shown. The radius is set on
+/// the app's delegate, which does not read it from `config.toml` in 0.2.0
+/// (#490) but still hands it to every window (for #491 in 0.3.0). The
 /// window-number seam is the real guard, and treats an unselected tab as off
 /// screen (as WindowServer does; this host reports such a tab visible).
 @MainActor
@@ -572,7 +583,8 @@ final class TabVisibilityTests: XCTestCase {
         appDelegate.reducesTransparency = { false }
         dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-tab-blur-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        try write(radius: 20)
+        try TransparencyTests.config.write(
+            to: dir.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)
         previous = ProcessInfo.processInfo.environment["TESSERA_CONFIG_DIR"]
         setenv("TESSERA_CONFIG_DIR", dir.path, 1)
         recorder = BlurRecorder()
@@ -584,6 +596,7 @@ final class TabVisibilityTests: XCTestCase {
             (window.tabGroup?.selectedWindow ?? window) === window ? real(window) : nil
         }
         try appDelegate.replaceCore(start: true)
+        appDelegate.windowBlurRadius = 20
     }
 
     override func tearDown() async throws {
@@ -604,12 +617,6 @@ final class TabVisibilityTests: XCTestCase {
         try? FileManager.default.removeItem(at: dir)
     }
 
-    private func write(radius: Int) throws {
-        let config = TransparencyTests.config.replacingOccurrences(
-            of: "blur = true", with: "blur = true\nblur_radius = \(radius)")
-        try config.write(to: dir.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)
-    }
-
     private func waitUntil(_ description: String, _ condition: () -> Bool) async throws {
         let deadline = ContinuousClock.now + .seconds(10)
         while !condition() {
@@ -623,7 +630,7 @@ final class TabVisibilityTests: XCTestCase {
 
     /// Two tabs of one window, the first (default profile: translucent,
     /// blurred) selected, the second of `profile`; the radius then changed
-    /// to 40 in the file, which the unselected second tab cannot take yet.
+    /// to 40, which the unselected second tab cannot take yet.
     private func openTabs(
         second profile: String?
     ) async throws -> (TerminalWindowController, TerminalWindowController) {
@@ -641,10 +648,8 @@ final class TabVisibilityTests: XCTestCase {
         XCTAssertTrue(window.tabGroup === tab.tabGroup, "one tab group")
         window.tabGroup?.selectedWindow = window
         XCTAssertNil(WindowBlurRadius.windowNumber(tab), "the second tab is off screen")
-        try write(radius: 40)
-        try await waitUntil("the reload reaches both tabs") {
-            appDelegate.windowBlurRadius == 40 && [first, second].allSatisfy { $0.windowBlurRadius == 40 }
-        }
+        appDelegate.windowBlurRadius = 40
+        XCTAssertEqual([first, second].map(\.windowBlurRadius), [40, 40], "both tabs")
         XCTAssertEqual(recorder.calls.filter { $0.windowNumber == window.windowNumber }.last?.radius, 40)
         if profile == nil {
             XCTAssertEqual(
@@ -780,7 +785,7 @@ final class TabVisibilityTests: XCTestCase {
         XCTAssertFalse(try XCTUnwrap(second.window).isRestorable, "a new tab")
     }
 
-    /// #405 n1: the radius changed in the file while the window's tabs are
+    /// #405 n1: the radius changed while the window's tabs are
     /// minimized, then while the app is hidden, reaches every tab window as
     /// it comes back, through the real window-number guard (a minimized or
     /// hidden window has none), with no notification posted by the test.
@@ -806,8 +811,8 @@ final class TabVisibilityTests: XCTestCase {
         while !tab.isMiniaturized, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
         guard tab.isMiniaturized else { throw XCTSkip("the host cannot minimize a window (no Dock)") }
         try await waitUntil("minimized") { [window, tab].allSatisfy { !$0.isVisible } }
-        try write(radius: 40)
-        try await waitUntil("the reload reaches both tabs") { controllers.allSatisfy { $0.windowBlurRadius == 40 } }
+        appDelegate.windowBlurRadius = 40
+        XCTAssertEqual(controllers.map(\.windowBlurRadius), [40, 40], "both tabs")
         XCTAssertFalse(radii().contains(40), "minimized: no window number to set it on")
         tab.deminiaturize(nil)
         try await waitUntil("restored, every tab at the new radius") { radii() == [40, 40] }
@@ -815,8 +820,8 @@ final class TabVisibilityTests: XCTestCase {
 
         NSApp.hide(nil)
         try await waitUntil("hidden") { NSApp.isHidden }
-        try write(radius: 30)
-        try await waitUntil("the reload reaches both tabs") { controllers.allSatisfy { $0.windowBlurRadius == 30 } }
+        appDelegate.windowBlurRadius = 30
+        XCTAssertEqual(controllers.map(\.windowBlurRadius), [30, 30], "both tabs")
         NSApp.unhide(nil)
         try await waitUntil("shown again, every tab at the new radius") { radii() == [30, 30] }
         XCTAssertEqual(contents.map(\.usesBlurRadius), [true, true])

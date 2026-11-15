@@ -185,12 +185,27 @@ final class SettingsTests: XCTestCase {
         XCTAssertEqual(writer.calls.filter { $0.key == field.key }.count, writes.count, "nothing after the release")
     }
 
-    /// The blur radius slider (#390, ADR 0044 mirror of `blur_radius`)
-    /// writes whole numbers within 0...64, coalesced like any slider, never
-    /// a float (which the core refuses for an integer key).
-    func testTheBlurRadiusSliderWritesWholeNumbersInItsRange() async throws {
+    /// The blur radius slider of #390, which no pane shows in 0.2.0 (#490):
+    /// it returns in 0.3.0 (#491), and its control is kept and tested.
+    static let integerSlider = SettingsField(
+        key: "appearance.blur_radius", title: "Blur radius", control: .integerSlider(0...64, zeroTitle: "Off"))
+
+    /// #490: Appearance has no blur radius slider, only the blur toggle.
+    func testAppearanceHasTheBlurToggleAndNoBlurRadius() {
+        let keys = AppearancePane.fields.map(\.key)
+        XCTAssertTrue(keys.contains("appearance.blur"), "\(keys)")
+        XCTAssertFalse(keys.contains("appearance.blur_radius"), "\(keys)")
+        XCTAssertFalse(
+            AppearancePane.fields.contains { if case .integerSlider = $0.control { true } else { false } },
+            "no integer slider: \(keys)")
+    }
+
+    /// An integer slider writes whole numbers within its range, coalesced
+    /// like any slider, never a float (which the core refuses for an
+    /// integer key).
+    func testAnIntegerSliderWritesWholeNumbersInItsRange() async throws {
         let (model, _, writer) = try fakeModel(Self.fakeConfig, clock: ManualClock())
-        let field = try XCTUnwrap(AppearancePane.fields.first { $0.key == "appearance.blur_radius" })
+        let field = Self.integerSlider
         let context = SettingsFieldContext(model: model, path: field.key)
         let binding = field.integerSliderBinding(context)
         for (dragged, written) in [(20.4, 20), (20.6, 21), (90.0, 64), (-3.0, 0)] {
@@ -217,7 +232,7 @@ final class SettingsTests: XCTestCase {
             ("appearance.opacity", [TesseraConfigValue.float(0.4), .float(0.5), .float(0.6)]),
             ("appearance.blur_radius", [.integer(10), .integer(11), .integer(12)]),
         ] {
-            let field = try XCTUnwrap(AppearancePane.fields.first { $0.key == key })
+            let field = try XCTUnwrap((AppearancePane.fields + [Self.integerSlider]).first { $0.key == key })
             let context = SettingsFieldContext(model: model, path: field.key)
             let editingChanged = field.editingChanged(context)
             editingChanged(true)
@@ -744,7 +759,6 @@ final class SettingsTests: XCTestCase {
             Edit(key: "appearance.font_size", value: .float(15), line: "font_size = 15.0"),
             Edit(key: "appearance.opacity", value: .float(0.5), line: "opacity = 0.5"),
             Edit(key: "appearance.blur", value: .bool(true), line: "blur = true"),
-            Edit(key: "appearance.blur_radius", value: .integer(20), line: "blur_radius = 20"),
             Edit(key: "appearance.cursor_shape", value: .string("beam"), line: #"cursor_shape = "beam""#),
             Edit(key: "appearance.cursor_blink", value: .bool(true), line: "cursor_blink = true"),
             Edit(key: "appearance.dim_inactive_panes", value: .float(0.3), line: "dim_inactive_panes = 0.3"),
@@ -2060,7 +2074,7 @@ extension SettingsTests {
     /// draws or the app shares.
     func testTheProfileAppearanceFieldsLeaveOutTheWindowAndAppKeys() {
         let left = Set(AppearancePane.fields.map(\.key)).subtracting(ProfilesPane.appearanceFields.map(\.key))
-        XCTAssertEqual(left, ["appearance.dim_inactive_panes", "appearance.blur_radius", "appearance.app_appearance"])
+        XCTAssertEqual(left, ["appearance.dim_inactive_panes", "appearance.app_appearance"])
     }
 }
 

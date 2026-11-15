@@ -31,9 +31,8 @@ font_size = 13.0
 # what is behind the window when it is translucent.
 opacity = 1.0
 blur = false
-# Blur radius for the whole window (0 to 64): 0 keeps the standard blur
-# behind each pane that asks for it; above 0 blurs the window at that
-# radius while every translucent pane of the tab asks for blur.
+# Blur radius for the whole window (0 to 64). No effect in 0.2.0: every
+# pane that asks for blur keeps the standard blur. It returns in 0.3.0.
 blur_radius = 0
 # Cursor shape: "block", "underline" or "beam" (a vertical bar), and whether
 # it blinks. Programs may change both (vim, fish); they come back to these

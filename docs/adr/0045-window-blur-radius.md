@@ -1,6 +1,10 @@
 # ADR 0045: Window blur radius (amends 0043)
 
-**Status:** accepted · 2026-11-11
+**Status:** accepted · 2026-11-11 · amended 2026-11-15 (#490: turned off for
+0.2.0. The app does not read `blur_radius` and has no Settings slider for
+it, so every blurred window keeps the material blur of ADR 0043; the key
+still parses, is clamped and is reported by `tessera_app_blur_radius`, and
+has no effect. It returns with the rework in 0.3.0, #491)
 
 ## Context
 
