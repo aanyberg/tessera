@@ -121,7 +121,7 @@ terminfo-ssh host:
     {{terminfo}} --ssh {{host}}
 
 # Release: archive the app (Release, universal, ad-hoc signed); version = CFBundleShortVersionString (numeric), build = CFBundleVersion
-archive version="0.1.0" build="1": xcodeproj
+archive version="0.2.0" build="1": xcodeproj
     test -d {{quote(xcframework)}} || { echo "missing {{xcframework}}: run 'just xcframework' first" >&2; exit 1 }
     rm -rf {{quote(archive_path)}}
     mkdir -p {{quote(build_dir)}}
