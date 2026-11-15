@@ -2367,7 +2367,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-app-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proptest",
  "regex",
@@ -2388,14 +2388,14 @@ dependencies = [
 
 [[package]]
 name = "tessera-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tessera-protocol",
 ]
 
 [[package]]
 name = "tessera-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "insta",
  "kqueue",
@@ -2415,11 +2415,11 @@ dependencies = [
 
 [[package]]
 name = "tessera-control"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "tessera-devtool"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "serde_json",
@@ -2433,7 +2433,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-devwin"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde_json",
  "tessera-app-core",
@@ -2443,7 +2443,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-ffi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cbindgen",
  "serde_json",
@@ -2456,7 +2456,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-grid"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "insta",
  "proptest",
@@ -2466,7 +2466,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-plugin-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -2474,14 +2474,14 @@ dependencies = [
 
 [[package]]
 name = "tessera-plugin-hello"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tessera-plugin-api",
 ]
 
 [[package]]
 name = "tessera-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2490,7 +2490,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-pty"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "nix",
@@ -2501,7 +2501,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-render"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -2519,7 +2519,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-search"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proptest",
  "regex",
@@ -2529,7 +2529,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-shell-integration"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proptest",
  "tempfile",
@@ -2540,7 +2540,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-term"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "insta",
@@ -2552,7 +2552,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-vt"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proptest",
  "vte",
@@ -3457,7 +3457,7 @@ checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "schemars",
