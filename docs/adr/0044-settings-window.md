@@ -459,3 +459,41 @@ Known limits:
 * A plugin that takes longer than 2 seconds to start or stop shows
   Starting… or Stopping… until the pane is shown again or the next apply.
 
+## Amendment: Add and Duplicate through the core's add of a profile (#312, 2026-11-15)
+
+The app half of the ADR 0040 amendment for #312.
+
+- **One edit.** Add and Duplicate are each one `tessera_config_add_profile`
+  (`TesseraConfigWriter.addProfile(named:keys:)`): Add sends
+  `{"name": "New Profile"}`; Duplicate sends the source's name with " Copy"
+  and every key of `profileKeys` the source sets, from an entry or from a
+  profile of `profiles/`. The core writes all of it or nothing, so the
+  #455 run of the name and then each key is gone, and so is the app's
+  `unusedProfileName`. A value the loader warns about or a name past 128
+  bytes writes nothing. A `[[profiles]]` entry without a name (the #455
+  bug) can no longer come from Add or Duplicate.
+- **The core names and places it.** The core numbers a taken name
+  ("New Profile 2") against the entries and the profile files, and puts the
+  new entry after the entries, before the profiles of `profiles/`. Index and
+  name come back from the call. Until a configuration lists the profile, the
+  model shows it at that index with the name and keys sent, and the profiles
+  of `profiles/` one further on, as they will be. The add ends when the
+  applied list has that name at that index (the core's name is unique), or
+  when the listed profiles differ from the ones it was queued against (a
+  hand edit of the file), as in the #344 amendment. The pane selects the
+  new row once the call returns, through a callback with the index, since
+  the index is not known before the write. A `Conflict` (the file changed
+  on disk) is written again once, as an edit is, after a reload, and the
+  add waits for a configuration after the external edit's.
+- **The cap is the core's.** The #344 constant that mirrored `MAX_PROFILES`
+  (256) and the disabled Add and Duplicate at that count are gone: they
+  counted only what the window listed, while the core counts entries and
+  profile files together. The buttons are disabled only while the list is
+  locked, and the core's refusal ("the first 256 profiles, with those in
+  profiles/, are read; one more would push one out") shows by the list.
+- **The core's messages.** A refused add shows the core's message by the
+  list, sanitised and cut as every message is (S3), not "This value cannot
+  be written.". Only the error kind is logged (S8).
+- **No key past the list.** A key-path edit of a profile index at or past
+  the applied list's count is not written: the core would add a
+  `[[profiles]]` table without a name. A new profile goes through the add.

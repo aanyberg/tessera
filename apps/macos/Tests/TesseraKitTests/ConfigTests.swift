@@ -1,4 +1,5 @@
 import Foundation
+import TesseraCore
 import XCTest
 
 @testable import TesseraKit
@@ -190,6 +191,71 @@ final class ConfigTests: XCTestCase {
         }
         XCTAssertThrowsError(try app.configWriter.set("appearance.opacity", to: .table([:]))) { error in
             XCTAssertEqual((error as? TesseraConfigEditError)?.kind, .invalidArgument)
+        }
+        XCTAssertEqual(try file(), original, "nothing was written")
+    }
+
+    // MARK: Profiles
+
+    /// An added profile goes after the `[[profiles]]` entries with its keys,
+    /// named by the core (numbered when taken); the name and the values keep
+    /// their quotes, and a name of the most bytes comes back whole (#312).
+    func testAProfileIsAddedWithItsKeysWhereAndAsTheCoreNamesIt() async throws {
+        let app = try start(
+            config: """
+                [[profiles]]
+                name = "work \\"one\\""
+
+                """)
+        let writer = app.configWriter
+        let first = await Self.inBackground { () -> Result<TesseraAddedProfile, TesseraConfigEditError> in
+            do throws(TesseraConfigEditError) {
+                return .success(
+                    try writer.addProfile(
+                        named: #"work "one""#,
+                        keys: [
+                            (key: "command", value: .string(#"/bin/echo "hi""#)),
+                            (key: "appearance.opacity", value: .float(0.5)),
+                        ]))
+            } catch {
+                return .failure(error)
+            }
+        }
+        XCTAssertEqual(try first.get(), TesseraAddedProfile(index: 1, name: #"work "one" 2"#))
+        let longest = String(repeating: "é", count: Int(TESSERA_MAX_PROFILE_NAME_LEN) / 2)
+        XCTAssertEqual(longest.utf8.count, 128)
+        XCTAssertEqual(try writer.addProfile(named: longest), TesseraAddedProfile(index: 2, name: longest))
+        try await waitUntil("the watch applied both") { (try? app.configSnapshot())?["profiles[2].name"] != nil }
+        let snapshot = try app.configSnapshot()
+        XCTAssertEqual(snapshot["profiles[1].name"], .string(#"work "one" 2"#))
+        XCTAssertEqual(snapshot["profiles[1].command"], .string(#"/bin/echo "hi""#))
+        XCTAssertEqual(try XCTUnwrap(snapshot["profiles[1].appearance.opacity"]?.double), 0.5, accuracy: 1e-6)
+        XCTAssertEqual(snapshot["profiles[2].name"], .string(longest))
+    }
+
+    /// A refused add writes nothing and says why: a value with no JSON
+    /// before the core, a value the loader warns about and a name too long
+    /// with the core's message.
+    func testARefusedAddWritesNothingAndSaysWhy() throws {
+        let original = "[[profiles]]\nname = \"one\"\n"
+        let app = try start(config: original)
+        let writer = app.configWriter
+        XCTAssertThrowsError(try writer.addProfile(named: "x", keys: [(key: "command", value: .table([:]))])) {
+            let error = $0 as? TesseraConfigEditError
+            XCTAssertEqual(error?.kind, .invalidArgument)
+            XCTAssertTrue(error?.message.contains("command") ?? false, error?.message ?? "")
+        }
+        XCTAssertThrowsError(
+            try writer.addProfile(named: "x", keys: [(key: "appearance.theme", value: .string("No Such Theme"))])
+        ) {
+            let error = $0 as? TesseraConfigEditError
+            XCTAssertEqual(error?.kind, .refused)
+            XCTAssertTrue(error?.message.contains("profiles[1].appearance.theme") ?? false, error?.message ?? "")
+        }
+        XCTAssertThrowsError(try writer.addProfile(named: String(repeating: "a", count: 129))) {
+            let error = $0 as? TesseraConfigEditError
+            XCTAssertNotNil(error?.kind)
+            XCTAssertTrue(error?.message.contains("128 bytes") ?? false, error?.message ?? "")
         }
         XCTAssertEqual(try file(), original, "nothing was written")
     }
