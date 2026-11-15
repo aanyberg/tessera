@@ -116,7 +116,7 @@ work; each is shaped when it is picked up. A 1.0.0 will be defined once the 0.x 
 ### Plugins
 
 Plugins implement one trait (`tessera-plugin-api`) and declare the capabilities they need. v1 links first-party
-plugins into the binary and, from 0.2.0, toggles them from Preferences. v2 loads third-party plugins as sandboxed WASM
+plugins into the binary and, from 0.2.0, toggles them in the Settings window's Plugins pane. v2 loads third-party plugins as sandboxed WASM
 components using the same API.
 
 ## Contributing

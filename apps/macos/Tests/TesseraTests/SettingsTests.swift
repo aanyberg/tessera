@@ -930,7 +930,7 @@ final class SettingsTests: XCTestCase {
         XCTAssertEqual(NSApp.windows.filter { $0.identifier?.rawValue == "settings" && $0.delegate != nil }.count, 1)
         XCTAssertEqual(
             controller.tabs?.tabViewItems.compactMap { $0.identifier as? String },
-            ["general", "appearance", "profiles", "keys", "advanced"])
+            ["general", "appearance", "profiles", "keys", "plugins", "advanced"])
         controller.select(pane: "profiles")
         XCTAssertEqual(controller.tabs?.selectedTabViewItemIndex, 2)
     }
@@ -1889,6 +1889,14 @@ final class FakeSource: SettingsConfigSource {
     func keymap() throws -> TesseraKeymap {
         guard let keymapResult else { throw TesseraCoreError.invalidArgument }
         return keymapResult
+    }
+    /// The plugins, or `nil` when they cannot be read; counts the reads.
+    var pluginList: [TesseraPlugin]? = []
+    private(set) var pluginReads = 0
+    func plugins() throws -> [TesseraPlugin] {
+        pluginReads += 1
+        guard let pluginList else { throw TesseraCoreError.invalidArgument }
+        return pluginList
     }
     var settingsWriter: any SettingsConfigWriting { writer }
 }

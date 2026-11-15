@@ -95,8 +95,9 @@ watch applies the file (or the write fails, with its message by the list)
 the list, its buttons and the profile's controls are disabled and the
 profile actions do nothing. Each `ProfileAppearance` key has
 an Inherit toggle: on removes the profile's key, so `[appearance]`'s
-applies; off writes the value shown. Profile names, theme names and plugin
-names are shown sanitised (`MainMenu.profileTitle`).
+applies; off writes the value shown. Profile names and theme names are
+shown sanitised (`MainMenu.profileTitle`); plugin text as the Plugins pane
+amendment says.
 
 **Themes.** Import Theme… opens an `NSOpenPanel` for `.itermcolors` and
 base16 YAML, calls `tessera_theme_import`, and selects the new theme; a file
@@ -403,3 +404,58 @@ Known limits:
   pane shows (`tabView(_:willSelect:)`): the switch takes the field away
   before it sees the focus go, and a typed Command, Name or Working
   directory was lost.
+
+## Amendment: Plugins pane (#48, 2026-11-14)
+
+The Plugins pane (between Keys and Advanced) lists every plugin built into
+this version, as `tessera_app_plugins_json` reports it (ADR 0047), and
+replaces the read-only list of `[plugins] enabled` in Advanced.
+
+* **What it shows.** Per plugin: a toggle named after the plugin, its
+  version and id, its status, its capabilities (in the pane's words:
+  Sessions (titles and commands), Status bar items, Storage (in memory), and
+  for the capabilities 0.2.0 does not grant Terminal output, Side panels,
+  Commands, Files, Network; one the pane does not know as the core names
+  it), and while it is listed and refused or failed, the host's message (a
+  failed one adds that turning it off and on tries again). The status is
+  Running, Not started (refused), Failed or Off, and Starting… or Stopping…
+  while the toggle shows another value than the host last applied or the
+  host has yet to start or stop it (`TesseraPlugin.isSettling`). Ids
+  `[plugins] enabled` lists that this version does not have are listed once
+  each under the plugins. The status bar the items go to is #49.
+* **When it reads.** On `SettingsModel.reload()` (so on every
+  `on_config_applied`, after the configuration) and whenever the pane shows.
+  The host starts and stops plugins on its own thread after an apply, so
+  while a plugin settles the model reads the JSON again every 50 ms
+  (`pluginSettleInterval`), at most 40 times per reload or show
+  (`pluginSettleReads`); a reload cancels the pending read and starts the
+  count again. There is no new callback, and nothing is read per session
+  event or output byte.
+* **The write.** A toggle sets `plugins.enabled` as a whole array, as shown
+  (an edit not yet applied included): on adds the id at the end unless it is
+  listed, off takes every copy of it out; ids this version does not have and
+  the file's order are kept. It goes through the write queue as every other
+  edit (a conflict retried once on top of the other edit, a refusal shown by
+  the toggles with the core's message, sanitised, and the toggles showing
+  the file again). From the moment it is queued until a configuration
+  applied after it (or the write fails), every toggle is disabled and a line
+  says why, as the Profiles list is while its indices move.
+* **Text (S3).** Every text of the JSON (name, version, id, capabilities,
+  message) and every unknown id goes through `SettingsModel.sanitisedMessage`
+  before it is shown; an empty name shows the id. The core already caps and
+  sanitises the manifest's name and version, and writes the messages itself.
+* **VoiceOver.** The toggle's label is the plugin's name, with the hint that
+  it turns the plugin on or off in `config.toml`; status, capabilities and
+  the problem are read as their rows.
+
+Known limits:
+
+* A hand edit of `[plugins] enabled` that lands between the snapshot the
+  pane shows and the toggle's write is overwritten: the last writer of the
+  key wins, as for every scalar.
+* The lock releases on the first apply after the write, which can be an
+  apply of an earlier hand edit; the toggles then edit from that snapshot
+  until the next apply (the wave 22 generation token fixes it).
+* A plugin that takes longer than 2 seconds to start or stop shows
+  Starting… or Stopping… until the pane is shown again or the next apply.
+
