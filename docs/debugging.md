@@ -150,6 +150,7 @@ is not visible, because nothing is drawn then. The other footprint budgets in th
 
 ## Window blur radius fallback
 
+Not reachable in 0.2.0: the app ignores `blur_radius` (#490) until the rework in 0.3.0 (#491).
 `[appearance] blur_radius` above 0 blurs a window through the private call `CGSSetWindowBackgroundBlurRadius`
 (ADR 0045), looked up once at the first window that asks for it. If the lookup fails, every window keeps the
 material blur of ADR 0043 and the app logs one error, category `window`

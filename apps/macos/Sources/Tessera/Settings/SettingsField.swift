@@ -24,7 +24,8 @@ struct SettingsField: Identifiable {
         /// A float, stepped; written coalesced.
         case stepper(ClosedRange<Double>, step: Double, unit: String)
         /// An integer, dragged in steps of 1; written coalesced. 0 shows
-        /// `zeroTitle` instead of the number.
+        /// `zeroTitle` instead of the number. No pane uses it in 0.2.0: it
+        /// was the blur radius slider, which returns in 0.3.0 (#491).
         case integerSlider(ClosedRange<Int64>, zeroTitle: String)
         /// An integer, typed.
         case integer

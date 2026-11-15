@@ -84,8 +84,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
     }
-    /// `[appearance] blur_radius` as last read from the core, 0 while Reduce
-    /// Transparency is on: every window's blur radius (ADR 0045).
+    /// Every window's blur radius (ADR 0045). 0 in 0.2.0, which keeps each
+    /// pane's material blur: the app does not read `[appearance]
+    /// blur_radius` (#490) until the rework in 0.3.0 (#491).
     var windowBlurRadius: UInt32 = 0 {
         didSet {
             for controller in windowControllers {
@@ -627,7 +628,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.readAppAppearance()
             self?.applyKeymap()
             self?.readPaneDimming()
-            self?.readBlurRadius()
             self?.readRemoteIndicator()
             self?.applyProfiles()
             self?.settingsWindowController?.model.reload()
@@ -673,7 +673,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Self.log.error("display options not applied: \(String(describing: error), privacy: .public)")
         }
         readPaneDimming()
-        readBlurRadius()
     }
 
     /// AppKit posts this on the workspace's centre, on the main thread, when
@@ -721,23 +720,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             paneDimming = CGFloat(try core.dimInactivePanes())
         } catch {
             Self.log.error("dim_inactive_panes not read: \(String(describing: error), privacy: .public)")
-        }
-    }
-
-    /// Reads `blur_radius` from the core: after the display options are
-    /// applied (at start and whenever they change) and after every
-    /// configuration it applies (live reload). 0 while Reduce Transparency is
-    /// on: the core reports the configured value whatever the display
-    /// options, and every window is opaque then anyway (ADR 0043 E8). Keeps
-    /// the previous radius if it cannot be read.
-    private func readBlurRadius() {
-        guard let core else { return }
-        do {
-            let radius = try core.blurRadius()
-            let reduced = appliedDisplayOptions?.reduceTransparency ?? reducesTransparency()
-            windowBlurRadius = reduced ? 0 : radius
-        } catch {
-            Self.log.error("blur_radius not read: \(String(describing: error), privacy: .public)")
         }
     }
 
