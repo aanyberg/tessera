@@ -161,6 +161,15 @@ printf '[[profile.default.overrides]]\n%s\ntest-group = "timing"\n' "$real_line"
 change crates/tessera-config/src/lib.rs '// untimed change'
 commit
 
+# Nextest exact-match syntax: `package(=x)` and `binary(=x)` name x, not `=x`.
+branch exact-match
+printf '[[profile.default.overrides]]\nfilter = %s\ntest-group = "timing"\n' \
+    "'(package(=tessera-grid) & binary(=edit)) | (package( = tessera-pty ) & binary( =plugins )) | (package(=tessera-ffi) & test(=x))'" > .config/nextest.toml
+change crates/tessera-grid/src/lib.rs '// untimed change'
+change crates/tessera-pty/src/lib.rs '// untimed change'
+change crates/tessera-ffi/src/lib.rs '// untimed change'
+commit
+
 branch everything
 for b in app-core-lib render-golden render-helper devwin-bin term-devwin overrides; do
     git merge -q --no-edit "$b"
@@ -203,6 +212,7 @@ list term-devwin;       expect 'one alternative per package, each with its own s
 list devwin-only;       expect 'a bin-only package named by an alternative is a bins target' "$header${nl}tessera-devwin:bins" --list-targets
 list overrides;         expect 'nextest overrides' "$header${nl}tessera-config:reload${nl}tessera-term:decscusr${nl}tessera-term:lib" --list-targets
 list real-line;         expect 'one target per binary of an alternative (#273)' "$header${nl}tessera-config:reload${nl}tessera-config:watch_themes" --list-targets
+list exact-match;       expect 'exact-match package(=x) and binary(=x) name x' "$header${nl}tessera-ffi:lib${nl}tessera-grid:edit${nl}tessera-pty:plugins" --list-targets
 list everything
 all="tessera-app-core:lib${nl}tessera-config:reload${nl}tessera-devwin:bins${nl}tessera-render:golden${nl}tessera-render:tests${nl}tessera-term:decscusr${nl}tessera-term:lib"
 expect 'every trigger' "$header${nl}$all" --list-targets
