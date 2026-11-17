@@ -26,7 +26,8 @@
 #             style (xterm-256color's CSI 2 SP q would fix a steady block)
 #   Cs/Cr     cursor colour (OSC 12 / OSC 112)
 #   Ms        clipboard (OSC 52)
-#   smol/rmol overline (SGR 53 / 55)
+#   Smol/Rmol overline (SGR 53 / 55); tmux reads Smol. Not smol/rmol: no
+#   consumer reads the lower-case names (#110)
 #   BE/BD/PS/PE bracketed paste
 #   XM        SGR mouse (1006)
 #   XR/RV     XTVERSION / primary DA queries
@@ -96,7 +97,7 @@ tessera|Tessera terminal emulator,
 	Smulx=\E[4:%p1%dm, Sync=\EP=%p1%ds\E\\,
 	XM=\E[?1006;1000%?%p1%{1}%=%th%el%;, XR=\E[>0q,
 	fd=\E[?1004l, fe=\E[?1004h, kxIN=\E[I, kxOUT=\E[O,
-	rmol=\E[55m, smol=\E[53m,
+	Rmol=\E[55m, Smol=\E[53m,
 	setrgbb=\E[48:2::%p1%d:%p2%d:%p3%dm,
 	setrgbf=\E[38:2::%p1%d:%p2%d:%p3%dm,
 	kDC3=\E[3;3~, kDC4=\E[3;4~, kDC5=\E[3;5~, kDC6=\E[3;6~,

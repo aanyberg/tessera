@@ -35,7 +35,7 @@ via `COLORTERM`) rather than from terminfo.
    on: `fullkbd` (kitty keyboard protocol), `Smulx`/`Setulc`/`Su` (styled
    and coloured underlines), `Tc`/`setrgbf`/`setrgbb` (24-bit colour),
    `Sync` (synchronized output), `XF`/`kxIN`/`kxOUT` (focus events),
-   `Ss`/`Se`, `Cs`/`Cr`, `Ms`, `smol`/`rmol`, bracketed paste and SGR mouse.
+   `Ss`/`Se`, `Cs`/`Cr`, `Ms`, `Smol`/`Rmol`, bracketed paste and SGR mouse.
    The entry is named plainly `tessera`, not `xterm-tessera`: the `xterm-`
    prefix makes some applications assume xterm's exact behaviour, and the
    kitty keyboard protocol is deliberately not that.
@@ -47,6 +47,15 @@ via `COLORTERM`) rather than from terminfo.
    steady block that stops following configuration edits. Under the default
    `TERM=xterm-256color` tmux still sends `\E[2 q`; that entry is not ours
    to change. `tests/decscusr.rs` reads `Se` from the entry and checks it.
+
+   *Amended by #110 (2026-11-17):* the overline capabilities are spelled
+   `Smol`/`Rmol` (SGR 53 / 55), not `smol`/`rmol`. They are user-defined
+   capabilities, as in ncurses' `ecma+overline`, vte-256color, mintty and
+   contour; tmux's `overline` feature reads `Smol` only, so with the
+   lower-case names tmux never sent overline to a Tessera terminal. No
+   consumer reads the lower-case names, so they are gone. `just
+   terminfo-check` requires both and `tests/terminfo.rs` feeds them to a
+   terminal.
 
 3. **Installation is a script, not magic.** `just terminfo-install` compiles
    the entry into `~/.terminfo`; `just terminfo-ssh user@host` streams the

@@ -14,7 +14,7 @@ set -eu
 
 here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 src="$here/tessera.terminfo"
-required="fullkbd Smulx Setulc Su Tc Sync kxIN kxOUT"
+required="fullkbd Smulx Setulc Su Tc Sync kxIN kxOUT Smol Rmol"
 
 usage() {
     sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
@@ -35,7 +35,7 @@ check() {
             status=1
         fi
     done
-    printf '%s\n' "$dump" | grep -E '^[[:space:]]*(fullkbd|Smulx|Setulc|Sync)' || true
+    printf '%s\n' "$dump" | grep -E '^[[:space:]]*(fullkbd|Smulx|Setulc|Sync|Smol|Rmol)' || true
     exit "$status"
 }
 
