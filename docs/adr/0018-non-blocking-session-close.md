@@ -315,3 +315,67 @@ installed to suppress that. This does not break S8 (`docs/security.md`): S8
 covers terminal content in logs, and the hook is host code (`tessera-ffi`'s
 QoS call in production) whose payload carries no terminal content and
 reaches stderr only, never the log.
+
+## Amendment: hangup and kill signal the child's process group (#126, #127, 2026-11-17)
+
+`Pty::hangup`, `Pty::kill` and dropping a `NativePty` used to send `SIGHUP`
+or `SIGKILL` to the child's pid alone, so a grandchild the shell did not
+`exec` (`sh -c "trap '' HUP; sleep 97 & wait"`) outlived the close. They now
+call `killpg(2)` on the child's process group, as xterm (`kill_process_group`
+on cleanup) and kitty (`killpg` after closing the master) do; Alacritty and
+WezTerm signal the pid only. `portable-pty` calls `setsid(2)` in the child,
+so the child leads its own session and process group (pgid = pid), and a
+session leader cannot change its group. Which processes a close reaches:
+
+- The child's own group: the shell and every process it started without
+  job control (`sh -c`, scripts, a non-interactive shell's `&` jobs). They
+  all get the signal.
+- A job a job-control shell moved to a group of its own (an interactive
+  shell's jobs, `set -m`) is not signalled. It gets the kernel's `SIGHUP`
+  only while it is the terminal's foreground group when the session leader
+  dies, and an interactive bash forwards `SIGHUP` to its jobs on a hangup
+  but cannot on a kill. So after a close a background job that ignores
+  `SIGHUP`, or any background job after the reaper's `SIGKILL`, keeps
+  running, as it would after closing an xterm or kitty window. Hunting
+  other groups of the session (`tcgetpgrp`, or every group whose session
+  is the child's) was rejected: those are the user's jobs, and `nohup`-style
+  survival is their intent.
+- Signals stay `SIGHUP` (hangup, drop) and `SIGKILL` (kill, the reaper after
+  `HANGUP_GRACE`); there is no `SIGTERM` and no new escalation.
+
+The phase lock still decides whether anything is signalled: `killpg` runs
+under it while the phase is `Running`, so the child (alive or a zombie)
+still holds its pid and with it the group id, and neither can have been
+reused. Once the reader thread has started reaping, nothing is signalled,
+so members of a group whose leader was already reaped are not hunted
+either. macOS answers `EPERM` for a group whose only member is the child's
+zombie (not yet reaped by the reader thread), where `kill(pid)` returned 0;
+`EPERM` and `ESRCH` count as success. A pid of 0 or 1 is refused before any
+signal (`killpg(0)` would signal Tessera's own group).
+
+Exec failures (#127). `portable-pty`'s `pre_exec` closes every descriptor
+above 2, including the pipe through which the standard library reports an
+`exec` error, so such a failure made a spawn that returned `Ok` and a child
+that aborted at once (`Signaled(SIGABRT)`). The issue's headline case, a
+file without a `#!` line (`ENOEXEC`), is not one of them: `execvp(3)` runs
+it with `/bin/sh`, and it keeps running. `NativePty::spawn` now checks,
+before it opens the PTY, the one failure class that can be seen from the
+file: a `#!` script whose interpreter is missing, not a regular file or not
+executable, including a script saved with CRLF line endings (interpreter
+`/bin/sh\r`). It resolves the program as `portable-pty` will (the login
+shell, an absolute path, `./` against the working directory, else the
+command's `PATH`), reads at most the first 512 bytes (XNU's `IMG_SHSIZE`)
+into a fixed array, opening a regular file only, read-only and
+non-blocking, and parses the `#!` line as XNU does (the line ends at `\n`
+or `#` within those bytes, the interpreter at a blank or NUL). The refusal
+is `PtyError::Spawn` naming the interpreter and `ENOENT` or `EACCES`; no
+new error variant. An interpreter that is itself a script is not
+inspected (it is an `ENOEXEC` that runs). Still reported only by the
+child's death: `EBADARCH` and `EBADMACHO` (fat or Mach-O files that do not
+load), `ENOMEM`, and a file changed between the check and the `exec`
+(`Signaled(SIGABRT)`); a binary that code signing rejects, or one open for
+writing, execs and is then killed (`Signaled(SIGKILL)`). `ETXTBSY` does not
+occur on macOS. A fork/exec wrapper or a `portable-pty` patch that keeps
+the error pipe was out of scope. The cases and what exec does with each
+are in `crates/tessera-pty/tests/fixtures/exec_spec.txt`, which a test
+replays against this machine's exec.

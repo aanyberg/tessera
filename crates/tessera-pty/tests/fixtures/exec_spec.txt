@@ -1,0 +1,86 @@
+# What exec does with each kind of program file, and what NativePty::spawn
+# must do with it (issue #127). Measured on macOS 27.2 (arm64, /bin/sh =
+# bash 3.2.57) with fork + execve / execvp and through portable-pty 0.9.0;
+# the B rows are the spec-researcher's (wave 24, task 24.3), the E rows
+# were added while implementing the #! interpreter pre-check.
+#
+# `tests/spawn.rs` (`exec_spec_fixture`, macOS only) builds every file in
+# a temporary directory and spawns each row whose `tessera` column is not
+# `doc`.
+#
+# Columns, separated by " | ":
+#   id       file name in the temporary directory; rows ending in `i` are
+#            helpers (an interpreter another row names) and are not spawned
+#   kind     file   regular file, mode 755, holding `content`
+#            nox    regular file, mode 644, holding `content`
+#            dir    directory, mode 755 (`content` empty)
+#            fifo   named pipe, mode 755 (`content` empty)
+#            link   symbolic link to `content` (`$DIR/` names a row's file)
+#            none   nothing is created (a missing program)
+#   content  bytes with escapes \n \r \t \0 \xHH \\, `$DIR` for the
+#            temporary directory, `{c*N}` for N copies of the character c
+#   execve   errno of execve(2), or `ok`
+#   execvp   what execvp(3) does: `sh` = retries through /bin/sh (ENOEXEC
+#            only), `ok`, or the errno it returns
+#   tessera  what spawn must do:
+#            runs <exit> [<text>]   spawns; the child exits with <exit>
+#                                   after printing <text>
+#            refused <ERRNO>        PtyError::Spawn naming <ERRNO>, before
+#                                   any fork (the #! interpreter pre-check)
+#            refused-pp <text>      PtyError::Spawn from portable-pty's own
+#                                   checks (reason contains <text>), no fork
+#            returns                spawn returns (Ok or Err) without
+#                                   blocking; the outcome is not pinned
+#            doc                    not spawned; the note says why
+#   note     free text
+#
+# id | kind | content | execve | execvp | tessera | note
+B1 | file | echo hello-from-sh\n | ENOEXEC | sh | runs 0 hello-from-sh | no #!: execvp runs it with /bin/sh, must keep working
+B2 | file |  | ENOEXEC | sh | runs 0 | empty file
+B3 | file | #! | ENOEXEC | sh | runs 0 | #! alone, no line end
+B3b | file | #! \n | ENOEXEC | sh | runs 0 | the line ends before an interpreter
+B4 | file | #!/nonexistent/interp\necho x\n | ENOENT | ENOENT | refused ENOENT | used to abort after a successful spawn (SIGABRT)
+B5 | file | #!/bin/sh\r\necho crlf\r\n | ENOENT | ENOENT | refused ENOENT | CRLF: the interpreter is "/bin/sh\r"
+B6i | nox | echo interp\n | EACCES | EACCES | doc | interpreter of B6
+B6 | file | #!$DIR/B6i\necho x\n | EACCES | EACCES | refused EACCES | interpreter without x permission
+B7i | dir |  | EACCES | EACCES | doc | interpreter of B7
+B7 | file | #!$DIR/B7i\n | EACCES | EACCES | refused EACCES | interpreter is a directory
+B8i | file | #!/bin/sh\necho interp\n | ok | ok | doc | interpreter of B8
+B8 | file | #!$DIR/B8i\necho chained\n | ENOEXEC | sh | runs 0 chained | interpreter is itself a script: ENOEXEC, so sh runs the outer file
+B9 | file | #!/usr/bin/env sh\necho env-sh\n | ok | ok | runs 0 env-sh | env finds sh
+B9b | file | #!/usr/bin/env tessera-no-such-tool-xyz\n | ok | ok | runs 127 | exec succeeds; env itself exits 127
+B10 | file | #!/bin/sh -e\necho with-arg\n | ok | ok | runs 0 with-arg | the interpreter ends at the first blank
+B11 | file | #!/bin/{x*600}\necho long\n | ENOEXEC | sh | runs 0 long | no line end in the first 512 bytes: no #! line
+B11b | file | #!/bin/sh{ *503}\necho pad\n | ENOEXEC | sh | runs 0 pad | the \n is byte 512, one past the header
+B11c | file | #!/bin/sh{ *490}\necho pad\n | ok | ok | runs 0 pad | the \n is inside the header
+B11d | file | #!/nonexistent{ *600}\necho long\n | ENOEXEC | sh | runs 0 long | a missing interpreter past the header is not refused
+B12 | doc |  | ok | ok | doc | Mach-O thin and fat (/bin/echo, /bin/sh): spawn_tests run them every day
+B13 | doc |  | EBADARCH | EBADARCH | doc | fat magic cafebabe + garbage (also a Java .class): aborts after spawn (SIGABRT); not pre-checked (needs the fat arch list)
+B14 | file | \xcf\xfa\xed\xfegarbage\n | ENOEXEC | sh | runs 127 | Mach-O magic + garbage: sh runs it as a command, not found
+B15 | file | \x8c\x99\0\x01garbage\n | ENOEXEC | sh | runs 126 | binary garbage: sh refuses to run it
+B16 | doc |  | ok | ok | doc | a copy of /bin/echo: exec succeeds, AMFI then kills it (SIGKILL); not pre-checkable
+B17 | doc |  | ok | ok | doc | ETXTBSY: macOS never returns it (a Mach-O open for writing execs, then SIGKILL)
+B18 | doc |  | ENOMEM | ENOMEM | doc | ENOMEM: not reproducible; would abort after spawn (SIGABRT); not pre-checkable
+B19 | dir |  | EACCES | EACCES | refused-pp directory | portable-pty refuses a directory
+B20 | nox | #!/bin/sh\necho x\n | EACCES | EACCES | refused-pp not executable | portable-pty refuses a file without x permission
+B21 | none |  | ENOENT | ENOENT | refused-pp exist | portable-pty refuses a missing program
+B22 | link | $DIR/B1 | ENOEXEC | sh | runs 0 hello-from-sh | a symbolic link is followed, as exec follows it
+B22b | link | $DIR/B4 | ENOENT | ENOENT | refused ENOENT | the pre-check follows the link too
+B23 | file | \x20#!/bin/sh\necho lead\n | ENOEXEC | sh | runs 0 lead | #! must be the first two bytes
+B23b | file | \xef\xbb\xbf#!/bin/sh\necho bom\n | ENOEXEC | sh | runs 0 bom | a UTF-8 BOM before #!: sh complains about line 1, runs the rest
+B24 | doc |  | E2BIG | E2BIG | doc | PtyError::ArgumentsTooLong before the fork (#74, its own tests)
+E1 | file | #!/bin/sh#x\necho hash-eol\n | ok | ok | runs 0 hash-eol | XNU ends the line at # as well as \n
+E2 | file | #!\t/bin/sh\necho tab\n | ok | ok | runs 0 tab | blanks (space, tab) before the interpreter are skipped
+E3 | file | #!/bin/sh\0junk\necho nul\n | ok | ok | runs 126 | the interpreter stops at a NUL; sh then refuses the binary file
+E4 | file | #!tessera-relative-missing\necho rel\n | ENOENT | ENOENT | refused ENOENT | a relative interpreter is looked up in the child's working directory
+E5 | file | #!#/bin/sh\necho hashfirst\n | ENOEXEC | sh | runs 0 hashfirst | the line ends before an interpreter
+E6 | file | #!/nonexistent/x#\n | ENOENT | ENOENT | refused ENOENT | # ends the interpreter
+E7 | file | #!\0/nonexistent\n | ENOENT | ENOENT | refused ENOENT | an empty interpreter
+E8i | fifo |  | EACCES | EACCES | doc | interpreter of E8
+E8 | file | #!$DIR/E8i\n | EACCES | EACCES | refused EACCES | interpreter is a FIFO
+E9i | link | /bin/sh | ok | ok | doc | interpreter of E9
+E9 | file | #!$DIR/E9i\necho via-link\n | ok | ok | runs 0 via-link | an interpreter reached through a symbolic link
+E10i | file | #!/bin/sh\r\n | ENOENT | ENOENT | doc | interpreter of E10
+E10 | file | #!$DIR/E10i\necho chain\n | ENOEXEC | sh | runs 0 chain | the interpreter's own #! line is never checked
+E11 | fifo |  | EACCES | EACCES | returns | a FIFO named as the program is never opened, so spawn cannot block on it
+E12 | file | #!E9i\necho rel-ok\n | ok | ok | runs 0 rel-ok | a relative interpreter found in the working directory
