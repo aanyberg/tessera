@@ -417,6 +417,20 @@ enum FontFamilies {
     }()
 }
 
+/// What `SettingsPanels.present` may do with an open panel: `NSOpenPanel`
+/// is the only conformer outside tests. A test seam: a recording panel
+/// shows how `present` ran it without a real panel, whose out-of-process
+/// bridge can block the main thread for a minute (#492).
+@MainActor
+protocol SettingsOpenPanel: AnyObject {
+    var url: URL? { get }
+    func beginSheetModal(for window: NSWindow, completionHandler handler: @escaping (NSApplication.ModalResponse) -> Void)
+    func begin(completionHandler handler: @escaping (NSApplication.ModalResponse) -> Void)
+    func runModal() -> NSApplication.ModalResponse
+}
+
+extension NSOpenPanel: SettingsOpenPanel {}
+
 /// The open panels the panes show, as sheets on the Settings window.
 @MainActor
 enum SettingsPanels {
@@ -445,7 +459,9 @@ enum SettingsPanels {
 
     /// Shows `panel` as a sheet on `window` (on its own without one, not
     /// app-modal) and calls `chosen` with what was chosen, if anything was.
-    static func present(_ panel: NSOpenPanel, on window: NSWindow?, chosen: @escaping @MainActor (URL) -> Void) {
+    static func present(
+        _ panel: some SettingsOpenPanel, on window: NSWindow?, chosen: @escaping @MainActor (URL) -> Void
+    ) {
         let done: (NSApplication.ModalResponse) -> Void = { response in
             guard response == .OK, let url = panel.url else { return }
             MainActor.assumeIsolated { chosen(url) }

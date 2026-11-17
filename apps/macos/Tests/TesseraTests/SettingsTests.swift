@@ -1,4 +1,5 @@
 import AppKit
+import OSLog
 import SwiftUI
 import XCTest
 
@@ -1541,22 +1542,64 @@ extension SettingsTests {
     /// the window the app opens is the model's, which the panes' Choose…
     /// and Import Theme… present their panels on. (Those two SwiftUI
     /// buttons take no synthetic click in a hosted window, so the test
-    /// presents the panels as they do.)
-    func testTheOpenPanelsAreSheetsOnTheSettingsWindow() async throws {
+    /// presents a panel as they do: a recording one, since a real panel's
+    /// bridge can block the main thread for a minute in a full run, #492.)
+    func testTheOpenPanelsAreSheetsOnTheSettingsWindow() throws {
         let model = try openSettings(config: "")
         let controller = try XCTUnwrap(appDelegate.settingsWindowController)
         let window = try XCTUnwrap(controller.window)
         XCTAssertTrue(model.window === window, "the panels' window is the Settings window")
-        for panel in [SettingsPanels.directoryPanel(), SettingsPanels.themeFilePanel()] {
-            var chosen: [URL] = []
-            SettingsPanels.present(panel, on: model.window) { chosen.append($0) }
-            try await waitUntil("a sheet") { window.attachedSheet != nil }
-            XCTAssertTrue(window.attachedSheet === panel)
-            XCTAssertNil(NSApp.modalWindow, "not app-modal")
-            window.endSheet(panel, returnCode: .cancel)
-            try await waitUntil("the sheet ends") { window.attachedSheet == nil }
-            XCTAssertEqual(chosen, [], "cancelled: nothing chosen")
+        var chosen: [URL] = []
+
+        let cancelled = RecordingOpenPanel(url: URL(filePath: "/tmp/not-chosen"))
+        SettingsPanels.present(cancelled, on: model.window) { chosen.append($0) }
+        XCTAssertEqual(cancelled.runs, [.sheet(on: ObjectIdentifier(window))], "a sheet on the Settings window")
+        XCTAssertEqual(chosen, [], "nothing chosen while the sheet is open")
+        cancelled.end(.cancel)
+        XCTAssertEqual(chosen, [], "cancelled: nothing chosen")
+
+        let file = URL(filePath: "/tmp/scheme.itermcolors")
+        let picked = RecordingOpenPanel(url: file)
+        SettingsPanels.present(picked, on: model.window) { chosen.append($0) }
+        XCTAssertEqual(picked.runs, [.sheet(on: ObjectIdentifier(window))])
+        picked.end(.OK)
+        XCTAssertEqual(chosen, [file], "chosen: the panel's URL")
+
+        // Without a window: on its own, still not app-modal.
+        let alone = RecordingOpenPanel(url: file)
+        SettingsPanels.present(alone, on: nil) { chosen.append($0) }
+        XCTAssertEqual(alone.runs, [.alone])
+    }
+
+    /// A real open panel (the directory one) becomes a sheet on the
+    /// Settings window, not app-modal. Skipped when the panel's
+    /// out-of-process bridge did not start, which in a full run can take a
+    /// minute to time out (`Assertion failure in -[NSOpenPanel
+    /// _initBridgeAndStuff]`, #492) and says nothing of `present`.
+    func testARealOpenPanelIsASheetOnTheSettingsWindow() async throws {
+        let model = try openSettings(config: "")
+        let window = try XCTUnwrap(model.window)
+        let log = try OSLogStore(scope: .currentProcessIdentifier)
+        let since = log.position(date: Date())
+        let start = ContinuousClock.now
+        let panel = SettingsPanels.directoryPanel()
+        // The bridge starts in the panel's init and gives up after a
+        // minute; reading the log takes seconds, so only a slow init does.
+        if ContinuousClock.now - start > .seconds(10) {
+            let bridgeFailed = try log.getEntries(
+                at: since, matching: NSPredicate(format: "composedMessage CONTAINS %@", "_initBridgeAndStuff")
+            ).contains { _ in true }
+            try XCTSkipIf(bridgeFailed, "the open panel's bridge did not start (#492)")
         }
+        defer { if window.attachedSheet === panel { window.endSheet(panel, returnCode: .cancel) } }
+        var chosen: [URL] = []
+        SettingsPanels.present(panel, on: window) { chosen.append($0) }
+        try await waitUntil("a sheet") { window.attachedSheet != nil }
+        XCTAssertTrue(window.attachedSheet === panel)
+        XCTAssertNil(NSApp.modalWindow, "not app-modal")
+        window.endSheet(panel, returnCode: .cancel)
+        try await waitUntil("the sheet ends") { window.attachedSheet == nil }
+        XCTAssertEqual(chosen, [], "cancelled: nothing chosen")
     }
 
     /// Text typed into a field and not committed, which the model holds
@@ -2222,5 +2265,43 @@ final class ManualClock: SettingsClock {
             if !timer.isCancelled { action() }
         }
         now = target
+    }
+}
+
+/// An open panel that records how `SettingsPanels.present` ran it, and
+/// ends when the test says (#492).
+@MainActor
+private final class RecordingOpenPanel: SettingsOpenPanel {
+    enum Run: Equatable {
+        case sheet(on: ObjectIdentifier)
+        case alone
+        case modal
+    }
+
+    private(set) var runs: [Run] = []
+    let url: URL?
+    private var handler: ((NSApplication.ModalResponse) -> Void)?
+
+    init(url: URL?) { self.url = url }
+
+    func beginSheetModal(for window: NSWindow, completionHandler handler: @escaping (NSApplication.ModalResponse) -> Void) {
+        runs.append(.sheet(on: ObjectIdentifier(window)))
+        self.handler = handler
+    }
+
+    func begin(completionHandler handler: @escaping (NSApplication.ModalResponse) -> Void) {
+        runs.append(.alone)
+        self.handler = handler
+    }
+
+    func runModal() -> NSApplication.ModalResponse {
+        runs.append(.modal)
+        return .cancel
+    }
+
+    func end(_ response: NSApplication.ModalResponse) {
+        let handler = handler
+        self.handler = nil
+        handler?(response)
     }
 }
