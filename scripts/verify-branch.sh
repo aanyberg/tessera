@@ -156,6 +156,8 @@ filter_targets() {
             $a =~ s/^\s+|\s+$//g;
             my ($p) = $a =~ /package\(([^)]*)\)/ or next;
             my @b = $a =~ /binary\(([^)]*)\)/g;
+            # Exact-match syntax `package(=x)` / `binary(=x)` names x; the `=` is not part of the name.
+            for ($p, @b) { s/^\s*=\s*//; s/^\s+|\s+$//g }
             if (@b) { print "$p $_\n" for @b } else { print "$p \n" }
         }
     ' -- "$1"
