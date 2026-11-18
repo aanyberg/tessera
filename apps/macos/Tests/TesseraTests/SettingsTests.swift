@@ -1689,15 +1689,25 @@ extension SettingsTests {
     /// watch waits 100 ms to 1 s) edits on with the model that made it,
     /// still locked: an edit of the stale list's last profile would land
     /// past the end of the file's and make a nameless profile. Opened the
-    /// way the app opens it.
+    /// way the app opens it. The watch can apply the delete before the
+    /// reopen on a loaded machine: that attempt is made again, a few times
+    /// at most (#455 m1).
     func testSettingsOpenedAgainBeforeADeleteAppliesStaysLocked() async throws {
-        let model = try openSettings(config: Self.threeProfilesTOML)
-        XCTAssertEqual(model.profiles.map(\.name), ["one", "two", "three"])
-        XCTAssertTrue(model.deleteProfile(1))
-        try XCTUnwrap(appDelegate.settingsWindowController).close()
-        XCTAssertNil(appDelegate.settingsWindowController)
-        // Written, and the watch (100 ms at least) not yet applied it.
-        try await waitUntil("the delete written") { !model.isWriting }
+        var attempts = 0
+        var model: SettingsModel
+        repeat {
+            attempts += 1
+            model = try openSettings(config: Self.threeProfilesTOML)
+            XCTAssertEqual(model.profiles.map(\.name), ["one", "two", "three"])
+            XCTAssertTrue(model.deleteProfile(1))
+            try XCTUnwrap(appDelegate.settingsWindowController).close()
+            XCTAssertNil(appDelegate.settingsWindowController)
+            try await waitUntil("the delete written") { !model.isWriting }
+            // Nothing awaited from here to the reopen: the watch's apply (on
+            // the main actor) cannot come in between.
+            if appDelegate.waitingSettingsModel === model { break }
+            guard attempts < 5 else { throw XCTSkip("the watch applied each delete before the reopen") }
+        } while true
         MainMenu.run(command: "settings")
         let reopened = try XCTUnwrap(appDelegate.settingsWindowController?.model)
         XCTAssertTrue(reopened === model, "the model that made the delete")

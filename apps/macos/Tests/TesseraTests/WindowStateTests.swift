@@ -31,6 +31,61 @@ final class CountingDefaults: UserDefaults, @unchecked Sendable {
     }
 }
 
+/// The defaults suites the tests name, `com.aanyberg.tessera.tests.<UUID>`,
+/// and the files of such suites left in ~/Library/Preferences: by the
+/// termination-signal child hosts before #496, whose suites are now paths
+/// in their own temporary directories (``TerminationSignalTests``), and by
+/// any host killed before its cleanup. cfprefsd writes what another process
+/// saved to a suite's file seconds later, in batches, and an empty domain
+/// as a 42-byte file after `removePersistentDomain(forName:)`, so a file
+/// deleted at once comes back. Only names with this prefix and a UUID are
+/// ever touched.
+enum TestDefaultsSuite {
+    static let prefix = "com.aanyberg.tessera.tests."
+
+    /// A new suite name, unique to the caller.
+    static func make() -> String {
+        prefix + UUID().uuidString
+    }
+
+    /// Where cfprefsd keeps the user's domains.
+    static var preferencesDirectory: URL {
+        FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Preferences", isDirectory: true)
+    }
+
+    /// The file of `suite` in `directory`, for a name from ``make()``;
+    /// `nil` for any other name.
+    static func file(of suite: String, in directory: URL = preferencesDirectory) -> URL? {
+        guard suite.hasPrefix(prefix), UUID(uuidString: String(suite.dropFirst(prefix.count))) != nil else {
+            return nil
+        }
+        return directory.appendingPathComponent(suite + ".plist")
+    }
+
+    /// Deletes the files of the suites last changed more than `age` ago,
+    /// which a host killed before its cleanup left: once per run, at the
+    /// test bundle's start (``HostDisplaySettings``). A younger file may be
+    /// a run's in another worktree. Returns how many it deleted.
+    @discardableResult
+    static func sweep(
+        in directory: URL = preferencesDirectory, olderThan age: TimeInterval = 3600, now: Date = Date()
+    ) -> Int {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
+        var deleted = 0
+        for name in names where name.hasSuffix(".plist") {
+            guard let file = file(of: String(name.dropLast(".plist".count)), in: directory),
+                let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?
+                    .contentModificationDate,
+                now.timeIntervalSince(modified) > age,
+                (try? FileManager.default.removeItem(at: file)) != nil
+            else { continue }
+            deleted += 1
+        }
+        return deleted
+    }
+}
+
 /// Each window's frame and tab count are saved as they change and on quit,
 /// and recreated at launch with fresh shells (ADR 0031, D4c).
 @MainActor
@@ -43,7 +98,7 @@ final class WindowStateTests: XCTestCase {
         appDelegate = try XCTUnwrap(NSApp.delegate as? AppDelegate)
         appDelegate.spawnOptions = .init(program: "/bin/cat")
         XCTAssertNil(appDelegate.windowStateStore, "hosted tests must not save to the user's defaults")
-        suiteName = "com.aanyberg.tessera.tests.\(UUID().uuidString)"
+        suiteName = TestDefaultsSuite.make()
         defaults = try XCTUnwrap(CountingDefaults(suiteName: suiteName))
         XCTAssertTrue(appDelegate.windowControllers.isEmpty, "a previous test left windows open")
     }
@@ -66,6 +121,56 @@ final class WindowStateTests: XCTestCase {
 
     private static let screen = CGRect(x: 0, y: 0, width: 1440, height: 875)
     private static let secondScreen = CGRect(x: 1440, y: -200, width: 1920, height: 1055)
+
+    // MARK: The tests' suites
+
+    /// The sweep at the test bundle's start deletes the files of test
+    /// suites older than an hour and nothing else: not a younger one (a run
+    /// in another worktree may be using it), not another domain's, not a
+    /// name with the prefix but no UUID after it, and not a lock file.
+    func testTheSweepDeletesOnlyOldFilesOfTestSuites() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-sweep-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let now = Date()
+        let old = now.addingTimeInterval(-3601)
+        let stale = [TestDefaultsSuite.make(), TestDefaultsSuite.make()].map { $0 + ".plist" }
+        let kept: [(name: String, modified: Date)] = [
+            (TestDefaultsSuite.make() + ".plist", now.addingTimeInterval(-3599)),
+            ("com.aanyberg.tessera.plist", old),
+            ("com.aanyberg.tessera.tests.plist", old),
+            ("com.aanyberg.tessera.tests.not-a-uuid.plist", old),
+            ("com.aanyberg.tessera.testsx\(UUID().uuidString).plist", old),
+            ("com.apple.Terminal.plist", old),
+            (TestDefaultsSuite.make() + ".plist.lockfile", old),
+            (TestDefaultsSuite.make(), old),
+        ]
+        for (name, modified) in stale.map({ ($0, old) }) + kept {
+            let file = dir.appendingPathComponent(name)
+            XCTAssertTrue(FileManager.default.createFile(atPath: file.path, contents: Data("x".utf8)))
+            try FileManager.default.setAttributes([.modificationDate: modified], ofItemAtPath: file.path)
+        }
+
+        XCTAssertEqual(TestDefaultsSuite.sweep(in: dir, now: now), stale.count)
+        let left = try Set(FileManager.default.contentsOfDirectory(atPath: dir.path))
+        XCTAssertEqual(left, Set(kept.map(\.name)))
+        XCTAssertEqual(TestDefaultsSuite.sweep(in: dir, now: now), 0, "nothing more")
+    }
+
+    /// Only a test suite's own file is ever deleted.
+    func testOnlyATestSuitesFileIsDeleted() {
+        let suite = TestDefaultsSuite.make()
+        XCTAssertEqual(
+            TestDefaultsSuite.file(of: suite)?.path,
+            FileManager.default.homeDirectoryForCurrentUser.path + "/Library/Preferences/\(suite).plist")
+        for name in [
+            "com.aanyberg.tessera", "com.aanyberg.tessera.tests", "com.aanyberg.tessera.tests.", "com.apple.Terminal",
+            "com.aanyberg.tessera.tests.\(UUID().uuidString)/../com.aanyberg.tessera",
+            "../com.aanyberg.tessera.tests.\(UUID().uuidString)",
+        ] {
+            XCTAssertNil(TestDefaultsSuite.file(of: name), name)
+        }
+    }
 
     // MARK: Store
 
