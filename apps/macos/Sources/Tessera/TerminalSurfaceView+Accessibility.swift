@@ -51,6 +51,8 @@ extension TerminalSurfaceView {
     /// Ignored (D-6): it would move neither the cursor nor the selection.
     override func setAccessibilitySelectedTextRange(_ range: NSRange) {}
 
+    /// The keyboard focus: the view is the first responder of the key
+    /// window. Output is announced only while this holds (D10).
     override func isAccessibilityFocused() -> Bool {
         guard let window else { return false }
         return window.isKeyWindow && window.firstResponder === self
@@ -226,12 +228,22 @@ struct MainQueueAccessibilityScheduler: AccessibilityScheduling {
 ///   `NSApp`, ``announcementPriority``) before `valueChanged`, and a moved
 ///   cursor or selection posts `selectedTextChanged`. A cursor that only
 ///   moved posts that alone. `layoutChanged` is never posted.
+/// - Only the element with the keyboard focus announces
+///   (`isAccessibilityFocused()`: the first responder of the key window,
+///   D10): output in a background window or tab or an unfocused pane
+///   posts `valueChanged` and `selectedTextChanged` alone, and is not
+///   announced later either: a change that finds the focus gained takes a
+///   snapshot and tells it without a post, so the settle reads only what
+///   comes after, and a settle that finds a gain no change saw announces
+///   nothing. Output just before the focus leaves is not announced
+///   (only the element focused at the settle speaks).
 /// - Attaching posts one `valueChanged` (the same way, so within the
 ///   budget); detaching drops the snapshots. A view out of its window
 ///   posts nothing.
 ///
-/// Per output callback the work is a few stores, whatever the rate; at
-/// most one timer is pending and two snapshots are held. Text is never
+/// Per output callback the work is a few stores and a focus check,
+/// whatever the rate (a snapshot only on a focus gain); at most one timer
+/// is pending and two snapshots are held. Text is never
 /// logged (S8).
 @MainActor
 final class TerminalAccessibility {
@@ -264,6 +276,9 @@ final class TerminalAccessibility {
     private var firstChange: CFTimeInterval?
     private var lastChange: CFTimeInterval = 0
     private var settleScheduled = false
+    /// Whether the element had the keyboard focus at the last change or
+    /// settle (D10).
+    private var wasFocused = false
     /// When the posts of the last second went out, oldest first.
     private var postTimes: [CFTimeInterval] = []
 
@@ -285,10 +300,19 @@ final class TerminalAccessibility {
     }
 
     /// The view's content may have changed (output, a scroll, a selection,
-    /// a resize): called per output callback, so it only stores.
+    /// a resize, a focus change): called per output callback, so it only
+    /// stores, but for a snapshot when it finds the focus gained.
     func contentChanged() {
         cached = nil
         guard isClientAttached else { return }
+        let focused = element?.isAccessibilityFocused() == true
+        if focused && !wasFocused && told != nil {
+            // The focus came (D10): what was printed before it is told
+            // without a post, so it is never announced.
+            told = try? textProvider()
+            cached = told
+        }
+        wasFocused = focused
         let now = scheduler.now
         if firstChange == nil { firstChange = now }
         lastChange = now
@@ -353,16 +377,25 @@ final class TerminalAccessibility {
         cached = current
         let previous = told
         told = current
+        // Only the focused element's output is read (D10), and only once
+        // a change saw the focus: a gain seen first here may follow output
+        // printed before it.
+        let focused = element.isAccessibilityFocused()
+        let mayAnnounce = focused && wasFocused
+        wasFocused = focused
         guard let previous else {
             post(element, .valueChanged)
             return
         }
         if current.string != previous.string {
-            let announcement = current.announcement(since: previous)
-            if !announcement.allSatisfy(\.isWhitespace) {
-                post(
-                    NSApp as Any, .announcementRequested,
-                    [.announcement: announcement, .priority: Self.announcementPriority.rawValue])
+            // The announcement goes to the app, with no source.
+            if mayAnnounce {
+                let announcement = current.announcement(since: previous)
+                if !announcement.allSatisfy(\.isWhitespace) {
+                    post(
+                        NSApp as Any, .announcementRequested,
+                        [.announcement: announcement, .priority: Self.announcementPriority.rawValue])
+                }
             }
             post(element, .valueChanged)
         }

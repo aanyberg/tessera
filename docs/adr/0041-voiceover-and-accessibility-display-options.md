@@ -1,6 +1,7 @@
 # ADR 0041: VoiceOver, Increase Contrast and Reduce Motion
 
-**Status:** accepted · 2026-11-08
+**Status:** accepted · 2026-11-08 · amended 2026-11-18 (#357: D10, the
+manual checks, the known limit)
 
 ## Context
 
@@ -80,10 +81,14 @@ size (a clear) the lines from the top to the cursor are. At most
 `MAX_ANNOUNCEMENT_CHARS` (1024, `TESSERA_MAX_ANNOUNCEMENT_CHARS`)
 characters, the newest kept, cut between characters (D-5).
 
-Accepted limit: output arriving in the same settle (0.15 s after the last
-change, at most 1 s) as a resize, screen switch or Cmd-K is not announced,
-because the suppression compares only the two snapshots of one settle
-(tracked in #357).
+Known limit (M-C2-1): output arriving in the same settle (0.15 s after the
+last change, at most 1 s) as a resize, screen switch or Cmd-K is not
+announced, because the suppression compares only the two snapshots of one
+settle: the `git commit` summary printed right after vim quits, or up to
+1 s of build output during a split. The direction for the fix, left to
+0.3.0: on leaving the alternate screen compare with the last primary-screen
+snapshot told (output on the alternate screen pushes no lines), and keep a
+baseline per line epoch.
 
 **Notifications are bounded (S6).** `TerminalAccessibility` (one per view)
 tells VoiceOver about output:
@@ -99,6 +104,28 @@ tells VoiceOver about output:
   so it queues after what VoiceOver is saying, D-4; iTerm2 uses high)
   before `valueChanged`; a moved cursor or selection posts
   `selectedTextChanged`. `layoutChanged` is never posted.
+- Only the pane with the keyboard focus announces (D10): the view that
+  is the first responder of the key window, its `isAccessibilityFocused`.
+  An announcement goes to `NSApp` and names no source, so output in a
+  background window or tab or in an unfocused pane is not announced: its
+  settle posts `valueChanged` and `selectedTextChanged` only, and records
+  the snapshot, so focusing the pane later does not read what it missed.
+  That holds with a settle still pending when the focus comes (24.16 M1):
+  the change the focus gain makes (first responder or key window) takes a
+  snapshot and records it without a post, so the settle reads only output
+  after the focus (VoiceOver reads the element the focus moved to
+  itself); a gain only the settle sees (no change told the view)
+  announces nothing. Accepted: output printed just before the focus
+  leaves, within the same settle, is never announced, since only the pane
+  focused at the settle speaks.
+  Nothing is announced while another application is active or the pane's
+  find field has the keyboard. macOS reports where the VoiceOver cursor
+  is through no public API; when VoiceOver moves the keyboard focus with
+  its cursor (it sets the element's AXFocused, which AppKit makes the
+  first responder) the pane it lands on announces, and a pane the
+  VoiceOver cursor reads without the keyboard focus stays silent. iTerm2
+  announces every session's output; this is quieter, and says only what
+  the user is looking at.
 - At most 10 posts in any second per view (a settle is delayed until the
   last second's posts leave room for its three), at most one timer
   pending, two snapshots held.
@@ -132,7 +159,10 @@ change, and new ones start with the setting.
   (the cached one is kept until the content changes). It holds the text,
   a few kB for a normal view and at most `MAX_TEXT_UNITS` (8 MiB), plus a
   4-byte offset per cell whatever the text (8 MiB at 1024x2048): about
-  16 MiB at most. The app holds two per view (the cached one and the last
+  16 MiB in the core. The wrapper also copies the text into a Swift
+  `String` (UTF-8: up to three bytes per UTF-16 unit, so at most 12 MiB,
+  2 MiB for a full 1024x2048 grid of plain text), so about 28 MiB at most
+  per snapshot. The app holds two per view (the cached one and the last
   told).
 - Terminal content now reaches assistive clients, as on screen. It reaches
   only the processes macOS lets query the app's accessibility tree (those
@@ -143,12 +173,29 @@ change, and new ones start with the setting.
 
 ## Manual checks
 
-These need a person at the keyboard; tests cover the selector and the
-setter, not what the system does with them.
+These need a person at the keyboard; tests cover the selector, the setter
+and the focus gate, not what the system does with them.
 
 - Full Keyboard Access on (System Settings, Accessibility, Keyboard),
-  VoiceOver off: type `echo a b` and Return in a pane; the shell prints
-  `a b` (Space reaches the shell).
+  VoiceOver off: click into a pane first, so it has the keyboard focus
+  (Full Keyboard Access's focus ring may start elsewhere in the window),
+  then type `echo a b` and Return; the shell prints `a b` (Space reaches
+  the shell). With Full Keyboard Access and VoiceOver both on, Space may
+  be swallowed, as in iTerm2: that combination is not part of the check.
+  If Space does not reach the shell with VoiceOver off, the fallback is a
+  no-op `setAccessibilityContents(_:)` beside the `setAccessibilityValue`
+  one; it is not added unless this check fails.
 - VoiceOver on: QuickNav (Left and Right arrows together) toggles and the
   arrows move through the text; VoiceOver reads new output and follows the
   cursor.
+- VoiceOver on, two windows, the first split: make them with New Window
+  (⌘N) twice and, in the first, Split Right (⌘D, in the
+  Shell menu). Background window: type `sleep 3; echo far` there, then
+  click into the other window within 3 s: `far` is not read, then or once
+  you click back. Unfocused pane: in the left pane type `sleep 3; echo
+  near`, then click the right pane within 3 s: `near` is not read. Move
+  the VoiceOver cursor into the left pane (VO-Right Arrow, or VO-Command
+  with the arrows) without clicking: output there (`sleep 3; echo
+  cursor`) is read only if VoiceOver moved the keyboard focus with it
+  (the pane becomes the first responder); note which in #428. Output in
+  the focused pane (`echo here`) is read.
