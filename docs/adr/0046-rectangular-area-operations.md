@@ -172,3 +172,42 @@ own advance and the selection guard, not the grid alone).
   the right instead (`CSI 1;1;1024;1024;1;1;2;1 $ v`), so it still times
   the merge path (a merge that sets each copied entry on its own fails
   it, over clusters and over links).
+
+## Amendment: DECFRA through a single shift, and where it differs from xterm (#489, 2026-11-17)
+
+- **A pending single shift maps `Pch`, and stays pending.** With an SS2
+  or SS3 pending, a DECFRA `Pch` from 32 to 126 maps through the shifted
+  set (G2 or G3), as printing that character would, and the shift is
+  still pending for the next printed character, as in xterm
+  (`current_charset()` reads `curss`; `CASE_DECFRA` never clears it).
+  Before, DECFRA mapped through GL and ignored the shift (`q|qq` under
+  SS2 with DEC Special Graphics in G2 where xterm shows `─|──`). A `Pch`
+  from 160 to 255 maps through GR, shift or not: the GL or GR in-use
+  table of the VT510 manual, and xterm's `gsets[curgr]`.
+- **Three places Tessera keeps its behaviour against xterm** (the lead's
+  ruling, rows in `tests/fixtures/decfra_charset_spec.txt`):
+  - *D-DROP*: a `Pch` that printing drops (255 under a seven-bit set in
+    GR, DEL after the mapping) fills nothing; xterm fills a space. A
+    DECFRA never writes a C0, C1 or DEL cell (docs/security.md), and
+    "fills nothing where printing writes nothing" keeps the differential
+    one rule. Row C04.
+  - *D-SHY*: `Pch` 173 that stays U+00AD (ASCII or Latin-1 in GR) fills
+    nothing, since printing it writes no cell (zero width); xterm fills
+    U+00AD. A zero-width cell breaks the one-column cell model. Row A09.
+  - *D-WIDE*: a `Pch` from 256 up must be one column wide; xterm accepts
+    a wide character and fills it into every cell, so its screen holds
+    overlapping double-width glyphs. Row A13.
+- **The DECFRA fixture.** `tests/fixtures/decfra_charset_spec.txt` (48
+  rows: `Pch` acceptance, GL, GR, the single shifts, NRCS, the levels,
+  DECCRA's overlap and self copy), checked whole and byte by byte by
+  `tests/rect_fixes.rs`, with the code points of the invisible fills (a
+  no-break space) compared cell by cell.
+- **The differential is wider.** `tests/rect_fixes.rs` compares DECFRA
+  with printing the same character for every designation in each of
+  G0-G3, reached through GL, through GR and through SS2 or SS3, with
+  DECNRCM off and on, at levels 4 and 5, for every `Pch` 32-126 and
+  160-255 (exhaustively, 270,456 cases), and over ten million seeded
+  random charset states in a release build (200,000 in a debug one).
+  The rule each case checks: DECFRA fills with what printing shows,
+  nothing exactly where printing shows nothing one cell wide, and never
+  a control character.

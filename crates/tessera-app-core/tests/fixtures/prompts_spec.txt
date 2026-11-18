@@ -184,8 +184,8 @@ flags: decision D-ALT-NAV
 ### N12_marks_set_on_alt_screen_are_dropped
 layer: T
 in: `\x1b[?1049h\x1b]133;A\x07\x1b]133;C\x07\x1b]133;D;0\x07\x1b[?1049l`
-expect: requests=[] (no Request::Mark), main-screen marks unchanged
-cite: [ADR] D-ALT, osc.rs osc_mark (`is_alt_screen` -> ignored)
+expect: requests=[Mark { D(0), line 0 }] (no Request::Mark for A or C), main-screen marks: D(0) on line 0 only (#489: the D leaves the alternate screen first, then marks the primary; ADR 0039 amendment)
+cite: [ADR] D-ALT, osc.rs osc_mark (`is_alt_screen` after the command end's reset -> ignored)
 note: Request::Mark must be emitted from the same branch that sets the mark, never before the alt check.
 
 ### N13_scan_cap

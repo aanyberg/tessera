@@ -463,3 +463,15 @@ its instruction counts within 1.01 on every line; its cycles reach 1.019
 planned for 0.2.0, and the capture-alone figures above stay as measured: nine
 of the eleven "every row" lines are over the 1.05 bar, recorded here as an
 accepted exception, not as a pass.
+
+## Amendment: a command end on the alternate screen (#489, 2026-11-17)
+
+Restating fixture row N12 (`marks_set_on_alt_screen_are_dropped`): marks received on the alternate screen are dropped,
+with their requests, except a command end (`D`). Since #461 a `D` received there first turns off the modes a dead
+program left on and leaves the alternate screen (ADR 0020, "Amendment: modes a dead program left on"); since #489 it
+is then recorded on the primary screen it took back, on the line below the carried text, where the next prompt
+starts, and its `Request::Mark` is queued and coalesced as any other's. Before, it was dropped, so the exit-status
+gutter had no end for the command that died (an ssh session whose connection dropped) until the next prompt's start
+closed it with an unknown status. `A`, `B` and `C` on the alternate screen are still dropped: the lines they would
+land on vanish with it. The N12 input (`ESC [?1049h`, `A`, `C`, `D;0`, `ESC [?1049l`) now gives one mark, `D` with
+status 0 on line 0, and one request for it.

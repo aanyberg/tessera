@@ -5,6 +5,9 @@
 //! more than the screen's width of cells. (A copy that carries clusters or
 //! links also allocates their scratch lists, each at most a row's entries,
 //! and one string per copied cluster: `tests/rect.rs` bounds its cost.)
+//! And the command end's carry of the alternate screen (#489, ADR 0020)
+//! moves the screen's rows instead of copying them: it allocates no more
+//! than a command end on the primary screen, plus the list of rows.
 //!
 //! The counting allocator is process-wide, so it lives in this binary of
 //! its own. It counts per thread, so the harness's own threads do not
@@ -163,4 +166,45 @@ fn an_exact_self_copy_allocates_nothing() {
         let ignored = allocations_by(|| off.advance(&flood)).0;
         assert_eq!(ran, ignored, "{:?}", String::from_utf8_lossy(op));
     }
+}
+
+/// A 200 x 500 alternate screen of text on all rows but the last two (so
+/// the carry, from the primary screen's second row, scrolls nothing),
+/// `leave` (DECRST 1049) or not.
+fn full_alternate_screen(leave: bool) -> Terminal {
+    let mut term = Terminal::new(200, 500);
+    term.advance(b"\x1b]133;A\x07$ \x1b]133;B\x07tui\r\n\x1b]133;C\x07\x1b[?1049h");
+    for row in 1..=198 {
+        term.advance(format!("\x1b[{row};1H").as_bytes());
+        term.advance(&b"0123456789".repeat(50));
+    }
+    if leave {
+        term.advance(b"\x1b[?1049l");
+    }
+    term
+}
+
+/// #489 (#461 r2-M3): the command end's carry takes the alternate
+/// screen's rows instead of cloning them: on a 200 x 500 screen of text
+/// it allocates the list of the rows, and the mark list of the line
+/// below them that takes the command end mark, and nothing more than the
+/// same command end after the program left the screen itself (its mark
+/// goes on the output start's line, which has a list): never one per row
+/// (a copy of the rows allocated 198 rows of cells).
+#[test]
+fn the_command_end_carry_moves_the_alternate_rows() {
+    let end = b"\x1b]133;D;0\x07";
+    let mut carried = full_alternate_screen(false);
+    let (allocations, _) = allocations_by(|| carried.advance(end));
+    let mut left = full_alternate_screen(true);
+    let (baseline, _) = allocations_by(|| left.advance(end));
+    assert_eq!(
+        carried.grid().visible_lines()[198].text().trim_end(),
+        "0123456789".repeat(50),
+        "the carry ran"
+    );
+    assert!(
+        allocations <= baseline + 2,
+        "{allocations} allocations, {baseline} without the carry"
+    );
 }

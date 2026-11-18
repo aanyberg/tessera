@@ -154,7 +154,9 @@ pub fn parse_fixture(text: &str) -> Vec<Case> {
                 }),
                 "screen" => {
                     while let Some(row) = lines.next_if(|l| l.starts_with('>')) {
-                        screen.push_str(row[1..].trim_end());
+                        // Only spaces trim: a no-break space a row holds
+                        // (DECFRA `Pch` 160) is a cell, not padding.
+                        screen.push_str(row[1..].trim_end_matches(' '));
                         screen.push('\n');
                     }
                 }

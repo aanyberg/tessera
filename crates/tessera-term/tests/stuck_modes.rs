@@ -141,8 +141,9 @@ fn the_command_end_after_a_dead_tmux_turns_its_modes_off() {
     // Back on the primary screen: `$ ssh host` shows again, ssh's
     // message is carried over from the alternate screen onto the line the
     // cursor was restored to, after ssh's output start, and the next
-    // prompt and its marks are below it. The command end itself arrived
-    // on the alternate screen and was dropped, as every mark there is.
+    // prompt and its marks are below it. The command end arrived on the
+    // alternate screen and is recorded on the primary screen it took
+    // back, on the prompt's line (#489).
     let grid = term.grid();
     assert_eq!(
         rows(&term, 4),
@@ -160,7 +161,13 @@ fn the_command_end_after_a_dead_tmux_turns_its_modes_off() {
     assert_eq!(grid.visible_lines()[1].marks, [Mark::OutputStart]);
     assert_eq!(
         grid.visible_lines()[3].marks,
-        [Mark::PromptStart, Mark::CommandStart]
+        [
+            Mark::CommandEnd {
+                exit_code: Some(255)
+            },
+            Mark::PromptStart,
+            Mark::CommandStart
+        ]
     );
 }
 
@@ -316,8 +323,8 @@ fn other_modes_are_left_alone() {
 /// the cursor saved on entry, as `CSI ? 1049 l` would, then prints what
 /// the alternate screen showed from there (its blank rows before the
 /// first text and after the last left out) and puts the cursor at the
-/// start of the line below it; the mark itself is dropped, as every mark
-/// received there is (ADR 0039), and nothing is queued for the host.
+/// start of the line below it. The mark is then recorded on that line of
+/// the primary screen, and reported once (#489, ADR 0039 N12).
 #[test]
 fn a_command_end_on_the_alternate_screen_leaves_it() {
     let mut term = shell();
@@ -342,11 +349,23 @@ fn a_command_end_on_the_alternate_screen_leaves_it() {
             )
         })
         .collect();
-    assert_eq!(marks, []);
+    let end = Mark::CommandEnd {
+        exit_code: Some(255),
+    };
+    assert_eq!(
+        marks,
+        [Request::Mark {
+            mark: end.clone(),
+            line: u64::from(cursor.row) + 1
+        }]
+    );
+    assert_eq!(term.grid().visible_lines()[2].marks, [end]);
 }
 
 /// S6: a flood of command ends, each after a program's modes and an
-/// alternate screen, queues nothing and leaves no mode on.
+/// alternate screen, queues one coalesced command end mark (each is
+/// recorded on the primary screen it took back, #489) and nothing else,
+/// and leaves no mode on.
 #[test]
 fn a_flood_of_command_ends_queues_nothing() {
     let mut term = shell();
@@ -355,12 +374,15 @@ fn a_flood_of_command_ends_queues_nothing() {
     term.advance(&unit.repeat(20_000));
     let requests = term.take_requests();
     assert!(
-        requests
-            .iter()
-            .all(|request| !matches!(request, Request::Mark { .. })),
-        "every command end arrived on the alternate screen"
+        matches!(
+            requests.as_slice(),
+            [Request::Mark {
+                mark: Mark::CommandEnd { exit_code: Some(1) },
+                ..
+            }]
+        ),
+        "{requests:?}"
     );
-    assert!(requests.len() <= 1, "{requests:?}");
     assert_input_modes_off(&term);
 }
 
@@ -562,7 +584,8 @@ fn backgrounds(term: &Terminal, row: usize) -> Vec<tessera_grid::Color> {
 /// The carry scrolls in rows in the shell's colours: tmux's green status
 /// bar, the last row carried, does not fill the row the line break after
 /// it scrolls in (BCE), so the next prompt has the default background,
-/// while the status bar's text keeps its green.
+/// while the status bar keeps its green, blanks included (#489: a blank
+/// in a background other than the shell's is not trimmed).
 #[test]
 fn a_row_the_carry_scrolls_in_has_the_shells_background() {
     let green = tessera_grid::Color::Indexed(2);
@@ -574,9 +597,9 @@ fn a_row_the_carry_scrolls_in_has_the_shells_background() {
         all_lines(&term),
         ["$ ssh host", "remote$", "", "", "[0] 0:zsh*", "$"]
     );
-    // The status bar's text keeps its green; its trailing blanks are
-    // trimmed like every carried row's, colour or not.
-    assert_eq!(backgrounds(&term, 2)[..10], [green; 10], "the status bar");
+    // The whole status bar keeps its green: its trailing blanks are not
+    // in the shell's background, so they are not trimmed.
+    assert_eq!(backgrounds(&term, 2), vec![green; 20], "the status bar");
     assert_eq!(
         backgrounds(&term, 3),
         vec![tessera_grid::Color::Default; 20],
@@ -629,5 +652,131 @@ fn a_wrap_the_carry_scrolls_in_has_the_shells_background() {
             .iter()
             .map(|cell| cell.style.bg)
             .collect::<Vec<_>>()
+    );
+}
+
+/// #489 (#461 r2-M1): the carried cells are moved, not printed again, so
+/// a cell that printing would merge with its neighbour stays where the
+/// program put it: a skin-tone modifier placed by cursor addressing next
+/// to an emoji, a combining mark on a cell of its own, and a hyperlink,
+/// with their clusters and styles.
+#[test]
+fn the_carried_cells_are_the_alternate_screens_own() {
+    let mut term = shell();
+    term.advance("\x1b[?1049h\x1b[H\u{1f44d}\x1b[1;3H\x1b[32m\u{1f3fd}\x1b[m".as_bytes());
+    term.advance("\x1b[1;6He\u{301}\x1b[1;8H\u{301}x".as_bytes());
+    term.advance(b"\x1b[1;12H\x1b]8;;https://a.example/\x1b\\link\x1b]8;;\x1b\\");
+    let alt = term.grid().visible_lines()[0].clone();
+    term.advance(b"\x1b]133;D;1\x07");
+    let carried = &term.grid().visible_lines()[1];
+    assert_eq!(carried.cells, alt.cells);
+    assert_eq!(carried.graphemes, alt.graphemes);
+    assert_eq!(carried.text(), alt.text());
+    assert_eq!(rows(&term, 3)[2], "");
+}
+
+/// #489 (#461 r2-M2): a soft-wrapped row that is not full, because the
+/// wide character after it did not fit in the last column, stays wrapped
+/// with its pad, so the carried rows are still one line.
+#[test]
+fn a_padded_soft_wrap_stays_wrapped() {
+    let mut term = Terminal::new(4, 10);
+    term.advance(b"$ ssh\r\n");
+    term.advance("\x1b[?1049h\x1b[Habcdefghi\u{4e2d}".as_bytes());
+    assert!(term.grid().visible_lines()[0].wrapped);
+    term.advance(b"\x1b]133;D;1\x07");
+    let grid = term.grid();
+    let row = &grid.visible_lines()[1];
+    assert!(row.wrapped, "the row continues");
+    assert!(row.cells[9].is_pad(), "its pad is kept");
+    assert!(
+        !grid.visible_lines()[2].wrapped,
+        "the last carried row ends"
+    );
+    assert_eq!(rows(&term, 4), ["$ ssh", "abcdefghi", "\u{4e2d}", ""]);
+}
+
+/// #489 (#461 adv-M2): the primary screen is cleared from the restored
+/// cursor to its end before the carry: the rest of the cursor's line
+/// (its mark kept) and the stale rows below it do not show between or
+/// after the carried text, and the stale marks go with them, on the row
+/// a carried row lands on too.
+#[test]
+fn the_carry_clears_from_the_restored_cursor_first() {
+    let mut term = shell();
+    term.advance(
+        b"\x1b[3;1H\x1b]133;A\x07\x1b[5;1H\x1b]133;A\x07stale prompt\x1b[7;1Hstale output",
+    );
+    term.advance(b"\x1b[2;1Hpartial-stale\x1b[2;8H");
+    term.advance(b"\x1b[?1049h\x1b[Hgone\x1b]133;D;1\x07");
+    assert_eq!(
+        rows(&term, 10),
+        ["$ ssh host", "partial", "gone", "", "", "", "", "", "", ""]
+    );
+    let grid = term.grid();
+    assert_eq!(grid.visible_lines()[1].marks, [Mark::OutputStart]);
+    assert!(
+        grid.visible_lines()[2..]
+            .iter()
+            .all(|line| line.marks.is_empty()
+                || line.marks == [Mark::CommandEnd { exit_code: Some(1) }]),
+        "the stale prompt marks are gone"
+    );
+    assert_eq!((grid.cursor().row, grid.cursor().col), (3, 0));
+    assert_eq!(term.screen_clears(), 0, "the carry's clear is no ED");
+}
+
+/// #489: with the restored cursor's wrap pending, its last character
+/// stays (no clear erases it) and the carry starts on the next line.
+#[test]
+fn a_pending_wrap_keeps_the_last_character() {
+    let mut term = Terminal::new(4, 10);
+    term.advance(b"0123456789");
+    assert!(term.grid().pending_wrap());
+    term.advance(b"\x1b[?1049h\x1b[Hgone\x1b]133;D;1\x07");
+    assert_eq!(rows(&term, 4), ["0123456789", "gone", "", ""]);
+    assert!(!term.grid().visible_lines()[0].wrapped);
+}
+
+/// A 200 x 500 alternate screen of text after `$ tui`, left by the
+/// program itself (`leave`, DECRST 1049) or not, then a command end.
+fn full_screen_unit(leave: bool) -> Terminal {
+    let mut term = Terminal::new(200, 500);
+    term.advance(b"\x1b]133;A\x07$ \x1b]133;B\x07tui\r\n\x1b]133;C\x07\x1b[?1049h");
+    let mut fill = Vec::new();
+    for row in 1..=200 {
+        fill.extend(format!("\x1b[{row};1H").as_bytes());
+        fill.extend(b"0123456789".repeat(50));
+    }
+    term.advance(&fill);
+    if leave {
+        term.advance(b"\x1b[?1049l");
+    }
+    term.advance(b"\x1b]133;D;0\x07");
+    term
+}
+
+/// #489 (#461 r2-M3): the carry costs at most 1.1 times the same unit
+/// without it (a 200 x 500 alternate screen drawn, then a command end
+/// after the program left it itself), the best of 15 runs each,
+/// interleaved: the rows are moved, not cloned and printed again (2.3
+/// times before).
+#[test]
+#[cfg_attr(debug_assertions, ignore = "timing: release only")]
+fn the_carry_of_a_full_screen_costs_a_tenth_more_at_most() {
+    let best = |leave: bool, best: &mut std::time::Duration| {
+        let start = std::time::Instant::now();
+        let term = full_screen_unit(leave);
+        *best = (*best).min(start.elapsed());
+        assert!(!term.modes().alt_screen);
+    };
+    let (mut carried, mut left) = (std::time::Duration::MAX, std::time::Duration::MAX);
+    for _ in 0..15 {
+        best(false, &mut carried);
+        best(true, &mut left);
+    }
+    assert!(
+        carried.as_secs_f64() <= 1.1 * left.as_secs_f64(),
+        "{carried:?} with the carry, {left:?} without"
     );
 }
