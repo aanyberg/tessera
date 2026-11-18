@@ -45,7 +45,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::ModifiersKeyState;
+use winit::keyboard::{ModifiersKeyState, ModifiersState};
 use winit::window::{Window, WindowId};
 
 use crate::input::{CellGeometry, InputHold, KeyAction, KeyInput, KeyMods, Platform};
@@ -111,6 +111,15 @@ impl HeldButtons {
         MouseButton::Forward,
     ];
 
+    /// winit's names for [`Self::ORDER`], in the same order.
+    const WINIT_ORDER: [winit::event::MouseButton; 5] = [
+        winit::event::MouseButton::Left,
+        winit::event::MouseButton::Middle,
+        winit::event::MouseButton::Right,
+        winit::event::MouseButton::Back,
+        winit::event::MouseButton::Forward,
+    ];
+
     /// `button`'s bit, 0 for [`MouseButton::None`].
     fn bit(button: MouseButton) -> u8 {
         Self::ORDER
@@ -132,8 +141,9 @@ impl HeldButtons {
     /// Applies a winit `MouseInput` event: `button` pressed or released.
     /// A button the terminal does not report changes nothing. Returns
     /// whether the event goes to the session: not the release of a button
-    /// that is not held, which is the stale release of one held when the
-    /// window lost focus (see [`HeldButtons::release_all`]).
+    /// that is not held, which is the late release of one held when the
+    /// window lost focus: its Release was sent then (see
+    /// [`focus_loss_releases`]).
     fn apply(&mut self, state: ElementState, button: winit::event::MouseButton) -> bool {
         let Some(mapped) = input::mouse_button(button) else {
             return true;
@@ -144,11 +154,17 @@ impl HeldButtons {
         pressed || held
     }
 
-    /// Forgets every held button, when the window loses focus (#292): the
-    /// release may go to another window, and motion after the window is
-    /// focused again must not carry a drag nobody holds.
-    fn release_all(&mut self) {
-        self.0 = 0;
+    /// Forgets every held button and returns them, lowest first, when the
+    /// window loses focus (#292): the release may go to another window,
+    /// and motion after the window is focused again must not carry a drag
+    /// nobody holds.
+    fn release_all(&mut self) -> impl Iterator<Item = winit::event::MouseButton> + use<> {
+        let held = std::mem::take(&mut self.0);
+        Self::WINIT_ORDER
+            .into_iter()
+            .enumerate()
+            .filter(move |(index, _)| held & (1 << index) != 0)
+            .map(|(_, button)| button)
     }
 
     /// The button motion carries: the lowest one held, or
@@ -159,6 +175,24 @@ impl HeldButtons {
             .find(|&button| self.0 & Self::bit(button) != 0)
             .unwrap_or(MouseButton::None)
     }
+}
+
+/// The Release of every button in `held`, which is emptied, for a window
+/// losing focus at `cursor`: the real release may never come here, and a
+/// reported press is always released (ADR 0027). The core reports only those
+/// whose press it reported; [`HeldButtons::apply`] then keeps the real
+/// release, if it does come, from being sent a second time.
+fn focus_loss_releases(
+    held: &mut HeldButtons,
+    cursor: (f64, f64),
+    geometry: CellGeometry,
+    mods: ModifiersState,
+) -> Vec<InputEvent> {
+    held.release_all()
+        .filter_map(|button| {
+            input::mouse_input(ElementState::Released, button, cursor, geometry, mods)
+        })
+        .collect()
 }
 
 /// The window, its session and the input state winit does not keep.
@@ -548,7 +582,16 @@ impl ApplicationHandler<Wake> for DevWin {
             }
             WindowEvent::Focused(focused) => {
                 if !focused {
-                    self.held.release_all();
+                    let geometry = self.geometry();
+                    let releases = focus_loss_releases(
+                        &mut self.held,
+                        self.cursor,
+                        geometry,
+                        self.modifiers.held,
+                    );
+                    for event in releases {
+                        self.send(event);
+                    }
                 }
                 self.send(input::focus(focused));
             }
@@ -627,24 +670,29 @@ impl ApplicationHandler<Wake> for DevWin {
 
 #[cfg(test)]
 mod tests {
+    use tessera_app_core::Config;
+
     use super::*;
 
-    /// #292: losing focus forgets the held buttons, so motion after the
-    /// window is focused again carries no drag, and the release of a
-    /// button held across the focus change is not sent as a stale
-    /// release; a press after it, and its release, are.
+    /// #292, #526: losing focus empties the held buttons and names each
+    /// one, so motion after the window is focused again carries no drag.
+    /// The Release went out at the focus loss, so the real release of a
+    /// button held across it is not sent again; a press after it, and its
+    /// release, are.
     #[test]
-    fn focus_loss_forgets_held_buttons() {
+    fn focus_loss_releases_the_held_buttons_once() {
         use winit::event::MouseButton as Winit;
         let mut held = HeldButtons::default();
-        assert!(held.apply(ElementState::Pressed, Winit::Left));
         assert!(held.apply(ElementState::Pressed, Winit::Right));
+        assert!(held.apply(ElementState::Pressed, Winit::Left));
         assert_eq!(held.drag_button(), MouseButton::Left);
         // WindowEvent::Focused(false).
-        held.release_all();
+        let released: Vec<_> = held.release_all().collect();
+        assert_eq!(released, [Winit::Left, Winit::Right]);
         assert_eq!(held, HeldButtons::default());
         assert_eq!(held.drag_button(), MouseButton::None);
-        // Focused again: the releases of the buttons held before are stale.
+        assert_eq!(held.release_all().count(), 0, "nothing is released twice");
+        // Focused again: the real releases add nothing.
         assert!(!held.apply(ElementState::Released, Winit::Left));
         assert!(!held.apply(ElementState::Released, Winit::Right));
         assert_eq!(held.drag_button(), MouseButton::None);
@@ -654,6 +702,117 @@ mod tests {
         assert_eq!(held.drag_button(), MouseButton::None);
         // A button the terminal does not report is passed on unchanged.
         assert!(held.apply(ElementState::Released, Winit::Other(9)));
+    }
+
+    /// The two button tables name the same buttons in the same order.
+    #[test]
+    fn the_winit_order_matches_the_core_order() {
+        assert_eq!(
+            HeldButtons::WINIT_ORDER.map(input::mouse_button),
+            HeldButtons::ORDER.map(Some)
+        );
+    }
+
+    /// Runs `/bin/sh` with mouse reporting on (1000, SGR encoding) and its
+    /// input written raw to `log`; returns once `press` has been reported.
+    /// Tracking is seen from the press itself, which is ignored until the
+    /// child's request has been read.
+    fn press_reported_by_a_tracking_child(
+        app: &App,
+        log: &std::path::Path,
+        press: &InputEvent,
+    ) -> SessionId {
+        let script = r#"stty raw -echo; printf '\033[?1000h\033[?1006h'; exec cat > "$0""#;
+        let log = log.to_str().expect("a UTF-8 temporary path");
+        let options = SpawnOptions {
+            size: tessera_app_core::PtySize::new(24, 80),
+            ..SpawnOptions::command("/bin/sh", "devwin-focus").args(["-c", script, log])
+        };
+        let id = app.spawn_session(options).expect("spawn the child");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while app.send_input(id, press.clone()).expect("press") != InputOutcome::Consumed {
+            assert!(Instant::now() < deadline, "tracking never came on");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        id
+    }
+
+    /// #526 (24.13 m1, ADR 0027: a reported press is always released): a
+    /// press, a focus loss with Cmd down (Cmd-Tab), then the real release
+    /// give the child exactly one Release, at the focus loss. The core
+    /// drops the Release of a press it never reported (Shift-click), and
+    /// devwin sends no second Release for the real one, so nothing but
+    /// the end marker follows.
+    #[test]
+    fn the_child_sees_one_release_per_reported_press() {
+        use winit::event::MouseButton as Winit;
+        let dir = std::env::temp_dir().join(format!("tessera-devwin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temporary directory");
+        let log = dir.join("input");
+        let app = App::new(Config::default(), ConfigPaths::new(dir.join("config")));
+        let geometry = CellGeometry {
+            padding: 0.0,
+            cell_width: 10.0,
+            cell_height: 20.0,
+        };
+        let cursor = (15.0, 25.0);
+        let button = |state, button, mods| {
+            input::mouse_input(state, button, cursor, geometry, mods).expect("a known button")
+        };
+        let mut held = HeldButtons::default();
+
+        assert!(held.apply(ElementState::Pressed, Winit::Left));
+        let press = button(
+            ElementState::Pressed,
+            Winit::Left,
+            ModifiersState::default(),
+        );
+        let id = press_reported_by_a_tracking_child(&app, &log, &press);
+        assert!(held.apply(ElementState::Pressed, Winit::Right));
+        let unreported = button(ElementState::Pressed, Winit::Right, ModifiersState::SHIFT);
+        assert_eq!(
+            app.send_input(id, unreported).expect("press"),
+            InputOutcome::Ignored,
+            "a Shift press is not reported"
+        );
+
+        let releases = focus_loss_releases(&mut held, cursor, geometry, ModifiersState::SUPER);
+        let outcomes: Vec<_> = releases
+            .into_iter()
+            .map(|event| app.send_input(id, event).expect("release"))
+            .collect();
+        assert_eq!(
+            outcomes,
+            [InputOutcome::Consumed, InputOutcome::Ignored],
+            "left was reported, right was not"
+        );
+        assert!(!held.apply(ElementState::Released, Winit::Left));
+        assert!(!held.apply(ElementState::Released, Winit::Right));
+
+        assert_eq!(
+            app.send_input(id, InputEvent::Paste("END".to_owned()))
+                .expect("marker"),
+            InputOutcome::Consumed
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let received = loop {
+            let received = std::fs::read(&log).unwrap_or_default();
+            if received.ends_with(b"END") {
+                break received;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the marker never came: {:?}",
+                String::from_utf8_lossy(&received)
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(
+            String::from_utf8_lossy(&received),
+            "\x1b[<0;2;2M\x1b[<0;2;2mEND"
+        );
+        app.close_session(id).expect("close");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #194.12: press left, press right, release right: the motion after

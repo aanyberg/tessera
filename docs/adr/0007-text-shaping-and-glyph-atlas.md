@@ -354,3 +354,27 @@ order and gains the same in-family step.
 The per-family cache holds the face each family matches for each of the
 four query styles, so the sibling queries add no entries beyond families
 x 4.
+
+## Amendment 2026-11-18: emoji-presentation characters and variation selectors (#526)
+
+Two consequences of the 2026-11-17 amendment, stated so they read as
+decisions.
+
+**A character with emoji presentation that the primary family covers stays
+in the primary, in every style.** The primary family comes first for every
+character without VS16, and the in-family step keeps such a character there
+in italic too. With Menlo that is U+25FD, U+25FE and 17 characters in
+U+26xx (U+2614, U+2615, the zodiac U+2648 to U+2653, U+267F, U+2693 and
+U+26A1): monochrome Menlo in regular, bold, italic and bold italic alike,
+with synthetic italic where Menlo Italic lacks them. U+303D is not one of
+them: Menlo does not cover it and it is not in the emoji-first set, so it
+takes the ordinary chain (Hiragino Sans in regular and italic, Apple Color
+Emoji in bold and bold italic on the macOS tested).
+
+**Both variation selectors end in the in-family order.** VS15 uses the
+text-first chain with the in-family step. VS16 tries Apple Color Emoji's
+styled face first; when that does not cover the character it falls through
+to the ordinary resolution, in-family step included. #119 said emoji
+presentation must not change; this is an accepted deviation from the issue:
+which family is tried first is unchanged for both selectors, and a selector
+should not bring back the wrong-family result the step exists to avoid.

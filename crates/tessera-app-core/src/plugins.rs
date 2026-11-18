@@ -197,9 +197,14 @@ fn sanitise_items(items: Vec<StatusItem>) -> Vec<StatusItem> {
         .collect()
 }
 
-/// A plugin id for the log: sanitised, capped and escaped (S3, S8).
+/// A plugin id for the log: at most [`MAX_PLUGIN_ID_LEN`] bytes of it, cut
+/// at a character boundary (S5, S8), then escaped (S3). Control and bidi
+/// characters are escaped rather than removed, so an id that differs from
+/// another only by them does not log as that other plugin.
 fn id_for_log(id: &str) -> String {
-    sanitise(id, MAX_PLUGIN_ID_LEN).escape_debug().to_string()
+    id[..id.floor_char_boundary(MAX_PLUGIN_ID_LEN)]
+        .escape_debug()
+        .to_string()
 }
 
 /// An error's kind for the log and the report, never its text (S8).
@@ -1137,5 +1142,59 @@ impl Runner {
 fn drop_quietly(plugin: Box<dyn Plugin>) {
     if panic::catch_unwind(AssertUnwindSafe(move || drop(plugin))).is_err() {
         tracing::warn!("a plugin panicked while it was dropped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #526 (24.13 m4): only the first [`MAX_PLUGIN_ID_LEN`] bytes of an
+    /// id are logged, and the cut never splits a character.
+    #[test]
+    fn a_logged_id_is_capped_on_a_character_boundary() {
+        let long = "a".repeat(MAX_PLUGIN_ID_LEN + 10);
+        assert_eq!(id_for_log(&long), "a".repeat(MAX_PLUGIN_ID_LEN));
+        let exact = "a".repeat(MAX_PLUGIN_ID_LEN);
+        assert_eq!(id_for_log(&exact), exact);
+        // One byte, then two-byte characters: the last that fits ends one
+        // byte short of the cap.
+        let wide = format!("x{}", "\u{e9}".repeat(MAX_PLUGIN_ID_LEN));
+        let expected = format!("x{}", "\u{e9}".repeat((MAX_PLUGIN_ID_LEN - 1) / 2));
+        assert_eq!(id_for_log(&wide), expected);
+        assert_eq!(expected.len(), MAX_PLUGIN_ID_LEN - 1);
+    }
+
+    /// #526 (24.13 m4): the cap counts the id's bytes, not the escaped
+    /// text's: an id of control characters logs one escape per byte kept.
+    #[test]
+    fn the_cap_applies_before_the_escaping() {
+        let id = "\u{1b}".repeat(MAX_PLUGIN_ID_LEN * 2);
+        assert_eq!(id_for_log(&id), "\\u{1b}".repeat(MAX_PLUGIN_ID_LEN));
+    }
+
+    /// #526 (24.13 A1): ids that differ only by a control or bidi
+    /// character log differently, so one cannot pass for the other.
+    #[test]
+    fn ids_differing_only_by_hidden_characters_log_apart() {
+        let plain = id_for_log("com.example.plugin");
+        for hidden in ['\u{202e}', '\u{7}', '\u{1b}', '\u{2066}', '\u{200f}'] {
+            let id = format!("com.example{hidden}.plugin");
+            assert_ne!(id_for_log(&id), plain, "{hidden:?}");
+        }
+    }
+
+    /// S3: no character a title drops reaches the log as itself, for every
+    /// such character there is.
+    #[test]
+    fn no_hidden_character_is_logged_raw() {
+        let hidden: Vec<char> = (char::MIN..=char::MAX)
+            .filter(|&c| !shown_in_title(c))
+            .collect();
+        assert!(hidden.contains(&'\u{202e}') && hidden.contains(&'\u{1b}'));
+        for c in hidden {
+            let logged = id_for_log(&format!("a{c}b"));
+            assert!(logged.chars().all(shown_in_title), "{c:?}: {logged:?}");
+        }
     }
 }
