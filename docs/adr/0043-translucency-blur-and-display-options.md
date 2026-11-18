@@ -171,3 +171,48 @@ theme's: a light app appearance around a dark theme draws the theme unchanged.
 whether or not anything changed. Settings writes it through
 `tessera_config_set("appearance.app_appearance", "\"light\"")` like any other
 key. The host side (`AppDelegate.applyAppAppearance(_:)`) is #365's app half.
+
+## Amendment: native full screen (#494, 2026-11-18)
+
+**Decision (D7).** In native full screen the title bar and tab bar of a
+translucent window draw opaque: `titlebarAppearsTransparent` is false and the
+content has no strip under them (the strip's blur and tint are zero high),
+whatever the window's opacity and blur. The terminal content keeps its
+opacity setting: the window stays transparent and each pane draws its
+background at its opacity, with its own blur. Leaving full screen brings the
+windowed look back (transparent title bar over the blurred, tinted strip). An
+opaque window is the same in and out of full screen.
+
+**Why.** In full screen AppKit moves the title bar and tab bar into its
+separate full-screen toolbar window, which slides in over the content. There
+is no desktop behind them there, so a transparent bar showed the content or
+the space's backdrop through it, over a strip sized for the windowed title
+bar (#494, found in the 0.2.0 manual pass).
+
+**How.** One pure function, `TerminalWindowContentView.titlebarLayout(fullScreen:translucent:measuredStrip:)`,
+returns `(titlebarTransparent, stripHeight)`: a transparent bar over the
+measured strip only for a translucent window out of full screen. The content
+view applies it on every layout pass, reading
+`window.styleMask.contains(.fullScreen)` (the transition resizes the window
+and moves its `contentLayoutRect`, and a tab selected in full screen lays out
+again), and `TerminalWindowController`'s `windowDidEnterFullScreen` and
+`windowDidExitFullScreen` bring every tab of the window up to date at the end
+of the transition. `.fullSizeContentView` follows opacity as before, so the
+panes stay in `contentLayoutRect` and the window's frame is AppKit's.
+
+**Tests.** The decision is unit tested for all four cases; the layout is
+tested on windows that report `.fullScreen` (AppKit raises if anyone else sets
+it), through the delegate and through a layout pass alone; and a hosted test
+enters and leaves full screen with `toggleFullScreen(_:)` on a window and tab
+opened as ⌘N and ⌘T open them, posting nothing, one toggle in and one out;
+in full screen it selects the tab and reads its layout there, since a tab not
+shown keeps its windowed frame and style mask until it is selected (macOS 15).
+That test makes its toggles in a child copy of the test host, because a
+transition that does not complete (a locked or sleeping console, a session off
+the console) ends in an AppKit assertion (`NSWindowStackController`) a few
+seconds later that kills the process, even after one toggle. The parent skips,
+printing why, when the child reports that a toggle did not finish within 5 s,
+or when the child crashes or stalls; it skips before launching one on a locked
+console (`CGSSessionScreenIsLocked`, `IOConsoleLocked`) or a session off the
+console (`kCGSessionOnConsoleKey`). Whether the bar looks like the windowed one
+is an eye check (E2).

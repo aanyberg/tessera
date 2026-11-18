@@ -24,6 +24,12 @@ import TesseraKit
 /// if the call is not available, each pane keeps its material blur. The
 /// strip keeps its material either way (D4): over a window blurred at a
 /// radius it shows its own blur, not the radius.
+///
+/// In native full screen (ADR 0043 D7) the title bar and tab bar move into
+/// AppKit's full-screen toolbar window, where there is no desktop behind
+/// them: they draw opaque there (the title bar is not transparent) and the
+/// content has no strip under them, whatever the window's opacity and blur;
+/// the panes keep theirs. Leaving full screen brings the windowed look back.
 @MainActor
 final class TerminalWindowContentView: NSView {
     let paneContainer: PaneContainerView
@@ -80,6 +86,27 @@ final class TerminalWindowContentView: NSView {
     /// own blur hidden.
     private(set) var usesBlurRadius = false
 
+    /// What the title bar and the strip under it are for a window
+    /// (ADR 0043 D7).
+    struct TitlebarLayout: Equatable {
+        /// The window's `titlebarAppearsTransparent`.
+        var titlebarTransparent: Bool
+        /// The height of the blurred, tinted strip under the title bar and
+        /// tab bar; 0 for none.
+        var stripHeight: CGFloat
+    }
+
+    /// The title bar and strip of a window in native full screen or not,
+    /// translucent or opaque, whose content runs `measuredStrip` above the
+    /// panes (under the title bar and tab bar): windowed and translucent,
+    /// a transparent title bar over a strip of that height; otherwise
+    /// (opaque, or in full screen, which has no desktop behind the bars)
+    /// a title bar that draws its own material and no strip.
+    static func titlebarLayout(fullScreen: Bool, translucent: Bool, measuredStrip: CGFloat) -> TitlebarLayout {
+        guard translucent, !fullScreen else { return TitlebarLayout(titlebarTransparent: false, stripHeight: 0) }
+        return TitlebarLayout(titlebarTransparent: true, stripHeight: max(0, measuredStrip))
+    }
+
     /// A view for `paneContainer`, which ``install(in:)`` puts in it.
     init(paneContainer: PaneContainerView, frame: NSRect) {
         self.paneContainer = paneContainer
@@ -115,7 +142,10 @@ final class TerminalWindowContentView: NSView {
 
     /// Makes the window's title bar transparent over full-size content while
     /// `translucent`, standard otherwise, keeping the window's frame, and
-    /// blurs under it while `translucent`, whatever the panes' blur.
+    /// blurs under it while `translucent`, whatever the panes' blur; in
+    /// native full screen the title bar draws its own material over the
+    /// full-size content and nothing is under it
+    /// (``titlebarLayout(fullScreen:translucent:measuredStrip:)``).
     func updateTitlebar(translucent: Bool) {
         guard let window else { return }
         if window.styleMask.contains(.fullSizeContentView) != translucent {
@@ -128,6 +158,7 @@ final class TerminalWindowContentView: NSView {
             } else {
                 window.styleMask.remove(.fullSizeContentView)
             }
+            // In full screen, ``placeSubviews()`` below makes it opaque again.
             window.titlebarAppearsTransparent = translucent
             if window.frame != frame {
                 window.setFrame(frame, display: false)
@@ -313,16 +344,26 @@ final class TerminalWindowContentView: NSView {
         updateWindowBlur()
     }
 
-    /// Lays the panes out in ``paneArea`` and the blur above them; the
-    /// window's smallest size follows a change of the title bar's height.
+    /// Lays the panes out in ``paneArea`` and the blur above them, and
+    /// makes the title bar transparent or not, as
+    /// ``titlebarLayout(fullScreen:translucent:measuredStrip:)`` has it for
+    /// the window now (in or out of native full screen, whose transition
+    /// changes the layout rect); the window's smallest size follows a
+    /// change of the title bar's height.
     private func placeSubviews() {
         guard !holdsPanes else { return }
         let area = paneArea
         if paneContainer.frame != area {
             paneContainer.frame = area
         }
-        let strip = NSRect(
-            x: bounds.minX, y: area.maxY, width: bounds.width, height: max(0, bounds.maxY - area.maxY))
+        let style = window?.styleMask ?? []
+        let layout = Self.titlebarLayout(
+            fullScreen: style.contains(.fullScreen), translucent: style.contains(.fullSizeContentView),
+            measuredStrip: bounds.maxY - area.maxY)
+        if let window, window.titlebarAppearsTransparent != layout.titlebarTransparent {
+            window.titlebarAppearsTransparent = layout.titlebarTransparent
+        }
+        let strip = NSRect(x: bounds.minX, y: area.maxY, width: bounds.width, height: layout.stripHeight)
         titlebarBackdrop?.frame = strip
         titlebarTint?.frame = strip
         updateTitlebarTint()

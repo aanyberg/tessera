@@ -20,7 +20,9 @@ final class HostDisplaySettings: NSObject, XCTestObservation {
 
     func testBundleWillStart(_ testBundle: Bundle) {
         MainActor.assumeIsolated {
-            // A child of TerminationSignalTests runs no test.
+            // A child of TerminationSignalTests or FullScreenToggleTests
+            // runs no test.
+            FullScreenToggleChild.runIfRequested()
             TerminationSignalChild.runIfRequested()
             // Files of test suites that an earlier run's killed host left.
             TestDefaultsSuite.sweep()
