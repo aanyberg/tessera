@@ -3916,13 +3916,11 @@ mod native {
                     std::os::unix::fs::symlink(locked.join("profiles"), root.join("profiles"))
                         .unwrap();
                 }
-                let mode = |mode| {
-                    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(mode))
-                        .unwrap();
-                };
-                mode(0o000);
+                // Back to 0755 when dropped, so a failing assert leaves
+                // nothing the temporary directory's removal cannot enter.
+                let restore = Locked(vec![locked.clone()]);
+                std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
                 if std::fs::read_dir(&locked).is_ok() {
-                    mode(0o755);
                     return; // as root
                 }
                 let running = run_native(&root, |native| {
@@ -3939,7 +3937,7 @@ mod native {
                 std::thread::sleep(window.saturating_sub(Duration::from_millis(10)));
                 let polled = running.probe.polls() - polls;
                 assert!(polled <= 3, "{layout}: {polled} polls in about 1 s");
-                mode(0o755);
+                drop(restore);
                 assert!(
                     applies_profile(&running, "p", "/bin/p", CAPPED_CHAIN_POLL_INTERVAL * 3),
                     "{layout}: the profile was not applied once searchable"

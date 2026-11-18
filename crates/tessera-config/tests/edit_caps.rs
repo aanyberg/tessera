@@ -279,3 +279,128 @@ fn a_save_removes_the_stale_temporary_files_of_a_crashed_edit() {
         [running.file_name().unwrap(), path.file_name().unwrap()]
     );
 }
+
+/// #526 24.10 M2: a cap belongs to its own array. Index 70 of a list with
+/// no cap of its own is above the 64 of smart rules and is edited; index
+/// 300 of another key is above the 256 of profiles and is not refused for
+/// that cap.
+#[test]
+fn an_index_past_another_arrays_cap_is_edited() {
+    let names: Vec<String> = (0..72).map(|i| format!("p{i}")).collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let text = format!(
+        "[plugins]\nenabled = {}\n",
+        toml::Value::try_from(&names).unwrap()
+    );
+    let (_dir, path, mut editor) = open(&text);
+    editor.set("plugins.enabled[70]", s("changed")).unwrap();
+    assert!(editor.save().unwrap());
+    let loaded = Config::from_toml_lenient(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(loaded.config.plugins.enabled[70], "changed");
+    assert_eq!(loaded.config.plugins.enabled[71], "p71");
+
+    // The same at a depth of one key, where the profile cap's row looks.
+    let values: Vec<i64> = (0..301).collect();
+    let text = format!("zzz = {}\n", toml::Value::try_from(&values).unwrap());
+    let (_dir, _path, mut editor) = open(&text);
+    let result = editor.set("zzz[300]", toml::Value::Integer(7));
+    assert!(
+        !matches!(&result, Err(EditError::Unsupported { reason, .. }) if reason.contains("cap")),
+        "{result:?}"
+    );
+}
+
+/// #526 24.10 M4: `replace` writes a rejected value's replacement as a
+/// float where the setting is one, also when that replaces a list the
+/// loader rejected, which `set` refuses.
+#[test]
+fn a_replace_writes_an_integer_as_the_float_the_setting_is() {
+    let text = "[appearance]\nopacity = [\"x\"]\n";
+    let (_dir, path, mut editor) = open(text);
+    let refused = editor.set("appearance.opacity", toml::Value::Integer(1));
+    assert!(
+        matches!(&refused, Err(EditError::Invalid { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(editor.to_toml(), text);
+    editor
+        .replace("appearance.opacity", toml::Value::Integer(1))
+        .unwrap();
+    assert!(editor.save().unwrap());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "[appearance]\nopacity = 1.0\n"
+    );
+}
+
+/// #526 24.10 M4: the file `replace` makes load must load without any
+/// warning, since the failing file had none to keep: an unknown key
+/// elsewhere in it refuses the replace, naming that key, and nothing
+/// changes. (ADR 0040: pinned as it is, not endorsed by this test.)
+#[test]
+fn a_replace_is_refused_while_an_unrelated_key_is_unknown() {
+    let text = "[appearance]\nopacity = [\"x\"]\nzzz = 1\n";
+    let (_dir, path, mut editor) = open(text);
+    let result = editor.replace("appearance.opacity", toml::Value::Float(0.5));
+    assert!(
+        matches!(&result, Err(EditError::Refused { warnings, .. })
+            if matches!(&warnings[..], [Warning::UnknownKey { path }] if path == "appearance.zzz")),
+        "{result:?}"
+    );
+    assert_eq!(editor.to_toml(), text);
+    assert!(!editor.save().unwrap());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+}
+
+/// #526 24.10 r2 m1: a key with no default holding a scalar is a rejected
+/// value that the edit would make a list. `set` refuses that like any list
+/// it would replace, with the loader's error; `replace` writes it. This
+/// pins what the editor does; it does not make the scalar a repair.
+#[test]
+fn a_scalar_at_a_key_with_no_default_is_not_turned_into_a_list_by_a_set() {
+    let text = "[selection]\nsmart_rules = \"x\"\n";
+    let no_rules = || toml::Value::Array(Vec::new());
+    let (_dir, path, mut editor) = open(text);
+    let refused = editor.set("selection.smart_rules", no_rules());
+    assert!(
+        matches!(&refused, Err(EditError::Invalid { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(editor.to_toml(), text);
+    assert!(!editor.save().unwrap());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    editor.replace("selection.smart_rules", no_rules()).unwrap();
+    assert!(editor.save().unwrap());
+    let loaded = Config::from_toml_lenient(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(loaded.warnings, []);
+    assert_eq!(loaded.config.selection.smart_rules, Some(Vec::new()));
+}
+
+/// #526 24.10 M5: a new profile's name differs from the names as written
+/// and as loaded. `"A\0"` loads as `"A\u{FFFD}"`, so that name takes a
+/// number; so does `"A\0"` itself, and a name a failing file holds, which
+/// only the raw half can see.
+#[test]
+fn a_new_profile_name_avoids_written_and_loaded_names() {
+    let text = "[[profiles]]\nname = \"A\\u0000\"\n";
+    let (_dir, path, mut editor) = open(text);
+    assert_eq!(editor.unused_profile_name("A\u{FFFD}"), "A\u{FFFD} 2");
+    assert_eq!(editor.unused_profile_name("A\0"), "A\0 2");
+    assert_eq!(editor.unused_profile_name("A"), "A", "not a taken name");
+    let added = editor.add_profile_with("A\u{FFFD}", &[]).unwrap();
+    assert_eq!((added.index, added.name.as_str()), (1, "A\u{FFFD} 2"));
+    assert!(editor.save().unwrap());
+    let loaded = Config::from_toml_lenient(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let names: Vec<&str> = loaded.config.profiles.iter().map(|p| &*p.name).collect();
+    assert_eq!(names, ["A\u{FFFD}", "A\u{FFFD} 2"]);
+
+    // Beside no such name it is taken as given.
+    let (_dir, _path, mut editor) = open("[[profiles]]\nname = \"B\"\n");
+    let added = editor.add_profile_with("A\u{FFFD}", &[]).unwrap();
+    assert_eq!(added.name, "A\u{FFFD}");
+
+    // A file the loader fails on has only its written names.
+    let failing = "[appearance]\nopacity = \"x\"\n[[profiles]]\nname = \"C\"\n";
+    let (_dir, _path, editor) = open(failing);
+    assert_eq!(editor.unused_profile_name("C"), "C 2");
+}

@@ -1054,14 +1054,56 @@ impl tracing::Subscriber for Capture {
     fn exit(&self, _: &tracing::span::Id) {}
 }
 
+/// Makes every thread's capture see every event: a callsite first reached
+/// while no subscriber is interested caches "never" for all threads, which
+/// under plain `cargo test` would hide events from a capture running beside
+/// another test (`store::captures_see_every_event`, unreachable from here).
+fn captures_see_every_event() {
+    struct Interested;
+
+    impl tracing::Subscriber for Interested {
+        fn register_callsite(
+            &self,
+            _: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            false
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(Interested);
+    });
+    tracing::callsite::rebuild_interest_cache();
+}
+
 /// S8: checking an edit logs nothing, so a refused value never reaches
-/// the log.
+/// the log. The save sweeps a crashed edit's temporary file and logs that:
+/// the positive control that the capture sees this code's events, without
+/// which an empty capture would pass.
 #[test]
 fn checking_an_edit_logs_no_values() {
+    captures_see_every_event();
     let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let capture = Capture(events.clone());
     tracing::subscriber::with_default(capture, || {
-        let (_dir, _path, mut editor) = open("[appearance]\nopacity = 1.0\n");
+        let (dir, _path, mut editor) = open("[appearance]\nopacity = 1.0\n");
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let stale = dir.path().join(format!(".config.toml.{dead}.0.edit"));
+        std::fs::write(&stale, "half an edit").unwrap();
         let _ = editor.set("appearance.opacity", toml::Value::Float(123.456));
         let _ = editor.set("appearance.secret_unknown", s("hunter2"));
         let _ = editor.set("keys.\"cmd+hunter3\"", s("new_tab"));
@@ -1069,8 +1111,15 @@ fn checking_an_edit_logs_no_values() {
             .set("appearance.opacity", toml::Value::Float(0.5))
             .unwrap();
         editor.save().unwrap();
+        assert!(!stale.exists(), "the save swept the stale file");
     });
     let events = events.lock().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.contains("stale temporary files")),
+        "the capture saw no event of the save: {events:?}"
+    );
     for event in events.iter() {
         for secret in ["123.456", "hunter2", "hunter3", "0.5"] {
             assert!(!event.contains(secret), "{event}");

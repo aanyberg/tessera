@@ -195,3 +195,25 @@ more than 32 profile files, the native backend samples all of them every
 within about 2 s, as the polling backend's full listing does. The profile
 themes' resolution and warning rules are in ADR 0006's amendment of the
 same date.
+
+## Amendment: the notice for a refused `#!` script, and polling (#489, #526, 2026-11-18)
+
+- **The errno of a refused script.** `tessera-pty` refuses a `#!` script
+  whose interpreter cannot run, and the fallback notice takes its errno
+  text from that refusal. A script with CRLF line endings is `ENOEXEC`
+  (`Exec format error`), not the `ENOENT` of its `/bin/sh\r`, which said
+  "No such file or directory" about a file that is there. An interpreter
+  that is not a regular file or not executable is `EACCES`, a missing one
+  or a line naming none `ENOENT`, and one that cannot be reached (`ENOTDIR`,
+  `ELOOP`) keeps its own errno. Only the text after the quoted interpreter
+  is read: the path comes from the script and cannot choose the errno. The
+  notice still shows only the sanitised profile name and the errno text
+  (S3, S8).
+- **Registration errors stay on the fast poll.** The native backend polls
+  every `CAPPED_CHAIN_POLL_INTERVAL` only when the chain cannot be walked
+  (past a cap, a cycle, a directory it may not search): nothing there can
+  be seen until the links or the mode change. A directory holding a link
+  that can be walked but not registered (#393 B1, mode 0311) fails the
+  registration and stays on `poll_interval`, as intended: the walk still
+  works, so the poll is what applies a retarget of that link, as promptly
+  as the polling backend does.
