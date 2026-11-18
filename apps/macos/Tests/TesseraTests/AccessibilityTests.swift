@@ -86,6 +86,14 @@ final class FakeClientMonitor: AssistiveClientMonitoring {
     }
 }
 
+/// A plain element that says whether it has the keyboard focus, which
+/// gates the announcements (D10).
+final class FocusStandIn: NSView {
+    var isFocused = true
+
+    override func isAccessibilityFocused() -> Bool { isFocused }
+}
+
 private struct TimedOut: Error, CustomStringConvertible {
     var description: String
 }
@@ -163,7 +171,7 @@ final class TerminalAccessibilityViewTests: XCTestCase {
     /// A0c, F2 (amended): the selected range is never settable; the value
     /// is settable (a no-op setter, for Full Keyboard Access's Space) only
     /// while VoiceOver is off, so QuickNav never sees a settable value.
-    func testA0cTheValueIsSettableOnlyWithoutVoiceOverAndNothingSetTakesEffect() throws {
+    func testA0cTheValueIsSettableOnlyWithoutVoiceOverAndNothingSetTakesEffect() async throws {
         let setValue = #selector(NSView.setAccessibilityValue(_:))
         let setRange = #selector(NSView.setAccessibilitySelectedTextRange(_:))
         XCTAssertNotEqual(
@@ -175,16 +183,86 @@ final class TerminalAccessibilityViewTests: XCTestCase {
         XCTAssertTrue(view.isAccessibilitySelectorAllowed(#selector(NSView.accessibilityValue)))
 
         view.setAccessibilityValue("rm -rf ~")
-        XCTAssertEqual(view.accessibilityValue() as? String, Self.b1, "D-6: ignored")
         view.setAccessibilitySelectedTextRange(NSRange(location: 0, length: 2))
+        // Anything the setters sent the child would reach it, and come back
+        // through `cat`, before a sentinel written after them.
+        try session.write(Data("sentinel".utf8))
+        try await waitForValue(Self.b1 + "sentinel")
+        let value = try XCTUnwrap(view.accessibilityValue() as? String)
+        XCTAssertFalse(value.contains("rm -rf"), "D-6: ignored")
         XCTAssertFalse(try session.hasSelection, "D-6: ignored")
-        XCTAssertEqual(view.accessibilitySelectedTextRange(), NSRange(location: 18, length: 0))
+        XCTAssertEqual(view.accessibilitySelectedTextRange(), NSRange(location: 26, length: 0))
 
         view.accessibility.monitor = FakeClientMonitor(attached: true)
         XCTAssertFalse(view.isAccessibilitySelectorAllowed(setValue), "VoiceOver on: QuickNav")
         XCTAssertFalse(view.isAccessibilitySelectorAllowed(setRange))
         view.accessibility.monitor = FakeClientMonitor(attached: false)
         XCTAssertTrue(view.isAccessibilitySelectorAllowed(setValue), "VoiceOver off again")
+    }
+
+    /// m19: the view has the focus only as the first responder of the key
+    /// window, the window's key state included.
+    func testA0dTheFocusIsTheKeyWindowsFirstResponder() {
+        let window = KeyControlledWindow(contentRect: NSRect(x: 0, y: 0, width: 160, height: 96))
+        self.window = window
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 160, height: 96))
+        window.contentView = container
+        container.addSubview(view)
+        XCTAssertTrue(window.makeFirstResponder(view))
+        XCTAssertFalse(view.isAccessibilityFocused(), "the first responder of a window that is not key")
+        window.isKeyForTest = true
+        XCTAssertTrue(view.isAccessibilityFocused())
+        XCTAssertTrue(window.makeFirstResponder(nil))
+        XCTAssertFalse(view.isAccessibilityFocused(), "a key window whose first responder is another")
+    }
+
+    /// D10 on a real view: its output is announced while it is the key
+    /// window's first responder, and not while the window is not key or
+    /// the keyboard is elsewhere in it. VoiceOver focusing the view (with
+    /// its cursor moving the keyboard focus) makes it the first responder.
+    func testD10TheViewAnnouncesOnlyWithTheKeyboardFocus() async throws {
+        let window = KeyControlledWindow(contentRect: NSRect(x: 0, y: 0, width: 160, height: 96))
+        self.window = window
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 160, height: 96))
+        window.contentView = container
+        container.addSubview(view)
+        XCTAssertTrue(window.makeFirstResponder(view))
+        window.isKeyForTest = true
+        let scheduler = ManualScheduler()
+        let recorder = PostRecorder { scheduler.now }
+        view.accessibility.scheduler = scheduler
+        view.accessibility.poster = recorder
+        view.accessibility.monitor = FakeClientMonitor(attached: true)
+        view.accessibility.contentChanged()
+        scheduler.advance(by: 0.2)
+        XCTAssertEqual(recorder.notifications, [.valueChanged], "the first settle only tells the client to read")
+        var printed = Self.b1
+        func output(_ line: String) async throws -> String? {
+            recorder.clear()
+            try session.write(Data("\(line)\n".utf8))
+            printed += line + "\n"
+            try await waitForValue(printed)
+            // Past the settle and the posts budget of the one before.
+            scheduler.advance(by: 1.1)
+            XCTAssertTrue(recorder.notifications.contains(.valueChanged), "\(line): told")
+            return recorder.posts.first { $0.notification == .announcementRequested }?.userInfo?[.announcement]
+                as? String
+        }
+        let first = try await output("one")
+        XCTAssertEqual(first, "$ one", "focused")
+        window.isKeyForTest = false
+        let second = try await output("two")
+        XCTAssertNil(second, "the window is not key")
+        window.isKeyForTest = true
+        XCTAssertTrue(window.makeFirstResponder(nil))
+        let third = try await output("three")
+        XCTAssertNil(third, "the keyboard is elsewhere")
+        // As VoiceOver moves the keyboard focus to the element its cursor
+        // is on (AXFocused set), which AppKit makes the first responder.
+        view.setAccessibilityFocused(true)
+        XCTAssertTrue(window.firstResponder === view, "AXFocused gives the view the keyboard")
+        let fourth = try await output("four")
+        XCTAssertEqual(fourth, "four", "focused again")
     }
 
     func testA1ToA13TheValueAndItsLookups() throws {
@@ -287,6 +365,69 @@ final class TerminalAccessibilityViewTests: XCTestCase {
         let right = window.convertToScreen(view.convert(NSRect(x: 150, y: 90, width: 0, height: 0), to: nil))
         XCTAssertEqual(view.accessibilityRange(for: right.origin), NSRange(location: 1, length: 1), "row 0's last")
     }
+
+    /// Puts the view in a borderless window at (200, 300) on the screen, a
+    /// container's only subview, with `metrics`.
+    private func putInAWindow(metrics: TesseraSurface.Metrics) -> NSWindow {
+        let window = NSWindow(
+            contentRect: NSRect(x: 200, y: 300, width: 160, height: 96), styleMask: [.borderless], backing: .buffered,
+            defer: false)
+        window.isReleasedWhenClosed = false
+        self.window = window
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 160, height: 96))
+        window.contentView = container
+        view.frame = container.bounds
+        container.addSubview(view)
+        view.metrics = metrics
+        view.sessionDidOutput()
+        return window
+    }
+
+    /// m20: on a Retina screen the metrics are in pixels, twice the points
+    /// (4 px of padding is 2 pt); the frames are in points all the same.
+    func testC10FramesConvertPixelsToPointsAtTheScreensScale() {
+        let window = putInAWindow(
+            metrics: TesseraSurface.Metrics(
+                widthPx: 320, heightPx: 192, scale: 2, cellWidthPx: 16, cellHeightPx: 32, baselinePx: 24,
+                paddingPx: 4, rows: 5, cols: 19, fontSizePt: 13, cursorRow: 2, cursorCol: 2, cursorOnScreen: true,
+                cursorWide: false))
+        let frame = view.accessibilityFrame(for: NSRange(location: 3, length: 5))
+        // a.txt: 2 pt in, row 1 from 2 + 16 to 2 + 32 pt from the top of 96.
+        let expected = window.convertToScreen(view.convert(NSRect(x: 2, y: 96 - 34, width: 40, height: 16), to: nil))
+        XCTAssertEqual(frame, expected)
+        let onB = window.convertToScreen(view.convert(NSRect(x: 2 + 7 * 8 + 1, y: 96 - 34 + 1, width: 0, height: 0), to: nil))
+        XCTAssertEqual(view.accessibilityRange(for: onB.origin), NSRange(location: 10, length: 1), "the b of b.txt")
+    }
+
+    /// D-2 on the view: a wide character is one character over two cells,
+    /// an `e` with a combining acute one character of two UTF-16 units over
+    /// one cell; their ranges, strings, frames and the characters under
+    /// points follow.
+    func testB2WideAndCombiningTextOnTheView() async throws {
+        let wide = try app.spawn(
+            .init(
+                program: "/bin/sh",
+                arguments: ["-c", #"stty -echo -icanon; printf '\346\227\245\346\234\254x\r\ne\314\201y\r\n$ '; exec cat"#],
+                rows: 6, cols: 20))
+        view = TerminalSurfaceView(session: wide)
+        view.accessibility.monitor = FakeClientMonitor(attached: false)
+        let text = "日本x\ne\u{301}y\n$ "
+        try await waitForValue(text)
+        let window = putInAWindow(metrics: Self.metrics)
+        XCTAssertEqual(view.accessibilityNumberOfCharacters(), 10)
+        XCTAssertEqual(view.accessibilityRange(forLine: 1), NSRange(location: 4, length: 4))
+        XCTAssertEqual(view.accessibilityRange(for: 1), NSRange(location: 1, length: 1), "本")
+        XCTAssertEqual(view.accessibilityRange(for: 5), NSRange(location: 4, length: 2), "the cluster, from its mark")
+        XCTAssertEqual(view.accessibilityString(for: NSRange(location: 4, length: 2)), "e\u{301}")
+        func screen(_ rect: NSRect) -> NSRect { window.convertToScreen(view.convert(rect, to: nil)) }
+        // Rows from the top of a 96 pt view: row 0 is y 80 to 96, row 1 64 to 80.
+        XCTAssertEqual(view.accessibilityFrame(for: NSRange(location: 1, length: 1)), screen(NSRect(x: 16, y: 80, width: 16, height: 16)), "本: two cells")
+        XCTAssertEqual(view.accessibilityFrame(for: NSRange(location: 2, length: 1)), screen(NSRect(x: 32, y: 80, width: 8, height: 16)), "x after it")
+        XCTAssertEqual(view.accessibilityFrame(for: NSRange(location: 4, length: 2)), screen(NSRect(x: 0, y: 64, width: 8, height: 16)), "é: one cell")
+        XCTAssertEqual(view.accessibilityFrame(for: NSRange(location: 6, length: 1)), screen(NSRect(x: 8, y: 64, width: 8, height: 16)), "y")
+        XCTAssertEqual(view.accessibilityRange(for: screen(NSRect(x: 3 * 8 + 1, y: 81, width: 0, height: 0)).origin), NSRange(location: 1, length: 1), "the right half of 本")
+        XCTAssertEqual(view.accessibilityRange(for: screen(NSRect(x: 1, y: 65, width: 0, height: 0)).origin), NSRange(location: 4, length: 2), "é")
+    }
 }
 
 // MARK: Notifications (fixture rows D)
@@ -294,13 +435,14 @@ final class TerminalAccessibilityViewTests: XCTestCase {
 /// When and how ``TerminalAccessibility`` tells VoiceOver about output
 /// (#52, accessibility fixture rows N1 to N18, docs/security.md S6), with a
 /// fake client, a recorder for the posts and a clock the test advances. The
-/// element is a plain view in a window; the snapshots come from a real
+/// element is a plain view in a window, focused unless a test says
+/// otherwise (D10); the snapshots come from a real
 /// session whose child prints a prompt with echo off and copies its input.
 @MainActor
 final class TerminalAccessibilityNotificationTests: XCTestCase {
     private var app: TesseraApp!
     private var session: TesseraSession!
-    private var element: NSView!
+    private var element: FocusStandIn!
     private var window: NSWindow!
     private var scheduler: ManualScheduler!
     private var recorder: PostRecorder!
@@ -318,7 +460,7 @@ final class TerminalAccessibilityNotificationTests: XCTestCase {
             contentRect: NSRect(x: 0, y: 0, width: 200, height: 100), styleMask: [.borderless], backing: .buffered,
             defer: false)
         window.isReleasedWhenClosed = false
-        element = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 100))
+        element = FocusStandIn(frame: NSRect(x: 0, y: 0, width: 200, height: 100))
         window.contentView = element
         scheduler = ManualScheduler()
         recorder = PostRecorder { [unowned self] in scheduler.now }
@@ -463,6 +605,63 @@ final class TerminalAccessibilityNotificationTests: XCTestCase {
         XCTAssertEqual(recorder.notifications, [.selectedTextChanged], "nothing changed: nothing posted")
     }
 
+    /// m16: output that adds only blank lines changes the value and moves
+    /// the cursor, but the announcement is empty and is not posted.
+    func testN16BlankLinesAreNotAnnounced() async throws {
+        attach()
+        try session.write(Data("\n\n".utf8))
+        try await waitUntil("two blank lines") { try session.accessibleText().lineCount == 3 }
+        accessibility.contentChanged()
+        scheduler.advance(by: 0.2)
+        XCTAssertEqual(recorder.notifications, [.valueChanged, .selectedTextChanged], "no empty announcement")
+    }
+
+    /// m17: the view scrolled back by a line, so the cursor left it while
+    /// the insertion point stayed put (the end of a text of the same
+    /// length): only `hasCursor` changed, and `selectedTextChanged` says so.
+    func testN17ACursorThatOnlyLeavesTheViewPostsSelectedTextChanged() async throws {
+        let script = #"stty -echo -icanon; printf 'ab\r\ncd\r\nef\r\ngh\r\n$ '; exec cat"#
+        let short = try app.spawn(.init(program: "/bin/sh", arguments: ["-c", script], rows: 3, cols: 20))
+        try await waitUntil("the lines are printed") { try short.accessibleText().string == "ef\ngh\n$ " }
+        accessibility.textProvider = { try short.accessibleText() }
+        attach()
+        let live = try short.accessibleText()
+        try short.scroll(to: .offset(1))
+        let back = try short.accessibleText()
+        XCTAssertEqual(back.string, "cd\nef\ngh")
+        XCTAssertEqual(back.selectedRange, live.selectedRange, "the insertion point did not move")
+        XCTAssertTrue(live.hasCursor)
+        XCTAssertFalse(back.hasCursor, "the cursor left the view")
+        accessibility.contentChanged()
+        scheduler.advance(by: 0.2)
+        XCTAssertEqual(recorder.notifications, [.valueChanged, .selectedTextChanged])
+    }
+
+    /// D10: an element without the keyboard focus (a background window or
+    /// tab, an unfocused pane) tells the change but announces nothing,
+    /// then or once it is focused; output after that is announced.
+    func testD10OnlyTheFocusedElementAnnounces() async throws {
+        attach()
+        element.isFocused = false
+        try session.write(Data("unfocused\n".utf8))
+        try await waitForText("$ unfocused\n")
+        accessibility.contentChanged()
+        scheduler.advance(by: 0.2)
+        XCTAssertEqual(recorder.notifications, [.valueChanged, .selectedTextChanged], "told, not announced")
+        recorder.clear()
+
+        element.isFocused = true
+        accessibility.contentChanged()
+        scheduler.advance(by: 0.2)
+        XCTAssertTrue(recorder.posts.isEmpty, "the missed output is not read on focus")
+        try session.write(Data("focused\n".utf8))
+        try await waitForText("$ unfocused\nfocused\n")
+        accessibility.contentChanged()
+        scheduler.advance(by: 0.2)
+        XCTAssertEqual(recorder.notifications, [.announcementRequested, .valueChanged, .selectedTextChanged])
+        XCTAssertEqual(recorder.posts.first?.userInfo?[.announcement] as? String, "focused", "only the new line")
+    }
+
     func testN18AnElementOutOfItsWindowPostsNothing() async throws {
         attach()
         try session.write(Data("one\n".utf8))
@@ -529,6 +728,151 @@ final class TerminalAccessibilityNotificationTests: XCTestCase {
     }
 }
 
+/// D10 against a focus change while a settle is pending (adversarial
+/// 24.16 M1): output printed before the view got the keyboard focus is
+/// never read, whether the focus comes from the first responder or the
+/// window becoming key; output just before the focus leaves is dropped
+/// (accepted, ADR 0041).
+@MainActor
+final class TerminalAccessibilityFocusRaceTests: XCTestCase {
+    private var app: TesseraApp!
+    private var session: TesseraSession!
+    private var view: TerminalSurfaceView!
+    private var window: KeyControlledWindow!
+    private var scheduler: ManualScheduler!
+    private var recorder: PostRecorder!
+    private var printed = "ls\na.txt  b.txt\n$ "
+
+    override func setUp() async throws {
+        app = try TesseraApp()
+        session = try app.spawn(
+            .init(
+                program: "/bin/sh", arguments: ["-c", #"stty -echo -icanon; printf 'ls\r\na.txt  b.txt\r\n$ '; exec cat"#],
+                rows: 24, cols: 20))
+        view = TerminalSurfaceView(session: session)
+        view.accessibility.monitor = FakeClientMonitor(attached: false)
+        try await waitForValue(printed)
+        window = KeyControlledWindow(contentRect: NSRect(x: 0, y: 0, width: 160, height: 96))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 160, height: 96))
+        window.contentView = container
+        container.addSubview(view)
+        window.isKeyForTest = true
+        scheduler = ManualScheduler()
+        recorder = PostRecorder { [unowned self] in scheduler.now }
+        view.accessibility.scheduler = scheduler
+        view.accessibility.poster = recorder
+        view.accessibility.monitor = FakeClientMonitor(attached: true)
+        view.accessibility.contentChanged()
+        scheduler.advance(by: 1.2)
+        recorder.clear()
+    }
+
+    override func tearDown() async throws {
+        window?.close()
+        window = nil
+        view = nil
+        session = nil
+        app?.shutdown()
+        app = nil
+    }
+
+    private func waitForValue(_ expected: String) async throws {
+        try await waitUntil("the view reads \(expected.debugDescription)") {
+            view.sessionDidOutput()
+            return view.accessibilityValue() as? String == expected
+        }
+    }
+
+    /// Output reaches the view and its settle is pending (0.05 s in).
+    private func output(_ line: String) async throws {
+        try session.write(Data("\(line)\n".utf8))
+        printed += line + "\n"
+        try await waitForValue(printed)
+        scheduler.advance(by: 0.05)
+    }
+
+    private var announcements: [String] {
+        recorder.posts.filter { $0.notification == .announcementRequested }
+            .compactMap { $0.userInfo?[.announcement] as? String }
+    }
+
+    /// R1: the unfocused pane prints, then gets the keyboard before the
+    /// settle: "focusing the pane later does not read what it missed".
+    func testR1OutputBeforeTheFocusIsNotReadOnFocus() async throws {
+        XCTAssertTrue(window.makeFirstResponder(nil))
+        scheduler.advance(by: 1.2)
+        recorder.clear()
+        try await output("missed")
+        XCTAssertTrue(window.makeFirstResponder(view))
+        scheduler.advance(by: 1.2)
+        XCTAssertEqual(announcements, [], "output from before the focus")
+        // Told at the focus without a post: VoiceOver reads the element
+        // the focus moved to itself.
+        XCTAssertEqual(recorder.notifications, [], "nothing to tell at the settle")
+    }
+
+    /// R2 (accepted): the focused pane prints, the keyboard leaves before
+    /// the settle: the output is never announced, not even once the focus
+    /// is back.
+    func testR2OutputJustBeforeTheFocusLeavesIsDropped() async throws {
+        XCTAssertTrue(window.makeFirstResponder(view))
+        scheduler.advance(by: 1.2)
+        recorder.clear()
+        try await output("seen")
+        XCTAssertTrue(window.makeFirstResponder(nil))
+        scheduler.advance(by: 1.2)
+        XCTAssertTrue(window.makeFirstResponder(view))
+        scheduler.advance(by: 1.2)
+        XCTAssertEqual(announcements, [], "only the element focused at the settle speaks")
+    }
+
+    /// R3: a stream in an unfocused pane (a change every 0.1 s, one settle
+    /// held up to `maxWait`) that gets the keyboard 0.8 s in.
+    func testR3AStreamBeforeTheFocusIsNotReadOnFocus() async throws {
+        XCTAssertTrue(window.makeFirstResponder(nil))
+        scheduler.advance(by: 1.2)
+        recorder.clear()
+        for index in 0..<8 {
+            try session.write(Data("b\(index)\n".utf8))
+            printed += "b\(index)\n"
+            try await waitForValue(printed)
+            scheduler.advance(by: 0.1)
+        }
+        XCTAssertTrue(window.makeFirstResponder(view))
+        scheduler.advance(by: 1.2)
+        XCTAssertEqual(announcements, [], "the stream from before the focus")
+    }
+
+    /// R4: the window becomes key with a settle pending, and nothing tells
+    /// the view (only the settle sees the gain).
+    func testR4AWindowThatBecomesKeyDoesNotReadWhatCameBefore() async throws {
+        XCTAssertTrue(window.makeFirstResponder(view))
+        window.isKeyForTest = false
+        scheduler.advance(by: 1.2)
+        recorder.clear()
+        try await output("far")
+        window.isKeyForTest = true
+        scheduler.advance(by: 1.2)
+        XCTAssertEqual(announcements, [], "output from before the window was key")
+        try await output("near")
+        scheduler.advance(by: 1.2)
+        XCTAssertEqual(announcements, ["near"], "output once it is key")
+    }
+
+    /// R5: output right after the focus came, in the same pending settle as
+    /// the missed output, is read alone.
+    func testR5OutputAfterTheFocusInTheSameSettleIsReadAlone() async throws {
+        XCTAssertTrue(window.makeFirstResponder(nil))
+        scheduler.advance(by: 1.2)
+        recorder.clear()
+        try await output("missed")
+        XCTAssertTrue(window.makeFirstResponder(view))
+        try await output("after")
+        scheduler.advance(by: 1.2)
+        XCTAssertEqual(announcements, ["after"], "only what came after the focus")
+    }
+}
+
 // MARK: The view and the app
 
 /// The terminal view's own accessibility through the app: output reaches
@@ -568,6 +912,14 @@ final class TerminalAccessibilityAppTests: XCTestCase {
         appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-c", "stty -echo -icanon; exec cat"])
         let controller = try appDelegate.newWindow()
         let view = controller.focusedPane.view
+        // Only the key window's first responder announces (D10), and the
+        // host's windows need not become key: the view moves to a window
+        // that says it is.
+        let window = KeyControlledWindow(contentRect: view.frame)
+        window.isKeyForTest = true
+        window.contentView = view
+        XCTAssertTrue(window.makeFirstResponder(view))
+        defer { window.close() }
         let scheduler = ManualScheduler()
         let recorder = PostRecorder { scheduler.now }
         view.accessibility.scheduler = scheduler
@@ -593,6 +945,73 @@ final class TerminalAccessibilityAppTests: XCTestCase {
         XCTAssertEqual(
             recorder.posts.first { $0.notification == .announcementRequested }?.userInfo?[.announcement] as? String,
             "hello")
+    }
+
+    /// D10 through the app: two windows, the first split and with a second
+    /// tab. The test moves the focus as the app does (a tab's selection with
+    /// `makeKeyAndOrderFront`, the controller giving a pane the keyboard
+    /// with `makeFirstResponder`) and posts nothing itself; the views run on
+    /// the real clock and timers. Output in the background window, the
+    /// background tab and the unfocused pane is told (`valueChanged`) but
+    /// not announced. The focused pane's is announced where the host makes
+    /// a window key (the CI runner); a locked session has no key window,
+    /// so nothing is announced there, and the view test above covers a key
+    /// window.
+    func testD10OnlyTheFocusedPaneOfTheKeyWindowAnnounces() async throws {
+        appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-c", "stty -echo -icanon; exec cat"])
+        let first = try appDelegate.newWindow()
+        let firstWindow = try XCTUnwrap(first.window as? TerminalWindow)
+        let left = first.focusedPane
+        let right = try XCTUnwrap(try first.splitFocusedPane(.right))
+        let tab = try appDelegate.newTab(in: firstWindow)
+        let second = try appDelegate.newWindow()
+        firstWindow.selectTab(at: 0)
+        first.focus(left)
+        XCTAssertTrue(firstWindow.tabGroup?.selectedWindow === firstWindow, "the first tab is selected")
+        XCTAssertTrue(firstWindow.firstResponder === left.view, "the left pane has the keyboard")
+        try await Task.sleep(for: .milliseconds(100))
+        let hasKey = NSApp.keyWindow != nil
+        if hasKey {
+            XCTAssertTrue(NSApp.keyWindow === firstWindow, "the window brought to the front is key")
+        }
+
+        let panes = [
+            ("the focused pane", left), ("the unfocused pane", right), ("the background tab", tab.focusedPane),
+            ("the background window", second.focusedPane),
+        ]
+        let recorders = panes.map { _, pane in
+            let recorder = PostRecorder { CACurrentMediaTime() }
+            pane.view.accessibility.poster = recorder
+            // Detached first, whatever the machine's VoiceOver says, so
+            // attaching is a change; the first settle records the snapshot.
+            pane.view.accessibility.monitor = FakeClientMonitor(attached: false)
+            pane.view.accessibility.monitor = FakeClientMonitor(attached: true)
+            pane.view.accessibility.contentChanged()
+            return recorder
+        }
+        try await waitUntil("every first settle") {
+            recorders.allSatisfy { $0.notifications.contains(.valueChanged) }
+        }
+        for recorder in recorders { recorder.clear() }
+        for (_, pane) in panes {
+            try pane.session.write(Data("hello\n".utf8))
+        }
+        try await waitUntil("every pane shows its output") {
+            try panes.allSatisfy { _, pane in try pane.session.accessibleText().string == "hello\n" }
+        }
+        try await waitUntil("every pane told its output") {
+            recorders.allSatisfy { $0.notifications.contains(.valueChanged) }
+        }
+        // A settle still pending, had the output come in two reads.
+        try await Task.sleep(for: .milliseconds(500))
+        for ((name, _), recorder) in zip(panes, recorders) {
+            let announced = recorder.notifications.contains(.announcementRequested)
+            XCTAssertEqual(announced, name == "the focused pane" && hasKey, "\(name): announced")
+        }
+        let announcement = recorders[0].posts.first { $0.notification == .announcementRequested }
+        if hasKey {
+            XCTAssertEqual(announcement?.userInfo?[.announcement] as? String, "hello")
+        }
     }
 
     /// `seq` floods a view whose (fake) VoiceOver is attached, on the real
@@ -846,6 +1265,20 @@ final class DisplayOptionsSettingTests: XCTestCase {
         postSettingChange()
         try await waitUntil("the dimming is back") { appDelegate.paneDimming > 0.39 }
         XCTAssertEqual(appDelegate.displayOptionsCallCount, calls + 2)
+    }
+
+    /// m10: a new core starts with the default options, so it is handed
+    /// the settings even though they did not change since the last core.
+    func testANewCoreIsHandedTheSettingsTheLastOneHad() async throws {
+        contrast = true
+        try appDelegate.replaceCore(start: true)
+        XCTAssertEqual(appDelegate.paneDimming, 0, "Increase Contrast reached the first core")
+        let calls = appDelegate.displayOptionsCallCount
+        try appDelegate.replaceCore(start: true)
+        XCTAssertEqual(appDelegate.displayOptionsCallCount, calls + 1, "the same options, a new core")
+        XCTAssertEqual(appDelegate.paneDimming, 0, "and the new core has them")
+        let controller = try appDelegate.newWindow()
+        XCTAssertEqual(controller.paneContainer.inactivePaneDimming, 0)
     }
 
     func testOnlyTheWorkspaceCentreIsObserved() async throws {

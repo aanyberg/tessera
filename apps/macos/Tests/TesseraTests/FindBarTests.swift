@@ -342,6 +342,59 @@ final class FindBarTests: XCTestCase {
         XCTAssertNil(view.findBar, "the close button")
     }
 
+    /// ⌘↑ with the find field focused (#334, ADR 0039 N1): the prompt rule
+    /// is the terminal's own key route, which runs only while the terminal
+    /// has the keyboard, so the key goes on to the menus, where it is Page
+    /// Up's key equivalent, and pages as choosing Page Up does. The field
+    /// keeps the keyboard, its text and its caret. With the terminal
+    /// focused the same key jumps to the previous prompt. Routed as AppKit
+    /// routes a key equivalent: the window's views, then the menus.
+    func testCommandUpWithTheFieldFocusedPagesThroughTheMenu() async throws {
+        let mark = { (payload: String) in "\\033]133;\(payload)\\007" }
+        let first = "\(mark("A"))$ \(mark("B"))ls\\n\(mark("C"))out1\\nout2\\n\(mark("D;0"))"
+        let second = "\(mark("A"))$ \(mark("B"))echo\\n\(mark("C"))hi\\n\(mark("D;0"))\(mark("A"))$ "
+        // Line 0 is the first prompt, 103 the second and 105 the live one.
+        let view = try makeView("printf '\(first)'; seq 1 100; printf '\(second)'; exec cat")
+        try await tick(view, until: "the marked output") {
+            let position = try view.session.scrollPosition
+            let marked = try view.session.hasCommandOutput
+            return position.history + UInt64(position.rows) == 106 && marked
+        }
+        let window = try XCTUnwrap(view.window)
+        view.showFindBar(nil)
+        let bar = try XCTUnwrap(view.findBar)
+        bar.field.currentEditor()?.insertText("abc")
+        XCTAssertTrue(bar.fieldHasFocus)
+        // The menu items have no target: from the field AppKit finds the
+        // view up the responder chain. The test host has no key window to
+        // start that chain from, so the items are aimed at the view.
+        let chain = sequence(first: try XCTUnwrap(window.firstResponder), next: \.nextResponder)
+        XCTAssertTrue(chain.contains { $0 === view }, "the field's responder chain reaches the terminal")
+        let menu = try XCTUnwrap(MainMenu.item(forCommand: "scroll_page_up", in: NSApp.mainMenu)?.menu)
+        for item in menu.items { item.target = view }
+        defer { for item in menu.items { item.target = nil } }
+        let characters = MainMenu.functionKey(NSUpArrowFunctionKey)
+        let commandUp = try XCTUnwrap(
+            NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: [.command, .numericPad, .function], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, characters: characters,
+                charactersIgnoringModifiers: characters, isARepeat: false, keyCode: 126))
+        let position = try view.session.scrollPosition
+        XCTAssertEqual(position.offset, 0)
+
+        XCTAssertFalse(window.performKeyEquivalent(with: commandUp), "no view takes it: the terminal lacks the keyboard")
+        XCTAssertTrue(NSApp.mainMenu?.performKeyEquivalent(with: commandUp) ?? false, "Page Up's item takes it")
+        XCTAssertEqual(try view.session.scrollPosition.offset, UInt64(position.rows - 1), "one page, not the prompt")
+        XCTAssertTrue(bar.fieldHasFocus, "the field keeps the keyboard")
+        XCTAssertEqual(bar.field.stringValue, "abc")
+        XCTAssertEqual((bar.field.currentEditor() as? NSTextView)?.selectedRange(), NSRange(location: 3, length: 0))
+
+        view.scroll(to: .bottom)
+        XCTAssertTrue(window.makeFirstResponder(view))
+        XCTAssertTrue(window.performKeyEquivalent(with: commandUp), "the terminal's own route")
+        XCTAssertEqual(try view.session.scrollPosition.offset, position.history, "the first prompt at the top")
+    }
+
     func testTheBarFloatsInTheTopTrailingCornerAndNeverResizesTheGrid() async throws {
         let view = try await makeView(showing: ["hit"])
         let resizes = view.coreResizeCount

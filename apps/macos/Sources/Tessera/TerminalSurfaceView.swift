@@ -976,7 +976,12 @@ final class TerminalSurfaceView: NSView, TerminalContentView {
         // command whose item's key equivalent `AppKit` did not match to this
         // event, on another layout say); the rest go up the responder chain
         // (and end in a beep), not to the session, which would encode them as
-        // kitty `CSI u` sequences the shell would print.
+        // kitty `CSI u` sequences the shell would print. The binding lookup
+        // is defensive: in AppKit's routing `performKeyEquivalent(with:)`
+        // has already offered the chord to the key map before the menus, so
+        // in the app a bound chord normally does not get here. It is kept
+        // for a key event delivered to `keyDown` directly (a responder that
+        // forwards one, a test), which skips that step.
         if !markedBefore && flags.contains(.command) {
             if let key = keyEvent(for: event, selector: nil), dispatch(key, bindingsOnly: true) == .consumed {
                 return

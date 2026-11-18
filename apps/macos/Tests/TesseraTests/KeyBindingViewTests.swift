@@ -157,10 +157,11 @@ final class KeyBindingViewTests: XCTestCase {
     }
 
     /// ⌘↑ (Page Up) during a composition (#415, simulated marked text; a
-    /// real input method is a manual check): the view passes it on, the
-    /// installed View menu's item is disabled so it does not scroll, and
-    /// `keyDown` hands it to the input method; nothing reaches the child
-    /// and the marked text stays. Without marked text the view runs the
+    /// real input method is a manual check): the view passes it on and the
+    /// installed View menu's item, disabled, takes it without scrolling
+    /// (AppKit swallows a key equivalent of a disabled item), so it never
+    /// reaches `keyDown`; nothing reaches the child and the marked text
+    /// stays. Without marked text the view runs the
     /// binding (`prompt_previous` by default) and the menu item scrolls, so
     /// both routes are live.
     func testCommandUpDuringACompositionNeitherScrollsNorReachesTheChild() async throws {
