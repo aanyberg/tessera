@@ -831,9 +831,9 @@ final class PaneTests: XCTestCase {
         try await start("sleep 200", in: try split(second, .below))
         _ = try split(second, .right)
 
-        presenter.quitAnswer = false
+        presenter.modalAnswer = false
         XCTAssertEqual(appDelegate.applicationShouldTerminate(NSApp), .terminateCancel)
-        XCTAssertEqual(presenter.quits, [CloseConfirmation(scope: .quit, processNames: ["sleep", "sleep"])])
+        XCTAssertEqual(presenter.modals, [CloseConfirmation(scope: .quit, processNames: ["sleep", "sleep"])])
         second.closeTabGroup(nil)
         XCTAssertEqual(
             presenter.sheets.map(\.confirmation), [CloseConfirmation(scope: .window, processNames: ["sleep", "sleep"])])

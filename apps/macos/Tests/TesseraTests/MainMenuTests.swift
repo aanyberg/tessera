@@ -50,15 +50,21 @@ final class MainMenuTests: XCTestCase {
         var modifiers: NSEvent.ModifierFlags = []
         var action: Selector?
         var hidden = false
+        /// Shown in place of the item before it while ⌥ is held.
+        var alternate = false
 
         static let separator = Item(title: "-")
 
-        init(title: String, key: String = "", modifiers: NSEvent.ModifierFlags = [], action: Selector? = nil, hidden: Bool = false) {
+        init(
+            title: String, key: String = "", modifiers: NSEvent.ModifierFlags = [], action: Selector? = nil,
+            hidden: Bool = false, alternate: Bool = false
+        ) {
             self.title = title
             self.key = key
             self.modifiers = key.isEmpty ? [] : modifiers
             self.action = action
             self.hidden = hidden
+            self.alternate = alternate
         }
 
         @MainActor init(_ item: NSMenuItem) {
@@ -70,7 +76,9 @@ final class MainMenuTests: XCTestCase {
             let modifiers = mask.intersection(.deviceIndependentFlagsMask)
             // A hidden item counts only if its key equivalent works (D3).
             let hidden = item.isHidden && item.allowsKeyEquivalentWhenHidden
-            self.init(title: item.title, key: key, modifiers: modifiers, action: item.action, hidden: hidden)
+            self.init(
+                title: item.title, key: key, modifiers: modifiers, action: item.action, hidden: hidden,
+                alternate: item.isAlternate)
             if item.isHidden && !hidden {
                 self.title += " (hidden, key equivalent off)"
             }
@@ -79,6 +87,7 @@ final class MainMenuTests: XCTestCase {
         var description: String {
             let action = action.map(NSStringFromSelector) ?? "nil"
             return "\(title) [\(key) \(modifiers.rawValue)] \(action)\(hidden ? " hidden" : "")"
+                + (alternate ? " alternate" : "")
         }
     }
 
@@ -97,6 +106,12 @@ final class MainMenuTests: XCTestCase {
         Item(title: "Show All", action: #selector(NSApplication.unhideAllApplications(_:))),
         .separator,
         Item(title: "Quit Tessera", key: "q", modifiers: command, action: #selector(NSApplication.terminate(_:))),
+        // Titled for the test host's "Close windows when quitting an
+        // application" (#464; QuitAndCloseAllTests flips it).
+        Item(
+            title: AppDelegate.quitAlternateTitle(quitKeepsWindows: WindowStateStore.quitKeepsWindows(.standard)),
+            key: "q", modifiers: [.command, .option], action: #selector(AppDelegate.quitWithTheOtherWindowChoice(_:)),
+            alternate: true),
     ]
 
     private static let shellItems: [Item] = [
@@ -108,6 +123,10 @@ final class MainMenuTests: XCTestCase {
         Item(title: "New Tab with Profile (hidden, key equivalent off)", action: #selector(NSMenu.submenuAction(_:))),
         .separator,
         Item(title: "Close Tab", key: "w", modifiers: command, action: #selector(NSWindow.performClose(_:))),
+        // Tessera's own, in place of AppKit's `closeAll:` (#464).
+        Item(
+            title: "Close All", key: "w", modifiers: [.command, .option],
+            action: #selector(AppDelegate.closeAllWindows(_:)), alternate: true),
         Item(
             title: "Close Window", key: "w", modifiers: [.command, .shift],
             action: #selector(TerminalWindowController.closeTabGroup(_:))),
@@ -210,12 +229,14 @@ final class MainMenuTests: XCTestCase {
         return try XCTUnwrap(bar.items.first { $0.submenu?.title == title }?.submenu, "no \(title) menu")
     }
 
-    /// Items AppKit adds to the installed menus: the Close All alternate of
-    /// Close Tab, the window list, and those it adds to Edit and View (Show
-    /// All Tabs and Enter Full Screen, in a running app only).
+    /// Items AppKit adds to the installed menus: the window list, and those
+    /// it adds to Edit and View (Show All Tabs and Enter Full Screen, in a
+    /// running app only). Not its Close All (`closeAll:`), which it adds
+    /// only to a menu bar without a ⌥⌘W item: Tessera's own takes its
+    /// place (#464), so one would fail this test.
     private static func isAppKitItem(_ item: NSMenuItem) -> Bool {
         let added: Set<String> = [
-            "closeAll:", "makeKeyAndOrderFront:", "orderFrontCharacterPalette:", "startDictation:",
+            "makeKeyAndOrderFront:", "orderFrontCharacterPalette:", "startDictation:",
             "toggleFullScreen:", "toggleTabOverview:", "_handleInsertFromContactsCommand:",
         ]
         return item.action.map { added.contains(NSStringFromSelector($0)) } ?? false
@@ -231,6 +252,9 @@ final class MainMenuTests: XCTestCase {
     func testEveryItemHasItsTitleKeyEquivalentAndModifiers() throws {
         for (title, items) in Self.expected {
             let menu = try installedMenu(title)
+            // The Quit alternate's title follows the setting as the menu is
+            // validated.
+            if title == "Tessera" { menu.update() }
             // AppKit adds items of its own (see `isAppKitItem`).
             var installed = menu.items.filter { !Self.isAppKitItem($0) }
             // And the AutoFill submenu, after a separator, at the end of Edit.

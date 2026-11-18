@@ -15,9 +15,12 @@ final class RecordingCloseConfirmationPresenter: CloseConfirmationPresenter {
     }
 
     private(set) var sheets: [Sheet] = []
-    private(set) var quits: [CloseConfirmation] = []
-    /// What ``confirmQuit(_:)`` answers.
-    var quitAnswer = false
+    private(set) var modals: [CloseConfirmation] = []
+    /// What ``confirmApplicationModally(_:)`` answers.
+    var modalAnswer = false
+    /// Runs while ``confirmApplicationModally(_:)`` asks, as the main queue
+    /// runs under a real alert's `runModal`.
+    var whileAskingModally: (@MainActor () -> Void)?
 
     func confirm(
         _ confirmation: CloseConfirmation, sheetFor window: NSWindow,
@@ -26,9 +29,10 @@ final class RecordingCloseConfirmationPresenter: CloseConfirmationPresenter {
         sheets.append(Sheet(confirmation: confirmation, window: window, answer: completion))
     }
 
-    func confirmQuit(_ confirmation: CloseConfirmation) -> Bool {
-        quits.append(confirmation)
-        return quitAnswer
+    func confirmApplicationModally(_ confirmation: CloseConfirmation) -> Bool {
+        modals.append(confirmation)
+        whileAskingModally?()
+        return modalAnswer
     }
 }
 
@@ -228,9 +232,12 @@ final class CloseConfirmationTests: XCTestCase {
     // MARK: AppKit's own multi-tab closes
 
     /// AppKit's tab closes (the tab bar's Close Other Tabs, Close Tabs to
-    /// the Right, Close Window from the Window menu, Close All) ask each tab
-    /// through `windowShouldClose`: a busy tab's sheet must hold back only
-    /// that tab, so the idle tabs close and every busy tab asks.
+    /// the Right, Close Window from the Window menu, and `NSApplication`'s
+    /// `closeAll:`) ask each tab through `windowShouldClose`: a busy tab's
+    /// sheet must hold back only that tab, so the idle tabs close and every
+    /// busy tab asks. (AppKit's Close All menu item, which sent `closeAll:`,
+    /// is no longer added: Tessera's own ⌥⌘W takes its place, #464; the
+    /// action stays reachable, as from another menu item or a script.)
     func testCloseOtherTabsClosesTheIdleTabsAndAsksEveryBusyOne() async throws {
         try await checkAppKitClose("performCloseOtherTabs:", on: 0, keeps: [0])
     }
@@ -247,8 +254,8 @@ final class CloseConfirmationTests: XCTestCase {
         try await checkAppKitClose("closeAll:", on: nil, keeps: [])
     }
 
-    /// Close All (⌥⌘W, the alternate AppKit adds to Close Tab) over two
-    /// windows: every idle tab closes, every busy tab of either window asks
+    /// AppKit's `closeAll:` (its Close All, no longer in the menu, #464)
+    /// over two windows: every idle tab closes, every busy tab of either window asks
     /// once on its own sheet, and a second Close All while they ask adds
     /// none. Cancel keeps a tab; Close closes it.
     func testCloseAllAsksOncePerBusyTabOfEveryWindow() async throws {
@@ -395,15 +402,15 @@ final class CloseConfirmationTests: XCTestCase {
         try await start("sleep 100", in: try controller(of: windows[1]))
         try await start("cat", in: second)
 
-        presenter.quitAnswer = false
+        presenter.modalAnswer = false
         XCTAssertEqual(appDelegate.applicationShouldTerminate(NSApp), .terminateCancel)
-        XCTAssertEqual(presenter.quits, [CloseConfirmation(scope: .quit, processNames: ["sleep", "cat"])])
+        XCTAssertEqual(presenter.modals, [CloseConfirmation(scope: .quit, processNames: ["sleep", "cat"])])
         XCTAssertEqual(appDelegate.windowControllers.count, 3, "Cancel keeps everything open")
         XCTAssertTrue(presenter.sheets.isEmpty)
 
-        presenter.quitAnswer = true
+        presenter.modalAnswer = true
         XCTAssertEqual(appDelegate.applicationShouldTerminate(NSApp), .terminateNow)
-        XCTAssertEqual(presenter.quits.count, 2)
+        XCTAssertEqual(presenter.modals.count, 2)
     }
 
     /// `SIGTERM`, `SIGINT` and `SIGHUP` quit without asking: nobody may be
@@ -415,7 +422,7 @@ final class CloseConfirmationTests: XCTestCase {
         defer { appDelegate.terminatesWithoutConfirmation = false }
 
         XCTAssertEqual(appDelegate.applicationShouldTerminate(NSApp), .terminateNow)
-        XCTAssertTrue(presenter.quits.isEmpty)
+        XCTAssertTrue(presenter.modals.isEmpty)
     }
 
     /// A quit Apple event that names no reason (the Dock's Quit,
@@ -459,7 +466,7 @@ final class CloseConfirmationTests: XCTestCase {
     ) async throws {
         let controller = try appDelegate.newWindow()
         try await start("sleep 100", in: controller)
-        presenter.quitAnswer = false
+        presenter.modalAnswer = false
 
         let event = NSAppleEventDescriptor(
             eventClass: AEEventClass(kCoreEventClass), eventID: AEEventID(kAEQuitApplication),
@@ -477,7 +484,7 @@ final class CloseConfirmationTests: XCTestCase {
         }
 
         XCTAssertEqual(
-            presenter.quits, [CloseConfirmation(scope: .quit, processNames: ["sleep"])], "it asks once", file: file,
+            presenter.modals, [CloseConfirmation(scope: .quit, processNames: ["sleep"])], "it asks once", file: file,
             line: line)
         XCTAssertEqual(error, Int32(userCanceledErr), "Cancel answers the event as cancelled", file: file, line: line)
         XCTAssertEqual(appDelegate.windowControllers.count, 1, "Cancel keeps everything open", file: file, line: line)
@@ -488,7 +495,7 @@ final class CloseConfirmationTests: XCTestCase {
         _ = try openTabs(2)
 
         XCTAssertEqual(appDelegate.applicationShouldTerminate(NSApp), .terminateNow)
-        XCTAssertTrue(presenter.quits.isEmpty)
+        XCTAssertTrue(presenter.modals.isEmpty)
     }
 
     // MARK: Text
@@ -527,25 +534,6 @@ final class CloseConfirmationTests: XCTestCase {
     }
 
     // MARK: Helpers
-
-    /// Builds a program that sleeps 100 s at `binary` with the toolchain's
-    /// C compiler, or skips the test without one.
-    private func compileSleeper(to binary: URL) throws {
-        let compiler = Process()
-        compiler.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
-        compiler.arguments = ["clang", "-x", "c", "-", "-o", binary.path]
-        let source = Pipe()
-        compiler.standardInput = source
-        compiler.standardOutput = FileHandle.nullDevice
-        compiler.standardError = FileHandle.nullDevice
-        try compiler.run()
-        source.fileHandleForWriting.write(Data("#include <unistd.h>\nint main(void) { sleep(100); return 0; }\n".utf8))
-        try source.fileHandleForWriting.close()
-        compiler.waitUntilExit()
-        guard compiler.terminationStatus == 0 else {
-            throw XCTSkip("no C compiler to build a program with a hostile name (xcrun clang exited \(compiler.terminationStatus))")
-        }
-    }
 
     /// Opens a window with `count` tabs and returns them in tab-bar order.
     private func openTabs(_ count: Int) throws -> [NSWindow] {
@@ -589,6 +577,25 @@ final class CloseConfirmationTests: XCTestCase {
         _ description: String, timeout: Duration = .seconds(5), _ condition: () throws -> Bool
     ) async throws {
         _ = try await poll(description, timeout: timeout) { try condition() ? true : nil }
+    }
+}
+
+/// Builds a program that sleeps 100 s at `binary` with the toolchain's
+/// C compiler, or skips the test without one.
+func compileSleeper(to binary: URL) throws {
+    let compiler = Process()
+    compiler.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+    compiler.arguments = ["clang", "-x", "c", "-", "-o", binary.path]
+    let source = Pipe()
+    compiler.standardInput = source
+    compiler.standardOutput = FileHandle.nullDevice
+    compiler.standardError = FileHandle.nullDevice
+    try compiler.run()
+    source.fileHandleForWriting.write(Data("#include <unistd.h>\nint main(void) { sleep(100); return 0; }\n".utf8))
+    try source.fileHandleForWriting.close()
+    compiler.waitUntilExit()
+    guard compiler.terminationStatus == 0 else {
+        throw XCTSkip("no C compiler to build a program with a hostile name (xcrun clang exited \(compiler.terminationStatus))")
     }
 }
 
@@ -733,6 +740,69 @@ final class TerminationSignalTests: XCTestCase {
         assertQuit(result, within: Self.exitDeadline, "a quit event, error alert, idle sessions")
     }
 
+    // MARK: Close All and Quit's alternate (#464)
+
+    /// A signal or the system's quit with Close All's alert up (⌥⌘W, a job
+    /// running) ends the alert, and the app quits without asking, its
+    /// windows saved, through `terminate`.
+    func testASignalOrTheSystemsQuitEndsTheAppWithTheCloseAllAlertUp() async throws {
+        let triggers: [(Trigger, String)] = [
+            (.signal(SIGTERM), "SIGTERM"), (.systemQuitEvent(reason: OSType(kAEReallyLogOut)), "a log out quit event"),
+        ]
+        for (trigger, name) in triggers {
+            let result = try await run(.closeAllAlert, command: "sleep 100", trigger: trigger)
+            assertQuit(result, within: Self.exitDeadline, "\(name), Close All alert")
+        }
+    }
+
+    /// Any other quit event with Close All's alert up asks to quit, the
+    /// quit alert over Close All's; a signal then ends both.
+    func testAQuitEventWithTheCloseAllAlertUpAsksToQuit() async throws {
+        let result = try await run(
+            .closeAllAlert, command: "sleep 100", trigger: .quitEvent, thenExpect: "sheets=0 modal=Cancel,Quit",
+            followedBy: SIGTERM)
+        XCTAssertEqual(result.stateAfterTrigger, "sheets=0 modal=Cancel,Quit", "the quit alert asks")
+        XCTAssertEqual(result.ranOnAfterTrigger, true, "the app runs on while it asks")
+        assertQuit(result, within: Self.exitDeadline, "the signal after the quit event")
+    }
+
+    /// A signal or the system's quit with the quit alert of Quit and Keep
+    /// Windows up (⌥⌘Q, windows close on quit) quits without asking, and
+    /// keeps the alternate's choice: the next launch restores the windows.
+    func testASignalOrTheSystemsQuitWithTheQuitAlternatesAlertUpKeepsItsChoice() async throws {
+        let triggers: [(Trigger, String)] = [
+            (.signal(SIGTERM), "SIGTERM"), (.systemQuitEvent(reason: OSType(kAEShutDown)), "a shut down quit event"),
+        ]
+        for (trigger, name) in triggers {
+            let result = try await run(
+                .quitAlternateAlert, command: "sleep 100", trigger: trigger, quitKeepsWindows: false)
+            assertQuit(result, within: Self.exitDeadline, "\(name), quit alternate's alert")
+            XCTAssertEqual(result.restoresAtNextLaunch, true, "\(name): the next launch keeps the windows")
+        }
+    }
+
+    /// ⌥⌘Q with two windows, three tabs and two jobs asks once, Quit
+    /// quits through `terminate` and saves every window, and the next
+    /// launch makes the other choice than the setting: Quit and Keep
+    /// Windows restores them though windows close on quit, Quit and Close
+    /// All Windows restores none though they are kept. A save while the
+    /// alert asks takes no part in it.
+    func testTheQuitAlternateAsksOnceQuitsAndMakesTheOtherWindowChoice() async throws {
+        for keeps in [false, true] {
+            let result = try await run(.quitAlternate, command: "sleep 100", trigger: nil, quitKeepsWindows: keeps)
+            let what = keeps ? "Quit and Close All Windows" : "Quit and Keep Windows"
+            let tail = result.output.split(separator: "\n").suffix(15).joined(separator: "\n")
+            XCTAssertNotNil(result.exitTime, "\(what): quits on its own; output:\n\(tail)")
+            XCTAssertEqual(result.reason, .exit, what)
+            XCTAssertEqual(result.status, 0, "\(what): exit status; output:\n\(tail)")
+            XCTAssertTrue(result.quitThroughTerminate, "\(what): through terminate")
+            XCTAssertEqual(result.confirmations, ["quit sleep,cat"], "\(what): asks once, for both jobs")
+            XCTAssertEqual(
+                result.savedState?.windows.map(\.tabCount).sorted(), [1, 2], "\(what): every window is saved")
+            XCTAssertEqual(result.restoresAtNextLaunch, !keeps, "\(what): the next launch's choice")
+        }
+    }
+
     // MARK: Helpers
 
     /// What ends the child.
@@ -769,6 +839,12 @@ final class TerminationSignalTests: XCTestCase {
         /// Whether `NSApplication.willTerminateNotification` was posted:
         /// the app quit through `terminate` rather than its own `exit`.
         let quitThroughTerminate: Bool
+        /// The choice the quit recorded for the next launch
+        /// (``WindowStateStore/restoresAtNextLaunchKey``), if any.
+        let restoresAtNextLaunch: Bool?
+        /// The questions ``TerminationSignalChild/AnsweringPresenter``
+        /// answered.
+        let confirmations: [String]
         let output: String
     }
 
@@ -832,14 +908,18 @@ final class TerminationSignalTests: XCTestCase {
     /// `expected` and `followUp`, it first waits for the child to show the
     /// `expected` state and run on in it, then sends the `followUp` signal
     /// and times the exit from there.
+    ///
+    /// Without a trigger, the child is expected to quit on its own once
+    /// ready. `quitKeepsWindows` stands in for macOS's setting.
     private func run(
-        _ mode: TerminationSignalChild.Mode, command: String, trigger: Trigger, thenExpect expected: String? = nil,
-        followedBy followUp: Int32? = nil
+        _ mode: TerminationSignalChild.Mode, command: String, trigger: Trigger?, thenExpect expected: String? = nil,
+        followedBy followUp: Int32? = nil, quitKeepsWindows: Bool? = nil
     ) async throws -> Result {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-441-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let suite = "com.aanyberg.tessera.tests.\(UUID().uuidString)"
-        let request = TerminationSignalChild.Request(mode: mode, command: command, suite: suite)
+        let request = TerminationSignalChild.Request(
+            mode: mode, command: command, suite: suite, quitKeepsWindows: quitKeepsWindows)
         try JSONEncoder().encode(request).write(to: dir.appendingPathComponent(TerminationSignalChild.requestFile))
         var jobPid: pid_t?
         var shellPid: pid_t?
@@ -880,7 +960,9 @@ final class TerminationSignalTests: XCTestCase {
         shellPid = (try? String(contentsOf: dir.appendingPathComponent("shell.pid"), encoding: .utf8))
             .flatMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
 
-        try send(trigger, to: child)
+        if let trigger {
+            try send(trigger, to: child)
+        }
         var stateAfterTrigger: String?
         var ranOnAfterTrigger: Bool?
         if let expected, let followUp {
@@ -916,14 +998,20 @@ final class TerminationSignalTests: XCTestCase {
         child.waitUntilExit()
         // Before the cleanup above kills it.
         let shellRemains = shellPid.map { kill($0, 0) == 0 }
-        let saved = UserDefaults(suiteName: suite).flatMap { WindowStateStore(defaults: $0).load() }
+        let savedDefaults = UserDefaults(suiteName: suite)
+        let saved = savedDefaults.flatMap { WindowStateStore(defaults: $0).load() }
+        let restoresAtNextLaunch = savedDefaults?.object(forKey: WindowStateStore.restoresAtNextLaunchKey) as? Bool
+        let confirmations = ((try? String(
+            contentsOf: dir.appendingPathComponent(TerminationSignalChild.confirmationsFile), encoding: .utf8)) ?? "")
+            .split(separator: "\n").map(String.init)
         let output = (try? String(contentsOf: dir.appendingPathComponent("output.log"), encoding: .utf8)) ?? ""
         let quitThroughTerminate = FileManager.default.fileExists(
             atPath: dir.appendingPathComponent(TerminationSignalChild.willTerminateFile).path)
         return Result(
             exitTime: exitTime, stateAfterTrigger: stateAfterTrigger, ranOnAfterTrigger: ranOnAfterTrigger,
             reason: child.terminationReason, status: child.terminationStatus, savedState: saved, shellPid: shellPid,
-            shellRemains: shellRemains, quitThroughTerminate: quitThroughTerminate, output: output)
+            shellRemains: shellRemains, quitThroughTerminate: quitThroughTerminate,
+            restoresAtNextLaunch: restoresAtNextLaunch, confirmations: confirmations, output: output)
     }
 }
 
@@ -962,6 +1050,14 @@ enum TerminationSignalChild {
         case errorAlert
         /// The same with the job ended first: nothing to ask about.
         case idleErrorAlert
+        /// ⌥⌘W: Close All's application-modal alert (#464).
+        case closeAllAlert
+        /// ⌥⌘Q: the quit alert of Quit's alternate (#464).
+        case quitAlternateAlert
+        /// ⌥⌘Q with two windows, three tabs and two jobs (`sleep` and
+        /// `cat`), answered Quit by ``AnsweringPresenter``: the child quits
+        /// on its own.
+        case quitAlternate
     }
 
     struct Request: Codable {
@@ -970,6 +1066,47 @@ enum TerminationSignalChild {
         let command: String
         /// The defaults suite the window state is saved to.
         let suite: String
+        /// What macOS's "Close windows when quitting an application" says
+        /// (``AppDelegate/quitKeepsWindows``); `nil` for the real setting.
+        var quitKeepsWindows: Bool?
+    }
+
+    /// Where ``AnsweringPresenter`` writes each question it answered, one
+    /// line each: `<scope> <names, comma-separated>`.
+    static let confirmationsFile = "confirmations.txt"
+
+    /// Answers every application-modal question Quit (or Close), after a
+    /// save of the window state such as one the main queue could run while
+    /// a real alert asks; a sheet is answered Cancel. Each question is
+    /// written to ``confirmationsFile``.
+    final class AnsweringPresenter: CloseConfirmationPresenter {
+        private let file: URL
+        private let whileAsking: @MainActor () -> Void
+
+        init(file: URL, whileAsking: @escaping @MainActor () -> Void) {
+            self.file = file
+            self.whileAsking = whileAsking
+        }
+
+        private func record(_ confirmation: CloseConfirmation, _ kind: String) {
+            let line = "\(kind)\(confirmation.scope) \(confirmation.processNames.joined(separator: ","))\n"
+            let previous = (try? String(contentsOf: file, encoding: .utf8)) ?? ""
+            try? (previous + line).write(to: file, atomically: true, encoding: .utf8)
+        }
+
+        func confirm(
+            _ confirmation: CloseConfirmation, sheetFor window: NSWindow,
+            completion: @escaping @MainActor (Bool) -> Void
+        ) {
+            record(confirmation, "sheet ")
+            completion(false)
+        }
+
+        func confirmApplicationModally(_ confirmation: CloseConfirmation) -> Bool {
+            record(confirmation, "")
+            whileAsking()
+            return true
+        }
     }
 
     struct Ready: Codable {
@@ -1163,6 +1300,9 @@ enum TerminationSignalChild {
         else { throw Failure(description: "no app delegate or defaults suite") }
         appDelegate.windowStateStore = WindowStateStore(defaults: defaults)
         appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-i"], workingDirectory: dir)
+        if let keeps = request.quitKeepsWindows {
+            appDelegate.quitKeepsWindows = { keeps }
+        }
         let controller = try appDelegate.newWindow()
         mark("a window opened")
         let session = controller.focusedPane.session
@@ -1225,6 +1365,33 @@ enum TerminationSignalChild {
             reportReadyOnceModal(job.pid, in: dir)
             appDelegate.presentOpenError(Failure(description: "an error"))
             throw Failure(description: "the error alert returned: the app was not quit")
+        case .closeAllAlert, .quitAlternateAlert:
+            // As the keyboard sends ⌥⌘W or ⌥⌘Q to the menu bar; the alert
+            // runs modally inside, so ready is written from its session.
+            reportReadyOnceModal(job.pid, in: dir)
+            let closesAll = request.mode == .closeAllAlert
+            guard let bar = NSApp.mainMenu, let key = keyDown(closesAll ? "w" : "q", keyCode: closesAll ? 13 : 12)
+            else { throw Failure(description: "no menu bar or key event") }
+            _ = bar.performKeyEquivalent(with: key)
+            throw Failure(description: "the alert returned: the app was not quit")
+        case .quitAlternate:
+            _ = try appDelegate.newTab(in: window)
+            let second = try appDelegate.newWindow()
+            try second.focusedPane.session.write(Array("cat\n".utf8))
+            let catRuns = try spin(timeout: .seconds(10)) {
+                try second.focusedPane.session.foregroundProcess()?.name == "cat"
+            }
+            guard catRuns else { throw Failure(description: "cat did not start in the foreground") }
+            mark("two windows, three tabs, two jobs")
+            appDelegate.closeConfirmationPresenter = AnsweringPresenter(
+                file: dir.appendingPathComponent(confirmationsFile)
+            ) { [weak appDelegate] in appDelegate?.saveWindowState() }
+            try reportReady(job.pid, in: dir)
+            guard let bar = NSApp.mainMenu, let key = keyDown("q", keyCode: 12) else {
+                throw Failure(description: "no menu bar or key event")
+            }
+            _ = bar.performKeyEquivalent(with: key)
+            throw Failure(description: "⌥⌘Q returned: the app was not quit")
         }
         try spin(timeout: .seconds(30)) { false }
     }

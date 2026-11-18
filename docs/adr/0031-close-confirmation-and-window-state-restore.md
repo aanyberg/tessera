@@ -133,8 +133,9 @@ closes exactly as before:
 |---|---|---|
 | ⌘W, the tab's or window's close button (AppKit closes only the selected tab) | the tab's session runs a job | sheet on the tab, which is selected first: "Close this tab?" |
 | ⇧⌘W (`closeTabGroup`) | any tab of the window runs a job | one sheet on the current tab listing every busy tab's job (D4b) |
-| AppKit's own multi-tab closes (Close Other Tabs, Close Tabs to the Right, Close All), which close each tab through `windowShouldClose` | that tab's session runs a job | idle tabs close at once; each busy tab asks on its own sheet, as for ⌘W |
-| ⌘Q, the Dock's Quit, logging out (`applicationShouldTerminate`) | any session runs a job | one application-modal alert listing them all (D4b); a quit Apple event that arrives with a confirmation up: see the #458 amendment |
+| AppKit's own multi-tab closes (Close Other Tabs, Close Tabs to the Right, and `NSApplication`'s `closeAll:`, no longer in the menu since #464), which close each tab through `windowShouldClose` | that tab's session runs a job | idle tabs close at once; each busy tab asks on its own sheet, as for ⌘W |
+| Close All, ⌥⌘W (`closeAllWindows`, #464 amendment) | any session runs a job | one application-modal alert listing them all (D4b): "Close all windows?" |
+| ⌘Q, ⌥⌘Q (Quit's alternate, #464 amendment), the Dock's Quit, logging out (`applicationShouldTerminate`) | any session runs a job | one application-modal alert listing them all (D4b); a quit Apple event that arrives with a confirmation up: see the #458 amendment |
 
 Close (Quit) is the default button and marked destructive, as Terminal.app
 makes Terminate the default; Cancel (Escape) keeps every tab and its job.
@@ -146,9 +147,9 @@ request for any tab of that window is ignored. A tab's own question holds
 back none of its neighbours: an idle tab next to an asking one still
 closes, and ⇧⌘W on another tab asks for the whole window on that tab,
 beside the first sheet, rather than doing nothing; its Close closes the
-asking tab too. Close All (⌥⌘W, the alternate AppKit adds to Close Tab)
-asks every window's tabs in turn, so each busy tab asks once on its own
-sheet and a second ⌥⌘W while they ask adds none. A tab that closes under
+asking tab too. Close All (⌥⌘W) was AppKit's alternate of Close Tab,
+which asked every window's tabs in turn, one sheet per busy tab; since
+#464 it is Tessera's own and asks once (see that amendment). A tab that closes under
 its own sheet (its shell exits cleanly, or the window's Close closes it)
 ends the sheet as Cancel in `windowWillClose`, so the alert and its modal
 session do not outlive the tab. `SIGTERM`, `SIGINT` and `SIGHUP` still
@@ -224,9 +225,10 @@ Not covered, accepted for 0.1.0: the order of windows in depth, which
 tab was selected (both restored since #414, see the amendment below),
 and whether a window was full screen or minimized are
 not restored (a full-screen window comes back as a normal window of the
-screen's size); ⌥⌘Q (Quit and Keep Windows) is not offered; and restore
-follows only `NSQuitAlwaysKeepsWindows`, not the logout panel's "Reopen
-windows when logging back in".
+screen's size); ⌥⌘Q (Quit and Keep Windows) is not offered (offered
+since #464, see that amendment); and restore follows only
+`NSQuitAlwaysKeepsWindows`, not the logout panel's "Reopen windows when
+logging back in".
 
 ## Consequences
 
@@ -325,3 +327,56 @@ Hostile values (S5): a `selectedTab` that is not a whole number, is
 negative, or is not a tab other than the last of the tabs kept (by the
 saved count, the 64-tab cap or the session budget) is ignored and the
 last tab is selected; it never makes the value unreadable.
+
+## Amendment: Quit and Keep Windows and Close All ask once (#464, 2026-11-17)
+
+**Quit's alternate.** Under ⌥ the Tessera menu's Quit becomes Quit and
+Keep Windows (⌥⌘Q), or Quit and Close All Windows while macOS keeps
+windows on quit (`NSQuitAlwaysKeepsWindows` true): AppKit's titles and
+meaning. AppKit's own such item (`NSAlternateQuitMenuItem`, which it adds
+after Quit of an active app about a second after launch) quits through
+`terminate:` without the window choice below, so the app removes it as it
+is added and adds its own, right after Quit (an alternate shows under ⌥
+only directly after its item). The title is set as the item is validated (`validateMenuItem`,
+when the menu opens or a key equivalent is matched), so a change of the
+setting while the app runs shows at once. The item quits through
+`terminate`, so it asks exactly as ⌘Q does, one alert for every busy
+session (D4b), and signals and quit Apple events with that alert up
+behave as for ⌘Q (#441, #458). Its choice holds for that quit only: the
+action records "the next launch restores the windows" as the opposite of
+the setting, only the quit's own save takes it (`saveWindowState(quitting:)`,
+from `applicationShouldTerminate` or the termination grace's exit; a save
+that the main queue runs while the alert asks does not), and it is dropped
+once `terminate` returns, which happens only when the app does not quit
+(Cancel, or `terminate` refusing while a sheet is up), so a later ⌘Q makes
+no choice. The choice is written beside the window state, under
+`TesseraWindowState.restoresAtNextLaunch` (a Boolean), and the next launch
+takes it, removing it, so the launch after follows the setting again; a
+value that is not a Boolean is no choice. The registry names the command
+`quit_keep_windows` (System, ⌥⌘Q); a rebinding moves the item's key
+equivalent, and only its title follows the setting.
+
+**Close All.** AppKit adds a hidden alternate of its own to Close Tab
+when the menu bar is installed: Close All (⌥⌘W, `closeAll:`, aimed at
+`NSApplication` itself), which closes each tab through
+`windowShouldClose`, so a busy tab in each window asked on its own sheet.
+It adds that item only when no item of the menu bar has ⌥⌘W at that
+moment, and a later rebinding of the item that had it, or setting the
+menu bar again, does not bring it back (probed on macOS 27.2). So the
+Shell menu carries Tessera's own Close All, right after Close Tab, built
+at its default ⌥⌘W before the menu bar is installed: AppKit then adds
+none, with no `NSApplication` subclass, no override of `closeAll:` and
+nothing removed. It runs `AppDelegate.closeAllWindows`: if any session of
+any terminal window runs a job, one application-modal alert ("Close all
+windows?", Close and Cancel) lists them all (D4b) and no tab asks on a
+sheet of its own; Cancel closes nothing. Close, or no busy session, closes
+every terminal window with all its tabs through `NSWindow.close()`, and
+the Settings window too, as AppKit's Close All did; Settings asks
+nothing, and the alert is only about the terminals. While a tab asks on
+its own sheet (about itself, a pane or its window), ⌥⌘W is ignored, as
+⇧⌘W on the asking tab is. A termination signal or the system's quit with
+the alert up ends it (`terminateWithoutAsking()`), and Close All then
+calls `terminate`, so the app quits without asking, its windows saved;
+any other quit event asks to quit with the quit alert over Close All's
+(#458). The registry names the command `close_all_windows` (App, ⌥⌘W).
+`closeAll:` itself still answers as before, should anything send it.

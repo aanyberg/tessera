@@ -29,9 +29,40 @@ enum MainMenu {
     /// AppKit (which appends the window list to it).
     static func install(in app: NSApplication) {
         let (mainMenu, windowMenu, helpMenu) = makeMenuBar()
+        if let appMenu = mainMenu.items.first?.submenu { keepOnlyTesserasQuitAlternate(in: appMenu) }
         app.mainMenu = mainMenu
         app.windowsMenu = windowMenu
         app.helpMenu = helpMenu
+    }
+
+    /// AppKit's own Quit alternate: "Quit and Keep Windows" (`terminate:`),
+    /// which an active app's Tessera menu gets after Quit about a second
+    /// after launch (#464).
+    static let appKitQuitAlternate = NSUserInterfaceItemIdentifier("NSAlternateQuitMenuItem")
+
+    /// Removes AppKit's Quit alternate (``appKitQuitAlternate``) from
+    /// `appMenu` each time AppKit adds it: it quits without the window
+    /// choice, and right after Quit it would be the alternate ⌥ shows,
+    /// in place of Tessera's.
+    private static func keepOnlyTesserasQuitAlternate(in appMenu: NSMenu) {
+        let center = NotificationCenter.default
+        center.removeObserver(AppKitQuitAlternateRemover.shared)
+        center.addObserver(
+            AppKitQuitAlternateRemover.shared, selector: #selector(AppKitQuitAlternateRemover.menuDidAddItem(_:)),
+            name: NSMenu.didAddItemNotification, object: appMenu)
+    }
+
+    /// Observes the Tessera menu for ``keepOnlyTesserasQuitAlternate(in:)``.
+    @MainActor
+    private final class AppKitQuitAlternateRemover: NSObject {
+        static let shared = AppKitQuitAlternateRemover()
+
+        @objc func menuDidAddItem(_ notification: Notification) {
+            guard let menu = notification.object as? NSMenu else { return }
+            for item in menu.items where item.identifier == MainMenu.appKitQuitAlternate {
+                menu.removeItem(item)
+            }
+        }
     }
 
     /// The menu bar with the default key equivalents, and its Window and
@@ -59,6 +90,15 @@ enum MainMenu {
         add(menu, "show_all", "Show All", #selector(NSApplication.unhideAllApplications(_:)))
         menu.addItem(.separator())
         add(menu, "quit", "Quit Tessera", #selector(NSApplication.terminate(_:)), "q")
+        // Shown under ⌥ (right after Quit, or it would not replace it):
+        // Quit and Keep Windows, or Quit and Close All Windows while macOS
+        // keeps windows; AppDelegate retitles it as the setting changes
+        // (#464). AppKit's own, which records no window choice, is removed
+        // as it is added (`keepOnlyTesserasQuitAlternate(in:)`).
+        let quitAlternate = add(
+            menu, "quit_keep_windows", AppDelegate.quitAlternateTitle(quitKeepsWindows: false),
+            #selector(AppDelegate.quitWithTheOtherWindowChoice(_:)), "q", [.command, .option])
+        quitAlternate.isAlternate = true
         return menu
     }
 
@@ -73,6 +113,15 @@ enum MainMenu {
         // Closes the key window, which is the selected tab; AppKit closes the
         // tab bar's window once its last tab is gone.
         add(menu, "close_tab", "Close Tab", #selector(NSWindow.performClose(_:)), "w")
+        // Close All, under ⌥ (#464). AppKit adds an alternate of its own
+        // (`closeAll:`, aimed at NSApplication, which asks each busy tab on
+        // its own sheet) when the menu bar is installed, unless an item
+        // already has ⌥⌘W then; a later rebinding of this one does not
+        // bring it back.
+        let closeAll = add(
+            menu, "close_all_windows", "Close All", #selector(AppDelegate.closeAllWindows(_:)), "w",
+            [.command, .option])
+        closeAll.isAlternate = true
         add(menu, "close_window", "Close Window", #selector(TerminalWindowController.closeTabGroup(_:)), "w", [.command, .shift])
         menu.addItem(.separator())
         add(menu, "clear_scrollback", "Clear to Start", #selector(TerminalSurfaceView.clearScrollback(_:)), "k")

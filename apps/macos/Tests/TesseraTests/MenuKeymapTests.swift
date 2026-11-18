@@ -87,7 +87,7 @@ final class MenuKeymapTests: XCTestCase {
         // 41, the ten pane items (ADR 0035, #38b), the five Find items (#46b),
         // the three prompt items (ADR 0039, #45a) and Copy with Formatting
         // (ADR 0042, #47).
-        XCTAssertEqual(names.count, 60, "\(names)")
+        XCTAssertEqual(names.count, 62, "\(names)")
         // Nothing else is exempt: Open config.toml left the menu for the
         // Settings window's Advanced pane (#410).
         XCTAssertEqual(unmapped, [], "\(unmapped)")

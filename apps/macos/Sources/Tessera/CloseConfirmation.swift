@@ -15,6 +15,8 @@ struct CloseConfirmation: Equatable {
         case pane
         case tab
         case window
+        /// Close All (⌥⌘W): every terminal window.
+        case allWindows
         case quit
     }
 
@@ -73,6 +75,7 @@ struct CloseConfirmation: Equatable {
         case .pane: "Close this pane?"
         case .tab: "Close this tab?"
         case .window: "Close this window?"
+        case .allWindows: "Close all windows?"
         case .quit: "Quit Tessera?"
         }
     }
@@ -85,6 +88,7 @@ struct CloseConfirmation: Equatable {
             case .pane: "Closing this pane will terminate \(what):"
             case .tab: "Closing this tab will terminate \(what):"
             case .window: "Closing this window will terminate \(what):"
+            case .allWindows: "Closing all windows will terminate \(what):"
             case .quit: "Quitting will terminate \(what):"
             }
         var lines = processNames.prefix(Self.maxListedProcesses).map { "• \($0)" }
@@ -110,8 +114,9 @@ protocol CloseConfirmationPresenter: AnyObject {
     func confirm(
         _ confirmation: CloseConfirmation, sheetFor window: NSWindow,
         completion: @escaping @MainActor (Bool) -> Void)
-    /// Asks before quitting, application-modally; `true` to quit.
-    func confirmQuit(_ confirmation: CloseConfirmation) -> Bool
+    /// Asks application-modally, before quitting or closing every window
+    /// (Close All); `true` to quit or close.
+    func confirmApplicationModally(_ confirmation: CloseConfirmation) -> Bool
 }
 
 /// ``CloseConfirmationPresenter`` with `NSAlert`: Close (or Quit) is the
@@ -127,7 +132,7 @@ final class AlertCloseConfirmationPresenter: CloseConfirmationPresenter {
         }
     }
 
-    func confirmQuit(_ confirmation: CloseConfirmation) -> Bool {
+    func confirmApplicationModally(_ confirmation: CloseConfirmation) -> Bool {
         NSApp.activate()
         return makeAlert(confirmation).runModal() == .alertFirstButtonReturn
     }
