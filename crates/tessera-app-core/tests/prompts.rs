@@ -734,6 +734,8 @@ fn zsh_printf_abc_selects_abc_without_the_end_of_line_mark() {
         ("abc", "abc"),
         ("ab\x1b[7mc\x1b[27m", "ab"),
         ("a\x1b[7mb\x1b[27mc", "abc"),
+        // `printf 'abc '`: the blank before the mark goes with it.
+        ("abc ", "abc"),
     ] {
         let app = app();
         let id = session(&app, 4, 20, 100);
@@ -1055,6 +1057,91 @@ fn a_clear_in_the_chunk_of_the_last_c_offers_no_older_output() {
     }
 }
 
+/// The chunks of #516 up to the clear, in a 4x20 session: `cmd1` prints
+/// `a` and a line that wraps once, `cmd2` prints an empty line. The top
+/// row then continues the wrapped line, whose start is in the history.
+fn wrapped_line_on_top() -> [String; 4] {
+    [
+        format!("{}\r\n", prompt(None, "cmd1")),
+        format!("{}a\r\n{}\r\n", m("C"), "L".repeat(25)),
+        format!("{}\r\n", prompt(Some(0), "cmd2")),
+        format!("{}\r\n", m("C")),
+    ]
+}
+
+/// `CSI H CSI J` (the `clear` of screen, tmux, vt100 and linux terminfo)
+/// while the top row continues a wrapped history line blanks the screen,
+/// `cmd2`'s `C` with it: `cmd1`'s output in the history is not offered in
+/// its place, whether the clear comes alone or in the chunk of that `C`
+/// (#516). The next command's output is selected again.
+#[test]
+fn a_clear_under_a_wrapped_history_line_offers_no_older_output() {
+    let next = prompt(Some(0), "");
+    for clear in ["\x1b[H\x1b[J", "\x1b[H\x1b[0J"] {
+        let [first, output, second, last_c] = wrapped_line_on_top();
+        let alone = vec![
+            first.clone(),
+            output.clone(),
+            second.clone(),
+            last_c.clone(),
+            clear.to_owned(),
+            next.clone(),
+        ];
+        let with_its_c = vec![
+            first,
+            output,
+            second,
+            format!("{last_c}{clear}"),
+            next.clone(),
+        ];
+        let one_chunk = vec![alone.concat()];
+        for (chunks, what) in [
+            (alone, "the clear alone"),
+            (with_its_c, "the clear in the chunk of the `C`"),
+            (one_chunk, "all in one chunk"),
+        ] {
+            let app = app();
+            let id = session(&app, 4, 20, 100);
+            for chunk in &chunks {
+                feed(&app, id, chunk.as_bytes());
+            }
+            assert!(!app.has_command_output(id).unwrap(), "{what}");
+            assert_eq!(select(&app, id), (false, None), "{what}");
+            feed(&app, id, b"echo e\r\n");
+            feed(
+                &app,
+                id,
+                format!("{}e\r\n{}", m("C"), prompt(Some(0), "")).as_bytes(),
+            );
+            assert_eq!(
+                select(&app, id),
+                (true, Some("e".to_owned())),
+                "{what}: next"
+            );
+            assert!(app.has_command_output(id).unwrap(), "{what}: next");
+        }
+    }
+}
+
+/// The same erase as a shell's redraw of a command line that began above
+/// the screen (#86): the prompt and the last output are in the history,
+/// above what it blanked, and the output is still the last one.
+#[test]
+fn a_redraw_of_a_line_from_the_history_keeps_the_last_output() {
+    let app = app();
+    let id = session(&app, 4, 20, 100);
+    for chunk in [
+        format!("{}\r\n", prompt(None, "cmd1")),
+        format!("{}out\r\n", m("C")),
+        format!("{}{}", prompt(Some(0), ""), "t".repeat(100)),
+        format!("\x1b[H\x1b[J{}", "t".repeat(30)),
+    ] {
+        feed(&app, id, chunk.as_bytes());
+    }
+    assert!(app.has_command_output(id).unwrap());
+    assert_eq!(select(&app, id), (true, Some("out".to_owned())));
+}
+
 /// The same with a resize before the clear: the newest command's `C` is
 /// followed into the new line ids (#45a adversarial cycle 2).
 #[test]
@@ -1164,6 +1251,104 @@ fn edits_above_the_output_keep_it_selectable() {
         feed(&app, id, format!("\x1b7{edit}\x1b8").as_bytes());
         assert_eq!(select(&app, id), (true, Some("d".to_owned())), "{what}");
         assert!(app.has_command_output(id).unwrap(), "{what}");
+    }
+}
+
+/// A prompt after an empty Enter: a `D` with no status from Tessera's
+/// scripts, or `D;0` from an integration that reports one anyway.
+fn empty_enter(end: &str) -> String {
+    format!("\r\n{}{}$ {}", m(end), m("A"), m("B"))
+}
+
+/// An empty Enter says no command ran (a bare `D`), so output a DL moved
+/// off its recorded line stays the last one, in zsh's shape and in fish's
+/// (`D` on the output's row). A `D;0` there reads as a command that ran,
+/// whose `C` is gone: refused, a documented limit (ADR 0039, #334).
+#[test]
+fn an_empty_enter_after_moved_output_keeps_it_selectable() {
+    type Start = fn(&App) -> SessionId;
+    let zsh = |app: &App| three_commands_in(app, 10);
+    let fish = |app: &App| {
+        let id = session(app, 10, 20, 100);
+        feed(
+            app,
+            id,
+            format!("{}\r\n", prompt(None, "echo d")).as_bytes(),
+        );
+        feed(app, id, fish_abandon_line("d\r\n", 20).as_bytes());
+        id
+    };
+    for (start, shell) in [(zsh as Start, "zsh"), (fish as Start, "fish")] {
+        for (end, expected) in [("D", Some("d")), ("D;0", None)] {
+            let app = app();
+            let id = start(&app);
+            feed(&app, id, empty_enter(end).as_bytes());
+            feed(&app, id, b"\x1b7\x1b[1H\x1b[M\x1b8");
+            assert_eq!(
+                select(&app, id),
+                (expected.is_some(), expected.map(str::to_owned)),
+                "{shell}, {end}"
+            );
+            assert_eq!(
+                app.has_command_output(id).unwrap(),
+                expected.is_some(),
+                "{shell}, {end}"
+            );
+        }
+    }
+}
+
+/// A documented limit (ADR 0039, #334): fish's row of `printf abc` holds
+/// both the `C` and the `D;0`, so a DL of exactly that row leaves no trace
+/// of the command and the older output reads as the last one.
+#[test]
+fn a_dl_of_fishs_output_row_offers_the_older_output() {
+    let app = app();
+    let id = session(&app, 10, 20, 100);
+    for chunk in [
+        format!("{}$ {}seq\r\n", m("A"), m("B")),
+        fish_abandon_line("1\r\n", 20),
+        "printf abc\r\n".to_owned(),
+        fish_abandon_line("abc", 20),
+    ] {
+        feed(&app, id, chunk.as_bytes());
+    }
+    assert_eq!(select(&app, id), (true, Some("abc".to_owned())));
+    app.select_clear(id).unwrap();
+    // `abc`'s row is the fourth: `1` ended with a newline, so the next
+    // prompt took the row of its `D`.
+    feed(&app, id, b"\x1b7\x1b[4H\x1b[M\x1b8");
+    assert_eq!(select(&app, id), (true, Some("1".to_owned())));
+    assert!(app.has_command_output(id).unwrap());
+}
+
+/// A documented limit (ADR 0039, #334): a DL that shifts a running
+/// command's `C` onto the line recorded for the last finished one reads
+/// as that `C` still being there, and the moved output is refused. Any
+/// other shift leaves it selectable.
+#[test]
+fn a_running_c_moved_onto_the_recorded_line_refuses_the_output() {
+    for (count, expected) in [(1, Some("d")), (2, None)] {
+        let app = app();
+        // `echo d`'s `C` on row 7, the running `echo e`'s on row 9.
+        let id = three_commands_in(&app, 14);
+        feed(&app, id, b"echo e\r\n");
+        feed(&app, id, format!("{}e\r\n", m("C")).as_bytes());
+        feed(
+            &app,
+            id,
+            format!("\x1b7\x1b[1H\x1b[{count}M\x1b8").as_bytes(),
+        );
+        assert_eq!(
+            select(&app, id),
+            (expected.is_some(), expected.map(str::to_owned)),
+            "DL {count}"
+        );
+        assert_eq!(
+            app.has_command_output(id).unwrap(),
+            expected.is_some(),
+            "DL {count}"
+        );
     }
 }
 
@@ -1698,6 +1883,7 @@ fn op() -> impl proptest::strategy::Strategy<Value = Op> {
         }),
         1 => row.prop_map(|r| format!("\x1b7\x1b[{r}H\x1b[2K\x1b8")),
         1 => Just(format!("\x1b[H\x1b[2J{}", prompt(None, ""))),
+        1 => Just(format!("\x1b[H\x1b[J{}", prompt(None, ""))),
         1 => Just("\x1b[3J".to_owned()),
         1 => Just("\x1b[?1049h".to_owned()),
         1 => Just("\x1b[?1049l".to_owned()),

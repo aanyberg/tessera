@@ -5,7 +5,9 @@ exit-status gutter, its hover and a yield between scan holds; see
 "Amendment: #45b") · amended 2026-11-12 (#377, #378 M3: a whole-screen
 clear retires the records it erased; see "Amendment: #377" at the end) ·
 amended 2026-11-12 (#392: the capture-only cost is accepted; see "Amendment:
-capture-only cost")
+capture-only cost") · amended 2026-11-18 (#516: ED 0 from home counts as a
+clear on a top row that continues the history too; see "The signal" and "An
+older `C`")
 
 ## Context
 
@@ -328,12 +330,15 @@ ED 0 at home, DECSED, RIS and DECCOLM (asserted in
 `tessera-term/tests/screen_clears.rs`), because the ids are still valid:
 the lines they name were erased, not renumbered.
 
-**What counts.** Exactly the erases that clear `scrolled_since_clear`
-(the grid's `whole_screen` predicate), on the primary screen only:
+**What counts.** The erases that blank every row of the screen (the
+grid's `whole_screen` predicate), on the primary screen only:
 
 - ED 2 and DECSED 2, protected cells kept or not;
-- ED 0 from the home position, unless the top row continues the newest
-  history line (then it erased a continuation, not a screen);
+- ED 0 from the home position, also when the top row continues the newest
+  history line (#516). That one alone leaves `scrolled_since_clear` and the
+  history line's wrap flag as they were, because it may be a shell redrawing
+  a line that began above the screen (ADR 0009, #86); its rows are blank
+  either way, which is what the log needs to know;
 - DECCOLM (when allowed), which erases through the same path;
 - RIS, through `Grid::reset`, also while the alternate screen is up (it
   drops the stashed primary rows).
@@ -528,11 +533,23 @@ blanked (a whole-screen clear now also marks the `C` of a record carried
 into the epoch by a resize as erased) or may have been: a chunk's clears
 are reported before its marks, so a `C` at or below the top of a clear
 reported since the last `A` may have come before that clear and been erased
-by it (`clear` or `tput clear` as the command, Ctrl-L typed ahead). Otherwise an edit the log does not
+by it (`clear` or `tput clear` as the command, Ctrl-L typed ahead). `ESC[H
+ESC[J` is such a clear also while the top row continues a wrapped history
+line (#516): it blanks the newest `C` and the prompt above it, so the older
+output in the history is refused, as after `ESC[2J`. A shell's redraw of a
+line from the history is the same erase and blanks only what is on the
+screen: a `C` above the top row stays, and its output is still offered.
+Otherwise an edit the log does not
 see moved the rows or erased the `C`, and the marks decide: the older `C`
 is offered unless a `D` with an exit status follows its next prompt's `A`
 (a command ran there, whose `C` is gone). Tessera's scripts send a bare `D`
-for a prompt that ran nothing. Limit: an edit that erases the prompt after
+for a prompt that ran nothing. Limits: an edit that erases the prompt after
 the last output (its `D` with it) and moves or erases that output's `C` (a
-DL over both, a scroll region scrolled down over that prompt) makes the
-output above look like the last one, and it is selected.
+DL over both, a scroll region scrolled down over that prompt), or fish's
+output row, which carries both `C` and `D` (`printf abc`, a DL of exactly
+that row), makes the output above look like the last one, and it is
+selected. The other two err towards refusing: another integration that
+sends `D;status` after an empty Enter reads as a command that ran, so output
+moved off its recorded line is refused; and any `C` on the recorded line
+counts as the one recorded, so a DL whose shift equals the distance from a
+running command's `C` to that line refuses the moved output too.

@@ -241,8 +241,9 @@ there (by design, above).
 
 The narrowed ED 0 rule has two costs. A vt100 `clear` (`ESC[H ESC[J`)
 issued while the top row continues a wrapped history line looks like
-that redraw and does not count as a clear (`ESC[2J` does; test
-`a_vt100_clear_inside_a_wrapped_line_is_not_a_clear`). And when a narrow
+that redraw and does not count as a clear here (`ESC[2J` does; test
+`a_vt100_clear_inside_a_wrapped_line_is_not_a_clear`; the command log's
+separate count does take it, ADR 0039, #516). And when a narrow
 makes the prompt line exactly as tall as the window, its first row is
 row 0 and starts a line of its own, so zsh's redraw from home is
 indistinguishable from a clear and counts as one: the widen then keeps
