@@ -248,6 +248,7 @@ final class SettingsModel {
     func reload() {
         guard let source else {
             loadError = "Tessera’s core is not running."
+            readPluginsAgain()
             return
         }
         do {
@@ -296,6 +297,12 @@ final class SettingsModel {
             movedFrom[key] = nil
         }
         endAdditionIfApplied(masking: masks)
+        if messages[Self.pluginsKey] == Self.pluginsFullRefusal,
+            (value(Self.pluginsKey)?.array?.count ?? 0) < Self.maxEnabledPlugins
+        {
+            // A hand edit made room: the refusal at the cap no longer holds.
+            messages[Self.pluginsKey] = nil
+        }
         if !profilesChanging {
             profileSettle?.cancel()
             profileSettle = nil
@@ -342,16 +349,26 @@ final class SettingsModel {
     func readPluginsAgain() {
         pluginRead?.cancel()
         pluginRead = nil
-        guard let source else { return }
-        readPlugins(source)
+        readPlugins()
         settlePlugins(reads: Self.pluginSettleReads)
     }
 
-    /// Reads the plugins (ADR 0047).
-    private func readPlugins(_ source: any SettingsConfigSource) {
+    /// Reads the plugins (ADR 0047). With no core there are none to show,
+    /// and the pane says they could not be read (#489 48b adversarial m4).
+    /// A read that succeeds sets ``plugins`` and ``pluginsUnreadable`` only
+    /// when they change: the reads while a plugin settles redraw the pane
+    /// only when it does (#489 48b m2; Swift 6.1's `@Observable` notifies
+    /// on equal values).
+    private func readPlugins() {
+        guard let source else {
+            if !plugins.isEmpty { plugins = [] }
+            if !pluginsUnreadable { pluginsUnreadable = true }
+            return
+        }
         do {
-            plugins = try source.plugins()
-            pluginsUnreadable = false
+            let read = try source.plugins()
+            if read != plugins { plugins = read }
+            if pluginsUnreadable { pluginsUnreadable = false }
         } catch {
             pluginsUnreadable = true
             Self.log.error("plugins not read: \(String(describing: error), privacy: .public)")
@@ -364,9 +381,9 @@ final class SettingsModel {
     private func settlePlugins(reads: Int) {
         guard reads > 0, plugins.contains(where: \.isSettling) else { return }
         let timer = clock.schedule(after: Self.pluginSettleInterval) { [weak self] in
-            guard let self, let source = self.source else { return }
+            guard let self else { return }
             self.pluginRead = nil
-            self.readPlugins(source)
+            self.readPlugins()
             self.settlePlugins(reads: reads - 1)
         }
         pluginRead = timer
@@ -410,6 +427,12 @@ final class SettingsModel {
     /// The message next to the control of `key`, if an edit of it failed.
     func message(_ key: String) -> String? {
         messages[key]
+    }
+
+    /// Shows `text` (the pane's own, or sanitised) next to the control of
+    /// `key`: an edit the pane refused before writing it.
+    func show(_ text: String, for key: String) {
+        messages[key] = text
     }
 
     /// Whether any edit is queued or running (for tests and the window's

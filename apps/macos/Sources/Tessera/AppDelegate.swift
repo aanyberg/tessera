@@ -44,14 +44,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// closes. Internal for tests.
     private(set) var settingsWindowController: SettingsWindowController?
     /// The closed Settings window's model while an add or delete of a
-    /// profile it made waits for the watch to apply it (#455): Settings
-    /// opened again before then edits on with it, still locked, instead of
-    /// a model of the configuration from before the add or delete (whose
-    /// indices are the old ones). Dropped with the next configuration
-    /// applied once the add or delete no longer waits (applied, or failed),
+    /// profile it made waits for the watch to apply it (#455), or an edit
+    /// of `[plugins] enabled` does (#489 48b m1): Settings opened again
+    /// before then edits on with it, still locked, instead of a model of
+    /// the configuration from before the edit (whose indices are the old
+    /// ones, whose toggles would write a list without it). Dropped with the
+    /// next configuration applied once nothing waits (applied, or failed),
     /// ``settingsWaitLimit`` after the window closed, or with the core.
-    /// Internal for tests.
-    private(set) var waitingSettingsModel: SettingsModel?
+    /// Internal for tests, which may give Settings a model of their own
+    /// through it.
+    var waitingSettingsModel: SettingsModel?
     /// The one timer of ``settingsWaitLimit``, the last close's: it goes
     /// with the waiting model, so a reopened and again closed model waits
     /// its whole limit (#455).
@@ -428,6 +430,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// which it starts if no session has yet.
     @objc func openSettings(_ sender: Any?) {
         if let controller = settingsWindowController {
+            // The host may have started or stopped a plugin since the pane
+            // last read them (#489 48b m6).
+            controller.model.readPluginsAgain()
             controller.showWindow(sender)
             controller.window?.makeKeyAndOrderFront(sender)
             return
@@ -452,7 +457,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.onClose = { [weak self, weak controller] in
             guard let self else { return }
             self.settingsWindowController = nil
-            guard let model = controller?.model, model.profilesChanging else { return }
+            guard let model = controller?.model, Self.waitsForApply(model) else { return }
             self.waitingSettingsModel = model
             // No other timer runs: this window's model was taken, with
             // its timer, when the window opened.
@@ -469,7 +474,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func reloadWaitingSettingsModel() {
         guard let model = waitingSettingsModel else { return }
         model.reload()
-        if !model.profilesChanging { _ = takeWaitingSettingsModel() }
+        if !Self.waitsForApply(model) { _ = takeWaitingSettingsModel() }
+    }
+
+    /// Whether `model` has an edit that a closed window keeps it for: an
+    /// add or delete of a profile, or an edit of `[plugins] enabled`, not
+    /// yet applied.
+    private static func waitsForApply(_ model: SettingsModel) -> Bool {
+        model.profilesChanging || model.pluginsChanging
     }
 
     /// The closed Settings window's waiting model, which the app delegate

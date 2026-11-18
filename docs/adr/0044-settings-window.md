@@ -461,7 +461,8 @@ Known limits:
   apply of an earlier hand edit; the toggles then edit from that snapshot
   until the next apply (the wave 22 generation token fixes it).
 * A plugin that takes longer than 2 seconds to start or stop shows
-  Starting… or Stopping… until the pane is shown again or the next apply.
+  Starting… or Stopping… until the pane is shown again (also by ⌘, onto
+  the open window, #489) or the next apply.
 
 ## Amendment: Add and Duplicate through the core's add of a profile (#312, 2026-11-15)
 
@@ -561,3 +562,52 @@ amendment's "The profile list's lock", and "The cap is the core's" in the
   while a slider or stepper is pressed keeps the value it shows (a step
   by VoiceOver or the keyboard has no press: it shows the configuration
   applied after it, as before).
+
+## Amendment: the Plugins pane's cap, ids and close, and the Keys pane's keys (#489, 2026-11-18)
+
+This replaces "on adds the id at the end unless it is listed" and "every
+unknown id goes through `SettingsModel.sanitisedMessage`" in the #48
+amendment.
+
+- **The host's 64 ids.** The plugin host reads the first 64 ids of
+  `[plugins] enabled` and ignores the rest with a warning. The FFI does not
+  export the cap: `SettingsModel.maxEnabledPlugins` mirrors
+  `MAX_ENABLED_PLUGINS` (tessera-app-core), and the two change together.
+  The toggles and the status follow the first 64 ids, as the host does, so
+  a plugin listed only past them shows Off. At 64 ids a toggle turned on
+  writes nothing and says why next to the toggles; turning one off still
+  writes, unless the JSON of the list left is over the 64 KiB a config
+  value may be (about 6 000 ids of 8 bytes, or one id of 100 KB): the core
+  then refuses the edit with
+  "value too long" and the file stays as it was. A hand edit that makes
+  room clears the line. Past 64 the pane
+  shows the host's warning in its words, with how many ids are ignored.
+  The config loader does not refuse a longer list, so the pane does not
+  either.
+- **Unknown ids, escaped and capped (S3, S5).** The ids of the first 64
+  that this version does not have are listed once each, compared byte for
+  byte, in quotes: printable ASCII as is (a quote and a backslash escaped),
+  every other code point as `\u{…}`, at most 80 characters each. Ids that
+  differ by a zero-width or trailing space, or by NFC and NFD, show apart,
+  and nothing of one reaches the window unescaped. At most 16 are listed,
+  then "and N more".
+- **Ids and keys are bytes, as for the core.** The toggles compare ids byte
+  for byte (turning `café` off keeps its NFD spelling, another id for the
+  host), and the Keys pane keys what an edit leaves in `[keys]` by the
+  table key's bytes, so an edit of `"cmd+ö"` written in NFC beside an NFD
+  entry ends when the key map shows it, not after the 2 s timeout. It
+  compares the key map's chords by bytes too: `cmd+;` and `cmd+` with
+  U+037E are one Swift `String` and two keys for `Chord::parse`, so an edit
+  of one neither removes, overwrites nor conflicts with the other.
+- **A closed window's plugin edit.** A model whose `[plugins] enabled` edit
+  waits to apply is kept when Settings closes, as one whose profile add or
+  delete waits (#455), with the same 2 s limit; Settings opened again
+  before then shows it, still locked.
+- **Reads.** ⌘, onto the open Settings window reads the plugins again. With
+  no core the pane lists no plugins and says they could not be read, also
+  from a read while one settles. A read that returns the plugins shown sets
+  nothing, so the reads while a plugin settles redraw the pane only when it
+  changes.
+- **Entry values.** A `[keys]` entry value of a shape this version does not
+  know (a number, list, other object, or none) reads as not a string; one
+  entry never fails the key map.

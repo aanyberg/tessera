@@ -93,6 +93,43 @@ final class ConfigTests: XCTestCase {
         XCTAssertThrowsError(try TesseraConfigValue.parse(json: Data("{".utf8)))
     }
 
+    /// A U+FEFF that starts a string or a key stays (`JSONSerialization`
+    /// alone drops it), written or escaped, and the numbers of the same
+    /// text keep their type (#489).
+    func testALeadingByteOrderMarkStaysAndNumbersKeepTheirType() throws {
+        let mark = "\u{FEFF}"
+        let json = #"{"a":"\#(mark)x","b":["\#(mark)y","\uFEFFz",13.0,13],"\#(mark)k":1.5,"\#(mark)n":2.0,"#
+            + #""c":{"\#(mark)d":"\#(mark)","f":1e2,"i":-3},"t":true,"u":null,"m":18446744073709551615}"#
+        guard case .table(let table) = try TesseraConfigValue.parse(json: Data(json.utf8)) else {
+            return XCTFail("not a table")
+        }
+        func bytes(_ value: TesseraConfigValue?) -> [UInt8]? { value?.string.map { Array($0.utf8) } }
+        XCTAssertEqual(bytes(table["a"]), Array("\(mark)x".utf8))
+        guard case .array(let array)? = table["b"], array.count == 4 else { return XCTFail("\(String(describing: table["b"]))") }
+        XCTAssertEqual(bytes(array[0]), Array("\(mark)y".utf8))
+        XCTAssertEqual(bytes(array[1]), Array("\(mark)z".utf8))
+        XCTAssertEqual(array[2], .float(13))
+        XCTAssertEqual(array[3], .integer(13))
+        XCTAssertEqual(table["\(mark)k"], .float(1.5))
+        XCTAssertEqual(table["\(mark)n"], .float(2), "a float under a marked key")
+        XCTAssertNil(table["k"])
+        guard case .table(let inner)? = table["c"] else { return XCTFail("\(String(describing: table["c"]))") }
+        XCTAssertEqual(bytes(inner["\(mark)d"]), Array(mark.utf8))
+        XCTAssertEqual(inner["f"], .float(100))
+        XCTAssertEqual(inner["i"], .integer(-3))
+        XCTAssertEqual(table["t"], .bool(true))
+        XCTAssertEqual(table["u"], .null)
+        XCTAssertEqual(table["m"]?.double, 18446744073709551615.0)
+
+        // Each way of writing the mark is enough on its own.
+        for text in [#"["\#(mark)a"]"#, #"["\uFEFFa"]"#, #"["\ufeffa"]"#] {
+            guard case .array(let items) = try TesseraConfigValue.parse(json: Data(text.utf8)) else {
+                return XCTFail(text)
+            }
+            XCTAssertEqual(items.map(bytes), [Array("\(mark)a".utf8)], text)
+        }
+    }
+
     func testAKeyPathReadsNestedTablesAndArrays() throws {
         let json = #"{"a":{"b":[{"c":1},{"c":"two","d":null}]},"e":true}"#
         let value = try TesseraConfigValue.parse(json: Data(json.utf8))
