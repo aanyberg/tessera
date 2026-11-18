@@ -1916,8 +1916,10 @@ mod tests {
     ///
     /// Timing-based, so run it only in release builds:
     /// `cargo nextest run --release -p tessera-app-core
-    /// search_lock_hold`. Up to three attempts, as for
-    /// `reader_lock_hold_is_bounded`. A step that copied a 256-line chunk
+    /// search_lock_hold`. Up to three counted attempts, as for
+    /// `reader_lock_hold_is_bounded`; an attempt with a late piece is not
+    /// counted, and after ten tries without a counted one the test reports
+    /// itself inconclusive and passes. A step that copied a 256-line chunk
     /// regardless of width (512 Ki cells here) fails the cell check of
     /// [`each_hold_copies_at_most_a_haystack_of_cells`] at once and the
     /// time bar on most attempts.
@@ -1925,13 +1927,18 @@ mod tests {
     #[cfg_attr(debug_assertions, ignore = "timing bar; run in release")]
     fn search_lock_hold_is_bounded() {
         const ATTEMPTS: usize = 3;
+        const TRIES: usize = 10;
         let line: String = "lorem ipsum dolor sit amet "
             .chars()
             .cycle()
             .take(2048)
             .collect();
         let mut misses = Vec::new();
-        for attempt in 1..=ATTEMPTS {
+        let mut counted = 0;
+        for attempt in 1..=TRIES {
+            if counted == ATTEMPTS {
+                break;
+            }
             let shared = Arc::new(Shared::new(filled(50, 2048, 10_000, &line)));
             let stop = Arc::new(AtomicBool::new(false));
             let flood = {
@@ -1952,6 +1959,15 @@ mod tests {
             }
             stop.store(true, Ordering::Relaxed);
             flood.join().unwrap();
+            // A late piece halves the limit (#368), and smaller pieces
+            // would meet the bound without testing it (#447 m3): such an
+            // attempt does not count (#433 round 1).
+            let limit = search.active.as_ref().map(|active| active.limit);
+            if limit != Some(PieceLimit::FULL) {
+                misses.push(format!("attempt {attempt}: a piece was late ({limit:?})"));
+                continue;
+            }
+            counted += 1;
             let (mut holds, cells): (Vec<_>, Vec<_>) = search.take_holds().into_iter().unzip();
             holds.sort_unstable();
             let most = cells.iter().copied().max().unwrap_or(0);
@@ -1980,6 +1996,10 @@ mod tests {
                 return;
             }
             misses.push(format!("attempt {attempt}: p99 hold {p99:?} > 1 ms"));
+        }
+        if counted == 0 {
+            eprintln!("inconclusive: every try had a late piece: {misses:#?}");
+            return;
         }
         panic!("{misses:#?}");
     }
@@ -2031,17 +2051,18 @@ mod tests {
             .cycle()
             .take(2048)
             .collect();
-        for (rows, keeps) in [(50, true), (100, false)] {
+        // 64 rows of 2048 cells are exactly the cap (#447 m2).
+        for (rows, keeps) in [(50, true), (64, true), (65, false), (100, false)] {
             let shared = Shared::new(filled(rows, 2048, 200, &line));
             let mut search = SearchState::default();
             search.start("dolor", LITERAL).unwrap();
             let mut most = (0, 0);
             for round in 0..40 {
-                // A budget no stall outlasts: a late piece would halve the
+                // A long budget ([`run`]): a late piece would halve the
                 // limit for the rest of the search, and a pass whose lines
                 // are cut finer than the full limit keeps no copy (so the
                 // 50-row screen would keep nothing under machine load).
-                while !search.step(&shared, Duration::from_secs(3600)).done {}
+                run(&mut search, &shared);
                 let active = search.active.as_ref().unwrap();
                 assert_eq!(
                     (active.limit, active.skips),
@@ -2895,6 +2916,81 @@ mod tests {
             (2, false),
             "{status:?}"
         );
+    }
+
+    /// S5, #447 m2: a pass cut at the match cap drops the copy it was
+    /// making and the one kept before it into the spares at once, which
+    /// would pile up past [`MAX_KEPT_CELLS`]; they are cut back to it. A
+    /// pass that keeps a copy makes it of the spares, so the spares after
+    /// it are the copy the pass replaced.
+    #[test]
+    fn spares_are_reused_and_cut_back_to_the_cap() {
+        use std::fmt::Write as _;
+        fn buffers(
+            lines: impl Iterator<Item = *const tessera_grid::Cell>,
+        ) -> Vec<*const tessera_grid::Cell> {
+            let mut buffers: Vec<_> = lines.collect();
+            buffers.sort_unstable();
+            buffers
+        }
+        let active = |search: &SearchState| -> (
+            Vec<*const tessera_grid::Cell>,
+            Vec<*const tessera_grid::Cell>,
+        ) {
+            let active = search.active.as_ref().unwrap();
+            (
+                buffers(
+                    active
+                        .scanned
+                        .rows
+                        .iter()
+                        .flatten()
+                        .map(|l| l.cells.as_ptr()),
+                ),
+                buffers(active.spare.iter().map(|l| l.cells.as_ptr())),
+            )
+        };
+        let lorem: String = "lorem ipsum dolor sit amet "
+            .chars()
+            .cycle()
+            .take(2048)
+            .collect();
+        // Each row rewritten in place, so nothing scrolls into the history.
+        let screen = |round: usize| {
+            let mut out = String::new();
+            for row in 0..64 {
+                let _ = write!(out, "\x1b[{};1H{round:03}{row:03}{}", row + 1, &lorem[6..]);
+            }
+            out
+        };
+        let shared = Shared::new(filled(64, 2048, 200, &lorem));
+        let mut search = SearchState::default();
+        search.start("x", LITERAL).unwrap();
+        run(&mut search, &shared);
+        for round in 0..3 {
+            let (kept, _) = active(&search);
+            assert_eq!(kept.len(), 64, "round {round}: the screen is kept");
+            shared
+                .term
+                .lock()
+                .unwrap()
+                .advance(screen(round).as_bytes());
+            let status = run(&mut search, &shared);
+            assert!(!status.truncated);
+            let (_, spares) = active(&search);
+            if round > 0 {
+                assert_eq!(spares, kept, "round {round}: the old copy is the spares");
+            }
+        }
+        // A screen of more matches than the cap: the pass is cut, and both
+        // copies go to the spares, cut back to one copy's worth.
+        let x = format!("{}\r\n", "x".repeat(2048)).repeat(64);
+        shared.term.lock().unwrap().advance(x.as_bytes());
+        let status = run(&mut search, &shared);
+        assert!(status.truncated, "{status:?}");
+        let (kept, spares) = active(&search);
+        assert_eq!(kept.len(), 0, "the cut pass keeps no copy");
+        assert_eq!(spares.len(), MAX_KEPT_CELLS / 2048);
     }
 
     /// Steps `search` over `shared` to the end with a long budget.

@@ -2,7 +2,8 @@
 
 **Status:** accepted · 2026-10-31 · amended 2026-11-04 (#191: the guarded
 rows, CJK around URLs, the lookup's fast path); amended 2026-11-13 (#279, #281:
-invisible characters in a detected link, the narrowed hidden-end check)
+invisible characters in a detected link, the narrowed hidden-end check); amended
+2026-11-18 (#434: the URL cap counts characters too)
 
 ## Context
 
@@ -574,8 +575,9 @@ DerivedCoreProperties.txt, merged ranges, no dependency); a test checks
 it against the listed UCD ranges and one code point of each class. The
 hover span still covers the cells, stripped ones included. The 2083 cap
 (U9) counts cells, a cell whose only scalar is stripped included, so it is
-at least as strict as stripping first and the URL stays at most 2083
-characters.
+at least as strict as stripping first. It does not keep the URL at 2083
+characters, though: a cell holds a whole cluster, up to 32 scalars (#434,
+see the amendment below).
 
 **The hidden-end check after a miss (#281)**, lead decision D3-1, option
 (b). When `url_at` finds no URL on the base scalars of a window that holds
@@ -608,3 +610,20 @@ of the second hash on each link's last-cell drop. A differential run of
 the hover against the per-cell reference (200 000 seeds) and of the base,
 its URL stripped the same way, against the head (200 000 seeds) found no
 difference.
+
+## Amendment: the URL cap in characters (#434, 2026-11-18)
+
+U9 counted cells only, and a cell holds a cluster of up to 32 scalars (a
+letter and its combining marks), so `https://a.b/` and 2071 cells of `e`
+with 31 combining marks each passed it as a 2083-cell URL of 66 284
+characters (130 KB). U9 is now two bounds: a candidate is no link when it
+is longer than 2083 cells (`MAX_URL_LEN`, as before, which also bounds the
+lookup's walk) or when its text, after the invisible characters are left
+out, is longer than 2083 characters. `link_of` counts the characters
+after stripping, and only when the text is longer than 2083 bytes (a text
+of at most 2083 bytes has at most as many characters), so ordinary URLs
+pay nothing. A URL that opens is at most 2083 cells and 2083 characters.
+Tests: the #434 construction gives no link; 2083 characters of letters with
+one combining mark each give a link and 2084 none; 2083 plain cells give a
+link and 2084 none; 2083 cells of a letter and VS16 give a link of 2083
+characters (the selectors are stripped before the count).

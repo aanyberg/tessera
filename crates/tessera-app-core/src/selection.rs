@@ -81,7 +81,7 @@ use std::cmp::Reverse;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-use tessera_config::{RuleCheck, SmartRules};
+use tessera_config::{CompiledRule, RuleCheck, SmartRules};
 pub use tessera_grid::Point;
 use tessera_grid::{Cell, Color, DamageRows, Grid, Line};
 use tessera_render::{Overlay, OverlayKind, Selection as Highlight};
@@ -429,9 +429,26 @@ pub const SMART_SCAN_LEN: usize = 8192;
 /// The characters before the click a smart scan takes at most.
 const SMART_SCAN_BEFORE: usize = SMART_SCAN_LEN / 2;
 
+/// The most bytes of text smart selection scans around the click (S5,
+/// #433): up to 16 KiB before the clicked character, and up to 16 KiB from
+/// it on, within [`SMART_SCAN_LEN`] characters.
+///
+/// Text of one scalar a cell (ASCII, CJK, emoji, at most 4 bytes each)
+/// never reaches it, so only cells holding long clusters (a letter with
+/// many combining marks: up to 32 scalars, 128 bytes) shorten the window.
+/// With the compile bound of a rule
+/// ([`tessera_config::SMART_RULE_SIZE_LIMIT`]) it bounds what one match
+/// attempt of a rule can cost, and so how far a click can run past
+/// [`SMART_RULE_BUDGET`].
+pub const SMART_SCAN_BYTES: usize = 4 * SMART_SCAN_LEN;
+
+/// The bytes before the click a smart scan takes at most.
+const SMART_SCAN_BYTES_BEFORE: usize = SMART_SCAN_BYTES / 2;
+
 /// The text smart-selection rules scan: part of one logical line around
 /// the clicked character, one entry per character (a cell's cluster or
-/// character; spacers and padding give none).
+/// character; spacers and padding give none), at most [`SMART_SCAN_LEN`]
+/// characters and [`SMART_SCAN_BYTES`] bytes.
 #[derive(Debug, Default)]
 struct ScanWindow {
     text: String,
@@ -483,6 +500,8 @@ impl ScanWindow {
             window.push(lines, pos);
         }
         window.push(lines, at);
+        window.cut_to_bytes_before();
+        let click_start = window.starts.get(window.click).copied().unwrap_or(0);
         let mut pos = at;
         while pos < last {
             let Some(next) = lines.next_char(pos) else {
@@ -493,6 +512,11 @@ impl ScanWindow {
                 break;
             }
             window.push(lines, next);
+            if window.text.len() - click_start > SMART_SCAN_BYTES - SMART_SCAN_BYTES_BEFORE {
+                window.pop();
+                window.line_end = false;
+                break;
+            }
             pos = next;
         }
         window.cut_before = if window.line_start {
@@ -536,6 +560,38 @@ impl ScanWindow {
         match line.cluster(col) {
             Some(text) if cell.is_cluster() => self.text.push_str(text),
             _ => self.text.push(cell.ch),
+        }
+    }
+
+    /// Drops the characters furthest before the click while those before
+    /// it hold more than [`SMART_SCAN_BYTES_BEFORE`] bytes; the window then
+    /// no longer starts with its line.
+    fn cut_to_bytes_before(&mut self) {
+        let Some(&click_start) = self.starts.get(self.click) else {
+            return;
+        };
+        if click_start <= SMART_SCAN_BYTES_BEFORE {
+            return;
+        }
+        let first = self
+            .starts
+            .partition_point(|&s| click_start - s > SMART_SCAN_BYTES_BEFORE);
+        let cut = self.starts[first];
+        self.text.drain(..cut);
+        self.cells.drain(..first);
+        self.starts.drain(..first);
+        for start in &mut self.starts {
+            *start -= cut;
+        }
+        self.click -= first;
+        self.line_start = false;
+    }
+
+    /// Takes the last character off again.
+    fn pop(&mut self) {
+        if let Some(start) = self.starts.pop() {
+            self.cells.pop();
+            self.text.truncate(start);
         }
     }
 
@@ -604,9 +660,15 @@ fn trim_url(text: &str, span: Range<usize>) -> Range<usize> {
 }
 
 /// The wall time one double-click gives its smart-selection rules (#351
-/// m1): checked before each rule after the first, a rule not started
-/// within it is skipped. Rules are bounded in count and size (S5), not in
-/// time, and 64 slow user rules take ~425 ms on 8192 characters.
+/// m1, #433): checked before each rule and after each match a rule finds,
+/// the first rule included. A rule not started within it is skipped, and
+/// one that has spent it stops at the match it found. Rules are bounded in
+/// count and size (S5); this bounds them in time: a click costs at most the
+/// budget plus one match attempt, which only [`SMART_SCAN_BYTES`] and
+/// [`tessera_config::SMART_RULE_SIZE_LIMIT`] bound: a rule with no match
+/// in the window searches all of it at once, about 1 s at worst, or about
+/// 3 s (more under load) for a rule with capture groups, with the terminal
+/// lock held (#433; bounding each attempt is a 0.3.0 follow-up).
 pub const SMART_RULE_BUDGET: Duration = Duration::from_millis(50);
 
 #[cfg(test)]
@@ -614,20 +676,34 @@ thread_local! {
     /// Test hook: wall time charged to the budget per rule run, so a test
     /// can spend the budget without slow rules.
     static RULE_COST: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
-    /// Test hook: how many rules the last [`smart_at`] on this thread ran.
+    /// Test hook: wall time charged to the budget per match a rule finds.
+    static MATCH_COST: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+    /// Test hook: how many rules the last [`smart_at`] on this thread
+    /// started.
     static RULES_RUN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test hook: how many matches the rules of the last [`smart_at`] on
+    /// this thread found.
+    static MATCHES_SEEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The time the rules of a click have taken: since `started`, plus in tests
-/// the charged cost of the `ran` rules.
-fn rules_time(started: Instant, ran: usize) -> Duration {
+/// the charged cost of the `ran` rules finished and the `found` matches.
+fn rules_time(started: Instant, ran: usize, found: usize) -> Duration {
     #[cfg(test)]
-    let charged = RULE_COST
-        .with(std::cell::Cell::get)
-        .saturating_mul(u32::try_from(ran).unwrap_or(u32::MAX));
+    let charged = {
+        let times = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        RULE_COST
+            .with(std::cell::Cell::get)
+            .saturating_mul(times(ran))
+            .saturating_add(
+                MATCH_COST
+                    .with(std::cell::Cell::get)
+                    .saturating_mul(times(found)),
+            )
+    };
     #[cfg(not(test))]
     let charged = {
-        let _ = ran;
+        let _ = (ran, found);
         Duration::ZERO
     };
     started.elapsed().saturating_add(charged)
@@ -637,13 +713,11 @@ fn rules_time(started: Instant, ran: usize) -> Duration {
 /// character at `pos` (see the module docs), or `None`: no rule matches
 /// there, or `pos` is past the end of its line's text or on padding.
 ///
-/// The rules share [`SMART_RULE_BUDGET`]: once it is spent, the rules not
-/// yet started are skipped (one debug log with the counts, S8) and the
-/// best match of those that ran wins; with none the word is selected. The
-/// first rule always runs.
+/// The rules share [`SMART_RULE_BUDGET`]: once it is spent, the rule
+/// running stops and the rules not yet started are skipped (one debug log
+/// with the counts, S8), and the best match found so far wins; with none
+/// the word is selected.
 fn smart_at(lines: &Lines<'_>, pos: Pos, rules: &SmartRules) -> Option<(Pos, Pos)> {
-    // (score, weight, length, start, rule) and the characters.
-    type Key = (u64, u64, usize, Reverse<usize>, Reverse<usize>);
     if rules.is_empty() {
         return None;
     }
@@ -654,55 +728,89 @@ fn smart_at(lines: &Lines<'_>, pos: Pos, rules: &SmartRules) -> Option<(Pos, Pos
     let click = window.bytes(window.click);
     let mut best: Option<(Key, Range<usize>)> = None;
     let started = Instant::now();
-    #[cfg(test)]
-    RULES_RUN.with(|run| run.set(rules.len()));
+    // Rules finished, and matches found.
+    let (mut ran, mut found) = (0usize, 0usize);
+    let mut spent = false;
     for (index, rule) in rules.rules().iter().enumerate() {
-        // `index` rules have run.
-        if index > 0 && rules_time(started, index) >= SMART_RULE_BUDGET {
-            let ran = index;
-            #[cfg(test)]
-            RULES_RUN.with(|run| run.set(ran));
-            tracing::debug!(
-                ran,
-                skipped = rules.len() - ran,
-                rules = rules.len(),
-                "smart selection budget spent; rules skipped"
-            );
+        if rules_time(started, ran, found) >= SMART_RULE_BUDGET {
+            spent = true;
             break;
         }
-        for found in rule.regex().find_iter(&window.text) {
-            if found.start() >= click.end {
+        for one in rule.regex().find_iter(&window.text) {
+            found += 1;
+            if one.start() >= click.end {
                 break;
             }
-            if found.end() <= click.start || found.is_empty() {
-                continue;
+            if let Some(candidate) = candidate(&window, rule, index, one.range(), &click)
+                && best.as_ref().is_none_or(|(best, _)| candidate.0 > *best)
+            {
+                best = Some(candidate);
             }
-            // A match in a run that reaches a window edge where the line
-            // goes on may be cut: dropped, never taken shortened.
-            let cut = found.start() < window.cut_before || found.end() > window.cut_after;
-            if cut {
-                continue;
-            }
-            let Some(span) = checked(rule.check(), &window.text, found.range()) else {
-                continue;
-            };
-            if span.is_empty() {
-                continue;
-            }
-            let chars = window.chars(span);
-            let weight = rule.precision().weight();
-            let len = chars.len();
-            let score = weight.saturating_mul(u64::try_from(len).unwrap_or(u64::MAX));
-            let key = (score, weight, len, Reverse(chars.start), Reverse(index));
-            if best.as_ref().is_none_or(|(best, _)| key > *best) {
-                best = Some((key, chars));
+            if rules_time(started, ran, found) >= SMART_RULE_BUDGET {
+                spent = true;
+                break;
             }
         }
+        ran += 1;
+        if spent {
+            break;
+        }
+    }
+    #[cfg(test)]
+    {
+        RULES_RUN.with(|run| run.set(ran));
+        MATCHES_SEEN.with(|seen| seen.set(found));
+    }
+    if spent {
+        tracing::debug!(
+            ran,
+            skipped = rules.len() - ran,
+            rules = rules.len(),
+            matches = found,
+            "smart selection budget spent; rules skipped"
+        );
     }
     let (_, chars) = best?;
     let first = *window.cells.get(chars.start)?;
     let last = *window.cells.get(chars.end.checked_sub(1)?)?;
     Some((first, lines.char_end(last)))
+}
+
+/// How a smart-selection candidate ranks: (score, weight, length, start,
+/// rule), the higher the better.
+type Key = (u64, u64, usize, Reverse<usize>, Reverse<usize>);
+
+/// Match `found` of `rule` (the `index`th) in `window` as a candidate for
+/// the click at bytes `click`: its key and characters, or `None` when it
+/// does not cover the click, is empty, may be cut at a window edge or
+/// fails the rule's check.
+fn candidate(
+    window: &ScanWindow,
+    rule: &CompiledRule,
+    index: usize,
+    found: Range<usize>,
+    click: &Range<usize>,
+) -> Option<(Key, Range<usize>)> {
+    if found.end <= click.start || found.is_empty() {
+        return None;
+    }
+    // A match in a run that reaches a window edge where the line goes on
+    // may be cut: dropped, never taken shortened.
+    if found.start < window.cut_before || found.end > window.cut_after {
+        return None;
+    }
+    let span = checked(rule.check(), &window.text, found)?;
+    if span.is_empty() {
+        return None;
+    }
+    let chars = window.chars(span);
+    let weight = rule.precision().weight();
+    let len = chars.len();
+    let score = weight.saturating_mul(u64::try_from(len).unwrap_or(u64::MAX));
+    Some((
+        (score, weight, len, Reverse(chars.start), Reverse(index)),
+        chars,
+    ))
 }
 
 /// What a selection was taken against, to tell when it must be cleared.
@@ -1776,14 +1884,19 @@ fn link_with_reach(grid: &Grid, offset: usize, at: Point, reach: usize) -> Optio
 /// The link whose characters start at `cells`: their text (clusters
 /// whole, default-ignorable code points left out) and their cells in the
 /// view at scroll `offset`, row by row, and whether one of the clusters
-/// hides a URL end ([`url_char`]).
+/// hides a URL end ([`url_char`]). `None` when the text is longer than
+/// [`MAX_URL_LEN`] characters (#434).
 ///
 /// The text leaves out what [`url::is_default_ignorable`] names (ZWNJ,
 /// variation selectors, CGJ, tags, fillers; #279): the cells show nothing
 /// for them, so the URL that opens is the text the cells show. The cap
-/// (U9) has already counted the cells, one character each, a cell whose
-/// only scalar is left out included; leaving them out only shortens the
-/// text, so the URL stays within [`MAX_URL_LEN`] characters after it.
+/// (U9) has already counted the cells, at most [`MAX_URL_LEN`], one
+/// character each. A cell's cluster can hold more than one character (a
+/// letter and its combining marks, up to 32 scalars), so the text is
+/// counted again in characters, after the invisible ones are left out: a
+/// candidate longer than [`MAX_URL_LEN`] characters is no link either, as
+/// one longer in cells is not. The URL stays within [`MAX_URL_LEN`]
+/// cells and [`MAX_URL_LEN`] characters.
 fn link_of(lines: &Lines<'_>, offset: usize, cells: &[Pos]) -> Option<(Link, bool)> {
     let mut text = String::new();
     let top = lines.view_top(offset);
@@ -1811,6 +1924,11 @@ fn link_of(lines: &Lines<'_>, offset: usize, cells: &[Pos]) -> Option<(Link, boo
     // Looked for before the invisible characters go (ZWJ is one of them).
     let hidden = hidden_url_end(&text).is_some();
     url::strip_default_ignorables(&mut text);
+    // A text of at most `MAX_URL_LEN` bytes has at most as many characters,
+    // so only a longer one is counted.
+    if text.len() > MAX_URL_LEN && text.chars().count() > MAX_URL_LEN {
+        return None;
+    }
     Some((
         Link {
             url: text,
@@ -2146,6 +2264,8 @@ mod tests {
             ("see https://go\u{200d}od.com/ ok", 15, None),
             // The letter before the scheme hides an end: no letter to U1.
             ("see a\u{200d}https://b.com ok", 8, Some("https://b.com")),
+            // On the scheme's first letter, right after that cell (#430 m1).
+            ("see a\u{200d}https://b.com ok", 5, Some("https://b.com")),
             ("see ab\u{200d}https://b.com ok", 8, Some("https://b.com")),
             // With the letter, the first scheme is no start and the second
             // one's URL is the link; without it the first one's is.
@@ -2192,6 +2312,52 @@ mod tests {
                 "{bytes:?}"
             );
         }
+    }
+
+    /// #434: a URL is at most [`MAX_URL_LEN`] cells (U9) and, after the
+    /// invisible characters are left out, at most [`MAX_URL_LEN`]
+    /// characters: a cell of a letter and its combining marks counts once
+    /// for the first bound and once per scalar for the second.
+    #[test]
+    fn a_url_is_capped_in_cells_and_in_characters() {
+        let heavy = format!("e{}", "\u{301}".repeat(31));
+        let scheme = "https://a.b/";
+        let url_of = |text: &str| {
+            let term = term(40, 100, text.as_bytes());
+            let at = point(0, 4);
+            let link = link_at(term.grid(), 0, at);
+            assert_eq!(
+                link,
+                reference_link(term.grid(), at),
+                "{} bytes",
+                text.len()
+            );
+            link.map(|link| link.url)
+        };
+        // The construction of #434: 2083 cells, 66 284 characters.
+        let huge = format!("{scheme}{}", heavy.repeat(MAX_URL_LEN - scheme.len()));
+        assert_eq!(huge.chars().count(), 66_284);
+        assert_eq!(url_of(&huge), None);
+        // Characters at the bound, two to a cell: a link; one more, none.
+        let marks = "e\u{301}".repeat((MAX_URL_LEN - scheme.len()) / 2);
+        let at_cap = format!("{scheme}{marks}x");
+        assert_eq!(at_cap.chars().count(), MAX_URL_LEN);
+        assert_eq!(url_of(&at_cap).as_deref(), Some(at_cap.as_str()));
+        let over = format!("{at_cap}x");
+        assert_eq!(url_of(&over), None);
+        // Cells at the bound, one character each: a link; one more, none.
+        let cells = format!("{scheme}{}", "x".repeat(MAX_URL_LEN - scheme.len()));
+        assert_eq!(url_of(&cells).as_deref(), Some(cells.as_str()));
+        assert_eq!(url_of(&format!("{cells}x")), None);
+        // Invisible characters are left out before the count: 2083 cells
+        // of a letter and VS16 give a link of 2083 characters.
+        let selectors = "e\u{fe0f}".repeat(MAX_URL_LEN - scheme.len());
+        let url = url_of(&format!("{scheme}{selectors}")).expect("a link");
+        assert_eq!(url.chars().count(), MAX_URL_LEN);
+        assert_eq!(
+            url,
+            format!("{scheme}{}", "e".repeat(MAX_URL_LEN - scheme.len()))
+        );
     }
 
     #[test]
@@ -2882,6 +3048,43 @@ mod tests {
         assert!(smart_at(&lines, at, &rules).is_some());
     }
 
+    /// #430 m5: the dotted-name rule takes combining marks, so a name
+    /// written with a decomposed letter (`e` + U+0301) is selected whole.
+    #[test]
+    fn a_dotted_name_with_a_combining_mark_is_selected_whole() {
+        let rules = tessera_config::Selection::default().compiled_rules();
+        for (text, col, want) in [
+            (
+                "see cafe\u{301}.module.name ok",
+                4,
+                "cafe\u{301}.module.name",
+            ),
+            (
+                "see cafe\u{301}.module.name ok",
+                10,
+                "cafe\u{301}.module.name",
+            ),
+            ("see caf\u{e9}.module.name ok", 4, "caf\u{e9}.module.name"),
+            ("see n\u{303}u.x\u{300}y ok", 4, "n\u{303}u.x\u{300}y"),
+        ] {
+            let term = term(2, 40, text.as_bytes());
+            let mut state = SelectionState::default();
+            state.begin(
+                term.grid(),
+                0,
+                point(0, col),
+                Granularity::Word,
+                false,
+                &rules,
+            );
+            assert_eq!(
+                state.text(term.grid(), true).as_deref(),
+                Some(want),
+                "{text:?} at {col}"
+            );
+        }
+    }
+
     /// Rules made from `(pattern, precision)` pairs.
     fn smart_rules(rules: &[(&str, Precision)]) -> Arc<SmartRules> {
         let mut selection = tessera_config::Selection::default();
@@ -2990,6 +3193,296 @@ mod tests {
             "fastest click took {fastest:?} ({ran} rules ran)"
         );
         assert!(ran < MAX_SMART_RULES, "{ran} rules ran in {fastest:?}");
+    }
+
+    /// #433: the budget is checked after each match a rule finds, the
+    /// first rule included, so a rule with a match at every character
+    /// stops at the budget instead of running to the click. The cost of
+    /// each match is charged through the test hook.
+    #[test]
+    fn a_rule_with_many_matches_stops_at_the_budget() {
+        let mut term = Terminal::new(2, 200);
+        term.set_max_scrollback(1_000);
+        term.advance("a".repeat(20_000).as_bytes());
+        let lines = Lines::of(term.grid());
+        let mid = Pos {
+            line: lines.base + 50,
+            col: 100,
+        };
+        let run = |lines: &Lines<'_>, at: Pos, rules: &SmartRules, cost: Duration| {
+            MATCH_COST.with(|c| c.set(cost));
+            let found = smart_at(lines, at, rules);
+            MATCH_COST.with(|c| c.set(Duration::ZERO));
+            (
+                found,
+                RULES_RUN.with(std::cell::Cell::get),
+                MATCHES_SEEN.with(std::cell::Cell::get),
+            )
+        };
+        let tiny = smart_rules(&[("[a-z]", Precision::Normal)]);
+        // Within the budget the rule runs to the click: 4096 matches
+        // before it, the clicked one and the one after it.
+        assert_eq!(
+            run(&lines, mid, &tiny, Duration::ZERO),
+            (None, 1, SMART_SCAN_BEFORE + 2)
+        );
+        // The first rule stops at the budget, at its tenth match.
+        assert_eq!(
+            run(&lines, mid, &tiny, SMART_RULE_BUDGET / 10),
+            (None, 1, 10)
+        );
+        assert_eq!(
+            run(&lines, mid, &tiny, SMART_RULE_BUDGET * 10),
+            (None, 1, 1)
+        );
+        // A later rule stops likewise, and the rules after it are skipped.
+        let later = smart_rules(&[
+            ("q+", Precision::Normal),
+            ("[a-z]", Precision::Normal),
+            ("a+", Precision::Normal),
+        ]);
+        assert_eq!(
+            run(&lines, mid, &later, SMART_RULE_BUDGET / 10),
+            (None, 2, 10)
+        );
+        // The best match found before the budget ran out still wins.
+        let mut term = Terminal::new(2, 40);
+        term.advance(b"see /tmp/xyz ok");
+        let lines = Lines::of(term.grid());
+        let at = Pos {
+            line: lines.base,
+            col: 6,
+        };
+        let path = (
+            Pos {
+                line: lines.base,
+                col: 4,
+            },
+            Pos {
+                line: lines.base,
+                col: 11,
+            },
+        );
+        let first_wins = smart_rules(&[
+            ("/tmp/[a-z]+", Precision::Normal),
+            ("[a-z]", Precision::VeryHigh),
+        ]);
+        assert_eq!(
+            run(&lines, at, &first_wins, SMART_RULE_BUDGET / 2),
+            (Some(path), 2, 2),
+            "one match each"
+        );
+    }
+
+    /// #433, S5: the scan window holds at most [`SMART_SCAN_BYTES`] bytes,
+    /// half before the click: a line of cells with 32-scalar clusters
+    /// gives a window of fewer characters, starting and ending inside the
+    /// line; one of 4-byte characters fills the window in characters and
+    /// bytes at once.
+    #[test]
+    fn the_scan_window_is_bounded_in_bytes() {
+        let window_of = |cell: &str, count: usize, row: i64, col: u16| {
+            let mut term = Terminal::new(2, 200);
+            term.set_max_scrollback(1_000);
+            term.advance(cell.repeat(count).as_bytes());
+            let lines = Lines::of(term.grid());
+            let at = lines
+                .char_at(Pos {
+                    line: lines.base + row,
+                    col,
+                })
+                .unwrap();
+            let (_, last) = lines.text_end(at.line);
+            let window = ScanWindow::around(&lines, at, last.unwrap());
+            assert_eq!(window.cells[window.click], at, "{cell:?}: the click");
+            assert_eq!(window.cells.len(), window.starts.len());
+            assert_eq!(window.starts.first(), Some(&0));
+            window
+        };
+        let heavy = format!("e{}", "\u{301}".repeat(31));
+        assert_eq!(heavy.len(), 63);
+        let window = window_of(&heavy, 20_000, 50, 100);
+        let click_start = window.starts[window.click];
+        assert!(
+            window.text.len() <= SMART_SCAN_BYTES,
+            "{}",
+            window.text.len()
+        );
+        assert!(click_start <= SMART_SCAN_BYTES_BEFORE, "{click_start}");
+        assert!(click_start > SMART_SCAN_BYTES_BEFORE - heavy.len());
+        assert!(window.text.len() > SMART_SCAN_BYTES - 2 * heavy.len());
+        assert!(!window.line_start && !window.line_end);
+        assert!(window.text.starts_with('e') && window.text.ends_with('\u{301}'));
+        // 4 bytes a character: both caps at once, nothing cut.
+        let window = window_of("\u{1F600}", 20_000, 100, 100);
+        assert_eq!(window.cells.len(), SMART_SCAN_LEN);
+        assert_eq!(window.text.len(), SMART_SCAN_BYTES);
+        assert_eq!(window.click, SMART_SCAN_BEFORE);
+        assert!(!window.line_start && !window.line_end);
+        // A click with exactly 16 KiB of the line before it (4096 emoji,
+        // 100 a row): nothing is cut, so the window starts with the line.
+        let window = window_of("\u{1F600}", 20_000, 40, 192);
+        assert_eq!(window.click, SMART_SCAN_BEFORE);
+        assert_eq!(window.starts[window.click], SMART_SCAN_BYTES_BEFORE);
+        assert!(window.line_start && !window.line_end);
+        // Near the line's start only the bytes after the click are cut.
+        let window = window_of(&heavy, 20_000, 0, 10);
+        assert!(window.line_start && !window.line_end);
+        assert_eq!(window.click, 10);
+        assert!(
+            window.text.len() - window.starts[10] <= SMART_SCAN_BYTES - SMART_SCAN_BYTES_BEFORE
+        );
+    }
+
+    /// A window cut to its 16 KiB before the click no longer starts with
+    /// its line, so a match running into the cut edge is not taken (the
+    /// edge rule of the module docs): 300 cells of 32-scalar clusters, a
+    /// click 290 cells in.
+    #[test]
+    fn a_match_at_the_byte_cut_is_not_taken() {
+        let heavy = format!("e{}", "\u{301}".repeat(31));
+        let rules = smart_rules(&[("e[\u{301}e]*", Precision::Normal)]);
+        let click = |count: usize| {
+            let mut term = Terminal::new(2, 200);
+            term.advance(heavy.repeat(count).as_bytes());
+            let lines = Lines::of(term.grid());
+            let at = Pos {
+                line: lines.base + 1,
+                col: 40,
+            };
+            smart_at(&lines, at, &rules)
+        };
+        // 250 cells (15 750 bytes): nothing is cut, the whole line matches.
+        assert!(click(250).is_some());
+        // 300 cells, clicked 290 in: 18 270 bytes before the click, cut to
+        // 16 KiB, so the match runs into the cut edge.
+        let mut term = Terminal::new(2, 200);
+        term.advance(heavy.repeat(300).as_bytes());
+        let lines = Lines::of(term.grid());
+        let at = Pos {
+            line: lines.base + 1,
+            col: 90,
+        };
+        assert_eq!(smart_at(&lines, at, &rules), None);
+    }
+
+    /// The hostile rules of #433, one at a time, on 20 000-character lines:
+    /// each is refused at load with a warning naming its index, or a click
+    /// in the middle of the line returns in bounded time (the fastest of
+    /// three): within 100 ms on ASCII where the rule matches at every
+    /// character (the budget stops it), within 10 s for a no-match rule
+    /// with capture groups (about 3 s at worst idle), otherwise within 3 s
+    /// (a rule that never matches costs one find over the whole window,
+    /// about 1 s at worst without captures). Release builds only: the
+    /// bound is for the shipped code.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn hostile_smart_rules_are_refused_or_bounded() {
+        use std::fmt::Write as _;
+        // One find over the whole window with no match took up to about
+        // 1 s (985 ms) in the round-1 review's probe, up to 768 ms here; the
+        // bar leaves room for a loaded machine.
+        const NO_MATCH_BAR: Duration = Duration::from_secs(3);
+        // The capture-group rule took 2.2-3.0 s idle and up to 6.2 s at load
+        // 14 in the adversarial probe.
+        const CAPTURES_BAR: Duration = Duration::from_secs(10);
+        let captures = r"(?:(e?)(\x{301}?)){0,2560}[XY]";
+        let cap = tessera_config::MAX_SMART_RULE_PATTERN_LEN;
+        let mut literals = String::from("(?:w000");
+        let mut n = 1;
+        while literals.len() + 5 + 2 <= cap {
+            let _ = write!(literals, "|w{n:03}");
+            n += 1;
+        }
+        literals.push_str(")+");
+        let at_cap = format!("{}XY|a", "a?".repeat(510));
+        assert_eq!(at_cap.len(), cap);
+        let rules = [
+            // The rule of #433 and nested counted repetition.
+            r"(?:[^X]{0,50}){0,20}X|a".to_owned(),
+            r"(?:[a-z]{0,50}){0,20}X|a".to_owned(),
+            r"(?:(?:a|b){0,50}){0,20}X|a".to_owned(),
+            // An alternation of many literals.
+            literals,
+            // A long Unicode class repetition, and a short one.
+            r"\p{L}{0,1000}X|a".to_owned(),
+            r"\p{L}{0,20}X|a".to_owned(),
+            // Many tiny matches.
+            ".".to_owned(),
+            // A pattern at the length cap.
+            at_cap,
+            // A rule that never matches the combining text: one find
+            // scans the whole window (#433 round 1).
+            r"(?:[e\x{301}]{0,60}){0,20}[XY]".to_owned(),
+            // The same with capture groups, about 3x slower a byte once the
+            // lazy DFA gives up (#433 adversarial F1).
+            r"(?:(e?)(\x{301}?)){0,2560}[XY]".to_owned(),
+        ];
+        let heavy = format!("e{}", "\u{301}".repeat(31));
+        let texts = [
+            ("a", 20_000, "ascii"),
+            ("\u{e9}", 20_000, "latin"),
+            ("\u{1F600}", 20_000, "emoji"),
+            (heavy.as_str(), 20_000, "combining"),
+            ("e\u{301}", 20_000, "decomposed"),
+            ("w001", 5_000, "literals"),
+        ];
+        let terms: Vec<Terminal> = texts
+            .iter()
+            .map(|&(cell, count, _)| {
+                let mut term = Terminal::new(2, 200);
+                term.set_max_scrollback(1_000);
+                term.advance(cell.repeat(count).as_bytes());
+                term
+            })
+            .collect();
+        for (index, rule) in rules.iter().enumerate() {
+            assert!(rule.len() <= cap, "rule {index}: {} bytes", rule.len());
+            let toml = format!("[[selection.smart_rules]]\nregex = '''{rule}'''\n");
+            let loaded = tessera_config::Config::from_toml_lenient(&toml).unwrap();
+            let compiled = loaded.config.selection.compiled_rules();
+            if compiled.is_empty() {
+                assert!(
+                    loaded
+                        .warnings
+                        .iter()
+                        .any(|w| w.to_string().contains("`selection.smart_rules[0].regex`")),
+                    "rule {index} refused without a warning naming it: {:?}",
+                    loaded.warnings
+                );
+                eprintln!("rule {index}: refused at load");
+                continue;
+            }
+            let every_char = compiled.rules()[0].regex().is_match("a");
+            for (term, &(_, _, text)) in terms.iter().zip(&texts) {
+                let lines = Lines::of(term.grid());
+                let mid = Pos {
+                    line: lines.base + (lines.last() - lines.base) / 2,
+                    col: 100,
+                };
+                let mut fastest = Duration::MAX;
+                for _ in 0..3 {
+                    let started = Instant::now();
+                    let _ = smart_at(&lines, mid, &compiled);
+                    fastest = fastest.min(started.elapsed());
+                }
+                eprintln!("rule {index} on {text}: {fastest:?}");
+                // A rule with a match at every character stops at the
+                // budget; one without a match scans the window in one
+                // find, whose cost only the window and the program bound.
+                let bar = if text == "ascii" && every_char {
+                    Duration::from_millis(100)
+                } else if rule == captures {
+                    CAPTURES_BAR
+                } else {
+                    NO_MATCH_BAR
+                };
+                assert!(
+                    fastest < bar,
+                    "rule {index} on {text}: fastest click {fastest:?}, over {bar:?}"
+                );
+            }
+        }
     }
 
     /// SS-C5: a match running past the scan window where its logical line

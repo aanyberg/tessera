@@ -1,7 +1,8 @@
 # ADR 0042: Smart selection rules and Copy with Formatting
 
 **Status:** accepted · 2026-11-08 · amended 2026-11-13 (#351: click budget, path marks,
-rich-copy output)
+rich-copy output); amended 2026-11-18 (#433: a per-match click budget, single-walk
+rich copy)
 
 ## Context
 
@@ -43,7 +44,7 @@ selection off). The built-in rules, in order:
 | 0 | C++ names `(?:[A-Za-z0-9_]+::)+[A-Za-z0-9_]+` | normal |
 | 1 | Paths `~?/?(?:[\p{L}\p{N}._-]+/+)+[\p{L}\p{N}._-]+/?` | normal |
 | 2 | Double-quoted strings `@?"(?:[^"\\]\|\\.)*"` | normal |
-| 3 | Dotted names `(?:[\p{L}\p{N}._]+\.)+[\p{L}\p{N}._]+` | normal |
+| 3 | Dotted names `(?:[\p{L}\p{M}\p{N}._]+\.)+[\p{L}\p{M}\p{N}._]+` | normal |
 | 4 | `mailto:` | normal |
 | 5 | `@selector(...)` | high |
 | 6 | Email addresses, TLD of 2 to 4 letters (D15) | high |
@@ -129,8 +130,9 @@ one is short), and a copy past the cap is `TESSERA_ERROR_REFUSED` with only
 | Input | Cap |
 |---|---|
 | Rules | 64 (`MAX_SMART_RULES`), later ones dropped with one warning |
-| Pattern | 1024 bytes (`MAX_SMART_RULE_PATTERN_LEN`); compiled program and lazy DFA cache 1 MiB each (`SMART_RULE_SIZE_LIMIT`), nesting 50 (`SMART_RULE_NEST_LIMIT`); a rule that breaks one, does not compile or matches the empty string is left out with a warning |
-| Scan | 8192 characters of the logical line around the click (`SMART_SCAN_LEN`: 4096 before it, the rest after) |
+| Pattern | 1024 bytes (`MAX_SMART_RULE_PATTERN_LEN`); compiled program and lazy DFA cache 1 MiB each (`SMART_RULE_SIZE_LIMIT`), nesting 50 (`SMART_RULE_NEST_LIMIT`); a rule that breaks one, does not compile or matches the empty string is left out with a warning naming its index |
+| Scan | 8192 characters of the logical line around the click (`SMART_SCAN_LEN`: 4096 before it, the rest after) and 32 KiB (`SMART_SCAN_BYTES`: 16 KiB before it, 16 KiB from it on, #433) |
+| Click time | 50 ms (`SMART_RULE_BUDGET`), checked before each rule and after each match, the first rule included (#433) |
 | Formatted copy | 16 MiB of HTML and of RTF (`MAX_RICH_COPY_LEN`), counted while the runs are built; past it the formatted copy is refused and the plain copy still works |
 | RTF colour table | 4096 entries (`MAX_RTF_COLORS`); more is refused like a copy past the size cap |
 
@@ -144,11 +146,10 @@ builds (a test asserts it).
 - Double-clicking a path in `git status`, a URL, a commit hash or an
   address selects all of it; elsewhere a double-click selects what it did.
 - A user rule can select almost anything, but it cannot make a double-click
-  large: the scan, the pattern and the number of rules are capped. Its
-  cost is bounded only by those caps, not by a time limit: a rule that
-  matches often near the click (64 such rules on a long line) can take a
-  double-click to hundreds of milliseconds. The built-in rules on any
-  text a program prints stay around a millisecond.
+  large or slow: the scan, the pattern and the number of rules are capped,
+  and the rules share a time budget checked after every match (#351,
+  #433). The built-in rules on any text a program prints stay around a
+  millisecond.
 - Rich text pastes with the terminal's colours on a white page as well as
   a dark one, since default colours are left to the document.
 - A double-click near the far end of a 8192-character line may select only
@@ -186,7 +187,8 @@ builds (a test asserts it).
 - **`<pre>` and a leading blank line.** The HTML always has a line feed
   right after the `<pre ...>` open tag. An HTML parser drops one line feed
   there, so a selection starting with a blank line keeps it.
-- **Output sized up front.** Each format is written twice: first counted
+- **Output sized up front** (superseded by the single walk of #433, below).
+  Each format is written twice: first counted
   (nothing stored, the cap checked), then into a string of exactly that
   length, at most `MAX_RICH_COPY_LEN`. A 14 MB copy allocates its output
   once instead of doubling into it, and an over-cap copy is refused before
@@ -205,3 +207,117 @@ builds (a test asserts it).
   bounds the lazy DFA's cache. Past the limit the regex crate falls back to
   a slower engine with the same matches, so no test can kill the mutant
   that drops it. It bounds memory, not results.
+
+## Amendment: a click bounded by a per-match budget, single-walk rich copy (#433, #430, 2026-11-18)
+
+**Where the 18 s went (#433).** The rule `(?:[^X]{0,50}){0,20}X|a` compiles
+to 1 042 424 bytes, just under the 1 MiB program bound. Its lazy DFA
+thrashes in a 1 MiB cache and the regex crate falls back to the PikeVM,
+whose cost per byte grows with the program (4 to 46 µs a byte here). On a
+line of `a`s every character is a match, each found after the PikeVM
+looks up to ~1000 bytes ahead: about 4097 matches before the click at
+~10 ms each, 41 s a click on 8192 characters. The budget was checked
+between rules only, and the first rule was exempt, so nothing stopped it.
+A click now costs at most the budget plus one match attempt, and that
+attempt is bounded only by the scan window and the program size (about
+1 s at worst, about 3 s with capture groups, more under load; below):
+
+- **Program size.** `SMART_RULE_SIZE_LIMIT` stays 1 MiB, for the program
+  and for the lazy DFA cache. A smaller bound cannot bound the cost:
+  at 256 KiB it refused common rules (`\w{2,6}`, `\w+@\w+\.\w{2,6}`,
+  `\S{1,200}`, `\w{10}`, `\p{L}{2,20}`), while nested ASCII repetition
+  such as `(?:[a-z]{0,50}){0,20}X|a` fits in ~100 KiB and still thrashes
+  the DFA. The largest built-in rule (paths) compiles to ~104 KiB, and a
+  test checks that every built-in rule fits half the bound.
+- **Budget per match.** `SMART_RULE_BUDGET` (50 ms) is checked before each
+  rule and after each match a rule finds, the first rule included: a rule
+  that has spent it stops at the match it found, the rules after it are
+  skipped, and the best match so far wins. The debug log adds the match
+  count (S8: counts only).
+- **Scan bytes.** The window is also capped at 32 KiB
+  (`SMART_SCAN_BYTES`: 16 KiB before the click, 16 KiB from it on). Text of
+  one scalar a cell never reaches it; 32-scalar clusters (128 bytes a cell)
+  would otherwise make an 8192-character window 1 MiB.
+
+**What stays unbounded: one attempt.** The budget is checked after each
+match, so a rule that finds no match in the window costs one search over
+the whole of it, which only the window and the program size bound. The
+worst case measured without capture groups is
+`(?:[e\x{301}]{0,60}){0,20}[XY]` on combining text: about 1 s (985 ms in
+the round-1 review's probe; 206-768 ms in the release test on this
+machine). Capture groups make each byte about 3x slower once the lazy DFA
+gives up: `(?:(e?)(\x{301}?)){0,2560}[XY]` compiles to 1 044 824 bytes,
+under the bound, and one click on 32 KiB of `e` and U+0301 took 2.2-3.0 s
+idle and up to 6.2 s at load 14 in the adversarial probe (2.2 s on
+decomposed text and 4.7 s on 32-scalar clusters in the release test, at
+load 53), all with the terminal lock held. A click therefore costs at
+most the budget plus about 1 s for a rule without captures, and about
+3 s, more under load, for one with them. Bounding each attempt by construction (a hybrid DFA that
+gives up, or matching on a worker thread) is a 0.3.0 follow-up.
+
+Measured with the release test `hostile_smart_rules_are_refused_or_bounded`
+(20 000-character lines of ASCII, Latin, emoji, 32-scalar clusters and
+repeated literals, plus decomposed `e` and U+0301; fastest of three
+clicks): the #433 rule stops at the budget on ASCII (~51 ms) and takes
+72-237 ms on the other texts, where it rarely matches; `\p{L}{0,1000}X|a`
+compiles to more than 1 MiB and is refused at load; the other nested
+counted repetition stops at the budget (~51 ms on ASCII, under 0.4 ms
+elsewhere); the no-match rules above take 206-768 ms and, with capture
+groups, 2.2-4.7 s on combining and decomposed text;
+an alternation of ~200 literals, `.` and a 1024-byte `a?a?...XY|a` stay
+under 4 ms. The test's bars are 100 ms where a rule matches at every
+character, 10 s for the capture-group rule and 3 s otherwise.
+
+**Dotted names keep combining marks** (#430 m5): the built-in rule is
+`(?:[\p{L}\p{M}\p{N}._]+\.)+[\p{L}\p{M}\p{N}._]+`, as the path rule
+became in #351.
+
+**Single-walk rich copy** (#433 adversarial M3). Copy with Formatting
+walked the HTML twice (counted, then written) and the RTF body four times
+(colour table and body, both counted then written). Each format is now
+written in one walk of the text into one reservation: an upper bound of
+its length computed from the runs' lengths (not their text), at most
+`MAX_RICH_COPY_LEN`. The RTF colour table is built first from the looks
+alone. The pages of the reservation the output does not reach are never
+touched, so memory follows the output, not the bound. A debug assertion
+checks that the output never outgrows its reservation, and a test checks
+the bounds on the text that writes the most bytes per byte in each format.
+
+**Measurements** (`cargo xtask ab bench` against bd80cde, 7 interleaved
+pairs, best instructions retired net of process overhead, release, load
+20-40). Hover (`link_at` at every column of a line holding a URL and a
+path): ASCII 1.007, Latin 1.003, CJK 1.002, box drawing 1.003, Hebrew
+1.004, Arabic 1.003, punctuation 1.014, braille 1.004, emoji 1.002, SGR
+1.003, combining 1.003. Double-click with the built-in rules at every
+column of the same lines: ASCII 1.018, Latin 1.006, CJK 1.005, box drawing
+1.007, Hebrew 1.006, Arabic 1.004, punctuation 1.021, braille 1.006,
+emoji 1.005, SGR 1.017, combining 1.008; checksums equal on every line.
+Cycles on the click cases run about 3 points above instructions: the
+clock read after each match costs that, while instructions stay within
+the bar. Copy with Formatting of a 5000-row selection in runs of five cells
+(11.5 MB of HTML, 4.9 MB of RTF), ten copies: 2.59x fewer instructions and
+2.25x less wall time than before, the corpus setup subtracted; the peak
+resident set the ten copies add is the same (62.6 MB against 62.7 MB,
+median of 11). Differential runs against the base (20 000 random styled
+selections for both formats, 5000 random lines for hover and click with
+combining marks left out, which dotted names now keep) found no
+difference. Hostile hovers (#430 m6, record only): a URL of zero-width
+characters 0.999; 1978 cells of `e` and a combining mark after a URL
+0.988, now no link (3956 characters, over the cap).
+
+**Mutants left alive, by design** (#430 m7). These mutants change how much
+work is done, not any result, so no test can kill them:
+
+- `started` in `hidden_end_can_link`: with no scheme start up to the point,
+  `url_at` found no candidate and a hidden end cannot create one, so
+  dropping the guard only reads clusters the answer does not need.
+- The blocks guard (`url::blocks_scheme(chars[s - 1])`) there: a cell
+  before a start that does not block the scheme leaves U1 passing either
+  way, so checking it too only reads one more cluster.
+- `dfa_size_limit` in the rule compiler (see the #351 amendment).
+- `>=` turned into `>` in the budget checks of `smart_at`: the time
+  compared adds the real time elapsed since the click to the cost the
+  tests charge, and that time is never zero, so the sum never equals the
+  budget and both comparisons stop at the same match.
+
+The `index > 0` exemption is gone.
