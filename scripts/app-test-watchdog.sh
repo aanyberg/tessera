@@ -28,6 +28,15 @@
 # launchd parents), except those already running when the command started (a `just run` Tessera: same PID and same
 # start time), and the command's `xctest` descendants. Otherwise the exit status is the command's own.
 # On SIGINT, SIGTERM, SIGHUP or SIGALRM the hosts and the command are killed and the state directory is removed.
+# Two limits cover what the test-level clock cannot (the 9.5 h run of a bare xcodebuild whose host had crashed, wave 26):
+# a run with no output and no CPU progress in the command, its descendants or its hosts for TESSERA_APP_TEST_IDLE_SECONDS
+# (default 900: 6x the 150 s limit above and 3x xcodebuild's 300 s per-test maximum, so a loaded machine does not trip it;
+# this also covers a host that died before any test started, when no test line ever arms the clock) and a run that lasts
+# more than TESSERA_APP_TEST_HARD_SECONDS (default 5400; a normal run of one suite is 7 minutes). Either trip samples the
+# command's processes and hosts, appends the last 30 output lines and the reason to the sample log, kills only the
+# command's own tree and the hosts of this run, and exits 97 with a one-line message that says HANG. Any other hang
+# this script ends exits 97 too. Any command works, not only xcodebuild (`just test` runs nextest through it): the
+# test-level clock simply never arms without "Test Case" lines.
 # `sample` is looked up on PATH (the self-test, scripts/test-app-test-watchdog.sh, puts a fake one there).
 set -eu
 usage() { print -u2 "usage: scripts/app-test-watchdog.sh [--sample-log <file>] <command> [args]..."; exit 2; }
@@ -42,6 +51,10 @@ fi
 (( $# )) || usage
 limit="${TESSERA_APP_TEST_HANG_SECONDS:-150}"
 [[ "$limit" == <1-> ]] || { print -u2 "TESSERA_APP_TEST_HANG_SECONDS must be a positive integer, got '$limit'"; exit 2; }
+idle_limit="${TESSERA_APP_TEST_IDLE_SECONDS:-900}"
+[[ "$idle_limit" == <1-> ]] || { print -u2 "TESSERA_APP_TEST_IDLE_SECONDS must be a positive integer, got '$idle_limit'"; exit 2; }
+hard_limit="${TESSERA_APP_TEST_HARD_SECONDS:-5400}"
+[[ "$hard_limit" == <1-> ]] || { print -u2 "TESSERA_APP_TEST_HARD_SECONDS must be a positive integer, got '$hard_limit'"; exit 2; }
 sample_limit="${TESSERA_APP_TEST_SAMPLE_SECONDS:-60}"
 [[ "$sample_limit" == <1-> ]] || { print -u2 "TESSERA_APP_TEST_SAMPLE_SECONDS must be a positive integer, got '$sample_limit'"; exit 2; }
 
@@ -52,7 +65,7 @@ for (( i = 1; i < ${#args}; i++ )); do
         products="${args[i+1]:a}/Build/Products/"
     fi
 done
-[[ -n "$products" ]] || print -u2 "app-test watchdog: no -derivedDataPath; only xctest hosts can be found"
+[[ -n "$products" || "$1" != *xcodebuild ]] || print -u2 "app-test watchdog: no -derivedDataPath; only xctest hosts can be found"
 
 state="$(mktemp -d "${TMPDIR:-/tmp}/app-test-watchdog.XXXXXX")"
 # zsh skips the EXIT trap when a signal kills it, so the signals are trapped too: the monitor (which kills the hosts
@@ -84,7 +97,8 @@ monitor() {
         use strict; use warnings;
         use POSIX qw(:sys_wait_h);
         use IO::Select; use Time::HiRes qw(time sleep);
-        my ($limit, $slimit, $products, $state, @cmd) = @ARGV;
+        my ($limit, $slimit, $idle, $hard, $products, $state, @cmd) = @ARGV;
+        my $began = time; my $lastout = $began; my %cpu_seen; my $cpu_polled = 0; my @tail;
         my $parent = getppid();
         $| = 1;
         # Processes under the products path that predate this run (a `just run` Tessera and its shells) are never hosts:
@@ -103,13 +117,15 @@ monitor() {
         }
         close $w;
         sub table {
-            my (%kids, %args, %start);
-            open(my $ps, "-|", "ps", "-A", "-o", "pid=,ppid=,lstart=,args=") or return ({}, {}, {});
+            my (%kids, %args, %start, %cpu);
+            open(my $ps, "-|", "ps", "-A", "-o", "pid=,ppid=,lstart=,time=,args=") or return ({}, {}, {}, {});
             while (<$ps>) {
-                next unless /^\s*(\d+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s?(.*)$/;
-                push @{$kids{$2}}, $1; $args{$1} = $4; $start{$1} = $3;
+                next unless /^\s*(\d+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s+([\d:.-]+)\s?(.*)$/;
+                push @{$kids{$2}}, $1; $args{$1} = $5; $start{$1} = $3;
+                my ($t, $d) = ($4, 0); $d = $1 * 86400 if $t =~ s/^(\d+)-//;
+                my $v = 0; $v = $v * 60 + $_ for split /:/, $t; $cpu{$1} = $d + $v;
             }
-            return (\%kids, \%args, \%start);
+            return (\%kids, \%args, \%start, \%cpu);
         }
         sub below {
             my ($kids, @todo) = @_; my @all;
@@ -151,8 +167,11 @@ monitor() {
         # group), then the group.
         sub stop_all {
             kill "KILL", -$sampler if $sampler;
-            my ($k, $a2, @h) = hosts(); kill_hosts($k, @h);
+            my ($k, $a2, @h) = hosts(); my @t = grep { $_ != $pid } below($k, $pid);
+            kill_hosts($k, @h);
             stop_group();
+            # Descendants in a process group of their own (xcodebuild'"'"'s children) are outside the group kill.
+            ($k) = table(); kill_hosts($k, grep { kill 0, $_ } @t);
         }
         my $stopping = 0;
         $SIG{INT} = $SIG{TERM} = sub { return if $stopping++; stop_all(); exit 130; };
@@ -194,9 +213,11 @@ monitor() {
                 if (!$n) { $open = 0; close $r; }
                 else {
                     print $chunk;
+                    $lastout = time;
                     $buf .= $chunk;
                     while ($buf =~ s/^([^\n]*)\n//) {
                         my $line = $1;
+                        push @tail, $line; shift @tail if @tail > 30;
                         # Failed tests as <Class>.<test>: from "Test Case ... failed" and from the "Failing tests:"
                         # summary, which is the only place a test whose host was killed is listed.
                         if ($failing && $line =~ /^\s+(\S+?)(\(\))?\s*$/) {
@@ -226,6 +247,44 @@ monitor() {
                 $polled = time;
                 my (undef, undef, @alive) = hosts();
                 $last = time unless @alive;
+            }
+            # No output and no CPU progress in the command, its descendants or its hosts, or too long a run: a hang below
+            # the test level (a host that died before any test started leaves xcodebuild waiting for it, and no test line
+            # ever arms $last). The CPU time of every process of this run is read every 3 s.
+            if (!defined $exited && time - $cpu_polled >= 3) {
+                $cpu_polled = time;
+                my ($k, $a2, @h) = hosts(); my (undef, undef, $st2, $cpu) = table();
+                for my $p (below($k, $pid), @h) {
+                    next unless defined $cpu->{$p};
+                    my $key = "$p $st2->{$p}";
+                    # A new process is not progress, and a rise under 50 ms is bookkeeping (it is added up until it counts).
+                    if (!exists $cpu_seen{$key}) { $cpu_seen{$key} = $cpu->{$p}; }
+                    elsif ($cpu->{$p} - $cpu_seen{$key} > 0.05) { $lastout = time; $cpu_seen{$key} = $cpu->{$p}; }
+                }
+            }
+            if (!defined $exited && (time - $began > $hard || time - $lastout > $idle)) {
+                my ($why, $var) = time - $began > $hard
+                    ? ("the run lasted more than $hard s", "TESSERA_APP_TEST_HARD_SECONDS")
+                    : ("no output and no CPU progress for more than $idle s", "TESSERA_APP_TEST_IDLE_SECONDS");
+                my ($k, $a2, @h) = hosts();
+                my @procs = (@h, grep { $_ != $pid && $_ != $$ } below($k, $pid));
+                my %seen; @procs = grep { !$seen{$_}++ } @procs; @procs = @procs[0 .. 5] if @procs > 6;
+                open(my $s, ">>", "$state/hang-1") or die;
+                print $s "== $why ($var); last output lines:\n"; print $s "   $_\n" for @tail;
+                for my $h ($pid, @procs) {
+                    next unless $a2->{$h};
+                    print $s "== sample of pid $h: $a2->{$h}\n"; close $s;
+                    my ($rc, $timed_out) = run_sample($h);
+                    open($s, ">>", "$state/hang-1") or die;
+                    if (open(my $in, "<", "$state/sample-$h")) { print $s $_ while <$in>; close $in; }
+                    else { print $s $timed_out ? "sample timed out after $slimit s\n" : "sample failed (exit $rc)\n"; }
+                }
+                close $s;
+                open(my $all, ">>", "$state/sample") or die; open(my $one, "<", "$state/hang-1") or die;
+                print $all $_ while <$one>; close $one; close $all;
+                open(my $t, ">>", "$state/test") or die; print $t "(no progress)\t$why ($var)\n"; close $t;
+                stop_all();
+                exit 97;
             }
             next unless defined $last && time - $last > $limit;
             if ($fired && !$progress) {
@@ -270,7 +329,7 @@ monitor() {
         }
         $status = $? unless defined $status;
         exit($status & 127 ? 128 + ($status & 127) : $status >> 8);
-    ' "$limit" "$sample_limit" "$products" "$state" "$@" &
+    ' "$limit" "$sample_limit" "$idle_limit" "$hard_limit" "$products" "$state" "$@" &
     monitor_pid=$!
     local rc=0
     wait "$monitor_pid" || rc=$?
@@ -337,12 +396,17 @@ tsan_hang() {
 
 st=0
 monitor "$@" || st=$?
+if (( st == 97 )); then
+    keep_sample 1
+    print -u2 -r -- "app-test watchdog: HANG: $(hangs); killed the command and the hosts of this run; sample and last output lines in $sample_log"
+    exit 97
+fi
 (( st == 124 )) || exit $st
 keep_sample 1
 hung=("${(@f)$(cut -f1 "$state/test" | sort -u)}")
 fail() {
     print -u2 -r -- "app-test watchdog FAILED: $1 (TESSERA_APP_TEST_HANG_SECONDS=$limit); stack sample(s) in $sample_log"
-    exit 1
+    exit "${fail_code:-97}"
 }
 # Each hang is classified on its own samples: one outside the TSan runtime fails the run, whatever the others show.
 tsan_reports=() outside=() n=0
@@ -383,5 +447,6 @@ if (( st == 124 )); then
     keep_sample 2
     fail "$what, retried, and $(hangs)"
 fi
+fail_code=1  # a rerun that failed without hanging is a plain failure, not a hang
 (( st == 0 )) || fail "$what, retried, and the rerun failed (exit $st)"
 print -u2 -r -- "app-test watchdog: $what, retried: the rerun of ${(j:, :)hung} passed; first sample in $sample_log"

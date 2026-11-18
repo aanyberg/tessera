@@ -35,6 +35,8 @@
 # Every case runs through the app-test recipe's pipeline (`set -o pipefail; ... | tee | tail`) and checks that no fake
 # host or its `sleep` is left behind.
 set -eu
+# No case may read the caller's terminal or pipe: a stray reader of stdin would hang the self-test.
+exec < /dev/null
 
 here="$(cd "$(dirname "$0")" && pwd)"
 watchdog="$here/app-test-watchdog.sh"
@@ -90,6 +92,15 @@ if [ -n "$only" ]; then
     echo "** TEST SUCCEEDED **"
     exit 0
 fi
+hold() { sleep 3000 & echo $! >> "$FAKE_WORK/sleeps"; wait; }
+case "$mode" in
+    # The host died before any test started: xcodebuild waits for it, silently, forever.
+    dead-start) hold ;;
+    # The host died during a test: xcodebuild waits for it, silently, forever; no host is left to find.
+    dead) echo "Test Case '-[FakeTests.HangTests testHangs]' started."; hold ;;
+    # Output forever: never idle, only the hard limit ends it.
+    chatty) while :; do echo "Compiling something"; sleep 1; done ;;
+esac
 echo "Test Case '-[FakeTests.PassTests testPasses]' started."
 echo "Test Case '-[FakeTests.PassTests testPasses]' passed (0.001 seconds)."
 case "$mode" in
@@ -409,6 +420,33 @@ check_no_strays() {
 runs() { cat "$w/runs" 2>/dev/null || echo 0; }
 hosts() { wc -l < "$w/hosts" | tr -d ' '; }
 
+# Case $1: the watchdog run directly (its exit status is read before any pipeline), with the environment in $2 (a
+# string of NAME=value pairs) and the command in $3...; FAKE_RUNS is $4 for the fake xcodebuild. Output in $w/out, status in $w/result.
+start_direct() {
+    local w="$work/$1" envs="$2" runs="$3"; shift 3
+    mkdir -p "$w/DerivedData/Build/Products/Debug"
+    cp "$work/bin/FakeHost" "$w/DerivedData/Build/Products/Debug/FakeHost"
+    (
+        local start=$SECONDS st=0
+        env FAKE_WORK="$w" FAKE_RUNS="$runs" FAKE_SAMPLE_TSAN=0 ${=envs} perl -e 'alarm shift; exec @ARGV' 120 \
+            zsh "$watchdog" --sample-log "$w/sample.log" "$@" < /dev/null > "$w/out" 2> "$w/err" || st=$?
+        print -r -- "$st $(( SECONDS - start ))" > "$w/result"
+    ) &
+}
+xc() { print -r -- xcodebuild test -scheme Fake -derivedDataPath "$work/$1/DerivedData"; }
+
+# An unrelated process (another run's, another worktree's) that no case may touch.
+sleep 301 &!
+bystander=$!
+start_direct dead "TESSERA_APP_TEST_IDLE_SECONDS=100" dead ${=$(xc dead)}
+start_direct dead-start "TESSERA_APP_TEST_IDLE_SECONDS=6" dead-start ${=$(xc dead-start)}
+start_direct chatty "TESSERA_APP_TEST_IDLE_SECONDS=100 TESSERA_APP_TEST_HARD_SECONDS=6" chatty ${=$(xc chatty)}
+start_direct silent "TESSERA_APP_TEST_IDLE_SECONDS=6" - zsh -c 'echo begin; trap "" TERM; perl -e "setpgrp(0,0); exec q(sleep), 302" & echo $! > '"$work"'/silent-grandchild; sleep 303 & wait'
+start_direct fails "TESSERA_APP_TEST_IDLE_SECONDS=6" - zsh -c 'echo out-line; echo err-line >&2; exit 7'
+start_direct passes "TESSERA_APP_TEST_IDLE_SECONDS=6" - zsh -c 'echo fine'
+# One process spinning for 9 s without a byte of output: only its CPU time is progress (a bounded single process, no load generator).
+start_direct spinner "TESSERA_APP_TEST_IDLE_SECONDS=4" - perl -e '$t = time + 9; 1 while time < $t'
+start_direct slow-chat "TESSERA_APP_TEST_IDLE_SECONDS=6" - zsh -c 'for i in 1 2 3 4 5; do echo tick $i; sleep 2; done'
 start_case pass pass 0
 start_case slow-results slow-results 0
 start_case hang hang,pass 0 user
@@ -432,6 +470,79 @@ start_case tsan-twice hang,hang 1
 start_case mixed hang-hang,pass 1,0
 start_case mixed-reversed hang-hang,pass 0,1
 wait
+
+# --- hangs below the test level: exit 97, a one-line message saying HANG, a diagnostic, only this run's processes killed
+direct() { w="$work/$1"; read -r st secs < "$w/result"; out="$(< "$w/out")"; err="$(< "$w/err")"; }
+alive() { kill -0 "$1" 2>/dev/null; }
+
+direct dead
+if (( st == 97 && secs <= 2 * limit + slack )) && [[ "$err" == *"FAILED: -[FakeTests.HangTests testHangs] ran longer than 5 s"* ]]; then
+    ok "a test host that died mid-test (xcodebuild waits silently) is caught by the test clock: exit 97 within twice the limit"
+else
+    not_ok "a dead host mid-test: exit $st after ${secs} s: $err"
+fi
+check_no_strays "a dead host mid-test"
+
+direct dead-start
+if (( st == 97 && secs <= 6 + slack )) && [[ "$err" == *"HANG: no output and no CPU progress for more than 6 s (TESSERA_APP_TEST_IDLE_SECONDS)"* \
+    && "$(print -r -- "$err" | wc -l | tr -d ' ')" == 1 ]] \
+    && grep -q "last output lines" "$w/sample.log" && grep -q "Test Suite 'Selected tests' started" "$w/sample.log" \
+    && grep -q "== sample of pid" "$w/sample.log"; then
+    ok "a host that died before any test started is caught by the idle limit: exit 97, one HANG line, sample and last output lines kept"
+else
+    not_ok "a dead host before the first test: exit $st after ${secs} s: $err; log: $(cat "$w/sample.log" 2>/dev/null)"
+fi
+check_no_strays "a dead host before the first test"
+
+direct chatty
+if (( st == 97 && secs <= 6 + slack )) && [[ "$err" == *"HANG: the run lasted more than 6 s (TESSERA_APP_TEST_HARD_SECONDS)"* ]]; then
+    ok "a run that keeps printing is ended by the hard limit: exit 97"
+else
+    not_ok "the hard limit: exit $st after ${secs} s: $err"
+fi
+check_no_strays "the hard limit"
+
+direct silent
+gc="$(cat "$work/silent-grandchild" 2>/dev/null)"
+sleep 1
+if (( st == 97 && secs <= 6 + slack )) && [[ "$err" == *"HANG: no output and no CPU progress"* && "$out" == *begin* ]] \
+    && ! alive "$gc" && [[ -z "$(ps -A -o args= | grep -E '^sleep 30[23]$')" ]]; then
+    ok "a silent command that ignores SIGTERM, with a grandchild in its own process group, is killed with all its processes"
+else
+    not_ok "a silent command: exit $st after ${secs} s, grandchild $gc alive=$(alive "$gc" && echo yes || echo no): $err"
+fi
+if alive "$bystander" && ps -o args= -p "$bystander" | grep -q "sleep 301"; then
+    ok "an unrelated process running at the same time is left alone"
+else
+    not_ok "the unrelated process ($bystander) was killed"
+fi
+kill "$bystander" 2>/dev/null
+
+direct fails
+if (( st == 7 )) && [[ "$out" == *out-line*err-line* && "$err" != *HANG* ]]; then
+    ok "a failing command's exit code (7), output (stdout and stderr, merged as the recipe's redirect does) pass through"
+else
+    not_ok "a failing command: exit $st: $out / $err"
+fi
+direct passes
+if (( st == 0 )) && [[ "$out" == fine && -z "$err" ]]; then
+    ok "a passing command exits 0 with its output"
+else
+    not_ok "a passing command: exit $st: $out / $err"
+fi
+direct slow-chat
+if (( st == 0 && secs >= 9 )) && [[ "$err" != *HANG* ]]; then
+    ok "a command that outlasts the idle limit but keeps printing is not a hang"
+else
+    not_ok "a chatty command: exit $st after ${secs} s: $err"
+fi
+
+direct spinner
+if (( st == 0 && secs >= 9 )) && [[ "$err" != *HANG* && "$out" != *HANG* ]]; then
+    ok "a silent command that keeps using CPU for longer than the idle limit is not a hang (CPU progress)"
+else
+    not_ok "a silent spinner: exit $st after ${secs} s: $out $err"
+fi
 
 # --- all tests pass
 load_case pass

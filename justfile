@@ -22,8 +22,9 @@ fmt-check:
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
 
+# Through scripts/app-test-watchdog.sh: nextest's own timeouts end a hung test, the watchdog a run that stops making progress anywhere else (a hung build, a stuck nextest; exit 97)
 test:
-    cargo nextest run --workspace
+    scripts/app-test-watchdog.sh cargo nextest run --workspace
 
 deny:
     cargo deny check
@@ -90,12 +91,20 @@ app-test: xcframework xcodeproj
     rm -f {{quote(build_dir + "/app-test-pass")}}
     set -o pipefail; scripts/app-test-watchdog.sh xcodebuild test -project {{quote(app_dir + "/Tessera.xcodeproj")}} -scheme TesseraKit -enableThreadSanitizer YES {{test_timeouts}} \
         -destination 'platform=macOS' -derivedDataPath {{quote(app_dir + "/DerivedData")}} 2>&1 | tee {{quote(build_dir + "/app-test.log")}} | tail -5 \
-        || { echo "xcodebuild test failed; errors from {{build_dir}}/app-test.log:" >&2; grep -E 'error:|failed|ThreadSanitizer|app-test watchdog' {{quote(build_dir + "/app-test.log")}} >&2; exit 1 }
+        || { rc=$?; echo "xcodebuild test failed (exit $rc, 97 is a hang); errors from {{build_dir}}/app-test.log:" >&2; grep -E 'error:|failed|ThreadSanitizer|app-test watchdog|HANG' {{quote(build_dir + "/app-test.log")}} >&2; exit $rc }
     set -o pipefail; scripts/app-test-watchdog.sh xcodebuild test -project {{quote(app_dir + "/Tessera.xcodeproj")}} -scheme Tessera -enableThreadSanitizer YES {{test_timeouts}} \
         -destination 'platform=macOS' -derivedDataPath {{quote(app_dir + "/DerivedData")}} 2>&1 | tee {{quote(build_dir + "/app-test-tessera.log")}} | tail -5 \
-        || { echo "xcodebuild test failed; errors from {{build_dir}}/app-test-tessera.log:" >&2; grep -E 'error:|failed|ThreadSanitizer|app-test watchdog' {{quote(build_dir + "/app-test-tessera.log")}} >&2; exit 1 }
+        || { rc=$?; echo "xcodebuild test failed (exit $rc, 97 is a hang); errors from {{build_dir}}/app-test-tessera.log:" >&2; grep -E 'error:|failed|ThreadSanitizer|app-test watchdog|HANG' {{quote(build_dir + "/app-test-tessera.log")}} >&2; exit $rc }
     # The record scripts/verify-branch.sh's `app-test` lens reads (#446): HEAD and whether the tree was clean, written only after both suites passed
     printf '%s %s\n' "$(git rev-parse HEAD)" "$(if [ -z "$(git status --porcelain)" ]; then echo clean; else echo dirty; fi)" > {{quote(build_dir + "/app-test-pass")}}
+
+# The one way to run part of the app's XCTest suites (one test, a class or a filtered set, mutation runs included): `just app-test-only TesseraKit TesseraKitTests/KeymapTests/testChord`. The first argument is the scheme (TesseraKit or Tessera), the others are -only-testing selectors (Target/Class[/test]). It runs through scripts/app-test-watchdog.sh like `just app-test`, so a dead test host ends the run (exit 97) instead of stalling it; never run a bare `xcodebuild test` (a 9.5 hour hang, wave 26). Log: apps/macos/build/app-test-only.log; it does not write app-test-pass
+app-test-only $scheme +$selectors: xcframework xcodeproj
+    mkdir -p {{quote(build_dir)}}
+    set -o pipefail; scripts/app-test-watchdog.sh xcodebuild test -project {{quote(app_dir + "/Tessera.xcodeproj")}} -scheme "$scheme" -enableThreadSanitizer YES {{test_timeouts}} \
+        ${${=selectors}/#/-only-testing:} \
+        -destination 'platform=macOS' -derivedDataPath {{quote(app_dir + "/DerivedData")}} 2>&1 | tee {{quote(build_dir + "/app-test-only.log")}} | tail -20 \
+        || { rc=$?; echo "xcodebuild test failed (exit $rc, 97 is a hang); errors from {{build_dir}}/app-test-only.log:" >&2; grep -E 'error:|failed|ThreadSanitizer|app-test watchdog|HANG' {{quote(build_dir + "/app-test-only.log")}} >&2; exit $rc }
 
 # #228
 # Check scripts/app-test-watchdog.sh with a fake xcodebuild: a host that hangs and ignores SIGTERM is killed, named and sampled; a __tsan hang is retried once
