@@ -30,6 +30,8 @@ final class PluginsPaneTests: XCTestCase {
 
     override func tearDown() async throws {
         appDelegate.settingsWindowController?.close()
+        appDelegate.settingsClock = SystemSettingsClock()
+        appDelegate.settingsWaitLimit = .seconds(2)
         controllers.forEach { $0.close() }
         controllers = []
         if replacedCore {
@@ -305,11 +307,155 @@ final class PluginsPaneTests: XCTestCase {
             XCTAssertTrue(clean(text), text.debugDescription)
         }
         XCTAssertEqual(PluginsPane.title(plugin), "eviltxt]0;title")
-        XCTAssertEqual(model.unknownEnabledPlugins, ["gonex"], "each once, nothing for an id with nothing visible")
+        XCTAssertEqual(
+            model.unknownEnabledPlugins, [#""gone\u{202e}x""#, #""\u{200b}""#],
+            "each once, escaped, an id with nothing visible too")
         // A name with nothing visible shows the id.
         let nameless = TesseraPlugin(
             id: "dev.n", name: "\u{202E}", version: "1", capabilities: [], enabled: false, state: .disabled)
         XCTAssertEqual(PluginsPane.title(nameless), "dev.n")
+    }
+
+    /// Ids that differ by a character the window would not show apart (a
+    /// zero-width or trailing space, NFC and NFD) show apart, escaped, and
+    /// never as a plugin this version has (#489 48b adversarial m1).
+    func testUnknownIdsShowEscapedAndApart() throws {
+        let long = String(repeating: "\u{200B}", count: 300)
+        let (model, _, _, _) = try fakeModel(
+            enabled: [
+                "dev.a", "dev.a\u{200B}", "dev.a ", "caf\u{E9}", "cafe\u{301}", "a\"b\\c", "dev.a\u{200B}", long,
+            ],
+            plugins: [Self.plugin("dev.a", enabled: true, state: .active)])
+        let shown = model.unknownEnabledPlugins
+        XCTAssertEqual(
+            Array(shown.prefix(5)),
+            [#""dev.a\u{200b}""#, #""dev.a ""#, #""caf\u{e9}""#, #""cafe\u{301}""#, #""a\"b\\c""#])
+        // Checked before it is indexed: an index out of range ends the
+        // test host, and xcodebuild with it hangs on the crashed host.
+        guard shown.count == 6 else { return XCTFail("\(shown.count) shown: \(shown)") }
+        XCTAssertEqual(shown[5].count, SettingsModel.maxPluginIDShown + 2, "capped, in quotes")
+        XCTAssertTrue(shown[5].hasSuffix("…\""), shown[5])
+        XCTAssertEqual(SettingsModel.shownPluginID("dev.tessera.hello"), #""dev.tessera.hello""#)
+        let exact = SettingsModel.shownPluginID(String(repeating: "x", count: SettingsModel.maxPluginIDShown))
+        XCTAssertFalse(exact.contains("…"), "exactly at the cap: whole")
+        for text in shown {
+            XCTAssertTrue(text.unicodeScalars.allSatisfy { (0x20...0x7E).contains($0.value) || $0 == "…" }, text)
+        }
+        XCTAssertTrue(model.isPluginEnabled("dev.a"))
+        // NFC listed, NFD asked: another id for the host, which compares bytes.
+        let (nfc, _, _, _) = try fakeModel(enabled: ["caf\u{E9}"], plugins: [])
+        XCTAssertTrue(nfc.isPluginEnabled("caf\u{E9}"))
+        XCTAssertFalse(nfc.isPluginEnabled("cafe\u{301}"))
+    }
+
+    /// Turning a plugin off takes out its id byte for byte: another
+    /// spelling of it (NFD for NFC), another id for the host, stays.
+    func testTurningOffKeepsAnotherSpellingOfTheId() async throws {
+        let writer = FakeWriter()
+        let (model, _, _, _) = try fakeModel(
+            enabled: ["caf\u{E9}", "cafe\u{301}", "caf\u{E9}"],
+            plugins: [Self.plugin("caf\u{E9}", enabled: true, state: .active)], writer: writer)
+        PluginsPane.enabledBinding(model, "caf\u{E9}").wrappedValue = false
+        try await waitUntil("written") { !model.isWriting }
+        XCTAssertEqual(writer.calls.count, 1)
+        let written = try XCTUnwrap(writer.calls.first?.value?.array?.compactMap(\.string))
+        XCTAssertEqual(written.map { Array($0.utf8) }, [Array("cafe\u{301}".utf8)])
+    }
+
+    /// A flood of `[plugins] enabled` ids (S5): the footer lists at most
+    /// ``SettingsModel/maxUnknownPluginsShown`` of the ids the host reads
+    /// and a line for the rest, and the host's warning says how many it
+    /// ignores; the pane renders it in a bounded time.
+    func testTenThousandIdsShowACappedFooterAndTheSkipWarning() throws {
+        let ids = (0..<10_000).map { "flood.\($0)" }
+        let (model, _, _, _) = try fakeModel(enabled: ids, plugins: [Self.plugin("dev.a")])
+        let shown = model.unknownEnabledPlugins
+        XCTAssertEqual(shown.count, SettingsModel.maxUnknownPluginsShown + 1, "\(shown)")
+        XCTAssertEqual(shown.first, #""flood.0""#)
+        XCTAssertEqual(
+            shown.last, "and \(SettingsModel.maxEnabledPlugins - SettingsModel.maxUnknownPluginsShown) more",
+            "of the ids the host reads")
+        XCTAssertEqual(
+            model.pluginsSkipWarning,
+            "[plugins] enabled lists more than 64 ids; the rest are ignored (\(10_000 - 64) ids ignored).")
+        // One id, ten thousand times: once.
+        let (same, _, _, _) = try fakeModel(enabled: Array(repeating: "x", count: 10_000), plugins: [])
+        XCTAssertEqual(same.unknownEnabledPlugins, [#""x""#])
+
+        let controller = SettingsWindowController(
+            model: model, actions: SettingsActions(openConfigFile: {}), autosaveName: nil)
+        controllers.append(controller)
+        let start = ContinuousClock.now
+        controller.select(pane: "plugins")
+        controller.window?.contentView?.layoutSubtreeIfNeeded()
+        let elapsed = ContinuousClock.now - start
+        // Recorded for the report; a loose bound (the uncapped footer took
+        // 0.23 s at 10 000 ids, 1.57 s at 100 000).
+        print("plugins pane with 10 000 ids rendered in \(elapsed)")
+        XCTAssertLessThan(elapsed, .seconds(5))
+    }
+
+    /// At ``SettingsModel/maxEnabledPlugins`` ids a toggle turned on writes
+    /// nothing and says why; turning one off still writes, and a hand edit
+    /// that makes room clears the refusal (#489 48b B1, stand-ins).
+    func testAtTheCapTurningOnIsRefusedAndOffStillWrites() async throws {
+        let full = (0..<SettingsModel.maxEnabledPlugins).map { "x.\($0)" }
+        let (model, source, writer, _) = try fakeModel(enabled: full, plugins: [Self.plugin("dev.a")])
+        let toggle = PluginsPane.enabledBinding(model, "dev.a")
+        toggle.wrappedValue = true
+        XCTAssertFalse(toggle.wrappedValue)
+        XCTAssertFalse(model.pluginsChanging)
+        XCTAssertEqual(model.message(SettingsModel.pluginsKey), SettingsModel.pluginsFullRefusal)
+        XCTAssertNil(model.pluginsSkipWarning, "64 ids: none ignored")
+        try Self.apply(source, model, generation: 1, enabled: full, plugins: [Self.plugin("dev.a")])
+        XCTAssertEqual(model.message(SettingsModel.pluginsKey), SettingsModel.pluginsFullRefusal, "still full")
+        try Self.apply(source, model, generation: 2, enabled: Array(full.dropLast()), plugins: [Self.plugin("dev.a")])
+        XCTAssertNil(model.message(SettingsModel.pluginsKey), "room made by hand")
+        XCTAssertEqual(writer.calls, [])
+    }
+
+    /// The plugins read again while one settles and read the same are not
+    /// set again, nor is whether they could be read: the pane, which reads
+    /// both, is not redrawn for them (#489 48b m2).
+    func testASettleReadThatChangesNothingDoesNotRedraw() throws {
+        let stuck = [Self.plugin("dev.a", enabled: true, state: .disabled)]
+        let (model, source, _, clock) = try fakeModel(enabled: ["dev.a"], plugins: stuck)
+        let changes = ChangeCount()
+        func observe() {
+            withObservationTracking {
+                _ = model.plugins
+                _ = model.pluginsUnreadable
+            } onChange: {
+                changes.value += 1
+            }
+        }
+        observe()
+        clock.advance(by: SettingsModel.pluginSettleInterval * 5)
+        model.readPluginsAgain()
+        XCTAssertEqual(changes.value, 0, "the same plugins read again")
+        source.pluginList = [Self.plugin("dev.a", enabled: true, state: .active)]
+        clock.advance(by: SettingsModel.pluginSettleInterval)
+        XCTAssertEqual(changes.value, 1, "a change is shown")
+        XCTAssertEqual(model.plugins.first?.state, .active)
+    }
+
+    /// With no core the pane shows no plugins and says they could not be
+    /// read, also from a read while one settles (#489 48b adversarial m4).
+    func testWithNoCoreThePluginsCannotBeRead() throws {
+        let (model, _, _, clock) = try fakeModel(
+            enabled: ["dev.a"], plugins: [Self.plugin("dev.a", enabled: true, state: .disabled)])
+        XCTAssertEqual(model.plugins.count, 1)
+        XCTAssertFalse(model.pluginsUnreadable)
+        sources = []
+        clock.advance(by: SettingsModel.pluginSettleInterval)
+        XCTAssertTrue(model.pluginsUnreadable, "a settle read with the core gone")
+        XCTAssertEqual(model.plugins, [])
+        let (other, _, _, _) = try fakeModel(enabled: [], plugins: [Self.plugin("dev.b", enabled: false)])
+        sources = []
+        other.reload()
+        XCTAssertTrue(other.pluginsUnreadable, "a reload with the core gone")
+        XCTAssertEqual(other.plugins, [])
+        XCTAssertNotNil(other.loadError)
     }
 
     // MARK: The window on a core
@@ -366,4 +512,145 @@ final class PluginsPaneTests: XCTestCase {
         XCTAssertNotNil(opened.window)
         try await waitUntil("the controller and model are freed") { opened.controller == nil && opened.model == nil }
     }
+
+    private static let hello = "dev.tessera.hello"
+
+    /// `[plugins] enabled` as TOML, one id per line.
+    private static func enabledTOML(_ ids: [String]) -> String {
+        "# mine\n[plugins]\nenabled = [\n" + ids.map { "  \"\($0)\",\n" }.joined() + "]\n"
+    }
+
+    /// At 64 ids Hello's toggle is refused with the pane's message, the
+    /// file keeps its bytes and nothing waits; with 65 the host's warning
+    /// shows, and Hello, the 65th, shows off as the host has it (#489 48b
+    /// B1). On the app's core.
+    func testAtSixtyFourIdsTheToggleIsRefusedAndSixtyFiveShowTheSkipWarning() async throws {
+        let unknown = (0..<SettingsModel.maxEnabledPlugins).map { "x.\($0)" }
+        let config = Self.enabledTOML(unknown)
+        let controller = try openPlugins(config: config)
+        let model = controller.model
+        let toggle = PluginsPane.enabledBinding(model, Self.hello)
+        XCTAssertNil(model.pluginsSkipWarning)
+        toggle.wrappedValue = true
+        XCTAssertFalse(toggle.wrappedValue)
+        XCTAssertFalse(model.pluginsChanging)
+        XCTAssertFalse(model.isWriting)
+        XCTAssertEqual(model.message(SettingsModel.pluginsKey), SettingsModel.pluginsFullRefusal)
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(try file(), config, "nothing written")
+
+        // 65: Hello listed past the host's cap.
+        try Self.enabledTOML(unknown + [Self.hello])
+            .write(to: try XCTUnwrap(dir).appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)
+        try await waitUntil("the 65 ids applied") { model.pluginsSkipWarning != nil }
+        XCTAssertEqual(
+            model.pluginsSkipWarning, "[plugins] enabled lists more than 64 ids; the rest are ignored (1 id ignored).")
+        let hello = try XCTUnwrap(model.plugins.first { $0.id == Self.hello })
+        XCTAssertFalse(hello.enabled, "the host ignores it")
+        XCTAssertFalse(toggle.wrappedValue, "shown as the host has it")
+        XCTAssertEqual(PluginsPane.status(model, hello), "Off")
+        toggle.wrappedValue = true
+        XCTAssertEqual(model.message(SettingsModel.pluginsKey), SettingsModel.pluginsFullRefusal)
+        XCTAssertFalse(model.pluginsChanging)
+    }
+
+    /// A wrong-typed `[plugins] enabled` (a string): the toggle shows the
+    /// core's refusal (the loader's error, sanitised) and the file keeps
+    /// what the user wrote (#489 48b adversarial m2, #449).
+    func testAWrongTypedEnabledShowsTheCoresRefusal() async throws {
+        let config = "# mine\n[plugins]\nenabled = \"\(Self.hello)\" # by hand\n"
+        let controller = try openPlugins(config: config)
+        let model = controller.model
+        PluginsPane.enabledBinding(model, Self.hello).wrappedValue = true
+        try await waitUntil("refused") { !model.isWriting && model.message(SettingsModel.pluginsKey) != nil }
+        let message = try XCTUnwrap(model.message(SettingsModel.pluginsKey))
+        print("wrong-typed enabled refusal: \(message)")
+        XCTAssertTrue(message.contains("invalid type"), message)
+        XCTAssertFalse(model.pluginsChanging)
+        XCTAssertEqual(try file(), config, "what the user wrote is kept")
+    }
+
+    /// Settings closed while a toggle's edit waits to apply keeps its model
+    /// (#489 48b m1): opened again, the app shows that model, still locked,
+    /// not one of the configuration from before the edit; it goes once the
+    /// edit applies. Opened and closed as the app does; on a manual clock,
+    /// so only the apply can release it. Nothing awaited from the toggle to
+    /// the reopen, so the watch's apply (on the main actor) cannot come
+    /// first.
+    func testClosingSettingsDuringAPluginChangeKeepsTheModelUntilItLands() async throws {
+        let clock = ManualClock()
+        appDelegate.settingsClock = clock
+        let controller = try openPlugins(config: "[plugins]\nenabled = []\n")
+        let model = controller.model
+        model.setPlugin(Self.hello, enabled: true)
+        XCTAssertTrue(model.pluginsChanging)
+        controller.close()
+        XCTAssertNil(appDelegate.settingsWindowController)
+        XCTAssertTrue(appDelegate.waitingSettingsModel === model, "kept while the edit waits")
+        MainMenu.run(command: "settings")
+        let reopened = try XCTUnwrap(appDelegate.settingsWindowController)
+        XCTAssertTrue(reopened.model === model, "the model that made the edit")
+        XCTAssertTrue(reopened.model.pluginsChanging, "still locked")
+        XCTAssertTrue(PluginsPane.enabledBinding(reopened.model, Self.hello).wrappedValue)
+        reopened.close()
+        XCTAssertTrue(appDelegate.waitingSettingsModel === model)
+        try await waitUntil("applied and let go") { appDelegate.waitingSettingsModel == nil }
+        XCTAssertFalse(model.pluginsChanging)
+        let written = try file()
+        XCTAssertTrue(written.contains("\"\(Self.hello)\""), written)
+    }
+
+    /// An id starting with U+FEFF is another id for the host, and the pane
+    /// reads it as one: the toggle follows the host, the footer shows it,
+    /// and a toggle's write keeps it byte for byte (#489). On the app's core.
+    func testAnIdStartingWithAByteOrderMarkStaysAnotherId() async throws {
+        let marked = "\u{FEFF}\(Self.hello)"
+        let controller = try openPlugins(config: "[plugins]\nenabled = [\"\(marked)\"]\n")
+        let model = controller.model
+        let toggle = PluginsPane.enabledBinding(model, Self.hello)
+        let hello = try XCTUnwrap(model.plugins.first { $0.id == Self.hello })
+        XCTAssertFalse(hello.enabled, "the host does not read it as Hello")
+        XCTAssertFalse(toggle.wrappedValue)
+        XCTAssertEqual(PluginsPane.status(model, hello), "Off")
+        XCTAssertEqual(model.unknownEnabledPlugins, [#""\u{feff}dev.tessera.hello""#])
+
+        toggle.wrappedValue = true
+        try await waitUntil("applied") {
+            !model.pluginsChanging && model.plugins.first { $0.id == Self.hello }?.enabled == true
+        }
+        let listed = try XCTUnwrap(model.value(SettingsModel.pluginsKey)?.array?.compactMap(\.string))
+        XCTAssertEqual(listed.map { Array($0.utf8) }, [Array(marked.utf8), Array(Self.hello.utf8)])
+        XCTAssertTrue(try file().contains(marked), "the id in the file keeps its mark")
+    }
+
+    /// ⌘, onto an open Settings window reads the plugins again: one that
+    /// settled after the reads stopped shows where it stands (#489 48b
+    /// m6). Opened and brought forward as the menu does, nothing posted;
+    /// on a stand-in model the app opens (a plugin of the app's core
+    /// settles before any read the test could race) on a manual clock, so
+    /// no read while it settles runs.
+    func testSettingsOpenedAgainReadsThePluginsAgain() async throws {
+        try openPlugins(config: "[plugins]\nenabled = []\n").close()
+        XCTAssertNil(appDelegate.waitingSettingsModel)
+        let (model, source, _, _) = try fakeModel(
+            enabled: ["dev.a"], plugins: [Self.plugin("dev.a", enabled: true, state: .disabled)])
+        appDelegate.waitingSettingsModel = model
+        MainMenu.run(command: "settings")
+        let controller = try XCTUnwrap(appDelegate.settingsWindowController)
+        XCTAssertTrue(controller.model === model)
+        XCTAssertEqual(PluginsPane.status(model, try XCTUnwrap(model.plugins.first)), "Starting…")
+        // Started once the reads stopped: nothing reads it on its own.
+        source.pluginList = [Self.plugin("dev.a", enabled: true, state: .active)]
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(PluginsPane.status(model, try XCTUnwrap(model.plugins.first)), "Starting…")
+        MainMenu.run(command: "settings")
+        XCTAssertTrue(appDelegate.settingsWindowController === controller, "the open window brought forward")
+        XCTAssertEqual(PluginsPane.status(model, try XCTUnwrap(model.plugins.first)), "Running", "read again")
+    }
+}
+
+/// Counts observation changes; the onChange closure runs on the main
+/// actor here, where every change in these tests is made.
+private final class ChangeCount: @unchecked Sendable {
+    var value = 0
 }

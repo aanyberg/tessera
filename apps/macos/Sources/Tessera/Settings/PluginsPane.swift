@@ -14,15 +14,38 @@ import TesseraKit
 extension SettingsModel {
     /// The key path the toggles write, and the key of their message.
     static let pluginsKey = "plugins.enabled"
+    /// The most ids of `[plugins] enabled` the plugin host reads: it
+    /// ignores the rest, with a warning. Mirrors `MAX_ENABLED_PLUGINS` in
+    /// tessera-app-core (`crates/tessera-app-core/src/plugins.rs`), which
+    /// the FFI does not export yet; change both together.
+    static let maxEnabledPlugins = 64
+    /// At most this many ids this version does not have are listed under
+    /// the plugins, and a line for the rest (S5).
+    static let maxUnknownPluginsShown = 16
+    /// An unknown id is shown in at most this many characters.
+    static let maxPluginIDShown = 80
+    /// The host's warning for the ids past ``maxEnabledPlugins``, in its
+    /// words (tessera-app-core logs it; the FFI does not pass it on).
+    static let pluginsSkippedWarning =
+        "[plugins] enabled lists more than \(maxEnabledPlugins) ids; the rest are ignored"
+    /// Why a toggle turned on at ``maxEnabledPlugins`` ids did nothing.
+    static let pluginsFullRefusal =
+        "[plugins] enabled lists \(maxEnabledPlugins) ids, as many as Tessera reads; take one out of config.toml to turn this plugin on."
 
-    /// The ids `[plugins] enabled` lists, as shown.
-    private var enabledPluginIDs: [String] {
+    /// Every id `[plugins] enabled` lists, as shown.
+    private var listedPluginIDs: [String] {
         value(Self.pluginsKey)?.array?.compactMap(\.string) ?? []
     }
 
-    /// Whether `[plugins] enabled` lists `id`, as shown.
+    /// The ids the host reads, as shown: the first ``maxEnabledPlugins``.
+    private var enabledPluginIDs: ArraySlice<String> {
+        listedPluginIDs.prefix(Self.maxEnabledPlugins)
+    }
+
+    /// Whether `[plugins] enabled` lists `id` among the ids the host reads,
+    /// as shown.
     func isPluginEnabled(_ id: String) -> Bool {
-        enabledPluginIDs.contains(id)
+        enabledPluginIDs.contains { $0.utf8.elementsEqual(id.utf8) }
     }
 
     /// Whether an edit of `[plugins] enabled` is queued, running, or written
@@ -37,27 +60,80 @@ extension SettingsModel {
             ? "Waiting for config.toml to be applied; plugins can be turned on or off once it is." : nil
     }
 
-    /// Lists `id` in `[plugins] enabled` (at the end, unless it is listed),
-    /// or takes every copy of it out. Nothing while ``pluginsChanging``.
+    /// The host's warning while `[plugins] enabled` lists more ids than it
+    /// reads, with how many it ignores; `nil` otherwise.
+    var pluginsSkipWarning: String? {
+        let count = listedPluginIDs.count
+        guard count > Self.maxEnabledPlugins else { return nil }
+        let ignored = count - Self.maxEnabledPlugins
+        return "\(Self.pluginsSkippedWarning) (\(ignored) \(ignored == 1 ? "id" : "ids") ignored)."
+    }
+
+    /// Lists `id` in `[plugins] enabled` (at the end, unless the host reads
+    /// it already), or takes every copy of it out. Nothing while
+    /// ``pluginsChanging``; at ``maxEnabledPlugins`` ids, turning one on is
+    /// refused with ``pluginsFullRefusal`` and writes nothing (the host
+    /// would ignore the id).
     func setPlugin(_ id: String, enabled: Bool) {
         guard !pluginsChanging else { return }
         let listed = value(Self.pluginsKey)?.array ?? []
         let entry = TesseraConfigValue.string(id)
         if enabled {
-            guard !listed.contains(entry) else { return }
+            guard !isPluginEnabled(id) else { return }
+            guard listed.count < Self.maxEnabledPlugins else {
+                show(Self.pluginsFullRefusal, for: Self.pluginsKey)
+                return
+            }
             set(Self.pluginsKey, .array(listed + [entry]))
         } else {
-            set(Self.pluginsKey, .array(listed.filter { $0 != entry }))
+            // Byte for byte, as the host compares: another spelling of the
+            // id (NFD for NFC) is another id, and stays.
+            set(Self.pluginsKey, .array(listed.filter { $0.string.map { !$0.utf8.elementsEqual(id.utf8) } ?? true }))
         }
     }
 
-    /// The ids `[plugins] enabled` lists that are not built into this
-    /// version (the host ignores them), each once, sanitised (S3).
+    /// The ids the host reads that are not built into this version (it
+    /// ignores them), each once, as ``shownPluginID(_:)`` shows them: at
+    /// most ``maxUnknownPluginsShown``, then a line for the rest.
     var unknownEnabledPlugins: [String] {
-        let known = Set(plugins.map(\.id))
-        var seen = Set<String>()
-        return enabledPluginIDs.filter { !known.contains($0) && seen.insert($0).inserted }
-            .map(Self.sanitisedMessage).filter { !$0.isEmpty }
+        let known = Set(plugins.map(\.id).map { Array($0.utf8) })
+        var seen = Set<[UInt8]>()
+        var shown: [String] = []
+        var more = 0
+        for id in enabledPluginIDs {
+            let bytes = Array(id.utf8)
+            guard !known.contains(bytes), seen.insert(bytes).inserted else { continue }
+            if shown.count < Self.maxUnknownPluginsShown {
+                shown.append(Self.shownPluginID(id))
+            } else {
+                more += 1
+            }
+        }
+        if more > 0 { shown.append("and \(more) more") }
+        return shown
+    }
+
+    /// `id` from the file as the footer shows it (S3): in quotes, printable
+    /// ASCII as it is (a quote and a backslash escaped), every other code
+    /// point as `\u{…}`, so ids that differ by an invisible or look-alike
+    /// character (a zero-width or trailing space, another normalisation)
+    /// show apart and nothing in one reaches the window unescaped. At most
+    /// ``maxPluginIDShown`` characters.
+    static func shownPluginID(_ id: String) -> String {
+        var text = ""
+        for scalar in id.unicodeScalars {
+            switch scalar.value {
+            case 0x22: text += "\\\""
+            case 0x5C: text += "\\\\"
+            case 0x20...0x7E: text.unicodeScalars.append(scalar)
+            default: text += "\\u{\(String(scalar.value, radix: 16))}"
+            }
+            if text.count > maxPluginIDShown {
+                text = String(text.prefix(maxPluginIDShown - 1)) + "…"
+                break
+            }
+        }
+        return "\"\(text)\""
     }
 }
 
@@ -91,7 +167,17 @@ struct PluginsPane: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
+                // The core's refusal (displayMessage, sanitised) or the
+                // pane's own text at the cap.
                 SettingsMessage(text: model.message(SettingsModel.pluginsKey))
+                if let skipped = model.pluginsSkipWarning {
+                    Label(skipped, systemImage: "exclamationmark.triangle")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityLabel(skipped)
+                }
+                // Escaped by shownPluginID (S3).
                 let unknown = model.unknownEnabledPlugins
                 if !unknown.isEmpty {
                     Text("config.toml also lists plugins this version does not have: \(unknown.joined(separator: ", "))")

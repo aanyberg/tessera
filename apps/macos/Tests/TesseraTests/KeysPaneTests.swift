@@ -830,6 +830,140 @@ final class KeysPaneTests: XCTestCase {
         XCTAssertFalse(other.keys.isChanging, "a failure ends the edit at once")
     }
 
+    /// The NFD and NFC spellings of one key (`cmd+ö`) are two entries for
+    /// the core, which compares bytes: an edit of the NFC one ends once the
+    /// key map shows it, though an NFD entry before it says something else
+    /// (#489 21.6b a2).
+    func testAnEditOfOneSpellingEndsWhenTheKeyMapShowsItBesideTheOther() async throws {
+        let nfd = "cmd+o\u{308}"
+        let nfc = "cmd+\u{F6}"
+        XCTAssertEqual(nfd, nfc, "one String for Swift")
+        let writer = FakeWriter()
+        let (model, source, _) = try fakeKeys(writer: writer)
+        let first = Self.entry(0, nfd, chord: nil, value: "copy", effect: "refused")
+        source.snapshot = Self.snapshot(generation: 1, [nfd: "copy", nfc: "find"])
+        source.keymapResult = try Self.keymap(
+            generation: 1,
+            entries: [first, Self.entry(1, nfc, chord: nfc, value: "find", effect: "bound")])
+        model.reload()
+        let keys = model.keys
+        keys.settleTimeout = .seconds(60)
+        keys.window = testWindow()
+        keys.record(nfc, for: "new_tab")
+        try await waitUntil("written") { writer.calls.count == 2 }
+        XCTAssertTrue(keys.isChanging)
+        source.snapshot = Self.snapshot(generation: 2, [nfd: "copy", nfc: "new_tab", "cmd+t": "unbound"])
+        source.keymapResult = try Self.keymap(
+            generation: 2, newTabChords: [nfc],
+            entries: [
+                first, Self.entry(1, nfc, chord: nfc, value: "new_tab", effect: "bound"),
+                Self.entry(2, "cmd+t", chord: "cmd+t", value: "unbound", effect: "unbound"),
+            ])
+        model.reload()
+        XCTAssertFalse(keys.isChanging, "the key map shows the NFC entry set")
+    }
+
+    /// A `[keys]` entry the core refuses, in the NFD spelling of the chord
+    /// recorded, is another entry: the NFC key is written beside it, not
+    /// refused as an entry Settings cannot edit (#489 21.6b a2). On the
+    /// app's core.
+    func testRecordingBesideARefusedEntryInAnotherSpellingWrites() async throws {
+        let nfd = "cmd+o\u{308}"
+        let nfc = "cmd+\u{F6}"
+        let controller = try openKeys(config: "[keys]\n\"\(nfd)\" = \"copy\"\n", monitor: FakeKeyMonitor())
+        let keys = controller.model.keys
+        let entry = try XCTUnwrap(controller.model.keymap?.entries.first)
+        XCTAssertEqual(Array(entry.key.utf8), Array(nfd.utf8))
+        XCTAssertEqual(entry.effect, .refused, "\(entry)")
+        keys.record(nfc, for: "new_tab")
+        XCTAssertNil(keys.message("new_tab"))
+        try await waitUntil("recorded") { Self.chords("new_tab", controller) == [nfc] && !keys.isChanging }
+        let written = Array(try file().utf8)
+        XCTAssertNotNil(written.firstRange(of: Array(nfd.utf8)), "the refused entry stays")
+        XCTAssertNotNil(written.firstRange(of: Array(nfc.utf8)), "the new one is written in its own spelling")
+    }
+
+    // MARK: Chords that are one String and two keys (core)
+
+    /// U+037E is canonically `;`: one `String` for Swift, two keys for the
+    /// core's `Chord::parse` (#489).
+    private static let greekChord = "cmd+\u{37E}"
+
+    /// Waits for the pane to finish and for `command`'s first chord to be
+    /// `first` (none for `nil`), compared by bytes, then checks the file's
+    /// bytes.
+    private func assertFile(
+        _ expected: String, after command: String, shows first: String?, _ controller: SettingsWindowController,
+        line: UInt = #line
+    ) async throws {
+        let keys = controller.model.keys
+        try await waitUntil("\(command) applied") {
+            !keys.isChanging
+                && Self.chords(command, controller)?.first.map { Array($0.utf8) } == first.map { Array($0.utf8) }
+        }
+        XCTAssertEqual(Array(try file().unicodeScalars), Array(expected.unicodeScalars), line: line)
+    }
+
+    /// Clearing the command on one key leaves the entry on the other.
+    func testClearingACommandKeepsTheEntryOnTheCanonicalTwinOfItsChord() async throws {
+        let controller = try openKeys(
+            config: "# mine\n[keys]\n\"cmd+;\" = \"copy\"\n\"\(Self.greekChord)\" = \"find\"\n", monitor: FakeKeyMonitor())
+        controller.model.keys.clear("find")
+        try await assertFile(
+            "# mine\n[keys]\n\"cmd+;\" = \"copy\"\n\"cmd+f\" = \"unbound\"\n",
+            after: "find", shows: nil, controller)
+    }
+
+    /// Recording another chord for a command leaves what the twin of its
+    /// old chord sends.
+    func testRecordingKeepsTheEntryOnTheCanonicalTwinOfTheOldChord() async throws {
+        let controller = try openKeys(
+            config: "[keys]\n\"\(Self.greekChord)\" = \"send_text:keep\"\n\"cmd+;\" = \"find\"\n",
+            monitor: FakeKeyMonitor())
+        controller.model.keys.record("cmd+j", for: "find")
+        try await assertFile(
+            "[keys]\n\"\(Self.greekChord)\" = \"send_text:keep\"\n\"cmd+j\" = \"find\"\n\"cmd+f\" = \"unbound\"\n",
+            after: "find", shows: "cmd+j", controller)
+    }
+
+    /// A chord whose twin belongs to another command is free: no conflict,
+    /// and the other entry is not overwritten.
+    func testTheCanonicalTwinOfAnotherCommandsChordIsFree() async throws {
+        let controller = try openKeys(config: "[keys]\n\"\(Self.greekChord)\" = \"copy\"\n", monitor: FakeKeyMonitor())
+        let keys = controller.model.keys
+        keys.record("cmd+;", for: "new_tab")
+        XCTAssertNil(keys.conflict)
+        try await assertFile(
+            "[keys]\n\"\(Self.greekChord)\" = \"copy\"\n\"cmd+;\" = \"new_tab\"\n\"cmd+t\" = \"unbound\"\n",
+            after: "new_tab", shows: "cmd+;", controller)
+        XCTAssertEqual(Self.chords("copy", controller)?.first.map { Array($0.utf8) }, Array(Self.greekChord.utf8))
+    }
+
+    /// Recording the twin of a command's own chord moves it to that key.
+    func testRecordingTheCanonicalTwinOfACommandsOwnChordWritesIt() async throws {
+        let controller = try openKeys(
+            config: "[keys]\n\"\(Self.greekChord)\" = \"new_tab\"\n", monitor: FakeKeyMonitor())
+        controller.model.keys.record("cmd+;", for: "new_tab")
+        try await assertFile(
+            "[keys]\n\"cmd+;\" = \"new_tab\"\n\"cmd+t\" = \"unbound\"\n",
+            after: "new_tab", shows: "cmd+;", controller)
+    }
+
+    /// Restore Defaults removes the command's entry, by its own bytes, and
+    /// keeps what the twin sends, in either order of spelling.
+    func testRestoreDefaultsKeepsTextSentByTheCanonicalTwin() async throws {
+        for (text, command) in [(Self.greekChord, "cmd+;"), ("cmd+;", Self.greekChord)] {
+            appDelegate.settingsWindowController?.close()
+            if let dir { try FileManager.default.removeItem(at: dir) }
+            let controller = try openKeys(
+                config: "[keys]\n\"\(text)\" = \"send_text:keep\"\n\"\(command)\" = \"find\"\n",
+                monitor: FakeKeyMonitor())
+            controller.model.keys.restoreDefaults()
+            try await assertFile(
+                "[keys]\n\"\(text)\" = \"send_text:keep\"\n", after: "find", shows: "cmd+f", controller)
+        }
+    }
+
     func testAnEditWaitsForAKeyMapShowingItAndNothingIsEditedFromATornRead() async throws {
         let writer = FakeWriter()
         let (model, source, _) = try fakeKeys(writer: writer)

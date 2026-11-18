@@ -127,6 +127,9 @@ extension TesseraConfigValue {
     /// exponent (`13.0`) is a float, one without an integer, as the core
     /// writes them: `JSONDecoder` would read `13.0` as an integer, and an
     /// edit that writes it back would turn a float key into an integer.
+    /// `JSONSerialization` drops a U+FEFF that starts a string, so a text
+    /// holding one takes its strings from `JSONDecoder` (#489): a string
+    /// reaches the app byte for byte, as the core has it.
     ///
     /// - Throws: ``TesseraCoreError/invalidArgument`` if it is not JSON.
     public static func parse(json: Data) throws -> TesseraConfigValue {
@@ -136,7 +139,16 @@ extension TesseraConfigValue {
         } catch {
             throw TesseraCoreError.invalidArgument
         }
-        return try TesseraConfigValue(object)
+        let escaped = String(decoding: json, as: UTF8.self)
+            .range(of: "\\uFEFF", options: [.literal, .caseInsensitive])
+        guard json.range(of: Data("\u{FEFF}".utf8)) != nil || escaped != nil else {
+            return try TesseraConfigValue(object)
+        }
+        do {
+            return try JSONDecoder().decode(ExactJSON.self, from: json).value(numbers: object)
+        } catch {
+            throw TesseraCoreError.invalidArgument
+        }
     }
 
     private init(_ object: Any) throws {
@@ -162,6 +174,67 @@ extension TesseraConfigValue {
             self = .table(try table.mapValues(TesseraConfigValue.init))
         default:
             throw TesseraCoreError.invalidArgument
+        }
+    }
+}
+
+/// A JSON text as `JSONDecoder` reads it: every string exact, but a number
+/// with a fraction no longer told from an integer (`13.0` decodes as both),
+/// which ``value(numbers:)`` takes from `JSONSerialization`'s reading.
+private enum ExactJSON: Decodable {
+    case null
+    case bool(Bool)
+    case string(String)
+    case number(integer: Int64?, float: Double)
+    case array([ExactJSON])
+    case table([String: ExactJSON])
+
+    init(from decoder: any Decoder) throws {
+        let value = try decoder.singleValueContainer()
+        if value.decodeNil() {
+            self = .null
+        } else if let bool = try? value.decode(Bool.self) {
+            self = .bool(bool)
+        } else if let string = try? value.decode(String.self) {
+            self = .string(string)
+        } else if let float = try? value.decode(Double.self) {
+            self = .number(integer: try? value.decode(Int64.self), float: float)
+        } else if let array = try? value.decode([ExactJSON].self) {
+            self = .array(array)
+        } else {
+            self = .table(try value.decode([String: ExactJSON].self))
+        }
+    }
+
+    /// This value, with `numbers` the same place in `JSONSerialization`'s
+    /// reading (whose table keys have lost a leading U+FEFF).
+    func value(numbers: Any?) -> TesseraConfigValue {
+        switch self {
+        case .null:
+            return .null
+        case .bool(let bool):
+            return .bool(bool)
+        case .string(let string):
+            return .string(string)
+        case .number(let integer, let float):
+            let number = numbers as? NSNumber
+            let isFloat = number.map { CFGetTypeID($0) != CFBooleanGetTypeID() && CFNumberIsFloatType($0) } ?? false
+            if !isFloat, let integer { return .integer(integer) }
+            return .float(float)
+        case .array(let array):
+            let others = numbers as? [Any]
+            return .array(
+                array.enumerated().map { index, item in
+                    item.value(numbers: others.flatMap { index < $0.count ? $0[index] : nil })
+                })
+        case .table(let table):
+            let others = numbers as? [String: Any]
+            var values: [String: TesseraConfigValue] = [:]
+            for (key, item) in table {
+                let bare = key.unicodeScalars.first == "\u{FEFF}" ? String(key.unicodeScalars.dropFirst()) : key
+                values[key] = item.value(numbers: others?[key] ?? others?[bare])
+            }
+            return .table(values)
         }
     }
 }

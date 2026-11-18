@@ -116,6 +116,23 @@ final class KeymapTests: XCTestCase {
         XCTAssertTrue(entries[3].warning?.contains("use_selection_for_find") ?? false, "\(entries[3])")
     }
 
+    /// An entry value of a shape this version does not know (a number, an
+    /// object, a list, a `send_text` that is not a string, `null`, none)
+    /// reads as not a string; the key map still decodes (#489 21.6b m4).
+    func testAValueOfAnUnknownShapeReadsAsNotAString() throws {
+        let values = [#"7"#, #"{"x":1}"#, #"[1]"#, #"{"send_text":3}"#, #"null"#, nil, #""copy""#, #"{"send_text":"hi"}"#]
+        let entries = values.enumerated().map { index, value in
+            let field = value.map { #","value":\#($0)"# } ?? ""
+            return #"{"index":\#(index),"key":"k\#(index)","chord":null\#(field),"effect":"refused","warning":null}"#
+        }
+        let json = #"{"generation":3,"commands":[],"entries":["# + entries.joined(separator: ",") + #"],"warnings":[]}"#
+        let keymap = try TesseraKeymap.decode(Array(json.utf8))
+        XCTAssertEqual(keymap.generation, 3)
+        XCTAssertEqual(
+            keymap.entries.map(\.value),
+            [.notAString, .notAString, .notAString, .notAString, .notAString, .notAString, .text("copy"), .sendText("hi")])
+    }
+
     func testHandleKeyReportsCommandsAndSendsOnlyWithoutBindingsOnly() throws {
         let app = try start()
         let session = try app.spawn(.init(program: "/bin/cat"))

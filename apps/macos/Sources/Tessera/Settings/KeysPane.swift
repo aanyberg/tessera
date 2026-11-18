@@ -373,19 +373,37 @@ final class KeysModel {
     private struct State {
         let map: TesseraKeymap
         /// The table keys of `[keys]` as written: an entry whose (escaped,
-        /// capped) key is one of them is one the pane can change.
+        /// capped) key is one of them is one the pane can change. Compared
+        /// canonically, as the snapshot's table holds one of two spellings;
+        /// it only lets an edit be tried, and an edit names its key's bytes.
         let keys: Set<String>
+
+        /// Whether `first` and `second` are one chord for the core. A chord
+        /// is its modifiers and one character, which the key map prints in
+        /// one form, so that is when their bytes are equal; `==` is canonical
+        /// equivalence, for which U+037E is `;`, another key (#489).
+        static func isSame(_ first: String, _ second: String) -> Bool {
+            first.utf8.elementsEqual(second.utf8)
+        }
+
+        /// Whether `chords` holds `chord`, as ``isSame(_:_:)`` compares.
+        static func holds(_ chords: [String], _ chord: String) -> Bool {
+            chords.contains { isSame($0, chord) }
+        }
 
         /// The entry that took `chord`: the first kept one, binding it or
         /// `unbound`.
         func effective(_ chord: String) -> TesseraKeymap.Entry? {
-            map.entries.first { $0.chord == chord && ($0.effect == .bound || $0.effect == .unbound) }
+            map.entries.first { entry in
+                entry.chord.map { Self.isSame($0, chord) } == true
+                    && (entry.effect == .bound || entry.effect == .unbound)
+            }
         }
 
         /// The entries binding one of `command`'s chords: its own.
         func bound(_ command: TesseraKeymap.Command) -> [TesseraKeymap.Entry] {
             map.entries.filter { entry in
-                entry.effect == .bound && entry.chord.map(command.chords.contains) == true
+                entry.effect == .bound && entry.chord.map { Self.holds(command.chords, $0) } == true
             }
         }
 
@@ -397,8 +415,8 @@ final class KeysModel {
 
         /// `command`'s chords no entry of its own binds: its defaults.
         func defaults(_ command: TesseraKeymap.Command) -> [String] {
-            let own = Set(bound(command).compactMap(\.chord))
-            return command.chords.filter { !own.contains($0) }
+            let own = bound(command).compactMap(\.chord)
+            return command.chords.filter { !Self.holds(own, $0) }
         }
 
         /// Whether Restore Defaults removes `entry`: one binding a command
@@ -450,9 +468,11 @@ final class KeysModel {
     /// Counts runs released by ``settleTimeout``: it changes what
     /// ``isChanging`` reads.
     private var timedOut = 0
-    /// What the latest run leaves in `[keys]`, by table key: the value set,
-    /// or `nil` for a key removed. `nil` once the key map shows it.
-    @ObservationIgnored private var settling: [String: String?]?
+    /// What the latest run leaves in `[keys]`, by table key (its UTF-8
+    /// bytes: NFC and NFD spellings are two keys, as for the core, #489
+    /// a2): the value set, or `nil` for a key removed. `nil` once the key
+    /// map shows it.
+    @ObservationIgnored private var settling: [[UInt8]: String?]?
     /// The latest run.
     @ObservationIgnored private var runs = 0
 
@@ -490,10 +510,10 @@ final class KeysModel {
 
     /// Whether `map`'s entries hold `outcome`: each key set has its value,
     /// each key removed is gone.
-    private static func shows(_ map: TesseraKeymap, _ outcome: [String: String?]) -> Bool {
-        var values: [String: TesseraKeymap.Entry.Value] = [:]
-        for entry in map.entries where values[entry.key] == nil {
-            values[entry.key] = entry.value
+    private static func shows(_ map: TesseraKeymap, _ outcome: [[UInt8]: String?]) -> Bool {
+        var values: [[UInt8]: TesseraKeymap.Entry.Value] = [:]
+        for entry in map.entries where values[Array(entry.key.utf8)] == nil {
+            values[Array(entry.key.utf8)] = entry.value
         }
         return outcome.allSatisfy { key, value in
             guard let value else { return values[key] == nil }
@@ -784,7 +804,7 @@ final class KeysModel {
     /// says it; `nil` when it is free or `command`'s already.
     private func conflictText(_ chord: String, for command: String, in state: State) -> String? {
         let label = Self.label(chord, in: state.map)
-        if let owner = state.map.commands.first(where: { $0.command != command && $0.chords.contains(chord) }) {
+        if let owner = state.map.commands.first(where: { $0.command != command && State.holds($0.chords, chord) }) {
             return "\(label) is the shortcut of “\(title(of: owner.command))”."
         }
         // An entry binding the chord to no command: a text, or `none`.
@@ -840,13 +860,17 @@ final class KeysModel {
             if entry.effect != .bound || entry.value != .text(command) {
                 edits.append(.set(entry.key, command))
             }
-        } else if !spec.chords.contains(chord) {
+        } else if !State.holds(spec.chords, chord) {
             kept = chord
             edits.append(.set(chord, command))
         }
-        let others = (state.bound(spec) + state.shadowed(spec)).filter { $0.key != kept }
+        // Another spelling of the kept key (NFD for NFC) is another entry
+        // for the core (#489 a2).
+        let others = (state.bound(spec) + state.shadowed(spec)).filter { entry in
+            kept.map { !entry.key.utf8.elementsEqual($0.utf8) } ?? true
+        }
         edits += Self.removals(others)
-        edits += state.defaults(spec).filter { $0 != chord }.map { .set($0, "unbound") }
+        edits += state.defaults(spec).filter { !State.isSame($0, chord) }.map { .set($0, "unbound") }
         run(edits, key: command, showing: (command, [chord]), in: state)
     }
 
@@ -889,8 +913,10 @@ final class KeysModel {
         _ edits: [Edit], key: String, showing: (command: String, chords: [String])?, in state: State
     ) {
         guard !edits.isEmpty else { return }
-        let written = Set(state.map.entries.map(\.key))
-        guard edits.allSatisfy({ !written.contains($0.key) || state.keys.contains($0.key) }) else {
+        // By bytes: an entry in another spelling of an edit's key (NFD for
+        // NFC) is another entry for the core (#489 a2).
+        let written = Set(state.map.entries.map { Array($0.key.utf8) })
+        guard edits.allSatisfy({ !written.contains(Array($0.key.utf8)) || state.keys.contains($0.key) }) else {
             show("An entry this changes is written in config.toml in a way Settings cannot edit.", for: key)
             return
         }
@@ -902,11 +928,11 @@ final class KeysModel {
         inFlight = true
         runs += 1
         let run = runs
-        var outcome: [String: String?] = [:]
+        var outcome: [[UInt8]: String?] = [:]
         for edit in edits {
             switch edit {
-            case .set(let table, let value): outcome.updateValue(value, forKey: table)
-            case .remove(let table): outcome.updateValue(nil, forKey: table)
+            case .set(let table, let value): outcome.updateValue(value, forKey: Array(table.utf8))
+            case .remove(let table): outcome.updateValue(nil, forKey: Array(table.utf8))
             }
         }
         settling = outcome

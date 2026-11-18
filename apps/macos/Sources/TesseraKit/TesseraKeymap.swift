@@ -116,7 +116,8 @@ public struct TesseraKeymap: Sendable, Equatable, Decodable {
             case text(String)
             /// The text after `send_text:`, its escapes as written.
             case sendText(String)
-            /// The value is not a string.
+            /// The value is not a string (or has a shape this version does
+            /// not know).
             case notAString
         }
 
@@ -146,13 +147,17 @@ public struct TesseraKeymap: Sendable, Equatable, Decodable {
             index = try container.decode(Int.self, forKey: .index)
             key = try container.decode(String.self, forKey: .key)
             chord = try container.decodeIfPresent(String.self, forKey: .chord)
-            if try container.decodeNil(forKey: .value) {
-                value = .notAString
-            } else if let text = try? container.decode(String.self, forKey: .value) {
+            // `null` for a value that is not a string; any other shape (a
+            // newer core's, or none) reads as not a string too, so one
+            // entry never fails the whole key map (#489 21.6b m4).
+            if let text = try? container.decode(String.self, forKey: .value) {
                 value = .text(text)
+            } else if let object = try? container.nestedContainer(keyedBy: ValueKeys.self, forKey: .value),
+                let text = try? object.decode(String.self, forKey: .sendText)
+            {
+                value = .sendText(text)
             } else {
-                let object = try container.nestedContainer(keyedBy: ValueKeys.self, forKey: .value)
-                value = .sendText(try object.decode(String.self, forKey: .sendText))
+                value = .notAString
             }
             // An effect a newer core adds reads as refused: it binds nothing
             // the pane knows of.
