@@ -157,6 +157,24 @@ final class SettingsModel {
     /// profile's controls name may now be another profile, so they start
     /// again from it.
     private(set) var profileListGeneration = 0
+    /// The index of the profile an Add or Duplicate wrote, for the
+    /// Profiles pane to select (``takeSelectionRequest()``): whichever pane
+    /// shows the model then, so Settings opened again on a waiting model
+    /// selects the copy too (#312 m5). Nothing holds the pane (#312 m1).
+    private(set) var selectionRequest: Int?
+    /// How long a written add or delete of a profile waits for a
+    /// configuration that shows it before the lock goes (the Keys pane's
+    /// settle rule, ``KeysModel/settleTimeout``): an apply the window
+    /// missed, or another app that saved config.toml from a stale read and
+    /// dropped it (#312 adversarial M4). Then the applied configuration is
+    /// read again and the list says the add or delete did not apply.
+    @ObservationIgnored var profileSettleTimeout: Duration = .seconds(2)
+    /// The one ``profileSettleTimeout`` timer, of the add or delete that
+    /// locks the list now.
+    @ObservationIgnored private var profileSettle: SettingsTimer?
+    /// Why ``renameProfile(_:to:)`` last refused a name, while
+    /// ``commitDraft()`` runs (#344 adversarial M5).
+    @ObservationIgnored private var nameRefusal: String?
 
     @ObservationIgnored private weak var source: (any SettingsConfigSource)?
     /// The clock edits are coalesced by (and the app delegate times a closed
@@ -174,6 +192,10 @@ final class SettingsModel {
     static let importThemeKey = "action:import_theme"
     /// The key of the message the profile list shows.
     static let profilesKey = "action:profiles"
+    /// The list's notice for a slider's or stepper's value of a profile
+    /// held back and not written: an add or delete locked the profiles.
+    static let heldValueNotice =
+        "A profile’s value set as the list was locked was not saved; set it again once the list is unlocked."
     /// While a plugin settles, the plugins are read again this often…
     static let pluginSettleInterval: Duration = .milliseconds(50)
     /// …at most this many times after each configuration applied (2 s).
@@ -187,11 +209,14 @@ final class SettingsModel {
         var listed: [TesseraConfigValue]
         /// The keys sent besides the name, by key path within the profile.
         var keys: [String: TesseraConfigValue]
+        /// The keys this window had set and not yet seen applied when it was
+        /// queued: left out of both lists as the keys pending then are, so
+        /// an earlier edit's configuration applied before the add's result
+        /// comes back does not end it (#312 adversarial M1).
+        var masks: [String: TesseraConfigValue]
         /// Where the core put it and what it named it, once written: shown
         /// there until the watch has applied the file.
         var added: TesseraAddedProfile?
-        /// Called with ``added``'s index once written (the pane selects it).
-        var select: @MainActor (Int) -> Void
     }
 
     /// One slider's or stepper's coalescing state.
@@ -199,6 +224,9 @@ final class SettingsModel {
         var lastWrite: ContinuousClock.Instant?
         var lastWritten: TesseraConfigValue?
         var timer: SettingsTimer?
+        /// Pressed and not yet let go (``beginChange(_:)`` to
+        /// ``endChange(_:)``).
+        var dragging = false
     }
 
     init(source: any SettingsConfigSource, clock: any SettingsClock = SystemSettingsClock()) {
@@ -246,31 +274,46 @@ final class SettingsModel {
         readPluginsAgain()
         let masks = pending
         let listed = snapshot["profiles"]?.array ?? []
-        for key in Array(pending.keys) where (inFlight[key] ?? 0) == 0 && throttles[key]?.timer == nil {
+        // Read once for every key that waits for the list (21.6a m5).
+        var listedEntries: [[String: TesseraConfigValue]]?
+        // A slider or stepper being dragged (pressed, not yet let go) keeps
+        // the value it shows, not an earlier one of the drag that has
+        // applied since (#344); one stepped with no press (VoiceOver, the
+        // keyboard) has no release, so it waits only for its timer.
+        for key in Array(pending.keys)
+        where (inFlight[key] ?? 0) == 0 && throttles[key]?.timer == nil && throttles[key]?.dragging != true {
             if let queued = queuedAtGeneration[key], snapshot.generation <= queued { continue }
             // An add or delete waits for the list to change (it, or a hand
             // edit too), not for any later configuration (#344 m-b). Both
             // lists leave out the same keys, this window's pending ones.
-            if let base = movedFrom[key], Self.entries(base, masking: masks) == Self.entries(listed, masking: masks) {
-                continue
+            if let base = movedFrom[key] {
+                let current = listedEntries ?? Self.entries(listed, masking: masks)
+                listedEntries = current
+                if Self.entries(base, masking: masks) == current { continue }
             }
             pending[key] = nil
             queuedAtGeneration[key] = nil
             movedFrom[key] = nil
         }
         endAdditionIfApplied(masking: masks)
+        if !profilesChanging {
+            profileSettle?.cancel()
+            profileSettle = nil
+        }
     }
 
     /// Ends the written add of a profile once the configuration lists it
     /// where the core put it (the core gave it a name no other profile
     /// has), or once the listed profiles are no longer the ones it was
     /// queued against (a hand edit of the file was applied with it, or
-    /// before it), `masks` (this window's pending keys) left out of both.
+    /// before it), `masks` (this window's pending keys) and the keys
+    /// pending when it was queued left out of both.
     private func endAdditionIfApplied(masking masks: [String: TesseraConfigValue]) {
         guard let addition, let added = addition.added else { return }
         let listed = snapshot["profiles"]?.array ?? []
         let shown = listed.indices.contains(added.index) && listed[added.index]["name"]?.string == added.name
-        if shown || Self.entries(addition.listed, masking: masks) != Self.entries(listed, masking: masks) {
+        let all = masks.merging(addition.masks) { current, _ in current }
+        if shown || Self.entries(addition.listed, masking: all) != Self.entries(listed, masking: all) {
             self.addition = nil
         }
     }
@@ -416,6 +459,13 @@ final class SettingsModel {
         writeThrottled(key, value)
     }
 
+    /// The slider or stepper at `key` was pressed: until it is let go
+    /// (``endChange(_:)``), a configuration applied keeps the value it
+    /// shows.
+    func beginChange(_ key: String) {
+        throttles[key, default: Throttle()].dragging = true
+    }
+
     /// The slider or stepper at `key` was released: its final value is
     /// written if it was not yet.
     func endChange(_ key: String) {
@@ -435,6 +485,17 @@ final class SettingsModel {
     }
 
     private func writeThrottled(_ key: String, _ value: TesseraConfigValue) {
+        if profilesChanging, lockedProfileEdit(key, value) {
+            // Held back since before an add or delete locked the profiles
+            // (the index may name another profile once it applies): not
+            // written, and the list says so (#344 adversarial M6). The
+            // control shows what was written of the drag, if anything
+            // waits to apply, else the file's value.
+            pending[key] = queuedAtGeneration[key] != nil ? throttles[key]?.lastWritten : nil
+            cancelThrottle(key)
+            messages[Self.profilesKey] = Self.heldValueNotice
+            return
+        }
         throttles[key, default: Throttle()].lastWrite = clock.now
         throttles[key, default: Throttle()].lastWritten = value
         if value == snapshot[key], (inFlight[key] ?? 0) == 0 {
@@ -474,9 +535,12 @@ final class SettingsModel {
             loadError = "Tessera’s core is not running."
             return
         }
-        // A slider's value held back since before the lock stays shown
-        // until the next configuration applies.
         guard !edits.contains(where: { lockedProfileEdit($0.key, $0.value ?? .null) }) else { return }
+        if edits.contains(where: { movesProfiles($0.key, $0.value ?? .null) }) {
+            // A new lock: an earlier one's timer must not end it.
+            profileSettle?.cancel()
+            profileSettle = nil
+        }
         for edit in edits {
             let written = edit.value ?? .null
             pending[edit.key] = written
@@ -517,7 +581,7 @@ final class SettingsModel {
     /// refused: a key of a profile while an add or delete waits (the
     /// profiles are locked), but for the delete itself, and a key of a
     /// profile past the applied ones, which would add a profile without a
-    /// name (a new one goes through ``addProfile(then:)``, #312).
+    /// name (a new one goes through ``addProfile()``, #312).
     private func lockedProfileEdit(_ key: String, _ value: TesseraConfigValue) -> Bool {
         guard let (index, _) = Self.profilePath(key) else { return false }
         if profilesChanging { return !movesProfiles(key, value) }
@@ -570,15 +634,93 @@ final class SettingsModel {
             }
         }
         if retried {
+            let base = movedFrom[key]
             reload()
-            if case .success = result, inFlight[key] == nil, let written {
+            if case .success = result, inFlight[key] == nil, let written,
+                !deleteShown(key, written, from: base)
+            {
                 // The external edit was applied before this one: show this
-                // one until a configuration after it applies.
+                // one until a configuration after it applies. A delete the
+                // reload shows applied already is not waited for again
+                // (21.6a m6): its list would not change again.
                 pending[key] = written
                 queuedAtGeneration[key] = snapshot.generation
                 movedFrom[key] = movesProfiles(key, written) ? snapshot["profiles"]?.array ?? [] : nil
             }
         }
+        if case .success = result, let written, movesProfiles(key, written), inFlight[key] == nil,
+            pending[key] != nil
+        {
+            settleProfiles()
+        }
+    }
+
+    /// Whether the applied profiles are `base` (the ones a delete of
+    /// `key` was queued against) without the deleted one, this window's
+    /// pending keys left out of both: the delete is applied.
+    private func deleteShown(_ key: String, _ written: TesseraConfigValue, from base: [TesseraConfigValue]?) -> Bool {
+        guard let base, movesProfiles(key, written), let (index, _) = Self.profilePath(key), base.indices.contains(index)
+        else { return false }
+        var after = base
+        after.remove(at: index)
+        return Self.entries(after, masking: pending) == Self.entries(snapshot["profiles"]?.array ?? [], masking: pending)
+    }
+
+    /// Starts ``profileSettleTimeout`` for the add or delete just written.
+    private func settleProfiles() {
+        profileSettle?.cancel()
+        profileSettle = clock.schedule(after: profileSettleTimeout) { [weak self] in
+            self?.releaseProfiles()
+        }
+    }
+
+    /// ``profileSettleTimeout`` after an add or delete was written: the
+    /// applied configuration is read again, and an add or delete it does
+    /// not show either (another app rewrote config.toml without it, or the
+    /// watch missed it) no longer locks the list, with a notice by it.
+    private func releaseProfiles() {
+        profileSettle = nil
+        reload()
+        var notice: String?
+        if let addition, let added = addition.added, (inFlight[Self.profilesKey] ?? 0) == 0 {
+            self.addition = nil
+            // The rows after it are back where they were.
+            shiftProfileMessages(from: added.index, by: -1)
+            notice =
+                "“\(MainMenu.profileTitle(added.name))” was written but is not in the configuration applied: "
+                + "another app may have saved config.toml without it."
+        }
+        for (key, value) in pending where movesProfiles(key, value) && (inFlight[key] ?? 0) == 0 {
+            pending[key] = nil
+            queuedAtGeneration[key] = nil
+            movedFrom[key] = nil
+            notice =
+                "The profile deleted is still in the configuration applied: another app may have saved "
+                + "config.toml with it."
+        }
+        guard let notice else { return }
+        Self.log.info("profile add or delete not shown by the applied configuration in time")
+        messages[Self.profilesKey] = notice
+        // The list is not the one the controls were made for.
+        profileListGeneration += 1
+        draft = nil
+    }
+
+    /// Moves the messages of the profiles at `start` and after by `offset`
+    /// (an add put a profile at `start`: +1; it went again: -1, dropping
+    /// those at `start`), so each stays with its profile (#312 adversarial
+    /// M3).
+    private func shiftProfileMessages(from start: Int, by offset: Int) {
+        var moved: [String: String] = [:]
+        for (key, text) in messages {
+            guard let (index, rest) = Self.profilePath(key), index >= start else {
+                moved[key] = text
+                continue
+            }
+            let target = index + offset
+            if target >= start { moved["profiles[\(target)]\(rest)"] = text }
+        }
+        messages = moved
     }
 
     /// What the user sees for `error`: the core's message as lines
@@ -643,17 +785,32 @@ final class SettingsModel {
         draft = (ObjectIdentifier(owner), commit)
     }
 
-    /// `owner`'s field has no uncommitted text (any more).
-    func releaseDraft(_ owner: AnyObject) {
-        if draft?.owner == ObjectIdentifier(owner) { draft = nil }
+    /// `owner`'s field has no uncommitted text (any more); whether it held
+    /// some until now (else it was committed already, or went with a hand
+    /// edit of the profiles).
+    @discardableResult
+    func releaseDraft(_ owner: AnyObject) -> Bool {
+        guard draft?.owner == ObjectIdentifier(owner) else { return false }
+        draft = nil
+        return true
     }
 
     /// Commits the text typed into a field and not yet committed, if any:
-    /// before what moves the selection away from the field.
-    func commitDraft() {
-        guard let draft else { return }
+    /// before what moves the selection away from the field. A profile name
+    /// refused by it shows by the list too, since its own message goes
+    /// from view with the selection (#344 adversarial M5); the notice is
+    /// returned.
+    @discardableResult
+    func commitDraft() -> String? {
+        guard let draft else { return nil }
         self.draft = nil
+        nameRefusal = nil
         draft.commit()
+        guard let refusal = nameRefusal else { return nil }
+        nameRefusal = nil
+        let notice = "The name typed was not saved: \(refusal)"
+        messages[Self.profilesKey] = notice
+        return notice
     }
 
     // MARK: Themes
@@ -695,6 +852,11 @@ final class SettingsModel {
         /// Its name as shown: ``MainMenu/profileTitle(_:)`` (S3), numbered
         /// when an earlier profile shows the same.
         var title: String
+        /// The file of `profiles/` that defines it (`profiles/<stem>.toml`,
+        /// the core's `source`, sanitised as a message is, S3), or `nil`
+        /// for a `[[profiles]]` entry of config.toml. The window edits
+        /// none of a file's keys; the core refuses them (#312 m4).
+        var file: String?
 
         var id: Int { index }
         /// The key path of `key` in this profile.
@@ -720,7 +882,9 @@ final class SettingsModel {
                 title = "\(base) (\(number))"
                 number += 1
             }
-            return Profile(index: index, name: name, title: title)
+            let source = profile["source"]?.string
+            let file = source.flatMap { $0 == "config" ? nil : SettingsModel.sanitisedMessage($0) }
+            return Profile(index: index, name: name, title: title, file: file)
         }
     }
 
@@ -783,30 +947,48 @@ final class SettingsModel {
         profiles.map { value($0.key("name"))?.string ?? $0.name }
     }
 
+    /// Most profiles the core reads, the `[[profiles]]` entries and those
+    /// of `profiles/` together: its `MAX_PROFILES`, which the FFI does not
+    /// export (the app mirrors it; a test on the core pins it). The
+    /// configuration lists at most this many, so at this count the core
+    /// refuses an add, which would push one out.
+    static let maxProfiles = 256
+
     /// Whether Add and Duplicate can add a profile: none is being added
-    /// or deleted. The core refuses one past its 256 profiles, the
-    /// `[[profiles]]` entries and those of `profiles/` together, with its
-    /// message by the list (#312).
+    /// or deleted, and fewer than ``maxProfiles`` are listed (21.6a m4).
     var canAddProfile: Bool {
-        !profilesChanging
+        !profilesChanging && profiles.count < Self.maxProfiles
     }
 
-    /// Why the profile list and the profile's controls are disabled, while
-    /// they are (VoiceOver reads it, #344 m-f).
+    /// Why the profile list and the profile's controls are disabled, or
+    /// Add and Duplicate are, while they are (VoiceOver reads it; the
+    /// buttons' help shows it too, #344 m-f, 21.6a m4).
     var profilesStatus: String? {
-        profilesChanging ? "Waiting for config.toml to be applied; the profiles can be edited once it is." : nil
+        if profilesChanging { return "Waiting for config.toml to be applied; the profiles can be edited once it is." }
+        if profiles.count >= Self.maxProfiles {
+            return "Tessera reads at most \(Self.maxProfiles) profiles, those in profiles/ included; delete one to add another."
+        }
+        return nil
+    }
+
+    /// The Profiles pane selects the profile ``selectionRequest`` names,
+    /// once; the request goes.
+    func takeSelectionRequest() -> Int? {
+        defer { selectionRequest = nil }
+        return selectionRequest
     }
 
     /// Adds a profile named "New Profile" (numbered by the core if taken)
     /// after the `[[profiles]]` entries, before the profiles of
-    /// `profiles/`; `select` gets its index once it is written. `false`
-    /// while ``profilesChanging``. Text typed into a field is committed
-    /// first.
+    /// `profiles/`; ``selectionRequest`` names it once it is written.
+    /// `false` unless ``canAddProfile``. Text typed into a field is
+    /// committed first.
     @discardableResult
-    func addProfile(then select: @escaping @MainActor (Int) -> Void = { _ in }) -> Bool {
-        commitDraft()
-        guard !profilesChanging else { return false }
-        enqueueAddition(named: "New Profile", keys: [], then: select)
+    func addProfile() -> Bool {
+        let notice = commitDraft()
+        guard canAddProfile else { return false }
+        enqueueAddition(named: "New Profile", keys: [])
+        if let notice { messages[Self.profilesKey] = notice }
         return true
     }
 
@@ -815,20 +997,21 @@ final class SettingsModel {
 
     /// Adds a copy of the profile at `index` (an entry or a profile of
     /// `profiles/`) as Add does, named after it with " Copy" and with its
-    /// ``profileKeys``; `select` gets the copy's index once it is written.
-    /// `false` while ``profilesChanging``. Text typed into a field is
-    /// committed first, so the copy has it. The name and the keys are one
-    /// edit of the core's, all or nothing: a name it refuses (" Copy"
+    /// ``profileKeys``; ``selectionRequest`` names the copy once it is
+    /// written. `false` unless ``canAddProfile``. Text typed into a field
+    /// is committed first, so the copy has it. The name and the keys are
+    /// one edit of the core's, all or nothing: a name it refuses (" Copy"
     /// makes it longer than 128 bytes) or a value the loader warns about
     /// writes nothing, with the core's message by the list (#455, #312).
     @discardableResult
-    func duplicateProfile(_ index: Int, then select: @escaping @MainActor (Int) -> Void = { _ in }) -> Bool {
-        commitDraft()
+    func duplicateProfile(_ index: Int) -> Bool {
+        let notice = commitDraft()
         let all = profiles
-        guard !profilesChanging, all.indices.contains(index) else { return false }
+        guard canAddProfile, all.indices.contains(index) else { return false }
         let name = value(all[index].key("name"))?.string ?? all[index].name
         let keys = Self.profileKeys.compactMap { key in value(all[index].key(key)).map { (key: key, value: $0) } }
-        enqueueAddition(named: name + " Copy", keys: keys, then: select)
+        enqueueAddition(named: name + " Copy", keys: keys)
+        if let notice { messages[Self.profilesKey] = notice }
         return true
     }
 
@@ -836,10 +1019,7 @@ final class SettingsModel {
     /// `base` with `keys`: the profiles are locked from now until the
     /// listed profiles show it, or it fails. A conflict (the file changed
     /// on disk) is retried once, as an edit is.
-    private func enqueueAddition(
-        named base: String, keys: [(key: String, value: TesseraConfigValue)],
-        then select: @escaping @MainActor (Int) -> Void
-    ) {
+    private func enqueueAddition(named base: String, keys: [(key: String, value: TesseraConfigValue)]) {
         guard let source else {
             loadError = "Tessera’s core is not running."
             return
@@ -847,9 +1027,12 @@ final class SettingsModel {
         let key = Self.profilesKey
         messages[key] = nil
         inFlight[key, default: 0] += 1
+        // A new lock: an earlier one's timer must not end it.
+        profileSettle?.cancel()
+        profileSettle = nil
         addition = Addition(
             listed: snapshot["profiles"]?.array ?? [],
-            keys: Dictionary(keys, uniquingKeysWith: { $1 }), added: nil, select: select)
+            keys: Dictionary(keys, uniquingKeysWith: { $1 }), masks: pending, added: nil)
         let writer = source.settingsWriter
         Self.writeQueue.async { [weak self] in
             var retried = false
@@ -877,8 +1060,10 @@ final class SettingsModel {
     }
 
     /// The add of a profile has run: written, it shows where the core put
-    /// it until the watch applies it, and the pane selects it; refused, the
-    /// list unlocks at once with the core's message by it.
+    /// it until the watch applies it (or ``profileSettleTimeout`` has
+    /// passed), the messages of the profiles after it move with them, and
+    /// the pane selects it; refused, the list unlocks at once with the
+    /// core's message by it.
     private func finishAddition(_ result: Result<TesseraAddedProfile, TesseraConfigEditError>, retried: Bool) {
         let key = Self.profilesKey
         inFlight[key, default: 1] -= 1
@@ -900,9 +1085,11 @@ final class SettingsModel {
             }
             addition.added = added
             self.addition = addition
+            shiftProfileMessages(from: added.index, by: 1)
+            selectionRequest = added.index
             // The watch may have applied it already (a slow main thread).
             endAdditionIfApplied(masking: pending)
-            addition.select(added.index)
+            if self.addition != nil { settleProfiles() }
         }
     }
 
@@ -922,6 +1109,7 @@ final class SettingsModel {
         }
         if let refusal = profileNameRefusal(name, at: index) {
             messages[key] = refusal
+            nameRefusal = refusal
             return
         }
         var edits = [Edit(key: key, value: .string(name))]
@@ -936,7 +1124,8 @@ final class SettingsModel {
 
     /// Why `name` cannot name the profile at `index`, if it cannot: a
     /// control character or line break, nothing visible, or the name of
-    /// another profile.
+    /// another profile, byte for byte as the core compares names (an NFD
+    /// "café" is not the NFC one, 21.6a adversarial M4).
     func profileNameRefusal(_ name: String, at index: Int) -> String? {
         let breaks = name.unicodeScalars.contains {
             switch $0.properties.generalCategory {
@@ -947,17 +1136,24 @@ final class SettingsModel {
         if breaks { return "A profile name cannot contain control characters or line breaks." }
         if Self.sanitisedMessage(name).isEmpty { return "A profile needs a name." }
         let others = shownProfileNames.enumerated().filter { $0.offset != index }.map(\.element)
-        if others.contains(name) { return "A profile named “\(MainMenu.profileTitle(name))” exists." }
+        if others.contains(where: { $0.utf8.elementsEqual(name.utf8) }) {
+            return "A profile named “\(MainMenu.profileTitle(name))” exists."
+        }
         return nil
     }
 
     /// Deletes the profile at `index`, except the default profile (new tabs
-    /// would lose it): `false` and a message by the list for that one, and
+    /// would lose it) and a profile of `profiles/` (the core edits only
+    /// config.toml): `false` and a message by the list for those, and
     /// `false` while ``profilesChanging``.
     @discardableResult
     func deleteProfile(_ index: Int) -> Bool {
         let all = profiles
         guard !profilesChanging, all.indices.contains(index) else { return false }
+        if let file = all[index].file {
+            messages[Self.profilesKey] = "“\(all[index].title)” is defined in \(file); delete that file to remove it."
+            return false
+        }
         if value("general.default_profile")?.string == all[index].name {
             messages[Self.profilesKey] =
                 "“\(all[index].title)” is the default profile. Choose another default profile in General first."

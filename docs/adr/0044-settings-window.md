@@ -127,9 +127,10 @@ the importer refuses writes nothing and shows the importer's message.
   may apply only about once a second; the tabs follow the drag at that rate
   and reach the released value about 100 ms after the last write.
 - After Add, Duplicate or Delete the Profiles pane waits for the watch (0.1
-  to about 1 s) before the next profile edit. A watch that never applies
-  keeps the pane disabled until the window is closed and opened again,
-  which starts from the configuration the core has applied.
+  to about 1 s) before the next profile edit, at most 2 s after the write
+  (the #344 Profiles amendment): a watch that never applies it, or another
+  app that saved config.toml without it, unlocks the pane then, with a
+  notice by the list.
 - `on_config_applied` reloads the model once per applied configuration, not
   per edit; nothing in the window runs per byte of terminal output.
 - Keys the panes do not show are untouched by the window and reachable
@@ -265,7 +266,10 @@ config.toml.
   loader warning (only a new tab would warn), and the watch's 100 ms
   debounce normally applies both edits together. The name is written first
   so the in-between file never names a profile that a refusal then leaves
-  missing.
+  missing. If the second write fails (refused, or the file changed twice),
+  the rename stays and `default_profile` names the old name: new tabs start
+  with the built-in profile and the loader warns once one opens; the
+  core's message shows by General's Default profile picker.
 - **Profile names** are checked before anything is written: a control
   character or line break, nothing visible (empty, spaces, a lone BOM) and
   another profile's name (as shown, renames not yet applied included) are
@@ -378,7 +382,7 @@ Known limits:
 - **Duplicate is one run.** The copy's name and the keys copied to it are
   one run on the write queue, the name first, stopping at the first
   refusal (as the rename of the default profile). A name the core refuses
-  (" Copy" pushes a 125-byte name past its 128 bytes) writes none of the
+  (" Copy" pushes a name of 124 bytes or more past its 128) writes none of the
   copy's keys: written alone, they made a `[[profiles]]` table without a
   name, which the core loads as "Default". The message shows by the list.
 - **Settings opened again before an add or delete applies.** A closed
@@ -483,8 +487,9 @@ The app half of the ADR 0040 amendment for #312.
   hand edit of the file), as in the #344 amendment. The pane selects the
   new row once the call returns, through a callback with the index, since
   the index is not known before the write. A `Conflict` (the file changed
-  on disk) is written again once, as an edit is, after a reload, and the
-  add waits for a configuration after the external edit's.
+  on disk) is written again once on the write queue, as an edit is, and
+  only then does the model read the configuration again; the add waits for
+  a configuration after the external edit's.
 - **The cap is the core's.** The #344 constant that mirrored `MAX_PROFILES`
   (256) and the disabled Add and Duplicate at that count are gone: they
   counted only what the window listed, while the core counts entries and
@@ -497,3 +502,62 @@ The app half of the ADR 0040 amendment for #312.
 - **No key past the list.** A key-path edit of a profile index at or past
   the applied list's count is not written: the core would add a
   `[[profiles]]` table without a name. A new profile goes through the add.
+
+## Amendment: the Profiles lock's release, file profiles and the cap (#344, #489, 2026-11-18)
+
+This replaces "A hand edit that puts back the very profiles…" in the #344
+amendment's "The profile list's lock", and "The cap is the core's" in the
+#312 amendment.
+
+- **A bounded lock.** An add or delete, once written, locks the list at
+  most 2 s (the Keys pane's settle rule). Then the model reads the applied
+  configuration again; an add or delete it does not show no longer locks
+  the list, and a notice by the list says so ("… was written but is not in
+  the configuration applied: another app may have saved config.toml
+  without it", or that the profile deleted is still there). Another app
+  that saves config.toml from a read before the add drops it; until #344
+  that kept the pane locked until Settings was closed. The selected
+  profile's controls start again, as after a hand edit. If the watch
+  applies the other app's file before the window's own write lands, no
+  configuration showed the add, and the notice is the only sign (the
+  file on disk is the other app's).
+- **Profiles of `profiles/` are read-only.** Selected, one shows "Defined
+  in profiles/<file>.toml. Edit that file to change this profile." above
+  its controls (the core's `source`, sanitised for control, bidi and line
+  separator characters, S3); its row has the same text only as its help
+  tag. Every control is disabled, and Delete is disabled for them (its
+  help tag says why); the model refuses a delete of one with the same
+  reason. The core edits only config.toml and refused each edit anyway.
+- **The cap, mirrored again.** The configuration lists at most the core's
+  256 profiles, entries and profile files together, so the count the
+  window lists is the core's. At 256 Add and Duplicate are disabled and a
+  line under the list says why; while an add or delete waits, the same
+  line says the pane waits for config.toml to be applied. The line is
+  selectable text, so VoiceOver and tests read it. `MAX_PROFILES` is still
+  not exported: the app's constant mirrors it, and the core's refusal is
+  still shown if they ever differ.
+- **The new row is selected through the model.** An Add or Duplicate
+  leaves the index the core wrote it at in the model's selection request,
+  which whichever Profiles pane shows the model takes: the model holds no
+  closure of a pane (a closed window's pane is not kept alive by a waiting
+  model, and Settings opened again on that model selects the copy).
+- **The keys pending at queue time.** An add keeps the keys this window
+  had set and not seen applied when it was queued, and leaves them out of
+  the lists it compares, so an earlier edit applied before the add's
+  result does not end it.
+- **Messages move with their profile.** A message keyed by a profile's key
+  path moves one index on when an add puts a profile before it, and back
+  when the add is released unseen.
+- **Names compared as the core compares them.** A name taken by another
+  profile is the same bytes (UTF-8), not the same canonical string: NFC
+  and NFD spellings are two names, as for the core.
+- **Nothing dropped silently.** A slider's or stepper's value of a
+  profile held back while the list was locked is not written, with a
+  notice by the list; Add or Duplicate after a refused rename says the
+  name typed was not saved and why. Only a field holding typed text is
+  committed by a click elsewhere, so a typed working directory no longer
+  overwrites the folder Choose… just wrote. A retried delete that the
+  reload shows applied unlocks at once, and a configuration applied
+  while a slider or stepper is pressed keeps the value it shows (a step
+  by VoiceOver or the keyboard has no press: it shows the configuration
+  applied after it, as before).

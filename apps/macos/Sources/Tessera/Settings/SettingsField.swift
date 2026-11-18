@@ -122,12 +122,17 @@ extension SettingsField {
         context.model.endChange(context.path)
     }
 
-    /// A slider's or stepper's `onEditingChanged`: ``endEditing(_:)`` once
-    /// the control is let go, nothing as it is taken.
+    /// A slider's or stepper's `onEditingChanged`: the model holds the
+    /// value it shows while it is pressed, ``endEditing(_:)`` once it is
+    /// let go.
     @MainActor
     func editingChanged(_ context: SettingsFieldContext) -> (Bool) -> Void {
         { editing in
-            if !editing { endEditing(context) }
+            if editing {
+                context.model.beginChange(context.path)
+            } else {
+                endEditing(context)
+            }
         }
     }
 
@@ -296,17 +301,32 @@ struct SettingsFieldRow: View {
                         title: "", placeholder: "Home folder", value: field.stringBinding(context),
                         drafts: context.model)
                     Button("Choose…") {
-                        let model = context.model
-                        let generation = model.profileListGeneration
-                        SettingsPanels.present(SettingsPanels.directoryPanel(), on: model.window) { directory in
-                            // A hand edit may have put another profile at
-                            // this one's index while the sheet was open.
-                            guard model.profileListGeneration == generation else { return }
-                            field.stringBinding(context).wrappedValue = directory.path(percentEncoded: false)
-                        }
+                        Self.chooseDirectory(SettingsPanels.directoryPanel(), for: field, context)
                     }
                 }
             }
+        }
+    }
+}
+
+extension SettingsFieldRow {
+    /// Choose… of a directory field: `panel` as a sheet on the Settings
+    /// window, its directory written to the field's key. Text typed into
+    /// a field is committed first and the field let go, so the directory
+    /// chosen is the last write and the field shows it: the typed text
+    /// was written over it once the field lost the focus (21.6a m7).
+    static func chooseDirectory(
+        _ panel: some SettingsOpenPanel, for field: SettingsField, _ context: SettingsFieldContext
+    ) {
+        let model = context.model
+        model.commitDraft()
+        model.window?.makeFirstResponder(nil)
+        let generation = model.profileListGeneration
+        SettingsPanels.present(panel, on: model.window) { directory in
+            // A hand edit may have put another profile at this one's index
+            // while the sheet was open.
+            guard model.profileListGeneration == generation else { return }
+            field.stringBinding(context).wrappedValue = directory.path(percentEncoded: false)
         }
     }
 }
@@ -338,7 +358,9 @@ struct SettingsPicker: View {
 /// not on every keystroke; it follows the value when that changes. Text
 /// typed and not yet written is held with `drafts`
 /// (``SettingsModel/holdDraft(_:commit:)``), which writes it before a click
-/// elsewhere takes the field away.
+/// elsewhere takes the field away; once `drafts` has committed it (or let
+/// it go), the field writes it no more, so a value set since (Choose…)
+/// stays.
 struct CommitTextField: View {
     let title: String
     let placeholder: String
@@ -376,8 +398,8 @@ struct CommitTextField: View {
     }
 
     private func commit() {
-        drafts?.releaseDraft(token)
-        if draft != value.wrappedValue {
+        let held = drafts?.releaseDraft(token) ?? true
+        if held, draft != value.wrappedValue {
             value.wrappedValue = draft
         }
         // A value refused before it was written (a profile name) shows the
