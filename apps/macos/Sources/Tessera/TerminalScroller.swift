@@ -23,6 +23,13 @@ import TesseraKit
 ///   own overlay scrollers. A faded-out scroller lets clicks through to
 ///   the terminal. Under the system's Reduce Motion (``reducesMotion``) it
 ///   appears and disappears at once, with no fade (ADR 0041).
+/// - Overlay knob: AppKit draws the knob of an overlay scroller outside an
+///   `NSScrollView` at alpha 0 and never widens it (#495), so in overlay
+///   style this scroller draws its own knob over AppKit's knob rect, and
+///   AppKit's own knob and slot are not drawn. A scroll shows the narrow
+///   knob alone; under the pointer, or while the knob is held, the knob is
+///   wide, over AppKit's slot drawn as wide, and stays so until the
+///   scroller has faded out after the pointer left.
 /// - Input: dragging the knob or clicking the track reports where to go
 ///   through ``onScroll``; the terminal view moves the session's view.
 @MainActor
@@ -54,6 +61,17 @@ final class TerminalScroller: NSScroller {
     /// The history and style ``applyHidden()`` last applied, or `nil`
     /// before the first: a position that changes neither sets nothing.
     private var applied: (hasHistory: Bool, style: NSScroller.Style)?
+    /// The overlay knob is wide, over its slot (``layoutOverlayKnob()``).
+    private var isExpanded = false
+    /// The overlay knob (a rim around a fill) and the slot behind a wide
+    /// one, drawn over AppKit's layers; hidden in legacy style.
+    private let knobLayer = CALayer()
+    private let knobFill = CALayer()
+    private let knobRim = CAShapeLayer()
+    private let slotLayer = CALayer()
+    /// The overlay layers' delegate: no implicit animations, and the slot
+    /// drawn by AppKit.
+    private let painter = OverlayPainter()
 
     /// How long a scroll keeps it shown before it fades, and the fade.
     static let holdDuration: CFTimeInterval = 1.0
@@ -110,6 +128,7 @@ final class TerminalScroller: NSScroller {
             self, selector: #selector(preferredStyleChanged(_:)),
             name: NSScroller.preferredScrollerStyleDidChangeNotification, object: nil)
         scrollerStyle = effectiveStyle
+        setUpOverlayLayers()
         applyStripBackground()
         applyHidden()
     }
@@ -148,6 +167,7 @@ final class TerminalScroller: NSScroller {
         // Another thread's resize can shrink the history under a stored
         // offset between two reads; the core clamps, and so does this.
         doubleValue = (history - Double(min(position.offset, position.history))) / history
+        layoutOverlayKnob()
     }
 
     /// Where the user's action on `part` moves the view, from the knob's
@@ -184,6 +204,8 @@ final class TerminalScroller: NSScroller {
     }
 
     @objc private func userScrolled(_ sender: Any?) {
+        // AppKit moved the knob it tracks; the drawn knob follows.
+        layoutOverlayKnob()
         userMoved(part: hitPart)
     }
 
@@ -204,9 +226,19 @@ final class TerminalScroller: NSScroller {
 
     /// Shows it after a scroll and fades it out after a moment, from what
     /// is on screen now (a fade in progress turns back). Nothing to do
-    /// while it stays shown or is in use.
+    /// while it stays shown or is in use. Shown from faded out, the
+    /// overlay knob is narrow; a fade in progress keeps its width.
     func flash() {
+        flash(keepingWidth: isRevealed)
+    }
+
+    /// ``flash()``, keeping the overlay knob's width when `keepingWidth`
+    /// (the pointer just left, or the knob was just released).
+    private func flash(keepingWidth: Bool) {
         guard !isHidden, !staysShown, !isTracking, !isPointerInside, let layer else { return }
+        if !keepingWidth {
+            setExpanded(false)
+        }
         guard !reducesMotion else {
             layer.removeAnimation(forKey: Self.flashKey)
             alphaValue = 1
@@ -268,6 +300,7 @@ final class TerminalScroller: NSScroller {
             }
         }
         applyVisibility()
+        layoutOverlayKnob()
     }
 
     /// Shown for good while it stays shown, is in use or under the
@@ -326,10 +359,165 @@ final class TerminalScroller: NSScroller {
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         applyStripBackground()
+        applyOverlayColors()
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         isRevealed ? super.hitTest(point) : nil
+    }
+
+    // MARK: Overlay knob
+
+    private func setUpOverlayLayers() {
+        guard let layer else { return }
+        for sublayer in [slotLayer, knobLayer, knobFill, knobRim] {
+            sublayer.delegate = painter
+        }
+        painter.drawSlot = { [weak self] context, size in self?.drawOverlaySlot(in: context, size: size) }
+        slotLayer.needsDisplayOnBoundsChange = true
+        knobRim.fillRule = .evenOdd
+        knobLayer.addSublayer(knobRim)
+        knobLayer.addSublayer(knobFill)
+        // Above AppKit's track and knob layers, whatever their order.
+        slotLayer.zPosition = 1
+        knobLayer.zPosition = 2
+        layer.addSublayer(slotLayer)
+        layer.addSublayer(knobLayer)
+        applyOverlayColors()
+        layoutOverlayKnob()
+    }
+
+    /// AppKit's overlay knob colours for the knob style, measured from its
+    /// `drawKnob()` on macOS 27: a dark knob (light appearance, or
+    /// `.dark`) is black at half opacity with a 1 pt white rim at 15 %
+    /// outside it, a light one white at half opacity with a black rim at
+    /// 20 %. Layer colours are not dynamic: a change of appearance applies
+    /// them again, and redraws the slot.
+    private func applyOverlayColors() {
+        let darkKnob: Bool
+        switch knobStyle {
+        case .dark: darkKnob = true
+        case .light: darkKnob = false
+        default: darkKnob = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) != .darkAqua
+        }
+        knobFill.backgroundColor = CGColor(gray: darkKnob ? 0 : 1, alpha: 0.5)
+        knobRim.fillColor = CGColor(gray: darkKnob ? 1 : 0, alpha: darkKnob ? 0.15 : 0.2)
+        slotLayer.setNeedsDisplay()
+    }
+
+    /// AppKit's slot, as wide as the layer it is drawn into.
+    private func drawOverlaySlot(in context: CGContext, size: CGSize) {
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            super.drawKnobSlot(in: NSRect(origin: .zero, size: size), highlight: false)
+        }
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
+    private func setExpanded(_ expanded: Bool) {
+        guard expanded != isExpanded else { return }
+        isExpanded = expanded
+        layoutOverlayKnob()
+    }
+
+    /// `rect` (AppKit's knob or slot) in the overlay knob's column, at its
+    /// right edge: while expanded, wide, from as far from the left edge as
+    /// AppKit insets it from the right; otherwise narrow, at most half as
+    /// wide. That is AppKit's own overlay knob, 6 or 11 pt of 17 on
+    /// macOS 27, whose `rect(for:)` gives the narrow one; macOS 15 gives a
+    /// wider rect for a scroller outside a scroll view.
+    private func widened(_ rect: NSRect) -> NSRect {
+        guard !rect.isEmpty else { return rect }
+        let left = min(max(bounds.maxX - rect.maxX, 0), rect.minX)
+        let wide = rect.maxX - left
+        let width = isExpanded ? wide : min(rect.width, (wide / 2).rounded(.up))
+        return NSRect(x: rect.maxX - width, y: rect.minY, width: width, height: rect.height)
+    }
+
+    /// Places the overlay knob over AppKit's knob rect (its position and
+    /// minimum length are AppKit's), narrow or wide, and the slot
+    /// behind it while expanded; hides both in legacy style or without
+    /// history. Sets nothing that has not changed.
+    private func layoutOverlayKnob() {
+        let overlay = scrollerStyle == .overlay && hasHistory
+        let knob = overlay ? widened(rect(for: .knob)) : .zero
+        let slot = overlay && isExpanded ? widened(rect(for: .knobSlot)) : .zero
+        let knobShown = !knob.isEmpty, slotShown = !slot.isEmpty
+        if knobLayer.isHidden == knobShown {
+            knobLayer.isHidden = !knobShown
+        }
+        if slotLayer.isHidden == slotShown {
+            slotLayer.isHidden = !slotShown
+        }
+        if slotShown, slotLayer.frame != slot {
+            slotLayer.frame = slot
+        }
+        // The rim is 1 pt outside the knob rect, as AppKit draws it.
+        let outer = knob.insetBy(dx: -1, dy: -1)
+        guard knobShown, knobLayer.frame != outer else { return }
+        let resized = knobLayer.frame.size != outer.size
+        knobLayer.frame = outer
+        guard resized else { return }
+        let bounds = CGRect(origin: .zero, size: outer.size)
+        let fill = bounds.insetBy(dx: 1, dy: 1)
+        knobFill.frame = fill
+        knobFill.cornerRadius = min(fill.width, fill.height) / 2
+        let rim = CGMutablePath()
+        let outerRadius = min(bounds.width, bounds.height) / 2
+        rim.addRoundedRect(in: bounds, cornerWidth: outerRadius, cornerHeight: outerRadius)
+        rim.addRoundedRect(in: fill, cornerWidth: knobFill.cornerRadius, cornerHeight: knobFill.cornerRadius)
+        knobRim.frame = bounds
+        knobRim.path = rim
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        layoutOverlayKnob()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        applySlotScale()
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        applySlotScale()
+    }
+
+    /// The slot is drawn at the window's backing scale.
+    private func applySlotScale() {
+        let scale = window?.backingScaleFactor ?? 1
+        guard slotLayer.contentsScale != scale else { return }
+        slotLayer.contentsScale = scale
+        slotLayer.setNeedsDisplay()
+    }
+
+    /// In overlay style AppKit's own knob (drawn at alpha 0 outside a
+    /// scroll view) and narrow slot are not drawn: the overlay layers are.
+    override func drawKnob() {
+        if scrollerStyle == .legacy {
+            super.drawKnob()
+        }
+    }
+
+    override func drawKnobSlot(in slotRect: NSRect, highlight flag: Bool) {
+        if scrollerStyle == .legacy {
+            super.drawKnobSlot(in: slotRect, highlight: flag)
+        }
+    }
+
+    /// While expanded, a point over the wide knob or slot is tested where
+    /// AppKit's narrow ones are, at the same height: the wide knob grabs.
+    override func testPart(_ point: NSPoint) -> NSScroller.Part {
+        guard isExpanded, scrollerStyle == .overlay else { return super.testPart(point) }
+        let narrow = super.rect(for: .knobSlot)
+        let wide = widened(narrow)
+        var local = convert(point, from: nil)
+        guard local.x >= wide.minX, local.x < wide.maxX else { return super.testPart(point) }
+        local.x = narrow.midX
+        return super.testPart(convert(local, to: nil))
     }
 
     // MARK: Pointer
@@ -349,6 +537,7 @@ final class TerminalScroller: NSScroller {
     override func mouseEntered(with event: NSEvent) {
         super.mouseEntered(with: event)
         isPointerInside = true
+        setExpanded(true)
         applyVisibility()
     }
 
@@ -356,7 +545,7 @@ final class TerminalScroller: NSScroller {
         super.mouseExited(with: event)
         isPointerInside = false
         applyVisibility()
-        flash()
+        flash(keepingWidth: true)
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -378,6 +567,7 @@ final class TerminalScroller: NSScroller {
     func beginTracking() {
         isTracking = true
         lastSentKnobValue = nil
+        setExpanded(true)
         applyVisibility()
     }
 
@@ -390,6 +580,23 @@ final class TerminalScroller: NSScroller {
             applyKnob(position)
         }
         applyVisibility()
-        flash()
+        flash(keepingWidth: true)
+    }
+}
+
+/// The delegate of ``TerminalScroller``'s overlay layers: no implicit
+/// animations (the knob moves with the view, and the scroller's own
+/// opacity fades it), and the slot drawn by the scroller. Core Animation
+/// asks on the thread that changes or displays the layers: the main one.
+@MainActor
+private final class OverlayPainter: NSObject, @preconcurrency CALayerDelegate {
+    var drawSlot: ((CGContext, CGSize) -> Void)?
+
+    nonisolated func action(for layer: CALayer, forKey event: String) -> (any CAAction)? {
+        NSNull()
+    }
+
+    func draw(_ layer: CALayer, in ctx: CGContext) {
+        drawSlot?(ctx, layer.bounds.size)
     }
 }
