@@ -239,61 +239,54 @@ fn is_dropped(c: char) -> bool {
     c.is_ascii_control()
 }
 
-/// A string that refuses to grow past a cap, or only its length: each
-/// format is written twice, first counted (nothing stored), then into a
-/// string of exactly that length, so a copy of many megabytes allocates
-/// its output once instead of doubling into it (#351).
+/// A string that refuses to grow past a cap, reserved once: each format
+/// is written in one walk into a string reserved to an upper bound of its
+/// length (at most the cap), so a copy of many megabytes allocates its
+/// output once instead of doubling into it (#351), and walks its text
+/// once (#433 adv M3). The pages of the reservation the text does not
+/// reach are never touched, so they cost no memory.
 struct Capped {
     text: String,
-    len: usize,
     cap: usize,
-    /// Whether the text is kept, not only counted.
-    write: bool,
 }
 
 /// The cap was reached.
 struct Over;
 
 impl Capped {
-    /// A counter of at most `cap` bytes.
-    fn counting(cap: usize) -> Self {
+    /// A string of at most `cap` bytes, `bound` of them (at most `cap`)
+    /// reserved.
+    fn new(bound: usize, cap: usize) -> Self {
         Self {
-            text: String::new(),
-            len: 0,
+            text: String::with_capacity(bound.min(cap)),
             cap,
-            write: false,
-        }
-    }
-
-    /// A string of at most `cap` bytes, `len` of them reserved (at most
-    /// `cap`).
-    fn writing(len: usize, cap: usize) -> Self {
-        Self {
-            text: String::with_capacity(len.min(cap)),
-            len: 0,
-            cap,
-            write: true,
         }
     }
 
     fn push_str(&mut self, s: &str) -> Result<(), Over> {
-        if self.len + s.len() > self.cap {
+        if self.text.len() + s.len() > self.cap {
             return Err(Over);
         }
-        self.len += s.len();
-        if self.write {
-            self.text.push_str(s);
-        }
+        self.text.push_str(s);
         Ok(())
     }
 
     fn push(&mut self, c: char) -> Result<(), Over> {
         self.push_str(c.encode_utf8(&mut [0u8; 4]))
     }
+
+    /// The text, which never outgrew its reservation.
+    fn finish(self, reserved: usize) -> String {
+        debug_assert_eq!(self.text.capacity(), reserved, "the output grew");
+        self.text
+    }
 }
 
 /// A short piece of text built on the stack: one character reference or
-/// RTF control word or colour entry, so escaping allocates nothing.
+/// RTF control word or colour entry, so escaping allocates nothing. The
+/// longest is a run's RTF control words with every look set and both
+/// colours at [`MAX_RTF_COLORS`]: `\cf4096 \cb4096 \b \i \ul \strike `, 34
+/// bytes ([`RTF_WORD_MAX`]).
 struct Small {
     bytes: [u8; 48],
     len: usize,
@@ -313,6 +306,26 @@ impl Small {
     }
 }
 
+/// The longest RTF control words of a run, which [`Small`] holds.
+const RTF_WORD_MAX: &str = "\\cf4096 \\cb4096 \\b \\i \\ul \\strike ";
+
+/// The longest HTML style of a run, every look set.
+const HTML_STYLE_MAX: &str = "color:#000000;background-color:#000000;font-weight:bold;font-style:italic;text-decoration:underline line-through";
+
+/// The most HTML bytes one byte of a run's text becomes: `&quot;` for `"`
+/// (a scalar above U+007E takes fewer per byte: `&#x7ff;` for 2 bytes,
+/// `&#xffff;` for 3, `&#x10ffff;` for 4).
+const HTML_PER_BYTE_MAX: usize = "&quot;".len();
+
+/// Twice the most RTF bytes one byte of a run's text becomes: a 4-byte
+/// scalar is two `\uN?` words (UTF-16 surrogates) of at most 9 bytes
+/// (`\u-10240?`), under 4.5 a byte; `\\` is 2 for 1 byte, `\u2047?` 7 for
+/// 2 and `\u-32768?` 9 for 3.
+const RTF_PER_TWO_BYTES_MAX: usize = 9;
+
+/// The longest RTF colour table entry.
+const RTF_COLOR_MAX: &str = "\\red255\\green255\\blue255;";
+
 impl std::fmt::Write for Small {
     fn write_str(&mut self, s: &str) -> std::fmt::Result {
         let end = self.len + s.len();
@@ -323,13 +336,31 @@ impl std::fmt::Write for Small {
     }
 }
 
-/// The HTML document of `styled`, or `None` past `cap` bytes.
+/// The HTML document of `styled`, or `None` past `cap` bytes: written in
+/// one walk of the text into one reservation of at most `cap` bytes.
 pub(crate) fn html(styled: &Styled, cap: usize) -> Option<String> {
-    let mut count = Capped::counting(cap);
-    html_into(styled, &mut count)?;
-    let mut out = Capped::writing(count.len, cap);
+    let mut out = Capped::new(html_bound(styled), cap);
+    let reserved = out.text.capacity();
     html_into(styled, &mut out)?;
-    Some(out.text)
+    Some(out.finish(reserved))
+}
+
+/// An upper bound of the length of the HTML of `styled`, from the length
+/// of each run (not its text): the most markup a run takes, and the most
+/// bytes each byte of text becomes.
+fn html_bound(styled: &Styled) -> usize {
+    let span = "<span style=\"".len() + HTML_STYLE_MAX.len() + "\">".len() + "</span>".len();
+    styled
+        .segments
+        .iter()
+        .fold(HTML_HEAD.len() + HTML_TAIL.len(), |bound, segment| {
+            bound.saturating_add(match segment {
+                Segment::Newline => 1,
+                Segment::Run(_, text) => {
+                    span.saturating_add(text.len().saturating_mul(HTML_PER_BYTE_MAX))
+                }
+            })
+        })
 }
 
 /// The HTML document of `styled` into `out`.
@@ -403,7 +434,8 @@ fn html_escape(c: char, out: &mut Capped) -> Result<(), Over> {
         c if is_dropped(c) => Ok(()),
         c if u32::from(c) > 0x7e => {
             let mut reference = Small::new();
-            let _ = write!(reference, "&#x{:x};", u32::from(c));
+            let written = write!(reference, "&#x{:x};", u32::from(c));
+            debug_assert!(written.is_ok(), "a reference fits");
             out.push_str(reference.as_str())
         }
         c => out.push(c),
@@ -411,51 +443,78 @@ fn html_escape(c: char, out: &mut Capped) -> Result<(), Over> {
 }
 
 /// The RTF document of `styled`, or `None` past `cap` bytes or
-/// [`MAX_RTF_COLORS`] colours.
+/// [`MAX_RTF_COLORS`] colours. The colour table comes before the body that
+/// uses it, so it is built first from the looks alone ([`rtf_colors`]);
+/// then the text is walked once, into one reservation of at most `cap`
+/// bytes.
 pub(crate) fn rtf(styled: &Styled, cap: usize) -> Option<String> {
-    let mut count = Capped::counting(cap);
-    rtf_into(styled, &mut count)?;
-    let mut out = Capped::writing(count.len, cap);
-    rtf_into(styled, &mut out)?;
-    Some(out.text)
-}
-
-/// The RTF document of `styled` into `out`. The colour table comes before
-/// the body that fills it, so the body is walked twice: once counted, for
-/// the table (bounded by [`MAX_RTF_COLORS`]), then written after it.
-fn rtf_into(styled: &Styled, out: &mut Capped) -> Option<()> {
-    let mut table: Vec<Rgb> = Vec::new();
-    rtf_body(styled, &mut Capped::counting(out.cap), &mut table)?;
+    let (table, colors) = rtf_colors(styled)?;
+    let mut out = Capped::new(rtf_bound(styled, table.len()), cap);
+    let reserved = out.text.capacity();
     out.push_str(RTF_HEAD).ok()?;
     out.push_str("{\\colortbl;").ok()?;
     let mut entry = Small::new();
     for &Rgb { r, g, b } in &table {
         entry.len = 0;
-        let _ = write!(entry, "\\red{r}\\green{g}\\blue{b};");
+        let written = write!(entry, "\\red{r}\\green{g}\\blue{b};");
+        debug_assert!(written.is_ok(), "a colour entry fits");
         out.push_str(entry.as_str()).ok()?;
     }
     out.push('}').ok()?;
     out.push_str(RTF_BODY).ok()?;
-    // The same walk numbers the colours the same way.
-    table.clear();
-    rtf_body(styled, out, &mut table)?;
-    out.push('}').ok()
+    rtf_body(styled, &mut out, &colors)?;
+    out.push('}').ok()?;
+    Some(out.finish(reserved))
 }
 
-/// The RTF body of `styled` into `out`, its colours numbered into `table`.
-fn rtf_body(styled: &Styled, body: &mut Capped, table: &mut Vec<Rgb>) -> Option<()> {
+/// The RTF colour table of `styled`: its colours in the order the body
+/// first uses them (each run's text colour, then its background), and
+/// each colour's number in the table (from 1). `None` past
+/// [`MAX_RTF_COLORS`] colours.
+fn rtf_colors(styled: &Styled) -> Option<(Vec<Rgb>, HashMap<Rgb, usize>)> {
+    let mut table: Vec<Rgb> = Vec::new();
     let mut colors: HashMap<Rgb, usize> = HashMap::new();
-    let mut index = |rgb: Rgb| -> Option<usize> {
-        if let Some(&i) = colors.get(&rgb) {
-            return Some(i);
+    for segment in &styled.segments {
+        let Segment::Run(look, _) = segment else {
+            continue;
+        };
+        for rgb in [look.fg, look.bg].into_iter().flatten() {
+            if colors.contains_key(&rgb) {
+                continue;
+            }
+            if table.len() >= MAX_RTF_COLORS {
+                return None;
+            }
+            table.push(rgb);
+            colors.insert(rgb, table.len());
         }
-        if table.len() >= MAX_RTF_COLORS {
-            return None;
-        }
-        table.push(rgb);
-        colors.insert(rgb, table.len());
-        Some(table.len())
-    };
+    }
+    Some((table, colors))
+}
+
+/// An upper bound of the length of the RTF of `styled` with `colors`
+/// colours, from the length of each run (not its text).
+fn rtf_bound(styled: &Styled, colors: usize) -> usize {
+    let head = RTF_HEAD.len()
+        + "{\\colortbl;".len()
+        + colors.saturating_mul(RTF_COLOR_MAX.len())
+        + "}".len()
+        + RTF_BODY.len()
+        + "}".len();
+    let group = "{".len() + RTF_WORD_MAX.len() + "}".len();
+    styled.segments.iter().fold(head, |bound, segment| {
+        bound.saturating_add(match segment {
+            Segment::Newline => "\\par ".len(),
+            Segment::Run(_, text) => {
+                group.saturating_add(text.len().saturating_mul(RTF_PER_TWO_BYTES_MAX).div_ceil(2))
+            }
+        })
+    })
+}
+
+/// The RTF body of `styled` into `out`, its colours numbered by `colors`.
+fn rtf_body(styled: &Styled, body: &mut Capped, colors: &HashMap<Rgb, usize>) -> Option<()> {
+    let index = |rgb: Rgb| colors.get(&rgb).copied();
     let mut word = Small::new();
     for segment in &styled.segments {
         match segment {
@@ -463,10 +522,12 @@ fn rtf_body(styled: &Styled, body: &mut Capped, table: &mut Vec<Rgb>) -> Option<
             Segment::Run(look, text) => {
                 word.len = 0;
                 if let Some(fg) = look.fg {
-                    let _ = write!(word, "\\cf{} ", index(fg)?);
+                    let written = write!(word, "\\cf{} ", index(fg)?);
+                    debug_assert!(written.is_ok(), "the control words fit");
                 }
                 if let Some(bg) = look.bg {
-                    let _ = write!(word, "\\cb{} ", index(bg)?);
+                    let written = write!(word, "\\cb{} ", index(bg)?);
+                    debug_assert!(written.is_ok(), "the control words fit");
                 }
                 for (on, control) in [
                     (look.bold, "\\b "),
@@ -475,7 +536,8 @@ fn rtf_body(styled: &Styled, body: &mut Capped, table: &mut Vec<Rgb>) -> Option<
                     (look.strike, "\\strike "),
                 ] {
                     if on {
-                        let _ = word.write_str(control);
+                        let written = word.write_str(control);
+                        debug_assert!(written.is_ok(), "the control words fit");
                     }
                 }
                 let grouped = word.len > 0;
@@ -508,7 +570,8 @@ fn rtf_escape(c: char, out: &mut Capped) -> Result<(), Over> {
             for unit in c.encode_utf16(&mut units) {
                 // RTF's \uN takes a signed 16-bit number.
                 let signed = i16::from_ne_bytes(unit.to_ne_bytes());
-                let _ = write!(item, "\\u{signed}?");
+                let written = write!(item, "\\u{signed}?");
+                debug_assert!(written.is_ok(), "a \\u word fits");
             }
             out.push_str(item.as_str())
         }
@@ -583,12 +646,13 @@ mod tests {
         assert!(HTML_HEAD.ends_with("\">\n"));
     }
 
-    /// #351: each format is counted first and written into a string of
-    /// exactly its length, one allocation however long the copy: the
-    /// capacity equals the length (a string grown by doubling would end
-    /// with spare capacity). 2 MiB of mixed text and looks.
+    /// #351, #433 adv M3: each format is written in one walk into one
+    /// reservation, however long the copy: the string never grows past it
+    /// (checked in [`Capped::finish`]), the reservation is the format's
+    /// bound or the cap, and the text fits the cap exactly. 2 MiB of mixed
+    /// text and looks.
     #[test]
-    fn each_format_is_written_into_one_exact_allocation() {
+    fn each_format_is_written_into_one_allocation() {
         let mut s = Styled::default();
         let cell = Cell::default();
         for i in 0..40_000u32 {
@@ -612,13 +676,120 @@ mod tests {
             panic!("refused");
         };
         assert!(html.len() > 1 << 20 && rtf.len() > 1 << 20);
-        assert_eq!(html.capacity(), html.len());
-        assert_eq!(rtf.capacity(), rtf.len());
+        let colors = rtf_colors(&s).unwrap().0.len();
+        assert!(html.capacity() >= html_bound(&s).min(MAX_RICH_COPY_LEN));
+        assert!(rtf.capacity() >= rtf_bound(&s, colors).min(MAX_RICH_COPY_LEN));
+        assert!(html.len() <= html_bound(&s) && rtf.len() <= rtf_bound(&s, colors));
         // At the exact cap too, and refused one byte under it.
         let (h, r) = (html.len(), rtf.len());
-        assert_eq!(super::html(&s, h).map(|t| t.capacity()), Some(h));
-        assert_eq!(super::rtf(&s, r).map(|t| t.capacity()), Some(r));
+        assert_eq!(super::html(&s, h).as_deref(), Some(html.as_str()));
+        assert_eq!(super::rtf(&s, r).as_deref(), Some(rtf.as_str()));
         assert!(super::html(&s, h - 1).is_none() && super::rtf(&s, r - 1).is_none());
+    }
+
+    /// The bounds the formats reserve hold for the text that writes the
+    /// most bytes a byte in each (`"` and `'` in HTML, U+07FF, U+0800,
+    /// U+8000, U+FFFF and the first astral scalar), with every look set on
+    /// one-cell runs: the output fits its reservation.
+    #[test]
+    fn the_reserved_bounds_hold_for_the_widest_text() {
+        let cell = Cell::default();
+        for text in [
+            "\"",
+            "'",
+            "\\",
+            "{",
+            "\u{7ff}",
+            "\u{800}",
+            "\u{8000}",
+            "\u{ffff}",
+            "\u{10000}",
+            "\u{10ffff}",
+        ] {
+            let mut s = Styled::default();
+            for i in 0..1_000u32 {
+                let look = RunStyle {
+                    fg: Some(Rgb::new(byte(i), byte(i >> 8), 1)),
+                    bg: Some(Rgb::new(255, byte(i), 255)),
+                    bold: true,
+                    italic: true,
+                    underline: true,
+                    strike: true,
+                };
+                s.push_cell(
+                    &cell,
+                    Some(&text.repeat(1 + usize::try_from(i % 3).unwrap())),
+                    look,
+                    MAX_RICH_COPY_LEN,
+                );
+                if i % 7 == 0 {
+                    s.push_newline(MAX_RICH_COPY_LEN);
+                }
+            }
+            let html = html(&s, MAX_RICH_COPY_LEN).unwrap();
+            let rtf = rtf(&s, MAX_RICH_COPY_LEN).unwrap();
+            let colors = rtf_colors(&s).unwrap().0.len();
+            assert!(html.len() <= html_bound(&s), "{text:?}: html");
+            assert!(rtf.len() <= rtf_bound(&s, colors), "{text:?}: rtf");
+        }
+        // One long run of 4-byte scalars, the widest RTF a byte (two
+        // surrogate words, 17 bytes for 4), so the run's control-word
+        // allowance cannot hide a per-byte bound that is too small.
+        let mut s = Styled::default();
+        for _ in 0..1_000 {
+            s.push_cell(
+                &cell,
+                Some("\u{10000}"),
+                RunStyle::default(),
+                MAX_RICH_COPY_LEN,
+            );
+        }
+        let rtf_text = rtf(&s, MAX_RICH_COPY_LEN).unwrap();
+        assert!(rtf_text.contains(&"\\u-10240?\\u-9216?".repeat(1_000)));
+        assert!(rtf_text.len() <= rtf_bound(&s, rtf_colors(&s).unwrap().0.len()));
+        let mut all = String::new();
+        html_style(
+            &RunStyle {
+                fg: Some(RED),
+                bg: Some(RED),
+                bold: true,
+                italic: true,
+                underline: true,
+                strike: true,
+            },
+            &mut all,
+        );
+        assert_eq!(all.len(), HTML_STYLE_MAX.len());
+    }
+
+    /// #430 m2: the longest RTF control words of a run (every look, both
+    /// colours numbered 4096) are written whole: [`Small`] holds them.
+    #[test]
+    fn the_longest_control_words_are_written_whole() {
+        let cell = Cell::default();
+        let mut s = Styled::default();
+        for i in 0..4095u32 {
+            let look = RunStyle {
+                fg: Some(Rgb::new(byte(i), byte(i >> 8), 0)),
+                ..RunStyle::default()
+            };
+            s.push_cell(&cell, Some("x"), look, MAX_RICH_COPY_LEN);
+        }
+        let last = Rgb::new(1, 2, 3);
+        let every = RunStyle {
+            fg: Some(last),
+            bg: Some(last),
+            bold: true,
+            italic: true,
+            underline: true,
+            strike: true,
+        };
+        s.push_cell(&cell, Some("y"), every, MAX_RICH_COPY_LEN);
+        let rtf = rtf(&s, MAX_RICH_COPY_LEN).unwrap();
+        let group = format!("{{{RTF_WORD_MAX}y}}}}");
+        assert_eq!(RTF_WORD_MAX.len(), 34);
+        assert!(rtf.ends_with(&group), "{}", &rtf[rtf.len() - 60..]);
+        assert!(rtf.contains("\\red1\\green2\\blue3;}"));
     }
 
     #[test]

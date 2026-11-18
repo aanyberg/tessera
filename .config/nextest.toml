@@ -82,7 +82,7 @@ test-group = 'timing'
 
 # Release-only accessibility bar (#52): the S6 lock hold of `App::accessible_text` against a frame's capture.
 [[profile.default.overrides]]
-filter = 'package(tessera-app-core) & kind(lib) & test(accessible_text_lock_hold_is_no_longer_than_a_capture)'
+filter = 'package(tessera-app-core) & kind(lib) & (test(accessible_text_lock_hold_is_no_longer_than_a_capture) | test(hostile_smart_rules_))'
 test-group = 'timing'
 
 # Release-only smart-selection latency bar (#47, SS-C6), also run by the gate's release timing step.

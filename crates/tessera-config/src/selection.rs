@@ -227,8 +227,12 @@ pub const DEFAULT_SMART_RULES: [(&str, Precision); 15] = [
     ),
     // Double-quoted strings, with an Objective-C `@`.
     (r#"@?"(?:[^"\\]|\\.)*""#, Precision::Normal),
-    // Dotted names: java.util.List, file.txt.
-    (r"(?:[\p{L}\p{N}._]+\.)+[\p{L}\p{N}._]+", Precision::Normal),
+    // Dotted names: java.util.List, file.txt; `\p{M}` keeps a decomposed
+    // accent inside the name, as in the path rule.
+    (
+        r"(?:[\p{L}\p{M}\p{N}._]+\.)+[\p{L}\p{M}\p{N}._]+",
+        Precision::Normal,
+    ),
     (
         r"\bmailto:(?:[a-z0-9A-Z_]+@)?(?:[a-zA-Z0-9\-]+\.)*[a-zA-Z0-9\-]+\b",
         Precision::Normal,
@@ -405,9 +409,9 @@ pub struct Selection {
     /// weight times length wins (one level is worth a thousand times the
     /// length; then the more precise, the longer, the earlier one, the
     /// earlier rule); with none, the word is selected. Matching looks at
-    /// most 8192 characters around the click along the logical line (4096
-    /// before it); where the line goes on past an edge of that window, a
-    /// match starting or ending in the unbroken run of non-blank
+    /// most 8192 characters and 32 KiB around the click along the logical
+    /// line (half before it); where the line goes on past an edge of that
+    /// window, a match starting or ending in the unbroken run of non-blank
     /// characters at that edge is not taken.
     ///
     /// Unset, the built-in rules apply: file paths, `http`, `https`,
@@ -678,6 +682,22 @@ mod tests {
         let loaded = Config::from_toml_lenient(&rules_toml(&[mid.into(), "ok".into()])).unwrap();
         assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
         assert_eq!(loaded.config.selection.compiled_rules().len(), 1);
+    }
+
+    /// Every built-in rule compiles within half the bound, so a user's copy
+    /// of one, or of one with a class added, still loads.
+    #[test]
+    fn every_default_rule_fits_the_size_limit_twice() {
+        for (pattern, _) in DEFAULT_SMART_RULES {
+            assert!(
+                RegexBuilder::new(pattern)
+                    .size_limit(SMART_RULE_SIZE_LIMIT / 2)
+                    .nest_limit(SMART_RULE_NEST_LIMIT)
+                    .build()
+                    .is_ok(),
+                "{pattern}"
+            );
+        }
     }
 
     /// Rules set without the loader (a frontend building a configuration)

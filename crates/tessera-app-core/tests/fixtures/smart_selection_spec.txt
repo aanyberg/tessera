@@ -46,7 +46,7 @@
 # cpp_namespace normal     iTerm2   (?:[A-Za-z0-9_]+::)+[A-Za-z0-9_]+
 # path          normal     iTerm2   ~?/?(?:[\p{L}\p{M}\p{N}._-]+/+)+[\p{L}\p{M}\p{N}._-]+/?   (\p{M} added, #351: NFD accents)
 # quoted        normal     iTerm2   @?"(?:[^"\\]|\\.)*"
-# include_path  normal     iTerm2   (?:[\p{L}\p{N}._]+\.)+[\p{L}\p{N}._]+
+# include_path  normal     iTerm2   (?:[\p{L}\p{M}\p{N}._]+\.)+[\p{L}\p{M}\p{N}._]+   (\p{M} added, #430 m5)
 # mailto        normal     iTerm2   \bmailto:(?:[a-z0-9A-Z_]+@)?(?:[a-zA-Z0-9\-]+\.)*[a-zA-Z0-9\-]+\b
 # objc_selector high       iTerm2   @selector\([^)]+\)
 # email         high       iTerm2   \b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,4}\b
@@ -730,7 +730,7 @@ escape(c):
 
 ### 7c ROWS  (input cells -> expected strings; colours given as resolved #rrggbb)
 ### RT-1 plain                    cells: "hi"
-html: <!DOCTYPE html><html><head><meta charset="utf-8"></head><body><pre style="font-family:Menlo,monospace">\nhi</pre>        (\n = one LF byte)</body></html>
+html: <!DOCTYPE html><html><head><meta charset="utf-8"></head><body><pre style="font-family:Menlo,monospace">\nhi</pre></body></html>        (\n = one LF byte)
 rtf:  {\rtf1\ansi\ansicpg1252\deff0{\fonttbl{\f0\fmodern Menlo;}}{\colortbl;}\f0\fs24 hi}
 ### RT-2 red bold then newline     cells: line1 "a" fg #ff0000 bold ; line2 "b" default
 html body: <span style="color:#ff0000;font-weight:bold">a</span>\nb          (\n = one LF byte)
@@ -764,10 +764,10 @@ html body: <span style="color:#101010;background-color:#c0c0c0">i</span>   # swa
 ## 8. S5 BOUNDS
 # MAX_SMART_RULES = 64: the 65th rule is dropped with a warning (config load), defaults count towards it? DECISION D-RULECOUNT: user rules only; with
 #   include-defaults the sum is capped at 64. Test: 65 rules => 64 kept and one warning.
-# pattern <= 1024 bytes (1025 refused with a warning); compile with regex::RegexBuilder size_limit(1 MiB) and dfa_size_limit(1 MiB);
-#   nest_limit(50). A pattern that fails to compile is skipped with a warning, other rules still work.
+# pattern <= 1024 bytes (1025 refused with a warning); compile with regex::RegexBuilder size_limit(1 MiB) and
+#   dfa_size_limit(1 MiB); nest_limit(50). A pattern that fails to compile is skipped with a warning, other rules still work.
 # empty-match patterns (`a*`, `^`) are refused at load: a rule must not match the empty string (test on the string "").
-# scanned logical line <= 8192 characters around the click (section 4 SS-C5).
+# scanned logical line <= 8192 characters and 32 KiB (SMART_SCAN_BYTES, #433) around the click (section 4 SS-C5).
 # rich output <= 16 MiB = 16_777_216 bytes per string (html and rtf each): exactly the cap passes, one byte more => rich refused, plain copy
 #   still written. Generation aborts as soon as a string exceeds the cap (no unbounded String growth); the test uses a lowered cap constant.
 #   The styled runs collected under the terminal lock are bounded by the same cap: each run with a look of its own is charged the least
