@@ -67,6 +67,11 @@ final class TerminalSurfaceViewTests: XCTestCase {
         view.pasteboard = NSPasteboard(name: NSPasteboard.Name("com.aanyberg.tessera.tests.\(UUID().uuidString)"))
         // The recorder prints R once raw mode is set.
         try await waitUntil("the recorder is in raw mode") { FileManager.default.fileExists(atPath: self.file.path) }
+        if !FileManager.default.fileExists(atPath: file.path) {
+            // What the child did: the wait alone cannot tell slow from dead.
+            let screen = (try? view.session.accessibleText().string) ?? ""
+            XCTFail("the recorder did not start: \(view.status ?? "still running"), screen \(screen.debugDescription)")
+        }
         try await Task.sleep(for: .milliseconds(100))
     }
 

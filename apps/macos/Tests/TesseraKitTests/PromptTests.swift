@@ -29,8 +29,11 @@ final class PromptTests: XCTestCase {
         let second = "\(mark("A"))$ \(mark("B"))echo\\n\(mark("C"))hi\\n\(mark("D;0"))\(mark("A"))$ "
         let script = "printf '\(first)'; seq 1 30; printf '\(second)'; exec cat"
         let session = try app.spawn(.init(program: "/bin/sh", arguments: ["-c", script], rows: Self.rows))
+        // The history is complete before the second command's marks arrive,
+        // and until they do the last output is the first command's.
         try await waitUntil("the marked output is complete") {
             (try? session.scrollPosition)?.history == 12 && (try? session.selectLastOutput()) == true
+                && (try? session.selectionText()) == "hi"
         }
         return session
     }

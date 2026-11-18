@@ -648,10 +648,12 @@ final class FindBarTests: XCTestCase {
         defer { pasteboard.releaseGlobally() }
         pasteboard.clearContents()
         pasteboard.setString("before", forType: .string)
-        // 2000 lines of 600 digits: 1.2 MB of matches (26 000 rows at 48
-        // columns, all kept).
+        // 25 000 lines of 48 digits: 1.2 MB of matches, all kept, each line
+        // one row at 48 columns. A longer line would not do: a search behind
+        // its time budget may cut inside a wrapped line (ADR 0038), which
+        // splits a run of digits in two and reports the line as skipped.
         try startCore("[terminal]\nscrollback_lines = 40000\n")
-        let view = try makeView("echo hit one; echo hit two; read x; printf '%0600d\\n' $(seq 1 2000); exec cat > /dev/null")
+        let view = try makeView("echo hit one; echo hit two; read x; printf '%048d\\n' $(seq 1 25000); exec cat > /dev/null")
         view.pasteboard = pasteboard
         view.copyAllFindMatches(nil)
         XCTAssertEqual(pasteboard.string(forType: .string), "before", "no search: nothing copied")
@@ -664,11 +666,15 @@ final class FindBarTests: XCTestCase {
         view.find.regex = true
         try type("[0-9]+", into: view)
         try view.session.write(Array("\n".utf8))
-        try await tick(view, until: "2000 matches") { try status(view).matches == 2_000 && status(view).done }
+        try await tick(view, until: "the output is in") { try view.session.scrollPosition.history >= 25_000 - 10 }
+        // More than fit in 1 MB, even with a few lines skipped under load.
+        try await tick(view, until: "the matches are counted") {
+            try status(view).done && status(view).matches >= 22_000
+        }
         view.copyAllFindMatches(nil)
         let copied = try XCTUnwrap(pasteboard.string(forType: .string))
         XCTAssertLessThanOrEqual(copied.utf8.count, TesseraSession.searchMaxMatchesTextBytes)
-        XCTAssertGreaterThan(copied.utf8.count, TesseraSession.searchMaxMatchesTextBytes - 601)
+        XCTAssertGreaterThan(copied.utf8.count, TesseraSession.searchMaxMatchesTextBytes - 49)
         XCTAssertEqual(view.findBar?.countLabel.stringValue, "Copied the matches that fit in 1 MB")
         try type("[0-9]+ ", into: view)
         XCTAssertNotEqual(view.findBar?.countLabel.stringValue, "Copied the matches that fit in 1 MB", "a new query drops it")
