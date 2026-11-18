@@ -284,8 +284,8 @@ margins go back to the full width), DECCKM, DECKPAM, `modifyOtherKeys` and both 
 the scroll region (DECSTBM, shared by both screens) to the full screen without moving the cursor, before the carry
 below: a dead program's region (tmux sets `1;rows-1` for each scroll burst, irssi and mutt keep one) would make the
 carried rows overwrite one line below the region or be discarded inside it, and would keep the shell's output out of
-the scrollback. A command end received on the alternate screen is still dropped as a mark (ADR 0039), and the reset
-queues nothing for the host.
+the scrollback. A command end received on the alternate screen was dropped as a mark (ADR 0039; since #489 it is
+recorded on the primary screen, see below), and the reset itself queues nothing for the host.
 
 What the alternate screen showed is kept: its rows from the first to the last that shows anything but blanks (at most
 the screen's height) are printed on the primary screen from the start of the restored cursor's line (the next line when
@@ -294,7 +294,8 @@ into the scrollback like printed text and the next prompt starts below them. Tha
 what followed it on the alternate screen: ssh's `Connection to host closed by remote host.`, a TUI's panic or traceback,
 zsh's `segmentation fault` job status (printed before `precmd` writes `D`). xterm, kitty, WezTerm, Ghostty and iTerm2
 keep that text visible (they stay on the alternate screen); so did Tessera 0.1.0. Each cell keeps its character,
-grapheme cluster and style, and a full soft-wrapped row stays wrapped; hyperlinks are not carried. The pen the leave
+grapheme cluster and style, and a full soft-wrapped row stays wrapped; hyperlinks were not carried (since #489 they
+are, see below). The pen the leave
 restored is set again before each line break, so a row the carry scrolls in (filled with the pen's background) and the
 next prompt take the shell's colours, not those of the dead program's last cell (tmux's status bar). A program that
 leaves the alternate screen itself before the shell's `D` (vim, htop, a local tmux detaching) is unaffected: the `D`
@@ -339,3 +340,31 @@ Tests: `crates/tessera-term/tests/stuck_modes.rs` (the tmux attach sequence, eac
 do not reset, the modes a shell turns on after the command end, a flood), `crates/tessera-app-core/tests/stuck_modes.rs`
 (a killed program on a real pty, the real zsh with the integration, and the real tmux with its server and client killed,
 ignored).
+
+### How the carry places the rows (#489, 2026-11-17)
+
+The carry above, as the second critic round and the adversarial run of #461 found it, printed each cell again and
+cloned the rows first. It now works as follows; where this list and the text above differ, this list holds.
+
+- **Clear before the carry.** Once the leave restored the cursor, the primary screen is cleared from the cursor to the
+  end of the screen before any row is carried: the rest of the cursor's line (EL 0, its marks kept; skipped while the
+  cursor's wrap is pending, so its last character stays) and every row below it (their marks dropped, as ED 0 drops
+  them). Primary text at or below the restored cursor (a program's own output after the cursor saved on entry, a
+  stale prompt) no longer shows beside or after the carried rows. It is not counted as a screen clear (ADR 0039,
+  D-CLEAR): it is part of the carry, not a program's ED.
+- **Cells are moved, not printed again.** Each carried row takes a row of its own, and its cells, clusters and
+  hyperlinks are moved into it as they were. Printing them again merged cells that printing merges (an emoji
+  skin-tone modifier that the program put next to its base by cursor addressing joined the base, and the row shifted
+  left by two), and lost what printing does not keep. Hyperlinks are carried now (the link pool is the grid's, shared
+  by both screens).
+- **Soft wraps.** A soft-wrapped row stays wrapped, full or padded where a wide character did not fit in the last
+  column (its pad is kept), unless it is the last carried row: the next prompt is no continuation.
+- **The rows are taken, not cloned.** The alternate screen is discarded by the leave anyway, so its rows are taken out
+  of it first: the carry allocates the list of rows and no cells (`tests/rect_alloc.rs`). On a 200 x 500 screen of
+  text a drawn screen and a carrying command end cost 0.99 times the same unit with the program leaving the screen
+  itself (1.61 times before, 1.34 ms against 0.84 ms; release, best of 15).
+- **Trim.** A row's trailing cells are trimmed to the shell's pen only when blank in the shell's background (the
+  pen's): a blank in another background is not blank, so a status bar keeps its colour to the end of the row. The
+  same rule picks the first and last rows that show anything.
+- **The command end mark.** Once the reset took the primary screen back, the `D` is recorded there, on the line below
+  the carried text (where the next prompt starts), with its request (ADR 0039, restating N12).

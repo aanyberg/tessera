@@ -67,7 +67,8 @@
 //! command end (`D`) received on either screen first turns off the input
 //! modes a dead command may have left on, the alternate screen included
 //! (see the `modes` module, #461); one received on the alternate screen is
-//! still dropped.
+//! then recorded on the primary screen it took back, on the line below
+//! the carried text, where the next prompt starts (#489, ADR 0039 N12).
 //! Every mark the grid takes is also reported as [`Request::Mark`] with the
 //! line's absolute id, coalesced to the last mark of each kind per
 //! [`Terminal::advance`](crate::Terminal::advance) call (ADR 0039). The
@@ -288,19 +289,20 @@ impl State {
 
     /// `OSC 133`: marks the cursor's line on the main screen. A command
     /// end, on either screen, first turns off the modes a dead command
-    /// may have left on (#461).
+    /// may have left on (#461), the alternate screen included, and then
+    /// marks the primary screen's line (#489).
     fn osc_mark(&mut self, args: &[Vec<u8>]) {
         let Some(mark) = Mark::from_osc133(&args.join(&b';')) else {
             trace!("OSC 133 that is no mark ignored");
             return;
         };
-        // Decided before the reset leaves the alternate screen: a mark
-        // received there is dropped all the same.
-        let alt = self.grid.is_alt_screen();
+        // After the reset: a command end received on the alternate screen
+        // has left it, so it marks the primary screen's line below the
+        // carried text, where the next prompt starts (#489, ADR 0039 N12).
         if matches!(mark, Mark::CommandEnd { .. }) {
             self.command_end_reset_modes();
         }
-        if alt {
+        if self.grid.is_alt_screen() {
             trace!(?mark, "OSC 133 on the alternate screen ignored");
             return;
         }

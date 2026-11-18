@@ -326,7 +326,10 @@ fn n10_ps2_never_stops() {
     assert_eq!(marks, [(A, 0), (B, 1), (C, 2)]);
 }
 
-/// Marks on the alternate screen are dropped, and so are their requests.
+/// Marks on the alternate screen are dropped, and so are their requests,
+/// except a command end: it first takes the primary screen back (#461),
+/// and is then recorded there, on the line the cursor was restored to,
+/// with its request (#489, ADR 0039).
 #[test]
 fn n12_marks_set_on_alt_screen_are_dropped() {
     let (term, marks) = fed(
@@ -334,8 +337,9 @@ fn n12_marks_set_on_alt_screen_are_dropped() {
         20,
         b"\x1b[?1049h\x1b]133;A\x07\x1b]133;C\x07\x1b]133;D;0\x07\x1b[?1049l",
     );
-    assert_eq!(marks, []);
-    assert!(grid_marks(&term).iter().all(Vec::is_empty));
+    assert_eq!(marks, [(d(Some(0)), 0)]);
+    assert_eq!(screen_marks(&term), [(0, vec![d(Some(0))])]);
+    assert!(grid_marks(&term)[1..].iter().all(Vec::is_empty));
 }
 
 /// The ids are only meaningful within one [`Terminal::line_epoch`]: a

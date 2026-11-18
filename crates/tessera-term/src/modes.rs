@@ -100,14 +100,19 @@
 //! resets the scroll region to the full screen without moving the cursor.
 //! The alternate screen's text (the dead program's last screen and what
 //! followed it: ssh's disconnect reason, a panic, the shell's job status)
-//! is then printed on the primary screen from the restored cursor's line,
-//! as the reference terminals keep it visible. Bracketed paste is left on
+//! is then carried onto the primary screen from the restored cursor's
+//! line, as the reference terminals keep it visible: the primary screen is
+//! cleared from the restored cursor to its end, and the alternate rows are
+//! moved there, cells, clusters, hyperlinks and soft wraps as they were
+//! (#489). Bracketed paste is left on
 //! (shells turn it on and off around each command themselves), and so is
 //! every other mode. Shells write the command end before their line editor
 //! turns its own modes back on, so those stay (ADR 0020, "Amendment: modes
 //! a dead program left on").
 
-use tessera_grid::{EraseDisplay, Line};
+use std::mem;
+
+use tessera_grid::{Cell, EraseDisplay, EraseLine, Line};
 use tracing::trace;
 
 use crate::keyboard::{KeyboardModes, KittyFlags, KittyFlagsMode, ModifyOtherKeys};
@@ -601,7 +606,7 @@ impl State {
     /// screen ([`State::carry_alt_screen_text`]). See the module
     /// documentation.
     pub(crate) fn command_end_reset_modes(&mut self) {
-        let carried = self.alt_screen_text();
+        let carried = self.take_alt_screen_lines();
         self.set_dec_mode(1049, false);
         self.modes.cursor_visible = true;
         self.modes.mouse = MouseTracking::None;
@@ -616,73 +621,89 @@ impl State {
         self.grid.reset_scroll_region();
         self.keyboard = KeyboardModes::default();
         self.kitty = KittyStacks::default();
-        self.carry_alt_screen_text(&carried);
+        self.carry_alt_screen_text(carried);
     }
 
-    /// The alternate screen's rows from its first to its last row showing
-    /// anything but blanks, at most the screen's height; none on the
-    /// primary screen.
-    fn alt_screen_text(&self) -> Vec<Line> {
+    /// Every row of the alternate screen, taken out of it (the leave drops
+    /// what is left: rows without cells), so the carry moves the rows'
+    /// cells instead of copying them (#489); none on the primary screen.
+    fn take_alt_screen_lines(&mut self) -> Vec<Line> {
         if !self.grid.is_alt_screen() {
             return Vec::new();
         }
-        let lines = self.grid.visible_lines();
-        let shows = |line: &Line| line.cells.iter().any(|cell| !cell.is_blank());
-        let Some(first) = lines.iter().position(shows) else {
-            return Vec::new();
-        };
-        let last = lines.iter().rposition(shows).unwrap_or(first);
-        lines[first..=last].to_vec()
+        let rows = self.grid.rows();
+        let mut lines = Vec::with_capacity(usize::from(rows));
+        lines.extend((0..rows).filter_map(|row| self.grid.line_mut(row).map(mem::take)));
+        lines
     }
 
-    /// Prints `lines` (the alternate screen a command end left,
-    /// [`State::alt_screen_text`]) on the primary screen from the start of
-    /// the cursor's line, or of the next one when the cursor is not at its
-    /// start, each row's trailing blanks trimmed and followed by a new
-    /// line, so the dead program's last screen and the messages after it
+    /// Puts `lines` (the alternate screen a command end left,
+    /// [`State::take_alt_screen_lines`]) on the primary screen, from its
+    /// first to its last row showing anything, at most the screen's
+    /// height, so the dead program's last screen and the messages after it
     /// (ssh's disconnect reason, a panic, the shell's job status) stay
     /// above the next prompt and scroll into the scrollback like printed
-    /// text. Each cell keeps its character, cluster and style, and a full
-    /// soft-wrapped row stays wrapped; hyperlinks are not carried. The
-    /// shell's pen is restored before each line break, so a row the carry
-    /// scrolls in is blank in the shell's colours, not the carried text's.
-    fn carry_alt_screen_text(&mut self, lines: &[Line]) {
-        if lines.is_empty() {
-            return;
-        }
+    /// text (ADR 0020, "modes a dead program left on").
+    ///
+    /// The primary screen is cleared from the restored cursor to its end
+    /// first, so no stale row shows between or after the carried ones. The
+    /// rows start at the start of the cursor's line, or of the next one
+    /// when the cursor is not at its start, and each takes a row of its
+    /// own: its cells are moved, not printed again, so every cell keeps
+    /// its character, cluster, hyperlink, style and place, and a
+    /// soft-wrapped row (full, or padded where a wide character did not
+    /// fit) stays wrapped unless it is the last one. A row's trailing
+    /// blanks in the shell's background are trimmed to the shell's pen;
+    /// a blank in another background is not blank (a status bar's colour
+    /// stays). Rows scrolled in take the shell's pen too, which the
+    /// carry never changes. The cursor's row keeps its marks; a row below
+    /// it loses the stale ones it held.
+    fn carry_alt_screen_text(&mut self, mut lines: Vec<Line>) {
         let pen = self.grid.pen();
+        // Blank in the shell's background and no wide character's pad.
+        let trims = |cell: &Cell| cell.is_blank() && cell.style.bg == pen.bg && !cell.is_pad();
+        let shows = |line: &Line| !line.cells.iter().all(trims);
+        let Some(first) = lines.iter().position(shows) else {
+            return;
+        };
+        let last = lines.iter().rposition(shows).unwrap_or(first);
+        lines.truncate(last + 1);
+        let restored = self.grid.cursor().row;
+        let cols = usize::from(self.grid.cols());
         if self.grid.cursor().col != 0 || self.grid.pending_wrap() {
+            // The rest of the cursor's line, unless its last cell is still
+            // to be wrapped after.
+            if !self.grid.pending_wrap() {
+                self.grid.erase_in_line(EraseLine::ToEnd);
+            }
             self.grid.carriage_return();
             self.grid.line_feed();
         }
-        for (index, line) in lines.iter().enumerate() {
+        let count = lines.len() - first;
+        for (index, mut line) in lines.drain(first..).enumerate() {
+            let row = self.grid.cursor().row;
             let end = line
                 .cells
                 .iter()
-                .rposition(|cell| !cell.is_blank())
+                .rposition(|cell| !trims(cell))
                 .map_or(0, |col| col + 1);
-            for (col, cell) in line.cells[..end].iter().enumerate() {
-                if cell.is_spacer() {
-                    continue;
-                }
-                self.grid.set_pen(cell.style);
-                match line.cluster(col) {
-                    Some(text) if cell.is_cluster() => self.grid.put_str(text),
-                    _ => self.grid.put_char(cell.ch),
-                }
+            line.fill(end..cols, pen);
+            let Some(target) = self.grid.line_mut(row) else {
+                break;
+            };
+            if row != restored && !target.marks.is_empty() {
+                target.clear(pen);
             }
-            // The shell's pen before each line break: a scroll fills the
-            // new row with the pen's background (BCE), which must not be
-            // the dead program's.
-            self.grid.set_pen(pen);
-            // A soft-wrapped row that filled the line continues on the
-            // next one, as it was printed.
-            let continues = line.wrapped && self.grid.pending_wrap() && index + 1 < lines.len();
-            if continues {
-                self.grid.wrap_line();
-            } else {
-                self.grid.carriage_return();
-                self.grid.line_feed();
+            mem::swap(&mut target.cells, &mut line.cells);
+            mem::swap(&mut target.graphemes, &mut line.graphemes);
+            target.wrapped = line.wrapped && index + 1 < count;
+            self.grid.carriage_return();
+            self.grid.line_feed();
+        }
+        // The rows below the last carried one: stale primary text.
+        for row in self.grid.cursor().row..self.grid.rows() {
+            if let Some(line) = self.grid.line_mut(row) {
+                line.clear(pen);
             }
         }
     }

@@ -364,16 +364,18 @@ fn q3_deccra_copies_clusters_and_overlaps_within_a_row() {
     assert!(line.cells.iter().all(|c| !c.is_spacer() || c.ch == ' '));
 }
 
-/// Q4: Pch maps through GL as printing would (DEC Special Graphics), and
-/// DECFRA does not consume a pending single shift.
+/// Q4: Pch maps as printing would, through GL (DEC Special Graphics) or a
+/// pending single shift's set, and DECFRA does not consume the shift.
 #[test]
 fn q4_pch_maps_through_gl_and_leaves_a_single_shift_pending() {
     let term = feed(2, 6, b"\x1b(0\x1b[113;1;1;1;2$x");
     assert_eq!(screen_text(&term)[0], "──");
-    // G2 = Special Graphics, SS2 pending: the fill takes GL (ASCII) and
-    // the next printed character still takes G2.
-    let term = feed(2, 6, b"\x1b*0\x1bN\x1b[113;1;1;1;2$x\x1b[1;3Hq");
-    assert_eq!(screen_text(&term)[0], "qq─");
+    // G2 = Special Graphics, SS2 pending: the fill takes G2, as printing
+    // would (xterm's `current_charset`, #489 D-SS), and the shift stays
+    // pending: the next printed character takes G2 too, the one after it
+    // GL (ASCII).
+    let term = feed(2, 6, b"\x1b*0\x1bN\x1b[113;1;1;1;2$x\x1b[1;3Hqq");
+    assert_eq!(screen_text(&term)[0], "───q");
     // A Latin-1 Pch maps through GR (ASCII by default: itself).
     let term = feed(2, 6, b"\x1b[233;1;1;1;1$x");
     assert_eq!(screen_text(&term)[0], "é");

@@ -1,0 +1,703 @@
+# =============================================================================
+# tessera-term: DECFRA Pch through GL/GR and the designated sets; DECCRA overlap and self copy
+# Run by tests/rect_fixes.rs (`decfra_charset_spec_rows`) through tests/spec/mod.rs, whole and byte by byte  (task 24.14, refs #489 #461)
+#
+# Same layout as charset_spec.txt (### ID / size / step / cite / note / screen / cursor / pending_wrap / requests /
+# scrollback), parseable by tests/spec/mod.rs once pointed at this file. Extra keys the shared parser ignores:
+#   flags: decision | xterm-quirk | control | invisible    (decision = a lead ruling, 2026-11-17; Tessera's behaviour is in `screen`)
+#   xterm_screen: what xterm shows when it differs from `screen` (documentation only)
+#   cells: code points of the filled cells for rows whose glyph is invisible (NBSP, soft hyphen)
+# Cursor is 0-based (row,col); render_screen puts `|` AFTER the cursor's cell. Non-ASCII payload is written \u{..};
+# expected screens are literal characters. Every row fills columns 1-3 of row 1 with `CSI Pch;1;1;1;3 $ x` unless noted.
+# Tessera is always UTF-8; the terminal starts at level 4 (Terminal::new, VT400-class; tests/rect_fixes.rs also checks level 5), DECNRCM off unless a row says so.
+#
+# SOURCES (all fetched this run)
+#   [CTL]    xterm ctlseqs  https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+#            "CSI Pc;Pt;Pl;Pb;Pr $ x  Fill Rectangular Area (DECFRA), VT420 and up. Pc is the character to use."  (no range, no GL/GR text)
+#            "CSI Pt;Pl;Pb;Pr;Pp;Pt;Pl;Pp $ v  Copy Rectangular Area (DECCRA)"  (nothing on overlap)
+#   [XT-cp]  xterm charproc.c (ThomasDickey/xterm-snapshots master) CASE_DECFRA (~line 5666) and current_charset() (~1785):
+#              value = use_default_value(0, ' ');            /* Pch <= 0 or absent -> space */
+#              /* DEC 070, page 5-170 says the fill-character is either ASCII or Latin1; xterm allows printable Unicode values. */
+#              if (nparam > 0 && ((value >= 256 && CharWidth(screen, value) > 0) || IsLatin1(screen, value)))
+#                  ScrnFillRectangle(xw, &rect, value, current_charset(screen, value), xw->flags, True);
+#              current_charset(): result = nrc_ASCII; if IsLatin1(value): curss != 0 ? gsets[curss]
+#                                 : value >= 0x80 ? gsets[curgr] : gsets[curgl]
+#              IsLatin1(n) = (32 <= n <= 126) || (160 <= n <= 255)   [Upper8Bits = 160 unless allowC1Printable, then 128]  (xterm.h)
+#              CSI state does SetParam(nparam++, DEFAULT), so nparam >= 1 even for a bare `CSI $ x`.
+#   [XT-scr] xterm screen.c ScrnFillRectangle(): `if (charset != nrc_ASCII) { write_text = &actual; if (xtermCharSetOut(xw,1,charset)==0) actual = ' '; }`
+#            then writes `actual` to every cell of the rectangle (translation happens BEFORE any width test; there is no width test).
+#            screen.c ScrnCopyRectangle(): "make a local copy of the source rectangle first, then apply the target from that"
+#            (newCellData(size) of the whole source rectangle); target = parsed Ptd;Pld, sized like the source, clipped by the
+#            `col <= getMaxCol` / `row <= getMaxRow` guards in the write loop; pages ignored.
+#   [XT-cs]  xterm charsets.c xtermCharSetOut(): cs = (eight >= 128) ? gsets[curgr] : leftset (the set passed in, = current_charset);
+#            seven = eight & 0x7f; skipped for code points > 0xFF in UTF-8; DEC Special Graphic: seven 0x60..0x7E -> dec2ucs, `chr == 0x5f` (the
+#            UNMASKED code) -> 0, else chr = seven; DEC Supplemental/Technical via map_DEC_Supp_Graphic / map_DEC_Technical (UNI entries active:
+#            begin_CODEPAGE bumps utf8_nrc_mode unless DECNRCM is on); DEL (chr == 0x7f) in a seven-bit set is REMOVED and `count` drops to 0 -
+#            which makes ScrnFillRectangle fill a SPACE; afterwards `if (eight >= 128 && chr < 128 && chr > 32) chr |= 128`.
+#   [XT-tbl] xterm charsets.h: UNDEF = 0x2426; map_DEC_Supp_Graphic 0x24/0x26/0x2C-0x2F/0x34/0x38/0x3E/0x50/0x5E/0x70/0x7E -> U+2426,
+#            0x28 -> U+00A4, 0x57 -> U+0152, 0x5D -> U+0178, 0x77 -> U+0153, 0x7D -> U+00FF; map_DEC_Technical 0x2D -> U+23AB.
+#   [VT510]  https://vt100.net/docs/vt510-rm/DECFRA.html : "Pch can be any value from 32 to 126 or from 160 to 255. If Pch is not in this
+#            range, then the terminal ignores the DECFRA command. The decimal value refers to the character in the current GL or GR in-use
+#            table." / "The fill character assumes the visual character attributes set by the last SGR" / "DECFRA does not change the
+#            current line attributes" / "does not change the active cursor position" / out-of-page values are clamped / VT level 4 only.
+#            https://vt100.net/docs/vt510-rm/DECCRA.html : "retains its character values and attributes"; "If the destination area is
+#            partially off the page, then DECCRA clips the off-page data"; page 4 DOES NOT SAY how overlap is handled; the text's
+#            "If Pbs is greater than Pts" is a typo for Pts > Pbs; DECOM affects coordinates; margins do not.
+#   [DEC070] DEC STD 070 (the video systems reference) p. 5-170 as quoted by the xterm comment above: fill character is ASCII or Latin-1.
+#            Not fetched directly (not online); only the quote in [XT-cp] is relied on.
+#   [TESS]   crates/tessera-term/src/rect.rs fill_char() (HEAD a4c1408), tests/rect_fixes.rs, tests/rect.rs Q4, docs/adr/0046 amendment
+#            "DECFRA mapping order and the exact self copy (#269)", crates/tessera-term/tests/fixtures/charset_spec.txt (rows GR*, SG*, SU*, SS*).
+#   kitty, WezTerm, Alacritty, iTerm2: not cited. Alacritty and kitty do not implement DECFRA at all (from memory, not verified here);
+#   iTerm2 implements DECFRA/DECCRA/DECERA (from memory, not verified here). xterm and the DEC manuals are the oracle.
+#
+# STATE OF THE BRIEF vs main (read this first)
+#   The DECFRA "translate, then check" defect, the exact DECCRA self copy and the app-core damage test ALL ALREADY LIVE on main:
+#   rect.rs fill_char() maps through the sets and then calls fillable(); tests/rect_fixes.rs has the exhaustive 191x24x2x2 table;
+#   tests/rect_alloc.rs checks the self copy; crates/tessera-app-core/tests/rect_damage.rs EXISTS (not new). ADR 0046 has the
+#   amendment. What is left of "DECFRA" is: the decisions D-SS, D-DROP, D-SHY, D-WIDE below (Tessera vs xterm), the differential
+#   volume bar (rect_fixes.rs compares 36,672 cases; the brief wants >= 10M random), and a mutation check.
+#
+# DECISIONS (the lead's rulings of 2026-11-17: D-GR through GR, D-SS follows xterm, D-DROP / D-SHY / D-WIDE keep Tessera; ADR 0046)
+#   D-GR     Do Pch 160-255 map through GR or are they Latin-1? -> THROUGH GR. [VT510] "refers to the character in the current GL or GR
+#            in-use table"; [XT-cp] current_charset() uses gsets[curgr]. With the default GR (ASCII in UTF-8) the mapping is the identity, so
+#            "Latin-1" is the special case, not an alternative. Tessera already does this (rows C01-C12).
+#   D-SS     A pending single shift (SS2/SS3) when DECFRA arrives: xterm uses the shifted set for Pch 32-126 (current_charset: curss != 0 ->
+#            gsets[curss]) and leaves it pending (CASE_DECFRA never clears curss). Tessera uses GL and also leaves it pending (rect.rs
+#            `Charsets::from(saved())`, tests/rect.rs q4). Recommend xterm: it is what "fills with the character printing the same byte would
+#            write" means, and what the brief's differential should then include. Costs one `single_shift` copy in fill_char(). Row D01.
+#   D-DROP   A Pch that printing DROPS (255 under a seven-bit GR set, i.e. DEL after mapping): xterm fills a SPACE (count 0 -> ' '); Tessera
+#            ignores the sequence. Recommend KEEP Tessera (nothing), which is what the brief's "writes nothing where print writes nothing" and
+#            security.md's "never writes a C0, C1 or DEL cell" say; document the xterm deviation in ADR 0046. Row C04.
+#   D-SHY    Pch 173 with ASCII (or any set that leaves it U+00AD): xterm fills U+00AD (CharWidth(173) is 1 for any Latin-1 value); Tessera
+#            ignores it (U+00AD is zero width, so printing it writes no cell). Recommend KEEP Tessera: a zero-width fill cell breaks the
+#            one-column cell model; same class as D-WIDE. Row A09.
+#   D-WIDE   Pch >= 256 that is a wide character: xterm fills it into every cell (CharWidth > 0 accepts width 2, no HIDDEN_CHAR pairing,
+#            so the screen holds overlapping double-width glyphs); Tessera requires width 1. Recommend KEEP Tessera. Row A13.
+#   D-NOPARAM `CSI $ x` with no Pch at all: xterm fills the whole screen with spaces (nparam >= 1); Tessera does the same. Same result, no
+#            decision needed (row A15); listed because the brief's "Pch absent is a space" is right.
+#
+# THINGS THE BRIEF / ISSUE TEXT GETS WRONG
+#   - "DECFRA (20.1 adversarial M1, real defect): fill_char tests fillable(U+00AD) before translating": already fixed on main (see above).
+#   - "crates/tessera-app-core/tests/rect_damage.rs (new)": the file exists (2 tests: damage like EL, selection cleared like after EL).
+#   - "20.1 adv M2: DECCRA self-copy cost already fixed": true; the doc says so in rect.rs, grid rect.rs, ADR 0046 and security.md.
+#   - "20.1 n2 take() moves the entry Vec out": rect.rs L55-57, grid rect.rs L28 and security.md already say it.
+#   - The 34.7M-case differential is not in the repo; rect_fixes.rs does 36,672 cases (24 sets x GL/GR x DECNRCM x 191 Pch). The sets with
+#     NRCS finals K Y E 6 Z 7 H = 9 ` %6 are in; only ISO Latin-2/5/Greek/Hebrew/Cyrillic and JIS are not implemented at all, so a
+#     bigger run can only add the G0-G3 x GL/GR x single-shift x DECNRCM x level state space (G1 alone is covered today), not more sets.
+#   - Whether xterm "treats Pch 160-255 as Latin-1": it does for acceptance (IsLatin1), and maps through GR for the glyph.
+#
+# =============================================================================
+
+# ---- A. Pch acceptance (no sets designated) ---------------------------------------------------------------------------------------
+
+### A01_pch_ascii
+size: 2x8
+step: feed \x1b[65;1;1;1;3$x
+cite: [CTL] DECFRA; [VT510] "Pch can be any value from 32 to 126"; [XT-cp] IsLatin1 (32..126)
+screen:
+>A|AA
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### A02_pch_omitted_is_a_space
+size: 2x8
+step: feed abc\x1b[H\x1b[;1;1;1;3$x
+cite: [XT-cp] value = use_default_value(0, ' ')
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### A03_pch_zero_is_a_space
+size: 2x8
+step: feed abc\x1b[H\x1b[0;1;1;1;3$x
+cite: [XT-cp] use_default_value: `if (result <= 0) result = default_value`
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### A04_pch_126_tilde
+size: 2x8
+step: feed \x1b[126;1;1;1;3$x
+cite: [VT510] upper end of 32-126
+screen:
+>~|~~
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### A05_pch_31_ignored
+size: 2x8
+step: feed abc\x1b[H\x1b[31;1;1;1;3$x
+cite: [VT510] "If Pch is not in this range, then the terminal ignores the DECFRA command"; [XT-cp] IsLatin1 false
+screen:
+>a|bc
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### A06_pch_127_ignored
+size: 2x8
+step: feed abc\x1b[H\x1b[127;1;1;1;3$x
+cite: [VT510] 127 is outside 32-126; [XT-cp] IsLatin1(127) false
+screen:
+>a|bc
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### A07_pch_128_to_159_ignored
+size: 2x8
+step: feed abc\x1b[H\x1b[128;1;1;1;3$x\x1b[155;1;1;1;3$x\x1b[159;1;1;1;3$x
+cite: [VT510] gap between 126 and 160; [XT-cp] Upper8Bits = 160 (allowC1Printable false)
+note: With allowC1Printable on, xterm would take 128-159; Tessera has no such option, so they stay refused (S3: no C1 cell).
+screen:
+>a|bc
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### A08_pch_160_nbsp_default_gr
+size: 2x8
+step: feed \x1b[160;1;1;1;3$x
+flags: invisible
+cells: U+00A0 U+00A0 U+00A0
+cite: [VT510] 160 is the first accepted GR value; [XT-cp] IsLatin1(160), current_charset -> gsets[curgr] = ASCII -> no translation
+note: The ASCII GR is the identity above 0x7F, so the NBSP is stored. Tessera: char_width(U+00A0) == 1, not a control: fills.
+screen:
+> |  
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### A09_pch_173_default_gr_soft_hyphen
+size: 2x8
+step: feed abc\x1b[H\x1b[173;1;1;1;3$x
+flags: decision
+xterm_screen: cells 0-2 hold U+00AD (invisible): `\u{ad}|\u{ad}\u{ad}`
+cite: [XT-cp] IsLatin1(173) accepts; current_charset = ASCII -> `actual` stays 0xAD; [TESS] fillable(U+00AD) = false (zero width)
+note: D-SHY. The same byte printed with the default sets writes no cell in Tessera (zero width), so DECFRA ignoring it is the "same as print" answer.
+screen:
+>a|bc
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### A10_pch_233_e_acute_default_gr
+size: 2x8
+step: feed \x1b[233;1;1;1;3$x
+cite: [XT-cp] IsLatin1(233); ASCII GR = identity
+screen:
+>é|éé
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### A11_pch_255_default_gr
+size: 2x8
+step: feed \x1b[255;1;1;1;3$x
+cite: [XT-cp] IsLatin1(255); ASCII GR -> U+00FF
+screen:
+>ÿ|ÿÿ
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### A12_pch_256_and_up_unicode_scalar
+size: 2x8
+step: feed \x1b[9472;1;1;1;3$x
+cite: [XT-cp] "xterm allows printable Unicode values" (value >= 256 && CharWidth > 0); [TESS] rect.rs fill_char (one-column, not noncharacter)
+screen:
+>─|──
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### A13_pch_wide_scalar
+size: 2x8
+step: feed abc\x1b[H\x1b[19968;1;1;1;3$x
+flags: decision
+xterm_screen: three overlapping U+4E00 cells (CharWidth 2 passes `> 0`; ScrnFillRectangle writes charData[col] with no HIDDEN_CHAR pair)
+cite: [XT-cp] CharWidth(screen, value) > 0; [XT-scr] no width handling; [TESS] fillable requires char_width == 1
+note: D-WIDE.
+screen:
+>a|bc
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### A14_pch_combining_and_noncharacter_ignored
+size: 2x8
+step: feed abc\x1b[H\x1b[768;1;1;1;3$x\x1b[65535;1;1;1;3$x\x1b[55296;1;1;1;3$x
+cite: [XT-cp] CharWidth(0x300) == 0 -> refused; U+FFFF / surrogate: my_wcwidth <= 0 (not verified in wcwidth.c this run); [TESS] fillable rejects zero width, noncharacters, surrogates
+screen:
+>a|bc
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### A15_no_parameters_blanks_the_screen
+size: 2x8
+step: feed abc\r\nxyz\x1b[H\x1b[$x
+cite: [XT-cp] CASE_CSI_STATE does SetParam(nparam++, DEFAULT), so nparam > 0: value = ' ', rectangle = the whole screen
+note: D-NOPARAM: same in Tessera (Pch absent is a space, absent edges are the screen).
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### A16_cursor_and_pending_wrap_untouched
+size: 2x8
+step: feed abc\x1b[2;5H\x1b[65;1;1;1;3$x
+cite: [VT510] "DECFRA does not change the active cursor position"; [TESS] rect.rs doc ("does not move the cursor, clear a pending wrap")
+screen:
+>AAA
+>     |
+cursor: (1,4)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+# ---- B. Pch through GL (invocation GL = G0 unless SO/SI) -------------------------------------------------------------------------
+
+### B01_dec_special_in_gl
+size: 2x8
+step: feed \x1b(0\x1b[113;1;1;1;3$x
+cite: [CTL] ESC ( 0; [XT-cp] current_charset: value < 0x80, curss == 0 -> gsets[curgl]; [XT-cs] DEC Special Graphic, dec2ucs(0x71 - 0x5f)
+screen:
+>─|──
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### B02_dec_special_first_and_last_of_the_table
+size: 2x8
+step: feed \x1b(0\x1b[96;1;3;1;3$x\x1b[126;1;1;2;2$x
+cite: [XT-cs] dec2ucs(1) = U+25C6, dec2ucs(31) = U+00B7 (charset_spec.txt SG01)
+note: First fill: Pch 96 into row 1 column 3 only. Second: Pch 126 into rows 1-2, columns 1-2 (top;left;bottom;right = 1;1;2;2).
+screen:
+>·|·◆
+>··
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### B03_dec_special_underscore_is_blank
+size: 2x8
+step: feed abc\x1b[H\x1b(0\x1b[95;1;1;1;3$x
+cite: [XT-cs] `chr == 0x5f` -> 0 (a blank cell); charset_spec.txt SG01 (Tessera stores a space)
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### B04_dec_special_leaves_other_ascii
+size: 2x8
+step: feed \x1b(0\x1b[65;1;1;1;3$x
+cite: [XT-cs] DEC Special Graphic: seven <= 0x5e and not 0x5f -> chr = seven
+screen:
+>A|AA
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### B05_so_invokes_g1_into_gl_si_returns
+size: 2x8
+step: feed \x1b)0\x0e\x1b[113;1;1;1;1$x\x0f\x1b[113;1;2;1;2$x
+cite: [XT-cp] CASE_SO/CASE_SI set curgl; current_charset reads curgl at DECFRA time
+screen:
+>─|q
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### B06_british_at_level_4_without_decnrcm
+size: 2x8
+step: feed \x1b(A\x1b[35;1;1;1;3$x
+flags: xterm-quirk
+cite: [XT-cs] case nrc_British: maps # to the pound sign only with NATIONAL or vtXX_level <= 1; charset_spec.txt NR9C (D-BRITISH)
+screen:
+>#|##
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### B07_british_with_decnrcm
+size: 2x8
+step: feed \x1b[?42h\x1b(A\x1b[35;1;1;1;3$x
+cite: [XT-cs] NATIONAL set: chr == 0x23 -> pound
+screen:
+>£|££
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### B08_pch_above_ff_is_never_translated_even_in_gl
+size: 2x8
+step: feed \x1b(0\x1b[960;1;1;1;3$x
+cite: [XT-cp] current_charset returns nrc_ASCII when !IsLatin1(value) (960 >= 256), so ScrnFillRectangle skips xtermCharSetOut; charset_spec.txt GR07
+screen:
+>π|ππ
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+# ---- C. Pch 160-255 through GR (GR = G2 by default; ESC ~ ESC } ESC | invoke G1/G2/G3) ---------------------------------------------
+
+### C01_dec_special_in_gr_via_ls1r
+size: 2x8
+step: feed \x1b)0\x1b~\x1b[241;1;1;1;3$x
+cite: [XT-cs] eight >= 128 -> cs = rightset = gsets[curgr]; seven = 0x71 -> U+2500; charset_spec.txt GR02
+screen:
+>─|──
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### C02_dec_special_in_gr_first_and_last
+size: 2x8
+step: feed \x1b)0\x1b~\x1b[224;1;1;1;1$x\x1b[254;1;2;1;2$x
+cite: [XT-cs] seven 0x60 -> U+25C6, 0x7E -> U+00B7
+screen:
+>◆|·
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### C03_dec_special_gr_0xdf_is_not_a_blank
+size: 2x8
+step: feed \x1b)0\x1b~\x1b[223;1;1;1;3$x
+cite: [XT-cs] the `== 0x5f` test is on the unmasked code, so 0xDF leaves chr = seven = 0x5F and the bit-7 fix-up returns 0xDF; charset_spec.txt GR14
+screen:
+>ß|ßß
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### C04_dec_special_gr_255_dropped_by_print
+size: 2x8
+step: feed abc\x1b[H\x1b)0\x1b~\x1b[255;1;1;1;3$x
+flags: decision
+xterm_screen: > |   (xterm fills a space: xtermCharSetOut removes the DEL and returns 0, ScrnFillRectangle turns that into ' ')
+cite: [XT-cs] chr == ANSI_DEL && isSevenBit(cs) -> removed, --count; [XT-scr] `== 0 -> actual = ' '`; charset_spec.txt GR12 (printing 0xFF drops it)
+note: D-DROP. Tessera: nothing printed, nothing filled.
+screen:
+>a|bc
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### C05_dec_supplemental_in_gr
+size: 2x8
+step: feed \x1b)%5\x1b~\x1b[168;1;1;1;3$x
+cite: [XT-tbl] map_DEC_Supp_Graphic 0x28 -> U+00A4; charset_spec.txt SU02
+screen:
+>¤|¤¤
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### C06_dec_supplemental_gr_173_is_the_substitute_glyph
+size: 2x8
+step: feed \x1b)%5\x1b~\x1b[173;1;1;1;3$x
+cite: [XT-tbl] map_DEC_Supp_Graphic XXX(0x2D, UNDEF) with UNDEF = 0x2426; [XT-cs] translate first, no width test (the #489 defect row)
+note: The row the brief calls the defect. 173 -> seven 0x2D -> U+2426 (SYMBOL FOR SUBSTITUTE FORM TWO, one column). Printing 173 shows the same glyph.
+screen:
+>␦|␦␦
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### C07_dec_technical_gr_173_is_a_curly_bracket_piece
+size: 2x8
+step: feed \x1b)>\x1b~\x1b[173;1;1;1;3$x
+cite: [XT-tbl] map_DEC_Technical UNI(0x2D, 0x23AB); Tessera DEC_TECHNICAL[0x2D-0x21] = U+23AB
+screen:
+>⎫|⎫⎫
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### C08_dec_technical_gr_160_is_a_space
+size: 2x8
+step: feed abc\x1b[H\x1b)>\x1b~\x1b[160;1;1;1;3$x
+cite: [XT-cs] seven 0x20 is outside the Technical table (0x21..0x7E), chr = seven = 0x20, the fix-up needs chr > 0x20; charset_spec.txt GR11
+screen:
+> |
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### C09_dec_special_gr_233
+size: 2x8
+step: feed \x1b)0\x1b~\x1b[233;1;1;1;3$x
+cite: [XT-cs] seven 0x69 -> dec2ucs(10) = U+240B
+screen:
+>␋|␋␋
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### C10_gr_does_not_touch_pch_below_128
+size: 2x8
+step: feed \x1b)0\x1b~\x1b[113;1;1;1;3$x
+cite: [XT-cp] current_charset: value < 0x80 -> gsets[curgl] (G0 = ASCII), GR is not consulted
+screen:
+>q|qq
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### C11_gr_is_g2_by_default
+size: 2x8
+step: feed \x1b*0\x1b[241;1;1;1;3$x
+cite: [XT-cp] resetCharsets: curgr = 2; charset_spec.txt GR01 (designating G2 changes GR at once)
+screen:
+>─|──
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### C12_pch_128_to_159_ignored_whatever_gr_holds
+size: 2x8
+step: feed abc\x1b[H\x1b)0\x1b~\x1b[170;1;1;1;1$x\x1b[140;1;1;1;3$x
+cite: [XT-cp] IsLatin1(140) false before any mapping; [XT-cs] bit-7 fix-up: seven 0x2A is outside the SG range, chr = 0x2A then |= 0x80 = U+00AA
+note: Row proves the guard is on Pch, not on the mapped value: 170 fills col 1 with U+00AA (feminine ordinal), then 140 does nothing.
+screen:
+>ª|bc
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### C13_german_nrcs_gr_with_decnrcm
+size: 2x8
+step: feed \x1b[?42h\x1b)K\x1b~\x1b[219;1;1;1;3$x
+cite: [XT-tbl] map_NRCS_German 0x5B -> U+00C4; charset_spec.txt NR9x/GR15 (national sets need DECNRCM)
+note: Not re-derived from charsets.h this run; the exhaustive table in rect_fixes.rs (G1_SETS contains ESC ) K, nrcs on) is the real check.
+screen:
+>Ä|ÄÄ
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### C14_german_nrcs_without_decnrcm_designates_ascii
+size: 2x8
+step: feed \x1b)K\x1b~\x1b[219;1;1;1;3$x
+cite: [XT-cp] scs_table: NRCS sets need DECNRCM, else G1 := ASCII (charset_spec.txt SG11, NR90); GR = ASCII -> identity
+screen:
+>Û|ÛÛ
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+# ---- D. Single shift ---------------------------------------------------------------------------------------------------------------
+
+### D01_pending_ss2_set_applies_to_pch_below_128
+size: 2x8
+step: feed \x1b*0\x1bN\x1b[113;1;1;1;3$x
+flags: decision
+cite: [XT-cp] current_charset(); CASE_DECFRA does not clear curss; [TESS] rect.rs fill_char translates on a copy of the sets, single shift included; tests/rect.rs q4
+note: D-SS, ruled: follow xterm. Before #489 Tessera filled through GL (`q|qq`); tests/rect.rs q4 changed with it.
+screen:
+>─|──
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### D02_pending_ss2_stays_pending_after_decfra
+size: 2x8
+step: feed \x1b*0\x1bN\x1b[65;1;1;1;3$xqq
+cite: [XT-cp] DECFRA leaves curss alone; print consumes it (CASE_SS2, WriteNow)
+note: Fill AAA (cursor stays home), then the first printed q (col 1, cursor home) still takes SS2 -> U+2500, the second is plain q. Same under both D-SS options.
+screen:
+>─qA|
+>
+cursor: (0,2)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### D03_pch_above_7f_ignores_a_pending_single_shift
+size: 2x8
+step: feed \x1b*B\x1b+0\x1bO\x1b)0\x1b~\x1b[241;1;1;1;3$x
+cite: [XT-cs] cs = (eight >= 128) ? rightset : leftset, so GR (G1 = SG here) wins over the pending SS3 for 241; [XT-cp] current_charset's curss branch only changes `leftset`
+screen:
+>─|──
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+# ---- E. DECCRA overlap, self copy and clipping (size 4x8 unless noted) -------------------------------------------------------------
+
+### E01_overlap_copy_right_is_buffered
+size: 2x8
+step: feed abcdef\x1b[H\x1b[1;1;1;4;1;1;3;1$v
+cite: [XT-scr] ScrnCopyRectangle copies the whole source to a local buffer first; [TESS] grid copy_rect "overlapping rectangles copy as if through a buffer"; [VT510] silent on overlap
+note: A forward cell-by-cell copy would give "ababab". Source abcd -> columns 3-6.
+screen:
+>a|babcd
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E02_overlap_copy_left_is_buffered
+size: 2x8
+step: feed abcdef\x1b[H\x1b[1;3;1;6;1;1;1;1$v
+cite: [XT-scr] as E01
+note: A backward cell-by-cell copy is fine here ("cdefef"); the row pins that the buffered result and the naive one agree on this direction.
+screen:
+>c|defef
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E03_overlap_copy_down
+size: 4x8
+step: feed a\r\nb\r\nc\x1b[H\x1b[1;1;3;1;1;2;1;1$v
+cite: [XT-scr] as E01
+note: Source rows 1-3 column 1 -> rows 2-4. A top-down in-place copy would give a,a,a,a.
+screen:
+>a|
+>a
+>b
+>c
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E04_exact_self_copy_is_a_noop
+size: 2x8
+step: feed abc\x1b[H\x1b[1;1;1;3;1;1;1;1$v
+cite: [XT-scr] copying onto itself is the identity; [TESS] rect.rs "An exact self copy ... is a no-op: no cell, no damage, no allocation" (ADR 0046 amendment)
+screen:
+>a|bc
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E05_self_copy_of_an_oversized_source_is_still_a_noop
+size: 2x8
+step: feed abc\x1b[H\x1b[1;1;65535;65535;1;1;1;1$v
+cite: [VT510] out-of-page values are the page edge; [TESS] "the destination is the CLIPPED source's top-left corner"
+screen:
+>a|bc
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E06_destination_clipped_at_the_screen_edge
+size: 2x8
+step: feed abcdefgh\x1b[H\x1b[1;1;1;4;1;1;6;1$v
+cite: [VT510] "If the destination area is partially off the page, then DECCRA clips the off-page data"; [XT-scr] write loop guards `col <= getMaxCol`
+note: Source abcd, destination columns 6-9 -> only 6-8 exist: abc.
+screen:
+>a|bcdeabc
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0
+
+### E07_inverted_source_is_ignored
+size: 2x8
+step: feed abc\x1b[H\x1b[1;4;1;2;1;1;5;1$v
+cite: [VT510] "If ... Pls is greater than Prs, the terminal ignores DECCRA"; [XT-scr] validRect needs top <= bottom && left <= right
+screen:
+>a|bc
+>
+cursor: (0,0)
+pending_wrap: false
+requests: []
+scrollback: len=0

@@ -28,10 +28,14 @@
 //!   background only ([`tessera_grid::Grid::erase_rect`]).
 //! - DECFRA fills with `Pch` in the full pen style, [`Style::PROTECTED`]
 //!   included ([`tessera_grid::Grid::fill_rect`]). `Pch` 0 or absent is a
-//!   space; 32-126 and 160-255 (Latin-1) are taken, mapped through the
-//!   character set invoked into GL (or GR, for 160-255) as printing would
-//!   map them, without consuming a pending single shift; a value from 256
-//!   up must be a one-column Unicode scalar that is not a noncharacter. A
+//!   space; 32-126 and 160-255 (Latin-1) are taken and mapped as printing
+//!   would map them: 32-126 through the set of a pending single shift (SS2,
+//!   SS3) or else the one invoked into GL, 160-255 through the one in GR.
+//!   The single shift stays pending for the next printed character, as in
+//!   xterm. A value from 256 up is not mapped and must be a one-column
+//!   Unicode scalar that is not a noncharacter. What printing would drop
+//!   (255 under a seven-bit set in GR) fills nothing, where xterm fills a
+//!   space (ADR 0046). A
 //!   control character (1-31, 127-159), a wide, zero-width or combining
 //!   character, a surrogate and a noncharacter (65535, what a saturated
 //!   parameter becomes) make DECFRA do nothing.
@@ -62,7 +66,6 @@ use tessera_grid::{Cell, Rect, char_width};
 use tracing::trace;
 
 use crate::State;
-use crate::charset::Charsets;
 use crate::csi::Protection;
 
 /// The rows and columns positions may address: the screen, or the origin
@@ -200,7 +203,9 @@ impl State {
     /// one it takes. A Latin-1 `Pch` is mapped through the character sets
     /// first and the result checked, as printing it would show it (#430):
     /// U+00AD (173, a zero-width soft hyphen) under DEC Supplemental or DEC
-    /// Technical in GR is a one-column glyph and fills.
+    /// Technical in GR is a one-column glyph and fills. A pending single
+    /// shift maps a `Pch` below 128 and stays pending (xterm's
+    /// `current_charset`, #489).
     fn fill_char(&self, pch: u16) -> Option<char> {
         let code = match pch {
             0 => 0x20,
@@ -211,9 +216,10 @@ impl State {
         if !self.charsets.active || code > 0xFF {
             return Some(ch).filter(|&ch| fillable(ch));
         }
-        // Printing would map it through GL or GR; a copy of the sets
-        // without the single shift, so a pending SS2 or SS3 stays pending.
-        let mut sets = Charsets::from(self.charsets.saved());
+        // Printing would map it through the single shift's set or GL, or
+        // through GR; on a copy of the sets, so a pending SS2 or SS3 stays
+        // pending for the next printed character.
+        let mut sets = self.charsets;
         sets.translate(ch, self.modes.nrcs, self.conformance_level)
             .filter(|&ch| fillable(ch))
     }
