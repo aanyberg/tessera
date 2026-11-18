@@ -324,6 +324,7 @@ impl EntryValue {
 /// settings view lists. Every text is escaped as warnings are (S3) and
 /// capped.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct KeymapEntry<'a> {
     /// Its place in the table, from 0, refused entries counted.
     pub index: usize,
@@ -947,6 +948,61 @@ mod tests {
     use std::fmt::Write as _;
 
     use super::*;
+
+    /// A configuration whose `[keys]` has `count` distinct entries.
+    fn config_with_entries(count: usize) -> crate::Config {
+        let mut toml = String::from("[keys]\n");
+        for i in 0..count {
+            let c = char::from_u32(0x4E00 + u32::try_from(i).unwrap()).unwrap();
+            writeln!(toml, "'cmd+ctrl+{c}' = 'new_tab'").unwrap();
+        }
+        crate::Config::from_toml_lenient(&toml).unwrap().config
+    }
+
+    /// 21.3 m1: two tables past the cap with the same first
+    /// [`tessera_config::MAX_KEY_BINDINGS`] entries but different
+    /// overflows (one entry left out, then two) are different tables: an
+    /// apply of the second compiles the map again, so the overflow warning
+    /// the settings view lists counts two.
+    #[test]
+    fn a_table_that_overflows_further_is_compiled_again() {
+        use tessera_config::{MAX_KEY_BINDINGS, Warning};
+        let one_over = config_with_entries(MAX_KEY_BINDINGS + 1);
+        let two_over = config_with_entries(MAX_KEY_BINDINGS + 2);
+        assert_eq!(one_over.keys.bindings(), two_over.keys.bindings());
+        assert_eq!(one_over.keys.entries(), two_over.keys.entries());
+        let map = Keymap::compile(&one_over.keys);
+        assert!(map.compiled_from(&one_over.keys));
+        assert!(!map.compiled_from(&two_over.keys));
+
+        let app = crate::App::new(
+            crate::Config::default(),
+            crate::ConfigPaths::new("/nonexistent/tessera"),
+        );
+        let theme = tessera_config::Theme::default();
+        app.apply_config(&one_over, &theme);
+        let compiled = app.keymap();
+        assert_eq!(
+            compiled.overflow(),
+            Some(&Warning::TooManyKeyBindings { dropped: 1 })
+        );
+        app.apply_config(&two_over, &theme);
+        assert!(
+            !std::sync::Arc::ptr_eq(&compiled, &app.keymap()),
+            "compiled again"
+        );
+        assert_eq!(
+            app.keymap().overflow(),
+            Some(&Warning::TooManyKeyBindings { dropped: 2 })
+        );
+        app.apply_config(&two_over, &theme);
+        let same = app.keymap();
+        app.apply_config(&two_over, &theme);
+        assert!(
+            std::sync::Arc::ptr_eq(&same, &app.keymap()),
+            "an equal table is kept"
+        );
+    }
 
     #[test]
     fn every_default_chord_is_canonical_and_bound_once() {

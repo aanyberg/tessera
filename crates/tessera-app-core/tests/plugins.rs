@@ -51,6 +51,8 @@ struct Spec {
     capabilities: Vec<Capability>,
     on_activate: OnActivate,
     panic_on_event: bool,
+    /// Whether `on_event` returns an error (after recording the event).
+    error_on_event: bool,
 }
 
 impl Spec {
@@ -60,6 +62,7 @@ impl Spec {
             capabilities: capabilities.to_vec(),
             on_activate: OnActivate::Succeed,
             panic_on_event: false,
+            error_on_event: false,
         }
     }
 }
@@ -132,6 +135,19 @@ impl Probe {
                 _ => 0,
             })
             .sum()
+    }
+
+    /// The sessions its latest activation was told are open, by id.
+    fn open_set(&self) -> std::collections::BTreeSet<u64> {
+        let mut open = std::collections::BTreeSet::new();
+        for event in &self.seen.lock().unwrap().current {
+            match event {
+                Event::SessionCreated { session } => assert!(open.insert(session.0), "{event:?}"),
+                Event::SessionClosed { session } => assert!(open.remove(&session.0), "{event:?}"),
+                _ => {}
+            }
+        }
+        open
     }
 
     /// Lets one held event through.
@@ -214,6 +230,9 @@ impl Plugin for Probe {
             thread::sleep(Duration::from_millis(1));
         }
         assert!(!self.spec.panic_on_event, "secret-event-panic");
+        if self.spec.error_on_event {
+            return Err(Error::Plugin("secret-event-error".into()));
+        }
         Ok(())
     }
 
@@ -757,6 +776,11 @@ fn erroring_and_panicking_plugins_fail_alone() {
 /// Nothing a plugin or a session wrote reaches the log, at any level: not a
 /// plugin's error text, not its panic message, not a title, not a stored
 /// value.
+/// S8: plugins that fail to activate, panic in an event, store values and
+/// set status items, next to a session that sets a title, log none of
+/// that text (every value here is marked `secret`): the log names a plugin
+/// by its id and an error by its kind, and the panicking plugin's failure
+/// is one warning.
 #[test]
 fn the_log_carries_no_text_a_plugin_or_session_wrote() {
     let root = tempfile::tempdir().unwrap();
@@ -1362,4 +1386,183 @@ fn a_host_outliving_its_activation_is_refused() {
         probe.host().storage_get("kept").unwrap().as_deref(),
         Some(&b"1"[..])
     );
+}
+
+// --- #489: lifecycle events past the cap, the queued head, errors, output ---
+
+/// A plugin held while 1024 sessions' creations and closes fill the queue
+/// (21.1 m3, adversarial cycle 2): the creations and closes that find it
+/// full are dropped, a close whose creation is still queued takes that
+/// creation out, and once the plugin moves again it is told of what it
+/// missed. The sessions it counts open are then exactly the `App`'s.
+#[test]
+fn lifecycle_events_past_the_cap_leave_the_session_count_right() {
+    let root = tempfile::tempdir().unwrap();
+    let probe = Probe::new(Spec::new("test.cap.count", &[Capability::Sessions]));
+    let app = app(&root, &["test.cap.count"], vec![probe.factory()]);
+    wait_for_state(&app, "test.cap.count", PluginState::Active);
+    let open = || app.spawn_test_session(PtySize::new(4, 10)).unwrap();
+    let raw = |id: SessionId| id.get();
+
+    let first = open();
+    wait("the first creation", || probe.open_sessions() == 1);
+    probe.hold_thread(&app, &["test.cap.count"]);
+    // 1 + 2 × 511 + 1 = 1024 lifecycle events: the queue is full of them.
+    let queued = open();
+    for _ in 0..511 {
+        let id = open();
+        app.close_session(id).unwrap();
+    }
+    let last = open();
+    let full = app.plugin_queue_stats();
+    assert_eq!(full.queued, MAX_PLUGIN_EVENTS, "{full:?}");
+    // Dropped: `late`'s creation, `first`'s close (its creation was
+    // delivered).
+    let late = open();
+    app.close_session(first).unwrap();
+    // `queued`'s close takes its queued creation out, which leaves room
+    // for `after_room`.
+    app.close_session(queued).unwrap();
+    let after_room = open();
+    // Both of `brief`'s events are dropped.
+    let brief = open();
+    app.close_session(brief).unwrap();
+    let after = app.plugin_queue_stats();
+    assert_eq!(after.queued, MAX_PLUGIN_EVENTS, "{after:?}");
+    assert_eq!(after.dropped, full.dropped + 5, "{after:?}");
+
+    probe.hold.store(false, Ordering::Relaxed);
+    let want: std::collections::BTreeSet<u64> = [raw(late), raw(last), raw(after_room)].into();
+    wait("the queue to drain", || {
+        app.plugin_queue_stats().queued == 0
+    });
+    wait("the counts to settle", || probe.open_set() == want);
+    // A later turn changes nothing.
+    let check = open();
+    app.close_session(check).unwrap();
+    wait("the check session's close", || {
+        probe.current_holds(&Event::SessionClosed {
+            session: plugin_session(check),
+        })
+    });
+    assert_eq!(probe.open_set(), want);
+    assert_eq!(probe.open_sessions(), 3);
+    for id in [late, last, after_room] {
+        app.close_session(id).unwrap();
+    }
+}
+
+/// 21.1 m4 MX2: a plugin enabled again while a session's creation is still
+/// queued is told of the sessions open as of the queue's head, so it counts
+/// that session once (from the queued creation), not twice.
+#[test]
+fn a_reenabled_plugin_counts_a_session_whose_creation_is_queued_once() {
+    let root = tempfile::tempdir().unwrap();
+    let busy = Probe::new(Spec::new("test.head.busy", &[Capability::Sessions]));
+    let count = Probe::new(Spec::new("test.head.count", &[Capability::Sessions]));
+    let both = ["test.head.busy", "test.head.count"];
+    let app = app(&root, &both, vec![busy.factory(), count.factory()]);
+    wait_for_state(&app, "test.head.busy", PluginState::Active);
+    wait_for_state(&app, "test.head.count", PluginState::Active);
+
+    busy.hold_thread(&app, &both);
+    enable(&app, &["test.head.busy"]);
+    // Queued: `busy` still wants sessions.
+    let session = app.spawn_test_session(PtySize::new(4, 10)).unwrap();
+    enable(&app, &both);
+    busy.hold.store(false, Ordering::Relaxed);
+
+    wait("the second activation", || count.activations() == 2);
+    wait("the creation", || {
+        count.current_holds(&Event::SessionCreated {
+            session: plugin_session(session),
+        })
+    });
+    wait("the queue to drain", || {
+        app.plugin_queue_stats().queued == 0
+    });
+    assert_eq!(count.open_sessions(), 1, "{:?}", count.events());
+    app.close_session(session).unwrap();
+}
+
+/// 21.1 m4 MX13 (S3, S8): an id in `[plugins] enabled` that no linked
+/// plugin has is logged sanitised and escaped, never as written: no escape
+/// sequence or bidi control reaches the log.
+#[test]
+fn an_unknown_enabled_id_is_logged_escaped() {
+    let root = tempfile::tempdir().unwrap();
+    let id = "test.unknown.\u{1b}[2Jmx13\u{202e}\u{7}";
+    let app = app(&root, &[id], vec![]);
+    let logged = warnings_naming("mx13");
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    let line = &logged[0];
+    for raw in ['\u{1b}', '\u{202e}', '\u{7}'] {
+        assert!(!line.contains(raw), "{raw:?} in {line:?}");
+    }
+    assert!(line.contains("test.unknown.[2Jmx13"), "{line:?}");
+    drop(app);
+}
+
+/// 21.1 m4 MX22: a plugin whose `on_event` returns an error keeps running
+/// and gets the events after it; only a panic fails a plugin.
+#[test]
+fn an_event_error_does_not_fail_the_plugin() {
+    let root = tempfile::tempdir().unwrap();
+    let mut spec = Spec::new("test.event.error", &[Capability::Sessions]);
+    spec.error_on_event = true;
+    let probe = Probe::new(spec);
+    let app = app(&root, &["test.event.error"], vec![probe.factory()]);
+    wait_for_state(&app, "test.event.error", PluginState::Active);
+    let first = app.spawn_test_session(PtySize::new(4, 10)).unwrap();
+    let second = app.spawn_test_session(PtySize::new(4, 10)).unwrap();
+    wait("both creations", || probe.open_sessions() == 2);
+    assert_eq!(info(&app, "test.event.error").state, PluginState::Active);
+    assert_eq!(warnings_naming("test.event.error"), Vec::<String>::new());
+    for id in [first, second] {
+        app.close_session(id).unwrap();
+    }
+    wait("both closes", || probe.open_sessions() == 0);
+    assert_eq!(probe.activations(), 1);
+}
+
+/// P11: a session's output reaches the frontend's observer while a plugin
+/// granted sessions is active, and never the plugin host: the plugin is
+/// handed the session's creation and title, no event for its output.
+#[test]
+fn output_reaches_the_frontend_and_not_the_plugins() {
+    let root = tempfile::tempdir().unwrap();
+    let probe = Probe::new(Spec::new("test.output", &[Capability::Sessions]));
+    let app = app(&root, &["test.output"], vec![probe.factory()]);
+    wait_for_state(&app, "test.output", PluginState::Active);
+    let outputs = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&outputs);
+    app.set_observer(Some(Box::new(move |_, event| {
+        if event == tessera_app_core::SessionEvent::Output {
+            seen.fetch_add(1, Ordering::Relaxed);
+        }
+    })));
+    let id = spawn(
+        &app,
+        "printf 'out-1\\n'; printf '\\033]0;p11\\007'; sleep 600",
+    );
+    wait("the title", || {
+        probe
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::TitleChanged { .. }))
+    });
+    wait("the output", || outputs.load(Ordering::Relaxed) > 0);
+    let session = plugin_session(id);
+    assert_eq!(
+        probe.events(),
+        [
+            Event::SessionCreated { session },
+            Event::TitleChanged {
+                session,
+                title: "p11".into()
+            }
+        ]
+    );
+    app.close_session(id).unwrap();
+    app.set_observer(None);
 }

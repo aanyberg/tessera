@@ -55,8 +55,16 @@ working directory `None`: the core keeps no command text, ADR 0039) and
 attach and close. Events are queued for the thread, 1024 at most
 (`MAX_PLUGIN_EVENTS`) for all plugins; when full the newest event is
 dropped and counted, with one counts-only debug log per burst, except that
-`SessionCreated` and `SessionClosed` evict the oldest other event instead,
-so a plugin that counts sessions stays right after a flood. Nothing is
+`SessionCreated` and `SessionClosed` evict the oldest other event instead.
+When the queue holds only lifecycle events, a `SessionClosed` whose
+`SessionCreated` is still queued removes that creation (neither is
+delivered), and any other lifecycle event is dropped and counted; the
+plugin thread's next turn then resyncs each active plugin with
+`sessions`: it delivers `SessionClosed` for every session the plugin was
+told about that is gone and `SessionCreated` for every live one it was
+not, so a plugin that counts sessions stays right after a flood (#489).
+The resync comes ahead of the events still queued; the net set of open
+sessions is right, not the interleaving. Nothing is
 queued while no enabled plugin has `sessions` (and no `ConfigChanged` while
 none is enabled). The reader only locks the queue; it never waits for a
 plugin.
@@ -93,7 +101,9 @@ storage and a status bar in the app.
   stays at 1024 and the overflow is counted
   (`a_slow_plugin_keeps_session_throughput`, release timing step).
 - Events past the queue are lost; a plugin cannot rely on seeing every
-  title or command, only every session's creation and close.
+  title or command, only on its set of open sessions ending right: a
+  session created and closed while the queue was full of lifecycle
+  events may never be reported.
 - A failed plugin needs a config edit to be tried again.
 - `tessera-control` no longer depends on `tessera-protocol` and is no
   longer a workspace dependency (#417); it stays an empty crate for #53.
