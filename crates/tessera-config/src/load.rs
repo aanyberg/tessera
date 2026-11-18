@@ -675,67 +675,100 @@ pub(crate) fn is_invisible(c: char) -> bool {
         .is_some_and(|&(first, _)| first <= c)
 }
 
-/// Deserializes `appearance.cursor_shape` without failing: a value that is
-/// not exactly one of [`CursorShape::as_str`](crate::CursorShape::as_str)
-/// (another spelling, another case, another type) gives the default shape,
-/// and [`invalid_lenient_values`] reports it. So a mistyped shape costs a
+/// A setting whose value is one of a few names, written exactly
+/// (`cursor_shape = "beam"`, `app_appearance = "dark"`): the enums
+/// [`named_values!`] implements, read and reported by the helpers below
+/// (#489 20.5 M4).
+pub(crate) trait Named: Copy + Default + 'static {
+    /// Every value, in the order the documentation lists them.
+    fn values() -> &'static [Self];
+    /// The value as written in `config.toml`.
+    fn name(self) -> &'static str;
+}
+
+/// For an enum of named values (`Type { Variant => "name", … }`): the
+/// constant `ALL` and the functions `as_str`, `from_name` and (with the
+/// `schema` feature) `schema`, a plain string `enum` schema (the derived
+/// one for documented variants, a `oneOf` of `const`s, is a shape
+/// `cargo xtask config-docs` does not render), and the [`Named`] impl
+/// the lenient readers take.
+macro_rules! named_values {
+    ($type:ident { $($variant:ident => $name:literal),+ $(,)? }) => {
+        impl $type {
+            /// Every value, in the order the documentation lists them.
+            pub const ALL: [Self; [$(stringify!($variant)),+].len()] = [$(Self::$variant),+];
+
+            /// The value as written in `config.toml`.
+            #[must_use]
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $name),+
+                }
+            }
+
+            /// The value `name` is written as: exactly
+            #[doc = concat!("[`", stringify!($type), "::as_str`],")]
+            /// no other spelling or case.
+            #[must_use]
+            pub fn from_name(name: &str) -> Option<Self> {
+                Self::ALL.into_iter().find(|value| value.as_str() == name)
+            }
+
+            /// A plain string `enum` schema of [`Self::ALL`].
+            #[cfg(feature = "schema")]
+            fn schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+                let values: Vec<&str> = Self::ALL.iter().map(|value| value.as_str()).collect();
+                schemars::json_schema!({ "type": "string", "enum": values })
+            }
+        }
+
+        impl $crate::load::Named for $type {
+            fn values() -> &'static [Self] {
+                &Self::ALL
+            }
+
+            fn name(self) -> &'static str {
+                self.as_str()
+            }
+        }
+    };
+}
+pub(crate) use named_values;
+
+/// The value of `T` exactly `name`.
+fn named<T: Named>(name: &str) -> Option<T> {
+    T::values()
+        .iter()
+        .copied()
+        .find(|value| value.name() == name)
+}
+
+/// `T`'s names, each quoted, joined by `separator`: `"block", "beam"`.
+fn quoted_names<T: Named>(separator: &str) -> String {
+    let names: Vec<String> = T::values()
+        .iter()
+        .map(|value| format!("\"{}\"", value.name()))
+        .collect();
+    names.join(separator)
+}
+
+/// Deserializes a named setting (`appearance.cursor_shape`,
+/// `appearance.app_appearance`, `general.remote_indicator`) without
+/// failing: a value that is not exactly one of `T`'s names (another
+/// spelling, another case, another type) gives `T`'s default, and
+/// [`invalid_lenient_values`] reports it. So a mistyped value costs a
 /// warning, not the whole configuration.
-pub(crate) fn lenient_cursor_shape<'de, D>(deserializer: D) -> Result<crate::CursorShape, D::Error>
+pub(crate) fn lenient_named<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
+    T: Named,
 {
-    use serde::Deserialize as _;
-
-    let value = toml::Value::deserialize(deserializer)?;
-    Ok(value
-        .as_str()
-        .and_then(crate::CursorShape::from_name)
-        .unwrap_or_default())
-}
-
-/// Deserializes `general.remote_indicator` without failing: a value that
-/// is not exactly one of
-/// [`RemoteIndicator::as_str`](crate::RemoteIndicator::as_str) gives
-/// `"title"`, and [`invalid_lenient_values`] reports it, as for
-/// [`lenient_cursor_shape`].
-pub(crate) fn lenient_remote_indicator<'de, D>(
-    deserializer: D,
-) -> Result<crate::RemoteIndicator, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::Deserialize as _;
-
-    let value = toml::Value::deserialize(deserializer)?;
-    Ok(value
-        .as_str()
-        .and_then(crate::RemoteIndicator::from_name)
-        .unwrap_or_default())
-}
-
-/// Deserializes `appearance.app_appearance` without failing: a value that
-/// is not exactly one of
-/// [`AppAppearance::as_str`](crate::AppAppearance::as_str) gives `"dark"`,
-/// and [`invalid_lenient_values`] reports it, as for
-/// [`lenient_cursor_shape`].
-pub(crate) fn lenient_app_appearance<'de, D>(
-    deserializer: D,
-) -> Result<crate::AppAppearance, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::Deserialize as _;
-
-    let value = toml::Value::deserialize(deserializer)?;
-    Ok(value
-        .as_str()
-        .and_then(crate::AppAppearance::from_name)
-        .unwrap_or_default())
+    Ok(lenient_optional_named(deserializer)?.unwrap_or_default())
 }
 
 /// Deserializes `appearance.cursor_blink` without failing: anything but a
 /// boolean gives the default (`false`), and [`invalid_lenient_values`]
-/// reports it, as for [`lenient_cursor_shape`].
+/// reports it, as for [`lenient_named`].
 pub(crate) fn lenient_cursor_blink<'de, D>(deserializer: D) -> Result<bool, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -743,24 +776,24 @@ where
     Ok(lenient_bool(deserializer)?.unwrap_or(crate::Appearance::default().cursor_blink))
 }
 
-/// Deserializes a profile's `appearance.cursor_shape` without failing: a
-/// value that is not a shape is left unset (so `[appearance]`'s is used),
-/// and [`invalid_lenient_values`] reports it.
-pub(crate) fn lenient_optional_cursor_shape<'de, D>(
-    deserializer: D,
-) -> Result<Option<crate::CursorShape>, D::Error>
+/// Deserializes a profile's named setting (`appearance.cursor_shape`)
+/// without failing: a value that is not one of `T`'s names is left unset
+/// (so `[appearance]`'s is used), and [`invalid_lenient_values`] reports
+/// it.
+pub(crate) fn lenient_optional_named<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
+    T: Named,
 {
     use serde::Deserialize as _;
 
     let value = toml::Value::deserialize(deserializer)?;
-    Ok(value.as_str().and_then(crate::CursorShape::from_name))
+    Ok(value.as_str().and_then(named))
 }
 
 /// Deserializes a profile's `appearance.cursor_blink` without failing:
 /// anything but a boolean is left unset, as for
-/// [`lenient_optional_cursor_shape`].
+/// [`lenient_optional_named`].
 pub(crate) fn lenient_optional_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -789,67 +822,34 @@ where
     Ok(toml::Value::deserialize(deserializer)?.as_bool())
 }
 
-/// The [`Warning::OutOfRange`] for `[general] remote_indicator` when its
-/// value is not one of [`RemoteIndicator::ALL`](crate::RemoteIndicator::ALL),
-/// with where the key is (see [`invalid_lenient_values`]).
-fn invalid_remote_indicator(text: &str, root: &toml::de::DeTable<'_>) -> Option<(usize, Warning)> {
+/// The [`Warning::OutOfRange`] for the named setting `key` of `table`
+/// (`[general] remote_indicator`) when its value is not one of `T`'s
+/// names, with where the key is (see [`invalid_lenient_values`]); the
+/// expected names are joined by `separator`.
+fn invalid_named<T: Named>(
+    text: &str,
+    root: &toml::de::DeTable<'_>,
+    table: &str,
+    key: &str,
+    separator: &str,
+) -> Option<(usize, Warning)> {
     use toml::de::DeValue;
 
-    const REMOTE: &str = "remote_indicator";
-
-    let (at, value) = lookup(root, &[Step::Key("general"), Step::Key(REMOTE)])?;
+    let (at, value) = lookup(root, &[Step::Key(table), Step::Key(key)])?;
     if let DeValue::String(name) = value.get_ref()
-        && crate::RemoteIndicator::from_name(name).is_some()
+        && named::<T>(name).is_some()
     {
         return None;
     }
-    let names: Vec<String> = crate::RemoteIndicator::ALL
-        .iter()
-        .map(|value| format!("\"{}\"", value.as_str()))
-        .collect();
     Some((
         at,
         Warning::OutOfRange {
-            path: format!("general.{REMOTE}"),
+            path: format!("{table}.{key}"),
             detail: format!(
                 "{} replaced by \"{}\" (expected {})",
                 written(text, value),
-                crate::RemoteIndicator::default().as_str(),
-                names.join(" or ")
-            ),
-        },
-    ))
-}
-
-/// The [`Warning::OutOfRange`] for `[appearance] app_appearance` when its
-/// value is not one of [`AppAppearance::ALL`](crate::AppAppearance::ALL),
-/// with where the key is (see [`invalid_lenient_values`]). A profile's
-/// `app_appearance` is not looked at here: it gets the window-level
-/// warning instead ([`WINDOW_APPEARANCE_KEYS`]).
-fn invalid_app_appearance(text: &str, root: &toml::de::DeTable<'_>) -> Option<(usize, Warning)> {
-    use toml::de::DeValue;
-
-    const APP: &str = "app_appearance";
-
-    let (at, value) = lookup(root, &[Step::Key("appearance"), Step::Key(APP)])?;
-    if let DeValue::String(name) = value.get_ref()
-        && crate::AppAppearance::from_name(name).is_some()
-    {
-        return None;
-    }
-    let names: Vec<String> = crate::AppAppearance::ALL
-        .iter()
-        .map(|value| format!("\"{}\"", value.as_str()))
-        .collect();
-    Some((
-        at,
-        Warning::OutOfRange {
-            path: format!("appearance.{APP}"),
-            detail: format!(
-                "{} replaced by \"{}\" (expected {})",
-                written(text, value),
-                crate::AppAppearance::default().as_str(),
-                names.join(", ")
+                T::default().name(),
+                quoted_names::<T>(separator)
             ),
         },
     ))
@@ -870,13 +870,6 @@ fn invalid_lenient_values(text: &str, root: &toml::de::DeTable<'_>) -> Vec<(usiz
     const BLINK: &str = "cursor_blink";
     const CLIPBOARD: &str = "clipboard_write";
 
-    let shape_names = || {
-        let names: Vec<String> = crate::CursorShape::ALL
-            .iter()
-            .map(|shape| format!("\"{}\"", shape.as_str()))
-            .collect();
-        names.join(", ")
-    };
     let profiles = match lookup(root, &[Step::Key("profiles")]) {
         Some((_, value)) => match value.get_ref() {
             DeValue::Array(array) => array.len(),
@@ -908,7 +901,7 @@ fn invalid_lenient_values(text: &str, root: &toml::de::DeTable<'_>) -> Vec<(usiz
         steps.push(Step::Key(SHAPE));
         if let Some((at, value)) = lookup(root, &steps) {
             let valid = match value.get_ref() {
-                DeValue::String(name) => crate::CursorShape::from_name(name).is_some(),
+                DeValue::String(name) => named::<crate::CursorShape>(name).is_some(),
                 _ => false,
             };
             if !valid {
@@ -920,7 +913,7 @@ fn invalid_lenient_values(text: &str, root: &toml::de::DeTable<'_>) -> Vec<(usiz
                             "{} {} (expected {})",
                             written(text, value),
                             instead(&format!("\"{}\"", crate::CursorShape::default().as_str())),
-                            shape_names()
+                            quoted_names::<crate::CursorShape>(", ")
                         ),
                     },
                 ));
@@ -944,8 +937,22 @@ fn invalid_lenient_values(text: &str, root: &toml::de::DeTable<'_>) -> Vec<(usiz
             ));
         }
     }
-    warnings.extend(invalid_app_appearance(text, root));
-    warnings.extend(invalid_remote_indicator(text, root));
+    // A profile's `app_appearance` is not looked at here: it gets the
+    // window-level warning instead ([`WINDOW_APPEARANCE_KEYS`]).
+    warnings.extend(invalid_named::<crate::AppAppearance>(
+        text,
+        root,
+        "appearance",
+        "app_appearance",
+        ", ",
+    ));
+    warnings.extend(invalid_named::<crate::RemoteIndicator>(
+        text,
+        root,
+        "general",
+        "remote_indicator",
+        " or ",
+    ));
     if let Some((at, value)) = lookup(root, &[Step::Key("terminal"), Step::Key(CLIPBOARD)])
         && !matches!(value.get_ref(), DeValue::Boolean(_))
     {

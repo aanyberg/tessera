@@ -264,7 +264,9 @@ the watch has applied each one.
   the index its key paths use from then on. `profiles/` is never written.
 - **The core names it.** The profile is named the first of `name`,
   `name 2`, `name 3`, … that no profile has, entries and profile files
-  together, compared byte for byte (the rule the Settings window used),
+  together, compared byte for byte (the Settings window compared Swift
+  strings, which equal under canonical equivalence; two names that differ
+  only in Unicode normalization now count as different),
   so a new entry never shadows a profile file of the same name (the
   loader keeps the first of a duplicate name, and entries come first).
   The name goes back in `name_buf`, which must hold
@@ -293,3 +295,67 @@ the watch has applied each one.
   with `N` the entry count still adds an entry when there are no profile
   files, so a caller without them is unchanged; with files the app uses
   the export.
+
+## Amendment: every loader cap, failing files and stale temporary files (#449, #324, 2026-11-18)
+
+- **One table of caps.** An edit is checked by loading the edited copy,
+  so an item the loader never reads cannot be checked. Every cap at which
+  the loader stops reading is a row of one table in `edit.rs`
+  (`LOADER_CAPS`), and a test iterates the table, picking each row's flood
+  test by an exhaustive match: a profile from the 257th (`MAX_PROFILES`),
+  a smart rule from the 65th (`MAX_SMART_RULES`), a `[keys]` entry from
+  the 513th in document order (`MAX_KEY_BINDINGS`, a new key at 512
+  entries too, since it would go last). A set or remove there is
+  `Unsupported` with "past the loader's cap of N", whatever the value;
+  the item before the cap is checked as before. The fourth row, the 64
+  listed unknown keys (`MAX_UNKNOWN_KEY_WARNINGS`), refuses nothing by
+  index: the hidden ones count as present and a new key in an unknown
+  table is probed alone (the #430 amendment).
+- **A file the loader fails on.** A value of the wrong type fails the
+  whole load. An edit that leaves the file failing is refused, as before.
+  One that makes it load repairs it, as before, when it sets or removes a
+  scalar (`opacity = "x"`, `confirm_close = "yes"`, `theme = 3`): nothing
+  of the user's is lost. It is refused with the loader's error for the
+  file (`EditError::Invalid`, `TESSERA_ERROR_REFUSED`) when it would
+  replace a list or table the loader rejected: the value at the error's
+  offset is an array or table, or its key holds one by default or after
+  the edit, and the edit's path is at, under or above it. So the Plugins
+  toggle's set of `[plugins] enabled = "x"`, `3` or `["a", 1]` keeps the
+  user's ids, and so do its remove, the remove of `[plugins]` and a set of
+  one element; nothing is written. The value at the offset is the
+  innermost one, found through inline tables and the inline-table
+  elements of an inline array: `command = 3` in
+  `profiles = [{ name = "Work", command = 3 }]`, or a smart rule's
+  `precision = 7`, is a scalar and is repaired; an element of a list of
+  scalars or arrays is that list. An error that points into no value is
+  treated as a list. `ConfigEditor::replace` is the one way to replace a
+  rejected list, for an action where the user asked to replace it; it has
+  no C export yet. This settles #48b adversarial m2.
+- **Stale temporary files.** This replaces "It is not swept" in the #324
+  amendment. After a save renames its own temporary file, it removes the
+  ones a crashed edit of the same target left: names exactly
+  `.<target name>.<pid>.<n>.edit` (pid up to 10 digits, `n` up to 20), a
+  regular file by `lstat` (a symlink or directory of that name is kept and
+  never followed), owned by the uid of the save's own temporary file, and
+  a pid other than the editor's own that `/bin/ps -p` does not find (the
+  crate has no `unsafe`, so no `kill(pid, 0)`; a failed `ps` keeps the
+  file). At most 16 candidates are checked per save
+  (`MAX_STALE_EDITS_SWEPT`) of at most 4096 directory entries
+  (`MAX_STALE_SWEEP_ENTRIES`, S5); the rest wait for the next save. A pid
+  reused by a running process keeps its file until that process exits.
+  The delete path stays inside the configuration directory, by the same
+  name pattern the editor creates.
+- **Extended attributes and ACLs** (#324 item 7) stay not carried over:
+  copying them needs `unsafe` calls the crate does not make (S7). Accepted.
+- **Accepted as they are** (#324): item 11, the Settings window writes on
+  its serial background queue (`SettingsModel.writeQueue`), never on the
+  main thread; items 13 and 23, the cosmetic placements listed in the #324
+  amendment.
+- **A NUL in a profile's `command` or `working_directory`** is dropped by
+  the loader with a warning, as if unset, so an edit that would write one
+  is refused.
+- **`tessera_config_add_profile`.** Every out-pointer that is not `NULL`
+  is 0 before any pointer is checked. A member given twice takes its last
+  value, `"name"` too (serde_json's object; the C side has no duplicate
+  check), and the keys are set in byte order of their paths. The key path
+  cap is checked on the full path after `profiles[N].`.

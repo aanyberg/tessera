@@ -251,7 +251,7 @@ The rest of #348 and the Rust half of what #317 still listed.
   escaped and capped at 4106 bytes (`MAX_ENTRY_VALUE_TEXT_LEN`, the
   `send_text:` prefix plus 4096); `warning` is the entry's warning or
   `null`.
-* **Effects.** `bound` (it took effect: a command, a text or `ignore`),
+* **Effects.** `bound` (it took effect: a command, a text or `none`),
   `unbound` (an `unbound` entry that removed a default), `shadowed` (an
   earlier entry for the same chord took effect, the first entry wins as
   in #317; an `unbound` entry after a binding included, with the "same

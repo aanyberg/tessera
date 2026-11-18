@@ -103,7 +103,7 @@ pub struct ProfileAppearance {
     /// `[appearance] cursor_shape`. Any other value is reported with a
     /// warning and `[appearance]`'s shape is used.
     #[serde(
-        deserialize_with = "load::lenient_optional_cursor_shape",
+        deserialize_with = "load::lenient_optional_named",
         skip_serializing_if = "Option::is_none"
     )]
     #[cfg_attr(feature = "schema", schemars(schema_with = "CursorShape::schema"))]
@@ -256,6 +256,19 @@ pub(crate) fn cap_profiles(config: &mut Config, warnings: &mut Vec<Warning>) {
                 detail: "holds a NUL character, replaced with U+FFFD".into(),
             });
             profile.name = profile.name.replace('\0', "\u{fffd}");
+        }
+        // No program takes a NUL in an argument or a path: the session
+        // would fail to start it (#312 adversarial M1).
+        for (key, value) in [
+            ("command", &mut profile.command),
+            ("working_directory", &mut profile.working_directory),
+        ] {
+            if value.take_if(|v| v.contains('\0')).is_some() {
+                warnings.push(Warning::OutOfRange {
+                    path: format!("profiles[{i}].{key}"),
+                    detail: "holds a NUL character; ignored".into(),
+                });
+            }
         }
         if profile.name.len() > MAX_PROFILE_NAME_LEN {
             let mut end = MAX_PROFILE_NAME_LEN;

@@ -974,6 +974,19 @@ mod tests {
         assert!(s.len() <= MAX_SLUG_LEN && !s.ends_with('-'), "{s}");
     }
 
+    /// #489 21.0b m2: two names without a slug match only when equal
+    /// ignoring case: `"!!!"` and `"???"` both slug to `None`, which is not
+    /// a slug they share.
+    #[test]
+    fn names_without_a_slug_match_only_by_case() {
+        let bangs = NameKey::of("!!!");
+        assert!(bangs.matches(&NameKey::of("!!!")));
+        assert!(!bangs.matches(&NameKey::of("???")));
+        assert!(!NameKey::of("???").matches(&bangs));
+        assert!(NameKey::of("Nord").matches(&NameKey::of("nord")));
+        assert!(NameKey::of("Solarized Dark").matches(&NameKey::of("solarized-dark")));
+    }
+
     #[test]
     fn hex_digits_of_both_cases() {
         assert_eq!(

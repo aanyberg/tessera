@@ -1016,6 +1016,47 @@ mod tests {
     use super::*;
     use crate::load::DEFAULT_IGNORABLE;
 
+    /// #489 21.3 m2: two tables with the same bindings differ when a
+    /// refused entry or the overflow differs, so a reload that changes
+    /// only those is not taken as no change.
+    #[test]
+    fn tables_differ_by_refused_entries_and_overflow() {
+        let a = Keys::from_entries([("cmd+e", "new_tab"), ("cmd+nosuchkey", "copy")]);
+        let b = Keys::from_entries([("cmd+e", "new_tab"), ("cmd+nosuchkey", "paste")]);
+        assert_eq!(a.bindings(), b.bindings());
+        assert!(matches!(a.entries()[1], KeyEntry::Refused(_)), "{a:?}");
+        assert_ne!(a, b);
+        assert_eq!(a, a.clone());
+        let keys: Vec<String> = ('a'..='z')
+            .chain('0'..='9')
+            .map(String::from)
+            .chain((1..=35).map(|n| format!("f{n}")))
+            .collect();
+        let mods = [
+            "",
+            "ctrl+",
+            "alt+",
+            "shift+",
+            "ctrl+alt+",
+            "ctrl+shift+",
+            "alt+shift+",
+            "ctrl+alt+shift+",
+        ];
+        let chords: Vec<String> = mods
+            .iter()
+            .flat_map(|m| keys.iter().map(move |k| format!("cmd+{m}{k}")))
+            .collect();
+        assert!(chords.len() > MAX_KEY_BINDINGS + 1);
+        let table = |count: usize| {
+            Keys::from_entries(chords.iter().take(count).map(|c| (c.as_str(), "new_tab")))
+        };
+        let (one, two) = (table(MAX_KEY_BINDINGS + 1), table(MAX_KEY_BINDINGS + 2));
+        assert_eq!(one.bindings(), two.bindings());
+        assert_eq!(one.entries(), two.entries());
+        assert_ne!(one.overflow(), two.overflow());
+        assert_ne!(one, two);
+    }
+
     #[test]
     fn modifier_bits_match_the_terminal() {
         // tessera_term::Modifiers: SHIFT 1, ALT 2, CTRL 4, SUPER 8.

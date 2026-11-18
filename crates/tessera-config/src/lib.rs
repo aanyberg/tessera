@@ -274,7 +274,7 @@ pub struct General {
     /// no such report; `"off"` shows titles unchanged. Applies to open
     /// tabs when the file changes. Any other value is reported with a
     /// warning and `"title"` is used.
-    #[serde(deserialize_with = "load::lenient_remote_indicator")]
+    #[serde(deserialize_with = "load::lenient_named")]
     #[cfg_attr(feature = "schema", schemars(schema_with = "RemoteIndicator::schema"))]
     pub remote_indicator: RemoteIndicator,
 }
@@ -300,33 +300,10 @@ pub enum RemoteIndicator {
     Off,
 }
 
-impl RemoteIndicator {
-    /// Every value, in the order the documentation lists them.
-    pub const ALL: [Self; 2] = [Self::Title, Self::Off];
-
-    /// The value as written in `config.toml`.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Title => "title",
-            Self::Off => "off",
-        }
-    }
-
-    /// The value `name` is written as: exactly
-    /// [`RemoteIndicator::as_str`], no other spelling or case.
-    #[must_use]
-    pub fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|value| value.as_str() == name)
-    }
-
-    /// A plain string `enum` schema, as for [`CursorShape`].
-    #[cfg(feature = "schema")]
-    fn schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        let values: Vec<&str> = Self::ALL.iter().map(|value| value.as_str()).collect();
-        schemars::json_schema!({ "type": "string", "enum": values })
-    }
-}
+load::named_values!(RemoteIndicator {
+    Title => "title",
+    Off => "off",
+});
 
 /// Visual settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -384,7 +361,7 @@ pub struct Appearance {
     /// (DECSCUSR, `CSI Ps SP q`, as vim and fish do); it returns to this
     /// one when the program asks for the default or resets the terminal.
     /// Any other value is reported with a warning and the default is used.
-    #[serde(deserialize_with = "load::lenient_cursor_shape")]
+    #[serde(deserialize_with = "load::lenient_named")]
     #[cfg_attr(feature = "schema", schemars(schema_with = "CursorShape::schema"))]
     pub cursor_shape: CursorShape,
     /// Whether the cursor blinks, unless a program says otherwise (as for
@@ -413,7 +390,7 @@ pub struct Appearance {
     /// other value is reported with a warning and `"dark"` is used. Set it
     /// here only: in a profile's `appearance` it is ignored with a
     /// warning, since it applies to the whole app.
-    #[serde(deserialize_with = "load::lenient_app_appearance")]
+    #[serde(deserialize_with = "load::lenient_named")]
     #[cfg_attr(feature = "schema", schemars(schema_with = "AppAppearance::schema"))]
     pub app_appearance: AppAppearance,
 }
@@ -433,34 +410,11 @@ pub enum AppAppearance {
     System,
 }
 
-impl AppAppearance {
-    /// Every value, in the order the documentation lists them.
-    pub const ALL: [Self; 3] = [Self::Dark, Self::Light, Self::System];
-
-    /// The value as written in `config.toml`.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Dark => "dark",
-            Self::Light => "light",
-            Self::System => "system",
-        }
-    }
-
-    /// The value `name` is written as: exactly [`AppAppearance::as_str`],
-    /// no other spelling or case.
-    #[must_use]
-    pub fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|value| value.as_str() == name)
-    }
-
-    /// A plain string `enum` schema, as for [`CursorShape`].
-    #[cfg(feature = "schema")]
-    fn schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        let values: Vec<&str> = Self::ALL.iter().map(|value| value.as_str()).collect();
-        schemars::json_schema!({ "type": "string", "enum": values })
-    }
-}
+load::named_values!(AppAppearance {
+    Dark => "dark",
+    Light => "light",
+    System => "system",
+});
 
 /// The cursor's shape (`[appearance] cursor_shape`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -475,34 +429,11 @@ pub enum CursorShape {
     Beam,
 }
 
-impl CursorShape {
-    /// Every value, in the order the documentation lists them.
-    pub const ALL: [Self; 3] = [Self::Block, Self::Underline, Self::Beam];
-
-    /// The value as written in `config.toml`.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Block => "block",
-            Self::Underline => "underline",
-            Self::Beam => "beam",
-        }
-    }
-
-    /// The shape `name` is written as: exactly [`CursorShape::as_str`],
-    /// no other spelling or case.
-    #[must_use]
-    pub fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|shape| shape.as_str() == name)
-    }
-
-    /// A plain string `enum` schema, as for [`ShellIntegration`].
-    #[cfg(feature = "schema")]
-    fn schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        let values: Vec<&str> = Self::ALL.iter().map(|value| value.as_str()).collect();
-        schemars::json_schema!({ "type": "string", "enum": values })
-    }
-}
+load::named_values!(CursorShape {
+    Block => "block",
+    Underline => "underline",
+    Beam => "beam",
+});
 
 impl Appearance {
     /// Smallest `font_size` accepted; smaller values are raised on load.
@@ -589,28 +520,10 @@ pub enum ShellIntegration {
     Off,
 }
 
-impl ShellIntegration {
-    /// Every value, in the order the documentation lists them.
-    pub const ALL: [Self; 2] = [Self::Auto, Self::Off];
-
-    /// The value as written in `config.toml`.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Off => "off",
-        }
-    }
-
-    /// A plain string `enum` schema: the derived one for documented
-    /// variants (`oneOf` of `const`s) is a shape `cargo xtask config-docs`
-    /// does not render.
-    #[cfg(feature = "schema")]
-    fn schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        let values: Vec<&str> = Self::ALL.iter().map(|value| value.as_str()).collect();
-        schemars::json_schema!({ "type": "string", "enum": values })
-    }
-}
+load::named_values!(ShellIntegration {
+    Auto => "auto",
+    Off => "off",
+});
 
 impl Terminal {
     /// Upper bound for `scrollback_lines`; larger values are capped on load.
@@ -649,14 +562,16 @@ pub struct Profile {
     /// your home directory instead, with a line in the new session saying
     /// so. A command with a space is started by `/bin/sh`, which always
     /// exists: when the program it names is missing, the shell reports it
-    /// in the session and exits, with no fallback.
+    /// in the session and exits, with no fallback. A command with a NUL
+    /// character is ignored with a warning, as if unset.
     pub command: Option<String>,
     /// Starting directory; `~` at the start is your home directory. A
     /// directory that does not exist falls back to your home directory
     /// with a warning; one that exists but cannot be entered starts your
     /// login shell in your home directory, with a line in the new session
     /// saying so. Used only when the session is not given a directory of
-    /// its own; unset means your home directory.
+    /// its own; unset means your home directory. One with a NUL character
+    /// is ignored with a warning, as if unset.
     pub working_directory: Option<String>,
     /// Appearance for this profile's sessions: each key set here replaces
     /// the one in `[appearance]`, each key left out follows `[appearance]`
