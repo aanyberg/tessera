@@ -64,6 +64,20 @@ test, and a test that turns one on puts the pin back in its tearDown. A
 view's VoiceOver monitor is the machine's until a test replaces it, so a
 test that needs a client attached sets a detached fake first.
 
+## Timing tests and the `timing` group
+
+A test with a wall-clock bar (a latency, a lock hold, a ratio of two costs) joins the `timing` test group in
+`.config/nextest.toml`, so nextest runs it alone and a loaded machine cannot fail it by running two of them at once.
+Add an override with a `filter` that names the package, the binary and the test, and a one-line comment that says what
+the bar is and which issue set it. The groups today cover the config reload, shaping, close and writer bounds, the
+DECSCUSR flood, the theme-edit bound, the search caps (including `the_kept_copy_and_its_spares_stay_within_the_cap`,
+which failed at load 35 before it fixed its budget), the plugin host throughput and the rectangle cost bars: the `b02_*`
+tests of `tests/rect.rs` and the two cluster bars of `tests/rect_fixes.rs`. Release-only bars are also listed in the
+quality gate's release timing step (`release_timing` in `scripts/quality-gate.sh`); a bar added to one place belongs in
+the other, and `cargo nextest list --release --run-ignored all -E 'test(<name>)'` shows that the filter finds it.
+`scripts/verify-branch.sh` runs the suites such an override names, in a changed package, ten times each, so a new bar
+is exercised under load before it merges.
+
 ## Adding an escape-sequence test
 
 Emulator tests in `crates/tessera-term/tests/` feed bytes into a fresh

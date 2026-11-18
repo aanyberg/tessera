@@ -31,7 +31,7 @@ a low-risk change.
 | Escape sequences from the child: parser, OSC, DCS, replies, titles, clipboard, marks, cwd | `tessera-vt`, `tessera-term`, the session event path in `tessera-app-core` | S1, S2, S3, S5, S6 |
 | Paste and clipboard, Copy with Formatting (child text turned into HTML and RTF, ADR 0042) | `tessera-app-core` input and paste, `rich_text.rs`, the app's pasteboard bridge | S4, S5 |
 | Child-controlled text in the UI: titles, process names, URLs | `tessera-app-core` (`url.rs`), `apps/macos` | S3 |
-| Opening links (ADR 0027 and its amendments): a Command-click opens only `http`, `https`, `mailto`, `ftp` and local `file` URLs; a local file that would run, install or import something (Launch Services' `LSRiskCategoryUnsafeExecutable` list and installer packages, a risky or agent default handler, an `OpenWith` attribute, an app, alias, symbolic link, executable, script, stored URL, disk image, profile or certificate) is shown in Finder instead; the file system and Launch Services are asked only on the click | `apps/macos` (`LinkOpening.swift`, `TerminalSurfaceView.swift`) | S9 |
+| Opening links (ADR 0027 and its amendments): a Command-click opens only `http`, `https`, `mailto`, `ftp` and local `file` URLs; a local file that would run, install or import something (Launch Services' `LSRiskCategoryUnsafeExecutable` list and installer packages, a risky or agent default handler, an `OpenWith` attribute, an app, alias, symbolic link named by the click (`dirlink/.` and `dirlink/../x` are judged on the target they reach, which is harmless), executable, script, stored URL, disk image, profile or certificate) is shown in Finder instead; the file system and Launch Services are asked only on the click | `apps/macos` (`LinkOpening.swift`, `TerminalSurfaceView.swift`) | S9 |
 | The C ABI | `tessera-ffi`, the TesseraKit wrapper | S7 |
 | Spawning the child: environment, fds, signals, foreground job | `tessera-pty`, `tessera-shell-integration` | S5, S7 |
 | Parsing and writing files: config, profile files (`profiles/*.toml`, ADR 0037, read only: nothing in `profiles/` is ever written, and an edit of a file's profile is refused), themes, imports. Settings write-back (ADR 0040) writes `config.toml` and `themes/` only through a new temporary file in the target's directory, renamed (or hard-linked, for a theme) only while the file is byte for byte what was read, through a symlink to its target, with the mode kept; a hard-linked, read-only or non-regular file is not written; every edit passes the lenient loader without a new warning first | `tessera-config` (`edit.rs`, `profile_files.rs`, `watch.rs`), `tessera-devtool`, the config exports in `tessera-ffi` (`config.rs`) | S3, S5, S7, S8 |
@@ -155,7 +155,13 @@ Tracked: churn and leak checks for Rust, FFI and the app (#214); FFI fuzzing, AS
   bracketed paste runs every line, and the child inherits the app's whole environment (#217).
 - Link opening (ADR 0027, #437): a local file whose default handler is a regular third-party app opens with it,
   whatever that app does with it (a `.torrent`, a `.skill`); only system apps that run, install or import, and agent
-  apps, are judged risky by name.
+  apps, are judged risky by name. Also trusted by that rule, so not named: Excel for macro add-ins (`.xlam`, `.xla`,
+  `.xlm`) and Distiller for `.ps` and `.eps`; third-party terminals (iTerm2, Warp and the like; the types they run are
+  caught by the type rules); VoiceOver Utility, AirPort Utility (`.basebinary`) and Certificate Assistant
+  (`.certAuthorityConfig`, `.certSigningRequest`); and first-party import flows beyond `.vcf` and `.ics`: Notes
+  (`.enex`, `.notesairdropdocument`), Journal (`.journalarchive`) and Mail (`.mbox`, `.imapmbox`, `.ewsmbox` folders). The
+  other way, some harmless files are revealed in Finder instead of opened: `.spx` (System Information is an agent app),
+  `*.service`, `*.tool` and `*.menu` files (on Apple's list), and files with a per-file Open With set in Finder.
 - An unknown OSC command's bytes are traced uncapped (`crates/tessera-term/src/osc.rs`; S8). No subscriber is
   installed in the app today, so nothing is written.
 - The app ships Developer ID signed and notarized when the six release secrets exist, ad-hoc signed and not

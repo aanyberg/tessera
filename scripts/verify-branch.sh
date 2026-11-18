@@ -7,8 +7,9 @@
 #
 # Checks, each printed as PASS, WARN, FAIL or skip:
 #   stale     first, before the gate and the load runs: FAIL (and stop) when the worktree is dirty and its target/ holds
-#             build output newer than the last commit, usually a mutant built by a critic into this worktree (#446): a
-#             load or gate run would test it and report failures that do not exist. A clean worktree is never checked.
+#             build output newer than the last commit (up to four levels deep), usually a mutant built by a critic into
+#             this worktree (#446): a load or gate run would test it and report failures that do not exist. A clean
+#             worktree is never checked, and neither is a CARGO_TARGET_DIR outside the worktree (shared: `skip`).
 #   gate      scripts/quality-gate.sh exits 0 (reuses a recorded pass for the same commit, toolchain and gate script)
 #   clean     the worktree has no uncommitted or untracked changes
 #   app-test  when the branch changes apps/macos (other than *.md): FAIL unless `just app-test` recorded a pass for HEAD
@@ -192,12 +193,17 @@ skip() { print -P "%F{cyan}skip%f $1"; }
 fail() { print -P "%F{red}FAIL%f $1"; failed=1; }
 
 # stale: a dirty worktree whose target/ was built after the last commit. A critic's mutant built into this target/ is
-# still there: the gate and the load runs would test it. One find over the build outputs' depth (target/<profile>/deps).
+# still there: the gate and the load runs would test it. One find over the build outputs: target/<profile>/deps is
+# depth 3, target/<triple>/<profile>/deps depth 4 (a mutant built for another triple was missed at depth 3). A
+# CARGO_TARGET_DIR outside the worktree is shared with other worktrees, whose builds are always newer than this commit:
+# it says nothing about this worktree, so the check is skipped for it with a `skip` line (#489, 21.0c m1, m2).
 if [[ -n "$(git status --porcelain)" ]]; then
     target_dir="${CARGO_TARGET_DIR:-$PWD/target}"
-    if [[ -d "$target_dir" ]]; then
+    if [[ -n "${CARGO_TARGET_DIR:-}" && "${target_dir:A}" != "${PWD:A}"/* ]]; then
+        skip "stale (CARGO_TARGET_DIR $target_dir is outside the worktree: build output there says nothing about this tree)"
+    elif [[ -d "$target_dir" ]]; then
         committed="$(git log -1 --format=%ct HEAD)"
-        newer="$(find "$target_dir" -maxdepth 3 -type f -newermt "$(date -r "$committed" '+%Y-%m-%d %H:%M:%S')" -print -quit 2>/dev/null)"
+        newer="$(find "$target_dir" -maxdepth 4 -type f -newermt "$(date -r "$committed" '+%Y-%m-%d %H:%M:%S')" -print -quit 2>/dev/null)"
         if [[ -n "$newer" ]]; then
             fail "stale: the worktree is dirty and $target_dir holds build output newer than the last commit ($newer): a left-over mutant would fail the gate and the load runs for no reason. Run \`git status\`, restore or commit the changes, and \`cargo clean -p <crate>\` for the crate that was changed (or use a clean worktree), then run again."
             git status --short | head -20

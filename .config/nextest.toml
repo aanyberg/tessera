@@ -99,7 +99,13 @@ test-group = 'timing'
 # Release-only cost bars of the rectangular area operations (#251, B02) and of a config edit among 20 000 mark-like lines
 # (#324), run by the gate's release timing step.
 [[profile.default.overrides]]
-filter = '(package(tessera-term) & binary(=rect) & test(b02_)) | (package(tessera-config) & binary(=edit) & test(=an_edit_among_many_mark_like_lines_is_fast))'
+filter = '(package(tessera-term) & binary(=rect) & test(b02_)) | (package(tessera-term) & binary(=rect_fixes) & (test(a_self_copy_of_a_screen_of_clusters_) | test(a_shifted_partial_copy_over_clusters_))) | (package(tessera-config) & binary(=edit) & test(=an_edit_among_many_mark_like_lines_is_fast))'
+test-group = 'timing'
+
+# The search cap test (#447, #489): a pass with a late piece keeps no copy, so under load it asserted on a stall rather
+# than on the cap (it failed 33 of 200 runs at load 35 before it fixed its budget); it still runs alone.
+[[profile.default.overrides]]
+filter = 'package(tessera-app-core) & kind(lib) & test(=search::tests::the_kept_copy_and_its_spares_stay_within_the_cap)'
 test-group = 'timing'
 
 # Device loss through a full Metal command queue (#84): ~1.1 GB each.

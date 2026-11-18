@@ -8,6 +8,20 @@ set -euo pipefail
 dir="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
 cd "$dir"
 
+# Scratch directories of this run, removed on every way out. The EXIT trap alone is not enough: zsh skips it when the
+# script is killed with TERM (the gate's watchdog does that), so TERM, INT and HUP run the cleanup and exit with the
+# conventional 128 + signal status. The traps are set before the first directory is made, so a failure between the
+# mktemp and a later line leaves nothing behind either (#489, 21.1 n2).
+out_dir="" config_dir=""
+cleanup() {
+    [[ -z "$out_dir" ]] || rm -rf "$out_dir"
+    [[ -z "$config_dir" ]] || rm -rf "$config_dir"
+}
+trap cleanup EXIT
+trap 'cleanup; trap - EXIT; exit 143' TERM
+trap 'cleanup; trap - EXIT; exit 130' INT
+trap 'cleanup; trap - EXIT; exit 129' HUP
+
 cargo build -p tessera-ffi
 # build.rs always writes the header under the workspace's own target/; the
 # library follows CARGO_TARGET_DIR when it is set.
@@ -33,7 +47,6 @@ esac
 # tessera_app_new reads and watches its configuration directory (#100): the
 # tests use a scratch one, never the user's.
 config_dir="$(mktemp -d)"
-trap 'rm -rf "$config_dir" "$out_dir"' EXIT
 export TESSERA_CONFIG_DIR="$config_dir"
 
 for test in lifecycle input keymap scroll clipboard remote selection selection_rich search prompts foreground config appearance plugins accessibility surface; do

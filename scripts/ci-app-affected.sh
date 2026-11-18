@@ -9,7 +9,7 @@
 # The app links the xcframework built from tessera-ffi, so a Rust change anywhere in the crates that tessera-ffi
 # depends on can break the hosted Swift tests (an FFI JSON shape did, wave 21 #452). The job is skipped ONLY when
 # every changed path is skip-eligible:
-#   docs/**, *.md, LICENSE*, xtask/**, fuzz/**, .github/ISSUE_TEMPLATE/**
+#   docs/**, *.md, LICENSE* (not under a src/ directory), xtask/**, fuzz/**, .github/ISSUE_TEMPLATE/**
 #   <crate>/tests/**, <crate>/benches/** for every workspace crate
 #   scripts/** except scripts/app-test-watchdog.sh (just app-test runs it) and scripts/rustc-wrapper.sh (every cargo
 #       build runs it through .cargo/config.toml)
@@ -82,8 +82,16 @@ clean=()
 for p in ${paths[@]+"${paths[@]}"}; do [[ -n "$p" ]] && clean+=("$p"); done
 if (( ${#clean[@]} == 0 )); then echo false; exit 0; fi
 
-cr="$(crates)" || failsafe "could not compute the crate list"
-[[ -n "$cr" ]] || failsafe "empty crate list"
+# The crate list (cargo metadata and jq) is computed only when a path needs it: a change of docs and scripts alone never
+# runs cargo, so a runner that cannot satisfy the toolchain cannot turn a docs-only PR into a full macOS run (#489,
+# 21.0d m1). Any failure to compute it still prints `true`.
+cr="" cr_loaded=""
+load_crates() {
+    [[ -z "$cr_loaded" ]] || return 0
+    cr="$(crates)" || failsafe "could not compute the crate list"
+    [[ -n "$cr" ]] || failsafe "empty crate list"
+    cr_loaded=1
+}
 
 # Skip-eligible? 0 = yes (cannot affect the app), 1 = no.
 skippable() {
@@ -92,9 +100,13 @@ skippable() {
         /*|../*|*/../*|..) return 1 ;;
         apps/*|justfile|Cargo.toml|Cargo.lock|.cargo/*|rust-toolchain*|.github/workflows/*) return 1 ;;
         scripts/app-test-watchdog.sh|scripts/rustc-wrapper.sh) return 1 ;;
-        docs/*|*.md|LICENSE*|*/LICENSE*|xtask/*|fuzz/*|.github/ISSUE_TEMPLATE/*) return 0 ;;
-        scripts/*) return 0 ;;
+        docs/*|xtask/*|fuzz/*|.github/ISSUE_TEMPLATE/*|scripts/*) return 0 ;;
+        # A markdown or LICENSE file inside a crate's src/ can be `include_str!`ed or `include_bytes!`ed: it goes through
+        # the crate rules below (the job runs for a closure crate), never through the docs rule (21.0d m2).
+        */src/*) ;;
+        *.md|LICENSE*|*/LICENSE*) return 0 ;;
     esac
+    load_crates
     local line dir state best="" best_state=""
     while IFS= read -r line; do
         dir="${line% *}"; state="${line##* }"

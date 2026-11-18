@@ -22,6 +22,8 @@ jobs:
     name: Changed paths
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
     outputs:
       app: ${{ steps.decide.outputs.app }}
     steps:
@@ -33,14 +35,21 @@ jobs:
           EVENT: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
+          # The script's reason for a fail-safe `true` (no cargo, no jq, a bad ref) is on stderr: keep it in the job
+          # summary as well as the log, so a docs-only PR that ran the macOS job says why.
+          why="$RUNNER_TEMP/ci-app-affected.err"
           if [ "$EVENT" != pull_request ]; then
             app=true
           else
-            app="$(scripts/ci-app-affected.sh --base "$BASE_SHA" --head HEAD)"
+            app="$(scripts/ci-app-affected.sh --base "$BASE_SHA" --head HEAD 2> "$why")" || app=true
+            cat "$why" >&2
           fi
           case "$app" in true|false) ;; *) echo "unexpected decision: $app" >&2; app=true ;; esac
           echo "app=$app" >> "$GITHUB_OUTPUT"
           echo "macOS app job: $app" >> "$GITHUB_STEP_SUMMARY"
+          if [ -s "$why" ]; then
+            { echo; echo '```'; cat "$why"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   rust:
     name: Rust (stable)
@@ -88,11 +97,22 @@ jobs:
       - run: brew install just cbindgen xcodegen
       - run: sudo xcode-select -s /Applications/Xcode_16.4.app || true
       - run: just app
-      # 30 minutes: macos-15 hits the fork deadlock of #278 (and the `Coverage::build` close stacks of #443) in this step;
-      # each hang costs the watchdog's 150 s plus a restart, and 6 hangs in 3 runs passed 18 minutes. Fixing the hangs
-      # is #278 and #443; this only keeps a run that recovers from being cut off.
+      # 30 minutes: macos-15 hits the fork deadlock of #278 in this step (its partner in #443 is AppKit's NSPersistentUI
+      # queue); each hang costs the watchdog's 150 s plus a restart, and 6 hangs in 3 runs passed 18 minutes. Fixing the
+      # hangs is #278 and #443; this only keeps a run that recovers from being cut off.
       - run: just app-test
         timeout-minutes: 30
+      # The console shows only the first line of a compiler error (wave 21: three toolchain differences were read from
+      # it): on a failure, print the last 30 lines of each xcodebuild log. The full logs are uploaded below.
+      - name: Tail of the app test logs
+        if: failure()
+        run: |
+          shopt -s nullglob
+          for log in apps/macos/build/app-test*.log; do
+            echo "::group::last 30 lines of $log"
+            tail -n 30 "$log"
+            echo "::endgroup::"
+          done
       # After a failed, timed-out or cancelled test step the full xcodebuild logs name the hanging test (#121). The
       # step limit (30 min) is below the job limit (37 min), so this step still runs after a step timeout.
       - name: Upload app test logs

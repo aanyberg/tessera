@@ -62,6 +62,10 @@ check true  "docs and src mix, src first"  crates/core/src/lib.rs docs/a.md
 check true  "leaf and app mix"             crates/leaf/src/lib.rs apps/macos/project.yml
 check true  "a path with spaces (src)"     "crates/core/src/with space.rs"
 check true  "crate dir prefix is not a match" crates/core2/src/lib.rs
+check true  "a LICENSE-named file in a closure crate src" crates/core/src/LICENSE_x.rs
+check true  "markdown in a closure crate src (include_str)" crates/core/src/notes.md
+check false "markdown in a leaf crate src"  crates/leaf/src/notes.md
+check true  "a quoted control-character path (git quotes it)" '"docs/a\tb.md"'
 
 # git modes: rename, delete, empty diff, bad ref
 work="$(mktemp -d "${TMPDIR:-/tmp}/ci-app-affected-test.XXXXXX")"
@@ -94,9 +98,13 @@ unset TESSERA_CI_CRATES
 if command -v cargo >/dev/null && command -v jq >/dev/null; then
     root="$(cd "$(dirname "$script")/.." && pwd)"
     real() { (cd "$root" && printf '%s\n' "$@" | "$script" --stdin 2>/dev/null); }
-    [[ "$(real crates/tessera-ffi/src/lib.rs)" == true ]] && echo "ok   real: tessera-ffi src" || { echo "FAIL real: tessera-ffi src"; failures=$((failures + 1)); }
-    [[ "$(real crates/tessera-vt/src/lib.rs)" == true ]] && echo "ok   real: tessera-vt src (a dependency)" || { echo "FAIL real: tessera-vt src"; failures=$((failures + 1)); }
-    [[ "$(real crates/tessera-cli/src/main.rs)" == false ]] && echo "ok   real: tessera-cli src (not linked)" || { echo "FAIL real: tessera-cli src"; failures=$((failures + 1)); }
+    real_check() { # <expected> <description> <path>
+        local got; got="$(real "$3")"
+        if [[ "$got" == "$1" ]]; then echo "ok   real: $2"; else echo "FAIL real: $2: want $1, got $got"; failures=$((failures + 1)); fi
+    }
+    real_check true  "tessera-ffi src"                crates/tessera-ffi/src/lib.rs
+    real_check true  "tessera-vt src (a dependency)"  crates/tessera-vt/src/lib.rs
+    real_check false "tessera-cli src (not linked)"   crates/tessera-cli/src/main.rs
 else
     echo "skip real crate list: cargo or jq missing"
 fi
