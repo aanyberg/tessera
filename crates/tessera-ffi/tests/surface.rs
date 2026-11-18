@@ -13,6 +13,7 @@
 
 mod common;
 
+use std::cell::Cell;
 use std::ffi::{CString, c_char};
 use std::panic::AssertUnwindSafe;
 use std::ptr;
@@ -40,6 +41,17 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// 25 runs (#316). The waits poll and return as soon as the reply is on
 /// screen, so a passing run never waits this long.
 const CHILD_TIMEOUT: Duration = Duration::from_secs(60);
+
+thread_local! {
+    /// A shorter [`CHILD_TIMEOUT`] for the waits on this thread, set by
+    /// the tests of the waits' own timeout failures.
+    static CHILD_TIMEOUT_HERE: Cell<Option<Duration>> = const { Cell::new(None) };
+}
+
+/// [`CHILD_TIMEOUT`], or this thread's shorter bound.
+fn child_timeout() -> Duration {
+    CHILD_TIMEOUT_HERE.get().unwrap_or(CHILD_TIMEOUT)
+}
 
 /// How often the waits on the child look at the screen.
 const POLL: Duration = Duration::from_millis(10);
@@ -308,23 +320,7 @@ impl Handle {
         self.write(id, format!("echo \"{tag}:$(stty size).\"\n").as_bytes());
         let prefix = format!("{tag}:");
         let expected = format!("{rows} {cols}");
-        wait_for_child(|| {
-            let screen = self.screen(id);
-            let reply = screen.lines().find_map(|line| {
-                line.trim_end()
-                    .strip_prefix(&prefix)
-                    .and_then(|rest| rest.strip_suffix('.'))
-            });
-            match reply {
-                Some(size) if size == expected => Ok(()),
-                Some(size) => Err(Miss::Wrong(format!(
-                    "child reported {prefix}{size:?}, not {prefix}{expected:?}:\n{screen}"
-                ))),
-                None => Err(Miss::NotYet(format!(
-                    "child never reported {prefix}{expected:?}:\n{screen}"
-                ))),
-            }
-        });
+        wait_for_child(|| size_reply(&self.screen(id), &prefix, &expected));
     }
 
     /// Renders one frame after waiting out the pacing interval, so its
@@ -569,7 +565,31 @@ fn wait_for_cursor(app: &Handle, id: u64, (row, col): (u16, u16)) -> SurfaceMetr
     })
 }
 
+/// What `screen` says of the size reply tagged `prefix`: `Ok` when it
+/// shows `prefix`, `expected` and the closing `.`, [`Miss::Wrong`] when it
+/// shows a complete reply with another size, and [`Miss::NotYet`] while
+/// the reply is missing or still incomplete: a reply the reader got in two
+/// reads is on screen without its `.` (and maybe without the last digits
+/// of the size) in between, and is no answer yet.
+fn size_reply(screen: &str, prefix: &str, expected: &str) -> Result<(), Miss> {
+    let reply = screen.lines().find_map(|line| {
+        line.trim_end()
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix('.'))
+    });
+    match reply {
+        Some(size) if size == expected => Ok(()),
+        Some(size) => Err(Miss::Wrong(format!(
+            "child reported {prefix}{size:?}, not {prefix}{expected:?}:\n{screen}"
+        ))),
+        None => Err(Miss::NotYet(format!(
+            "child never reported {prefix}{expected:?}:\n{screen}"
+        ))),
+    }
+}
+
 /// What a probe of [`wait_for_child`] saw instead of what it waits for.
+#[derive(Debug)]
 enum Miss {
     /// Not there yet: poll again until the deadline.
     NotYet(String),
@@ -584,7 +604,8 @@ enum Miss {
 /// how long the child may take. The panic names the caller's line.
 #[track_caller]
 fn wait_for_child<T>(mut probe: impl FnMut() -> Result<T, Miss>) -> T {
-    let deadline = Instant::now() + CHILD_TIMEOUT;
+    let timeout = child_timeout();
+    let deadline = Instant::now() + timeout;
     loop {
         let seen = match probe() {
             Ok(value) => return value,
@@ -592,7 +613,7 @@ fn wait_for_child<T>(mut probe: impl FnMut() -> Result<T, Miss>) -> T {
             Err(Miss::NotYet(seen)) => seen,
         };
         let left = deadline.saturating_duration_since(Instant::now());
-        assert!(!left.is_zero(), "{seen}\n(waited {CHILD_TIMEOUT:?})");
+        assert!(!left.is_zero(), "{seen}\n(waited {timeout:?})");
         std::thread::sleep(left.min(POLL));
     }
 }
@@ -605,29 +626,9 @@ fn wait_for_child<T>(mut probe: impl FnMut() -> Result<T, Miss>) -> T {
 fn a_wrong_size_fails_at_once_at_the_callers_line() {
     let app = Handle::new();
     let id = app.spawn_shell();
-    // The panic's location and message, recorded by a hook on this thread;
-    // panics on other threads go to the default hook.
-    let seen: Arc<Mutex<Option<(String, u32, String)>>> = Arc::default();
-    let previous = std::panic::take_hook();
-    let this = std::thread::current().id();
-    let record = Arc::clone(&seen);
-    std::panic::set_hook(Box::new(move |info| {
-        if std::thread::current().id() != this {
-            return previous(info);
-        }
-        let location = info.location().expect("a panic location");
-        let message = info
-            .payload()
-            .downcast_ref::<String>()
-            .cloned()
-            .unwrap_or_default();
-        *record.lock().unwrap() = Some((location.file().to_owned(), location.line(), message));
-    }));
     let call_line = line!() + 1;
-    let caught = std::panic::catch_unwind(AssertUnwindSafe(|| app.assert_child_sees(id, 24, 81)));
-    drop(std::panic::take_hook());
-    assert!(caught.is_err(), "24 81 was accepted for a 24x80 shell");
-    let (file, line, message) = seen.lock().unwrap().take().expect("the panic was recorded");
+    let seen = panic_of(|| app.assert_child_sees(id, 24, 81));
+    let (file, line, message) = seen.expect("24 81 was accepted for a 24x80 shell");
     assert_eq!((file.as_str(), line), (file!(), call_line), "{message}");
     assert!(
         message.starts_with("child reported ") && !message.contains("(waited "),
@@ -639,6 +640,113 @@ fn a_wrong_size_fails_at_once_at_the_callers_line() {
         message.trim_end(),
         "trailing blank rows: {message:?}"
     );
+}
+
+/// Runs `f` on this thread and returns the file, line and message of the
+/// panic it raised, or `None` when it returned. The panic is recorded by a
+/// panic hook while `f` runs; a panic on another thread meanwhile goes to
+/// the hook installed before, which is put back afterwards (#340).
+fn panic_of(f: impl FnOnce()) -> Option<(String, u32, String)> {
+    type Hook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
+    let seen: Arc<Mutex<Option<(String, u32, String)>>> = Arc::default();
+    let previous: Arc<Hook> = Arc::new(std::panic::take_hook());
+    let this = std::thread::current().id();
+    let (record, others) = (Arc::clone(&seen), Arc::clone(&previous));
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().id() != this {
+            return others(info);
+        }
+        let location = info.location().expect("a panic location");
+        let message = info
+            .payload()
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                info.payload()
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_owned())
+            })
+            .unwrap_or_default();
+        *record.lock().unwrap() = Some((location.file().to_owned(), location.line(), message));
+    }));
+    let caught = std::panic::catch_unwind(AssertUnwindSafe(f));
+    // Dropping the recorder drops its handle on the previous hook.
+    drop(std::panic::take_hook());
+    let previous: Hook =
+        Arc::try_unwrap(previous).unwrap_or_else(|shared| Box::new(move |info| shared(info)));
+    std::panic::set_hook(previous);
+    let seen = seen.lock().unwrap().take();
+    assert_eq!(caught.is_err(), seen.is_some(), "a panic and its record");
+    seen
+}
+
+/// #340: [`panic_of`] puts back the panic hook installed before it, not
+/// the default one: a panic after it reaches that hook.
+#[test]
+fn recording_a_panic_keeps_the_previous_hook() {
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    std::panic::set_hook(Box::new(|_| {
+        CALLS.fetch_add(1, Ordering::SeqCst);
+    }));
+    let seen = panic_of(|| panic!("recorded"));
+    let (file, _, message) = seen.expect("recorded");
+    assert_eq!((file.as_str(), message.as_str()), (file!(), "recorded"));
+    assert_eq!(CALLS.load(Ordering::SeqCst), 0, "the recorder took it");
+    let caught = std::panic::catch_unwind(|| panic!("after"));
+    assert!(caught.is_err());
+    assert_eq!(CALLS.load(Ordering::SeqCst), 1, "the previous hook is back");
+    drop(std::panic::take_hook());
+}
+
+/// #340: a size reply the reader got in two reads is no answer until its
+/// closing `.` is on screen: the first half of `24 80` reads as `24 8`,
+/// which must not fail the wait as a wrong size.
+#[test]
+fn a_size_reply_split_over_two_reads_is_not_yet_an_answer() {
+    let echoed = "$ echo \"7:$(stty size).\"";
+    for first in ["7:", "7:24", "7:24 ", "7:24 8"] {
+        let screen = format!("{echoed}\n{first}\n");
+        assert!(
+            matches!(size_reply(&screen, "7:", "24 80"), Err(Miss::NotYet(_))),
+            "{first:?}"
+        );
+    }
+    let done = format!("{echoed}\n7:24 80.\n$ ");
+    assert!(size_reply(&done, "7:", "24 80").is_ok());
+    let wrong = format!("{echoed}\n7:24 8.\n$ ");
+    assert!(matches!(
+        size_reply(&wrong, "7:", "24 80"),
+        Err(Miss::Wrong(_))
+    ));
+    // Another query's reply is not this one's.
+    assert!(matches!(
+        size_reply("17:24 80.\n", "7:", "24 80"),
+        Err(Miss::NotYet(_))
+    ));
+}
+
+/// #340: [`wait_for_cursor`] reports its timeout at the caller's line
+/// (`#[track_caller]`), with the cursor it saw instead.
+#[test]
+fn a_cursor_wait_that_times_out_fails_at_the_callers_line() {
+    if !gpu_enabled() {
+        return;
+    }
+    let app = Handle::new();
+    let id = app.spawn_sh(&["-c", "stty -echo; printf ready; exec cat"]);
+    let layer = Layer::new();
+    assert_eq!(app.attach(id, &layer, 800, 600, 1.0), Error::Ok);
+    CHILD_TIMEOUT_HERE.set(Some(Duration::from_millis(200)));
+    let call_line = line!() + 1;
+    let seen = panic_of(|| _ = wait_for_cursor(&app, id, (u16::MAX, u16::MAX)));
+    CHILD_TIMEOUT_HERE.set(None);
+    let (file, line, message) = seen.expect("no cursor is at (65535, 65535)");
+    assert_eq!((file.as_str(), line), (file!(), call_line), "{message}");
+    assert!(
+        message.contains("not (65535, 65535)") && message.ends_with("(waited 200ms)"),
+        "not the timeout: {message}"
+    );
+    assert_eq!(app.close(id), Error::Ok);
 }
 
 #[test]

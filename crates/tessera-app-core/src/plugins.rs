@@ -24,7 +24,11 @@
 //! first activation; it runs the thread start hook first (ADR 0018). The
 //! session readers and the applying thread hand it events through a queue
 //! of at most [`MAX_PLUGIN_EVENTS`] and never wait for a plugin: when the
-//! queue is full the newest event is dropped and counted (S6). A plugin
+//! queue is full the newest event is dropped and counted (S6). A session's
+//! creation or close dropped that way is made good on the thread's next
+//! turn: each plugin granted [`Capability::Sessions`] is told of the
+//! sessions opened and closed since, so its count of the open sessions
+//! matches the `App`'s once it has the events queued. A plugin
 //! that panics, or whose `activate` returns an error, is put in
 //! [`PluginState::Failed`] and gets no further calls until a configuration
 //! that does not enable it is applied and one that does follows. Dropping
@@ -54,7 +58,9 @@ pub const MAX_PLUGIN_ID_LEN: usize = 128;
 /// Events queued for the plugin thread; when the queue is full the newest
 /// event is dropped and counted (a session's created or closed event
 /// takes the place of the oldest other event instead, while there is
-/// one).
+/// one; a close whose creation is still queued takes that creation out;
+/// any other is dropped, and the plugin thread's next turn tells the
+/// plugins of the sessions opened and closed since).
 pub const MAX_PLUGIN_EVENTS: usize = 1024;
 /// Status items kept per plugin; later ones are dropped.
 pub const MAX_STATUS_ITEMS: usize = 8;
@@ -262,6 +268,10 @@ struct Inbox {
     /// Events dropped since the queue was last empty (one debug log per
     /// burst).
     burst_dropped: u64,
+    /// Sessions' created and closed events dropped since the plugin
+    /// thread last took the sessions open (saturating; S5): while it is
+    /// not 0 the thread's next turn hands the plugins what they missed.
+    lifecycle_dropped: u64,
     /// Hash of the last `[plugins] enabled` list applied, so its warnings
     /// are logged once per change, not once per apply.
     last_enabled: Option<u64>,
@@ -276,7 +286,7 @@ impl Inbox {
     /// created and closed events still queued undone, newest first, so a
     /// plugin told of these and then handed the queued events counts each
     /// session once.
-    fn live_at_head(&self) -> Vec<u64> {
+    fn live_at_head(&self) -> BTreeSet<u64> {
         let mut live = self.live.clone();
         for event in self.events.iter().rev() {
             match event {
@@ -289,7 +299,7 @@ impl Inbox {
                 _ => {}
             }
         }
-        live.into_iter().collect()
+        live
     }
 }
 
@@ -454,7 +464,7 @@ impl PluginHost {
             match board.iter().position(|entry| entry.id == *id) {
                 Some(index) => listed[index] = true,
                 None if warn => tracing::warn!(
-                    plugin = %id.escape_debug(),
+                    plugin = %id_for_log(id),
                     "[plugins] enabled names a plugin this build does not have; ignored"
                 ),
                 None => {}
@@ -514,11 +524,28 @@ impl PluginHost {
                 .flatten();
             self.shared.dropped.fetch_add(1, Ordering::Relaxed);
             inbox.burst_dropped += 1;
-            match evicted {
-                Some(at) => {
-                    inbox.events.remove(at);
+            if let Some(at) = evicted {
+                inbox.events.remove(at);
+            } else {
+                // Only sessions' creations and closes are queued. A close
+                // whose creation is still queued undoes it; any other is
+                // made good on the thread's next turn.
+                let created = match &event {
+                    Event::SessionClosed { session } => inbox.events.iter().position(
+                        |e| matches!(e, Event::SessionCreated { session: s } if s == session),
+                    ),
+                    _ => None,
+                };
+                match created {
+                    Some(at) => {
+                        inbox.events.remove(at);
+                    }
+                    None if is_lifecycle(&event) => {
+                        inbox.lifecycle_dropped = inbox.lifecycle_dropped.saturating_add(1);
+                    }
+                    None => {}
                 }
-                None => return,
+                return;
             }
         }
         inbox.events.push_back(event);
@@ -560,9 +587,14 @@ impl PluginHost {
     }
 
     /// Queues the plugin event `event` of session `id` stands for, if any.
-    /// Never called for [`SessionEvent::Output`].
+    /// Never called for [`SessionEvent::Output`] ([`Tee`] hands it to the
+    /// frontend alone, P11).
     #[inline(never)]
     fn session_event(&self, id: SessionId, event: &SessionEvent) {
+        debug_assert!(
+            !matches!(event, SessionEvent::Output),
+            "output never reaches the plugin host (P11)"
+        );
         if !self.shared.wants_sessions.load(Ordering::Acquire) {
             return;
         }
@@ -701,9 +733,12 @@ impl SessionObserver for Tee {
         }
     }
 
-    /// The plugins follow the configuration first, so the frontend reads
-    /// the new `enabled` here (and a frontend that panics cannot keep them
-    /// from following it).
+    /// The plugins follow the configuration first, then the frontend is
+    /// called: it reads the new `enabled` in the report here (and a
+    /// frontend that panics cannot keep the plugins from following it).
+    /// Only the report and the queue change on this thread; the plugins'
+    /// activations and deactivations follow on the plugin thread, later and
+    /// with no callback of their own.
     fn on_config_applied(&self, generation: u64) {
         self.plugins.apply(true);
         if let Some(inner) = &self.inner {
@@ -799,9 +834,9 @@ struct Slot {
     /// Whether the activation in effect was granted
     /// [`Capability::Sessions`].
     sessions: bool,
-    /// Set when it failed; cleared when the configuration stops enabling
-    /// it, so enabling it again retries.
-    failed: bool,
+    /// The sessions the activation in effect was told are open: created
+    /// minus closed. As many as the `App` has sessions.
+    open: BTreeSet<u64>,
     /// The [`Inbox::epochs`] entry its latest activation was made for.
     epoch: u64,
     /// Kept across activations for the `App`'s life.
@@ -821,7 +856,7 @@ struct Desired {
     /// [`Inbox::epochs`].
     epochs: Vec<u64>,
     /// [`Inbox::live_at_head`].
-    live: Vec<u64>,
+    live: BTreeSet<u64>,
 }
 
 /// What the plugin thread takes from the inbox in one turn.
@@ -829,6 +864,9 @@ struct Turn {
     /// The plugins to run and the sessions open as of the queue's head
     /// ([`Inbox::live_at_head`]), when the configuration changed.
     desired: Option<Desired>,
+    /// The sessions open as of the queue's head, when a session's created
+    /// or closed event was dropped ([`Inbox::lifecycle_dropped`]).
+    resync: Option<BTreeSet<u64>>,
     event: Option<Event>,
     shutdown: bool,
 }
@@ -846,6 +884,9 @@ impl Runner {
             }
             if let Some(desired) = turn.desired {
                 self.reconcile(&desired);
+            }
+            if let Some(live) = turn.resync {
+                self.resync(&live);
             }
             if let Some(event) = turn.event {
                 self.fan_out(&event);
@@ -866,14 +907,19 @@ impl Runner {
         if inbox.shutdown {
             return Turn {
                 desired: None,
+                resync: None,
                 event: None,
                 shutdown: true,
             };
         }
+        let resync = (inbox.lifecycle_dropped > 0).then(|| {
+            inbox.lifecycle_dropped = 0;
+            inbox.live_at_head()
+        });
         let desired = std::mem::take(&mut inbox.reconcile).then(|| Desired {
             wanted: inbox.desired.clone(),
             epochs: inbox.epochs.clone(),
-            live: inbox.live_at_head(),
+            live: resync.clone().unwrap_or_else(|| inbox.live_at_head()),
         });
         let event = inbox.events.pop_front();
         if inbox.events.is_empty() && inbox.burst_dropped > 0 {
@@ -885,6 +931,7 @@ impl Runner {
         }
         Turn {
             desired,
+            resync,
             event,
             shutdown: false,
         }
@@ -899,12 +946,10 @@ impl Runner {
             let epoch = desired.epochs[index];
             if wanted && self.slots[index].epoch != epoch {
                 self.deactivate(index);
-                self.slots[index].failed = false;
                 self.slots[index].epoch = epoch;
                 self.activate(index, &desired.live);
             } else if !wanted {
                 self.deactivate(index);
-                self.slots[index].failed = false;
                 let mut board = self.shared.board();
                 if board[index].state == PluginState::Failed {
                     board[index].state = PluginState::Disabled;
@@ -914,7 +959,34 @@ impl Runner {
         }
     }
 
-    fn activate(&mut self, index: usize, live: &[u64]) {
+    /// Tells every active plugin granted [`Capability::Sessions`] of the
+    /// sessions closed and opened that it was not told of, so the sessions
+    /// it counts open are `live`, the sessions open as of the queue's head.
+    fn resync(&mut self, live: &BTreeSet<u64>) {
+        for index in 0..self.slots.len() {
+            let slot = &self.slots[index];
+            if slot.plugin.is_none() || !slot.sessions {
+                continue;
+            }
+            let closed: Vec<u64> = slot.open.difference(live).copied().collect();
+            let opened: Vec<u64> = live.difference(&slot.open).copied().collect();
+            let events = closed
+                .into_iter()
+                .map(|session| Event::SessionClosed {
+                    session: tessera_plugin_api::SessionId(session),
+                })
+                .chain(opened.into_iter().map(|session| Event::SessionCreated {
+                    session: tessera_plugin_api::SessionId(session),
+                }));
+            for event in events {
+                if !self.deliver(index, &event) {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn activate(&mut self, index: usize, live: &BTreeSet<u64>) {
         let made = panic::catch_unwind(AssertUnwindSafe(|| (self.shared.factories[index])()));
         let Ok(mut plugin) = made else {
             self.fail(index, "panicked");
@@ -974,6 +1046,7 @@ impl Runner {
         let Some(mut plugin) = self.slots[index].plugin.take() else {
             return;
         };
+        self.slots[index].open.clear();
         // Its handle still serves storage and status items here; retired
         // (and the items cleared) right after.
         let outcome = panic::catch_unwind(AssertUnwindSafe(|| plugin.deactivate()));
@@ -1009,7 +1082,7 @@ impl Runner {
         if let Some(plugin) = self.slots[index].plugin.take() {
             drop_quietly(plugin);
         }
-        self.slots[index].failed = true;
+        self.slots[index].open.clear();
         self.retire(index, PluginState::Failed, Some(format!("failed: {kind}")));
         let id = id_for_log(&self.shared.board()[index].id);
         tracing::warn!(plugin = %id, error = kind, "plugin failed; it gets no further calls");
@@ -1033,6 +1106,15 @@ impl Runner {
         };
         if needs_sessions(event) && !slot.sessions {
             return true;
+        }
+        match event {
+            Event::SessionCreated { session } => {
+                slot.open.insert(session.0);
+            }
+            Event::SessionClosed { session } => {
+                slot.open.remove(&session.0);
+            }
+            _ => {}
         }
         match panic::catch_unwind(AssertUnwindSafe(|| plugin.on_event(event))) {
             Ok(Ok(())) => true,

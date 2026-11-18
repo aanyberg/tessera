@@ -9,11 +9,12 @@ use std::cell::Cell;
 use std::fmt::Write as _;
 use std::path::Path;
 
-use tessera_app_core::Config;
 use tessera_app_core::command::{
     COMMANDS, CommandId, CommandOwner, Keymap, MenuShortcut, menu_shortcut,
 };
+use tessera_app_core::input::ScrollEvent;
 use tessera_app_core::input::{Key, KeyEvent, Modifiers};
+use tessera_app_core::{App, Config, ConfigPaths, InputEvent, InputOutcome, PtySize};
 use tessera_config::{Chord, ChordModifiers, Keys, MAX_KEY_BINDINGS, Warning};
 
 /// Counts this thread's allocations.
@@ -616,6 +617,40 @@ fn is_default_allocates_nothing() {
     let defaults = chords.iter().filter(|&&c| map.is_default(c)).count();
     assert_eq!(ALLOCATIONS.with(Cell::get), before);
     assert_eq!(defaults, 2, "cmd+down and cmd+t");
+}
+
+/// #292: a wheel turn of less than a line while the program tracks the
+/// mouse reports nothing and allocates nothing: the line count is checked
+/// before a report is encoded, so a trackpad's stream of small deltas
+/// costs no allocation per event. A whole line is still reported.
+#[test]
+fn a_sub_line_wheel_report_allocates_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let app = App::new(
+        Config::default(),
+        ConfigPaths::new(root.path().join("config")),
+    );
+    let id = app.spawn_test_session(PtySize::new(24, 80)).unwrap();
+    // Normal tracking, SGR encoding.
+    app.feed_for_test(id, b"\x1b[?1000h\x1b[?1006h").unwrap();
+    let small = InputEvent::Scroll(ScrollEvent::new(0.001).with_cell(3, 4));
+    // Once outside the count, so a lazily built lock or table is built.
+    assert_eq!(
+        app.send_input(id, small.clone()).unwrap(),
+        InputOutcome::Ignored
+    );
+    let before = ALLOCATIONS.with(Cell::get);
+    for _ in 0..100 {
+        assert_eq!(
+            app.send_input(id, small.clone()).unwrap(),
+            InputOutcome::Ignored
+        );
+    }
+    assert_eq!(ALLOCATIONS.with(Cell::get), before);
+    // 101 × 0.001 banked plus 0.9 more makes one whole line.
+    let line = InputEvent::Scroll(ScrollEvent::new(0.9).with_cell(3, 4));
+    assert_eq!(app.send_input(id, line).unwrap(), InputOutcome::Consumed);
+    app.close_session(id).unwrap();
 }
 
 /// S5: a table past every cap compiles to at most `MAX_KEY_BINDINGS`

@@ -79,6 +79,10 @@
 //!   and outbox locks are leaves: nothing is locked while either is held,
 //!   except by a close's delivery-lock holder above, which never takes
 //!   the input lock.
+//! - The reader thread and `Session::push_look` queue the replies they
+//!   take from the terminal while they hold the terminal lock (the outbox
+//!   lock, a leaf), so replies reach the child in the order the terminal
+//!   made them (ADR 0024, #489 M2).
 //! - Applying a cursor default reads the `App`'s configuration
 //!   (`Applied`) under the terminal lock (`Live::apply`, `App::attach`;
 //!   #168). Nothing takes a terminal lock while holding `Applied`.
@@ -1074,22 +1078,28 @@ impl Session {
     /// two applies racing the last to get here leaves the newest look.
     ///
     /// A colour scheme report the new colours queue (mode 2031, #269) goes
-    /// to the outbox at once, after the terminal lock is released, as the
+    /// to the outbox at once, before the terminal lock is released, as the
     /// reader queues its replies: an idle child gets it without writing
-    /// first. Only replies are taken ([`Terminal::take_replies`]); the
-    /// reader drains every request under the lock hold of the slice that
-    /// queued it, so no reply of the child's own queries is pending here to
-    /// be sent twice or lost.
+    /// first, after every reply the reader drained before it (a `CSI ? 996
+    /// n` answer with the old scheme), and of two racing applies the
+    /// reports reach the child in the order the terminal took the looks,
+    /// so the last one names the scheme the terminal has (#489 M2). Only
+    /// replies are taken ([`Terminal::take_replies`]); the reader drains
+    /// every request under the lock hold of the slice that queued it, so no
+    /// reply of the child's own queries is pending here to be sent twice or
+    /// lost.
     pub(crate) fn push_look(&self) {
         let mut term = self.term.lock();
         let look = self.look();
         term.set_default_cursor_style(look.cursor());
         term.set_theme_colors(crate::view::theme_colors_for(&look.colours));
         let replies = term.take_replies();
-        drop(term);
         if !replies.is_empty() {
+            #[cfg(test)]
+            pause_at(self.delivery_key(), LockPause::PushLook);
             self.outbox.try_queue_reply(self.id, replies);
         }
+        drop(term);
     }
 
     /// The working directory the session's shell last reported (OSC 7).
@@ -2021,13 +2031,17 @@ fn advance_chunk(
                 other => requests.push(other, epoch),
             }
         }
-        drop(locked);
-        // The slice's replies, joined, once the terminal is unlocked: one
-        // outbox entry per slice, so a flood of queries costs bytes, not
-        // entries.
+        // The slice's replies, joined: one outbox entry per slice, so a
+        // flood of queries costs bytes, not entries. Queued before the
+        // terminal is unlocked (the outbox lock is a leaf, ADR 0024), so a
+        // colour scheme report `Session::push_look` queues under the lock
+        // after this slice goes after its replies, never ahead (#489 M2).
         if !replies.is_empty() {
+            #[cfg(test)]
+            pause_at(std::ptr::from_ref(term).addr(), LockPause::ReaderReplies);
             reply(replies);
         }
+        drop(locked);
         give_way(term, thread::yield_now);
         rest = after;
     }
@@ -2279,6 +2293,14 @@ pub(crate) enum LockPause {
     ScrollState,
     /// `Session::with_viewport`, before the terminal lock is taken.
     Viewport,
+    /// The reader thread's `advance_chunk`, after a slice's replies are
+    /// taken and before they are queued. Keyed by the address of the
+    /// session's `SharedTerminal`, not [`Session::delivery_key`]: the
+    /// reader has no `Session`.
+    ReaderReplies,
+    /// `Session::push_look`, after the colour scheme report is taken and
+    /// before it is queued.
+    PushLook,
 }
 
 /// A test pause: where a session pauses and what it runs there.
@@ -4150,5 +4172,278 @@ pub(crate) mod tests {
             .expect("live");
         assert_eq!(text, "");
         app.close_session(id).expect("close");
+    }
+
+    /// A PTY that records what the writer writes, refuses writes while
+    /// `would_block` is set (the writer then holds its entry and retries),
+    /// and ends its event stream on a hang-up.
+    struct RecordingPty {
+        events: Option<SyncSender<PtyEvent>>,
+        written: Arc<Mutex<Vec<u8>>>,
+        would_block: Arc<AtomicBool>,
+    }
+
+    impl Pty for RecordingPty {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+            lock(&self.written).extend_from_slice(bytes);
+            Ok(())
+        }
+
+        fn try_write(&mut self, bytes: &[u8]) -> io::Result<()> {
+            if self.would_block.load(Ordering::SeqCst) {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+            self.write(bytes)
+        }
+
+        fn resize(&mut self, _size: PtySize) -> Result<(), PtyError> {
+            Ok(())
+        }
+
+        fn size(&self) -> PtySize {
+            PtySize::new(24, 80)
+        }
+
+        fn child_pid(&self) -> Option<u32> {
+            None
+        }
+
+        fn exit_status(&self) -> Option<ExitStatus> {
+            None
+        }
+
+        fn hangup(&mut self) -> io::Result<()> {
+            if let Some(events) = self.events.take() {
+                let _ = events.send(PtyEvent::Exited(ExitStatus::Signaled(1)));
+            }
+            Ok(())
+        }
+
+        fn kill(&mut self) -> io::Result<()> {
+            self.hangup()
+        }
+    }
+
+    /// A session on a [`RecordingPty`] with the dark theme and colour
+    /// scheme reports (mode 2031) on, nothing written yet; with the dark
+    /// and light looks the configuration gives it.
+    struct ReplySession {
+        app: App,
+        id: SessionId,
+        session: Arc<Session>,
+        tx: SyncSender<PtyEvent>,
+        written: Arc<Mutex<Vec<u8>>>,
+        would_block: Arc<AtomicBool>,
+        dark: Arc<crate::view::Look>,
+        light: Arc<crate::view::Look>,
+    }
+
+    /// The answer to `CSI ? 996 n` and the report under the dark theme.
+    const DARK: &[u8] = b"\x1b[?997;1n";
+    /// The same under the light theme.
+    const LIGHT: &[u8] = b"\x1b[?997;2n";
+
+    /// `wait_until` with a deadline long enough for a background-QoS run
+    /// on a loaded machine, which stalls a thread for seconds.
+    fn wait_long(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting: {what}");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn theme(name: &str) -> &'static tessera_config::Theme {
+        tessera_config::Theme::bundled(name).expect("bundled")
+    }
+
+    fn reply_session() -> ReplySession {
+        let app = App::new(Config::default(), ConfigPaths::new("/nonexistent/tessera"));
+        let (tx, rx) = mpsc::sync_channel(16);
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let would_block = Arc::new(AtomicBool::new(false));
+        let pty = RecordingPty {
+            events: Some(tx.clone()),
+            written: Arc::clone(&written),
+            would_block: Arc::clone(&would_block),
+        };
+        let id = app.allocate_id();
+        app.attach(id, Box::new(pty), rx, PtySize::new(24, 80))
+            .expect("attach");
+        let session = app.session(id).unwrap();
+        let config = Config::default();
+        app.apply_config(&config, theme("tessera-light"));
+        let light = session.look();
+        app.apply_config(&config, theme("tessera-dark"));
+        let dark = session.look();
+        assert_ne!(dark.colours, light.colours);
+        tx.send(PtyEvent::Output(b"\x1b[?2031h\x1b[5n".to_vec()))
+            .expect("reader alive");
+        wait_long("the status report", || lock(&written).ends_with(b"\x1b[0n"));
+        lock(&written).clear();
+        ReplySession {
+            app,
+            id,
+            session,
+            tx,
+            written,
+            would_block,
+            dark,
+            light,
+        }
+    }
+
+    /// #489 M2, staged: the reader has drained a `CSI ? 996 n` and taken
+    /// its answer (the old scheme) when an apply changes the scheme. The
+    /// pause holds the reader between taking the answer and queuing it
+    /// until the apply waits for the terminal lock or has finished; the
+    /// answer reaches the child first and the new scheme's report after
+    /// it, every round, both ways. Queued after the reader released the
+    /// lock, the report went first: the child heard the new scheme and
+    /// then the old one, and kept the old.
+    #[test]
+    fn a_drained_scheme_query_is_answered_before_a_new_scheme_report() {
+        let s = reply_session();
+        let config = Config::default();
+        let term_key = Arc::as_ptr(&s.session.term).addr();
+        let mut wrong = Vec::new();
+        for round in 0..20 {
+            let (now, next, name) = if round % 2 == 0 {
+                (DARK, LIGHT, "tessera-light")
+            } else {
+                (LIGHT, DARK, "tessera-dark")
+            };
+            let paused = Arc::new(AtomicBool::new(false));
+            let applied = Arc::new(AtomicBool::new(false));
+            let pause = {
+                let (paused, applied) = (Arc::clone(&paused), Arc::clone(&applied));
+                let term = Arc::clone(&s.session.term);
+                move || {
+                    paused.store(true, Ordering::SeqCst);
+                    wait_long("the apply to wait or finish", || {
+                        applied.load(Ordering::SeqCst) || term.waiting.load(Ordering::SeqCst) > 0
+                    });
+                }
+            };
+            let pause = set_lock_pause(term_key, (LockPause::ReaderReplies, Arc::new(pause)));
+            thread::scope(|scope| {
+                s.tx.send(PtyEvent::Output(b"\x1b[?996n".to_vec()))
+                    .expect("reader alive");
+                wait_long("the reader to pause", || paused.load(Ordering::SeqCst));
+                scope.spawn(|| {
+                    s.app.apply_config(&config, theme(name));
+                    applied.store(true, Ordering::SeqCst);
+                });
+            });
+            drop(pause);
+            let want = [now, next].concat();
+            wait_long("the answer and the report", || {
+                lock(&s.written).len() >= want.len()
+            });
+            let got = std::mem::take(&mut *lock(&s.written));
+            if got != want {
+                wrong.push((round, String::from_utf8_lossy(&got).into_owned()));
+            }
+        }
+        assert_eq!(wrong, [], "(round, written)");
+        s.app.close_session(s.id).expect("close");
+    }
+
+    /// #489 M2, staged: two applies race to give the terminal their looks.
+    /// The first has taken its report (the light scheme) when the second
+    /// stores a newer look (dark) and pushes it; the pause holds the first
+    /// between taking its report and queuing it until the second waits for
+    /// the terminal lock or has finished. The reports reach the child in
+    /// generation order, so the last names the scheme the terminal has.
+    /// Queued after the first released the lock, the second's report went
+    /// first and the child kept the older scheme.
+    #[test]
+    fn racing_look_pushes_report_in_generation_order() {
+        let s = reply_session();
+        let mut generation = s.session.look_generation();
+        let mut wrong = Vec::new();
+        for round in 0..20 {
+            // The terminal has `dark` at the start of every round.
+            let armed = Arc::new(AtomicBool::new(true));
+            let paused = Arc::new(AtomicBool::new(false));
+            let pushed = Arc::new(AtomicBool::new(false));
+            let pause = {
+                let (armed, paused, pushed) =
+                    (Arc::clone(&armed), Arc::clone(&paused), Arc::clone(&pushed));
+                let term = Arc::clone(&s.session.term);
+                move || {
+                    if !armed.swap(false, Ordering::SeqCst) {
+                        return;
+                    }
+                    paused.store(true, Ordering::SeqCst);
+                    wait_long("the second push to wait or finish", || {
+                        pushed.load(Ordering::SeqCst) || term.waiting.load(Ordering::SeqCst) > 0
+                    });
+                }
+            };
+            let pause = set_lock_pause(
+                s.session.delivery_key(),
+                (LockPause::PushLook, Arc::new(pause)),
+            );
+            thread::scope(|scope| {
+                scope.spawn(|| {
+                    s.session.set_look(generation + 1, Arc::clone(&s.light));
+                    s.session.push_look();
+                });
+                wait_long("the first push to pause", || paused.load(Ordering::SeqCst));
+                scope.spawn(|| {
+                    s.session.set_look(generation + 2, Arc::clone(&s.dark));
+                    s.session.push_look();
+                    pushed.store(true, Ordering::SeqCst);
+                });
+            });
+            drop(pause);
+            generation += 2;
+            let want = [LIGHT, DARK].concat();
+            wait_long("both reports", || lock(&s.written).len() >= want.len());
+            let got = std::mem::take(&mut *lock(&s.written));
+            if got != want {
+                wrong.push((round, String::from_utf8_lossy(&got).into_owned()));
+            }
+        }
+        assert_eq!(wrong, [], "(round, written)");
+        s.app.close_session(s.id).expect("close");
+    }
+
+    /// #489 M3 (S5): 10 000 scheme changes onto an outbox with room for
+    /// two reports queue those two and drop and count the rest: the outbox
+    /// never holds more than [`PENDING_INPUT_BYTES`].
+    #[test]
+    fn ten_thousand_scheme_changes_keep_the_outbox_at_its_cap() {
+        let s = reply_session();
+        s.would_block.store(true, Ordering::SeqCst);
+        let room = 2 * DARK.len() + 2;
+        s.session
+            .queue_input(vec![b'x'; PENDING_INPUT_BYTES - room])
+            .expect("fits");
+        let mut generation = s.session.look_generation();
+        for change in 0..10_000 {
+            generation += 1;
+            let look = if change % 2 == 0 { &s.light } else { &s.dark };
+            s.session.set_look(generation, Arc::clone(look));
+            s.session.push_look();
+            let (bytes, _, _) = s.session.outbox_stats();
+            assert!(bytes <= PENDING_INPUT_BYTES, "{change}: {bytes}");
+        }
+        let (bytes, _, dropped) = s.session.outbox_stats();
+        assert_eq!(
+            (bytes, dropped),
+            (PENDING_INPUT_BYTES - 2, 9_998),
+            "two reports queued, every other one dropped and counted"
+        );
+        s.would_block.store(false, Ordering::SeqCst);
+        wait_long("the outbox to drain", || s.session.outbox_stats().0 == 0);
+        let written = lock(&s.written);
+        assert!(
+            written.ends_with(&[LIGHT, DARK].concat()),
+            "the two reports"
+        );
+        drop(written);
+        s.app.close_session(s.id).expect("close");
     }
 }

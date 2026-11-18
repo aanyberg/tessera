@@ -130,11 +130,25 @@ impl HeldButtons {
     }
 
     /// Applies a winit `MouseInput` event: `button` pressed or released.
-    /// A button the terminal does not report changes nothing.
-    fn apply(&mut self, state: ElementState, button: winit::event::MouseButton) {
-        if let Some(mapped) = input::mouse_button(button) {
-            self.set(mapped, state == ElementState::Pressed);
-        }
+    /// A button the terminal does not report changes nothing. Returns
+    /// whether the event goes to the session: not the release of a button
+    /// that is not held, which is the stale release of one held when the
+    /// window lost focus (see [`HeldButtons::release_all`]).
+    fn apply(&mut self, state: ElementState, button: winit::event::MouseButton) -> bool {
+        let Some(mapped) = input::mouse_button(button) else {
+            return true;
+        };
+        let pressed = state == ElementState::Pressed;
+        let held = self.0 & Self::bit(mapped) != 0;
+        self.set(mapped, pressed);
+        pressed || held
+    }
+
+    /// Forgets every held button, when the window loses focus (#292): the
+    /// release may go to another window, and motion after the window is
+    /// focused again must not carry a drag nobody holds.
+    fn release_all(&mut self) {
+        self.0 = 0;
     }
 
     /// The button motion carries: the lowest one held, or
@@ -532,7 +546,12 @@ impl ApplicationHandler<Wake> for DevWin {
                     window.request_redraw();
                 }
             }
-            WindowEvent::Focused(focused) => self.send(input::focus(focused)),
+            WindowEvent::Focused(focused) => {
+                if !focused {
+                    self.held.release_all();
+                }
+                self.send(input::focus(focused));
+            }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = input::effective_modifiers(
                     modifiers.state(),
@@ -564,7 +583,9 @@ impl ApplicationHandler<Wake> for DevWin {
                 ));
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                self.held.apply(state, button);
+                if !self.held.apply(state, button) {
+                    return;
+                }
                 if let Some(event) = input::mouse_input(
                     state,
                     button,
@@ -607,6 +628,33 @@ impl ApplicationHandler<Wake> for DevWin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #292: losing focus forgets the held buttons, so motion after the
+    /// window is focused again carries no drag, and the release of a
+    /// button held across the focus change is not sent as a stale
+    /// release; a press after it, and its release, are.
+    #[test]
+    fn focus_loss_forgets_held_buttons() {
+        use winit::event::MouseButton as Winit;
+        let mut held = HeldButtons::default();
+        assert!(held.apply(ElementState::Pressed, Winit::Left));
+        assert!(held.apply(ElementState::Pressed, Winit::Right));
+        assert_eq!(held.drag_button(), MouseButton::Left);
+        // WindowEvent::Focused(false).
+        held.release_all();
+        assert_eq!(held, HeldButtons::default());
+        assert_eq!(held.drag_button(), MouseButton::None);
+        // Focused again: the releases of the buttons held before are stale.
+        assert!(!held.apply(ElementState::Released, Winit::Left));
+        assert!(!held.apply(ElementState::Released, Winit::Right));
+        assert_eq!(held.drag_button(), MouseButton::None);
+        assert!(held.apply(ElementState::Pressed, Winit::Middle));
+        assert_eq!(held.drag_button(), MouseButton::Middle);
+        assert!(held.apply(ElementState::Released, Winit::Middle));
+        assert_eq!(held.drag_button(), MouseButton::None);
+        // A button the terminal does not report is passed on unchanged.
+        assert!(held.apply(ElementState::Released, Winit::Other(9)));
+    }
 
     /// #194.12: press left, press right, release right: the motion after
     /// it is still a left drag (a single held button lost it, and 1002

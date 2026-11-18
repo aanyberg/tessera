@@ -302,11 +302,17 @@ pub(crate) fn route_wheel(
     } else {
         MouseReportButton::WheelDown
     };
+    // Counted before anything is encoded: a trackpad sends many deltas of
+    // less than a line, and each would otherwise allocate a report it
+    // throws away (#292).
+    let count = usize::try_from(lines.unsigned_abs()).unwrap_or(0);
+    if count == 0 {
+        return Route::Ignore { next: state };
+    }
     let modifiers = modifiers - (Modifiers::SHIFT | Modifiers::SUPER);
     let (report, position) = mode.report(MouseReportKind::Press, button, cell, modifiers);
-    let count = usize::try_from(lines.unsigned_abs()).unwrap_or(0);
     match mode.encode(&report) {
-        Some(one) if count > 0 => Route::Report {
+        Some(one) => Route::Report {
             bytes: one.repeat(count),
             next: ReportState {
                 baseline: Some(position),

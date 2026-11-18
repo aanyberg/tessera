@@ -38,8 +38,9 @@ the fixture; the milestone lead accepted them on 2026-10-31.
   drops a reply; bounding them is the host's job.
 - `tessera-app-core`'s reader thread (`Pump::run`) collects the replies of
   each slice of output (4 KiB, see ADR 0014) under the slice's terminal
-  lock, joins them into one buffer and, after releasing the lock, queues
-  it in the session's input outbox (`Outbox::try_queue_reply`), behind the
+  lock, joins them into one buffer and, before releasing the lock (#489
+  M2; the outbox lock is a leaf under it), queues it in the session's
+  input outbox (`Outbox::try_queue_reply`), behind the
   input already queued: appended to the last entry still queued, or as a
   new entry when the queue is empty (the writer pops an entry before
   writing it, so order is kept). The writer thread writes it like any
@@ -553,15 +554,15 @@ specification, tmux, Ghostty, foot, kitty and neovim, read from source.
   carry its report to the child: `Session::push_look` drains the replies
   the theme queued (`Terminal::take_replies`, which leaves every other
   request queued for the reader) under the terminal lock and queues
-  them through the same outbox after dropping it. A reply the reader
+  them through the same outbox before dropping it. A reply the reader
   had already drained is queued by the reader, one still in the
-  terminal by whichever drains first, so none is lost or doubled. The
-  order is not kept across the two paths: in the short window between
-  the reader dropping the terminal lock and queueing the replies it
-  drained, a theme's report can reach the outbox first. If one of those
-  replies is a `?996` answer given before the theme changed, the child
-  then reads the new scheme's report followed by the old scheme's
-  answer and believes the old scheme until the next change. The window
-  is one lock release to one outbox call on the reader thread; a fix
-  (queueing the reader's replies before it releases the lock, or
-  ordering both paths through one sequence) is tracked in #430.
+  terminal by whichever drains first, so none is lost or doubled.
+  Both paths queue while they hold the terminal lock (the outbox lock is
+  a leaf under it), so replies reach the outbox in the order the
+  terminal produced them: a `?996` answer given before a theme change
+  is read before the new scheme's report, and two racing theme pushes
+  report in the order their looks were set (#489 M2, which replaced the
+  window #430 tracked; `a_drained_scheme_query_is_answered_before_a_new_scheme_report`,
+  `racing_look_pushes_report_in_generation_order`). The cost is the
+  outbox push (an append, at worst the one-off copy above) inside the
+  terminal lock, and the drop log at a power of two.
