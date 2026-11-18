@@ -1,6 +1,6 @@
 # ADR 0032: Scroll bar and grid width
 
-**Status:** accepted · 2026-11-02
+**Status:** accepted · 2026-11-02 · amended 2026-11-18 (#495: the overlay knob)
 
 ## Context
 
@@ -225,3 +225,78 @@ flashes unconditionally, as feedback for an explicit command.
 - In vim, htop or `fzf --height` with mouse tracking, the wheel on the
   primary screen with history: the program scrolls, the scroller does not
   flash.
+
+## Amendment: the overlay knob (#495, 2026-11-18)
+
+**Cause.** Found in the 0.2.0 manual pass: in overlay style ("When
+scrolling", or "Automatically" with a trackpad) a scroll or the pointer
+showed the scroll bar's track but no knob, so nothing said where in the
+scrollback the view was. AppKit draws an overlay `NSScroller`'s knob and
+track in two sublayers whose opacities (its private
+`overlayScrollerKnobAlpha` and `overlayScrollerTrackAlpha`), and the
+widening of both under the pointer, are driven by the private
+`NSScrollerImpPair` that only an `NSScrollView` has. A scroller added as a
+plain subview, as this one is, keeps the knob at alpha 0 and the track at
+alpha 1, narrow (6 pt) for good. The hover tracking area was not the cause:
+it covers the whole 17 pt strip, wider than AppKit's own (x 1 to 16). The
+knob's position and proportion were right, and its length is AppKit's
+minimum (26 pt for a regular overlay knob on macOS 27, 20 pt legacy) for any
+long history: the position is what shows where the view is.
+
+**Decision.** Public API only; hosting the scroller in an `NSScrollView`,
+which would give AppKit's behaviour as Terminal.app, iTerm2 and Ghostty
+get it, is a larger change (the scroll view must not take the terminal's
+wheel and clicks) left for 0.3.0. In overlay style:
+
+- AppKit's own knob and slot are not drawn (`drawKnob` and
+  `drawKnobSlot(in:highlight:)` draw nothing; legacy style calls AppKit's).
+  The scroller draws its own knob in sublayers of its layer, above AppKit's,
+  placed on AppKit's `rect(for: .knob)`: its position, length and minimum
+  length are AppKit's. It is a rounded fill with a 1 pt rim outside it, in
+  AppKit's colours measured from its `drawKnob()` on macOS 27: black at half
+  opacity with a white rim at 15 % for a dark knob (light appearance), white
+  at half opacity with a black rim at 20 % for a light one (dark
+  appearance). Layer colours are not dynamic: an appearance change applies
+  them again.
+- A scroll shows the narrow knob alone, as AppKit's `flashScrollers` does:
+  AppKit's knob rect at the right edge, at most half the wide one (x 8 to
+  14 of 17 on macOS 27; macOS 15 gives a wider rect for a scroller outside
+  a scroll view, #505). With the pointer over the strip (the existing
+  tracking area) or the knob pressed, the knob is wide, over a slot: both
+  are AppKit's rects widened to the left by as much as AppKit insets them
+  from the right edge (x 3 to 14 of 17, AppKit's own wide knob), and the
+  slot is AppKit's `drawKnobSlot(in:highlight:)` drawn into a layer of that
+  size. It stays
+  wide while the pointer is inside or the knob held, and through the fade
+  after the pointer leaves (held 1 s, faded over 0.3 s, as a scroll's flash;
+  at once under Reduce Motion, ADR 0041); a scroll that shows the scroller
+  again from faded out, or after it was hidden, shows it narrow.
+- While wide, `testPart(_:)` tests a point over the wide knob or slot at the
+  narrow one's column, so the wide knob grabs and drags through AppKit's
+  own tracking (`.knob`, the `freezesKnob` rule and the release dedupe are
+  unchanged). The drawn knob follows AppKit's knob on each action during a
+  drag, and the position otherwise, at once: the layers have no implicit
+  animations, and the scroller's own opacity is what fades.
+- The widening is not animated (AppKit widens its own over about half a
+  second).
+
+The view's layout is unchanged: an overlay scroller still takes no grid
+width, and a legacy scroller is AppKit's alone.
+
+**Tests.** `TerminalScrollerTests` renders the scroller's layer tree into an
+sRGB bitmap, its sublayers stacked by `zPosition` as on screen, and reads
+the knob, its width, its rim and its slot from the pixels, so the oracle is
+what is drawn, not `alphaValue`. The pointer enters and leaves
+through the handlers with a synthesised event (a window never on screen
+gets no tracking-area events); the tracking area's options are checked
+beside them, and real pointer dispatch is a manual check.
+
+**Manual checks.**
+
+- With "Show scroll bars: When scrolling" and "Automatically" with a
+  trackpad: scroll back in a long output; the narrow knob shows where the
+  view is and fades. Move the pointer to the right edge: the knob widens
+  over its slot at the view's place; drag it, the view follows; move away:
+  it stays about 1 s, then fades. Compare with Terminal.app.
+- The same in dark appearance, and with "Always": the legacy scroller is
+  unchanged.
