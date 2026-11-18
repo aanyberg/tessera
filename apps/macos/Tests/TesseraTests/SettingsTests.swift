@@ -350,12 +350,11 @@ final class SettingsTests: XCTestCase {
         source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(deleted))
         model.reload()
         XCTAssertEqual(model.profiles.map(\.name), ["one", "three"])
-        var selected: Int?
-        XCTAssertTrue(model.duplicateProfile(1) { selected = $0 })
+        XCTAssertTrue(model.duplicateProfile(1))
         XCTAssertFalse(model.addProfile(), "the copy is not applied yet")
         try await waitUntil("the copy ran") { !model.isWriting }
         XCTAssertEqual(writer.calls.dropFirst(), [FakeWriter.added("three Copy")])
-        XCTAssertEqual(selected, 2, "where the core put it")
+        XCTAssertEqual(model.takeSelectionRequest(), 2, "where the core put it")
         XCTAssertFalse(model.addProfile(), "written, not yet applied")
     }
 
@@ -821,17 +820,16 @@ final class SettingsTests: XCTestCase {
         }
         XCTAssertEqual(model.profiles.map(\.title), ["one", "two"])
 
-        var selected: Int?
-        XCTAssertTrue(model.addProfile { selected = $0 })
+        XCTAssertTrue(model.addProfile())
         try await waitUntil("added") { !model.isWriting }
-        XCTAssertEqual(selected, 2)
+        XCTAssertEqual(model.takeSelectionRequest(), 2)
         XCTAssertTrue(try file().contains(#"name = "New Profile""#), contents)
         try await waitUntil("the window lists it") { model.profiles.map(\.name) == ["one", "two", "New Profile"] }
 
         try await waitUntil("the add applied") { !model.profilesChanging }
-        XCTAssertTrue(model.duplicateProfile(1) { selected = $0 })
+        XCTAssertTrue(model.duplicateProfile(1))
         try await waitUntil("duplicated") { !model.isWriting }
-        XCTAssertEqual(selected, 3)
+        XCTAssertEqual(model.takeSelectionRequest(), 3)
         try await waitUntil("the copy is applied with the command") {
             !model.profilesChanging && model.profiles.map(\.name) == ["one", "two", "New Profile", "two Copy"]
                 && model.value("profiles[3].command") == .string("/bin/cat")
@@ -1280,39 +1278,55 @@ extension SettingsTests {
     }
 
     /// On the core: at its 256 profiles, the `[[profiles]]` entries and
-    /// those of `profiles/` together, Add and Duplicate write nothing and
-    /// the list shows the core's reason; it is not left locked, and a
-    /// delete still runs. One fewer, and Add adds the 256th.
-    func testAddAndDuplicateAreRefusedAtTheProfileCap() async throws {
+    /// those of `profiles/` together, Add and Duplicate are disabled and the
+    /// status line says why (21.6a m4, #344 m-f); they write nothing, and a
+    /// delete still runs. One fewer, and Add adds the 256th. The app's
+    /// mirror of the cap is the core's: one more add is refused there.
+    func testAddAndDuplicateAreDisabledAtTheProfileCapWithTheReason() async throws {
         let model = try openSettings(
             config: Self.profilesTOML(255), files: ["profiles/extra.toml": "command = \"/bin/cat\"\n"])
         XCTAssertEqual(model.profiles.count, 256)
         XCTAssertEqual(model.profiles.last?.name, "extra")
-        XCTAssertTrue(model.canAddProfile, "the core says why, not a disabled button")
+        XCTAssertFalse(model.canAddProfile, "disabled at the cap")
+        let status = try XCTUnwrap(model.profilesStatus, "the status line says why")
+        XCTAssertEqual(
+            status, "Tessera reads at most 256 profiles, those in profiles/ included; delete one to add another.")
         let before = try file()
-        for press in ["Add", "Duplicate"] {
-            XCTAssertTrue(press == "Add" ? model.addProfile() : model.duplicateProfile(3))
-            XCTAssertTrue(model.profilesChanging, "\(press): locked while it runs")
-            try await waitUntil("\(press) refused") { !model.isWriting }
-            XCTAssertFalse(model.profilesChanging, "\(press): not left locked")
-            XCTAssertNil(model.profilesStatus)
-            let message = try XCTUnwrap(model.message(SettingsModel.profilesKey), press)
-            XCTAssertTrue(message.contains("256"), "\(press): the core's reason: \(message)")
-            XCTAssertNotEqual(message, "This value cannot be written.")
-            XCTAssertEqual(try file(), before, "\(press): nothing written")
-        }
+        XCTAssertFalse(model.addProfile())
+        XCTAssertFalse(model.duplicateProfile(3))
+        XCTAssertFalse(model.profilesChanging, "nothing was queued")
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertFalse(model.isWriting)
+        XCTAssertEqual(try file(), before, "nothing written")
+
+        // The mirror: the core refuses one more, with its own reason.
+        let writer = try XCTUnwrap(model.writer)
+        let refusal = await Task.detached { () -> String? in
+            do throws(TesseraConfigEditError) {
+                _ = try writer.addProfile(named: "New Profile", keys: [])
+                return nil
+            } catch {
+                return error.message
+            }
+        }.value
+        XCTAssertTrue(refusal?.contains("256") ?? false, "the core's cap is the app's: \(refusal ?? "added")")
+        XCTAssertEqual(try file(), before)
+
         XCTAssertTrue(model.deleteProfile(5), "a delete still runs")
+        XCTAssertNotNil(model.profilesStatus, "while it waits the pane says so")
         try await waitUntil("deleted") { !model.isWriting }
         XCTAssertNil(model.message(SettingsModel.profilesKey))
         try await waitUntil("the delete applied") { !model.profilesChanging }
         XCTAssertEqual(model.profiles.count, 255)
-        var selected: Int?
-        XCTAssertTrue(model.addProfile { selected = $0 })
+        XCTAssertNil(model.profilesStatus, "under the cap: no reason")
+        XCTAssertTrue(model.canAddProfile)
+        XCTAssertTrue(model.addProfile())
         try await waitUntil("the 256th added") { !model.isWriting }
         XCTAssertNil(model.message(SettingsModel.profilesKey))
-        XCTAssertEqual(selected, 254, "after the 254 entries, before extra")
+        XCTAssertEqual(model.takeSelectionRequest(), 254, "after the 254 entries, before extra")
         try await waitUntil("applied") { !model.profilesChanging && model.profiles.count == 256 }
         XCTAssertEqual(model.profiles.suffix(2).map(\.name), ["New Profile", "extra"])
+        XCTAssertNotNil(model.profilesStatus, "at the cap again")
     }
 
     /// #344 m-b: an earlier edit's configuration, applied just after a
@@ -1647,13 +1661,12 @@ extension SettingsTests {
                 ? TesseraConfigEditError(.invalidArgument, message: "profiles[3].name: too long") : nil
         }
         let (model, _, _) = try fakeModel(Self.threeProfiles, writer: writer)
-        var selected: Int?
-        XCTAssertTrue(model.duplicateProfile(1) { selected = $0 })
+        XCTAssertTrue(model.duplicateProfile(1))
         XCTAssertTrue(model.profilesChanging)
         try await waitUntil("refused") { !model.isWriting }
         try await Task.sleep(for: .milliseconds(50))
         XCTAssertEqual(writer.calls, [FakeWriter.added("two Copy", ["command": .string("/bin/cat")])])
-        XCTAssertNil(selected, "nothing to select")
+        XCTAssertNil(model.selectionRequest, "nothing to select")
         XCTAssertFalse(model.profilesChanging, "a refused copy unlocks the list")
         XCTAssertEqual(model.message(SettingsModel.profilesKey), "profiles[3].name: too long")
         XCTAssertNil(model.value("profiles[3].command"))
@@ -1787,8 +1800,9 @@ extension SettingsTests {
     /// A closed window's model goes ``AppDelegate/settingsWaitLimit`` after
     /// the close, applied or not (a watch that never applies must not keep
     /// Settings locked): here the core refuses the delete (a profile of
-    /// `profiles/*.toml`), so no configuration is applied after it.
-    /// Settings opened then starts afresh.
+    /// `profiles/*.toml`, removed by its key path: the pane's Delete is
+    /// disabled for it), so no configuration is applied after it. Settings
+    /// opened then starts afresh.
     func testAClosedWindowsWaitingModelGoesAfterTheWaitLimit() async throws {
         appDelegate.settingsWaitLimit = .milliseconds(300)
         try autoreleasepool {
@@ -1798,7 +1812,9 @@ extension SettingsTests {
         }
         let closed = try await opened { controller in
             XCTAssertEqual(controller.model.profiles.map(\.name), ["one", "extra"])
-            XCTAssertTrue(controller.model.deleteProfile(1))
+            XCTAssertFalse(controller.model.deleteProfile(1), "a file's profile: refused in the model")
+            controller.model.remove("profiles[1]")
+            XCTAssertTrue(controller.model.profilesChanging)
             controller.close()
         }
         try await waitUntil("the controller is freed") { closed.controller == nil }
@@ -1919,12 +1935,11 @@ extension SettingsTests {
     func testAProfileAddedShowsWhereTheCorePutItUntilApplied() async throws {
         let (model, source, writer) = try fakeModel(Self.entriesAndFiles)
         XCTAssertEqual(model.profiles.map(\.name), ["one", "two", "extra", "zeta"])
-        var selected: [Int] = []
-        XCTAssertTrue(model.duplicateProfile(1) { selected.append($0) })
+        XCTAssertTrue(model.duplicateProfile(1))
         try await waitUntil("written") { !model.isWriting }
         XCTAssertEqual(
             writer.calls, [FakeWriter.added("two Copy", ["command": .string("/bin/sh"), "appearance.opacity": .float(0.5)])])
-        XCTAssertEqual(selected, [2], "selected where the core put it")
+        XCTAssertEqual(model.takeSelectionRequest(), 2, "selected where the core put it")
         let shown = { model.profiles.map(\.name) }
         XCTAssertEqual(shown(), ["one", "two", "two Copy", "extra", "zeta"])
         XCTAssertEqual(model.profiles.map(\.index), [0, 1, 2, 3, 4])
@@ -1954,7 +1969,7 @@ extension SettingsTests {
         XCTAssertFalse(model.profilesChanging)
         XCTAssertEqual(shown(), ["one", "two", "two Copy", "extra", "zeta"])
         XCTAssertEqual(model.value("profiles[3].command"), .string("/bin/cat"))
-        XCTAssertEqual(selected, [2])
+        XCTAssertNil(model.takeSelectionRequest(), "selected once")
     }
 
     /// A configuration that lists other profiles than the add was queued
@@ -1986,12 +2001,11 @@ extension SettingsTests {
             applied.value = TesseraConfigSnapshot(generation: 1, config: external)
             return TesseraConfigEditError(.conflict, message: "config.toml changed on disk")
         }
-        var selected: Int?
-        XCTAssertTrue(model.addProfile { selected = $0 })
+        XCTAssertTrue(model.addProfile())
         try await waitUntil("written") { !model.isWriting }
         XCTAssertEqual(writer.calls, [FakeWriter.added("New Profile"), FakeWriter.added("New Profile")])
         XCTAssertNil(model.message(SettingsModel.profilesKey))
-        XCTAssertEqual(selected, 3)
+        XCTAssertEqual(model.takeSelectionRequest(), 3)
         XCTAssertEqual(model.value("profiles[1].command"), .string("/bin/zsh"), "reloaded: the external edit stays")
         XCTAssertTrue(model.profilesChanging, "the external edit's configuration does not show the add")
         XCTAssertEqual(model.profiles.map(\.name), ["one", "two", "three", "New Profile"])
@@ -2018,10 +2032,9 @@ extension SettingsTests {
             applied.value = TesseraConfigSnapshot(generation: 2, config: both)
             return nil
         }
-        var selected: Int?
-        XCTAssertTrue(model.addProfile { selected = $0 })
+        XCTAssertTrue(model.addProfile())
         try await waitUntil("written") { !model.isWriting }
-        XCTAssertEqual(selected, 3)
+        XCTAssertEqual(model.takeSelectionRequest(), 3)
         XCTAssertFalse(model.profilesChanging, "the reload shows the add")
         XCTAssertEqual(model.profiles.map(\.name), ["one", "two", "three", "New Profile"])
     }
@@ -2066,21 +2079,20 @@ extension SettingsTests {
                 """, files: files)
         let shown = { model.profiles.map(\.name) }
         XCTAssertEqual(shown(), ["one", "two", "extra", "New Profile"])
-        var selected: [Int] = []
 
-        XCTAssertTrue(model.addProfile { selected.append($0) })
+        XCTAssertTrue(model.addProfile())
         try await waitUntil("added") { !model.isWriting }
         XCTAssertNil(model.message(SettingsModel.profilesKey))
-        XCTAssertEqual(selected, [2])
+        XCTAssertEqual(model.takeSelectionRequest(), 2)
         XCTAssertTrue(try lines().contains(#"name = "New Profile 2""#), contents)
         try await waitUntil("applied") {
             !model.profilesChanging && shown() == ["one", "two", "New Profile 2", "extra", "New Profile"]
         }
 
-        XCTAssertTrue(model.duplicateProfile(3) { selected.append($0) })
+        XCTAssertTrue(model.duplicateProfile(3))
         try await waitUntil("duplicated") { !model.isWriting }
         XCTAssertNil(model.message(SettingsModel.profilesKey))
-        XCTAssertEqual(selected, [2, 3])
+        XCTAssertEqual(model.takeSelectionRequest(), 3)
         try await waitUntil("applied") {
             !model.profilesChanging && shown() == ["one", "two", "New Profile 2", "extra Copy", "extra", "New Profile"]
         }
@@ -2132,6 +2144,721 @@ extension SettingsTests {
 }
 
 // MARK: Stand-ins
+
+// MARK: The Profiles lock's release, file profiles, the cap (#344, #489)
+
+extension SettingsTests {
+    /// The text the SwiftUI views in `view` show, as their accessibility
+    /// elements give it (labels and values), depth first.
+    private static func shownTexts(in view: NSView?) -> [String] {
+        var texts: [String] = []
+        func walk(_ element: Any, depth: Int) {
+            guard depth < 80, let element = element as? NSAccessibilityProtocol else { return }
+            if let label = element.accessibilityLabel(), !label.isEmpty { texts.append(label) }
+            if let value = element.accessibilityValue() as? String, !value.isEmpty { texts.append(value) }
+            for child in element.accessibilityChildren() ?? [] { walk(child, depth: depth + 1) }
+        }
+        func walkViews(_ view: NSView) {
+            walk(view, depth: 0)
+            for subview in view.subviews { walkViews(subview) }
+        }
+        if let view { walkViews(view) }
+        return texts
+    }
+
+    /// The list's buttons in `window`, left to right: Add, Duplicate,
+    /// Delete.
+    private static func listButtons(in window: NSWindow) -> [NSButton] {
+        views(NSButton.self, in: window.contentView)
+            .filter { $0.convert($0.bounds, to: nil).minX < 200 }
+            .sorted { $0.convert($0.bounds, to: nil).minX < $1.convert($1.bounds, to: nil).minX }
+    }
+
+    /// A Profiles pane on `model` in a key window of the test's own.
+    private func profilesPane(_ model: SettingsModel) -> KeyControlledWindow {
+        let window = KeyControlledWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 600))
+        window.isKeyForTest = true
+        window.contentView = NSHostingView(rootView: ProfilesPane(model: model))
+        window.layoutIfNeeded()
+        return window
+    }
+
+    /// #312 adversarial M4, on the core, in the window the app opens:
+    /// another app that read config.toml before an Add saves it again just
+    /// after, without the profile. No configuration that shows the add
+    /// applies, so the Profiles lock goes the settle time after the add
+    /// was written (2 s, plus the apply's read), and the list says the add
+    /// was overwritten.
+    func testAnAddAStaleWriterDropsUnlocksTheProfilesPaneWithANotice() async throws {
+        let model = try openSettings(config: Self.threeProfilesTOML)
+        let (_, window) = try appSettingsInAKeyWindow()
+        defer {
+            window.contentViewController = nil
+            window.close()
+        }
+        try Self.pressToolbarItem("Profiles", in: window)
+        window.layoutIfNeeded()
+        let original = try file()
+        let attempts = 3
+        for _ in 1...attempts {
+            if try await staleWriterDropsTheAdd(model, window, original) { return }
+            // The watch applied the add before the rewrite, then the
+            // rewrite as a hand edit: back to the three profiles.
+            try await waitUntil("the rewrite applied") {
+                model.profiles.map(\.name) == ["one", "two", "three"] && !model.profilesChanging
+            }
+        }
+        throw XCTSkip(
+            "in each of \(attempts) tries the other app's rewrite came after the watch's 100 ms debounce, "
+                + "so a configuration showing the add applied first (a loaded machine)")
+    }
+
+    /// One try of the stale writer: `false` if the rewrite came too late
+    /// (the watch applied the add first, the lock went with no notice),
+    /// so that what this test is about did not happen.
+    private func staleWriterDropsTheAdd(
+        _ model: SettingsModel, _ window: NSWindow, _ original: String
+    ) async throws -> Bool {
+        let url = try configFile
+        // The other app: as soon as the add is in the file, its stale copy
+        // goes over it (inside the watch's 100 ms debounce, unless the
+        // machine is loaded).
+        let stop = Locked(false)
+        let rewrote = Locked(false)
+        let staleWriter = Thread {
+            let deadline = Date(timeIntervalSinceNow: 10)
+            while !stop.value, Date() < deadline {
+                if let text = try? String(contentsOf: url, encoding: .utf8), text.contains("New Profile") {
+                    try? original.write(to: url, atomically: true, encoding: .utf8)
+                    rewrote.value = true
+                    return
+                }
+                usleep(500)
+            }
+        }
+        staleWriter.start()
+        defer { stop.value = true }
+        let raced = { !model.profilesChanging && model.message(SettingsModel.profilesKey) == nil }
+
+        let start = ContinuousClock.now
+        XCTAssertTrue(model.addProfile())
+        try await waitUntil("the add written and overwritten") { rewrote.value && !model.isWriting }
+        if raced() { return false }
+        let waiting = "Waiting for config.toml to be applied; the profiles can be edited once it is."
+        try await waitUntil("the pane says it waits, Add disabled") {
+            !model.profilesChanging
+                || (Self.shownTexts(in: window.contentView).contains(waiting)
+                    && Self.listButtons(in: window).first?.isEnabled == false)
+        }
+        if raced() { return false }
+        XCTAssertTrue(model.profilesChanging, "locked: no configuration applied shows the add")
+        XCTAssertEqual(model.profilesStatus, waiting)
+        try await waitUntil("the lock goes") { !model.profilesChanging }
+        if raced() { return false }
+        let took = ContinuousClock.now - start
+        XCTAssertGreaterThanOrEqual(took, .milliseconds(1900), "by the settle time, not by an apply")
+        XCTAssertLessThan(took, .seconds(4), "the settle time and one apply")
+        let notice = try XCTUnwrap(model.message(SettingsModel.profilesKey))
+        XCTAssertEqual(
+            notice,
+            "“New Profile” was written but is not in the configuration applied: another app may have saved "
+                + "config.toml without it.")
+        XCTAssertEqual(model.profiles.map(\.name), ["one", "two", "three"])
+        XCTAssertNil(model.profilesStatus)
+        XCTAssertTrue(model.canAddProfile)
+        // The pane: unlocked, and the notice by the list (its message,
+        // which SwiftUI draws without a view to read: E6 sees it).
+        try await waitUntil("the pane is unlocked") {
+            Self.listButtons(in: window).first?.isEnabled == true
+                && !Self.shownTexts(in: window.contentView).contains(waiting)
+        }
+        XCTAssertEqual(try file(), original)
+        return true
+    }
+
+    /// The same on stand-ins, to the millisecond: written, the add locks
+    /// the list until a configuration shows it, at most
+    /// ``SettingsModel/profileSettleTimeout``; one that never does (here
+    /// another app's rewrite applied with the profiles as they were)
+    /// unlocks it then, with the notice by it, the rows after it and their
+    /// messages back where they were (#312 adversarial M3).
+    func testAnAddAnotherAppDroppedUnlocksAfterTheSettleTimeWithANotice() async throws {
+        let clock = ManualClock()
+        let writer = FakeWriter()
+        let refusal = "`profiles[2].command`: this profile is defined in a file in profiles/, not in config.toml"
+        writer.respond = { call, _ in
+            call.key == "profiles[2].command" ? TesseraConfigEditError(.invalidArgument, message: refusal) : nil
+        }
+        let (model, source, _) = try fakeModel(Self.entriesAndFiles, writer: writer, clock: clock)
+        let names = ["one", "two", "extra", "zeta"]
+        XCTAssertEqual(model.profiles.map(\.name), names)
+        model.set("profiles[2].command", .string("/bin/sh"))
+        try await waitUntil("refused") { !model.isWriting }
+        XCTAssertEqual(model.message("profiles[2].command"), refusal)
+
+        XCTAssertTrue(model.addProfile())
+        try await waitUntil("written") { !model.isWriting }
+        XCTAssertEqual(model.profiles.map(\.name), ["one", "two", "New Profile", "extra", "zeta"])
+        XCTAssertEqual(model.takeSelectionRequest(), 2)
+        XCTAssertNil(model.message("profiles[2].command"), "adv M3: not on the new profile")
+        XCTAssertEqual(model.message("profiles[3].command"), refusal, "adv M3: moved with extra")
+        let generation = model.profileListGeneration
+
+        // Another app's save from before the add is applied.
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(Self.entriesAndFiles))
+        model.reload()
+        XCTAssertTrue(model.profilesChanging, "a configuration without the add")
+        clock.advance(by: .milliseconds(1990))
+        XCTAssertTrue(model.profilesChanging, "locked until the settle time")
+        XCTAssertNil(model.message(SettingsModel.profilesKey))
+        clock.advance(by: .milliseconds(20))
+        XCTAssertFalse(model.profilesChanging, "unlocked at the settle time")
+        XCTAssertEqual(
+            model.message(SettingsModel.profilesKey),
+            "“New Profile” was written but is not in the configuration applied: another app may have saved "
+                + "config.toml without it.")
+        XCTAssertEqual(model.profiles.map(\.name), names)
+        XCTAssertEqual(model.message("profiles[2].command"), refusal, "back with extra")
+        XCTAssertNil(model.message("profiles[3].command"))
+        XCTAssertEqual(model.profileListGeneration, generation + 1, "the controls start again")
+        XCTAssertTrue(model.canAddProfile)
+    }
+
+    /// A delete another app's save undid unlocks the list the settle time
+    /// after it was written, with a notice; one the watch applies in time
+    /// leaves no timer behind.
+    func testADeleteAnotherAppUndidUnlocksAfterTheSettleTimeWithANotice() async throws {
+        let clock = ManualClock()
+        let (model, source, _) = try fakeModel(Self.threeProfiles, clock: clock)
+        let deleted = Self.threeProfiles.replacingOccurrences(of: #", {"name": "three"}"#, with: "")
+        XCTAssertNotEqual(deleted, Self.threeProfiles)
+
+        XCTAssertTrue(model.deleteProfile(2))
+        try await waitUntil("written") { !model.isWriting }
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(deleted))
+        model.reload()
+        XCTAssertFalse(model.profilesChanging, "applied")
+        clock.advance(by: .seconds(3))
+        XCTAssertNil(model.message(SettingsModel.profilesKey), "applied in time: no notice")
+        XCTAssertEqual(model.profiles.map(\.name), ["one", "two"])
+
+        XCTAssertTrue(model.deleteProfile(1))
+        try await waitUntil("written") { !model.isWriting }
+        XCTAssertTrue(model.profilesChanging)
+        // Another app's save from before the delete is applied.
+        source.snapshot = TesseraConfigSnapshot(generation: 2, config: try Self.json(deleted))
+        model.reload()
+        XCTAssertTrue(model.profilesChanging, "a configuration with the profile deleted")
+        clock.advance(by: .milliseconds(1990))
+        XCTAssertTrue(model.profilesChanging)
+        clock.advance(by: .milliseconds(20))
+        XCTAssertFalse(model.profilesChanging)
+        XCTAssertEqual(
+            model.message(SettingsModel.profilesKey),
+            "The profile deleted is still in the configuration applied: another app may have saved config.toml "
+                + "with it.")
+        XCTAssertEqual(model.profiles.map(\.name), ["one", "two"])
+        XCTAssertEqual(model.value("profiles[1].name"), .string("two"))
+    }
+
+    /// #312 m4, on the core, in the window the app opens: a profile of
+    /// `profiles/` shows its file (the name sanitised, S3), its controls
+    /// are read-only and Delete is disabled;
+    /// the model refuses to delete it, and an edit by key path shows the
+    /// core's refusal verbatim (21.4 M6).
+    func testAProfileFileShowsItsFileAndIsReadOnly() async throws {
+        let model = try openSettings(
+            config: Self.threeProfilesTOML, files: ["profiles/evil\u{202E}txt.toml": "command = \"/bin/cat\"\n"])
+        XCTAssertEqual(model.profiles.count, 4)
+        XCTAssertEqual(model.snapshot["profiles[3].source"], .string("profiles/evil\u{202E}txt.toml"), "raw")
+        let profile = try XCTUnwrap(model.profiles.last)
+        XCTAssertEqual(profile.file, "profiles/eviltxt.toml", "sanitised (S3)")
+        XCTAssertNil(model.profiles[1].file, "an entry of config.toml")
+        let note = "Defined in profiles/eviltxt.toml. Edit that file to change this profile."
+        XCTAssertEqual(ProfilesPane.fileNote(try XCTUnwrap(profile.file)), note)
+
+        let (_, window) = try appSettingsInAKeyWindow()
+        defer {
+            window.contentViewController = nil
+            window.close()
+        }
+        try Self.pressToolbarItem("Profiles", in: window)
+        window.layoutIfNeeded()
+        try await waitUntil("the list shows the profiles") {
+            Self.views(NSTableView.self, in: window.contentView).first?.numberOfRows == 4
+        }
+        let table = try XCTUnwrap(Self.views(NSTableView.self, in: window.contentView).first)
+        let editable = { Self.views(NSTextField.self, in: window.contentView).filter { $0.isEditable && $0.isEnabled } }
+        // The profile's controls: fields, switches (Inherit too), steppers
+        // and pickers, right of the list.
+        let controls = {
+            Self.views(NSControl.self, in: window.contentView).filter { $0.convert($0.bounds, to: nil).minX > 200 }
+        }
+        // An entry of config.toml, for comparison.
+        Self.click(table, row: 1)
+        try await waitUntil("two's fields are shown") { Self.commandField(in: window)?.stringValue == "/bin/cat" }
+        XCTAssertEqual(editable().count, 3, "name, command and working directory: \(editable().map(\.stringValue))")
+        XCTAssertTrue(controls().contains(where: \.isEnabled))
+        XCTAssertTrue(Self.listButtons(in: window).last?.isEnabled ?? false, "Delete")
+        XCTAssertFalse(Self.shownTexts(in: window.contentView).contains(note))
+
+        Self.click(table, row: 3)
+        try await waitUntil("the file's note is shown") { Self.shownTexts(in: window.contentView).contains(note) }
+        XCTAssertEqual(editable().map(\.stringValue), [], "no field is editable")
+        XCTAssertGreaterThan(controls().count, 10)
+        // The note is selectable text: on macOS 15 SwiftUI backs it with
+        // an enabled, non-editable NSTextField (`SelectionTextField`), on
+        // later systems with a view that is no NSControl. A label is no
+        // input, so it is set apart, and it may only be the note.
+        let isLabel = { (control: NSControl) in (control as? NSTextField).map { !$0.isEditable } ?? false }
+        XCTAssertEqual(
+            controls().filter { $0.isEnabled && !isLabel($0) }.map { "\(type(of: $0))" }, [], "no control is enabled")
+        XCTAssertEqual(
+            Set(controls().filter { $0.isEnabled && isLabel($0) }.map(\.stringValue)).subtracting([note]), [],
+            "the only enabled label is the note")
+        let buttons = Self.listButtons(in: window)
+        XCTAssertEqual(buttons.count, 3)
+        XCTAssertTrue(buttons[0].isEnabled, "Add")
+        XCTAssertTrue(buttons[1].isEnabled, "a file's profile can be copied into config.toml")
+        XCTAssertFalse(buttons[2].isEnabled, "Delete")
+        XCTAssertFalse(
+            Self.shownTexts(in: window.contentView).contains { $0.contains("profiles/evil\u{202E}") },
+            "the file name is never shown raw")
+
+        XCTAssertFalse(model.deleteProfile(3))
+        XCTAssertEqual(
+            model.message(SettingsModel.profilesKey),
+            "“eviltxt” is defined in profiles/eviltxt.toml; delete that file to remove it.")
+        let before = try file()
+        model.set("profiles[3].command", .string("/bin/sh"))
+        try await waitUntil("refused") { !model.isWriting }
+        XCTAssertEqual(
+            model.message("profiles[3].command"),
+            "`profiles[3].command`: this profile is defined in a file in profiles/, not in config.toml; "
+                + "edit that file instead",
+            "the core's message, verbatim")
+        XCTAssertEqual(model.value("profiles[3].command"), .string("/bin/cat"))
+        XCTAssertEqual(try file(), before)
+    }
+
+    /// 21.4 adversarial M1: the core's `source` carries control, bidi and
+    /// line separator characters as the file name has them; the window
+    /// shows it sanitised (S3).
+    func testAProfileSourceIsShownSanitised() throws {
+        let (model, _, _) = try fakeModel(
+            #"{"profiles": [{"name": "x", "source": "profiles/a\u001b]0;t\u0007‮b c\u0085.toml"}]}"#)
+        let raw = try XCTUnwrap(model.snapshot["profiles[0].source"]?.string)
+        XCTAssertTrue(raw.unicodeScalars.contains("\u{202E}"))
+        let file = try XCTUnwrap(model.profiles.first?.file)
+        let unsafe: Set<Unicode.GeneralCategory> = [.control, .format, .lineSeparator, .paragraphSeparator]
+        for text in [file, ProfilesPane.fileNote(file)] {
+            XCTAssertFalse(text.unicodeScalars.contains { unsafe.contains($0.properties.generalCategory) }, text)
+        }
+        XCTAssertEqual(file, SettingsModel.sanitisedMessage(raw))
+        XCTAssertTrue(file.hasPrefix("profiles/a"), file)
+        XCTAssertTrue(file.hasSuffix(".toml"), file)
+    }
+
+    /// 21.6a m4, #344 m-f, in the pane: at the cap Add and Duplicate are
+    /// disabled with the reason under the list (their help says it too, an
+    /// eye check: SwiftUI's help is not a view's tool tip); while a delete
+    /// waits the line says so; under the cap neither shows.
+    func testThePaneSaysWhyAddIsDisabledAtTheCapAndWhileItWaits() async throws {
+        let profiles = (0..<256).map { #"{"name": "p\#($0)"}"# }.joined(separator: ", ")
+        let (model, source, _) = try fakeModel(#"{"general": {"default_profile": "p0"}, "profiles": [\#(profiles)]}"#)
+        let window = profilesPane(model)
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        let cap = "Tessera reads at most 256 profiles, those in profiles/ included; delete one to add another."
+        let waiting = "Waiting for config.toml to be applied; the profiles can be edited once it is."
+        try await waitUntil("the list shows the profiles") {
+            Self.views(NSTableView.self, in: window.contentView).first?.numberOfRows == 256
+        }
+        let table = try XCTUnwrap(Self.views(NSTableView.self, in: window.contentView).first)
+        Self.click(table, row: 0)
+        try await waitUntil("p0's fields are shown") { Self.commandField(in: window) != nil }
+        XCTAssertEqual(model.profilesStatus, cap)
+        XCTAssertTrue(Self.shownTexts(in: window.contentView).contains(cap), "the status line")
+        let buttons = Self.listButtons(in: window)
+        XCTAssertEqual(buttons.count, 3)
+        XCTAssertFalse(buttons[0].isEnabled, "Add")
+        XCTAssertFalse(buttons[1].isEnabled, "Duplicate")
+        XCTAssertTrue(buttons[2].isEnabled, "Delete")
+
+        XCTAssertTrue(model.deleteProfile(5))
+        try await waitUntil("the pane says it waits") { Self.shownTexts(in: window.contentView).contains(waiting) }
+        XCTAssertFalse(Self.shownTexts(in: window.contentView).contains(cap))
+        try await waitUntil("written") { !model.isWriting }
+        let fewer = (0..<256).filter { $0 != 5 }.map { #"{"name": "p\#($0)"}"# }.joined(separator: ", ")
+        source.snapshot = TesseraConfigSnapshot(
+            generation: 1, config: try Self.json(#"{"general": {"default_profile": "p0"}, "profiles": [\#(fewer)]}"#))
+        model.reload()
+        // The buttons and the status line's view update apart: wait for both.
+        try await waitUntil("Add is enabled and no status line is shown") {
+            let shown = Self.shownTexts(in: window.contentView)
+            return Self.listButtons(in: window).first?.isEnabled == true
+                && !shown.contains(cap) && !shown.contains(waiting)
+        }
+        XCTAssertNil(model.profilesStatus)
+    }
+
+    /// #312 m2, mutant M7: a second add clears the message the first one's
+    /// failure left by the list as it starts.
+    func testASecondAddClearsTheFirstAddsMessage() async throws {
+        let writer = FakeWriter()
+        writer.respond = { call, attempt in
+            call.key == FakeWriter.addKey && attempt == 1 ? TesseraConfigEditError(.io, message: "disk full") : nil
+        }
+        let (model, _, _) = try fakeModel(Self.threeProfiles, writer: writer)
+        XCTAssertTrue(model.addProfile())
+        try await waitUntil("failed") { !model.isWriting }
+        XCTAssertEqual(model.message(SettingsModel.profilesKey), "disk full")
+        XCTAssertTrue(model.addProfile())
+        XCTAssertNil(model.message(SettingsModel.profilesKey), "M7: the next add clears it")
+        try await waitUntil("written") { !model.isWriting }
+        XCTAssertNil(model.message(SettingsModel.profilesKey))
+    }
+
+    /// #312 m2, mutant M15: while an add runs, a profile's key is not
+    /// written by its key path (the index may name another profile once
+    /// it applies).
+    func testAProfileKeyIsNotWrittenWhileAnAddRuns() async throws {
+        let (model, _, writer) = try fakeModel(Self.threeProfiles)
+        XCTAssertTrue(model.addProfile())
+        model.set("profiles[1].command", .string("/bin/sh"))
+        model.remove("profiles[1].command")
+        XCTAssertFalse(model.isPending("profiles[1].command"), "M15: refused while the add runs")
+        try await waitUntil("written") { !model.isWriting }
+        model.set("profiles[1].command", .string("/bin/sh"))
+        XCTAssertFalse(model.isPending("profiles[1].command"), "M15: refused until the add applies")
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(writer.calls, [FakeWriter.added("New Profile")])
+        XCTAssertEqual(model.value("profiles[1].command"), .string("/bin/cat"))
+    }
+
+    /// #312 m2, mutant M6: an add that failed after its retry reads the
+    /// configuration again, so the external edit the conflict was over
+    /// shows.
+    func testARetriedAddThatFailsShowsTheExternalEdit() async throws {
+        let writer = FakeWriter()
+        let (model, source, _) = try fakeModel(Self.threeProfiles, writer: writer)
+        let external = try Self.json(Self.threeProfiles.replacingOccurrences(of: "/bin/cat", with: "/bin/zsh"))
+        let applied = source.applied
+        writer.respond = { call, attempt in
+            guard call.key == FakeWriter.addKey else { return nil }
+            if attempt == 1 {
+                applied.value = TesseraConfigSnapshot(generation: 1, config: external)
+                return TesseraConfigEditError(.conflict, message: "config.toml changed on disk")
+            }
+            return TesseraConfigEditError(.io, message: "disk full")
+        }
+        XCTAssertTrue(model.addProfile())
+        try await waitUntil("failed") { !model.isWriting }
+        XCTAssertEqual(model.message(SettingsModel.profilesKey), "disk full")
+        XCTAssertFalse(model.profilesChanging)
+        XCTAssertEqual(model.value("profiles[1].command"), .string("/bin/zsh"), "M6: read again")
+        XCTAssertEqual(model.snapshot.generation, 1)
+    }
+
+    /// 21.6a m6: a delete retried after a conflict, which the reload shows
+    /// applied already (the external edit was of another key), unlocks the
+    /// list at once: no later configuration would change the list again.
+    func testARetriedDeleteAlreadyAppliedUnlocksAtOnce() async throws {
+        let clock = ManualClock()
+        let writer = FakeWriter()
+        let (model, source, _) = try fakeModel(Self.threeProfiles, writer: writer, clock: clock)
+        let nord = Self.threeProfiles.replacingOccurrences(of: "Tessera Dark", with: "Nord")
+        let external = try Self.json(nord)
+        let both = try Self.json(nord.replacingOccurrences(of: #"{"name": "two", "command": "/bin/cat"}, "#, with: ""))
+        XCTAssertEqual(both["profiles"]?.array?.count, 2, "the fixture deletes two")
+        let applied = source.applied
+        writer.respond = { call, attempt in
+            guard call.key == "profiles[1]" else { return nil }
+            if attempt == 1 {
+                applied.value = TesseraConfigSnapshot(generation: 1, config: external)
+                return TesseraConfigEditError(.conflict, message: "config.toml changed on disk")
+            }
+            applied.value = TesseraConfigSnapshot(generation: 2, config: both)
+            return nil
+        }
+        XCTAssertTrue(model.deleteProfile(1))
+        try await waitUntil("written") { !model.isWriting }
+        XCTAssertFalse(model.profilesChanging, "m6: the reload shows the delete")
+        XCTAssertEqual(model.profiles.map(\.name), ["one", "three"])
+        XCTAssertEqual(model.value("appearance.theme"), .string("Nord"))
+        clock.advance(by: .seconds(3))
+        XCTAssertNil(model.message(SettingsModel.profilesKey), "no settle notice either")
+    }
+
+    /// #344 round 1: a configuration applied while a slider is dragged (an
+    /// earlier value of the drag) does not move the slider back: the value
+    /// it shows stays until the drag ends and its own value applies.
+    func testAConfigurationAppliedMidDragKeepsTheSlidersValue() async throws {
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let key = "appearance.opacity"
+        // The slider is pressed: its onEditingChanged.
+        let field = try XCTUnwrap(AppearancePane.fields.first { $0.key == key })
+        let editingChanged = field.editingChanged(.init(model: model, path: key))
+        editingChanged(true)
+        model.change(key, .float(0.5))
+        try await waitUntil("the first value written") { writer.calls.count == 1 && !model.isWriting }
+        clock.advance(by: SettingsModel.coalescingInterval)
+        model.change(key, .float(0.6))
+        try await waitUntil("the second written") { writer.calls.count == 2 && !model.isWriting }
+        // The watch applies the first value's file.
+        let first = Self.fakeConfig.replacingOccurrences(of: "0.85", with: "0.5")
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(first))
+        model.reload()
+        XCTAssertEqual(model.value(key), .float(0.6), "the drag's value, not an earlier one of it")
+        editingChanged(false)
+        let second = Self.fakeConfig.replacingOccurrences(of: "0.85", with: "0.6")
+        source.snapshot = TesseraConfigSnapshot(generation: 2, config: try Self.json(second))
+        model.reload()
+        XCTAssertFalse(model.isPending(key), "its own value applied")
+        XCTAssertEqual(model.value(key), .float(0.6))
+    }
+
+    /// 24.12 adversarial B1: a step of the real Stepper by VoiceOver
+    /// (AXIncrement, as the keyboard) has no press and no release, so no
+    /// ``SettingsModel/endChange(_:)``. Its value stops waiting once a
+    /// configuration after it applies: a hand edit after it shows, and the
+    /// next step goes from the hand edit's value, not over it.
+    func testAStepperStepWithoutAPressFollowsAHandEditAfterIt() async throws {
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let key = "appearance.font_size"
+        let field = try XCTUnwrap(AppearancePane.fields.first { $0.key == key })
+        let window = KeyControlledWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 200))
+        window.isKeyForTest = true
+        window.contentView = NSHostingView(
+            rootView: SettingsFieldRow(field: field, context: .init(model: model, path: key)).padding())
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        window.layoutIfNeeded()
+        func incrementor() throws -> NSAccessibilityProtocol {
+            var found: NSAccessibilityProtocol?
+            func walk(_ element: Any, depth: Int) {
+                guard found == nil, depth < 60, let element = element as? NSAccessibilityProtocol else { return }
+                if element.accessibilityRole() == .incrementor { found = element }
+                for child in element.accessibilityChildren() ?? [] { walk(child, depth: depth + 1) }
+            }
+            func walkViews(_ view: NSView) {
+                walk(view, depth: 0)
+                view.subviews.forEach(walkViews)
+            }
+            walkViews(try XCTUnwrap(window.contentView))
+            return try XCTUnwrap(found, "the stepper's incrementor")
+        }
+        func apply(_ size: String, generation: UInt64) throws {
+            let text = Self.fakeConfig.replacingOccurrences(of: #""font_size": 13.0"#, with: #""font_size": \#(size)"#)
+            source.snapshot = TesseraConfigSnapshot(generation: generation, config: try Self.json(text))
+            model.reload()
+        }
+        try await waitUntil("the stepper is shown") { (try? incrementor()) != nil }
+
+        // Its result is false though the step is taken.
+        _ = try incrementor().accessibilityPerformIncrement()
+        try await waitUntil("the step written") { writer.calls.count == 1 && !model.isWriting }
+        XCTAssertEqual(writer.calls.last, .init(key: key, value: .float(14)))
+        try apply("14.0", generation: 1)
+        XCTAssertFalse(model.isPending(key), "its own value applied")
+        clock.advance(by: .seconds(3))
+        try apply("20.0", generation: 2)
+        XCTAssertEqual(model.value(key), .float(20), "the hand edit shows")
+
+        window.layoutIfNeeded()
+        _ = try incrementor().accessibilityPerformIncrement()
+        try await waitUntil("the next step written") { writer.calls.count == 2 && !model.isWriting }
+        XCTAssertEqual(writer.calls.last, .init(key: key, value: .float(21)), "from the hand edit's 20")
+    }
+
+    /// 21.6a adversarial M6: a profile's slider value held back by the
+    /// coalescing when a delete locks the profiles is not written (its
+    /// index may name another profile once the delete applies), and the
+    /// list says so; the slider shows what was written of the drag.
+    func testASlidersProfileValueHeldBackByADeleteIsNotSavedWithANotice() async throws {
+        let clock = ManualClock()
+        let (model, _, writer) = try fakeModel(Self.threeProfiles, clock: clock)
+        let key = "profiles[1].appearance.opacity"
+        model.change(key, .float(0.4))
+        try await waitUntil("the first value written") { writer.calls.count == 1 && !model.isWriting }
+        model.change(key, .float(0.5))
+        XCTAssertTrue(model.deleteProfile(2))
+        try await waitUntil("the delete written") { writer.calls.count == 2 && !model.isWriting }
+        XCTAssertNil(model.message(SettingsModel.profilesKey))
+        clock.advance(by: SettingsModel.coalescingInterval)
+        XCTAssertEqual(model.message(SettingsModel.profilesKey), SettingsModel.heldValueNotice)
+        XCTAssertEqual(model.value(key), .float(0.4), "what was written of the drag")
+        model.endChange(key)
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(
+            writer.calls, [.init(key: key, value: .float(0.4)), .init(key: "profiles[2]", value: nil)],
+            "0.5 is not written")
+    }
+
+    /// 21.6a adversarial M4: the core compares profile names byte for
+    /// byte, so a decomposed "café" is another name than the composed one,
+    /// and the window takes it as the core does.
+    func testAProfileNameIsComparedByteForByte() throws {
+        let (model, _, _) = try fakeModel(#"{"profiles": [{"name": "café"}, {"name": "two"}]}"#)
+        XCTAssertEqual(model.profileNameRefusal("caf\u{E9}", at: 1), "A profile named “café” exists.")
+        XCTAssertNil(model.profileNameRefusal("cafe\u{301}", at: 1), "decomposed: another name to the core")
+        XCTAssertNil(model.profileNameRefusal("caf\u{E9}", at: 0), "its own name")
+    }
+
+    /// 21.6a adversarial M5: Add pressed while a profile's Name field holds
+    /// a name the window refuses says, by the list, that the name was not
+    /// saved (its own message goes from view with the selection).
+    func testAddAfterARefusedRenameSaysTheNameWasNotSaved() async throws {
+        let (model, _, writer) = try fakeModel(Self.threeProfiles)
+        let field = NSObject()
+        model.holdDraft(field) { model.renameProfile(1, to: "one") }
+        XCTAssertTrue(model.addProfile())
+        let notice = "The name typed was not saved: A profile named “one” exists."
+        XCTAssertEqual(model.message(SettingsModel.profilesKey), notice)
+        try await waitUntil("written") { !model.isWriting }
+        XCTAssertEqual(writer.calls, [FakeWriter.added("New Profile")])
+        XCTAssertEqual(model.message(SettingsModel.profilesKey), notice)
+
+        // A name it takes says nothing.
+        let (other, _, _) = try fakeModel(Self.threeProfiles)
+        other.holdDraft(field) { other.renameProfile(1, to: "zwei") }
+        XCTAssertTrue(other.duplicateProfile(1))
+        XCTAssertNil(other.message(SettingsModel.profilesKey))
+        try await waitUntil("written") { !other.isWriting }
+    }
+
+    /// #312 adversarial M1: a configuration an earlier edit applies while
+    /// the add runs (the keys this window had pending when it was queued
+    /// now applied) does not end the add: its row stays and the list stays
+    /// locked until a configuration shows it.
+    func testAnEarlierEditAppliedBeforeTheAddsResultKeepsTheAdd() async throws {
+        let gate = DispatchSemaphore(value: 0)
+        let writer = FakeWriter()
+        writer.respond = { call, _ in
+            if call.key == FakeWriter.addKey { gate.wait() }
+            return nil
+        }
+        let (model, source, _) = try fakeModel(Self.threeProfiles, writer: writer)
+        model.set("profiles[1].command", .string("/bin/sh"))
+        XCTAssertTrue(model.addProfile())
+        try await waitUntil("the command written, the add running") { writer.calls.count == 2 }
+        // The command's result comes back to the main thread.
+        try await Task.sleep(for: .milliseconds(100))
+        // The watch applies the command's edit before the add's result.
+        let commandOnly = Self.threeProfiles.replacingOccurrences(of: "/bin/cat", with: "/bin/sh")
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(commandOnly))
+        model.reload()
+        XCTAssertFalse(model.isPending("profiles[1].command"), "applied")
+        gate.signal()
+        try await waitUntil("added") { !model.isWriting }
+        XCTAssertTrue(model.profilesChanging, "adv M1: the add waits for a list that shows it")
+        XCTAssertEqual(model.profiles.map(\.name), ["one", "two", "three", "New Profile"])
+    }
+
+    /// #312 m1 and m5: an add holds no pane, so a model whose add was
+    /// written and never applied goes with its last reference (the pane
+    /// and window closed; the settle timer holds it weakly). A pane shown
+    /// on a model whose add was written meanwhile selects the profile.
+    func testAnAddWrittenWithNoPaneHoldsNothingAndThePaneShownThenSelectsIt() async throws {
+        weak var gone: SettingsModel?
+        do {
+            let (model, _, writer) = try fakeModel(Self.threeProfiles)
+            gone = model
+            XCTAssertTrue(model.addProfile())
+            try await waitUntil("written") { writer.calls.count == 1 && !model.isWriting }
+            XCTAssertTrue(model.profilesChanging, "written, never applied")
+        }
+        try await waitUntil("m1: the model goes, its add never applied") { gone == nil }
+
+        let (model, _, _) = try fakeModel(Self.threeProfiles)
+        XCTAssertTrue(model.addProfile())
+        try await waitUntil("written") { !model.isWriting }
+        XCTAssertEqual(model.selectionRequest, 3)
+        let window = profilesPane(model)
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        try await waitUntil("m5: the pane shown later selects the copy") {
+            let table = Self.views(NSTableView.self, in: window.contentView).first
+            return table?.numberOfRows == 4 && table?.selectedRow == 3
+        }
+        XCTAssertNil(model.selectionRequest, "taken")
+    }
+
+    /// 21.6a m7: a directory chosen with Choose… while text is typed into
+    /// the Working directory field is the last write, and the field shows
+    /// it: the typed text is written first, not over it once the field
+    /// loses the focus.
+    func testChooseAfterTypedTextKeepsTheChosenDirectory() async throws {
+        try await chooseAfterTypedText(onWindow: true)
+    }
+
+    /// Without a window to take the focus from the field (the panel runs
+    /// on its own), the field still writes its text no more once the
+    /// model committed it: each guard alone keeps the chosen directory.
+    func testChooseAfterTypedTextKeepsTheChosenDirectoryWithTheFieldFocused() async throws {
+        try await chooseAfterTypedText(onWindow: false)
+    }
+
+    /// Types into two's working directory, then Choose… picks another one
+    /// (21.6a m7): the typed text is written first, the chosen directory
+    /// last, and the field shows it.
+    private func chooseAfterTypedText(onWindow: Bool) async throws {
+        let (model, _, writer) = try fakeModel(Self.threeProfiles)
+        let window = profilesPane(model)
+        if onWindow { model.window = window }
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        try await waitUntil("the list shows the profiles") {
+            Self.views(NSTableView.self, in: window.contentView).first?.numberOfRows == 3
+        }
+        let table = try XCTUnwrap(Self.views(NSTableView.self, in: window.contentView).first)
+        Self.click(table, row: 1)
+        let directory = {
+            Self.views(NSTextField.self, in: window.contentView).first {
+                $0.placeholderString == "Home folder" && $0.isEditable
+            }
+        }
+        try await waitUntil("two's fields are shown") { directory() != nil }
+        let field = try XCTUnwrap(directory())
+        XCTAssertTrue(window.makeFirstResponder(field))
+        field.currentEditor()?.selectAll(nil)
+        (field.currentEditor() as? NSTextView)?.insertText(
+            "/typed", replacementRange: NSRange(location: NSNotFound, length: 0))
+        try await Task.sleep(for: .milliseconds(50))
+
+        let panel = RecordingOpenPanel(url: URL(filePath: "/tmp/chosen", directoryHint: .notDirectory))
+        let path = "profiles[1].working_directory"
+        SettingsFieldRow.chooseDirectory(
+            panel, for: ProfilesPane.fields[2], .init(model: model, path: path, profile: 1))
+        XCTAssertEqual(panel.runs, [onWindow ? .sheet(on: ObjectIdentifier(window)) : .alone])
+        try await Task.sleep(for: .milliseconds(100))
+        panel.end(.OK)
+        if onWindow {
+            // Choose… let the field go: it shows the directory without a
+            // click elsewhere.
+            try await waitUntil("the field shows it") { directory()?.stringValue == "/tmp/chosen" }
+        }
+        window.makeFirstResponder(nil)
+        try await Task.sleep(for: .milliseconds(150))
+        try await waitUntil("written") { !model.isWriting }
+        XCTAssertEqual(
+            writer.calls,
+            [.init(key: path, value: .string("/typed")), .init(key: path, value: .string("/tmp/chosen"))],
+            "the chosen directory last")
+        XCTAssertEqual(model.value(path), .string("/tmp/chosen"))
+        try await waitUntil("the field shows it") { directory()?.stringValue == "/tmp/chosen" }
+    }
+}
 
 /// Records each edit and answers with `respond` (by the call and how many
 /// times its key was edited, from 1); asserts no edit runs on the main

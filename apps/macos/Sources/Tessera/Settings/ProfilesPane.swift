@@ -4,7 +4,9 @@ import SwiftUI
 /// `profiles/*.toml`, with Add, Duplicate and Delete under it, and the
 /// selected profile's name, command, working directory and appearance. Each
 /// appearance key either follows `[appearance]` (Inherit, the key left out
-/// of the profile) or is the profile's own.
+/// of the profile) or is the profile's own. A profile of `profiles/` shows
+/// its file and is read-only here: the core edits only config.toml (#312
+/// m4).
 struct ProfilesPane: View {
     let model: SettingsModel
     @State private var selection: Int?
@@ -39,6 +41,7 @@ struct ProfilesPane: View {
                         Text(profile.title)
                             .lineLimit(1)
                             .truncationMode(.tail)
+                            .help(profile.file.map(Self.fileNote) ?? "")
                             .tag(profile.index)
                     }
                 }
@@ -47,33 +50,39 @@ struct ProfilesPane: View {
                 .disabled(changing)
                 HStack(spacing: 4) {
                     Button {
-                        // Selected once written, where the core put it.
-                        model.addProfile { selection = $0 }
+                        // Selected once written, where the core put it
+                        // (the model's selection request).
+                        model.addProfile()
                     } label: {
                         Image(systemName: "plus").accessibilityLabel("Add Profile")
                     }
                     .disabled(!model.canAddProfile)
+                    .help(model.canAddProfile ? "Add a profile" : model.profilesStatus ?? "")
                     Button {
                         if let selection {
-                            model.duplicateProfile(selection) { self.selection = $0 }
+                            model.duplicateProfile(selection)
                         }
                     } label: {
                         Image(systemName: "plus.square.on.square").accessibilityLabel("Duplicate Profile")
                     }
                     .disabled(selected(in: profiles) == nil || !model.canAddProfile)
+                    .help(model.canAddProfile ? "Duplicate the selected profile" : model.profilesStatus ?? "")
                     Button {
                         confirmingDelete = selected(in: profiles)
                     } label: {
                         Image(systemName: "minus").accessibilityLabel("Delete Profile")
                     }
-                    .disabled(selected(in: profiles) == nil)
+                    .disabled(selected(in: profiles).map { $0.file != nil } ?? true)
+                    .help(selected(in: profiles)?.file.map(Self.fileNote) ?? "Delete the selected profile")
                 }
                 .buttonStyle(.borderless)
                 .disabled(changing)
                 .padding(.top, 6)
                 if let status = model.profilesStatus {
-                    // Why the list and the profile are disabled (#344 m-f).
+                    // Why the list and the profile, or Add and Duplicate,
+                    // are disabled (#344 m-f, 21.6a m4).
                     Text(status)
+                        .textSelection(.enabled)
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -86,8 +95,7 @@ struct ProfilesPane: View {
             .padding([.leading, .top, .bottom], 20)
 
             if let profile = selected(in: profiles) {
-                ProfileDetail(model: model, profile: profile)
-                    .disabled(changing)
+                ProfileDetail(model: model, profile: profile, changing: changing)
             } else {
                 Text(profiles.isEmpty ? "No profiles. Add one with +." : "Select a profile.")
                     .foregroundStyle(.secondary)
@@ -97,6 +105,11 @@ struct ProfilesPane: View {
         }
         .frame(width: 680)
         .fixedSize(horizontal: false, vertical: true)
+        // The profile an Add or Duplicate wrote, once written: also when
+        // this pane shows a model a closed window left waiting (#312 m5).
+        .onChange(of: model.selectionRequest, initial: true) {
+            if let index = model.takeSelectionRequest() { selection = index }
+        }
         .confirmationDialog(
             "Delete the profile “\(confirmingDelete?.title ?? "")”?",
             isPresented: Binding(get: { confirmingDelete != nil }, set: { if !$0 { confirmingDelete = nil } })
@@ -112,24 +125,42 @@ struct ProfilesPane: View {
         }
     }
 
+    /// What a profile of `profiles/` shows: `file` is the core's
+    /// `source`, sanitised (``SettingsModel/Profile/file``, S3).
+    static func fileNote(_ file: String) -> String {
+        "Defined in \(file). Edit that file to change this profile."
+    }
+
     private func selected(in profiles: [SettingsModel.Profile]) -> SettingsModel.Profile? {
         guard let selection else { return nil }
         return profiles.first { $0.index == selection }
     }
 }
 
-/// The selected profile's settings.
+/// The selected profile's settings: disabled while the list is locked,
+/// and for a profile of `profiles/`, which shows its file instead.
 private struct ProfileDetail: View {
     let model: SettingsModel
     let profile: SettingsModel.Profile
+    let changing: Bool
 
     var body: some View {
         Form {
+            if let file = profile.file {
+                Section {
+                    // Plain text: the file name is the core's, sanitised.
+                    Text(ProfilesPane.fileNote(file))
+                        .textSelection(.enabled)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
             Section {
                 ForEach(ProfilesPane.fields) { field in
                     SettingsFieldRow(
                         field: field,
                         context: .init(model: model, path: profile.key(field.key), profile: profile.index))
+                    .disabled(readOnly)
                 }
             }
             Section("Appearance") {
@@ -142,12 +173,14 @@ private struct ProfileDetail: View {
                                 model: model, path: profile.key(field.key), fallback: field.key,
                                 profile: profile.index),
                             disabled: inherits)
+                        .disabled(readOnly)
                         Toggle(
                             "Inherit from Appearance",
                             isOn: Binding(
                                 get: { model.inherits(profile.index, field.key) },
                                 set: { model.setInherits(profile.index, field.key, $0) }))
                         .controlSize(.small)
+                        .disabled(readOnly)
                     }
                 }
             }
@@ -156,5 +189,10 @@ private struct ProfileDetail: View {
         // Rows of another profile must not keep this one's draft text: nor
         // the same index once a hand edit put another profile there.
         .id([profile.index, model.profileListGeneration])
+    }
+
+    /// No control edits: the list is locked, or the profile is a file's.
+    private var readOnly: Bool {
+        changing || profile.file != nil
     }
 }
