@@ -618,6 +618,24 @@ final class TerminalWindowController: NSWindowController, NSWindowDelegate, NSMe
         (window?.contentView as? TerminalWindowContentView)?.windowDidBecomeVisible()
     }
 
+    /// The window is in native full screen (View > Enter Full Screen, the
+    /// green button, ⌃⌘F): every tab's title bar draws opaque, with no strip
+    /// under it (ADR 0043 D7). A tab not shown now is also brought up to
+    /// date as it is selected and as its layout changes.
+    func windowDidEnterFullScreen(_ notification: Notification) {
+        for tab in (window as? TerminalWindow)?.tabs ?? [] {
+            (tab.contentView as? TerminalWindowContentView)?.windowDidBecomeVisible()
+        }
+    }
+
+    /// The window left native full screen: every tab's title bar and strip
+    /// are the windowed ones again.
+    func windowDidExitFullScreen(_ notification: Notification) {
+        for tab in (window as? TerminalWindow)?.tabs ?? [] {
+            (tab.contentView as? TerminalWindowContentView)?.windowDidBecomeVisible()
+        }
+    }
+
     /// ⌘W's title is this tab's while its window is key: another window's
     /// menu (one that is not a terminal's) says Close Tab again.
     func windowDidResignKey(_ notification: Notification) {
