@@ -307,3 +307,50 @@ sooner if RustSec publishes a vulnerability against `ttf-parser`, since an
   rejected and not rasterised again until the next `clear`.
 - Every glyph upload runs inside a validation error scope, which costs one
   scope pop per atlas miss. Misses are rare after the first frame.
+
+## Amendment 2026-11-17: a styled character stays in its family (#119)
+
+**Order within a family.** Every family of the chain (the primary, the
+configured fallbacks, Apple Color Emoji and the system list) is now tried
+the way faces found through the coverage index already were: the face
+for the requested style, then, for italic, the upright face at the
+requested weight with synthetic italic (the Regular face for italic, the
+upright Bold face for bold italic), and only then the next family.
+Before, the chain tried only each family's styled face, so a character
+the italic cut lacks but the upright cut has (U+01DE in Menlo Italic,
+which Menlo Regular covers) was drawn from the next family that covers
+it (Arial Unicode MS) instead of slanted Menlo. A family none of whose
+faces covers the character still falls through to the next family.
+
+**Synthetic bold comes last.** Bold and bold italic walk the chain twice.
+The first pass tries each family's styled face (and, for bold italic,
+its upright Bold face), as above; a family with no bold face at all
+answers the bold query with its Regular face, drawn with synthetic bold,
+as before #119. Only when no family's face covers the character does a
+second pass try each family's Regular face with synthetic bold (and
+italic as needed), so a later family's real bold beats an earlier
+family's synthetic bold. Synthetic italic is a benign shear and stays in
+the family; synthetic bold fills the counters of dense glyphs: Hiragino
+Sans Bold lacks about 4,400 Han characters its W3 face has (类 among
+them), and drawing those as emboldened W3 made one character in twenty
+of bold Chinese blotchier than its real-bold neighbours, where the chain
+already drew them from Hiragino Sans GB W6. Each pass ends with the
+family the coverage index finds for the character, so a real bold found
+only through the index (Hiragino Mincho ProN W6 for U+24F5) also beats
+the chain's synthetic bold; a synthetic bold the chain finds while the
+index is still building is not cached.
+
+The order and its passes are defined once, in a pure function of the
+family's faces (their slant, weight, colour and `wght` axis), their
+coverage and the pass, used by both the chain and the coverage-index
+path; a face the database matches for two of the queries, in either
+pass, is tested once. The synthesis rules are
+unchanged: colour faces are never synthesised and are drawn at their own
+weight, so an emoji resolves to the same face and flags in every style.
+VS16 still tries Apple Color Emoji first; VS15 keeps the text-first
+order and gains the same in-family step.
+
+**Caches.** Per-character results stay keyed by character and style.
+The per-family cache holds the face each family matches for each of the
+four query styles, so the sibling queries add no entries beyond families
+x 4.

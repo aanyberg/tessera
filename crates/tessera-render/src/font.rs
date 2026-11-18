@@ -210,6 +210,208 @@ pub(crate) struct ResolvedFace {
     pub(crate) synthetic_italic: bool,
 }
 
+/// What the face choice needs to know about one face of a family.
+///
+/// `I` is the face's identity: a `fontdb::ID` in [`Inner`], anything
+/// comparable in tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Face<I> {
+    id: I,
+    /// Italic or oblique.
+    italic: bool,
+    /// The face's own weight (the default instance of a variable face).
+    weight: u16,
+    /// A `wght` axis reaching [`BOLD_THRESHOLD`]; only looked at, and only
+    /// computed, for faces lighter than that.
+    bold_axis: bool,
+    /// Carries colour glyphs (`sbix`, `COLR` or `CBDT`).
+    color: bool,
+}
+
+/// A face chosen to draw a style: the face instantiated at `weight`, with
+/// the synthesis it needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Picked<I> {
+    id: I,
+    weight: u16,
+    synthetic_bold: bool,
+    synthetic_italic: bool,
+}
+
+impl Picked<fontdb::ID> {
+    fn resolved(self) -> ResolvedFace {
+        ResolvedFace {
+            face: FaceId::font(self.id, fontdb::Weight(self.weight)),
+            synthetic_bold: self.synthetic_bold,
+            synthetic_italic: self.synthetic_italic,
+        }
+    }
+}
+
+/// One family, as [`pick_in_family`] queries it.
+trait Family {
+    /// What identifies a face of the family.
+    type Id: Copy + PartialEq;
+    /// The family's best match for `query` (as the font database matches
+    /// a weight and slant), or `None` when the family has no face at all.
+    fn face(&mut self, query: FontStyle) -> Option<Face<Self::Id>>;
+    /// Whether `picked` has a glyph for the character being resolved.
+    fn covers(&mut self, picked: &Picked<Self::Id>) -> bool;
+}
+
+/// The pass over the chain that tries a family's styled face, the upright
+/// face at the requested weight with synthetic italic, and (for italic)
+/// the regular face with synthetic italic.
+const STYLED_PASS: u8 = 0;
+
+/// The pass over the chain, for bold styles only and only after
+/// [`STYLED_PASS`] found nothing in any family, that tries a family's
+/// regular face with synthetic bold: a later family's real bold beats an
+/// earlier family's synthetic bold (CJK bold, #119).
+const SYNTHETIC_BOLD_PASS: u8 = 1;
+
+/// The number of passes over the chain that `style` needs.
+const fn passes(style: FontStyle) -> u8 {
+    if style.is_bold() {
+        SYNTHETIC_BOLD_PASS + 1
+    } else {
+        STYLED_PASS + 1
+    }
+}
+
+/// The queries tried within one family to draw `style`, in order, each
+/// with the pass over the chain it belongs to: the styled face; the
+/// upright face at the requested weight (synthetic italic); the regular
+/// face, with synthetic italic in the styled pass and with synthetic bold
+/// in the synthetic-bold pass. ADR 0007.
+const fn family_order(style: FontStyle) -> &'static [(FontStyle, u8)] {
+    match style {
+        FontStyle::Regular => &[(FontStyle::Regular, STYLED_PASS)],
+        FontStyle::Bold => &[
+            (FontStyle::Bold, STYLED_PASS),
+            (FontStyle::Regular, SYNTHETIC_BOLD_PASS),
+        ],
+        FontStyle::Italic => &[
+            (FontStyle::Italic, STYLED_PASS),
+            (FontStyle::Regular, STYLED_PASS),
+        ],
+        FontStyle::BoldItalic => &[
+            (FontStyle::BoldItalic, STYLED_PASS),
+            (FontStyle::Bold, STYLED_PASS),
+            (FontStyle::Regular, SYNTHETIC_BOLD_PASS),
+        ],
+    }
+}
+
+/// `face` drawing `style`, with the synthesis it needs: bold when the
+/// face is lighter than [`BOLD_THRESHOLD`] and has no `wght` axis reaching
+/// it, italic when the face is upright. A colour face is never
+/// synthesised and is always drawn at its own weight, so an emoji looks
+/// (and is cached) the same in every style.
+const fn synthesise<I: Copy>(face: &Face<I>, style: FontStyle) -> Picked<I> {
+    if face.color {
+        return Picked {
+            id: face.id,
+            weight: face.weight,
+            synthetic_bold: false,
+            synthetic_italic: false,
+        };
+    }
+    Picked {
+        id: face.id,
+        weight: style.weight().0,
+        synthetic_bold: style.is_bold() && face.weight < BOLD_THRESHOLD && !face.bold_axis,
+        synthetic_italic: style.is_italic() && !face.italic,
+    }
+}
+
+/// The face of `family` that draws the character in `style` in `pass`:
+/// the first face of that pass in [`family_order`] that covers it, drawn
+/// with the [`synthesise`] rule, or `None` when no face of the pass covers
+/// it (the caller moves on to the next family, then to the next pass). A
+/// face the database matches for two queries, in this pass or an earlier
+/// one, is tested once.
+fn pick_in_family<F: Family>(family: &mut F, style: FontStyle, pass: u8) -> Option<Picked<F::Id>> {
+    let mut tried: [Option<F::Id>; 3] = [None; 3];
+    for (slot, &(query, query_pass)) in family_order(style).iter().enumerate() {
+        if query_pass > pass {
+            break;
+        }
+        let Some(face) = family.face(query) else {
+            continue;
+        };
+        if tried.contains(&Some(face.id)) {
+            continue;
+        }
+        tried[slot] = Some(face.id);
+        if query_pass < pass {
+            // Tested in the earlier pass.
+            continue;
+        }
+        let picked = synthesise(&face, style);
+        if family.covers(&picked) {
+            return Some(picked);
+        }
+    }
+    None
+}
+
+/// A family of the fallback chain, by its index in `Inner::families`;
+/// its faces are cached per query style.
+struct ChainFamily<'a> {
+    inner: &'a mut Inner,
+    index: usize,
+    ch: char,
+}
+
+impl Family for ChainFamily<'_> {
+    type Id = fontdb::ID;
+
+    fn face(&mut self, query: FontStyle) -> Option<Face<fontdb::ID>> {
+        self.inner.family_face(self.index, query)
+    }
+
+    fn covers(&mut self, picked: &Picked<fontdb::ID>) -> bool {
+        self.inner.covers(picked.resolved().face, self.ch)
+    }
+}
+
+/// A family found through the coverage index, by name; not cached (the
+/// per-character result is).
+struct NamedFamily<'a> {
+    inner: &'a mut Inner,
+    name: &'a str,
+    ch: char,
+}
+
+impl Family for NamedFamily<'_> {
+    type Id = fontdb::ID;
+
+    fn face(&mut self, query: FontStyle) -> Option<Face<fontdb::ID>> {
+        let id = query_family(self.inner.system.db(), self.name, query)?;
+        self.inner.face_traits(id)
+    }
+
+    fn covers(&mut self, picked: &Picked<fontdb::ID>) -> bool {
+        self.inner.covers(picked.resolved().face, self.ch)
+    }
+}
+
+/// The database's best match in family `name` for `style`'s weight and
+/// slant.
+fn query_family(db: &fontdb::Database, name: &str, style: FontStyle) -> Option<fontdb::ID> {
+    db.query(&fontdb::Query {
+        families: &[fontdb::Family::Name(name)],
+        weight: style.weight(),
+        stretch: fontdb::Stretch::Normal,
+        style: if style.is_italic() {
+            fontdb::Style::Italic
+        } else {
+            fontdb::Style::Normal
+        },
+    })
+}
+
 /// One glyph out of the shaper, in device pixels, before cell placement.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RawGlyph {
@@ -278,7 +480,9 @@ pub(crate) struct Inner {
     families: Vec<String>,
     chain: Chain,
     used_default_family: bool,
-    styled_faces: HashMap<(usize, FontStyle), Option<ResolvedFace>>,
+    /// The face each family matches for each query style; bounded by
+    /// families x 4.
+    styled_faces: HashMap<(usize, FontStyle), Option<Face<fontdb::ID>>>,
     char_faces: HashMap<(char, FontStyle), ResolvedFace>,
     /// Filled by a background thread started in [`Fonts::new`]; read
     /// without blocking, so a frame never waits for it.
@@ -589,59 +793,54 @@ impl Inner {
     /// The face family `index` uses for `style`, with the synthesis needed
     /// when the family has no matching face.
     fn styled_face(&mut self, index: usize, style: FontStyle) -> Option<ResolvedFace> {
-        if let Some(cached) = self.styled_faces.get(&(index, style)) {
+        self.family_face(index, style)
+            .map(|face| synthesise(&face, style).resolved())
+    }
+
+    /// The face family `index` matches for `query`, cached.
+    fn family_face(&mut self, index: usize, query: FontStyle) -> Option<Face<fontdb::ID>> {
+        if let Some(cached) = self.styled_faces.get(&(index, query)) {
             return *cached;
         }
-        let resolved = self.query_styled_face(index, style);
-        self.styled_faces.insert((index, style), resolved);
-        resolved
+        let face = self
+            .families
+            .get(index)
+            .and_then(|family| query_family(self.system.db(), family, query))
+            .and_then(|id| self.face_traits(id));
+        self.styled_faces.insert((index, query), face);
+        face
     }
 
-    fn query_styled_face(&mut self, index: usize, style: FontStyle) -> Option<ResolvedFace> {
-        let family = self.families.get(index)?;
-        let db = self.system.db();
-        let id = db.query(&fontdb::Query {
-            families: &[fontdb::Family::Name(family)],
-            weight: style.weight(),
-            stretch: fontdb::Stretch::Normal,
-            style: if style.is_italic() {
-                fontdb::Style::Italic
-            } else {
-                fontdb::Style::Normal
-            },
-        })?;
-        self.with_synthesis(id, style)
-    }
-
-    /// Face `id` drawing `style`, with the synthesis it needs: bold when
-    /// the face is lighter than [`BOLD_THRESHOLD`] and has no `wght` axis
-    /// reaching it, italic when the face is upright. Colour faces are
-    /// never synthesised and always drawn at their own weight, so an emoji
-    /// looks (and is cached) the same in every style.
-    fn with_synthesis(&mut self, id: fontdb::ID, style: FontStyle) -> Option<ResolvedFace> {
+    /// What [`synthesise`] needs to know about face `id`, read from the
+    /// face loaded at its own weight.
+    fn face_traits(&mut self, id: fontdb::ID) -> Option<Face<fontdb::ID>> {
         let info = self.system.db().face(id)?;
-        let face_style = info.style;
-        let face_weight = info.weight.0;
-        let own = FaceId::font(id, info.weight);
-        if self.is_color(own) {
-            return Some(ResolvedFace {
-                face: own,
-                synthetic_bold: false,
-                synthetic_italic: false,
+        let italic = info.style != fontdb::Style::Normal;
+        let weight = info.weight;
+        let own = FaceId::font(id, weight);
+        let color = self.is_color(own);
+        let bold_axis = !color
+            && weight.0 < BOLD_THRESHOLD
+            && self.load(own).is_some_and(|font| {
+                font.as_swash()
+                    .variations()
+                    .find_by_tag(swash::tag_from_bytes(b"wght"))
+                    .is_some_and(|axis| axis.max_value() >= f32::from(BOLD_THRESHOLD))
             });
-        }
-        let face = FaceId::font(id, style.weight());
-        let has_wght_axis = self.load(face).is_some_and(|font| {
-            font.as_swash()
-                .variations()
-                .find_by_tag(swash::tag_from_bytes(b"wght"))
-                .is_some_and(|axis| axis.max_value() >= f32::from(BOLD_THRESHOLD))
-        });
-        Some(ResolvedFace {
-            face,
-            synthetic_bold: style.is_bold() && face_weight < BOLD_THRESHOLD && !has_wght_axis,
-            synthetic_italic: style.is_italic() && face_style == fontdb::Style::Normal,
+        Some(Face {
+            id,
+            italic,
+            weight: weight.0,
+            bold_axis,
+            color,
         })
+    }
+
+    /// Face `id` drawing `style`, with the synthesis it needs (the
+    /// [`synthesise`] rule).
+    fn with_synthesis(&mut self, id: fontdb::ID, style: FontStyle) -> Option<ResolvedFace> {
+        self.face_traits(id)
+            .map(|face| synthesise(&face, style).resolved())
     }
 
     /// The face that draws `ch` in `style`: the primary family, then the
@@ -651,6 +850,13 @@ impl Inner {
         if let Some(r) = self.char_faces.get(&(ch, style)) {
             return *r;
         }
+        self.resolve_miss(ch, style)
+    }
+
+    /// [`Self::resolve`] on a cache miss. Out of line so the walk of the
+    /// chain does not bloat the hit path (a lookup per character drawn).
+    #[inline(never)]
+    fn resolve_miss(&mut self, ch: char, style: FontStyle) -> ResolvedFace {
         let (resolved, cacheable) = self.resolve_uncached(ch, style);
         if !cacheable {
             // The coverage index is still building; resolve again later.
@@ -718,31 +924,49 @@ impl Inner {
                 .copied()
                 .collect()
         };
-        for index in std::iter::once(0).chain(chain.user).chain(tail) {
-            if let Some(r) = self.styled_face(index, style)
-                && self.covers(r.face, ch)
+        // Each pass walks the chain, then the family the coverage index
+        // finds, so a real bold found through the index beats the chain's
+        // synthetic bold. A synthetic bold the chain finds before the
+        // index is ready may lose to the index later: not cached.
+        let coverage = Arc::clone(&self.coverage);
+        let index = coverage.get();
+        let mut found = None;
+        for pass in 0..passes(style) {
+            let order = std::iter::once(0)
+                .chain(chain.user.iter().copied())
+                .chain(tail.iter().copied());
+            for family_index in order {
+                let mut family = ChainFamily {
+                    inner: self,
+                    index: family_index,
+                    ch,
+                };
+                if let Some(picked) = pick_in_family(&mut family, style, pass) {
+                    return (picked.resolved(), pass == STYLED_PASS || index.is_some());
+                }
+            }
+            if pass == STYLED_PASS {
+                found = index.and_then(|index| index.lookup(ch));
+            }
+            if let Some(id) = found
+                && let Some(r) = self.styled_sibling(id, ch, style, pass)
             {
                 return (r, true);
             }
         }
-        let coverage = Arc::clone(&self.coverage);
-        let Some(index) = coverage.get() else {
+        if index.is_none() {
             return (self.notdef(style), false);
-        };
-        if let Some(r) = index
-            .lookup(ch)
-            .and_then(|id| self.styled_sibling(id, ch, style))
-        {
+        }
+        if let Some(r) = found.and_then(|id| self.with_synthesis(id, style)) {
             return (r, true);
         }
         (self.notdef(style), true)
     }
 
-    /// `style` drawn from the family of face `found` (which covers `ch`):
-    /// the family's best face for `style` when that face also covers `ch`;
-    /// else, for italic, the family's upright face at the requested weight;
-    /// else the family's regular face; else `found` itself. Each is drawn
-    /// with the synthesis it needs.
+    /// `style` drawn in `pass` from the family of face `found` (which
+    /// covers `ch`): the family's face chosen by [`pick_in_family`], or
+    /// `None` (the caller falls back to `found` itself, with the
+    /// synthesis it needs, after the last pass).
     ///
     /// The coverage index records the first face in database order, which
     /// is often a Black or Bold cut; a regular cell must not be drawn
@@ -754,43 +978,21 @@ impl Inner {
         found: fontdb::ID,
         ch: char,
         style: FontStyle,
+        pass: u8,
     ) -> Option<ResolvedFace> {
-        let family = self
+        let name = self
             .system
             .db()
             .face(found)?
             .families
             .first()
             .map(|(name, _)| name.clone());
-        if let Some(family) = family {
-            let mut wanted = vec![(style.weight(), style.is_italic())];
-            if style.is_italic() {
-                wanted.push((style.weight(), false));
-            }
-            if !wanted.contains(&(fontdb::Weight::NORMAL, false)) {
-                wanted.push((fontdb::Weight::NORMAL, false));
-            }
-            for (weight, italic) in wanted {
-                let Some(id) = self.system.db().query(&fontdb::Query {
-                    families: &[fontdb::Family::Name(&family)],
-                    weight,
-                    stretch: fontdb::Stretch::Normal,
-                    style: if italic {
-                        fontdb::Style::Italic
-                    } else {
-                        fontdb::Style::Normal
-                    },
-                }) else {
-                    continue;
-                };
-                if let Some(r) = self.with_synthesis(id, style)
-                    && self.covers(r.face, ch)
-                {
-                    return Some(r);
-                }
-            }
-        }
-        self.with_synthesis(found, style)
+        let mut family = NamedFamily {
+            inner: self,
+            name: &name?,
+            ch,
+        };
+        pick_in_family(&mut family, style, pass).map(Picked::resolved)
     }
 
     /// The primary face in `style`, which draws `.notdef` for characters
@@ -1463,6 +1665,539 @@ mod tests {
             italic.synthetic_italic && !italic.synthetic_bold,
             "{italic:?}"
         );
+    }
+
+    /// A synthetic family: its faces, the queries the "database" answers
+    /// with each, and which faces cover the character.
+    struct TestFamily {
+        faces: Vec<Face<&'static str>>,
+        /// `(query, face id)`; a query without a row has no match.
+        matches: Vec<(FontStyle, &'static str)>,
+        covering: Vec<&'static str>,
+        /// Every face whose coverage was asked for, in order.
+        asked: Vec<&'static str>,
+    }
+
+    impl Family for TestFamily {
+        type Id = &'static str;
+
+        fn face(&mut self, query: FontStyle) -> Option<Face<&'static str>> {
+            let id = self.matches.iter().find(|(q, _)| *q == query)?.1;
+            self.faces.iter().copied().find(|f| f.id == id)
+        }
+
+        fn covers(&mut self, picked: &Picked<&'static str>) -> bool {
+            self.asked.push(picked.id);
+            self.covering.contains(&picked.id)
+        }
+    }
+
+    const fn test_face(id: &'static str, weight: u16, italic: bool) -> Face<&'static str> {
+        Face {
+            id,
+            italic,
+            weight,
+            bold_axis: false,
+            color: false,
+        }
+    }
+
+    /// A family with all four faces, as a database matches them.
+    fn four_faces(covering: &[&'static str]) -> TestFamily {
+        TestFamily {
+            faces: vec![
+                test_face("regular", 400, false),
+                test_face("bold", 700, false),
+                test_face("italic", 400, true),
+                test_face("bold-italic", 700, true),
+            ],
+            matches: vec![
+                (FontStyle::Regular, "regular"),
+                (FontStyle::Bold, "bold"),
+                (FontStyle::Italic, "italic"),
+                (FontStyle::BoldItalic, "bold-italic"),
+            ],
+            covering: covering.to_vec(),
+            asked: Vec::new(),
+        }
+    }
+
+    fn picked(id: &'static str, weight: u16, bold: bool, italic: bool) -> Picked<&'static str> {
+        Picked {
+            id,
+            weight,
+            synthetic_bold: bold,
+            synthetic_italic: italic,
+        }
+    }
+
+    #[test]
+    fn pick_takes_the_styled_face_when_it_covers() {
+        let all = ["regular", "bold", "italic", "bold-italic"];
+        let mut family = four_faces(&all);
+        assert_eq!(
+            pick_in_family(&mut family, FontStyle::Regular, STYLED_PASS),
+            Some(picked("regular", 400, false, false))
+        );
+        assert_eq!(
+            pick_in_family(&mut family, FontStyle::Bold, STYLED_PASS),
+            Some(picked("bold", 700, false, false))
+        );
+        assert_eq!(
+            pick_in_family(&mut family, FontStyle::Italic, STYLED_PASS),
+            Some(picked("italic", 400, false, false))
+        );
+        assert_eq!(
+            pick_in_family(&mut family, FontStyle::BoldItalic, STYLED_PASS),
+            Some(picked("bold-italic", 700, false, false))
+        );
+        assert_eq!(family.asked, all, "one coverage test each");
+    }
+
+    #[test]
+    fn pick_synthesises_italic_on_the_regular_face_when_italic_lacks_it() {
+        let mut family = four_faces(&["regular", "bold", "bold-italic"]);
+        assert_eq!(
+            pick_in_family(&mut family, FontStyle::Italic, STYLED_PASS),
+            Some(picked("regular", 400, false, true))
+        );
+        assert_eq!(family.asked, ["italic", "regular"]);
+    }
+
+    /// Bold the bold face lacks is left to the next family's bold face in
+    /// the styled pass, and is the regular face with synthetic bold only
+    /// in the synthetic-bold pass (#119: real CJK bold from a later family
+    /// beats an earlier family's synthetic bold).
+    #[test]
+    fn pick_synthesises_bold_on_the_regular_face_only_in_the_synthetic_bold_pass() {
+        let mut family = four_faces(&["regular", "italic", "bold-italic"]);
+        assert_eq!(
+            pick_in_family(&mut family, FontStyle::Bold, STYLED_PASS),
+            None
+        );
+        assert_eq!(family.asked, ["bold"]);
+        // Drawn at the requested weight, emboldened; the bold face is not
+        // tested again.
+        assert_eq!(
+            pick_in_family(&mut family, FontStyle::Bold, SYNTHETIC_BOLD_PASS),
+            Some(picked("regular", 700, true, false))
+        );
+        assert_eq!(family.asked, ["bold", "regular"]);
+    }
+
+    #[test]
+    fn pick_prefers_upright_bold_over_regular_for_bold_italic() {
+        let mut family = four_faces(&["regular", "bold", "italic"]);
+        assert_eq!(
+            pick_in_family(&mut family, FontStyle::BoldItalic, STYLED_PASS),
+            Some(picked("bold", 700, false, true))
+        );
+        assert_eq!(family.asked, ["bold-italic", "bold"]);
+    }
+
+    #[test]
+    fn pick_synthesises_both_on_the_regular_face_for_bold_italic() {
+        let mut family = four_faces(&["regular", "italic"]);
+        assert_eq!(
+            pick_in_family(&mut family, FontStyle::BoldItalic, STYLED_PASS),
+            None
+        );
+        assert_eq!(family.asked, ["bold-italic", "bold"]);
+        assert_eq!(
+            pick_in_family(&mut family, FontStyle::BoldItalic, SYNTHETIC_BOLD_PASS),
+            Some(picked("regular", 700, true, true))
+        );
+        assert_eq!(family.asked, ["bold-italic", "bold", "regular"]);
+    }
+
+    /// Regular and italic need one pass: the regular face with synthetic
+    /// italic is part of the styled pass, so a second pass tests nothing.
+    #[test]
+    fn pick_needs_a_second_pass_for_bold_styles_only() {
+        assert_eq!(passes(FontStyle::Regular), 1);
+        assert_eq!(passes(FontStyle::Italic), 1);
+        assert_eq!(passes(FontStyle::Bold), 2);
+        assert_eq!(passes(FontStyle::BoldItalic), 2);
+        for style in [FontStyle::Regular, FontStyle::Italic] {
+            let mut family = four_faces(&["regular", "bold", "italic", "bold-italic"]);
+            assert_eq!(
+                pick_in_family(&mut family, style, SYNTHETIC_BOLD_PASS),
+                None,
+                "{style:?}"
+            );
+            assert_eq!(family.asked, [] as [&str; 0], "{style:?}");
+        }
+    }
+
+    #[test]
+    fn pick_returns_none_when_no_face_of_the_family_covers() {
+        for style in [
+            FontStyle::Regular,
+            FontStyle::Bold,
+            FontStyle::Italic,
+            FontStyle::BoldItalic,
+        ] {
+            for pass in 0..passes(style) {
+                let mut family = four_faces(&[]);
+                assert_eq!(pick_in_family(&mut family, style, pass), None, "{style:?}");
+            }
+        }
+        let mut empty = TestFamily {
+            faces: Vec::new(),
+            matches: Vec::new(),
+            covering: Vec::new(),
+            asked: Vec::new(),
+        };
+        assert_eq!(
+            pick_in_family(&mut empty, FontStyle::BoldItalic, STYLED_PASS),
+            None
+        );
+        assert_eq!(empty.asked, [] as [&str; 0], "nothing to test");
+    }
+
+    /// A database answers every query of a one-face family with that face;
+    /// it is tested once, and drawn with the synthesis each style needs.
+    #[test]
+    fn pick_tests_a_face_matched_twice_once() {
+        let one_face = |covering: &[&'static str]| TestFamily {
+            faces: vec![test_face("only", 400, false)],
+            matches: [
+                FontStyle::Regular,
+                FontStyle::Bold,
+                FontStyle::Italic,
+                FontStyle::BoldItalic,
+            ]
+            .map(|q| (q, "only"))
+            .to_vec(),
+            covering: covering.to_vec(),
+            asked: Vec::new(),
+        };
+        let mut family = one_face(&[]);
+        assert_eq!(
+            pick_in_family(&mut family, FontStyle::BoldItalic, STYLED_PASS),
+            None
+        );
+        assert_eq!(family.asked, ["only"]);
+        // The regular query matches the same face: not tested again.
+        assert_eq!(
+            pick_in_family(&mut family, FontStyle::BoldItalic, SYNTHETIC_BOLD_PASS),
+            None
+        );
+        assert_eq!(family.asked, ["only"]);
+        let mut family = one_face(&["only"]);
+        assert_eq!(
+            pick_in_family(&mut family, FontStyle::BoldItalic, STYLED_PASS),
+            Some(picked("only", 700, true, true))
+        );
+    }
+
+    #[test]
+    fn pick_draws_a_colour_family_as_is() {
+        let emoji = Face {
+            color: true,
+            ..test_face("emoji", 400, false)
+        };
+        for style in [
+            FontStyle::Regular,
+            FontStyle::Bold,
+            FontStyle::Italic,
+            FontStyle::BoldItalic,
+        ] {
+            let mut family = TestFamily {
+                faces: vec![emoji],
+                matches: vec![
+                    (style, "emoji"),
+                    (FontStyle::Bold, "emoji"),
+                    (FontStyle::Regular, "emoji"),
+                ],
+                covering: vec!["emoji"],
+                asked: Vec::new(),
+            };
+            assert_eq!(
+                pick_in_family(&mut family, style, STYLED_PASS),
+                Some(picked("emoji", 400, false, false)),
+                "{style:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pick_uses_a_wght_axis_instead_of_synthetic_bold() {
+        let variable = Face {
+            bold_axis: true,
+            ..test_face("variable", 400, false)
+        };
+        let mut family = TestFamily {
+            faces: vec![variable],
+            matches: vec![(FontStyle::Bold, "variable")],
+            covering: vec!["variable"],
+            asked: Vec::new(),
+        };
+        assert_eq!(
+            pick_in_family(&mut family, FontStyle::Bold, STYLED_PASS),
+            Some(picked("variable", 700, false, false))
+        );
+    }
+
+    /// Family name, weight and slant of `face`.
+    fn describe(inner: &Inner, face: FaceId) -> Option<(String, u16, fontdb::Style)> {
+        let FaceRepr::Font { id, .. } = face.0 else {
+            return None;
+        };
+        let info = inner.system.db().face(id)?;
+        Some((info.families.first()?.0.clone(), info.weight.0, info.style))
+    }
+
+    /// Whether `family`'s face matched for `style` covers `ch`, or `None`
+    /// when the match is not a face of that exact weight and slant.
+    fn own_face_covers(
+        inner: &mut Inner,
+        family: &str,
+        style: FontStyle,
+        ch: char,
+    ) -> Option<bool> {
+        let index = inner.families.iter().position(|f| f == family)?;
+        let face = inner.family_face(index, style)?;
+        let exact =
+            (face.weight >= BOLD_THRESHOLD) == style.is_bold() && face.italic == style.is_italic();
+        exact.then(|| inner.covers(FaceId::font(face.id, fontdb::Weight(face.weight)), ch))
+    }
+
+    /// #119: Menlo Italic lacks U+01DE but Menlo Regular has it, so italic
+    /// U+01DE is Menlo Regular with synthetic italic, not the next family
+    /// that covers it. Runs without the coverage index: the fixed chain
+    /// alone must find it.
+    #[test]
+    fn italic_missing_from_the_styled_face_stays_in_the_family() {
+        let fonts = menlo_without_index();
+        if fonts.family() != DEFAULT_FAMILY {
+            eprintln!(
+                "skipping: Menlo is not installed (primary is {})",
+                fonts.family()
+            );
+            return;
+        }
+        let ch = '\u{01DE}';
+        let mut inner = fonts.lock();
+        let regular = own_face_covers(&mut inner, "Menlo", FontStyle::Regular, ch);
+        let italic = own_face_covers(&mut inner, "Menlo", FontStyle::Italic, ch);
+        assert_eq!(
+            (regular, italic),
+            (Some(true), Some(false)),
+            "the premise of #119: Menlo Regular has U+01DE, Menlo Italic does not"
+        );
+
+        let r = inner.resolve(ch, FontStyle::Italic);
+        assert_eq!(
+            describe(&inner, r.face),
+            Some(("Menlo".to_owned(), 400, fontdb::Style::Normal)),
+            "italic U+01DE: {r:?}"
+        );
+        assert!(r.synthetic_italic && !r.synthetic_bold, "{r:?}");
+
+        // Bold: Menlo Bold when it has the character. (When it lacks it,
+        // a later family's bold face comes first: see
+        // `bold_a_bold_face_lacks_is_a_later_familys_real_bold`.)
+        let bold_has = own_face_covers(&mut inner, "Menlo", FontStyle::Bold, ch);
+        let r = inner.resolve(ch, FontStyle::Bold);
+        if bold_has == Some(true) {
+            assert_eq!(
+                describe(&inner, r.face),
+                Some(("Menlo".to_owned(), 700, fontdb::Style::Normal)),
+                "bold U+01DE: Menlo Bold has it: {r:?}"
+            );
+            assert!(!r.synthetic_bold && !r.synthetic_italic, "{r:?}");
+        } else {
+            eprintln!("Menlo Bold lacks U+01DE here: bold not checked");
+        }
+
+        // Bold italic: Menlo Bold Italic, else the upright Menlo Bold with
+        // synthetic italic, when either has the character.
+        let bold_italic_has = own_face_covers(&mut inner, "Menlo", FontStyle::BoldItalic, ch);
+        let r = inner.resolve(ch, FontStyle::BoldItalic);
+        let described = describe(&inner, r.face);
+        match (bold_italic_has, bold_has) {
+            (Some(true), _) => {
+                assert_eq!(
+                    described,
+                    Some(("Menlo".to_owned(), 700, fontdb::Style::Italic)),
+                    "{r:?}"
+                );
+                assert!(!r.synthetic_bold && !r.synthetic_italic, "{r:?}");
+            }
+            (_, Some(true)) => {
+                assert_eq!(
+                    described,
+                    Some(("Menlo".to_owned(), 700, fontdb::Style::Normal)),
+                    "{r:?}"
+                );
+                assert!(!r.synthetic_bold && r.synthetic_italic, "{r:?}");
+            }
+            _ => eprintln!("Menlo's bold faces lack U+01DE here: bold italic not checked"),
+        }
+    }
+
+    /// #119 critic B1: Hiragino Sans Bold lacks 类 but Hiragino Sans
+    /// Regular has it. Bold 类 is a later family's real bold (Hiragino Sans
+    /// GB W6, as before #119), not Hiragino Sans Regular with synthetic
+    /// bold; 型, which Hiragino Sans Bold has, stays Hiragino Sans.
+    #[test]
+    fn bold_a_bold_face_lacks_is_a_later_familys_real_bold() {
+        let fonts = menlo_without_index();
+        let mut inner = fonts.lock();
+        let (lei, xing) = ('\u{7C7B}', '\u{578B}');
+        let premise = (
+            own_face_covers(&mut inner, "Hiragino Sans", FontStyle::Regular, lei),
+            own_face_covers(&mut inner, "Hiragino Sans", FontStyle::Bold, lei),
+            own_face_covers(&mut inner, "Hiragino Sans GB", FontStyle::Bold, lei),
+            own_face_covers(&mut inner, "Hiragino Sans", FontStyle::Bold, xing),
+        );
+        if premise != (Some(true), Some(false), Some(true), Some(true)) {
+            eprintln!(
+                "skipping: Hiragino Sans and Hiragino Sans GB coverage differs here: {premise:?}"
+            );
+            return;
+        }
+        let hiragino_sans = inner.families.iter().position(|f| f == "Hiragino Sans");
+        let hiragino_gb = inner.families.iter().position(|f| f == "Hiragino Sans GB");
+        assert!(
+            hiragino_sans < hiragino_gb,
+            "the premise: Hiragino Sans comes first"
+        );
+        for style in [FontStyle::Bold, FontStyle::BoldItalic] {
+            let r = inner.resolve(lei, style);
+            let (family, weight, slant) = describe(&inner, r.face).expect("a font face");
+            assert_eq!(family, "Hiragino Sans GB", "{style:?} 类: {r:?}");
+            assert!(weight >= BOLD_THRESHOLD, "{style:?} 类: {r:?}");
+            assert_eq!(slant, fontdb::Style::Normal, "{style:?} 类: {r:?}");
+            assert!(!r.synthetic_bold, "{style:?} 类: {r:?}");
+            assert_eq!(r.synthetic_italic, style.is_italic(), "{style:?} 类: {r:?}");
+
+            let r = inner.resolve(xing, style);
+            let (family, weight, _) = describe(&inner, r.face).expect("a font face");
+            assert_eq!(family, "Hiragino Sans", "{style:?} 型: {r:?}");
+            assert!(
+                weight >= BOLD_THRESHOLD && !r.synthetic_bold,
+                "{style:?} 型: {r:?}"
+            );
+        }
+    }
+
+    /// A real bold found through the coverage index beats the chain's
+    /// synthetic bold: no chain family's bold face has U+24F5, Hiragino
+    /// Sans Regular does, and Hiragino Mincho `ProN` W6 (found only through
+    /// the index) has a real bold one. A synthetic bold resolved before
+    /// the index is ready is not cached, so it gives way once it is.
+    #[test]
+    fn bold_found_through_the_index_beats_the_chains_synthetic_bold() {
+        let fonts = menlo_without_index();
+        let ch = '\u{24F5}';
+        let before = fonts.lock().resolve(ch, FontStyle::Bold);
+        if !before.synthetic_bold {
+            eprintln!("skipping: a chain family has a bold U+24F5 here: {before:?}");
+            return;
+        }
+        let index = Coverage::build(fonts.lock().system.db());
+        let _ = fonts.lock().coverage.set(index);
+        let mut inner = fonts.lock();
+        let found = inner
+            .coverage
+            .get()
+            .and_then(|index| index.lookup(ch))
+            .and_then(|id| inner.system.db().face(id))
+            .and_then(|f| f.families.first().map(|(n, _)| n.clone()));
+        let Some(family) = found else {
+            eprintln!("skipping: the index has no face for U+24F5");
+            return;
+        };
+        let bold = query_family(inner.system.db(), &family, FontStyle::Bold)
+            .and_then(|id| inner.face_traits(id))
+            .filter(|face| face.weight >= BOLD_THRESHOLD);
+        let bold_covers = bold.is_some_and(|face| {
+            inner.covers(FaceId::font(face.id, fontdb::Weight(face.weight)), ch)
+        });
+        if !bold_covers {
+            eprintln!("skipping: {family}, found through the index, has no bold U+24F5");
+            return;
+        }
+        for style in [FontStyle::Bold, FontStyle::BoldItalic] {
+            let r = inner.resolve(ch, style);
+            let (drawn, weight, _) = describe(&inner, r.face).expect("a font face");
+            assert_eq!(
+                drawn, family,
+                "{style:?}: {r:?} (before the index: {before:?})"
+            );
+            assert!(
+                weight >= BOLD_THRESHOLD && !r.synthetic_bold,
+                "{style:?}: {r:?}"
+            );
+        }
+    }
+
+    /// A character no family's bold face has is the earliest covering
+    /// family's regular face with synthetic bold. Menlo Bold lacks the box
+    /// drawing block, Menlo Regular has it; with the chain cut to Menlo
+    /// alone, no family has a bold U+2500.
+    #[test]
+    fn bold_no_bold_face_has_is_the_regular_face_with_synthetic_bold() {
+        let fonts = menlo_without_index();
+        if fonts.family() != DEFAULT_FAMILY {
+            eprintln!(
+                "skipping: Menlo is not installed (primary is {})",
+                fonts.family()
+            );
+            return;
+        }
+        let ch = '\u{2500}';
+        let mut inner = fonts.lock();
+        let premise = (
+            own_face_covers(&mut inner, "Menlo", FontStyle::Regular, ch),
+            own_face_covers(&mut inner, "Menlo", FontStyle::Bold, ch),
+        );
+        if premise != (Some(true), Some(false)) {
+            eprintln!("skipping: Menlo Bold has U+2500 here or Regular lacks it: {premise:?}");
+            return;
+        }
+        inner.chain = Chain::default();
+        for (style, italic) in [(FontStyle::Bold, false), (FontStyle::BoldItalic, true)] {
+            let r = inner.resolve(ch, style);
+            assert_eq!(
+                describe(&inner, r.face),
+                Some(("Menlo".to_owned(), 400, fontdb::Style::Normal)),
+                "{style:?} U+2500: {r:?}"
+            );
+            assert!(
+                matches!(r.face.0, FaceRepr::Font { weight: 700, .. }),
+                "drawn at the bold weight: {r:?}"
+            );
+            assert!(r.synthetic_bold, "{style:?}: {r:?}");
+            assert_eq!(r.synthetic_italic, italic, "{style:?}: {r:?}");
+        }
+    }
+
+    /// An emoji keeps its colour face in every style, with no synthesis:
+    /// the in-family step never reaches a text family's regular face for
+    /// it, and colour faces are never synthesised.
+    #[test]
+    fn italic_emoji_is_the_colour_face_without_synthesis() {
+        let fonts = menlo_without_index();
+        if !fonts.has_family(EMOJI_FAMILY) {
+            eprintln!("skipping: {EMOJI_FAMILY} is not installed");
+            return;
+        }
+        let mut inner = fonts.lock();
+        for ch in ['\u{1F600}', '\u{231A}', '\u{1F44D}'] {
+            let regular = inner.resolve(ch, FontStyle::Regular);
+            assert!(inner.is_color(regular.face), "{ch:?}: {regular:?}");
+            for style in [FontStyle::Italic, FontStyle::Bold, FontStyle::BoldItalic] {
+                let r = inner.resolve(ch, style);
+                assert_eq!(r, regular, "{ch:?} in {style:?}");
+                assert!(
+                    !r.synthetic_bold && !r.synthetic_italic,
+                    "{ch:?} in {style:?}"
+                );
+            }
+        }
     }
 
     #[test]
