@@ -227,7 +227,8 @@ step "ffi release build"; cargo build --release -p tessera-ffi
 step "ffi C tests"; ffi_c_tests_step
 step "release timing tests"; release_timing_step
 # fuzz/ is not a workspace member (#14). Its lock file is the workspace's, copied in before every build so the
-# fuzzers test the workspace's dependency versions (fuzz/Cargo.lock is ignored; cargo only adds libfuzzer-sys and its dependencies).
+# fuzzers test the workspace's dependency versions (fuzz/Cargo.lock is ignored; cargo only adds libfuzzer-sys and its
+# dependencies).
 # Format and stable clippy always run, so a rename breaks here before merge; the libFuzzer build needs a nightly
 # toolchain and cargo-fuzz, optional for contributors (the nightly fuzz workflow always builds it).
 cp Cargo.lock fuzz/Cargo.lock
