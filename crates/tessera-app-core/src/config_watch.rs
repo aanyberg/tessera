@@ -24,7 +24,7 @@
 //!
 //! [`SessionObserver::on_appearance_changed`]: crate::SessionObserver::on_appearance_changed
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -61,6 +61,24 @@ pub const CONFIG_DIR_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// reads `themes/` once, at most 256 files).
 const THEME_LOOKUP_ATTEMPTS: u32 = 3;
 
+/// How many profile themes one recorded configuration keeps resolved
+/// ([`ProfileThemes`]): every profile and the `[appearance]` theme. A
+/// configuration names at most that many; past it a lookup is not kept
+/// (S5).
+pub(crate) const MAX_PROFILE_THEMES_RESOLVED: usize = tessera_config::MAX_PROFILES + 1;
+
+/// How many distinct profile theme warnings one recorded configuration
+/// remembers, to log each once and not again on the next apply while it
+/// still holds (#489 21.0b m4). Past it, one line says further warnings
+/// are not shown (S5).
+pub(crate) const MAX_PROFILE_THEME_WARNINGS: usize = 2 * MAX_PROFILE_THEMES_RESOLVED;
+
+/// How many queued watcher events the apply thread folds into the one it
+/// handles (#338): each applies the store's state as it is then, so one
+/// apply covers them all, and a burst of edits made during an apply costs
+/// one more apply, not one per edit (S6).
+pub(crate) const MAX_EVENTS_FOLDED: usize = 1024;
+
 /// The configuration views draw with, the colours it resolved to and the
 /// renderer theme built from both, kept together so a change replaces all
 /// three at once.
@@ -81,6 +99,102 @@ pub(crate) struct Applied {
     /// The host's display options ([`App::set_display_options`]), applied
     /// to every look.
     pub(crate) display: DisplayOptions,
+    /// The profile themes resolved under `config`, a fresh set for each
+    /// configuration recorded: a restyle under the same configuration
+    /// (display options set, a session attached or catching up) reuses
+    /// them and reads no theme file (#338).
+    pub(crate) profile_themes: ProfileThemes,
+    /// The warning [`Live::look_up`] last logged for a theme file in use
+    /// that does not load: the next lookup that finds it again logs
+    /// nothing (#489 21.0b m4).
+    pub(crate) kept_broken: Option<String>,
+}
+
+/// The profile themes resolved under one recorded configuration, shared by
+/// every [`Looks`] built under it ([`Applied::profile_themes`]).
+pub(crate) type ProfileThemes = Arc<Mutex<Resolutions>>;
+
+/// What [`ProfileThemes`] holds.
+#[derive(Debug, Default)]
+pub(crate) struct Resolutions {
+    /// By theme name, at most [`MAX_PROFILE_THEMES_RESOLVED`].
+    themes: HashMap<String, Resolved>,
+    /// The warnings logged (or, as logged under the previous
+    /// configuration, left out) under this one, at most
+    /// [`MAX_PROFILE_THEME_WARNINGS`].
+    warned: HashSet<String>,
+    /// [`Resolutions::warned`] of the configuration recorded before.
+    earlier: HashSet<String>,
+    /// Whether the line saying further warnings are not shown was logged.
+    overflowed: bool,
+}
+
+/// A profile theme looked up.
+#[derive(Debug, Clone)]
+struct Resolved {
+    /// The colours, or, when `broken`, what the lookup fell back to.
+    theme: tessera_config::Theme,
+    /// The file is there but does not load ([`Warning::ThemeInvalid`]).
+    broken: bool,
+}
+
+impl Resolutions {
+    /// Resolutions for the configuration recorded after the one `earlier`
+    /// were made under: none resolved, `earlier`'s warnings not logged
+    /// again while they hold.
+    fn after(earlier: &Mutex<Self>) -> ProfileThemes {
+        let earlier = std::mem::take(&mut lock(earlier).warned);
+        Arc::new(Mutex::new(Self {
+            earlier,
+            ..Self::default()
+        }))
+    }
+
+    /// Logs `warning` unless it was logged under this configuration or the
+    /// one before (and still holds), past [`MAX_PROFILE_THEME_WARNINGS`]
+    /// once for all. The warning's text is escaped by the loader (S3, S8).
+    fn warn(&mut self, warning: &Warning) {
+        let text = warning.to_string();
+        if self.warned.contains(&text) {
+            return;
+        }
+        if self.warned.len() >= MAX_PROFILE_THEME_WARNINGS {
+            if !self.overflowed {
+                self.overflowed = true;
+                tracing::warn!(
+                    target: "tessera_app_core",
+                    "more than {MAX_PROFILE_THEME_WARNINGS} profile theme warnings; further ones are not shown"
+                );
+            }
+            return;
+        }
+        let new = !self.earlier.contains(&text);
+        if new {
+            tracing::warn!(target: "tessera_app_core", "profile theme: {text}");
+        }
+        self.warned.insert(text);
+    }
+}
+
+/// Counts the profile theme lookups (`themes/` reads) [`Looks`] makes on
+/// this thread, for the tests that no restyle under the same
+/// configuration reads a theme file (#338).
+#[cfg(test)]
+pub(crate) mod lookups {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn count() {
+        COUNT.with(|count| count.set(count.get() + 1));
+    }
+
+    /// The lookups on this thread so far.
+    pub(crate) fn on_this_thread() -> usize {
+        COUNT.with(Cell::get)
+    }
 }
 
 /// What looking the theme up again gave.
@@ -107,33 +221,37 @@ pub(crate) struct Live {
     pub(crate) themes_dir: Arc<Path>,
 }
 
-/// Themes a profile names, resolved once per configuration applied:
-/// every session of one profile shares them, and a profile not in use is
-/// never looked up (each lookup reads `themes/`, at most 256 files).
+/// Themes a profile names, resolved once per configuration recorded
+/// (kept in `themes`, [`Applied::profile_themes`]): every session of one
+/// profile shares them, every restyle under that configuration reuses
+/// them, and a profile not in use is never looked up (each lookup reads
+/// `themes/`, at most 256 files).
 pub(crate) struct Looks<'a> {
     themes_dir: &'a Path,
     config: &'a Config,
     colours: &'a tessera_config::Theme,
     display: DisplayOptions,
-    resolved: HashMap<String, Option<tessera_config::Theme>>,
+    themes: &'a ProfileThemes,
 }
 
 impl<'a> Looks<'a> {
     /// Looks for `config`, whose `[appearance]` theme resolved to
-    /// `colours`, drawn under `display`; other themes are looked up in
-    /// `themes_dir`.
+    /// `colours`, drawn under `display`; other themes are taken from
+    /// `themes`, the ones resolved under `config` so far, or looked up in
+    /// `themes_dir` and kept there.
     pub(crate) fn new(
         themes_dir: &'a Path,
         config: &'a Config,
         colours: &'a tessera_config::Theme,
         display: DisplayOptions,
+        themes: &'a ProfileThemes,
     ) -> Self {
         Self {
             themes_dir,
             config,
             colours,
             display,
-            resolved: HashMap::new(),
+            themes,
         }
     }
 
@@ -163,31 +281,44 @@ impl<'a> Looks<'a> {
         if appearance.theme == self.config.appearance.theme {
             return Look::new(appearance, self.colours.clone(), self.display);
         }
-        let themes_dir = self.themes_dir;
-        let resolved = self
-            .resolved
-            .entry(appearance.theme.clone())
-            .or_insert_with(|| {
-                let resolved = tessera_config::Theme::resolve(themes_dir, &appearance.theme);
-                for warning in &resolved.warnings {
-                    tracing::warn!(target: "tessera_app_core", "profile theme: {warning}");
-                }
-                let broken = resolved
-                    .warnings
-                    .iter()
-                    .any(|warning| matches!(warning, Warning::ThemeInvalid { .. }));
-                (!broken).then_some(resolved.theme)
-            });
-        let colours = match (resolved, previous) {
-            (Some(colours), _) => colours.clone(),
-            (None, Some(previous)) if previous.appearance.theme == appearance.theme => {
+        let resolved = self.resolve(&appearance.theme);
+        let colours = match previous {
+            Some(previous) if resolved.broken && previous.appearance.theme == appearance.theme => {
                 previous.colours.clone()
             }
-            // A broken file and nothing to keep: what the lookup fell back
-            // to (`Theme::resolve` warned).
-            (None, _) => tessera_config::Theme::resolve(themes_dir, &appearance.theme).theme,
+            // Loaded, or a broken file and nothing to keep: what the lookup
+            // fell back to (it warned).
+            _ => resolved.theme,
         };
         Look::new(appearance, colours, self.display)
+    }
+
+    /// The theme `name` resolved under this configuration: kept from an
+    /// earlier lookup, or looked up now (outside the lock: two looking
+    /// the same name up at once both read `themes/`, and their warnings
+    /// are logged once) and kept.
+    fn resolve(&self, name: &str) -> Resolved {
+        if let Some(resolved) = lock(self.themes).themes.get(name) {
+            return resolved.clone();
+        }
+        #[cfg(test)]
+        lookups::count();
+        let looked_up = tessera_config::Theme::resolve(self.themes_dir, name);
+        let resolved = Resolved {
+            broken: looked_up
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, Warning::ThemeInvalid { .. })),
+            theme: looked_up.theme,
+        };
+        let mut themes = lock(self.themes);
+        for warning in &looked_up.warnings {
+            themes.warn(warning);
+        }
+        if themes.themes.len() < MAX_PROFILE_THEMES_RESOLVED {
+            themes.themes.insert(name.to_owned(), resolved.clone());
+        }
+        resolved
     }
 }
 
@@ -232,33 +363,47 @@ impl Live {
         source: Option<PathBuf>,
     ) -> bool {
         let config = Arc::new(config.clone());
-        let (generation, display, radius_changed) = {
+        let (generation, display, radius_changed, themes) = {
             let mut applied = lock(&self.applied);
             let generation = applied.generation + 1;
             let display = applied.display;
             let radius_changed =
                 applied.config.appearance.blur_radius != config.appearance.blur_radius;
+            // Theme files may have changed too: this configuration's
+            // profile themes are looked up afresh.
+            let themes = Resolutions::after(&applied.profile_themes);
             *applied = Applied {
                 config: Arc::clone(&config),
                 colours: colours.clone(),
                 source,
                 generation,
                 display,
+                profile_themes: Arc::clone(&themes),
+                kept_broken: applied.kept_broken.take(),
             };
-            (generation, display, radius_changed)
+            (generation, display, radius_changed, themes)
         };
-        self.restyle_at(&config, colours, generation, display, radius_changed)
+        self.restyle_at(
+            &config,
+            colours,
+            &themes,
+            generation,
+            display,
+            radius_changed,
+        )
     }
 
     /// The part of [`Live::restyle`] after the configuration is recorded:
-    /// gives every session its look under `config`, `colours` and
-    /// `display` at `generation`, updates the views and tells the
-    /// observer, also when nothing a session draws changed but
-    /// `window_changed` (the window's blur radius, [`App::blur_radius`]).
+    /// gives every session its look under `config`, `colours` (profile
+    /// themes from `themes`) and `display` at `generation`, updates the
+    /// views and tells the observer, also when nothing a session draws
+    /// changed but `window_changed` (the window's blur radius,
+    /// [`App::blur_radius`]).
     fn restyle_at(
         &self,
         config: &Config,
         colours: &tessera_config::Theme,
+        themes: &ProfileThemes,
         generation: u64,
         display: DisplayOptions,
         window_changed: bool,
@@ -269,7 +414,7 @@ impl Live {
             .iter()
             .map(|(id, session)| (*id, Arc::clone(session)))
             .collect();
-        let mut looks = Looks::new(&self.themes_dir, config, colours, display);
+        let mut looks = Looks::new(&self.themes_dir, config, colours, display, themes);
         let default_look = looks.default_look();
         let mut restyled: HashMap<SessionId, (Arc<Look>, &Arc<Session>)> = HashMap::new();
         let mut cursor_changed = false;
@@ -382,19 +527,24 @@ impl Live {
     /// Gives `session`, just listed, the look of the configuration in
     /// effect if one was applied after it resolved its own, and its
     /// terminal that look's defaults (`App::attach`).
+    ///
+    /// The profile's theme comes from the ones the configuration in effect
+    /// resolved ([`Applied::profile_themes`]), so it reads no theme file
+    /// unless that configuration never looked it up.
     pub(crate) fn catch_up(&self, session: &Session) {
-        let (config, colours, generation, display) = {
+        let (config, colours, themes, generation, display) = {
             let applied = lock(&self.applied);
             (
                 Arc::clone(&applied.config),
                 applied.colours.clone(),
+                Arc::clone(&applied.profile_themes),
                 applied.generation,
                 applied.display,
             )
         };
         if session.look_generation() < generation {
             let previous = session.look();
-            let look = Looks::new(&self.themes_dir, &config, &colours, display)
+            let look = Looks::new(&self.themes_dir, &config, &colours, display, &themes)
                 .of(session.profile(), Some(&previous));
             session.set_look(generation, Arc::new(look));
         }
@@ -410,8 +560,15 @@ impl Live {
     /// are taken under one hold of the `applied` lock, so a configuration
     /// the watch applies meanwhile is never replaced by the older one, and
     /// whichever restyle comes second carries both.
+    ///
+    /// Called on the main thread, it reads no theme file (#338): the
+    /// profile themes are the ones the configuration in effect resolved
+    /// when it was applied ([`Applied::profile_themes`]), for every
+    /// session then and every session attached since. Only a session
+    /// whose profile theme that configuration never looked up (one that
+    /// attaches while this runs) has it looked up here.
     pub(crate) fn set_display(&self, display: DisplayOptions) -> bool {
-        let (config, colours, generation) = {
+        let (config, colours, themes, generation) = {
             let mut applied = lock(&self.applied);
             if applied.display == display {
                 return false;
@@ -421,10 +578,11 @@ impl Live {
             (
                 Arc::clone(&applied.config),
                 applied.colours.clone(),
+                Arc::clone(&applied.profile_themes),
                 applied.generation,
             )
         };
-        self.restyle_at(&config, &colours, generation, display, false)
+        self.restyle_at(&config, &colours, &themes, generation, display, false)
     }
 
     /// Compiles the key map of the configuration in effect when its
@@ -568,6 +726,10 @@ impl Live {
     /// `same_name` as the one in effect, the file the colours in use came
     /// from (which may match by its `name` key, so its failure is not
     /// reported).
+    ///
+    /// The failure is logged once while it lasts: a lookup that finds the
+    /// same one as the lookup before logs nothing (#489 21.0b m4); the
+    /// store logs the lookup's own warnings once too.
     fn look_up(&self, store: &ConfigStore, same_name: bool) -> Lookup {
         let resolved = store.resolve_theme();
         let source = match resolved.source {
@@ -581,7 +743,10 @@ impl Live {
             .find(|warning| matches!(warning, Warning::ThemeInvalid { .. }))
             && (source.is_none() || source != previous)
         {
-            tracing::warn!(target: "tessera_app_core", "{warning}; keeping the colours in use");
+            let text = warning.to_string();
+            if self.first_kept_broken(&text) {
+                tracing::warn!(target: "tessera_app_core", "{text}; keeping the colours in use");
+            }
             return Lookup::KeepBroken;
         }
         if source.is_none()
@@ -592,26 +757,44 @@ impl Live {
         {
             // S8: the path is a `themes/` entry name, and an I/O error
             // (too large, not a regular file) quotes it.
-            tracing::warn!(
-                target: "tessera_app_core",
-                path = %tessera_config::escaped(
-                    &previous.display().to_string(),
-                    tessera_config::MAX_WARNING_PATH_LEN
-                ),
-                error = %tessera_config::escaped(
-                    &error.to_string(),
-                    tessera_config::MAX_PARSE_ERROR_LEN
-                ),
-                "the theme file in use does not load; keeping its colours"
+            let path = tessera_config::escaped(
+                &previous.display().to_string(),
+                tessera_config::MAX_WARNING_PATH_LEN,
             );
+            let error =
+                tessera_config::escaped(&error.to_string(), tessera_config::MAX_PARSE_ERROR_LEN);
+            if self.first_kept_broken(&format!("{path}: {error}")) {
+                tracing::warn!(
+                    target: "tessera_app_core",
+                    %path,
+                    %error,
+                    "the theme file in use does not load; keeping its colours"
+                );
+            }
             return Lookup::KeepBroken;
         }
+        lock(&self.applied).kept_broken = None;
         Lookup::Use(resolved.theme, source)
+    }
+
+    /// Records `failure` (escaped, at most a capped path and error) as the
+    /// theme failure [`Live::look_up`] last found; returns whether it
+    /// differs from the one before, and so is to be logged.
+    fn first_kept_broken(&self, failure: &str) -> bool {
+        let mut applied = lock(&self.applied);
+        if applied.kept_broken.as_deref() == Some(failure) {
+            return false;
+        }
+        applied.kept_broken = Some(failure.to_owned());
+        true
     }
 
     /// Looks the theme up again and applies it if it differs from the
     /// colours in use (lead decision D3). Returns `false` when the theme
-    /// file in use does not load (the colours in use are kept).
+    /// file in use does not load: the colours in use are kept, and the
+    /// sessions are restyled with them all the same, since a profile's
+    /// theme (and so the default look, [`App::view_theme`]) may have
+    /// changed (#338).
     ///
     /// The theme is applied with the store's configuration, the one the
     /// lookup resolved the name of, not the one in effect: when the store
@@ -632,8 +815,12 @@ impl Live {
                 break (config, lookup);
             }
         };
-        let Lookup::Use(colours, source) = lookup else {
-            return false;
+        let (colours, source, loaded) = match lookup {
+            Lookup::Use(colours, source) => (colours, source, true),
+            Lookup::KeepBroken => {
+                let applied = lock(&self.applied);
+                (applied.colours.clone(), applied.source.clone(), false)
+            }
         };
         let same = {
             let applied = lock(&self.applied);
@@ -647,8 +834,20 @@ impl Live {
         } else {
             self.apply_from(&config, &colours, source);
         }
-        true
+        loaded
     }
+}
+
+/// What makes [`App::open_config`] one step: its check that a watch runs
+/// and its start of one happen under `lock`, so two callers at once (the
+/// Open Config menu item and a Settings edit on the write queue) start one
+/// watch, never two (K5, #344).
+#[derive(Debug, Default)]
+pub(crate) struct OpenConfig {
+    lock: Mutex<()>,
+    /// The watches [`App::open_config`] started, for the tests.
+    #[cfg(any(test, feature = "test-hooks"))]
+    starts: std::sync::atomic::AtomicUsize,
 }
 
 /// The running watch: the watcher's guard and the apply thread.
@@ -794,7 +993,7 @@ impl ConfigWatch {
                     if lock(&thread_slot).stopped {
                         return;
                     }
-                    live.handle(&store, event);
+                    live.handle(&store, fold(event, &events));
                 }
             })?;
         Ok(Self {
@@ -810,6 +1009,32 @@ impl ConfigWatch {
     fn is_active(&self) -> bool {
         lock(&self.slot).guard.is_some()
     }
+}
+
+/// `event` with the events queued behind it folded in, at most
+/// [`MAX_EVENTS_FOLDED`]: the one to handle for all of them. Each applies
+/// the store's state as it is when handled, not the one it carries, so
+/// one apply covers every event queued meanwhile: a `Changed` covers a
+/// `ThemesChanged` (it looks the theme up again too), and either covers an
+/// `Invalid` (the store keeps the last good configuration and logged the
+/// error). Of two alike the later is kept.
+fn fold(mut event: ConfigEvent, events: &Receiver<ConfigEvent>) -> ConfigEvent {
+    fn rank(event: &ConfigEvent) -> u8 {
+        match event {
+            ConfigEvent::Changed(_) => 2,
+            ConfigEvent::ThemesChanged => 1,
+            _ => 0,
+        }
+    }
+    for _ in 0..MAX_EVENTS_FOLDED {
+        let Ok(next) = events.try_recv() else {
+            break;
+        };
+        if rank(&next) >= rank(&event) {
+            event = next;
+        }
+    }
+    event
 }
 
 /// `options` with the core's thread start hook for the watcher's thread.
@@ -927,6 +1152,14 @@ impl App {
     /// already. Returns the path of `config.toml`. For a frontend about to
     /// open the file for editing (Preferences, ⌘,); idempotent.
     ///
+    /// One step for any number of callers at once (K5, #344): the default
+    /// file is created only where no file is (a hard link of a finished
+    /// temporary file, failing on an existing one), so an existing
+    /// `config.toml` is never truncated or replaced, and the check that a
+    /// watch runs and its start happen under one lock, so two callers
+    /// start one watch. Nothing is opened when the file exists and is
+    /// watched: opening it again would reload and log it (#324 item 9).
+    ///
     /// # Errors
     ///
     /// When the directory or the default file cannot be created, or the
@@ -935,6 +1168,11 @@ impl App {
         &self,
         options: WatchOptions,
     ) -> Result<std::path::PathBuf, tessera_config::Error> {
+        let _open = lock(&self.open_config.lock);
+        let path = self.paths.config_file();
+        if self.is_watching_config() && path.is_file() {
+            return Ok(path);
+        }
         let store = ConfigStore::open(self.paths.clone())?;
         if !self.is_watching_config() {
             // A wait whose store refuses clipboard writes hands that store
@@ -942,9 +1180,23 @@ impl App {
             let refusing = lock(&self.config_watch)
                 .as_ref()
                 .and_then(|watch| watch.refusing.clone());
+            #[cfg(any(test, feature = "test-hooks"))]
+            self.open_config
+                .starts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.start_config_watch(refusing.unwrap_or(store), options)?;
         }
-        Ok(self.paths.config_file())
+        Ok(path)
+    }
+
+    /// How many watches [`App::open_config`] started, for the tests of
+    /// callers at once.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn config_watch_starts(&self) -> usize {
+        self.open_config
+            .starts
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Watches `store` (its `config.toml` and `themes/`) and applies every
@@ -1027,6 +1279,64 @@ mod tests {
     use super::*;
     use crate::view::Snapshot;
     use crate::{ConfigPaths, SessionEvent, SessionObserver};
+
+    /// #338 r1 m2: folding keeps the queued `Changed` when an `Invalid`
+    /// follows it (the store kept that configuration; dropping it would
+    /// skip a valid edit), keeps the later of two alike, and takes at most
+    /// [`MAX_EVENTS_FOLDED`] events from a flood.
+    #[test]
+    fn folding_never_lets_an_invalid_displace_a_queued_change() {
+        fn changed() -> (Arc<Config>, ConfigEvent) {
+            let config = Arc::new(Config::default());
+            let event = ConfigEvent::Changed(tessera_config::ConfigChanged {
+                config: Arc::clone(&config),
+                warnings: Vec::new(),
+            });
+            (config, event)
+        }
+        fn invalid() -> ConfigEvent {
+            ConfigEvent::Invalid(tessera_config::Error::Io(Arc::new(io::Error::other("bad"))))
+        }
+        fn folded_config(event: &ConfigEvent) -> &Arc<Config> {
+            match event {
+                ConfigEvent::Changed(changed) => &changed.config,
+                other => panic!("folded into {other:?}, not the queued Changed"),
+            }
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let (_, first) = changed();
+        let (later, second) = changed();
+        tx.send(second).unwrap();
+        tx.send(invalid()).unwrap();
+        tx.send(ConfigEvent::ThemesChanged).unwrap();
+        tx.send(invalid()).unwrap();
+        let event = fold(first, &rx);
+        assert!(
+            Arc::ptr_eq(folded_config(&event), &later),
+            "the later Changed is kept"
+        );
+        assert!(rx.try_recv().is_err(), "every queued event was folded");
+
+        let (kept, start) = changed();
+        tx.send(invalid()).unwrap();
+        let event = fold(start, &rx);
+        assert!(
+            Arc::ptr_eq(folded_config(&event), &kept),
+            "an Invalid folds into the Changed"
+        );
+
+        for _ in 0..MAX_EVENTS_FOLDED + 5 {
+            tx.send(invalid()).unwrap();
+        }
+        let (_, start) = changed();
+        drop(fold(start, &rx));
+        assert_eq!(
+            rx.try_iter().count(),
+            5,
+            "a fold takes at most MAX_EVENTS_FOLDED"
+        );
+    }
 
     /// A PTY that records its sizes and whether the views lock was free
     /// while it was resized.
@@ -1902,12 +2212,16 @@ mod tests {
         )
         .unwrap();
         assert!(
-            eventually(Duration::from_secs(5), || first(&app).as_deref()
+            eventually(Duration::from_secs(30), || first(&app).as_deref()
                 == Some("cmd+y")),
             "{:?}",
             first(&app)
         );
-        assert!(!lock(&seen).is_empty(), "on_config_applied");
+        // The observer hears it after the key map is published.
+        assert!(
+            eventually(Duration::from_secs(30), || !lock(&seen).is_empty()),
+            "on_config_applied"
+        );
     }
 
     /// #287 (M1): a configuration directory that is a symlink whose target
@@ -2612,7 +2926,14 @@ mod tests {
             bundled("Nord"),
             DisplayOptions::default(),
         );
-        let mut looks = Looks::new(dir.path(), &config, &colours, DisplayOptions::default());
+        let themes = ProfileThemes::default();
+        let mut looks = Looks::new(
+            dir.path(),
+            &config,
+            &colours,
+            DisplayOptions::default(),
+            &themes,
+        );
         assert_eq!(
             looks.of(Some("p"), Some(&previous)).colours,
             previous.colours
@@ -3003,8 +3324,14 @@ mod tests {
             (applied.generation, applied.colours.clone())
         };
         app.set_display_options(REDUCE);
-        app.live()
-            .restyle_at(&config, &colours, before, DisplayOptions::default(), false);
+        app.live().restyle_at(
+            &config,
+            &colours,
+            &ProfileThemes::default(),
+            before,
+            DisplayOptions::default(),
+            false,
+        );
         assert_eq!(
             flags(app.session_appearance(id).unwrap()),
             appearance(true, false),
@@ -3499,5 +3826,432 @@ font_size = 14.0
         let new_tab = crate::command::CommandId::find("new_tab", None).unwrap();
         assert_eq!(app.keymap().chords(new_tab).first(), Some(&chord));
         assert_eq!(app.config_generation(), 2);
+    }
+
+    /// #338: display options set on the main thread read no theme file:
+    /// the profile themes are the ones the configuration in effect
+    /// resolved (for the sessions then and those attached since), and a
+    /// session attached after them reads none either. Without the kept
+    /// resolutions each call looked every profile theme up again.
+    #[test]
+    fn display_options_read_no_theme_file_on_the_calling_thread() {
+        let mut config = profiles_config();
+        config.profiles[1].appearance.as_mut().unwrap().opacity = Some(0.5);
+        let app = App::new(config, ConfigPaths::new("/nonexistent/tessera"));
+        let nord = attach_fake_profile(&app, Some("nord"));
+        let plain = attach_fake_profile(&app, None);
+        assert!(
+            !flags(app.session_appearance(nord).unwrap()).0,
+            "translucent"
+        );
+        let before = lookups::on_this_thread();
+        app.set_display_options(REDUCE);
+        assert_eq!(lookups::on_this_thread(), before, "no theme lookup");
+        assert!(
+            flags(app.session_appearance(nord).unwrap()).0,
+            "restyled opaque"
+        );
+        assert_eq!(
+            app.session_appearance(nord).unwrap().background,
+            background_of(bundled("Nord").background, 1.0),
+            "in its own theme"
+        );
+        let later = attach_fake_profile(&app, Some("nord"));
+        app.set_display_options(DisplayOptions::default());
+        assert_eq!(
+            lookups::on_this_thread(),
+            before,
+            "none for a later session"
+        );
+        assert!(!flags(app.session_appearance(later).unwrap()).0);
+        assert!(flags(app.session_appearance(plain).unwrap()).0);
+    }
+
+    /// #338: a session that catches up takes the display options in
+    /// effect, not the defaults.
+    #[test]
+    fn a_session_catching_up_takes_the_display_options_in_effect() {
+        let app = App::new(
+            translucency_config(),
+            ConfigPaths::new("/nonexistent/tessera"),
+        );
+        let id = attach_fake_profile(&app, None);
+        assert_eq!(
+            flags(app.session_appearance(id).unwrap()),
+            appearance(false, true)
+        );
+        {
+            // As if the options were set after the session resolved its
+            // look and before it was listed.
+            let mut applied = lock(&app.applied);
+            applied.display = REDUCE;
+            applied.generation += 1;
+        }
+        app.live().catch_up(&app.session(id).unwrap());
+        assert_eq!(
+            flags(app.session_appearance(id).unwrap()),
+            appearance(true, false)
+        );
+    }
+
+    /// #338: while the `[appearance]` theme file does not load (its
+    /// colours kept), a change of the default profile's theme file still
+    /// restyles: the app-level theme (`App::view_theme`) follows the
+    /// applied configuration and the observer is told.
+    #[test]
+    fn the_app_theme_follows_a_profile_theme_while_the_theme_in_use_is_broken() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(root.path());
+        std::fs::create_dir_all(paths.themes_dir()).unwrap();
+        std::fs::write(paths.themes_dir().join("Bad.toml"), "this = = broken").unwrap();
+        let mine = paths.themes_dir().join("mine.toml");
+        std::fs::write(&mine, theme_doc("Mine", "#102030")).unwrap();
+        let config = Config::from_toml_lenient(
+            "[general]\ndefault_profile = \"p\"\n[appearance]\ntheme = \"Bad\"\n\
+             [[profiles]]\nname = \"p\"\n[profiles.appearance]\ntheme = \"mine\"\n",
+        )
+        .unwrap()
+        .config;
+        let store = ConfigStore::in_memory(paths.clone(), config.clone());
+        let app = App::new(config, paths);
+        let recorder = Recorder::default();
+        app.set_observer(Some(Box::new(recorder.clone())));
+        assert_eq!(
+            app.view_theme().background,
+            Rgba::from_srgb8(0x10, 0x20, 0x30)
+        );
+        std::fs::write(&mine, theme_doc("Mine", "#405060")).unwrap();
+        app.live().handle(&store, ConfigEvent::ThemesChanged);
+        assert_eq!(
+            app.view_theme().background,
+            Rgba::from_srgb8(0x40, 0x50, 0x60),
+            "the default profile's saved theme"
+        );
+        assert_eq!(recorder.take(), [true], "told, opaque");
+    }
+
+    /// #489 21.0b m4, adversarial m1: a profile theme that matches no file
+    /// warns once under a configuration however often it is looked up
+    /// (10 000 looks), not again under the next one while it is still
+    /// missing, and again once it went away and came back.
+    #[test]
+    fn a_missing_profile_theme_warns_once_while_it_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::from_toml_lenient(
+            "[appearance]\ntheme = \"Dracula\"\n\
+             [[profiles]]\nname = \"p\"\n[profiles.appearance]\ntheme = \"Missing\"\n",
+        )
+        .unwrap()
+        .config;
+        let colours = bundled("Dracula");
+        let capture = Arc::new(WarningText(Mutex::new(String::new())));
+        let warned = || lock(&capture.0).matches("profile theme:").count();
+        tracing::subscriber::with_default(Arc::clone(&capture), || {
+            let look = |themes: &ProfileThemes| {
+                Looks::new(
+                    dir.path(),
+                    &config,
+                    &colours,
+                    DisplayOptions::default(),
+                    themes,
+                )
+                .of(Some("p"), None)
+            };
+            let themes = ProfileThemes::default();
+            let before = lookups::on_this_thread();
+            for _ in 0..10_000 {
+                look(&themes);
+            }
+            assert_eq!(lookups::on_this_thread() - before, 1, "looked up once");
+            assert_eq!(warned(), 1, "{:?}", lock(&capture.0));
+            let next = Resolutions::after(&themes);
+            look(&next);
+            assert_eq!(warned(), 1, "not again while it is missing");
+            let without = Resolutions::after(&next);
+            let back = Resolutions::after(&without);
+            look(&back);
+            assert_eq!(warned(), 2, "again once it came back");
+        });
+    }
+
+    /// S5: 10 000 lookups of distinct missing themes keep at most
+    /// [`MAX_PROFILE_THEMES_RESOLVED`] resolutions and
+    /// [`MAX_PROFILE_THEME_WARNINGS`] warnings, and log at most that many
+    /// warnings and one line for the rest.
+    #[test]
+    fn a_flood_of_missing_themes_stays_under_the_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let colours = bundled("Dracula");
+        let themes = ProfileThemes::default();
+        let capture = Arc::new(WarningText(Mutex::new(String::new())));
+        tracing::subscriber::with_default(Arc::clone(&capture), || {
+            let mut looks = Looks::new(
+                dir.path(),
+                &config,
+                &colours,
+                DisplayOptions::default(),
+                &themes,
+            );
+            for n in 0..10_000 {
+                let appearance = tessera_config::Appearance {
+                    theme: format!("missing-{n}"),
+                    ..tessera_config::Appearance::default()
+                };
+                looks.with(appearance, None);
+            }
+        });
+        let kept = lock(&themes);
+        assert_eq!(kept.themes.len(), MAX_PROFILE_THEMES_RESOLVED);
+        assert_eq!(kept.warned.len(), MAX_PROFILE_THEME_WARNINGS);
+        let logged = lock(&capture.0);
+        assert!(
+            logged.matches("profile theme:").count() <= MAX_PROFILE_THEME_WARNINGS,
+            "{}",
+            logged.len()
+        );
+        assert_eq!(logged.matches("further ones are not shown").count(), 1);
+    }
+
+    /// #489 21.0b m4: a theme file in use that does not load is logged
+    /// once while it stays broken (each lookup keeps its colours), and
+    /// again when it breaks the same way once more after loading.
+    #[test]
+    fn a_broken_theme_in_use_is_logged_once_while_it_stays_broken() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(root.path());
+        std::fs::create_dir_all(paths.themes_dir()).unwrap();
+        let bad = paths.themes_dir().join("Bad.toml");
+        std::fs::write(&bad, "this = = broken").unwrap();
+        let config = Config::from_toml_lenient("[appearance]\ntheme = \"Bad\"\n")
+            .unwrap()
+            .config;
+        let store = ConfigStore::in_memory(paths.clone(), config.clone());
+        let app = App::new(config, paths);
+        let live = app.live();
+        let capture = Arc::new(WarningText(Mutex::new(String::new())));
+        let kept = || {
+            lock(&capture.0)
+                .matches("keeping the colours in use")
+                .count()
+        };
+        tracing::subscriber::with_default(Arc::clone(&capture), || {
+            for _ in 0..3 {
+                live.handle(&store, ConfigEvent::ThemesChanged);
+            }
+            assert_eq!(kept(), 1, "{:?}", lock(&capture.0));
+            std::fs::write(&bad, theme_doc("Bad", "#102030")).unwrap();
+            live.handle(&store, ConfigEvent::ThemesChanged);
+            assert_eq!(
+                app.view_theme().background,
+                Rgba::from_srgb8(0x10, 0x20, 0x30)
+            );
+            // The same failure as before: logged again only because the
+            // load in between cleared it.
+            std::fs::write(&bad, "this = = broken").unwrap();
+            live.handle(&store, ConfigEvent::ThemesChanged);
+            live.handle(&store, ConfigEvent::ThemesChanged);
+            assert_eq!(kept(), 2, "{:?}", lock(&capture.0));
+        });
+    }
+
+    /// Counts `on_config_applied` and, while armed, holds the apply thread
+    /// in it until released: an apply in progress.
+    #[derive(Clone)]
+    struct Holding {
+        applies: Arc<std::sync::atomic::AtomicUsize>,
+        armed: Arc<AtomicBool>,
+        entered: mpsc::Sender<()>,
+        released: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl SessionObserver for Holding {
+        fn on_session_event(&self, _: SessionId, _: SessionEvent) {}
+        fn on_config_applied(&self, _: u64) {
+            self.applies.fetch_add(1, Ordering::SeqCst);
+            if self.armed.swap(false, Ordering::SeqCst) {
+                let _ = self.entered.send(());
+                let (released, wake) = &*self.released;
+                let mut released = lock(released);
+                while !*released {
+                    released = wake.wait(released).unwrap_or_else(PoisonError::into_inner);
+                }
+            }
+        }
+    }
+
+    impl Holding {
+        /// An armed one, and the receiver that hears it hold.
+        fn armed() -> (Self, mpsc::Receiver<()>) {
+            let (entered, holding) = mpsc::channel();
+            let hold = Self {
+                applies: Arc::default(),
+                armed: Arc::new(AtomicBool::new(true)),
+                entered,
+                released: Arc::default(),
+            };
+            (hold, holding)
+        }
+
+        fn release(&self) {
+            let (released, wake) = &*self.released;
+            *lock(released) = true;
+            wake.notify_all();
+        }
+
+        fn applies(&self) -> usize {
+            self.applies.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Polls `done` every 10 ms, at most 3000 times: counted waits, not a
+    /// wall deadline, so a stalled process keeps its budget (#419).
+    fn waited(mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..3000 {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        done()
+    }
+
+    /// `config.toml` of `root` with `scrollback_lines = lines`, saved as an
+    /// editor does (a finished file renamed over it).
+    fn save_scrollback(paths: &ConfigPaths, lines: u32) {
+        let staged = paths.root().join("config.toml.staged");
+        std::fs::write(&staged, format!("[terminal]\nscrollback_lines = {lines}\n")).unwrap();
+        std::fs::rename(&staged, paths.config_file()).unwrap();
+    }
+
+    fn scrollback(config: &Config) -> u32 {
+        config.terminal.scrollback_lines
+    }
+
+    /// A store on `config.toml` in a fresh directory, holding
+    /// `scrollback_lines = 1`, and an application started with it whose
+    /// observer is an armed [`Holding`].
+    fn held_app() -> (
+        tempfile::TempDir,
+        ConfigPaths,
+        ConfigStore,
+        App,
+        Holding,
+        mpsc::Receiver<()>,
+    ) {
+        let base = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(base.path().join("Tessera"));
+        std::fs::create_dir_all(paths.root()).unwrap();
+        save_scrollback(&paths, 1);
+        let store = ConfigStore::open(paths.clone()).unwrap();
+        let app = App::new((*store.config()).clone(), paths.clone());
+        let (hold, holding) = Holding::armed();
+        app.set_observer(Some(Box::new(hold.clone())));
+        (base, paths, store, app, hold, holding)
+    }
+
+    /// #338: an edit that lands while the watch applies the one before is
+    /// applied after it. The apply is held in its observer call; the
+    /// watcher records the edit in the store meanwhile.
+    #[test]
+    fn an_edit_landing_during_an_apply_is_applied_after_it() {
+        let (_base, paths, store, app, hold, holding) = held_app();
+        app.start_config_watch(store.clone(), WatchOptions::default())
+            .unwrap();
+        save_scrollback(&paths, 2);
+        holding
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the apply of the first edit");
+        assert_eq!(scrollback(&app.config()), 2);
+        save_scrollback(&paths, 3);
+        assert!(
+            waited(|| scrollback(&store.config()) == 3),
+            "the watcher read it"
+        );
+        assert_eq!(scrollback(&app.config()), 2, "during the apply");
+        hold.release();
+        assert!(
+            waited(|| scrollback(&app.config()) == 3),
+            "applied after it: {}",
+            scrollback(&app.config())
+        );
+    }
+
+    /// #338: 1000 edits saved while the watch applies one converge to the
+    /// last with at most 3 applies in all: the one held, one for every
+    /// event queued meanwhile (folded, [`MAX_EVENTS_FOLDED`]), and one
+    /// for the event of the last edit if the watcher sends it after the
+    /// fold. The watcher settles each edit on its own (1 ms debounce), so
+    /// without the fold each queued event is an apply of its own.
+    #[test]
+    fn a_burst_of_edits_during_an_apply_converges_in_at_most_three_applies() {
+        const EDITS: u32 = 1000;
+        let (_base, paths, store, app, hold, holding) = held_app();
+        app.start_config_watch(
+            store.clone(),
+            WatchOptions {
+                debounce: Duration::from_millis(1),
+                max_wait: Duration::from_millis(1),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap();
+        save_scrollback(&paths, 2);
+        holding
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the apply of the first edit");
+        for lines in 3..=EDITS + 1 {
+            save_scrollback(&paths, lines);
+        }
+        assert!(
+            waited(|| scrollback(&store.config()) == EDITS + 1),
+            "the watcher read the last edit"
+        );
+        assert_eq!(hold.applies(), 1, "held");
+        hold.release();
+        assert!(waited(|| scrollback(&app.config()) == EDITS + 1));
+        // Until no apply follows for 50 polls (10 ms each, counted).
+        let mut quiet = 0;
+        let mut seen = hold.applies();
+        for _ in 0..3000 {
+            std::thread::sleep(Duration::from_millis(10));
+            let now = hold.applies();
+            quiet = if now == seen { quiet + 1 } else { 0 };
+            seen = now;
+            if quiet == 50 {
+                break;
+            }
+        }
+        assert!(seen <= 3, "{seen} applies for {EDITS} edits");
+        assert_eq!(scrollback(&app.config()), EDITS + 1);
+    }
+
+    /// K5: two `App::open_config` calls at once on a missing directory
+    /// create `config.toml` once and start one watch, and both return it.
+    #[test]
+    fn two_open_configs_at_once_start_one_watch() {
+        for round in 0..50 {
+            let base = tempfile::tempdir().unwrap();
+            let paths = ConfigPaths::new(base.path().join("tessera"));
+            let app = Arc::new(App::new(Config::default(), paths.clone()));
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let callers: Vec<_> = (0..2)
+                .map(|_| {
+                    let app = Arc::clone(&app);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        app.open_config(WatchOptions::default()).unwrap()
+                    })
+                })
+                .collect();
+            for caller in callers {
+                assert_eq!(caller.join().unwrap(), paths.config_file(), "round {round}");
+            }
+            assert!(paths.config_file().is_file());
+            assert!(app.is_watching_config());
+            assert_eq!(app.config_watch_starts(), 1, "round {round}");
+            app.stop_config_watch();
+        }
     }
 }

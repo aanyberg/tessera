@@ -782,10 +782,12 @@ impl ThemesFingerprint {
 /// Most profile files the watcher samples or follows between two full
 /// listings of `profiles/`: the first by stem. The native backend holds one
 /// kqueue descriptor for each (S5), so an in-place save of one of these is
-/// seen at once; an in-place save of a file past them is seen with the
-/// next change of `profiles/` or `config.toml` there, and by the polling
-/// backend within [`POLL_FULL_THEMES_EVERY`] ticks. A file created,
-/// deleted or renamed in `profiles/` is seen at once whatever its place.
+/// seen at once; an in-place save of a file past them is seen by the
+/// native backend's sample of every profile file each
+/// `PROFILE_TAIL_POLL_INTERVAL` (2 s, only while there are more), and by
+/// the polling backend within [`POLL_FULL_THEMES_EVERY`] ticks. A file
+/// created, deleted or renamed in `profiles/` is seen at once whatever its
+/// place.
 pub(crate) const MAX_PROFILE_FILES_FOLLOWED: usize = 32;
 
 /// A cheap identity of the state of `profiles/`: the directory's own
@@ -798,6 +800,9 @@ pub(crate) const MAX_PROFILE_FILES_FOLLOWED: usize = 32;
 struct ProfilesFingerprint {
     dir: Fingerprint,
     files: Vec<(std::path::PathBuf, Fingerprint)>,
+    /// Whether the listing stopped at its limit with `*.toml` entries
+    /// left, so profile files past the sampled ones may exist.
+    more: bool,
 }
 
 impl ProfilesFingerprint {
@@ -806,6 +811,7 @@ impl ProfilesFingerprint {
     /// first `limit` profile files.
     fn listed(dir: &Path, dir_now: Fingerprint, limit: usize) -> Self {
         let listing = crate::profile_files::list_first(dir, limit);
+        let more = listing.dropped > 0;
         let files = listing
             .files
             .into_iter()
@@ -819,6 +825,7 @@ impl ProfilesFingerprint {
         Self {
             dir: dir_now,
             files,
+            more,
         }
     }
 
@@ -845,6 +852,7 @@ impl ProfilesFingerprint {
                     (path.clone(), fingerprint)
                 })
                 .collect(),
+            more: self.more,
         }
     }
 }
@@ -1041,9 +1049,11 @@ mod native {
         /// polls, slowly ([`CAPPED_CHAIN_POLL_INTERVAL`]).
         chain: Vec<(PathBuf, ChainSlot)>,
         /// Whether the last [`Native::register_chain`] found the chain past
-        /// a cap or in a cycle: polling then waits
+        /// a cap or in a cycle, or could not walk it through a directory
+        /// it may not search (`EACCES`): polling then waits
         /// [`CAPPED_CHAIN_POLL_INTERVAL`] rather than `poll_interval`, since
-        /// nothing will arm the backend until the links change (#393 m3).
+        /// nothing will arm the backend until the links or the mode change
+        /// (#393 m3, #489 21.4 M3).
         chain_capped: bool,
         /// `config.toml` and its handle, `None` while the file is missing.
         /// Opening follows symlinks, so the handle is the link's target.
@@ -1109,6 +1119,16 @@ mod native {
         /// or one that appears, is seen through a directory of the chain
         /// only.
         profiles_seen: super::ProfilesFingerprint,
+        /// While `profiles/` holds more profile files than are followed
+        /// (`profiles_seen.more`): the state of all of them (at most
+        /// [`crate::MAX_PROFILE_FILES`]) when the last settle began. An
+        /// in-place save of one past the followed ones raises no event, so
+        /// the thread samples them every [`PROFILE_TAIL_POLL_INTERVAL`]
+        /// and settles when they changed (#489 21.4 M1). `None` otherwise:
+        /// an idle watcher with fewer files never wakes.
+        profiles_tail: Option<super::ProfilesFingerprint>,
+        /// When the next sample of `profiles_tail` is due.
+        tail_due: Instant,
         /// The error from the most recent [`Native::register_all`] that
         /// could not register every slot, or `None` when it registered
         /// them all. While `Some` the backend is not armed and polls, since
@@ -1163,6 +1183,19 @@ mod native {
     /// link on the way, within about 2 s.
     pub(crate) const CAPPED_CHAIN_POLL_INTERVAL: std::time::Duration =
         std::time::Duration::from_secs(2);
+
+    /// How often the thread samples every profile file while `profiles/`
+    /// holds more than [`super::MAX_PROFILE_FILES_FOLLOWED`]
+    /// ([`Native::profiles_tail`]): an in-place save of one past them is
+    /// applied within about this long. Each sample lists `profiles/` and
+    /// `stat`s at most [`crate::MAX_PROFILE_FILES`] files (S6), as a full
+    /// listing of the polling backend does.
+    pub(crate) const PROFILE_TAIL_POLL_INTERVAL: std::time::Duration =
+        std::time::Duration::from_secs(2);
+
+    /// Most times a settle samples `profiles/` again after re-registering
+    /// for a changed set of profile files ([`Native::settle`]).
+    const MAX_PROFILE_RESAMPLES: usize = 4;
 
     /// What a registration slot expects to find at its path.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1540,6 +1573,8 @@ mod native {
                 profile_files: Vec::new(),
                 profile_file_handles: Vec::new(),
                 profiles_seen: super::ProfilesFingerprint::default(),
+                profiles_tail: None,
+                tail_due: Instant::now(),
                 register_error: None,
                 config_seen: super::Fingerprint::Missing,
                 #[cfg(test)]
@@ -1663,7 +1698,13 @@ mod native {
                 let dirs = match resolved {
                     Ok(dirs) => dirs,
                     Err(error) => {
-                        self.chain_capped = ChainCapped::is(&error);
+                        // Past a cap, in a cycle, or behind a directory
+                        // that cannot be searched (a profile file or
+                        // `profiles/` linked into a mode 000 directory,
+                        // #489 21.4 M3): that lasts until someone changes
+                        // the links or the mode, so poll slowly.
+                        self.chain_capped = ChainCapped::is(&error)
+                            || error.kind() == std::io::ErrorKind::PermissionDenied;
                         self.drop_chain(registered);
                         return Err(error);
                     }
@@ -1951,8 +1992,19 @@ mod native {
         /// `None` to stop.
         fn next_event(&mut self, store: &ConfigStore, options: &WatchOptions) -> Option<Event> {
             loop {
+                if self.tail_changed() {
+                    self.settle(store);
+                    continue;
+                }
                 if self.armed() {
-                    return self.queue.poll_forever(None);
+                    if self.profiles_tail.is_none() {
+                        return self.queue.poll_forever(None);
+                    }
+                    let wait = self.tail_due.saturating_duration_since(Instant::now());
+                    match self.queue.poll(Some(wait)) {
+                        Some(event) => return Some(event),
+                        None => continue,
+                    }
                 }
                 let interval = if self.chain_capped {
                     options.poll_interval.max(CAPPED_CHAIN_POLL_INTERVAL)
@@ -1996,11 +2048,26 @@ mod native {
             // before it: a write after the registration raises an event, one
             // before is read. A changed set rearms everything, the chain
             // included, so a new linked file's way is watched too (#312).
-            let (files, seen) = self.sample_profiles();
-            if files != self.profile_files {
+            //
+            // Re-registering `profiles/` drops its pending events, so a
+            // file added between a sample and that rearm would be loaded
+            // but not followed: the set is sampled again after each rearm,
+            // until it holds still, at most `MAX_PROFILE_RESAMPLES` times
+            // (#489 21.4 M4). One added after the last rearm raises an
+            // event on the armed directory.
+            let (mut files, mut seen) = self.sample_profiles();
+            for _ in 0..MAX_PROFILE_RESAMPLES {
+                if files == self.profile_files {
+                    break;
+                }
                 self.profile_files = files;
                 self.rearm();
+                (files, seen) = self.sample_profiles();
             }
+            self.profiles_tail = seen
+                .more
+                .then(|| super::ProfilesFingerprint::of(&self.profiles, crate::MAX_PROFILE_FILES));
+            self.tail_due = Instant::now() + PROFILE_TAIL_POLL_INTERVAL;
             self.profiles_seen = seen;
             #[cfg(test)]
             self.probe.note_settle();
@@ -2013,6 +2080,24 @@ mod native {
         fn changed_unseen(&self) -> bool {
             super::Fingerprint::of(&self.file) != self.config_seen
                 || self.sample_profiles().1 != self.profiles_seen
+        }
+
+        /// Whether a sample of every profile file is due
+        /// ([`Native::profiles_tail`]) and finds them changed since the
+        /// last settle began. Takes the sample when due, and schedules the
+        /// next one.
+        fn tail_changed(&mut self) -> bool {
+            let Some(tail) = &self.profiles_tail else {
+                return false;
+            };
+            let now = Instant::now();
+            if now < self.tail_due {
+                return false;
+            }
+            self.tail_due = now + PROFILE_TAIL_POLL_INTERVAL;
+            #[cfg(test)]
+            self.probe.note_tail();
+            super::ProfilesFingerprint::of(&self.profiles, crate::MAX_PROFILE_FILES) != *tail
         }
 
         /// Follows the theme files `config`'s `appearance.theme` and its
@@ -2863,6 +2948,75 @@ mod native {
             assert_eq!(native.profile_file_handles.len(), 1);
         }
 
+        thread_local! {
+            /// For [`write_once_at`]: the path whose registration triggers
+            /// the write, and the file it writes, once.
+            static WRITE_AT: std::cell::RefCell<Option<(PathBuf, PathBuf)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        /// A [`BEFORE_OPEN`] hook: the first time the path in [`WRITE_AT`]
+        /// is about to be registered, writes its file (an empty profile
+        /// file) or, for a path ending in `/`, creates that directory.
+        fn write_once_at(path: &Path) {
+            let due = WRITE_AT.with(|at| {
+                let mut at = at.borrow_mut();
+                if at.as_ref().is_some_and(|(trigger, _)| trigger == path) {
+                    at.take().map(|(_, file)| file)
+                } else {
+                    None
+                }
+            });
+            if let Some(file) = due {
+                if file.as_os_str().to_string_lossy().ends_with('/') {
+                    std::fs::create_dir(&file).unwrap();
+                } else {
+                    std::fs::write(&file, "").unwrap();
+                }
+            }
+        }
+
+        /// Runs `f` with [`write_once_at`] armed to write `file` when
+        /// `trigger` is about to be registered, and asserts it wrote.
+        fn writing_once_at<T>(trigger: &Path, file: &Path, f: impl FnOnce() -> T) -> T {
+            WRITE_AT.with(|at| *at.borrow_mut() = Some((trigger.to_owned(), file.to_owned())));
+            BEFORE_OPEN.with(|hook| hook.set(Some(write_once_at)));
+            let result = f();
+            BEFORE_OPEN.with(|hook| hook.set(None));
+            assert!(
+                WRITE_AT.with(|at| at.borrow_mut().take().is_none()),
+                "the hook did not write"
+            );
+            result
+        }
+
+        /// #489 21.4 M4: a profile file added between the settle's sample
+        /// and the rearm that re-registers `profiles/` (whose pending
+        /// events that drops) is followed too: the settle samples again
+        /// after the rearm. Deterministic: the file is written in that
+        /// window, on the registering thread.
+        #[test]
+        fn a_profile_file_added_during_the_settle_rearm_is_followed() {
+            let base = tempfile::tempdir().unwrap();
+            let paths = ConfigPaths::new(base.path());
+            let profiles = paths.profiles_dir();
+            std::fs::create_dir_all(&profiles).unwrap();
+            let [a, b, c] = ["a", "b", "c"].map(|stem| profiles.join(format!("{stem}.toml")));
+            std::fs::write(&a, "").unwrap();
+            let store = ConfigStore::open(paths.clone()).unwrap();
+            let (mut native, _stop) = Native::open(&paths).unwrap();
+            native.settle(&store);
+            std::fs::write(&b, "").unwrap();
+            writing_once_at(&profiles, &c, || native.settle(&store));
+            assert_eq!(native.profile_files, [a, b, c.clone()]);
+            assert_eq!(native.profile_file_handles.len(), 3);
+            assert_eq!(native.profiles_seen.files.len(), 3);
+            while native.queue.poll(Some(Duration::ZERO)).is_some() {}
+            std::fs::write(&c, "command = \"/bin/c\"\n").unwrap();
+            let fd = native.profile_file_handles[2].as_raw_fd();
+            assert!(event_on(&mut native, fd).is_some(), "no event on c.toml");
+        }
+
         /// A root `base/root` (with `config.toml`) whose `profiles/` holds
         /// `links` profile files, each a symbolic link into a directory of
         /// its own (`profiles/p07.toml -> base/t07/p.toml`).
@@ -3013,6 +3167,7 @@ mod native {
             polls: AtomicUsize,
             settles: AtomicUsize,
             rearms: AtomicUsize,
+            tails: AtomicUsize,
         }
 
         impl Probe {
@@ -3028,6 +3183,10 @@ mod native {
                 self.rearms.fetch_add(1, Ordering::Relaxed);
             }
 
+            pub(super) fn note_tail(&self) {
+                self.tails.fetch_add(1, Ordering::Relaxed);
+            }
+
             fn polls(&self) -> usize {
                 self.polls.load(Ordering::Relaxed)
             }
@@ -3038,6 +3197,10 @@ mod native {
 
             fn rearms(&self) -> usize {
                 self.rearms.load(Ordering::Relaxed)
+            }
+
+            fn tails(&self) -> usize {
+                self.tails.load(Ordering::Relaxed)
             }
         }
 
@@ -3651,6 +3814,187 @@ mod native {
                 themes_change_within(&watcher, Duration::from_millis(500)),
                 "no ThemesChanged within 500 ms of the link's target appearing"
             );
+        }
+
+        /// Waits up to `within` for the store to apply a profile `name`
+        /// whose command is `command`.
+        fn applies_profile(running: &Running, name: &str, command: &str, within: Duration) -> bool {
+            let started = Instant::now();
+            loop {
+                if running.store.config().profiles.iter().any(|profile| {
+                    profile.name == name && profile.command.as_deref() == Some(command)
+                }) {
+                    return true;
+                }
+                if started.elapsed() > within {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        /// #489 21.4 M7: `profiles/` a link whose target directory appears
+        /// in a directory of the chain after `profiles/` was registered
+        /// (nothing to register then, no error) and before the settle
+        /// samples it. The chain event that follows changes nothing on the
+        /// way, but `profiles/` now exists unwatched, so the registration
+        /// is incomplete and the loop rearms (as `run` does), after which
+        /// a profile file added to it raises an event. Deterministic: the
+        /// directory appears on the registering thread, as `config.toml`
+        /// (registered last) is about to be, and the events are read off
+        /// the queue here (in a running watch, any event on the busy
+        /// `$TMPDIR` of the chain would also find `profiles/` changed).
+        #[test]
+        fn a_profiles_target_appearing_after_its_registration_is_watched() {
+            let (_dir, base) = resolved_tempdir();
+            let root = base.join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("config.toml"), sized(11)).unwrap();
+            let elsewhere = base.join("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap();
+            let target = elsewhere.join("profiles");
+            std::os::unix::fs::symlink(&target, root.join("profiles")).unwrap();
+            let paths = ConfigPaths::new(&root);
+            let store = ConfigStore::open(paths.clone()).unwrap();
+            let (mut native, _stop) = writing_once_at(
+                &paths.config_file(),
+                &PathBuf::from(format!("{}/", target.display())),
+                || Native::open(&paths).unwrap(),
+            );
+            native.settle(&store);
+            assert!(
+                native.profiles_handle.is_none(),
+                "registered before it appeared"
+            );
+            assert!(native.armed());
+            let fd = chain_fd(&native, &elsewhere);
+            let event = event_on(&mut native, fd).expect("no event on elsewhere");
+            assert!(native.changes_nothing(&event), "{event:?}");
+            assert!(
+                native.registration_incomplete(),
+                "profiles/ exists unwatched, yet the registration looks complete"
+            );
+            native.rearm();
+            let fd = native
+                .profiles_handle
+                .as_ref()
+                .expect("profiles/ not registered by the rearm")
+                .as_raw_fd();
+            while native.queue.poll(Some(Duration::ZERO)).is_some() {}
+            std::fs::write(target.join("late.toml"), "").unwrap();
+            assert!(event_on(&mut native, fd).is_some(), "no event on profiles/");
+        }
+
+        /// #489 21.4 M3 and adversarial M2: a profile file, or `profiles/`
+        /// itself, linked into a directory that cannot be searched (mode
+        /// 000) cannot be walked, so the backend is not armed. It polls
+        /// slowly then ([`CAPPED_CHAIN_POLL_INTERVAL`]), as past a cap,
+        /// not every `poll_interval` (20 a second); an edit of
+        /// `config.toml` still applies from its own watch, and the profile
+        /// is applied once the directory can be searched again.
+        #[test]
+        fn a_profile_link_into_an_unsearchable_directory_polls_slowly() {
+            use std::os::unix::fs::PermissionsExt as _;
+            for layout in ["file", "dir"] {
+                let (_dir, base) = resolved_tempdir();
+                let root = base.join("root");
+                std::fs::create_dir_all(&root).unwrap();
+                std::fs::write(root.join("config.toml"), sized(11)).unwrap();
+                let locked = base.join("locked");
+                std::fs::create_dir_all(locked.join("profiles")).unwrap();
+                let file = "command = \"/bin/p\"\n";
+                if layout == "file" {
+                    std::fs::create_dir(root.join("profiles")).unwrap();
+                    std::fs::write(locked.join("p.toml"), file).unwrap();
+                    std::os::unix::fs::symlink(
+                        locked.join("p.toml"),
+                        root.join("profiles").join("p.toml"),
+                    )
+                    .unwrap();
+                } else {
+                    std::fs::write(locked.join("profiles").join("p.toml"), file).unwrap();
+                    std::os::unix::fs::symlink(locked.join("profiles"), root.join("profiles"))
+                        .unwrap();
+                }
+                let mode = |mode| {
+                    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(mode))
+                        .unwrap();
+                };
+                mode(0o000);
+                if std::fs::read_dir(&locked).is_ok() {
+                    mode(0o755);
+                    return; // as root
+                }
+                let running = run_native(&root, |native| {
+                    assert!(!native.armed(), "{layout}: armed behind mode 000");
+                    assert!(native.chain_capped, "{layout}: polls fast");
+                });
+                let polls = running.probe.polls();
+                let window = Duration::from_millis(1000);
+                std::fs::write(root.join("config.toml"), sized(22)).unwrap();
+                assert!(
+                    applies(&running, 22, window),
+                    "{layout}: the edit was missed"
+                );
+                std::thread::sleep(window.saturating_sub(Duration::from_millis(10)));
+                let polled = running.probe.polls() - polls;
+                assert!(polled <= 3, "{layout}: {polled} polls in about 1 s");
+                mode(0o755);
+                assert!(
+                    applies_profile(&running, "p", "/bin/p", CAPPED_CHAIN_POLL_INTERVAL * 3),
+                    "{layout}: the profile was not applied once searchable"
+                );
+            }
+        }
+
+        /// #489 21.4 M1: with more profile files than are followed, an
+        /// in-place save of one past them (no event) is applied from the
+        /// sample of every file the thread takes every
+        /// [`PROFILE_TAIL_POLL_INTERVAL`]. With no more files than are
+        /// followed it takes none, so an idle watcher sleeps.
+        #[test]
+        fn a_profile_file_past_the_followed_ones_saved_in_place_is_applied() {
+            let cap = super::super::MAX_PROFILE_FILES_FOLLOWED;
+            for count in [cap, cap + 8] {
+                let (_dir, base) = resolved_tempdir();
+                let root = base.join("root");
+                std::fs::create_dir_all(root.join("profiles")).unwrap();
+                std::fs::write(root.join("config.toml"), sized(11)).unwrap();
+                for i in 0..count {
+                    std::fs::write(root.join("profiles").join(format!("p{i:02}.toml")), "")
+                        .unwrap();
+                }
+                let running = run_native(&root, |native| {
+                    assert_eq!(native.profiles_tail.is_some(), count > cap, "{count} files");
+                });
+                if count == cap {
+                    std::thread::sleep(PROFILE_TAIL_POLL_INTERVAL + Duration::from_millis(200));
+                    assert_eq!(running.probe.tails(), 0, "sampled with {count} files");
+                    continue;
+                }
+                // #338 r1 m1: idle, the tail is sampled once per
+                // interval, not on every wakeup.
+                let tails = running.probe.tails();
+                std::thread::sleep(PROFILE_TAIL_POLL_INTERVAL + Duration::from_millis(200));
+                assert!(
+                    running.probe.tails() - tails <= 2,
+                    "{} tail samples in an idle {:?}",
+                    running.probe.tails() - tails,
+                    PROFILE_TAIL_POLL_INTERVAL + Duration::from_millis(200)
+                );
+                let last = root
+                    .join("profiles")
+                    .join(format!("p{:02}.toml", count - 1));
+                let mut file = std::fs::OpenOptions::new().write(true).open(&last).unwrap();
+                std::io::Write::write_all(&mut file, b"command = \"/bin/last\"\n").unwrap();
+                drop(file);
+                let name = format!("p{:02}", count - 1);
+                assert!(
+                    applies_profile(&running, &name, "/bin/last", PROFILE_TAIL_POLL_INTERVAL * 3),
+                    "the in-place save past the followed files was not applied"
+                );
+                assert!(running.probe.tails() > 0);
+            }
         }
 
         /// #430 item 4 (20.7 adversarial F2): a profile theme found only

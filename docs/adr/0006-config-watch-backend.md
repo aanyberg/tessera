@@ -333,3 +333,60 @@ caller's thread, not twice (#283 item 2).
 stop pipe, the root, a linked file's target directory, `themes/`, the
 theme file and `config.toml`, plus 8 unloadable theme files, 8 profile
 theme files and 32 directories on the way.
+
+## Amendment: catching up, profile themes resolved once, atomic open (#338, #489, 2026-11-18)
+
+**Queued events fold.** Each apply reads the store's state as it is when
+handled, not the one its event carries, so the apply thread folds the
+events queued behind the one it takes (at most 1024, `MAX_EVENTS_FOLDED`)
+into one: a `Changed` covers a `ThemesChanged` and an `Invalid` (which
+only logs), and of two alike the later is kept. An edit that lands while
+an apply runs is applied after it, and a burst of edits during one apply
+costs at most three applies: the one running, one for everything queued
+by then, and one for an event the watcher sends after the fold.
+
+**Profile themes resolved once per configuration.** The applied state
+holds the resolutions of the profile themes (`ProfileThemes`, by name, at
+most `MAX_PROFILES` + 1), fresh for each configuration or theme change the
+apply thread records. Restyling looks a name up there and reads its file
+only on a miss. So `set_display` (the main thread), a session catching up
+(`catch_up`) and a session attached later reuse what the apply thread
+read: `set_display` reads no theme file unless a session attached with a
+name no apply has resolved yet, a race that reads it once.
+
+**Warnings once.** A profile theme that is missing or does not load warns
+once while it stays so: each apply's set of names warned carries over to
+the next, and a name warns again only after it resolved in between. The
+set is capped at twice the resolutions (`MAX_PROFILE_THEME_WARNINGS`), past
+which one line says further ones are not shown (S5). The `[appearance]`
+theme file that does not load ("keeping the colours in use") is logged
+once while it fails the same way, and again after it loaded or failed
+otherwise (#489 21.0b m4). Keeping its colours no longer skips the
+restyle, so `App::theme` and the profiles' themes follow a change of
+another theme file while the one in use stays broken.
+
+**`open_config` is one step.** `App::open_config` holds one lock across
+its check (watching, and `config.toml` is a file: return the path, no
+reload), the creation of a missing file (an exclusive hard link of a
+written temporary, never a truncation) and the start of the watch, so two
+callers at once, Rust or FFI, create the file once and start one watch.
+The FFI's own `OPEN_LOCK` is gone (K5, #344).
+
+**Native watcher (#489 21.4).**
+- A settle that re-registers for a changed set of profile files samples
+  `profiles/` again after the rearm, until the set holds still (at most 4
+  times), since the re-registration drops the directory's pending events
+  and a file added in between would be loaded but not followed (M4).
+- A chain that cannot be walked because a directory on the way may not be
+  searched (`EACCES`: a profile file or `profiles/` linked into a mode 000
+  directory) is polled every 2 s (`CAPPED_CHAIN_POLL_INTERVAL`), as past a
+  cap, not every `poll_interval` (M3, adversarial M2). An edit of
+  `config.toml` still applies from its own watch.
+- While `profiles/` holds more profile files than the 32 followed, the
+  thread samples all of them (at most `MAX_PROFILE_FILES`, one listing and
+  that many `stat`s) every 2 s (`PROFILE_TAIL_POLL_INTERVAL`) and settles
+  when they changed, so an in-place save past the first 32 applies within
+  about 2 s (M1). With 32 or fewer an idle watcher still never wakes.
+- A chain event that changes nothing on the way still rearms when
+  `profiles/` exists without a watch (the `registration_incomplete` rule
+  of #417 M-B, now tested for `profiles/`, M7).

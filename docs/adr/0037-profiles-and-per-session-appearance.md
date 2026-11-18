@@ -186,3 +186,12 @@ restored windows start with the default profile.
   `"config"` or `"profiles/<stem>.toml"`. `ConfigEditor` refuses a set or
   remove under `profiles[i]` for a file's profile (ADR 0040 amendment
   below) rather than writing it into `config.toml`.
+
+## Amendment: profile files past the followed ones (#489 21.4 M1, 2026-11-18)
+
+The limit in the watching rule above is lifted: while `profiles/` holds
+more than 32 profile files, the native backend samples all of them every
+2 s, so an in-place save of one past the first 32 by stem is applied
+within about 2 s, as the polling backend's full listing does. The profile
+themes' resolution and warning rules are in ADR 0006's amendment of the
+same date.

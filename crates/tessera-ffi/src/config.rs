@@ -166,39 +166,17 @@ enum Change {
 /// taken over.
 static EDIT_LOCK: Mutex<()> = Mutex::new(());
 
-/// Held across [`open_config`]'s check and its start of the watch.
-static OPEN_LOCK: Mutex<()> = Mutex::new(());
-
-/// The apps (by address) [`open_config`] started a watch for, in order:
-/// what the test of two callers at once counts.
-#[cfg(test)]
-static WATCH_STARTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-
 /// Makes `config.toml` editable: creates the configuration directory and a
 /// commented default `config.toml` where they are missing and starts the
 /// watch unless it runs already (`App::open_config`); returns the file's
 /// path. Nothing is opened again when the file exists and is watched: that
-/// would reload and log it (#324 item 9). The check and the start happen
-/// under one lock, so two callers at once (the Open Config menu item's
+/// would reload and log it (#324 item 9). The core makes it one step, so
+/// two callers at once (the Open Config menu item's
 /// `tessera_app_create_config` and a Settings edit on the write queue)
-/// start one watch, never two (#344). A Settings edit
-/// (`tessera_config_set`, `tessera_config_remove`) creates the file too.
+/// start one watch, never two, and never truncate the file (#344, K5). A
+/// Settings edit (`tessera_config_set`, `tessera_config_remove`) creates
+/// the file too.
 pub(crate) fn open_config(app: &App) -> Result<PathBuf, String> {
-    let _open = OPEN_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let path = app.core.config_path();
-    let watching = app.core.is_watching_config();
-    if path.is_file() && watching {
-        return Ok(path);
-    }
-    #[cfg(test)]
-    if !watching {
-        WATCH_STARTS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(std::ptr::from_ref(app) as usize);
-    }
     app.core
         .open_config(WatchOptions::default())
         .map_err(|error| error.to_string())
@@ -924,10 +902,10 @@ mod tests {
     use super::*;
     use std::fmt::Write as _;
 
-    /// #344: `open_config` from two threads at once (the Open Config menu
-    /// item and a Settings edit) starts one watch, never two: the check
-    /// and the start are under one lock. 100 rounds, each a fresh
-    /// directory the two threads race to create.
+    /// #344, K5: `open_config` from two threads at once (the Open Config
+    /// menu item and a Settings edit) creates the file once and starts one
+    /// watch, never two: the core makes the check and the start one step.
+    /// 100 rounds, each a fresh directory the two threads race to create.
     #[test]
     fn two_callers_at_once_start_one_watch() {
         for round in 0..100 {
@@ -938,7 +916,6 @@ mod tests {
                     tessera_app_core::ConfigPaths::new(dir.path().join("tessera")),
                 ),
             });
-            let address = std::ptr::from_ref::<App>(&app) as usize;
             let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
             let callers: Vec<_> = (0..2)
                 .map(|_| {
@@ -950,23 +927,72 @@ mod tests {
                     })
                 })
                 .collect();
-            for caller in callers {
-                assert!(caller.join().unwrap().is_file());
-            }
+            let paths: Vec<PathBuf> = callers
+                .into_iter()
+                .map(|caller| caller.join().unwrap())
+                .collect();
+            assert!(paths[0].is_file(), "round {round}");
+            assert_eq!(paths[0], paths[1], "round {round}");
             assert!(app.core.is_watching_config());
-            let starts = WATCH_STARTS
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .iter()
-                .filter(|&&started| started == address)
-                .count();
-            assert_eq!(starts, 1, "round {round}");
-            // The next app may reuse the address.
-            drop(app);
-            WATCH_STARTS
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .retain(|&started| started != address);
+            assert_eq!(app.core.config_watch_starts(), 1, "round {round}");
+        }
+    }
+
+    /// K5: two callers at once never truncate or replace a `config.toml`
+    /// that is there, written before them or while they run.
+    #[test]
+    fn two_callers_at_once_keep_an_existing_file() {
+        const MINE: &str = "# mine\n[appearance]\nfont_size = 15\n";
+        for round in 0..50 {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = tessera_app_core::ConfigPaths::new(dir.path().join("tessera"));
+            let before = round % 2 == 0;
+            if before {
+                std::fs::create_dir_all(paths.root()).unwrap();
+                std::fs::write(paths.config_file(), MINE).unwrap();
+            }
+            let app = std::sync::Arc::new(App {
+                core: tessera_app_core::App::new(
+                    tessera_app_core::Config::default(),
+                    paths.clone(),
+                ),
+            });
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+            let callers: Vec<_> = (0..2)
+                .map(|_| {
+                    let app = std::sync::Arc::clone(&app);
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        open_config(&app).unwrap()
+                    })
+                })
+                .collect();
+            barrier.wait();
+            // The user's own file, written while the callers run: only
+            // where none is yet, as an editor's first save would.
+            let written = !before && {
+                let _ = std::fs::create_dir_all(paths.root());
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(paths.config_file())
+                    .and_then(|mut file| std::io::Write::write_all(&mut file, MINE.as_bytes()))
+                    .is_ok()
+            };
+            for caller in callers {
+                caller.join().unwrap();
+            }
+            let text = std::fs::read_to_string(paths.config_file()).unwrap();
+            if before || written {
+                assert_eq!(text, MINE, "round {round}");
+            } else {
+                assert!(
+                    text.contains("[appearance]"),
+                    "round {round}: the default file"
+                );
+            }
+            assert_eq!(app.core.config_watch_starts(), 1, "round {round}");
         }
     }
 

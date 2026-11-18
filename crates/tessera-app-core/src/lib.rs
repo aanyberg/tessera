@@ -273,6 +273,8 @@ pub struct App {
     reaper: Reaper,
     /// The configuration watch, if [`App::start_config_watch`] started one.
     config_watch: Mutex<Option<ConfigWatch>>,
+    /// Makes [`App::open_config`] one step for callers at once.
+    open_config: config_watch::OpenConfig,
     /// The built-in plugin host (ADR 0047); looks on through the observer
     /// slot, which always holds a [`plugins::Tee`] while the `App` lives.
     plugins: Arc<plugins::PluginHost>,
@@ -314,11 +316,13 @@ impl App {
         for warning in &colours.warnings {
             tracing::warn!(target: "tessera_app_core", "{warning}");
         }
+        let profile_themes = config_watch::ProfileThemes::default();
         let default_look = config_watch::Looks::new(
             &paths.themes_dir(),
             &config,
             &colours.theme,
             DisplayOptions::default(),
+            &profile_themes,
         )
         .default_look();
         let theme = Arc::new(Mutex::new(default_look.theme));
@@ -332,6 +336,8 @@ impl App {
             },
             generation: 0,
             display: DisplayOptions::default(),
+            profile_themes,
+            kept_broken: None,
         }));
         let plugins = Arc::new(plugins::PluginHost::new(factories, Arc::clone(&applied)));
         // The configuration the `App` starts with enables its plugins; no
@@ -354,6 +360,7 @@ impl App {
             theme,
             reaper: Reaper::new(),
             config_watch: Mutex::new(None),
+            open_config: config_watch::OpenConfig::default(),
             plugins,
         }
     }
@@ -660,17 +667,24 @@ impl App {
         // sessions started after a change only (lead decision
         // D-SCROLLBACK-LIVE); it is capped like a loaded configuration's,
         // in case this one was built by hand.
-        let (config, colours, generation, display) = {
+        let (config, colours, themes, generation, display) = {
             let applied = lock(&self.applied);
             (
                 Arc::clone(&applied.config),
                 applied.colours.clone(),
+                Arc::clone(&applied.profile_themes),
                 applied.generation,
                 applied.display,
             )
         };
-        let look = config_watch::Looks::new(&self.paths.themes_dir(), &config, &colours, display)
-            .of(profile.as_deref(), None);
+        let look = config_watch::Looks::new(
+            &self.paths.themes_dir(),
+            &config,
+            &colours,
+            display,
+            &themes,
+        )
+        .of(profile.as_deref(), None);
         let scrollback = config
             .terminal
             .scrollback_lines
