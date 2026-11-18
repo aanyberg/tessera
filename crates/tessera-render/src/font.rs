@@ -1939,6 +1939,92 @@ mod tests {
         );
     }
 
+    /// #526 (24.6 m1): bold on a real variable family comes from its
+    /// `wght` axis, not from synthetic bold. The premise (no bold face, an
+    /// axis reaching bold) is read from the font itself, so it does not
+    /// depend on the code under test.
+    #[test]
+    fn bold_on_an_installed_variable_family_is_not_synthetic() {
+        let mut checked = 0;
+        for family in [".SF NS Mono", "System Font"] {
+            let config = FontConfig {
+                family: family.into(),
+                size_pt: 13.0,
+                scale: 1.0,
+                fallback: Vec::new(),
+            };
+            let Ok(fonts) = Fonts::with_system(FontSystem::new(), &config, IndexBuild::Never)
+            else {
+                eprintln!("skipping {family}: it does not load");
+                continue;
+            };
+            if fonts.family() != family {
+                eprintln!("skipping {family}: not installed");
+                continue;
+            }
+            let mut inner = fonts.lock();
+            let face = inner.family_face(0, FontStyle::Bold).expect("a face");
+            let own = FaceId::font(face.id, fontdb::Weight(face.weight));
+            let axis_reaches_bold = inner.load(own).is_some_and(|font| {
+                font.as_swash()
+                    .variations()
+                    .find_by_tag(swash::tag_from_bytes(b"wght"))
+                    .is_some_and(|axis| axis.max_value() >= f32::from(BOLD_THRESHOLD))
+            });
+            if face.weight >= BOLD_THRESHOLD || !axis_reaches_bold {
+                eprintln!("skipping {family}: not a variable family without a bold face");
+                continue;
+            }
+            let bold = inner.resolve('a', FontStyle::Bold);
+            assert_eq!(
+                bold.face,
+                FaceId::font(face.id, fontdb::Weight::BOLD),
+                "{family}"
+            );
+            assert!(!bold.synthetic_bold, "{family}: {bold:?}");
+            checked += 1;
+        }
+        if checked == 0 {
+            eprintln!("skipping: no variable family is installed");
+        }
+    }
+
+    /// #526 (24.6 m2): an oblique face is already slanted, so italic text
+    /// drawn with it gets no synthetic italic. No face installed on macOS
+    /// is classified oblique by `fontdb`, so Menlo Regular's data is
+    /// registered as one, in a family of its own.
+    #[test]
+    fn an_oblique_face_is_not_slanted_again() {
+        let fonts = menlo_without_index();
+        if fonts.family() != DEFAULT_FAMILY {
+            eprintln!("skipping: Menlo is not installed");
+            return;
+        }
+        let mut inner = fonts.lock();
+        let regular = query_family(inner.system.db(), DEFAULT_FAMILY, FontStyle::Regular)
+            .expect("Menlo Regular");
+        let mut info = inner.system.db().face(regular).expect("face").clone();
+        info.families = vec![(
+            "Test Oblique".to_owned(),
+            fontdb::Language::English_UnitedStates,
+        )];
+        info.style = fontdb::Style::Oblique;
+        let oblique = inner.system.db_mut().push_face_info(info);
+        assert_eq!(
+            query_family(inner.system.db(), "Test Oblique", FontStyle::Italic),
+            Some(oblique),
+            "the italic query finds the oblique face"
+        );
+        assert!(inner.face_traits(oblique).expect("traits").italic);
+        let drawn = inner
+            .with_synthesis(oblique, FontStyle::Italic)
+            .expect("resolved");
+        assert!(
+            !drawn.synthetic_italic && !drawn.synthetic_bold,
+            "{drawn:?}"
+        );
+    }
+
     /// Family name, weight and slant of `face`.
     fn describe(inner: &Inner, face: FaceId) -> Option<(String, u16, fontdb::Style)> {
         let FaceRepr::Font { id, .. } = face.0 else {

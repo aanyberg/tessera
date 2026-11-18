@@ -1499,7 +1499,10 @@ fn an_unknown_enabled_id_is_logged_escaped() {
     for raw in ['\u{1b}', '\u{202e}', '\u{7}'] {
         assert!(!line.contains(raw), "{raw:?} in {line:?}");
     }
-    assert!(line.contains("test.unknown.[2Jmx13"), "{line:?}");
+    assert!(
+        line.contains(r"test.unknown.\u{1b}[2Jmx13\u{202e}\u{7}"),
+        "{line:?}"
+    );
     drop(app);
 }
 

@@ -630,6 +630,48 @@ fn a_coloured_row_does_not_bleed_into_the_next() {
     );
 }
 
+/// #526 (24.14 m3): the blanks a carried row is trimmed of become the
+/// shell's: spaces written under a protected (DECSCA 1) pen lose that
+/// attribute, so a later selective erase clears them, while the text before
+/// them keeps it.
+#[test]
+fn trimmed_blanks_lose_a_protected_alt_pen() {
+    let mut term = shell();
+    let pen = term.grid().pen();
+    term.advance(b"\x1b[?1049h\x1b[H\x1b[1\"qkept      \x1b[0\"q\x1b]133;D;1\x07");
+    assert_eq!(rows(&term, 3), ["$ ssh host", "kept", ""]);
+    let carried = &term.grid().visible_lines()[1];
+    assert!(
+        carried.cells[..4]
+            .iter()
+            .all(tessera_grid::Cell::is_protected)
+    );
+    for (col, cell) in carried.cells.iter().enumerate().skip(4) {
+        assert_eq!(cell.style, pen, "column {col}");
+    }
+}
+
+/// #526 (24.14 m4): which rows are carried is decided by the same rule as
+/// the trim: a row of blanks in a background other than the shell's shows,
+/// so full-width coloured rows above and below the text are carried, and
+/// the rows beyond them are not.
+#[test]
+fn full_width_coloured_rows_around_the_text_are_carried() {
+    let blue = tessera_grid::Color::Indexed(4);
+    let mut term = shell();
+    term.advance(b"\x1b[?1049h\x1b[H\x1b[2J\x1b[2;1H\x1b[44m\x1b[K\x1b[m");
+    term.advance(b"\x1b[3;1Htext\x1b[4;1H\x1b[44m\x1b[K\x1b[m\x1b]133;D;1\x07");
+    assert_eq!(rows(&term, 5), ["$ ssh host", "", "text", "", ""]);
+    assert_eq!(backgrounds(&term, 1), vec![blue; 40], "the row above");
+    assert_eq!(backgrounds(&term, 3), vec![blue; 40], "the row below");
+    assert_eq!(
+        backgrounds(&term, 4),
+        vec![tessera_grid::Color::Default; 40],
+        "the row after the carry"
+    );
+    assert_eq!((term.grid().cursor().row, term.grid().cursor().col), (4, 0));
+}
+
 /// A coloured soft-wrapped row whose wrap scrolls at the bottom of the
 /// screen: the row scrolled in for its continuation takes the shell's
 /// background past the carried text, as after a line break.
