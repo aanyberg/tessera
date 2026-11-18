@@ -77,9 +77,14 @@ commands! {
     "hide_others" => ["cmd+alt+h"] System,
     "show_all" => [] System,
     "quit" => ["cmd+q"] System,
+    // Quit's ⌥ alternate: Quit and Keep Windows, or Quit and Close All
+    // Windows when macOS keeps windows (ADR 0031, #464).
+    "quit_keep_windows" => ["cmd+alt+q"] System,
     "new_window" => ["cmd+n"] App,
     "new_tab" => ["cmd+t"] App,
     "close_tab" => ["cmd+w"] App,
+    // Close Tab's ⌥ alternate, Close All: every window, one question (#464).
+    "close_all_windows" => ["cmd+alt+w"] App,
     "close_window" => ["cmd+shift+w"] App,
     "clear_scrollback" => ["cmd+k"] App,
     "copy" => ["cmd+c"] App,

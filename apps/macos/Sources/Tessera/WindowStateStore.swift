@@ -385,4 +385,26 @@ final class WindowStateStore {
     static func quitKeepsWindows(_ defaults: UserDefaults) -> Bool {
         defaults.bool(forKey: "NSQuitAlwaysKeepsWindows")
     }
+
+    /// The key of the choice the last quit made for the next launch alone
+    /// (``setRestoresAtNextLaunch(_:)``).
+    nonisolated static let restoresAtNextLaunchKey = "TesseraWindowState.restoresAtNextLaunch"
+
+    /// Records that the next launch restores the saved windows, or does
+    /// not, whatever ``quitKeepsWindows(_:)`` says then: Quit and Keep
+    /// Windows and Quit and Close All Windows (⌥⌘Q) quit with the other
+    /// choice, for this quit only (#464).
+    func setRestoresAtNextLaunch(_ restores: Bool) {
+        defaults.set(restores, forKey: Self.restoresAtNextLaunchKey)
+    }
+
+    /// Whether this launch restores the saved windows: as the last quit
+    /// chose (``setRestoresAtNextLaunch(_:)``), a choice this takes, so the
+    /// launch after follows `setting` (``quitKeepsWindows(_:)``) again;
+    /// without one, `setting`. A value that is not a Boolean is no choice.
+    func takeRestoresAtLaunch(setting: Bool) -> Bool {
+        let choice = defaults.object(forKey: Self.restoresAtNextLaunchKey) as? Bool
+        defaults.removeObject(forKey: Self.restoresAtNextLaunchKey)
+        return choice ?? setting
+    }
 }

@@ -215,7 +215,10 @@ pub struct Config {
     /// byte and `\u{H..}` for a character; at most 4096 bytes, written
     /// as is), `unbound` (remove the chord's default) or `none` (swallow
     /// the key). Commands: `settings`, `hide`, `hide_others`, `quit`,
-    /// `new_window`, `new_tab`, `close_tab`, `close_window`,
+    /// `quit_keep_windows` (Quit and Keep Windows, or Quit and Close All
+    /// Windows when macOS keeps windows on quit), `new_window`, `new_tab`,
+    /// `close_tab`, `close_all_windows` (close every window, asking once),
+    /// `close_window`,
     /// `clear_scrollback`, `copy`, `copy_with_formatting` (Copy as RTF and
     /// HTML too), `paste`, `paste_plain`, `select_all`,
     /// `font_bigger`, `font_smaller`, `font_reset`, `scroll_to_top`,

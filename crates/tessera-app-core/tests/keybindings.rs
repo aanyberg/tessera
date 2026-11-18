@@ -354,6 +354,49 @@ fn table_cases_over_the_defaults() {
     assert!(Keymap::compile(&Keys::default()).is_default(chord("cmd+up")));
 }
 
+/// Quit's alternate (a system command) and Close All (an app command)
+/// move to a user's chords like any other command (#464): with their
+/// defaults unbound, only the new chords resolve to them and their menu
+/// items show those.
+#[test]
+fn a_user_binding_moves_quit_keep_windows_and_close_all_windows() {
+    let map = keymap(
+        "'cmd+alt+q' = 'unbound'\n'cmd+ctrl+e' = 'quit_keep_windows'\n\
+         'cmd+alt+w' = 'unbound'\n'cmd+ctrl+w' = 'close_all_windows'\n",
+    );
+    assert_eq!(map.warnings(), []);
+    let quit = command("quit_keep_windows");
+    let close_all = command("close_all_windows");
+    assert_eq!(quit.spec().owner, CommandOwner::System);
+    assert_eq!(close_all.spec().owner, CommandOwner::App);
+    assert_eq!(map.chords(quit), [chord("cmd+ctrl+e")]);
+    assert_eq!(map.chords(close_all), [chord("cmd+ctrl+w")]);
+    let pressed = |c, modifiers| command_of(&map, &event(Key::Char(c), modifiers));
+    assert_eq!(pressed('e', Modifiers::SUPER | Modifiers::CTRL), Some(quit));
+    assert_eq!(
+        pressed('w', Modifiers::SUPER | Modifiers::CTRL),
+        Some(close_all)
+    );
+    assert_eq!(
+        bound(
+            &map,
+            &event(Key::Char('q'), Modifiers::SUPER | Modifiers::ALT)
+        ),
+        None
+    );
+    assert_eq!(
+        bound(
+            &map,
+            &event(Key::Char('w'), Modifiers::SUPER | Modifiers::ALT)
+        ),
+        None
+    );
+    // The defaults: ⌥⌘Q and ⌥⌘W.
+    let defaults = Keymap::compile(&Keys::default());
+    assert_eq!(defaults.chords(quit), [chord("cmd+alt+q")]);
+    assert_eq!(defaults.chords(close_all), [chord("cmd+alt+w")]);
+}
+
 /// Text or `none` on an app command's chord, any command on a system
 /// command's chord, and the chords macOS uses each warn and are honoured;
 /// a command on another app command's chord is a plain override.

@@ -10,9 +10,11 @@ hide,cmd+h,,Tessera > Hide Tessera,h,cmd,cmd+h (system),cmd+h (system),system,S-
 hide_others,cmd+alt+h,,Tessera > Hide Others,h,cmd+alt,cmd+alt+h (system),cmd+alt+h (system),system,S-MM:38. iTerm2 binds cmd+alt+h to 'Split Horizontally (New Profile)' only in custom setups (unverified); no conflict in Tessera.
 show_all,,,Tessera > Show All,,,none,none,system,S-MM:40.
 quit,cmd+q,,Tessera > Quit Tessera,q,cmd,cmd+q,cmd+q,system,S-MM:42. Core tests already treat Cmd+Q as Ignored (input.rs doc line 10).
+quit_keep_windows,cmd+alt+q,,Tessera > Quit and Keep Windows (Quit's alternate; Quit and Close All Windows when NSQuitAlwaysKeepsWindows is true),q,cmd+alt,none,cmd+alt+q (system; unverified),system,#464. AppKit's own titles (MenuCommands.loctable); AppKit adds no such item itself.
 new_window,cmd+n,,Shell > New Window,n,cmd,cmd+n,cmd+n (S-TERM),app,S-MM:48.
 new_tab,cmd+t,,Shell > New Tab,t,cmd,cmd+t,cmd+t (S-TERM),app,S-MM:49.
 close_tab,cmd+w,,Shell > Close Tab,w,cmd,cmd+w (closes pane/tab),cmd+w (S-TERM 'Close tab'),app,S-MM:53. D1 (T1): with panes it closes the focused pane and the last pane closes the tab. T1 may rename to close_pane; registry keeps 'close_tab' as an alias name until then (decision N3).
+close_all_windows,cmd+alt+w,,Shell > Close All (Close Tab's alternate),w,cmd+alt,none,cmd+alt+w (system; unverified),app,#464. Takes the place of the closeAll: alternate AppKit adds at install; one question for every window.
 close_window,cmd+shift+w,,Shell > Close Window,w,cmd+shift,cmd+shift+w (unverified),cmd+shift+w (S-TERM),app,S-MM:54.
 clear_scrollback,cmd+k,,Shell > Clear to Start,k,cmd,cmd+k = Clear Buffer (iTerm2 cheat sheet; docs list item without shortcut),cmd+k (S-TERM 'Clear to start'),app,S-MM:57. iTerm2 'Clear Scrollback Buffer' is a separate item (unverified chord cmd+alt+k).
 copy,cmd+c,,Edit > Copy,c,cmd,cmd+c,cmd+c (S-TERM),app,S-MM:66.

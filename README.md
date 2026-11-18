@@ -43,6 +43,7 @@ The menu bar follows the standard macOS layout, and the shortcuts are fixed unti
 | ⌘T | Shell > New Tab | A new tab in the current window |
 | ⌘W | Shell > Close Tab | Closes the current tab |
 | ⇧⌘W | Shell > Close Window | Closes every tab of the current window |
+| ⌥⌘W | Shell > Close All (hold ⌥) | Closes every window, asking once if any tab runs a job |
 | ⌘K | Shell > Clear to Start | Clears the scrollback and the screen above the prompt line |
 | ⌘C | Edit > Copy | Copies the selected text (plain text; nothing is copied by selecting) |
 | ⌘V | Edit > Paste | Pastes the clipboard's text (bracketed when the program asks) |
@@ -54,6 +55,7 @@ The menu bar follows the standard macOS layout, and the shortcuts are fixed unti
 | ⌘M | Window > Minimize | Minimises the window |
 | ⇧⌘[ and ⇧⌘] | Window > Show Previous/Next Tab | Moves between tabs |
 | ⌘1 to ⌘9 | Window > Select Tab | Selects one of the first nine tabs |
+| ⌥⌘Q | Tessera > Quit and Keep Windows (hold ⌥) | Quits and restores the windows at the next launch; Quit and Close All Windows when macOS keeps windows on quit |
 | ⌘? | Help > Tessera Help | Opens this page |
 
 </details>

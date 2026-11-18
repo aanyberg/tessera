@@ -106,6 +106,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Set by a termination signal, or by the system's quit Apple event (a
     /// logout) with a confirmation up: quit without asking.
     var terminatesWithoutConfirmation = false
+    /// Reads macOS's "Close windows when quitting an application"
+    /// (``WindowStateStore/quitKeepsWindows(_:)``) whenever it is needed,
+    /// so a change while the app runs applies: at launch, and for the
+    /// Quit alternate's title and choice (#464). Tests replace it.
+    var quitKeepsWindows: @MainActor () -> Bool = { WindowStateStore.quitKeepsWindows(.standard) }
+    /// The choice the Quit alternate (⌥⌘Q) made for this quit alone:
+    /// whether the next launch restores the windows. Set from the
+    /// alternate's action until its `terminate` returns (the quit was
+    /// cancelled or refused), and taken by the quit's save
+    /// (``saveWindowState(quitting:)``).
+    private var quitRestoresWindowsChoice: Bool?
     /// Reads the system's Reduce Transparency setting (Accessibility,
     /// Display), which ``applyDisplayOptions()`` hands the core. Tests
     /// replace it.
@@ -195,8 +206,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !Self.isTestHost else { return }
         let store = WindowStateStore(defaults: .standard)
         windowStateStore = store
-        let restored = WindowStateStore.quitKeepsWindows(.standard) && restoreWindows(from: store.load())
-        if !restored {
+        if !restoreWindowsAtLaunch(from: store) {
             openNewWindow(nil)
         }
         NSApp.activate(ignoringOtherApps: true)
@@ -208,7 +218,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// that alert is up: it ends the alert (``terminateWithoutAsking()``),
     /// and the quit goes on rather than being cancelled; so does the
     /// system's quit Apple event (a logout) that arrives while it is up.
-    /// Once the app quits, the windows are saved for the next launch.
+    /// Once the app quits, the windows are saved for the next launch, with
+    /// the Quit alternate's choice (⌥⌘Q) if it asked to quit
+    /// (``quitWithTheOtherWindowChoice(_:)`` drops that choice on Cancel).
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if !terminatesWithoutConfirmation, let presenter = closeConfirmationPresenter,
             let confirmation = CloseConfirmation(.quit, sessions: windowControllers.flatMap(\.sessions)),
@@ -216,8 +228,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         {
             return .terminateCancel
         }
-        saveWindowState()
+        saveWindowState(quitting: true)
         return .terminateNow
+    }
+
+    /// Quit and Keep Windows, or Quit and Close All Windows while macOS
+    /// keeps windows on quit (⌥⌘Q, Quit's alternate; AppKit's titles):
+    /// quits as ⌘Q does, the one alert included (D4b), and the next launch
+    /// restores the windows if the setting says not to, or restores none if
+    /// it says to; the launch after follows the setting again. `terminate`
+    /// returns only if the app does not quit (Cancel, or a refusal while a
+    /// sheet is up), and the choice is dropped then, so a later ⌘Q makes
+    /// none.
+    @objc func quitWithTheOtherWindowChoice(_ sender: Any?) {
+        quitRestoresWindowsChoice = !quitKeepsWindows()
+        defer { quitRestoresWindowsChoice = nil }
+        NSApp.terminate(sender)
+    }
+
+    /// The Quit alternate's title for the setting
+    /// (``WindowStateStore/quitKeepsWindows(_:)``): AppKit's own wording.
+    static func quitAlternateTitle(quitKeepsWindows: Bool) -> String {
+        quitKeepsWindows ? "Quit and Close All Windows" : "Quit and Keep Windows"
+    }
+
+    /// Restores the windows saved at the last quit, if this launch restores
+    /// them (``WindowStateStore/takeRestoresAtLaunch(setting:)``, which
+    /// takes the Quit alternate's choice); whether any window opened.
+    func restoreWindowsAtLaunch(from store: WindowStateStore) -> Bool {
+        store.takeRestoresAtLaunch(setting: quitKeepsWindows()) && restoreWindows(from: store.load())
     }
 
     /// The quit alert asks (``confirmQuit(_:with:)``): a quit Apple event
@@ -227,7 +266,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func confirmQuit(_ confirmation: CloseConfirmation, with presenter: any CloseConfirmationPresenter) -> Bool {
         asksToQuit = true
         defer { asksToQuit = false }
-        return presenter.confirmQuit(confirmation)
+        return presenter.confirmApplicationModally(confirmation)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -340,6 +379,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } catch {
             presentOpenError(error)
         }
+    }
+
+    /// Close All (⌥⌘W, Close Tab's alternate, which takes the place of
+    /// AppKit's own, #464): closes every terminal window with all its tabs,
+    /// and the Settings window. If any session runs a job, one
+    /// application-modal alert lists them all first (D4b; the Settings
+    /// window asks nothing), and Cancel closes nothing. Ignored while a tab
+    /// asks about itself, a pane or its window, as ⇧⌘W is. A termination
+    /// signal or the system's quit while the alert asks ends it, and the
+    /// app quits without asking (``terminateWithoutAsking()``).
+    @objc func closeAllWindows(_ sender: Any?) {
+        guard !windowControllers.contains(where: { $0.pendingClose != nil }) else { return }
+        if let presenter = closeConfirmationPresenter,
+            let confirmation = CloseConfirmation(.allWindows, sessions: windowControllers.flatMap(\.sessions))
+        {
+            let confirmed = presenter.confirmApplicationModally(confirmation)
+            // The alert was aborted for a quit that asks nothing: the
+            // windows stay, to be saved, and the app quits.
+            if terminatesWithoutConfirmation {
+                NSApp.terminate(sender)
+                return
+            }
+            guard confirmed else { return }
+        }
+        // `close()`, not `performClose(_:)`: the user has been asked once
+        // for all of them, or nothing in them runs.
+        for window in windowControllers.compactMap(\.window) {
+            window.close()
+        }
+        settingsWindowController?.close()
     }
 
     private static func profileName(of sender: Any?) -> String? {
@@ -560,10 +629,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ]
     }
 
-    /// Saves ``currentWindowState()`` to ``windowStateStore``, if there is one.
-    func saveWindowState() {
+    /// Saves ``currentWindowState()`` to ``windowStateStore``, if there is
+    /// one. `quitting`, for the save of a quit, also takes the Quit
+    /// alternate's choice and records it for the next launch; no other save
+    /// does, so a save while the quit alert asks cannot leave it behind.
+    func saveWindowState(quitting: Bool = false) {
         windowStateSavePending = false
         windowStateStore?.save(currentWindowState())
+        guard quitting, let choice = quitRestoresWindowsChoice else { return }
+        quitRestoresWindowsChoice = nil
+        windowStateStore?.setRestoresAtNextLaunch(choice)
     }
 
     /// Saves the window state once the main actor is next free: a burst of
@@ -827,7 +902,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// children), then the process ends.
     private func exitAfterTerminationGrace() {
         Self.log.error("terminate did not end the app in time; exiting")
-        saveWindowState()
+        saveWindowState(quitting: true)
         core?.shutdown()
         exit(0)
     }
@@ -884,6 +959,19 @@ extension AppDelegate {
     static func isSystemQuit(_ event: NSAppleEventDescriptor) -> Bool {
         let reason = AEKeyword(kAEQuitReason)
         return event.paramDescriptor(forKeyword: reason) != nil || event.attributeDescriptor(forKeyword: reason) != nil
+    }
+}
+
+extension AppDelegate: NSMenuItemValidation {
+    /// The Quit alternate's title follows the setting each time the menu
+    /// opens or a key equivalent is matched, so a change while the app runs
+    /// (System Settings, `defaults write`) shows at once. Every item is
+    /// enabled, as without this.
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(quitWithTheOtherWindowChoice(_:)) {
+            menuItem.title = Self.quitAlternateTitle(quitKeepsWindows: quitKeepsWindows())
+        }
+        return true
     }
 }
 
