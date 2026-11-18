@@ -18,8 +18,11 @@
 //! select therefore never read the records: they read the marks on the
 //! lines, which are complete. The records feed the
 //! [`SessionEvent::CommandStarted`] and [`SessionEvent::CommandFinished`]
-//! events, [`crate::App::command_at`] and the menu's
-//! [`crate::App::has_command_output`].
+//! events and [`crate::App::command_at`], and tell Select Last Output
+//! whether a `C` above the newest command's is an older command's
+//! (`CommandLog::last_output_line`). The menu's
+//! [`crate::App::has_command_output`] computes the same range as the
+//! command (`last_output`, #334).
 //!
 //! Line ids are [`Grid::scrollback_pushed`] plus the screen row, the
 //! numbering of the selection (ADR 0025), valid within one
@@ -54,7 +57,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use tessera_grid::{Grid, Line, Mark};
+use tessera_grid::{Grid, Line, Mark, Style};
 use tessera_term::Terminal;
 
 use crate::search::TerminalSource;
@@ -172,8 +175,9 @@ struct Record {
     exit_known: bool,
     /// The line id of its `C` now, in epoch `anchor_epoch`: `output` at
     /// first, carried across each resize by the `C`'s rank from the bottom
-    /// ([`resize`]); [`ERASED`] once the `C` was gone at a resize, below
-    /// the oldest line once it left the history.
+    /// ([`resize`]); [`ERASED`] once the `C` was gone at a resize or a
+    /// whole-screen clear blanked it ([`CommandLog::screen_cleared`]),
+    /// below the oldest line once it left the history.
     anchor: i64,
     anchor_epoch: u64,
     /// Whether a screen clear ([`CommandLog::screen_cleared`]) blanked
@@ -182,6 +186,12 @@ struct Record {
     /// gutter reports the status unknown, yet the record still describes
     /// the prompt and keeps its duration (#378 M3).
     end_erased: bool,
+    /// Whether its `C` came at or below the top of a whole-screen clear
+    /// reported since the last `A` ([`CommandLog::clear_since_prompt`]):
+    /// a chunk's clears are reported before its marks, so the clear may
+    /// have come after the `C` and erased it (`clear`, `tput clear`,
+    /// Ctrl-L typed ahead; #334 B1).
+    cleared: bool,
 }
 
 impl Record {
@@ -196,8 +206,9 @@ impl Record {
 /// reports no lines and no hover pairs with it.
 const REDRAWN: u64 = u64::MAX;
 
-/// [`Record::anchor`] of a `C` that a screen clear or a deleted line
-/// erased before a resize: newer than every line.
+/// [`Record::anchor`] of a `C` that a whole-screen clear blanked, or that
+/// a screen clear or a deleted line erased before a resize: newer than
+/// every line.
 const ERASED: i64 = i64::MAX;
 
 /// A prompt whose command has not started (no `C` yet): not a record.
@@ -248,6 +259,10 @@ pub(crate) struct CommandLog {
     /// Whether the shell ever reported a prompt (`A`): without one no line
     /// carries a [`Mark::PromptStart`], so the prompt keys page at once.
     prompt_seen: bool,
+    /// The top line and epoch of the whole-screen clears reported since
+    /// the last `A` (the lowest top of that epoch), which a `C` reported
+    /// after them may have come before ([`Record::cleared`]).
+    clear_since_prompt: Option<(u64, u64)>,
 }
 
 impl CommandLog {
@@ -275,6 +290,7 @@ impl CommandLog {
         match mark {
             Mark::PromptStart => {
                 self.prompt_seen = true;
+                self.clear_since_prompt = None;
                 self.finish(None, line, epoch, now, &mut emit);
                 self.pending = Some(Pending {
                     prompt: line,
@@ -325,6 +341,9 @@ impl CommandLog {
                     anchor: id(line),
                     anchor_epoch: epoch,
                     end_erased: false,
+                    cleared: self
+                        .clear_since_prompt
+                        .is_some_and(|(top, at)| at == epoch && line >= top),
                 });
                 emit(SessionEvent::CommandStarted);
             }
@@ -362,16 +381,30 @@ impl CommandLog {
     /// ran no command is forgotten, and a finished record whose first line
     /// is above the clear (in the history) but whose end was not keeps the
     /// lines above `top`, ends at `top` and notes that the line that ended
-    /// it was erased ([`Record::end_erased`]).
+    /// it was erased ([`Record::end_erased`]). A record's `C` followed into
+    /// this epoch ([`Record::anchor`]) at or below `top` is [`ERASED`],
+    /// whatever epoch the record's other lines belong to, so Select Last
+    /// Output knows it was blanked (#334); a `C` reported after it, before
+    /// the next `A`, may have come before it ([`Record::cleared`]).
     ///
     /// Clears come in order and their tops never decrease within an epoch,
     /// so the first clear after a record's `A` decides: a later one cannot
     /// reach above it. Visits each record once (S6: at most
     /// [`MAX_COMMAND_RECORDS`]), allocates nothing.
     pub(crate) fn screen_cleared(&mut self, top: u64, epoch: u64) {
+        self.clear_since_prompt = Some(match self.clear_since_prompt {
+            Some((earlier, at)) if at == epoch => (earlier.min(top), epoch),
+            _ => (top, epoch),
+        });
         self.pending
             .take_if(|p| p.epoch == epoch && p.prompt >= top);
         for record in &mut self.records {
+            // Its `C`, followed into this epoch across resizes, was blanked
+            // with the rest of the screen, whatever epoch its other lines
+            // belong to (#334).
+            if record.anchor_epoch == epoch && record.anchor >= id(top) {
+                record.anchor = ERASED;
+            }
             if record.epoch != epoch {
                 continue;
             }
@@ -489,30 +522,24 @@ impl CommandLog {
             .then(|| finished.saturating_duration_since(record.started))
     }
 
-    /// Whether the newest finished command printed something that is still
-    /// there, as far as the records tell: what the menu offers Select Last
-    /// Output for. True for a record of an older epoch (unknown), so the
-    /// menu never hides output the grid still has; Select Last Output reads
-    /// the grid and may still find nothing.
-    pub(crate) fn has_output(&self, view: LineView) -> bool {
-        self.records
-            .iter()
-            .rev()
-            .find(|r| r.finished.is_some())
-            .is_some_and(|r| {
-                r.epoch != view.epoch || (view.line(r, r.output).is_some() && r.output < r.end)
-            })
-    }
-
     /// The line of the newest finished command's `C` ([`Record::anchor`]),
-    /// when known in line epoch `epoch`.
-    fn last_output_line(&self, epoch: u64) -> Option<i64> {
+    /// when known in line epoch `epoch`, and whether the log knows that
+    /// line was blanked since: a whole-screen clear or an in-place redraw
+    /// retired the record ([`REDRAWN`]), its `C` was gone at a clear or
+    /// a resize ([`ERASED`]), or a clear reported with it may have erased
+    /// it ([`Record::cleared`]).
+    fn last_output_line(&self, epoch: u64) -> Option<(i64, bool)> {
         self.records
             .iter()
             .rev()
             .find(|r| r.finished.is_some())
             .filter(|r| r.anchor_epoch == epoch)
-            .map(|r| r.anchor)
+            .map(|r| {
+                (
+                    r.anchor,
+                    r.epoch == REDRAWN || r.anchor == ERASED || r.cleared,
+                )
+            })
     }
 }
 
@@ -552,28 +579,12 @@ fn public(record: &Record, view: LineView) -> CommandRecord {
     }
 }
 
-/// Whether the newest finished command in `session` printed something that
-/// is still there, as its records tell and with its `C` still on its line
-/// (ED 2 or DL erases the mark with the row): what the menu offers Select
-/// Last Output for ([`crate::App::has_command_output`]). `false` on the
-/// alternate screen.
+/// Whether `session` holds output Select Last Output selects: exactly
+/// [`last_output`] found one, so the menu item and the command never
+/// disagree (#334). What a frontend enables the item for
+/// ([`crate::App::has_command_output`]).
 pub(crate) fn has_command_output(session: &Session) -> bool {
-    session.with_terminal(|term| {
-        let grid = term.grid();
-        if grid.is_alt_screen() {
-            return false;
-        }
-        let view = LineView::of(term);
-        // The log's lock is a leaf: taking it under the terminal's is fine.
-        let log = session.reports().commands();
-        log.has_output(view)
-            && log.last_output_line(view.epoch).is_none_or(|line| {
-                let index = line
-                    .checked_sub(view.base)
-                    .and_then(|index| usize::try_from(index).ok());
-                index.is_some_and(|index| has(grid.logical_line(index), &Mark::OutputStart))
-            })
-    })
+    last_output(session).is_some()
 }
 
 /// Where a record's `C` stood before a resize.
@@ -1003,46 +1014,91 @@ fn top_of(session: &Session) -> i64 {
 /// What a backwards look for the last finished command's output found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Output {
-    /// Its first line, and the first line of the prompt after it.
-    Lines(i64, i64),
+    /// Its first line, the first line of the prompt after it, and whether a
+    /// command ran after that prompt's `A` ([`ran_after`]).
+    Lines(i64, i64, bool),
     /// The last finished command printed nothing.
     Empty,
 }
 
-/// Selects the output of the last finished command in `session`, a running
-/// one skipped; returns whether it selected anything.
+/// The output of the last finished command, as [`last_output`] finds it:
+/// whole lines from the line of its `C`, ending at a cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutputRange {
+    /// The [`Terminal::line_epoch`] the line ids belong to.
+    epoch: u64,
+    /// The line of its `C`.
+    first: i64,
+    /// The last line with text, not above `first`.
+    last: i64,
+    /// The last cell with text on `last`.
+    col: u16,
+}
+
+/// The output of the last finished command in `session`, a running one
+/// skipped: what Select Last Output selects and the menu offers it for
+/// (one function, so they never disagree: #334). Computed on request, never
+/// per byte of output.
 ///
 /// From the bottom up: a line with a [`Mark::OutputStart`] starts a
 /// command's output, which ends before the next line with a
 /// [`Mark::PromptStart`]; one with no prompt below it is still running.
-/// The selection runs from the start of the output to the last cell with
-/// text before that prompt: interior blank lines are kept, trailing blank
-/// lines and cells dropped (also on a row that soft-wraps into the prompt,
-/// as zsh's `PROMPT_SP` leaves it). Nothing is selected (and a selection
-/// there was stays) when the last finished command printed nothing (its
-/// output starts on the next prompt's line, or holds only blanks), when
-/// its first line left the history or lost its `C` (a screen clear or a
-/// deleted line erased it: an older command's output is not offered
-/// instead), without marks, on the alternate
-/// screen, or when the scan reached [`MAX_PROMPT_SCAN_LINES`]. The view
-/// scrolls so the start of the output is visible when it was not.
+/// The range runs from the start of the output to the last cell with text
+/// before that prompt: interior blank lines are kept, trailing blank lines
+/// and cells dropped (also on a row that soft-wraps into the prompt).
+///
+/// **The end of the output.** A last output row that soft-wraps into the
+/// prompt's row is a line the command left without a newline, padded by
+/// the shell so its prompt starts on a row of its own (zsh's `PROMPT_SP`,
+/// fish's omitted-newline mark), after the shell's end-of-line mark: the
+/// run of cells with text at the end of that row drawn in reverse video or
+/// dim (zsh's default `PROMPT_EOL_MARK` is a bold reverse-video `%` or
+/// `#`, fish's mark a dim `⏎`) is that mark and left out
+/// ([`last_text_col`]). The marks cannot say where it starts (they hold a
+/// row, not a column), the wrap into the prompt's row says it is there.
+///
+/// **An older command's `C`.** The log's newest finished command decides
+/// whether a `C` found above its own is an older command's, whose output is
+/// not offered instead ([`CommandLog::last_output_line`]): when the line
+/// of its `C` still carries one, or the log knows that line was blanked (a
+/// whole-screen clear, an erased `C` at a resize), an older `C` is
+/// refused. Otherwise an edit the log does not see (DL, IL, SU or SD, a
+/// scroll region) moved the rows or erased the `C`, and the marks decide:
+/// the older `C` is the moved one unless a command ran after its prompt
+/// (a `D` with an exit status follows that prompt's `A`), whose `C` is
+/// gone.
+///
+/// `None` when the last finished command printed nothing (its output
+/// starts on the next prompt's line, or holds only blanks and its
+/// end-of-line mark), when its first line left the history or lost its
+/// `C`, without prompt marks, on the alternate screen, when the scans
+/// reached [`MAX_PROMPT_SCAN_LINES`] or the line ids moved (a resize).
 ///
 /// Rows are read whole: a row with an `A` before its `C` (the shell sent
 /// `C` on the prompt's row) starts the output there, prompt included, and
-/// a last output line without a newline on the next prompt's row (bash
-/// without `PROMPT_SP`) is left out.
-pub(crate) fn select_command_output(session: &Session) -> bool {
+/// a last output line on the next prompt's row (bash without `PROMPT_SP`,
+/// or zsh's padded row merged into the prompt's by a re-wrap) is left out.
+pub(crate) fn last_output(session: &Session) -> Option<OutputRange> {
+    // Without a prompt ever reported no line has an `A` to end an output
+    // (the terminal reports every prompt mark it sets): no scan, so the
+    // menu's check costs nothing in a shell without integration.
+    if !session.reports().commands().prompt_seen() {
+        return None;
+    }
     let (epoch, alt, bottom) = session.read_terminal(|term, _| {
         let grid = term.grid();
         let bottom = id(grid.scrollback_pushed()) + i64::from(grid.rows()) - 1;
         (term.line_epoch(), grid.is_alt_screen(), bottom)
     });
     if alt {
-        return false;
+        return None;
     }
     let mut budget = MAX_PROMPT_SCAN_LINES;
     let mut found = None;
     let mut next_prompt: Option<i64> = None;
+    // A `D` with an exit status on the rows below the one looked at.
+    let mut ended_below = false;
+    let mut ran = false;
     let mut line = bottom;
     let result = scan(
         session,
@@ -1069,29 +1125,40 @@ pub(crate) fn select_command_output(session: &Session) -> bool {
                 // is still running and skipped.
                 (Some(_), _) => {
                     if let Some(end) = next_prompt {
-                        found = Some(Output::Lines(this, end));
+                        found = Some(Output::Lines(this, end, ran));
                         return true;
                     }
                 }
                 _ => {}
             }
-            if prompt.is_some() {
+            if let Some(prompt) = prompt {
                 next_prompt = Some(this);
+                ran = ended_below || ran_after(&row.marks[prompt + 1..]);
             }
+            ended_below |= ran_after(&row.marks);
             false
         },
     );
-    let (Scan::Found(_), Some(Output::Lines(first, end))) = (result, found) else {
-        return false;
+    let (Scan::Found(_), Some(Output::Lines(first, end, ran))) = (result, found) else {
+        return None;
     };
-    // A `C` older than the newest finished command's belongs to an older
-    // command: that command's own output rows were erased (ED 2, DL).
-    // A newer one is the grid's (the records lost it to coalescing).
-    // The newest finished command's `C` is followed across resizes
-    // ([`resize`]).
-    let recorded = session.reports().commands().last_output_line(epoch);
-    if recorded.is_some_and(|line| first < line) {
-        return false;
+    let refused = session.read_terminal(|term, _| {
+        let grid = term.grid();
+        if term.line_epoch() != epoch || grid.is_alt_screen() {
+            return true;
+        }
+        // The log's lock is a leaf: taking it under the terminal's is fine.
+        let recorded = session.reports().commands().last_output_line(epoch);
+        recorded.is_some_and(|(recorded, blanked)| {
+            let kept = recorded
+                .checked_sub(base_of(grid))
+                .and_then(|index| usize::try_from(index).ok())
+                .is_some_and(|index| has(grid.logical_line(index), &Mark::OutputStart));
+            first < recorded && (kept || blanked || ran)
+        })
+    });
+    if refused {
+        return None;
     }
     // The last line with text before the prompt, not above the output's
     // first, and its last cell with text.
@@ -1106,22 +1173,69 @@ pub(crate) fn select_command_output(session: &Session) -> bool {
         |grid, index| {
             let this = line;
             line -= 1;
-            col = grid.logical_line(index).and_then(|row| {
-                row.cells
-                    .iter()
-                    .rposition(|cell| !selection::is_blank(cell))
-            });
+            col = grid
+                .logical_line(index)
+                .and_then(|row| last_text_col(row, this == end - 1 && row.wrapped));
             this < first || col.is_some()
         },
     );
     let (Scan::Found(last), Some(col)) = (result, col) else {
+        return None;
+    };
+    // `last < first`: only blanks.
+    (last >= first).then(|| OutputRange {
+        epoch,
+        first,
+        last,
+        col: u16::try_from(col).unwrap_or(u16::MAX),
+    })
+}
+
+/// Whether `marks` hold a [`Mark::CommandEnd`] with an exit status: a
+/// command ended there. A prompt that ran nothing (an empty line, Ctrl-C)
+/// ends with a bare `D` from Tessera's scripts, or none.
+fn ran_after(marks: &[Mark]) -> bool {
+    marks
+        .iter()
+        .any(|mark| matches!(mark, Mark::CommandEnd { exit_code: Some(_) }))
+}
+
+/// The column of the last cell with text on `row`; with `padded` (the row
+/// soft-wraps into the next prompt's: [`last_output`]) the shell's
+/// end-of-line mark at its end, the cells with text drawn in reverse video
+/// or dim, is left out first. `None` for a row with no text left.
+fn last_text_col(row: &Line, padded: bool) -> Option<usize> {
+    let end = row
+        .cells
+        .iter()
+        .rposition(|cell| !selection::is_blank(cell))?;
+    if !padded {
+        return Some(end);
+    }
+    let mark = Style::INVERSE | Style::DIM;
+    let kept = row.cells[..=end]
+        .iter()
+        .rposition(|cell| selection::is_blank(cell) || cell.style.flags & mark == 0)?;
+    row.cells[..=kept]
+        .iter()
+        .rposition(|cell| !selection::is_blank(cell))
+}
+
+/// Selects the output of the last finished command in `session`
+/// ([`last_output`]); returns whether it selected anything. Nothing is
+/// selected (and a selection there was stays) when there is none, or the
+/// line ids moved since it was found. The view scrolls so the start of the
+/// output is visible when it was not.
+pub(crate) fn select_command_output(session: &Session) -> bool {
+    let Some(range) = last_output(session) else {
         return false;
     };
-    if last < first {
-        // Only blanks.
-        return false;
-    }
-    let col = u16::try_from(col).unwrap_or(u16::MAX);
+    let OutputRange {
+        epoch,
+        first,
+        last,
+        col,
+    } = range;
     let selected = session.with_selection(|selection, term, offset| {
         if term.line_epoch() != epoch {
             return None;
@@ -1472,7 +1586,11 @@ mod tests {
             (CommandState::Finished, Some(0), None, None)
         );
         assert_eq!(r.duration(), Some(Duration::from_millis(9)));
-        assert!(log.has_output(view), "unknown lines: the grid decides");
+        assert_eq!(
+            log.last_output_line(1),
+            None,
+            "unknown lines: the grid decides"
+        );
     }
 
     /// T06's reordering reaches the log as B@0, A@1, C@2: no panic, and
@@ -1571,8 +1689,11 @@ mod tests {
         assert!(log.command_at(52, view).is_some());
     }
 
+    /// The veto of Select Last Output reads the newest finished command's
+    /// `C`, a running one skipped (#334: whether it has output is the
+    /// grid's to say, [`last_output`]).
     #[test]
-    fn has_output_reads_the_newest_finished_command() {
+    fn last_output_line_reads_the_newest_finished_command() {
         use Mark::*;
         // S03: `true` printed nothing (C and the next A on one line).
         let (log, _, _) = log_of(&[
@@ -1583,7 +1704,7 @@ mod tests {
             (d(Some(0)), 9, 0),
             (PromptStart, 9, 0),
         ]);
-        assert!(!log.has_output(VIEW));
+        assert_eq!(log.last_output_line(0), Some((9, false)));
         // S04: the running command is skipped.
         let (log, _, _) = log_of(&[
             (OutputStart, 7, 0),
@@ -1591,16 +1712,32 @@ mod tests {
             (PromptStart, 8, 0),
             (OutputStart, 9, 0),
         ]);
-        assert!(log.has_output(VIEW));
-        assert!(
-            !log.has_output(LineView { epoch: 0, base: 8 }),
-            "S08: evicted"
-        );
-        assert!(!CommandLog::default().has_output(VIEW), "S09");
+        assert_eq!(log.last_output_line(0), Some((7, false)));
+        assert_eq!(log.last_output_line(1), None, "another epoch's line");
+        assert_eq!(CommandLog::default().last_output_line(0), None, "S09");
         let mut log = log;
         log.forget_finished();
-        assert!(!log.has_output(VIEW));
+        assert_eq!(log.last_output_line(0), None);
         assert_eq!(log.records(VIEW).len(), 1, "the running one stays");
+    }
+
+    /// A whole-screen clear marks the `C` of a record carried into this
+    /// epoch by a resize as blanked, even when its other lines are another
+    /// epoch's (#334).
+    #[test]
+    fn a_clear_blanks_a_carried_output_line() {
+        use Mark::*;
+        let (mut log, _, _) =
+            log_of(&[(PromptStart, 3, 0), (OutputStart, 4, 0), (d(Some(0)), 6, 0)]);
+        // Carried into epoch 1 at line 4 by a resize.
+        for record in &mut log.records {
+            record.anchor_epoch = 1;
+        }
+        assert_eq!(log.last_output_line(1), Some((4, false)));
+        log.screen_cleared(5, 1);
+        assert_eq!(log.last_output_line(1), Some((4, false)), "above the clear");
+        log.screen_cleared(4, 1);
+        assert_eq!(log.last_output_line(1), Some((ERASED, true)));
     }
 
     /// A terminal behind a mutex that counts the lines each lock hold

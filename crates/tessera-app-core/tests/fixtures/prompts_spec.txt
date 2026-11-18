@@ -495,9 +495,9 @@ flags: decision D-SELECT-TRAIL
 
 ### S07_output_without_trailing_newline_zsh_prompt_sp
 layer: S
-buffer: width 20: `printf foo` then zsh PROMPT_SP: row i `foo%` + 16 spaces(wrapped=true), row i+1 (wrapped continuation) carrying D(0) A B and `$ `; C on row i
+buffer: width 20: `printf foo` then zsh PROMPT_SP: row i `foo` + zsh's bold reverse-video `%` + 16 spaces(wrapped=true), row i+1 (wrapped continuation) carrying D(0) A B and `$ `; C on row i
 action: SelectCommandOutput
-expect: RECOMMENDED text "foo%" (the PROMPT_SP `%` is included; trailing blanks trimmed), range ends at the end of row i; the prompt row i+1 is excluded although it is a soft-wrap continuation
+expect: text "foo" (#334: the reverse-video or dim run at the end of a last output row that soft-wraps into the prompt's row is the shell's end-of-line mark and left out; an unstyled `%` is kept, "foo%"; trailing blanks trimmed), range ends at the last `o` of row i; the prompt row i+1 is excluded although it is a soft-wrap continuation; has_command_output true
 cite: [ADR] 2026-11-03 amendment (PROMPT_SP makes the prompt row a soft-wrapped continuation); D-MARKPOS
 note: the range end is the PromptStart mark's POSITION, not 'the previous row start'. After a resize the prompt mark moves with its text (D-MARKPOS), so the same text is selected at any width: add the 80 -> 37 -> 80 variant.
 flags: ambiguity
@@ -514,7 +514,7 @@ flags: decision D-EVICTED-OUTPUT
 layer: S
 buffer: plain text only
 action: SelectCommandOutput
-expect: false; menu item disabled (validateMenuItem uses a cheap core predicate `has_command_output(id)` not a scan of the whole history under the lock)
+expect: false; menu item disabled (validateMenuItem uses the core predicate `has_command_output(id)`, which since #334 computes the same range as Select Last Output in short lock holds, and no scan at all in a session that never reported a prompt)
 cite: [KT] cmd_output returns None
 flags: perf
 

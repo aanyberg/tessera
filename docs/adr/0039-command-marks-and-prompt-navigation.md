@@ -475,3 +475,64 @@ gutter had no end for the command that died (an ssh session whose connection dro
 closed it with an unknown status. `A`, `B` and `C` on the alternate screen are still dropped: the lines they would
 land on vanish with it. The N12 input (`ESC [?1049h`, `A`, `C`, `D;0`, `ESC [?1049l`) now gives one mark, `D` with
 status 0 on line 0, and one request for it.
+
+## Amendment: the end of the last output, and one range for the menu (#334, 2026-11-18)
+
+**One function.** `commands::last_output` computes the range Select Last
+Output selects; `has_command_output` is exactly `last_output(..).is_some()`,
+so the menu item is enabled exactly when the command selects (a property
+test feeds random marks, output, edits and resizes and checks this in every
+state). This replaces the "C API" sentence above (the records alone, no
+scan) and the "stale menu enable" consequence: the records lagged behind
+the grid (fish's `printf abc` gave `false`, a DL, IL, SD or a scroll region
+above the output gave `false` while Select selected). The range is computed
+on request, from the bottom up in holds of 256 lines with a yield between
+them, at most `MAX_PROMPT_SCAN_LINES`, and not at all in a session that never
+reported a prompt; nothing is added per byte of output (S6) and no buffer
+(S5). Release build, 80 columns: 0.4 ms after a finished command of 10 000
+lines (the default history), 2.3 ms for 100 000, 5.5 ms for 100 000 lines
+of a command still running (scanned past), 120 ms when the history holds
+1 000 000 lines of a running command (the scan cap, `false`). That last case
+under a flood (`yes` feeding the running command while the menu is
+validated): 74 to 226 ms per call on the main thread, against 1.4 to 2.4 ms
+idle in the same probe (review of #334). A hitch when the menu opens, not
+per frame.
+
+**The end of the output.** The output ends before the next prompt's `A`
+row, without trailing blank lines and cells. When the last output row
+soft-wraps into the prompt's row, the command left that line without a
+newline and the shell padded it so the prompt starts on a row of its own:
+zsh's `PROMPT_SP` (its `PROMPT_EOL_MARK`, by default a bold reverse-video
+`%` or `#`, then blanks to the row's end) and fish's omitted-newline mark (a
+dim `⏎`, then blanks). The run of cells with text at the end of that row
+drawn in reverse video or dim is that mark and is left out: `printf abc`
+selects `abc`. The marks cannot place it: they hold a row, not a column,
+zsh sends its `D` after `PROMPT_SP` (on the prompt's row) and fish before
+it (on the output's row); the wrap into the prompt's row says the mark is
+there, its attributes say where it starts. Limits: an end-of-line mark
+drawn without reverse video or dim (`PROMPT_EOL_MARK='%%'`) is kept, and
+output whose own last text is reverse video or dim and left without a
+newline loses that run.
+
+**After a resize.** zsh's `printf abc` at 80 columns, then 50, then 120: at
+50 the padded row re-wraps into two and the second carries the prompt, so
+`abc` still wraps into the prompt's row and both report it; at 120 the
+padded row and the prompt's re-wrap into one row with `C`, `D`, `A` and `B`
+on it, read like a command that printed nothing: both `false` (zsh's
+redraw of its prompt, `CR EL`, erases that row anyway).
+
+**An older `C`.** The newest finished record's `C` line decides whether a
+`C` found above it is refused (another command's output must not be offered
+instead): when that line still carries a `C`, or the log knows it was
+blanked (a whole-screen clear now also marks the `C` of a record carried
+into the epoch by a resize as erased) or may have been: a chunk's clears
+are reported before its marks, so a `C` at or below the top of a clear
+reported since the last `A` may have come before that clear and been erased
+by it (`clear` or `tput clear` as the command, Ctrl-L typed ahead). Otherwise an edit the log does not
+see moved the rows or erased the `C`, and the marks decide: the older `C`
+is offered unless a `D` with an exit status follows its next prompt's `A`
+(a command ran there, whose `C` is gone). Tessera's scripts send a bare `D`
+for a prompt that ran nothing. Limit: an edit that erases the prompt after
+the last output (its `D` with it) and moves or erases that output's `C` (a
+DL over both, a scroll region scrolled down over that prompt) makes the
+output above look like the last one, and it is selected.
