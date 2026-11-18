@@ -337,7 +337,9 @@ pub enum EditError {
         warnings: Vec<Warning>,
     },
     /// The loader would fail on the edited file (a value of the wrong type
-    /// for its key): the edit is refused.
+    /// for its key), or fails on the opened one and the edit would replace
+    /// the list or table it rejected (see [`ConfigEditor::set`]): the edit
+    /// is refused.
     #[error("`{path}` refused: {error}")]
     Invalid {
         /// The key path.
@@ -399,6 +401,8 @@ pub struct ConfigEditor {
     comments: Vec<String>,
     /// What the loader reports for the document; `None` when it fails.
     warnings: Option<Vec<Warning>>,
+    /// The loader's error when it fails on the document.
+    error: Option<ParseError>,
     /// The theme names the document uses.
     themes: Vec<String>,
     /// The configuration the document loads as; `None` when it fails.
@@ -510,6 +514,7 @@ impl ConfigEditor {
             plain: state.plain,
             comments: state.comments,
             warnings: state.warnings,
+            error: state.error,
             themes: state.themes,
             config: state.config,
         })
@@ -583,18 +588,56 @@ impl ConfigEditor {
     /// files define) is refused with [`EditError::Unsupported`] and
     /// [`FILE_PROFILE_REFUSED`], also by [`ConfigEditor::remove`].
     /// [`ConfigEditor::add_profile`] still adds an entry, before them.
+    ///
+    /// An item past one of the loader's caps (a profile from the 257th,
+    /// a smart rule from the 65th, a `[keys]` entry from the 513th) is not
+    /// edited: the loader never reads it, so the check cannot see the edit
+    /// (#449). [`EditError::Unsupported`] says "past the loader's cap of
+    /// N"; [`ConfigEditor::remove`] refuses the same.
+    ///
+    /// On a file the loader fails on (a value of the wrong type), an edit
+    /// that leaves it failing is refused with the error of the edited file.
+    /// One that makes it load repairs it, a set or remove of a scalar
+    /// (`opacity = "x"`), unless it sets, removes or edits inside a list or
+    /// table the loader rejected (`enabled = "x"` under `[plugins]`, a key
+    /// that holds a list): that is refused with the loader's error for the
+    /// file, so a toggle never replaces what the user wrote (#489 48b m2).
+    /// [`ConfigEditor::replace`] replaces it when the user asked for that.
     pub fn set(&mut self, path: &str, value: toml::Value) -> Result<(), EditError> {
         let path: KeyPath = path.parse()?;
         self.not_in_a_profile_file(&path)?;
-        self.set_path(&path, value)
+        self.set_path(&path, value, Rejected::Refuse)
+    }
+
+    /// [`ConfigEditor::set`], except that it may make a file the loader
+    /// fails on load: the value the loader rejected (`enabled = "x"`, an
+    /// array of the wrong type) is replaced by `value`, which must be well
+    /// typed. For an action where the user asked to replace what the file
+    /// holds; a toggle or field calls [`ConfigEditor::set`] and gets the
+    /// loader's error. Otherwise the same checks and errors as
+    /// [`ConfigEditor::set`]; the edited file must then load without any
+    /// warning, since the opened one had none to keep.
+    ///
+    /// # Errors
+    ///
+    /// As for [`ConfigEditor::set`].
+    pub fn replace(&mut self, path: &str, value: toml::Value) -> Result<(), EditError> {
+        let path: KeyPath = path.parse()?;
+        self.not_in_a_profile_file(&path)?;
+        self.set_path(&path, value, Rejected::Replace)
     }
 
     /// [`ConfigEditor::set`] of a parsed `path`, which may be one past the
     /// last `[[profiles]]` entry with profile files after it
     /// ([`ConfigEditor::add_profile`]).
-    fn set_path(&mut self, path: &KeyPath, value: toml::Value) -> Result<(), EditError> {
+    fn set_path(
+        &mut self,
+        path: &KeyPath,
+        value: toml::Value,
+        rejected: Rejected,
+    ) -> Result<(), EditError> {
         let path = path.clone();
-        let state = self.prepare_set(&path, &value)?;
+        let state = self.prepare_set(&path, &value, rejected)?;
         // The loader takes an integer for a float key; the file should say
         // what the setting is (`opacity = 1.0`, #324 item 4).
         let state = match state
@@ -602,7 +645,7 @@ impl ConfigEditor {
             .as_ref()
             .and_then(|config| floats_where_config_has_them(value, config, &path.0))
         {
-            Some(value) => self.prepare_set(&path, &value)?,
+            Some(value) => self.prepare_set(&path, &value, rejected)?,
             None => state,
         };
         self.keep(state);
@@ -611,12 +654,17 @@ impl ConfigEditor {
 
     /// The document with `value` set at `path`, checked as
     /// [`ConfigEditor::commit`] checks it, not yet kept.
-    fn prepare_set(&self, path: &KeyPath, value: &toml::Value) -> Result<State, EditError> {
+    fn prepare_set(
+        &self,
+        path: &KeyPath,
+        value: &toml::Value,
+        rejected: Rejected,
+    ) -> Result<State, EditError> {
         let unsupported = |reason| EditError::Unsupported {
             path: path.clone(),
             reason,
         };
-        past_profile_cap(path)?;
+        past_loader_cap(&self.doc, path)?;
         let edit_value = edit_value(value, 0).map_err(unsupported)?;
         let mut doc = self.doc.clone();
         // The comments inside a replaced value are moved, not removed.
@@ -642,7 +690,7 @@ impl ConfigEditor {
                 warnings: vec![unknown],
             });
         }
-        self.check(path, &doc.to_string(), &expected, &[], &before)
+        self.check(path, &doc.to_string(), &expected, &[], &before, rejected)
     }
 
     /// Removes the value, table or array element at `path`; `Ok(false)`
@@ -664,7 +712,7 @@ impl ConfigEditor {
             path: path.clone(),
             reason,
         };
-        past_profile_cap(&path)?;
+        past_loader_cap(&self.doc, &path)?;
         self.not_in_a_profile_file(&path)?;
         let mut doc = self.doc.clone();
         let carried = cut_leading_decor(&mut doc, &path.0);
@@ -720,7 +768,11 @@ impl ConfigEditor {
                 reason: "the first 256 profiles, with those in profiles/, are read; one more would push one out",
             });
         }
-        self.set_path(&path, toml::Value::String(name.to_owned()))?;
+        self.set_path(
+            &path,
+            toml::Value::String(name.to_owned()),
+            Rejected::Refuse,
+        )?;
         Ok(index)
     }
 
@@ -743,20 +795,15 @@ impl ConfigEditor {
     /// [`ConfigEditor::unused_profile_name`] with `files` read by the
     /// caller.
     fn unused_name(&self, base: &str, files: &crate::profile_files::ProfileFiles) -> String {
-        let entries: Vec<String> = match &self.config {
-            Some(config) => config.profiles.iter().map(|p| p.name.clone()).collect(),
-            None => match self.plain.get("profiles") {
-                Some(toml::Value::Array(profiles)) => profiles
-                    .iter()
-                    .filter_map(|p| p.get("name").and_then(toml::Value::as_str))
-                    .map(str::to_owned)
-                    .collect(),
-                _ => Vec::new(),
-            },
+        // The names as written: one the loader cuts or changes only makes
+        // the added name a duplicate, which the check refuses (#312 m6).
+        let entries = match self.plain.get("profiles") {
+            Some(toml::Value::Array(profiles)) => profiles.as_slice(),
+            _ => &[],
         };
         let taken: std::collections::HashSet<&str> = entries
             .iter()
-            .map(String::as_str)
+            .filter_map(|p| p.get("name").and_then(toml::Value::as_str))
             .chain(files.names())
             .collect();
         let mut name = base.to_owned();
@@ -790,8 +837,8 @@ impl ConfigEditor {
     /// [`MAX_PROFILE_NAME_LEN`](crate::MAX_PROFILE_NAME_LEN) bytes (`base`,
     /// or `base` with the number that makes it unused);
     /// [`EditError::KeyPath`] for a key that does not parse or makes a path
-    /// of more than [`MAX_KEY_PATH_STEPS`] steps. The document is unchanged
-    /// after any error.
+    /// of more than [`MAX_KEY_PATH_STEPS`] steps or [`MAX_KEY_PATH_LEN`]
+    /// bytes. The document is unchanged after any error.
     pub fn add_profile_with(
         &mut self,
         base: &str,
@@ -836,13 +883,19 @@ impl ConfigEditor {
             }
             let mut steps = vec![Step::Key("profiles".to_owned()), Step::Index(index)];
             steps.extend(relative.0);
-            paths.push(KeyPath(steps));
+            // The full path is a key path too: a 1024-byte key makes one
+            // longer than MAX_KEY_PATH_LEN with `profiles[N].` (#312 m3).
+            let path = KeyPath(steps);
+            if path.to_string().len() > MAX_KEY_PATH_LEN {
+                return Err(KeyPathError::TooLong.into());
+            }
+            paths.push(path);
         }
         let before = self.clone();
         let added = self.add_entry(&name, files.count()).and_then(|at| {
             debug_assert_eq!(at, index);
             for (path, (_, value)) in paths.iter().zip(keys) {
-                self.set_path(path, value.clone())?;
+                self.set_path(path, value.clone(), Rejected::Refuse)?;
             }
             Ok(AddedProfile { index, name })
         });
@@ -891,9 +944,36 @@ impl ConfigEditor {
         removed: &[String],
         before: &[Warning],
     ) -> Result<(), EditError> {
-        let state = self.check(path, text, expected, removed, before)?;
+        let state = self.check(path, text, expected, removed, before, Rejected::Refuse)?;
         self.keep(state);
         Ok(())
+    }
+
+    /// Whether an edit at `path` that makes the failing document load as
+    /// `after` sets, removes or edits inside a list or table the loader
+    /// rejected: the value at the loader's error, its key a list or table
+    /// by default, before or after the edit, and `path` at, under or above
+    /// it. Also when the error points into no value (nothing tells what
+    /// would be lost).
+    fn replaces_a_rejected_list(&self, path: &KeyPath, after: &toml::Table) -> bool {
+        let Some(span) = self.error.as_ref().and_then(ParseError::span) else {
+            return true;
+        };
+        // The document is the one opened: an edit that leaves it failing
+        // is never kept, so the error's offsets are its own.
+        let Some(rejected) = rejected_value(&self.doc.to_string(), span.start) else {
+            return true;
+        };
+        if !(path.0.starts_with(&rejected) || rejected.starts_with(&path.0)) {
+            return false;
+        }
+        let compound = |v: Option<&toml::Value>| {
+            matches!(v, Some(toml::Value::Array(_) | toml::Value::Table(_)))
+        };
+        let defaults = toml::Table::try_from(Config::default()).unwrap_or_default();
+        compound(plain_at(&defaults, &rejected))
+            || compound(plain_at(&self.plain, &rejected))
+            || compound(plain_at(after, &rejected))
     }
 
     /// Makes the checked document `state` the one being edited.
@@ -902,6 +982,7 @@ impl ConfigEditor {
         self.plain = state.plain;
         self.comments = state.comments;
         self.warnings = state.warnings;
+        self.error = state.error;
         self.themes = state.themes;
         self.config = state.config;
     }
@@ -909,7 +990,9 @@ impl ConfigEditor {
     /// Checks the edited document `text`: it parses, it is `expected` as
     /// plain TOML, it keeps every comment but those of `removed` and adds
     /// none, and the loader and the theme lookup warn about nothing that
-    /// `before` does not hold.
+    /// `before` does not hold. With the loader failing on the document
+    /// before the edit, the edited one must fail too unless `rejected`
+    /// says to replace.
     fn check(
         &self,
         path: &KeyPath,
@@ -917,6 +1000,7 @@ impl ConfigEditor {
         expected: &toml::Value,
         removed: &[String],
         before: &[Warning],
+        rejected: Rejected,
     ) -> Result<State, EditError> {
         let unsupported = |reason| EditError::Unsupported {
             path: path.clone(),
@@ -969,6 +1053,21 @@ impl ConfigEditor {
                 None => unsupported("internal: the loader failed"),
             });
         };
+        // The edit makes a file the loader failed on load: it replaced
+        // the value the loader rejected. A list or table the user wrote is
+        // not replaced by a toggle (#489 48b m2); a scalar is repaired.
+        if self.warnings.is_none()
+            && rejected == Rejected::Refuse
+            && self.replaces_a_rejected_list(path, &state.plain)
+        {
+            return Err(match &self.error {
+                Some(error) => EditError::Invalid {
+                    path: path.clone(),
+                    error: error.clone(),
+                },
+                None => unsupported("internal: the loader failed"),
+            });
+        }
         let mut new = new_warnings(before, after);
         // A theme the edit names must exist (`ConfigStore::theme` would
         // fall back to the default with a warning). Each use of a missing
@@ -1013,7 +1112,8 @@ impl ConfigEditor {
     /// group (not its extended attributes or ACLs), which is flushed to disk and then
     /// renamed over the file; the directory is flushed after. A crash
     /// leaves the old file or the new one, never a mix (a temporary file
-    /// may stay behind). Just before the rename the file is read again: if
+    /// may stay behind: the next save removes it, see
+    /// [`MAX_STALE_EDITS_SWEPT`]). Just before the rename the file is read again: if
     /// it is not byte for byte what was opened (or the symlink now points
     /// elsewhere), nothing is replaced and the result is
     /// [`EditError::Conflict`].
@@ -1043,6 +1143,7 @@ impl ConfigEditor {
         }
         check_writable(&self.target, &meta)?;
         let (tmp, mut file) = temporary_file(&self.target)?;
+        let owner = owner_of(&file);
         carry_group(&file, &meta);
         let written = file
             .set_permissions(meta.permissions())
@@ -1061,6 +1162,16 @@ impl ConfigEditor {
         }
         sync_dir(&self.target);
         self.original = text.into_bytes();
+        if let Some(owner) = owner {
+            let swept = sweep_stale_edits(&self.target, owner, process_exists);
+            if swept > 0 {
+                tracing::debug!(
+                    target: "tessera_config",
+                    swept,
+                    "stale temporary files of earlier edits removed"
+                );
+            }
+        }
         Ok(true)
     }
 
@@ -1155,6 +1266,13 @@ fn carry_group(file: &std::fs::File, meta: &std::fs::Metadata) {
 /// Numbers the temporary files within this process.
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// The `<name>` of [`temporary_file`]'s names for `target`.
+fn temporary_base(target: &Path) -> String {
+    target
+        .file_name()
+        .map_or_else(|| "config".into(), |n| n.to_string_lossy().into_owned())
+}
+
 /// A new temporary file next to `target`, named
 /// `.<name>.<pid>.<n>.edit`.
 fn temporary_file(target: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
@@ -1162,9 +1280,7 @@ fn temporary_file(target: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
     /// earlier process with the same id) is skipped.
     const ATTEMPTS: u32 = 16;
 
-    let name = target
-        .file_name()
-        .map_or_else(|| "config".into(), |n| n.to_string_lossy().into_owned());
+    let name = temporary_base(target);
     let mut attempts = 0;
     loop {
         let tmp = target.with_file_name(format!(
@@ -1180,6 +1296,148 @@ fn temporary_file(target: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Most stale temporary files of earlier edits one save removes
+/// (docs/security.md S5): a crash between creating the temporary file and
+/// the rename leaves `.<name>.<pid>.<n>.edit` behind (#324 item 6).
+pub const MAX_STALE_EDITS_SWEPT: usize = 16;
+
+/// Most entries of the target's directory a sweep for stale temporary
+/// files reads (docs/security.md S5).
+pub const MAX_STALE_SWEEP_ENTRIES: usize = 4096;
+
+/// The user id that owns `file`, the temporary file this process just
+/// created; `None` where there are no user ids.
+fn owner_of(file: &std::fs::File) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        file.metadata().ok().map(|meta| meta.uid())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        None
+    }
+}
+
+/// Removes the temporary files that earlier saves of `target` left
+/// behind (a crash before the rename) and returns how many: entries of
+/// the target's directory named exactly as [`temporary_file`] names them
+/// for this target, that are regular files (a symlink is neither followed
+/// nor removed, nor is a directory) owned by `owner` (this user), and
+/// whose process id is not this process's and, by `exists`, no running
+/// process's (a live one may still be saving). At most
+/// [`MAX_STALE_SWEEP_ENTRIES`] entries are read and
+/// [`MAX_STALE_EDITS_SWEPT`] candidates checked. Best effort: an entry
+/// that cannot be read or removed is left. Logs nothing about the files.
+fn sweep_stale_edits(target: &Path, owner: u32, exists: impl Fn(u32) -> bool) -> usize {
+    let Some(dir) = target.parent() else { return 0 };
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let names = entries.map(|entry| entry.ok().map(|entry| entry.file_name()));
+    sweep_names(dir, &temporary_base(target), names, owner, exists)
+}
+
+/// [`sweep_stale_edits`] of the entries `names` of `dir` (`None` for one
+/// that could not be read), for the target file named `name`. Reads at
+/// most [`MAX_STALE_SWEEP_ENTRIES`] of them, unreadable ones included.
+fn sweep_names(
+    dir: &Path,
+    name: &str,
+    names: impl Iterator<Item = Option<std::ffi::OsString>>,
+    owner: u32,
+    exists: impl Fn(u32) -> bool,
+) -> usize {
+    let prefix = format!(".{name}.");
+    let mut checked = 0;
+    let mut removed = 0;
+    for file_name in names.take(MAX_STALE_SWEEP_ENTRIES).flatten() {
+        if checked == MAX_STALE_EDITS_SWEPT {
+            break;
+        }
+        let Some(pid) = file_name
+            .to_str()
+            .and_then(|n| n.strip_prefix(prefix.as_str()))
+            .and_then(stale_pid)
+        else {
+            continue;
+        };
+        if pid == 0 || pid == std::process::id() {
+            continue;
+        }
+        let path = dir.join(&file_name);
+        // Not followed: a symlink of that name is not a file of ours.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.file_type().is_file() || !owned_by(&meta, owner) {
+            continue;
+        }
+        checked += 1;
+        if exists(pid) {
+            continue;
+        }
+        // `remove_file` never follows a symlink, should one replace the
+        // file meanwhile, and fails on a directory.
+        if std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// The process id in `rest`, the part of a temporary file's name after
+/// `.<name>.`, when it is exactly `<pid>.<n>.edit` (decimal digits, a
+/// pid up to `i32::MAX` and a `u64`).
+fn stale_pid(rest: &str) -> Option<u32> {
+    let (pid, rest) = rest.split_once('.')?;
+    let n = rest.strip_suffix(".edit")?;
+    let digits = |s: &str, max: usize| {
+        !s.is_empty() && s.len() <= max && s.bytes().all(|b| b.is_ascii_digit())
+    };
+    if !digits(pid, 10) || !digits(n, 20) {
+        return None;
+    }
+    n.parse::<u64>().ok()?;
+    // A pid is a positive `pid_t`: past `i32::MAX` no process wrote it,
+    // and `ps -p` reports it as not running.
+    pid.parse::<i32>().ok()?.try_into().ok()
+}
+
+/// Whether `meta` belongs to the user `owner`.
+fn owned_by(meta: &std::fs::Metadata, owner: u32) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        meta.uid() == owner
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (meta, owner);
+        false
+    }
+}
+
+/// Whether a process with id `pid` runs, asked of `/bin/ps` (this crate
+/// does not call `kill(2)`, which needs `unsafe`, S7). Anything but "no
+/// such process" (`ps` failing to start, an unexpected exit) counts as
+/// running, so a file is only removed when its process is known gone.
+fn process_exists(pid: u32) -> bool {
+    std::process::Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "pid="])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_or(true, |status| status.code() != Some(1))
 }
 
 /// Flushes the directory of `path`, so a rename in it survives a power
@@ -1199,6 +1457,16 @@ fn sync_dir(path: &Path) {
             "configuration directory not flushed"
         );
     }
+}
+
+/// Whether an edit may make a file the loader fails on load
+/// ([`ConfigEditor::replace`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rejected {
+    /// No: the edited file must fail as the opened one does.
+    Refuse,
+    /// Yes: the edit replaces the value the loader rejected.
+    Replace,
 }
 
 /// A document parsed every way the checks need.
@@ -1375,24 +1643,209 @@ fn plain_at<'a>(table: &'a toml::Table, steps: &[Step]) -> Option<&'a toml::Valu
 pub const FILE_PROFILE_REFUSED: &str =
     "this profile is defined in a file in profiles/, not in config.toml; edit that file instead";
 
-/// [`EditError::Unsupported`] when `path` is in a profile past
-/// [`MAX_PROFILES`](crate::MAX_PROFILES). The loader drops those, so the
-/// checks cannot see an edit of one: `profiles[256].name` on a file with
-/// 300 would rename its 257th entry unseen (#342 M7), and removing
-/// `profiles[257]` or a key in it would change a profile the app never
-/// reads (#430).
-fn past_profile_cap(path: &KeyPath) -> Result<(), EditError> {
-    const { assert!(crate::MAX_PROFILES == 256, "the reason below names the cap") };
-    if let [Step::Key(key), Step::Index(index), ..] = &path.0[..]
-        && key == "profiles"
-        && *index >= crate::MAX_PROFILES
-    {
-        return Err(EditError::Unsupported {
-            path: path.clone(),
-            reason: "only the first 256 profiles are read; this one would be ignored",
-        });
+/// A list the loader reads only the first [`LoaderCap::limit`] items of,
+/// or a list of its warnings it cuts there. The loader never checks what
+/// lies past such a cap, so neither can an edit's check: an edit there is
+/// refused ([`past_loader_cap`]) or checked another way. Every such cap is
+/// a row of [`LOADER_CAPS`], and a test iterates the table (a cap added
+/// without a row, or a row without a refusal test, fails it).
+#[derive(Debug, Clone, Copy)]
+struct LoaderCap {
+    /// Which cap, for the test that iterates the table.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the test that iterates the table")
+    )]
+    cap: Cap,
+    /// What the cap counts.
+    counts: Counts,
+    /// How many the loader reads.
+    limit: usize,
+    /// The reason of the refusal, naming the cap ("past the loader's cap
+    /// of N").
+    reason: &'static str,
+}
+
+/// The rows of [`LOADER_CAPS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cap {
+    /// [`MAX_PROFILES`](crate::MAX_PROFILES) `[[profiles]]` entries.
+    Profiles,
+    /// [`MAX_SMART_RULES`](crate::MAX_SMART_RULES) smart selection rules.
+    SmartRules,
+    /// [`MAX_KEY_BINDINGS`](crate::MAX_KEY_BINDINGS) `[keys]` entries.
+    KeyBindings,
+    /// [`MAX_UNKNOWN_KEY_WARNINGS`](crate::MAX_UNKNOWN_KEY_WARNINGS)
+    /// unknown-key warnings.
+    UnknownKeys,
+}
+
+/// What a [`LoaderCap`] counts.
+#[derive(Debug, Clone, Copy)]
+enum Counts {
+    /// The elements of the array at this key path: an edit at or under an
+    /// index from the cap on is refused.
+    Elements(&'static [&'static str]),
+    /// The entries of the table at this key path, in document order: an
+    /// edit of an entry from the cap on, or a new entry with the table at
+    /// the cap, is refused.
+    Entries(&'static [&'static str]),
+    /// The unknown keys the loader names: those past the cap are counted
+    /// ([`Warning::UnknownKeysOmitted`]), and [`new_warnings`] takes the
+    /// count as that many present, [`unknown_above`] asks about a new
+    /// key's table without the rest of the file. Nothing is refused for it.
+    UnknownKeyWarnings,
+}
+
+/// The loader's caps (docs/security.md S5) that an edit's check meets.
+const LOADER_CAPS: [LoaderCap; 4] = [
+    LoaderCap {
+        cap: Cap::Profiles,
+        counts: Counts::Elements(&["profiles"]),
+        limit: crate::MAX_PROFILES,
+        reason: "past the loader's cap of 256 profiles: the app never reads this one",
+    },
+    LoaderCap {
+        cap: Cap::SmartRules,
+        counts: Counts::Elements(&["selection", "smart_rules"]),
+        limit: crate::MAX_SMART_RULES,
+        reason: "past the loader's cap of 64 smart rules: the app never reads this one",
+    },
+    LoaderCap {
+        cap: Cap::KeyBindings,
+        counts: Counts::Entries(&["keys"]),
+        limit: crate::MAX_KEY_BINDINGS,
+        reason: "past the loader's cap of 512 key bindings: the app never reads this one",
+    },
+    LoaderCap {
+        cap: Cap::UnknownKeys,
+        counts: Counts::UnknownKeyWarnings,
+        limit: crate::MAX_UNKNOWN_KEY_WARNINGS,
+        reason: "past the loader's cap of 64 unknown-key warnings",
+    },
+];
+
+const _: () = {
+    assert!(
+        crate::MAX_PROFILES == 256
+            && crate::MAX_SMART_RULES == 64
+            && crate::MAX_KEY_BINDINGS == 512
+            && crate::MAX_UNKNOWN_KEY_WARNINGS == 64,
+        "the reasons in LOADER_CAPS name the caps"
+    );
+};
+
+/// [`EditError::Unsupported`] when `path`, in `doc` (the document before
+/// the edit), is in an item past one of the [`LOADER_CAPS`]. The loader
+/// drops those unread, so the checks cannot see an edit of one:
+/// `profiles[256].name` on a file with 300 would rename its 257th entry
+/// unseen (#342 M7), `selection.smart_rules[64].regex = "("` would be
+/// accepted where `[63]` is refused (#449), and removing `profiles[257]`
+/// or a key in it would change a profile the app never reads (#430).
+fn past_loader_cap(doc: &DocumentMut, path: &KeyPath) -> Result<(), EditError> {
+    for row in &LOADER_CAPS {
+        let past = match row.counts {
+            Counts::Elements(at) => match path.0.get(at.len()) {
+                Some(Step::Index(index)) if starts_with_keys(&path.0, at) => *index >= row.limit,
+                _ => false,
+            },
+            Counts::Entries(at) => match path.0.get(at.len()) {
+                Some(Step::Key(key)) if starts_with_keys(&path.0, at) => {
+                    entry_position(doc, at, key) >= row.limit
+                }
+                _ => false,
+            },
+            Counts::UnknownKeyWarnings => false,
+        };
+        if past {
+            return Err(EditError::Unsupported {
+                path: path.clone(),
+                reason: row.reason,
+            });
+        }
     }
     Ok(())
+}
+
+/// The key path of the value of `text` that holds byte offset `at`: the
+/// value of a `key = value` line, an inline table's entry as a key of its
+/// own, an inline array's inline-table element as an index (its entries
+/// searched in turn), and any other array as one value, so a scalar or
+/// nested array that a list holds is the list. `None` when `at` is in no
+/// value or `text` does not parse.
+fn rejected_value(text: &str, at: usize) -> Option<Vec<Step>> {
+    fn in_table(table: &dyn TableLike, at: usize, path: &mut Vec<Step>) -> bool {
+        for (key, item) in table.iter() {
+            path.push(Step::Key(key.to_owned()));
+            if in_item(item, at, path) {
+                return true;
+            }
+            path.pop();
+        }
+        false
+    }
+    fn in_item(item: &Item, at: usize, path: &mut Vec<Step>) -> bool {
+        match item {
+            Item::Value(value) => in_value(value, at, path),
+            Item::Table(table) => in_table(table, at, path),
+            Item::ArrayOfTables(tables) => tables.iter().enumerate().any(|(index, table)| {
+                path.push(Step::Index(index));
+                in_table(table, at, path) || {
+                    path.pop();
+                    false
+                }
+            }),
+            Item::None => false,
+        }
+    }
+    fn in_value(value: &Value, at: usize, path: &mut Vec<Step>) -> bool {
+        match value {
+            Value::InlineTable(table) => in_table(table, at, path),
+            Value::Array(array) => {
+                if !value.span().is_some_and(|span| span.contains(&at)) {
+                    return false;
+                }
+                for (index, element) in array.iter().enumerate() {
+                    if matches!(element, Value::InlineTable(_)) {
+                        path.push(Step::Index(index));
+                        if in_value(element, at, path) {
+                            return true;
+                        }
+                        path.pop();
+                    }
+                }
+                true
+            }
+            value => value.span().is_some_and(|span| span.contains(&at)),
+        }
+    }
+    let doc = toml_edit::Document::parse(text).ok()?;
+    let mut path = Vec::new();
+    in_table(doc.as_table(), at, &mut path).then_some(path)
+}
+
+/// Whether `steps` starts with the keys `keys`.
+fn starts_with_keys(steps: &[Step], keys: &[&str]) -> bool {
+    steps.len() >= keys.len()
+        && steps
+            .iter()
+            .zip(keys)
+            .all(|(step, key)| matches!(step, Step::Key(k) if k == key))
+}
+
+/// The position of the entry `key` among the entries of the table at
+/// `table` in `doc`, in document order (the loader's order, for `[keys]`):
+/// the number of entries when it has none (a new entry goes last), and 0
+/// without the table.
+fn entry_position(doc: &DocumentMut, table: &[&str], key: &str) -> usize {
+    let mut node: Option<&dyn TableLike> = Some(doc.as_table());
+    for step in table {
+        node = node.and_then(|t| t.get(step)).and_then(Item::as_table_like);
+    }
+    let Some(node) = node else { return 0 };
+    node.iter()
+        .position(|(k, _)| k == key)
+        .unwrap_or_else(|| node.len())
 }
 
 /// The [`Warning::UnknownKey`] for the table (or array) `steps` lies in,
@@ -2606,5 +3059,385 @@ mod tests {
         assert!(matches!(saved, Err(EditError::Conflict)), "{saved:?}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "# theirs\n");
         assert_eq!(names(dir.path()), ["config.toml"]);
+    }
+
+    /// `count` distinct `[keys]` entries with `cmd`, each a valid binding.
+    pub(crate) fn key_entries(count: usize) -> Vec<String> {
+        let keys = ('a'..='z')
+            .map(String::from)
+            .chain(('0'..='9').map(String::from))
+            .chain((1..=35).map(|n| format!("f{n}")));
+        let keys: Vec<String> = keys.collect();
+        let mods = [
+            "",
+            "ctrl+",
+            "alt+",
+            "shift+",
+            "ctrl+alt+",
+            "ctrl+shift+",
+            "alt+shift+",
+            "ctrl+alt+shift+",
+        ];
+        mods.iter()
+            .flat_map(|m| keys.iter().map(move |k| format!("cmd+{m}{k}")))
+            .take(count)
+            .collect()
+    }
+
+    /// A `[keys]` table of `count` entries, all `new_tab`.
+    fn keys_file(count: usize) -> String {
+        use std::fmt::Write as _;
+
+        let mut text = String::from("[keys]\n");
+        for chord in key_entries(count) {
+            writeln!(text, "\"{chord}\" = \"new_tab\"").unwrap();
+        }
+        text
+    }
+
+    #[track_caller]
+    fn unsupported(result: Result<(), EditError>, reason: &str, what: &str) {
+        match result {
+            Err(EditError::Unsupported { reason: r, .. }) => assert_eq!(r, reason, "{what}"),
+            other => panic!("{what}: {other:?}"),
+        }
+    }
+
+    #[track_caller]
+    fn refused(result: Result<(), EditError>, what: &str) {
+        match result {
+            Err(EditError::Refused { .. }) => {}
+            other => panic!("{what}: {other:?}"),
+        }
+    }
+
+    /// #449: every row of [`LOADER_CAPS`] has a refusal test, picked by an
+    /// exhaustive match (a new [`Cap`] without one does not compile), and
+    /// names its cap in its reason. Each test floods a file one past the
+    /// cap: an edit of the item past it is refused, set and remove, with a
+    /// valid and an invalid value, and the item before it keeps today's
+    /// behaviour (a valid value set, an invalid one refused with the
+    /// loader's warning).
+    #[test]
+    fn every_loader_cap_refuses_an_edit_past_it() {
+        let mut seen = Vec::new();
+        for row in &LOADER_CAPS {
+            assert!(!seen.contains(&row.cap), "{:?} twice", row.cap);
+            seen.push(row.cap);
+            assert!(
+                row.reason
+                    .contains(&format!("past the loader's cap of {}", row.limit)),
+                "{:?}: {}",
+                row.cap,
+                row.reason
+            );
+            match row.cap {
+                Cap::Profiles => profiles_past_the_cap(row),
+                Cap::SmartRules => smart_rules_past_the_cap(row),
+                Cap::KeyBindings => key_bindings_past_the_cap(row),
+                Cap::UnknownKeys => unknown_keys_past_the_cap(row),
+            }
+        }
+        // Every cap has a row.
+        for cap in [
+            Cap::Profiles,
+            Cap::SmartRules,
+            Cap::KeyBindings,
+            Cap::UnknownKeys,
+        ] {
+            match cap {
+                Cap::Profiles | Cap::SmartRules | Cap::KeyBindings | Cap::UnknownKeys => {
+                    assert!(seen.contains(&cap), "{cap:?} has no row");
+                }
+            }
+        }
+    }
+
+    fn profiles_past_the_cap(row: &LoaderCap) {
+        use std::fmt::Write as _;
+
+        assert_eq!(row.limit, crate::MAX_PROFILES);
+        let mut text = String::new();
+        for i in 0..=row.limit + 1 {
+            writeln!(text, "[[profiles]]\nname = \"p{i}\"").unwrap();
+        }
+        let (_dir, _path, mut editor) = editor_for(&text);
+        let past = row.limit;
+        for value in [s("beam"), s("zzz")] {
+            unsupported(
+                editor.set(&format!("profiles[{past}].appearance.cursor_shape"), value),
+                row.reason,
+                "set past",
+            );
+        }
+        for path in [
+            format!("profiles[{past}]"),
+            format!("profiles[{}]", past + 1),
+            format!("profiles[{}].name", past + 1),
+        ] {
+            unsupported(editor.remove(&path).map(drop), row.reason, &path);
+        }
+        assert_eq!(editor.to_toml(), text);
+        let last = row.limit - 1;
+        refused(
+            editor.set(
+                &format!("profiles[{last}].appearance.cursor_shape"),
+                s("zzz"),
+            ),
+            "invalid before",
+        );
+        editor
+            .set(
+                &format!("profiles[{last}].appearance.cursor_shape"),
+                s("beam"),
+            )
+            .unwrap();
+        editor
+            .remove(&format!("profiles[{last}].appearance"))
+            .unwrap();
+    }
+
+    fn smart_rules_past_the_cap(row: &LoaderCap) {
+        use std::fmt::Write as _;
+
+        assert_eq!(row.limit, crate::MAX_SMART_RULES);
+        let mut text = String::new();
+        for i in 0..=row.limit {
+            writeln!(text, "[[selection.smart_rules]]\nregex = \"x{i}\"").unwrap();
+        }
+        let (_dir, _path, mut editor) = editor_for(&text);
+        let past = row.limit;
+        for value in ["(", "a"] {
+            unsupported(
+                editor.set(&format!("selection.smart_rules[{past}].regex"), s(value)),
+                row.reason,
+                value,
+            );
+        }
+        for path in [
+            format!("selection.smart_rules[{past}]"),
+            format!("selection.smart_rules[{past}].regex"),
+        ] {
+            unsupported(editor.remove(&path).map(drop), row.reason, &path);
+        }
+        assert_eq!(editor.to_toml(), text);
+        let last = row.limit - 1;
+        refused(
+            editor.set(&format!("selection.smart_rules[{last}].regex"), s("(")),
+            "invalid before",
+        );
+        editor
+            .set(&format!("selection.smart_rules[{last}].regex"), s("a"))
+            .unwrap();
+    }
+
+    fn key_bindings_past_the_cap(row: &LoaderCap) {
+        assert_eq!(row.limit, crate::MAX_KEY_BINDINGS);
+        let chords = key_entries(row.limit + 2);
+        // At the cap: a new entry would be dropped.
+        let text = keys_file(row.limit);
+        let (_dir, _path, mut editor) = editor_for(&text);
+        assert_eq!(editor.warnings.as_deref(), Some(&[][..]));
+        let new = &chords[row.limit];
+        unsupported(
+            editor.set(&format!("keys.\"{new}\""), s("copy")),
+            row.reason,
+            "new at the cap",
+        );
+        let last = &chords[row.limit - 1];
+        refused(
+            editor.set(&format!("keys.\"{last}\""), toml::Value::Integer(3)),
+            "invalid before",
+        );
+        editor.set(&format!("keys.\"{last}\""), s("copy")).unwrap();
+        // Past the cap: the entries from the cap on are not read.
+        let text = keys_file(row.limit + 1);
+        let (_dir, _path, mut editor) = editor_for(&text);
+        for value in [s("copy"), toml::Value::Integer(3)] {
+            unsupported(
+                editor.set(&format!("keys.\"{new}\""), value),
+                row.reason,
+                "set past",
+            );
+        }
+        unsupported(
+            editor.remove(&format!("keys.\"{new}\"")).map(drop),
+            row.reason,
+            "remove past",
+        );
+        let newer = &chords[row.limit + 1];
+        unsupported(
+            editor.set(&format!("keys.\"{newer}\""), s("copy")),
+            row.reason,
+            "new past",
+        );
+        assert_eq!(editor.to_toml(), text);
+        refused(
+            editor.set(&format!("keys.\"{last}\""), toml::Value::Integer(3)),
+            "invalid before",
+        );
+        editor.set(&format!("keys.\"{last}\""), s("copy")).unwrap();
+    }
+
+    /// The unknown keys past the cap are not refused for (nothing is
+    /// edited there), but checked: a new key in a table hidden past them,
+    /// or a new unknown key, is still refused.
+    fn unknown_keys_past_the_cap(row: &LoaderCap) {
+        use std::fmt::Write as _;
+
+        assert_eq!(row.limit, crate::MAX_UNKNOWN_KEY_WARNINGS);
+        let mut text = String::new();
+        for i in 0..row.limit + 6 {
+            writeln!(text, "unknown{i} = {i}").unwrap();
+        }
+        text.push_str("[zzz]\na = 1\n");
+        let (_dir, _path, mut editor) = editor_for(&text);
+        let before = editor.warnings.clone().unwrap();
+        assert!(
+            before
+                .iter()
+                .any(|w| matches!(w, Warning::UnknownKeysOmitted { .. })),
+            "{before:?}"
+        );
+        let result = editor.set("zzz.newkey", toml::Value::Integer(1));
+        assert!(
+            matches!(&result, Err(EditError::Refused { warnings, .. })
+                if matches!(&warnings[..], [Warning::UnknownKey { path }] if path == "zzz")),
+            "{result:?}"
+        );
+        refused(
+            editor.set("general.newkey", toml::Value::Integer(1)),
+            "new unknown key",
+        );
+        assert_eq!(editor.to_toml(), text);
+        editor.set("zzz.a", toml::Value::Integer(2)).unwrap();
+    }
+
+    fn s(text: &str) -> toml::Value {
+        toml::Value::String(text.into())
+    }
+
+    /// `n` names of temporary files of `config.toml` for `pid`.
+    fn temporaries(dir: &Path, pid: u32, n: usize) -> Vec<PathBuf> {
+        (0..n)
+            .map(|i| {
+                let path = dir.join(format!(".config.toml.{pid}.{i}.edit"));
+                std::fs::write(&path, "stale").unwrap();
+                path
+            })
+            .collect()
+    }
+
+    fn uid(dir: &Path) -> u32 {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(dir).unwrap().uid()
+    }
+
+    /// #324 item 6: the sweep removes a stale temporary file of this target
+    /// only: not one of a running process, of this process, of another
+    /// target or another name pattern, a symlink or a directory of that
+    /// name, or a file of another user (`owner` another uid). At most
+    /// [`MAX_STALE_EDITS_SWEPT`] candidates are checked per sweep.
+    #[test]
+    fn the_sweep_removes_only_stale_temporary_files_of_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        std::fs::write(&target, "").unwrap();
+        let dead = 4_000_001;
+        let live = 4_000_002;
+        let exists = |pid: u32| pid == live;
+        let stale = temporaries(dir.path(), dead, 1);
+        let mine = temporaries(dir.path(), std::process::id(), 1);
+        let running = temporaries(dir.path(), live, 1);
+        let others = [
+            ".config.toml.2147483648.0.edit",
+            ".config.toml.4294967295.0.edit",
+            ".other.toml.4000001.0.edit",
+            ".config.toml.4000001.0.edit.bak",
+            ".config.toml.4000001.edit",
+            ".config.toml.40x0001.0.edit",
+            ".config.toml.4000001.0x.edit",
+            ".config.toml.0.0.edit",
+            ".config.toml.40000010000.0.edit",
+            "config.toml.4000001.0.edit",
+        ];
+        for name in others {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        let link = dir.path().join(".config.toml.4000001.1.edit");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let folder = dir.path().join(".config.toml.4000001.2.edit");
+        std::fs::create_dir(&folder).unwrap();
+        // Another user's: every file here is this user's, so the sweep of
+        // another uid sees them as someone else's.
+        assert_eq!(sweep_stale_edits(&target, uid(dir.path()) + 1, exists), 0);
+        assert!(stale[0].exists());
+        assert_eq!(sweep_stale_edits(&target, uid(dir.path()), exists), 1);
+        assert!(!stale[0].exists());
+        assert!(mine[0].exists() && running[0].exists());
+        for name in others {
+            assert!(dir.path().join(name).exists(), "{name}");
+        }
+        assert!(link.symlink_metadata().is_ok() && target.exists());
+        assert!(folder.is_dir());
+    }
+
+    /// S5: one sweep checks at most [`MAX_STALE_EDITS_SWEPT`] candidates
+    /// (20 stale files take two saves) and reads at most
+    /// [`MAX_STALE_SWEEP_ENTRIES`] entries.
+    #[test]
+    fn the_sweep_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        let stale = temporaries(dir.path(), 4_000_001, 20);
+        let asked = Cell::new(0);
+        let exists = |_| {
+            asked.set(asked.get() + 1);
+            false
+        };
+        assert_eq!(
+            sweep_stale_edits(&target, uid(dir.path()), exists),
+            MAX_STALE_EDITS_SWEPT
+        );
+        assert_eq!(asked.get(), MAX_STALE_EDITS_SWEPT);
+        assert_eq!(stale.iter().filter(|p| p.exists()).count(), 4);
+        assert_eq!(sweep_stale_edits(&target, uid(dir.path()), |_| false), 4);
+        // Running candidates count too: 20 live ones cost 16 checks.
+        temporaries(dir.path(), 4_000_002, 20);
+        let asked = Cell::new(0);
+        let running = |_| {
+            asked.set(asked.get() + 1);
+            true
+        };
+        assert_eq!(sweep_stale_edits(&target, uid(dir.path()), running), 0);
+        assert_eq!(asked.get(), MAX_STALE_EDITS_SWEPT);
+        // The entry cap: a stale name read as the last entry the cap allows
+        // is removed, one after it is not.
+        for (at, swept) in [
+            (MAX_STALE_SWEEP_ENTRIES - 1, 1),
+            (MAX_STALE_SWEEP_ENTRIES, 0),
+        ] {
+            let stale = temporaries(dir.path(), 4_000_001, 1);
+            let pulled = Cell::new(0);
+            let names = (0..)
+                .map(|i| {
+                    pulled.set(pulled.get() + 1);
+                    if i == at {
+                        Some(stale[0].file_name().unwrap().to_owned())
+                    } else if i % 7 == 0 {
+                        None
+                    } else {
+                        Some(std::ffi::OsString::from(format!("junk{i}")))
+                    }
+                })
+                .take(MAX_STALE_SWEEP_ENTRIES + 10);
+            assert_eq!(
+                sweep_names(dir.path(), "config.toml", names, uid(dir.path()), |_| false),
+                swept,
+                "{at}"
+            );
+            assert!(pulled.get() <= MAX_STALE_SWEEP_ENTRIES);
+            let _ = std::fs::remove_file(&stale[0]);
+        }
     }
 }

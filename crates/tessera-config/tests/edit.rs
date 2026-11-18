@@ -151,9 +151,18 @@ fn setting_an_array_moves_its_comments_above_the_key() {
         ),
     ] {
         let (_dir, _path, mut editor) = open(text);
-        editor
-            .set("plugins.enabled", toml::Value::Array(vec![s("a")]))
-            .unwrap();
+        let value = toml::Value::Array(vec![s("a")]);
+        if tessera_config::Config::from_toml_lenient(text).is_ok() {
+            editor.set("plugins.enabled", value).unwrap();
+        } else {
+            // A nested array fails the load: a set is refused and only a
+            // replace writes over it (#489 48b m2).
+            assert!(matches!(
+                editor.set("plugins.enabled", value.clone()),
+                Err(EditError::Invalid { .. })
+            ));
+            editor.replace("plugins.enabled", value).unwrap();
+        }
         assert_eq!(editor.to_toml(), want, "{text:?}");
     }
 }

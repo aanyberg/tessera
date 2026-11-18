@@ -29,7 +29,8 @@ use crate::selection::copy_out;
 use crate::session::MAX_PROFILE_NAME_LEN;
 
 /// Longest value JSON `tessera_config_set` takes, in bytes (64 KiB): far
-/// more than any setting needs, small enough to parse on the UI thread.
+/// more than any setting needs, small enough to parse on the app's
+/// background write queue between two edits.
 pub const MAX_CONFIG_VALUE_LEN: usize = 64 * 1024;
 
 /// Longest path `tessera_theme_import` takes, in bytes (macOS `PATH_MAX`).
@@ -469,7 +470,12 @@ fn config_value(config: &tessera_app_core::Config) -> serde_json::Value {
 /// * `TESSERA_ERROR_REFUSED` when the configuration loader would warn
 ///   about the result (an unknown key, a value out of range or of the
 ///   wrong type, a theme that does not exist, a key binding it would drop
-///   or honour with a caveat): nothing is written;
+///   or honour with a caveat): nothing is written. Also when the loader
+///   fails on the file (a value of the wrong type) and still would after
+///   the edit, or when the edit sets, removes or edits inside a list or
+///   table the loader rejected (`[plugins] enabled = "x"`), so a toggle
+///   never replaces what the user wrote; a set or remove that repairs a
+///   wrong-typed scalar is saved;
 /// * `TESSERA_ERROR_CONFLICT` when `config.toml` changed on disk while the
 ///   edit was made (an editor saved it): nothing is written, the other
 ///   change stays; read the configuration again and retry;
@@ -577,8 +583,11 @@ struct NewProfile {
 }
 
 /// Parses `json`, a JSON object of key paths within a profile to values
-/// with a string `"name"` (S5: the caller checked its length; the keys
-/// are counted here).
+/// with a string `"name"` (S5: the caller checked its length, at most
+/// [`MAX_CONFIG_VALUE_LEN`] bytes, so the object is parsed within that
+/// bound; its members are counted after, before any is converted). A
+/// member given twice counts once, with its last value (#312 m2), and the
+/// keys come in byte order of their paths.
 fn new_profile(json: &[u8]) -> Result<NewProfile, Failure> {
     let invalid = |message: String| Failure::new(Error::InvalidArgument, message);
     let object: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(json)
@@ -620,7 +629,9 @@ fn new_profile(json: &[u8]) -> Result<NewProfile, Failure> {
 /// is the base name, and every other member is a key path within the
 /// profile (`"command"`, `"appearance.theme"`, as after
 /// `profiles[N].` in `tessera_config_set`) with its value as JSON, at most
-/// `TESSERA_MAX_ADDED_PROFILE_KEYS` of them:
+/// `TESSERA_MAX_ADDED_PROFILE_KEYS` of them. A member given twice counts
+/// once, with its last value (`"name"` too), and the keys are set in byte
+/// order of their paths:
 ///
 /// ```json
 /// {"name": "Work Copy", "command": "/bin/zsh",
@@ -635,7 +646,11 @@ fn new_profile(json: &[u8]) -> Result<NewProfile, Failure> {
 /// its key path index, `profiles[N].command`) goes to `*index`, and its
 /// name (at most `TESSERA_MAX_PROFILE_NAME_LEN` bytes, no NUL terminator)
 /// to `name_buf` and its length to `*name_len`. Either all of it is
-/// written or nothing is: one refused key refuses the profile.
+/// written or nothing is: one refused key refuses the profile. With
+/// profiles in `profiles/`, `tessera_config_set` of `profiles[*index]` is
+/// refused as a file's profile until `on_config_applied` has reported the
+/// configuration with the new profile, since the index is checked against
+/// the configuration applied (#312 m1).
 ///
 /// Returns, writing nothing to `config.toml` for any failure:
 ///
@@ -643,14 +658,14 @@ fn new_profile(json: &[u8]) -> Result<NewProfile, Failure> {
 ///   (a value out of range or of the wrong type, an unknown key, a theme
 ///   that does not exist), as for `tessera_config_set`;
 /// * `TESSERA_ERROR_INVALID_ARGUMENT` when `name_cap` is below
-///   `TESSERA_MAX_PROFILE_NAME_LEN` (checked first), `profile_json` is too
+///   `TESSERA_MAX_PROFILE_NAME_LEN` (checked after the pointers), `profile_json` is too
 ///   long, not a JSON object, has no string `"name"`, more keys than
 ///   `TESSERA_MAX_ADDED_PROFILE_KEYS`, a `null` value or a key path that
 ///   does not parse; when the app reads `MAX_PROFILES` (256) profiles
 ///   already, counting `config.toml`'s and `profiles/`'s together; when the
 ///   name (with the number that makes it unused) would be longer than
 ///   `TESSERA_MAX_PROFILE_NAME_LEN` bytes; or an edit the editor does not
-///   make (a key that holds a table);
+///   make (a value that is or holds a table);
 /// * `TESSERA_ERROR_CONFLICT` and `TESSERA_ERROR_IO` as for
 ///   `tessera_config_set`;
 /// * `TESSERA_ERROR_NULL_POINTER` for a `NULL` `app`, `index`, `name_buf`
@@ -659,7 +674,8 @@ fn new_profile(json: &[u8]) -> Result<NewProfile, Failure> {
 /// On every failure a message for the user goes to `msg` as for
 /// `tessera_config_set`: the core's reason, naming the key that was
 /// refused (`profiles[3].appearance.theme`) where one was. `*index` and
-/// `*name_len` are 0 then.
+/// `*name_len` are 0 then, each that is not `NULL` (also when another
+/// pointer is).
 ///
 /// Any thread (the app's background write queue), as for
 /// `tessera_config_set`; serialised with it.
@@ -689,16 +705,22 @@ pub unsafe extern "C" fn tessera_config_add_profile(
         // SAFETY: `msg_len` and `msg` per the contract.
         unsafe { message_out("", msg, msg_cap, msg_len) };
         let outcome = (|| {
+            // Each out-pointer given is 0 on every failure, a NULL one
+            // among them too (#312 adversarial M1).
+            // SAFETY: each is NULL or writable per the contract.
+            unsafe {
+                if !index.is_null() {
+                    index.write(0);
+                }
+                if !name_len.is_null() {
+                    name_len.write(0);
+                }
+            }
             if index.is_null() || name_buf.is_null() || name_len.is_null() {
                 return Err(Failure::new(
                     Error::NullPointer,
                     "index, name_buf or name_len is NULL",
                 ));
-            }
-            // SAFETY: non-null and writable per the contract.
-            unsafe {
-                index.write(0);
-                name_len.write(0);
             }
             if name_cap < MAX_PROFILE_NAME_LEN {
                 return Err(Failure::new(Error::InvalidArgument, "name_cap too small"));
@@ -811,14 +833,15 @@ pub unsafe extern "C" fn tessera_theme_list(
 /// The theme is not selected; set `appearance.theme` to the id for that.
 ///
 /// Returns `TESSERA_ERROR_INVALID_ARGUMENT` when `id_cap` is below
-/// `TESSERA_THEME_ID_LEN` (checked first; nothing is imported), the path
+/// `TESSERA_THEME_ID_LEN` (checked after the pointers; nothing is imported), the path
 /// is too long or not UTF-8, or the file is not a scheme the importers
 /// read; `TESSERA_ERROR_CONFLICT` when `themes/` has a file of that name
 /// already (it is kept); `TESSERA_ERROR_IO` when the file cannot be read
 /// (missing, not a regular file, larger than 1 MiB) or the theme not
 /// written; `TESSERA_ERROR_NULL_POINTER` for a `NULL` `app`, `id_buf` or
 /// `id_len`, or a `NULL` `path` with a non-zero length. A message goes to
-/// `msg` as for `tessera_config_set`.
+/// `msg` as for `tessera_config_set`; `*id_len` is 0 on every failure
+/// when `id_len` is not `NULL`.
 ///
 /// Any thread (the app's background write queue); it reads the scheme
 /// and writes `themes/`.
@@ -845,11 +868,13 @@ pub unsafe extern "C" fn tessera_theme_import(
         // SAFETY: `msg_len` and `msg` per the contract.
         unsafe { message_out("", msg, msg_cap, msg_len) };
         let outcome = (|| {
+            if !id_len.is_null() {
+                // SAFETY: non-null and writable per the contract.
+                unsafe { id_len.write(0) };
+            }
             if id_len.is_null() || id_buf.is_null() {
                 return Err(Failure::new(Error::NullPointer, "id_buf or id_len is NULL"));
             }
-            // SAFETY: non-null and writable per the contract.
-            unsafe { id_len.write(0) };
             if id_cap < THEME_ID_LEN {
                 return Err(Failure::new(Error::InvalidArgument, "id_cap too small"));
             }
