@@ -205,7 +205,14 @@ pub enum PtyError {
     /// The PTY pair could not be allocated.
     #[error("failed to open pty: {0}")]
     Open(String),
-    /// The child could not be started (program missing, not executable, …).
+    /// The child could not be started: the program is missing, a
+    /// directory or not executable, it is a `#!` script whose interpreter
+    /// is missing, not a regular file or not executable (a script saved
+    /// with CRLF line endings names `/bin/sh\r`), or an argument or
+    /// variable holds a NUL byte. All of these are found before the fork.
+    /// An `exec` that fails after the fork for any other reason is not
+    /// reported here: the spawn succeeds and the child ends at once (see
+    /// [`NativePty::spawn`]).
     #[error("failed to spawn {program}: {reason}")]
     Spawn {
         /// Program that was requested.
@@ -407,6 +414,15 @@ pub trait Pty: Send {
     /// Asks the child to hang up (`SIGHUP`), as closing a terminal window
     /// does. Shells save history and exit; the status arrives as an event.
     ///
+    /// The signal goes to the child's whole process group, as xterm and
+    /// kitty send it: the child and every process it started without job
+    /// control, so a grandchild the shell did not `exec` hangs up too. A
+    /// job a job-control shell moved to a process group of its own is not
+    /// signalled; it gets the kernel's `SIGHUP` only if it is the
+    /// terminal's foreground job when the shell exits, and an interactive
+    /// shell may hang up its jobs itself. Nothing is signalled once the
+    /// child has been reaped, so a recycled pid is never hit.
+    ///
     /// Hanging up ends the session's input first: input still queued is
     /// dropped, never delivered, and the writer abandons what it was
     /// writing before the signal is sent. Implementations may let a bounded
@@ -418,6 +434,11 @@ pub trait Pty: Send {
 
     /// Forcibly terminates the child (`SIGKILL`), ending the session's input
     /// first exactly as [`Pty::hangup`] does.
+    ///
+    /// Like [`Pty::hangup`], the signal goes to the child's process group,
+    /// so grandchildren that ignore `SIGHUP` die too; a job in a process
+    /// group of its own is not signalled, and a shell killed this way
+    /// cannot hang up its jobs, so such a job outlives the session.
     fn kill(&mut self) -> io::Result<()>;
 
     /// The job the child shell runs in the foreground, if any: the

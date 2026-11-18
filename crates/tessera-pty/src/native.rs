@@ -1,18 +1,23 @@
 //! [`NativePty`]: the `portable-pty` backed implementation of [`Pty`].
 
 use std::collections::VecDeque;
+use std::ffi::{CString, OsStr};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::BorrowedFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::panic;
+use std::path::{Component, Path, PathBuf};
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
 
+use nix::errno::Errno;
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use portable_pty::{CommandBuilder, MasterPty, native_pty_system};
@@ -48,8 +53,9 @@ const WRITE_SLICE: usize = 1024;
 /// bounded to [`WRITE_QUEUE_BYTES`] into the master so callers never block
 /// on a stalled child beyond that budget.
 ///
-/// Dropping a `NativePty` whose child is still running sends it `SIGHUP`,
-/// matching what closing a terminal window does. Nothing is ever written to
+/// Dropping a `NativePty` whose child is still running sends `SIGHUP` to
+/// the child's process group, matching what closing a terminal window
+/// does (see [`Pty::hangup`] for which processes that reaches). Nothing is ever written to
 /// the child's input on close: pending input is dropped (see
 /// [`Pty::hangup`]), and the writer is a plain duplicate of the master
 /// descriptor, so dropping it only closes a file. The reader thread outlives
@@ -158,17 +164,42 @@ impl NativePty {
     /// columns, [`PtyError::ArgumentsTooLong`] if the arguments and
     /// environment exceed what `execve(2)` accepts (checked before
     /// anything is opened or forked), [`PtyError::Open`] if no PTY could be
-    /// allocated, [`PtyError::Spawn`] if the program is missing or not
-    /// executable or an argument or variable contains a NUL byte,
-    /// [`PtyError::Io`] if the reader or writer side of the master or one
-    /// of their threads could not be set up.
+    /// allocated, [`PtyError::Spawn`] if the program is missing, a
+    /// directory or not executable, if it is a `#!` script whose
+    /// interpreter is missing, not a regular file or not executable
+    /// (checked before anything is opened or forked; a script with CRLF
+    /// line endings names `/bin/sh\r` and is refused with a hint), or if
+    /// an argument or variable contains a NUL byte, [`PtyError::Io`] if the
+    /// reader or writer side of the master or one of their threads could
+    /// not be set up.
     ///
     /// Every error leaves nothing behind: a child started before the
     /// failure is killed and reaped, and both ends of the PTY are closed.
+    ///
+    /// A file that is not a `#!` script and not a binary (`ENOEXEC`, such
+    /// as a text file without a `#!` line or an empty file) is not refused:
+    /// `execvp(3)` on macOS (and glibc) runs it with `/bin/sh`, so it
+    /// spawns and runs.
+    ///
+    /// `exec` failures this cannot see before the fork make a spawn that
+    /// returns `Ok` and a child that ends at once, because `portable-pty`
+    /// closes the pipe through which the standard library would report the
+    /// error: the child aborts and [`PtyEvent::Exited`] carries
+    /// `Signaled(SIGABRT)`. On macOS these are a fat binary without a
+    /// slice for this machine or a damaged Mach-O file (`EBADARCH`,
+    /// `EBADMACHO`), `ENOMEM`, and a file replaced between the check and
+    /// the `exec`. `ETXTBSY` never occurs on macOS (a binary open for
+    /// writing execs and is then killed, `Signaled(SIGKILL)`, as is a
+    /// binary that code signing rejects); on Linux it would abort like the
+    /// others.
     pub fn spawn(options: &SpawnOptions) -> Result<(Self, PtyEvents), PtyError> {
         check_size(options.size)?;
         let command = build_command(options);
         check_exec_size(&command, options)?;
+        check_interpreter(&command).map_err(|reason| PtyError::Spawn {
+            program: describe_program(&options.program),
+            reason,
+        })?;
         let pair = native_pty_system()
             .openpty(options.size.into())
             .map_err(|err| PtyError::Open(err.to_string()))?;
@@ -283,24 +314,45 @@ impl NativePty {
         }
     }
 
-    /// Delivers `signal` to the child unless it has been (or is being)
-    /// reaped. Holding the phase lock across `kill(2)` is what keeps the pid
-    /// from being recycled underneath us.
+    /// Delivers `signal` to the child's process group unless the child has
+    /// been (or is being) reaped. Holding the phase lock across
+    /// `killpg(2)` is what keeps the pid, and with it the group id, from
+    /// being recycled underneath us.
     fn signal_if_running(&self, signal: Signal) -> io::Result<()> {
         signal_child(&self.phase, self.pid, signal)
     }
 }
 
-/// Delivers `signal` to `pid` unless `phase` shows it has been (or is
-/// being) reaped; see [`NativePty::signal_if_running`].
+/// Delivers `signal` to the process group `pid` leads unless `phase` shows
+/// the child has been (or is being) reaped; see
+/// [`NativePty::signal_if_running`].
+///
+/// The child leads its own session and so its own process group
+/// (`portable-pty` calls `setsid(2)` before `exec`, and a session leader
+/// cannot move to another group), so the group holds the child and every
+/// process it started without job control. A job a job-control shell moved
+/// to a group of its own is not signalled (ADR 0018, amendment for #126).
+///
+/// While the phase lock shows `Running` the child is alive or a zombie, so
+/// its pid, which is the group id, cannot have been reused. `ESRCH` and
+/// `EPERM` count as success: macOS answers `EPERM` when no member could be
+/// signalled, which is what a group whose only member is the child's
+/// zombie gives (the reader thread may not have reaped it yet), and either
+/// way no process we may signal is left in the group. A pid of 0 or 1 is refused before any signal: `killpg(0)` would
+/// signal this process's own group, and 1 is `launchd` or `init`.
 fn signal_child(phase: &Mutex<Phase>, pid: u32, signal: Signal) -> io::Result<()> {
     let phase = phase.lock().unwrap_or_else(PoisonError::into_inner);
     if *phase != Phase::Running {
         return Ok(());
     }
     let pid = i32::try_from(pid)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pid out of range"))?;
-    signal::kill(Pid::from_raw(pid), signal).map_err(io::Error::from)
+        .ok()
+        .filter(|&pid| pid > 1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "pid out of range"))?;
+    match signal::killpg(Pid::from_raw(pid), signal) {
+        Ok(()) | Err(Errno::ESRCH | Errno::EPERM) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 /// A child that has not been handed to its reader thread yet. Dropping
@@ -460,6 +512,188 @@ impl ExecLimits {
 /// checked here and the kernel's own check stands.
 fn check_exec_size(command: &CommandBuilder, options: &SpawnOptions) -> Result<(), PtyError> {
     ExecLimits::system().check(exec_bytes(command, options))
+}
+
+/// Bytes of a file `execve(2)` reads to find its `#!` line: XNU's
+/// `IMG_SHSIZE`. A `#!` line that does not end within them is no `#!` line
+/// to the kernel.
+const SHEBANG_HEADER_BYTES: usize = 512;
+
+/// Refuses, with the reason for [`PtyError::Spawn`], a program that is a
+/// `#!` script whose interpreter `execve(2)` cannot run: missing, not a
+/// regular file or not executable, including the interpreter `/bin/sh\r`
+/// of a script saved with CRLF line endings.
+///
+/// Without this such a spawn would look successful: `portable-pty` closes
+/// the pipe the standard library reports `exec` errors through, so the
+/// child aborts after the fork (`SIGABRT`) instead of the spawn failing.
+/// Every other kind of file is left to `exec`. A file with no `#!` line
+/// (`ENOEXEC`) is not refused, because `execvp(3)` runs it with `/bin/sh`.
+///
+/// The program checked is the one `portable-pty` will run (see
+/// [`resolve_program`]); one it cannot resolve is left to `portable-pty`,
+/// which refuses it with its own reason. Best effort: the file can change
+/// between this check and the `exec`.
+fn check_interpreter(command: &CommandBuilder) -> Result<(), String> {
+    let Some(program) = resolve_program(command) else {
+        return Ok(());
+    };
+    let header = read_header(&program);
+    let Some(interpreter) = shebang_interpreter(&header) else {
+        return Ok(());
+    };
+    if interpreter.is_empty() {
+        // `#!` followed by a NUL: the kernel looks up an empty path.
+        return Err("its #! line names no interpreter (ENOENT)".to_owned());
+    }
+    let interpreter = Path::new(OsStr::from_bytes(interpreter));
+    let crlf = if interpreter.as_os_str().as_bytes().ends_with(b"\r") {
+        " (the script has CRLF line endings; save it with LF endings)"
+    } else {
+        ""
+    };
+    let path = if interpreter.is_absolute() {
+        interpreter.to_path_buf()
+    } else {
+        // The kernel resolves a relative interpreter against the child's
+        // working directory.
+        let Some(dir) = working_dir(command) else {
+            return Ok(());
+        };
+        dir.join(interpreter)
+    };
+    let problem = match std::fs::metadata(&path) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => "does not exist (ENOENT)".to_owned(),
+        Err(err) => format!("cannot be reached ({err})"),
+        Ok(meta) if !meta.is_file() => "is not a regular file (EACCES)".to_owned(),
+        Ok(_) if !executable(&path) => "is not executable (EACCES)".to_owned(),
+        Ok(_) => return Ok(()),
+    };
+    // Quoted and escaped (Debug), so a `\r` or a control byte shows.
+    let shown = String::from_utf8_lossy(interpreter.as_os_str().as_bytes());
+    Err(format!("its #! interpreter {shown:?} {problem}{crlf}"))
+}
+
+/// The file `portable-pty` will hand to `exec` for `command`, resolved the
+/// way its `CommandBuilder` does: the login shell is `$SHELL` if executable,
+/// else the password database's shell, else `/bin/sh`; an absolute program
+/// is used as given; a program starting with `./` or `../` is joined to the
+/// working directory; any other relative program is looked up in the
+/// command's `PATH` (the caller's environment over this process's), each
+/// entry joined to the working directory, taking the first candidate that
+/// is executable and not a directory. `None` where `portable-pty` would
+/// refuse the program itself or the working directory is unknown.
+fn resolve_program(command: &CommandBuilder) -> Option<PathBuf> {
+    if command.is_default_prog() {
+        return Some(PathBuf::from(command.get_shell()));
+    }
+    let exe = Path::new(command.get_argv().first()?);
+    if exe.is_absolute() {
+        return Some(exe.to_path_buf());
+    }
+    let dir = working_dir(command)?;
+    if matches!(
+        exe.components().next(),
+        Some(Component::CurDir | Component::ParentDir)
+    ) {
+        return Some(dir.join(exe));
+    }
+    std::env::split_paths(command.get_env("PATH")?)
+        .map(|entry| dir.join(entry).join(exe))
+        .find(|candidate| !candidate.is_dir() && executable(candidate))
+}
+
+/// The child's working directory as `portable-pty` picks it: the requested
+/// directory if it is one, else `$HOME` (from the command's environment).
+/// `None` when neither is known here (`portable-pty` then asks the password
+/// database).
+fn working_dir(command: &CommandBuilder) -> Option<PathBuf> {
+    command
+        .get_cwd()
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_dir())
+        .or_else(|| {
+            command
+                .get_env("HOME")
+                .and_then(OsStr::to_str)
+                .map(PathBuf::from)
+        })
+}
+
+/// `access(path, X_OK)`: whether this process's real user may execute
+/// `path`, as `portable-pty` asks before it spawns.
+fn executable(path: &Path) -> bool {
+    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `path` is a NUL-terminated string that outlives the call, and
+    // `access(2)` only reads it.
+    unsafe { nix::libc::access(path.as_ptr(), nix::libc::X_OK) == 0 }
+}
+
+/// The first [`SHEBANG_HEADER_BYTES`] of `program`, zero-filled past its
+/// end as the kernel's header buffer is. All zeros (no `#!`) for anything
+/// that is not a regular file or cannot be opened and read: `exec` refuses
+/// a non-regular file itself, and checking the type first means a FIFO or
+/// device named as the program is never opened. The file is opened
+/// read-only, non-blocking and without becoming a controlling terminal,
+/// and symbolic links are followed, as `exec` follows them.
+fn read_header(program: &Path) -> [u8; SHEBANG_HEADER_BYTES] {
+    let mut header = [0u8; SHEBANG_HEADER_BYTES];
+    if !std::fs::metadata(program).is_ok_and(|meta| meta.is_file()) {
+        return header;
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY)
+        .open(program)
+    else {
+        return header;
+    };
+    let mut filled = 0;
+    while filled < header.len() {
+        match file.read(&mut header[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return [0u8; SHEBANG_HEADER_BYTES],
+        }
+    }
+    header
+}
+
+/// The interpreter a `#!` line names, parsed as XNU's `exec_shell_imgact`
+/// parses it, or `None` where `execve(2)` would not treat the header as a
+/// `#!` script (it then fails with `ENOEXEC`, and `execvp(3)` runs the file
+/// with `/bin/sh`).
+///
+/// After `#!`, spaces and tabs are skipped; the line ends at the first `\n`
+/// or `#`, which must come within the header (an end right after `#!`, or
+/// none at all, is `ENOEXEC`); the interpreter runs from the first
+/// non-blank byte to the next space or tab or the line's end, and stops at
+/// a NUL as the kernel's C string does. A `\r` is part of the name, which
+/// is how a CRLF script fails.
+fn shebang_interpreter(header: &[u8]) -> Option<&[u8]> {
+    let is_end = |byte: u8| byte == b'\n' || byte == b'#';
+    let is_blank = |byte: u8| byte == b' ' || byte == b'\t';
+    let line = header.strip_prefix(b"#!")?;
+    let start = line.iter().position(|&byte| !is_blank(byte))?;
+    let line = &line[start..];
+    let end = line.iter().position(|&byte| is_end(byte))?;
+    if end == 0 {
+        return None;
+    }
+    let line = &line[..end];
+    let token = line
+        .iter()
+        .position(|&byte| is_blank(byte))
+        .map_or(line, |blank| &line[..blank]);
+    Some(
+        token
+            .iter()
+            .position(|&byte| byte == 0)
+            .map_or(token, |nul| &token[..nul]),
+    )
 }
 
 /// `sysconf(_SC_ARG_MAX)`: the most bytes of arguments and environment
@@ -1244,6 +1478,119 @@ mod tests {
             Err(PtyError::ArgumentsTooLong { bytes, max: limit }) if bytes == max + 1 && limit == max
         ));
         assert_eq!(fault::take_forked(), None, "nothing was forked");
+    }
+
+    #[test]
+    fn shebang_lines_parse_as_the_kernel_parses_them() {
+        let parse = |header: &[u8]| {
+            let mut full = [0u8; SHEBANG_HEADER_BYTES];
+            let len = header.len().min(SHEBANG_HEADER_BYTES);
+            full[..len].copy_from_slice(&header[..len]);
+            shebang_interpreter(&full).map(<[u8]>::to_vec)
+        };
+        let some = |name: &str| Some(name.as_bytes().to_vec());
+        assert_eq!(parse(b"#!/bin/sh\n"), some("/bin/sh"));
+        assert_eq!(parse(b"#! \t/bin/sh -e x\n"), some("/bin/sh"));
+        assert_eq!(parse(b"#!/bin/sh\r\n"), some("/bin/sh\r"));
+        assert_eq!(parse(b"#!/bin/sh#x\n"), some("/bin/sh"));
+        assert_eq!(parse(b"#!/bin/sh   \n"), some("/bin/sh"));
+        assert_eq!(parse(b"#!/bin/sh\0junk\n"), some("/bin/sh"));
+        assert_eq!(parse(b"#!\0/x\n"), some(""));
+        assert_eq!(parse(b"#!sh\n"), some("sh"));
+        // Not a `#!` line: `ENOEXEC`, which `execvp` runs with `/bin/sh`.
+        for header in [
+            &b""[..],
+            b"#!",
+            b"#! \n",
+            b"#!#/bin/sh\n",
+            b"#!/bin/sh",
+            b" #!/bin/sh\n",
+            b"\xef\xbb\xbf#!/bin/sh\n",
+            b"echo hi\n",
+        ] {
+            assert_eq!(parse(header), None, "{:?}", String::from_utf8_lossy(header));
+        }
+        // The line must end within the 512-byte header.
+        let mut long = b"#!/bin/sh".to_vec();
+        long.resize(SHEBANG_HEADER_BYTES - 1, b' ');
+        long.push(b'\n');
+        assert_eq!(parse(&long), some("/bin/sh"));
+        long.insert(9, b' ');
+        assert_eq!(parse(&long), None, "the line end moved past the header");
+    }
+
+    #[test]
+    fn the_header_read_stops_at_512_bytes() {
+        let dir = std::env::temp_dir().join(format!("tessera-pty-header-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big");
+        let mut bytes = b"#!/bin/sh".to_vec();
+        bytes.resize(4096, b'x');
+        std::fs::write(&path, &bytes).unwrap();
+        let header = read_header(&path);
+        assert_eq!(&header[..], &bytes[..SHEBANG_HEADER_BYTES]);
+        // A short file is zero-filled; a directory reads as no header.
+        std::fs::write(&path, b"#!/x\n").unwrap();
+        let header = read_header(&path);
+        assert_eq!(&header[..5], b"#!/x\n");
+        assert!(header[5..].iter().all(|&byte| byte == 0));
+        assert!(read_header(&dir).iter().all(|&byte| byte == 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn signalling_refuses_pids_that_name_no_child_of_ours() {
+        let phase = Mutex::new(Phase::Running);
+        // `killpg(0)` would signal this process's own group and `killpg(1)`
+        // launchd's: refused before any signal. (1 is the one probed: as a
+        // non-root user `killpg(1, 0)` fails with `EPERM`, which counts as
+        // success, so a missing guard shows here without harm.)
+        for pid in [1, u32::MAX] {
+            let err = signal_child(&phase, pid, Signal::SIGHUP).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "pid {pid}");
+        }
+        assert!(signal_child(&Mutex::new(Phase::Reaping), 1, Signal::SIGHUP).is_ok());
+    }
+
+    /// The `ps` state letters of `pid` (`Z` for a zombie).
+    fn process_state(pid: u32) -> String {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("run ps");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    #[test]
+    fn signalling_a_child_that_exited_but_is_not_reaped_succeeds() {
+        // The group's only member is the child's zombie: macOS `killpg`
+        // fails with `EPERM` there, where `kill` on the pid succeeded. The
+        // reader thread may not have reaped the child yet when a close
+        // signals it, so this must not be an error.
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("/usr/bin/true")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        while !process_state(child.id()).starts_with('Z') {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the child never became a zombie"
+            );
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            signal::killpg(Pid::from_raw(i32::try_from(child.id()).unwrap()), None),
+            Err(Errno::EPERM),
+            "macOS no longer answers EPERM for a zombie-only group"
+        );
+        let phase = Mutex::new(Phase::Running);
+        for signal in [Signal::SIGHUP, Signal::SIGKILL] {
+            signal_child(&phase, child.id(), signal).unwrap();
+        }
+        child.wait().unwrap();
     }
 
     #[test]

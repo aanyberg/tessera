@@ -452,3 +452,178 @@ fn child_gets_default_signal_dispositions() {
     let status = exit_before(&events, Instant::now() + Duration::from_secs(1));
     assert_eq!(status, Some(ExitStatus::Signaled(Signal::SIGINT as i32)));
 }
+
+/// A grandchild a test started, killed on drop unless it was seen gone, so
+/// a failing test leaves no `sleep` behind.
+struct Grandchild {
+    pid: Pid,
+    gone: bool,
+}
+
+impl Grandchild {
+    /// Waits for the child to print `GC=<pid>` and returns that process.
+    fn announced(events: &PtyEvents) -> Self {
+        let deadline = Instant::now() + TIMEOUT;
+        let mut seen = String::new();
+        loop {
+            if let Some(rest) = seen.split("GC=").nth(1)
+                && let Some(end) = rest.find(['\r', '\n'])
+            {
+                let pid = rest[..end].parse().expect("a pid after GC=");
+                return Self {
+                    pid: Pid::from_raw(pid),
+                    gone: false,
+                };
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match events.recv_timeout(remaining) {
+                Ok(PtyEvent::Output(bytes)) => seen.push_str(&String::from_utf8_lossy(&bytes)),
+                Ok(PtyEvent::Exited(status)) => panic!("child exited ({status:?}): {seen:?}"),
+                Err(err) => panic!("no GC= line ({err}): {seen:?}"),
+            }
+        }
+    }
+
+    /// Waits for the grandchild to be gone (reaped: a zombie still answers
+    /// `kill(pid, 0)`) and asserts that it went before its `sleep` could
+    /// have ended by itself. The wait is counted in 10 ms polls rather than
+    /// wall time, as a background-QoS stall stretches the polls as much as
+    /// it delays the processes polled, and the wall-time bound keeps a
+    /// stall that long from passing a grandchild that was never signalled.
+    fn assert_gone(&mut self, after: &str) {
+        let started = Instant::now();
+        for _ in 0..GONE_POLLS {
+            if signal::kill(self.pid, None) == Err(Errno::ESRCH) {
+                self.gone = true;
+                let took = started.elapsed();
+                assert!(
+                    took < SLEEP_ENDS,
+                    "the grandchild {} went only after {took:?}, when its sleep had ended",
+                    self.pid
+                );
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the grandchild {} outlived {after}", self.pid);
+    }
+
+    /// Waits until the grandchild runs `sleep`. Until it has exec'd it is
+    /// a copy of the shell with the shell's SIGHUP handler, which would
+    /// swallow a hangup sent in that window.
+    fn wait_for_exec(&self) {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let ps = std::process::Command::new("ps")
+                .args(["-o", "comm=", "-p", &self.pid.to_string()])
+                .output()
+                .unwrap();
+            if String::from_utf8_lossy(&ps.stdout)
+                .trim()
+                .ends_with("sleep")
+            {
+                return;
+            }
+            assert!(Instant::now() < deadline, "the grandchild never ran sleep");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn alive(&self) -> bool {
+        signal::kill(self.pid, None).is_ok()
+    }
+}
+
+impl Drop for Grandchild {
+    fn drop(&mut self) {
+        if !self.gone {
+            let _ = signal::kill(self.pid, Signal::SIGKILL);
+        }
+    }
+}
+
+/// Spawns `sh -c script` and returns the session with the grandchild it
+/// announces, which must share the child's process group.
+fn spawn_with_grandchild(script: &str) -> (NativePty, PtyEvents, Grandchild) {
+    let options = SpawnOptions::command("/bin/sh", "close-test").args(["-c", script]);
+    let (pty, events) = NativePty::spawn(&options).unwrap();
+    let grandchild = Grandchild::announced(&events);
+    grandchild.wait_for_exec();
+    (pty, events, grandchild)
+}
+
+/// Polls of 10 ms (nominally 10 s) a signalled grandchild may take to be
+/// reaped: generous, so a loaded machine does not flake the tests.
+const GONE_POLLS: u32 = 1000;
+/// When the grandchildren's `sleep 97` would end unsignalled, less a
+/// margin: a grandchild gone only later proves nothing.
+const SLEEP_ENDS: Duration = Duration::from_secs(90);
+
+#[test]
+fn kill_ends_a_grandchild_that_ignores_sighup() {
+    // `kill` must reach the whole process group, not just the shell: the
+    // backgrounded `sleep` ignores SIGHUP (the disposition survives exec),
+    // so neither the shell's death nor the terminal's revoke ends it.
+    let (mut pty, events, mut grandchild) =
+        spawn_with_grandchild("trap '' HUP; sleep 97 & echo GC=$!; wait");
+    let child = Pid::from_raw(i32::try_from(pty.child_pid().unwrap()).unwrap());
+    assert_eq!(nix::unistd::getpgid(Some(grandchild.pid)), Ok(child));
+    pty.kill().unwrap();
+    assert_eq!(
+        exit_before(&events, Instant::now() + TIMEOUT),
+        Some(ExitStatus::Signaled(Signal::SIGKILL as i32))
+    );
+    grandchild.assert_gone("kill");
+}
+
+#[test]
+fn hangup_reaches_a_grandchild_of_a_shell_that_survives_it() {
+    // The shell handles SIGHUP and keeps running, so the terminal is never
+    // revoked and the kernel sends the grandchild nothing: only a hangup
+    // of the whole group ends the `sleep`, which the shell then reaps.
+    // The spec's script loops on `wait`, which spins once the grandchild is
+    // reaped and outlives a test binary killed mid-test; this one waits
+    // only while the grandchild lives, then turns into a bounded `sleep`.
+    let (mut pty, events, mut grandchild) = spawn_with_grandchild(
+        "trap : HUP; sleep 97 & echo GC=$!; while kill -0 $! 2>/dev/null; do wait; done; exec sleep 96",
+    );
+    pty.hangup().unwrap();
+    grandchild.assert_gone("hangup");
+    assert!(
+        pty.exit_status().is_none() && !reaped(pty.child_pid().unwrap()),
+        "the shell handles SIGHUP and must still be running"
+    );
+    pty.kill().unwrap();
+    assert_eq!(
+        exit_before(&events, Instant::now() + TIMEOUT),
+        Some(ExitStatus::Signaled(Signal::SIGKILL as i32))
+    );
+}
+
+#[test]
+fn a_job_in_its_own_process_group_outlives_the_close() {
+    // ADR 0018 (#126): only the child's own process group is signalled. A
+    // job a job-control shell moved to a group of its own is not, and it
+    // is not the terminal's foreground group when the shell dies, so the
+    // kernel does not hang it up either.
+    for close in [Pty::hangup, Pty::kill] {
+        let (mut pty, events, grandchild) =
+            spawn_with_grandchild("set -m; sleep 98 & echo GC=$!; wait");
+        assert_eq!(
+            nix::unistd::getpgid(Some(grandchild.pid)),
+            Ok(grandchild.pid),
+            "the job leads its own group"
+        );
+        close(&mut pty).unwrap();
+        assert!(
+            exit_before(&events, Instant::now() + TIMEOUT).is_some(),
+            "the shell did not exit"
+        );
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            grandchild.alive(),
+            "the job {} in its own group was signalled",
+            grandchild.pid
+        );
+    }
+}
