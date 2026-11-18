@@ -95,15 +95,19 @@ pub unsafe extern "C" fn tessera_session_scroll_to_prompt(
 
 /// Selects the output of session `session_id`'s last finished command:
 /// the lines from its first output line to the line before the next
-/// prompt, without the trailing blank lines, and stores in `*selected`
-/// whether it selected anything. The view scrolls to the output's start
+/// prompt, without the trailing blank lines (and, when its last line had
+/// no newline, without the shell's end-of-line mark the shell padded it
+/// with: zsh's reverse-video `%`, fish's dim `⏎`), and stores in
+/// `*selected` whether it selected anything. The view scrolls to the output's start
 /// when it is not visible. Copy (`tessera_session_selection_text`) then
 /// gives its text.
 ///
 /// A command still running is skipped. Nothing is selected, the earlier
 /// selection stays and `*selected` is `false` when the last finished
 /// command printed nothing, when its output's first line has left the
-/// scrollback, without OSC 133 marks, and on the alternate screen.
+/// scrollback or was erased, without OSC 133 marks, and on the alternate
+/// screen: exactly when `tessera_session_has_command_output` reports
+/// `false`.
 ///
 /// Returns `TESSERA_ERROR_NULL_POINTER` if `app` or `selected` is `NULL`,
 /// `TESSERA_ERROR_SESSION_NOT_FOUND` if the id is not a live session. On
@@ -132,11 +136,11 @@ pub unsafe extern "C" fn tessera_session_select_last_output(
 
 /// Stores in `*out` whether session `session_id` holds a finished command
 /// whose output Select Last Output may select (to enable its menu item):
-/// one that printed at least one line still in the scrollback. It reads
-/// the session's command records only, without searching the history, so
-/// it is cheap enough for every menu validation; when it is `true`,
-/// `tessera_session_select_last_output` can still find nothing to select
-/// (for example after a resize moved the lines).
+/// `true` exactly when `tessera_session_select_last_output` would select
+/// something now (one function decides both). It reads the lines from the
+/// bottom up to that output on each call, in short lock holds (none in a
+/// session that never reported a prompt): call it when a menu is
+/// validated, not per frame.
 ///
 /// Returns `TESSERA_ERROR_NULL_POINTER` if `app` or `out` is `NULL`,
 /// `TESSERA_ERROR_SESSION_NOT_FOUND` if the id is not a live session. On

@@ -1314,14 +1314,17 @@ impl App {
 
     /// Selects the output of session `id`'s last finished command (Select
     /// Last Output, ADR 0039), as the shell's OSC 133 marks bound it: from
-    /// the line of its `C` mark to the last non-blank cell before the next
-    /// prompt (`A`), a command still running skipped. Scrolls the view so
-    /// the start of the output is visible. Returns whether anything was
-    /// selected: `false` (the selection unchanged) when the last command
-    /// printed nothing, its output left the history or was erased (a
-    /// screen clear, a deleted first line), the shell sent no
-    /// marks, on the alternate screen, or when its start is more than
-    /// [`MAX_PROMPT_SCAN_LINES`] lines up.
+    /// the line of its `C` mark to the last cell with text before the next
+    /// prompt (`A`), a command still running skipped. A last line left
+    /// without a newline, which the shell padded into the prompt's row,
+    /// ends before the shell's end-of-line mark (zsh's reverse-video `%`,
+    /// fish's dim `⏎`; #334). Scrolls the view so the start of the output
+    /// is visible. Returns whether anything was selected: `false` (the
+    /// selection unchanged) exactly when [`App::has_command_output`] is
+    /// `false`: the last command printed nothing, its output left the
+    /// history or was erased (a screen clear, a deleted first line), the
+    /// shell sent no marks, on the alternate screen, or when its start is
+    /// more than [`MAX_PROMPT_SCAN_LINES`] lines up.
     ///
     /// # Errors
     ///
@@ -1330,12 +1333,13 @@ impl App {
         Ok(commands::select_command_output(&*self.session(id)?))
     }
 
-    /// Whether session `id`'s last finished command printed output that is
-    /// still there, as its records and the mark on its first line tell (no
-    /// scan): what a frontend enables Select Last Output for. `false` on
-    /// the alternate screen; `true` for
-    /// a command recorded before a resize, whose lines are unknown, so
-    /// [`App::select_command_output`] may still find nothing.
+    /// Whether [`App::select_command_output`] would select something now:
+    /// both read the grid through one function, so the menu item a
+    /// frontend enables with this and the command never disagree (#334).
+    /// Reads the lines from the bottom up to the last command's output on
+    /// each call (at most [`MAX_PROMPT_SCAN_LINES`], in short lock holds;
+    /// none in a session that never reported a prompt): call it when the
+    /// menu opens, not per frame.
     ///
     /// # Errors
     ///

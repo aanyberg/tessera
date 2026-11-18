@@ -632,8 +632,60 @@ fn s06_output_with_blank_rows() {
     assert_eq!(select(&app, id), (true, Some("a\n\nb".to_owned())));
 }
 
-/// zsh's `PROMPT_SP`: `foo%` and blanks soft-wrap into the prompt row.
-/// The same text is selected after a resize there and back.
+/// zsh's default `PROMPT_EOL_MARK`, `%B%S%#%s%b`: a bold reverse-video
+/// `%` (`#` for root).
+const ZSH_EOL_MARK: &str = "\x1b[1m\x1b[7m%\x1b[27m\x1b[22m";
+
+/// zsh's `PROMPT_SP` after output `text` left without a newline in a
+/// `cols`-column session (`text` and `mark` one column each per char): the
+/// end-of-line `mark`, padding to the row's end and one blank more, which
+/// soft-wraps the row into the next, then `CR` and the prompt (whose `D`
+/// precmd sends after `PROMPT_SP`).
+fn zsh_prompt_sp(text: &str, mark: &str, cols: usize) -> String {
+    let pad = cols - width(text) - 1;
+    format!(
+        "{}{text}{mark}{} \r{}",
+        m("C"),
+        " ".repeat(pad),
+        prompt(Some(0), "")
+    )
+}
+
+/// The columns `text` takes: its chars outside `CSI` sequences.
+fn width(text: &str) -> usize {
+    let mut in_csi = false;
+    text.chars()
+        .filter(|&c| {
+            if c == '\x1b' {
+                in_csi = true;
+            } else if in_csi {
+                in_csi = !c.is_ascii_alphabetic();
+            } else {
+                return true;
+            }
+            false
+        })
+        .count()
+}
+
+/// fish's omitted-newline handling after output `text` (left without a
+/// newline, or not), our fish script's `D` first (`fish_postexec`, on the output's
+/// row): a dim `⏎` and enough blanks to wrap the row, then `CR`, the mark
+/// and a blank over the new row's start, `CR`, `EL`, the prompt.
+fn fish_abandon_line(text: &str, cols: usize) -> String {
+    format!(
+        "{}{text}{}\x1b[2m\u{23ce}\x1b[m{}\r\u{23ce} \r\x1b[K{}$ {}",
+        m("C"),
+        m("D;0"),
+        " ".repeat(cols - 1),
+        m("A"),
+        m("B"),
+    )
+}
+
+/// zsh's `PROMPT_SP`: `foo`, its end-of-line mark and blanks soft-wrap into
+/// the prompt row; the mark is the shell's, not the output's, and left out
+/// (#334). The same text is selected after a resize there and back.
 #[test]
 fn s07_output_without_trailing_newline_zsh_prompt_sp() {
     let app = app();
@@ -643,16 +695,162 @@ fn s07_output_without_trailing_newline_zsh_prompt_sp() {
         id,
         format!("{}\r\n", prompt(None, "printf foo")).as_bytes(),
     );
-    let sp = format!("{}foo%{} \r{}", m("C"), " ".repeat(16), prompt(Some(0), ""));
-    feed(&app, id, sp.as_bytes());
+    feed(&app, id, zsh_prompt_sp("foo", ZSH_EOL_MARK, 20).as_bytes());
     let wrapped = app
         .with_terminal(id, |t| t.grid().logical_line(1).unwrap().wrapped)
         .unwrap();
     assert!(wrapped);
-    assert_eq!(select(&app, id), (true, Some("foo%".to_owned())));
+    assert_eq!(select(&app, id), (true, Some("foo".to_owned())));
+    assert!(app.has_command_output(id).unwrap());
     app.resize(id, PtySize::new(4, 37)).unwrap();
     app.resize(id, PtySize::new(4, 20)).unwrap();
+    assert_eq!(select(&app, id), (true, Some("foo".to_owned())));
+    assert!(app.has_command_output(id).unwrap());
+}
+
+/// An end-of-line mark drawn without reverse video or dim (a custom
+/// `PROMPT_EOL_MARK='%%'`) cannot be told from output: it is kept, a
+/// documented limit (ADR 0039, #334).
+#[test]
+fn s07_an_unstyled_end_of_line_mark_is_kept() {
+    let app = app();
+    let id = session(&app, 4, 20, 100);
+    feed(
+        &app,
+        id,
+        format!("{}\r\n", prompt(None, "printf foo")).as_bytes(),
+    );
+    feed(&app, id, zsh_prompt_sp("foo", "%", 20).as_bytes());
     assert_eq!(select(&app, id), (true, Some("foo%".to_owned())));
+    assert!(app.has_command_output(id).unwrap());
+}
+
+/// zsh-style `printf abc` (#334 1): `abc` without the bold reverse-video
+/// `%`, also when the output's text ends in reverse video itself; only the
+/// trailing run of marked cells goes.
+#[test]
+fn zsh_printf_abc_selects_abc_without_the_end_of_line_mark() {
+    for (text, expected) in [
+        ("abc", "abc"),
+        ("ab\x1b[7mc\x1b[27m", "ab"),
+        ("a\x1b[7mb\x1b[27mc", "abc"),
+    ] {
+        let app = app();
+        let id = session(&app, 4, 20, 100);
+        feed(
+            &app,
+            id,
+            format!("{}\r\n", prompt(None, "printf abc")).as_bytes(),
+        );
+        feed(&app, id, zsh_prompt_sp(text, ZSH_EOL_MARK, 20).as_bytes());
+        assert_eq!(
+            select(&app, id),
+            (true, Some(expected.to_owned())),
+            "{text:?}"
+        );
+        assert!(app.has_command_output(id).unwrap(), "{text:?}");
+    }
+}
+
+/// Reverse video on a last output line that ends with a newline is the
+/// output's own: kept, also on a soft-wrapped row whose continuation holds
+/// only blanks (it does not wrap into the prompt's row).
+#[test]
+fn reverse_video_output_with_a_newline_is_kept() {
+    let x20 = "x".repeat(20);
+    for (output, expected) in [
+        ("ok \x1b[7mWARN\x1b[27m".to_owned(), "ok WARN"),
+        (format!("\x1b[7m{x20}\x1b[27m  "), x20.as_str()),
+    ] {
+        let app = app();
+        let id = session(&app, 4, 20, 100);
+        feed(&app, id, format!("{}\r\n", prompt(None, "x")).as_bytes());
+        feed(
+            &app,
+            id,
+            format!("{}{output}\r\n{}", m("C"), prompt(Some(0), "")).as_bytes(),
+        );
+        assert_eq!(
+            select(&app, id),
+            (true, Some(expected.to_owned())),
+            "{output:?}"
+        );
+        assert!(app.has_command_output(id).unwrap(), "{output:?}");
+    }
+}
+
+/// fish-style `printf abc` (#334 1, 2): `D` on the output's row, a dim `⏎`
+/// wrapping it into the prompt's: `abc` selected, and the menu agrees.
+#[test]
+fn fish_printf_abc_selects_abc_and_has_output() {
+    let app = app();
+    let id = session(&app, 4, 20, 100);
+    feed(
+        &app,
+        id,
+        format!("{}$ {}printf abc\r\n", m("A"), m("B")).as_bytes(),
+    );
+    feed(&app, id, fish_abandon_line("abc", 20).as_bytes());
+    let (wrapped, row) = app
+        .with_terminal(id, |t| {
+            let line = t.grid().logical_line(1).unwrap();
+            (
+                line.wrapped,
+                line.cells.iter().map(|c| c.ch).collect::<String>(),
+            )
+        })
+        .unwrap();
+    assert!(wrapped);
+    assert!(row.starts_with("abc\u{23ce}"), "{row:?}");
+    assert!(app.has_command_output(id).unwrap());
+    assert_eq!(select(&app, id), (true, Some("abc".to_owned())));
+    // A fish command that ends its output with a newline: the abandon-line
+    // blanks are erased, nothing to leave out.
+    feed(&app, id, b"echo d\r\n");
+    feed(&app, id, fish_abandon_line("d\r\n", 20).as_bytes());
+    assert_eq!(select(&app, id), (true, Some("d".to_owned())));
+    assert!(app.has_command_output(id).unwrap());
+}
+
+/// zsh `printf abc`, then 80 -> 50 -> 120 columns (#334 3). At 50 the
+/// padded row re-wraps into two, the second with the prompt: `abc` still
+/// soft-wraps into the prompt's row, both report it. At 120 the
+/// padded output row and the prompt's re-wrap into one row, `C D A B` on
+/// it. Rows are read whole and marks hold no column, so the output cannot
+/// be told from the prompt: like a command that printed nothing, both
+/// report nothing (zsh's redraw of the prompt after the resize, `CR EL`,
+/// erases that row anyway).
+#[test]
+fn zsh_printf_abc_then_resizes_80_50_120_agree() {
+    for redraw in [false, true] {
+        let app = app();
+        let id = session(&app, 6, 80, 100);
+        feed(
+            &app,
+            id,
+            format!("{}\r\n", prompt(None, "printf abc")).as_bytes(),
+        );
+        feed(&app, id, zsh_prompt_sp("abc", ZSH_EOL_MARK, 80).as_bytes());
+        assert_eq!(select(&app, id), (true, Some("abc".to_owned())));
+        app.select_clear(id).unwrap();
+        app.resize(id, PtySize::new(6, 50)).unwrap();
+        if redraw {
+            redraw_prompt(&app, id);
+        }
+        assert_eq!(
+            select(&app, id),
+            (true, Some("abc".to_owned())),
+            "50 {redraw}"
+        );
+        assert!(app.has_command_output(id).unwrap(), "50 {redraw}");
+        app.select_clear(id).unwrap();
+        app.resize(id, PtySize::new(6, 120)).unwrap();
+        if redraw {
+            redraw_prompt(&app, id);
+        }
+        assert_eq!(select(&app, id), (false, None), "120 {redraw}");
+        assert!(!app.has_command_output(id).unwrap(), "120 {redraw}");
+    }
 }
 
 /// D-EVICTED-OUTPUT: the output's first line left the history.
@@ -741,7 +939,12 @@ fn s11_alt_screen_and_scrolled_view() {
 /// `seq 1 3`, `echo b`, `echo d` in a 4x20 session, the live prompt
 /// last.
 fn three_commands(app: &App) -> SessionId {
-    let id = session(app, 4, 20, 100);
+    three_commands_in(app, 4)
+}
+
+/// [`three_commands`] in a session of `rows` rows.
+fn three_commands_in(app: &App, rows: u16) -> SessionId {
+    let id = session(app, rows, 20, 100);
     for chunk in [
         format!("{}\r\n", prompt(None, "seq 1 3")),
         format!("{}1\r\n2\r\n3\r\n", m("C")),
@@ -782,6 +985,74 @@ fn select_after_a_screen_clear_offers_no_older_output() {
     assert_eq!(select(&app, id), (false, None));
     assert_eq!(app.scroll_offset(id).unwrap(), 0, "the view stays");
     assert!(!app.has_command_output(id).unwrap());
+}
+
+/// A whole-screen clear in the same chunk as the newest command's `C`
+/// (`clear` or `tput clear` as the command, or Ctrl-L typed ahead of the
+/// next prompt): the terminal reports the chunk's clear before its marks,
+/// so the log sees that `C` after the clear that erased it. The older
+/// `seq 1 3` output is not offered instead (#334 B1). The next command's
+/// output is selected again.
+#[test]
+fn a_clear_in_the_chunk_of_the_last_c_offers_no_older_output() {
+    let clear = format!("\x1b[H\x1b[2J{}", prompt(None, ""));
+    let seq = [
+        format!("{}\r\n", prompt(None, "seq 1 3")),
+        format!("{}1\r\n2\r\n3\r\n", m("C")),
+    ];
+    let typed_ahead = vec![
+        seq[0].clone(),
+        seq[1].clone(),
+        format!(
+            "{}\r\n{}d\r\n{}{clear}",
+            prompt(Some(0), "echo d"),
+            m("C"),
+            prompt(Some(0), "")
+        ),
+    ];
+    let tput = vec![
+        seq[0].clone(),
+        seq[1].clone(),
+        format!("{}\r\n", prompt(Some(0), "tput clear")),
+        format!("{}\x1b[H\x1b[2J", m("C")),
+        prompt(Some(0), ""),
+    ];
+    let one_chunk = vec![tput.concat()];
+    for (chunks, what) in [
+        (typed_ahead, "Ctrl-L typed ahead"),
+        (tput, "`tput clear`, its `C` and the clear in one chunk"),
+        (one_chunk, "all in one chunk"),
+    ] {
+        let app = app();
+        let id = session(&app, 4, 20, 100);
+        for chunk in &chunks {
+            feed(&app, id, chunk.as_bytes());
+        }
+        assert!(!app.has_command_output(id).unwrap(), "{what}");
+        assert_eq!(select(&app, id), (false, None), "{what}");
+        feed(&app, id, b"echo e\r\n");
+        feed(
+            &app,
+            id,
+            format!("{}e\r\n{}", m("C"), prompt(Some(0), "")).as_bytes(),
+        );
+        assert_eq!(
+            select(&app, id),
+            (true, Some("e".to_owned())),
+            "{what}: next"
+        );
+        assert!(app.has_command_output(id).unwrap(), "{what}: next");
+        // Its `C` came after the next prompt's `A`, so after the clear: a
+        // DL above it moves it, and it is still offered.
+        app.select_clear(id).unwrap();
+        feed(&app, id, b"\x1b7\x1b[1H\x1b[M\x1b8");
+        assert_eq!(
+            select(&app, id),
+            (true, Some("e".to_owned())),
+            "{what}: moved"
+        );
+        assert!(app.has_command_output(id).unwrap(), "{what}: moved");
+    }
 }
 
 /// The same with a resize before the clear: the newest command's `C` is
@@ -855,6 +1126,71 @@ fn select_after_the_first_output_row_was_deleted_offers_no_older_output() {
     }
     assert_eq!(select(&app, id), (false, None));
     assert!(!app.has_command_output(id).unwrap());
+}
+
+/// Edits the log does not see move the rows above or around the last
+/// output (#334 4): in [`three_commands_in`] 10 rows, `echo d`'s `C` on
+/// row 7 and the live prompt on row 8, each edit (cursor saved and
+/// restored around it) leaves `d` on the screen, and both report it.
+#[test]
+fn edits_above_the_output_keep_it_selectable() {
+    for (edit, what) in [
+        ("\x1b[1H\x1b[M", "DL at the top"),
+        ("\x1b[3H\x1b[2M", "DL of two rows inside an older output"),
+        ("\x1b[1H\x1b[L", "IL at the top"),
+        ("\x1b[T", "SD"),
+        ("\x1b[S", "SU"),
+        (
+            "\x1b[2;9r\x1b[9H\n\x1b[r",
+            "a scroll region from row 2 scrolled up",
+        ),
+        (
+            "\x1b[2;10r\x1b[2H\x1bM\x1b[r",
+            "a scroll region from row 2 scrolled down",
+        ),
+        (
+            "\x1b[3;10r\x1b[10H\n\n\x1b[r",
+            "a scroll region scrolled twice",
+        ),
+    ] {
+        let app = app();
+        let id = three_commands_in(&app, 10);
+        assert_eq!(
+            select(&app, id),
+            (true, Some("d".to_owned())),
+            "before {what}"
+        );
+        app.select_clear(id).unwrap();
+        feed(&app, id, format!("\x1b7{edit}\x1b8").as_bytes());
+        assert_eq!(select(&app, id), (true, Some("d".to_owned())), "{what}");
+        assert!(app.has_command_output(id).unwrap(), "{what}");
+    }
+}
+
+/// An edit the log does not see that takes the last output's `C` away
+/// (#334 4): the output is gone, and the older `echo b`'s output, whose
+/// prompt ran a command after it, is not offered instead; both report
+/// nothing.
+#[test]
+fn edits_that_take_the_output_away_report_nothing() {
+    for (edit, what) in [
+        (
+            "\x1b[8;9r\x1b[9H\n\x1b[r",
+            "a scroll region from the `C` scrolled up",
+        ),
+        ("\x1b[8H\x1b[M", "DL of the `C` row"),
+        // EL keeps the row's `C`: the output is that row, only blanks.
+        ("\x1b[8H\x1b[2K", "EL of the `C` row"),
+        // The prompt after it went: `echo d` looks running, its `C` is
+        // still there, so the older output is not offered.
+        ("\x1b[9H\x1b[M", "DL of the prompt after it"),
+    ] {
+        let app = app();
+        let id = three_commands_in(&app, 10);
+        feed(&app, id, format!("\x1b7{edit}\x1b8").as_bytes());
+        assert!(!app.has_command_output(id).unwrap(), "{what}");
+        assert_eq!(select(&app, id), (false, None), "{what}");
+    }
 }
 
 /// The records lost two commands to one chunk's coalescing: the grid's
@@ -1315,4 +1651,91 @@ fn g03_a_command_run_after_an_in_place_clear_has_no_borrowed_duration() {
     feed(&app, id, chunk.as_bytes());
     let mark = app.command_mark_at(id, 0).unwrap().expect("y finished");
     assert_eq!((mark.exit_code, mark.duration), (Some(0), None));
+}
+
+// ------------------------------------------- has == select, in every state
+
+/// One step of [`has_command_output_agrees_with_select`].
+#[derive(Debug, Clone)]
+enum Op {
+    /// A chunk of output.
+    Feed(String),
+    /// A resize to these rows and columns.
+    Resize(u16, u16),
+}
+
+fn op() -> impl proptest::strategy::Strategy<Value = Op> {
+    use proptest::prelude::*;
+    let row = 1u16..8;
+    let piece = prop_oneof![
+        // Whole commands, so states with finished output are common.
+        4 => (proptest::option::of(0i32..2), "[a-c]{0,3}( [a-c]{1,3}){0,3}")
+            .prop_map(|(status, text)| format!(
+                "{}\r\n{}{text}\r\n{}",
+                prompt(status, "x"),
+                m("C"),
+                prompt(Some(0), "")
+            )),
+        2 => "[a-c]{1,3}".prop_map(|text| zsh_prompt_sp(&text, ZSH_EOL_MARK, 20)),
+        2 => "[a-c]{1,3}".prop_map(|text| fish_abandon_line(&text, 20)),
+        4 => "[ab %]{1,8}",
+        3 => Just("\r\n".to_owned()),
+        1 => Just(ZSH_EOL_MARK.to_owned()),
+        1 => Just("\x1b[2m\u{23ce}\x1b[m".to_owned()),
+        2 => Just(m("A")),
+        1 => Just(m("B")),
+        2 => Just(m("C")),
+        1 => Just(m("D;0")),
+        1 => Just(m("D")),
+        1 => (row.clone(), 1u16..3).prop_map(|(r, n)| format!("\x1b7\x1b[{r}H\x1b[{n}M\x1b8")),
+        1 => (row.clone(), 1u16..3).prop_map(|(r, n)| format!("\x1b7\x1b[{r}H\x1b[{n}L\x1b8")),
+        1 => (1u16..3).prop_map(|n| format!("\x1b7\x1b[{n}T\x1b8")),
+        1 => (1u16..3).prop_map(|n| format!("\x1b7\x1b[{n}S\x1b8")),
+        1 => (row.clone(), row.clone(), proptest::bool::ANY).prop_map(|(a, b, up)| {
+            let (top, bottom) = (a.min(b), a.max(b) + 1);
+            let scroll = if up { format!("\x1b[{bottom}H\n") } else { format!("\x1b[{top}H\x1bM") };
+            format!("\x1b7\x1b[{top};{bottom}r{scroll}\x1b[r\x1b8")
+        }),
+        1 => row.prop_map(|r| format!("\x1b7\x1b[{r}H\x1b[2K\x1b8")),
+        1 => Just(format!("\x1b[H\x1b[2J{}", prompt(None, ""))),
+        1 => Just("\x1b[3J".to_owned()),
+        1 => Just("\x1b[?1049h".to_owned()),
+        1 => Just("\x1b[?1049l".to_owned()),
+    ];
+    prop_oneof![
+        8 => proptest::collection::vec(piece, 1..6).prop_map(|p| Op::Feed(p.concat())),
+        1 => (3u16..9, 8u16..30).prop_map(|(rows, cols)| Op::Resize(rows, cols)),
+    ]
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(128))]
+
+    /// Whatever marks, output and edits arrived (whole commands, stray
+    /// marks, end-of-line marks, DL, IL, SU, SD, scroll regions, EL,
+    /// clears, the alternate screen, resizes, eviction), the menu's
+    /// `has_command_output` says exactly whether Select Last Output selects
+    /// (#334: one function decides both).
+    #[test]
+    fn has_command_output_agrees_with_select(
+        ops in proptest::collection::vec(op(), 1..16),
+        scrollback in 0usize..24,
+    ) {
+        let app = app();
+        let id = session(&app, 6, 20, scrollback);
+        for (step, op) in ops.iter().enumerate() {
+            match op {
+                Op::Feed(text) => feed(&app, id, text.as_bytes()),
+                Op::Resize(rows, cols) => app.resize(id, PtySize::new(*rows, *cols)).unwrap(),
+            }
+            let has = app.has_command_output(id).unwrap();
+            let selected = app.select_command_output(id).unwrap();
+            proptest::prop_assert_eq!(has, selected, "step {}: {:?}", step, op);
+            if selected {
+                let text = app.selection_text(id).unwrap();
+                proptest::prop_assert!(text.is_some_and(|t| !t.trim().is_empty()), "step {}", step);
+            }
+            app.select_clear(id).unwrap();
+        }
+    }
 }

@@ -75,11 +75,12 @@ extension TesseraSession {
         }
     }
 
-    /// Whether the last finished command printed output still in the
-    /// scrollback, from the session's command records alone (no search of
-    /// the history): cheap enough to enable Select Last Output in
-    /// `validateMenuItem(_:)`. ``selectLastOutput()`` can still find nothing
-    /// (after a resize moved the lines, say).
+    /// Whether ``selectLastOutput()`` would select something now: the core
+    /// decides both with one function, so Select Last Output enabled in
+    /// `validateMenuItem(_:)` selects unless output changed the lines in
+    /// between. Each read looks at the lines from the bottom up to that
+    /// output (in short lock holds), so read it when a menu is validated,
+    /// not per frame.
     @MainActor
     public var hasCommandOutput: Bool {
         get throws {
