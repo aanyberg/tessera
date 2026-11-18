@@ -1340,6 +1340,60 @@ extension PaneTests {
         try hidden.session.write([0x03])
     }
 
+    /// #323 (21.5 m4): a pane hidden behind a maximized one while idle,
+    /// with nothing left to draw and no output while hidden, is drawn at
+    /// the next refresh once shown again, since what it showed may be
+    /// stale. Only the show can ask for that frame: the flood test's pane
+    /// always has output waiting when it is shown.
+    func testAnIdlePaneHiddenBehindAMaximizedOneIsDrawnWhenShownAgain() async throws {
+        let controller = try openTab()
+        let shown = controller.focusedPane
+        let hidden = try split(controller, .right)
+        try skipUnlessAttached(controller)
+        for pane in [shown, hidden] { pane.view.occlusionOverride = false }
+        // A frame counts as drawn even without a drawable (a locked
+        // console has none), so the pane can go idle.
+        hidden.view.frameStatusOverride = .presented
+        controller.focus(shown)
+        // Idle: its shell's prompt drawn and nothing more to draw for a
+        // while, so no output is still on its way.
+        let deadline = ContinuousClock.now + .seconds(10)
+        var quiet: (since: ContinuousClock.Instant, renders: Int)?
+        while true {
+            hidden.view.displayLinkDidFire()
+            let renders = hidden.view.renderCount
+            if hidden.view.isDisplayLinkPaused, let quiet, quiet.renders == renders {
+                if ContinuousClock.now - quiet.since > .milliseconds(500) { break }
+            } else {
+                quiet = hidden.view.isDisplayLinkPaused ? (ContinuousClock.now, renders) : nil
+            }
+            guard ContinuousClock.now < deadline else { throw PollTimedOut(description: "the pane never went idle") }
+            try await Task.sleep(for: .milliseconds(16))
+        }
+        XCTAssertGreaterThan(hidden.view.renderCount, 0, "it drew its prompt")
+
+        controller.toggleZoomPane(nil)
+        XCTAssertTrue(controller.isZoomed)
+        XCTAssertTrue(hidden.view.isOccluded, "hidden")
+        let before = hidden.view.renderCount
+        for _ in 0..<10 {
+            hidden.view.displayLinkDidFire()
+            try await Task.sleep(for: .milliseconds(16))
+        }
+        XCTAssertTrue(hidden.view.isDisplayLinkPaused, "nothing wakes its link while hidden")
+        XCTAssertEqual(hidden.view.renderCount, before, "no frame while hidden")
+
+        controller.toggleZoomPane(nil)
+        XCTAssertFalse(controller.isZoomed)
+        XCTAssertFalse(hidden.view.isOccluded)
+        XCTAssertFalse(hidden.view.isDisplayLinkPaused, "shown again, its link runs with nothing new to draw")
+        hidden.view.displayLinkDidFire()
+        XCTAssertEqual(hidden.view.renderCount, before + 1, "the next refresh draws it")
+        hidden.view.displayLinkDidFire()
+        XCTAssertEqual(hidden.view.renderCount, before + 1, "once")
+        XCTAssertTrue(hidden.view.isDisplayLinkPaused, "then its link idles again")
+    }
+
     /// A layout held by a clamp (the left pane's larger font keeps it above
     /// its ratio's share): maximizing either pane leaves the other's frame
     /// and grid alone, a font change of the maximized pane too, and showing
@@ -2094,6 +2148,11 @@ extension PaneTests {
             controller.delegate = appDelegate
         }
         let window = try XCTUnwrap(controller.window)
+        let observers = proxy.countWindowChanges(of: window)
+        defer { observers.forEach { NotificationCenter.default.removeObserver($0) } }
+        // The window becomes main, as it can on CI (#453): a save, but not
+        // the panes'.
+        NotificationCenter.default.post(name: NSWindow.didBecomeMainNotification, object: window)
         let outer = try XCTUnwrap(controller.paneContainer.subviews.first as? PaneSplitView)
         let start = frame(of: left, in: controller).maxX + 0.5
         func event(_ type: NSEvent.EventType, x: CGFloat) throws -> NSEvent {
@@ -2109,7 +2168,8 @@ extension PaneTests {
         NSApp.postEvent(try event(.leftMouseUp, x: start - 200), atStart: false)
         outer.mouseDown(with: try event(.leftMouseDown, x: start))
         XCTAssertLessThan(frame(of: left, in: controller).maxX, start - 50, "the drag moved the divider")
-        XCTAssertEqual(proxy.layoutChanges, 1, "one save asked for, at the end of the drag")
+        XCTAssertGreaterThanOrEqual(proxy.windowChanges, 1, "the window's own save is counted apart")
+        XCTAssertEqual(proxy.paneLayoutChanges, 1, "one save asked for, at the end of the drag")
 
         let ratio = Double(controller.paneContainer.tree.root.splits[0].ratio)
         try await waitUntil("the drag's ratio is saved") {
@@ -2119,7 +2179,7 @@ extension PaneTests {
         // A click on the divider that moves nothing asks for none.
         NSApp.postEvent(try event(.leftMouseUp, x: frame(of: left, in: controller).maxX + 0.5), atStart: false)
         outer.mouseDown(with: try event(.leftMouseDown, x: frame(of: left, in: controller).maxX + 0.5))
-        XCTAssertEqual(proxy.layoutChanges, 1, "a click without a move")
+        XCTAssertEqual(proxy.paneLayoutChanges, 1, "a click without a move")
     }
 
     /// A pane's shell exiting during a divider drag (#371), with the events
@@ -2653,8 +2713,14 @@ extension PaneTests {
         defer { controller.delegate = appDelegate }
         let container = controller.paneContainer
         let start = autoreleasepool { frame(of: left, in: controller).maxX + 0.5 }
+        let window = try XCTUnwrap(controller.window)
+        let observers = proxy.countWindowChanges(of: window)
+        defer { observers.forEach { NotificationCenter.default.removeObserver($0) } }
+        // The window becomes main, as it can on CI (#453): a save, but not
+        // the panes'.
+        NotificationCenter.default.post(name: NSWindow.didBecomeMainNotification, object: window)
         try await trackDividerDragUntilAnException(
-            at: start, in: container, window: try XCTUnwrap(controller.window),
+            at: start, in: container, window: window,
             steps: [
                 { post in
                     for step in 1...5 { post(.leftMouseDragged, start - CGFloat(10 * step)) }
@@ -2663,7 +2729,8 @@ extension PaneTests {
                 { _ in self.frame(of: left, in: controller).maxX < start - 25 },
             ])
         XCTAssertFalse(isTrackingDividerDragInEventTrackingMode(container), "the drag ended")
-        XCTAssertEqual(proxy.layoutChanges, 1, "its ratio is saved")
+        XCTAssertGreaterThanOrEqual(proxy.windowChanges, 1, "the window's own save is counted apart")
+        XCTAssertEqual(proxy.paneLayoutChanges, 1, "its ratio is saved")
     }
 
     /// Two divider drags on different splits, each ended by an exception
@@ -2934,6 +3001,12 @@ extension PaneTests {
         let proxy = PaneHostProxy(app: appDelegate)
         controller.delegate = proxy
         defer { controller.delegate = appDelegate }
+        let window = try XCTUnwrap(controller.window)
+        let observers = proxy.countWindowChanges(of: window)
+        defer { observers.forEach { NotificationCenter.default.removeObserver($0) } }
+        // The window becomes main, as it can on CI (#453): a save, but not
+        // the panes'.
+        NotificationCenter.default.post(name: NSWindow.didBecomeMainNotification, object: window)
         proxy.spawnsLeft = 1
         let layout = PaneLayout.split(
             .right, ratio: 0.5, first: .leaf, second: .split(.below, ratio: 0.5, first: .leaf, second: .leaf))
@@ -2946,7 +3019,8 @@ extension PaneTests {
         XCTAssertThrowsError(try proxy.spawned[0].close(), "already closed") { error in
             XCTAssertEqual(error as? TesseraCoreError, .sessionNotFound)
         }
-        XCTAssertEqual(proxy.layoutChanges, 0, "nothing changed to save")
+        XCTAssertGreaterThanOrEqual(proxy.windowChanges, 1, "the window's own save is counted apart")
+        XCTAssertEqual(proxy.paneLayoutChanges, 0, "nothing changed to save")
     }
 
     // MARK: ⌘W's title outside the panes

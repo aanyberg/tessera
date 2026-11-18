@@ -917,7 +917,11 @@ final class TerminationSignalTests: XCTestCase {
     ) async throws -> Result {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-441-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let suite = "com.aanyberg.tessera.tests.\(UUID().uuidString)"
+        // A suite at a path in `dir`, not in ~/Library/Preferences:
+        // cfprefsd writes what the child saved to its file seconds after
+        // the child exits, after any cleanup here, and would leave it there
+        // (#496).
+        let suite = dir.appendingPathComponent("defaults").path
         let request = TerminationSignalChild.Request(
             mode: mode, command: command, suite: suite, quitKeepsWindows: quitKeepsWindows)
         try JSONEncoder().encode(request).write(to: dir.appendingPathComponent(TerminationSignalChild.requestFile))
@@ -927,7 +931,6 @@ final class TerminationSignalTests: XCTestCase {
             // The job may outlive the app (it ignores SIGHUP, or its shell
             // was killed first).
             for pid in [jobPid, shellPid].compactMap(\.self) { kill(pid, SIGKILL) }
-            UserDefaults.standard.removePersistentDomain(forName: suite)
             try? FileManager.default.removeItem(at: dir)
         }
 

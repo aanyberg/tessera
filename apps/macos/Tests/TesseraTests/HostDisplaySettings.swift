@@ -22,6 +22,8 @@ final class HostDisplaySettings: NSObject, XCTestObservation {
         MainActor.assumeIsolated {
             // A child of TerminationSignalTests runs no test.
             TerminationSignalChild.runIfRequested()
+            // Files of test suites that an earlier run's killed host left.
+            TestDefaultsSuite.sweep()
             if let appDelegate = NSApp.delegate as? AppDelegate {
                 Self.pin(appDelegate)
             }
