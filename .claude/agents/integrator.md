@@ -29,3 +29,5 @@ When the brief says the wave ships as one wave PR, integrate into local main ins
 5. `git worktree remove --force <wt>`; keep the branch. Never push.
 
 Report: merged, the new commit on local main, conflict files outside Cargo.lock, and the gate result.
+
+Never start a background job and stop: run it in the foreground with `timeout`, or poll its log until it finishes (a gate, a build, a test run). The only time you hand back with work still running is a single "gate running, log <path>" report.

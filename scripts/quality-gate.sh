@@ -152,11 +152,13 @@ ffi_c_tests_step() {
 }
 
 # Timing bars that only run in release builds (#114, #175): the reader lock hold, the view metrics under an output
-# flood, scrolling through a long history, captures under a flood while scrolled back, a click with each hostile smart
-# rule of #433, and the `b02_*` cost bars of
-# the rectangular area operations (tessera-term, tests/rect.rs; the `#[ignore]`d one-MiB run stays out) and the config edit among 20 000 mark-like lines (tessera-config, tests/edit.rs). They are in the `timing`
-# test group (one at a time). A failure under load (1-min load average >= the core count) is retried once; a second
-# failure, any failure below that load and any failure of the build (`--no-run`) fail the gate.
+# flood, scrolling through a long history, captures under a flood while scrolled back, the scrollback search bars, the
+# accessible-text lock hold, the smart-selection latency and a click with each hostile smart rule of #433, the plugin
+# host throughput, the `b02_*` cost bars of the rectangular area operations (tessera-term, tests/rect.rs; the
+# `#[ignore]`d one-MiB run stays out) with the two cluster bars of tests/rect_fixes.rs, and the config edit among
+# 20 000 mark-like lines (tessera-config, tests/edit.rs). They are in the `timing` test group of .config/nextest.toml
+# (one at a time). A failure under load (1-min load average >= the core count) is retried once; a second failure, any
+# failure below that load and any failure of the build (`--no-run`) fail the gate.
 timing_stub=(${(s:,:)${TESSERA_GATE_TEST_TIMING_RESULTS:-}})
 release_timing() {
     if [[ -n "$selftest" && -n "${TESSERA_GATE_TEST_TIMING_RESULTS:-}" ]]; then
@@ -168,7 +170,7 @@ release_timing() {
         print -r -- "-- release timing run (self-test): exit $st"
         return "$st"
     fi
-    run_nextest --release -p tessera-app-core -p tessera-term -p tessera-config -E 'kind(lib) & (test(reader_lock_hold_is_bounded) | test(view_metrics_are_fast_while_output_floods_the_terminal) | test(scrolling_through_a_long_history_is_smooth) | test(a_flood_under_a_scrolled_view_keeps_captures_short) | test(search_lock_hold_is_bounded) | test(a_million_lines_) | test(no_step_outlasts_four_budgets_and_a_quarter_second) | test(accessible_text_lock_hold_is_no_longer_than_a_capture) | test(hostile_smart_rules_)) | (binary(smart_selection) & test(=a_double_click_with_64_rules_on_2048_columns_takes_under_5_ms)) | (package(tessera-term) & binary(=rect) & test(b02_)) | (package(tessera-config) & binary(=edit) & test(=an_edit_among_many_mark_like_lines_is_fast)) | (package(tessera-app-core) & binary(=plugins) & test(=a_slow_plugin_keeps_session_throughput))'
+    run_nextest --release -p tessera-app-core -p tessera-term -p tessera-config -E 'kind(lib) & (test(reader_lock_hold_is_bounded) | test(view_metrics_are_fast_while_output_floods_the_terminal) | test(scrolling_through_a_long_history_is_smooth) | test(a_flood_under_a_scrolled_view_keeps_captures_short) | test(search_lock_hold_is_bounded) | test(a_million_lines_) | test(no_step_outlasts_four_budgets_and_a_quarter_second) | test(accessible_text_lock_hold_is_no_longer_than_a_capture) | test(hostile_smart_rules_)) | (binary(smart_selection) & test(=a_double_click_with_64_rules_on_2048_columns_takes_under_5_ms)) | (package(tessera-term) & binary(=rect) & test(b02_)) | (package(tessera-term) & binary(=rect_fixes) & (test(a_self_copy_of_a_screen_of_clusters_) | test(a_shifted_partial_copy_over_clusters_))) | (package(tessera-config) & binary(=edit) & test(=an_edit_among_many_mark_like_lines_is_fast)) | (package(tessera-app-core) & binary(=plugins) & test(=a_slow_plugin_keeps_session_throughput))'
 }
 load_1min() {
     if [[ -n "$selftest" && -n "${TESSERA_GATE_TEST_LOAD:-}" ]]; then

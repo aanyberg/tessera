@@ -13,11 +13,12 @@ The full runbook is `docs/software-factory.md`. Read it before you delegate work
    `adversarial-tester` pass for product code (`crates/`, `apps/macos/`; docs, infra, tooling and test-only changes
    are exempt), and a green `scripts/quality-gate.sh` on the integrated commit. CI only confirms. Never push
    mid-review.
-2. **Waves run as an agent team.** The lead owns the shared task list and keeps up to three tasks in flight from
-   the wave's queue; each task ships as its own PR as soon as it is verified. One teammate per issue implements in
-   its own worktree and fixes its own branch on `revise`. Do not use the Workflow tool for waves.
+2. **Waves run on unnamed background subagents.** The lead owns the task list and starts up to seven tasks from the
+   wave's queue, with up to three open PRs; each task ships as its own PR as soon as it is verified. One implementer
+   subagent per issue works in its own worktree and fixes its own branch on `revise`. Start a new implementer only
+   with a 1-minute load below twice the core count and more than 40 GB free. Do not use the Workflow tool for waves.
 3. **Fresh reviewers.** Every critique round and every adversarial run is a new one-shot subagent
-   (`rust-critic`, `swift-critic`, `code-critic`, `adversarial-tester`). Never a teammate. The adversarial brief
+   (`rust-critic`, `swift-critic`, `code-critic`, `adversarial-tester`). Never a long-lived agent. The adversarial brief
    carries the critic's `coverage` (checks run versus only read).
 4. **Review rules** (runbook "Review rules"). Round 1 is one strict full review; every finding is a BLOCKER (wrong
    behaviour, spec or "Done when" miss, data loss or safety, flaky or hanging test, unmet perf bar, breaks a
@@ -50,8 +51,10 @@ The full runbook is `docs/software-factory.md`. Read it before you delegate work
    resyncs local main before the next integration. Wave PRs from wave 4 and earlier follow "Wave PRs" in the
    runbook. Changes outside a wave follow "Changes outside a wave".
 8. **Labels.** Wave numbers are global and never reset across milestones.
-9. **Short reports, resumable lead.** Teammates and subagents report a verdict, blockers and a path or issue link;
-   detail goes to a file or the GitHub issue. Between waves a fresh lead resumes from GitHub state; mid-wave the
+9. **Short reports, resumable lead.** Subagents report a verdict, blockers and a path or issue link through their
+   handback (critics and the adversarial tester have no Write tool: no report files); detail goes to the GitHub
+   issue. Never block on `AskUserQuestion` mid-wave: low disk means deleting finished sessions' scratch, and a user
+   decision is posted once while the wave carries on. Between waves a fresh lead resumes from GitHub state; mid-wave the
    briefs and decisions live in the lead's task list, so keep the lead (runbook "Session hygiene").
 10. **Tooling, not ad-hoc setups.** Benchmarks and differential fuzzing use `cargo xtask ab`; mechanical checks
     use `scripts/verify-branch.sh`; retro numbers come from `scripts/factory-stats.sh`. Pre-flight checks that

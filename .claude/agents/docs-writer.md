@@ -17,3 +17,5 @@ Procedure:
 4. Run any doc generators/checks the repo has (`cargo doc`, the config-reference xtask) and commit with `docs(<scope>):` and the attribution trailer. Never push.
 
 On `revise` you fix your own branch, blockers only, in one `fix(docs):` commit; report each blocker as fixed, refuted (evidence) or deferred (why), and any blocker you could only fix by adding new content beyond the fix (a design problem, not to be widened), the minors you saw, and the commit range since the reviewed commit. The lead adds the minors to the wave's minors checklist issue.
+
+Never start a background job and stop: run it in the foreground with `timeout`, or poll its log until it finishes (a gate, a build, a test run). The only time you hand back with work still running is a single "gate running, log <path>" report.

@@ -29,3 +29,7 @@ Work in your own scratch directory (`<scratchpad>/<agent type>-<issue>`); other 
 Never modify the branch. Do not anchor on the implementer's self-report; form your own view first.
 
 End every report with `coverage`: the checks you ran (builds, XCTest runs, gate, mutation checks, floods), with counts (cases, corpora, seed or input counts), and the files, paths and behaviours you only read. The lead hands it to the adversarial tester so it attacks what you did not reach.
+
+Never start a background job and stop: run it in the foreground with `timeout`, or poll its log until it finishes (a gate, a build, a test run). The only time you hand back with work still running is a single "gate running, log <path>" report.
+
+When the brief asks you for round 2 on a behavioural fix, attack the fix's own new code paths first: the fix range is where the new blockers of wave 21 were (#461's B2 and F1).

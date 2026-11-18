@@ -502,6 +502,21 @@ for runner in bash zsh; do
     else not_ok "dirty worktree with an older target/ ($runner): $(cat "$work/stale.log")"; fi
     touch -t "$(date -v+1d +%Y%m%d%H%M)" "$newer"
 done
+# A mutant built for another triple sits one level deeper (target/<triple>/debug/deps), and a CARGO_TARGET_DIR outside
+# the worktree is shared, so its output is never a verdict on this tree (#489, 21.0c m1, m2).
+touch -t 200001010000 "$newer"
+mkdir -p "$repo/target/x86_64-apple-darwin/debug/deps"
+deep="$repo/target/x86_64-apple-darwin/debug/deps/libmutant.rlib"
+: > "$deep"; touch -t "$(date -v+1d +%Y%m%d%H%M)" "$deep"
+printf 'x\n' > "$repo/dirty.txt"
+rc=0; "$script" "$repo" --no-load > "$work/stale.log" 2>&1 || rc=$?
+if [ "$rc" = 1 ] && grep -q 'FAIL.* stale: the worktree is dirty' "$work/stale.log"; then
+    ok "a mutant four levels down in target/ is found"
+else not_ok "deep mutant: exit $rc: $(cat "$work/stale.log")"; fi
+rc=0; CARGO_TARGET_DIR="$work/shared-target" "$script" "$repo" --no-load > "$work/stale.log" 2>&1 || rc=$?
+if grep -q 'skip.* stale (CARGO_TARGET_DIR .* is outside the worktree' "$work/stale.log" && ! grep -q 'FAIL.* stale' "$work/stale.log"; then
+    ok "a CARGO_TARGET_DIR outside the worktree skips the stale check"
+else not_ok "external CARGO_TARGET_DIR: exit $rc: $(cat "$work/stale.log")"; fi
 rm -rf "$repo/target" "$repo/dirty.txt"
 
 # The load check runs 2 tests x 10 runs and never has more than --parallel of them in flight. The fixture's gate
