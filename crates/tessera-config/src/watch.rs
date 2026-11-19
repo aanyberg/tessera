@@ -64,7 +64,9 @@
 //! file is reported as
 //! [`ConfigEvent::Changed`] (or [`ConfigEvent::Invalid`]); a change in
 //! `themes/` as [`ConfigEvent::ThemesChanged`], after which the application
-//! resolves the theme again ([`ConfigStore::theme`]).
+//! resolves the theme again ([`ConfigStore::theme`]). A re-read that finds
+//! the configuration already applied (a save undone inside the debounce,
+//! say) is reported as [`ConfigEvent::Unchanged`] (#535).
 //!
 //! Each re-read settles in one order: `config.toml` is loaded, the theme
 //! file it names is followed (registered, or recorded as the poll
@@ -255,6 +257,22 @@ pub enum ConfigEvent {
     /// documentation); the polling backend sees writes to every theme file,
     /// to one not in use within about twenty polling intervals.
     ThemesChanged,
+    /// The watcher re-read `config.toml` (and the profile files) after a
+    /// change on disk, and the configuration it loaded is the one already
+    /// applied: a save another writer undid inside the debounce, a rewrite
+    /// with the same text, a change in `themes/` or `profiles/` that left
+    /// the configuration alone. Sent instead of a
+    /// [`Changed`](ConfigEvent::Changed), so every re-read of a successful
+    /// load reports one or the other, and an application that waits to
+    /// see a value it saved can tell "read, and not there" from "not read
+    /// yet" (#535).
+    ///
+    /// Nothing is to be applied. A re-read that fails with an error
+    /// already reported sends nothing, and neither does the catch-up a
+    /// watcher does when it starts ([`ConfigStore::watch`]) when it finds
+    /// nothing new. Several watchers of one store each send their own, so
+    /// each of them may see one per watcher for one change.
+    Unchanged,
 }
 
 /// A background watcher over the store's `config.toml` and `themes/`.
@@ -443,16 +461,30 @@ impl Drop for WatchGuard {
 /// lookup, which would then miss the save that fixes it. Following first
 /// means such a save lands on a watched file, and the themes directory is
 /// sampled after that, so a write between the two is reported here.
-fn settle(store: &ConfigStore, follow: impl FnOnce(&Config)) {
+///
+/// `reread` says whether a load that finds the configuration unchanged
+/// reports [`ConfigEvent::Unchanged`]: yes after a change on disk, no for
+/// the catch-up when the watcher starts.
+fn settle(store: &ConfigStore, follow: impl FnOnce(&Config), reread: Reread) {
     let outcome = store.load_from_disk();
     match &outcome {
         Ok(from) => follow(&from.loaded.config),
         Err(_) => follow(&store.config()),
     }
-    if let Some(event) = apply(store, outcome) {
+    if let Some(event) = apply(store, outcome, reread) {
         store.broadcast(&event);
     }
     report_themes(store);
+}
+
+/// Why [`settle`] re-reads the files, which decides whether a load that
+/// finds nothing new reports [`ConfigEvent::Unchanged`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reread {
+    /// A change on disk was seen: an unchanged load is reported.
+    Changed,
+    /// The catch-up when the watcher starts: an unchanged load is not.
+    CatchUp,
 }
 
 /// Samples the themes directory and sends [`ConfigEvent::ThemesChanged`]
@@ -591,15 +623,21 @@ fn profile_theme_files(themes: &Path, config: &Config) -> Vec<std::path::PathBuf
 }
 
 /// Applies a load's outcome: the event that reports it, for the caller to
-/// send to every watcher of the store, or `None` when the file is
-/// unchanged (or the same error was reported already).
-fn apply(store: &ConfigStore, outcome: Result<FromDisk, Error>) -> Option<ConfigEvent> {
+/// send to every watcher of the store: [`ConfigEvent::Unchanged`] for an
+/// unchanged configuration when `reread` is [`Reread::Changed`], `None`
+/// for one at the catch-up or for an error reported already.
+fn apply(
+    store: &ConfigStore,
+    outcome: Result<FromDisk, Error>,
+    reread: Reread,
+) -> Option<ConfigEvent> {
     match outcome {
         Ok(from) => {
             let warnings = from.loaded.warnings.clone();
-            store
-                .apply(from)
-                .map(|config| ConfigEvent::Changed(ConfigChanged { config, warnings }))
+            match store.apply(from) {
+                Some(config) => Some(ConfigEvent::Changed(ConfigChanged { config, warnings })),
+                None => (reread == Reread::Changed).then_some(ConfigEvent::Unchanged),
+            }
         }
         Err(error) => {
             // Two watchers of one store both load the same broken file; only
@@ -687,9 +725,13 @@ impl Backend {
     fn catch_up(&mut self, store: &ConfigStore) {
         match self {
             Self::Poll { baseline, .. } => {
-                settle(store, |config| {
-                    follow_polled_theme(store, baseline, &config.appearance.theme);
-                });
+                settle(
+                    store,
+                    |config| {
+                        follow_polled_theme(store, baseline, &config.appearance.theme);
+                    },
+                    Reread::CatchUp,
+                );
             }
             #[cfg(any(
                 target_os = "macos",
@@ -699,7 +741,7 @@ impl Backend {
                 target_os = "netbsd",
                 target_os = "dragonfly"
             ))]
-            Self::Native(native) => native.settle(store),
+            Self::Native(native) => native.catch_up(store),
         }
     }
 
@@ -972,9 +1014,13 @@ fn run_polling(
         }
         quiet_since = None;
         dirty_since = None;
-        settle(store, |config| {
-            follow_polled_theme(store, &mut last_seen, &config.appearance.theme);
-        });
+        settle(
+            store,
+            |config| {
+                follow_polled_theme(store, &mut last_seen, &config.appearance.theme);
+            },
+            Reread::Changed,
+        );
     }
 }
 
@@ -2038,9 +2084,23 @@ mod native {
         /// after the lookup leaves a directory event for the next round, a
         /// write after the registration raises an event on the armed file,
         /// and nothing lands unseen between the sample and the next wait.
-        /// `Watcher::spawn` runs it once before the thread starts, to catch
-        /// up on what changed since `ConfigStore::open` (#253 item 1).
+        /// `Watcher::spawn` runs it once before the thread starts, as
+        /// [`Native::catch_up`], to catch up on what changed since
+        /// `ConfigStore::open` (#253 item 1). A load that finds the
+        /// configuration unchanged reports [`super::ConfigEvent::Unchanged`]
+        /// here, not at the catch-up (#535).
         pub(super) fn settle(&mut self, store: &ConfigStore) {
+            self.reread(store, super::Reread::Changed);
+        }
+
+        /// [`Native::settle`] for the catch-up in `Watcher::spawn`: a load
+        /// that finds nothing new reports nothing (#535).
+        pub(super) fn catch_up(&mut self, store: &ConfigStore) {
+            self.reread(store, super::Reread::CatchUp);
+        }
+
+        /// [`Native::settle`] and [`Native::catch_up`].
+        fn reread(&mut self, store: &ConfigStore, reread: super::Reread) {
             // Before the load: a change after this sample is either read
             // by the load or seen as a difference on the next poll.
             self.config_seen = super::Fingerprint::of(&self.file);
@@ -2071,7 +2131,7 @@ mod native {
             self.profiles_seen = seen;
             #[cfg(test)]
             self.probe.note_settle();
-            super::settle(store, |config| self.follow(config));
+            super::settle(store, |config| self.follow(config), reread);
         }
 
         /// Whether `config.toml` or `profiles/` changed since the last

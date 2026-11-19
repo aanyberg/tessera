@@ -1,6 +1,7 @@
 //! Live reload: an external edit reaches the store within 500 ms, rapid
 //! writes coalesce into one event, and both backends behave the same.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tessera_config::{
@@ -235,8 +236,11 @@ fn edit_between_open_and_watch_is_applied() {
     }
 }
 
+/// An edit that leaves the configuration as it is applies nothing and
+/// reports one `Unchanged`, so an application waiting to see a value it
+/// saved learns the file was read (#535).
 #[test]
-fn comment_only_edit_emits_nothing() {
+fn comment_only_edit_reports_unchanged_once() {
     for backend in BACKENDS {
         let (_dir, store, watcher) = open_watched(WatchOptions {
             backend,
@@ -244,15 +248,70 @@ fn comment_only_edit_emits_nothing() {
             debounce: Duration::from_millis(30),
             ..Default::default()
         });
+        let before = store.config();
         let path = store.paths().config_file();
         let mut text = std::fs::read_to_string(&path).unwrap();
         text.push_str("\n# trailing comment\n");
         std::fs::write(&path, text).unwrap();
+        let event = watcher
+            .recv_timeout(EVENTUALLY)
+            .unwrap_or_else(|e| panic!("{backend:?}: the re-read reported nothing: {e}"));
+        assert!(
+            matches!(event, ConfigEvent::Unchanged),
+            "{backend:?}: {event:?}"
+        );
         assert!(
             watcher.recv_timeout(Duration::from_millis(300)).is_err(),
-            "{backend:?}"
+            "{backend:?}: reported once"
         );
-        assert_eq!(*store.config(), Config::default());
+        assert!(
+            Arc::ptr_eq(&before, &store.config()),
+            "{backend:?}: nothing applied"
+        );
+    }
+}
+
+/// A save undone inside the debounce (another app restores the text it
+/// replaced) is read as one unchanged configuration: the watcher reports
+/// `Unchanged`, never nothing, and applies nothing (#535).
+#[test]
+fn a_save_undone_inside_the_debounce_reports_unchanged() {
+    for backend in BACKENDS {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(dir.path());
+        std::fs::write(paths.config_file(), font_size_doc(13)).unwrap();
+        let store = ConfigStore::open(paths).unwrap();
+        let watcher = store
+            .watch(WatchOptions {
+                backend,
+                poll_interval: Duration::from_millis(10),
+                // Long enough that a loaded machine still lands the undo
+                // inside it.
+                debounce: Duration::from_millis(500),
+                ..Default::default()
+            })
+            .unwrap();
+        let before = store.config();
+        let path = store.paths().config_file();
+        std::fs::write(&path, font_size_doc(14)).unwrap();
+        std::thread::sleep(Duration::from_millis(40));
+        std::fs::write(&path, font_size_doc(13)).unwrap();
+        let event = watcher
+            .recv_timeout(EVENTUALLY)
+            .unwrap_or_else(|e| panic!("{backend:?}: the re-read reported nothing: {e}"));
+        assert!(
+            matches!(event, ConfigEvent::Unchanged),
+            "{backend:?}: {event:?}"
+        );
+        assert!(
+            watcher.recv_timeout(Duration::from_millis(300)).is_err(),
+            "{backend:?}: reported once"
+        );
+        assert!(
+            Arc::ptr_eq(&before, &store.config()),
+            "{backend:?}: nothing applied"
+        );
+        assert_eq!(store.config().appearance.font_size, 13.0);
     }
 }
 
@@ -444,9 +503,17 @@ fn every_watcher_on_a_store_receives_every_event() {
                 changed.config.appearance.font_size, 17.0,
                 "{backend:?}: {name}"
             );
+            // The other watcher's re-read finds the change applied and
+            // reports `Unchanged` (#535): at most that one more.
+            match watcher.recv_timeout(Duration::from_millis(200)) {
+                Err(_) | Ok(ConfigEvent::Unchanged) => {}
+                Ok(event) => {
+                    panic!("{backend:?}: {name} watcher reported the change twice: {event:?}")
+                }
+            }
             assert!(
                 watcher.recv_timeout(Duration::from_millis(200)).is_err(),
-                "{backend:?}: {name} watcher reported the change twice"
+                "{backend:?}: {name} watcher reported more"
             );
         }
 

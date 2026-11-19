@@ -422,8 +422,9 @@ impl App {
 
     /// How many configurations were applied since the `App` was created
     /// ([`App::apply_config`], and the configuration watch): 0 for the one
-    /// it was created with. [`SessionObserver::on_config_applied`] passes
-    /// the new value.
+    /// it was created with. A re-read of `config.toml` by the watch that
+    /// finds the configuration in effect counts too (#535).
+    /// [`SessionObserver::on_config_applied`] passes the new value.
     pub fn config_generation(&self) -> u64 {
         self.bindings.generation()
     }

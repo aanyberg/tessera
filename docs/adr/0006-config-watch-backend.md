@@ -390,3 +390,46 @@ The FFI's own `OPEN_LOCK` is gone (K5, #344).
 - A chain event that changes nothing on the way still rearms when
   `profiles/` exists without a watch (the `registration_incomplete` rule
   of #417 M-B, now tested for `profiles/`, M7).
+
+## Amendment: an unchanged re-read is reported (#535, 2026-11-19)
+
+**Context.** A re-read that loaded the configuration already applied sent
+nothing. Settings saves a value and waits for a configuration generation
+newer than the save before it shows the file's value again, so a save
+that another app undid inside the debounce (the file read once, with the
+old text) left Settings showing the saved value until the next apply or
+until the window opened again.
+
+**Decision.** The watcher sends `ConfigEvent::Unchanged` when a re-read
+after a change on disk loads successfully and the store finds nothing new
+(`ConfigStore::apply` returns `None`): a save undone inside the debounce,
+a rewrite with the same text, a comment-only edit, or a change in
+`themes/` or `profiles/` that leaves the configuration alone (then before
+its `ThemesChanged`). Every re-read of a good file thus reports `Changed`
+or `Unchanged`. The catch-up when a watcher starts sends nothing for an
+unchanged file, and a repeated load error still sends nothing. Several
+watchers of one store each send their own `Unchanged`, so one change can
+reach a watcher as a `Changed` and, from the other watcher's re-read, an
+`Unchanged`.
+
+app-core handles `Unchanged` without restyling: no look generation, no
+session look, no `on_appearance_changed`. It moves the configuration
+generation (`App::config_generation`) and calls
+`SessionObserver::on_config_applied`, which the FFI forwards as the
+existing `on_config_applied` callback, so the host reads the
+configuration again and settles what it holds. When the apply thread
+folds an `Unchanged` into an event that announces nothing (a
+`ThemesChanged` that changed no theme in use, an `Invalid`), it announces
+once itself. One folded into a `Changed` is covered by that apply's
+announcement. No FFI item is added: `on_config_applied` already meant "a
+configuration was applied, whether or not anything in it changed".
+
+**Consequences.** The host hears `on_config_applied` a little more often:
+once per settled change on disk, including a change of a theme file not
+in use. Each costs one key map check (no compile when `[keys]` are the
+same) and the host's re-read of the configuration. Active plugins hear
+each one as a `ConfigChanged` too (`PluginObserver::on_config_applied`
+queues it, within the plugin queue's cap), also for a comment edit or an
+edit of a theme file not in use. ADR 0044's settle rule
+for Settings (a pending value goes once a later generation is read) now
+also covers the undone save.
