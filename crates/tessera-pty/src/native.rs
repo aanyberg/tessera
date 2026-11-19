@@ -164,7 +164,9 @@ impl NativePty {
     /// columns, [`PtyError::ArgumentsTooLong`] if the arguments and
     /// environment exceed what `execve(2)` accepts (checked before
     /// anything is opened or forked), [`PtyError::Open`] if no PTY could be
-    /// allocated, [`PtyError::Spawn`] if the program is missing, a
+    /// allocated (an open that lost the kernel's pty allocation race to a
+    /// concurrent one, in this or another process, is retried a few times
+    /// first, #563), [`PtyError::Spawn`] if the program is missing, a
     /// directory or not executable, if it is a `#!` script whose
     /// interpreter is missing, not a regular file or not executable
     /// (checked before anything is opened or forked; a script with CRLF
@@ -202,8 +204,7 @@ impl NativePty {
             program: describe_program(&options.program),
             reason,
         })?;
-        let pair = native_pty_system()
-            .openpty(options.size.into())
+        let pair = redrive_open(|| native_pty_system().openpty(options.size.into()))
             .map_err(|err| PtyError::Open(err.to_string()))?;
 
         let program = describe_program(&options.program);
@@ -985,6 +986,54 @@ fn duplicate_master(master: &dyn MasterPty) -> Result<File, PtyError> {
     Ok(File::from(duplicate))
 }
 
+/// The errno XNU uses inside the kernel to redrive an open that lost the
+/// pty allocation race (`EREDRIVEOPEN` in `sys/errno.h`, kernel only).
+///
+/// Two opens of `/dev/ptmx` at the same time, in any processes, can be
+/// handed the same minor number: the clone picks the first free slot and
+/// claims it only later, with the devfs lock dropped in between. The loser
+/// gets `EREDRIVEOPEN`, which `vn_open_auth` redrives ten times and then
+/// returns to user space, where `openpty(3)` reports it as
+/// `Unknown error: -6` (#563).
+const EREDRIVEOPEN: i32 = -6;
+/// Most `openpty` calls one spawn makes while the kernel keeps reporting
+/// [`EREDRIVEOPEN`]. A lost race leaves no state behind, so the next
+/// attempt is a fresh open; at 16 threads opening ptys as fast as they
+/// can, no open needed more than one retry in 160 000.
+const OPEN_ATTEMPTS: u32 = 8;
+
+/// Runs `open` until it succeeds, fails with anything but a lost pty
+/// allocation race ([`EREDRIVEOPEN`]), or has run [`OPEN_ATTEMPTS`] times,
+/// sleeping one more millisecond after each lost race so a competing open
+/// can claim its minor first.
+///
+/// `portable-pty` reports a failed `openpty(3)` as text only (`failed to
+/// openpty: {errno:?}`), so the race is recognised by the `Debug` form of
+/// the errno inside that text.
+///
+/// A process-wide lock around `openpty` is no fix: the race is lost to
+/// opens in other processes too, and a rare kernel spin in `grantpt(3)`
+/// (#563) would then hold up every later spawn instead of one.
+fn redrive_open<T, E: fmt::Display>(mut open: impl FnMut() -> Result<T, E>) -> Result<T, E> {
+    let mut attempt: u32 = 1;
+    loop {
+        match open() {
+            Err(err) if attempt < OPEN_ATTEMPTS && lost_allocation_race(&err) => {
+                tracing::debug!(attempt, "pty allocation race lost; opening again");
+                thread::sleep(std::time::Duration::from_millis(attempt.into()));
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Whether `err` is `openpty(3)` failing with [`EREDRIVEOPEN`].
+fn lost_allocation_race(err: &impl fmt::Display) -> bool {
+    let raced = format!("{:?}", io::Error::from_raw_os_error(EREDRIVEOPEN));
+    err.to_string().contains(&raced)
+}
+
 fn check_size(size: PtySize) -> Result<(), PtyError> {
     if size.rows == 0 || size.cols == 0 {
         return Err(PtyError::InvalidSize(size));
@@ -1253,6 +1302,60 @@ impl From<PtySize> for portable_pty::PtySize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `openpty` failing with `errno`, worded as `portable-pty` 0.9 words it
+    /// (#563 saw `failed to openpty: Os { code: -6, kind: Uncategorized,
+    /// message: "Unknown error: -6" }`).
+    fn openpty_error(errno: i32) -> String {
+        format!(
+            "failed to openpty: {:?}",
+            io::Error::from_raw_os_error(errno)
+        )
+    }
+
+    /// Runs [`redrive_open`] over `results`, one per attempt, and returns
+    /// its result with the number of attempts it made.
+    fn redrive(results: &[Result<u8, String>]) -> (Result<u8, String>, usize) {
+        let mut calls = 0;
+        let result = redrive_open(|| {
+            calls += 1;
+            results[calls - 1].clone()
+        });
+        (result, calls)
+    }
+
+    #[test]
+    fn a_lost_allocation_race_is_opened_again() {
+        let raced = Err(openpty_error(EREDRIVEOPEN));
+        assert_eq!(redrive(&[raced.clone(), Ok(7)]), (Ok(7), 2));
+        assert_eq!(
+            redrive(&[raced.clone(), raced.clone(), raced, Ok(7)]),
+            (Ok(7), 4)
+        );
+    }
+
+    #[test]
+    fn redriving_stops_after_open_attempts() {
+        let raced = Err(openpty_error(EREDRIVEOPEN));
+        let results = vec![raced.clone(); OPEN_ATTEMPTS as usize + 1];
+        assert_eq!(redrive(&results), (raced, OPEN_ATTEMPTS as usize));
+    }
+
+    #[test]
+    fn other_open_failures_are_not_retried() {
+        // Descriptors or ptys exhausted, no such device, and an errno whose
+        // text starts like the race's.
+        let errnos = [Errno::EMFILE, Errno::EAGAIN, Errno::ENXIO].map(|errno| errno as i32);
+        for errno in errnos.into_iter().chain([-60, 6]) {
+            let failed = Err(openpty_error(errno));
+            assert_eq!(
+                redrive(&[failed.clone(), Ok(7)]),
+                (failed, 1),
+                "errno {errno}"
+            );
+        }
+        assert_eq!(redrive(&[Ok(7)]), (Ok(7), 1));
+    }
 
     #[test]
     fn zero_dimensions_are_rejected() {
