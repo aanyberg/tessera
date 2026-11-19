@@ -90,6 +90,15 @@ struct SettingsFieldContext {
     var fallback: String?
     /// The profile, for a profile's field.
     var profile: Int?
+    /// The ``SettingsModel/profileListGeneration`` a profile's row was made
+    /// for: once the list has moved on, the row is made again and a slider
+    /// or stepper of the old one, still pressed, writes nothing (#536).
+    var listGeneration: Int?
+
+    /// Whether the row is the one the list shows now.
+    @MainActor var isCurrent: Bool {
+        listGeneration.map { $0 == model.profileListGeneration } ?? true
+    }
 
     /// The value shown.
     @MainActor var current: TesseraConfigValue? {
@@ -109,12 +118,24 @@ extension SettingsField {
     }
 
     /// A slider's or stepper's: every change coalesced, ``SettingsModel/endChange(_:)``
-    /// on release (``endEditing(_:)``).
+    /// on release (``endEditing(_:)``). A value whose label reads as the
+    /// label shown is no step: a slider sends the knob's value when pressed
+    /// (and an `NSSlider` again on mouse-up), and for a value off the step
+    /// (0.123 by hand, or 0.85 read back as the `f32` 0.85000002) that is
+    /// the nearest step, which a press that does not move must not write
+    /// (#534). A value the label shows differently is always written, so on
+    /// a slider whose label is finer than its step (dim, 1 % against 5 %)
+    /// the step nearest a value off it can be chosen.
     @MainActor
     func doubleBinding(_ context: SettingsFieldContext) -> Binding<Double> {
         Binding(
             get: { context.current?.double ?? 0 },
-            set: { context.model.change(context.path, .float(Self.rounded($0, control))) })
+            set: { new in
+                guard context.isCurrent else { return }
+                let value = Self.rounded(new, control)
+                guard Self.shown(value, control) != Self.shown(context.current?.double ?? 0, control) else { return }
+                context.model.change(context.path, .float(value))
+            })
     }
 
     @MainActor
@@ -203,6 +224,16 @@ extension SettingsField {
         guard case .integerSlider(let range, _) = control else { return Int64(value.rounded()) }
         let clamped = min(max(value.rounded(), Double(range.lowerBound)), Double(range.upperBound))
         return Int64(clamped)
+    }
+
+    /// A slider's or stepper's value as its label shows it: a slider's to
+    /// a hundredth (`33 %`, `0.33`), a stepper's to a tenth.
+    static func shown(_ value: Double, _ control: Control) -> Double {
+        switch control {
+        case .slider: (value * 100).rounded() / 100
+        case .stepper: (value * 10).rounded() / 10
+        default: value
+        }
     }
 
     /// A slider's value on its step, so a drag writes `0.85`, not

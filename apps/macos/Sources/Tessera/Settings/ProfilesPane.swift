@@ -160,7 +160,9 @@ private struct ProfileDetail: View {
                 ForEach(ProfilesPane.fields) { field in
                     SettingsFieldRow(
                         field: field,
-                        context: .init(model: model, path: profile.key(field.key), profile: profile.index))
+                        context: .init(
+                            model: model, path: profile.key(field.key), profile: profile.index,
+                            listGeneration: model.profileListGeneration))
                     .disabled(readOnly)
                 }
             }
@@ -172,7 +174,7 @@ private struct ProfileDetail: View {
                             field: field,
                             context: .init(
                                 model: model, path: profile.key(field.key), fallback: field.key,
-                                profile: profile.index),
+                                profile: profile.index, listGeneration: model.profileListGeneration),
                             disabled: inherits)
                         .disabled(readOnly)
                         Toggle(

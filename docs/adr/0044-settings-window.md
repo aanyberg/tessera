@@ -636,8 +636,8 @@ rule now runs at the release.
   reloads, the control shows the edit, and the next step starts from it.
 - **What looks like no edit.** A configuration applied during the press
   can leave the key as it was, or on an earlier value of the press: another
-  app saved over the step before the watch read it, or a profile row moved.
-  That cannot be told from the press's own values on their way, so if one
+  app saved over the step before the watch read it. (A profile row that
+  moved ends the press instead: the #534 and #536 amendment.) That cannot be told from the press's own values on their way, so if one
   applied since the last write, the model reloads
   `profileSettleTimeout` (2 s) after the release, unless the key is pressed
   again, and the control shows what is applied. A watch slower than that
@@ -660,6 +660,44 @@ rule now runs at the release.
   release until the newer values apply. In a press that made a step, a hand
   edit equal to one of its unseen writes still reads as the press's own: a
   last step not yet written goes over it, and if the last step was written
-  the control shows the edit after `profileSettleTimeout`. A step taken
-  after a profile row moved under the press goes to the profile now at that
-  index.
+  the control shows the edit after `profileSettleTimeout`. A profile row
+  that moved under the press ends it (the #534 and #536 amendment).
+
+## Amendment: a press that does not move, and a press whose row goes (#534, #536, 2026-11-19)
+
+This completes the #517 amendment's "The release".
+
+- **The value shown is no step.** A slider sends the knob's value when it
+  is pressed, and an `NSSlider` (the macOS 15 SDK) again on mouse-up. The
+  knob sits on a step, so for a value off the step (`0.123` by hand, or
+  `0.85` as the core's `f32` reads it back, 0.85000002) that value differs
+  from the one shown. A value that the label shows as it shows the value
+  set (a slider's to a hundredth, `12 %` or `0.12`; a stepper's to a tenth)
+  is no step: a press that does not move writes nothing, and the file keeps
+  `0.123`. A value the label shows differently is always written. On the
+  opacity slider the step is the label's hundredth, so that is any step.
+  On the dim slider the label counts in 1 % and the step is 5 %, so a
+  value off the step (`0.33` by hand, `33 %`) and the step nearest it
+  (`35 %`, where the knob sits) look different: a press that ends there
+  writes `0.35`. A click on the knob does too, as it cannot be told from a
+  drag that ends where it began. Steppers follow the same rule.
+- **A press whose row goes.** When `profileListGeneration` moves (a hand
+  edit added, removed, reordered or changed a profile, or an add or delete
+  was released), the Profiles pane makes the rows again, so a pressed
+  slider or stepper there goes with no release. The model ends the press of
+  every profile key then: a step held back is dropped, nothing more is
+  written, and with no write running the row shows the configuration
+  applied at once. The old control's value binding carries the generation
+  it was made for and writes nothing after it moved, so its late actions
+  go to no profile, and its release finds no press. A press of the new row
+  writes as any. Only the reload of a hand edit settles the row at once: a
+  value pending when an add or delete is released settles at the next
+  apply.
+- **Not covered: a save undone before the watch reads it (#535).** When
+  another app restores the file inside the watch's debounce, the watch
+  reads a configuration equal to the one applied, so no
+  `on_config_applied` arrives and the value set stays shown as pending
+  until the next apply or the window opens again. The model cannot tell
+  that read from a slow watch (the #517 B1 rule waits for the watch however
+  long it takes), so the fix is the core's: report a read that changed
+  nothing.

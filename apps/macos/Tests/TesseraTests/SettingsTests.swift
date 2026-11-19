@@ -3186,6 +3186,249 @@ extension SettingsTests {
         XCTAssertEqual(writer.calls.last, .init(key: key, value: .float(15)))
     }
 
+    private var opacityField: SettingsField {
+        get throws { try XCTUnwrap(AppearancePane.fields.first { $0.key == "appearance.opacity" }) }
+    }
+
+    /// #534: a slider pressed and let go without moving sends the knob's
+    /// value, the step nearest the value shown: for one off the step (0.123
+    /// by hand, or 0.85 as the core's `f32` reads it back) that is no step,
+    /// and nothing is written.
+    func testANoMovePressOfAValueOffTheStepWritesNothing() async throws {
+        for (file, knob) in [("0.12300000339746475", 0.12), ("0.8500000238418579", 0.85)] {
+            let clock = ManualClock()
+            let config = Self.fakeConfig.replacingOccurrences(of: #""opacity": 0.85"#, with: #""opacity": \#(file)"#)
+            let (model, _, writer) = try fakeModel(config, clock: clock)
+            let field = try opacityField
+            let context = SettingsFieldContext(model: model, path: field.key)
+            let shown = try XCTUnwrap(model.value(field.key))
+            field.editingChanged(context)(true)
+            field.doubleBinding(context).wrappedValue = knob
+            field.editingChanged(context)(false)
+            clock.advance(by: .zero)
+            try await Task.sleep(for: .milliseconds(50))
+            clock.advance(by: model.profileSettleTimeout)
+            XCTAssertEqual(writer.calls, [], "\(file): the press writes nothing")
+            XCTAssertEqual(model.value(field.key), shown, file)
+            XCTAssertFalse(model.isPending(field.key), file)
+        }
+    }
+
+    /// #534 on the macOS 15 SDK's `NSSlider`: a hand edit off the step
+    /// applies while the knob is held without moving; the mouse-up action
+    /// after the release sends the step nearest it, which writes nothing.
+    func testAHandEditOffTheStepDuringANoMoveHoldIsNotRounded() async throws {
+        let clock = ManualClock()
+        let (model, source, writer) = try fakeModel(Self.fakeConfig, clock: clock)
+        let field = try opacityField
+        let context = SettingsFieldContext(model: model, path: field.key)
+        field.editingChanged(context)(true)
+        try applyOpacity("0.12300000339746475", generation: 1, model, source)
+        field.editingChanged(context)(false)
+        field.doubleBinding(context).wrappedValue = 0.12
+        clock.advance(by: .zero)
+        try await Task.sleep(for: .milliseconds(50))
+        clock.advance(by: model.profileSettleTimeout)
+        XCTAssertEqual(writer.calls, [], "the release writes nothing")
+        XCTAssertEqual(model.value(field.key), .float(0.12300000339746475))
+        XCTAssertFalse(model.isPending(field.key))
+    }
+
+    /// A slider moved off a value off the step and back writes the step
+    /// it ends on: only the value shown is compared, not where the press
+    /// began.
+    func testASliderMovedFromAValueOffTheStepAndBackWritesTheStep() async throws {
+        let clock = ManualClock()
+        let config = Self.fakeConfig.replacingOccurrences(of: #""opacity": 0.85"#, with: #""opacity": 0.123"#)
+        let (model, _, writer) = try fakeModel(config, clock: clock)
+        let field = try opacityField
+        let context = SettingsFieldContext(model: model, path: field.key)
+        field.editingChanged(context)(true)
+        field.doubleBinding(context).wrappedValue = 0.2
+        try await waitUntil("0.2 written") { writer.calls.count == 1 && !model.isWriting }
+        field.doubleBinding(context).wrappedValue = 0.12
+        field.editingChanged(context)(false)
+        try await waitUntil("0.12 written") { writer.calls.count == 2 && !model.isWriting }
+        XCTAssertEqual(writer.calls.last, .init(key: field.key, value: .float(0.12)))
+    }
+
+    /// #534 review M1: the dim slider's label counts in 1 % but its step
+    /// is 5 %, so a value off the step (0.33 by hand, `33 %`) and its
+    /// nearest step (`35 %`) look different: a press that ends on that
+    /// step writes it, as does one that ends on the range's end (0.79 by
+    /// hand, `80 %`).
+    func testASliderEndedOnAStepShownDifferentlyFromAValueOffItWritesTheStep() async throws {
+        let field = try XCTUnwrap(AppearancePane.fields.first { $0.key == "appearance.dim_inactive_panes" })
+        for (file, set, knob) in [("0.33000001311302185", 0.33, 0.35), ("0.7900000214576721", 0.79, 0.8)] {
+            let config = Self.fakeConfig.replacingOccurrences(
+                of: #""opacity": 0.85"#, with: #""opacity": 0.85, "dim_inactive_panes": \#(file)"#)
+            XCTAssertNotEqual(config, Self.fakeConfig)
+            let (model, _, writer) = try fakeModel(config, clock: ManualClock())
+            let context = SettingsFieldContext(model: model, path: field.key)
+            XCTAssertEqual(model.value(field.key)?.double ?? 0, set, accuracy: 0.0001, file)
+            field.editingChanged(context)(true)
+            field.doubleBinding(context).wrappedValue = knob
+            field.editingChanged(context)(false)
+            try await waitUntil("\(knob) written") { writer.calls.count == 1 && !model.isWriting }
+            XCTAssertEqual(writer.calls, [.init(key: field.key, value: .float(knob))], file)
+        }
+    }
+
+    /// #534 review M3: an add released by the settle time (no
+    /// configuration showed it) moves the list generation as a hand edit
+    /// does, and ends the press of a profile's held slider the same way:
+    /// its writes are forgotten, and neither its late action nor its
+    /// release writes anything.
+    func testAnAddReleasedDuringAHeldProfileSliderEndsThePress() async throws {
+        let clock = ManualClock()
+        let (model, _, writer) = try fakeModel(Self.profileOpacities, clock: clock)
+        let field = try opacityField
+        let key = "profiles[1].appearance.opacity"
+        let held = SettingsFieldContext(
+            model: model, path: key, fallback: field.key, profile: 1, listGeneration: model.profileListGeneration)
+        field.editingChanged(held)(true)
+        field.doubleBinding(held).wrappedValue = 0.6
+        try await waitUntil("0.6 written") { writer.calls.count == 1 && !model.isWriting }
+        XCTAssertEqual(model.unappliedWriteCount(key), 1)
+
+        XCTAssertTrue(model.addProfile())
+        try await waitUntil("added") { writer.calls.count == 2 && !model.isWriting }
+        clock.advance(by: model.profileSettleTimeout)
+        XCTAssertNotNil(model.message(SettingsModel.profilesKey), "the add was released")
+        XCTAssertNotEqual(held.listGeneration, model.profileListGeneration, "the row is made again")
+        XCTAssertEqual(model.unappliedWriteCount(key), 0, "the press ended, its writes forgotten")
+        field.doubleBinding(held).wrappedValue = 0.4
+        field.editingChanged(held)(false)
+        clock.advance(by: .seconds(3))
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(writer.calls.count, 2, "nothing more is written: \(writer.calls)")
+    }
+
+    /// The configuration of #536: the second profile has an opacity, and
+    /// so does the third, which a hand edit can move to its index.
+    private static let profileOpacities = """
+        {"general": {"default_profile": "one"}, "appearance": {"theme": "Tessera Dark", "opacity": 0.85},
+         "profiles": [{"name": "one"}, {"name": "two", "appearance": {"opacity": 0.5}},
+                      {"name": "three", "appearance": {"opacity": 0.7}}]}
+        """
+
+    /// #536: the profile list changes while the second profile's opacity
+    /// is held (the first profile removed, or the held profile's key
+    /// removed). The pane makes the row again, so the slider goes with no
+    /// release: the press ends there, nothing more is written, the row
+    /// shows the applied value at once, and the old slider changes
+    /// nothing. A press of the new row writes as any.
+    func testAListChangeDuringAHeldSliderEndsThePress() async throws {
+        let removedFirst = Self.profileOpacities.replacingOccurrences(of: #"{"name": "one"}, "#, with: "")
+        let removedKey = Self.profileOpacities.replacingOccurrences(
+            of: #"{"name": "two", "appearance": {"opacity": 0.5}}"#, with: #"{"name": "two", "appearance": null}"#)
+        XCTAssertNotEqual(removedFirst, Self.profileOpacities)
+        XCTAssertNotEqual(removedKey, Self.profileOpacities)
+        for (edit, shown) in [(removedFirst, TesseraConfigValue.float(0.7)), (removedKey, .float(0.85))] {
+            let clock = ManualClock()
+            let (model, source, writer) = try fakeModel(Self.profileOpacities, clock: clock)
+            let field = try opacityField
+            let key = "profiles[1].appearance.opacity"
+            let held = SettingsFieldContext(
+                model: model, path: key, fallback: field.key, profile: 1, listGeneration: model.profileListGeneration)
+            field.editingChanged(held)(true)
+            field.doubleBinding(held).wrappedValue = 0.6
+            try await waitUntil("0.6 written") { writer.calls.count == 1 && !model.isWriting }
+            clock.advance(by: SettingsModel.coalescingInterval / 2)
+            field.doubleBinding(held).wrappedValue = 0.59
+            XCTAssertEqual(writer.calls.count, 1, "0.59 held back")
+
+            source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(edit))
+            model.reload()
+            XCTAssertNotEqual(held.listGeneration, model.profileListGeneration, "the row is made again")
+            XCTAssertFalse(model.isPending(key), "the press ended")
+            XCTAssertEqual(model.unappliedWriteCount(key), 0, "its writes forgotten")
+            XCTAssertEqual(held.current, shown, "the applied value, at once")
+            // The old slider, still pressed, and its release.
+            field.doubleBinding(held).wrappedValue = 0.4
+            field.editingChanged(held)(false)
+            clock.advance(by: .seconds(3))
+            try await Task.sleep(for: .milliseconds(50))
+            XCTAssertEqual(writer.calls.count, 1, "nothing more is written: \(writer.calls)")
+            XCTAssertEqual(held.current, shown)
+            XCTAssertFalse(model.isPending(key))
+
+            let row = SettingsFieldContext(
+                model: model, path: key, fallback: field.key, profile: 1, listGeneration: model.profileListGeneration)
+            field.editingChanged(row)(true)
+            field.doubleBinding(row).wrappedValue = 0.3
+            field.editingChanged(row)(false)
+            try await waitUntil("the new row's press written") { writer.calls.count == 2 && !model.isWriting }
+            XCTAssertEqual(writer.calls.last, .init(key: key, value: .float(0.3)))
+        }
+    }
+
+    /// #536 with the press's write still running when the list changes:
+    /// the step held back behind it is dropped with the press, not written
+    /// to the profile now at that index once the write returns.
+    func testAListChangeDuringAHeldSliderDropsTheStepHeldBehindAWrite() async throws {
+        let clock = ManualClock()
+        let gate = DispatchSemaphore(value: 0)
+        defer { gate.signal() }
+        let writer = FakeWriter()
+        writer.respond = { _, attempt in
+            if attempt == 1 { gate.wait() }
+            return nil
+        }
+        let (model, source, _) = try fakeModel(Self.profileOpacities, writer: writer, clock: clock)
+        let key = "profiles[1].appearance.opacity"
+        model.beginChange(key)
+        model.change(key, .float(0.6))
+        try await waitUntil("0.6 being written") { writer.calls.count == 1 }
+        model.change(key, .float(0.59))
+        let removed = Self.profileOpacities.replacingOccurrences(of: #"{"name": "one"}, "#, with: "")
+        source.snapshot = TesseraConfigSnapshot(generation: 1, config: try Self.json(removed))
+        model.reload()
+        gate.signal()
+        try await waitUntil("the write returned") { !model.isWriting }
+        clock.advance(by: .seconds(3))
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(writer.calls.count, 1, "0.59 is not written: \(writer.calls)")
+    }
+
+    /// #536 on the core, in the window the app opens: the first profile is
+    /// removed by another app while the second's opacity is held. With no
+    /// release the row shows the applied value (the third profile's, now
+    /// at that index), and nothing is written to it.
+    func testARemovedProfileDuringAHeldSliderShowsTheAppliedValueOnTheCore() async throws {
+        let profiles = """
+            [[profiles]]
+            name = "one"
+
+            [[profiles]]
+            name = "two"
+            [profiles.appearance]
+            opacity = 0.5
+
+            [[profiles]]
+            name = "three"
+            [profiles.appearance]
+            opacity = 0.7
+
+            """
+        let model = try openSettings(config: profiles)
+        let key = "profiles[1].appearance.opacity"
+        try await waitUntil("the profiles") { model.profiles.count == 3 }
+        model.beginChange(key)
+        model.change(key, .float(0.6))
+        try await waitUntil("written") { !model.isWriting && self.contents.contains("0.6") }
+        let removed = profiles.replacingOccurrences(of: "[[profiles]]\nname = \"one\"\n\n", with: "")
+        XCTAssertNotEqual(removed, profiles)
+        try removed.write(to: configFile, atomically: true, encoding: .utf8)
+        try await waitUntil("applied, and the row shows it") {
+            model.profiles.count == 2 && !model.isPending(key) && Self.same(model.value(key), .float(0.7))
+        }
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertFalse(model.isWriting)
+        XCTAssertEqual(try file(), removed, "nothing written")
+        XCTAssertTrue(Self.same(model.value(key), .float(0.7)))
+    }
+
     /// The real opacity slider where it is an `NSSlider`: in an app linked
     /// against the macOS 15 SDK, which is what CI and releases build. An
     /// app linked against a later SDK gets SwiftUI's own slider, and the
@@ -3358,6 +3601,51 @@ extension SettingsTests {
         clock.advance(by: model.profileSettleTimeout)
         XCTAssertEqual(writer.calls.count, written)
         XCTAssertEqual(model.value(key), .float(0.3))
+    }
+
+    /// #534 on the `NSSlider` CI and releases get: a value off the step,
+    /// clicked on the knob with no drag. Where AppKit sends no action for
+    /// the click the press did not reach the slider, and the test is
+    /// skipped; otherwise nothing is written and the file's value stays.
+    func testANoMoveClickOnAnNSSliderKeepsAValueOffTheStep() async throws {
+        let clock = ManualClock()
+        let config = Self.fakeConfig.replacingOccurrences(
+            of: #""opacity": 0.85"#, with: #""opacity": 0.12300000339746475"#)
+        let (model, _, writer) = try fakeModel(config, clock: clock)
+        let key = "appearance.opacity"
+        let (window, slider) = try await hostedOpacitySlider(.init(model: model, path: key))
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        let cell = try XCTUnwrap(slider.cell as? NSSliderCell)
+        let knob = cell.knobRect(flipped: slider.isFlipped)
+        let point = slider.convert(NSPoint(x: knob.midX, y: knob.midY), to: nil)
+        let actions = ActionCounter(slider)
+        defer {
+            slider.target = actions.target
+            slider.action = actions.action
+        }
+        func event(_ type: NSEvent.EventType) throws -> NSEvent {
+            try XCTUnwrap(
+                NSEvent.mouseEvent(
+                    with: type, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                    windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+        }
+        NSApp.postEvent(try event(.leftMouseUp), atStart: false)
+        window.sendEvent(try event(.leftMouseDown))
+        while let next = NSApp.nextEvent(matching: .leftMouseUp, until: .distantPast, inMode: .default, dequeue: true) {
+            NSApp.sendEvent(next)
+        }
+        clock.advance(by: .zero)
+        try await Task.sleep(for: .milliseconds(50))
+        guard !actions.values.isEmpty || !writer.calls.isEmpty || model.isPending(key) else {
+            throw XCTSkip("the synthetic click did not reach the NSSlider: no action, no change")
+        }
+        clock.advance(by: model.profileSettleTimeout)
+        XCTAssertEqual(writer.calls, [], "a click that does not move writes nothing")
+        XCTAssertEqual(model.value(key), .float(0.12300000339746475))
+        XCTAssertFalse(model.isPending(key))
     }
 
     /// The same slider without a hand edit: the last value of the drag,
