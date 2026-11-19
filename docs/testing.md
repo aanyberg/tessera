@@ -41,10 +41,16 @@ that holds the atfork lock. In #443 that was AppKit's `NSPersistentUI` queue (`a
 `-[NSPersistentUIWindowInfo initWithWindowID:]`); other samples show a CoreSpotlight queue. Terminal windows are not
 restorable by AppKit (the window state store restores them), which removes the `NSPersistentUI` partner but not the
 others. `scripts/app-test-watchdog.sh` kills such a host and reruns the hung test once; the run fails anyway when
-another test failed in it. A test that waits for a child's output should therefore wait for all of it and allow 30 s, so
-that it does not fail on its own on a loaded host. To reproduce locally, run the affected classes under TSan with
-`-test-iterations 20` through the watchdog (`taskpolicy -b` and a concurrent `cargo build`). On main that gave 1 hang in
-60 iterations of `TabVisibilityTests` and `PromptNavigationTests`, and none in 40 with terminal windows not restorable.
+another test failed in it. The watchdog does not see the same hang in a child copy of the host, so
+`TerminationSignalTests` handles it itself (#525). A loaded child that is still not ready 20 s after launch is
+sampled, and again every 20 s after that. If one thread spent the whole sample in `wrap_fork` with an atfork prepare
+handler or `__tsan::` frames on the same stack (only the sample is read, never the child's output), the child is killed
+and started once more. The deadlock never resolves, so a retry costs about 25 s and the test stays within the default
+120 s allowance and the watchdog's 150 s limit. A second hang fails the test as the second try. A test that waits for
+a child's output should wait for all of it and allow 30 s, so that it does not fail on its own on a loaded host. To
+reproduce locally, run the affected classes under TSan with `-test-iterations 20` through the watchdog (`taskpolicy -b`
+and a concurrent `cargo build`). On main that gave 1 hang in 60 iterations of `TabVisibilityTests` and
+`PromptNavigationTests`, and none in 40 with terminal windows not restorable.
 
 ## Hung runs: the test watchdog
 
