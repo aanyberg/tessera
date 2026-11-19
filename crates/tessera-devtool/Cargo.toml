@@ -21,6 +21,8 @@ tessera-term.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# The thread's CPU clock, for a bar that load must not move.
+nix = { workspace = true, features = ["time"] }
 serde_json.workspace = true
 tempfile = "3"
 

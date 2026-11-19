@@ -1861,6 +1861,44 @@ mod tests {
         }
     }
 
+    /// Makes the scoped subscribers of these tests see every event when
+    /// the tests share a process (`cargo test`): a process-wide subscriber
+    /// interested in every callsite and enabled for none. Without it a
+    /// callsite first hit by a thread with no subscriber is cached as of no
+    /// interest to any thread, as in `tessera_config`'s store tests (#430).
+    fn captures_see_every_event() {
+        struct Interested;
+
+        impl tracing::Subscriber for Interested {
+            fn register_callsite(
+                &self,
+                _: &'static tracing::Metadata<'static>,
+            ) -> tracing::subscriber::Interest {
+                tracing::subscriber::Interest::sometimes()
+            }
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                false
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            // Fails only if a global subscriber is set already, which then
+            // decides; nothing in this crate sets one.
+            let _ = tracing::subscriber::set_global_default(Interested);
+        });
+        // A callsite whose interest was cached before the line above.
+        tracing::callsite::rebuild_interest_cache();
+    }
+
     /// Counts the warnings (and errors) logged on the thread it is the
     /// default subscriber of.
     struct WarningCount(std::sync::atomic::AtomicUsize);
@@ -1889,6 +1927,7 @@ mod tests {
     /// one from `App::with_config_dir`; and clipboard writes are refused.
     #[test]
     fn a_broken_file_at_start_is_one_warning() {
+        captures_see_every_event();
         let root = tempfile::tempdir().unwrap();
         let paths = ConfigPaths::new(root.path());
         std::fs::write(paths.config_file(), "[terminal\nclipboard_write = true\n").unwrap();
@@ -1898,6 +1937,79 @@ mod tests {
         });
         assert_eq!(count.0.load(Ordering::SeqCst), 1, "one warning at start");
         assert!(!app.config().terminal.clipboard_write, "writes refused");
+    }
+
+    /// `open_config` on a file that exists and is watched only answers with
+    /// its path (#324 item 9): a `config.toml` that does not load is not
+    /// loaded and logged again, and no second watch starts.
+    #[test]
+    fn open_config_while_watching_does_not_load_the_file_again() {
+        captures_see_every_event();
+        let root = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(root.path());
+        let app = App::with_config_dir(paths.clone(), WatchOptions::default());
+        app.open_config(WatchOptions::default()).unwrap();
+        assert!(app.is_watching_config());
+        let starts = app.config_watch_starts();
+        std::fs::write(paths.config_file(), "[terminal\n").unwrap();
+        let count = Arc::new(WarningCount(std::sync::atomic::AtomicUsize::new(0)));
+        let path = tracing::subscriber::with_default(Arc::clone(&count), || {
+            app.open_config(WatchOptions::default()).unwrap()
+        });
+        assert_eq!(path, paths.config_file());
+        assert_eq!(count.0.load(Ordering::SeqCst), 0, "not loaded again");
+        assert_eq!(app.config_watch_starts(), starts, "still the one watch");
+    }
+
+    /// A `config.toml` deleted while it is watched is created again by
+    /// `open_config`, which the editor it is opened in needs, and the watch
+    /// goes on.
+    #[test]
+    fn open_config_recreates_a_file_deleted_while_watching() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(root.path());
+        let app = App::with_config_dir(paths.clone(), WatchOptions::default());
+        app.open_config(WatchOptions::default()).unwrap();
+        std::fs::remove_file(paths.config_file()).unwrap();
+        assert!(app.is_watching_config());
+        let path = app.open_config(WatchOptions::default()).unwrap();
+        assert_eq!(path, paths.config_file());
+        assert!(path.is_file(), "created again");
+        assert!(app.is_watching_config());
+    }
+
+    /// The theme file in use grown past the size cap fails to read rather
+    /// than to parse: that failure too is one warning however many
+    /// `ThemesChanged` find it, and the colours stay.
+    #[test]
+    fn a_theme_file_in_use_past_the_cap_is_logged_once() {
+        captures_see_every_event();
+        let root = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(root.path());
+        std::fs::create_dir_all(paths.themes_dir()).unwrap();
+        // Matched by its `name` key: a file whose stem is the theme's name
+        // is reported by the lookup instead.
+        let file = paths.themes_dir().join("mine.toml");
+        std::fs::write(&file, theme_doc("Keyed", "#101010")).unwrap();
+        std::fs::write(paths.config_file(), "[appearance]\ntheme = \"Keyed\"\n").unwrap();
+        let store = ConfigStore::open(paths.clone()).unwrap();
+        let app = App::new((*store.config()).clone(), paths);
+        let live = app.live();
+        live.reconcile(&store);
+        let cap = usize::try_from(tessera_config::MAX_THEME_FILE_LEN).unwrap();
+        std::fs::write(&file, "#".repeat(cap + 1)).unwrap();
+        let capture = Arc::new(WarningText(Mutex::new(String::new())));
+        tracing::subscriber::with_default(Arc::clone(&capture), || {
+            live.handle(&store, ConfigEvent::ThemesChanged);
+            live.handle(&store, ConfigEvent::ThemesChanged);
+        });
+        let logged = lock(&capture.0).clone();
+        assert_eq!(logged.matches("does not load").count(), 1, "{logged:?}");
+        assert_eq!(
+            app.view_theme().background,
+            Rgba::from_srgb8(0x10, 0x10, 0x10),
+            "its colours are kept"
+        );
     }
 
     fn theme_doc(name: &str, background: &str) -> String {

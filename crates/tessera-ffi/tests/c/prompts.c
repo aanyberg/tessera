@@ -2,8 +2,9 @@
  * Prompt navigation smoke test of TesseraCore.h from C (ADR 0039), built
  * and run by scripts/ffi-c-test.sh: spawn /bin/sh printing two commands
  * with their OSC 133 marks around 30 plain lines on a 24-row screen, wait
- * (at most 5 s) until Select Last Output selects the last command's
- * output, then walk the prompts with tessera_session_scroll_to_prompt and
+ * until Select Last Output selects the last command's output (polls are
+ * counted, so a loaded machine stretches the wait instead of failing it),
+ * then walk the prompts with tessera_session_scroll_to_prompt and
  * ask tessera_session_has_command_output and the exit-status marks'
  * tessera_session_command_at, including NULL pointers and an unknown
  * session id.
@@ -79,34 +80,33 @@ int main(void) {
     uint64_t id = 0;
     EXPECT(tessera_session_spawn(app, &options, &id), TESSERA_ERROR_OK);
 
-    bool selected = false;
-    struct timespec start;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    for (;;) {
+    /* The history reaches 12 lines with "hi\n", before the marks after it
+     * are parsed: until the next prompt's mark is in, the last finished
+     * command is the first one, so wait for the selection itself. 6000
+     * polls of 10 ms: a minute on an idle machine. */
+    char text[64];
+    size_t len = 0;
+    for (int polls = 0;; polls++) {
+        bool selected = false;
         EXPECT(tessera_session_select_last_output(app, id, &selected), TESSERA_ERROR_OK);
         TesseraScrollPosition position;
         EXPECT(tessera_session_scroll_position(app, id, &position), TESSERA_ERROR_OK);
-        if (selected && position.history == 12) {
+        len = 0;
+        if (selected) {
+            EXPECT(tessera_session_selection_text(app, id, (uint8_t *)text, sizeof text, &len),
+                   TESSERA_ERROR_OK);
+        }
+        if (selected && position.history == 12 && len == 2 && memcmp(text, "hi", 2) == 0) {
             break;
         }
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        if (now.tv_sec - start.tv_sec > 5) {
-            fprintf(stderr, "timed out waiting for the output (history %llu)\n",
-                    (unsigned long long)position.history);
+        if (polls == 6000) {
+            fprintf(stderr, "timed out waiting for the output (history %llu, selected \"%.*s\")\n",
+                    (unsigned long long)position.history, (int)(len < sizeof text ? len : sizeof text),
+                    text);
             return 1;
         }
         struct timespec pause = {.tv_sec = 0, .tv_nsec = 10 * 1000 * 1000};
         nanosleep(&pause, NULL);
-    }
-
-    char text[64];
-    size_t len = 0;
-    EXPECT(tessera_session_selection_text(app, id, (uint8_t *)text, sizeof text, &len),
-           TESSERA_ERROR_OK);
-    if (len != 2 || memcmp(text, "hi", 2) != 0) {
-        fprintf(stderr, "selected \"%.*s\", expected \"hi\"\n", (int)len, text);
-        return 1;
     }
 
     bool has = false;

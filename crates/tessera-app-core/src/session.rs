@@ -499,6 +499,36 @@ struct SharedTerminal {
     /// waiting; a stale non-zero read costs at most [`GIVE_WAY_YIELDS`]
     /// needless yields.
     waiting: AtomicUsize,
+    /// What the reader's holds of the lock cost, for the lock-hold bar.
+    #[cfg(test)]
+    holds: Mutex<HoldLog>,
+}
+
+/// What the reader thread did under the terminal lock.
+#[cfg(test)]
+#[derive(Default)]
+struct HoldLog {
+    /// The reader's CPU time in each hold.
+    cpu: Vec<Duration>,
+    /// Holds ended in a row, up to now, with a thread waiting for the lock.
+    streak: usize,
+    /// The finished streaks: one for each time a thread had to wait.
+    streaks: Vec<usize>,
+}
+
+#[cfg(test)]
+impl HoldLog {
+    /// Records a hold that began when the thread's CPU clock read `from`
+    /// and is ending with a thread waiting for the lock or not.
+    fn record(&mut self, from: Duration, waited_for: bool) {
+        self.cpu.push(crate::thread_cpu_time().saturating_sub(from));
+        if waited_for {
+            self.streak += 1;
+        } else if self.streak > 0 {
+            let streak = std::mem::take(&mut self.streak);
+            self.streaks.push(streak);
+        }
+    }
 }
 
 /// Registration of one thread in [`SharedTerminal::waiting`], undone when
@@ -523,6 +553,8 @@ impl SharedTerminal {
         Self {
             term: Mutex::new(term),
             waiting: AtomicUsize::new(0),
+            #[cfg(test)]
+            holds: Mutex::default(),
         }
     }
 
@@ -2017,6 +2049,8 @@ fn advance_chunk(
         // The reader locks the mutex directly: it never counts as waiting,
         // so it never makes itself yield.
         let mut locked = lock(&term.term);
+        #[cfg(test)]
+        let held_from = crate::thread_cpu_time();
         locked.advance(slice);
         let mut replies = Vec::new();
         // Only `Terminal::resize` changes the epoch, never `advance`: the
@@ -2041,6 +2075,8 @@ fn advance_chunk(
             pause_at(std::ptr::from_ref(term).addr(), LockPause::ReaderReplies);
             reply(replies);
         }
+        #[cfg(test)]
+        lock(&term.holds).record(held_from, term.waiting.load(Ordering::Relaxed) > 0);
         drop(locked);
         give_way(term, thread::yield_now);
         rest = after;
@@ -3341,30 +3377,85 @@ pub(crate) mod tests {
         waits
     }
 
+    /// What [`lock_holds`] saw.
+    struct Holds {
+        /// For each time a thread had to wait for the terminal lock, the
+        /// slices the reader finished in a row with it waiting; sorted.
+        streaks: Vec<usize>,
+        /// The reader's CPU time in each hold of the lock; sorted.
+        cpu: Vec<Duration>,
+    }
+
+    /// Feeds 50 MiB of `line` (repeated) to a fresh session in chunks of
+    /// `chunk_len` bytes while a thread takes the terminal lock every
+    /// 200 µs, as `render_view` does once per frame.
+    fn lock_holds(line: &str, chunk_len: usize) -> Holds {
+        const VOLUME: usize = 50 * 1024 * 1024;
+        let app = App::new(Config::default(), ConfigPaths::new("/nonexistent/tessera"));
+        let (id, tx, events) = fake_session(&app, PtySize::new(24, 80));
+        let session = app.session(id).expect("session");
+        let corpus = repeated(line, VOLUME);
+        let chunks = corpus.chunks(chunk_len).count();
+        let done = AtomicBool::new(false);
+        thread::scope(|scope| {
+            let probe = scope.spawn(|| {
+                while !done.load(Ordering::Acquire) {
+                    app.with_terminal(id, |_| ()).expect("session");
+                    thread::sleep(Duration::from_micros(200));
+                }
+            });
+            for chunk in corpus.chunks(chunk_len) {
+                tx.send(PtyEvent::Output(chunk.to_vec()))
+                    .expect("reader alive");
+            }
+            for _ in 0..chunks {
+                let event = events
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("output");
+                assert_eq!(event, SessionEvent::Output);
+            }
+            done.store(true, Ordering::Release);
+            probe.join().expect("probe");
+        });
+        let HoldLog {
+            mut cpu,
+            mut streaks,
+            ..
+        } = std::mem::take(&mut *lock(&session.term.holds));
+        drop(session);
+        app.close_session(id).expect("close");
+        streaks.sort_unstable();
+        cpu.sort_unstable();
+        Holds { streaks, cpu }
+    }
+
     /// The lock-hold bar of #83: while the reader parses 50 MiB each of the
     /// `sgr_heavy` and `cjk` corpus lines, delivered in 64 KiB chunks (the
     /// largest the native PTY reader delivers) and in 1 KiB chunks (what a
-    /// macOS PTY delivers under a flood), a thread taking the terminal lock
-    /// the way `render_view` does waits at most 2 ms at the 99th percentile
-    /// and 5 ms at worst.
+    /// macOS PTY delivers under a flood), a thread that waits for the
+    /// terminal lock the way `render_view` does gets it after a slice or
+    /// two of the reader's, and each hold costs the reader at most 2 ms of
+    /// CPU time at the 99th percentile and 5 ms at worst.
     ///
-    /// Timing-based, so run it only in release builds, one test at a time:
-    /// `cargo nextest run --release -p tessera-app-core --test-threads 1
-    /// reader_lock_hold`. In debug builds (where `scripts/quality-gate.sh`
-    /// runs the suite) it is ignored; `--run-ignored` there would run it
-    /// unoptimised, where the bar does not apply. It prints every attempt's
-    /// percentiles.
+    /// Neither measure reads a wall clock, because on one the bar failed on
+    /// correct builds at load 55 and above (#520): a preempted reader or
+    /// probe stretches a wait by a time slice of other work. A hold's CPU
+    /// time leaves preemption out, and a waiter is measured in the holds
+    /// the reader ends while it is counted as waiting. The median is what
+    /// is bounded, since a waiter that is itself descheduled lets slices
+    /// pass that say nothing about the reader. Only times a thread really
+    /// waited count: at high load the reader is often idle between chunks,
+    /// and a probe that finds the lock free says nothing either.
     ///
-    /// Each case gets up to three attempts and passes on the first that
-    /// meets the bar. A measured wait includes the probe's own scheduling
-    /// delay, so on a loaded machine a single preemption of the probe (or
-    /// of the reader inside a slice) can push one sample past 5 ms; a
-    /// reader that keeps the lock (main before #83: hundreds of
-    /// milliseconds, a few dozen samples) fails every attempt.
+    /// Release only, like every bar here that depends on the speed of
+    /// optimised code; `cargo nextest run --release -p tessera-app-core
+    /// reader_lock_hold --no-capture` prints the figures of every attempt.
+    /// A case has three attempts and passes on the first that meets the bar.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "timing bar; run in release")]
     fn reader_lock_hold_is_bounded() {
         const ATTEMPTS: usize = 3;
+        const MAX_MEDIAN_STREAK: usize = 3;
         let cases = [
             ("sgr_heavy", SGR_HEAVY, PTY_CHUNK),
             ("cjk", CJK, PTY_CHUNK),
@@ -3375,23 +3466,30 @@ pub(crate) mod tests {
         for (name, line, chunk_len) in cases {
             let mut misses = Vec::new();
             for attempt in 1..=ATTEMPTS {
-                let waits = lock_waits(line, chunk_len, 1).remove(0);
-                let p99 = waits[waits.len() * 99 / 100];
-                let max = *waits.last().expect("samples");
+                let Holds { streaks, cpu } = lock_holds(line, chunk_len);
+                let waited = streaks.len();
+                let median = streaks.get(waited / 2).copied().unwrap_or(0);
+                let p99 = cpu[cpu.len() * 99 / 100];
+                let max = *cpu.last().expect("holds");
                 eprintln!(
-                    "{name} attempt {attempt}: {} samples, p50 {:?}, p99 {p99:?}, max {max:?}",
-                    waits.len(),
-                    waits[waits.len() / 2],
+                    "{name} attempt {attempt}: {waited} waits, median {median} slices in a row, \
+                     p99 {}; {} holds, CPU p50 {:?}, p99 {p99:?}, max {max:?}",
+                    streaks.get(waited * 99 / 100).copied().unwrap_or(0),
+                    cpu.len(),
+                    cpu[cpu.len() / 2],
                 );
                 let mut miss = Vec::new();
-                if waits.len() < 100 {
-                    miss.push(format!("only {} samples", waits.len()));
+                if waited < 100 {
+                    miss.push(format!("only {waited} waits"));
+                }
+                if median > MAX_MEDIAN_STREAK {
+                    miss.push(format!("a median wait spans {median} slices"));
                 }
                 if p99 > Duration::from_millis(2) {
-                    miss.push(format!("p99 wait {p99:?} > 2 ms"));
+                    miss.push(format!("p99 hold {p99:?} of CPU time > 2 ms"));
                 }
                 if max > Duration::from_millis(5) {
-                    miss.push(format!("max wait {max:?} > 5 ms"));
+                    miss.push(format!("longest hold {max:?} of CPU time > 5 ms"));
                 }
                 if miss.is_empty() {
                     misses.clear();

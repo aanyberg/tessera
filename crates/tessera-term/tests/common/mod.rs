@@ -533,3 +533,14 @@ pub fn render_pens(term: &Terminal) -> String {
     }
     out
 }
+
+/// The CPU time the calling thread has used so far.
+///
+/// For cost bars: time the thread spends preempted does not count, so a
+/// loaded machine cannot fail them the way it fails a wall-clock bar.
+#[allow(dead_code)]
+pub fn thread_cpu_time() -> std::time::Duration {
+    nix::time::clock_gettime(nix::time::ClockId::CLOCK_THREAD_CPUTIME_ID)
+        .expect("the thread CPU clock")
+        .into()
+}

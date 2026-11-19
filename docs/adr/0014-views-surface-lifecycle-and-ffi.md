@@ -248,7 +248,9 @@ M4, a machine already loaded by other builds; load averages in brackets):
 50 MiB of the `sgr_heavy` and `cjk` corpus lines in 64 KiB chunks (the
 largest the native PTY reader delivers) and in 1 KiB chunks (what a macOS
 PTY delivers), while a probe takes the lock through `with_terminal`, the way
-`render_view` does, every 200 µs.
+`render_view` does, every 200 µs. These are wall-clock waits, as the test
+measured them then; since #520 it bounds the slices the reader finishes per
+wait and the reader's CPU time per hold, which load does not move.
 
 | | 64 KiB chunks: p99 / max | 1 KiB chunks: p99 / max |
 |---|---|---|

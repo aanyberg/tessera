@@ -478,7 +478,18 @@ mod tests {
             .expect("queued");
         tx.send(PtyEvent::Exited(ExitStatus::Exited(0)))
             .expect("queued");
-        let started = Instant::now();
+        // CPU time: parsing the whole chunk costs many seconds of it, and
+        // a preempted thread does not add to it (the wall clock failed at
+        // load 60 and above).
+        let cpu_time = || {
+            let now = nix::time::clock_gettime(nix::time::ClockId::CLOCK_THREAD_CPUTIME_ID)
+                .expect("the thread's CPU clock");
+            Duration::new(
+                u64::try_from(now.tv_sec()).expect("positive"),
+                u32::try_from(now.tv_nsec()).expect("under a second"),
+            )
+        };
+        let started = cpu_time();
         let outcome = drive(
             &rx,
             Terminal::new(300, 300),
@@ -487,9 +498,9 @@ mod tests {
             |_| {},
         )
         .expect("the stream ends with an exit");
-        let elapsed = started.elapsed();
+        let spent = cpu_time().saturating_sub(started);
         assert_eq!(outcome.completion, Completion::TimedOut);
-        assert!(elapsed < Duration::from_secs(1), "took {elapsed:?}");
+        assert!(spent < Duration::from_secs(1), "took {spent:?} of CPU time");
     }
 
     #[test]

@@ -678,6 +678,9 @@ thread_local! {
     static RULE_COST: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
     /// Test hook: wall time charged to the budget per match a rule finds.
     static MATCH_COST: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+    /// Test hook: whether wall time counts toward the budget; off, only
+    /// the charged costs do, so a stall of the test thread cannot spend it.
+    static WALL_CLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     /// Test hook: how many rules the last [`smart_at`] on this thread
     /// started.
     static RULES_RUN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -689,6 +692,14 @@ thread_local! {
 /// The time the rules of a click have taken: since `started`, plus in tests
 /// the charged cost of the `ran` rules finished and the `found` matches.
 fn rules_time(started: Instant, ran: usize, found: usize) -> Duration {
+    #[cfg(test)]
+    let elapsed = if WALL_CLOCK.with(std::cell::Cell::get) {
+        started.elapsed()
+    } else {
+        Duration::ZERO
+    };
+    #[cfg(not(test))]
+    let elapsed = started.elapsed();
     #[cfg(test)]
     let charged = {
         let times = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
@@ -706,7 +717,7 @@ fn rules_time(started: Instant, ran: usize, found: usize) -> Duration {
         let _ = (ran, found);
         Duration::ZERO
     };
-    started.elapsed().saturating_add(charged)
+    elapsed.saturating_add(charged)
 }
 
 /// The cells of the best smart-selection match of `rules` covering the
@@ -3045,7 +3056,7 @@ mod tests {
             line: lines.base,
             col: 4,
         };
-        assert!(smart_at(&lines, at, &rules).is_some());
+        assert!(charged_only(|| smart_at(&lines, at, &rules)).is_some());
     }
 
     /// #430 m5: the dotted-name rule takes combining marks, so a name
@@ -3127,7 +3138,7 @@ mod tests {
         ));
         let run = |cost: Duration| {
             RULE_COST.with(|c| c.set(cost));
-            let found = smart_at(&lines, at, &rules);
+            let found = charged_only(|| smart_at(&lines, at, &rules));
             RULE_COST.with(|c| c.set(Duration::ZERO));
             (found, RULES_RUN.with(std::cell::Cell::get))
         };
@@ -3153,9 +3164,20 @@ mod tests {
             ("[a-z]+", Precision::Normal),
         ]);
         RULE_COST.with(|c| c.set(SMART_RULE_BUDGET));
-        assert_eq!(smart_at(&lines, at, &rules), path);
+        assert_eq!(charged_only(|| smart_at(&lines, at, &rules)), path);
         RULE_COST.with(|c| c.set(Duration::ZERO));
         assert_eq!(RULES_RUN.with(std::cell::Cell::get), 1);
+    }
+
+    /// Runs `f` with the rule budget counting only the charged test costs,
+    /// not wall time: a stall of the test thread past
+    /// [`SMART_RULE_BUDGET`] would skip the rules and select nothing
+    /// (#525), so tests that expect a match or exact counts run here.
+    fn charged_only<T>(f: impl FnOnce() -> T) -> T {
+        WALL_CLOCK.with(|clock| clock.set(false));
+        let out = f();
+        WALL_CLOCK.with(|clock| clock.set(true));
+        out
     }
 
     /// #351 m1 in real time: 64 slow user rules (`[a-z]+X|[a-z]`, ~425 ms
@@ -3211,7 +3233,7 @@ mod tests {
         };
         let run = |lines: &Lines<'_>, at: Pos, rules: &SmartRules, cost: Duration| {
             MATCH_COST.with(|c| c.set(cost));
-            let found = smart_at(lines, at, rules);
+            let found = charged_only(|| smart_at(lines, at, rules));
             MATCH_COST.with(|c| c.set(Duration::ZERO));
             (
                 found,
@@ -3350,7 +3372,7 @@ mod tests {
                 line: lines.base + 1,
                 col: 40,
             };
-            smart_at(&lines, at, &rules)
+            charged_only(|| smart_at(&lines, at, &rules))
         };
         // 250 cells (15 750 bytes): nothing is cut, the whole line matches.
         assert!(click(250).is_some());
@@ -3373,8 +3395,10 @@ mod tests {
     /// character (the budget stops it), within 10 s for a no-match rule
     /// with capture groups (about 3 s at worst idle), otherwise within 3 s
     /// (a rule that never matches costs one find over the whole window,
-    /// about 1 s at worst without captures). Release builds only: the
-    /// bound is for the shipped code.
+    /// about 1 s at worst without captures). The bounds are on the thread's
+    /// CPU time, which leaves out preemption but not core speed: a thread
+    /// moved to an efficiency core runs these regexes 3-4 times slower.
+    /// Release builds only: the bound is for the shipped code.
     #[cfg(not(debug_assertions))]
     #[test]
     fn hostile_smart_rules_are_refused_or_bounded() {
@@ -3384,8 +3408,10 @@ mod tests {
         // bar leaves room for a loaded machine.
         const NO_MATCH_BAR: Duration = Duration::from_secs(3);
         // The capture-group rule took 2.2-3.0 s idle and up to 6.2 s at load
-        // 14 in the adversarial probe.
-        const CAPTURES_BAR: Duration = Duration::from_secs(10);
+        // 14 in the adversarial probe, and 13.1 s of CPU time on an
+        // efficiency core under `taskpolicy -b` (#525): 3-4 times its cost
+        // on a performance core, so the bar is about six times the fast one.
+        const CAPTURES_BAR: Duration = Duration::from_secs(20);
         let captures = r"(?:(e?)(\x{301}?)){0,2560}[XY]";
         let cap = tessera_config::MAX_SMART_RULE_PATTERN_LEN;
         let mut literals = String::from("(?:w000");
@@ -3462,9 +3488,9 @@ mod tests {
                 };
                 let mut fastest = Duration::MAX;
                 for _ in 0..3 {
-                    let started = Instant::now();
+                    let started = crate::thread_cpu_time();
                     let _ = smart_at(&lines, mid, &compiled);
-                    fastest = fastest.min(started.elapsed());
+                    fastest = fastest.min(crate::thread_cpu_time().saturating_sub(started));
                 }
                 eprintln!("rule {index} on {text}: {fastest:?}");
                 // A rule with a match at every character stops at the
@@ -3544,7 +3570,7 @@ mod tests {
             col: 5,
         };
         assert_eq!(
-            smart_at(&lines, lib, &rules),
+            charged_only(|| smart_at(&lines, lib, &rules)),
             Some((
                 Pos {
                     line: lines.base + 30,

@@ -2094,8 +2094,23 @@ mod tests {
         }
     }
 
+    /// Runs `search` to its end in 16 ms steps; returns the last status and
+    /// the CPU time this thread spent. Every step runs on this thread, so a
+    /// loaded machine that preempts it does not count against the bars
+    /// below (on the wall clock they took 3.5 s at load 86, #525). A step's
+    /// budget is on the wall clock: a preempted step just does less.
+    fn scan_to_the_end(search: &mut SearchState, shared: &Shared) -> (SearchStatus, Duration) {
+        let started = crate::thread_cpu_time();
+        let mut status = search.step(shared, Duration::from_millis(16));
+        while !status.done {
+            status = search.step(shared, Duration::from_millis(16));
+        }
+        (status, crate::thread_cpu_time().saturating_sub(started))
+    }
+
     /// A full scan of 1 000 000 history lines (80 columns, one match every
-    /// line) finishes within 2 s. Release only, like the lock-hold bar.
+    /// line) takes at most 2 s of CPU time. Release only, like the
+    /// lock-hold bar.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "timing bar; run in release")]
     fn a_million_lines_scan_within_two_seconds() {
@@ -2107,13 +2122,8 @@ mod tests {
         ));
         let mut search = SearchState::default();
         search.start("fox", LITERAL).unwrap();
-        let started = Instant::now();
-        let mut status = search.step(&shared, Duration::from_millis(16));
-        while !status.done {
-            status = search.step(&shared, Duration::from_millis(16));
-        }
-        let took = started.elapsed();
-        eprintln!("1 000 000 lines: {took:?}, {status:?}");
+        let (status, took) = scan_to_the_end(&mut search, &shared);
+        eprintln!("1 000 000 lines: {took:?} of CPU time, {status:?}");
         assert_eq!(status.matches, MAX_MATCHES);
         assert!(status.truncated);
         assert!(took <= Duration::from_secs(2), "{took:?}");
@@ -2131,13 +2141,8 @@ mod tests {
         ));
         let mut search = SearchState::default();
         search.start("zebra", LITERAL).unwrap();
-        let started = Instant::now();
-        let mut status = search.step(&shared, Duration::from_millis(16));
-        while !status.done {
-            status = search.step(&shared, Duration::from_millis(16));
-        }
-        let took = started.elapsed();
-        eprintln!("1 000 000 lines, no match: {took:?}, {status:?}");
+        let (status, took) = scan_to_the_end(&mut search, &shared);
+        eprintln!("1 000 000 lines, no match: {took:?} of CPU time, {status:?}");
         assert_eq!(status.matches, 0);
         assert!(took <= Duration::from_secs(2), "{took:?}");
     }
@@ -2218,8 +2223,24 @@ mod tests {
     /// searched over many steps leaves the same matches as a fresh search
     /// of the final terminal: the new history, the screen, the older
     /// history and the evicted head are each filed whole.
+    ///
+    /// A stall of the test thread at the floor limit skips a piece by
+    /// design, and a match with it (#525); such an attempt shows nothing,
+    /// so up to five run and the first that skipped nothing is compared.
     #[test]
     fn a_chunk_searched_over_steps_files_every_match() {
+        for attempt in 1..=5 {
+            if chunk_searched_over_steps_without_a_skip() {
+                return;
+            }
+            eprintln!("attempt {attempt} skipped a piece");
+        }
+        panic!("every attempt skipped a piece");
+    }
+
+    /// One attempt of [`a_chunk_searched_over_steps_files_every_match`]:
+    /// `false` if the live search skipped a piece, else its checks.
+    fn chunk_searched_over_steps_without_a_skip() -> bool {
         let row = |n: usize| {
             let mut row = String::new();
             for col in 0..300 {
@@ -2259,6 +2280,11 @@ mod tests {
             }
         }
         while !search.step(&shared, Duration::ZERO).done {}
+        let skips = search.active.as_ref().unwrap().skips;
+        if skips > 0 {
+            eprintln!("{skips} pieces skipped");
+            return false;
+        }
         let mut fresh = SearchState::default();
         fresh.start("X", LITERAL).unwrap();
         while !fresh.step(&shared, Duration::from_secs(60)).done {}
@@ -2280,6 +2306,7 @@ mod tests {
         // moved on, the fresh one is the newest.
         let counts = |status: SearchStatus| (status.matches, status.done, status.truncated);
         assert_eq!(counts(search.status()), counts(fresh.status()));
+        true
     }
 
     const REGEX: QueryOptions = QueryOptions {

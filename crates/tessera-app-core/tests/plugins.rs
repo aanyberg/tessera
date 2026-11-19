@@ -89,8 +89,12 @@ struct Probe {
     delay: Arc<AtomicU64>,
     /// While set, each event waits (after it is recorded) until it clears.
     hold: Arc<AtomicBool>,
+    /// [`Probe::hold`] applies to `ConfigChanged` only.
+    hold_reloads_only: Arc<AtomicBool>,
     /// Held events let through one at a time ([`Probe::step`]).
     steps: Arc<AtomicUsize>,
+    /// While set, the next event panics (and clears it).
+    panic_next: Arc<AtomicBool>,
 }
 
 impl Probe {
@@ -100,7 +104,9 @@ impl Probe {
             seen: Arc::default(),
             delay: Arc::default(),
             hold: Arc::default(),
+            hold_reloads_only: Arc::default(),
             steps: Arc::default(),
+            panic_next: Arc::default(),
         }
     }
 
@@ -172,8 +178,12 @@ impl Probe {
     /// Holds the plugin thread inside this probe's `on_event`: sets
     /// `hold` and has `app` announce a reload of `enabled` (the list in
     /// effect), then waits until the probe is handed that
-    /// `ConfigChanged`.
+    /// `ConfigChanged`. Only that event is held: an earlier one the plugin
+    /// thread has recorded but not finished (a preempted thread can sit
+    /// there while the test moves on) would otherwise park the thread
+    /// short of the reload, and the wait would never end (#525).
     fn hold_thread(&self, app: &App, enabled: &[&str]) {
+        self.hold_reloads_only.store(true, Ordering::Relaxed);
         self.hold.store(true, Ordering::Relaxed);
         let before = self.events().len();
         enable(app, enabled);
@@ -217,7 +227,9 @@ impl Plugin for Probe {
         seen.current.push(event.clone());
         drop(seen);
         thread::sleep(Duration::from_millis(self.delay.load(Ordering::Relaxed)));
-        while self.hold.load(Ordering::Relaxed) {
+        let holdable =
+            !self.hold_reloads_only.load(Ordering::Relaxed) || *event == Event::ConfigChanged;
+        while holdable && self.hold.load(Ordering::Relaxed) {
             let left = self.steps.load(Ordering::Relaxed);
             if left > 0
                 && self
@@ -230,6 +242,10 @@ impl Plugin for Probe {
             thread::sleep(Duration::from_millis(1));
         }
         assert!(!self.spec.panic_on_event, "secret-event-panic");
+        assert!(
+            !self.panic_next.swap(false, Ordering::Relaxed),
+            "secret-event-panic"
+        );
         if self.spec.error_on_event {
             return Err(Error::Plugin("secret-event-error".into()));
         }
@@ -1452,6 +1468,118 @@ fn lifecycle_events_past_the_cap_leave_the_session_count_right() {
     }
 }
 
+/// Fills the plugin queue with lifecycle events while the plugin thread is
+/// held: 1 + 2 × 511 + 1 = 1024. Returns the two sessions left open.
+fn fill_the_queue(app: &App) -> (SessionId, SessionId) {
+    let open = || app.spawn_test_session(PtySize::new(4, 10)).unwrap();
+    let first = open();
+    for _ in 0..511 {
+        let id = open();
+        app.close_session(id).unwrap();
+    }
+    let last = open();
+    let full = app.plugin_queue_stats();
+    assert_eq!(full.queued, MAX_PLUGIN_EVENTS, "{full:?}");
+    (first, last)
+}
+
+/// A close that finds the queue full, and no creation of its session there,
+/// is the only event dropped: the plugin is still told of it on the
+/// thread's next turn (24.13 m2).
+#[test]
+fn a_close_dropped_alone_is_made_good() {
+    let root = tempfile::tempdir().unwrap();
+    let probe = Probe::new(Spec::new("test.cap.close", &[Capability::Sessions]));
+    let app = app(&root, &["test.cap.close"], vec![probe.factory()]);
+    wait_for_state(&app, "test.cap.close", PluginState::Active);
+    let delivered = app.spawn_test_session(PtySize::new(4, 10)).unwrap();
+    wait("the creation", || probe.open_sessions() == 1);
+    probe.hold_thread(&app, &["test.cap.close"]);
+    let (first, last) = fill_the_queue(&app);
+    let full = app.plugin_queue_stats();
+    app.close_session(delivered).unwrap();
+    let after = app.plugin_queue_stats();
+    assert_eq!(after.dropped, full.dropped + 1, "{after:?}");
+
+    probe.hold.store(false, Ordering::Relaxed);
+    let want: std::collections::BTreeSet<u64> = [first.get(), last.get()].into();
+    wait("the queue to drain", || {
+        app.plugin_queue_stats().queued == 0
+    });
+    wait("the close to be made good", || probe.open_set() == want);
+    for id in [first, last] {
+        app.close_session(id).unwrap();
+    }
+}
+
+/// Overflows the queue while `busy` holds the plugin thread, so that the
+/// next turn tells `count` what it missed, and checks that `count` then
+/// holds exactly the sessions open. [`Probe::open_set`] fails on a close of
+/// a session this activation was never told of.
+fn overflow_and_check_the_count(app: &App, busy: &Probe, count: &Probe, enabled: &[&str]) {
+    busy.hold_thread(app, enabled);
+    let (first, last) = fill_the_queue(app);
+    let late = app.spawn_test_session(PtySize::new(4, 10)).unwrap();
+    busy.hold.store(false, Ordering::Relaxed);
+    let want: std::collections::BTreeSet<u64> = [first.get(), last.get(), late.get()].into();
+    wait("the queue to drain", || {
+        app.plugin_queue_stats().queued == 0
+    });
+    wait("the counts to settle", || count.open_set() == want);
+    for id in [first, last, late] {
+        app.close_session(id).unwrap();
+    }
+}
+
+/// A plugin disabled with a session open forgets it: the session closed
+/// meanwhile is not reported closed to the next activation when an overflow
+/// later makes the thread compare what it told the plugin (24.13 m3).
+#[test]
+fn a_disabled_plugin_forgets_the_sessions_it_was_told_of() {
+    let root = tempfile::tempdir().unwrap();
+    let count = Probe::new(Spec::new("test.forget.count", &[Capability::Sessions]));
+    let busy = Probe::new(Spec::new("test.forget.busy", &[]));
+    let both = ["test.forget.count", "test.forget.busy"];
+    let app = app(&root, &both, vec![count.factory(), busy.factory()]);
+    wait_for_state(&app, "test.forget.count", PluginState::Active);
+    wait_for_state(&app, "test.forget.busy", PluginState::Active);
+    let session = app.spawn_test_session(PtySize::new(4, 10)).unwrap();
+    wait("the creation", || count.open_sessions() == 1);
+
+    enable(&app, &["test.forget.busy"]);
+    wait_for_state(&app, "test.forget.count", PluginState::Disabled);
+    app.close_session(session).unwrap();
+    enable(&app, &both);
+    wait_for_state(&app, "test.forget.count", PluginState::Active);
+    overflow_and_check_the_count(&app, &busy, &count, &both);
+}
+
+/// The same for a plugin that failed with sessions open and was retried:
+/// the failed activation's sessions are forgotten (24.13 m3).
+#[test]
+fn a_failed_plugin_forgets_the_sessions_it_was_told_of() {
+    let root = tempfile::tempdir().unwrap();
+    let count = Probe::new(Spec::new("test.failed.count", &[Capability::Sessions]));
+    let busy = Probe::new(Spec::new("test.failed.busy", &[]));
+    let both = ["test.failed.count", "test.failed.busy"];
+    let app = app(&root, &both, vec![count.factory(), busy.factory()]);
+    wait_for_state(&app, "test.failed.count", PluginState::Active);
+    wait_for_state(&app, "test.failed.busy", PluginState::Active);
+    let session = app.spawn_test_session(PtySize::new(4, 10)).unwrap();
+    wait("the creation", || count.open_sessions() == 1);
+
+    count.panic_next.store(true, Ordering::Relaxed);
+    let last_straw = app.spawn_test_session(PtySize::new(4, 10)).unwrap();
+    wait_for_state(&app, "test.failed.count", PluginState::Failed);
+    app.close_session(session).unwrap();
+    app.close_session(last_straw).unwrap();
+    enable(&app, &["test.failed.busy"]);
+    wait_for_state(&app, "test.failed.count", PluginState::Disabled);
+    enable(&app, &both);
+    wait_for_state(&app, "test.failed.count", PluginState::Active);
+    overflow_and_check_the_count(&app, &busy, &count, &both);
+}
+
 /// 21.1 m4 MX2: a plugin enabled again while a session's creation is still
 /// queued is told of the sessions open as of the queue's head, so it counts
 /// that session once (from the queued creation), not twice.
@@ -1533,6 +1661,7 @@ fn an_event_error_does_not_fail_the_plugin() {
 /// handed the session's creation and title, no event for its output.
 #[test]
 fn output_reaches_the_frontend_and_not_the_plugins() {
+    log();
     let root = tempfile::tempdir().unwrap();
     let probe = Probe::new(Spec::new("test.output", &[Capability::Sessions]));
     let app = app(&root, &["test.output"], vec![probe.factory()]);
@@ -1568,4 +1697,12 @@ fn output_reaches_the_frontend_and_not_the_plugins() {
     );
     app.close_session(id).unwrap();
     app.set_observer(None);
+    let panicked: Vec<_> = log()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|line| line.text.contains("session observer panicked"))
+        .cloned()
+        .collect();
+    assert!(panicked.is_empty(), "{panicked:?}");
 }
