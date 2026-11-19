@@ -8,15 +8,22 @@
 //!   machine ([`Cwd::is_local`]) makes the session local; one naming
 //!   another makes it remote with that host, shown sanitised
 //!   ([`shown_host`]). "This machine" is any host name it has had during
-//!   the session (at most [`MAX_LOCAL_HOST_NAMES`], the newest kept): a
-//!   shell sends the name it read when it started (zsh `$HOST`, bash
-//!   `$HOSTNAME`), and macOS changes the name with the network.
+//!   the session (at most [`MAX_LOCAL_HOST_NAMES`]: the session's first
+//!   and the newest others), as sent (decoded, as fish 4.3 and later
+//!   percent-encode it) or as Tessera's scripts send it
+//!   (reduced to `[A-Za-z0-9._-]`, so a name such as `Mårten.local` still
+//!   matches): a shell sends the name it read when it started (zsh
+//!   `$HOST`, bash `$HOSTNAME`), and macOS changes the name with the
+//!   network.
 //! - While no non-local report is in effect, on output at most once per
 //!   [`SSH_PROBE_INTERVAL`]: the program in front is asked for its name
 //!   (the terminal's foreground job, or with no job the session's own
 //!   program, as for a profile's `command = "ssh build-box"`), and one
 //!   called [`SSH_PROCESS_NAME`] makes the session remote without a host
 //!   ([`Remote::Unnamed`]), for a remote shell that sends no reports.
+//!
+//! - When the session's program exits: a dead pane runs nothing remote,
+//!   so the session is local again.
 //!
 //! The tracker reports a state only when it differs from the last one
 //! it reported (S6), so a flood of reports costs at most one event per
@@ -29,6 +36,10 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use tessera_shell_integration::Cwd;
+use tessera_term::shown_in_title;
+use unicode_width::UnicodeWidthChar;
+
+use crate::url::is_default_ignorable;
 
 /// Most bytes of a reported host the frontend is shown: the longest DNS
 /// name. A longer host is dropped whole (never cut), and the session shows
@@ -44,62 +55,79 @@ pub const SSH_PROCESS_NAME: &str = "ssh";
 
 /// Most host names of this machine a session remembers as local (S5): the
 /// names `gethostname` returned at the session's start and at each of its
-/// reports, the oldest forgotten first.
+/// reports. The first is never forgotten (the shell reports the name it
+/// read when it started for as long as it runs); of the others the oldest
+/// is forgotten first.
 pub const MAX_LOCAL_HOST_NAMES: usize = 4;
 
 /// Where a session's shell runs, as the frontend shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Remote {
     /// On this machine, or nothing says otherwise.
     #[default]
     Local,
     /// On another machine, which the last OSC 7 report named: sanitised
-    /// (no control, bidi or line-separator characters), not empty and at
-    /// most [`MAX_REMOTE_HOST_BYTES`] bytes.
+    /// ([`shown_host`]: no control, bidi, line-separator or invisible
+    /// characters), with something visible and at most
+    /// [`MAX_REMOTE_HOST_BYTES`] bytes.
     Host(String),
     /// On another machine whose name is not shown: the foreground job is
     /// `ssh` and no report named a host, or the report's host could not be
-    /// shown (too long, or nothing left once sanitised). The frontend shows
+    /// shown (too long, or nothing visible once sanitised). The frontend shows
     /// it as `⇢ ssh`.
     Unnamed,
 }
 
 /// `host` as the frontend may show it, or `None` when it is longer than
 /// [`MAX_REMOTE_HOST_BYTES`] (measured before sanitising, so the bound is
-/// on what the child sent) or nothing remains once control (C0, C1, DEL),
-/// bidi-control and line-separator characters are removed and surrounding
-/// whitespace is trimmed (S3).
+/// on what the child sent) or nothing visible remains (S3) once
+///
+/// - the characters a title drops ([`tessera_term::shown_in_title`]:
+///   control, bidi-control and line-separator characters) and the
+///   default-ignorable (invisible) ones ([`is_default_ignorable`]: zero
+///   width spaces and joiners, U+FEFF, the Hangul fillers, tags, variation
+///   selectors) are removed, since no host name needs them and they would
+///   make one host look like another, and
+/// - surrounding whitespace is trimmed.
+///
+/// Visible means a character that takes a cell: whitespace and combining
+/// marks alone are not a host.
 #[must_use]
 pub fn shown_host(host: &str) -> Option<String> {
     if host.len() > MAX_REMOTE_HOST_BYTES {
         return None;
     }
-    let kept: String = host.chars().filter(|&c| shown_in_title(c)).collect();
+    let kept: String = host
+        .chars()
+        .filter(|&c| shown_in_title(c) && !is_default_ignorable(c))
+        .collect();
     let trimmed = kept.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    trimmed
+        .chars()
+        .any(|c| !c.is_whitespace() && c.width().is_some_and(|width| width > 0))
+        .then(|| trimmed.to_owned())
 }
 
-/// Whether `c` may appear in a title: the set `tessera-term` keeps in an
-/// OSC 0 or 2 title (ADR 0022 S3), here for a host the title is built from.
-pub(crate) fn shown_in_title(c: char) -> bool {
-    !c.is_control()
-        && !matches!(
-            c,
-            '\u{061C}'
-                | '\u{200E}'
-                | '\u{200F}'
-                | '\u{202A}'..='\u{202E}'
-                | '\u{2066}'..='\u{2069}'
-                | '\u{2028}'
-                | '\u{2029}'
-        )
+/// `name` as Tessera's shell integration scripts put it in an OSC 7
+/// report (`[A-Za-z0-9._-]` kept, every other byte removed), when that
+/// differs from `name` and is not empty (a script sends `localhost` for
+/// an empty one, which is local anyway).
+fn as_scripts_send(name: &str) -> Option<String> {
+    let sent = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-');
+    if name.bytes().all(sent) {
+        return None;
+    }
+    let reduced: String = name.bytes().filter(|&b| sent(b)).map(char::from).collect();
+    (!reduced.is_empty()).then_some(reduced)
 }
 
 /// A session's remote state, owned by its reader thread.
 #[derive(Debug, Default)]
 pub(crate) struct RemoteTracker {
-    /// This machine's host names during the session, newest last, at most
-    /// [`MAX_LOCAL_HOST_NAMES`] and none empty.
+    /// This machine's host names during the session, at most
+    /// [`MAX_LOCAL_HOST_NAMES`] and none empty: the first one remembered
+    /// (the session's start) first and kept, then the others, newest last.
     local_names: VecDeque<String>,
     /// What the last valid OSC 7 report made the session, while that report
     /// named another machine; `None` after a local report or before any.
@@ -123,18 +151,36 @@ impl RemoteTracker {
     }
 
     /// Adds `name` to the local names as the newest, forgetting the oldest
-    /// beyond [`MAX_LOCAL_HOST_NAMES`]. An empty name (`gethostname`
-    /// failed) is not kept.
+    /// but the first beyond [`MAX_LOCAL_HOST_NAMES`]. An empty name
+    /// (`gethostname` failed) is not kept; the first name stays first.
     fn remember(&mut self, name: String) {
-        if name.is_empty() {
+        if name.is_empty() || self.local_names.front() == Some(&name) {
             return;
         }
-        if let Some(known) = self.local_names.iter().position(|known| *known == name) {
-            self.local_names.remove(known);
+        if let Some(known) = self
+            .local_names
+            .iter()
+            .skip(1)
+            .position(|known| *known == name)
+        {
+            self.local_names.remove(known + 1);
         } else if self.local_names.len() == MAX_LOCAL_HOST_NAMES {
-            self.local_names.pop_front();
+            // Never the first (index 0): the oldest of the others.
+            self.local_names.remove(1);
         }
         self.local_names.push_back(name);
+    }
+
+    /// Whether `cwd` names this machine: by one of the local names, as
+    /// sent or as the scripts send it ([`as_scripts_send`]), or with no
+    /// local name known by the empty host or `localhost` only.
+    fn names_this_machine(&self, cwd: &Cwd) -> bool {
+        if self.local_names.is_empty() {
+            return cwd.is_local("");
+        }
+        self.local_names.iter().any(|name| {
+            cwd.is_local(name) || as_scripts_send(name).is_some_and(|sent| cwd.is_local(&sent))
+        })
     }
 
     /// Applies a valid OSC 7 report, while this machine is called
@@ -142,12 +188,7 @@ impl RemoteTracker {
     /// one it had earlier in the session.
     pub(crate) fn report(&mut self, cwd: &Cwd, local_hostname: String) {
         self.remember(local_hostname);
-        let local = if self.local_names.is_empty() {
-            cwd.is_local("")
-        } else {
-            self.local_names.iter().any(|name| cwd.is_local(name))
-        };
-        if local {
+        if self.names_this_machine(cwd) {
             self.reported = None;
             self.ssh = false;
         } else {
@@ -177,6 +218,15 @@ impl RemoteTracker {
         }
         self.last_probe = Some(now);
         self.ssh = probe().is_some_and(|name| name == SSH_PROCESS_NAME);
+    }
+
+    /// The session's program exited: nothing of it runs on another machine
+    /// any more, so the session is local (a dead pane keeps no `⇢ ssh`).
+    /// Returns the change, as [`changed`](Self::changed) does.
+    pub(crate) fn exited(&mut self) -> Option<Remote> {
+        self.reported = None;
+        self.ssh = false;
+        self.changed()
     }
 
     /// The state, when it differs from the one this last returned (S6).
@@ -285,30 +335,124 @@ mod tests {
     #[test]
     fn the_local_names_stay_within_their_cap() {
         let mut tracker = RemoteTracker::new("first".into());
-        for name in ["first", "", "second", "first"] {
+        for name in ["first", "", "second", "third", "second"] {
             tracker.report(&at("x"), name.into());
         }
         assert_eq!(
             tracker.local_names,
-            ["second", "first"],
-            "deduplicated, newest last"
+            ["first", "third", "second"],
+            "deduplicated, the first kept first, the others newest last"
         );
         for n in 0..10 {
             tracker.report(&at("x"), format!("name-{n}"));
             assert!(tracker.local_names.len() <= MAX_LOCAL_HOST_NAMES);
         }
+        assert_eq!(tracker.local_names, ["first", "name-7", "name-8", "name-9"]);
         assert_eq!(
-            tracker.local_names,
-            ["name-6", "name-7", "name-8", "name-9"]
-        );
-        assert_eq!(
-            report(&mut tracker, "first", "name-9"),
-            Some(Remote::Host("first".into())),
+            report(&mut tracker, "second", "name-9"),
+            Some(Remote::Host("second".into())),
             "a forgotten name is another machine's"
         );
         assert_eq!(
-            report(&mut tracker, "name-6", "name-9"),
+            report(&mut tracker, "name-7", "name-9"),
             Some(Remote::Local)
+        );
+    }
+
+    /// #358: the session's first name is the one its shell keeps sending
+    /// (zsh `$HOST` is read once), so however many network names follow it
+    /// stays this machine's.
+    #[test]
+    fn the_first_name_is_never_forgotten() {
+        let mut tracker = RemoteTracker::new("Mac.home".into());
+        for n in 0..(MAX_LOCAL_HOST_NAMES * 3) {
+            assert_eq!(
+                report(&mut tracker, "Mac.home", &format!("net-{n}.local")),
+                None,
+                "after {n} network names"
+            );
+        }
+        tracker.report(&at("x"), "Mac.home".into());
+        assert_eq!(
+            tracker.local_names.front().map(String::as_str),
+            Some("Mac.home")
+        );
+        // With no name at the start, the first one learnt is kept instead.
+        let mut tracker = RemoteTracker::new(String::new());
+        for name in ["one", "two", "three", "four", "five", "six"] {
+            tracker.report(&at("x"), name.into());
+        }
+        assert_eq!(tracker.local_names, ["one", "four", "five", "six"]);
+    }
+
+    /// #358: the scripts reduce the host to `[A-Za-z0-9._-]`, so a machine
+    /// called `Mårten.local` (or a name that is not UTF-8, which
+    /// `local_hostname` gives with U+FFFD) reports `Mrten.local`.
+    #[test]
+    fn a_name_the_scripts_reduce_is_still_this_machine() {
+        for (local, sent) in [
+            ("M\u{e5}rten.local", "Mrten.local"),
+            ("M\u{e5}rten.local", "M\u{e5}rten.local"),
+            ("M\u{e5}rten", "mrten.lan"),
+            ("M\u{fffd}rten.local", "Mrten.local"),
+            ("caf\u{e9} mac", "cafmac"),
+        ] {
+            let mut tracker = RemoteTracker::new(local.into());
+            assert_eq!(
+                report(&mut tracker, sent, local),
+                None,
+                "{sent:?} from {local:?}"
+            );
+        }
+        let mut tracker = RemoteTracker::new("M\u{e5}rten.local".into());
+        assert_eq!(
+            report(&mut tracker, "Marten.local", "M\u{e5}rten.local"),
+            Some(Remote::Host("Marten.local".into())),
+            "another name is another machine"
+        );
+        assert_eq!(as_scripts_send("Mac.local"), None, "already as sent");
+        assert_eq!(
+            as_scripts_send("\u{e5}\u{e4}\u{f6}"),
+            None,
+            "sent as localhost"
+        );
+        assert_eq!(as_scripts_send("a b"), Some("ab".into()));
+    }
+
+    #[test]
+    fn a_fish_style_encoded_host_is_compared_and_shown_decoded() {
+        // fish 4.3 and later send their own OSC 7 with the host
+        // percent-encoded (#358).
+        let sent = |tracker: &mut RemoteTracker, payload: &[u8], local: &str| {
+            let cwd = tessera_shell_integration::osc7::parse_osc7(payload).unwrap();
+            tracker.report(&cwd, local.into());
+            tracker.changed()
+        };
+        let mut tracker = RemoteTracker::new("M\u{e5}rten.local".into());
+        assert_eq!(
+            sent(
+                &mut tracker,
+                b"file://M%C3%A5rten.local/tmp",
+                "M\u{e5}rten.local"
+            ),
+            None,
+            "this machine"
+        );
+        let mut tracker = RemoteTracker::new("M\u{fffd}rten".into());
+        assert_eq!(
+            sent(&mut tracker, b"file://M%E5rten/tmp", "M\u{fffd}rten"),
+            None,
+            "this machine, not UTF-8"
+        );
+        let mut tracker = RemoteTracker::new("Mac".into());
+        assert_eq!(
+            sent(&mut tracker, b"file://my%20host/tmp", "Mac"),
+            Some(Remote::Host("my host".into()))
+        );
+        assert_eq!(
+            sent(&mut tracker, b"file://%E2%80%8B%EF%BB%BF/tmp", "Mac"),
+            Some(Remote::Unnamed),
+            "decoded invisible text is not shown"
         );
     }
 
@@ -343,6 +487,40 @@ mod tests {
         assert_eq!(shown_host("  host  "), Some("host".into()));
         for blank in ["", "\u{1b}\u{7}", "\u{2066}\u{200F}", "   \t"] {
             assert_eq!(shown_host(blank), None, "{blank:?}");
+        }
+        // #358: invisible characters are removed, and a host with nothing
+        // visible (only invisible characters, combining marks or
+        // whitespace) is not shown.
+        assert_eq!(
+            shown_host("ev\u{200B}il\u{FEFF}.c\u{2060}om\u{E0041}\u{FE0F}"),
+            Some("evil.com".into())
+        );
+        assert_eq!(
+            shown_host("e\u{301}x"),
+            Some("e\u{301}x".into()),
+            "a mark on a letter"
+        );
+        for invisible in [
+            "\u{200B}",
+            "\u{FEFF}\u{FEFF}",
+            "\u{3164}",
+            "\u{115F}\u{1160}",
+            "\u{FFA0}",
+            "\u{301}\u{302}",
+            "\u{20DD}",
+            "\u{E0001}\u{E0068}\u{E007F}",
+            "\u{180E}",
+            "\u{AD}",
+            " \u{200B} \u{A0}",
+            "\u{34F}\u{FE00}",
+        ] {
+            assert_eq!(shown_host(invisible), None, "{invisible:?}");
+            let mut tracker = RemoteTracker::default();
+            assert_eq!(
+                report(&mut tracker, invisible, "Mac"),
+                Some(Remote::Unnamed),
+                "{invisible:?} is remote, without a name"
+            );
         }
         let mut tracker = RemoteTracker::default();
         assert_eq!(
@@ -386,6 +564,22 @@ mod tests {
             None,
             "only ssh itself"
         );
+    }
+
+    /// #358: when the session's program exits, a pane that showed a
+    /// host or `ssh` is local again; one that was local reports nothing.
+    #[test]
+    fn an_exit_makes_the_session_local() {
+        let start = Instant::now();
+        let mut tracker = RemoteTracker::default();
+        output(&mut tracker, start, Some(job("ssh")));
+        assert_eq!(tracker.exited(), Some(Remote::Local), "the ssh fallback");
+        let mut tracker = RemoteTracker::default();
+        report(&mut tracker, "far", "Mac");
+        assert_eq!(tracker.exited(), Some(Remote::Local), "a reported host");
+        assert_eq!(tracker.exited(), None, "only a change");
+        let mut tracker = RemoteTracker::default();
+        assert_eq!(tracker.exited(), None, "local all along");
     }
 
     #[test]

@@ -201,6 +201,7 @@ pub use keyboard::{
 };
 pub use modes::{KITTY_STACK_DEPTH, Modes, MouseEncoding, MouseTracking};
 pub use mouse::{MouseReport, MouseReportButton, MouseReportKind, encode_mouse};
+pub use osc::shown_in_title;
 pub use osc_color::{ColorOverrides, MAX_COLOR_OVERRIDES, Rgb, ThemeColors};
 pub use reports::{DA2_PV, TITLE_STACK_DEPTH};
 

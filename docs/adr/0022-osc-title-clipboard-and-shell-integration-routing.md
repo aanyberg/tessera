@@ -182,8 +182,9 @@ the pasteboard on the main actor (`CallbackBridge`, through an injectable
   tells a consumer (a new tab in the same directory) whether the report
   names this machine: an empty host, `localhost`, or the host name, ignoring
   ASCII case and a trailing `.`, a bare name also matching itself with a
-  domain (`Mac` and `Mac.local`). How Terminal.app, kitty and WezTerm
-  compare hosts was not verified.
+  domain (`Mac` and `Mac.local`). A `file://` host is percent-decoded like
+  the path (#358); kitty's raw form is kept as sent. How Terminal.app,
+  kitty and WezTerm compare hosts was not verified.
 - **OSC 1337** (D-1337): only payloads starting with
   `ShellIntegrationVersion=` are forwarded (same caps); iTerm2's many other
   keys (`File=` images of megabytes, `SetUserVar`, queries such as
@@ -291,11 +292,19 @@ shell runs on another machine, as `⇢ <host>: <title>`.
   valid OSC 7 report: one that `Cwd::is_local` accepts makes the session
   local, any other remote with its host. "This machine" is any name
   `tessera_pty::local_hostname()` (`gethostname`) returned at the session's
-  start or at one of its reports, at most 4 (`MAX_LOCAL_HOST_NAMES`, the
-  oldest forgotten first): a shell sends the name it read when it started
-  (zsh `$HOST`, bash `$HOSTNAME`), and macOS changes the name with the
-  network, so comparing with the current name alone would mark every open
-  local tab remote after a network change.
+  start or at one of its reports, at most 4 (`MAX_LOCAL_HOST_NAMES`; the
+  first is never forgotten, of the others the oldest goes first, #358): a
+  shell sends the name it read when it started (zsh `$HOST`, bash
+  `$HOSTNAME`), and macOS changes the name with the network, so comparing
+  with the current name alone would mark every open local tab remote after
+  a network change. Each name matches as `gethostname` gave it (with
+  U+FFFD for bytes that are not UTF-8), which is also how fish 4.3 and
+  later send it (their own OSC 7, with the host percent-encoded:
+  `M%C3%A5rten.local`; `parse_osc7` decodes a `file://` host, bytes that
+  are not UTF-8 again as U+FFFD, #358), and as Tessera's scripts send it,
+  reduced to `[A-Za-z0-9._-]` (`Mårten.local` reports `Mrten.local`).
+  When the session's program exits the session is local again, just before
+  the exit event, so a dead pane kept open shows no prefix (#358).
 - **D-REMOTE-SSH** (lead decision): while no non-local report is in effect,
   the program in front is asked for its name at most once per second per
   session (`SSH_PROBE_INTERVAL`, on output only, never on a timer): the
@@ -309,8 +318,11 @@ shell runs on another machine, as `⇢ <host>: <title>`.
 - **D-REMOTE-HOST** (S3): the host is dropped whole when it is longer than
   253 bytes (`MAX_REMOTE_HOST_BYTES`, the longest DNS name; measured before
   sanitising), and otherwise loses control (C0, C1, DEL), bidi-control and
-  line-separator characters and surrounding white space, the set a title
-  loses. Dropped, or empty once sanitised, it is `Unnamed`. `parse_osc7`
+  line-separator characters (the set a title loses, `tessera_term::shown_in_title`,
+  the one filter both use), default-ignorable (invisible) characters and
+  surrounding white space. Dropped, or with nothing visible left once
+  sanitised (no character that takes a cell: only invisible characters,
+  combining marks or white space, #358), it is `Unnamed`. `parse_osc7`
   already refuses a host with a control character, so the sanitising is a
   second line. Logs carry the host's length only (S8). The Swift bridge
   copies the bytes before the callback returns, reads a host kind with a
@@ -326,6 +338,11 @@ shell runs on another machine, as `⇢ <host>: <title>`.
   - Leaving an integrated remote shell for a local shell without
     integration keeps the prefix until a local report (the session cannot
     tell the remote shell exited).
+  - Tessera's scripts keep a report within the 4096-byte payload cap
+    (`MAX_OSC7_LEN`; a longer one is dropped whole, which kept the previous
+    report, another host's say, in effect): a directory whose report would
+    be longer is reported as its deepest ancestor that fits (#358). fish
+    4.3 and later send their own report, which may pass the cap.
   - A remote shell that sends OSC 7 with an empty host counts as local, so
     inside `ssh` the title flips between `⇢ ssh` (the probe) and no prefix
     (the report) at each prompt.

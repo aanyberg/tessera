@@ -70,12 +70,22 @@ function __tessera_si_schedule --on-event fish_prompt -d "Set up Tessera shell i
         # outside [/._~A-Za-z0-9-] as %XX, Terminal.app's rule; the host is
         # reduced to [A-Za-z0-9._-]. Sent at every prompt (a program run
         # from the shell, ssh say, may have reported another directory
-        # meanwhile) and when the directory changes.
+        # meanwhile) and when the directory changes. Tessera drops a payload
+        # over 4096 bytes (MAX_OSC7_LEN) whole, which would keep the previous
+        # report in effect, so a longer one names the deepest ancestor
+        # directory that fits (`file://` is 7 bytes; the cut is at a `/`,
+        # which the encoding keeps as is).
         function __tessera_si_report_pwd --on-variable PWD --on-event fish_prompt -d "Report the working directory to Tessera"
             status is-command-substitution; and return
             set --local host (string replace -ra '[^A-Za-z0-9._-]' '' -- $hostname)
             test -n "$host"; or set host localhost
-            printf '\e]7;file://%s%s\a' $host (string escape --style=url -- $PWD)
+            set --local url (string escape --style=url -- $PWD)
+            set --local room (math 4096 - 7 - (string length -- $host))
+            if test $room -gt 0 -a (string length -- $url) -gt $room
+                set url (string sub --length (math $room + 1) -- $url | string replace -r '/[^/]*$' '')
+                test -n "$url"; or set url /
+            end
+            printf '\e]7;file://%s%s\a' $host $url
         end
         __tessera_si_report_pwd
     end

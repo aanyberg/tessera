@@ -226,9 +226,13 @@ impl SessionObserver for CallbackObserver {
             SessionEvent::Remote(remote) => {
                 if let Some(callback) = callbacks.on_session_remote {
                     let (kind, host) = match &remote {
-                        Remote::Local => (RemoteKind::Local, None),
                         Remote::Host(host) => (RemoteKind::Host, Some(host.as_bytes())),
                         Remote::Unnamed => (RemoteKind::Unnamed, None),
+                        // `Remote::Local`, and since `Remote` is
+                        // non-exhaustive any state this table has no kind
+                        // for yet: this machine, the state a session
+                        // starts in.
+                        _ => (RemoteKind::Local, None),
                     };
                     let (ptr, len) = host.map_or((std::ptr::null(), 0), |h| (h.as_ptr(), h.len()));
                     // SAFETY: host contract on `Callbacks`; `host` outlives

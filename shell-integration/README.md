@@ -98,7 +98,9 @@ Loading a script twice installs its hooks once.
 - OSC 7 at startup, at every prompt and whenever the directory changes
   (not for a subshell's `cd`). The host is the
   shell's host name reduced to `[A-Za-z0-9._-]`; the path is encoded like
-  Terminal.app's (every byte outside `[/._~A-Za-z0-9-]` as `%XX`).
+  Terminal.app's (every byte outside `[/._~A-Za-z0-9-]` as `%XX`). A report
+  is at most 4096 bytes (what Tessera accepts): a directory whose report
+  would be longer is reported as its deepest ancestor that fits.
 
 zsh: the marks go into `PS1`; a theme that redraws its prompt
 asynchronously (powerlevel10k's instant prompt, say) can drop the `B` mark,

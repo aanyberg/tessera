@@ -201,6 +201,9 @@ if [[ $- == *i* && -n "${TESSERA_SHELL_INTEGRATION-}" && "${TESSERA_SHELL_INTEGR
     # %XX), the host from $HOSTNAME reduced to [A-Za-z0-9._-]. Sent at
     # every prompt (as zsh and fish do): a program run from the shell, ssh
     # say, may have reported another directory, or another host, meanwhile.
+    # Tessera drops a payload over 4096 bytes (MAX_OSC7_LEN) whole, which
+    # would keep the previous report in effect, so a longer one names the
+    # deepest ancestor directory that fits.
     _tessera_si_report_pwd() {
         builtin local LC_ALL=C LC_CTYPE=C LC_COLLATE=C
         # bash 3.2 word-splits unquoted expansions in `local` arguments.
@@ -222,6 +225,14 @@ if [[ $- == *i* && -n "${TESSERA_SHELL_INTEGRATION-}" && "${TESSERA_SHELL_INTEGR
                 done
                 ;;
         esac
+        # `file://` is 7 bytes; cut at the last `/` that leaves the rest
+        # within the cap (the encoding keeps `/` as is, so no %XX is split).
+        i=$(( 4096 - 7 - ${#host} ))
+        if (( i > 0 && ${#url} > i )); then
+            url=${url:0:i+1}
+            url=${url%/*}
+            [[ -n "$url" ]] || url=/
+        fi
         builtin printf '\033]7;file://%s%s\007' "$host" "$url"
     }
 
