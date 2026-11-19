@@ -295,6 +295,7 @@ final class SettingsModel {
                 // The draft's field names an index that may now be another
                 // profile: its text goes, as the field does.
                 draft = nil
+                endProfilePresses()
             }
         } catch {
             loadError = "The configuration could not be read."
@@ -868,6 +869,23 @@ final class SettingsModel {
         // The list is not the one the controls were made for.
         profileListGeneration += 1
         draft = nil
+        endProfilePresses()
+    }
+
+    /// Ends the press of every profile's slider or stepper, writing
+    /// nothing: ``profileListGeneration`` moved, so the panes make the
+    /// profile rows again and the pressed control goes with no release
+    /// (#536). A step held back is dropped and the values written and not
+    /// yet applied are forgotten; with no write running, the reload's
+    /// settle shows the configuration applied in the row. The old
+    /// control's binding writes nothing from now on
+    /// (``SettingsFieldContext/listGeneration``).
+    private func endProfilePresses() {
+        for (key, throttle) in throttles where throttle.dragging && Self.profilePath(key) != nil {
+            throttle.timer?.cancel()
+            throttles[key] = nil
+            unappliedWrites[key] = nil
+        }
     }
 
     /// Moves the messages of the profiles at `start` and after by `offset`
