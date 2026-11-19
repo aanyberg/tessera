@@ -63,6 +63,7 @@ fn install(app: *mut App, applied: &AtomicU64) {
         on_session_clipboard: None,
         on_config_applied: Some(on_config_applied),
         on_session_remote: None,
+        on_config_invalid: None,
     };
     // SAFETY: live handle and a valid table; `applied` outlives the app.
     assert_eq!(
@@ -224,6 +225,48 @@ fn app_appearance_round_trips(root: &Path) {
     unsafe { tessera_app_free(app) };
 }
 
+/// `load_error` in `tessera_config_json` (#547): `null` while the file
+/// loads, the store's error once a broken file was read (the generation
+/// and the configuration in effect stay), `null` again once it is fixed.
+fn load_error_round_trips(root: &Path) {
+    let dir = root.join("load-error");
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("config.toml");
+    std::fs::write(&config, "[appearance]\nopacity = 0.5\n").unwrap();
+    let applied = AtomicU64::new(0);
+    let app = new_app(&dir);
+    install(app, &applied);
+    let json = config_json(app);
+    assert_eq!(json["load_error"], serde_json::Value::Null, "{json}");
+    let generation = json["generation"].clone();
+
+    std::fs::write(&config, "[appearance]\nopacity = 0.25\nnot toml\n").unwrap();
+    let deadline = Instant::now() + BOUND;
+    let mut json = config_json(app);
+    while json["load_error"].is_null() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        json = config_json(app);
+    }
+    let error = json["load_error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no load_error: {json}"));
+    assert!(error.contains("not toml"), "{error}");
+    assert!(!error.contains('\n'), "escaped (S8): {error}");
+    assert_eq!(json["generation"], generation, "nothing applied");
+    assert_eq!(
+        json["config"]["appearance"]["opacity"], 0.5,
+        "the configuration in effect"
+    );
+
+    std::fs::write(&config, "[appearance]\nopacity = 0.25\n").unwrap();
+    assert_eq!(settled(&applied, 1), 1, "the fixed file applies once");
+    let json = config_json(app);
+    assert_eq!(json["load_error"], serde_json::Value::Null, "{json}");
+    assert_eq!(json["config"]["appearance"]["opacity"], 0.25);
+    // SAFETY: live handle, freed once; no other call races.
+    unsafe { tessera_app_free(app) };
+}
+
 #[test]
 fn the_watch_applies_a_write_once() {
     let dir = tempfile::tempdir().unwrap();
@@ -285,6 +328,7 @@ fn the_watch_applies_a_write_once() {
 
     app_appearance_round_trips(dir.path());
     an_undone_save_is_announced(dir.path());
+    load_error_round_trips(dir.path());
 }
 
 /// #535: a Settings save that another app undoes right away (inside the

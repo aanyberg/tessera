@@ -21,6 +21,9 @@ final class SessionRouter: TesseraAppDelegate {
     /// Runs when the core applied a configuration: the application delegate
     /// gives the menus the new key map.
     var onConfigurationApplied: (() -> Void)?
+    /// Runs when `config.toml` changed and does not load: the application
+    /// delegate has Settings read the error.
+    var onConfigurationInvalid: (() -> Void)?
 
     /// Routes `session`'s events to `controller`, the tab whose pane runs it.
     func register(_ controller: TerminalWindowController, session: TesseraSession) {
@@ -76,5 +79,11 @@ final class SessionRouter: TesseraAppDelegate {
     /// A configuration was applied: its `[keys]` may move menu shortcuts.
     func configurationDidApply(generation: UInt64) {
         onConfigurationApplied?()
+    }
+
+    /// `config.toml` does not load: nothing was applied, but Settings
+    /// shows the error and stops waiting for its edits (#547).
+    func configurationDidNotLoad() {
+        onConfigurationInvalid?()
     }
 }

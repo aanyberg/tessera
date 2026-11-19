@@ -304,6 +304,20 @@ pub trait SessionObserver: Send + Sync {
     fn on_config_applied(&self, generation: u64) {
         let _ = generation;
     }
+
+    /// `config.toml` changed and does not load, with an error other than
+    /// the one last reported (or the file was already broken when the
+    /// configuration watch started): the last good configuration stays in
+    /// effect, so nothing is applied and
+    /// [`SessionObserver::on_config_applied`] is not called. The host reads
+    /// the error with
+    /// [`App::config_generation_and_load_error`](crate::App::config_generation_and_load_error)
+    /// and stops waiting for an edit it saved to apply (#547). Called once
+    /// per failure, on the configuration watch's thread, under the rules of
+    /// [`SessionObserver::on_appearance_changed`]; once the file loads
+    /// again, the configuration applied clears the error. Does nothing by
+    /// default.
+    fn on_config_invalid(&self) {}
 }
 
 impl<F> SessionObserver for F

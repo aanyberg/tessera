@@ -56,7 +56,13 @@ single other thread is safe. Only this queue writes; the main thread reads.
 **What a control shows.** An edit shows at once: the model lays the value
 over the snapshot (`pending`) until a configuration applied after the edit
 was queued (a later `generation`) and no edit of that key is queued; then
-the file's value shows. The core does not apply its own write: the
+the file's value shows. A `config.toml` that stops loading after the edit
+(a broken hand edit read before or instead of the save) applies nothing:
+the core calls `on_config_invalid` once per new failure, the window reads
+the snapshot's `load_error` again, shows it (sanitised, S3) and drops the
+edit, an add or a delete of a profile from `pending`, so the control shows
+the configuration in effect (#547). An edit queued while the file already
+failed with that error (a repair) waits for its configuration as before. The core does not apply its own write: the
 configuration watch applies the saved file like a hand edit (ADR 0040), so
 the window, the open tabs and a hand edit all go through one apply path.
 
