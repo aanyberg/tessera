@@ -267,3 +267,49 @@ a fresh copy in its place.
 - `tests/live.rs` runs the scripts in `/bin/zsh`, `/bin/bash`, Homebrew's
   bash 5 and fish (each skipped when absent) through a real PTY on every
   test run.
+
+## Amendment: bash marks stay out of redirected output (#538, 2026-11-19)
+
+The bash `DEBUG` trap fires before the first simple command inside a
+compound command's redirection, so `{ echo hi; } > f` ran it with `f` as
+standard output and the `C` mark landed in `f`. So the prompt hook, where
+standard output is the session's own stream, keeps two copies of it on
+private descriptors, the first two of 59 down to 50 that are not open
+(checked with `/dev/fd/N`; 63 and down are bash's process substitutions
+and 255 its terminal descriptor; not bash 4.1's `{var}>&1`, which 3.2
+lacks and which picks 10 or above, the numbers users redirect). The trap
+writes `C` to the first copy and closes both before the user's command
+runs (bash cannot mark a descriptor close-on-exec, so an open copy would
+be inherited by every command), but only while the two are still the same
+file: the trap runs inside a compound command's redirections, so
+`{ echo a >&59; } 59>f` or `while read -u 59 l; do ...; done 59<in` has
+already pointed one of them at the user's file, and writing `C` there and
+closing it would corrupt the command. Then the trap writes no `C` and
+closes nothing, and the next prompt closes the copies (every prompt closes
+the last line's copies before taking new ones, so none outlives a prompt).
+`C` therefore follows the session's stream
+exactly as the command's output and `D` do: a session logged through
+`exec > >(tee log)` gets `C` and `D` in order with the output still in the
+pipe. Writing `C` to `/dev/tty` instead put it around the pipe: `D` sent
+that way arrived before the last 40 KB of `seq 1 20000`, and the `C` of a
+second pasted line some 30 KB inside the first line's output. A command
+line that only runs a subshell (`( cmd ) > f`) runs no trap in the shell
+itself, so the copies stay open in that subshell until the next prompt
+closes them. A command that redirects either copy's descriptor gets no `C` for
+that line (and its commands inherit the copy it left alone); one that
+points both at the same file, or one at the file the other already is
+(`59>&1` at the terminal), gets `C` written to it and its descriptors
+closed. `D`, OSC 7 and the handshake are written at a prompt or at load
+and go to standard output. The same review found
+three more bugs in the hooks, fixed with it: the trap's conditional
+commands were unquoted expansions, split with the user's `IFS` (`IFS=,`
+gave "command not found" around every command), so they are now `eval`'d
+quoted strings; and the hooks that pass the last status on (to the user's
+`PROMPT_COMMAND` entries, `PS1` and the trap before ours) failed with it,
+so a user's `ERR` trap ran for them and `set -e` exited the shell after
+`false && true`. They now run as the first command of an `&&` list
+(`_tessera_si_precmd && _tessera_si_nop`), which keeps the status without
+counting as a failed command. bash 3.2 resets `PIPESTATUS` in any `DEBUG`
+trap, ours included (4 and later restore it): restoring it would take a
+pipeline of forked subshells before every command, so it is a documented
+limit of the script.

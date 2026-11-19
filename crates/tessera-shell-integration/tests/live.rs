@@ -1743,6 +1743,389 @@ fn bash_with_nounset() {
     }
 }
 
+/// `[A, B, C, D;code]` for one command (`c`: whether it has its C;
+/// `code`: `None` for a bare D).
+fn command_marks(c: bool, code: Option<i32>) -> Vec<Mark> {
+    let mut marks = vec![Mark::PromptStart, Mark::CommandStart];
+    if c {
+        marks.push(Mark::OutputStart);
+    }
+    marks.push(Mark::CommandEnd { exit_code: code });
+    marks
+}
+
+/// Output redirected to a file is byte for byte the command's: the C mark
+/// (written from the DEBUG trap, which fires inside the redirection of a
+/// compound command, and inside a subshell's under `set -T`) goes to the
+/// terminal instead, also when standard error is redirected too. #538.
+#[test]
+fn bash_redirected_output_gets_no_marks() {
+    for bash in bashes() {
+        for functrace in [false, true] {
+            let out = tempfile::tempdir().unwrap();
+            let bashrc = format!(
+                "{}fout() {{ echo f; }}\nfbody() {{ echo b; }} > \"$OUT/body\"\n",
+                if functrace { "set -T\n" } else { "" }
+            );
+            let observed = run_steps(
+                &Case {
+                    shell: Shell::Bash,
+                    program: bash.clone(),
+                    args: Some(&["-i"]),
+                    files: &[(".bashrc", &bashrc)],
+                    env: &[("OUT", out.path().to_str().unwrap())],
+                },
+                &[
+                    (Wait::Prompts(1), "{ echo g; } > \"$OUT/group\"\r"),
+                    (Wait::Prompts(2), "( echo s ) > \"$OUT/subshell\"\r"),
+                    (Wait::Prompts(3), "fout > \"$OUT/function\"\r"),
+                    (Wait::Prompts(4), "fbody\r"),
+                    (
+                        Wait::Prompts(5),
+                        "for i in 1; do echo $i; done > \"$OUT/loop\"\r",
+                    ),
+                    (Wait::Prompts(6), "{ echo both; } > \"$OUT/both\" 2>&1\r"),
+                    (Wait::Prompts(7), "exit\r"),
+                ],
+            );
+            let text = String::from_utf8_lossy(&observed.output);
+            let what = format!("{} functrace={functrace}", bash.display());
+            for (name, want) in [
+                ("group", "g\n"),
+                ("subshell", "s\n"),
+                ("function", "f\n"),
+                ("body", "b\n"),
+                ("loop", "1\n"),
+                ("both", "both\n"),
+            ] {
+                let got = std::fs::read(out.path().join(name)).unwrap();
+                assert_eq!(
+                    String::from_utf8_lossy(&got),
+                    want,
+                    "{what}: {name}; terminal: {text:?}"
+                );
+            }
+            // Every C reached the terminal. A command line that only runs
+            // a subshell has none (with `set -T` the subshell sends it) and
+            // ends with a bare D (the script's limits).
+            let mut want = command_marks(true, Some(0));
+            want.extend(command_marks(functrace, None));
+            for _ in 0..4 {
+                want.extend(command_marks(true, Some(0)));
+            }
+            want.extend([Mark::PromptStart, Mark::CommandStart, Mark::OutputStart]);
+            let got = marks(observed.payloads.iter().map(Vec::as_slice));
+            assert_eq!(got, want, "{what}: {text:?}");
+        }
+    }
+}
+
+/// A session logged through a pipe (`exec > >(tee -a log) 2>&1` in
+/// `.bashrc`): D follows the command's output, which is still in the pipe
+/// when the command ends, so D must take the same way (it once went to
+/// /dev/tty and arrived before the last 40 KB of `seq 1 20000`).
+#[test]
+fn bash_session_through_tee_gets_d_after_the_output() {
+    for bash in bashes() {
+        let observed = run_steps(
+            &Case {
+                shell: Shell::Bash,
+                program: bash.clone(),
+                args: Some(&["-i"]),
+                files: &[(".bashrc", "exec > >(tee -a \"$HOME/session.log\") 2>&1\n")],
+                env: &[],
+            },
+            // The prompt (A) goes through the pipe too: once the third is
+            // in, so is everything `seq` wrote before it.
+            &[
+                (Wait::Prompts(1), "seq 1 20000\r"),
+                (Wait::Prompts(2), "true\r"),
+                (Wait::Prompts(3), "exit\r"),
+            ],
+        );
+        let text = String::from_utf8_lossy(&observed.output);
+        let what = bash.display();
+        let output = &observed.output;
+        let end = output
+            .windows(9)
+            .position(|w| w == b"\r\n20000\r\n")
+            .unwrap_or_else(|| panic!("{what}: no end of output: {text:?}"))
+            + 9;
+        assert_eq!(
+            count(&output[..end], b"\x1b]133;D"),
+            0,
+            "{what}: a D before the output ended"
+        );
+        // `exit`'s C may still be in the pipe when bash exits.
+        let mut got = marks(observed.payloads.iter().map(Vec::as_slice));
+        got.truncate(10);
+        let mut want = marks_for(&[0, 0]);
+        want.truncate(10);
+        assert_eq!(got, want, "{what}");
+    }
+}
+
+/// Two lines pasted at once into a session logged through a pipe: the
+/// second line's C takes the pipe, as the first line's output did, so it
+/// follows that output and the first line's D (through /dev/tty it once
+/// landed some 30 KB inside `seq 1 20000`).
+#[test]
+fn bash_pasted_lines_through_tee_keep_c_after_the_output() {
+    for bash in bashes() {
+        let observed = run_steps(
+            &Case {
+                shell: Shell::Bash,
+                program: bash.clone(),
+                args: Some(&["-i"]),
+                files: &[(".bashrc", "exec > >(tee -a \"$HOME/session.log\") 2>&1\n")],
+                env: &[],
+            },
+            &[
+                (
+                    Wait::Prompts(1),
+                    "seq 1 20000; echo ENDOUT\rprintf 'lastline\\n'\r",
+                ),
+                (Wait::Prompts(3), "exit\r"),
+            ],
+        );
+        let text = String::from_utf8_lossy(&observed.output);
+        let what = bash.display();
+        let output = &observed.output;
+        let tail = b"\r\n20000\r\nENDOUT\r\n";
+        let end = output
+            .windows(tail.len())
+            .position(|w| w == tail)
+            .unwrap_or_else(|| panic!("{what}: no end of output: {text:?}"))
+            + tail.len();
+        let at = |mark: &[u8]| -> Vec<usize> {
+            output
+                .windows(mark.len())
+                .enumerate()
+                .filter(|(_, w)| *w == mark)
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let cs = at(b"\x1b]133;C");
+        let ds = at(b"\x1b]133;D");
+        // The third (exit's) may or may not be in.
+        assert!(cs.len() >= 2, "{what}: {text:?}");
+        assert!(!ds.is_empty(), "{what}: {text:?}");
+        assert!(cs[0] < end, "{what}: first C after the output");
+        assert!(
+            cs[1] > end && cs[1] > ds[0],
+            "{what}: second C at {} inside the first line's output (ends at {end}, D at {})",
+            cs[1],
+            ds[0]
+        );
+        // `exit`'s C may still be in the pipe when bash exits.
+        let mut got = marks(observed.payloads.iter().map(Vec::as_slice));
+        got.truncate(10);
+        let mut want = marks_for(&[0, 0]);
+        want.truncate(10);
+        assert_eq!(got, want, "{what}");
+    }
+}
+
+/// The copy of standard output the hooks keep for C is closed before the
+/// user's command runs: no command sees an fd it did not open (the copies
+/// are two of 59 down to 50; `ls` itself opens 3).
+#[test]
+fn bash_commands_inherit_no_mark_fd() {
+    for bash in bashes() {
+        for bashrc in ["", "exec > >(tee -a \"$HOME/session.log\") 2>&1\n"] {
+            let out = tempfile::tempdir().unwrap();
+            let observed = run_steps(
+                &Case {
+                    shell: Shell::Bash,
+                    program: bash.clone(),
+                    args: Some(&["-i"]),
+                    files: &[(".bashrc", bashrc)],
+                    env: &[("OUT", out.path().to_str().unwrap())],
+                },
+                &[
+                    (Wait::Prompts(1), "/bin/ls /dev/fd > \"$OUT/plain\"\r"),
+                    (Wait::Prompts(2), "{ /bin/ls /dev/fd; } > \"$OUT/group\"\r"),
+                    (Wait::Prompts(3), "\r"),
+                    (Wait::Prompts(4), "/bin/ls /dev/fd > \"$OUT/after_empty\"\r"),
+                    (Wait::Prompts(5), "exit\r"),
+                ],
+            );
+            let text = String::from_utf8_lossy(&observed.output);
+            let what = format!("{} {bashrc:?}", bash.display());
+            for name in ["plain", "group", "after_empty"] {
+                let got = std::fs::read_to_string(out.path().join(name)).unwrap();
+                let fds: Vec<u32> = got.lines().map(|l| l.parse().unwrap()).collect();
+                assert!(
+                    !fds.is_empty() && fds.iter().all(|&fd| fd < 10),
+                    "{what}: {name}: {got:?}; terminal: {text:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A compound command that redirects a descriptor the hooks keep a copy
+/// of standard output on (59 and 58) keeps its data: the trap, which runs
+/// inside that redirection, writes no C there and closes nothing (C once
+/// went into `f59` and the user's 59 was closed before `echo` ran). Any
+/// other number (11, which bash 4.1+ `{var}` once picked) gets its C.
+#[test]
+fn bash_compound_redirecting_a_mark_fd_keeps_its_data() {
+    for bash in bashes() {
+        let out = tempfile::tempdir().unwrap();
+        std::fs::write(out.path().join("in"), "x\ny\n").unwrap();
+        let observed = run_steps(
+            &Case {
+                shell: Shell::Bash,
+                program: bash.clone(),
+                args: Some(&["-i"]),
+                files: &[(".bashrc", "")],
+                env: &[("OUT", out.path().to_str().unwrap())],
+            },
+            &[
+                (Wait::Prompts(1), "{ echo a >&59; } 59>\"$OUT/f59\"\r"),
+                (
+                    Wait::Prompts(2),
+                    "while read -u 59 l; do echo \"got $l\"; done 59<\"$OUT/in\" > \"$OUT/read\"\r",
+                ),
+                (Wait::Prompts(3), "{ echo b >&58; } 58>\"$OUT/f58\"\r"),
+                (Wait::Prompts(4), "{ echo c >&11; } 11>\"$OUT/f11\"\r"),
+                (Wait::Prompts(5), "/bin/ls /dev/fd > \"$OUT/fds\"\r"),
+                (Wait::Prompts(6), "exit\r"),
+            ],
+        );
+        let text = String::from_utf8_lossy(&observed.output);
+        let what = bash.display();
+        assert!(!text.contains("file descriptor"), "{what}: {text:?}");
+        for (name, want) in [
+            ("f59", "a\n"),
+            ("read", "got x\ngot y\n"),
+            ("f58", "b\n"),
+            ("f11", "c\n"),
+        ] {
+            let got = std::fs::read_to_string(out.path().join(name)).unwrap();
+            assert_eq!(got, want, "{what}: {name}; terminal: {text:?}");
+        }
+        let fds = std::fs::read_to_string(out.path().join("fds")).unwrap();
+        assert!(
+            fds.lines().all(|l| l.parse::<u32>().unwrap() < 10),
+            "{what}: a copy outlived its prompt: {fds:?}"
+        );
+        let mut want = Vec::new();
+        for _ in 0..3 {
+            want.extend(command_marks(false, Some(0)));
+        }
+        for _ in 0..2 {
+            want.extend(command_marks(true, Some(0)));
+        }
+        want.extend([Mark::PromptStart, Mark::CommandStart, Mark::OutputStart]);
+        let got = marks(observed.payloads.iter().map(Vec::as_slice));
+        assert_eq!(got, want, "{what}: {text:?}");
+    }
+}
+
+/// Our hooks work whatever IFS holds: the DEBUG trap's conditional
+/// commands are not split with it (`IFS=,` gave "builtin eval builtin trap
+/// - DEBUG: command not found" around every command).
+#[test]
+fn bash_with_any_ifs() {
+    for bash in bashes() {
+        // Also with a user's DEBUG trap (chained after ours).
+        for bashrc in ["", "trap 'n=1' DEBUG\n"] {
+            let observed = run_steps(
+                &Case {
+                    shell: Shell::Bash,
+                    program: bash.clone(),
+                    args: Some(&["-i"]),
+                    files: &[(".bashrc", bashrc)],
+                    env: &[],
+                },
+                &[
+                    (Wait::Prompts(1), "IFS=,\r"),
+                    (Wait::Prompts(2), "true\r"),
+                    (Wait::Prompts(3), "IFS=$'\\n'\r"),
+                    (Wait::Prompts(4), "false\r"),
+                    (Wait::Prompts(5), "IFS=\r"),
+                    (Wait::Prompts(6), "true\r"),
+                    (Wait::Prompts(7), "exit\r"),
+                ],
+            );
+            let text = String::from_utf8_lossy(&observed.output);
+            let what = format!("{} {bashrc:?}", bash.display());
+            assert!(!text.contains("not found"), "{what}: {text:?}");
+            let got = marks(observed.payloads.iter().map(Vec::as_slice));
+            assert_eq!(got, marks_for(&[0, 0, 0, 1, 0, 0]), "{what}: {text:?}");
+        }
+    }
+}
+
+/// A user's ERR trap runs for the user's failing commands only, as without
+/// the integration: our hooks hand on the last status without failing a
+/// command (they ran it once each after every failing command), also with
+/// `set -E` (errtrace) and a user's DEBUG trap.
+#[test]
+fn bash_err_trap_runs_for_the_users_commands_only() {
+    for bash in bashes() {
+        for bashrc in [
+            "trap 'echo trap-err' ERR\n",
+            "set -E\ntrap ': \"$_\"' DEBUG\ntrap 'echo trap-err' ERR\n",
+        ] {
+            let observed = run_steps(
+                &Case {
+                    shell: Shell::Bash,
+                    program: bash.clone(),
+                    args: Some(&["-i"]),
+                    files: &[(".bashrc", bashrc)],
+                    env: &[],
+                },
+                &[
+                    (Wait::Prompts(1), "false\r"),
+                    (Wait::Prompts(2), "true\r"),
+                    (Wait::Prompts(3), "exit\r"),
+                ],
+            );
+            let text = String::from_utf8_lossy(&observed.output);
+            let what = format!("{} {bashrc:?}", bash.display());
+            assert_eq!(
+                count(&observed.output, b"trap-err\r\n"),
+                1,
+                "{what}: {text:?}"
+            );
+            let got = marks(observed.payloads.iter().map(Vec::as_slice));
+            assert_eq!(got, marks_for(&[1, 0]), "{what}: {text:?}");
+        }
+    }
+}
+
+/// `set -e` (errexit): a failed command the shell survives without the
+/// integration (`false && true`) does not exit it through our hooks either.
+#[test]
+fn bash_with_errexit() {
+    for bash in bashes() {
+        for bashrc in ["set -e\n", "set -e\ntrap 'n=1' DEBUG\n"] {
+            let observed = run_steps(
+                &Case {
+                    shell: Shell::Bash,
+                    program: bash.clone(),
+                    args: Some(&["-i"]),
+                    files: &[(".bashrc", bashrc)],
+                    env: &[],
+                },
+                &[
+                    (Wait::Prompts(1), "false && true\r"),
+                    (Wait::Prompts(2), "echo alive-$((40+3))\r"),
+                    (Wait::Prompts(3), "exit\r"),
+                ],
+            );
+            let text = String::from_utf8_lossy(&observed.output);
+            let what = format!("{} {bashrc:?}", bash.display());
+            assert!(text.contains("alive-43\r\n"), "{what}: {text:?}");
+            let got = marks(observed.payloads.iter().map(Vec::as_slice));
+            assert_eq!(got, marks_for(&[1, 0]), "{what}: {text:?}");
+        }
+    }
+}
+
 /// A prompt framework's own preexec (starship's shape: `PROMPT_COMMAND` is
 /// its precmd, which arms it at its end, and its DEBUG trap starts a timer
 /// at the first command after that) must start on the user's command, as

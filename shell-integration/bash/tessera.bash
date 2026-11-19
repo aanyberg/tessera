@@ -24,8 +24,14 @@
 # Hooks: PROMPT_COMMAND entries close the last command (D), put the prompt
 # marks into PS1 (A before it, B after it) and install a DEBUG trap that
 # marks the start of the next command (C) and then removes itself, so it
-# costs nothing while commands run; it keeps $? and $_ as it found them. An
-# existing DEBUG trap keeps running (after ours, and alone while a command
+# costs nothing while commands run; it keeps $? and $_ as it found them.
+# The marks go to standard output as it is at the prompt (the session's
+# stream, also when that is a pipe to a logger such as `exec > >(tee log)`),
+# never into a command's redirected output (`{ ...; } > f` runs the trap
+# with f as standard output): the C mark goes to copies of standard output
+# taken at the prompt, closed before the command runs.
+# The hooks run no ERR trap and do not exit a `set -e` shell, whatever IFS
+# holds. An existing DEBUG trap keeps running (after ours, and alone while a command
 # runs); with bash-preexec loaded, its hook lists are used instead. Once
 # installed, PROMPT_COMMAND is no longer exported (child shells have none of
 # our functions). An array PROMPT_COMMAND (bash 5.1+) is joined into one
@@ -42,7 +48,17 @@
 #   followed by a bare D);
 # - a login shell's startup file that assigns PROMPT_COMMAND (rather than
 #   adding to it) drops the loader, so that shell is not integrated (and
-#   the TESSERA_* variables stay in its environment, unread).
+#   the TESSERA_* variables stay in its environment, unread);
+# - bash 3.2 resets PIPESTATUS in any DEBUG trap (ours included; bash 4 and
+#   later restore it): `${PIPESTATUS[*]}` on the command line after a
+#   pipeline holds one status, not the pipeline's;
+# - a command line that only runs a subshell also leaves the two copies
+#   of standard output (descriptors from 59 down to 50) open in it, closed
+#   at the next prompt, so its commands inherit them;
+# - a compound command that redirects one of those descriptors
+#   (`{ ...; } 59>f`) gets no C, and its commands inherit the other copy;
+#   one that points both at the same file, or one at the file the other
+#   is (`59>&1` at the terminal), gets C written to it and both closed.
 #
 # bash 3.2 compatibility: no PS0, no associative arrays, no ${var,,}, no
 # BASHPID; PROMPT_COMMAND arrays only on 5.1+. Run on 3.2.57 and 5.3.20.
@@ -137,6 +153,49 @@ if [[ $- == *i* && -n "${TESSERA_SHELL_INTEGRATION-}" && "${TESSERA_SHELL_INTEGR
     _tessera_si_mark_a='\[\033]133;A\007\]'
     _tessera_si_mark_b='\[\033]133;B\007\]'
 
+    # The C mark goes to standard output as it was at the prompt (the
+    # session's stream: the terminal, or a pipe such as `exec > >(tee log)`
+    # that C must stay in order in), never into a command's redirected
+    # output (the DEBUG trap fires inside `{ ...; } > f`, with f as
+    # standard output). _tessera_si_prompt keeps two copies of standard
+    # output on descriptors of ours, _tessera_si_out and _tessera_si_out2:
+    # the first two of 59 down to 50 that are not open (bash keeps 63 and
+    # down for process substitutions and 255 for the terminal; no
+    # `{var}>&1`, which 3.2 lacks and which picks 10 or above, the numbers
+    # users redirect). A compound command can still redirect one of them
+    # (`{ ...; } 59>f`) before the trap runs: preexec writes C and closes
+    # both (bash cannot make them close-on-exec) only while they are still
+    # the same file; otherwise it writes no C and leaves the user's
+    # descriptor alone. Plain `exec`: 3.2 drops the redirections of
+    # `builtin exec` when it returns.
+    _tessera_si_out=
+    _tessera_si_out2=
+    _tessera_si_close_out() {
+        if [[ -n "$_tessera_si_out" ]]; then
+            builtin eval "exec $_tessera_si_out>&- $_tessera_si_out2>&-"
+            _tessera_si_out=
+            _tessera_si_out2=
+        fi
+    }
+    _tessera_si_open_out() {
+        _tessera_si_close_out
+        builtin local fd first=
+        for fd in 59 58 57 56 55 54 53 52 51 50; do
+            [[ -e /dev/fd/$fd ]] && continue
+            { builtin eval "exec $fd>&1"; } 2>/dev/null || continue
+            if [[ -z "$first" ]]; then
+                first=$fd
+            else
+                _tessera_si_out=$first
+                _tessera_si_out2=$fd
+                builtin return 0
+            fi
+        done
+        # Fewer than two free: none (C then goes to standard output).
+        [[ -n "$first" ]] && builtin eval "exec $first>&-"
+        builtin return 0
+    }
+
     # OSC 7: `file://<host><path>`, the path percent-encoded byte by byte
     # with Terminal.app's rule (every byte outside [/._~A-Za-z0-9-] becomes
     # %XX), the host from $HOSTNAME reduced to [A-Za-z0-9._-]. Sent at
@@ -181,6 +240,10 @@ if [[ $- == *i* && -n "${TESSERA_SHELL_INTEGRATION-}" && "${TESSERA_SHELL_INTEGR
             _tessera_si_elements=2
         fi
         # The head installs the trap next: the last command's disarm is done.
+        # A prompt with no command since the last (empty line, Ctrl-C, a
+        # line that only runs a subshell), or a command that redirected a
+        # copy, left the copies open: none outlives a prompt.
+        _tessera_si_close_out
         _tessera_si_disarm=
         _tessera_si_armed=
         case $_tessera_si_words in *" no-prompt-mark "*) ;; *)
@@ -194,7 +257,7 @@ if [[ $- == *i* && -n "${TESSERA_SHELL_INTEGRATION-}" && "${TESSERA_SHELL_INTEGR
             ;;
         esac
         case $_tessera_si_words in *" no-cwd "*) ;; *) _tessera_si_report_pwd ;; esac
-        builtin return $status
+        builtin return "$status"
     }
 
     # Next to last PROMPT_COMMAND entry: put the marks into PS1 (after any
@@ -210,6 +273,7 @@ if [[ $- == *i* && -n "${TESSERA_SHELL_INTEGRATION-}" && "${TESSERA_SHELL_INTEGR
     _tessera_si_prompt() {
         builtin local status=$?
         case $_tessera_si_words in *" no-prompt-mark "*) ;; *)
+            _tessera_si_open_out
             case $PS1 in *"$_tessera_si_mark_a"*) ;; *) PS1=$_tessera_si_mark_a$PS1 ;; esac
             case $PS1 in
                 *"$_tessera_si_mark_b") ;;
@@ -252,7 +316,14 @@ if [[ $- == *i* && -n "${TESSERA_SHELL_INTEGRATION-}" && "${TESSERA_SHELL_INTEGR
         _tessera_si_armed=
         case $_tessera_si_words in *" no-prompt-mark "*) builtin return 0 ;; esac
         # No `cmdline=`: the command line is the user's data (ADR 0021).
-        builtin printf '\033]133;C\007'
+        if [[ -z "$_tessera_si_out" ]]; then
+            builtin printf '\033]133;C\007'
+        elif [[ /dev/fd/$_tessera_si_out -ef /dev/fd/$_tessera_si_out2 ]]; then
+            builtin printf '\033]133;C\007' >&"$_tessera_si_out"
+            _tessera_si_close_out
+        fi
+        # Else the command redirects a copy: no C, and the copies stay open
+        # for it (the next prompt closes them).
         _tessera_si_state=1
     }
 
@@ -267,7 +338,13 @@ if [[ $- == *i* && -n "${TESSERA_SHELL_INTEGRATION-}" && "${TESSERA_SHELL_INTEGR
     # it (0, or that of the trap before ours) and sets $_ back (through its
     # argument).
     _tessera_si_keep() {
-        builtin return $?
+        builtin return "$?"
+    }
+
+    # Second command of the `&&` lists that run our status-returning hooks
+    # (see _tessera_si_head; in the trap text its argument sets $_ back).
+    _tessera_si_nop() {
+        builtin return 0
     }
 
     _tessera_si_debug() {
@@ -314,22 +391,33 @@ if [[ $- == *i* && -n "${TESSERA_SHELL_INTEGRATION-}" && "${TESSERA_SHELL_INTEGR
         # _tessera_si_keep, whose argument `$_` becomes. Its status is 0
         # unless the trap before ours decided otherwise: under `extdebug` a
         # DEBUG trap returning non-zero skips the command (2: `return`).
+        # The conditional commands are eval'd quoted strings (`eval ""` is
+        # a no-op with status 0), not unquoted expansions: those would be
+        # split with the user's IFS (`IFS=,` made `builtin eval ...` one
+        # word, "command not found").
         # shellcheck disable=SC2016
         _tessera_si_trap='_tessera_si_saved=("$?" "$_")
-${_tessera_si_armed:+_tessera_si_debug}
-${_tessera_si_disarm:+builtin eval "$_tessera_si_untrap"}'
+builtin eval "${_tessera_si_armed:+_tessera_si_debug}"
+builtin eval "${_tessera_si_disarm:+$_tessera_si_untrap}"'
         if [[ -n "$_tessera_si_prev_trap" ]]; then
             # shellcheck disable=SC2016
             _tessera_si_trap+='
-_tessera_si_restore "${_tessera_si_saved[1]}"
-${_tessera_si_disarm:+builtin eval "$_tessera_si_prev_trap"}'
+_tessera_si_restore "${_tessera_si_saved[1]}" && _tessera_si_nop "${_tessera_si_saved[1]}"
+builtin eval "${_tessera_si_disarm:+$_tessera_si_prev_trap}"'
         fi
         # shellcheck disable=SC2016
         _tessera_si_trap+='
 _tessera_si_keep "${_tessera_si_saved[1]}"'
         # shellcheck disable=SC2016
-        _tessera_si_head=$'_tessera_si_precmd\nbuiltin trap -- "$_tessera_si_trap" DEBUG\n_tessera_si_pass\n'
-        _tessera_si_tail=$'\n_tessera_si_prompt\n_tessera_si_ret'
+        # The entries that hand on a non-zero status do it as the first
+        # command of an `&&` list: a failing command there does not run an
+        # ERR trap or exit the shell under `set -e` (both would for a
+        # plain one), and the list's status is still theirs.
+        # _tessera_si_nop, not `:`, ends the list: the trap takes any
+        # command but ours for the user's (after _tessera_si_ret, `:` would
+        # get the C).
+        _tessera_si_head=$'_tessera_si_precmd && _tessera_si_nop\nbuiltin trap -- "$_tessera_si_trap" DEBUG\n_tessera_si_pass && _tessera_si_nop\n'
+        _tessera_si_tail=$'\n_tessera_si_prompt && _tessera_si_nop\n_tessera_si_ret && _tessera_si_nop'
         # Newline-separated: valid whatever the user's PROMPT_COMMAND ends
         # with (`;`, `&`, a newline or nothing).
         _tessera_si_join_prompt_command
@@ -348,14 +436,14 @@ _tessera_si_keep "${_tessera_si_saved[1]}"'
     # was set before: then the first command has no C.)
     if [[ -n "${_tessera_si_late-}" ]]; then
         builtin unset _tessera_si_late
-        _tessera_si_precmd
+        _tessera_si_precmd && _tessera_si_nop
         _tessera_si_elements=${_tessera_si_late_elements-1}
         builtin unset _tessera_si_late_elements
         if [[ -z "$_tessera_si_bp" ]]; then
             builtin trap -- "$_tessera_si_trap" DEBUG
         fi
-        _tessera_si_prompt
-        [[ -n "$_tessera_si_bp" ]] || _tessera_si_ret
+        _tessera_si_prompt && _tessera_si_nop
+        [[ -n "$_tessera_si_bp" ]] || { _tessera_si_ret && _tessera_si_nop; }
     fi
 else
     builtin unset _tessera_si_late _tessera_si_late_elements
