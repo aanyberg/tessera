@@ -91,6 +91,20 @@ fn settled(applied: &AtomicU64, n: u64) -> u64 {
     seen
 }
 
+/// Waits for the announcements of one write after `n` and returns the
+/// settled count: one for the apply, plus at most one `Unchanged` from a
+/// re-read that read the file before the write's rename or after it was
+/// applied (a slow `fsync` or a late event on a loaded machine, #535).
+/// More is a double announcement.
+fn applied_once(applied: &AtomicU64, n: u64, what: &str) -> u64 {
+    let seen = settled(applied, n + 1);
+    assert!(
+        (n + 1..=n + 2).contains(&seen),
+        "{what}: applied once (plus at most one unchanged re-read): {n} -> {seen}"
+    );
+    seen
+}
+
 fn set(app: *mut App, key: &str, json: &str) -> (Error, String) {
     let mut msg = [0u8; 512];
     let mut msg_len = 0;
@@ -175,8 +189,7 @@ fn app_appearance_round_trips(root: &Path) {
             format!("[appearance]\nfont_size = 13.0\napp_appearance = \"{name}\"\n"),
             "{name}"
         );
-        n += 1;
-        assert_eq!(settled(&applied, n), n, "{name}: applied once");
+        n = applied_once(&applied, n, name);
         assert_eq!(app_appearance(app), want as u32, "{name}");
         assert_eq!(
             config_json(app)["config"]["appearance"]["app_appearance"],
@@ -228,10 +241,10 @@ fn the_watch_applies_a_write_once() {
         std::fs::read_to_string(&config).unwrap(),
         "# Mine.\n[appearance]\nopacity = 0.5 # opaque\n"
     );
-    assert_eq!(settled(&applied, 1), 1, "one write, applied once");
+    let n = applied_once(&applied, 0, "one write");
     assert!((opacity(app) - 0.5).abs() < f32::EPSILON);
     let json = config_json(app);
-    assert_eq!(json["generation"], 1);
+    assert_eq!(json["generation"], n);
     assert_eq!(json["config"]["appearance"]["opacity"], 0.5);
 
     // Refused, or the same value again: nothing written, nothing applied.
@@ -242,7 +255,7 @@ fn the_watch_applies_a_write_once() {
     let (code, _) = set(app, "appearance.opacity", "0.5");
     assert_eq!(code, Error::Ok);
     assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
-    assert_eq!(settled(&applied, 1), 1, "nothing more applied");
+    assert_eq!(settled(&applied, n), n, "nothing more applied");
 
     // A remove is applied once too: the default is back.
     let key = "appearance.opacity";
@@ -260,7 +273,7 @@ fn the_watch_applies_a_write_once() {
         )
     };
     assert_eq!((code, msg_len), (Error::Ok, 0));
-    assert_eq!(settled(&applied, 2), 2);
+    applied_once(&applied, n, "a remove");
     assert!((opacity(app) - 1.0).abs() < f32::EPSILON);
     assert_eq!(
         std::fs::read_to_string(&config).unwrap(),
@@ -271,4 +284,38 @@ fn the_watch_applies_a_write_once() {
     unsafe { tessera_app_free(app) };
 
     app_appearance_round_trips(dir.path());
+    an_undone_save_is_announced(dir.path());
+}
+
+/// #535: a Settings save that another app undoes right away (inside the
+/// watch's debounce, when the timing allows) still reaches the host:
+/// `on_config_applied` is called with a new generation and the
+/// configuration then read is the file's, so a value the host holds as
+/// pending settles to it. Before the fix a re-read that found the
+/// configuration unchanged called nothing and the host waited forever.
+fn an_undone_save_is_announced(root: &Path) {
+    let dir = root.join("undone");
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("config.toml");
+    let text = "[appearance]\nfont_size = 13.0\n";
+    std::fs::write(&config, text).unwrap();
+    let applied = AtomicU64::new(0);
+    let app = new_app(&dir);
+    install(app, &applied);
+    assert_eq!(settled(&applied, 0), 0, "nothing applied at start");
+
+    let (code, msg) = set(app, "appearance.font_size", "14.0");
+    assert_eq!((code, msg.as_str()), (Error::Ok, ""));
+    std::fs::write(&config, text).unwrap();
+    let count = settled(&applied, 1);
+    assert!(count >= 1, "the re-read reached the host");
+    let json = config_json(app);
+    assert_eq!(json["generation"], count, "one generation per call");
+    assert_eq!(
+        json["config"]["appearance"]["font_size"], 13.0,
+        "the file's value"
+    );
+
+    // SAFETY: live handle, freed once; no other call races.
+    unsafe { tessera_app_free(app) };
 }

@@ -13,6 +13,14 @@
 //!   that is not in use changes nothing on screen.
 //! - [`ConfigEvent::Invalid`]: the last good configuration stays (the
 //!   store logged the error, once).
+//! - [`ConfigEvent::Unchanged`]: the watcher read the files again and
+//!   found the configuration in effect. Nothing is restyled, but the
+//!   configuration generation moves and the observer hears
+//!   [`SessionObserver::on_config_applied`], so a host waiting to see a
+//!   value it saved reads the configuration again and learns the file no
+//!   longer has it (a save another app undid inside the debounce, #535).
+//!   Also when the event was folded into another that announced nothing
+//!   (the apply thread folds queued events into one).
 //!
 //! Applying runs on that thread. It changes the views' colours and font
 //! size under the views lock (no GPU work), resizes the sessions whose grid
@@ -23,6 +31,7 @@
 //! window translucent or opaque and redraw.
 //!
 //! [`SessionObserver::on_appearance_changed`]: crate::SessionObserver::on_appearance_changed
+//! [`SessionObserver::on_config_applied`]: crate::SessionObserver::on_config_applied
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -657,8 +666,26 @@ impl Live {
         (config, self.bindings.generation())
     }
 
-    /// Handles one watcher event.
-    fn handle(&self, store: &ConfigStore, event: ConfigEvent) {
+    /// Handles `event` with the events queued behind it folded in
+    /// ([`fold`]), on the apply thread.
+    fn handle_folded(
+        &self,
+        store: &ConfigStore,
+        event: ConfigEvent,
+        events: &Receiver<ConfigEvent>,
+    ) {
+        let (event, reread) = fold(event, events);
+        if !self.handle(store, event) && reread {
+            // An `Unchanged` folded into an event that announced nothing (a
+            // `ThemesChanged` of a theme not in use, an `Invalid`): the
+            // host still hears that the file was read (#535).
+            self.config_applied();
+        }
+    }
+
+    /// Handles one watcher event. Returns whether the observer heard
+    /// [`SessionObserver::on_config_applied`](crate::SessionObserver::on_config_applied).
+    fn handle(&self, store: &ConfigStore, event: ConfigEvent) -> bool {
         match event {
             ConfigEvent::Changed(changed) => {
                 // The store logged the warnings it had not logged before
@@ -669,10 +696,9 @@ impl Live {
                 // applied a newer one must not bring the older back (#283).
                 drop(changed);
                 self.apply_changed(store, &store.config());
+                true
             }
-            ConfigEvent::ThemesChanged => {
-                self.apply_theme_if_changed(store);
-            }
+            ConfigEvent::ThemesChanged => self.apply_theme_if_changed(store),
             ConfigEvent::Invalid(error) => {
                 // The store logged it as a warning when it recorded it.
                 tracing::debug!(
@@ -680,8 +706,19 @@ impl Live {
                     %error,
                     "config.toml could not be loaded; keeping the last good configuration"
                 );
+                false
             }
-            other => tracing::debug!(target: "tessera_app_core", ?other, "config event ignored"),
+            ConfigEvent::Unchanged => {
+                // Nothing to restyle: the configuration in effect is the
+                // file's. The host still hears that the file was read
+                // (#535).
+                self.config_applied();
+                true
+            }
+            other => {
+                tracing::debug!(target: "tessera_app_core", ?other, "config event ignored");
+                false
+            }
         }
     }
 
@@ -790,8 +827,9 @@ impl Live {
     }
 
     /// Looks the theme up again and applies it if it differs from the
-    /// colours in use (lead decision D3). Returns `false` when the theme
-    /// file in use does not load: the colours in use are kept, and the
+    /// colours in use (lead decision D3). Returns whether it applied a
+    /// configuration (and so announced it to the observer). When the theme
+    /// file in use does not load, the colours in use are kept, and the
     /// sessions are restyled with them all the same, since a profile's
     /// theme (and so the default look, [`App::view_theme`]) may have
     /// changed (#338).
@@ -815,11 +853,11 @@ impl Live {
                 break (config, lookup);
             }
         };
-        let (colours, source, loaded) = match lookup {
-            Lookup::Use(colours, source) => (colours, source, true),
+        let (colours, source) = match lookup {
+            Lookup::Use(colours, source) => (colours, source),
             Lookup::KeepBroken => {
                 let applied = lock(&self.applied);
-                (applied.colours.clone(), applied.source.clone(), false)
+                (applied.colours.clone(), applied.source.clone())
             }
         };
         let same = {
@@ -834,7 +872,7 @@ impl Live {
         } else {
             self.apply_from(&config, &colours, source);
         }
-        loaded
+        !same
     }
 }
 
@@ -993,7 +1031,7 @@ impl ConfigWatch {
                     if lock(&thread_slot).stopped {
                         return;
                     }
-                    live.handle(&store, fold(event, &events));
+                    live.handle_folded(&store, event, &events);
                 }
             })?;
         Ok(Self {
@@ -1018,7 +1056,11 @@ impl ConfigWatch {
 /// `ThemesChanged` (it looks the theme up again too), and either covers an
 /// `Invalid` (the store keeps the last good configuration and logged the
 /// error). Of two alike the later is kept.
-fn fold(mut event: ConfigEvent, events: &Receiver<ConfigEvent>) -> ConfigEvent {
+///
+/// Also returns whether any of them was an `Unchanged` (#535): the event
+/// kept may announce nothing, and then the apply thread announces the
+/// re-read itself.
+fn fold(mut event: ConfigEvent, events: &Receiver<ConfigEvent>) -> (ConfigEvent, bool) {
     fn rank(event: &ConfigEvent) -> u8 {
         match event {
             ConfigEvent::Changed(_) => 2,
@@ -1026,15 +1068,17 @@ fn fold(mut event: ConfigEvent, events: &Receiver<ConfigEvent>) -> ConfigEvent {
             _ => 0,
         }
     }
+    let mut reread = matches!(event, ConfigEvent::Unchanged);
     for _ in 0..MAX_EVENTS_FOLDED {
         let Ok(next) = events.try_recv() else {
             break;
         };
+        reread |= matches!(next, ConfigEvent::Unchanged);
         if rank(&next) >= rank(&event) {
             event = next;
         }
     }
-    event
+    (event, reread)
 }
 
 /// `options` with the core's thread start hook for the watcher's thread.
@@ -1311,7 +1355,7 @@ mod tests {
         tx.send(invalid()).unwrap();
         tx.send(ConfigEvent::ThemesChanged).unwrap();
         tx.send(invalid()).unwrap();
-        let event = fold(first, &rx);
+        let (event, _) = fold(first, &rx);
         assert!(
             Arc::ptr_eq(folded_config(&event), &later),
             "the later Changed is kept"
@@ -1320,7 +1364,7 @@ mod tests {
 
         let (kept, start) = changed();
         tx.send(invalid()).unwrap();
-        let event = fold(start, &rx);
+        let (event, _) = fold(start, &rx);
         assert!(
             Arc::ptr_eq(folded_config(&event), &kept),
             "an Invalid folds into the Changed"
@@ -4365,5 +4409,255 @@ font_size = 14.0
             assert_eq!(app.config_watch_starts(), 1, "round {round}");
             app.stop_config_watch();
         }
+    }
+
+    /// Records the generations `on_config_applied` passes and counts
+    /// `on_appearance_changed`.
+    #[derive(Clone, Default)]
+    struct Announced {
+        applied: Arc<Mutex<Vec<u64>>>,
+        appearance: Arc<std::sync::atomic::AtomicUsize>,
+        heard: Option<Arc<(Mutex<()>, std::sync::Condvar)>>,
+    }
+
+    impl SessionObserver for Announced {
+        fn on_session_event(&self, _: SessionId, _: SessionEvent) {}
+        fn on_appearance_changed(&self, _: bool) {
+            self.appearance.fetch_add(1, Ordering::SeqCst);
+        }
+        fn on_config_applied(&self, generation: u64) {
+            lock(&self.applied).push(generation);
+            if let Some(heard) = &self.heard {
+                let _guard = lock(&heard.0);
+                heard.1.notify_all();
+            }
+        }
+    }
+
+    impl Announced {
+        /// One whose `on_config_applied` wakes [`Announced::wait_for`].
+        fn waking() -> Self {
+            Self {
+                heard: Some(Arc::default()),
+                ..Self::default()
+            }
+        }
+
+        /// Waits up to `bound` until `on_config_applied` was heard `count`
+        /// times; whether it was.
+        fn wait_for(&self, count: usize, bound: Duration) -> bool {
+            let heard = self.heard.as_ref().expect("a waking recorder");
+            let deadline = std::time::Instant::now() + bound;
+            let mut guard = lock(&heard.0);
+            while lock(&self.applied).len() < count {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                guard = heard
+                    .1
+                    .wait_timeout(guard, left)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+            true
+        }
+    }
+
+    /// #535: an `Unchanged` moves the configuration generation and tells
+    /// the observer, so a host waiting to see a value it saved reads the
+    /// configuration again; nothing is restyled (no new look generation,
+    /// no session given a look, no appearance change) and the
+    /// configuration in effect stays the same `Arc`.
+    #[test]
+    fn an_unchanged_reread_is_announced_without_a_restyle() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(root.path());
+        let config = Config::default();
+        let store = ConfigStore::in_memory(paths.clone(), config.clone());
+        let app = App::new(config, paths);
+        let id = attach_fake_profile(&app, None);
+        let heard = Announced::default();
+        app.set_observer(Some(Box::new(heard.clone())));
+        let live = app.live();
+        let looks = lock(&live.applied).generation;
+        let session_looks = lock(&app.sessions)[&id].look_generation();
+        let generation = app.config_generation();
+        let in_effect = app.config();
+
+        assert!(live.handle(&store, ConfigEvent::Unchanged), "announced");
+        assert_eq!(app.config_generation(), generation + 1);
+        assert_eq!(*lock(&heard.applied), [generation + 1]);
+        assert_eq!(
+            heard.appearance.load(Ordering::SeqCst),
+            0,
+            "nothing redrawn"
+        );
+        assert_eq!(lock(&live.applied).generation, looks, "no restyle");
+        assert_eq!(
+            lock(&app.sessions)[&id].look_generation(),
+            session_looks,
+            "no session given a look"
+        );
+        assert!(Arc::ptr_eq(&in_effect, &app.config()));
+    }
+
+    /// #535: folding reports an `Unchanged` among the events it folds,
+    /// whichever event it keeps, and only then.
+    #[test]
+    fn folding_says_whether_an_unchanged_was_among_the_events() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(ConfigEvent::Unchanged).unwrap();
+        tx.send(ConfigEvent::ThemesChanged).unwrap();
+        let (event, reread) = fold(ConfigEvent::ThemesChanged, &rx);
+        assert!(matches!(event, ConfigEvent::ThemesChanged), "{event:?}");
+        assert!(reread, "the queued Unchanged is reported");
+
+        tx.send(ConfigEvent::ThemesChanged).unwrap();
+        let (_, reread) = fold(ConfigEvent::Unchanged, &rx);
+        assert!(reread, "the first event's Unchanged is reported");
+
+        tx.send(ConfigEvent::ThemesChanged).unwrap();
+        let (_, reread) = fold(ConfigEvent::ThemesChanged, &rx);
+        assert!(!reread, "no Unchanged, none reported");
+    }
+
+    /// #535, the issue's sequence on a real watch: a save (font size 14)
+    /// that another writer undoes (back to 13) inside the debounce
+    /// applies nothing, but the observer hears `on_config_applied` with a
+    /// new generation, and the configuration it then reads is the file's.
+    /// Before the fix the watcher sent nothing and the host waited forever.
+    #[test]
+    fn a_save_undone_inside_the_debounce_is_announced() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(root.path());
+        std::fs::create_dir_all(paths.root()).unwrap();
+        let doc = |size: u32| format!("[appearance]\nfont_size = {size}\n");
+        std::fs::write(paths.config_file(), doc(13)).unwrap();
+        let store = ConfigStore::open(paths.clone()).unwrap();
+        let app = App::new((*store.config()).clone(), paths.clone());
+        let heard = Announced::waking();
+        app.set_observer(Some(Box::new(heard.clone())));
+        app.start_config_watch(
+            store,
+            WatchOptions {
+                // Long enough that a loaded machine still lands the undo
+                // inside it.
+                debounce: Duration::from_millis(500),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap();
+        // The catch-up at the start finds nothing new and announces
+        // nothing; give the apply thread time to have handled it.
+        std::thread::sleep(Duration::from_millis(200));
+        let generation = app.config_generation();
+        let announced = lock(&heard.applied).len();
+
+        std::fs::write(paths.config_file(), doc(14)).unwrap();
+        std::thread::sleep(Duration::from_millis(40));
+        std::fs::write(paths.config_file(), doc(13)).unwrap();
+        assert!(
+            heard.wait_for(announced + 1, Duration::from_secs(10)),
+            "the re-read was never announced"
+        );
+        let (config, now) = app.config_and_generation();
+        assert!(
+            now > generation,
+            "the generation moved: {generation} -> {now}"
+        );
+        assert_eq!(config.appearance.font_size, 13.0, "the file's value");
+        assert_eq!(
+            heard.appearance.load(Ordering::SeqCst),
+            0,
+            "nothing redrawn"
+        );
+        app.stop_config_watch();
+    }
+
+    /// #535: an `Unchanged` folded into a `ThemesChanged` that applies the
+    /// theme in use is covered by that apply's announcement: one, not two.
+    #[test]
+    fn an_unchanged_folded_into_an_applied_theme_is_announced_once() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(root.path());
+        std::fs::create_dir_all(paths.themes_dir()).unwrap();
+        let mine = paths.themes_dir().join("Mine.toml");
+        std::fs::write(&mine, theme_doc("Mine", "#101010")).unwrap();
+        let config = Config::from_toml_lenient("[appearance]\ntheme = \"Mine\"\n")
+            .unwrap()
+            .config;
+        let store = ConfigStore::in_memory(paths.clone(), config.clone());
+        let app = App::new(config, paths);
+        let heard = Announced::default();
+        app.set_observer(Some(Box::new(heard.clone())));
+        let live = app.live();
+        let (tx, rx) = mpsc::channel();
+
+        std::fs::write(&mine, theme_doc("Mine", "#203040")).unwrap();
+        tx.send(ConfigEvent::Unchanged).unwrap();
+        live.handle_folded(&store, ConfigEvent::ThemesChanged, &rx);
+        assert_eq!(
+            app.view_theme().background,
+            Rgba::from_srgb8(0x20, 0x30, 0x40),
+            "the theme in use applied"
+        );
+        assert_eq!(
+            lock(&heard.applied).len(),
+            1,
+            "its apply announces, the folded Unchanged with it"
+        );
+    }
+
+    /// #535: an `Unchanged` folded into a `ThemesChanged` that announces
+    /// nothing (no theme in use changed) is announced all the same, once;
+    /// one folded into a `Changed` is covered by its announcement.
+    #[test]
+    fn an_unchanged_folded_into_a_quiet_event_is_announced_once() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(root.path());
+        let config = Config::default();
+        let store = ConfigStore::in_memory(paths.clone(), config.clone());
+        let app = App::new(config, paths);
+        let heard = Announced::default();
+        app.set_observer(Some(Box::new(heard.clone())));
+        let live = app.live();
+        let (tx, rx) = mpsc::channel();
+
+        tx.send(ConfigEvent::ThemesChanged).unwrap();
+        live.handle_folded(&store, ConfigEvent::Unchanged, &rx);
+        assert_eq!(lock(&heard.applied).len(), 1, "announced once");
+
+        live.handle_folded(&store, ConfigEvent::ThemesChanged, &rx);
+        assert_eq!(
+            lock(&heard.applied).len(),
+            1,
+            "a quiet event alone announces nothing"
+        );
+
+        tx.send(ConfigEvent::Unchanged).unwrap();
+        live.handle_folded(
+            &store,
+            ConfigEvent::Invalid(tessera_config::Error::Io(Arc::new(io::Error::other("bad")))),
+            &rx,
+        );
+        assert_eq!(lock(&heard.applied).len(), 2, "after an Invalid too");
+
+        tx.send(ConfigEvent::Unchanged).unwrap();
+        let changed = ConfigEvent::Changed(tessera_config::ConfigChanged {
+            config: store.config(),
+            warnings: Vec::new(),
+        });
+        live.handle_folded(&store, changed, &rx);
+        assert_eq!(
+            lock(&heard.applied).len(),
+            3,
+            "a Changed announces once, its folded Unchanged with it"
+        );
+        assert_eq!(
+            heard.appearance.load(Ordering::SeqCst),
+            0,
+            "nothing redrawn"
+        );
     }
 }

@@ -113,7 +113,11 @@ pub struct Callbacks {
     >,
     /// The configuration watch applied a configuration (after an edit of
     /// `config.toml` or of the theme file in use), whether or not anything
-    /// in it changed; `generation` counts the configurations applied since
+    /// in it changed, or read `config.toml` again after a change on disk
+    /// and found the configuration in effect (a save another app undid
+    /// within the watch's debounce, #535): the generation moves all the
+    /// same, so a host holding a value it saved learns the file was read.
+    /// `generation` counts the configurations applied since
     /// the application was created (the first one applied is 1). The host
     /// reads what it shows from the configuration again: the menus' key
     /// equivalents with `tessera_app_keymap_json`, which reports the

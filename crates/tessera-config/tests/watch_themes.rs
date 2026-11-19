@@ -5,6 +5,7 @@
 //! `appearance.theme` names another one.
 
 use std::path::Path;
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 use tessera_config::{
@@ -68,15 +69,31 @@ fn setup(backend: WatchBackend, theme: &str) -> (tempfile::TempDir, ConfigStore,
     (dir, store, watcher)
 }
 
-/// Every event that arrives within `window`.
+/// Every event that arrives within `window`, but the
+/// [`ConfigEvent::Unchanged`] of each re-read of the unchanged
+/// `config.toml` a change in `themes/` causes (#535): these tests are
+/// about the themes events.
 fn drain(watcher: &Watcher, window: Duration) -> Vec<ConfigEvent> {
     let deadline = Instant::now() + window;
     let mut events = Vec::new();
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
-        match watcher.recv_timeout(left) {
+        match next_event(watcher, left) {
             Ok(event) => events.push(event),
             Err(_) => return events,
+        }
+    }
+}
+
+/// The next event within `bound` that is not a [`ConfigEvent::Unchanged`]
+/// (see [`drain`]).
+fn next_event(watcher: &Watcher, bound: Duration) -> Result<ConfigEvent, RecvTimeoutError> {
+    let deadline = Instant::now() + bound;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match watcher.recv_timeout(left)? {
+            ConfigEvent::Unchanged => {}
+            event => return Ok(event),
         }
     }
 }
@@ -92,8 +109,7 @@ fn expect_themes_changed_within(
     bound: Duration,
 ) {
     let started = Instant::now();
-    let event = watcher
-        .recv_timeout(bound)
+    let event = next_event(watcher, bound)
         .unwrap_or_else(|e| panic!("{backend:?}: no event for {what} within {bound:?}: {e}"));
     assert!(
         matches!(event, ConfigEvent::ThemesChanged),
@@ -161,8 +177,7 @@ fn editing_an_unrelated_theme_file_is_at_most_one_event_and_no_changed() {
         let events = if backend == WatchBackend::Poll {
             let defaults = WatchOptions::default();
             let bound = (defaults.poll_interval * 20 * 4 + defaults.debounce).max(EVENTUALLY);
-            let first = watcher
-                .recv_timeout(bound)
+            let first = next_event(&watcher, bound)
                 .unwrap_or_else(|e| panic!("Poll: unused-file write unseen within {bound:?}: {e}"));
             let mut events = vec![first];
             events.extend(drain(&watcher, QUIET));
@@ -349,7 +364,7 @@ fn an_edit_right_after_the_watch_starts_is_seen() {
                 &store.paths().themes_dir().join("mine.toml"),
                 &theme_doc("Mine", "#171717"),
             );
-            let event = watcher.recv_timeout(EVENTUALLY).unwrap_or_else(|e| {
+            let event = next_event(&watcher, EVENTUALLY).unwrap_or_else(|e| {
                 panic!("{backend:?}: round {round}: no event within {EVENTUALLY:?}: {e}")
             });
             assert!(

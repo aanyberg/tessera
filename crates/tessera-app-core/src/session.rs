@@ -291,7 +291,9 @@ pub trait SessionObserver: Send + Sync {
     }
 
     /// A configuration was applied ([`App::apply_config`](crate::App::apply_config),
-    /// or the configuration watch), whether or not anything in it changed;
+    /// or the configuration watch), whether or not anything in it changed,
+    /// or the watch read `config.toml` again after a change on disk and
+    /// found the configuration in effect (a save another app undid, #535);
     /// `generation` is the new [`App::config_generation`](crate::App::config_generation).
     /// The host reads what it shows from the configuration again, such as
     /// the key equivalents of its menus ([`App::keymap`](crate::App::keymap)).
