@@ -276,6 +276,202 @@ final class QuitAndCloseAllTests: XCTestCase {
         XCTAssertEqual(presenter.modals, [CloseConfirmation(scope: .allWindows, processNames: ["sleep"])])
     }
 
+    /// Close All ends a sheet on the Settings window as Cancel, once, before
+    /// it closes that window, as a quit does: neither is left behind.
+    func testCloseAllEndsASheetOnSettingsAsCancel() async throws {
+        _ = try appDelegate.newWindow()
+        appDelegate.openSettings(nil)
+        let settings = try XCTUnwrap(appDelegate.settingsWindowController?.window)
+        let sheet = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 200, height: 100), styleMask: [.titled], backing: .buffered,
+            defer: true)
+        sheet.isReleasedWhenClosed = false
+        var responses: [NSApplication.ModalResponse] = []
+        settings.beginSheet(sheet) { responses.append($0) }
+        try await waitUntil("the sheet is up") { settings.sheets.contains(sheet) }
+
+        XCTAssertTrue(try pressCloseAll())
+
+        try await waitUntil("the sheet answered") { !responses.isEmpty }
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(responses, [.cancel], "its Cancel path, once")
+        XCTAssertTrue(settings.sheets.isEmpty)
+        XCTAssertFalse(sheet.isVisible)
+        XCTAssertFalse(settings.isVisible)
+        XCTAssertNil(appDelegate.settingsWindowController)
+        XCTAssertTrue(appDelegate.windowControllers.isEmpty)
+    }
+
+    // MARK: Option-click on a close button
+
+    /// Clicks the window's close button as the mouse does, through
+    /// `NSApp.sendEvent`, with `modifiers` held: AppKit's button tracks the
+    /// press until the release queued behind it.
+    private func clickCloseButton(of window: NSWindow, _ modifiers: NSEvent.ModifierFlags) throws {
+        let button = try XCTUnwrap(window.standardWindowButton(.closeButton))
+        let location = button.convert(NSPoint(x: button.bounds.midX, y: button.bounds.midY), to: nil)
+        NSApp.postEvent(try mouseEvent(.leftMouseUp, at: location, in: window, modifiers), atStart: false)
+        NSApp.sendEvent(try mouseEvent(.leftMouseDown, at: location, in: window, modifiers))
+    }
+
+    private func mouseEvent(
+        _ type: NSEvent.EventType, at location: NSPoint, in window: NSWindow, _ modifiers: NSEvent.ModifierFlags
+    ) throws -> NSEvent {
+        try XCTUnwrap(
+            NSEvent.mouseEvent(
+                with: type, location: location, modifierFlags: modifiers,
+                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil,
+                eventNumber: 1, clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1))
+    }
+
+    /// Option-click on the close button with two busy windows, one of two
+    /// tabs: one application-modal alert for every job, no tab's sheet.
+    /// Cancel closes nothing; a second Option-click answered Close closes
+    /// everything (by ``AppDelegate/closeAllWindows(_:)``, whose freeing of
+    /// the controllers the ⌥⌘W test checks). Driven by the click alone.
+    func testOptionClickOnACloseButtonAsksOnceForEveryWindow() async throws {
+        let first = try openTabs(2)
+        let second = try openTabs(1)
+        try await start("sleep 100", in: try controller(of: first[0]))
+        try await start("cat", in: try controller(of: second[0]))
+        presenter.modalAnswer = false
+
+        try clickCloseButton(of: second[0], [.option])
+
+        try await waitUntil("Close All asks") { !presenter.modals.isEmpty }
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(presenter.modals, [CloseConfirmation(scope: .allWindows, processNames: ["sleep", "cat"])])
+        XCTAssertTrue(presenter.sheets.isEmpty, "no tab asks on a sheet of its own")
+        XCTAssertEqual(appDelegate.windowControllers.count, 3, "Cancel closes nothing")
+        XCTAssertTrue(second[0].isVisible && first[0].tabGroup?.windows.count == 2, "both windows stay")
+        XCTAssertTrue(appDelegate.windowControllers.allSatisfy { $0.pendingClose == nil }, "nothing asks on")
+
+        presenter.modalAnswer = true
+        try clickCloseButton(of: second[0], [.option])
+
+        try await waitUntil("every window closes") { appDelegate.windowControllers.isEmpty }
+        XCTAssertEqual(presenter.modals.count, 2, "asked once more, once")
+        XCTAssertTrue(presenter.sheets.isEmpty)
+    }
+
+    /// With every session at its prompt the Option-click closes every
+    /// window, without a question.
+    func testOptionClickOnACloseButtonWithIdleSessionsClosesEveryWindow() async throws {
+        let first = try openTabs(2)
+        _ = try openTabs(1)
+
+        try clickCloseButton(of: first[0], [.option])
+
+        try await waitUntil("every window closes") { appDelegate.windowControllers.isEmpty }
+        XCTAssertTrue(presenter.modals.isEmpty, "nothing to ask about")
+        XCTAssertTrue(presenter.sheets.isEmpty)
+    }
+
+    /// Option-click on the Settings window's own close button, with two
+    /// busy windows: the same one alert and no tab's sheet. Cancel closes
+    /// nothing, Settings included; answered Close, everything closes.
+    func testOptionClickOnTheSettingsCloseButtonIsCloseAll() async throws {
+        let first = try openTabs(2)
+        let second = try openTabs(1)
+        try await start("sleep 100", in: try controller(of: first[0]))
+        try await start("cat", in: try controller(of: second[0]))
+        appDelegate.openSettings(nil)
+        let settings = try XCTUnwrap(appDelegate.settingsWindowController?.window)
+        presenter.modalAnswer = false
+
+        try clickCloseButton(of: settings, [.option])
+
+        try await waitUntil("Close All asks") { !presenter.modals.isEmpty }
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(presenter.modals, [CloseConfirmation(scope: .allWindows, processNames: ["sleep", "cat"])])
+        XCTAssertTrue(presenter.sheets.isEmpty, "no tab asks on a sheet of its own")
+        XCTAssertEqual(appDelegate.windowControllers.count, 3, "Cancel closes no tab")
+        XCTAssertTrue(settings.isVisible, "Cancel keeps Settings")
+        XCTAssertNotNil(appDelegate.settingsWindowController)
+
+        presenter.modalAnswer = true
+        try clickCloseButton(of: settings, [.option])
+
+        try await waitUntil("every window closes") {
+            appDelegate.windowControllers.isEmpty && appDelegate.settingsWindowController == nil
+        }
+        XCTAssertEqual(presenter.modals.count, 2, "asked once more, once")
+        XCTAssertTrue(presenter.sheets.isEmpty)
+        XCTAssertFalse(settings.isVisible)
+    }
+
+    /// Option-click on a terminal's close button: Settings waits for the
+    /// answer like the terminals, and stays on Cancel.
+    func testCancellingAnOptionClickOnATerminalKeepsSettings() async throws {
+        let window = try openTabs(1)[0]
+        try await start("sleep 100", in: try controller(of: window))
+        appDelegate.openSettings(nil)
+        let settings = try XCTUnwrap(appDelegate.settingsWindowController?.window)
+        presenter.modalAnswer = false
+
+        try clickCloseButton(of: window, [.option])
+
+        try await waitUntil("Close All asks") { !presenter.modals.isEmpty }
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(presenter.modals.count, 1)
+        XCTAssertTrue(settings.isVisible, "Cancel keeps Settings")
+        XCTAssertNotNil(appDelegate.settingsWindowController)
+    }
+
+    /// A click without Option on the Settings button closes only Settings,
+    /// and asks nothing about the busy terminal.
+    func testAPlainClickOnTheSettingsCloseButtonClosesOnlySettings() async throws {
+        let window = try openTabs(1)[0]
+        try await start("sleep 100", in: try controller(of: window))
+        appDelegate.openSettings(nil)
+        let settings = try XCTUnwrap(appDelegate.settingsWindowController?.window)
+
+        try clickCloseButton(of: settings, [])
+
+        try await waitUntil("Settings closes") { appDelegate.settingsWindowController == nil }
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertFalse(settings.isVisible)
+        XCTAssertTrue(presenter.modals.isEmpty, "no Close All")
+        XCTAssertTrue(presenter.sheets.isEmpty)
+        XCTAssertEqual(appDelegate.windowControllers.count, 1)
+    }
+
+    /// A click without Option stays the tab's own close: its own sheet, and
+    /// the other window is not asked about.
+    func testAPlainClickOnACloseButtonAsksOnlyForItsTab() async throws {
+        let first = try openTabs(1)
+        let second = try openTabs(1)
+        try await start("sleep 100", in: try controller(of: first[0]))
+        try await start("cat", in: try controller(of: second[0]))
+
+        try clickCloseButton(of: second[0], [])
+
+        try await waitUntil("the tab asks") { !presenter.sheets.isEmpty }
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(presenter.sheets.count, 1)
+        XCTAssertTrue(presenter.modals.isEmpty, "no Close All")
+        presenter.sheets[0].answer(false)
+        XCTAssertEqual(appDelegate.windowControllers.count, 2)
+    }
+
+    /// Only the release of an Option-click on the button itself counts:
+    /// Option elsewhere in the window (where a tab's own close button would
+    /// be) keeps AppKit's meaning.
+    func testOnlyAnOptionClickOnTheButtonCounts() throws {
+        let window = try XCTUnwrap(try openTabs(1).first)
+        let button = try XCTUnwrap(window.standardWindowButton(.closeButton))
+        let onButton = button.convert(NSPoint(x: button.bounds.midX, y: button.bounds.midY), to: nil)
+        let elsewhere = NSPoint(x: window.frame.width / 2, y: window.frame.height / 2)
+        func counts(_ type: NSEvent.EventType, _ at: NSPoint, _ modifiers: NSEvent.ModifierFlags) throws -> Bool {
+            AppDelegate.isOptionClickOnCloseButton(try mouseEvent(type, at: at, in: window, modifiers))
+        }
+        XCTAssertTrue(try counts(.leftMouseUp, onButton, [.option]))
+        XCTAssertFalse(try counts(.leftMouseUp, onButton, []), "no Option")
+        XCTAssertFalse(try counts(.leftMouseDown, onButton, [.option]), "the press, not the release")
+        XCTAssertFalse(try counts(.leftMouseUp, elsewhere, [.option]), "not on the button")
+        XCTAssertFalse(AppDelegate.isOptionClickOnCloseButton(nil))
+    }
+
     // MARK: Quit's alternate
 
     /// ⌥⌘Q with two windows, three tabs and two jobs asks once, as ⌘Q

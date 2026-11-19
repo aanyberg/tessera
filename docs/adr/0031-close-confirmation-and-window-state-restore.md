@@ -380,3 +380,19 @@ calls `terminate`, so the app quits without asking, its windows saved;
 any other quit event asks to quit with the quit alert over Close All's
 (#458). The registry names the command `close_all_windows` (App, ⌥⌘W).
 `closeAll:` itself still answers as before, should anything send it.
+
+## Amendment 2026-11-18: how Close All is reached, and a quit during its alert (#526)
+
+- **Option-click on a close button is Close All.** AppKit does not send `closeAll:` for it: the button's `_close:`
+  becomes `-[NSWindow _batchClose]` for every window, which reaches each tab's `windowShouldClose`. The window
+  controller asks its delegate there; for the release of an Option-click on a window's close button (checked against
+  `NSApp.currentEvent`) every tab refuses, and the delegate runs `closeAllWindows` once, after AppKit's round, by a
+  zero-delay `perform` so that the alert's modal loop does not sit inside a main-queue block. No method is swizzled.
+  The close buttons of the tab bar's tabs are other buttons: Option there stays AppKit's Close Other Tabs. The Settings
+  window refuses the same way, so its own button is Close All too and Cancel leaves it open. The About panel has no such
+  check: AppKit's round closes it before the question, whatever its answer.
+- **A quit during Close All's alert keeps asking.** A Dock or AppleScript quit while the alert is up shows the quit
+  alert over it, as `TerminationSignalTests` covers: two alerts, each honest about what it does. This stays.
+- **Close All rebound to a key other than Close Tab's is an ordinary visible item.** AppKit pairs an alternate only
+  with an item of the same key, so `MainMenu.apply` makes it one only while it has that key, and it is one again when
+  the key map gives it back. Close All ends a sheet on Settings as Cancel before closing that window, as a quit does.

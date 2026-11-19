@@ -1,4 +1,5 @@
 import AppKit
+import TesseraKit
 import XCTest
 
 @testable import Tessera
@@ -19,6 +20,10 @@ final class MainMenuTests: XCTestCase {
     private let configFile = URL(fileURLWithPath: "/nonexistent/tessera-tests/config.toml")
     /// What happened, in order: "create" and "open <path>".
     private var events: [String] = []
+    /// The default key map, put back on the menus after a test re-binds them.
+    private var defaultKeymap: TesseraKeymap?
+    private var cores: [TesseraApp] = []
+    private var configDirs: [URL] = []
 
     override func setUp() async throws {
         appDelegate = try XCTUnwrap(NSApp.delegate as? AppDelegate)
@@ -35,6 +40,13 @@ final class MainMenuTests: XCTestCase {
     }
 
     override func tearDown() async throws {
+        if let defaultKeymap, let bar = NSApp.mainMenu {
+            MainMenu.apply(defaultKeymap, to: bar)
+        }
+        for core in cores { core.shutdown() }
+        cores = []
+        for dir in configDirs { try? FileManager.default.removeItem(at: dir) }
+        configDirs = []
         appDelegate.opener = WorkspaceOpener()
         appDelegate.configFileCreator = nil
         appDelegate = nil
@@ -354,6 +366,117 @@ final class MainMenuTests: XCTestCase {
         MainMenu.run(command: "no_such_command")
         XCTAssertEqual(opener.urls.count, 1, "a command without an item does nothing")
         XCTAssertEqual(events, [])
+    }
+
+    // MARK: Re-bound alternates
+
+    /// A core of the test's own on `config`, shut down in `tearDown`; the
+    /// test's environment is put back at once, the core has read it.
+    private func startCore(config: String) throws -> TesseraApp {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tessera-menu-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        configDirs.append(dir)
+        try config.write(to: dir.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)
+        let previous = ProcessInfo.processInfo.environment["TESSERA_CONFIG_DIR"]
+        setenv("TESSERA_CONFIG_DIR", dir.path, 1)
+        defer {
+            if let previous { setenv("TESSERA_CONFIG_DIR", previous, 1) } else { unsetenv("TESSERA_CONFIG_DIR") }
+        }
+        let core = try TesseraApp()
+        cores.append(core)
+        return core
+    }
+
+    /// Close All on a key other than Close Tab's cannot be Close Tab's
+    /// alternate: it is an ordinary visible item that runs on its chord,
+    /// Close Tab does not change, AppKit adds no Close All of its own, and
+    /// the default key map makes it the alternate again.
+    func testCloseAllReboundToAnotherKeyIsAVisibleItemThatWorks() throws {
+        let bar = try XCTUnwrap(NSApp.mainMenu)
+        defaultKeymap = try startCore(config: "").keymap()
+        let previousPresenter = appDelegate.closeConfirmationPresenter
+        let presenter = RecordingCloseConfirmationPresenter()
+        appDelegate.closeConfirmationPresenter = presenter
+        appDelegate.spawnOptions = .init(program: "/bin/sh", arguments: ["-i"])
+        defer {
+            appDelegate.closeConfirmationPresenter = previousPresenter
+            appDelegate.spawnOptions = .init()
+            for controller in appDelegate.windowControllers { controller.window?.close() }
+        }
+        // First: the app's first window starts its core, which applies its own key map.
+        _ = try appDelegate.newWindow()
+        let config = "[keys]\n'cmd+alt+w' = 'none'\n'cmd+alt+j' = 'close_all_windows'\n"
+        MainMenu.apply(try startCore(config: config).keymap(), to: bar)
+        NSApp.mainMenu = bar
+        bar.update()
+
+        let closeAll = try XCTUnwrap(MainMenu.item(forCommand: "close_all_windows", in: bar))
+        let closeTab = try XCTUnwrap(MainMenu.item(forCommand: "close_tab", in: bar))
+        let menu = try XCTUnwrap(closeAll.menu)
+        menu.update()
+        XCTAssertFalse(closeAll.isAlternate, "another key than Close Tab's: an ordinary item")
+        XCTAssertFalse(closeAll.isHidden, "visible")
+        XCTAssertEqual(authoredKeyEquivalent(of: closeAll).key, "j")
+        XCTAssertEqual(authoredKeyEquivalent(of: closeAll).modifiers, [.command, .option])
+        XCTAssertEqual(authoredKeyEquivalent(of: closeTab).key, "w", "Close Tab keeps its key")
+        XCTAssertEqual(authoredKeyEquivalent(of: closeTab).modifiers, [.command])
+        XCTAssertFalse(closeTab.isAlternate)
+        XCTAssertFalse(closeTab.isHidden)
+        XCTAssertFalse(
+            menu.items.contains { $0.action == NSSelectorFromString("closeAll:") }, "AppKit's Close All stays away")
+
+        let chord = try XCTUnwrap(TesseraTests.keyDown("j", keyCode: 38))
+        XCTAssertTrue(bar.performKeyEquivalent(with: chord), "⌥⌘J is Close All")
+        XCTAssertTrue(appDelegate.windowControllers.isEmpty, "and closes every window")
+        XCTAssertTrue(presenter.modals.isEmpty, "idle: nothing asks")
+
+        MainMenu.apply(try XCTUnwrap(defaultKeymap), to: bar)
+        XCTAssertTrue(closeAll.isAlternate, "⌥⌘W again: the alternate again")
+    }
+
+    /// Identifiers of the items from `first` on, `count` of them.
+    private func identifiers(from first: NSMenuItem, count: Int) throws -> [String] {
+        let menu = try XCTUnwrap(first.menu)
+        let start = menu.index(of: first)
+        XCTAssertLessThanOrEqual(start + count, menu.numberOfItems)
+        guard start >= 0, start + count <= menu.numberOfItems else { return [] }
+        return menu.items[start..<(start + count)].map { $0.identifier?.rawValue ?? "" }
+    }
+
+    /// A second chord on Quit or Close Tab goes behind the item's ⌥
+    /// alternate, which only works directly under its item; applying the
+    /// key map again gives the same order. On the item's own letter the
+    /// alternate stays one; on another letter that comes first the item
+    /// has another key, and the alternate is an ordinary item, still there.
+    func testASecondChordStaysBehindTheOptionAlternate() throws {
+        let bar = try XCTUnwrap(NSApp.mainMenu)
+        defaultKeymap = try startCore(config: "").keymap()
+        let expected = [
+            ("quit", ["quit", "quit_keep_windows", "alias:quit"]),
+            ("close_tab", ["close_tab", "close_all_windows", "alias:close_tab"]),
+        ]
+        let configs = [
+            ("[keys]\n'cmd+ctrl+q' = 'quit'\n'cmd+ctrl+w' = 'close_tab'\n", true),
+            ("[keys]\n'cmd+ctrl+u' = 'quit'\n'cmd+ctrl+j' = 'close_tab'\n", false),
+        ]
+        for (config, staysAlternate) in configs {
+            let keymap = try startCore(config: config).keymap()
+            for pass in ["applied", "applied again"] {
+                MainMenu.apply(keymap, to: bar)
+                for (command, order) in expected {
+                    let context = "\(command), \(pass), \(config)"
+                    let item = try XCTUnwrap(MainMenu.item(forCommand: command, in: bar))
+                    XCTAssertEqual(try identifiers(from: item, count: order.count), order, context)
+                    let menu = try XCTUnwrap(item.menu)
+                    let index = menu.index(of: item)
+                    guard index + 2 < menu.numberOfItems else { return XCTFail("\(context): too few items") }
+                    XCTAssertFalse(item.isAlternate, context)
+                    XCTAssertEqual(menu.items[index + 1].isAlternate, staysAlternate, context)
+                    XCTAssertTrue(menu.items[index + 2].isHidden, "\(context): the second chord")
+                    XCTAssertTrue(menu.items[index + 2].allowsKeyEquivalentWhenHidden, context)
+                }
+            }
+        }
     }
 
     func testTesseraHelpOpensTheReadme() throws {

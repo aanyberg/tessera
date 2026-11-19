@@ -374,8 +374,11 @@ final class KeysModel {
         let map: TesseraKeymap
         /// The table keys of `[keys]` as written: an entry whose (escaped,
         /// capped) key is one of them is one the pane can change. Compared
-        /// canonically, as the snapshot's table holds one of two spellings;
-        /// it only lets an edit be tried, and an edit names its key's bytes.
+        /// canonically, as the snapshot's table holds one of two spellings.
+        /// An edit names its key's bytes, so this only lets it be tried, but
+        /// Restore Defaults also goes by it: an entry the snapshot leaves
+        /// out (a refused key) is removed when a canonical twin of its key
+        /// is written, and stays without one.
         let keys: Set<String>
 
         /// Whether `first` and `second` are one chord for the core. A chord

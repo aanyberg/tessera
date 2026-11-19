@@ -964,6 +964,44 @@ final class KeysPaneTests: XCTestCase {
         }
     }
 
+    /// Recording a chord for a command whose entries are on it and on its
+    /// twin keeps the entry on the chord and removes the twin's, by bytes.
+    func testRecordingAChordRemovesTheCommandsEntryOnItsCanonicalTwin() async throws {
+        let controller = try openKeys(
+            config: "[keys]\n\"cmd+;\" = \"find\"\n\"\(Self.greekChord)\" = \"find\"\n", monitor: FakeKeyMonitor())
+        controller.model.keys.record("cmd+;", for: "find")
+        try await waitUntil("the twin's entry is gone") {
+            !controller.model.keys.isChanging
+                && (try? self.file())?.unicodeScalars.contains("\u{37E}") == false
+        }
+        XCTAssertEqual(
+            Array(try file().unicodeScalars),
+            Array("[keys]\n\"cmd+;\" = \"find\"\n\"cmd+f\" = \"unbound\"\n".unicodeScalars))
+    }
+
+    /// An entry the snapshot leaves out (a key in NFD, refused) goes with
+    /// Restore Defaults when a canonical twin of its key is written, and
+    /// without a twin is left alone: the pane cannot name it.
+    func testRestoreDefaultsGoesByTheCanonicalKeys() async throws {
+        let nfd = "cmd+o\u{308}", nfc = "cmd+\u{F6}"
+        let twinned = "[keys]\n\"\(nfd)\" = \"copy\"\n\"\(nfc)\" = \"send_text:x\"\n"
+        var controller = try openKeys(config: twinned, monitor: FakeKeyMonitor())
+        controller.model.keys.restoreDefaults()
+        let kept = Array("[keys]\n\"\(nfc)\" = \"send_text:x\"\n".unicodeScalars)
+        try await waitUntil("the entry is removed") {
+            !controller.model.keys.isChanging && (try? self.file()).map { Array($0.unicodeScalars) } == kept
+        }
+
+        controller.close()
+        if let dir { try FileManager.default.removeItem(at: dir) }
+        let alone = "[keys]\n\"\(nfd)\" = \"copy\"\n"
+        controller = try openKeys(config: alone, monitor: FakeKeyMonitor())
+        controller.model.keys.restoreDefaults()
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertFalse(controller.model.keys.isChanging, "nothing to run")
+        XCTAssertEqual(Array(try file().unicodeScalars), Array(alone.unicodeScalars), "left alone")
+    }
+
     func testAnEditWaitsForAKeyMapShowingItAndNothingIsEditedFromATornRead() async throws {
         let writer = FakeWriter()
         let (model, source, _) = try fakeKeys(writer: writer)

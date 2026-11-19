@@ -437,10 +437,11 @@ final class TerminalScroller: NSScroller {
 
     /// Places the overlay knob over AppKit's knob rect (its position and
     /// minimum length are AppKit's), narrow or wide, and the slot
-    /// behind it while expanded; hides both in legacy style or without
-    /// history. Sets nothing that has not changed.
+    /// behind it while expanded; hides both in legacy style, without
+    /// history, or when the scroller is too short for AppKit to give it a
+    /// knob. Sets nothing that has not changed.
     private func layoutOverlayKnob() {
-        let overlay = scrollerStyle == .overlay && hasHistory
+        let overlay = scrollerStyle == .overlay && hasHistory && usableParts == .allScrollerParts
         let knob = overlay ? widened(rect(for: .knob)) : .zero
         let slot = overlay && isExpanded ? widened(rect(for: .knobSlot)) : .zero
         let knobShown = !knob.isEmpty, slotShown = !slot.isEmpty
@@ -484,6 +485,8 @@ final class TerminalScroller: NSScroller {
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
         applySlotScale()
+        // AppKit rounds the knob's rect to the new backing scale.
+        layoutOverlayKnob()
     }
 
     /// The slot is drawn at the window's backing scale.

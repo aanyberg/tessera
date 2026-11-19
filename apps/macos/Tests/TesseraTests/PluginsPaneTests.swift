@@ -34,6 +34,9 @@ final class PluginsPaneTests: XCTestCase {
         appDelegate.settingsWaitLimit = .seconds(2)
         controllers.forEach { $0.close() }
         controllers = []
+        // Whether or not the test got as far as replacing the core: a
+        // stand-in model left here would be the next test's Settings.
+        appDelegate.waitingSettingsModel = nil
         if replacedCore {
             try appDelegate.replaceCore(start: false)
         }
@@ -333,8 +336,9 @@ final class PluginsPaneTests: XCTestCase {
         // Checked before it is indexed: an index out of range ends the
         // test host, and xcodebuild with it hangs on the crashed host.
         guard shown.count == 6 else { return XCTFail("\(shown.count) shown: \(shown)") }
-        XCTAssertEqual(shown[5].count, SettingsModel.maxPluginIDShown + 2, "capped, in quotes")
-        XCTAssertTrue(shown[5].hasSuffix("…\""), shown[5])
+        XCTAssertLessThanOrEqual(shown[5].count, SettingsModel.maxPluginIDShown + 2, "capped, in quotes")
+        XCTAssertTrue(shown[5].contains("…"), shown[5])
+        XCTAssertTrue(shown[5].hasSuffix(#"\u{200b}""#), "its end is kept, no escape cut: \(shown[5])")
         XCTAssertEqual(SettingsModel.shownPluginID("dev.tessera.hello"), #""dev.tessera.hello""#)
         let exact = SettingsModel.shownPluginID(String(repeating: "x", count: SettingsModel.maxPluginIDShown))
         XCTAssertFalse(exact.contains("…"), "exactly at the cap: whole")
@@ -395,11 +399,71 @@ final class PluginsPaneTests: XCTestCase {
         XCTAssertLessThan(elapsed, .seconds(5))
     }
 
+    /// Ids too long to show whole that share far more than the shown start
+    /// show apart by their ends, within the cap, with no escape cut and
+    /// nothing unescaped (S3, S5).
+    func testLongIdsSharingTheirStartShowApart() {
+        let cap = SettingsModel.maxPluginIDShown
+        let start = String(repeating: "x", count: cap + 20)
+        let one = SettingsModel.shownPluginID(start + "-one")
+        let two = SettingsModel.shownPluginID(start + "-two")
+        XCTAssertNotEqual(one, two)
+        XCTAssertTrue(one.hasSuffix("-one\""), one)
+        // A piece of every width on both sides of the cut: control, bidi
+        // and quote characters, none of them whole-or-cut by accident.
+        let pieces = ["\u{202E}", "\u{7}", "\"", "\\", "\u{10FFFF}", "e\u{301}", "a"]
+        for piece in pieces {
+            for filler in 40..<70 {
+                let id = String(repeating: "y", count: filler) + String(repeating: piece, count: 30)
+                let shown = SettingsModel.shownPluginID(id)
+                XCTAssertLessThanOrEqual(shown.count, cap + 2, shown)
+                XCTAssertTrue(
+                    shown.unicodeScalars.allSatisfy { (0x20...0x7E).contains($0.value) || $0 == "…" }, shown)
+                Self.assertWholeEscapes(String(shown.dropFirst().dropLast()), shown)
+            }
+        }
+    }
+
+    /// Every backslash in `text` starts a whole escape: a `\u{…}`, or an
+    /// escaped quote or backslash; the ellipsis only follows or precedes one.
+    private static func assertWholeEscapes(_ text: String, _ shown: String, line: UInt = #line) {
+        let rest = text.replacing(/\\u\{[0-9a-f]+\}/, with: "").replacing(/\\["\\]/, with: "")
+        XCTAssertFalse(rest.contains("\\"), "a cut escape in \(shown)", line: line)
+    }
+
+    /// The refusal is true at exactly the cap and past it, where the file
+    /// lists more than Tessera reads, and it does not say how many are listed.
+    func testTheFullRefusalHoldsAtTheCapAndPastIt() throws {
+        let cap = SettingsModel.maxEnabledPlugins
+        for count in [cap, cap + 1] {
+            let listed = (0..<count).map { "x.\($0)" }
+            let (model, _, writer, _) = try fakeModel(enabled: listed, plugins: [Self.plugin("dev.a")])
+            PluginsPane.enabledBinding(model, "dev.a").wrappedValue = true
+            XCTAssertEqual(model.message(SettingsModel.pluginsKey), SettingsModel.pluginsFullRefusal, "\(count)")
+            XCTAssertEqual(writer.calls, [], "\(count)")
+        }
+        XCTAssertFalse(SettingsModel.pluginsFullRefusal.contains("lists \(cap)"), "true of any number listed")
+        XCTAssertTrue(SettingsModel.pluginsFullRefusal.contains("first \(cap) ids"))
+    }
+
+    /// Turning on an id whose other spelling (NFD for NFC) is listed adds
+    /// it: for the host, which compares bytes, it is another id.
+    func testTurningOnAnIdListedOnlyInAnotherSpellingAddsIt() async throws {
+        let nfd = "cafe\u{301}", nfc = "caf\u{E9}"
+        let (model, _, writer, _) = try fakeModel(enabled: [nfd], plugins: [Self.plugin(nfc)])
+        model.setPlugin(nfc, enabled: true)
+        try await waitUntil("written") { !writer.calls.isEmpty }
+        guard let written = writer.calls.first?.value?.array?.compactMap(\.string), writer.calls.count == 1 else {
+            return XCTFail("one write, got \(writer.calls)")
+        }
+        XCTAssertEqual(written.map { Array($0.utf8) }, [Array(nfd.utf8), Array(nfc.utf8)])
+    }
+
     /// At ``SettingsModel/maxEnabledPlugins`` ids a toggle turned on writes
     /// nothing and says why; turning one off still writes, and a hand edit
     /// that makes room clears the refusal (#489 48b B1, stand-ins).
     func testAtTheCapTurningOnIsRefusedAndOffStillWrites() async throws {
-        let full = (0..<SettingsModel.maxEnabledPlugins).map { "x.\($0)" }
+        let full = ["dev.b"] + (1..<SettingsModel.maxEnabledPlugins).map { "x.\($0)" }
         let (model, source, writer, _) = try fakeModel(enabled: full, plugins: [Self.plugin("dev.a")])
         let toggle = PluginsPane.enabledBinding(model, "dev.a")
         toggle.wrappedValue = true
@@ -412,6 +476,17 @@ final class PluginsPaneTests: XCTestCase {
         try Self.apply(source, model, generation: 2, enabled: Array(full.dropLast()), plugins: [Self.plugin("dev.a")])
         XCTAssertNil(model.message(SettingsModel.pluginsKey), "room made by hand")
         XCTAssertEqual(writer.calls, [])
+
+        // Full again, and one turned off: that writes.
+        let plugins = [Self.plugin("dev.a"), Self.plugin("dev.b", enabled: true, state: .active)]
+        try Self.apply(source, model, generation: 3, enabled: full, plugins: plugins)
+        toggle.wrappedValue = true
+        XCTAssertEqual(model.message(SettingsModel.pluginsKey), SettingsModel.pluginsFullRefusal)
+        PluginsPane.enabledBinding(model, "dev.b").wrappedValue = false
+        try await waitUntil("written") { !writer.calls.isEmpty }
+        XCTAssertEqual(
+            writer.calls, [.init(key: SettingsModel.pluginsKey, value: Self.listed(Array(full.dropFirst())))],
+            "at the cap, turning one off writes the list without it")
     }
 
     /// 25.2 adversarial M1: at the cap, a hand edit that swaps ids keeps 64
@@ -633,6 +708,54 @@ final class PluginsPaneTests: XCTestCase {
         XCTAssertFalse(model.pluginsChanging)
         let written = try file()
         XCTAssertTrue(written.contains("\"\(Self.hello)\""), written)
+    }
+
+    /// A configuration applied that does not yet hold the closed window's
+    /// plugin edit keeps its model, and the one that holds it lets it go.
+    /// The applies are real (the app's core, an edit of its file); the
+    /// model is a stand-in, so the test decides what each reads.
+    func testTheKeptModelStaysUntilAnApplyHoldsItsPluginEdit() async throws {
+        try openPlugins(config: "[plugins]\nenabled = []\n").close()
+        XCTAssertNil(appDelegate.waitingSettingsModel)
+        let (model, source, writer, _) = try fakeModel(enabled: [], plugins: [Self.plugin("dev.a")])
+        model.setPlugin("dev.a", enabled: true)
+        try await waitUntil("written") { !writer.calls.isEmpty }
+        XCTAssertTrue(model.pluginsChanging)
+        appDelegate.waitingSettingsModel = model
+        let config = try XCTUnwrap(dir).appendingPathComponent("config.toml")
+
+        // The generation the edit was queued at: not an apply after it.
+        let reads = source.pluginReads
+        try "[appearance]\nfont_size = 15.0\n".write(to: config, atomically: true, encoding: .utf8)
+        try await waitUntil("the apply reached the kept model") { source.pluginReads > reads }
+        XCTAssertTrue(model.pluginsChanging, "not applied yet")
+        XCTAssertTrue(appDelegate.waitingSettingsModel === model, "kept: its edit still waits")
+
+        source.snapshot = TesseraConfigSnapshot(generation: 2, config: try Self.config(enabled: ["dev.a"]))
+        source.pluginList = [Self.plugin("dev.a", enabled: true, state: .active)]
+        try "[appearance]\nfont_size = 16.0\n".write(to: config, atomically: true, encoding: .utf8)
+        try await waitUntil("let go") { appDelegate.waitingSettingsModel == nil }
+        XCTAssertFalse(model.pluginsChanging)
+    }
+
+    /// The model a closed window left waiting is freed once its edit lands.
+    /// As the app does it, on its core; on a manual clock, so only the
+    /// apply can release it.
+    func testTheKeptModelIsFreedOnceItsEditLands() async throws {
+        appDelegate.settingsClock = ManualClock()
+        let opened = try autoreleasepool {
+            let controller = try openPlugins(config: "[plugins]\nenabled = []\n")
+            controller.window?.contentView?.layoutSubtreeIfNeeded()
+            controller.model.setPlugin(Self.hello, enabled: true)
+            XCTAssertTrue(controller.model.pluginsChanging)
+            let opened = Opened(controller: controller, model: controller.model, window: nil)
+            controller.close()
+            XCTAssertTrue(appDelegate.waitingSettingsModel === controller.model, "kept while the edit waits")
+            return opened
+        }
+        try await waitUntil("applied and let go") { appDelegate.waitingSettingsModel == nil }
+        try await waitUntil("the model is freed") { autoreleasepool { opened.model == nil } }
+        XCTAssertNil(opened.model, "nothing keeps it once its edit landed")
     }
 
     /// An id starting with U+FEFF is another id for the host, and the pane
