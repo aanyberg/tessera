@@ -114,10 +114,10 @@ pub struct SearchStatus {
     /// Some lines were too slow for the pattern to search whole: a row
     /// that took more than `max(4 x budget, 250 ms)` (budget: the step's
     /// `budget_us`) was skipped, or a line was cut into
-    /// pieces smaller than 64 KiB (a match across or touching such a cut
-    /// is not found, so a run is not counted in parts). Matches there may
-    /// be missing from the count. Clears once those lines are gone or a new
-    /// query starts.
+    /// pieces smaller than 64 KiB (a match across such a cut is not found,
+    /// nor a regex match touching it, so a run is not counted in parts).
+    /// Matches there may be missing from the count. Clears once those
+    /// lines are gone or a new query starts.
     pub lines_skipped: bool,
 }
 

@@ -205,8 +205,8 @@ impl Query {
     /// widened to whole cells (a boundary inside a grapheme cluster takes
     /// the cluster's cell); and a match that, widened, starts before the
     /// previous one ends is dropped. In a piece [`scan_piece`] cut finer
-    /// than [`PieceLimit::FULL`], a match touching such a cut is dropped
-    /// too.
+    /// than [`PieceLimit::FULL`], a regex match touching such a cut is
+    /// dropped too.
     pub fn find(
         &self,
         haystack: &Haystack,
@@ -803,9 +803,12 @@ pub struct PieceScan {
 /// the same segment (they no longer fall where the full limit cuts), would
 /// split a variable-length match the full limit finds whole into parts on
 /// each side, each a match of its own (`[0-9]+` on a long run of digits).
-/// A match that starts right behind such a cut or ends right at it is
-/// therefore not handed to `found` (#531): it may be such a part. The
-/// caller reports such a segment as not searched whole.
+/// A regex match that starts right behind such a cut or ends right at it
+/// is therefore not handed to `found` (#531): it may be such a part. A
+/// literal query's match is the query's whole text, never a part, so it is
+/// kept (#569: dropping it lost a match at every cut once a stall halved
+/// the limit). The caller reports such a segment as not searched whole: a
+/// match across the cut is not found either way.
 pub fn scan_piece(
     query: &Query,
     rows: &[Line],
@@ -819,11 +822,13 @@ pub fn scan_piece(
     let rows = &rows[segment.start..segment.end];
     let base = piece.first + segment.start as u64;
     let stopped = haystack.fill_from(rows, piece.from, limit, piece.above, segment.below);
-    // A cut the full limit would not make splits a match it would find
-    // whole into parts on either side: those are dropped (#531).
+    // A cut the full limit would not make splits a regex match it would
+    // find whole into parts on either side: those are dropped (#531). A
+    // literal match is whole wherever it ends (#569).
     let below_fine = piece.fine || limit != PieceLimit::FULL;
-    haystack.drop_at_start = piece.fine;
-    haystack.drop_at_end = stopped.is_some() && below_fine;
+    let parts = query.options.regex;
+    haystack.drop_at_start = parts && piece.fine;
+    haystack.drop_at_end = parts && stopped.is_some() && below_fine;
     let flow = query.find_until(haystack, deadline, |m| {
         found(Match {
             start_line: base + u64::from(m.start_row),
@@ -1139,6 +1144,26 @@ mod tests {
             }
         }
 
+        /// #569: a literal match is never a part of a longer one, so a cut
+        /// below the full limit drops no single-character literal match
+        /// touching it: piece by piece at any limit, such a query finds
+        /// exactly what the whole segment holds.
+        #[test]
+        fn pieces_below_the_full_limit_keep_every_one_character_literal(
+            cols in 2u16..12,
+            text in "[0-9a ]{0,90}",
+            bytes in 1usize..24,
+            cells in 1usize..16,
+            needle in "[0-9a]",
+        ) {
+            let rows = rows(cols, &text);
+            let options = QueryOptions { regex: false, case_sensitive: true };
+            let query = Query::new(&needle, options).unwrap().unwrap();
+            let whole = query_matches(&rows, &query, PieceLimit::FULL);
+            let pieces = query_matches(&rows, &query, limit(bytes, cells));
+            prop_assert_eq!(pieces, whole, "{:?} in {:?}", needle, text);
+        }
+
         /// The run-length cell map gives every byte the cell the per-cell
         /// map gives it.
         #[test]
@@ -1182,6 +1207,12 @@ mod tests {
             case_sensitive: true,
         };
         let query = Query::new(pattern, options).unwrap().unwrap();
+        query_matches(rows, &query, at)
+    }
+
+    /// The matches of `query` in `rows`, taken as one segment and searched
+    /// piece by piece at `at`.
+    fn query_matches(rows: &[Line], query: &Query, at: PieceLimit) -> Vec<Match> {
         let segment = Segment {
             start: 0,
             end: rows.len(),
@@ -1192,7 +1223,7 @@ mod tests {
         let mut found = Vec::new();
         let mut piece = Piece::first(0, segment);
         loop {
-            let scan = scan_piece(&query, rows, piece, at, None, &mut haystack, |m| {
+            let scan = scan_piece(query, rows, piece, at, None, &mut haystack, |m| {
                 found.push(m);
                 ControlFlow::Continue(())
             });
