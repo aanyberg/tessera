@@ -11,7 +11,7 @@ Pick the cheapest check that covers the change while you work; the full gate run
 |---|---|---|
 | Iterating | `cargo nextest run -p <crate>` | one crate |
 | After a change | `just test-affected` (`--clippy` to lint too; `--base <ref>`; `-- <nextest args>`) | every crate your change touches since the merge base with `main` (committed, staged, unstaged and untracked), plus every crate that depends on them |
-| Swift or `tessera-ffi` surface | `just app-test` | the XCTest suites (Xcode, Thread Sanitizer); the gate does not run them, CI does |
+| Swift or `tessera-ffi` surface | `just app-test` (all suites) or `just app-test-only <scheme> <Target/Class[/test]>...` (a test, a class, a mutation run) | the XCTest suites (Xcode, Thread Sanitizer); the gate does not run them, CI does |
 | Docs, scripts, CI | the matching check: `actionlint`, `just config-docs-check`; for the factory scripts `just factory-test`, `just verify-branch-test`, `just quality-gate-test` | no Rust test is affected |
 | `shell-integration/` | `just test-affected` (selects those two crates and their dependents: `tessera-shell-integration` and `tessera-term` read it), plus `just terminfo-check` for the terminfo entry | the shell scripts and the terminfo entry |
 | Before any push or PR | `scripts/quality-gate.sh <worktree>` | everything: fmt, clippy, workspace tests, rustdoc, deny, FFI build and C tests, release timing tests, fuzz fmt and clippy |
@@ -45,6 +45,23 @@ another test failed in it. A test that waits for a child's output should therefo
 that it does not fail on its own on a loaded host. To reproduce locally, run the affected classes under TSan with
 `-test-iterations 20` through the watchdog (`taskpolicy -b` and a concurrent `cargo build`). On main that gave 1 hang in
 60 iterations of `TabVisibilityTests` and `PromptNavigationTests`, and none in 40 with terminal windows not restorable.
+
+## Hung runs: the test watchdog
+
+Every XCTest run goes through `scripts/app-test-watchdog.sh` (`just app-test`, `just app-test-only`; `just test` wraps
+nextest the same way). Never run a bare `xcodebuild test`: one ran for 9.5 hours after its test host crashed, because
+launchd, not xcodebuild, parents the host. The watchdog passes the output and the exit code through and ends a run that
+hangs, with exit **97** and a line starting `app-test watchdog: HANG` (or `FAILED:` for a test that outran
+`TESSERA_APP_TEST_HANG_SECONDS`, 150). Three clocks, each overridable by environment variable:
+
+| Variable | Default | Trips when |
+|---|---|---|
+| `TESSERA_APP_TEST_HANG_SECONDS` | 150 | a started test has had no test line for that long (xcodebuild's own allowance is 120 s) |
+| `TESSERA_APP_TEST_IDLE_SECONDS` | 900 | no output and no CPU progress (above 50 ms) in the command, its descendants or its hosts, also when the host died before any test started |
+| `TESSERA_APP_TEST_HARD_SECONDS` | 5400 | the run has lasted that long (a normal suite is about 7 minutes; 5400 s leaves 7x for a loaded machine) |
+
+It kills only the command's own process tree and the hosts under this run's `-derivedDataPath` that started after it
+did, so runs in other worktrees are untouched. `just app-test-watchdog-test` checks it with fake commands.
 
 ## Tests and the home directory
 

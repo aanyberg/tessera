@@ -285,7 +285,11 @@ Agents use these instead of rebuilding the setup in every run:
   Tessera; it is matched by PID and start time), and on SIGINT, SIGTERM, SIGHUP or SIGALRM it kills the hosts and
   removes its state directory. `just app-test-watchdog-test` checks it with a fake `xcodebuild`, `sample` and `ps`, with
   timing bounds that grow with the machine's load. A new test that legitimately needs more than 300 s gets its own
-  `slow-timeout` override there.
+  `slow-timeout` override there. **Agents run every test through the watchdog** (`just app-test`, `just app-test-only`,
+  `just test`; the gate's own nextest watchdog covers the gate): a bare `xcodebuild test` ran 9.5 hours after its host
+  crashed. The watchdog also ends a run with no output and no CPU progress for `TESSERA_APP_TEST_IDLE_SECONDS`
+  (default 900) or longer than `TESSERA_APP_TEST_HARD_SECONDS` (default 5400), with exit 97 and a HANG line; mutation
+  runs use `just app-test-only`.
 - **CI skips the macOS app job (#417).** The `changes` job in `.github/workflows/ci.yml` runs
   `scripts/ci-app-affected.sh --base <PR base sha> --head HEAD` and the `macOS app` job runs only when it prints `true`
   (pushes to main always run it). A skipped required job satisfies branch protection (the check shows as skipped); the
@@ -522,8 +526,8 @@ issue or in a message, and the wave goes on with the work that does not depend o
    runs the critics' standing checks on its own branch (mutation of tolerance tests, flood of per-byte events, fast
    paths against their reference) and ticks off every lead decision. A change to a JSON shape the FFI returns (a key
    renamed, added, reordered or retyped) also greps `apps/macos` for its readers (the key name, and the `TesseraCore`
-   wrapper type that decodes it) and runs the hosted test classes that exercise them (`xcodebuild test ...
-   -only-testing` through `just app-test`'s project) before the branch is reported, so that the Swift side is not
+   wrapper type that decodes it) and runs the hosted test classes that exercise them (`just app-test-only <scheme>
+   <Target/Class/test>...`) before the branch is reported, so that the Swift side is not
    first checked by CI or the critic; the report names the readers found and the classes run (wave 20 retro). An
    agent never starts a background job and stops (44 "waiting on its own background work" notices in wave 21): it runs
    the gate in the foreground with a timeout, polls a log it started, or reports "gate running, log <path>" once and

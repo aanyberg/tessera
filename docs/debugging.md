@@ -172,3 +172,20 @@ the directory, and only stopping the watch wakes it early. Nothing waits on that
 latency. Avoiding the park would need tick polling (idle wake-ups) or a stop latency above `CONFIG_WATCH_STOP_CAP`.
 With identical-code folding, the symbol in the report can show as a `PtyEvent` channel's `recv_timeout`, so a search
 of the log for `PtyEvent` still matches this report.
+
+## Reading a test watchdog diagnostic
+
+A hung test run ends with exit 97 and `app-test watchdog: HANG: <reason>` (or `FAILED: <test> ran longer than ...`).
+The diagnostic is `apps/macos/build/app-test-hang-sample.log` (CI uploads it with `app-test-logs`); each attempt starts
+with a `=== <time> attempt <n>: <reason>` line. Under it:
+
+- `== <reason> (TESSERA_APP_TEST_IDLE_SECONDS|..._HARD_SECONDS); last output lines:` is what tripped, then the last 30
+  lines of output. A last line such as `Test Suite ... started` with no test after it means the host never ran a test
+  (it crashed at launch); a test name means that test hung.
+- `== sample of pid <pid>: <command>` blocks are `sample` stacks of the command and its hosts (up to 6). A command
+  stack parked in `waitpid`/`read` with no host listed means xcodebuild was waiting for a dead host: look for a crash
+  report in `~/Library/Logs/DiagnosticReports`. `no test host found` says the same.
+- A thread inside `__tsan::` frames or `wrap_fork` is the known fork deadlock (#278, `docs/testing.md`).
+- `sample timed out` means `sample` itself did not return and was killed.
+
+Exit 97 is always a hang; any other code is the command's own.
